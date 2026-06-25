@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 
 	"github.com/go-faster/errors"
@@ -11,7 +12,9 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/signal/metric"
 	"github.com/oteldb/storage/tenant"
 )
 
@@ -30,6 +33,9 @@ type Storage struct {
 	backend backend.Backend
 	tenant  tenant.Resolver
 	closed  atomic.Bool
+
+	tmu     sync.Mutex
+	tenants map[signal.TenantID]*engine.Engine
 }
 
 // Open constructs a [Storage] from [Options] (DESIGN.md §5). If [Options.Backend] is
@@ -47,6 +53,7 @@ func Open(_ context.Context, o Options, opts ...Option) (*Storage, error) {
 		opts:    o,
 		backend: o.Backend,
 		tenant:  o.Tenancy,
+		tenants: make(map[signal.TenantID]*engine.Engine),
 	}
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
@@ -77,67 +84,99 @@ func (s *Storage) Close(_ context.Context) error {
 	return nil
 }
 
-// WriteMetrics ingests OTLP metrics (DESIGN.md §5, §8). It projects pdata to internal
-// columnar builders, interns symbols, computes SeriesIDs, appends to the WAL (per
-// durability), and inserts into the in-memory head. Returns per-OTLP partial-success
-// counts via [Accepted].
-func (s *Storage) WriteMetrics(_ context.Context, t signal.TenantID, _ pmetric.Metrics) (Accepted, error) {
-	if _, err := s.write(t); err != nil {
-		return Accepted{}, err
+// WriteMetrics ingests OTLP metrics. It projects pdata to the internal model, derives
+// each point's tenant from its Resource+Scope, and appends to that tenant's engine
+// (indexing labels + buffering samples). Returns per-OTLP partial-success counts:
+// rejected counts unsupported point kinds, value-less points, and out-of-order drops.
+func (s *Storage) WriteMetrics(_ context.Context, md pmetric.Metrics) (Accepted, error) {
+	if s.closed.Load() {
+		return Accepted{}, errors.Wrap(ErrClosed, "write metrics")
 	}
-	// TODO(M3): project pdata → builders, intern, SeriesID, WAL, head.
-	return Accepted{}, ErrNotImplemented
+
+	var oooRejected int64
+
+	emitted, projRejected := metric.Project(md, func(id metric.Identity, sample metric.Sample) {
+		eng := s.engineFor(s.tenantFor(id.Series.Resource, id.Series.Scope))
+		// Engines are ephemeral here, so Append never errors; a false result is an
+		// out-of-order rejection.
+		if ok, _ := eng.Append(id.ToSeries(), sample.Ts, sample.Value); !ok {
+			oooRejected++
+		}
+	})
+
+	return Accepted{
+		Accepted: int64(emitted) - oooRejected,
+		Rejected: int64(projRejected) + oooRejected,
+	}, nil
 }
 
-// WriteLogs ingests OTLP logs (DESIGN.md §5). Later vertical (M8+).
-func (s *Storage) WriteLogs(_ context.Context, t signal.TenantID, _ plog.Logs) (Accepted, error) {
-	if _, err := s.write(t); err != nil {
-		return Accepted{}, err
-	}
-	return Accepted{}, ErrNotImplemented
+// WriteLogs ingests OTLP logs. Later vertical.
+func (s *Storage) WriteLogs(_ context.Context, _ plog.Logs) (Accepted, error) {
+	return s.notImplementedWrite("write logs")
 }
 
-// WriteTraces ingests OTLP traces (DESIGN.md §5). Later vertical (M8+).
-func (s *Storage) WriteTraces(_ context.Context, t signal.TenantID, _ ptrace.Traces) (Accepted, error) {
-	if _, err := s.write(t); err != nil {
-		return Accepted{}, err
-	}
-	return Accepted{}, ErrNotImplemented
+// WriteTraces ingests OTLP traces. Later vertical.
+func (s *Storage) WriteTraces(_ context.Context, _ ptrace.Traces) (Accepted, error) {
+	return s.notImplementedWrite("write traces")
 }
 
-// WriteProfiles ingests OTLP profiles (DESIGN.md §5). Later vertical (M8+).
-func (s *Storage) WriteProfiles(_ context.Context, t signal.TenantID, _ pprofile.Profiles) (Accepted, error) {
-	if _, err := s.write(t); err != nil {
-		return Accepted{}, err
-	}
-	return Accepted{}, ErrNotImplemented
+// WriteProfiles ingests OTLP profiles. Later vertical.
+func (s *Storage) WriteProfiles(_ context.Context, _ pprofile.Profiles) (Accepted, error) {
+	return s.notImplementedWrite("write profiles")
 }
 
-// Query runs a query (DESIGN.md §5, §9). The engine selects the language by
-// [Query.Lang]; all compile to the fetch contract. Returns a [Result].
+// Query runs a query against one tenant. The engine selects the language by [Query.Lang].
+// PromQL and the rest land at M4; for now the low-level read path is the fetch contract.
 func (s *Storage) Query(_ context.Context, t signal.TenantID, _ Query) (Result, error) {
 	if s.closed.Load() {
 		return Result{}, errors.Wrap(ErrClosed, "query")
 	}
-	if t == "" {
-		t = "default"
-	}
-	_ = s.tenant.Resolve(t) // policy may gate query concurrency/limits (M3)
-	// TODO(M4): parse → plan → shard → fetch → exec.
+
+	_ = s.tenant.Resolve(s.normalizeTenant(t)) // policy may gate query concurrency/limits
+
 	return Result{}, ErrNotImplemented
 }
 
-// write checks the closed flag and resolves the tenant policy before dispatching.
-//
-//nolint:unparam // The resolved tenant.Policy is consumed by the M3 dispatch path.
-func (s *Storage) write(t signal.TenantID) (tenant.Policy, error) {
+func (s *Storage) notImplementedWrite(op string) (Accepted, error) {
 	if s.closed.Load() {
-		return tenant.Policy{}, errors.Wrap(ErrClosed, "write")
+		return Accepted{}, errors.Wrap(ErrClosed, op)
 	}
+
+	return Accepted{}, ErrNotImplemented
+}
+
+// tenantFor derives a record's tenant from its resource and scope via the configured
+// callback, defaulting to "default".
+func (s *Storage) tenantFor(r signal.Resource, sc signal.Scope) signal.TenantID {
+	if s.opts.Tenant != nil {
+		if tid := s.opts.Tenant(r, sc); tid != "" {
+			return tid
+		}
+	}
+
+	return "default"
+}
+
+func (s *Storage) normalizeTenant(t signal.TenantID) signal.TenantID {
 	if t == "" {
-		t = "default"
+		return "default"
 	}
-	return s.tenant.Resolve(t), nil
+
+	return t
+}
+
+// engineFor returns the engine for a tenant, creating it on first use.
+func (s *Storage) engineFor(tid signal.TenantID) *engine.Engine {
+	s.tmu.Lock()
+	defer s.tmu.Unlock()
+
+	e := s.tenants[tid]
+	if e == nil {
+		e = engine.New(engine.Config{OOOWindow: s.opts.OOOWindow})
+		s.tenants[tid] = e
+	}
+
+	return e
 }
 
 // Accepted carries per-OTLP partial-success counts (DESIGN.md §5). It implements the

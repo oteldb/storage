@@ -6,6 +6,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/encoding"
+	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
 )
 
@@ -21,8 +22,12 @@ type Options struct {
 	// is absent, DESIGN.md §3, §11). Single-node users ignore L0 entirely.
 	Cluster *cluster.Config
 
-	// Tenancy resolves a tenant id to limits, retention, downsampling, and routing
-	// (DESIGN.md §2, §8). If nil, a permissive default resolver is used.
+	// Tenant derives a record's tenant id from its Resource and Scope (so one OTLP
+	// batch may fan out to many tenants). If nil, every record routes to "default".
+	Tenant func(signal.Resource, signal.Scope) signal.TenantID
+
+	// Tenancy resolves a tenant id to limits, retention, downsampling, and routing.
+	// If nil, a permissive default resolver is used.
 	Tenancy tenant.Resolver
 
 	// Encoding is the default codec-chain profile per column kind (DESIGN.md §6).
@@ -75,6 +80,11 @@ func WithCluster(c *cluster.Config) Option { return func(o *Options) { o.Cluster
 
 // WithTenancy sets the tenant policy resolver.
 func WithTenancy(r tenant.Resolver) Option { return func(o *Options) { o.Tenancy = r } }
+
+// WithTenant sets the record→tenant routing callback (resource/scope → tenant id).
+func WithTenant(fn func(signal.Resource, signal.Scope) signal.TenantID) Option {
+	return func(o *Options) { o.Tenant = fn }
+}
 
 // WithEncoding sets the default encoding profile.
 func WithEncoding(p encoding.Profile) Option { return func(o *Options) { o.Encoding = p } }
