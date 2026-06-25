@@ -9,7 +9,8 @@
 > Forward-looking design and the milestone plan live in `DESIGN.md` and `PROMPT.md`;
 > keep speculation and TODOs out of this file.
 >
-> Last verified against the tree: 2026-06-26 (M3: engine vertical — ingest/flush/merge/fetch).
+> Last verified against the tree: 2026-06-26 (M3: engine vertical — ingest/flush/merge/fetch;
+> ingest boundary moved off pdata to the internal `metric.Metrics` batch + `otlp/pdataconv` bridge).
 
 `github.com/oteldb/storage` is a low-level, OpenTelemetry-centric columnar storage
 **library** (Go 1.26). It has no `main`, server, or CLI: an embedder (primarily
@@ -215,16 +216,33 @@ torn final record (crash recovery), surfaces a bad-CRC complete record as corrup
 skips unknown record types (forward-compat). Replaying the log rebuilds the symbols +
 series + postings index — the path that reconstructs the head after a restart.
 
-## 3e. Metrics projection (`signal/metric/`)
+## 3e. Metrics ingest model + projection (`signal/metric/`)
 
-The OTLP → internal boundary for metrics. `metric.Project(md, emit)` walks
-resource → scope → metric → number data point for **Gauge and Sum** points (Histogram /
-ExpHistogram / Summary are deferred and counted as rejected, as are value-less points),
-converting `pcommon.Map`/`pcommon.Value` to typed `signal.Attributes`/`signal.Value`
-(`convert.go`). Metric identity (`Identity`) folds the metric-specific fields — name,
-unit, kind, temporality, monotonicity — into **reserved labels** (`__name__`, `__unit__`,
-…) on a `signal.Series`, so the one identity/index machinery covers metrics and a query
-matches `__name__` like any other label. `emit` receives `(Identity, Sample)` per point.
+**The ingest boundary is the internal model, not OTel-Go pdata.** `metric.Metrics`
+(`metrics.go`) is a `[]byte`-based, OTLP-shaped batch — `ResourceMetrics → ScopeMetrics →
+Metric → NumberPoint` — that mirrors the OTLP hierarchy but holds all identity as `[]byte`,
+so an embedder decoding OTLP protobuf can build it by aliasing the decode buffer and
+projection copies nothing. It is **resettable and pool-friendly**: the `Add*` builders
+reuse the retained capacity of the nested slices (the resettable-arena `grow` trick), so a
+`Reset`-then-rebuild cycle (or a `GetMetrics`/`PutMetrics` pool round-trip) allocates
+nothing across ingest calls.
+
+`metric.Project(md, emit)` walks the batch for **Gauge and Sum** number points; every point
+in a `Metrics` batch is well-formed by construction, so projection rejects nothing
+(out-of-order rejection is the engine's concern downstream). Metric identity (`Identity`)
+folds the metric-specific fields — name, unit, kind, temporality, monotonicity — into
+**reserved labels** (`__name__`, `__unit__`, …) on a `signal.Series`, so the one
+identity/index machinery covers metrics and a query matches `__name__` like any other
+label. `emit` receives `(Identity, Sample)` per point.
+
+**pdata is confined to one optional adapter.** `otlp/pdataconv` converts the collector
+`pmetric.Metrics` into `metric.Metrics` (`AppendMetrics`, holding the `pcommon` →
+`signal.Value` conversion). It filters and **counts** the points the internal model does not
+yet represent — Histogram / ExpHistogram / Summary, and value-less number points — returning
+`dropped` so the caller folds them into an OTLP partial-success. It is the only package that
+imports `go.opentelemetry.io/collector/pdata`; the conversion necessarily allocates (pdata
+stores keys/values as Go strings), which is why it sits off the hot path and embedders that
+own their OTLP decoder build `metric.Metrics` directly.
 
 ## 3f. Engine (`engine/`) — the single-node metrics vertical
 
@@ -269,13 +287,15 @@ Series, Timestamps, Values}` (one batch per matching series for M3). `SliceItera
 
 The embedder-facing API. The construction and **metrics ingest+read path are wired and
 working**; logs/traces/profiles ingest and the query-language path still return
-`ErrNotImplemented`.
+`ErrNotImplemented`. The `Write*` methods take the library's internal, `[]byte`-based
+ingest batches (`metric.Metrics`, and placeholder `log.Logs`/`trace.Traces`/
+`profile.Profiles`), **not pdata** — OTel-Go users convert via `otlp/pdataconv` (§3e).
 
 - **`Storage`** — the facade. `Open(ctx, Options, ...Option)` and `InMemory(...Option)`
   construct it (validation, defaulting, tenant-resolver wiring, and — when `FlushInterval`
   is set — the background maintenance loop start here); `Close(ctx)` stops the loop and
   flushes every tenant engine. `WriteMetrics(ctx, md)` is **fully implemented**: it
-  projects pdata (`signal/metric`), derives each point's **tenant from its Resource+Scope**
+  projects the internal `metric.Metrics` batch, derives each point's **tenant from its Resource+Scope**
   via the `Options.Tenant` callback (no tenant argument), and appends to that tenant's
   lazily-created `engine.Engine` (one per tenant, parts under `{tenant}/metrics`). It
   returns `Accepted` (OTLP partial-success: rejected counts unsupported kinds, value-less
@@ -350,7 +370,9 @@ encoding/             umbrella doc for the codec layers
   encoding/compress   zstd/none block wrapper (lz4 stub)                              [implemented]
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
 signal/               typed Attributes/Value, Resource/Scope/Series identity, 128-bit SeriesID, Signal, TenantID [implemented]
-  signal/metric       metrics identity + OTLP→columnar projection (gauge/sum)          [implemented; histogram/summary deferred]
+  signal/metric       []byte-based OTLP-shaped Metrics ingest batch (resettable/pooled) + identity + projection (gauge/sum) [implemented; histogram/summary deferred]
+  signal/log,trace,profile  placeholder ingest batch types (keep facade pdata-free)    [stub; verticals deferred]
+otlp/pdataconv        optional OTel-Go bridge: pmetric.Metrics → metric.Metrics (only package importing pdata) [implemented for metrics]
 tenant/               Limits/Retention/Downsample/Policy, Resolver                     [implemented]
 backend/              Backend interface + memory (root) + file/                         [implemented; s3/bucketindex seam only]
 block/                immutable columnar part format: column/marks/manifest/part        [implemented]

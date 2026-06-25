@@ -8,24 +8,25 @@ import (
 	"time"
 
 	"github.com/go-faster/errors"
-	"go.opentelemetry.io/collector/pdata/plog"
-	"go.opentelemetry.io/collector/pdata/pmetric"
-	"go.opentelemetry.io/collector/pdata/pprofile"
-	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/signal/log"
 	"github.com/oteldb/storage/signal/metric"
+	"github.com/oteldb/storage/signal/profile"
+	"github.com/oteldb/storage/signal/trace"
 	"github.com/oteldb/storage/tenant"
 )
 
 // Storage is the embeddable entry point (DESIGN.md §5). It is safe for concurrent use.
 // Construct with [Open] or [InMemory]; never with a literal.
 //
-// All ingestion is push-based and OTLP-shaped: methods accept the OTel-Go pdata types
-// and return an [Accepted] carrying per-OTLP partial-success counts. Queries compile
-// to the fetch contract (DESIGN.md §7) regardless of [Query.Lang].
+// All ingestion is push-based and OTLP-shaped: methods accept the library's internal,
+// []byte-based, zero-alloc ingest batches (e.g. [metric.Metrics]) and return an [Accepted]
+// carrying per-OTLP partial-success counts. OTel-Go users convert pdata to these via the
+// optional otlp/pdataconv bridge, which keeps pdata off this hot path. Queries compile to
+// the fetch contract (DESIGN.md §7) regardless of [Query.Lang].
 //
 // This is a scaffold stub: ingestion and query are wired end-to-end at M3 (metrics
 // vertical). The methods currently validate arguments and return
@@ -112,18 +113,19 @@ func (s *Storage) Close(ctx context.Context) error {
 	return firstErr
 }
 
-// WriteMetrics ingests OTLP metrics. It projects pdata to the internal model, derives
-// each point's tenant from its Resource+Scope, and appends to that tenant's engine
-// (indexing labels + buffering samples). Returns per-OTLP partial-success counts:
-// rejected counts unsupported point kinds, value-less points, and out-of-order drops.
-func (s *Storage) WriteMetrics(_ context.Context, md pmetric.Metrics) (Accepted, error) {
+// WriteMetrics ingests a metrics batch. It projects the internal model, derives each
+// point's tenant from its Resource+Scope, and appends to that tenant's engine (indexing
+// labels + buffering samples). Returns per-OTLP partial-success counts: rejected counts
+// out-of-order drops. (Unsupported point kinds and value-less points never reach here:
+// they are filtered and counted by the producer — e.g. the otlp/pdataconv bridge.)
+func (s *Storage) WriteMetrics(_ context.Context, md metric.Metrics) (Accepted, error) {
 	if s.closed.Load() {
 		return Accepted{}, errors.Wrap(ErrClosed, "write metrics")
 	}
 
 	var oooRejected int64
 
-	emitted, projRejected := metric.Project(md, func(id metric.Identity, sample metric.Sample) {
+	emitted := metric.Project(md, func(id metric.Identity, sample metric.Sample) {
 		eng := s.engineFor(s.tenantFor(id.Series.Resource, id.Series.Scope))
 		// Engines are ephemeral here, so Append never errors; a false result is an
 		// out-of-order rejection.
@@ -134,22 +136,22 @@ func (s *Storage) WriteMetrics(_ context.Context, md pmetric.Metrics) (Accepted,
 
 	return Accepted{
 		Accepted: int64(emitted) - oooRejected,
-		Rejected: int64(projRejected) + oooRejected,
+		Rejected: oooRejected,
 	}, nil
 }
 
-// WriteLogs ingests OTLP logs. Later vertical.
-func (s *Storage) WriteLogs(_ context.Context, _ plog.Logs) (Accepted, error) {
+// WriteLogs ingests a logs batch. Later vertical.
+func (s *Storage) WriteLogs(_ context.Context, _ log.Logs) (Accepted, error) {
 	return s.notImplementedWrite("write logs")
 }
 
-// WriteTraces ingests OTLP traces. Later vertical.
-func (s *Storage) WriteTraces(_ context.Context, _ ptrace.Traces) (Accepted, error) {
+// WriteTraces ingests a traces batch. Later vertical.
+func (s *Storage) WriteTraces(_ context.Context, _ trace.Traces) (Accepted, error) {
 	return s.notImplementedWrite("write traces")
 }
 
-// WriteProfiles ingests OTLP profiles. Later vertical.
-func (s *Storage) WriteProfiles(_ context.Context, _ pprofile.Profiles) (Accepted, error) {
+// WriteProfiles ingests a profiles batch. Later vertical.
+func (s *Storage) WriteProfiles(_ context.Context, _ profile.Profiles) (Accepted, error) {
 	return s.notImplementedWrite("write profiles")
 }
 

@@ -1,8 +1,6 @@
 package metric
 
 import (
-	"go.opentelemetry.io/collector/pdata/pmetric"
-
 	"github.com/oteldb/storage/signal"
 )
 
@@ -85,119 +83,44 @@ type Sample struct {
 	Value   float64
 }
 
-// Project iterates an OTLP metric batch and calls emit for every gauge/sum number data
-// point with its [Identity] and [Sample]. Resource and scope are converted once per
-// group (hoisted). It returns how many points were accepted and how many were rejected
-// (unsupported point kinds or value-less points). Histogram/exp-histogram/summary are not
-// yet projected (their points are counted as rejected).
-func Project(md pmetric.Metrics, emit func(Identity, Sample)) (accepted, rejected int) {
-	rms := md.ResourceMetrics()
-	for i := range rms.Len() {
-		rm := rms.At(i)
-		resource := signal.Resource{
-			SchemaURL:  []byte(rm.SchemaUrl()),
-			Attributes: convertMap(rm.Resource().Attributes()),
-		}
+// Project iterates an internal [Metrics] batch and calls emit for every number data point
+// with its [Identity] and [Sample]. Resource and scope are hoisted once per group. It
+// returns how many points were emitted. Every point in a [Metrics] batch is well-formed by
+// construction (value-less and unsupported OTLP points are filtered by the producer — e.g.
+// the otlp/pdataconv bridge), so projection rejects nothing; out-of-order rejection is the
+// engine's concern downstream.
+func Project(md Metrics, emit func(Identity, Sample)) (accepted int) {
+	for ri := range md.Resources {
+		rm := &md.Resources[ri]
 
-		sms := rm.ScopeMetrics()
-		for j := range sms.Len() {
-			sm := sms.At(j)
-			scope := signal.Scope{
-				Name:       []byte(sm.Scope().Name()),
-				Version:    []byte(sm.Scope().Version()),
-				SchemaURL:  []byte(sm.SchemaUrl()),
-				Attributes: convertMap(sm.Scope().Attributes()),
-			}
+		for si := range rm.Scopes {
+			sm := &rm.Scopes[si]
 
-			metrics := sm.Metrics()
-			for k := range metrics.Len() {
-				a, r := projectMetric(metrics.At(k), resource, scope, emit)
-				accepted += a
-				rejected += r
+			for mi := range sm.Metrics {
+				accepted += projectMetric(&sm.Metrics[mi], rm.Resource, sm.Scope, emit)
 			}
 		}
 	}
 
-	return accepted, rejected
+	return accepted
 }
 
-func projectMetric(m pmetric.Metric, resource signal.Resource, scope signal.Scope, emit func(Identity, Sample)) (int, int) {
-	base := Identity{Series: signal.Series{Resource: resource, Scope: scope}, Name: []byte(m.Name()), Unit: []byte(m.Unit())}
-
-	switch m.Type() {
-	case pmetric.MetricTypeGauge:
-		base.Kind = KindGauge
-
-		return projectNumbers(m.Gauge().DataPoints(), base, resource, scope, emit)
-	case pmetric.MetricTypeSum:
-		sum := m.Sum()
-		base.Kind = KindSum
-		base.Temporality = temporalityOf(sum.AggregationTemporality())
-		base.Monotonic = sum.IsMonotonic()
-
-		return projectNumbers(sum.DataPoints(), base, resource, scope, emit)
-	default:
-		return 0, unsupportedPointCount(m)
+func projectMetric(m *Metric, resource signal.Resource, scope signal.Scope, emit func(Identity, Sample)) int {
+	base := Identity{
+		Series:      signal.Series{Resource: resource, Scope: scope},
+		Name:        m.Name,
+		Unit:        m.Unit,
+		Kind:        m.Kind,
+		Temporality: m.Temporality,
+		Monotonic:   m.Monotonic,
 	}
-}
 
-func projectNumbers(
-	dps pmetric.NumberDataPointSlice, base Identity, resource signal.Resource, scope signal.Scope,
-	emit func(Identity, Sample),
-) (accepted, rejected int) {
-	for i := range dps.Len() {
-		dp := dps.At(i)
-
-		v, ok := numberValue(dp)
-		if !ok {
-			rejected++
-
-			continue
-		}
-
+	for i := range m.Points {
+		p := &m.Points[i]
 		id := base
-		id.Series = signal.Series{Resource: resource, Scope: scope, Attributes: convertMap(dp.Attributes())}
-		emit(id, Sample{StartTs: int64(dp.StartTimestamp()), Ts: int64(dp.Timestamp()), Value: v})
-
-		accepted++
+		id.Series = signal.Series{Resource: resource, Scope: scope, Attributes: p.Attributes}
+		emit(id, Sample{StartTs: p.StartTs, Ts: p.Ts, Value: p.Value})
 	}
 
-	return accepted, rejected
-}
-
-func numberValue(dp pmetric.NumberDataPoint) (float64, bool) {
-	switch dp.ValueType() {
-	case pmetric.NumberDataPointValueTypeDouble:
-		return dp.DoubleValue(), true
-	case pmetric.NumberDataPointValueTypeInt:
-		return float64(dp.IntValue()), true
-	default:
-		return 0, false
-	}
-}
-
-func temporalityOf(t pmetric.AggregationTemporality) Temporality {
-	switch t {
-	case pmetric.AggregationTemporalityDelta:
-		return TemporalityDelta
-	case pmetric.AggregationTemporalityCumulative:
-		return TemporalityCumulative
-	default:
-		return TemporalityUnspecified
-	}
-}
-
-// unsupportedPointCount returns the number of data points of a not-yet-projected metric
-// type, so they are counted as rejected.
-func unsupportedPointCount(m pmetric.Metric) int {
-	switch m.Type() {
-	case pmetric.MetricTypeHistogram:
-		return m.Histogram().DataPoints().Len()
-	case pmetric.MetricTypeExponentialHistogram:
-		return m.ExponentialHistogram().DataPoints().Len()
-	case pmetric.MetricTypeSummary:
-		return m.Summary().DataPoints().Len()
-	default:
-		return 0
-	}
+	return len(m.Points)
 }

@@ -7,31 +7,33 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/pdata/pcommon"
-	"go.opentelemetry.io/collector/pdata/plog"
-	"go.opentelemetry.io/collector/pdata/pmetric"
-	"go.opentelemetry.io/collector/pdata/pprofile"
-	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/signal/log"
 	"github.com/oteldb/storage/signal/metric"
+	"github.com/oteldb/storage/signal/profile"
+	"github.com/oteldb/storage/signal/trace"
 )
 
-// gaugeBatch builds a one-gauge OTLP batch under resource service.name=service.
-func gaugeBatch(service, name string, ts []int64, values []float64) pmetric.Metrics {
-	md := pmetric.NewMetrics()
-	rm := md.ResourceMetrics().AppendEmpty()
-	rm.Resource().Attributes().PutStr("service.name", service)
-	m := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
-	m.SetName(name)
-	g := m.SetEmptyGauge()
+// gaugeBatch builds a one-gauge internal batch under resource service.name=service.
+func gaugeBatch(service, name string, ts []int64, values []float64) metric.Metrics {
+	var md metric.Metrics
+	rm := md.AddResource()
+	rm.Resource = signal.Resource{
+		Attributes: signal.NewAttributes(signal.KeyValue{
+			Key: []byte("service.name"), Value: signal.StringValue([]byte(service)),
+		}),
+	}
+	mt := rm.AddScope().AddMetric()
+	mt.Name = []byte(name)
+	mt.Kind = metric.KindGauge
 
 	for i := range ts {
-		dp := g.DataPoints().AppendEmpty()
-		dp.SetTimestamp(pcommon.Timestamp(ts[i]))
-		dp.SetDoubleValue(values[i])
+		p := mt.AddPoint()
+		p.Ts = ts[i]
+		p.Value = values[i]
 	}
 
 	return md
@@ -128,27 +130,6 @@ func TestMultiTenantRouting(t *testing.T) {
 	assert.InDelta(t, 2.0, webBatches[0].Values[0], 0)
 }
 
-func TestWriteMetricsRejectsUnsupported(t *testing.T) {
-	t.Parallel()
-
-	md := pmetric.NewMetrics()
-	sm := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
-	h := sm.Metrics().AppendEmpty()
-	h.SetName("h")
-	h.SetEmptyHistogram().DataPoints().AppendEmpty() // unsupported ⇒ rejected
-	g := sm.Metrics().AppendEmpty()
-	g.SetName("g")
-	dp := g.SetEmptyGauge().DataPoints().AppendEmpty()
-	dp.SetDoubleValue(5)
-
-	s, err := InMemory()
-	require.NoError(t, err)
-	acc, err := s.WriteMetrics(context.Background(), md)
-	require.NoError(t, err)
-	assert.Equal(t, int64(1), acc.Accepted)
-	assert.Equal(t, int64(1), acc.Rejected)
-}
-
 func TestWriteAfterCloseRejected(t *testing.T) {
 	t.Parallel()
 
@@ -160,7 +141,7 @@ func TestWriteAfterCloseRejected(t *testing.T) {
 	ctx := context.Background()
 	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{1}, []float64{1}))
 	require.ErrorIs(t, err, ErrClosed)
-	_, err = s.WriteLogs(ctx, plog.NewLogs())
+	_, err = s.WriteLogs(ctx, log.Logs{})
 	require.ErrorIs(t, err, ErrClosed)
 	_, err = s.Query(ctx, "t", Query{Lang: LangPromQL})
 	require.ErrorIs(t, err, ErrClosed)
@@ -173,11 +154,11 @@ func TestUnimplementedSignals(t *testing.T) {
 	require.NoError(t, err)
 	ctx := context.Background()
 
-	_, err = s.WriteLogs(ctx, plog.NewLogs())
+	_, err = s.WriteLogs(ctx, log.Logs{})
 	require.ErrorIs(t, err, ErrNotImplemented)
-	_, err = s.WriteTraces(ctx, ptrace.NewTraces())
+	_, err = s.WriteTraces(ctx, trace.Traces{})
 	require.ErrorIs(t, err, ErrNotImplemented)
-	_, err = s.WriteProfiles(ctx, pprofile.NewProfiles())
+	_, err = s.WriteProfiles(ctx, profile.Profiles{})
 	require.ErrorIs(t, err, ErrNotImplemented)
 	_, err = s.Query(ctx, "", Query{Lang: LangPromQL})
 	require.ErrorIs(t, err, ErrNotImplemented)
