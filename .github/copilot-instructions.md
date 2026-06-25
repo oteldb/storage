@@ -82,7 +82,12 @@ comments instead, and reference `ARCHITECTURE.md` (which is committed) when a po
   lossless exp-histogram downsampling.
 - **Golden tests** for on-disk formats (parts, WAL) to catch accidental format breaks.
 - **Benchmarks on hot paths** (bit-stream, merge, postings intersection, fetch); use benchmarks +
-  pprof as the performance feedback loop — measure before and after hot-path changes.
+  pprof as the performance feedback loop — measure before and after hot-path changes. **Both encode
+  and decode benchmarks must report throughput** via `b.SetBytes` (plus `b.ReportAllocs()`). Size it
+  by the **logical, uncompressed data** (`rows × elementSize`) on *both* sides — never the encoded
+  length — so decode reports a real decode speed that is directly comparable to encode and isn't
+  distorted by the codec's compression ratio (an RLE column compresses 16 KiB to a few bytes;
+  sizing decode by the encoded length would report a meaningless ~64 MB/s instead of GB/s).
 - **Assertions:** use `github.com/stretchr/testify` (`require` for must-stop checks — errors,
   preconditions; `assert` for independent value checks). Prefer it for new and converted tests over
   hand-written `if got != want { t.Fatalf(...) }`. Fuzz/benchmark bodies stay testify-free where it

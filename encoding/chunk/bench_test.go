@@ -184,6 +184,68 @@ func BenchmarkDictDecodeSplit(b *testing.B) {
 	}
 }
 
+// makeU128Runs builds nRuns distinct ids, each repeated runLen times — the metric
+// id-column shape (all of a series' samples are contiguous) that CodecID128 RLE
+// targets. runLen of 1 is the worst case (every row is its own run).
+func makeU128Runs(nRuns, runLen int) []U128 {
+	vals := make([]U128, 0, nRuns*runLen)
+	for r := range nRuns {
+		id := U128{Hi: uint64(r) >> 1, Lo: uint64(r)*0x9e3779b97f4a7c15 + 1}
+		for range runLen {
+			vals = append(vals, id)
+		}
+	}
+
+	return vals
+}
+
+func BenchmarkU128Encode(b *testing.B) {
+	vals := makeU128Runs(10, 100)
+	b.SetBytes(int64(len(vals)) * 16) // raw input bytes encoded/sec
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		_ = EncodeU128(nil, vals)
+	}
+}
+
+func BenchmarkU128EncodeDistinct(b *testing.B) {
+	vals := makeU128Runs(1000, 1)     // worst case: every row is its own run
+	b.SetBytes(int64(len(vals)) * 16) // raw input bytes encoded/sec
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		_ = EncodeU128(nil, vals)
+	}
+}
+
+func BenchmarkU128Decode(b *testing.B) {
+	vals := makeU128Runs(10, 100)
+	enc := EncodeU128(nil, vals)
+	b.SetBytes(int64(len(vals)) * 16) // logical decoded bytes/sec
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		_, _, _ = DecodeU128(nil, enc)
+	}
+}
+
+func BenchmarkU128DecodeReuseDst(b *testing.B) {
+	vals := makeU128Runs(10, 100)
+	enc := EncodeU128(nil, vals)
+	dst := make([]U128, 0, len(vals))
+	b.SetBytes(int64(len(vals)) * 16) // logical decoded bytes/sec
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		dst, _, _ = DecodeU128(dst[:0], enc)
+	}
+}
+
 func BenchmarkDecimalEncode(b *testing.B) {
 	vals := make([]float64, 1000)
 	for i := range vals {
