@@ -9,7 +9,7 @@
 > Forward-looking design and the milestone plan live in `DESIGN.md` and `PROMPT.md`;
 > keep speculation and TODOs out of this file.
 >
-> Last verified against the tree: 2026-06-25.
+> Last verified against the tree: 2026-06-25 (M2: index + WAL).
 
 `github.com/oteldb/storage` is a low-level, OpenTelemetry-centric columnar storage
 **library** (Go 1.26). It has no `main`, server, or CLI: an embedder (primarily
@@ -17,10 +17,12 @@
 
 What is actually built today is the **encoding foundation** (the bit-level and
 column-codec layer), the **part format** (`block`) and **storage backends**
-(`backend` memory + file), its supporting **pool**, and the **public facade skeleton**
-(construction, options, shared types). The higher layers — index, engine, fetch
-contract, query languages, cluster — currently exist as package boundaries with
-documented seams; their behavior is not yet implemented.
+(`backend` memory + file), the **identity + index layer** (typed attributes/SeriesID in
+`signal`, plus `index/{symbols,series,postings}`) and the **write-ahead log** (`wal`),
+its supporting **pool**, and the **public facade skeleton** (construction, options,
+shared types). The remaining layers — engine, fetch contract, query languages, cluster —
+currently exist as package boundaries with documented seams; their behavior is not yet
+implemented.
 
 ---
 
@@ -34,7 +36,7 @@ The design is a single columnar engine with swappable front-ends and backends
 | L6 Query languages | promql/logql/traceql/genericql | — (package `query`, seam only) |
 | L5 Query engine | plan IR · sharding · streaming exec · cache | — (package `query`, seam only) |
 | L4 Fetch contract | matchers + column conditions + window → iterator | — (package `query`, seam only) |
-| L3 Engine / Index | WAL · head · flush · merge / postings · marks · blooms | — (packages `engine`, `index`, `wal`, seam only) |
+| L3 Engine / **Index / WAL** | head · flush · merge / **symbols · series · postings** · **write-ahead log** | engine seam only; **index (symbols/series/postings) + wal implemented** |
 | L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
 | L1 **Backend** | file · s3 · memory behind one interface | **memory + file implemented**; s3 + CAS pending |
 | L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | — (package `cluster`, seam only) |
@@ -166,6 +168,41 @@ columns it references (projection pushdown without ranged reads):
   the manifest; `Column`/`Marks` read their objects lazily. An incompletely written part
   (no manifest) is not openable.
 
+## 3c. Identity & index (`index/`)
+
+The L3 indexing layer maps query matchers to the series that satisfy them.
+
+- **Identity** lives in `signal`: an `Attributes` set is the typed OTel attribute model
+  (`Value` = the AnyValue sum: string/bool/int/double/bytes/array/map, all held as
+  `[]byte` for scalars-inline + zero-alloc projection). `Attributes.Hash` is the
+  content-addressed **`SeriesID`** — a **128-bit** xxh3 of a canonical, type-tagged
+  pre-image (maps hash order-independently, arrays keep order, `int 5`/`"5"`/`5.0`/empty
+  are distinct). 128-bit because content addressing has no allocator to resolve a
+  collision. `AppendValue`/`DecodeAttributes` are the reversible binary codec (used by the
+  WAL and value interning).
+- **`index/symbols`** — a `[]byte → uint32` interning table (via `pool.ByteIntMap`,
+  no string conversion) with a CRC32C serialize/decode. Names and typed-value encodings
+  intern to small ids.
+- **`index/series`** — `SeriesID ↔ Attributes`. `Add` is idempotent (id is the hash) and
+  retains a deep copy, so a query reconstructs labels from an id and replay is dedup-safe.
+- **`index/postings`** — the inverted index, keyed on **interned symbol ids** (`nameID →
+  valueID → sorted []SeriesID`), so it is zero-alloc and **type-preserving** (the value id
+  comes from the value's typed encoding). Lazy set-op iterators (`Intersect`/`Merge`/
+  `Without` with galloping `Seek`, property-tested vs a naive reference) compose lists.
+  Matching is **callback-based**: `Select(nameID, func(valueID) bool)` hands the predicate
+  a candidate value id, which the caller decodes to a typed `signal.Value` and tests —
+  storage imports no query-language operator; negation/equality compose from the
+  primitives (`Get`/`Without`/`WithoutName`).
+
+## 3d. Write-ahead log (`wal/`)
+
+CRC-framed records (`[uvarint len][type][payload][CRC32C]`) appended to numbered segment
+files (`SegmentWriter`, rotating at a size limit). A series record carries the `SeriesID`
++ the typed attribute encoding. `ReplayDir` stitches segments in order; replay tolerates a
+torn final record (crash recovery), surfaces a bad-CRC complete record as corruption, and
+skips unknown record types (forward-compat). Replaying the log rebuilds the symbols +
+series + postings index — the path that reconstructs the head after a restart.
+
 ---
 
 ## 4. Public surface (`storage` root package)
@@ -190,7 +227,9 @@ the ingest and query paths are scaffolded and return `ErrNotImplemented`.
 ### Shared model types
 
 - **`signal`** — signal-neutral model: the `Signal` enum (`Metric`/`Log`/`Trace`/
-  `Profile`), `ParseSignal`, and `TenantID`.
+  `Profile`), `ParseSignal`, `TenantID`, and the typed identity primitives (`Value`,
+  `KeyValue`, `Attributes`, the 128-bit `SeriesID`, and the attribute binary codec) — see
+  §3c.
 - **`tenant`** — policy model: `Limits`, `Retention`, `Downsample`, and the composed
   `Policy`, resolved per tenant id through a `Resolver` (`ResolverFunc` adapter;
   `Default()` returns an empty-policy resolver). Multi-tenancy, retention, and
@@ -215,11 +254,12 @@ These hold in the implemented code and must be preserved by changes:
 - **Immutable, in-memory-first.** The in-memory/ephemeral path is first-class — every
   layer must work with no disk or object store. `backend.Memory()` is the reference
   backend.
-- **Stable formats.** The `Codec` enum, the per-stream header, each codec's framing, and
-  the part formats — the manifest (magic `OTPM`, versioned, CRC32C), the marks index
-  (`OTMK`), the per-column object framing, and the `{prefix}/manifest|marks|c/{i}` key
-  layout — are persisted/wire-stable. Changing any of them is an architectural change
-  (golden tests guard formats; bump the format version and update this file too).
+- **Stable formats.** The `Codec` enum, the per-stream header, each codec's framing, the
+  part formats (manifest `OTPM`, marks `OTMK`, per-column object framing, the
+  `{prefix}/manifest|marks|c/{i}` key layout), the **attribute hash/binary encoding** (the
+  SeriesID pre-image), the **symbol table** (`OTSY`), and the **WAL record framing** are
+  all persisted/wire-stable. Changing any of them is an architectural change (golden tests
+  guard formats; bump the version and update this file too).
 
 ### Testing discipline
 
@@ -239,13 +279,13 @@ encoding/             umbrella doc for the codec layers
   encoding/chunk      DoD / Gorilla / T64 / dict / decimal column codecs              [implemented]
   encoding/compress   zstd/none block wrapper (lz4 stub)                              [implemented]
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
-signal/               Signal enum, TenantID, ParseSignal                              [implemented]
+signal/               typed Attributes/Value, 128-bit SeriesID, codec, Signal, TenantID [implemented]
   signal/metric       metrics point types & OTLP→columnar projection                  [seam only]
 tenant/               Limits/Retention/Downsample/Policy, Resolver                     [implemented]
 backend/              Backend interface + memory (root) + file/                         [implemented; s3/bucketindex seam only]
 block/                immutable columnar part format: column/marks/manifest/part        [implemented]
-index/                postings / symbols / bloom / series identity                     [seam only]
-wal/                  write-ahead log framing                                          [seam only]
+index/                symbols (intern) · series (id↔attrs) · postings (set-ops/matchers) [implemented; bloom seam only]
+wal/                  CRC-framed segmented write-ahead log + replay                    [implemented]
 engine/               head · flush · background-merge                                  [seam only]
 query/                fetch contract · plan · exec · language front-ends               [seam only]
 cluster/              etcd ring · HRW sharding · replication · rebalance               [seam only]
