@@ -153,6 +153,37 @@ func TestSyncAndDoubleClose(t *testing.T) {
 	require.NoError(t, sw.Close(), "double close is a no-op")
 }
 
+func TestSegmentSamplesRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	s := mkSeries("a", "b")
+	id := s.Hash()
+
+	sw, err := Create(dir, 0)
+	require.NoError(t, err)
+	require.NoError(t, sw.WriteSeries(id, s))
+	require.NoError(t, sw.WriteSamples(id, []int64{1, 2}, []float64{10, 20}))
+	require.NoError(t, sw.WriteSamples(id, []int64{3}, []float64{30}))
+	require.NoError(t, sw.Close())
+
+	var gotTs []int64
+
+	var gotVal []float64
+
+	err = ReplayDir(dir, Handlers{
+		OnSamples: func(_ signal.SeriesID, ts []int64, v []float64) error {
+			gotTs = append(gotTs, ts...)
+			gotVal = append(gotVal, v...)
+
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []int64{1, 2, 3}, gotTs)
+	assert.Equal(t, []float64{10, 20, 30}, gotVal)
+}
+
 func TestReplayDirCorruptSegment(t *testing.T) {
 	t.Parallel()
 

@@ -77,6 +77,31 @@ func TestWriteReplayRoundTrip(t *testing.T) {
 	assert.True(t, s2.Equal(got[1].s))
 }
 
+func TestWriteReplaySamples(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	id := signal.SeriesID{Hi: 3, Lo: 7}
+	ts := []int64{100, 250, -5}
+	values := []float64{1.5, 2.5, -3.25}
+	require.NoError(t, NewWriter(&buf).WriteSamples(id, ts, values))
+
+	var (
+		gotID     signal.SeriesID
+		gotTs     []int64
+		gotValues []float64
+	)
+	err := Replay(buf.Bytes(), Handlers{OnSamples: func(i signal.SeriesID, t []int64, v []float64) error {
+		gotID, gotTs, gotValues = i, t, v
+
+		return nil
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, id, gotID)
+	assert.Equal(t, ts, gotTs)
+	assert.Equal(t, values, gotValues)
+}
+
 func TestTornTailRecoversPrefix(t *testing.T) {
 	t.Parallel()
 
@@ -147,6 +172,23 @@ func TestOnSeriesError(t *testing.T) {
 
 	err := Replay(buf.Bytes(), Handlers{OnSeries: func(signal.SeriesID, signal.Series) error { return errBoom }})
 	require.ErrorIs(t, err, errBoom)
+}
+
+func TestParseSamplesErrors(t *testing.T) {
+	t.Parallel()
+
+	noop := Handlers{OnSamples: func(signal.SeriesID, []int64, []float64) error { return nil }}
+
+	// Payload shorter than a SeriesID.
+	require.ErrorIs(t, Replay(appendFrame(nil, recordSamples, []byte{1, 2, 3}), noop), ErrCorrupt)
+
+	// Valid id, count claims more samples than the bytes allow.
+	tooMany := append(make([]byte, seriesIDLen), 0x05) // count=5, no samples follow
+	require.Error(t, Replay(appendFrame(nil, recordSamples, tooMany), noop))
+
+	// Valid id, count=1, a timestamp, but a truncated value (<8 bytes).
+	truncVal := append(make([]byte, seriesIDLen), 0x01, 0x02, 0x00, 0x00) // count=1, ts, 2 value bytes
+	require.Error(t, Replay(appendFrame(nil, recordSamples, truncVal), noop))
 }
 
 func TestParseSeriesErrors(t *testing.T) {

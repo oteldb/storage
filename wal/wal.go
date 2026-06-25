@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"io"
+	"math"
 
 	"github.com/go-faster/errors"
 
@@ -13,7 +14,8 @@ import (
 // Record type tags. New types may be appended; unknown types are skipped on replay so
 // an old reader tolerates a newer log.
 const (
-	recordSeries byte = 1
+	recordSeries  byte = 1
+	recordSamples byte = 2
 )
 
 // seriesIDLen is the fixed 16-byte big-endian width of a [signal.SeriesID] on the wire.
@@ -25,9 +27,10 @@ var ErrCorrupt = errors.New("wal: corrupt record")
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 // Handlers receives decoded records during [Replay]. Unset handlers skip their record
-// type. More handlers (samples, …) are added as later milestones add record types.
+// type.
 type Handlers struct {
-	OnSeries func(id signal.SeriesID, s signal.Series) error
+	OnSeries  func(id signal.SeriesID, s signal.Series) error
+	OnSamples func(id signal.SeriesID, ts []int64, values []float64) error
 }
 
 // Writer appends framed records to an [io.Writer] (typically a segment file). It reuses
@@ -52,6 +55,29 @@ func (wr *Writer) WriteSeries(id signal.SeriesID, s signal.Series) error {
 	}
 
 	return nil
+}
+
+// WriteSamples logs a run of samples for one series: its [signal.SeriesID] then the
+// (timestamp, value) pairs. ts and values must have the same length.
+func (wr *Writer) WriteSamples(id signal.SeriesID, ts []int64, values []float64) error {
+	wr.payload = appendSamples(id.AppendBinary(wr.payload[:0]), ts, values)
+	wr.frame = appendFrame(wr.frame[:0], recordSamples, wr.payload)
+
+	if _, err := wr.w.Write(wr.frame); err != nil {
+		return errors.Wrap(err, "write record")
+	}
+
+	return nil
+}
+
+func appendSamples(dst []byte, ts []int64, values []float64) []byte {
+	dst = binary.AppendUvarint(dst, uint64(len(ts)))
+	for i := range ts {
+		dst = binary.AppendVarint(dst, ts[i])
+		dst = binary.BigEndian.AppendUint64(dst, math.Float64bits(values[i]))
+	}
+
+	return dst
 }
 
 // Replay reads every complete record from data and dispatches it to h. It stops cleanly
@@ -92,6 +118,17 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 		}
 
 		return h.OnSeries(id, s)
+	case recordSamples:
+		if h.OnSamples == nil {
+			return nil
+		}
+
+		id, ts, values, err := parseSamples(payload)
+		if err != nil {
+			return err
+		}
+
+		return h.OnSamples(id, ts, values)
 	default:
 		return nil // unknown record type: skip for forward compatibility
 	}
@@ -152,4 +189,46 @@ func parseSeries(payload []byte) (signal.SeriesID, signal.Series, error) {
 	}
 
 	return id, s, nil
+}
+
+// parseSamples decodes a samples record payload: a 16-byte SeriesID then a uvarint count
+// and that many (varint timestamp, float64 value) pairs. Bounds-checked; never panics.
+func parseSamples(payload []byte) (signal.SeriesID, []int64, []float64, error) {
+	if len(payload) < seriesIDLen {
+		return signal.SeriesID{}, nil, nil, errors.Wrap(ErrCorrupt, "samples record too short")
+	}
+
+	id := signal.SeriesID{
+		Hi: binary.BigEndian.Uint64(payload[:8]),
+		Lo: binary.BigEndian.Uint64(payload[8:seriesIDLen]),
+	}
+
+	rest := payload[seriesIDLen:]
+
+	n, k := binary.Uvarint(rest)
+	if k <= 0 || n > uint64(len(rest)) { // ≥1 byte per sample guards against OOM
+		return signal.SeriesID{}, nil, nil, errors.Wrap(ErrCorrupt, "sample count")
+	}
+
+	off := k
+	ts := make([]int64, 0, n)
+	values := make([]float64, 0, n)
+
+	for range n {
+		t, kt := binary.Varint(rest[off:])
+		if kt <= 0 {
+			return signal.SeriesID{}, nil, nil, errors.Wrap(ErrCorrupt, "sample timestamp")
+		}
+
+		off += kt
+		if len(rest)-off < 8 {
+			return signal.SeriesID{}, nil, nil, errors.Wrap(ErrCorrupt, "sample value")
+		}
+
+		values = append(values, math.Float64frombits(binary.BigEndian.Uint64(rest[off:])))
+		off += 8
+		ts = append(ts, t)
+	}
+
+	return id, ts, values, nil
 }
