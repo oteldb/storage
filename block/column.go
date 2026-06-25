@@ -24,6 +24,7 @@ type Column struct {
 	Int64    []int64
 	Float64  []float64
 	Bytes    [][]byte
+	Int128   []chunk.U128
 	Codec    chunk.Codec
 	Compress compress.Algorithm
 }
@@ -37,6 +38,8 @@ func (c Column) rows() int {
 		return len(c.Float64)
 	case KindBytes:
 		return len(c.Bytes)
+	case KindInt128:
+		return len(c.Int128)
 	default:
 		return 0
 	}
@@ -50,6 +53,8 @@ func defaultCodec(k Kind) chunk.Codec {
 		return chunk.CodecT64
 	case KindFloat64:
 		return chunk.CodecGorilla
+	case KindInt128:
+		return chunk.CodecID128
 	default:
 		return chunk.CodecDict
 	}
@@ -78,6 +83,9 @@ func buildColumn(c Column, comp *compress.Compressor) (ColumnDesc, []byte, error
 		fillFloat64Stats(&desc, c.Float64)
 	case KindBytes:
 		fillBytesConst(&desc, c.Bytes)
+	case KindInt128:
+		// No stats and never constant-collapsed: the RLE codec already shrinks a
+		// single-id column to a handful of bytes, and id columns carry no min/max.
 	}
 
 	if desc.Const {
@@ -104,6 +112,8 @@ func encodeStream(c Column, codec chunk.Codec) ([]byte, error) {
 		return chunk.EncodeFloatsDecimal(nil, c.Float64, decimalPrecisionLossless), nil
 	case c.Kind == KindBytes && codec == chunk.CodecDict:
 		return chunk.EncodeBytes(nil, c.Bytes), nil
+	case c.Kind == KindInt128 && codec == chunk.CodecID128:
+		return chunk.EncodeU128(nil, c.Int128), nil
 	default:
 		return nil, errors.Errorf("block: codec %s invalid for kind %s", codec, c.Kind)
 	}
@@ -278,6 +288,24 @@ func (r *ColumnReader) Float64(dst []float64) ([]float64, error) {
 	}
 
 	return decodeColumn(r, dst, dec)
+}
+
+// ID128 decodes the column into dst (reusing its capacity) and returns the result. It
+// errors if the column is not [KindInt128]. Id columns are never constant-collapsed, so
+// the value always comes from the decoded RLE stream.
+func (r *ColumnReader) ID128(dst []chunk.U128) ([]chunk.U128, error) {
+	if r.desc.Kind != KindInt128 {
+		return nil, errors.Errorf("block: column %q is %s, not int128", r.desc.Name, r.desc.Kind)
+	}
+
+	stream, err := r.stream()
+	if err != nil {
+		return nil, err
+	}
+
+	out, _, err := chunk.DecodeU128(dst[:0], stream)
+
+	return out, err
 }
 
 // fillConst materializes a constant column: n copies of v into dst (reusing capacity).

@@ -45,6 +45,9 @@ func sampleManifest() Manifest {
 			{
 				Name: "name", Kind: KindBytes, Codec: chunk.CodecDict, Compress: compress.AlgorithmZSTD,
 			},
+			{
+				Name: "series", Kind: KindInt128, Codec: chunk.CodecID128, Compress: compress.AlgorithmNone,
+			},
 		},
 	}
 }
@@ -208,6 +211,7 @@ func TestKindString(t *testing.T) {
 	assert.Equal(t, "int64", KindInt64.String())
 	assert.Equal(t, "float64", KindFloat64.String())
 	assert.Equal(t, "bytes", KindBytes.String())
+	assert.Equal(t, "int128", KindInt128.String())
 	assert.Equal(t, "unknown", Kind(99).String())
 }
 

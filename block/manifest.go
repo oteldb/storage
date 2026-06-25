@@ -24,6 +24,9 @@ const (
 	KindFloat64
 	// KindBytes is a []byte column (low-cardinality attributes, strings).
 	KindBytes
+	// KindInt128 is a 128-bit id column ([chunk.U128]), e.g. the SeriesID sort key of a
+	// metric part. RLE-coded; carries no min/max or constant value in the manifest.
+	KindInt128
 )
 
 // String returns a stable lower-case kind name.
@@ -35,12 +38,14 @@ func (k Kind) String() string {
 		return "float64"
 	case KindBytes:
 		return "bytes"
+	case KindInt128:
+		return "int128"
 	default:
 		return "unknown"
 	}
 }
 
-func (k Kind) valid() bool { return k <= KindBytes }
+func (k Kind) valid() bool { return k <= KindInt128 }
 
 // manifest framing constants. The manifest is the last object written for a part
 // (the commit point) and is the entry point a reader parses first.
@@ -144,6 +149,8 @@ func (m Manifest) Encode(dst []byte) []byte {
 				w.WriteUvarint(uint64(len(c.ConstBytes)))
 				w.WriteBytes(c.ConstBytes)
 			}
+		case KindInt128:
+			// No min/max or constant value: id columns are never constant-collapsed.
 		}
 	}
 
@@ -286,6 +293,8 @@ func decodeColumnDesc(r *bitstream.Reader) (ColumnDesc, error) {
 		err = decodeFloat64Col(r, &c)
 	case KindBytes:
 		err = decodeBytesCol(r, &c)
+	case KindInt128:
+		// No per-column metadata: id columns carry no min/max or constant value.
 	}
 
 	if err != nil {

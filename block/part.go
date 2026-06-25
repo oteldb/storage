@@ -112,13 +112,15 @@ func (w *PartWriter) build() (builtPart, error) {
 	descs := make([]ColumnDesc, len(w.columns))
 	objects := make([][]byte, len(w.columns))
 
-	for i, c := range w.columns {
+	for i := range w.columns {
+		c := &w.columns[i]
+
 		alg := c.Compress
 		if alg == compress.AlgorithmNone {
 			alg = w.defaultComp
 		}
 
-		desc, obj, err := buildColumn(c, w.compressorFor(alg))
+		desc, obj, err := buildColumn(*c, w.compressorFor(alg))
 		if err != nil {
 			return builtPart{}, errors.Wrapf(err, "column %q", c.Name)
 		}
@@ -146,7 +148,8 @@ func (w *PartWriter) build() (builtPart, error) {
 // sortKeyIndex returns the index of the sort-key column: the one named by [WithSortKey],
 // or the first int64 column if unnamed, or -1 if there is no int64 column.
 func (w *PartWriter) sortKeyIndex() int {
-	for i, c := range w.columns {
+	for i := range w.columns {
+		c := &w.columns[i]
 		if w.sortKey != "" {
 			if c.Name == w.sortKey && c.Kind == KindInt64 {
 				return i

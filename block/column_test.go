@@ -185,6 +185,42 @@ func TestColumnWrongAccessor(t *testing.T) {
 	assert.Nil(t, v)
 }
 
+func TestColumnInt128RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	// Runs of one id then another — the metric series sort-key shape.
+	vals := []chunk.U128{{Lo: 5}, {Lo: 5}, {Lo: 5}, {Hi: 1, Lo: 0}, {Hi: 9, Lo: 9}}
+	for _, comp := range []*compress.Compressor{noneComp(), zstdComp()} {
+		desc, obj, err := buildColumn(Column{Name: "series", Kind: KindInt128, Int128: vals}, comp)
+		require.NoError(t, err)
+		assert.False(t, desc.Const, "id columns are never constant-collapsed")
+		assert.Equal(t, chunk.CodecID128, desc.Codec)
+
+		r := newColumnReader(desc, obj, comp, len(vals))
+		assert.Equal(t, KindInt128, r.Kind())
+
+		got, err := r.ID128(nil)
+		require.NoError(t, err)
+		assert.Equal(t, vals, got)
+
+		// Wrong-kind accessors must error; it is never constant.
+		_, err = r.Int64(nil)
+		require.Error(t, err)
+		_, ok := r.Const()
+		assert.False(t, ok)
+	}
+}
+
+func TestColumnInt128WrongAccessor(t *testing.T) {
+	t.Parallel()
+
+	desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: []float64{1, 2}}, noneComp())
+	require.NoError(t, err)
+
+	_, err = newColumnReader(desc, obj, noneComp(), 2).ID128(nil)
+	require.Error(t, err, "ID128 on a float column must error")
+}
+
 func TestColumnKindAccessors(t *testing.T) {
 	t.Parallel()
 
