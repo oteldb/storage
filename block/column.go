@@ -1,0 +1,345 @@
+package block
+
+import (
+	"bytes"
+	"math"
+
+	"github.com/go-faster/errors"
+
+	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/encoding/compress"
+)
+
+// decimalPrecisionLossless is the precision passed to the scaled-decimal codec when a
+// float column opts into [chunk.CodecDecimal]: full precision (lossless).
+const decimalPrecisionLossless = 64
+
+// Column is an input column for a part: a name, a physical [Kind], and the matching
+// typed slice (exactly one of Int64/Float64/Bytes per Kind). Codec and Compress are
+// optional overrides; the zero values select the per-kind default codec and no block
+// compression (the chunk codecs already compress well).
+type Column struct {
+	Name     string
+	Kind     Kind
+	Int64    []int64
+	Float64  []float64
+	Bytes    [][]byte
+	Codec    chunk.Codec
+	Compress compress.Algorithm
+}
+
+// rows returns the column's row count from the active typed slice.
+func (c Column) rows() int {
+	switch c.Kind {
+	case KindInt64:
+		return len(c.Int64)
+	case KindFloat64:
+		return len(c.Float64)
+	case KindBytes:
+		return len(c.Bytes)
+	default:
+		return 0
+	}
+}
+
+// defaultCodec is the codec used when [Column.Codec] is unset (CodecNone). The
+// timestamp/sort column overrides this to [chunk.CodecDoD] via the part writer.
+func defaultCodec(k Kind) chunk.Codec {
+	switch k {
+	case KindInt64:
+		return chunk.CodecT64
+	case KindFloat64:
+		return chunk.CodecGorilla
+	default:
+		return chunk.CodecDict
+	}
+}
+
+// buildColumn computes a column's descriptor and serialized object. A constant column
+// collapses to its descriptor with no object (the value lives in the manifest); every
+// other column is a chunk-codec stream wrapped in comp's block frame. comp selects the
+// block-compression algorithm recorded in the descriptor.
+func buildColumn(c Column, comp *compress.Compressor) (ColumnDesc, []byte, error) {
+	if !c.Kind.valid() {
+		return ColumnDesc{}, nil, errors.Errorf("block: column %q has invalid kind %d", c.Name, c.Kind)
+	}
+
+	codec := c.Codec
+	if codec == chunk.CodecNone {
+		codec = defaultCodec(c.Kind)
+	}
+
+	desc := ColumnDesc{Name: c.Name, Kind: c.Kind, Codec: codec, Compress: comp.Algorithm()}
+
+	switch c.Kind {
+	case KindInt64:
+		fillInt64Stats(&desc, c.Int64)
+	case KindFloat64:
+		fillFloat64Stats(&desc, c.Float64)
+	case KindBytes:
+		fillBytesConst(&desc, c.Bytes)
+	}
+
+	if desc.Const {
+		return desc, nil, nil
+	}
+
+	stream, err := encodeStream(c, codec)
+	if err != nil {
+		return ColumnDesc{}, nil, err
+	}
+
+	return desc, comp.Compress(nil, stream), nil
+}
+
+func encodeStream(c Column, codec chunk.Codec) ([]byte, error) {
+	switch {
+	case c.Kind == KindInt64 && codec == chunk.CodecDoD:
+		return chunk.EncodeTimestamps(nil, c.Int64), nil
+	case c.Kind == KindInt64 && codec == chunk.CodecT64:
+		return chunk.EncodeIntsT64(nil, c.Int64), nil
+	case c.Kind == KindFloat64 && codec == chunk.CodecGorilla:
+		return chunk.EncodeFloats(nil, c.Float64), nil
+	case c.Kind == KindFloat64 && codec == chunk.CodecDecimal:
+		return chunk.EncodeFloatsDecimal(nil, c.Float64, decimalPrecisionLossless), nil
+	case c.Kind == KindBytes && codec == chunk.CodecDict:
+		return chunk.EncodeBytes(nil, c.Bytes), nil
+	default:
+		return nil, errors.Errorf("block: codec %s invalid for kind %s", codec, c.Kind)
+	}
+}
+
+func fillInt64Stats(d *ColumnDesc, vals []int64) {
+	if len(vals) == 0 {
+		return
+	}
+
+	lo, hi := vals[0], vals[0]
+	for _, v := range vals[1:] {
+		if v < lo {
+			lo = v
+		}
+
+		if v > hi {
+			hi = v
+		}
+	}
+
+	d.MinInt64, d.MaxInt64 = lo, hi
+	if lo == hi {
+		d.Const = true
+		d.ConstInt64 = lo
+	}
+}
+
+func fillFloat64Stats(d *ColumnDesc, vals []float64) {
+	if len(vals) == 0 {
+		return
+	}
+
+	firstBits := math.Float64bits(vals[0])
+	allSame := true
+
+	var lo, hi float64
+
+	haveReal := false
+
+	for _, v := range vals {
+		if math.Float64bits(v) != firstBits {
+			allSame = false
+		}
+
+		if math.IsNaN(v) {
+			continue
+		}
+
+		if !haveReal {
+			lo, hi, haveReal = v, v, true
+
+			continue
+		}
+
+		if v < lo {
+			lo = v
+		}
+
+		if v > hi {
+			hi = v
+		}
+	}
+
+	if !haveReal { // all-NaN column
+		lo, hi = vals[0], vals[0]
+	}
+
+	d.MinFloat64, d.MaxFloat64 = lo, hi
+	if allSame {
+		d.Const = true
+		d.ConstFloat64 = vals[0]
+	}
+}
+
+func fillBytesConst(d *ColumnDesc, vals [][]byte) {
+	if len(vals) == 0 {
+		return
+	}
+
+	for _, v := range vals[1:] {
+		if !bytes.Equal(v, vals[0]) {
+			return
+		}
+	}
+
+	d.Const = true
+	d.ConstBytes = append([]byte(nil), vals[0]...)
+}
+
+// ColumnReader gives lazy, decode-on-demand access to one column of a part. Constant
+// columns are synthesized from the manifest with no I/O; other columns are decompressed
+// and decoded only when an accessor is called (DESIGN.md §7: decode only what the query
+// touches). It is created by [PartReader.Column].
+type ColumnReader struct {
+	desc   ColumnDesc
+	object []byte // compress-framed stream; nil for a constant column
+	comp   *compress.Compressor
+	rows   int
+}
+
+func newColumnReader(desc ColumnDesc, object []byte, comp *compress.Compressor, rows int) *ColumnReader {
+	return &ColumnReader{desc: desc, object: object, comp: comp, rows: rows}
+}
+
+// Kind reports the column's physical type.
+func (r *ColumnReader) Kind() Kind { return r.desc.Kind }
+
+// Len reports the column's row count.
+func (r *ColumnReader) Len() int { return r.rows }
+
+// Const returns the column's constant value (int64/float64/[]byte per Kind) and true if
+// the column was constant-collapsed; otherwise (nil, false).
+func (r *ColumnReader) Const() (any, bool) {
+	if !r.desc.Const {
+		return nil, false
+	}
+
+	switch r.desc.Kind {
+	case KindInt64:
+		return r.desc.ConstInt64, true
+	case KindFloat64:
+		return r.desc.ConstFloat64, true
+	default:
+		return r.desc.ConstBytes, true
+	}
+}
+
+// Int64 decodes the column into dst (reusing its capacity) and returns the result.
+// It errors if the column is not [KindInt64].
+func (r *ColumnReader) Int64(dst []int64) ([]int64, error) {
+	if r.desc.Kind != KindInt64 {
+		return nil, errors.Errorf("block: column %q is %s, not int64", r.desc.Name, r.desc.Kind)
+	}
+
+	if r.desc.Const {
+		return fillConst(dst, r.rows, r.desc.ConstInt64), nil
+	}
+
+	var dec func([]int64, []byte) ([]int64, int, error)
+
+	switch r.desc.Codec {
+	case chunk.CodecDoD:
+		dec = chunk.DecodeTimestamps
+	case chunk.CodecT64:
+		dec = chunk.DecodeIntsT64
+	default: // dec stays nil ⇒ decodeColumn reports the bad codec
+	}
+
+	return decodeColumn(r, dst, dec)
+}
+
+// Float64 decodes the column into dst (reusing its capacity) and returns the result.
+// It errors if the column is not [KindFloat64].
+func (r *ColumnReader) Float64(dst []float64) ([]float64, error) {
+	if r.desc.Kind != KindFloat64 {
+		return nil, errors.Errorf("block: column %q is %s, not float64", r.desc.Name, r.desc.Kind)
+	}
+
+	if r.desc.Const {
+		return fillConst(dst, r.rows, r.desc.ConstFloat64), nil
+	}
+
+	var dec func([]float64, []byte) ([]float64, int, error)
+
+	switch r.desc.Codec {
+	case chunk.CodecGorilla:
+		dec = chunk.DecodeFloats
+	case chunk.CodecDecimal:
+		dec = chunk.DecodeFloatsDecimal
+	default: // dec stays nil ⇒ decodeColumn reports the bad codec
+	}
+
+	return decodeColumn(r, dst, dec)
+}
+
+// fillConst materializes a constant column: n copies of v into dst (reusing capacity).
+func fillConst[T any](dst []T, n int, v T) []T {
+	dst = dst[:0]
+	for range n {
+		dst = append(dst, v)
+	}
+
+	return dst
+}
+
+// decodeColumn decompresses the column object and runs the selected typed decoder. A nil
+// decoder means the descriptor's codec does not match the column's kind.
+func decodeColumn[T any](r *ColumnReader, dst []T, dec func([]T, []byte) ([]T, int, error)) ([]T, error) {
+	if dec == nil {
+		return nil, errors.Errorf("block: codec %s invalid for column %q", r.desc.Codec, r.desc.Name)
+	}
+
+	stream, err := r.stream()
+	if err != nil {
+		return nil, err
+	}
+
+	out, _, err := dec(dst[:0], stream)
+
+	return out, err
+}
+
+// Bytes decodes the column into its split [chunk.DictColumn] form (unique entries + a
+// per-row id array), deferring the per-row gather to [chunk.DictColumn.At]. A constant
+// column is synthesized as a single-entry dictionary. It errors if the column is not
+// [KindBytes].
+func (r *ColumnReader) Bytes() (*chunk.DictColumn, error) {
+	if r.desc.Kind != KindBytes {
+		return nil, errors.Errorf("block: column %q is %s, not bytes", r.desc.Name, r.desc.Kind)
+	}
+
+	if r.desc.Const {
+		return &chunk.DictColumn{
+			Entries: [][]byte{r.desc.ConstBytes},
+			IDs:     make([]byte, r.rows), // all zero ⇒ every row maps to the single entry
+			IDWidth: 1,
+		}, nil
+	}
+
+	stream, err := r.stream()
+	if err != nil {
+		return nil, err
+	}
+
+	dc, _, err := chunk.DecodeBytesDict(stream)
+
+	return dc, err
+}
+
+// stream decompresses the column's block frame into its raw codec stream.
+func (r *ColumnReader) stream() ([]byte, error) {
+	out, err := r.comp.Decompress(nil, r.object)
+	if err != nil {
+		return nil, errors.Wrapf(err, "decompress column %q", r.desc.Name)
+	}
+
+	return out, nil
+}
