@@ -81,6 +81,38 @@ func (w *Writer) WriteByte(b byte) error {
 	return nil
 }
 
+// WriteBytes appends a slice of bytes. When the writer is byte-aligned (the common
+// case after [PadToByte] or a whole-byte field), this is a single append — the fast
+// path for bulk byte writes like dictionary entries and row-id arrays. When not
+// aligned, it falls back to per-byte [WriteByte].
+//
+// Go's `append([]byte, string...)` is a compiler special case that avoids a copy, so
+// callers may pass a string directly: w.WriteBytes([]byte(s)) is still a copy, but
+// w.stream = append(w.stream, s...) is not. For the zero-copy string path, use
+// [Writer.AppendString] instead.
+func (w *Writer) WriteBytes(p []byte) {
+	if w.count == 0 {
+		w.stream = append(w.stream, p...)
+		return
+	}
+	for _, b := range p {
+		_ = w.WriteByte(b)
+	}
+}
+
+// AppendString appends a string's bytes directly when byte-aligned, with no copy
+// (append([]byte, string...) is a compiler intrinsic). Falls back to per-byte
+// [WriteByte] when not aligned.
+func (w *Writer) AppendString(s string) {
+	if w.count == 0 {
+		w.stream = append(w.stream, s...)
+		return
+	}
+	for i := 0; i < len(s); i++ {
+		_ = w.WriteByte(s[i])
+	}
+}
+
 // WriteBits appends the nbits least-significant bits of u, MSB-first within the
 // field. nbits must be in [0, 64]; WriteBits(0, 0) is a no-op.
 //
@@ -280,6 +312,37 @@ func (r *Reader) ReadByte() (byte, error) {
 		return 0, err
 	}
 	return byte(v), nil
+}
+
+// ReadBytes reads n bytes into p (which must have length n) when the reader is
+// byte-aligned, which is the common case after [AlignToByte] or a whole-byte field.
+// When not aligned, it falls back to per-byte [ReadByte]. This is the bulk read path
+// for dictionary entries and row-id arrays.
+func (r *Reader) ReadBytes(p []byte) error {
+	// Align first: drop any partial-buffer bits so we can read from the stream
+	// directly.
+	r.AlignToByte()
+	// If we have buffered bytes (from a refill), drain them first.
+	for len(p) > 0 && r.valid >= 8 {
+		bits := r.buffer >> (r.valid - 8)
+		p[0] = byte(bits)
+		p = p[1:]
+		r.valid -= 8
+	}
+	if len(p) == 0 {
+		return nil
+	}
+	// Read remaining bytes directly from the stream.
+	avail := len(r.stream) - r.offset
+	if avail < len(p) {
+		return io.EOF
+	}
+	copy(p, r.stream[r.offset:r.offset+len(p)])
+	r.offset += len(p)
+	// Reset buffer state since we've consumed past it.
+	r.buffer = 0
+	r.valid = 0
+	return nil
 }
 
 // ReadUvarint reads an unsigned varint (7 bits per byte, continuation in the high

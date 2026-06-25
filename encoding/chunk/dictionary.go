@@ -7,75 +7,86 @@ import "github.com/oteldb/storage/encoding/bitstream"
 // thresholds (DESIGN.md §6: "≤256 distinct → 1 byte/row").
 const maxDictSize = 256
 
+// Dictionary format flag bytes (full byte, not a single bit, so all subsequent bulk
+// writes stay byte-aligned for the fast [bitstream.Writer.AppendString]/
+// [bitstream.Writer.WriteBytes] paths).
+const (
+	flagFlat byte = 0x00 // no dictionary, strings stored inline
+	flagDict byte = 0x01 // dictionary mode
+)
+
 // EncodeStrings appends a dictionary-encoded string column to dst and returns the
 // extended slice (DESIGN.md §6, §14 M0).
 //
-// Layout: [uvarint rows] [uvarint dictSize] [dict entries] [row ids]
+// Layout: [uvarint rows] [1 byte flag] [payload]
 //
-// For dictSize ≤ 256, each row id is 1 byte. For dictSize ≤ 65536, each row id is
-// 2 bytes (big-endian). Above that, the dictionary is abandoned and values are stored
-// as length-prefixed (uvarint) strings — the "flat" fallback.
+// flagDict payload: [uvarint dictSize] [dict entries: per entry uvarint len + bytes]
+// [row ids: 1 byte each if dictSize ≤ 256, else 2 bytes big-endian each]
 //
-// Dictionary entries are length-prefixed (uvarint length + bytes), concatenated.
-// The flat fallback is: [uvarint rows] then per row [uvarint len][bytes].
+// flagFlat payload: per row [uvarint len][bytes] (the flat fallback for >65536 distinct).
+//
+// Dictionary entries are deduplicated in insertion order. The full-byte flag (not a
+// single bit) keeps the writer byte-aligned so dictionary-entry string data and row-id
+// arrays are written as bulk appends (zero-copy via append([]byte, string...)).
 func EncodeStrings(dst []byte, vals []string) []byte {
-	// Build the dictionary.
-	dict := make(map[string]int, len(vals))
-	ids := make([]int, len(vals))
-	size := 0
-	for i, s := range vals {
-		if _, ok := dict[s]; !ok {
-			dict[s] = size
-			size++
-		}
-		ids[i] = dict[s]
-	}
-
 	w := bitstream.NewWriter(dst)
 	w.WriteUvarint(uint64(len(vals)))
 
-	if size == 0 {
+	if len(vals) == 0 {
 		w.PadToByte()
 		return w.Bytes()
 	}
+
+	// Single-pass dictionary build: one map lookup per string, collect entries in
+	// insertion order to avoid a reverse map iteration.
+	dict := make(map[string]int, min(len(vals), 256))
+	entries := make([]string, 0, min(len(vals), 256))
+	ids := make([]int, len(vals))
+	for i, s := range vals {
+		id, ok := dict[s]
+		if !ok {
+			id = len(entries)
+			dict[s] = id
+			entries = append(entries, s)
+		}
+		ids[i] = id
+	}
+	size := len(entries)
 
 	if size > 65536 {
 		// Flat fallback: no dictionary, store each string inline.
-		w.WriteBit(false) // flag: no dictionary
+		_ = w.WriteByte(flagFlat)
 		for _, s := range vals {
 			w.WriteUvarint(uint64(len(s)))
-			for _, b := range []byte(s) {
-				_ = w.WriteByte(b)
-			}
+			w.AppendString(s)
 		}
 		w.PadToByte()
 		return w.Bytes()
 	}
 
-	// Dictionary mode.
-	w.WriteBit(true) // flag: dictionary present
+	// Dictionary mode. Flag is a full byte so everything after stays byte-aligned.
+	_ = w.WriteByte(flagDict)
 	w.WriteUvarint(uint64(size))
-	// Write dictionary entries (deduplicated, in insertion order).
-	entries := make([]string, size)
-	for s, id := range dict {
-		entries[id] = s
-	}
+	// Write dictionary entries: length-prefixed (uvarint) + string bytes (bulk append,
+	// zero-copy via append([]byte, string...)).
 	for _, s := range entries {
 		w.WriteUvarint(uint64(len(s)))
-		for _, b := range []byte(s) {
-			_ = w.WriteByte(b)
-		}
+		w.AppendString(s)
 	}
-	// Write row ids.
+	// Write row ids as a bulk byte array (byte-aligned here).
 	if size <= maxDictSize {
-		for _, id := range ids {
-			_ = w.WriteByte(byte(id))
+		idBytes := make([]byte, len(ids))
+		for i, id := range ids {
+			idBytes[i] = byte(id)
 		}
+		w.WriteBytes(idBytes)
 	} else {
-		for _, id := range ids {
-			_ = w.WriteByte(byte(id >> 8))
-			_ = w.WriteByte(byte(id))
+		idBytes := make([]byte, len(ids)*2)
+		for i, id := range ids {
+			idBytes[i*2] = byte(id >> 8)
+			idBytes[i*2+1] = byte(id)
 		}
+		w.WriteBytes(idBytes)
 	}
 	w.PadToByte()
 	return w.Bytes()
@@ -95,12 +106,12 @@ func DecodeStrings(dst []string, src []byte) ([]string, int, error) {
 	}
 	dst = dst[:rows]
 
-	hasDict, err := r.ReadBit()
+	flag, err := r.ReadByte()
 	if err != nil {
 		return dst, 0, err
 	}
 
-	if !hasDict {
+	if flag == flagFlat {
 		// Flat fallback.
 		for i := range rows {
 			ln, err := r.ReadUvarint()
@@ -108,12 +119,8 @@ func DecodeStrings(dst []string, src []byte) ([]string, int, error) {
 				return dst, 0, err
 			}
 			buf := make([]byte, ln)
-			for j := range buf {
-				b, err := r.ReadBits(8)
-				if err != nil {
-					return dst, 0, err
-				}
-				buf[j] = byte(b)
+			if err := r.ReadBytes(buf); err != nil {
+				return dst, 0, err
 			}
 			dst[i] = string(buf)
 		}
@@ -132,35 +139,27 @@ func DecodeStrings(dst []string, src []byte) ([]string, int, error) {
 			return dst, 0, err
 		}
 		buf := make([]byte, ln)
-		for j := range buf {
-			b, err := r.ReadBits(8)
-			if err != nil {
-				return dst, 0, err
-			}
-			buf[j] = byte(b)
+		if err := r.ReadBytes(buf); err != nil {
+			return dst, 0, err
 		}
 		entries[i] = string(buf)
 	}
 
 	if dictSize <= maxDictSize {
+		idBuf := make([]byte, rows)
+		if err := r.ReadBytes(idBuf); err != nil {
+			return dst, 0, err
+		}
 		for i := range rows {
-			id, err := r.ReadBits(8)
-			if err != nil {
-				return dst, 0, err
-			}
-			dst[i] = entries[id]
+			dst[i] = entries[idBuf[i]]
 		}
 	} else {
+		idBuf := make([]byte, rows*2)
+		if err := r.ReadBytes(idBuf); err != nil {
+			return dst, 0, err
+		}
 		for i := range rows {
-			hi, err := r.ReadBits(8)
-			if err != nil {
-				return dst, 0, err
-			}
-			lo, err := r.ReadBits(8)
-			if err != nil {
-				return dst, 0, err
-			}
-			dst[i] = entries[(hi<<8)|lo]
+			dst[i] = entries[(uint16(idBuf[i*2])<<8)|uint16(idBuf[i*2+1])]
 		}
 	}
 

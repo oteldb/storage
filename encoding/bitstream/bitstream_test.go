@@ -400,3 +400,97 @@ func TestReaderResetOnEmpty(t *testing.T) {
 		t.Fatalf("ReadBit after Reset(nil): %v, want EOF", err)
 	}
 }
+
+// TestWriteBytes verifies bulk byte writes, both aligned and unaligned.
+func TestWriteBytes(t *testing.T) {
+	t.Parallel()
+	// Aligned: single append.
+	w := NewWriter(nil)
+	w.WriteBits(0xff, 8) // byte-align
+	w.WriteBytes([]byte{1, 2, 3, 4})
+	r := NewReader(w.Bytes())
+	v, _ := r.ReadBits(8)
+	if v != 0xff {
+		t.Fatalf("prefix = %#x", v)
+	}
+	buf := make([]byte, 4)
+	if err := r.ReadBytes(buf); err != nil {
+		t.Fatalf("ReadBytes: %v", err)
+	}
+	if !bytes.Equal(buf, []byte{1, 2, 3, 4}) {
+		t.Fatalf("ReadBytes = %v", buf)
+	}
+
+	// Unaligned: falls back to per-byte WriteByte. The byte gets split across
+	// the boundary, so we read it back bit-by-bit through ReadBits, not via
+	// AlignToByte + ReadByte.
+	w = NewWriter(nil)
+	w.WriteBits(0b101, 3) // not aligned
+	w.WriteBytes([]byte{0xaa})
+	r = NewReader(w.Bytes())
+	v, _ = r.ReadBits(3)
+	if v != 0b101 {
+		t.Fatalf("prefix = %#x", v)
+	}
+	// Read the 8 bits of 0xaa back through the bit reader (they span the boundary).
+	b, err := r.ReadBits(8)
+	if err != nil {
+		t.Fatalf("ReadBits(8): %v", err)
+	}
+	if byte(b) != 0xaa {
+		t.Fatalf("byte = %#x, want 0xaa", byte(b))
+	}
+}
+
+// TestAppendString verifies zero-copy string append when aligned.
+func TestAppendString(t *testing.T) {
+	t.Parallel()
+	w := NewWriter(nil)
+	w.WriteBits(0xff, 8) // byte-align
+	w.AppendString("hello")
+	r := NewReader(w.Bytes())
+	v, _ := r.ReadBits(8)
+	if v != 0xff {
+		t.Fatalf("prefix = %#x", v)
+	}
+	buf := make([]byte, 5)
+	if err := r.ReadBytes(buf); err != nil {
+		t.Fatalf("ReadBytes: %v", err)
+	}
+	if string(buf) != "hello" {
+		t.Fatalf("ReadBytes = %q", buf)
+	}
+}
+
+// TestReadBytesEOF verifies ReadBytes returns EOF when not enough data.
+func TestReadBytesEOF(t *testing.T) {
+	t.Parallel()
+	r := NewReader([]byte{0x01, 0x02})
+	buf := make([]byte, 10)
+	if err := r.ReadBytes(buf); err == nil {
+		t.Fatal("expected EOF from ReadBytes past end")
+	}
+}
+
+// TestReadBytesPartialBuffer verifies ReadBytes drains the refill buffer first.
+func TestReadBytesPartialBuffer(t *testing.T) {
+	t.Parallel()
+	data := make([]byte, 20)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	r := NewReader(data)
+	// Read a few bits to prime the buffer with a partial byte.
+	_, _ = r.ReadBits(4)
+	// Now read 10 bytes: should align, drain buffered bytes, then read from stream.
+	buf := make([]byte, 10)
+	if err := r.ReadBytes(buf); err != nil {
+		t.Fatalf("ReadBytes: %v", err)
+	}
+	// After 4 bits + align, we're at byte 1. So buf should be data[1:11].
+	for i := range buf {
+		if buf[i] != byte(i+1) {
+			t.Fatalf("buf[%d] = %d, want %d", i, buf[i], i+1)
+		}
+	}
+}
