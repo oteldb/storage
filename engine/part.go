@@ -33,6 +33,23 @@ type part struct {
 	ranges map[signal.SeriesID]rowRange
 }
 
+// deletePart removes every backend object of the part at prefix (manifest, marks, and
+// column objects), found by listing the prefix.
+func deletePart(ctx context.Context, b backend.Backend, prefix string) error {
+	keys, err := b.List(ctx, prefix)
+	if err != nil {
+		return err
+	}
+
+	for _, k := range keys {
+		if err := b.Delete(ctx, k); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // openPart opens the part at prefix and builds its SeriesID → row-range index.
 func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, error) {
 	r, err := block.OpenPart(ctx, b, prefix)
