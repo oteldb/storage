@@ -3,6 +3,7 @@ package signal
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"math"
 	"slices"
 	"strconv"
@@ -10,10 +11,66 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-// SeriesID is the content-addressed identity of a time series: a hash of its sorted
-// attribute set. Equal attribute sets yield equal SeriesID on every node, which makes
-// placement and dedup deterministic without a central id allocator.
-type SeriesID uint64
+// SeriesID is the content-addressed identity of a time series: a 128-bit hash of its
+// sorted attribute set. Equal attribute sets yield equal SeriesID on every node, which
+// makes placement and dedup deterministic without a central id allocator.
+//
+// It is 128-bit, not 64-bit, on purpose: identity is content-addressed, so there is no
+// allocator to detect or resolve a hash collision. At this system's scale (~1e9 series
+// over retention) a 64-bit content hash collides with a few-percent probability — a
+// silent merge of two distinct series. 128 bits makes that negligible for any realistic
+// cardinality. SeriesID is comparable, so it is usable directly as a map key.
+type SeriesID struct {
+	Hi, Lo uint64
+}
+
+// Compare orders SeriesIDs (high word first), giving postings lists a total order.
+func (s SeriesID) Compare(o SeriesID) int {
+	switch {
+	case s.Hi != o.Hi:
+		if s.Hi < o.Hi {
+			return -1
+		}
+
+		return 1
+	case s.Lo != o.Lo:
+		if s.Lo < o.Lo {
+			return -1
+		}
+
+		return 1
+	default:
+		return 0
+	}
+}
+
+// Less reports whether s sorts before o.
+func (s SeriesID) Less(o SeriesID) bool { return s.Compare(o) < 0 }
+
+// String returns the 32-hex-digit form of the id.
+func (s SeriesID) String() string {
+	var raw [16]byte
+	binary.BigEndian.PutUint64(raw[:8], s.Hi)
+	binary.BigEndian.PutUint64(raw[8:], s.Lo)
+
+	return hex.EncodeToString(raw[:])
+}
+
+// AppendBinary appends the 16-byte big-endian encoding (Hi then Lo) of the id to dst.
+func (s SeriesID) AppendBinary(dst []byte) []byte {
+	dst = binary.BigEndian.AppendUint64(dst, s.Hi)
+
+	return binary.BigEndian.AppendUint64(dst, s.Lo)
+}
+
+// HashBytes returns the [SeriesID] of a canonical hash pre-image (see
+// [Attributes.AppendHashInput]). Callers that already built the pre-image use this to
+// stay zero-alloc.
+func HashBytes(preimage []byte) SeriesID {
+	h := xxh3.Hash128(preimage)
+
+	return SeriesID{Hi: h.Hi, Lo: h.Lo}
+}
 
 // ValueKind is the dynamic type of an OTel attribute [Value] — the OTLP AnyValue oneof.
 // Values are persisted in the canonical hash pre-image and the symbol/series formats;
@@ -292,7 +349,7 @@ func (a Attributes) Get(key []byte) (Value, bool) {
 
 // Hash returns the content-addressed [SeriesID] of the sorted attribute set.
 func (a Attributes) Hash() SeriesID {
-	return SeriesID(xxh3.Hash(a.AppendHashInput(nil)))
+	return HashBytes(a.AppendHashInput(nil))
 }
 
 // AppendHashInput appends the canonical, type-tagged hash pre-image of the (sorted)

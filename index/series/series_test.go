@@ -51,10 +51,10 @@ func TestGetReconstructs(t *testing.T) {
 	require.True(t, ok)
 	assert.True(t, got.Equal(want))
 
-	_, ok = ix.Get(signal.SeriesID(123))
+	_, ok = ix.Get(signal.SeriesID{Lo: 123})
 	assert.False(t, ok)
 	assert.True(t, ix.Has(id))
-	assert.False(t, ix.Has(signal.SeriesID(123)))
+	assert.False(t, ix.Has(signal.SeriesID{Lo: 123}))
 }
 
 func TestAddRetainsACopy(t *testing.T) {

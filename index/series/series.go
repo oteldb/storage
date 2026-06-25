@@ -6,8 +6,6 @@
 package series
 
 import (
-	"github.com/zeebo/xxh3"
-
 	"github.com/oteldb/storage/signal"
 )
 
@@ -29,7 +27,7 @@ func New() *Index {
 // reuse its buffers.
 func (ix *Index) Add(attrs signal.Attributes) signal.SeriesID {
 	ix.buf = attrs.AppendHashInput(ix.buf[:0])
-	id := signal.SeriesID(xxh3.Hash(ix.buf))
+	id := signal.HashBytes(ix.buf)
 
 	if _, ok := ix.byID[id]; !ok {
 		ix.byID[id] = attrs.Clone()

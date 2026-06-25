@@ -154,6 +154,29 @@ func TestValueAppendText(t *testing.T) {
 	assert.Equal(t, `["x"]`, text(SliceValue(sv("x"))))
 }
 
+func TestSeriesIDMethods(t *testing.T) {
+	t.Parallel()
+
+	a := SeriesID{Hi: 1, Lo: 2}
+	b := SeriesID{Hi: 1, Lo: 3}
+	c := SeriesID{Hi: 2, Lo: 0}
+
+	assert.Negative(t, a.Compare(b), "low word breaks ties")
+	assert.Negative(t, b.Compare(c), "high word dominates")
+	assert.Equal(t, 0, a.Compare(a))
+	assert.True(t, a.Less(b))
+	assert.False(t, c.Less(a))
+
+	assert.Equal(t, "00000000000000010000000000000002", a.String())
+	assert.Equal(t,
+		[]byte{0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2},
+		a.AppendBinary(nil))
+
+	// HashBytes is 128-bit and matches Attributes.Hash for the same pre-image.
+	at := NewAttributes(kv("k", sv("v")))
+	assert.Equal(t, at.Hash(), HashBytes(at.AppendHashInput(nil)))
+}
+
 func FuzzAttributesHash(f *testing.F) {
 	f.Add("job", "api", int64(1), true)
 
