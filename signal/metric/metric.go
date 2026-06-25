@@ -1,8 +1,6 @@
 package metric
 
 import (
-	"encoding/binary"
-
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/oteldb/storage/signal"
@@ -30,8 +28,21 @@ const (
 	TemporalityCumulative
 )
 
-// Identity is a metric series' full identity: the [signal.Series] backbone plus the
-// metric-specific fields. [Identity.SeriesID] folds them all into one content-addressed id.
+// Reserved attribute keys: the metric-specific identity fields are folded into the
+// series' point attributes as reserved labels, so the unified [signal.Series] identity +
+// the index machinery handle metrics with no metric-specific code, and queries can match
+// `__name__` etc. (Prometheus convention). Resource and Scope stay structured.
+var (
+	LabelName        = []byte("__name__")
+	LabelUnit        = []byte("__unit__")
+	LabelKind        = []byte("__kind__")
+	LabelTemporality = []byte("__temporality__")
+	LabelMonotonic   = []byte("__monotonic__")
+)
+
+// Identity is a metric series' full identity: the [signal.Series] backbone (Resource +
+// Scope + data-point attributes) plus the metric-specific fields name, unit, kind,
+// temporality and monotonicity.
 type Identity struct {
 	Series      signal.Series
 	Name        []byte
@@ -41,23 +52,31 @@ type Identity struct {
 	Monotonic   bool
 }
 
-// SeriesID hashes the full metric identity: the backbone pre-image followed by the
-// metric-specific fields, so two metrics differing only in name/unit/kind/temporality/
-// monotonicity get distinct ids.
-func (id Identity) SeriesID() signal.SeriesID {
-	buf := id.Series.AppendHashInput(nil)
-	buf = appendLenBytes(buf, id.Name)
-	buf = appendLenBytes(buf, id.Unit)
+// ToSeries folds the metric-specific fields into the point attributes as reserved labels
+// and returns the full [signal.Series] — the value stored, indexed, and returned in
+// fetch batches. Two metrics differing only in name/unit/kind/temporality/monotonicity
+// produce distinct series (and thus distinct [signal.SeriesID]).
+func (id Identity) ToSeries() signal.Series {
+	pts := id.Series.Attributes
+	merged := make([]signal.KeyValue, 0, len(pts)+5)
+	merged = append(merged, pts...)
+	merged = append(merged,
+		signal.KeyValue{Key: LabelName, Value: signal.StringValue(id.Name)},
+		signal.KeyValue{Key: LabelUnit, Value: signal.StringValue(id.Unit)},
+		signal.KeyValue{Key: LabelKind, Value: signal.IntValue(int64(id.Kind))},
+		signal.KeyValue{Key: LabelTemporality, Value: signal.IntValue(int64(id.Temporality))},
+		signal.KeyValue{Key: LabelMonotonic, Value: signal.BoolValue(id.Monotonic)},
+	)
 
-	var mono byte
-	if id.Monotonic {
-		mono = 1
+	return signal.Series{
+		Resource:   id.Series.Resource,
+		Scope:      id.Series.Scope,
+		Attributes: signal.NewAttributes(merged...),
 	}
-
-	buf = append(buf, byte(id.Kind), byte(id.Temporality), mono)
-
-	return signal.HashBytes(buf)
 }
+
+// SeriesID is the content-addressed id of the full identity ([ToSeries] hashed).
+func (id Identity) SeriesID() signal.SeriesID { return id.ToSeries().Hash() }
 
 // Sample is a projected number data point: its (start, time] timestamps and value.
 type Sample struct {
@@ -181,10 +200,4 @@ func unsupportedPointCount(m pmetric.Metric) int {
 	default:
 		return 0
 	}
-}
-
-func appendLenBytes(dst, b []byte) []byte {
-	dst = binary.AppendUvarint(dst, uint64(len(b)))
-
-	return append(dst, b...)
 }

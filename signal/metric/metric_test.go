@@ -190,6 +190,36 @@ func TestUnsupportedAndEmptyRejected(t *testing.T) {
 	assert.Equal(t, 3, rejected, "2 histogram points + 1 value-less gauge point")
 }
 
+func TestToSeriesFoldsReservedLabels(t *testing.T) {
+	t.Parallel()
+
+	id := Identity{
+		Series:      signal.Series{Attributes: signal.NewAttributes(signal.KeyValue{Key: []byte("route"), Value: signal.StringValue([]byte("/x"))})},
+		Name:        []byte("http.requests"),
+		Unit:        []byte("1"),
+		Kind:        KindSum,
+		Temporality: TemporalityDelta,
+		Monotonic:   true,
+	}
+	s := id.ToSeries()
+
+	get := func(key []byte) signal.Value {
+		v, ok := s.Attributes.Get(key)
+		require.Truef(t, ok, "missing %s", key)
+
+		return v
+	}
+	assert.Equal(t, []byte("http.requests"), get(LabelName).Str())
+	assert.Equal(t, []byte("1"), get(LabelUnit).Str())
+	assert.Equal(t, int64(KindSum), get(LabelKind).Int())
+	assert.Equal(t, int64(TemporalityDelta), get(LabelTemporality).Int())
+	assert.True(t, get(LabelMonotonic).Bool())
+	// The original point attribute is preserved.
+	assert.Equal(t, []byte("/x"), get([]byte("route")).Str())
+	// SeriesID is ToSeries hashed.
+	assert.Equal(t, s.Hash(), id.SeriesID())
+}
+
 func TestProjectEmptyBatch(t *testing.T) {
 	t.Parallel()
 
