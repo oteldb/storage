@@ -201,8 +201,12 @@ func bitRange(x int64, nbits uint8) bool {
 // preserved as positive — matching the asymmetric DoD range (positive side gets one
 // extra value). See Prometheus chunkenc/xor.go:388-393.
 func signExtend(u uint64, nbits uint8) int64 {
+	// u holds nbits significant bits (nbits ≤ 20 here, never the 64-bit DoD case),
+	// so int64(u) is non-negative and the signed subtraction below stays well within
+	// int64 range. Doing the negative branch in signed arithmetic avoids the unsigned
+	// wraparound that uint64 subtraction would rely on, while giving identical results.
 	if u > uint64(1)<<(nbits-1) {
-		u -= uint64(1) << nbits
+		return int64(u) - int64(1)<<nbits
 	}
 
 	return int64(u)

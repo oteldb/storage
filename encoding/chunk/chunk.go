@@ -30,6 +30,10 @@ const (
 	// float64. Optionally lossy (precisionBits < 64): zeros trailing low bits of
 	// deltas so the varint stream is ZSTD-compressible.
 	CodecDecimal
+	// CodecID128 is run-length encoding for 128-bit id columns ([U128]): a sorted id
+	// column (e.g. the SeriesID sort key of a metric part) is long runs of one id, so
+	// RLE stores a distinct id + run length per run.
+	CodecID128
 )
 
 // String returns a stable lower-case codec name.
@@ -47,6 +51,8 @@ func (c Codec) String() string {
 		return "t64"
 	case CodecDecimal:
 		return "decimal"
+	case CodecID128:
+		return "id128"
 	default:
 		return "unknown"
 	}
