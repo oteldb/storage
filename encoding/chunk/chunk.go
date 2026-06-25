@@ -63,12 +63,14 @@ func writeHeader(dst []byte, rows int) (*bitstream.Writer, []byte) {
 	w := bitstream.NewWriter(dst)
 	w.WriteUvarint(uint64(rows))
 
-	return w, w.Bytes()
+	b := w.Bytes()
+
+	return w, b
 }
 
 // readHeader reads the row count from src and returns a reader positioned after it,
 // along with the number of bytes consumed by the uvarint count.
-func readHeader(src []byte) (r *bitstream.Reader, rows int, consumed int, err error) {
+func readHeader(src []byte) (r *bitstream.Reader, rows, consumed int, err error) {
 	rows, consumed, err = readHeaderInto(src, nil)
 	if err != nil {
 		return nil, 0, 0, err
@@ -77,7 +79,7 @@ func readHeader(src []byte) (r *bitstream.Reader, rows int, consumed int, err er
 	return bitstream.NewReader(src[consumed:]), rows, consumed, nil
 }
 
-func readHeaderInto(src []byte, r *bitstream.Reader) (rows int, consumed int, err error) {
+func readHeaderInto(src []byte, r *bitstream.Reader) (rows, consumed int, err error) {
 	// Read the uvarint count directly from the bytes (it's byte-aligned).
 	var (
 		n int

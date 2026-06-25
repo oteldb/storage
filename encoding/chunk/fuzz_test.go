@@ -134,15 +134,43 @@ func FuzzDictRoundTrip(f *testing.F) {
 				t.Fatalf("vals[%d] = %q, want %q", i, got[i], vals[i])
 			}
 		}
+
+		// The reusable DictEncoder must produce byte-identical output, and the split
+		// DecodeBytesDict form must agree with the gather-form DecodeBytes.
+		encReuse := NewDictEncoder()
+		defer encReuse.Release()
+
+		if got := encReuse.Encode(nil, vals); !bytes.Equal(got, enc) {
+			t.Fatalf("DictEncoder output differs from EncodeBytes")
+		}
+
+		col, consumed, err := DecodeBytesDict(enc)
+		if err != nil {
+			t.Fatalf("DecodeBytesDict: %v", err)
+		}
+
+		if consumed != len(enc) {
+			t.Fatalf("DecodeBytesDict consumed = %d, want %d", consumed, len(enc))
+		}
+
+		if col.Len() != len(vals) {
+			t.Fatalf("DecodeBytesDict Len = %d, want %d", col.Len(), len(vals))
+		}
+
+		for i := range vals {
+			if !bytes.Equal(col.At(i), vals[i]) {
+				t.Fatalf("DecodeBytesDict At(%d) = %q, want %q", i, col.At(i), vals[i])
+			}
+		}
 	})
 }
 
 // decodeSeedToInt64s reads a sequence of zigzag varints from the seed.
-func decodeSeedToInt64s(seed []byte, max int) []int64 {
+func decodeSeedToInt64s(seed []byte, maxVals int) []int64 {
 	var vals []int64
 
 	off := 0
-	for off < len(seed) && len(vals) < max {
+	for off < len(seed) && len(vals) < maxVals {
 		v, n := binary.Varint(seed[off:])
 		if n <= 0 {
 			break
@@ -156,9 +184,9 @@ func decodeSeedToInt64s(seed []byte, max int) []int64 {
 }
 
 // decodeSeedToFloats interprets 8-byte chunks of the seed as float64 bits.
-func decodeSeedToFloats(seed []byte, max int) []float64 {
+func decodeSeedToFloats(seed []byte, maxVals int) []float64 {
 	var vals []float64
-	for i := 0; i+8 <= len(seed) && len(vals) < max; i += 8 {
+	for i := 0; i+8 <= len(seed) && len(vals) < maxVals; i += 8 {
 		vals = append(vals, math.Float64frombits(binary.LittleEndian.Uint64(seed[i:])))
 	}
 

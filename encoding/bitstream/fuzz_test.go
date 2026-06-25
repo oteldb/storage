@@ -28,23 +28,20 @@ func FuzzRoundTripBits(f *testing.F) {
 		if err != nil {
 			t.Fatalf("ReadBits(%d): %v", nbits, err)
 		}
-		mask := uint64(0)
-		if nbits == 64 {
-			mask = ^uint64(0)
-		} else {
+		mask := ^uint64(0)
+		if nbits != 64 {
 			mask = (uint64(1) << nbits) - 1
 		}
 		if want := val & mask; got != want {
 			t.Fatalf("ReadBits(%d) = %#x, want %#x", nbits, got, want)
 		}
 		// Stream must be exhausted: the remaining bits in the partial trailing byte
-		// are padding and must read as EOF for the *next* field.
-		if _, err := r.ReadBits(1); err == nil && nbits%8 != 0 {
-			// A full-byte field has no padding, so the next read should hit EOF only
-			// if there's genuinely no more data. For partial-byte fields any extra
-			// bits are padding: we wrote exactly nbits, so the byte holds (8 - nbits%8)
-			// padding zeros. Reading them back succeeds but yields zero — that's fine.
-		}
+		// are padding and must read as EOF for the *next* field. A full-byte field has
+		// no padding, so the next read hits EOF only if there's genuinely no more data.
+		// For partial-byte fields any extra bits are padding: we wrote exactly nbits, so
+		// the byte holds (8 - nbits%8) padding zeros. Reading them back succeeds but
+		// yields zero — that's fine. Either way, this must not panic.
+		_, _ = r.ReadBits(1)
 	})
 }
 
@@ -144,10 +141,10 @@ func FuzzReaderFromArbitraryBytes(f *testing.F) {
 	f.Add([]byte{0xff})
 	f.Add([]byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01})
 
-	f.Fuzz(func(t *testing.T, b []byte) {
+	f.Fuzz(func(_ *testing.T, b []byte) {
 		r := NewReader(b)
 		// Read bits in arbitrary-width chunks; must not panic.
-		for i := 0; i < 200; i++ {
+		for i := range 200 {
 			width := uint8(((i * 7) + 1) % 65) // 1..64 cycle
 			if width == 0 {
 				width = 1

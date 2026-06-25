@@ -1,6 +1,7 @@
 package compress
 
 import (
+	"bytes"
 	"testing"
 )
 
@@ -17,9 +18,7 @@ func TestCompressRoundTrip(t *testing.T) {
 		{"zeros", make([]byte, 4096)},
 	}
 	for _, alg := range []Algorithm{AlgorithmNone, AlgorithmZSTD} {
-		alg := alg
 		for _, tc := range cases {
-			tc := tc
 			t.Run(tc.name+"/"+alg.String(), func(t *testing.T) {
 				t.Parallel()
 				c := NewCompressor(alg, LevelDefault)
@@ -201,7 +200,7 @@ func TestCompressNoneAlgorithm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Decompress: %v", err)
 	}
-	if string(got) != string(data) {
+	if !bytes.Equal(got, data) {
 		t.Errorf("got %q, want %q", got, data)
 	}
 }
@@ -234,7 +233,7 @@ func TestLevelConstants(t *testing.T) {
 
 func TestErrBadFlag(t *testing.T) {
 	t.Parallel()
-	e := errBadFlag{flag: 0xFF}
+	e := badFlagError{flag: 0xFF}
 	if e.Error() != "compress: unknown block flag" {
 		t.Errorf("Error() = %q", e.Error())
 	}

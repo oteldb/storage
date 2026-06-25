@@ -54,15 +54,15 @@ func TestByteIntMapPutOrGet(t *testing.T) {
 	t.Parallel()
 	m := NewByteIntMap()
 	defer m.PutBack()
-	v, existed := m.PutOrGet([]byte("a"), 0)
+	_, existed := m.PutOrGet([]byte("a"), 0)
 	if existed {
 		t.Fatal("first PutOrGet should not exist")
 	}
-	v, existed = m.PutOrGet([]byte("a"), 1)
+	v, existed := m.PutOrGet([]byte("a"), 1)
 	if !existed || v != 0 {
 		t.Fatalf("second PutOrGet: v=%d existed=%v", v, existed)
 	}
-	v, existed = m.PutOrGet([]byte("b"), 1)
+	_, existed = m.PutOrGet([]byte("b"), 1)
 	if existed {
 		t.Fatal("new key should not exist")
 	}

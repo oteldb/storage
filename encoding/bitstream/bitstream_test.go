@@ -16,12 +16,9 @@ func TestRoundTripBits(t *testing.T) {
 		0x5555555555555555, 0xaaaaaaaaaaaaaaaa, 0x123456789abcdef0}
 
 	for _, nbits := range widths {
-		nbits := nbits
 		// Mask values to nbits.
-		mask := uint64(0)
-		if nbits == 64 {
-			mask = ^uint64(0)
-		} else {
+		mask := ^uint64(0)
+		if nbits != 64 {
 			mask = (uint64(1) << nbits) - 1
 		}
 		for _, v := range values {
@@ -79,10 +76,8 @@ func TestRoundTripSequence(t *testing.T) {
 		if err != nil {
 			t.Fatalf("op %d: ReadBits(%d): %v", i, o.nbits, err)
 		}
-		mask := uint64(0)
-		if o.nbits == 64 {
-			mask = ^uint64(0)
-		} else {
+		mask := ^uint64(0)
+		if o.nbits != 64 {
 			mask = (uint64(1) << o.nbits) - 1
 		}
 		if want := o.val & mask; got != want {

@@ -104,12 +104,12 @@ func TestNearestDelta(t *testing.T) {
 	}
 
 	// Counter-reset hysteresis: sudden tz jump.
-	d, tz = nearestDelta(100, 1<<60, 16, 0)
+	d, _ = nearestDelta(100, 1<<60, 16, 0)
 	if d != 100 {
 		t.Errorf("counter reset (jump up): d=%d, want 100 (full precision)", d)
 	}
 	// Counter-reset hysteresis: sudden tz drop.
-	d, tz = nearestDelta(100, 100, 16, 30)
+	d, _ = nearestDelta(100, 100, 16, 30)
 	if d != 100 {
 		t.Errorf("counter reset (jump down): d=%d, want 100 (full precision)", d)
 	}

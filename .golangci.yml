@@ -2,8 +2,29 @@ version: "2"
 linters:
   default: all
   disable:
-    - wsl
-    - gomodguard
+    # Superseded / not applicable.
+    - wsl # superseded by wsl_v5 (also disabled below)
+    - gomodguard # superseded by gomodguard_v2
+    - depguard # no import allowlist maintained for this library
+    # Style linters that fight this codebase's deliberate conventions.
+    - wsl_v5 # pedantic cuddle/whitespace rules; not the house style
+    - nlreturn # requires a blank line before every return; too noisy
+    - varnamelen # short names (i, w, r, b, v, m) are idiomatic in hot loops
+    - godox # TODO/FIXME markers are intentional milestone (M1/M3) trackers
+    # Inappropriate for a low-level, zero-alloc codec library.
+    - mnd # bit widths, masks, and codec constants are inherently "magic"
+    - exhaustruct # fights Go's zero-value idiom (sync.Pool scratch, decoders)
+    - gochecknoglobals # package-level sync.Pool instances are idiomatic here
+    - gochecknoinits # init() wires sync.Pool to satisfy the noCopy vet check
+    - forcetypeassert # pool.Get().(*T) is provably safe; checking adds noise
+    - noinlineerr # `if err := f(); err != nil` is idiomatic Go
+    - ireturn # encoders/decoders legitimately return interfaces
+    - wrapcheck # error wrapping is governed by go-faster/errors conventions
+    - funlen # codec encode/decode bodies are long but cohesive
+    - cyclop # codecs are inherently branchy; complexity caps fight them
+    - gocyclo # same rationale as cyclop
+    - nonamedreturns # named returns document multi-value codec signatures
+    - testpackage # tests are white-box (assert on unexported codec internals)
   enable:
     - dogsled
     - errcheck
@@ -19,7 +40,6 @@ linters:
     - unconvert
     - unparam
     - whitespace
-    - wsl_v5
     - gomodguard_v2
   settings:
     dupl:
@@ -34,8 +54,17 @@ linters:
         - opinionated
         - performance
         - style
+      disabled-checks:
+        # Opinionated checks that fight intentional choices here:
+        - hugeParam # Options is passed by value into the functional-options constructor
+        - unnamedResult # multi-value codec helpers read fine without named results
     gocyclo:
       min-complexity: 15
+    gosec:
+      excludes:
+        # Integer-conversion overflow: deliberate and bounds-checked in codec
+        # paths (row ids, bit widths, varint lengths); flagging every cast is noise.
+        - G115
     lll:
       line-length: 140
     misspell:
@@ -53,6 +82,7 @@ linters:
           - gosec
           - lll
           - scopelint
+          - unparam
         path: _test\.go
       - linters:
           - gocritic

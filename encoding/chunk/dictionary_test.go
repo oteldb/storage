@@ -116,6 +116,165 @@ func TestDictCompressionRatio(t *testing.T) {
 	}
 }
 
+// TestDictEncoderMatchesEncodeBytes verifies DictEncoder.Encode is byte-identical to
+// EncodeBytes across inputs and across reuse of a single encoder.
+func TestDictEncoderMatchesEncodeBytes(t *testing.T) {
+	t.Parallel()
+
+	cases := [][][]byte{
+		nil,
+		{[]byte("hello")},
+		{[]byte("a"), []byte("b"), []byte("a"), []byte("b")},
+		makeLowCardBytes(100, 10),
+		makeLowCardBytes(500, 400), // >256 distinct: 2-byte id path
+		{nil, nil, nil},
+	}
+
+	enc := NewDictEncoder()
+	defer enc.Release()
+
+	// Run twice over the same encoder to exercise warm-state reuse.
+	for pass := range 2 {
+		for i, vals := range cases {
+			want := EncodeBytes(nil, vals)
+			got := enc.Encode(nil, vals)
+
+			if !bytes.Equal(got, want) {
+				t.Fatalf("pass %d case %d: DictEncoder output != EncodeBytes\n got=%x\nwant=%x", pass, i, got, want)
+			}
+
+			// And the result must still decode back to the input.
+			dec, _, err := DecodeBytes(nil, got)
+			if err != nil {
+				t.Fatalf("pass %d case %d: Decode: %v", pass, i, err)
+			}
+
+			if len(dec) != len(vals) {
+				t.Fatalf("pass %d case %d: len = %d, want %d", pass, i, len(dec), len(vals))
+			}
+
+			for j := range vals {
+				if !bytes.Equal(dec[j], vals[j]) {
+					t.Fatalf("pass %d case %d: vals[%d] = %q, want %q", pass, i, j, dec[j], vals[j])
+				}
+			}
+		}
+	}
+}
+
+// TestDictEncoderReset verifies Reset drops references to a prior batch's input.
+func TestDictEncoderReset(t *testing.T) {
+	t.Parallel()
+
+	enc := NewDictEncoder()
+	defer enc.Release()
+
+	_ = enc.Encode(nil, [][]byte{[]byte("a"), []byte("b")})
+	enc.Reset()
+
+	for _, e := range enc.entries {
+		if e != nil {
+			t.Fatalf("Reset did not clear entries: %q", e)
+		}
+	}
+
+	// Encoder is still usable after Reset.
+	got := enc.Encode(nil, [][]byte{[]byte("x"), []byte("x")})
+	want := EncodeBytes(nil, [][]byte{[]byte("x"), []byte("x")})
+
+	if !bytes.Equal(got, want) {
+		t.Fatalf("after Reset: got=%x want=%x", got, want)
+	}
+}
+
+// TestDictColumnRoundTrip verifies DecodeBytesDict's split form returns the same values
+// as the input (and as DecodeBytes) for the dict, 2-byte-id, flat, and empty paths.
+func TestDictColumnRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		vals      [][]byte
+		wantWidth int
+	}{
+		{"empty", nil, 0},
+		{"low-card-1byte", makeLowCardBytes(100, 10), 1},
+		{"high-card-2byte", makeDistinctBytes(500), 2},
+		{"flat-fallback", makeDistinctBytes(70000), 0},
+		{"empty-strings", [][]byte{nil, nil, nil}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			enc := EncodeBytes(nil, tc.vals)
+
+			col, consumed, err := DecodeBytesDict(enc)
+			if err != nil {
+				t.Fatalf("DecodeBytesDict: %v", err)
+			}
+
+			if consumed != len(enc) {
+				t.Fatalf("consumed = %d, want %d", consumed, len(enc))
+			}
+
+			if col.Len() != len(tc.vals) {
+				t.Fatalf("Len = %d, want %d", col.Len(), len(tc.vals))
+			}
+
+			if col.IDWidth != tc.wantWidth {
+				t.Fatalf("IDWidth = %d, want %d", col.IDWidth, tc.wantWidth)
+			}
+
+			for i := range tc.vals {
+				if !bytes.Equal(col.At(i), tc.vals[i]) {
+					t.Fatalf("At(%d) = %q, want %q", i, col.At(i), tc.vals[i])
+				}
+			}
+		})
+	}
+}
+
+// TestDictColumnDecodeReuse verifies a single DictColumn can be reused across decodes.
+func TestDictColumnDecodeReuse(t *testing.T) {
+	t.Parallel()
+
+	a := EncodeBytes(nil, makeLowCardBytes(50, 5))
+	b := EncodeBytes(nil, makeDistinctBytes(300))
+
+	var col DictColumn
+	for _, enc := range [][]byte{a, b, a} {
+		if _, err := col.DecodeBytes(enc); err != nil {
+			t.Fatalf("DecodeBytes: %v", err)
+		}
+
+		ref, _, err := DecodeBytes(nil, enc)
+		if err != nil {
+			t.Fatalf("DecodeBytes ref: %v", err)
+		}
+
+		if col.Len() != len(ref) {
+			t.Fatalf("Len = %d, want %d", col.Len(), len(ref))
+		}
+
+		for i := range ref {
+			if !bytes.Equal(col.At(i), ref[i]) {
+				t.Fatalf("At(%d) = %q, want %q", i, col.At(i), ref[i])
+			}
+		}
+	}
+}
+
+// makeDistinctBytes returns n distinct values ("val-0".."val-(n-1)").
+func makeDistinctBytes(n int) [][]byte {
+	vals := make([][]byte, n)
+	for i := range vals {
+		vals[i] = []byte("val-" + itoa(i))
+	}
+
+	return vals
+}
+
 func makeLowCardBytes(n, cardinality int) [][]byte {
 	if cardinality > n {
 		cardinality = n

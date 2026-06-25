@@ -1,12 +1,3 @@
-// Package compress wraps zstd/lz4 block compression and defines the composable
-// codec-chain type (preprocessor → general compressor) used to reach 0.4–0.8
-// bytes/point (DESIGN.md §3.3, §14 M0).
-//
-// A [Chain] is a sequence of a column-specific preprocessor (from [chunk]) followed
-// by a general compressor (ZSTD or LZ4). Cold-tier recompression is just a different
-// chain over the same parts. The wrappers are append-style
-// (Compress(dst, src) []byte / Decompress(dst, src) []byte) and use pooled encoders/
-// decoders to avoid per-call allocation.
 package compress
 
 import (
@@ -108,7 +99,7 @@ func (c *Compressor) Decompress(dst, src []byte) ([]byte, error) {
 	case FlagCompressed:
 		return c.decompressPool(dst, body), nil
 	default:
-		return dst, errBadFlag{flag}
+		return dst, badFlagError{flag}
 	}
 }
 
@@ -127,6 +118,9 @@ func (c *Compressor) compressPool(dst, src []byte) []byte {
 		defer c.encPool.Put(enc)
 		out := enc.EncodeAll(src, append(dst, FlagCompressed))
 		return out
+	case AlgorithmNone:
+		// Identity: store raw (Compress already short-circuits this case).
+		return append(append(dst, FlagRaw), src...)
 	case AlgorithmLZ4:
 		// LZ4 block compression (klauspost/compress/lz4).
 		// For M0 we use the zstd path as the primary; LZ4 is a stub that falls
@@ -144,6 +138,9 @@ func (c *Compressor) decompressPool(dst, src []byte) []byte {
 		defer c.decPool.Put(dec)
 		out, _ := dec.DecodeAll(src, dst)
 		return out
+	case AlgorithmNone, AlgorithmLZ4:
+		// Identity / LZ4 stub: return as-is (raw fallback).
+		return append(dst, src...)
 	default:
 		// LZ4 stub: return as-is (raw fallback).
 		return append(dst, src...)
@@ -181,7 +178,7 @@ type nilReader struct{}
 
 func (nilReader) Read([]byte) (int, error) { return 0, io.EOF }
 
-// errBadFlag is returned when the decompressor sees an unknown flag byte.
-type errBadFlag struct{ flag byte }
+// badFlagError is returned when the decompressor sees an unknown flag byte.
+type badFlagError struct{ flag byte }
 
-func (e errBadFlag) Error() string { return "compress: unknown block flag" }
+func (e badFlagError) Error() string { return "compress: unknown block flag" }

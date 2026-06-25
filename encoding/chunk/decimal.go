@@ -279,7 +279,7 @@ func nearestDelta(d, origin int64, precisionBits uint8, prevTZ int) (int64, int)
 		d = -d
 	}
 
-	mask := uint64(^uint64(0)) << tz
+	mask := ^uint64(0) << tz
 
 	d = int64(uint64(d) & mask)
 	if minus {

@@ -12,7 +12,7 @@ func BenchmarkWriteBits(b *testing.B) {
 	b.ReportAllocs()
 	w := NewWriter(make([]byte, 0, 1<<16))
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		w.Reset(w.stream[:0])
 		for range 1024 {
 			w.WriteBits(0x0123456789abcdef, 64)
@@ -26,7 +26,7 @@ func BenchmarkWriteBitsUnaligned(b *testing.B) {
 	b.ReportAllocs()
 	w := NewWriter(make([]byte, 0, 1<<16))
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		w.Reset(w.stream[:0])
 		for range 1024 {
 			w.WriteBits(0x1ace, 13)
@@ -44,7 +44,7 @@ func BenchmarkReadBits(b *testing.B) {
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		r := NewReader(data)
 		for range 8192 {
 			_, _ = r.ReadBits(64)
@@ -61,7 +61,7 @@ func BenchmarkReadBitsUnaligned(b *testing.B) {
 	data := w.Bytes()
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		r := NewReader(data)
 		for range 4096 {
 			_, _ = r.ReadBits(13)
@@ -78,7 +78,7 @@ func BenchmarkReadBit(b *testing.B) {
 	data := w.Bytes()
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		r := NewReader(data)
 		for range 65536 {
 			_, _ = r.ReadBit()
@@ -92,7 +92,7 @@ func BenchmarkVarintWrite(b *testing.B) {
 	w := NewWriter(make([]byte, 0, 1<<16))
 	vals := []int64{0, 1, -1, 1 << 20, -(1 << 20), 1 << 40, 1<<63 - 1}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := range b.N {
 		w.Reset(w.stream[:0])
 		for range 1024 {
 			w.WriteVarint(vals[i%len(vals)])
@@ -112,7 +112,7 @@ func BenchmarkVarintRead(b *testing.B) {
 	b.SetBytes(int64(len(data) / n))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		r := NewReader(data)
 		for range n {
 			_, _ = r.ReadVarint()
@@ -131,7 +131,7 @@ func BenchmarkStdlibVarintRead(b *testing.B) {
 	b.SetBytes(int64(n))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		br := bytesReader{data: data}
 		for range 1024 {
 			_, _ = binary.ReadVarint(&br)

@@ -36,6 +36,9 @@ type ByteIntMap struct {
 	growAt int      // precomputed: len(hashes)*3/4; grow when used+1 > growAt
 }
 
+// NewByteIntMap returns a pooled, ready-to-use map. A reused instance is cleared
+// via [ByteIntMap.Reset] so its backing arrays are retained; a fresh one allocates
+// at the initial capacity.
 func NewByteIntMap() *ByteIntMap {
 	const initial = 1 << 5 // 32 slots
 	m := byteIntMapPool.Get().(*ByteIntMap)
@@ -51,6 +54,7 @@ func NewByteIntMap() *ByteIntMap {
 	return m
 }
 
+// Reset clears the map for reuse without freeing the backing arrays.
 func (m *ByteIntMap) Reset() {
 	clear(m.hashes)
 	clear(m.keys)
@@ -58,6 +62,7 @@ func (m *ByteIntMap) Reset() {
 	m.used = 0
 }
 
+// Len returns the number of live entries in the map.
 func (m *ByteIntMap) Len() int { return m.count }
 
 // hashKey returns the xxh3 hash of b, ensuring it's never 0 (reserved for empty slot).
@@ -194,6 +199,18 @@ func (m *ByteIntMap) PutRaw(b []byte, v int, h uint64) {
 	}
 }
 
+// PutBack returns m to the pool for reuse. After this, m must not be used.
+func (m *ByteIntMap) PutBack() { byteIntMapPool.Put(m) }
+
+// ForEach calls fn for each (key, value) pair. Iteration order is unspecified.
+func (m *ByteIntMap) ForEach(fn func(key []byte, value int)) {
+	for i := range m.hashes {
+		if m.hashes[i] != 0 && m.keys[i] != nil {
+			fn(m.keys[i], m.values[i])
+		}
+	}
+}
+
 func (m *ByteIntMap) grow() {
 	newCap := len(m.hashes) * 2
 	oldKeys, oldVals, oldHashes := m.keys, m.values, m.hashes
@@ -207,18 +224,6 @@ func (m *ByteIntMap) grow() {
 	for i := range oldHashes {
 		if oldHashes[i] != 0 && oldKeys[i] != nil {
 			m.PutRaw(oldKeys[i], oldVals[i], oldHashes[i])
-		}
-	}
-}
-
-// PutBack returns m to the pool for reuse. After this, m must not be used.
-func (m *ByteIntMap) PutBack() { byteIntMapPool.Put(m) }
-
-// ForEach calls fn for each (key, value) pair. Iteration order is unspecified.
-func (m *ByteIntMap) ForEach(fn func(key []byte, value int)) {
-	for i := range m.hashes {
-		if m.hashes[i] != 0 && m.keys[i] != nil {
-			fn(m.keys[i], m.values[i])
 		}
 	}
 }

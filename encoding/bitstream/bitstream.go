@@ -50,19 +50,6 @@ func (w *Writer) Bytes() []byte { return w.stream }
 // Len returns the number of bytes consumed so far (including a partial trailing byte).
 func (w *Writer) Len() int { return len(w.stream) }
 
-// writeBit appends a single bit (MSB-first). Kept small for inlining.
-func (w *Writer) writeBit(bit bool) {
-	if w.count == 0 {
-		w.stream = append(w.stream, 0)
-		w.count = 8
-	}
-	i := len(w.stream) - 1
-	if bit {
-		w.stream[i] |= 1 << (w.count - 1)
-	}
-	w.count--
-}
-
 // WriteBit appends a single bit (MSB-first).
 func (w *Writer) WriteBit(bit bool) { w.writeBit(bit) }
 
@@ -130,7 +117,7 @@ func (w *Writer) AppendString(s string) {
 		w.stream = append(w.stream, s...)
 		return
 	}
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		_ = w.WriteByte(s[i])
 	}
 }
@@ -212,6 +199,19 @@ func (w *Writer) AppendTo(dst []byte) []byte {
 	return append(dst, w.stream...)
 }
 
+// writeBit appends a single bit (MSB-first). Kept small for inlining.
+func (w *Writer) writeBit(bit bool) {
+	if w.count == 0 {
+		w.stream = append(w.stream, 0)
+		w.count = 8
+	}
+	i := len(w.stream) - 1
+	if bit {
+		w.stream[i] |= 1 << (w.count - 1)
+	}
+	w.count--
+}
+
 // Reader is an MSB-first bit reader over a []byte view. It performs no allocation
 // after construction. The design (an 8-byte refill buffer with a valid-bit count) is
 // modeled on the Prometheus/dgryski bstream; [loadNextBuffer] refills 8 bytes at a
@@ -264,16 +264,6 @@ func (r *Reader) ConsumedBytes() int {
 	return r.offset - int(r.valid)/8
 }
 
-// readBitFast is the inlined fast path: returns io.EOF if the buffer is empty so the
-// caller can fall back to [readBit]. Kept a leaf for inlining.
-func (r *Reader) readBitFast() (bool, error) {
-	if r.valid == 0 {
-		return false, io.EOF
-	}
-	r.valid--
-	return (r.buffer & (1 << r.valid)) != 0, nil
-}
-
 // ReadBit reads one bit.
 func (r *Reader) ReadBit() (bool, error) {
 	if r.valid == 0 {
@@ -283,16 +273,6 @@ func (r *Reader) ReadBit() (bool, error) {
 	}
 	r.valid--
 	return (r.buffer & (1 << r.valid)) != 0, nil
-}
-
-// readBitsFast is the inlined fast path for readBits when nbits ≤ valid.
-func (r *Reader) readBitsFast(nbits uint8) (uint64, error) {
-	if nbits > r.valid {
-		return 0, io.EOF
-	}
-	mask := (uint64(1) << nbits) - 1
-	r.valid -= nbits
-	return (r.buffer >> r.valid) & mask, nil
 }
 
 // ReadBits reads nbits bits (nbits in [0,64]) and returns them in the low nbits of a
@@ -346,8 +326,8 @@ func (r *Reader) ReadBytes(p []byte) error {
 	r.AlignToByte()
 	// If we have buffered bytes (from a refill), drain them first.
 	for len(p) > 0 && r.valid >= 8 {
-		bits := r.buffer >> (r.valid - 8)
-		p[0] = byte(bits)
+		nbits := r.buffer >> (r.valid - 8)
+		p[0] = byte(nbits)
 		p = p[1:]
 		r.valid -= 8
 	}
@@ -454,6 +434,16 @@ func (r *Reader) AlignToByte() {
 	}
 }
 
+// readBitsFast is the inlined fast path for readBits when nbits ≤ valid.
+func (r *Reader) readBitsFast(nbits uint8) (uint64, error) {
+	if nbits > r.valid {
+		return 0, io.EOF
+	}
+	mask := (uint64(1) << nbits) - 1
+	r.valid -= nbits
+	return (r.buffer >> r.valid) & mask, nil
+}
+
 // loadNextBuffer refills the 8-byte buffer from the stream. nbits is the minimum the
 // caller needs, but we read up to 8 bytes when possible to amortize. It handles the
 // final-byte race (the last byte may be concurrently written by a Writer sharing the
@@ -483,7 +473,7 @@ func (r *Reader) loadNextBuffer(nbits uint8) bool {
 		buffer = uint64(r.last)
 		skip = 1
 	}
-	for i := 0; i < nbytes-skip; i++ {
+	for i := range nbytes - skip {
 		buffer |= uint64(r.stream[r.offset+i]) << uint(8*(nbytes-i-1))
 	}
 	r.buffer = buffer

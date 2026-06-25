@@ -155,6 +155,35 @@ func BenchmarkDictDecodeReuseDst(b *testing.B) {
 	}
 }
 
+func BenchmarkDictEncoderReuse(b *testing.B) {
+	vals := makeLowCardBytes(1000, 10)
+	enc := NewDictEncoder()
+
+	defer enc.Release()
+
+	buf := make([]byte, 0, len(enc.Encode(nil, vals)))
+	b.SetBytes(totalStringBytes(vals)) // raw input bytes encoded/sec
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		buf = enc.Encode(buf[:0], vals)
+	}
+}
+
+func BenchmarkDictDecodeSplit(b *testing.B) {
+	vals := makeLowCardBytes(1000, 10)
+	enc := EncodeBytes(nil, vals)
+	var col DictColumn
+	b.SetBytes(int64(len(enc)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		_, _ = col.DecodeBytes(enc)
+	}
+}
+
 func BenchmarkDecimalEncode(b *testing.B) {
 	vals := make([]float64, 1000)
 	for i := range vals {

@@ -152,8 +152,7 @@ func TestDoDTruncated(t *testing.T) {
 		t.Fatal("expected error from truncated stream")
 	}
 
-	if !IsEOF(err) && !errors.Is(err, errUnexpectedEOF) {
-		// Non-EOF/UnexpectedEOF errors are also acceptable (bitstream may report
-		// differently); the key is that we don't panic.
-	}
+	// Any error is acceptable here (IsEOF, errUnexpectedEOF, or a bitstream-specific
+	// report); the key is that we don't panic.
+	_ = errors.Is(err, errUnexpectedEOF)
 }
