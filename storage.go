@@ -113,6 +113,30 @@ func (s *Storage) Close(ctx context.Context) error {
 	return firstErr
 }
 
+// Reset discards all ingested data, returning every tenant engine to empty (head and
+// flushed parts) without reconstructing the [Storage]. It is intended for tests and
+// benchmarks that reuse one store across runs instead of rebuilding it. Reset is only valid
+// on an ephemeral (in-memory) backend; on a durable backend it returns [ErrNotEphemeral]
+// rather than wipe persisted data. The tenant engines themselves are retained (emptied, not
+// dropped), so subsequent writes reuse them.
+func (s *Storage) Reset(ctx context.Context) error {
+	if s.closed.Load() {
+		return errors.Wrap(ErrClosed, "reset")
+	}
+
+	if !s.backend.IsEphemeral() {
+		return ErrNotEphemeral
+	}
+
+	for _, eng := range s.engineSnapshot() {
+		if err := eng.Reset(ctx); err != nil {
+			return errors.Wrap(err, "reset engine")
+		}
+	}
+
+	return nil
+}
+
 // WriteMetrics ingests a metrics batch. It projects the internal model, derives each
 // point's tenant from its Resource+Scope, and appends to that tenant's engine (indexing
 // labels + buffering samples). Returns per-OTLP partial-success counts: rejected counts

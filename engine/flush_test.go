@@ -101,6 +101,49 @@ func TestFlushEmptyNoop(t *testing.T) {
 	assert.Equal(t, 0, e.PartCount())
 }
 
+func TestResetClearsHeadAndParts(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := backend.Memory()
+	e := engine.New(engine.Config{Backend: be, Prefix: "default/metrics"})
+
+	s := mkSeries("job", "api")
+	mustAppend(t, e, s, 100, 1.0)
+	mustAppend(t, e, s, 200, 2.0)
+	require.NoError(t, e.Flush(ctx))
+	require.Equal(t, 1, e.PartCount())
+
+	keys, err := be.List(ctx, "default/metrics/")
+	require.NoError(t, err)
+	require.NotEmpty(t, keys, "flush wrote part objects to the backend")
+
+	require.NoError(t, e.Reset(ctx))
+	assert.Equal(t, 0, e.PartCount())
+	assert.Equal(t, 0, e.SeriesCount(), "the series index is cleared too")
+
+	keys, err = be.List(ctx, "default/metrics/")
+	require.NoError(t, err)
+	assert.Empty(t, keys, "Reset deleted the part objects from the backend")
+
+	// The engine is reusable after Reset: a fresh write queries back cleanly.
+	mustAppend(t, e, s, 300, 3.0)
+	got := fetchAll(t, e, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
+	require.Len(t, got, 1)
+	assert.Equal(t, []int64{300}, got[0].Timestamps)
+}
+
+func TestResetHeadOnlyEngine(t *testing.T) {
+	t.Parallel()
+
+	e := engine.New(engine.Config{}) // no backend
+	mustAppend(t, e, mkSeries("job", "api"), 1, 1.0)
+	require.Equal(t, 1, e.SeriesCount())
+
+	require.NoError(t, e.Reset(context.Background()), "Reset with no backend just clears the head")
+	assert.Equal(t, 0, e.SeriesCount())
+}
+
 func TestFetchPartAbsentSeries(t *testing.T) {
 	t.Parallel()
 

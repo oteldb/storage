@@ -107,6 +107,10 @@ func WithOOOWindow(ns int64) Option { return func(o *Options) { o.OOOWindow = ns
 // ErrClosed is returned by [Storage] methods after [Storage.Close].
 var ErrClosed = errors.New("storage: closed")
 
+// ErrNotEphemeral is returned by [Storage.Reset] when the backend is durable: Reset wipes
+// all ingested data and is only permitted on an ephemeral (in-memory) store.
+var ErrNotEphemeral = errors.New("storage: reset requires an ephemeral backend")
+
 // errOptionInvalid is returned by [Open] for an invalid option combination.
 func errOptionInvalid(reason string) error {
 	return errors.Errorf("storage: invalid options: %s", reason)

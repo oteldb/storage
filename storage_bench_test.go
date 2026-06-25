@@ -95,12 +95,10 @@ func benchmarkWriteMetrics(b *testing.B, seriesCount, pointsPerSeries int) {
 		}
 
 		if (i+1)%resetEvery == 0 {
-			// Drop the store (and its in-memory backend) for a fresh head; the old one is
-			// unreferenced and reclaimed. No Close: that would flush samples into the
-			// backend and accumulate parts across resets. Excluded from the timer.
+			// Empty the head so its per-series buffers don't grow without bound across b.N.
+			// Excluded from the timer.
 			b.StopTimer()
-			s, err = InMemory()
-			if err != nil {
+			if err := s.Reset(ctx); err != nil {
 				b.Fatal(err)
 			}
 			b.StartTimer()
@@ -129,7 +127,7 @@ func benchmarkIngestAndFlush(b *testing.B, seriesCount, pointsPerSeries int) {
 	md := benchBatch(seriesCount, pointsPerSeries)
 	total := seriesCount * pointsPerSeries
 
-	// Each iteration writes one part; rebuild the store periodically so flushed parts don't
+	// Each iteration writes one part; reset the store periodically so flushed parts don't
 	// accumulate in the in-memory backend without bound across b.N.
 	resetEvery := max((1<<20)/total, 1)
 
@@ -154,8 +152,7 @@ func benchmarkIngestAndFlush(b *testing.B, seriesCount, pointsPerSeries int) {
 
 		if (i+1)%resetEvery == 0 {
 			b.StopTimer()
-			s, err = InMemory()
-			if err != nil {
+			if err := s.Reset(ctx); err != nil {
 				b.Fatal(err)
 			}
 			b.StartTimer()

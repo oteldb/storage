@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -16,6 +17,12 @@ import (
 	"github.com/oteldb/storage/signal/profile"
 	"github.com/oteldb/storage/signal/trace"
 )
+
+// durableBackend wraps the memory backend but reports itself non-ephemeral, to exercise
+// the [Storage.Reset] ephemeral gate without touching disk.
+type durableBackend struct{ backend.Backend }
+
+func (durableBackend) IsEphemeral() bool { return false }
 
 // gaugeBatch builds a one-gauge internal batch under resource service.name=service.
 func gaugeBatch(service, name string, ts []int64, values []float64) metric.Metrics {
@@ -128,6 +135,53 @@ func TestMultiTenantRouting(t *testing.T) {
 	assert.NotEqual(t, apiBatches[0].ID, webBatches[0].ID)
 	assert.InDelta(t, 1.0, apiBatches[0].Values[0], 0)
 	assert.InDelta(t, 2.0, webBatches[0].Values[0], 0)
+}
+
+func TestResetClearsData(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := InMemory()
+	require.NoError(t, err)
+
+	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
+	require.NoError(t, err)
+	eng := s.engineFor("default")
+	require.NoError(t, eng.Flush(ctx))
+	require.Equal(t, 1, eng.PartCount())
+	require.Equal(t, 1, eng.SeriesCount())
+
+	require.NoError(t, s.Reset(ctx))
+	assert.Equal(t, 0, eng.PartCount(), "flushed parts dropped")
+	assert.Equal(t, 0, eng.SeriesCount(), "head index cleared")
+	assert.Empty(t, queryEngine(t, eng, nameMatcher("http.requests")))
+
+	// The store is reusable: writing after reset works and only the new data is visible.
+	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{300}, []float64{3}))
+	require.NoError(t, err)
+	batches := queryEngine(t, eng, nameMatcher("http.requests"))
+	require.Len(t, batches, 1)
+	assert.Equal(t, []int64{300}, batches[0].Timestamps)
+	assert.Equal(t, []float64{3}, batches[0].Values)
+}
+
+func TestResetRequiresEphemeral(t *testing.T) {
+	t.Parallel()
+
+	s, err := Open(context.Background(), Options{}, WithBackend(durableBackend{backend.Memory()}))
+	require.NoError(t, err)
+
+	require.ErrorIs(t, s.Reset(context.Background()), ErrNotEphemeral)
+}
+
+func TestResetAfterCloseRejected(t *testing.T) {
+	t.Parallel()
+
+	s, err := InMemory()
+	require.NoError(t, err)
+	require.NoError(t, s.Close(context.Background()))
+
+	require.ErrorIs(t, s.Reset(context.Background()), ErrClosed)
 }
 
 func TestWriteAfterCloseRejected(t *testing.T) {

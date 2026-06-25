@@ -267,7 +267,10 @@ It is safe for concurrent use (one `sync.RWMutex`).
   source parts. Retention is a timestamp, not a clock read, so the engine is deterministic.
 - **Fetch** (`engine.go`) implements the fetch contract: it resolves matchers to series
   over the index, then merges each series' head buffer ∪ every part by timestamp into one
-  batch. `Close` flushes the head.
+  batch. `Close` flushes the head. `Reset(ctx)` is the inverse of accumulation: it replaces
+  the head with an empty one, drops the part handles, and deletes this engine's part objects
+  from the backend (scoped to `{Prefix}/`), returning the engine to its `New` state for
+  reuse (tests/benchmarks) without reallocating it.
 
 The metric part column layout and the WAL sample record are **wire-stable** on-disk
 formats.
@@ -301,9 +304,12 @@ ingest batches (`metric.Metrics`, and placeholder `log.Logs`/`trace.Traces`/
   returns `Accepted` (OTLP partial-success: rejected counts unsupported kinds, value-less
   points, and out-of-order drops). `WriteLogs`/`WriteTraces`/`WriteProfiles` are later
   verticals (`ErrNotImplemented`). A single **maintenance loop** periodically flushes +
-  merges every engine, applying per-tenant retention from the resolved policy. `Query` is
-  the seam for the query languages (M4); the low-level read path today is `engine.Fetch`
-  via the fetch contract.
+  merges every engine, applying per-tenant retention from the resolved policy. `Reset(ctx)`
+  discards all ingested data (every engine's head + flushed parts), retaining the engines
+  for reuse; it is gated to an **ephemeral backend** (`ErrNotEphemeral` otherwise) and is
+  meant for tests/benchmarks that reuse one store across runs. `Query` is the seam for the
+  query languages (M4); the low-level read path today is `engine.Fetch` via the fetch
+  contract.
 - **`Options` / `Option`** (`options.go`) — config struct plus functional options
   (`WithBackend`, `WithCluster`, `WithTenancy`, `WithEncoding`, `WithDurability`,
   `WithWALDir`, `WithFlushThresholdBytes`, `WithFlushInterval`, `WithOOOWindow`).

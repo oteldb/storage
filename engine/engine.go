@@ -5,6 +5,8 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/go-faster/errors"
+
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -155,6 +157,40 @@ func (e *Engine) Flush(ctx context.Context) error {
 	defer e.mu.Unlock()
 
 	return e.flushLocked(ctx)
+}
+
+// Reset discards all of the engine's data — the in-memory head (samples + series index)
+// and every flushed part — returning it to the empty state of a freshly [New]'d engine,
+// without reallocating the engine itself. Flushed part objects are deleted from the backend
+// so none are orphaned. It is destructive (it wipes this engine's parts under
+// [Config.Prefix]) and is meant for the ephemeral in-memory engine in tests and benchmarks,
+// letting a long-lived engine be reused across runs. Safe for concurrent use.
+func (e *Engine) Reset(ctx context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.head = newHead()
+	e.parts = nil
+	e.nextSeq = 0
+
+	if e.cfg.Backend == nil {
+		return nil
+	}
+
+	// Delete every object this engine wrote: all part keys are "{Prefix}/{seq}/...", so the
+	// "{Prefix}/" scope catches them without touching a sibling engine's keys.
+	keys, err := e.cfg.Backend.List(ctx, e.cfg.Prefix+"/")
+	if err != nil {
+		return errors.Wrap(err, "list parts")
+	}
+
+	for _, k := range keys {
+		if err := e.cfg.Backend.Delete(ctx, k); err != nil && !errors.Is(err, backend.ErrNotExist) {
+			return errors.Wrapf(err, "delete %q", k)
+		}
+	}
+
+	return nil
 }
 
 // PartCount returns the number of flushed parts (testing/introspection).
