@@ -1,6 +1,7 @@
 package postings
 
 import (
+	"regexp"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,8 +28,15 @@ func buildIndex() *MemPostings {
 	return p
 }
 
-func eq(name, value string) Matcher {
-	return Matcher{Op: MatchEqual, Name: []byte(name), Value: []byte(value)}
+// re builds a fully-anchored regexp predicate, as a query-language layer would.
+func re(pattern string) func([]byte) bool {
+	r := regexp.MustCompile("^(?:" + pattern + ")$")
+
+	return r.Match
+}
+
+func matcher(name string, match func([]byte) bool) Matcher {
+	return Matcher{Name: []byte(name), Match: match}
 }
 
 func TestGetAndPrimitives(t *testing.T) {
@@ -51,7 +59,21 @@ func TestGetAndPrimitives(t *testing.T) {
 	assert.Nil(t, p.LabelValues([]byte("region")))
 }
 
-func TestResolveMatchers(t *testing.T) {
+func TestSelectPredicate(t *testing.T) {
+	t.Parallel()
+	p := buildIndex()
+
+	// regexp predicate (supplied by the caller, not storage)
+	assert.Equal(t, sortedSet(1, 2), mustSlice(t, p.Select([]byte("job"), re("a.*"))))
+	assert.Equal(t, sortedSet(1, 2, 3), mustSlice(t, p.Select([]byte("env"), re("(prod|dev)"))))
+	// arbitrary custom predicate: values starting with 'w'
+	assert.Equal(t, sortedSet(3), mustSlice(t, p.Select([]byte("job"), func(v []byte) bool { return v[0] == 'w' })))
+	// no match, and unknown name
+	assert.Empty(t, mustSlice(t, p.Select([]byte("job"), re("nope"))))
+	assert.Empty(t, mustSlice(t, p.Select([]byte("region"), re(".*"))))
+}
+
+func TestResolveCallbackMatchers(t *testing.T) {
 	t.Parallel()
 	p := buildIndex()
 
@@ -61,39 +83,32 @@ func TestResolveMatchers(t *testing.T) {
 		want []signal.SeriesID
 	}{
 		{"none ⇒ all", nil, sortedSet(1, 2, 3)},
-		{"equal", []Matcher{eq("job", "api")}, sortedSet(1, 2)},
-		{"intersection", []Matcher{eq("job", "api"), eq("env", "prod")}, sortedSet(1)},
-		{"not-equal", []Matcher{{Op: MatchNotEqual, Name: []byte("job"), Value: []byte("api")}}, sortedSet(3)},
-		{"regexp", []Matcher{{Op: MatchRegexp, Name: []byte("job"), Value: []byte("a.*")}}, sortedSet(1, 2)},
-		{"regexp-exact-anchored", []Matcher{{Op: MatchRegexp, Name: []byte("job"), Value: []byte("ap")}}, nil},
-		{"not-regexp", []Matcher{{Op: MatchNotRegexp, Name: []byte("env"), Value: []byte("pro.*")}}, sortedSet(2)},
-		{"regexp ∩ equal", []Matcher{{Op: MatchRegexp, Name: []byte("job"), Value: []byte(".*")}, eq("env", "dev")}, sortedSet(2)},
+		{"single predicate", []Matcher{matcher("job", re("a.*"))}, sortedSet(1, 2)},
+		{"intersection", []Matcher{matcher("job", re("a.*")), matcher("env", re("prod"))}, sortedSet(1)},
+		{"anchored, no partial", []Matcher{matcher("job", re("ap"))}, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			it, err := p.Resolve(tc.ms...)
-			require.NoError(t, err)
-
-			got, err := ToSlice(it)
+			got, err := ToSlice(p.Resolve(tc.ms...))
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, got)
 		})
 	}
 }
 
-func TestResolveInvalidRegexp(t *testing.T) {
+// TestComposedNegation shows the language layer composes negation and equality from the
+// storage primitives, keeping storage free of operators.
+func TestComposedNegation(t *testing.T) {
 	t.Parallel()
 	p := buildIndex()
 
-	_, err := p.Resolve(Matcher{Op: MatchRegexp, Name: []byte("job"), Value: []byte("a(")})
-	require.Error(t, err)
-
-	_, err = p.Resolve(Matcher{Op: MatchNotRegexp, Name: []byte("job"), Value: []byte("a(")})
-	require.Error(t, err)
-
-	_, err = p.Resolve(Matcher{Op: MatchOp(99), Name: []byte("job")})
-	require.Error(t, err)
+	// job="api" (fast path via Get)
+	assert.Equal(t, sortedSet(1, 2), mustSlice(t, p.Get([]byte("job"), []byte("api"))))
+	// job!="api" = All \ Get(job,api)
+	assert.Equal(t, sortedSet(3), mustSlice(t, Without(p.All(), p.Get([]byte("job"), []byte("api")))))
+	// job!~"a.*" = All \ Select(job, /a.*/)
+	assert.Equal(t, sortedSet(3), mustSlice(t, Without(p.All(), p.Select([]byte("job"), re("a.*")))))
 }
 
 func TestDedupAcrossDuplicateAdds(t *testing.T) {

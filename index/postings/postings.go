@@ -2,16 +2,15 @@
 // sorted list of [signal.SeriesID]s that carry it, and composes those lists with lazy
 // set-op iterators ([Intersect]/[Merge]/[Without]) to resolve label matchers to series.
 //
-// Matchers here are **literal set algebra** over the index (equal / not-equal / regexp /
-// not-regexp), not a query language: a language package (PromQL, …) extracts conditions
-// and composes these primitives with its own semantics. Storage stays language-neutral.
+// Matching is **callback-based**: a [Matcher] carries a `Match func([]byte) bool`
+// predicate, and [MemPostings.Select] scans a label's values applying it. Storage knows
+// nothing about a query language's operators (regexp, equality, ranges) — a language
+// package supplies the predicate (e.g. a compiled regexp's Match) and composes the
+// primitives (Get/Select/ForName/WithoutName + the set ops) with its own semantics.
 package postings
 
 import (
-	"regexp"
 	"slices"
-
-	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/signal"
 )
@@ -110,91 +109,62 @@ func (p *MemPostings) LabelValues(name []byte) [][]byte {
 	return out
 }
 
-// MatchOp is a label-matcher operator: literal set semantics over the index.
-type MatchOp uint8
-
-const (
-	// MatchEqual selects series whose name value equals Value.
-	MatchEqual MatchOp = iota
-	// MatchNotEqual selects all series except those whose name value equals Value.
-	MatchNotEqual
-	// MatchRegexp selects series whose name value fully matches the Value regexp.
-	MatchRegexp
-	// MatchNotRegexp selects all series except those whose name value matches Value.
-	MatchNotRegexp
-)
-
-// Matcher is a single literal label condition.
-type Matcher struct {
-	Op    MatchOp
-	Name  []byte
-	Value []byte // exact value, or RE2 pattern for the regexp ops
-}
-
-// Resolve returns the series matching all matchers (their intersection). With no
-// matchers it returns every series. A regexp matcher with an invalid pattern errors.
-func (p *MemPostings) Resolve(ms ...Matcher) (Postings, error) {
-	if len(ms) == 0 {
-		return p.All(), nil
-	}
-
-	its := make([]Postings, 0, len(ms))
-	for _, m := range ms {
-		it, err := p.resolveMatcher(m)
-		if err != nil {
-			return nil, err
-		}
-
-		its = append(its, it)
-	}
-
-	return Intersect(its...), nil
-}
-
-func (p *MemPostings) resolveMatcher(m Matcher) (Postings, error) {
-	switch m.Op {
-	case MatchEqual:
-		return p.Get(m.Name, m.Value), nil
-	case MatchNotEqual:
-		return Without(p.All(), p.Get(m.Name, m.Value)), nil
-	case MatchRegexp:
-		return p.resolveRegexp(m.Name, m.Value)
-	case MatchNotRegexp:
-		pos, err := p.resolveRegexp(m.Name, m.Value)
-		if err != nil {
-			return nil, err
-		}
-
-		return Without(p.All(), pos), nil
-	default:
-		return nil, errors.Errorf("postings: unknown match op %d", m.Op)
-	}
-}
-
-// resolveRegexp returns the union of the series whose name value fully matches pattern.
-func (p *MemPostings) resolveRegexp(name, pattern []byte) (Postings, error) {
-	re, err := regexp.Compile("^(?:" + string(pattern) + ")$") // fully anchored, like PromQL
-	if err != nil {
-		return nil, errors.Wrapf(err, "compile regexp %q", pattern)
-	}
-
+// Select returns the union of the series whose value for name satisfies match — a
+// caller-supplied predicate, so storage stays free of any query-language operator. Use
+// it for regexp / range / custom conditions; for exact equality prefer [MemPostings.Get]
+// (an O(1) lookup instead of a values scan).
+//
+// match must not retain or mutate value: the same buffer is reused across the scan.
+func (p *MemPostings) Select(name []byte, match func(value []byte) bool) Postings {
 	p.ensureSorted()
 
 	byVal := p.m[string(name)]
+	if len(byVal) == 0 {
+		return Empty()
+	}
 
-	var its []Postings
+	var (
+		its     []Postings
+		scratch []byte
+	)
 
 	for v, ids := range byVal {
-		if re.MatchString(v) {
+		scratch = append(scratch[:0], v...)
+		if match(scratch) {
 			its = append(its, FromSlice(ids))
 		}
 	}
 
 	if len(its) == 0 {
-		return Empty(), nil
+		return Empty()
 	}
 
-	return Merge(its...), nil
+	return Merge(its...)
+}
+
+// Matcher is a single label condition: the values of Name whose bytes satisfy Match.
+// The callback form keeps storage language-neutral — a language package supplies the
+// predicate (a compiled regexp's Match, an exact compare, a numeric range, …).
+type Matcher struct {
+	Name  []byte
+	Match func(value []byte) bool
+}
+
+// Resolve returns the series matching all matchers (their intersection). With no
+// matchers it returns every series. Each matcher is resolved with [MemPostings.Select];
+// negation and absent-label semantics are composed by the caller with [Without] /
+// [MemPostings.WithoutName].
+func (p *MemPostings) Resolve(ms ...Matcher) Postings {
+	if len(ms) == 0 {
+		return p.All()
+	}
+
+	its := make([]Postings, len(ms))
+	for i, m := range ms {
+		its[i] = p.Select(m.Name, m.Match)
+	}
+
+	return Intersect(its...)
 }
 
 // ensureSorted sorts and deduplicates every list (and the all-set) in place. It runs on
