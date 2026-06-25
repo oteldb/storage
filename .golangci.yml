@@ -69,6 +69,9 @@ linters:
         # Integer-conversion overflow: deliberate and bounds-checked in codec
         # paths (row ids, bit widths, varint lengths); flagging every cast is noise.
         - G115
+        # Slice-bounds: hand-written binary parsers bounds-check every length before
+        # slicing and are fuzzed for no-panic; G602 can't see the invariant.
+        - G602
     lll:
       line-length: 140
     misspell:
