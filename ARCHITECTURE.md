@@ -16,9 +16,10 @@
 `go-faster/oteldb`) owns the process and calls the small `storage` facade.
 
 What is actually built today is the **encoding foundation** (the bit-level and
-column-codec layer), its supporting **pool**, and the **public facade skeleton**
-(construction, options, shared types). The higher layers — part format, index, engine,
-fetch contract, query languages, cluster — currently exist as package boundaries with
+column-codec layer), the **part format** (`block`) and **storage backends**
+(`backend` memory + file), its supporting **pool**, and the **public facade skeleton**
+(construction, options, shared types). The higher layers — index, engine, fetch
+contract, query languages, cluster — currently exist as package boundaries with
 documented seams; their behavior is not yet implemented.
 
 ---
@@ -34,12 +35,13 @@ The design is a single columnar engine with swappable front-ends and backends
 | L5 Query engine | plan IR · sharding · streaming exec · cache | — (package `query`, seam only) |
 | L4 Fetch contract | matchers + column conditions + window → iterator | — (package `query`, seam only) |
 | L3 Engine / Index | WAL · head · flush · merge / postings · marks · blooms | — (packages `engine`, `index`, `wal`, seam only) |
-| L2 Part / **Encoding** | immutable parts · per-column streams / **bitstream · codecs · compress** | **Encoding implemented**; part format (`block`) seam only |
-| L1 Backend | file · s3 · memory behind one interface | Interface + ephemeral memory stub |
+| L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
+| L1 **Backend** | file · s3 · memory behind one interface | **memory + file implemented**; s3 + CAS pending |
 | L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | — (package `cluster`, seam only) |
 
-The **implemented substance is the L2 encoding column** plus the supporting pool and
-the public facade. The rest of this document details those.
+The **implemented substance is the L1 backend seam, the L2 encoding column + part
+format**, plus the supporting pool and the public facade. The rest of this document
+details those.
 
 ---
 
@@ -114,6 +116,58 @@ both `chunk.EncodeBytes` and `chunk.DictEncoder`.
 
 ---
 
+## 3a. Storage backends (`backend/`)
+
+The L1 seam: a common `Backend` interface over whole-object, slash-delimited keys —
+`Read(ctx,key)([]byte)`, `Write(ctx,key,[]byte)`, `List(ctx,prefix)([]string)`,
+`Delete(ctx,key)`, plus `IsEphemeral()`. Absent keys return an error satisfying
+`errors.Is(_, backend.ErrNotExist)`. Ranged/streaming reads and compare-and-swap are
+deferred to the s3 backend (later milestone).
+
+- **`backend.Memory()`** (root package) — the ephemeral reference backend: a concurrent
+  map that copies on both `Write` and `Read`, so stored objects are immutable and never
+  alias a caller's buffer. The default in tests.
+- **`backend/file`** — a directory tree. Keys map to paths under a root (with a `..`
+  traversal guard); `Write` is atomic via a temp file + `fsync` + `rename`, which is the
+  per-object atomicity the "manifest written last" part commit relies on.
+- **`backend/backendtest`** — a shared conformance suite (`Run(t, factory)`) that both
+  backends pass under `-race`, proving they are interchangeable.
+
+Backends are interchangeable behind the interface; s3 and `bucketindex` remain seam-only.
+
+## 3b. Part format (`block/`)
+
+The L2 on-disk unit: an **immutable, columnar part**. A part is **not** a single blob —
+it is a set of backend objects under one key prefix, so a reader fetches only the
+columns it references (projection pushdown without ranged reads):
+
+```
+{prefix}/manifest   schema + stats, CRC32C-checked, WRITTEN LAST = the commit point
+{prefix}/marks      sparse granule index (sort-key min/max per granule)
+{prefix}/c/{i}      column i's stream (absent for a constant-collapsed column)
+```
+
+- **Columns** (`column.go`) carry one physical `Kind` — `KindInt64` / `KindFloat64` /
+  `KindBytes`. A codec is selected per kind (`CodecDoD`/`CodecT64` for int64,
+  `CodecGorilla`/`CodecDecimal` for float64, `CodecDict` for bytes; overridable). The
+  encoded chunk stream is wrapped in a `compress` frame. Per column the writer records
+  min/max and **collapses a constant column** to a single value in the manifest (no data
+  object) — the OTel resource-attribute win. The lazy `ColumnReader` decodes on demand:
+  `Int64`/`Float64` into a reusable slice, `Bytes` into `chunk.DictColumn` split form, and
+  synthesizes constants with no I/O.
+- **Manifest** (`manifest.go`) is a versioned binary record (magic `OTPM`, version, row
+  count, time range, granule size, per-column descriptors) with a trailing CRC32C. Decode
+  bounds-checks every field and never panics (fuzzed).
+- **Marks** (`marks.go`) is the sparse granule index over the sort-key (timestamp)
+  column: per-granule first row + min/max, delta-encoded, CRC-checked. `Overlapping(lo,hi)`
+  prunes granules for a time window (used by the future fetcher).
+- **PartWriter / PartReader** (`part.go`): `WritePart(ctx, backend, prefix, w)` writes the
+  column and marks objects first, then the manifest last (commit). `OpenPart` reads only
+  the manifest; `Column`/`Marks` read their objects lazily. An incompletely written part
+  (no manifest) is not openable.
+
+---
+
 ## 4. Public surface (`storage` root package)
 
 The embedder-facing API. The construction and configuration path is wired and working;
@@ -141,10 +195,8 @@ the ingest and query paths are scaffolded and return `ErrNotImplemented`.
   `Policy`, resolved per tenant id through a `Resolver` (`ResolverFunc` adapter;
   `Default()` returns an empty-policy resolver). Multi-tenancy, retention, and
   downsampling are consumer-supplied callbacks keyed by tenant id.
-- **`backend`** — the L1 seam. The `Backend` interface currently exposes only
-  `IsEphemeral()`; `Memory()` returns the ephemeral reference backend used as the test
-  default. The full Read/Write/List/Delete/CAS surface and the file/s3 implementations
-  are not yet present.
+- **`backend`** — the L1 seam (detailed in §3a): `Read`/`Write`/`List`/`Delete` over
+  whole-object keys, with memory and file implementations. s3 + CAS pending.
 
 ---
 
@@ -163,9 +215,11 @@ These hold in the implemented code and must be preserved by changes:
 - **Immutable, in-memory-first.** The in-memory/ephemeral path is first-class — every
   layer must work with no disk or object store. `backend.Memory()` is the reference
   backend.
-- **Stable formats.** The `Codec` enum, the per-stream header, and each codec's framing
-  are persisted/wire-stable. Changing a framing is an architectural change (golden tests
-  guard formats; update this file too).
+- **Stable formats.** The `Codec` enum, the per-stream header, each codec's framing, and
+  the part formats — the manifest (magic `OTPM`, versioned, CRC32C), the marks index
+  (`OTMK`), the per-column object framing, and the `{prefix}/manifest|marks|c/{i}` key
+  layout — are persisted/wire-stable. Changing any of them is an architectural change
+  (golden tests guard formats; bump the format version and update this file too).
 
 ### Testing discipline
 
@@ -188,8 +242,8 @@ pool/                 ByteIntMap (xxh3) for dict building                       
 signal/               Signal enum, TenantID, ParseSignal                              [implemented]
   signal/metric       metrics point types & OTLP→columnar projection                  [seam only]
 tenant/               Limits/Retention/Downsample/Policy, Resolver                     [implemented]
-backend/              Backend interface + ephemeral Memory() stub                      [interface + stub]
-block/                immutable columnar part format + manifest                        [seam only]
+backend/              Backend interface + memory (root) + file/                         [implemented; s3/bucketindex seam only]
+block/                immutable columnar part format: column/marks/manifest/part        [implemented]
 index/                postings / symbols / bloom / series identity                     [seam only]
 wal/                  write-ahead log framing                                          [seam only]
 engine/               head · flush · background-merge                                  [seam only]
