@@ -9,7 +9,7 @@
 > Forward-looking design and the milestone plan live in `DESIGN.md` and `PROMPT.md`;
 > keep speculation and TODOs out of this file.
 >
-> Last verified against the tree: 2026-06-25 (M2: index + WAL).
+> Last verified against the tree: 2026-06-26 (M3: engine vertical — ingest/flush/merge/fetch).
 
 `github.com/oteldb/storage` is a low-level, OpenTelemetry-centric columnar storage
 **library** (Go 1.26). It has no `main`, server, or CLI: an embedder (primarily
@@ -18,11 +18,14 @@
 What is actually built today is the **encoding foundation** (the bit-level and
 column-codec layer), the **part format** (`block`) and **storage backends**
 (`backend` memory + file), the **identity + index layer** (typed attributes/SeriesID in
-`signal`, plus `index/{symbols,series,postings}`) and the **write-ahead log** (`wal`),
-its supporting **pool**, and the **public facade skeleton** (construction, options,
-shared types). The remaining layers — engine, fetch contract, query languages, cluster —
-currently exist as package boundaries with documented seams; their behavior is not yet
-implemented.
+`signal`, plus `index/{symbols,series,postings}`), the **write-ahead log** (`wal`), and —
+new in M3 — the **single-node metrics engine** (`engine`): an in-memory head, flush to
+immutable flat parts, size-tiered merge with retention, and the **fetch contract**
+(`query/fetch`) reading head ∪ parts, all driven through the **public facade**
+(`storage`) which now ingests OTLP metrics (`signal/metric` projection) and routes them
+per-tenant. The remaining layers — query languages (PromQL/LogQL/…), the query planner,
+and cluster — currently exist as package boundaries with documented seams; their behavior
+is not yet implemented.
 
 ---
 
@@ -35,15 +38,16 @@ The design is a single columnar engine with swappable front-ends and backends
 |---|---|---|
 | L6 Query languages | promql/logql/traceql/genericql | — (package `query`, seam only) |
 | L5 Query engine | plan IR · sharding · streaming exec · cache | — (package `query`, seam only) |
-| L4 Fetch contract | matchers + column conditions + window → iterator | — (package `query`, seam only) |
-| L3 Engine / **Index / WAL** | head · flush · merge / **symbols · series · postings** · **write-ahead log** | engine seam only; **index (symbols/series/postings) + wal implemented** |
+| L4 **Fetch contract** | **callback matchers + window → iterator of batches** | **implemented for metrics** (`query/fetch`); column conditions pending |
+| L3 **Engine** / **Index / WAL** | **head · flush · merge · retention** / **symbols · series · postings** · **write-ahead log** | **engine implemented (metrics)**; **index + wal implemented** |
 | L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
 | L1 **Backend** | file · s3 · memory behind one interface | **memory + file implemented**; s3 + CAS pending |
 | L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | — (package `cluster`, seam only) |
 
-The **implemented substance is the L1 backend seam, the L2 encoding column + part
-format**, plus the supporting pool and the public facade. The rest of this document
-details those.
+The **implemented substance now spans L1 (backends) through L4 (the metrics fetch
+contract)**: encoding, parts, index, WAL, the engine head/flush/merge, and the facade's
+metrics ingest+read path. L5/L6 (planner, query languages) and L0 (cluster) remain seams.
+The rest of this document details what is built.
 
 ---
 
@@ -83,6 +87,7 @@ persisted/wire-stable and must never be reordered. `IsEOF` classifies truncation
 | `CodecT64` | low-range `int64` | `EncodeIntsT64` / `DecodeIntsT64` | ClickHouse T64 bit-transpose + crop |
 | `CodecDict` | low-cardinality `[][]byte` | `EncodeBytes` / `DecodeBytes` | dictionary; 1 byte/row ≤256 distinct, 2 bytes ≤65536, flat fallback above |
 | `CodecDecimal` | `float64` | `EncodeFloatsDecimal` / `DecodeFloatsDecimal` | scaled-decimal + nearest-delta, optionally lossy |
+| `CodecID128` | 128-bit ids (`[]U128`) | `EncodeU128` / `DecodeU128` | run-length (distinct id + run length); optimal for a sorted SeriesID sort key |
 
 Dictionary codec specifics (the most built-out):
 - `DecodeBytes` materializes one `[]byte` header per row (the gather form).
@@ -150,13 +155,15 @@ columns it references (projection pushdown without ranged reads):
 ```
 
 - **Columns** (`column.go`) carry one physical `Kind` — `KindInt64` / `KindFloat64` /
-  `KindBytes`. A codec is selected per kind (`CodecDoD`/`CodecT64` for int64,
-  `CodecGorilla`/`CodecDecimal` for float64, `CodecDict` for bytes; overridable). The
-  encoded chunk stream is wrapped in a `compress` frame. Per column the writer records
-  min/max and **collapses a constant column** to a single value in the manifest (no data
-  object) — the OTel resource-attribute win. The lazy `ColumnReader` decodes on demand:
-  `Int64`/`Float64` into a reusable slice, `Bytes` into `chunk.DictColumn` split form, and
-  synthesizes constants with no I/O.
+  `KindBytes` / `KindInt128`. A codec is selected per kind (`CodecDoD`/`CodecT64` for
+  int64, `CodecGorilla`/`CodecDecimal` for float64, `CodecDict` for bytes, `CodecID128`
+  for int128; overridable). The encoded chunk stream is wrapped in a `compress` frame. Per
+  column the writer records min/max and **collapses a constant column** to a single value
+  in the manifest (no data object) — the OTel resource-attribute win. `KindInt128` (the
+  metric SeriesID sort key) is the exception: it carries no min/max or constant value, as
+  its RLE codec already collapses a single-id run to a few bytes. The lazy `ColumnReader`
+  decodes on demand: `Int64`/`Float64`/`ID128` into a reusable slice, `Bytes` into
+  `chunk.DictColumn` split form, and synthesizes constants with no I/O.
 - **Manifest** (`manifest.go`) is a versioned binary record (magic `OTPM`, version, row
   count, time range, granule size, per-column descriptors) with a trailing CRC32C. Decode
   bounds-checks every field and never panics (fuzzed).
@@ -208,19 +215,75 @@ torn final record (crash recovery), surfaces a bad-CRC complete record as corrup
 skips unknown record types (forward-compat). Replaying the log rebuilds the symbols +
 series + postings index — the path that reconstructs the head after a restart.
 
+## 3e. Metrics projection (`signal/metric/`)
+
+The OTLP → internal boundary for metrics. `metric.Project(md, emit)` walks
+resource → scope → metric → number data point for **Gauge and Sum** points (Histogram /
+ExpHistogram / Summary are deferred and counted as rejected, as are value-less points),
+converting `pcommon.Map`/`pcommon.Value` to typed `signal.Attributes`/`signal.Value`
+(`convert.go`). Metric identity (`Identity`) folds the metric-specific fields — name,
+unit, kind, temporality, monotonicity — into **reserved labels** (`__name__`, `__unit__`,
+…) on a `signal.Series`, so the one identity/index machinery covers metrics and a query
+matches `__name__` like any other label. `emit` receives `(Identity, Sample)` per point.
+
+## 3f. Engine (`engine/`) — the single-node metrics vertical
+
+One `Engine` per tenant ties the index, parts, and WAL into a working ingest+query path.
+It is safe for concurrent use (one `sync.RWMutex`).
+
+- **Head** (`head.go`) is the in-memory write buffer: the index (`symbols` + `series` +
+  `postings`) plus per-series `(ts, value)` append buffers. `append` interns every
+  queryable label (resource + scope attributes, scope name/version as reserved labels, and
+  the folded point attributes), registers the series on first sight, and rejects samples
+  older than `newest − OOOWindow`. The **series index outlives a flush** — only sample
+  buffers are drained — so flushed series stay queryable and re-appends don't re-index.
+- **Flush** (`flush.go`) drains the head's buffered samples into one **flat 3-column part**
+  `[series:int128, ts:int64, value:float64]`, one row per sample, sorted by `(series, ts)`,
+  written via `block.PartWriter` under `{tenant}/metrics/{seq}`.
+- **Part fetch** (`part.go`) — `openPart` rebuilds a `SeriesID → [rowStart,rowEnd)` index
+  by scanning the series column once (each series is one contiguous run); `mergeInto`
+  decodes a series' `ts`/`value` sub-slice within the window.
+- **Merge + retention** (`merge.go`) is the one background-merge engine: `Merge(retainFrom)`
+  compacts every part into one, merging samples per series by timestamp (freshest wins on a
+  tie) and dropping samples older than the absolute `retainFrom` cutoff before deleting the
+  source parts. Retention is a timestamp, not a clock read, so the engine is deterministic.
+- **Fetch** (`engine.go`) implements the fetch contract: it resolves matchers to series
+  over the index, then merges each series' head buffer ∪ every part by timestamp into one
+  batch. `Close` flushes the head.
+
+The metric part column layout and the WAL sample record are **wire-stable** on-disk
+formats.
+
+## 3g. Fetch contract (`query/fetch/`)
+
+The dual-shape read seam (metrics shape today). A `Request{Tenant, Start, End, Matchers}`
+carries **callback matchers** — `Matcher{Name, Match func(signal.Value) bool}`, never an
+operator enum, so equality/regex/negation live in the (future) language layer and the
+storage layer stays operator-free. `Fetcher.Fetch` returns an `Iterator` of `*Batch{ID,
+Series, Timestamps, Values}` (one batch per matching series for M3). `SliceIterator` and
+`Drain` are the in-memory helpers.
+
 ---
 
 ## 4. Public surface (`storage` root package)
 
-The embedder-facing API. The construction and configuration path is wired and working;
-the ingest and query paths are scaffolded and return `ErrNotImplemented`.
+The embedder-facing API. The construction and **metrics ingest+read path are wired and
+working**; logs/traces/profiles ingest and the query-language path still return
+`ErrNotImplemented`.
 
 - **`Storage`** — the facade. `Open(ctx, Options, ...Option)` and `InMemory(...Option)`
-  construct it (validation, defaulting, and tenant-resolver wiring run here);
-  `Close(ctx)` tears it down. Ingest methods `WriteMetrics`/`WriteLogs`/`WriteTraces`/
-  `WriteProfiles` take pdata and return `Accepted` (OTLP partial-success counts).
-  `Query(ctx, tenant, Query)` returns a `Result`. The unexported `write` helper resolves
-  the tenant policy and checks the closed flag — the seam ingest dispatches through.
+  construct it (validation, defaulting, tenant-resolver wiring, and — when `FlushInterval`
+  is set — the background maintenance loop start here); `Close(ctx)` stops the loop and
+  flushes every tenant engine. `WriteMetrics(ctx, md)` is **fully implemented**: it
+  projects pdata (`signal/metric`), derives each point's **tenant from its Resource+Scope**
+  via the `Options.Tenant` callback (no tenant argument), and appends to that tenant's
+  lazily-created `engine.Engine` (one per tenant, parts under `{tenant}/metrics`). It
+  returns `Accepted` (OTLP partial-success: rejected counts unsupported kinds, value-less
+  points, and out-of-order drops). `WriteLogs`/`WriteTraces`/`WriteProfiles` are later
+  verticals (`ErrNotImplemented`). A single **maintenance loop** periodically flushes +
+  merges every engine, applying per-tenant retention from the resolved policy. `Query` is
+  the seam for the query languages (M4); the low-level read path today is `engine.Fetch`
+  via the fetch contract.
 - **`Options` / `Option`** (`options.go`) — config struct plus functional options
   (`WithBackend`, `WithCluster`, `WithTenancy`, `WithEncoding`, `WithDurability`,
   `WithWALDir`, `WithFlushThresholdBytes`, `WithFlushInterval`, `WithOOOWindow`).
@@ -262,9 +325,11 @@ These hold in the implemented code and must be preserved by changes:
 - **Stable formats.** The `Codec` enum, the per-stream header, each codec's framing, the
   part formats (manifest `OTPM`, marks `OTMK`, per-column object framing, the
   `{prefix}/manifest|marks|c/{i}` key layout), the **attribute hash/binary encoding** (the
-  SeriesID pre-image), the **symbol table** (`OTSY`), and the **WAL record framing** are
-  all persisted/wire-stable. Changing any of them is an architectural change (golden tests
-  guard formats; bump the version and update this file too).
+  SeriesID pre-image), the **symbol table** (`OTSY`), the **WAL record framing** (series +
+  sample records), and the **metric part column layout** (`[series:int128, ts:int64,
+  value:float64]` sorted by `(series, ts)`) are all persisted/wire-stable. Changing any of
+  them is an architectural change (golden tests guard formats; bump the version and update
+  this file too).
 
 ### Testing discipline
 
@@ -278,21 +343,22 @@ green; the tree is `gofmt`/`goimports` clean.
 ## 6. Package map
 
 ```
-.                     storage facade: Storage, Open/InMemory, Options, Query/Result   [implemented: construction; ingest/query stubbed]
+.                     storage facade: Storage, Open/InMemory, Options, per-tenant engines, maintenance loop [implemented: metrics ingest+read; logs/traces/profiles & query-lang stubbed]
 encoding/             umbrella doc for the codec layers
   encoding/bitstream  MSB-first bit Writer/Reader                                      [implemented]
-  encoding/chunk      DoD / Gorilla / T64 / dict / decimal column codecs              [implemented]
+  encoding/chunk      DoD / Gorilla / T64 / dict / decimal / id128 column codecs      [implemented]
   encoding/compress   zstd/none block wrapper (lz4 stub)                              [implemented]
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
 signal/               typed Attributes/Value, Resource/Scope/Series identity, 128-bit SeriesID, Signal, TenantID [implemented]
-  signal/metric       metrics point types & OTLP→columnar projection                  [seam only]
+  signal/metric       metrics identity + OTLP→columnar projection (gauge/sum)          [implemented; histogram/summary deferred]
 tenant/               Limits/Retention/Downsample/Policy, Resolver                     [implemented]
 backend/              Backend interface + memory (root) + file/                         [implemented; s3/bucketindex seam only]
 block/                immutable columnar part format: column/marks/manifest/part        [implemented]
 index/                symbols (intern) · series (id↔attrs) · postings (set-ops/matchers) [implemented; bloom seam only]
 wal/                  CRC-framed segmented write-ahead log + replay                    [implemented]
-engine/               head · flush · background-merge                                  [seam only]
-query/                fetch contract · plan · exec · language front-ends               [seam only]
+engine/               head · flush · background-merge · retention · fetch (metrics)    [implemented]
+query/fetch           callback-matcher fetch contract (Request/Matcher/Iterator/Batch) [implemented for metrics]
+query/                plan · exec · language front-ends                               [seam only]
 cluster/              etcd ring · HRW sharding · replication · rebalance               [seam only]
 ```
 
