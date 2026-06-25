@@ -7,13 +7,13 @@ import "github.com/go-faster/errors"
 type Signal uint8
 
 const (
-	// Metric is the metrics signal (the first vertical, DESIGN.md §14 M0–M7).
+	// Metric is the metrics signal (the first vertical).
 	Metric Signal = iota + 1
-	// Log is the logs signal (later vertical, DESIGN.md §12).
+	// Log is the logs signal (later vertical).
 	Log
-	// Trace is the traces signal (later vertical, DESIGN.md §12).
+	// Trace is the traces signal (later vertical).
 	Trace
-	// Profile is the profiles signal (later vertical, DESIGN.md §12).
+	// Profile is the profiles signal (later vertical).
 	Profile
 )
 
@@ -61,9 +61,9 @@ func ParseSignal(s string) (Signal, error) {
 // ErrUnknownSignal is returned by [ParseSignal] for an unrecognized name.
 var ErrUnknownSignal = errors.New("signal: unknown signal kind")
 
-// TenantID identifies a tenant. It is the leading key/path prefix for all data
-// (DESIGN.md §9) and the argument to [tenant.Resolver] policy lookups. The zero value
-// is the default tenant; callers may use any non-empty string.
+// TenantID identifies a tenant. It is the leading key/path prefix for all data and the
+// argument to [tenant.Resolver] policy lookups. The zero value is the default tenant;
+// callers may use any non-empty string.
 //
 // TenantID is compared by value (it is a string) and is safe to use as a map key.
 type TenantID string
