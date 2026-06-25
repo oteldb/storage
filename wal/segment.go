@@ -65,14 +65,14 @@ func (sw *SegmentWriter) Write(p []byte) (int, error) {
 
 // WriteSeries logs a series registration, rotating to a new segment first if the current
 // one is full.
-func (sw *SegmentWriter) WriteSeries(id signal.SeriesID, attrs signal.Attributes) error {
+func (sw *SegmentWriter) WriteSeries(id signal.SeriesID, s signal.Series) error {
 	if sw.size >= sw.maxBytes {
 		if err := sw.rotate(); err != nil {
 			return err
 		}
 	}
 
-	return sw.w.WriteSeries(id, attrs)
+	return sw.w.WriteSeries(id, s)
 }
 
 // Sync flushes the current segment to stable storage.

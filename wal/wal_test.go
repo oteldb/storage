@@ -29,9 +29,19 @@ func attrs(pairs ...string) signal.Attributes {
 	return signal.NewAttributes(kvs...)
 }
 
+// mkSeries builds a series identity with a fixed resource/scope and the given point
+// attributes.
+func mkSeries(pointPairs ...string) signal.Series {
+	return signal.Series{
+		Resource:   signal.Resource{Attributes: attrs("service.name", "svc")},
+		Scope:      signal.Scope{Name: []byte("lib")},
+		Attributes: attrs(pointPairs...),
+	}
+}
+
 type captured struct {
 	id signal.SeriesID
-	a  signal.Attributes
+	s  signal.Series
 }
 
 func collect(t *testing.T, data []byte) []captured {
@@ -39,8 +49,8 @@ func collect(t *testing.T, data []byte) []captured {
 
 	var got []captured
 
-	err := Replay(data, Handlers{OnSeries: func(id signal.SeriesID, a signal.Attributes) error {
-		got = append(got, captured{id, a.Clone()})
+	err := Replay(data, Handlers{OnSeries: func(id signal.SeriesID, s signal.Series) error {
+		got = append(got, captured{id, s.Clone()})
 
 		return nil
 	}})
@@ -55,16 +65,16 @@ func TestWriteReplayRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	w := NewWriter(&buf)
 
-	a1, a2 := attrs("job", "api"), attrs("job", "web", "env", "prod")
-	require.NoError(t, w.WriteSeries(a1.Hash(), a1))
-	require.NoError(t, w.WriteSeries(a2.Hash(), a2))
+	s1, s2 := mkSeries("job", "api"), mkSeries("job", "web", "env", "prod")
+	require.NoError(t, w.WriteSeries(s1.Hash(), s1))
+	require.NoError(t, w.WriteSeries(s2.Hash(), s2))
 
 	got := collect(t, buf.Bytes())
 	require.Len(t, got, 2)
-	assert.Equal(t, a1.Hash(), got[0].id)
-	assert.True(t, a1.Equal(got[0].a))
-	assert.Equal(t, a2.Hash(), got[1].id)
-	assert.True(t, a2.Equal(got[1].a))
+	assert.Equal(t, s1.Hash(), got[0].id)
+	assert.True(t, s1.Equal(got[0].s))
+	assert.Equal(t, s2.Hash(), got[1].id)
+	assert.True(t, s2.Equal(got[1].s))
 }
 
 func TestTornTailRecoversPrefix(t *testing.T) {
@@ -72,28 +82,28 @@ func TestTornTailRecoversPrefix(t *testing.T) {
 
 	var buf bytes.Buffer
 	w := NewWriter(&buf)
-	a1, a2 := attrs("job", "api"), attrs("job", "web")
-	require.NoError(t, w.WriteSeries(a1.Hash(), a1))
+	s1, s2 := mkSeries("job", "api"), mkSeries("job", "web")
+	require.NoError(t, w.WriteSeries(s1.Hash(), s1))
 	full := len(buf.Bytes())
-	require.NoError(t, w.WriteSeries(a2.Hash(), a2))
+	require.NoError(t, w.WriteSeries(s2.Hash(), s2))
 
-	// Cut the second record in the middle: replay must keep the first and stop cleanly.
-	torn := buf.Bytes()[:full+2]
+	torn := buf.Bytes()[:full+2] // cut the second record mid-frame
 	got := collect(t, torn)
 	require.Len(t, got, 1)
-	assert.Equal(t, a1.Hash(), got[0].id)
+	assert.Equal(t, s1.Hash(), got[0].id)
 }
 
 func TestCorruptRecordSurfaced(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	require.NoError(t, NewWriter(&buf).WriteSeries(attrs("job", "api").Hash(), attrs("job", "api")))
+	s := mkSeries("job", "api")
+	require.NoError(t, NewWriter(&buf).WriteSeries(s.Hash(), s))
 
 	data := buf.Bytes()
 	data[3] ^= 0xFF // corrupt a body byte; length stays valid, CRC fails
 
-	err := Replay(data, Handlers{OnSeries: func(signal.SeriesID, signal.Attributes) error { return nil }})
+	err := Replay(data, Handlers{OnSeries: func(signal.SeriesID, signal.Series) error { return nil }})
 	require.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -102,7 +112,7 @@ func TestUnknownRecordSkipped(t *testing.T) {
 
 	frame := appendFrame(nil, 99, []byte("future record type"))
 	called := false
-	err := Replay(frame, Handlers{OnSeries: func(signal.SeriesID, signal.Attributes) error {
+	err := Replay(frame, Handlers{OnSeries: func(signal.SeriesID, signal.Series) error {
 		called = true
 
 		return nil
@@ -115,16 +125,16 @@ func TestReplayNilHandler(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	require.NoError(t, NewWriter(&buf).WriteSeries(attrs("a", "b").Hash(), attrs("a", "b")))
-	// No handler set: records are read (and skipped) without error.
+	s := mkSeries("a", "b")
+	require.NoError(t, NewWriter(&buf).WriteSeries(s.Hash(), s))
 	require.NoError(t, Replay(buf.Bytes(), Handlers{}))
 }
 
 func TestWriterWriteError(t *testing.T) {
 	t.Parallel()
 
-	a := attrs("a", "b")
-	err := NewWriter(errWriter{}).WriteSeries(a.Hash(), a)
+	s := mkSeries("a", "b")
+	err := NewWriter(errWriter{}).WriteSeries(s.Hash(), s)
 	require.ErrorIs(t, err, errWrite)
 }
 
@@ -132,38 +142,39 @@ func TestOnSeriesError(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	a := attrs("a", "b")
-	require.NoError(t, NewWriter(&buf).WriteSeries(a.Hash(), a))
+	s := mkSeries("a", "b")
+	require.NoError(t, NewWriter(&buf).WriteSeries(s.Hash(), s))
 
-	err := Replay(buf.Bytes(), Handlers{OnSeries: func(signal.SeriesID, signal.Attributes) error { return errBoom }})
+	err := Replay(buf.Bytes(), Handlers{OnSeries: func(signal.SeriesID, signal.Series) error { return errBoom }})
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestParseSeriesErrors(t *testing.T) {
 	t.Parallel()
 
-	noop := Handlers{OnSeries: func(signal.SeriesID, signal.Attributes) error { return nil }}
+	noop := Handlers{OnSeries: func(signal.SeriesID, signal.Series) error { return nil }}
 
 	// Payload shorter than a SeriesID.
 	short := appendFrame(nil, recordSeries, []byte{1, 2, 3})
 	require.ErrorIs(t, Replay(short, noop), ErrCorrupt)
 
-	// Valid 16-byte id, then attributes that claim more entries than the bytes allow.
-	payload := append(make([]byte, seriesIDLen), 0x05) // count=5, no following data
+	// Valid 16-byte id, then a resource whose schema-url length runs past the data.
+	payload := append(make([]byte, seriesIDLen), 0x7f) // schema_url len=127, no following bytes
 	require.Error(t, Replay(appendFrame(nil, recordSeries, payload), noop))
 }
 
 func FuzzReplay(f *testing.F) {
 	var buf bytes.Buffer
-	_ = NewWriter(&buf).WriteSeries(attrs("job", "api").Hash(), attrs("job", "api"))
+	s := mkSeries("job", "api")
+	_ = NewWriter(&buf).WriteSeries(s.Hash(), s)
 	f.Add(buf.Bytes())
 	f.Add([]byte{})
 
 	f.Fuzz(func(_ *testing.T, data []byte) {
 		// Must never panic; corrupt input returns an error or stops cleanly.
-		_ = Replay(data, Handlers{OnSeries: func(id signal.SeriesID, a signal.Attributes) error {
+		_ = Replay(data, Handlers{OnSeries: func(id signal.SeriesID, s signal.Series) error {
 			_ = id
-			_ = a.Clone()
+			_ = s.Clone()
 
 			return nil
 		}})

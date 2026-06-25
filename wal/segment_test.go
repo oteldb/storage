@@ -17,7 +17,7 @@ import (
 
 // head is the in-memory index reconstructed from the WAL: the symbol table, the series
 // index, and the inverted index. Adding a series mirrors what the engine does on ingest
-// and on replay.
+// and on replay — it indexes the resource, scope and point attributes as queryable labels.
 type head struct {
 	sym    *symbols.Table
 	series *series.Index
@@ -28,24 +28,38 @@ func newHead() *head {
 	return &head{sym: symbols.New(), series: series.New(), post: postings.NewMemPostings()}
 }
 
-func (h *head) add(id signal.SeriesID, a signal.Attributes) error {
-	h.series.Add(a) // recomputes the same content-addressed id
-	for _, kv := range a {
-		nameID := uint32(h.sym.Intern(kv.Key))
-		valueID := uint32(h.sym.Intern(signal.AppendValue(nil, kv.Value)))
-		h.post.Add(id, nameID, valueID)
+func (h *head) add(id signal.SeriesID, s signal.Series) error {
+	h.series.Add(s) // recomputes the same content-addressed id
+
+	h.indexAttrs(id, s.Resource.Attributes)
+	if len(s.Scope.Name) > 0 {
+		h.addLabel(id, []byte("otel.scope.name"), signal.StringValue(s.Scope.Name))
 	}
+	h.indexAttrs(id, s.Attributes)
 
 	return nil
 }
 
-// query resolves name=value to series ids on the reconstructed head.
+func (h *head) indexAttrs(id signal.SeriesID, a signal.Attributes) {
+	for _, kv := range a {
+		h.addLabel(id, kv.Key, kv.Value)
+	}
+}
+
+func (h *head) addLabel(id signal.SeriesID, name []byte, v signal.Value) {
+	nameID := uint32(h.sym.Intern(name))
+	valueID := uint32(h.sym.Intern(signal.AppendValue(nil, v)))
+	h.post.Add(id, nameID, valueID)
+}
+
+// query resolves name=value (a string-valued label) to series ids on the reconstructed
+// head.
 func (h *head) query(t *testing.T, name, value string) []signal.SeriesID {
 	t.Helper()
 	nameID, ok := h.sym.Lookup([]byte(name))
-	require.True(t, ok)
+	require.True(t, ok, "name %q", name)
 	valueID, ok := h.sym.Lookup(signal.AppendValue(nil, signal.StringValue([]byte(value))))
-	require.True(t, ok)
+	require.True(t, ok, "value %q", value)
 
 	got, err := postings.ToSlice(h.post.Get(uint32(nameID), uint32(valueID)))
 	require.NoError(t, err)
@@ -53,33 +67,41 @@ func (h *head) query(t *testing.T, name, value string) []signal.SeriesID {
 	return got
 }
 
+func mkInput(service, job, env string) signal.Series {
+	return signal.Series{
+		Resource:   signal.Resource{Attributes: attrs("service.name", service)},
+		Scope:      signal.Scope{Name: []byte("lib")},
+		Attributes: attrs("job", job, "env", env),
+	}
+}
+
 // TestSegmentReplayReconstructsHead is the M2 exit: write series across several
-// segments, then replay the directory to rebuild the index and query it.
+// segments, then replay the directory to rebuild the index and query it — including by a
+// Resource label, proving identity spans Resource + Scope + attributes.
 func TestSegmentReplayReconstructsHead(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 
-	input := []signal.Attributes{
-		attrs("job", "api", "env", "prod"),
-		attrs("job", "api", "env", "dev"),
-		attrs("job", "web", "env", "prod"),
-		attrs("job", "web", "env", "dev"),
-		attrs("job", "db", "env", "prod"),
+	input := []signal.Series{
+		mkInput("api", "ingest", "prod"),
+		mkInput("api", "ingest", "dev"),
+		mkInput("web", "ingest", "prod"),
+		mkInput("web", "render", "dev"),
+		mkInput("db", "compact", "prod"),
 	}
 
 	// Tiny segments force rotation, so replay must stitch multiple files together.
-	sw, err := Create(dir, 48)
+	sw, err := Create(dir, 64)
 	require.NoError(t, err)
-	for _, a := range input {
-		require.NoError(t, sw.WriteSeries(a.Hash(), a))
+	for _, s := range input {
+		require.NoError(t, sw.WriteSeries(s.Hash(), s))
 	}
 	require.NoError(t, sw.Close())
 
-	// More than one segment was produced.
+	segs := 0
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
-	segs := 0
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".wal") {
 			segs++
@@ -87,25 +109,20 @@ func TestSegmentReplayReconstructsHead(t *testing.T) {
 	}
 	require.GreaterOrEqual(t, segs, 2, "small maxBytes should rotate segments")
 
-	// Replay reconstructs the head.
 	h := newHead()
 	require.NoError(t, ReplayDir(dir, Handlers{OnSeries: h.add}))
 
 	assert.Equal(t, len(input), h.series.Len(), "every series recovered")
-	for _, a := range input {
-		_, ok := h.series.Get(a.Hash())
-		assert.Truef(t, ok, "series %v missing after replay", a)
+	for _, s := range input {
+		_, ok := h.series.Get(s.Hash())
+		assert.Truef(t, ok, "series %v missing after replay", s)
 	}
 
-	// matcher → SeriesIDs on the reconstructed index.
-	apiSeries := h.query(t, "job", "api")
-	assert.Len(t, apiSeries, 2)
-	for _, want := range []signal.Attributes{input[0], input[1]} {
-		assert.Contains(t, apiSeries, want.Hash())
-	}
-
-	prod := h.query(t, "env", "prod")
-	assert.Len(t, prod, 3)
+	// Query by a Resource label, a point label, and the scope name.
+	assert.Len(t, h.query(t, "service.name", "api"), 2)
+	assert.Len(t, h.query(t, "service.name", "web"), 2)
+	assert.Len(t, h.query(t, "job", "ingest"), 3)
+	assert.Len(t, h.query(t, "otel.scope.name", "lib"), len(input))
 }
 
 func TestCreateDefaultMaxBytes(t *testing.T) {
@@ -129,8 +146,8 @@ func TestSyncAndDoubleClose(t *testing.T) {
 
 	sw, err := Create(t.TempDir(), 0)
 	require.NoError(t, err)
-	a := attrs("a", "b")
-	require.NoError(t, sw.WriteSeries(a.Hash(), a))
+	s := mkSeries("a", "b")
+	require.NoError(t, sw.WriteSeries(s.Hash(), s))
 	require.NoError(t, sw.Sync())
 	require.NoError(t, sw.Close())
 	require.NoError(t, sw.Close(), "double close is a no-op")
@@ -144,6 +161,6 @@ func TestReplayDirCorruptSegment(t *testing.T) {
 	frame[3] ^= 0xFF // corrupt the body so the CRC fails
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "00000001.wal"), frame, 0o600))
 
-	err := ReplayDir(dir, Handlers{OnSeries: func(signal.SeriesID, signal.Attributes) error { return nil }})
+	err := ReplayDir(dir, Handlers{OnSeries: func(signal.SeriesID, signal.Series) error { return nil }})
 	require.ErrorIs(t, err, ErrCorrupt)
 }

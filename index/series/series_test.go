@@ -9,42 +9,55 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
+func sv(s string) signal.Value { return signal.StringValue([]byte(s)) }
+
 func attrs(pairs ...string) signal.Attributes {
 	kvs := make([]signal.KeyValue, 0, len(pairs)/2)
 	for i := 0; i+1 < len(pairs); i += 2 {
-		kvs = append(kvs, signal.KeyValue{Key: []byte(pairs[i]), Value: signal.StringValue([]byte(pairs[i+1]))})
+		kvs = append(kvs, signal.KeyValue{Key: []byte(pairs[i]), Value: sv(pairs[i+1])})
 	}
 
 	return signal.NewAttributes(kvs...)
+}
+
+// mk builds a series with a fixed resource/scope and the given point attributes.
+func mk(service string, pointPairs ...string) signal.Series {
+	return signal.Series{
+		Resource:   signal.Resource{Attributes: attrs("service.name", service)},
+		Scope:      signal.Scope{Name: []byte("lib"), Version: []byte("1.0")},
+		Attributes: attrs(pointPairs...),
+	}
 }
 
 func TestAddIsIdempotent(t *testing.T) {
 	t.Parallel()
 
 	ix := New()
-	id1 := ix.Add(attrs("job", "api", "inst", "1"))
-	id2 := ix.Add(attrs("inst", "1", "job", "api")) // same set, different order
+	id1 := ix.Add(mk("api", "route", "/x", "code", "200"))
+	id2 := ix.Add(mk("api", "code", "200", "route", "/x")) // same identity, attrs reordered
 
-	assert.Equal(t, id1, id2, "equal attribute sets ⇒ same id")
+	assert.Equal(t, id1, id2, "equal identities ⇒ same id")
 	assert.Equal(t, 1, ix.Len(), "re-adding does not store a second copy")
 }
 
-func TestAddDistinctSeries(t *testing.T) {
+func TestDistinctByResourceAndAttrs(t *testing.T) {
 	t.Parallel()
 
 	ix := New()
-	a := ix.Add(attrs("job", "api"))
-	b := ix.Add(attrs("job", "web"))
+	api := ix.Add(mk("api", "route", "/x"))
+	web := ix.Add(mk("web", "route", "/x")) // differs only in resource
+	other := ix.Add(mk("api", "route", "/y"))
 
-	assert.NotEqual(t, a, b)
-	assert.Equal(t, 2, ix.Len())
+	assert.NotEqual(t, api, web, "different resource ⇒ different series")
+	assert.NotEqual(t, api, other)
+	assert.Equal(t, 3, ix.Len())
 }
 
 func TestGetReconstructs(t *testing.T) {
 	t.Parallel()
 
 	ix := New()
-	want := attrs("job", "api", "inst", "1")
+	want := mk("api", "route", "/x")
 	id := ix.Add(want)
 
 	got, ok := ix.Get(id)
@@ -61,26 +74,22 @@ func TestAddRetainsACopy(t *testing.T) {
 	t.Parallel()
 
 	ix := New()
-	key := []byte("job")
-	val := []byte("api")
-	id := ix.Add(signal.NewAttributes(signal.KeyValue{Key: key, Value: signal.StringValue(val)}))
-
-	key[0] = 'X' // mutate caller buffers after Add
-	val[0] = 'Y'
+	s := mk("api", "route", "/x")
+	id := ix.Add(s)
+	s.Resource.Attributes[0].Value = sv("mutated") // mutate caller's struct after Add
 
 	got, _ := ix.Get(id)
-	want := attrs("job", "api")
-	assert.True(t, got.Equal(want), "the index must retain a deep copy")
+	assert.True(t, got.Equal(mk("api", "route", "/x")), "the index must retain a deep copy")
 }
 
 func TestForEach(t *testing.T) {
 	t.Parallel()
 
 	ix := New()
-	ix.Add(attrs("job", "api"))
-	ix.Add(attrs("job", "web"))
+	ix.Add(mk("api", "route", "/x"))
+	ix.Add(mk("web", "route", "/x"))
 
 	seen := map[signal.SeriesID]bool{}
-	ix.ForEach(func(id signal.SeriesID, _ signal.Attributes) { seen[id] = true })
+	ix.ForEach(func(id signal.SeriesID, _ signal.Series) { seen[id] = true })
 	assert.Len(t, seen, 2)
 }

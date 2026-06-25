@@ -27,7 +27,7 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 // Handlers receives decoded records during [Replay]. Unset handlers skip their record
 // type. More handlers (samples, …) are added as later milestones add record types.
 type Handlers struct {
-	OnSeries func(id signal.SeriesID, attrs signal.Attributes) error
+	OnSeries func(id signal.SeriesID, s signal.Series) error
 }
 
 // Writer appends framed records to an [io.Writer] (typically a segment file). It reuses
@@ -41,10 +41,10 @@ type Writer struct {
 // NewWriter returns a [Writer] over w.
 func NewWriter(w io.Writer) *Writer { return &Writer{w: w} }
 
-// WriteSeries logs a series registration: its [signal.SeriesID] and full typed attribute
-// set. Replaying it reconstructs the series in the index.
-func (wr *Writer) WriteSeries(id signal.SeriesID, attrs signal.Attributes) error {
-	wr.payload = attrs.AppendHashInput(id.AppendBinary(wr.payload[:0]))
+// WriteSeries logs a series registration: its [signal.SeriesID] and full identity
+// (Resource + Scope + data-point attributes). Replaying it reconstructs the series.
+func (wr *Writer) WriteSeries(id signal.SeriesID, s signal.Series) error {
+	wr.payload = s.AppendHashInput(id.AppendBinary(wr.payload[:0]))
 	wr.frame = appendFrame(wr.frame[:0], recordSeries, wr.payload)
 
 	if _, err := wr.w.Write(wr.frame); err != nil {
@@ -86,12 +86,12 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 			return nil
 		}
 
-		id, attrs, err := parseSeries(payload)
+		id, s, err := parseSeries(payload)
 		if err != nil {
 			return err
 		}
 
-		return h.OnSeries(id, attrs)
+		return h.OnSeries(id, s)
 	default:
 		return nil // unknown record type: skip for forward compatibility
 	}
@@ -134,11 +134,11 @@ func readFrame(src []byte) (typ byte, payload []byte, consumed int, err error) {
 	return body[0], body[1:], crcEnd, nil
 }
 
-// parseSeries decodes a series record payload: a 16-byte SeriesID then the typed
-// attribute set. The returned attributes alias payload.
-func parseSeries(payload []byte) (signal.SeriesID, signal.Attributes, error) {
+// parseSeries decodes a series record payload: a 16-byte SeriesID then the full identity
+// (Resource + Scope + attributes). The returned identity aliases payload.
+func parseSeries(payload []byte) (signal.SeriesID, signal.Series, error) {
 	if len(payload) < seriesIDLen {
-		return signal.SeriesID{}, nil, errors.Wrap(ErrCorrupt, "series record too short")
+		return signal.SeriesID{}, signal.Series{}, errors.Wrap(ErrCorrupt, "series record too short")
 	}
 
 	id := signal.SeriesID{
@@ -146,10 +146,10 @@ func parseSeries(payload []byte) (signal.SeriesID, signal.Attributes, error) {
 		Lo: binary.BigEndian.Uint64(payload[8:seriesIDLen]),
 	}
 
-	attrs, _, err := signal.DecodeAttributes(payload[seriesIDLen:])
+	s, _, err := signal.DecodeSeries(payload[seriesIDLen:])
 	if err != nil {
-		return signal.SeriesID{}, nil, errors.Wrap(err, "series attributes")
+		return signal.SeriesID{}, signal.Series{}, errors.Wrap(err, "series identity")
 	}
 
-	return id, attrs, nil
+	return id, s, nil
 }
