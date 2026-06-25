@@ -1,4 +1,4 @@
-# storage
+# storage [![codecov](https://img.shields.io/codecov/c/github/oteldb/storage?label=cover)](https://codecov.io/gh/oteldb/storage) [![experimental](https://img.shields.io/badge/-experimental-blueviolet)](https://go-faster.org/docs/projects/status#experimental)
 
 Low-level, distributed, OpenTelemetry-centric storage **library** (Go) for signals:
 - Metrics
