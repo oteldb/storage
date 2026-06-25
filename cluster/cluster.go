@@ -1,8 +1,3 @@
-// Package cluster implements the L0 distribution layer (DESIGN.md §3, §11, §14 M6–M7).
-//
-// This is a scaffold stub. The ring, etcd integration, replication, and rebalancing
-// are filled in at M6. Single-node users skip this package entirely
-// ([Options.Cluster] == nil ⇒ no cluster layer).
 package cluster
 
 // Config is the cluster configuration (DESIGN.md §5, §11). It is optional: a nil

@@ -1,4 +1,3 @@
-// Package tenant provides the cross-cutting policy-callback layer (DESIGN.md §2, §8).
 package tenant
 
 import (

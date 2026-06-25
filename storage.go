@@ -58,10 +58,11 @@ func Open(_ context.Context, o Options, opts ...Option) (*Storage, error) {
 // to [Open] with [backend.Memory] and [DurabilityEphemeral]. It is the default in
 // tests — a full ingest+query path with no disk or object store.
 func InMemory(opts ...Option) (*Storage, error) {
-	all := []Option{
+	all := make([]Option, 0, 2+len(opts))
+	all = append(all,
 		WithBackend(backend.Memory()),
 		WithDurability(DurabilityEphemeral),
-	}
+	)
 	all = append(all, opts...)
 	return Open(context.Background(), Options{}, all...)
 }
@@ -74,17 +75,6 @@ func (s *Storage) Close(_ context.Context) error {
 	}
 	// TODO(M3): close engine, flusher, merger, WAL, backend.
 	return nil
-}
-
-// write checks the closed flag and resolves the tenant policy before dispatching.
-func (s *Storage) write(t signal.TenantID) (tenant.Policy, error) {
-	if s.closed.Load() {
-		return tenant.Policy{}, errors.Wrap(ErrClosed, "write")
-	}
-	if t == "" {
-		t = "default"
-	}
-	return s.tenant.Resolve(t), nil
 }
 
 // WriteMetrics ingests OTLP metrics (DESIGN.md §5, §8). It projects pdata to internal
@@ -135,6 +125,19 @@ func (s *Storage) Query(_ context.Context, t signal.TenantID, _ Query) (Result, 
 	_ = s.tenant.Resolve(t) // policy may gate query concurrency/limits (M3)
 	// TODO(M4): parse → plan → shard → fetch → exec.
 	return Result{}, ErrNotImplemented
+}
+
+// write checks the closed flag and resolves the tenant policy before dispatching.
+//
+//nolint:unparam // The resolved tenant.Policy is consumed by the M3 dispatch path.
+func (s *Storage) write(t signal.TenantID) (tenant.Policy, error) {
+	if s.closed.Load() {
+		return tenant.Policy{}, errors.Wrap(ErrClosed, "write")
+	}
+	if t == "" {
+		t = "default"
+	}
+	return s.tenant.Resolve(t), nil
 }
 
 // Accepted carries per-OTLP partial-success counts (DESIGN.md §5). It implements the
