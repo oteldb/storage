@@ -54,16 +54,14 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 		return id, false, false
 	}
 
-	buf := h.samples[id]
-	if buf == nil {
+	if !h.series.Has(id) {
 		isNew = true
 
 		h.series.Add(s)
 		h.indexLabels(id, s)
-		buf = &sampleBuf{}
-		h.samples[id] = buf
 	}
 
+	buf := h.bufFor(id)
 	buf.ts = append(buf.ts, ts)
 	buf.values = append(buf.values, value)
 
@@ -74,25 +72,35 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 	return id, true, isNew
 }
 
-// registerSeries records and indexes a series without samples (used by WAL replay, where
-// the series record precedes its sample records).
+// bufFor returns the (created-on-demand) sample buffer for an already-registered series.
+func (h *head) bufFor(id signal.SeriesID) *sampleBuf {
+	buf := h.samples[id]
+	if buf == nil {
+		buf = &sampleBuf{}
+		h.samples[id] = buf
+	}
+
+	return buf
+}
+
+// registerSeries records and indexes a series identity without samples (used by WAL
+// replay, where the series record precedes its sample records).
 func (h *head) registerSeries(s signal.Series) {
 	id := s.Hash()
-	if _, ok := h.samples[id]; !ok {
+	if !h.series.Has(id) {
 		h.series.Add(s)
 		h.indexLabels(id, s)
-		h.samples[id] = &sampleBuf{}
 	}
 }
 
 // replaySamples appends a run of samples to an already-registered series (WAL replay; no
 // OOO rejection — logged samples are authoritative).
 func (h *head) replaySamples(id signal.SeriesID, ts []int64, values []float64) {
-	buf := h.samples[id]
-	if buf == nil {
+	if !h.series.Has(id) {
 		return // series record missing; ignore (defensive)
 	}
 
+	buf := h.bufFor(id)
 	buf.ts = append(buf.ts, ts...)
 	buf.values = append(buf.values, values...)
 
