@@ -30,7 +30,7 @@ func BenchmarkDoDEncode(b *testing.B) {
 func BenchmarkDoDDecode(b *testing.B) {
 	ts := makeConstantStride(1000, 1_000_000_000, 15_000)
 	enc := EncodeTimestamps(nil, ts)
-	b.SetBytes(int64(len(enc)))
+	b.SetBytes(int64(len(ts)) * 8) // logical decoded bytes/sec
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -64,7 +64,7 @@ func BenchmarkGorillaEncode(b *testing.B) {
 func BenchmarkGorillaDecode(b *testing.B) {
 	vals := makeSlowFloats(1000, 42.0, 0.001)
 	enc := EncodeFloats(nil, vals)
-	b.SetBytes(int64(len(enc)))
+	b.SetBytes(int64(len(vals)) * 8) // logical decoded bytes/sec
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -98,7 +98,7 @@ func BenchmarkT64Encode(b *testing.B) {
 func BenchmarkT64Decode(b *testing.B) {
 	vals := makeRange(0, 1000)
 	enc := EncodeIntsT64(nil, vals)
-	b.SetBytes(int64(len(enc)))
+	b.SetBytes(int64(len(vals)) * 8) // logical decoded bytes/sec
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -133,7 +133,7 @@ func BenchmarkDictEncodeReuseBuffer(b *testing.B) {
 func BenchmarkDictDecode(b *testing.B) {
 	vals := makeLowCardBytes(1000, 10)
 	enc := EncodeBytes(nil, vals)
-	b.SetBytes(int64(len(enc)))
+	b.SetBytes(totalStringBytes(vals)) // logical decoded bytes/sec
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -146,7 +146,7 @@ func BenchmarkDictDecodeReuseDst(b *testing.B) {
 	vals := makeLowCardBytes(1000, 10)
 	enc := EncodeBytes(nil, vals)
 	dst := make([][]byte, 0, len(vals))
-	b.SetBytes(int64(len(enc)))
+	b.SetBytes(totalStringBytes(vals)) // logical decoded bytes/sec
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -175,7 +175,7 @@ func BenchmarkDictDecodeSplit(b *testing.B) {
 	vals := makeLowCardBytes(1000, 10)
 	enc := EncodeBytes(nil, vals)
 	var col DictColumn
-	b.SetBytes(int64(len(enc)))
+	b.SetBytes(totalStringBytes(vals)) // logical decoded bytes/sec
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -268,7 +268,7 @@ func BenchmarkDecimalDecode(b *testing.B) {
 	}
 
 	enc := EncodeFloatsDecimal(nil, vals, 64)
-	b.SetBytes(int64(len(enc)))
+	b.SetBytes(int64(len(vals)) * 8) // logical decoded bytes/sec
 	b.ReportAllocs()
 	b.ResetTimer()
 
