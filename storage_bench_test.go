@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"strconv"
+	"sync/atomic"
 	"testing"
 
 	"github.com/oteldb/storage/signal"
@@ -177,4 +178,54 @@ func benchmarkIngestAndFlush(b *testing.B, seriesCount, pointsPerSeries int) {
 	}
 
 	reportIngestMetrics(b, total)
+}
+
+// BenchmarkWriteMetricsConcurrent measures aggregate ingest throughput when many goroutines
+// write to one shared store concurrently — the workload the per-metric AppendBatch lock is
+// built for. All writers route to the same tenant, so they contend on a single engine lock;
+// because a metric's whole run is appended under one critical section (not one lock per
+// point), the critical section stays coarse and short. Reported Mpoints/s is the aggregate
+// across all goroutines (b.N is the total iteration count under RunParallel).
+//
+// To keep the shared head bounded across b.N, a writer periodically resets the store; Reset
+// takes each engine's lock, so it is safe against the concurrent appends.
+func BenchmarkWriteMetricsConcurrent(b *testing.B) {
+	const (
+		pointsPerBatch = 500     // one metric, 500 series × 1 point — a chunky single push
+		resetEvery     = 1 << 12 // ~2M points (~32 MiB of samples) between head resets
+	)
+
+	ctx := context.Background()
+
+	s, err := InMemory()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	var iters atomic.Int64
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		md := benchBatch(pointsPerBatch, 1) // each goroutine owns its batch; all build the same series
+
+		for pb.Next() {
+			if _, err := s.WriteMetrics(ctx, md); err != nil {
+				b.Error(err)
+
+				return
+			}
+
+			if iters.Add(1)%resetEvery == 0 {
+				if err := s.Reset(ctx); err != nil {
+					b.Error(err)
+
+					return
+				}
+			}
+		}
+	})
+
+	reportIngestMetrics(b, pointsPerBatch)
 }
