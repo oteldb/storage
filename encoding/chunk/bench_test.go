@@ -7,7 +7,7 @@ import (
 
 // totalStringBytes returns the total byte length of all strings in vals, used as the
 // raw input size for [BenchmarkDictEncode] (so it reports input bytes encoded/sec).
-func totalStringBytes(vals []string) int64 {
+func totalStringBytes(vals [][]byte) int64 {
 	var n int64
 	for _, s := range vals {
 		n += int64(len(s))
@@ -99,23 +99,46 @@ func BenchmarkT64Decode(b *testing.B) {
 }
 
 func BenchmarkDictEncode(b *testing.B) {
-	vals := makeLowCardStrings(1000, 10)
+	vals := makeLowCardBytes(1000, 10)
 	b.SetBytes(totalStringBytes(vals)) // raw input bytes encoded/sec
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = EncodeStrings(nil, vals)
+		_ = EncodeBytes(nil, vals)
+	}
+}
+
+func BenchmarkDictEncodeReuseBuffer(b *testing.B) {
+	vals := makeLowCardBytes(1000, 10)
+	buf := make([]byte, 0, len(EncodeBytes(nil, vals)))
+	b.SetBytes(totalStringBytes(vals)) // raw input bytes encoded/sec
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf = EncodeBytes(buf[:0], vals)
 	}
 }
 
 func BenchmarkDictDecode(b *testing.B) {
-	vals := makeLowCardStrings(1000, 10)
-	enc := EncodeStrings(nil, vals)
+	vals := makeLowCardBytes(1000, 10)
+	enc := EncodeBytes(nil, vals)
 	b.SetBytes(int64(len(enc)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, _ = DecodeStrings(nil, enc)
+		_, _, _ = DecodeBytes(nil, enc)
+	}
+}
+
+func BenchmarkDictDecodeReuseDst(b *testing.B) {
+	vals := makeLowCardBytes(1000, 10)
+	enc := EncodeBytes(nil, vals)
+	dst := make([][]byte, 0, len(vals))
+	b.SetBytes(int64(len(enc)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dst, _, _ = DecodeBytes(dst[:0], enc)
 	}
 }
 

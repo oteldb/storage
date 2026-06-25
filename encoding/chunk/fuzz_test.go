@@ -1,6 +1,7 @@
 package chunk
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math"
 	"testing"
@@ -102,8 +103,8 @@ func FuzzDictRoundTrip(f *testing.F) {
 		if len(vals) == 0 {
 			t.Skip("no values")
 		}
-		enc := EncodeStrings(nil, vals)
-		got, _, err := DecodeStrings(nil, enc)
+		enc := EncodeBytes(nil, vals)
+		got, _, err := DecodeBytes(nil, enc)
 		if err != nil {
 			t.Fatalf("Decode: %v", err)
 		}
@@ -111,7 +112,7 @@ func FuzzDictRoundTrip(f *testing.F) {
 			t.Fatalf("len = %d, want %d", len(got), len(vals))
 		}
 		for i := range vals {
-			if got[i] != vals[i] {
+			if !bytes.Equal(got[i], vals[i]) {
 				t.Fatalf("vals[%d] = %q, want %q", i, got[i], vals[i])
 			}
 		}
@@ -142,9 +143,9 @@ func decodeSeedToFloats(seed []byte, max int) []float64 {
 	return vals
 }
 
-// decodeSeedToStrings splits the seed on 0x00 bytes into strings.
-func decodeSeedToStrings(seed []byte, maxStrings, maxLen int) []string {
-	var vals []string
+// decodeSeedToStrings splits the seed on 0x00 bytes into bytes.
+func decodeSeedToStrings(seed []byte, maxStrings, maxLen int) [][]byte {
+	var vals [][]byte
 	start := 0
 	for i := 0; i <= len(seed) && len(vals) < maxStrings; i++ {
 		if i == len(seed) || seed[i] == 0 {
@@ -153,7 +154,7 @@ func decodeSeedToStrings(seed []byte, maxStrings, maxLen int) []string {
 				s = s[:maxLen]
 			}
 			if len(s) > 0 {
-				vals = append(vals, string(s))
+				vals = append(vals, s)
 			}
 			start = i + 1
 		}

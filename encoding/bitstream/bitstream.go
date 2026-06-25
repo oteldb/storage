@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 	"math/bits"
+	"slices"
 )
 
 // Writer is an MSB-first bit writer that appends to a caller-owned []byte. It is the
@@ -98,6 +99,27 @@ func (w *Writer) WriteBytes(p []byte) {
 	for _, b := range p {
 		_ = w.WriteByte(b)
 	}
+}
+
+// AppendBytes reserves n byte-aligned bytes in the stream and returns the writable
+// tail. The returned slice aliases the writer buffer until the next write.
+func (w *Writer) AppendBytes(n int) []byte {
+	if n < 0 {
+		panic("bitstream: AppendBytes negative length")
+	}
+	if n == 0 {
+		return nil
+	}
+	if w.count != 0 {
+		oldLen := len(w.stream)
+		for range n {
+			_ = w.WriteByte(0)
+		}
+		return w.stream[oldLen:len(w.stream)]
+	}
+	oldLen := len(w.stream)
+	w.stream = slices.Grow(w.stream, n)[:oldLen+n]
+	return w.stream[oldLen:]
 }
 
 // AppendString appends a string's bytes directly when byte-aligned, with no copy
@@ -343,6 +365,37 @@ func (r *Reader) ReadBytes(p []byte) error {
 	r.buffer = 0
 	r.valid = 0
 	return nil
+}
+
+// ReadBytesView returns the next n byte-aligned bytes as a view into the source
+// stream. The returned slice aliases the reader input and is valid until that input
+// is mutated or released.
+func (r *Reader) ReadBytesView(n int) ([]byte, error) {
+	if n < 0 {
+		panic("bitstream: ReadBytesView negative length")
+	}
+	if n == 0 {
+		return nil, nil
+	}
+
+	r.AlignToByte()
+	validBytes := int(r.valid) / 8
+	start := r.offset - validBytes
+	if len(r.stream)-start < n {
+		return nil, io.EOF
+	}
+	view := r.stream[start : start+n]
+	if n <= validBytes {
+		r.valid -= uint8(n * 8)
+		if r.valid == 0 {
+			r.buffer = 0
+		}
+		return view, nil
+	}
+	r.offset = start + n
+	r.buffer = 0
+	r.valid = 0
+	return view, nil
 }
 
 // ReadUvarint reads an unsigned varint (7 bits per byte, continuation in the high

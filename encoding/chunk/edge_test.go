@@ -91,11 +91,11 @@ func TestEncodeFloatsDecimalPrecision0(t *testing.T) {
 	}
 }
 
-func TestDecodeStringsTruncated(t *testing.T) {
+func TestDecodeBytesTruncated(t *testing.T) {
 	t.Parallel()
 	// Truncated dictionary stream.
-	enc := EncodeStrings(nil, []string{"a", "b", "c"})
-	if _, _, err := DecodeStrings(nil, enc[:2]); err == nil {
+	enc := EncodeBytes(nil, [][]byte{[]byte("a"), []byte("b"), []byte("c")})
+	if _, _, err := DecodeBytes(nil, enc[:2]); err == nil {
 		t.Error("expected error from truncated strings")
 	}
 }
