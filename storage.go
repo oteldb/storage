@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"maps"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-faster/errors"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -36,6 +38,9 @@ type Storage struct {
 
 	tmu     sync.Mutex
 	tenants map[signal.TenantID]*engine.Engine
+
+	stopCh chan struct{}  // closed by Close to stop the maintenance loop
+	wg     sync.WaitGroup // tracks the maintenance goroutine
 }
 
 // Open constructs a [Storage] from [Options] (DESIGN.md §5). If [Options.Backend] is
@@ -58,6 +63,15 @@ func Open(_ context.Context, o Options, opts ...Option) (*Storage, error) {
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
 	}
+	if o.FlushInterval > 0 {
+		s.stopCh = make(chan struct{})
+		s.wg.Add(1)
+
+		// The maintenance loop's context is created inside the goroutine and scoped to
+		// its own lifetime (stopped via stopCh), not to this Open call.
+		go s.runMaintenance(time.Duration(o.FlushInterval)) //nolint:gosec,contextcheck // G118: loop-scoped context, see runMaintenance
+	}
+
 	return s, nil
 }
 
@@ -76,12 +90,26 @@ func InMemory(opts ...Option) (*Storage, error) {
 
 // Close releases all resources. It is idempotent. After [Close], every method on s
 // returns [ErrClosed].
-func (s *Storage) Close(_ context.Context) error {
+func (s *Storage) Close(ctx context.Context) error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	// TODO(M3): close engine, flusher, merger, WAL, backend.
-	return nil
+
+	if s.stopCh != nil {
+		close(s.stopCh)
+		s.wg.Wait()
+	}
+
+	// Final flush: drain every engine's head to a durable part.
+	var firstErr error
+
+	for _, eng := range s.engineSnapshot() {
+		if err := eng.Close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
 }
 
 // WriteMetrics ingests OTLP metrics. It projects pdata to the internal model, derives
@@ -181,6 +209,72 @@ func (s *Storage) engineFor(tid signal.TenantID) *engine.Engine {
 	}
 
 	return e
+}
+
+// runMaintenance periodically flushes and compacts every tenant engine until Close stops
+// it. It is the single background loop driving flush (age) and merge+retention.
+func (s *Storage) runMaintenance(interval time.Duration) {
+	defer s.wg.Done()
+
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-t.C:
+			// The loop owns its lifetime (stopped via stopCh, not a request), so a
+			// background context is correct here.
+			s.maintain(context.Background())
+		}
+	}
+}
+
+// maintain flushes then merges (with retention) every tenant engine once. Errors are
+// swallowed: a transient backend failure must not crash the background loop, and the next
+// tick retries.
+func (s *Storage) maintain(ctx context.Context) {
+	for tid, eng := range s.engineSnapshotByTenant() {
+		_ = eng.Flush(ctx)
+		_ = eng.Merge(ctx, s.retainFrom(tid))
+	}
+}
+
+// retainFrom converts a tenant's retention window into an absolute cutoff timestamp (unix
+// nanoseconds); 0 means retain forever.
+func (s *Storage) retainFrom(tid signal.TenantID) int64 {
+	maxAge := s.tenant.Resolve(s.normalizeTenant(tid)).Retention.MaxAge
+	if maxAge <= 0 {
+		return 0
+	}
+
+	return time.Now().UnixNano() - maxAge.Nanoseconds()
+}
+
+// engineSnapshot returns the current tenant engines (a copy, so callers iterate without
+// holding the lock).
+func (s *Storage) engineSnapshot() []*engine.Engine {
+	s.tmu.Lock()
+	defer s.tmu.Unlock()
+
+	out := make([]*engine.Engine, 0, len(s.tenants))
+	for _, eng := range s.tenants {
+		out = append(out, eng)
+	}
+
+	return out
+}
+
+// engineSnapshotByTenant is engineSnapshot keyed by tenant id (for policy lookup).
+func (s *Storage) engineSnapshotByTenant() map[signal.TenantID]*engine.Engine {
+	s.tmu.Lock()
+	defer s.tmu.Unlock()
+
+	out := make(map[signal.TenantID]*engine.Engine, len(s.tenants))
+	maps.Copy(out, s.tenants)
+
+	return out
 }
 
 // Accepted carries per-OTLP partial-success counts (DESIGN.md §5). It implements the
