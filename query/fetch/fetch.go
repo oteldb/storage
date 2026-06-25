@@ -15,27 +15,17 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// MatchOp is a label-matcher operator. It lives here at the query (language-facing)
-// boundary; a [Fetcher] lowers it to the storage index's operator-free callback
-// primitives.
-type MatchOp uint8
-
-const (
-	// MatchEqual selects series whose Name value equals Value.
-	MatchEqual MatchOp = iota
-	// MatchNotEqual selects series whose Name value does not equal Value.
-	MatchNotEqual
-	// MatchRegexp selects series whose Name value fully matches the Value RE2 pattern.
-	MatchRegexp
-	// MatchNotRegexp selects series whose Name value does not match Value.
-	MatchNotRegexp
-)
-
-// Matcher is one label condition against a series' identity.
+// Matcher is one label condition: the predicate Match selects which values of the
+// attribute Name satisfy it. The condition is a **callback**, not an operator enum, so
+// the contract carries no query-language semantics — a language supplies the predicate (a
+// compiled regexp, an exact compare, a typed numeric range, a custom rule) over the typed
+// [signal.Value]. A [Fetcher] applies Match while scanning the label's distinct values.
+//
+// Negation and absent-label semantics compose at the language layer (a fetcher selects
+// the matching values; the language decides whether to complement the result).
 type Matcher struct {
 	Name  []byte
-	Op    MatchOp
-	Value []byte // exact value, or RE2 pattern for the regexp ops
+	Match func(value signal.Value) bool
 }
 
 // Request selects series for a tenant within an inclusive time window, filtered by all
