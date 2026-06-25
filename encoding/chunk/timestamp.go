@@ -34,6 +34,7 @@ func EncodeTimestamps(dst []byte, ts []int64) []byte {
 
 	if len(ts) == 1 {
 		w.PadToByte()
+
 		return w.Bytes()
 	}
 
@@ -47,10 +48,12 @@ func EncodeTimestamps(dst []byte, ts []int64) []byte {
 		tDelta = ts[i] - ts[i-1]
 		dod := tDelta - prevDelta
 		prevDelta = tDelta
+
 		writeDoD(w, dod)
 	}
 
 	w.PadToByte()
+
 	return w.Bytes()
 }
 
@@ -61,12 +64,15 @@ func DecodeTimestamps(dst []int64, src []byte) ([]int64, int, error) {
 	if err != nil {
 		return dst, 0, err
 	}
+
 	if rows == 0 {
 		return dst, consumed, nil
 	}
+
 	if cap(dst) < rows {
 		dst = resize(dst, rows)
 	}
+
 	dst = dst[:rows]
 
 	// Row 0.
@@ -74,6 +80,7 @@ func DecodeTimestamps(dst []int64, src []byte) ([]int64, int, error) {
 	if err != nil {
 		return dst, 0, err
 	}
+
 	dst[0] = t0
 	if rows == 1 {
 		return dst, consumed + r.ConsumedBytes(), nil
@@ -84,6 +91,7 @@ func DecodeTimestamps(dst []int64, src []byte) ([]int64, int, error) {
 	if err != nil {
 		return dst, 0, err
 	}
+
 	tDelta := int64(td64)
 	dst[1] = dst[0] + tDelta
 
@@ -93,6 +101,7 @@ func DecodeTimestamps(dst []int64, src []byte) ([]int64, int, error) {
 		if err != nil {
 			return dst, 0, err
 		}
+
 		tDelta += dod
 		dst[i] = dst[i-1] + tDelta
 	}
@@ -124,15 +133,19 @@ func writeDoD(w *bitstream.Writer, dod int64) {
 func readDoD(r *bitstream.Reader) (int64, error) {
 	// Read the unary-ish prefix: count the leading 1 bits up to 4.
 	var d uint8
+
 	for range 4 {
 		bit, err := r.ReadBit()
 		if err != nil {
 			return 0, err
 		}
+
 		d <<= 1
+
 		if !bit {
 			break
 		}
+
 		d |= 1
 	}
 
@@ -144,24 +157,28 @@ func readDoD(r *bitstream.Reader) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
+
 		return signExtend(bits, 14), nil
 	case 0b110:
 		bits, err := r.ReadBits(17)
 		if err != nil {
 			return 0, err
 		}
+
 		return signExtend(bits, 17), nil
 	case 0b1110:
 		bits, err := r.ReadBits(20)
 		if err != nil {
 			return 0, err
 		}
+
 		return signExtend(bits, 20), nil
 	case 0b1111:
 		bits, err := r.ReadBits(64)
 		if err != nil {
 			return 0, err
 		}
+
 		return int64(bits), nil
 	default:
 		// 0b110 or 0b111 would not reach here due to the break-on-zero loop,
@@ -175,6 +192,7 @@ func readDoD(r *bitstream.Reader) (int64, error) {
 // side gets one extra value).
 func bitRange(x int64, nbits uint8) bool {
 	hi := int64(1) << (nbits - 1)
+
 	return -(hi-1) <= x && x <= hi
 }
 
@@ -186,6 +204,7 @@ func signExtend(u uint64, nbits uint8) int64 {
 	if u > uint64(1)<<(nbits-1) {
 		u -= uint64(1) << nbits
 	}
+
 	return int64(u)
 }
 
@@ -194,11 +213,11 @@ func resize[T any](dst []T, n int) []T {
 	if cap(dst) >= n {
 		return dst[:n]
 	}
-	newCap := max(n, cap(dst)*2)
-	if newCap < n {
-		newCap = n
-	}
+
+	newCap := max(max(n, cap(dst)*2), n)
+
 	out := make([]T, n, newCap)
 	copy(out, dst)
+
 	return out
 }

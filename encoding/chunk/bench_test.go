@@ -12,6 +12,7 @@ func totalStringBytes(vals [][]byte) int64 {
 	for _, s := range vals {
 		n += int64(len(s))
 	}
+
 	return n
 }
 
@@ -20,7 +21,8 @@ func BenchmarkDoDEncode(b *testing.B) {
 	b.SetBytes(int64(len(ts)) * 8) // raw input bytes encoded/sec
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		_ = EncodeTimestamps(nil, ts)
 	}
 }
@@ -31,7 +33,8 @@ func BenchmarkDoDDecode(b *testing.B) {
 	b.SetBytes(int64(len(enc)))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		_, _, _ = DecodeTimestamps(nil, enc)
 	}
 }
@@ -41,7 +44,8 @@ func BenchmarkDoDEncodeJittered(b *testing.B) {
 	b.SetBytes(int64(len(ts)) * 8) // raw input bytes encoded/sec
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		_ = EncodeTimestamps(nil, ts)
 	}
 }
@@ -51,7 +55,8 @@ func BenchmarkGorillaEncode(b *testing.B) {
 	b.SetBytes(int64(len(vals)) * 8) // raw input bytes encoded/sec
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		_ = EncodeFloats(nil, vals)
 	}
 }
@@ -62,7 +67,8 @@ func BenchmarkGorillaDecode(b *testing.B) {
 	b.SetBytes(int64(len(enc)))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		_, _, _ = DecodeFloats(nil, enc)
 	}
 }
@@ -72,7 +78,8 @@ func BenchmarkGorillaEncodeConstant(b *testing.B) {
 	b.SetBytes(int64(len(vals)) * 8) // raw input bytes encoded/sec
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		_ = EncodeFloats(nil, vals)
 	}
 }
@@ -82,7 +89,8 @@ func BenchmarkT64Encode(b *testing.B) {
 	b.SetBytes(int64(len(vals)) * 8) // raw input bytes encoded/sec
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		_ = EncodeIntsT64(nil, vals)
 	}
 }
@@ -93,7 +101,8 @@ func BenchmarkT64Decode(b *testing.B) {
 	b.SetBytes(int64(len(enc)))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		_, _, _ = DecodeIntsT64(nil, enc)
 	}
 }
@@ -103,7 +112,8 @@ func BenchmarkDictEncode(b *testing.B) {
 	b.SetBytes(totalStringBytes(vals)) // raw input bytes encoded/sec
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		_ = EncodeBytes(nil, vals)
 	}
 }
@@ -114,7 +124,8 @@ func BenchmarkDictEncodeReuseBuffer(b *testing.B) {
 	b.SetBytes(totalStringBytes(vals)) // raw input bytes encoded/sec
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		buf = EncodeBytes(buf[:0], vals)
 	}
 }
@@ -125,7 +136,8 @@ func BenchmarkDictDecode(b *testing.B) {
 	b.SetBytes(int64(len(enc)))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		_, _, _ = DecodeBytes(nil, enc)
 	}
 }
@@ -137,7 +149,8 @@ func BenchmarkDictDecodeReuseDst(b *testing.B) {
 	b.SetBytes(int64(len(enc)))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		dst, _, _ = DecodeBytes(dst[:0], enc)
 	}
 }
@@ -147,10 +160,12 @@ func BenchmarkDecimalEncode(b *testing.B) {
 	for i := range vals {
 		vals[i] = math.Round(float64(i)*100) / 100
 	}
+
 	b.SetBytes(int64(len(vals)) * 8) // raw input bytes encoded/sec
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		_ = EncodeFloatsDecimal(nil, vals, 64)
 	}
 }
@@ -160,11 +175,13 @@ func BenchmarkDecimalDecode(b *testing.B) {
 	for i := range vals {
 		vals[i] = math.Round(float64(i)*100) / 100
 	}
+
 	enc := EncodeFloatsDecimal(nil, vals, 64)
 	b.SetBytes(int64(len(enc)))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		_, _, _ = DecodeFloatsDecimal(nil, enc)
 	}
 }

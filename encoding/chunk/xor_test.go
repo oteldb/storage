@@ -8,6 +8,7 @@ import (
 // TestGorillaRoundTrip verifies EncodeFloats∘DecodeFloats == identity.
 func TestGorillaRoundTrip(t *testing.T) {
 	t.Parallel()
+
 	cases := []struct {
 		name string
 		vals []float64
@@ -25,24 +26,29 @@ func TestGorillaRoundTrip(t *testing.T) {
 		{"precision", []float64{0.1, 0.2, 0.3, 0.4, 0.5}},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+
 			enc := EncodeFloats(nil, tc.vals)
+
 			got, _, err := DecodeFloats(nil, enc)
 			if err != nil {
 				t.Fatalf("Decode: %v", err)
 			}
+
 			if len(got) != len(tc.vals) {
 				t.Fatalf("len = %d, want %d", len(got), len(tc.vals))
 			}
+
 			for i := range tc.vals {
 				if math.IsNaN(tc.vals[i]) {
 					if !math.IsNaN(got[i]) {
 						t.Errorf("vals[%d] = %v, want NaN", i, got[i])
 					}
+
 					continue
 				}
+
 				if got[i] != tc.vals[i] {
 					t.Errorf("vals[%d] = %v, want %v", i, got[i], tc.vals[i])
 				}
@@ -54,6 +60,7 @@ func TestGorillaRoundTrip(t *testing.T) {
 // TestGorillaConstantCompression verifies constant values achieve ~1 bit/sample.
 func TestGorillaConstantCompression(t *testing.T) {
 	t.Parallel()
+
 	vals := makeConstantFloats(1000, 42.0)
 	enc := EncodeFloats(nil, vals)
 	// 1000 constant floats → 1000 bits (all delta==0 → single 0 bit) → ~125 bytes.
@@ -68,15 +75,18 @@ func makeConstantFloats(n int, v float64) []float64 {
 	for i := range n {
 		vals[i] = v
 	}
+
 	return vals
 }
 
 func makeSlowFloats(n int, start, delta float64) []float64 {
 	vals := make([]float64, n)
+
 	v := start
 	for i := range n {
 		vals[i] = v
 		v += delta
 	}
+
 	return vals
 }

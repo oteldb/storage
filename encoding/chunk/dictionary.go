@@ -42,6 +42,7 @@ func newDictEncodeScratch(rows int) *dictEncodeScratch {
 	s := dictEncodeScratchPool.Get().(*dictEncodeScratch)
 	s.entries = s.entries[:0]
 	s.ids = slices.Grow(s.ids[:0], rows)[:rows]
+
 	return s
 }
 
@@ -55,6 +56,7 @@ func (s *dictEncodeScratch) putBack() {
 func newDictDecodeScratch(entries int) *dictDecodeScratch {
 	s := dictDecodeScratchPool.Get().(*dictDecodeScratch)
 	s.entries = slices.Grow(s.entries[:0], entries)[:entries]
+
 	return s
 }
 
@@ -83,6 +85,7 @@ func EncodeBytes(dst []byte, vals [][]byte) []byte {
 		w := bitstream.NewWriter(dst)
 		w.WriteUvarint(0)
 		w.PadToByte()
+
 		return w.Bytes()
 	}
 
@@ -91,23 +94,29 @@ func EncodeBytes(dst []byte, vals [][]byte) []byte {
 	// same-lifetime scratch arena.
 	m := pool.NewByteIntMap()
 	defer m.PutBack()
+
 	scratch := newDictEncodeScratch(len(vals))
 	defer scratch.putBack()
 
 	dictEntryBytes := 0
 	flat := false
+
 	for i, v := range vals {
 		id, existed := m.PutOrGet(v, len(scratch.entries))
 		if !existed {
 			if len(scratch.entries) == 65536 {
 				flat = true
+
 				break
 			}
+
 			scratch.entries = append(scratch.entries, v)
 			dictEntryBytes += uvarintLen(uint64(len(v))) + len(v)
 		}
+
 		scratch.ids[i] = uint16(id)
 	}
+
 	size := len(scratch.entries)
 
 	if flat {
@@ -117,15 +126,19 @@ func EncodeBytes(dst []byte, vals [][]byte) []byte {
 		for _, v := range vals {
 			flatPayloadBytes += uvarintLen(uint64(len(v))) + len(v)
 		}
+
 		dst = slices.Grow(dst, uvarintLen(uint64(len(vals)))+1+flatPayloadBytes)
 		w := bitstream.NewWriter(dst)
 		w.WriteUvarint(uint64(len(vals)))
+
 		_ = w.WriteByte(flagFlat)
 		for _, v := range vals {
 			w.WriteUvarint(uint64(len(v)))
 			w.WriteBytes(v)
 		}
+
 		w.PadToByte()
+
 		return w.Bytes()
 	}
 
@@ -134,6 +147,7 @@ func EncodeBytes(dst []byte, vals [][]byte) []byte {
 	if size > maxDictSize {
 		rowIDBytes *= 2
 	}
+
 	dst = slices.Grow(
 		dst,
 		uvarintLen(uint64(len(vals)))+1+uvarintLen(uint64(size))+dictEntryBytes+rowIDBytes,
@@ -160,16 +174,20 @@ func EncodeBytes(dst []byte, vals [][]byte) []byte {
 			idBytes[i*2+1] = byte(id)
 		}
 	}
+
 	w.PadToByte()
+
 	return w.Bytes()
 }
 
 func uvarintLen(u uint64) int {
 	n := 1
+
 	for u >= 0x80 {
 		u >>= 7
 		n++
 	}
+
 	return n
 }
 
@@ -177,16 +195,20 @@ func uvarintLen(u uint64) int {
 // slices alias src.
 func DecodeBytes(dst [][]byte, src []byte) ([][]byte, int, error) {
 	var r bitstream.Reader
+
 	rows, consumed, err := readHeaderInto(src, &r)
 	if err != nil {
 		return dst, 0, err
 	}
+
 	if rows == 0 {
 		return dst, consumed, nil
 	}
+
 	if cap(dst) < rows {
 		dst = resize(dst, rows)
 	}
+
 	dst = dst[:rows]
 
 	flag, err := r.ReadByte()
@@ -201,12 +223,15 @@ func DecodeBytes(dst [][]byte, src []byte) ([][]byte, int, error) {
 			if err != nil {
 				return dst, 0, err
 			}
+
 			buf, err := r.ReadBytesView(int(ln))
 			if err != nil {
 				return dst, 0, err
 			}
+
 			dst[i] = buf
 		}
+
 		return dst, consumed + r.ConsumedBytes(), nil
 	}
 
@@ -215,18 +240,23 @@ func DecodeBytes(dst [][]byte, src []byte) ([][]byte, int, error) {
 	if err != nil {
 		return dst, 0, err
 	}
+
 	scratch := newDictDecodeScratch(int(dictSize))
 	defer scratch.putBack()
+
 	entries := scratch.entries
+
 	for i := range dictSize {
 		ln, err := r.ReadUvarint()
 		if err != nil {
 			return dst, 0, err
 		}
+
 		buf, err := r.ReadBytesView(int(ln))
 		if err != nil {
 			return dst, 0, err
 		}
+
 		entries[i] = buf
 	}
 
@@ -235,6 +265,7 @@ func DecodeBytes(dst [][]byte, src []byte) ([][]byte, int, error) {
 		if err != nil {
 			return dst, 0, err
 		}
+
 		for i := range rows {
 			dst[i] = entries[idBuf[i]]
 		}
@@ -243,6 +274,7 @@ func DecodeBytes(dst [][]byte, src []byte) ([][]byte, int, error) {
 		if err != nil {
 			return dst, 0, err
 		}
+
 		for i := range rows {
 			dst[i] = entries[(uint16(idBuf[i*2])<<8)|uint16(idBuf[i*2+1])]
 		}

@@ -41,6 +41,7 @@ func EncodeFloats(dst []byte, vals []float64) []byte {
 	}
 
 	w.PadToByte()
+
 	return w.Bytes()
 }
 
@@ -50,12 +51,15 @@ func DecodeFloats(dst []float64, src []byte) ([]float64, int, error) {
 	if err != nil {
 		return dst, 0, err
 	}
+
 	if rows == 0 {
 		return dst, consumed, nil
 	}
+
 	if cap(dst) < rows {
 		dst = resize(dst, rows)
 	}
+
 	dst = dst[:rows]
 
 	// Row 0.
@@ -63,13 +67,16 @@ func DecodeFloats(dst []float64, src []byte) ([]float64, int, error) {
 	if err != nil {
 		return dst, 0, err
 	}
+
 	dst[0] = math.Float64frombits(v0)
 
 	// Row 1+: XOR delta. Carry the previous value forward as the XOR base.
 	var leading, trailing uint8 = 0xff, 0
+
 	for i := 1; i < rows; i++ {
 		dst[i] = dst[i-1] // XOR is relative to the previous value
-		if err := xorRead(r, &dst[i], &leading, &trailing); err != nil {
+		err := xorRead(r, &dst[i], &leading, &trailing)
+		if err != nil {
 			return dst, 0, err
 		}
 	}
@@ -84,8 +91,10 @@ func xorWrite(w *bitstream.Writer, newVal, curVal float64, leading, trailing *ui
 	delta := math.Float64bits(newVal) ^ math.Float64bits(curVal)
 	if delta == 0 {
 		w.WriteBit(false)
+
 		return
 	}
+
 	w.WriteBit(true)
 
 	newLeading := uint8(bits.LeadingZeros64(delta))
@@ -98,13 +107,16 @@ func xorWrite(w *bitstream.Writer, newVal, curVal float64, leading, trailing *ui
 	if *leading != 0xff && newLeading >= *leading && newTrailing >= *trailing {
 		// Reuse previous leading/trailing.
 		w.WriteBit(false)
+
 		sigbits := 64 - int(*leading) - int(*trailing)
 		w.WriteBits(delta>>*trailing, sigbits)
+
 		return
 	}
 
 	// New leading/trailing.
 	*leading, *trailing = newLeading, newTrailing
+
 	w.WriteBit(true)
 	w.WriteBits(uint64(newLeading), 5)
 
@@ -121,6 +133,7 @@ func xorRead(r *bitstream.Reader, val *float64, leading, trailing *uint8) error 
 	if err != nil {
 		return err
 	}
+
 	if !bit {
 		return nil // value unchanged
 	}
@@ -141,16 +154,19 @@ func xorRead(r *bitstream.Reader, val *float64, leading, trailing *uint8) error 
 		if err != nil {
 			return err
 		}
+
 		newLeading = uint8(lbits)
 
 		sbits, err := r.ReadBits(6)
 		if err != nil {
 			return err
 		}
+
 		sigbits = uint8(sbits)
 		if sigbits == 0 {
 			sigbits = 64 // sentinel
 		}
+
 		newTrailing = 64 - newLeading - sigbits
 		*leading, *trailing = newLeading, newTrailing
 	}
@@ -159,8 +175,10 @@ func xorRead(r *bitstream.Reader, val *float64, leading, trailing *uint8) error 
 	if err != nil {
 		return err
 	}
+
 	vbits := math.Float64bits(*val)
 	vbits ^= mbits << newTrailing
 	*val = math.Float64frombits(vbits)
+
 	return nil
 }

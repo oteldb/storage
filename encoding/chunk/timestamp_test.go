@@ -10,6 +10,7 @@ import (
 // of timestamp patterns (constant stride, jitter, monotonic, empty, single).
 func TestDoDRoundTrip(t *testing.T) {
 	t.Parallel()
+
 	cases := []struct {
 		name string
 		ts   []int64
@@ -26,17 +27,20 @@ func TestDoDRoundTrip(t *testing.T) {
 		{"min-int64", []int64{math.MinInt64, math.MinInt64 + 1, math.MinInt64 + 2}},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+
 			enc := EncodeTimestamps(nil, tc.ts)
+
 			got, _, err := DecodeTimestamps(nil, enc)
 			if err != nil {
 				t.Fatalf("Decode: %v", err)
 			}
+
 			if len(got) != len(tc.ts) {
 				t.Fatalf("len = %d, want %d", len(got), len(tc.ts))
 			}
+
 			for i := range tc.ts {
 				if got[i] != tc.ts[i] {
 					t.Fatalf("ts[%d] = %d, want %d", i, got[i], tc.ts[i])
@@ -49,6 +53,7 @@ func TestDoDRoundTrip(t *testing.T) {
 // TestDoDCompressionRatio verifies constant-stride timestamps achieve ~1 bit/sample.
 func TestDoDCompressionRatio(t *testing.T) {
 	t.Parallel()
+
 	ts := makeConstantStride(1000, 1_000_000_000, 15_000)
 	enc := EncodeTimestamps(nil, ts)
 	// 1000 samples → ~1000 bits (all dod==0) → ~125 bytes + header.
@@ -64,20 +69,24 @@ func makeConstantStride(n int, start, step int64) []int64 {
 	for i := range n {
 		ts[i] = start + int64(i)*step
 	}
+
 	return ts
 }
 
 func makeJittered(n int, start, step, jitter int64) []int64 {
 	ts := make([]int64, n)
+
 	ts[0] = start
 	for i := 1; i < n; i++ {
 		ts[i] = ts[i-1] + step + (int64(i)*7)%jitter - jitter/2
 	}
+
 	return ts
 }
 
 func TestBitRange(t *testing.T) {
 	t.Parallel()
+
 	cases := []struct {
 		x    int64
 		n    uint8
@@ -103,6 +112,7 @@ func TestBitRange(t *testing.T) {
 
 func TestSignExtend(t *testing.T) {
 	t.Parallel()
+
 	cases := []struct {
 		u    uint64
 		n    uint8
@@ -123,7 +133,9 @@ func TestSignExtend(t *testing.T) {
 
 func TestDoDEmptyDecode(t *testing.T) {
 	t.Parallel()
+
 	enc := EncodeTimestamps(nil, nil)
+
 	got, n, err := DecodeTimestamps(nil, enc)
 	if err != nil || len(got) != 0 || n != len(enc) {
 		t.Fatalf("decode empty: got=%v n=%d err=%v", got, n, err)
@@ -132,12 +144,14 @@ func TestDoDEmptyDecode(t *testing.T) {
 
 func TestDoDTruncated(t *testing.T) {
 	t.Parallel()
+
 	enc := EncodeTimestamps(nil, []int64{1000, 2000, 3000})
 	// Truncate the encoded bytes to simulate a torn stream.
 	_, _, err := DecodeTimestamps(nil, enc[:1])
 	if err == nil {
 		t.Fatal("expected error from truncated stream")
 	}
+
 	if !IsEOF(err) && !errors.Is(err, errUnexpectedEOF) {
 		// Non-EOF/UnexpectedEOF errors are also acceptable (bitstream may report
 		// differently); the key is that we don't panic.

@@ -7,6 +7,7 @@ import (
 
 func TestCodecString(t *testing.T) {
 	t.Parallel()
+
 	cases := []struct {
 		c    Codec
 		want string
@@ -39,10 +40,12 @@ func TestDoDAllCases(t *testing.T) {
 		1000 + 5000 + 60000 + 500000 + 1<<40, // dod = 2^40 → escape → case 0b1111
 	}
 	enc := EncodeTimestamps(nil, ts)
+
 	got, _, err := DecodeTimestamps(nil, enc)
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
+
 	for i := range ts {
 		if got[i] != ts[i] {
 			t.Fatalf("ts[%d] = %d, want %d", i, got[i], ts[i])
@@ -62,10 +65,12 @@ func TestDoDNegativeCases(t *testing.T) {
 		1000 - 5000 - 60000 - 500000, // dod = -500000 → 20 bits
 	}
 	enc := EncodeTimestamps(nil, ts)
+
 	got, _, err := DecodeTimestamps(nil, enc)
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
+
 	for i := range ts {
 		if got[i] != ts[i] {
 			t.Fatalf("ts[%d] = %d, want %d", i, got[i], ts[i])
@@ -117,6 +122,7 @@ func TestFloatToDecimalFractional(t *testing.T) {
 	if v != 15 || e != -1 {
 		t.Errorf("floatToDecimal(1.5) = (%d, %d), want (15, -1)", v, e)
 	}
+
 	v, e = floatToDecimal(0.5)
 	if v != 5 || e != -1 {
 		t.Errorf("floatToDecimal(0.5) = (%d, %d), want (5, -1)", v, e)
@@ -125,9 +131,11 @@ func TestFloatToDecimalFractional(t *testing.T) {
 
 func TestErrorStrings(t *testing.T) {
 	t.Parallel()
+
 	if errEOF.Error() != "chunk: unexpected end of stream" {
 		t.Errorf("errEOF.Error() = %q", errEOF.Error())
 	}
+
 	if errUnexpectedEOF.Error() != "chunk: truncated stream" {
 		t.Errorf("errUnexpectedEOF.Error() = %q", errUnexpectedEOF.Error())
 	}
@@ -135,9 +143,11 @@ func TestErrorStrings(t *testing.T) {
 
 func TestIsEOF(t *testing.T) {
 	t.Parallel()
+
 	if !IsEOF(errEOF) {
 		t.Error("IsEOF(errEOF) = false, want true")
 	}
+
 	if IsEOF(errUnexpectedEOF) {
 		t.Error("IsEOF(errUnexpectedEOF) = true, want false")
 	}
@@ -153,10 +163,12 @@ func TestGorillaReuseCase(t *testing.T) {
 		3.0, 3.0, 3.0, // XOR then unchanged
 	}
 	enc := EncodeFloats(nil, vals)
+
 	got, _, err := DecodeFloats(nil, enc)
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
+
 	for i := range vals {
 		if got[i] != vals[i] {
 			t.Fatalf("vals[%d] = %v, want %v", i, got[i], vals[i])
@@ -166,12 +178,15 @@ func TestGorillaReuseCase(t *testing.T) {
 
 func TestGorillaNaNRoundTrip(t *testing.T) {
 	t.Parallel()
+
 	vals := []float64{1.0, math.NaN(), 2.0, math.NaN()}
 	enc := EncodeFloats(nil, vals)
+
 	got, _, err := DecodeFloats(nil, enc)
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
+
 	if got[0] != 1.0 || got[2] != 2.0 {
 		t.Fatalf("non-NaN values wrong: %v %v", got[0], got[2])
 	}
@@ -182,10 +197,12 @@ func TestGorillaAllBitsChanged(t *testing.T) {
 	// XOR with no leading/trailing zeros → sigbits=64 → sentinel case.
 	vals := []float64{0.0, math.Float64frombits(0x8000000000000001)} // -5e-324 (denorm)
 	enc := EncodeFloats(nil, vals)
+
 	got, _, err := DecodeFloats(nil, enc)
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
+
 	if math.Float64bits(got[0]) != math.Float64bits(vals[0]) ||
 		math.Float64bits(got[1]) != math.Float64bits(vals[1]) {
 		t.Fatalf("vals = %#x %#x, want %#x %#x",

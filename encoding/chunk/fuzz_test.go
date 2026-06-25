@@ -20,18 +20,23 @@ func FuzzDoDRoundTrip(f *testing.F) {
 		}
 		// Make timestamps monotonic-ish for meaningful DoD compression.
 		ts := make([]int64, len(vals))
+
 		ts[0] = vals[0]
 		for i := 1; i < len(vals); i++ {
 			ts[i] = ts[i-1] + vals[i]
 		}
+
 		enc := EncodeTimestamps(nil, ts)
+
 		got, _, err := DecodeTimestamps(nil, enc)
 		if err != nil {
 			t.Fatalf("Decode: %v", err)
 		}
+
 		if len(got) != len(ts) {
 			t.Fatalf("len = %d, want %d", len(got), len(ts))
 		}
+
 		for i := range ts {
 			if got[i] != ts[i] {
 				t.Fatalf("ts[%d] = %d, want %d", i, got[i], ts[i])
@@ -49,19 +54,24 @@ func FuzzGorillaRoundTrip(f *testing.F) {
 		if len(vals) == 0 {
 			t.Skip("no values")
 		}
+
 		enc := EncodeFloats(nil, vals)
+
 		got, _, err := DecodeFloats(nil, enc)
 		if err != nil {
 			t.Fatalf("Decode: %v", err)
 		}
+
 		if len(got) != len(vals) {
 			t.Fatalf("len = %d, want %d", len(got), len(vals))
 		}
+
 		for i := range vals {
 			// NaN is checked via IsNaN (NaN != NaN).
 			if isNaN(vals[i]) != isNaN(got[i]) {
 				t.Fatalf("vals[%d] NaN mismatch: %v vs %v", i, vals[i], got[i])
 			}
+
 			if !isNaN(vals[i]) && got[i] != vals[i] {
 				t.Fatalf("vals[%d] = %v, want %v", i, got[i], vals[i])
 			}
@@ -78,14 +88,18 @@ func FuzzT64RoundTrip(f *testing.F) {
 		if len(vals) == 0 {
 			t.Skip("no values")
 		}
+
 		enc := EncodeIntsT64(nil, vals)
+
 		got, _, err := DecodeIntsT64(nil, enc)
 		if err != nil {
 			t.Fatalf("Decode: %v", err)
 		}
+
 		if len(got) != len(vals) {
 			t.Fatalf("len = %d, want %d", len(got), len(vals))
 		}
+
 		for i := range vals {
 			if got[i] != vals[i] {
 				t.Fatalf("vals[%d] = %d, want %d", i, got[i], vals[i])
@@ -103,14 +117,18 @@ func FuzzDictRoundTrip(f *testing.F) {
 		if len(vals) == 0 {
 			t.Skip("no values")
 		}
+
 		enc := EncodeBytes(nil, vals)
+
 		got, _, err := DecodeBytes(nil, enc)
 		if err != nil {
 			t.Fatalf("Decode: %v", err)
 		}
+
 		if len(got) != len(vals) {
 			t.Fatalf("len = %d, want %d", len(got), len(vals))
 		}
+
 		for i := range vals {
 			if !bytes.Equal(got[i], vals[i]) {
 				t.Fatalf("vals[%d] = %q, want %q", i, got[i], vals[i])
@@ -122,15 +140,18 @@ func FuzzDictRoundTrip(f *testing.F) {
 // decodeSeedToInt64s reads a sequence of zigzag varints from the seed.
 func decodeSeedToInt64s(seed []byte, max int) []int64 {
 	var vals []int64
+
 	off := 0
 	for off < len(seed) && len(vals) < max {
 		v, n := binary.Varint(seed[off:])
 		if n <= 0 {
 			break
 		}
+
 		vals = append(vals, v)
 		off += n
 	}
+
 	return vals
 }
 
@@ -140,25 +161,31 @@ func decodeSeedToFloats(seed []byte, max int) []float64 {
 	for i := 0; i+8 <= len(seed) && len(vals) < max; i += 8 {
 		vals = append(vals, math.Float64frombits(binary.LittleEndian.Uint64(seed[i:])))
 	}
+
 	return vals
 }
 
 // decodeSeedToStrings splits the seed on 0x00 bytes into bytes.
 func decodeSeedToStrings(seed []byte, maxStrings, maxLen int) [][]byte {
 	var vals [][]byte
+
 	start := 0
+
 	for i := 0; i <= len(seed) && len(vals) < maxStrings; i++ {
 		if i == len(seed) || seed[i] == 0 {
 			s := seed[start:i]
 			if len(s) > maxLen {
 				s = s[:maxLen]
 			}
+
 			if len(s) > 0 {
 				vals = append(vals, s)
 			}
+
 			start = i + 1
 		}
 	}
+
 	return vals
 }
 

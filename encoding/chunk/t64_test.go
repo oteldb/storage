@@ -8,6 +8,7 @@ import (
 // TestT64RoundTrip verifies EncodeIntsT64∘DecodeIntsT64 == identity (lossless).
 func TestT64RoundTrip(t *testing.T) {
 	t.Parallel()
+
 	cases := []struct {
 		name string
 		vals []int64
@@ -27,17 +28,20 @@ func TestT64RoundTrip(t *testing.T) {
 		{"uint8-range", makeRange(0, 256)},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+
 			enc := EncodeIntsT64(nil, tc.vals)
+
 			got, _, err := DecodeIntsT64(nil, enc)
 			if err != nil {
 				t.Fatalf("Decode: %v", err)
 			}
+
 			if len(got) != len(tc.vals) {
 				t.Fatalf("len = %d, want %d", len(got), len(tc.vals))
 			}
+
 			for i := range tc.vals {
 				if got[i] != tc.vals[i] {
 					t.Fatalf("vals[%d] = %d, want %d", i, got[i], tc.vals[i])
@@ -50,6 +54,7 @@ func TestT64RoundTrip(t *testing.T) {
 // TestT64ConstantCompression verifies a constant column stores only the header.
 func TestT64ConstantCompression(t *testing.T) {
 	t.Parallel()
+
 	vals := makeConstantInts(1000, 42)
 	enc := EncodeIntsT64(nil, vals)
 	// numBits=0 → only [uvarint rows][16 bytes header] → ~18 bytes.
@@ -62,6 +67,7 @@ func TestT64ConstantCompression(t *testing.T) {
 // TestT64BoolCompression verifies 0/1 values collapse to ~1 bit/value.
 func TestT64BoolCompression(t *testing.T) {
 	t.Parallel()
+
 	vals := makeBools(640) // 10 blocks of 64
 	enc := EncodeIntsT64(nil, vals)
 	// numBits=1 → 1 transposed row × 8 bytes per block of 64 → 80 bytes + header.
@@ -76,6 +82,7 @@ func makeRange(start, n int) []int64 {
 	for i := range n {
 		vals[i] = int64(start + i)
 	}
+
 	return vals
 }
 
@@ -84,6 +91,7 @@ func makeBools(n int) []int64 {
 	for i := range n {
 		vals[i] = int64(i % 2)
 	}
+
 	return vals
 }
 
@@ -92,11 +100,13 @@ func makeConstantInts(n int, v int64) []int64 {
 	for i := range n {
 		vals[i] = v
 	}
+
 	return vals
 }
 
 func TestValuableBits(t *testing.T) {
 	t.Parallel()
+
 	cases := []struct {
 		min, max uint64
 		straddle bool

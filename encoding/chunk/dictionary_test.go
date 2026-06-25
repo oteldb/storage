@@ -9,6 +9,7 @@ import (
 // TestDictRoundTrip verifies EncodeBytes∘DecodeBytes == identity.
 func TestDictRoundTrip(t *testing.T) {
 	t.Parallel()
+
 	cases := []struct {
 		name string
 		vals [][]byte
@@ -24,17 +25,20 @@ func TestDictRoundTrip(t *testing.T) {
 		{"long-strings", [][]byte{[]byte("a-very-long-string-value-here"), []byte("a-very-long-string-value-here"), []byte("different")}},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+
 			enc := EncodeBytes(nil, tc.vals)
+
 			got, _, err := DecodeBytes(nil, enc)
 			if err != nil {
 				t.Fatalf("Decode: %v", err)
 			}
+
 			if len(got) != len(tc.vals) {
 				t.Fatalf("len = %d, want %d", len(got), len(tc.vals))
 			}
+
 			for i := range tc.vals {
 				if !bytes.Equal(got[i], tc.vals[i]) {
 					t.Fatalf("vals[%d] = %q, want %q", i, got[i], tc.vals[i])
@@ -47,18 +51,23 @@ func TestDictRoundTrip(t *testing.T) {
 // TestDictLargeCardinality verifies the 2-byte id path (>256 distinct).
 func TestDictLargeCardinality(t *testing.T) {
 	t.Parallel()
+
 	vals := make([][]byte, 500)
 	for i := range vals {
 		vals[i] = []byte("val-" + itoa(i))
 	}
+
 	enc := EncodeBytes(nil, vals)
+
 	got, _, err := DecodeBytes(nil, enc)
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
+
 	if len(got) != 500 {
 		t.Fatalf("len = %d, want 500", len(got))
 	}
+
 	for i := range vals {
 		if !bytes.Equal(got[i], vals[i]) {
 			t.Fatalf("vals[%d] = %q, want %q", i, got[i], vals[i])
@@ -69,15 +78,19 @@ func TestDictLargeCardinality(t *testing.T) {
 // TestDictFlatFallback verifies the flat fallback (>65536 distinct).
 func TestDictFlatFallback(t *testing.T) {
 	t.Parallel()
+
 	vals := make([][]byte, 70000)
 	for i := range vals {
 		vals[i] = []byte("v" + itoa(i))
 	}
+
 	enc := EncodeBytes(nil, vals)
+
 	got, _, err := DecodeBytes(nil, enc)
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
+
 	if len(got) != 70000 {
 		t.Fatalf("len = %d, want 70000", len(got))
 	}
@@ -92,6 +105,7 @@ func TestDictFlatFallback(t *testing.T) {
 // TestDictCompressionRatio verifies low-cardinality strings achieve ~1 byte/row.
 func TestDictCompressionRatio(t *testing.T) {
 	t.Parallel()
+
 	vals := makeLowCardBytes(1000, 5) // 5 distinct strings
 	enc := EncodeBytes(nil, vals)
 	// 1000 rows × 1 byte id + dictionary (5 short strings + lengths) + header.
@@ -106,14 +120,17 @@ func makeLowCardBytes(n, cardinality int) [][]byte {
 	if cardinality > n {
 		cardinality = n
 	}
+
 	templates := make([][]byte, cardinality)
 	for i := range cardinality {
 		templates[i] = []byte("label-" + itoa(i))
 	}
+
 	vals := make([][]byte, n)
 	for i := range n {
 		vals[i] = templates[i%cardinality]
 	}
+
 	return vals
 }
 
@@ -122,21 +139,26 @@ func itoa(n int) string {
 	if n == 0 {
 		return "0"
 	}
+
 	neg := n < 0
 	if neg {
 		n = -n
 	}
+
 	var buf [20]byte
+
 	i := len(buf)
 	for n > 0 {
 		i--
 		buf[i] = byte('0' + n%10)
 		n /= 10
 	}
+
 	if neg {
 		i--
 		buf[i] = '-'
 	}
+
 	return string(buf[i:])
 }
 

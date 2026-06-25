@@ -1,6 +1,10 @@
 package chunk
 
-import "github.com/oteldb/storage/encoding/bitstream"
+import (
+	"errors"
+
+	"github.com/oteldb/storage/encoding/bitstream"
+)
 
 // Codec identifies a column encoding (DESIGN.md §6, §14 M0). It is stored in the
 // column/part metadata so the decoder selects the right [Decode] function. Values
@@ -58,6 +62,7 @@ func (c Codec) String() string {
 func writeHeader(dst []byte, rows int) (*bitstream.Writer, []byte) {
 	w := bitstream.NewWriter(dst)
 	w.WriteUvarint(uint64(rows))
+
 	return w, w.Bytes()
 }
 
@@ -68,24 +73,31 @@ func readHeader(src []byte) (r *bitstream.Reader, rows int, consumed int, err er
 	if err != nil {
 		return nil, 0, 0, err
 	}
+
 	return bitstream.NewReader(src[consumed:]), rows, consumed, nil
 }
 
 func readHeaderInto(src []byte, r *bitstream.Reader) (rows int, consumed int, err error) {
 	// Read the uvarint count directly from the bytes (it's byte-aligned).
-	var n int
-	var u uint64
+	var (
+		n int
+		u uint64
+	)
 	{
 		br := &byteReader{data: src}
+
 		u, err = readUvarint(br)
 		if err != nil {
 			return 0, 0, err
 		}
+
 		n = br.off
 	}
+
 	if r != nil {
 		r.Reset(src[n:])
 	}
+
 	return int(u), n, nil
 }
 
@@ -100,29 +112,38 @@ func (r *byteReader) ReadByte() (byte, error) {
 	if r.off >= len(r.data) {
 		return 0, errEOF
 	}
+
 	b := r.data[r.off]
 	r.off++
+
 	return b, nil
 }
 
 // readUvarint mirrors bitstream.Reader.ReadUvarint but over a byteReader.
 func readUvarint(r *byteReader) (uint64, error) {
-	var x uint64
-	var s uint
-	for i := 0; i < 10; i++ {
+	var (
+		x uint64
+		s uint
+	)
+
+	for i := range 10 {
 		b, err := r.ReadByte()
 		if err != nil {
 			if i == 0 {
 				return 0, errEOF
 			}
+
 			return x, errEOF
 		}
+
 		if b < 0x80 {
 			return x | uint64(b)<<s, nil
 		}
+
 		x |= uint64(b&0x7f) << s
 		s += 7
 	}
+
 	return x, errUnexpectedEOF
 }
 
@@ -142,6 +163,8 @@ func (unexpectedEOFError) Error() string { return "chunk: truncated stream" }
 
 // IsEOF reports whether err is an end-of-stream error.
 func IsEOF(err error) bool {
-	_, ok := err.(eofError)
+	var eofError eofError
+	ok := errors.As(err, &eofError)
+
 	return ok
 }
