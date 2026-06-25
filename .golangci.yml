@@ -58,6 +58,10 @@ linters:
         # Opinionated checks that fight intentional choices here:
         - hugeParam # Options is passed by value into the functional-options constructor
         - unnamedResult # multi-value codec helpers read fine without named results
+    exhaustive:
+      # A switch with an explicit default is considered exhaustive: codec/kind
+      # subset-switches legitimately handle a few enum values and error on the rest.
+      default-signifies-exhaustive: true
     gocyclo:
       min-complexity: 15
     gosec:
