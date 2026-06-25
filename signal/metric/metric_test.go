@@ -19,10 +19,13 @@ func collect(tb testing.TB, md Metrics) ([]emitted, int) {
 	tb.Helper()
 
 	var out []emitted
-	a := Project(md, func(sid signal.SeriesID, id *Identity, s Sample) {
-		// The hot-path id must equal the materialized identity's hash on every point.
-		require.Equal(tb, id.SeriesID(), sid)
-		out = append(out, emitted{sid, id.clone(), s})
+	a := Project(md, func(b *Batch) {
+		for i := range b.Len() {
+			id := b.Identity(i)
+			// The hot-path id must equal the materialized identity's hash on every point.
+			require.Equal(tb, id.SeriesID(), b.IDs[i])
+			out = append(out, emitted{b.IDs[i], id.clone(), b.Sample(i)})
+		}
 	})
 
 	return out, a
@@ -245,8 +248,10 @@ func FuzzProjectIDMatchesToSeries(f *testing.F) {
 			signal.KeyValue{Key: k2, Value: signal.BytesValue(v2)},
 		)
 
-		Project(md, func(sid signal.SeriesID, id *Identity, _ Sample) {
-			require.Equal(t, id.ToSeries().Hash(), sid)
+		Project(md, func(b *Batch) {
+			for i := range b.Len() {
+				require.Equal(t, b.Series(i).Hash(), b.IDs[i])
+			}
 		})
 	})
 }

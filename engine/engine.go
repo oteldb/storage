@@ -69,36 +69,50 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 	return true, nil
 }
 
-// AppendByID ingests one sample for a series whose content [signal.SeriesID] is already
-// computed (by the projection layer, on a reused buffer). The full identity is materialized
-// lazily via materialize — called only when the series is new — so a repeat series costs
-// just a map probe and a buffer append, with no per-point [signal.Series] construction or
-// hashing. It returns whether the sample was accepted (false ⇒ out-of-order beyond the
+// AppendBatch ingests a run of samples whose content ids are already computed (by the
+// projection layer, on a reused buffer). ids[i], ts[i], values[i] describe sample i;
+// materialize(i) returns sample i's full identity and is called only when its series is new
+// (first sight), so a repeat series costs just a map probe and a buffer append, with no
+// per-point [signal.Series] construction or hashing. The whole run is appended under a single
+// lock. It returns how many samples were accepted (the rest were out-of-order beyond the
 // window). Safe for concurrent use.
-func (e *Engine) AppendByID(
-	id signal.SeriesID, ts int64, value float64, materialize func() signal.Series,
-) (bool, error) {
+func (e *Engine) AppendBatch(
+	ids []signal.SeriesID, ts []int64, values []float64, materialize func(i int) signal.Series,
+) (accepted int, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	accepted, isNew, s := e.head.appendByID(id, ts, value, e.cfg.OOOWindow, materialize)
-	if !accepted {
-		return false, nil
-	}
+	// One closure for the whole run (not one per point): bi selects the current sample for
+	// the lazy materializer, which fires only on a newly-seen series.
+	var bi int
 
-	if e.cfg.WAL != nil {
-		if isNew {
-			if err := e.cfg.WAL.WriteSeries(id, s); err != nil {
-				return true, err
+	mat := func() signal.Series { return materialize(bi) }
+
+	for i := range ids {
+		bi = i
+
+		ok, isNew, s := e.head.appendByID(ids[i], ts[i], values[i], e.cfg.OOOWindow, mat)
+		if !ok {
+			continue
+		}
+
+		accepted++
+
+		if e.cfg.WAL != nil {
+			if isNew {
+				if err := e.cfg.WAL.WriteSeries(ids[i], s); err != nil {
+					return accepted, err
+				}
+			}
+
+			// Slice the columns in place (no per-sample allocation) for the WAL record.
+			if err := e.cfg.WAL.WriteSamples(ids[i], ts[i:i+1], values[i:i+1]); err != nil {
+				return accepted, err
 			}
 		}
-
-		if err := e.cfg.WAL.WriteSamples(id, []int64{ts}, []float64{value}); err != nil {
-			return true, err
-		}
 	}
 
-	return true, nil
+	return accepted, nil
 }
 
 // Fetch implements [fetch.Fetcher] over the head ∪ flushed parts: it resolves the

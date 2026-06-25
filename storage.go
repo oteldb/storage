@@ -149,34 +149,24 @@ func (s *Storage) WriteMetrics(_ context.Context, md metric.Metrics) (Accepted, 
 
 	var oooRejected int64
 
-	// cur tracks the point currently being ingested; materialize folds it into a full
-	// identity only when the engine reports the series is new (first sight). Both are
-	// allocated once for the whole batch — not per point — so the hot path stays alloc-free.
-	var cur *metric.Identity
-
-	materialize := func() signal.Series { return cur.ToSeries() }
-
-	// The tenant (hence the engine) is derived from Resource+Scope, which are constant across
-	// a scope group's points, so points arrive in tenant-contiguous runs. Cache the last
-	// resolution to skip the locked engine-map lookup on every point.
+	// The tenant (hence the engine) is derived from Resource+Scope, which are constant within
+	// a metric, so points arrive in tenant-contiguous runs. Cache the last resolution to skip
+	// the locked engine-map lookup per metric.
 	var (
 		lastTenant signal.TenantID
 		lastEng    *engine.Engine
 	)
 
-	emitted := metric.Project(md, func(id signal.SeriesID, ident *metric.Identity, sample metric.Sample) {
-		cur = ident
-
-		tid := s.tenantFor(ident.Series.Resource, ident.Series.Scope)
+	emitted := metric.Project(md, func(b *metric.Batch) {
+		tid := s.tenantFor(b.Resource(), b.Scope())
 		if lastEng == nil || tid != lastTenant {
 			lastTenant, lastEng = tid, s.engineFor(tid)
 		}
 
-		// Engines are ephemeral here, so Append never errors; a false result is an
-		// out-of-order rejection.
-		if ok, _ := lastEng.AppendByID(id, sample.Ts, sample.Value, materialize); !ok {
-			oooRejected++
-		}
+		// Engines are ephemeral here, so AppendBatch never errors; samples beyond the OOO
+		// window are not accepted and counted as rejected.
+		accepted, _ := lastEng.AppendBatch(b.IDs, b.Ts, b.Values, b.Series)
+		oooRejected += int64(b.Len() - accepted)
 	})
 
 	return Accepted{

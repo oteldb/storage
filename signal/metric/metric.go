@@ -3,6 +3,7 @@ package metric
 import (
 	"bytes"
 	"encoding/binary"
+	"sync"
 
 	"github.com/oteldb/storage/signal"
 )
@@ -86,47 +87,109 @@ type Sample struct {
 	Value   float64
 }
 
-// Project iterates an internal [Metrics] batch and calls emit for every number data point
-// with its content-addressed [signal.SeriesID], its [Identity], and its [Sample]. It
-// returns how many points were emitted. Every point in a [Metrics] batch is well-formed by
-// construction (value-less and unsupported OTLP points are filtered by the producer — e.g.
-// the otlp/pdataconv bridge), so projection rejects nothing; out-of-order rejection is the
-// engine's concern downstream.
+// Batch is the projection of a single metric's points: the per-point series ids and the
+// timestamp/value columns the engine ingests, plus the metric context needed to materialize
+// a full [signal.Series] lazily (only for a series the engine has not seen). Emitting a
+// whole metric at once lets the engine take its lock and resolve the tenant once per metric
+// rather than once per point.
 //
-// The SeriesID is computed on the hot path without allocating: the resource‖scope hash
-// pre-image is hoisted once per scope group, the five folded reserved labels once per
-// metric, and only the point attributes are merged in per point, into a reused buffer. The
-// emitted id equals [Identity.SeriesID] (i.e. emit's id == id.ToSeries().Hash()). The
-// *Identity passed to emit is reused across points: emit must not retain it past the call;
-// materialize a [signal.Series] via [Identity.ToSeries] if a durable copy is needed.
-func Project(md Metrics, emit func(signal.SeriesID, *Identity, Sample)) (accepted int) {
-	var (
-		p  projector
-		id Identity
-	)
+// A Batch is reused across metrics within one [Project] pass: its slices and the data they
+// alias (point attributes live in the source [Metrics]) are valid only for the duration of
+// the emit call. Do not retain it.
+type Batch struct {
+	// IDs[i] is the content-addressed id of point i; Ts[i]/Values[i] are its timestamp and
+	// value. The three slices share one length, [Batch.Len].
+	IDs    []signal.SeriesID
+	Ts     []int64
+	Values []float64
+
+	base   Identity      // resource/scope/metric fields shared by every point
+	points []NumberPoint // the metric's points (aliases the source Metrics)
+}
+
+var batchPool = sync.Pool{New: func() any { return &Batch{} }}
+
+// Len returns the number of points in the batch.
+func (b *Batch) Len() int { return len(b.IDs) }
+
+// Resource is the batch's source resource (for tenant routing).
+func (b *Batch) Resource() signal.Resource { return b.base.Series.Resource }
+
+// Scope is the batch's source scope (for tenant routing).
+func (b *Batch) Scope() signal.Scope { return b.base.Series.Scope }
+
+// Identity returns the i-th point's full [Identity]. The returned value aliases the source
+// batch (zero-copy); clone it if a durable copy is needed.
+func (b *Batch) Identity(i int) Identity {
+	id := b.base
+	id.Series.Attributes = b.points[i].Attributes
+
+	return id
+}
+
+// Series materializes the i-th point's full [signal.Series] (the folded identity). It is the
+// lazy materializer the engine calls only when registering a newly-seen series.
+func (b *Batch) Series(i int) signal.Series { return b.Identity(i).ToSeries() }
+
+// Sample returns the i-th point's [Sample].
+func (b *Batch) Sample(i int) Sample {
+	pt := &b.points[i]
+
+	return Sample{StartTs: pt.StartTs, Ts: pt.Ts, Value: pt.Value}
+}
+
+// Project iterates an internal [Metrics] batch and calls emit once per metric with a [Batch]
+// of that metric's projected points (Gauge and Sum). It returns how many points were
+// emitted. Every point in a [Metrics] batch is well-formed by construction (value-less and
+// unsupported OTLP points are filtered by the producer — e.g. the otlp/pdataconv bridge), so
+// projection rejects nothing; out-of-order rejection is the engine's concern downstream.
+//
+// Each point's SeriesID is computed without allocating: the resource‖scope hash pre-image is
+// hoisted once per scope group, the five folded reserved labels once per metric, and only
+// the point attributes are merged in per point, into a reused buffer. The id equals
+// [Identity.SeriesID] (id == [Batch.Series](i).Hash()).
+func Project(md Metrics, emit func(*Batch)) (accepted int) {
+	var p projector
+
+	// Pool the Batch so its id/ts/value column buffers persist across Project calls instead
+	// of being reallocated each ingest.
+	b, _ := batchPool.Get().(*Batch)
+	defer func() {
+		b.base = Identity{}
+		b.points = nil
+		batchPool.Put(b)
+	}()
 
 	for ri := range md.Resources {
 		rm := &md.Resources[ri]
-		id.Series.Resource = rm.Resource
+		b.base.Series.Resource = rm.Resource
 
 		for si := range rm.Scopes {
 			sm := &rm.Scopes[si]
-			id.Series.Scope = sm.Scope
+			b.base.Series.Scope = sm.Scope
 			p.setGroup(rm.Resource, sm.Scope)
 
 			for mi := range sm.Metrics {
 				m := &sm.Metrics[mi]
-				id.Name, id.Unit, id.Kind = m.Name, m.Unit, m.Kind
-				id.Temporality, id.Monotonic = m.Temporality, m.Monotonic
+				if len(m.Points) == 0 {
+					continue
+				}
+
+				b.base.Name, b.base.Unit, b.base.Kind = m.Name, m.Unit, m.Kind
+				b.base.Temporality, b.base.Monotonic = m.Temporality, m.Monotonic
 				p.setMetric(m)
 
+				b.IDs, b.Ts, b.Values = b.IDs[:0], b.Ts[:0], b.Values[:0]
 				for pi := range m.Points {
 					pt := &m.Points[pi]
-					id.Series.Attributes = pt.Attributes
-					sid := p.id(pt.Attributes)
-					emit(sid, &id, Sample{StartTs: pt.StartTs, Ts: pt.Ts, Value: pt.Value})
-					accepted++
+					b.IDs = append(b.IDs, p.id(pt.Attributes))
+					b.Ts = append(b.Ts, pt.Ts)
+					b.Values = append(b.Values, pt.Value)
 				}
+
+				b.points = m.Points
+				emit(b)
+				accepted += len(m.Points)
 			}
 		}
 	}
