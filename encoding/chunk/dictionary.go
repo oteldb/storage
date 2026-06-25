@@ -389,11 +389,21 @@ type DictColumn struct {
 	// IDWidth is the number of id bytes per row: 1 (dict ≤ 256 entries), 2 (larger
 	// dict), or 0 for the flat fallback where Entries is indexed by row directly.
 	IDWidth int
-	rows    int
 }
 
-// Len reports the number of rows in the column.
-func (c *DictColumn) Len() int { return c.rows }
+// Len reports the number of rows in the column. It is derived from the fields so a
+// [DictColumn] can be constructed directly (e.g. a constant column: one entry, an
+// all-zero IDs slice of the desired length, IDWidth 1).
+func (c *DictColumn) Len() int {
+	switch c.IDWidth {
+	case 0: // flat fallback (or empty): Entries holds one value per row
+		return len(c.Entries)
+	case 1:
+		return len(c.IDs)
+	default: // 2-byte ids
+		return len(c.IDs) / 2
+	}
+}
 
 // At returns the value at row, as a view aliasing the decode source. row must be in
 // [0, Len()).
@@ -437,7 +447,6 @@ func (c *DictColumn) DecodeBytes(src []byte) (int, error) {
 		return 0, err
 	}
 
-	c.rows = rows
 	c.Entries = c.Entries[:0]
 	c.IDs = nil
 	c.IDWidth = 0
