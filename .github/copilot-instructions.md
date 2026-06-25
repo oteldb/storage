@@ -31,6 +31,11 @@ Read these before designing or implementing:
 
 When `PROMPT.md`, `DESIGN.md`, and the code disagree, surface it rather than silently picking one.
 
+**`PROMPT.md`, `DESIGN.md`, and `_ref/` are gitignored — not committed to the repo.** Use them as
+local guidance, but **never cite them from committed code** (no `DESIGN.md §6` / `_ref/docs/…` in
+source comments): those references dangle for anyone who clones the repo. Write self-contained
+comments instead, and reference `ARCHITECTURE.md` (which is committed) when a pointer is warranted.
+
 ## Working agreement
 
 - **Library, not a binary.** No `main`, no server/HTTP/gRPC, no CLI, no auth, no scraping. The
@@ -51,6 +56,9 @@ When `PROMPT.md`, `DESIGN.md`, and the code disagree, surface it rather than sil
   OTel pdata types at the API boundary. Discuss before adding anything else.
 - **Zero-alloc hot paths** (this is a hard requirement, not a nicety):
   - append-style APIs: `func(dst []byte, …) []byte`; callers own/reuse buffers.
+  - **`[]byte`, not `string`, for keys/values/identity in the data model** (e.g. `signal.Value`,
+    `KeyValue.Key`): OTLP decode buffers and the interning map (`pool.ByteIntMap`) are byte-based, so
+    `[]byte` avoids the string-conversion allocation. Convert to `string` only at display boundaries.
   - `sync.Pool` + `Reset()` for parsers, blocks, iterators, result rows; arenas for same-lifetime
     batches; intern label strings and compare by id.
   - lazy column decode; never materialize columns a query doesn't reference.
