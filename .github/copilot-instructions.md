@@ -19,7 +19,11 @@ Read these before designing or implementing:
 - **`PROMPT.md`** — the requirements (goals, performance targets, features). The source of truth
   for *what* to build.
 - **`DESIGN.md`** — the architecture of record: layers, package layout, the fetch contract, write/
-  read paths, the milestone plan (M0–M7). The source of truth for *how*.
+  read paths, the milestone plan (M0–M7). The source of truth for *how* (forward-looking).
+- **`ARCHITECTURE.md`** — the architecture *as currently built* (no roadmap/TODOs). The source of
+  truth for *what exists today*. **Keep it current:** any architectural change — a new package or
+  layer, a new public type/interface, a new or changed on-disk/wire format or codec framing, a moved
+  layer boundary, or a new cross-cutting invariant — must update `ARCHITECTURE.md` in the same change.
 - **`_ref/docs/`** — analyses of 13 reference systems + two synthesis docs
   (`storage-engine.md`, `query-languages.md`), indexed by `_ref/docs/README.md`. The prior art;
   cite it when justifying a design choice. The `_ref/` source trees are reference only — never
