@@ -9,6 +9,12 @@
 `github.com/oteldb/storage` — a low-level, distributed, OpenTelemetry-centric storage
 **library** (not a binary) for signals: metrics, logs, traces, profiles. Greenfield, Go 1.26.
 
+It is built as the storage tier for **oteldb** (`github.com/go-faster/oteldb`), an OpenTelemetry
+observability backend by the same authors (today ClickHouse-backed). oteldb is the primary
+consumer — it must embed this library as a native Go storage engine — so its data model, query
+needs (PromQL/LogQL/TraceQL), and house conventions (go-faster, ch-go) are the concrete target.
+See `_ref/docs/oteldb.md` for the embedder analysis.
+
 Read these before designing or implementing:
 - **`PROMPT.md`** — the requirements (goals, performance targets, features). The source of truth
   for *what* to build.
@@ -75,7 +81,10 @@ When `PROMPT.md`, `DESIGN.md`, and the code disagree, surface it rather than sil
   storage. Don't leak a language's concepts into the storage layer.
 - **Immutable parts + one merge engine.** Compaction, retention, downsampling, and recompression
   are the same background-merge code. Don't add a parallel subsystem for any of them.
-- **Backends are interchangeable** behind `backend.Backend` (file/s3/memory share the code path).
+- **Backends are interchangeable** behind `backend.Backend` (memory/file/s3 share the code path).
+  The **in-memory engine** (`backend.Memory()` + `Durability=Ephemeral`, exposed as
+  `storage.InMemory(...)`) is first-class: a full ingest+query path with WAL/flush disabled, the
+  reference backend, and the default in tests. Every layer must work in-memory with no disk/S3.
 - **Coordination is external/minimal:** etcd for ring/leases/rebalance, backend CAS for manifest
   commits. No homegrown Raft. Single-node mode must work with the cluster layer absent.
 - **Policy via callbacks:** multi-tenancy, retention, downsampling, and limits resolve through
