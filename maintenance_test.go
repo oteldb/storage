@@ -79,6 +79,42 @@ func TestMaintainRetainsRecentData(t *testing.T) {
 	assert.Equal(t, []float64{5}, batches[0].Values)
 }
 
+func TestMultiTenantIsolationThroughMerge(t *testing.T) {
+	t.Parallel()
+
+	s, err := InMemory(WithTenant(func(r signal.Resource, _ signal.Scope) signal.TenantID {
+		v, _ := r.Attributes.Get([]byte("service.name"))
+
+		return signal.TenantID(v.Str())
+	}))
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	// Two services across two flushes each, then a compaction.
+	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{100}, []float64{1}))
+	require.NoError(t, err)
+	_, err = s.WriteMetrics(ctx, gaugeBatch("web", "m", []int64{100}, []float64{2}))
+	require.NoError(t, err)
+	s.maintain(ctx)
+	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{200}, []float64{11}))
+	require.NoError(t, err)
+	_, err = s.WriteMetrics(ctx, gaugeBatch("web", "m", []int64{200}, []float64{22}))
+	require.NoError(t, err)
+	s.maintain(ctx)
+
+	apiEng, webEng := s.engineFor("api"), s.engineFor("web")
+	assert.Equal(t, 1, apiEng.SeriesCount())
+	assert.Equal(t, 1, webEng.SeriesCount(), "web never sees api's series")
+
+	api := queryEngine(t, apiEng, nameMatcher("m"))
+	web := queryEngine(t, webEng, nameMatcher("m"))
+	require.Len(t, api, 1)
+	require.Len(t, web, 1)
+	assert.NotEqual(t, api[0].ID, web[0].ID)
+	assert.Equal(t, []float64{1, 11}, api[0].Values, "api's data only")
+	assert.Equal(t, []float64{2, 22}, web[0].Values, "web's data only")
+}
+
 func TestBackgroundMaintenanceFlushes(t *testing.T) {
 	t.Parallel()
 
