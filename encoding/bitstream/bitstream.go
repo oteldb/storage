@@ -301,6 +301,12 @@ func (r *Reader) ReadBits(nbits uint8) (uint64, error) {
 	if !r.loadNextBuffer(nbits) {
 		return 0, io.EOF
 	}
+	// A truncated stream can refill with fewer than nbits bits (loadNextBuffer
+	// clamps to the bytes that remain); the field is incomplete, so report EOF
+	// rather than underflowing r.valid below.
+	if r.valid < nbits {
+		return 0, io.EOF
+	}
 	mask = (uint64(1) << nbits) - 1
 	v |= (r.buffer >> (r.valid - nbits)) & mask
 	r.valid -= nbits
@@ -439,7 +445,11 @@ func (r *Reader) readBitsFast(nbits uint8) (uint64, error) {
 	if nbits > r.valid {
 		return 0, io.EOF
 	}
-	mask := (uint64(1) << nbits) - 1
+	// Low-nbits mask. nbits may be 64 here (e.g. a full 64-bit field), where
+	// (1<<64)-1 would rely on unsigned wraparound; shifting an all-ones word
+	// right by (64-nbits) builds the same mask without underflowing. nbits is
+	// in [1,64] (the nbits==0 case returns before reaching readBitsFast).
+	mask := ^uint64(0) >> (64 - nbits)
 	r.valid -= nbits
 	return (r.buffer >> r.valid) & mask, nil
 }
