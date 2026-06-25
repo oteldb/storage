@@ -61,6 +61,8 @@ var fuzzFuncRe = regexp.MustCompile(`^func (Fuzz[A-Za-z0-9_]*)\(`)
 type config struct {
 	root      string
 	goBin     string
+	goroot    string
+	gocache   string
 	targetSel string
 	pkgSel    string
 	fuzztime  string
@@ -121,8 +123,7 @@ func run() error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
-	// gosentry's LibAFL harness exports C ABI symbols, so cgo is required.
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
+	cmd.Env = buildEnv(cfg)
 
 	fmt.Fprintf(os.Stderr, "fuzz: selected %s\nfuzz: %s %s\n",
 		t, cfg.goBin, strings.Join(args, " "))
@@ -153,6 +154,8 @@ func parseFlags(argv []string) (config, error) {
 	fs := flag.NewFlagSet("fuzz", flag.ContinueOnError)
 	fs.StringVar(&cfg.root, "C", ".", "module root directory to scan and run in")
 	fs.StringVar(&cfg.goBin, "go", "gosentry", "go toolchain binary to invoke (gosentry for LibAFL)")
+	fs.StringVar(&cfg.goroot, "goroot", "", "GOROOT for the toolchain (default: let the -go binary self-detect)")
+	fs.StringVar(&cfg.gocache, "gocache", "", "GOCACHE for the run (default: inherit)")
 	fs.StringVar(&cfg.targetSel, "target", "", "fuzz target to run (default: random)")
 	fs.StringVar(&cfg.pkgSel, "pkg", "", "restrict selection to package dirs containing this substring")
 	fs.StringVar(&cfg.fuzztime, "fuzztime", "", "duration to run, e.g. 30s or 1m (default: until interrupted)")
@@ -299,6 +302,39 @@ func pick(targets []target, name string, seed int64) (target, error) {
 		rng = rand.New(rand.NewSource(rand.Int63()))
 	}
 	return targets[rng.Intn(len(targets))], nil
+}
+
+// buildEnv constructs the child environment.
+//
+// It strips any inherited GOROOT so the chosen toolchain self-detects its own
+// root from its binary location. This matters for gosentry: its `go` driver is
+// a go1.27-devel fork, but a stale `GOROOT=/usr/local/go` in the ambient
+// environment would pin the stock go1.26.3 `compile` tool, yielding
+// "version does not match go tool version" errors. A `-goroot` override is
+// honored when set.
+func buildEnv(cfg config) []string {
+	env := os.Environ()
+	out := env[:0:0] // copy to avoid mutating the shared backing array
+	for _, kv := range env {
+		switch {
+		case strings.HasPrefix(kv, "GOROOT="):
+			continue // dropped; re-added below if overridden
+		case strings.HasPrefix(kv, "GOCACHE=") && cfg.gocache != "":
+			continue // replaced below
+		case strings.HasPrefix(kv, "CGO_ENABLED="):
+			continue // forced on below
+		}
+		out = append(out, kv)
+	}
+	if cfg.goroot != "" {
+		out = append(out, "GOROOT="+cfg.goroot)
+	}
+	if cfg.gocache != "" {
+		out = append(out, "GOCACHE="+cfg.gocache)
+	}
+	// gosentry's LibAFL harness exports C ABI symbols, so cgo is required.
+	out = append(out, "CGO_ENABLED=1")
+	return out
 }
 
 // buildArgs assembles the `go test` argument list for the chosen target.
