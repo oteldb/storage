@@ -199,6 +199,17 @@ func (r *Reader) Reset(b []byte) {
 // in the refill buffer. It is approximate (rounds the buffered bits up to a byte).
 func (r *Reader) Remaining() int { return len(r.stream) - r.offset + int(r.valid)/8 }
 
+// ConsumedBytes reports how many bytes of the source stream have been fully consumed
+// (every bit read). It is the byte offset at which the next byte-aligned field or
+// column stream begins. Callers that [Writer.PadToByte] at the end of encoding can use
+// this to slice the source for the next column.
+func (r *Reader) ConsumedBytes() int {
+	// Total bits pulled from stream = offset * 8. Bits still in buffer = valid.
+	// Consumed bits = offset*8 - valid. Consumed bytes (ceil, since partial bytes
+	// are part of the current column) = offset - floor(valid / 8).
+	return r.offset - int(r.valid)/8
+}
+
 // readBitFast is the inlined fast path: returns io.EOF if the buffer is empty so the
 // caller can fall back to [readBit]. Kept a leaf for inlining.
 func (r *Reader) readBitFast() (bool, error) {
