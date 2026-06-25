@@ -56,6 +56,67 @@ func DecodeValue(src []byte) (Value, int, error) {
 	}
 }
 
+// DecodeSeries parses the canonical binary form produced by [Series.AppendHashInput]:
+// resource, then scope, then data-point attributes. All byte fields alias src.
+func DecodeSeries(src []byte) (Series, int, error) {
+	res, rn, err := decodeResource(src)
+	if err != nil {
+		return Series{}, 0, errors.Wrap(err, "resource")
+	}
+
+	sc, sn, err := decodeScope(src[rn:])
+	if err != nil {
+		return Series{}, 0, errors.Wrap(err, "scope")
+	}
+
+	attrs, an, err := DecodeAttributes(src[rn+sn:])
+	if err != nil {
+		return Series{}, 0, errors.Wrap(err, "attributes")
+	}
+
+	return Series{Resource: res, Scope: sc, Attributes: attrs}, rn + sn + an, nil
+}
+
+func decodeResource(src []byte) (Resource, int, error) {
+	schema, n, err := readLenBytes(src)
+	if err != nil {
+		return Resource{}, 0, errors.Wrap(err, "schema_url")
+	}
+
+	attrs, an, err := DecodeAttributes(src[n:])
+	if err != nil {
+		return Resource{}, 0, err
+	}
+
+	return Resource{SchemaURL: schema, Attributes: attrs}, n + an, nil
+}
+
+func decodeScope(src []byte) (Scope, int, error) {
+	name, n1, err := readLenBytes(src)
+	if err != nil {
+		return Scope{}, 0, errors.Wrap(err, "name")
+	}
+
+	version, n2, err := readLenBytes(src[n1:])
+	if err != nil {
+		return Scope{}, 0, errors.Wrap(err, "version")
+	}
+
+	schema, n3, err := readLenBytes(src[n1+n2:])
+	if err != nil {
+		return Scope{}, 0, errors.Wrap(err, "schema_url")
+	}
+
+	off := n1 + n2 + n3
+
+	attrs, an, err := DecodeAttributes(src[off:])
+	if err != nil {
+		return Scope{}, 0, err
+	}
+
+	return Scope{Name: name, Version: version, SchemaURL: schema, Attributes: attrs}, off + an, nil
+}
+
 // DecodeAttributes parses the canonical binary form produced by
 // [Attributes.AppendHashInput]. Keys and string/byte values alias src.
 func DecodeAttributes(src []byte) (Attributes, int, error) {
