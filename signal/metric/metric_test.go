@@ -10,14 +10,19 @@ import (
 )
 
 type emitted struct {
-	id Identity
-	s  Sample
+	sid signal.SeriesID
+	id  Identity
+	s   Sample
 }
 
-func collect(md Metrics) ([]emitted, int) {
+func collect(tb testing.TB, md Metrics) ([]emitted, int) {
+	tb.Helper()
+
 	var out []emitted
-	a := Project(md, func(id Identity, s Sample) {
-		out = append(out, emitted{id.clone(), s})
+	a := Project(md, func(sid signal.SeriesID, id *Identity, s Sample) {
+		// The hot-path id must equal the materialized identity's hash on every point.
+		require.Equal(tb, id.SeriesID(), sid)
+		out = append(out, emitted{sid, id.clone(), s})
 	})
 
 	return out, a
@@ -64,7 +69,7 @@ func TestProjectGauge(t *testing.T) {
 	t.Parallel()
 
 	md := newGauge("http.requests", "/x", 1.0, "/y", 2.0)
-	got, accepted := collect(md)
+	got, accepted := collect(t, md)
 
 	require.Len(t, got, 2)
 	assert.Equal(t, 2, accepted)
@@ -98,7 +103,7 @@ func TestProjectSumCarriesTemporalityAndMonotonic(t *testing.T) {
 	p.Ts = 5
 	p.Value = 42
 
-	got, accepted := collect(md)
+	got, accepted := collect(t, md)
 	require.Len(t, got, 1)
 	assert.Equal(t, 1, accepted)
 	assert.Equal(t, KindSum, got[0].id.Kind)
@@ -121,7 +126,7 @@ func TestProjectCarriesPointAttributes(t *testing.T) {
 		signal.KeyValue{Key: []byte("i"), Value: signal.IntValue(7)},
 	)
 
-	got, _ := collect(md)
+	got, _ := collect(t, md)
 	require.Len(t, got, 1)
 	at := got[0].id.Series.Attributes
 	sv, ok := at.Get([]byte("s"))
@@ -191,7 +196,57 @@ func TestToSeriesFoldsReservedLabels(t *testing.T) {
 func TestProjectEmptyBatch(t *testing.T) {
 	t.Parallel()
 
-	got, accepted := collect(Metrics{})
+	got, accepted := collect(t, Metrics{})
 	assert.Empty(t, got)
 	assert.Equal(t, 0, accepted)
+}
+
+// TestProjectIDHandlesReservedCollision pins the trickiest merge case: a point attribute
+// whose key collides with a reserved label (__name__). The hoisted-merge id must still
+// equal the materialized identity's hash, with the point attribute ordered before the
+// reserved one (stable-sort semantics).
+func TestProjectIDHandlesReservedCollision(t *testing.T) {
+	t.Parallel()
+
+	var md Metrics
+	mt := md.AddResource().AddScope().AddMetric()
+	mt.Name = []byte("real.name")
+	mt.Kind = KindGauge
+	p := mt.AddPoint()
+	p.Attributes = signal.NewAttributes(
+		signal.KeyValue{Key: LabelName, Value: signal.StringValue([]byte("shadow"))}, // collides with reserved
+		signal.KeyValue{Key: []byte("route"), Value: signal.StringValue([]byte("/x"))},
+	)
+
+	got, _ := collect(t, md) // collect asserts sid == id.SeriesID() per point
+	require.Len(t, got, 1)
+	assert.Equal(t, got[0].id.ToSeries().Hash(), got[0].sid)
+}
+
+// FuzzProjectIDMatchesToSeries fuzzes the hot-path id against the reference materialization
+// (Identity.ToSeries hashed) over arbitrary point attributes, including keys that collide
+// with reserved labels and with each other.
+func FuzzProjectIDMatchesToSeries(f *testing.F) {
+	f.Add([]byte("route"), []byte("/x"), []byte("__name__"), []byte("api"), uint8(1))
+	f.Add([]byte("a"), []byte("1"), []byte("a"), []byte("2"), uint8(0))
+	f.Add([]byte(""), []byte(""), []byte("z"), []byte(""), uint8(3))
+
+	f.Fuzz(func(t *testing.T, k1, v1, k2, v2 []byte, kind uint8) {
+		var md Metrics
+		mt := md.AddResource().AddScope().AddMetric()
+		mt.Name = []byte("m")
+		mt.Unit = []byte("u")
+		mt.Kind = PointKind(kind % 2)
+		mt.Temporality = Temporality(kind % 3)
+		mt.Monotonic = kind&1 == 1
+		p := mt.AddPoint()
+		p.Attributes = signal.NewAttributes(
+			signal.KeyValue{Key: k1, Value: signal.StringValue(v1)},
+			signal.KeyValue{Key: k2, Value: signal.BytesValue(v2)},
+		)
+
+		Project(md, func(sid signal.SeriesID, id *Identity, _ Sample) {
+			require.Equal(t, id.ToSeries().Hash(), sid)
+		})
+	})
 }

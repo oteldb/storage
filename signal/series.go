@@ -38,8 +38,8 @@ type Series struct {
 // distinct identities share a pre-image. It is the reversible wire form decoded by
 // [DecodeSeries].
 func (s Series) AppendHashInput(dst []byte) []byte {
-	dst = s.Resource.appendHashInput(dst)
-	dst = s.Scope.appendHashInput(dst)
+	dst = s.Resource.AppendHashInput(dst)
+	dst = s.Scope.AppendHashInput(dst)
 
 	return s.Attributes.AppendHashInput(dst)
 }
@@ -67,7 +67,11 @@ func (r Resource) Clone() Resource {
 	return Resource{SchemaURL: bytes.Clone(r.SchemaURL), Attributes: r.Attributes.Clone()}
 }
 
-func (r Resource) appendHashInput(dst []byte) []byte {
+// AppendHashInput appends the canonical, length-delimited hash pre-image of the resource
+// (schema_url ‖ attributes) to dst. It is the resource segment of [Series.AppendHashInput],
+// exposed so ingest paths can build a series hash from hoisted, per-group prefixes without
+// rebuilding the resource segment per point.
+func (r Resource) AppendHashInput(dst []byte) []byte {
 	dst = appendLenBytes(dst, r.SchemaURL)
 
 	return r.Attributes.AppendHashInput(dst)
@@ -91,7 +95,10 @@ func (s Scope) Clone() Scope {
 	}
 }
 
-func (s Scope) appendHashInput(dst []byte) []byte {
+// AppendHashInput appends the canonical, length-delimited hash pre-image of the scope
+// (name ‖ version ‖ schema_url ‖ attributes) to dst. It is the scope segment of
+// [Series.AppendHashInput], exposed so ingest paths can hoist it per scope group.
+func (s Scope) AppendHashInput(dst []byte) []byte {
 	dst = appendLenBytes(dst, s.Name)
 	dst = appendLenBytes(dst, s.Version)
 	dst = appendLenBytes(dst, s.SchemaURL)

@@ -233,7 +233,20 @@ in a `Metrics` batch is well-formed by construction, so projection rejects nothi
 folds the metric-specific fields — name, unit, kind, temporality, monotonicity — into
 **reserved labels** (`__name__`, `__unit__`, …) on a `signal.Series`, so the one
 identity/index machinery covers metrics and a query matches `__name__` like any other
-label. `emit` receives `(Identity, Sample)` per point.
+label. `emit` receives `(SeriesID, *Identity, Sample)` per point.
+
+**The series id is computed on the hot path without allocating or sorting.** A `projector`
+hoists the invariant work: the resource‖scope hash pre-image is built once per scope group
+and kept **resident** at the front of a reused buffer (never re-copied per point); the five
+folded reserved labels are built once per metric in sorted-key order. Per point, only the
+point's (already-sorted) attributes are merged with the reserved labels in **one pass** —
+emitting the canonical hash pre-image directly via `signal.AppendKeyValueHashInput`, never
+materializing a combined sorted `[]KeyValue` — and hashed. The result is byte-identical to
+`Identity.ToSeries().Hash()` (a fuzz test pins this, including reserved-key collisions), so
+`ToSeries` stays the reference materialization, used only when the engine reports a new
+series. The reused `*Identity` must not be retained past the `emit` call. This is what makes
+ingest ~zero-alloc: the per-point hash, sort, and merged-slice allocations the naïve path
+paid (≈7 allocs/point) collapse to none.
 
 **pdata is confined to one optional adapter.** `otlp/pdataconv` converts the collector
 `pmetric.Metrics` into `metric.Metrics` (`AppendMetrics`, holding the `pcommon` →
@@ -255,6 +268,12 @@ It is safe for concurrent use (one `sync.RWMutex`).
   the folded point attributes), registers the series on first sight, and rejects samples
   older than `newest − OOOWindow`. The **series index outlives a flush** — only sample
   buffers are drained — so flushed series stay queryable and re-appends don't re-index.
+  `appendByID` is the hot ingest path: it takes the **precomputed** `SeriesID` (from the
+  projection layer) and a `materialize func() signal.Series` that is invoked **only on first
+  sight**. A repeat append is a **single map probe** — a present sample buffer means the
+  series is known, so the series index is never consulted and no `signal.Series` is built or
+  hashed; only an absent buffer falls back to the (authoritative) series index. `Append`
+  (full `signal.Series` in, hash inside) remains for callers that already hold an identity.
 - **Flush** (`flush.go`) drains the head's buffered samples into one **flat 3-column part**
   `[series:int128, ts:int64, value:float64]`, one row per sample, sorted by `(series, ts)`,
   written via `block.PartWriter` under `{tenant}/metrics/{seq}`.
@@ -300,9 +319,10 @@ ingest batches (`metric.Metrics`, and placeholder `log.Logs`/`trace.Traces`/
   flushes every tenant engine. `WriteMetrics(ctx, md)` is **fully implemented**: it
   projects the internal `metric.Metrics` batch, derives each point's **tenant from its Resource+Scope**
   via the `Options.Tenant` callback (no tenant argument), and appends to that tenant's
-  lazily-created `engine.Engine` (one per tenant, parts under `{tenant}/metrics`). It
-  returns `Accepted` (OTLP partial-success: rejected counts unsupported kinds, value-less
-  points, and out-of-order drops). `WriteLogs`/`WriteTraces`/`WriteProfiles` are later
+  lazily-created `engine.Engine` (one per tenant, parts under `{tenant}/metrics`) through the
+  `AppendByID` fast path, caching the resolved engine across a tenant-contiguous run of
+  points. It returns `Accepted` (OTLP partial-success: rejected counts out-of-order drops;
+  unsupported kinds and value-less points are filtered upstream by the producer). `WriteLogs`/`WriteTraces`/`WriteProfiles` are later
   verticals (`ErrNotImplemented`). A single **maintenance loop** periodically flushes +
   merges every engine, applying per-tenant retention from the resolved policy. `Reset(ctx)`
   discards all ingested data (every engine's head + flushed parts), retaining the engines

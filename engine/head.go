@@ -72,6 +72,46 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 	return id, true, isNew
 }
 
+// appendByID adds one sample for the series whose content id is already computed. The full
+// identity is materialized lazily — materialize() is called only on first sight, when the
+// series must be registered and indexed — so the hot path for a repeat series never builds
+// or hashes a [signal.Series]. It returns whether the sample was accepted (false ⇒ out of
+// the OOO window), whether the series was newly seen, and, when new, the materialized
+// identity (for the caller's WAL series record).
+func (h *head) appendByID(
+	id signal.SeriesID, ts int64, value float64, oooWindow int64, materialize func() signal.Series,
+) (accepted, isNew bool, s signal.Series) {
+	if h.newest != 0 && oooWindow > 0 && ts < h.newest-oooWindow {
+		return false, false, signal.Series{}
+	}
+
+	// One map probe on the hot path: a present sample buffer means the series is already
+	// known, so a repeat append never touches the series index. Only when the buffer is
+	// absent do we consult the series index (authoritative — WAL replay can register a
+	// series before its first live sample) to decide whether to materialize and index it.
+	buf := h.samples[id]
+	if buf == nil {
+		if !h.series.Has(id) {
+			isNew = true
+			s = materialize()
+			h.series.Add(s)
+			h.indexLabels(id, s)
+		}
+
+		buf = &sampleBuf{}
+		h.samples[id] = buf
+	}
+
+	buf.ts = append(buf.ts, ts)
+	buf.values = append(buf.values, value)
+
+	if ts > h.newest {
+		h.newest = ts
+	}
+
+	return true, isNew, s
+}
+
 // bufFor returns the (created-on-demand) sample buffer for an already-registered series.
 func (h *head) bufFor(id signal.SeriesID) *sampleBuf {
 	buf := h.samples[id]

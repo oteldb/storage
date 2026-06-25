@@ -56,6 +56,9 @@ type Metric struct {
 // value-less or unsupported OTLP points are filtered (and counted) by the producer, never
 // represented here.
 type NumberPoint struct {
+	// Attributes are the point's data-point attributes. They must be sorted by key (use
+	// [signal.NewAttributes]): [Project] hashes them by a one-pass merge with the reserved
+	// labels that assumes both sides are sorted, so an unsorted slice yields a wrong id.
 	Attributes signal.Attributes
 	StartTs    int64
 	Ts         int64

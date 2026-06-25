@@ -69,6 +69,38 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 	return true, nil
 }
 
+// AppendByID ingests one sample for a series whose content [signal.SeriesID] is already
+// computed (by the projection layer, on a reused buffer). The full identity is materialized
+// lazily via materialize — called only when the series is new — so a repeat series costs
+// just a map probe and a buffer append, with no per-point [signal.Series] construction or
+// hashing. It returns whether the sample was accepted (false ⇒ out-of-order beyond the
+// window). Safe for concurrent use.
+func (e *Engine) AppendByID(
+	id signal.SeriesID, ts int64, value float64, materialize func() signal.Series,
+) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	accepted, isNew, s := e.head.appendByID(id, ts, value, e.cfg.OOOWindow, materialize)
+	if !accepted {
+		return false, nil
+	}
+
+	if e.cfg.WAL != nil {
+		if isNew {
+			if err := e.cfg.WAL.WriteSeries(id, s); err != nil {
+				return true, err
+			}
+		}
+
+		if err := e.cfg.WAL.WriteSamples(id, []int64{ts}, []float64{value}); err != nil {
+			return true, err
+		}
+	}
+
+	return true, nil
+}
+
 // Fetch implements [fetch.Fetcher] over the head ∪ flushed parts: it resolves the
 // request's matchers to series (the index spans every series ever seen, flushed or not)
 // and returns one batch per series with its samples in the window, merged across the head

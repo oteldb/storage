@@ -92,7 +92,7 @@ func TestAppendMetricsDropsUnsupportedAndValueless(t *testing.T) {
 	assert.Equal(t, 3, dropped, "2 histogram points + 1 value-less gauge point")
 
 	// Only the valid gauge point survives projection.
-	accepted := metric.Project(out, func(metric.Identity, metric.Sample) {})
+	accepted := metric.Project(out, func(signal.SeriesID, *metric.Identity, metric.Sample) {})
 	assert.Equal(t, 1, accepted)
 }
 

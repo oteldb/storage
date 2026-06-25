@@ -1,6 +1,9 @@
 package metric
 
 import (
+	"bytes"
+	"encoding/binary"
+
 	"github.com/oteldb/storage/signal"
 )
 
@@ -84,20 +87,46 @@ type Sample struct {
 }
 
 // Project iterates an internal [Metrics] batch and calls emit for every number data point
-// with its [Identity] and [Sample]. Resource and scope are hoisted once per group. It
+// with its content-addressed [signal.SeriesID], its [Identity], and its [Sample]. It
 // returns how many points were emitted. Every point in a [Metrics] batch is well-formed by
 // construction (value-less and unsupported OTLP points are filtered by the producer — e.g.
 // the otlp/pdataconv bridge), so projection rejects nothing; out-of-order rejection is the
 // engine's concern downstream.
-func Project(md Metrics, emit func(Identity, Sample)) (accepted int) {
+//
+// The SeriesID is computed on the hot path without allocating: the resource‖scope hash
+// pre-image is hoisted once per scope group, the five folded reserved labels once per
+// metric, and only the point attributes are merged in per point, into a reused buffer. The
+// emitted id equals [Identity.SeriesID] (i.e. emit's id == id.ToSeries().Hash()). The
+// *Identity passed to emit is reused across points: emit must not retain it past the call;
+// materialize a [signal.Series] via [Identity.ToSeries] if a durable copy is needed.
+func Project(md Metrics, emit func(signal.SeriesID, *Identity, Sample)) (accepted int) {
+	var (
+		p  projector
+		id Identity
+	)
+
 	for ri := range md.Resources {
 		rm := &md.Resources[ri]
+		id.Series.Resource = rm.Resource
 
 		for si := range rm.Scopes {
 			sm := &rm.Scopes[si]
+			id.Series.Scope = sm.Scope
+			p.setGroup(rm.Resource, sm.Scope)
 
 			for mi := range sm.Metrics {
-				accepted += projectMetric(&sm.Metrics[mi], rm.Resource, sm.Scope, emit)
+				m := &sm.Metrics[mi]
+				id.Name, id.Unit, id.Kind = m.Name, m.Unit, m.Kind
+				id.Temporality, id.Monotonic = m.Temporality, m.Monotonic
+				p.setMetric(m)
+
+				for pi := range m.Points {
+					pt := &m.Points[pi]
+					id.Series.Attributes = pt.Attributes
+					sid := p.id(pt.Attributes)
+					emit(sid, &id, Sample{StartTs: pt.StartTs, Ts: pt.Ts, Value: pt.Value})
+					accepted++
+				}
 			}
 		}
 	}
@@ -105,22 +134,72 @@ func Project(md Metrics, emit func(Identity, Sample)) (accepted int) {
 	return accepted
 }
 
-func projectMetric(m *Metric, resource signal.Resource, scope signal.Scope, emit func(Identity, Sample)) int {
-	base := Identity{
-		Series:      signal.Series{Resource: resource, Scope: scope},
-		Name:        m.Name,
-		Unit:        m.Unit,
-		Kind:        m.Kind,
-		Temporality: m.Temporality,
-		Monotonic:   m.Monotonic,
+// projector holds the reusable scratch buffers for one [Project] pass so per-point identity
+// hashing allocates nothing. buf[:prefixLen] holds the resource‖scope hash pre-image
+// (hoisted per scope group and kept resident, so it is never re-copied per point); each
+// point's attributes are appended after it in place. reserved is the metric's five folded
+// labels in sorted-by-key order (hoisted per metric).
+type projector struct {
+	buf       []byte
+	prefixLen int
+	reserved  [5]signal.KeyValue
+}
+
+// setGroup rebuilds the hoisted resource‖scope prefix at the front of buf for a new scope
+// group; subsequent per-point ids reuse it without copying.
+func (p *projector) setGroup(r signal.Resource, sc signal.Scope) {
+	p.buf = sc.AppendHashInput(r.AppendHashInput(p.buf[:0]))
+	p.prefixLen = len(p.buf)
+}
+
+// setMetric fills the five reserved labels for a metric, in sorted-by-key order:
+// __kind__ < __monotonic__ < __name__ < __temporality__ < __unit__.
+func (p *projector) setMetric(m *Metric) {
+	p.reserved[0] = signal.KeyValue{Key: LabelKind, Value: signal.IntValue(int64(m.Kind))}
+	p.reserved[1] = signal.KeyValue{Key: LabelMonotonic, Value: signal.BoolValue(m.Monotonic)}
+	p.reserved[2] = signal.KeyValue{Key: LabelName, Value: signal.StringValue(m.Name)}
+	p.reserved[3] = signal.KeyValue{Key: LabelTemporality, Value: signal.IntValue(int64(m.Temporality))}
+	p.reserved[4] = signal.KeyValue{Key: LabelUnit, Value: signal.StringValue(m.Unit)}
+}
+
+// id computes the series id for a point with the given already-sorted attributes, reusing
+// buf. It builds the same hash pre-image as [Identity.ToSeries] hashed — prefix, then the
+// attribute set (point attributes ∪ the five reserved labels) in sorted order — but merges
+// the two sorted sources in one pass instead of allocating and sorting a combined slice.
+func (p *projector) id(attrs signal.Attributes) signal.SeriesID {
+	// Reuse buf, truncated to the resident prefix; the attribute bytes are appended after it
+	// in place (keeping the grown capacity), so the prefix is never re-copied.
+	buf := p.buf[:p.prefixLen]
+	buf = binary.AppendUvarint(buf, uint64(len(attrs)+len(p.reserved)))
+	buf = appendMergedHashInput(buf, attrs, p.reserved[:])
+	p.buf = buf
+
+	return signal.HashBytes(buf)
+}
+
+// appendMergedHashInput appends the attribute hash pre-image for the merge of two
+// already-sorted, individually-unique key/value sequences. Ties (equal keys) resolve to a
+// first, which matches the stable sort of (a ‖ b) that [Identity.ToSeries] performs, so the
+// resulting id is byte-identical.
+func appendMergedHashInput(dst []byte, a signal.Attributes, b []signal.KeyValue) []byte {
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		if bytes.Compare(a[i].Key, b[j].Key) <= 0 {
+			dst = signal.AppendKeyValueHashInput(dst, a[i].Key, a[i].Value)
+			i++
+		} else {
+			dst = signal.AppendKeyValueHashInput(dst, b[j].Key, b[j].Value)
+			j++
+		}
 	}
 
-	for i := range m.Points {
-		p := &m.Points[i]
-		id := base
-		id.Series = signal.Series{Resource: resource, Scope: scope, Attributes: p.Attributes}
-		emit(id, Sample{StartTs: p.StartTs, Ts: p.Ts, Value: p.Value})
+	for ; i < len(a); i++ {
+		dst = signal.AppendKeyValueHashInput(dst, a[i].Key, a[i].Value)
 	}
 
-	return len(m.Points)
+	for ; j < len(b); j++ {
+		dst = signal.AppendKeyValueHashInput(dst, b[j].Key, b[j].Value)
+	}
+
+	return dst
 }

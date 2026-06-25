@@ -366,6 +366,18 @@ func (a Attributes) AppendHashInput(dst []byte) []byte {
 	return dst
 }
 
+// AppendKeyValueHashInput appends the canonical hash pre-image of a single attribute — a
+// length-prefixed key followed by the type-tagged value — to dst. It is the per-entry unit
+// of [Attributes.AppendHashInput], exposed so an ingest path can build a series' hash by
+// merging several already-sorted attribute sources in one pass, without first materializing
+// the combined sorted slice. Entries must be appended in sorted-by-key order and prefixed
+// with their count (see [Attributes.AppendHashInput]) for the result to match.
+func AppendKeyValueHashInput(dst, key []byte, v Value) []byte {
+	dst = appendLenBytes(dst, key)
+
+	return v.appendHash(dst)
+}
+
 // Equal reports whether two sorted attribute sets are deeply equal.
 func (a Attributes) Equal(other Attributes) bool {
 	if len(a) != len(other) {
