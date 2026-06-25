@@ -1,7 +1,6 @@
 package pool
 
 import (
-	"bytes"
 	"testing"
 )
 
@@ -198,22 +197,40 @@ func TestByteIntMapCollision(t *testing.T) {
 	}
 }
 
-func TestByteKeysEqual(t *testing.T) {
+func TestBytesEqualUsage(t *testing.T) {
 	t.Parallel()
-	if !byteKeysEqual([]byte("abc"), []byte("abc")) {
-		t.Error("equal keys not equal")
+	// Verify the map uses bytes.Equal correctly via Get/Put behavior.
+	m := NewByteIntMap()
+	defer m.PutBack()
+	m.Put([]byte("abc"), 1)
+	if _, ok := m.Get([]byte("abc")); !ok {
+		t.Error("Get(abc) should find it")
 	}
-	if byteKeysEqual([]byte("abc"), []byte("abd")) {
-		t.Error("different keys equal")
+	if _, ok := m.Get([]byte("abd")); ok {
+		t.Error("Get(abd) should not find abc")
 	}
-	if byteKeysEqual([]byte("abc"), []byte("ab")) {
-		t.Error("different-length keys equal")
+	if _, ok := m.Get([]byte("ab")); ok {
+		t.Error("Get(ab) should not find abc (different length)")
 	}
-	if !byteKeysEqual(nil, nil) {
-		t.Error("nil keys not equal")
+}
+
+func TestByteIntMapDeleteAllAndReinsert(t *testing.T) {
+	t.Parallel()
+	m := NewByteIntMap()
+	defer m.PutBack()
+	m.Put([]byte("a"), 1)
+	m.Put([]byte("b"), 2)
+	m.Put([]byte("c"), 3)
+	// Delete all, then reinsert to exercise the full Delete backshift.
+	m.Delete([]byte("a"))
+	m.Delete([]byte("c"))
+	m.Delete([]byte("b"))
+	if m.Len() != 0 {
+		t.Errorf("Len = %d after deleting all", m.Len())
 	}
-	// Ensure bytes.Equal fallback path is correct.
-	if !bytes.Equal([]byte("abc"), []byte("abc")) {
+	m.Put([]byte("d"), 4)
+	if v, ok := m.Get([]byte("d")); !ok || v != 4 {
+		t.Errorf("Get(d) after reinsert = %d, %v", v, ok)
 	}
 }
 

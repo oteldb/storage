@@ -94,18 +94,13 @@ func EncodeBytes(dst []byte, vals [][]byte) []byte {
 	scratch := newDictEncodeScratch(len(vals))
 	defer scratch.putBack()
 
-	flatPayloadBytes := 0
 	dictEntryBytes := 0
 	flat := false
 	for i, v := range vals {
-		flatPayloadBytes += uvarintLen(uint64(len(v))) + len(v)
 		id, existed := m.PutOrGet(v, len(scratch.entries))
 		if !existed {
 			if len(scratch.entries) == 65536 {
 				flat = true
-				for _, v := range vals[i+1:] {
-					flatPayloadBytes += uvarintLen(uint64(len(v))) + len(v)
-				}
 				break
 			}
 			scratch.entries = append(scratch.entries, v)
@@ -117,6 +112,11 @@ func EncodeBytes(dst []byte, vals [][]byte) []byte {
 
 	if flat {
 		// Flat fallback: no dictionary, store each value inline.
+		// Compute payload size now (deferred from the hot loop above).
+		flatPayloadBytes := 0
+		for _, v := range vals {
+			flatPayloadBytes += uvarintLen(uint64(len(v))) + len(v)
+		}
 		dst = slices.Grow(dst, uvarintLen(uint64(len(vals)))+1+flatPayloadBytes)
 		w := bitstream.NewWriter(dst)
 		w.WriteUvarint(uint64(len(vals)))

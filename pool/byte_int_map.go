@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"bytes"
 	"sync"
 
 	"github.com/zeebo/xxh3"
@@ -26,15 +27,14 @@ func init() {
 // Capacity is rounded up to a power of two; the load factor is ≤ 0.75 (probed slots)
 // before [grow] is triggered. Keys are compared with bytes.Equal (no string conversion).
 type ByteIntMap struct {
-	keys   [][]byte // key at slot i; nil ⇒ empty; sentinelLen=-1 means tombstone
+	keys   [][]byte // key at slot i; nil ⇒ empty
 	values []int    // value at slot i
-	hashes []uint64 // cached hash (0 is reserved for empty; 1 is used for a real hash==0 case)
+	hashes []uint64 // cached hash (0 is reserved for empty)
 	mask   uint64   // len(hashes)-1
 	count  int      // number of live entries
 	used   int      // number of non-empty slots (live + tombstones)
+	growAt int      // precomputed: len(hashes)*3/4; grow when used+1 > growAt
 }
-
-const byteIntMapTombstone = -1 // marker for a deleted key's length slot (see keys)
 
 func NewByteIntMap() *ByteIntMap {
 	const initial = 1 << 5 // 32 slots
@@ -44,6 +44,7 @@ func NewByteIntMap() *ByteIntMap {
 		m.values = make([]int, initial)
 		m.hashes = make([]uint64, initial)
 		m.mask = initial - 1
+		m.growAt = initial * 3 / 4
 	} else {
 		m.Reset() // clear stale data from a previous use
 	}
@@ -51,17 +52,18 @@ func NewByteIntMap() *ByteIntMap {
 }
 
 func (m *ByteIntMap) Reset() {
-	for i := range m.hashes {
-		m.keys[i] = nil
-		m.hashes[i] = 0
-	}
+	clear(m.hashes)
+	clear(m.keys)
 	m.count = 0
 	m.used = 0
 }
 
 func (m *ByteIntMap) Len() int { return m.count }
 
-// hashKey returns the xxh3 hash of b, ensuring it's never 0 (reserved for empty).
+// hashKey returns the xxh3 hash of b, ensuring it's never 0 (reserved for empty slot).
+// Inlined by the compiler.
+//
+//go:inline
 func hashKey(b []byte) uint64 {
 	h := xxh3.Hash(b)
 	if h == 0 {
@@ -71,15 +73,17 @@ func hashKey(b []byte) uint64 {
 }
 
 // Get returns the value for key b and true if present.
+//
+//go:nosplit
 func (m *ByteIntMap) Get(b []byte) (int, bool) {
 	h := hashKey(b)
 	i := h & m.mask
 	for {
-		slot := &m.hashes[i]
-		if *slot == 0 {
+		sh := m.hashes[i]
+		if sh == 0 {
 			return 0, false // empty
 		}
-		if *slot == h && byteKeysEqual(m.keys[i], b) {
+		if sh == h && bytes.Equal(m.keys[i], b) {
 			return m.values[i], true
 		}
 		i = (i + 1) & m.mask
@@ -89,15 +93,14 @@ func (m *ByteIntMap) Get(b []byte) (int, bool) {
 // Put inserts or updates key b → v. Returns the old value and true if the key
 // existed, or (v, false) for a new insertion.
 func (m *ByteIntMap) Put(b []byte, v int) (int, bool) {
-	if float64(m.used+1) > float64(len(m.hashes))*0.75 {
+	if m.used+1 > m.growAt {
 		m.grow()
 	}
 	h := hashKey(b)
 	i := h & m.mask
 	for {
-		slot := &m.hashes[i]
-		if *slot == 0 {
-			// Empty slot: insert.
+		sh := m.hashes[i]
+		if sh == 0 {
 			m.keys[i] = b
 			m.values[i] = v
 			m.hashes[i] = h
@@ -105,7 +108,7 @@ func (m *ByteIntMap) Put(b []byte, v int) (int, bool) {
 			m.used++
 			return v, false
 		}
-		if *slot == h && byteKeysEqual(m.keys[i], b) {
+		if sh == h && bytes.Equal(m.keys[i], b) {
 			old := m.values[i]
 			m.values[i] = v
 			return old, true
@@ -117,15 +120,17 @@ func (m *ByteIntMap) Put(b []byte, v int) (int, bool) {
 // PutOrGet inserts b → v if b is absent; otherwise returns the existing value and
 // false. This is the single-lookup dedup path for dictionary building: one probe
 // chain either finds the existing id or inserts a new one.
+//
+//go:nosplit
 func (m *ByteIntMap) PutOrGet(b []byte, v int) (int, bool) {
-	if float64(m.used+1) > float64(len(m.hashes))*0.75 {
+	if m.used+1 > m.growAt {
 		m.grow()
 	}
 	h := hashKey(b)
 	i := h & m.mask
 	for {
-		slot := &m.hashes[i]
-		if *slot == 0 {
+		sh := m.hashes[i]
+		if sh == 0 {
 			m.keys[i] = b
 			m.values[i] = v
 			m.hashes[i] = h
@@ -133,7 +138,7 @@ func (m *ByteIntMap) PutOrGet(b []byte, v int) (int, bool) {
 			m.used++
 			return v, false
 		}
-		if *slot == h && byteKeysEqual(m.keys[i], b) {
+		if sh == h && bytes.Equal(m.keys[i], b) {
 			return m.values[i], true
 		}
 		i = (i + 1) & m.mask
@@ -145,19 +150,15 @@ func (m *ByteIntMap) Delete(b []byte) bool {
 	h := hashKey(b)
 	i := h & m.mask
 	for {
-		slot := &m.hashes[i]
-		if *slot == 0 {
+		sh := m.hashes[i]
+		if sh == 0 {
 			return false
 		}
-		if *slot == h && byteKeysEqual(m.keys[i], b) {
+		if sh == h && bytes.Equal(m.keys[i], b) {
 			m.keys[i] = nil
 			m.hashes[i] = 0
 			m.count--
 			m.used--
-			// Re-insert subsequent entries to fix probe chain (Robin Hood / linear
-			// probing backshift). For simplicity, just mark as empty and let the
-			// probe chain re-evaluate — linear probing tolerates this without
-			// tombstones as long as we re-insert the next cluster.
 			j := (i + 1) & m.mask
 			for m.hashes[j] != 0 {
 				k := m.keys[j]
@@ -200,6 +201,7 @@ func (m *ByteIntMap) grow() {
 	m.values = make([]int, newCap)
 	m.hashes = make([]uint64, newCap)
 	m.mask = uint64(newCap - 1)
+	m.growAt = newCap * 3 / 4
 	m.count = 0
 	m.used = 0
 	for i := range oldHashes {
@@ -207,18 +209,6 @@ func (m *ByteIntMap) grow() {
 			m.PutRaw(oldKeys[i], oldVals[i], oldHashes[i])
 		}
 	}
-}
-
-func byteKeysEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // PutBack returns m to the pool for reuse. After this, m must not be used.
