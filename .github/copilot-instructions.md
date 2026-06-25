@@ -104,4 +104,11 @@ comments instead, and reference `ARCHITECTURE.md` (which is committed) when a po
 - **Coordination is external/minimal:** etcd for ring/leases/rebalance, backend CAS for manifest
   commits. No homegrown Raft. Single-node mode must work with the cluster layer absent.
 - **Policy via callbacks:** multi-tenancy, retention, downsampling, and limits resolve through
-  consumer-supplied callbacks keyed by tenant id.
+  consumer-supplied callbacks keyed by tenant id. Two specifics:
+  - **Tenant id is derived, not passed:** a `func(Resource, Scope) → TenantID` callback routes each
+    ingested record to a tenant from its resource/scope (one batch may span tenants); `tenant.Resolver`
+    maps that id → policy. The `Write*` facade methods take no tenant argument.
+  - **Matchers are callbacks, not operator enums:** at every layer (`index/postings` and the `fetch`
+    contract) a label matcher carries a `Match(value) bool` predicate over the typed value — never an
+    `=/!=/=~/!~` enum. Languages supply the predicate and compose negation/absent; storage and the
+    fetch seam stay operator-free.
