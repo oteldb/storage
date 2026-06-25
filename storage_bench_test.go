@@ -55,11 +55,27 @@ var benchShapes = []struct {
 	{"10000series_1point", 10000, 1},
 }
 
+// reportIngestMetrics adds the point-oriented custom metrics that make an ingest benchmark
+// readable: the throughput (million points/sec) and the per-point cost (ns/point). Both are
+// derived from b.Elapsed (the timed duration, which excludes the reset work wrapped in
+// StopTimer) over the total points ingested across all b.N iterations.
+func reportIngestMetrics(b *testing.B, pointsPerOp int) {
+	b.Helper()
+
+	totalPoints := float64(pointsPerOp) * float64(b.N)
+	secs := b.Elapsed().Seconds()
+	if totalPoints == 0 || secs == 0 {
+		return
+	}
+
+	b.ReportMetric(totalPoints/secs/1e6, "Mpoints/s")
+	b.ReportMetric(secs*1e9/totalPoints, "ns/point")
+}
+
 // BenchmarkWriteMetrics measures the end-to-end point-ingestion throughput of the storage
 // facade — tenant routing, projection, identity hashing, index registration, and head
-// append — across a few cardinality/depth shapes. Throughput (via b.SetBytes) is reported
-// in logical sample bytes: 16 per point (an int64 timestamp + a float64 value), sized by
-// the uncompressed data so it is a real ingest speed.
+// append — across a few cardinality/depth shapes. It reports custom metrics (Mpoints/s and
+// ns/point) via b.ReportMetric.
 func BenchmarkWriteMetrics(b *testing.B) {
 	for _, sh := range benchShapes {
 		b.Run(sh.name, func(b *testing.B) {
@@ -85,7 +101,6 @@ func benchmarkWriteMetrics(b *testing.B, seriesCount, pointsPerSeries int) {
 		b.Fatal(err)
 	}
 
-	b.SetBytes(int64(total) * 16) // logical (timestamp, value) bytes ingested/sec
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -104,14 +119,17 @@ func benchmarkWriteMetrics(b *testing.B, seriesCount, pointsPerSeries int) {
 			b.StartTimer()
 		}
 	}
+
+	reportIngestMetrics(b, total)
 }
 
 // BenchmarkIngestAndFlush is the companion to [BenchmarkWriteMetrics] that includes the
 // flush-to-part cost: each iteration ingests the batch into the head and then flushes it to
 // a new immutable columnar part (column encode + compress + backend write). It measures the
 // steady-state ingest+flush cycle — after the first flush the series index is retained, so
-// subsequent iterations re-append to known series and flush again. Throughput is sized the
-// same way (16 logical bytes/point) so it is directly comparable to the head-only number.
+// subsequent iterations re-append to known series and flush again. It reports the same
+// custom metrics as [BenchmarkWriteMetrics], so the flush overhead shows up directly as a
+// lower Mpoints/s.
 func BenchmarkIngestAndFlush(b *testing.B) {
 	for _, sh := range benchShapes {
 		b.Run(sh.name, func(b *testing.B) {
@@ -136,7 +154,6 @@ func benchmarkIngestAndFlush(b *testing.B, seriesCount, pointsPerSeries int) {
 		b.Fatal(err)
 	}
 
-	b.SetBytes(int64(total) * 16) // logical (timestamp, value) bytes ingested+flushed/sec
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -158,4 +175,6 @@ func benchmarkIngestAndFlush(b *testing.B, seriesCount, pointsPerSeries int) {
 			b.StartTimer()
 		}
 	}
+
+	reportIngestMetrics(b, total)
 }
