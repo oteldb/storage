@@ -17,17 +17,25 @@ const (
 	Profile
 )
 
+// Stable lower-case signal names (used by [Signal.String] and [ParseSignal]).
+const (
+	nameMetric  = "metric"
+	nameLog     = "log"
+	nameTrace   = "trace"
+	nameProfile = "profile"
+)
+
 // String returns a lower-case signal name. It is stable.
 func (s Signal) String() string {
 	switch s {
 	case Metric:
-		return "metric"
+		return nameMetric
 	case Log:
-		return "log"
+		return nameLog
 	case Trace:
-		return "trace"
+		return nameTrace
 	case Profile:
-		return "profile"
+		return nameProfile
 	default:
 		return "unknown"
 	}
@@ -37,13 +45,13 @@ func (s Signal) String() string {
 // [ErrUnknownSignal].
 func ParseSignal(s string) (Signal, error) {
 	switch s {
-	case "metric":
+	case nameMetric:
 		return Metric, nil
-	case "log":
+	case nameLog:
 		return Log, nil
-	case "trace":
+	case nameTrace:
 		return Trace, nil
-	case "profile":
+	case nameProfile:
 		return Profile, nil
 	default:
 		return 0, errors.Wrapf(ErrUnknownSignal, "unknown signal kind %q", s)
