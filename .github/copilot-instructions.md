@@ -75,6 +75,10 @@ When `PROMPT.md`, `DESIGN.md`, and the code disagree, surface it rather than sil
 - **Golden tests** for on-disk formats (parts, WAL) to catch accidental format breaks.
 - **Benchmarks on hot paths** (bit-stream, merge, postings intersection, fetch); use benchmarks +
   pprof as the performance feedback loop — measure before and after hot-path changes.
+- **Assertions:** use `github.com/stretchr/testify` (`require` for must-stop checks — errors,
+  preconditions; `assert` for independent value checks). Prefer it for new and converted tests over
+  hand-written `if got != want { t.Fatalf(...) }`. Fuzz/benchmark bodies stay testify-free where it
+  would add overhead to the hot loop.
 - Run `go test ./...` and `go vet ./...`; keep the tree green and formatted (`gofmt`/`goimports`).
 
 ## Architecture invariants to preserve
