@@ -100,6 +100,13 @@ linters:
         path: _test\.go
         text: dupArg
         source: (assert|require).+Equal
+      # internal/cmd/* are developer-run CLI tools, not the library surface: launching
+      # `go test` as a subprocess (G204), opening discovered test files (G304), and
+      # picking a random fuzz target with math/rand (G404) are inherent to the tool, not
+      # untrusted-input risks.
+      - linters:
+          - gosec
+        path: internal/cmd/
     paths:
       - third_party$
       - builtin$

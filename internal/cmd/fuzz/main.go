@@ -107,7 +107,7 @@ func run() error {
 
 	if cfg.list {
 		for _, t := range targets {
-			fmt.Println(t)
+			_, _ = fmt.Fprintln(os.Stdout, t)
 		}
 		return nil
 	}
@@ -118,34 +118,37 @@ func run() error {
 	}
 
 	args := buildArgs(cfg, t)
-	cmd := exec.Command(cfg.goBin, args...)
-	cmd.Dir = cfg.root
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	cmd.Env = buildEnv(cfg)
 
-	fmt.Fprintf(os.Stderr, "fuzz: selected %s\nfuzz: %s %s\n",
+	_, _ = fmt.Fprintf(os.Stderr, "fuzz: selected %s\nfuzz: %s %s\n",
 		t, cfg.goBin, strings.Join(args, " "))
 	if cfg.dryRun {
 		return nil
 	}
 
-	// Forward Ctrl-C to the child so a campaign can be stopped cleanly.
+	// Forward Ctrl-C/SIGTERM to the child so a campaign stops cleanly and persists its corpus.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := cmd.Start(); err != nil {
-		return errors.Wrap(err, "start")
-	}
-	go func() {
-		<-ctx.Done()
-		if cmd.Process != nil {
-			_ = cmd.Process.Signal(syscall.SIGINT)
+
+	cmd := exec.CommandContext(ctx, cfg.goBin, args...)
+	cmd.Dir = cfg.root
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.Env = buildEnv(cfg)
+	// CommandContext kills with SIGKILL on cancellation by default; send SIGINT instead so
+	// the fuzzer shuts down gracefully and writes its corpus.
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
 		}
-	}()
-	if err := cmd.Wait(); err != nil {
+
+		return cmd.Process.Signal(syscall.SIGINT)
+	}
+
+	if err := cmd.Run(); err != nil {
 		return errors.Wrap(err, "fuzzing failed")
 	}
+
 	return nil
 }
 
@@ -172,7 +175,7 @@ func parseFlags(argv []string) (config, error) {
 	fs.StringVar(&cfg.libaflConfig, "libafl-config", "", "LibAFL: path to a tuning config (jsonc)")
 
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: fuzz [flags] [-- extra go-test args]\n\n"+
+		_, _ = fmt.Fprintf(fs.Output(), "Usage: fuzz [flags] [-- extra go-test args]\n\n"+
 			"Starts a gosentry+LibAFL fuzzing campaign for a random fuzz target.\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
