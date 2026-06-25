@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -119,6 +120,9 @@ func TestFileNewUnderFileErrors(t *testing.T) {
 // TestFileWriteIntoReadOnlyDir covers the temp-create error branch in Write.
 func TestFileWriteIntoReadOnlyDir(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX directory permission bits do not block file creation on Windows")
+	}
 	ctx := context.Background()
 	root := t.TempDir()
 	b, err := file.New(root)
@@ -188,6 +192,9 @@ func TestFileListSkipsTempFiles(t *testing.T) {
 // subdirectory surfaces an error from the walk.
 func TestFileListWalkError(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX directory permission bits do not block directory walks on Windows")
+	}
 	ctx := context.Background()
 	root := t.TempDir()
 	b, err := file.New(root)
