@@ -4,6 +4,9 @@ import (
 	"errors"
 	"math"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDoDRoundTrip verifies EncodeTimestamps∘DecodeTimestamps == identity for a range
@@ -33,19 +36,8 @@ func TestDoDRoundTrip(t *testing.T) {
 			enc := EncodeTimestamps(nil, tc.ts)
 
 			got, _, err := DecodeTimestamps(nil, enc)
-			if err != nil {
-				t.Fatalf("Decode: %v", err)
-			}
-
-			if len(got) != len(tc.ts) {
-				t.Fatalf("len = %d, want %d", len(got), len(tc.ts))
-			}
-
-			for i := range tc.ts {
-				if got[i] != tc.ts[i] {
-					t.Fatalf("ts[%d] = %d, want %d", i, got[i], tc.ts[i])
-				}
-			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.ts, got)
 		})
 	}
 }
@@ -59,9 +51,7 @@ func TestDoDCompressionRatio(t *testing.T) {
 	// 1000 samples → ~1000 bits (all dod==0) → ~125 bytes + header.
 	// Allow some overhead for the header uvarint and first two samples.
 	maxBytes := 200 // generous; ~0.16 bytes/sample
-	if len(enc) > maxBytes {
-		t.Fatalf("compressed size = %d bytes for 1000 constant-stride ts, want ≤ %d", len(enc), maxBytes)
-	}
+	assert.LessOrEqualf(t, len(enc), maxBytes, "compressed size for 1000 constant-stride ts")
 }
 
 func makeConstantStride(n int, start, step int64) []int64 {
@@ -104,9 +94,7 @@ func TestBitRange(t *testing.T) {
 		{524289, 20, false},
 	}
 	for _, tc := range cases {
-		if got := bitRange(tc.x, tc.n); got != tc.want {
-			t.Errorf("bitRange(%d, %d) = %v, want %v", tc.x, tc.n, got, tc.want)
-		}
+		assert.Equalf(t, tc.want, bitRange(tc.x, tc.n), "bitRange(%d, %d)", tc.x, tc.n)
 	}
 }
 
@@ -125,9 +113,7 @@ func TestSignExtend(t *testing.T) {
 		{0x3fff, 14, 0x3fff - 16384}, // = -1
 	}
 	for _, tc := range cases {
-		if got := signExtend(tc.u, tc.n); got != tc.want {
-			t.Errorf("signExtend(%#x, %d) = %d, want %d", tc.u, tc.n, got, tc.want)
-		}
+		assert.Equalf(t, tc.want, signExtend(tc.u, tc.n), "signExtend(%#x, %d)", tc.u, tc.n)
 	}
 }
 
@@ -137,9 +123,9 @@ func TestDoDEmptyDecode(t *testing.T) {
 	enc := EncodeTimestamps(nil, nil)
 
 	got, n, err := DecodeTimestamps(nil, enc)
-	if err != nil || len(got) != 0 || n != len(enc) {
-		t.Fatalf("decode empty: got=%v n=%d err=%v", got, n, err)
-	}
+	require.NoError(t, err)
+	assert.Empty(t, got)
+	assert.Equal(t, len(enc), n)
 }
 
 func TestDoDTruncated(t *testing.T) {
@@ -148,9 +134,7 @@ func TestDoDTruncated(t *testing.T) {
 	enc := EncodeTimestamps(nil, []int64{1000, 2000, 3000})
 	// Truncate the encoded bytes to simulate a torn stream.
 	_, _, err := DecodeTimestamps(nil, enc[:1])
-	if err == nil {
-		t.Fatal("expected error from truncated stream")
-	}
+	require.Error(t, err, "expected error from truncated stream")
 
 	// Any error is acceptable here (IsEOF, errUnexpectedEOF, or a bitstream-specific
 	// report); the key is that we don't panic.

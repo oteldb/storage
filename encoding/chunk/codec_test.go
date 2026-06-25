@@ -3,6 +3,9 @@ package chunk
 import (
 	"math"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCodecString(t *testing.T) {
@@ -21,9 +24,7 @@ func TestCodecString(t *testing.T) {
 		{Codec(99), "unknown"},
 	}
 	for _, tc := range cases {
-		if got := tc.c.String(); got != tc.want {
-			t.Errorf("Codec(%d).String() = %q, want %q", tc.c, got, tc.want)
-		}
+		assert.Equalf(t, tc.want, tc.c.String(), "Codec(%d).String()", tc.c)
 	}
 }
 
@@ -42,15 +43,8 @@ func TestDoDAllCases(t *testing.T) {
 	enc := EncodeTimestamps(nil, ts)
 
 	got, _, err := DecodeTimestamps(nil, enc)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-
-	for i := range ts {
-		if got[i] != ts[i] {
-			t.Fatalf("ts[%d] = %d, want %d", i, got[i], ts[i])
-		}
-	}
+	require.NoError(t, err)
+	assert.Equal(t, ts, got)
 }
 
 func TestDoDNegativeCases(t *testing.T) {
@@ -67,90 +61,63 @@ func TestDoDNegativeCases(t *testing.T) {
 	enc := EncodeTimestamps(nil, ts)
 
 	got, _, err := DecodeTimestamps(nil, enc)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-
-	for i := range ts {
-		if got[i] != ts[i] {
-			t.Fatalf("ts[%d] = %d, want %d", i, got[i], ts[i])
-		}
-	}
+	require.NoError(t, err)
+	assert.Equal(t, ts, got)
 }
 
 func TestNearestDelta(t *testing.T) {
 	t.Parallel()
 	// With precisionBits=64, nearestDelta returns d unchanged.
 	d, tz := nearestDelta(100, 200, 64, 0)
-	if d != 100 || tz != 0 {
-		t.Errorf("precisionBits=64: d=%d tz=%d, want d=100 tz=0", d, tz)
-	}
+	assert.Equal(t, int64(100), d, "precisionBits=64")
+	assert.Equal(t, 0, tz, "precisionBits=64")
 
 	// With precisionBits=8, a large origin zeros trailing bits.
 	// Use prevTZ=10 so the counter-reset hysteresis (±4) doesn't fire.
 	d, tz = nearestDelta(12345, 1000000, 8, 10)
-	if tz == 0 {
-		t.Errorf("precisionBits=8: expected tz > 0, got %d", tz)
-	}
+	assert.Positive(t, tz, "precisionBits=8: expected tz > 0")
 	// The zeroed delta should have low bits cleared.
-	if d != 0 && d&((1<<tz)-1) != 0 {
-		t.Errorf("zeroed delta has low bits set: d=%d tz=%d", d, tz)
+	if d != 0 {
+		assert.Zerof(t, d&((1<<tz)-1), "zeroed delta has low bits set: d=%d tz=%d", d, tz)
 	}
 
 	// d == 0 fast path.
 	d, tz = nearestDelta(0, 100, 16, 5)
-	if d != 0 || tz != 5 {
-		t.Errorf("d=0: got d=%d tz=%d, want d=0 tz=5", d, tz)
-	}
+	assert.Equal(t, int64(0), d, "d=0 fast path")
+	assert.Equal(t, 5, tz, "d=0 fast path")
 
 	// Counter-reset hysteresis: sudden tz jump.
 	d, _ = nearestDelta(100, 1<<60, 16, 0)
-	if d != 100 {
-		t.Errorf("counter reset (jump up): d=%d, want 100 (full precision)", d)
-	}
+	assert.Equal(t, int64(100), d, "counter reset (jump up): want full precision")
 	// Counter-reset hysteresis: sudden tz drop.
 	d, _ = nearestDelta(100, 100, 16, 30)
-	if d != 100 {
-		t.Errorf("counter reset (jump down): d=%d, want 100 (full precision)", d)
-	}
+	assert.Equal(t, int64(100), d, "counter reset (jump down): want full precision")
 }
 
 func TestFloatToDecimalFractional(t *testing.T) {
 	t.Parallel()
 	// Fractional value that exercises the slow path.
 	v, e := floatToDecimal(1.5)
-	if v != 15 || e != -1 {
-		t.Errorf("floatToDecimal(1.5) = (%d, %d), want (15, -1)", v, e)
-	}
+	assert.Equal(t, int64(15), v, "floatToDecimal(1.5)")
+	assert.Equal(t, -1, e, "floatToDecimal(1.5)")
 
 	v, e = floatToDecimal(0.5)
-	if v != 5 || e != -1 {
-		t.Errorf("floatToDecimal(0.5) = (%d, %d), want (5, -1)", v, e)
-	}
+	assert.Equal(t, int64(5), v, "floatToDecimal(0.5)")
+	assert.Equal(t, -1, e, "floatToDecimal(0.5)")
 }
 
 func TestErrorStrings(t *testing.T) {
 	t.Parallel()
 
-	if errEOF.Error() != "chunk: unexpected end of stream" {
-		t.Errorf("errEOF.Error() = %q", errEOF.Error())
-	}
-
-	if errUnexpectedEOF.Error() != "chunk: truncated stream" {
-		t.Errorf("errUnexpectedEOF.Error() = %q", errUnexpectedEOF.Error())
-	}
+	require.EqualError(t, errEOF, "chunk: unexpected end of stream")
+	require.EqualError(t, errUnexpectedEOF, "chunk: truncated stream")
 }
 
 func TestIsEOF(t *testing.T) {
 	t.Parallel()
 
-	if !IsEOF(errEOF) {
-		t.Error("IsEOF(errEOF) = false, want true")
-	}
-
-	if IsEOF(errUnexpectedEOF) {
-		t.Error("IsEOF(errUnexpectedEOF) = true, want false")
-	}
+	assert.True(t, IsEOF(errEOF), "IsEOF(errEOF)")
+	assert.False(t, IsEOF(errUnexpectedEOF), "IsEOF(errUnexpectedEOF)")
 }
 
 func TestGorillaReuseCase(t *testing.T) {
@@ -165,15 +132,8 @@ func TestGorillaReuseCase(t *testing.T) {
 	enc := EncodeFloats(nil, vals)
 
 	got, _, err := DecodeFloats(nil, enc)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-
-	for i := range vals {
-		if got[i] != vals[i] {
-			t.Fatalf("vals[%d] = %v, want %v", i, got[i], vals[i])
-		}
-	}
+	require.NoError(t, err)
+	assert.Equal(t, vals, got)
 }
 
 func TestGorillaNaNRoundTrip(t *testing.T) {
@@ -183,13 +143,10 @@ func TestGorillaNaNRoundTrip(t *testing.T) {
 	enc := EncodeFloats(nil, vals)
 
 	got, _, err := DecodeFloats(nil, enc)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
+	require.NoError(t, err)
 
-	if got[0] != 1.0 || got[2] != 2.0 {
-		t.Fatalf("non-NaN values wrong: %v %v", got[0], got[2])
-	}
+	assert.InDelta(t, 1.0, got[0], 0, "non-NaN value at index 0")
+	assert.InDelta(t, 2.0, got[2], 0, "non-NaN value at index 2")
 }
 
 func TestGorillaAllBitsChanged(t *testing.T) {
@@ -199,14 +156,8 @@ func TestGorillaAllBitsChanged(t *testing.T) {
 	enc := EncodeFloats(nil, vals)
 
 	got, _, err := DecodeFloats(nil, enc)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
+	require.NoError(t, err)
 
-	if math.Float64bits(got[0]) != math.Float64bits(vals[0]) ||
-		math.Float64bits(got[1]) != math.Float64bits(vals[1]) {
-		t.Fatalf("vals = %#x %#x, want %#x %#x",
-			math.Float64bits(got[0]), math.Float64bits(got[1]),
-			math.Float64bits(vals[0]), math.Float64bits(vals[1]))
-	}
+	assert.Equal(t, math.Float64bits(vals[0]), math.Float64bits(got[0]))
+	assert.Equal(t, math.Float64bits(vals[1]), math.Float64bits(got[1]))
 }

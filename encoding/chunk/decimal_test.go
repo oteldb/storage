@@ -3,6 +3,9 @@ package chunk
 import (
 	"math"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDecimalRoundTripLossless verifies that with precisionBits=64, integer-valued
@@ -30,19 +33,8 @@ func TestDecimalRoundTripLossless(t *testing.T) {
 			enc := EncodeFloatsDecimal(nil, tc.vals, 64)
 
 			got, _, err := DecodeFloatsDecimal(nil, enc)
-			if err != nil {
-				t.Fatalf("Decode: %v", err)
-			}
-
-			if len(got) != len(tc.vals) {
-				t.Fatalf("len = %d, want %d", len(got), len(tc.vals))
-			}
-
-			for i := range tc.vals {
-				if got[i] != tc.vals[i] {
-					t.Fatalf("vals[%d] = %v, want %v (exact)", i, got[i], tc.vals[i])
-				}
-			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.vals, got)
 		})
 	}
 }
@@ -56,19 +48,11 @@ func TestDecimalRoundTripApproximate(t *testing.T) {
 	enc := EncodeFloatsDecimal(nil, vals, 64)
 
 	got, _, err := DecodeFloatsDecimal(nil, enc)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-
-	if len(got) != len(vals) {
-		t.Fatalf("len = %d, want %d", len(got), len(vals))
-	}
+	require.NoError(t, err)
+	require.Len(t, got, len(vals))
 
 	for i := range vals {
-		relErr := math.Abs(got[i]-vals[i]) / math.Max(1, math.Abs(vals[i]))
-		if relErr > 1e-9 {
-			t.Errorf("vals[%d] = %v, want %v (relErr=%e)", i, got[i], vals[i], relErr)
-		}
+		assert.InDeltaf(t, vals[i], got[i], 1e-9, "vals[%d]", i)
 	}
 }
 
@@ -81,17 +65,13 @@ func TestDecimalLossy(t *testing.T) {
 	enc := EncodeFloatsDecimal(nil, vals, 16) // 16 bits of precision
 
 	got, _, err := DecodeFloatsDecimal(nil, enc)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
+	require.NoError(t, err)
+	require.Len(t, got, len(vals))
 	// With 16 bits of precision, the low bits are zeroed; the perturbation may
 	// be partially lost. Check the constant values are preserved and the
 	// perturbation is within a reasonable bound.
 	for i := range vals {
-		relErr := math.Abs(got[i]-vals[i]) / math.Abs(vals[i])
-		if relErr > 0.1 {
-			t.Errorf("vals[%d] = %v, want %v (relErr=%e)", i, got[i], vals[i], relErr)
-		}
+		assert.InEpsilonf(t, vals[i], got[i], 0.1, "vals[%d]", i)
 	}
 }
 
@@ -103,25 +83,12 @@ func TestDecimalSpecialValues(t *testing.T) {
 	enc := EncodeFloatsDecimal(nil, vals, 64)
 
 	got, _, err := DecodeFloatsDecimal(nil, enc)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
+	require.NoError(t, err)
 
-	if !math.IsInf(got[0], 1) {
-		t.Errorf("vals[0] = %v, want +Inf", got[0])
-	}
-
-	if !math.IsInf(got[1], -1) {
-		t.Errorf("vals[1] = %v, want -Inf", got[1])
-	}
-
-	if got[2] != 0 {
-		t.Errorf("vals[2] = %v, want 0", got[2])
-	}
-
-	if got[3] != 42 {
-		t.Errorf("vals[3] = %v, want 42", got[3])
-	}
+	assert.True(t, math.IsInf(got[0], 1), "vals[0] want +Inf")
+	assert.True(t, math.IsInf(got[1], -1), "vals[1] want -Inf")
+	assert.InDelta(t, 0.0, got[2], 0, "vals[2] want 0")
+	assert.InDelta(t, 42.0, got[3], 0, "vals[3] want 42")
 }
 
 func TestFloatToDecimal(t *testing.T) {
@@ -142,8 +109,7 @@ func TestFloatToDecimal(t *testing.T) {
 	}
 	for _, tc := range cases {
 		v, e := floatToDecimal(tc.f)
-		if v != tc.wantV || e != tc.wantE {
-			t.Errorf("floatToDecimal(%v) = (%d, %d), want (%d, %d)", tc.f, v, e, tc.wantV, tc.wantE)
-		}
+		assert.Equalf(t, tc.wantV, v, "floatToDecimal(%v) value", tc.f)
+		assert.Equalf(t, tc.wantE, e, "floatToDecimal(%v) exp", tc.f)
 	}
 }

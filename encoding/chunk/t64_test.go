@@ -3,6 +3,9 @@ package chunk
 import (
 	"math"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestT64RoundTrip verifies EncodeIntsT64∘DecodeIntsT64 == identity (lossless).
@@ -34,19 +37,8 @@ func TestT64RoundTrip(t *testing.T) {
 			enc := EncodeIntsT64(nil, tc.vals)
 
 			got, _, err := DecodeIntsT64(nil, enc)
-			if err != nil {
-				t.Fatalf("Decode: %v", err)
-			}
-
-			if len(got) != len(tc.vals) {
-				t.Fatalf("len = %d, want %d", len(got), len(tc.vals))
-			}
-
-			for i := range tc.vals {
-				if got[i] != tc.vals[i] {
-					t.Fatalf("vals[%d] = %d, want %d", i, got[i], tc.vals[i])
-				}
-			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.vals, got)
 		})
 	}
 }
@@ -59,9 +51,7 @@ func TestT64ConstantCompression(t *testing.T) {
 	enc := EncodeIntsT64(nil, vals)
 	// numBits=0 → only [uvarint rows][16 bytes header] → ~18 bytes.
 	maxBytes := 25
-	if len(enc) > maxBytes {
-		t.Fatalf("compressed size = %d for 1000 constant ints, want ≤ %d", len(enc), maxBytes)
-	}
+	assert.LessOrEqualf(t, len(enc), maxBytes, "compressed size for 1000 constant ints")
 }
 
 // TestT64BoolCompression verifies 0/1 values collapse to ~1 bit/value.
@@ -72,9 +62,7 @@ func TestT64BoolCompression(t *testing.T) {
 	enc := EncodeIntsT64(nil, vals)
 	// numBits=1 → 1 transposed row × 8 bytes per block of 64 → 80 bytes + header.
 	maxBytes := 100
-	if len(enc) > maxBytes {
-		t.Fatalf("compressed size = %d for 640 bools, want ≤ %d", len(enc), maxBytes)
-	}
+	assert.LessOrEqualf(t, len(enc), maxBytes, "compressed size for 640 bools")
 }
 
 func makeRange(start, n int) []int64 {
@@ -120,8 +108,7 @@ func TestValuableBits(t *testing.T) {
 		{0, 1, true, 2},                    // signed straddle → +1
 	}
 	for _, tc := range cases {
-		if got := valuableBits(tc.min, tc.max, tc.straddle); got != tc.want {
-			t.Errorf("valuableBits(%d, %d, %v) = %d, want %d", tc.min, tc.max, tc.straddle, got, tc.want)
-		}
+		assert.Equalf(t, tc.want, valuableBits(tc.min, tc.max, tc.straddle),
+			"valuableBits(%d, %d, %v)", tc.min, tc.max, tc.straddle)
 	}
 }

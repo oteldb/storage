@@ -1,9 +1,11 @@
 package chunk
 
 import (
-	"bytes"
 	"math/rand/v2"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDictRoundTrip verifies EncodeBytes∘DecodeBytes == identity.
@@ -31,19 +33,8 @@ func TestDictRoundTrip(t *testing.T) {
 			enc := EncodeBytes(nil, tc.vals)
 
 			got, _, err := DecodeBytes(nil, enc)
-			if err != nil {
-				t.Fatalf("Decode: %v", err)
-			}
-
-			if len(got) != len(tc.vals) {
-				t.Fatalf("len = %d, want %d", len(got), len(tc.vals))
-			}
-
-			for i := range tc.vals {
-				if !bytes.Equal(got[i], tc.vals[i]) {
-					t.Fatalf("vals[%d] = %q, want %q", i, got[i], tc.vals[i])
-				}
-			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.vals, got)
 		})
 	}
 }
@@ -60,19 +51,8 @@ func TestDictLargeCardinality(t *testing.T) {
 	enc := EncodeBytes(nil, vals)
 
 	got, _, err := DecodeBytes(nil, enc)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-
-	if len(got) != 500 {
-		t.Fatalf("len = %d, want 500", len(got))
-	}
-
-	for i := range vals {
-		if !bytes.Equal(got[i], vals[i]) {
-			t.Fatalf("vals[%d] = %q, want %q", i, got[i], vals[i])
-		}
-	}
+	require.NoError(t, err)
+	assert.Equal(t, vals, got)
 }
 
 // TestDictFlatFallback verifies the flat fallback (>65536 distinct).
@@ -87,18 +67,11 @@ func TestDictFlatFallback(t *testing.T) {
 	enc := EncodeBytes(nil, vals)
 
 	got, _, err := DecodeBytes(nil, enc)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-
-	if len(got) != 70000 {
-		t.Fatalf("len = %d, want 70000", len(got))
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 70000)
 	// Check a sample (checking all 70k is slow in a test).
 	for _, i := range []int{0, 1, 49999, 69999} {
-		if !bytes.Equal(got[i], vals[i]) {
-			t.Fatalf("vals[%d] = %q, want %q", i, got[i], vals[i])
-		}
+		assert.Equalf(t, vals[i], got[i], "vals[%d]", i)
 	}
 }
 
@@ -111,9 +84,7 @@ func TestDictCompressionRatio(t *testing.T) {
 	// 1000 rows × 1 byte id + dictionary (5 short strings + lengths) + header.
 	// Should be well under 1100 bytes.
 	maxBytes := 1200
-	if len(enc) > maxBytes {
-		t.Fatalf("compressed size = %d bytes for 1000 rows × 5 distinct, want ≤ %d", len(enc), maxBytes)
-	}
+	assert.LessOrEqualf(t, len(enc), maxBytes, "compressed size for 1000 rows × 5 distinct")
 }
 
 // TestDictEncoderMatchesEncodeBytes verifies DictEncoder.Encode is byte-identical to
@@ -139,25 +110,12 @@ func TestDictEncoderMatchesEncodeBytes(t *testing.T) {
 			want := EncodeBytes(nil, vals)
 			got := enc.Encode(nil, vals)
 
-			if !bytes.Equal(got, want) {
-				t.Fatalf("pass %d case %d: DictEncoder output != EncodeBytes\n got=%x\nwant=%x", pass, i, got, want)
-			}
+			assert.Equalf(t, want, got, "pass %d case %d: DictEncoder output != EncodeBytes", pass, i)
 
 			// And the result must still decode back to the input.
 			dec, _, err := DecodeBytes(nil, got)
-			if err != nil {
-				t.Fatalf("pass %d case %d: Decode: %v", pass, i, err)
-			}
-
-			if len(dec) != len(vals) {
-				t.Fatalf("pass %d case %d: len = %d, want %d", pass, i, len(dec), len(vals))
-			}
-
-			for j := range vals {
-				if !bytes.Equal(dec[j], vals[j]) {
-					t.Fatalf("pass %d case %d: vals[%d] = %q, want %q", pass, i, j, dec[j], vals[j])
-				}
-			}
+			require.NoErrorf(t, err, "pass %d case %d", pass, i)
+			assert.Equalf(t, vals, dec, "pass %d case %d", pass, i)
 		}
 	}
 }
@@ -172,19 +130,13 @@ func TestDictEncoderReset(t *testing.T) {
 	_ = enc.Encode(nil, [][]byte{[]byte("a"), []byte("b")})
 	enc.Reset()
 
-	for _, e := range enc.entries {
-		if e != nil {
-			t.Fatalf("Reset did not clear entries: %q", e)
-		}
-	}
+	assert.Empty(t, enc.entries, "Reset did not clear entries")
 
 	// Encoder is still usable after Reset.
 	got := enc.Encode(nil, [][]byte{[]byte("x"), []byte("x")})
 	want := EncodeBytes(nil, [][]byte{[]byte("x"), []byte("x")})
 
-	if !bytes.Equal(got, want) {
-		t.Fatalf("after Reset: got=%x want=%x", got, want)
-	}
+	assert.Equal(t, want, got, "after Reset")
 }
 
 // TestDictColumnRoundTrip verifies DecodeBytesDict's split form returns the same values
@@ -210,26 +162,14 @@ func TestDictColumnRoundTrip(t *testing.T) {
 			enc := EncodeBytes(nil, tc.vals)
 
 			col, consumed, err := DecodeBytesDict(enc)
-			if err != nil {
-				t.Fatalf("DecodeBytesDict: %v", err)
-			}
+			require.NoError(t, err)
 
-			if consumed != len(enc) {
-				t.Fatalf("consumed = %d, want %d", consumed, len(enc))
-			}
-
-			if col.Len() != len(tc.vals) {
-				t.Fatalf("Len = %d, want %d", col.Len(), len(tc.vals))
-			}
-
-			if col.IDWidth != tc.wantWidth {
-				t.Fatalf("IDWidth = %d, want %d", col.IDWidth, tc.wantWidth)
-			}
+			assert.Equal(t, len(enc), consumed)
+			require.Equal(t, len(tc.vals), col.Len())
+			assert.Equal(t, tc.wantWidth, col.IDWidth)
 
 			for i := range tc.vals {
-				if !bytes.Equal(col.At(i), tc.vals[i]) {
-					t.Fatalf("At(%d) = %q, want %q", i, col.At(i), tc.vals[i])
-				}
+				assert.Equalf(t, tc.vals[i], col.At(i), "At(%d)", i)
 			}
 		})
 	}
@@ -244,23 +184,16 @@ func TestDictColumnDecodeReuse(t *testing.T) {
 
 	var col DictColumn
 	for _, enc := range [][]byte{a, b, a} {
-		if _, err := col.DecodeBytes(enc); err != nil {
-			t.Fatalf("DecodeBytes: %v", err)
-		}
+		_, err := col.DecodeBytes(enc)
+		require.NoError(t, err)
 
 		ref, _, err := DecodeBytes(nil, enc)
-		if err != nil {
-			t.Fatalf("DecodeBytes ref: %v", err)
-		}
+		require.NoError(t, err)
 
-		if col.Len() != len(ref) {
-			t.Fatalf("Len = %d, want %d", col.Len(), len(ref))
-		}
+		require.Equal(t, len(ref), col.Len())
 
 		for i := range ref {
-			if !bytes.Equal(col.At(i), ref[i]) {
-				t.Fatalf("At(%d) = %q, want %q", i, col.At(i), ref[i])
-			}
+			assert.Equalf(t, ref[i], col.At(i), "At(%d)", i)
 		}
 	}
 }
