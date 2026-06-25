@@ -172,19 +172,24 @@ columns it references (projection pushdown without ranged reads):
 
 The L3 indexing layer maps query matchers to the series that satisfy them.
 
-- **Identity** lives in `signal`: an `Attributes` set is the typed OTel attribute model
-  (`Value` = the AnyValue sum: string/bool/int/double/bytes/array/map, all held as
-  `[]byte` for scalars-inline + zero-alloc projection). `Attributes.Hash` is the
-  content-addressed **`SeriesID`** — a **128-bit** xxh3 of a canonical, type-tagged
-  pre-image (maps hash order-independently, arrays keep order, `int 5`/`"5"`/`5.0`/empty
-  are distinct). 128-bit because content addressing has no allocator to resolve a
-  collision. `AppendValue`/`DecodeAttributes` are the reversible binary codec (used by the
-  WAL and value interning).
+- **Identity** lives in `signal`. The leaf is the typed OTel attribute model: `Value` =
+  the AnyValue sum (string/bool/int/double/bytes/array/map, scalars inline + `[]byte` for
+  zero-alloc projection), grouped into a sorted `Attributes` set. A **`Series`** is the
+  full OTel identity backbone — **`Resource` (schema_url + attrs) + `Scope` (name,
+  version, schema_url, attrs) + the data-point `Attributes`** — so series differing only
+  in resource or scope are distinct (not collapsed into one attribute bag). Its
+  content-addressed **`SeriesID`** is a **128-bit** xxh3 of a canonical, type-tagged,
+  length-delimited pre-image (maps hash order-independently, arrays keep order, `int 5`/
+  `"5"`/`5.0`/empty are distinct). 128-bit because content addressing has no allocator to
+  resolve a collision. `AppendValue`/`DecodeSeries`/`DecodeAttributes` are the reversible
+  binary codec (used by the WAL and value interning). Signal-specific identity (metric
+  name/unit/temporality) folds into the pre-image at the `signal/metric` layer.
 - **`index/symbols`** — a `[]byte → uint32` interning table (via `pool.ByteIntMap`,
   no string conversion) with a CRC32C serialize/decode. Names and typed-value encodings
   intern to small ids.
-- **`index/series`** — `SeriesID ↔ Attributes`. `Add` is idempotent (id is the hash) and
-  retains a deep copy, so a query reconstructs labels from an id and replay is dedup-safe.
+- **`index/series`** — `SeriesID ↔ Series`. `Add` is idempotent (id is the identity hash)
+  and retains a deep copy, so a query reconstructs labels from an id and replay is
+  dedup-safe.
 - **`index/postings`** — the inverted index, keyed on **interned symbol ids** (`nameID →
   valueID → sorted []SeriesID`), so it is zero-alloc and **type-preserving** (the value id
   comes from the value's typed encoding). Lazy set-op iterators (`Intersect`/`Merge`/
@@ -279,7 +284,7 @@ encoding/             umbrella doc for the codec layers
   encoding/chunk      DoD / Gorilla / T64 / dict / decimal column codecs              [implemented]
   encoding/compress   zstd/none block wrapper (lz4 stub)                              [implemented]
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
-signal/               typed Attributes/Value, 128-bit SeriesID, codec, Signal, TenantID [implemented]
+signal/               typed Attributes/Value, Resource/Scope/Series identity, 128-bit SeriesID, Signal, TenantID [implemented]
   signal/metric       metrics point types & OTLP→columnar projection                  [seam only]
 tenant/               Limits/Retention/Downsample/Policy, Resolver                     [implemented]
 backend/              Backend interface + memory (root) + file/                         [implemented; s3/bucketindex seam only]
