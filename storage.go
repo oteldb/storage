@@ -172,7 +172,11 @@ func (s *Storage) engineFor(tid signal.TenantID) *engine.Engine {
 
 	e := s.tenants[tid]
 	if e == nil {
-		e = engine.New(engine.Config{OOOWindow: s.opts.OOOWindow})
+		e = engine.New(engine.Config{
+			OOOWindow: s.opts.OOOWindow,
+			Backend:   s.backend,
+			Prefix:    string(s.normalizeTenant(tid)) + "/metrics",
+		})
 		s.tenants[tid] = e
 	}
 

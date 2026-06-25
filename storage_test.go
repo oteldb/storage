@@ -74,6 +74,29 @@ func TestWriteMetricsAndFetch(t *testing.T) {
 	assert.Equal(t, []byte("http.requests"), nv.Str())
 }
 
+func TestWriteMetricsFlushThenFetch(t *testing.T) {
+	t.Parallel()
+
+	s, err := InMemory()
+	require.NoError(t, err)
+
+	_, err = s.WriteMetrics(context.Background(), gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
+	require.NoError(t, err)
+
+	eng := s.engineFor("default")
+	require.NoError(t, eng.Flush(context.Background()))
+	assert.Equal(t, 1, eng.PartCount())
+
+	// Ingest more after the flush; the query reads head ∪ part transparently.
+	_, err = s.WriteMetrics(context.Background(), gaugeBatch("api", "http.requests", []int64{300}, []float64{3}))
+	require.NoError(t, err)
+
+	batches := queryEngine(t, eng, nameMatcher("http.requests"))
+	require.Len(t, batches, 1)
+	assert.Equal(t, []int64{100, 200, 300}, batches[0].Timestamps)
+	assert.Equal(t, []float64{1, 2, 3}, batches[0].Values)
+}
+
 func TestMultiTenantRouting(t *testing.T) {
 	t.Parallel()
 
