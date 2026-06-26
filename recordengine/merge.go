@@ -7,6 +7,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/signal"
 )
@@ -28,14 +29,21 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 
 	if err != nil {
 		span.RecordError(err)
+		e.cfg.Obs.Log.Error("merge failed",
+			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix), zap.Error(err))
+
+		return err
 	}
 
 	if compacted > 0 {
 		span.SetAttributes(attribute.Int("storage.merge.parts_in", compacted))
 		e.cfg.Obs.Merge.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(compacted))
+		e.cfg.Obs.Log.Debug("merged parts",
+			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
+			zap.Int("parts_in", compacted), zap.Duration("took", time.Since(startNs)))
 	}
 
-	return err
+	return nil
 }
 
 // mergeLocked compacts the parts and returns the number of source parts compacted (0 ⇒ no-op). The

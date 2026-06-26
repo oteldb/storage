@@ -10,6 +10,7 @@ import (
 	"github.com/go-faster/errors"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/internal/obs"
@@ -335,14 +336,20 @@ func (e *Engine) Flush(ctx context.Context) error {
 
 	if err != nil {
 		span.RecordError(err)
+		e.cfg.Obs.Log.Error("flush failed", zap.String("prefix", e.cfg.Prefix), zap.Error(err))
+
+		return err
 	}
 
 	if rows > 0 {
 		span.SetAttributes(attribute.Int("storage.rows", rows))
 		e.cfg.Obs.Flush.Record(ctx, metricSignal, time.Since(startNs), int64(rows))
+		e.cfg.Obs.Log.Debug("flushed head to part",
+			zap.String("prefix", e.cfg.Prefix), zap.Int("rows", rows),
+			zap.Duration("took", time.Since(startNs)))
 	}
 
-	return err
+	return nil
 }
 
 // Reset discards all of the engine's data — the in-memory head (samples + series index)
