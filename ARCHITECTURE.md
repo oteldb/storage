@@ -181,13 +181,20 @@ flushed (it is a no-op for an ephemeral backend).
 
 **The unflushed head is recovered from a per-tenant WAL** when `Options.WALDir` is set (§3d, §4):
 each `*EngineFor` attaches a resuming `wal.SegmentWriter` under `{WALDir}/{tenant}/{signal}`, every
-engine logs its head writes there, and a flush **checkpoints** the WAL (rotates + deletes the
-now-durable segments — `SegmentWriter.Checkpoint`) so replay is bounded. `recover` replays each WAL
-directory after `LoadParts`, restoring the records — and, for profiles, the symbol store (the
-`recordSide` frame) — a crash left unflushed. Part commit and WAL truncation are not atomic across
-the two stores, so a crash in the narrow window between them can replay just-flushed records: benign
-re-flush, deduped on merge for metrics, a rare duplicate for append-only records (exactly-once via a
-flush epoch is future hardening).
+engine logs its head writes there, and a flush **checkpoints** the WAL (deletes the now-durable
+segments — `SegmentWriter.Checkpoint`) so replay is bounded. `recover` replays each WAL directory
+after `LoadParts`, restoring the records — and, for profiles, the symbol store (the `recordSide`
+frame) — a crash left unflushed.
+
+**Recovery is exactly-once** (record signals): a flush generation (*epoch*) advances only on a head
+flush; WAL segments encode their epoch in the filename, and the watermark of the last-flushed epoch
+lives in the **bucket index** (`FlushedEpoch`), so it advances *atomically with part-discoverability*
+— the very object `recover` reads. Replay (`wal.ReplayDirFrom`) skips segments at or below the
+watermark, so even a crash in the window between a part committing and its WAL being deleted re-applies
+nothing already flushed. (Metrics don't track the epoch — their merge dedup makes the same window
+self-healing.) The **fsync policy** (`Options.WALSync`) trades durability for throughput: `None`
+(default — OS page cache, process-crash safe), `Always` (fsync per record, power-loss safe), or
+`Interval` (a background `runWALSync` fsyncs every engine's WAL on a timer).
 
 ## 3b. Part format (`block/`)
 
@@ -264,10 +271,13 @@ recovery), surfaces a bad-CRC complete record as corruption, and skips unknown r
 (forward-compat). Replaying the log rebuilds the symbols + series + postings index and the head —
 the path that reconstructs unflushed state after a restart.
 
-`Create` **resumes** an existing directory (opens a fresh segment beyond the prior run's, never
-truncating them), and `Checkpoint` rotates then deletes the segments a flush has made durable
-(truncate-on-flush, so replay stays bounded). The facade attaches one writer per (tenant, signal)
-engine and replays them on recovery (§3a, §4).
+Segment files are named `{seq}-{epoch}.wal`: `seq` orders replay, `epoch` is the flush generation of
+the records (so a segment self-describes which generation it holds). `Create` **resumes** an existing
+directory (the writer opens lazily on first write, beyond the prior run's segments, never truncating
+them); `SetEpoch` stamps the generation onto new segments; `Checkpoint` deletes the segments a flush
+made durable (truncate-on-flush). `ReplayDirFrom(minEpoch, …)` replays only segments past the
+watermark — the basis for exactly-once recovery (§3a). `SetSync` enables a per-write fsync. The facade
+attaches one writer per (tenant, signal) engine and replays them on recovery (§3a, §4).
 
 ## 3e. Metrics ingest model + projection (`signal/metric/`)
 
@@ -714,11 +724,12 @@ query-language path stays in the embedder. The `Write*` methods take the library
   listing) — together enough to back an embedder's Pyroscope/ProfileQL querier.
 - **`Options` / `Option`** (`options.go`) — config struct plus functional options
   (`WithBackend`, `WithCluster`, `WithTenancy`, `WithEncoding`, `WithDurability`,
-  `WithWALDir`, `WithFlushThresholdBytes`, `WithFlushInterval`, `WithOOOWindow`,
-  `WithQuerySplitInterval`, `WithQueryCache`, `WithQueryCacheFreshness`). `Durability` selects the
-  durability mode; an ephemeral backend with no explicit choice defaults to the in-memory engine.
-  `WithWALDir` (durable backends only) turns on per-tenant write-ahead logging so a crash recovers
-  the unflushed head (§3a/§3d); without it, recovery restores only flushed parts.
+  `WithWALDir`, `WithWALSync`, `WithWALSyncInterval`, `WithFlushThresholdBytes`, `WithFlushInterval`,
+  `WithOOOWindow`, `WithQuerySplitInterval`, `WithQueryCache`, `WithQueryCacheFreshness`). `Durability`
+  selects the durability mode; an ephemeral backend with no explicit choice defaults to the in-memory
+  engine. `WithWALDir` (durable backends only) turns on per-tenant write-ahead logging so a crash
+  recovers the unflushed head exactly-once (§3a/§3d); without it, recovery restores only flushed parts.
+  `WithWALSync`/`WithWALSyncInterval` pick the fsync policy (page-cache / per-write / background).
 - **`Query` / `Lang` / `Result` / `Accepted`** — the query request (language selected by
   `Lang`), its result, and the ingest acknowledgement type.
 
@@ -791,7 +802,7 @@ tenant/               Limits/Retention/Downsample/Policy, Resolver              
 backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + memory (root) [implemented]
   backend/file        directory-tree backend; atomic write + exclusive PutIfAbsent (os.Link) [implemented]
   backend/s3          object-store-native backend over ObjectStore + aws-sdk-go-v2 adapter   [implemented; in-process go-faster/fs S3 integration test]
-  backend/bucketindex versioned block-list index (time-pruned part enumeration, no full LIST) [implemented]
+  backend/bucketindex versioned block-list index (time-pruned part enumeration, no full LIST) + WAL flush-epoch watermark [implemented]
 block/                immutable columnar part format: column/marks/manifest/part        [implemented]
 index/                symbols (intern) · series (id↔attrs) · postings (set-ops/matchers) [implemented]
   index/bloom         token bloom filter (no false negatives) + tokenizer: full-text + attr/equality pruning [implemented]
