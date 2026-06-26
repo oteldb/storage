@@ -99,6 +99,11 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 
 	s.obs = observer
 
+	// Meter the backend only when a meter is configured, so the default path is the bare backend.
+	if o.MeterProvider != nil {
+		s.backend = instrumentBackend(s.backend, s.obs.Backend)
+	}
+
 	if o.QueryCacheEntries > 0 {
 		s.queryCache = scale.NewMemoryCache(o.QueryCacheEntries)
 	}

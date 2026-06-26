@@ -349,3 +349,22 @@ func TestRecordEngineMetricsEmitted(t *testing.T) {
 	assert.Positive(t, sumCounter(t, rm, "storage.flush.total", map[string]string{"signal": "log"}))
 	assert.Positive(t, sumCounter(t, rm, "storage.fetch.total", map[string]string{"signal": "log"}))
 }
+
+func TestBackendMetricsEmitted(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	s, err := InMemory(WithMeterProvider(mp))
+	require.NoError(t, err)
+
+	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{1}, []float64{1}))
+	require.NoError(t, err)
+	s.maintain(ctx) // flush writes a part (backend writes)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &rm))
+	assert.Positive(t, sumCounter(t, rm, "storage.backend.ops", map[string]string{"op": "write"}))
+}
