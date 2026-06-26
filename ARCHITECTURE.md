@@ -600,16 +600,28 @@ optional side store differ.
   functions, all index-based) with a large shared symbol dictionary — Pyroscope's **two-table
   split**: a columnar sample table + a deduplicated symbol store. Each `Sample` flattens to one
   record **row** (a sample with `timestamps_unix_nano` explodes to one row per (timestamp, value); an
-  aggregated sample is one row at the profile time); schema = `value`/`sample_type`/`period`/
-  `duration`(int) + `stack_id`/`profile_id`(Equality)/`trace_id`/`span_id`/`attrs`(Attrs)(bytes).
-  `stack_id` and `sample_type` are **content-addressed ids** into the symbol store, computed
-  Merkle-style bottom-up (string→function→location→stack), so an embedder selects a profile type by
-  computing the same hash (`profile.SampleTypeID`) — no lookup. The symbol store (strings, mappings,
-  functions, locations, stacks) is built per-stream at projection time, attached to `Batch.Side`, and
-  persisted/merged as part sidecars via the side-store hook above. Query is **search + return
-  samples** (`WriteProfiles` / `ProfileFetcher`): matchers resolve streams, conditions filter
-  samples; fetch-time **stack symbolization is deferred** (the store is persisted now to support it),
-  so returned rows carry the opaque global content ids.
+  aggregated sample is one row at the profile time); schema = `value`/`period`/`duration`(int) +
+  `stack_id`/`profile_id`(Equality)/`trace_id`/`span_id`/`attrs`(Attrs)(bytes). The **profile type is
+  folded into the stream identity** as reserved `otel.profile.*` labels (sample/period type+unit) —
+  like a metric's `__name__` — so a query selects a type with an ordinary label matcher and the
+  available types enumerate through the postings index (rather than a per-sample column). `stack_id`
+  is a **content-addressed id** into the symbol store, computed Merkle-style bottom-up
+  (string→function→location→stack), so the same stack has the same id everywhere. The symbol store
+  (strings, mappings, functions, locations, stacks) is built per-stream at projection time, attached
+  to `Batch.Side`, and persisted/merged as part sidecars via the side-store hook above.
+- **Profiles query surface** (`WriteProfiles` / `ProfileFetcher` plus the read primitives that make
+  an embedder's Pyroscope/ProfileQL `Querier` buildable):
+  - **Sample search** — matchers resolve streams (incl. the profile type), conditions filter samples;
+    returned rows carry `value` + the global `stack_id`.
+  - **`ProfileResolver(tenant)`** → a `profile.Resolver` over the tenant's unioned symbol store
+    (`recordengine.Engine.SideSnapshot` merges the head accumulator with every part's sidecars);
+    `Resolve(stack_id) → []Frame{Function, File, Line}` (leaf-first, bounds-checked). This is what
+    turns a sample search into a symbol-resolved **flamegraph** (`SelectMergeProfile`).
+  - **`ProfileSeries(tenant, matchers, window)`** → the matching stream identities
+    (`recordengine.Engine.Series`), from which an embedder derives **ProfileTypes** (distinct
+    `otel.profile.*` tuples), **LabelNames**, and **LabelValues**. Local to the node — cluster
+    fan-out for enumeration (and replicating the symbol *store* itself) is deferred; sample search and
+    `stack_id`s are global, so those are correct cluster-wide.
 - **Cluster**: one signal-discriminated path serves all four signals. The write envelope
   (`cluster.EncodeWrite`) and read request (`cluster.EncodeFetchRequest`) carry a `signal.Signal`
   byte; the primary-write, replicate, and read handlers dispatch to the metric / log / trace /
@@ -675,8 +687,11 @@ query-language path stays in the embedder. The `Write*` methods take the library
   **`Trace(ctx, tenant, traceID)`** is the trace-by-id convenience: it issues a fetch with an
   equality `Condition` on the `trace_id` column (pruned by that column's equality bloom) and returns
   all of the trace's spans across services. **`ProfileFetcher(tenants...)`** is the identical seam
-  over the profile engines (matchers resolve streams; conditions filter samples — e.g. a
-  `sample_type` equality computed via `profile.SampleTypeID`).
+  over the profile engines (matchers resolve streams — incl. the profile type via its reserved
+  `otel.profile.*` labels — and conditions filter samples), complemented by
+  **`ProfileResolver(ctx, tenant)`** (stack-id → frames, for flamegraphs) and
+  **`ProfileSeries(ctx, tenant, matchers, window)`** (stream enumeration, for profile-type/label
+  listing) — together enough to back an embedder's Pyroscope/ProfileQL querier.
 - **`Options` / `Option`** (`options.go`) — config struct plus functional options
   (`WithBackend`, `WithCluster`, `WithTenancy`, `WithEncoding`, `WithDurability`,
   `WithWALDir`, `WithFlushThresholdBytes`, `WithFlushInterval`, `WithOOOWindow`,
@@ -748,7 +763,7 @@ signal/               typed Attributes/Value, Resource/Scope/Series identity, 12
   signal/metric       []byte-based OTLP-shaped Metrics ingest batch (resettable/pooled) + identity + projection (gauge/sum) [implemented; histogram/summary deferred]
   signal/log          []byte-based OTLP-shaped Logs ingest batch (resettable/pooled) + stream identity + projection [implemented]
   signal/trace        []byte-based OTLP-shaped Traces ingest batch (resettable/pooled) + span schema + projection (nested-set, events/links) [implemented]
-  signal/profile      []byte-based OTLP-shaped Profiles ingest batch + sample schema + projection + content-addressed symbol store (SideStore) [implemented]
+  signal/profile      []byte-based OTLP-shaped Profiles ingest batch + sample schema (type folded into identity) + projection + content-addressed symbol store (SideStore) + stack Resolver [implemented]
 otlp/pdataconv        optional OTel-Go bridge: pmetric.Metrics → metric.Metrics (only package importing pdata) [implemented for metrics]
 tenant/               Limits/Retention/Downsample/Policy, Resolver                     [implemented]
 backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + memory (root) [implemented]

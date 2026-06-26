@@ -35,10 +35,10 @@ func (s *Storage) WriteProfiles(ctx context.Context, pd profile.Profiles) (Accep
 }
 
 // ProfileFetcher returns the read seam for profiles — a [fetch.Fetcher] over the named tenants'
-// sample data. Label matchers resolve streams (services); column Conditions filter samples (value,
-// sample_type, profile id, attributes). Returned rows carry content-addressed stack/sample-type ids
-// (resolution against the symbol store is the embedder's, deferred at the fetch seam this milestone).
-// Same tenant scoping as [Storage.TraceFetcher].
+// sample data. Label matchers resolve streams (service plus the profile type, carried in reserved
+// `otel.profile.*` labels); column Conditions filter samples (value, profile id, attributes).
+// Returned rows carry the global content-addressed `stack_id`; resolve it with
+// [Storage.ProfileResolver]. Same tenant scoping as [Storage.TraceFetcher].
 func (s *Storage) ProfileFetcher(tenants ...signal.TenantID) fetch.Fetcher {
 	return s.recordFetcher(tenants, s.profileEngineSnapshot, s.lookupProfileEngine, s.clusterProfileFetcherFor)
 }
