@@ -183,7 +183,7 @@ func TestAddSeriesLabelless(t *testing.T) {
 }
 
 // TestAddSeriesDedup ensures registering the same series in the all-set repeatedly (and alongside a
-// labelled Add) collapses to a single entry after the first read sorts and deduplicates.
+// labeled Add) collapses to a single entry after the first read sorts and deduplicates.
 func TestAddSeriesDedup(t *testing.T) {
 	t.Parallel()
 
