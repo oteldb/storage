@@ -3,8 +3,11 @@ package storage
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -25,7 +28,8 @@ type clusterNode struct {
 	client     *clientv3.Client
 	membership *etcd.Membership
 	ownership  *etcd.Ownership
-	writer     *cluster.Writer
+	replicator *replica.Replicator // primary→secondary replication
+	httpc      *http.Client        // primary-write client
 	server     *http.Server
 	listener   net.Listener
 	self       string // this node's address
@@ -63,7 +67,8 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle(replica.ReplicatePath, rp.Handler())
+	mux.Handle(replica.ReplicatePath, rp.Handler())                 // secondary: trusting apply
+	mux.Handle(primaryWritePath, s.primaryWriteHandler())           // primary: OOO apply + replicate
 	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch)) // read fan-out endpoint
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
@@ -81,7 +86,8 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 		client:     client,
 		membership: mship,
 		ownership:  etcd.NewOwnership(client, root, cfg.Self.ID, mship.LeaseID()),
-		writer:     cluster.NewWriter(rf, mship, mship.AddrOf, rp),
+		replicator: rp,
+		httpc:      http.DefaultClient,
 		server:     srv,
 		listener:   ln,
 		self:       cfg.Self.Addr,
@@ -134,17 +140,15 @@ func (s *Storage) clusterFetcherFor(tid signal.TenantID) fetch.Fetcher {
 	return &filteringFetcher{inner: failoverFetcher(remotes)}
 }
 
-// applyReplicated decodes a replicated write and applies it to the local tenant engine. It is
-// the receive side of replication (called for both local and remote owners).
+// applyReplicated is the secondary receive path: it decodes a primary's accepted write and
+// applies it verbatim to the local tenant engine (no OOO re-check — the primary already decided).
 func (s *Storage) applyReplicated(_ context.Context, payload []byte) error {
 	tenant, walBytes, err := cluster.DecodeWrite(payload)
 	if err != nil {
 		return err
 	}
 
-	// The OOO-rejected count is not propagated back to the origin's partial-success; cluster
-	// ingest reports accepted == emitted (see writeMetricsClustered).
-	if _, err := s.engineFor(signal.TenantID(tenant)).ApplyReplicated(walBytes); err != nil {
+	if err := s.engineFor(signal.TenantID(tenant)).ApplyReplicated(walBytes); err != nil {
 		return errors.Wrapf(err, "apply replicated write for tenant %q", tenant)
 	}
 
@@ -240,9 +244,10 @@ func (n *clusterNode) close(ctx context.Context) error {
 }
 
 // writeMetricsClustered is the cluster ingest path: it projects the batch, frames each
-// tenant's series+samples as a WAL-encoded payload, and routes each to its ring-owners at
-// write quorum (the local owner applies in process). Out-of-order rejection and per-point
-// accounting of the single-node path are not applied here.
+// tenant's series+samples as a WAL-encoded payload, and routes each to its ring **primary**.
+// The primary is the single authority for the shard: it OOO-checks the write, reports the
+// rejected count back here, and replicates the accepted set to the secondary owners — so the
+// returned [Accepted] accounting matches the single-node path and every replica converges.
 func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) (Accepted, error) {
 	type tenantWAL struct {
 		buf  bytes.Buffer
@@ -273,12 +278,131 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 		}
 	})
 
+	var rejected int64
+
 	for tid, tw := range byTenant {
-		payload := cluster.EncodeWrite(string(s.normalizeTenant(tid)), tw.buf.Bytes())
-		if err := s.cluster.writer.Write(ctx, string(s.normalizeTenant(tid)), payload); err != nil {
-			return Accepted{Accepted: int64(emitted)}, err
+		tenant := string(s.normalizeTenant(tid))
+
+		rej, err := s.routeToPrimary(ctx, tenant, tw.buf.Bytes())
+		if err != nil {
+			return Accepted{Accepted: int64(emitted) - rejected, Rejected: rejected}, err
+		}
+
+		rejected += int64(rej)
+	}
+
+	return Accepted{Accepted: int64(emitted) - rejected, Rejected: rejected}, nil
+}
+
+const primaryWritePath = "/internal/primary-write"
+
+// routeToPrimary sends a tenant's write (WAL-framed series+samples) to the tenant's ring
+// primary and returns how many samples the primary rejected as out-of-order. The primary —
+// local or remote — is the single authority for the shard, so the OOO decision and the
+// accepted set are consistent across all replicas.
+func (s *Storage) routeToPrimary(ctx context.Context, tenant string, walBytes []byte) (rejected int, err error) {
+	primary, ok := s.cluster.membership.Ring().Primary([]byte(tenant))
+	if !ok {
+		return 0, errors.New("cluster: no primary for tenant (empty ring)")
+	}
+
+	if s.cluster.membership.AddrOf(primary.ID) == s.cluster.self {
+		return s.primaryWrite(ctx, tenant, walBytes)
+	}
+
+	return s.sendPrimaryWrite(ctx, s.cluster.membership.AddrOf(primary.ID), cluster.EncodeWrite(tenant, walBytes))
+}
+
+// primaryWrite applies a write as the tenant's primary (OOO-checked, the authoritative
+// decision) and replicates the accepted set to the secondary owners at write quorum (the
+// primary is one durable copy, so it needs RF/2 secondary acks). It returns the rejected count.
+func (s *Storage) primaryWrite(ctx context.Context, tenant string, walBytes []byte) (int, error) {
+	accepted, rejected, err := s.engineFor(signal.TenantID(tenant)).ApplyPrimary(walBytes)
+	if err != nil {
+		return 0, errors.Wrapf(err, "primary apply for tenant %q", tenant)
+	}
+
+	owners := s.cluster.membership.Ring().Lookup([]byte(tenant), s.cluster.rf)
+
+	var targets []replica.Target
+	for _, o := range owners {
+		if addr := s.cluster.membership.AddrOf(o.ID); addr != s.cluster.self {
+			targets = append(targets, replica.Target{Addr: addr})
 		}
 	}
 
-	return Accepted{Accepted: int64(emitted)}, nil
+	// The primary already holds one durable copy; it needs RF/2 more from secondaries, bounded
+	// by how many are actually available (availability over strict durability when nodes are down).
+	needAcks := min(s.cluster.rf/2, len(targets))
+	if err := s.cluster.replicator.ReplicateQuorum(ctx, targets, cluster.EncodeWrite(tenant, accepted), needAcks); err != nil {
+		return rejected, errors.Wrapf(err, "replicate tenant %q", tenant)
+	}
+
+	return rejected, nil
+}
+
+// primaryWriteHandler serves the primary-write endpoint: a peer routes a tenant's write here
+// when this node is the ring primary. The reject count is returned in the response body.
+func (s *Storage) primaryWriteHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
+			return
+		}
+
+		payload, err := io.ReadAll(req.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+
+			return
+		}
+
+		tenant, walBytes, err := cluster.DecodeWrite(payload)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+
+			return
+		}
+
+		rejected, err := s.primaryWrite(req.Context(), tenant, walBytes)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+
+			return
+		}
+
+		_, _ = fmt.Fprintf(w, "%d", rejected)
+	})
+}
+
+// sendPrimaryWrite forwards a tenant's write to the remote primary at addr and returns the
+// reject count it reports.
+func (s *Storage) sendPrimaryWrite(ctx context.Context, addr string, payload []byte) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+primaryWritePath, bytes.NewReader(payload))
+	if err != nil {
+		return 0, errors.Wrap(err, "build primary-write request")
+	}
+
+	resp, err := s.cluster.httpc.Do(req)
+	if err != nil {
+		return 0, errors.Wrapf(err, "primary-write to %q", addr)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, errors.Wrap(err, "read primary-write response")
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, errors.Errorf("cluster: primary %q returned %d: %s", addr, resp.StatusCode, bytes.TrimSpace(body))
+	}
+
+	rejected, err := strconv.Atoi(string(bytes.TrimSpace(body)))
+	if err != nil {
+		return 0, errors.Wrap(err, "parse reject count")
+	}
+
+	return rejected, nil
 }

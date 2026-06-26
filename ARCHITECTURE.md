@@ -334,6 +334,13 @@ It is safe for concurrent use (one `sync.RWMutex`).
   the head with an empty one, drops the part handles, and deletes this engine's part objects
   from the backend (scoped to `{Prefix}/`), returning the engine to its `New` state for
   reuse (tests/benchmarks) without reallocating it.
+- **Replication apply** (`engine.go`) is the engine's cluster-facing surface (used by §3i):
+  `ApplyPrimary(walBytes)` OOO-checks each sample, appends the accepted ones, and returns a
+  WAL payload of just the accepted set plus the rejected count — the shard primary's single
+  authoritative decision. `ApplyReplicated(walBytes)` applies a payload verbatim (no OOO
+  re-check, like WAL replay), the secondary receive path. `RefreshReplica(ctx)` reloads parts
+  from the shared store and trims the head to the still-unflushed window, bounding a replica's
+  memory after the owner flushes.
 
 The metric part column layout and the WAL sample record are **wire-stable** on-disk
 formats.
@@ -410,11 +417,13 @@ propagation → lease-revoke departure).
 write payload out to a key's ring-owners and returns as soon as a **quorum** —
 `(len/2)+1` — has applied it (the local owner in process, the rest over the transport),
 returning early with an error once quorum is unreachable; non-quorum owners still receive the
-write so all replicas converge. **The storage library owns the node-to-node transport** (a
-deliberate departure from "the embedder owns transport"): `cluster/replica` ships an HTTP
-`Transport` + receiving `Handler` (mounted at `ReplicatePath`), tested over `httptest`. The
-replicator is decoupled from the ring — the caller maps owners→addresses — so the routing and
-quorum logic test against a fake transport.
+write so all replicas converge. `ReplicateQuorum` is the same with an explicit ack count, for a
+caller that has already applied locally and needs only `RF/2` more acks from secondaries (the
+primary-write path below); a quorum ≤ 0 fans out best-effort and waits for none. **The storage
+library owns the node-to-node transport** (a deliberate departure from "the embedder owns
+transport"): `cluster/replica` ships an HTTP `Transport` + receiving `Handler` (mounted at
+`ReplicatePath`), tested over `httptest`. The replicator is decoupled from the ring — the caller
+maps owners→addresses — so the routing and quorum logic test against a fake transport.
 
 **Rebalance** (`cluster/rebalance`) computes the minimal ownership change for a membership
 change as a pure function of the old and new rings: `Plan(shards, prev, next, rf)` returns, per
@@ -424,22 +433,28 @@ parts from S3 via the bucket index; the loser stops), not a copy — and HRW gua
 ~1/N shards that actually moved appear, each one-in/one-out. Executing the plan (an
 etcd-coordinated handoff so exactly one node compacts a shard at a time) is a remaining piece.
 
-**The cluster write path** is assembled in `cluster.Writer`: it routes a tenant's write to the
-tenant's ring-owners and replicates it to a write quorum. A write is framed as `EncodeWrite`
-(tenant ‖ WAL-encoded series+samples); the receiving node decodes it and calls
-`engine.ApplyReplicated`, which replays the WAL bytes into its head — so each owner
-independently holds the unflushed data and either can serve it (after both flush, the shared
-object store reconciles them). A two-node end-to-end test exercises this over the real HTTP
-transport: a write routed by the ring lands in *both* nodes' engines. Sharding is by tenant for
-now (a whole stream pinned to its owners).
+**The cluster write path is primary-authoritative.** A write is framed as `EncodeWrite`
+(tenant ‖ WAL-encoded series+samples) and routed to the tenant's **ring-primary** — the single
+authority for the shard. The primary applies it via `engine.ApplyPrimary`, which OOO-checks each
+sample (the *only* OOO decision for the shard), re-frames the **accepted** set into a fresh WAL
+payload, and returns that payload plus the **rejected count**. The primary then replicates the
+accepted payload to the secondary owners (it already holds one durable copy, so it needs `RF/2`
+more acks via `ReplicateQuorum`); a secondary applies it verbatim through `engine.ApplyReplicated`
+(no re-check — the primary already decided, the way WAL replay trusts the log). Because every
+replica receives the *same accepted set* from one authority, the replicas converge even under
+concurrent writers, and the rejected count is exact. Sharding is by tenant for now (a whole stream
+pinned to its owners; the primary is `Ring().Primary(tenant)`).
 
 **Facade cluster mode** (`cluster.go`, `Options.Cluster`): when configured, `Storage.Open`
-joins the etcd cluster, runs the replica HTTP server on the node's address, and builds the
-routed write path; `WriteMetrics` then frames each tenant's projected series+samples as a write
-payload and replicates it to the tenant's owners (the local owner applies in process via
-`engine.ApplyReplicated`), instead of appending locally. `Close` revokes the lease and stops
-the server. A **two-node end-to-end test** (shared embedded etcd, two `Storage` instances)
-confirms a write to one node is served by both.
+joins the etcd cluster, runs the HTTP server on the node's address (mounting the replicate,
+primary-write, and read endpoints), and builds the routed write path. `WriteMetrics` frames each
+tenant's projected series+samples and calls `routeToPrimary` — applied in process if this node is
+the primary, else forwarded to the primary's `primaryWritePath` over HTTP — and the primary's
+reject count flows back into the returned `Accepted{Accepted, Rejected}`, so clustered ingest
+reports the same partial-success accounting as the single-node path. `Close` revokes the lease and
+stops the server. A **two-node end-to-end test** (shared embedded etcd, two `Storage` instances)
+confirms a write to one node is served by both; a single-node test confirms an out-of-order sample
+surfaces in `Accepted.Rejected`.
 
 **Read fan-out** (`cluster/read.go`): `Storage.Fetcher` is owner-aware in cluster mode. If the
 node owns the tenant it serves locally (the head is replicated there, full matcher pushdown);
@@ -465,11 +480,12 @@ sets it for `=` matchers). The read RPC forwards the equality specs; the peer re
 `__name__="metric"` on the owner instead of pulling the whole window. Non-equality matchers are
 not forwarded; the requester's re-check still applies them.
 
-Closed parity items: the replication receive path now applies the OOO window (§3f
-`ApplyReplicated`); replica heads are trimmed to the unflushed window after the owner flushes
-(`Engine.RefreshReplica`, over a shared store); and equality matcher pushdown (above). Still
-open: per-point **partial-success accounting** is not propagated back from owners to the origin
-(cluster ingest reports accepted == emitted) — that needs primary-authoritative replication.
+Closed parity items: the write path is primary-authoritative, so the OOO decision is made once
+by the shard primary (`engine.ApplyPrimary`) and secondaries apply the accepted set verbatim
+(`engine.ApplyReplicated`); replica heads are trimmed to the unflushed window after the owner
+flushes (`Engine.RefreshReplica`, over a shared store); per-point **partial-success accounting**
+now propagates from the primary back to the origin (the reject count flows into `Accepted`); and
+equality matcher pushdown (above).
 
 ---
 

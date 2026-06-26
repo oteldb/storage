@@ -60,11 +60,35 @@ var ErrNoTargets = errors.New("replica: no targets")
 // non-quorum targets still receive the write (best-effort) so all replicas converge; only the
 // wait is quorum-bounded.
 func (r *Replicator) Replicate(ctx context.Context, targets []Target, payload []byte) error {
+	return r.ReplicateQuorum(ctx, targets, payload, len(targets)/2+1)
+}
+
+// ReplicateQuorum is [Replicator.Replicate] with an explicit required-ack count, for callers
+// that compute quorum themselves — e.g. a shard primary that has already applied locally and
+// needs only (RF/2) more acks from its secondaries. A quorum ≤ 0 returns immediately (the
+// caller's own copy suffices); a quorum exceeding len(targets) can never be met.
+func (r *Replicator) ReplicateQuorum(ctx context.Context, targets []Target, payload []byte, quorum int) error {
+	if quorum <= 0 {
+		// Fan out best-effort, wait for none (the caller already holds a durable copy).
+		for _, t := range targets {
+			go func(addr string) {
+				if addr == r.self {
+					_ = r.apply(ctx, payload)
+
+					return
+				}
+
+				_ = r.transport.Send(ctx, addr, payload)
+			}(t.Addr)
+		}
+
+		return nil
+	}
+
 	if len(targets) == 0 {
 		return ErrNoTargets
 	}
 
-	quorum := len(targets)/2 + 1
 	results := make(chan error, len(targets)) // buffered so stragglers never block
 
 	for _, t := range targets {

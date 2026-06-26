@@ -72,15 +72,16 @@ func openClusterNode(t *testing.T, endpoint, id string) *Storage {
 	return openClusterNodeWith(t, endpoint, id, backend.Memory())
 }
 
-func openClusterNodeWith(t *testing.T, endpoint, id string, be backend.Backend) *Storage {
+func openClusterNodeWith(t *testing.T, endpoint, id string, be backend.Backend, opts ...Option) *Storage {
 	t.Helper()
 
-	s, err := Open(context.Background(), Options{}, WithBackend(be),
-		WithCluster(&cluster.Config{
-			Etcd: []string{endpoint},
-			Self: etcd.Member{ID: id, Addr: freeAddr(t)},
-			RF:   2,
-		}))
+	all := append([]Option{WithBackend(be), WithCluster(&cluster.Config{
+		Etcd: []string{endpoint},
+		Self: etcd.Member{ID: id, Addr: freeAddr(t)},
+		RF:   2,
+	})}, opts...)
+
+	s, err := Open(context.Background(), Options{}, all...)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close(context.Background()) })
 
@@ -246,6 +247,34 @@ func TestClusterReplicaTrimsHeadAfterOwnerFlush(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, []int64{100, 200}, got[0].Timestamps)
+}
+
+// TestClusterPrimaryAccountsForRejectedSamples proves the primary-authoritative write path
+// reports accurate partial-success accounting: the ring-primary OOO-checks the write (the single
+// authority for the shard) and the rejected count surfaces all the way back through the clustered
+// ingest call's [Accepted], matching the single-node path.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterPrimaryAccountsForRejectedSamples(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	s := openClusterNodeWith(t, endpoint, "node-a", backend.Memory(), WithOOOWindow(50))
+
+	require.Eventually(t, func() bool {
+		return len(s.cluster.membership.Members()) == 1
+	}, 10*time.Second, 50*time.Millisecond)
+
+	// First write establishes the head's newest timestamp at 2000.
+	acc, err := s.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{2000}, []float64{1}))
+	require.NoError(t, err)
+	assert.Equal(t, Accepted{Accepted: 1, Rejected: 0}, acc)
+
+	// Second write: 3000 advances newest; 900 is far below (newest-OOOWindow) so the primary
+	// rejects it. The reject count must reach the caller via Accepted.
+	acc, err = s.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{3000, 900}, []float64{5, 9}))
+	require.NoError(t, err)
+	assert.Equal(t, Accepted{Accepted: 1, Rejected: 1}, acc, "the out-of-order sample is accounted as rejected")
 }
 
 // TestClusteredReadFansOutToOwners is the read-fan-out capstone: with three nodes and RF=2,

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"slices"
 	"sync"
@@ -266,18 +267,22 @@ func (e *Engine) Replay(dir string) error {
 	})
 }
 
-// ApplyReplicated applies an in-memory WAL-framed write (a replication payload from a peer)
-// to the head: it registers each series and appends its samples through the **same
-// out-of-order-checked path as a local ingest** (unlike WAL [Engine.Replay], which trusts the
-// log unconditionally), so a replica drops samples older than its OOO window just as the
-// origin would. It returns the number of samples rejected as out-of-order. A replica holds a
-// peer's unflushed head this way; after a flush the shared object store reconciles them. Safe
-// for concurrent use.
-func (e *Engine) ApplyReplicated(data []byte) (rejected int, err error) {
+// ApplyPrimary applies a write as the shard's **primary**: it appends each sample through the
+// out-of-order-checked path (the single OOO decision for the shard) and re-frames the
+// *accepted* samples into a WAL payload to replicate to the secondary owners. It returns that
+// accepted payload and the number of samples rejected as out-of-order. Because only the
+// primary OOO-checks and it dictates the accepted set, every replica converges on the same
+// data regardless of concurrent writers. Safe for concurrent use.
+func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	byID := make(map[signal.SeriesID]signal.Series)
+	var (
+		buf     bytes.Buffer
+		w       = wal.NewWriter(&buf)
+		byID    = make(map[signal.SeriesID]signal.Series)
+		written = make(map[signal.SeriesID]struct{})
+	)
 
 	err = wal.Replay(data, wal.Handlers{
 		OnSeries: func(id signal.SeriesID, s signal.Series) error {
@@ -287,18 +292,60 @@ func (e *Engine) ApplyReplicated(data []byte) (rejected int, err error) {
 		},
 		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
 			s := byID[id] // the series record precedes its samples in the frame
+
+			var accTs []int64
+
+			var accVals []float64
+
 			for i := range ts {
 				if ok, _, _ := e.head.appendByID(id, ts[i], values[i], e.cfg.OOOWindow,
-					func() signal.Series { return s }); !ok {
+					func() signal.Series { return s }); ok {
+					accTs = append(accTs, ts[i])
+					accVals = append(accVals, values[i])
+				} else {
 					rejected++
 				}
 			}
 
-			return nil
+			if len(accTs) == 0 {
+				return nil
+			}
+
+			if _, ok := written[id]; !ok {
+				written[id] = struct{}{}
+				if err := w.WriteSeries(id, s); err != nil {
+					return err
+				}
+			}
+
+			return w.WriteSamples(id, accTs, accVals)
 		},
 	})
 
-	return rejected, err
+	return buf.Bytes(), rejected, err
+}
+
+// ApplyReplicated applies a replicated write from the shard's primary to this secondary's head:
+// it registers each series and appends its samples **verbatim** (no OOO re-check — the primary
+// already decided the accepted set, the same way WAL [Engine.Replay] trusts the log), so all
+// replicas hold identical data. A replica holds the unflushed head this way; after a flush the
+// shared object store reconciles them. Safe for concurrent use.
+func (e *Engine) ApplyReplicated(data []byte) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return wal.Replay(data, wal.Handlers{
+		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
+			e.head.registerSeries(s)
+
+			return nil
+		},
+		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
+			e.head.replaySamples(id, ts, values)
+
+			return nil
+		},
+	})
 }
 
 // HeadSampleCount returns the number of samples currently buffered in the head (across all
