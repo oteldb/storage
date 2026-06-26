@@ -51,18 +51,76 @@ func (m EqualMatcher) Predicate() func(signal.Value) bool {
 
 // Request selects series for a tenant within an inclusive time window, filtered by all
 // matchers (their intersection).
+//
+// The contract is **dual-shape** (DESIGN §7): Matchers resolve identity over the postings index
+// (a metric series, a log stream), while Conditions filter the per-record columns *within* that
+// identity (a log record's severity, body, attributes). Metrics use only Matchers; logs use both.
+// The columnar fields are all zero-valued for a metrics request, so the metrics path is unaffected.
 type Request struct {
 	Tenant     signal.TenantID
-	Start, End int64 // unix nanos, inclusive
+	Signal     signal.Signal // 0 ⇒ metric (the default vertical); Log for the logs read path
+	Start, End int64         // unix nanos, inclusive
 	Matchers   []Matcher
+
+	// Conditions are columnar predicates applied per record (logs). Each names a column and
+	// carries an operator-free Match callback over the row's typed value (mirroring Matcher).
+	Conditions []Condition
+	// AllConditions, when true, ANDs the conditions; a fetcher may still return a superset (an
+	// approximate index like a bloom is re-checked by the requester). False ⇒ the fetcher need
+	// not apply them at all (pure fetch-all; the caller filters).
+	AllConditions bool
+	// Projection names the columns to materialize for surviving rows (the second pass). Empty ⇒
+	// the fetcher's default column set. Filter columns are decoded regardless of Projection.
+	Projection []string
+	// SecondPass, when set, is an engine-side row filter applied after the column Conditions —
+	// for predicates not expressible as a single-column Match (e.g. a per-record attribute
+	// decoded from the serialized attrs column). It sees the candidate row's materialized Batch.
+	SecondPass func(*Batch) bool
 }
 
-// Batch is one matching series and its samples within the request window, time-ordered.
+// Condition is one columnar predicate (logs): the rows whose value in column Column satisfy
+// Match. Like [Matcher] it is operator-free — the language layer supplies the predicate. Tokens,
+// when set, are the full-text tokens the column's value must contain (lowered), used to consult a
+// per-part token bloom for pushdown; an empty Tokens means the condition is not full-text.
+type Condition struct {
+	Column string
+	Match  func(value signal.Value) bool
+	Tokens [][]byte
+}
+
+// Batch is one matching identity (a metric series, or a log stream) and its rows within the
+// request window. For metrics the rows are (Timestamps, Values) samples. For logs the rows are
+// the per-record Columns (the projected set); Timestamps still carries each record's time.
 type Batch struct {
 	ID         signal.SeriesID
 	Series     signal.Series
 	Timestamps []int64
 	Values     []float64
+
+	// Columns are the materialized per-record columns (logs); nil for metrics. Each column's
+	// length matches Timestamps. The named layout is the engine's (e.g. severity, body, attrs).
+	Columns []NamedColumn
+}
+
+// NamedColumn is one materialized column of a log [Batch]: its name and exactly one populated
+// typed slice (Int64/Float64/Bytes), matching the physical column kind. Row i of the batch is
+// Int64[i] / Float64[i] / Bytes[i] for that column.
+type NamedColumn struct {
+	Name    string
+	Int64   []int64
+	Float64 []float64
+	Bytes   [][]byte
+}
+
+// Column returns the named column of the batch and whether it is present.
+func (b *Batch) Column(name string) (NamedColumn, bool) {
+	for i := range b.Columns {
+		if b.Columns[i].Name == name {
+			return b.Columns[i], true
+		}
+	}
+
+	return NamedColumn{}, false
 }
 
 // Iterator yields batches lazily; Next returns (nil, io.EOF) at the end.

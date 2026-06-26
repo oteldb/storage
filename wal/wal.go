@@ -14,8 +14,9 @@ import (
 // Record type tags. New types may be appended; unknown types are skipped on replay so
 // an old reader tolerates a newer log.
 const (
-	recordSeries  byte = 1
-	recordSamples byte = 2
+	recordSeries     byte = 1
+	recordSamples    byte = 2
+	recordLogRecords byte = 3
 )
 
 // seriesIDLen is the fixed 16-byte big-endian width of a [signal.SeriesID] on the wire.
@@ -29,8 +30,9 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 // Handlers receives decoded records during [Replay]. Unset handlers skip their record
 // type.
 type Handlers struct {
-	OnSeries  func(id signal.SeriesID, s signal.Series) error
-	OnSamples func(id signal.SeriesID, ts []int64, values []float64) error
+	OnSeries     func(id signal.SeriesID, s signal.Series) error
+	OnSamples    func(id signal.SeriesID, ts []int64, values []float64) error
+	OnLogRecords func(id signal.SeriesID, recs []LogRecord) error
 }
 
 // Writer appends framed records to an [io.Writer] (typically a segment file). It reuses
@@ -129,6 +131,17 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 		}
 
 		return h.OnSamples(id, ts, values)
+	case recordLogRecords:
+		if h.OnLogRecords == nil {
+			return nil
+		}
+
+		id, recs, err := parseLogRecords(payload)
+		if err != nil {
+			return err
+		}
+
+		return h.OnLogRecords(id, recs)
 	default:
 		return nil // unknown record type: skip for forward compatibility
 	}

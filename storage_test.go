@@ -258,8 +258,7 @@ func TestUnimplementedSignals(t *testing.T) {
 	require.NoError(t, err)
 	ctx := context.Background()
 
-	_, err = s.WriteLogs(ctx, log.Logs{})
-	require.ErrorIs(t, err, ErrNotImplemented)
+	// Logs are implemented (see logs_test.go); traces and profiles remain later verticals.
 	_, err = s.WriteTraces(ctx, trace.Traces{})
 	require.ErrorIs(t, err, ErrNotImplemented)
 	_, err = s.WriteProfiles(ctx, profile.Profiles{})

@@ -1,0 +1,124 @@
+package logengine
+
+import (
+	"context"
+	"slices"
+
+	"github.com/oteldb/storage/signal"
+)
+
+// Merge compacts every flushed part into a single new part, dropping records older than retainFrom
+// (retention; retainFrom ≤ 0 disables it). No-op when there is nothing to gain — fewer than two
+// parts and no retention cutoff. Source parts are deleted after the new part is durably written.
+//
+// Unlike metrics, log records are append-only: merge concatenates a stream's records across parts
+// (no value dedup) and re-sorts them by timestamp.
+func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.mergeLocked(ctx, retainFrom)
+}
+
+func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) error {
+	if len(e.parts) == 0 || (len(e.parts) == 1 && retainFrom <= 0) {
+		return nil
+	}
+
+	start := minInt64
+	if retainFrom > 0 {
+		start = retainFrom
+	}
+
+	f, err := e.compactParts(ctx, start)
+	if err != nil {
+		return err
+	}
+
+	old := e.parts
+
+	if f.len() == 0 {
+		e.parts = nil // retention dropped every record
+	} else {
+		prefix := e.partPrefix(e.nextSeq)
+		if err := writePart(ctx, e.cfg.Backend, prefix, f); err != nil {
+			return err
+		}
+
+		p, err := openPart(ctx, e.cfg.Backend, prefix)
+		if err != nil {
+			return err
+		}
+
+		p.minTime, p.maxTime = colsTimeRange(f)
+		e.parts = []*part{p}
+		e.nextSeq++
+	}
+
+	// Commit the new part set before deleting the sources (crash-safe: never reference a deleted
+	// part; orphan objects are harmless and reclaimed by a later merge).
+	if err := e.updateIndexLocked(ctx); err != nil {
+		return err
+	}
+
+	for _, p := range old {
+		if err := deletePart(ctx, e.cfg.Backend, p.prefix); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// compactParts concatenates every part's records per stream (within [start, maxInt64], applying
+// retention), returning the combined columns sorted by (stream, ts). Empty when no record survives.
+func (e *Engine) compactParts(ctx context.Context, start int64) (*flushColumns, error) {
+	idSet := make(map[signal.SeriesID]struct{})
+	for _, p := range e.parts {
+		for id := range p.ranges {
+			idSet[id] = struct{}{}
+		}
+	}
+
+	ids := make([]signal.SeriesID, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+
+	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
+
+	f := &flushColumns{}
+
+	for _, id := range ids {
+		acc := &recordCols{}
+
+		for _, p := range e.parts {
+			if err := p.appendWindow(ctx, id, acc, start, maxInt64); err != nil {
+				return nil, err
+			}
+		}
+
+		if acc.len() == 0 {
+			continue
+		}
+
+		acc.sortByTs()
+
+		u := idToU128(id)
+		for i := range acc.ts {
+			f.stream = append(f.stream, u)
+			f.cols.appendRow(acc, i)
+		}
+	}
+
+	return f, nil
+}
+
+// Close flushes any buffered records to a part. It does not stop a background loop — the owner
+// ([storage.Storage]) does that before calling Close.
+func (e *Engine) Close(ctx context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.flushLocked(ctx)
+}

@@ -87,6 +87,18 @@ func (sw *SegmentWriter) WriteSamples(id signal.SeriesID, ts []int64, values []f
 	return sw.w.WriteSamples(id, ts, values)
 }
 
+// WriteLogRecords logs a run of log records for one stream, rotating first if the current
+// segment is full.
+func (sw *SegmentWriter) WriteLogRecords(id signal.SeriesID, recs []LogRecord) error {
+	if sw.size >= sw.maxBytes {
+		if err := sw.rotate(); err != nil {
+			return err
+		}
+	}
+
+	return sw.w.WriteLogRecords(id, recs)
+}
+
 // Sync flushes the current segment to stable storage.
 func (sw *SegmentWriter) Sync() error { return sw.f.Sync() }
 

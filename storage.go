@@ -14,10 +14,10 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/logengine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/scale"
 	"github.com/oteldb/storage/signal"
-	"github.com/oteldb/storage/signal/log"
 	"github.com/oteldb/storage/signal/metric"
 	"github.com/oteldb/storage/signal/profile"
 	"github.com/oteldb/storage/signal/trace"
@@ -42,8 +42,9 @@ type Storage struct {
 	tenant  tenant.Resolver
 	closed  atomic.Bool
 
-	tmu     sync.Mutex
-	tenants map[signal.TenantID]*engine.Engine
+	tmu        sync.Mutex
+	tenants    map[signal.TenantID]*engine.Engine
+	logTenants map[signal.TenantID]*logengine.Engine
 
 	cluster *clusterNode // cluster runtime (membership + replica server + routed writes); nil ⇒ single-node
 
@@ -65,10 +66,11 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	}
 	o.applyDefaults()
 	s := &Storage{
-		opts:    o,
-		backend: o.Backend,
-		tenant:  o.Tenancy,
-		tenants: make(map[signal.TenantID]*engine.Engine),
+		opts:       o,
+		backend:    o.Backend,
+		tenant:     o.Tenancy,
+		tenants:    make(map[signal.TenantID]*engine.Engine),
+		logTenants: make(map[signal.TenantID]*logengine.Engine),
 	}
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
@@ -143,6 +145,12 @@ func (s *Storage) Close(ctx context.Context) error {
 		}
 	}
 
+	for _, eng := range s.logEngineSnapshot() {
+		if err := eng.Close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
 	return firstErr
 }
 
@@ -164,6 +172,12 @@ func (s *Storage) Reset(ctx context.Context) error {
 	for _, eng := range s.engineSnapshot() {
 		if err := eng.Reset(ctx); err != nil {
 			return errors.Wrap(err, "reset engine")
+		}
+	}
+
+	for _, eng := range s.logEngineSnapshot() {
+		if err := eng.Reset(ctx); err != nil {
+			return errors.Wrap(err, "reset log engine")
 		}
 	}
 
@@ -210,11 +224,6 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted
 		Accepted: int64(emitted) - oooRejected,
 		Rejected: oooRejected,
 	}, nil
-}
-
-// WriteLogs ingests a logs batch. Later vertical.
-func (s *Storage) WriteLogs(_ context.Context, _ log.Logs) (Accepted, error) {
-	return s.notImplementedWrite("write logs")
 }
 
 // WriteTraces ingests a traces batch. Later vertical.
@@ -392,15 +401,21 @@ func (s *Storage) recover(ctx context.Context) error {
 		return errors.Wrap(err, "list backend for recovery")
 	}
 
-	suffix := metricsPrefix + "/" + bucketindex.Object
-	for _, k := range keys {
-		if !strings.HasSuffix(k, suffix) {
-			continue
-		}
+	metricSuffix := metricsPrefix + "/" + bucketindex.Object
+	logSuffix := logsPrefix + "/" + bucketindex.Object
 
-		tid := signal.TenantID(strings.TrimSuffix(k, suffix))
-		if err := s.engineFor(tid).LoadParts(ctx); err != nil {
-			return errors.Wrapf(err, "recover tenant %q", tid)
+	for _, k := range keys {
+		switch {
+		case strings.HasSuffix(k, metricSuffix):
+			tid := signal.TenantID(strings.TrimSuffix(k, metricSuffix))
+			if err := s.engineFor(tid).LoadParts(ctx); err != nil {
+				return errors.Wrapf(err, "recover metrics tenant %q", tid)
+			}
+		case strings.HasSuffix(k, logSuffix):
+			tid := signal.TenantID(strings.TrimSuffix(k, logSuffix))
+			if err := s.logEngineFor(tid).LoadParts(ctx); err != nil {
+				return errors.Wrapf(err, "recover logs tenant %q", tid)
+			}
 		}
 	}
 
@@ -465,6 +480,13 @@ func (s *Storage) maintain(ctx context.Context) {
 			}
 		}
 
+		_ = eng.Flush(ctx)
+		_ = eng.Merge(ctx, s.retainFrom(tid))
+	}
+
+	// Logs do not yet participate in cluster ownership (single-node compaction), so every log
+	// engine flushes/merges locally. Cluster log routing is a later milestone.
+	for tid, eng := range s.logEngineSnapshotByTenant() {
 		_ = eng.Flush(ctx)
 		_ = eng.Merge(ctx, s.retainFrom(tid))
 	}
