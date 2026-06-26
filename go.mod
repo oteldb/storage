@@ -3,10 +3,10 @@ module github.com/oteldb/storage
 go 1.26.3
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.41.5
+	github.com/aws/aws-sdk-go-v2 v1.42.0
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.97.3
-	github.com/aws/smithy-go v1.24.2
+	github.com/aws/smithy-go v1.27.1
 	github.com/go-faster/errors v0.7.1
 	github.com/go-faster/fs v0.2.0
 	github.com/go-faster/jx v1.2.0
