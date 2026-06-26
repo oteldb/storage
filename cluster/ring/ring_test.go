@@ -196,3 +196,91 @@ func TestWithoutMissingIsNoOp(t *testing.T) {
 	r := ring.New(nodes("n1", "n2")...)
 	assert.Equal(t, ids(r.Nodes()), ids(r.Without("nope").Nodes()))
 }
+
+// zoned builds nodes from (id, zone) pairs.
+func zoned(pairs ...[2]string) []ring.Node {
+	out := make([]ring.Node, len(pairs))
+	for i, p := range pairs {
+		out[i] = ring.Node{ID: p[0], Zone: p[1]}
+	}
+
+	return out
+}
+
+func distinctZones(ns []ring.Node) int {
+	z := map[string]struct{}{}
+	for _, n := range ns {
+		z[n.Zone] = struct{}{}
+	}
+
+	return len(z)
+}
+
+// TestLookupZoneAwareSpread checks that a key's replicas land in as many distinct zones as
+// possible, for every key, and that the primary is unaffected by zone spreading.
+func TestLookupZoneAwareSpread(t *testing.T) {
+	t.Parallel()
+
+	// Three zones, two nodes each.
+	r := ring.New(zoned(
+		[2]string{"a1", "z1"}, [2]string{"a2", "z1"},
+		[2]string{"b1", "z2"}, [2]string{"b2", "z2"},
+		[2]string{"c1", "z3"}, [2]string{"c2", "z3"},
+	)...)
+
+	for _, k := range keys(500) {
+		for _, rf := range []int{1, 2, 3} {
+			got := r.Lookup(k, rf)
+			require.Len(t, got, rf)
+			assert.Equal(t, rf, distinctZones(got), "rf=%d replicas span rf distinct zones", rf)
+			assert.Equal(t, ids([]ring.Node{r.Lookup(k, 1)[0]}), ids(got[:1]), "primary stable across rf")
+			assert.Len(t, ids(got), len(dedup(ids(got))), "no duplicate nodes")
+		}
+	}
+}
+
+// TestLookupZoneAwareFallback checks graceful degradation when there are fewer zones than rf:
+// every zone is represented and the extra slots fill by score (a repeat zone), with no dup nodes.
+func TestLookupZoneAwareFallback(t *testing.T) {
+	t.Parallel()
+
+	// Two zones but rf=3 ⇒ one zone must repeat.
+	r := ring.New(zoned(
+		[2]string{"a1", "z1"}, [2]string{"a2", "z1"},
+		[2]string{"b1", "z2"}, [2]string{"b2", "z2"},
+	)...)
+
+	for _, k := range keys(500) {
+		got := r.Lookup(k, 3)
+		require.Len(t, got, 3)
+		assert.Equal(t, 2, distinctZones(got), "both zones present")
+		assert.Len(t, dedup(ids(got)), 3, "no duplicate nodes despite the repeated zone")
+	}
+}
+
+// TestLookupEmptyZonesIsPureHRW confirms zone-awareness is a no-op when zones are unset: the
+// result keeps the HRW prefix property (Lookup(k, n) is a prefix of Lookup(k, n+1)).
+func TestLookupEmptyZonesIsPureHRW(t *testing.T) {
+	t.Parallel()
+
+	r := ring.New(nodes("a", "b", "c", "d", "e")...)
+	for _, k := range keys(300) {
+		for rf := 1; rf < 5; rf++ {
+			assert.Equal(t, ids(r.Lookup(k, rf)), ids(r.Lookup(k, rf+1))[:rf],
+				"empty-zone Lookup is a stable HRW prefix")
+		}
+	}
+}
+
+func dedup(s []string) []string {
+	seen := map[string]struct{}{}
+	out := s[:0]
+	for _, v := range s {
+		if _, ok := seen[v]; !ok {
+			seen[v] = struct{}{}
+			out = append(out, v)
+		}
+	}
+
+	return out
+}

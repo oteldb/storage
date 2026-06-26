@@ -488,8 +488,8 @@ type and the core leaks nothing prometheus-shaped.
 
 The first piece of the (optional) distribution layer: **rendezvous / highest-random-weight
 (HRW) hashing**. A node's score for a key is `xxh3.HashSeed(key, seed(nodeID))`; `Lookup(key,
-rf)` returns the `rf` highest-scoring nodes (primary first, replicas after), ties broken by
-ID. Two properties make it the sharding base:
+rf)` returns the `rf` owning nodes (primary first, replicas after), ties broken by ID. Three
+properties make it the sharding base:
 
 - **Deterministic, coordinator-free placement** — every node computes the same owners from
   just the membership list, so routing needs no lookup table on the hot path.
@@ -497,6 +497,14 @@ ID. Two properties make it the sharding base:
   slot *to itself* (existing pairings never reshuffle); removing one only redistributes *its*
   keys. A property test pins this: per key, at most one replica moves on an add, and the new
   node receives exactly its `~1/(N+1)` fair share of slots.
+- **Zone-aware replica spreading** — `Lookup` selection is zone-aware: walking nodes in score
+  order it takes the highest-scoring node of each not-yet-used **zone** (`Node.Zone`, the failure
+  domain) first, so a key's replicas land in as many distinct zones as possible, and only fills
+  the remaining slots in pure score order once distinct zones run out (fewer zones than `rf`).
+  The primary is still the single highest-scoring node. When every zone is empty (the default) the
+  result is exactly the score-ordered top-`rf` — pure HRW, no behavior change — so zone-awareness
+  costs nothing until an operator sets zones (`Config.Self.Zone`, plumbed membership→ring). A
+  property test pins the spread and the empty-zone equivalence.
 
 The `Ring` is immutable (`With`/`Without` return a new ring).
 
@@ -913,7 +921,7 @@ query/fetch           dual-shape fetch contract (Matchers + Conditions/Projectio
 query/scale           fetch-seam scale-out decorators: split-by-interval + results cache  [implemented]
 query/promql          OPTIONAL adapter: fetch → Prometheus storage.Queryable (no engine) [implemented; only package importing prometheus]
 cluster/              L0 distribution: ring + membership + (later) replication · rebalance [partly implemented]
-  cluster/ring        rendezvous (HRW) hashing: deterministic placement, ~1/N movement  [implemented]
+  cluster/ring        rendezvous (HRW) hashing: deterministic placement, ~1/N movement, zone-aware replica spread [implemented]
   cluster/etcd        etcd-backed live membership (lease + watch → atomic ring)          [implemented; embedded-etcd tested]
   cluster/replica     quorum write-replication + node-to-node HTTP transport             [implemented]
   cluster/rebalance   minimal ownership-handoff plan from a ring diff (pure)              [implemented]

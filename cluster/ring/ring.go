@@ -19,9 +19,11 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-// Node is a cluster member. ID is its stable, unique identity (the only thing that affects
-// placement). Zone is an optional failure domain for zone-aware replica spreading (carried
-// now, used by the replication layer later).
+// Node is a cluster member. ID is its stable, unique identity (the only thing that affects a
+// node's HRW score). Zone is an optional failure domain: [Ring.Lookup] spreads a key's replicas
+// across distinct zones where possible, so a single zone failure cannot take out every replica.
+// An empty Zone means "unspecified"; when every node's zone is empty (the default) placement is
+// pure HRW, identical to a zone-unaware ring.
 type Node struct {
 	ID   string
 	Zone string
@@ -75,33 +77,58 @@ func (r *Ring) Nodes() []Node {
 	return out
 }
 
-// Lookup returns up to rf nodes responsible for key, ordered by descending HRW score — the
-// first is the primary, the rest are replicas. It returns fewer than rf nodes only when the
-// ring has fewer than rf members, and nil for an empty ring or rf ≤ 0. Ties (equal scores)
-// break by node ID, so the result is fully deterministic.
+// Lookup returns up to rf nodes responsible for key — the first is the primary, the rest are
+// replicas. It returns fewer than rf nodes only when the ring has fewer than rf members, and nil
+// for an empty ring or rf ≤ 0. Selection is **zone-aware**: among nodes sorted by descending HRW
+// score (ties broken by ID), it greedily picks the highest-scoring node from each not-yet-used
+// zone first, so a key's replicas spread across as many distinct failure domains as possible;
+// once distinct zones are exhausted (fewer zones than rf) it fills the remaining slots in score
+// order. The primary is always the single highest-scoring node, and when every zone is empty the
+// result is exactly the score-ordered top-rf (pure HRW). The result is fully deterministic.
 func (r *Ring) Lookup(key []byte, rf int) []Node {
 	if rf <= 0 || len(r.nodes) == 0 {
 		return nil
 	}
 
 	rf = min(rf, len(r.nodes))
+	scored := r.scoreSorted(key)
 
-	scored := make([]scoredNode, len(r.nodes))
-	for i := range r.nodes {
-		scored[i] = scoredNode{node: r.nodes[i].node, score: xxh3.HashSeed(key, r.nodes[i].seed)}
-	}
+	out := make([]Node, 0, rf)
+	usedZones := make(map[string]struct{}, rf)
 
-	sort.Slice(scored, func(i, j int) bool {
-		if scored[i].score != scored[j].score {
-			return scored[i].score > scored[j].score
+	// Pass 1: the highest-scoring node from each distinct zone (in score order), so replicas
+	// land in different failure domains. The primary (scored[0]) is always taken first.
+	for i := range scored {
+		if len(out) == rf {
+			break
 		}
 
-		return scored[i].node.ID < scored[j].node.ID
-	})
+		zone := scored[i].node.Zone
+		if _, used := usedZones[zone]; used {
+			continue
+		}
 
-	out := make([]Node, rf)
-	for i := range out {
-		out[i] = scored[i].node
+		usedZones[zone] = struct{}{}
+		out = append(out, scored[i].node)
+	}
+
+	// Pass 2: zones are exhausted but rf is not filled — take the remaining highest-scoring nodes
+	// regardless of zone (graceful degradation when there are fewer zones than replicas).
+	if len(out) < rf {
+		picked := make(map[string]struct{}, len(out))
+		for _, n := range out {
+			picked[n.ID] = struct{}{}
+		}
+
+		for i := range scored {
+			if len(out) == rf {
+				break
+			}
+
+			if _, ok := picked[scored[i].node.ID]; !ok {
+				out = append(out, scored[i].node)
+			}
+		}
 	}
 
 	return out
@@ -133,4 +160,23 @@ func (r *Ring) Without(id string) *Ring {
 	kept := slices.DeleteFunc(r.Nodes(), func(n Node) bool { return n.ID == id })
 
 	return New(kept...)
+}
+
+// scoreSorted returns the membership scored for key and sorted by descending HRW score, ties
+// broken by ascending node ID (so placement is fully deterministic).
+func (r *Ring) scoreSorted(key []byte) []scoredNode {
+	scored := make([]scoredNode, len(r.nodes))
+	for i := range r.nodes {
+		scored[i] = scoredNode{node: r.nodes[i].node, score: xxh3.HashSeed(key, r.nodes[i].seed)}
+	}
+
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].score != scored[j].score {
+			return scored[i].score > scored[j].score
+		}
+
+		return scored[i].node.ID < scored[j].node.ID
+	})
+
+	return scored
 }
