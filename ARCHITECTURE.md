@@ -43,7 +43,7 @@ The design is a single columnar engine with swappable front-ends and backends
 | L4 **Fetch contract** | **callback matchers + window → iterator of batches** | **the library's query surface** (`query/fetch`, exposed via `Storage.Fetcher`); implemented for metrics, column conditions pending |
 | L3 **Engine** / **Index / WAL** | **head · flush · merge · retention** / **symbols · series · postings** · **write-ahead log** | **engine implemented (metrics)**; **index + wal implemented** |
 | L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
-| L1 **Backend** | file · s3 · memory behind one interface | **memory + file implemented**; s3 + CAS pending |
+| L1 **Backend** | file · s3 · memory behind one interface | **memory + file + s3 implemented**, with `PutIfAbsent` CAS; `bucketindex` for stateless part enumeration |
 | L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | — (package `cluster`, seam only) |
 
 The **implemented substance spans L1 (backends) through L4 (the fetch contract)** for
@@ -134,20 +134,36 @@ both `chunk.EncodeBytes` and `chunk.DictEncoder`.
 
 The L1 seam: a common `Backend` interface over whole-object, slash-delimited keys —
 `Read(ctx,key)([]byte)`, `Write(ctx,key,[]byte)`, `List(ctx,prefix)([]string)`,
-`Delete(ctx,key)`, plus `IsEphemeral()`. Absent keys return an error satisfying
-`errors.Is(_, backend.ErrNotExist)`. Ranged/streaming reads and compare-and-swap are
-deferred to the s3 backend (later milestone).
+`Delete(ctx,key)`, `PutIfAbsent(ctx,key,[]byte)(bool)`, plus `IsEphemeral()`. Absent keys
+return an error satisfying `errors.Is(_, backend.ErrNotExist)`. **`PutIfAbsent`** is the
+conditional-write (CAS) primitive on which atomic manifest / block-list commits build
+(single-writer-wins with no Raft): a guarded map insert (memory), an exclusive `os.Link`
+(file), and S3 `If-None-Match: *` (s3).
 
 - **`backend.Memory()`** (root package) — the ephemeral reference backend: a concurrent
   map that copies on both `Write` and `Read`, so stored objects are immutable and never
   alias a caller's buffer. The default in tests.
 - **`backend/file`** — a directory tree. Keys map to paths under a root (with a `..`
-  traversal guard); `Write` is atomic via a temp file + `fsync` + `rename`, which is the
-  per-object atomicity the "manifest written last" part commit relies on.
-- **`backend/backendtest`** — a shared conformance suite (`Run(t, factory)`) that both
-  backends pass under `-race`, proving they are interchangeable.
+  traversal guard); `Write` is atomic via a temp file + `fsync` + `rename`; `PutIfAbsent` is
+  an atomic exclusive create via temp + `os.Link` (fails `EEXIST` if the key exists).
+- **`backend/s3`** — the object-store-native backend. The store-specific calls sit behind a
+  small `ObjectStore` interface, so the Backend's contract logic — root-prefixing, sorted
+  listing, `404 → ErrNotExist`, conditional put, and an existence-checked `Delete` (S3's
+  `DeleteObject` is idempotent) — is covered by the conformance suite over an in-memory fake.
+  `NewAWS` adapts `aws-sdk-go-v2` (GetObject / PutObject±If-None-Match / HeadObject /
+  idempotent DeleteObject / paginated ListObjectsV2); a faithful map-based fake `AWSAPI` runs
+  the same suite through the adapter, so everything but the network is tested. **This is the
+  only package importing the AWS SDK.**
+- **`backend/bucketindex`** — a compact, versioned binary index (block list + per-part time
+  bounds) stored as one object, so a stateless reader enumerates and time-prunes a tenant's
+  parts (`Overlapping(start,end)`) without a full bucket `List`. Fuzzed for decode safety,
+  golden-tested for format stability.
+- **`backend/backendtest`** — a shared conformance suite (`Run(t, factory)`) that memory,
+  file, and s3 (over both fakes) pass under `-race`, proving they are interchangeable.
 
-Backends are interchangeable behind the interface; s3 and `bucketindex` remain seam-only.
+The **stateless read path** (a node reconstructing parts from the bucket via `bucketindex`,
+with no local part state) is the remaining M5 integration; the building blocks (s3 + CAS +
+bucketindex) are in place.
 
 ## 3b. Part format (`block/`)
 
@@ -452,7 +468,10 @@ signal/               typed Attributes/Value, Resource/Scope/Series identity, 12
   signal/log,trace,profile  placeholder ingest batch types (keep facade pdata-free)    [stub; verticals deferred]
 otlp/pdataconv        optional OTel-Go bridge: pmetric.Metrics → metric.Metrics (only package importing pdata) [implemented for metrics]
 tenant/               Limits/Retention/Downsample/Policy, Resolver                     [implemented]
-backend/              Backend interface + memory (root) + file/                         [implemented; s3/bucketindex seam only]
+backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + memory (root) [implemented]
+  backend/file        directory-tree backend; atomic write + exclusive PutIfAbsent (os.Link) [implemented]
+  backend/s3          object-store-native backend over ObjectStore + aws-sdk-go-v2 adapter   [implemented; live-S3 integration untested here]
+  backend/bucketindex versioned block-list index (time-pruned part enumeration, no full LIST) [implemented]
 block/                immutable columnar part format: column/marks/manifest/part        [implemented]
 index/                symbols (intern) · series (id↔attrs) · postings (set-ops/matchers) [implemented; bloom seam only]
 wal/                  CRC-framed segmented write-ahead log + replay                    [implemented]
