@@ -177,9 +177,17 @@ The **stateless read path** is wired end-to-end: at the engine level (§3f,
 identity index (from a durable series object) from the backend alone; at the facade level
 `Storage.Open` calls `recover`, which — for a **durable** backend — discovers tenants by their
 bucket-index objects and `LoadParts` each, so a fresh process serves data a previous one
-flushed (it is a no-op for an ephemeral backend). This restores **flushed** data only;
-recovering the unflushed head from a per-tenant WAL is the remaining piece (the WAL is not yet
-wired into the facade — it needs a truncate-on-flush API to bound replay).
+flushed (it is a no-op for an ephemeral backend).
+
+**The unflushed head is recovered from a per-tenant WAL** when `Options.WALDir` is set (§3d, §4):
+each `*EngineFor` attaches a resuming `wal.SegmentWriter` under `{WALDir}/{tenant}/{signal}`, every
+engine logs its head writes there, and a flush **checkpoints** the WAL (rotates + deletes the
+now-durable segments — `SegmentWriter.Checkpoint`) so replay is bounded. `recover` replays each WAL
+directory after `LoadParts`, restoring the records — and, for profiles, the symbol store (the
+`recordSide` frame) — a crash left unflushed. Part commit and WAL truncation are not atomic across
+the two stores, so a crash in the narrow window between them can replay just-flushed records: benign
+re-flush, deduped on merge for metrics, a rare duplicate for append-only records (exactly-once via a
+flush epoch is future hardening).
 
 ## 3b. Part format (`block/`)
 
@@ -248,11 +256,18 @@ The L3 indexing layer maps query matchers to the series that satisfy them.
 ## 3d. Write-ahead log (`wal/`)
 
 CRC-framed records (`[uvarint len][type][payload][CRC32C]`) appended to numbered segment
-files (`SegmentWriter`, rotating at a size limit). A series record carries the `SeriesID`
-+ the typed attribute encoding. `ReplayDir` stitches segments in order; replay tolerates a
-torn final record (crash recovery), surfaces a bad-CRC complete record as corruption, and
-skips unknown record types (forward-compat). Replaying the log rebuilds the symbols +
-series + postings index — the path that reconstructs the head after a restart.
+files (`SegmentWriter`, rotating at a size limit). Record types: a **series** record (`SeriesID`
++ typed attribute encoding), a **samples** record (metrics), an opaque **records** payload (the
+record signals), and an opaque **side** record (a content-addressed side-store delta — the profiles
+symbol store). `ReplayDir` stitches segments in order; replay tolerates a torn final record (crash
+recovery), surfaces a bad-CRC complete record as corruption, and skips unknown record types
+(forward-compat). Replaying the log rebuilds the symbols + series + postings index and the head —
+the path that reconstructs unflushed state after a restart.
+
+`Create` **resumes** an existing directory (opens a fresh segment beyond the prior run's, never
+truncating them), and `Checkpoint` rotates then deletes the segments a flush has made durable
+(truncate-on-flush, so replay stays bounded). The facade attaches one writer per (tenant, signal)
+engine and replays them on recovery (§3a, §4).
 
 ## 3e. Metrics ingest model + projection (`signal/metric/`)
 
@@ -702,6 +717,8 @@ query-language path stays in the embedder. The `Write*` methods take the library
   `WithWALDir`, `WithFlushThresholdBytes`, `WithFlushInterval`, `WithOOOWindow`,
   `WithQuerySplitInterval`, `WithQueryCache`, `WithQueryCacheFreshness`). `Durability` selects the
   durability mode; an ephemeral backend with no explicit choice defaults to the in-memory engine.
+  `WithWALDir` (durable backends only) turns on per-tenant write-ahead logging so a crash recovers
+  the unflushed head (§3a/§3d); without it, recovery restores only flushed parts.
 - **`Query` / `Lang` / `Result` / `Accepted`** — the query request (language selected by
   `Lang`), its result, and the ingest acknowledgement type.
 
@@ -739,8 +756,8 @@ These hold in the implemented code and must be preserved by changes:
 - **Stable formats.** The `Codec` enum, the per-stream header, each codec's framing, the
   part formats (manifest `OTPM`, marks `OTMK`, per-column object framing, the
   `{prefix}/manifest|marks|c/{i}` key layout), the **attribute hash/binary encoding** (the
-  SeriesID pre-image), the **symbol table** (`OTSY`), the **WAL record framing** (series +
-  sample records), the **metric part column layout** (`[series:int128, ts:int64,
+  SeriesID pre-image), the **symbol table** (`OTSY`), the **WAL record framing** (series, sample,
+  records, and side frames), the **metric part column layout** (`[series:int128, ts:int64,
   value:float64]` sorted by `(series, ts)`), and the **profile symbol-store table** (`OTSP`, the
   content-addressed side-store sidecars) are all persisted/wire-stable. Changing any of
   them is an architectural change (golden tests guard formats; bump the version and update
@@ -778,7 +795,7 @@ backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + m
 block/                immutable columnar part format: column/marks/manifest/part        [implemented]
 index/                symbols (intern) · series (id↔attrs) · postings (set-ops/matchers) [implemented]
   index/bloom         token bloom filter (no false negatives) + tokenizer: full-text + attr/equality pruning [implemented]
-wal/                  CRC-framed segmented write-ahead log + replay (samples + opaque records + side delta) [implemented]
+wal/                  CRC-framed segmented WAL: samples + opaque records + side delta, resume + checkpoint (truncate-on-flush), facade-wired durability [implemented]
 engine/               head · flush · background-merge · retention · fetch (metrics)    [implemented]
 recordengine/         shared schema-driven record engine (logs+traces+profiles): head · flush · merge · fetch · conditions · per-column blooms · optional content-addressed side store [implemented]
 query/fetch           dual-shape fetch contract (Matchers + Conditions/Projection/SecondPass) [implemented for metrics + logs + traces + profiles; the library's query surface]

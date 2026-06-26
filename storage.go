@@ -621,7 +621,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 //
 //nolint:nilnil // a nil writer is the documented "no WAL configured" sentinel, checked by the engine
 func (s *Storage) walFor(prefix string) (*wal.SegmentWriter, error) {
-	if s.opts.WALDir == "" {
+	if s.opts.WALDir == "" || s.backend.IsEphemeral() {
 		return nil, nil
 	}
 
