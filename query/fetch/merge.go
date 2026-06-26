@@ -2,8 +2,6 @@ package fetch
 
 import (
 	"context"
-	"errors"
-	"io"
 	"slices"
 
 	"github.com/oteldb/storage/signal"
@@ -47,9 +45,7 @@ type mergeAcc struct {
 }
 
 func (m mergeFetcher) Fetch(ctx context.Context, r Request) (Iterator, error) {
-	byID := make(map[signal.SeriesID]*mergeAcc)
-
-	var order []signal.SeriesID
+	groups := make([][]*Batch, 0, len(m))
 
 	for _, f := range m {
 		it, err := f.Fetch(ctx, r)
@@ -57,14 +53,55 @@ func (m mergeFetcher) Fetch(ctx context.Context, r Request) (Iterator, error) {
 			return nil, err
 		}
 
-		if err := mergeDrain(ctx, it, byID, &order); err != nil {
-			_ = it.Close()
+		batches, derr := Drain(ctx, it)
+		cerr := it.Close()
 
-			return nil, err
+		if derr != nil {
+			return nil, derr
 		}
 
-		if err := it.Close(); err != nil {
-			return nil, err
+		if cerr != nil {
+			return nil, cerr
+		}
+
+		groups = append(groups, batches)
+	}
+
+	return NewSliceIterator(MergeBatches(groups...)), nil
+}
+
+// MergeBatches merges batches from multiple result groups by [signal.SeriesID] into one slice,
+// ordered by first appearance. Batches that share an id — the same series in more than one
+// group (cluster fan-out across replicas, or the sub-windows of a split-by-interval fetch) —
+// are combined into one batch with samples in timestamp order, the value from the later group
+// winning on a duplicate timestamp. It is the batch-level form of [Merge]; a series present in
+// a single group is copied through unchanged (no re-sort/dedup). Input batches are never
+// mutated (a merged batch holds cloned sample columns).
+func MergeBatches(groups ...[]*Batch) []*Batch {
+	byID := make(map[signal.SeriesID]*mergeAcc)
+
+	var order []signal.SeriesID
+
+	for _, g := range groups {
+		for _, b := range g {
+			if a, ok := byID[b.ID]; ok {
+				a.b.Timestamps = append(a.b.Timestamps, b.Timestamps...)
+				a.b.Values = append(a.b.Values, b.Values...)
+				a.sources++
+
+				continue
+			}
+
+			byID[b.ID] = &mergeAcc{
+				b: &Batch{
+					ID:         b.ID,
+					Series:     b.Series,
+					Timestamps: slices.Clone(b.Timestamps),
+					Values:     slices.Clone(b.Values),
+				},
+				sources: 1,
+			}
+			order = append(order, b.ID)
 		}
 	}
 
@@ -78,41 +115,7 @@ func (m mergeFetcher) Fetch(ctx context.Context, r Request) (Iterator, error) {
 		out = append(out, a.b)
 	}
 
-	return NewSliceIterator(out), nil
-}
-
-// mergeDrain folds an iterator's batches into the accumulator: a new id is stored as a fresh
-// copy (so a child's batch is never mutated), a repeat id appends its samples.
-func mergeDrain(ctx context.Context, it Iterator, byID map[signal.SeriesID]*mergeAcc, order *[]signal.SeriesID) error {
-	for {
-		b, err := it.Next(ctx)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-
-			return err
-		}
-
-		if a, ok := byID[b.ID]; ok {
-			a.b.Timestamps = append(a.b.Timestamps, b.Timestamps...)
-			a.b.Values = append(a.b.Values, b.Values...)
-			a.sources++
-
-			continue
-		}
-
-		byID[b.ID] = &mergeAcc{
-			b: &Batch{
-				ID:         b.ID,
-				Series:     b.Series,
-				Timestamps: slices.Clone(b.Timestamps),
-				Values:     slices.Clone(b.Values),
-			},
-			sources: 1,
-		}
-		*order = append(*order, b.ID)
-	}
+	return out
 }
 
 // dedupByTimestamp sorts (ts, value) pairs by timestamp, keeping the last value seen for a

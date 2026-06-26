@@ -39,8 +39,8 @@ The design is a single columnar engine with swappable front-ends and backends
 | Layer | Concern | Realized today |
 |---|---|---|
 | L6 Query languages | promql/logql/traceql/genericql | **owned by the embedder, not the library** — the library exposes the fetch seam; `query/promql` is an optional fetch→Prometheus-Queryable *adapter* (no engine) |
-| L5 Query engine | plan IR · sharding · streaming exec · cache | **embedder's concern** (it drives its own engine over the fetch contract); our sharded planner/cache is out of scope for the library |
-| L4 **Fetch contract** | **callback matchers + window → iterator of batches** | **the library's query surface** (`query/fetch`, exposed via `Storage.Fetcher`); implemented for metrics, column conditions pending |
+| L5 Query engine | plan IR · sharding · streaming exec · cache | **embedder's concern** (it drives its own engine over the fetch contract); the planner/streaming exec is out of scope — but the part expressible purely over the fetch contract (split-by-interval + results cache) ships as `query/scale` decorators (§3g) |
+| L4 **Fetch contract** | **callback matchers + window → iterator of batches** | **the library's query surface** (`query/fetch`, exposed via `Storage.Fetcher`); implemented for metrics, with `query/scale` split + cache decorators; column conditions pending |
 | L3 **Engine** / **Index / WAL** | **head · flush · merge · retention** / **symbols · series · postings** · **write-ahead log** | **engine implemented (metrics)**; **index + wal implemented** |
 | L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
 | L1 **Backend** | file · s3 · memory behind one interface | **memory + file + s3 implemented**, with `PutIfAbsent` CAS; `bucketindex` for stateless part enumeration |
@@ -356,7 +356,32 @@ the in-memory helpers. **`Merge(fetchers...)`** is the fan-out combinator: it ru
 against several fetchers and merges their batches by series id (timestamp-ordered, later child
 wins a duplicate timestamp) — the basis for multi-tenant / cross-tenant reads (via
 `Storage.Fetcher`) and, later, cluster fan-out across replicas. A single child is a
-pass-through; child batches are cloned, never mutated.
+pass-through; child batches are cloned, never mutated. **`MergeBatches(groups...)`** is the
+batch-level form (same series-id union + timestamp dedup) for callers that already hold drained
+results from differing requests — the basis for the split-by-interval combinator below.
+
+### Fetch scale-out decorators (`query/scale/`)
+
+Query scale-out (the L5 "split + cache" a query frontend does) is the embedder's engine concern,
+but the part expressible **purely over the fetch contract** ships here as two `Fetcher → Fetcher`
+decorators, so any embedder engine composes them without the library owning a query language:
+
+- **`SplitFetcher{Inner, Interval}`** splits a `Request`'s window into sub-windows **aligned to
+  multiples of Interval**, fetches them concurrently against `Inner`, and `MergeBatches`-es the
+  results. Grid alignment (not request-relative) makes a sub-window's bounds independent of the
+  overall range, so overlapping queries share sub-windows — the property the cache below exploits.
+  A narrow window (or `Interval ≤ 0`) is a transparent pass-through, so splitting never burdens a
+  small query.
+- **`CacheFetcher{Inner, Cache}`** memoizes results of **fully-pushable** requests only — every
+  matcher must carry a serializable equality `Spec`, so the key (tenant ‖ window ‖ sorted specs)
+  is exact and a hit can never drop a matching series. A request with an opaque (non-equality)
+  matcher, or a nil cache, bypasses to `Inner`. `Cache` is an interface; `MemoryCache` is a
+  bounded-LRU implementation that stores a deep snapshot on `Put` (independent of producer buffer
+  reuse) and returns a fresh slice on `Get` (so a caller's reslicing never disturbs cached order).
+
+They nest: `SplitFetcher` over `CacheFetcher` caches each aligned sub-window independently, so a
+shifted re-query reuses the sub-windows it overlaps. Both sit above the seam — no language, no
+engine, no query-result type — keeping the library boundary at L4.
 
 ## 3h. PromQL adapter (`query/promql/`) — optional, embedder-facing
 
@@ -600,6 +625,7 @@ index/                symbols (intern) · series (id↔attrs) · postings (set-o
 wal/                  CRC-framed segmented write-ahead log + replay                    [implemented]
 engine/               head · flush · background-merge · retention · fetch (metrics)    [implemented]
 query/fetch           callback-matcher fetch contract (Request/Matcher/Iterator/Batch) [implemented for metrics; the library's query surface]
+query/scale           fetch-seam scale-out decorators: split-by-interval + results cache  [implemented]
 query/promql          OPTIONAL adapter: fetch → Prometheus storage.Queryable (no engine) [implemented; only package importing prometheus]
 cluster/              L0 distribution: ring + membership + (later) replication · rebalance [partly implemented]
   cluster/ring        rendezvous (HRW) hashing: deterministic placement, ~1/N movement  [implemented]
