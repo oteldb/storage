@@ -17,6 +17,7 @@ const (
 	recordSeries  byte = 1
 	recordSamples byte = 2
 	recordRecords byte = 3 // generic, engine-encoded record payload (logs, traces, …)
+	recordSide    byte = 4 // opaque, engine-encoded side-store delta (profiles symbol store)
 )
 
 // seriesIDLen is the fixed 16-byte big-endian width of a [signal.SeriesID] on the wire.
@@ -33,6 +34,7 @@ type Handlers struct {
 	OnSeries  func(id signal.SeriesID, s signal.Series) error
 	OnSamples func(id signal.SeriesID, ts []int64, values []float64) error
 	OnRecords func(id signal.SeriesID, payload []byte) error
+	OnSide    func(payload []byte) error
 }
 
 // Writer appends framed records to an [io.Writer] (typically a segment file). It reuses
@@ -64,6 +66,18 @@ func (wr *Writer) WriteSeries(id signal.SeriesID, s signal.Series) error {
 func (wr *Writer) WriteSamples(id signal.SeriesID, ts []int64, values []float64) error {
 	wr.payload = appendSamples(id.AppendBinary(wr.payload[:0]), ts, values)
 	wr.frame = appendFrame(wr.frame[:0], recordSamples, wr.payload)
+
+	if _, err := wr.w.Write(wr.frame); err != nil {
+		return errors.Wrap(err, "write record")
+	}
+
+	return nil
+}
+
+// WriteSide logs an opaque engine-encoded side-store delta (e.g. a profiles symbol-store delta).
+// It carries no series id — the payload is self-describing to the engine that wrote it.
+func (wr *Writer) WriteSide(payload []byte) error {
+	wr.frame = appendFrame(wr.frame[:0], recordSide, payload)
 
 	if _, err := wr.w.Write(wr.frame); err != nil {
 		return errors.Wrap(err, "write record")
@@ -142,6 +156,12 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 		}
 
 		return h.OnRecords(id, blob)
+	case recordSide:
+		if h.OnSide == nil {
+			return nil
+		}
+
+		return h.OnSide(payload)
 	default:
 		return nil // unknown record type: skip for forward compatibility
 	}

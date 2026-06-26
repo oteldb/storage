@@ -18,6 +18,10 @@ func EncodeWAL(b *Batch) []byte {
 	_ = w.WriteSeries(b.Stream, b.Identity())
 	_ = w.WriteRecords(b.Stream, encodeBatchRecs(b))
 
+	if len(b.Side) > 0 {
+		_ = w.WriteSide(b.Side)
+	}
+
 	return buf.Bytes()
 }
 

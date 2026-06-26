@@ -155,6 +155,42 @@ func TestSideStoreFlushPersistsAndResets(t *testing.T) {
 	require.Empty(t, fs.acc)
 }
 
+// TestSideStoreReplicates verifies the side delta rides the cluster write path: EncodeWAL carries
+// it, ApplyPrimary absorbs it (and forwards it), and ApplyReplicated absorbs it on a secondary — so
+// both replicas' accumulators converge.
+func TestSideStoreReplicates(t *testing.T) {
+	t.Parallel()
+
+	fsP := newFakeSide()
+	primary := recordengine.New(recordengine.Config{Schema: testSchema, SideStore: fsP})
+	fsS := newFakeSide()
+	secondary := recordengine.New(recordengine.Config{Schema: testSchema, SideStore: fsS})
+
+	b := mkBatch("api", rrec{ts: 1, body: "x"})
+	b.Side = encodeSide(map[uint64][]byte{1: []byte("a"), 2: []byte("b")})
+
+	accepted, rejected, err := primary.ApplyPrimary(recordengine.EncodeWAL(b))
+	require.NoError(t, err)
+	require.Zero(t, rejected)
+	require.NoError(t, secondary.ApplyReplicated(accepted))
+
+	want := []uint64{1, 2}
+	require.Equal(t, want, accIDs(fsP), "primary absorbed the symbols")
+	require.Equal(t, want, accIDs(fsS), "secondary absorbed the forwarded symbols")
+}
+
+// accIDs returns the sorted ids in a fakeSide accumulator.
+func accIDs(f *fakeSide) []uint64 {
+	ids := make([]uint64, 0, len(f.acc))
+	for id := range f.acc {
+		ids = append(ids, id)
+	}
+
+	slices.Sort(ids)
+
+	return ids
+}
+
 // TestSideStoreMergeUnions verifies a merge unions the sidecars of the compacted parts into the new
 // part's sidecar (content-addressed dedup, no remap).
 func TestSideStoreMergeUnions(t *testing.T) {

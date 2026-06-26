@@ -56,7 +56,9 @@ func (s *Storage) ProfileSeries(
 		return nil, errors.Wrap(ErrClosed, "profile series")
 	}
 
-	_ = ctx // enumeration is in-memory over the index; ctx is reserved for future cluster fan-out.
+	if s.cluster != nil {
+		return s.clusterProfileSeries(ctx, tenant, matchers, start, end)
+	}
 
 	eng, ok := s.lookupProfileEngine(s.normalizeTenant(tenant))
 	if !ok {
@@ -77,12 +79,19 @@ func (s *Storage) ProfileResolver(ctx context.Context, tenant signal.TenantID) (
 		return nil, errors.Wrap(ErrClosed, "profile resolver")
 	}
 
-	eng, ok := s.lookupProfileEngine(s.normalizeTenant(tenant))
-	if !ok {
+	var (
+		tables map[string][]byte
+		err    error
+	)
+
+	if s.cluster != nil {
+		tables, err = s.clusterProfileSymbols(ctx, tenant)
+	} else if eng, ok := s.lookupProfileEngine(s.normalizeTenant(tenant)); ok {
+		tables, err = eng.SideSnapshot(ctx)
+	} else {
 		return profile.NewResolver(nil)
 	}
 
-	tables, err := eng.SideSnapshot(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "load profile symbols")
 	}

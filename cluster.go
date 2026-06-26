@@ -72,6 +72,8 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	mux.Handle(primaryWritePath, s.primaryWriteHandler()) // primary: OOO apply + replicate
 	// read fan-out across metric/log/trace/profile signals.
 	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch, s.localLogFetch, s.localTraceFetch, s.localProfileFetch))
+	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(s.localProfileSeries)) // profile series enumeration
+	mux.Handle(cluster.SidePath, cluster.SideHandler(s.localProfileSymbols))    // profile symbol store
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	go func() { _ = srv.Serve(ln) }()
@@ -207,6 +209,115 @@ func (s *Storage) localProfileFetch(
 // clusterProfileFetcherFor is the profiles analog of [Storage.clusterLogFetcherFor].
 func (s *Storage) clusterProfileFetcherFor(tid signal.TenantID) fetch.Fetcher {
 	return s.clusterRecordFetcherFor(signal.Profile, tid, s.lookupProfileEngine)
+}
+
+// recordOwners reports whether this node owns the tenant and the addresses of its other owners.
+func (s *Storage) recordOwners(tid signal.TenantID) (local bool, remotes []string) {
+	cn := s.cluster
+	for _, o := range cn.membership.Ring().Lookup([]byte(s.normalizeTenant(tid)), cn.rf) {
+		addr := cn.membership.AddrOf(o.ID)
+
+		switch {
+		case addr == cn.self:
+			local = true
+		case addr != "":
+			remotes = append(remotes, addr)
+		}
+	}
+
+	return local, remotes
+}
+
+// equalitySpecs extracts the serializable (equality) matchers to push down to a peer.
+func equalitySpecs(matchers []fetch.Matcher) []fetch.EqualMatcher {
+	var eq []fetch.EqualMatcher
+	for i := range matchers {
+		if matchers[i].Spec != nil {
+			eq = append(eq, *matchers[i].Spec)
+		}
+	}
+
+	return eq
+}
+
+// localProfileSeries serves a peer's profile series listing from the local engine.
+func (s *Storage) localProfileSeries(
+	_ context.Context, tenant string, start, end int64, matchers []fetch.Matcher,
+) ([]signal.Series, error) {
+	eng, ok := s.lookupProfileEngine(s.normalizeTenant(signal.TenantID(tenant)))
+	if !ok {
+		return nil, nil
+	}
+
+	return eng.Series(matchers, start, end), nil
+}
+
+// localProfileSymbols serves a peer's profile symbol store from the local engine.
+func (s *Storage) localProfileSymbols(ctx context.Context, tenant string) (map[string][]byte, error) {
+	eng, ok := s.lookupProfileEngine(s.normalizeTenant(signal.TenantID(tenant)))
+	if !ok {
+		return map[string][]byte{}, nil
+	}
+
+	return eng.SideSnapshot(ctx)
+}
+
+// clusterProfileSeries lists a tenant's profile streams in cluster mode: locally if this node owns
+// the tenant, else from an owner (failover), re-applying the non-equality matchers to the superset.
+func (s *Storage) clusterProfileSeries(
+	ctx context.Context, tid signal.TenantID, matchers []fetch.Matcher, start, end int64,
+) ([]signal.Series, error) {
+	local, remotes := s.recordOwners(tid)
+	if local {
+		return s.localProfileSeries(ctx, string(tid), start, end, matchers)
+	}
+
+	eq := equalitySpecs(matchers)
+
+	var lastErr error
+	for _, addr := range remotes {
+		series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, signal.Profile,
+			string(s.normalizeTenant(tid)), start, end, eq)
+		if err != nil {
+			lastErr = err
+
+			continue
+		}
+
+		kept := series[:0]
+		for i := range series {
+			if matchesAllSeries(series[i], matchers) {
+				kept = append(kept, series[i])
+			}
+		}
+
+		return kept, nil
+	}
+
+	return nil, lastErr
+}
+
+// clusterProfileSymbols returns a tenant's symbol-store tables in cluster mode: locally if owned,
+// else from an owner (failover). Each owner is a complete replica (symbols ride the write path).
+func (s *Storage) clusterProfileSymbols(ctx context.Context, tid signal.TenantID) (map[string][]byte, error) {
+	local, remotes := s.recordOwners(tid)
+	if local {
+		return s.localProfileSymbols(ctx, string(tid))
+	}
+
+	var lastErr error
+	for _, addr := range remotes {
+		tables, err := cluster.FetchSide(ctx, s.cluster.httpc, addr, signal.Profile, string(s.normalizeTenant(tid)))
+		if err != nil {
+			lastErr = err
+
+			continue
+		}
+
+		return tables, nil
+	}
+
+	return map[string][]byte{}, lastErr
 }
 
 // clusterRecordFetcherFor returns a record signal's read seam for one tenant in cluster mode:

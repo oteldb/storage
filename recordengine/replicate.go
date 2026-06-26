@@ -58,6 +58,17 @@ func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err e
 
 			return w.WriteRecords(id, encodeRecs(acc))
 		},
+		OnSide: func(payload []byte) error {
+			// Absorb the symbol delta locally and forward it to the secondaries (content-addressed,
+			// so re-absorbing on every replica is an idempotent dedup).
+			if e.cfg.SideStore != nil {
+				if aerr := e.cfg.SideStore.Absorb(payload); aerr != nil {
+					return aerr
+				}
+			}
+
+			return w.WriteSide(payload)
+		},
 	})
 
 	return buf.Bytes(), rejected, err
@@ -85,6 +96,13 @@ func (e *Engine) ApplyReplicated(data []byte) error {
 			e.head.replayRecords(id, recs)
 
 			return nil
+		},
+		OnSide: func(payload []byte) error {
+			if e.cfg.SideStore == nil {
+				return nil
+			}
+
+			return e.cfg.SideStore.Absorb(payload)
 		},
 	})
 }

@@ -23,6 +23,7 @@ import (
 	"github.com/oteldb/storage/cluster/etcd"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/signal/profile"
 )
 
 func freeAddr(t *testing.T) string {
@@ -321,9 +322,9 @@ func TestClusteredTracesReplicateAndRead(t *testing.T) {
 }
 
 // TestClusteredProfilesReplicateAndRead is the profiles analog of the clustered capstone: samples
-// written to one node are routed to the tenant's primary and replicated to both owners, and a
-// sample search on the third (non-owner) node fans out to an owner and returns the samples — the
-// returned content ids are global, so fan-out needs no symbol store.
+// AND the symbol store written to one node are routed to the tenant's primary and replicated to
+// both owners, so every node — including the third (non-owner), via fan-out — serves a sample
+// search, the series enumeration, and the symbol resolution.
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredProfilesReplicateAndRead(t *testing.T) {
@@ -341,13 +342,15 @@ func TestClusteredProfilesReplicateAndRead(t *testing.T) {
 		return len(a.cluster.membership.Members()) == 3
 	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
 
+	// profileBatch stacks main→work; this lets us check resolution end to end.
 	_, err := a.WriteProfiles(ctx, profileBatch("api", 1000,
 		sampleSpec{"cpu", "nanoseconds", 50},
 		sampleSpec{"cpu", "nanoseconds", 70},
 	))
 	require.NoError(t, err)
 
-	// Every node serves the samples — owners locally, the non-owner via fan-out.
+	// Every node serves the samples, the enumeration, and the resolution — owners locally, the
+	// non-owner via fan-out.
 	for name, s := range nodes {
 		got, err := fetch.Drain(ctx, must(s.ProfileFetcher("default").Fetch(ctx, fetch.Request{
 			Signal: signal.Profile, Start: 0, End: 1 << 60,
@@ -356,6 +359,24 @@ func TestClusteredProfilesReplicateAndRead(t *testing.T) {
 		require.NoErrorf(t, err, "%s profile search", name)
 		require.Lenf(t, got, 1, "%s serves the replicated stream", name)
 		assert.ElementsMatchf(t, []int64{50, 70}, profValues(got[0]), "%s returns the samples", name)
+
+		// Enumeration fan-out: the matching stream is listed with its type label.
+		series, err := s.ProfileSeries(ctx, "default", []fetch.Matcher{nameMatcherSvc("api")}, 0, 0)
+		require.NoErrorf(t, err, "%s profile series", name)
+		require.Lenf(t, series, 1, "%s enumerates the stream", name)
+		st, _ := series[0].Resource.Attributes.Get(profile.LabelSampleType)
+		assert.Equalf(t, "cpu", string(st.Str()), "%s type label", name)
+
+		// Resolution fan-out: the replicated symbol store resolves the sample's stack to its frames.
+		resolver, err := s.ProfileResolver(ctx, "default")
+		require.NoErrorf(t, err, "%s profile resolver", name)
+		stacks, _ := got[0].Column(profile.ColStackID)
+		frames := resolver.Resolve(stacks.Bytes[0])
+		names := make([]string, 0, len(frames))
+		for _, f := range frames {
+			names = append(names, f.Function)
+		}
+		assert.ElementsMatchf(t, []string{"work", "main"}, names, "%s resolves the stack", name)
 	}
 }
 
