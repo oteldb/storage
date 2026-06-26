@@ -38,9 +38,11 @@ type ScopeMetrics struct {
 }
 
 // Metric is a single metric stream: its name, unit, kind, the sum-only temporality and
-// monotonicity, and its number data points. Only gauge and sum number points are modeled
-// (the metrics-first vertical); histogram/exp-histogram/summary are added with their
-// support.
+// monotonicity, and its number data points. The model carries only gauge and sum number points;
+// histogram, exponential-histogram, and summary points are stored by **classic decomposition**
+// into ordinary `_count`/`_sum`/`_bucket{le}`/`{quantile}` gauge/sum series (done in the
+// otlp/pdataconv bridge, or by a direct embedder), so they reuse this same model with no
+// histogram-specific fields.
 type Metric struct {
 	Name        []byte
 	Unit        []byte

@@ -67,13 +67,13 @@ func TestAppendMetricsGaugeAndSum(t *testing.T) {
 	assert.InDelta(t, 42.0, smt.Points[0].Value, 0, "int widened to float")
 }
 
-func TestAppendMetricsDropsUnsupportedAndValueless(t *testing.T) {
+func TestAppendMetricsDropsOnlyValueless(t *testing.T) {
 	t.Parallel()
 
 	md := pmetric.NewMetrics()
 	sm := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
 
-	// A histogram (unsupported) with 2 points.
+	// A histogram with 2 (empty) points: each decomposes to a `_count` series — not dropped.
 	h := sm.Metrics().AppendEmpty()
 	h.SetName("h")
 	hp := h.SetEmptyHistogram()
@@ -89,11 +89,11 @@ func TestAppendMetricsDropsUnsupportedAndValueless(t *testing.T) {
 
 	var out metric.Metrics
 	dropped := AppendMetrics(&out, md)
-	assert.Equal(t, 3, dropped, "2 histogram points + 1 value-less gauge point")
+	assert.Equal(t, 1, dropped, "only the value-less gauge point is dropped")
 
-	// Only the valid gauge point survives projection.
+	// The two histogram _count series plus the valid gauge survive projection.
 	accepted := metric.Project(out, func(*metric.Batch) {})
-	assert.Equal(t, 1, accepted)
+	assert.Equal(t, 3, accepted)
 }
 
 func TestConvertTypedAttributes(t *testing.T) {

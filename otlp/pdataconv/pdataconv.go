@@ -19,10 +19,11 @@ import (
 )
 
 // AppendMetrics converts an OTLP metrics batch into dst, reusing dst's retained capacity
-// (call [metric.Metrics.Reset] or use [metric.GetMetrics] for a recycled batch). Only
-// gauge and sum number points are representable today; histogram, exponential-histogram,
-// and summary points, plus value-less number points, are skipped and counted in dropped so
-// the caller can fold them into an OTLP partial-success response.
+// (call [metric.Metrics.Reset] or use [metric.GetMetrics] for a recycled batch). Gauge and sum
+// number points convert directly; histogram, exponential-histogram, and summary points are stored
+// by **classic decomposition** into `_count`/`_sum`/`_bucket{le}`/`{quantile}` float series (see
+// histogram.go), so they need no engine support. Only value-less number points are skipped and
+// counted in dropped so the caller can fold them into an OTLP partial-success response.
 func AppendMetrics(dst *metric.Metrics, md pmetric.Metrics) (dropped int) {
 	rms := md.ResourceMetrics()
 	for i := range rms.Len() {
@@ -75,6 +76,18 @@ func appendMetric(sm *metric.ScopeMetrics, m pmetric.Metric) (dropped int) {
 		mt.Monotonic = sum.IsMonotonic()
 
 		return appendNumbers(mt, sum.DataPoints())
+	case pmetric.MetricTypeHistogram:
+		appendHistogram(sm, m)
+
+		return 0
+	case pmetric.MetricTypeExponentialHistogram:
+		appendExpHistogram(sm, m)
+
+		return 0
+	case pmetric.MetricTypeSummary:
+		appendSummary(sm, m)
+
+		return 0
 	default:
 		return unsupportedPointCount(m)
 	}

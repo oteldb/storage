@@ -317,12 +317,20 @@ merged-slice allocations the naïve path paid (≈7 allocs/point) collapse to no
 
 **pdata is confined to one optional adapter.** `otlp/pdataconv` converts the collector
 `pmetric.Metrics` into `metric.Metrics` (`AppendMetrics`, holding the `pcommon` →
-`signal.Value` conversion). It filters and **counts** the points the internal model does not
-yet represent — Histogram / ExpHistogram / Summary, and value-less number points — returning
-`dropped` so the caller folds them into an OTLP partial-success. It is the only package that
-imports `go.opentelemetry.io/collector/pdata`; the conversion necessarily allocates (pdata
-stores keys/values as Go strings), which is why it sits off the hot path and embedders that
-own their OTLP decoder build `metric.Metrics` directly.
+`signal.Value` conversion). Gauge and Sum points convert directly; **Histogram,
+ExponentialHistogram, and Summary points are stored by classic decomposition** (`histogram.go`):
+each point explodes into ordinary float series the columnar engine already handles —
+`<name>_count`, `<name>_sum`, and **cumulative** `<name>_bucket{le=…}` for histograms (the
+Prometheus convention, so an embedder's `histogram_quantile` works directly), and
+`_count`/`_sum`/`<name>{quantile=…}` for summaries. An exponential histogram is first converted to
+explicit `le` buckets from its scale (`base = 2^(2^-scale)`, negative/zero/positive buckets folded
+into ascending cumulative `le` bounds), then decomposed the same way — so all three types reuse the
+engine, merge, downsample, sampling, and fetch paths with **no histogram-specific storage code**.
+Only value-less number points are still **counted** in `dropped` (folded into an OTLP
+partial-success). It is the only package that imports `go.opentelemetry.io/collector/pdata`; the
+conversion necessarily allocates (pdata stores keys/values as Go strings, and decomposition fans
+out a point into many series), which is why it sits off the hot path — embedders that own their
+OTLP decoder build `metric.Metrics` directly (and, for histograms, decompose themselves).
 
 ## 3f. Engine (`engine/`) — the single-node metrics vertical
 
@@ -870,11 +878,11 @@ encoding/             umbrella doc for the codec layers
   encoding/compress   zstd/none block wrapper (lz4 stub)                              [implemented]
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
 signal/               typed Attributes/Value, Resource/Scope/Series identity, 128-bit SeriesID, Signal, TenantID, Aggregation [implemented]
-  signal/metric       []byte-based OTLP-shaped Metrics ingest batch (resettable/pooled) + identity + projection (gauge/sum) [implemented; histogram/summary deferred]
+  signal/metric       []byte-based OTLP-shaped Metrics ingest batch (resettable/pooled) + identity + projection (gauge/sum; histogram/exp-histogram/summary via classic decomposition in otlp/pdataconv) [implemented]
   signal/log          []byte-based OTLP-shaped Logs ingest batch (resettable/pooled) + stream identity + projection [implemented]
   signal/trace        []byte-based OTLP-shaped Traces ingest batch (resettable/pooled) + span schema + projection (nested-set, events/links) [implemented]
   signal/profile      []byte-based OTLP-shaped Profiles ingest batch + sample schema (type folded into identity) + projection + content-addressed symbol store (SideStore) + stack Resolver [implemented]
-otlp/pdataconv        optional OTel-Go bridge: pmetric.Metrics → metric.Metrics (only package importing pdata) [implemented for metrics]
+otlp/pdataconv        optional OTel-Go bridge: pmetric.Metrics → metric.Metrics; gauge/sum direct + histogram/exp-histogram/summary classic decomposition (only package importing pdata) [implemented]
 tenant/               Limits/Retention/Downsample/Sampling/Policy, Resolver             [implemented]
 backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + memory (root) [implemented]
   backend/file        directory-tree backend; atomic write + exclusive PutIfAbsent (os.Link) [implemented]
