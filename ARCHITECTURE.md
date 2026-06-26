@@ -506,8 +506,10 @@ change as a pure function of the old and new rings: `Plan(shards, prev, next, rf
 shard whose owner set changed, the IDs added and removed. Because the data is in the shared
 object store, a reassignment is an **ownership handoff** (the gainer starts serving the shard's
 parts from S3 via the bucket index; the loser stops), not a copy — and HRW guarantees only the
-~1/N shards that actually moved appear, each one-in/one-out. Executing the plan (an
-etcd-coordinated handoff so exactly one node compacts a shard at a time) is a remaining piece.
+~1/N shards that actually moved appear, each one-in/one-out. The etcd-coordinated handoff that
+makes exactly one node compact a shard at a time **is** built (the compaction-claim executor,
+§3j), but it reconciles ownership **directly from the ring** — so `Plan` is a pure diff that the
+executor does **not** yet consume; the minimal-move diff is currently informational only.
 
 **The cluster write path is primary-authoritative.** A write is framed as `EncodeWrite`
 (tenant ‖ WAL-encoded series+samples) and routed to the tenant's **ring-primary** — the single
@@ -540,10 +542,11 @@ the RPC carries only the tenant + window — a peer returns its whole window (a 
 contract permits) and the requesting node **re-applies the matchers** (their closures live
 there). A three-node, RF=2 end-to-end test confirms a query on a non-owner returns the data.
 
-**Rebalance executor** (`cluster/etcd/ownership.go`): the `Plan` is the diff; the executor
-enacts the handoff via **exclusive compaction claims**. `Ownership.Acquire` is an etcd CAS
-(create-if-absent) bound to the node's membership lease; `Reconcile(ring, shards)` acquires
-every shard the node is the ring-primary of and releases the rest, returning the owned set. In
+**Rebalance executor** (`cluster/etcd/ownership.go`): the handoff is enacted via **exclusive
+compaction claims derived directly from the ring** — `Reconcile` does **not** consume
+`rebalance.Plan` (that minimal-move diff is built but currently unwired; §3i). `Ownership.Acquire`
+is an etcd CAS (create-if-absent) bound to the node's membership lease; `Reconcile(ring, shards)`
+acquires every shard the node is the ring-primary of and releases the rest, returning the owned set. In
 cluster mode the maintenance loop flushes/merges **only owned tenants**, so a tenant's parts are
 written to the shared object store by exactly one node — even during ring-disagreement windows,
 the claim arbitrates. A departed node's claims auto-free with its lease and the new primary
