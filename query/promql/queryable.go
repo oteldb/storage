@@ -217,6 +217,7 @@ type chunkSample struct {
 }
 
 func (s chunkSample) T() int64                    { return s.t }
+func (chunkSample) ST() int64                     { return 0 } // no created/start timestamp for float-only samples
 func (s chunkSample) F() float64                  { return s.v }
 func (chunkSample) H() *histogram.Histogram       { return nil }
 func (chunkSample) FH() *histogram.FloatHistogram { return nil }
