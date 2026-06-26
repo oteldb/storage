@@ -62,10 +62,14 @@ type Options struct {
 
 	// QueryCacheEntries, when > 0, gives [Storage.Fetcher] a shared bounded-LRU results
 	// cache of this many entries. Only fully-pushable (serializable-equality) requests over
-	// an explicit tenant set are cached; the cache does not auto-invalidate, so it suits
-	// historical windows (an embedder should avoid caching the open/recent window). Zero ⇒
-	// no cache.
+	// an explicit tenant set are cached. Zero ⇒ no cache.
 	QueryCacheEntries int
+
+	// QueryCacheFreshness is the recent-window guard for the results cache, in nanoseconds: a
+	// query whose window ends within this of now is not cached (new samples may still land in
+	// it), so only settled/historical windows are memoized. 0 ⇒ no guard (cache every eligible
+	// request). Ignored when QueryCacheEntries is 0.
+	QueryCacheFreshness int64 // nanoseconds
 }
 
 // Durability is the WAL + flush policy (DESIGN.md §5, §8).
@@ -128,6 +132,13 @@ func WithQuerySplitInterval(ns int64) Option {
 // over an explicit tenant set are cached, and entries do not auto-invalidate.
 func WithQueryCache(maxEntries int) Option {
 	return func(o *Options) { o.QueryCacheEntries = maxEntries }
+}
+
+// WithQueryCacheFreshness sets the results-cache recent-window guard in nanoseconds: a query whose
+// window ends within ns of now is not cached, so only settled windows are memoized. ns ≤ 0
+// disables the guard. Has effect only with the cache enabled (see [WithQueryCache]).
+func WithQueryCacheFreshness(ns int64) Option {
+	return func(o *Options) { o.QueryCacheFreshness = ns }
 }
 
 // ErrClosed is returned by [Storage] methods after [Storage.Close].

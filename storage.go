@@ -293,7 +293,8 @@ func (s *Storage) baseFetcher(tenants []signal.TenantID) fetch.Fetcher {
 // enabled) wraps the outside, so each aligned sub-window is cached independently.
 func (s *Storage) scaleWrap(f fetch.Fetcher, tenants []signal.TenantID) fetch.Fetcher {
 	if s.queryCache != nil && len(tenants) > 0 {
-		f = scopedFetcher{inner: scale.CacheFetcher{Inner: f, Cache: s.queryCache}, scope: s.tenantScope(tenants)}
+		cached := scale.CacheFetcher{Inner: f, Cache: s.queryCache, Freshness: s.opts.QueryCacheFreshness}
+		f = scopedFetcher{inner: cached, scope: s.tenantScope(tenants)}
 	}
 
 	if s.opts.QuerySplitInterval > 0 {

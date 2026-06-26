@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/oteldb/storage/query/fetch"
 )
@@ -28,9 +29,23 @@ type Cache interface {
 // when every matcher carries a serializable equality [fetch.EqualMatcher] spec, so the cache key
 // is exact and a hit can never drop a matching series. Requests with a non-equality matcher
 // (an opaque predicate that cannot be keyed) bypass the cache and hit Inner directly.
+//
+// The results cache does not auto-invalidate, so a request touching the **recent** window — where
+// new samples may still arrive — must not be cached. The Freshness guard enforces that: a request
+// whose window ends within Freshness of now bypasses the cache. Composed under a [SplitFetcher],
+// this caches the settled sub-windows and always re-fetches the most recent one (the standard
+// query-frontend behavior).
 type CacheFetcher struct {
 	Inner fetch.Fetcher
 	Cache Cache
+
+	// Freshness is the recent-window guard in nanoseconds: a request whose End is within
+	// Freshness of now is not cached. 0 ⇒ no guard (every cacheable request is cached).
+	Freshness int64
+
+	// Now returns the current time as unix nanoseconds, for the Freshness guard. nil ⇒
+	// [time.Now]. Tests inject a fixed clock.
+	Now func() int64
 }
 
 var _ fetch.Fetcher = CacheFetcher{}
@@ -39,7 +54,7 @@ var _ fetch.Fetcher = CacheFetcher{}
 // the result. A non-cacheable request (or a nil Cache) is a transparent pass-through to Inner.
 func (f CacheFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
 	key, ok := cacheKey(r)
-	if !ok || f.Cache == nil {
+	if !ok || f.Cache == nil || !f.settled(r) {
 		return f.Inner.Fetch(ctx, r)
 	}
 
@@ -66,6 +81,25 @@ func (f CacheFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterato
 	f.Cache.Put(key, batches)
 
 	return fetch.NewSliceIterator(batches), nil
+}
+
+// settled reports whether r's window has aged past the Freshness horizon — i.e. its End is old
+// enough that no new sample will land in it, so the result is safe to cache. With Freshness ≤ 0
+// the guard is off and every (otherwise cacheable) request is settled.
+func (f CacheFetcher) settled(r fetch.Request) bool {
+	if f.Freshness <= 0 {
+		return true
+	}
+
+	return r.End <= f.now()-f.Freshness
+}
+
+func (f CacheFetcher) now() int64 {
+	if f.Now != nil {
+		return f.Now()
+	}
+
+	return time.Now().UnixNano()
 }
 
 // cacheKey builds a deterministic key for r, reporting false when the request is not cacheable

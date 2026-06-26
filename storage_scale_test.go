@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -107,6 +108,45 @@ func TestFacadeQueryCacheScopedByTenant(t *testing.T) {
 	b := fetchTimestamps(t, s.Fetcher("team-b"), 0, 1000, m)
 	assert.Equal(t, []int64{100}, a, "team-a's own data")
 	assert.Equal(t, []int64{100, 200}, b, "team-b is not served team-a's cached result")
+}
+
+func TestFacadeQueryCacheFreshnessGuard(t *testing.T) {
+	t.Parallel()
+
+	// With a freshness guard, a settled (old) window is cached but a window touching the recent
+	// horizon is always re-fetched, so newly-ingested samples are never served stale.
+	hour := int64(time.Hour)
+	now := time.Now().UnixNano()
+
+	s, err := InMemory(WithQueryCache(16), WithQueryCacheFreshness(hour))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	_, err = s.WriteMetrics(context.Background(), gaugeBatch("api", "http.requests", []int64{now - 2*hour}, []float64{1}))
+	require.NoError(t, err)
+
+	m := cacheableNameMatcher("http.requests")
+
+	// Settled window [0, now-hour]: cached on first query, so a later in-window write is not seen.
+	settledEnd := now - hour
+	s1 := fetchTimestamps(t, s.Fetcher("default"), 0, settledEnd, m)
+	require.Len(t, s1, 1)
+
+	_, err = s.WriteMetrics(context.Background(), gaugeBatch("api", "http.requests", []int64{now - 90*int64(time.Minute)}, []float64{2}))
+	require.NoError(t, err)
+
+	s2 := fetchTimestamps(t, s.Fetcher("default"), 0, settledEnd, m)
+	assert.Len(t, s2, 1, "settled window served from cache (the in-window write is not seen)")
+
+	// Recent window [0, now]: ends inside the freshness horizon, so it bypasses the cache and
+	// always reflects fresh data — even across an intervening write.
+	r1 := fetchTimestamps(t, s.Fetcher("default"), 0, now, m)
+
+	_, err = s.WriteMetrics(context.Background(), gaugeBatch("api", "http.requests", []int64{now - 30*int64(time.Minute)}, []float64{3}))
+	require.NoError(t, err)
+
+	r2 := fetchTimestamps(t, s.Fetcher("default"), 0, now, m)
+	assert.Greater(t, len(r2), len(r1), "recent window bypasses the cache and sees the new sample")
 }
 
 func TestFacadeSplitAndCacheCompose(t *testing.T) {

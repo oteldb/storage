@@ -378,16 +378,21 @@ decorators, so any embedder engine composes them without the library owning a qu
   overall range, so overlapping queries share sub-windows — the property the cache below exploits.
   A narrow window (or `Interval ≤ 0`) is a transparent pass-through, so splitting never burdens a
   small query.
-- **`CacheFetcher{Inner, Cache}`** memoizes results of **fully-pushable** requests only — every
-  matcher must carry a serializable equality `Spec`, so the key (tenant ‖ window ‖ sorted specs)
-  is exact and a hit can never drop a matching series. A request with an opaque (non-equality)
-  matcher, or a nil cache, bypasses to `Inner`. `Cache` is an interface; `MemoryCache` is a
-  bounded-LRU implementation that stores a deep snapshot on `Put` (independent of producer buffer
-  reuse) and returns a fresh slice on `Get` (so a caller's reslicing never disturbs cached order).
+- **`CacheFetcher{Inner, Cache, Freshness, Now}`** memoizes results of **fully-pushable** requests
+  only — every matcher must carry a serializable equality `Spec`, so the key (tenant ‖ window ‖
+  sorted specs) is exact and a hit can never drop a matching series. A request with an opaque
+  (non-equality) matcher, or a nil cache, bypasses to `Inner`. The cache does not auto-invalidate,
+  so a **`Freshness`** guard keeps the recent window uncached: a request whose `End` is within
+  `Freshness` of now (`Now`, injectable for tests; defaults to `time.Now`) bypasses to `Inner`.
+  `Cache` is an interface; `MemoryCache` is a bounded-LRU implementation that stores a deep
+  snapshot on `Put` (independent of producer buffer reuse) and returns a fresh slice on `Get` (so a
+  caller's reslicing never disturbs cached order).
 
 They nest: `SplitFetcher` over `CacheFetcher` caches each aligned sub-window independently, so a
-shifted re-query reuses the sub-windows it overlaps. Both sit above the seam — no language, no
-engine, no query-result type — keeping the library boundary at L4.
+shifted re-query reuses the sub-windows it overlaps — and with `Freshness` set, the settled
+sub-windows cache while the most recent one is always re-fetched (the standard query-frontend
+behavior). Both sit above the seam — no language, no engine, no query-result type — keeping the
+library boundary at L4.
 
 ## 3h. PromQL adapter (`query/promql/`) — optional, embedder-facing
 
@@ -555,12 +560,13 @@ ingest batches (`metric.Metrics`, and placeholder `log.Logs`/`trace.Traces`/
   `Fetcher` wraps the result with the `query/scale` split / cache decorators (§3g): the cache is
   shared and **scoped by tenant set** (a `scopedFetcher` stamps the sorted tenant ids onto the
   request so cache keys never collide across scopes), so only explicit-tenant queries are cached
-  — a no-arg cross-tenant query is never cached (its membership is dynamic).
+  — a no-arg cross-tenant query is never cached (its membership is dynamic). `WithQueryCacheFreshness`
+  keeps the recent window uncached so freshly-ingested samples are never served stale.
 - **`Options` / `Option`** (`options.go`) — config struct plus functional options
   (`WithBackend`, `WithCluster`, `WithTenancy`, `WithEncoding`, `WithDurability`,
   `WithWALDir`, `WithFlushThresholdBytes`, `WithFlushInterval`, `WithOOOWindow`,
-  `WithQuerySplitInterval`, `WithQueryCache`). `Durability` selects the durability mode; an
-  ephemeral backend with no explicit choice defaults to the in-memory engine.
+  `WithQuerySplitInterval`, `WithQueryCache`, `WithQueryCacheFreshness`). `Durability` selects the
+  durability mode; an ephemeral backend with no explicit choice defaults to the in-memory engine.
 - **`Query` / `Lang` / `Result` / `Accepted`** — the query request (language selected by
   `Lang`), its result, and the ingest acknowledgement type.
 

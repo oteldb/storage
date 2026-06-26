@@ -177,6 +177,40 @@ func TestCacheNilCacheAndErrorPassThrough(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestCacheFreshnessGuardSkipsRecentWindow(t *testing.T) {
+	t.Parallel()
+
+	const now = int64(10_000)
+
+	inner := &countingFetcher{batches: []*fetch.Batch{sample(1, 10, 1)}}
+	cf := scale.CacheFetcher{
+		Inner:     inner,
+		Cache:     scale.NewMemoryCache(8),
+		Freshness: 1000,
+		Now:       func() int64 { return now },
+	}
+
+	m := []fetch.Matcher{eqMatcher("__name__", "cpu")}
+
+	// A settled window (End well before now-Freshness=9000) is cached: the second call is a hit.
+	settled := fetch.Request{Tenant: "t1", Start: 0, End: 5000, Matchers: m}
+	_ = drainFetch(t, cf, settled)
+	_ = drainFetch(t, cf, settled)
+	assert.Equal(t, int64(1), inner.calls.Load(), "settled window is cached")
+
+	// A window ending inside the freshness horizon (End=9500 > 9000) always bypasses the cache.
+	recent := fetch.Request{Tenant: "t1", Start: 0, End: 9500, Matchers: m}
+	_ = drainFetch(t, cf, recent)
+	_ = drainFetch(t, cf, recent)
+	assert.Equal(t, int64(3), inner.calls.Load(), "recent window is re-fetched every time")
+
+	// Exactly on the horizon (End == now-Freshness) is settled and cacheable.
+	boundary := fetch.Request{Tenant: "t1", Start: 0, End: now - 1000, Matchers: m}
+	_ = drainFetch(t, cf, boundary)
+	_ = drainFetch(t, cf, boundary)
+	assert.Equal(t, int64(4), inner.calls.Load(), "the boundary window is cached")
+}
+
 func TestSplitOverCacheCachesEachSubWindow(t *testing.T) {
 	t.Parallel()
 
