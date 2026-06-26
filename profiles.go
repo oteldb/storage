@@ -43,6 +43,29 @@ func (s *Storage) ProfileFetcher(tenants ...signal.TenantID) fetch.Fetcher {
 	return s.recordFetcher(tenants, s.profileEngineSnapshot, s.lookupProfileEngine, s.clusterProfileFetcherFor)
 }
 
+// ProfileSeries returns the identities of a tenant's profile streams matching the label matchers
+// within [start, end] (zero start AND end disables the time filter). It is the enumeration primitive
+// an embedder uses to build the Pyroscope-style ProfileTypes / LabelNames / LabelValues responses:
+// the profile type is carried in each series' reserved `otel.profile.*` labels (see `signal/profile`),
+// and the user labels are the resource/scope attributes. Local to this node — cluster fan-out for
+// enumeration is not yet wired (the sample read path already fans out).
+func (s *Storage) ProfileSeries(
+	ctx context.Context, tenant signal.TenantID, matchers []fetch.Matcher, start, end int64,
+) ([]signal.Series, error) {
+	if s.closed.Load() {
+		return nil, errors.Wrap(ErrClosed, "profile series")
+	}
+
+	_ = ctx // enumeration is in-memory over the index; ctx is reserved for future cluster fan-out.
+
+	eng, ok := s.lookupProfileEngine(s.normalizeTenant(tenant))
+	if !ok {
+		return nil, nil
+	}
+
+	return eng.Series(matchers, start, end), nil
+}
+
 // profileEngineFor returns the profiles engine for a tenant, creating it on first use. The engine
 // carries a [profile.SymbolStore] side store, so flush/merge persist and union the symbol tables.
 func (s *Storage) profileEngineFor(tid signal.TenantID) *recordengine.Engine {

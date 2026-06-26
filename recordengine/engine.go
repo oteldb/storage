@@ -174,6 +174,39 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	return fetch.NewSliceIterator(batches), nil
 }
 
+// Series returns the identities of the streams matching matchers that hold at least one record in
+// [start, end] — the enumeration primitive behind profile-type / label listing. A zero start AND
+// end disables the time filter (return every matching stream). The time filter is part-overlap
+// granular (a returned stream is guaranteed to match the matchers; its in-window records are a
+// superset check). Safe for concurrent use.
+func (e *Engine) Series(matchers []fetch.Matcher, start, end int64) []signal.Series {
+	e.mu.RLock()
+	for !e.head.indexSorted() {
+		e.mu.RUnlock()
+		e.mu.Lock()
+		e.head.ensureIndexSorted()
+		e.mu.Unlock()
+		e.mu.RLock()
+	}
+
+	defer e.mu.RUnlock()
+
+	ids := e.head.resolve(matchers)
+
+	out := make([]signal.Series, 0, len(ids))
+	for _, id := range ids {
+		if !e.streamInRangeLocked(id, start, end) {
+			continue
+		}
+
+		if s, ok := e.head.series.Get(id); ok {
+			out = append(out, s)
+		}
+	}
+
+	return out
+}
+
 // appendWindowRows appends rows of cols in [rng.start, rng.end) whose timestamp is in [start, end]
 // to acc, bulk-appending the whole range when it falls entirely in the window.
 func appendWindowRows(acc, cols *recordCols, rng rowRange, start, end int64) {
@@ -282,6 +315,30 @@ func (e *Engine) HeadRecordCount() int {
 	}
 
 	return n
+}
+
+// streamInRangeLocked reports whether stream id has any record in [start, end] (head ∪ parts). A
+// zero start AND end disables the filter. Caller holds the lock.
+func (e *Engine) streamInRangeLocked(id signal.SeriesID, start, end int64) bool {
+	if start == 0 && end == 0 {
+		return true
+	}
+
+	if buf := e.head.records[id]; buf != nil {
+		for _, t := range buf.ts {
+			if t >= start && t <= end {
+				return true
+			}
+		}
+	}
+
+	for _, p := range e.parts {
+		if rng, ok := p.ranges[id]; ok && rng.start < rng.end && p.maxTime >= start && p.minTime <= end {
+			return true
+		}
+	}
+
+	return false
 }
 
 // accumulate gathers each requested stream's in-window records (head ∪ live parts) into a

@@ -105,6 +105,59 @@ func labelMatcher(name []byte, want string) fetch.Matcher {
 	return fetch.Matcher{Name: name, Match: func(v signal.Value) bool { return bytes.Equal(v.Str(), w) }}
 }
 
+// TestFacadeProfileSeriesEnumeration proves the enumeration primitive serves the Querier's
+// ProfileTypes / LabelNames / LabelValues: an embedder derives all three from the returned series'
+// reserved type labels and resource labels.
+func TestFacadeProfileSeriesEnumeration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	s, err := InMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close(ctx) })
+
+	_, err = s.WriteProfiles(ctx, profileBatch("api", 1000,
+		sampleSpec{"cpu", "nanoseconds", 1}, sampleSpec{"heap", "bytes", 1}))
+	require.NoError(t, err)
+	_, err = s.WriteProfiles(ctx, profileBatch("web", 1000, sampleSpec{"cpu", "nanoseconds", 1}))
+	require.NoError(t, err)
+
+	all, err := s.ProfileSeries(ctx, "default", nil, 0, 0)
+	require.NoError(t, err)
+	require.Len(t, all, 3, "api/cpu, api/heap, web/cpu")
+
+	// ProfileTypes: distinct (sample_type, sample_unit) tuples across the streams.
+	types := map[string]bool{}
+	for _, ser := range all {
+		st, _ := ser.Resource.Attributes.Get(profile.LabelSampleType)
+		su, _ := ser.Resource.Attributes.Get(profile.LabelSampleUnit)
+		types[string(st.Str())+"/"+string(su.Str())] = true
+	}
+	assert.Equal(t, map[string]bool{"cpu/nanoseconds": true, "heap/bytes": true}, types)
+
+	// LabelValues("service.name"): distinct service values.
+	svcs := map[string]bool{}
+	for _, ser := range all {
+		v, _ := ser.Resource.Attributes.Get([]byte("service.name"))
+		svcs[string(v.Str())] = true
+	}
+	assert.Equal(t, map[string]bool{"api": true, "web": true}, svcs)
+
+	// Matcher + type matcher narrows to one stream.
+	got, err := s.ProfileSeries(ctx, "default",
+		[]fetch.Matcher{nameMatcherSvc("api"), labelMatcher(profile.LabelSampleType, "heap")}, 0, 0)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+
+	// Time filter: a window before the data returns nothing; a covering window returns all.
+	none, err := s.ProfileSeries(ctx, "default", nil, 0, 500)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+	covering, err := s.ProfileSeries(ctx, "default", nil, 0, 5000)
+	require.NoError(t, err)
+	assert.Len(t, covering, 3)
+}
+
 func TestFacadeProfilesCoexistWithOtherSignals(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
