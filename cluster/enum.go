@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -132,7 +133,7 @@ func SeriesHandler(fn SeriesFunc) http.Handler {
 			return
 		}
 
-		series, err := fn(req.Context(), tenant, start, end, matchers)
+		series, err := fn(obs.ExtractHTTP(req.Context(), req.Header), tenant, start, end, matchers)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 
@@ -153,7 +154,7 @@ func SideHandler(fn SideFunc) http.Handler {
 			return
 		}
 
-		tables, err := fn(req.Context(), tenant)
+		tables, err := fn(obs.ExtractHTTP(req.Context(), req.Header), tenant)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 
@@ -222,6 +223,8 @@ func postEnum(ctx context.Context, client *http.Client, addr, path string, paylo
 	if err != nil {
 		return nil, errors.Wrap(err, "build request")
 	}
+
+	obs.InjectHTTP(ctx, req.Header) // carry the trace into the enumeration/resolution RPC
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -404,7 +405,9 @@ func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc) http.Handler {
 			fn, encode = profileFn, EncodeLogBatches
 		}
 
-		batches, err := fn(req.Context(), tenant, start, end, matchers)
+		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace (peer fetch spans nest)
+
+		batches, err := fn(ctx, tenant, start, end, matchers)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 
@@ -451,6 +454,8 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Itera
 	if err != nil {
 		return nil, errors.Wrap(err, "build request")
 	}
+
+	obs.InjectHTTP(ctx, req.Header) // carry the trace into the read fan-out
 
 	resp, err := f.client.Do(req)
 	if err != nil {

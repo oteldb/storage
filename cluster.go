@@ -18,6 +18,7 @@ import (
 	"github.com/oteldb/storage/cluster/etcd"
 	"github.com/oteldb/storage/cluster/replica"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
@@ -731,7 +732,9 @@ func (s *Storage) primaryWriteHandler() http.Handler {
 			return
 		}
 
-		rejected, err := s.primaryWrite(req.Context(), sig, tenant, walBytes)
+		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace
+
+		rejected, err := s.primaryWrite(ctx, sig, tenant, walBytes)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 
@@ -749,6 +752,8 @@ func (s *Storage) sendPrimaryWrite(ctx context.Context, addr string, payload []b
 	if err != nil {
 		return 0, errors.Wrap(err, "build primary-write request")
 	}
+
+	obs.InjectHTTP(ctx, req.Header) // carry the trace into the primary-write RPC
 
 	resp, err := s.cluster.httpc.Do(req)
 	if err != nil {

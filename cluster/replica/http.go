@@ -7,6 +7,8 @@ import (
 	"net/http"
 
 	"github.com/go-faster/errors"
+
+	"github.com/oteldb/storage/internal/obs"
 )
 
 // ReplicatePath is the HTTP path the replication server serves and the transport posts to.
@@ -37,6 +39,7 @@ func (t *httpTransport) Send(ctx context.Context, addr string, payload []byte) e
 	}
 
 	req.Header.Set("Content-Type", "application/octet-stream")
+	obs.InjectHTTP(ctx, req.Header) // carry the trace into the replication RPC
 
 	resp, err := t.client.Do(req)
 	if err != nil {
@@ -73,7 +76,8 @@ func (r *Replicator) Handler() http.Handler {
 			return
 		}
 
-		if err := r.apply(req.Context(), payload); err != nil {
+		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace
+		if err := r.apply(ctx, payload); err != nil {
 			http.Error(w, "apply: "+err.Error(), http.StatusInternalServerError)
 
 			return
