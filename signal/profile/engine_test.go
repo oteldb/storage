@@ -50,7 +50,7 @@ func TestEngineSymbolStoreDedupAcrossParts(t *testing.T) {
 	for _, v := range []int64{10, 20} {
 		pd := oneSampleBatch(v)
 		Project(&pd, func(b *recordengine.Batch) {
-			_, err := eng.AppendBatch(b)
+			_, err := eng.AppendBatch(b, recordengine.AppendLimits{})
 			require.NoError(t, err)
 		})
 		require.NoError(t, eng.Flush(ctx))

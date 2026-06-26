@@ -6,6 +6,7 @@ import (
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/tenant"
 )
 
 // The logs and traces facades are structurally identical — both are record signals over
@@ -60,10 +61,12 @@ type recordEngineFunc func(signal.TenantID) (*recordengine.Engine, error)
 // deriving the tenant from each stream's Resource+Scope and returning OTLP partial-success counts.
 func (s *Storage) writeRecordsLocal(project recordProjector, engineFor recordEngineFunc) (Accepted, error) {
 	var (
-		oooRejected int64
-		firstErr    error
-		lastTenant  signal.TenantID
-		lastEng     *recordengine.Engine
+		rej        rejectTally
+		firstErr   error
+		lastTenant signal.TenantID
+		lastEng    *recordengine.Engine
+		lastAdmit  *tenantAdmission
+		lastLimits tenant.Limits
 	)
 
 	emitted := project(func(b *recordengine.Batch) {
@@ -82,25 +85,44 @@ func (s *Storage) writeRecordsLocal(project recordProjector, engineFor recordEng
 			}
 
 			lastTenant, lastEng = tid, eng
+			lastAdmit = s.admissionFor(tid)
+			lastLimits = s.tenant.Resolve(s.normalizeTenant(tid)).Limits
 		}
 
-		// AppendBatch can fail when a WAL is wired (a backend/fs write error); records beyond the
-		// OOO window are not accepted and counted as rejected.
-		accepted, err := lastEng.AppendBatch(b)
+		// Admission (same valves as metrics, no sampling — dropping a log/span breaks a
+		// stream/trace): the ingest-rate valve sheds a whole over-budget stream batch; cardinality
+		// and in-flight-memory limits are enforced per record inside the engine.
+		if !lastAdmit.allowRate(lastLimits, b.ByteSize(), s.now()) {
+			rej.rate += int64(b.Len())
+			lastAdmit.addRate(int64(b.Len()))
+
+			return
+		}
+
+		// AppendBatch can also fail when a WAL is wired (a backend/fs write error).
+		res, err := lastEng.AppendBatch(b, recordengine.AppendLimits{
+			MaxSeries:        lastLimits.MaxSeries,
+			MaxInFlightBytes: lastLimits.MaxInFlightBytes,
+		})
 		if err != nil {
 			firstErr = err
 
 			return
 		}
 
-		oooRejected += int64(b.Len() - accepted)
+		rej.ooo += int64(res.RejectedOOO)
+		rej.cardinality += int64(res.RejectedCardinality)
+		rej.inflight += int64(res.RejectedBytes)
+		lastAdmit.record(int64(res.Accepted), int64(res.RejectedOOO), int64(res.RejectedCardinality), int64(res.RejectedBytes))
 	})
 
 	if firstErr != nil {
 		return Accepted{}, firstErr
 	}
 
-	return Accepted{Accepted: int64(emitted) - oooRejected, Rejected: oooRejected}, nil
+	total := rej.total()
+
+	return Accepted{Accepted: int64(emitted) - total, Rejected: total, RejectedReason: rej.reason()}, nil
 }
 
 // writeRecordsClustered frames each tenant's streams+records as a WAL payload and routes it to the
@@ -117,9 +139,7 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 	var rejected int64
 
 	for tid, payload := range byTenant {
-		tenant := string(s.normalizeTenant(tid))
-
-		rej, err := s.routeToPrimary(ctx, sig, tenant, payload)
+		rej, err := s.routeToPrimary(ctx, sig, string(s.normalizeTenant(tid)), payload)
 		if err != nil {
 			return Accepted{Accepted: int64(emitted) - rejected, Rejected: rejected}, err
 		}

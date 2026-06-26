@@ -76,7 +76,7 @@ func newEngine(t *testing.T, be backend.Backend) *recordengine.Engine {
 
 func ingest(t *testing.T, e *recordengine.Engine, b *recordengine.Batch) {
 	t.Helper()
-	_, err := e.AppendBatch(b)
+	_, err := e.AppendBatch(b, recordengine.AppendLimits{})
 	require.NoError(t, err)
 }
 
@@ -176,9 +176,9 @@ func TestOutOfOrderRejected(t *testing.T) {
 	t.Parallel()
 
 	e := recordengine.New(recordengine.Config{Schema: testSchema, OOOWindow: 50})
-	n, err := e.AppendBatch(mkBatch("api", rrec{ts: 100, body: "a"}, rrec{ts: 80, body: "b"}, rrec{ts: 40, body: "c"}))
+	res, err := e.AppendBatch(mkBatch("api", rrec{ts: 100, body: "a"}, rrec{ts: 80, body: "b"}, rrec{ts: 40, body: "c"}), recordengine.AppendLimits{})
 	require.NoError(t, err)
-	assert.Equal(t, 2, n, "40 < newest(100)-50 ⇒ rejected")
+	assert.Equal(t, 2, res.Accepted, "40 < newest(100)-50 ⇒ rejected")
 
 	got := fetchAll(t, e, req("api"))
 	require.Len(t, got, 1)

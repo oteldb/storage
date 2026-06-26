@@ -24,6 +24,7 @@ type head struct {
 	post    *postings.MemPostings
 	records map[signal.SeriesID]*recordCols
 	newest  int64 // newest record timestamp, for the OOO window
+	bytes   int64 // buffered record bytes; the in-flight memory measure
 }
 
 func newHead(schema *Schema) *head {
@@ -39,8 +40,14 @@ func newHead(schema *Schema) *head {
 // ensureStream registers and indexes the stream on first sight and makes sure its (full-column)
 // record buffer exists. materialize is called only when the stream identity is newly seen. It
 // returns whether the identity was newly registered (so the caller logs a stream record to the WAL).
-func (h *head) ensureStream(id signal.SeriesID, materialize func() signal.Series) (isNew bool) {
+func (h *head) ensureStream(id signal.SeriesID, materialize func() signal.Series, maxSeries int64) (isNew, ok bool) {
 	if !h.series.Has(id) {
+		// A new stream: reject it if minting it would exceed the cardinality cap. Existing streams
+		// are never blocked, so a query keeps returning what is already admitted.
+		if maxSeries > 0 && int64(h.series.Len()) >= maxSeries {
+			return false, false
+		}
+
 		isNew = true
 		s := materialize()
 		h.series.Add(s)
@@ -51,15 +58,19 @@ func (h *head) ensureStream(id signal.SeriesID, materialize func() signal.Series
 		h.records[id] = newRecordCols(h.schema, 0, fullSel(h.schema))
 	}
 
-	return isNew
+	return isNew, true
 }
 
 // appendRecord appends r to stream id's buffer (already ensured, or created on demand for the
 // replica apply path), rejecting it as out-of-order when older than newest-oooWindow
 // (oooWindow > 0). It returns whether the record was accepted.
-func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow int64) bool {
+func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow, maxBytes int64) admitOutcome {
 	if h.newest != 0 && oooWindow > 0 && r.ts < h.newest-oooWindow {
-		return false
+		return rejectOOO
+	}
+
+	if maxBytes > 0 && h.bytes >= maxBytes {
+		return rejectBytes
 	}
 
 	buf := h.records[id]
@@ -69,12 +80,13 @@ func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow int64) bool {
 	}
 
 	buf.appendClone(r)
+	h.bytes += recByteSize(r)
 
 	if r.ts > h.newest {
 		h.newest = r.ts
 	}
 
-	return true
+	return admitted
 }
 
 // registerStream records and indexes a stream identity without records (WAL replay / load).
@@ -94,7 +106,7 @@ func (h *head) replayRecords(id signal.SeriesID, recs []rec) {
 	}
 
 	for i := range recs {
-		h.appendRecord(id, recs[i], 0)
+		h.appendRecord(id, recs[i], 0, 0) // replay/replica: authoritative, no admission limits
 	}
 }
 
@@ -209,4 +221,17 @@ func (h *head) trimBelow(t int64) {
 
 		buf.truncate(w)
 	}
+
+	h.recountBytes()
+}
+
+// recountBytes resets the in-flight byte measure from the current buffers (used after a bulk
+// mutation like trimBelow that does not track per-record deltas).
+func (h *head) recountBytes() {
+	var n int64
+	for _, buf := range h.records {
+		n += buf.byteSize()
+	}
+
+	h.bytes = n
 }

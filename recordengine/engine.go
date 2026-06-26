@@ -73,18 +73,44 @@ type Batch struct {
 // Len returns the number of records in the batch.
 func (b *Batch) Len() int { return len(b.Ts) }
 
+// ByteSize returns the in-flight memory the batch's records occupy (timestamps, int columns, and
+// the lengths of the byte columns) — the size a caller charges against an ingest-rate budget.
+func (b *Batch) ByteSize() int64 {
+	n := int64(8 * len(b.Ts))
+	for k := range b.Ints {
+		n += int64(8 * len(b.Ints[k]))
+	}
+
+	for k := range b.Bytes {
+		for _, v := range b.Bytes[k] {
+			n += int64(len(v))
+		}
+	}
+
+	return n
+}
+
 // AppendBatch ingests one stream's records: it registers the stream on first sight, appends each
-// record through the OOO check, and logs accepted records to the WAL. It returns how many records
-// were accepted (the rest were out-of-order beyond the window). Safe for concurrent use.
-func (e *Engine) AppendBatch(b *Batch) (accepted int, err error) {
+// record through the admission limits (OOO window, cardinality, in-flight bytes), and logs accepted
+// records to the WAL. It returns an [AppendResult] breaking accepted/rejected down by reason, so the
+// caller can report an exact OTLP partial-success. Safe for concurrent use.
+func (e *Engine) AppendBatch(b *Batch, limits AppendLimits) (AppendResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	isNew := e.head.ensureStream(b.Stream, b.Identity)
+	// Cardinality is a per-batch decision (a batch is one stream): if this stream is new and the
+	// head is at the cap, the whole batch is rejected and the stream is not registered.
+	isNew, ok := e.head.ensureStream(b.Stream, b.Identity, limits.MaxSeries)
+	if !ok {
+		return AppendResult{RejectedCardinality: len(b.Ts)}, nil
+	}
 
 	scratch := rec{ints: make([]int64, len(b.Ints)), bytes: make([][]byte, len(b.Bytes))}
 
-	var walRecs []rec
+	var (
+		res     AppendResult
+		walRecs []rec
+	)
 
 	for i := range b.Ts {
 		scratch.ts = b.Ts[i]
@@ -96,30 +122,46 @@ func (e *Engine) AppendBatch(b *Batch) (accepted int, err error) {
 			scratch.bytes[k] = b.Bytes[k][i]
 		}
 
-		if !e.head.appendRecord(b.Stream, scratch, e.cfg.OOOWindow) {
+		switch e.head.appendRecord(b.Stream, scratch, e.cfg.OOOWindow, limits.MaxInFlightBytes) {
+		case admitted:
+			res.Accepted++
+		case rejectOOO:
+			res.RejectedOOO++
+
+			continue
+		case rejectBytes:
+			res.RejectedBytes++
+
 			continue
 		}
-
-		accepted++
 
 		if e.cfg.WAL != nil {
 			walRecs = append(walRecs, cloneRec(scratch))
 		}
 	}
 
-	if e.cfg.WAL != nil && accepted > 0 {
+	if e.cfg.WAL != nil && res.Accepted > 0 {
 		if err := e.logWAL(b, walRecs, isNew); err != nil {
-			return accepted, err
+			return res, err
 		}
 	}
 
-	if e.cfg.SideStore != nil && accepted > 0 && len(b.Side) > 0 {
+	if e.cfg.SideStore != nil && res.Accepted > 0 && len(b.Side) > 0 {
 		if err := e.cfg.SideStore.Absorb(b.Side); err != nil {
-			return accepted, errors.Wrap(err, "absorb side delta")
+			return res, errors.Wrap(err, "absorb side delta")
 		}
 	}
 
-	return accepted, nil
+	return res, nil
+}
+
+// HeadBytes returns the head's current buffered record bytes — the in-flight memory measure for
+// [AppendLimits.MaxInFlightBytes].
+func (e *Engine) HeadBytes() int64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	return e.head.bytes
 }
 
 // Fetch implements [fetch.Fetcher] over head ∪ flushed parts: it resolves matchers to streams,

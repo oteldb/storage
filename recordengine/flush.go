@@ -58,6 +58,7 @@ func (h *head) drainHead() *flushColumns {
 	}
 
 	h.records = make(map[signal.SeriesID]*recordCols)
+	h.bytes = 0
 
 	return f
 }

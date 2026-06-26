@@ -129,6 +129,23 @@ func newRecordCols(s *Schema, n int, sel colSel) *recordCols {
 	return c
 }
 
+// byteSize returns the in-flight memory the buffer holds: its timestamps, int columns, and the
+// lengths of its byte columns (the basis for the head's MaxInFlightBytes accounting after a trim).
+func (c *recordCols) byteSize() int64 {
+	n := int64(8 * len(c.ts))
+	for k := range c.ints {
+		n += int64(8 * len(c.ints[k]))
+	}
+
+	for k := range c.bytes {
+		for _, b := range c.bytes[k] {
+			n += int64(len(b))
+		}
+	}
+
+	return n
+}
+
 // appendRow appends row i of src's selected columns (ts always). Byte slices are copied by
 // reference (they alias src's owned bytes). src must populate at least c's selected columns.
 func (c *recordCols) appendRow(src *recordCols, i int) {

@@ -38,7 +38,9 @@ func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err e
 
 			acc := recs[:0]
 			for i := range recs {
-				if e.head.appendRecord(id, recs[i], e.cfg.OOOWindow) {
+				// The replica apply path enforces only the OOO window (the primary's authoritative
+				// decision); cardinality/memory admission is applied at the origin ingest.
+				if e.head.appendRecord(id, recs[i], e.cfg.OOOWindow, 0) == admitted {
 					acc = append(acc, recs[i])
 				} else {
 					rejected++

@@ -11,6 +11,7 @@ import (
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/log"
+	"github.com/oteldb/storage/tenant"
 )
 
 // logBatch builds a one-stream Logs batch for service svc with (ts, severity, body) records.
@@ -148,4 +149,26 @@ func TestFacadeLogsFlushAndRecover(t *testing.T) {
 
 	got := logBodies(t, s.LogFetcher("default"), fetch.Request{Start: 0, End: 1000})
 	assert.Equal(t, []string{"buffered"}, got, "served from the flushed part")
+}
+
+func TestWriteLogsAdmissionMaxSeries(t *testing.T) {
+	t.Parallel()
+
+	s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+		return tenant.Policy{Limits: tenant.Limits{MaxSeries: 1}}
+	})))
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	a, err := s.WriteLogs(ctx, logBatch("api", [3]any{100, 1, "x"}))
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), a.Accepted)
+
+	// A second distinct stream (service) exceeds the per-tenant cardinality cap.
+	b, err := s.WriteLogs(ctx, logBatch("web", [3]any{100, 1, "y"}))
+	require.NoError(t, err)
+	assert.Zero(t, b.Accepted)
+	assert.Equal(t, int64(1), b.Rejected)
+	assert.Equal(t, "max_series", b.RejectedReason)
+	assert.Equal(t, int64(1), s.AdmissionStats("default").RejectedCardinality)
 }

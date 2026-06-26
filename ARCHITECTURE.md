@@ -727,9 +727,13 @@ Overload protection so a load spike **degrades rather than OOMs**. It is **lossl
 always exact) and enforces the per-tenant `tenant.Limits`, resolved through the policy callback so
 changes hot-reload on the next write. Anything shed is reported back via OTLP partial-success
 (`Accepted.Rejected` + `RejectedReason`), never silently dropped or queued unbounded. The admission
-stage sits **between tenant resolution and the engine** in `WriteMetrics`, so a shed point costs no
-index/head/WAL/flush work; the engine core stays policy-agnostic (it sees only numbers via
-`engine.AppendLimits`, never a tenant or policy). Three valves:
+stage sits **between tenant resolution and the engine** in the write path (`WriteMetrics` and, for
+the record signals, `writeRecordsLocal`), so a shed point costs no index/head/WAL/flush work; the
+engine core stays policy-agnostic (it sees only numbers via `engine.AppendLimits` /
+`recordengine.AppendLimits`, never a tenant or policy). It covers **all four signals** — metrics on
+the float engine, logs/traces/profiles on the record engine (cardinality + in-flight enforced per
+record in `recordengine`'s head; no sampling, since dropping a log/span would break a stream/trace).
+Three valves:
 
 - **Ingest rate** (`Limits.IngestBytesPerSecond`) — a per-tenant **token bucket** (`tokenBucket`,
   burst = one second of budget) in the facade; an over-budget batch is shed up front. The clock is
@@ -766,12 +770,12 @@ read seam as **`fetch.Batch.ScaleFactors`** (nil when unsampled;
 `Batch.ScaleFactor(i)` reads it with the default-1). The library only *carries* the weight; honoring
 it in aggregation is the embedder's job (a gauge read ignores it).
 
-Scope today: **metrics, single-node** ingest. Not yet built (the rest of §8a): the **cardinality
-budget with hysteresis / `__overflow__` routing** (the cap is a hard reject, not yet a soft budget),
-the clustered **central→edge budget feedback**, **WAL persistence of the scale factor** (so a crash
-recovers unflushed *sampled* data as weight 1 — a narrow window), and admission on the **record
-signals** and the **clustered write path** (the primary applies only the OOO check today).
-`MaxPartSize` is also not yet enforced.
+Scope today: **all four signals, single-node** ingest (budgeted sampling is metrics-only). Not yet
+built (the rest of §8a): the **cardinality budget with hysteresis / `__overflow__` routing** (the cap
+is a hard reject, not yet a soft budget), the clustered **central→edge budget feedback**, **WAL
+persistence of the scale factor** (so a crash recovers unflushed *sampled* data as weight 1 — a
+narrow window), and admission on the **clustered write path** (the primary applies only the OOO check
+today). `MaxPartSize` is also not yet enforced.
 
 ---
 
