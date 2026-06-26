@@ -79,6 +79,43 @@ func TestMaintainRetainsRecentData(t *testing.T) {
 	assert.Equal(t, []float64{5}, batches[0].Values)
 }
 
+func TestMaintainDownsamplesOldData(t *testing.T) {
+	t.Parallel()
+
+	// Roll up data older than 1h into 10-minute buckets (keep last); recent data stays raw.
+	const bucketWidth = 10 * time.Minute
+	s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+		return tenant.Policy{Downsample: tenant.Downsample{Tiers: []tenant.DownsampleTier{
+			{After: time.Hour, Interval: bucketWidth, Agg: signal.AggLast},
+		}}}
+	})))
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	now := time.Now().UnixNano()
+	old := now - 2*time.Hour.Nanoseconds() // older than After ⇒ downsampled
+
+	// Three old samples inside one 10-minute bucket (collapse to the last) plus one recent raw.
+	bucket := old - (old % bucketWidth.Nanoseconds())
+	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m",
+		[]int64{bucket + 1, bucket + 2, bucket + 3, now},
+		[]float64{1, 2, 3, 9}))
+	require.NoError(t, err)
+
+	s.maintain(ctx) // flush, then merge rolls up the old bucket
+
+	eng := mustEngine(s.engineFor("default"))
+	// A real-now range (queryEngine's fixed 1<<60 end predates now-based timestamps).
+	it, err := eng.Fetch(ctx, fetch.Request{Start: 0, End: now + 1, Matchers: []fetch.Matcher{nameMatcher("m")}})
+	require.NoError(t, err)
+	batches, err := fetch.Drain(ctx, it)
+	require.NoError(t, err)
+	require.Len(t, batches, 1)
+	// The three old samples collapse to one at the bucket start (last value 3); the recent stays.
+	assert.Equal(t, []int64{bucket, now}, batches[0].Timestamps)
+	assert.Equal(t, []float64{3, 9}, batches[0].Values)
+}
+
 func TestMultiTenantIsolationThroughMerge(t *testing.T) {
 	t.Parallel()
 

@@ -364,10 +364,20 @@ this caller-owned-synchronization upgrade.
 - **Part fetch** (`part.go`) — `openPart` rebuilds a `SeriesID → [rowStart,rowEnd)` index
   by scanning the series column once (each series is one contiguous run); `mergeInto`
   decodes a series' `ts`/`value` sub-slice within the window.
-- **Merge + retention** (`merge.go`) is the one background-merge engine: `Merge(retainFrom)`
-  compacts every part into one, merging samples per series by timestamp (freshest wins on a
-  tie) and dropping samples older than the absolute `retainFrom` cutoff before deleting the
-  source parts. Retention is a timestamp, not a clock read, so the engine is deterministic.
+- **Merge + retention + downsampling** (`merge.go`, `downsample.go`) is the one background-merge
+  engine. `MergeWith(MergeOptions{RetainFrom, Downsample})` (and the convenience `Merge(retainFrom)`)
+  compacts every part into one, merging samples per series by timestamp (freshest wins on a tie),
+  dropping samples older than the absolute `retainFrom` cutoff, then **downsampling** the survivors
+  by the supplied tiers before deleting the source parts. A `DownsampleTier{Before, Interval, Agg}`
+  rolls every sample older than `Before` into one representative per absolute `Interval`-aligned
+  bucket, combined by a `signal.Aggregation` (last/first/min/max/sum/avg/count); a sample is assigned
+  the coarsest tier it qualifies for, and younger samples stay raw. Both `Before` and `retainFrom`
+  are absolute timestamps (not clock reads), so the whole merge is deterministic — the caller
+  ([storage.Storage]) resolves the tenant's `tenant.Downsample` policy against one `now` per pass.
+  Bucket alignment is to the absolute grid (not ingest time), so the rollup of a range is independent
+  of when the merge runs and repeated merges are a **fixed point** for last/first/min/max/sum/avg (a
+  one-sample bucket aggregates to itself); count is the documented non-idempotent exception. Records
+  (logs/traces/profiles) carry retention only — downsampling is metrics-specific.
 - **Fetch** (`engine.go`) implements the fetch contract: it resolves matchers to series
   over the index, then merges each series' head buffer ∪ every part by timestamp into one
   batch. `Close` flushes the head. `Reset(ctx)` is the inverse of accumulation: it replaces
@@ -739,11 +749,13 @@ query-language path stays in the embedder. The `Write*` methods take the library
 ### Shared model types
 
 - **`signal`** — signal-neutral model: the `Signal` enum (`Metric`/`Log`/`Trace`/
-  `Profile`), `ParseSignal`, `TenantID`, and the typed identity primitives (`Value`,
-  `KeyValue`, `Attributes`, the 128-bit `SeriesID`, and the attribute binary codec) — see
-  §3c.
-- **`tenant`** — policy model: `Limits`, `Retention`, `Downsample`, and the composed
-  `Policy`, resolved per tenant id through a `Resolver` (`ResolverFunc` adapter;
+  `Profile`), `ParseSignal`, `TenantID`, the `Aggregation` enum (the shared rollup
+  vocabulary for merge-time downsampling, see §3f), and the typed identity primitives
+  (`Value`, `KeyValue`, `Attributes`, the 128-bit `SeriesID`, and the attribute binary
+  codec) — see §3c.
+- **`tenant`** — policy model: `Limits`, `Retention`, `Downsample` (a list of
+  `DownsampleTier{After, Interval, Agg}` rollup bands, applied at merge time — §3f), and the
+  composed `Policy`, resolved per tenant id through a `Resolver` (`ResolverFunc` adapter;
   `Default()` returns an empty-policy resolver). Multi-tenancy, retention, and
   downsampling are consumer-supplied callbacks keyed by tenant id.
 - **`backend`** — the L1 seam (detailed in §3a): `Read`/`Write`/`List`/`Delete` over
@@ -795,7 +807,7 @@ encoding/             umbrella doc for the codec layers
   encoding/chunk      DoD / Gorilla / T64 / dict / bytesraw / decimal / id128 column codecs [implemented]
   encoding/compress   zstd/none block wrapper (lz4 stub)                              [implemented]
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
-signal/               typed Attributes/Value, Resource/Scope/Series identity, 128-bit SeriesID, Signal, TenantID [implemented]
+signal/               typed Attributes/Value, Resource/Scope/Series identity, 128-bit SeriesID, Signal, TenantID, Aggregation [implemented]
   signal/metric       []byte-based OTLP-shaped Metrics ingest batch (resettable/pooled) + identity + projection (gauge/sum) [implemented; histogram/summary deferred]
   signal/log          []byte-based OTLP-shaped Logs ingest batch (resettable/pooled) + stream identity + projection [implemented]
   signal/trace        []byte-based OTLP-shaped Traces ingest batch (resettable/pooled) + span schema + projection (nested-set, events/links) [implemented]
@@ -810,7 +822,7 @@ block/                immutable columnar part format: column/marks/manifest/part
 index/                symbols (intern) · series (id↔attrs) · postings (set-ops/matchers) [implemented]
   index/bloom         token bloom filter (no false negatives) + tokenizer: full-text + attr/equality pruning [implemented]
 wal/                  CRC-framed segmented WAL: samples + opaque records + side delta, resume + checkpoint (truncate-on-flush), facade-wired durability [implemented]
-engine/               head · flush · background-merge · retention · fetch (metrics)    [implemented]
+engine/               head · flush · background-merge · retention · downsampling · fetch (metrics) [implemented]
 recordengine/         shared schema-driven record engine (logs+traces+profiles): head · flush · merge · fetch · conditions · per-column blooms · optional content-addressed side store [implemented]
 query/fetch           dual-shape fetch contract (Matchers + Conditions/Projection/SecondPass) [implemented for metrics + logs + traces + profiles; the library's query surface]
 query/scale           fetch-seam scale-out decorators: split-by-interval + results cache  [implemented]

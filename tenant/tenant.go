@@ -31,10 +31,31 @@ type Retention struct {
 	MaxBytes int64
 }
 
-// Downsample is the per-tenant downsampling policy (DESIGN.md §10): a merge-time
-// rollup reusing the same background-merge engine. Optional and per-tenant.
+// DownsampleTier rolls up samples once they reach a given age: every sample older than
+// After is replaced, at merge time, by one representative per Interval-wide time bucket,
+// the bucket's samples combined by Agg. A tier with Interval ≤ 0 is ignored.
+//
+// Tiers coarsen old data: configure increasing After with increasing Interval (e.g. 5m
+// buckets after 24h, 1h buckets after 7d). A sample is rolled up by the coarsest tier
+// whose After it has exceeded; samples younger than every tier's After stay raw. Buckets
+// are aligned to absolute multiples of Interval (not to ingest time), so the rollup of a
+// time range is independent of when the merge runs — repeated merges are stable.
+type DownsampleTier struct {
+	// After is the age past which this tier applies (relative to now at merge time).
+	After time.Duration
+	// Interval is the rollup bucket width. Zero ⇒ the tier is disabled.
+	Interval time.Duration
+	// Agg combines the samples in a bucket. The zero value is [signal.AggLast].
+	Agg signal.Aggregation
+}
+
+// Downsample is the per-tenant downsampling policy: a merge-time rollup reusing the same
+// background-merge engine (no separate subsystem). Optional and per-tenant; an empty
+// Tiers list disables downsampling (data stays raw until retention drops it).
 type Downsample struct {
-	// TODO(M3): rollup definitions and merge-time hooks.
+	// Tiers are the age-banded rollup resolutions, applied at merge time. Order does not
+	// matter; the engine assigns each sample to the coarsest applicable tier.
+	Tiers []DownsampleTier
 }
 
 // Policy is the resolved policy for a tenant: limits, retention, downsampling, and

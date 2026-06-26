@@ -735,7 +735,10 @@ func (s *Storage) maintain(ctx context.Context) {
 
 	owned := s.ownedTenants(ctx, tids)
 
-	maintainEngine := func(tid signal.TenantID, flush func() error, merge func(int64) error, refresh func() error) {
+	// maintainEngine flushes then merges one engine, unless this node is a non-owning replica (then
+	// it only refreshes from the shared store). merge is signal-specific: metrics carry downsampling
+	// (engine.MergeWith), the record signals carry retention only.
+	maintainEngine := func(tid signal.TenantID, flush, merge, refresh func() error) {
 		if owned != nil {
 			if _, ok := owned[tid]; !ok {
 				// A replica, not the compaction owner: pull the owner's flushed parts and trim the
@@ -747,27 +750,28 @@ func (s *Storage) maintain(ctx context.Context) {
 		}
 
 		_ = flush()
-		_ = merge(s.retainFrom(tid))
+		_ = merge()
 	}
 
 	for tid, eng := range metricEngines {
 		maintainEngine(tid, func() error { return eng.Flush(ctx) },
-			func(r int64) error { return eng.Merge(ctx, r) }, func() error { return eng.RefreshReplica(ctx) })
+			func() error { return eng.MergeWith(ctx, s.metricMergeOptions(tid)) },
+			func() error { return eng.RefreshReplica(ctx) })
 	}
 
 	for tid, eng := range logEngines {
 		maintainEngine(tid, func() error { return eng.Flush(ctx) },
-			func(r int64) error { return eng.Merge(ctx, r) }, func() error { return eng.RefreshReplica(ctx) })
+			func() error { return eng.Merge(ctx, s.retainFrom(tid)) }, func() error { return eng.RefreshReplica(ctx) })
 	}
 
 	for tid, eng := range traceEngines {
 		maintainEngine(tid, func() error { return eng.Flush(ctx) },
-			func(r int64) error { return eng.Merge(ctx, r) }, func() error { return eng.RefreshReplica(ctx) })
+			func() error { return eng.Merge(ctx, s.retainFrom(tid)) }, func() error { return eng.RefreshReplica(ctx) })
 	}
 
 	for tid, eng := range profileEngines {
 		maintainEngine(tid, func() error { return eng.Flush(ctx) },
-			func(r int64) error { return eng.Merge(ctx, r) }, func() error { return eng.RefreshReplica(ctx) })
+			func() error { return eng.Merge(ctx, s.retainFrom(tid)) }, func() error { return eng.RefreshReplica(ctx) })
 	}
 }
 
@@ -799,12 +803,42 @@ func (s *Storage) ownedTenants(ctx context.Context, tids map[signal.TenantID]str
 // retainFrom converts a tenant's retention window into an absolute cutoff timestamp (unix
 // nanoseconds); 0 means retain forever.
 func (s *Storage) retainFrom(tid signal.TenantID) int64 {
-	maxAge := s.tenant.Resolve(s.normalizeTenant(tid)).Retention.MaxAge
-	if maxAge <= 0 {
+	return retentionCutoff(s.tenant.Resolve(s.normalizeTenant(tid)).Retention, time.Now().UnixNano())
+}
+
+// retentionCutoff converts a retention window into an absolute cutoff at the given now (unix
+// nanoseconds); 0 means retain forever.
+func retentionCutoff(r tenant.Retention, now int64) int64 {
+	if r.MaxAge <= 0 {
 		return 0
 	}
 
-	return time.Now().UnixNano() - maxAge.Nanoseconds()
+	return now - r.MaxAge.Nanoseconds()
+}
+
+// metricMergeOptions resolves a metric tenant's policy into the absolute merge parameters —
+// retention cutoff plus downsampling tiers — for one maintenance pass. Resolving against a single
+// now keeps the whole merge deterministic (the engine reads no clock). Downsampling applies to
+// metrics only (the record signals are append-only event data; rolling them up would destroy them).
+func (s *Storage) metricMergeOptions(tid signal.TenantID) engine.MergeOptions {
+	now := time.Now().UnixNano()
+	p := s.tenant.Resolve(s.normalizeTenant(tid))
+
+	var tiers []engine.DownsampleTier
+
+	for _, t := range p.Downsample.Tiers {
+		if t.Interval <= 0 {
+			continue
+		}
+
+		tiers = append(tiers, engine.DownsampleTier{
+			Before:   now - t.After.Nanoseconds(),
+			Interval: t.Interval.Nanoseconds(),
+			Agg:      t.Agg,
+		})
+	}
+
+	return engine.MergeOptions{RetainFrom: retentionCutoff(p.Retention, now), Downsample: tiers}
 }
 
 // engineSnapshot returns the current tenant engines (a copy, so callers iterate without

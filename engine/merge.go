@@ -13,27 +13,47 @@ import (
 // the backend after the new part is durably written.
 //
 // Retention is expressed as an absolute timestamp (unix nanoseconds), so the engine stays
-// free of wall-clock dependencies; the caller derives it from the tenant policy.
+// free of wall-clock dependencies; the caller derives it from the tenant policy. For
+// downsampling, use [Engine.MergeWith].
 func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
+	return e.MergeWith(ctx, MergeOptions{RetainFrom: retainFrom})
+}
+
+// MergeWith compacts every flushed part into a single new part, applying retention and
+// downsampling per opts. It is the one background-merge entry point; compaction, retention,
+// and downsampling are the same pass over the immutable parts (no separate subsystem).
+func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return e.mergeLocked(ctx, retainFrom)
+	return e.mergeLocked(ctx, opts)
 }
 
-func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) error {
-	if len(e.parts) == 0 || (len(e.parts) == 1 && retainFrom <= 0) {
+func (e *Engine) mergeLocked(ctx context.Context, opts MergeOptions) error {
+	if len(e.parts) == 0 {
+		return nil
+	}
+
+	// A single part with no retention cutoff and nothing old enough to downsample has nothing
+	// to gain — skip without decoding it.
+	if len(e.parts) == 1 && opts.RetainFrom <= 0 && !downsampleApplies(opts.Downsample, e.parts[0].minTime) {
 		return nil
 	}
 
 	start := minInt64
-	if retainFrom > 0 {
-		start = retainFrom
+	if opts.RetainFrom > 0 {
+		start = opts.RetainFrom
 	}
 
-	cols, err := e.compactParts(ctx, start)
+	cols, err := e.compactParts(ctx, start, opts.Downsample)
 	if err != nil {
 		return err
+	}
+
+	// Fixed point: a single source part whose row count downsampling did not reduce is already
+	// at its target resolution, so rewriting it would only churn the backend each tick.
+	if len(e.parts) == 1 && opts.RetainFrom <= 0 && len(cols.ts) == e.parts[0].rows() {
+		return nil
 	}
 
 	old := e.parts
@@ -74,9 +94,9 @@ func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) error {
 }
 
 // compactParts merges every part's samples per series (within [start, maxInt64], so
-// retention is applied), returning the combined columns sorted by (series, ts). The
-// returned columns are empty when no sample survives.
-func (e *Engine) compactParts(ctx context.Context, start int64) (*flushColumns, error) {
+// retention is applied), then downsamples the survivors per tiers, returning the combined
+// columns sorted by (series, ts). The returned columns are empty when no sample survives.
+func (e *Engine) compactParts(ctx context.Context, start int64, tiers []DownsampleTier) (*flushColumns, error) {
 	idSet := make(map[signal.SeriesID]struct{})
 	for _, p := range e.parts {
 		for id := range p.ranges {
@@ -104,6 +124,7 @@ func (e *Engine) compactParts(ctx context.Context, start int64) (*flushColumns, 
 		}
 
 		ts, values := m.collect()
+		ts, values = downsample(ts, values, tiers)
 
 		u := idToU128(id)
 		for i := range ts {

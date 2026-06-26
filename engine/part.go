@@ -87,6 +87,16 @@ func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, err
 	return &part{reader: r, prefix: prefix, ranges: ranges}, nil
 }
 
+// rows returns the part's total sample count (its series ranges partition [0, rows)).
+func (p *part) rows() int {
+	n := 0
+	for _, r := range p.ranges {
+		n += r.end - r.start
+	}
+
+	return n
+}
+
 // mergeInto adds series id's samples within [start, end] to m. It is a no-op if the part
 // does not hold the series.
 func (p *part) mergeInto(ctx context.Context, id signal.SeriesID, m *sampleMerge, start, end int64) error {
