@@ -20,7 +20,10 @@ const profilesPrefix = "/profiles"
 // timestamped samples and denormalizing profile fields) and a content-addressed symbol delta,
 // derives each sample's tenant from its Resource+Scope, and appends to that tenant's profiles
 // engine — which persists the symbol store as part sidecars. Returns OTLP partial-success counts.
-func (s *Storage) WriteProfiles(ctx context.Context, pd profile.Profiles) (Accepted, error) {
+func (s *Storage) WriteProfiles(ctx context.Context, pd profile.Profiles) (acc Accepted, err error) {
+	ctx, finish := s.writeSpan(ctx, "storage.write.profiles")
+	defer finish(&acc, &err)
+
 	if s.closed.Load() {
 		return Accepted{}, errors.Wrap(ErrClosed, "write profiles")
 	}

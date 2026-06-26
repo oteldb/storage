@@ -18,7 +18,10 @@ const logsPrefix = "/logs"
 // WriteLogs ingests a logs batch. It projects the internal model, derives each record's tenant
 // from its Resource+Scope, and appends to that tenant's logs engine (indexing stream labels +
 // buffering records). Returns per-OTLP partial-success counts: rejected counts out-of-order drops.
-func (s *Storage) WriteLogs(ctx context.Context, ld log.Logs) (Accepted, error) {
+func (s *Storage) WriteLogs(ctx context.Context, ld log.Logs) (acc Accepted, err error) {
+	ctx, finish := s.writeSpan(ctx, "storage.write.logs")
+	defer finish(&acc, &err)
+
 	if s.closed.Load() {
 		return Accepted{}, errors.Wrap(ErrClosed, "write logs")
 	}

@@ -19,7 +19,10 @@ const tracesPrefix = "/traces"
 // WriteTraces ingests a traces batch. It projects the span model (computing nested-set ids and
 // serializing events/links), derives each span's tenant from its Resource+Scope, and appends to
 // that tenant's traces engine. Returns per-OTLP partial-success counts (out-of-order drops).
-func (s *Storage) WriteTraces(ctx context.Context, td trace.Traces) (Accepted, error) {
+func (s *Storage) WriteTraces(ctx context.Context, td trace.Traces) (acc Accepted, err error) {
+	ctx, finish := s.writeSpan(ctx, "storage.write.traces")
+	defer finish(&acc, &err)
+
 	if s.closed.Load() {
 		return Accepted{}, errors.Wrap(ErrClosed, "write traces")
 	}

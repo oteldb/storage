@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
 )
@@ -234,6 +236,26 @@ func (s *Storage) AdmissionStats(tid signal.TenantID) AdmissionStats {
 	}
 
 	return a.stats()
+}
+
+// writeSpan starts a span for a public Write* call and returns the child ctx and a finish closure
+// that stamps the result (accepted/rejected counts, any error) on the span and ends it. With the
+// no-op tracer it is free. Use: ctx, finish := s.writeSpan(ctx, "…"); defer finish(&acc, &err).
+func (s *Storage) writeSpan(ctx context.Context, name string) (context.Context, func(*Accepted, *error)) {
+	ctx, span := s.obs.Tracer.Start(ctx, name) //nolint:spancheck // the returned finish() closure ends the span
+
+	return ctx, func(acc *Accepted, err *error) { //nolint:spancheck // span.End is called here, in the returned closure
+		span.SetAttributes(
+			attribute.Int64("storage.accepted", acc.Accepted),
+			attribute.Int64("storage.rejected", acc.Rejected),
+		)
+
+		if *err != nil {
+			span.RecordError(*err)
+		}
+
+		span.End()
+	}
 }
 
 // emitAdmission records a write's admission outcome to the OTel meta-metrics (DESIGN §8a/§16): the

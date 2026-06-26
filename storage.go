@@ -245,7 +245,10 @@ func (s *Storage) Reset(ctx context.Context) error {
 // labels + buffering samples). Returns per-OTLP partial-success counts: rejected counts
 // out-of-order drops. (Unsupported point kinds and value-less points never reach here:
 // they are filtered and counted by the producer — e.g. the otlp/pdataconv bridge.)
-func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted, error) {
+func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Accepted, err error) {
+	ctx, finish := s.writeSpan(ctx, "storage.write.metrics")
+	defer finish(&acc, &err)
+
 	if s.closed.Load() {
 		return Accepted{}, errors.Wrap(ErrClosed, "write metrics")
 	}
