@@ -267,26 +267,38 @@ func (e *Engine) Replay(dir string) error {
 }
 
 // ApplyReplicated applies an in-memory WAL-framed write (a replication payload from a peer)
-// to the head: it registers each series and appends its samples, the same way [Engine.Replay]
-// restores from disk. It is the receive side of cluster write-replication — a node holds a
-// replica of a peer's unflushed head this way, and after both flush, the shared object store
-// reconciles them. Safe for concurrent use.
-func (e *Engine) ApplyReplicated(data []byte) error {
+// to the head: it registers each series and appends its samples through the **same
+// out-of-order-checked path as a local ingest** (unlike WAL [Engine.Replay], which trusts the
+// log unconditionally), so a replica drops samples older than its OOO window just as the
+// origin would. It returns the number of samples rejected as out-of-order. A replica holds a
+// peer's unflushed head this way; after a flush the shared object store reconciles them. Safe
+// for concurrent use.
+func (e *Engine) ApplyReplicated(data []byte) (rejected int, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return wal.Replay(data, wal.Handlers{
-		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
-			e.head.registerSeries(s)
+	byID := make(map[signal.SeriesID]signal.Series)
+
+	err = wal.Replay(data, wal.Handlers{
+		OnSeries: func(id signal.SeriesID, s signal.Series) error {
+			byID[id] = s
 
 			return nil
 		},
 		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
-			e.head.replaySamples(id, ts, values)
+			s := byID[id] // the series record precedes its samples in the frame
+			for i := range ts {
+				if ok, _, _ := e.head.appendByID(id, ts[i], values[i], e.cfg.OOOWindow,
+					func() signal.Series { return s }); !ok {
+					rejected++
+				}
+			}
 
 			return nil
 		},
 	})
+
+	return rejected, err
 }
 
 // SeriesCount returns the number of distinct series in the head.

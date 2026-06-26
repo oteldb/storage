@@ -142,7 +142,9 @@ func (s *Storage) applyReplicated(_ context.Context, payload []byte) error {
 		return err
 	}
 
-	if err := s.engineFor(signal.TenantID(tenant)).ApplyReplicated(walBytes); err != nil {
+	// The OOO-rejected count is not propagated back to the origin's partial-success; cluster
+	// ingest reports accepted == emitted (see writeMetricsClustered).
+	if _, err := s.engineFor(signal.TenantID(tenant)).ApplyReplicated(walBytes); err != nil {
 		return errors.Wrapf(err, "apply replicated write for tenant %q", tenant)
 	}
 

@@ -68,7 +68,9 @@ func engineApply(t *testing.T, eng *engine.Engine) replica.ApplyFunc {
 			return err
 		}
 
-		return eng.ApplyReplicated(walBytes)
+		_, err = eng.ApplyReplicated(walBytes)
+
+		return err
 	}
 }
 
