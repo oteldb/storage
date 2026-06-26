@@ -56,7 +56,7 @@ func TestAttrEqualsPresent(t *testing.T) {
 		return signal.NewAttributes(signal.KeyValue{Key: []byte(key), Value: signal.StringValue([]byte(val))}).AppendHashInput(nil)
 	}
 
-	f, _, err := bloom.Decode(buildAttrBloom([][]byte{rec("user", "alice"), rec("region", "eu")}))
+	f, _, err := bloom.Decode(buildAttrBloom([][]byte{rec("user", "alice"), rec("msg", "connection refused")}))
 	require.NoError(t, err)
 
 	withBloom := &part{attrBloom: f}
@@ -70,11 +70,27 @@ func TestAttrEqualsPresent(t *testing.T) {
 
 		return out
 	}
+	contains := func(col string, toks ...string) []fetch.Condition {
+		c := fetch.Condition{Column: col}
+		for _, tk := range toks {
+			c.Tokens = append(c.Tokens, []byte(tk))
+		}
 
-	assert.True(t, withBloom.attrEqualsPresent(eq([2]string{"user", "alice"})), "present key=value ⇒ keep")
-	assert.True(t, withBloom.attrEqualsPresent(eq([2]string{"user", "alice"}, [2]string{"region", "eu"})), "all present ⇒ keep")
-	assert.False(t, withBloom.attrEqualsPresent(eq([2]string{"user", "bob"})), "absent value ⇒ prune")
-	assert.False(t, withBloom.attrEqualsPresent(eq([2]string{"team", "x"})), "absent key ⇒ prune")
-	assert.True(t, withBloom.attrEqualsPresent([]fetch.Condition{{Column: "user"}}), "no Equal spec ⇒ not consulted")
-	assert.True(t, noBloom.attrEqualsPresent(eq([2]string{"user", "alice"})), "no bloom ⇒ always scan")
+		return []fetch.Condition{c}
+	}
+
+	// Equality pruning.
+	assert.True(t, withBloom.attrConditionsPresent(eq([2]string{"user", "alice"})), "present key=value ⇒ keep")
+	assert.True(t, withBloom.attrConditionsPresent(eq([2]string{"user", "alice"}, [2]string{"msg", "connection refused"})), "all present ⇒ keep")
+	assert.False(t, withBloom.attrConditionsPresent(eq([2]string{"user", "bob"})), "absent value ⇒ prune")
+	assert.False(t, withBloom.attrConditionsPresent(eq([2]string{"team", "x"})), "absent key ⇒ prune")
+	assert.True(t, withBloom.attrConditionsPresent([]fetch.Condition{{Column: "user"}}), "no hints ⇒ not consulted")
+
+	// Non-equality (contains) pruning over key-scoped value tokens.
+	assert.True(t, withBloom.attrConditionsPresent(contains("msg", "connection")), "present word ⇒ keep")
+	assert.True(t, withBloom.attrConditionsPresent(contains("msg", "connection", "refused")), "all words present ⇒ keep")
+	assert.False(t, withBloom.attrConditionsPresent(contains("msg", "timeout")), "absent word ⇒ prune")
+	assert.False(t, withBloom.attrConditionsPresent(contains("user", "connection")), "word under the wrong key ⇒ prune")
+
+	assert.True(t, noBloom.attrConditionsPresent(eq([2]string{"user", "alice"})), "no bloom ⇒ always scan")
 }

@@ -567,10 +567,14 @@ dual-shape fetch contract (§3g): **Matchers resolve the stream, Conditions filt
   (`bloom-body.bin`) over the body's full-text tokens, and an attribute bloom (`bloom-attrs.bin`)
   over each record's per-record attributes as exact `key=value` tokens. `Fetch` skips a part whose
   body bloom proves a required full-text token (`Condition.Tokens`) absent or whose attribute bloom
-  proves a required equality (`Condition.Equal`, a serializable spec the language sets) absent — then
-  re-checks the exact predicate per row on surviving parts. A part with no bloom is always scanned
-  (safe). Attribute *equality* prunes parts; non-equality attribute predicates still scan (an
-  inverted attribute index is the deferred next step).
+  proves a required equality (`Condition.Equal`) **or** full-text term (`Condition.Tokens`) absent —
+  then re-checks the exact predicate per row on surviving parts. The attribute bloom is **key-scoped**:
+  for each record attribute it holds both the exact `key‖value` (equality pruning) and one
+  `key‖word` per lowercased value word (non-equality `contains` pruning), so a value's word never
+  matches a query against a different key. A part with no bloom is always scanned (safe). Equality
+  and substring/full-text attribute predicates prune; other shapes (numeric range) still scan —
+  promoted attribute *columns* with min/max stats (needs nullable `block` columns) are the deferred
+  next step for those.
 - **WAL** gains a `recordLogRecords` frame (the signal-neutral `wal.LogRecord`, with opaque
   serialized attrs); replay reconstructs the head.
 - **Facade**: `WriteLogs` and `LogFetcher` mirror `WriteMetrics`/`Fetcher` over per-tenant log

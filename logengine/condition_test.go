@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/index/bloom"
 	"github.com/oteldb/storage/logengine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -67,6 +68,18 @@ func attrEquals(key, val string) fetch.Condition {
 		Column: key,
 		Match:  func(v signal.Value) bool { return bytes.Equal(v.Str(), want) },
 		Equal:  &fetch.EqualMatcher{Name: key, Value: val},
+	}
+}
+
+// attrContains is a non-equality (substring) condition over a per-record attribute key. It carries
+// the search Tokens so the engine can prune parts via the attribute bloom's key-scoped value tokens.
+func attrContains(key, sub string) fetch.Condition {
+	want := []byte(sub)
+
+	return fetch.Condition{
+		Column: key,
+		Match:  func(v signal.Value) bool { return bytes.Contains(v.Str(), want) },
+		Tokens: bloom.Tokenize(nil, []byte(sub)),
 	}
 }
 
@@ -210,6 +223,51 @@ func TestAttributeBloomPrunesParts(t *testing.T) {
 	// A value present in no part nor head ⇒ every part pruned, head scanned, nothing matches.
 	none := fetchAll(t, e, condReq("api", attrEquals("user", "nobody")))
 	assert.Empty(t, none)
+}
+
+func TestNonEqualityAttributeSearchAndPrune(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := logengine.New(logengine.Config{Backend: backend.Memory(), Prefix: "t/logs"})
+
+	// "msg" attribute carries free text; two parts with disjoint vocabularies, plus a head record.
+	ingestMsg := func(ts int64, body, m string) {
+		var ld log.Logs
+		rl := ld.AddResource()
+		rl.Resource = signal.Resource{Attributes: signal.NewAttributes(
+			signal.KeyValue{Key: []byte("service.name"), Value: signal.StringValue([]byte("api"))},
+		)}
+		sl := rl.AddScope()
+		r := sl.AddRecord()
+		r.Timestamp, r.Body = ts, []byte(body)
+		r.Attributes = signal.NewAttributes(signal.KeyValue{Key: []byte("msg"), Value: signal.StringValue([]byte(m))})
+		ingest(t, e, ld)
+	}
+
+	ingestMsg(100, "p1", "connection refused upstream")
+	require.NoError(t, e.Flush(ctx))
+	ingestMsg(200, "p2", "request timeout")
+	require.NoError(t, e.Flush(ctx))
+	ingestMsg(300, "head", "connection reset")
+	require.Equal(t, 2, e.PartCount())
+
+	// `msg contains "connection"`: part 2 (timeout) is bloom-pruned; part 1 + head match.
+	got := fetchAll(t, e, condReq("api", attrContains("msg", "connection")))
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"p1", "head"}, bodies(got[0]), "non-equality attribute search across head ∪ parts")
+
+	// A word in no part nor head ⇒ every part pruned, head scanned, nothing matches.
+	assert.Empty(t, fetchAll(t, e, condReq("api", attrContains("msg", "nonexistent"))))
+
+	// A range predicate over a numeric attribute still evaluates correctly (it just can't be
+	// bloom-pruned): only the equality/contains hints prune.
+	ingestMsg(400, "lvl", "ok")
+	got = fetchAll(t, e, condReq("api", fetch.Condition{
+		Column: "msg", Match: func(v signal.Value) bool { return len(v.Str()) <= 2 },
+	}))
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"lvl"}, bodies(got[0]), "non-token predicate scans and matches")
 }
 
 func TestProjectionMultipleColumnsAndUnknown(t *testing.T) {

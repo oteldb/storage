@@ -119,6 +119,17 @@ const (
 	colAttrs    = "attrs"
 )
 
+// isFixedColumn reports whether name is one of the fixed per-record columns (as opposed to a
+// per-record attribute key, which lives in the serialized attrs column).
+func isFixedColumn(name string) bool {
+	switch name {
+	case colTs, colObserved, colSeverity, colFlags, colDropped, colSevText, colBody, colTraceID, colSpanID, colAttrs:
+		return true
+	default:
+		return false
+	}
+}
+
 // toBatch builds the fetch batch for one stream from the accumulated columns, materializing only
 // the projected columns (an empty projection materializes all). Timestamps always carries each
 // record's event time.

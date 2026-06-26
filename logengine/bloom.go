@@ -83,15 +83,19 @@ func loadBodyBloom(ctx context.Context, b backend.Backend, prefix string) (*bloo
 	return f, nil
 }
 
-// bodyTokensPresent reports whether the part may contain a body holding every token of every
-// full-text condition. A part is prunable only when it has a bloom; without one (nil), the answer
-// is conservatively true (scan it). A single token testing absent rules the whole part out.
+// bodyTokensPresent reports whether the part may contain a body holding every full-text token of
+// every `body` condition. A part is prunable only when it has a bloom; without one (nil) the
+// answer is conservatively true (scan it). A single token testing absent rules the whole part out.
 func (p *part) bodyTokensPresent(conds []fetch.Condition) bool {
 	if p.bodyBloom == nil {
 		return true
 	}
 
 	for i := range conds {
+		if conds[i].Column != colBody {
+			continue // body bloom holds body tokens only
+		}
+
 		for _, tok := range conds[i].Tokens {
 			if !p.bodyBloom.Test(tok) {
 				return false
@@ -102,12 +106,16 @@ func (p *part) bodyTokensPresent(conds []fetch.Condition) bool {
 	return true
 }
 
-// buildAttrBloom returns the encoded bloom of every record's per-record attributes as key=value
-// tokens. attrs is the serialized-attribute column (one blob per record).
+// buildAttrBloom returns the encoded bloom of every record's per-record attributes. For each
+// attribute (key, value) it adds two kinds of key-scoped token: the **equality** token
+// `key‖value-text` (so an exact `key=value` condition can prune), and one **full-text** token
+// `key‖word` per lowercased word of the value (so a `key contains word` condition can prune). All
+// tokens are key-scoped, so a value's word only matches a query against that same key.
 func buildAttrBloom(attrs [][]byte) []byte {
 	var (
 		tokens  [][]byte
 		scratch []byte
+		words   [][]byte
 	)
 
 	for _, blob := range attrs {
@@ -119,6 +127,11 @@ func buildAttrBloom(attrs [][]byte) []byte {
 		for i := range a {
 			scratch = a[i].Value.AppendText(scratch[:0])
 			tokens = append(tokens, attrToken(nil, a[i].Key, scratch))
+
+			words = bloom.Tokenize(words[:0], scratch)
+			for _, w := range words {
+				tokens = append(tokens, attrToken(nil, a[i].Key, w))
+			}
 		}
 	}
 
@@ -158,21 +171,30 @@ func loadAttrBloom(ctx context.Context, b backend.Backend, prefix string) (*bloo
 	return f, nil
 }
 
-// attrEqualsPresent reports whether the part may hold a record satisfying every equality condition
-// (those carrying a serializable Equal spec). Without an attribute bloom the answer is
-// conservatively true. A single key=value testing absent rules the whole part out.
-func (p *part) attrEqualsPresent(conds []fetch.Condition) bool {
+// attrConditionsPresent reports whether the part may hold a record satisfying every **attribute**
+// condition's serializable hint: an `Equal` spec (exact key=value) and/or `Tokens` (a key-scoped
+// `contains`, the non-equality path). Body conditions are handled by [part.bodyTokensPresent], so
+// only conditions over a non-fixed column (an attribute key) are consulted here. Without an
+// attribute bloom the answer is conservatively true; a single absent token rules the part out.
+func (p *part) attrConditionsPresent(conds []fetch.Condition) bool {
 	if p.attrBloom == nil {
 		return true
 	}
 
 	for i := range conds {
-		if conds[i].Equal == nil {
-			continue
+		c := &conds[i]
+		if isFixedColumn(c.Column) {
+			continue // attribute (non-fixed-column) conditions only
 		}
 
-		if !p.attrBloom.Test(equalToken(*conds[i].Equal)) {
+		if c.Equal != nil && !p.attrBloom.Test(equalToken(*c.Equal)) {
 			return false
+		}
+
+		for _, tok := range c.Tokens {
+			if !p.attrBloom.Test(attrToken(nil, []byte(c.Column), tok)) {
+				return false
+			}
 		}
 	}
 
@@ -180,8 +202,8 @@ func (p *part) attrEqualsPresent(conds []fetch.Condition) bool {
 }
 
 // mayContain reports whether the part can be skipped for a conjunctive (AllConditions) query:
-// false ⇒ a bloom proved a required full-text token or equality value absent, so the part holds no
-// matching record and is pruned. The engine still re-checks Match per row for surviving parts.
+// false ⇒ a bloom proved a required token or equality value absent, so the part holds no matching
+// record and is pruned. The engine still re-checks Match per row for surviving parts.
 func (p *part) mayContain(conds []fetch.Condition) bool {
-	return p.bodyTokensPresent(conds) && p.attrEqualsPresent(conds)
+	return p.bodyTokensPresent(conds) && p.attrConditionsPresent(conds)
 }
