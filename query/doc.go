@@ -1,8 +1,11 @@
-// Package query implements the L4–L6 query layers (DESIGN.md §3, §14 M4–M7):
-//   - fetch: the dual-shape FetchRequest/Fetcher/Iterator contract (the seam)
-//   - plan: logical plan IR, Shardable, lowering
-//   - exec: streaming pull engine, results cache
-//   - promql/logql/traceql/genericql: language front-ends compiling to the fetch contract
+// Package query holds the query layer and its neutral result types (see [Result]).
 //
-// Not yet implemented (M4+).
+// Sub-packages:
+//   - fetch: the dual-shape Request/Fetcher/Iterator contract — the seam every language
+//     front-end compiles to and every backend implements.
+//   - promql: the PromQL front-end, an adapter from the fetch contract to the Prometheus
+//     promql.Engine.
+//
+// LogQL/TraceQL/cross-signal front-ends and a sharded execution layer are later milestones.
+// See ARCHITECTURE.md for the query layer's current state.
 package query

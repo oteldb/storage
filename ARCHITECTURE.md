@@ -9,8 +9,9 @@
 > Forward-looking design and the milestone plan live in `DESIGN.md` and `PROMPT.md`;
 > keep speculation and TODOs out of this file.
 >
-> Last verified against the tree: 2026-06-26 (M3: engine vertical — ingest/flush/merge/fetch;
-> ingest boundary moved off pdata to the internal `metric.Metrics` batch + `otlp/pdataconv` bridge).
+> Last verified against the tree: 2026-06-26 (M4: PromQL read path via `query/promql`, a
+> fetch→Prometheus-engine adapter wired through `Storage.Query`; ingest boundary on the
+> internal `metric.Metrics` batch + `otlp/pdataconv` bridge).
 
 `github.com/oteldb/storage` is a low-level, OpenTelemetry-centric columnar storage
 **library** (Go 1.26). It has no `main`, server, or CLI: an embedder (primarily
@@ -37,18 +38,20 @@ The design is a single columnar engine with swappable front-ends and backends
 
 | Layer | Concern | Realized today |
 |---|---|---|
-| L6 Query languages | promql/logql/traceql/genericql | — (package `query`, seam only) |
-| L5 Query engine | plan IR · sharding · streaming exec · cache | — (package `query`, seam only) |
+| L6 Query languages | promql/logql/traceql/genericql | **PromQL implemented** (`query/promql`, adapter over the embedded Prometheus engine); logql/traceql pending |
+| L5 Query engine | plan IR · sharding · streaming exec · cache | **PromQL eval provided by the embedded Prometheus `promql.Engine`**; our sharded planner/cache pending |
 | L4 **Fetch contract** | **callback matchers + window → iterator of batches** | **implemented for metrics** (`query/fetch`); column conditions pending |
 | L3 **Engine** / **Index / WAL** | **head · flush · merge · retention** / **symbols · series · postings** · **write-ahead log** | **engine implemented (metrics)**; **index + wal implemented** |
 | L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
 | L1 **Backend** | file · s3 · memory behind one interface | **memory + file implemented**; s3 + CAS pending |
 | L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | — (package `cluster`, seam only) |
 
-The **implemented substance now spans L1 (backends) through L4 (the metrics fetch
-contract)**: encoding, parts, index, WAL, the engine head/flush/merge, and the facade's
-metrics ingest+read path. L5/L6 (planner, query languages) and L0 (cluster) remain seams.
-The rest of this document details what is built.
+The **implemented substance now spans L1 (backends) through L6 (the PromQL front-end)** for
+metrics: encoding, parts, index, WAL, the engine head/flush/merge, the metrics fetch
+contract, and — new — the **PromQL read path** (`query/promql`) wired through the facade's
+`Query`. PromQL evaluation reuses the upstream Prometheus engine over an adapter (§3h); our
+own sharded query planner/cache (L5) and the other query languages (L6) remain pending, as
+does L0 (cluster). The rest of this document details what is built.
 
 ---
 
@@ -303,10 +306,37 @@ formats.
 
 The dual-shape read seam (metrics shape today). A `Request{Tenant, Start, End, Matchers}`
 carries **callback matchers** — `Matcher{Name, Match func(signal.Value) bool}`, never an
-operator enum, so equality/regex/negation live in the (future) language layer and the
-storage layer stays operator-free. `Fetcher.Fetch` returns an `Iterator` of `*Batch{ID,
-Series, Timestamps, Values}` (one batch per matching series for M3). `SliceIterator` and
-`Drain` are the in-memory helpers.
+operator enum, so equality/regex/negation live in the language layer (§3h) and the storage
+layer stays operator-free. `Fetcher.Fetch` returns an `Iterator` of `*Batch{ID, Series,
+Timestamps, Values}` (one batch per matching series for M3). `SliceIterator` and `Drain` are
+the in-memory helpers.
+
+## 3h. PromQL front-end (`query/promql/`, `query/`)
+
+PromQL is **not reimplemented**: `query/promql` adapts the fetch contract to the Prometheus
+`storage.Queryable` interface and drives the upstream `promql.Engine` (the same approach
+Mimir/Loki/Pyroscope take), so selector/lookback/rate/aggregation/binary-op semantics match
+Prometheus by construction. Our code is the seam:
+
+- **Matcher lowering (condition extraction lives here, never in storage).** A Prometheus
+  `*labels.Matcher` becomes a `fetch.Matcher` whose `Match` runs the matcher over the typed
+  value's text projection. Only **index-safe** matchers (those that do *not* match the empty
+  string) are pushed into the `fetch.Request`: a negated/absent matcher (`!=`, `!~`, `=""`)
+  would wrongly drop series lacking the label via the postings index, so every fetched series
+  is **re-checked against the full matcher set** (absent label = empty string) for exact
+  semantics.
+- **Label projection.** A `signal.Series` becomes a `labels.Labels`: resource/scope/point
+  attributes flatten to string labels, scope name/version under `otel.scope.*`, the internal
+  reserved labels (`__unit__`/`__kind__`/`__temporality__`/`__monotonic__`) hidden, `__name__`
+  kept. Each fetched batch becomes a Prometheus `SeriesSet` of float samples.
+- **Time units.** Storage is unix **nanoseconds**, Prometheus is **milliseconds**; the
+  adapter converts both directions.
+- **Result shape.** `query.Result` (Vector/Matrix/Scalar/String with ns timestamps) is the
+  neutral type returned through the facade, so the public API never leaks Prometheus types.
+
+L5 (our own sharded planner, results cache) is still provided by the embedded Prometheus
+engine, not yet by our `query/exec`. This adds a dependency on
+`github.com/prometheus/prometheus` — deliberate, scoped to `query/promql`.
 
 ---
 
@@ -333,9 +363,12 @@ ingest batches (`metric.Metrics`, and placeholder `log.Logs`/`trace.Traces`/
   merges every engine, applying per-tenant retention from the resolved policy. `Reset(ctx)`
   discards all ingested data (every engine's head + flushed parts), retaining the engines
   for reuse; it is gated to an **ephemeral backend** (`ErrNotEphemeral` otherwise) and is
-  meant for tests/benchmarks that reuse one store across runs. `Query` is the seam for the
-  query languages (M4); the low-level read path today is `engine.Fetch` via the fetch
-  contract.
+  meant for tests/benchmarks that reuse one store across runs. `Query(ctx, tenant, Query)`
+  runs the language front-end selected by `Query.Lang`: **PromQL is implemented** (§3h) —
+  it resolves the tenant's engine (without creating one for unknown tenants → empty result)
+  and evaluates via `query/promql`, returning the neutral `query.Result` (aliased as
+  `storage.Result`); LogQL/TraceQL return `ErrNotImplemented`. Times are unix nanoseconds;
+  `Step == 0` is an instant query at `End`. The low-level read path remains `engine.Fetch`.
 - **`Options` / `Option`** (`options.go`) — config struct plus functional options
   (`WithBackend`, `WithCluster`, `WithTenancy`, `WithEncoding`, `WithDurability`,
   `WithWALDir`, `WithFlushThresholdBytes`, `WithFlushInterval`, `WithOOOWindow`).
@@ -412,7 +445,8 @@ index/                symbols (intern) · series (id↔attrs) · postings (set-o
 wal/                  CRC-framed segmented write-ahead log + replay                    [implemented]
 engine/               head · flush · background-merge · retention · fetch (metrics)    [implemented]
 query/fetch           callback-matcher fetch contract (Request/Matcher/Iterator/Batch) [implemented for metrics]
-query/                plan · exec · language front-ends                               [seam only]
+query/                neutral Result value types (Vector/Matrix/Scalar/String)         [implemented]
+query/promql          PromQL front-end: fetch→Prometheus Queryable adapter + engine    [implemented]
 cluster/              etcd ring · HRW sharding · replication · rebalance               [seam only]
 ```
 

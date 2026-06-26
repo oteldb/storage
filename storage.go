@@ -11,6 +11,8 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/query"
+	qpromql "github.com/oteldb/storage/query/promql"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/log"
 	"github.com/oteldb/storage/signal/metric"
@@ -40,6 +42,8 @@ type Storage struct {
 	tmu     sync.Mutex
 	tenants map[signal.TenantID]*engine.Engine
 
+	promql *qpromql.Engine // PromQL query engine (Prometheus engine over the fetch contract)
+
 	stopCh chan struct{}  // closed by Close to stop the maintenance loop
 	wg     sync.WaitGroup // tracks the maintenance goroutine
 }
@@ -64,6 +68,7 @@ func Open(_ context.Context, o Options, opts ...Option) (*Storage, error) {
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
 	}
+	s.promql = qpromql.NewEngine()
 	if o.FlushInterval > 0 {
 		s.stopCh = make(chan struct{})
 		s.wg.Add(1)
@@ -190,16 +195,51 @@ func (s *Storage) WriteProfiles(_ context.Context, _ profile.Profiles) (Accepted
 	return s.notImplementedWrite("write profiles")
 }
 
-// Query runs a query against one tenant. The engine selects the language by [Query.Lang].
-// PromQL and the rest land at M4; for now the low-level read path is the fetch contract.
-func (s *Storage) Query(_ context.Context, t signal.TenantID, _ Query) (Result, error) {
+// Query runs a query against one tenant. The language front-end is selected by [Query.Lang]
+// (PromQL today; LogQL/TraceQL are later verticals and return [ErrNotImplemented]). The
+// PromQL path compiles to the fetch contract via the query/promql adapter and evaluates with
+// the embedded Prometheus engine. Times in [Query] are unix nanoseconds; Step == 0 is an
+// instant query at End.
+func (s *Storage) Query(ctx context.Context, t signal.TenantID, q Query) (Result, error) {
 	if s.closed.Load() {
 		return Result{}, errors.Wrap(ErrClosed, "query")
 	}
 
-	_ = s.tenant.Resolve(s.normalizeTenant(t)) // policy may gate query concurrency/limits
+	if q.Lang != LangPromQL {
+		return Result{}, ErrNotImplemented
+	}
 
-	return Result{}, ErrNotImplemented
+	tid := s.normalizeTenant(t)
+	_ = s.tenant.Resolve(tid) // policy may gate query concurrency/limits
+
+	eng, ok := s.lookupEngine(tid)
+	if !ok {
+		// No data ingested for this tenant ⇒ an empty result of the requested shape.
+		return emptyResult(q.Step), nil
+	}
+
+	return s.promql.Eval(ctx, eng, tid, qpromql.Params{Text: q.Text, Start: q.Start, End: q.End, Step: q.Step})
+}
+
+// lookupEngine returns the tenant's engine if it exists, without creating one (queries must
+// not materialize empty engines for unknown tenants).
+func (s *Storage) lookupEngine(tid signal.TenantID) (*engine.Engine, bool) {
+	s.tmu.Lock()
+	defer s.tmu.Unlock()
+
+	e, ok := s.tenants[tid]
+
+	return e, ok
+}
+
+// emptyResult is the empty result for a tenant with no data: an empty matrix for a range
+// query (Step > 0), an empty vector for an instant query.
+func emptyResult(step int64) Result {
+	if step > 0 {
+		return Result{Type: query.ResultMatrix}
+	}
+
+	return Result{Type: query.ResultVector}
 }
 
 func (s *Storage) notImplementedWrite(op string) (Accepted, error) {
@@ -373,12 +413,9 @@ func (l Lang) String() string {
 	}
 }
 
-// Result is a query result (DESIGN.md §9). The concrete shape (matrix/vector/scalar
-// for PromQL; log streams for LogQL; trace batches for TraceQL) is filled in at M4.
-// It is a placeholder now so the [Storage.Query] signature is stable.
-type Result struct {
-	// TODO(M4): a streaming result iterator or typed value.
-}
+// Result is a query result (DESIGN.md §9): the neutral [query.Result] shape (matrix/vector/
+// scalar/string). Timestamps are unix nanoseconds.
+type Result = query.Result
 
 // ErrNotImplemented is returned by scaffold-stub methods whose end-to-end wiring
 // lands in a later milestone. It is not a fatal error: embedders may compile against

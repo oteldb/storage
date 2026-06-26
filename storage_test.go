@@ -214,7 +214,8 @@ func TestUnimplementedSignals(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotImplemented)
 	_, err = s.WriteProfiles(ctx, profile.Profiles{})
 	require.ErrorIs(t, err, ErrNotImplemented)
-	_, err = s.Query(ctx, "", Query{Lang: LangPromQL})
+	// PromQL is implemented (M4); the still-unimplemented query languages return ErrNotImplemented.
+	_, err = s.Query(ctx, "", Query{Lang: LangLogQL, Text: "{}"})
 	require.ErrorIs(t, err, ErrNotImplemented)
 }
 
