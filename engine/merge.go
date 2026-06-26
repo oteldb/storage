@@ -3,6 +3,10 @@ package engine
 import (
 	"context"
 	"slices"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/oteldb/storage/signal"
 )
@@ -23,22 +27,44 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 // downsampling per opts. It is the one background-merge entry point; compaction, retention,
 // and downsampling are the same pass over the immutable parts (no separate subsystem).
 func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.merge",
+		trace.WithAttributes(
+			attribute.String("storage.prefix", e.cfg.Prefix),
+			attribute.Bool("storage.merge.downsample", len(opts.Downsample) > 0),
+			attribute.Bool("storage.merge.recompress", opts.Recompress != nil),
+		))
+	defer span.End()
 
-	return e.mergeLocked(ctx, opts)
+	startNs := time.Now()
+
+	e.mu.Lock()
+	compacted, err := e.mergeLocked(ctx, opts)
+	e.mu.Unlock()
+
+	if err != nil {
+		span.RecordError(err)
+	}
+
+	if compacted > 0 {
+		span.SetAttributes(attribute.Int("storage.merge.parts_in", compacted))
+		e.cfg.Obs.Merge.Record(ctx, metricSignal, time.Since(startNs), int64(compacted))
+	}
+
+	return err
 }
 
-func (e *Engine) mergeLocked(ctx context.Context, opts MergeOptions) error {
+// mergeLocked compacts the parts per opts and returns the number of source parts compacted (0 ⇒ a
+// no-op). The caller holds e.mu.
+func (e *Engine) mergeLocked(ctx context.Context, opts MergeOptions) (int, error) {
 	if len(e.parts) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	// A single part with no retention cutoff, nothing old enough to downsample, and nothing to
 	// recompress has nothing to gain — skip without decoding it.
 	if len(e.parts) == 1 && opts.RetainFrom <= 0 &&
 		!downsampleApplies(opts.Downsample, e.parts[0].minTime) && !recompressApplies(e.parts[0], opts.Recompress) {
-		return nil
+		return 0, nil
 	}
 
 	start := minInt64
@@ -48,17 +74,18 @@ func (e *Engine) mergeLocked(ctx context.Context, opts MergeOptions) error {
 
 	cols, err := e.compactParts(ctx, start, opts.Downsample)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// Fixed point: a single source part whose row count downsampling did not reduce, and which
 	// needs no recompression, is already at its target — rewriting it would only churn the backend.
 	if len(e.parts) == 1 && opts.RetainFrom <= 0 && len(cols.ts) == e.parts[0].rows() &&
 		!recompressApplies(e.parts[0], opts.Recompress) {
-		return nil
+		return 0, nil
 	}
 
 	old := e.parts
+	compacted := len(old)
 
 	if len(cols.ts) == 0 {
 		// Retention dropped every sample: keep no parts.
@@ -69,12 +96,12 @@ func (e *Engine) mergeLocked(ctx context.Context, opts MergeOptions) error {
 
 		// Recompress when the merged part is fully cold (its newest sample predates the cutoff).
 		if err := writePart(ctx, e.cfg.Backend, prefix, cols, coldProfile(opts.Recompress, maxT)); err != nil {
-			return err
+			return 0, err
 		}
 
 		p, err := openPart(ctx, e.cfg.Backend, prefix)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		p.minTime, p.maxTime = minT, maxT
@@ -86,16 +113,16 @@ func (e *Engine) mergeLocked(ctx context.Context, opts MergeOptions) error {
 	// crash mid-merge never leaves the index referencing a deleted part (it may leave orphan
 	// objects, which are harmless and reclaimed by a later merge).
 	if err := e.updateIndexLocked(ctx); err != nil {
-		return err
+		return 0, err
 	}
 
 	for _, p := range old {
 		if err := deletePart(ctx, e.cfg.Backend, p.prefix); err != nil {
-			return err
+			return compacted, err
 		}
 	}
 
-	return nil
+	return compacted, nil
 }
 
 // compactParts merges every part's samples per series (within [start, maxInt64], so
@@ -151,7 +178,7 @@ func (e *Engine) Close(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := e.flushLocked(ctx); err != nil {
+	if _, err := e.flushLocked(ctx); err != nil {
 		return err
 	}
 

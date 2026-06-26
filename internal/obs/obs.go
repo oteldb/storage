@@ -33,6 +33,9 @@ type Obs struct {
 	Log       *zap.Logger
 	Tracer    trace.Tracer
 	Admission *Admission
+	Flush     *Flush
+	Merge     *Merge
+	Fetch     *Fetch
 }
 
 // New builds the observability handle, defaulting each unset pillar to its no-op implementation.
@@ -53,7 +56,14 @@ func New(cfg Config) (*Obs, error) {
 		mp = mnoop.NewMeterProvider()
 	}
 
-	adm, err := newAdmission(mp.Meter(scope))
+	meter := mp.Meter(scope)
+
+	adm, err := newAdmission(meter)
+	if err != nil {
+		return nil, err
+	}
+
+	flush, merge, fetch, err := newEngineInstruments(meter)
 	if err != nil {
 		return nil, err
 	}
@@ -62,6 +72,9 @@ func New(cfg Config) (*Obs, error) {
 		Log:       log,
 		Tracer:    tp.Tracer(scope),
 		Admission: adm,
+		Flush:     flush,
+		Merge:     merge,
+		Fetch:     fetch,
 	}, nil
 }
 

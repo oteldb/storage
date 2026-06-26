@@ -295,3 +295,31 @@ func TestWriteMetricsEmitsAdmissionMetrics(t *testing.T) {
 	assert.Equal(t, int64(1), sumCounter(t, rm, "storage.ingest.accepted", map[string]string{"signal": "metric"}))
 	assert.Equal(t, int64(1), sumCounter(t, rm, "storage.ingest.rejected", map[string]string{"signal": "metric", "reason": "max_series"}))
 }
+
+func TestEngineFlushAndFetchMetricsEmitted(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	s, err := InMemory(WithMeterProvider(mp))
+	require.NoError(t, err)
+
+	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{1, 2}, []float64{1, 2}))
+	require.NoError(t, err)
+	s.maintain(ctx) // flushes the head to a part
+
+	it, err := s.Fetcher("default").Fetch(ctx, fetch.Request{
+		Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{nameMatcher("m")},
+	})
+	require.NoError(t, err)
+	_, err = fetch.Drain(ctx, it)
+	require.NoError(t, err)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &rm))
+
+	assert.Positive(t, sumCounter(t, rm, "storage.flush.total", map[string]string{"signal": "metric"}))
+	assert.Positive(t, sumCounter(t, rm, "storage.fetch.total", map[string]string{"signal": "metric"}))
+}

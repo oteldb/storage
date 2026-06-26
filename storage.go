@@ -751,6 +751,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		Backend:   s.backend,
 		Prefix:    prefix,
 		WAL:       w,
+		Obs:       s.obs,
 	})
 	s.tenants[tid] = e
 

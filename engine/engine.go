@@ -5,10 +5,14 @@ import (
 	"context"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/go-faster/errors"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
@@ -26,6 +30,9 @@ type Config struct {
 	// Prefix is the backend key prefix under which this engine's parts are written
 	// (typically "{tenant}/metrics").
 	Prefix string
+	// Obs is the observability handle (spans + metrics). nil ⇒ a no-op handle, so an engine
+	// constructed without one logs/spans/counts nothing.
+	Obs *obs.Obs
 }
 
 // Engine is a single tenant's storage engine. Safe for concurrent use.
@@ -41,8 +48,15 @@ var _ fetch.Fetcher = (*Engine)(nil)
 
 // New returns an engine with an empty head.
 func New(cfg Config) *Engine {
+	if cfg.Obs == nil {
+		cfg.Obs = obs.NewNop()
+	}
+
 	return &Engine{cfg: cfg, head: newHead()}
 }
+
+// metricSignal is the signal label for this engine's observability (it is the metrics engine).
+const metricSignal = "metric"
 
 // Append ingests one sample for series s, logging to the WAL when durable. It returns
 // whether the sample was accepted (false ⇒ rejected as out-of-order beyond the window).
@@ -152,6 +166,12 @@ func (e *Engine) HeadBytes() int64 {
 // and returns one batch per series with its samples in the window, merged across the head
 // buffer and every part by timestamp.
 func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
+	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.fetch",
+		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
+	defer span.End()
+
+	startNs := time.Now()
+
 	// The label index sorts lazily on first read after a write, mutating in place. Reads run
 	// under the shared lock (concurrent fetches are allowed — e.g. split-by-interval), so do
 	// that one-time sort under the exclusive lock first: hold the read lock, and while the
@@ -169,8 +189,12 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	defer e.mu.RUnlock()
 
 	ids := e.head.resolve(r.Matchers)
+	partsScanned := len(e.parts)
 
-	var batches []*fetch.Batch
+	var (
+		batches []*fetch.Batch
+		rows    int
+	)
 
 	for _, id := range ids {
 		s, _ := e.head.series.Get(id)
@@ -181,6 +205,8 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		// wins on a duplicate timestamp.
 		for _, p := range e.parts {
 			if err := p.mergeInto(ctx, id, &m, r.Start, r.End); err != nil {
+				span.RecordError(err)
+
 				return nil, err
 			}
 		}
@@ -191,8 +217,16 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 		if ts, values, sf := m.collect(); len(ts) > 0 {
 			batches = append(batches, &fetch.Batch{ID: id, Series: s, Timestamps: ts, Values: values, ScaleFactors: sf})
+			rows += len(ts)
 		}
 	}
+
+	span.SetAttributes(
+		attribute.Int("storage.series_matched", len(ids)),
+		attribute.Int("storage.parts_scanned", partsScanned),
+		attribute.Int("storage.rows", rows),
+	)
+	e.cfg.Obs.Fetch.Record(ctx, metricSignal, time.Since(startNs), int64(len(ids)), int64(partsScanned), int64(rows))
 
 	return fetch.NewSliceIterator(batches), nil
 }
@@ -270,10 +304,26 @@ func (m *sampleMerge) collect() (tsOut []int64, values, sf []float64) {
 // (the series index is retained). It is a no-op if the head holds no samples. Requires a
 // [Config.Backend].
 func (e *Engine) Flush(ctx context.Context) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.flush",
+		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
+	defer span.End()
 
-	return e.flushLocked(ctx)
+	startNs := time.Now()
+
+	e.mu.Lock()
+	rows, err := e.flushLocked(ctx)
+	e.mu.Unlock()
+
+	if err != nil {
+		span.RecordError(err)
+	}
+
+	if rows > 0 {
+		span.SetAttributes(attribute.Int("storage.rows", rows))
+		e.cfg.Obs.Flush.Record(ctx, metricSignal, time.Since(startNs), int64(rows))
+	}
+
+	return err
 }
 
 // Reset discards all of the engine's data — the in-memory head (samples + series index)
@@ -443,22 +493,25 @@ func (e *Engine) SeriesCount() int {
 	return e.head.series.Len()
 }
 
-func (e *Engine) flushLocked(ctx context.Context) error {
+// flushLocked drains the head to a new part and returns the number of rows flushed (0 ⇒ the head
+// held nothing). The caller holds e.mu.
+func (e *Engine) flushLocked(ctx context.Context) (int, error) {
 	cols := e.head.drainHead()
 	if cols == nil {
-		return nil
+		return 0, nil
 	}
 
+	rows := len(cols.ts)
 	prefix := e.partPrefix(e.nextSeq)
 	// Flush writes freshly-ingested (warm) data with the default codec-only framing; recompression
 	// of cold data happens later, at merge.
 	if err := writePart(ctx, e.cfg.Backend, prefix, cols, nil); err != nil {
-		return err
+		return 0, err
 	}
 
 	p, err := openPart(ctx, e.cfg.Backend, prefix)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	p.minTime, p.maxTime = colsTimeRange(cols)
@@ -466,17 +519,17 @@ func (e *Engine) flushLocked(ctx context.Context) error {
 	e.nextSeq++
 
 	if err := e.updateIndexLocked(ctx); err != nil {
-		return err
+		return rows, err
 	}
 
 	if err := e.writeSeriesIndexLocked(ctx); err != nil {
-		return err
+		return rows, err
 	}
 
 	// The part (and its index) is durable, so the WAL records it covers are obsolete.
 	if e.cfg.WAL != nil {
-		return e.cfg.WAL.Checkpoint()
+		return rows, e.cfg.WAL.Checkpoint()
 	}
 
-	return nil
+	return rows, nil
 }
