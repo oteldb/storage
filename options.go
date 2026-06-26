@@ -4,6 +4,9 @@ import (
 	"time"
 
 	"github.com/go-faster/errors"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/cluster"
@@ -79,6 +82,17 @@ type Options struct {
 	// it), so only settled/historical windows are memoized. 0 ⇒ no guard (cache every eligible
 	// request). Ignored when QueryCacheEntries is 0.
 	QueryCacheFreshness int64 // nanoseconds
+
+	// Observability is injected, never owned (DESIGN.md §16): the library logs, traces, and meters
+	// through the embedder's handles and is a zero-overhead no-op when they are unset. The library
+	// imports only the OTel API; the embedder owns the SDK, sampling, and exporters.
+	//
+	// Logger is the zap logger (nil ⇒ a no-op logger). TracerProvider supplies OTel spans (nil ⇒
+	// the OTel noop tracer). MeterProvider supplies OTel metrics, including the mandatory admission
+	// meta-metrics (nil ⇒ the OTel noop meter).
+	Logger         *zap.Logger
+	TracerProvider trace.TracerProvider
+	MeterProvider  metric.MeterProvider
 }
 
 // Durability is the WAL + flush policy (DESIGN.md §5, §8).
@@ -169,6 +183,20 @@ func WithFlushInterval(ns int64) Option { return func(o *Options) { o.FlushInter
 
 // WithOOOWindow sets the out-of-order ingestion window in nanoseconds.
 func WithOOOWindow(ns int64) Option { return func(o *Options) { o.OOOWindow = ns } }
+
+// WithLogger sets the zap logger the library logs through (DESIGN.md §16). nil ⇒ a no-op logger.
+func WithLogger(l *zap.Logger) Option { return func(o *Options) { o.Logger = l } }
+
+// WithTracerProvider sets the OTel tracer provider for the library's spans. nil ⇒ the noop tracer.
+func WithTracerProvider(tp trace.TracerProvider) Option {
+	return func(o *Options) { o.TracerProvider = tp }
+}
+
+// WithMeterProvider sets the OTel meter provider for the library's metrics (including the admission
+// meta-metrics). nil ⇒ the noop meter.
+func WithMeterProvider(mp metric.MeterProvider) Option {
+	return func(o *Options) { o.MeterProvider = mp }
+}
 
 // WithQuerySplitInterval enables split-by-interval on [Storage.Fetcher]: a query window is
 // divided into aligned sub-windows of ns nanoseconds, fetched concurrently and merged. ns ≤ 0

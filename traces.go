@@ -30,7 +30,7 @@ func (s *Storage) WriteTraces(ctx context.Context, td trace.Traces) (Accepted, e
 		return s.writeRecordsClustered(ctx, signal.Trace, project)
 	}
 
-	return s.writeRecordsLocal(project, s.traceEngineFor)
+	return s.writeRecordsLocal(ctx, signal.Trace, project, s.traceEngineFor)
 }
 
 // TraceFetcher returns the read seam for traces — a [fetch.Fetcher] over the named tenants' span

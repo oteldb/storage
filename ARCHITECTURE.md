@@ -750,9 +750,12 @@ Three valves:
 
 `engine.AppendBatch` returns an `AppendResult` breaking accepted/rejected down by reason
 (`RejectedOOO`/`RejectedCardinality`/`RejectedBytes`), which the facade folds — together with rate
-rejections — into the `Accepted` reply and into per-tenant **meta-metrics** (`AdmissionStats`,
-exposed by `Storage.AdmissionStats(tenant)`: accepted plus rejected-by-reason plus
-`SampledDropped`), so an operator can see which valve tripped.
+rejections — into the `Accepted` reply, into per-tenant **meta-metrics** (`AdmissionStats`, exposed
+by `Storage.AdmissionStats(tenant)`: accepted plus rejected-by-reason plus `SampledDropped`), and —
+when a meter is configured — into **OTel counters** via the injected observability handle
+(`internal/obs`, §4a): `storage.ingest.accepted` / `.rejected` (by `reason`+`signal`) /
+`.sampled_dropped`, emitted **once per write** (bulk, never per point). So an operator sees which
+valve tripped both in-process and in their metrics backend.
 
 **Budgeted (lossy) sampling — the StatsHouse-style unbiased path** (`Limits` is the lossless floor;
 this is the lossy ceiling). Under `Sampling.MaxRowsPerSecond`, when a tenant exceeds the budget the
@@ -863,6 +866,18 @@ query-language path stays in the embedder. The `Write*` methods take the library
 - **`backend`** — the L1 seam (detailed in §3a): `Read`/`Write`/`List`/`Delete` over
   whole-object keys, with memory and file implementations. s3 + CAS pending.
 
+### 4a. Observability handle (`internal/obs`)
+
+Observability is **injected, never owned** (DESIGN §16). `internal/obs.Obs` bundles the three
+pillars — a `*zap.Logger`, an OTel `trace.Tracer`, and the metric instruments — built once by
+`obs.New` from `Options.{Logger, TracerProvider, MeterProvider}` and held on the facade (`s.obs`,
+never nil after `Open`). Each unset pillar defaults to its **no-op** implementation (`zap.NewNop`,
+the OTel noop tracer/meter), so an unconfigured store logs, spans, and counts nothing at zero
+overhead, and the library imports only the OTel **API** — the embedder owns the SDK and exporters.
+**Built today:** the handle + `Options` wiring + the **admission meta-metrics** (`obs.Admission`),
+emitted once per write from the facade for every signal (§3k). The rest of §16 (per-layer spans +
+metrics, and the `query/profile` EXPLAIN ANALYZE tree) is forward-looking.
+
 ---
 
 ## 5. Cross-cutting invariants (enforced today)
@@ -913,6 +928,7 @@ encoding/             umbrella doc for the codec layers
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
 internal/simd         vectorized columnar kernels (AVX2) + pure-Go fallback + runtime CPU dispatch [implemented: int64 min/max]
 internal/cmd/gensimd  avo generator for internal/simd's committed *_amd64.s (//go:generate)   [implemented]
+internal/obs          injected observability handle: zap logger + OTel tracer + admission meta-metrics (no-op default) [implemented; per-layer spans/metrics + EXPLAIN ANALYZE pending]
 signal/               typed Attributes/Value, Resource/Scope/Series identity, 128-bit SeriesID, Signal, TenantID, Aggregation [implemented]
   signal/metric       []byte-based OTLP-shaped Metrics ingest batch (resettable/pooled) + identity + projection (gauge/sum; histogram/exp-histogram/summary via classic decomposition in otlp/pdataconv) [implemented]
   signal/log          []byte-based OTLP-shaped Logs ingest batch (resettable/pooled) + stream identity + projection [implemented]

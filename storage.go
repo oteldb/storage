@@ -18,6 +18,7 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/scale"
 	"github.com/oteldb/storage/recordengine"
@@ -59,6 +60,8 @@ type Storage struct {
 	admit   map[signal.TenantID]*tenantAdmission // per-tenant admission state (rate valve + counters)
 	now     func() int64                         // unix-nano clock for admission; overridable in tests
 
+	obs *obs.Obs // injected logging/tracing/metrics (no-op by default); never nil after Open
+
 	stopCh chan struct{}  // closed by Close to stop the maintenance loop
 	wg     sync.WaitGroup // tracks the maintenance goroutine
 }
@@ -88,6 +91,13 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
 	}
+
+	observer, err := obs.New(obs.Config{Logger: o.Logger, TracerProvider: o.TracerProvider, MeterProvider: o.MeterProvider})
+	if err != nil {
+		return nil, errors.Wrap(err, "init observability")
+	}
+
+	s.obs = observer
 
 	if o.QueryCacheEntries > 0 {
 		s.queryCache = scale.NewMemoryCache(o.QueryCacheEntries)
@@ -244,7 +254,10 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted
 		return s.writeMetricsClustered(ctx, md)
 	}
 
-	var rej rejectTally
+	var (
+		rej            rejectTally
+		sampledDropped int64
+	)
 
 	// The tenant (hence the engine) is derived from Resource+Scope, which are constant within
 	// a metric, so points arrive in tenant-contiguous runs. Cache the last resolution to skip
@@ -322,6 +335,7 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted
 			ids, tss, vals, sf = fids, fts, fvals, fsf
 			mat = func(j int) signal.Series { return b.Series(kept[j]) }
 			lastAdmit.recordSampledDropped(dropped)
+			sampledDropped += dropped
 		}
 
 		res, err := lastEng.AppendBatch(ids, tss, vals, sf, mat, engine.AppendLimits{
@@ -345,9 +359,11 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted
 	}
 
 	total := rej.total()
+	accepted := int64(emitted) - total
+	s.emitAdmission(ctx, signal.Metric, accepted, rej, sampledDropped)
 
 	return Accepted{
-		Accepted:       int64(emitted) - total,
+		Accepted:       accepted,
 		Rejected:       total,
 		RejectedReason: rej.reason(),
 	}, nil

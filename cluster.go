@@ -635,7 +635,11 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 		rejected += int64(rej)
 	}
 
-	return Accepted{Accepted: int64(emitted) - rejected, Rejected: rejected}, nil
+	// The primary's rejections are out-of-order drops (admission is applied at the origin today).
+	accepted := int64(emitted) - rejected
+	s.emitAdmission(ctx, signal.Metric, accepted, rejectTally{ooo: rejected}, 0)
+
+	return Accepted{Accepted: accepted, Rejected: rejected}, nil
 }
 
 const primaryWritePath = "/internal/primary-write"

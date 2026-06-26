@@ -6,6 +6,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -237,4 +240,58 @@ func TestWriteMetricsNoLimitsUnaffected(t *testing.T) {
 	assert.Zero(t, a.Rejected)
 	assert.Empty(t, a.RejectedReason)
 	assert.Equal(t, int64(3), s.AdmissionStats("default").Accepted)
+}
+
+func sumCounter(t *testing.T, rm metricdata.ResourceMetrics, name string, want map[string]string) int64 {
+	t.Helper()
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			var total int64
+			for _, dp := range sum.DataPoints {
+				match := true
+				for k, v := range want {
+					av, has := dp.Attributes.Value(attribute.Key(k))
+					if !has || av.AsString() != v {
+						match = false
+						break
+					}
+				}
+				if match {
+					total += dp.Value
+				}
+			}
+			return total
+		}
+	}
+	return 0
+}
+
+func TestWriteMetricsEmitsAdmissionMetrics(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	s, err := InMemory(WithMeterProvider(mp), WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+		return tenant.Policy{Limits: tenant.Limits{MaxSeries: 1}}
+	})))
+	require.NoError(t, err)
+
+	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m1", []int64{1}, []float64{1}))
+	require.NoError(t, err)
+	// Second distinct series exceeds the cardinality cap ⇒ one rejected (max_series).
+	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m2", []int64{1}, []float64{1}))
+	require.NoError(t, err)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &rm))
+
+	assert.Equal(t, int64(1), sumCounter(t, rm, "storage.ingest.accepted", map[string]string{"signal": "metric"}))
+	assert.Equal(t, int64(1), sumCounter(t, rm, "storage.ingest.rejected", map[string]string{"signal": "metric", "reason": "max_series"}))
 }

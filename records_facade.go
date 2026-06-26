@@ -59,7 +59,9 @@ type recordEngineFunc func(signal.TenantID) (*recordengine.Engine, error)
 
 // writeRecordsLocal ingests a projected record batch into per-tenant engines (single-node path),
 // deriving the tenant from each stream's Resource+Scope and returning OTLP partial-success counts.
-func (s *Storage) writeRecordsLocal(project recordProjector, engineFor recordEngineFunc) (Accepted, error) {
+func (s *Storage) writeRecordsLocal(
+	ctx context.Context, sig signal.Signal, project recordProjector, engineFor recordEngineFunc,
+) (Accepted, error) {
 	var (
 		rej        rejectTally
 		firstErr   error
@@ -121,8 +123,10 @@ func (s *Storage) writeRecordsLocal(project recordProjector, engineFor recordEng
 	}
 
 	total := rej.total()
+	accepted := int64(emitted) - total
+	s.emitAdmission(ctx, sig, accepted, rej, 0) // records are not sampled
 
-	return Accepted{Accepted: int64(emitted) - total, Rejected: total, RejectedReason: rej.reason()}, nil
+	return Accepted{Accepted: accepted, Rejected: total, RejectedReason: rej.reason()}, nil
 }
 
 // writeRecordsClustered frames each tenant's streams+records as a WAL payload and routes it to the
@@ -147,7 +151,10 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 		rejected += int64(rej)
 	}
 
-	return Accepted{Accepted: int64(emitted) - rejected, Rejected: rejected}, nil
+	accepted := int64(emitted) - rejected
+	s.emitAdmission(ctx, sig, accepted, rejectTally{ooo: rejected}, 0)
+
+	return Accepted{Accepted: accepted, Rejected: rejected}, nil
 }
 
 // recordFetcher builds a record signal's read seam over the named tenants: owner-aware in cluster

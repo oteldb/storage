@@ -31,7 +31,7 @@ func (s *Storage) WriteProfiles(ctx context.Context, pd profile.Profiles) (Accep
 		return s.writeRecordsClustered(ctx, signal.Profile, project)
 	}
 
-	return s.writeRecordsLocal(project, s.profileEngineFor)
+	return s.writeRecordsLocal(ctx, signal.Profile, project, s.profileEngineFor)
 }
 
 // ProfileFetcher returns the read seam for profiles — a [fetch.Fetcher] over the named tenants'

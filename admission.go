@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"sync"
 
 	"github.com/oteldb/storage/signal"
@@ -233,4 +234,19 @@ func (s *Storage) AdmissionStats(tid signal.TenantID) AdmissionStats {
 	}
 
 	return a.stats()
+}
+
+// emitAdmission records a write's admission outcome to the OTel meta-metrics (DESIGN §8a/§16): the
+// accepted count, the per-reason rejections, and the sampled-dropped count, all tagged with the
+// signal. It is called once per write (bulk), so it never touches the per-point hot path; with the
+// no-op meter it is a no-op.
+func (s *Storage) emitAdmission(ctx context.Context, sig signal.Signal, accepted int64, rej rejectTally, sampled int64) {
+	name := sig.String()
+	a := s.obs.Admission
+	a.Accepted(ctx, accepted, name)
+	a.Rejected(ctx, rej.ooo, name, "out_of_order")
+	a.Rejected(ctx, rej.rate, name, "rate_limit")
+	a.Rejected(ctx, rej.cardinality, name, "max_series")
+	a.Rejected(ctx, rej.inflight, name, "max_in_flight_bytes")
+	a.SampledDropped(ctx, sampled, name)
 }

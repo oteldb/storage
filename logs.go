@@ -29,7 +29,7 @@ func (s *Storage) WriteLogs(ctx context.Context, ld log.Logs) (Accepted, error) 
 		return s.writeRecordsClustered(ctx, signal.Log, project)
 	}
 
-	return s.writeRecordsLocal(project, s.logEngineFor)
+	return s.writeRecordsLocal(ctx, signal.Log, project, s.logEngineFor)
 }
 
 // LogFetcher returns the read seam for logs — a [fetch.Fetcher] over the named tenants' log data
