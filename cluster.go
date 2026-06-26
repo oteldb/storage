@@ -330,16 +330,47 @@ func (f *filteringFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.It
 }
 
 // matchesAllSeries reports whether s satisfies every matcher (each over the present value of
-// its named attribute).
+// its named label).
 func matchesAllSeries(s signal.Series, matchers []fetch.Matcher) bool {
 	for i := range matchers {
-		v, ok := s.Attributes.Get(matchers[i].Name)
+		v, ok := lookupSeriesLabel(s, matchers[i].Name)
 		if !ok || !matchers[i].Match(v) {
 			return false
 		}
 	}
 
 	return true
+}
+
+// lookupSeriesLabel resolves a label value from a series the way the engine indexes it for matching
+// (recordengine's indexLabels / metric's series labels): the series' own attributes, then the
+// resource and scope attributes, then the reserved scope name/version labels. This is what lets a
+// fan-out matcher on a resource label (e.g. service.name) re-filter correctly for the record signals.
+func lookupSeriesLabel(s signal.Series, name []byte) (signal.Value, bool) {
+	if v, ok := s.Attributes.Get(name); ok {
+		return v, true
+	}
+
+	if v, ok := s.Resource.Attributes.Get(name); ok {
+		return v, true
+	}
+
+	if v, ok := s.Scope.Attributes.Get(name); ok {
+		return v, true
+	}
+
+	switch string(name) {
+	case "otel.scope.name":
+		if len(s.Scope.Name) > 0 {
+			return signal.StringValue(s.Scope.Name), true
+		}
+	case "otel.scope.version":
+		if len(s.Scope.Version) > 0 {
+			return signal.StringValue(s.Scope.Version), true
+		}
+	}
+
+	return signal.Value{}, false
 }
 
 // close tears down the cluster runtime: deregister (revoke lease), stop the server, close the

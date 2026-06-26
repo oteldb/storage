@@ -131,6 +131,65 @@ func TestProjectStreamsAndAttributes(t *testing.T) {
 	assert.Equal(t, want, batches[0].Bytes[bAttrs][0])
 }
 
+// TestModelBuildersAndPool exercises the dictionary Add helpers, the pool round-trip, and Reset.
+func TestModelBuildersAndPool(t *testing.T) {
+	t.Parallel()
+
+	pd := GetProfiles()
+	d := &pd.Dictionary
+	m := d.AddMapping(Mapping{FilenameStrindex: d.InternString([]byte("libc.so"))})
+	loc := d.AddLocation(Location{MappingIndex: m, Address: 0x1000})
+	st := d.AddStack(loc)
+	link := d.AddLink(Link{TraceID: []byte("trace"), SpanID: []byte("span")})
+
+	rp := pd.AddResource()
+	rp.Resource = svcResource("api")
+	pr := rp.AddScope().AddProfile()
+	pr.TimeNanos = 1
+	s := pr.AddSample()
+	s.StackIndex, s.LinkIndex, s.Values = st, link, []int64{1}
+
+	require.Len(t, collect(pd), 1)
+
+	// Reset clears every table and the hierarchy; the pool reuses the backing arrays.
+	PutProfiles(pd)
+	got := GetProfiles()
+	assert.Empty(t, got.Resources)
+	assert.Empty(t, got.Dictionary.Strings)
+	PutProfiles(got)
+}
+
+// TestProjectLinkAndMapping verifies a sample's link resolves into the trace/span id columns and a
+// mapped location round-trips through the symbol delta.
+func TestProjectLinkAndMapping(t *testing.T) {
+	t.Parallel()
+
+	var pd Profiles
+	d := &pd.Dictionary
+	m := d.AddMapping(Mapping{FilenameStrindex: d.InternString([]byte("app"))})
+	loc := d.AddLocation(Location{MappingIndex: m, Lines: []Line{{FunctionIndex: d.AddFunction(Function{NameStrindex: d.InternString([]byte("f"))})}}})
+	st := d.AddStack(loc)
+	link := d.AddLink(Link{TraceID: []byte("T"), SpanID: []byte("S")})
+
+	rp := pd.AddResource()
+	rp.Resource = svcResource("api")
+	pr := rp.AddScope().AddProfile()
+	pr.TimeNanos = 1
+	s := pr.AddSample()
+	s.StackIndex, s.LinkIndex, s.Values = st, link, []int64{1}
+
+	b := collect(&pd)[0]
+	assert.Equal(t, [][]byte{[]byte("T")}, b.Bytes[bTraceID])
+	assert.Equal(t, [][]byte{[]byte("S")}, b.Bytes[bSpanID])
+
+	// The mapping is recorded in the symbol delta's mappings table.
+	store := NewSymbolStore()
+	require.NoError(t, store.Absorb(b.Side))
+	mappings := map[signal.SeriesID][]byte{}
+	require.NoError(t, decodeTable(mappings, store.Encode()["mappings"]))
+	assert.Len(t, mappings, 1)
+}
+
 // TestProjectMalformedIndicesNoPanic feeds out-of-range dictionary indices and asserts Project still
 // produces rows without panicking (defensive resolution).
 func TestProjectMalformedIndicesNoPanic(t *testing.T) {

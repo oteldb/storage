@@ -31,9 +31,9 @@ import (
 // optional otlp/pdataconv bridge, which keeps pdata off this hot path. Reads go through the
 // language-agnostic [Storage.Fetcher] seam; query languages live in the embedder.
 //
-// This is a scaffold stub: ingestion and query are wired end-to-end at M3 (metrics
-// vertical). The methods currently validate arguments and return
-// [ErrNotImplemented] so the surface is stable for embedders to compile against.
+// All four signals are wired end-to-end: metrics ([Storage.WriteMetrics]/[Storage.Fetcher]) on the
+// float-sample engine, and logs, traces, and profiles ([Storage.WriteLogs]/[Storage.WriteTraces]/
+// [Storage.WriteProfiles] and their fetchers) on the shared record engine.
 type Storage struct {
 	opts    Options
 	backend backend.Backend
@@ -627,8 +627,3 @@ type Accepted struct {
 // this is a columnar storage library, and the embedder owns the query languages
 // (PromQL/LogQL/TraceQL) — driving them over [fetch.Fetcher] (see the optional query/promql
 // adapter). There is deliberately no Storage.Query / query-language type here.
-
-// ErrNotImplemented is returned by scaffold-stub methods whose end-to-end wiring
-// lands in a later milestone. It is not a fatal error: embedders may compile against
-// the surface and gate on [errors.Is](err, [ErrNotImplemented]).
-var ErrNotImplemented = errors.New("storage: not implemented in this milestone")

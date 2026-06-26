@@ -24,12 +24,12 @@ column-codec layer), the **part format** (`block`) and **storage backends**
 new in M3 — the **single-node metrics engine** (`engine`): an in-memory head, flush to
 immutable flat parts, size-tiered merge with retention, and the **fetch contract**
 (`query/fetch`) reading head ∪ parts, all driven through the **public facade**
-(`storage`) which ingests OTLP **metrics, logs, and traces** (`signal/metric` / `signal/log` /
-`signal/trace` projection) and routes them per-tenant, single-node or **clustered** (etcd ring,
-primary-authoritative replication, read fan-out). Logs and traces share one schema-driven
-**record engine** (`recordengine`). The remaining layers — query languages
-(PromQL/LogQL/TraceQL/…) and the query planner — are the embedder's, reached through the fetch
-seam; profiles are a later vertical.
+(`storage`) which ingests OTLP **metrics, logs, traces, and profiles** (`signal/metric` /
+`signal/log` / `signal/trace` / `signal/profile` projection) and routes them per-tenant, single-node
+or **clustered** (etcd ring, primary-authoritative replication, read fan-out). Logs, traces, and
+profiles share one schema-driven **record engine** (`recordengine`). The remaining layers — query
+languages (PromQL/LogQL/TraceQL/…) and the query planner — are the embedder's, reached through the
+fetch seam.
 
 ---
 
@@ -42,11 +42,11 @@ The design is a single columnar engine with swappable front-ends and backends
 |---|---|---|
 | L6 Query languages | promql/logql/traceql/genericql | **owned by the embedder, not the library** — the library exposes the fetch seam; `query/promql` is an optional fetch→Prometheus-Queryable *adapter* (no engine) |
 | L5 Query engine | plan IR · sharding · streaming exec · cache | **embedder's concern** (it drives its own engine over the fetch contract); the planner/streaming exec is out of scope — but the part expressible purely over the fetch contract (split-by-interval + results cache) ships as `query/scale` decorators (§3g) |
-| L4 **Fetch contract** | **callback matchers + column conditions + window → iterator of batches** | **the library's query surface** (`query/fetch`, exposed via `Storage.Fetcher`/`Storage.LogFetcher`/`Storage.TraceFetcher`); dual-shape implemented for **metrics, logs, and traces** (matchers + Conditions + Projection + SecondPass), with `query/scale` split + cache decorators |
-| L3 **Engine** / **Index / WAL** | **head · flush · merge · retention** / **symbols · series · postings · token blooms** / **write-ahead log** | **metrics engine** (`engine`) **and the shared record engine** (`recordengine`, schema-driven — **logs and traces**) implemented; **index + wal implemented**, with `index/bloom` per-column token/equality filters |
+| L4 **Fetch contract** | **callback matchers + column conditions + window → iterator of batches** | **the library's query surface** (`query/fetch`, exposed via `Storage.Fetcher`/`Storage.LogFetcher`/`Storage.TraceFetcher`/`Storage.ProfileFetcher`); dual-shape implemented for **metrics, logs, traces, and profiles** (matchers + Conditions + Projection + SecondPass), with `query/scale` split + cache decorators |
+| L3 **Engine** / **Index / WAL** | **head · flush · merge · retention** / **symbols · series · postings · token blooms** / **write-ahead log** | **metrics engine** (`engine`) **and the shared record engine** (`recordengine`, schema-driven — **logs, traces, profiles**, with an optional content-addressed side store) implemented; **index + wal implemented**, with `index/bloom` per-column token/equality filters |
 | L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
 | L1 **Backend** | file · s3 · memory behind one interface | **memory + file + s3 implemented**, with `PutIfAbsent` CAS; `bucketindex` for stateless part enumeration |
-| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **full L0 implemented**: ring, membership, quorum replication, rebalance plan + executor, clustered ingest, read fan-out — for **metrics, logs, and traces** (one signal-discriminated write/read path) |
+| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **full L0 implemented**: ring, membership, quorum replication, rebalance plan + executor, clustered ingest, read fan-out — for **metrics, logs, traces, and profiles** (one signal-discriminated write/read path) |
 
 The **implemented substance spans L1 (backends) through L4 (the fetch contract)** for
 metrics: encoding, parts, index, WAL, the engine head/flush/merge, and the metrics fetch
@@ -540,14 +540,15 @@ equality matcher pushdown (above).
 
 ---
 
-## 3j. Record signals — logs & traces (`recordengine`, `signal/log`, `signal/trace`, `index/bloom`)
+## 3j. Record signals — logs, traces & profiles (`recordengine`, `signal/log`, `signal/trace`, `signal/profile`, `index/bloom`)
 
-Logs and traces are **record-shaped** signals: a stream (a Resource+Scope identity, indexed by the
-postings index exactly like a metric series) of rows that each carry a primary timestamp plus a
-fixed set of typed columns. Unlike a metric's `(ts, float)` sample, a record's per-row fields vary
-*within* the stream, so they are **columns filtered by predicate**, not identity — the dual-shape
-fetch contract (§3g): **Matchers resolve the stream, Conditions filter its records.** Both signals
-share one engine; only the column schema and projection differ.
+Logs, traces, and profiles are **record-shaped** signals: a stream (a Resource+Scope identity,
+indexed by the postings index exactly like a metric series) of rows that each carry a primary
+timestamp plus a fixed set of typed columns. Unlike a metric's `(ts, float)` sample, a record's
+per-row fields vary *within* the stream, so they are **columns filtered by predicate**, not identity
+— the dual-shape fetch contract (§3g): **Matchers resolve the stream, Conditions filter its
+records.** All three share one engine; only the column schema, projection, and (for profiles) an
+optional side store differ.
 
 - **Shared engine** (`recordengine`) is the metrics engine's structural twin, generalized over a
   `Schema` of `Column{Name, Kind(Int64|Bytes), Codec, Bloom(None|FullText|Attrs|Equality)}` (the
@@ -571,6 +572,13 @@ share one engine; only the column schema and projection differ.
   bloom proves a required `Condition.Tokens`/`Condition.Equal` absent, then re-checks per row.
 - **WAL** carries a signal-agnostic records frame (`wal.WriteRecords`/`OnRecords`) of an opaque,
   engine-encoded payload; `recordengine` owns the rec codec and `EncodeWAL` (the cluster write form).
+- **Side store** (`recordengine.SideStore`, optional; nil for logs/traces) — a content-addressed
+  auxiliary store a signal attaches to each batch (`Batch.Side`) that rides the part lifecycle: the
+  engine absorbs each batch's delta into a live accumulator, writes the accumulated tables as part
+  sidecars on flush (`{prefix}/sym-{name}.bin`, mirroring the bloom sidecars), and unions the
+  compacted parts' sidecars on merge — under the one merge engine, no parallel subsystem.
+  Content-addressing (an entry's id is a hash of its content) makes the union a plain dedup with no
+  id remap. Profiles is the first user (its symbol store).
 - **Logs** (`signal/log`): schema = `observed`/`severity`/`flags`/`dropped`(int) +
   `severity_text`/`body`(FullText)/`trace_id`/`span_id`/`attrs`(Attrs)(bytes). `WriteLogs` /
   `LogFetcher`.
@@ -588,24 +596,43 @@ share one engine; only the column schema and projection differ.
   **`Trace(tenant, id)`** — trace-by-id as an equality condition on `trace_id`, pruned by its
   equality bloom, returning the trace's spans across services. Events/links round-trip via
   `trace.DecodeEvents`/`DecodeLinks`.
-- **Cluster**: one signal-discriminated path serves all three signals. The write envelope
+- **Profiles** (`signal/profile`): a profile is a pprof-style graph (samples → stacks → locations →
+  functions, all index-based) with a large shared symbol dictionary — Pyroscope's **two-table
+  split**: a columnar sample table + a deduplicated symbol store. Each `Sample` flattens to one
+  record **row** (a sample with `timestamps_unix_nano` explodes to one row per (timestamp, value); an
+  aggregated sample is one row at the profile time); schema = `value`/`sample_type`/`period`/
+  `duration`(int) + `stack_id`/`profile_id`(Equality)/`trace_id`/`span_id`/`attrs`(Attrs)(bytes).
+  `stack_id` and `sample_type` are **content-addressed ids** into the symbol store, computed
+  Merkle-style bottom-up (string→function→location→stack), so an embedder selects a profile type by
+  computing the same hash (`profile.SampleTypeID`) — no lookup. The symbol store (strings, mappings,
+  functions, locations, stacks) is built per-stream at projection time, attached to `Batch.Side`, and
+  persisted/merged as part sidecars via the side-store hook above. Query is **search + return
+  samples** (`WriteProfiles` / `ProfileFetcher`): matchers resolve streams, conditions filter
+  samples; fetch-time **stack symbolization is deferred** (the store is persisted now to support it),
+  so returned rows carry the opaque global content ids.
+- **Cluster**: one signal-discriminated path serves all four signals. The write envelope
   (`cluster.EncodeWrite`) and read request (`cluster.EncodeFetchRequest`) carry a `signal.Signal`
-  byte; the primary-write, replicate, and read handlers dispatch to the metric / log / trace engine.
-  Record writes are **primary-authoritative** (`recordengine.ApplyPrimary`/`ApplyReplicated`) with
-  accurate `Accepted` accounting; read fan-out ships batches via the column-aware codec
-  (`EncodeLogBatches`, shared by logs and traces). Compaction ownership is per-tenant, reconciled
-  once across all signals. The facade's `WriteLogs`/`WriteTraces` and `LogFetcher`/`TraceFetcher`
-  share generic helpers (`writeRecordsLocal`/`writeRecordsClustered`/`recordFetcher`).
+  byte; the primary-write, replicate, and read handlers dispatch to the metric / log / trace /
+  profile engine. Record writes are **primary-authoritative**
+  (`recordengine.ApplyPrimary`/`ApplyReplicated`) with accurate `Accepted` accounting; read fan-out
+  ships batches via the column-aware codec (`EncodeLogBatches`, shared by the record signals) — a
+  fan-out matcher re-filters against the full series label set (resource + scope, not just
+  data-point attributes). Compaction ownership is per-tenant, reconciled once across all signals. The
+  facade's `WriteLogs`/`WriteTraces`/`WriteProfiles` and `LogFetcher`/`TraceFetcher`/`ProfileFetcher`
+  share generic helpers (`writeRecordsLocal`/`writeRecordsClustered`/`recordFetcher`). Profiles'
+  sample rows carry **global** content ids, so cluster reads need no symbol store; replicating the
+  symbol *store* itself (shipping `Batch.Side` through the replication frame) is deferred with
+  fetch-time resolution — single-node persists the full store today.
 
 ---
 
 ## 4. Public surface (`storage` root package)
 
-The embedder-facing API. The construction and **metrics ingest+read path are wired and
-working**; logs/traces/profiles ingest and the query-language path still return
-`ErrNotImplemented`. The `Write*` methods take the library's internal, `[]byte`-based
-ingest batches (`metric.Metrics`, and placeholder `log.Logs`/`trace.Traces`/
-`profile.Profiles`), **not pdata** — OTel-Go users convert via `otlp/pdataconv` (§3e).
+The embedder-facing API. **All four signals' ingest+read paths are wired and working** (metrics on
+the float-sample engine; logs, traces, profiles on the shared record engine); only the
+query-language path stays in the embedder. The `Write*` methods take the library's internal,
+`[]byte`-based ingest batches (`metric.Metrics`/`log.Logs`/`trace.Traces`/`profile.Profiles`),
+**not pdata** — OTel-Go users convert via `otlp/pdataconv` (§3e).
 
 - **`Storage`** — the facade. `Open(ctx, Options, ...Option)` and `InMemory(...Option)`
   construct it (validation, defaulting, tenant-resolver wiring, and — when `FlushInterval`
@@ -620,9 +647,11 @@ ingest batches (`metric.Metrics`, and placeholder `log.Logs`/`trace.Traces`/
   the producer). **`WriteLogs(ctx, ld)` is fully implemented** the same way over per-tenant
   `recordengine.Engine`s (parts under `{tenant}/logs`). **`WriteTraces(ctx, td)` is fully
   implemented** the same way over per-tenant `recordengine.Engine`s on the span schema (parts under
-  `{tenant}/traces`); `WriteProfiles` is a later vertical (`ErrNotImplemented`). A single
+  `{tenant}/traces`). **`WriteProfiles(ctx, pd)` is fully implemented** over per-tenant
+  `recordengine.Engine`s on the sample schema **with a `profile.SymbolStore` side store** (parts +
+  symbol sidecars under `{tenant}/profiles`). A single
   **maintenance loop** periodically flushes +
-  merges every metric, log, and trace engine, applying per-tenant retention from the resolved policy. `Reset(ctx)`
+  merges every metric, log, trace, and profile engine, applying per-tenant retention from the resolved policy. `Reset(ctx)`
   discards all ingested data (every engine's head + flushed parts), retaining the engines
   for reuse; it is gated to an **ephemeral backend** (`ErrNotEphemeral` otherwise) and is
   meant for tests/benchmarks that reuse one store across runs. `Fetcher(tenants...)` is the
@@ -645,7 +674,9 @@ ingest batches (`metric.Metrics`, and placeholder `log.Logs`/`trace.Traces`/
   **`TraceFetcher(tenants...)`** is the identical seam over the trace engines, and
   **`Trace(ctx, tenant, traceID)`** is the trace-by-id convenience: it issues a fetch with an
   equality `Condition` on the `trace_id` column (pruned by that column's equality bloom) and returns
-  all of the trace's spans across services.
+  all of the trace's spans across services. **`ProfileFetcher(tenants...)`** is the identical seam
+  over the profile engines (matchers resolve streams; conditions filter samples — e.g. a
+  `sample_type` equality computed via `profile.SampleTypeID`).
 - **`Options` / `Option`** (`options.go`) — config struct plus functional options
   (`WithBackend`, `WithCluster`, `WithTenancy`, `WithEncoding`, `WithDurability`,
   `WithWALDir`, `WithFlushThresholdBytes`, `WithFlushInterval`, `WithOOOWindow`,
@@ -677,10 +708,11 @@ These hold in the implemented code and must be preserved by changes:
   callers own and reuse buffers. Parsers, scratch slices, and the dict map are pooled
   and `Reset`. Decoders return views aliasing the source (`ReadBytesView`,
   `DictColumn`) instead of copying, where the lifetime is bounded.
-- **One physical engine, many front-ends.** Query languages and signals are meant to be
-  thin layers over the shared columnar engine and the fetch contract; storage-layer code
-  must not learn a language's or signal's concepts. (The seam exists; the layers above it
-  are not built yet.)
+- **One physical engine, many front-ends.** Signals are thin layers over the shared columnar
+  engine and the fetch contract: metrics on `engine`, and logs/traces/profiles on the schema-driven
+  `recordengine` (each supplying only a column schema, a projection, and — profiles — a side store).
+  Storage-layer code must not learn a language's or signal's concepts; query languages stay in the
+  embedder above the seam.
 - **Immutable, in-memory-first.** The in-memory/ephemeral path is first-class — every
   layer must work with no disk or object store. `backend.Memory()` is the reference
   backend.
@@ -688,8 +720,9 @@ These hold in the implemented code and must be preserved by changes:
   part formats (manifest `OTPM`, marks `OTMK`, per-column object framing, the
   `{prefix}/manifest|marks|c/{i}` key layout), the **attribute hash/binary encoding** (the
   SeriesID pre-image), the **symbol table** (`OTSY`), the **WAL record framing** (series +
-  sample records), and the **metric part column layout** (`[series:int128, ts:int64,
-  value:float64]` sorted by `(series, ts)`) are all persisted/wire-stable. Changing any of
+  sample records), the **metric part column layout** (`[series:int128, ts:int64,
+  value:float64]` sorted by `(series, ts)`), and the **profile symbol-store table** (`OTSP`, the
+  content-addressed side-store sidecars) are all persisted/wire-stable. Changing any of
   them is an architectural change (golden tests guard formats; bump the version and update
   this file too).
 
@@ -705,7 +738,7 @@ green; the tree is `gofmt`/`goimports` clean.
 ## 6. Package map
 
 ```
-.                     storage facade: Storage, Open/InMemory, Options, per-tenant engines, maintenance loop [implemented: metrics+logs+traces ingest+read; profiles & query-lang stubbed]
+.                     storage facade: Storage, Open/InMemory, Options, per-tenant engines, maintenance loop [implemented: metrics+logs+traces+profiles ingest+read; query-lang in embedder]
 encoding/             umbrella doc for the codec layers
   encoding/bitstream  MSB-first bit Writer/Reader                                      [implemented]
   encoding/chunk      DoD / Gorilla / T64 / dict / bytesraw / decimal / id128 column codecs [implemented]
@@ -715,7 +748,7 @@ signal/               typed Attributes/Value, Resource/Scope/Series identity, 12
   signal/metric       []byte-based OTLP-shaped Metrics ingest batch (resettable/pooled) + identity + projection (gauge/sum) [implemented; histogram/summary deferred]
   signal/log          []byte-based OTLP-shaped Logs ingest batch (resettable/pooled) + stream identity + projection [implemented]
   signal/trace        []byte-based OTLP-shaped Traces ingest batch (resettable/pooled) + span schema + projection (nested-set, events/links) [implemented]
-  signal/profile      placeholder ingest batch type (keep facade pdata-free)            [stub; vertical deferred]
+  signal/profile      []byte-based OTLP-shaped Profiles ingest batch + sample schema + projection + content-addressed symbol store (SideStore) [implemented]
 otlp/pdataconv        optional OTel-Go bridge: pmetric.Metrics → metric.Metrics (only package importing pdata) [implemented for metrics]
 tenant/               Limits/Retention/Downsample/Policy, Resolver                     [implemented]
 backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + memory (root) [implemented]
@@ -727,8 +760,8 @@ index/                symbols (intern) · series (id↔attrs) · postings (set-o
   index/bloom         token bloom filter (no false negatives) + tokenizer: full-text + attr/equality pruning [implemented]
 wal/                  CRC-framed segmented write-ahead log + replay (samples + opaque records) [implemented]
 engine/               head · flush · background-merge · retention · fetch (metrics)    [implemented]
-recordengine/         shared schema-driven record engine (logs+traces): head · flush · merge · fetch · conditions · per-column blooms [implemented]
-query/fetch           dual-shape fetch contract (Matchers + Conditions/Projection/SecondPass) [implemented for metrics + logs + traces; the library's query surface]
+recordengine/         shared schema-driven record engine (logs+traces+profiles): head · flush · merge · fetch · conditions · per-column blooms · optional content-addressed side store [implemented]
+query/fetch           dual-shape fetch contract (Matchers + Conditions/Projection/SecondPass) [implemented for metrics + logs + traces + profiles; the library's query surface]
 query/scale           fetch-seam scale-out decorators: split-by-interval + results cache  [implemented]
 query/promql          OPTIONAL adapter: fetch → Prometheus storage.Queryable (no engine) [implemented; only package importing prometheus]
 cluster/              L0 distribution: ring + membership + (later) replication · rebalance [partly implemented]
