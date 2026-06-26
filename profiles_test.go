@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -79,27 +80,29 @@ func TestFacadeWriteAndQueryProfiles(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, Accepted{Accepted: 2}, acc)
 
+	// The two sample types are two streams (the type is folded into identity); a service matcher
+	// returns both.
 	all := fetch.Request{
 		Signal: signal.Profile, Start: 0, End: 1 << 60,
 		Matchers: []fetch.Matcher{nameMatcherSvc("api")},
 	}
 	got, err := fetch.Drain(ctx, must(s.ProfileFetcher("default").Fetch(ctx, all)))
 	require.NoError(t, err)
-	require.Len(t, got, 1)
-	assert.ElementsMatch(t, []int64{50, 4096}, profValues(got[0]))
+	require.Len(t, got, 2)
 
-	// Select only the cpu profile type by its content id — the embedder computes the same hash.
-	cpuID := profile.SampleTypeID([]byte("cpu"), []byte("nanoseconds"))
-	all.Conditions = []fetch.Condition{{
-		Column: profile.ColSampleType,
-		Match:  func(v signal.Value) bool { return v.Int() == cpuID },
-	}}
-	all.AllConditions = true
-
+	// Select only the cpu profile type with an ordinary label matcher on the reserved type label.
+	all.Matchers = append(all.Matchers, labelMatcher(profile.LabelSampleType, "cpu"))
 	got, err = fetch.Drain(ctx, must(s.ProfileFetcher("default").Fetch(ctx, all)))
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, []int64{50}, profValues(got[0]))
+}
+
+// labelMatcher matches a reserved/resource label by exact value.
+func labelMatcher(name []byte, want string) fetch.Matcher {
+	w := []byte(want)
+
+	return fetch.Matcher{Name: name, Match: func(v signal.Value) bool { return bytes.Equal(v.Str(), w) }}
 }
 
 func TestFacadeProfilesCoexistWithOtherSignals(t *testing.T) {

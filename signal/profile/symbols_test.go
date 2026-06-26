@@ -121,19 +121,6 @@ func TestSymbolStoreAbsorbEncodeUnion(t *testing.T) {
 	assert.Len(t, strings, 5)
 }
 
-// TestSampleTypeIDStable verifies the sample-type id is deterministic and distinguishes type vs unit.
-func TestSampleTypeIDStable(t *testing.T) {
-	t.Parallel()
-
-	d := &Dictionary{}
-	cpu := ValueType{TypeStrindex: d.InternString([]byte("cpu")), UnitStrindex: d.InternString([]byte("nanoseconds"))}
-	heap := ValueType{TypeStrindex: d.InternString([]byte("heap")), UnitStrindex: d.InternString([]byte("bytes"))}
-
-	cpuID := sampleTypeID(d, cpu)
-	assert.Equal(t, cpuID, sampleTypeID(d, cpu), "deterministic")
-	assert.NotEqual(t, cpuID, sampleTypeID(d, heap))
-}
-
 // TestDecodeTableGolden pins the table wire format.
 func TestDecodeTableGolden(t *testing.T) {
 	t.Parallel()

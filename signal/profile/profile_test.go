@@ -75,7 +75,7 @@ func TestProjectFlattensSamples(t *testing.T) {
 	require.Len(t, batches, 1)
 	b := batches[0]
 
-	require.Len(t, b.Ints, 4)
+	require.Len(t, b.Ints, 3)
 	require.Len(t, b.Bytes, 5)
 	require.Len(t, b.Ts, 3, "1 aggregated + 2 timestamped rows")
 
@@ -90,8 +90,12 @@ func TestProjectFlattensSamples(t *testing.T) {
 		assert.Equal(t, want, got)
 	}
 
-	// sample_type column is the deterministic content id of (cpu, nanoseconds).
-	assert.Equal(t, sampleTypeID(d, cpu), b.Ints[iSampleType][0])
+	// The profile type is folded into the stream identity as reserved labels.
+	series := streamSeries(svcResource("api"), signal.Scope{}, resolveType(d, pr))
+	assert.Equal(t, series.Hash(), b.Stream)
+	v, ok := series.Resource.Attributes.Get(LabelSampleType)
+	require.True(t, ok)
+	assert.Equal(t, "cpu", string(v.Str()))
 
 	// The symbol delta is present and decodes.
 	require.NotEmpty(t, b.Side)

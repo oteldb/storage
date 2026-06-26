@@ -31,7 +31,6 @@ const (
 	tagFunction
 	tagLocation
 	tagStack
-	tagValueType // sample-type id pre-image tag (not a stored table)
 )
 
 // Sidecar table names, in delta order.
@@ -206,33 +205,6 @@ func (b *builder) stackID(idx int32) signal.SeriesID {
 	b.tables.put(4, id, entry)
 
 	return id
-}
-
-// SampleTypeID is the content id (low 64 bits of the xxh3-128) of a (type, unit) pair, the value
-// stored in the [ColSampleType] column. An embedder selects one profile type by computing this from
-// the type/unit it wants and filtering the column — no stored value-type table or lookup is needed.
-func SampleTypeID(typeName, unit []byte) int64 {
-	pre := make([]byte, 0, 2+len(typeName)+len(unit))
-	pre = append(pre, tagValueType)
-	pre = append(pre, typeName...)
-	pre = append(pre, 0) // separator so ("ab","c") ≠ ("a","bc")
-	pre = append(pre, unit...)
-
-	return int64(signal.HashBytes(pre).Lo)
-}
-
-// sampleTypeID computes [SampleTypeID] for a dictionary value type, resolving its string indices.
-func sampleTypeID(d *Dictionary, vt ValueType) int64 {
-	var typ, unit []byte
-	if inRange(d.Strings, vt.TypeStrindex) {
-		typ = d.Strings[vt.TypeStrindex]
-	}
-
-	if inRange(d.Strings, vt.UnitStrindex) {
-		unit = d.Strings[vt.UnitStrindex]
-	}
-
-	return SampleTypeID(typ, unit)
 }
 
 // ---- table / delta encoding (CRC-framed, fuzz-safe decode) ----
