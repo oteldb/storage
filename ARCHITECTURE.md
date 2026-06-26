@@ -540,8 +540,23 @@ accepted payload to the secondary owners (it already holds one durable copy, so 
 more acks via `ReplicateQuorum`); a secondary applies it verbatim through `engine.ApplyReplicated`
 (no re-check — the primary already decided, the way WAL replay trusts the log). Because every
 replica receives the *same accepted set* from one authority, the replicas converge even under
-concurrent writers, and the rejected count is exact. Sharding is by tenant for now (a whole stream
-pinned to its owners; the primary is `Ring().Primary(tenant)`).
+concurrent writers, and the rejected count is exact.
+
+**Per-series sharding (sharded-tenant)** spreads a single tenant's metric series across the ring so
+one large tenant is not pinned to a single owner set. `Config.ShardsPerTenant` (default 1) splits a
+tenant into N shards; a series maps to `shard = hash(seriesID) % N` and the **shard** — not the
+tenant — is the ring/storage/compaction unit. A shard's routing/storage key is `{tenant}/_s{idx}`,
+which **collapses to the bare tenant at N=1**, so the default layout, placement, and on-disk prefixes
+are byte-identical to the unsharded path (and the shard key is just a tenant-like string the existing
+tenant-keyed machinery — engine map, `{key}/metrics` prefix, ring lookup, compaction claims, and
+stateless `recover` — handles transparently). `WriteMetrics` groups each point by its shard key and
+routes each group to that shard's `Ring().Primary(shardKey)` (so different series in one batch scatter
+to different primaries, each replicating to its shard's owners); the read seam (`clusterFetcherFor`)
+**gathers across all N shards** — serving a shard locally when this node owns it, else fanning out to
+an owner — and merges, so any node answers a full query. Compaction stays one-owner-per-shard
+(`metricMergeOptions` resolves the tenant's retention/downsampling policy from the shard key via
+`tenantOfShard`). Sharding applies to **metrics only**; the record signals (logs/traces/profiles)
+remain a single shard (`Ring().Primary(tenant)`).
 
 **Facade cluster mode** (`cluster.go`, `Options.Cluster`): when configured, `Storage.Open`
 joins the etcd cluster, runs the HTTP server on the node's address (mounting the replicate,
@@ -906,7 +921,7 @@ cluster/              L0 distribution: ring + membership + (later) replication �
   cluster/            cluster write path: EncodeWrite codec + Writer + Config             [implemented]
   cluster/ (read.go)  cluster read RPC: window-fetch codec + ReadHandler + RemoteFetcher    [implemented]
   cluster/ (enum.go)  cluster enumeration/resolution RPC: series-list + side-store fan-out [implemented]
-.                     (cluster.go) facade cluster mode: routed WriteMetrics + owner-aware fan-out reads [implemented]
+.                     (cluster.go) facade cluster mode: routed WriteMetrics + owner-aware fan-out reads + per-series sharding (sharded-tenant, metrics) [implemented]
 ```
 
 "Seam only" packages currently contain their `doc.go` (and, where noted, an interface or

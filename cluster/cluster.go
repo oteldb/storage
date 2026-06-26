@@ -14,6 +14,12 @@ type Config struct {
 	Self etcd.Member
 	// RF is the replication factor (replicas per write). Zero ⇒ 3.
 	RF int
+	// ShardsPerTenant splits each tenant's metric series into this many independently-placed
+	// shards (series → shard = hash(seriesID) % N), so a single large tenant spreads its ingest,
+	// storage, and compaction across up to N nodes instead of being pinned to one owner set. Zero
+	// or one ⇒ a single shard (the tenant is the shard; on-disk layout and placement are identical
+	// to the unsharded path). Applies to metrics only; the record signals are a single shard.
+	ShardsPerTenant int
 	// Root is the etcd key prefix for this cluster's state. Empty ⇒ "/oteldb".
 	Root string
 }

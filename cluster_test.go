@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"testing"
 	"time"
 
@@ -88,6 +89,91 @@ func openClusterNodeWith(t *testing.T, endpoint, id string, be backend.Backend, 
 	t.Cleanup(func() { _ = s.Close(context.Background()) })
 
 	return s
+}
+
+// openClusterNodeSharded opens a clustered node with ShardsPerTenant set, for per-series sharding.
+func openClusterNodeSharded(t *testing.T, endpoint, id string, shards int) *Storage {
+	t.Helper()
+
+	s, err := Open(context.Background(), Options{}, WithBackend(backend.Memory()), WithCluster(&cluster.Config{
+		Etcd:            []string{endpoint},
+		Self:            etcd.Member{ID: id, Addr: freeAddr(t)},
+		RF:              2,
+		ShardsPerTenant: shards,
+	}))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	return s
+}
+
+// TestClusterPerSeriesShardingSpreadsAndGathers verifies sharded-tenant placement: one tenant's
+// series spread across the ring by shard, every series is readable from any node (the read gathers
+// across shards), and the shards are genuinely distributed (no single node owns them all).
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterPerSeriesShardingSpreadsAndGathers(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	const shards = 4
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodeSharded(t, endpoint, "node-a", shards),
+		"node-b": openClusterNodeSharded(t, endpoint, "node-b", shards),
+		"node-c": openClusterNodeSharded(t, endpoint, "node-c", shards),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+
+	// Write many distinct series through node A; each routes to its shard's primary.
+	const nSeries = 24
+
+	names := make([]string, nSeries)
+	for i := range names {
+		names[i] = "metric_" + strconv.Itoa(i)
+		_, err := a.WriteMetrics(ctx, gaugeBatch("svc", names[i], []int64{100}, []float64{float64(i)}))
+		require.NoError(t, err)
+	}
+
+	// Every series is readable from every node — the read gathers across all shards.
+	for name, s := range nodes {
+		for i, m := range names {
+			it, err := s.Fetcher("default").Fetch(ctx, fetch.Request{
+				Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{nameMatcher(m)},
+			})
+			require.NoError(t, err)
+			got, err := fetch.Drain(ctx, it)
+			require.NoError(t, err)
+			require.Lenf(t, got, 1, "%s reads %s across shards", name, m)
+			assert.Equal(t, []float64{float64(i)}, got[0].Values)
+		}
+	}
+
+	// The shards are genuinely spread: their primaries span more than one node.
+	primaries := map[string]bool{}
+	for idx := range shards {
+		sk := shardKeyOf("default", idx, shards)
+		p, ok := a.cluster.membership.Ring().Primary([]byte(sk))
+		require.True(t, ok)
+		primaries[p.ID] = true
+	}
+	assert.Greaterf(t, len(primaries), 1, "the %d shards are owned by more than one node", shards)
+
+	// Cross-node fan-out is genuinely exercised: with RF=2 < 3 nodes, every shard has a non-owner,
+	// and the "readable from every node" loop above had those non-owners gather from owners. Confirm
+	// the data is distributed (not all co-located on one node): the per-node local engine counts sum
+	// to more than the shard count, i.e. shards are replicated across distinct nodes.
+	total := 0
+	for _, s := range nodes {
+		s.tmu.Lock()
+		total += len(s.tenants)
+		s.tmu.Unlock()
+	}
+	assert.Greaterf(t, total, shards, "shards are replicated across nodes (%d engine instances over %d shards)", total, shards)
 }
 
 // sharedS3 starts one in-process S3 server and returns a factory of backends over the same
@@ -484,4 +570,34 @@ func TestClusteredReadFansOutToOwners(t *testing.T) {
 	require.Lenf(t, got, 1, "%s served the series via read fan-out", nonOwnerName)
 	assert.Equal(t, []int64{100, 200}, got[0].Timestamps)
 	assert.Equal(t, []float64{1, 2}, got[0].Values)
+}
+
+func TestShardHelpers(t *testing.T) {
+	t.Parallel()
+
+	// A single shard collapses to the bare tenant (byte-identical to the unsharded layout).
+	assert.Equal(t, signal.TenantID("acme"), shardKeyOf("acme", 0, 1))
+	assert.Equal(t, signal.TenantID("acme"), shardKeyOf("acme", 0, 0))
+
+	// With N>1 the shard index is suffixed, and tenantOfShard inverts it.
+	for _, n := range []int{2, 4, 8} {
+		for idx := range n {
+			sk := shardKeyOf("acme", idx, n)
+			assert.Equal(t, signal.TenantID("acme"), tenantOfShard(sk), "round-trips to the tenant")
+			assert.NotEqual(t, signal.TenantID("acme"), sk, "sharded key differs from the tenant")
+		}
+	}
+
+	// tenantOfShard is a no-op on an unsharded (bare tenant) key.
+	assert.Equal(t, signal.TenantID("acme"), tenantOfShard("acme"))
+
+	// shardOf is in range and stable.
+	id := signal.SeriesID{Hi: 7, Lo: 123456789}
+	assert.Equal(t, 0, shardOf(id, 1))
+	for _, n := range []int{2, 4, 16} {
+		s := shardOf(id, n)
+		assert.GreaterOrEqual(t, s, 0)
+		assert.Less(t, s, n)
+		assert.Equal(t, s, shardOf(id, n), "deterministic")
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -36,6 +37,52 @@ type clusterNode struct {
 	listener   net.Listener
 	self       string // this node's address
 	rf         int
+	shards     int // metric shards per tenant (≤1 ⇒ one shard = the tenant)
+}
+
+// shardCount is the configured metric shards per tenant, clamped to a minimum of 1.
+func (n *clusterNode) shardCount() int {
+	if n.shards < 1 {
+		return 1
+	}
+
+	return n.shards
+}
+
+// shardSep separates a tenant from its shard index in a shard key. It is chosen so a shard key is
+// a valid backend path segment and never collides with a real tenant id (which the embedder keeps
+// free of this marker).
+const shardSep = "/_s"
+
+// shardKeyOf returns the routing/storage key for tenant's shard idx. With a single shard it is the
+// bare (already-normalized) tenant, so ring placement and on-disk prefixes are byte-identical to
+// the unsharded path; with N>1 it suffixes the shard index.
+func shardKeyOf(tenant signal.TenantID, idx, n int) signal.TenantID {
+	if n <= 1 {
+		return tenant
+	}
+
+	return tenant + signal.TenantID(shardSep+strconv.Itoa(idx))
+}
+
+// tenantOfShard recovers the tenant id from a shard key (the inverse of [shardKeyOf]), for policy
+// resolution. A key without the shard marker (the single-shard case) is returned unchanged.
+func tenantOfShard(shardKey signal.TenantID) signal.TenantID {
+	if i := strings.LastIndex(string(shardKey), shardSep); i >= 0 {
+		return shardKey[:i]
+	}
+
+	return shardKey
+}
+
+// shardOf maps a series id to a shard index in [0, n). The series id is already a uniform content
+// hash, so the low word modulo n distributes evenly.
+func shardOf(id signal.SeriesID, n int) int {
+	if n <= 1 {
+		return 0
+	}
+
+	return int(id.Lo % uint64(n))
 }
 
 // startCluster joins the etcd-coordinated cluster, runs the replica server on Self.Addr, and
@@ -97,6 +144,7 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 		listener:   ln,
 		self:       cfg.Self.Addr,
 		rf:         rf,
+		shards:     cfg.ShardsPerTenant,
 	}
 
 	return nil
@@ -118,19 +166,38 @@ func (s *Storage) localFetch(ctx context.Context, tenant string, start, end int6
 	return fetch.Drain(ctx, it)
 }
 
-// clusterFetcherFor returns the read seam for one tenant in cluster mode: if this node owns the
-// tenant it serves locally (the head is replicated here, with full matcher pushdown); otherwise
-// it fans out to an owner over HTTP (a window superset) and re-applies the request's matchers,
-// failing over between owners.
+// clusterFetcherFor returns the read seam for one tenant in cluster mode. A tenant's series are
+// spread across N shards (each a separately-placed ring unit), so a query gathers across every
+// shard and merges: for each shard, serve locally if this node owns it, else fan out to an owner.
+// With a single shard this is exactly the unsharded owner-aware fetch.
 func (s *Storage) clusterFetcherFor(tid signal.TenantID) fetch.Fetcher {
 	cn := s.cluster
-	owners := cn.membership.Ring().Lookup([]byte(s.normalizeTenant(tid)), cn.rf)
+	tenant := s.normalizeTenant(tid)
+	n := cn.shardCount()
+
+	shardFetchers := make([]fetch.Fetcher, 0, n)
+	for idx := range n {
+		sk := shardKeyOf(tenant, idx, n)
+		// Stamp the shard key as the request tenant so a remote peer serves the right shard engine
+		// (and a local engine ignores it). scopedFetcher does the stamping.
+		shardFetchers = append(shardFetchers, scopedFetcher{inner: s.shardFetcher(sk), scope: sk})
+	}
+
+	return fetch.Merge(shardFetchers...)
+}
+
+// shardFetcher returns the read seam for one metric shard: the local engine if this node is an
+// owner (full matcher pushdown), else a fail-over across the shard's remote owners (each owner's
+// copy is complete; matchers are re-applied to the returned superset).
+func (s *Storage) shardFetcher(shardKey signal.TenantID) fetch.Fetcher {
+	cn := s.cluster
+	owners := cn.membership.Ring().Lookup([]byte(shardKey), cn.rf)
 
 	var remotes []fetch.Fetcher
 	for _, o := range owners {
 		addr := cn.membership.AddrOf(o.ID)
 		if addr == cn.self { // this node is an owner: serve locally
-			if e, ok := s.lookupEngine(s.normalizeTenant(tid)); ok {
+			if e, ok := s.lookupEngine(shardKey); ok {
 				return e
 			}
 
@@ -522,41 +589,45 @@ func (n *clusterNode) close(ctx context.Context) error {
 // rejected count back here, and replicates the accepted set to the secondary owners — so the
 // returned [Accepted] accounting matches the single-node path and every replica converges.
 func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) (Accepted, error) {
-	type tenantWAL struct {
+	type shardWAL struct {
 		buf  bytes.Buffer
 		w    *wal.Writer
 		seen map[signal.SeriesID]struct{}
 	}
 
-	byTenant := make(map[signal.TenantID]*tenantWAL)
+	// Group each point by its shard key — the (tenant, hash(seriesID) % N) routing/storage unit —
+	// so a tenant's series spread across the ring instead of pinning to one owner set. With a
+	// single shard the key is the tenant, identical to the unsharded path.
+	n := s.cluster.shardCount()
+	byShard := make(map[signal.TenantID]*shardWAL)
 
 	emitted := metric.Project(md, func(b *metric.Batch) {
-		tid := s.tenantFor(b.Resource(), b.Scope())
-
-		tw := byTenant[tid]
-		if tw == nil {
-			tw = &tenantWAL{seen: make(map[signal.SeriesID]struct{})}
-			tw.w = wal.NewWriter(&tw.buf)
-			byTenant[tid] = tw
-		}
+		tenant := s.normalizeTenant(s.tenantFor(b.Resource(), b.Scope()))
 
 		for i := range b.Len() {
 			id := b.IDs[i]
-			if _, ok := tw.seen[id]; !ok { // register each series once
-				tw.seen[id] = struct{}{}
-				_ = tw.w.WriteSeries(id, b.Series(i))
+			sk := shardKeyOf(tenant, shardOf(id, n), n)
+
+			sw := byShard[sk]
+			if sw == nil {
+				sw = &shardWAL{seen: make(map[signal.SeriesID]struct{})}
+				sw.w = wal.NewWriter(&sw.buf)
+				byShard[sk] = sw
 			}
 
-			_ = tw.w.WriteSamples(id, b.Ts[i:i+1], b.Values[i:i+1])
+			if _, ok := sw.seen[id]; !ok { // register each series once per shard
+				sw.seen[id] = struct{}{}
+				_ = sw.w.WriteSeries(id, b.Series(i))
+			}
+
+			_ = sw.w.WriteSamples(id, b.Ts[i:i+1], b.Values[i:i+1])
 		}
 	})
 
 	var rejected int64
 
-	for tid, tw := range byTenant {
-		tenant := string(s.normalizeTenant(tid))
-
-		rej, err := s.routeToPrimary(ctx, signal.Metric, tenant, tw.buf.Bytes())
+	for sk, sw := range byShard {
+		rej, err := s.routeToPrimary(ctx, signal.Metric, string(sk), sw.buf.Bytes())
 		if err != nil {
 			return Accepted{Accepted: int64(emitted) - rejected, Rejected: rejected}, err
 		}

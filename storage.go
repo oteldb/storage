@@ -939,7 +939,8 @@ func retentionCutoff(r tenant.Retention, now int64) int64 {
 // metrics only (the record signals are append-only event data; rolling them up would destroy them).
 func (s *Storage) metricMergeOptions(tid signal.TenantID) engine.MergeOptions {
 	now := time.Now().UnixNano()
-	p := s.tenant.Resolve(s.normalizeTenant(tid))
+	// In cluster mode tid is a shard key ({tenant}/_s{idx}); policy is per real tenant.
+	p := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid)))
 
 	var tiers []engine.DownsampleTier
 
