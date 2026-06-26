@@ -75,32 +75,67 @@ func (c *recordCols) filterInPlace(conds []fetch.Condition) {
 	c.truncate(w)
 }
 
-// moveRow overwrites row to with row from (a backward compaction step).
+// moveRow overwrites row to with row from (a backward compaction step), for the selected columns.
 func (c *recordCols) moveRow(from, to int) {
+	s := &c.sel
 	c.ts[to] = c.ts[from]
-	c.observed[to] = c.observed[from]
-	c.severity[to] = c.severity[from]
-	c.flags[to] = c.flags[from]
-	c.dropped[to] = c.dropped[from]
-	c.sevText[to] = c.sevText[from]
-	c.body[to] = c.body[from]
-	c.traceID[to] = c.traceID[from]
-	c.spanID[to] = c.spanID[from]
-	c.attrs[to] = c.attrs[from]
+
+	if s.observed {
+		c.observed[to] = c.observed[from]
+	}
+
+	if s.severity {
+		c.severity[to] = c.severity[from]
+	}
+
+	if s.flags {
+		c.flags[to] = c.flags[from]
+	}
+
+	if s.dropped {
+		c.dropped[to] = c.dropped[from]
+	}
+
+	if s.sevText {
+		c.sevText[to] = c.sevText[from]
+	}
+
+	if s.body {
+		c.body[to] = c.body[from]
+	}
+
+	if s.traceID {
+		c.traceID[to] = c.traceID[from]
+	}
+
+	if s.spanID {
+		c.spanID[to] = c.spanID[from]
+	}
+
+	if s.attrs {
+		c.attrs[to] = c.attrs[from]
+	}
 }
 
-// truncate shortens every column to n rows.
+// truncate shortens every selected column to n rows.
 func (c *recordCols) truncate(n int) {
+	s := &c.sel
 	c.ts = c.ts[:n]
-	c.observed = c.observed[:n]
-	c.severity = c.severity[:n]
-	c.flags = c.flags[:n]
-	c.dropped = c.dropped[:n]
-	c.sevText = c.sevText[:n]
-	c.body = c.body[:n]
-	c.traceID = c.traceID[:n]
-	c.spanID = c.spanID[:n]
-	c.attrs = c.attrs[:n]
+	truncateIf(s.observed, &c.observed, n)
+	truncateIf(s.severity, &c.severity, n)
+	truncateIf(s.flags, &c.flags, n)
+	truncateIf(s.dropped, &c.dropped, n)
+	truncateIf(s.sevText, &c.sevText, n)
+	truncateIf(s.body, &c.body, n)
+	truncateIf(s.traceID, &c.traceID, n)
+	truncateIf(s.spanID, &c.spanID, n)
+	truncateIf(s.attrs, &c.attrs, n)
+}
+
+func truncateIf[T any](active bool, col *[]T, n int) {
+	if active {
+		*col = (*col)[:n]
+	}
 }
 
 // projectColumns is the set of named columns to materialize in a batch, given a projection. An

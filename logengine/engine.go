@@ -306,6 +306,9 @@ func (e *Engine) HeadRecordCount() int {
 // each accumulator from the parts' row ranges and the head, then decodes each live part exactly
 // once and distributes its rows — so a part is never re-decoded per stream it holds.
 func (e *Engine) accumulate(ctx context.Context, ids []signal.SeriesID, r fetch.Request) (map[signal.SeriesID]*recordCols, error) {
+	// Decode/copy/output only the columns this request filters on or projects (lazy decode).
+	sel := selectColumns(r)
+
 	live := make([]*part, 0, len(e.parts))
 	for _, p := range e.parts {
 		switch {
@@ -325,11 +328,11 @@ func (e *Engine) accumulate(ctx context.Context, ids []signal.SeriesID, r fetch.
 			}
 		}
 
-		accs[id] = newRecordCols(n)
+		accs[id] = newRecordCols(n, sel)
 	}
 
 	for _, p := range live {
-		cols, err := p.readCols(ctx)
+		cols, err := p.readCols(ctx, sel)
 		if err != nil {
 			return nil, err
 		}

@@ -270,6 +270,33 @@ func TestNonEqualityAttributeSearchAndPrune(t *testing.T) {
 	assert.Equal(t, []string{"lvl"}, bodies(got[0]), "non-token predicate scans and matches")
 }
 
+func TestConditionColumnNotProjected(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := logengine.New(logengine.Config{Backend: backend.Memory(), Prefix: "t/logs"})
+
+	ingest(t, e, richStream("api",
+		richRec{100, 17, "error one", "a"},
+		richRec{200, 9, "info two", "b"},
+		richRec{300, 17, "error three", "c"},
+	))
+	require.NoError(t, e.Flush(ctx)) // force the part path (lazy decode applies)
+
+	// Filter by severity but project only body: severity must still be decoded for the filter,
+	// while only body is materialized in the output.
+	r := condReq("api", severityAtLeast(17))
+	r.Projection = []string{"body"}
+	got := fetchAll(t, e, r)
+	require.Len(t, got, 1)
+
+	assert.Equal(t, []string{"error one", "error three"}, bodies(got[0]), "filtered by the unprojected severity column")
+	require.Len(t, got[0].Columns, 1)
+	assert.Equal(t, "body", got[0].Columns[0].Name)
+	_, ok := got[0].Column("severity")
+	assert.False(t, ok, "the filter-only column is not materialized in the output")
+}
+
 func TestProjectionMultipleColumnsAndUnknown(t *testing.T) {
 	t.Parallel()
 

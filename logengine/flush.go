@@ -39,13 +39,13 @@ func (h *head) drainHead() *flushColumns {
 
 	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
 
-	f := &flushColumns{}
+	f := &flushColumns{cols: recordCols{sel: allCols}} // a flush materializes every column
 
 	for _, id := range ids {
 		buf := h.records[id]
 
 		// Sort each stream's records by ts so the part is ordered by (stream, ts).
-		ordered := &recordCols{}
+		ordered := &recordCols{sel: allCols}
 		for i := range buf.ts {
 			ordered.appendRow(buf, i)
 		}

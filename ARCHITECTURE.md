@@ -549,11 +549,15 @@ dual-shape fetch contract (§3g): **Matchers resolve the stream, Conditions filt
 - **Engine** (`logengine`) is the metrics engine's structural twin: a head buffering records per
   stream (the same `symbols`+`series`+`postings` index over stream labels), flush to an immutable
   columnar part, the durable bucket-index + `streams.bin` stateless-read path, an append-only
-  merge with retention, and `Fetch` implementing `fetch.Fetcher`. `Fetch` decodes each surviving
-  part **once** and distributes its rows to per-stream accumulators (never re-decoding a part per
-  stream it holds), pre-sizes those accumulators from the parts' row-range counts (no growth
-  reallocation), bulk-appends whole in-window ranges, filters **in place**, and skips the sort when
-  the accumulated window is already timestamp-ordered. The **log part** (a new
+  merge with retention, and `Fetch` implementing `fetch.Fetcher`. `Fetch` is heavily tuned:
+  **lazy column decode** — it materializes only the columns a request references (the conditions'
+  filter columns ∪ the projection; an empty projection means all), so a body-search-projecting-body
+  query touches just `ts` + `body` and never decodes the other eight columns. It also decodes each
+  surviving part **once** and distributes its rows to per-stream accumulators (never re-decoding a
+  part per stream it holds), pre-sizes those accumulators from the parts' row-range counts (no
+  growth reallocation), bulk-appends whole in-window ranges, filters **in place**, and skips the
+  sort when the accumulated window is already timestamp-ordered. Flush/merge always materialize the
+  full column set (they rewrite the whole part). The **log part** (a new
   wire-stable format) is sorted by `(stream, ts)` with columns
   `stream`(int128)·`ts`(DoD)·`severity`/`observed`/`flags`/`dropped`(T64)·
   `body`/`severity_text`/`trace_id`/`span_id`/`attrs`(dict-bytes); per-record attributes are one

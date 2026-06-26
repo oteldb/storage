@@ -119,8 +119,11 @@ func BenchmarkLogTextSearch(b *testing.B) {
 		}
 	}
 
-	req := func(c fetch.Condition) fetch.Request {
-		return fetch.Request{Signal: signal.Log, Start: 0, End: 1 << 60, Conditions: []fetch.Condition{c}, AllConditions: true}
+	req := func(c fetch.Condition, projection ...string) fetch.Request {
+		return fetch.Request{
+			Signal: signal.Log, Start: 0, End: 1 << 60,
+			Conditions: []fetch.Condition{c}, AllConditions: true, Projection: projection,
+		}
 	}
 
 	rare := fmt.Sprintf("evt%d", rareRound)
@@ -129,7 +132,10 @@ func BenchmarkLogTextSearch(b *testing.B) {
 		name string
 		req  fetch.Request
 	}{
-		{"Body/CommonToken_scan", req(bodyContainsCond("status"))},    // present in every part
+		// Full scan (common token in every part): the all-columns vs body-only projection pair
+		// shows the lazy-decode win — only the referenced columns are decoded, copied, and returned.
+		{"Body/CommonToken_scanAllCols", req(bodyContainsCond("status"))},
+		{"Body/CommonToken_scanProjBody", req(bodyContainsCond("status"), "body")},
 		{"Body/RareToken_prune", req(bodyContainsCond(rare))},         // one part; nine pruned
 		{"Body/AbsentToken_prune", req(bodyContainsCond("zzzznone"))}, // all pruned
 		{"Attr/EqualRare_prune", req(attrEqualCond("region", fmt.Sprintf("r%d", rareRound)))},

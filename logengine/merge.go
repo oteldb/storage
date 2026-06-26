@@ -87,10 +87,10 @@ func (e *Engine) compactParts(ctx context.Context, start int64) (*flushColumns, 
 
 	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
 
-	f := &flushColumns{}
+	f := &flushColumns{cols: recordCols{sel: allCols}} // a merge rewrites every column
 
 	for _, id := range ids {
-		acc := &recordCols{}
+		acc := &recordCols{sel: allCols}
 
 		for _, p := range e.parts {
 			if err := p.appendWindow(ctx, id, acc, start, maxInt64); err != nil {

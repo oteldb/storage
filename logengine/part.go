@@ -100,16 +100,16 @@ func (p *part) holdsAny(ids []signal.SeriesID) bool {
 	return false
 }
 
-// appendWindow appends stream id's records whose timestamp is in [start, end] to acc. It is a
-// no-op if the part does not hold the stream. M8a decodes the full column set; projection narrows
-// this in M8b.
+// appendWindow appends stream id's records whose timestamp is in [start, end] to acc, decoding the
+// full column set (used by merge, which rewrites every column). It is a no-op if the part does not
+// hold the stream.
 func (p *part) appendWindow(ctx context.Context, id signal.SeriesID, acc *recordCols, start, end int64) error {
 	rng, ok := p.ranges[id]
 	if !ok {
 		return nil
 	}
 
-	cols, err := p.readCols(ctx)
+	cols, err := p.readCols(ctx, allCols)
 	if err != nil {
 		return err
 	}
@@ -123,10 +123,11 @@ func (p *part) appendWindow(ctx context.Context, id signal.SeriesID, acc *record
 	return nil
 }
 
-// readCols decodes every column of the part into a recordCols (rows aligned across columns). The
+// readCols decodes the part's timestamp column plus the columns selected by sel into a recordCols
+// (rows aligned across the decoded columns; unselected columns stay nil — lazy decode). The
 // returned byte slices are freshly decoded (owned by the caller).
-func (p *part) readCols(ctx context.Context) (*recordCols, error) {
-	c := &recordCols{}
+func (p *part) readCols(ctx context.Context, sel colSet) (*recordCols, error) {
+	c := &recordCols{sel: sel}
 
 	var err error
 
@@ -134,40 +135,41 @@ func (p *part) readCols(ctx context.Context) (*recordCols, error) {
 		return nil, err
 	}
 
-	if c.observed, err = p.readInt64(ctx, colObserved); err != nil {
-		return nil, err
+	ints := []struct {
+		on  bool
+		dst *[]int64
+		col string
+	}{
+		{sel.observed, &c.observed, colObserved},
+		{sel.severity, &c.severity, colSeverity},
+		{sel.flags, &c.flags, colFlags},
+		{sel.dropped, &c.dropped, colDropped},
+	}
+	for _, f := range ints {
+		if f.on {
+			if *f.dst, err = p.readInt64(ctx, f.col); err != nil {
+				return nil, err
+			}
+		}
 	}
 
-	if c.severity, err = p.readInt64(ctx, colSeverity); err != nil {
-		return nil, err
+	byteCols := []struct {
+		on  bool
+		dst *[][]byte
+		col string
+	}{
+		{sel.sevText, &c.sevText, colSevText},
+		{sel.body, &c.body, colBody},
+		{sel.traceID, &c.traceID, colTraceID},
+		{sel.spanID, &c.spanID, colSpanID},
+		{sel.attrs, &c.attrs, colAttrs},
 	}
-
-	if c.flags, err = p.readInt64(ctx, colFlags); err != nil {
-		return nil, err
-	}
-
-	if c.dropped, err = p.readInt64(ctx, colDropped); err != nil {
-		return nil, err
-	}
-
-	if c.sevText, err = p.readBytes(ctx, colSevText); err != nil {
-		return nil, err
-	}
-
-	if c.body, err = p.readBytes(ctx, colBody); err != nil {
-		return nil, err
-	}
-
-	if c.traceID, err = p.readBytes(ctx, colTraceID); err != nil {
-		return nil, err
-	}
-
-	if c.spanID, err = p.readBytes(ctx, colSpanID); err != nil {
-		return nil, err
-	}
-
-	if c.attrs, err = p.readBytes(ctx, colAttrs); err != nil {
-		return nil, err
+	for _, f := range byteCols {
+		if f.on {
+			if *f.dst, err = p.readBytes(ctx, f.col); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	return c, nil

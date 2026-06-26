@@ -25,10 +25,72 @@ type rec struct {
 	attrs    []byte // serialized attributes (opaque here)
 }
 
+// colSet is the set of per-record columns a fetch must materialize — the timestamp is always
+// needed, so it is not tracked here. A fetch decodes, copies, and outputs only these columns
+// (lazy column decode): the conditions' columns (for filtering) ∪ the projection (for output).
+type colSet struct {
+	observed, severity, flags, dropped bool
+	sevText, body, traceID, spanID     bool
+	attrs                              bool
+}
+
+// allCols selects every column (the default when a request has no projection).
+var allCols = colSet{true, true, true, true, true, true, true, true, true}
+
+// mark sets the bit for a fixed column name (a no-op for the always-present ts or an unknown name).
+func (s *colSet) mark(name string) {
+	switch name {
+	case colObserved:
+		s.observed = true
+	case colSeverity:
+		s.severity = true
+	case colFlags:
+		s.flags = true
+	case colDropped:
+		s.dropped = true
+	case colSevText:
+		s.sevText = true
+	case colBody:
+		s.body = true
+	case colTraceID:
+		s.traceID = true
+	case colSpanID:
+		s.spanID = true
+	case colAttrs:
+		s.attrs = true
+	}
+}
+
+// selectColumns derives the column set a request needs: an empty projection means "all columns"
+// (output everything); otherwise the projected columns (output) plus the conditions' columns
+// (filter) — an attribute condition needs the serialized attrs blob.
+func selectColumns(r fetch.Request) colSet {
+	if len(r.Projection) == 0 {
+		return allCols
+	}
+
+	var s colSet
+	for _, name := range r.Projection {
+		s.mark(name)
+	}
+
+	for i := range r.Conditions {
+		if isFixedColumn(r.Conditions[i].Column) {
+			s.mark(r.Conditions[i].Column)
+		} else {
+			s.attrs = true // a per-record attribute predicate reads the blob
+		}
+	}
+
+	return s
+}
+
 // recordCols is a set of log records laid out columnarly (one entry per record across the parallel
 // slices). It is the head's per-stream buffer, the per-stream slice of a flush, and a fetch
-// accumulator. All slices share one length, [recordCols.len].
+// accumulator. The ts slice is always populated; the other columns are populated only when sel
+// selects them (lazy decode). All populated slices share one length, [recordCols.len].
 type recordCols struct {
+	sel      colSet
 	ts       []int64
 	observed []int64
 	severity []int64
@@ -43,21 +105,47 @@ type recordCols struct {
 
 func (c *recordCols) len() int { return len(c.ts) }
 
-// newRecordCols returns an empty recordCols whose columns are pre-sized to hold n rows, so the
-// accumulation copies never reallocate.
-func newRecordCols(n int) *recordCols {
-	return &recordCols{
-		ts:       make([]int64, 0, n),
-		observed: make([]int64, 0, n),
-		severity: make([]int64, 0, n),
-		flags:    make([]int64, 0, n),
-		dropped:  make([]int64, 0, n),
-		sevText:  make([][]byte, 0, n),
-		body:     make([][]byte, 0, n),
-		traceID:  make([][]byte, 0, n),
-		spanID:   make([][]byte, 0, n),
-		attrs:    make([][]byte, 0, n),
+// newRecordCols returns an empty recordCols whose selected columns are pre-sized to hold n rows
+// (so the accumulation copies never reallocate); unselected columns stay nil and are never touched.
+func newRecordCols(n int, sel colSet) *recordCols {
+	c := &recordCols{sel: sel, ts: make([]int64, 0, n)}
+	if sel.observed {
+		c.observed = make([]int64, 0, n)
 	}
+
+	if sel.severity {
+		c.severity = make([]int64, 0, n)
+	}
+
+	if sel.flags {
+		c.flags = make([]int64, 0, n)
+	}
+
+	if sel.dropped {
+		c.dropped = make([]int64, 0, n)
+	}
+
+	if sel.sevText {
+		c.sevText = make([][]byte, 0, n)
+	}
+
+	if sel.body {
+		c.body = make([][]byte, 0, n)
+	}
+
+	if sel.traceID {
+		c.traceID = make([][]byte, 0, n)
+	}
+
+	if sel.spanID {
+		c.spanID = make([][]byte, 0, n)
+	}
+
+	if sel.attrs {
+		c.attrs = make([][]byte, 0, n)
+	}
+
+	return c
 }
 
 // appendClone appends r, cloning its byte fields — for the head buffer, whose bytes outlive the
@@ -75,33 +163,91 @@ func (c *recordCols) appendClone(r rec) {
 	c.attrs = append(c.attrs, bytes.Clone(r.attrs))
 }
 
-// appendRow appends row i of src as-is (no clone — src's bytes are already owned/stable).
+// appendRow appends row i of src as-is (no clone — src's bytes are already owned/stable). Only the
+// destination's selected columns are copied; src must populate at least those (a part decodes the
+// same set; the head buffer holds all). ts is always copied.
 func (c *recordCols) appendRow(src *recordCols, i int) {
+	s := &c.sel
 	c.ts = append(c.ts, src.ts[i])
-	c.observed = append(c.observed, src.observed[i])
-	c.severity = append(c.severity, src.severity[i])
-	c.flags = append(c.flags, src.flags[i])
-	c.dropped = append(c.dropped, src.dropped[i])
-	c.sevText = append(c.sevText, src.sevText[i])
-	c.body = append(c.body, src.body[i])
-	c.traceID = append(c.traceID, src.traceID[i])
-	c.spanID = append(c.spanID, src.spanID[i])
-	c.attrs = append(c.attrs, src.attrs[i])
+
+	if s.observed {
+		c.observed = append(c.observed, src.observed[i])
+	}
+
+	if s.severity {
+		c.severity = append(c.severity, src.severity[i])
+	}
+
+	if s.flags {
+		c.flags = append(c.flags, src.flags[i])
+	}
+
+	if s.dropped {
+		c.dropped = append(c.dropped, src.dropped[i])
+	}
+
+	if s.sevText {
+		c.sevText = append(c.sevText, src.sevText[i])
+	}
+
+	if s.body {
+		c.body = append(c.body, src.body[i])
+	}
+
+	if s.traceID {
+		c.traceID = append(c.traceID, src.traceID[i])
+	}
+
+	if s.spanID {
+		c.spanID = append(c.spanID, src.spanID[i])
+	}
+
+	if s.attrs {
+		c.attrs = append(c.attrs, src.attrs[i])
+	}
 }
 
-// appendRange bulk-appends rows [lo, hi) of src — one append per column rather than per row. The
-// byte slices are copied by reference (they alias src's decoded bytes, owned by the caller).
+// appendRange bulk-appends rows [lo, hi) of src's selected columns — one append per column rather
+// than per row. Byte slices are copied by reference (they alias src's decoded bytes).
 func (c *recordCols) appendRange(src *recordCols, lo, hi int) {
+	s := &c.sel
 	c.ts = append(c.ts, src.ts[lo:hi]...)
-	c.observed = append(c.observed, src.observed[lo:hi]...)
-	c.severity = append(c.severity, src.severity[lo:hi]...)
-	c.flags = append(c.flags, src.flags[lo:hi]...)
-	c.dropped = append(c.dropped, src.dropped[lo:hi]...)
-	c.sevText = append(c.sevText, src.sevText[lo:hi]...)
-	c.body = append(c.body, src.body[lo:hi]...)
-	c.traceID = append(c.traceID, src.traceID[lo:hi]...)
-	c.spanID = append(c.spanID, src.spanID[lo:hi]...)
-	c.attrs = append(c.attrs, src.attrs[lo:hi]...)
+
+	if s.observed {
+		c.observed = append(c.observed, src.observed[lo:hi]...)
+	}
+
+	if s.severity {
+		c.severity = append(c.severity, src.severity[lo:hi]...)
+	}
+
+	if s.flags {
+		c.flags = append(c.flags, src.flags[lo:hi]...)
+	}
+
+	if s.dropped {
+		c.dropped = append(c.dropped, src.dropped[lo:hi]...)
+	}
+
+	if s.sevText {
+		c.sevText = append(c.sevText, src.sevText[lo:hi]...)
+	}
+
+	if s.body {
+		c.body = append(c.body, src.body[lo:hi]...)
+	}
+
+	if s.traceID {
+		c.traceID = append(c.traceID, src.traceID[lo:hi]...)
+	}
+
+	if s.spanID {
+		c.spanID = append(c.spanID, src.spanID[lo:hi]...)
+	}
+
+	if s.attrs {
+		c.attrs = append(c.attrs, src.attrs[lo:hi]...)
+	}
 }
 
 // sortByTs reorders every column by ascending timestamp (stable, so equal-ts records keep their
@@ -120,16 +266,24 @@ func (c *recordCols) sortByTs() {
 
 	sort.SliceStable(idx, func(a, b int) bool { return c.ts[idx[a]] < c.ts[idx[b]] })
 
+	s := &c.sel
 	c.ts = permute(c.ts, idx)
-	c.observed = permute(c.observed, idx)
-	c.severity = permute(c.severity, idx)
-	c.flags = permute(c.flags, idx)
-	c.dropped = permute(c.dropped, idx)
-	c.sevText = permute(c.sevText, idx)
-	c.body = permute(c.body, idx)
-	c.traceID = permute(c.traceID, idx)
-	c.spanID = permute(c.spanID, idx)
-	c.attrs = permute(c.attrs, idx)
+	permuteIf(s.observed, &c.observed, idx)
+	permuteIf(s.severity, &c.severity, idx)
+	permuteIf(s.flags, &c.flags, idx)
+	permuteIf(s.dropped, &c.dropped, idx)
+	permuteIf(s.sevText, &c.sevText, idx)
+	permuteIf(s.body, &c.body, idx)
+	permuteIf(s.traceID, &c.traceID, idx)
+	permuteIf(s.spanID, &c.spanID, idx)
+	permuteIf(s.attrs, &c.attrs, idx)
+}
+
+// permuteIf reorders *col by idx only when active (a nil column stays nil).
+func permuteIf[T any](active bool, col *[]T, idx []int) {
+	if active {
+		*col = permute(*col, idx)
+	}
 }
 
 // isSortedByTs reports whether the timestamps are already non-decreasing.
