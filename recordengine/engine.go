@@ -99,13 +99,7 @@ func (e *Engine) AppendBatch(b *Batch) (accepted int, err error) {
 	}
 
 	if e.cfg.WAL != nil && accepted > 0 {
-		if isNew {
-			if err := e.cfg.WAL.WriteSeries(b.Stream, b.Identity()); err != nil {
-				return accepted, err
-			}
-		}
-
-		if err := e.cfg.WAL.WriteRecords(b.Stream, encodeRecs(walRecs)); err != nil {
+		if err := e.logWAL(b, walRecs, isNew); err != nil {
 			return accepted, err
 		}
 	}
@@ -264,28 +258,12 @@ func (e *Engine) Reset(ctx context.Context) error {
 	return nil
 }
 
-// Replay rebuilds the head from the WAL segments in dir (durable restart).
+// Replay rebuilds the head (and side store) from the WAL segments in dir (durable restart).
 func (e *Engine) Replay(dir string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return wal.ReplayDir(dir, wal.Handlers{
-		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
-			e.head.registerStream(s)
-
-			return nil
-		},
-		OnRecords: func(id signal.SeriesID, blob []byte) error {
-			recs, err := decodeRecs(blob, e.cfg.Schema.numInts(), e.cfg.Schema.numBytes())
-			if err != nil {
-				return err
-			}
-
-			e.head.replayRecords(id, recs)
-
-			return nil
-		},
-	})
+	return wal.ReplayDir(dir, e.replayHandlers())
 }
 
 // SideSnapshot returns the engine's full side-store tables — the live head accumulator unioned with
@@ -341,6 +319,56 @@ func (e *Engine) HeadRecordCount() int {
 	}
 
 	return n
+}
+
+// logWAL durably logs a batch's series (on first sight), its accepted records, and — when present —
+// its side-store delta, so a WAL replay reconstructs the head and the symbols those records reference.
+func (e *Engine) logWAL(b *Batch, walRecs []rec, isNew bool) error {
+	if isNew {
+		if err := e.cfg.WAL.WriteSeries(b.Stream, b.Identity()); err != nil {
+			return err
+		}
+	}
+
+	if err := e.cfg.WAL.WriteRecords(b.Stream, encodeRecs(walRecs)); err != nil {
+		return err
+	}
+
+	if len(b.Side) > 0 {
+		return e.cfg.WAL.WriteSide(b.Side)
+	}
+
+	return nil
+}
+
+// replayHandlers builds the WAL handlers that rebuild the head and side store from a record log
+// verbatim (no OOO re-check). Shared by [Engine.Replay] (durable restart) and
+// [Engine.ApplyReplicated] (cluster secondary). The caller holds the lock.
+func (e *Engine) replayHandlers() wal.Handlers {
+	return wal.Handlers{
+		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
+			e.head.registerStream(s)
+
+			return nil
+		},
+		OnRecords: func(id signal.SeriesID, blob []byte) error {
+			recs, err := decodeRecs(blob, e.cfg.Schema.numInts(), e.cfg.Schema.numBytes())
+			if err != nil {
+				return err
+			}
+
+			e.head.replayRecords(id, recs)
+
+			return nil
+		},
+		OnSide: func(payload []byte) error {
+			if e.cfg.SideStore == nil {
+				return nil
+			}
+
+			return e.cfg.SideStore.Absorb(payload)
+		},
+	}
 }
 
 // streamInRangeLocked reports whether stream id has any record in [start, end] (head ∪ parts). A

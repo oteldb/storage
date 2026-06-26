@@ -99,6 +99,18 @@ func (sw *SegmentWriter) WriteRecords(id signal.SeriesID, payload []byte) error 
 	return sw.w.WriteRecords(id, payload)
 }
 
+// WriteSide logs an opaque engine-encoded side-store delta, rotating first if the current segment is
+// full.
+func (sw *SegmentWriter) WriteSide(payload []byte) error {
+	if sw.size >= sw.maxBytes {
+		if err := sw.rotate(); err != nil {
+			return err
+		}
+	}
+
+	return sw.w.WriteSide(payload)
+}
+
 // Sync flushes the current segment to stable storage.
 func (sw *SegmentWriter) Sync() error { return sw.f.Sync() }
 

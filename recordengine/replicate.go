@@ -81,28 +81,5 @@ func (e *Engine) ApplyReplicated(data []byte) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return wal.Replay(data, wal.Handlers{
-		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
-			e.head.registerStream(s)
-
-			return nil
-		},
-		OnRecords: func(id signal.SeriesID, blob []byte) error {
-			recs, err := decodeRecs(blob, e.cfg.Schema.numInts(), e.cfg.Schema.numBytes())
-			if err != nil {
-				return err
-			}
-
-			e.head.replayRecords(id, recs)
-
-			return nil
-		},
-		OnSide: func(payload []byte) error {
-			if e.cfg.SideStore == nil {
-				return nil
-			}
-
-			return e.cfg.SideStore.Absorb(payload)
-		},
-	})
+	return wal.Replay(data, e.replayHandlers())
 }

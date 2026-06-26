@@ -11,6 +11,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/recordengine"
+	"github.com/oteldb/storage/wal"
 )
 
 // fakeSide is a minimal content-addressed [recordengine.SideStore] for testing the hook: a single
@@ -177,6 +178,32 @@ func TestSideStoreReplicates(t *testing.T) {
 	want := []uint64{1, 2}
 	require.Equal(t, want, accIDs(fsP), "primary absorbed the symbols")
 	require.Equal(t, want, accIDs(fsS), "secondary absorbed the forwarded symbols")
+}
+
+// TestSideStoreWALReplay verifies the side delta is logged to the WAL and a fresh engine's Replay
+// reconstructs the side store along with the head.
+func TestSideStoreWALReplay(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	w, err := wal.Create(dir, 0)
+	require.NoError(t, err)
+
+	e := recordengine.New(recordengine.Config{Schema: testSchema, WAL: w, SideStore: newFakeSide()})
+
+	b := mkBatch("api", rrec{ts: 1, body: "x"})
+	b.Side = encodeSide(map[uint64][]byte{1: []byte("a"), 2: []byte("b")})
+	ingest(t, e, b)
+	require.NoError(t, w.Sync())
+
+	// A fresh engine replays the WAL directory: head records and side store both come back.
+	fs := newFakeSide()
+	replayed := recordengine.New(recordengine.Config{Schema: testSchema, SideStore: fs})
+	require.NoError(t, replayed.Replay(dir))
+
+	require.Equal(t, 1, replayed.HeadRecordCount(), "record replayed")
+	require.Equal(t, []uint64{1, 2}, accIDs(fs), "side store replayed")
 }
 
 // accIDs returns the sorted ids in a fakeSide accumulator.
