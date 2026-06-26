@@ -51,6 +51,10 @@ func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) error {
 		p.minTime, p.maxTime = colsTimeRange(f)
 		e.parts = []*part{p}
 		e.nextSeq++
+
+		if err := e.mergeSidecars(ctx, old, prefix); err != nil {
+			return err
+		}
 	}
 
 	if err := e.updateIndexLocked(ctx); err != nil {
@@ -64,6 +68,32 @@ func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) error {
 	}
 
 	return nil
+}
+
+// mergeSidecars unions the side-store sidecars of the compacted parts and writes the merged tables
+// under the new part. No-op when the engine has no side store. Content-addressing makes the union a
+// plain dedup — no id remap.
+func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix string) error {
+	if e.cfg.SideStore == nil {
+		return nil
+	}
+
+	parts := make([]map[string][]byte, 0, len(old))
+	for _, p := range old {
+		m, err := loadSidecars(ctx, e.cfg.Backend, p.prefix, e.cfg.SideStore.Names())
+		if err != nil {
+			return err
+		}
+
+		parts = append(parts, m)
+	}
+
+	merged, err := e.cfg.SideStore.Union(parts)
+	if err != nil {
+		return err
+	}
+
+	return writeSidecars(ctx, e.cfg.Backend, newPrefix, merged)
 }
 
 // compactParts concatenates every part's records per stream (within [start, maxInt64], applying

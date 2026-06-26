@@ -24,6 +24,10 @@ type Config struct {
 	Backend backend.Backend
 	// Prefix is the backend key prefix under which this engine's parts are written.
 	Prefix string
+	// SideStore, when non-nil, is a signal-supplied content-addressed auxiliary store (e.g. the
+	// profiles symbol store) that the engine persists as part sidecars on flush and unions on merge.
+	// nil ⇒ no side data (logs, traces).
+	SideStore SideStore
 }
 
 // Engine is one tenant's record store for a signal. Safe for concurrent use.
@@ -52,6 +56,9 @@ type Batch struct {
 	Ts       []int64
 	Ints     [][]int64  // len == schema int count; Ints[k][row]
 	Bytes    [][][]byte // len == schema byte count; Bytes[k][row]
+	// Side is an optional encoded side-store delta (the content-addressed symbols this batch's
+	// records reference) absorbed by [Config.SideStore]. nil when the engine has no side store.
+	Side []byte
 }
 
 // Len returns the number of records in the batch.
@@ -100,6 +107,12 @@ func (e *Engine) AppendBatch(b *Batch) (accepted int, err error) {
 
 		if err := e.cfg.WAL.WriteRecords(b.Stream, encodeRecs(walRecs)); err != nil {
 			return accepted, err
+		}
+	}
+
+	if e.cfg.SideStore != nil && accepted > 0 && len(b.Side) > 0 {
+		if err := e.cfg.SideStore.Absorb(b.Side); err != nil {
+			return accepted, errors.Wrap(err, "absorb side delta")
 		}
 	}
 
@@ -338,6 +351,14 @@ func (e *Engine) flushLocked(ctx context.Context) error {
 	p.minTime, p.maxTime = colsTimeRange(f)
 	e.parts = append(e.parts, p)
 	e.nextSeq++
+
+	if e.cfg.SideStore != nil {
+		if err := writeSidecars(ctx, e.cfg.Backend, prefix, e.cfg.SideStore.Encode()); err != nil {
+			return err
+		}
+
+		e.cfg.SideStore.Reset()
+	}
 
 	if err := e.updateIndexLocked(ctx); err != nil {
 		return err
