@@ -44,7 +44,7 @@ The design is a single columnar engine with swappable front-ends and backends
 | L3 **Engine** / **Index / WAL** | **head · flush · merge · retention** / **symbols · series · postings** · **write-ahead log** | **engine implemented (metrics)**; **index + wal implemented** |
 | L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
 | L1 **Backend** | file · s3 · memory behind one interface | **memory + file + s3 implemented**, with `PutIfAbsent` CAS; `bucketindex` for stateless part enumeration |
-| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | — (package `cluster`, seam only) |
+| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **HRW ring implemented** (`cluster/ring`); etcd, replication, rebalance pending |
 
 The **implemented substance spans L1 (backends) through L4 (the fetch contract)** for
 metrics: encoding, parts, index, WAL, the engine head/flush/merge, and the metrics fetch
@@ -381,6 +381,23 @@ The embedder owns evaluation and result types: it runs `promql.Engine` over the 
 consumes Prometheus' own `Vector`/`Matrix`/`Scalar`, so the library defines no query-result
 type and the core leaks nothing prometheus-shaped.
 
+## 3i. Cluster ring (`cluster/ring/`) — L0 sharding primitive
+
+The first piece of the (optional) distribution layer: **rendezvous / highest-random-weight
+(HRW) hashing**. A node's score for a key is `xxh3.HashSeed(key, seed(nodeID))`; `Lookup(key,
+rf)` returns the `rf` highest-scoring nodes (primary first, replicas after), ties broken by
+ID. Two properties make it the sharding base:
+
+- **Deterministic, coordinator-free placement** — every node computes the same owners from
+  just the membership list, so routing needs no lookup table on the hot path.
+- **Minimal movement on membership change** — adding a node only ever steals a key's replica
+  slot *to itself* (existing pairings never reshuffle); removing one only redistributes *its*
+  keys. A property test pins this: per key, at most one replica moves on an add, and the new
+  node receives exactly its `~1/(N+1)` fair share of slots.
+
+The `Ring` is immutable (`With`/`Without` return a new ring). etcd-backed membership/leases,
+RF=3 quorum replication, and the rebalance orchestrator build on this and remain pending.
+
 ---
 
 ## 4. Public surface (`storage` root package)
@@ -495,7 +512,8 @@ wal/                  CRC-framed segmented write-ahead log + replay             
 engine/               head · flush · background-merge · retention · fetch (metrics)    [implemented]
 query/fetch           callback-matcher fetch contract (Request/Matcher/Iterator/Batch) [implemented for metrics; the library's query surface]
 query/promql          OPTIONAL adapter: fetch → Prometheus storage.Queryable (no engine) [implemented; only package importing prometheus]
-cluster/              etcd ring · HRW sharding · replication · rebalance               [seam only]
+cluster/              L0 distribution: ring + (later) etcd · replication · rebalance     [ring implemented; rest seam]
+  cluster/ring        rendezvous (HRW) hashing: deterministic placement, ~1/N movement  [implemented]
 ```
 
 "Seam only" packages currently contain their `doc.go` (and, where noted, an interface or
