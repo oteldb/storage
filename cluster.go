@@ -91,15 +91,15 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	return nil
 }
 
-// localFetch returns every series of a tenant within [start, end] from the local engine (no
-// matcher filtering) — the read-fan-out server's view of this node's data.
-func (s *Storage) localFetch(ctx context.Context, tenant string, start, end int64) ([]*fetch.Batch, error) {
+// localFetch serves a peer's fetch from the local engine, pushing down the (equality) matchers
+// it forwarded — the read-fan-out server's view of this node's data.
+func (s *Storage) localFetch(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
 	eng, ok := s.lookupEngine(s.normalizeTenant(signal.TenantID(tenant)))
 	if !ok {
 		return nil, nil
 	}
 
-	it, err := eng.Fetch(ctx, fetch.Request{Tenant: signal.TenantID(tenant), Start: start, End: end})
+	it, err := eng.Fetch(ctx, fetch.Request{Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers})
 	if err != nil {
 		return nil, err
 	}

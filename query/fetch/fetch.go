@@ -26,6 +26,27 @@ import (
 type Matcher struct {
 	Name  []byte
 	Match func(value signal.Value) bool
+
+	// Spec is an optional **serializable** form of an equality predicate, set by the language
+	// layer when Match is an exact compare. It lets the cluster fan-out push a selective
+	// matcher (e.g. `__name__="metric"`) to a peer node — the Match closure cannot cross the
+	// wire. It is metadata only: a [Fetcher] always matches via Match; a peer reconstructs an
+	// equivalent closure from Spec. Only equality is carried (it is exact, so a peer's pushdown
+	// never drops a matching series); other predicates fall back to the requester's re-check.
+	Spec *EqualMatcher
+}
+
+// EqualMatcher is the serializable form of an exact label-equality predicate (see
+// [Matcher.Spec]). [EqualMatcher.Predicate] reconstructs the equivalent [Matcher.Match].
+type EqualMatcher struct {
+	Name  string
+	Value string
+}
+
+// Predicate returns the Match closure equivalent to this equality: the label's canonical text
+// projection equals Value (the same comparison the language layer's exact matcher makes).
+func (m EqualMatcher) Predicate() func(signal.Value) bool {
+	return func(v signal.Value) bool { return string(v.AppendText(nil)) == m.Value }
 }
 
 // Request selects series for a tenant within an inclusive time window, filtered by all

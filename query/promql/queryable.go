@@ -128,7 +128,13 @@ func pushableMatchers(ms []*labels.Matcher) []fetch.Matcher {
 			continue
 		}
 
-		out = append(out, fetch.Matcher{Name: []byte(m.Name), Match: valuePredicate(m)})
+		fm := fetch.Matcher{Name: []byte(m.Name), Match: valuePredicate(m)}
+		if m.Type == labels.MatchEqual {
+			// Equality is serializable and exact: let the cluster fan-out push it to peers.
+			fm.Spec = &fetch.EqualMatcher{Name: m.Name, Value: m.Value}
+		}
+
+		out = append(out, fm)
 	}
 
 	return out

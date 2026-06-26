@@ -18,13 +18,15 @@ import (
 func TestFetchRequestCodec(t *testing.T) {
 	t.Parallel()
 
-	tenant, start, end, err := cluster.DecodeFetchRequest(cluster.EncodeFetchRequest("acme", -5, 1_700_000_000))
+	eq := []fetch.EqualMatcher{{Name: "__name__", Value: "http_requests"}, {Name: "job", Value: "api"}}
+	tenant, start, end, gotEq, err := cluster.DecodeFetchRequest(cluster.EncodeFetchRequest("acme", -5, 1_700_000_000, eq))
 	require.NoError(t, err)
 	assert.Equal(t, "acme", tenant)
 	assert.Equal(t, int64(-5), start)
 	assert.Equal(t, int64(1_700_000_000), end)
+	assert.Equal(t, eq, gotEq, "equality matchers round-trip")
 
-	_, _, _, err = cluster.DecodeFetchRequest([]byte{0xff}) //nolint:dogsled // only the error matters
+	_, _, _, _, err = cluster.DecodeFetchRequest([]byte{0xff}) //nolint:dogsled // only the error matters
 	require.Error(t, err)
 }
 
@@ -71,8 +73,9 @@ func TestRemoteFetcherOverHTTP(t *testing.T) {
 
 	var gotTenant string
 	var gotStart, gotEnd int64
-	handler := cluster.ReadHandler(func(_ context.Context, tenant string, start, end int64) ([]*fetch.Batch, error) {
-		gotTenant, gotStart, gotEnd = tenant, start, end
+	var gotMatchers int
+	handler := cluster.ReadHandler(func(_ context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
+		gotTenant, gotStart, gotEnd, gotMatchers = tenant, start, end, len(matchers)
 
 		return want, nil
 	})
@@ -84,7 +87,10 @@ func TestRemoteFetcherOverHTTP(t *testing.T) {
 	addr := strings.TrimPrefix(srv.URL, "http://")
 
 	rf := cluster.NewRemoteFetcher(addr, nil)
-	it, err := rf.Fetch(context.Background(), fetch.Request{Tenant: "acme", Start: 10, End: 20})
+	it, err := rf.Fetch(context.Background(), fetch.Request{
+		Tenant: "acme", Start: 10, End: 20,
+		Matchers: []fetch.Matcher{{Name: []byte("job"), Spec: &fetch.EqualMatcher{Name: "job", Value: "api"}}},
+	})
 	require.NoError(t, err)
 	got, err := fetch.Drain(context.Background(), it)
 	require.NoError(t, err)
@@ -92,6 +98,7 @@ func TestRemoteFetcherOverHTTP(t *testing.T) {
 	assert.Equal(t, "acme", gotTenant)
 	assert.Equal(t, int64(10), gotStart)
 	assert.Equal(t, int64(20), gotEnd)
+	assert.Equal(t, 1, gotMatchers, "the equality matcher was pushed to the peer")
 	require.Len(t, got, 1)
 	assert.True(t, want[0].Series.Equal(got[0].Series))
 	assert.Equal(t, want[0].Timestamps, got[0].Timestamps)

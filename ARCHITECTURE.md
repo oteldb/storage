@@ -458,10 +458,18 @@ written to the shared object store by exactly one node — even during ring-disa
 the claim arbitrates. A departed node's claims auto-free with its lease and the new primary
 takes over (tested via lease revoke). A two-node test confirms only the primary compacts.
 
-Remaining parity work: the cluster-mode write path does not yet apply the single-node OOO window
-or partial-success accounting; remote fan-out has no matcher pushdown (a serializable-matcher
-protocol would add it); and replica heads are not yet trimmed after the owner flushes (they hold
-the replicated window until the node restarts).
+**Matcher pushdown.** Most matchers are opaque closures, but **equality** is exact and
+serializable, so `fetch.Matcher` carries an optional `Spec *EqualMatcher` (the PromQL adapter
+sets it for `=` matchers). The read RPC forwards the equality specs; the peer reconstructs them
+(`EqualMatcher.Predicate`) and pushes them into its local fetch — so a non-owner read narrows by
+`__name__="metric"` on the owner instead of pulling the whole window. Non-equality matchers are
+not forwarded; the requester's re-check still applies them.
+
+Closed parity items: the replication receive path now applies the OOO window (§3f
+`ApplyReplicated`); replica heads are trimmed to the unflushed window after the owner flushes
+(`Engine.RefreshReplica`, over a shared store); and equality matcher pushdown (above). Still
+open: per-point **partial-success accounting** is not propagated back from owners to the origin
+(cluster ingest reports accepted == emitted) — that needs primary-authoritative replication.
 
 ---
 

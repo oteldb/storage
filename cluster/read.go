@@ -21,35 +21,75 @@ const ReadPath = "/internal/fetch"
 // are opaque Go predicates (not serializable). A peer returns every series in the window (a
 // superset, which the fetch contract permits); the requesting node re-applies its matchers.
 
-// EncodeFetchRequest frames a window-only fetch request.
-func EncodeFetchRequest(tenant string, start, end int64) []byte {
-	buf := binary.AppendUvarint(nil, uint64(len(tenant)))
-	buf = append(buf, tenant...)
+// EncodeFetchRequest frames a fetch request: tenant, window, and any serializable equality
+// matchers to push down to the peer (other predicates are re-checked by the requester).
+func EncodeFetchRequest(tenant string, start, end int64, eq []fetch.EqualMatcher) []byte {
+	buf := appendString(nil, tenant)
 	buf = binary.AppendVarint(buf, start)
+	buf = binary.AppendVarint(buf, end)
+	buf = binary.AppendUvarint(buf, uint64(len(eq)))
+	for _, m := range eq {
+		buf = appendString(buf, m.Name)
+		buf = appendString(buf, m.Value)
+	}
 
-	return binary.AppendVarint(buf, end)
+	return buf
 }
 
 // DecodeFetchRequest parses a request made by [EncodeFetchRequest].
-func DecodeFetchRequest(data []byte) (tenant string, start, end int64, err error) {
+func DecodeFetchRequest(data []byte) (tenant string, start, end int64, eq []fetch.EqualMatcher, err error) {
+	tenant, data, err = takeString(data)
+	if err != nil {
+		return "", 0, 0, nil, errors.Wrap(err, "tenant")
+	}
+
+	var m int
+	if start, m = binary.Varint(data); m <= 0 {
+		return "", 0, 0, nil, errors.New("cluster: malformed fetch request start")
+	}
+	data = data[m:]
+
+	if end, m = binary.Varint(data); m <= 0 {
+		return "", 0, 0, nil, errors.New("cluster: malformed fetch request end")
+	}
+	data = data[m:]
+
+	count, m := binary.Uvarint(data)
+	if m <= 0 {
+		return "", 0, 0, nil, errors.New("cluster: malformed matcher count")
+	}
+	data = data[m:]
+
+	eq = make([]fetch.EqualMatcher, 0, count)
+	for range count {
+		var name, value string
+		if name, data, err = takeString(data); err != nil {
+			return "", 0, 0, nil, errors.Wrap(err, "matcher name")
+		}
+
+		if value, data, err = takeString(data); err != nil {
+			return "", 0, 0, nil, errors.Wrap(err, "matcher value")
+		}
+
+		eq = append(eq, fetch.EqualMatcher{Name: name, Value: value})
+	}
+
+	return tenant, start, end, eq, nil
+}
+
+func appendString(dst []byte, s string) []byte {
+	dst = binary.AppendUvarint(dst, uint64(len(s)))
+
+	return append(dst, s...)
+}
+
+func takeString(data []byte) (string, []byte, error) {
 	n, m := binary.Uvarint(data)
 	if m <= 0 || n > uint64(len(data)-m) {
-		return "", 0, 0, errors.New("cluster: malformed fetch request")
-	}
-	tenant = string(data[m : m+int(n)])
-	data = data[m+int(n):]
-
-	start, m = binary.Varint(data)
-	if m <= 0 {
-		return "", 0, 0, errors.New("cluster: malformed fetch request start")
+		return "", nil, errors.New("cluster: malformed length-prefixed string")
 	}
 
-	end, m = binary.Varint(data[m:])
-	if m <= 0 {
-		return "", 0, 0, errors.New("cluster: malformed fetch request end")
-	}
-
-	return tenant, start, end, nil
+	return string(data[m : m+int(n)]), data[m+int(n):], nil
 }
 
 // EncodeBatches serializes fetch batches: each series' identity (reversible hash pre-image)
@@ -118,12 +158,12 @@ func DecodeBatches(data []byte) ([]*fetch.Batch, error) {
 	return out, nil
 }
 
-// FetchFunc fetches every series of a tenant within [start, end] from the local store (no
-// matcher filtering). It is what [ReadHandler] serves.
-type FetchFunc func(ctx context.Context, tenant string, start, end int64) ([]*fetch.Batch, error)
+// FetchFunc fetches a tenant's series within [start, end] from the local store, applying the
+// pushed-down matchers. It is what [ReadHandler] serves.
+type FetchFunc func(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error)
 
-// ReadHandler returns the HTTP handler that serves window fetches from the local store. Mount
-// it on the node's server at [ReadPath].
+// ReadHandler returns the HTTP handler that serves fetches from the local store, reconstructing
+// the pushed-down equality matchers. Mount it on the node's server at [ReadPath].
 func ReadHandler(fetchFn FetchFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
@@ -139,14 +179,19 @@ func ReadHandler(fetchFn FetchFunc) http.Handler {
 			return
 		}
 
-		tenant, start, end, err := DecodeFetchRequest(body)
+		tenant, start, end, eq, err := DecodeFetchRequest(body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 
 			return
 		}
 
-		batches, err := fetchFn(req.Context(), tenant, start, end)
+		matchers := make([]fetch.Matcher, len(eq))
+		for i := range eq {
+			matchers[i] = fetch.Matcher{Name: []byte(eq[i].Name), Match: eq[i].Predicate(), Spec: &eq[i]}
+		}
+
+		batches, err := fetchFn(req.Context(), tenant, start, end, matchers)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 
@@ -175,9 +220,18 @@ func NewRemoteFetcher(addr string, client *http.Client) *RemoteFetcher {
 	return &RemoteFetcher{addr: addr, client: client}
 }
 
-// Fetch forwards r's tenant and window to the peer and returns the decoded batches.
+// Fetch forwards r's tenant, window, and serializable (equality) matchers to the peer and
+// returns the decoded batches. Non-equality matchers are not forwarded — the requester
+// re-applies the full matcher set to the (possibly superset) result.
 func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
-	payload := EncodeFetchRequest(string(r.Tenant), r.Start, r.End)
+	var eq []fetch.EqualMatcher
+	for i := range r.Matchers {
+		if r.Matchers[i].Spec != nil {
+			eq = append(eq, *r.Matchers[i].Spec)
+		}
+	}
+
+	payload := EncodeFetchRequest(string(r.Tenant), r.Start, r.End, eq)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+f.addr+ReadPath, bytes.NewReader(payload))
 	if err != nil {
