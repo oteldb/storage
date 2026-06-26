@@ -38,15 +38,11 @@ func embeddedS3(t *testing.T, bucket string) *awss3.Client {
 	})
 }
 
-// TestS3IntegrationEmbedded runs the core backend conformance suite over the aws-sdk-go-v2
+// TestS3IntegrationEmbedded runs the full backend conformance suite over the aws-sdk-go-v2
 // adapter against a real S3 protocol implementation (the embeddable go-faster/fs server). It
-// exercises the adapter's GET/PUT/HEAD/DELETE/paginated-LIST against actual HTTP + XML, which
-// the in-memory fakes cannot.
-//
-// It uses [backendtest.RunCore], not Run: go-faster/fs v0.1.0 does not implement the
-// If-None-Match conditional write, so the PutIfAbsent CAS is covered separately by the
-// in-memory fakeAWS conformance (TestAWSAdapterConformance), which honors it. Verifying the
-// CAS over a real wire needs a conditional-write-capable store (AWS S3 / MinIO).
+// exercises the adapter's GET/PUT/HEAD/DELETE/paginated-LIST — and the If-None-Match
+// PutIfAbsent CAS (go-faster/fs ≥ v0.2.0) — against actual HTTP + XML, which the in-memory
+// fakes cannot.
 func TestS3IntegrationEmbedded(t *testing.T) {
 	t.Parallel()
 
@@ -54,7 +50,7 @@ func TestS3IntegrationEmbedded(t *testing.T) {
 	store := s3.NewAWS(embeddedS3(t, bucket), bucket)
 
 	// Each subtest gets an isolated key prefix in the shared bucket.
-	backendtest.RunCore(t, func(t *testing.T) backend.Backend {
+	backendtest.Run(t, func(t *testing.T) backend.Backend {
 		t.Helper()
 
 		return s3.New(store, strings.ReplaceAll(t.Name(), "/", "_")+"/")

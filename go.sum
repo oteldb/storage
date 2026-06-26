@@ -72,8 +72,8 @@ github.com/felixge/httpsnoop v1.0.4 h1:NFTV2Zj1bL4mc9sqWACXbQFVBBg2W3GPvqp8/ESS2
 github.com/felixge/httpsnoop v1.0.4/go.mod h1:m8KPJKqk1gH5J9DgRY2ASl2lWCfGKXixSwevea8zH2U=
 github.com/go-faster/errors v0.7.1 h1:MkJTnDoEdi9pDabt1dpWf7AA8/BaSYZqibYyhZ20AYg=
 github.com/go-faster/errors v0.7.1/go.mod h1:5ySTjWFiphBs07IKuiL69nxdfd5+fzh1u7FPGZP2quo=
-github.com/go-faster/fs v0.1.0 h1:qwc+YSb0mt8JzNgdwibQWNOclXd9Xugdl7iRYiH2bI4=
-github.com/go-faster/fs v0.1.0/go.mod h1:mLiHxFDaou7/ouAcigcUOJrMOoIWfdjqCsj59gV2pk0=
+github.com/go-faster/fs v0.2.0 h1:IMd4xXSK2sOyxpP8x/zudJ13AFfAcBSgr2I4MuaPxMU=
+github.com/go-faster/fs v0.2.0/go.mod h1:mLiHxFDaou7/ouAcigcUOJrMOoIWfdjqCsj59gV2pk0=
 github.com/go-faster/sdk v0.35.0 h1:AmI8VHE2Ffu/fyWbQ6nSbD+itWnHU5pa9h6nj9Up3m8=
 github.com/go-faster/sdk v0.35.0/go.mod h1:U5aImdJt2+c0bx9F2xeOER77F1tqHhWbyZ5NQYKI6vA=
 github.com/go-ini/ini v1.67.0 h1:z6ZrTEZqSWOTyH2FlglNbNgARyHG8oLW9gMELqKr06A=

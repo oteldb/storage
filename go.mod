@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.97.3
 	github.com/aws/smithy-go v1.24.2
 	github.com/go-faster/errors v0.7.1
-	github.com/go-faster/fs v0.1.0
+	github.com/go-faster/fs v0.2.0
 	github.com/klauspost/compress v1.18.6
 	github.com/prometheus/prometheus v0.307.3
 	github.com/stretchr/testify v1.11.1
