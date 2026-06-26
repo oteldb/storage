@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-faster/errors"
+	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
@@ -138,6 +139,11 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 		go s.runWALSync(walSyncEvery)
 	}
 
+	s.obs.Log.Info("storage opened",
+		zap.Bool("clustered", o.Cluster != nil),
+		zap.Bool("ephemeral", o.Durability == DurabilityEphemeral),
+		zap.Duration("flush_interval", time.Duration(o.FlushInterval)))
+
 	return s, nil
 }
 
@@ -198,6 +204,12 @@ func (s *Storage) Close(ctx context.Context) error {
 		if err := eng.Close(ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
+	}
+
+	if firstErr != nil {
+		s.obs.Log.Warn("storage closed with errors", zap.Error(firstErr))
+	} else {
+		s.obs.Log.Info("storage closed")
 	}
 
 	return firstErr
