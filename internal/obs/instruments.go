@@ -143,6 +143,34 @@ func newBackend(m metric.Meter) (*Backend, error) {
 	return bk, b.err
 }
 
+// WAL instruments the write-ahead log. The recording methods use a background context (the WAL
+// writer carries none) and are called at append/fsync/rotation granularity, never per sample.
+type WAL struct {
+	appends   metric.Int64Counter
+	fsyncs    metric.Int64Counter
+	rotations metric.Int64Counter
+}
+
+// Append accounts one WAL record-batch append.
+func (w *WAL) Append() { w.appends.Add(context.Background(), 1) }
+
+// Fsync accounts one WAL fsync.
+func (w *WAL) Fsync() { w.fsyncs.Add(context.Background(), 1) }
+
+// Rotate accounts one WAL segment rotation.
+func (w *WAL) Rotate() { w.rotations.Add(context.Background(), 1) }
+
+func newWAL(m metric.Meter) (*WAL, error) {
+	b := &imb{m: m}
+	w := &WAL{
+		appends:   b.counter("storage.wal.appends", "WAL record-batch appends", "{append}"),
+		fsyncs:    b.counter("storage.wal.fsyncs", "WAL fsyncs", "{fsync}"),
+		rotations: b.counter("storage.wal.rotations", "WAL segment rotations", "{rotation}"),
+	}
+
+	return w, b.err
+}
+
 func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 	b := &imb{m: m}
 

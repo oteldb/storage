@@ -37,6 +37,7 @@ type Obs struct {
 	Merge     *Merge
 	Fetch     *Fetch
 	Backend   *Backend
+	WAL       *WAL
 }
 
 // New builds the observability handle, defaulting each unset pillar to its no-op implementation.
@@ -74,6 +75,11 @@ func New(cfg Config) (*Obs, error) {
 		return nil, err
 	}
 
+	wal, err := newWAL(meter)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Obs{
 		Log:       log,
 		Tracer:    tp.Tracer(scope),
@@ -82,6 +88,7 @@ func New(cfg Config) (*Obs, error) {
 		Merge:     merge,
 		Fetch:     fetch,
 		Backend:   backend,
+		WAL:       wal,
 	}, nil
 }
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -33,8 +34,12 @@ type SegmentWriter struct {
 	f        *os.File
 	size     int
 	w        *Writer
-	sync     bool // fsync after every framed write (durability vs throughput)
+	sync     bool     // fsync after every framed write (durability vs throughput)
+	metrics  *obs.WAL // append/fsync/rotation counters; nil ⇒ not metered
 }
+
+// SetObs attaches the WAL metrics handle (append/fsync/rotation counters). nil disables metering.
+func (sw *SegmentWriter) SetObs(m *obs.WAL) { sw.metrics = m }
 
 // Create opens (creating the directory if needed) a segmented WAL writer. A non-positive maxBytes
 // uses [DefaultMaxSegmentBytes]. If the directory already holds segments from a prior run, Create
@@ -199,6 +204,10 @@ func (sw *SegmentWriter) Sync() error {
 		return nil
 	}
 
+	if sw.metrics != nil {
+		sw.metrics.Fsync()
+	}
+
 	return sw.f.Sync()
 }
 
@@ -232,8 +241,20 @@ func (sw *SegmentWriter) prepare() error {
 
 // afterWrite fsyncs the segment when the sync policy is on (and the write succeeded).
 func (sw *SegmentWriter) afterWrite(err error) error {
-	if err != nil || !sw.sync {
+	if err != nil {
 		return err
+	}
+
+	if sw.metrics != nil {
+		sw.metrics.Append()
+	}
+
+	if !sw.sync {
+		return nil
+	}
+
+	if sw.metrics != nil {
+		sw.metrics.Fsync()
 	}
 
 	return sw.f.Sync()
@@ -242,6 +263,10 @@ func (sw *SegmentWriter) afterWrite(err error) error {
 func (sw *SegmentWriter) rotate() error {
 	if err := sw.Close(); err != nil {
 		return err
+	}
+
+	if sw.metrics != nil {
+		sw.metrics.Rotate()
 	}
 
 	return sw.openNext()

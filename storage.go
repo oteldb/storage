@@ -786,6 +786,10 @@ func (s *Storage) walFor(prefix string) (*wal.SegmentWriter, error) {
 		w.SetSync(true)
 	}
 
+	if s.opts.MeterProvider != nil {
+		w.SetObs(s.obs.WAL)
+	}
+
 	return w, nil
 }
 
