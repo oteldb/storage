@@ -152,8 +152,9 @@ conditional-write (CAS) primitive on which atomic manifest / block-list commits 
   `DeleteObject` is idempotent) — is covered by the conformance suite over an in-memory fake.
   `NewAWS` adapts `aws-sdk-go-v2` (GetObject / PutObject±If-None-Match / HeadObject /
   idempotent DeleteObject / paginated ListObjectsV2); a faithful map-based fake `AWSAPI` runs
-  the same suite through the adapter, so everything but the network is tested. **This is the
-  only package importing the AWS SDK.**
+  the same suite through the adapter, and an env-gated integration test (`OTELDB_S3_ENDPOINT`)
+  runs it against a real endpoint — verified against MinIO, including the If-None-Match CAS.
+  **This is the only package importing the AWS SDK.**
 - **`backend/bucketindex`** — a compact, versioned binary index (block list + per-part time
   bounds) stored as one object, so a stateless reader enumerates and time-prunes a tenant's
   parts (`Overlapping(start,end)`) without a full bucket `List`. Fuzzed for decode safety,
@@ -470,7 +471,7 @@ otlp/pdataconv        optional OTel-Go bridge: pmetric.Metrics → metric.Metric
 tenant/               Limits/Retention/Downsample/Policy, Resolver                     [implemented]
 backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + memory (root) [implemented]
   backend/file        directory-tree backend; atomic write + exclusive PutIfAbsent (os.Link) [implemented]
-  backend/s3          object-store-native backend over ObjectStore + aws-sdk-go-v2 adapter   [implemented; live-S3 integration untested here]
+  backend/s3          object-store-native backend over ObjectStore + aws-sdk-go-v2 adapter   [implemented; env-gated MinIO/S3 integration test]
   backend/bucketindex versioned block-list index (time-pruned part enumeration, no full LIST) [implemented]
 block/                immutable columnar part format: column/marks/manifest/part        [implemented]
 index/                symbols (intern) · series (id↔attrs) · postings (set-ops/matchers) [implemented; bloom seam only]
