@@ -141,37 +141,25 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	defer e.mu.RUnlock()
 
 	ids := e.head.resolve(r.Matchers)
+	if len(ids) == 0 {
+		return fetch.NewSliceIterator(nil), nil
+	}
+
+	accs, err := e.accumulate(ctx, ids, r)
+	if err != nil {
+		return nil, err
+	}
 
 	var batches []*fetch.Batch
 
 	for _, id := range ids {
-		acc := &recordCols{}
-
-		// Parts oldest → newest, then the head, then sort the whole window by timestamp.
-		for _, p := range e.parts {
-			if p.maxTime < r.Start || p.minTime > r.End {
-				continue // time-prune via the part's bounds
-			}
-
-			// Bloom prune: when conditions are applied (AllConditions), skip a part whose body or
-			// attribute bloom proves a required full-text token or equality value absent (no
-			// false negatives; surviving parts are still re-checked per row).
-			if r.AllConditions && !p.mayContain(r.Conditions) {
-				continue
-			}
-
-			if err := p.appendWindow(ctx, id, acc, r.Start, r.End); err != nil {
-				return nil, err
-			}
-		}
-
-		e.head.appendWindow(id, acc, r.Start, r.End)
+		acc := accs[id]
 
 		// Column conditions (AND) filter records within the stream. Per the contract, the engine
 		// applies them conjunctively only when AllConditions is set; otherwise it returns the
 		// window superset and the language layer filters.
 		if r.AllConditions && len(r.Conditions) > 0 {
-			acc = acc.filtered(r.Conditions)
+			acc.filterInPlace(r.Conditions)
 		}
 
 		if acc.len() == 0 {
@@ -193,6 +181,27 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	}
 
 	return fetch.NewSliceIterator(batches), nil
+}
+
+// appendWindowRows appends the rows of cols in [rng.start, rng.end) whose timestamp is in
+// [start, end] to acc. When the whole range falls in the window (the common case) it bulk-appends
+// the contiguous slice instead of testing every row.
+func appendWindowRows(acc, cols *recordCols, rng rowRange, start, end int64) {
+	if rng.start >= rng.end {
+		return
+	}
+
+	if cols.ts[rng.start] >= start && cols.ts[rng.end-1] <= end {
+		acc.appendRange(cols, rng.start, rng.end) // whole range in window (part rows are ts-sorted)
+
+		return
+	}
+
+	for i := rng.start; i < rng.end; i++ {
+		if cols.ts[i] >= start && cols.ts[i] <= end {
+			acc.appendRow(cols, i)
+		}
+	}
 }
 
 // Flush writes the head's buffered records to a new immutable part and clears the buffers (the
@@ -290,6 +299,53 @@ func (e *Engine) HeadRecordCount() int {
 	}
 
 	return n
+}
+
+// accumulate gathers each requested stream's in-window records (head ∪ live parts) into a
+// pre-sized accumulator. It selects the live parts once (time + bloom pruning, no decode), sizes
+// each accumulator from the parts' row ranges and the head, then decodes each live part exactly
+// once and distributes its rows — so a part is never re-decoded per stream it holds.
+func (e *Engine) accumulate(ctx context.Context, ids []signal.SeriesID, r fetch.Request) (map[signal.SeriesID]*recordCols, error) {
+	live := make([]*part, 0, len(e.parts))
+	for _, p := range e.parts {
+		switch {
+		case p.maxTime < r.Start || p.minTime > r.End: // time-prune via the part's bounds
+		case r.AllConditions && !p.mayContain(r.Conditions): // bloom-prune (no false negatives)
+		case p.holdsAny(ids):
+			live = append(live, p)
+		}
+	}
+
+	accs := make(map[signal.SeriesID]*recordCols, len(ids))
+	for _, id := range ids {
+		n := e.head.recordCount(id)
+		for _, p := range live {
+			if rng, ok := p.ranges[id]; ok {
+				n += rng.end - rng.start
+			}
+		}
+
+		accs[id] = newRecordCols(n)
+	}
+
+	for _, p := range live {
+		cols, err := p.readCols(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, id := range ids {
+			if rng, ok := p.ranges[id]; ok {
+				appendWindowRows(accs[id], cols, rng, r.Start, r.End)
+			}
+		}
+	}
+
+	for _, id := range ids {
+		e.head.appendWindow(id, accs[id], r.Start, r.End)
+	}
+
+	return accs, nil
 }
 
 func (e *Engine) flushLocked(ctx context.Context) error {

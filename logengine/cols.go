@@ -43,6 +43,23 @@ type recordCols struct {
 
 func (c *recordCols) len() int { return len(c.ts) }
 
+// newRecordCols returns an empty recordCols whose columns are pre-sized to hold n rows, so the
+// accumulation copies never reallocate.
+func newRecordCols(n int) *recordCols {
+	return &recordCols{
+		ts:       make([]int64, 0, n),
+		observed: make([]int64, 0, n),
+		severity: make([]int64, 0, n),
+		flags:    make([]int64, 0, n),
+		dropped:  make([]int64, 0, n),
+		sevText:  make([][]byte, 0, n),
+		body:     make([][]byte, 0, n),
+		traceID:  make([][]byte, 0, n),
+		spanID:   make([][]byte, 0, n),
+		attrs:    make([][]byte, 0, n),
+	}
+}
+
 // appendClone appends r, cloning its byte fields — for the head buffer, whose bytes outlive the
 // caller's (which may reuse the ingest batch).
 func (c *recordCols) appendClone(r rec) {
@@ -72,9 +89,30 @@ func (c *recordCols) appendRow(src *recordCols, i int) {
 	c.attrs = append(c.attrs, src.attrs[i])
 }
 
+// appendRange bulk-appends rows [lo, hi) of src — one append per column rather than per row. The
+// byte slices are copied by reference (they alias src's decoded bytes, owned by the caller).
+func (c *recordCols) appendRange(src *recordCols, lo, hi int) {
+	c.ts = append(c.ts, src.ts[lo:hi]...)
+	c.observed = append(c.observed, src.observed[lo:hi]...)
+	c.severity = append(c.severity, src.severity[lo:hi]...)
+	c.flags = append(c.flags, src.flags[lo:hi]...)
+	c.dropped = append(c.dropped, src.dropped[lo:hi]...)
+	c.sevText = append(c.sevText, src.sevText[lo:hi]...)
+	c.body = append(c.body, src.body[lo:hi]...)
+	c.traceID = append(c.traceID, src.traceID[lo:hi]...)
+	c.spanID = append(c.spanID, src.spanID[lo:hi]...)
+	c.attrs = append(c.attrs, src.attrs[lo:hi]...)
+}
+
 // sortByTs reorders every column by ascending timestamp (stable, so equal-ts records keep their
-// source order: older parts before the head).
+// source order: older parts before the head). Records arrive part-ordered and a part's rows are
+// already ts-sorted, so the accumulated window is very often already ordered — an O(n) check skips
+// the O(n log n) sort and its permute allocations in that common case.
 func (c *recordCols) sortByTs() {
+	if c.isSortedByTs() {
+		return
+	}
+
 	idx := make([]int, c.len())
 	for i := range idx {
 		idx[i] = i
@@ -92,6 +130,17 @@ func (c *recordCols) sortByTs() {
 	c.traceID = permute(c.traceID, idx)
 	c.spanID = permute(c.spanID, idx)
 	c.attrs = permute(c.attrs, idx)
+}
+
+// isSortedByTs reports whether the timestamps are already non-decreasing.
+func (c *recordCols) isSortedByTs() bool {
+	for i := 1; i < len(c.ts); i++ {
+		if c.ts[i] < c.ts[i-1] {
+			return false
+		}
+	}
+
+	return true
 }
 
 func permute[T any](s []T, idx []int) []T {

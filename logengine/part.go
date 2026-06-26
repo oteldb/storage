@@ -89,6 +89,17 @@ func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, err
 	return &part{reader: r, prefix: prefix, ranges: ranges, bodyBloom: bf, attrBloom: af}, nil
 }
 
+// holdsAny reports whether the part carries any of the requested streams.
+func (p *part) holdsAny(ids []signal.SeriesID) bool {
+	for _, id := range ids {
+		if _, ok := p.ranges[id]; ok {
+			return true
+		}
+	}
+
+	return false
+}
+
 // appendWindow appends stream id's records whose timestamp is in [start, end] to acc. It is a
 // no-op if the part does not hold the stream. M8a decodes the full column set; projection narrows
 // this in M8b.

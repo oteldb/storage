@@ -56,16 +56,51 @@ func (c *recordCols) rowMatches(i int, conds []fetch.Condition) bool {
 	return true
 }
 
-// filtered returns a new recordCols holding only the rows satisfying all conditions (AND).
-func (c *recordCols) filtered(conds []fetch.Condition) *recordCols {
-	out := &recordCols{}
+// filterInPlace compacts the columns to keep only the rows satisfying all conditions (AND),
+// reusing the backing arrays — no new allocation (a select-all filter is just a no-op truncate).
+func (c *recordCols) filterInPlace(conds []fetch.Condition) {
+	w := 0
 	for i := range c.ts {
-		if c.rowMatches(i, conds) {
-			out.appendRow(c, i)
+		if !c.rowMatches(i, conds) {
+			continue
 		}
+
+		if w != i {
+			c.moveRow(i, w)
+		}
+
+		w++
 	}
 
-	return out
+	c.truncate(w)
+}
+
+// moveRow overwrites row to with row from (a backward compaction step).
+func (c *recordCols) moveRow(from, to int) {
+	c.ts[to] = c.ts[from]
+	c.observed[to] = c.observed[from]
+	c.severity[to] = c.severity[from]
+	c.flags[to] = c.flags[from]
+	c.dropped[to] = c.dropped[from]
+	c.sevText[to] = c.sevText[from]
+	c.body[to] = c.body[from]
+	c.traceID[to] = c.traceID[from]
+	c.spanID[to] = c.spanID[from]
+	c.attrs[to] = c.attrs[from]
+}
+
+// truncate shortens every column to n rows.
+func (c *recordCols) truncate(n int) {
+	c.ts = c.ts[:n]
+	c.observed = c.observed[:n]
+	c.severity = c.severity[:n]
+	c.flags = c.flags[:n]
+	c.dropped = c.dropped[:n]
+	c.sevText = c.sevText[:n]
+	c.body = c.body[:n]
+	c.traceID = c.traceID[:n]
+	c.spanID = c.spanID[:n]
+	c.attrs = c.attrs[:n]
 }
 
 // projectColumns is the set of named columns to materialize in a batch, given a projection. An

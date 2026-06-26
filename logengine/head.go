@@ -173,6 +173,16 @@ func drain(p postings.Postings) []signal.SeriesID {
 	return out
 }
 
+// recordCount returns the number of records buffered for stream id (an upper bound on how many a
+// window fetch will append, used to pre-size the accumulator).
+func (h *head) recordCount(id signal.SeriesID) int {
+	if buf := h.records[id]; buf != nil {
+		return buf.len()
+	}
+
+	return 0
+}
+
 // appendWindow appends stream id's buffered records whose timestamp is in [start, end] to acc.
 func (h *head) appendWindow(id signal.SeriesID, acc *recordCols, start, end int64) {
 	buf := h.records[id]
