@@ -47,6 +47,15 @@ func (p *MemPostings) Add(series signal.SeriesID, nameID, valueID uint32) {
 	p.sorted = false
 }
 
+// AddSeries registers series in the all-set without associating any attribute, so a series with no
+// indexed labels (e.g. a log stream whose resource and scope carry no attributes) is still returned
+// by [MemPostings.All] and by [MemPostings.Resolve] with no matchers. Idempotent: duplicates are
+// removed on the first read.
+func (p *MemPostings) AddSeries(series signal.SeriesID) {
+	p.all = append(p.all, series)
+	p.sorted = false
+}
+
 // All returns a Postings over every series in the index.
 func (p *MemPostings) All() Postings {
 	p.ensureSorted()

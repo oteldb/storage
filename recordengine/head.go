@@ -113,6 +113,10 @@ func (h *head) replayRecords(id signal.SeriesID, recs []rec) {
 // indexLabels interns and registers every queryable label of the stream — resource and scope
 // attributes plus the scope name/version — into the postings index under id.
 func (h *head) indexLabels(id signal.SeriesID, s signal.Series) {
+	// Register the series in the all-set so it is resolvable even when it carries no labels at all
+	// (e.g. a log stream whose resource and scope are empty); otherwise resolve(nil) would skip it.
+	h.post.AddSeries(id)
+
 	for i := range s.Resource.Attributes {
 		h.addLabel(id, s.Resource.Attributes[i].Key, s.Resource.Attributes[i].Value)
 	}
