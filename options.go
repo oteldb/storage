@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"time"
+
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
@@ -42,6 +44,13 @@ type Options struct {
 	// WALDir is the WAL directory for the file backend with durability enabled.
 	// Ignored when [Durability] is [DurabilityEphemeral].
 	WALDir string
+
+	// WALSync is the WAL fsync policy (default [WALSyncNone]). Ignored without a WAL.
+	WALSync WALSyncMode
+
+	// WALSyncInterval is the background fsync period when [WALSync] is [WALSyncInterval]. Zero ⇒
+	// default. (Resolved into a duration internally.)
+	WALSyncInterval int64 // nanoseconds
 
 	// FlushThresholdBytes is the head size at which a flush to an immutable part is
 	// triggered. Zero ⇒ default.
@@ -85,6 +94,21 @@ const (
 	DurabilityEphemeral
 )
 
+// WALSyncMode is the WAL fsync policy (the durability/throughput trade-off). It applies only when a
+// WAL is configured ([Options.WALDir] on a durable backend).
+type WALSyncMode uint8
+
+const (
+	// WALSyncNone (default) lets WAL writes settle in the OS page cache: they survive a process
+	// crash (recovery replays them) but not necessarily a power loss. Fastest.
+	WALSyncNone WALSyncMode = iota
+	// WALSyncAlways fsyncs after every WAL record — power-loss durable, slowest.
+	WALSyncAlways
+	// WALSyncInterval fsyncs every engine's WAL in the background every [Options.WALSyncInterval]:
+	// a bounded power-loss window at a fraction of the cost of WALSyncAlways.
+	WALSyncInterval
+)
+
 // Option is a functional option applied to [Options] by [Open]/[InMemory].
 type Option func(*Options)
 
@@ -110,6 +134,32 @@ func WithDurability(d Durability) Option { return func(o *Options) { o.Durabilit
 
 // WithWALDir sets the WAL directory (file backend + durability).
 func WithWALDir(dir string) Option { return func(o *Options) { o.WALDir = dir } }
+
+// WithWALSync sets the WAL fsync policy ([WALSyncNone]/[WALSyncAlways]/[WALSyncInterval]).
+func WithWALSync(m WALSyncMode) Option { return func(o *Options) { o.WALSync = m } }
+
+// WithWALSyncInterval selects background fsync ([WALSyncInterval]) every d.
+func WithWALSyncInterval(d time.Duration) Option {
+	return func(o *Options) { o.WALSync = WALSyncInterval; o.WALSyncInterval = int64(d) }
+}
+
+// defaultWALSyncInterval is the background fsync period when [WALSyncInterval] is selected without an
+// explicit interval.
+const defaultWALSyncInterval = 200 * time.Millisecond
+
+// walSyncInterval returns the background WAL fsync period, or 0 when background syncing is off (no
+// WAL, or a non-interval sync mode).
+func (o *Options) walSyncInterval() time.Duration {
+	if o.WALSync != WALSyncInterval || o.WALDir == "" {
+		return 0
+	}
+
+	if o.WALSyncInterval > 0 {
+		return time.Duration(o.WALSyncInterval)
+	}
+
+	return defaultWALSyncInterval
+}
 
 // WithFlushThresholdBytes sets the head flush size threshold.
 func WithFlushThresholdBytes(n int64) Option { return func(o *Options) { o.FlushThresholdBytes = n } }

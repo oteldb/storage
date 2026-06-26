@@ -98,13 +98,22 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 		}
 	}
 
-	if o.FlushInterval > 0 {
+	walSyncEvery := o.walSyncInterval()
+	if o.FlushInterval > 0 || walSyncEvery > 0 {
 		s.stopCh = make(chan struct{})
+	}
+
+	if o.FlushInterval > 0 {
 		s.wg.Add(1)
 
 		// The maintenance loop's context is created inside the goroutine and scoped to
 		// its own lifetime (stopped via stopCh), not to this Open call.
 		go s.runMaintenance(time.Duration(o.FlushInterval)) //nolint:gosec,contextcheck // G118: loop-scoped context, see runMaintenance
+	}
+
+	if walSyncEvery > 0 {
+		s.wg.Add(1)
+		go s.runWALSync(walSyncEvery)
 	}
 
 	return s, nil
@@ -630,6 +639,10 @@ func (s *Storage) walFor(prefix string) (*wal.SegmentWriter, error) {
 		return nil, errors.Wrapf(err, "create wal for %q", prefix)
 	}
 
+	if s.opts.WALSync == WALSyncAlways {
+		w.SetSync(true)
+	}
+
 	return w, nil
 }
 
@@ -650,6 +663,43 @@ func (s *Storage) runMaintenance(interval time.Duration) {
 			// background context is correct here.
 			s.maintain(context.Background())
 		}
+	}
+}
+
+// runWALSync periodically fsyncs every engine's WAL until Close stops it ([WALSyncInterval] mode).
+func (s *Storage) runWALSync(interval time.Duration) {
+	defer s.wg.Done()
+
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-t.C:
+			s.syncWALs()
+		}
+	}
+}
+
+// syncWALs fsyncs every tenant engine's WAL across all signals (background interval sync). Errors are
+// swallowed; the next tick retries.
+func (s *Storage) syncWALs() {
+	for _, e := range s.engineSnapshot() {
+		_ = e.SyncWAL()
+	}
+
+	for _, e := range s.logEngineSnapshot() {
+		_ = e.SyncWAL()
+	}
+
+	for _, e := range s.traceEngineSnapshot() {
+		_ = e.SyncWAL()
+	}
+
+	for _, e := range s.profileEngineSnapshot() {
+		_ = e.SyncWAL()
 	}
 }
 

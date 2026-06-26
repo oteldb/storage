@@ -28,7 +28,7 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 		return nil
 	}
 
-	ix := &bucketindex.Index{}
+	ix := &bucketindex.Index{FlushedEpoch: e.flushedEpoch}
 	for _, p := range e.parts {
 		ix.Add(bucketindex.Entry{Prefix: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime})
 	}
@@ -75,6 +75,13 @@ func (e *Engine) LoadParts(ctx context.Context) error {
 
 	e.parts = parts
 	e.nextSeq = maxSeq + 1
+	e.flushedEpoch = ix.FlushedEpoch
+
+	// New head records belong to the generation past the recovered watermark; replay (which the
+	// facade runs next) then skips everything the loaded parts already hold.
+	if e.cfg.WAL != nil {
+		e.cfg.WAL.SetEpoch(e.flushedEpoch + 1)
+	}
 
 	return e.loadStreamIndexLocked(ctx)
 }

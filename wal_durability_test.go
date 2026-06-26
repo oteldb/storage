@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -83,6 +84,56 @@ func TestWALRecoversUnflushedProfiles(t *testing.T) {
 	frames := resolver.Resolve(stacks.Bytes[0])
 	require.NotEmpty(t, frames, "the WAL-recovered symbol store resolves the stack")
 	assert.Equal(t, "main", frames[len(frames)-1].Function)
+}
+
+// TestWALSyncAlwaysRecovers confirms the WALSyncAlways fsync policy is wired and still recovers an
+// abandoned (crashed) write.
+func TestWALSyncAlwaysRecovers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dataDir, walDir := t.TempDir(), t.TempDir()
+
+	be, err := file.New(dataDir)
+	require.NoError(t, err)
+	s1, err := Open(ctx, Options{}, WithBackend(be), WithWALDir(walDir), WithWALSync(WALSyncAlways))
+	require.NoError(t, err)
+	_, err = s1.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100}, []float64{1}))
+	require.NoError(t, err)
+	// Crash: no Close (WALSyncAlways starts no background goroutine, so nothing leaks).
+
+	s2 := reopenDurable(t, dataDir, walDir)
+	t.Cleanup(func() { _ = s2.Close(ctx) })
+	batches, err := fetch.Drain(ctx, must(s2.Fetcher("default").Fetch(ctx, fetch.Request{
+		Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{nameMatcher("http.requests")},
+	})))
+	require.NoError(t, err)
+	require.Len(t, batches, 1)
+}
+
+// TestWALSyncIntervalLifecycle confirms the background-fsync goroutine starts and stops cleanly with
+// the store, and the data survives a clean close.
+func TestWALSyncIntervalLifecycle(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dataDir, walDir := t.TempDir(), t.TempDir()
+
+	be, err := file.New(dataDir)
+	require.NoError(t, err)
+	s1, err := Open(ctx, Options{}, WithBackend(be), WithWALDir(walDir), WithWALSyncInterval(20*time.Millisecond))
+	require.NoError(t, err)
+	_, err = s1.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100}, []float64{1}))
+	require.NoError(t, err)
+
+	time.Sleep(60 * time.Millisecond) // let the background sync tick at least twice
+	require.NoError(t, s1.Close(ctx)) // stops the sync goroutine and flushes
+
+	s2 := reopenDurable(t, dataDir, walDir)
+	t.Cleanup(func() { _ = s2.Close(ctx) })
+	batches, err := fetch.Drain(ctx, must(s2.Fetcher("default").Fetch(ctx, fetch.Request{
+		Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{nameMatcher("http.requests")},
+	})))
+	require.NoError(t, err)
+	require.Len(t, batches, 1)
 }
 
 // TestWALEmptyAfterCleanClose verifies a graceful Close flushes the head and checkpoints the WAL,

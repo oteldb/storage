@@ -156,3 +156,15 @@ func (e *Engine) Close(ctx context.Context) error {
 
 	return nil
 }
+
+// SyncWAL fsyncs the engine's WAL, if any (the background WALSyncInterval path). No-op without a WAL.
+func (e *Engine) SyncWAL() error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.cfg.WAL != nil {
+		return e.cfg.WAL.Sync()
+	}
+
+	return nil
+}

@@ -36,6 +36,11 @@ type Entry struct {
 // a valid empty index.
 type Index struct {
 	Entries []Entry
+	// FlushedEpoch is the highest WAL flush generation durably persisted in these parts (0 if
+	// unused). It is the watermark a record engine reads on recovery to skip WAL records a part
+	// already holds — advanced atomically with the part list, so exactly-once replay survives a
+	// crash between a flush committing and its WAL being truncated. Added in format v2.
+	FlushedEpoch uint64
 }
 
 // Add inserts e, replacing any existing entry with the same prefix, keeping the index sorted.
@@ -81,7 +86,7 @@ func (ix *Index) Overlapping(start, end int64) []Entry {
 
 const (
 	magic0, magic1 = 'B', 'I'
-	version        = 1
+	version        = 2 // v2 appends FlushedEpoch; v1 (no epoch) still decodes.
 )
 
 // AppendBinary appends the versioned binary encoding of the index to dst (append-style for
@@ -97,7 +102,7 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 		dst = binary.AppendVarint(dst, e.MaxTime)
 	}
 
-	return dst
+	return binary.AppendUvarint(dst, ix.FlushedEpoch)
 }
 
 // ErrCorrupt is returned (wrapped) by [Decode] for malformed input.
@@ -110,8 +115,9 @@ func Decode(data []byte) (*Index, error) {
 		return nil, errors.Wrap(ErrCorrupt, "bad magic")
 	}
 
-	if data[2] != version {
-		return nil, errors.Wrapf(ErrCorrupt, "unsupported version %d", data[2])
+	ver := data[2]
+	if ver < 1 || ver > version {
+		return nil, errors.Wrapf(ErrCorrupt, "unsupported version %d", ver)
 	}
 
 	buf := data[3:]
@@ -149,6 +155,16 @@ func Decode(data []byte) (*Index, error) {
 		}
 
 		ix.Entries = append(ix.Entries, e)
+	}
+
+	// v2+ appends the flush-epoch watermark; v1 has none (it stays 0).
+	if ver >= 2 {
+		epoch, m := binary.Uvarint(buf)
+		if m <= 0 {
+			return nil, errors.Wrap(ErrCorrupt, "bad flushed epoch")
+		}
+
+		ix.FlushedEpoch = epoch
 	}
 
 	return ix, nil

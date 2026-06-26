@@ -37,13 +37,22 @@ type Engine struct {
 	head    *head
 	parts   []*part
 	nextSeq int
+	// flushedEpoch is the WAL flush watermark: the generation of the most recently flushed head
+	// (persisted in the bucket index). Current head records are written to the WAL at flushedEpoch+1,
+	// so on recovery the engine replays only WAL segments past flushedEpoch — exactly-once.
+	flushedEpoch uint64
 }
 
 var _ fetch.Fetcher = (*Engine)(nil)
 
 // New returns an engine with an empty head over cfg.Schema.
 func New(cfg Config) *Engine {
-	return &Engine{cfg: cfg, head: newHead(cfg.Schema)}
+	e := &Engine{cfg: cfg, head: newHead(cfg.Schema)}
+	if cfg.WAL != nil {
+		cfg.WAL.SetEpoch(e.flushedEpoch + 1) // first head generation
+	}
+
+	return e
 }
 
 // Batch is one stream's projected records in the engine's column layout: the primary timestamps
@@ -258,12 +267,14 @@ func (e *Engine) Reset(ctx context.Context) error {
 	return nil
 }
 
-// Replay rebuilds the head (and side store) from the WAL segments in dir (durable restart).
+// Replay rebuilds the head (and side store) from the WAL segments in dir (durable restart). It skips
+// segments at or below the flush watermark recovered by [Engine.LoadParts] (call LoadParts first), so
+// records already in a flushed part are not re-applied — exactly-once recovery.
 func (e *Engine) Replay(dir string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return wal.ReplayDir(dir, e.replayHandlers())
+	return wal.ReplayDirFrom(dir, e.flushedEpoch, e.replayHandlers())
 }
 
 // SideSnapshot returns the engine's full side-store tables — the live head accumulator unioned with
@@ -471,6 +482,10 @@ func (e *Engine) flushLocked(ctx context.Context) error {
 		e.cfg.SideStore.Reset()
 	}
 
+	// This flush's records become durable generation flushedEpoch+1; advance the watermark before
+	// persisting the index, so the bucket index commits the new watermark atomically with the part.
+	e.flushedEpoch++
+
 	if err := e.updateIndexLocked(ctx); err != nil {
 		return err
 	}
@@ -479,8 +494,11 @@ func (e *Engine) flushLocked(ctx context.Context) error {
 		return err
 	}
 
-	// The part (and its sidecars/index) is durable, so the WAL records it covers are obsolete.
+	// The part (and its watermark) is durable, so the WAL records it covers are obsolete. New head
+	// records start the next generation; the checkpoint discards the flushed segments.
 	if e.cfg.WAL != nil {
+		e.cfg.WAL.SetEpoch(e.flushedEpoch + 1)
+
 		return e.cfg.WAL.Checkpoint()
 	}
 

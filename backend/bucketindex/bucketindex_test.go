@@ -74,9 +74,31 @@ func TestRoundTrip(t *testing.T) {
 func TestGoldenEncoding(t *testing.T) {
 	t.Parallel()
 
-	ix := &bucketindex.Index{Entries: []bucketindex.Entry{{Prefix: "a", MinTime: 1, MaxTime: 2}}}
-	// magic 'B','I', version 1, count 1, len 1, 'a', zigzag(1)=2, zigzag(2)=4.
-	assert.Equal(t, []byte{'B', 'I', 1, 1, 1, 'a', 2, 4}, ix.AppendBinary(nil))
+	ix := &bucketindex.Index{Entries: []bucketindex.Entry{{Prefix: "a", MinTime: 1, MaxTime: 2}}, FlushedEpoch: 3}
+	// magic 'B','I', version 2, count 1, len 1, 'a', zigzag(1)=2, zigzag(2)=4, flushedEpoch 3.
+	assert.Equal(t, []byte{'B', 'I', 2, 1, 1, 'a', 2, 4, 3}, ix.AppendBinary(nil))
+}
+
+// TestDecodeV1Compat verifies a v1 index (no flush epoch) decodes with FlushedEpoch 0.
+func TestDecodeV1Compat(t *testing.T) {
+	t.Parallel()
+
+	got, err := bucketindex.Decode([]byte{'B', 'I', 1, 1, 1, 'a', 2, 4})
+	require.NoError(t, err)
+	require.Len(t, got.Entries, 1)
+	assert.Equal(t, "a", got.Entries[0].Prefix)
+	assert.Zero(t, got.FlushedEpoch)
+}
+
+// TestFlushedEpochRoundTrip verifies the watermark survives encode∘decode.
+func TestFlushedEpochRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	ix := &bucketindex.Index{Entries: []bucketindex.Entry{{Prefix: "p", MinTime: 5, MaxTime: 9}}, FlushedEpoch: 42}
+	got, err := bucketindex.Decode(ix.AppendBinary(nil))
+	require.NoError(t, err)
+	assert.Equal(t, uint64(42), got.FlushedEpoch)
+	assert.Equal(t, ix.Entries, got.Entries)
 }
 
 func TestDecodeRejectsCorrupt(t *testing.T) {

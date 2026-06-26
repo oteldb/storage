@@ -58,6 +58,42 @@ func TestSegmentCheckpoint(t *testing.T) {
 	require.Equal(t, []string{"live"}, collectSides(t, dir))
 }
 
+// collectSidesFrom replays dir skipping segments at or below minEpoch.
+func collectSidesFrom(t *testing.T, dir string, minEpoch uint64) []string {
+	t.Helper()
+
+	var got []string
+	require.NoError(t, ReplayDirFrom(dir, minEpoch, Handlers{
+		OnSide: func(payload []byte) error { got = append(got, string(payload)); return nil },
+	}))
+
+	return got
+}
+
+// TestReplayDirFromSkipsLowEpochs verifies the watermark filter: segments at or below minEpoch (a
+// flushed part already holds them) are skipped, the rest replay — the basis for exactly-once.
+func TestReplayDirFromSkipsLowEpochs(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	w1, err := Create(dir, 0)
+	require.NoError(t, err)
+	w1.SetEpoch(1)
+	require.NoError(t, w1.WriteSide([]byte("gen1")))
+	require.NoError(t, w1.Close())
+
+	w2, err := Create(dir, 0) // resume
+	require.NoError(t, err)
+	w2.SetEpoch(2)
+	require.NoError(t, w2.WriteSide([]byte("gen2")))
+	require.NoError(t, w2.Close())
+
+	require.Equal(t, []string{"gen1", "gen2"}, collectSidesFrom(t, dir, 0))
+	require.Equal(t, []string{"gen2"}, collectSidesFrom(t, dir, 1), "watermark 1 skips gen1")
+	require.Empty(t, collectSidesFrom(t, dir, 2))
+}
+
 // TestCheckpointThenResume verifies resume after a checkpoint keeps only the post-checkpoint records
 // across a reopen.
 func TestCheckpointThenResume(t *testing.T) {

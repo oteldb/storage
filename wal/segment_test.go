@@ -190,7 +190,7 @@ func TestReplayDirCorruptSegment(t *testing.T) {
 	dir := t.TempDir()
 	frame := appendFrame(nil, recordSeries, append(make([]byte, seriesIDLen), 0x00))
 	frame[3] ^= 0xFF // corrupt the body so the CRC fails
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "00000001.wal"), frame, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, segmentName(1, 1)), frame, 0o600))
 
 	err := ReplayDir(dir, Handlers{OnSeries: func(signal.SeriesID, signal.Series) error { return nil }})
 	require.ErrorIs(t, err, ErrCorrupt)
