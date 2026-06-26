@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -135,6 +136,44 @@ func TestMultiTenantRouting(t *testing.T) {
 	assert.NotEqual(t, apiBatches[0].ID, webBatches[0].ID)
 	assert.InDelta(t, 1.0, apiBatches[0].Values[0], 0)
 	assert.InDelta(t, 2.0, webBatches[0].Values[0], 0)
+}
+
+func TestRecoverFlushedDataOnReopen(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// Process 1: ingest over a durable (file) backend, then Close (which flushes to disk).
+	be1, err := file.New(dir)
+	require.NoError(t, err)
+	s1, err := Open(ctx, Options{}, WithBackend(be1))
+	require.NoError(t, err)
+	_, err = s1.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
+	require.NoError(t, err)
+	require.NoError(t, s1.Close(ctx))
+
+	// Process 2: a fresh Storage over the same directory recovers the flushed data at Open.
+	be2, err := file.New(dir)
+	require.NoError(t, err)
+	s2, err := Open(ctx, Options{}, WithBackend(be2))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s2.Close(ctx) })
+
+	it, err := s2.Fetcher("default").Fetch(ctx, fetch.Request{
+		Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{nameMatcher("http.requests")},
+	})
+	require.NoError(t, err)
+	batches, err := fetch.Drain(ctx, it)
+	require.NoError(t, err)
+	require.Len(t, batches, 1, "the previous process's flushed series is served after recovery")
+	assert.Equal(t, []int64{100, 200}, batches[0].Timestamps)
+	assert.Equal(t, []float64{1, 2}, batches[0].Values)
+
+	// Labels were reconstructed from the identity index, not just ids.
+	nv, ok := batches[0].Series.Attributes.Get(metric.LabelName)
+	require.True(t, ok)
+	assert.Equal(t, []byte("http.requests"), nv.Str())
 }
 
 func TestResetClearsData(t *testing.T) {

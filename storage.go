@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"maps"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -48,7 +50,7 @@ type Storage struct {
 // Open constructs a [Storage] from [Options] (DESIGN.md §5). If [Options.Backend] is
 // nil it defaults to [backend.Memory]; if the backend is ephemeral and no durability
 // is chosen, it defaults to [DurabilityEphemeral] (the in-memory engine).
-func Open(_ context.Context, o Options, opts ...Option) (*Storage, error) {
+func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -65,6 +67,12 @@ func Open(_ context.Context, o Options, opts ...Option) (*Storage, error) {
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
 	}
+
+	// Recover previously-flushed data from a durable backend so a fresh process serves it.
+	if err := s.recover(ctx); err != nil {
+		return nil, err
+	}
+
 	if o.FlushInterval > 0 {
 		s.stopCh = make(chan struct{})
 		s.wg.Add(1)
@@ -268,6 +276,42 @@ func (s *Storage) normalizeTenant(t signal.TenantID) signal.TenantID {
 	return t
 }
 
+// metricsPrefix is the per-tenant key prefix under which a tenant's metric parts and indexes
+// live. It must match the prefix engineFor builds.
+const metricsPrefix = "/metrics"
+
+// recover reconstructs each tenant's engine from a durable backend — the flushed parts and
+// the identity index (the object-store-native, stateless read path) — so a fresh process
+// serves data written by a previous one. It is a no-op for an ephemeral backend (a new
+// process starts with an empty store). Tenants are discovered by their bucket-index objects.
+//
+// Note: this restores only *flushed* data. Recovering the unflushed head from a per-tenant
+// WAL is a separate piece (the WAL is not yet wired into the facade).
+func (s *Storage) recover(ctx context.Context) error {
+	if s.backend.IsEphemeral() {
+		return nil
+	}
+
+	keys, err := s.backend.List(ctx, "")
+	if err != nil {
+		return errors.Wrap(err, "list backend for recovery")
+	}
+
+	suffix := metricsPrefix + "/" + bucketindex.Object
+	for _, k := range keys {
+		if !strings.HasSuffix(k, suffix) {
+			continue
+		}
+
+		tid := signal.TenantID(strings.TrimSuffix(k, suffix))
+		if err := s.engineFor(tid).LoadParts(ctx); err != nil {
+			return errors.Wrapf(err, "recover tenant %q", tid)
+		}
+	}
+
+	return nil
+}
+
 // engineFor returns the engine for a tenant, creating it on first use.
 func (s *Storage) engineFor(tid signal.TenantID) *engine.Engine {
 	s.tmu.Lock()
@@ -278,7 +322,7 @@ func (s *Storage) engineFor(tid signal.TenantID) *engine.Engine {
 		e = engine.New(engine.Config{
 			OOOWindow: s.opts.OOOWindow,
 			Backend:   s.backend,
-			Prefix:    string(s.normalizeTenant(tid)) + "/metrics",
+			Prefix:    string(s.normalizeTenant(tid)) + metricsPrefix,
 		})
 		s.tenants[tid] = e
 	}

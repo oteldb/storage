@@ -163,11 +163,14 @@ conditional-write (CAS) primitive on which atomic manifest / block-list commits 
 - **`backend/backendtest`** — a shared conformance suite (`Run(t, factory)`) that memory,
   file, and s3 (over both fakes) pass under `-race`, proving they are interchangeable.
 
-The **stateless read path** is wired at the engine level (§3f, `Engine.LoadParts`): a fresh
-engine reconstructs its part set (from `bucketindex`) and its identity index (from a durable
-series object) from the backend alone — no local state — and serves matcher-based queries
-with full labels. Facade-level recovery (`Open` → per-tenant `LoadParts` + WAL replay) is the
-remaining wiring.
+The **stateless read path** is wired end-to-end: at the engine level (§3f,
+`Engine.LoadParts`) a fresh engine reconstructs its part set (from `bucketindex`) and its
+identity index (from a durable series object) from the backend alone; at the facade level
+`Storage.Open` calls `recover`, which — for a **durable** backend — discovers tenants by their
+bucket-index objects and `LoadParts` each, so a fresh process serves data a previous one
+flushed (it is a no-op for an ephemeral backend). This restores **flushed** data only;
+recovering the unflushed head from a per-tenant WAL is the remaining piece (the WAL is not yet
+wired into the facade — it needs a truncate-on-flush API to bound replay).
 
 ## 3b. Part format (`block/`)
 
