@@ -12,6 +12,7 @@ import (
 
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -407,6 +408,13 @@ func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc) http.Handler {
 
 		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace (peer fetch spans nest)
 
+		// When the caller is collecting EXPLAIN ANALYZE, run the fetch under a profile collector and
+		// return the peer's subtree ahead of the batches so the requester can graft it.
+		var coll *profile.Collector
+		if req.Header.Get(profileHeader) == "1" {
+			ctx, coll = profile.WithCollector(ctx)
+		}
+
 		batches, err := fn(ctx, tenant, start, end, matchers)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -414,9 +422,21 @@ func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc) http.Handler {
 			return
 		}
 
-		_, _ = w.Write(encode(batches))
+		out := encode(batches)
+		if coll != nil {
+			tree := coll.Root().Encode(nil)
+			framed := binary.AppendUvarint(nil, uint64(len(tree)))
+			framed = append(framed, tree...)
+			out = append(framed, out...)
+		}
+
+		_, _ = w.Write(out)
 	})
 }
+
+// profileHeader opts a read RPC into returning the peer's EXPLAIN ANALYZE subtree (framed ahead of
+// the batches): [uvarint len][profile bytes][batches]. Absent ⇒ the plain batches response.
+const profileHeader = "X-Oteldb-Profile"
 
 // RemoteFetcher is a [fetch.Fetcher] over a peer node's [ReadHandler]. It forwards only the
 // request's tenant and window (matchers are re-applied by the caller), so it returns the
@@ -457,6 +477,11 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Itera
 
 	obs.InjectHTTP(ctx, req.Header) // carry the trace into the read fan-out
 
+	wantProfile := profile.Active(ctx)
+	if wantProfile {
+		req.Header.Set(profileHeader, "1")
+	}
+
 	resp, err := f.client.Do(req)
 	if err != nil {
 		return nil, errors.Wrapf(err, "fetch from %q", f.addr)
@@ -472,6 +497,13 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Itera
 		return nil, errors.Errorf("cluster: %q fetch returned %d: %s", f.addr, resp.StatusCode, bytes.TrimSpace(body))
 	}
 
+	if wantProfile {
+		body, err = f.graftProfile(ctx, body)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	decode := DecodeBatches
 	if f.sig != signal.Metric { // log and trace share the column codec
 		decode = DecodeLogBatches
@@ -483,4 +515,24 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Itera
 	}
 
 	return fetch.NewSliceIterator(batches), nil
+}
+
+// graftProfile strips the [uvarint len][profile] frame the peer prepended (see [profileHeader]),
+// grafts the peer's subtree (labeled by the peer address) under the current profile node in ctx, and
+// returns the remaining batches bytes. A malformed frame is fatal (the batch offset is unknown); a
+// merely-corrupt subtree is skipped (best-effort profiling).
+func (f *RemoteFetcher) graftProfile(ctx context.Context, body []byte) ([]byte, error) {
+	plen, m := binary.Uvarint(body)
+	if m <= 0 || plen > uint64(len(body)-m) {
+		return nil, errors.New("cluster: malformed profile frame")
+	}
+
+	tree, rest := body[m:m+int(plen)], body[m+int(plen):]
+
+	if node, _, err := profile.Decode(tree); err == nil && node != nil {
+		node.Name = "remote " + f.addr
+		profile.Graft(ctx, node)
+	}
+
+	return rest, nil
 }

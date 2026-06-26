@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
 	"github.com/oteldb/storage/query/fetch"
+	qprofile "github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/profile"
 )
@@ -600,4 +602,65 @@ func TestShardHelpers(t *testing.T) {
 		assert.Less(t, s, n)
 		assert.Equal(t, s, shardOf(id, n), "deterministic")
 	}
+}
+
+// TestClusterExplainAnalyzeRemote verifies the distributed EXPLAIN ANALYZE: a profiled query on a
+// non-owner grafts the owner's fetch subtree (labeled by peer address) into the requester's tree.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterExplainAnalyzeRemote(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNode(t, endpoint, "node-a"),
+		"node-b": openClusterNode(t, endpoint, "node-b"),
+		"node-c": openClusterNode(t, endpoint, "node-c"),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond)
+
+	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
+	require.NoError(t, err)
+
+	owners := a.cluster.membership.Ring().Lookup([]byte("default"), 2)
+	ownerID := map[string]bool{owners[0].ID: true, owners[1].ID: true}
+
+	var nonOwner *Storage
+	for name, s := range nodes {
+		if !ownerID[name] {
+			nonOwner = s
+		}
+	}
+	require.NotNil(t, nonOwner)
+
+	pctx, coll := qprofile.WithCollector(ctx)
+	it, err := nonOwner.Fetcher("default").Fetch(pctx, fetch.Request{
+		Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{nameMatcher("http.requests")},
+	})
+	require.NoError(t, err)
+	_, err = fetch.Drain(pctx, it)
+	require.NoError(t, err)
+
+	root := coll.Root()
+	t.Logf("DISTRIBUTED EXPLAIN ANALYZE:\n%s", root.Render())
+
+	// The non-owner's tree contains a "remote …" node holding the owner's engine.fetch subtree.
+	var remote *qprofile.Node
+	var walk func(*qprofile.Node)
+	walk = func(n *qprofile.Node) {
+		if strings.HasPrefix(n.Name, "remote ") {
+			remote = n
+		}
+		for _, c := range n.Children {
+			walk(c)
+		}
+	}
+	walk(root)
+
+	require.NotNil(t, remote, "the peer's subtree was grafted")
+	require.NotNil(t, findNode(remote, "engine.fetch"), "owner's engine.fetch nests under the remote node")
 }
