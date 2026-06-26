@@ -44,7 +44,7 @@ The design is a single columnar engine with swappable front-ends and backends
 | L3 **Engine** / **Index / WAL** | **head · flush · merge · retention** / **symbols · series · postings** · **write-ahead log** | **engine implemented (metrics)**; **index + wal implemented** |
 | L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
 | L1 **Backend** | file · s3 · memory behind one interface | **memory + file + s3 implemented**, with `PutIfAbsent` CAS; `bucketindex` for stateless part enumeration |
-| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **HRW ring implemented** (`cluster/ring`); etcd, replication, rebalance pending |
+| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **HRW ring + etcd membership implemented** (`cluster/ring`, `cluster/etcd`); replication, rebalance pending |
 
 The **implemented substance spans L1 (backends) through L4 (the fetch contract)** for
 metrics: encoding, parts, index, WAL, the engine head/flush/merge, and the metrics fetch
@@ -395,8 +395,17 @@ ID. Two properties make it the sharding base:
   keys. A property test pins this: per key, at most one replica moves on an add, and the new
   node receives exactly its `~1/(N+1)` fair share of slots.
 
-The `Ring` is immutable (`With`/`Without` return a new ring). etcd-backed membership/leases,
-RF=3 quorum replication, and the rebalance orchestrator build on this and remain pending.
+The `Ring` is immutable (`With`/`Without` return a new ring).
+
+**Membership** (`cluster/etcd`) makes the ring *live*. `Join` registers a node under
+`{root}/members/{id}` with an etcd **lease**, keeps the lease alive, and **watches** the
+member prefix; each change rebuilds the ring and publishes it via an `atomic.Pointer`, so
+`Membership.Ring()` is a lock-free read of the current membership. A crashed node's lease
+expires and it drops out of every peer's ring within the TTL — no manual deregistration;
+`Close` revokes the lease for prompt, clean departure. etcd only distributes membership;
+placement stays local and coordinator-free. Tested against an **embedded etcd** (join → watch
+propagation → lease-revoke departure). RF=3 quorum replication and the rebalance orchestrator
+build on this and remain pending.
 
 ---
 
@@ -512,8 +521,9 @@ wal/                  CRC-framed segmented write-ahead log + replay             
 engine/               head · flush · background-merge · retention · fetch (metrics)    [implemented]
 query/fetch           callback-matcher fetch contract (Request/Matcher/Iterator/Batch) [implemented for metrics; the library's query surface]
 query/promql          OPTIONAL adapter: fetch → Prometheus storage.Queryable (no engine) [implemented; only package importing prometheus]
-cluster/              L0 distribution: ring + (later) etcd · replication · rebalance     [ring implemented; rest seam]
+cluster/              L0 distribution: ring + membership + (later) replication · rebalance [partly implemented]
   cluster/ring        rendezvous (HRW) hashing: deterministic placement, ~1/N movement  [implemented]
+  cluster/etcd        etcd-backed live membership (lease + watch → atomic ring)          [implemented; embedded-etcd tested]
 ```
 
 "Seam only" packages currently contain their `doc.go` (and, where noted, an interface or
