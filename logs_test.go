@@ -79,6 +79,39 @@ func TestFacadeWriteAndQueryLogs(t *testing.T) {
 	assert.Equal(t, []string{"first", "second"}, got)
 }
 
+// TestFacadeWriteAndQueryLabellessLogStream is a regression test for streams that carry no resource
+// or scope labels at all — produced by logs ingested over the Loki protocol, where stream labels
+// arrive as per-record attributes and the resource is empty. Such a stream was never registered in
+// the postings all-set, so a no-matcher fetch (resolve(nil)) skipped it and the records were
+// silently undiscoverable.
+func TestFacadeWriteAndQueryLabellessLogStream(t *testing.T) {
+	t.Parallel()
+
+	s, err := InMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	// A stream with an empty resource and scope; the only identifying attribute is per-record.
+	var ld log.Logs
+	rl := ld.AddResource() // no resource attributes
+	sl := rl.AddScope()    // no scope name/attributes
+	rec := sl.AddRecord()
+	rec.Timestamp = 100
+	rec.Body = []byte("labelless")
+	rec.Attributes = signal.NewAttributes(
+		signal.KeyValue{Key: []byte("job"), Value: signal.StringValue([]byte("varlogs"))},
+	)
+
+	acc, err := s.WriteLogs(context.Background(), ld)
+	require.NoError(t, err)
+	assert.Equal(t, Accepted{Accepted: 1}, acc)
+
+	// A no-matcher fetch must return the label-less stream's records.
+	all := fetch.Request{Start: 0, End: 1000}
+	assert.Equal(t, []string{"labelless"}, logBodies(t, s.LogFetcher("default"), all))
+	assert.Equal(t, []string{"labelless"}, logBodies(t, s.LogFetcher(), all), "no-arg fetcher spans it too")
+}
+
 func TestFacadeLogsTenantIsolation(t *testing.T) {
 	t.Parallel()
 
