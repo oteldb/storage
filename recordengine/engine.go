@@ -3,10 +3,14 @@ package recordengine
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/go-faster/errors"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
@@ -28,6 +32,11 @@ type Config struct {
 	// profiles symbol store) that the engine persists as part sidecars on flush and unions on merge.
 	// nil ⇒ no side data (logs, traces).
 	SideStore SideStore
+	// Obs is the observability handle (spans + metrics). nil ⇒ a no-op handle.
+	Obs *obs.Obs
+	// Signal is the signal label for this engine's metrics ("log"/"trace"/"profile"); the facade
+	// sets it per signal. Empty ⇒ "record".
+	Signal string
 }
 
 // Engine is one tenant's record store for a signal. Safe for concurrent use.
@@ -47,6 +56,14 @@ var _ fetch.Fetcher = (*Engine)(nil)
 
 // New returns an engine with an empty head over cfg.Schema.
 func New(cfg Config) *Engine {
+	if cfg.Obs == nil {
+		cfg.Obs = obs.NewNop()
+	}
+
+	if cfg.Signal == "" {
+		cfg.Signal = "record"
+	}
+
 	e := &Engine{cfg: cfg, head: newHead(cfg.Schema)}
 	if cfg.WAL != nil {
 		cfg.WAL.SetEpoch(e.flushedEpoch + 1) // first head generation
@@ -168,6 +185,12 @@ func (e *Engine) HeadBytes() int64 {
 // gathers each stream's in-window records (decoding only the referenced columns), applies the
 // column conditions and projection, and returns one batch per stream sorted by timestamp.
 func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
+	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "recordengine.fetch",
+		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
+	defer span.End()
+
+	startNs := time.Now()
+
 	// The label index sorts lazily on first read after a write; do that one-time sort under the
 	// exclusive lock so concurrent fetches never race on it.
 	e.mu.RLock()
@@ -182,16 +205,34 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	defer e.mu.RUnlock()
 
 	ids := e.head.resolve(r.Matchers)
+	partsScanned := len(e.parts)
+
+	record := func(rows int) {
+		span.SetAttributes(
+			attribute.Int("storage.series_matched", len(ids)),
+			attribute.Int("storage.parts_scanned", partsScanned),
+			attribute.Int("storage.rows", rows),
+		)
+		e.cfg.Obs.Fetch.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(len(ids)), int64(partsScanned), int64(rows))
+	}
+
 	if len(ids) == 0 {
+		record(0)
+
 		return fetch.NewSliceIterator(nil), nil
 	}
 
 	accs, err := e.accumulate(ctx, ids, r)
 	if err != nil {
+		span.RecordError(err)
+
 		return nil, err
 	}
 
-	var batches []*fetch.Batch
+	var (
+		batches []*fetch.Batch
+		rows    int
+	)
 
 	for _, id := range ids {
 		acc := accs[id]
@@ -214,7 +255,10 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		}
 
 		batches = append(batches, b)
+		rows += len(b.Timestamps)
 	}
+
+	record(rows)
 
 	return fetch.NewSliceIterator(batches), nil
 }
@@ -275,10 +319,26 @@ func appendWindowRows(acc, cols *recordCols, rng rowRange, start, end int64) {
 // Flush writes the head's buffered records to a new immutable part and clears the buffers. No-op if
 // the head is empty. Requires a [Config.Backend].
 func (e *Engine) Flush(ctx context.Context) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "recordengine.flush",
+		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
+	defer span.End()
 
-	return e.flushLocked(ctx)
+	startNs := time.Now()
+
+	e.mu.Lock()
+	rows, err := e.flushLocked(ctx)
+	e.mu.Unlock()
+
+	if err != nil {
+		span.RecordError(err)
+	}
+
+	if rows > 0 {
+		span.SetAttributes(attribute.Int("storage.rows", rows))
+		e.cfg.Obs.Flush.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(rows))
+	}
+
+	return err
 }
 
 // Reset discards all data (head + parts) and deletes this engine's part objects, returning it to
@@ -496,20 +556,24 @@ func (e *Engine) accumulate(ctx context.Context, ids []signal.SeriesID, r fetch.
 	return accs, nil
 }
 
-func (e *Engine) flushLocked(ctx context.Context) error {
+// flushLocked drains the head to a new part and returns the number of records flushed (0 ⇒ the
+// head held nothing). The caller holds e.mu.
+func (e *Engine) flushLocked(ctx context.Context) (int, error) {
 	f := e.head.drainHead()
 	if f == nil {
-		return nil
+		return 0, nil
 	}
 
+	rows := len(f.stream)
 	prefix := e.partPrefix(e.nextSeq)
+
 	if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f); err != nil {
-		return err
+		return 0, err
 	}
 
 	p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	p.minTime, p.maxTime = colsTimeRange(f)
@@ -518,7 +582,7 @@ func (e *Engine) flushLocked(ctx context.Context) error {
 
 	if e.cfg.SideStore != nil {
 		if err := writeSidecars(ctx, e.cfg.Backend, prefix, e.cfg.SideStore.Encode()); err != nil {
-			return err
+			return rows, err
 		}
 
 		e.cfg.SideStore.Reset()
@@ -529,11 +593,11 @@ func (e *Engine) flushLocked(ctx context.Context) error {
 	e.flushedEpoch++
 
 	if err := e.updateIndexLocked(ctx); err != nil {
-		return err
+		return rows, err
 	}
 
 	if err := e.writeStreamIndexLocked(ctx); err != nil {
-		return err
+		return rows, err
 	}
 
 	// The part (and its watermark) is durable, so the WAL records it covers are obsolete. New head
@@ -541,8 +605,8 @@ func (e *Engine) flushLocked(ctx context.Context) error {
 	if e.cfg.WAL != nil {
 		e.cfg.WAL.SetEpoch(e.flushedEpoch + 1)
 
-		return e.cfg.WAL.Checkpoint()
+		return rows, e.cfg.WAL.Checkpoint()
 	}
 
-	return nil
+	return rows, nil
 }

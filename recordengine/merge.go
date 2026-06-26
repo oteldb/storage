@@ -3,6 +3,10 @@ package recordengine
 import (
 	"context"
 	"slices"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/oteldb/storage/signal"
 )
@@ -12,15 +16,33 @@ import (
 // parts and no retention cutoff. Records are append-only: a stream's records are concatenated
 // across parts (no value dedup) and re-sorted by timestamp.
 func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "recordengine.merge",
+		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
+	defer span.End()
 
-	return e.mergeLocked(ctx, retainFrom)
+	startNs := time.Now()
+
+	e.mu.Lock()
+	compacted, err := e.mergeLocked(ctx, retainFrom)
+	e.mu.Unlock()
+
+	if err != nil {
+		span.RecordError(err)
+	}
+
+	if compacted > 0 {
+		span.SetAttributes(attribute.Int("storage.merge.parts_in", compacted))
+		e.cfg.Obs.Merge.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(compacted))
+	}
+
+	return err
 }
 
-func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) error {
+// mergeLocked compacts the parts and returns the number of source parts compacted (0 ⇒ no-op). The
+// caller holds e.mu.
+func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) (int, error) {
 	if len(e.parts) == 0 || (len(e.parts) == 1 && retainFrom <= 0) {
-		return nil
+		return 0, nil
 	}
 
 	start := minInt64
@@ -30,22 +52,23 @@ func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) error {
 
 	f, err := e.compactParts(ctx, start)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	old := e.parts
+	compacted := len(old)
 
 	if f.len() == 0 {
 		e.parts = nil // retention dropped every record
 	} else {
 		prefix := e.partPrefix(e.nextSeq)
 		if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f); err != nil {
-			return err
+			return 0, err
 		}
 
 		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		p.minTime, p.maxTime = colsTimeRange(f)
@@ -53,21 +76,21 @@ func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) error {
 		e.nextSeq++
 
 		if err := e.mergeSidecars(ctx, old, prefix); err != nil {
-			return err
+			return 0, err
 		}
 	}
 
 	if err := e.updateIndexLocked(ctx); err != nil {
-		return err
+		return 0, err
 	}
 
 	for _, p := range old {
 		if err := deletePart(ctx, e.cfg.Backend, p.prefix); err != nil {
-			return err
+			return compacted, err
 		}
 	}
 
-	return nil
+	return compacted, nil
 }
 
 // mergeSidecars unions the side-store sidecars of the compacted parts and writes the merged tables
@@ -146,7 +169,7 @@ func (e *Engine) Close(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := e.flushLocked(ctx); err != nil {
+	if _, err := e.flushLocked(ctx); err != nil {
 		return err
 	}
 

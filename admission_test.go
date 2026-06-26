@@ -323,3 +323,29 @@ func TestEngineFlushAndFetchMetricsEmitted(t *testing.T) {
 	assert.Positive(t, sumCounter(t, rm, "storage.flush.total", map[string]string{"signal": "metric"}))
 	assert.Positive(t, sumCounter(t, rm, "storage.fetch.total", map[string]string{"signal": "metric"}))
 }
+
+func TestRecordEngineMetricsEmitted(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	s, err := InMemory(WithMeterProvider(mp))
+	require.NoError(t, err)
+
+	_, err = s.WriteLogs(ctx, logBatch("api", [3]any{100, 1, "x"}))
+	require.NoError(t, err)
+	s.maintain(ctx)
+
+	it, err := s.LogFetcher("default").Fetch(ctx, fetch.Request{Start: 0, End: 1 << 62})
+	require.NoError(t, err)
+	_, err = fetch.Drain(ctx, it)
+	require.NoError(t, err)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &rm))
+
+	assert.Positive(t, sumCounter(t, rm, "storage.flush.total", map[string]string{"signal": "log"}))
+	assert.Positive(t, sumCounter(t, rm, "storage.fetch.total", map[string]string{"signal": "log"}))
+}

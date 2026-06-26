@@ -22,7 +22,7 @@ type recordProjector func(emit func(*recordengine.Batch)) int
 // holds s.tmu. Shared by the logs/traces/profiles *EngineFor constructors, which differ only in the
 // tenant map, key-prefix suffix, schema, and side store.
 func (s *Storage) recordEngineCached(
-	m map[signal.TenantID]*recordengine.Engine, tid signal.TenantID, suffix string,
+	m map[signal.TenantID]*recordengine.Engine, tid signal.TenantID, sig signal.Signal, suffix string,
 	schema *recordengine.Schema, newSide func() recordengine.SideStore,
 ) (*recordengine.Engine, error) {
 	if e := m[tid]; e != nil {
@@ -48,6 +48,8 @@ func (s *Storage) recordEngineCached(
 		Prefix:    prefix,
 		SideStore: side,
 		WAL:       w,
+		Obs:       s.obs,
+		Signal:    sig.String(),
 	})
 	m[tid] = e
 

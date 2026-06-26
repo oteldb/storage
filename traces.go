@@ -92,7 +92,7 @@ func (s *Storage) traceEngineFor(tid signal.TenantID) (*recordengine.Engine, err
 	s.tmu.Lock()
 	defer s.tmu.Unlock()
 
-	return s.recordEngineCached(s.traceTenants, tid, tracesPrefix, trace.Schema, nil)
+	return s.recordEngineCached(s.traceTenants, tid, signal.Trace, tracesPrefix, trace.Schema, nil)
 }
 
 func (s *Storage) lookupTraceEngine(tid signal.TenantID) (*recordengine.Engine, bool) {

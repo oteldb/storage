@@ -90,7 +90,7 @@ func (s *Storage) logEngineFor(tid signal.TenantID) (*recordengine.Engine, error
 	s.tmu.Lock()
 	defer s.tmu.Unlock()
 
-	return s.recordEngineCached(s.logTenants, tid, logsPrefix, log.Schema, nil)
+	return s.recordEngineCached(s.logTenants, tid, signal.Log, logsPrefix, log.Schema, nil)
 }
 
 // lookupLogEngine returns the tenant's logs engine if it exists, without creating one.

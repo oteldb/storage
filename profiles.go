@@ -106,7 +106,7 @@ func (s *Storage) profileEngineFor(tid signal.TenantID) (*recordengine.Engine, e
 	s.tmu.Lock()
 	defer s.tmu.Unlock()
 
-	return s.recordEngineCached(s.profileTenants, tid, profilesPrefix, profile.Schema,
+	return s.recordEngineCached(s.profileTenants, tid, signal.Profile, profilesPrefix, profile.Schema,
 		func() recordengine.SideStore { return profile.NewSymbolStore() })
 }
 
