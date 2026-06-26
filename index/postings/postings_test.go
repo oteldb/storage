@@ -164,3 +164,35 @@ func TestAddThenReadThenAdd(t *testing.T) {
 
 	assert.Equal(t, sortedSet(1, 2, 4), mustSlice(t, p.Get(nJob, vAPI)), "re-sorts after a later add")
 }
+
+// TestAddSeriesLabelless registers a series that carries no attribute at all (e.g. a log stream
+// with an empty resource and scope) and verifies it is still returned by All and by Resolve with
+// no matchers — but never surfaces through any label-keyed lookup.
+func TestAddSeriesLabelless(t *testing.T) {
+	t.Parallel()
+
+	p := buildIndex()
+	p.AddSeries(sid(4)) // no labels
+
+	assert.Equal(t, sortedSet(1, 2, 3, 4), mustSlice(t, p.All()), "label-less series is in the all-set")
+	assert.Equal(t, sortedSet(1, 2, 3, 4), mustSlice(t, p.Resolve()), "no matchers ⇒ all, including label-less")
+
+	// It is not reachable through any label, since it carries none.
+	assert.Equal(t, sortedSet(1, 2, 3), mustSlice(t, p.ForName(nJob)), "label-less series has no job")
+	assert.Equal(t, sortedSet(4), mustSlice(t, Without(p.All(), p.ForName(nJob))), "only the label-less series lacks job")
+}
+
+// TestAddSeriesDedup ensures registering the same series in the all-set repeatedly (and alongside a
+// labeled Add) collapses to a single entry after the first read sorts and deduplicates.
+func TestAddSeriesDedup(t *testing.T) {
+	t.Parallel()
+
+	p := NewMemPostings()
+	p.AddSeries(sid(7))
+	p.AddSeries(sid(7))       // duplicate registration
+	p.Add(sid(7), nJob, vAPI) // later gains a label
+	p.AddSeries(sid(7))       // and is registered again
+
+	assert.Equal(t, sortedSet(7), mustSlice(t, p.All()))
+	assert.Equal(t, sortedSet(7), mustSlice(t, p.Get(nJob, vAPI)))
+}
