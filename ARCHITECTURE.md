@@ -372,11 +372,18 @@ this caller-owned-synchronization upgrade.
 - **Part fetch** (`part.go`) — `openPart` rebuilds a `SeriesID → [rowStart,rowEnd)` index
   by scanning the series column once (each series is one contiguous run); `mergeInto`
   decodes a series' `ts`/`value` sub-slice within the window.
-- **Merge + retention + downsampling** (`merge.go`, `downsample.go`) is the one background-merge
-  engine. `MergeWith(MergeOptions{RetainFrom, Downsample})` (and the convenience `Merge(retainFrom)`)
-  compacts every part into one, merging samples per series by timestamp (freshest wins on a tie),
-  dropping samples older than the absolute `retainFrom` cutoff, then **downsampling** the survivors
-  by the supplied tiers before deleting the source parts. A `DownsampleTier{Before, Interval, Agg}`
+- **Merge — compaction + retention + downsampling + recompression** (`merge.go`, `downsample.go`,
+  `recompress.go`) is the one background-merge engine; all four modes are one pass over the immutable
+  parts (no separate subsystem). `MergeWith(MergeOptions{RetainFrom, Downsample, Recompress})` (and
+  the convenience `Merge(retainFrom)`) compacts every part into one, merging samples per series by
+  timestamp (freshest wins on a tie), dropping samples older than the absolute `retainFrom` cutoff,
+  **downsampling** the survivors by the supplied tiers, and — when the merged part is **fully cold**
+  (its newest sample predates `Recompress.Before`) — rewriting it with a higher-ratio compression
+  profile (`RecompressSpec{Before, Algorithm, Level}` → zstd at a chosen level) before deleting the
+  source parts. Recompression is **decode-transparent**: the reader keys decompression off the
+  per-column algorithm in the manifest (level is decode-irrelevant), so it is a pure ratio/CPU
+  trade-off with **no format change**; a lone cold part is recompressed once and then skipped (the
+  fixed point checks the part's recorded algorithm, so re-merges don't churn). A `DownsampleTier{Before, Interval, Agg}`
   rolls every sample older than `Before` into one representative per absolute `Interval`-aligned
   bucket, combined by a `signal.Aggregation` (last/first/min/max/sum/avg/count); a sample is assigned
   the coarsest tier it qualifies for, and younger samples stay raw. Both the rollup and the
@@ -387,7 +394,7 @@ this caller-owned-synchronization upgrade.
   Bucket alignment is to the absolute grid (not ingest time), so the rollup of a range is independent
   of when the merge runs and repeated merges are a **fixed point** for last/first/min/max/sum/avg (a
   one-sample bucket aggregates to itself); count is the documented non-idempotent exception. Records
-  (logs/traces/profiles) carry retention only — downsampling is metrics-specific.
+  (logs/traces/profiles) carry retention only — downsampling and recompression are metrics-specific.
 - **Fetch** (`engine.go`) implements the fetch contract: it resolves matchers to series
   over the index, then merges each series' head buffer ∪ every part by timestamp into one
   batch. `Close` flushes the head. `Reset(ctx)` is the inverse of accumulation: it replaces
@@ -845,7 +852,7 @@ query-language path stays in the embedder. The `Write*` methods take the library
   codec) — see §3c.
 - **`tenant`** — policy model: `Limits` (admission valves — §3k), `Retention`, `Downsample` (a list
   of `DownsampleTier{After, Interval, Agg}` rollup bands, applied at merge time — §3f), `Sampling`
-  (the lossy budget — §3k), and the
+  (the lossy budget — §3k), `Recompress` (cold-data zstd recompression at merge — §3f), and the
   composed `Policy`, resolved per tenant id through a `Resolver` (`ResolverFunc` adapter;
   `Default()` returns an empty-policy resolver). Multi-tenancy, retention, and
   downsampling are consumer-supplied callbacks keyed by tenant id.
@@ -906,7 +913,7 @@ signal/               typed Attributes/Value, Resource/Scope/Series identity, 12
   signal/trace        []byte-based OTLP-shaped Traces ingest batch (resettable/pooled) + span schema + projection (nested-set, events/links) [implemented]
   signal/profile      []byte-based OTLP-shaped Profiles ingest batch + sample schema (type folded into identity) + projection + content-addressed symbol store (SideStore) + stack Resolver [implemented]
 otlp/pdataconv        optional OTel-Go bridge: pmetric.Metrics → metric.Metrics; gauge/sum direct + histogram/exp-histogram/summary classic decomposition (only package importing pdata) [implemented]
-tenant/               Limits/Retention/Downsample/Sampling/Policy, Resolver             [implemented]
+tenant/               Limits/Retention/Downsample/Sampling/Recompress/Policy, Resolver             [implemented]
 backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + memory (root) [implemented]
   backend/file        directory-tree backend; atomic write + exclusive PutIfAbsent (os.Link) [implemented]
   backend/s3          object-store-native backend over ObjectStore + aws-sdk-go-v2 adapter   [implemented; in-process go-faster/fs S3 integration test]
@@ -915,7 +922,7 @@ block/                immutable columnar part format: column/marks/manifest/part
 index/                symbols (intern) · series (id↔attrs) · postings (set-ops/matchers) [implemented]
   index/bloom         token bloom filter (no false negatives) + tokenizer: full-text + attr/equality pruning [implemented]
 wal/                  CRC-framed segmented WAL: samples + opaque records + side delta, resume + checkpoint (truncate-on-flush), facade-wired durability [implemented]
-engine/               head · flush · background-merge · retention · downsampling · admission limits · fetch (metrics) [implemented]
+engine/               head · flush · background-merge · retention · downsampling · recompression · admission limits · fetch (metrics) [implemented]
 recordengine/         shared schema-driven record engine (logs+traces+profiles): head · flush · merge · fetch · conditions · per-column blooms · optional content-addressed side store [implemented]
 query/fetch           dual-shape fetch contract (Matchers + Conditions/Projection/SecondPass) [implemented for metrics + logs + traces + profiles; the library's query surface]
 query/scale           fetch-seam scale-out decorators: split-by-interval + results cache  [implemented]

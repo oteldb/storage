@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
@@ -191,4 +192,25 @@ func TestCloseFlushesAllTenants(t *testing.T) {
 
 	assert.Equal(t, 1, apiEng.PartCount(), "Close flushed tenant api")
 	assert.Equal(t, 1, webEng.PartCount(), "Close flushed tenant web")
+}
+
+func TestMetricMergeOptionsRecompress(t *testing.T) {
+	t.Parallel()
+
+	s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+		return tenant.Policy{Recompress: tenant.Recompress{After: time.Hour, Level: 7}}
+	})))
+	require.NoError(t, err)
+
+	now := time.Now().UnixNano()
+	opts := s.metricMergeOptions("default")
+	require.NotNil(t, opts.Recompress, "policy with Recompress.After yields a recompression spec")
+	assert.Equal(t, compress.AlgorithmZSTD, opts.Recompress.Algorithm)
+	assert.Equal(t, compress.Level(7), opts.Recompress.Level)
+	assert.InDelta(t, now-time.Hour.Nanoseconds(), opts.Recompress.Before, float64(time.Minute.Nanoseconds()))
+
+	// No policy ⇒ no recompression.
+	s2, err := InMemory()
+	require.NoError(t, err)
+	assert.Nil(t, s2.metricMergeOptions("default").Recompress)
 }

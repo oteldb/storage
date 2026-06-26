@@ -16,6 +16,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/scale"
@@ -956,7 +957,22 @@ func (s *Storage) metricMergeOptions(tid signal.TenantID) engine.MergeOptions {
 		})
 	}
 
-	return engine.MergeOptions{RetainFrom: retentionCutoff(p.Retention, now), Downsample: tiers}
+	var recompress *engine.RecompressSpec
+
+	if p.Recompress.After > 0 {
+		level := compress.LevelBest
+		if p.Recompress.Level > 0 {
+			level = compress.Level(p.Recompress.Level)
+		}
+
+		recompress = &engine.RecompressSpec{
+			Before:    now - p.Recompress.After.Nanoseconds(),
+			Algorithm: compress.AlgorithmZSTD,
+			Level:     level,
+		}
+	}
+
+	return engine.MergeOptions{RetainFrom: retentionCutoff(p.Retention, now), Downsample: tiers, Recompress: recompress}
 }
 
 // engineSnapshot returns the current tenant engines (a copy, so callers iterate without

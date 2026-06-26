@@ -18,6 +18,11 @@ type MergeOptions struct {
 	// with age). It reuses the one merge engine — no separate subsystem. The cutoffs are
 	// absolute (the caller resolves now − After into Before), keeping the merge deterministic.
 	Downsample []DownsampleTier
+	// Recompress, when non-nil, rewrites a fully-cold merged part (every sample older than its
+	// Before cutoff) with a higher-ratio compression profile — the fourth merge mode after
+	// compaction, retention, and downsampling, still one pass over the parts. nil keeps the
+	// default (codec-only) compression.
+	Recompress *RecompressSpec
 }
 
 // DownsampleTier is the absolute (wall-clock-free) form of a tenant downsampling tier: every

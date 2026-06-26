@@ -34,9 +34,10 @@ func (e *Engine) mergeLocked(ctx context.Context, opts MergeOptions) error {
 		return nil
 	}
 
-	// A single part with no retention cutoff and nothing old enough to downsample has nothing
-	// to gain — skip without decoding it.
-	if len(e.parts) == 1 && opts.RetainFrom <= 0 && !downsampleApplies(opts.Downsample, e.parts[0].minTime) {
+	// A single part with no retention cutoff, nothing old enough to downsample, and nothing to
+	// recompress has nothing to gain — skip without decoding it.
+	if len(e.parts) == 1 && opts.RetainFrom <= 0 &&
+		!downsampleApplies(opts.Downsample, e.parts[0].minTime) && !recompressApplies(e.parts[0], opts.Recompress) {
 		return nil
 	}
 
@@ -50,9 +51,10 @@ func (e *Engine) mergeLocked(ctx context.Context, opts MergeOptions) error {
 		return err
 	}
 
-	// Fixed point: a single source part whose row count downsampling did not reduce is already
-	// at its target resolution, so rewriting it would only churn the backend each tick.
-	if len(e.parts) == 1 && opts.RetainFrom <= 0 && len(cols.ts) == e.parts[0].rows() {
+	// Fixed point: a single source part whose row count downsampling did not reduce, and which
+	// needs no recompression, is already at its target — rewriting it would only churn the backend.
+	if len(e.parts) == 1 && opts.RetainFrom <= 0 && len(cols.ts) == e.parts[0].rows() &&
+		!recompressApplies(e.parts[0], opts.Recompress) {
 		return nil
 	}
 
@@ -62,8 +64,11 @@ func (e *Engine) mergeLocked(ctx context.Context, opts MergeOptions) error {
 		// Retention dropped every sample: keep no parts.
 		e.parts = nil
 	} else {
+		minT, maxT := colsTimeRange(cols)
 		prefix := e.partPrefix(e.nextSeq)
-		if err := writePart(ctx, e.cfg.Backend, prefix, cols); err != nil {
+
+		// Recompress when the merged part is fully cold (its newest sample predates the cutoff).
+		if err := writePart(ctx, e.cfg.Backend, prefix, cols, coldProfile(opts.Recompress, maxT)); err != nil {
 			return err
 		}
 
@@ -72,7 +77,7 @@ func (e *Engine) mergeLocked(ctx context.Context, opts MergeOptions) error {
 			return err
 		}
 
-		p.minTime, p.maxTime = colsTimeRange(cols)
+		p.minTime, p.maxTime = minT, maxT
 		e.parts = []*part{p}
 		e.nextSeq++
 	}

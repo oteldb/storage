@@ -450,7 +450,9 @@ func (e *Engine) flushLocked(ctx context.Context) error {
 	}
 
 	prefix := e.partPrefix(e.nextSeq)
-	if err := writePart(ctx, e.cfg.Backend, prefix, cols); err != nil {
+	// Flush writes freshly-ingested (warm) data with the default codec-only framing; recompression
+	// of cold data happens later, at merge.
+	if err := writePart(ctx, e.cfg.Backend, prefix, cols, nil); err != nil {
 		return err
 	}
 

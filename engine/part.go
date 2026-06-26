@@ -7,6 +7,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -89,6 +90,19 @@ func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, err
 	}
 
 	return &part{reader: r, prefix: prefix, ranges: ranges, hasSF: slices.Contains(r.ColumnNames(), colSF)}, nil
+}
+
+// compressedWith returns the block-compression algorithm the part's value column was written with
+// (representative of the part — all columns share the writer's default algorithm). It is the basis
+// for the recompression fixed point: a part already at the cold algorithm is not rewritten again.
+func (p *part) compressedWith() compress.Algorithm {
+	for _, c := range p.reader.Manifest().Columns {
+		if c.Name == colValue {
+			return c.Compress
+		}
+	}
+
+	return compress.AlgorithmNone
 }
 
 // rows returns the part's total sample count (its series ranges partition [0, rows)).

@@ -90,9 +90,16 @@ const (
 	maxInt64 = int64(1<<63 - 1)
 )
 
-// writePart writes cols as a metric part under prefix via [block.PartWriter].
-func writePart(ctx context.Context, b backend.Backend, prefix string, cols *flushColumns) error {
-	w := block.NewPartWriter(block.WithSortKey(colTs))
+// writePart writes cols as a metric part under prefix via [block.PartWriter]. A non-nil comp
+// rewrites the part with a higher-ratio compression profile (recompression of cold data); nil
+// keeps the default codec-only framing.
+func writePart(ctx context.Context, b backend.Backend, prefix string, cols *flushColumns, comp *RecompressSpec) error {
+	opts := []block.PartOption{block.WithSortKey(colTs)}
+	if comp != nil {
+		opts = append(opts, block.WithCompression(comp.Algorithm), block.WithCompressionLevel(comp.Level))
+	}
+
+	w := block.NewPartWriter(opts...)
 	if err := w.AddColumn(block.Column{Name: colSeries, Kind: block.KindInt128, Int128: cols.series}); err != nil {
 		return err
 	}

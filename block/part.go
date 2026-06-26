@@ -55,6 +55,14 @@ func WithCompression(alg compress.Algorithm) PartOption {
 	return func(w *PartWriter) { w.defaultComp = alg }
 }
 
+// WithCompressionLevel sets the compression level used by the block compressors (default
+// [compress.LevelDefault]). It is decode-irrelevant — the reader reconstructs the decompressor
+// from the per-column algorithm recorded in the manifest, regardless of the level data was written
+// at — so a merge can rewrite cold parts at a higher ratio with no format change.
+func WithCompressionLevel(level compress.Level) PartOption {
+	return func(w *PartWriter) { w.level = level }
+}
+
 // NewPartWriter returns a [PartWriter] with the given options applied.
 func NewPartWriter(opts ...PartOption) *PartWriter {
 	w := &PartWriter{

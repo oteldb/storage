@@ -74,13 +74,25 @@ type Sampling struct {
 	MaxRowsPerSecond int64
 }
 
-// Policy is the resolved policy for a tenant: limits, retention, downsampling, sampling, and
-// routing. It is the return value of [Resolver.Resolve].
+// Recompress is the per-tenant cold-data recompression policy: once a part's data is older than
+// After, the merge engine rewrites it with a higher-ratio (Zstandard) profile, trading merge CPU
+// for storage. It is decode-transparent (the reader keys off the recorded algorithm), so it costs
+// nothing to read. Optional; a zero After disables it.
+type Recompress struct {
+	// After is the age past which a fully-cold part is recompressed at merge. Zero ⇒ disabled.
+	After time.Duration
+	// Level is the Zstandard level (1 fastest … 19 best ratio). Zero ⇒ the best-ratio default.
+	Level int
+}
+
+// Policy is the resolved policy for a tenant: limits, retention, downsampling, sampling,
+// recompression, and routing. It is the return value of [Resolver.Resolve].
 type Policy struct {
 	Limits     Limits
 	Retention  Retention
 	Downsample Downsample
 	Sampling   Sampling
+	Recompress Recompress
 	// RoutingHints TODO(M6): per-tenant shard placement / zone preferences.
 }
 
