@@ -24,6 +24,7 @@ import (
 type clusterNode struct {
 	client     *clientv3.Client
 	membership *etcd.Membership
+	ownership  *etcd.Ownership
 	writer     *cluster.Writer
 	server     *http.Server
 	listener   net.Listener
@@ -79,6 +80,7 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	s.cluster = &clusterNode{
 		client:     client,
 		membership: mship,
+		ownership:  etcd.NewOwnership(client, root, cfg.Self.ID, mship.LeaseID()),
 		writer:     cluster.NewWriter(rf, mship, mship.AddrOf, rp),
 		server:     srv,
 		listener:   ln,

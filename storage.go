@@ -383,12 +383,48 @@ func (s *Storage) runMaintenance(interval time.Duration) {
 
 // maintain flushes then merges (with retention) every tenant engine once. Errors are
 // swallowed: a transient backend failure must not crash the background loop, and the next
-// tick retries.
+// tick retries. In cluster mode only the tenants this node owns (its compaction claims) are
+// flushed/merged, so exactly one node writes a tenant's parts to the shared object store.
 func (s *Storage) maintain(ctx context.Context) {
-	for tid, eng := range s.engineSnapshotByTenant() {
+	engines := s.engineSnapshotByTenant()
+
+	owned := s.ownedTenants(ctx, engines) // nil ⇒ single-node: own everything
+
+	for tid, eng := range engines {
+		if owned != nil {
+			if _, ok := owned[tid]; !ok {
+				continue // a replica, not the compaction owner — skip flush/merge
+			}
+		}
+
 		_ = eng.Flush(ctx)
 		_ = eng.Merge(ctx, s.retainFrom(tid))
 	}
+}
+
+// ownedTenants reconciles cluster compaction ownership for the local tenants and returns the
+// set this node owns. It returns nil in single-node mode (every tenant is owned).
+func (s *Storage) ownedTenants(ctx context.Context, engines map[signal.TenantID]*engine.Engine) map[signal.TenantID]struct{} {
+	if s.cluster == nil {
+		return nil
+	}
+
+	shards := make([]string, 0, len(engines))
+	for tid := range engines {
+		shards = append(shards, string(s.normalizeTenant(tid)))
+	}
+
+	owned, err := s.cluster.ownership.Reconcile(ctx, s.cluster.membership.Ring(), shards)
+	if err != nil {
+		return map[signal.TenantID]struct{}{} // on error, own nothing this tick (retry next)
+	}
+
+	out := make(map[signal.TenantID]struct{}, len(owned))
+	for _, shard := range owned {
+		out[signal.TenantID(shard)] = struct{}{}
+	}
+
+	return out
 }
 
 // retainFrom converts a tenant's retention window into an absolute cutoff timestamp (unix

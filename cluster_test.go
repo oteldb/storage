@@ -109,6 +109,53 @@ func TestClusteredStorageReplicatesAcrossNodes(t *testing.T) {
 	}
 }
 
+// TestClusterOnlyPrimaryCompacts proves the rebalance executor at work: with the tenant
+// replicated to both nodes, only the ring-primary acquires the compaction claim and flushes to
+// the object store; the replica skips, so a tenant's parts are written by exactly one node.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterOnlyPrimaryCompacts(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNode(t, endpoint, "node-a"),
+		"node-b": openClusterNode(t, endpoint, "node-b"),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 2
+	}, 10*time.Second, 50*time.Millisecond)
+
+	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
+	require.NoError(t, err)
+
+	// Both nodes hold the replicated head; identify the ring-primary and the replica.
+	p, ok := a.cluster.membership.Ring().Primary([]byte("default"))
+	require.True(t, ok)
+	primary := nodes[p.ID]
+
+	var replica *Storage
+	for id, s := range nodes {
+		if id != p.ID {
+			replica = s
+		}
+	}
+
+	// Run a maintenance tick on both nodes.
+	primary.maintain(ctx)
+	replica.maintain(ctx)
+
+	pe, ok := primary.lookupEngine("default")
+	require.True(t, ok)
+	assert.Equal(t, 1, pe.PartCount(), "the primary flushed the tenant's part")
+
+	re, ok := replica.lookupEngine("default")
+	require.True(t, ok)
+	assert.Equal(t, 0, re.PartCount(), "the replica did not compact (it holds no claim)")
+}
+
 // TestClusteredReadFansOutToOwners is the read-fan-out capstone: with three nodes and RF=2,
 // a tenant is owned by two of them; a query on the third (a non-owner, which holds none of the
 // tenant's data) fans out to an owner over HTTP and returns the result.

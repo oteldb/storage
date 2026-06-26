@@ -153,6 +153,10 @@ func Join(ctx context.Context, client *clientv3.Client, root string, self Member
 // Ring returns the current ring (lock-free). It is replaced atomically as membership changes.
 func (m *Membership) Ring() *ring.Ring { return m.current.Load() }
 
+// LeaseID is this node's membership lease. Ownership claims bind to it so they auto-release
+// when the node dies (the basis for the rebalance handoff).
+func (m *Membership) LeaseID() clientv3.LeaseID { return m.leaseID }
+
 // AddrOf returns the network address of the member with the given ring node ID, or "" if the
 // member is unknown. It is the resolver the cluster write path uses to turn ring owners into
 // transport targets.

@@ -44,7 +44,7 @@ The design is a single columnar engine with swappable front-ends and backends
 | L3 **Engine** / **Index / WAL** | **head · flush · merge · retention** / **symbols · series · postings** · **write-ahead log** | **engine implemented (metrics)**; **index + wal implemented** |
 | L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
 | L1 **Backend** | file · s3 · memory behind one interface | **memory + file + s3 implemented**, with `PutIfAbsent` CAS; `bucketindex` for stateless part enumeration |
-| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **ring + membership + quorum replication + rebalance + clustered ingest + read fan-out implemented**; rebalance-plan execution pending |
+| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **full L0 implemented**: ring, membership, quorum replication, rebalance plan + executor, clustered ingest, read fan-out |
 
 The **implemented substance spans L1 (backends) through L4 (the fetch contract)** for
 metrics: encoding, parts, index, WAL, the engine head/flush/merge, and the metrics fetch
@@ -447,11 +447,21 @@ otherwise it fans out over HTTP to an owner's read endpoint and **fails over** b
 single owner's copy is complete). Matchers are opaque Go predicates and **not serializable**, so
 the RPC carries only the tenant + window — a peer returns its whole window (a superset the fetch
 contract permits) and the requesting node **re-applies the matchers** (their closures live
-there). A three-node, RF=2 end-to-end test confirms a query on a non-owner returns the data. The
-**rebalance-plan executor** (etcd-coordinated ownership handoff) is the remaining L0 work; the
-cluster-mode write path does not yet apply the single-node OOO window or partial-success
-accounting, and remote fan-out has no matcher pushdown (a serializable-matcher protocol would
-add it).
+there). A three-node, RF=2 end-to-end test confirms a query on a non-owner returns the data.
+
+**Rebalance executor** (`cluster/etcd/ownership.go`): the `Plan` is the diff; the executor
+enacts the handoff via **exclusive compaction claims**. `Ownership.Acquire` is an etcd CAS
+(create-if-absent) bound to the node's membership lease; `Reconcile(ring, shards)` acquires
+every shard the node is the ring-primary of and releases the rest, returning the owned set. In
+cluster mode the maintenance loop flushes/merges **only owned tenants**, so a tenant's parts are
+written to the shared object store by exactly one node — even during ring-disagreement windows,
+the claim arbitrates. A departed node's claims auto-free with its lease and the new primary
+takes over (tested via lease revoke). A two-node test confirms only the primary compacts.
+
+Remaining parity work: the cluster-mode write path does not yet apply the single-node OOO window
+or partial-success accounting; remote fan-out has no matcher pushdown (a serializable-matcher
+protocol would add it); and replica heads are not yet trimmed after the owner flushes (they hold
+the replicated window until the node restarts).
 
 ---
 
@@ -572,6 +582,7 @@ cluster/              L0 distribution: ring + membership + (later) replication �
   cluster/etcd        etcd-backed live membership (lease + watch → atomic ring)          [implemented; embedded-etcd tested]
   cluster/replica     quorum write-replication + node-to-node HTTP transport             [implemented]
   cluster/rebalance   minimal ownership-handoff plan from a ring diff (pure)              [implemented]
+  cluster/etcd (ownership.go) exclusive compaction claims (CAS+lease) — the rebalance executor [implemented]
   cluster/            cluster write path: EncodeWrite codec + Writer + Config             [implemented]
   cluster/ (read.go)  cluster read RPC: window-fetch codec + ReadHandler + RemoteFetcher    [implemented]
 .                     (cluster.go) facade cluster mode: routed WriteMetrics + owner-aware fan-out reads [implemented]
