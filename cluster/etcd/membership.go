@@ -17,6 +17,7 @@ import (
 	"github.com/go-faster/errors"
 	"github.com/go-faster/jx"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/cluster/ring"
 )
@@ -89,6 +90,17 @@ type Membership struct {
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	log *zap.Logger // membership-change logging; nil ⇒ no-op
+}
+
+// SetLogger attaches a logger that records member joins and leaves (Info on each change). It must
+// be called before [Join] starts the watch loop in practice it is set immediately after Join.
+// nil disables logging. Safe only before the watch observes its first event.
+func (m *Membership) SetLogger(l *zap.Logger) {
+	if l != nil {
+		m.log = l
+	}
 }
 
 // Join registers self in the cluster rooted at root (an etcd key prefix) under a lease of ttl
@@ -240,15 +252,20 @@ func (m *Membership) watch(ctx context.Context, rev int64) {
 				if mem, err := decodeMember(ev.Kv.Value); err == nil {
 					m.set(mem)
 					changed = true
+					m.logger().Info("member joined",
+						zap.String("id", mem.ID), zap.String("zone", mem.Zone), zap.String("addr", mem.Addr))
 				}
 			case clientv3.EventTypeDelete:
-				m.remove(strings.TrimPrefix(string(ev.Kv.Key), m.prefix))
+				id := strings.TrimPrefix(string(ev.Kv.Key), m.prefix)
+				m.remove(id)
 				changed = true
+				m.logger().Info("member left", zap.String("id", id))
 			}
 		}
 
 		if changed {
 			m.rebuild()
+			m.logger().Info("ring rebuilt", zap.Int("members", len(m.Members())))
 		}
 	}
 }
@@ -275,4 +292,12 @@ func (m *Membership) rebuild() {
 	m.mu.RUnlock()
 
 	m.current.Store(ring.New(nodes...))
+}
+
+func (m *Membership) logger() *zap.Logger {
+	if m.log == nil {
+		return zap.NewNop()
+	}
+
+	return m.log
 }

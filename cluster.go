@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-faster/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
@@ -134,6 +135,10 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 
 		return errors.Wrap(err, "join cluster")
 	}
+
+	mship.SetLogger(s.obs.Log)
+	s.obs.Log.Info("joined cluster",
+		zap.String("id", cfg.Self.ID), zap.String("zone", cfg.Self.Zone), zap.String("addr", cfg.Self.Addr))
 
 	s.cluster = &clusterNode{
 		client:     client,
