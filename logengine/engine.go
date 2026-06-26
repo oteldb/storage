@@ -153,9 +153,10 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 				continue // time-prune via the part's bounds
 			}
 
-			// Full-text prune: when conditions are applied (AllConditions) and carry required
-			// body tokens, skip a part whose bloom proves a token absent (no false negatives).
-			if r.AllConditions && !p.bodyTokensPresent(r.Conditions) {
+			// Bloom prune: when conditions are applied (AllConditions), skip a part whose body or
+			// attribute bloom proves a required full-text token or equality value absent (no
+			// false negatives; surviving parts are still re-checked per row).
+			if r.AllConditions && !p.mayContain(r.Conditions) {
 				continue
 			}
 

@@ -118,8 +118,13 @@ func writePart(ctx context.Context, b backend.Backend, prefix string, f *flushCo
 		return errors.Wrapf(err, "write part %q", prefix)
 	}
 
-	// Write the body token bloom alongside the part for full-text pruning.
+	// Write the per-part blooms alongside the part: body tokens for full-text pruning, and
+	// per-record attribute key=value tokens for equality pruning.
 	if err := writeBodyBloom(ctx, b, prefix, f.cols.body); err != nil {
+		return err
+	}
+
+	if err := writeAttrBloom(ctx, b, prefix, f.cols.attrs); err != nil {
 		return err
 	}
 

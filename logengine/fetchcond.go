@@ -31,14 +31,14 @@ func (c *recordCols) colValue(i int, name string) (signal.Value, bool) {
 	case colSpanID:
 		return signal.BytesValue(c.spanID[i]), true
 	default:
-		attrs, _, err := signal.DecodeAttributes(c.attrs[i])
-		if err != nil {
+		// A non-fixed name is a per-record attribute: scan the serialized blob for just that
+		// key (no full-map decode, no allocation).
+		v, ok, err := signal.LookupAttribute(c.attrs[i], name)
+		if err != nil || !ok {
 			return signal.Value{}, false
 		}
 
-		v, ok := attrs.Get([]byte(name))
-
-		return v, ok
+		return v, true
 	}
 }
 

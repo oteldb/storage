@@ -358,7 +358,7 @@ The **dual-shape** read seam. A `Request{Tenant, Signal, Start, End, Matchers, C
 AllConditions, Projection, SecondPass}` carries two operator-free predicate families: **callback
 matchers** — `Matcher{Name, Match func(signal.Value) bool}` — that resolve **identity** over the
 postings index (a metric series, a log stream), and **callback conditions** —
-`Condition{Column, Match, Tokens}` — that filter the **per-record columns** within that identity
+`Condition{Column, Match, Tokens, Equal}` — that filter the **per-record columns** within that identity
 (a log record's severity/body/attributes). Neither is an operator enum, so equality/regex/
 negation and condition extraction live in the language layer (§3h) and storage stays
 operator-free. `Fetcher.Fetch` returns an `Iterator` of `*Batch{ID, Series, Timestamps, Values,
@@ -557,14 +557,20 @@ dual-shape fetch contract (§3g): **Matchers resolve the stream, Conditions filt
 - **Conditions / projection / second-pass** (`logengine.Fetch`): a `Condition` is an
   operator-free per-record column predicate, ANDed when `AllConditions` is set (else the engine
   returns the window superset and the language re-checks). A condition naming a fixed column reads
-  that column; any other name is looked up in the record's `attrs` blob, so per-record attribute
-  predicates push down. `Projection` materializes only the named columns; `SecondPass` is an
-  optional post-filter over the assembled stream batch.
-- **Full-text** (`index/bloom`): a token bloom filter (bit array, k probes by double-hashing one
-  xxh3-128 digest; versioned + CRC'd; **no false negatives**) plus an alphanumeric tokenizer. Each
-  flushed/merged part writes a body-token bloom (`bloom-body.bin`); `Fetch` skips a part whose
-  bloom proves a required full-text token (`Condition.Tokens`) absent, then re-checks the exact
-  substring per row. A part with no bloom is always scanned (safe).
+  that column; any other name is a per-record attribute, resolved by `signal.LookupAttribute` — a
+  **targeted, zero-allocation** scan of the record's `attrs` blob for that one key (no full-map
+  decode). `Projection` materializes only the named columns; `SecondPass` is an optional post-filter
+  over the assembled stream batch.
+- **Full-text & equality pruning** (`index/bloom`): a token bloom filter (bit array, k probes by
+  double-hashing one xxh3-128 digest; versioned + CRC'd; **no false negatives**) plus an
+  alphanumeric tokenizer. Each flushed/merged part writes **two** blooms: a body-token bloom
+  (`bloom-body.bin`) over the body's full-text tokens, and an attribute bloom (`bloom-attrs.bin`)
+  over each record's per-record attributes as exact `key=value` tokens. `Fetch` skips a part whose
+  body bloom proves a required full-text token (`Condition.Tokens`) absent or whose attribute bloom
+  proves a required equality (`Condition.Equal`, a serializable spec the language sets) absent — then
+  re-checks the exact predicate per row on surviving parts. A part with no bloom is always scanned
+  (safe). Attribute *equality* prunes parts; non-equality attribute predicates still scan (an
+  inverted attribute index is the deferred next step).
 - **WAL** gains a `recordLogRecords` frame (the signal-neutral `wal.LogRecord`, with opaque
   serialized attrs); replay reconstructs the head.
 - **Facade**: `WriteLogs` and `LogFetcher` mirror `WriteMetrics`/`Fetcher` over per-tenant log
@@ -697,7 +703,7 @@ backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + m
   backend/bucketindex versioned block-list index (time-pruned part enumeration, no full LIST) [implemented]
 block/                immutable columnar part format: column/marks/manifest/part        [implemented]
 index/                symbols (intern) · series (id↔attrs) · postings (set-ops/matchers) [implemented]
-  index/bloom         token bloom filter (no false negatives) + tokenizer for full-text  [implemented]
+  index/bloom         token bloom filter (no false negatives) + tokenizer: body full-text + attr equality pruning [implemented]
 wal/                  CRC-framed segmented write-ahead log + replay (samples + log records) [implemented]
 engine/               head · flush · background-merge · retention · fetch (metrics)    [implemented]
 logengine/            logs engine: record head · flush · merge · fetch · conditions · body-bloom [implemented]

@@ -81,13 +81,19 @@ type Request struct {
 }
 
 // Condition is one columnar predicate (logs): the rows whose value in column Column satisfy
-// Match. Like [Matcher] it is operator-free — the language layer supplies the predicate. Tokens,
-// when set, are the full-text tokens the column's value must contain (lowered), used to consult a
-// per-part token bloom for pushdown; an empty Tokens means the condition is not full-text.
+// Match. Like [Matcher] it is operator-free — the language layer supplies the predicate.
+//
+// Two optional, serializable hints let a fetcher prune whole parts before scanning (the engine
+// always re-checks Match per row, so a hint only ever skips work, never changes results):
+//   - Tokens: the full-text tokens the column value must contain (lowered) — consulted against a
+//     per-part token bloom for a `contains` condition (an empty Tokens ⇒ not full-text).
+//   - Equal: an exact column=value equality — consulted against a per-part value bloom. For a
+//     per-record attribute condition, Column is the attribute key and Equal carries key=value.
 type Condition struct {
 	Column string
 	Match  func(value signal.Value) bool
 	Tokens [][]byte
+	Equal  *EqualMatcher
 }
 
 // Batch is one matching identity (a metric series, or a log stream) and its rows within the

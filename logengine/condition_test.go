@@ -58,11 +58,16 @@ func bodyContains(sub string) fetch.Condition {
 	return fetch.Condition{Column: "body", Match: func(v signal.Value) bool { return bytes.Contains(v.Str(), want) }}
 }
 
-// attrEquals is a condition over a per-record attribute key.
+// attrEquals is an equality condition over a per-record attribute key. It carries the serializable
+// Equal spec so the engine can prune parts via the attribute bloom.
 func attrEquals(key, val string) fetch.Condition {
 	want := []byte(val)
 
-	return fetch.Condition{Column: key, Match: func(v signal.Value) bool { return bytes.Equal(v.Str(), want) }}
+	return fetch.Condition{
+		Column: key,
+		Match:  func(v signal.Value) bool { return bytes.Equal(v.Str(), want) },
+		Equal:  &fetch.EqualMatcher{Name: key, Value: val},
+	}
 }
 
 func condReq(svc string, conds ...fetch.Condition) fetch.Request {
@@ -180,6 +185,31 @@ func TestProjectionNarrowsColumns(t *testing.T) {
 	_, ok := got[0].Column("severity")
 	assert.False(t, ok, "unprojected columns are not materialized")
 	assert.Equal(t, []int64{100}, got[0].Timestamps, "timestamps are always present")
+}
+
+func TestAttributeBloomPrunesParts(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := logengine.New(logengine.Config{Backend: backend.Memory(), Prefix: "t/logs"})
+
+	// Two parts with disjoint attribute values, plus a head record.
+	ingest(t, e, richStream("api", richRec{100, 9, "p1", "alice"}))
+	require.NoError(t, e.Flush(ctx))
+	ingest(t, e, richStream("api", richRec{200, 9, "p2", "bob"}))
+	require.NoError(t, e.Flush(ctx))
+	ingest(t, e, richStream("api", richRec{300, 9, "head", "alice"}))
+	require.Equal(t, 2, e.PartCount())
+
+	// user=alice: part 2 (only bob) is bloom-pruned; part 1 and the head match. The per-row Match
+	// re-checks, so the result is exact — no false negatives from pruning.
+	got := fetchAll(t, e, condReq("api", attrEquals("user", "alice")))
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"p1", "head"}, bodies(got[0]))
+
+	// A value present in no part nor head ⇒ every part pruned, head scanned, nothing matches.
+	none := fetchAll(t, e, condReq("api", attrEquals("user", "nobody")))
+	assert.Empty(t, none)
 }
 
 func TestProjectionMultipleColumnsAndUnknown(t *testing.T) {

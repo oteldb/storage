@@ -151,6 +151,45 @@ func DecodeAttributes(src []byte) (Attributes, int, error) {
 	return a, off, nil
 }
 
+// LookupAttribute scans the canonical binary form produced by [Attributes.AppendHashInput] for
+// the attribute named key and returns its value (aliasing src) and whether it was present. Unlike
+// [DecodeAttributes] it materializes no slice and decodes only keys plus the one matching value,
+// so a per-row attribute predicate over a serialized blob allocates nothing. It is bounds-checked
+// and never panics (safe to fuzz).
+func LookupAttribute(src []byte, key string) (Value, bool, error) {
+	count, n := binary.Uvarint(src)
+	if n <= 0 {
+		return Value{}, false, errors.Wrap(ErrMalformed, "attribute count")
+	}
+
+	off := n
+	if count > uint64(len(src)) { // each attribute needs ≥1 byte; guards against OOM
+		return Value{}, false, errors.Wrapf(ErrMalformed, "attribute count %d exceeds input", count)
+	}
+
+	for range count {
+		k, kn, err := readLenBytes(src[off:])
+		if err != nil {
+			return Value{}, false, errors.Wrap(err, "attribute key")
+		}
+
+		off += kn
+
+		v, vn, err := DecodeValue(src[off:])
+		if err != nil {
+			return Value{}, false, err
+		}
+
+		off += vn
+
+		if string(k) == key { // compiler avoids the []byte→string allocation in a comparison
+			return v, true, nil
+		}
+	}
+
+	return Value{}, false, nil
+}
+
 func decodeSlice(src []byte, off int) (Value, int, error) {
 	count, n := binary.Uvarint(src[off:])
 	if n <= 0 {

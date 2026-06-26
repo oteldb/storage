@@ -24,6 +24,7 @@ type part struct {
 	prefix    string
 	ranges    map[signal.SeriesID]rowRange
 	bodyBloom *bloom.Filter // body token bloom for full-text pruning; nil ⇒ always scan
+	attrBloom *bloom.Filter // per-record attribute key=value bloom for equality pruning; nil ⇒ scan
 
 	// minTime, maxTime are the inclusive unix-ns record bounds of the part (from the flush/merge
 	// columns when written, from the bucket index when reconstructed), for time pruning.
@@ -80,7 +81,12 @@ func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, err
 		return nil, err
 	}
 
-	return &part{reader: r, prefix: prefix, ranges: ranges, bodyBloom: bf}, nil
+	af, err := loadAttrBloom(ctx, b, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	return &part{reader: r, prefix: prefix, ranges: ranges, bodyBloom: bf, attrBloom: af}, nil
 }
 
 // appendWindow appends stream id's records whose timestamp is in [start, end] to acc. It is a

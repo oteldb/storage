@@ -50,6 +50,69 @@ func TestAttributesBinaryRoundTrip(t *testing.T) {
 	assert.Equal(t, a.Hash(), got.Hash())
 }
 
+func TestLookupAttribute(t *testing.T) {
+	t.Parallel()
+
+	a := NewAttributes(
+		kv("job", sv("api")),
+		kv("count", IntValue(7)),
+		kv("ratio", DoubleValue(0.5)),
+	)
+	blob := a.AppendHashInput(nil)
+
+	// Present keys agree with DecodeAttributes().Get; an absent key reports false.
+	for _, key := range []string{"job", "count", "ratio"} {
+		v, ok, err := LookupAttribute(blob, key)
+		require.NoError(t, err)
+		require.True(t, ok)
+		want, _ := a.Get([]byte(key))
+		assert.Truef(t, want.Equal(v), "LookupAttribute(%q) matches Get", key)
+	}
+
+	_, ok, err := LookupAttribute(blob, "missing")
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	// Truncations never panic.
+	for n := range blob {
+		_, _, _ = LookupAttribute(blob[:n], "job")
+	}
+}
+
+//nolint:paralleltest // testing.AllocsPerRun must not run during a parallel test.
+func TestLookupAttributeZeroAlloc(t *testing.T) {
+	blob := NewAttributes(kv("user", sv("alice")), kv("region", sv("eu"))).AppendHashInput(nil)
+
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _, _ = LookupAttribute(blob, "region")
+	})
+	assert.Zero(t, allocs, "a targeted attribute lookup materializes no slice")
+}
+
+func FuzzLookupAttribute(f *testing.F) {
+	f.Add(NewAttributes(kv("k", sv("v"))).AppendHashInput(nil), "k")
+	f.Add([]byte{0x00}, "x")
+
+	f.Fuzz(func(t *testing.T, blob []byte, key string) {
+		// Must never panic; when it succeeds, it must agree with a full decode.
+		v, ok, err := LookupAttribute(blob, key)
+		if err != nil {
+			return
+		}
+
+		a, _, derr := DecodeAttributes(blob)
+		if derr != nil {
+			return // LookupAttribute may accept a prefix DecodeAttributes rejects; nothing to compare
+		}
+
+		want, wantOK := a.Get([]byte(key))
+		assert.Equal(t, wantOK, ok)
+		if ok {
+			assert.True(t, want.Equal(v))
+		}
+	})
+}
+
 func TestDecodeRejectsTruncation(t *testing.T) {
 	t.Parallel()
 
