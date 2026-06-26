@@ -1,4 +1,4 @@
-package logengine
+package recordengine
 
 import (
 	"bytes"
@@ -9,10 +9,9 @@ import (
 
 // ApplyPrimary applies a write as the stream's **primary**: it appends each record through the
 // out-of-order check (the single OOO decision for the shard) and re-frames the *accepted* records
-// into a WAL payload to replicate to the secondary owners. It returns that accepted payload and
-// the number of records rejected as out-of-order. Because only the primary OOO-checks and dictates
-// the accepted set, every replica converges on the same data. Safe for concurrent use. It mirrors
-// engine.Engine.ApplyPrimary for the logs vertical.
+// into a WAL payload to replicate to the secondary owners. It returns that accepted payload and the
+// number of records rejected as out-of-order. Every replica converges on the same data. Safe for
+// concurrent use.
 func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -31,13 +30,15 @@ func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err e
 
 			return nil
 		},
-		OnLogRecords: func(id signal.SeriesID, recs []wal.LogRecord) error {
-			s := byID[id] // the stream record precedes its log records in the frame
+		OnRecords: func(id signal.SeriesID, blob []byte) error {
+			recs, derr := decodeRecs(blob, e.cfg.Schema.numInts(), e.cfg.Schema.numBytes())
+			if derr != nil {
+				return derr
+			}
 
-			var acc []wal.LogRecord
-
+			acc := recs[:0]
 			for i := range recs {
-				if e.head.appendRecord(id, fromWALRecord(recs[i]), e.cfg.OOOWindow) {
+				if e.head.appendRecord(id, recs[i], e.cfg.OOOWindow) {
 					acc = append(acc, recs[i])
 				} else {
 					rejected++
@@ -50,21 +51,21 @@ func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err e
 
 			if _, ok := written[id]; !ok {
 				written[id] = struct{}{}
-				if err := w.WriteSeries(id, s); err != nil {
-					return err
+				if werr := w.WriteSeries(id, byID[id]); werr != nil {
+					return werr
 				}
 			}
 
-			return w.WriteLogRecords(id, acc)
+			return w.WriteRecords(id, encodeRecs(acc))
 		},
 	})
 
 	return buf.Bytes(), rejected, err
 }
 
-// ApplyReplicated applies a replicated write from the stream's primary to this secondary verbatim
-// (no OOO re-check — the primary already decided the accepted set), the way WAL replay trusts the
-// log, so all replicas hold identical data. Safe for concurrent use.
+// ApplyReplicated applies a replicated write from the primary verbatim (no OOO re-check — the
+// primary already decided the accepted set), so all replicas hold identical data. Safe for
+// concurrent use.
 func (e *Engine) ApplyReplicated(data []byte) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -75,8 +76,13 @@ func (e *Engine) ApplyReplicated(data []byte) error {
 
 			return nil
 		},
-		OnLogRecords: func(id signal.SeriesID, recs []wal.LogRecord) error {
-			e.head.replayRecords(id, toRecs(recs))
+		OnRecords: func(id signal.SeriesID, blob []byte) error {
+			recs, err := decodeRecs(blob, e.cfg.Schema.numInts(), e.cfg.Schema.numBytes())
+			if err != nil {
+				return err
+			}
+
+			e.head.replayRecords(id, recs)
 
 			return nil
 		},

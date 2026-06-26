@@ -10,91 +10,78 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-func TestWriteReplayLogRecords(t *testing.T) {
+func TestWriteReplayRecords(t *testing.T) {
 	t.Parallel()
 
 	id := signal.SeriesID{Hi: 7, Lo: 9}
-	recs := []LogRecord{
-		{
-			Timestamp: 100, ObservedTimestamp: 101, SeverityNumber: 9, Flags: 1, Dropped: 2,
-			SeverityText: []byte("INFO"), Body: []byte("hello world"),
-			TraceID: []byte("0123456789abcdef"), SpanID: []byte("01234567"), Attrs: []byte("a=b"),
-		},
-		{Timestamp: 200, SeverityNumber: 17, Body: []byte("second")}, // sparse: empty byte fields
-	}
+	blob := []byte("opaque-engine-encoded-record-payload")
 
 	var buf bytes.Buffer
-	require.NoError(t, NewWriter(&buf).WriteLogRecords(id, recs))
+	require.NoError(t, NewWriter(&buf).WriteRecords(id, blob))
 
 	var (
-		gotID  signal.SeriesID
-		gotRec []LogRecord
+		gotID   signal.SeriesID
+		gotBlob []byte
 	)
 
 	require.NoError(t, Replay(buf.Bytes(), Handlers{
-		OnLogRecords: func(i signal.SeriesID, r []LogRecord) error {
-			gotID, gotRec = i, r
+		OnRecords: func(i signal.SeriesID, p []byte) error {
+			gotID, gotBlob = i, append([]byte(nil), p...)
 
 			return nil
 		},
 	}))
 
 	assert.Equal(t, id, gotID)
-	require.Len(t, gotRec, 2)
-	assert.Equal(t, recs[0], gotRec[0], "all fields round-trip")
-	assert.Equal(t, int64(200), gotRec[1].Timestamp)
-	assert.Equal(t, []byte("second"), gotRec[1].Body)
-	assert.Nil(t, gotRec[1].SeverityText, "an empty byte field round-trips as nil")
+	assert.Equal(t, blob, gotBlob, "the opaque payload round-trips")
 }
 
-func TestLogRecordsNilHandlerSkips(t *testing.T) {
+func TestRecordsNilHandlerSkips(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	require.NoError(t, NewWriter(&buf).WriteLogRecords(signal.SeriesID{Lo: 1}, []LogRecord{{Timestamp: 1}}))
-	require.NoError(t, Replay(buf.Bytes(), Handlers{})) // no OnLogRecords ⇒ skipped, no error
+	require.NoError(t, NewWriter(&buf).WriteRecords(signal.SeriesID{Lo: 1}, []byte("x")))
+	require.NoError(t, Replay(buf.Bytes(), Handlers{})) // no OnRecords ⇒ skipped, no error
 }
 
-func TestParseLogRecordsTruncated(t *testing.T) {
+func TestParseRecordsTruncated(t *testing.T) {
 	t.Parallel()
 
-	_, _, err := parseLogRecords([]byte{0x01}) // shorter than a SeriesID
+	_, _, err := parseRecords([]byte{0x01}) // shorter than a SeriesID
 	require.ErrorIs(t, err, ErrCorrupt)
 }
 
-// FuzzLogRecordFraming asserts parseLogRecords never panics on arbitrary input and that any
-// well-formed record set round-trips through Write∘parse unchanged.
-func FuzzLogRecordFraming(f *testing.F) {
-	f.Add([]byte("INFO"), []byte("body"), int64(5), int64(3))
-	f.Add([]byte(""), []byte(""), int64(0), int64(-1))
+// FuzzRecordFraming asserts a records frame round-trips through Write∘Replay and that parseRecords
+// never panics on arbitrary input.
+func FuzzRecordFraming(f *testing.F) {
+	f.Add([]byte("payload"), uint64(5), uint64(9))
+	f.Add([]byte(""), uint64(0), uint64(0))
 
-	f.Fuzz(func(t *testing.T, sevText, body []byte, ts, observed int64) {
-		id := signal.SeriesID{Hi: uint64(ts), Lo: uint64(observed)}
-		recs := []LogRecord{{
-			Timestamp: ts, ObservedTimestamp: observed, SeverityNumber: int32(len(body)),
-			SeverityText: sevText, Body: body,
-		}}
+	f.Fuzz(func(t *testing.T, blob []byte, hi, lo uint64) {
+		_, _, _ = parseRecords(blob) // must never panic on arbitrary bytes
 
-		payload := appendLogRecords(id.AppendBinary(nil), recs)
+		id := signal.SeriesID{Hi: hi, Lo: lo}
 
-		// parse must never panic and must reproduce the records.
-		gotID, got, err := parseLogRecords(payload)
-		require.NoError(t, err)
-		assert.Equal(t, id, gotID)
-		require.Len(t, got, 1)
-		assert.Equal(t, ts, got[0].Timestamp)
-		assert.Equal(t, observed, got[0].ObservedTimestamp)
-		assert.Equal(t, normalizeBytes(body), got[0].Body)
+		var buf bytes.Buffer
+		require.NoError(t, NewWriter(&buf).WriteRecords(id, blob))
 
-		// Arbitrary truncations of a valid payload must error cleanly, never panic.
-		for i := range payload {
-			_, _, _ = parseLogRecords(payload[:i])
-		}
+		var (
+			rid   signal.SeriesID
+			rblob []byte
+		)
+
+		require.NoError(t, Replay(buf.Bytes(), Handlers{OnRecords: func(i signal.SeriesID, p []byte) error {
+			rid, rblob = i, append([]byte(nil), p...)
+
+			return nil
+		}}))
+
+		assert.Equal(t, id, rid)
+		assert.Equal(t, normBytes(blob), normBytes(rblob))
 	})
 }
 
-// normalizeBytes maps an empty (len 0) slice to nil, matching takeBytes' zero-length handling.
-func normalizeBytes(b []byte) []byte {
+func normBytes(b []byte) []byte {
 	if len(b) == 0 {
 		return nil
 	}

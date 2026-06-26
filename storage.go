@@ -14,9 +14,9 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/logengine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/scale"
+	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
 	"github.com/oteldb/storage/signal/profile"
@@ -44,7 +44,7 @@ type Storage struct {
 
 	tmu        sync.Mutex
 	tenants    map[signal.TenantID]*engine.Engine
-	logTenants map[signal.TenantID]*logengine.Engine
+	logTenants map[signal.TenantID]*recordengine.Engine
 
 	cluster *clusterNode // cluster runtime (membership + replica server + routed writes); nil ⇒ single-node
 
@@ -70,7 +70,7 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 		backend:    o.Backend,
 		tenant:     o.Tenancy,
 		tenants:    make(map[signal.TenantID]*engine.Engine),
-		logTenants: make(map[signal.TenantID]*logengine.Engine),
+		logTenants: make(map[signal.TenantID]*recordengine.Engine),
 	}
 	if s.tenant == nil {
 		s.tenant = tenant.Default()

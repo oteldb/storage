@@ -1,4 +1,4 @@
-package logengine
+package recordengine
 
 import (
 	"context"
@@ -14,10 +14,9 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// The logs engine, like the metrics engine, keeps a [bucketindex] of its parts and a persisted
-// stream-identity object alongside them, so a stateless node reconstructs both the part set and
-// the postings/labels from the object store with no local state (the object-store-native read
-// path). Both are rewritten on every flush and merge.
+// The engine keeps a [bucketindex] of its parts and a persisted stream-identity object alongside
+// them, so a stateless node reconstructs both the part set and the postings/labels from the object
+// store with no local state. Both are rewritten on every flush and merge.
 
 func (e *Engine) indexKey() string  { return e.cfg.Prefix + "/" + bucketindex.Object }
 func (e *Engine) streamKey() string { return e.cfg.Prefix + "/streams.bin" }
@@ -42,8 +41,8 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 }
 
 // LoadParts reconstructs the engine's durable state from the object store: the part set from the
-// bucket index and the stream identity index (postings + labels) from the persisted object. A
-// head-only engine (no backend) is a no-op. Replaces current parts and advances the sequence.
+// bucket index and the stream identity index from the persisted object. A head-only engine is a
+// no-op. Replaces current parts and advances the sequence.
 func (e *Engine) LoadParts(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -61,7 +60,7 @@ func (e *Engine) LoadParts(ctx context.Context) error {
 	maxSeq := -1
 
 	for _, ent := range ix.Entries {
-		p, err := openPart(ctx, e.cfg.Backend, ent.Prefix)
+		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, ent.Prefix)
 		if err != nil {
 			return errors.Wrapf(err, "open part %q", ent.Prefix)
 		}
@@ -82,7 +81,7 @@ func (e *Engine) LoadParts(ctx context.Context) error {
 
 // RefreshReplica brings a replica node's view up to date with the shared object store: it
 // reconstructs the flushed parts and trims its head to the still-unflushed window. With no shared
-// store, it is a safe no-op.
+// store, a safe no-op.
 func (e *Engine) RefreshReplica(ctx context.Context) error {
 	if err := e.LoadParts(ctx); err != nil {
 		return err
@@ -108,7 +107,7 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 }
 
 // writeStreamIndexLocked persists the head's full stream identity set so a stateless reader can
-// rebuild the postings/series index. Written on flush; the set only grows. Caller holds e.mu.
+// rebuild the postings/series index. Caller holds e.mu.
 func (e *Engine) writeStreamIndexLocked(ctx context.Context) error {
 	if e.cfg.Backend == nil {
 		return nil
@@ -122,7 +121,7 @@ func (e *Engine) writeStreamIndexLocked(ctx context.Context) error {
 }
 
 // loadStreamIndexLocked rebuilds the head's series/postings index from the persisted object. A
-// missing object (nothing flushed yet) is a no-op. Caller holds e.mu.
+// missing object is a no-op. Caller holds e.mu.
 func (e *Engine) loadStreamIndexLocked(ctx context.Context) error {
 	data, err := e.cfg.Backend.Read(ctx, e.streamKey())
 	if err != nil {
@@ -153,8 +152,7 @@ func encodeSeriesSet(ix *series.Index) []byte {
 	return buf
 }
 
-// decodeSeriesSet parses encodeSeriesSet output, calling fn for each identity. Defensive against
-// truncated input.
+// decodeSeriesSet parses encodeSeriesSet output, calling fn for each identity.
 func decodeSeriesSet(data []byte, fn func(signal.Series)) error {
 	count, n := binary.Uvarint(data)
 	if n <= 0 {

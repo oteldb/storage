@@ -1,0 +1,143 @@
+package recordengine_test
+
+import (
+	"bytes"
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/index/bloom"
+	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/signal"
+)
+
+func sevAtLeast(threshold int64) fetch.Condition {
+	return fetch.Condition{Column: "sev", Match: func(v signal.Value) bool { return v.Int() >= threshold }}
+}
+
+func bodyContains(sub string) fetch.Condition {
+	want := []byte(sub)
+
+	return fetch.Condition{
+		Column: "body",
+		Match:  func(v signal.Value) bool { return bytes.Contains(v.Str(), want) },
+		Tokens: bloom.Tokenize(nil, want),
+	}
+}
+
+func idEquals(id string) fetch.Condition {
+	want := []byte(id)
+
+	return fetch.Condition{
+		Column: "id",
+		Match:  func(v signal.Value) bool { return bytes.Equal(v.Str(), want) },
+		Equal:  &fetch.EqualMatcher{Name: "id", Value: id},
+	}
+}
+
+func attrEquals(key, val string) fetch.Condition {
+	want := []byte(val)
+
+	return fetch.Condition{
+		Column: key,
+		Match:  func(v signal.Value) bool { return bytes.Equal(v.Str(), want) },
+		Equal:  &fetch.EqualMatcher{Name: key, Value: val},
+	}
+}
+
+func TestConditionsFilterColumnsAndAttributes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := newEngine(t, backend.Memory())
+	ingest(t, e, mkBatch("api",
+		rrec{ts: 100, sev: 9, body: "info ok", attr: [2]string{"user", "alice"}},
+		rrec{ts: 200, sev: 17, body: "error boom", attr: [2]string{"user", "bob"}},
+		rrec{ts: 300, sev: 17, body: "error again", attr: [2]string{"user", "alice"}},
+	))
+	require.NoError(t, e.Flush(ctx))
+
+	// Int-column condition.
+	got := fetchAll(t, e, req("api", sevAtLeast(17)))
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"error boom", "error again"}, bodies(got[0]))
+
+	// Full-text body condition (with bloom token).
+	got = fetchAll(t, e, req("api", bodyContains("info")))
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"info ok"}, bodies(got[0]))
+
+	// Attribute condition (decoded from the attrs blob), ANDed with severity.
+	got = fetchAll(t, e, req("api", sevAtLeast(17), attrEquals("user", "alice")))
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"error again"}, bodies(got[0]))
+}
+
+func TestEqualityBloomPrunesTraceByID(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := newEngine(t, backend.Memory())
+
+	// Two parts with disjoint ids, plus a head record.
+	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "a", id: "trace-1"}))
+	require.NoError(t, e.Flush(ctx))
+	ingest(t, e, mkBatch("api", rrec{ts: 200, body: "b", id: "trace-2"}))
+	require.NoError(t, e.Flush(ctx))
+	ingest(t, e, mkBatch("api", rrec{ts: 300, body: "c", id: "trace-1"}))
+
+	// id == trace-1: part 2 (only trace-2) is equality-bloom-pruned; part 1 + head match.
+	got := fetchAll(t, e, fetch.Request{
+		Start: 0, End: 1 << 60, AllConditions: true, Conditions: []fetch.Condition{idEquals("trace-1")},
+	})
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"a", "c"}, bodies(got[0]))
+
+	// An id present nowhere ⇒ all parts pruned, head scanned, empty.
+	assert.Empty(t, fetchAll(t, e, fetch.Request{
+		Start: 0, End: 1 << 60, AllConditions: true, Conditions: []fetch.Condition{idEquals("trace-none")},
+	}))
+}
+
+func TestLazyProjectionDecodesReferencedColumnsOnly(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := newEngine(t, backend.Memory())
+	ingest(t, e, mkBatch("api", rrec{ts: 100, sev: 17, body: "x", id: "t", attr: [2]string{"k", "v"}}))
+	require.NoError(t, e.Flush(ctx))
+
+	// Filter on sev, project only body: sev is decoded for the filter, only body is output.
+	r := req("api", sevAtLeast(17))
+	r.Projection = []string{"body"}
+	got := fetchAll(t, e, r)
+	require.Len(t, got, 1)
+
+	require.Len(t, got[0].Columns, 1)
+	assert.Equal(t, "body", got[0].Columns[0].Name)
+	_, ok := got[0].Column("sev")
+	assert.False(t, ok, "the filter-only column is not materialized in the output")
+	assert.Equal(t, []int64{100}, got[0].Timestamps)
+}
+
+func TestSecondPassDropsBatch(t *testing.T) {
+	t.Parallel()
+
+	e := newEngine(t, nil)
+	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "a"}))
+	ingest(t, e, mkBatch("web", rrec{ts: 100, body: "b"}))
+
+	got := fetchAll(t, e, fetch.Request{
+		Start: 0, End: 1 << 60,
+		SecondPass: func(b *fetch.Batch) bool {
+			col, _ := b.Column("body")
+
+			return len(col.Bytes) > 0 && bytes.Equal(col.Bytes[0], []byte("b"))
+		},
+	})
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"b"}, bodies(got[0]))
+}

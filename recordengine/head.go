@@ -1,4 +1,4 @@
-package logengine
+package recordengine
 
 import (
 	"github.com/oteldb/storage/index/postings"
@@ -14,10 +14,11 @@ var (
 	labelScopeVersion = []byte("otel.scope.version")
 )
 
-// head is the logs engine's in-memory write buffer: the identity index (symbols + series +
-// postings over stream labels) plus per-stream record buffers in arrival order (sorted on read).
-// It is not safe for concurrent use; the [Engine] holds the lock.
+// head is the engine's in-memory write buffer: the identity index (symbols + series + postings
+// over stream labels) plus per-stream full-column record buffers in arrival order (sorted on
+// read). Not safe for concurrent use; the [Engine] holds the lock.
 type head struct {
+	schema  *Schema
 	sym     *symbols.Table
 	series  *series.Index
 	post    *postings.MemPostings
@@ -25,8 +26,9 @@ type head struct {
 	newest  int64 // newest record timestamp, for the OOO window
 }
 
-func newHead() *head {
+func newHead(schema *Schema) *head {
 	return &head{
+		schema:  schema,
 		sym:     symbols.New(),
 		series:  series.New(),
 		post:    postings.NewMemPostings(),
@@ -34,9 +36,9 @@ func newHead() *head {
 	}
 }
 
-// ensureStream registers and indexes the stream on first sight and makes sure its record buffer
-// exists. materialize is called only when the stream identity is newly seen. It returns whether
-// the identity was newly registered (so the caller logs a stream record to the WAL).
+// ensureStream registers and indexes the stream on first sight and makes sure its (full-column)
+// record buffer exists. materialize is called only when the stream identity is newly seen. It
+// returns whether the identity was newly registered (so the caller logs a stream record to the WAL).
 func (h *head) ensureStream(id signal.SeriesID, materialize func() signal.Series) (isNew bool) {
 	if !h.series.Has(id) {
 		isNew = true
@@ -46,22 +48,23 @@ func (h *head) ensureStream(id signal.SeriesID, materialize func() signal.Series
 	}
 
 	if h.records[id] == nil {
-		h.records[id] = &recordCols{}
+		h.records[id] = newRecordCols(h.schema, 0, fullSel(h.schema))
 	}
 
 	return isNew
 }
 
-// appendRecord appends r to stream id's buffer (already ensured), rejecting it as out-of-order
-// when older than newest-oooWindow (oooWindow > 0). It returns whether the record was accepted.
+// appendRecord appends r to stream id's buffer (already ensured, or created on demand for the
+// replica apply path), rejecting it as out-of-order when older than newest-oooWindow
+// (oooWindow > 0). It returns whether the record was accepted.
 func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow int64) bool {
 	if h.newest != 0 && oooWindow > 0 && r.ts < h.newest-oooWindow {
 		return false
 	}
 
 	buf := h.records[id]
-	if buf == nil { // tolerate a registered-but-unbuffered stream (replica apply path)
-		buf = &recordCols{}
+	if buf == nil {
+		buf = newRecordCols(h.schema, 0, fullSel(h.schema))
 		h.records[id] = buf
 	}
 
@@ -74,8 +77,7 @@ func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow int64) bool {
 	return true
 }
 
-// registerStream records and indexes a stream identity without records (WAL replay / load, where
-// the stream record precedes its log records).
+// registerStream records and indexes a stream identity without records (WAL replay / load).
 func (h *head) registerStream(s signal.Series) {
 	id := s.Hash()
 	if !h.series.Has(id) {
@@ -91,15 +93,8 @@ func (h *head) replayRecords(id signal.SeriesID, recs []rec) {
 		return // stream record missing; ignore (defensive)
 	}
 
-	if h.records[id] == nil {
-		h.records[id] = &recordCols{}
-	}
-
 	for i := range recs {
-		h.records[id].appendClone(recs[i])
-		if recs[i].ts > h.newest {
-			h.newest = recs[i].ts
-		}
+		h.appendRecord(id, recs[i], 0)
 	}
 }
 
@@ -130,7 +125,7 @@ func (h *head) addLabel(id signal.SeriesID, name []byte, v signal.Value) {
 }
 
 // indexSorted / ensureIndexSorted let the engine perform the postings' one-time lazy sort under
-// the exclusive lock, so concurrent reads never trigger the in-place mutation (see Engine.Fetch).
+// the exclusive lock, so concurrent reads never trigger the in-place mutation.
 func (h *head) indexSorted() bool  { return h.post.Sorted() }
 func (h *head) ensureIndexSorted() { h.post.EnsureSorted() }
 
@@ -145,7 +140,7 @@ func (h *head) resolve(matchers []fetch.Matcher) []signal.SeriesID {
 	for i := range matchers {
 		nameID, ok := h.sym.Lookup(matchers[i].Name)
 		if !ok {
-			return nil // no stream carries this label
+			return nil
 		}
 
 		match := matchers[i].Match
@@ -168,13 +163,13 @@ func (h *head) resolve(matchers []fetch.Matcher) []signal.SeriesID {
 }
 
 func drain(p postings.Postings) []signal.SeriesID {
-	out, _ := postings.ToSlice(p) // memory postings never errors
+	out, _ := postings.ToSlice(p)
 
 	return out
 }
 
-// recordCount returns the number of records buffered for stream id (an upper bound on how many a
-// window fetch will append, used to pre-size the accumulator).
+// recordCount returns the number of records buffered for stream id (an upper bound used to
+// pre-size a fetch accumulator).
 func (h *head) recordCount(id signal.SeriesID) int {
 	if buf := h.records[id]; buf != nil {
 		return buf.len()
@@ -201,35 +196,17 @@ func (h *head) appendWindow(id signal.SeriesID, acc *recordCols, start, end int6
 // bounding a replica's head to the still-unflushed window. Each buffer is compacted in place.
 func (h *head) trimBelow(t int64) {
 	for _, buf := range h.records {
-		kept := buf.ts[:0]
-		keepIdx := make([]int, 0, len(buf.ts))
-
+		w := 0
 		for i := range buf.ts {
 			if buf.ts[i] > t {
-				keepIdx = append(keepIdx, i)
-				kept = append(kept, buf.ts[i])
+				if w != i {
+					buf.moveRow(i, w)
+				}
+
+				w++
 			}
 		}
 
-		buf.ts = kept
-		buf.observed = compact(buf.observed, keepIdx)
-		buf.severity = compact(buf.severity, keepIdx)
-		buf.flags = compact(buf.flags, keepIdx)
-		buf.dropped = compact(buf.dropped, keepIdx)
-		buf.sevText = compact(buf.sevText, keepIdx)
-		buf.body = compact(buf.body, keepIdx)
-		buf.traceID = compact(buf.traceID, keepIdx)
-		buf.spanID = compact(buf.spanID, keepIdx)
-		buf.attrs = compact(buf.attrs, keepIdx)
+		buf.truncate(w)
 	}
-}
-
-// compact rewrites s in place to keep only the rows in keepIdx (ascending).
-func compact[T any](s []T, keepIdx []int) []T {
-	out := s[:0]
-	for _, i := range keepIdx {
-		out = append(out, s[i])
-	}
-
-	return out
 }

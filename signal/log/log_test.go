@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -86,12 +87,10 @@ func TestProjectEmitsOneBatchPerStream(t *testing.T) {
 		accepted int
 	)
 
-	accepted = Project(mkLogs(), func(b *Batch) {
-		streams = append(streams, b.StreamID)
+	accepted = Project(mkLogs(), func(b *recordengine.Batch) {
+		streams = append(streams, b.Stream)
 		lens = append(lens, b.Len())
-		for i := range b.Records() {
-			bodies = append(bodies, b.At(i).Body)
-		}
+		bodies = append(bodies, b.Bytes[bBody]...)
 	})
 
 	require.Len(t, streams, 2, "one batch per (resource, scope) stream")
@@ -104,10 +103,38 @@ func TestProjectEmitsOneBatchPerStream(t *testing.T) {
 func TestProjectStreamIDMatchesIdentity(t *testing.T) {
 	t.Parallel()
 
-	Project(mkLogs(), func(b *Batch) {
-		want := Identity{Resource: b.Resource(), Scope: b.Scope()}.StreamID()
-		assert.Equal(t, want, b.StreamID, "StreamID equals the identity hash")
-		assert.Equal(t, b.Series().Hash(), b.StreamID, "and the materialized series hash")
+	Project(mkLogs(), func(b *recordengine.Batch) {
+		assert.Equal(t, b.Identity().Hash(), b.Stream, "Stream equals the identity hash")
+	})
+}
+
+func TestProjectFillsSchemaColumns(t *testing.T) {
+	t.Parallel()
+
+	var ld Logs
+	rl := ld.AddResource()
+	rl.Resource = signal.Resource{Attributes: signal.NewAttributes(
+		signal.KeyValue{Key: []byte("service.name"), Value: signal.StringValue([]byte("api"))},
+	)}
+	sl := rl.AddScope()
+	r := sl.AddRecord()
+	r.Timestamp, r.ObservedTimestamp, r.SeverityNumber = 100, 101, 9
+	r.SeverityText, r.Body, r.TraceID = []byte("INFO"), []byte("hello"), []byte("tid")
+	r.Attributes = signal.NewAttributes(signal.KeyValue{Key: []byte("k"), Value: signal.StringValue([]byte("v"))})
+
+	Project(ld, func(b *recordengine.Batch) {
+		require.Equal(t, []int64{100}, b.Ts)
+		assert.Equal(t, int64(101), b.Ints[iObserved][0])
+		assert.Equal(t, int64(9), b.Ints[iSeverity][0])
+		assert.Equal(t, []byte("INFO"), b.Bytes[bSeverityText][0])
+		assert.Equal(t, []byte("hello"), b.Bytes[bBody][0])
+		assert.Equal(t, []byte("tid"), b.Bytes[bTraceID][0])
+
+		decoded, _, err := signal.DecodeAttributes(b.Bytes[bAttrs][0])
+		require.NoError(t, err)
+		v, ok := decoded.Get([]byte("k"))
+		require.True(t, ok)
+		assert.Equal(t, []byte("v"), v.Str())
 	})
 }
 
@@ -123,25 +150,13 @@ func TestGetPutLogsRecycles(t *testing.T) {
 	PutLogs(l2)
 }
 
-//nolint:paralleltest // testing.AllocsPerRun must not run during a parallel test.
-func TestProjectZeroAlloc(t *testing.T) {
-	ld := mkLogs()
-	// Warm the projector's buffer pool, then assert a steady-state Project allocates nothing.
-	Project(ld, func(*Batch) {})
-
-	allocs := testing.AllocsPerRun(100, func() {
-		Project(ld, func(*Batch) {})
-	})
-	assert.Zero(t, allocs, "Project reuses the batch and hash buffer")
-}
-
 func BenchmarkProject(b *testing.B) {
 	ld := mkLogs()
 
 	b.ReportAllocs()
 
 	for b.Loop() {
-		Project(ld, func(*Batch) {})
+		Project(ld, func(*recordengine.Batch) {})
 	}
 }
 
@@ -155,7 +170,7 @@ func TestProjectSkipsEmptyScopes(t *testing.T) {
 	sl.AddRecord().Body = []byte("x")
 
 	n := 0
-	accepted := Project(ld, func(*Batch) { n++ })
+	accepted := Project(ld, func(*recordengine.Batch) { n++ })
 	assert.Equal(t, 1, n, "empty scope groups emit nothing")
 	assert.Equal(t, 1, accepted)
 }

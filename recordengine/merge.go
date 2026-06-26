@@ -1,4 +1,4 @@
-package logengine
+package recordengine
 
 import (
 	"context"
@@ -9,10 +9,8 @@ import (
 
 // Merge compacts every flushed part into a single new part, dropping records older than retainFrom
 // (retention; retainFrom ≤ 0 disables it). No-op when there is nothing to gain — fewer than two
-// parts and no retention cutoff. Source parts are deleted after the new part is durably written.
-//
-// Unlike metrics, log records are append-only: merge concatenates a stream's records across parts
-// (no value dedup) and re-sorts them by timestamp.
+// parts and no retention cutoff. Records are append-only: a stream's records are concatenated
+// across parts (no value dedup) and re-sorted by timestamp.
 func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -41,11 +39,11 @@ func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) error {
 		e.parts = nil // retention dropped every record
 	} else {
 		prefix := e.partPrefix(e.nextSeq)
-		if err := writePart(ctx, e.cfg.Backend, prefix, f); err != nil {
+		if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f); err != nil {
 			return err
 		}
 
-		p, err := openPart(ctx, e.cfg.Backend, prefix)
+		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix)
 		if err != nil {
 			return err
 		}
@@ -55,8 +53,6 @@ func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) error {
 		e.nextSeq++
 	}
 
-	// Commit the new part set before deleting the sources (crash-safe: never reference a deleted
-	// part; orphan objects are harmless and reclaimed by a later merge).
 	if err := e.updateIndexLocked(ctx); err != nil {
 		return err
 	}
@@ -71,7 +67,7 @@ func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) error {
 }
 
 // compactParts concatenates every part's records per stream (within [start, maxInt64], applying
-// retention), returning the combined columns sorted by (stream, ts). Empty when no record survives.
+// retention), returning the combined full columns sorted by (stream, ts). Empty when none survive.
 func (e *Engine) compactParts(ctx context.Context, start int64) (*flushColumns, error) {
 	idSet := make(map[signal.SeriesID]struct{})
 	for _, p := range e.parts {
@@ -87,10 +83,10 @@ func (e *Engine) compactParts(ctx context.Context, start int64) (*flushColumns, 
 
 	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
 
-	f := &flushColumns{cols: recordCols{sel: allCols}} // a merge rewrites every column
+	f := &flushColumns{cols: newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))}
 
 	for _, id := range ids {
-		acc := &recordCols{sel: allCols}
+		acc := newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
 
 		for _, p := range e.parts {
 			if err := p.appendWindow(ctx, id, acc, start, maxInt64); err != nil {

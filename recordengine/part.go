@@ -1,4 +1,4 @@
-package logengine
+package recordengine
 
 import (
 	"context"
@@ -16,18 +16,18 @@ func u128ToID(u chunk.U128) signal.SeriesID  { return signal.SeriesID{Hi: u.Hi, 
 // rowRange is the half-open row span [start, end) a stream occupies in a part.
 type rowRange struct{ start, end int }
 
-// part is a flushed, immutable log part: the lazy on-backend [block.PartReader] plus an in-memory
-// StreamID → row-range index. Rows are sorted by (stream, ts), so every stream occupies one
-// contiguous run; the index is one entry per stream, built by scanning the stream column once.
+// part is a flushed, immutable part: the lazy on-backend [block.PartReader], an in-memory
+// StreamID → row-range index (rows are sorted by (stream, ts), so each stream is one contiguous
+// run), and the per-column blooms for predicate pruning.
 type part struct {
-	reader    *block.PartReader
-	prefix    string
-	ranges    map[signal.SeriesID]rowRange
-	bodyBloom *bloom.Filter // body token bloom for full-text pruning; nil ⇒ always scan
-	attrBloom *bloom.Filter // per-record attribute key=value bloom for equality pruning; nil ⇒ scan
+	schema *Schema
+	reader *block.PartReader
+	prefix string
+	ranges map[signal.SeriesID]rowRange
+	blooms map[string]*bloom.Filter // column name → its bloom (FullText/Attrs/Equality); absent ⇒ scan
 
-	// minTime, maxTime are the inclusive unix-ns record bounds of the part (from the flush/merge
-	// columns when written, from the bucket index when reconstructed), for time pruning.
+	// minTime, maxTime are the inclusive unix-ns record bounds of the part (from the columns when
+	// written, from the bucket index when reconstructed), for time pruning.
 	minTime, maxTime int64
 }
 
@@ -47,8 +47,8 @@ func deletePart(ctx context.Context, b backend.Backend, prefix string) error {
 	return nil
 }
 
-// openPart opens the part at prefix and builds its StreamID → row-range index.
-func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, error) {
+// openPart opens the part at prefix and builds its StreamID → row-range index and bloom set.
+func openPart(ctx context.Context, b backend.Backend, schema *Schema, prefix string) (*part, error) {
 	r, err := block.OpenPart(ctx, b, prefix)
 	if err != nil {
 		return nil, err
@@ -76,17 +76,12 @@ func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, err
 		i = j
 	}
 
-	bf, err := loadBodyBloom(ctx, b, prefix)
+	blooms, err := loadBlooms(ctx, b, schema, prefix)
 	if err != nil {
 		return nil, err
 	}
 
-	af, err := loadAttrBloom(ctx, b, prefix)
-	if err != nil {
-		return nil, err
-	}
-
-	return &part{reader: r, prefix: prefix, ranges: ranges, bodyBloom: bf, attrBloom: af}, nil
+	return &part{schema: schema, reader: r, prefix: prefix, ranges: ranges, blooms: blooms}, nil
 }
 
 // holdsAny reports whether the part carries any of the requested streams.
@@ -101,15 +96,14 @@ func (p *part) holdsAny(ids []signal.SeriesID) bool {
 }
 
 // appendWindow appends stream id's records whose timestamp is in [start, end] to acc, decoding the
-// full column set (used by merge, which rewrites every column). It is a no-op if the part does not
-// hold the stream.
+// full column set (used by merge, which rewrites every column). No-op if the part lacks the stream.
 func (p *part) appendWindow(ctx context.Context, id signal.SeriesID, acc *recordCols, start, end int64) error {
 	rng, ok := p.ranges[id]
 	if !ok {
 		return nil
 	}
 
-	cols, err := p.readCols(ctx, allCols)
+	cols, err := p.readCols(ctx, fullSel(p.schema))
 	if err != nil {
 		return err
 	}
@@ -123,50 +117,27 @@ func (p *part) appendWindow(ctx context.Context, id signal.SeriesID, acc *record
 	return nil
 }
 
-// readCols decodes the part's timestamp column plus the columns selected by sel into a recordCols
-// (rows aligned across the decoded columns; unselected columns stay nil — lazy decode). The
-// returned byte slices are freshly decoded (owned by the caller).
-func (p *part) readCols(ctx context.Context, sel colSet) (*recordCols, error) {
-	c := &recordCols{sel: sel}
+// readCols decodes the part's timestamp column plus the schema columns selected by sel (unselected
+// stay nil — lazy decode). Returned byte slices are freshly decoded (owned by the caller).
+func (p *part) readCols(ctx context.Context, sel colSel) (*recordCols, error) {
+	c := &recordCols{schema: p.schema, sel: sel, ints: make([][]int64, p.schema.numInts()), bytes: make([][][]byte, p.schema.numBytes())}
 
 	var err error
-
 	if c.ts, err = p.readInt64(ctx, colTs); err != nil {
 		return nil, err
 	}
 
-	ints := []struct {
-		on  bool
-		dst *[]int64
-		col string
-	}{
-		{sel.observed, &c.observed, colObserved},
-		{sel.severity, &c.severity, colSeverity},
-		{sel.flags, &c.flags, colFlags},
-		{sel.dropped, &c.dropped, colDropped},
-	}
-	for _, f := range ints {
-		if f.on {
-			if *f.dst, err = p.readInt64(ctx, f.col); err != nil {
+	for k := range c.ints {
+		if sel.ints[k] {
+			if c.ints[k], err = p.readInt64(ctx, p.schema.intColumn(k).Name); err != nil {
 				return nil, err
 			}
 		}
 	}
 
-	byteCols := []struct {
-		on  bool
-		dst *[][]byte
-		col string
-	}{
-		{sel.sevText, &c.sevText, colSevText},
-		{sel.body, &c.body, colBody},
-		{sel.traceID, &c.traceID, colTraceID},
-		{sel.spanID, &c.spanID, colSpanID},
-		{sel.attrs, &c.attrs, colAttrs},
-	}
-	for _, f := range byteCols {
-		if f.on {
-			if *f.dst, err = p.readBytes(ctx, f.col); err != nil {
+	for k := range c.bytes {
+		if sel.bytes[k] {
+			if c.bytes[k], err = p.readBytes(ctx, p.schema.byteColumn(k).Name); err != nil {
 				return nil, err
 			}
 		}

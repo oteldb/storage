@@ -3,81 +3,84 @@ package log
 import (
 	"sync"
 
+	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
 )
 
-// Identity is a log stream's identity: its [signal.Resource] and the [signal.Scope] that produced
-// it. Unlike a metric series, a stream carries no data-point attributes — the per-record
-// attributes vary within the stream and are stored as a column, not folded into identity. Two
-// streams with equal resource+scope are the same stream (and the same [signal.SeriesID]).
-type Identity struct {
-	Resource signal.Resource
-	Scope    signal.Scope
+// Column names of the logs schema (the per-record columns; the primary timestamp and the stream id
+// are implicit in the record engine).
+const (
+	ColObserved     = "observed"
+	ColSeverity     = "severity"
+	ColFlags        = "flags"
+	ColDropped      = "dropped"
+	ColSeverityText = "severity_text"
+	ColBody         = "body"
+	ColTraceID      = "trace_id"
+	ColSpanID       = "span_id"
+	ColAttrs        = "attrs"
+)
+
+// Schema is the logs vertical's record-engine column schema: four small int columns, the body
+// (full-text bloom), the trace/span ids, severity text, and the serialized per-record attributes
+// (attribute bloom). The primary timestamp (the record's event time) is the implicit sort key.
+var Schema = recordengine.NewSchema(
+	recordengine.Column{Name: ColObserved, Kind: recordengine.KindInt64, Codec: chunk.CodecT64},
+	recordengine.Column{Name: ColSeverity, Kind: recordengine.KindInt64, Codec: chunk.CodecT64},
+	recordengine.Column{Name: ColFlags, Kind: recordengine.KindInt64, Codec: chunk.CodecT64},
+	recordengine.Column{Name: ColDropped, Kind: recordengine.KindInt64, Codec: chunk.CodecT64},
+	recordengine.Column{Name: ColSeverityText, Kind: recordengine.KindBytes, Codec: chunk.CodecDict},
+	recordengine.Column{Name: ColBody, Kind: recordengine.KindBytes, Codec: chunk.CodecDict, Bloom: recordengine.BloomFullText},
+	recordengine.Column{Name: ColTraceID, Kind: recordengine.KindBytes, Codec: chunk.CodecDict},
+	recordengine.Column{Name: ColSpanID, Kind: recordengine.KindBytes, Codec: chunk.CodecDict},
+	recordengine.Column{Name: ColAttrs, Kind: recordengine.KindBytes, Codec: chunk.CodecDict, Bloom: recordengine.BloomAttrs},
+)
+
+// Schema int/byte column indices, in the declaration order above (used to fill the engine batch).
+const (
+	iObserved = iota
+	iSeverity
+	iFlags
+	iDropped
+)
+
+const (
+	bSeverityText = iota
+	bBody
+	bTraceID
+	bSpanID
+	bAttrs
+)
+
+// projector holds the reusable per-stream column buffers and hash scratch so a steady-state
+// [Project] allocates only the per-record attribute blobs (which the head must own).
+type projector struct {
+	b     recordengine.Batch
+	hash  []byte
+	res   signal.Resource
+	scope signal.Scope
 }
 
-// ToSeries returns the stream's [signal.Series] — the value stored, indexed (resource attributes
-// and scope name/version become queryable labels), and returned in fetch batches. Its data-point
-// attributes are empty.
-func (id Identity) ToSeries() signal.Series {
-	return signal.Series{Resource: id.Resource, Scope: id.Scope}
-}
+var projectorPool = sync.Pool{New: func() any {
+	p := &projector{}
+	p.b.Ints = make([][]int64, 4)
+	p.b.Bytes = make([][][]byte, 5)
 
-// StreamID is the content-addressed id of the stream identity ([ToSeries] hashed).
-func (id Identity) StreamID() signal.SeriesID { return id.ToSeries().Hash() }
+	return p
+}}
 
-// Batch is the projection of one log stream: its [signal.SeriesID], the identity needed to
-// materialize a full [signal.Series] lazily (only for a stream the engine has not seen), and the
-// stream's records (aliasing the source [Logs]). Emitting a whole stream at once lets the engine
-// take its lock and register the stream once, then append every record under it.
-//
-// A Batch is reused across streams within one [Project] pass: its fields and the data they alias
-// are valid only for the duration of the emit call. Do not retain it.
-type Batch struct {
-	StreamID signal.SeriesID
-	base     Identity
-	records  []Record // the stream's records (aliases the source Logs)
-	buf      []byte   // reused stream-id hash-input scratch (persists via the pool)
-}
-
-var batchPool = sync.Pool{New: func() any { return &Batch{} }}
-
-// Len returns the number of records in the batch.
-func (b *Batch) Len() int { return len(b.records) }
-
-// Resource is the batch's source resource (for tenant routing).
-func (b *Batch) Resource() signal.Resource { return b.base.Resource }
-
-// Scope is the batch's source scope (for tenant routing).
-func (b *Batch) Scope() signal.Scope { return b.base.Scope }
-
-// Series materializes the stream's full [signal.Series] (resource+scope). It is the lazy
-// materializer the engine calls only when registering a newly-seen stream.
-func (b *Batch) Series() signal.Series { return b.base.ToSeries() }
-
-// At returns the i-th record. The returned value aliases the source batch (zero-copy).
-func (b *Batch) At(i int) Record { return b.records[i] }
-
-// Records returns the batch's records (aliasing the source). Read-only.
-func (b *Batch) Records() []Record { return b.records }
-
-// Project iterates a [Logs] batch and calls emit once per stream (each Resource+Scope group) with
-// a [Batch] of that stream's records. It returns how many records were emitted. Every record in a
-// [Logs] batch is well-formed by construction, so projection rejects nothing; out-of-order
-// rejection is the engine's concern downstream.
-//
-// The stream id is computed without per-record work: it is the resource+scope identity hashed
-// once per group into the batch's reused buffer, so a steady-state [Project] allocates nothing.
-func Project(ld Logs, emit func(*Batch)) (accepted int) {
-	b, _ := batchPool.Get().(*Batch)
-	defer func() {
-		b.base = Identity{}
-		b.records = nil
-		batchPool.Put(b) // keeps b.buf for the next pass
-	}()
+// Project iterates a [Logs] batch and calls emit once per stream (each Resource+Scope group) with a
+// [recordengine.Batch] of that stream's records laid out in the logs [Schema]'s column order. It
+// returns how many records were emitted. The batch and its column buffers are reused across emit
+// calls — do not retain them.
+func Project(ld Logs, emit func(*recordengine.Batch)) (accepted int) {
+	p, _ := projectorPool.Get().(*projector)
+	defer projectorPool.Put(p)
 
 	for ri := range ld.Resources {
 		rl := &ld.Resources[ri]
-		b.base.Resource = rl.Resource
+		p.res = rl.Resource
 
 		for si := range rl.Scopes {
 			sl := &rl.Scopes[si]
@@ -85,14 +88,44 @@ func Project(ld Logs, emit func(*Batch)) (accepted int) {
 				continue
 			}
 
-			b.base.Scope = sl.Scope
-			b.buf = b.base.ToSeries().AppendHashInput(b.buf[:0])
-			b.StreamID = signal.HashBytes(b.buf)
-			b.records = sl.Records
-			emit(b)
+			p.scope = sl.Scope
+			p.fill(sl.Records)
+			emit(&p.b)
 			accepted += len(sl.Records)
 		}
 	}
 
 	return accepted
+}
+
+// fill resets the reusable batch and populates it from the stream's records.
+func (p *projector) fill(recs []Record) {
+	p.hash = (signal.Series{Resource: p.res, Scope: p.scope}).AppendHashInput(p.hash[:0])
+	p.b.Stream = signal.HashBytes(p.hash)
+
+	res, scope := p.res, p.scope
+	p.b.Identity = func() signal.Series { return signal.Series{Resource: res, Scope: scope} }
+
+	p.b.Ts = p.b.Ts[:0]
+	for k := range p.b.Ints {
+		p.b.Ints[k] = p.b.Ints[k][:0]
+	}
+
+	for k := range p.b.Bytes {
+		p.b.Bytes[k] = p.b.Bytes[k][:0]
+	}
+
+	for i := range recs {
+		r := &recs[i]
+		p.b.Ts = append(p.b.Ts, r.Timestamp)
+		p.b.Ints[iObserved] = append(p.b.Ints[iObserved], r.ObservedTimestamp)
+		p.b.Ints[iSeverity] = append(p.b.Ints[iSeverity], int64(r.SeverityNumber))
+		p.b.Ints[iFlags] = append(p.b.Ints[iFlags], int64(r.Flags))
+		p.b.Ints[iDropped] = append(p.b.Ints[iDropped], int64(r.Dropped))
+		p.b.Bytes[bSeverityText] = append(p.b.Bytes[bSeverityText], r.SeverityText)
+		p.b.Bytes[bBody] = append(p.b.Bytes[bBody], r.Body)
+		p.b.Bytes[bTraceID] = append(p.b.Bytes[bTraceID], r.TraceID)
+		p.b.Bytes[bSpanID] = append(p.b.Bytes[bSpanID], r.SpanID)
+		p.b.Bytes[bAttrs] = append(p.b.Bytes[bAttrs], r.Attributes.AppendHashInput(nil))
+	}
 }
