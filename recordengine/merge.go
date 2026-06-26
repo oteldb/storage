@@ -157,6 +157,23 @@ func (e *Engine) Close(ctx context.Context) error {
 	return nil
 }
 
+// CloseWAL closes the engine's open WAL segment file handle without flushing the head or
+// checkpointing — modeling a process crash, where the OS reclaims open descriptors but the on-disk
+// WAL segments survive for replay. The head is left as-is (and lost, as a crash would lose it). A
+// crash-recovery test uses this to release the file handle so the WAL directory can be removed even
+// on platforms that refuse to delete a file held open by a live process (Windows). No-op without a
+// WAL.
+func (e *Engine) CloseWAL() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.cfg.WAL != nil {
+		return e.cfg.WAL.Close()
+	}
+
+	return nil
+}
+
 // SyncWAL fsyncs the engine's WAL, if any (the background WALSyncInterval path). No-op without a WAL.
 func (e *Engine) SyncWAL() error {
 	e.mu.RLock()

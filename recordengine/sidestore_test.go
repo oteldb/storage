@@ -189,6 +189,7 @@ func TestSideStoreWALReplay(t *testing.T) {
 
 	w, err := wal.Create(dir, 0)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() }) // release the segment handle so the temp WAL dir is removable (Windows)
 
 	e := recordengine.New(recordengine.Config{Schema: testSchema, WAL: w, SideStore: newFakeSide()})
 

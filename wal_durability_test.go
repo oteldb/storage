@@ -28,6 +28,31 @@ func reopenDurable(t *testing.T, dataDir, walDir string) *Storage {
 	return s
 }
 
+// crash models a process crash for a WAL-backed store: it releases every engine's open WAL file
+// handle (as the OS does on process death) WITHOUT flushing or checkpointing, so the on-disk WAL
+// segments survive for a reopen to replay. It is also what lets the temp WAL dir be removed on
+// Windows, which refuses to delete a file held open by a live process — abandoning the store (no
+// Close) would otherwise leak the open segment handle into t.TempDir cleanup.
+func crash(t *testing.T, s *Storage) {
+	t.Helper()
+
+	for _, e := range s.engineSnapshot() {
+		require.NoError(t, e.CloseWAL())
+	}
+
+	for _, e := range s.logEngineSnapshot() {
+		require.NoError(t, e.CloseWAL())
+	}
+
+	for _, e := range s.traceEngineSnapshot() {
+		require.NoError(t, e.CloseWAL())
+	}
+
+	for _, e := range s.profileEngineSnapshot() {
+		require.NoError(t, e.CloseWAL())
+	}
+}
+
 // TestWALRecoversUnflushedMetrics writes metrics to a WAL-backed durable store, abandons it (no
 // flush, no Close — a crash), and verifies a reopened store replays the WAL to restore the
 // unflushed head.
@@ -39,7 +64,9 @@ func TestWALRecoversUnflushedMetrics(t *testing.T) {
 	s1 := reopenDurable(t, dataDir, walDir)
 	_, err := s1.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
 	require.NoError(t, err)
-	// Simulate a crash: do not Close (which would flush + checkpoint the WAL).
+	// Simulate a crash: do not flush or checkpoint, just release the open WAL handles (as the OS
+	// would on process death). The unflushed head is lost; the WAL segments survive for replay.
+	crash(t, s1)
 
 	s2 := reopenDurable(t, dataDir, walDir)
 	t.Cleanup(func() { _ = s2.Close(ctx) })
@@ -64,7 +91,8 @@ func TestWALRecoversUnflushedProfiles(t *testing.T) {
 	s1 := reopenDurable(t, dataDir, walDir)
 	_, err := s1.WriteProfiles(ctx, profileBatch("api", 1000, sampleSpec{"cpu", "nanoseconds", 42}))
 	require.NoError(t, err)
-	// Crash: no Close.
+	// Crash: release WAL handles without flush/checkpoint.
+	crash(t, s1)
 
 	s2 := reopenDurable(t, dataDir, walDir)
 	t.Cleanup(func() { _ = s2.Close(ctx) })
@@ -99,7 +127,9 @@ func TestWALSyncAlwaysRecovers(t *testing.T) {
 	require.NoError(t, err)
 	_, err = s1.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100}, []float64{1}))
 	require.NoError(t, err)
-	// Crash: no Close (WALSyncAlways starts no background goroutine, so nothing leaks).
+	// Crash: release WAL handles without flush/checkpoint (WALSyncAlways starts no background
+	// goroutine, so nothing else leaks).
+	crash(t, s1)
 
 	s2 := reopenDurable(t, dataDir, walDir)
 	t.Cleanup(func() { _ = s2.Close(ctx) })

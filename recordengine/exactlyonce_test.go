@@ -46,6 +46,7 @@ func TestWALExactlyOnceRecovery(t *testing.T) {
 
 	w, err := wal.Create(walDir, 0)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() }) // release the segment handle so the temp WAL dir is removable (Windows)
 	e := recordengine.New(recordengine.Config{Schema: testSchema, Backend: be, Prefix: "t/recs", WAL: w})
 
 	// B1 (generation 1) → WAL, then flush it to a part (watermark 1, segment checkpointed/deleted).
@@ -67,6 +68,7 @@ func TestWALExactlyOnceRecovery(t *testing.T) {
 	// Recover into a fresh engine over the same backend + WAL dir.
 	w2, err := wal.Create(walDir, 0)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = w2.Close() })
 	e2 := recordengine.New(recordengine.Config{Schema: testSchema, Backend: be, Prefix: "t/recs", WAL: w2})
 	require.NoError(t, e2.LoadParts(ctx)) // recovers the watermark (1)
 	require.NoError(t, e2.Replay(walDir)) // skips generation ≤ 1, replays generation 2
