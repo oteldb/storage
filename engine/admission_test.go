@@ -22,7 +22,7 @@ func appendBatch(t *testing.T, e *engine.Engine, limits engine.AppendLimits, ser
 		ids[i] = series[i].Hash()
 	}
 
-	res, err := e.AppendBatch(ids, ts, vals, func(i int) signal.Series { return series[i] }, limits)
+	res, err := e.AppendBatch(ids, ts, vals, nil, func(i int) signal.Series { return series[i] }, limits)
 	require.NoError(t, err)
 
 	return res

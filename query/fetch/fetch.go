@@ -105,9 +105,27 @@ type Batch struct {
 	Timestamps []int64
 	Values     []float64
 
+	// ScaleFactors carries each sample's lossy-sampling weight (metrics only): a kept sample
+	// with ScaleFactors[i] = N "represents" N original samples that budgeted sampling dropped
+	// (DESIGN §8a). It is nil when no sampling occurred (every weight is 1), so the common path
+	// is unaffected; when non-nil its length matches Values. The storage layer only *carries* the
+	// weight — an embedder's aggregation multiplies it back into count/sum/rate to stay unbiased
+	// (a gauge read ignores it). Use [Batch.ScaleFactor] to read it with the nil default.
+	ScaleFactors []float64
+
 	// Columns are the materialized per-record columns (logs); nil for metrics. Each column's
 	// length matches Timestamps. The named layout is the engine's (e.g. severity, body, attrs).
 	Columns []NamedColumn
+}
+
+// ScaleFactor returns sample i's lossy-sampling weight, defaulting to 1 when no sampling occurred
+// (ScaleFactors is nil). It is the safe accessor for consumers that honor the weight.
+func (b *Batch) ScaleFactor(i int) float64 {
+	if b.ScaleFactors == nil {
+		return 1
+	}
+
+	return b.ScaleFactors[i]
 }
 
 // NamedColumn is one materialized column of a log [Batch]: its name and exactly one populated

@@ -249,10 +249,11 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted
 	// a metric, so points arrive in tenant-contiguous runs. Cache the last resolution to skip
 	// the locked engine-map lookup and policy resolve per metric.
 	var (
-		lastTenant signal.TenantID
-		lastEng    *engine.Engine
-		lastAdmit  *tenantAdmission
-		lastLimits tenant.Limits
+		lastTenant   signal.TenantID
+		lastEng      *engine.Engine
+		lastAdmit    *tenantAdmission
+		lastLimits   tenant.Limits
+		lastSampling int64
 	)
 
 	var firstErr error
@@ -271,9 +272,11 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted
 				return
 			}
 
+			pol := s.tenant.Resolve(s.normalizeTenant(tid))
 			lastTenant, lastEng = tid, eng
 			lastAdmit = s.admissionFor(tid)
-			lastLimits = s.tenant.Resolve(s.normalizeTenant(tid)).Limits
+			lastLimits = pol.Limits
+			lastSampling = pol.Sampling.MaxRowsPerSecond
 		}
 
 		// Admission stage (between tenant resolution and the engine, DESIGN §8a): the ingest-rate
@@ -286,7 +289,41 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted
 			return
 		}
 
-		res, err := lastEng.AppendBatch(b.IDs, b.Ts, b.Values, b.Series, engine.AppendLimits{
+		// Budgeted (lossy) sampling: keep a representative subset and weight each kept sample with a
+		// scale factor so the embedder's count/sum/rate stays unbiased. Under budget this window the
+		// sampler returns no weights and the batch passes through unchanged (no scale-factor column).
+		ids, tss, vals, sf := b.IDs, b.Ts, b.Values, []float64(nil)
+		mat := b.Series
+
+		if weights, active := lastAdmit.sample(lastSampling, s.now(), b.IDs, b.Ts); active {
+			fids := make([]signal.SeriesID, 0, len(weights))
+			fts := make([]int64, 0, len(weights))
+			fvals := make([]float64, 0, len(weights))
+			fsf := make([]float64, 0, len(weights))
+			kept := make([]int, 0, len(weights))
+
+			var dropped int64
+
+			for i, w := range weights {
+				if w == 0 {
+					dropped++
+
+					continue
+				}
+
+				fids = append(fids, b.IDs[i])
+				fts = append(fts, b.Ts[i])
+				fvals = append(fvals, b.Values[i])
+				fsf = append(fsf, w)
+				kept = append(kept, i)
+			}
+
+			ids, tss, vals, sf = fids, fts, fvals, fsf
+			mat = func(j int) signal.Series { return b.Series(kept[j]) }
+			lastAdmit.recordSampledDropped(dropped)
+		}
+
+		res, err := lastEng.AppendBatch(ids, tss, vals, sf, mat, engine.AppendLimits{
 			MaxSeries:        lastLimits.MaxSeries,
 			MaxInFlightBytes: lastLimits.MaxInFlightBytes,
 		})

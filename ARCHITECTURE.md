@@ -371,7 +371,9 @@ this caller-owned-synchronization upgrade.
   by the supplied tiers before deleting the source parts. A `DownsampleTier{Before, Interval, Agg}`
   rolls every sample older than `Before` into one representative per absolute `Interval`-aligned
   bucket, combined by a `signal.Aggregation` (last/first/min/max/sum/avg/count); a sample is assigned
-  the coarsest tier it qualifies for, and younger samples stay raw. Both `Before` and `retainFrom`
+  the coarsest tier it qualifies for, and younger samples stay raw. Both the rollup and the
+  compaction are **weight-aware** (the lossy-sampling scale factor, §3k): a sampled series stays
+  unbiased through a merge. Both `Before` and `retainFrom`
   are absolute timestamps (not clock reads), so the whole merge is deterministic — the caller
   ([storage.Storage]) resolves the tenant's `tenant.Downsample` policy against one `now` per pass.
   Bucket alignment is to the absolute grid (not ingest time), so the rollup of a range is independent
@@ -707,13 +709,31 @@ index/head/WAL/flush work; the engine core stays policy-agnostic (it sees only n
 `engine.AppendBatch` returns an `AppendResult` breaking accepted/rejected down by reason
 (`RejectedOOO`/`RejectedCardinality`/`RejectedBytes`), which the facade folds — together with rate
 rejections — into the `Accepted` reply and into per-tenant **meta-metrics** (`AdmissionStats`,
-exposed by `Storage.AdmissionStats(tenant)`: accepted plus rejected-by-reason), so an operator can
-see which valve tripped. Scope today: **metrics, single-node** ingest. Not yet built (the lossy and
-distributed half of §8a): **budgeted sampling with a query-time scale factor** (the StatsHouse-style
-unbiased-aggregate path — needs SF threaded through the fetch contract), the **cardinality budget
-with hysteresis / overflow routing**, the clustered **central→edge budget feedback**, and admission
-on the **record signals** and the **clustered write path** (the primary applies only the OOO check
-today). `MaxPartSize` is also not yet enforced.
+exposed by `Storage.AdmissionStats(tenant)`: accepted plus rejected-by-reason plus
+`SampledDropped`), so an operator can see which valve tripped.
+
+**Budgeted (lossy) sampling — the StatsHouse-style unbiased path** (`Limits` is the lossless floor;
+this is the lossy ceiling). Under `Sampling.MaxRowsPerSecond`, when a tenant exceeds the budget the
+facade **keeps a representative subset rather than rejecting** and tags each kept sample with a
+**scale factor** so an embedder's count/sum/rate stays unbiased. The sampler (`tenantAdmission.sample`)
+is **deterministic by (series, ts)** — the same point is consistently kept or dropped — and the
+scale factor **adapts each 1-second window** from the prior window's observed rate, so the kept rate
+tracks the budget. Sampled-out points count as **accepted** (the producer must not retry — a kept
+peer's weight represents them) and are tracked as `SampledDropped`. The scale factor rides the whole
+metric path: a 4th **`sf` part column** (`engine`, written only when sampling occurred, so an
+unsampled part keeps its original three-column layout and a missing column reads as weight 1),
+carried through flush, the one merge engine (compaction **and** downsampling are weight-aware — Sum
+emits Σ(value·sf), Count emits Σsf, the rest carry the representative's weight), and surfaced on the
+read seam as **`fetch.Batch.ScaleFactors`** (nil when unsampled;
+`Batch.ScaleFactor(i)` reads it with the default-1). The library only *carries* the weight; honoring
+it in aggregation is the embedder's job (a gauge read ignores it).
+
+Scope today: **metrics, single-node** ingest. Not yet built (the rest of §8a): the **cardinality
+budget with hysteresis / `__overflow__` routing** (the cap is a hard reject, not yet a soft budget),
+the clustered **central→edge budget feedback**, **WAL persistence of the scale factor** (so a crash
+recovers unflushed *sampled* data as weight 1 — a narrow window), and admission on the **record
+signals** and the **clustered write path** (the primary applies only the OOO check today).
+`MaxPartSize` is also not yet enforced.
 
 ---
 
@@ -792,8 +812,9 @@ query-language path stays in the embedder. The `Write*` methods take the library
   vocabulary for merge-time downsampling, see §3f), and the typed identity primitives
   (`Value`, `KeyValue`, `Attributes`, the 128-bit `SeriesID`, and the attribute binary
   codec) — see §3c.
-- **`tenant`** — policy model: `Limits`, `Retention`, `Downsample` (a list of
-  `DownsampleTier{After, Interval, Agg}` rollup bands, applied at merge time — §3f), and the
+- **`tenant`** — policy model: `Limits` (admission valves — §3k), `Retention`, `Downsample` (a list
+  of `DownsampleTier{After, Interval, Agg}` rollup bands, applied at merge time — §3f), `Sampling`
+  (the lossy budget — §3k), and the
   composed `Policy`, resolved per tenant id through a `Resolver` (`ResolverFunc` adapter;
   `Default()` returns an empty-policy resolver). Multi-tenancy, retention, and
   downsampling are consumer-supplied callbacks keyed by tenant id.
@@ -823,7 +844,8 @@ These hold in the implemented code and must be preserved by changes:
   `{prefix}/manifest|marks|c/{i}` key layout), the **attribute hash/binary encoding** (the
   SeriesID pre-image), the **symbol table** (`OTSY`), the **WAL record framing** (series, sample,
   records, and side frames), the **metric part column layout** (`[series:int128, ts:int64,
-  value:float64]` sorted by `(series, ts)`), and the **profile symbol-store table** (`OTSP`, the
+  value:float64]` sorted by `(series, ts)`, plus an **optional 4th `sf:float64`** scale-factor column
+  present only when lossy sampling occurred — §3k), and the **profile symbol-store table** (`OTSP`, the
   content-addressed side-store sidecars) are all persisted/wire-stable. Changing any of
   them is an architectural change (golden tests guard formats; bump the version and update
   this file too).
@@ -853,7 +875,7 @@ signal/               typed Attributes/Value, Resource/Scope/Series identity, 12
   signal/trace        []byte-based OTLP-shaped Traces ingest batch (resettable/pooled) + span schema + projection (nested-set, events/links) [implemented]
   signal/profile      []byte-based OTLP-shaped Profiles ingest batch + sample schema (type folded into identity) + projection + content-addressed symbol store (SideStore) + stack Resolver [implemented]
 otlp/pdataconv        optional OTel-Go bridge: pmetric.Metrics → metric.Metrics (only package importing pdata) [implemented for metrics]
-tenant/               Limits/Retention/Downsample/Policy, Resolver                     [implemented]
+tenant/               Limits/Retention/Downsample/Sampling/Policy, Resolver             [implemented]
 backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + memory (root) [implemented]
   backend/file        directory-tree backend; atomic write + exclusive PutIfAbsent (os.Link) [implemented]
   backend/s3          object-store-native backend over ObjectStore + aws-sdk-go-v2 adapter   [implemented; in-process go-faster/fs S3 integration test]

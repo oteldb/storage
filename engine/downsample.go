@@ -44,17 +44,22 @@ func downsampleApplies(tiers []DownsampleTier, minTime int64) bool {
 	return false
 }
 
-// downsample rolls up (ts, values) — sorted ascending by ts with no duplicate timestamps, as
+// downsample rolls up (ts, values, sf) — sorted ascending by ts with no duplicate timestamps, as
 // produced by sampleMerge.collect — according to tiers, returning the rolled-up series (still
-// sorted ascending, unique ts). Samples younger than every tier's Before pass through unchanged.
-// A sample old enough for a tier is assigned to the coarsest applicable tier (the one with the
-// largest Before it still falls under) and contributes to that tier's Interval bucket; the bucket
-// emits one sample at its aligned start timestamp with the Agg-combined value.
+// sorted ascending, unique ts). sf carries each input sample's lossy-sampling weight (nil ⇒ every
+// weight is 1); the returned sf is nil when every output weight is 1. Samples younger than every
+// tier's Before pass through unchanged (weight included). A sample old enough for a tier is
+// assigned to the coarsest applicable tier and contributes to that tier's Interval bucket; the
+// bucket emits one sample at its aligned start timestamp.
+//
+// The rollup is weight-aware so a sampled series stays unbiased: Sum emits Σ(value·sf) with weight
+// 1, Count emits Σsf (the estimated original count) with weight 1, Avg emits the weighted mean
+// with weight 1, and Last/First/Min/Max carry the representative sample's value and its weight.
 //
 // The transform is a fixed point for an already-rolled-up series under Last/First/Min/Max/Sum/Avg
 // (a one-sample bucket aggregates to itself), so repeated merges are stable. Count is the
 // exception — re-counting a representative yields 1 — and is documented as non-idempotent.
-func downsample(ts []int64, values []float64, tiers []DownsampleTier) ([]int64, []float64) {
+func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int64, []float64, []float64) {
 	// Keep only usable tiers, ordered by Before ascending so the first match for a sample is the
 	// coarsest tier it qualifies for (smallest Before ⇒ largest age threshold).
 	active := make([]DownsampleTier, 0, len(tiers))
@@ -65,7 +70,15 @@ func downsample(ts []int64, values []float64, tiers []DownsampleTier) ([]int64, 
 	}
 
 	if len(active) == 0 || len(ts) == 0 {
-		return ts, values
+		return ts, values, sf
+	}
+
+	weight := func(i int) float64 {
+		if sf == nil {
+			return 1
+		}
+
+		return sf[i]
 	}
 
 	slices.SortFunc(active, func(a, b DownsampleTier) int { return cmp.Compare(a.Before, b.Before) })
@@ -90,7 +103,7 @@ func downsample(ts []int64, values []float64, tiers []DownsampleTier) ([]int64, 
 				order = append(order, k)
 			}
 
-			b.add(t, values[i])
+			b.add(t, values[i], weight(i))
 
 			continue
 		}
@@ -103,7 +116,7 @@ func downsample(ts []int64, values []float64, tiers []DownsampleTier) ([]int64, 
 			order = append(order, k)
 		}
 
-		b.add(t, values[i])
+		b.add(t, values[i], weight(i))
 	}
 
 	// Emit one sample per bucket at its start ts. Sort by ts, finer interval first, so an
@@ -119,16 +132,30 @@ func downsample(ts []int64, values []float64, tiers []DownsampleTier) ([]int64, 
 	outTs := make([]int64, 0, len(order))
 	outVal := make([]float64, 0, len(order))
 
+	var outSF []float64
+
 	for _, k := range order {
 		if n := len(outTs); n > 0 && outTs[n-1] == k.start {
 			continue // a finer bucket already emitted this timestamp
 		}
 
+		v, w := buckets[k].result()
 		outTs = append(outTs, k.start)
-		outVal = append(outVal, buckets[k].result())
+		outVal = append(outVal, v)
+
+		if w != 1 && outSF == nil {
+			outSF = make([]float64, len(outTs)-1, len(order))
+			for i := range outSF {
+				outSF[i] = 1
+			}
+		}
+
+		if outSF != nil {
+			outSF = append(outSF, w)
+		}
 	}
 
-	return outTs, outVal
+	return outTs, outVal, outSF
 }
 
 // pickTier returns the coarsest tier a sample at ts qualifies for (the first, in Before-ascending
@@ -153,59 +180,77 @@ func alignDown(ts, interval int64) int64 {
 	return ts - r
 }
 
-// bucketAcc accumulates the samples of one downsample bucket. Input timestamps within a bucket
-// are unique (sampleMerge dedups by ts), so first/last are unambiguous.
+// bucketAcc accumulates the samples of one downsample bucket, weight-aware so sampled data stays
+// unbiased. Input timestamps within a bucket are unique (sampleMerge dedups by ts), so first/last
+// are unambiguous. n counts samples; nWeighted sums their weights (the estimated original count);
+// wsum sums value·weight (the estimated original total). min/max track the extreme value and the
+// weight of the sample that set it.
 type bucketAcc struct {
-	agg      signal.Aggregation
-	count    int64
-	sum      float64
-	min, max float64
-	firstTs  int64
-	firstVal float64
-	lastTs   int64
-	lastVal  float64
+	agg       signal.Aggregation
+	n         int64
+	nWeighted float64
+	wsum      float64
+	min, max  float64
+	minSF     float64
+	maxSF     float64
+	firstTs   int64
+	firstVal  float64
+	firstSF   float64
+	lastTs    int64
+	lastVal   float64
+	lastSF    float64
 }
 
-func (b *bucketAcc) add(ts int64, v float64) {
-	if b.count == 0 {
+func (b *bucketAcc) add(ts int64, v, sf float64) {
+	if b.n == 0 {
 		b.min, b.max = v, v
-		b.firstTs, b.firstVal = ts, v
-		b.lastTs, b.lastVal = ts, v
-		b.sum, b.count = v, 1
+		b.minSF, b.maxSF = sf, sf
+		b.firstTs, b.firstVal, b.firstSF = ts, v, sf
+		b.lastTs, b.lastVal, b.lastSF = ts, v, sf
+		b.wsum, b.nWeighted, b.n = v*sf, sf, 1
 
 		return
 	}
 
-	b.min = min(b.min, v)
-	b.max = max(b.max, v)
+	if v < b.min {
+		b.min, b.minSF = v, sf
+	}
+
+	if v > b.max {
+		b.max, b.maxSF = v, sf
+	}
 
 	if ts < b.firstTs {
-		b.firstTs, b.firstVal = ts, v
+		b.firstTs, b.firstVal, b.firstSF = ts, v, sf
 	}
 
 	if ts > b.lastTs {
-		b.lastTs, b.lastVal = ts, v
+		b.lastTs, b.lastVal, b.lastSF = ts, v, sf
 	}
 
-	b.sum += v
-	b.count++
+	b.wsum += v * sf
+	b.nWeighted += sf
+	b.n++
 }
 
-func (b *bucketAcc) result() float64 {
+// result returns the bucket's representative (value, weight). The value-selecting aggregations
+// carry the chosen sample's weight; the summarizing ones fold the weight into the value and emit
+// weight 1 (already unbiased).
+func (b *bucketAcc) result() (float64, float64) {
 	switch b.agg {
 	case signal.AggFirst:
-		return b.firstVal
+		return b.firstVal, b.firstSF
 	case signal.AggMin:
-		return b.min
+		return b.min, b.minSF
 	case signal.AggMax:
-		return b.max
+		return b.max, b.maxSF
 	case signal.AggSum:
-		return b.sum
+		return b.wsum, 1
 	case signal.AggAvg:
-		return b.sum / float64(b.count)
+		return b.wsum / b.nWeighted, 1
 	case signal.AggCount:
-		return float64(b.count)
+		return b.nWeighted, 1
 	default: // signal.AggLast
-		return b.lastVal
+		return b.lastVal, b.lastSF
 	}
 }

@@ -61,12 +61,26 @@ type Downsample struct {
 	Tiers []DownsampleTier
 }
 
-// Policy is the resolved policy for a tenant: limits, retention, downsampling, and
+// Sampling is the per-tenant lossy admission policy (DESIGN §8a): when ingest exceeds the
+// budget, keep a representative subset rather than reject, tagging each kept sample with a scale
+// factor (the inverse keep-probability) so an embedder's count/sum/rate stays unbiased. It is
+// off by default (lossless) — sampling only ever activates under an explicit budget, and only
+// for metrics (dropping a log or span would break a stream or trace). Sampling is deterministic
+// by (series, timestamp), so the same point is consistently kept or dropped.
+type Sampling struct {
+	// MaxRowsPerSecond is the per-tenant ingest budget. When the observed rate exceeds it, the
+	// sampler keeps ~budget rows/second and scales the kept samples up to compensate. 0 ⇒ no
+	// sampling (lossless: every sample is stored with a scale factor of 1).
+	MaxRowsPerSecond int64
+}
+
+// Policy is the resolved policy for a tenant: limits, retention, downsampling, sampling, and
 // routing. It is the return value of [Resolver.Resolve].
 type Policy struct {
 	Limits     Limits
 	Retention  Retention
 	Downsample Downsample
+	Sampling   Sampling
 	// RoutingHints TODO(M6): per-tenant shard placement / zone preferences.
 }
 

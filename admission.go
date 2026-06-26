@@ -16,6 +16,10 @@ type AdmissionStats struct {
 	RejectedRate        int64 // over IngestBytesPerSecond
 	RejectedCardinality int64 // over MaxSeries
 	RejectedInFlight    int64 // over MaxInFlightBytes
+	// SampledDropped counts points dropped by budgeted (lossy) sampling. Unlike the Rejected
+	// counters these are NOT failures — the kept samples carry a scale factor that represents
+	// them — so they count toward Accepted, not Rejected.
+	SampledDropped int64
 }
 
 // Rejected returns the total shed across all reasons.
@@ -83,9 +87,78 @@ type tenantAdmission struct {
 	rejectedRate        int64
 	rejectedCardinality int64
 	rejectedInFlight    int64
+	sampledDropped      int64
+
+	// Budgeted-sampling window state (guarded by smu): the sampler adapts the scale factor each
+	// 1-second window from the prior window's observed rate, so the kept set tracks the budget.
+	smu      sync.Mutex
+	winStart int64 // unix-nano of the current window's start (0 ⇒ uninitialized)
+	winCount int64 // rows observed in the current window
+	winSF    int64 // scale factor applied this window (≥1), derived from the prior window
+}
+
+// sample decides a batch's budgeted sampling. When sampling is active it returns a per-point
+// weight slice — a kept point gets its scale factor (≥1), a dropped point gets 0 — and active=true.
+// When the tenant is under budget this window it returns (nil, false): every point is kept at
+// weight 1, so the caller takes the allocation-free pass-through. Sampling is deterministic by
+// (series, ts) — the same point is consistently kept or dropped — and the scale factor adapts each
+// 1-second window from the prior window's observed rate, so the kept rate tracks the budget while
+// the weights keep counts/sums unbiased.
+func (a *tenantAdmission) sample(budgetPerSec, nowNs int64, ids []signal.SeriesID, ts []int64) (weights []float64, active bool) {
+	a.smu.Lock()
+	defer a.smu.Unlock()
+
+	if a.winStart == 0 || nowNs-a.winStart >= 1e9 {
+		a.winSF = 1
+		if budgetPerSec > 0 && a.winCount > budgetPerSec {
+			a.winSF = (a.winCount + budgetPerSec - 1) / budgetPerSec // scale factor = ceil of observed over budget
+		}
+
+		a.winStart, a.winCount = nowNs, 0
+	}
+
+	a.winCount += int64(len(ids)) // every observed row feeds the next window's rate estimate
+
+	sf := a.winSF
+	if sf <= 1 {
+		return nil, false // under budget this window: keep everything, no scale factors
+	}
+
+	weights = make([]float64, len(ids))
+	for i := range ids {
+		if sampleHash(ids[i], ts[i])%uint64(sf) == 0 {
+			weights[i] = float64(sf) // kept; its weight represents the sf-1 dropped peers
+		}
+	}
+
+	return weights, true
+}
+
+// sampleHash is a deterministic mix of a series id and timestamp, so a given (series, ts) is
+// consistently kept or dropped across batches and nodes.
+func sampleHash(id signal.SeriesID, ts int64) uint64 {
+	const k = 0x9E3779B97F4A7C15
+
+	h := id.Hi * k
+	h = (h ^ (id.Lo + k + (h << 6) + (h >> 2)))
+	h = (h ^ (uint64(ts) + k + (h << 6) + (h >> 2)))
+
+	return h
 }
 
 func (a *tenantAdmission) addRate(n int64) { a.add(&a.rejectedRate, n) }
+
+// recordSampledDropped accounts the sampled-out points: they count toward Accepted (the producer
+// must not retry — a kept peer's scale factor represents them) and are also tracked as the sampled
+// subset for observability. The kept points are accounted by the normal record path via the engine
+// result.
+func (a *tenantAdmission) recordSampledDropped(n int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.accepted += n
+	a.sampledDropped += n
+}
 
 func (a *tenantAdmission) record(accepted, ooo, cardinality, inflight int64) {
 	a.mu.Lock()
@@ -114,6 +187,7 @@ func (a *tenantAdmission) stats() AdmissionStats {
 		RejectedRate:        a.rejectedRate,
 		RejectedCardinality: a.rejectedCardinality,
 		RejectedInFlight:    a.rejectedInFlight,
+		SampledDropped:      a.sampledDropped,
 	}
 }
 

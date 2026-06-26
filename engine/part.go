@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"slices"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
@@ -9,12 +10,14 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// A flushed metric part is three flat columns — the series id sort key, the sample
-// timestamp, and the sample value — one row per sample, sorted by (series, ts).
+// A flushed metric part is the series id sort key, the sample timestamp, the sample value, and —
+// only when lossy sampling occurred — a scale-factor column, one row per sample, sorted by
+// (series, ts).
 const (
 	colSeries = "series"
 	colTs     = "ts"
 	colValue  = "value"
+	colSF     = "sf" // lossy-sampling weight; absent when no sampling occurred (reader defaults to 1)
 )
 
 func idToU128(id signal.SeriesID) chunk.U128 { return chunk.U128{Hi: id.Hi, Lo: id.Lo} }
@@ -31,6 +34,7 @@ type part struct {
 	reader *block.PartReader
 	prefix string
 	ranges map[signal.SeriesID]rowRange
+	hasSF  bool // the part carries a scale-factor column (sampling occurred); else every weight is 1
 
 	// minTime, maxTime are the inclusive unix-ns sample bounds of the part, recorded in the
 	// bucket index for time pruning. Set from the flush/merge columns when written and from
@@ -84,7 +88,7 @@ func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, err
 		i = j
 	}
 
-	return &part{reader: r, prefix: prefix, ranges: ranges}, nil
+	return &part{reader: r, prefix: prefix, ranges: ranges, hasSF: slices.Contains(r.ColumnNames(), colSF)}, nil
 }
 
 // rows returns the part's total sample count (its series ranges partition [0, rows)).
@@ -125,7 +129,24 @@ func (p *part) mergeInto(ctx context.Context, id signal.SeriesID, m *sampleMerge
 		return err
 	}
 
-	m.add(ts[rng.start:rng.end], vals[rng.start:rng.end], start, end)
+	// The scale-factor column is present only when sampling occurred; absent ⇒ every weight is 1.
+	var sf []float64
+
+	if p.hasSF {
+		sfCol, err := p.reader.Column(ctx, colSF)
+		if err != nil {
+			return err
+		}
+
+		full, err := sfCol.Float64(nil)
+		if err != nil {
+			return err
+		}
+
+		sf = full[rng.start:rng.end]
+	}
+
+	m.add(ts[rng.start:rng.end], vals[rng.start:rng.end], sf, start, end)
 
 	return nil
 }

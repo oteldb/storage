@@ -123,14 +123,17 @@ func (e *Engine) compactParts(ctx context.Context, start int64, tiers []Downsamp
 			}
 		}
 
-		ts, values := m.collect()
-		ts, values = downsample(ts, values, tiers)
+		ts, values, sf := m.collect()
+		ts, values, sf = downsample(ts, values, sf, tiers)
 
 		u := idToU128(id)
 		for i := range ts {
-			cols.series = append(cols.series, u)
-			cols.ts = append(cols.ts, ts[i])
-			cols.value = append(cols.value, values[i])
+			w := float64(1)
+			if sf != nil {
+				w = sf[i]
+			}
+
+			cols.appendRow(u, ts[i], values[i], w)
 		}
 	}
 

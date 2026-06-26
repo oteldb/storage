@@ -16,12 +16,12 @@ func TestDownsampleNoTiers(t *testing.T) {
 	ts := []int64{1, 2, 3}
 	vals := []float64{10, 20, 30}
 
-	gotTs, gotVal := downsample(ts, vals, nil)
+	gotTs, gotVal, _ := downsample(ts, vals, nil, nil)
 	assert.Equal(t, ts, gotTs)
 	assert.Equal(t, vals, gotVal)
 
 	// A tier with a non-positive interval is inert.
-	gotTs, gotVal = downsample(ts, vals, []DownsampleTier{{Before: 1 << 40, Interval: 0, Agg: signal.AggSum}})
+	gotTs, gotVal, _ = downsample(ts, vals, nil, []DownsampleTier{{Before: 1 << 40, Interval: 0, Agg: signal.AggSum}})
 	assert.Equal(t, ts, gotTs)
 	assert.Equal(t, vals, gotVal)
 }
@@ -54,7 +54,7 @@ func TestDownsampleAggregations(t *testing.T) {
 		t.Run(c.agg.String(), func(t *testing.T) {
 			t.Parallel()
 
-			gotTs, gotVal := downsample(ts, vals, tier(c.agg))
+			gotTs, gotVal, _ := downsample(ts, vals, nil, tier(c.agg))
 			assert.Equal(t, []int64{10, 20, 105, 110}, gotTs)
 			assert.Equal(t, c.want, gotVal)
 		})
@@ -74,7 +74,7 @@ func TestDownsampleMultiTier(t *testing.T) {
 		{Before: 50, Interval: 20, Agg: signal.AggLast},  // coarse, oldest (order intentionally reversed)
 	}
 
-	gotTs, gotVal := downsample(ts, vals, tiers)
+	gotTs, gotVal, _ := downsample(ts, vals, nil, tiers)
 	assert.Equal(t, []int64{0, 20, 70, 120}, gotTs)
 	assert.Equal(t, []float64{2, 3, 5, 6}, gotVal)
 }
@@ -87,7 +87,7 @@ func TestDownsampleNegativeTimestamps(t *testing.T) {
 	vals := []float64{1, 2, 3}
 	tiers := []DownsampleTier{{Before: 0, Interval: 10, Agg: signal.AggSum}}
 
-	gotTs, gotVal := downsample(ts, vals, tiers)
+	gotTs, gotVal, _ := downsample(ts, vals, nil, tiers)
 	assert.Equal(t, []int64{-30, -10}, gotTs)
 	assert.Equal(t, []float64{3, 3}, gotVal) // (-25,-22)→bucket-30 sum 3; (-5)→bucket-10 sum 3
 }
@@ -107,10 +107,11 @@ func TestDownsampleIdempotent(t *testing.T) {
 			t.Parallel()
 
 			tiers := []DownsampleTier{{Before: 100, Interval: 10, Agg: agg}}
-			ts1, val1 := downsample(ts, vals, tiers)
-			ts2, val2 := downsample(ts1, val1, tiers)
+			ts1, val1, sf1 := downsample(ts, vals, nil, tiers)
+			ts2, val2, sf2 := downsample(ts1, val1, sf1, tiers)
 			assert.Equal(t, ts1, ts2, "timestamps stable under re-merge")
 			assert.Equal(t, val1, val2, "values stable under re-merge")
+			assert.Equal(t, sf1, sf2, "weights stable under re-merge")
 		})
 	}
 }
@@ -164,7 +165,7 @@ func FuzzDownsample(f *testing.F) {
 		agg := signal.Aggregation(aggByte % 7)
 		tiers := []DownsampleTier{{Before: before, Interval: interval, Agg: agg}}
 
-		gotTs, gotVal := downsample(ts, vals, tiers)
+		gotTs, gotVal, gotSF := downsample(ts, vals, nil, tiers)
 		require.Len(t, gotVal, len(gotTs))
 		require.LessOrEqual(t, len(gotTs), len(ts), "rollup never grows the series")
 		require.True(t, slices.IsSorted(gotTs), "output is sorted")
@@ -174,7 +175,7 @@ func FuzzDownsample(f *testing.F) {
 		}
 
 		if agg == signal.AggLast {
-			ts2, val2 := downsample(gotTs, gotVal, tiers)
+			ts2, val2, _ := downsample(gotTs, gotVal, gotSF, tiers)
 			require.Equal(t, gotTs, ts2, "AggLast is a fixed point")
 			require.Equal(t, gotVal, val2, "AggLast is a fixed point")
 		}

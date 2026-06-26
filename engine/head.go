@@ -34,6 +34,27 @@ type head struct {
 type sampleBuf struct {
 	ts     []int64
 	values []float64
+	sf     []float64 // lossy-sampling weights; nil ⇒ every weight is 1, else len == len(ts)
+}
+
+// appendSample appends one (ts, value, sf). The sf slice stays nil — and the common path
+// allocation-free — until the first non-unit weight arrives, at which point prior weights are
+// backfilled to 1.
+func (b *sampleBuf) appendSample(ts int64, value, sf float64) {
+	b.ts = append(b.ts, ts)
+	b.values = append(b.values, value)
+
+	switch {
+	case b.sf != nil:
+		b.sf = append(b.sf, sf)
+	case sf != 1:
+		b.sf = make([]float64, len(b.ts)-1, len(b.ts))
+		for i := range b.sf {
+			b.sf[i] = 1
+		}
+
+		b.sf = append(b.sf, sf)
+	}
 }
 
 func newHead() *head {
@@ -63,8 +84,7 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 	}
 
 	buf := h.bufFor(id)
-	buf.ts = append(buf.ts, ts)
-	buf.values = append(buf.values, value)
+	buf.appendSample(ts, value, 1)
 	h.bytes += SampleBytes
 
 	if ts > h.newest {
@@ -81,7 +101,7 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 // and returns the per-sample outcome, whether the series was newly seen, and, when new, the
 // materialized identity (for the caller's WAL series record).
 func (h *head) appendByID(
-	id signal.SeriesID, ts int64, value float64, oooWindow int64, limits AppendLimits, materialize func() signal.Series,
+	id signal.SeriesID, ts int64, value, sf float64, oooWindow int64, limits AppendLimits, materialize func() signal.Series,
 ) (out admitOutcome, isNew bool, s signal.Series) {
 	if h.newest != 0 && oooWindow > 0 && ts < h.newest-oooWindow {
 		return rejectOOO, false, signal.Series{}
@@ -116,8 +136,7 @@ func (h *head) appendByID(
 		h.samples[id] = buf
 	}
 
-	buf.ts = append(buf.ts, ts)
-	buf.values = append(buf.values, value)
+	buf.appendSample(ts, value, sf)
 	h.bytes += SampleBytes
 
 	if ts > h.newest {
@@ -189,6 +208,14 @@ func (h *head) replaySamples(id signal.SeriesID, ts []int64, values []float64) {
 	buf := h.bufFor(id)
 	buf.ts = append(buf.ts, ts...)
 	buf.values = append(buf.values, values...)
+	// The WAL does not yet carry scale factors, so replayed samples take weight 1; keep the sf
+	// slice aligned if it was already materialized.
+	if buf.sf != nil {
+		for range ts {
+			buf.sf = append(buf.sf, 1)
+		}
+	}
+
 	h.bytes += int64(len(ts)) * SampleBytes
 
 	for _, t := range ts {
@@ -283,26 +310,28 @@ func (h *head) batch(id signal.SeriesID, start, end int64) *fetch.Batch {
 		return nil
 	}
 
-	ts, values := sortedWindow(buf, start, end)
+	ts, values, sf := sortedWindow(buf, start, end)
 	if len(ts) == 0 {
 		return nil
 	}
 
 	s, _ := h.series.Get(id)
 
-	return &fetch.Batch{ID: id, Series: s, Timestamps: ts, Values: values}
+	return &fetch.Batch{ID: id, Series: s, Timestamps: ts, Values: values, ScaleFactors: sf}
 }
 
 type tsv struct {
 	ts  int64
 	val float64
+	sf  float64
 }
 
-// sortedWindow returns the buffer's samples within [start, end], sorted by timestamp.
-func sortedWindow(buf *sampleBuf, start, end int64) ([]int64, []float64) {
+// sortedWindow returns the buffer's samples within [start, end], sorted by timestamp. The
+// returned sf slice is nil when every weight is 1 (the unsampled common case), else len == len(ts).
+func sortedWindow(buf *sampleBuf, start, end int64) ([]int64, []float64, []float64) {
 	pairs := make([]tsv, len(buf.ts))
 	for i := range buf.ts {
-		pairs[i] = tsv{buf.ts[i], buf.values[i]}
+		pairs[i] = tsv{ts: buf.ts[i], val: buf.values[i], sf: bufSF(buf, i)}
 	}
 
 	slices.SortFunc(pairs, func(a, b tsv) int { return cmp.Compare(a.ts, b.ts) })
@@ -310,6 +339,7 @@ func sortedWindow(buf *sampleBuf, start, end int64) ([]int64, []float64) {
 	var (
 		ts     []int64
 		values []float64
+		sf     []float64
 	)
 
 	for _, p := range pairs {
@@ -319,7 +349,28 @@ func sortedWindow(buf *sampleBuf, start, end int64) ([]int64, []float64) {
 
 		ts = append(ts, p.ts)
 		values = append(values, p.val)
+
+		if p.sf != 1 && sf == nil {
+			sf = make([]float64, len(ts)-1, len(pairs))
+			for i := range sf {
+				sf[i] = 1
+			}
+		}
+
+		if sf != nil {
+			sf = append(sf, p.sf)
+		}
 	}
 
-	return ts, values
+	return ts, values, sf
+}
+
+// bufSF returns sample i's weight from a sample buffer, defaulting to 1 when the buffer carries
+// no weights.
+func bufSF(buf *sampleBuf, i int) float64 {
+	if buf.sf == nil {
+		return 1
+	}
+
+	return buf.sf[i]
 }

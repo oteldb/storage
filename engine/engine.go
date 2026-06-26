@@ -77,9 +77,10 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 // per-point [signal.Series] construction or hashing. The whole run is appended under a single
 // lock. limits caps cardinality and in-flight memory (0 fields ⇒ unlimited). It returns an
 // [AppendResult] breaking accepted/rejected down by reason, so the caller can report an exact
-// OTLP partial-success. Safe for concurrent use.
+// OTLP partial-success. sf carries each sample's lossy-sampling weight (nil ⇒ every weight is 1);
+// it is non-nil only when the caller's admission layer sampled the batch. Safe for concurrent use.
 func (e *Engine) AppendBatch(
-	ids []signal.SeriesID, ts []int64, values []float64, materialize func(i int) signal.Series, limits AppendLimits,
+	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(i int) signal.Series, limits AppendLimits,
 ) (AppendResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -95,7 +96,12 @@ func (e *Engine) AppendBatch(
 	for i := range ids {
 		bi = i
 
-		out, isNew, s := e.head.appendByID(ids[i], ts[i], values[i], e.cfg.OOOWindow, limits, mat)
+		w := float64(1)
+		if sf != nil {
+			w = sf[i]
+		}
+
+		out, isNew, s := e.head.appendByID(ids[i], ts[i], values[i], w, e.cfg.OOOWindow, limits, mat)
 
 		switch out {
 		case admitted:
@@ -180,28 +186,35 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		}
 
 		if hb := e.head.batch(id, r.Start, r.End); hb != nil {
-			m.add(hb.Timestamps, hb.Values, r.Start, r.End)
+			m.add(hb.Timestamps, hb.Values, hb.ScaleFactors, r.Start, r.End)
 		}
 
-		if ts, values := m.collect(); len(ts) > 0 {
-			batches = append(batches, &fetch.Batch{ID: id, Series: s, Timestamps: ts, Values: values})
+		if ts, values, sf := m.collect(); len(ts) > 0 {
+			batches = append(batches, &fetch.Batch{ID: id, Series: s, Timestamps: ts, Values: values, ScaleFactors: sf})
 		}
 	}
 
 	return fetch.NewSliceIterator(batches), nil
 }
 
-// sampleMerge merges samples from multiple sources for one series, deduplicating by
-// timestamp. Sources are added oldest → newest, so a later add overwrites an earlier value
-// at the same timestamp.
-type sampleMerge struct {
-	byTs map[int64]float64
+// sfval is a sample's value paired with its lossy-sampling weight.
+type sfval struct {
+	value float64
+	sf    float64
 }
 
-// add merges the samples whose timestamps fall in [start, end].
-func (m *sampleMerge) add(ts []int64, values []float64, start, end int64) {
+// sampleMerge merges samples from multiple sources for one series, deduplicating by
+// timestamp. Sources are added oldest → newest, so a later add overwrites an earlier value
+// (and its weight) at the same timestamp.
+type sampleMerge struct {
+	byTs map[int64]sfval
+}
+
+// add merges the samples whose timestamps fall in [start, end]. sf carries each sample's weight
+// (nil ⇒ every weight is 1).
+func (m *sampleMerge) add(ts []int64, values, sf []float64, start, end int64) {
 	if m.byTs == nil {
-		m.byTs = make(map[int64]float64, len(ts))
+		m.byTs = make(map[int64]sfval, len(ts))
 	}
 
 	for i := range ts {
@@ -209,29 +222,48 @@ func (m *sampleMerge) add(ts []int64, values []float64, start, end int64) {
 			continue
 		}
 
-		m.byTs[ts[i]] = values[i]
+		w := float64(1)
+		if sf != nil {
+			w = sf[i]
+		}
+
+		m.byTs[ts[i]] = sfval{value: values[i], sf: w}
 	}
 }
 
-// collect returns the merged samples sorted ascending by timestamp.
-func (m *sampleMerge) collect() ([]int64, []float64) {
+// collect returns the merged samples sorted ascending by timestamp. The returned sf slice is nil
+// when every weight is 1 (the unsampled common case), else len == len(ts).
+func (m *sampleMerge) collect() (tsOut []int64, values, sf []float64) {
 	if len(m.byTs) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	ts := make([]int64, 0, len(m.byTs))
+	tsOut = make([]int64, 0, len(m.byTs))
 	for t := range m.byTs {
-		ts = append(ts, t)
+		tsOut = append(tsOut, t)
 	}
 
-	slices.Sort(ts)
+	slices.Sort(tsOut)
 
-	values := make([]float64, len(ts))
-	for i, t := range ts {
-		values[i] = m.byTs[t]
+	values = make([]float64, len(tsOut))
+
+	for i, t := range tsOut {
+		v := m.byTs[t]
+		values[i] = v.value
+
+		if v.sf != 1 && sf == nil {
+			sf = make([]float64, i, len(tsOut))
+			for j := range sf {
+				sf[j] = 1
+			}
+		}
+
+		if sf != nil {
+			sf = append(sf, v.sf)
+		}
 	}
 
-	return ts, values
+	return tsOut, values, sf
 }
 
 // Flush writes the head's buffered samples to a new immutable part and clears the buffers
@@ -339,7 +371,7 @@ func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err e
 				// The replication apply path enforces only the OOO window (the shard primary's
 				// authoritative timing decision); cardinality/memory admission is applied at the
 				// origin ingest, so pass no limits here.
-				if out, _, _ := e.head.appendByID(id, ts[i], values[i], e.cfg.OOOWindow,
+				if out, _, _ := e.head.appendByID(id, ts[i], values[i], 1, e.cfg.OOOWindow,
 					AppendLimits{}, func() signal.Series { return s }); out == admitted {
 					accTs = append(accTs, ts[i])
 					accVals = append(accVals, values[i])

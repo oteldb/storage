@@ -13,12 +13,35 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// flushColumns is the head's buffered samples laid out as the three flat part columns,
-// one row per sample, sorted by (series, ts).
+// flushColumns is the head's buffered samples laid out as the flat part columns, one row per
+// sample, sorted by (series, ts). sf carries the lossy-sampling weights and is nil when every
+// weight is 1 (the unsampled common case), in which case no sf column is written — the part keeps
+// its original three-column layout.
 type flushColumns struct {
 	series []chunk.U128
 	ts     []int64
 	value  []float64
+	sf     []float64
+}
+
+// appendRow appends one (series, ts, value, sf) row, materializing the sf column lazily the first
+// time a non-unit weight appears (backfilling 1 for the rows already collected).
+func (c *flushColumns) appendRow(u chunk.U128, ts int64, value, sf float64) {
+	c.series = append(c.series, u)
+	c.ts = append(c.ts, ts)
+	c.value = append(c.value, value)
+
+	switch {
+	case c.sf != nil:
+		c.sf = append(c.sf, sf)
+	case sf != 1:
+		c.sf = make([]float64, len(c.ts)-1, len(c.ts))
+		for i := range c.sf {
+			c.sf[i] = 1
+		}
+
+		c.sf = append(c.sf, sf)
+	}
 }
 
 // drainHead snapshots every buffered sample into part columns sorted by (series, ts) and
@@ -43,13 +66,16 @@ func (h *head) drainHead() *flushColumns {
 	for _, id := range ids {
 		buf := h.samples[id]
 
-		ts, values := sortedWindow(buf, minInt64, maxInt64)
+		ts, values, sf := sortedWindow(buf, minInt64, maxInt64)
 		u := idToU128(id)
 
 		for i := range ts {
-			cols.series = append(cols.series, u)
-			cols.ts = append(cols.ts, ts[i])
-			cols.value = append(cols.value, values[i])
+			w := float64(1)
+			if sf != nil {
+				w = sf[i]
+			}
+
+			cols.appendRow(u, ts[i], values[i], w)
 		}
 	}
 
@@ -77,6 +103,16 @@ func writePart(ctx context.Context, b backend.Backend, prefix string, cols *flus
 
 	if err := w.AddColumn(block.Column{Name: colValue, Kind: block.KindFloat64, Float64: cols.value}); err != nil {
 		return err
+	}
+
+	// The scale-factor column is additive: it is written only when sampling actually occurred, so
+	// an unsampled part keeps its original three-column layout (and a reader defaults a missing sf
+	// column to weight 1). A constant column (e.g. a whole part sampled at one factor) collapses to
+	// a single manifest value with no data object.
+	if cols.sf != nil {
+		if err := w.AddColumn(block.Column{Name: colSF, Kind: block.KindFloat64, Float64: cols.sf}); err != nil {
+			return err
+		}
 	}
 
 	if err := block.WritePart(ctx, b, prefix, w); err != nil {
