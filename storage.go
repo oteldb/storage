@@ -11,8 +11,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/query"
-	qpromql "github.com/oteldb/storage/query/promql"
+	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/log"
 	"github.com/oteldb/storage/signal/metric"
@@ -27,8 +26,8 @@ import (
 // All ingestion is push-based and OTLP-shaped: methods accept the library's internal,
 // []byte-based, zero-alloc ingest batches (e.g. [metric.Metrics]) and return an [Accepted]
 // carrying per-OTLP partial-success counts. OTel-Go users convert pdata to these via the
-// optional otlp/pdataconv bridge, which keeps pdata off this hot path. Queries compile to
-// the fetch contract (DESIGN.md §7) regardless of [Query.Lang].
+// optional otlp/pdataconv bridge, which keeps pdata off this hot path. Reads go through the
+// language-agnostic [Storage.Fetcher] seam; query languages live in the embedder.
 //
 // This is a scaffold stub: ingestion and query are wired end-to-end at M3 (metrics
 // vertical). The methods currently validate arguments and return
@@ -41,8 +40,6 @@ type Storage struct {
 
 	tmu     sync.Mutex
 	tenants map[signal.TenantID]*engine.Engine
-
-	promql *qpromql.Engine // PromQL query engine (Prometheus engine over the fetch contract)
 
 	stopCh chan struct{}  // closed by Close to stop the maintenance loop
 	wg     sync.WaitGroup // tracks the maintenance goroutine
@@ -68,7 +65,6 @@ func Open(_ context.Context, o Options, opts ...Option) (*Storage, error) {
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
 	}
-	s.promql = qpromql.NewEngine()
 	if o.FlushInterval > 0 {
 		s.stopCh = make(chan struct{})
 		s.wg.Add(1)
@@ -195,34 +191,28 @@ func (s *Storage) WriteProfiles(_ context.Context, _ profile.Profiles) (Accepted
 	return s.notImplementedWrite("write profiles")
 }
 
-// Query runs a query against one tenant. The language front-end is selected by [Query.Lang]
-// (PromQL today; LogQL/TraceQL are later verticals and return [ErrNotImplemented]). The
-// PromQL path compiles to the fetch contract via the query/promql adapter and evaluates with
-// the embedded Prometheus engine. Times in [Query] are unix nanoseconds; Step == 0 is an
-// instant query at End.
-func (s *Storage) Query(ctx context.Context, t signal.TenantID, q Query) (Result, error) {
+// Fetcher returns the read seam — a [fetch.Fetcher] over one tenant's data (head ∪ flushed
+// parts). It is the storage library's query surface: this is a language-agnostic columnar
+// store, so the embedder drives its own query engines (PromQL/LogQL/TraceQL) over the fetch
+// contract. The optional query/promql package bridges this to the Prometheus
+// storage.Queryable for embedders using the Prometheus engine.
+//
+// The returned Fetcher is always usable: for an unknown tenant (or after [Close]) it is an
+// empty fetcher that yields no series, so callers need not special-case "no data yet".
+func (s *Storage) Fetcher(t signal.TenantID) fetch.Fetcher {
 	if s.closed.Load() {
-		return Result{}, errors.Wrap(ErrClosed, "query")
+		return emptyFetcher{}
 	}
 
-	if q.Lang != LangPromQL {
-		return Result{}, ErrNotImplemented
+	if e, ok := s.lookupEngine(s.normalizeTenant(t)); ok {
+		return e
 	}
 
-	tid := s.normalizeTenant(t)
-	_ = s.tenant.Resolve(tid) // policy may gate query concurrency/limits
-
-	eng, ok := s.lookupEngine(tid)
-	if !ok {
-		// No data ingested for this tenant ⇒ an empty result of the requested shape.
-		return emptyResult(q.Step), nil
-	}
-
-	return s.promql.Eval(ctx, eng, tid, qpromql.Params{Text: q.Text, Start: q.Start, End: q.End, Step: q.Step})
+	return emptyFetcher{}
 }
 
-// lookupEngine returns the tenant's engine if it exists, without creating one (queries must
-// not materialize empty engines for unknown tenants).
+// lookupEngine returns the tenant's engine if it exists, without creating one (reads must not
+// materialize empty engines for unknown tenants).
 func (s *Storage) lookupEngine(tid signal.TenantID) (*engine.Engine, bool) {
 	s.tmu.Lock()
 	defer s.tmu.Unlock()
@@ -232,14 +222,12 @@ func (s *Storage) lookupEngine(tid signal.TenantID) (*engine.Engine, bool) {
 	return e, ok
 }
 
-// emptyResult is the empty result for a tenant with no data: an empty matrix for a range
-// query (Step > 0), an empty vector for an instant query.
-func emptyResult(step int64) Result {
-	if step > 0 {
-		return Result{Type: query.ResultMatrix}
-	}
+// emptyFetcher is the [fetch.Fetcher] returned for a tenant with no data; it yields an empty
+// iterator.
+type emptyFetcher struct{}
 
-	return Result{Type: query.ResultVector}
+func (emptyFetcher) Fetch(context.Context, fetch.Request) (fetch.Iterator, error) {
+	return fetch.NewSliceIterator(nil), nil
 }
 
 func (s *Storage) notImplementedWrite(op string) (Accepted, error) {
@@ -368,54 +356,10 @@ type Accepted struct {
 	RejectedReason string
 }
 
-// Query is a query against the store (DESIGN.md §5, §9).
-type Query struct {
-	// Lang selects the query language front-end (DESIGN.md §6). Required.
-	Lang Lang
-	// Tenant is the tenant scope; the top-level [Storage.Query] takes it separately.
-	// Text is the query text in [Lang].
-	Text string
-	// Start, End is the time range in unix nanoseconds, inclusive.
-	Start, End int64
-	// Step is the evaluation step for range queries (PromQL `range query`), in
-	// nanoseconds. Zero ⇒ an instant query.
-	Step int64
-	// TODO(M4): Timeout, Hints (sharding, sampling, limits), MaxSeries.
-}
-
-// Lang is the query language front-end (DESIGN.md §5, §6).
-type Lang uint8
-
-const (
-	// LangPromQL is the PromQL language (must-have, DESIGN.md §14 M4).
-	LangPromQL Lang = iota + 1
-	// LangLogQL is the LogQL language (logs, later vertical).
-	LangLogQL
-	// LangTraceQL is the TraceQL language (traces, later vertical).
-	LangTraceQL
-	// LangGenericQL is the cross-signal language (deferred until ≥2 signals, §15).
-	LangGenericQL
-)
-
-// String returns a stable lower-case language name.
-func (l Lang) String() string {
-	switch l {
-	case LangPromQL:
-		return "promql"
-	case LangLogQL:
-		return "logql"
-	case LangTraceQL:
-		return "traceql"
-	case LangGenericQL:
-		return "genericql"
-	default:
-		return "unknown"
-	}
-}
-
-// Result is a query result (DESIGN.md §9): the neutral [query.Result] shape (matrix/vector/
-// scalar/string). Timestamps are unix nanoseconds.
-type Result = query.Result
+// The read path is the language-agnostic [Storage.Fetcher] seam, not a query-language method:
+// this is a columnar storage library, and the embedder owns the query languages
+// (PromQL/LogQL/TraceQL) — driving them over [fetch.Fetcher] (see the optional query/promql
+// adapter). There is deliberately no Storage.Query / query-language type here.
 
 // ErrNotImplemented is returned by scaffold-stub methods whose end-to-end wiring
 // lands in a later milestone. It is not a fatal error: embedders may compile against

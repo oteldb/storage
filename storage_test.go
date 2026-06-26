@@ -197,8 +197,19 @@ func TestWriteAfterCloseRejected(t *testing.T) {
 	require.ErrorIs(t, err, ErrClosed)
 	_, err = s.WriteLogs(ctx, log.Logs{})
 	require.ErrorIs(t, err, ErrClosed)
-	_, err = s.Query(ctx, "t", Query{Lang: LangPromQL})
-	require.ErrorIs(t, err, ErrClosed)
+	// After Close, the read seam yields an empty fetcher (not an error).
+	got, err := fetch.Drain(ctx, mustFetch(t, s.Fetcher("t")))
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
+// mustFetch runs a match-all fetch over f and returns the iterator.
+func mustFetch(t *testing.T, f fetch.Fetcher) fetch.Iterator {
+	t.Helper()
+	it, err := f.Fetch(context.Background(), fetch.Request{Start: 0, End: 1 << 62})
+	require.NoError(t, err)
+
+	return it
 }
 
 func TestUnimplementedSignals(t *testing.T) {
@@ -213,9 +224,6 @@ func TestUnimplementedSignals(t *testing.T) {
 	_, err = s.WriteTraces(ctx, trace.Traces{})
 	require.ErrorIs(t, err, ErrNotImplemented)
 	_, err = s.WriteProfiles(ctx, profile.Profiles{})
-	require.ErrorIs(t, err, ErrNotImplemented)
-	// PromQL is implemented (M4); the still-unimplemented query languages return ErrNotImplemented.
-	_, err = s.Query(ctx, "", Query{Lang: LangLogQL, Text: "{}"})
 	require.ErrorIs(t, err, ErrNotImplemented)
 }
 
@@ -233,13 +241,4 @@ func TestOOOWindowViaStorage(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), acc.Accepted)
 	assert.Equal(t, int64(1), acc.Rejected)
-}
-
-func TestLangString(t *testing.T) {
-	t.Parallel()
-	assert.Equal(t, "promql", LangPromQL.String())
-	assert.Equal(t, "logql", LangLogQL.String())
-	assert.Equal(t, "traceql", LangTraceQL.String())
-	assert.Equal(t, "genericql", LangGenericQL.String())
-	assert.Equal(t, "unknown", Lang(99).String())
 }

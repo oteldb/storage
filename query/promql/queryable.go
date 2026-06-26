@@ -1,9 +1,10 @@
-// Package promql is the PromQL front-end. It does not reimplement PromQL: it adapts the
-// storage fetch contract (query/fetch) to the Prometheus storage.Queryable interface and
-// drives the upstream Prometheus promql.Engine, the same pattern Mimir/Loki/Pyroscope use.
-// PromQL semantics — selectors, lookback, rate, aggregations, binary ops — therefore match
-// Prometheus by construction; our code is only the seam that turns label matchers into a
-// fetch.Request and turns fetched columnar batches into a Prometheus SeriesSet.
+// Package promql is an optional adapter that bridges the storage fetch contract
+// (query/fetch) to the Prometheus storage.Queryable interface. It does not own a PromQL
+// engine: the embedder (e.g. go-faster/oteldb, which already has PromQL/LogQL/TraceQL
+// engines) drives its own promql.Engine over the [Queryable] this package returns. The
+// storage library proper stops at the fetch seam and stays language- and Prometheus-free;
+// this package is the only one importing github.com/prometheus/prometheus, and importing it
+// is opt-in.
 //
 // Condition extraction lives here (the language layer), never in storage: a Prometheus
 // matcher that can match the empty string (e.g. `!=`, `!~`, `=""`) would wrongly exclude
@@ -23,7 +24,6 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/util/annotations"
 
-	"github.com/oteldb/storage/query"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
@@ -190,16 +190,6 @@ func promLabels(s signal.Series) labels.Labels {
 	b.Sort()
 
 	return b.Labels()
-}
-
-// convertLabels projects a Prometheus label set to the neutral [query.Label] slice.
-func convertLabels(lset labels.Labels) []query.Label {
-	out := make([]query.Label, 0, lset.Len())
-	lset.Range(func(l labels.Label) {
-		out = append(out, query.Label{Name: l.Name, Value: l.Value})
-	})
-
-	return out
 }
 
 // floatSamples converts the storage ns timeline to Prometheus float samples (ms).

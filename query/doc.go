@@ -1,11 +1,13 @@
-// Package query holds the query layer and its neutral result types (see [Result]).
+// Package query groups the storage library's read seam and its language adapters.
 //
 // Sub-packages:
-//   - fetch: the dual-shape Request/Fetcher/Iterator contract — the seam every language
-//     front-end compiles to and every backend implements.
-//   - promql: the PromQL front-end, an adapter from the fetch contract to the Prometheus
-//     promql.Engine.
+//   - fetch: the dual-shape Request/Fetcher/Iterator contract — the language-agnostic seam
+//     every embedder query engine drives and every backend implements. This is the library's
+//     query surface (exposed via Storage.Fetcher); the storage library does not implement
+//     query languages.
+//   - promql: an OPTIONAL adapter bridging the fetch contract to the Prometheus
+//     storage.Queryable, for embedders that drive the Prometheus PromQL engine. It is the
+//     only package importing github.com/prometheus/prometheus.
 //
-// LogQL/TraceQL/cross-signal front-ends and a sharded execution layer are later milestones.
 // See ARCHITECTURE.md for the query layer's current state.
 package query
