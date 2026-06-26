@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-faster/errors"
@@ -172,5 +173,57 @@ func Run(t *testing.T, factory func(t *testing.T) backend.Backend) {
 		// Just exercise the method; value depends on the implementation.
 		_ = b.IsEphemeral()
 		_ = errors.Is(backend.ErrNotExist, backend.ErrNotExist)
+	})
+
+	t.Run("PutIfAbsentClaimsKey", func(t *testing.T) {
+		b := factory(t)
+
+		ok, err := b.PutIfAbsent(ctx, "cas/k", []byte("first"))
+		require.NoError(t, err)
+		assert.True(t, ok, "first PutIfAbsent claims the key")
+
+		ok, err = b.PutIfAbsent(ctx, "cas/k", []byte("second"))
+		require.NoError(t, err)
+		assert.False(t, ok, "second PutIfAbsent is a no-op")
+
+		got, err := b.Read(ctx, "cas/k")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("first"), got, "the original value is preserved")
+	})
+
+	t.Run("PutIfAbsentVsWrite", func(t *testing.T) {
+		b := factory(t)
+
+		require.NoError(t, b.Write(ctx, "cas/w", []byte("written")))
+		ok, err := b.PutIfAbsent(ctx, "cas/w", []byte("absent"))
+		require.NoError(t, err)
+		assert.False(t, ok, "PutIfAbsent yields to an existing Write")
+	})
+
+	t.Run("PutIfAbsentConcurrentSingleWinner", func(t *testing.T) {
+		b := factory(t)
+
+		const n = 32
+
+		var (
+			wg   sync.WaitGroup
+			wins atomic.Int64
+		)
+
+		wg.Add(n)
+		for i := range n {
+			go func(i int) {
+				defer wg.Done()
+
+				ok, err := b.PutIfAbsent(ctx, "cas/race", fmt.Appendf(nil, "w-%d", i))
+				assert.NoError(t, err)
+				if ok {
+					wins.Add(1)
+				}
+			}(i)
+		}
+
+		wg.Wait()
+		assert.Equal(t, int64(1), wins.Load(), "exactly one writer claims the key")
 	})
 }

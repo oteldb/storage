@@ -19,15 +19,24 @@ import (
 // so whole-object Read/Write is sufficient and gives per-object write atomicity.
 // All methods are safe for concurrent use.
 //
-// Ranged/streaming reads and compare-and-swap (PutIfAbsent) are deliberately not part
-// of this M1 interface; they land with the s3 backend (M5). This is a conscious
-// divergence from the original `Read → io.ReadCloser` sketch: a part column is read
-// whole, and the multi-key layout already gives projection pushdown (read only the
+// Ranged/streaming reads are deliberately not part of this interface: a part column is
+// read whole, and the multi-key layout already gives projection pushdown (read only the
 // referenced column objects) without ranged reads.
+//
+// [Backend.PutIfAbsent] is the conditional-write primitive (added in M5) on which atomic
+// manifest / block-list commits build: a versioned manifest key is written only if no
+// writer has claimed that version, so single-writer-wins coordination needs no Raft (it
+// maps to S3 If-None-Match, a filesystem exclusive create, and a guarded map insert).
 type Backend interface {
 	// IsEphemeral reports whether the backend stores data only in RAM (dropped on
 	// process exit). [Memory] is ephemeral; file and s3 are not.
 	IsEphemeral() bool
+
+	// PutIfAbsent stores data under key only if the key does not already exist. It
+	// returns true if the write happened, false if the key was already present (no
+	// change). Like [Backend.Write] it is atomic per object. It is the compare-and-swap
+	// primitive for manifest commits.
+	PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error)
 
 	// Write stores data under key, overwriting any existing value. The write is
 	// atomic per object: a reader never observes a partially written value. The
@@ -84,6 +93,24 @@ func (m *memoryBackend) Write(_ context.Context, key string, data []byte) error 
 	m.mu.Unlock()
 
 	return nil
+}
+
+func (m *memoryBackend) PutIfAbsent(_ context.Context, key string, data []byte) (bool, error) {
+	cp := slices.Clone(data)
+	if cp == nil {
+		cp = []byte{}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.objects[key]; ok {
+		return false, nil
+	}
+
+	m.objects[key] = cp
+
+	return true, nil
 }
 
 func (m *memoryBackend) Read(_ context.Context, key string) ([]byte, error) {

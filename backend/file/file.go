@@ -92,6 +92,57 @@ func (f *File) Write(_ context.Context, key string, data []byte) (rerr error) {
 	return nil
 }
 
+// PutIfAbsent stores data under key only if it does not already exist, returning whether the
+// write happened. It writes a temp file then hard-links it to the final path: os.Link fails
+// with EEXIST if the destination exists, giving an atomic, exclusive create (the conditional
+// commit primitive). A reader never sees a partial object — the link publishes a fully
+// written file.
+func (f *File) PutIfAbsent(_ context.Context, key string, data []byte) (written bool, rerr error) {
+	p, err := f.path(key)
+	if err != nil {
+		return false, err
+	}
+
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return false, errors.Wrapf(err, "mkdir %q", dir)
+	}
+
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return false, errors.Wrap(err, "create temp")
+	}
+
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }() // the link, if made, is the durable copy
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+
+		return false, errors.Wrap(err, "write temp")
+	}
+
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+
+		return false, errors.Wrap(err, "sync temp")
+	}
+
+	if err := tmp.Close(); err != nil {
+		return false, errors.Wrap(err, "close temp")
+	}
+
+	if err := os.Link(tmpName, p); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return false, nil // key already present
+		}
+
+		return false, errors.Wrapf(err, "link into %q", p)
+	}
+
+	return true, nil
+}
+
 // Read returns the value stored under key, or an [backend.ErrNotExist]-wrapping error.
 func (f *File) Read(_ context.Context, key string) ([]byte, error) {
 	p, err := f.path(key)
