@@ -1,15 +1,25 @@
 package cluster
 
-// Config is the cluster configuration (DESIGN.md §5, §11). It is optional: a nil
-// [Options.Cluster] means single-node mode, where the cluster layer is absent.
-//
-// Fields will be filled in at M6 (ring tokens, etcd endpoints, RF, zone config,
-// rebalance policy). It is a placeholder struct now so the [storage.Options] shape
-// is stable.
+import "github.com/oteldb/storage/cluster/etcd"
+
+// Config is the cluster configuration. It is optional: a nil [storage.Options].Cluster means
+// single-node mode (the cluster layer is absent). When set, the storage facade joins the
+// etcd-coordinated cluster, runs the replica server on [Config.Self].Addr, and routes writes
+// to their ring-owners at replication factor [Config.RF].
 type Config struct {
-	// TODO(M6): EtcdEndpoints []string
-	// TODO(M6): ReplicationFactor int      // default 3
-	// TODO(M6): RingTokens []uint32        // spread-minimizing tokens
-	// TODO(M6): Zones []string             // zone-aware placement
-	// TODO(M6): Rebalance RebalancePolicy
+	// Etcd is the etcd endpoint list for membership coordination.
+	Etcd []string
+	// Self is this node's identity: ID (ring identity), Zone (failure domain), and Addr
+	// (host:port the node listens on for replication and reaches peers at).
+	Self etcd.Member
+	// RF is the replication factor (replicas per write). Zero ⇒ 3.
+	RF int
+	// Root is the etcd key prefix for this cluster's state. Empty ⇒ "/oteldb".
+	Root string
 }
+
+// DefaultRF is the replication factor used when [Config.RF] is unset.
+const DefaultRF = 3
+
+// DefaultRoot is the etcd key prefix used when [Config.Root] is empty.
+const DefaultRoot = "/oteldb"

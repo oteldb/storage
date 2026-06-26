@@ -112,12 +112,12 @@ func TestMembershipJoinWatchLeave(t *testing.T) {
 		"placement agrees across nodes")
 
 	// Node B leaves (lease revoked on Close); A's ring shrinks back.
-	require.NoError(t, b.Close())
+	require.NoError(t, b.Close(ctx))
 	require.Eventually(t, func() bool { return a.Ring().Len() == 1 }, 5*time.Second, 25*time.Millisecond,
 		"node A drops node B after it leaves")
 	assert.Equal(t, []string{"node-a"}, memberIDs(a.Members()))
 
-	require.NoError(t, a.Close())
+	require.NoError(t, a.Close(ctx))
 }
 
 func TestJoinRequiresID(t *testing.T) {

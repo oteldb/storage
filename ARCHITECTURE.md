@@ -44,7 +44,7 @@ The design is a single columnar engine with swappable front-ends and backends
 | L3 **Engine** / **Index / WAL** | **head · flush · merge · retention** / **symbols · series · postings** · **write-ahead log** | **engine implemented (metrics)**; **index + wal implemented** |
 | L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
 | L1 **Backend** | file · s3 · memory behind one interface | **memory + file + s3 implemented**, with `PutIfAbsent` CAS; `bucketindex` for stateless part enumeration |
-| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **ring + membership + quorum replication + rebalance plan implemented** (`cluster/{ring,etcd,replica,rebalance}`); facade wiring pending |
+| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **ring + membership + quorum replication + rebalance + facade cluster mode implemented**; rebalance-plan execution + read fan-out pending |
 
 The **implemented substance spans L1 (backends) through L4 (the fetch contract)** for
 metrics: encoding, parts, index, WAL, the engine head/flush/merge, and the metrics fetch
@@ -431,9 +431,19 @@ tenant's ring-owners and replicates it to a write quorum. A write is framed as `
 independently holds the unflushed data and either can serve it (after both flush, the shared
 object store reconciles them). A two-node end-to-end test exercises this over the real HTTP
 transport: a write routed by the ring lands in *both* nodes' engines. Sharding is by tenant for
-now (a whole stream pinned to its owners); per-series sharding and the **facade `Open`
-cluster-mode wiring** (join membership, run the replica server, route `WriteMetrics`, fan-out
-reads) are the remaining integration.
+now (a whole stream pinned to its owners).
+
+**Facade cluster mode** (`cluster.go`, `Options.Cluster`): when configured, `Storage.Open`
+joins the etcd cluster, runs the replica HTTP server on the node's address, and builds the
+routed write path; `WriteMetrics` then frames each tenant's projected series+samples as a write
+payload and replicates it to the tenant's owners (the local owner applies in process via
+`engine.ApplyReplicated`), instead of appending locally. `Close` revokes the lease and stops
+the server. A **two-node end-to-end test** (shared embedded etcd, two `Storage` instances)
+confirms a write to one node is served by both. Reads stay **local** for now — each node
+serves its own engine ∪ object store; **read fan-out** to owners (for another node's unflushed
+head) and the **rebalance-plan executor** (etcd-coordinated ownership handoff) are the
+remaining L0 work. The cluster-mode write path does not yet apply the single-node OOO window or
+per-point partial-success accounting.
 
 ---
 
@@ -554,7 +564,8 @@ cluster/              L0 distribution: ring + membership + (later) replication �
   cluster/etcd        etcd-backed live membership (lease + watch → atomic ring)          [implemented; embedded-etcd tested]
   cluster/replica     quorum write-replication + node-to-node HTTP transport             [implemented]
   cluster/rebalance   minimal ownership-handoff plan from a ring diff (pure)              [implemented]
-  cluster/            cluster write path: EncodeWrite codec + Writer (route+replicate)    [implemented; facade Open cluster-mode wiring pending]
+  cluster/            cluster write path: EncodeWrite codec + Writer + Config             [implemented]
+.                     (cluster.go) facade cluster mode: Open joins + replica server + routed WriteMetrics [implemented; reads local]
 ```
 
 "Seam only" packages currently contain their `doc.go` (and, where noted, an interface or

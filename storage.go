@@ -43,6 +43,8 @@ type Storage struct {
 	tmu     sync.Mutex
 	tenants map[signal.TenantID]*engine.Engine
 
+	cluster *clusterNode // cluster runtime (membership + replica server + routed writes); nil ⇒ single-node
+
 	stopCh chan struct{}  // closed by Close to stop the maintenance loop
 	wg     sync.WaitGroup // tracks the maintenance goroutine
 }
@@ -71,6 +73,13 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	// Recover previously-flushed data from a durable backend so a fresh process serves it.
 	if err := s.recover(ctx); err != nil {
 		return nil, err
+	}
+
+	// Join the cluster (membership + replica server + routed writes) when configured.
+	if o.Cluster != nil {
+		if err := s.startCluster(ctx, o.Cluster); err != nil {
+			return nil, errors.Wrap(err, "start cluster")
+		}
 	}
 
 	if o.FlushInterval > 0 {
@@ -113,6 +122,13 @@ func (s *Storage) Close(ctx context.Context) error {
 	// Final flush: drain every engine's head to a durable part.
 	var firstErr error
 
+	// Leave the cluster first (revoke lease, stop the replica server) so peers stop routing here.
+	if s.cluster != nil {
+		if err := s.cluster.close(ctx); err != nil {
+			firstErr = err
+		}
+	}
+
 	for _, eng := range s.engineSnapshot() {
 		if err := eng.Close(ctx); err != nil && firstErr == nil {
 			firstErr = err
@@ -151,9 +167,13 @@ func (s *Storage) Reset(ctx context.Context) error {
 // labels + buffering samples). Returns per-OTLP partial-success counts: rejected counts
 // out-of-order drops. (Unsupported point kinds and value-less points never reach here:
 // they are filtered and counted by the producer — e.g. the otlp/pdataconv bridge.)
-func (s *Storage) WriteMetrics(_ context.Context, md metric.Metrics) (Accepted, error) {
+func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted, error) {
 	if s.closed.Load() {
 		return Accepted{}, errors.Wrap(ErrClosed, "write metrics")
+	}
+
+	if s.cluster != nil {
+		return s.writeMetricsClustered(ctx, md)
 	}
 
 	var oooRejected int64

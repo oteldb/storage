@@ -153,6 +153,16 @@ func Join(ctx context.Context, client *clientv3.Client, root string, self Member
 // Ring returns the current ring (lock-free). It is replaced atomically as membership changes.
 func (m *Membership) Ring() *ring.Ring { return m.current.Load() }
 
+// AddrOf returns the network address of the member with the given ring node ID, or "" if the
+// member is unknown. It is the resolver the cluster write path uses to turn ring owners into
+// transport targets.
+func (m *Membership) AddrOf(id string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.members[id].Addr
+}
+
 // Members returns the current members, sorted by ID.
 func (m *Membership) Members() []Member {
 	m.mu.RLock()
@@ -169,12 +179,13 @@ func (m *Membership) Members() []Member {
 }
 
 // Close stops watching, revokes this node's lease (so its peers drop it immediately rather
-// than after the TTL), and waits for the background goroutines to exit.
-func (m *Membership) Close() error {
+// than after the TTL), and waits for the background goroutines to exit. The revoke is bounded
+// by a derived timeout.
+func (m *Membership) Close(ctx context.Context) error {
 	m.cancel()
 	m.wg.Wait()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	if _, err := m.client.Revoke(ctx, m.leaseID); err != nil {
