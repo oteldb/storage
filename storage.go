@@ -240,6 +240,17 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 		return fetch.Merge() // empty
 	}
 
+	// In cluster mode a named tenant is served owner-aware (local if owned, else fanned out to
+	// an owner). Without named tenants we fall back to a local cross-tenant snapshot.
+	if s.cluster != nil && len(tenants) > 0 {
+		fetchers := make([]fetch.Fetcher, 0, len(tenants))
+		for _, t := range tenants {
+			fetchers = append(fetchers, s.clusterFetcherFor(t))
+		}
+
+		return fetch.Merge(fetchers...)
+	}
+
 	var fetchers []fetch.Fetcher
 
 	if len(tenants) == 0 {

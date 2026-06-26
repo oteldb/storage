@@ -108,3 +108,57 @@ func TestClusteredStorageReplicatesAcrossNodes(t *testing.T) {
 		assert.Equalf(t, []float64{1, 2}, got[0].Values, "%s values", name)
 	}
 }
+
+// TestClusteredReadFansOutToOwners is the read-fan-out capstone: with three nodes and RF=2,
+// a tenant is owned by two of them; a query on the third (a non-owner, which holds none of the
+// tenant's data) fans out to an owner over HTTP and returns the result.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusteredReadFansOutToOwners(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNode(t, endpoint, "node-a"),
+		"node-b": openClusterNode(t, endpoint, "node-b"),
+		"node-c": openClusterNode(t, endpoint, "node-c"),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+
+	// Write via node A; it routes to the tenant's two owners.
+	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
+	require.NoError(t, err)
+
+	// The tenant's owners are two of the three nodes; find the third (the non-owner).
+	owners := a.cluster.membership.Ring().Lookup([]byte("default"), 2)
+	require.Len(t, owners, 2)
+	ownerID := map[string]bool{owners[0].ID: true, owners[1].ID: true}
+
+	var nonOwner *Storage
+	var nonOwnerName string
+	for name, s := range nodes {
+		if !ownerID[name] {
+			nonOwner, nonOwnerName = s, name
+		}
+	}
+	require.NotNil(t, nonOwner, "one node is not an owner")
+
+	// The non-owner holds no local data for the tenant...
+	_, hasLocal := nonOwner.lookupEngine("default")
+	assert.Falsef(t, hasLocal, "%s (non-owner) has no local engine for the tenant", nonOwnerName)
+
+	// ...yet its Fetcher fans out to an owner and returns the data.
+	it, err := nonOwner.Fetcher("default").Fetch(ctx, fetch.Request{
+		Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{nameMatcher("http.requests")},
+	})
+	require.NoError(t, err)
+	got, err := fetch.Drain(ctx, it)
+	require.NoError(t, err)
+	require.Lenf(t, got, 1, "%s served the series via read fan-out", nonOwnerName)
+	assert.Equal(t, []int64{100, 200}, got[0].Timestamps)
+	assert.Equal(t, []float64{1, 2}, got[0].Values)
+}

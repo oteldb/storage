@@ -13,6 +13,7 @@ import (
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
 	"github.com/oteldb/storage/cluster/replica"
+	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
 	"github.com/oteldb/storage/wal"
@@ -26,6 +27,8 @@ type clusterNode struct {
 	writer     *cluster.Writer
 	server     *http.Server
 	listener   net.Listener
+	self       string // this node's address
+	rf         int
 }
 
 // startCluster joins the etcd-coordinated cluster, runs the replica server on Self.Addr, and
@@ -60,6 +63,7 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 
 	mux := http.NewServeMux()
 	mux.Handle(replica.ReplicatePath, rp.Handler())
+	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch)) // read fan-out endpoint
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	go func() { _ = srv.Serve(ln) }()
@@ -78,9 +82,54 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 		writer:     cluster.NewWriter(rf, mship, mship.AddrOf, rp),
 		server:     srv,
 		listener:   ln,
+		self:       cfg.Self.Addr,
+		rf:         rf,
 	}
 
 	return nil
+}
+
+// localFetch returns every series of a tenant within [start, end] from the local engine (no
+// matcher filtering) — the read-fan-out server's view of this node's data.
+func (s *Storage) localFetch(ctx context.Context, tenant string, start, end int64) ([]*fetch.Batch, error) {
+	eng, ok := s.lookupEngine(s.normalizeTenant(signal.TenantID(tenant)))
+	if !ok {
+		return nil, nil
+	}
+
+	it, err := eng.Fetch(ctx, fetch.Request{Tenant: signal.TenantID(tenant), Start: start, End: end})
+	if err != nil {
+		return nil, err
+	}
+
+	return fetch.Drain(ctx, it)
+}
+
+// clusterFetcherFor returns the read seam for one tenant in cluster mode: if this node owns the
+// tenant it serves locally (the head is replicated here, with full matcher pushdown); otherwise
+// it fans out to an owner over HTTP (a window superset) and re-applies the request's matchers,
+// failing over between owners.
+func (s *Storage) clusterFetcherFor(tid signal.TenantID) fetch.Fetcher {
+	cn := s.cluster
+	owners := cn.membership.Ring().Lookup([]byte(s.normalizeTenant(tid)), cn.rf)
+
+	var remotes []fetch.Fetcher
+	for _, o := range owners {
+		addr := cn.membership.AddrOf(o.ID)
+		if addr == cn.self { // this node is an owner: serve locally
+			if e, ok := s.lookupEngine(s.normalizeTenant(tid)); ok {
+				return e
+			}
+
+			return fetch.Merge() // owner but no data yet
+		}
+
+		if addr != "" {
+			remotes = append(remotes, cluster.NewRemoteFetcher(addr, nil))
+		}
+	}
+
+	return &filteringFetcher{inner: failoverFetcher(remotes)}
 }
 
 // applyReplicated decodes a replicated write and applies it to the local tenant engine. It is
@@ -96,6 +145,74 @@ func (s *Storage) applyReplicated(_ context.Context, payload []byte) error {
 	}
 
 	return nil
+}
+
+// failoverFetcher tries its children in order and returns the first that succeeds — a read
+// from any single owner is complete (owners are replicas), so this tolerates a down owner.
+type failoverFetcher []fetch.Fetcher
+
+func (fs failoverFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
+	if len(fs) == 0 {
+		return nil, errors.New("cluster: no reachable owners for tenant")
+	}
+
+	var lastErr error
+	for _, f := range fs {
+		it, err := f.Fetch(ctx, r)
+		if err == nil {
+			return it, nil
+		}
+
+		lastErr = err
+	}
+
+	return nil, errors.Wrap(lastErr, "cluster: all owners failed")
+}
+
+// filteringFetcher re-applies a request's matchers to the inner result, which may be a superset
+// (a remote owner returns its whole window since matchers are not serializable). A series is
+// kept iff every matcher matches a present attribute of that name — the same positive semantics
+// the engine's postings resolution applies; absent/negated handling stays in the language layer.
+type filteringFetcher struct {
+	inner fetch.Fetcher
+}
+
+func (f *filteringFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
+	it, err := f.inner.Fetch(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+
+	batches, err := fetch.Drain(ctx, it)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(r.Matchers) == 0 {
+		return fetch.NewSliceIterator(batches), nil
+	}
+
+	kept := batches[:0]
+	for _, b := range batches {
+		if matchesAllSeries(b.Series, r.Matchers) {
+			kept = append(kept, b)
+		}
+	}
+
+	return fetch.NewSliceIterator(kept), nil
+}
+
+// matchesAllSeries reports whether s satisfies every matcher (each over the present value of
+// its named attribute).
+func matchesAllSeries(s signal.Series, matchers []fetch.Matcher) bool {
+	for i := range matchers {
+		v, ok := s.Attributes.Get(matchers[i].Name)
+		if !ok || !matchers[i].Match(v) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // close tears down the cluster runtime: deregister (revoke lease), stop the server, close the

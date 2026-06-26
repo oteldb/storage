@@ -44,7 +44,7 @@ The design is a single columnar engine with swappable front-ends and backends
 | L3 **Engine** / **Index / WAL** | **head · flush · merge · retention** / **symbols · series · postings** · **write-ahead log** | **engine implemented (metrics)**; **index + wal implemented** |
 | L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
 | L1 **Backend** | file · s3 · memory behind one interface | **memory + file + s3 implemented**, with `PutIfAbsent` CAS; `bucketindex` for stateless part enumeration |
-| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **ring + membership + quorum replication + rebalance + facade cluster mode implemented**; rebalance-plan execution + read fan-out pending |
+| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **ring + membership + quorum replication + rebalance + clustered ingest + read fan-out implemented**; rebalance-plan execution pending |
 
 The **implemented substance spans L1 (backends) through L4 (the fetch contract)** for
 metrics: encoding, parts, index, WAL, the engine head/flush/merge, and the metrics fetch
@@ -439,11 +439,19 @@ routed write path; `WriteMetrics` then frames each tenant's projected series+sam
 payload and replicates it to the tenant's owners (the local owner applies in process via
 `engine.ApplyReplicated`), instead of appending locally. `Close` revokes the lease and stops
 the server. A **two-node end-to-end test** (shared embedded etcd, two `Storage` instances)
-confirms a write to one node is served by both. Reads stay **local** for now — each node
-serves its own engine ∪ object store; **read fan-out** to owners (for another node's unflushed
-head) and the **rebalance-plan executor** (etcd-coordinated ownership handoff) are the
-remaining L0 work. The cluster-mode write path does not yet apply the single-node OOO window or
-per-point partial-success accounting.
+confirms a write to one node is served by both.
+
+**Read fan-out** (`cluster/read.go`): `Storage.Fetcher` is owner-aware in cluster mode. If the
+node owns the tenant it serves locally (the head is replicated there, full matcher pushdown);
+otherwise it fans out over HTTP to an owner's read endpoint and **fails over** between owners (a
+single owner's copy is complete). Matchers are opaque Go predicates and **not serializable**, so
+the RPC carries only the tenant + window — a peer returns its whole window (a superset the fetch
+contract permits) and the requesting node **re-applies the matchers** (their closures live
+there). A three-node, RF=2 end-to-end test confirms a query on a non-owner returns the data. The
+**rebalance-plan executor** (etcd-coordinated ownership handoff) is the remaining L0 work; the
+cluster-mode write path does not yet apply the single-node OOO window or partial-success
+accounting, and remote fan-out has no matcher pushdown (a serializable-matcher protocol would
+add it).
 
 ---
 
@@ -565,7 +573,8 @@ cluster/              L0 distribution: ring + membership + (later) replication �
   cluster/replica     quorum write-replication + node-to-node HTTP transport             [implemented]
   cluster/rebalance   minimal ownership-handoff plan from a ring diff (pure)              [implemented]
   cluster/            cluster write path: EncodeWrite codec + Writer + Config             [implemented]
-.                     (cluster.go) facade cluster mode: Open joins + replica server + routed WriteMetrics [implemented; reads local]
+  cluster/ (read.go)  cluster read RPC: window-fetch codec + ReadHandler + RemoteFetcher    [implemented]
+.                     (cluster.go) facade cluster mode: routed WriteMetrics + owner-aware fan-out reads [implemented]
 ```
 
 "Seam only" packages currently contain their `doc.go` (and, where noted, an interface or
