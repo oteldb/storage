@@ -66,6 +66,30 @@ func (s *Storage) ProfileSeries(
 	return eng.Series(matchers, start, end), nil
 }
 
+// ProfileResolver returns a symbol resolver over a tenant's profile symbol store (the unioned head +
+// part sidecars), so an embedder resolves the content-addressed `stack_id` column of a sample fetch
+// to function frames and builds a flamegraph. An unknown tenant yields an empty resolver (every
+// stack resolves to no frames), so callers need not special-case "no data". Resolution is correct
+// across the cluster — `stack_id`s are global content ids — but reads the local node's symbol store;
+// replicating the store itself is deferred (see `signal/profile`).
+func (s *Storage) ProfileResolver(ctx context.Context, tenant signal.TenantID) (*profile.Resolver, error) {
+	if s.closed.Load() {
+		return nil, errors.Wrap(ErrClosed, "profile resolver")
+	}
+
+	eng, ok := s.lookupProfileEngine(s.normalizeTenant(tenant))
+	if !ok {
+		return profile.NewResolver(nil)
+	}
+
+	tables, err := eng.SideSnapshot(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "load profile symbols")
+	}
+
+	return profile.NewResolver(tables)
+}
+
 // profileEngineFor returns the profiles engine for a tenant, creating it on first use. The engine
 // carries a [profile.SymbolStore] side store, so flush/merge persist and union the symbol tables.
 func (s *Storage) profileEngineFor(tid signal.TenantID) *recordengine.Engine {

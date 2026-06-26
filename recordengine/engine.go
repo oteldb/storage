@@ -288,6 +288,32 @@ func (e *Engine) Replay(dir string) error {
 	})
 }
 
+// SideSnapshot returns the engine's full side-store tables — the live head accumulator unioned with
+// every flushed part's sidecars — as named payloads, for a signal to build a resolver over (e.g. the
+// profiles symbol store). nil when the engine has no side store. Safe for concurrent use.
+func (e *Engine) SideSnapshot(ctx context.Context) (map[string][]byte, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.cfg.SideStore == nil {
+		return map[string][]byte{}, nil
+	}
+
+	parts := make([]map[string][]byte, 0, len(e.parts)+1)
+	parts = append(parts, e.cfg.SideStore.Encode()) // unflushed head symbols
+
+	for _, p := range e.parts {
+		m, err := loadSidecars(ctx, e.cfg.Backend, p.prefix, e.cfg.SideStore.Names())
+		if err != nil {
+			return nil, err
+		}
+
+		parts = append(parts, m)
+	}
+
+	return e.cfg.SideStore.Union(parts)
+}
+
 // PartCount returns the number of flushed parts (introspection).
 func (e *Engine) PartCount() int {
 	e.mu.RLock()
