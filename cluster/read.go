@@ -364,9 +364,10 @@ func decodeColumn(data []byte) (fetch.NamedColumn, []byte, error) {
 type FetchFunc func(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error)
 
 // ReadHandler returns the HTTP handler that serves fetches from the local store, reconstructing
-// the pushed-down equality matchers and dispatching to the metric or log fetch by the request's
-// signal (encoding the result with the matching batch codec). Mount it at [ReadPath].
-func ReadHandler(metricFn, logFn FetchFunc) http.Handler {
+// the pushed-down equality matchers and dispatching to the metric, log, or trace fetch by the
+// request's signal (encoding the result with the matching batch codec — samples for metrics,
+// columns for the record signals). Mount it at [ReadPath].
+func ReadHandler(metricFn, logFn, traceFn FetchFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -394,8 +395,11 @@ func ReadHandler(metricFn, logFn FetchFunc) http.Handler {
 		}
 
 		fn, encode := metricFn, EncodeBatches
-		if sig == signal.Log {
+		switch sig { //nolint:exhaustive // metric is the default; profile is not yet a read signal
+		case signal.Log:
 			fn, encode = logFn, EncodeLogBatches
+		case signal.Trace:
+			fn, encode = traceFn, EncodeLogBatches // record signals share the column codec
 		}
 
 		batches, err := fn(req.Context(), tenant, start, end, matchers)
@@ -462,7 +466,7 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Itera
 	}
 
 	decode := DecodeBatches
-	if f.sig == signal.Log {
+	if f.sig != signal.Metric { // log and trace share the column codec
 		decode = DecodeLogBatches
 	}
 

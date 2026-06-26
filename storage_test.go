@@ -16,7 +16,6 @@ import (
 	"github.com/oteldb/storage/signal/log"
 	"github.com/oteldb/storage/signal/metric"
 	"github.com/oteldb/storage/signal/profile"
-	"github.com/oteldb/storage/signal/trace"
 )
 
 // durableBackend wraps the memory backend but reports itself non-ephemeral, to exercise
@@ -258,9 +257,8 @@ func TestUnimplementedSignals(t *testing.T) {
 	require.NoError(t, err)
 	ctx := context.Background()
 
-	// Logs are implemented (see logs_test.go); traces and profiles remain later verticals.
-	_, err = s.WriteTraces(ctx, trace.Traces{})
-	require.ErrorIs(t, err, ErrNotImplemented)
+	// Logs and traces are implemented (see logs_test.go / traces_test.go); profiles remain a later
+	// vertical.
 	_, err = s.WriteProfiles(ctx, profile.Profiles{})
 	require.ErrorIs(t, err, ErrNotImplemented)
 }

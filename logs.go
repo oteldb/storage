@@ -23,63 +23,13 @@ func (s *Storage) WriteLogs(ctx context.Context, ld log.Logs) (Accepted, error) 
 		return Accepted{}, errors.Wrap(ErrClosed, "write logs")
 	}
 
+	project := func(emit func(*recordengine.Batch)) int { return log.Project(ld, emit) }
+
 	if s.cluster != nil {
-		return s.writeLogsClustered(ctx, ld)
+		return s.writeRecordsClustered(ctx, signal.Log, project)
 	}
 
-	var oooRejected int64
-
-	var (
-		lastTenant signal.TenantID
-		lastEng    *recordengine.Engine
-	)
-
-	emitted := log.Project(ld, func(b *recordengine.Batch) {
-		id := b.Identity()
-		tid := s.tenantFor(id.Resource, id.Scope)
-		if lastEng == nil || tid != lastTenant {
-			lastTenant, lastEng = tid, s.logEngineFor(tid)
-		}
-
-		// Engines are ephemeral here (no WAL wired into the facade), so AppendBatch never errors;
-		// records beyond the OOO window are not accepted and counted as rejected.
-		accepted, _ := lastEng.AppendBatch(b)
-		oooRejected += int64(b.Len() - accepted)
-	})
-
-	return Accepted{
-		Accepted: int64(emitted) - oooRejected,
-		Rejected: oooRejected,
-	}, nil
-}
-
-// writeLogsClustered is the cluster ingest path for logs: it projects the batch, frames each
-// tenant's streams + records as a WAL-encoded payload (via [recordengine.EncodeWAL]), and routes
-// each to its ring primary (the single authority — it OOO-checks, reports the reject count, and
-// replicates the accepted set). The returned accounting matches the single-node path.
-func (s *Storage) writeLogsClustered(ctx context.Context, ld log.Logs) (Accepted, error) {
-	byTenant := make(map[signal.TenantID][]byte)
-
-	emitted := log.Project(ld, func(b *recordengine.Batch) {
-		id := b.Identity()
-		tid := s.tenantFor(id.Resource, id.Scope)
-		byTenant[tid] = append(byTenant[tid], recordengine.EncodeWAL(b)...)
-	})
-
-	var rejected int64
-
-	for tid, payload := range byTenant {
-		tenant := string(s.normalizeTenant(tid))
-
-		rej, err := s.routeToPrimary(ctx, signal.Log, tenant, payload)
-		if err != nil {
-			return Accepted{Accepted: int64(emitted) - rejected, Rejected: rejected}, err
-		}
-
-		rejected += int64(rej)
-	}
-
-	return Accepted{Accepted: int64(emitted) - rejected, Rejected: rejected}, nil
+	return s.writeRecordsLocal(project, s.logEngineFor)
 }
 
 // LogFetcher returns the read seam for logs — a [fetch.Fetcher] over the named tenants' log data
@@ -87,46 +37,7 @@ func (s *Storage) writeLogsClustered(ctx context.Context, ld log.Logs) (Accepted
 // or none ⇒ all tenants with log data. Always usable: an empty fetcher when no tenant matches or
 // after [Close]. Label matchers resolve streams; column Conditions filter records.
 func (s *Storage) LogFetcher(tenants ...signal.TenantID) fetch.Fetcher {
-	if s.closed.Load() {
-		return fetch.Merge() // empty
-	}
-
-	// In cluster mode a named tenant is served owner-aware (local if owned, else fanned out).
-	if s.cluster != nil && len(tenants) > 0 {
-		fetchers := make([]fetch.Fetcher, 0, len(tenants))
-		for _, t := range tenants {
-			fetchers = append(fetchers, s.clusterLogFetcherFor(t))
-		}
-
-		if len(fetchers) == 1 {
-			return fetchers[0]
-		}
-
-		return concatFetcher(fetchers)
-	}
-
-	var fetchers []fetch.Fetcher
-
-	if len(tenants) == 0 {
-		for _, eng := range s.logEngineSnapshot() {
-			fetchers = append(fetchers, eng)
-		}
-	} else {
-		for _, t := range tenants {
-			if e, ok := s.lookupLogEngine(s.normalizeTenant(t)); ok {
-				fetchers = append(fetchers, e)
-			}
-		}
-	}
-
-	switch len(fetchers) {
-	case 0:
-		return fetch.Merge() // empty
-	case 1:
-		return fetchers[0]
-	default:
-		return concatFetcher(fetchers)
-	}
+	return s.recordFetcher(tenants, s.logEngineSnapshot, s.lookupLogEngine, s.clusterLogFetcherFor)
 }
 
 // concatFetcher runs each child and concatenates their batches. Unlike [fetch.Merge] it does not

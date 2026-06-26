@@ -17,6 +17,7 @@ import (
 	"github.com/oteldb/storage/cluster/etcd"
 	"github.com/oteldb/storage/cluster/replica"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
 	"github.com/oteldb/storage/wal"
@@ -67,9 +68,9 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle(replica.ReplicatePath, rp.Handler())                                  // secondary: trusting apply
-	mux.Handle(primaryWritePath, s.primaryWriteHandler())                            // primary: OOO apply + replicate
-	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch, s.localLogFetch)) // read fan-out
+	mux.Handle(replica.ReplicatePath, rp.Handler())                                                     // secondary: trusting apply
+	mux.Handle(primaryWritePath, s.primaryWriteHandler())                                               // primary: OOO apply + replicate
+	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch, s.localLogFetch, s.localTraceFetch)) // read fan-out
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	go func() { _ = srv.Serve(ln) }()
@@ -117,8 +118,6 @@ func (s *Storage) localFetch(ctx context.Context, tenant string, start, end int6
 // tenant it serves locally (the head is replicated here, with full matcher pushdown); otherwise
 // it fans out to an owner over HTTP (a window superset) and re-applies the request's matchers,
 // failing over between owners.
-//
-//nolint:dupl // the log analog clusterLogFetcherFor deliberately mirrors this shape
 func (s *Storage) clusterFetcherFor(tid signal.TenantID) fetch.Fetcher {
 	cn := s.cluster
 	owners := cn.membership.Ring().Lookup([]byte(s.normalizeTenant(tid)), cn.rf)
@@ -161,17 +160,45 @@ func (s *Storage) localLogFetch(ctx context.Context, tenant string, start, end i
 // clusterLogFetcherFor returns the log read seam for one tenant in cluster mode: local if this
 // node owns the tenant, otherwise fanned out to an owner (a window+matcher superset re-filtered
 // here), failing over between owners — the logs analog of [Storage.clusterFetcherFor].
-//
-//nolint:dupl // deliberately mirrors clusterFetcherFor over the log engine + log remote fetcher
 func (s *Storage) clusterLogFetcherFor(tid signal.TenantID) fetch.Fetcher {
+	return s.clusterRecordFetcherFor(signal.Log, tid, s.lookupLogEngine)
+}
+
+// localTraceFetch serves a peer's span fetch from the local traces engine.
+func (s *Storage) localTraceFetch(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
+	eng, ok := s.lookupTraceEngine(s.normalizeTenant(signal.TenantID(tenant)))
+	if !ok {
+		return nil, nil
+	}
+
+	it, err := eng.Fetch(ctx, fetch.Request{Signal: signal.Trace, Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers})
+	if err != nil {
+		return nil, err
+	}
+
+	return fetch.Drain(ctx, it)
+}
+
+// clusterTraceFetcherFor is the traces analog of [Storage.clusterLogFetcherFor].
+func (s *Storage) clusterTraceFetcherFor(tid signal.TenantID) fetch.Fetcher {
+	return s.clusterRecordFetcherFor(signal.Trace, tid, s.lookupTraceEngine)
+}
+
+// clusterRecordFetcherFor returns a record signal's read seam for one tenant in cluster mode:
+// local if this node owns the tenant (the head is replicated here), otherwise fanned out to an
+// owner over HTTP (a window+matcher superset the requester re-filters), failing over between
+// owners. lookup resolves the local engine for the signal.
+func (s *Storage) clusterRecordFetcherFor(
+	sig signal.Signal, tid signal.TenantID, lookup func(signal.TenantID) (*recordengine.Engine, bool),
+) fetch.Fetcher {
 	cn := s.cluster
 	owners := cn.membership.Ring().Lookup([]byte(s.normalizeTenant(tid)), cn.rf)
 
 	var remotes []fetch.Fetcher
 	for _, o := range owners {
 		addr := cn.membership.AddrOf(o.ID)
-		if addr == cn.self { // owner: serve locally (head replicated here)
-			if e, ok := s.lookupLogEngine(s.normalizeTenant(tid)); ok {
+		if addr == cn.self { // owner: serve locally
+			if e, ok := lookup(s.normalizeTenant(tid)); ok {
 				return e
 			}
 
@@ -179,32 +206,41 @@ func (s *Storage) clusterLogFetcherFor(tid signal.TenantID) fetch.Fetcher {
 		}
 
 		if addr != "" {
-			remotes = append(remotes, cluster.NewRemoteFetcher(signal.Log, addr, nil))
+			remotes = append(remotes, cluster.NewRemoteFetcher(sig, addr, nil))
 		}
 	}
 
 	return &filteringFetcher{inner: failoverFetcher(remotes)}
 }
 
-// applyReplicated is the secondary receive path: it decodes a primary's accepted write and
-// applies it verbatim to the local tenant engine for the addressed signal (metrics or logs) —
-// no OOO re-check, the primary already decided.
+// recordEngineFor returns the local record engine (logs or traces) for a signal+tenant.
+func (s *Storage) recordEngineFor(sig signal.Signal, tenant string) *recordengine.Engine {
+	if sig == signal.Trace {
+		return s.traceEngineFor(signal.TenantID(tenant))
+	}
+
+	return s.logEngineFor(signal.TenantID(tenant))
+}
+
+// applyReplicated is the secondary receive path: it decodes a primary's accepted write and applies
+// it verbatim to the local tenant engine for the addressed signal — no OOO re-check, the primary
+// already decided.
 func (s *Storage) applyReplicated(_ context.Context, payload []byte) error {
 	sig, tenant, walBytes, err := cluster.DecodeWrite(payload)
 	if err != nil {
 		return err
 	}
 
-	if sig == signal.Log {
-		if err := s.logEngineFor(signal.TenantID(tenant)).ApplyReplicated(walBytes); err != nil {
-			return errors.Wrapf(err, "apply replicated logs for tenant %q", tenant)
+	if sig == signal.Metric {
+		if err := s.engineFor(signal.TenantID(tenant)).ApplyReplicated(walBytes); err != nil {
+			return errors.Wrapf(err, "apply replicated metrics for tenant %q", tenant)
 		}
 
 		return nil
 	}
 
-	if err := s.engineFor(signal.TenantID(tenant)).ApplyReplicated(walBytes); err != nil {
-		return errors.Wrapf(err, "apply replicated write for tenant %q", tenant)
+	if err := s.recordEngineFor(sig, tenant).ApplyReplicated(walBytes); err != nil {
+		return errors.Wrapf(err, "apply replicated %s for tenant %q", sig, tenant)
 	}
 
 	return nil
@@ -379,10 +415,10 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 		err      error
 	)
 
-	if sig == signal.Log {
-		accepted, rejected, err = s.logEngineFor(signal.TenantID(tenant)).ApplyPrimary(walBytes)
-	} else {
+	if sig == signal.Metric {
 		accepted, rejected, err = s.engineFor(signal.TenantID(tenant)).ApplyPrimary(walBytes)
+	} else {
+		accepted, rejected, err = s.recordEngineFor(sig, tenant).ApplyPrimary(walBytes)
 	}
 
 	if err != nil {

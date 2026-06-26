@@ -20,7 +20,6 @@ import (
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
 	"github.com/oteldb/storage/signal/profile"
-	"github.com/oteldb/storage/signal/trace"
 	"github.com/oteldb/storage/tenant"
 )
 
@@ -42,9 +41,10 @@ type Storage struct {
 	tenant  tenant.Resolver
 	closed  atomic.Bool
 
-	tmu        sync.Mutex
-	tenants    map[signal.TenantID]*engine.Engine
-	logTenants map[signal.TenantID]*recordengine.Engine
+	tmu          sync.Mutex
+	tenants      map[signal.TenantID]*engine.Engine
+	logTenants   map[signal.TenantID]*recordengine.Engine
+	traceTenants map[signal.TenantID]*recordengine.Engine
 
 	cluster *clusterNode // cluster runtime (membership + replica server + routed writes); nil ⇒ single-node
 
@@ -66,11 +66,12 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	}
 	o.applyDefaults()
 	s := &Storage{
-		opts:       o,
-		backend:    o.Backend,
-		tenant:     o.Tenancy,
-		tenants:    make(map[signal.TenantID]*engine.Engine),
-		logTenants: make(map[signal.TenantID]*recordengine.Engine),
+		opts:         o,
+		backend:      o.Backend,
+		tenant:       o.Tenancy,
+		tenants:      make(map[signal.TenantID]*engine.Engine),
+		logTenants:   make(map[signal.TenantID]*recordengine.Engine),
+		traceTenants: make(map[signal.TenantID]*recordengine.Engine),
 	}
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
@@ -151,6 +152,12 @@ func (s *Storage) Close(ctx context.Context) error {
 		}
 	}
 
+	for _, eng := range s.traceEngineSnapshot() {
+		if err := eng.Close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
 	return firstErr
 }
 
@@ -178,6 +185,12 @@ func (s *Storage) Reset(ctx context.Context) error {
 	for _, eng := range s.logEngineSnapshot() {
 		if err := eng.Reset(ctx); err != nil {
 			return errors.Wrap(err, "reset log engine")
+		}
+	}
+
+	for _, eng := range s.traceEngineSnapshot() {
+		if err := eng.Reset(ctx); err != nil {
+			return errors.Wrap(err, "reset trace engine")
 		}
 	}
 
@@ -224,11 +237,6 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted
 		Accepted: int64(emitted) - oooRejected,
 		Rejected: oooRejected,
 	}, nil
-}
-
-// WriteTraces ingests a traces batch. Later vertical.
-func (s *Storage) WriteTraces(_ context.Context, _ trace.Traces) (Accepted, error) {
-	return s.notImplementedWrite("write traces")
 }
 
 // WriteProfiles ingests a profiles batch. Later vertical.
@@ -403,6 +411,7 @@ func (s *Storage) recover(ctx context.Context) error {
 
 	metricSuffix := metricsPrefix + "/" + bucketindex.Object
 	logSuffix := logsPrefix + "/" + bucketindex.Object
+	traceSuffix := tracesPrefix + "/" + bucketindex.Object
 
 	for _, k := range keys {
 		switch {
@@ -415,6 +424,11 @@ func (s *Storage) recover(ctx context.Context) error {
 			tid := signal.TenantID(strings.TrimSuffix(k, logSuffix))
 			if err := s.logEngineFor(tid).LoadParts(ctx); err != nil {
 				return errors.Wrapf(err, "recover logs tenant %q", tid)
+			}
+		case strings.HasSuffix(k, traceSuffix):
+			tid := signal.TenantID(strings.TrimSuffix(k, traceSuffix))
+			if err := s.traceEngineFor(tid).LoadParts(ctx); err != nil {
+				return errors.Wrapf(err, "recover traces tenant %q", tid)
 			}
 		}
 	}
@@ -467,16 +481,21 @@ func (s *Storage) runMaintenance(interval time.Duration) {
 func (s *Storage) maintain(ctx context.Context) {
 	metricEngines := s.engineSnapshotByTenant()
 	logEngines := s.logEngineSnapshotByTenant()
+	traceEngines := s.traceEngineSnapshotByTenant()
 
 	// Compaction ownership is per-tenant and shared across signals, so reconcile it once over the
-	// union of metric and log tenants (reconciling per-signal would have each release the other's
+	// union of all signals' tenants (reconciling per-signal would have each release the others'
 	// claims). nil ⇒ single-node: own everything.
-	tids := make(map[signal.TenantID]struct{}, len(metricEngines)+len(logEngines))
+	tids := make(map[signal.TenantID]struct{}, len(metricEngines)+len(logEngines)+len(traceEngines))
 	for tid := range metricEngines {
 		tids[tid] = struct{}{}
 	}
 
 	for tid := range logEngines {
+		tids[tid] = struct{}{}
+	}
+
+	for tid := range traceEngines {
 		tids[tid] = struct{}{}
 	}
 
@@ -503,6 +522,11 @@ func (s *Storage) maintain(ctx context.Context) {
 	}
 
 	for tid, eng := range logEngines {
+		maintainEngine(tid, func() error { return eng.Flush(ctx) },
+			func(r int64) error { return eng.Merge(ctx, r) }, func() error { return eng.RefreshReplica(ctx) })
+	}
+
+	for tid, eng := range traceEngines {
 		maintainEngine(tid, func() error { return eng.Flush(ctx) },
 			func(r int64) error { return eng.Merge(ctx, r) }, func() error { return eng.RefreshReplica(ctx) })
 	}

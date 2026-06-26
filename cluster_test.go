@@ -279,6 +279,46 @@ func TestClusteredLogsReplicateAndRead(t *testing.T) {
 	}
 }
 
+// TestClusteredTracesReplicateAndRead is the traces analog of the clustered-logs capstone: spans
+// written to one node are routed to the tenant's primary and replicated to both owners, and a
+// trace-by-id lookup on the third (non-owner) node fans out to an owner and returns the trace.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusteredTracesReplicateAndRead(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNode(t, endpoint, "node-a"),
+		"node-b": openClusterNode(t, endpoint, "node-b"),
+		"node-c": openClusterNode(t, endpoint, "node-c"),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+
+	_, err := a.WriteTraces(ctx, traceBatch("api",
+		spanSpec{traceID: "T", spanID: "root", name: "GET /", start: 100, end: 900},
+		spanSpec{traceID: "T", spanID: "child", parent: "root", name: "db", start: 200, end: 400},
+	))
+	require.NoError(t, err)
+
+	// Every node serves the trace by id — owners locally, the non-owner via fan-out.
+	for name, s := range nodes {
+		got, err := s.Trace(ctx, "default", []byte("T"))
+		require.NoErrorf(t, err, "%s trace-by-id", name)
+
+		names := make([]string, 0, 2)
+		for _, b := range got {
+			names = append(names, spanNames(b)...)
+		}
+
+		assert.ElementsMatchf(t, []string{"GET /", "db"}, names, "%s returns the trace's spans", name)
+	}
+}
+
 // TestClusteredLogsAccountForRejected proves the primary-authoritative log path reports accurate
 // partial-success accounting: an out-of-order record surfaces in Accepted.Rejected.
 //

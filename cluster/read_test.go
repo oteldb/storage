@@ -120,8 +120,8 @@ func TestRemoteFetcherOverHTTP(t *testing.T) {
 
 		return want, nil
 	}
-	logFn := func(context.Context, string, int64, int64, []fetch.Matcher) ([]*fetch.Batch, error) { return nil, nil }
-	handler := cluster.ReadHandler(metricFn, logFn)
+	noFn := func(context.Context, string, int64, int64, []fetch.Matcher) ([]*fetch.Batch, error) { return nil, nil }
+	handler := cluster.ReadHandler(metricFn, noFn, noFn)
 
 	mux := http.NewServeMux()
 	mux.Handle(cluster.ReadPath, handler)
