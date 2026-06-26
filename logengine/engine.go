@@ -153,6 +153,12 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 				continue // time-prune via the part's bounds
 			}
 
+			// Full-text prune: when conditions are applied (AllConditions) and carry required
+			// body tokens, skip a part whose bloom proves a token absent (no false negatives).
+			if r.AllConditions && !p.bodyTokensPresent(r.Conditions) {
+				continue
+			}
+
 			if err := p.appendWindow(ctx, id, acc, r.Start, r.End); err != nil {
 				return nil, err
 			}

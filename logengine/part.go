@@ -6,6 +6,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/index/bloom"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -19,9 +20,10 @@ type rowRange struct{ start, end int }
 // StreamID → row-range index. Rows are sorted by (stream, ts), so every stream occupies one
 // contiguous run; the index is one entry per stream, built by scanning the stream column once.
 type part struct {
-	reader *block.PartReader
-	prefix string
-	ranges map[signal.SeriesID]rowRange
+	reader    *block.PartReader
+	prefix    string
+	ranges    map[signal.SeriesID]rowRange
+	bodyBloom *bloom.Filter // body token bloom for full-text pruning; nil ⇒ always scan
 
 	// minTime, maxTime are the inclusive unix-ns record bounds of the part (from the flush/merge
 	// columns when written, from the bucket index when reconstructed), for time pruning.
@@ -73,7 +75,12 @@ func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, err
 		i = j
 	}
 
-	return &part{reader: r, prefix: prefix, ranges: ranges}, nil
+	bf, err := loadBodyBloom(ctx, b, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	return &part{reader: r, prefix: prefix, ranges: ranges, bodyBloom: bf}, nil
 }
 
 // appendWindow appends stream id's records whose timestamp is in [start, end] to acc. It is a

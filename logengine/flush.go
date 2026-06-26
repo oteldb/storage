@@ -118,6 +118,11 @@ func writePart(ctx context.Context, b backend.Backend, prefix string, f *flushCo
 		return errors.Wrapf(err, "write part %q", prefix)
 	}
 
+	// Write the body token bloom alongside the part for full-text pruning.
+	if err := writeBodyBloom(ctx, b, prefix, f.cols.body); err != nil {
+		return err
+	}
+
 	return nil
 }
 
