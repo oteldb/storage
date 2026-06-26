@@ -17,9 +17,22 @@ import (
 	"github.com/oteldb/storage/backend"
 )
 
-// Run executes the full conformance suite against a backend produced by factory. Each
-// subtest gets a fresh, empty backend. Call it from each implementation's test package.
+// Run executes the full conformance suite against a backend produced by factory: the core
+// object operations ([RunCore]) plus the conditional-write (CAS) operations. Each subtest
+// gets a fresh, empty backend. Call it from each implementation's test package.
 func Run(t *testing.T, factory func(t *testing.T) backend.Backend) {
+	t.Helper()
+
+	RunCore(t, factory)
+	runConditional(t, factory)
+}
+
+// RunCore executes the unconditional object operations of the conformance suite
+// (Read/Write/List/Delete/IsEphemeral). It omits [Backend.PutIfAbsent], so it can validate a
+// backend over an object store that lacks conditional writes (S3 If-None-Match) — the
+// embeddable go-faster/fs server used by the s3 integration test does not implement them.
+// Backends that do support CAS should use [Run].
+func RunCore(t *testing.T, factory func(t *testing.T) backend.Backend) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -174,6 +187,13 @@ func Run(t *testing.T, factory func(t *testing.T) backend.Backend) {
 		_ = b.IsEphemeral()
 		_ = errors.Is(backend.ErrNotExist, backend.ErrNotExist)
 	})
+}
+
+// runConditional executes the PutIfAbsent (CAS) conformance subtests.
+func runConditional(t *testing.T, factory func(t *testing.T) backend.Backend) {
+	t.Helper()
+
+	ctx := context.Background()
 
 	t.Run("PutIfAbsentClaimsKey", func(t *testing.T) {
 		b := factory(t)
