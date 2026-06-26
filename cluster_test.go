@@ -249,6 +249,60 @@ func TestClusterReplicaTrimsHeadAfterOwnerFlush(t *testing.T) {
 	assert.Equal(t, []int64{100, 200}, got[0].Timestamps)
 }
 
+// TestClusteredLogsReplicateAndRead is the logs analog of the metric capstone: a log write to one
+// node is routed by the ring to the tenant's primary and replicated to both owners, so each node
+// serves it. The third node (a non-owner) reads it via the log read fan-out.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusteredLogsReplicateAndRead(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNode(t, endpoint, "node-a"),
+		"node-b": openClusterNode(t, endpoint, "node-b"),
+		"node-c": openClusterNode(t, endpoint, "node-c"),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+
+	_, err := a.WriteLogs(ctx, logBatch("api", [3]any{100, 9, "first"}, [3]any{200, 17, "second"}))
+	require.NoError(t, err)
+
+	// Every node serves the records — owners from their replica, the non-owner via fan-out.
+	for name, s := range nodes {
+		got := logBodies(t, s.LogFetcher("default"), fetch.Request{Start: 0, End: 1 << 60})
+		assert.Equalf(t, []string{"first", "second"}, got, "%s serves the clustered logs", name)
+	}
+}
+
+// TestClusteredLogsAccountForRejected proves the primary-authoritative log path reports accurate
+// partial-success accounting: an out-of-order record surfaces in Accepted.Rejected.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusteredLogsAccountForRejected(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	s := openClusterNodeWith(t, endpoint, "node-a", backend.Memory(), WithOOOWindow(50))
+
+	require.Eventually(t, func() bool {
+		return len(s.cluster.membership.Members()) == 1
+	}, 10*time.Second, 50*time.Millisecond)
+
+	acc, err := s.WriteLogs(ctx, logBatch("api", [3]any{2000, 9, "a"}))
+	require.NoError(t, err)
+	assert.Equal(t, Accepted{Accepted: 1}, acc)
+
+	// 3000 advances newest; 900 is far below (newest-OOOWindow) so the primary rejects it.
+	acc, err = s.WriteLogs(ctx, logBatch("api", [3]any{3000, 9, "b"}, [3]any{900, 9, "old"}))
+	require.NoError(t, err)
+	assert.Equal(t, Accepted{Accepted: 1, Rejected: 1}, acc, "the out-of-order record is accounted as rejected")
+}
+
 // TestClusterPrimaryAccountsForRejectedSamples proves the primary-authoritative write path
 // reports accurate partial-success accounting: the ring-primary OOO-checks the write (the single
 // authority for the shard) and the rejected count surfaces all the way back through the clustered

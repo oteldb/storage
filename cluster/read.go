@@ -21,10 +21,11 @@ const ReadPath = "/internal/fetch"
 // are opaque Go predicates (not serializable). A peer returns every series in the window (a
 // superset, which the fetch contract permits); the requesting node re-applies its matchers.
 
-// EncodeFetchRequest frames a fetch request: tenant, window, and any serializable equality
-// matchers to push down to the peer (other predicates are re-checked by the requester).
-func EncodeFetchRequest(tenant string, start, end int64, eq []fetch.EqualMatcher) []byte {
-	buf := appendString(nil, tenant)
+// EncodeFetchRequest frames a fetch request: the signal, tenant, window, and any serializable
+// equality matchers to push down to the peer (other predicates are re-checked by the requester).
+func EncodeFetchRequest(sig signal.Signal, tenant string, start, end int64, eq []fetch.EqualMatcher) []byte {
+	buf := []byte{byte(sig)}
+	buf = appendString(buf, tenant)
 	buf = binary.AppendVarint(buf, start)
 	buf = binary.AppendVarint(buf, end)
 	buf = binary.AppendUvarint(buf, uint64(len(eq)))
@@ -37,26 +38,35 @@ func EncodeFetchRequest(tenant string, start, end int64, eq []fetch.EqualMatcher
 }
 
 // DecodeFetchRequest parses a request made by [EncodeFetchRequest].
-func DecodeFetchRequest(data []byte) (tenant string, start, end int64, eq []fetch.EqualMatcher, err error) {
+//
+//nolint:gocritic // the wire shape is signal+tenant+window+matchers+err; a struct would obscure it
+func DecodeFetchRequest(data []byte) (sig signal.Signal, tenant string, start, end int64, eq []fetch.EqualMatcher, err error) {
+	if len(data) < 1 {
+		return 0, "", 0, 0, nil, errors.New("cluster: empty fetch request")
+	}
+
+	sig = signal.Signal(data[0])
+	data = data[1:]
+
 	tenant, data, err = takeString(data)
 	if err != nil {
-		return "", 0, 0, nil, errors.Wrap(err, "tenant")
+		return 0, "", 0, 0, nil, errors.Wrap(err, "tenant")
 	}
 
 	var m int
 	if start, m = binary.Varint(data); m <= 0 {
-		return "", 0, 0, nil, errors.New("cluster: malformed fetch request start")
+		return 0, "", 0, 0, nil, errors.New("cluster: malformed fetch request start")
 	}
 	data = data[m:]
 
 	if end, m = binary.Varint(data); m <= 0 {
-		return "", 0, 0, nil, errors.New("cluster: malformed fetch request end")
+		return 0, "", 0, 0, nil, errors.New("cluster: malformed fetch request end")
 	}
 	data = data[m:]
 
 	count, m := binary.Uvarint(data)
 	if m <= 0 {
-		return "", 0, 0, nil, errors.New("cluster: malformed matcher count")
+		return 0, "", 0, 0, nil, errors.New("cluster: malformed matcher count")
 	}
 	data = data[m:]
 
@@ -64,17 +74,17 @@ func DecodeFetchRequest(data []byte) (tenant string, start, end int64, eq []fetc
 	for range count {
 		var name, value string
 		if name, data, err = takeString(data); err != nil {
-			return "", 0, 0, nil, errors.Wrap(err, "matcher name")
+			return 0, "", 0, 0, nil, errors.Wrap(err, "matcher name")
 		}
 
 		if value, data, err = takeString(data); err != nil {
-			return "", 0, 0, nil, errors.Wrap(err, "matcher value")
+			return 0, "", 0, 0, nil, errors.Wrap(err, "matcher value")
 		}
 
 		eq = append(eq, fetch.EqualMatcher{Name: name, Value: value})
 	}
 
-	return tenant, start, end, eq, nil
+	return sig, tenant, start, end, eq, nil
 }
 
 func appendString(dst []byte, s string) []byte {
@@ -158,13 +168,205 @@ func DecodeBatches(data []byte) ([]*fetch.Batch, error) {
 	return out, nil
 }
 
+// Log-batch column kind tags on the wire.
+const (
+	colKindInt64 byte = 0
+	colKindFloat byte = 1
+	colKindBytes byte = 2
+)
+
+// EncodeLogBatches serializes log fetch batches: each stream's identity, its record timestamps,
+// and its named per-record columns (each tagged by physical kind). The id is recomputed from the
+// identity on decode, so it is not sent.
+func EncodeLogBatches(batches []*fetch.Batch) []byte {
+	buf := binary.AppendUvarint(nil, uint64(len(batches)))
+	for _, b := range batches {
+		enc := b.Series.AppendHashInput(nil)
+		buf = binary.AppendUvarint(buf, uint64(len(enc)))
+		buf = append(buf, enc...)
+
+		buf = binary.AppendUvarint(buf, uint64(len(b.Timestamps)))
+		for _, t := range b.Timestamps {
+			buf = binary.AppendVarint(buf, t)
+		}
+
+		buf = binary.AppendUvarint(buf, uint64(len(b.Columns)))
+		for i := range b.Columns {
+			buf = appendColumn(buf, &b.Columns[i])
+		}
+	}
+
+	return buf
+}
+
+func appendColumn(buf []byte, c *fetch.NamedColumn) []byte {
+	buf = appendString(buf, c.Name)
+
+	switch {
+	case c.Bytes != nil:
+		buf = append(buf, colKindBytes)
+		buf = binary.AppendUvarint(buf, uint64(len(c.Bytes)))
+		for _, v := range c.Bytes {
+			buf = appendString(buf, string(v))
+		}
+	case c.Float64 != nil:
+		buf = append(buf, colKindFloat)
+		buf = binary.AppendUvarint(buf, uint64(len(c.Float64)))
+		for _, v := range c.Float64 {
+			buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(v))
+		}
+	default:
+		buf = append(buf, colKindInt64)
+		buf = binary.AppendUvarint(buf, uint64(len(c.Int64)))
+		for _, v := range c.Int64 {
+			buf = binary.AppendVarint(buf, v)
+		}
+	}
+
+	return buf
+}
+
+// DecodeLogBatches parses [EncodeLogBatches] output, recomputing each batch's id from its identity.
+func DecodeLogBatches(data []byte) ([]*fetch.Batch, error) {
+	count, m := binary.Uvarint(data)
+	if m <= 0 {
+		return nil, errors.New("cluster: malformed log batches")
+	}
+
+	data = data[m:]
+
+	out := make([]*fetch.Batch, 0, count)
+	for range count {
+		sl, m := binary.Uvarint(data)
+		if m <= 0 || sl > uint64(len(data)-m) {
+			return nil, errors.New("cluster: malformed log batch identity")
+		}
+
+		data = data[m:]
+
+		s, _, err := signal.DecodeSeries(data[:sl])
+		if err != nil {
+			return nil, errors.Wrap(err, "decode stream")
+		}
+
+		data = data[sl:]
+
+		b := &fetch.Batch{ID: s.Hash(), Series: s}
+
+		if b.Timestamps, data, err = decodeTimestamps(data); err != nil {
+			return nil, err
+		}
+
+		nc, m := binary.Uvarint(data)
+		if m <= 0 {
+			return nil, errors.New("cluster: malformed column count")
+		}
+
+		data = data[m:]
+
+		for range nc {
+			var col fetch.NamedColumn
+			if col, data, err = decodeColumn(data); err != nil {
+				return nil, err
+			}
+
+			b.Columns = append(b.Columns, col)
+		}
+
+		out = append(out, b)
+	}
+
+	return out, nil
+}
+
+func decodeTimestamps(data []byte) ([]int64, []byte, error) {
+	n, m := binary.Uvarint(data)
+	if m <= 0 {
+		return nil, nil, errors.New("cluster: malformed timestamp count")
+	}
+
+	data = data[m:]
+	ts := make([]int64, 0, n)
+
+	for range n {
+		t, m := binary.Varint(data)
+		if m <= 0 {
+			return nil, nil, errors.New("cluster: malformed timestamp")
+		}
+
+		data = data[m:]
+		ts = append(ts, t)
+	}
+
+	return ts, data, nil
+}
+
+func decodeColumn(data []byte) (fetch.NamedColumn, []byte, error) {
+	name, data, err := takeString(data)
+	if err != nil {
+		return fetch.NamedColumn{}, nil, errors.Wrap(err, "column name")
+	}
+
+	if len(data) < 1 {
+		return fetch.NamedColumn{}, nil, errors.New("cluster: missing column kind")
+	}
+
+	kind := data[0]
+	data = data[1:]
+
+	n, m := binary.Uvarint(data)
+	if m <= 0 {
+		return fetch.NamedColumn{}, nil, errors.New("cluster: malformed column length")
+	}
+
+	data = data[m:]
+	col := fetch.NamedColumn{Name: name}
+
+	switch kind {
+	case colKindBytes:
+		col.Bytes = make([][]byte, 0, n)
+		for range n {
+			var v string
+			if v, data, err = takeString(data); err != nil {
+				return fetch.NamedColumn{}, nil, errors.Wrap(err, "column bytes")
+			}
+
+			col.Bytes = append(col.Bytes, []byte(v))
+		}
+	case colKindFloat:
+		col.Float64 = make([]float64, 0, n)
+		for range n {
+			if len(data) < 8 {
+				return fetch.NamedColumn{}, nil, errors.New("cluster: malformed float column")
+			}
+
+			col.Float64 = append(col.Float64, math.Float64frombits(binary.BigEndian.Uint64(data)))
+			data = data[8:]
+		}
+	default:
+		col.Int64 = make([]int64, 0, n)
+		for range n {
+			v, m := binary.Varint(data)
+			if m <= 0 {
+				return fetch.NamedColumn{}, nil, errors.New("cluster: malformed int column")
+			}
+
+			data = data[m:]
+			col.Int64 = append(col.Int64, v)
+		}
+	}
+
+	return col, data, nil
+}
+
 // FetchFunc fetches a tenant's series within [start, end] from the local store, applying the
 // pushed-down matchers. It is what [ReadHandler] serves.
 type FetchFunc func(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error)
 
 // ReadHandler returns the HTTP handler that serves fetches from the local store, reconstructing
-// the pushed-down equality matchers. Mount it on the node's server at [ReadPath].
-func ReadHandler(fetchFn FetchFunc) http.Handler {
+// the pushed-down equality matchers and dispatching to the metric or log fetch by the request's
+// signal (encoding the result with the matching batch codec). Mount it at [ReadPath].
+func ReadHandler(metricFn, logFn FetchFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -179,7 +381,7 @@ func ReadHandler(fetchFn FetchFunc) http.Handler {
 			return
 		}
 
-		tenant, start, end, eq, err := DecodeFetchRequest(body)
+		sig, tenant, start, end, eq, err := DecodeFetchRequest(body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 
@@ -191,14 +393,19 @@ func ReadHandler(fetchFn FetchFunc) http.Handler {
 			matchers[i] = fetch.Matcher{Name: []byte(eq[i].Name), Match: eq[i].Predicate(), Spec: &eq[i]}
 		}
 
-		batches, err := fetchFn(req.Context(), tenant, start, end, matchers)
+		fn, encode := metricFn, EncodeBatches
+		if sig == signal.Log {
+			fn, encode = logFn, EncodeLogBatches
+		}
+
+		batches, err := fn(req.Context(), tenant, start, end, matchers)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 
 			return
 		}
 
-		_, _ = w.Write(EncodeBatches(batches))
+		_, _ = w.Write(encode(batches))
 	})
 }
 
@@ -206,23 +413,24 @@ func ReadHandler(fetchFn FetchFunc) http.Handler {
 // request's tenant and window (matchers are re-applied by the caller), so it returns the
 // peer's full window — a superset the fetch contract permits.
 type RemoteFetcher struct {
+	sig    signal.Signal
 	addr   string
 	client *http.Client
 }
 
-// NewRemoteFetcher returns a fetcher that reads from the peer at addr. A nil client uses
-// [http.DefaultClient].
-func NewRemoteFetcher(addr string, client *http.Client) *RemoteFetcher {
+// NewRemoteFetcher returns a fetcher that reads the given signal from the peer at addr. A nil
+// client uses [http.DefaultClient]. The zero signal value reads metrics.
+func NewRemoteFetcher(sig signal.Signal, addr string, client *http.Client) *RemoteFetcher {
 	if client == nil {
 		client = http.DefaultClient
 	}
 
-	return &RemoteFetcher{addr: addr, client: client}
+	return &RemoteFetcher{sig: sig, addr: addr, client: client}
 }
 
 // Fetch forwards r's tenant, window, and serializable (equality) matchers to the peer and
-// returns the decoded batches. Non-equality matchers are not forwarded — the requester
-// re-applies the full matcher set to the (possibly superset) result.
+// returns the decoded batches. Non-equality matchers (and columnar conditions) are not forwarded —
+// the requester re-applies them to the (possibly superset) result.
 func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
 	var eq []fetch.EqualMatcher
 	for i := range r.Matchers {
@@ -231,7 +439,7 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Itera
 		}
 	}
 
-	payload := EncodeFetchRequest(string(r.Tenant), r.Start, r.End, eq)
+	payload := EncodeFetchRequest(f.sig, string(r.Tenant), r.Start, r.End, eq)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+f.addr+ReadPath, bytes.NewReader(payload))
 	if err != nil {
@@ -253,7 +461,12 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Itera
 		return nil, errors.Errorf("cluster: %q fetch returned %d: %s", f.addr, resp.StatusCode, bytes.TrimSpace(body))
 	}
 
-	batches, err := DecodeBatches(body)
+	decode := DecodeBatches
+	if f.sig == signal.Log {
+		decode = DecodeLogBatches
+	}
+
+	batches, err := decode(body)
 	if err != nil {
 		return nil, err
 	}

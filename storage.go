@@ -465,42 +465,58 @@ func (s *Storage) runMaintenance(interval time.Duration) {
 // tick retries. In cluster mode only the tenants this node owns (its compaction claims) are
 // flushed/merged, so exactly one node writes a tenant's parts to the shared object store.
 func (s *Storage) maintain(ctx context.Context) {
-	engines := s.engineSnapshotByTenant()
+	metricEngines := s.engineSnapshotByTenant()
+	logEngines := s.logEngineSnapshotByTenant()
 
-	owned := s.ownedTenants(ctx, engines) // nil ⇒ single-node: own everything
+	// Compaction ownership is per-tenant and shared across signals, so reconcile it once over the
+	// union of metric and log tenants (reconciling per-signal would have each release the other's
+	// claims). nil ⇒ single-node: own everything.
+	tids := make(map[signal.TenantID]struct{}, len(metricEngines)+len(logEngines))
+	for tid := range metricEngines {
+		tids[tid] = struct{}{}
+	}
 
-	for tid, eng := range engines {
+	for tid := range logEngines {
+		tids[tid] = struct{}{}
+	}
+
+	owned := s.ownedTenants(ctx, tids)
+
+	maintainEngine := func(tid signal.TenantID, flush func() error, merge func(int64) error, refresh func() error) {
 		if owned != nil {
 			if _, ok := owned[tid]; !ok {
-				// A replica, not the compaction owner: pull the owner's flushed parts from the
-				// shared store and trim the head to the unflushed window, bounding memory.
-				_ = eng.RefreshReplica(ctx)
+				// A replica, not the compaction owner: pull the owner's flushed parts and trim the
+				// head to the unflushed window, bounding memory.
+				_ = refresh()
 
-				continue
+				return
 			}
 		}
 
-		_ = eng.Flush(ctx)
-		_ = eng.Merge(ctx, s.retainFrom(tid))
+		_ = flush()
+		_ = merge(s.retainFrom(tid))
 	}
 
-	// Logs do not yet participate in cluster ownership (single-node compaction), so every log
-	// engine flushes/merges locally. Cluster log routing is a later milestone.
-	for tid, eng := range s.logEngineSnapshotByTenant() {
-		_ = eng.Flush(ctx)
-		_ = eng.Merge(ctx, s.retainFrom(tid))
+	for tid, eng := range metricEngines {
+		maintainEngine(tid, func() error { return eng.Flush(ctx) },
+			func(r int64) error { return eng.Merge(ctx, r) }, func() error { return eng.RefreshReplica(ctx) })
+	}
+
+	for tid, eng := range logEngines {
+		maintainEngine(tid, func() error { return eng.Flush(ctx) },
+			func(r int64) error { return eng.Merge(ctx, r) }, func() error { return eng.RefreshReplica(ctx) })
 	}
 }
 
-// ownedTenants reconciles cluster compaction ownership for the local tenants and returns the
+// ownedTenants reconciles cluster compaction ownership for the given tenant ids and returns the
 // set this node owns. It returns nil in single-node mode (every tenant is owned).
-func (s *Storage) ownedTenants(ctx context.Context, engines map[signal.TenantID]*engine.Engine) map[signal.TenantID]struct{} {
+func (s *Storage) ownedTenants(ctx context.Context, tids map[signal.TenantID]struct{}) map[signal.TenantID]struct{} {
 	if s.cluster == nil {
 		return nil
 	}
 
-	shards := make([]string, 0, len(engines))
-	for tid := range engines {
+	shards := make([]string, 0, len(tids))
+	for tid := range tids {
 		shards = append(shards, string(s.normalizeTenant(tid)))
 	}
 

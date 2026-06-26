@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"maps"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/log"
+	"github.com/oteldb/storage/wal"
 )
 
 // logsPrefix is the per-tenant key prefix under which a tenant's log parts and indexes live.
@@ -18,9 +20,13 @@ const logsPrefix = "/logs"
 // WriteLogs ingests a logs batch. It projects the internal model, derives each record's tenant
 // from its Resource+Scope, and appends to that tenant's logs engine (indexing stream labels +
 // buffering records). Returns per-OTLP partial-success counts: rejected counts out-of-order drops.
-func (s *Storage) WriteLogs(_ context.Context, ld log.Logs) (Accepted, error) {
+func (s *Storage) WriteLogs(ctx context.Context, ld log.Logs) (Accepted, error) {
 	if s.closed.Load() {
 		return Accepted{}, errors.Wrap(ErrClosed, "write logs")
+	}
+
+	if s.cluster != nil {
+		return s.writeLogsClustered(ctx, ld)
 	}
 
 	var oooRejected int64
@@ -50,6 +56,75 @@ func (s *Storage) WriteLogs(_ context.Context, ld log.Logs) (Accepted, error) {
 	}, nil
 }
 
+// writeLogsClustered is the cluster ingest path for logs: it projects the batch, frames each
+// tenant's stream registrations + records as a WAL-encoded payload, and routes each to its ring
+// primary (the single authority — it OOO-checks, reports the reject count, and replicates the
+// accepted set to the secondary owners). The returned accounting matches the single-node path.
+func (s *Storage) writeLogsClustered(ctx context.Context, ld log.Logs) (Accepted, error) {
+	type tenantWAL struct {
+		buf  bytes.Buffer
+		w    *wal.Writer
+		seen map[signal.SeriesID]struct{}
+	}
+
+	byTenant := make(map[signal.TenantID]*tenantWAL)
+
+	emitted := log.Project(ld, func(b *log.Batch) {
+		tid := s.tenantFor(b.Resource(), b.Scope())
+
+		tw := byTenant[tid]
+		if tw == nil {
+			tw = &tenantWAL{seen: make(map[signal.SeriesID]struct{})}
+			tw.w = wal.NewWriter(&tw.buf)
+			byTenant[tid] = tw
+		}
+
+		id := b.StreamID
+		if _, ok := tw.seen[id]; !ok { // register each stream once
+			tw.seen[id] = struct{}{}
+			_ = tw.w.WriteSeries(id, b.Series())
+		}
+
+		recs := make([]wal.LogRecord, b.Len())
+		for i := range b.Records() {
+			recs[i] = logRecordToWAL(b.At(i))
+		}
+
+		_ = tw.w.WriteLogRecords(id, recs)
+	})
+
+	var rejected int64
+
+	for tid, tw := range byTenant {
+		tenant := string(s.normalizeTenant(tid))
+
+		rej, err := s.routeToPrimary(ctx, signal.Log, tenant, tw.buf.Bytes())
+		if err != nil {
+			return Accepted{Accepted: int64(emitted) - rejected, Rejected: rejected}, err
+		}
+
+		rejected += int64(rej)
+	}
+
+	return Accepted{Accepted: int64(emitted) - rejected, Rejected: rejected}, nil
+}
+
+// logRecordToWAL converts a model record to the WAL wire form, serializing attributes.
+func logRecordToWAL(r log.Record) wal.LogRecord {
+	return wal.LogRecord{
+		Timestamp:         r.Timestamp,
+		ObservedTimestamp: r.ObservedTimestamp,
+		SeverityNumber:    r.SeverityNumber,
+		Flags:             r.Flags,
+		Dropped:           r.Dropped,
+		SeverityText:      r.SeverityText,
+		Body:              r.Body,
+		TraceID:           r.TraceID,
+		SpanID:            r.SpanID,
+		Attrs:             r.Attributes.AppendHashInput(nil),
+	}
+}
+
 // LogFetcher returns the read seam for logs — a [fetch.Fetcher] over the named tenants' log data
 // (head ∪ flushed parts). Like [Storage.Fetcher] it scopes by tenant: one, several (concatenated),
 // or none ⇒ all tenants with log data. It is always usable: an empty fetcher when no tenant
@@ -57,6 +132,20 @@ func (s *Storage) WriteLogs(_ context.Context, ld log.Logs) (Accepted, error) {
 func (s *Storage) LogFetcher(tenants ...signal.TenantID) fetch.Fetcher {
 	if s.closed.Load() {
 		return fetch.Merge() // empty
+	}
+
+	// In cluster mode a named tenant is served owner-aware (local if owned, else fanned out).
+	if s.cluster != nil && len(tenants) > 0 {
+		fetchers := make([]fetch.Fetcher, 0, len(tenants))
+		for _, t := range tenants {
+			fetchers = append(fetchers, s.clusterLogFetcherFor(t))
+		}
+
+		if len(fetchers) == 1 {
+			return fetchers[0]
+		}
+
+		return concatFetcher(fetchers)
 	}
 
 	var fetchers []fetch.Fetcher

@@ -67,9 +67,9 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle(replica.ReplicatePath, rp.Handler())                 // secondary: trusting apply
-	mux.Handle(primaryWritePath, s.primaryWriteHandler())           // primary: OOO apply + replicate
-	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch)) // read fan-out endpoint
+	mux.Handle(replica.ReplicatePath, rp.Handler())                                  // secondary: trusting apply
+	mux.Handle(primaryWritePath, s.primaryWriteHandler())                            // primary: OOO apply + replicate
+	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch, s.localLogFetch)) // read fan-out
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	go func() { _ = srv.Serve(ln) }()
@@ -117,6 +117,8 @@ func (s *Storage) localFetch(ctx context.Context, tenant string, start, end int6
 // tenant it serves locally (the head is replicated here, with full matcher pushdown); otherwise
 // it fans out to an owner over HTTP (a window superset) and re-applies the request's matchers,
 // failing over between owners.
+//
+//nolint:dupl // the log analog clusterLogFetcherFor deliberately mirrors this shape
 func (s *Storage) clusterFetcherFor(tid signal.TenantID) fetch.Fetcher {
 	cn := s.cluster
 	owners := cn.membership.Ring().Lookup([]byte(s.normalizeTenant(tid)), cn.rf)
@@ -133,7 +135,51 @@ func (s *Storage) clusterFetcherFor(tid signal.TenantID) fetch.Fetcher {
 		}
 
 		if addr != "" {
-			remotes = append(remotes, cluster.NewRemoteFetcher(addr, nil))
+			remotes = append(remotes, cluster.NewRemoteFetcher(signal.Metric, addr, nil))
+		}
+	}
+
+	return &filteringFetcher{inner: failoverFetcher(remotes)}
+}
+
+// localLogFetch serves a peer's log fetch from the local log engine, pushing down the (equality)
+// stream matchers it forwarded.
+func (s *Storage) localLogFetch(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
+	eng, ok := s.lookupLogEngine(s.normalizeTenant(signal.TenantID(tenant)))
+	if !ok {
+		return nil, nil
+	}
+
+	it, err := eng.Fetch(ctx, fetch.Request{Signal: signal.Log, Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers})
+	if err != nil {
+		return nil, err
+	}
+
+	return fetch.Drain(ctx, it)
+}
+
+// clusterLogFetcherFor returns the log read seam for one tenant in cluster mode: local if this
+// node owns the tenant, otherwise fanned out to an owner (a window+matcher superset re-filtered
+// here), failing over between owners — the logs analog of [Storage.clusterFetcherFor].
+//
+//nolint:dupl // deliberately mirrors clusterFetcherFor over the log engine + log remote fetcher
+func (s *Storage) clusterLogFetcherFor(tid signal.TenantID) fetch.Fetcher {
+	cn := s.cluster
+	owners := cn.membership.Ring().Lookup([]byte(s.normalizeTenant(tid)), cn.rf)
+
+	var remotes []fetch.Fetcher
+	for _, o := range owners {
+		addr := cn.membership.AddrOf(o.ID)
+		if addr == cn.self { // owner: serve locally (head replicated here)
+			if e, ok := s.lookupLogEngine(s.normalizeTenant(tid)); ok {
+				return e
+			}
+
+			return fetch.Merge() // owner but no data yet
+		}
+
+		if addr != "" {
+			remotes = append(remotes, cluster.NewRemoteFetcher(signal.Log, addr, nil))
 		}
 	}
 
@@ -141,11 +187,20 @@ func (s *Storage) clusterFetcherFor(tid signal.TenantID) fetch.Fetcher {
 }
 
 // applyReplicated is the secondary receive path: it decodes a primary's accepted write and
-// applies it verbatim to the local tenant engine (no OOO re-check — the primary already decided).
+// applies it verbatim to the local tenant engine for the addressed signal (metrics or logs) —
+// no OOO re-check, the primary already decided.
 func (s *Storage) applyReplicated(_ context.Context, payload []byte) error {
-	tenant, walBytes, err := cluster.DecodeWrite(payload)
+	sig, tenant, walBytes, err := cluster.DecodeWrite(payload)
 	if err != nil {
 		return err
+	}
+
+	if sig == signal.Log {
+		if err := s.logEngineFor(signal.TenantID(tenant)).ApplyReplicated(walBytes); err != nil {
+			return errors.Wrapf(err, "apply replicated logs for tenant %q", tenant)
+		}
+
+		return nil
 	}
 
 	if err := s.engineFor(signal.TenantID(tenant)).ApplyReplicated(walBytes); err != nil {
@@ -283,7 +338,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 	for tid, tw := range byTenant {
 		tenant := string(s.normalizeTenant(tid))
 
-		rej, err := s.routeToPrimary(ctx, tenant, tw.buf.Bytes())
+		rej, err := s.routeToPrimary(ctx, signal.Metric, tenant, tw.buf.Bytes())
 		if err != nil {
 			return Accepted{Accepted: int64(emitted) - rejected, Rejected: rejected}, err
 		}
@@ -296,28 +351,40 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 
 const primaryWritePath = "/internal/primary-write"
 
-// routeToPrimary sends a tenant's write (WAL-framed series+samples) to the tenant's ring
-// primary and returns how many samples the primary rejected as out-of-order. The primary —
-// local or remote — is the single authority for the shard, so the OOO decision and the
-// accepted set are consistent across all replicas.
-func (s *Storage) routeToPrimary(ctx context.Context, tenant string, walBytes []byte) (rejected int, err error) {
+// routeToPrimary sends a signal's tenant write (WAL-framed records) to the tenant's ring primary
+// and returns how many records the primary rejected as out-of-order. The primary — local or
+// remote — is the single authority for the shard, so the OOO decision and the accepted set are
+// consistent across all replicas. The same path serves metrics and logs, dispatched by sig.
+func (s *Storage) routeToPrimary(ctx context.Context, sig signal.Signal, tenant string, walBytes []byte) (rejected int, err error) {
 	primary, ok := s.cluster.membership.Ring().Primary([]byte(tenant))
 	if !ok {
 		return 0, errors.New("cluster: no primary for tenant (empty ring)")
 	}
 
 	if s.cluster.membership.AddrOf(primary.ID) == s.cluster.self {
-		return s.primaryWrite(ctx, tenant, walBytes)
+		return s.primaryWrite(ctx, sig, tenant, walBytes)
 	}
 
-	return s.sendPrimaryWrite(ctx, s.cluster.membership.AddrOf(primary.ID), cluster.EncodeWrite(tenant, walBytes))
+	return s.sendPrimaryWrite(ctx, s.cluster.membership.AddrOf(primary.ID), cluster.EncodeWrite(sig, tenant, walBytes))
 }
 
-// primaryWrite applies a write as the tenant's primary (OOO-checked, the authoritative
-// decision) and replicates the accepted set to the secondary owners at write quorum (the
-// primary is one durable copy, so it needs RF/2 secondary acks). It returns the rejected count.
-func (s *Storage) primaryWrite(ctx context.Context, tenant string, walBytes []byte) (int, error) {
-	accepted, rejected, err := s.engineFor(signal.TenantID(tenant)).ApplyPrimary(walBytes)
+// primaryWrite applies a write as the tenant's primary (OOO-checked, the authoritative decision)
+// and replicates the accepted set to the secondary owners at write quorum (the primary is one
+// durable copy, so it needs RF/2 secondary acks). It returns the rejected count. The applying
+// engine is selected by sig (metrics vs logs).
+func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant string, walBytes []byte) (int, error) {
+	var (
+		accepted []byte
+		rejected int
+		err      error
+	)
+
+	if sig == signal.Log {
+		accepted, rejected, err = s.logEngineFor(signal.TenantID(tenant)).ApplyPrimary(walBytes)
+	} else {
+		accepted, rejected, err = s.engineFor(signal.TenantID(tenant)).ApplyPrimary(walBytes)
+	}
+
 	if err != nil {
 		return 0, errors.Wrapf(err, "primary apply for tenant %q", tenant)
 	}
@@ -334,7 +401,7 @@ func (s *Storage) primaryWrite(ctx context.Context, tenant string, walBytes []by
 	// The primary already holds one durable copy; it needs RF/2 more from secondaries, bounded
 	// by how many are actually available (availability over strict durability when nodes are down).
 	needAcks := min(s.cluster.rf/2, len(targets))
-	if err := s.cluster.replicator.ReplicateQuorum(ctx, targets, cluster.EncodeWrite(tenant, accepted), needAcks); err != nil {
+	if err := s.cluster.replicator.ReplicateQuorum(ctx, targets, cluster.EncodeWrite(sig, tenant, accepted), needAcks); err != nil {
 		return rejected, errors.Wrapf(err, "replicate tenant %q", tenant)
 	}
 
@@ -358,14 +425,14 @@ func (s *Storage) primaryWriteHandler() http.Handler {
 			return
 		}
 
-		tenant, walBytes, err := cluster.DecodeWrite(payload)
+		sig, tenant, walBytes, err := cluster.DecodeWrite(payload)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 
 			return
 		}
 
-		rejected, err := s.primaryWrite(req.Context(), tenant, walBytes)
+		rejected, err := s.primaryWrite(req.Context(), sig, tenant, walBytes)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 

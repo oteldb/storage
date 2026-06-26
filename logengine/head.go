@@ -59,7 +59,13 @@ func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow int64) bool {
 		return false
 	}
 
-	h.records[id].appendClone(r)
+	buf := h.records[id]
+	if buf == nil { // tolerate a registered-but-unbuffered stream (replica apply path)
+		buf = &recordCols{}
+		h.records[id] = buf
+	}
+
+	buf.appendClone(r)
 
 	if r.ts > h.newest {
 		h.newest = r.ts

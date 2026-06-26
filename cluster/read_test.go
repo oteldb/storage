@@ -19,14 +19,55 @@ func TestFetchRequestCodec(t *testing.T) {
 	t.Parallel()
 
 	eq := []fetch.EqualMatcher{{Name: "__name__", Value: "http_requests"}, {Name: "job", Value: "api"}}
-	tenant, start, end, gotEq, err := cluster.DecodeFetchRequest(cluster.EncodeFetchRequest("acme", -5, 1_700_000_000, eq))
+	sig, tenant, start, end, gotEq, err := cluster.DecodeFetchRequest(cluster.EncodeFetchRequest(signal.Log, "acme", -5, 1_700_000_000, eq))
 	require.NoError(t, err)
+	assert.Equal(t, signal.Log, sig)
 	assert.Equal(t, "acme", tenant)
 	assert.Equal(t, int64(-5), start)
 	assert.Equal(t, int64(1_700_000_000), end)
 	assert.Equal(t, eq, gotEq, "equality matchers round-trip")
 
-	_, _, _, _, err = cluster.DecodeFetchRequest([]byte{0xff}) //nolint:dogsled // only the error matters
+	_, _, _, _, _, err = cluster.DecodeFetchRequest([]byte{byte(signal.Metric), 0xff}) //nolint:dogsled // only the error matters
+	require.Error(t, err)
+}
+
+func TestLogBatchesCodec(t *testing.T) {
+	t.Parallel()
+
+	mk := func(svc string, ts []int64, bodies []string, sev []int64) *fetch.Batch {
+		s := signal.Series{Resource: signal.Resource{Attributes: signal.NewAttributes(
+			signal.KeyValue{Key: []byte("service.name"), Value: signal.StringValue([]byte(svc))},
+		)}}
+		body := make([][]byte, len(bodies))
+		for i, b := range bodies {
+			body[i] = []byte(b)
+		}
+
+		return &fetch.Batch{ID: s.Hash(), Series: s, Timestamps: ts, Columns: []fetch.NamedColumn{
+			{Name: "body", Bytes: body},
+			{Name: "severity", Int64: sev},
+		}}
+	}
+
+	in := []*fetch.Batch{
+		mk("api", []int64{100, 200}, []string{"first", "second"}, []int64{9, 17}),
+		mk("web", []int64{150}, []string{"web"}, []int64{9}),
+	}
+
+	out, err := cluster.DecodeLogBatches(cluster.EncodeLogBatches(in))
+	require.NoError(t, err)
+	require.Len(t, out, 2)
+
+	for i := range in {
+		assert.Equal(t, in[i].ID, out[i].ID, "id recomputed from identity")
+		assert.True(t, in[i].Series.Equal(out[i].Series))
+		assert.Equal(t, in[i].Timestamps, out[i].Timestamps)
+		require.Len(t, out[i].Columns, 2)
+		assert.Equal(t, in[i].Columns[0].Bytes, out[i].Columns[0].Bytes, "body column round-trips")
+		assert.Equal(t, in[i].Columns[1].Int64, out[i].Columns[1].Int64, "severity column round-trips")
+	}
+
+	_, err = cluster.DecodeLogBatches([]byte{0xff})
 	require.Error(t, err)
 }
 
@@ -74,11 +115,13 @@ func TestRemoteFetcherOverHTTP(t *testing.T) {
 	var gotTenant string
 	var gotStart, gotEnd int64
 	var gotMatchers int
-	handler := cluster.ReadHandler(func(_ context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
+	metricFn := func(_ context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
 		gotTenant, gotStart, gotEnd, gotMatchers = tenant, start, end, len(matchers)
 
 		return want, nil
-	})
+	}
+	logFn := func(context.Context, string, int64, int64, []fetch.Matcher) ([]*fetch.Batch, error) { return nil, nil }
+	handler := cluster.ReadHandler(metricFn, logFn)
 
 	mux := http.NewServeMux()
 	mux.Handle(cluster.ReadPath, handler)
@@ -86,7 +129,7 @@ func TestRemoteFetcherOverHTTP(t *testing.T) {
 	t.Cleanup(srv.Close)
 	addr := strings.TrimPrefix(srv.URL, "http://")
 
-	rf := cluster.NewRemoteFetcher(addr, nil)
+	rf := cluster.NewRemoteFetcher(signal.Metric, addr, nil)
 	it, err := rf.Fetch(context.Background(), fetch.Request{
 		Tenant: "acme", Start: 10, End: 20,
 		Matchers: []fetch.Matcher{{Name: []byte("job"), Spec: &fetch.EqualMatcher{Name: "job", Value: "api"}}},
