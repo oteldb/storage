@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
@@ -271,4 +272,13 @@ func (s *Storage) emitAdmission(ctx context.Context, sig signal.Signal, accepted
 	a.Rejected(ctx, rej.cardinality, name, "max_series")
 	a.Rejected(ctx, rej.inflight, name, "max_in_flight_bytes")
 	a.SampledDropped(ctx, sampled, name)
+
+	// Shedding is the overload/backpressure event — log it (Warn) so operators see it without
+	// scraping metrics. Only fires when something was actually rejected, so it stays coarse.
+	if total := rej.ooo + rej.rate + rej.cardinality + rej.inflight; total > 0 {
+		s.obs.Log.Warn("admission shed writes",
+			zap.String("signal", name), zap.Int64("rejected", total),
+			zap.Int64("out_of_order", rej.ooo), zap.Int64("rate_limit", rej.rate),
+			zap.Int64("max_series", rej.cardinality), zap.Int64("max_in_flight_bytes", rej.inflight))
+	}
 }
