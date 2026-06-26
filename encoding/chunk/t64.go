@@ -88,13 +88,8 @@ func DecodeIntsT64(dst []int64, src []byte) ([]int64, int, error) {
 		return dst, consumed, nil
 	}
 
-	if cap(dst) < rows {
-		dst = resize(dst, rows)
-	}
-
-	dst = dst[:rows]
-
-	// Read the 16-byte header.
+	// Read the 16-byte min/max header before allocating dst: it tells us whether this is a constant
+	// column (no per-row payload) and thus which row-count bound applies.
 	minBytes := make([]byte, 8)
 
 	for i := range 8 {
@@ -125,13 +120,35 @@ func DecodeIntsT64(dst []int64, src []byte) ([]int64, int, error) {
 	numBits := valuableBits(umin, umax, minVal < 0 && maxVal >= 0)
 
 	if numBits == 0 {
-		// Constant column.
+		// Constant column: only the 16-byte header, no per-row bytes — so the stream length gives no
+		// bound on rows. Cap defensively to keep a corrupt header from triggering a giant make; the
+		// ceiling is far above any real column and column streams come from CRC-validated parts.
+		if err := boundRows(rows, maxColumnRows); err != nil {
+			return dst, 0, err
+		}
+
+		if cap(dst) < rows {
+			dst = resize(dst, rows)
+		}
+
+		dst = dst[:rows]
 		for i := range rows {
 			dst[i] = minVal
 		}
 
 		return dst, consumed + r.ConsumedBytes(), nil
 	}
+
+	// Non-constant: value blocks are bit-packed (≥1 bit/row), so a count above 8×remaining is corrupt.
+	if err := boundRows(rows, 8*(len(src)-consumed)); err != nil {
+		return dst, 0, err
+	}
+
+	if cap(dst) < rows {
+		dst = resize(dst, rows)
+	}
+
+	dst = dst[:rows]
 
 	// Read blocks.
 	idx := 0

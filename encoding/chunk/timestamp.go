@@ -69,6 +69,11 @@ func DecodeTimestamps(dst []int64, src []byte) ([]int64, int, error) {
 		return dst, consumed, nil
 	}
 
+	// DoD is bit-packed (≥1 bit/row), so a count above 8×remaining bytes is a corrupt header.
+	if err := boundRows(rows, 8*(len(src)-consumed)); err != nil {
+		return dst, 0, err
+	}
+
 	if cap(dst) < rows {
 		dst = resize(dst, rows)
 	}

@@ -45,6 +45,12 @@ func DecodeU128(dst []U128, src []byte) ([]U128, int, error) {
 		return dst, 0, err
 	}
 
+	// RLE packs many rows into few bytes, so the stream length gives no bound on rows; cap defensively
+	// so a corrupt header can't drive a giant make. Each run is also bounded against rows below.
+	if err := boundRows(rows, maxColumnRows); err != nil {
+		return dst, 0, err
+	}
+
 	dst = dst[:0]
 	if cap(dst) < rows {
 		dst = make([]U128, 0, rows)
