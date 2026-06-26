@@ -44,7 +44,7 @@ The design is a single columnar engine with swappable front-ends and backends
 | L3 **Engine** / **Index / WAL** | **head · flush · merge · retention** / **symbols · series · postings** · **write-ahead log** | **engine implemented (metrics)**; **index + wal implemented** |
 | L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
 | L1 **Backend** | file · s3 · memory behind one interface | **memory + file + s3 implemented**, with `PutIfAbsent` CAS; `bucketindex` for stateless part enumeration |
-| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **HRW ring + etcd membership implemented** (`cluster/ring`, `cluster/etcd`); replication, rebalance pending |
+| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **HRW ring + etcd membership + quorum replication implemented** (`cluster/ring`, `cluster/etcd`, `cluster/replica`); rebalance pending |
 
 The **implemented substance spans L1 (backends) through L4 (the fetch contract)** for
 metrics: encoding, parts, index, WAL, the engine head/flush/merge, and the metrics fetch
@@ -404,8 +404,18 @@ member prefix; each change rebuilds the ring and publishes it via an `atomic.Poi
 expires and it drops out of every peer's ring within the TTL — no manual deregistration;
 `Close` revokes the lease for prompt, clean departure. etcd only distributes membership;
 placement stays local and coordinator-free. Tested against an **embedded etcd** (join → watch
-propagation → lease-revoke departure). RF=3 quorum replication and the rebalance orchestrator
-build on this and remain pending.
+propagation → lease-revoke departure).
+
+**Replication** (`cluster/replica`) protects the unflushed head: `Replicate` fans an opaque
+write payload out to a key's ring-owners and returns as soon as a **quorum** —
+`(len/2)+1` — has applied it (the local owner in process, the rest over the transport),
+returning early with an error once quorum is unreachable; non-quorum owners still receive the
+write so all replicas converge. **The storage library owns the node-to-node transport** (a
+deliberate departure from "the embedder owns transport"): `cluster/replica` ships an HTTP
+`Transport` + receiving `Handler` (mounted at `ReplicatePath`), tested over `httptest`. The
+replicator is decoupled from the ring — the caller maps owners→addresses — so the routing and
+quorum logic test against a fake transport. The rebalance orchestrator is the remaining L0
+piece.
 
 ---
 
@@ -524,6 +534,7 @@ query/promql          OPTIONAL adapter: fetch → Prometheus storage.Queryable (
 cluster/              L0 distribution: ring + membership + (later) replication · rebalance [partly implemented]
   cluster/ring        rendezvous (HRW) hashing: deterministic placement, ~1/N movement  [implemented]
   cluster/etcd        etcd-backed live membership (lease + watch → atomic ring)          [implemented; embedded-etcd tested]
+  cluster/replica     quorum write-replication + node-to-node HTTP transport             [implemented]
 ```
 
 "Seam only" packages currently contain their `doc.go` (and, where noted, an interface or

@@ -38,9 +38,13 @@ comments instead, and reference `ARCHITECTURE.md` (which is committed) when a po
 
 ## Working agreement
 
-- **Library, not a binary.** No `main`, no server/HTTP/gRPC, no CLI, no auth, no scraping. The
-  embedder (e.g. the parent `go-faster/oteldb`) owns the process and transport. Public surface is
-  the small `Storage` facade in `DESIGN.md` §5; keep everything else internal.
+- **Library, not a binary.** No `main`, no CLI, no auth, no scraping. The embedder (e.g. the
+  parent `go-faster/oteldb`) owns the process. Public surface is the small `Storage` facade in
+  `DESIGN.md` §5; keep everything else internal. **Exception (decided M6): the L0 cluster layer
+  owns its node-to-node transport** — `cluster/replica` ships an HTTP transport + receiving
+  handler for quorum replication, rather than delegating cluster networking to the embedder.
+  This is the one place the library runs a server; the ingest/query data plane stays
+  transport-free (the embedder still owns those).
 - **Follow the milestone order** in `DESIGN.md` §14. Don't build a layer before the one it
   depends on exists and is tested. Current target: M0 (encoding foundations), metrics vertical first.
 - **Match the surrounding code** — its naming, comment density, and idioms. Don't introduce a new
