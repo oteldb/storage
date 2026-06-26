@@ -14,6 +14,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
 )
@@ -170,6 +171,9 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
 	defer span.End()
 
+	ctx, pf := profile.Begin(ctx, "engine.fetch")
+	defer pf.End()
+
 	startNs := time.Now()
 
 	// The label index sorts lazily on first read after a write, mutating in place. Reads run
@@ -188,8 +192,14 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 	defer e.mu.RUnlock()
 
+	_, rpf := profile.Begin(ctx, "resolve-matchers")
 	ids := e.head.resolve(r.Matchers)
+	rpf.Add("series_matched", int64(len(ids)))
+	rpf.End()
+
 	partsScanned := len(e.parts)
+
+	_, spf := profile.Begin(ctx, "scan")
 
 	var (
 		batches []*fetch.Batch
@@ -206,6 +216,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		for _, p := range e.parts {
 			if err := p.mergeInto(ctx, id, &m, r.Start, r.End); err != nil {
 				span.RecordError(err)
+				spf.End()
 
 				return nil, err
 			}
@@ -220,6 +231,14 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 			rows += len(ts)
 		}
 	}
+
+	spf.Add("parts_scanned", int64(partsScanned))
+	spf.Add("rows", int64(rows))
+	spf.End()
+
+	pf.Add("series_matched", int64(len(ids)))
+	pf.Add("parts_scanned", int64(partsScanned))
+	pf.Add("rows", int64(rows))
 
 	span.SetAttributes(
 		attribute.Int("storage.series_matched", len(ids)),
