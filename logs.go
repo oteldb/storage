@@ -40,6 +40,25 @@ func (s *Storage) LogFetcher(tenants ...signal.TenantID) fetch.Fetcher {
 	return s.recordFetcher(tenants, s.logEngineSnapshot, s.lookupLogEngine, s.clusterLogFetcherFor)
 }
 
+// LogSeries returns the identities of a tenant's log streams matching the label matchers within
+// [start, end] (zero start AND end disables the time filter). It mirrors [Storage.ProfileSeries]
+// for the logs vertical, so an embedder can build LabelNames/LabelValues/Series responses without
+// materializing records. Local to this node; cluster fan-out for log enumeration is not yet wired.
+func (s *Storage) LogSeries(
+	_ context.Context, tenant signal.TenantID, matchers []fetch.Matcher, start, end int64,
+) ([]signal.Series, error) {
+	if s.closed.Load() {
+		return nil, errors.Wrap(ErrClosed, "log series")
+	}
+
+	eng, ok := s.lookupLogEngine(s.normalizeTenant(tenant))
+	if !ok {
+		return nil, nil
+	}
+
+	return eng.Series(matchers, start, end), nil
+}
+
 // concatFetcher runs each child and concatenates their batches. Unlike [fetch.Merge] it does not
 // deduplicate by timestamp — records are append-only and several may share a timestamp, and the
 // metric-shaped merge would drop the record columns. Used for multi-tenant record reads.
