@@ -782,6 +782,40 @@ today). `MaxPartSize` is also not yet enforced.
 
 ---
 
+## 3l. Observability (`internal/obs`, `query/profile`)
+
+The library is **observed through embedder-injected handles** — it never owns a global logger,
+tracer, or meter. `Options.Logger` (a `*zap.Logger`), `Options.TracerProvider`, and
+`Options.MeterProvider` (OTel **API** types — the embedder brings the SDK, exporters, and
+sampling) feed `obs.New`, which builds the single `*obs.Obs` handle threaded into every layer
+(`engine`, `recordengine`, `wal`, the backend decorator, the cluster transport). **Every pillar
+is no-op by default** — an unset logger becomes `zap.Nop`, an unset provider becomes the OTel
+noop provider — so an unconfigured store spans, logs, and counts nothing and pays no overhead.
+
+- **Tracing.** Each coarse operation opens a span: `engine.flush` / `engine.merge` /
+  `engine.fetch` (and the `recordengine.*` analogs), backend object ops, and the cluster RPCs.
+  W3C trace-context propagates across the node-to-node HTTP transport via the **global**
+  `otel.GetTextMapPropagator()` (default no-op) — `obs.InjectHTTP`/`obs.ExtractHTTP` on the
+  replica-write and read paths — so a distributed query is one trace.
+- **Metrics.** `internal/obs` owns the instrument set: ingest admission meta-metrics
+  (`storage.ingest.{accepted,rejected,sampled_dropped}`, the rejected counter tagged by reason),
+  plus flush/merge/fetch/backend/WAL latency+throughput. Instruments fire at **operation
+  granularity only** (flush, merge, fetch, RPC, WAL append/fsync/rotate) — **never per-sample or
+  per-row**, preserving the zero-alloc hot path.
+- **Logging.** zap fires at the same coarse boundaries: `storage opened`/`storage closed`,
+  per-engine `flushed head to part` / `merged parts` (Debug; Error on failure), cluster member
+  join/leave + ring rebuild (Info), and `admission shed writes` (Warn, only when overload control
+  rejects). No per-sample logging.
+- **EXPLAIN ANALYZE** (`query/profile`). Opt-in per query via `profile.WithCollector(ctx)`:
+  operators call `profile.Begin(ctx, name)` to push a timed node onto a concurrency-safe tree
+  (nil collector ⇒ no-op, the default). A fetch yields `query → engine.fetch →
+  {resolve-matchers, scan}`, a cross-tenant fetch a `fan-out` node per engine. **Distributed:**
+  the read RPC client sets an `X-Oteldb-Profile` header when a collector is active; the peer runs
+  the read under its own collector and prepends a `[uvarint len][profile-tree]` frame to the
+  response (`Node.Encode`/`Decode`, bounds-checked + fuzzed); the requester strips the frame and
+  grafts the peer's subtree (labeled by peer address) under the current node, so a query on a
+  non-owner shows the owner's timing as a nested `remote {addr}` subtree.
+
 ## 4. Public surface (`storage` root package)
 
 The embedder-facing API. **All four signals' ingest+read paths are wired and working** (metrics on
@@ -896,6 +930,12 @@ These hold in the implemented code and must be preserved by changes:
 - **Immutable, in-memory-first.** The in-memory/ephemeral path is first-class — every
   layer must work with no disk or object store. `backend.Memory()` is the reference
   backend.
+- **Injected, no-op-default observability.** The library never owns a global logger, tracer, or
+  meter — they arrive through `Options` and are no-op unless the embedder configures them, so the
+  default path pays no overhead. Telemetry fires at **operation granularity** (flush/merge/fetch/
+  RPC/WAL), never per-sample or per-row; this is what keeps the zero-alloc invariant intact. Only
+  the OTel **API** is imported (the embedder owns the SDK). EXPLAIN ANALYZE is ctx-threaded and
+  no-op without a collector (§3l).
 - **Stable formats.** The `Codec` enum, the per-stream header, each codec's framing, the
   part formats (manifest `OTPM`, marks `OTMK`, per-column object framing, the
   `{prefix}/manifest|marks|c/{i}` key layout), the **attribute hash/binary encoding** (the
@@ -928,7 +968,7 @@ encoding/             umbrella doc for the codec layers
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
 internal/simd         vectorized columnar kernels (AVX2) + pure-Go fallback + runtime CPU dispatch [implemented: int64 min/max]
 internal/cmd/gensimd  avo generator for internal/simd's committed *_amd64.s (//go:generate)   [implemented]
-internal/obs          injected observability handle: zap logger + OTel tracer + admission meta-metrics (no-op default) [implemented; per-layer spans/metrics + EXPLAIN ANALYZE pending]
+internal/obs          injected observability handle: zap logger + OTel tracer + per-layer metric instruments (admission/flush/merge/fetch/backend/WAL) + W3C trace propagation; no-op default [implemented]
 signal/               typed Attributes/Value, Resource/Scope/Series identity, 128-bit SeriesID, Signal, TenantID, Aggregation [implemented]
   signal/metric       []byte-based OTLP-shaped Metrics ingest batch (resettable/pooled) + identity + projection (gauge/sum; histogram/exp-histogram/summary via classic decomposition in otlp/pdataconv) [implemented]
   signal/log          []byte-based OTLP-shaped Logs ingest batch (resettable/pooled) + stream identity + projection [implemented]
@@ -948,6 +988,7 @@ engine/               head · flush · background-merge · retention · downsamp
 recordengine/         shared schema-driven record engine (logs+traces+profiles): head · flush · merge · fetch · conditions · per-column blooms · optional content-addressed side store [implemented]
 query/fetch           dual-shape fetch contract (Matchers + Conditions/Projection/SecondPass) [implemented for metrics + logs + traces + profiles; the library's query surface]
 query/scale           fetch-seam scale-out decorators: split-by-interval + results cache  [implemented]
+query/profile         EXPLAIN ANALYZE: concurrency-safe per-query timing tree (ctx-threaded, no-op default) + binary encode/decode for distributed grafting [implemented]
 query/promql          OPTIONAL adapter: fetch → Prometheus storage.Queryable (no engine) [implemented; only package importing prometheus]
 cluster/              L0 distribution: ring + membership + (later) replication · rebalance [partly implemented]
   cluster/ring        rendezvous (HRW) hashing: deterministic placement, ~1/N movement, zone-aware replica spread [implemented]
