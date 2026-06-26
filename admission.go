@@ -1,0 +1,162 @@
+package storage
+
+import (
+	"sync"
+
+	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/tenant"
+)
+
+// AdmissionStats are the per-tenant admission counters (the overload-control meta-metrics): how
+// many samples were accepted and how many were shed, by reason. They make it observable which
+// valve tripped under load. Counts are cumulative since the store opened.
+type AdmissionStats struct {
+	Accepted            int64
+	RejectedOOO         int64 // out of the out-of-order window
+	RejectedRate        int64 // over IngestBytesPerSecond
+	RejectedCardinality int64 // over MaxSeries
+	RejectedInFlight    int64 // over MaxInFlightBytes
+}
+
+// Rejected returns the total shed across all reasons.
+func (s AdmissionStats) Rejected() int64 {
+	return s.RejectedOOO + s.RejectedRate + s.RejectedCardinality + s.RejectedInFlight
+}
+
+// tokenBucket is a byte-rate limiter: tokens (bytes) accrue at ratePerSec up to burst, and a
+// request of n bytes is admitted only if n tokens are available. It is the per-tenant ingest-rate
+// valve. Safe for concurrent use. The clock is injected (unix nanoseconds) so the facade can pass
+// a test clock; production passes time.Now().UnixNano().
+type tokenBucket struct {
+	mu        sync.Mutex
+	ratePerNs float64
+	burst     float64
+	tokens    float64
+	last      int64 // unix-nano of the last refill
+}
+
+// reconfigure updates the rate/burst from the current policy (hot-reload) without discarding the
+// accrued tokens, and lazily seeds the clock on first use.
+func (b *tokenBucket) reconfigure(ratePerSec, burst float64, nowNs int64) {
+	if b.last == 0 {
+		b.last = nowNs
+		b.tokens = burst
+	}
+
+	b.ratePerNs = ratePerSec / 1e9
+	b.burst = burst
+}
+
+// allow reports whether n bytes fit the budget at nowNs, consuming them when they do. A
+// non-positive rate means "unlimited" and always admits.
+func (b *tokenBucket) allow(n float64, nowNs int64, unlimited bool) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if unlimited {
+		return true
+	}
+
+	if d := nowNs - b.last; d > 0 {
+		b.tokens = min(b.burst, b.tokens+float64(d)*b.ratePerNs)
+		b.last = nowNs
+	}
+
+	if b.tokens >= n {
+		b.tokens -= n
+
+		return true
+	}
+
+	return false
+}
+
+// tenantAdmission is the per-tenant admission state: the ingest-rate bucket plus the cumulative
+// counters. The engine enforces cardinality/in-flight limits itself (race-free under its lock);
+// this struct owns the rate valve and aggregates every reason for AdmissionStats.
+type tenantAdmission struct {
+	bucket tokenBucket
+
+	mu                  sync.Mutex
+	accepted            int64
+	rejectedOOO         int64
+	rejectedRate        int64
+	rejectedCardinality int64
+	rejectedInFlight    int64
+}
+
+func (a *tenantAdmission) addRate(n int64) { a.add(&a.rejectedRate, n) }
+
+func (a *tenantAdmission) record(accepted, ooo, cardinality, inflight int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.accepted += accepted
+	a.rejectedOOO += ooo
+	a.rejectedCardinality += cardinality
+	a.rejectedInFlight += inflight
+}
+
+func (a *tenantAdmission) add(p *int64, n int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	*p += n
+}
+
+func (a *tenantAdmission) stats() AdmissionStats {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return AdmissionStats{
+		Accepted:            a.accepted,
+		RejectedOOO:         a.rejectedOOO,
+		RejectedRate:        a.rejectedRate,
+		RejectedCardinality: a.rejectedCardinality,
+		RejectedInFlight:    a.rejectedInFlight,
+	}
+}
+
+// admissionFor returns the tenant's admission state (keyed by the normalized tenant id, like the
+// engine maps), creating it on first use.
+func (s *Storage) admissionFor(tid signal.TenantID) *tenantAdmission {
+	key := s.normalizeTenant(tid)
+
+	s.admitMu.Lock()
+	defer s.admitMu.Unlock()
+
+	a := s.admit[key]
+	if a == nil {
+		a = &tenantAdmission{}
+		s.admit[key] = a
+	}
+
+	return a
+}
+
+// allowRate consumes the rate budget for a batch of nBytes against the tenant's policy, returning
+// whether the batch is admitted. An unset (zero) IngestBytesPerSecond is unlimited.
+func (a *tenantAdmission) allowRate(limits tenant.Limits, nBytes, nowNs int64) bool {
+	unlimited := limits.IngestBytesPerSecond <= 0
+	if !unlimited {
+		// Burst is one second of budget, so a steady producer at the limit is never shed and a
+		// spike up to one second's worth is absorbed.
+		a.bucket.reconfigure(float64(limits.IngestBytesPerSecond), float64(limits.IngestBytesPerSecond), nowNs)
+	}
+
+	return a.bucket.allow(float64(nBytes), nowNs, unlimited)
+}
+
+// AdmissionStats returns the cumulative admission counters for a tenant (the overload-control
+// meta-metrics). It is safe to call concurrently; an unknown tenant returns the zero value.
+func (s *Storage) AdmissionStats(tid signal.TenantID) AdmissionStats {
+	s.admitMu.Lock()
+	a := s.admit[s.normalizeTenant(tid)]
+	s.admitMu.Unlock()
+
+	if a == nil {
+		return AdmissionStats{}
+	}
+
+	return a.stats()
+}

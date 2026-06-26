@@ -6,19 +6,22 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// Limits are the per-tenant operational limits (DESIGN.md §8, §9): a memory tracker
-// caps in-flight bytes; ingestion rate and series cardinality are bounded. Hot-reloaded
-// by the consumer via [Resolver]. Zero values mean "no limit".
-//
-// This is a scaffold stub; fields are filled in as the engine grows (M3+).
+// Limits are the per-tenant operational limits enforced as lossless admission control: when a
+// tenant exceeds one, the offending samples are shed and reported via OTLP partial-success
+// (RESOURCE_EXHAUSTED), so an overload degrades rather than OOMs. They are resolved per write,
+// so a consumer's hot-reloaded changes take effect immediately. Zero values mean "no limit".
 type Limits struct {
-	// IngestBytesPerSecond caps the ingest rate. Zero ⇒ unlimited.
+	// IngestBytesPerSecond caps the per-tenant ingest rate (a token bucket whose burst is one
+	// second of budget). Bytes over budget are shed. Zero ⇒ unlimited.
 	IngestBytesPerSecond int64
-	// MaxInFlightBytes caps in-flight bytes per tenant (backpressure).
+	// MaxInFlightBytes caps the unflushed in-flight bytes buffered for a tenant (memory
+	// backpressure): samples arriving while at the cap are shed until a flush drains the head.
+	// Zero ⇒ unlimited.
 	MaxInFlightBytes int64
-	// MaxSeries caps the active series cardinality.
+	// MaxSeries caps the active series cardinality per tenant: a sample that would mint a new
+	// series past the cap is shed; existing series are unaffected. Zero ⇒ unlimited.
 	MaxSeries int64
-	// MaxPartSize caps an immutable part's size.
+	// MaxPartSize caps an immutable part's size. Zero ⇒ unlimited. (Not yet enforced.)
 	MaxPartSize int64
 }
 

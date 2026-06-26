@@ -75,11 +75,12 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 // materialize(i) returns sample i's full identity and is called only when its series is new
 // (first sight), so a repeat series costs just a map probe and a buffer append, with no
 // per-point [signal.Series] construction or hashing. The whole run is appended under a single
-// lock. It returns how many samples were accepted (the rest were out-of-order beyond the
-// window). Safe for concurrent use.
+// lock. limits caps cardinality and in-flight memory (0 fields ⇒ unlimited). It returns an
+// [AppendResult] breaking accepted/rejected down by reason, so the caller can report an exact
+// OTLP partial-success. Safe for concurrent use.
 func (e *Engine) AppendBatch(
-	ids []signal.SeriesID, ts []int64, values []float64, materialize func(i int) signal.Series,
-) (accepted int, err error) {
+	ids []signal.SeriesID, ts []int64, values []float64, materialize func(i int) signal.Series, limits AppendLimits,
+) (AppendResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -89,31 +90,55 @@ func (e *Engine) AppendBatch(
 
 	mat := func() signal.Series { return materialize(bi) }
 
+	var res AppendResult
+
 	for i := range ids {
 		bi = i
 
-		ok, isNew, s := e.head.appendByID(ids[i], ts[i], values[i], e.cfg.OOOWindow, mat)
-		if !ok {
+		out, isNew, s := e.head.appendByID(ids[i], ts[i], values[i], e.cfg.OOOWindow, limits, mat)
+
+		switch out {
+		case admitted:
+			res.Accepted++
+		case rejectOOO:
+			res.RejectedOOO++
+
+			continue
+		case rejectCardinality:
+			res.RejectedCardinality++
+
+			continue
+		case rejectBytes:
+			res.RejectedBytes++
+
 			continue
 		}
-
-		accepted++
 
 		if e.cfg.WAL != nil {
 			if isNew {
 				if err := e.cfg.WAL.WriteSeries(ids[i], s); err != nil {
-					return accepted, err
+					return res, err
 				}
 			}
 
 			// Slice the columns in place (no per-sample allocation) for the WAL record.
 			if err := e.cfg.WAL.WriteSamples(ids[i], ts[i:i+1], values[i:i+1]); err != nil {
-				return accepted, err
+				return res, err
 			}
 		}
 	}
 
-	return accepted, nil
+	return res, nil
+}
+
+// HeadBytes returns the head's current buffered sample bytes — the in-flight memory measure a
+// consumer compares against a per-tenant cap (see [AppendLimits.MaxInFlightBytes]) and the basis
+// for a size-triggered flush.
+func (e *Engine) HeadBytes() int64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	return e.head.bytes
 }
 
 // Fetch implements [fetch.Fetcher] over the head ∪ flushed parts: it resolves the
@@ -311,8 +336,11 @@ func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err e
 			var accVals []float64
 
 			for i := range ts {
-				if ok, _, _ := e.head.appendByID(id, ts[i], values[i], e.cfg.OOOWindow,
-					func() signal.Series { return s }); ok {
+				// The replication apply path enforces only the OOO window (the shard primary's
+				// authoritative timing decision); cardinality/memory admission is applied at the
+				// origin ingest, so pass no limits here.
+				if out, _, _ := e.head.appendByID(id, ts[i], values[i], e.cfg.OOOWindow,
+					AppendLimits{}, func() signal.Series { return s }); out == admitted {
 					accTs = append(accTs, ts[i])
 					accVals = append(accVals, values[i])
 				} else {

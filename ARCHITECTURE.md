@@ -681,6 +681,42 @@ optional side store differ.
 
 ---
 
+## 3k. Admission control & backpressure (`admission.go`, `engine/admission.go`)
+
+Overload protection so a load spike **degrades rather than OOMs**. It is **lossless** (parts are
+always exact) and enforces the per-tenant `tenant.Limits`, resolved through the policy callback so
+changes hot-reload on the next write. Anything shed is reported back via OTLP partial-success
+(`Accepted.Rejected` + `RejectedReason`), never silently dropped or queued unbounded. The admission
+stage sits **between tenant resolution and the engine** in `WriteMetrics`, so a shed point costs no
+index/head/WAL/flush work; the engine core stays policy-agnostic (it sees only numbers via
+`engine.AppendLimits`, never a tenant or policy). Three valves:
+
+- **Ingest rate** (`Limits.IngestBytesPerSecond`) — a per-tenant **token bucket** (`tokenBucket`,
+  burst = one second of budget) in the facade; an over-budget batch is shed up front. The clock is
+  injected (`Storage.now`) for deterministic tests.
+- **Cardinality** (`Limits.MaxSeries`) — enforced **in the head** (`head.appendByID`, race-free under
+  the engine lock): a sample that would mint a *new* series past the cap is shed; samples for
+  already-known series are never blocked, so a query keeps returning what is already admitted. (No
+  hysteresis or `__overflow__`-series routing yet — those are §8a refinements.)
+- **In-flight memory** (`Limits.MaxInFlightBytes`) — also head-enforced, against the head's buffered
+  **byte measure** (`engine.SampleBytes` = 16 per buffered sample, reset on flush, recomputed on
+  replica trim): samples arriving while at the cap are shed until a flush drains the head. This is the
+  bounded-memory valve; pair it with `FlushInterval` (or a flush threshold) so the head drains and the
+  valve reopens.
+
+`engine.AppendBatch` returns an `AppendResult` breaking accepted/rejected down by reason
+(`RejectedOOO`/`RejectedCardinality`/`RejectedBytes`), which the facade folds — together with rate
+rejections — into the `Accepted` reply and into per-tenant **meta-metrics** (`AdmissionStats`,
+exposed by `Storage.AdmissionStats(tenant)`: accepted plus rejected-by-reason), so an operator can
+see which valve tripped. Scope today: **metrics, single-node** ingest. Not yet built (the lossy and
+distributed half of §8a): **budgeted sampling with a query-time scale factor** (the StatsHouse-style
+unbiased-aggregate path — needs SF threaded through the fetch contract), the **cardinality budget
+with hysteresis / overflow routing**, the clustered **central→edge budget feedback**, and admission
+on the **record signals** and the **clustered write path** (the primary applies only the OOO check
+today). `MaxPartSize` is also not yet enforced.
+
+---
+
 ## 4. Public surface (`storage` root package)
 
 The embedder-facing API. **All four signals' ingest+read paths are wired and working** (metrics on
@@ -697,9 +733,12 @@ query-language path stays in the embedder. The `Write*` methods take the library
   via the `Options.Tenant` callback (no tenant argument), and appends to that tenant's
   lazily-created `engine.Engine` (one per tenant, parts under `{tenant}/metrics`) through the
   `AppendBatch` fast path (one locked call per metric), caching the resolved engine across a
-  tenant-contiguous run of metrics. It returns `Accepted` (OTLP partial-success: rejected
-  counts out-of-order drops; unsupported kinds and value-less points are filtered upstream by
-  the producer). **`WriteLogs(ctx, ld)` is fully implemented** the same way over per-tenant
+  tenant-contiguous run of metrics. Before the engine append it runs the **admission stage** (§3k):
+  the per-tenant ingest-rate valve, then the engine's per-sample cardinality / in-flight-memory
+  limits. It returns `Accepted` (OTLP partial-success: `Rejected` counts every shed point —
+  out-of-order drops plus admission rejections — and `RejectedReason` names the principal valve;
+  unsupported kinds and value-less points are filtered upstream by the producer). **`WriteLogs(ctx,
+  ld)` is fully implemented** the same way over per-tenant
   `recordengine.Engine`s (parts under `{tenant}/logs`). **`WriteTraces(ctx, td)` is fully
   implemented** the same way over per-tenant `recordengine.Engine`s on the span schema (parts under
   `{tenant}/traces`). **`WriteProfiles(ctx, pd)` is fully implemented** over per-tenant
@@ -802,6 +841,7 @@ green; the tree is `gofmt`/`goimports` clean.
 
 ```
 .                     storage facade: Storage, Open/InMemory, Options, per-tenant engines, maintenance loop [implemented: metrics+logs+traces+profiles ingest+read; query-lang in embedder]
+  admission.go        per-tenant admission control: ingest-rate token bucket + AdmissionStats meta-metrics (§3k) [implemented: metrics, single-node]
 encoding/             umbrella doc for the codec layers
   encoding/bitstream  MSB-first bit Writer/Reader                                      [implemented]
   encoding/chunk      DoD / Gorilla / T64 / dict / bytesraw / decimal / id128 column codecs [implemented]
@@ -822,7 +862,7 @@ block/                immutable columnar part format: column/marks/manifest/part
 index/                symbols (intern) · series (id↔attrs) · postings (set-ops/matchers) [implemented]
   index/bloom         token bloom filter (no false negatives) + tokenizer: full-text + attr/equality pruning [implemented]
 wal/                  CRC-framed segmented WAL: samples + opaque records + side delta, resume + checkpoint (truncate-on-flush), facade-wired durability [implemented]
-engine/               head · flush · background-merge · retention · downsampling · fetch (metrics) [implemented]
+engine/               head · flush · background-merge · retention · downsampling · admission limits · fetch (metrics) [implemented]
 recordengine/         shared schema-driven record engine (logs+traces+profiles): head · flush · merge · fetch · conditions · per-column blooms · optional content-addressed side store [implemented]
 query/fetch           dual-shape fetch contract (Matchers + Conditions/Projection/SecondPass) [implemented for metrics + logs + traces + profiles; the library's query surface]
 query/scale           fetch-seam scale-out decorators: split-by-interval + results cache  [implemented]

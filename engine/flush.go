@@ -54,6 +54,7 @@ func (h *head) drainHead() *flushColumns {
 	}
 
 	h.samples = make(map[signal.SeriesID]*sampleBuf)
+	h.bytes = 0
 
 	return cols
 }

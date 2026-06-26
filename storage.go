@@ -54,6 +54,10 @@ type Storage struct {
 
 	queryCache scale.Cache // shared results cache for Fetcher; nil ⇒ caching disabled
 
+	admitMu sync.Mutex                           // guards admit
+	admit   map[signal.TenantID]*tenantAdmission // per-tenant admission state (rate valve + counters)
+	now     func() int64                         // unix-nano clock for admission; overridable in tests
+
 	stopCh chan struct{}  // closed by Close to stop the maintenance loop
 	wg     sync.WaitGroup // tracks the maintenance goroutine
 }
@@ -77,6 +81,8 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 		logTenants:     make(map[signal.TenantID]*recordengine.Engine),
 		traceTenants:   make(map[signal.TenantID]*recordengine.Engine),
 		profileTenants: make(map[signal.TenantID]*recordengine.Engine),
+		admit:          make(map[signal.TenantID]*tenantAdmission),
+		now:            func() int64 { return time.Now().UnixNano() },
 	}
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
@@ -237,14 +243,16 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted
 		return s.writeMetricsClustered(ctx, md)
 	}
 
-	var oooRejected int64
+	var rej rejectTally
 
 	// The tenant (hence the engine) is derived from Resource+Scope, which are constant within
 	// a metric, so points arrive in tenant-contiguous runs. Cache the last resolution to skip
-	// the locked engine-map lookup per metric.
+	// the locked engine-map lookup and policy resolve per metric.
 	var (
 		lastTenant signal.TenantID
 		lastEng    *engine.Engine
+		lastAdmit  *tenantAdmission
+		lastLimits tenant.Limits
 	)
 
 	var firstErr error
@@ -264,26 +272,98 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted
 			}
 
 			lastTenant, lastEng = tid, eng
+			lastAdmit = s.admissionFor(tid)
+			lastLimits = s.tenant.Resolve(s.normalizeTenant(tid)).Limits
 		}
 
-		accepted, err := lastEng.AppendBatch(b.IDs, b.Ts, b.Values, b.Series)
+		// Admission stage (between tenant resolution and the engine, DESIGN §8a): the ingest-rate
+		// valve sheds a whole over-budget batch up front; cardinality and in-flight-memory limits
+		// are enforced per sample inside the engine (race-free under its lock).
+		if !lastAdmit.allowRate(lastLimits, int64(b.Len())*engine.SampleBytes, s.now()) {
+			rej.rate += int64(b.Len())
+			lastAdmit.addRate(int64(b.Len()))
+
+			return
+		}
+
+		res, err := lastEng.AppendBatch(b.IDs, b.Ts, b.Values, b.Series, engine.AppendLimits{
+			MaxSeries:        lastLimits.MaxSeries,
+			MaxInFlightBytes: lastLimits.MaxInFlightBytes,
+		})
 		if err != nil {
 			firstErr = err
 
 			return
 		}
 
-		oooRejected += int64(b.Len() - accepted)
+		rej.ooo += int64(res.RejectedOOO)
+		rej.cardinality += int64(res.RejectedCardinality)
+		rej.inflight += int64(res.RejectedBytes)
+		lastAdmit.record(int64(res.Accepted), int64(res.RejectedOOO), int64(res.RejectedCardinality), int64(res.RejectedBytes))
 	})
 
 	if firstErr != nil {
 		return Accepted{}, firstErr
 	}
 
+	total := rej.total()
+
 	return Accepted{
-		Accepted: int64(emitted) - oooRejected,
-		Rejected: oooRejected,
+		Accepted:       int64(emitted) - total,
+		Rejected:       total,
+		RejectedReason: rej.reason(),
 	}, nil
+}
+
+// rejectTally accumulates per-reason rejection counts during a write and renders the dominant
+// OTLP partial-success reason.
+type rejectTally struct {
+	ooo         int64
+	rate        int64
+	cardinality int64
+	inflight    int64
+}
+
+func (r rejectTally) total() int64 { return r.ooo + r.rate + r.cardinality + r.inflight }
+
+// reason returns a machine-readable reason for the rejections. When several reasons fired it
+// reports the largest contributor (suffixed to signal it was not the only one), so a producer
+// sees the principal valve without losing the fact that others tripped.
+func (r rejectTally) reason() string {
+	type kv struct {
+		name string
+		n    int64
+	}
+
+	all := []kv{
+		{"out_of_order", r.ooo},
+		{"rate_limit", r.rate},
+		{"max_series", r.cardinality},
+		{"max_in_flight_bytes", r.inflight},
+	}
+
+	var top kv
+
+	var nonzero int
+
+	for _, c := range all {
+		if c.n > 0 {
+			nonzero++
+		}
+
+		if c.n > top.n {
+			top = c
+		}
+	}
+
+	switch nonzero {
+	case 0:
+		return ""
+	case 1:
+		return top.name
+	default:
+		return top.name + "+others"
+	}
 }
 
 // Fetcher returns the read seam — a [fetch.Fetcher] over the named tenants' data (head ∪

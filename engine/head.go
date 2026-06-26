@@ -28,6 +28,7 @@ type head struct {
 	post    *postings.MemPostings
 	samples map[signal.SeriesID]*sampleBuf
 	newest  int64 // newest timestamp seen, for the OOO window
+	bytes   int64 // buffered sample bytes (SampleBytes each); the in-flight memory measure
 }
 
 type sampleBuf struct {
@@ -64,6 +65,7 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 	buf := h.bufFor(id)
 	buf.ts = append(buf.ts, ts)
 	buf.values = append(buf.values, value)
+	h.bytes += SampleBytes
 
 	if ts > h.newest {
 		h.newest = ts
@@ -75,14 +77,20 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 // appendByID adds one sample for the series whose content id is already computed. The full
 // identity is materialized lazily — materialize() is called only on first sight, when the
 // series must be registered and indexed — so the hot path for a repeat series never builds
-// or hashes a [signal.Series]. It returns whether the sample was accepted (false ⇒ out of
-// the OOO window), whether the series was newly seen, and, when new, the materialized
-// identity (for the caller's WAL series record).
+// or hashes a [signal.Series]. It enforces limits (OOO window, in-flight bytes, cardinality)
+// and returns the per-sample outcome, whether the series was newly seen, and, when new, the
+// materialized identity (for the caller's WAL series record).
 func (h *head) appendByID(
-	id signal.SeriesID, ts int64, value float64, oooWindow int64, materialize func() signal.Series,
-) (accepted, isNew bool, s signal.Series) {
+	id signal.SeriesID, ts int64, value float64, oooWindow int64, limits AppendLimits, materialize func() signal.Series,
+) (out admitOutcome, isNew bool, s signal.Series) {
 	if h.newest != 0 && oooWindow > 0 && ts < h.newest-oooWindow {
-		return false, false, signal.Series{}
+		return rejectOOO, false, signal.Series{}
+	}
+
+	// Memory backpressure applies to every sample (known or new): once the head is at the
+	// in-flight cap, shed until a flush drains it.
+	if limits.MaxInFlightBytes > 0 && h.bytes >= limits.MaxInFlightBytes {
+		return rejectBytes, false, signal.Series{}
 	}
 
 	// One map probe on the hot path: a present sample buffer means the series is already
@@ -92,6 +100,12 @@ func (h *head) appendByID(
 	buf := h.samples[id]
 	if buf == nil {
 		if !h.series.Has(id) {
+			// A new series: reject it if minting it would exceed the cardinality cap. Existing
+			// series are never blocked, so a query keeps returning what is already admitted.
+			if limits.MaxSeries > 0 && int64(h.series.Len()) >= limits.MaxSeries {
+				return rejectCardinality, false, signal.Series{}
+			}
+
 			isNew = true
 			s = materialize()
 			h.series.Add(s)
@@ -104,12 +118,13 @@ func (h *head) appendByID(
 
 	buf.ts = append(buf.ts, ts)
 	buf.values = append(buf.values, value)
+	h.bytes += SampleBytes
 
 	if ts > h.newest {
 		h.newest = ts
 	}
 
-	return true, isNew, s
+	return admitted, isNew, s
 }
 
 // trimBelow drops every buffered sample with timestamp ≤ t (now durable in a flushed part),
@@ -128,6 +143,19 @@ func (h *head) trimBelow(t int64) {
 
 		buf.ts, buf.values = ts, vs
 	}
+
+	h.recountBytes()
+}
+
+// recountBytes resets the in-flight byte measure from the current buffers (used after a bulk
+// mutation like trimBelow that does not track per-sample deltas).
+func (h *head) recountBytes() {
+	var n int64
+	for _, buf := range h.samples {
+		n += int64(len(buf.ts))
+	}
+
+	h.bytes = n * SampleBytes
 }
 
 // bufFor returns the (created-on-demand) sample buffer for an already-registered series.
@@ -161,6 +189,7 @@ func (h *head) replaySamples(id signal.SeriesID, ts []int64, values []float64) {
 	buf := h.bufFor(id)
 	buf.ts = append(buf.ts, ts...)
 	buf.values = append(buf.values, values...)
+	h.bytes += int64(len(ts)) * SampleBytes
 
 	for _, t := range ts {
 		if t > h.newest {
