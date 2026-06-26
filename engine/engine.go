@@ -301,6 +301,20 @@ func (e *Engine) ApplyReplicated(data []byte) (rejected int, err error) {
 	return rejected, err
 }
 
+// HeadSampleCount returns the number of samples currently buffered in the head (across all
+// series) — for introspection and tests (e.g. to observe replica head trimming).
+func (e *Engine) HeadSampleCount() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	n := 0
+	for _, buf := range e.head.samples {
+		n += len(buf.ts)
+	}
+
+	return n
+}
+
 // SeriesCount returns the number of distinct series in the head.
 func (e *Engine) SeriesCount() int {
 	e.mu.RLock()

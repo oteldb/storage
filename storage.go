@@ -393,7 +393,11 @@ func (s *Storage) maintain(ctx context.Context) {
 	for tid, eng := range engines {
 		if owned != nil {
 			if _, ok := owned[tid]; !ok {
-				continue // a replica, not the compaction owner — skip flush/merge
+				// A replica, not the compaction owner: pull the owner's flushed parts from the
+				// shared store and trim the head to the unflushed window, bounding memory.
+				_ = eng.RefreshReplica(ctx)
+
+				continue
 			}
 		}
 

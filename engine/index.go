@@ -94,6 +94,35 @@ func (e *Engine) LoadParts(ctx context.Context) error {
 	return e.loadSeriesIndexLocked(ctx)
 }
 
+// RefreshReplica brings a replica node's view up to date with the shared object store: it
+// reconstructs the flushed parts from the bucket index and trims its head to the
+// still-unflushed window — samples a primary has already flushed (covered by a part) are
+// dropped, bounding replica memory. With no shared store (this node cannot see the parts), it
+// is a safe no-op: nothing loads, so nothing is trimmed.
+func (e *Engine) RefreshReplica(ctx context.Context) error {
+	if err := e.LoadParts(ctx); err != nil {
+		return err
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if len(e.parts) == 0 {
+		return nil
+	}
+
+	maxT := minInt64
+	for _, p := range e.parts {
+		if p.maxTime > maxT {
+			maxT = p.maxTime
+		}
+	}
+
+	e.head.trimBelow(maxT)
+
+	return nil
+}
+
 // writeSeriesIndexLocked persists the head's full series identity set so a stateless reader
 // can rebuild the postings/series index. Written on flush; the identity set only grows
 // (identities outlive a flush), so a full rewrite is correct. Caller holds e.mu.

@@ -112,6 +112,24 @@ func (h *head) appendByID(
 	return true, isNew, s
 }
 
+// trimBelow drops every buffered sample with timestamp ≤ t (now durable in a flushed part),
+// bounding a replica's head to the still-unflushed window. Each buffer is compacted in place.
+func (h *head) trimBelow(t int64) {
+	for _, buf := range h.samples {
+		ts := buf.ts[:0]
+		vs := buf.values[:0]
+
+		for i := range buf.ts {
+			if buf.ts[i] > t {
+				ts = append(ts, buf.ts[i])
+				vs = append(vs, buf.values[i])
+			}
+		}
+
+		buf.ts, buf.values = ts, vs
+	}
+}
+
 // bufFor returns the (created-on-demand) sample buffer for an already-registered series.
 func (h *head) bufFor(id signal.SeriesID) *sampleBuf {
 	buf := h.samples[id]
