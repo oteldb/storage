@@ -119,24 +119,14 @@ const (
 	colAttrs    = "attrs"
 )
 
-// toBatch builds the fetch batch for one stream from the accumulated columns. Timestamps carries
-// each record's event time; the per-record fields are the named columns (the full set in M8a —
-// projection narrows this later).
-func (c *recordCols) toBatch(id signal.SeriesID, s signal.Series) *fetch.Batch {
+// toBatch builds the fetch batch for one stream from the accumulated columns, materializing only
+// the projected columns (an empty projection materializes all). Timestamps always carries each
+// record's event time.
+func (c *recordCols) toBatch(id signal.SeriesID, s signal.Series, projection []string) *fetch.Batch {
 	return &fetch.Batch{
 		ID:         id,
 		Series:     s,
 		Timestamps: c.ts,
-		Columns: []fetch.NamedColumn{
-			{Name: colObserved, Int64: c.observed},
-			{Name: colSeverity, Int64: c.severity},
-			{Name: colFlags, Int64: c.flags},
-			{Name: colDropped, Int64: c.dropped},
-			{Name: colSevText, Bytes: c.sevText},
-			{Name: colBody, Bytes: c.body},
-			{Name: colTraceID, Bytes: c.traceID},
-			{Name: colSpanID, Bytes: c.spanID},
-			{Name: colAttrs, Bytes: c.attrs},
-		},
+		Columns:    projectColumns(c, projection),
 	}
 }

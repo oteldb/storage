@@ -2,9 +2,11 @@
 // every data source (head, parts, cluster fan-out) implements. A [Request] of label
 // matchers + a time window resolves to an [Iterator] of lazily-produced [Batch]es.
 //
-// This is the metrics shape of the contract — one batch per matching series, carrying its
-// sample columns. The columnar/projection/second-pass and nested-reconstruction aspects
-// (for logs/traces) extend it in later milestones; the seam itself stays the same.
+// The contract is dual-shape. For metrics, a batch is one matching series carrying its sample
+// columns. For logs, label Matchers resolve a stream and columnar Conditions filter its records;
+// a batch carries the per-record Columns. Projection narrows the materialized columns and an
+// optional SecondPass post-filters. Nested reconstruction (traces) extends it later; the seam
+// stays the same.
 package fetch
 
 import (

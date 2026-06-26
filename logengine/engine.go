@@ -160,6 +160,13 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 		e.head.appendWindow(id, acc, r.Start, r.End)
 
+		// Column conditions (AND) filter records within the stream. Per the contract, the engine
+		// applies them conjunctively only when AllConditions is set; otherwise it returns the
+		// window superset and the language layer filters.
+		if r.AllConditions && len(r.Conditions) > 0 {
+			acc = acc.filtered(r.Conditions)
+		}
+
 		if acc.len() == 0 {
 			continue
 		}
@@ -167,7 +174,15 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		acc.sortByTs()
 
 		s, _ := e.head.series.Get(id)
-		batches = append(batches, acc.toBatch(id, s))
+		b := acc.toBatch(id, s, r.Projection)
+
+		// SecondPass is an optional engine-side post-filter (e.g. a cross-column predicate); a
+		// false verdict drops the whole stream batch.
+		if r.SecondPass != nil && !r.SecondPass(b) {
+			continue
+		}
+
+		batches = append(batches, b)
 	}
 
 	return fetch.NewSliceIterator(batches), nil
