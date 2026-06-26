@@ -31,6 +31,11 @@ type part struct {
 	reader *block.PartReader
 	prefix string
 	ranges map[signal.SeriesID]rowRange
+
+	// minTime, maxTime are the inclusive unix-ns sample bounds of the part, recorded in the
+	// bucket index for time pruning. Set from the flush/merge columns when written and from
+	// the index entry when reconstructed (see engine/index.go).
+	minTime, maxTime int64
 }
 
 // deletePart removes every backend object of the part at prefix (manifest, marks, and

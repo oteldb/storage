@@ -52,8 +52,16 @@ func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) error {
 			return err
 		}
 
+		p.minTime, p.maxTime = colsTimeRange(cols)
 		e.parts = []*part{p}
 		e.nextSeq++
+	}
+
+	// Commit the new part set to the bucket index before deleting the source parts, so a
+	// crash mid-merge never leaves the index referencing a deleted part (it may leave orphan
+	// objects, which are harmless and reclaimed by a later merge).
+	if err := e.updateIndexLocked(ctx); err != nil {
+		return err
 	}
 
 	for _, p := range old {

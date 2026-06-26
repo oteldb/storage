@@ -162,9 +162,11 @@ conditional-write (CAS) primitive on which atomic manifest / block-list commits 
 - **`backend/backendtest`** — a shared conformance suite (`Run(t, factory)`) that memory,
   file, and s3 (over both fakes) pass under `-race`, proving they are interchangeable.
 
-The **stateless read path** (a node reconstructing parts from the bucket via `bucketindex`,
-with no local part state) is the remaining M5 integration; the building blocks (s3 + CAS +
-bucketindex) are in place.
+The **stateless read path** is wired at the engine level (§3f, `Engine.LoadParts`): a fresh
+engine reconstructs its part set (from `bucketindex`) and its identity index (from a durable
+series object) from the backend alone — no local state — and serves matcher-based queries
+with full labels. Facade-level recovery (`Open` → per-tenant `LoadParts` + WAL replay) is the
+remaining wiring.
 
 ## 3b. Part format (`block/`)
 
@@ -304,7 +306,17 @@ It is safe for concurrent use (one `sync.RWMutex`).
   inside) remains for callers that already hold an identity.
 - **Flush** (`flush.go`) drains the head's buffered samples into one **flat 3-column part**
   `[series:int128, ts:int64, value:float64]`, one row per sample, sorted by `(series, ts)`,
-  written via `block.PartWriter` under `{tenant}/metrics/{seq}`.
+  written via `block.PartWriter` under `{tenant}/metrics/{seq}`. After the part is written,
+  flush updates the two durable index objects (§3a): the **bucket index**
+  (`{prefix}/bucket-index.bin` — part list + per-part time bounds) and the **identity index**
+  (`{prefix}/series.bin` — every series' reversible labels). Merge updates both too,
+  committing the new part set to the bucket index *before* deleting the source parts.
+- **Stateless reconstruction** (`index.go`) — `Engine.LoadParts` rebuilds a fresh engine's
+  durable state from the backend alone: the part set from the bucket index, and the
+  postings/series index from the identity object (so matchers resolve and batches carry real
+  labels — parts store only ids). This is the object-store-native read path: any node serves a
+  tenant's flushed data without the (local) WAL. WAL `Replay` is complementary, restoring only
+  the *unflushed* head.
 - **Part fetch** (`part.go`) — `openPart` rebuilds a `SeriesID → [rowStart,rowEnd)` index
   by scanning the series column once (each series is one contiguous run); `mergeInto`
   decodes a series' `ts`/`value` sub-slice within the window.

@@ -290,8 +290,13 @@ func (e *Engine) flushLocked(ctx context.Context) error {
 		return err
 	}
 
+	p.minTime, p.maxTime = colsTimeRange(cols)
 	e.parts = append(e.parts, p)
 	e.nextSeq++
 
-	return nil
+	if err := e.updateIndexLocked(ctx); err != nil {
+		return err
+	}
+
+	return e.writeSeriesIndexLocked(ctx)
 }
