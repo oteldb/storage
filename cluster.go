@@ -68,9 +68,10 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle(replica.ReplicatePath, rp.Handler())                                                     // secondary: trusting apply
-	mux.Handle(primaryWritePath, s.primaryWriteHandler())                                               // primary: OOO apply + replicate
-	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch, s.localLogFetch, s.localTraceFetch)) // read fan-out
+	mux.Handle(replica.ReplicatePath, rp.Handler())       // secondary: trusting apply
+	mux.Handle(primaryWritePath, s.primaryWriteHandler()) // primary: OOO apply + replicate
+	// read fan-out across metric/log/trace/profile signals.
+	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch, s.localLogFetch, s.localTraceFetch, s.localProfileFetch))
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	go func() { _ = srv.Serve(ln) }()
@@ -184,6 +185,30 @@ func (s *Storage) clusterTraceFetcherFor(tid signal.TenantID) fetch.Fetcher {
 	return s.clusterRecordFetcherFor(signal.Trace, tid, s.lookupTraceEngine)
 }
 
+// localProfileFetch serves a peer's sample fetch from the local profiles engine.
+func (s *Storage) localProfileFetch(
+	ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher,
+) ([]*fetch.Batch, error) {
+	eng, ok := s.lookupProfileEngine(s.normalizeTenant(signal.TenantID(tenant)))
+	if !ok {
+		return nil, nil
+	}
+
+	it, err := eng.Fetch(ctx, fetch.Request{
+		Signal: signal.Profile, Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return fetch.Drain(ctx, it)
+}
+
+// clusterProfileFetcherFor is the profiles analog of [Storage.clusterLogFetcherFor].
+func (s *Storage) clusterProfileFetcherFor(tid signal.TenantID) fetch.Fetcher {
+	return s.clusterRecordFetcherFor(signal.Profile, tid, s.lookupProfileEngine)
+}
+
 // clusterRecordFetcherFor returns a record signal's read seam for one tenant in cluster mode:
 // local if this node owns the tenant (the head is replicated here), otherwise fanned out to an
 // owner over HTTP (a window+matcher superset the requester re-filters), failing over between
@@ -213,13 +238,16 @@ func (s *Storage) clusterRecordFetcherFor(
 	return &filteringFetcher{inner: failoverFetcher(remotes)}
 }
 
-// recordEngineFor returns the local record engine (logs or traces) for a signal+tenant.
+// recordEngineFor returns the local record engine (logs, traces, or profiles) for a signal+tenant.
 func (s *Storage) recordEngineFor(sig signal.Signal, tenant string) *recordengine.Engine {
-	if sig == signal.Trace {
+	switch sig {
+	case signal.Trace:
 		return s.traceEngineFor(signal.TenantID(tenant))
+	case signal.Profile:
+		return s.profileEngineFor(signal.TenantID(tenant))
+	default:
+		return s.logEngineFor(signal.TenantID(tenant))
 	}
-
-	return s.logEngineFor(signal.TenantID(tenant))
 }
 
 // applyReplicated is the secondary receive path: it decodes a primary's accepted write and applies

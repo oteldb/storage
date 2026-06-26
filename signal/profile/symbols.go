@@ -208,9 +208,20 @@ func (b *builder) stackID(idx int32) signal.SeriesID {
 	return id
 }
 
-// sampleTypeID is the content id (low 64 bits of the xxh3-128) of a (type, unit) pair, used as the
-// sample_type_id int64 column. An embedder filters by computing the same hash for the type/unit it
-// wants — no stored value-type table is needed for search.
+// SampleTypeID is the content id (low 64 bits of the xxh3-128) of a (type, unit) pair, the value
+// stored in the [ColSampleType] column. An embedder selects one profile type by computing this from
+// the type/unit it wants and filtering the column — no stored value-type table or lookup is needed.
+func SampleTypeID(typeName, unit []byte) int64 {
+	pre := make([]byte, 0, 2+len(typeName)+len(unit))
+	pre = append(pre, tagValueType)
+	pre = append(pre, typeName...)
+	pre = append(pre, 0) // separator so ("ab","c") ≠ ("a","bc")
+	pre = append(pre, unit...)
+
+	return int64(signal.HashBytes(pre).Lo)
+}
+
+// sampleTypeID computes [SampleTypeID] for a dictionary value type, resolving its string indices.
 func sampleTypeID(d *Dictionary, vt ValueType) int64 {
 	var typ, unit []byte
 	if inRange(d.Strings, vt.TypeStrindex) {
@@ -221,13 +232,7 @@ func sampleTypeID(d *Dictionary, vt ValueType) int64 {
 		unit = d.Strings[vt.UnitStrindex]
 	}
 
-	pre := make([]byte, 0, 2+len(typ)+len(unit))
-	pre = append(pre, tagValueType)
-	pre = append(pre, typ...)
-	pre = append(pre, 0) // separator so ("ab","c") ≠ ("a","bc")
-	pre = append(pre, unit...)
-
-	return int64(signal.HashBytes(pre).Lo)
+	return SampleTypeID(typ, unit)
 }
 
 // ---- table / delta encoding (CRC-framed, fuzz-safe decode) ----

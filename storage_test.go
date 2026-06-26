@@ -15,7 +15,6 @@ import (
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/log"
 	"github.com/oteldb/storage/signal/metric"
-	"github.com/oteldb/storage/signal/profile"
 )
 
 // durableBackend wraps the memory backend but reports itself non-ephemeral, to exercise
@@ -248,19 +247,6 @@ func mustFetch(t *testing.T, f fetch.Fetcher) fetch.Iterator {
 	require.NoError(t, err)
 
 	return it
-}
-
-func TestUnimplementedSignals(t *testing.T) {
-	t.Parallel()
-
-	s, err := InMemory()
-	require.NoError(t, err)
-	ctx := context.Background()
-
-	// Logs and traces are implemented (see logs_test.go / traces_test.go); profiles remain a later
-	// vertical.
-	_, err = s.WriteProfiles(ctx, profile.Profiles{})
-	require.ErrorIs(t, err, ErrNotImplemented)
 }
 
 func TestOOOWindowViaStorage(t *testing.T) {

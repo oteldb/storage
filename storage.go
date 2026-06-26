@@ -19,7 +19,6 @@ import (
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
-	"github.com/oteldb/storage/signal/profile"
 	"github.com/oteldb/storage/tenant"
 )
 
@@ -41,10 +40,11 @@ type Storage struct {
 	tenant  tenant.Resolver
 	closed  atomic.Bool
 
-	tmu          sync.Mutex
-	tenants      map[signal.TenantID]*engine.Engine
-	logTenants   map[signal.TenantID]*recordengine.Engine
-	traceTenants map[signal.TenantID]*recordengine.Engine
+	tmu            sync.Mutex
+	tenants        map[signal.TenantID]*engine.Engine
+	logTenants     map[signal.TenantID]*recordengine.Engine
+	traceTenants   map[signal.TenantID]*recordengine.Engine
+	profileTenants map[signal.TenantID]*recordengine.Engine
 
 	cluster *clusterNode // cluster runtime (membership + replica server + routed writes); nil ⇒ single-node
 
@@ -66,12 +66,13 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	}
 	o.applyDefaults()
 	s := &Storage{
-		opts:         o,
-		backend:      o.Backend,
-		tenant:       o.Tenancy,
-		tenants:      make(map[signal.TenantID]*engine.Engine),
-		logTenants:   make(map[signal.TenantID]*recordengine.Engine),
-		traceTenants: make(map[signal.TenantID]*recordengine.Engine),
+		opts:           o,
+		backend:        o.Backend,
+		tenant:         o.Tenancy,
+		tenants:        make(map[signal.TenantID]*engine.Engine),
+		logTenants:     make(map[signal.TenantID]*recordengine.Engine),
+		traceTenants:   make(map[signal.TenantID]*recordengine.Engine),
+		profileTenants: make(map[signal.TenantID]*recordengine.Engine),
 	}
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
@@ -158,6 +159,12 @@ func (s *Storage) Close(ctx context.Context) error {
 		}
 	}
 
+	for _, eng := range s.profileEngineSnapshot() {
+		if err := eng.Close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
 	return firstErr
 }
 
@@ -191,6 +198,12 @@ func (s *Storage) Reset(ctx context.Context) error {
 	for _, eng := range s.traceEngineSnapshot() {
 		if err := eng.Reset(ctx); err != nil {
 			return errors.Wrap(err, "reset trace engine")
+		}
+	}
+
+	for _, eng := range s.profileEngineSnapshot() {
+		if err := eng.Reset(ctx); err != nil {
+			return errors.Wrap(err, "reset profile engine")
 		}
 	}
 
@@ -237,11 +250,6 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted
 		Accepted: int64(emitted) - oooRejected,
 		Rejected: oooRejected,
 	}, nil
-}
-
-// WriteProfiles ingests a profiles batch. Later vertical.
-func (s *Storage) WriteProfiles(_ context.Context, _ profile.Profiles) (Accepted, error) {
-	return s.notImplementedWrite("write profiles")
 }
 
 // Fetcher returns the read seam — a [fetch.Fetcher] over the named tenants' data (head ∪
@@ -360,14 +368,6 @@ func (s *Storage) lookupEngine(tid signal.TenantID) (*engine.Engine, bool) {
 	return e, ok
 }
 
-func (s *Storage) notImplementedWrite(op string) (Accepted, error) {
-	if s.closed.Load() {
-		return Accepted{}, errors.Wrap(ErrClosed, op)
-	}
-
-	return Accepted{}, ErrNotImplemented
-}
-
 // tenantFor derives a record's tenant from its resource and scope via the configured
 // callback, defaulting to "default".
 func (s *Storage) tenantFor(r signal.Resource, sc signal.Scope) signal.TenantID {
@@ -412,6 +412,7 @@ func (s *Storage) recover(ctx context.Context) error {
 	metricSuffix := metricsPrefix + "/" + bucketindex.Object
 	logSuffix := logsPrefix + "/" + bucketindex.Object
 	traceSuffix := tracesPrefix + "/" + bucketindex.Object
+	profileSuffix := profilesPrefix + "/" + bucketindex.Object
 
 	for _, k := range keys {
 		switch {
@@ -429,6 +430,11 @@ func (s *Storage) recover(ctx context.Context) error {
 			tid := signal.TenantID(strings.TrimSuffix(k, traceSuffix))
 			if err := s.traceEngineFor(tid).LoadParts(ctx); err != nil {
 				return errors.Wrapf(err, "recover traces tenant %q", tid)
+			}
+		case strings.HasSuffix(k, profileSuffix):
+			tid := signal.TenantID(strings.TrimSuffix(k, profileSuffix))
+			if err := s.profileEngineFor(tid).LoadParts(ctx); err != nil {
+				return errors.Wrapf(err, "recover profiles tenant %q", tid)
 			}
 		}
 	}
@@ -482,11 +488,12 @@ func (s *Storage) maintain(ctx context.Context) {
 	metricEngines := s.engineSnapshotByTenant()
 	logEngines := s.logEngineSnapshotByTenant()
 	traceEngines := s.traceEngineSnapshotByTenant()
+	profileEngines := s.profileEngineSnapshotByTenant()
 
 	// Compaction ownership is per-tenant and shared across signals, so reconcile it once over the
 	// union of all signals' tenants (reconciling per-signal would have each release the others'
 	// claims). nil ⇒ single-node: own everything.
-	tids := make(map[signal.TenantID]struct{}, len(metricEngines)+len(logEngines)+len(traceEngines))
+	tids := make(map[signal.TenantID]struct{}, len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines))
 	for tid := range metricEngines {
 		tids[tid] = struct{}{}
 	}
@@ -496,6 +503,10 @@ func (s *Storage) maintain(ctx context.Context) {
 	}
 
 	for tid := range traceEngines {
+		tids[tid] = struct{}{}
+	}
+
+	for tid := range profileEngines {
 		tids[tid] = struct{}{}
 	}
 
@@ -527,6 +538,11 @@ func (s *Storage) maintain(ctx context.Context) {
 	}
 
 	for tid, eng := range traceEngines {
+		maintainEngine(tid, func() error { return eng.Flush(ctx) },
+			func(r int64) error { return eng.Merge(ctx, r) }, func() error { return eng.RefreshReplica(ctx) })
+	}
+
+	for tid, eng := range profileEngines {
 		maintainEngine(tid, func() error { return eng.Flush(ctx) },
 			func(r int64) error { return eng.Merge(ctx, r) }, func() error { return eng.RefreshReplica(ctx) })
 	}
