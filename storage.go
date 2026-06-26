@@ -2,7 +2,10 @@ package storage
 
 import (
 	"context"
+	"io/fs"
 	"maps"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -20,6 +23,7 @@ import (
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
 	"github.com/oteldb/storage/tenant"
+	"github.com/oteldb/storage/wal"
 )
 
 // Storage is the embeddable entry point (DESIGN.md §5). It is safe for concurrent use.
@@ -234,17 +238,38 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (Accepted
 		lastEng    *engine.Engine
 	)
 
+	var firstErr error
+
 	emitted := metric.Project(md, func(b *metric.Batch) {
-		tid := s.tenantFor(b.Resource(), b.Scope())
-		if lastEng == nil || tid != lastTenant {
-			lastTenant, lastEng = tid, s.engineFor(tid)
+		if firstErr != nil {
+			return
 		}
 
-		// Engines are ephemeral here, so AppendBatch never errors; samples beyond the OOO
-		// window are not accepted and counted as rejected.
-		accepted, _ := lastEng.AppendBatch(b.IDs, b.Ts, b.Values, b.Series)
+		tid := s.tenantFor(b.Resource(), b.Scope())
+		if lastEng == nil || tid != lastTenant {
+			eng, err := s.engineFor(tid)
+			if err != nil {
+				firstErr = err
+
+				return
+			}
+
+			lastTenant, lastEng = tid, eng
+		}
+
+		accepted, err := lastEng.AppendBatch(b.IDs, b.Ts, b.Values, b.Series)
+		if err != nil {
+			firstErr = err
+
+			return
+		}
+
 		oooRejected += int64(b.Len() - accepted)
 	})
+
+	if firstErr != nil {
+		return Accepted{}, firstErr
+	}
 
 	return Accepted{
 		Accepted: int64(emitted) - oooRejected,
@@ -397,8 +422,8 @@ const metricsPrefix = "/metrics"
 // serves data written by a previous one. It is a no-op for an ephemeral backend (a new
 // process starts with an empty store). Tenants are discovered by their bucket-index objects.
 //
-// Note: this restores only *flushed* data. Recovering the unflushed head from a per-tenant
-// WAL is a separate piece (the WAL is not yet wired into the facade).
+// It then replays each per-tenant WAL ([Storage.recoverWAL]) to restore the *unflushed* head a
+// crash would otherwise lose.
 func (s *Storage) recover(ctx context.Context) error {
 	if s.backend.IsEphemeral() {
 		return nil
@@ -407,6 +432,15 @@ func (s *Storage) recover(ctx context.Context) error {
 	keys, err := s.backend.List(ctx, "")
 	if err != nil {
 		return errors.Wrap(err, "list backend for recovery")
+	}
+
+	// load creates an engine (propagating a creation error) and loads its flushed parts.
+	load := func(e partLoader, err error) error {
+		if err != nil {
+			return err
+		}
+
+		return e.LoadParts(ctx)
 	}
 
 	metricSuffix := metricsPrefix + "/" + bucketindex.Object
@@ -418,46 +452,185 @@ func (s *Storage) recover(ctx context.Context) error {
 		switch {
 		case strings.HasSuffix(k, metricSuffix):
 			tid := signal.TenantID(strings.TrimSuffix(k, metricSuffix))
-			if err := s.engineFor(tid).LoadParts(ctx); err != nil {
+			if err := load(s.engineFor(tid)); err != nil {
 				return errors.Wrapf(err, "recover metrics tenant %q", tid)
 			}
 		case strings.HasSuffix(k, logSuffix):
 			tid := signal.TenantID(strings.TrimSuffix(k, logSuffix))
-			if err := s.logEngineFor(tid).LoadParts(ctx); err != nil {
+			if err := load(s.logEngineFor(tid)); err != nil {
 				return errors.Wrapf(err, "recover logs tenant %q", tid)
 			}
 		case strings.HasSuffix(k, traceSuffix):
 			tid := signal.TenantID(strings.TrimSuffix(k, traceSuffix))
-			if err := s.traceEngineFor(tid).LoadParts(ctx); err != nil {
+			if err := load(s.traceEngineFor(tid)); err != nil {
 				return errors.Wrapf(err, "recover traces tenant %q", tid)
 			}
 		case strings.HasSuffix(k, profileSuffix):
 			tid := signal.TenantID(strings.TrimSuffix(k, profileSuffix))
-			if err := s.profileEngineFor(tid).LoadParts(ctx); err != nil {
+			if err := load(s.profileEngineFor(tid)); err != nil {
 				return errors.Wrapf(err, "recover profiles tenant %q", tid)
 			}
 		}
 	}
 
-	return nil
+	return s.recoverWAL(ctx)
 }
 
-// engineFor returns the engine for a tenant, creating it on first use.
-func (s *Storage) engineFor(tid signal.TenantID) *engine.Engine {
+// partLoader is the LoadParts surface shared by both engine types, so recovery can load a freshly
+// created engine's flushed parts uniformly.
+type partLoader interface {
+	LoadParts(ctx context.Context) error
+}
+
+// recoverWAL replays each per-tenant WAL directory under [Options.WALDir] into its engine, restoring
+// the unflushed head a crash would otherwise lose. The directory layout mirrors the engine prefixes
+// ({WALDir}/{tenant}/{signal}); creating the engine (via the *EngineFor constructors) re-attaches a
+// fresh resumed WAL before replay. No-op when no WAL directory is configured or present.
+func (s *Storage) recoverWAL(ctx context.Context) error {
+	if s.opts.WALDir == "" {
+		return nil
+	}
+
+	if _, err := os.Stat(s.opts.WALDir); os.IsNotExist(err) {
+		return nil
+	}
+
+	return filepath.WalkDir(s.opts.WALDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !d.IsDir() {
+			return nil
+		}
+
+		replay, ok := s.walReplayerFor(d.Name())
+		if !ok {
+			return nil // a tenant dir or the root, not a signal leaf
+		}
+
+		switch has, herr := dirHasSegments(path); {
+		case herr != nil:
+			return herr
+		case !has:
+			return nil
+		}
+
+		rel, err := filepath.Rel(s.opts.WALDir, filepath.Dir(path))
+		if err != nil {
+			return err
+		}
+
+		return replay(ctx, signal.TenantID(filepath.ToSlash(rel)), path)
+	})
+}
+
+// walReplayerFor maps a WAL leaf-directory name (a signal) to a function that creates that signal's
+// engine for the tenant and replays the directory into it.
+func (s *Storage) walReplayerFor(name string) (func(context.Context, signal.TenantID, string) error, bool) {
+	switch "/" + name {
+	case metricsPrefix:
+		return func(_ context.Context, tid signal.TenantID, dir string) error {
+			e, err := s.engineFor(tid)
+			if err != nil {
+				return err
+			}
+
+			return e.Replay(dir)
+		}, true
+	case logsPrefix:
+		return func(_ context.Context, tid signal.TenantID, dir string) error {
+			e, err := s.logEngineFor(tid)
+			if err != nil {
+				return err
+			}
+
+			return e.Replay(dir)
+		}, true
+	case tracesPrefix:
+		return func(_ context.Context, tid signal.TenantID, dir string) error {
+			e, err := s.traceEngineFor(tid)
+			if err != nil {
+				return err
+			}
+
+			return e.Replay(dir)
+		}, true
+	case profilesPrefix:
+		return func(_ context.Context, tid signal.TenantID, dir string) error {
+			e, err := s.profileEngineFor(tid)
+			if err != nil {
+				return err
+			}
+
+			return e.Replay(dir)
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+// dirHasSegments reports whether dir contains any WAL segment file.
+func dirHasSegments(dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false, err
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".wal") {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// engineFor returns the engine for a tenant, creating it (with a WAL when [Options.WALDir] is set)
+// on first use.
+func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 	s.tmu.Lock()
 	defer s.tmu.Unlock()
 
-	e := s.tenants[tid]
-	if e == nil {
-		e = engine.New(engine.Config{
-			OOOWindow: s.opts.OOOWindow,
-			Backend:   s.backend,
-			Prefix:    string(s.normalizeTenant(tid)) + metricsPrefix,
-		})
-		s.tenants[tid] = e
+	if e := s.tenants[tid]; e != nil {
+		return e, nil
 	}
 
-	return e
+	prefix := string(s.normalizeTenant(tid)) + metricsPrefix
+
+	w, err := s.walFor(prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	e := engine.New(engine.Config{
+		OOOWindow: s.opts.OOOWindow,
+		Backend:   s.backend,
+		Prefix:    prefix,
+		WAL:       w,
+	})
+	s.tenants[tid] = e
+
+	return e, nil
+}
+
+// walFor returns a per-engine durable WAL writer rooted at [Options.WALDir]/prefix, or a nil writer
+// when no WAL directory is configured (the engine then runs without durable head logging — flushed
+// parts are still recovered from the backend). The directory is created on first use and resumed on
+// restart (see [wal.Create]).
+//
+//nolint:nilnil // a nil writer is the documented "no WAL configured" sentinel, checked by the engine
+func (s *Storage) walFor(prefix string) (*wal.SegmentWriter, error) {
+	if s.opts.WALDir == "" {
+		return nil, nil
+	}
+
+	w, err := wal.Create(filepath.Join(s.opts.WALDir, filepath.FromSlash(prefix)), 0)
+	if err != nil {
+		return nil, errors.Wrapf(err, "create wal for %q", prefix)
+	}
+
+	return w, nil
 }
 
 // runMaintenance periodically flushes and compacts every tenant engine until Close stops

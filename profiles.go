@@ -99,25 +99,15 @@ func (s *Storage) ProfileResolver(ctx context.Context, tenant signal.TenantID) (
 	return profile.NewResolver(tables)
 }
 
-// profileEngineFor returns the profiles engine for a tenant, creating it on first use. The engine
-// carries a [profile.SymbolStore] side store, so flush/merge persist and union the symbol tables.
-func (s *Storage) profileEngineFor(tid signal.TenantID) *recordengine.Engine {
+// profileEngineFor returns the profiles engine for a tenant, creating it (with a WAL when
+// [Options.WALDir] is set) on first use. The engine carries a [profile.SymbolStore] side store, so
+// flush/merge persist and union the symbol tables.
+func (s *Storage) profileEngineFor(tid signal.TenantID) (*recordengine.Engine, error) {
 	s.tmu.Lock()
 	defer s.tmu.Unlock()
 
-	e := s.profileTenants[tid]
-	if e == nil {
-		e = recordengine.New(recordengine.Config{
-			Schema:    profile.Schema,
-			OOOWindow: s.opts.OOOWindow,
-			Backend:   s.backend,
-			Prefix:    string(s.normalizeTenant(tid)) + profilesPrefix,
-			SideStore: profile.NewSymbolStore(),
-		})
-		s.profileTenants[tid] = e
-	}
-
-	return e
+	return s.recordEngineCached(s.profileTenants, tid, profilesPrefix, profile.Schema,
+		func() recordengine.SideStore { return profile.NewSymbolStore() })
 }
 
 func (s *Storage) lookupProfileEngine(tid signal.TenantID) (*recordengine.Engine, bool) {

@@ -140,11 +140,19 @@ func (e *Engine) compactParts(ctx context.Context, start int64) (*flushColumns, 
 	return f, nil
 }
 
-// Close flushes any buffered records to a part. It does not stop a background loop — the owner
-// ([storage.Storage]) does that before calling Close.
+// Close flushes any buffered records to a part and closes the WAL. It does not stop a background
+// loop — the owner ([storage.Storage]) does that before calling Close.
 func (e *Engine) Close(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return e.flushLocked(ctx)
+	if err := e.flushLocked(ctx); err != nil {
+		return err
+	}
+
+	if e.cfg.WAL != nil {
+		return e.cfg.WAL.Close()
+	}
+
+	return nil
 }

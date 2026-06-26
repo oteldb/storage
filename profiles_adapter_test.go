@@ -116,7 +116,7 @@ func TestProfilesAdapterFlamegraph(t *testing.T) {
 
 	// After a flush the symbols live in a part sidecar, not the head; the resolver still resolves
 	// (SideSnapshot unions parts) — content ids are stable across the flush.
-	require.NoError(t, s.profileEngineFor("default").Flush(ctx))
+	require.NoError(t, mustEngine(s.profileEngineFor("default")).Flush(ctx))
 	flushed, err := s.ProfileResolver(ctx, "default")
 	require.NoError(t, err)
 

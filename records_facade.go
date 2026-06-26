@@ -16,28 +16,89 @@ import (
 // total record count (it wraps log.Project / trace.Project).
 type recordProjector func(emit func(*recordengine.Batch)) int
 
+// recordEngineCached returns the cached record engine for a tenant in m, creating it (with a WAL
+// when [Options.WALDir] is set, and the optional side store from newSide) on first use. The caller
+// holds s.tmu. Shared by the logs/traces/profiles *EngineFor constructors, which differ only in the
+// tenant map, key-prefix suffix, schema, and side store.
+func (s *Storage) recordEngineCached(
+	m map[signal.TenantID]*recordengine.Engine, tid signal.TenantID, suffix string,
+	schema *recordengine.Schema, newSide func() recordengine.SideStore,
+) (*recordengine.Engine, error) {
+	if e := m[tid]; e != nil {
+		return e, nil
+	}
+
+	prefix := string(s.normalizeTenant(tid)) + suffix
+
+	w, err := s.walFor(prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	var side recordengine.SideStore
+	if newSide != nil {
+		side = newSide()
+	}
+
+	e := recordengine.New(recordengine.Config{
+		Schema:    schema,
+		OOOWindow: s.opts.OOOWindow,
+		Backend:   s.backend,
+		Prefix:    prefix,
+		SideStore: side,
+		WAL:       w,
+	})
+	m[tid] = e
+
+	return e, nil
+}
+
+// recordEngineFunc is the engine accessor passed to [Storage.writeRecordsLocal].
+type recordEngineFunc func(signal.TenantID) (*recordengine.Engine, error)
+
 // writeRecordsLocal ingests a projected record batch into per-tenant engines (single-node path),
 // deriving the tenant from each stream's Resource+Scope and returning OTLP partial-success counts.
-func (s *Storage) writeRecordsLocal(project recordProjector, engineFor func(signal.TenantID) *recordengine.Engine) (Accepted, error) {
-	var oooRejected int64
-
+func (s *Storage) writeRecordsLocal(project recordProjector, engineFor recordEngineFunc) (Accepted, error) {
 	var (
-		lastTenant signal.TenantID
-		lastEng    *recordengine.Engine
+		oooRejected int64
+		firstErr    error
+		lastTenant  signal.TenantID
+		lastEng     *recordengine.Engine
 	)
 
 	emitted := project(func(b *recordengine.Batch) {
+		if firstErr != nil {
+			return
+		}
+
 		id := b.Identity()
 		tid := s.tenantFor(id.Resource, id.Scope)
 		if lastEng == nil || tid != lastTenant {
-			lastTenant, lastEng = tid, engineFor(tid)
+			eng, err := engineFor(tid)
+			if err != nil {
+				firstErr = err
+
+				return
+			}
+
+			lastTenant, lastEng = tid, eng
 		}
 
-		// Ephemeral here (no WAL wired into the facade), so AppendBatch never errors; records
-		// beyond the OOO window are not accepted and counted as rejected.
-		accepted, _ := lastEng.AppendBatch(b)
+		// AppendBatch can fail when a WAL is wired (a backend/fs write error); records beyond the
+		// OOO window are not accepted and counted as rejected.
+		accepted, err := lastEng.AppendBatch(b)
+		if err != nil {
+			firstErr = err
+
+			return
+		}
+
 		oooRejected += int64(b.Len() - accepted)
 	})
+
+	if firstErr != nil {
+		return Accepted{}, firstErr
+	}
 
 	return Accepted{Accepted: int64(emitted) - oooRejected, Rejected: oooRejected}, nil
 }

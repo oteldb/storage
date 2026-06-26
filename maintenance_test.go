@@ -25,7 +25,7 @@ func TestMaintainFlushesAndMerges(t *testing.T) {
 
 	s.maintain(ctx) // flush + merge (no retention)
 
-	eng := s.engineFor("default")
+	eng := mustEngine(s.engineFor("default"))
 	assert.Equal(t, 1, eng.PartCount(), "head flushed to one part")
 
 	batches := queryEngine(t, eng, nameMatcher("m"))
@@ -48,7 +48,7 @@ func TestMaintainAppliesRetention(t *testing.T) {
 
 	s.maintain(ctx) // flush, then merge drops everything older than now-1m
 
-	eng := s.engineFor("default")
+	eng := mustEngine(s.engineFor("default"))
 	assert.Equal(t, 0, eng.PartCount(), "retention dropped every part")
 	assert.Empty(t, queryEngine(t, eng, nameMatcher("m")))
 }
@@ -68,7 +68,7 @@ func TestMaintainRetainsRecentData(t *testing.T) {
 
 	s.maintain(ctx)
 
-	eng := s.engineFor("default")
+	eng := mustEngine(s.engineFor("default"))
 	assert.Equal(t, 1, eng.PartCount(), "recent sample retained")
 
 	it, err := eng.Fetch(ctx, fetch.Request{Start: 0, End: now + 1, Matchers: []fetch.Matcher{nameMatcher("m")}})
@@ -102,7 +102,7 @@ func TestMultiTenantIsolationThroughMerge(t *testing.T) {
 	require.NoError(t, err)
 	s.maintain(ctx)
 
-	apiEng, webEng := s.engineFor("api"), s.engineFor("web")
+	apiEng, webEng := mustEngine(s.engineFor("api")), mustEngine(s.engineFor("web"))
 	assert.Equal(t, 1, apiEng.SeriesCount())
 	assert.Equal(t, 1, webEng.SeriesCount(), "web never sees api's series")
 
@@ -127,7 +127,7 @@ func TestBackgroundMaintenanceFlushes(t *testing.T) {
 
 	// The background loop should flush the head without any explicit call.
 	assert.Eventually(t, func() bool {
-		return s.engineFor("default").PartCount() >= 1
+		return mustEngine(s.engineFor("default")).PartCount() >= 1
 	}, time.Second, 2*time.Millisecond)
 
 	require.NoError(t, s.Close(ctx))
@@ -149,7 +149,7 @@ func TestCloseFlushesAllTenants(t *testing.T) {
 	_, err = s.WriteMetrics(ctx, gaugeBatch("web", "m", []int64{100}, []float64{2}))
 	require.NoError(t, err)
 
-	apiEng, webEng := s.engineFor("api"), s.engineFor("web")
+	apiEng, webEng := mustEngine(s.engineFor("api")), mustEngine(s.engineFor("web"))
 	require.NoError(t, s.Close(ctx))
 
 	assert.Equal(t, 1, apiEng.PartCount(), "Close flushed tenant api")

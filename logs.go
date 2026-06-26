@@ -65,23 +65,13 @@ func (c concatFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterat
 	return fetch.NewSliceIterator(all), nil
 }
 
-// logEngineFor returns the logs engine for a tenant, creating it on first use.
-func (s *Storage) logEngineFor(tid signal.TenantID) *recordengine.Engine {
+// logEngineFor returns the logs engine for a tenant, creating it (with a WAL when [Options.WALDir]
+// is set) on first use.
+func (s *Storage) logEngineFor(tid signal.TenantID) (*recordengine.Engine, error) {
 	s.tmu.Lock()
 	defer s.tmu.Unlock()
 
-	e := s.logTenants[tid]
-	if e == nil {
-		e = recordengine.New(recordengine.Config{
-			Schema:    log.Schema,
-			OOOWindow: s.opts.OOOWindow,
-			Backend:   s.backend,
-			Prefix:    string(s.normalizeTenant(tid)) + logsPrefix,
-		})
-		s.logTenants[tid] = e
-	}
-
-	return e
+	return s.recordEngineCached(s.logTenants, tid, logsPrefix, log.Schema, nil)
 }
 
 // lookupLogEngine returns the tenant's logs engine if it exists, without creating one.

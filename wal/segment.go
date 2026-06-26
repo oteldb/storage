@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/go-faster/errors"
@@ -33,8 +34,11 @@ type SegmentWriter struct {
 	w        *Writer
 }
 
-// Create opens (creating the directory if needed) a new segmented WAL writer. A
-// non-positive maxBytes uses [DefaultMaxSegmentBytes].
+// Create opens (creating the directory if needed) a segmented WAL writer. A non-positive maxBytes
+// uses [DefaultMaxSegmentBytes]. If the directory already holds segments from a prior run, Create
+// **resumes**: it opens a fresh segment numbered beyond the existing ones (never truncating them), so
+// [ReplayDir] can still recover the prior segments before the next [SegmentWriter.Checkpoint] discards
+// them.
 func Create(dir string, maxBytes int) (*SegmentWriter, error) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxSegmentBytes
@@ -44,7 +48,12 @@ func Create(dir string, maxBytes int) (*SegmentWriter, error) {
 		return nil, errors.Wrapf(err, "create wal dir %q", dir)
 	}
 
-	sw := &SegmentWriter{dir: dir, maxBytes: maxBytes}
+	last, err := lastSegmentSeq(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	sw := &SegmentWriter{dir: dir, maxBytes: maxBytes, seq: last}
 	sw.w = NewWriter(sw) // the inner Writer frames records and writes them through sw
 
 	if err := sw.openNext(); err != nil {
@@ -52,6 +61,60 @@ func Create(dir string, maxBytes int) (*SegmentWriter, error) {
 	}
 
 	return sw, nil
+}
+
+// Checkpoint discards every segment written so far and starts a fresh one. Call it after a full head
+// flush, whose part durably supersedes those records. It rotates to a new segment, then best-effort
+// deletes the obsolete ones. (Part commit and this deletion are not atomic across the two stores: a
+// crash in between can leave a deleted-part's records to be replayed, a benign re-flush — deduped on
+// merge for metrics, a rare duplicate for append-only records.)
+func (sw *SegmentWriter) Checkpoint() error {
+	obsolete := sw.seq // the segment currently open, about to be closed by rotate
+
+	if err := sw.rotate(); err != nil {
+		return err
+	}
+
+	for i := 1; i <= obsolete; i++ {
+		if err := os.Remove(filepath.Join(sw.dir, segmentName(i))); err != nil && !os.IsNotExist(err) {
+			return errors.Wrapf(err, "remove obsolete segment %d", i)
+		}
+	}
+
+	return nil
+}
+
+// lastSegmentSeq returns the highest segment number present in dir, or 0 if none.
+func lastSegmentSeq(dir string) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, errors.Wrapf(err, "read wal dir %q", dir)
+	}
+
+	last := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), segmentExt) {
+			continue
+		}
+
+		if seq, ok := parseSegmentSeq(e.Name()); ok && seq > last {
+			last = seq
+		}
+	}
+
+	return last, nil
+}
+
+// parseSegmentSeq parses a segment file name (e.g. "00000007.wal") to its sequence number.
+func parseSegmentSeq(name string) (int, bool) {
+	base := strings.TrimSuffix(name, segmentExt)
+
+	seq, err := strconv.Atoi(base)
+	if err != nil || seq <= 0 {
+		return 0, false
+	}
+
+	return seq, true
 }
 
 // Write implements [io.Writer], appending to the current segment and tracking its size

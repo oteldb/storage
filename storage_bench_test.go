@@ -164,7 +164,7 @@ func benchmarkIngestAndFlush(b *testing.B, seriesCount, pointsPerSeries int) {
 		}
 		// Flush the default tenant's head to a part (the batch routes to "default"); this is
 		// the cost the head-only benchmark omits.
-		if err := s.engineFor("default").Flush(ctx); err != nil {
+		if err := mustEngine(s.engineFor("default")).Flush(ctx); err != nil {
 			b.Fatal(err)
 		}
 

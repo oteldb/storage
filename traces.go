@@ -67,23 +67,13 @@ func (s *Storage) Trace(ctx context.Context, tenant signal.TenantID, traceID []b
 	return fetch.Drain(ctx, it)
 }
 
-// traceEngineFor returns the traces engine for a tenant, creating it on first use.
-func (s *Storage) traceEngineFor(tid signal.TenantID) *recordengine.Engine {
+// traceEngineFor returns the traces engine for a tenant, creating it (with a WAL when
+// [Options.WALDir] is set) on first use.
+func (s *Storage) traceEngineFor(tid signal.TenantID) (*recordengine.Engine, error) {
 	s.tmu.Lock()
 	defer s.tmu.Unlock()
 
-	e := s.traceTenants[tid]
-	if e == nil {
-		e = recordengine.New(recordengine.Config{
-			Schema:    trace.Schema,
-			OOOWindow: s.opts.OOOWindow,
-			Backend:   s.backend,
-			Prefix:    string(s.normalizeTenant(tid)) + tracesPrefix,
-		})
-		s.traceTenants[tid] = e
-	}
-
-	return e
+	return s.recordEngineCached(s.traceTenants, tid, tracesPrefix, trace.Schema, nil)
 }
 
 func (s *Storage) lookupTraceEngine(tid signal.TenantID) (*recordengine.Engine, bool) {

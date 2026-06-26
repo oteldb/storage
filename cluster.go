@@ -16,6 +16,7 @@ import (
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
 	"github.com/oteldb/storage/cluster/replica"
+	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
@@ -349,8 +350,9 @@ func (s *Storage) clusterRecordFetcherFor(
 	return &filteringFetcher{inner: failoverFetcher(remotes)}
 }
 
-// recordEngineFor returns the local record engine (logs, traces, or profiles) for a signal+tenant.
-func (s *Storage) recordEngineFor(sig signal.Signal, tenant string) *recordengine.Engine {
+// recordEngineFor returns the local record engine (logs, traces, or profiles) for a signal+tenant,
+// creating it (with a WAL when configured) on first use.
+func (s *Storage) recordEngineFor(sig signal.Signal, tenant string) (*recordengine.Engine, error) {
 	switch sig {
 	case signal.Trace:
 		return s.traceEngineFor(signal.TenantID(tenant))
@@ -371,14 +373,24 @@ func (s *Storage) applyReplicated(_ context.Context, payload []byte) error {
 	}
 
 	if sig == signal.Metric {
-		if err := s.engineFor(signal.TenantID(tenant)).ApplyReplicated(walBytes); err != nil {
+		eng, err := s.engineFor(signal.TenantID(tenant))
+		if err != nil {
+			return err
+		}
+
+		if err := eng.ApplyReplicated(walBytes); err != nil {
 			return errors.Wrapf(err, "apply replicated metrics for tenant %q", tenant)
 		}
 
 		return nil
 	}
 
-	if err := s.recordEngineFor(sig, tenant).ApplyReplicated(walBytes); err != nil {
+	eng, err := s.recordEngineFor(sig, tenant)
+	if err != nil {
+		return err
+	}
+
+	if err := eng.ApplyReplicated(walBytes); err != nil {
 		return errors.Wrapf(err, "apply replicated %s for tenant %q", sig, tenant)
 	}
 
@@ -586,9 +598,15 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 	)
 
 	if sig == signal.Metric {
-		accepted, rejected, err = s.engineFor(signal.TenantID(tenant)).ApplyPrimary(walBytes)
+		var eng *engine.Engine
+		if eng, err = s.engineFor(signal.TenantID(tenant)); err == nil {
+			accepted, rejected, err = eng.ApplyPrimary(walBytes)
+		}
 	} else {
-		accepted, rejected, err = s.recordEngineFor(sig, tenant).ApplyPrimary(walBytes)
+		var eng *recordengine.Engine
+		if eng, err = s.recordEngineFor(sig, tenant); err == nil {
+			accepted, rejected, err = eng.ApplyPrimary(walBytes)
+		}
 	}
 
 	if err != nil {

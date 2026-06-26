@@ -475,5 +475,14 @@ func (e *Engine) flushLocked(ctx context.Context) error {
 		return err
 	}
 
-	return e.writeStreamIndexLocked(ctx)
+	if err := e.writeStreamIndexLocked(ctx); err != nil {
+		return err
+	}
+
+	// The part (and its sidecars/index) is durable, so the WAL records it covers are obsolete.
+	if e.cfg.WAL != nil {
+		return e.cfg.WAL.Checkpoint()
+	}
+
+	return nil
 }

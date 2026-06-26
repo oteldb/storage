@@ -72,7 +72,7 @@ func TestWriteMetricsAndFetch(t *testing.T) {
 	assert.Equal(t, int64(2), acc.Accepted)
 	assert.Equal(t, int64(0), acc.Rejected)
 
-	batches := queryEngine(t, s.engineFor("default"), nameMatcher("http.requests"))
+	batches := queryEngine(t, mustEngine(s.engineFor("default")), nameMatcher("http.requests"))
 	require.Len(t, batches, 1)
 	assert.Equal(t, []int64{100, 200}, batches[0].Timestamps)
 	assert.Equal(t, []float64{1, 2}, batches[0].Values)
@@ -91,7 +91,7 @@ func TestWriteMetricsFlushThenFetch(t *testing.T) {
 	_, err = s.WriteMetrics(context.Background(), gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
 	require.NoError(t, err)
 
-	eng := s.engineFor("default")
+	eng := mustEngine(s.engineFor("default"))
 	require.NoError(t, eng.Flush(context.Background()))
 	assert.Equal(t, 1, eng.PartCount())
 
@@ -122,7 +122,7 @@ func TestMultiTenantRouting(t *testing.T) {
 	_, err = s.WriteMetrics(ctx, gaugeBatch("web", "m", []int64{1}, []float64{2}))
 	require.NoError(t, err)
 
-	apiEng, webEng := s.engineFor("api"), s.engineFor("web")
+	apiEng, webEng := mustEngine(s.engineFor("api")), mustEngine(s.engineFor("web"))
 	assert.Equal(t, 1, apiEng.SeriesCount())
 	assert.Equal(t, 1, webEng.SeriesCount())
 
@@ -183,7 +183,7 @@ func TestResetClearsData(t *testing.T) {
 
 	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
 	require.NoError(t, err)
-	eng := s.engineFor("default")
+	eng := mustEngine(s.engineFor("default"))
 	require.NoError(t, eng.Flush(ctx))
 	require.Equal(t, 1, eng.PartCount())
 	require.Equal(t, 1, eng.SeriesCount())
@@ -263,4 +263,15 @@ func TestOOOWindowViaStorage(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), acc.Accepted)
 	assert.Equal(t, int64(1), acc.Rejected)
+}
+
+// mustEngine unwraps an *EngineFor result in a test/benchmark, panicking on a creation error (the
+// constructors only fail when a WAL cannot be opened, which these callers do not configure). It
+// takes the (engine, error) pair as a sole multi-value argument: mustEngine(s.engineFor(tid)).
+func mustEngine[E any](e E, err error) E {
+	if err != nil {
+		panic(err)
+	}
+
+	return e
 }
