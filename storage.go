@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"maps"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/query/scale"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/log"
 	"github.com/oteldb/storage/signal/metric"
@@ -45,6 +47,8 @@ type Storage struct {
 
 	cluster *clusterNode // cluster runtime (membership + replica server + routed writes); nil ⇒ single-node
 
+	queryCache scale.Cache // shared results cache for Fetcher; nil ⇒ caching disabled
+
 	stopCh chan struct{}  // closed by Close to stop the maintenance loop
 	wg     sync.WaitGroup // tracks the maintenance goroutine
 }
@@ -68,6 +72,10 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	}
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
+	}
+
+	if o.QueryCacheEntries > 0 {
+		s.queryCache = scale.NewMemoryCache(o.QueryCacheEntries)
 	}
 
 	// Recover previously-flushed data from a durable backend so a fresh process serves it.
@@ -235,11 +243,22 @@ func (s *Storage) WriteProfiles(_ context.Context, _ profile.Profiles) (Accepted
 //
 // The returned Fetcher is always usable: with no matching tenant (or after [Close]) it is an
 // empty fetcher that yields no series, so callers need not special-case "no data yet".
+//
+// Scale-out: when [Options.QuerySplitInterval] and/or [Options.QueryCacheEntries] are set, the
+// returned fetcher is wrapped with split-by-interval and/or a results cache (the query/scale
+// decorators). The cache keys on the explicit tenant set, so it applies only to named-tenant
+// queries — a no-arg cross-tenant query is never cached (its tenant membership is dynamic).
 func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 	if s.closed.Load() {
 		return fetch.Merge() // empty
 	}
 
+	return s.scaleWrap(s.baseFetcher(tenants), tenants)
+}
+
+// baseFetcher builds the unwrapped read seam for the tenant set: owner-aware per tenant in
+// cluster mode, otherwise the local engines (or a cross-tenant snapshot when none are named).
+func (s *Storage) baseFetcher(tenants []signal.TenantID) fetch.Fetcher {
 	// In cluster mode a named tenant is served owner-aware (local if owned, else fanned out to
 	// an owner). Without named tenants we fall back to a local cross-tenant snapshot.
 	if s.cluster != nil && len(tenants) > 0 {
@@ -266,6 +285,50 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 	}
 
 	return fetch.Merge(fetchers...)
+}
+
+// scaleWrap decorates the base fetcher with the configured query/scale layers. The cache (when
+// enabled and the query names an explicit tenant set) sits inside a scope-stamping wrapper so
+// its keys carry the tenant set and never collide across scopes; split-by-interval (when
+// enabled) wraps the outside, so each aligned sub-window is cached independently.
+func (s *Storage) scaleWrap(f fetch.Fetcher, tenants []signal.TenantID) fetch.Fetcher {
+	if s.queryCache != nil && len(tenants) > 0 {
+		f = scopedFetcher{inner: scale.CacheFetcher{Inner: f, Cache: s.queryCache}, scope: s.tenantScope(tenants)}
+	}
+
+	if s.opts.QuerySplitInterval > 0 {
+		f = scale.SplitFetcher{Inner: f, Interval: s.opts.QuerySplitInterval}
+	}
+
+	return f
+}
+
+// tenantScope is a stable token identifying a tenant set, used to namespace cache entries so a
+// query over {a,b} never reads a cached result for {c}. Order-independent (sorted) so the token
+// is the same regardless of argument order.
+func (s *Storage) tenantScope(tenants []signal.TenantID) signal.TenantID {
+	norm := make([]string, len(tenants))
+	for i, t := range tenants {
+		norm[i] = string(s.normalizeTenant(t))
+	}
+
+	sort.Strings(norm)
+
+	return signal.TenantID(strings.Join(norm, "\x00"))
+}
+
+// scopedFetcher stamps a stable tenant-scope token onto each request before delegating, so a
+// downstream [scale.CacheFetcher] keys on the tenant set the fetcher was built for (the merge
+// children ignore Request.Tenant, so overwriting it does not affect the actual fetch).
+type scopedFetcher struct {
+	inner fetch.Fetcher
+	scope signal.TenantID
+}
+
+func (f scopedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
+	r.Tenant = f.scope
+
+	return f.inner.Fetch(ctx, r)
 }
 
 // lookupEngine returns the tenant's engine if it exists, without creating one (reads must not

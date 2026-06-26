@@ -121,7 +121,20 @@ func (e *Engine) AppendBatch(
 // and returns one batch per series with its samples in the window, merged across the head
 // buffer and every part by timestamp.
 func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
+	// The label index sorts lazily on first read after a write, mutating in place. Reads run
+	// under the shared lock (concurrent fetches are allowed — e.g. split-by-interval), so do
+	// that one-time sort under the exclusive lock first: hold the read lock, and while the
+	// index is still unsorted, upgrade to sort and re-check. Once we hold the read lock with a
+	// sorted index, no writer can be running, so resolve only reads.
 	e.mu.RLock()
+	for !e.head.indexSorted() {
+		e.mu.RUnlock()
+		e.mu.Lock()
+		e.head.ensureIndexSorted()
+		e.mu.Unlock()
+		e.mu.RLock()
+	}
+
 	defer e.mu.RUnlock()
 
 	ids := e.head.resolve(r.Matchers)

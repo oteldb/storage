@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"regexp"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -145,4 +146,51 @@ func mustAppend(t *testing.T, e *engine.Engine, s signal.Series, ts int64, v flo
 	ok, err := e.Append(s, ts, v)
 	require.NoError(t, err)
 	require.True(t, ok)
+}
+
+// TestConcurrentFetchAfterWrite guards the engine's concurrent-read contract: the label index
+// sorts lazily on the first read after a write, so several fetches issued at once (as
+// split-by-interval does) must not race on that in-place sort. Run under `go test -race`.
+func TestConcurrentFetchAfterWrite(t *testing.T) {
+	t.Parallel()
+
+	e := engine.New(engine.Config{})
+	for i := range 50 {
+		mustAppend(t, e, mkSeries("job", "api", "shard", string(rune('a'+i%5))), int64(100+i), float64(i))
+	}
+
+	const readers = 8
+
+	var (
+		wg     sync.WaitGroup
+		counts [readers]int
+		errs   [readers]error
+	)
+
+	wg.Add(readers)
+
+	for i := range readers {
+		go func(i int) {
+			defer wg.Done()
+
+			it, err := e.Fetch(context.Background(), fetch.Request{
+				Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")},
+			})
+			if err != nil {
+				errs[i] = err
+
+				return
+			}
+
+			got, err := fetch.Drain(context.Background(), it)
+			errs[i], counts[i] = err, len(got)
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i := range readers {
+		require.NoError(t, errs[i])
+		assert.Equal(t, 5, counts[i], "every concurrent reader resolves all five job=api series")
+	}
 }

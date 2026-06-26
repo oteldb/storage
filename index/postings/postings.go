@@ -155,6 +155,17 @@ func (p *MemPostings) Resolve(ms ...Matcher) Postings {
 	return Intersect(its...)
 }
 
+// Sorted reports whether the index is already sorted (no read will mutate it). A caller that
+// owns synchronization checks this under a read lock to decide whether it must upgrade to an
+// exclusive lock and call [MemPostings.EnsureSorted] before issuing concurrent reads.
+func (p *MemPostings) Sorted() bool { return p.sorted }
+
+// EnsureSorted sorts and deduplicates the index in place (idempotent; a no-op once sorted). It
+// is the exported form of the read-triggered lazy sort: a caller holding the index's **exclusive**
+// lock calls it after writes so that subsequent **concurrent** reads (which only inspect the
+// already-sorted lists) never trigger the in-place mutation. See [MemPostings.Sorted].
+func (p *MemPostings) EnsureSorted() { p.ensureSorted() }
+
 // ensureSorted sorts and deduplicates every list (and the all-set) in place. It runs on
 // the first read after a write; set-op iterators require sorted, deduplicated inputs.
 func (p *MemPostings) ensureSorted() {

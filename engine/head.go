@@ -200,6 +200,13 @@ func (h *head) addLabel(id signal.SeriesID, name []byte, v signal.Value) {
 	h.post.Add(id, nameID, valueID)
 }
 
+// indexSorted reports whether the label index is sorted (so a read will not mutate it).
+func (h *head) indexSorted() bool { return h.post.Sorted() }
+
+// ensureIndexSorted sorts the label index in place. The engine calls it while holding the
+// exclusive lock so that later concurrent [head.resolve] reads never trigger the lazy sort.
+func (h *head) ensureIndexSorted() { h.post.EnsureSorted() }
+
 // resolve returns the SeriesIDs matching all matchers (their intersection), lowering each
 // callback matcher to a postings value scan over the typed value.
 func (h *head) resolve(matchers []fetch.Matcher) []signal.SeriesID {

@@ -54,6 +54,18 @@ type Options struct {
 	// OOOWindow is the out-of-order ingestion window in nanoseconds (DESIGN.md §8).
 	// Samples older than (newest - OOOWindow) are rejected (counted). Zero ⇒ default.
 	OOOWindow int64 // nanoseconds
+
+	// QuerySplitInterval, when > 0, makes [Storage.Fetcher] split a query's time window
+	// into aligned sub-windows of this width (nanoseconds), fetched concurrently and merged
+	// (the query-frontend "split by interval" technique). Zero ⇒ no splitting.
+	QuerySplitInterval int64 // nanoseconds
+
+	// QueryCacheEntries, when > 0, gives [Storage.Fetcher] a shared bounded-LRU results
+	// cache of this many entries. Only fully-pushable (serializable-equality) requests over
+	// an explicit tenant set are cached; the cache does not auto-invalidate, so it suits
+	// historical windows (an embedder should avoid caching the open/recent window). Zero ⇒
+	// no cache.
+	QueryCacheEntries int
 }
 
 // Durability is the WAL + flush policy (DESIGN.md §5, §8).
@@ -103,6 +115,20 @@ func WithFlushInterval(ns int64) Option { return func(o *Options) { o.FlushInter
 
 // WithOOOWindow sets the out-of-order ingestion window in nanoseconds.
 func WithOOOWindow(ns int64) Option { return func(o *Options) { o.OOOWindow = ns } }
+
+// WithQuerySplitInterval enables split-by-interval on [Storage.Fetcher]: a query window is
+// divided into aligned sub-windows of ns nanoseconds, fetched concurrently and merged. ns ≤ 0
+// disables splitting.
+func WithQuerySplitInterval(ns int64) Option {
+	return func(o *Options) { o.QuerySplitInterval = ns }
+}
+
+// WithQueryCache enables a shared bounded-LRU results cache on [Storage.Fetcher] holding at most
+// maxEntries results. maxEntries ≤ 0 disables the cache. Only fully-pushable equality requests
+// over an explicit tenant set are cached, and entries do not auto-invalidate.
+func WithQueryCache(maxEntries int) Option {
+	return func(o *Options) { o.QueryCacheEntries = maxEntries }
+}
 
 // ErrClosed is returned by [Storage] methods after [Storage.Close].
 var ErrClosed = errors.New("storage: closed")

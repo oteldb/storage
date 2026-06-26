@@ -293,7 +293,13 @@ own their OTLP decoder build `metric.Metrics` directly.
 ## 3f. Engine (`engine/`) — the single-node metrics vertical
 
 One `Engine` per tenant ties the index, parts, and WAL into a working ingest+query path.
-It is safe for concurrent use (one `sync.RWMutex`).
+It is safe for concurrent use (one `sync.RWMutex`). Reads run under the **shared** lock, so
+several fetches proceed at once (e.g. `query/scale` split-by-interval issuing one per sub-window).
+The label index sorts lazily on the first read after a write, mutating in place — so `Fetch`
+performs that one-time sort under the **exclusive** lock first (hold the read lock; while the
+index is unsorted, drop to the write lock, `EnsureSorted`, re-check), after which concurrent
+readers only read. The `postings.MemPostings` exposes `Sorted()`/`EnsureSorted()` for exactly
+this caller-owned-synchronization upgrade.
 
 - **Head** (`head.go`) is the in-memory write buffer: the index (`symbols` + `series` +
   `postings`) plus per-series `(ts, value)` append buffers. `append` interns every
@@ -545,12 +551,16 @@ ingest batches (`metric.Metrics`, and placeholder `log.Logs`/`trace.Traces`/
   tenant matches or after `Close`, so callers need not special-case "no data". There is
   deliberately **no `Query` / query-language method**: the store is language-agnostic and the
   embedder drives its own engines over the fetch contract (the optional `query/promql` adapter
-  bridges to the Prometheus engine).
+  bridges to the Prometheus engine). When `WithQuerySplitInterval` / `WithQueryCache` are set,
+  `Fetcher` wraps the result with the `query/scale` split / cache decorators (§3g): the cache is
+  shared and **scoped by tenant set** (a `scopedFetcher` stamps the sorted tenant ids onto the
+  request so cache keys never collide across scopes), so only explicit-tenant queries are cached
+  — a no-arg cross-tenant query is never cached (its membership is dynamic).
 - **`Options` / `Option`** (`options.go`) — config struct plus functional options
   (`WithBackend`, `WithCluster`, `WithTenancy`, `WithEncoding`, `WithDurability`,
-  `WithWALDir`, `WithFlushThresholdBytes`, `WithFlushInterval`, `WithOOOWindow`).
-  `Durability` selects the durability mode; an ephemeral backend with no explicit choice
-  defaults to the in-memory engine.
+  `WithWALDir`, `WithFlushThresholdBytes`, `WithFlushInterval`, `WithOOOWindow`,
+  `WithQuerySplitInterval`, `WithQueryCache`). `Durability` selects the durability mode; an
+  ephemeral backend with no explicit choice defaults to the in-memory engine.
 - **`Query` / `Lang` / `Result` / `Accepted`** — the query request (language selected by
   `Lang`), its result, and the ingest acknowledgement type.
 
