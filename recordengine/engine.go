@@ -12,6 +12,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
 )
@@ -189,6 +190,9 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
 	defer span.End()
 
+	ctx, pf := profile.Begin(ctx, "recordengine.fetch")
+	defer pf.End()
+
 	startNs := time.Now()
 
 	// The label index sorts lazily on first read after a write; do that one-time sort under the
@@ -204,10 +208,17 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 	defer e.mu.RUnlock()
 
+	_, rpf := profile.Begin(ctx, "resolve-matchers")
 	ids := e.head.resolve(r.Matchers)
+	rpf.Add("series_matched", int64(len(ids)))
+	rpf.End()
+
 	partsScanned := len(e.parts)
 
 	record := func(rows int) {
+		pf.Add("series_matched", int64(len(ids)))
+		pf.Add("parts_scanned", int64(partsScanned))
+		pf.Add("rows", int64(rows))
 		span.SetAttributes(
 			attribute.Int("storage.series_matched", len(ids)),
 			attribute.Int("storage.parts_scanned", partsScanned),

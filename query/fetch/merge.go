@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 
+	"github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -45,10 +46,14 @@ type mergeAcc struct {
 }
 
 func (m mergeFetcher) Fetch(ctx context.Context, r Request) (Iterator, error) {
+	ctx, pf := profile.Begin(ctx, "fan-out")
+	defer pf.End()
+	pf.Add("children", int64(len(m)))
+
 	groups := make([][]*Batch, 0, len(m))
 
 	for _, f := range m {
-		it, err := f.Fetch(ctx, r)
+		it, err := f.Fetch(ctx, r) // children profile under the fan-out node
 		if err != nil {
 			return nil, err
 		}
@@ -67,7 +72,12 @@ func (m mergeFetcher) Fetch(ctx context.Context, r Request) (Iterator, error) {
 		groups = append(groups, batches)
 	}
 
-	return NewSliceIterator(MergeBatches(groups...)), nil
+	_, mpf := profile.Begin(ctx, "merge")
+	out := MergeBatches(groups...)
+	mpf.Add("batches", int64(len(out)))
+	mpf.End()
+
+	return NewSliceIterator(out), nil
 }
 
 // MergeBatches merges batches from multiple result groups by [signal.SeriesID] into one slice,
