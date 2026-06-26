@@ -907,6 +907,8 @@ encoding/             umbrella doc for the codec layers
   encoding/chunk      DoD / Gorilla / T64 / dict / bytesraw / decimal / id128 column codecs [implemented]
   encoding/compress   zstd/none block wrapper (lz4 stub)                              [implemented]
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
+internal/simd         vectorized columnar kernels (AVX2) + pure-Go fallback + runtime CPU dispatch [implemented: int64 min/max]
+internal/cmd/gensimd  avo generator for internal/simd's committed *_amd64.s (//go:generate)   [implemented]
 signal/               typed Attributes/Value, Resource/Scope/Series identity, 128-bit SeriesID, Signal, TenantID, Aggregation [implemented]
   signal/metric       []byte-based OTLP-shaped Metrics ingest batch (resettable/pooled) + identity + projection (gauge/sum; histogram/exp-histogram/summary via classic decomposition in otlp/pdataconv) [implemented]
   signal/log          []byte-based OTLP-shaped Logs ingest batch (resettable/pooled) + stream identity + projection [implemented]

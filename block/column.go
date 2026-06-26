@@ -8,6 +8,7 @@ import (
 
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
+	"github.com/oteldb/storage/internal/simd"
 )
 
 // decimalPrecisionLossless is the precision passed to the scaled-decimal codec when a
@@ -126,16 +127,7 @@ func fillInt64Stats(d *ColumnDesc, vals []int64) {
 		return
 	}
 
-	lo, hi := vals[0], vals[0]
-	for _, v := range vals[1:] {
-		if v < lo {
-			lo = v
-		}
-
-		if v > hi {
-			hi = v
-		}
-	}
+	lo, hi := simd.MinMaxInt64(vals)
 
 	d.MinInt64, d.MaxInt64 = lo, hi
 	if lo == hi {
