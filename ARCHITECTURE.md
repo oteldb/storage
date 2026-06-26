@@ -422,8 +422,18 @@ shard whose owner set changed, the IDs added and removed. Because the data is in
 object store, a reassignment is an **ownership handoff** (the gainer starts serving the shard's
 parts from S3 via the bucket index; the loser stops), not a copy — and HRW guarantees only the
 ~1/N shards that actually moved appear, each one-in/one-out. Executing the plan (an
-etcd-coordinated handoff so exactly one node compacts a shard at a time) and **wiring L0 into
-the `Storage` facade** (clustered ingest/replicate, fan-out reads) are the remaining work.
+etcd-coordinated handoff so exactly one node compacts a shard at a time) is a remaining piece.
+
+**The cluster write path** is assembled in `cluster.Writer`: it routes a tenant's write to the
+tenant's ring-owners and replicates it to a write quorum. A write is framed as `EncodeWrite`
+(tenant ‖ WAL-encoded series+samples); the receiving node decodes it and calls
+`engine.ApplyReplicated`, which replays the WAL bytes into its head — so each owner
+independently holds the unflushed data and either can serve it (after both flush, the shared
+object store reconciles them). A two-node end-to-end test exercises this over the real HTTP
+transport: a write routed by the ring lands in *both* nodes' engines. Sharding is by tenant for
+now (a whole stream pinned to its owners); per-series sharding and the **facade `Open`
+cluster-mode wiring** (join membership, run the replica server, route `WriteMetrics`, fan-out
+reads) are the remaining integration.
 
 ---
 
@@ -544,6 +554,7 @@ cluster/              L0 distribution: ring + membership + (later) replication �
   cluster/etcd        etcd-backed live membership (lease + watch → atomic ring)          [implemented; embedded-etcd tested]
   cluster/replica     quorum write-replication + node-to-node HTTP transport             [implemented]
   cluster/rebalance   minimal ownership-handoff plan from a ring diff (pure)              [implemented]
+  cluster/            cluster write path: EncodeWrite codec + Writer (route+replicate)    [implemented; facade Open cluster-mode wiring pending]
 ```
 
 "Seam only" packages currently contain their `doc.go` (and, where noted, an interface or

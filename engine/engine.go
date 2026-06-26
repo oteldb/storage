@@ -266,6 +266,29 @@ func (e *Engine) Replay(dir string) error {
 	})
 }
 
+// ApplyReplicated applies an in-memory WAL-framed write (a replication payload from a peer)
+// to the head: it registers each series and appends its samples, the same way [Engine.Replay]
+// restores from disk. It is the receive side of cluster write-replication — a node holds a
+// replica of a peer's unflushed head this way, and after both flush, the shared object store
+// reconciles them. Safe for concurrent use.
+func (e *Engine) ApplyReplicated(data []byte) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return wal.Replay(data, wal.Handlers{
+		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
+			e.head.registerSeries(s)
+
+			return nil
+		},
+		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
+			e.head.replaySamples(id, ts, values)
+
+			return nil
+		},
+	})
+}
+
 // SeriesCount returns the number of distinct series in the head.
 func (e *Engine) SeriesCount() int {
 	e.mu.RLock()
