@@ -42,6 +42,11 @@ func queryable(s *storage.Storage) *qpromql.Queryable {
 	return qpromql.NewQueryable(s.Fetcher("default"), "default")
 }
 
+// queryableOver builds a Queryable over a specific tenant set (empty ⇒ all tenants).
+func queryableOver(s *storage.Storage, tenants ...signal.TenantID) *qpromql.Queryable {
+	return qpromql.NewQueryable(s.Fetcher(tenants...), "")
+}
+
 func instant(t *testing.T, s *storage.Storage, text string, atSec int64) *promql.Result {
 	t.Helper()
 	pq, err := promEngine().NewInstantQuery(context.Background(), queryable(s), nil, text, time.Unix(0, atSec*sec))
@@ -216,6 +221,76 @@ func TestQueryEmptyTenant(t *testing.T) {
 	v, err := instant(t, s, "http_requests", 1000).Vector()
 	require.NoError(t, err)
 	assert.Empty(t, v, "unknown tenant ⇒ empty fetcher ⇒ empty result")
+}
+
+func TestMultiTenantQuery(t *testing.T) {
+	t.Parallel()
+
+	// Route each record to a tenant named after its `tenant` resource attribute.
+	s, err := storage.InMemory(storage.WithTenant(func(r signal.Resource, _ signal.Scope) signal.TenantID {
+		v, _ := r.Attributes.Get([]byte("tenant"))
+
+		return signal.TenantID(v.Str())
+	}))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	writeTenant(t, s, "team-a", "cpu", "/x", 5)
+	writeTenant(t, s, "team-b", "cpu", "/y", 7)
+
+	eng := promEngine()
+	atT := time.Unix(0, 1000*sec)
+
+	// One tenant sees only its own series.
+	one := mustInstant(t, eng, queryableOver(s, "team-a"), "cpu", atT)
+	assert.Equal(t, map[string]float64{"/x": 5}, vectorByRoute(t, one))
+
+	// A multi-tenant fan-out over both tenants sees both series.
+	both := mustInstant(t, eng, queryableOver(s, "team-a", "team-b"), "cpu", atT)
+	assert.Equal(t, map[string]float64{"/x": 5, "/y": 7}, vectorByRoute(t, both))
+
+	// A cross-tenant query (all tenants) likewise spans every tenant.
+	all := mustInstant(t, eng, queryableOver(s), "cpu", atT)
+	assert.Equal(t, map[string]float64{"/x": 5, "/y": 7}, vectorByRoute(t, all))
+
+	// Aggregating across tenants sums the federated series.
+	total, err := mustInstant(t, eng, queryableOver(s), "sum(cpu)", atT).Vector()
+	require.NoError(t, err)
+	require.Len(t, total, 1)
+	assert.InDelta(t, 12.0, total[0].F, 1e-9)
+}
+
+// writeTenant ingests a single (route,value) gauge point at t=1000s tagged with a tenant
+// resource attribute (so the WithTenant callback routes it).
+func writeTenant(t *testing.T, s *storage.Storage, tenant, name, route string, v float64) {
+	t.Helper()
+
+	var md metric.Metrics
+	rm := md.AddResource()
+	rm.Resource = signal.Resource{Attributes: signal.NewAttributes(
+		signal.KeyValue{Key: []byte("tenant"), Value: signal.StringValue([]byte(tenant))},
+	)}
+	mt := rm.AddScope().AddMetric()
+	mt.Name = []byte(name)
+	mt.Kind = metric.KindGauge
+	p := mt.AddPoint()
+	p.Ts = 1000 * sec
+	p.Value = v
+	p.Attributes = signal.NewAttributes(signal.KeyValue{Key: []byte("route"), Value: signal.StringValue([]byte(route))})
+
+	_, err := s.WriteMetrics(context.Background(), md)
+	require.NoError(t, err)
+}
+
+func mustInstant(t *testing.T, eng *promql.Engine, q *qpromql.Queryable, text string, ts time.Time) *promql.Result {
+	t.Helper()
+	pq, err := eng.NewInstantQuery(context.Background(), q, nil, text, ts)
+	require.NoError(t, err)
+	t.Cleanup(pq.Close)
+	res := pq.Exec(context.Background())
+	require.NoError(t, res.Err)
+
+	return res
 }
 
 func TestQueryParseError(t *testing.T) {

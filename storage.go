@@ -191,24 +191,42 @@ func (s *Storage) WriteProfiles(_ context.Context, _ profile.Profiles) (Accepted
 	return s.notImplementedWrite("write profiles")
 }
 
-// Fetcher returns the read seam — a [fetch.Fetcher] over one tenant's data (head ∪ flushed
-// parts). It is the storage library's query surface: this is a language-agnostic columnar
-// store, so the embedder drives its own query engines (PromQL/LogQL/TraceQL) over the fetch
-// contract. The optional query/promql package bridges this to the Prometheus
+// Fetcher returns the read seam — a [fetch.Fetcher] over the named tenants' data (head ∪
+// flushed parts). It is the storage library's query surface: this is a language-agnostic
+// columnar store, so the embedder drives its own query engines (PromQL/LogQL/TraceQL) over
+// the fetch contract. The optional query/promql package bridges this to the Prometheus
 // storage.Queryable for embedders using the Prometheus engine.
 //
-// The returned Fetcher is always usable: for an unknown tenant (or after [Close]) it is an
+// Tenant scoping:
+//   - Fetcher(t) — one tenant.
+//   - Fetcher(a, b, …) — a fan-out over several tenants (multi-tenant query): results are
+//     merged by series id, so a series with equal labels in more than one tenant is federated
+//     into one (see [fetch.Merge]). Add a tenant label upstream if per-tenant separation is
+//     wanted.
+//   - Fetcher() — all tenants that have ingested data (a cross-tenant query).
+//
+// The returned Fetcher is always usable: with no matching tenant (or after [Close]) it is an
 // empty fetcher that yields no series, so callers need not special-case "no data yet".
-func (s *Storage) Fetcher(t signal.TenantID) fetch.Fetcher {
+func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 	if s.closed.Load() {
-		return emptyFetcher{}
+		return fetch.Merge() // empty
 	}
 
-	if e, ok := s.lookupEngine(s.normalizeTenant(t)); ok {
-		return e
+	var fetchers []fetch.Fetcher
+
+	if len(tenants) == 0 {
+		for _, eng := range s.engineSnapshot() {
+			fetchers = append(fetchers, eng)
+		}
+	} else {
+		for _, t := range tenants {
+			if e, ok := s.lookupEngine(s.normalizeTenant(t)); ok {
+				fetchers = append(fetchers, e)
+			}
+		}
 	}
 
-	return emptyFetcher{}
+	return fetch.Merge(fetchers...)
 }
 
 // lookupEngine returns the tenant's engine if it exists, without creating one (reads must not
@@ -220,14 +238,6 @@ func (s *Storage) lookupEngine(tid signal.TenantID) (*engine.Engine, bool) {
 	e, ok := s.tenants[tid]
 
 	return e, ok
-}
-
-// emptyFetcher is the [fetch.Fetcher] returned for a tenant with no data; it yields an empty
-// iterator.
-type emptyFetcher struct{}
-
-func (emptyFetcher) Fetch(context.Context, fetch.Request) (fetch.Iterator, error) {
-	return fetch.NewSliceIterator(nil), nil
 }
 
 func (s *Storage) notImplementedWrite(op string) (Accepted, error) {

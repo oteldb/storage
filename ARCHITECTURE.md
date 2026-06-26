@@ -312,7 +312,11 @@ carries **callback matchers** — `Matcher{Name, Match func(signal.Value) bool}`
 operator enum, so equality/regex/negation live in the language layer (§3h) and the storage
 layer stays operator-free. `Fetcher.Fetch` returns an `Iterator` of `*Batch{ID, Series,
 Timestamps, Values}` (one batch per matching series for M3). `SliceIterator` and `Drain` are
-the in-memory helpers.
+the in-memory helpers. **`Merge(fetchers...)`** is the fan-out combinator: it runs a Request
+against several fetchers and merges their batches by series id (timestamp-ordered, later child
+wins a duplicate timestamp) — the basis for multi-tenant / cross-tenant reads (via
+`Storage.Fetcher`) and, later, cluster fan-out across replicas. A single child is a
+pass-through; child batches are cloned, never mutated.
 
 ## 3h. PromQL adapter (`query/promql/`) — optional, embedder-facing
 
@@ -369,12 +373,15 @@ ingest batches (`metric.Metrics`, and placeholder `log.Logs`/`trace.Traces`/
   merges every engine, applying per-tenant retention from the resolved policy. `Reset(ctx)`
   discards all ingested data (every engine's head + flushed parts), retaining the engines
   for reuse; it is gated to an **ephemeral backend** (`ErrNotEphemeral` otherwise) and is
-  meant for tests/benchmarks that reuse one store across runs. `Fetcher(tenant)` is the
-  **read seam**: it returns a `fetch.Fetcher` over that tenant's data (head ∪ parts) — always
-  usable, an empty fetcher for an unknown tenant or after `Close`, so callers need not
-  special-case "no data". There is deliberately **no `Query` / query-language method**: the
-  store is language-agnostic and the embedder drives its own engines over the fetch contract
-  (the optional `query/promql` adapter bridges to the Prometheus engine).
+  meant for tests/benchmarks that reuse one store across runs. `Fetcher(tenants...)` is the
+  **read seam**: it returns a `fetch.Fetcher` over the named tenants' data (head ∪ parts) —
+  one tenant, several (a **multi-tenant** fan-out), or none ⇒ **all** tenants (a
+  **cross-tenant** query). A fan-out merges by series id via `fetch.Merge`, federating a
+  series with equal labels across tenants into one. Always usable: an empty fetcher when no
+  tenant matches or after `Close`, so callers need not special-case "no data". There is
+  deliberately **no `Query` / query-language method**: the store is language-agnostic and the
+  embedder drives its own engines over the fetch contract (the optional `query/promql` adapter
+  bridges to the Prometheus engine).
 - **`Options` / `Option`** (`options.go`) — config struct plus functional options
   (`WithBackend`, `WithCluster`, `WithTenancy`, `WithEncoding`, `WithDurability`,
   `WithWALDir`, `WithFlushThresholdBytes`, `WithFlushInterval`, `WithOOOWindow`).
