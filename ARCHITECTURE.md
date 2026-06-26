@@ -44,7 +44,7 @@ The design is a single columnar engine with swappable front-ends and backends
 | L3 **Engine** / **Index / WAL** | **head · flush · merge · retention** / **symbols · series · postings** · **write-ahead log** | **engine implemented (metrics)**; **index + wal implemented** |
 | L2 **Part** / **Encoding** | **immutable parts · per-column objects · manifest** / **bitstream · codecs · compress** | **both implemented** (`block`, `encoding`) |
 | L1 **Backend** | file · s3 · memory behind one interface | **memory + file + s3 implemented**, with `PutIfAbsent` CAS; `bucketindex` for stateless part enumeration |
-| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **HRW ring + etcd membership + quorum replication implemented** (`cluster/ring`, `cluster/etcd`, `cluster/replica`); rebalance pending |
+| L0 Cluster | etcd ring · HRW sharding · RF=3 · rebalance | **ring + membership + quorum replication + rebalance plan implemented** (`cluster/{ring,etcd,replica,rebalance}`); facade wiring pending |
 
 The **implemented substance spans L1 (backends) through L4 (the fetch contract)** for
 metrics: encoding, parts, index, WAL, the engine head/flush/merge, and the metrics fetch
@@ -414,8 +414,16 @@ write so all replicas converge. **The storage library owns the node-to-node tran
 deliberate departure from "the embedder owns transport"): `cluster/replica` ships an HTTP
 `Transport` + receiving `Handler` (mounted at `ReplicatePath`), tested over `httptest`. The
 replicator is decoupled from the ring — the caller maps owners→addresses — so the routing and
-quorum logic test against a fake transport. The rebalance orchestrator is the remaining L0
-piece.
+quorum logic test against a fake transport.
+
+**Rebalance** (`cluster/rebalance`) computes the minimal ownership change for a membership
+change as a pure function of the old and new rings: `Plan(shards, prev, next, rf)` returns, per
+shard whose owner set changed, the IDs added and removed. Because the data is in the shared
+object store, a reassignment is an **ownership handoff** (the gainer starts serving the shard's
+parts from S3 via the bucket index; the loser stops), not a copy — and HRW guarantees only the
+~1/N shards that actually moved appear, each one-in/one-out. Executing the plan (an
+etcd-coordinated handoff so exactly one node compacts a shard at a time) and **wiring L0 into
+the `Storage` facade** (clustered ingest/replicate, fan-out reads) are the remaining work.
 
 ---
 
@@ -535,6 +543,7 @@ cluster/              L0 distribution: ring + membership + (later) replication �
   cluster/ring        rendezvous (HRW) hashing: deterministic placement, ~1/N movement  [implemented]
   cluster/etcd        etcd-backed live membership (lease + watch → atomic ring)          [implemented; embedded-etcd tested]
   cluster/replica     quorum write-replication + node-to-node HTTP transport             [implemented]
+  cluster/rebalance   minimal ownership-handoff plan from a ring diff (pure)              [implemented]
 ```
 
 "Seam only" packages currently contain their `doc.go` (and, where noted, an interface or
