@@ -112,6 +112,8 @@ func encodeStream(c Column, codec chunk.Codec) ([]byte, error) {
 		return chunk.EncodeFloatsDecimal(nil, c.Float64, decimalPrecisionLossless), nil
 	case c.Kind == KindBytes && codec == chunk.CodecDict:
 		return chunk.EncodeBytes(nil, c.Bytes), nil
+	case c.Kind == KindBytes && codec == chunk.CodecBytesRaw:
+		return chunk.EncodeBytesRaw(nil, c.Bytes), nil
 	case c.Kind == KindInt128 && codec == chunk.CodecID128:
 		return chunk.EncodeU128(nil, c.Int128), nil
 	default:

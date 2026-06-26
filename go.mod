@@ -10,6 +10,7 @@ require (
 	github.com/go-faster/errors v0.7.1
 	github.com/go-faster/fs v0.2.0
 	github.com/go-faster/jx v1.2.0
+	github.com/go-faster/sdk v0.35.0
 	github.com/klauspost/compress v1.18.6
 	github.com/prometheus/prometheus v0.311.3
 	github.com/stretchr/testify v1.11.1
@@ -39,7 +40,6 @@ require (
 	github.com/edsrzf/mmap-go v1.2.0 // indirect
 	github.com/facette/natsort v0.0.0-20181210072756-2cd4dd1e2dcb // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
-	github.com/go-faster/sdk v0.35.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect

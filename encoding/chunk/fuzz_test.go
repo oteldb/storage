@@ -165,6 +165,86 @@ func FuzzDictRoundTrip(f *testing.F) {
 	})
 }
 
+// FuzzBytesRawRoundTrip fuzzes the raw bytes codec round-trip, exercising both the fixed-width
+// path (uniform-length values) and the length-prefixed fallback (mixed widths), and confirming the
+// gather-form DecodeBytes and the split-form DecodeBytesDict agree.
+func FuzzBytesRawRoundTrip(f *testing.F) {
+	f.Add([]byte("abcd\x00efgh\x00ijkl"), uint8(4)) // uniform width ⇒ fixed path
+	f.Add([]byte("a\x00bb\x00ccc"), uint8(0))       // mixed widths ⇒ flat fallback
+
+	f.Fuzz(func(t *testing.T, seed []byte, pad uint8) {
+		vals := decodeSeedToStrings(seed, 64, 16)
+		if len(vals) == 0 {
+			t.Skip("no values")
+		}
+
+		// Optionally normalize every value to one width so the fixed-width path is taken.
+		if w := int(pad) % 17; w > 0 {
+			norm := make([][]byte, len(vals))
+			for i, v := range vals {
+				b := make([]byte, w)
+				copy(b, v)
+				norm[i] = b
+			}
+
+			vals = norm
+		}
+
+		enc := EncodeBytesRaw(nil, vals)
+
+		got, consumed, err := DecodeBytes(nil, enc)
+		if err != nil {
+			t.Fatalf("DecodeBytes: %v", err)
+		}
+
+		if consumed != len(enc) {
+			t.Fatalf("DecodeBytes consumed = %d, want %d", consumed, len(enc))
+		}
+
+		if len(got) != len(vals) {
+			t.Fatalf("len = %d, want %d", len(got), len(vals))
+		}
+
+		for i := range vals {
+			if !bytes.Equal(got[i], vals[i]) {
+				t.Fatalf("vals[%d] = %q, want %q", i, got[i], vals[i])
+			}
+		}
+
+		col, _, err := DecodeBytesDict(enc)
+		if err != nil {
+			t.Fatalf("DecodeBytesDict: %v", err)
+		}
+
+		if col.Len() != len(vals) {
+			t.Fatalf("DecodeBytesDict Len = %d, want %d", col.Len(), len(vals))
+		}
+
+		for i := range vals {
+			if !bytes.Equal(col.At(i), vals[i]) {
+				t.Fatalf("DecodeBytesDict At(%d) = %q, want %q", i, col.At(i), vals[i])
+			}
+		}
+	})
+}
+
+// FuzzDecodeBytesArbitrary feeds arbitrary bytes to both bytes-column decoders: they must report an
+// error or decode cleanly, never panic — covering corrupt flag bytes and out-of-range fixed widths.
+func FuzzDecodeBytesArbitrary(f *testing.F) {
+	f.Add([]byte{0x03, 0x02, 0xff, 0xff, 0xff, 0xff}) // flagFixed (0x02) with a huge width
+	f.Add([]byte{0x02, 0x02, 0x08})                   // flagFixed, width 8, but no value bytes
+
+	f.Fuzz(func(_ *testing.T, src []byte) {
+		_, _, _ = DecodeBytes(nil, src)
+
+		if col, _, err := DecodeBytesDict(src); err == nil && col != nil {
+			for i := range col.Len() {
+				_ = col.At(i)
+			}
+		}
+	})
+}
+
 // decodeSeedToInt64s reads a sequence of zigzag varints from the seed.
 func decodeSeedToInt64s(seed []byte, maxVals int) []int64 {
 	var vals []int64

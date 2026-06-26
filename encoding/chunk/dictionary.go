@@ -17,8 +17,9 @@ const maxDictSize = 256
 // writes stay byte-aligned for the fast [bitstream.Writer.AppendString]/
 // [bitstream.Writer.WriteBytes] paths).
 const (
-	flagFlat byte = 0x00 // no dictionary, values stored inline
-	flagDict byte = 0x01 // dictionary mode
+	flagFlat  byte = 0x00 // no dictionary, length-prefixed values stored inline
+	flagDict  byte = 0x01 // dictionary mode
+	flagFixed byte = 0x02 // no dictionary, one shared width + fixed-width values back-to-back
 )
 
 var dictEncodeScratchPool = sync.Pool{
@@ -112,6 +113,78 @@ func appendEmpty(dst []byte) []byte {
 	return w.Bytes()
 }
 
+// EncodeBytesRaw encodes a byte-string column without a dictionary ([CodecBytesRaw]): when every
+// value shares one length it writes a single shared width followed by the values back-to-back
+// (the fixed-width form, ideal for id columns); otherwise it falls back to the same length-prefixed
+// inline layout as the dictionary codec's flat fallback. The output is a self-describing bytes-column
+// stream that [DecodeBytes] and [DecodeBytesDict] read directly.
+//
+// Layout: [uvarint rows] [1 byte flag] [payload]
+//
+//	flagFixed payload: [uvarint width] [rows × width bytes]
+//	flagFlat  payload: per row [uvarint len][bytes]
+func EncodeBytesRaw(dst []byte, vals [][]byte) []byte {
+	if len(vals) == 0 {
+		return appendEmpty(dst)
+	}
+
+	width, uniform := uniformWidth(vals)
+
+	if uniform {
+		dst = slices.Grow(dst, uvarintLen(uint64(len(vals)))+1+uvarintLen(uint64(width))+len(vals)*width)
+		w := bitstream.NewWriter(dst)
+		w.WriteUvarint(uint64(len(vals)))
+		_ = w.WriteByte(flagFixed)
+		w.WriteUvarint(uint64(width))
+
+		for _, v := range vals {
+			w.WriteBytes(v)
+		}
+
+		w.PadToByte()
+
+		return w.Bytes()
+	}
+
+	return appendFlat(dst, vals)
+}
+
+// uniformWidth reports the common length of vals and whether every value (including the first)
+// shares it. vals is non-empty.
+func uniformWidth(vals [][]byte) (width int, uniform bool) {
+	width = len(vals[0])
+	for _, v := range vals[1:] {
+		if len(v) != width {
+			return 0, false
+		}
+	}
+
+	return width, true
+}
+
+// appendFlat writes the length-prefixed inline form (flagFlat): per row [uvarint len][bytes].
+// Shared by the dictionary codec's >65536-distinct fallback and [EncodeBytesRaw]'s mixed-width path.
+func appendFlat(dst []byte, vals [][]byte) []byte {
+	payload := 0
+	for _, v := range vals {
+		payload += uvarintLen(uint64(len(v))) + len(v)
+	}
+
+	dst = slices.Grow(dst, uvarintLen(uint64(len(vals)))+1+payload)
+	w := bitstream.NewWriter(dst)
+	w.WriteUvarint(uint64(len(vals)))
+	_ = w.WriteByte(flagFlat)
+
+	for _, v := range vals {
+		w.WriteUvarint(uint64(len(v)))
+		w.WriteBytes(v)
+	}
+
+	w.PadToByte()
+
+	return w.Bytes()
+}
+
 // appendDictEncoded is the shared encode core for [EncodeBytes] and
 // [DictEncoder.Encode]. It builds the dictionary into m, reusing the entries and ids
 // slices (grown as needed), and appends the encoded column to dst. The grown slices
@@ -150,26 +223,8 @@ func appendDictEncoded(
 	size := len(entries)
 
 	if flat {
-		// Flat fallback: no dictionary, store each value inline.
-		// Compute payload size now (deferred from the hot loop above).
-		flatPayloadBytes := 0
-		for _, v := range vals {
-			flatPayloadBytes += uvarintLen(uint64(len(v))) + len(v)
-		}
-
-		dst = slices.Grow(dst, uvarintLen(uint64(len(vals)))+1+flatPayloadBytes)
-		w := bitstream.NewWriter(dst)
-		w.WriteUvarint(uint64(len(vals)))
-
-		_ = w.WriteByte(flagFlat)
-		for _, v := range vals {
-			w.WriteUvarint(uint64(len(v)))
-			w.WriteBytes(v)
-		}
-
-		w.PadToByte()
-
-		return w.Bytes(), entries, ids
+		// Flat fallback (>65536 distinct): no dictionary, store each value inline.
+		return appendFlat(dst, vals), entries, ids
 	}
 
 	// Dictionary mode. Flag is a full byte so everything after stays byte-aligned.
@@ -264,6 +319,47 @@ func (e *DictEncoder) Release() {
 	e.ids = nil
 }
 
+// fixedTotal returns rows*width as an int, rejecting (as a corrupt stream) a product that would
+// overflow int — the subsequent [bitstream.Reader.ReadBytesView] bounds-checks the result against
+// the actual stream length, so a merely too-large value is caught there.
+func fixedTotal(rows int, width uint64) (int, error) {
+	const maxInt = int(^uint(0) >> 1)
+
+	if width != 0 && uint64(rows) > uint64(maxInt)/width {
+		return 0, errUnexpectedEOF
+	}
+
+	return rows * int(width), nil
+}
+
+// maxEmptyFixedRows caps the row count of a fixed-width column whose width is zero (an all-empty
+// column): it carries no per-row bytes, so without this a corrupt header could request an unbounded
+// allocation. Real signal columns are never all-empty under the raw codec, so this defensive bound —
+// far above any real column — only ever rejects untrusted/corrupt input, keeping decode panic-safe.
+const maxEmptyFixedRows = 1 << 20
+
+// readView reads an ln-byte view, rejecting (rather than panicking on) a length from an untrusted
+// uvarint that would overflow int when narrowed. An ln that merely exceeds the remaining stream is
+// caught by [bitstream.Reader.ReadBytesView] itself.
+func readView(r *bitstream.Reader, ln uint64) ([]byte, error) {
+	const maxInt = uint64(^uint(0) >> 1)
+
+	if ln > maxInt {
+		return nil, errUnexpectedEOF
+	}
+
+	return r.ReadBytesView(int(ln))
+}
+
+// ensureRows grows dst to exactly rows elements, reusing capacity.
+func ensureRows(dst [][]byte, rows int) [][]byte {
+	if cap(dst) < rows {
+		dst = resize(dst, rows)
+	}
+
+	return dst[:rows]
+}
+
 func uvarintLen(u uint64) int {
 	n := 1
 
@@ -289,82 +385,154 @@ func DecodeBytes(dst [][]byte, src []byte) ([][]byte, int, error) {
 		return dst, consumed, nil
 	}
 
-	if cap(dst) < rows {
-		dst = resize(dst, rows)
+	if rows < 0 { // a row count above maxInt wraps negative via int(uvarint): corrupt
+		return dst, 0, errUnexpectedEOF
 	}
-
-	dst = dst[:rows]
 
 	flag, err := r.ReadByte()
 	if err != nil {
 		return dst, 0, err
 	}
 
-	if flag == flagFlat {
-		// Flat fallback.
-		for i := range rows {
-			ln, err := r.ReadUvarint()
-			if err != nil {
-				return dst, 0, err
-			}
+	// avail bounds untrusted counts: every flat/dict row and every dict entry consumes at least one
+	// downstream byte, so a count exceeding the bytes left after the flag is a corrupt header — reject
+	// it before allocating (the dst/scratch sizing below trusts the validated count).
+	avail := len(src) - consumed - 1
 
-			buf, err := r.ReadBytesView(int(ln))
-			if err != nil {
-				return dst, 0, err
-			}
-
-			dst[i] = buf
-		}
-
-		return dst, consumed + r.ConsumedBytes(), nil
+	switch flag {
+	case flagFlat:
+		dst, err = decodeFlatGather(&r, dst, rows, avail)
+	case flagFixed:
+		dst, err = decodeFixedGather(&r, dst, rows)
+	default:
+		dst, err = decodeDictGather(&r, dst, rows, avail)
 	}
 
-	// Dictionary mode.
-	dictSize, err := r.ReadUvarint()
 	if err != nil {
 		return dst, 0, err
+	}
+
+	return dst, consumed + r.ConsumedBytes(), nil
+}
+
+// decodeFlatGather fills dst from a flagFlat payload: per row [uvarint len][bytes].
+func decodeFlatGather(r *bitstream.Reader, dst [][]byte, rows, avail int) ([][]byte, error) {
+	if rows > avail { // each row consumes at least one downstream byte
+		return dst, errUnexpectedEOF
+	}
+
+	dst = ensureRows(dst, rows)
+	for i := range rows {
+		ln, err := r.ReadUvarint()
+		if err != nil {
+			return dst, err
+		}
+
+		buf, err := readView(r, ln)
+		if err != nil {
+			return dst, err
+		}
+
+		dst[i] = buf
+	}
+
+	return dst, nil
+}
+
+// decodeFixedGather fills dst from a flagFixed payload: [uvarint width][rows×width bytes].
+func decodeFixedGather(r *bitstream.Reader, dst [][]byte, rows int) ([][]byte, error) {
+	width, err := r.ReadUvarint()
+	if err != nil {
+		return dst, err
+	}
+
+	if width == 0 && rows > maxEmptyFixedRows {
+		return dst, errUnexpectedEOF
+	}
+
+	total, err := fixedTotal(rows, width)
+	if err != nil {
+		return dst, err
+	}
+
+	block, err := r.ReadBytesView(total)
+	if err != nil {
+		return dst, err
+	}
+
+	dst = ensureRows(dst, rows)
+	w := int(width)
+	for i := range rows {
+		dst[i] = block[i*w : (i+1)*w]
+	}
+
+	return dst, nil
+}
+
+// decodeDictGather fills dst from a flagDict payload, gathering per-row values from the dictionary.
+func decodeDictGather(r *bitstream.Reader, dst [][]byte, rows, avail int) ([][]byte, error) {
+	if rows > avail {
+		return dst, errUnexpectedEOF
+	}
+
+	dst = ensureRows(dst, rows)
+
+	dictSize, err := r.ReadUvarint()
+	if err != nil {
+		return dst, err
+	}
+
+	if dictSize > uint64(avail) {
+		return dst, errUnexpectedEOF
 	}
 
 	scratch := newDictDecodeScratch(int(dictSize))
 	defer scratch.putBack()
 
 	entries := scratch.entries
-
 	for i := range dictSize {
 		ln, err := r.ReadUvarint()
 		if err != nil {
-			return dst, 0, err
+			return dst, err
 		}
 
-		buf, err := r.ReadBytesView(int(ln))
+		buf, err := readView(r, ln)
 		if err != nil {
-			return dst, 0, err
+			return dst, err
 		}
 
 		entries[i] = buf
 	}
 
-	if dictSize <= maxDictSize {
-		idBuf, err := r.ReadBytesView(rows)
-		if err != nil {
-			return dst, 0, err
-		}
-
-		for i := range rows {
-			dst[i] = entries[idBuf[i]]
-		}
-	} else {
-		idBuf, err := r.ReadBytesView(rows * 2)
-		if err != nil {
-			return dst, 0, err
-		}
-
-		for i := range rows {
-			dst[i] = entries[(uint16(idBuf[i*2])<<8)|uint16(idBuf[i*2+1])]
-		}
+	idWidth := 1
+	if dictSize > maxDictSize {
+		idWidth = 2
 	}
 
-	return dst, consumed + r.ConsumedBytes(), nil
+	idBuf, err := r.ReadBytesView(rows * idWidth)
+	if err != nil {
+		return dst, err
+	}
+
+	for i := range rows {
+		id := idAt(idBuf, i, idWidth)
+		if id >= len(entries) { // a row id past the dictionary is corrupt
+			return dst, errUnexpectedEOF
+		}
+
+		dst[i] = entries[id]
+	}
+
+	return dst, nil
+}
+
+// idAt returns the idWidth-byte big-endian row id at index i in a packed id array.
+func idAt(idBuf []byte, i, idWidth int) int {
+	if idWidth == 1 {
+		return int(idBuf[i])
+	}
+
+	return int(uint16(idBuf[i*2])<<8 | uint16(idBuf[i*2+1]))
 }
 
 // DictColumn is a decoded dictionary column in its split form: the unique entries plus
@@ -455,47 +623,114 @@ func (c *DictColumn) DecodeBytes(src []byte) (int, error) {
 		return consumed, nil
 	}
 
+	if rows < 0 { // a row count above maxInt wraps negative via int(uvarint): corrupt
+		return 0, errUnexpectedEOF
+	}
+
 	flag, err := r.ReadByte()
 	if err != nil {
 		return 0, err
 	}
 
-	if flag == flagFlat {
-		// Flat fallback: one entry per row, indexed directly (IDWidth stays 0).
-		c.Entries = slices.Grow(c.Entries, rows)[:rows]
-		for i := range rows {
-			ln, err := r.ReadUvarint()
-			if err != nil {
-				return 0, err
-			}
+	// See [DecodeBytes]: reject untrusted counts that exceed the downstream bytes before allocating.
+	avail := len(src) - consumed - 1
 
-			buf, err := r.ReadBytesView(int(ln))
-			if err != nil {
-				return 0, err
-			}
-
-			c.Entries[i] = buf
-		}
-
-		return consumed + r.ConsumedBytes(), nil
+	switch flag {
+	case flagFlat:
+		err = c.decodeFlat(&r, rows, avail)
+	case flagFixed:
+		err = c.decodeFixed(&r, rows)
+	default:
+		err = c.decodeDict(&r, rows, avail)
 	}
 
-	// Dictionary mode.
-	dictSize, err := r.ReadUvarint()
 	if err != nil {
 		return 0, err
+	}
+
+	return consumed + r.ConsumedBytes(), nil
+}
+
+// decodeFlat fills c from a flagFlat payload: one entry per row, indexed directly (IDWidth 0).
+func (c *DictColumn) decodeFlat(r *bitstream.Reader, rows, avail int) error {
+	if rows > avail {
+		return errUnexpectedEOF
+	}
+
+	c.Entries = slices.Grow(c.Entries, rows)[:rows]
+	for i := range rows {
+		ln, err := r.ReadUvarint()
+		if err != nil {
+			return err
+		}
+
+		buf, err := readView(r, ln)
+		if err != nil {
+			return err
+		}
+
+		c.Entries[i] = buf
+	}
+
+	return nil
+}
+
+// decodeFixed fills c from a flagFixed payload: one shared width, values sliced into per-row views.
+func (c *DictColumn) decodeFixed(r *bitstream.Reader, rows int) error {
+	width, err := r.ReadUvarint()
+	if err != nil {
+		return err
+	}
+
+	if width == 0 && rows > maxEmptyFixedRows {
+		return errUnexpectedEOF
+	}
+
+	total, err := fixedTotal(rows, width)
+	if err != nil {
+		return err
+	}
+
+	block, err := r.ReadBytesView(total)
+	if err != nil {
+		return err
+	}
+
+	c.Entries = slices.Grow(c.Entries, rows)[:rows]
+	w := int(width)
+	for i := range rows {
+		c.Entries[i] = block[i*w : (i+1)*w]
+	}
+
+	return nil
+}
+
+// decodeDict fills c's dictionary and validated id array from a flagDict payload, deferring the
+// per-row gather to [DictColumn.At].
+func (c *DictColumn) decodeDict(r *bitstream.Reader, rows, avail int) error {
+	if rows > avail {
+		return errUnexpectedEOF
+	}
+
+	dictSize, err := r.ReadUvarint()
+	if err != nil {
+		return err
+	}
+
+	if dictSize > uint64(avail) {
+		return errUnexpectedEOF
 	}
 
 	c.Entries = slices.Grow(c.Entries, int(dictSize))[:dictSize]
 	for i := range dictSize {
 		ln, err := r.ReadUvarint()
 		if err != nil {
-			return 0, err
+			return err
 		}
 
-		buf, err := r.ReadBytesView(int(ln))
+		buf, err := readView(r, ln)
 		if err != nil {
-			return 0, err
+			return err
 		}
 
 		c.Entries[i] = buf
@@ -508,11 +743,39 @@ func (c *DictColumn) DecodeBytes(src []byte) (int, error) {
 
 	idBuf, err := r.ReadBytesView(rows * idWidth)
 	if err != nil {
-		return 0, err
+		return err
+	}
+
+	// Validate every row id against the dictionary now so the deferred [DictColumn.At] gather is
+	// panic-safe on corrupt input (one cheap integer scan, no per-row []byte materialization).
+	if err := validateIDs(idBuf, idWidth, len(c.Entries)); err != nil {
+		return err
 	}
 
 	c.IDs = idBuf
 	c.IDWidth = idWidth
 
-	return consumed + r.ConsumedBytes(), nil
+	return nil
+}
+
+// validateIDs reports a corrupt stream if any idWidth-byte big-endian id in idBuf references an entry
+// at or beyond n (the dictionary size).
+func validateIDs(idBuf []byte, idWidth, n int) error {
+	if idWidth == 1 {
+		for _, id := range idBuf {
+			if int(id) >= n {
+				return errUnexpectedEOF
+			}
+		}
+
+		return nil
+	}
+
+	for i := 0; i+1 < len(idBuf); i += 2 {
+		if int(uint16(idBuf[i])<<8|uint16(idBuf[i+1])) >= n {
+			return errUnexpectedEOF
+		}
+	}
+
+	return nil
 }

@@ -34,6 +34,13 @@ const (
 	// column (e.g. the SeriesID sort key of a metric part) is long runs of one id, so
 	// RLE stores a distinct id + run length per run.
 	CodecID128
+	// CodecBytesRaw stores byte-string columns with no dictionary: a fixed-width block
+	// (one shared length + values back-to-back) when every value is the same length, else
+	// length-prefixed inline values. It is the right choice for high-cardinality, near-unique
+	// id columns (e.g. a span id) where a dictionary is pure overhead. The decoder reads the
+	// self-describing flag in the stream, so [DecodeBytes]/[DecodeBytesDict] handle it without
+	// consulting the codec.
+	CodecBytesRaw
 )
 
 // String returns a stable lower-case codec name.
@@ -53,6 +60,8 @@ func (c Codec) String() string {
 		return "decimal"
 	case CodecID128:
 		return "id128"
+	case CodecBytesRaw:
+		return "bytesraw"
 	default:
 		return "unknown"
 	}

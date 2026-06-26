@@ -95,8 +95,15 @@ persisted/wire-stable and must never be reordered. `IsEOF` classifies truncation
 | `CodecGorilla` | values (`float64`) | `EncodeFloats` / `DecodeFloats` | Gorilla XOR (leading/trailing-zero reuse) |
 | `CodecT64` | low-range `int64` | `EncodeIntsT64` / `DecodeIntsT64` | ClickHouse T64 bit-transpose + crop |
 | `CodecDict` | low-cardinality `[][]byte` | `EncodeBytes` / `DecodeBytes` | dictionary; 1 byte/row ≤256 distinct, 2 bytes ≤65536, flat fallback above |
+| `CodecBytesRaw` | high-cardinality `[][]byte` (ids) | `EncodeBytesRaw` / `DecodeBytes` | no dictionary: fixed-width block when all values share a length (e.g. a span id, ~unique → a dictionary is pure overhead), else length-prefixed inline |
 | `CodecDecimal` | `float64` | `EncodeFloatsDecimal` / `DecodeFloatsDecimal` | scaled-decimal + nearest-delta, optionally lossy |
 | `CodecID128` | 128-bit ids (`[]U128`) | `EncodeU128` / `DecodeU128` | run-length (distinct id + run length); optimal for a sorted SeriesID sort key |
+
+The three byte-column forms (`flagDict`/`flagFlat`/`flagFixed`) share one self-describing stream
+header, so `DecodeBytes`/`DecodeBytesDict` select the form from the stream's flag byte without
+consulting the column's `Codec`. All byte-column decoders bound every length/count read from the
+stream before allocating and reject out-of-range dictionary ids, so decode never panics on corrupt
+input (fuzzed). Wire layouts are pinned by golden files (`_golden/`, via `go-faster/sdk/gold`).
 
 Dictionary codec specifics (the most built-out):
 - `DecodeBytes` materializes one `[]byte` header per row (the gather form).
@@ -570,7 +577,10 @@ share one engine; only the column schema and projection differ.
 - **Traces** (`signal/trace`): a span is a record. Schema = `duration`/`kind`/`status_code` +
   ingest-computed nested-set ids `parent_id`/`nested_set_left`/`nested_set_right` (int) +
   `trace_id`(Equality)/`span_id`/`parent_span_id`/`name`(FullText)/`status_message`/`attrs`(Attrs) +
-  serialized `events`/`links` (bytes). `Project` computes nested-set ids per trace within the batch
+  serialized `events`/`links` (bytes). `span_id` is near-unique, so it uses the dictionary-free
+  fixed-width `CodecBytesRaw` (≈30% smaller than a dictionary for that column); `trace_id` keeps the
+  dictionary codec — it repeats once per span of a trace, which the dictionary exploits.
+  `Project` computes nested-set ids per trace within the batch
   (group by trace id across services, build the parent→child tree, preorder-DFS assign left/right/
   parent), so an embedder's TraceQL does ancestor/descendant/sibling as range comparisons on the
   returned columns — **no `SeekTo`**; a cross-batch parent is treated as a root (the raw
@@ -698,7 +708,7 @@ green; the tree is `gofmt`/`goimports` clean.
 .                     storage facade: Storage, Open/InMemory, Options, per-tenant engines, maintenance loop [implemented: metrics+logs+traces ingest+read; profiles & query-lang stubbed]
 encoding/             umbrella doc for the codec layers
   encoding/bitstream  MSB-first bit Writer/Reader                                      [implemented]
-  encoding/chunk      DoD / Gorilla / T64 / dict / decimal / id128 column codecs      [implemented]
+  encoding/chunk      DoD / Gorilla / T64 / dict / bytesraw / decimal / id128 column codecs [implemented]
   encoding/compress   zstd/none block wrapper (lz4 stub)                              [implemented]
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
 signal/               typed Attributes/Value, Resource/Scope/Series identity, 128-bit SeriesID, Signal, TenantID [implemented]
