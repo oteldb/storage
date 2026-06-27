@@ -131,25 +131,43 @@ func xorWrite(w *bitstream.Writer, newVal, curVal float64, leading, trailing *ui
 	w.WriteBits(delta>>newTrailing, int(sigbits))
 }
 
+// xorReadControl reads the XOR control bits: changed (bit0 = "value changed?") and, when changed,
+// newLT (bit1 = "new leading/trailing?"). It peeks both at once on the fast path (the common case)
+// and falls back to ReadBit at a buffer boundary.
+func xorReadControl(r *bitstream.Reader) (changed, newLT bool, err error) {
+	if r.Buffered() >= 2 {
+		p := uint8(r.Peek(2))
+		if p&0b10 == 0 {
+			r.Skip(1)
+
+			return false, false, nil // value unchanged
+		}
+
+		r.Skip(2)
+
+		return true, p&0b01 != 0, nil
+	}
+
+	bit, err := r.ReadBit()
+	if err != nil || !bit {
+		return false, false, err // err or value unchanged
+	}
+
+	newLT, err = r.ReadBit()
+
+	return true, newLT, err
+}
+
 // xorRead reads a single XOR delta and updates the value. State (leading, trailing)
 // is carried between samples.
 func xorRead(r *bitstream.Reader, val *float64, leading, trailing *uint8) error {
-	bit, err := r.ReadBit()
-	if err != nil {
-		return err
-	}
-
-	if !bit {
-		return nil // value unchanged
-	}
-
-	bit, err = r.ReadBit()
-	if err != nil {
-		return err
+	changed, ctrl1, err := xorReadControl(r)
+	if err != nil || !changed {
+		return err // err, or value unchanged (err == nil)
 	}
 
 	var newLeading, newTrailing, sigbits uint8
-	if !bit {
+	if !ctrl1 {
 		// Reuse previous leading/trailing.
 		newLeading, newTrailing = *leading, *trailing
 		sigbits = 64 - newLeading - newTrailing

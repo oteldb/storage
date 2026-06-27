@@ -46,12 +46,17 @@ func (s *Storage) TraceFetcher(tenants ...signal.TenantID) fetch.Fetcher {
 // TraceSeries returns the identities of a tenant's span streams matching the label matchers within
 // [start, end] (zero start AND end disables the time filter). It mirrors [Storage.ProfileSeries]
 // for the traces vertical, so an embedder can build tag-name/tag-value responses without
-// materializing spans. Local to this node; cluster fan-out for span enumeration is not yet wired.
+// materializing spans. In cluster mode it serves locally when this node owns the tenant, else it
+// fans out to an owner (hedged), re-applying the non-equality matchers to the superset.
 func (s *Storage) TraceSeries(
-	_ context.Context, tenant signal.TenantID, matchers []fetch.Matcher, start, end int64,
+	ctx context.Context, tenant signal.TenantID, matchers []fetch.Matcher, start, end int64,
 ) ([]signal.Series, error) {
 	if s.closed.Load() {
 		return nil, errors.Wrap(ErrClosed, "trace series")
+	}
+
+	if s.cluster != nil {
+		return s.clusterSeries(ctx, signal.Trace, s.normalizeTenant(tenant), matchers, start, end)
 	}
 
 	eng, ok := s.lookupTraceEngine(s.normalizeTenant(tenant))

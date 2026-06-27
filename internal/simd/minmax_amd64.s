@@ -75,3 +75,69 @@ done:
 	MOVQ DX, rmin+24(FP)
 	MOVQ BX, rmax+32(FP)
 	RET
+
+// func minMaxFloat64AVX2(s []float64) (rmin float64, rmax float64)
+// Requires: AVX, AVX2, SSE2
+TEXT ·minMaxFloat64AVX2(SB), NOSPLIT, $64-40
+	MOVQ         s_base+0(FP), AX
+	MOVQ         s_len+8(FP), CX
+	MOVQ         $0x7ff0000000000000, DX
+	MOVQ         $0xfff0000000000000, BX
+	MOVQ         DX, X0
+	MOVQ         BX, X1
+	VPBROADCASTQ X0, Y0
+	VPBROADCASTQ X1, Y1
+	VMOVDQU      Y0, Y2
+	VMOVDQU      Y1, Y3
+	XORQ         DX, DX
+	MOVQ         CX, BX
+	SUBQ         $0x03, BX
+
+vecloop:
+	CMPQ      DX, BX
+	JGE       vecdone
+	VMOVUPD   (AX)(DX*8), Y4
+	VCMPPD    $0x03, Y4, Y4, Y5
+	VBLENDVPD Y5, Y0, Y4, Y6
+	VMINPD    Y6, Y2, Y2
+	VBLENDVPD Y5, Y1, Y4, Y6
+	VMAXPD    Y6, Y3, Y3
+	ADDQ      $0x04, DX
+	JMP       vecloop
+
+vecdone:
+	VMOVDQU Y2, (SP)
+	VMOVDQU Y3, 32(SP)
+	VZEROUPPER
+	MOVSD   (SP), X0
+	MOVSD   32(SP), X1
+	MOVSD   8(SP), X2
+	MINSD   X2, X0
+	MOVSD   40(SP), X2
+	MAXSD   X2, X1
+	MOVSD   16(SP), X2
+	MINSD   X2, X0
+	MOVSD   48(SP), X2
+	MAXSD   X2, X1
+	MOVSD   24(SP), X2
+	MINSD   X2, X0
+	MOVSD   56(SP), X2
+	MAXSD   X2, X1
+
+tail:
+	CMPQ    DX, CX
+	JGE     done
+	MOVSD   (AX)(DX*8), X2
+	UCOMISD X2, X2
+	JP      tailnext
+	MINSD   X2, X0
+	MAXSD   X2, X1
+
+tailnext:
+	ADDQ $0x01, DX
+	JMP  tail
+
+done:
+	MOVSD X0, rmin+24(FP)
+	MOVSD X1, rmax+32(FP)
+	RET

@@ -3,7 +3,6 @@ package engine
 import (
 	"bytes"
 	"context"
-	"slices"
 	"sync"
 	"time"
 
@@ -40,6 +39,9 @@ type Config struct {
 	// bytes (LRU). It skips the column re-decode that the backend read cache cannot, and applies to
 	// every backend (a decode is CPU even when the read is RAM-fast). Zero disables it.
 	DecodeCacheBytes int64
+	// MaxPartBytes caps an immutable part's (approximate, uncompressed) size: flush and merge split
+	// their output into multiple parts so no single part exceeds it. 0 ⇒ unlimited (one part).
+	MaxPartBytes int64
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each part,
 	// so [Engine.AggregateRange] answers a range-covering aggregate from it without decoding the
 	// value column. It costs a little storage per series; off by default. AggregateRange works
@@ -65,6 +67,10 @@ type Engine struct {
 	walB *walBatch
 	// decodeCache memoizes decoded part columns across fetches (LRU); nil ⇒ decode every fetch.
 	decodeCache *decodeCache
+	// decPool recycles decodedPart column buffers on the no-cross-fetch-cache path: a fetch borrows
+	// them to decode a part and returns them on releaseParts (safe — the merge copies values out, so
+	// no result aliases them). This kills the per-query decode-buffer allocation (chunk.resize).
+	decPool sync.Pool
 }
 
 var _ fetch.Fetcher = (*Engine)(nil)
@@ -76,6 +82,8 @@ func New(cfg Config) *Engine {
 	}
 
 	e := &Engine{cfg: cfg, head: newHead()}
+	e.decPool.New = func() any { return &decodedPart{} }
+
 	if cfg.WAL != nil {
 		e.walB = newWALBatch()
 	}
@@ -147,11 +155,14 @@ func (e *Engine) AppendBatch(
 			w = sf[i]
 		}
 
-		out, isNew, s := e.head.appendByID(ids[i], ts[i], values[i], w, e.cfg.OOOWindow, limits, mat)
+		out, effID, isNew, s := e.head.appendByID(ids[i], ts[i], values[i], w, e.cfg.OOOWindow, limits, mat)
 
 		switch out {
 		case admitted:
 			res.Accepted++
+		case admittedOverflow:
+			res.Accepted++
+			res.Overflowed++
 		case rejectOOO:
 			res.RejectedOOO++
 
@@ -168,8 +179,10 @@ func (e *Engine) AppendBatch(
 
 		// Group the accepted samples by series; the grouped frames are written once after the loop
 		// (one WriteSamples per series, not one write+fsync syscall per sample, all under the lock).
+		// effID is the original id, or the overflow series' id when the sample was redirected — so
+		// the WAL logs the identity the head actually holds, and replay reconstructs it.
 		if e.cfg.WAL != nil {
-			e.walB.add(ids[i], ts[i], values[i], isNew, s)
+			e.walB.add(effID, ts[i], values[i], w, isNew, s)
 		}
 	}
 
@@ -190,6 +203,47 @@ func (e *Engine) HeadBytes() int64 {
 	defer e.mu.RUnlock()
 
 	return e.head.bytes
+}
+
+// Stats is an in-memory snapshot of an engine's state for introspection (no backend I/O, no decode).
+type Stats struct {
+	Series      int64 // distinct series ever seen (index span: head ∪ flushed)
+	HeadSamples int64 // samples currently buffered in the head (unflushed)
+	HeadBytes   int64 // head's buffered sample bytes (the in-flight memory measure)
+	Parts       int   // flushed immutable parts
+	MinTime     int64 // oldest flushed sample time (unix ns); 0 when no parts
+	MaxTime     int64 // newest sample time across parts and the head (unix ns); 0 when empty
+}
+
+// Stats returns an in-memory snapshot of the engine's state under a single read lock. It does no
+// backend I/O and decodes nothing, so it is safe to poll at dashboard cadence without touching the
+// hot path. Part byte sizes are not included (they would require backend stat calls).
+func (e *Engine) Stats() Stats {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	s := Stats{
+		Series:    int64(e.head.series.Len()),
+		HeadBytes: e.head.bytes,
+		Parts:     len(e.parts),
+		MaxTime:   e.head.newest,
+	}
+
+	for _, buf := range e.head.samples {
+		s.HeadSamples += int64(len(buf.ts))
+	}
+
+	for i, p := range e.parts {
+		if i == 0 || p.minTime < s.MinTime {
+			s.MinTime = p.minTime
+		}
+
+		if p.maxTime > s.MaxTime {
+			s.MaxTime = p.maxTime
+		}
+	}
+
+	return s
 }
 
 // Fetch implements [fetch.Fetcher] over the head ∪ flushed parts: it resolves the
@@ -299,6 +353,7 @@ type enginePlan struct {
 	liveParts  []*part
 	decoded    partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
 	decodeFn   decodeFunc      // how a part is decoded on a per-fetch miss (cache-aware)
+	engine     *Engine         // for returning pooled decode buffers on release
 	start, end int64
 }
 
@@ -337,75 +392,197 @@ func (p *enginePlan) releaseParts() {
 	for _, part := range p.liveParts {
 		part.release()
 	}
+
+	// Return pooled decode buffers (no-cross-fetch-cache path). The merge has already copied the
+	// values out into the result batches, so these slices are dead and safe to recycle.
+	for _, dp := range p.decoded {
+		if dp.pooled {
+			dp.pooled = false
+			dp.ts, dp.vals, dp.sf = dp.ts[:0], dp.vals[:0], dp.sf[:0]
+			p.engine.decPool.Put(dp)
+		}
+	}
 }
 
-// sfval is a sample's value paired with its lossy-sampling weight.
-type sfval struct {
-	value float64
-	sf    float64
+// tsRun is one source's in-window, ascending samples feeding a merge. sf is nil when every weight
+// is 1. The slices alias their source (a pooled decoded part, or a head/flush copy), so collect
+// copies into fresh result buffers — it never returns a run's backing array.
+type tsRun struct {
+	ts   []int64
+	vals []float64
+	sf   []float64
 }
 
-// sampleMerge merges samples from multiple sources for one series, deduplicating by
-// timestamp. Sources are added oldest → newest, so a later add overwrites an earlier value
-// (and its weight) at the same timestamp.
-type sampleMerge struct {
-	byTs map[int64]sfval
-}
-
-// add merges the samples whose timestamps fall in [start, end]. sf carries each sample's weight
-// (nil ⇒ every weight is 1).
-func (m *sampleMerge) add(ts []int64, values, sf []float64, start, end int64) {
-	if m.byTs == nil {
-		m.byTs = make(map[int64]sfval, len(ts))
+func (r tsRun) weight(i int) float64 {
+	if r.sf == nil {
+		return 1
 	}
 
-	for i := range ts {
-		if ts[i] < start || ts[i] > end {
+	return r.sf[i]
+}
+
+// sampleMerge merges one series' samples from several already-sorted sources, deduplicating by
+// timestamp with **freshest-wins**: sources are added oldest → newest, and on a timestamp tie the
+// latest-added source's value (and weight) is kept. It holds the sources as zero-copy run views and
+// merges them once in collect — no per-series map (which dominated the read-path allocations).
+type sampleMerge struct {
+	runs []tsRun // oldest → newest; a higher index wins a timestamp tie
+}
+
+// add registers a source's [start, end] window as a run. ts must be ascending; the window bounds are
+// found by binary search (a no-op clip for an already-windowed head/flush source). Empty windows are
+// skipped. sf carries each sample's weight (nil ⇒ every weight is 1).
+func (m *sampleMerge) add(ts []int64, values, sf []float64, start, end int64) {
+	lo := lowerBound(ts, start) // first i with ts[i] >= start
+	hi := upperBound(ts, end)   // first i with ts[i] > end
+	if lo >= hi {
+		return
+	}
+
+	var sfw []float64
+	if sf != nil {
+		sfw = sf[lo:hi]
+	}
+
+	m.runs = append(m.runs, tsRun{ts: ts[lo:hi], vals: values[lo:hi], sf: sfw})
+}
+
+// collect returns the merged samples sorted ascending by timestamp, in freshly allocated slices.
+// The returned sf slice is nil when every weight is 1 (the unsampled common case), else
+// len == len(ts).
+func (m *sampleMerge) collect() (tsOut []int64, values, sf []float64) {
+	switch len(m.runs) {
+	case 0:
+		return nil, nil, nil
+	case 1:
+		return collectOne(m.runs[0])
+	default:
+		return collectMany(m.runs)
+	}
+}
+
+// collectOne copies a single source's run into fresh result slices, dropping any adjacent
+// duplicate timestamps (keeping the last — matching the map's last-write-wins). No merge needed.
+func collectOne(r tsRun) (tsOut []int64, values, sf []float64) {
+	n := len(r.ts)
+	tsOut = make([]int64, 0, n)
+	values = make([]float64, 0, n)
+
+	for i := range n {
+		if i+1 < n && r.ts[i+1] == r.ts[i] { // keep the last of an equal-ts run
 			continue
 		}
 
-		w := float64(1)
-		if sf != nil {
-			w = sf[i]
-		}
-
-		m.byTs[ts[i]] = sfval{value: values[i], sf: w}
-	}
-}
-
-// collect returns the merged samples sorted ascending by timestamp. The returned sf slice is nil
-// when every weight is 1 (the unsampled common case), else len == len(ts).
-func (m *sampleMerge) collect() (tsOut []int64, values, sf []float64) {
-	if len(m.byTs) == 0 {
-		return nil, nil, nil
-	}
-
-	tsOut = make([]int64, 0, len(m.byTs))
-	for t := range m.byTs {
-		tsOut = append(tsOut, t)
-	}
-
-	slices.Sort(tsOut)
-
-	values = make([]float64, len(tsOut))
-
-	for i, t := range tsOut {
-		v := m.byTs[t]
-		values[i] = v.value
-
-		if v.sf != 1 && sf == nil {
-			sf = make([]float64, i, len(tsOut))
-			for j := range sf {
-				sf[j] = 1
-			}
-		}
-
-		if sf != nil {
-			sf = append(sf, v.sf)
-		}
+		tsOut = append(tsOut, r.ts[i])
+		values = append(values, r.vals[i])
+		sf = appendWeight(sf, r.weight(i), len(values), n)
 	}
 
 	return tsOut, values, sf
+}
+
+// collectMany k-way-merges several sorted runs into fresh result slices: at each step it emits the
+// smallest timestamp once, taking the value/weight from the highest-indexed (freshest) run that
+// holds it and advancing every run positioned there. O(rows × runs); runs is tiny (parts + flush +
+// head), so the linear min-scan beats a heap's overhead and allocations.
+func collectMany(runs []tsRun) (tsOut []int64, values, sf []float64) {
+	total := 0
+	for i := range runs {
+		total += len(runs[i].ts)
+	}
+
+	tsOut = make([]int64, 0, total)
+	values = make([]float64, 0, total)
+
+	// Per-run cursors. Stack-allocated for the common small fan-in; heap only for a huge one.
+	var curArr [16]int
+
+	var cur []int
+	if len(runs) <= len(curArr) {
+		cur = curArr[:len(runs)]
+	} else {
+		cur = make([]int, len(runs))
+	}
+
+	for {
+		minTs := int64(0)
+		found := false
+
+		for i := range runs {
+			if cur[i] < len(runs[i].ts) {
+				if t := runs[i].ts[cur[i]]; !found || t < minTs {
+					minTs, found = t, true
+				}
+			}
+		}
+
+		if !found {
+			break
+		}
+
+		var winVal, winW float64 = 0, 1
+
+		for i := range runs {
+			if cur[i] < len(runs[i].ts) && runs[i].ts[cur[i]] == minTs {
+				winVal, winW = runs[i].vals[cur[i]], runs[i].weight(cur[i])
+				cur[i]++
+			}
+		}
+
+		tsOut = append(tsOut, minTs)
+		values = append(values, winVal)
+		sf = appendWeight(sf, winW, len(values), total)
+	}
+
+	return tsOut, values, sf
+}
+
+// appendWeight appends w to the lazily-materialized sf column: it stays nil until the first non-unit
+// weight (backfilling 1 for the n-1 rows already emitted), keeping the unsampled path allocation-free.
+// n is the result length after this append; capHint sizes the slice on first materialization.
+func appendWeight(sf []float64, w float64, n, capHint int) []float64 {
+	if sf == nil {
+		if w == 1 {
+			return nil
+		}
+
+		sf = make([]float64, n-1, capHint)
+		for j := range sf {
+			sf[j] = 1
+		}
+	}
+
+	return append(sf, w)
+}
+
+// lowerBound returns the first index i in the ascending slice s with s[i] >= x (len(s) if none).
+func lowerBound(s []int64, x int64) int {
+	lo, hi := 0, len(s)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if s[mid] < x {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+
+	return lo
+}
+
+// upperBound returns the first index i in the ascending slice s with s[i] > x (len(s) if none).
+func upperBound(s []int64, x int64) int {
+	lo, hi := 0, len(s)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if s[mid] <= x {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+
+	return lo
 }
 
 // Flush writes the head's buffered samples to a new immutable part and clears the buffers
@@ -490,27 +667,18 @@ func (e *Engine) Replay(dir string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return wal.ReplayDir(dir, wal.Handlers{
-		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
-			e.head.registerSeries(s)
-
-			return nil
-		},
-		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
-			e.head.replaySamples(id, ts, values)
-
-			return nil
-		},
-	})
+	return wal.ReplayDir(dir, e.replayHandlers())
 }
 
-// ApplyPrimary applies a write as the shard's **primary**: it appends each sample through the
-// out-of-order-checked path (the single OOO decision for the shard) and re-frames the
-// *accepted* samples into a WAL payload to replicate to the secondary owners. It returns that
-// accepted payload and the number of samples rejected as out-of-order. Because only the
-// primary OOO-checks and it dictates the accepted set, every replica converges on the same
-// data regardless of concurrent writers. Safe for concurrent use.
-func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err error) {
+// ApplyPrimary applies a write as the shard's **primary**: it runs each sample through the
+// admission-checked append path (the single OOO decision for the shard, plus the cardinality
+// and in-flight-memory valves from limits) and re-frames the *accepted* samples into a WAL
+// payload to replicate to the secondary owners. It returns that accepted payload and an
+// [AppendResult] breaking the disposition down by reason, so the clustered ingest path can
+// attribute OTLP partial-success exactly like the single-node path. Because only the primary
+// admission-checks and it dictates the accepted set, every replica converges on the same data
+// regardless of concurrent writers. Safe for concurrent use.
+func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte, res AppendResult, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -535,15 +703,25 @@ func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err e
 			var accVals []float64
 
 			for i := range ts {
-				// The replication apply path enforces only the OOO window (the shard primary's
-				// authoritative timing decision); cardinality/memory admission is applied at the
-				// origin ingest, so pass no limits here.
-				if out, _, _ := e.head.appendByID(id, ts[i], values[i], 1, e.cfg.OOOWindow,
-					AppendLimits{}, func() signal.Series { return s }); out == admitted {
+				// The primary is the shard's single authority, so it makes the admission decision
+				// here (OOO window + cardinality + in-flight memory); secondaries apply the accepted
+				// set verbatim via ApplyReplicated.
+				// The cluster primary path does not set limits.Overflow, so a new series past the cap
+				// is hard-rejected here (overflow routing is single-node metrics today); effID == id.
+				out, _, _, _ := e.head.appendByID(id, ts[i], values[i], 1, e.cfg.OOOWindow,
+					limits, func() signal.Series { return s })
+
+				switch out {
+				case admitted, admittedOverflow: // primary path sets no Overflow, so only `admitted` occurs
 					accTs = append(accTs, ts[i])
 					accVals = append(accVals, values[i])
-				} else {
-					rejected++
+					res.Accepted++
+				case rejectOOO:
+					res.RejectedOOO++
+				case rejectCardinality:
+					res.RejectedCardinality++
+				case rejectBytes:
+					res.RejectedBytes++
 				}
 			}
 
@@ -562,7 +740,7 @@ func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err e
 		},
 	})
 
-	return buf.Bytes(), rejected, err
+	return buf.Bytes(), res, err
 }
 
 // ApplyReplicated applies a replicated write from the shard's primary to this secondary's head:
@@ -574,18 +752,7 @@ func (e *Engine) ApplyReplicated(data []byte) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return wal.Replay(data, wal.Handlers{
-		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
-			e.head.registerSeries(s)
-
-			return nil
-		},
-		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
-			e.head.replaySamples(id, ts, values)
-
-			return nil
-		},
-	})
+	return wal.Replay(data, e.replayHandlers())
 }
 
 // HeadSampleCount returns the number of samples currently buffered in the head (across all
@@ -642,28 +809,40 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	}
 
 	rows := len(cols.ts)
-	prefix := e.partPrefix(seq)
 
-	if err := writePart(ctx, e.cfg.Backend, prefix, cols, nil, 0, e.cfg.AggregateStats); err != nil {
-		return 0, err
+	// Split the flushed columns into one or more parts, each kept under MaxPartBytes (a single part
+	// when unlimited). Flush writes freshly-ingested data with codec-only framing (no recompression).
+	ranges := chunkRanges(rows, maxRowsPerPart(e.cfg.MaxPartBytes))
+
+	newParts := make([]*part, 0, len(ranges))
+	for i, rg := range ranges {
+		sub := cols.slice(rg[0], rg[1])
+		prefix := e.partPrefix(seq + i)
+
+		if err := writePart(ctx, e.cfg.Backend, prefix, sub, nil, 0, e.cfg.AggregateStats); err != nil {
+			return 0, err
+		}
+
+		p, err := openPart(ctx, e.cfg.Backend, prefix)
+		if err != nil {
+			return 0, err
+		}
+
+		p.minTime, p.maxTime = colsTimeRange(sub)
+		newParts = append(newParts, p)
 	}
 
-	p, err := openPart(ctx, e.cfg.Backend, prefix)
-	if err != nil {
-		return 0, err
-	}
-
-	p.minTime, p.maxTime = colsTimeRange(cols)
-
-	// Publish (under lock): add the part copy-on-write and clear e.flushing in the same critical
-	// section, so a fetch sees the samples either in e.flushing or in the part — never neither (no gap)
+	// Publish (under lock): add the parts copy-on-write and clear e.flushing in the same critical
+	// section, so a fetch sees the samples either in e.flushing or in a part — never neither (no gap)
 	// and never both (no double count). The small index writes and WAL checkpoint stay under the lock
 	// so the parts swap and the durable commit remain atomic.
 	e.mu.Lock()
-	e.parts = appendPart(e.parts, p)
+	for _, p := range newParts {
+		e.parts = appendPart(e.parts, p)
+	}
 	e.flushing = nil
-	e.nextSeq = seq + 1
-	err = e.publishLocked(ctx)
+	e.nextSeq = seq + len(ranges)
+	err := e.publishLocked(ctx)
 	e.mu.Unlock()
 
 	if err != nil {
@@ -697,7 +876,21 @@ func (e *Engine) publishLocked(ctx context.Context) error {
 // (immutable) decoded columns; a miss decodes and caches them. Without a cache it decodes plainly.
 func (e *Engine) decodeOf(ctx context.Context, p *part) (*decodedPart, error) {
 	if e.decodeCache == nil {
-		return p.decode(ctx)
+		// No cross-fetch cache: borrow buffers from the pool, decode into them, and mark the result
+		// pooled so the fetch returns it on releaseParts. The merge copies values out, so the buffers
+		// are free to reuse once the fetch ends.
+		dp := e.decPool.Get().(*decodedPart)
+
+		dp, err := p.decodeInto(ctx, dp)
+		if err != nil {
+			e.decPool.Put(dp)
+
+			return nil, err
+		}
+
+		dp.pooled = true
+
+		return dp, nil
 	}
 
 	if dp, ok := e.decodeCache.get(p.prefix); ok {
@@ -773,6 +966,7 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 		flushB:   make(map[signal.SeriesID]*fetch.Batch, len(ids)),
 		decoded:  make(partDecodeCache),
 		decodeFn: e.decodeOf,
+		engine:   e,
 		start:    r.Start,
 		end:      r.End,
 	}
@@ -803,4 +997,27 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 	}
 
 	return p
+}
+
+// replayHandlers returns the WAL handlers that rebuild the head from logged records — registering
+// each series and appending its samples (plain or scale-factor-carrying) verbatim. Shared by the
+// durable-restart [Engine.Replay] and the trusting [Engine.ApplyReplicated]. The caller holds e.mu.
+func (e *Engine) replayHandlers() wal.Handlers {
+	return wal.Handlers{
+		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
+			e.head.registerSeries(s)
+
+			return nil
+		},
+		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
+			e.head.replaySamples(id, ts, values)
+
+			return nil
+		},
+		OnSamplesSF: func(id signal.SeriesID, ts []int64, values, sf []float64) error {
+			e.head.replaySamplesSF(id, ts, values, sf)
+
+			return nil
+		},
+	}
 }

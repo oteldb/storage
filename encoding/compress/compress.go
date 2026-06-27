@@ -1,10 +1,12 @@
 package compress
 
 import (
+	"encoding/binary"
 	"io"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/pierrec/lz4/v4"
 )
 
 // Algorithm identifies a general-purpose compression algorithm.
@@ -51,8 +53,9 @@ const (
 type Compressor struct {
 	alg     Algorithm
 	level   Level
-	encPool sync.Pool
-	decPool sync.Pool
+	encPool sync.Pool // *zstd.Encoder
+	decPool sync.Pool // *zstd.Decoder
+	lz4Pool sync.Pool // *lz4.Compressor (not safe for concurrent use, so pooled)
 }
 
 // NewCompressor returns a [Compressor] for the given algorithm and level. Level is
@@ -61,6 +64,7 @@ func NewCompressor(alg Algorithm, level Level) *Compressor {
 	c := &Compressor{alg: alg, level: level}
 	c.encPool = sync.Pool{New: c.newEncoder}
 	c.decPool = sync.Pool{New: c.newDecoder}
+	c.lz4Pool = sync.Pool{New: func() any { return &lz4.Compressor{} }}
 	return c
 }
 
@@ -122,10 +126,22 @@ func (c *Compressor) compressPool(dst, src []byte) []byte {
 		// Identity: store raw (Compress already short-circuits this case).
 		return append(append(dst, FlagRaw), src...)
 	case AlgorithmLZ4:
-		// LZ4 block compression (klauspost/compress/lz4).
-		// For M0 we use the zstd path as the primary; LZ4 is a stub that falls
-		// through to raw. Full LZ4 wiring lands with the S3 backend (M5).
-		return append(append(dst, FlagRaw), src...)
+		// LZ4 block compression. Body framing is [uvarint origLen][lz4 block] after the flag, so
+		// Decompress can size the destination (block format carries no length itself).
+		comp := c.lz4Pool.Get().(*lz4.Compressor)
+		defer c.lz4Pool.Put(comp)
+
+		block := make([]byte, lz4.CompressBlockBound(len(src)))
+
+		n, err := comp.CompressBlock(src, block)
+		if err != nil || n == 0 { // error or incompressible: store raw
+			return append(append(dst, FlagRaw), src...)
+		}
+
+		dst = append(dst, FlagCompressed)
+		dst = binary.AppendUvarint(dst, uint64(len(src)))
+
+		return append(dst, block[:n]...)
 	default:
 		return append(append(dst, FlagRaw), src...)
 	}
@@ -138,11 +154,26 @@ func (c *Compressor) decompressPool(dst, src []byte) []byte {
 		defer c.decPool.Put(dec)
 		out, _ := dec.DecodeAll(src, dst)
 		return out
-	case AlgorithmNone, AlgorithmLZ4:
-		// Identity / LZ4 stub: return as-is (raw fallback).
-		return append(dst, src...)
+	case AlgorithmLZ4:
+		// Body is [uvarint origLen][lz4 block]. Size the destination from origLen, bounding it
+		// against the block length (LZ4's max expansion is ~255×) so a malformed length cannot
+		// trigger a huge allocation.
+		origLen, k := binary.Uvarint(src)
+		if k <= 0 || origLen > uint64(len(src))*256+1024 {
+			return dst // malformed; best-effort, matching the zstd path's swallow
+		}
+
+		base := len(dst)
+		dst = append(dst, make([]byte, origLen)...)
+
+		n, err := lz4.UncompressBlock(src[k:], dst[base:])
+		if err != nil {
+			return dst[:base]
+		}
+
+		return dst[:base+n]
 	default:
-		// LZ4 stub: return as-is (raw fallback).
+		// AlgorithmNone never produces a FlagCompressed body; return as-is defensively.
 		return append(dst, src...)
 	}
 }

@@ -286,6 +286,7 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 	var (
 		rej            rejectTally
 		sampledDropped int64
+		overflowed     int64
 	)
 
 	// The tenant (hence the engine) is derived from Resource+Scope, which are constant within
@@ -369,6 +370,8 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 
 		res, err := lastEng.AppendBatch(ids, tss, vals, sf, mat, engine.AppendLimits{
 			MaxSeries:        lastLimits.MaxSeries,
+			MaxSeriesSoft:    lastLimits.MaxSeriesSoft,
+			Overflow:         metricOverflow,
 			MaxInFlightBytes: lastLimits.MaxInFlightBytes,
 		})
 		if err != nil {
@@ -381,6 +384,11 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 		rej.cardinality += int64(res.RejectedCardinality)
 		rej.inflight += int64(res.RejectedBytes)
 		lastAdmit.record(int64(res.Accepted), int64(res.RejectedOOO), int64(res.RejectedCardinality), int64(res.RejectedBytes))
+
+		if res.Overflowed > 0 {
+			overflowed += int64(res.Overflowed)
+			lastAdmit.recordOverflowed(int64(res.Overflowed))
+		}
 	})
 
 	if firstErr != nil {
@@ -389,13 +397,41 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 
 	total := rej.total()
 	accepted := int64(emitted) - total
-	s.emitAdmission(ctx, signal.Metric, accepted, rej, sampledDropped)
+	s.emitAdmission(ctx, signal.Metric, accepted, rej, sampledDropped, overflowed)
 
 	return Accepted{
 		Accepted:       accepted,
 		Rejected:       total,
 		RejectedReason: rej.reason(),
 	}, nil
+}
+
+// Machine-readable admission rejection reasons, shared by the OTLP partial-success reason
+// ([rejectTally.reason]) and the admission meta-metrics ([Storage.emitAdmission]).
+const (
+	reasonOutOfOrder       = "out_of_order"
+	reasonRateLimit        = "rate_limit"
+	reasonMaxSeries        = "max_series"
+	reasonMaxInFlightBytes = "max_in_flight_bytes"
+)
+
+// metricOverflowLabel marks the synthetic series that absorbs a tenant's metric series past the
+// soft cardinality budget (Track 3a).
+var metricOverflowLabel = []byte("__overflow__")
+
+// metricOverflow builds the overflow-series identity for a metric series that crossed the soft
+// cardinality budget: it keeps only the metric name and adds __overflow__="true", dropping every
+// other label (and resource/scope), so all overflowing series of a metric collapse into one bucket.
+// That bounds cardinality to ~one extra series per metric name while keeping the metric's sum/count
+// approximately right; the embedder treats __overflow__ like any label. It is invoked only on the
+// degraded path (a new series past the soft line), so it never costs the steady-state hot path.
+func metricOverflow(s signal.Series) signal.Series {
+	name, _ := s.Attributes.Get(metric.LabelName)
+
+	return signal.Series{Attributes: signal.NewAttributes(
+		signal.KeyValue{Key: metric.LabelName, Value: name},
+		signal.KeyValue{Key: metricOverflowLabel, Value: signal.StringValue([]byte("true"))},
+	)}
 }
 
 // rejectTally accumulates per-reason rejection counts during a write and renders the dominant
@@ -419,10 +455,10 @@ func (r rejectTally) reason() string {
 	}
 
 	all := []kv{
-		{"out_of_order", r.ooo},
-		{"rate_limit", r.rate},
-		{"max_series", r.cardinality},
-		{"max_in_flight_bytes", r.inflight},
+		{reasonOutOfOrder, r.ooo},
+		{reasonRateLimit, r.rate},
+		{reasonMaxSeries, r.cardinality},
+		{reasonMaxInFlightBytes, r.inflight},
 	}
 
 	var top kv
@@ -902,6 +938,9 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		Obs:              s.obs,
 		DecodeCacheBytes: s.opts.DecodeCacheBytes,
 		AggregateStats:   s.opts.AggregateStats,
+		// MaxPartBytes caps each flushed/merged part; resolved from the tenant's policy. It is an
+		// operational/structural cap fixed at engine creation (unlike the per-write admission limits).
+		MaxPartBytes: s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Limits.MaxPartSize,
 	})
 	s.tenants[tid] = e
 
@@ -1010,6 +1049,13 @@ type walSyncer interface{ SyncWAL() error }
 
 // maintain flushes then merges (with retention) every tenant engine once. Errors are
 // swallowed: a transient backend failure must not crash the background loop, and the next
+// maintTask is one engine's maintenance work plus its flush pressure (head bytes), used to order
+// the cycle so the fullest heads flush first (fair scheduling — see maintain).
+type maintTask struct {
+	run      func()
+	pressure int64
+}
+
 // tick retries. In cluster mode only the tenants this node owns (its compaction claims) are
 // flushed/merged, so exactly one node writes a tenant's parts to the shared object store.
 func (s *Storage) maintain(ctx context.Context) {
@@ -1067,38 +1113,38 @@ func (s *Storage) maintain(ctx context.Context) {
 	// Each engine is an independent shard (per tenant, per signal) with its own lock, so flush/merge
 	// across engines parallelizes freely. Build one flat work list and fan out under a bound — a
 	// sequential pass would take the sum of every engine's compaction I/O.
-	tasks := make([]func(), 0, len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines))
+	//
+	// Fair scheduling: the work list is ordered by flush pressure (head bytes) descending, and
+	// parallel.ForEach dispatches in index order, so the fullest heads flush first within a cycle.
+	// This keeps one noisy tenant from delaying the relief of others when the work exceeds the
+	// concurrency bound, and drains the most in-flight memory soonest.
+	tasks := make([]maintTask, 0, len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines))
 
 	for tid, eng := range metricEngines {
-		tasks = append(tasks, func() {
+		tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
 			maintainEngine(tid, func() error { return eng.Flush(ctx) },
 				func() error { return eng.MergeWith(ctx, s.metricMergeOptions(tid)) },
 				func() error { return eng.RefreshReplica(ctx) })
-		})
+		}})
 	}
 
-	for tid, eng := range logEngines {
-		tasks = append(tasks, func() {
-			maintainEngine(tid, func() error { return eng.Flush(ctx) },
-				func() error { return eng.Merge(ctx, s.retainFrom(tid)) }, func() error { return eng.RefreshReplica(ctx) })
-		})
+	addRecord := func(engines map[signal.TenantID]*recordengine.Engine) {
+		for tid, eng := range engines {
+			tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
+				maintainEngine(tid, func() error { return eng.Flush(ctx) },
+					func() error { return eng.Merge(ctx, s.retainFrom(tid)) },
+					func() error { return eng.RefreshReplica(ctx) })
+			}})
+		}
 	}
 
-	for tid, eng := range traceEngines {
-		tasks = append(tasks, func() {
-			maintainEngine(tid, func() error { return eng.Flush(ctx) },
-				func() error { return eng.Merge(ctx, s.retainFrom(tid)) }, func() error { return eng.RefreshReplica(ctx) })
-		})
-	}
+	addRecord(logEngines)
+	addRecord(traceEngines)
+	addRecord(profileEngines)
 
-	for tid, eng := range profileEngines {
-		tasks = append(tasks, func() {
-			maintainEngine(tid, func() error { return eng.Flush(ctx) },
-				func() error { return eng.Merge(ctx, s.retainFrom(tid)) }, func() error { return eng.RefreshReplica(ctx) })
-		})
-	}
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].pressure > tasks[j].pressure })
 
-	parallel.ForEach(len(tasks), s.maintenanceConcurrency(), func(i int) { tasks[i]() })
+	parallel.ForEach(len(tasks), s.maintenanceConcurrency(), func(i int) { tasks[i].run() })
 }
 
 // maintenanceConcurrency is the parallel flush/merge/fsync fan-out cap for the background loops,
@@ -1139,7 +1185,8 @@ func (s *Storage) ownedTenants(ctx context.Context, tids map[signal.TenantID]str
 // retainFrom converts a tenant's retention window into an absolute cutoff timestamp (unix
 // nanoseconds); 0 means retain forever.
 func (s *Storage) retainFrom(tid signal.TenantID) int64 {
-	return retentionCutoff(s.tenant.Resolve(s.normalizeTenant(tid)).Retention, time.Now().UnixNano())
+	// tid may be a shard key ({tenant}/_s{idx}) when a signal is sharded; policy is per real tenant.
+	return retentionCutoff(s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Retention, time.Now().UnixNano())
 }
 
 // retentionCutoff converts a retention window into an absolute cutoff at the given now (unix

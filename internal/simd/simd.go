@@ -4,6 +4,8 @@
 // is the reference the assembly is fuzzed against, so results are bit-identical on every platform.
 package simd
 
+import "math"
+
 //go:generate go run github.com/oteldb/storage/internal/cmd/gensimd -out minmax_amd64.s
 
 // minMaxInt64Generic is the portable reference for [MinMaxInt64]; it requires len(s) >= 1 and is
@@ -11,6 +13,25 @@ package simd
 func minMaxInt64Generic(s []int64) (mn, mx int64) {
 	mn, mx = s[0], s[0]
 	for _, v := range s[1:] {
+		if v < mn {
+			mn = v
+		}
+
+		if v > mx {
+			mx = v
+		}
+	}
+
+	return mn, mx
+}
+
+// minMaxFloat64Generic is the portable reference for [MinMaxFloat64]: the min and max of s ignoring
+// NaN. The accumulators start at (+Inf, -Inf) and every NaN comparison is false, so NaN values never
+// update them; an all-NaN (or empty) slice therefore returns (+Inf, -Inf) — the sentinel callers
+// read as "no real values" (min > max). It is the reference the AVX2 kernel is fuzzed against.
+func minMaxFloat64Generic(s []float64) (mn, mx float64) {
+	mn, mx = math.Inf(1), math.Inf(-1)
+	for _, v := range s {
 		if v < mn {
 			mn = v
 		}

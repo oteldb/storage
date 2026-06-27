@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
@@ -46,12 +47,17 @@ func (s *Storage) LogFetcher(tenants ...signal.TenantID) fetch.Fetcher {
 // LogSeries returns the identities of a tenant's log streams matching the label matchers within
 // [start, end] (zero start AND end disables the time filter). It mirrors [Storage.ProfileSeries]
 // for the logs vertical, so an embedder can build LabelNames/LabelValues/Series responses without
-// materializing records. Local to this node; cluster fan-out for log enumeration is not yet wired.
+// materializing records. In cluster mode it serves locally when this node owns the tenant, else it
+// fans out to an owner (hedged), re-applying the non-equality matchers to the superset.
 func (s *Storage) LogSeries(
-	_ context.Context, tenant signal.TenantID, matchers []fetch.Matcher, start, end int64,
+	ctx context.Context, tenant signal.TenantID, matchers []fetch.Matcher, start, end int64,
 ) ([]signal.Series, error) {
 	if s.closed.Load() {
 		return nil, errors.Wrap(ErrClosed, "log series")
+	}
+
+	if s.cluster != nil {
+		return s.clusterSeries(ctx, signal.Log, s.normalizeTenant(tenant), matchers, start, end)
 	}
 
 	eng, ok := s.lookupLogEngine(s.normalizeTenant(tenant))
@@ -88,10 +94,21 @@ type KeyInfo struct {
 // stream identities): the per-record [KeyScopeRecord] keys let an embedder list and push down
 // record-attribute labels its [Storage.LogSeries]-based resolution cannot see, and the scope bitset
 // authoritatively distinguishes a stream label from a record attribute (or both). Keys are
-// low-cardinality metadata. Local to this node; cluster fan-out is a follow-up.
-func (s *Storage) LogKeys(_ context.Context, tenant signal.TenantID, start, end int64) ([]KeyInfo, error) {
+// low-cardinality metadata. In cluster mode it serves locally when this node owns the tenant, else
+// it fans out to an owner (hedged); each owner is a complete replica, so one response is
+// authoritative.
+func (s *Storage) LogKeys(ctx context.Context, tenant signal.TenantID, start, end int64) ([]KeyInfo, error) {
 	if s.closed.Load() {
 		return nil, errors.Wrap(ErrClosed, "log keys")
+	}
+
+	if s.cluster != nil {
+		raw, err := s.clusterKeys(ctx, signal.Log, s.normalizeTenant(tenant), start, end)
+		if err != nil {
+			return nil, err
+		}
+
+		return keyInfosFromCluster(raw), nil
 	}
 
 	eng, ok := s.lookupLogEngine(s.normalizeTenant(tenant))
@@ -110,6 +127,20 @@ func (s *Storage) LogKeys(_ context.Context, tenant signal.TenantID, start, end 
 	}
 
 	return out, nil
+}
+
+// keyInfosFromCluster converts the cluster RPC's key list into the facade's [KeyInfo] type.
+func keyInfosFromCluster(raw []cluster.KeyInfo) []KeyInfo {
+	if len(raw) == 0 {
+		return nil
+	}
+
+	out := make([]KeyInfo, len(raw))
+	for i := range raw {
+		out[i] = KeyInfo{Key: raw[i].Key, Scope: KeyScope(raw[i].Scope)}
+	}
+
+	return out
 }
 
 // concatFetcher runs each child and concatenates their batches. Unlike [fetch.Merge] it does not

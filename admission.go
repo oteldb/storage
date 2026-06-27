@@ -25,6 +25,10 @@ type AdmissionStats struct {
 	// counters these are NOT failures — the kept samples carry a scale factor that represents
 	// them — so they count toward Accepted, not Rejected.
 	SampledDropped int64
+	// Overflowed counts points for new series past the soft cardinality budget that were routed to
+	// an overflow series instead of being shed. Like SampledDropped these are accepted (the data is
+	// retained, relabeled), not rejected.
+	Overflowed int64
 }
 
 // Rejected returns the total shed across all reasons.
@@ -93,6 +97,7 @@ type tenantAdmission struct {
 	rejectedCardinality int64
 	rejectedInFlight    int64
 	sampledDropped      int64
+	overflowed          int64
 
 	// Budgeted-sampling window state (guarded by smu): the sampler adapts the scale factor each
 	// 1-second window from the prior window's observed rate, so the kept set tracks the budget.
@@ -175,6 +180,15 @@ func (a *tenantAdmission) record(accepted, ooo, cardinality, inflight int64) {
 	a.rejectedInFlight += inflight
 }
 
+// recordOverflowed accounts points routed to an overflow series past the soft budget; they are
+// already counted in accepted (the data is retained), so this only tracks the overflow subset.
+func (a *tenantAdmission) recordOverflowed(n int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.overflowed += n
+}
+
 func (a *tenantAdmission) add(p *int64, n int64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -193,6 +207,7 @@ func (a *tenantAdmission) stats() AdmissionStats {
 		RejectedCardinality: a.rejectedCardinality,
 		RejectedInFlight:    a.rejectedInFlight,
 		SampledDropped:      a.sampledDropped,
+		Overflowed:          a.overflowed,
 	}
 }
 
@@ -273,22 +288,23 @@ func (s *Storage) writeSpan(ctx context.Context, name string) (context.Context, 
 // accepted count, the per-reason rejections, and the sampled-dropped count, all tagged with the
 // signal. It is called once per write (bulk), so it never touches the per-point hot path; with the
 // no-op meter it is a no-op.
-func (s *Storage) emitAdmission(ctx context.Context, sig signal.Signal, accepted int64, rej rejectTally, sampled int64) {
+func (s *Storage) emitAdmission(ctx context.Context, sig signal.Signal, accepted int64, rej rejectTally, sampled, overflowed int64) {
 	name := sig.String()
 	a := s.obs.Admission
 	a.Accepted(ctx, accepted, name)
-	a.Rejected(ctx, rej.ooo, name, "out_of_order")
-	a.Rejected(ctx, rej.rate, name, "rate_limit")
-	a.Rejected(ctx, rej.cardinality, name, "max_series")
-	a.Rejected(ctx, rej.inflight, name, "max_in_flight_bytes")
+	a.Rejected(ctx, rej.ooo, name, reasonOutOfOrder)
+	a.Rejected(ctx, rej.rate, name, reasonRateLimit)
+	a.Rejected(ctx, rej.cardinality, name, reasonMaxSeries)
+	a.Rejected(ctx, rej.inflight, name, reasonMaxInFlightBytes)
 	a.SampledDropped(ctx, sampled, name)
+	a.Overflowed(ctx, overflowed, name)
 
 	// Shedding is the overload/backpressure event — log it (Warn) so operators see it without
 	// scraping metrics. Only fires when something was actually rejected, so it stays coarse.
 	if total := rej.ooo + rej.rate + rej.cardinality + rej.inflight; total > 0 {
 		zctx.From(ctx).Warn("admission shed writes",
 			zap.String("signal", name), zap.Int64("rejected", total),
-			zap.Int64("out_of_order", rej.ooo), zap.Int64("rate_limit", rej.rate),
-			zap.Int64("max_series", rej.cardinality), zap.Int64("max_in_flight_bytes", rej.inflight))
+			zap.Int64(reasonOutOfOrder, rej.ooo), zap.Int64(reasonRateLimit, rej.rate),
+			zap.Int64(reasonMaxSeries, rej.cardinality), zap.Int64(reasonMaxInFlightBytes, rej.inflight))
 	}
 }

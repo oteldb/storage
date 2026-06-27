@@ -102,6 +102,64 @@ func TestWriteReplaySamples(t *testing.T) {
 	assert.Equal(t, values, gotValues)
 }
 
+func TestWriteReplaySamplesSF(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	id := signal.SeriesID{Hi: 9, Lo: 11}
+	ts := []int64{10, 20, 30}
+	values := []float64{1, 2, 3}
+	sf := []float64{4, 4, 8}
+	require.NoError(t, NewWriter(&buf).WriteSamplesSF(id, ts, values, sf))
+
+	var (
+		gotID  signal.SeriesID
+		gotTs  []int64
+		gotVal []float64
+		gotSF  []float64
+	)
+	err := Replay(buf.Bytes(), Handlers{
+		OnSamplesSF: func(i signal.SeriesID, t []int64, v, s []float64) error {
+			gotID, gotTs, gotVal, gotSF = i, t, v, s
+
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, id, gotID)
+	assert.Equal(t, ts, gotTs)
+	assert.Equal(t, values, gotVal)
+	assert.Equal(t, sf, gotSF)
+}
+
+// A reader without OnSamplesSF still recovers the samples through OnSamples (weights dropped).
+func TestSamplesSFFallsBackToOnSamples(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	id := signal.SeriesID{Hi: 1, Lo: 2}
+	require.NoError(t, NewWriter(&buf).WriteSamplesSF(id, []int64{5}, []float64{42}, []float64{16}))
+
+	var gotVal []float64
+	err := Replay(buf.Bytes(), Handlers{OnSamples: func(_ signal.SeriesID, _ []int64, v []float64) error {
+		gotVal = v
+
+		return nil
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, []float64{42}, gotVal, "values recovered even without the sf-aware handler")
+}
+
+func TestParseSamplesSFErrors(t *testing.T) {
+	t.Parallel()
+
+	noop := Handlers{OnSamplesSF: func(signal.SeriesID, []int64, []float64, []float64) error { return nil }}
+
+	// A claimed sample with a ts but no room for value+sf is corrupt.
+	truncated := append(make([]byte, seriesIDLen), 0x01, 0x02) // count=1, ts=1, then nothing
+	require.Error(t, Replay(appendFrame(nil, recordSamplesSF, truncated), noop))
+}
+
 func TestTornTailRecoversPrefix(t *testing.T) {
 	t.Parallel()
 
@@ -208,17 +266,25 @@ func TestParseSeriesErrors(t *testing.T) {
 func FuzzReplay(f *testing.F) {
 	var buf bytes.Buffer
 	s := mkSeries("job", "api")
-	_ = NewWriter(&buf).WriteSeries(s.Hash(), s)
+	w := NewWriter(&buf)
+	_ = w.WriteSeries(s.Hash(), s)
+	_ = w.WriteSamples(s.Hash(), []int64{1, 2}, []float64{1, 2})
+	_ = w.WriteSamplesSF(s.Hash(), []int64{3, 4}, []float64{3, 4}, []float64{2, 2})
 	f.Add(buf.Bytes())
 	f.Add([]byte{})
 
 	f.Fuzz(func(_ *testing.T, data []byte) {
-		// Must never panic; corrupt input returns an error or stops cleanly.
-		_ = Replay(data, Handlers{OnSeries: func(id signal.SeriesID, s signal.Series) error {
-			_ = id
-			_ = s.Clone()
+		// Must never panic; corrupt input returns an error or stops cleanly. Exercise every
+		// handler, including the sf-aware one.
+		_ = Replay(data, Handlers{
+			OnSeries: func(id signal.SeriesID, s signal.Series) error {
+				_ = id
+				_ = s.Clone()
 
-			return nil
-		}})
+				return nil
+			},
+			OnSamples:   func(signal.SeriesID, []int64, []float64) error { return nil },
+			OnSamplesSF: func(signal.SeriesID, []int64, []float64, []float64) error { return nil },
+		})
 	})
 }

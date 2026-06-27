@@ -17,17 +17,20 @@ type walBatch struct {
 }
 
 type walSeriesAcc struct {
-	isNew  bool
-	series signal.Series // the materialized identity, set only when isNew
-	ts     []int64
-	values []float64
+	isNew   bool
+	series  signal.Series // the materialized identity, set only when isNew
+	ts      []int64
+	values  []float64
+	sf      []float64 // per-sample scale factors (aligned with ts)
+	sampled bool      // true once any sf != 1 — selects the sf-carrying WAL frame on flush
 }
 
 func newWALBatch() *walBatch { return &walBatch{pos: make(map[signal.SeriesID]int)} }
 
-// add records one accepted sample for series id. isNew/s are taken from the head append and used only
-// on the series' first sight in this batch (to log its identity).
-func (b *walBatch) add(id signal.SeriesID, ts int64, value float64, isNew bool, s signal.Series) {
+// add records one accepted sample for series id with its lossy-sampling weight sf (1 when unsampled).
+// isNew/s are taken from the head append and used only on the series' first sight in this batch (to
+// log its identity).
+func (b *walBatch) add(id signal.SeriesID, ts int64, value, sf float64, isNew bool, s signal.Series) {
 	k, ok := b.pos[id]
 	if !ok {
 		k = len(b.order)
@@ -35,7 +38,7 @@ func (b *walBatch) add(id signal.SeriesID, ts int64, value float64, isNew bool, 
 		b.pos[id] = k
 
 		if k < len(b.accs) { // reuse a prior batch's accumulator (and its slice capacity)
-			b.accs[k] = walSeriesAcc{isNew: isNew, series: s, ts: b.accs[k].ts[:0], values: b.accs[k].values[:0]}
+			b.accs[k] = walSeriesAcc{isNew: isNew, series: s, ts: b.accs[k].ts[:0], values: b.accs[k].values[:0], sf: b.accs[k].sf[:0]}
 		} else {
 			b.accs = append(b.accs, walSeriesAcc{isNew: isNew, series: s})
 		}
@@ -43,6 +46,11 @@ func (b *walBatch) add(id signal.SeriesID, ts int64, value float64, isNew bool, 
 
 	b.accs[k].ts = append(b.accs[k].ts, ts)
 	b.accs[k].values = append(b.accs[k].values, value)
+	b.accs[k].sf = append(b.accs[k].sf, sf)
+
+	if sf != 1 {
+		b.accs[k].sampled = true
+	}
 }
 
 // empty reports whether the batch buffered no samples (so the engine can skip the WAL write).
@@ -60,6 +68,16 @@ func (b *walBatch) flush(w *wal.SegmentWriter) error {
 			if err := w.WriteSeries(id, a.series); err != nil {
 				return err
 			}
+		}
+
+		// Only spend the per-sample sf bytes when sampling actually weighted this series; the common
+		// unsampled path stays on the original (no-sf) samples frame.
+		if a.sampled {
+			if err := w.WriteSamplesSF(id, a.ts, a.values, a.sf); err != nil {
+				return err
+			}
+
+			continue
 		}
 
 		if err := w.WriteSamples(id, a.ts, a.values); err != nil {

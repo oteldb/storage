@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"sync/atomic"
 
 	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/fetch"
@@ -128,7 +127,7 @@ func (s *Storage) writeRecordsLocal(
 
 	total := rej.total()
 	accepted := int64(emitted) - total
-	s.emitAdmission(ctx, sig, accepted, rej, 0) // records are not sampled
+	s.emitAdmission(ctx, sig, accepted, rej, 0, 0) // records are not sampled
 
 	return Accepted{Accepted: accepted, Rejected: total, RejectedReason: rej.reason()}, nil
 }
@@ -136,54 +135,88 @@ func (s *Storage) writeRecordsLocal(
 // writeRecordsClustered frames each tenant's streams+records as a WAL payload and routes it to the
 // tenant's ring primary (primary-authoritative replication); the reject count flows back.
 func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, project recordProjector) (Accepted, error) {
-	byTenant := make(map[signal.TenantID][]byte)
+	// Group each stream by its shard key — (tenant, hash(streamID) % N) — so a tenant's streams
+	// spread across the ring instead of pinning to one owner set (with N=1 the key is the tenant,
+	// byte-identical to the unsharded path).
+	n := s.cluster.shardCount()
+	byShard := make(map[signal.TenantID][]byte)
+
+	// The ingest-rate valve is applied at the origin (per real tenant, like the single-node path);
+	// cardinality and in-flight memory are head-enforced by the shard primary in primaryWrite.
+	var (
+		rateRejected int64
+		lastTenant   signal.TenantID
+		lastAdmit    *tenantAdmission
+		lastLimits   tenant.Limits
+		haveTenant   bool
+	)
 
 	emitted := project(func(b *recordengine.Batch) {
 		id := b.Identity()
-		tid := s.tenantFor(id.Resource, id.Scope)
-		byTenant[tid] = append(byTenant[tid], recordengine.EncodeWAL(b)...)
+		tid := s.normalizeTenant(s.tenantFor(id.Resource, id.Scope))
+		if !haveTenant || tid != lastTenant {
+			lastTenant, haveTenant = tid, true
+			lastAdmit = s.admissionFor(tid)
+			lastLimits = s.tenant.Resolve(tid).Limits
+		}
+
+		if !lastAdmit.allowRate(lastLimits, b.ByteSize(), s.now()) {
+			rateRejected += int64(b.Len())
+			lastAdmit.addRate(int64(b.Len()))
+
+			return // whole over-budget stream batch shed before framing
+		}
+
+		sk := shardKeyOf(tid, shardOf(b.Stream, n), n)
+		byShard[sk] = append(byShard[sk], recordengine.EncodeWAL(b)...)
 	})
 
-	// Each tenant routes to its own ring primary independently; fan the routes out under a bound
+	// Each shard routes to its own ring primary independently; fan the routes out under a bound
 	// rather than paying the sum of per-primary round-trips. Order-independent: results accumulate
 	// into per-index slots.
 	type route struct {
-		tid     signal.TenantID
+		key     signal.TenantID
 		payload []byte
 	}
 
-	routes := make([]route, 0, len(byTenant))
-	for tid, payload := range byTenant {
-		routes = append(routes, route{tid, payload})
+	routes := make([]route, 0, len(byShard))
+	for sk, payload := range byShard {
+		routes = append(routes, route{sk, payload})
 	}
 
-	var (
-		rejected atomic.Int64
-		errs     = make([]error, len(routes))
-	)
+	rejects := make([]primaryReject, len(routes))
+	errs := make([]error, len(routes))
 
 	parallel.ForEach(len(routes), clusterWriteFanOut, func(i int) {
-		rej, err := s.routeToPrimary(ctx, sig, string(s.normalizeTenant(routes[i].tid)), routes[i].payload)
+		rej, err := s.routeToPrimary(ctx, sig, string(routes[i].key), routes[i].payload)
 		if err != nil {
 			errs[i] = err
 
 			return
 		}
 
-		rejected.Add(int64(rej))
+		rejects[i] = rej
 	})
+
+	// Combine the origin rate rejections with each primary's per-reason breakdown.
+	rej := rejectTally{rate: rateRejected}
+	for _, r := range rejects {
+		rej.ooo += int64(r.ooo)
+		rej.cardinality += int64(r.cardinality)
+		rej.inflight += int64(r.inflight)
+	}
 
 	for _, err := range errs { // surface the first error deterministically (by route index)
 		if err != nil {
-			return Accepted{Accepted: int64(emitted) - rejected.Load(), Rejected: rejected.Load()}, err
+			return Accepted{Accepted: int64(emitted) - rej.total(), Rejected: rej.total()}, err
 		}
 	}
 
-	rej := rejected.Load()
-	accepted := int64(emitted) - rej
-	s.emitAdmission(ctx, sig, accepted, rejectTally{ooo: rej}, 0)
+	total := rej.total()
+	accepted := int64(emitted) - total
+	s.emitAdmission(ctx, sig, accepted, rej, 0, 0)
 
-	return Accepted{Accepted: accepted, Rejected: rej}, nil
+	return Accepted{Accepted: accepted, Rejected: total, RejectedReason: rej.reason()}, nil
 }
 
 // recordFetcher builds a record signal's read seam over the named tenants: owner-aware in cluster

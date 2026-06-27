@@ -192,6 +192,46 @@ func (e *Engine) HeadBytes() int64 {
 	return e.head.bytes
 }
 
+// Stats is an in-memory snapshot of a record engine's state for introspection (no backend I/O).
+type Stats struct {
+	Streams     int64 // distinct streams ever seen (index span: head ∪ flushed)
+	HeadRecords int64 // records currently buffered in the head (unflushed)
+	HeadBytes   int64 // head's buffered record bytes (the in-flight memory measure)
+	Parts       int   // flushed immutable parts
+	MinTime     int64 // oldest flushed record time (unix ns); 0 when no parts
+	MaxTime     int64 // newest record time across parts and the head (unix ns); 0 when empty
+}
+
+// Stats returns an in-memory snapshot of the engine's state under a single read lock (no backend
+// I/O, no decode), safe to poll at dashboard cadence. Part byte sizes are not included.
+func (e *Engine) Stats() Stats {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	s := Stats{
+		Streams:   int64(e.head.series.Len()),
+		HeadBytes: e.head.bytes,
+		Parts:     len(e.parts),
+		MaxTime:   e.head.newest,
+	}
+
+	for _, buf := range e.head.records {
+		s.HeadRecords += int64(buf.len())
+	}
+
+	for i, p := range e.parts {
+		if i == 0 || p.minTime < s.MinTime {
+			s.MinTime = p.minTime
+		}
+
+		if p.maxTime > s.MaxTime {
+			s.MaxTime = p.maxTime
+		}
+	}
+
+	return s
+}
+
 // Fetch implements [fetch.Fetcher] over head ∪ flushed parts: it resolves matchers to streams,
 // gathers each stream's in-window records (decoding only the referenced columns), applies the
 // column conditions and projection, and returns one batch per stream sorted by timestamp.

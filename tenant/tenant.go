@@ -19,9 +19,20 @@ type Limits struct {
 	// Zero ⇒ unlimited.
 	MaxInFlightBytes int64
 	// MaxSeries caps the active series cardinality per tenant: a sample that would mint a new
-	// series past the cap is shed; existing series are unaffected. Zero ⇒ unlimited.
+	// series past the cap is shed (or routed to overflow — see MaxSeriesSoft); existing series
+	// are unaffected. It is the hard ceiling. Zero ⇒ unlimited.
 	MaxSeries int64
-	// MaxPartSize caps an immutable part's size. Zero ⇒ unlimited. (Not yet enforced.)
+	// MaxSeriesSoft, when 0 < MaxSeriesSoft <= MaxSeries, is a soft cardinality budget: past it a
+	// *new* series' samples are routed to a synthetic per-metric overflow series (keeping a tenant's
+	// aggregates approximately correct under a spike) rather than shed, until the hard MaxSeries is
+	// reached. Zero (or with no MaxSeries) ⇒ no soft budget: the cap is a hard reject at MaxSeries.
+	// Metrics only (collapsing a log/trace stream would lose its rows). Note: cardinality here is
+	// monotonic within an engine's lifetime, so once crossed the budget stays in overflow (no
+	// hysteresis); see docs/design/cardinality-overflow.md.
+	MaxSeriesSoft int64
+	// MaxPartSize caps an immutable part's (approximate, uncompressed) size: flush and merge split
+	// their output so no single part exceeds it. It is a structural cap fixed when a tenant's engine
+	// is first created. Zero ⇒ unlimited (one part). Metrics only.
 	MaxPartSize int64
 }
 

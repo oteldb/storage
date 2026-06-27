@@ -193,6 +193,15 @@ func (sw *SegmentWriter) WriteSamples(id signal.SeriesID, ts []int64, values []f
 	return sw.afterWrite(sw.w.WriteSamples(id, ts, values))
 }
 
+// WriteSamplesSF logs a run of samples for one series that also carry per-sample scale factors.
+func (sw *SegmentWriter) WriteSamplesSF(id signal.SeriesID, ts []int64, values, sf []float64) error {
+	if err := sw.prepare(); err != nil {
+		return err
+	}
+
+	return sw.afterWrite(sw.w.WriteSamplesSF(id, ts, values, sf))
+}
+
 // WriteRecords logs a stream's opaque engine-encoded record payload.
 func (sw *SegmentWriter) WriteRecords(id signal.SeriesID, payload []byte) error {
 	if err := sw.prepare(); err != nil {

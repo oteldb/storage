@@ -134,9 +134,38 @@ func writeDoD(w *bitstream.Writer, dod int64) {
 	}
 }
 
-// readDoD reads a delta-of-delta value.
-func readDoD(r *bitstream.Reader) (int64, error) {
-	// Read the unary-ish prefix: count the leading 1 bits up to 4.
+// readDoDPrefix reads the variable-length DoD case selector ("0", "10", "110", "1110", "1111"),
+// returning it in the same low-bit form writeDoD emits. The fast path peeks the ≤4 prefix bits in
+// one shot (no per-bit call); the slow path (a buffer boundary mid-prefix) counts bits with ReadBit.
+func readDoDPrefix(r *bitstream.Reader) (uint8, error) {
+	if r.Buffered() >= 4 {
+		p := uint8(r.Peek(4)) // the 4 high bits, right-justified (0..15)
+
+		switch {
+		case p < 0b1000: // "0"
+			r.Skip(1)
+
+			return 0b0, nil
+		case p < 0b1100: // "10"
+			r.Skip(2)
+
+			return 0b10, nil
+		case p < 0b1110: // "110"
+			r.Skip(3)
+
+			return 0b110, nil
+		case p == 0b1110: // "1110"
+			r.Skip(4)
+
+			return 0b1110, nil
+		default: // "1111"
+			r.Skip(4)
+
+			return 0b1111, nil
+		}
+	}
+
+	// Boundary fallback: count the leading 1 bits up to 4, bit at a time.
 	var d uint8
 
 	for range 4 {
@@ -152,6 +181,16 @@ func readDoD(r *bitstream.Reader) (int64, error) {
 		}
 
 		d |= 1
+	}
+
+	return d, nil
+}
+
+// readDoD reads a delta-of-delta value.
+func readDoD(r *bitstream.Reader) (int64, error) {
+	d, err := readDoDPrefix(r)
+	if err != nil {
+		return 0, err
 	}
 
 	switch d {

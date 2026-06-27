@@ -19,7 +19,7 @@ func TestCompressRoundTrip(t *testing.T) {
 		{"random", makeRandom(4096)},
 		{"zeros", make([]byte, 4096)},
 	}
-	for _, alg := range []Algorithm{AlgorithmNone, AlgorithmZSTD} {
+	for _, alg := range []Algorithm{AlgorithmNone, AlgorithmZSTD, AlgorithmLZ4} {
 		for _, tc := range cases {
 			t.Run(tc.name+"/"+alg.String(), func(t *testing.T) {
 				t.Parallel()
@@ -30,6 +30,34 @@ func TestCompressRoundTrip(t *testing.T) {
 				assert.Equal(t, tc.data, got)
 			})
 		}
+	}
+}
+
+func TestCompressLZ4Shrinks(t *testing.T) {
+	t.Parallel()
+	data := makeRepetitive(8192, "hello world! ")
+	c := NewCompressor(AlgorithmLZ4, LevelDefault)
+	compressed := c.Compress(nil, data)
+	assert.Less(t, len(compressed), len(data), "LZ4 should shrink repetitive data")
+	assert.Equal(t, FlagCompressed, compressed[0])
+
+	got, err := c.Decompress(nil, compressed)
+	require.NoError(t, err)
+	assert.Equal(t, data, got)
+}
+
+// TestDecompressLZ4Malformed feeds a FlagCompressed body with a bogus length/block and asserts the
+// decompressor never panics (best-effort, like the zstd path).
+func TestDecompressLZ4Malformed(t *testing.T) {
+	t.Parallel()
+	c := NewCompressor(AlgorithmLZ4, LevelDefault)
+	for _, body := range [][]byte{
+		{FlagCompressed},                           // no length
+		{FlagCompressed, 0xff, 0xff, 0xff, 0xff},   // huge length, no block
+		append([]byte{FlagCompressed, 8}, 0xab, 1), // length 8, garbage block
+	} {
+		_, err := c.Decompress(nil, body)
+		_ = err // must not panic; error or empty result is acceptable
 	}
 }
 
