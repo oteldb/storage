@@ -241,46 +241,36 @@ func fillFloat64Stats(d *ColumnDesc, vals []float64) {
 		return
 	}
 
+	// All-same (Const) detection: bail on the first differing bit pattern, so varied data pays O(1)
+	// here. An all-constant column is its own min and max (NaN included, matching the prior
+	// behavior), so it needs no min/max scan.
 	firstBits := math.Float64bits(vals[0])
 	allSame := true
 
-	var lo, hi float64
-
-	haveReal := false
-
-	for _, v := range vals {
+	for _, v := range vals[1:] {
 		if math.Float64bits(v) != firstBits {
 			allSame = false
-		}
 
-		if math.IsNaN(v) {
-			continue
-		}
-
-		if !haveReal {
-			lo, hi, haveReal = v, v, true
-
-			continue
-		}
-
-		if v < lo {
-			lo = v
-		}
-
-		if v > hi {
-			hi = v
+			break
 		}
 	}
 
-	if !haveReal { // all-NaN column
+	if allSame {
+		d.MinFloat64, d.MaxFloat64 = vals[0], vals[0]
+		d.Const = true
+		d.ConstFloat64 = vals[0]
+
+		return
+	}
+
+	// Min/max ignoring NaN, vectorized (SIMD). The (+Inf, -Inf) sentinel (min > max) means every
+	// value was NaN, for which there is no meaningful range — fall back to the first value.
+	lo, hi := simd.MinMaxFloat64(vals)
+	if lo > hi {
 		lo, hi = vals[0], vals[0]
 	}
 
 	d.MinFloat64, d.MaxFloat64 = lo, hi
-	if allSame {
-		d.Const = true
-		d.ConstFloat64 = vals[0]
-	}
 }
 
 func fillBytesConst(d *ColumnDesc, vals [][]byte) {

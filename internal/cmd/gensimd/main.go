@@ -18,6 +18,7 @@ func main() {
 	ConstraintExpr("amd64")
 
 	genMinMaxInt64()
+	genMinMaxFloat64()
 
 	Generate()
 }
@@ -128,5 +129,116 @@ func genMinMaxInt64() {
 	Label("done")
 	Store(mn, ReturnIndex(0))
 	Store(mx, ReturnIndex(1))
+	RET()
+}
+
+// genMinMaxFloat64 emits minMaxFloat64AVX2(s []float64) (rmin, rmax float64): the min and max of s
+// ignoring NaN, four lanes at a time. NaN lanes are replaced with +Inf before VMINPD and -Inf
+// before VMAXPD (so they never affect the result), the accumulators start at (+Inf, -Inf), and the
+// scalar tail skips NaN — so an all-NaN (or empty) slice returns (+Inf, -Inf), the sentinel the
+// caller treats as "no real values". min/max are order-independent, so the result is bit-identical
+// to the pure-Go reference.
+func genMinMaxFloat64() {
+	TEXT("minMaxFloat64AVX2", NOSPLIT, "func(s []float64) (rmin, rmax float64)")
+	Doc("minMaxFloat64AVX2 returns the min and max of s ignoring NaN, using AVX2; all-NaN ⇒ (+Inf, -Inf).")
+
+	ptr := Load(Param("s").Base(), GP64())
+	n := Load(Param("s").Len(), GP64())
+
+	// +Inf / -Inf bit patterns, broadcast to YMM.
+	posBits := GP64()
+	MOVQ(U64(0x7FF0000000000000), posBits)
+	negBits := GP64()
+	MOVQ(U64(0xFFF0000000000000), negBits)
+
+	xPos := XMM()
+	MOVQ(posBits, xPos)
+	xNeg := XMM()
+	MOVQ(negBits, xNeg)
+
+	vPos := YMM()
+	VPBROADCASTQ(xPos, vPos)
+	vNeg := YMM()
+	VPBROADCASTQ(xNeg, vNeg)
+
+	vmin := YMM()
+	VMOVDQU(vPos, vmin) // running min = +Inf
+	vmax := YMM()
+	VMOVDQU(vNeg, vmax) // running max = -Inf
+
+	i := GP64()
+	XORQ(i, i)
+
+	limit := GP64()
+	MOVQ(n, limit)
+	SUBQ(Imm(3), limit) // i < n-3  ⇔  i+4 <= n (signed compare handles n<4)
+
+	v := YMM()
+	nanmask := YMM()
+	blended := YMM()
+
+	Label("vecloop")
+	CMPQ(i, limit)
+	JGE(LabelRef("vecdone"))
+
+	VMOVUPD(Mem{Base: ptr, Index: i, Scale: 8}, v)
+
+	// nanmask lane = all-ones where v is NaN (VCMPPD predicate 3 = unordered).
+	VCMPPD(Imm(3), v, v, nanmask)
+
+	// vmin = min(vmin, NaN?+Inf:v)
+	VBLENDVPD(nanmask, vPos, v, blended)
+	VMINPD(blended, vmin, vmin)
+
+	// vmax = max(vmax, NaN?-Inf:v)
+	VBLENDVPD(nanmask, vNeg, v, blended)
+	VMAXPD(blended, vmax, vmax)
+
+	ADDQ(Imm(4), i)
+	JMP(LabelRef("vecloop"))
+
+	Label("vecdone")
+
+	// Spill the 4 lanes and fold with scalar SSE (lanes are NaN-free after the blend).
+	bufMin := AllocLocal(32)
+	bufMax := AllocLocal(32)
+	VMOVDQU(vmin, bufMin)
+	VMOVDQU(vmax, bufMax)
+	VZEROUPPER() // avoid the AVX↔legacy-SSE transition penalty before the scalar fold/tail
+
+	rmin := XMM()
+	MOVSD(bufMin.Offset(0), rmin)
+	rmax := XMM()
+	MOVSD(bufMax.Offset(0), rmax)
+
+	for lane := 1; lane < 4; lane++ {
+		lo := XMM()
+		MOVSD(bufMin.Offset(lane*8), lo)
+		MINSD(lo, rmin)
+
+		hi := XMM()
+		MOVSD(bufMax.Offset(lane*8), hi)
+		MAXSD(hi, rmax)
+	}
+
+	// Scalar tail with NaN skip.
+	Label("tail")
+	CMPQ(i, n)
+	JGE(LabelRef("done"))
+
+	t := XMM()
+	MOVSD(Mem{Base: ptr, Index: i, Scale: 8}, t)
+	UCOMISD(t, t) // sets PF when t is NaN (unordered)
+	JP(LabelRef("tailnext"))
+	MINSD(t, rmin)
+	MAXSD(t, rmax)
+
+	Label("tailnext")
+	ADDQ(Imm(1), i)
+	JMP(LabelRef("tail"))
+
+	Label("done")
+	Store(rmin, ReturnIndex(0))
+	Store(rmax, ReturnIndex(1))
 	RET()
 }
