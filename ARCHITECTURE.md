@@ -105,6 +105,21 @@ consulting the column's `Codec`. All byte-column decoders bound every length/cou
 stream before allocating and reject out-of-range dictionary ids, so decode never panics on corrupt
 input (fuzzed). Wire layouts are pinned by golden files (`_golden/`, via `go-faster/sdk/gold`).
 
+**Adaptive float codec (lossless and lossy).** The value column is not pinned to one codec: the part
+writer (`block.Column.AutoCodec`) trial-encodes both float codecs and keeps the **smaller**, recording
+the winner in the column descriptor so the reader dispatches correctly. In the **lossless** regime
+(`FloatPrecisionBits == 0`) the scaled-decimal codec is taken only when it is smaller *and* a
+verification decode reproduces the values (numeric equality, so NaN/±Inf and any precision loss keep
+Gorilla) — this is what makes an integer-valued counter or a clean low-precision gauge land near a byte
+per point while a high-entropy gauge stays on Gorilla, the lossless floor. The scaled-decimal codec
+itself rounds (not truncates) to its base-10 scale and decodes by dividing by an exact power of ten, so
+clean decimals round-trip bit-for-bit (a spurious `-0` may surface as `+0`, numerically identical for a
+metric). In the **lossy** regime (`FloatPrecisionBits` in 1..63, set per age tier by the merge engine —
+§3f) the decimal codec retains only that many significant mantissa bits but still competes against
+lossless Gorilla, so a lossy tier is never worse than lossless. The budget is persisted in the manifest
+(below) as the merge fixed point. Note the lossy error is in the **delta** domain, so it accumulates
+mildly along a long series — a property of nearest-delta compression.
+
 Dictionary codec specifics (the most built-out):
 - `DecodeBytes` materializes one `[]byte` header per row (the gather form).
 - `DictColumn` + `DecodeBytesDict` are the **split form**: unique `Entries` plus the raw
@@ -219,8 +234,12 @@ columns it references (projection pushdown without ranged reads):
   decodes on demand: `Int64`/`Float64`/`ID128` into a reusable slice, `Bytes` into
   `chunk.DictColumn` split form, and synthesizes constants with no I/O.
 - **Manifest** (`manifest.go`) is a versioned binary record (magic `OTPM`, version, row
-  count, time range, granule size, per-column descriptors) with a trailing CRC32C. Decode
-  bounds-checks every field and never panics (fuzzed).
+  count, time range, granule size, per-column descriptors) with a trailing CRC32C. Each column
+  descriptor is `[name][kind][codec][compress][flags]` then, **only when `flagLossy` is set**, one
+  `FloatPrecisionBits` byte (the lossy precision budget — §2.2/§3f), then the per-kind stats/const.
+  The precision byte is flag-gated, so lossless columns and pre-existing parts keep their exact
+  byte-for-byte layout (no version bump, no golden churn). Decode bounds-checks every field and never
+  panics (fuzzed).
 - **Marks** (`marks.go`) is the sparse granule index over the sort-key (timestamp)
   column: per-granule first row + min/max, delta-encoded, CRC-checked. `Overlapping(lo,hi)`
   prunes granules for a time window (used by the future fetcher).
@@ -396,9 +415,10 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
 - **Part fetch** (`part.go`) — `openPart` rebuilds a `SeriesID → [rowStart,rowEnd)` index
   by scanning the series column once (each series is one contiguous run); `mergeInto`
   decodes a series' `ts`/`value` sub-slice within the window.
-- **Merge — compaction + retention + downsampling + recompression** (`merge.go`, `downsample.go`,
-  `recompress.go`) is the one background-merge engine; all four modes are one pass over the immutable
-  parts (no separate subsystem). `MergeWith(MergeOptions{RetainFrom, Downsample, Recompress})` (and
+- **Merge — compaction + retention + downsampling + recompression + precision** (`merge.go`,
+  `downsample.go`, `recompress.go`, `precision.go`) is the one background-merge engine; all five modes
+  are one pass over the immutable parts (no separate subsystem). `MergeWith(MergeOptions{RetainFrom,
+  Downsample, Recompress, Precision})` (and
   the convenience `Merge(retainFrom)`) compacts every part into one, merging samples per series by
   timestamp (freshest wins on a tie), dropping samples older than the absolute `retainFrom` cutoff,
   **downsampling** the survivors by the supplied tiers, and — when the merged part is **fully cold**
@@ -417,8 +437,16 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   ([storage.Storage]) resolves the tenant's `tenant.Downsample` policy against one `now` per pass.
   Bucket alignment is to the absolute grid (not ingest time), so the rollup of a range is independent
   of when the merge runs and repeated merges are a **fixed point** for last/first/min/max/sum/avg (a
-  one-sample bucket aggregates to itself); count is the documented non-idempotent exception. Records
-  (logs/traces/profiles) carry retention only — downsampling and recompression are metrics-specific.
+  one-sample bucket aggregates to itself); count is the documented non-idempotent exception.
+  **Precision** is age-tiered *lossy* float compression: a `PrecisionTier{Before, Bits}` re-encodes a
+  **fully-cold** part's value column with the scaled-decimal codec retaining only `Bits` significant
+  mantissa bits (fewer ⇒ denser, less accurate), so recent data stays lossless and only old data
+  trades accuracy for size. It is per-part (decided from the merged part's newest sample, like
+  recompression), never worse than lossless (the adaptive encoder keeps whichever of Gorilla/decimal
+  is smaller — §2.2), and reaches a **fixed point** via the budget recorded in the manifest (a part
+  already at or below the target budget is not rewritten). Records
+  (logs/traces/profiles) carry retention only — downsampling, recompression and precision are
+  metrics-specific.
 - **Fetch** (`engine.go`) implements the fetch contract: it resolves matchers to series
   over the index, then merges each series' head buffer ∪ every part by timestamp into one
   batch. `Close` flushes the head. `Reset(ctx)` is the inverse of accumulation: it replaces
@@ -977,7 +1005,9 @@ query-language path stays in the embedder. The `Write*` methods take the library
   codec) — see §3c.
 - **`tenant`** — policy model: `Limits` (admission valves — §3k), `Retention`, `Downsample` (a list
   of `DownsampleTier{After, Interval, Agg}` rollup bands, applied at merge time — §3f), `Sampling`
-  (the lossy budget — §3k), `Recompress` (cold-data zstd recompression at merge — §3f), and the
+  (the lossy budget — §3k), `Recompress` (cold-data zstd recompression at merge — §3f), `Precision`
+  (a list of `PrecisionTier{After, Bits}` age-banded *lossy* float-precision budgets, applied at merge
+  so only old data trades accuracy for size — §3f), and the
   composed `Policy`, resolved per tenant id through a `Resolver` (`ResolverFunc` adapter;
   `Default()` returns an empty-policy resolver). Multi-tenancy, retention, and
   downsampling are consumer-supplied callbacks keyed by tenant id.
@@ -1065,7 +1095,7 @@ signal/               typed Attributes/Value, Resource/Scope/Series identity, 12
   signal/trace        []byte-based OTLP-shaped Traces ingest batch (resettable/pooled) + span schema + projection (nested-set, events/links) [implemented]
   signal/profile      []byte-based OTLP-shaped Profiles ingest batch + sample schema (type folded into identity) + projection + content-addressed symbol store (SideStore) + stack Resolver [implemented]
 otlp/pdataconv        optional OTel-Go bridge: pmetric.Metrics → metric.Metrics; gauge/sum direct + histogram/exp-histogram/summary classic decomposition (only package importing pdata) [implemented]
-tenant/               Limits/Retention/Downsample/Sampling/Recompress/Policy, Resolver             [implemented]
+tenant/               Limits/Retention/Downsample/Sampling/Recompress/Precision/Policy, Resolver     [implemented]
 backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + memory (root) [implemented]
   backend/file        directory-tree backend; atomic write + exclusive PutIfAbsent (os.Link) [implemented]
   backend/s3          object-store-native backend over ObjectStore + aws-sdk-go-v2 adapter   [implemented; in-process go-faster/fs S3 integration test]

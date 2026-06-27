@@ -23,6 +23,11 @@ type MergeOptions struct {
 	// compaction, retention, and downsampling, still one pass over the parts. nil keeps the
 	// default (codec-only) compression.
 	Recompress *RecompressSpec
+	// Precision, when non-empty, re-encodes a cold part's value column lossily at merge — fewer
+	// significant mantissa bits for older data (age-tiered) — the fifth merge mode, still one
+	// pass. The cutoffs are absolute (the caller resolves now − After into Before). Empty keeps
+	// every part lossless.
+	Precision []PrecisionTier
 }
 
 // DownsampleTier is the absolute (wall-clock-free) form of a tenant downsampling tier: every

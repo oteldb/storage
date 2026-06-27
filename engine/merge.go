@@ -80,7 +80,8 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	// A single part with no retention cutoff, nothing old enough to downsample, and nothing to
 	// recompress has nothing to gain — skip without decoding it.
 	if len(src) == 0 || (len(src) == 1 && opts.RetainFrom <= 0 &&
-		!downsampleApplies(opts.Downsample, src[0].minTime) && !recompressApplies(src[0], opts.Recompress)) {
+		!downsampleApplies(opts.Downsample, src[0].minTime) && !recompressApplies(src[0], opts.Recompress) &&
+		!precisionApplies(src[0], opts.Precision)) {
 		e.reclaimRetired(ctx)
 
 		return 0, nil
@@ -99,9 +100,10 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	}
 
 	// Fixed point: a single source part whose row count downsampling did not reduce, and which
-	// needs no recompression, is already at its target — rewriting it would only churn the backend.
+	// needs neither recompression nor precision coarsening, is already at its target — rewriting it
+	// would only churn the backend.
 	if len(src) == 1 && opts.RetainFrom <= 0 && len(cols.ts) == src[0].rows() &&
-		!recompressApplies(src[0], opts.Recompress) {
+		!recompressApplies(src[0], opts.Recompress) && !precisionApplies(src[0], opts.Precision) {
 		e.reclaimRetired(ctx)
 
 		return 0, nil
@@ -113,8 +115,11 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 		minT, maxT := colsTimeRange(cols)
 		prefix := e.partPrefix(seq)
 
-		// Recompress when the merged part is fully cold (its newest sample predates the cutoff).
-		if err := writePart(ctx, e.cfg.Backend, prefix, cols, coldProfile(opts.Recompress, maxT)); err != nil {
+		// Recompress and/or coarsen precision when the merged part is fully cold (its newest sample
+		// predates the respective cutoff). Both are age-tiered and decided from the merged part's
+		// newest sample so the choice is deterministic.
+		if err := writePart(ctx, e.cfg.Backend, prefix, cols,
+			coldProfile(opts.Recompress, maxT), pickPrecision(opts.Precision, maxT)); err != nil {
 			return 0, err
 		}
 

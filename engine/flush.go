@@ -89,8 +89,9 @@ const (
 
 // writePart writes cols as a metric part under prefix via [block.PartWriter]. A non-nil comp
 // rewrites the part with a higher-ratio compression profile (recompression of cold data); nil
-// keeps the default codec-only framing.
-func writePart(ctx context.Context, b backend.Backend, prefix string, cols *flushColumns, comp *RecompressSpec) error {
+// keeps the default codec-only framing. precisionBits in 1..63 encodes the value column lossily
+// (age-tiered precision, set by the merge engine for cold data); 0 keeps it lossless.
+func writePart(ctx context.Context, b backend.Backend, prefix string, cols *flushColumns, comp *RecompressSpec, precisionBits uint8) error {
 	opts := []block.PartOption{block.WithSortKey(colTs)}
 	if comp != nil {
 		opts = append(opts, block.WithCompression(comp.Algorithm), block.WithCompressionLevel(comp.Level))
@@ -105,7 +106,14 @@ func writePart(ctx context.Context, b backend.Backend, prefix string, cols *flus
 		return err
 	}
 
-	if err := w.AddColumn(block.Column{Name: colValue, Kind: block.KindFloat64, Float64: cols.value}); err != nil {
+	// AutoCodec lets the part writer pick the denser float codec per part: an integer-valued or
+	// low-precision value column (e.g. a counter) takes the scaled-decimal path, a high-entropy
+	// one keeps Gorilla. precisionBits > 0 additionally allows a lossy (age-tiered) decimal
+	// encoding for cold data, traded against lossless Gorilla so it is never worse.
+	if err := w.AddColumn(block.Column{
+		Name: colValue, Kind: block.KindFloat64, Float64: cols.value,
+		AutoCodec: true, FloatPrecisionBits: precisionBits,
+	}); err != nil {
 		return err
 	}
 

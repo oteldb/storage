@@ -28,6 +28,18 @@ type Column struct {
 	Int128   []chunk.U128
 	Codec    chunk.Codec
 	Compress compress.Algorithm
+	// AutoCodec, when set on a float64 column with no explicit Codec, picks the smaller of the
+	// lossless float codecs (Gorilla XOR vs scaled-decimal+delta) by trial-encoding — so an
+	// integer-valued or low-precision column (e.g. a counter) takes the far denser decimal path
+	// while a high-entropy column keeps Gorilla. Lossless either way (see [chooseFloatCodec]).
+	AutoCodec bool
+	// FloatPrecisionBits, when in 1..63 on an AutoCodec float column, requests *lossy* encoding:
+	// the scaled-decimal codec retains only this many significant mantissa bits (fewer ⇒ denser,
+	// less accurate), competing against lossless Gorilla so the result is never worse than
+	// lossless. 0 (or ≥64) means lossless. The budget is recorded in the descriptor so the merge
+	// engine reaches a fixed point (it never re-applies a budget it has already met). Set per age
+	// tier by the merge engine so only old data trades accuracy for size.
+	FloatPrecisionBits uint8
 }
 
 // rows returns the column's row count from the active typed slice.
@@ -93,12 +105,100 @@ func buildColumn(c Column, comp *compress.Compressor) (ColumnDesc, []byte, error
 		return desc, nil, nil
 	}
 
+	// Adaptive float codec: when opted in and no codec was forced, pick the smaller encoding and
+	// record the winner (and the lossy budget, if any) in the descriptor so the reader dispatches
+	// correctly and the merge engine can reach its precision fixed point.
+	if c.AutoCodec && c.Kind == KindFloat64 && c.Codec == chunk.CodecNone {
+		budget := c.FloatPrecisionBits
+		if budget >= 64 {
+			budget = 0 // ≥64 bits is lossless; normalize to the lossless sentinel
+		}
+
+		var stream []byte
+		codec, stream = chooseFloatCodec(c.Float64, comp, budget)
+		desc.Codec = codec
+		desc.FloatPrecisionBits = budget
+
+		return desc, comp.Compress(nil, stream), nil
+	}
+
 	stream, err := encodeStream(c, codec)
 	if err != nil {
 		return ColumnDesc{}, nil, err
 	}
 
 	return desc, comp.Compress(nil, stream), nil
+}
+
+// chooseFloatCodec picks the denser float encoding for vals, returning the winning codec and its
+// encoded (pre-block-compression) stream. Gorilla XOR is always lossless and is the floor.
+//
+// budget == 0 selects the lossless regime: the scaled-decimal codec is taken only when it is
+// strictly smaller after block compression AND a verification decode reproduces vals (so an
+// integer/low-precision column compresses far better, never risking precision).
+//
+// budget in 1..63 selects the lossy regime requested by an age tier: the scaled-decimal codec
+// retains only budget significant bits, trading accuracy for size. It is offered only for all-
+// finite columns (it cannot represent NaN/±Inf) and chosen only when actually smaller than
+// Gorilla — so even in a lossy tier a column that compresses better losslessly stays lossless.
+// Sizes are compared post-compression via comp so the choice reflects the bytes actually written.
+func chooseFloatCodec(vals []float64, comp *compress.Compressor, budget uint8) (chunk.Codec, []byte) {
+	gorilla := chunk.EncodeFloats(nil, vals)
+	bestStream, bestCodec := gorilla, chunk.CodecGorilla
+	bestSize := len(comp.Compress(nil, gorilla))
+
+	if budget == 0 {
+		decimal := chunk.EncodeFloatsDecimal(nil, vals, decimalPrecisionLossless)
+		if len(comp.Compress(nil, decimal)) < bestSize && decimalRoundTrips(decimal, vals) {
+			bestStream, bestCodec = decimal, chunk.CodecDecimal
+		}
+
+		return bestCodec, bestStream
+	}
+
+	if floatsAllFinite(vals) {
+		decimal := chunk.EncodeFloatsDecimal(nil, vals, budget)
+		if len(comp.Compress(nil, decimal)) < bestSize {
+			bestStream, bestCodec = decimal, chunk.CodecDecimal
+		}
+	}
+
+	return bestCodec, bestStream
+}
+
+// floatsAllFinite reports whether vals contains no NaN or ±Inf — the precondition for the
+// scaled-decimal codec, which cannot represent non-finite values.
+func floatsAllFinite(vals []float64) bool {
+	for _, v := range vals {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// decimalRoundTrips reports whether the scaled-decimal stream decodes back to vals with no loss
+// of metric value. It is the lossless guard for the adaptive choice: a column the decimal codec
+// cannot represent is left on Gorilla. The comparison is IEEE numeric equality, which rejects
+// any real precision loss and (because NaN ≠ NaN) any NaN, while tolerating the single harmless
+// divergence the codec can introduce — negative zero decoding to positive zero. −0 and +0 are
+// numerically identical and indistinguishable to every metric query, so collapsing a spurious −0
+// (typically a rounding artifact) to +0 is value-preserving and lets a whole column take the far
+// denser decimal path instead of being poisoned by one −0.
+func decimalRoundTrips(stream []byte, vals []float64) bool {
+	got, _, err := chunk.DecodeFloatsDecimal(nil, stream)
+	if err != nil || len(got) != len(vals) {
+		return false
+	}
+
+	for i := range vals {
+		if got[i] != vals[i] {
+			return false
+		}
+	}
+
+	return true
 }
 
 func encodeStream(c Column, codec chunk.Codec) ([]byte, error) {

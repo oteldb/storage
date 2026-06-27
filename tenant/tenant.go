@@ -85,6 +85,37 @@ type Recompress struct {
 	Level int
 }
 
+// PrecisionTier makes a part's value column lossy once its data reaches a given age: a part fully
+// older than After is re-encoded, at merge, retaining only Bits significant mantissa bits
+// (scaled-decimal). Fewer bits ⇒ better compression, less accuracy. A tier with Bits == 0 or
+// Bits ≥ 64 is lossless and ignored.
+//
+// Tiers coarsen old data (configure increasing After with decreasing Bits, e.g. 32 bits after
+// 7d, 16 bits after 30d). A part takes the most aggressive tier whose After it has exceeded; data
+// younger than every tier's After stays lossless. It rides the same background-merge engine — no
+// separate subsystem — and is never worse than lossless Gorilla (the encoder keeps whichever is
+// smaller), so a tier can only help size.
+//
+// Bits is significant mantissa bits of the value, not decimal places: ~16 bits keeps roughly 4–5
+// significant decimal digits, ~24 bits ~7 digits. Counters and clean low-precision gauges are
+// already near-lossless dense, so precision tiers mainly help noisy/high-entropy gauges where some
+// accuracy on old data can be traded for size.
+type PrecisionTier struct {
+	// After is the age past which this tier applies (relative to now at merge time).
+	After time.Duration
+	// Bits is the significant mantissa bits to retain (1..63). 0 or ≥64 ⇒ lossless (ignored).
+	Bits uint8
+}
+
+// Precision is the per-tenant lossy float-compression policy: age-tiered value-column precision
+// applied at merge, so recent data stays lossless and only old data trades accuracy for size.
+// Optional and per-tenant; an empty Tiers list keeps every part lossless.
+type Precision struct {
+	// Tiers are the age-banded precision budgets. Order does not matter; the engine assigns each
+	// part the most aggressive applicable tier.
+	Tiers []PrecisionTier
+}
+
 // Policy is the resolved policy for a tenant: limits, retention, downsampling, sampling,
 // recompression, and routing. It is the return value of [Resolver.Resolve].
 type Policy struct {
@@ -93,6 +124,7 @@ type Policy struct {
 	Downsample Downsample
 	Sampling   Sampling
 	Recompress Recompress
+	Precision  Precision
 	// RoutingHints TODO(M6): per-tenant shard placement / zone preferences.
 }
 

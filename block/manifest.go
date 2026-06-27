@@ -55,6 +55,10 @@ const (
 
 	// flagConst marks a constant-collapsed column (single value, no data object).
 	flagConst byte = 1 << 0
+	// flagLossy marks a float column carrying a non-zero lossy precision budget; when set, one
+	// byte (FloatPrecisionBits) follows the flags byte. Absent on lossless columns, so existing
+	// parts and the common path keep their exact layout.
+	flagLossy byte = 1 << 1
 )
 
 // ErrCorrupt is returned when a manifest (or any part metadata) fails to parse:
@@ -81,6 +85,13 @@ type ColumnDesc struct {
 	// Numeric min/max (KindInt64/KindFloat64). Unused for KindBytes.
 	MinInt64, MaxInt64     int64
 	MinFloat64, MaxFloat64 float64
+
+	// FloatPrecisionBits is the lossy precision budget a float column was encoded under (the
+	// significant mantissa bits retained): 0 ⇒ lossless. Persisted only when non-zero (a
+	// flag-gated byte), so lossless parts keep their byte-for-byte layout. The merge engine reads
+	// it as the fixed point for age-tiered precision — it never re-coarsens a part already at or
+	// below the target budget.
+	FloatPrecisionBits uint8
 }
 
 // Manifest is the part descriptor: format version, row count, time range, granule size,
@@ -100,7 +111,7 @@ type Manifest struct {
 //	[u32 magic][uvarint version][uvarint rowCount][varint minTime][varint maxTime]
 //	[uvarint granuleSize][uvarint colCount]
 //	  per column: [uvarint nameLen][name][byte kind][byte codec][byte compress][byte flags]
-//	              [numeric min/max per kind][const value per kind if flagConst]
+//	              [byte precisionBits if flagLossy][numeric min/max per kind][const value per kind if flagConst]
 //	[u32 CRC32C over all the above]
 func (m Manifest) Encode(dst []byte) []byte {
 	start := len(dst)
@@ -127,7 +138,15 @@ func (m Manifest) Encode(dst []byte) []byte {
 			flags |= flagConst
 		}
 
+		if c.FloatPrecisionBits != 0 {
+			flags |= flagLossy
+		}
+
 		_ = w.WriteByte(flags)
+
+		if flags&flagLossy != 0 {
+			_ = w.WriteByte(c.FloatPrecisionBits)
+		}
 
 		switch c.Kind {
 		case KindInt64:
@@ -285,6 +304,15 @@ func decodeColumnDesc(r *bitstream.Reader) (ColumnDesc, error) {
 	}
 
 	c.Const = flags&flagConst != 0
+
+	if flags&flagLossy != 0 {
+		bits, err := r.ReadByte()
+		if err != nil {
+			return c, errors.Wrap(ErrCorrupt, "precisionBits")
+		}
+
+		c.FloatPrecisionBits = bits
+	}
 
 	switch c.Kind {
 	case KindInt64:

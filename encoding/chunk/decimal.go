@@ -115,9 +115,8 @@ func DecodeFloatsDecimal(dst []float64, src []byte) ([]float64, int, error) {
 	}
 
 	// Convert back to floats.
-	scale := math.Pow(10, float64(exp))
 	for i, v := range scaled {
-		dst[i] = decimalToFloat(v, scale)
+		dst[i] = decimalToFloat(v, exp)
 	}
 
 	_ = precisionBits // precision only affects encoding (lossy); decode is the same
@@ -204,11 +203,16 @@ func floatToDecimal(f float64) (int64, int) {
 		e      int
 	)
 
+	// Round to nearest (not truncate) so a clean decimal survives the scaling and strips back to
+	// a small mantissa: 42.3 → round(42.3·1e12)=4.23e13 → strip → 423·10⁻². Truncation would
+	// land on 422999999999xx and never strip, inflating the mantissa (and the encoded size) for
+	// every realistic fractional gauge. Rounding is also a strictly closer approximation, so it
+	// only improves the fractional round-trip.
 	if f < 1e6 {
-		scaled = int64(f * 1e12)
+		scaled = int64(math.Round(f * 1e12))
 		e = -12
 	} else {
-		scaled = int64(f * 1e6)
+		scaled = int64(math.Round(f * 1e6))
 		e = -6
 	}
 
@@ -225,8 +229,12 @@ func floatToDecimal(f float64) (int64, int) {
 	return scaled, e
 }
 
-// decimalToFloat converts (mantissa, scale) back to a float64.
-func decimalToFloat(v int64, scale float64) float64 {
+// decimalToFloat converts a (mantissa, base-10 exponent) pair back to a float64. For a
+// negative exponent it divides by the exact integer power of ten (10^|exp| is exact in
+// float64 for |exp| ≤ 22) rather than multiplying by its inexact reciprocal — so a clean
+// decimal like 423·10⁻² decodes to 4.23 bit-for-bit, the property the adaptive codec relies on
+// to choose the decimal path losslessly for realistic fractional gauges.
+func decimalToFloat(v int64, exp int) float64 {
 	// Handle special sentinel values from floatToDecimal.
 	switch v {
 	case math.MaxInt64:
@@ -237,7 +245,14 @@ func decimalToFloat(v int64, scale float64) float64 {
 		return 0
 	}
 
-	return float64(v) * scale
+	switch {
+	case exp == 0:
+		return float64(v)
+	case exp > 0:
+		return float64(v) * math.Pow10(exp)
+	default:
+		return float64(v) / math.Pow10(-exp)
+	}
 }
 
 // nearestDelta zeros the trailing low bits of a delta to make the varint stream

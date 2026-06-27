@@ -624,7 +624,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	rows := len(cols.ts)
 	prefix := e.partPrefix(seq)
 
-	if err := writePart(ctx, e.cfg.Backend, prefix, cols, nil); err != nil {
+	if err := writePart(ctx, e.cfg.Backend, prefix, cols, nil, 0); err != nil {
 		return 0, err
 	}
 

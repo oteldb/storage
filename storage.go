@@ -1087,7 +1087,25 @@ func (s *Storage) metricMergeOptions(tid signal.TenantID) engine.MergeOptions {
 		}
 	}
 
-	return engine.MergeOptions{RetainFrom: retentionCutoff(p.Retention, now), Downsample: tiers, Recompress: recompress}
+	var precision []engine.PrecisionTier
+
+	for _, t := range p.Precision.Tiers {
+		if t.Bits == 0 || t.Bits >= 64 {
+			continue
+		}
+
+		precision = append(precision, engine.PrecisionTier{
+			Before: now - t.After.Nanoseconds(),
+			Bits:   t.Bits,
+		})
+	}
+
+	return engine.MergeOptions{
+		RetainFrom: retentionCutoff(p.Retention, now),
+		Downsample: tiers,
+		Recompress: recompress,
+		Precision:  precision,
+	}
 }
 
 // engineSnapshot returns the current tenant engines (a copy, so callers iterate without
