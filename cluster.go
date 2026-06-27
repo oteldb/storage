@@ -20,8 +20,10 @@ import (
 	"github.com/oteldb/storage/cluster/replica"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/obs"
+	"github.com/oteldb/storage/internal/retry"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/recordengine"
+	"github.com/oteldb/storage/reliability"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
 	"github.com/oteldb/storage/wal"
@@ -39,7 +41,8 @@ type clusterNode struct {
 	listener   net.Listener
 	self       string // this node's address
 	rf         int
-	shards     int // metric shards per tenant (≤1 ⇒ one shard = the tenant)
+	shards     int                     // metric shards per tenant (≤1 ⇒ one shard = the tenant)
+	retry      reliability.RetryConfig // transport reliability profile (timeouts, retries, hedging)
 }
 
 // shardCount is the configured metric shards per tenant, clamped to a minimum of 1.
@@ -105,8 +108,12 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 		return errors.Wrap(err, "etcd client")
 	}
 
-	// The replicator applies an inbound (or local) write to the addressed tenant's engine.
-	rp := replica.New(cfg.Self.Addr, replica.NewHTTPTransport(nil), s.applyReplicated)
+	rc := s.opts.retryConfig()
+	httpc := newClusterHTTPClient(rc)
+
+	// The replicator applies an inbound (or local) write to the addressed tenant's engine. Its
+	// transport shares the tuned client (connection timeouts) so replication tolerates a slow peer.
+	rp := replica.New(cfg.Self.Addr, replica.NewHTTPTransport(httpc), s.applyReplicated)
 
 	var lc net.ListenConfig
 
@@ -145,12 +152,13 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 		membership: mship,
 		ownership:  etcd.NewOwnership(client, root, cfg.Self.ID, mship.LeaseID()),
 		replicator: rp,
-		httpc:      http.DefaultClient,
+		httpc:      httpc,
 		server:     srv,
 		listener:   ln,
 		self:       cfg.Self.Addr,
 		rf:         rf,
 		shards:     cfg.ShardsPerTenant,
+		retry:      rc,
 	}
 
 	return nil
@@ -211,11 +219,11 @@ func (s *Storage) shardFetcher(shardKey signal.TenantID) fetch.Fetcher {
 		}
 
 		if addr != "" {
-			remotes = append(remotes, cluster.NewRemoteFetcher(signal.Metric, addr, nil))
+			remotes = append(remotes, cluster.NewRemoteFetcher(signal.Metric, addr, cn.httpc))
 		}
 	}
 
-	return &filteringFetcher{inner: failoverFetcher(remotes)}
+	return &filteringFetcher{inner: hedgedFetcher{store: s, op: rpcOpRead, remotes: remotes}}
 }
 
 // localLogFetch serves a peer's log fetch from the local log engine, pushing down the (equality)
@@ -416,11 +424,11 @@ func (s *Storage) clusterRecordFetcherFor(
 		}
 
 		if addr != "" {
-			remotes = append(remotes, cluster.NewRemoteFetcher(sig, addr, nil))
+			remotes = append(remotes, cluster.NewRemoteFetcher(sig, addr, cn.httpc))
 		}
 	}
 
-	return &filteringFetcher{inner: failoverFetcher(remotes)}
+	return &filteringFetcher{inner: hedgedFetcher{store: s, op: rpcOpRead, remotes: remotes}}
 }
 
 // recordEngineFor returns the local record engine (logs, traces, or profiles) for a signal+tenant,
@@ -468,28 +476,6 @@ func (s *Storage) applyReplicated(_ context.Context, payload []byte) error {
 	}
 
 	return nil
-}
-
-// failoverFetcher tries its children in order and returns the first that succeeds — a read
-// from any single owner is complete (owners are replicas), so this tolerates a down owner.
-type failoverFetcher []fetch.Fetcher
-
-func (fs failoverFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
-	if len(fs) == 0 {
-		return nil, errors.New("cluster: no reachable owners for tenant")
-	}
-
-	var lastErr error
-	for _, f := range fs {
-		it, err := f.Fetch(ctx, r)
-		if err == nil {
-			return it, nil
-		}
-
-		lastErr = err
-	}
-
-	return nil, errors.Wrap(lastErr, "cluster: all owners failed")
 }
 
 // filteringFetcher re-applies a request's matchers to the inner result, which may be a superset
@@ -753,36 +739,41 @@ func (s *Storage) primaryWriteHandler() http.Handler {
 	})
 }
 
-// sendPrimaryWrite forwards a tenant's write to the remote primary at addr and returns the
-// reject count it reports.
+// sendPrimaryWrite forwards a tenant's write to the remote primary at addr and returns the reject
+// count it reports. It is bounded by the write policy: each attempt has a per-try timeout (so a
+// stuck primary is abandoned), but it retries only when the request provably never reached the
+// server ([retry.ConnFailure]) — a write is never re-sent after the primary may have applied it.
 func (s *Storage) sendPrimaryWrite(ctx context.Context, addr string, payload []byte) (int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+primaryWritePath, bytes.NewReader(payload))
-	if err != nil {
-		return 0, errors.Wrap(err, "build primary-write request")
-	}
-
-	obs.InjectHTTP(ctx, req.Header) // carry the trace into the primary-write RPC
 	s.obs.Logger(ctx).Debug("primary-write send", zap.String("addr", addr), zap.Int("bytes", len(payload)))
 
-	resp, err := s.cluster.httpc.Do(req)
-	if err != nil {
-		return 0, errors.Wrapf(err, "primary-write to %q", addr)
-	}
-	defer func() { _ = resp.Body.Close() }()
+	return retry.Do(ctx, s.writePolicy(ctx, rpcOpWrite), func(ctx context.Context) (int, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+primaryWritePath, bytes.NewReader(payload))
+		if err != nil {
+			return 0, errors.Wrap(err, "build primary-write request")
+		}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, errors.Wrap(err, "read primary-write response")
-	}
+		obs.InjectHTTP(ctx, req.Header) // carry the trace into the primary-write RPC
 
-	if resp.StatusCode != http.StatusOK {
-		return 0, errors.Errorf("cluster: primary %q returned %d: %s", addr, resp.StatusCode, bytes.TrimSpace(body))
-	}
+		resp, err := s.cluster.httpc.Do(req)
+		if err != nil {
+			return 0, errors.Wrapf(err, "primary-write to %q", addr)
+		}
+		defer func() { _ = resp.Body.Close() }()
 
-	rejected, err := strconv.Atoi(string(bytes.TrimSpace(body)))
-	if err != nil {
-		return 0, errors.Wrap(err, "parse reject count")
-	}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return 0, errors.Wrap(err, "read primary-write response")
+		}
 
-	return rejected, nil
+		if resp.StatusCode != http.StatusOK {
+			return 0, errors.Errorf("cluster: primary %q returned %d: %s", addr, resp.StatusCode, bytes.TrimSpace(body))
+		}
+
+		rejected, err := strconv.Atoi(string(bytes.TrimSpace(body)))
+		if err != nil {
+			return 0, errors.Wrap(err, "parse reject count")
+		}
+
+		return rejected, nil
+	})
 }

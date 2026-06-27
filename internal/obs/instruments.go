@@ -132,6 +132,40 @@ func (b *Backend) Record(ctx context.Context, op, result string, dur time.Durati
 	}
 }
 
+// RPC instruments the node-to-node cluster transport's reliability behavior: how often calls are
+// attempted, retried, or hedged (an opportunistic concurrent attempt fired because the in-flight one
+// was slow). Counts are tagged by op ("read"/"write"/"series"/"side"), so a rising retry/hedge rate
+// localizes a degrading link or peer.
+type RPC struct {
+	attempts metric.Int64Counter
+	retries  metric.Int64Counter
+	hedges   metric.Int64Counter
+}
+
+func opAttr(op string) metric.MeasurementOption {
+	return metric.WithAttributes(attribute.String("op", op))
+}
+
+// Attempt accounts one transport attempt (including the first) for op.
+func (r *RPC) Attempt(ctx context.Context, op string) { r.attempts.Add(ctx, 1, opAttr(op)) }
+
+// Retry accounts one sequential retry for op.
+func (r *RPC) Retry(ctx context.Context, op string) { r.retries.Add(ctx, 1, opAttr(op)) }
+
+// Hedge accounts one hedged (opportunistic concurrent) attempt for op.
+func (r *RPC) Hedge(ctx context.Context, op string) { r.hedges.Add(ctx, 1, opAttr(op)) }
+
+func newRPC(m metric.Meter) (*RPC, error) {
+	b := &imb{m: m}
+	r := &RPC{
+		attempts: b.counter("storage.rpc.attempts", "cluster RPC attempts (incl. first)", "{attempt}"),
+		retries:  b.counter("storage.rpc.retries", "cluster RPC sequential retries", "{retry}"),
+		hedges:   b.counter("storage.rpc.hedges", "cluster RPC hedged (concurrent) attempts", "{hedge}"),
+	}
+
+	return r, b.err
+}
+
 func newBackend(m metric.Meter) (*Backend, error) {
 	b := &imb{m: m}
 	bk := &Backend{

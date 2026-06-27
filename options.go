@@ -11,6 +11,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/encoding"
+	"github.com/oteldb/storage/reliability"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
 )
@@ -93,6 +94,22 @@ type Options struct {
 	Logger         *zap.Logger
 	TracerProvider trace.TracerProvider
 	MeterProvider  metric.MeterProvider
+
+	// Retry tunes how the library survives unreliable transports: per-attempt timeouts, bounded
+	// retries, and hedged (opportunistic concurrent) reads across cluster replicas. The zero value
+	// selects [reliability.Default] (a mild, LAN-safe profile); set [reliability.LossyEnvironment]
+	// (or a custom config) for networks that drop/stall/30s-timeout requests. It governs the cluster
+	// RPCs; the S3 backend is configured independently where it is constructed.
+	Retry reliability.RetryConfig
+}
+
+// retryConfig returns the configured retry profile, defaulting to [reliability.Default] when unset.
+func (o *Options) retryConfig() reliability.RetryConfig {
+	if !o.Retry.Enabled() {
+		return reliability.Default()
+	}
+
+	return o.Retry
 }
 
 // Durability is the WAL + flush policy (DESIGN.md §5, §8).
@@ -197,6 +214,11 @@ func WithTracerProvider(tp trace.TracerProvider) Option {
 func WithMeterProvider(mp metric.MeterProvider) Option {
 	return func(o *Options) { o.MeterProvider = mp }
 }
+
+// WithRetry sets the transport reliability profile (per-attempt timeouts, bounded retries, hedged
+// reads). Use [reliability.LossyEnvironment] in noisy networks; the zero config keeps the mild
+// [reliability.Default].
+func WithRetry(c reliability.RetryConfig) Option { return func(o *Options) { o.Retry = c } }
 
 // WithQuerySplitInterval enables split-by-interval on [Storage.Fetcher]: a query window is
 // divided into aligned sub-windows of ns nanoseconds, fetched concurrently and merged. ns ≤ 0

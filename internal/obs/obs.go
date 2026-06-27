@@ -41,6 +41,7 @@ type Obs struct {
 	Fetch     *Fetch
 	Backend   *Backend
 	WAL       *WAL
+	RPC       *RPC
 }
 
 // New builds the observability handle, defaulting each unset pillar to its no-op implementation.
@@ -83,6 +84,11 @@ func New(cfg Config) (*Obs, error) {
 		return nil, err
 	}
 
+	rpc, err := newRPC(meter)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Obs{
 		Log:       log,
 		Tracer:    tp.Tracer(scope),
@@ -92,6 +98,7 @@ func New(cfg Config) (*Obs, error) {
 		Fetch:     fetch,
 		Backend:   backend,
 		WAL:       wal,
+		RPC:       rpc,
 	}, nil
 }
 
