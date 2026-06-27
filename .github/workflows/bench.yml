@@ -1,0 +1,113 @@
+name: bench
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# One run per PR; cancel superseded runs.
+concurrency:
+  group: bench-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The definitive golden set (golden_bench_test.go) and the run flags. -count gives benchstat
+  # several samples per benchmark so it can judge significance; -benchtime bounds wall time.
+  BENCH: '^BenchmarkGolden$'
+  FLAGS: '-run=^$ -benchmem -benchtime=300ms -count=6 -timeout=30m'
+
+jobs:
+  golden:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # need the base commit to benchmark it too
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Install benchstat
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Benchmark PR head
+        run: go test ${FLAGS} -bench "${BENCH}" ./ | tee head.txt
+
+      # Run the SAME golden benchmark file against the base commit's library code, by copying this
+      # PR's golden_bench_test.go onto a checkout of the base SHA. The golden set is self-contained,
+      # so it compiles standalone. Non-fatal: if the base can't build the set, we show head only.
+      - name: Benchmark base
+        id: base
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          cp golden_bench_test.go "${RUNNER_TEMP}/golden_bench_test.go"
+          git checkout --quiet --force ${{ github.event.pull_request.base.sha }}
+          cp "${RUNNER_TEMP}/golden_bench_test.go" golden_bench_test.go
+          go test ${FLAGS} -bench "${BENCH}" ./ | tee base.txt
+
+      - name: Compare with benchstat
+        run: |
+          if [ -s base.txt ]; then
+            benchstat base.txt head.txt | tee bench.txt
+          else
+            {
+              echo "Base benchmark unavailable (the base commit did not build the golden set);"
+              echo "showing PR-head numbers only — no delta this run."
+              echo
+              benchstat head.txt
+            } | tee bench.txt
+          fi
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-bench
+          path: |
+            head.txt
+            base.txt
+            bench.txt
+          if-no-files-found: warn
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- golden-bench -->';
+            const table = fs.readFileSync('bench.txt', 'utf8').trim();
+            const body = [
+              marker,
+              '## 📊 Golden benchmarks',
+              '',
+              '`benchstat base → head` — overall values per metric plus the delta vs base ' +
+              '(`~` = no statistically significant change). Shared CI runners are noisy, so trust ' +
+              'large/repeated deltas over single small ones.',
+              '',
+              '```',
+              table,
+              '```',
+              '',
+              '<sub>Read+write golden set: `write/{head,flush,concurrent}`, `read/{fetch_all,fetch_recent}`, `density`. ' +
+              'Lower `ns/op` / higher `MB/s` / `Mpoints/s` is better; lower `B/point`, `B/op`, `allocs/op` is better.</sub>',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

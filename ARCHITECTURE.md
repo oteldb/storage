@@ -1072,6 +1072,14 @@ targets for every codec and the bitstream (`encode∘decode == identity`), and b
 on the hot paths. `go test ./...`, `go vet ./...`, and `golangci-lint run ./...` are all
 green; the tree is `gofmt`/`goimports` clean.
 
+**Golden benchmarks & per-PR deltas.** `golden_bench_test.go` defines the definitive, deterministic
+read+write performance set under `BenchmarkGolden/…` (`write/{head,flush,concurrent}`,
+`read/{fetch_all,fetch_recent}`, `density`). It is deliberately self-contained so the
+`.github/workflows/bench.yml` workflow can run the **same** benchmark file against both the PR head
+and the base commit, diff them with `golang.org/x/perf/cmd/benchstat`, and post a sticky PR comment
+with overall values plus the `vs base` delta and significance. Efficiency regression *gates* (hard
+ceilings on bytes/point and hot-path allocations) live separately in `efficiency_test.go`.
+
 ---
 
 ## 6. Package map
