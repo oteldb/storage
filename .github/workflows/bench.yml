@@ -111,3 +111,5 @@ jobs:
             } else {
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
+
+# bench CI demo: this PR exists to exercise .github/workflows/bench.yml (golden benchmark delta comment).
