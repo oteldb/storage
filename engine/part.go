@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"slices"
+	"sync/atomic"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
@@ -41,7 +42,16 @@ type part struct {
 	// bucket index for time pruning. Set from the flush/merge columns when written and from
 	// the index entry when reconstructed (see engine/index.go).
 	minTime, maxTime int64
+
+	// refs counts in-flight fetches reading this part lock-free. A fetch acquires (under the engine
+	// lock, while the part is still live) the parts it will read and releases them when done; a retired
+	// part is not deleted from the backend until its refs reach zero, so a lock-free read never races a
+	// delete.
+	refs atomic.Int32
 }
+
+func (p *part) acquire() { p.refs.Add(1) }
+func (p *part) release() { p.refs.Add(-1) }
 
 // deletePart removes every backend object of the part at prefix (manifest, marks, and
 // column objects), found by listing the prefix.

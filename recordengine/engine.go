@@ -49,6 +49,14 @@ type Engine struct {
 	head    *head
 	parts   []*part
 	nextSeq int
+	// retiring holds parts removed from the live set by flush/merge, pending backend deletion once
+	// their in-flight fetch readers drain (deferred reclamation; see reclaim.go).
+	retiring []*part
+	// flushing holds the record buffers detached from the head by an in-progress flush, kept readable
+	// by fetch until the flushed part is published (then cleared, atomically with adding the part). It
+	// closes the visibility gap a flush would otherwise open between draining the head and the part
+	// becoming live. nil when no flush is in flight.
+	flushing map[signal.SeriesID]*recordCols
 	// flushedEpoch is the WAL flush watermark: the generation of the most recently flushed head
 	// (persisted in the bucket index). Current head records are written to the WAL at flushedEpoch+1,
 	// so on recovery the engine replays only WAL segments past flushedEpoch — exactly-once.
@@ -213,8 +221,6 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		e.mu.RLock()
 	}
 
-	defer e.mu.RUnlock()
-
 	_, rpf := profile.Begin(ctx, "resolve-matchers")
 	ids := e.head.resolve(r.Matchers)
 	rpf.Add("series_matched", int64(len(ids)))
@@ -239,13 +245,22 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	}
 
 	if len(ids) == 0 {
+		e.mu.RUnlock()
 		record(0)
 
 		return fetch.NewSliceIterator(nil), nil
 	}
 
-	accs, err := e.accumulate(ctx, ids, r)
-	if err != nil {
+	// Plan under the read lock: seed each stream's accumulator from the head, select and acquire the
+	// live parts to read, and capture stream identities. Releasing the lock before the backend reads
+	// lets appends and flush/merge proceed concurrently — the acquired parts can't be reclaimed until
+	// we release them, so the lock-free reads never race a delete.
+	plan := e.planFetch(ids, r)
+	e.mu.RUnlock()
+
+	defer plan.releaseParts()
+
+	if err := plan.readParts(ctx); err != nil {
 		span.RecordError(err)
 
 		return nil, err
@@ -257,7 +272,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	)
 
 	for _, id := range ids {
-		acc := accs[id]
+		acc := plan.accs[id]
 
 		if r.AllConditions && len(r.Conditions) > 0 {
 			acc.filterInPlace(r.Conditions)
@@ -269,8 +284,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 		acc.sortByTs()
 
-		s, _ := e.head.series.Get(id)
-		b := acc.toBatch(id, s, r.Projection)
+		b := acc.toBatch(id, plan.series[id], r.Projection)
 
 		if r.SecondPass != nil && !r.SecondPass(b) {
 			continue
@@ -350,10 +364,7 @@ func (e *Engine) Flush(ctx context.Context) error {
 	log := zctx.From(ctx)
 	log.Debug("flush requested", zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix))
 
-	e.mu.Lock()
-	rows, err := e.flushLocked(ctx)
-	e.mu.Unlock()
-
+	rows, err := e.flush(ctx)
 	if err != nil {
 		span.RecordError(err)
 		log.Error("flush failed",
@@ -384,6 +395,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 
 	e.head = newHead(e.cfg.Schema)
 	e.parts = nil
+	e.retiring = nil // the List+Delete below removes their objects too
 	e.nextSeq = 0
 
 	if e.cfg.Backend == nil {
@@ -519,19 +531,15 @@ func (e *Engine) replayHandlers() wal.Handlers {
 	}
 }
 
-// streamInRangeLocked reports whether stream id has any record in [start, end] (head ∪ parts). A
-// zero start AND end disables the filter. Caller holds the lock.
+// streamInRangeLocked reports whether stream id has any record in [start, end] (head ∪ in-flight
+// flush buffers ∪ parts). A zero start AND end disables the filter. Caller holds the lock.
 func (e *Engine) streamInRangeLocked(id signal.SeriesID, start, end int64) bool {
 	if start == 0 && end == 0 {
 		return true
 	}
 
-	if buf := e.head.records[id]; buf != nil {
-		for _, t := range buf.ts {
-			if t >= start && t <= end {
-				return true
-			}
-		}
+	if bufInRange(e.head.records[id], start, end) || bufInRange(e.flushing[id], start, end) {
+		return true
 	}
 
 	for _, p := range e.parts {
@@ -543,64 +551,131 @@ func (e *Engine) streamInRangeLocked(id signal.SeriesID, start, end int64) bool 
 	return false
 }
 
-// accumulate gathers each requested stream's in-window records (head ∪ live parts) into a
-// pre-sized accumulator, decoding only the columns the request references (lazy decode) and each
-// live part exactly once.
-func (e *Engine) accumulate(ctx context.Context, ids []signal.SeriesID, r fetch.Request) (map[signal.SeriesID]*recordCols, error) {
-	sel := selectColumns(e.cfg.Schema, r)
+// fetchPlan is the lock-free-readable plan a fetch builds under the engine read lock: per-stream
+// accumulators already seeded from the head, the acquired (ref-held) live parts still to read, and the
+// captured stream identities. Its [fetchPlan.readParts] does the backend I/O off the lock.
+type fetchPlan struct {
+	sel        colSel
+	ids        []signal.SeriesID
+	accs       map[signal.SeriesID]*recordCols
+	series     map[signal.SeriesID]signal.Series
+	liveParts  []*part
+	start, end int64
+}
 
-	live := make([]*part, 0, len(e.parts))
-	for _, p := range e.parts {
+// planFetch builds the fetch plan: it selects and acquires the live parts that may hold a requested
+// stream in-window (time + bloom + stream prune), seeds each stream's accumulator from the head
+// buffer, and captures stream identities — all under the lock, so the subsequent part reads run
+// lock-free. Caller holds e.mu (read lock). The acquired parts must be released with releaseParts.
+func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *fetchPlan {
+	p := &fetchPlan{
+		sel:    selectColumns(e.cfg.Schema, r),
+		ids:    ids,
+		accs:   make(map[signal.SeriesID]*recordCols, len(ids)),
+		series: make(map[signal.SeriesID]signal.Series, len(ids)),
+		start:  r.Start,
+		end:    r.End,
+	}
+
+	for _, part := range e.parts {
 		switch {
-		case p.maxTime < r.Start || p.minTime > r.End: // time-prune
-		case r.AllConditions && !p.mayContain(r.Conditions): // bloom-prune
-		case p.holdsAny(ids):
-			live = append(live, p)
+		case part.maxTime < r.Start || part.minTime > r.End: // time-prune
+		case r.AllConditions && !part.mayContain(r.Conditions): // bloom-prune
+		case part.holdsAny(ids):
+			part.acquire()
+			p.liveParts = append(p.liveParts, part)
 		}
 	}
 
-	accs := make(map[signal.SeriesID]*recordCols, len(ids))
 	for _, id := range ids {
 		n := e.head.recordCount(id)
-		for _, p := range live {
-			if rng, ok := p.ranges[id]; ok {
+		if buf := e.flushing[id]; buf != nil {
+			n += buf.len()
+		}
+
+		for _, part := range p.liveParts {
+			if rng, ok := part.ranges[id]; ok {
 				n += rng.end - rng.start
 			}
 		}
 
-		accs[id] = newRecordCols(e.cfg.Schema, n, sel)
-	}
-
-	for _, p := range live {
-		cols, err := p.readCols(ctx, sel)
-		if err != nil {
-			return nil, err
+		acc := newRecordCols(e.cfg.Schema, n, p.sel)
+		e.head.appendWindow(id, acc, r.Start, r.End) // seed from the live head under the lock
+		if buf := e.flushing[id]; buf != nil {
+			appendColsWindow(buf, acc, r.Start, r.End) // …and from records mid-flush (not yet a part)
 		}
 
-		for _, id := range ids {
-			if rng, ok := p.ranges[id]; ok {
-				appendWindowRows(accs[id], cols, rng, r.Start, r.End)
+		p.accs[id] = acc
+
+		if s, ok := e.head.series.Get(id); ok {
+			p.series[id] = s
+		}
+	}
+
+	return p
+}
+
+// readParts decodes each acquired part (only the referenced columns — lazy decode) and appends its
+// in-window rows to the per-stream accumulators. Runs lock-free: the parts are immutable and ref-held.
+func (p *fetchPlan) readParts(ctx context.Context) error {
+	for _, part := range p.liveParts {
+		cols, err := part.readCols(ctx, p.sel)
+		if err != nil {
+			return err
+		}
+
+		for _, id := range p.ids {
+			if rng, ok := part.ranges[id]; ok {
+				appendWindowRows(p.accs[id], cols, rng, p.start, p.end)
 			}
 		}
 	}
 
-	for _, id := range ids {
-		e.head.appendWindow(id, accs[id], r.Start, r.End)
-	}
-
-	return accs, nil
+	return nil
 }
 
-// flushLocked drains the head to a new part and returns the number of records flushed (0 ⇒ the
-// head held nothing). The caller holds e.mu.
-func (e *Engine) flushLocked(ctx context.Context) (int, error) {
-	f := e.head.drainHead()
-	if f == nil {
+// releaseParts releases the fetch's hold on its acquired parts, letting a retired part be reclaimed.
+func (p *fetchPlan) releaseParts() {
+	for _, part := range p.liveParts {
+		part.release()
+	}
+}
+
+// flush drains the head to a new immutable part, returning the number of records flushed (0 ⇒ empty
+// head). It is phased so the part's column/bloom/footer write and read-back happen off the engine lock
+// — appends and fetches proceed concurrently — while the head drain, the side-store snapshot, and the
+// metadata publish run under it. Only the background maintenance task (or Close) calls flush, so the
+// parts mutation has a single writer.
+func (e *Engine) flush(ctx context.Context) (int, error) {
+	// Plan (under lock): detach the head's record buffers (keeping them readable via e.flushing so a
+	// concurrent fetch never loses them), snapshot the side-store delta atomically with the detach (so
+	// a concurrent append's symbols aren't lost by the Reset), and reserve the part sequence.
+	e.mu.Lock()
+	detached := e.head.detach()
+	if detached == nil {
+		e.mu.Unlock()
+		e.reclaimRetired(ctx) // nothing to flush, but still sweep pending deletions
+
 		return 0, nil
 	}
 
+	e.flushing = detached
+	seq := e.nextSeq
+
+	var side map[string][]byte
+	if e.cfg.SideStore != nil {
+		side = e.cfg.SideStore.Encode()
+		e.cfg.SideStore.Reset()
+	}
+
+	e.mu.Unlock()
+
+	// Build (lock-free): lay out the detached buffers as part columns, write the part (columns +
+	// blooms + record-key footer), read it back, and write the side-store sidecars. These are the
+	// large I/Os that previously blocked the whole engine. The detached buffers are immutable here.
+	f := buildFlushColumns(e.cfg.Schema, detached)
 	rows := len(f.stream)
-	prefix := e.partPrefix(e.nextSeq)
+	prefix := e.partPrefix(seq)
 
 	if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f); err != nil {
 		return 0, err
@@ -612,36 +687,53 @@ func (e *Engine) flushLocked(ctx context.Context) (int, error) {
 	}
 
 	p.minTime, p.maxTime = colsTimeRange(f)
-	e.parts = append(e.parts, p)
-	e.nextSeq++
 
-	if e.cfg.SideStore != nil {
-		if err := writeSidecars(ctx, e.cfg.Backend, prefix, e.cfg.SideStore.Encode()); err != nil {
+	if side != nil {
+		if err := writeSidecars(ctx, e.cfg.Backend, prefix, side); err != nil {
 			return rows, err
 		}
-
-		e.cfg.SideStore.Reset()
 	}
 
-	// This flush's records become durable generation flushedEpoch+1; advance the watermark before
-	// persisting the index, so the bucket index commits the new watermark atomically with the part.
+	// Publish (under lock): add the part copy-on-write and clear e.flushing in the same critical
+	// section — so a fetch sees the records either in e.flushing or in the part, never neither (no gap)
+	// and never both (no double count). Bump the sequence and the flush watermark, then persist the
+	// index/stream-index and checkpoint the WAL — small metadata writes kept under the lock so the
+	// parts swap and the durable watermark commit stay atomic, preserving the exactly-once
+	// crash-consistency ordering (index commits the watermark, then the WAL checkpoint discards the
+	// now-obsolete segments).
+	e.mu.Lock()
+	e.parts = appendPart(e.parts, p)
+	e.flushing = nil
+	e.nextSeq = seq + 1
 	e.flushedEpoch++
+	err = e.publishLocked(ctx)
+	e.mu.Unlock()
 
-	if err := e.updateIndexLocked(ctx); err != nil {
+	if err != nil {
 		return rows, err
+	}
+
+	e.reclaimRetired(ctx)
+
+	return rows, nil
+}
+
+// publishLocked persists the engine's part set (bucket index + stream identity index) and, for a
+// flush, checkpoints the WAL to the advanced watermark. Caller holds e.mu.
+func (e *Engine) publishLocked(ctx context.Context) error {
+	if err := e.updateIndexLocked(ctx); err != nil {
+		return err
 	}
 
 	if err := e.writeStreamIndexLocked(ctx); err != nil {
-		return rows, err
+		return err
 	}
 
-	// The part (and its watermark) is durable, so the WAL records it covers are obsolete. New head
-	// records start the next generation; the checkpoint discards the flushed segments.
 	if e.cfg.WAL != nil {
 		e.cfg.WAL.SetEpoch(e.flushedEpoch + 1)
 
-		return rows, e.cfg.WAL.Checkpoint()
+		return e.cfg.WAL.Checkpoint()
 	}
 
-	return rows, nil
+	return nil
 }

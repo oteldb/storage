@@ -2,6 +2,7 @@ package recordengine
 
 import (
 	"context"
+	"sync/atomic"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
@@ -33,7 +34,16 @@ type part struct {
 	// minTime, maxTime are the inclusive unix-ns record bounds of the part (from the columns when
 	// written, from the bucket index when reconstructed), for time pruning.
 	minTime, maxTime int64
+
+	// refs counts in-flight fetches reading this part lock-free. A fetch acquires (under the engine
+	// lock, while the part is still live) the parts it will read, releases them when done, and reads
+	// the backend objects between. A retired part (removed from the live set by flush/merge) is not
+	// deleted from the backend until its refs reach zero, so a lock-free reader never races a delete.
+	refs atomic.Int32
 }
+
+func (p *part) acquire() { p.refs.Add(1) }
+func (p *part) release() { p.refs.Add(-1) }
 
 // deletePart removes every backend object of the part at prefix.
 func deletePart(ctx context.Context, b backend.Backend, prefix string) error {

@@ -45,10 +45,7 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 		zap.Bool("downsample", len(opts.Downsample) > 0),
 		zap.Bool("recompress", opts.Recompress != nil))
 
-	e.mu.Lock()
-	compacted, err := e.mergeLocked(ctx, opts)
-	e.mu.Unlock()
-
+	compacted, err := e.merge(ctx, opts)
 	if err != nil {
 		span.RecordError(err)
 		log.Error("merge failed", zap.String("prefix", e.cfg.Prefix), zap.Error(err))
@@ -73,15 +70,19 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 
 // mergeLocked compacts the parts per opts and returns the number of source parts compacted (0 ⇒ a
 // no-op). The caller holds e.mu.
-func (e *Engine) mergeLocked(ctx context.Context, opts MergeOptions) (int, error) {
-	if len(e.parts) == 0 {
-		return 0, nil
-	}
+func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
+	// Plan (under lock): snapshot the source parts (immutable backing) and reserve the sequence.
+	e.mu.Lock()
+	src := e.parts
+	seq := e.nextSeq
+	e.mu.Unlock()
 
 	// A single part with no retention cutoff, nothing old enough to downsample, and nothing to
 	// recompress has nothing to gain — skip without decoding it.
-	if len(e.parts) == 1 && opts.RetainFrom <= 0 &&
-		!downsampleApplies(opts.Downsample, e.parts[0].minTime) && !recompressApplies(e.parts[0], opts.Recompress) {
+	if len(src) == 0 || (len(src) == 1 && opts.RetainFrom <= 0 &&
+		!downsampleApplies(opts.Downsample, src[0].minTime) && !recompressApplies(src[0], opts.Recompress)) {
+		e.reclaimRetired(ctx)
+
 		return 0, nil
 	}
 
@@ -90,65 +91,76 @@ func (e *Engine) mergeLocked(ctx context.Context, opts MergeOptions) (int, error
 		start = opts.RetainFrom
 	}
 
-	cols, err := e.compactParts(ctx, start, opts.Downsample)
+	// Build (lock-free): read+compact the source parts, downsample, write the merged part, read it
+	// back. The source parts stay live (not retired) until publish, so they can't be reclaimed here.
+	cols, err := e.compactParts(ctx, src, start, opts.Downsample)
 	if err != nil {
 		return 0, err
 	}
 
 	// Fixed point: a single source part whose row count downsampling did not reduce, and which
 	// needs no recompression, is already at its target — rewriting it would only churn the backend.
-	if len(e.parts) == 1 && opts.RetainFrom <= 0 && len(cols.ts) == e.parts[0].rows() &&
-		!recompressApplies(e.parts[0], opts.Recompress) {
+	if len(src) == 1 && opts.RetainFrom <= 0 && len(cols.ts) == src[0].rows() &&
+		!recompressApplies(src[0], opts.Recompress) {
+		e.reclaimRetired(ctx)
+
 		return 0, nil
 	}
 
-	old := e.parts
-	compacted := len(old)
+	var newPart *part
 
-	if len(cols.ts) == 0 {
-		// Retention dropped every sample: keep no parts.
-		e.parts = nil
-	} else {
+	if len(cols.ts) > 0 {
 		minT, maxT := colsTimeRange(cols)
-		prefix := e.partPrefix(e.nextSeq)
+		prefix := e.partPrefix(seq)
 
 		// Recompress when the merged part is fully cold (its newest sample predates the cutoff).
 		if err := writePart(ctx, e.cfg.Backend, prefix, cols, coldProfile(opts.Recompress, maxT)); err != nil {
 			return 0, err
 		}
 
-		p, err := openPart(ctx, e.cfg.Backend, prefix)
+		newPart, err = openPart(ctx, e.cfg.Backend, prefix)
 		if err != nil {
 			return 0, err
 		}
 
-		p.minTime, p.maxTime = minT, maxT
-		e.parts = []*part{p}
-		e.nextSeq++
+		newPart.minTime, newPart.maxTime = minT, maxT
 	}
 
-	// Commit the new part set to the bucket index before deleting the source parts, so a
-	// crash mid-merge never leaves the index referencing a deleted part (it may leave orphan
-	// objects, which are harmless and reclaimed by a later merge).
-	if err := e.updateIndexLocked(ctx); err != nil {
-		return 0, err
+	// Publish (under lock): swap the source parts for the merged one copy-on-write (keeping any part a
+	// concurrent flush may have added), retire the sources, and commit the index before any deletion —
+	// so a crash mid-merge never leaves the index referencing a deleted part. The retired parts' objects
+	// are deleted by reclaimRetired once their readers drain.
+	removed := make(map[string]struct{}, len(src))
+	for _, p := range src {
+		removed[p.prefix] = struct{}{}
 	}
 
-	for _, p := range old {
-		if err := deletePart(ctx, e.cfg.Backend, p.prefix); err != nil {
-			return compacted, err
-		}
+	e.mu.Lock()
+	e.parts = replaceParts(e.parts, removed, newPart)
+	if newPart != nil {
+		e.nextSeq = seq + 1
 	}
 
-	return compacted, nil
+	e.retireLocked(src)
+	err = e.updateIndexLocked(ctx)
+	e.mu.Unlock()
+
+	if err != nil {
+		return len(src), err
+	}
+
+	e.reclaimRetired(ctx)
+
+	return len(src), nil
 }
 
-// compactParts merges every part's samples per series (within [start, maxInt64], so
+// compactParts merges each source part's samples per series (within [start, maxInt64], so
 // retention is applied), then downsamples the survivors per tiers, returning the combined
-// columns sorted by (series, ts). The returned columns are empty when no sample survives.
-func (e *Engine) compactParts(ctx context.Context, start int64, tiers []DownsampleTier) (*flushColumns, error) {
+// columns sorted by (series, ts). The returned columns are empty when no sample survives. It reads
+// the parts off the engine lock; src is the immutable snapshot the caller planned over.
+func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tiers []DownsampleTier) (*flushColumns, error) {
 	idSet := make(map[signal.SeriesID]struct{})
-	for _, p := range e.parts {
+	for _, p := range src {
 		for id := range p.ranges {
 			idSet[id] = struct{}{}
 		}
@@ -167,7 +179,7 @@ func (e *Engine) compactParts(ctx context.Context, start int64, tiers []Downsamp
 		var m sampleMerge
 
 		// Oldest → newest part, so a later part's value wins on a duplicate timestamp.
-		for _, p := range e.parts {
+		for _, p := range src {
 			if err := p.mergeInto(ctx, id, &m, start, maxInt64); err != nil {
 				return nil, err
 			}
@@ -193,12 +205,12 @@ func (e *Engine) compactParts(ctx context.Context, start int64, tiers []Downsamp
 // Close flushes any buffered samples to a part and closes the WAL. It does not stop a background
 // loop — the owner ([storage.Storage]) does that before calling Close.
 func (e *Engine) Close(ctx context.Context) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if _, err := e.flushLocked(ctx); err != nil {
+	if _, err := e.flush(ctx); err != nil {
 		return err
 	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	if e.cfg.WAL != nil {
 		return e.cfg.WAL.Close()

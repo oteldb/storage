@@ -343,6 +343,27 @@ index is unsorted, drop to the write lock, `EnsureSorted`, re-check), after whic
 readers only read. The `postings.MemPostings` exposes `Sorted()`/`EnsureSorted()` for exactly
 this caller-owned-synchronization upgrade.
 
+**The engine lock is never held across object-store I/O.** Flush, merge, and fetch are phased so
+their large reads/writes run lock-free, exploiting that parts are immutable. Both engines (`engine`,
+`recordengine`) share this discipline:
+- The **`parts` slice is copy-on-write** (`appendPart`/`replaceParts`), so a reader that snapshots the
+  header under the lock keeps a stable backing array after releasing it.
+- **Fetch** *plans* under the read lock — resolve matchers, snapshot+`acquire()` the in-window parts,
+  seed accumulators from the head — then releases the lock and reads the parts' columns lock-free
+  (`planFetch`/`readParts`), `release()`-ing the parts after.
+- **Flush/merge** *plan* under the lock (drain/snapshot the head, reserve the part sequence), *build*
+  the part off the lock (compaction reads, part write, read-back, sidecar union), then *publish* under
+  the lock (swap the parts slice, persist the **small** bucket/stream index + WAL checkpoint — kept
+  under the lock so the swap and the durable-watermark commit stay atomic, preserving exactly-once
+  crash-consistency). Only the background maintenance task (or `Close`) mutates `parts`, so the swap is
+  single-writer.
+- **Parts retired** by flush/merge are not deleted inline: each `part` has an `atomic.Int32` refcount,
+  and `reclaimRetired` deletes a retired part's objects only once its in-flight readers have drained —
+  so a lock-free fetch never races a delete (deferred reclamation).
+- A flush **detaches** the head's buffers into an engine-level `flushing` set that fetches still read,
+  swapped for the new part atomically at publish — so a fetch sees the records in exactly one of
+  `flushing`/the part, never neither (no visibility gap) nor both (no double count).
+
 - **Head** (`head.go`) is the in-memory write buffer: the index (`symbols` + `series` +
   `postings`) plus per-series `(ts, value)` append buffers. `append` interns every
   queryable label (resource + scope attributes, scope name/version as reserved labels, and

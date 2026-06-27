@@ -45,6 +45,13 @@ type Engine struct {
 	head    *head
 	parts   []*part
 	nextSeq int
+	// retiring holds parts removed from the live set by flush/merge, pending backend deletion once
+	// their in-flight fetch readers drain (deferred reclamation; see reclaim.go).
+	retiring []*part
+	// flushing holds the sample buffers detached from the head by an in-progress flush, kept readable
+	// by fetch until the flushed part is published (then cleared, atomically with adding the part) — so
+	// a fetch never loses sight of records mid-flush. nil when no flush is in flight.
+	flushing map[signal.SeriesID]*sampleBuf
 }
 
 var _ fetch.Fetcher = (*Engine)(nil)
@@ -197,14 +204,20 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		e.mu.RLock()
 	}
 
-	defer e.mu.RUnlock()
-
 	_, rpf := profile.Begin(ctx, "resolve-matchers")
 	ids := e.head.resolve(r.Matchers)
 	rpf.Add("series_matched", int64(len(ids)))
 	rpf.End()
 
 	partsScanned := len(e.parts)
+
+	// Plan under the read lock: acquire the in-window parts to read and snapshot each series' head
+	// (and any mid-flush) samples + identity, so the part reads below run lock-free — appends and
+	// flush/merge proceed concurrently, and the acquired parts can't be reclaimed until released.
+	plan := e.planFetch(ids, r)
+	e.mu.RUnlock()
+
+	defer plan.releaseParts()
 
 	_, spf := profile.Begin(ctx, "scan")
 
@@ -214,27 +227,16 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	)
 
 	for _, id := range ids {
-		s, _ := e.head.series.Get(id)
+		m, err := plan.mergeSeries(ctx, id)
+		if err != nil {
+			span.RecordError(err)
+			spf.End()
 
-		var m sampleMerge
-
-		// Parts first (oldest → newest), then the head buffer last so the freshest value
-		// wins on a duplicate timestamp.
-		for _, p := range e.parts {
-			if err := p.mergeInto(ctx, id, &m, r.Start, r.End); err != nil {
-				span.RecordError(err)
-				spf.End()
-
-				return nil, err
-			}
-		}
-
-		if hb := e.head.batch(id, r.Start, r.End); hb != nil {
-			m.add(hb.Timestamps, hb.Values, hb.ScaleFactors, r.Start, r.End)
+			return nil, err
 		}
 
 		if ts, values, sf := m.collect(); len(ts) > 0 {
-			batches = append(batches, &fetch.Batch{ID: id, Series: s, Timestamps: ts, Values: values, ScaleFactors: sf})
+			batches = append(batches, &fetch.Batch{ID: id, Series: plan.series[id], Timestamps: ts, Values: values, ScaleFactors: sf})
 			rows += len(ts)
 		}
 	}
@@ -259,6 +261,88 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		zap.Duration("took", time.Since(startNs)))
 
 	return fetch.NewSliceIterator(batches), nil
+}
+
+// enginePlan is the lock-free-readable plan a fetch builds under the engine read lock: the acquired
+// (ref-held) in-window parts still to read, plus each series' identity and its already-snapshotted head
+// and mid-flush samples. Its [enginePlan.mergeSeries] does the part reads off the lock.
+type enginePlan struct {
+	ids        []signal.SeriesID
+	series     map[signal.SeriesID]signal.Series
+	headB      map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
+	flushB     map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
+	liveParts  []*part
+	start, end int64
+}
+
+// planFetch selects and acquires the in-window parts and snapshots each series' head + mid-flush
+// samples and identity — all under the lock — so the part reads run lock-free. Caller holds e.mu (read
+// lock). The acquired parts must be released with releaseParts.
+func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
+	p := &enginePlan{
+		ids:    ids,
+		series: make(map[signal.SeriesID]signal.Series, len(ids)),
+		headB:  make(map[signal.SeriesID]*fetch.Batch, len(ids)),
+		flushB: make(map[signal.SeriesID]*fetch.Batch, len(ids)),
+		start:  r.Start,
+		end:    r.End,
+	}
+
+	for _, part := range e.parts {
+		if part.maxTime < r.Start || part.minTime > r.End { // time-prune
+			continue
+		}
+
+		part.acquire()
+		p.liveParts = append(p.liveParts, part)
+	}
+
+	for _, id := range ids {
+		if s, ok := e.head.series.Get(id); ok {
+			p.series[id] = s
+		}
+
+		if hb := e.head.batch(id, r.Start, r.End); hb != nil {
+			p.headB[id] = hb
+		}
+
+		if buf := e.flushing[id]; buf != nil {
+			if fb := bufBatch(buf, id, p.series[id], r.Start, r.End); fb != nil {
+				p.flushB[id] = fb
+			}
+		}
+	}
+
+	return p
+}
+
+// mergeSeries gathers series id's samples lock-free: each acquired part oldest→newest, then the
+// mid-flush samples, then the head samples last — so on a duplicate timestamp the freshest value wins.
+func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampleMerge, error) {
+	var m sampleMerge
+
+	for _, part := range p.liveParts {
+		if err := part.mergeInto(ctx, id, &m, p.start, p.end); err != nil {
+			return m, err
+		}
+	}
+
+	if fb := p.flushB[id]; fb != nil {
+		m.add(fb.Timestamps, fb.Values, fb.ScaleFactors, p.start, p.end)
+	}
+
+	if hb := p.headB[id]; hb != nil {
+		m.add(hb.Timestamps, hb.Values, hb.ScaleFactors, p.start, p.end)
+	}
+
+	return m, nil
+}
+
+// releaseParts releases the fetch's hold on its acquired parts, letting a retired part be reclaimed.
+func (p *enginePlan) releaseParts() {
+	for _, part := range p.liveParts {
+		part.release()
+	}
 }
 
 // sfval is a sample's value paired with its lossy-sampling weight.
@@ -343,10 +427,7 @@ func (e *Engine) Flush(ctx context.Context) error {
 	log := zctx.From(ctx)
 	log.Debug("flush requested", zap.String("prefix", e.cfg.Prefix))
 
-	e.mu.Lock()
-	rows, err := e.flushLocked(ctx)
-	e.mu.Unlock()
-
+	rows, err := e.flush(ctx)
 	if err != nil {
 		span.RecordError(err)
 		log.Error("flush failed", zap.String("prefix", e.cfg.Prefix), zap.Error(err))
@@ -379,6 +460,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 
 	e.head = newHead()
 	e.parts = nil
+	e.retiring = nil // the List+Delete below removes their objects too
 	e.nextSeq = 0
 
 	if e.cfg.Backend == nil {
@@ -534,18 +616,40 @@ func (e *Engine) SeriesCount() int {
 	return e.head.series.Len()
 }
 
-// flushLocked drains the head to a new part and returns the number of rows flushed (0 ⇒ the head
-// held nothing). The caller holds e.mu.
-func (e *Engine) flushLocked(ctx context.Context) (int, error) {
-	cols := e.head.drainHead()
-	if cols == nil {
+// flush drains the head to a new immutable part, returning the rows flushed (0 ⇒ empty head). Phased
+// so the part write and read-back happen off the engine lock (appends and fetches proceed), while the
+// head detach and the metadata publish run under it. Only the background maintenance task (or Close)
+// calls flush, so the parts mutation has a single writer.
+func (e *Engine) flush(ctx context.Context) (int, error) {
+	// Plan (under lock): detach the head's sample buffers, keeping them readable via e.flushing so a
+	// concurrent fetch never loses them, and reserve the part sequence.
+	e.mu.Lock()
+	detached := e.head.detach()
+	if detached == nil {
+		e.mu.Unlock()
+		e.reclaimRetired(ctx) // nothing to flush, but still sweep pending deletions
+
+		return 0, nil
+	}
+
+	e.flushing = detached
+	seq := e.nextSeq
+	e.mu.Unlock()
+
+	// Build (lock-free): lay out the detached buffers and write the part. Flush writes freshly-ingested
+	// (warm) data with the default codec-only framing; recompression of cold data happens at merge.
+	cols := buildFlushColumns(detached)
+	if cols == nil { // every detached buffer was empty (defensive — detach guarantees ≥1 row)
+		e.mu.Lock()
+		e.flushing = nil
+		e.mu.Unlock()
+
 		return 0, nil
 	}
 
 	rows := len(cols.ts)
-	prefix := e.partPrefix(e.nextSeq)
-	// Flush writes freshly-ingested (warm) data with the default codec-only framing; recompression
-	// of cold data happens later, at merge.
+	prefix := e.partPrefix(seq)
+
 	if err := writePart(ctx, e.cfg.Backend, prefix, cols, nil); err != nil {
 		return 0, err
 	}
@@ -556,21 +660,41 @@ func (e *Engine) flushLocked(ctx context.Context) (int, error) {
 	}
 
 	p.minTime, p.maxTime = colsTimeRange(cols)
-	e.parts = append(e.parts, p)
-	e.nextSeq++
 
-	if err := e.updateIndexLocked(ctx); err != nil {
+	// Publish (under lock): add the part copy-on-write and clear e.flushing in the same critical
+	// section, so a fetch sees the samples either in e.flushing or in the part — never neither (no gap)
+	// and never both (no double count). The small index writes and WAL checkpoint stay under the lock
+	// so the parts swap and the durable commit remain atomic.
+	e.mu.Lock()
+	e.parts = appendPart(e.parts, p)
+	e.flushing = nil
+	e.nextSeq = seq + 1
+	err = e.publishLocked(ctx)
+	e.mu.Unlock()
+
+	if err != nil {
 		return rows, err
+	}
+
+	e.reclaimRetired(ctx)
+
+	return rows, nil
+}
+
+// publishLocked persists the engine's part set (bucket index + series identity index) and checkpoints
+// the WAL — the now-durable part makes its WAL records obsolete. Caller holds e.mu.
+func (e *Engine) publishLocked(ctx context.Context) error {
+	if err := e.updateIndexLocked(ctx); err != nil {
+		return err
 	}
 
 	if err := e.writeSeriesIndexLocked(ctx); err != nil {
-		return rows, err
+		return err
 	}
 
-	// The part (and its index) is durable, so the WAL records it covers are obsolete.
 	if e.cfg.WAL != nil {
-		return rows, e.cfg.WAL.Checkpoint()
+		return e.cfg.WAL.Checkpoint()
 	}
 
-	return rows, nil
+	return nil
 }

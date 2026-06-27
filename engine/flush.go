@@ -44,12 +44,12 @@ func (c *flushColumns) appendRow(u chunk.U128, ts int64, value, sf float64) {
 	}
 }
 
-// drainHead snapshots every buffered sample into part columns sorted by (series, ts) and
-// clears the head's sample buffers (the series index is retained — identities outlive a
-// flush). It returns nil if no series has buffered samples.
-func (h *head) drainHead() *flushColumns {
-	ids := make([]signal.SeriesID, 0, len(h.samples))
-	for id, buf := range h.samples {
+// buildFlushColumns lays the detached sample buffers out as part columns sorted by (series, ts),
+// returning nil if no series has a sample. It reads the (now immutable) detached buffers off the
+// engine lock.
+func buildFlushColumns(samples map[signal.SeriesID]*sampleBuf) *flushColumns {
+	ids := make([]signal.SeriesID, 0, len(samples))
+	for id, buf := range samples {
 		if len(buf.ts) > 0 {
 			ids = append(ids, id)
 		}
@@ -64,7 +64,7 @@ func (h *head) drainHead() *flushColumns {
 	cols := &flushColumns{}
 
 	for _, id := range ids {
-		buf := h.samples[id]
+		buf := samples[id]
 
 		ts, values, sf := sortedWindow(buf, minInt64, maxInt64)
 		u := idToU128(id)
@@ -78,9 +78,6 @@ func (h *head) drainHead() *flushColumns {
 			cols.appendRow(u, ts[i], values[i], w)
 		}
 	}
-
-	h.samples = make(map[signal.SeriesID]*sampleBuf)
-	h.bytes = 0
 
 	return cols
 }

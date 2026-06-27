@@ -1,6 +1,6 @@
 # Design: Concurrency optimization — lock scope & cross-shard parallelism
 
-Status: **proposal**
+Status: **implemented** (items #1–#6; see [§7](#7-prioritization) for the per-item status)
 
 ## Summary
 
@@ -248,20 +248,37 @@ churn / cold start.
 
 ## 7. Prioritization
 
-| # | Change | §  | Impact | Risk | Notes |
-|---|--------|----|--------|------|-------|
-| 1 | Parallelize maintenance loop (bounded errgroup) | 4.1 | High | Low | Do first; independent of all lock work |
-| 2 | Parallelize cross-shard read-merge + write-routing (bounded) | 4.3 | High (cluster) | Low-Med | Reuse `scale` fan-out; add bound |
-| 3 | Flush/merge I/O outside the engine lock + deferred reclamation | 3.1, 3.3 | Very High | **High** | Reclamation (option A) is the real cost; gates #4 |
-| 4 | Fetch reads parts lock-free | 3.2 | High | Med | Requires #3's reclamation |
-| 5 | WAL group-commit + lock-free fsync; one frame/batch for metrics | 3.4 | Med | Med | Metrics catches up to record engine |
-| 6 | Parallelize WAL-sync | 4.2 | Low | Low | Trivial once #1's helper exists |
-| 7 | `tmu` off the WAL-create path | 4.4 | Low-Med | Low | Tenant-churn / cold-start only |
-| 8 | Intra-tenant head striping | 3.5 | Med | High | Only on profiling evidence |
+| # | Change | §  | Impact | Risk | Status |
+|---|--------|----|--------|------|--------|
+| 1 | Parallelize maintenance loop (bounded fan-out) | 4.1 | High | Low | **done** (`internal/parallel`, `maintain`) |
+| 2 | Parallelize cross-shard read-merge + write-routing (bounded) | 4.3 | High (cluster) | Low-Med | **done** (`fetch.Merge`, cluster write loops) |
+| 3 | Flush/merge I/O outside the engine lock + deferred reclamation | 3.1, 3.3 | Very High | **High** | **done** (both engines; refcounted reclamation, COW parts) |
+| 4 | Fetch reads parts lock-free | 3.2 | High | Med | **done** (both engines; `planFetch`/`readParts`) |
+| 5 | WAL group-commit + lock-free fsync; one frame/batch for metrics | 3.4 | Med | Med | **deferred** (separate follow-up) |
+| 6 | Parallelize WAL-sync | 4.2 | Low | Low | **done** (`syncWALs`) |
+| 7 | `tmu` off the WAL-create path | 4.4 | Low-Med | Low | **deferred** (tenant-churn only) |
+| 8 | Intra-tenant head striping | 3.5 | Med | High | **deferred** (only on profiling evidence) |
 
-\#1 and #2 are cheap, safe, and large — start there. #3 is the headline win, but its cost is the
-deferred-reclamation scheme; rushing it risks readers hitting deleted backend objects, so it must land
-with #3 before #4 is enabled.
+#### Implementation notes (what actually landed for #3/#4)
+
+The reclamation scheme chosen was **option B (refcounting)**, not the grace-cycle, because the
+grace-cycle's correctness rests on "no query outlives the maintenance interval," which is not enforced.
+Each `part` carries an `atomic.Int32` refcount; a fetch acquires the live parts it will read under the
+brief plan lock and releases them after the lock-free read; flush/merge *retire* old parts (remove from
+the live set) and `reclaimRetired` deletes their backend objects only once `refs==0`. The parts slice
+is **copy-on-write** (`appendPart`/`replaceParts`) so a snapshot taken under the lock stays stable.
+
+A subtlety the stress test surfaced: a flush that drains the head before publishing the part opens a
+**visibility gap** (records briefly in neither the head nor a part). Fixed by detaching the head buffers
+into an engine-level `flushing` set that fetches still read, swapped for the part atomically at publish
+(so a fetch sees the records in exactly one of `flushing`/part — never neither, never both).
+
+The pragmatic scope held: the **small** metadata writes (bucket index, stream/series index, WAL
+checkpoint) stay under the publish lock, so the parts swap and the durable-watermark commit remain
+atomic and the exactly-once crash-consistency ordering is unchanged; only the **large** part I/O
+(compaction reads, part write/read-back, sidecar union, and fetch's part reads) moved off the lock.
+Validated by `-race` stress tests (concurrent append+fetch against a single flush/merge mutator) in
+both `engine` and `recordengine`, plus the existing exactly-once/recovery suites.
 
 ## 8. Non-goals
 

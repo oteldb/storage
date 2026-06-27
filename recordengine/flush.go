@@ -27,27 +27,48 @@ const (
 	maxInt64 = int64(1<<63 - 1)
 )
 
-// drainHead snapshots every buffered record into part columns sorted by (stream, ts) and clears
-// the head's record buffers (the stream index is retained — identities outlive a flush). nil if no
-// stream has buffered records.
-func (h *head) drainHead() *flushColumns {
-	ids := make([]signal.SeriesID, 0, len(h.records))
-	for id, buf := range h.records {
+// detach moves the head's record buffers aside for a flush and installs fresh empty buffers, so new
+// appends are unaffected, returning the detached buffers (nil if no stream holds a record). The stream
+// index is retained — identities outlive a flush. The caller (the engine) keeps the detached buffers
+// readable until the flushed part is published, so a concurrent fetch never loses sight of the records
+// mid-flush.
+func (h *head) detach() map[signal.SeriesID]*recordCols {
+	any := false
+	for _, buf := range h.records {
+		if buf.len() > 0 {
+			any = true
+
+			break
+		}
+	}
+
+	if !any {
+		return nil
+	}
+
+	detached := h.records
+	h.records = make(map[signal.SeriesID]*recordCols)
+	h.bytes = 0
+
+	return detached
+}
+
+// buildFlushColumns lays the detached record buffers out as part columns sorted by (stream, ts). It
+// reads the (now immutable) detached buffers off the engine lock.
+func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols) *flushColumns {
+	ids := make([]signal.SeriesID, 0, len(records))
+	for id, buf := range records {
 		if buf.len() > 0 {
 			ids = append(ids, id)
 		}
 	}
 
-	if len(ids) == 0 {
-		return nil
-	}
-
 	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
 
-	f := &flushColumns{cols: newRecordCols(h.schema, 0, fullSel(h.schema))}
+	f := &flushColumns{cols: newRecordCols(schema, 0, fullSel(schema))}
 
 	for _, id := range ids {
-		buf := h.records[id]
+		buf := records[id]
 		buf.sortByTs() // order each stream's records by ts so the part is (stream, ts)-sorted
 
 		u := idToU128(id)
@@ -56,9 +77,6 @@ func (h *head) drainHead() *flushColumns {
 			f.cols.appendRow(buf, i)
 		}
 	}
-
-	h.records = make(map[signal.SeriesID]*recordCols)
-	h.bytes = 0
 
 	return f
 }
