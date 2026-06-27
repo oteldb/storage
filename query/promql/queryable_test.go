@@ -2,6 +2,7 @@ package promql
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -180,4 +181,19 @@ func TestQuerierLabelMetadata(t *testing.T) {
 	vals, _, err = q.LabelValues(ctx, "route", nil, eq(t, "__name__", "nope"))
 	require.NoError(t, err)
 	assert.Empty(t, vals)
+}
+
+// TestMsToNsClamp covers the millisecond→nanosecond window conversion: finite values convert, while
+// any out-of-range magnitude (the MinInt64/MaxInt64 sentinels and Prometheus' MinTime/MaxTime, which
+// an unbounded label query arrives with) collapses to the open-ended clamp instead of overflowing.
+func TestMsToNsClamp(t *testing.T) {
+	t.Parallel()
+
+	const maxMs = math.MaxInt64 / nsPerMs
+	assert.Equal(t, int64(1000)*nsPerMs, msToNsClamp(1000, math.MinInt64), "finite ms converts")
+
+	for _, ms := range []int64{math.MinInt64, math.MaxInt64, -maxMs - 1, maxMs + 1, -9_000_000_000_000_000} {
+		assert.Equalf(t, int64(math.MinInt64), msToNsClamp(ms, math.MinInt64), "ms=%d start clamp", ms)
+		assert.Equalf(t, int64(math.MaxInt64), msToNsClamp(ms, math.MaxInt64), "ms=%d end clamp", ms)
+	}
 }

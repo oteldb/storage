@@ -284,7 +284,11 @@ func floatSamples(ts []int64, values []float64) []chunks.Sample {
 }
 
 func msToNsClamp(ms, clamp int64) int64 {
-	if ms == math.MinInt64 || ms == math.MaxInt64 {
+	// Any ms outside the range representable in nanoseconds collapses to the open-ended clamp:
+	// otherwise ms*nsPerMs overflows into a garbage window. This covers the MinInt64/MaxInt64
+	// sentinels and the Prometheus MinTime/MaxTime an unbounded label/metadata query arrives with.
+	const maxMs = math.MaxInt64 / nsPerMs
+	if ms < -maxMs || ms > maxMs {
 		return clamp
 	}
 
