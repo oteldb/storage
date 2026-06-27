@@ -487,7 +487,12 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   the pushdown is preserved across nodes: a compact aggregate RPC (`cluster.AggregatePath`,
   `AggregateHandler`/`RemoteAggregator`) has each shard owner run `AggregateStepNamed` locally and
   ship per-series identity + buckets, which the coordinator (`clusterAggregateFor`) re-checks against
-  the full matcher set and unions — so only aggregates cross the wire, not raw samples (§3i). `Reset(ctx)`
+  the full matcher set and unions — so only aggregates cross the wire, not raw samples (§3i). The
+  facade exposes both forms: `Storage.AggregateMetrics` (unlabeled, `map[SeriesID]SeriesAgg`) and
+  `Storage.AggregateMetricsNamed` (`[]SeriesAggregate`, each a `signal.Series` + `SeriesAgg`) — the
+  labeled form lets an embedder render the result as a PromQL vector from the same sidecar pass,
+  without a second value-decoding fetch (cluster mode unions via `clusterAggregateNamedFor`).
+  `Reset(ctx)`
   is the inverse of accumulation: it replaces
   the head with an empty one, drops the part handles, and deletes this engine's part objects
   from the backend (scoped to `{Prefix}/`), returning the engine to its `New` state for
@@ -577,6 +582,12 @@ What the adapter does (the non-trivial, reusable part):
   kept. Each fetched batch becomes a Prometheus `SeriesSet` of float samples.
 - **Time units.** Storage is unix **nanoseconds**, Prometheus is **milliseconds**; the
   adapter converts both directions (querier window and sample timestamps).
+
+The matcher-lowering and label-projection helpers are exported — `PushableMatchers`,
+`MatchesAll`, `PromLabels` — so an embedder building a pushdown path over the fetch/aggregate
+seam (e.g. oteldb's `*_over_time` aggregate pushdown, which renders a `Storage.AggregateMetrics`
+result as a PromQL vector) reuses the adapter's translation rather than duplicating it. They are
+the single source of truth for the Prom↔storage projection.
 
 The embedder owns evaluation and result types: it runs `promql.Engine` over the adapter and
 consumes Prometheus' own `Vector`/`Matrix`/`Scalar`, so the library defines no query-result

@@ -517,6 +517,62 @@ func (s *Storage) AggregateMetrics(ctx context.Context, t signal.TenantID, r fet
 	return eng.AggregateRange(ctx, r)
 }
 
+// SeriesAggregate pairs a series identity with its whole-range [engine.SeriesAgg]: the labeled
+// form of [Storage.AggregateMetrics]. It is computed from the per-part stats sidecar where the plan
+// is pushdown-safe, so a range-covering aggregate costs ~one row per series rather than a decode of
+// every sample — and because the identity rides along, an embedder can render the result as a
+// PromQL vector (labels + value) without a second, value-decoding fetch.
+type SeriesAggregate struct {
+	engine.SeriesAgg
+
+	Series signal.Series
+}
+
+// AggregateMetricsNamed is the labeled form of [Storage.AggregateMetrics]: it returns each matching
+// series' identity alongside its whole-range aggregate (count/sum/min/max — enough for avg). Use it
+// when the caller needs to render the result with labels (e.g. an embedder's PromQL
+// `*_over_time` pushdown); use [Storage.AggregateMetrics] when only the aggregate is needed. Series
+// with no sample in the window are omitted.
+func (s *Storage) AggregateMetricsNamed(ctx context.Context, t signal.TenantID, r fetch.Request) ([]SeriesAggregate, error) {
+	if s.closed.Load() {
+		return nil, nil
+	}
+
+	var named []engine.NamedAgg
+	if s.cluster != nil {
+		got, err := s.clusterAggregateNamedFor(ctx, t, r, 0) // step 0 ⇒ one whole-range bucket per series
+		if err != nil {
+			return nil, err
+		}
+
+		named = got
+	} else {
+		eng, ok := s.lookupEngine(s.normalizeTenant(t))
+		if !ok {
+			return nil, nil
+		}
+
+		got, err := eng.AggregateStepNamed(ctx, r, 0)
+		if err != nil {
+			return nil, err
+		}
+
+		named = got
+	}
+
+	out := make([]SeriesAggregate, 0, len(named))
+	for i := range named {
+		na := &named[i]
+		if len(na.Buckets) == 0 { // SeriesAgg.Count == 0; omitted upstream, defended anyway.
+			continue
+		}
+
+		out = append(out, SeriesAggregate{Series: na.Series, SeriesAgg: na.Buckets[0].SeriesAgg})
+	}
+
+	return out, nil
+}
+
 // seedFetcher is the outermost read wrapper: it installs the injected logger as the zctx base so
 // every downstream fetcher (fan-out, remote, engine) can log a trace-correlated line, and emits one
 // Debug at the query boundary. It does not touch the request.

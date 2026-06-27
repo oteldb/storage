@@ -11,6 +11,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/query/promql"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -107,5 +108,44 @@ func TestAggregateMetricsEndToEnd(t *testing.T) {
 		assert.InDelta(t, sum, agg.Sum, 0)
 		assert.InDelta(t, mn, agg.Min, 0)
 		assert.InDelta(t, mx, agg.Max, 0)
+	}
+}
+
+// TestAggregateMetricsNamed drives the labeled aggregate facade and checks each result carries the
+// series identity (renderable as labels) alongside the same aggregate the unlabeled facade returns.
+func TestAggregateMetricsNamed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()), WithAggregateStats())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close(ctx)) }()
+
+	if _, err := s.WriteMetrics(ctx, buildCorpus(corpusProfile{
+		name: "c", series: 100, points: 50, interval: 15_000_000_000, pattern: patCounter,
+	}, 1)); err != nil {
+		t.Fatal(err)
+	}
+	eng := mustEngine(s.engineFor("default"))
+	require.NoError(t, eng.Flush(ctx))
+
+	req := fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{nameMatcher("bench.metric")}}
+
+	want, err := s.AggregateMetrics(ctx, "default", req)
+	require.NoError(t, err)
+
+	got, err := s.AggregateMetricsNamed(ctx, "default", req)
+	require.NoError(t, err)
+	require.Len(t, got, len(want), "one labeled aggregate per unlabeled entry")
+
+	for _, la := range got {
+		id := la.Series.Hash()
+		agg, ok := want[id]
+		require.Truef(t, ok, "labeled series %v absent from unlabeled map", id)
+		assert.Equal(t, agg, la.SeriesAgg, "labeled aggregate matches the unlabeled facade")
+
+		// The identity renders as a Prometheus label set carrying the metric name.
+		lset := promql.PromLabels(la.Series)
+		assert.Equal(t, "bench.metric", lset.Get("__name__"))
 	}
 }

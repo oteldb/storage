@@ -197,3 +197,33 @@ func TestMsToNsClamp(t *testing.T) {
 		assert.Equalf(t, int64(math.MaxInt64), msToNsClamp(ms, math.MaxInt64), "ms=%d end clamp", ms)
 	}
 }
+
+// TestExportedHelpers covers the exported projection helpers an embedder's pushdown path calls
+// directly: PromLabels mirrors the [Queryable]'s label projection, MatchesAll is the
+// post-fetch full-set re-check, and PushableMatchers lowers only the index-safe subset.
+func TestExportedHelpers(t *testing.T) {
+	t.Parallel()
+
+	s := signal.Series{Attributes: signal.NewAttributes(
+		signal.KeyValue{Key: []byte("__name__"), Value: signal.StringValue([]byte("m"))},
+		signal.KeyValue{Key: []byte("__unit__"), Value: signal.StringValue([]byte("By"))},
+		signal.KeyValue{Key: []byte("route"), Value: signal.StringValue([]byte("/a"))},
+	)}
+
+	// PromLabels hides the reserved __unit__ and keeps __name__/route.
+	lset := PromLabels(s)
+	assert.Equal(t, "m", lset.Get("__name__"))
+	assert.Equal(t, "/a", lset.Get("route"))
+	assert.Empty(t, lset.Get("__unit__"), "__unit__ hidden")
+
+	// MatchesAll treats an absent label as "" (Prometheus semantics): a "!=" matcher passes.
+	assert.True(t, MatchesAll(lset, []*labels.Matcher{neq(t, "absent", "x")}))
+	assert.False(t, MatchesAll(lset, []*labels.Matcher{eq(t, "route", "/b")}))
+
+	// PushableMatchers keeps only index-safe matchers: the equality __name__ (with a serializable
+	// Spec) is pushed, the negated route matcher (which matches "") is not.
+	pushed := PushableMatchers([]*labels.Matcher{eq(t, "__name__", "m"), neq(t, "route", "/x")})
+	require.Len(t, pushed, 1)
+	assert.Equal(t, []byte("__name__"), pushed[0].Name)
+	assert.NotNil(t, pushed[0].Spec, "equality matcher carries a serializable Spec")
+}

@@ -273,6 +273,48 @@ func (s *Storage) clusterAggregateFor(
 	return out, nil
 }
 
+// clusterAggregateNamedFor is the labeled variant of [clusterAggregateFor]: it computes a tenant's
+// step-bucketed aggregate across all its shards but keeps each series' identity (so the coordinator
+// can render labels), re-checking the full matcher set against each shard's returned identities and
+// merging buckets for any series that surfaces from more than one shard. It backs the labeled
+// [Storage.AggregateMetricsNamed] pushdown path in cluster mode.
+func (s *Storage) clusterAggregateNamedFor(
+	ctx context.Context, tid signal.TenantID, r fetch.Request, step int64,
+) ([]engine.NamedAgg, error) {
+	cn := s.cluster
+	tenant := s.normalizeTenant(tid)
+	n := cn.shardCount()
+
+	var out []engine.NamedAgg
+	index := make(map[signal.SeriesID]int, n) // id → position in out, to merge a series seen twice
+
+	for idx := range n {
+		sk := shardKeyOf(tenant, idx, n)
+
+		named, err := s.shardAggregate(ctx, sk, r, step)
+		if err != nil {
+			return nil, err
+		}
+
+		for i := range named {
+			na := &named[i]
+			if !matchesAllSeries(na.Series, r.Matchers) {
+				continue
+			}
+
+			id := na.Series.Hash()
+			if j, ok := index[id]; ok {
+				out[j].Buckets = mergeBucketLists(out[j].Buckets, na.Buckets)
+			} else {
+				index[id] = len(out)
+				out = append(out, engine.NamedAgg{Series: na.Series, Buckets: na.Buckets})
+			}
+		}
+	}
+
+	return out, nil
+}
+
 // shardAggregate gets one metric shard's per-series aggregates: locally (full matcher pushdown) if
 // this node owns it, else from a remote owner with sequential failover (equality matchers pushed;
 // the coordinator re-checks the full set on the returned identities).

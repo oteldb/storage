@@ -75,7 +75,7 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.Select
 		Tenant:   q.tenant,
 		Start:    msToNsClamp(q.mint, math.MinInt64),
 		End:      msToNsClamp(q.maxt, math.MaxInt64),
-		Matchers: pushableMatchers(matchers),
+		Matchers: PushableMatchers(matchers),
 	}
 
 	it, err := q.fetcher.Fetch(ctx, req)
@@ -90,8 +90,8 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.Select
 
 	series := make([]storage.Series, 0, len(batches))
 	for _, b := range batches {
-		lset := promLabels(b.Series)
-		if !matchesAll(lset, matchers) {
+		lset := PromLabels(b.Series)
+		if !MatchesAll(lset, matchers) {
 			continue
 		}
 
@@ -154,7 +154,7 @@ func (q *querier) seriesLabels(ctx context.Context, matchers []*labels.Matcher) 
 		Tenant:   q.tenant,
 		Start:    msToNsClamp(q.mint, math.MinInt64),
 		End:      msToNsClamp(q.maxt, math.MaxInt64),
-		Matchers: pushableMatchers(matchers),
+		Matchers: PushableMatchers(matchers),
 	}
 
 	it, err := q.fetcher.Fetch(ctx, req)
@@ -169,8 +169,8 @@ func (q *querier) seriesLabels(ctx context.Context, matchers []*labels.Matcher) 
 
 	out := make([]labels.Labels, 0, len(batches))
 	for _, b := range batches {
-		lset := promLabels(b.Series)
-		if !matchesAll(lset, matchers) {
+		lset := PromLabels(b.Series)
+		if !MatchesAll(lset, matchers) {
 			continue
 		}
 
@@ -192,11 +192,15 @@ func sortedKeys(set map[string]struct{}) []string {
 	return out
 }
 
-// pushableMatchers returns fetch matchers for the index-safe subset: matchers that do not
+// PushableMatchers returns fetch matchers for the index-safe subset: matchers that do not
 // match the empty string. A matcher that matches "" (negated/absent) cannot prune via the
 // postings index without wrongly dropping series that lack the label, so it is enforced only
-// by the post-fetch re-check in matchesAll.
-func pushableMatchers(ms []*labels.Matcher) []fetch.Matcher {
+// by the post-fetch re-check in [MatchesAll].
+//
+// It is exported so an embedder building a pushdown path over the fetch/aggregate seam (e.g.
+// oteldb's *_over_time aggregate pushdown) can lower the same index-safe matcher set the
+// [Queryable] uses, keeping matcher translation in one place.
+func PushableMatchers(ms []*labels.Matcher) []fetch.Matcher {
 	out := make([]fetch.Matcher, 0, len(ms))
 	for _, m := range ms {
 		if m.Matches("") {
@@ -221,9 +225,11 @@ func valuePredicate(m *labels.Matcher) func(signal.Value) bool {
 	return func(v signal.Value) bool { return m.Matches(string(v.AppendText(nil))) }
 }
 
-// matchesAll reports whether a series' labels satisfy every matcher, treating an absent
-// label as the empty string (Prometheus semantics).
-func matchesAll(lset labels.Labels, ms []*labels.Matcher) bool {
+// MatchesAll reports whether a series' labels satisfy every matcher, treating an absent
+// label as the empty string (Prometheus semantics). It is the post-fetch re-check companion to
+// [PushableMatchers]: exported so an embedder's pushdown path re-checks the full matcher set the
+// same way [Queryable] does.
+func MatchesAll(lset labels.Labels, ms []*labels.Matcher) bool {
 	for _, m := range ms {
 		if !m.Matches(lset.Get(m.Name)) {
 			return false
@@ -233,11 +239,15 @@ func matchesAll(lset labels.Labels, ms []*labels.Matcher) bool {
 	return true
 }
 
-// promLabels projects a storage series identity to a Prometheus label set: every resource,
+// PromLabels projects a storage series identity to a Prometheus label set: every resource,
 // scope, and (folded) point attribute becomes a label, with the internal reserved labels
 // (except __name__) hidden. Scope name/version are exposed under the otel.scope.* keys, the
 // same labels the head indexes.
-func promLabels(s signal.Series) labels.Labels {
+//
+// PromLabels is exported so an embedder can render a [signal.Series] (e.g. the identity carried
+// alongside an [github.com/oteldb/storage.Storage.AggregateMetrics] result) as PromQL labels
+// without duplicating this projection.
+func PromLabels(s signal.Series) labels.Labels {
 	b := labels.NewScratchBuilder(0)
 
 	add := func(name string, v signal.Value) {
