@@ -5,8 +5,8 @@
 Implementation status (recommended order 4 → 1 → 3a → 2 → 3b/3c):
 - **Track 4a–4d — DONE** (rebalance.Plan wired; clustered admission; Log/Trace enumeration fan-out;
   WAL-durable scale factor). Folded into `ARCHITECTURE.md`.
-- **Track 4e — DEFERRED** (MaxPartSize needs part-splitting; lz4 needs a new dependency — discuss per
-  CLAUDE.md; SIMD expansion is large codegen). Follow-ups, not done.
+- **Track 4e — DONE.** MaxPartSize part-splitting (flush + merge), real LZ4 (pierrec/lz4/v4), and an
+  AVX2 MinMaxFloat64 SIMD kernel. Folded into `ARCHITECTURE.md`.
 - **Track 1 (`Storage.Inspect`) — DONE.** Folded into `ARCHITECTURE.md`.
 - **Track 2 (`Storage.Admin`) — DONE.** Folded into `ARCHITECTURE.md`.
 - **Track 3a (cardinality budget + overflow) — DONE** (`docs/design/cardinality-overflow.md`).
@@ -15,7 +15,7 @@ Implementation status (recommended order 4 → 1 → 3a → 2 → 3b/3c):
   `ARCHITECTURE.md`.
 - **Track 3c (fair maintenance scheduling) — DONE.** Folded into `ARCHITECTURE.md`.
 
-All tracks except 4e are now implemented.
+All tracks are now implemented.
 
 The sections below are the original proposal, kept for context. When a track is implemented, fold its
 outcome into `ARCHITECTURE.md`.

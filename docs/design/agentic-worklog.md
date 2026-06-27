@@ -18,7 +18,11 @@ more commits; the code of record is the git history and `ARCHITECTURE.md`.
   fuzzed.
 - **4d — WAL-durable scale factor.** New `recordSamplesSF` WAL frame; replay restores sampling
   weights so a crash recovers unflushed sampled data at its representative weight.
-- **4e — deferred** (MaxPartSize part-splitting; lz4 needs a dep; SIMD codegen). Follow-ups.
+- **4e — DONE.** (1) **lz4**: AlgorithmLZ4 now does real pierrec/lz4/v4 block compression
+  ([uvarint origLen][block] framing) instead of storing raw. (2) **SIMD**: added an AVX2
+  `MinMaxFloat64` kernel (NaN via ±Inf blend, +Inf/-Inf all-NaN sentinel) with a fuzz-parity pure-Go
+  fallback, used in `block.fillFloat64Stats`. (3) **MaxPartSize**: `Config.MaxPartBytes` splits
+  flush/merge output so no part exceeds the cap (from `tenant.Limits.MaxPartSize`).
 
 ## Track 1 — introspection
 

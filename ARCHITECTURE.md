@@ -450,6 +450,12 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   Bucket alignment is to the absolute grid (not ingest time), so the rollup of a range is independent
   of when the merge runs and repeated merges are a **fixed point** for last/first/min/max/sum/avg (a
   one-sample bucket aggregates to itself); count is the documented non-idempotent exception.
+- **MaxPartBytes — part splitting** (`Config.MaxPartBytes`, from `tenant.Limits.MaxPartSize`): both
+  **flush and merge split** their column output into row-bounded chunks (`chunkRanges`/`slice`, a
+  ~32 B/row estimate) so no single immutable part exceeds the cap; 0 ⇒ unlimited (one part,
+  byte-identical to before). Splitting at row boundaries is safe — parts are independent and a series
+  spanning two parts is merged back by the read seam — and a merge decides each split part's cold
+  recompression/precision from its own newest sample. `replaceParts` takes the resulting set.
   **Precision** is age-tiered *lossy* float compression: a `PrecisionTier{Before, Bits}` re-encodes a
   **fully-cold** part's value column with the scaled-decimal codec retaining only `Bits` significant
   mantissa bits (fewer ⇒ denser, less accurate), so recent data stays lossless and only old data
@@ -933,8 +939,8 @@ the original no-sf frame, byte-for-byte). The **soft cardinality budget with `__
 is built (metrics, single-node — see the Cardinality valve above; no hysteresis, as the head's series
 index is monotonic). Not yet built (the rest of §8a): the clustered **central→edge budget feedback**
 (each node's rate valve and soft budget see only their own node's traffic) and **overflow on the
-clustered write path** (the primary applies the hard cap only). `MaxPartSize` is also not yet
-enforced.
+clustered write path** (the primary applies the hard cap only). `MaxPartSize` **is** now enforced —
+flush and merge split their output so no part exceeds it (§3f, `engine.Config.MaxPartBytes`).
 
 ---
 
@@ -1227,9 +1233,9 @@ death (lease revoke) hands all of its shards to the survivors with none left orp
 encoding/             umbrella doc for the codec layers
   encoding/bitstream  MSB-first bit Writer/Reader                                      [implemented]
   encoding/chunk      DoD / Gorilla / T64 / dict / bytesraw / decimal / id128 column codecs [implemented]
-  encoding/compress   zstd/none block wrapper (lz4 stub)                              [implemented]
+  encoding/compress   zstd / lz4 (pierrec/lz4) / none block wrapper                   [implemented]
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
-internal/simd         vectorized columnar kernels (AVX2) + pure-Go fallback + runtime CPU dispatch [implemented: int64 min/max]
+internal/simd         vectorized columnar kernels (AVX2) + pure-Go fallback + runtime CPU dispatch [implemented: int64 + float64 min/max]
 internal/cmd/gensimd  avo generator for internal/simd's committed *_amd64.s (//go:generate)   [implemented]
 internal/obs          injected observability handle: zap logger (context-plumbed via go-faster/sdk/zctx, trace-correlated) + OTel tracer + per-layer metric instruments (admission/flush/merge/fetch/backend/WAL/rpc) + W3C trace propagation; no-op default [implemented]
 internal/retry        transport reliability primitives: Do (retry+per-try timeout+backoff), Hedge (opportunistic concurrent retries), HTTP error classifiers [implemented]
