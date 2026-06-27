@@ -9,11 +9,13 @@ Implementation status (recommended order 4 → 1 → 3a → 2 → 3b/3c):
   CLAUDE.md; SIMD expansion is large codegen). Follow-ups, not done.
 - **Track 1 (`Storage.Inspect`) — DONE.** Folded into `ARCHITECTURE.md`.
 - **Track 2 (`Storage.Admin`) — DONE.** Folded into `ARCHITECTURE.md`.
-- **Track 3a (cardinality budget + overflow) — DESIGNED** (`docs/design/cardinality-overflow.md`);
-  awaiting go-ahead. Hysteresis dropped (the head's series index is monotonic).
-- **Track 3b (per-signal record sharding) — DESIGNED** (`docs/design/record-sharding.md`); awaiting
-  go-ahead.
+- **Track 3a (cardinality budget + overflow) — DONE** (`docs/design/cardinality-overflow.md`).
+  Hysteresis dropped (the head's series index is monotonic). Folded into `ARCHITECTURE.md`.
+- **Track 3b (per-signal record sharding) — DONE** (`docs/design/record-sharding.md`). Folded into
+  `ARCHITECTURE.md`.
 - **Track 3c (fair maintenance scheduling) — DONE.** Folded into `ARCHITECTURE.md`.
+
+All tracks except 4e are now implemented.
 
 The sections below are the original proposal, kept for context. When a track is implemented, fold its
 outcome into `ARCHITECTURE.md`.

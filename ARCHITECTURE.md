@@ -678,8 +678,18 @@ to different primaries, each replicating to its shard's owners); the read seam (
 **gathers across all N shards** — serving a shard locally when this node owns it, else fanning out to
 an owner — and merges, so any node answers a full query. Compaction stays one-owner-per-shard
 (`metricMergeOptions` resolves the tenant's retention/downsampling policy from the shard key via
-`tenantOfShard`). Sharding applies to **metrics only**; the record signals (logs/traces/profiles)
-remain a single shard (`Ring().Primary(tenant)`).
+`tenantOfShard`). **Sharding applies to all signals.** The record signals (logs/traces/profiles)
+shard the same way: `writeRecordsClustered` groups each stream by `shardKeyOf(tenant,
+hash(streamID)%N)` and routes per shard; `clusterRecordFetcherFor` gathers across all N shards
+(concatenating, since records are not ts-deduped). The cross-shard reassembly that a record query
+needs is handled explicitly: **trace-by-id** runs the fetch across every shard (a trace's spans
+belong to different service streams that scatter), **`LogSeries`/`TraceSeries`/`ProfileSeries`**
+concatenate per-shard series (disjoint sets) and **`LogKeys`** unions per-shard keys (OR-ing scope
+bits), and the **profile symbol store** is unioned across shards (`clusterProfileSymbols` merges each
+shard's tables — content-addressed, so a plain dedup) so a flamegraph over samples from several
+shards resolves every stack. `retainFrom` resolves a record shard key's policy via `tenantOfShard`,
+like `metricMergeOptions`. One knob (`ShardsPerTenant`) governs every signal; N=1 stays
+byte-identical to the unsharded layout.
 
 **Facade cluster mode** (`cluster.go`, `Options.Cluster`): when configured, `Storage.Open`
 joins the etcd cluster, runs the HTTP server on the node's address (mounting the replicate,

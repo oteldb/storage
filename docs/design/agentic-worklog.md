@@ -39,4 +39,8 @@ more commits; the code of record is the git history and `ARCHITECTURE.md`.
   a collapsed `{__name__, __overflow__}` series (head-enforced, WAL-consistent via the effective id),
   counted as accepted+overflowed (`storage.ingest.overflowed`). No hysteresis (monotonic index). See
   `docs/design/cardinality-overflow.md`.
-- **3b — per-signal record sharding.** (in progress — see `docs/design/record-sharding.md`)
+- **3b — per-signal record sharding — DONE.** `ShardsPerTenant` now shards logs/traces/profiles too:
+  write groups by `shardKeyOf(tenant, hash(streamID)%N)`, reads gather/concat across shards. Cross-
+  shard reassembly handled: trace-by-id across shards, `Log/Trace/ProfileSeries` concat, `LogKeys`
+  union, profile symbol-store union (`clusterProfileSymbols`). N=1 byte-identical. See
+  `docs/design/record-sharding.md`.
