@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -20,6 +21,7 @@ import (
 	"github.com/oteldb/storage/cluster/replica"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/obs"
+	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/internal/retry"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/recordengine"
@@ -624,25 +626,54 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 		}
 	})
 
-	var rejected int64
+	// Each shard routes to its own ring primary independently; fan the routes out under a bound
+	// rather than paying the sum of per-primary round-trips.
+	type route struct {
+		key     signal.TenantID
+		payload []byte
+	}
 
+	routes := make([]route, 0, len(byShard))
 	for sk, sw := range byShard {
-		rej, err := s.routeToPrimary(ctx, signal.Metric, string(sk), sw.buf.Bytes())
+		routes = append(routes, route{sk, sw.buf.Bytes()})
+	}
+
+	var (
+		rejected atomic.Int64
+		errs     = make([]error, len(routes))
+	)
+
+	parallel.ForEach(len(routes), clusterWriteFanOut, func(i int) {
+		rej, err := s.routeToPrimary(ctx, signal.Metric, string(routes[i].key), routes[i].payload)
 		if err != nil {
-			return Accepted{Accepted: int64(emitted) - rejected, Rejected: rejected}, err
+			errs[i] = err
+
+			return
 		}
 
-		rejected += int64(rej)
+		rejected.Add(int64(rej))
+	})
+
+	for _, err := range errs { // surface the first error deterministically (by route index)
+		if err != nil {
+			return Accepted{Accepted: int64(emitted) - rejected.Load(), Rejected: rejected.Load()}, err
+		}
 	}
 
 	// The primary's rejections are out-of-order drops (admission is applied at the origin today).
-	accepted := int64(emitted) - rejected
-	s.emitAdmission(ctx, signal.Metric, accepted, rejectTally{ooo: rejected}, 0)
+	rej := rejected.Load()
+	accepted := int64(emitted) - rej
+	s.emitAdmission(ctx, signal.Metric, accepted, rejectTally{ooo: rej}, 0)
 
-	return Accepted{Accepted: accepted, Rejected: rejected}, nil
+	return Accepted{Accepted: accepted, Rejected: rej}, nil
 }
 
 const primaryWritePath = "/internal/primary-write"
+
+// clusterWriteFanOut bounds how many shard/tenant primaries a clustered write routes to at once.
+// Writes are RPC-bound, so this is set above the CPU count to overlap round-trips while capping
+// in-flight requests on a wide fan-out.
+const clusterWriteFanOut = 16
 
 // routeToPrimary sends a signal's tenant write (WAL-framed records) to the tenant's ring primary
 // and returns how many records the primary rejected as out-of-order. The primary — local or

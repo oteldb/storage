@@ -29,10 +29,7 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 		zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
 		zap.Int64("retain_from", retainFrom))
 
-	e.mu.Lock()
-	compacted, err := e.mergeLocked(ctx, retainFrom)
-	e.mu.Unlock()
-
+	compacted, err := e.merge(ctx, retainFrom)
 	if err != nil {
 		span.RecordError(err)
 		log.Error("merge failed",
@@ -55,10 +52,22 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 	return nil
 }
 
-// mergeLocked compacts the parts and returns the number of source parts compacted (0 ⇒ no-op). The
-// caller holds e.mu.
-func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) (int, error) {
-	if len(e.parts) == 0 || (len(e.parts) == 1 && retainFrom <= 0) {
+// merge compacts every flushed part into one new part, returning the number of source parts compacted
+// (0 ⇒ no-op). Phased like flush: the source-part reads, the compacted-part write/read-back, and the
+// sidecar union happen off the engine lock; only the small metadata publish runs under it. The old
+// parts are retired (not deleted inline) and reclaimed once their in-flight readers drain. Only the
+// background maintenance task calls merge, so the parts mutation has a single writer.
+func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
+	// Plan (under lock): snapshot the source parts (immutable backing) and reserve the sequence.
+	e.mu.Lock()
+	src := e.parts
+	noop := len(src) == 0 || (len(src) == 1 && retainFrom <= 0)
+	seq := e.nextSeq
+	e.mu.Unlock()
+
+	if noop {
+		e.reclaimRetired(ctx) // nothing to compact, but still sweep pending deletions
+
 		return 0, nil
 	}
 
@@ -67,47 +76,59 @@ func (e *Engine) mergeLocked(ctx context.Context, retainFrom int64) (int, error)
 		start = retainFrom
 	}
 
-	f, err := e.compactParts(ctx, start)
+	// Build (lock-free): read+compact the source parts, write the merged part, read it back, union the
+	// side-store sidecars. A merge reads the source parts; they stay live (not retired) until publish,
+	// so they cannot be reclaimed underneath this read.
+	f, err := e.compactParts(ctx, src, start)
 	if err != nil {
 		return 0, err
 	}
 
-	old := e.parts
-	compacted := len(old)
+	var newPart *part
 
-	if f.len() == 0 {
-		e.parts = nil // retention dropped every record
-	} else {
-		prefix := e.partPrefix(e.nextSeq)
+	if f.len() > 0 {
+		prefix := e.partPrefix(seq)
 		if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f); err != nil {
 			return 0, err
 		}
 
-		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix)
+		newPart, err = openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix)
 		if err != nil {
 			return 0, err
 		}
 
-		p.minTime, p.maxTime = colsTimeRange(f)
-		e.parts = []*part{p}
-		e.nextSeq++
+		newPart.minTime, newPart.maxTime = colsTimeRange(f)
 
-		if err := e.mergeSidecars(ctx, old, prefix); err != nil {
+		if err := e.mergeSidecars(ctx, src, prefix); err != nil {
 			return 0, err
 		}
 	}
 
-	if err := e.updateIndexLocked(ctx); err != nil {
-		return 0, err
+	// Publish (under lock): swap the source parts for the merged one copy-on-write (keeping any part a
+	// concurrent flush may have added), retire the sources, and persist the index. The retired parts'
+	// objects are deleted by reclaimRetired once their readers drain.
+	removed := make(map[string]struct{}, len(src))
+	for _, p := range src {
+		removed[p.prefix] = struct{}{}
 	}
 
-	for _, p := range old {
-		if err := deletePart(ctx, e.cfg.Backend, p.prefix); err != nil {
-			return compacted, err
-		}
+	e.mu.Lock()
+	e.parts = replaceParts(e.parts, removed, newPart)
+	if newPart != nil {
+		e.nextSeq = seq + 1
 	}
 
-	return compacted, nil
+	e.retireLocked(src)
+	err = e.updateIndexLocked(ctx)
+	e.mu.Unlock()
+
+	if err != nil {
+		return len(src), err
+	}
+
+	e.reclaimRetired(ctx)
+
+	return len(src), nil
 }
 
 // mergeSidecars unions the side-store sidecars of the compacted parts and writes the merged tables
@@ -136,11 +157,12 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 	return writeSidecars(ctx, e.cfg.Backend, newPrefix, merged)
 }
 
-// compactParts concatenates every part's records per stream (within [start, maxInt64], applying
-// retention), returning the combined full columns sorted by (stream, ts). Empty when none survive.
-func (e *Engine) compactParts(ctx context.Context, start int64) (*flushColumns, error) {
+// compactParts concatenates each source part's records per stream (within [start, maxInt64], applying
+// retention), returning the combined full columns sorted by (stream, ts). Empty when none survive. It
+// reads the parts off the engine lock; src is the immutable snapshot the caller planned over.
+func (e *Engine) compactParts(ctx context.Context, src []*part, start int64) (*flushColumns, error) {
 	idSet := make(map[signal.SeriesID]struct{})
-	for _, p := range e.parts {
+	for _, p := range src {
 		for id := range p.ranges {
 			idSet[id] = struct{}{}
 		}
@@ -158,7 +180,7 @@ func (e *Engine) compactParts(ctx context.Context, start int64) (*flushColumns, 
 	for _, id := range ids {
 		acc := newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
 
-		for _, p := range e.parts {
+		for _, p := range src {
 			if err := p.appendWindow(ctx, id, acc, start, maxInt64); err != nil {
 				return nil, err
 			}
@@ -183,12 +205,12 @@ func (e *Engine) compactParts(ctx context.Context, start int64) (*flushColumns, 
 // Close flushes any buffered records to a part and closes the WAL. It does not stop a background
 // loop — the owner ([storage.Storage]) does that before calling Close.
 func (e *Engine) Close(ctx context.Context) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if _, err := e.flushLocked(ctx); err != nil {
+	if _, err := e.flush(ctx); err != nil {
 		return err
 	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	if e.cfg.WAL != nil {
 		return e.cfg.WAL.Close()

@@ -68,6 +68,11 @@ type Options struct {
 	// Samples older than (newest - OOOWindow) are rejected (counted). Zero ⇒ default.
 	OOOWindow int64 // nanoseconds
 
+	// MaintenanceConcurrency caps how many engines the background maintenance loop flushes/merges
+	// (and fsyncs) concurrently. Engines are independent per-tenant/per-signal shards, so this
+	// bounds the parallel compaction fan-out against the backend. Zero ⇒ a CPU-derived default.
+	MaintenanceConcurrency int
+
 	// QuerySplitInterval, when > 0, makes [Storage.Fetcher] split a query's time window
 	// into aligned sub-windows of this width (nanoseconds), fetched concurrently and merged
 	// (the query-frontend "split by interval" technique). Zero ⇒ no splitting.
@@ -200,6 +205,12 @@ func WithFlushInterval(ns int64) Option { return func(o *Options) { o.FlushInter
 
 // WithOOOWindow sets the out-of-order ingestion window in nanoseconds.
 func WithOOOWindow(ns int64) Option { return func(o *Options) { o.OOOWindow = ns } }
+
+// WithMaintenanceConcurrency caps the background maintenance loop's parallel flush/merge fan-out
+// across engines. Zero ⇒ a CPU-derived default.
+func WithMaintenanceConcurrency(n int) Option {
+	return func(o *Options) { o.MaintenanceConcurrency = n }
+}
 
 // WithLogger sets the zap logger the library logs through (DESIGN.md §16). nil ⇒ a no-op logger.
 func WithLogger(l *zap.Logger) Option { return func(o *Options) { o.Logger = l } }

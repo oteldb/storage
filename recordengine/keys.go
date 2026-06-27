@@ -68,8 +68,11 @@ func (e *Engine) Keys(start, end int64) []KeyInfo {
 		}
 	})
 
-	// Record-attribute keys: the head's still-buffered records plus each in-window part's footer.
-	e.head.collectRecordKeys(start, end, func(key []byte) { add(key, KeyScopeRecord) })
+	// Record-attribute keys: the head's still-buffered records (plus any detached mid-flush) and each
+	// in-window part's footer.
+	emitRecord := func(key []byte) { add(key, KeyScopeRecord) }
+	collectRecordKeys(e.cfg.Schema, e.head.records, start, end, emitRecord)
+	collectRecordKeys(e.cfg.Schema, e.flushing, start, end, emitRecord)
 
 	for _, p := range e.parts {
 		if !partInWindow(p, start, end) {
@@ -110,18 +113,18 @@ func keyInfoSlice(scopes map[string]KeyScope) []KeyInfo {
 	return out
 }
 
-// collectRecordKeys calls emit for every per-record attribute key buffered in the head whose record
+// collectRecordKeys calls emit for every per-record attribute key buffered in records whose record
 // falls in [start, end] (a zero start AND end disables the filter). No-op when the schema has no
-// serialized-attributes column. Caller holds the engine lock.
-func (h *head) collectRecordKeys(start, end int64, emit func(key []byte)) {
-	k, ok := h.schema.attrsByteCol()
+// serialized-attributes column or records is nil. Caller holds the engine lock.
+func collectRecordKeys(schema *Schema, records map[signal.SeriesID]*recordCols, start, end int64, emit func(key []byte)) {
+	k, ok := schema.attrsByteCol()
 	if !ok {
 		return
 	}
 
 	all := start == 0 && end == 0
 
-	for _, buf := range h.records {
+	for _, buf := range records {
 		blobs := buf.bytes[k]
 		for i := range buf.ts {
 			if !all && (buf.ts[i] < start || buf.ts[i] > end) {

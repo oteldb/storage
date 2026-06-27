@@ -196,7 +196,11 @@ func (h *head) recordCount(id signal.SeriesID) int {
 
 // appendWindow appends stream id's buffered records whose timestamp is in [start, end] to acc.
 func (h *head) appendWindow(id signal.SeriesID, acc *recordCols, start, end int64) {
-	buf := h.records[id]
+	appendColsWindow(h.records[id], acc, start, end)
+}
+
+// appendColsWindow appends buf's rows whose timestamp is in [start, end] to acc. No-op when buf is nil.
+func appendColsWindow(buf, acc *recordCols, start, end int64) {
 	if buf == nil {
 		return
 	}
@@ -206,6 +210,22 @@ func (h *head) appendWindow(id signal.SeriesID, acc *recordCols, start, end int6
 			acc.appendRow(buf, i)
 		}
 	}
+}
+
+// bufInRange reports whether buf holds any record with timestamp in [start, end]. No-op (false) when
+// buf is nil.
+func bufInRange(buf *recordCols, start, end int64) bool {
+	if buf == nil {
+		return false
+	}
+
+	for _, t := range buf.ts {
+		if t >= start && t <= end {
+			return true
+		}
+	}
+
+	return false
 }
 
 // trimBelow drops every buffered record with timestamp ≤ t (now durable in a flushed part),

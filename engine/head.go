@@ -305,7 +305,15 @@ func drain(p postings.Postings) []signal.SeriesID {
 // batch builds a fetch batch for series id within [start, end], or nil if it has no
 // samples in the window.
 func (h *head) batch(id signal.SeriesID, start, end int64) *fetch.Batch {
-	buf := h.samples[id]
+	s, _ := h.series.Get(id)
+
+	return bufBatch(h.samples[id], id, s, start, end)
+}
+
+// bufBatch builds a fetch batch from one sample buffer within [start, end] (with the given identity),
+// or nil if buf is nil or has no samples in the window. Used for both the live head and the buffers a
+// flush has detached but not yet published as a part.
+func bufBatch(buf *sampleBuf, id signal.SeriesID, s signal.Series, start, end int64) *fetch.Batch {
 	if buf == nil {
 		return nil
 	}
@@ -315,9 +323,32 @@ func (h *head) batch(id signal.SeriesID, start, end int64) *fetch.Batch {
 		return nil
 	}
 
-	s, _ := h.series.Get(id)
-
 	return &fetch.Batch{ID: id, Series: s, Timestamps: ts, Values: values, ScaleFactors: sf}
+}
+
+// detach moves the head's sample buffers aside for a flush and installs fresh empty buffers, so new
+// appends are unaffected, returning the detached buffers (nil if no series holds a sample). The series
+// index is retained — identities outlive a flush. The caller keeps the detached buffers readable until
+// the flushed part is published, so a concurrent fetch never loses sight of the samples mid-flush.
+func (h *head) detach() map[signal.SeriesID]*sampleBuf {
+	hasRows := false
+	for _, buf := range h.samples {
+		if len(buf.ts) > 0 {
+			hasRows = true
+
+			break
+		}
+	}
+
+	if !hasRows {
+		return nil
+	}
+
+	detached := h.samples
+	h.samples = make(map[signal.SeriesID]*sampleBuf)
+	h.bytes = 0
+
+	return detached
 }
 
 type tsv struct {

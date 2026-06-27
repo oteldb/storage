@@ -20,6 +20,7 @@ import (
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/obs"
+	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/scale"
 	"github.com/oteldb/storage/recordengine"
@@ -873,22 +874,36 @@ func (s *Storage) runWALSync(interval time.Duration) {
 // syncWALs fsyncs every tenant engine's WAL across all signals (background interval sync). Errors are
 // swallowed; the next tick retries.
 func (s *Storage) syncWALs() {
-	for _, e := range s.engineSnapshot() {
-		_ = e.SyncWAL()
+	// Each engine's WAL is an independent file; fsyncs across engines parallelize. Gather them as a
+	// single list and fan out under the same bound as maintenance.
+	metrics := s.engineSnapshot()
+	logs := s.logEngineSnapshot()
+	traces := s.traceEngineSnapshot()
+	profiles := s.profileEngineSnapshot()
+
+	wals := make([]walSyncer, 0, len(metrics)+len(logs)+len(traces)+len(profiles))
+	for _, e := range metrics {
+		wals = append(wals, e)
 	}
 
-	for _, e := range s.logEngineSnapshot() {
-		_ = e.SyncWAL()
+	for _, e := range logs {
+		wals = append(wals, e)
 	}
 
-	for _, e := range s.traceEngineSnapshot() {
-		_ = e.SyncWAL()
+	for _, e := range traces {
+		wals = append(wals, e)
 	}
 
-	for _, e := range s.profileEngineSnapshot() {
-		_ = e.SyncWAL()
+	for _, e := range profiles {
+		wals = append(wals, e)
 	}
+
+	parallel.ForEach(len(wals), s.maintenanceConcurrency(), func(i int) { _ = wals[i].SyncWAL() })
 }
+
+// walSyncer is the subset of an engine the WAL-sync loop needs: both the metric engine and the
+// record engine expose SyncWAL, so the loop fans out over them uniformly.
+type walSyncer interface{ SyncWAL() error }
 
 // maintain flushes then merges (with retention) every tenant engine once. Errors are
 // swallowed: a transient backend failure must not crash the background loop, and the next
@@ -946,26 +961,51 @@ func (s *Storage) maintain(ctx context.Context) {
 		_ = merge()
 	}
 
+	// Each engine is an independent shard (per tenant, per signal) with its own lock, so flush/merge
+	// across engines parallelizes freely. Build one flat work list and fan out under a bound — a
+	// sequential pass would take the sum of every engine's compaction I/O.
+	tasks := make([]func(), 0, len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines))
+
 	for tid, eng := range metricEngines {
-		maintainEngine(tid, func() error { return eng.Flush(ctx) },
-			func() error { return eng.MergeWith(ctx, s.metricMergeOptions(tid)) },
-			func() error { return eng.RefreshReplica(ctx) })
+		tasks = append(tasks, func() {
+			maintainEngine(tid, func() error { return eng.Flush(ctx) },
+				func() error { return eng.MergeWith(ctx, s.metricMergeOptions(tid)) },
+				func() error { return eng.RefreshReplica(ctx) })
+		})
 	}
 
 	for tid, eng := range logEngines {
-		maintainEngine(tid, func() error { return eng.Flush(ctx) },
-			func() error { return eng.Merge(ctx, s.retainFrom(tid)) }, func() error { return eng.RefreshReplica(ctx) })
+		tasks = append(tasks, func() {
+			maintainEngine(tid, func() error { return eng.Flush(ctx) },
+				func() error { return eng.Merge(ctx, s.retainFrom(tid)) }, func() error { return eng.RefreshReplica(ctx) })
+		})
 	}
 
 	for tid, eng := range traceEngines {
-		maintainEngine(tid, func() error { return eng.Flush(ctx) },
-			func() error { return eng.Merge(ctx, s.retainFrom(tid)) }, func() error { return eng.RefreshReplica(ctx) })
+		tasks = append(tasks, func() {
+			maintainEngine(tid, func() error { return eng.Flush(ctx) },
+				func() error { return eng.Merge(ctx, s.retainFrom(tid)) }, func() error { return eng.RefreshReplica(ctx) })
+		})
 	}
 
 	for tid, eng := range profileEngines {
-		maintainEngine(tid, func() error { return eng.Flush(ctx) },
-			func() error { return eng.Merge(ctx, s.retainFrom(tid)) }, func() error { return eng.RefreshReplica(ctx) })
+		tasks = append(tasks, func() {
+			maintainEngine(tid, func() error { return eng.Flush(ctx) },
+				func() error { return eng.Merge(ctx, s.retainFrom(tid)) }, func() error { return eng.RefreshReplica(ctx) })
+		})
 	}
+
+	parallel.ForEach(len(tasks), s.maintenanceConcurrency(), func(i int) { tasks[i]() })
+}
+
+// maintenanceConcurrency is the parallel flush/merge/fsync fan-out cap for the background loops,
+// from [Options.MaintenanceConcurrency] or a CPU-derived default.
+func (s *Storage) maintenanceConcurrency() int {
+	if s.opts.MaintenanceConcurrency > 0 {
+		return s.opts.MaintenanceConcurrency
+	}
+
+	return parallel.DefaultLimit()
 }
 
 // ownedTenants reconciles cluster compaction ownership for the given tenant ids and returns the

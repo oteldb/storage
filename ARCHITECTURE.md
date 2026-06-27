@@ -343,6 +343,27 @@ index is unsorted, drop to the write lock, `EnsureSorted`, re-check), after whic
 readers only read. The `postings.MemPostings` exposes `Sorted()`/`EnsureSorted()` for exactly
 this caller-owned-synchronization upgrade.
 
+**The engine lock is never held across object-store I/O.** Flush, merge, and fetch are phased so
+their large reads/writes run lock-free, exploiting that parts are immutable. Both engines (`engine`,
+`recordengine`) share this discipline:
+- The **`parts` slice is copy-on-write** (`appendPart`/`replaceParts`), so a reader that snapshots the
+  header under the lock keeps a stable backing array after releasing it.
+- **Fetch** *plans* under the read lock — resolve matchers, snapshot+`acquire()` the in-window parts,
+  seed accumulators from the head — then releases the lock and reads the parts' columns lock-free
+  (`planFetch`/`readParts`), `release()`-ing the parts after.
+- **Flush/merge** *plan* under the lock (drain/snapshot the head, reserve the part sequence), *build*
+  the part off the lock (compaction reads, part write, read-back, sidecar union), then *publish* under
+  the lock (swap the parts slice, persist the **small** bucket/stream index + WAL checkpoint — kept
+  under the lock so the swap and the durable-watermark commit stay atomic, preserving exactly-once
+  crash-consistency). Only the background maintenance task (or `Close`) mutates `parts`, so the swap is
+  single-writer.
+- **Parts retired** by flush/merge are not deleted inline: each `part` has an `atomic.Int32` refcount,
+  and `reclaimRetired` deletes a retired part's objects only once its in-flight readers have drained —
+  so a lock-free fetch never races a delete (deferred reclamation).
+- A flush **detaches** the head's buffers into an engine-level `flushing` set that fetches still read,
+  swapped for the new part atomically at publish — so a fetch sees the records in exactly one of
+  `flushing`/the part, never neither (no visibility gap) nor both (no double count).
+
 - **Head** (`head.go`) is the in-memory write buffer: the index (`symbols` + `series` +
   `postings`) plus per-series `(ts, value)` append buffers. `append` interns every
   queryable label (resource + scope attributes, scope name/version as reserved labels, and
@@ -355,7 +376,10 @@ this caller-owned-synchronization upgrade.
   **single map probe** — a present sample buffer means the series is known, so the series
   index is never consulted and no `signal.Series` is built or hashed; only an absent buffer
   falls back to the (authoritative) series index. `Append` (full `signal.Series` in, hash
-  inside) remains for callers that already hold an identity.
+  inside) remains for callers that already hold an identity. When durable, a batch's WAL frames
+  are **grouped by series** (a reusable `walBatch` scratch — zero steady-state allocation): one
+  `WriteSamples` frame per series, one `WriteSeries` per new series, written once after the run —
+  not a write+fsync syscall per sample.
 - **Flush** (`flush.go`) drains the head's buffered samples into one **flat 3-column part**
   `[series:int128, ts:int64, value:float64]`, one row per sample, sorted by `(series, ts)`,
   written via `block.PartWriter` under `{tenant}/metrics/{seq}`. After the part is written,
@@ -895,14 +919,19 @@ query-language path stays in the embedder. The `Write*` methods take the library
   `recordengine.Engine`s on the sample schema **with a `profile.SymbolStore` side store** (parts +
   symbol sidecars under `{tenant}/profiles`). A single
   **maintenance loop** periodically flushes +
-  merges every metric, log, trace, and profile engine, applying per-tenant retention from the resolved policy. `Reset(ctx)`
+  merges every metric, log, trace, and profile engine, applying per-tenant retention from the resolved policy.
+  Engines are independent per-tenant/per-signal shards, so the loop **fans the flush/merge (and the
+  background WAL fsyncs) out concurrently** under a bound (`WithMaintenanceConcurrency`, default
+  CPU-derived) via `internal/parallel` rather than walking them sequentially. `Reset(ctx)`
   discards all ingested data (every engine's head + flushed parts), retaining the engines
   for reuse; it is gated to an **ephemeral backend** (`ErrNotEphemeral` otherwise) and is
   meant for tests/benchmarks that reuse one store across runs. `Fetcher(tenants...)` is the
   **read seam**: it returns a `fetch.Fetcher` over the named tenants' data (head ∪ parts) —
   one tenant, several (a **multi-tenant** fan-out), or none ⇒ **all** tenants (a
   **cross-tenant** query). A fan-out merges by series id via `fetch.Merge`, federating a
-  series with equal labels across tenants into one. Always usable: an empty fetcher when no
+  series with equal labels across tenants into one; `fetch.Merge` (and the clustered shard/tenant
+  write-routing) **fetch their children concurrently** under a bound, collecting into per-index slots
+  so the merge's duplicate-timestamp winner stays order-deterministic. Always usable: an empty fetcher when no
   tenant matches or after `Close`, so callers need not special-case "no data". There is
   deliberately **no `Query` / query-language method**: the store is language-agnostic and the
   embedder drives its own engines over the fetch contract (the optional `query/promql` adapter
