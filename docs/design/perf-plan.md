@@ -40,11 +40,34 @@ sets `Recycle` and releases each batch, the engine recycles the ts/value buffers
 **Recycling read path: B/op −59%, time −24%** (benchstat `fetch_all` vs `fetch_all_release`); a
 `-race` recycle + concurrent test guards correctness.
 
+### P1.5 — record engine read-path pooling (DONE)
+
+The logs/traces/profiles read path now pools two of its three dominant allocators (measured by
+`BenchmarkLogReadAll` plain / `BenchmarkLogReadRelease` recycle; profile tops: `newRecordCols` 37%,
+`readBytes` 27.6%, `fillConst[int64]`+`resize` ~25%):
+
+- **Part-decode int columns** (`Engine.i64Pool`, always-on, both paths): a part's decoded timestamp
+  + int columns are copied **by value** into the per-stream accumulators, so they are dead once the
+  part is distributed (`recycleDecodeInts`) and can be reused with no aliasing risk. Targets the
+  `fillConst`/`resize` ~25%. The byte columns are *not* pooled here (the accumulators alias them).
+- **Per-stream accumulators** (`Engine.recPool`, opt-in via `Recycle`): `newRecordCols` (37%, the
+  logs FINDINGS' #1 alloc) backs the returned batches, so it is pooled through the batch-release
+  lifecycle — `fetch.Batch.SetReleaseState` carries the `*recordCols` handle (a pointer, no alloc)
+  to the engine's one shared `recycle` hook, which re-arms it via `recordCols.prepare` on the next
+  fetch. Differing projection/selection across fetches is handled by `prepare` (reuse backing where
+  cap suffices, drop deselected columns to nil).
+
+**Result (baseline → final):** plain read **B/op −25%, allocs −23%** (the int pooling alone, no API
+change); recycle read **B/op −63%, time −44%, throughput +~85%, allocs −33%**. Race-clean; a new
+`TestFetchRecycleMatchesPlain` (multi-part + head, alternating projections, many release→fetch
+rounds) guards that reuse never corrupts a later result.
+
 ### What's left
 
-- **Record-signal release hook** — the `Batch.Release` hook is metric-only; the record engine's
-  per-query `recordCols` (the logs FINDINGS' #1 alloc) still GCs. Extending the hook to
-  `recordengine` is the next structural win for logs/traces.
+- **Record byte columns** (`readBytes` 27.6%, the decoded log/attr bytes) alias into the returned
+  batches, so pooling them needs either per-part refcounting (release the part-decode bytes once all
+  referencing batches are released) or a record decode cache (like the metric `decodeCache`) — the
+  structural remainder after P1.5.
 - **Win1 (pool head/flush windows)** — deferred: golden-flat (the lib bench is flush-heavy with a
   cold head); it helps only the live-ingestion head path the integration profile sees.
 - CPU is now the inherently **serial** DoD/varint decode (not SIMD-amenable) + the result copy.

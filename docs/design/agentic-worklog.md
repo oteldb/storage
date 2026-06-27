@@ -48,3 +48,19 @@ more commits; the code of record is the git history and `ARCHITECTURE.md`.
   shard reassembly handled: trace-by-id across shards, `Log/Trace/ProfileSeries` concat, `LogKeys`
   union, profile symbol-store union (`clusterProfileSymbols`). N=1 byte-identical. See
   `docs/design/record-sharding.md`.
+
+## Performance — read-path allocation/GC (see `docs/design/perf-plan.md`)
+
+Profile-guided via `scripts/bench-pprof.sh` (benchstat + CPU/alloc_space pprof; `.bench/`).
+
+- **P0.2** peek var-length prefixes (`bitstream`); **P0.1** pool part-decode buffers (`engine.decPool`);
+  **P1.4** map-free metric sample merge; decimal/uvarint/scale-hoist micro-wins; **Win1** pool head/flush
+  windows. Cumulative metric read: `fetch_all` **−74.7% time / +295% throughput**.
+- **P1.3** opt-in batch-release pooling (`Request.Recycle` + `Batch.Release`, shared hook): metric
+  recycling read **B/op −59% / time −24%**; default path byte-for-byte unchanged.
+- **P1.5 — record engine read path.** Pool the part-decode int columns (`i64Pool`, always-on; the
+  int columns are copied by value into accumulators, so no aliasing) and the per-stream accumulators
+  (`recPool`, opt-in via `Recycle` + `Batch.SetReleaseState` carrying the `*recordCols` handle).
+  Plain log read **B/op −25% / allocs −23%**; recycling log read **B/op −63% / time −44% / +85%
+  throughput**. `TestFetchRecycleMatchesPlain` guards reuse correctness; race-clean. Remaining record
+  allocator is the aliased byte columns (`readBytes`) — needs refcounting or a record decode cache.
