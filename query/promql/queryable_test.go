@@ -145,19 +145,39 @@ func TestSelectHidesReservedLabels(t *testing.T) {
 	assert.Empty(t, got[0].Labels().Get("__unit__"), "__unit__ is hidden")
 }
 
-func TestQuerierMetadataStubs(t *testing.T) {
+func TestQuerierLabelMetadata(t *testing.T) {
 	t.Parallel()
 
-	q, err := NewQueryable(&fakeFetcher{}, "default").Querier(0, 1000)
+	f := &fakeFetcher{batches: []*fetch.Batch{
+		series("http.requests", "/a", [2]int64{100, 1}),
+		series("http.requests", "/b", [2]int64{100, 2}),
+		series("cpu.seconds", "/a", [2]int64{100, 3}),
+	}}
+	q, err := NewQueryable(f, "default").Querier(0, 10_000_000)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = q.Close() })
+	ctx := context.Background()
 
-	names, _, err := q.LabelNames(context.Background(), nil)
+	names, _, err := q.LabelNames(ctx, nil)
 	require.NoError(t, err)
-	assert.Nil(t, names)
+	assert.Equal(t, []string{"__name__", "route"}, names)
 
-	vals, _, err := q.LabelValues(context.Background(), "x", nil)
+	// __name__ values are the metric names; dotted (UTF-8) names are preserved, not normalized.
+	vals, _, err := q.LabelValues(ctx, "__name__", nil)
 	require.NoError(t, err)
-	assert.Nil(t, vals)
+	assert.Equal(t, []string{"cpu.seconds", "http.requests"}, vals)
 
-	require.NoError(t, q.Close())
+	vals, _, err = q.LabelValues(ctx, "route", nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/a", "/b"}, vals)
+
+	// Matchers scope the metadata: only the routes of the cpu.seconds metric.
+	vals, _, err = q.LabelValues(ctx, "route", nil, eq(t, "__name__", "cpu.seconds"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/a"}, vals)
+
+	// An empty result (no matching series) is empty, not an error.
+	vals, _, err = q.LabelValues(ctx, "route", nil, eq(t, "__name__", "nope"))
+	require.NoError(t, err)
+	assert.Empty(t, vals)
 }
