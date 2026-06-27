@@ -2,6 +2,7 @@ package engine_test
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -119,6 +120,96 @@ func TestAggregateDedupsOverlappingParts(t *testing.T) {
 	got := assertAggMatchesFetch(t, e, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
 	// ts 10→1, 20→9 (freshest), 30→4: count 3, sum 14, not 4 samples / sum 16.
 	assert.Equal(t, engine.SeriesAgg{Count: 3, Sum: 14, Min: 1, Max: 9}, got[s.Hash()])
+}
+
+// stepBucket folds a value into a series' bucket map (the ground-truth bucketing).
+func stepBucket(m map[int64]engine.SeriesAgg, ts int64, v, step float64) {
+	bs := int64(0)
+	if step > 0 {
+		s := int64(step)
+		r := ts % s
+		if r < 0 {
+			r += s
+		}
+		bs = ts - r
+	}
+	a := m[bs]
+	if a.Count == 0 {
+		a.Min, a.Max = v, v
+	} else {
+		a.Min, a.Max = min(a.Min, v), max(a.Max, v)
+	}
+	a.Sum += v
+	a.Count++
+	m[bs] = a
+}
+
+// stepFromBatches buckets a raw fetch into the per-series, per-bucket aggregate it implies.
+func stepFromBatches(batches []*fetch.Batch, step int64) map[signal.SeriesID][]engine.BucketAgg {
+	out := make(map[signal.SeriesID][]engine.BucketAgg, len(batches))
+	for _, b := range batches {
+		m := map[int64]engine.SeriesAgg{}
+		for i, ts := range b.Timestamps {
+			stepBucket(m, ts, b.Values[i], float64(step))
+		}
+		list := make([]engine.BucketAgg, 0, len(m))
+		for start, a := range m {
+			list = append(list, engine.BucketAgg{Start: start, SeriesAgg: a})
+		}
+		slices.SortFunc(list, func(x, y engine.BucketAgg) int { return int(x.Start - y.Start) })
+		out[b.ID] = list
+	}
+
+	return out
+}
+
+func TestAggregateStepMatchesFetch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	e := aggEngine()
+	s := mkSeries("job", "api")
+
+	// Two parts inside distinct 100-wide buckets (sidecar fast path), one part straddling a bucket
+	// boundary (decode), plus head data.
+	mustAppend(t, e, s, 10, 1)
+	mustAppend(t, e, s, 40, 3)
+	require.NoError(t, e.Flush(ctx)) // part 1: [10,40] ⊂ bucket 0
+	mustAppend(t, e, s, 150, 5)
+	mustAppend(t, e, s, 180, 7)
+	require.NoError(t, e.Flush(ctx)) // part 2: [150,180] ⊂ bucket 100
+	mustAppend(t, e, s, 290, 9)
+	mustAppend(t, e, s, 320, 11)
+	require.NoError(t, e.Flush(ctx)) // part 3: [290,320] straddles buckets 200 and 300
+	mustAppend(t, e, s, 410, 13)     // head, bucket 400
+
+	req := fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}}
+	for _, step := range []int64{100, 50, 0} { // bucketed, finer, and whole-range
+		got, err := e.AggregateStep(ctx, req, step)
+		require.NoError(t, err)
+		want := stepFromBatches(fetchAll(t, e, req), step)
+		assert.Equalf(t, want, got, "step=%d buckets must match the bucketed fetch", step)
+	}
+}
+
+func TestAggregateStepDedupsOverlappingParts(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	e := aggEngine()
+	s := mkSeries("job", "api")
+
+	mustAppend(t, e, s, 10, 1)
+	mustAppend(t, e, s, 20, 2)
+	require.NoError(t, e.Flush(ctx))
+	mustAppend(t, e, s, 20, 9) // same ts, newer ⇒ unsafe ⇒ merge+bucket
+	mustAppend(t, e, s, 130, 4)
+	require.NoError(t, e.Flush(ctx))
+
+	req := fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}}
+	got, err := e.AggregateStep(ctx, req, 100)
+	require.NoError(t, err)
+	assert.Equal(t, stepFromBatches(fetchAll(t, e, req), 100), got)
 }
 
 // TestAggregatePushdownAvoidsDecode proves the fast path: with a decode cache attached, a

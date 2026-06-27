@@ -479,7 +479,12 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   sidecar-less part) it falls back to decode + merge, which dedups. The sidecar is a derived
   optimization — absent/corrupt ⇒ decode — so it carries no golden/format-stability burden. Off by
   default (it costs a little per-series storage); a full-range aggregate is **~30× faster and ~19×
-  lighter** than fetch-and-fold when on. `Reset(ctx)` is the inverse of accumulation: it replaces
+  lighter** than fetch-and-fold when on. `AggregateStep` (facade `Storage.AggregateMetricsStep`) is
+  the step-bucketed form — per series, the aggregate of each step-aligned bucket on the absolute grid
+  (the range-vector shape an embedder's `*_over_time` needs); it reuses the same pushdown, folding a
+  part's sidecar whenever the part falls wholly inside one bucket and decoding only the parts that
+  straddle a bucket boundary (an unsafe plan merges first to dedup by timestamp). `Reset(ctx)` is the
+  inverse of accumulation: it replaces
   the head with an empty one, drops the part handles, and deletes this engine's part objects
   from the backend (scoped to `{Prefix}/`), returning the engine to its `New` state for
   reuse (tests/benchmarks) without reallocating it.

@@ -61,6 +61,165 @@ func (e *Engine) AggregateRange(ctx context.Context, r fetch.Request) (map[signa
 	return out, nil
 }
 
+// BucketAgg is one step-aligned bucket's aggregate for a series: the bucket's start timestamp and
+// the count/sum/min/max of the samples that fall in it.
+type BucketAgg struct {
+	SeriesAgg
+
+	Start int64
+}
+
+// AggregateStep returns, per series, the aggregate of each non-empty step-aligned bucket in
+// [r.Start, r.End] — the range-vector shape an embedder's `*_over_time` needs. Buckets align to the
+// absolute grid (multiples of step), so a range's bucketing is independent of when it runs; the
+// returned buckets are sorted ascending by Start. step ≤ 0 collapses to a single whole-range bucket
+// (equivalent to [Engine.AggregateRange]).
+//
+// It reuses the stats sidecar where it still applies: when the plan is pushdown-safe (parts fully
+// covered and time-disjoint) and a part falls entirely within one bucket, that bucket folds the
+// part's sidecar without decoding. Parts that straddle buckets, or an unsafe plan, decode (and an
+// unsafe plan merges first, to dedup by timestamp).
+func (e *Engine) AggregateStep(ctx context.Context, r fetch.Request, step int64) (map[signal.SeriesID][]BucketAgg, error) {
+	e.mu.RLock()
+	for !e.head.indexSorted() {
+		e.mu.RUnlock()
+		e.mu.Lock()
+		e.head.ensureIndexSorted()
+		e.mu.Unlock()
+		e.mu.RLock()
+	}
+
+	ids := e.head.resolve(r.Matchers)
+	plan := e.planFetch(ids, r)
+	e.mu.RUnlock()
+
+	defer plan.releaseParts()
+
+	safe := aggPushdownSafe(plan)
+
+	out := make(map[signal.SeriesID][]BucketAgg, len(ids))
+
+	for _, id := range ids {
+		buckets, err := e.bucketSeries(ctx, plan, id, step, safe)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(buckets) == 0 {
+			continue
+		}
+
+		list := make([]BucketAgg, 0, len(buckets))
+		for start, agg := range buckets {
+			list = append(list, BucketAgg{Start: start, SeriesAgg: agg})
+		}
+
+		slices.SortFunc(list, func(a, b BucketAgg) int {
+			switch {
+			case a.Start < b.Start:
+				return -1
+			case a.Start > b.Start:
+				return 1
+			default:
+				return 0
+			}
+		})
+
+		out[id] = list
+	}
+
+	return out, nil
+}
+
+// bucketSeries folds id's samples into step-aligned buckets. On a pushdown-safe plan it buckets each
+// part independently (sidecar when the part fits one bucket, else decode); otherwise it merges first
+// (deduping by timestamp) and buckets the result.
+func (e *Engine) bucketSeries(
+	ctx context.Context, plan *enginePlan, id signal.SeriesID, step int64, safe bool,
+) (map[int64]SeriesAgg, error) {
+	buckets := map[int64]SeriesAgg{}
+
+	addSample := func(ts int64, v float64) {
+		bs := bucketStart(ts, step)
+		a := buckets[bs]
+		a.addSample(v)
+		buckets[bs] = a
+	}
+
+	if !safe {
+		m, err := plan.mergeSeries(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+
+		ts, values, _ := m.collect()
+		for i := range ts {
+			addSample(ts[i], values[i])
+		}
+
+		return buckets, nil
+	}
+
+	for _, p := range plan.liveParts {
+		rng, ok := p.ranges[id]
+		if !ok {
+			continue
+		}
+
+		// A part wholly inside one bucket contributes entirely to it — fold its sidecar, no decode.
+		if bucketStart(p.minTime, step) == bucketStart(p.maxTime, step) {
+			if st, ok := p.seriesStat(ctx, id); ok {
+				bs := bucketStart(p.minTime, step)
+				a := buckets[bs]
+				a.merge(st)
+				buckets[bs] = a
+
+				continue
+			}
+		}
+
+		dp, err := e.decodeOf(ctx, p)
+		if err != nil {
+			return nil, err
+		}
+
+		for i := rng.start; i < rng.end; i++ {
+			if dp.ts[i] >= plan.start && dp.ts[i] <= plan.end {
+				addSample(dp.ts[i], dp.vals[i])
+			}
+		}
+	}
+
+	for _, b := range []*fetch.Batch{plan.headB[id], plan.flushB[id]} {
+		if b == nil {
+			continue
+		}
+
+		for i, ts := range b.Timestamps {
+			if ts >= plan.start && ts <= plan.end {
+				addSample(ts, b.Values[i])
+			}
+		}
+	}
+
+	return buckets, nil
+}
+
+// bucketStart returns the start of the step-aligned bucket containing ts (floored to a multiple of
+// step on the absolute grid, correct for negative timestamps). step ≤ 0 maps everything to bucket 0.
+func bucketStart(ts, step int64) int64 {
+	if step <= 0 {
+		return 0
+	}
+
+	r := ts % step
+	if r < 0 {
+		r += step
+	}
+
+	return ts - r
+}
+
 // aggPushdownSafe reports whether the plan's parts can be aggregated from their stats sidecars
 // without risking a wrong count/sum: every in-window part must be fully inside [start, end] (else
 // its whole-part stats would include out-of-range samples) and the parts — plus any head/mid-flush

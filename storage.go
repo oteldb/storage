@@ -498,6 +498,25 @@ func (s *Storage) AggregateMetrics(ctx context.Context, t signal.TenantID, r fet
 	return eng.AggregateRange(ctx, r)
 }
 
+// AggregateMetricsStep is the step-bucketed form of [Storage.AggregateMetrics]: it returns, per
+// series, the aggregate of each step-aligned bucket in the window — the range-vector shape an
+// embedder's `*_over_time` needs. Buckets align to the absolute grid; step ≤ 0 yields one whole-range
+// bucket. Single-node (no cluster fan-out yet).
+func (s *Storage) AggregateMetricsStep(
+	ctx context.Context, t signal.TenantID, r fetch.Request, step int64,
+) (map[signal.SeriesID][]engine.BucketAgg, error) {
+	if s.closed.Load() {
+		return map[signal.SeriesID][]engine.BucketAgg{}, nil
+	}
+
+	eng, ok := s.lookupEngine(s.normalizeTenant(t))
+	if !ok {
+		return map[signal.SeriesID][]engine.BucketAgg{}, nil
+	}
+
+	return eng.AggregateStep(ctx, r, step)
+}
+
 // seedFetcher is the outermost read wrapper: it installs the injected logger as the zctx base so
 // every downstream fetcher (fan-out, remote, engine) can log a trace-correlated line, and emits one
 // Debug at the query boundary. It does not touch the request.
