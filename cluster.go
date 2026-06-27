@@ -684,21 +684,45 @@ func (s *Storage) clusterProfileSymbols(ctx context.Context, tid signal.TenantID
 	return retry.Hedge(ctx, s.readPolicy(ctx, rpcOpSide), thunks)
 }
 
-// clusterRecordFetcherFor returns a record signal's read seam for one tenant in cluster mode:
-// local if this node owns the tenant (the head is replicated here), otherwise fanned out to an
-// owner over HTTP (a window+matcher superset the requester re-filters), failing over between
-// owners. lookup resolves the local engine for the signal.
+// clusterRecordFetcherFor returns a record signal's read seam for one tenant in cluster mode. A
+// tenant's streams are spread across N shards (each a separately-placed ring unit, like metrics), so
+// a query gathers across every shard and concatenates (records are append-only, not ts-deduped).
+// With a single shard this is the unsharded owner-aware fetch. lookup resolves the local engine.
 func (s *Storage) clusterRecordFetcherFor(
 	sig signal.Signal, tid signal.TenantID, lookup func(signal.TenantID) (*recordengine.Engine, bool),
 ) fetch.Fetcher {
 	cn := s.cluster
-	owners := cn.membership.Ring().Lookup([]byte(s.normalizeTenant(tid)), cn.rf)
+	tenant := s.normalizeTenant(tid)
+	n := cn.shardCount()
+
+	shardFetchers := make([]fetch.Fetcher, 0, n)
+	for idx := range n {
+		sk := shardKeyOf(tenant, idx, n)
+		// Stamp the shard key as the request tenant so a remote peer serves the right shard engine
+		// (and the local engine ignores it).
+		shardFetchers = append(shardFetchers, scopedFetcher{inner: s.shardRecordFetcher(sig, sk, lookup), scope: sk})
+	}
+
+	if n == 1 {
+		return shardFetchers[0]
+	}
+
+	return concatFetcher(shardFetchers)
+}
+
+// shardRecordFetcher returns the read seam for one record shard: the local engine if this node is an
+// owner, else a hedged fan-out across the shard's remote owners (each owner's copy is complete).
+func (s *Storage) shardRecordFetcher(
+	sig signal.Signal, shardKey signal.TenantID, lookup func(signal.TenantID) (*recordengine.Engine, bool),
+) fetch.Fetcher {
+	cn := s.cluster
+	owners := cn.membership.Ring().Lookup([]byte(shardKey), cn.rf)
 
 	var remotes []fetch.Fetcher
 	for _, o := range owners {
 		addr := cn.membership.AddrOf(o.ID)
 		if addr == cn.self { // owner: serve locally
-			if e, ok := lookup(s.normalizeTenant(tid)); ok {
+			if e, ok := lookup(shardKey); ok {
 				return e
 			}
 

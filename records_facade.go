@@ -135,7 +135,11 @@ func (s *Storage) writeRecordsLocal(
 // writeRecordsClustered frames each tenant's streams+records as a WAL payload and routes it to the
 // tenant's ring primary (primary-authoritative replication); the reject count flows back.
 func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, project recordProjector) (Accepted, error) {
-	byTenant := make(map[signal.TenantID][]byte)
+	// Group each stream by its shard key — (tenant, hash(streamID) % N) — so a tenant's streams
+	// spread across the ring instead of pinning to one owner set (with N=1 the key is the tenant,
+	// byte-identical to the unsharded path).
+	n := s.cluster.shardCount()
+	byShard := make(map[signal.TenantID][]byte)
 
 	// The ingest-rate valve is applied at the origin (per real tenant, like the single-node path);
 	// cardinality and in-flight memory are head-enforced by the shard primary in primaryWrite.
@@ -163,27 +167,28 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 			return // whole over-budget stream batch shed before framing
 		}
 
-		byTenant[tid] = append(byTenant[tid], recordengine.EncodeWAL(b)...)
+		sk := shardKeyOf(tid, shardOf(b.Stream, n), n)
+		byShard[sk] = append(byShard[sk], recordengine.EncodeWAL(b)...)
 	})
 
-	// Each tenant routes to its own ring primary independently; fan the routes out under a bound
+	// Each shard routes to its own ring primary independently; fan the routes out under a bound
 	// rather than paying the sum of per-primary round-trips. Order-independent: results accumulate
 	// into per-index slots.
 	type route struct {
-		tid     signal.TenantID
+		key     signal.TenantID
 		payload []byte
 	}
 
-	routes := make([]route, 0, len(byTenant))
-	for tid, payload := range byTenant {
-		routes = append(routes, route{tid, payload})
+	routes := make([]route, 0, len(byShard))
+	for sk, payload := range byShard {
+		routes = append(routes, route{sk, payload})
 	}
 
 	rejects := make([]primaryReject, len(routes))
 	errs := make([]error, len(routes))
 
 	parallel.ForEach(len(routes), clusterWriteFanOut, func(i int) {
-		rej, err := s.routeToPrimary(ctx, sig, string(s.normalizeTenant(routes[i].tid)), routes[i].payload)
+		rej, err := s.routeToPrimary(ctx, sig, string(routes[i].key), routes[i].payload)
 		if err != nil {
 			errs[i] = err
 

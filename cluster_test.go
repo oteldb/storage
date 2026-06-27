@@ -729,6 +729,45 @@ func TestAdminCompactOwnershipGate(t *testing.T) {
 	}
 }
 
+// TestClusteredRecordShardingGathersAllStreams proves per-signal sharding for records: a tenant's
+// log streams scatter across shards, and a query on any node gathers across every shard to return
+// the full set (not just the streams whose shard that node happens to own).
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusteredRecordShardingGathersAllStreams(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	const shards = 4
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodeSharded(t, endpoint, "node-a", shards),
+		"node-b": openClusterNodeSharded(t, endpoint, "node-b", shards),
+		"node-c": openClusterNodeSharded(t, endpoint, "node-c", shards),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+
+	// Write 8 distinct log streams (distinct service.name ⇒ distinct stream ids ⇒ scattered shards).
+	const streams = 8
+	for i := range streams {
+		_, err := a.WriteLogs(ctx, logBatch("svc"+strconv.Itoa(i), [3]any{i + 1, 9, "m"}))
+		require.NoError(t, err)
+	}
+
+	// Every node must return all streams via cross-shard gather.
+	for name, s := range nodes {
+		it, err := s.LogFetcher("default").Fetch(ctx, fetch.Request{Signal: signal.Log, Start: 0, End: 1 << 62})
+		require.NoErrorf(t, err, "%s fetch", name)
+		got, err := fetch.Drain(ctx, it)
+		require.NoErrorf(t, err, "%s drain", name)
+		assert.Lenf(t, got, streams, "%s gathered all streams across shards", name)
+	}
+}
+
 func TestShardHelpers(t *testing.T) {
 	t.Parallel()
 

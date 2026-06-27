@@ -1182,7 +1182,8 @@ func (s *Storage) ownedTenants(ctx context.Context, tids map[signal.TenantID]str
 // retainFrom converts a tenant's retention window into an absolute cutoff timestamp (unix
 // nanoseconds); 0 means retain forever.
 func (s *Storage) retainFrom(tid signal.TenantID) int64 {
-	return retentionCutoff(s.tenant.Resolve(s.normalizeTenant(tid)).Retention, time.Now().UnixNano())
+	// tid may be a shard key ({tenant}/_s{idx}) when a signal is sharded; policy is per real tenant.
+	return retentionCutoff(s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Retention, time.Now().UnixNano())
 }
 
 // retentionCutoff converts a retention window into an absolute cutoff at the given now (unix
