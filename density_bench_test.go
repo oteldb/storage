@@ -157,7 +157,7 @@ func isPartKey(key string) bool {
 	if last == "" {
 		return false
 	}
-	for i := 0; i < len(last); i++ {
+	for i := range len(last) {
 		if last[i] < '0' || last[i] > '9' {
 			return false
 		}
@@ -217,6 +217,8 @@ func measureDensity(tb testing.TB, p corpusProfile) densityResult {
 // (constant value at constant interval; a clean counter ramp) must beat the 8-byte raw
 // float64 they'd cost uncompressed.
 func TestDensityReport(t *testing.T) {
+	t.Parallel()
+
 	if testing.Short() {
 		t.Skip("density report ingests sizable corpora; skipped under -short")
 	}
@@ -232,6 +234,8 @@ func TestDensityReport(t *testing.T) {
 			require.Less(t, r.bppParts, 2.0, "constant value at constant interval must compress hard")
 		case patCounter:
 			require.Less(t, r.bppParts, 8.0, "a clean counter ramp must beat raw 8-byte float64")
+		case patRandWalk, patBoundedWalk, patNoisy:
+			// No smoke assertion: high-entropy / already-dense shapes are gated by TestDensityBudget.
 		}
 	}
 }

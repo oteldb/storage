@@ -79,6 +79,12 @@ linters:
   exclusions:
     generated: lax
     rules:
+      # Test/bench helpers idiomatically take *testing.{T,B} first; forcing context.Context to be
+      # the first parameter fights that convention. (Excluded by text so the rest of revive — incl.
+      # dot-import — stays active; a revive `rules:` block would replace the whole default set.)
+      - linters:
+          - revive
+        text: context-as-argument
       - linters:
           - dupl
           - errcheck
