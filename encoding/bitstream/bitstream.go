@@ -275,6 +275,21 @@ func (r *Reader) ReadBit() (bool, error) {
 	return (r.buffer & (1 << r.valid)) != 0, nil
 }
 
+// Buffered returns the number of bits currently available without a stream refill. A decoder of a
+// short variable-length prefix takes a fast Peek/Skip path when Buffered() >= the prefix width and
+// falls back to bit-at-a-time ReadBit only at the rare buffer boundary — avoiding a function call
+// per bit on the common path.
+func (r *Reader) Buffered() uint8 { return r.valid }
+
+// Peek returns the next nbits bits (right-justified) without consuming them. The caller must ensure
+// 1 <= nbits <= Buffered() (typically by checking Buffered() first).
+func (r *Reader) Peek(nbits uint8) uint64 {
+	return (r.buffer >> (r.valid - nbits)) & (^uint64(0) >> (64 - nbits))
+}
+
+// Skip consumes n bits previously observed via Peek. The caller must ensure n <= Buffered().
+func (r *Reader) Skip(n uint8) { r.valid -= n }
+
 // ReadBits reads nbits bits (nbits in [0,64]) and returns them in the low nbits of a
 // uint64. Returns io.EOF if the stream is exhausted.
 func (r *Reader) ReadBits(nbits uint8) (uint64, error) {

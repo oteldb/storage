@@ -7,6 +7,49 @@ import (
 	"testing"
 )
 
+// TestPeekSkip verifies Peek observes upcoming bits without consuming and Skip advances past them,
+// so Peek(n)+Skip(n) equals ReadBits(n). This is the fast path the chunk decoders take for
+// variable-length prefixes.
+func TestPeekSkip(t *testing.T) {
+	t.Parallel()
+
+	w := NewWriter(nil)
+	w.WriteBits(0b1011, 4)
+	w.WriteBits(0b110, 3)
+	w.WriteBits(0x2A, 8)
+
+	r := NewReader(w.Bytes())
+
+	first, err := r.ReadBits(4) // loads the buffer
+	if err != nil || first != 0b1011 {
+		t.Fatalf("ReadBits(4) = %#b, err %v", first, err)
+	}
+
+	if r.Buffered() < 3 {
+		t.Fatalf("Buffered() = %d, want >= 3 for the next Peek", r.Buffered())
+	}
+
+	if p := r.Peek(3); p != 0b110 {
+		t.Fatalf("Peek(3) = %#b, want 0b110", p)
+	}
+
+	if p := r.Peek(3); p != 0b110 { // Peek must not consume
+		t.Fatalf("Peek(3) again = %#b, want 0b110 (no consume)", p)
+	}
+
+	before := r.Buffered()
+	r.Skip(3)
+
+	if r.Buffered() != before-3 {
+		t.Fatalf("Skip(3): Buffered %d -> %d, want %d", before, r.Buffered(), before-3)
+	}
+
+	v, err := r.ReadBits(8)
+	if err != nil || v != 0x2A {
+		t.Fatalf("ReadBits(8) after Skip = %#x, err %v", v, err)
+	}
+}
+
 // TestRoundTripBits verifies WriteBits∘ReadBits == identity for a range of widths and
 // values, including values that span the 8-byte refill boundary.
 func TestRoundTripBits(t *testing.T) {
