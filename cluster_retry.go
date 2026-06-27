@@ -16,8 +16,10 @@ import (
 
 // RPC op labels for retry/hedge metrics and logs.
 const (
-	rpcOpRead  = "read"
-	rpcOpWrite = "write"
+	rpcOpRead   = "read"
+	rpcOpWrite  = "write"
+	rpcOpSeries = "series" // profile series enumeration
+	rpcOpSide   = "side"   // profile symbol-store fetch
 )
 
 // newClusterHTTPClient builds the node-to-node HTTP client. It sets connection-level timeouts so a

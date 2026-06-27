@@ -718,7 +718,8 @@ optional side store differ.
   symbols and flushes them. Profiles' **enumeration and resolution also fan out**: a non-owner serves
   `ProfileSeries` (over `cluster.SeriesPath`, re-applying non-equality matchers to the superset) and
   `ProfileResolver` (over `cluster.SidePath`, fetching the owner's symbol tables) from an owner,
-  failing over between owners. Decoders for both peer responses are bounds-checked and fuzzed.
+  **hedging** across owners (§3m) so a slow/down owner is raced or failed over. Decoders for both
+  peer responses are bounds-checked and fuzzed.
 
 ---
 
@@ -844,8 +845,9 @@ lives entirely off the data plane's hot path.
 - **Idempotent reads hedge.** The cluster read fan-out (`hedgedFetcher`, replacing the old
   sequential failover) races a request across a shard's replica owners — first owner immediately, a
   second once it is slow or errors — so a single slow/stuck/down owner no longer dictates latency or
-  fails the read. The S3 backend hedges `GetObject` (a slow GET is re-issued on a fresh connection)
-  and never retries a genuine not-found.
+  fails the read. The profile-enumeration RPCs (series listing and symbol-store fetch) hedge across
+  owners the same way. The S3 backend hedges `GetObject` (a slow GET is re-issued on a fresh
+  connection) and never retries a genuine not-found.
 - **Per-attempt timeouts everywhere.** Every attempt is bounded by `PerTryTimeout` via context (not
   `http.Client.Timeout`, which would abort a request the hedge layer still wants to race); the
   cluster HTTP client also sets dial/TLS/response-header timeouts (it was `http.DefaultClient` with

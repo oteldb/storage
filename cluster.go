@@ -354,29 +354,36 @@ func (s *Storage) clusterProfileSeries(
 		return s.localProfileSeries(ctx, string(tid), start, end, matchers)
 	}
 
-	eq := equalitySpecs(matchers)
-
-	var lastErr error
-	for _, addr := range remotes {
-		series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, signal.Profile,
-			string(s.normalizeTenant(tid)), start, end, eq)
-		if err != nil {
-			lastErr = err
-
-			continue
-		}
-
-		kept := series[:0]
-		for i := range series {
-			if matchesAllSeries(series[i], matchers) {
-				kept = append(kept, series[i])
-			}
-		}
-
-		return kept, nil
+	if len(remotes) == 0 {
+		return nil, nil
 	}
 
-	return nil, lastErr
+	eq := equalitySpecs(matchers)
+
+	// Hedge the enumeration across the owners (each is a complete replica): a slow/down owner is
+	// raced or failed over, and the requester re-applies the non-equality matchers to the superset.
+	thunks := make([]func(context.Context) ([]signal.Series, error), len(remotes))
+	for i := range remotes {
+		addr := remotes[i]
+		thunks[i] = func(ctx context.Context) ([]signal.Series, error) {
+			series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, signal.Profile,
+				string(s.normalizeTenant(tid)), start, end, eq)
+			if err != nil {
+				return nil, err
+			}
+
+			kept := series[:0]
+			for i := range series {
+				if matchesAllSeries(series[i], matchers) {
+					kept = append(kept, series[i])
+				}
+			}
+
+			return kept, nil
+		}
+	}
+
+	return retry.Hedge(ctx, s.readPolicy(ctx, rpcOpSeries), thunks)
 }
 
 // clusterProfileSymbols returns a tenant's symbol-store tables in cluster mode: locally if owned,
@@ -387,19 +394,20 @@ func (s *Storage) clusterProfileSymbols(ctx context.Context, tid signal.TenantID
 		return s.localProfileSymbols(ctx, string(tid))
 	}
 
-	var lastErr error
-	for _, addr := range remotes {
-		tables, err := cluster.FetchSide(ctx, s.cluster.httpc, addr, signal.Profile, string(s.normalizeTenant(tid)))
-		if err != nil {
-			lastErr = err
-
-			continue
-		}
-
-		return tables, nil
+	if len(remotes) == 0 {
+		return map[string][]byte{}, nil
 	}
 
-	return map[string][]byte{}, lastErr
+	// Hedge across owners (each carries the full symbol store; it rides the write path).
+	thunks := make([]func(context.Context) (map[string][]byte, error), len(remotes))
+	for i := range remotes {
+		addr := remotes[i]
+		thunks[i] = func(ctx context.Context) (map[string][]byte, error) {
+			return cluster.FetchSide(ctx, s.cluster.httpc, addr, signal.Profile, string(s.normalizeTenant(tid)))
+		}
+	}
+
+	return retry.Hedge(ctx, s.readPolicy(ctx, rpcOpSide), thunks)
 }
 
 // clusterRecordFetcherFor returns a record signal's read seam for one tenant in cluster mode:

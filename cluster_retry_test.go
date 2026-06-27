@@ -15,6 +15,7 @@ import (
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/reliability"
 	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/signal/profile"
 )
 
 // fakeFetcher is a fetch.Fetcher that simulates a remote owner: an optional delay (slow/stuck peer,
@@ -207,4 +208,64 @@ func TestClusterReadSurvivesDownOwner(t *testing.T) {
 
 	require.NotEmpty(t, batches, "data still readable from the live replica")
 	assert.Less(t, time.Since(start), 3*time.Second, "failover was prompt, not a full-timeout stall")
+}
+
+// TestClusterProfileEnumSurvivesDownOwner exercises the hedged profile-enumeration RPCs (series +
+// symbol store): with profiles replicated to two owners, partitioning one owner still lets a
+// non-owner enumerate streams and resolve stacks via failover to the live replica.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterProfileEnumSurvivesDownOwner(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	ids := []string{"node-a", "node-b", "node-c"}
+	nodes := make(map[string]*Storage, len(ids))
+	for _, id := range ids {
+		nodes[id] = openClusterNodeWith(t, endpoint, id, backend.Memory(), WithRetry(reliability.LossyEnvironment()))
+	}
+
+	a := nodes["node-a"]
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond)
+
+	_, err := a.WriteProfiles(ctx, profileBatch("api", 1000,
+		sampleSpec{"cpu", "nanoseconds", 50},
+		sampleSpec{"cpu", "nanoseconds", 70}))
+	require.NoError(t, err)
+
+	owners := a.cluster.membership.Ring().Lookup([]byte("default"), 2)
+	ownerSet := map[string]bool{owners[0].ID: true, owners[1].ID: true}
+
+	var requesterID string
+	for _, id := range ids {
+		if !ownerSet[id] {
+			requesterID = id
+		}
+	}
+	require.NotEmpty(t, requesterID)
+
+	// Take down the first owner the enum RPCs would try; they must fail over to the live owner.
+	partition(t, nodes[owners[0].ID])
+	reader := nodes[requesterID]
+
+	// series enumeration RPC (rpcOpSeries) survives the down owner.
+	series, err := reader.ProfileSeries(ctx, "default", []fetch.Matcher{nameMatcherSvc("api")}, 0, 0)
+	require.NoError(t, err)
+	require.Len(t, series, 1, "stream still enumerable from the live replica")
+
+	// symbol-store RPC (rpcOpSide) survives too: building the resolver fetches the side store.
+	resolver, err := reader.ProfileResolver(ctx, "default")
+	require.NoError(t, err)
+
+	got, err := fetch.Drain(ctx, must(reader.ProfileFetcher("default").Fetch(ctx, fetch.Request{
+		Signal: signal.Profile, Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{nameMatcherSvc("api")},
+	})))
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+
+	stacks, _ := got[0].Column(profile.ColStackID)
+	frames := resolver.Resolve(stacks.Bytes[0])
+	require.NotEmpty(t, frames, "stack resolved via the hedged symbol-store fetch")
 }
