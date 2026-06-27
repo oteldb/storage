@@ -498,8 +498,14 @@ func (s *Storage) clusterProfileFetcherFor(tid signal.TenantID) fetch.Fetcher {
 
 // recordOwners reports whether this node owns the tenant and the addresses of its other owners.
 func (s *Storage) recordOwners(tid signal.TenantID) (local bool, remotes []string) {
+	return s.shardOwners(s.normalizeTenant(tid))
+}
+
+// shardOwners reports whether this node owns shardKey (is among its ring owners) and the addresses
+// of the remote owners. The key is used verbatim (already normalized, possibly a shard key).
+func (s *Storage) shardOwners(shardKey signal.TenantID) (local bool, remotes []string) {
 	cn := s.cluster
-	for _, o := range cn.membership.Ring().Lookup([]byte(s.normalizeTenant(tid)), cn.rf) {
+	for _, o := range cn.membership.Ring().Lookup([]byte(shardKey), cn.rf) {
 		addr := cn.membership.AddrOf(o.ID)
 
 		switch {
@@ -589,25 +595,46 @@ func (s *Storage) localProfileSymbols(ctx context.Context, tenant string) (map[s
 func (s *Storage) clusterSeries(
 	ctx context.Context, sig signal.Signal, tid signal.TenantID, matchers []fetch.Matcher, start, end int64,
 ) ([]signal.Series, error) {
-	local, remotes := s.recordOwners(tid)
+	tenant := s.normalizeTenant(tid)
+	n := s.cluster.shardCount()
+	eq := equalitySpecs(matchers)
+
+	// A tenant's streams are spread across N shards, so enumerate every shard and concatenate (a
+	// stream lives in exactly one shard, so the sets are disjoint — no dedup needed).
+	var all []signal.Series
+
+	for idx := range n {
+		ser, err := s.shardSeries(ctx, sig, shardKeyOf(tenant, idx, n), matchers, eq, start, end)
+		if err != nil {
+			return nil, err
+		}
+
+		all = append(all, ser...)
+	}
+
+	return all, nil
+}
+
+// shardSeries lists one record shard's stream identities: locally if this node owns the shard, else
+// hedged across its remote owners (re-applying the non-equality matchers to the owner's superset).
+func (s *Storage) shardSeries(
+	ctx context.Context, sig signal.Signal, shardKey signal.TenantID, matchers []fetch.Matcher,
+	eq []fetch.EqualMatcher, start, end int64,
+) ([]signal.Series, error) {
+	local, remotes := s.shardOwners(shardKey)
 	if local {
-		return s.localSeries(ctx, sig, string(tid), start, end, matchers)
+		return s.localSeries(ctx, sig, string(shardKey), start, end, matchers)
 	}
 
 	if len(remotes) == 0 {
 		return nil, nil
 	}
 
-	eq := equalitySpecs(matchers)
-
-	// Hedge the enumeration across the owners (each is a complete replica): a slow/down owner is
-	// raced or failed over, and the requester re-applies the non-equality matchers to the superset.
 	thunks := make([]func(context.Context) ([]signal.Series, error), len(remotes))
 	for i := range remotes {
 		addr := remotes[i]
 		thunks[i] = func(ctx context.Context) ([]signal.Series, error) {
-			series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, sig,
-				string(s.normalizeTenant(tid)), start, end, eq)
+			series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end, eq)
 			if err != nil {
 				return nil, err
 			}
@@ -640,9 +667,47 @@ func (s *Storage) clusterProfileSeries(
 func (s *Storage) clusterKeys(
 	ctx context.Context, sig signal.Signal, tid signal.TenantID, start, end int64,
 ) ([]cluster.KeyInfo, error) {
-	local, remotes := s.recordOwners(tid)
+	tenant := s.normalizeTenant(tid)
+	n := s.cluster.shardCount()
+
+	// A key can appear on streams in more than one shard, so union across shards, OR-ing the scope
+	// bits per distinct key.
+	scopes := make(map[string]uint8)
+
+	for idx := range n {
+		ks, err := s.shardKeys(ctx, sig, shardKeyOf(tenant, idx, n), start, end)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, k := range ks {
+			scopes[string(k.Key)] |= k.Scope
+		}
+	}
+
+	keys := make([]string, 0, len(scopes))
+	for k := range scopes {
+		keys = append(keys, k)
+	}
+
+	sort.Strings(keys) // deterministic order
+
+	out := make([]cluster.KeyInfo, len(keys))
+	for i, k := range keys {
+		out[i] = cluster.KeyInfo{Key: []byte(k), Scope: scopes[k]}
+	}
+
+	return out, nil
+}
+
+// shardKeys lists one record shard's distinct attribute keys: locally if owned, else hedged across
+// its remote owners (each a complete replica).
+func (s *Storage) shardKeys(
+	ctx context.Context, sig signal.Signal, shardKey signal.TenantID, start, end int64,
+) ([]cluster.KeyInfo, error) {
+	local, remotes := s.shardOwners(shardKey)
 	if local {
-		return s.localKeys(ctx, sig, string(tid), start, end)
+		return s.localKeys(ctx, sig, string(shardKey), start, end)
 	}
 
 	if len(remotes) == 0 {
@@ -653,7 +718,7 @@ func (s *Storage) clusterKeys(
 	for i := range remotes {
 		addr := remotes[i]
 		thunks[i] = func(ctx context.Context) ([]cluster.KeyInfo, error) {
-			return cluster.FetchKeys(ctx, s.cluster.httpc, addr, sig, string(s.normalizeTenant(tid)), start, end)
+			return cluster.FetchKeys(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end)
 		}
 	}
 

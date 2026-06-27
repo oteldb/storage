@@ -768,6 +768,54 @@ func TestClusteredRecordShardingGathersAllStreams(t *testing.T) {
 	}
 }
 
+// TestClusteredRecordShardingEnumeratesAcrossShards proves LogSeries/LogKeys gather across shards:
+// streams (and their distinct attribute keys) scattered over shards are all enumerated from any node.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusteredRecordShardingEnumeratesAcrossShards(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	const shards = 4
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodeSharded(t, endpoint, "node-a", shards),
+		"node-b": openClusterNodeSharded(t, endpoint, "node-b", shards),
+		"node-c": openClusterNodeSharded(t, endpoint, "node-c", shards),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond)
+
+	// Each service is a distinct stream (scattered across shards) carrying a distinct attribute key.
+	const streams = 6
+
+	wantKeys := map[string]struct{}{"service.name": {}, "otel.scope.name": {}}
+
+	for i := range streams {
+		key := "attr." + strconv.Itoa(i)
+		wantKeys[key] = struct{}{}
+		_, err := a.WriteLogs(ctx, logBatchWithAttrs("svc"+strconv.Itoa(i), [4]any{i + 1, 9, "m", key}))
+		require.NoError(t, err)
+	}
+
+	for name, s := range nodes {
+		series, err := s.LogSeries(ctx, "default", nil, 0, 0)
+		require.NoErrorf(t, err, "%s LogSeries", name)
+		assert.Lenf(t, series, streams, "%s enumerates all streams across shards", name)
+
+		keys, err := s.LogKeys(ctx, "default", 0, 0)
+		require.NoErrorf(t, err, "%s LogKeys", name)
+
+		got := logKeyScopes(keys)
+		for k := range wantKeys {
+			assert.Containsf(t, got, k, "%s LogKeys union includes %q", name, k)
+		}
+	}
+}
+
 func TestShardHelpers(t *testing.T) {
 	t.Parallel()
 
