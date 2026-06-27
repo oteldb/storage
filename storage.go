@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -479,15 +480,22 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 }
 
 // AggregateMetrics returns a per-series aggregate (count/sum/min/max — enough for avg) of one
-// tenant's metric series over the request window: the storage-side aggregate pushdown. With
-// [WithAggregateStats] it answers a range-covering aggregate from precomputed per-part stats without
-// decoding the value column — one row per series instead of every sample — and otherwise decodes.
-// An embedder's PromQL engine can use it to evaluate `*_over_time` cheaply.
+// tenant's metric series over the request window. An embedder's PromQL engine can use it to
+// evaluate `*_over_time` cheaply.
 //
-// Single-node: it queries the local tenant engine and does not yet fan out across cluster shards.
+// Single-node it is the storage-side **pushdown**: with [WithAggregateStats] a range-covering
+// aggregate is answered from precomputed per-part stats without decoding the value column (one row
+// per series instead of every sample), else by decoding. In **cluster** mode it gathers across the
+// tenant's shards through the owner-aware read fan-out and folds at the coordinator — correct across
+// all shards, though it transfers raw samples rather than pushing the aggregate to each node (a
+// compact per-node aggregate RPC is a planned optimization).
 func (s *Storage) AggregateMetrics(ctx context.Context, t signal.TenantID, r fetch.Request) (map[signal.SeriesID]engine.SeriesAgg, error) {
 	if s.closed.Load() {
 		return map[signal.SeriesID]engine.SeriesAgg{}, nil
+	}
+
+	if s.cluster != nil {
+		return aggregateFetch(ctx, s.Fetcher(t), r)
 	}
 
 	eng, ok := s.lookupEngine(s.normalizeTenant(t))
@@ -496,6 +504,43 @@ func (s *Storage) AggregateMetrics(ctx context.Context, t signal.TenantID, r fet
 	}
 
 	return eng.AggregateRange(ctx, r)
+}
+
+// aggregateFetch gathers raw samples via f and folds them into a per-series aggregate — the
+// cluster-correct path: it reuses the owner-aware fan-out (and its matcher re-checking and
+// failover) and aggregates at the coordinator.
+func aggregateFetch(ctx context.Context, f fetch.Fetcher, r fetch.Request) (map[signal.SeriesID]engine.SeriesAgg, error) {
+	it, err := f.Fetch(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+
+	batches, err := fetch.Drain(ctx, it)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[signal.SeriesID]engine.SeriesAgg, len(batches))
+
+	for _, b := range batches {
+		var a engine.SeriesAgg
+		for i, v := range b.Values {
+			if i == 0 {
+				a.Min, a.Max = v, v
+			} else {
+				a.Min, a.Max = min(a.Min, v), max(a.Max, v)
+			}
+
+			a.Sum += v
+			a.Count++
+		}
+
+		if a.Count > 0 {
+			out[b.ID] = a
+		}
+	}
+
+	return out, nil
 }
 
 // AggregateMetricsStep is the step-bucketed form of [Storage.AggregateMetrics]: it returns, per
@@ -509,12 +554,89 @@ func (s *Storage) AggregateMetricsStep(
 		return map[signal.SeriesID][]engine.BucketAgg{}, nil
 	}
 
+	if s.cluster != nil {
+		return aggregateFetchStep(ctx, s.Fetcher(t), r, step)
+	}
+
 	eng, ok := s.lookupEngine(s.normalizeTenant(t))
 	if !ok {
 		return map[signal.SeriesID][]engine.BucketAgg{}, nil
 	}
 
 	return eng.AggregateStep(ctx, r, step)
+}
+
+// aggregateFetchStep is the step-bucketed [aggregateFetch]: it gathers via the fan-out and buckets
+// the samples at the coordinator.
+func aggregateFetchStep(
+	ctx context.Context, f fetch.Fetcher, r fetch.Request, step int64,
+) (map[signal.SeriesID][]engine.BucketAgg, error) {
+	it, err := f.Fetch(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+
+	batches, err := fetch.Drain(ctx, it)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[signal.SeriesID][]engine.BucketAgg, len(batches))
+
+	for _, b := range batches {
+		buckets := map[int64]engine.SeriesAgg{}
+		for i, ts := range b.Timestamps {
+			bs := bucketStartOf(ts, step)
+			a := buckets[bs]
+			v := b.Values[i]
+			if a.Count == 0 {
+				a.Min, a.Max = v, v
+			} else {
+				a.Min, a.Max = min(a.Min, v), max(a.Max, v)
+			}
+			a.Sum += v
+			a.Count++
+			buckets[bs] = a
+		}
+
+		if len(buckets) == 0 {
+			continue
+		}
+
+		list := make([]engine.BucketAgg, 0, len(buckets))
+		for start, a := range buckets {
+			list = append(list, engine.BucketAgg{Start: start, SeriesAgg: a})
+		}
+
+		slices.SortFunc(list, func(x, y engine.BucketAgg) int {
+			switch {
+			case x.Start < y.Start:
+				return -1
+			case x.Start > y.Start:
+				return 1
+			default:
+				return 0
+			}
+		})
+
+		out[b.ID] = list
+	}
+
+	return out, nil
+}
+
+// bucketStartOf floors ts to its step-aligned bucket on the absolute grid (step ≤ 0 ⇒ one bucket).
+func bucketStartOf(ts, step int64) int64 {
+	if step <= 0 {
+		return 0
+	}
+
+	r := ts % step
+	if r < 0 {
+		r += step
+	}
+
+	return ts - r
 }
 
 // seedFetcher is the outermost read wrapper: it installs the injected logger as the zctx base so

@@ -8,8 +8,50 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/signal"
 )
+
+// sliceFetcher returns a fixed set of batches — stands in for the cluster fan-out so the coordinator
+// fold can be unit-tested without a real cluster.
+type sliceFetcher struct{ batches []*fetch.Batch }
+
+func (f sliceFetcher) Fetch(context.Context, fetch.Request) (fetch.Iterator, error) {
+	return fetch.NewSliceIterator(f.batches), nil
+}
+
+func aggBatch(lo uint64, ts []int64, vals []float64) *fetch.Batch {
+	return &fetch.Batch{ID: signal.SeriesID{Lo: lo}, Timestamps: ts, Values: vals}
+}
+
+func TestAggregateFetchFolds(t *testing.T) {
+	t.Parallel()
+
+	f := sliceFetcher{batches: []*fetch.Batch{
+		aggBatch(1, []int64{1, 2, 3}, []float64{10, 20, 6}),
+		aggBatch(2, []int64{5}, []float64{7}),
+	}}
+
+	got, err := aggregateFetch(context.Background(), f, fetch.Request{})
+	require.NoError(t, err)
+	assert.Equal(t, engine.SeriesAgg{Count: 3, Sum: 36, Min: 6, Max: 20}, got[signal.SeriesID{Lo: 1}])
+	assert.Equal(t, engine.SeriesAgg{Count: 1, Sum: 7, Min: 7, Max: 7}, got[signal.SeriesID{Lo: 2}])
+}
+
+func TestAggregateFetchStepFolds(t *testing.T) {
+	t.Parallel()
+
+	f := sliceFetcher{batches: []*fetch.Batch{aggBatch(1, []int64{1, 5, 105, 130}, []float64{1, 3, 9, 11})}}
+
+	got, err := aggregateFetchStep(context.Background(), f, fetch.Request{}, 100)
+	require.NoError(t, err)
+
+	list := got[signal.SeriesID{Lo: 1}]
+	require.Len(t, list, 2)
+	assert.Equal(t, engine.BucketAgg{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 4, Min: 1, Max: 3}}, list[0])
+	assert.Equal(t, engine.BucketAgg{Start: 100, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 20, Min: 9, Max: 11}}, list[1])
+}
 
 // TestAggregateMetricsEndToEnd drives AggregateMetrics through the public facade and checks it
 // matches the aggregate of a raw fetch, exercising the sidecar pushdown over flushed parts.
