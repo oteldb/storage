@@ -816,6 +816,92 @@ func TestClusteredRecordShardingEnumeratesAcrossShards(t *testing.T) {
 	}
 }
 
+// TestClusteredShardedTraceByID proves trace-by-id reassembles across shards: a trace whose spans
+// belong to different services (distinct streams, scattered shards) returns all spans from any node.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusteredShardedTraceByID(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	const shards = 4
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodeSharded(t, endpoint, "node-a", shards),
+		"node-b": openClusterNodeSharded(t, endpoint, "node-b", shards),
+		"node-c": openClusterNodeSharded(t, endpoint, "node-c", shards),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond)
+
+	// One trace "t" with spans in three services (three streams that scatter across shards).
+	for i, svc := range []string{"frontend", "backend", "db"} {
+		_, err := a.WriteTraces(ctx, traceBatch(svc, spanSpec{
+			traceID: "t", spanID: "s" + strconv.Itoa(i), name: "op" + strconv.Itoa(i), start: 1, end: 2,
+		}))
+		require.NoError(t, err)
+	}
+
+	for name, s := range nodes {
+		spans, err := s.Trace(ctx, "default", []byte("t"))
+		require.NoErrorf(t, err, "%s trace-by-id", name)
+
+		total := 0
+		for _, b := range spans {
+			total += len(b.Timestamps)
+		}
+
+		assert.Equalf(t, 3, total, "%s reassembles all spans of the trace across shards", name)
+	}
+}
+
+// TestClusteredShardedProfileResolver proves profile flamegraph resolution unions symbol stores
+// across shards: samples from streams on different shards all resolve from any node.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusteredShardedProfileResolver(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	const shards = 4
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodeSharded(t, endpoint, "node-a", shards),
+		"node-b": openClusterNodeSharded(t, endpoint, "node-b", shards),
+		"node-c": openClusterNodeSharded(t, endpoint, "node-c", shards),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond)
+
+	// Profiles for three services (distinct streams ⇒ scattered shards), each with a stack.
+	for _, svc := range []string{"svc-a", "svc-b", "svc-c"} {
+		_, err := a.WriteProfiles(ctx, profileBatch(svc, 1000, sampleSpec{"cpu", "nanoseconds", 50}))
+		require.NoError(t, err)
+	}
+
+	for name, s := range nodes {
+		// Gather samples across shards.
+		got, err := fetch.Drain(ctx, must(s.ProfileFetcher("default").Fetch(ctx, fetch.Request{
+			Signal: signal.Profile, Start: 0, End: 1 << 60,
+		})))
+		require.NoErrorf(t, err, "%s profile search", name)
+		require.GreaterOrEqualf(t, len(got), 3, "%s gathers streams across shards", name)
+
+		// The unioned-across-shards symbol store resolves a stack from any stream.
+		resolver, err := s.ProfileResolver(ctx, "default")
+		require.NoErrorf(t, err, "%s profile resolver", name)
+		stacks, _ := got[0].Column(profile.ColStackID)
+		frames := resolver.Resolve(stacks.Bytes[0])
+		assert.NotEmptyf(t, frames, "%s resolves a stack via the cross-shard symbol union", name)
+	}
+}
+
 func TestShardHelpers(t *testing.T) {
 	t.Parallel()
 

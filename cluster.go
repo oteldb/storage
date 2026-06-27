@@ -28,6 +28,7 @@ import (
 	"github.com/oteldb/storage/reliability"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
+	"github.com/oteldb/storage/signal/profile"
 	tenantpkg "github.com/oteldb/storage/tenant"
 	"github.com/oteldb/storage/wal"
 )
@@ -497,10 +498,6 @@ func (s *Storage) clusterProfileFetcherFor(tid signal.TenantID) fetch.Fetcher {
 }
 
 // recordOwners reports whether this node owns the tenant and the addresses of its other owners.
-func (s *Storage) recordOwners(tid signal.TenantID) (local bool, remotes []string) {
-	return s.shardOwners(s.normalizeTenant(tid))
-}
-
 // shardOwners reports whether this node owns shardKey (is among its ring owners) and the addresses
 // of the remote owners. The key is used verbatim (already normalized, possibly a shard key).
 func (s *Storage) shardOwners(shardKey signal.TenantID) (local bool, remotes []string) {
@@ -728,21 +725,45 @@ func (s *Storage) shardKeys(
 // clusterProfileSymbols returns a tenant's symbol-store tables in cluster mode: locally if owned,
 // else from an owner (failover). Each owner is a complete replica (symbols ride the write path).
 func (s *Storage) clusterProfileSymbols(ctx context.Context, tid signal.TenantID) (map[string][]byte, error) {
-	local, remotes := s.recordOwners(tid)
+	tenant := s.normalizeTenant(tid)
+	n := s.cluster.shardCount()
+
+	// A stack's symbols live in whichever shard ingested it, so collect every shard's symbol tables
+	// and union them — content-addressing makes the union a plain dedup, no id remap. A flamegraph
+	// over samples from several shards then resolves every stack_id.
+	parts := make([]map[string][]byte, 0, n)
+
+	for idx := range n {
+		tables, err := s.shardSymbols(ctx, shardKeyOf(tenant, idx, n))
+		if err != nil {
+			return nil, err
+		}
+
+		if len(tables) > 0 {
+			parts = append(parts, tables)
+		}
+	}
+
+	return profile.NewSymbolStore().Union(parts)
+}
+
+// shardSymbols returns one profile shard's unioned symbol tables: locally if owned, else hedged
+// across its remote owners (each a complete replica — symbols ride the write path).
+func (s *Storage) shardSymbols(ctx context.Context, shardKey signal.TenantID) (map[string][]byte, error) {
+	local, remotes := s.shardOwners(shardKey)
 	if local {
-		return s.localProfileSymbols(ctx, string(tid))
+		return s.localProfileSymbols(ctx, string(shardKey))
 	}
 
 	if len(remotes) == 0 {
 		return map[string][]byte{}, nil
 	}
 
-	// Hedge across owners (each carries the full symbol store; it rides the write path).
 	thunks := make([]func(context.Context) (map[string][]byte, error), len(remotes))
 	for i := range remotes {
 		addr := remotes[i]
 		thunks[i] = func(ctx context.Context) (map[string][]byte, error) {
-			return cluster.FetchSide(ctx, s.cluster.httpc, addr, signal.Profile, string(s.normalizeTenant(tid)))
+			return cluster.FetchSide(ctx, s.cluster.httpc, addr, signal.Profile, string(shardKey))
 		}
 	}
 
