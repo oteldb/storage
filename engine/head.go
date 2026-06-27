@@ -225,6 +225,27 @@ func (h *head) replaySamples(id signal.SeriesID, ts []int64, values []float64) {
 	}
 }
 
+// replaySamplesSF restores samples that carried lossy-sampling scale factors (WAL recovery), so a
+// crash recovers unflushed *sampled* data at its representative weight rather than weight 1. It
+// appends per sample through appendSample, which materializes the buffer's sf slice on the first
+// non-unit weight.
+func (h *head) replaySamplesSF(id signal.SeriesID, ts []int64, values, sf []float64) {
+	if !h.series.Has(id) {
+		return // series record missing; ignore (defensive)
+	}
+
+	buf := h.bufFor(id)
+	for i := range ts {
+		buf.appendSample(ts[i], values[i], sf[i])
+
+		if ts[i] > h.newest {
+			h.newest = ts[i]
+		}
+	}
+
+	h.bytes += int64(len(ts)) * SampleBytes
+}
+
 // indexLabels interns and registers every queryable label of the series — resource and
 // scope attributes, the scope name/version, and the (folded) point attributes — into the
 // postings index under id.

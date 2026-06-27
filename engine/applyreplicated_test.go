@@ -34,9 +34,9 @@ func TestApplyPrimaryRejectsOutOfOrder(t *testing.T) {
 	})
 
 	primary := engine.New(engine.Config{OOOWindow: 50})
-	accepted, rejected, err := primary.ApplyPrimary(data)
+	accepted, res, err := primary.ApplyPrimary(data, engine.AppendLimits{})
 	require.NoError(t, err)
-	assert.Equal(t, 1, rejected, "the out-of-order sample is rejected once, at the primary")
+	assert.Equal(t, 1, res.RejectedOOO, "the out-of-order sample is rejected once, at the primary")
 
 	want := []int64{100, 200}
 	got := fetchAll(t, primary, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})

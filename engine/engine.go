@@ -169,7 +169,7 @@ func (e *Engine) AppendBatch(
 		// Group the accepted samples by series; the grouped frames are written once after the loop
 		// (one WriteSamples per series, not one write+fsync syscall per sample, all under the lock).
 		if e.cfg.WAL != nil {
-			e.walB.add(ids[i], ts[i], values[i], isNew, s)
+			e.walB.add(ids[i], ts[i], values[i], w, isNew, s)
 		}
 	}
 
@@ -190,6 +190,47 @@ func (e *Engine) HeadBytes() int64 {
 	defer e.mu.RUnlock()
 
 	return e.head.bytes
+}
+
+// Stats is an in-memory snapshot of an engine's state for introspection (no backend I/O, no decode).
+type Stats struct {
+	Series      int64 // distinct series ever seen (index span: head ∪ flushed)
+	HeadSamples int64 // samples currently buffered in the head (unflushed)
+	HeadBytes   int64 // head's buffered sample bytes (the in-flight memory measure)
+	Parts       int   // flushed immutable parts
+	MinTime     int64 // oldest flushed sample time (unix ns); 0 when no parts
+	MaxTime     int64 // newest sample time across parts and the head (unix ns); 0 when empty
+}
+
+// Stats returns an in-memory snapshot of the engine's state under a single read lock. It does no
+// backend I/O and decodes nothing, so it is safe to poll at dashboard cadence without touching the
+// hot path. Part byte sizes are not included (they would require backend stat calls).
+func (e *Engine) Stats() Stats {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	s := Stats{
+		Series:    int64(e.head.series.Len()),
+		HeadBytes: e.head.bytes,
+		Parts:     len(e.parts),
+		MaxTime:   e.head.newest,
+	}
+
+	for _, buf := range e.head.samples {
+		s.HeadSamples += int64(len(buf.ts))
+	}
+
+	for i, p := range e.parts {
+		if i == 0 || p.minTime < s.MinTime {
+			s.MinTime = p.minTime
+		}
+
+		if p.maxTime > s.MaxTime {
+			s.MaxTime = p.maxTime
+		}
+	}
+
+	return s
 }
 
 // Fetch implements [fetch.Fetcher] over the head ∪ flushed parts: it resolves the
@@ -490,27 +531,18 @@ func (e *Engine) Replay(dir string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return wal.ReplayDir(dir, wal.Handlers{
-		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
-			e.head.registerSeries(s)
-
-			return nil
-		},
-		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
-			e.head.replaySamples(id, ts, values)
-
-			return nil
-		},
-	})
+	return wal.ReplayDir(dir, e.replayHandlers())
 }
 
-// ApplyPrimary applies a write as the shard's **primary**: it appends each sample through the
-// out-of-order-checked path (the single OOO decision for the shard) and re-frames the
-// *accepted* samples into a WAL payload to replicate to the secondary owners. It returns that
-// accepted payload and the number of samples rejected as out-of-order. Because only the
-// primary OOO-checks and it dictates the accepted set, every replica converges on the same
-// data regardless of concurrent writers. Safe for concurrent use.
-func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err error) {
+// ApplyPrimary applies a write as the shard's **primary**: it runs each sample through the
+// admission-checked append path (the single OOO decision for the shard, plus the cardinality
+// and in-flight-memory valves from limits) and re-frames the *accepted* samples into a WAL
+// payload to replicate to the secondary owners. It returns that accepted payload and an
+// [AppendResult] breaking the disposition down by reason, so the clustered ingest path can
+// attribute OTLP partial-success exactly like the single-node path. Because only the primary
+// admission-checks and it dictates the accepted set, every replica converges on the same data
+// regardless of concurrent writers. Safe for concurrent use.
+func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte, res AppendResult, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -535,15 +567,23 @@ func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err e
 			var accVals []float64
 
 			for i := range ts {
-				// The replication apply path enforces only the OOO window (the shard primary's
-				// authoritative timing decision); cardinality/memory admission is applied at the
-				// origin ingest, so pass no limits here.
-				if out, _, _ := e.head.appendByID(id, ts[i], values[i], 1, e.cfg.OOOWindow,
-					AppendLimits{}, func() signal.Series { return s }); out == admitted {
+				// The primary is the shard's single authority, so it makes the admission decision
+				// here (OOO window + cardinality + in-flight memory); secondaries apply the accepted
+				// set verbatim via ApplyReplicated.
+				out, _, _ := e.head.appendByID(id, ts[i], values[i], 1, e.cfg.OOOWindow,
+					limits, func() signal.Series { return s })
+
+				switch out {
+				case admitted:
 					accTs = append(accTs, ts[i])
 					accVals = append(accVals, values[i])
-				} else {
-					rejected++
+					res.Accepted++
+				case rejectOOO:
+					res.RejectedOOO++
+				case rejectCardinality:
+					res.RejectedCardinality++
+				case rejectBytes:
+					res.RejectedBytes++
 				}
 			}
 
@@ -562,7 +602,7 @@ func (e *Engine) ApplyPrimary(data []byte) (accepted []byte, rejected int, err e
 		},
 	})
 
-	return buf.Bytes(), rejected, err
+	return buf.Bytes(), res, err
 }
 
 // ApplyReplicated applies a replicated write from the shard's primary to this secondary's head:
@@ -574,18 +614,7 @@ func (e *Engine) ApplyReplicated(data []byte) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return wal.Replay(data, wal.Handlers{
-		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
-			e.head.registerSeries(s)
-
-			return nil
-		},
-		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
-			e.head.replaySamples(id, ts, values)
-
-			return nil
-		},
-	})
+	return wal.Replay(data, e.replayHandlers())
 }
 
 // HeadSampleCount returns the number of samples currently buffered in the head (across all
@@ -803,4 +832,27 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 	}
 
 	return p
+}
+
+// replayHandlers returns the WAL handlers that rebuild the head from logged records — registering
+// each series and appending its samples (plain or scale-factor-carrying) verbatim. Shared by the
+// durable-restart [Engine.Replay] and the trusting [Engine.ApplyReplicated]. The caller holds e.mu.
+func (e *Engine) replayHandlers() wal.Handlers {
+	return wal.Handlers{
+		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
+			e.head.registerSeries(s)
+
+			return nil
+		},
+		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
+			e.head.replaySamples(id, ts, values)
+
+			return nil
+		},
+		OnSamplesSF: func(id signal.SeriesID, ts []int64, values, sf []float64) error {
+			e.head.replaySamplesSF(id, ts, values, sf)
+
+			return nil
+		},
+	}
 }
