@@ -15,6 +15,7 @@ type Admission struct {
 	accepted metric.Int64Counter
 	rejected metric.Int64Counter
 	sampled  metric.Int64Counter
+	overflow metric.Int64Counter
 }
 
 func newAdmission(m metric.Meter) (*Admission, error) {
@@ -39,7 +40,14 @@ func newAdmission(m metric.Meter) (*Admission, error) {
 		return nil, err
 	}
 
-	return &Admission{accepted: accepted, rejected: rejected, sampled: sampled}, nil
+	overflow, err := m.Int64Counter("storage.ingest.overflowed",
+		metric.WithDescription("data points for new series past the soft cardinality budget, routed to an overflow series"),
+		metric.WithUnit("{point}"))
+	if err != nil {
+		return nil, err
+	}
+
+	return &Admission{accepted: accepted, rejected: rejected, sampled: sampled, overflow: overflow}, nil
 }
 
 // Accepted records n points accepted for the given signal. A zero n is ignored.
@@ -72,4 +80,14 @@ func (a *Admission) SampledDropped(ctx context.Context, n int64, sig string) {
 	}
 
 	a.sampled.Add(ctx, n, metric.WithAttributes(attribute.String("signal", sig)))
+}
+
+// Overflowed records n points routed to an overflow series past the soft cardinality budget for the
+// given signal. A zero n is ignored.
+func (a *Admission) Overflowed(ctx context.Context, n int64, sig string) {
+	if n <= 0 {
+		return
+	}
+
+	a.overflow.Add(ctx, n, metric.WithAttributes(attribute.String("signal", sig)))
 }
