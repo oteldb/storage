@@ -40,14 +40,35 @@ func TestSideTablesRoundTrip(t *testing.T) {
 	assert.Empty(t, out["strings"])
 }
 
+func TestKeyListRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	in := []cluster.KeyInfo{
+		{Key: []byte("http.method"), Scope: 0b101},
+		{Key: []byte{}, Scope: 0}, // empty key, zero scope
+		{Key: []byte("\x00\xff\x01"), Scope: 0b010},
+	}
+
+	out, err := cluster.DecodeKeyList(cluster.EncodeKeyList(in))
+	require.NoError(t, err)
+	require.Len(t, out, 3)
+	assert.Equal(t, []byte("http.method"), out[0].Key)
+	assert.Equal(t, uint8(0b101), out[0].Scope)
+	assert.Empty(t, out[1].Key)
+	assert.Equal(t, []byte("\x00\xff\x01"), out[2].Key)
+	assert.Equal(t, uint8(0b010), out[2].Scope)
+}
+
 // FuzzDecodeEnum: arbitrary bytes to the peer-response decoders must error or decode, never panic.
 func FuzzDecodeEnum(f *testing.F) {
 	f.Add(cluster.EncodeSeriesList([]signal.Series{ser("api")}))
 	f.Add(cluster.EncodeSideTables(map[string][]byte{"stacks": []byte("x")}))
+	f.Add(cluster.EncodeKeyList([]cluster.KeyInfo{{Key: []byte("k"), Scope: 1}}))
 	f.Add([]byte{0x02, 0xff})
 
 	f.Fuzz(func(_ *testing.T, data []byte) {
 		_, _ = cluster.DecodeSeriesList(data)
 		_, _ = cluster.DecodeSideTables(data)
+		_, _ = cluster.DecodeKeyList(data)
 	})
 }

@@ -18,8 +18,9 @@ import (
 const (
 	rpcOpRead   = "read"
 	rpcOpWrite  = "write"
-	rpcOpSeries = "series" // profile series enumeration
+	rpcOpSeries = "series" // record-signal series enumeration
 	rpcOpSide   = "side"   // profile symbol-store fetch
+	rpcOpKeys   = "keys"   // record-signal attribute-key enumeration
 )
 
 // newClusterHTTPClient builds the node-to-node HTTP client. It sets connection-level timeouts so a
