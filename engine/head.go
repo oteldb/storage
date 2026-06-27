@@ -440,6 +440,12 @@ type tsv struct {
 // sortedWindow returns the buffer's samples within [start, end], sorted by timestamp. The
 // returned sf slice is nil when every weight is 1 (the unsampled common case), else len == len(ts).
 func sortedWindow(buf *sampleBuf, start, end int64) ([]int64, []float64, []float64) {
+	// Fast path: head samples are usually ingested in order, so the buffer is already ascending —
+	// skip the sortable scratch and the sort, window-copying directly.
+	if ascendingInt64(buf.ts) {
+		return windowCopy(buf, start, end)
+	}
+
 	pairs := make([]tsv, len(buf.ts))
 	for i := range buf.ts {
 		pairs[i] = tsv{ts: buf.ts[i], val: buf.values[i], sf: bufSF(buf, i)}
@@ -484,4 +490,38 @@ func bufSF(buf *sampleBuf, i int) float64 {
 	}
 
 	return buf.sf[i]
+}
+
+// ascendingInt64 reports whether s is non-decreasing — the common case for a head buffer ingested
+// in time order, letting sortedWindow skip its sortable scratch and sort.
+func ascendingInt64(s []int64) bool {
+	for i := 1; i < len(s); i++ {
+		if s[i] < s[i-1] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// windowCopy copies the buffer's [start, end] samples in order (the buffer is already ascending),
+// pre-sizing the result to the buffer length. The sf slice stays nil until the first non-unit weight.
+func windowCopy(buf *sampleBuf, start, end int64) ([]int64, []float64, []float64) {
+	ts := make([]int64, 0, len(buf.ts))
+	values := make([]float64, 0, len(buf.ts))
+
+	var sf []float64
+
+	for i := range buf.ts {
+		t := buf.ts[i]
+		if t < start || t > end {
+			continue
+		}
+
+		ts = append(ts, t)
+		values = append(values, buf.values[i])
+		sf = appendWeight(sf, bufSF(buf, i), len(ts), len(buf.ts))
+	}
+
+	return ts, values, sf
 }
