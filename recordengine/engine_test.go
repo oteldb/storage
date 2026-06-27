@@ -308,3 +308,120 @@ func TestFetchSupersetOfBruteForce(t *testing.T) {
 		require.Equalf(t, want, got, "svc %q window [%d,%d]", svc, lo, hi)
 	}
 }
+
+// snapshot maps each returned stream to a stable, comparable string of its rows (ts:sev:body), so a
+// recycled fetch can be checked row-for-row against a plain one.
+func snapshot(batches []*fetch.Batch) map[signal.SeriesID][]string {
+	out := make(map[signal.SeriesID][]string, len(batches))
+	for _, b := range batches {
+		sev, _ := b.Column("sev")
+		rows := make([]string, len(b.Timestamps))
+
+		for i := range b.Timestamps {
+			rows[i] = fmt.Sprintf("%d:%d:%s", b.Timestamps[i], sev.Int64[i], bodies(b)[i])
+		}
+
+		out[b.ID] = rows
+	}
+
+	return out
+}
+
+// TestFetchRecycleMatchesPlain verifies the opt-in Recycle path: recycled fetches return byte-for-
+// byte the same rows as a plain fetch, and reusing the pooled accumulators/int buffers across many
+// release→fetch rounds never corrupts a later result. Projection alternates per round so the
+// accumulator re-arm (prepare) is exercised across differing column selections.
+func TestFetchRecycleMatchesPlain(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := newEngine(t, backend.Memory())
+
+	// Several flushed parts plus a live head, across multiple services (⇒ multiple streams pooled).
+	for round := range 4 {
+		for _, svc := range []string{"api", "web", "db"} {
+			recs := make([]rrec, 0, 8)
+			for i := range 8 {
+				recs = append(recs, rrec{
+					ts:   int64(round*100 + i),
+					sev:  int64(round*10 + i),
+					body: fmt.Sprintf("%s-r%d-%d", svc, round, i),
+				})
+			}
+
+			ingest(t, e, mkBatch(svc, recs...))
+		}
+
+		if round < 3 { // leave the last round in the head
+			require.NoError(t, e.Flush(ctx))
+		}
+	}
+
+	want := snapshot(fetchAll(t, e, fetch.Request{Start: 0, End: 1 << 60}))
+	require.NotEmpty(t, want)
+
+	projections := [][]string{nil, {"ts", "sev", "body"}, {"body"}, {"ts", "sev", "body"}}
+
+	for round := range 6 {
+		r := fetch.Request{Start: 0, End: 1 << 60, Recycle: true, Projection: projections[round%len(projections)]}
+
+		it, err := e.Fetch(ctx, r)
+		require.NoError(t, err)
+
+		var batches []*fetch.Batch
+
+		for {
+			b, err := it.Next(ctx)
+			if err != nil {
+				break
+			}
+
+			batches = append(batches, b)
+		}
+
+		require.NoError(t, it.Close())
+
+		// Compare to the plain snapshot before releasing (after Release the batch must not be read).
+		// When body is the only projection, compare just that column.
+		got := snapshotProjected(batches, r.Projection)
+		require.Equalf(t, projectWant(want, r.Projection), got, "recycle round %d projection %v", round, r.Projection)
+
+		for _, b := range batches {
+			b.Release()
+		}
+	}
+}
+
+// snapshotProjected is [snapshot] honoring a body-only projection (no sev/ts columns present).
+func snapshotProjected(batches []*fetch.Batch, projection []string) map[signal.SeriesID][]string {
+	if len(projection) == 1 && projection[0] == "body" {
+		out := make(map[signal.SeriesID][]string, len(batches))
+		for _, b := range batches {
+			out[b.ID] = bodies(b)
+		}
+
+		return out
+	}
+
+	return snapshot(batches)
+}
+
+// projectWant reduces a full snapshot to the body-only column when the request projects only body.
+func projectWant(full map[signal.SeriesID][]string, projection []string) map[signal.SeriesID][]string {
+	if len(projection) != 1 || projection[0] != "body" {
+		return full
+	}
+
+	out := make(map[signal.SeriesID][]string, len(full))
+	for id, rows := range full {
+		bodyOnly := make([]string, len(rows))
+		for i, row := range rows {
+			parts := bytes.SplitN([]byte(row), []byte(":"), 3)
+			bodyOnly[i] = string(parts[2])
+		}
+
+		out[id] = bodyOnly
+	}
+
+	return out
+}

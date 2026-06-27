@@ -122,7 +122,7 @@ func (p *part) appendWindow(ctx context.Context, id signal.SeriesID, acc *record
 		return nil
 	}
 
-	cols, err := p.readCols(ctx, fullSel(p.schema))
+	cols, err := p.readCols(ctx, fullSel(p.schema), nil)
 	if err != nil {
 		return err
 	}
@@ -137,18 +137,29 @@ func (p *part) appendWindow(ctx context.Context, id signal.SeriesID, acc *record
 }
 
 // readCols decodes the part's timestamp column plus the schema columns selected by sel (unselected
-// stay nil — lazy decode). Returned byte slices are freshly decoded (owned by the caller).
-func (p *part) readCols(ctx context.Context, sel colSel) (*recordCols, error) {
+// stay nil — lazy decode). Returned byte slices are freshly decoded (owned by the caller). getI64,
+// when non-nil, supplies reusable int-column scratch from a pool (the fetch path, whose decoded int
+// columns are copied out and then recycled by [Engine.recycleDecodeInts]); pass nil to decode into
+// fresh slices (the merge path, which has no recycle point).
+func (p *part) readCols(ctx context.Context, sel colSel, getI64 func() []int64) (*recordCols, error) {
 	c := &recordCols{schema: p.schema, sel: sel, ints: make([][]int64, p.schema.numInts()), bytes: make([][][]byte, p.schema.numBytes())}
 
+	dst := func() []int64 {
+		if getI64 != nil {
+			return getI64()
+		}
+
+		return nil
+	}
+
 	var err error
-	if c.ts, err = p.readInt64(ctx, colTs); err != nil {
+	if c.ts, err = p.readInt64(ctx, colTs, dst()); err != nil {
 		return nil, err
 	}
 
 	for k := range c.ints {
 		if sel.ints[k] {
-			if c.ints[k], err = p.readInt64(ctx, p.schema.intColumn(k).Name); err != nil {
+			if c.ints[k], err = p.readInt64(ctx, p.schema.intColumn(k).Name, dst()); err != nil {
 				return nil, err
 			}
 		}
@@ -165,13 +176,13 @@ func (p *part) readCols(ctx context.Context, sel colSel) (*recordCols, error) {
 	return c, nil
 }
 
-func (p *part) readInt64(ctx context.Context, name string) ([]int64, error) {
+func (p *part) readInt64(ctx context.Context, name string, dst []int64) ([]int64, error) {
 	col, err := p.reader.Column(ctx, name)
 	if err != nil {
 		return nil, err
 	}
 
-	return col.Int64(nil)
+	return col.Int64(dst)
 }
 
 func (p *part) readBytes(ctx context.Context, name string) ([][]byte, error) {

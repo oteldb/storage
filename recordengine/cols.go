@@ -129,6 +129,61 @@ func newRecordCols(s *Schema, n int, sel colSel) *recordCols {
 	return c
 }
 
+// prepare re-arms a pooled recordCols for a fresh accumulation: it adopts the new schema/selection
+// and pre-sizes the selected columns to n rows, reusing the backing arrays wherever their capacity
+// suffices (so a steady same-projection read loop reallocates nothing). Deselected columns are
+// dropped to nil so the lazy-decode paths never touch them. It mirrors [newRecordCols] for a reused
+// buffer; the byte vectors' stale element slices (aliasing the previous fetch's part bytes) are left
+// to be overwritten by the coming appends — never read past the truncated length.
+func (c *recordCols) prepare(s *Schema, n int, sel colSel) {
+	c.schema = s
+	c.sel = sel
+	c.ts = ensureI64(c.ts, n)
+
+	if len(c.ints) != s.numInts() {
+		c.ints = make([][]int64, s.numInts())
+	}
+
+	for k := range c.ints {
+		if sel.ints[k] {
+			c.ints[k] = ensureI64(c.ints[k], n)
+		} else {
+			c.ints[k] = nil
+		}
+	}
+
+	if len(c.bytes) != s.numBytes() {
+		c.bytes = make([][][]byte, s.numBytes())
+	}
+
+	for k := range c.bytes {
+		if sel.bytes[k] {
+			c.bytes[k] = ensureBytes(c.bytes[k], n)
+		} else {
+			c.bytes[k] = nil
+		}
+	}
+}
+
+// ensureI64 returns s truncated to length 0 if it already has capacity for n, else a fresh slice
+// pre-sized to n. Reused for the timestamp and every int column when re-arming a pooled buffer.
+func ensureI64(s []int64, n int) []int64 {
+	if cap(s) >= n {
+		return s[:0]
+	}
+
+	return make([]int64, 0, n)
+}
+
+// ensureBytes is [ensureI64] for a byte column's [][]byte vector.
+func ensureBytes(s [][]byte, n int) [][]byte {
+	if cap(s) >= n {
+		return s[:0]
+	}
+
+	return make([][]byte, 0, n)
+}
+
 // byteSize returns the in-flight memory the buffer holds: its timestamps, int columns, and the
 // lengths of its byte columns (the basis for the head's MaxInFlightBytes accounting after a trim).
 func (c *recordCols) byteSize() int64 {
