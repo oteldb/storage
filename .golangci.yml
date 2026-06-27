@@ -113,6 +113,16 @@ linters:
       - linters:
           - gosec
         path: internal/cmd/
+      # internal/cmd/* are developer-run CLI tools, not the library surface; CLI-shaped code —
+      # printing to stdout, long format strings, branchy formatters, repeated external label
+      # literals (e.g. benchstat unit names) — is inherent, so relax the style linters there.
+      - linters:
+          - forbidigo
+          - funlen
+          - gocognit
+          - goconst
+          - lll
+        path: internal/cmd/
     paths:
       - third_party$
       - builtin$
