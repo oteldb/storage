@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/go-faster/errors"
+	"github.com/go-faster/sdk/zctx"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
@@ -187,6 +188,7 @@ func (e *Engine) HeadBytes() int64 {
 // gathers each stream's in-window records (decoding only the referenced columns), applies the
 // column conditions and projection, and returns one batch per stream sorted by timestamp.
 func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
+	ctx = e.cfg.Obs.Base(ctx)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "recordengine.fetch",
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
 	defer span.End()
@@ -195,6 +197,10 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	defer pf.End()
 
 	startNs := time.Now()
+	log := zctx.From(ctx)
+	log.Debug("fetch start",
+		zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
+		zap.Int("matchers", len(r.Matchers)), zap.Int("conditions", len(r.Conditions)))
 
 	// The label index sorts lazily on first read after a write; do that one-time sort under the
 	// exclusive lock so concurrent fetches never race on it.
@@ -226,6 +232,10 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 			attribute.Int("storage.rows", rows),
 		)
 		e.cfg.Obs.Fetch.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(len(ids)), int64(partsScanned), int64(rows))
+		log.Debug("fetch done",
+			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
+			zap.Int("series_matched", len(ids)), zap.Int("parts_scanned", partsScanned),
+			zap.Int("rows", rows), zap.Duration("took", time.Since(startNs)))
 	}
 
 	if len(ids) == 0 {
@@ -331,11 +341,14 @@ func appendWindowRows(acc, cols *recordCols, rng rowRange, start, end int64) {
 // Flush writes the head's buffered records to a new immutable part and clears the buffers. No-op if
 // the head is empty. Requires a [Config.Backend].
 func (e *Engine) Flush(ctx context.Context) error {
+	ctx = e.cfg.Obs.Base(ctx)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "recordengine.flush",
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
 	defer span.End()
 
 	startNs := time.Now()
+	log := zctx.From(ctx)
+	log.Debug("flush requested", zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix))
 
 	e.mu.Lock()
 	rows, err := e.flushLocked(ctx)
@@ -343,7 +356,7 @@ func (e *Engine) Flush(ctx context.Context) error {
 
 	if err != nil {
 		span.RecordError(err)
-		e.cfg.Obs.Log.Error("flush failed",
+		log.Error("flush failed",
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix), zap.Error(err))
 
 		return err
@@ -352,9 +365,12 @@ func (e *Engine) Flush(ctx context.Context) error {
 	if rows > 0 {
 		span.SetAttributes(attribute.Int("storage.rows", rows))
 		e.cfg.Obs.Flush.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(rows))
-		e.cfg.Obs.Log.Debug("flushed head to part",
+		log.Debug("flushed head to part",
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
 			zap.Int("rows", rows), zap.Duration("took", time.Since(startNs)))
+	} else {
+		log.Debug("flush no-op (empty head)",
+			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix))
 	}
 
 	return nil

@@ -5,6 +5,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/go-faster/sdk/zctx"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
@@ -28,6 +29,7 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 // downsampling per opts. It is the one background-merge entry point; compaction, retention,
 // and downsampling are the same pass over the immutable parts (no separate subsystem).
 func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
+	ctx = e.cfg.Obs.Base(ctx)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.merge",
 		trace.WithAttributes(
 			attribute.String("storage.prefix", e.cfg.Prefix),
@@ -37,6 +39,11 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 	defer span.End()
 
 	startNs := time.Now()
+	log := zctx.From(ctx)
+	log.Debug("merge requested",
+		zap.String("prefix", e.cfg.Prefix),
+		zap.Bool("downsample", len(opts.Downsample) > 0),
+		zap.Bool("recompress", opts.Recompress != nil))
 
 	e.mu.Lock()
 	compacted, err := e.mergeLocked(ctx, opts)
@@ -44,7 +51,7 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 
 	if err != nil {
 		span.RecordError(err)
-		e.cfg.Obs.Log.Error("merge failed", zap.String("prefix", e.cfg.Prefix), zap.Error(err))
+		log.Error("merge failed", zap.String("prefix", e.cfg.Prefix), zap.Error(err))
 
 		return err
 	}
@@ -52,11 +59,13 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 	if compacted > 0 {
 		span.SetAttributes(attribute.Int("storage.merge.parts_in", compacted))
 		e.cfg.Obs.Merge.Record(ctx, metricSignal, time.Since(startNs), int64(compacted))
-		e.cfg.Obs.Log.Debug("merged parts",
+		log.Debug("merged parts",
 			zap.String("prefix", e.cfg.Prefix), zap.Int("parts_in", compacted),
 			zap.Bool("downsample", len(opts.Downsample) > 0),
 			zap.Bool("recompress", opts.Recompress != nil),
 			zap.Duration("took", time.Since(startNs)))
+	} else {
+		log.Debug("merge no-op (nothing to compact)", zap.String("prefix", e.cfg.Prefix))
 	}
 
 	return nil

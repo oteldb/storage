@@ -5,6 +5,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/go-faster/sdk/zctx"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
@@ -17,11 +18,16 @@ import (
 // parts and no retention cutoff. Records are append-only: a stream's records are concatenated
 // across parts (no value dedup) and re-sorted by timestamp.
 func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
+	ctx = e.cfg.Obs.Base(ctx)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "recordengine.merge",
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
 	defer span.End()
 
 	startNs := time.Now()
+	log := zctx.From(ctx)
+	log.Debug("merge requested",
+		zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
+		zap.Int64("retain_from", retainFrom))
 
 	e.mu.Lock()
 	compacted, err := e.mergeLocked(ctx, retainFrom)
@@ -29,7 +35,7 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 
 	if err != nil {
 		span.RecordError(err)
-		e.cfg.Obs.Log.Error("merge failed",
+		log.Error("merge failed",
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix), zap.Error(err))
 
 		return err
@@ -38,9 +44,12 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 	if compacted > 0 {
 		span.SetAttributes(attribute.Int("storage.merge.parts_in", compacted))
 		e.cfg.Obs.Merge.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(compacted))
-		e.cfg.Obs.Log.Debug("merged parts",
+		log.Debug("merged parts",
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
 			zap.Int("parts_in", compacted), zap.Duration("took", time.Since(startNs)))
+	} else {
+		log.Debug("merge no-op (nothing to compact)",
+			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix))
 	}
 
 	return nil
