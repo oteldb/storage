@@ -200,7 +200,7 @@ func (h *head) appendWindow(id signal.SeriesID, acc *recordCols, start, end int6
 }
 
 // appendColsWindow appends buf's rows whose timestamp is in [start, end] to acc. No-op when buf is nil.
-func appendColsWindow(buf *recordCols, acc *recordCols, start, end int64) {
+func appendColsWindow(buf, acc *recordCols, start, end int64) {
 	if buf == nil {
 		return
 	}

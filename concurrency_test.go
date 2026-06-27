@@ -81,7 +81,7 @@ func TestMaintainParallelWithConcurrentReads(t *testing.T) {
 	assert.Equal(t, tenants*3, total, "all samples survive parallel maintenance")
 }
 
-// TestCrossTenantMergeParallel checks the parallel fetch.Merge fan-out federates equal-labelled
+// TestCrossTenantMergeParallel checks the parallel fetch.Merge fan-out federates equal-labeled
 // series across tenants identically to the sequential version (order-independent dedup).
 func TestCrossTenantMergeParallel(t *testing.T) {
 	t.Parallel()

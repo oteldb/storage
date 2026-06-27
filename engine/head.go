@@ -331,16 +331,16 @@ func bufBatch(buf *sampleBuf, id signal.SeriesID, s signal.Series, start, end in
 // index is retained — identities outlive a flush. The caller keeps the detached buffers readable until
 // the flushed part is published, so a concurrent fetch never loses sight of the samples mid-flush.
 func (h *head) detach() map[signal.SeriesID]*sampleBuf {
-	any := false
+	hasRows := false
 	for _, buf := range h.samples {
 		if len(buf.ts) > 0 {
-			any = true
+			hasRows = true
 
 			break
 		}
 	}
 
-	if !any {
+	if !hasRows {
 		return nil
 	}
 

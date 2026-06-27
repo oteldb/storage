@@ -281,47 +281,6 @@ type enginePlan struct {
 	start, end int64
 }
 
-// planFetch selects and acquires the in-window parts and snapshots each series' head + mid-flush
-// samples and identity — all under the lock — so the part reads run lock-free. Caller holds e.mu (read
-// lock). The acquired parts must be released with releaseParts.
-func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
-	p := &enginePlan{
-		ids:    ids,
-		series: make(map[signal.SeriesID]signal.Series, len(ids)),
-		headB:  make(map[signal.SeriesID]*fetch.Batch, len(ids)),
-		flushB: make(map[signal.SeriesID]*fetch.Batch, len(ids)),
-		start:  r.Start,
-		end:    r.End,
-	}
-
-	for _, part := range e.parts {
-		if part.maxTime < r.Start || part.minTime > r.End { // time-prune
-			continue
-		}
-
-		part.acquire()
-		p.liveParts = append(p.liveParts, part)
-	}
-
-	for _, id := range ids {
-		if s, ok := e.head.series.Get(id); ok {
-			p.series[id] = s
-		}
-
-		if hb := e.head.batch(id, r.Start, r.End); hb != nil {
-			p.headB[id] = hb
-		}
-
-		if buf := e.flushing[id]; buf != nil {
-			if fb := bufBatch(buf, id, p.series[id], r.Start, r.End); fb != nil {
-				p.flushB[id] = fb
-			}
-		}
-	}
-
-	return p
-}
-
 // mergeSeries gathers series id's samples lock-free: each acquired part oldest→newest, then the
 // mid-flush samples, then the head samples last — so on a duplicate timestamp the freshest value wins.
 func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampleMerge, error) {
@@ -703,4 +662,45 @@ func (e *Engine) publishLocked(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// planFetch selects and acquires the in-window parts and snapshots each series' head + mid-flush
+// samples and identity — all under the lock — so the part reads run lock-free. Caller holds e.mu (read
+// lock). The acquired parts must be released with releaseParts.
+func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
+	p := &enginePlan{
+		ids:    ids,
+		series: make(map[signal.SeriesID]signal.Series, len(ids)),
+		headB:  make(map[signal.SeriesID]*fetch.Batch, len(ids)),
+		flushB: make(map[signal.SeriesID]*fetch.Batch, len(ids)),
+		start:  r.Start,
+		end:    r.End,
+	}
+
+	for _, part := range e.parts {
+		if part.maxTime < r.Start || part.minTime > r.End { // time-prune
+			continue
+		}
+
+		part.acquire()
+		p.liveParts = append(p.liveParts, part)
+	}
+
+	for _, id := range ids {
+		if s, ok := e.head.series.Get(id); ok {
+			p.series[id] = s
+		}
+
+		if hb := e.head.batch(id, r.Start, r.End); hb != nil {
+			p.headB[id] = hb
+		}
+
+		if buf := e.flushing[id]; buf != nil {
+			if fb := bufBatch(buf, id, p.series[id], r.Start, r.End); fb != nil {
+				p.flushB[id] = fb
+			}
+		}
+	}
+
+	return p
 }

@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -95,6 +96,7 @@ func TestConcurrentAppendFetchFlushMerge(t *testing.T) {
 	})
 
 	for appended.Load() < seriesN*perSeries {
+		runtime.Gosched()
 	}
 
 	stop.Store(true)

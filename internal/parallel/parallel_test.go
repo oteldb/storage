@@ -1,6 +1,7 @@
 package parallel_test
 
 import (
+	"runtime"
 	"sync/atomic"
 	"testing"
 
@@ -48,10 +49,12 @@ func TestForEachRespectsLimit(t *testing.T) {
 			}
 		}
 
-		for i := 0; i < 1000; i++ { // brief busy work to overlap workers
-			_ = i
+		sink := 0
+		for j := range 1000 { // brief busy work to overlap workers
+			sink += j
 		}
 
+		runtime.KeepAlive(sink)
 		inFlight.Add(-1)
 	})
 

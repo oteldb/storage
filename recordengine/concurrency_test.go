@@ -3,6 +3,7 @@ package recordengine_test
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -99,17 +100,11 @@ func TestConcurrentAppendFetchFlushMerge(t *testing.T) {
 		}
 	})
 
-	// Let the appenders finish, then stop the fetchers/maintainer.
-	doneAppending := make(chan struct{})
-	go func() {
-		// Spin until every appender has produced its quota.
-		for appended.Load() < services*perService {
-		}
+	// Wait for the appenders to finish, then stop the fetchers/maintainer.
+	for appended.Load() < services*perService {
+		runtime.Gosched()
+	}
 
-		close(doneAppending)
-	}()
-
-	<-doneAppending
 	stop.Store(true)
 	wg.Wait()
 

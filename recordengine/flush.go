@@ -33,16 +33,16 @@ const (
 // readable until the flushed part is published, so a concurrent fetch never loses sight of the records
 // mid-flush.
 func (h *head) detach() map[signal.SeriesID]*recordCols {
-	any := false
+	hasRows := false
 	for _, buf := range h.records {
 		if buf.len() > 0 {
-			any = true
+			hasRows = true
 
 			break
 		}
 	}
 
-	if !any {
+	if !hasRows {
 		return nil
 	}
 

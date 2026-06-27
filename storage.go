@@ -876,21 +876,25 @@ func (s *Storage) runWALSync(interval time.Duration) {
 func (s *Storage) syncWALs() {
 	// Each engine's WAL is an independent file; fsyncs across engines parallelize. Gather them as a
 	// single list and fan out under the same bound as maintenance.
-	var wals []walSyncer
+	metrics := s.engineSnapshot()
+	logs := s.logEngineSnapshot()
+	traces := s.traceEngineSnapshot()
+	profiles := s.profileEngineSnapshot()
 
-	for _, e := range s.engineSnapshot() {
+	wals := make([]walSyncer, 0, len(metrics)+len(logs)+len(traces)+len(profiles))
+	for _, e := range metrics {
 		wals = append(wals, e)
 	}
 
-	for _, e := range s.logEngineSnapshot() {
+	for _, e := range logs {
 		wals = append(wals, e)
 	}
 
-	for _, e := range s.traceEngineSnapshot() {
+	for _, e := range traces {
 		wals = append(wals, e)
 	}
 
-	for _, e := range s.profileEngineSnapshot() {
+	for _, e := range profiles {
 		wals = append(wals, e)
 	}
 
