@@ -483,8 +483,12 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   the step-bucketed form — per series, the aggregate of each step-aligned bucket on the absolute grid
   (the range-vector shape an embedder's `*_over_time` needs); it reuses the same pushdown, folding a
   part's sidecar whenever the part falls wholly inside one bucket and decoding only the parts that
-  straddle a bucket boundary (an unsafe plan merges first to dedup by timestamp). `Reset(ctx)` is the
-  inverse of accumulation: it replaces
+  straddle a bucket boundary (an unsafe plan merges first to dedup by timestamp). In **cluster** mode
+  the pushdown is preserved across nodes: a compact aggregate RPC (`cluster.AggregatePath`,
+  `AggregateHandler`/`RemoteAggregator`) has each shard owner run `AggregateStepNamed` locally and
+  ship per-series identity + buckets, which the coordinator (`clusterAggregateFor`) re-checks against
+  the full matcher set and unions — so only aggregates cross the wire, not raw samples (§3i). `Reset(ctx)`
+  is the inverse of accumulation: it replaces
   the head with an empty one, drops the part handles, and deletes this engine's part objects
   from the backend (scoped to `{Prefix}/`), returning the engine to its `New` state for
   reuse (tests/benchmarks) without reallocating it.

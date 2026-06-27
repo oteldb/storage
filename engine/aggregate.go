@@ -105,30 +105,79 @@ func (e *Engine) AggregateStep(ctx context.Context, r fetch.Request, step int64)
 			return nil, err
 		}
 
+		if len(buckets) > 0 {
+			out[id] = sortBuckets(buckets)
+		}
+	}
+
+	return out, nil
+}
+
+// NamedAgg pairs a series' identity with its step buckets — the cluster-facing aggregate result,
+// carrying the labels a coordinator re-checks the full matcher set against before unioning shards.
+type NamedAgg struct {
+	Series  signal.Series
+	Buckets []BucketAgg
+}
+
+// AggregateStepNamed is [Engine.AggregateStep] returning each series' identity alongside its
+// buckets, for the cluster aggregate RPC (a peer pushes the aggregate down and ships identities so
+// the coordinator can re-filter and union).
+func (e *Engine) AggregateStepNamed(ctx context.Context, r fetch.Request, step int64) ([]NamedAgg, error) {
+	e.mu.RLock()
+	for !e.head.indexSorted() {
+		e.mu.RUnlock()
+		e.mu.Lock()
+		e.head.ensureIndexSorted()
+		e.mu.Unlock()
+		e.mu.RLock()
+	}
+
+	ids := e.head.resolve(r.Matchers)
+	plan := e.planFetch(ids, r)
+	e.mu.RUnlock()
+
+	defer plan.releaseParts()
+
+	safe := aggPushdownSafe(plan)
+
+	out := make([]NamedAgg, 0, len(ids))
+
+	for _, id := range ids {
+		buckets, err := e.bucketSeries(ctx, plan, id, step, safe)
+		if err != nil {
+			return nil, err
+		}
+
 		if len(buckets) == 0 {
 			continue
 		}
 
-		list := make([]BucketAgg, 0, len(buckets))
-		for start, agg := range buckets {
-			list = append(list, BucketAgg{Start: start, SeriesAgg: agg})
-		}
-
-		slices.SortFunc(list, func(a, b BucketAgg) int {
-			switch {
-			case a.Start < b.Start:
-				return -1
-			case a.Start > b.Start:
-				return 1
-			default:
-				return 0
-			}
-		})
-
-		out[id] = list
+		out = append(out, NamedAgg{Series: plan.series[id], Buckets: sortBuckets(buckets)})
 	}
 
 	return out, nil
+}
+
+// sortBuckets turns a bucket-start→aggregate map into a slice sorted ascending by start.
+func sortBuckets(buckets map[int64]SeriesAgg) []BucketAgg {
+	list := make([]BucketAgg, 0, len(buckets))
+	for start, agg := range buckets {
+		list = append(list, BucketAgg{Start: start, SeriesAgg: agg})
+	}
+
+	slices.SortFunc(list, func(a, b BucketAgg) int {
+		switch {
+		case a.Start < b.Start:
+			return -1
+		case a.Start > b.Start:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	return list
 }
 
 // bucketSeries folds id's samples into step-aligned buckets. On a pushdown-safe plan it buckets each

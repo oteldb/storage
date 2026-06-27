@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -13,44 +14,48 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// sliceFetcher returns a fixed set of batches — stands in for the cluster fan-out so the coordinator
-// fold can be unit-tested without a real cluster.
-type sliceFetcher struct{ batches []*fetch.Batch }
-
-func (f sliceFetcher) Fetch(context.Context, fetch.Request) (fetch.Iterator, error) {
-	return fetch.NewSliceIterator(f.batches), nil
+func aggJobSeries(job string) signal.Series {
+	return signal.Series{Attributes: signal.NewAttributes(
+		signal.KeyValue{Key: []byte("job"), Value: signal.StringValue([]byte(job))})}
 }
 
-func aggBatch(lo uint64, ts []int64, vals []float64) *fetch.Batch {
-	return &fetch.Batch{ID: signal.SeriesID{Lo: lo}, Timestamps: ts, Values: vals}
+func aggJobMatcher(job string) fetch.Matcher {
+	want := []byte(job)
+
+	return fetch.Matcher{Name: []byte("job"), Match: func(v signal.Value) bool { return bytes.Equal(v.Str(), want) }}
 }
 
-func TestAggregateFetchFolds(t *testing.T) {
+// TestUnionNamed covers the coordinator side of the cluster aggregate fan-out: it re-checks the full
+// matcher set against each shard's returned identities (a remote peer applied only the equality
+// subset) and merges buckets for any series that surfaces from more than one shard.
+func TestUnionNamed(t *testing.T) {
 	t.Parallel()
 
-	f := sliceFetcher{batches: []*fetch.Batch{
-		aggBatch(1, []int64{1, 2, 3}, []float64{10, 20, 6}),
-		aggBatch(2, []int64{5}, []float64{7}),
-	}}
+	api, web := aggJobSeries("api"), aggJobSeries("web")
+	matchers := []fetch.Matcher{aggJobMatcher("api")}
 
-	got, err := aggregateFetch(context.Background(), f, fetch.Request{})
-	require.NoError(t, err)
-	assert.Equal(t, engine.SeriesAgg{Count: 3, Sum: 36, Min: 6, Max: 20}, got[signal.SeriesID{Lo: 1}])
-	assert.Equal(t, engine.SeriesAgg{Count: 1, Sum: 7, Min: 7, Max: 7}, got[signal.SeriesID{Lo: 2}])
-}
+	out := map[signal.SeriesID][]engine.BucketAgg{}
 
-func TestAggregateFetchStepFolds(t *testing.T) {
-	t.Parallel()
+	// Shard 1 returns a superset (api + web); only api survives the full matcher set.
+	unionNamed(out, []engine.NamedAgg{
+		{Series: api, Buckets: []engine.BucketAgg{{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 5, Min: 1, Max: 4}}}},
+		{Series: web, Buckets: []engine.BucketAgg{{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 9, Min: 9, Max: 9}}}},
+	}, matchers)
 
-	f := sliceFetcher{batches: []*fetch.Batch{aggBatch(1, []int64{1, 5, 105, 130}, []float64{1, 3, 9, 11})}}
+	require.Len(t, out, 1)
+	require.Contains(t, out, api.Hash())
+	assert.NotContains(t, out, web.Hash(), "web fails the full matcher set")
 
-	got, err := aggregateFetchStep(context.Background(), f, fetch.Request{}, 100)
-	require.NoError(t, err)
+	// A second shard surfaces the same series in a different bucket ⇒ merge (defensive; series are
+	// normally shard-partitioned).
+	unionNamed(out, []engine.NamedAgg{
+		{Series: api, Buckets: []engine.BucketAgg{{Start: 60, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 3, Min: 3, Max: 3}}}},
+	}, matchers)
 
-	list := got[signal.SeriesID{Lo: 1}]
+	list := out[api.Hash()]
 	require.Len(t, list, 2)
-	assert.Equal(t, engine.BucketAgg{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 4, Min: 1, Max: 3}}, list[0])
-	assert.Equal(t, engine.BucketAgg{Start: 100, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 20, Min: 9, Max: 11}}, list[1])
+	assert.Equal(t, int64(0), list[0].Start)
+	assert.Equal(t, int64(60), list[1].Start)
 }
 
 // TestAggregateMetricsEndToEnd drives AggregateMetrics through the public facade and checks it

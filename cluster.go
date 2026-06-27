@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -131,8 +132,9 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	mux.Handle(primaryWritePath, s.primaryWriteHandler()) // primary: OOO apply + replicate
 	// read fan-out across metric/log/trace/profile signals.
 	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch, s.localLogFetch, s.localTraceFetch, s.localProfileFetch))
-	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(s.localProfileSeries)) // profile series enumeration
-	mux.Handle(cluster.SidePath, cluster.SideHandler(s.localProfileSymbols))    // profile symbol store
+	mux.Handle(cluster.AggregatePath, cluster.AggregateHandler(s.localAggregate)) // metric aggregate pushdown
+	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(s.localProfileSeries))   // profile series enumeration
+	mux.Handle(cluster.SidePath, cluster.SideHandler(s.localProfileSymbols))      // profile symbol store
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	go func() { _ = srv.Serve(ln) }()
@@ -226,6 +228,162 @@ func (s *Storage) shardFetcher(shardKey signal.TenantID) fetch.Fetcher {
 	}
 
 	return &filteringFetcher{inner: hedgedFetcher{store: s, op: rpcOpRead, remotes: remotes}}
+}
+
+// localAggregate serves a peer's metric aggregate from the local shard engine, pushing down the
+// (equality) matchers it forwarded — the receiving side of [cluster.AggregateHandler].
+func (s *Storage) localAggregate(
+	ctx context.Context, tenant string, start, end, step int64, matchers []fetch.Matcher,
+) ([]engine.NamedAgg, error) {
+	eng, ok := s.lookupEngine(s.normalizeTenant(signal.TenantID(tenant)))
+	if !ok {
+		return nil, nil
+	}
+
+	return eng.AggregateStepNamed(ctx, fetch.Request{
+		Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers,
+	}, step)
+}
+
+// clusterAggregateFor computes a tenant's step-bucketed aggregate across all its shards in cluster
+// mode, preserving the pushdown: each shard's owner runs the aggregate locally (from its stats
+// sidecar where it applies) and ships compact per-series buckets, which the coordinator re-checks
+// against the full matcher set and unions. Series are shard-partitioned, so the union rarely needs
+// to merge, but it does so defensively.
+func (s *Storage) clusterAggregateFor(
+	ctx context.Context, tid signal.TenantID, r fetch.Request, step int64,
+) (map[signal.SeriesID][]engine.BucketAgg, error) {
+	cn := s.cluster
+	tenant := s.normalizeTenant(tid)
+	n := cn.shardCount()
+
+	out := make(map[signal.SeriesID][]engine.BucketAgg)
+
+	for idx := range n {
+		sk := shardKeyOf(tenant, idx, n)
+
+		named, err := s.shardAggregate(ctx, sk, r, step)
+		if err != nil {
+			return nil, err
+		}
+
+		unionNamed(out, named, r.Matchers)
+	}
+
+	return out, nil
+}
+
+// shardAggregate gets one metric shard's per-series aggregates: locally (full matcher pushdown) if
+// this node owns it, else from a remote owner with sequential failover (equality matchers pushed;
+// the coordinator re-checks the full set on the returned identities).
+func (s *Storage) shardAggregate(
+	ctx context.Context, shardKey signal.TenantID, r fetch.Request, step int64,
+) ([]engine.NamedAgg, error) {
+	cn := s.cluster
+	owners := cn.membership.Ring().Lookup([]byte(shardKey), cn.rf)
+
+	for _, o := range owners {
+		if cn.membership.AddrOf(o.ID) == cn.self { // owner: serve locally
+			eng, ok := s.lookupEngine(shardKey)
+			if !ok {
+				return nil, nil // owner, no data yet
+			}
+
+			return eng.AggregateStepNamed(ctx, fetch.Request{
+				Tenant: shardKey, Start: r.Start, End: r.End, Matchers: r.Matchers,
+			}, step)
+		}
+	}
+
+	eq := equalityMatchers(r.Matchers)
+
+	var lastErr error
+	for _, o := range owners {
+		addr := cn.membership.AddrOf(o.ID)
+		if addr == "" || addr == cn.self {
+			continue
+		}
+
+		named, err := cluster.NewRemoteAggregator(addr, cn.httpc).Aggregate(ctx, string(shardKey), r.Start, r.End, step, eq)
+		if err == nil {
+			return named, nil
+		}
+
+		lastErr = err
+	}
+
+	return nil, lastErr // nil when there were no reachable owners (treated as no data)
+}
+
+// equalityMatchers extracts the serializable (equality) subset of a request's matchers.
+func equalityMatchers(matchers []fetch.Matcher) []fetch.EqualMatcher {
+	var eq []fetch.EqualMatcher
+	for i := range matchers {
+		if matchers[i].Spec != nil {
+			eq = append(eq, *matchers[i].Spec)
+		}
+	}
+
+	return eq
+}
+
+// unionNamed folds a shard's per-series aggregates into out, dropping series that fail the full
+// matcher set (a remote peer applied only the equality subset) and merging buckets for any series
+// id that already has an entry.
+func unionNamed(out map[signal.SeriesID][]engine.BucketAgg, named []engine.NamedAgg, matchers []fetch.Matcher) {
+	for i := range named {
+		na := &named[i]
+		if !matchesAllSeries(na.Series, matchers) {
+			continue
+		}
+
+		id := na.Series.Hash()
+		if existing, ok := out[id]; ok {
+			out[id] = mergeBucketLists(existing, na.Buckets)
+		} else {
+			out[id] = na.Buckets
+		}
+	}
+}
+
+// mergeBucketLists combines two per-series bucket lists by aligned start, summing counts/sums and
+// taking min/max — used only on the rare path where a series surfaces from more than one shard. Each
+// input bucket is non-empty (Count > 0), so its Min/Max are valid.
+func mergeBucketLists(a, b []engine.BucketAgg) []engine.BucketAgg {
+	byStart := make(map[int64]engine.SeriesAgg, len(a)+len(b))
+
+	fold := func(x engine.BucketAgg) {
+		e, ok := byStart[x.Start]
+		if !ok {
+			byStart[x.Start] = x.SeriesAgg
+
+			return
+		}
+
+		byStart[x.Start] = engine.SeriesAgg{
+			Count: e.Count + x.Count,
+			Sum:   e.Sum + x.Sum,
+			Min:   min(e.Min, x.Min),
+			Max:   max(e.Max, x.Max),
+		}
+	}
+
+	for _, x := range a {
+		fold(x)
+	}
+
+	for _, x := range b {
+		fold(x)
+	}
+
+	out := make([]engine.BucketAgg, 0, len(byStart))
+	for start, agg := range byStart {
+		out = append(out, engine.BucketAgg{Start: start, SeriesAgg: agg})
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Start < out[j].Start })
+
+	return out
 }
 
 // localLogFetch serves a peer's log fetch from the local log engine, pushing down the (equality)
