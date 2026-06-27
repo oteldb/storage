@@ -103,9 +103,11 @@ func DecodeFloatsDecimal(dst []float64, src []byte) ([]float64, int, error) {
 	}
 
 	// Accumulate the nearest-delta scaled value and convert to float in one pass, straight into dst —
-	// no per-decode int64 scratch (it was a top read-path allocation).
+	// no per-decode int64 scratch. The 10^exp scale is hoisted out of the loop (was a per-value Pow10).
+	scale := decimalScale(exp)
+
 	cur := v0
-	dst[0] = decimalToFloat(cur, exp)
+	dst[0] = scaledToFloat(cur, exp, scale)
 
 	for i := 1; i < rows; i++ {
 		d, err := r.ReadVarint()
@@ -114,7 +116,7 @@ func DecodeFloatsDecimal(dst []float64, src []byte) ([]float64, int, error) {
 		}
 
 		cur += d
-		dst[i] = decimalToFloat(cur, exp)
+		dst[i] = scaledToFloat(cur, exp, scale)
 	}
 
 	_ = precisionBits // precision only affects encoding (lossy); decode is the same
@@ -232,7 +234,19 @@ func floatToDecimal(f float64) (int64, int) {
 // float64 for |exp| ≤ 22) rather than multiplying by its inexact reciprocal — so a clean
 // decimal like 423·10⁻² decodes to 4.23 bit-for-bit, the property the adaptive codec relies on
 // to choose the decimal path losslessly for realistic fractional gauges.
-func decimalToFloat(v int64, exp int) float64 {
+// decimalScale precomputes the magnitude 10^|exp| for a column's shared exponent, so a decode loop
+// computes it once rather than calling math.Pow10 per value (a top decode-CPU cost). exp == 0 ⇒ 1.
+func decimalScale(exp int) float64 {
+	if exp >= 0 {
+		return math.Pow10(exp)
+	}
+
+	return math.Pow10(-exp)
+}
+
+// scaledToFloat converts a scaled int64 to float64 using a precomputed scale (= decimalScale(exp)),
+// handling the floatToDecimal sentinels. Splitting the scale out lets the decode loop hoist it.
+func scaledToFloat(v int64, exp int, scale float64) float64 {
 	// Handle special sentinel values from floatToDecimal.
 	switch v {
 	case math.MaxInt64:
@@ -247,9 +261,9 @@ func decimalToFloat(v int64, exp int) float64 {
 	case exp == 0:
 		return float64(v)
 	case exp > 0:
-		return float64(v) * math.Pow10(exp)
+		return float64(v) * scale
 	default:
-		return float64(v) / math.Pow10(-exp)
+		return float64(v) / scale
 	}
 }
 
