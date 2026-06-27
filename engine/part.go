@@ -125,52 +125,82 @@ func (p *part) rows() int {
 	return n
 }
 
-// mergeInto adds series id's samples within [start, end] to m. It is a no-op if the part
-// does not hold the series.
-func (p *part) mergeInto(ctx context.Context, id signal.SeriesID, m *sampleMerge, start, end int64) error {
-	rng, ok := p.ranges[id]
-	if !ok {
-		return nil
-	}
+// decodedPart is a part's columns decoded once: the full ts and value columns (and the scale
+// factors when present), indexed by the part's per-series row ranges. One decode is shared
+// across every series a fetch or merge reads from the part — decoding the whole column is
+// O(rows), so doing it per series would be O(series × rows), the dominant fetch allocation.
+type decodedPart struct {
+	ts   []int64
+	vals []float64
+	sf   []float64 // nil when the part has no scale-factor column (every weight is 1)
+}
 
+// decode reads and decodes the part's ts / value (/ sf) columns once.
+func (p *part) decode(ctx context.Context) (*decodedPart, error) {
 	tsCol, err := p.reader.Column(ctx, colTs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	ts, err := tsCol.Int64(nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	valCol, err := p.reader.Column(ctx, colValue)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	vals, err := valCol.Float64(nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// The scale-factor column is present only when sampling occurred; absent ⇒ every weight is 1.
 	var sf []float64
 
 	if p.hasSF {
 		sfCol, err := p.reader.Column(ctx, colSF)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
-		full, err := sfCol.Float64(nil)
-		if err != nil {
-			return err
+		if sf, err = sfCol.Float64(nil); err != nil {
+			return nil, err
 		}
-
-		sf = full[rng.start:rng.end]
 	}
 
-	m.add(ts[rng.start:rng.end], vals[rng.start:rng.end], sf, start, end)
+	return &decodedPart{ts: ts, vals: vals, sf: sf}, nil
+}
 
-	return nil
+// mergeSeriesInto adds series row-range rng's samples within [start, end] to m, slicing the
+// already-decoded columns (no per-series decode or allocation).
+func (d *decodedPart) mergeSeriesInto(rng rowRange, m *sampleMerge, start, end int64) {
+	var sf []float64
+	if d.sf != nil {
+		sf = d.sf[rng.start:rng.end]
+	}
+
+	m.add(d.ts[rng.start:rng.end], d.vals[rng.start:rng.end], sf, start, end)
+}
+
+// partDecodeCache memoizes one [decodedPart] per part for the lifetime of a single fetch or
+// merge, so a part is read from the backend and decoded exactly once however many series read
+// it. It is not safe for concurrent use; each fetch/merge owns its own cache.
+type partDecodeCache map[*part]*decodedPart
+
+// get returns p's decoded columns, decoding and caching them on first use.
+func (c partDecodeCache) get(ctx context.Context, p *part) (*decodedPart, error) {
+	if d, ok := c[p]; ok {
+		return d, nil
+	}
+
+	d, err := p.decode(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	c[p] = d
+
+	return d, nil
 }

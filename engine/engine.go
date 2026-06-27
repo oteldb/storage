@@ -278,6 +278,7 @@ type enginePlan struct {
 	headB      map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
 	flushB     map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
 	liveParts  []*part
+	decoded    partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
 	start, end int64
 }
 
@@ -287,9 +288,17 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 	var m sampleMerge
 
 	for _, part := range p.liveParts {
-		if err := part.mergeInto(ctx, id, &m, p.start, p.end); err != nil {
+		rng, ok := part.ranges[id]
+		if !ok {
+			continue
+		}
+
+		d, err := p.decoded.get(ctx, part)
+		if err != nil {
 			return m, err
 		}
+
+		d.mergeSeriesInto(rng, &m, p.start, p.end)
 	}
 
 	if fb := p.flushB[id]; fb != nil {
@@ -669,12 +678,13 @@ func (e *Engine) publishLocked(ctx context.Context) error {
 // lock). The acquired parts must be released with releaseParts.
 func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 	p := &enginePlan{
-		ids:    ids,
-		series: make(map[signal.SeriesID]signal.Series, len(ids)),
-		headB:  make(map[signal.SeriesID]*fetch.Batch, len(ids)),
-		flushB: make(map[signal.SeriesID]*fetch.Batch, len(ids)),
-		start:  r.Start,
-		end:    r.End,
+		ids:     ids,
+		series:  make(map[signal.SeriesID]signal.Series, len(ids)),
+		headB:   make(map[signal.SeriesID]*fetch.Batch, len(ids)),
+		flushB:  make(map[signal.SeriesID]*fetch.Batch, len(ids)),
+		decoded: make(partDecodeCache),
+		start:   r.Start,
+		end:     r.End,
 	}
 
 	for _, part := range e.parts {

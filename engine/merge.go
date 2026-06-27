@@ -175,14 +175,26 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 
 	cols := &flushColumns{}
 
+	// Decode each source part once and reuse across all its series (compaction reads every
+	// series of every part), instead of re-decoding the whole part per series.
+	decoded := make(partDecodeCache, len(src))
+
 	for _, id := range ids {
 		var m sampleMerge
 
 		// Oldest → newest part, so a later part's value wins on a duplicate timestamp.
 		for _, p := range src {
-			if err := p.mergeInto(ctx, id, &m, start, maxInt64); err != nil {
+			rng, ok := p.ranges[id]
+			if !ok {
+				continue
+			}
+
+			d, err := decoded.get(ctx, p)
+			if err != nil {
 				return nil, err
 			}
+
+			d.mergeSeriesInto(rng, &m, start, maxInt64)
 		}
 
 		ts, values, sf := m.collect()
