@@ -2,10 +2,13 @@ package etcd
 
 import (
 	"context"
+	"sort"
+	"sync"
 
 	"github.com/go-faster/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/oteldb/storage/cluster/rebalance"
 	"github.com/oteldb/storage/cluster/ring"
 )
 
@@ -16,17 +19,35 @@ import (
 // without manual handoff. Placement still comes from the ring; etcd only arbitrates the claim
 // during the brief windows where nodes disagree on the ring (watch-propagation lag) or a node
 // has failed.
+//
+// Reconcile is **event-driven and minimal-move**: it tracks the claims this node currently
+// holds and, on each pass, only issues etcd writes for the shards whose ring-primary actually
+// changed since the last pass (plus retrying any wanted-but-uncontended claim). In steady
+// state — an unchanged ring with no new tenants — it makes no etcd round-trips at all, instead
+// of one acquire/release per shard every tick. When the ring does change it records the
+// [rebalance.Plan] it enacted (see [Ownership.LastPlan]) for observability/preview.
 type Ownership struct {
 	client  *clientv3.Client
 	prefix  string // "{root}/owners/"
 	id      string // this node's ring ID
 	leaseID clientv3.LeaseID
+
+	mu       sync.Mutex
+	held     map[string]struct{}      // shards this node currently holds a claim on
+	prevRing *ring.Ring               // ring at the last Reconcile (pointer-compared for "unchanged")
+	lastPlan []rebalance.Reassignment // the primary handoffs enacted at the last ring change
 }
 
 // NewOwnership returns an ownership coordinator for node id, claiming under root with the
 // node's membership lease (see [Membership.LeaseID]).
 func NewOwnership(client *clientv3.Client, root, id string, leaseID clientv3.LeaseID) *Ownership {
-	return &Ownership{client: client, prefix: joinKey(root, "owners"), id: id, leaseID: leaseID}
+	return &Ownership{
+		client:  client,
+		prefix:  joinKey(root, "owners"),
+		id:      id,
+		leaseID: leaseID,
+		held:    make(map[string]struct{}),
+	}
 }
 
 // Acquire tries to claim shard for this node. It returns true if the claim is now held by this
@@ -71,33 +92,102 @@ func (o *Ownership) Release(ctx context.Context, shard string) error {
 }
 
 // Reconcile makes this node's claims match the ring: it acquires every shard this node is the
-// primary of (ring.Primary) and releases the rest. It returns the shards this node now owns —
-// the set it should flush and compact. Idempotent, so it is safe to call on every membership
-// change and on a timer.
+// ring-primary of and releases the rest. It returns the shards this node now owns — the set it
+// should flush and compact. Idempotent, so it is safe to call on every membership change and on
+// a timer.
+//
+// The work is minimal: ring-primary lookups are pure in-memory HRW hashing (no etcd), and an
+// etcd write is issued only when a claim must change — a wanted shard not yet held is acquired
+// (retried every pass, which is what lets a stale claim's release converge even under an
+// unchanged ring), and a held shard no longer wanted is released. Steady state issues no etcd
+// writes. On a ring change the enacted primary handoffs are recorded in [Ownership.LastPlan].
 func (o *Ownership) Reconcile(ctx context.Context, r *ring.Ring, shards []string) ([]string, error) {
-	var owned []string
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	// want = shards this node is the ring-primary of (in-memory, no etcd).
+	want := make(map[string]struct{}, len(shards))
 
 	for _, shard := range shards {
-		primary, ok := r.Primary([]byte(shard))
-		if ok && primary.ID == o.id {
-			acquired, err := o.Acquire(ctx, shard)
-			if err != nil {
-				return owned, err
-			}
+		if primary, ok := r.Primary([]byte(shard)); ok && primary.ID == o.id {
+			want[shard] = struct{}{}
+		}
+	}
 
-			if acquired {
-				owned = append(owned, shard)
-			}
+	// Acquire each wanted shard we do not already hold. Retrying this every pass (cheap — it is
+	// empty in steady state) is what drives convergence: when a node displaced during a ring
+	// disagreement finally releases a claim, the rightful primary picks it up here.
+	for shard := range want {
+		if _, ok := o.held[shard]; ok {
+			continue
+		}
 
+		acquired, err := o.Acquire(ctx, shard)
+		if err != nil {
+			return o.ownedLocked(), err
+		}
+
+		if acquired {
+			o.held[shard] = struct{}{}
+		}
+	}
+
+	// Release each held shard we no longer want (its primary moved away, or its tenant is gone).
+	for shard := range o.held {
+		if _, ok := want[shard]; ok {
 			continue
 		}
 
 		if err := o.Release(ctx, shard); err != nil {
-			return owned, err
+			return o.ownedLocked(), err
 		}
+
+		delete(o.held, shard)
 	}
 
-	return owned, nil
+	// Record the primary handoffs this ring change implied (rf=1: compaction ownership tracks the
+	// primary only), so an operator can see/preview what moved. The membership layer republishes
+	// the ring via an atomic pointer only on a real change, so pointer inequality means "changed".
+	if o.prevRing != nil && o.prevRing != r {
+		o.lastPlan = rebalance.Plan(shards, o.prevRing, r, 1)
+	}
+
+	o.prevRing = r
+
+	return o.ownedLocked(), nil
+}
+
+// Owned returns a sorted snapshot of the shards this node currently holds a compaction claim on.
+func (o *Ownership) Owned() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return o.ownedLocked()
+}
+
+// LastPlan returns the primary handoffs enacted at the most recent ring change (empty if the
+// ring has not changed since open). It is informational — a preview of what the last rebalance
+// moved — for an operator dashboard.
+func (o *Ownership) LastPlan() []rebalance.Reassignment {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	out := make([]rebalance.Reassignment, len(o.lastPlan))
+	copy(out, o.lastPlan)
+
+	return out
+}
+
+// ownedLocked returns a sorted snapshot of held; the caller must hold o.mu.
+func (o *Ownership) ownedLocked() []string {
+	owned := make([]string, 0, len(o.held))
+	for shard := range o.held {
+		owned = append(owned, shard)
+	}
+
+	sort.Strings(owned)
+
+	return owned
 }
 
 // joinKey joins an etcd key root and a segment with a single trailing slash, tolerating a
