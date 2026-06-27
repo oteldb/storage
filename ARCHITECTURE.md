@@ -895,14 +895,19 @@ query-language path stays in the embedder. The `Write*` methods take the library
   `recordengine.Engine`s on the sample schema **with a `profile.SymbolStore` side store** (parts +
   symbol sidecars under `{tenant}/profiles`). A single
   **maintenance loop** periodically flushes +
-  merges every metric, log, trace, and profile engine, applying per-tenant retention from the resolved policy. `Reset(ctx)`
+  merges every metric, log, trace, and profile engine, applying per-tenant retention from the resolved policy.
+  Engines are independent per-tenant/per-signal shards, so the loop **fans the flush/merge (and the
+  background WAL fsyncs) out concurrently** under a bound (`WithMaintenanceConcurrency`, default
+  CPU-derived) via `internal/parallel` rather than walking them sequentially. `Reset(ctx)`
   discards all ingested data (every engine's head + flushed parts), retaining the engines
   for reuse; it is gated to an **ephemeral backend** (`ErrNotEphemeral` otherwise) and is
   meant for tests/benchmarks that reuse one store across runs. `Fetcher(tenants...)` is the
   **read seam**: it returns a `fetch.Fetcher` over the named tenants' data (head ∪ parts) —
   one tenant, several (a **multi-tenant** fan-out), or none ⇒ **all** tenants (a
   **cross-tenant** query). A fan-out merges by series id via `fetch.Merge`, federating a
-  series with equal labels across tenants into one. Always usable: an empty fetcher when no
+  series with equal labels across tenants into one; `fetch.Merge` (and the clustered shard/tenant
+  write-routing) **fetch their children concurrently** under a bound, collecting into per-index slots
+  so the merge's duplicate-timestamp winner stays order-deterministic. Always usable: an empty fetcher when no
   tenant matches or after `Close`, so callers need not special-case "no data". There is
   deliberately **no `Query` / query-language method**: the store is language-agnostic and the
   embedder drives its own engines over the fetch contract (the optional `query/promql` adapter

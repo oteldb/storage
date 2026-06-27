@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 
+	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
 )
@@ -35,6 +36,11 @@ func (emptyFetcher) Fetch(context.Context, Request) (Iterator, error) {
 	return NewSliceIterator(nil), nil
 }
 
+// fanOutConcurrency bounds how many children a merge fans out to at once. Reads are I/O-bound
+// (backend round-trips, node RPCs), so this is set above the CPU count to overlap latency while
+// still capping in-flight requests on a very wide fan-out.
+const fanOutConcurrency = 16
+
 type mergeFetcher []Fetcher
 
 // mergeAcc tracks one merged series and how many children contributed to it (so only
@@ -50,26 +56,38 @@ func (m mergeFetcher) Fetch(ctx context.Context, r Request) (Iterator, error) {
 	defer pf.End()
 	pf.Add("children", int64(len(m)))
 
-	groups := make([][]*Batch, 0, len(m))
+	// Children are independent shards/tenants/replicas; fetch them concurrently and collect into
+	// per-index slots so the group order (which decides the duplicate-timestamp winner in
+	// MergeBatches) is preserved regardless of completion order. Bounded so a wide fan-out can't
+	// spawn an unbounded number of in-flight backend/RPC requests.
+	groups := make([][]*Batch, len(m))
+	errs := make([]error, len(m))
 
-	for _, f := range m {
-		it, err := f.Fetch(ctx, r) // children profile under the fan-out node
+	parallel.ForEach(len(m), fanOutConcurrency, func(i int) {
+		it, err := m[i].Fetch(ctx, r) // children profile under the fan-out node
 		if err != nil {
-			return nil, err
+			errs[i] = err
+
+			return
 		}
 
 		batches, derr := Drain(ctx, it)
 		cerr := it.Close()
 
-		if derr != nil {
-			return nil, derr
+		switch {
+		case derr != nil:
+			errs[i] = derr
+		case cerr != nil:
+			errs[i] = cerr
+		default:
+			groups[i] = batches
 		}
+	})
 
-		if cerr != nil {
-			return nil, cerr
+	for _, err := range errs { // surface the first error deterministically (by child index)
+		if err != nil {
+			return nil, err
 		}
-
-		groups = append(groups, batches)
 	}
 
 	_, mpf := profile.Begin(ctx, "merge")

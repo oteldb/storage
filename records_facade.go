@@ -2,7 +2,9 @@ package storage
 
 import (
 	"context"
+	"sync/atomic"
 
+	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
@@ -142,21 +144,46 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 		byTenant[tid] = append(byTenant[tid], recordengine.EncodeWAL(b)...)
 	})
 
-	var rejected int64
-
-	for tid, payload := range byTenant {
-		rej, err := s.routeToPrimary(ctx, sig, string(s.normalizeTenant(tid)), payload)
-		if err != nil {
-			return Accepted{Accepted: int64(emitted) - rejected, Rejected: rejected}, err
-		}
-
-		rejected += int64(rej)
+	// Each tenant routes to its own ring primary independently; fan the routes out under a bound
+	// rather than paying the sum of per-primary round-trips. Order-independent: results accumulate
+	// into per-index slots.
+	type route struct {
+		tid     signal.TenantID
+		payload []byte
 	}
 
-	accepted := int64(emitted) - rejected
-	s.emitAdmission(ctx, sig, accepted, rejectTally{ooo: rejected}, 0)
+	routes := make([]route, 0, len(byTenant))
+	for tid, payload := range byTenant {
+		routes = append(routes, route{tid, payload})
+	}
 
-	return Accepted{Accepted: accepted, Rejected: rejected}, nil
+	var (
+		rejected atomic.Int64
+		errs     = make([]error, len(routes))
+	)
+
+	parallel.ForEach(len(routes), clusterWriteFanOut, func(i int) {
+		rej, err := s.routeToPrimary(ctx, sig, string(s.normalizeTenant(routes[i].tid)), routes[i].payload)
+		if err != nil {
+			errs[i] = err
+
+			return
+		}
+
+		rejected.Add(int64(rej))
+	})
+
+	for _, err := range errs { // surface the first error deterministically (by route index)
+		if err != nil {
+			return Accepted{Accepted: int64(emitted) - rejected.Load(), Rejected: rejected.Load()}, err
+		}
+	}
+
+	rej := rejected.Load()
+	accepted := int64(emitted) - rej
+	s.emitAdmission(ctx, sig, accepted, rejectTally{ooo: rej}, 0)
+
+	return Accepted{Accepted: accepted, Rejected: rej}, nil
 }
 
 // recordFetcher builds a record signal's read seam over the named tenants: owner-aware in cluster
