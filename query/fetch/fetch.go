@@ -129,12 +129,28 @@ type Batch struct {
 	// batch so the producer can use one shared closure for every batch (no per-batch allocation),
 	// reading the buffers off b. A nil hook (the default) means the GC reclaims, exactly as before.
 	release func(*Batch)
+
+	// recycleState is an opaque handle a producer attaches so its shared release closure can recover
+	// the pool entry backing this batch when that entry is more than the batch's own slices — e.g.
+	// the record engine's per-stream accumulator (a *recordCols whose columns back Columns). Holding
+	// a pointer here costs no allocation (it fits the interface word). nil for producers (metrics)
+	// whose buffers are recoverable directly from the batch.
+	recycleState any
 }
 
 // SetRelease installs the buffer-reclamation hook a producing fetcher uses to pool a batch's
 // backing slices. The producer passes one shared closure (it reads the buffers from the batch), so
 // installing it costs no per-batch allocation. Only the fetcher that allocated the buffers sets it.
 func (b *Batch) SetRelease(fn func(*Batch)) { b.release = fn }
+
+// SetReleaseState attaches an opaque pool handle (see [Batch.recycleState]) that the release hook
+// recovers via [Batch.ReleaseState]. A producer uses it when the pool entry backing the batch isn't
+// the batch's own slices (the record engine's accumulator). Pass a pointer to avoid allocation.
+func (b *Batch) SetReleaseState(s any) { b.recycleState = s }
+
+// ReleaseState returns the handle set by [Batch.SetReleaseState] (nil if none). The producer's
+// shared release closure type-asserts it back to recover the pooled entry.
+func (b *Batch) ReleaseState() any { return b.recycleState }
 
 // Release returns the batch's backing buffers to the producer's pool, if it set a hook. It is
 // **opt-in**: a consumer done with a batch may call it to enable reuse; one that never does simply
@@ -149,6 +165,7 @@ func (b *Batch) Release() {
 	if b.release != nil {
 		b.release(b)
 		b.release = nil
+		b.recycleState = nil
 	}
 }
 
