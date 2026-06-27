@@ -1,26 +1,44 @@
 # Performance plan — query-path allocation/GC reduction
 
-**Status:** P0 done; P1.4 is the next lever (the new bench loop now flags it as #1). Source:
+**Status:** P0 + P1.4 + four loop iterations done — read path −74.7% time cumulative (see below).
+Remaining gains are structural (P1.3 batch-release lifecycle, a public-API decision). Source:
 `/src/oteldb/benchmark/results/pprof/FINDINGS.md` and the captured profiles (oteldb v0.41.0, `file`
 backend). Grounded in the current storage code.
 
-## Done (P0) — measured by `scripts/bench-pprof.sh`
+## Done — measured by `scripts/bench-pprof.sh` (loop)
 
-- **P0.2 — peek variable-length prefixes** (`bitstream.Buffered/Peek/Skip`; `readDoD`/`xorRead`):
-  **GorillaDecode +26% throughput / −20% time** (benchstat, p=0.002), the float value column that
-  dominates real decode CPU. DoD/decimal flat on constant-stride synthetic data.
-- **P0.1 — pool part decode buffers** (`engine.decPool`, no-cross-fetch-cache path): **read-path
-  B/op −19%** (geomean, p=0.002), `fetch_all` −8% time; `chunk.resize` drops out of the alloc
-  profile entirely. Race-clean (merge copies out of the pooled `decodedPart`).
-- **Bench loop** — `scripts/bench-pprof.sh {run,cmp,top}` captures benchstat timings+allocs and
-  CPU + alloc_space pprof tops per labeled run, into `.bench/` (gitignored).
+The bench loop (`scripts/bench-pprof.sh {run,cmp,top}`) captures benchstat timings+allocs and CPU +
+alloc_space pprof tops per labeled run (`.bench/`, gitignored). Each step below was profile-picked,
+implemented, and verified with it; correctness via codec round-trip/fuzz + `-race` + golden.
 
-### What the loop now shows is #1 (do next)
+**Cumulative read-path result (benchstat, baseline → final, p=0.002):**
+`fetch_all` **−74.7% time / +295% throughput / B/op −63.5%**; `fetch_recent` **−49.8% time**.
 
-After P0, the read-path **alloc profile is 50% `engine.sampleMerge.add` + 11% `collect`** — the
-per-series `map[int64]sfval` (plan item **P1.4**). It is now the single biggest allocator *and* a GC
-driver (`mapassign`/scan). Replacing it (single-source fast path, or a k-way merge of the sorted
-runs, falling back to the map only on detected timestamp overlap) is the clear next win.
+In order:
+1. **P0.2 — peek var-length prefixes** (`bitstream.Buffered/Peek/Skip`; `readDoD`/`xorRead`):
+   GorillaDecode +26% throughput / −20% time.
+2. **P0.1 — pool part decode buffers** (`engine.decPool`, no-cross-fetch-cache path): read B/op −19%;
+   `chunk.resize` leaves the alloc profile. Race-clean (merge copies out of the pooled `decodedPart`).
+3. **P1.4 — map-free sample merge** (single-source fast path + k-way run merge, freshest-wins):
+   **fetch_all −70% time / +237% throughput**, allocs −37%. The dominant lever — eliminated the
+   per-series `map[int64]sfval` and its GC scan.
+4. **decimal decode, no scratch** — fold accumulate+convert into one pass into `dst` (dropped a
+   `make([]int64, rows)` per decode, ~25% of read allocs): fetch_recent −13% time.
+5. **`ReadUvarint` buffered fast path** — byte-from-word, no `ReadByte→ReadBits` per byte.
+6. **decimal scale hoist** — precompute `10^exp` once: DecimalDecode ~10µs → ~6.8µs (~32%).
+7. **`sortedWindow` in-order fast path** — skip scratch+sort for ascending head/flush buffers
+   (live-head read path; flat on the flush-heavy golden bench).
+
+### What the loop shows is left (structural — needs a decision)
+
+After the above, the read-path alloc profile is dominated by buffers that **back the returned
+batches**: `engine.collectOne` (~36%, the result ts/value slices) and `planFetch`/`Fetch` (~28%,
+per-series `*fetch.Batch` + head/flush windows). These are unavoidable *unless* the fetch contract
+gains a **batch-release lifecycle** (plan item **P1.3**) so the engine can pool the result + head
+buffers after the caller drains. That is a public-API change (every embedder must release), so it is
+flagged for a design decision rather than done in-loop. CPU is now spread across the inherently
+**serial** DoD/varint decode (delta dependency chains — not SIMD-amenable) and the result copy; the
+one SIMD-amenable spot (the decimal `v*scale` conversion) was already addressed by hoisting the scale.
 
 ## Diagnosis (what the profiles actually show)
 
