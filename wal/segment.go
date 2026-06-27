@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/go-faster/errors"
+	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/signal"
@@ -34,12 +35,21 @@ type SegmentWriter struct {
 	f        *os.File
 	size     int
 	w        *Writer
-	sync     bool     // fsync after every framed write (durability vs throughput)
-	metrics  *obs.WAL // append/fsync/rotation counters; nil ⇒ not metered
+	sync     bool        // fsync after every framed write (durability vs throughput)
+	metrics  *obs.WAL    // append/fsync/rotation counters; nil ⇒ not metered
+	log      *zap.Logger // segment open/rotate/checkpoint logging; nil ⇒ no-op
 }
 
 // SetObs attaches the WAL metrics handle (append/fsync/rotation counters). nil disables metering.
 func (sw *SegmentWriter) SetObs(m *obs.WAL) { sw.metrics = m }
+
+// SetLogger attaches a logger that records segment lifecycle events (open/rotate/checkpoint) at
+// Debug. The WAL append path takes no context, so these lines are not trace-correlated. nil ⇒ no-op.
+func (sw *SegmentWriter) SetLogger(l *zap.Logger) {
+	if l != nil {
+		sw.log = l
+	}
+}
 
 // Create opens (creating the directory if needed) a segmented WAL writer. A non-positive maxBytes
 // uses [DefaultMaxSegmentBytes]. If the directory already holds segments from a prior run, Create
@@ -107,6 +117,9 @@ func (sw *SegmentWriter) Checkpoint() error {
 			}
 		}
 	}
+
+	sw.logger().Debug("wal checkpoint (obsolete segments discarded)",
+		zap.String("dir", sw.dir), zap.Int("through_seq", obsolete))
 
 	return nil
 }
@@ -260,6 +273,14 @@ func (sw *SegmentWriter) afterWrite(err error) error {
 	return sw.f.Sync()
 }
 
+func (sw *SegmentWriter) logger() *zap.Logger {
+	if sw.log == nil {
+		return zap.NewNop()
+	}
+
+	return sw.log
+}
+
 func (sw *SegmentWriter) rotate() error {
 	if err := sw.Close(); err != nil {
 		return err
@@ -268,6 +289,8 @@ func (sw *SegmentWriter) rotate() error {
 	if sw.metrics != nil {
 		sw.metrics.Rotate()
 	}
+
+	sw.logger().Debug("wal rotate", zap.String("dir", sw.dir), zap.Int("from_seq", sw.seq), zap.Int("size", sw.size))
 
 	return sw.openNext()
 }
@@ -282,6 +305,7 @@ func (sw *SegmentWriter) openNext() error {
 	}
 
 	sw.f, sw.size = f, 0
+	sw.logger().Debug("wal segment opened", zap.String("name", name), zap.Int("seq", sw.seq), zap.Uint64("epoch", sw.epoch))
 
 	return nil
 }

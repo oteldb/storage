@@ -139,7 +139,7 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 		go s.runWALSync(walSyncEvery)
 	}
 
-	s.obs.Log.Info("storage opened",
+	s.obs.Logger(ctx).Info("storage opened",
 		zap.Bool("clustered", o.Cluster != nil),
 		zap.Bool("ephemeral", o.Durability == DurabilityEphemeral),
 		zap.Duration("flush_interval", time.Duration(o.FlushInterval)))
@@ -166,6 +166,8 @@ func (s *Storage) Close(ctx context.Context) error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+
+	s.obs.Logger(ctx).Debug("storage closing")
 
 	if s.stopCh != nil {
 		close(s.stopCh)
@@ -207,9 +209,9 @@ func (s *Storage) Close(ctx context.Context) error {
 	}
 
 	if firstErr != nil {
-		s.obs.Log.Warn("storage closed with errors", zap.Error(firstErr))
+		s.obs.Logger(ctx).Warn("storage closed with errors", zap.Error(firstErr))
 	} else {
-		s.obs.Log.Info("storage closed")
+		s.obs.Logger(ctx).Info("storage closed")
 	}
 
 	return firstErr
@@ -466,7 +468,25 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 		return fetch.Merge() // empty
 	}
 
-	return s.scaleWrap(s.baseFetcher(tenants), tenants)
+	return seedFetcher{inner: s.scaleWrap(s.baseFetcher(tenants), tenants), obs: s.obs, signal: signal.Metric.String()}
+}
+
+// seedFetcher is the outermost read wrapper: it installs the injected logger as the zctx base so
+// every downstream fetcher (fan-out, remote, engine) can log a trace-correlated line, and emits one
+// Debug at the query boundary. It does not touch the request.
+type seedFetcher struct {
+	inner  fetch.Fetcher
+	obs    *obs.Obs
+	signal string
+}
+
+func (f seedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
+	ctx = f.obs.Base(ctx)
+	f.obs.Logger(ctx).Debug("query fetch",
+		zap.String("signal", f.signal), zap.Int("matchers", len(r.Matchers)),
+		zap.Int64("start", r.Start), zap.Int64("end", r.End))
+
+	return f.inner.Fetch(ctx, r)
 }
 
 // baseFetcher builds the unwrapped read seam for the tenant set: owner-aware per tenant in
@@ -592,6 +612,10 @@ func (s *Storage) recover(ctx context.Context) error {
 		return nil
 	}
 
+	ctx = s.obs.Base(ctx)
+	log := s.obs.Logger(ctx)
+	log.Debug("recovery: scanning backend for flushed parts")
+
 	keys, err := s.backend.List(ctx, "")
 	if err != nil {
 		return errors.Wrap(err, "list backend for recovery")
@@ -635,6 +659,8 @@ func (s *Storage) recover(ctx context.Context) error {
 			}
 		}
 	}
+
+	log.Debug("recovery: parts loaded, replaying WAL", zap.Int("backend_keys", len(keys)))
 
 	return s.recoverWAL(ctx)
 }
@@ -802,6 +828,8 @@ func (s *Storage) walFor(prefix string) (*wal.SegmentWriter, error) {
 		w.SetObs(s.obs.WAL)
 	}
 
+	w.SetLogger(s.obs.Log)
+
 	return w, nil
 }
 
@@ -867,10 +895,16 @@ func (s *Storage) syncWALs() {
 // tick retries. In cluster mode only the tenants this node owns (its compaction claims) are
 // flushed/merged, so exactly one node writes a tenant's parts to the shared object store.
 func (s *Storage) maintain(ctx context.Context) {
+	ctx = s.obs.Base(ctx)
+
 	metricEngines := s.engineSnapshotByTenant()
 	logEngines := s.logEngineSnapshotByTenant()
 	traceEngines := s.traceEngineSnapshotByTenant()
 	profileEngines := s.profileEngineSnapshotByTenant()
+
+	s.obs.Logger(ctx).Debug("maintenance cycle start",
+		zap.Int("metric_tenants", len(metricEngines)), zap.Int("log_tenants", len(logEngines)),
+		zap.Int("trace_tenants", len(traceEngines)), zap.Int("profile_tenants", len(profileEngines)))
 
 	// Compaction ownership is per-tenant and shared across signals, so reconcile it once over the
 	// union of all signals' tenants (reconciling per-signal would have each release the others'

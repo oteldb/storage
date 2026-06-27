@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/go-faster/errors"
+	"github.com/go-faster/sdk/zctx"
+	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/internal/obs"
@@ -31,6 +33,9 @@ func (b *instrumentedBackend) Read(ctx context.Context, key string) ([]byte, err
 	start := time.Now()
 	v, err := b.inner.Read(ctx, key)
 	b.m.Record(ctx, "read", result(err), time.Since(start), int64(len(v)))
+	zctx.From(ctx).Debug("backend read",
+		zap.String("key", key), zap.Int("bytes", len(v)),
+		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
 
 	return v, err
 }
@@ -39,6 +44,9 @@ func (b *instrumentedBackend) Write(ctx context.Context, key string, data []byte
 	start := time.Now()
 	err := b.inner.Write(ctx, key, data)
 	b.m.Record(ctx, "write", result(err), time.Since(start), int64(len(data)))
+	zctx.From(ctx).Debug("backend write",
+		zap.String("key", key), zap.Int("bytes", len(data)),
+		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
 
 	return err
 }
@@ -47,6 +55,9 @@ func (b *instrumentedBackend) PutIfAbsent(ctx context.Context, key string, data 
 	start := time.Now()
 	ok, err := b.inner.PutIfAbsent(ctx, key, data)
 	b.m.Record(ctx, "cas", result(err), time.Since(start), int64(len(data)))
+	zctx.From(ctx).Debug("backend cas",
+		zap.String("key", key), zap.Int("bytes", len(data)), zap.Bool("stored", ok),
+		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
 
 	return ok, err
 }
@@ -55,6 +66,9 @@ func (b *instrumentedBackend) List(ctx context.Context, prefix string) ([]string
 	start := time.Now()
 	keys, err := b.inner.List(ctx, prefix)
 	b.m.Record(ctx, "list", result(err), time.Since(start), 0)
+	zctx.From(ctx).Debug("backend list",
+		zap.String("prefix", prefix), zap.Int("keys", len(keys)),
+		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
 
 	return keys, err
 }
@@ -63,6 +77,8 @@ func (b *instrumentedBackend) Delete(ctx context.Context, key string) error {
 	start := time.Now()
 	err := b.inner.Delete(ctx, key)
 	b.m.Record(ctx, "delete", result(err), time.Since(start), 0)
+	zctx.From(ctx).Debug("backend delete",
+		zap.String("key", key), zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
 
 	return err
 }
