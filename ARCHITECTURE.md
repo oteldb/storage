@@ -1080,6 +1080,14 @@ and the base commit, diff them with `golang.org/x/perf/cmd/benchstat`, and post 
 with overall values plus the `vs base` delta and significance. Efficiency regression *gates* (hard
 ceilings on bytes/point and hot-path allocations) live separately in `efficiency_test.go`.
 
+**Distributed fault-injection.** `cluster/chaos_test.go` wires N real engines behind a
+fault-injecting in-process transport, sharing the real HRW ring and quorum replicator, and asserts
+the L0 safety properties under node death, partition, and stragglers: a quorum write succeeds iff a
+quorum of owners is reachable (no false acks), every acked write survives a later minority failure
+(no data loss — verified by a randomized soak), and reads converge by gathering+merging across the
+reachable replicas. It drives the production `replica`/`ring`/`fetch.Merge` code, so a regression in
+the quorum or convergence logic trips it (race-clean under `-race`).
+
 ---
 
 ## 6. Package map
