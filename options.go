@@ -60,6 +60,13 @@ type Options struct {
 	// triggered. Zero ⇒ default.
 	FlushThresholdBytes int64
 
+	// ReadCacheBytes enables an in-memory LRU cache over backend read objects (immutable part
+	// columns/manifests/marks/index), sized to this many bytes. It targets the cold tier
+	// (file/S3), where a part is otherwise re-read on every query; recommended for those
+	// deployments. Zero disables it, and it is always skipped for an ephemeral (in-memory)
+	// backend, which is already RAM. See [backend.Cached].
+	ReadCacheBytes int64
+
 	// FlushInterval is the max age of unflushed head data. Zero ⇒ default.
 	// (Resolved into a duration internally to keep the API import-light.)
 	FlushInterval int64 // nanoseconds
@@ -199,6 +206,10 @@ func (o *Options) walSyncInterval() time.Duration {
 
 // WithFlushThresholdBytes sets the head flush size threshold.
 func WithFlushThresholdBytes(n int64) Option { return func(o *Options) { o.FlushThresholdBytes = n } }
+
+// WithReadCache enables an in-memory LRU object cache over the backend, sized to maxBytes (the
+// object-store read cache for the cold tier). Skipped for an ephemeral backend. See [Options.ReadCacheBytes].
+func WithReadCache(maxBytes int64) Option { return func(o *Options) { o.ReadCacheBytes = maxBytes } }
 
 // WithFlushInterval sets the head flush time interval in nanoseconds.
 func WithFlushInterval(ns int64) Option { return func(o *Options) { o.FlushInterval = ns } }

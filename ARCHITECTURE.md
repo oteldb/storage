@@ -180,6 +180,16 @@ conditional-write (CAS) primitive on which atomic manifest / block-list commits 
   integration test** runs the core suite over a real S3 protocol implementation — the
   embeddable `go-faster/fs` server on an `httptest` listener (no Docker), exercising actual
   HTTP+XML. **This is the only package importing the AWS SDK.**
+- **`backend.Cached(inner, maxBytes)`** (root package) — the object-store **read cache**: a
+  byte-bounded LRU over read objects that wraps any backend, targeting the cold tier (file/S3) where
+  a part column is otherwise re-read over the network on every query. Correct by construction —
+  part objects are write-once immutable, so a cached value is never stale; the only invalidation is
+  eviction, and a `Write`/`Delete` of the same key (manifest/index objects) updates/drops the entry.
+  It preserves the copy semantics (stored/returned slices are private), passes `List`/`PutIfAbsent`
+  through, and exposes hit/miss `Stats`. Enabled via `Options.ReadCacheBytes` / `WithReadCache`,
+  wrapped **outermost** (a hit skips both metering and the backend) and skipped for an ephemeral
+  backend. A hit removes the per-fetch backend-read latency entirely, so the win scales with object-
+  store latency × objects-per-query.
 - **`backend/bucketindex`** — a compact, versioned binary index (block list + per-part time
   bounds) stored as one object, so a stateless reader enumerates and time-prunes a tenant's
   parts (`Overlapping(start,end)`) without a full bucket `List`. Fuzzed for decode safety,
@@ -1119,7 +1129,7 @@ signal/               typed Attributes/Value, Resource/Scope/Series identity, 12
   signal/profile      []byte-based OTLP-shaped Profiles ingest batch + sample schema (type folded into identity) + projection + content-addressed symbol store (SideStore) + stack Resolver [implemented]
 otlp/pdataconv        optional OTel-Go bridge: pmetric.Metrics → metric.Metrics; gauge/sum direct + histogram/exp-histogram/summary classic decomposition (only package importing pdata) [implemented]
 tenant/               Limits/Retention/Downsample/Sampling/Recompress/Precision/Policy, Resolver     [implemented]
-backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + memory (root) [implemented]
+backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + memory + read cache (root) [implemented]
   backend/file        directory-tree backend; atomic write + exclusive PutIfAbsent (os.Link) [implemented]
   backend/s3          object-store-native backend over ObjectStore + aws-sdk-go-v2 adapter   [implemented; in-process go-faster/fs S3 integration test]
   backend/bucketindex versioned block-list index (time-pruned part enumeration, no full LIST) + WAL flush-epoch watermark [implemented]

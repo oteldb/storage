@@ -106,6 +106,12 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 		s.backend = instrumentBackend(s.backend, s.obs.Backend)
 	}
 
+	// Wrap the cold tier in the read cache outermost, so a cache hit skips both metering and the
+	// backend read. An ephemeral (in-memory) backend is already RAM, so it is never cached.
+	if o.ReadCacheBytes > 0 && !s.backend.IsEphemeral() {
+		s.backend = backend.Cached(s.backend, o.ReadCacheBytes)
+	}
+
 	if o.QueryCacheEntries > 0 {
 		s.queryCache = scale.NewMemoryCache(o.QueryCacheEntries)
 	}
