@@ -581,7 +581,7 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 					limits, func() signal.Series { return s })
 
 				switch out {
-				case admitted:
+				case admitted, admittedOverflow: // primary path sets no Overflow, so only `admitted` occurs
 					accTs = append(accTs, ts[i])
 					accVals = append(accVals, values[i])
 					res.Accepted++

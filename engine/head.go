@@ -120,26 +120,13 @@ func (h *head) appendByID(
 	// series before its first live sample) to decide whether to materialize and index it.
 	buf := h.samples[id]
 	if buf == nil {
+		// A new identity (not yet indexed) goes through the cardinality decision; an already-indexed
+		// one (WAL replay registered it before its first live sample) just needs a buffer.
 		if !h.series.Has(id) {
-			cardinality := int64(h.series.Len())
-
-			// Hard ceiling: reject a new series that would exceed MaxSeries. Existing series are
-			// never blocked, so a query keeps returning what is already admitted.
-			if limits.MaxSeries > 0 && cardinality >= limits.MaxSeries {
-				return rejectCardinality, id, false, signal.Series{}
+			var done bool
+			if out, effID, isNew, s, done = h.admitNew(id, ts, value, sf, limits, materialize); done {
+				return out, effID, isNew, s
 			}
-
-			// Soft budget: between MaxSeriesSoft and MaxSeries a new series is routed to a
-			// caller-built overflow series instead of registered, bounding cardinality while keeping
-			// the tenant's aggregates approximately right. Only on the degraded path — no hot-path cost.
-			if limits.Overflow != nil && limits.MaxSeriesSoft > 0 && cardinality >= limits.MaxSeriesSoft {
-				return h.appendOverflow(limits.Overflow(materialize()), ts, value, sf)
-			}
-
-			isNew = true
-			s = materialize()
-			h.series.Add(s)
-			h.indexLabels(id, s)
 		}
 
 		buf = &sampleBuf{}
@@ -154,6 +141,37 @@ func (h *head) appendByID(
 	}
 
 	return admitted, id, isNew, s
+}
+
+// admitNew decides admission for a series not yet in the index. done=true means the returned outcome
+// is final — a hard cardinality reject, or a soft-budget overflow that already appended the sample;
+// done=false means the series was registered normally and the caller should buffer the sample under
+// id (isNew and s are then set).
+func (h *head) admitNew(
+	id signal.SeriesID, ts int64, value, sf float64, limits AppendLimits, materialize func() signal.Series,
+) (out admitOutcome, effID signal.SeriesID, isNew bool, s signal.Series, done bool) {
+	cardinality := int64(h.series.Len())
+
+	// Hard ceiling: reject a new series that would exceed MaxSeries. Existing series are never
+	// blocked, so a query keeps returning what is already admitted.
+	if limits.MaxSeries > 0 && cardinality >= limits.MaxSeries {
+		return rejectCardinality, id, false, signal.Series{}, true
+	}
+
+	// Soft budget: between MaxSeriesSoft and MaxSeries a new series is routed to a caller-built
+	// overflow series instead of registered, bounding cardinality while keeping the tenant's
+	// aggregates approximately right. Only on the degraded path — no steady-state hot-path cost.
+	if limits.Overflow != nil && limits.MaxSeriesSoft > 0 && cardinality >= limits.MaxSeriesSoft {
+		o, oid, oNew, oS := h.appendOverflow(limits.Overflow(materialize()), ts, value, sf)
+
+		return o, oid, oNew, oS, true
+	}
+
+	s = materialize()
+	h.series.Add(s)
+	h.indexLabels(id, s)
+
+	return admitted, id, true, s, false
 }
 
 // appendOverflow appends a sample to the overflow series ov (the soft-budget redirect target). The
