@@ -586,8 +586,9 @@ surfaces in `Accepted.Rejected`.
 
 **Read fan-out** (`cluster/read.go`): `Storage.Fetcher` is owner-aware in cluster mode. If the
 node owns the tenant it serves locally (the head is replicated there, full matcher pushdown);
-otherwise it fans out over HTTP to an owner's read endpoint and **fails over** between owners (a
-single owner's copy is complete). Matchers are opaque Go predicates and **not serializable**, so
+otherwise it fans out over HTTP to an owner's read endpoint, **hedging** across owners (a single
+owner's copy is complete) — the first owner is tried immediately and a second is raced once it is
+slow or errors, first success wins (`hedgedFetcher`, §3m). Matchers are opaque Go predicates and **not serializable**, so
 the RPC carries only the tenant + window — a peer returns its whole window (a superset the fetch
 contract permits) and the requesting node **re-applies the matchers** (their closures live
 there). A three-node, RF=2 end-to-end test confirms a query on a non-owner returns the data.
@@ -824,6 +825,37 @@ noop provider — so an unconfigured store spans, logs, and counts nothing and p
   grafts the peer's subtree (labeled by peer address) under the current node, so a query on a
   non-owner shows the owner's timing as a nested `remote {addr}` subtree.
 
+## 3m. Transport reliability (`internal/retry`, `reliability`)
+
+The two transports that leave a process — the node-to-node cluster RPCs and the S3 backend — must
+survive a lossy, noisy network where a request can fail instantly, hang and fail after a long
+timeout, or simply run slow. `internal/retry` is the shared mechanism; `reliability.RetryConfig`
+(public, with `Default` and `LossyEnvironment` presets) is the knob, wired through `Options.Retry`
+(cluster) and `s3.WithRetry` (backend). It is **default-on** with the mild `Default` profile and
+lives entirely off the data plane's hot path.
+
+- **`internal/retry`** provides three composable primitives: `Do` (bounded sequential retry with a
+  per-attempt timeout and exponential, equal-jittered backoff), `Hedge` (opportunistic concurrent
+  retries — launch the first attempt, stage the next once the in-flight one passes `HedgeDelay` or
+  fails, race them, return the first success and cancel the losers), and HTTP error classifiers:
+  `Transient` (retry an idempotent call on any transport error except a parent cancellation),
+  `ConnFailure` (the *safe* write predicate — retry only when the request provably never reached the
+  server), and `RetryableStatus` (5xx/429).
+- **Idempotent reads hedge.** The cluster read fan-out (`hedgedFetcher`, replacing the old
+  sequential failover) races a request across a shard's replica owners — first owner immediately, a
+  second once it is slow or errors — so a single slow/stuck/down owner no longer dictates latency or
+  fails the read. The S3 backend hedges `GetObject` (a slow GET is re-issued on a fresh connection)
+  and never retries a genuine not-found.
+- **Per-attempt timeouts everywhere.** Every attempt is bounded by `PerTryTimeout` via context (not
+  `http.Client.Timeout`, which would abort a request the hedge layer still wants to race); the
+  cluster HTTP client also sets dial/TLS/response-header timeouts (it was `http.DefaultClient` with
+  none). A 30-second hang is abandoned in a per-try budget instead of stalling the whole deadline.
+- **Writes stay at-most-once.** Primary writes and the S3 conditional put (CAS) retry only on
+  `ConnFailure` and never hedge, so an ambiguous failure (a timeout after the body was sent) is not
+  re-applied; idempotent S3 overwrites/deletes retry on any transient error.
+- **Observable.** Retries and hedges increment `storage.rpc.{attempts,retries,hedges}` (tagged by
+  op) and emit trace-correlated Debug logs, so a degrading link shows up as a rising hedge/retry rate.
+
 ## 4. Public surface (`storage` root package)
 
 The embedder-facing API. **All four signals' ingest+read paths are wired and working** (metrics on
@@ -979,7 +1011,9 @@ encoding/             umbrella doc for the codec layers
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
 internal/simd         vectorized columnar kernels (AVX2) + pure-Go fallback + runtime CPU dispatch [implemented: int64 min/max]
 internal/cmd/gensimd  avo generator for internal/simd's committed *_amd64.s (//go:generate)   [implemented]
-internal/obs          injected observability handle: zap logger (context-plumbed via go-faster/sdk/zctx, trace-correlated) + OTel tracer + per-layer metric instruments (admission/flush/merge/fetch/backend/WAL) + W3C trace propagation; no-op default [implemented]
+internal/obs          injected observability handle: zap logger (context-plumbed via go-faster/sdk/zctx, trace-correlated) + OTel tracer + per-layer metric instruments (admission/flush/merge/fetch/backend/WAL/rpc) + W3C trace propagation; no-op default [implemented]
+internal/retry        transport reliability primitives: Do (retry+per-try timeout+backoff), Hedge (opportunistic concurrent retries), HTTP error classifiers [implemented]
+reliability           public RetryConfig + Default/LossyEnvironment presets (the embedder-facing reliability knob) [implemented]
 signal/               typed Attributes/Value, Resource/Scope/Series identity, 128-bit SeriesID, Signal, TenantID, Aggregation [implemented]
   signal/metric       []byte-based OTLP-shaped Metrics ingest batch (resettable/pooled) + identity + projection (gauge/sum; histogram/exp-histogram/summary via classic decomposition in otlp/pdataconv) [implemented]
   signal/log          []byte-based OTLP-shaped Logs ingest batch (resettable/pooled) + stream identity + projection [implemented]
