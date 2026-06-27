@@ -27,6 +27,7 @@ import (
 	qprofile "github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/profile"
+	"github.com/oteldb/storage/tenant"
 )
 
 func freeAddr(t *testing.T) string {
@@ -489,7 +490,8 @@ func TestClusteredLogsAccountForRejected(t *testing.T) {
 	// 3000 advances newest; 900 is far below (newest-OOOWindow) so the primary rejects it.
 	acc, err = s.WriteLogs(ctx, logBatch("api", [3]any{3000, 9, "b"}, [3]any{900, 9, "old"}))
 	require.NoError(t, err)
-	assert.Equal(t, Accepted{Accepted: 1, Rejected: 1}, acc, "the out-of-order record is accounted as rejected")
+	assert.Equal(t, Accepted{Accepted: 1, Rejected: 1, RejectedReason: "out_of_order"}, acc,
+		"the out-of-order record is accounted as rejected, with its reason")
 }
 
 // TestClusterPrimaryAccountsForRejectedSamples proves the primary-authoritative write path
@@ -517,7 +519,38 @@ func TestClusterPrimaryAccountsForRejectedSamples(t *testing.T) {
 	// rejects it. The reject count must reach the caller via Accepted.
 	acc, err = s.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{3000, 900}, []float64{5, 9}))
 	require.NoError(t, err)
-	assert.Equal(t, Accepted{Accepted: 1, Rejected: 1}, acc, "the out-of-order sample is accounted as rejected")
+	assert.Equal(t, Accepted{Accepted: 1, Rejected: 1, RejectedReason: "out_of_order"}, acc,
+		"the out-of-order sample is accounted as rejected, with its reason")
+}
+
+// TestClusterPrimaryAppliesCardinalityLimit proves the shard primary now enforces the per-tenant
+// cardinality valve on the clustered write path (not just the OOO check): a write that would mint a
+// series beyond MaxSeries is shed by the primary and surfaces as a max_series rejection.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterPrimaryAppliesCardinalityLimit(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	s := openClusterNodeWith(t, endpoint, "node-a", backend.Memory(),
+		WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+			return tenant.Policy{Limits: tenant.Limits{MaxSeries: 1}}
+		})))
+
+	require.Eventually(t, func() bool {
+		return len(s.cluster.membership.Members()) == 1
+	}, 10*time.Second, 50*time.Millisecond)
+
+	// First series fills the cardinality budget.
+	acc, err := s.WriteMetrics(ctx, gaugeBatch("api", "m1", []int64{1}, []float64{1}))
+	require.NoError(t, err)
+	assert.Equal(t, Accepted{Accepted: 1}, acc)
+
+	// A second, distinct series would exceed MaxSeries=1: the primary sheds it as cardinality.
+	acc, err = s.WriteMetrics(ctx, gaugeBatch("api", "m2", []int64{2}, []float64{2}))
+	require.NoError(t, err)
+	assert.Equal(t, Accepted{Accepted: 0, Rejected: 1, RejectedReason: "max_series"}, acc,
+		"the over-cardinality series is shed by the primary, accounted with its reason")
 }
 
 // TestClusteredReadFansOutToOwners is the read-fan-out capstone: with three nodes and RF=2,
@@ -572,6 +605,128 @@ func TestClusteredReadFansOutToOwners(t *testing.T) {
 	require.Lenf(t, got, 1, "%s served the series via read fan-out", nonOwnerName)
 	assert.Equal(t, []int64{100, 200}, got[0].Timestamps)
 	assert.Equal(t, []float64{1, 2}, got[0].Values)
+}
+
+// TestClusteredLogEnumerationFansOut covers the LogSeries/LogKeys cluster fan-out: a non-owner,
+// holding none of a tenant's log data, serves both enumerations from an owner over HTTP.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusteredLogEnumerationFansOut(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNode(t, endpoint, "node-a"),
+		"node-b": openClusterNode(t, endpoint, "node-b"),
+		"node-c": openClusterNode(t, endpoint, "node-c"),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+
+	// Write logs (with a record attribute) via node A; it routes to the tenant's two owners.
+	_, err := a.WriteLogs(ctx, logBatchWithAttrs("api",
+		[4]any{100, 9, "first", "http.method"},
+		[4]any{200, 17, "second", "http.status_code"},
+	))
+	require.NoError(t, err)
+
+	owners := a.cluster.membership.Ring().Lookup([]byte("default"), 2)
+	require.Len(t, owners, 2)
+	ownerID := map[string]bool{owners[0].ID: true, owners[1].ID: true}
+
+	var nonOwner *Storage
+	var nonOwnerName string
+	for name, s := range nodes {
+		if !ownerID[name] {
+			nonOwner, nonOwnerName = s, name
+		}
+	}
+	require.NotNil(t, nonOwner, "one node is not an owner")
+
+	_, hasLocal := nonOwner.lookupLogEngine("default")
+	require.Falsef(t, hasLocal, "%s (non-owner) has no local log engine", nonOwnerName)
+
+	// LogSeries fans out: the non-owner returns the tenant's one stream.
+	series, err := nonOwner.LogSeries(ctx, "default", []fetch.Matcher{logSvcMatcher("api")}, 0, 0)
+	require.NoError(t, err)
+	require.Lenf(t, series, 1, "%s served LogSeries via fan-out", nonOwnerName)
+
+	// LogKeys fans out: including the per-record attribute keys LogSeries cannot see.
+	keys, err := nonOwner.LogKeys(ctx, "default", 0, 0)
+	require.NoError(t, err)
+
+	got := logKeyScopes(keys)
+	assert.Equal(t, KeyScopeResource, got["service.name"], "resource attribute (a stream label)")
+	assert.Equal(t, KeyScopeRecord, got["http.method"], "record attribute served via fan-out")
+	assert.Equal(t, KeyScopeRecord, got["http.status_code"])
+}
+
+// TestInspectClusterSection verifies Inspect populates the cluster view: this node's address, the
+// live membership, and the shards it holds a compaction claim on.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestInspectClusterSection(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	s := openClusterNodeWith(t, endpoint, "node-a", backend.Memory())
+
+	require.Eventually(t, func() bool {
+		return len(s.cluster.membership.Members()) == 1
+	}, 10*time.Second, 50*time.Millisecond)
+
+	_, err := s.WriteMetrics(ctx, gaugeBatch("api", "m1", []int64{1}, []float64{1}))
+	require.NoError(t, err)
+
+	// A maintenance cycle reconciles ownership so this node claims the tenant's shard.
+	s.maintain(ctx)
+
+	ss := s.Inspect()
+	require.NotNil(t, ss.Cluster, "cluster mode ⇒ cluster section present")
+	assert.NotEmpty(t, ss.Cluster.Self, "node address")
+	require.Len(t, ss.Cluster.Members, 1)
+	assert.Equal(t, "node-a", ss.Cluster.Members[0].ID)
+	assert.Contains(t, ss.Cluster.Owned, "default", "the sole node owns the tenant's shard")
+}
+
+// TestAdminCompactOwnershipGate verifies the Admin flush/compact ownership gate: a node that is not
+// the ring-primary of a tenant returns ErrNotOwner (so a shard's parts stay single-writer), while
+// the owner succeeds.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestAdminCompactOwnershipGate(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNode(t, endpoint, "node-a"),
+		"node-b": openClusterNode(t, endpoint, "node-b"),
+		"node-c": openClusterNode(t, endpoint, "node-c"),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond)
+
+	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "m1", []int64{1}, []float64{1}))
+	require.NoError(t, err)
+
+	// The tenant's primary is one specific node; the others must refuse to compact it.
+	primary, ok := a.cluster.membership.Ring().Primary([]byte("default"))
+	require.True(t, ok)
+
+	for name, s := range nodes {
+		err := s.Admin().Compact(ctx, "default", signal.Metric)
+		if name == primary.ID {
+			require.NoErrorf(t, err, "%s is the primary and may compact", name)
+		} else {
+			require.ErrorIsf(t, err, ErrNotOwner, "%s is not the primary and must refuse", name)
+		}
+	}
 }
 
 func TestShardHelpers(t *testing.T) {
