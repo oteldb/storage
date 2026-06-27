@@ -26,6 +26,10 @@ type part struct {
 	ranges map[signal.SeriesID]rowRange
 	blooms map[string]*bloom.Filter // column name → its bloom (FullText/Attrs/Equality); absent ⇒ scan
 
+	// recordKeys is the part's distinct per-record attribute keys (the "keys.bin" footer), for
+	// [Engine.Keys] enumeration. nil when the part has no record attributes (or predates the footer).
+	recordKeys [][]byte
+
 	// minTime, maxTime are the inclusive unix-ns record bounds of the part (from the columns when
 	// written, from the bucket index when reconstructed), for time pruning.
 	minTime, maxTime int64
@@ -81,7 +85,12 @@ func openPart(ctx context.Context, b backend.Backend, schema *Schema, prefix str
 		return nil, err
 	}
 
-	return &part{schema: schema, reader: r, prefix: prefix, ranges: ranges, blooms: blooms}, nil
+	recordKeys, err := loadRecordKeys(ctx, b, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	return &part{schema: schema, reader: r, prefix: prefix, ranges: ranges, blooms: blooms, recordKeys: recordKeys}, nil
 }
 
 // holdsAny reports whether the part carries any of the requested streams.
