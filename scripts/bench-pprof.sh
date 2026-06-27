@@ -33,7 +33,8 @@ BENCHTIME="${BENCHTIME:-2s}"
 # in. -run '^$' skips tests; -benchmem reports B/op and allocs/op (the MEM axis).
 bench_set() {
   go test -run '^$' -bench '^BenchmarkGolden$/read' -benchmem -count="$COUNT" -benchtime="$BENCHTIME" .
-  # The release-aware read (realistic embedder pattern) — measures Batch.Release buffer pooling.
+  # The release-aware metric + record reads (realistic embedder pattern) — Batch.Release pooling.
+  go test -run '^$' -bench '^(BenchmarkLogReadAll|BenchmarkLogReadRelease)$' -benchmem -count="$COUNT" -benchtime="$BENCHTIME" .
   go test -run '^$' -bench '^(BenchmarkDoDDecode|BenchmarkGorillaDecode|BenchmarkDecimalDecode|BenchmarkT64Decode|BenchmarkU128Decode)$' \
     -benchmem -count="$COUNT" -benchtime="$BENCHTIME" ./encoding/chunk
   go test -run '^$' -bench '^(BenchmarkReadBit|BenchmarkReadBits|BenchmarkReadBitsUnaligned)$' \
