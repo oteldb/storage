@@ -194,7 +194,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 				continue
 			}
 
-			d, err := decoded.get(ctx, p)
+			d, err := decoded.get(ctx, p, decodePart)
 			if err != nil {
 				return nil, err
 			}

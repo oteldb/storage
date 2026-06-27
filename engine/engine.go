@@ -36,6 +36,10 @@ type Config struct {
 	// Obs is the observability handle (spans + metrics). nil ⇒ a no-op handle, so an engine
 	// constructed without one logs/spans/counts nothing.
 	Obs *obs.Obs
+	// DecodeCacheBytes enables a cross-fetch cache of decoded part columns, sized to this many
+	// bytes (LRU). It skips the column re-decode that the backend read cache cannot, and applies to
+	// every backend (a decode is CPU even when the read is RAM-fast). Zero disables it.
+	DecodeCacheBytes int64
 }
 
 // Engine is a single tenant's storage engine. Safe for concurrent use.
@@ -54,6 +58,8 @@ type Engine struct {
 	flushing map[signal.SeriesID]*sampleBuf
 	// walB groups a durable AppendBatch's WAL frames by series (reused under e.mu); nil head-only.
 	walB *walBatch
+	// decodeCache memoizes decoded part columns across fetches (LRU); nil ⇒ decode every fetch.
+	decodeCache *decodeCache
 }
 
 var _ fetch.Fetcher = (*Engine)(nil)
@@ -67,6 +73,10 @@ func New(cfg Config) *Engine {
 	e := &Engine{cfg: cfg, head: newHead()}
 	if cfg.WAL != nil {
 		e.walB = newWALBatch()
+	}
+
+	if cfg.DecodeCacheBytes > 0 {
+		e.decodeCache = newDecodeCache(cfg.DecodeCacheBytes)
 	}
 
 	return e
@@ -225,6 +235,10 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 	defer plan.releaseParts()
 
+	// Prefetch: decode the parts this fetch will touch concurrently (and cache them), so their
+	// backend reads + decodes overlap instead of happening one part at a time during the merge.
+	e.prefetch(ctx, plan)
+
 	_, spf := profile.Begin(ctx, "scan")
 
 	var (
@@ -279,6 +293,7 @@ type enginePlan struct {
 	flushB     map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
 	liveParts  []*part
 	decoded    partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
+	decodeFn   decodeFunc      // how a part is decoded on a per-fetch miss (cache-aware)
 	start, end int64
 }
 
@@ -293,7 +308,7 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 			continue
 		}
 
-		d, err := p.decoded.get(ctx, part)
+		d, err := p.decoded.get(ctx, part, p.decodeFn)
 		if err != nil {
 			return m, err
 		}
@@ -673,18 +688,88 @@ func (e *Engine) publishLocked(ctx context.Context) error {
 	return nil
 }
 
+// decodeOf decodes p through the cross-fetch decode cache when enabled: a hit returns the shared
+// (immutable) decoded columns; a miss decodes and caches them. Without a cache it decodes plainly.
+func (e *Engine) decodeOf(ctx context.Context, p *part) (*decodedPart, error) {
+	if e.decodeCache == nil {
+		return p.decode(ctx)
+	}
+
+	if dp, ok := e.decodeCache.get(p.prefix); ok {
+		return dp, nil
+	}
+
+	dp, err := p.decode(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	e.decodeCache.put(p.prefix, dp)
+
+	return dp, nil
+}
+
+// prefetchConcurrency bounds the parallel part decodes a single fetch's prefetch issues.
+const prefetchConcurrency = 8
+
+// prefetch concurrently decodes (and caches) the parts this fetch will actually touch — those
+// holding at least one matched series — so the per-part backend reads and decodes overlap instead
+// of running sequentially as the merge first reaches each part. It is a no-op without a decode
+// cache or with fewer than two parts to touch (the lazy path is already optimal). Best-effort: a
+// decode error here is ignored; the merge re-decodes and surfaces it.
+func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
+	if e.decodeCache == nil || len(plan.liveParts) < 2 {
+		return
+	}
+
+	var todo []*part
+
+	for _, pt := range plan.liveParts {
+		for _, id := range plan.ids {
+			if _, ok := pt.ranges[id]; ok {
+				todo = append(todo, pt)
+
+				break
+			}
+		}
+	}
+
+	if len(todo) < 2 {
+		return
+	}
+
+	sem := make(chan struct{}, prefetchConcurrency)
+
+	var wg sync.WaitGroup
+
+	for _, pt := range todo {
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(p *part) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			_, _ = e.decodeOf(ctx, p)
+		}(pt)
+	}
+
+	wg.Wait()
+}
+
 // planFetch selects and acquires the in-window parts and snapshots each series' head + mid-flush
 // samples and identity — all under the lock — so the part reads run lock-free. Caller holds e.mu (read
 // lock). The acquired parts must be released with releaseParts.
 func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 	p := &enginePlan{
-		ids:     ids,
-		series:  make(map[signal.SeriesID]signal.Series, len(ids)),
-		headB:   make(map[signal.SeriesID]*fetch.Batch, len(ids)),
-		flushB:  make(map[signal.SeriesID]*fetch.Batch, len(ids)),
-		decoded: make(partDecodeCache),
-		start:   r.Start,
-		end:     r.End,
+		ids:      ids,
+		series:   make(map[signal.SeriesID]signal.Series, len(ids)),
+		headB:    make(map[signal.SeriesID]*fetch.Batch, len(ids)),
+		flushB:   make(map[signal.SeriesID]*fetch.Batch, len(ids)),
+		decoded:  make(partDecodeCache),
+		decodeFn: e.decodeOf,
+		start:    r.Start,
+		end:      r.End,
 	}
 
 	for _, part := range e.parts {

@@ -28,6 +28,68 @@ func (s slowBackend) Read(ctx context.Context, key string) ([]byte, error) {
 	return s.Backend.Read(ctx, key)
 }
 
+// BenchmarkDecodeCacheRepeatFetch compares repeated fetches of the same part with the decoded-column
+// cache off vs on (on a fast in-memory backend, where column decode — not the read — dominates a
+// fetch). With the cache, the part decodes once and later fetches reuse the decoded arrays.
+func BenchmarkDecodeCacheRepeatFetch(b *testing.B) {
+	cases := []struct {
+		name  string
+		bytes int64
+	}{
+		{"nocache", 0},
+		{"cached", 64 << 20},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			ctx := context.Background()
+
+			s, err := Open(ctx, Options{}, WithDecodeCache(tc.bytes))
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer func() { _ = s.Close(ctx) }()
+
+			if _, err := s.WriteMetrics(ctx, buildCorpus(corpusProfile{
+				name: "c", series: 500, points: 100, interval: 15_000_000_000,
+				kind: metric.KindGauge, pattern: patRandWalk,
+			}, 1)); err != nil {
+				b.Fatal(err)
+			}
+			eng := mustEngine(s.engineFor("default"))
+			if err := eng.Flush(ctx); err != nil {
+				b.Fatal(err)
+			}
+			if err := eng.Merge(ctx, 0); err != nil {
+				b.Fatal(err)
+			}
+
+			req := fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{nameMatcher("bench.metric")}}
+			f := s.Fetcher("default")
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				it, err := f.Fetch(ctx, req)
+				if err != nil {
+					b.Fatal(err)
+				}
+				for {
+					if _, err := it.Next(ctx); err != nil {
+						if errors.Is(err, io.EOF) {
+							break
+						}
+						b.Fatal(err)
+					}
+				}
+				if err := it.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkReadCacheColdTier compares repeated fetches over a high-latency backend with the read
 // cache off vs on. Without the cache each fetch re-reads the part's column objects over the (slow)
 // backend; with it, the immutable objects are served from memory after the first fetch — the

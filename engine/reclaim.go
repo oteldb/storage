@@ -74,6 +74,13 @@ func (e *Engine) reclaimRetired(ctx context.Context) {
 		return
 	}
 
+	// A reclaimed part will never be read again — drop its decoded columns from the cache.
+	if e.decodeCache != nil {
+		for _, p := range deletable {
+			e.decodeCache.evict(p.prefix)
+		}
+	}
+
 	var failed []*part
 
 	for _, p := range deletable {

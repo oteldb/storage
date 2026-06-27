@@ -67,6 +67,12 @@ type Options struct {
 	// backend, which is already RAM. See [backend.Cached].
 	ReadCacheBytes int64
 
+	// DecodeCacheBytes enables a per-tenant LRU cache of *decoded* part columns, sized to this many
+	// bytes. It eliminates the column re-decode that the read cache cannot — a hit returns the
+	// already-decoded arrays — so it helps every backend (a decode is CPU even when the read is
+	// RAM-fast). With it, a fetch also prefetches its parts' decodes concurrently. Zero disables it.
+	DecodeCacheBytes int64
+
 	// FlushInterval is the max age of unflushed head data. Zero ⇒ default.
 	// (Resolved into a duration internally to keep the API import-light.)
 	FlushInterval int64 // nanoseconds
@@ -210,6 +216,12 @@ func WithFlushThresholdBytes(n int64) Option { return func(o *Options) { o.Flush
 // WithReadCache enables an in-memory LRU object cache over the backend, sized to maxBytes (the
 // object-store read cache for the cold tier). Skipped for an ephemeral backend. See [Options.ReadCacheBytes].
 func WithReadCache(maxBytes int64) Option { return func(o *Options) { o.ReadCacheBytes = maxBytes } }
+
+// WithDecodeCache enables a per-tenant LRU cache of decoded part columns, sized to maxBytes, plus
+// concurrent prefetch of a fetch's parts. See [Options.DecodeCacheBytes].
+func WithDecodeCache(maxBytes int64) Option {
+	return func(o *Options) { o.DecodeCacheBytes = maxBytes }
+}
 
 // WithFlushInterval sets the head flush time interval in nanoseconds.
 func WithFlushInterval(ns int64) Option { return func(o *Options) { o.FlushInterval = ns } }

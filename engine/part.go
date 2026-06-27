@@ -135,6 +135,19 @@ type decodedPart struct {
 	sf   []float64 // nil when the part has no scale-factor column (every weight is 1)
 }
 
+// bytes is the decoded footprint (for the decode cache's budget): 8 bytes per ts/value/sf element.
+func (d *decodedPart) bytes() int64 {
+	return int64(len(d.ts))*8 + int64(len(d.vals))*8 + int64(len(d.sf))*8
+}
+
+// decodeFunc decodes a part's columns — either plainly ([decodePart]) or via the engine's
+// cross-fetch decode cache ([Engine.decodeOf]).
+type decodeFunc func(context.Context, *part) (*decodedPart, error)
+
+// decodePart decodes p with no caching — used by the merge path, whose source parts are about to be
+// retired and so must not populate the decode cache.
+func decodePart(ctx context.Context, p *part) (*decodedPart, error) { return p.decode(ctx) }
+
 // decode reads and decodes the part's ts / value (/ sf) columns once.
 func (p *part) decode(ctx context.Context) (*decodedPart, error) {
 	tsCol, err := p.reader.Column(ctx, colTs)
@@ -189,13 +202,15 @@ func (d *decodedPart) mergeSeriesInto(rng rowRange, m *sampleMerge, start, end i
 // it. It is not safe for concurrent use; each fetch/merge owns its own cache.
 type partDecodeCache map[*part]*decodedPart
 
-// get returns p's decoded columns, decoding and caching them on first use.
-func (c partDecodeCache) get(ctx context.Context, p *part) (*decodedPart, error) {
+// get returns p's decoded columns, decoding (via decode) and memoizing them on first use within
+// the operation. decode is [decodePart] for a merge or [Engine.decodeOf] for a fetch (the latter
+// consults the cross-fetch decode cache).
+func (c partDecodeCache) get(ctx context.Context, p *part, decode decodeFunc) (*decodedPart, error) {
 	if d, ok := c[p]; ok {
 		return d, nil
 	}
 
-	d, err := p.decode(ctx)
+	d, err := decode(ctx, p)
 	if err != nil {
 		return nil, err
 	}

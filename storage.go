@@ -800,11 +800,12 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 	}
 
 	e := engine.New(engine.Config{
-		OOOWindow: s.opts.OOOWindow,
-		Backend:   s.backend,
-		Prefix:    prefix,
-		WAL:       w,
-		Obs:       s.obs,
+		OOOWindow:        s.opts.OOOWindow,
+		Backend:          s.backend,
+		Prefix:           prefix,
+		WAL:              w,
+		Obs:              s.obs,
+		DecodeCacheBytes: s.opts.DecodeCacheBytes,
 	})
 	s.tenants[tid] = e
 

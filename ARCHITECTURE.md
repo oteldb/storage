@@ -459,7 +459,15 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   metrics-specific.
 - **Fetch** (`engine.go`) implements the fetch contract: it resolves matchers to series
   over the index, then merges each series' head buffer ∪ every part by timestamp into one
-  batch. `Close` flushes the head. `Reset(ctx)` is the inverse of accumulation: it replaces
+  batch. Each part is **decoded once per fetch** (a per-fetch memo), and — when a per-tenant
+  **decode cache** is configured (`Config.DecodeCacheBytes`, `decodecache.go`) — once *across*
+  fetches: a byte-bounded LRU of decoded columns keyed by part prefix, valid until the part is
+  retired (reclaim evicts its prefix) or the budget evicts it. A decoded part is immutable (the
+  merge only reads its column slices), so entries are **shared without copying**, even across
+  concurrent fetches. It eliminates the re-decode the object-store read cache (§3a) cannot. With
+  the cache on, a fetch also **prefetches** the parts it will touch — decoding them concurrently
+  (bounded fan-out) so their backend reads + decodes overlap instead of running one part at a time
+  during the merge. `Close` flushes the head. `Reset(ctx)` is the inverse of accumulation: it replaces
   the head with an empty one, drops the part handles, and deletes this engine's part objects
   from the backend (scoped to `{Prefix}/`), returning the engine to its `New` state for
   reuse (tests/benchmarks) without reallocating it.
