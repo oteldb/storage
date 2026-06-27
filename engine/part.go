@@ -168,6 +168,10 @@ type decodedPart struct {
 	ts   []int64
 	vals []float64
 	sf   []float64 // nil when the part has no scale-factor column (every weight is 1)
+	// pooled marks a decodedPart whose slices came from the engine's decode-buffer pool (the
+	// no-cross-fetch-cache path). The fetch returns it to the pool on releaseParts; safe because the
+	// merge copies values out, so no result batch aliases these slices.
+	pooled bool
 }
 
 // bytes is the decoded footprint (for the decode cache's budget): 8 bytes per ts/value/sf element.
@@ -185,12 +189,27 @@ func decodePart(ctx context.Context, p *part) (*decodedPart, error) { return p.d
 
 // decode reads and decodes the part's ts / value (/ sf) columns once.
 func (p *part) decode(ctx context.Context) (*decodedPart, error) {
+	return p.decodeInto(ctx, nil)
+}
+
+// decodeInto decodes the part's columns, reusing reuse's slices as decode destinations when reuse is
+// non-nil (so a pooled buffer of sufficient capacity is filled without allocating). reuse == nil
+// allocates fresh. Returns reuse (mutated) or a new decodedPart.
+func (p *part) decodeInto(ctx context.Context, reuse *decodedPart) (*decodedPart, error) {
+	var tsDst []int64
+
+	var valDst, sfDst []float64
+
+	if reuse != nil {
+		tsDst, valDst, sfDst = reuse.ts[:0], reuse.vals[:0], reuse.sf[:0]
+	}
+
 	tsCol, err := p.reader.Column(ctx, colTs)
 	if err != nil {
 		return nil, err
 	}
 
-	ts, err := tsCol.Int64(nil)
+	ts, err := tsCol.Int64(tsDst)
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +219,7 @@ func (p *part) decode(ctx context.Context) (*decodedPart, error) {
 		return nil, err
 	}
 
-	vals, err := valCol.Float64(nil)
+	vals, err := valCol.Float64(valDst)
 	if err != nil {
 		return nil, err
 	}
@@ -213,12 +232,18 @@ func (p *part) decode(ctx context.Context) (*decodedPart, error) {
 			return nil, err
 		}
 
-		if sf, err = sfCol.Float64(nil); err != nil {
+		if sf, err = sfCol.Float64(sfDst); err != nil {
 			return nil, err
 		}
 	}
 
-	return &decodedPart{ts: ts, vals: vals, sf: sf}, nil
+	if reuse == nil {
+		return &decodedPart{ts: ts, vals: vals, sf: sf}, nil
+	}
+
+	reuse.ts, reuse.vals, reuse.sf = ts, vals, sf
+
+	return reuse, nil
 }
 
 // mergeSeriesInto adds series row-range rng's samples within [start, end] to m, slicing the

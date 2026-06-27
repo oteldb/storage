@@ -68,6 +68,10 @@ type Engine struct {
 	walB *walBatch
 	// decodeCache memoizes decoded part columns across fetches (LRU); nil ⇒ decode every fetch.
 	decodeCache *decodeCache
+	// decPool recycles decodedPart column buffers on the no-cross-fetch-cache path: a fetch borrows
+	// them to decode a part and returns them on releaseParts (safe — the merge copies values out, so
+	// no result aliases them). This kills the per-query decode-buffer allocation (chunk.resize).
+	decPool sync.Pool
 }
 
 var _ fetch.Fetcher = (*Engine)(nil)
@@ -79,6 +83,8 @@ func New(cfg Config) *Engine {
 	}
 
 	e := &Engine{cfg: cfg, head: newHead()}
+	e.decPool.New = func() any { return &decodedPart{} }
+
 	if cfg.WAL != nil {
 		e.walB = newWALBatch()
 	}
@@ -348,6 +354,7 @@ type enginePlan struct {
 	liveParts  []*part
 	decoded    partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
 	decodeFn   decodeFunc      // how a part is decoded on a per-fetch miss (cache-aware)
+	engine     *Engine         // for returning pooled decode buffers on release
 	start, end int64
 }
 
@@ -385,6 +392,16 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 func (p *enginePlan) releaseParts() {
 	for _, part := range p.liveParts {
 		part.release()
+	}
+
+	// Return pooled decode buffers (no-cross-fetch-cache path). The merge has already copied the
+	// values out into the result batches, so these slices are dead and safe to recycle.
+	for _, dp := range p.decoded {
+		if dp.pooled {
+			dp.pooled = false
+			dp.ts, dp.vals, dp.sf = dp.ts[:0], dp.vals[:0], dp.sf[:0]
+			p.engine.decPool.Put(dp)
+		}
 	}
 }
 
@@ -748,7 +765,21 @@ func (e *Engine) publishLocked(ctx context.Context) error {
 // (immutable) decoded columns; a miss decodes and caches them. Without a cache it decodes plainly.
 func (e *Engine) decodeOf(ctx context.Context, p *part) (*decodedPart, error) {
 	if e.decodeCache == nil {
-		return p.decode(ctx)
+		// No cross-fetch cache: borrow buffers from the pool, decode into them, and mark the result
+		// pooled so the fetch returns it on releaseParts. The merge copies values out, so the buffers
+		// are free to reuse once the fetch ends.
+		dp := e.decPool.Get().(*decodedPart)
+
+		dp, err := p.decodeInto(ctx, dp)
+		if err != nil {
+			e.decPool.Put(dp)
+
+			return nil, err
+		}
+
+		dp.pooled = true
+
+		return dp, nil
 	}
 
 	if dp, ok := e.decodeCache.get(p.prefix); ok {
@@ -824,6 +855,7 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 		flushB:   make(map[signal.SeriesID]*fetch.Batch, len(ids)),
 		decoded:  make(partDecodeCache),
 		decodeFn: e.decodeOf,
+		engine:   e,
 		start:    r.Start,
 		end:      r.End,
 	}
