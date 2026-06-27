@@ -209,8 +209,57 @@ func BenchmarkGolden(b *testing.B) {
 	b.Run("write/flush", benchGoldenWriteFlush)
 	b.Run("write/concurrent", benchGoldenWriteConcurrent)
 	b.Run("read/fetch_all", benchGoldenFetchAll)
+	b.Run("read/fetch_all_release", benchGoldenFetchAllRelease)
 	b.Run("read/fetch_recent", benchGoldenFetchRecent)
 	b.Run("density", benchGoldenDensity)
+}
+
+// benchGoldenFetchAllRelease is fetch_all where the consumer Releases each batch after use — the
+// realistic embedder pattern (copy out, then release). It measures the Batch.Release buffer pooling:
+// vs fetch_all, the per-query result allocations drop to near zero.
+func benchGoldenFetchAllRelease(b *testing.B) {
+	ctx := context.Background()
+	s, _ := goldenFlushedStore(b)
+	defer func() { _ = s.Close(ctx) }()
+
+	f := s.Fetcher("default")
+	req := fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{goldenMatcher()}, Recycle: true}
+
+	var rows int
+
+	b.SetBytes(goldenLogicalBytes)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		it, err := f.Fetch(ctx, req)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		rows = 0
+
+		for {
+			batch, err := it.Next(ctx)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+
+				b.Fatal(err)
+			}
+
+			rows += len(batch.Timestamps)
+			batch.Release() // done with the batch — recycle its buffers
+		}
+
+		if err := it.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.StopTimer()
+	b.ReportMetric(float64(rows), "rows/op")
 }
 
 func benchGoldenWriteHead(b *testing.B) {

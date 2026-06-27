@@ -78,6 +78,14 @@ type Request struct {
 	// for predicates not expressible as a single-column Match (e.g. a per-record attribute
 	// decoded from the serialized attrs column). It sees the candidate row's materialized Batch.
 	SecondPass func(*Batch) bool
+
+	// Recycle opts the fetch into buffer pooling: the caller promises to call [Batch.Release] on
+	// each returned batch once done with it, so the engine may hand out (and later reuse) pooled
+	// result buffers. Default false — the engine allocates fresh buffers and the caller need not
+	// release (so the non-recycling path takes no pool overhead at all). Misuse (reading a batch
+	// after Release, or not releasing while Recycle is set) only forfeits the reuse, except that
+	// reading after Release is undefined — never do it.
+	Recycle bool
 }
 
 // Condition is one columnar predicate (logs): the rows whose value in column Column satisfy
@@ -116,6 +124,32 @@ type Batch struct {
 	// Columns are the materialized per-record columns (logs); nil for metrics. Each column's
 	// length matches Timestamps. The named layout is the engine's (e.g. severity, body, attrs).
 	Columns []NamedColumn
+
+	// release, when set by the producing fetcher, returns the batch's buffers to a pool. It takes the
+	// batch so the producer can use one shared closure for every batch (no per-batch allocation),
+	// reading the buffers off b. A nil hook (the default) means the GC reclaims, exactly as before.
+	release func(*Batch)
+}
+
+// SetRelease installs the buffer-reclamation hook a producing fetcher uses to pool a batch's
+// backing slices. The producer passes one shared closure (it reads the buffers from the batch), so
+// installing it costs no per-batch allocation. Only the fetcher that allocated the buffers sets it.
+func (b *Batch) SetRelease(fn func(*Batch)) { b.release = fn }
+
+// Release returns the batch's backing buffers to the producer's pool, if it set a hook. It is
+// **opt-in**: a consumer done with a batch may call it to enable reuse; one that never does simply
+// lets the GC reclaim (identical to the pre-hook behavior — no allocation is added to the
+// non-releasing path). After Release the batch and its slices MUST NOT be read or retained. Release
+// is idempotent and safe on a nil-hook batch.
+//
+// Pass-through decorators ([Merge] with one child, split, cluster fan-out) forward the hook
+// unchanged. A decorator that *retains* a batch (the results cache, or a multi-child merge) deep-
+// copies it, so the copy has no hook and the original is safe to release.
+func (b *Batch) Release() {
+	if b.release != nil {
+		b.release(b)
+		b.release = nil
+	}
 }
 
 // ScaleFactor returns sample i's lossy-sampling weight, defaulting to 1 when no sampling occurred
