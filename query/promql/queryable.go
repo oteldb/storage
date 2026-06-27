@@ -105,17 +105,92 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.Select
 	return newSliceSeriesSet(series)
 }
 
-// LabelValues and LabelNames are not yet pushed down; metadata queries return empty. The
-// promql.Engine never calls these for evaluation, only label/metadata APIs do.
-func (q *querier) LabelValues(context.Context, string, *storage.LabelHints, ...*labels.Matcher) ([]string, annotations.Annotations, error) {
-	return nil, nil, nil
+// LabelValues returns the distinct values of name across the series matching matchers over the
+// querier window. It backs the Prometheus /api/v1/label/<name>/values endpoint (and so Grafana's
+// metric/label browser). The promql.Engine never calls it for evaluation.
+func (q *querier) LabelValues(
+	ctx context.Context, name string, _ *storage.LabelHints, matchers ...*labels.Matcher,
+) ([]string, annotations.Annotations, error) {
+	sets, err := q.seriesLabels(ctx, matchers)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	seen := map[string]struct{}{}
+	for _, lset := range sets {
+		if v := lset.Get(name); v != "" {
+			seen[v] = struct{}{}
+		}
+	}
+
+	return sortedKeys(seen), nil, nil
 }
 
-func (q *querier) LabelNames(context.Context, *storage.LabelHints, ...*labels.Matcher) ([]string, annotations.Annotations, error) {
-	return nil, nil, nil
+// LabelNames returns the distinct label names across the series matching matchers over the querier
+// window. It backs the Prometheus /api/v1/labels endpoint.
+func (q *querier) LabelNames(
+	ctx context.Context, _ *storage.LabelHints, matchers ...*labels.Matcher,
+) ([]string, annotations.Annotations, error) {
+	sets, err := q.seriesLabels(ctx, matchers)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	seen := map[string]struct{}{}
+	for _, lset := range sets {
+		lset.Range(func(l labels.Label) { seen[l.Name] = struct{}{} })
+	}
+
+	return sortedKeys(seen), nil, nil
 }
 
 func (q *querier) Close() error { return nil }
+
+// seriesLabels fetches the matching series over the querier window and projects each to its
+// Prometheus label set. It mirrors Select's matching (push the index-safe matchers, then re-check
+// every series against the full set) but keeps only the identities, not the samples.
+func (q *querier) seriesLabels(ctx context.Context, matchers []*labels.Matcher) ([]labels.Labels, error) {
+	req := fetch.Request{
+		Tenant:   q.tenant,
+		Start:    msToNsClamp(q.mint, math.MinInt64),
+		End:      msToNsClamp(q.maxt, math.MaxInt64),
+		Matchers: pushableMatchers(matchers),
+	}
+
+	it, err := q.fetcher.Fetch(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	batches, err := fetch.Drain(ctx, it)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]labels.Labels, 0, len(batches))
+	for _, b := range batches {
+		lset := promLabels(b.Series)
+		if !matchesAll(lset, matchers) {
+			continue
+		}
+
+		out = append(out, lset)
+	}
+
+	return out, nil
+}
+
+// sortedKeys returns the keys of set in sorted order (Prometheus label APIs return sorted results).
+func sortedKeys(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+
+	sort.Strings(out)
+
+	return out
+}
 
 // pushableMatchers returns fetch matchers for the index-safe subset: matchers that do not
 // match the empty string. A matcher that matches "" (negated/absent) cannot prune via the
