@@ -802,10 +802,18 @@ noop provider — so an unconfigured store spans, logs, and counts nothing and p
   plus flush/merge/fetch/backend/WAL latency+throughput. Instruments fire at **operation
   granularity only** (flush, merge, fetch, RPC, WAL append/fsync/rotate) — **never per-sample or
   per-row**, preserving the zero-alloc hot path.
-- **Logging.** zap fires at the same coarse boundaries: `storage opened`/`storage closed`,
-  per-engine `flushed head to part` / `merged parts` (Debug; Error on failure), cluster member
-  join/leave + ring rebuild (Info), and `admission shed writes` (Warn, only when overload control
-  rejects). No per-sample logging.
+- **Logging.** zap is plumbed through the **context** with `github.com/go-faster/sdk/zctx`: each
+  operation seeds the injected logger as the zctx base (`obs.Obs.Base`) before starting its span,
+  and every layer below retrieves a logger with `zctx.From(ctx)` / `obs.Obs.Logger(ctx)` — so log
+  lines automatically carry the active span's `trace_id`/`span_id` and a layer needs no logger
+  handle of its own, only the ctx. Debug fires at each layer boundary (facade `write start`/`done`,
+  `query fetch`, engine/recordengine `fetch start`/`done` + `flush`/`merge`, `backend read/write/
+  cas/list/delete`, WAL `segment opened`/`rotate`/`checkpoint`, cluster `primary-write send`/
+  `received`); Info on lifecycle (`storage opened`/`closed`, member join/leave + ring rebuild,
+  cluster join); Warn on `admission shed writes` (only when overload control rejects); Error on
+  operation failure. All at operation granularity — **no per-sample logging**. The two background
+  components without a request ctx (the etcd membership watch, the WAL writer) take the logger
+  directly via `SetLogger`.
 - **EXPLAIN ANALYZE** (`query/profile`). Opt-in per query via `profile.WithCollector(ctx)`:
   operators call `profile.Begin(ctx, name)` to push a timed node onto a concurrency-safe tree
   (nil collector ⇒ no-op, the default). A fetch yields `query → engine.fetch →
@@ -932,10 +940,13 @@ These hold in the implemented code and must be preserved by changes:
   backend.
 - **Injected, no-op-default observability.** The library never owns a global logger, tracer, or
   meter — they arrive through `Options` and are no-op unless the embedder configures them, so the
-  default path pays no overhead. Telemetry fires at **operation granularity** (flush/merge/fetch/
-  RPC/WAL), never per-sample or per-row; this is what keeps the zero-alloc invariant intact. Only
-  the OTel **API** is imported (the embedder owns the SDK). EXPLAIN ANALYZE is ctx-threaded and
-  no-op without a collector (§3l).
+  default path pays no overhead. Logging is plumbed through the **context** (`go-faster/sdk/zctx`):
+  seed the injected logger as the base at an operation entry, then `zctx.From(ctx)` below returns a
+  trace-correlated logger — never store a logger on a long-lived struct except the two ctx-less
+  background components (membership watch, WAL writer). Telemetry fires at **operation granularity**
+  (flush/merge/fetch/RPC/WAL), never per-sample or per-row; this is what keeps the zero-alloc
+  invariant intact. Only the OTel **API** is imported (the embedder owns the SDK). EXPLAIN ANALYZE
+  is ctx-threaded and no-op without a collector (§3l).
 - **Stable formats.** The `Codec` enum, the per-stream header, each codec's framing, the
   part formats (manifest `OTPM`, marks `OTMK`, per-column object framing, the
   `{prefix}/manifest|marks|c/{i}` key layout), the **attribute hash/binary encoding** (the
@@ -968,7 +979,7 @@ encoding/             umbrella doc for the codec layers
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
 internal/simd         vectorized columnar kernels (AVX2) + pure-Go fallback + runtime CPU dispatch [implemented: int64 min/max]
 internal/cmd/gensimd  avo generator for internal/simd's committed *_amd64.s (//go:generate)   [implemented]
-internal/obs          injected observability handle: zap logger + OTel tracer + per-layer metric instruments (admission/flush/merge/fetch/backend/WAL) + W3C trace propagation; no-op default [implemented]
+internal/obs          injected observability handle: zap logger (context-plumbed via go-faster/sdk/zctx, trace-correlated) + OTel tracer + per-layer metric instruments (admission/flush/merge/fetch/backend/WAL) + W3C trace propagation; no-op default [implemented]
 signal/               typed Attributes/Value, Resource/Scope/Series identity, 128-bit SeriesID, Signal, TenantID, Aggregation [implemented]
   signal/metric       []byte-based OTLP-shaped Metrics ingest batch (resettable/pooled) + identity + projection (gauge/sum; histogram/exp-histogram/summary via classic decomposition in otlp/pdataconv) [implemented]
   signal/log          []byte-based OTLP-shaped Logs ingest batch (resettable/pooled) + stream identity + projection [implemented]
