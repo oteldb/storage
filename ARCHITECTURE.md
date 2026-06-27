@@ -293,9 +293,11 @@ The L3 indexing layer maps query matchers to the series that satisfy them.
 
 CRC-framed records (`[uvarint len][type][payload][CRC32C]`) appended to numbered segment
 files (`SegmentWriter`, rotating at a size limit). Record types: a **series** record (`SeriesID`
-+ typed attribute encoding), a **samples** record (metrics), an opaque **records** payload (the
-record signals), and an opaque **side** record (a content-addressed side-store delta — the profiles
-symbol store). `ReplayDir` stitches segments in order; replay tolerates a torn final record (crash
++ typed attribute encoding), a **samples** record (metrics), a **scale-factor samples** record
+(metrics that carry per-sample lossy-sampling weights, written only when sampling occurred — see
+§3k), an opaque **records** payload (the record signals), and an opaque **side** record (a
+content-addressed side-store delta — the profiles symbol store). `ReplayDir` stitches segments in
+order; replay tolerates a torn final record (crash
 recovery), surfaces a bad-CRC complete record as corruption, and skips unknown record types
 (forward-compat). Replaying the log rebuilds the symbols + series + postings index and the head —
 the path that reconstructs unflushed state after a restart.
@@ -644,9 +646,13 @@ shard whose owner set changed, the IDs added and removed. Because the data is in
 object store, a reassignment is an **ownership handoff** (the gainer starts serving the shard's
 parts from S3 via the bucket index; the loser stops), not a copy — and HRW guarantees only the
 ~1/N shards that actually moved appear, each one-in/one-out. The etcd-coordinated handoff that
-makes exactly one node compact a shard at a time **is** built (the compaction-claim executor,
-§3j), but it reconciles ownership **directly from the ring** — so `Plan` is a pure diff that the
-executor does **not** yet consume; the minimal-move diff is currently informational only.
+makes exactly one node compact a shard at a time is the compaction-claim executor (§3j). That
+executor is now **event-driven and minimal-move**: it tracks the claims it holds and on each
+pass issues an etcd write only for a shard whose ring-primary actually changed (steady state is
+zero round-trips), and it **records the `rebalance.Plan` it enacted** at each ring change
+(`Ownership.LastPlan`) so an operator can preview what moved. `Plan` is therefore no longer
+informational-only — it is the published handoff record (and the same pure diff a preview API
+can compute against two rings).
 
 **The cluster write path is primary-authoritative.** A write is framed as `EncodeWrite`
 (tenant ‖ WAL-encoded series+samples) and routed to the tenant's **ring-primary** — the single
@@ -696,14 +702,20 @@ contract permits) and the requesting node **re-applies the matchers** (their clo
 there). A three-node, RF=2 end-to-end test confirms a query on a non-owner returns the data.
 
 **Rebalance executor** (`cluster/etcd/ownership.go`): the handoff is enacted via **exclusive
-compaction claims derived directly from the ring** — `Reconcile` does **not** consume
-`rebalance.Plan` (that minimal-move diff is built but currently unwired; §3i). `Ownership.Acquire`
-is an etcd CAS (create-if-absent) bound to the node's membership lease; `Reconcile(ring, shards)`
-acquires every shard the node is the ring-primary of and releases the rest, returning the owned set. In
-cluster mode the maintenance loop flushes/merges **only owned tenants**, so a tenant's parts are
-written to the shared object store by exactly one node — even during ring-disagreement windows,
-the claim arbitrates. A departed node's claims auto-free with its lease and the new primary
-takes over (tested via lease revoke). A two-node test confirms only the primary compacts.
+compaction claims**. `Ownership.Acquire` is an etcd CAS (create-if-absent) bound to the node's
+membership lease; `Reconcile(ring, shards)` is **stateful and minimal-move** — it tracks the
+shards it currently holds, computes the wanted set by in-memory ring-primary lookups (no etcd),
+and issues an etcd write only to acquire a wanted-but-unheld shard or release a held-but-unwanted
+one. Steady state (unchanged ring, no new tenants) is therefore **zero etcd round-trips** instead
+of one acquire/release per shard per tick; retrying the wanted-but-unheld acquires every pass is
+what converges a handoff once the prior owner releases. It returns the full owned set and, on a
+ring change, records the enacted `rebalance.Plan` (`Ownership.LastPlan`, rf=1 primary handoffs)
+for operator preview. In cluster mode the maintenance loop flushes/merges **only owned tenants**,
+so a tenant's parts are written to the shared object store by exactly one node — even during
+ring-disagreement windows, the claim arbitrates. A departed node's claims auto-free with its
+lease and the new primary takes over (tested via lease revoke). A two-node test confirms only the
+primary compacts; another confirms steady-state reconcile is a no-op and a node removal produces
+the expected one-in/one-out handoff plan.
 
 **Matcher pushdown.** Most matchers are opaque closures, but **equality** is exact and
 serializable, so `fetch.Matcher` carries an optional `Spec *EqualMatcher` (the PromQL adapter
@@ -886,12 +898,21 @@ read seam as **`fetch.Batch.ScaleFactors`** (nil when unsampled;
 `Batch.ScaleFactor(i)` reads it with the default-1). The library only *carries* the weight; honoring
 it in aggregation is the embedder's job (a gauge read ignores it).
 
-Scope today: **all four signals, single-node** ingest (budgeted sampling is metrics-only). Not yet
-built (the rest of §8a): the **cardinality budget with hysteresis / `__overflow__` routing** (the cap
-is a hard reject, not yet a soft budget), the clustered **central→edge budget feedback**, **WAL
-persistence of the scale factor** (so a crash recovers unflushed *sampled* data as weight 1 — a
-narrow window), and admission on the **clustered write path** (the primary applies only the OOO check
-today). `MaxPartSize` is also not yet enforced.
+Scope today: **all four signals**, single-node *and* clustered. The **clustered write path applies
+the lossless valves**: the ingest-rate valve runs at the origin (per real tenant, so each node
+rate-limits its own ingest, like the single-node path), and the cardinality + in-flight-memory valves
+run on the **shard primary** — the single authority for the shard — inside
+`engine`/`recordengine.ApplyPrimary`, which now takes the tenant's `AppendLimits` and returns a
+per-reason `AppendResult`. That breakdown rides the primary-write RPC back to the origin
+(`primaryReject` = ooo ‖ cardinality ‖ inflight), so clustered ingest reports the same per-reason
+`Accepted{Rejected, RejectedReason}` as single-node. Budgeted (lossy) sampling stays **metrics-only,
+single-node** — but its scale factor is now **WAL-durable**: a sampled batch logs its per-sample
+weights via a dedicated `recordSamplesSF` WAL frame, and replay restores them, so a crash recovers
+unflushed *sampled* data at its representative weight rather than weight 1 (the unsampled path keeps
+the original no-sf frame, byte-for-byte). Not yet built (the rest of §8a): the **cardinality budget
+with hysteresis / `__overflow__` routing** (the cap is a hard reject, not yet a soft budget) and the
+clustered **central→edge budget feedback** (each node's rate valve sees only its own traffic).
+`MaxPartSize` is also not yet enforced.
 
 ---
 
@@ -956,8 +977,9 @@ lives entirely off the data plane's hot path.
 - **Idempotent reads hedge.** The cluster read fan-out (`hedgedFetcher`, replacing the old
   sequential failover) races a request across a shard's replica owners — first owner immediately, a
   second once it is slow or errors — so a single slow/stuck/down owner no longer dictates latency or
-  fails the read. The profile-enumeration RPCs (series listing and symbol-store fetch) hedge across
-  owners the same way. The S3 backend hedges `GetObject` (a slow GET is re-issued on a fresh
+  fails the read. The record-signal enumeration RPCs — series listing (`LogSeries`/`TraceSeries`/
+  profile series), attribute-key listing (`LogKeys`), and the profile symbol-store fetch — hedge
+  across owners the same way. The S3 backend hedges `GetObject` (a slow GET is re-issued on a fresh
   connection) and never retries a genuine not-found.
 - **Per-attempt timeouts everywhere.** Every attempt is bounded by `PerTryTimeout` via context (not
   `http.Client.Timeout`, which would abort a request the hedge layer still wants to race); the
@@ -1000,7 +1022,11 @@ query-language path stays in the embedder. The `Write*` methods take the library
   merges every metric, log, trace, and profile engine, applying per-tenant retention from the resolved policy.
   Engines are independent per-tenant/per-signal shards, so the loop **fans the flush/merge (and the
   background WAL fsyncs) out concurrently** under a bound (`WithMaintenanceConcurrency`, default
-  CPU-derived) via `internal/parallel` rather than walking them sequentially. `Reset(ctx)`
+  CPU-derived) via `internal/parallel` rather than walking them sequentially. The work list is
+  **ordered by flush pressure (head bytes) descending** and `parallel.ForEach` dispatches in index
+  order, so the fullest heads flush first — fair scheduling that keeps one noisy tenant from delaying
+  others' relief and drains the most in-flight memory soonest (every engine is still serviced each
+  cycle; ordering is a within-cycle priority, not a cap). `Reset(ctx)`
   discards all ingested data (every engine's head + flushed parts), retaining the engines
   for reuse; it is gated to an **ephemeral backend** (`ErrNotEphemeral` otherwise) and is
   meant for tests/benchmarks that reuse one store across runs. `Fetcher(tenants...)` is the
@@ -1024,8 +1050,11 @@ query-language path stays in the embedder. The `Write*` methods take the library
   and carry columns); a query supplies stream `Matchers` plus record `Conditions`. Two
   enumeration primitives sit alongside it: **`LogSeries(ctx, tenant, matchers, window)`** (matching
   stream identities) and **`LogKeys(ctx, tenant, window)`** (distinct attribute keys with their
-  `KeyScope` bitset — the only way to see and push down per-record attribute label names). Both are
-  node-local today; cluster fan-out is a follow-up.
+  `KeyScope` bitset — the only way to see and push down per-record attribute label names). Both
+  **fan out in cluster mode** (a non-owner serves them from an owner, hedged), over the shared
+  signal-dispatched enumeration RPCs (`cluster.SeriesPath` for `LogSeries`/`TraceSeries`, the new
+  `cluster.KeysPath` for `LogKeys`); `LogSeries` re-applies non-equality matchers to the owner's
+  superset, and `LogKeys` takes the first owner's reply (each owner is a complete replica).
   **`TraceFetcher(tenants...)`** is the identical seam over the trace engines, and
   **`Trace(ctx, tenant, traceID)`** is the trace-by-id convenience: it issues a fetch with an
   equality `Condition` on the `trace_id` column (pruned by that column's equality bloom) and returns
@@ -1035,6 +1064,24 @@ query-language path stays in the embedder. The `Write*` methods take the library
   **`ProfileResolver(ctx, tenant)`** (stack-id → frames, for flamegraphs) and
   **`ProfileSeries(ctx, tenant, matchers, window)`** (stream enumeration, for profile-type/label
   listing) — together enough to back an embedder's Pyroscope/ProfileQL querier.
+- **`Inspect() StoreStats`** (`inspect.go`) — a pull-based, **in-memory** snapshot of store state for
+  an embedder's CLI/UI dashboard (and debugging): per tenant, a per-signal breakdown (series/stream
+  count, head items + bytes, flushed part count, data time span) plus the tenant's cumulative
+  admission tally; the read-path decode-cache totals; and, in cluster mode, this node's address, the
+  live membership, the shards it holds a compaction claim on, and the last enacted rebalance plan. It
+  does **no backend I/O and decodes nothing** (it takes only a brief per-engine read lock to copy
+  counters), so it never touches the ingest/query hot path — poll it at dashboard cadence. On-disk
+  part *byte* sizes are intentionally omitted (they would need backend stat calls); it is a counts +
+  time-span + state view. Backed by `engine.Stats` / `recordengine.Stats` (per-engine snapshots) and
+  the cluster `Ownership.Owned`/`LastPlan` accessors.
+- **`Admin()` → `Admin`** (`admin.go`) — the imperative operator-control surface complementing the
+  background maintenance loop: `Flush(ctx, key, signal)` drains a head to a part, `Compact(ctx, key,
+  signal)` merges its parts (reusing the loop's resolved policy — the one merge engine, no parallel
+  path), `Retention(ctx, key)` compacts every signal for a tenant, `Rebalance(ctx)` reconciles
+  ownership immediately, and `MaintainNow(ctx)` runs a full cycle. In cluster mode flush/compact are
+  gated to the shard's **ring-primary** (else `ErrNotOwner`), preserving the single-writer-per-shard
+  invariant; single-node owns everything. The `key` is the engine key (tenant id, or a metric shard
+  key under `ShardsPerTenant > 1`).
 - **`Options` / `Option`** (`options.go`) — config struct plus functional options
   (`WithBackend`, `WithCluster`, `WithTenancy`, `WithEncoding`, `WithDurability`,
   `WithWALDir`, `WithWALSync`, `WithWALSyncInterval`, `WithFlushThresholdBytes`, `WithFlushInterval`,
@@ -1107,7 +1154,8 @@ These hold in the implemented code and must be preserved by changes:
   part formats (manifest `OTPM`, marks `OTMK`, per-column object framing, the
   `{prefix}/manifest|marks|c/{i}` key layout), the **attribute hash/binary encoding** (the
   SeriesID pre-image), the **symbol table** (`OTSY`), the **WAL record framing** (series, sample,
-  records, and side frames), the **record-key footer** (`OTKY`, the per-part `keys.bin` distinct
+  scale-factor sample, records, and side frames — record types are additive, so an old reader skips
+  an unknown type), the **record-key footer** (`OTKY`, the per-part `keys.bin` distinct
   record-attribute keys), the **metric part column layout** (`[series:int128, ts:int64,
   value:float64]` sorted by `(series, ts)`, plus an **optional 4th `sf:float64`** scale-factor column
   present only when lossy sampling occurred — §3k), and the **profile symbol-store table** (`OTSP`, the
@@ -1151,7 +1199,9 @@ death (lease revoke) hands all of its shards to the survivors with none left orp
 
 ```
 .                     storage facade: Storage, Open/InMemory, Options, per-tenant engines, maintenance loop [implemented: metrics+logs+traces+profiles ingest+read; query-lang in embedder]
-  admission.go        per-tenant admission control: ingest-rate token bucket + AdmissionStats meta-metrics (§3k) [implemented: metrics, single-node]
+  admission.go        per-tenant admission control: ingest-rate token bucket + AdmissionStats meta-metrics (§3k) [implemented: all signals; rate at origin + cardinality/in-flight on the shard primary in cluster mode]
+  inspect.go          Inspect() StoreStats: in-memory pull snapshot (per-tenant/signal counts+time-span, admission, decode cache, cluster membership/ownership) for a dashboard/CLI [implemented]
+  admin.go            Admin(): on-demand Flush/Compact/Retention/Rebalance/MaintainNow; cluster flush/compact gated to the shard's ring-primary (ErrNotOwner) [implemented]
 encoding/             umbrella doc for the codec layers
   encoding/bitstream  MSB-first bit Writer/Reader                                      [implemented]
   encoding/chunk      DoD / Gorilla / T64 / dict / bytesraw / decimal / id128 column codecs [implemented]
@@ -1176,7 +1226,7 @@ backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + m
 block/                immutable columnar part format: column/marks/manifest/part        [implemented]
 index/                symbols (intern) · series (id↔attrs) · postings (set-ops/matchers) [implemented]
   index/bloom         token bloom filter (no false negatives) + tokenizer: full-text + attr/equality pruning [implemented]
-wal/                  CRC-framed segmented WAL: samples + opaque records + side delta, resume + checkpoint (truncate-on-flush), facade-wired durability [implemented]
+wal/                  CRC-framed segmented WAL: samples (+ scale-factor samples) + opaque records + side delta, resume + checkpoint (truncate-on-flush), facade-wired durability [implemented]
 engine/               head · flush · background-merge · retention · downsampling · recompression · admission limits · fetch (metrics) [implemented]
 recordengine/         shared schema-driven record engine (logs+traces+profiles): head · flush · merge · fetch · conditions · per-column blooms · optional content-addressed side store [implemented]
 query/fetch           dual-shape fetch contract (Matchers + Conditions/Projection/SecondPass) [implemented for metrics + logs + traces + profiles; the library's query surface]
