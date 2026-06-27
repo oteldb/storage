@@ -102,8 +102,10 @@ func DecodeFloatsDecimal(dst []float64, src []byte) ([]float64, int, error) {
 		return dst, 0, err
 	}
 
-	scaled := make([]int64, rows)
-	scaled[0] = v0
+	// Accumulate the nearest-delta scaled value and convert to float in one pass, straight into dst —
+	// no per-decode int64 scratch (it was a top read-path allocation).
+	cur := v0
+	dst[0] = decimalToFloat(cur, exp)
 
 	for i := 1; i < rows; i++ {
 		d, err := r.ReadVarint()
@@ -111,12 +113,8 @@ func DecodeFloatsDecimal(dst []float64, src []byte) ([]float64, int, error) {
 			return dst, 0, err
 		}
 
-		scaled[i] = scaled[i-1] + d
-	}
-
-	// Convert back to floats.
-	for i, v := range scaled {
-		dst[i] = decimalToFloat(v, exp)
+		cur += d
+		dst[i] = decimalToFloat(cur, exp)
 	}
 
 	_ = precisionBits // precision only affects encoding (lossy); decode is the same
