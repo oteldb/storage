@@ -119,7 +119,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 		// predates the respective cutoff). Both are age-tiered and decided from the merged part's
 		// newest sample so the choice is deterministic.
 		if err := writePart(ctx, e.cfg.Backend, prefix, cols,
-			coldProfile(opts.Recompress, maxT), pickPrecision(opts.Precision, maxT)); err != nil {
+			coldProfile(opts.Recompress, maxT), pickPrecision(opts.Precision, maxT), e.cfg.AggregateStats); err != nil {
 			return 0, err
 		}
 

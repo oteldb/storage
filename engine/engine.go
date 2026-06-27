@@ -40,6 +40,11 @@ type Config struct {
 	// bytes (LRU). It skips the column re-decode that the backend read cache cannot, and applies to
 	// every backend (a decode is CPU even when the read is RAM-fast). Zero disables it.
 	DecodeCacheBytes int64
+	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each part,
+	// so [Engine.AggregateRange] answers a range-covering aggregate from it without decoding the
+	// value column. It costs a little storage per series; off by default. AggregateRange works
+	// without it (via decoding), just without the fast path.
+	AggregateStats bool
 }
 
 // Engine is a single tenant's storage engine. Safe for concurrent use.
@@ -639,7 +644,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	rows := len(cols.ts)
 	prefix := e.partPrefix(seq)
 
-	if err := writePart(ctx, e.cfg.Backend, prefix, cols, nil, 0); err != nil {
+	if err := writePart(ctx, e.cfg.Backend, prefix, cols, nil, 0, e.cfg.AggregateStats); err != nil {
 		return 0, err
 	}
 

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"slices"
+	"sync"
 	"sync/atomic"
 
 	"github.com/oteldb/storage/backend"
@@ -34,9 +35,16 @@ type rowRange struct{ start, end int }
 // scanning the series column once on open.
 type part struct {
 	reader *block.PartReader
+	be     backend.Backend // for lazily loading the aggregate-pushdown stats sidecar
 	prefix string
 	ranges map[signal.SeriesID]rowRange
 	hasSF  bool // the part carries a scale-factor column (sampling occurred); else every weight is 1
+
+	// statsOnce lazily loads the per-series aggregate sidecar (statsKey) on first aggregate query;
+	// stats is nil when the sidecar is absent/corrupt or the part is sampled, signaling the
+	// aggregate path to fall back to decoding this part.
+	statsOnce sync.Once
+	stats     map[signal.SeriesID]SeriesAgg
 
 	// minTime, maxTime are the inclusive unix-ns sample bounds of the part, recorded in the
 	// bucket index for time pruning. Set from the flush/merge columns when written and from
@@ -99,7 +107,34 @@ func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, err
 		i = j
 	}
 
-	return &part{reader: r, prefix: prefix, ranges: ranges, hasSF: slices.Contains(r.ColumnNames(), colSF)}, nil
+	return &part{reader: r, be: b, prefix: prefix, ranges: ranges, hasSF: slices.Contains(r.ColumnNames(), colSF)}, nil
+}
+
+// seriesStat returns id's precomputed aggregate from the part's stats sidecar, lazily loading it.
+// ok is false when the sidecar is absent, corrupt, or the part is sampled — the caller then decodes.
+func (p *part) seriesStat(ctx context.Context, id signal.SeriesID) (SeriesAgg, bool) {
+	p.statsOnce.Do(func() {
+		if p.be == nil || p.hasSF {
+			return
+		}
+
+		data, err := p.be.Read(ctx, statsKey(p.prefix))
+		if err != nil {
+			return // absent ⇒ fall back to decode
+		}
+
+		if m, err := decodeSeriesStats(data); err == nil {
+			p.stats = m
+		}
+	})
+
+	if p.stats == nil {
+		return SeriesAgg{}, false
+	}
+
+	a, ok := p.stats[id]
+
+	return a, ok
 }
 
 // compressedWith returns the block-compression algorithm the part's value column was written with

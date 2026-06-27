@@ -467,7 +467,19 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   concurrent fetches. It eliminates the re-decode the object-store read cache (§3a) cannot. With
   the cache on, a fetch also **prefetches** the parts it will touch — decoding them concurrently
   (bounded fan-out) so their backend reads + decodes overlap instead of running one part at a time
-  during the merge. `Close` flushes the head. `Reset(ctx)` is the inverse of accumulation: it replaces
+  during the merge. `Close` flushes the head.
+- **Aggregate pushdown** (`aggregate.go`, `seriesstats.go`) — `AggregateRange` returns a per-series
+  `SeriesAgg` (count/sum/min/max → avg) over a window. With `Config.AggregateStats` (opt-in,
+  exposed as `WithAggregateStats` / `Storage.AggregateMetrics`), each part writes a small **stats
+  sidecar** (`{prefix}/stats`: per-series count/sum/min/max, CRC-guarded, deleted with the part) at
+  flush/merge. A range that **fully covers** a part folds its sidecar **without decoding the value
+  column** — one number per series instead of every sample. It is taken only when provably exact:
+  in-window parts must be fully covered *and* pairwise time-disjoint (plus head newer), so a
+  timestamp can't be double-counted; otherwise (partial range, overlapping parts, a sampled/
+  sidecar-less part) it falls back to decode + merge, which dedups. The sidecar is a derived
+  optimization — absent/corrupt ⇒ decode — so it carries no golden/format-stability burden. Off by
+  default (it costs a little per-series storage); a full-range aggregate is **~30× faster and ~19×
+  lighter** than fetch-and-fold when on. `Reset(ctx)` is the inverse of accumulation: it replaces
   the head with an empty one, drops the part handles, and deletes this engine's part objects
   from the backend (scoped to `{Prefix}/`), returning the engine to its `New` state for
   reuse (tests/benchmarks) without reallocating it.

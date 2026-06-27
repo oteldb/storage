@@ -91,7 +91,10 @@ const (
 // rewrites the part with a higher-ratio compression profile (recompression of cold data); nil
 // keeps the default codec-only framing. precisionBits in 1..63 encodes the value column lossily
 // (age-tiered precision, set by the merge engine for cold data); 0 keeps it lossless.
-func writePart(ctx context.Context, b backend.Backend, prefix string, cols *flushColumns, comp *RecompressSpec, precisionBits uint8) error {
+func writePart(
+	ctx context.Context, b backend.Backend, prefix string, cols *flushColumns,
+	comp *RecompressSpec, precisionBits uint8, writeStats bool,
+) error {
 	opts := []block.PartOption{block.WithSortKey(colTs)}
 	if comp != nil {
 		opts = append(opts, block.WithCompression(comp.Algorithm), block.WithCompressionLevel(comp.Level))
@@ -131,8 +134,23 @@ func writePart(ctx context.Context, b backend.Backend, prefix string, cols *flus
 		return errors.Wrapf(err, "write part %q", prefix)
 	}
 
+	// Aggregate-pushdown sidecar: per-series count/sum/min/max over the value column, so a query
+	// whose range fully covers this part answers from it without decoding the column. Opt-in (it
+	// costs a little storage per series) and written only for an unsampled part (raw values); a
+	// sampled part falls back to the weighted decode path.
+	if writeStats && cols.sf == nil {
+		ids, stats := computeSeriesStats(cols)
+		if err := b.Write(ctx, statsKey(prefix), encodeSeriesStats(ids, stats)); err != nil {
+			return errors.Wrapf(err, "write stats sidecar %q", prefix)
+		}
+	}
+
 	return nil
 }
+
+// statsKey is the backend key of a part's aggregate-pushdown sidecar (deleted with the part, since
+// deletePart lists and removes everything under the prefix).
+func statsKey(prefix string) string { return prefix + "/stats" }
 
 // partPrefix is the backend key prefix of the seq-th part of this engine.
 func (e *Engine) partPrefix(seq int) string {

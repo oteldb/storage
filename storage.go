@@ -478,6 +478,26 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 	return seedFetcher{inner: s.scaleWrap(s.baseFetcher(tenants), tenants), obs: s.obs, signal: signal.Metric.String()}
 }
 
+// AggregateMetrics returns a per-series aggregate (count/sum/min/max — enough for avg) of one
+// tenant's metric series over the request window: the storage-side aggregate pushdown. With
+// [WithAggregateStats] it answers a range-covering aggregate from precomputed per-part stats without
+// decoding the value column — one row per series instead of every sample — and otherwise decodes.
+// An embedder's PromQL engine can use it to evaluate `*_over_time` cheaply.
+//
+// Single-node: it queries the local tenant engine and does not yet fan out across cluster shards.
+func (s *Storage) AggregateMetrics(ctx context.Context, t signal.TenantID, r fetch.Request) (map[signal.SeriesID]engine.SeriesAgg, error) {
+	if s.closed.Load() {
+		return map[signal.SeriesID]engine.SeriesAgg{}, nil
+	}
+
+	eng, ok := s.lookupEngine(s.normalizeTenant(t))
+	if !ok {
+		return map[signal.SeriesID]engine.SeriesAgg{}, nil
+	}
+
+	return eng.AggregateRange(ctx, r)
+}
+
 // seedFetcher is the outermost read wrapper: it installs the injected logger as the zctx base so
 // every downstream fetcher (fan-out, remote, engine) can log a trace-correlated line, and emits one
 // Debug at the query boundary. It does not touch the request.
@@ -806,6 +826,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		WAL:              w,
 		Obs:              s.obs,
 		DecodeCacheBytes: s.opts.DecodeCacheBytes,
+		AggregateStats:   s.opts.AggregateStats,
 	})
 	s.tenants[tid] = e
 

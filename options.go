@@ -73,6 +73,12 @@ type Options struct {
 	// RAM-fast). With it, a fetch also prefetches its parts' decodes concurrently. Zero disables it.
 	DecodeCacheBytes int64
 
+	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each metric
+	// part, so [Storage.AggregateMetrics] answers a range-covering aggregate without decoding the
+	// value column — returning one number per series instead of every sample. It costs a little
+	// storage per series; off by default. AggregateMetrics works without it (by decoding).
+	AggregateStats bool
+
 	// FlushInterval is the max age of unflushed head data. Zero ⇒ default.
 	// (Resolved into a duration internally to keep the API import-light.)
 	FlushInterval int64 // nanoseconds
@@ -222,6 +228,10 @@ func WithReadCache(maxBytes int64) Option { return func(o *Options) { o.ReadCach
 func WithDecodeCache(maxBytes int64) Option {
 	return func(o *Options) { o.DecodeCacheBytes = maxBytes }
 }
+
+// WithAggregateStats writes the per-series aggregate sidecar that lets [Storage.AggregateMetrics]
+// answer range-covering aggregates without decoding. See [Options.AggregateStats].
+func WithAggregateStats() Option { return func(o *Options) { o.AggregateStats = true } }
 
 // WithFlushInterval sets the head flush time interval in nanoseconds.
 func WithFlushInterval(ns int64) Option { return func(o *Options) { o.FlushInterval = ns } }
