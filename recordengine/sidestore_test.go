@@ -170,9 +170,9 @@ func TestSideStoreReplicates(t *testing.T) {
 	b := mkBatch("api", rrec{ts: 1, body: "x"})
 	b.Side = encodeSide(map[uint64][]byte{1: []byte("a"), 2: []byte("b")})
 
-	accepted, rejected, err := primary.ApplyPrimary(recordengine.EncodeWAL(b))
+	accepted, res, err := primary.ApplyPrimary(recordengine.EncodeWAL(b), recordengine.AppendLimits{})
 	require.NoError(t, err)
-	require.Zero(t, rejected)
+	require.Zero(t, res.Rejected())
 	require.NoError(t, secondary.ApplyReplicated(accepted))
 
 	want := []uint64{1, 2}

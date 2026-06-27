@@ -16,11 +16,11 @@ func TestApplyPrimaryRejectsOOOAndConverges(t *testing.T) {
 	primary := recordengine.New(recordengine.Config{Schema: testSchema, OOOWindow: 50})
 
 	// 2000 sets newest; 900 is far below ⇒ rejected by the primary's single OOO decision.
-	accepted, rejected, err := primary.ApplyPrimary(recordengine.EncodeWAL(
+	accepted, res, err := primary.ApplyPrimary(recordengine.EncodeWAL(
 		mkBatch("api", rrec{ts: 2000, body: "a"}, rrec{ts: 900, body: "old"}),
-	))
+	), recordengine.AppendLimits{})
 	require.NoError(t, err)
-	assert.Equal(t, 1, rejected)
+	assert.Equal(t, 1, res.RejectedOOO)
 
 	// A secondary applies the accepted payload verbatim and converges with the primary.
 	secondary := recordengine.New(recordengine.Config{Schema: testSchema})
