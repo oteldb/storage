@@ -9,6 +9,9 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/oteldb/storage/internal/obs"
 )
@@ -107,4 +110,34 @@ func TestAdmissionCountersRecord(t *testing.T) {
 	assert.Equal(t, int64(7), counterSum(t, rm, "storage.ingest.rejected", map[string]string{"signal": "metric", "reason": "max_series"}))
 	assert.Equal(t, int64(3), counterSum(t, rm, "storage.ingest.rejected", map[string]string{"signal": "metric", "reason": "rate_limit"}))
 	assert.Equal(t, int64(12), counterSum(t, rm, "storage.ingest.sampled_dropped", map[string]string{"signal": "metric"}))
+}
+
+// TestLoggerTraceCorrelation confirms Obs.Logger routes through zctx: when a valid span is in ctx,
+// the returned logger stamps trace_id and span_id onto every line (the embedder's correlation key).
+func TestLoggerTraceCorrelation(t *testing.T) {
+	t.Parallel()
+
+	core, logs := observer.New(zap.DebugLevel)
+	o, err := obs.New(obs.Config{Logger: zap.New(core)})
+	require.NoError(t, err)
+
+	traceID := trace.TraceID{0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10}
+	spanID := trace.SpanID{0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8}
+	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: traceID, SpanID: spanID, TraceFlags: trace.FlagsSampled})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	o.Logger(ctx).Info("hello")
+
+	require.Equal(t, 1, logs.Len())
+	fields := logs.All()[0].ContextMap()
+	assert.Equal(t, traceID.String(), fields["trace_id"], "trace_id stamped from the active span")
+	assert.Equal(t, spanID.String(), fields["span_id"], "span_id stamped from the active span")
+
+	// Without a span, no correlation fields are added (base logger passes through).
+	core2, logs2 := observer.New(zap.DebugLevel)
+	o2, err := obs.New(obs.Config{Logger: zap.New(core2)})
+	require.NoError(t, err)
+	o2.Logger(context.Background()).Info("plain")
+	require.Equal(t, 1, logs2.Len())
+	assert.NotContains(t, logs2.All()[0].ContextMap(), "trace_id")
 }

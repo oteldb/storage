@@ -9,6 +9,9 @@
 package obs
 
 import (
+	"context"
+
+	"github.com/go-faster/sdk/zctx"
 	"go.opentelemetry.io/otel/metric"
 	mnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/trace"
@@ -98,4 +101,18 @@ func NewNop() *Obs {
 	o, _ := New(Config{})
 
 	return o
+}
+
+// Base installs the injected logger as the [zctx] base in ctx, so any layer below can retrieve a
+// trace-correlated logger via [zctx.From] without holding the obs handle. Seed it at each operation
+// entry, before starting the span; [zctx.From] then attaches span_id/trace_id from the active span.
+func (o *Obs) Base(ctx context.Context) context.Context {
+	return zctx.Base(ctx, o.Log)
+}
+
+// Logger returns the trace-correlated logger for ctx — the injected base with span_id/trace_id
+// attached when a span is active. It seeds the base first, so it is correct even when the caller
+// forgot to (or could not) seed ctx upstream.
+func (o *Obs) Logger(ctx context.Context) *zap.Logger {
+	return zctx.From(zctx.Base(ctx, o.Log))
 }
