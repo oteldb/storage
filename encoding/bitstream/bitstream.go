@@ -404,18 +404,35 @@ func (r *Reader) ReadBytesView(n int) ([]byte, error) {
 // calls (not io.ByteReader) avoid the receiver escaping to the heap.
 func (r *Reader) ReadUvarint() (uint64, error) {
 	var x uint64
+
 	var s uint
+
 	for range binary.MaxVarintLen64 {
-		b, err := r.ReadByte()
-		if err != nil {
-			return x, err
+		var b byte
+
+		// Fast path: pull the next byte straight from the buffered word (high-justified, MSB-first),
+		// avoiding the ReadByte→ReadBits call per byte — the common small-varint case. Only cross a
+		// buffer boundary (a refill) via ReadByte.
+		if r.valid >= 8 {
+			b = byte(r.buffer >> (r.valid - 8))
+			r.valid -= 8
+		} else {
+			rb, err := r.ReadByte()
+			if err != nil {
+				return x, err
+			}
+
+			b = rb
 		}
+
 		if b < 0x80 {
 			return x | uint64(b)<<s, nil
 		}
+
 		x |= uint64(b&0x7f) << s
 		s += 7
 	}
+
 	return x, io.ErrUnexpectedEOF
 }
 
