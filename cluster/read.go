@@ -423,6 +423,13 @@ func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc) http.Handler {
 		}
 
 		out := encode(batches)
+
+		// The batches are now serialized into out and no longer needed — release them so a producing
+		// engine recycles their buffers (a no-op for batches without a release hook).
+		for _, b := range batches {
+			b.Release()
+		}
+
 		if coll != nil {
 			tree := coll.Root().Encode(nil)
 			framed := binary.AppendUvarint(nil, uint64(len(tree)))

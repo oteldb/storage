@@ -178,7 +178,9 @@ func (s *Storage) localFetch(ctx context.Context, tenant string, start, end int6
 		return nil, nil
 	}
 
-	it, err := eng.Fetch(ctx, fetch.Request{Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers})
+	// Recycle: the read handler serializes the batches and discards them, so it releases them right
+	// after — recycling this node's result buffers across fan-out reads.
+	it, err := eng.Fetch(ctx, fetch.Request{Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers, Recycle: true})
 	if err != nil {
 		return nil, err
 	}
