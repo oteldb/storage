@@ -1086,7 +1086,11 @@ the L0 safety properties under node death, partition, and stragglers: a quorum w
 quorum of owners is reachable (no false acks), every acked write survives a later minority failure
 (no data loss — verified by a randomized soak), and reads converge by gathering+merging across the
 reachable replicas. It drives the production `replica`/`ring`/`fetch.Merge` code, so a regression in
-the quorum or convergence logic trips it (race-clean under `-race`).
+the quorum or convergence logic trips it (race-clean under `-race`). `cluster/rebalance_chaos_test.go`
+covers the other half — **ownership handoff under membership change**: across single and rolling ring
+changes (with ongoing ingest), a shard's gained owner opens a fresh engine over the shared backend and
+`LoadParts` reconstructs every flushed sample, proving the object-store-native handoff is lossless and
+stateless (no bytes move; the move stays minimal).
 
 ---
 
