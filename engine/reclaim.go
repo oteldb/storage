@@ -18,19 +18,22 @@ func appendPart(parts []*part, p *part) []*part {
 	return append(out, p)
 }
 
-// replaceParts returns a new slice with every part whose prefix is in removed dropped and add appended
-// (add may be nil, e.g. a retention merge that produced no part). Copy-on-write. It keeps any part not
-// in removed, so a part added concurrently is never lost.
-func replaceParts(parts []*part, removed map[string]struct{}, add *part) []*part {
-	out := make([]*part, 0, len(parts)+1)
+// replaceParts returns a new slice with every part whose prefix is in removed dropped and the given
+// parts appended (add may be empty — e.g. a retention merge that produced no part — or hold several
+// when the merge split its output by MaxPartBytes; nil entries are skipped). Copy-on-write. It keeps
+// any part not in removed, so a part added concurrently is never lost.
+func replaceParts(parts []*part, removed map[string]struct{}, add ...*part) []*part {
+	out := make([]*part, 0, len(parts)+len(add))
 	for _, p := range parts {
 		if _, drop := removed[p.prefix]; !drop {
 			out = append(out, p)
 		}
 	}
 
-	if add != nil {
-		out = append(out, add)
+	for _, p := range add {
+		if p != nil {
+			out = append(out, p)
+		}
 	}
 
 	return out

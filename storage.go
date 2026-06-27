@@ -938,6 +938,9 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		Obs:              s.obs,
 		DecodeCacheBytes: s.opts.DecodeCacheBytes,
 		AggregateStats:   s.opts.AggregateStats,
+		// MaxPartBytes caps each flushed/merged part; resolved from the tenant's policy. It is an
+		// operational/structural cap fixed at engine creation (unlike the per-write admission limits).
+		MaxPartBytes: s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Limits.MaxPartSize,
 	})
 	s.tenants[tid] = e
 

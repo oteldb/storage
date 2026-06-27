@@ -24,6 +24,51 @@ type flushColumns struct {
 	sf     []float64
 }
 
+// partRowBytes is the approximate uncompressed bytes a metric part row occupies (series int128 +
+// ts int64 + value float64). It bounds a part's row count against [Config.MaxPartBytes]; it ignores
+// compression (so the cap is conservative — real parts are smaller) and the optional sf column.
+const partRowBytes = 32
+
+// maxRowsPerPart converts a byte cap into a row cap (0 ⇒ unlimited). At least one row per part, so a
+// cap smaller than a single row still makes progress.
+func maxRowsPerPart(maxBytes int64) int {
+	if maxBytes <= 0 {
+		return 0
+	}
+
+	if r := int(maxBytes / partRowBytes); r >= 1 {
+		return r
+	}
+
+	return 1
+}
+
+// chunkRanges splits n rows into [lo, hi) ranges of at most maxRows each (maxRows ≤ 0 ⇒ a single
+// full-width range). Splitting at arbitrary row boundaries is safe: parts are independent and a
+// series spanning two parts is merged back by the read seam.
+func chunkRanges(n, maxRows int) [][2]int {
+	if maxRows <= 0 || n <= maxRows {
+		return [][2]int{{0, n}}
+	}
+
+	out := make([][2]int, 0, (n+maxRows-1)/maxRows)
+	for lo := 0; lo < n; lo += maxRows {
+		out = append(out, [2]int{lo, min(lo+maxRows, n)})
+	}
+
+	return out
+}
+
+// slice returns a view of rows [a, b) of the columns (sharing the backing arrays; read-only use).
+func (c *flushColumns) slice(a, b int) *flushColumns {
+	out := &flushColumns{series: c.series[a:b], ts: c.ts[a:b], value: c.value[a:b]}
+	if c.sf != nil {
+		out.sf = c.sf[a:b]
+	}
+
+	return out
+}
+
 // appendRow appends one (series, ts, value, sf) row, materializing the sf column lazily the first
 // time a non-unit weight appears (backfilling 1 for the rows already collected).
 func (c *flushColumns) appendRow(u chunk.U128, ts int64, value, sf float64) {

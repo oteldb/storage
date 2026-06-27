@@ -30,7 +30,9 @@ type Limits struct {
 	// monotonic within an engine's lifetime, so once crossed the budget stays in overflow (no
 	// hysteresis); see docs/design/cardinality-overflow.md.
 	MaxSeriesSoft int64
-	// MaxPartSize caps an immutable part's size. Zero ⇒ unlimited. (Not yet enforced.)
+	// MaxPartSize caps an immutable part's (approximate, uncompressed) size: flush and merge split
+	// their output so no single part exceeds it. It is a structural cap fixed when a tenant's engine
+	// is first created. Zero ⇒ unlimited (one part). Metrics only.
 	MaxPartSize int64
 }
 

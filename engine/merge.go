@@ -109,30 +109,36 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 		return 0, nil
 	}
 
-	var newPart *part
+	// Split the merged columns into one or more parts, each under MaxPartBytes (one when unlimited).
+	// Each part's cold-tier recompression/precision is decided from its own newest sample.
+	var newParts []*part
 
 	if len(cols.ts) > 0 {
-		minT, maxT := colsTimeRange(cols)
-		prefix := e.partPrefix(seq)
+		ranges := chunkRanges(len(cols.ts), maxRowsPerPart(e.cfg.MaxPartBytes))
+		newParts = make([]*part, 0, len(ranges))
 
-		// Recompress and/or coarsen precision when the merged part is fully cold (its newest sample
-		// predates the respective cutoff). Both are age-tiered and decided from the merged part's
-		// newest sample so the choice is deterministic.
-		if err := writePart(ctx, e.cfg.Backend, prefix, cols,
-			coldProfile(opts.Recompress, maxT), pickPrecision(opts.Precision, maxT), e.cfg.AggregateStats); err != nil {
-			return 0, err
+		for i, rg := range ranges {
+			sub := cols.slice(rg[0], rg[1])
+			minT, maxT := colsTimeRange(sub)
+			prefix := e.partPrefix(seq + i)
+
+			if err := writePart(ctx, e.cfg.Backend, prefix, sub,
+				coldProfile(opts.Recompress, maxT), pickPrecision(opts.Precision, maxT), e.cfg.AggregateStats); err != nil {
+				return 0, err
+			}
+
+			p, err := openPart(ctx, e.cfg.Backend, prefix)
+			if err != nil {
+				return 0, err
+			}
+
+			p.minTime, p.maxTime = minT, maxT
+			newParts = append(newParts, p)
 		}
-
-		newPart, err = openPart(ctx, e.cfg.Backend, prefix)
-		if err != nil {
-			return 0, err
-		}
-
-		newPart.minTime, newPart.maxTime = minT, maxT
 	}
 
-	// Publish (under lock): swap the source parts for the merged one copy-on-write (keeping any part a
-	// concurrent flush may have added), retire the sources, and commit the index before any deletion —
+	// Publish (under lock): swap the source parts for the merged one(s) copy-on-write (keeping any part
+	// a concurrent flush may have added), retire the sources, and commit the index before any deletion —
 	// so a crash mid-merge never leaves the index referencing a deleted part. The retired parts' objects
 	// are deleted by reclaimRetired once their readers drain.
 	removed := make(map[string]struct{}, len(src))
@@ -141,10 +147,8 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	}
 
 	e.mu.Lock()
-	e.parts = replaceParts(e.parts, removed, newPart)
-	if newPart != nil {
-		e.nextSeq = seq + 1
-	}
+	e.parts = replaceParts(e.parts, removed, newParts...)
+	e.nextSeq = seq + len(newParts)
 
 	e.retireLocked(src)
 	err = e.updateIndexLocked(ctx)

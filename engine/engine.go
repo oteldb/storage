@@ -40,6 +40,9 @@ type Config struct {
 	// bytes (LRU). It skips the column re-decode that the backend read cache cannot, and applies to
 	// every backend (a decode is CPU even when the read is RAM-fast). Zero disables it.
 	DecodeCacheBytes int64
+	// MaxPartBytes caps an immutable part's (approximate, uncompressed) size: flush and merge split
+	// their output into multiple parts so no single part exceeds it. 0 ⇒ unlimited (one part).
+	MaxPartBytes int64
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each part,
 	// so [Engine.AggregateRange] answers a range-covering aggregate from it without decoding the
 	// value column. It costs a little storage per series; off by default. AggregateRange works
@@ -678,28 +681,40 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	}
 
 	rows := len(cols.ts)
-	prefix := e.partPrefix(seq)
 
-	if err := writePart(ctx, e.cfg.Backend, prefix, cols, nil, 0, e.cfg.AggregateStats); err != nil {
-		return 0, err
+	// Split the flushed columns into one or more parts, each kept under MaxPartBytes (a single part
+	// when unlimited). Flush writes freshly-ingested data with codec-only framing (no recompression).
+	ranges := chunkRanges(rows, maxRowsPerPart(e.cfg.MaxPartBytes))
+
+	newParts := make([]*part, 0, len(ranges))
+	for i, rg := range ranges {
+		sub := cols.slice(rg[0], rg[1])
+		prefix := e.partPrefix(seq + i)
+
+		if err := writePart(ctx, e.cfg.Backend, prefix, sub, nil, 0, e.cfg.AggregateStats); err != nil {
+			return 0, err
+		}
+
+		p, err := openPart(ctx, e.cfg.Backend, prefix)
+		if err != nil {
+			return 0, err
+		}
+
+		p.minTime, p.maxTime = colsTimeRange(sub)
+		newParts = append(newParts, p)
 	}
 
-	p, err := openPart(ctx, e.cfg.Backend, prefix)
-	if err != nil {
-		return 0, err
-	}
-
-	p.minTime, p.maxTime = colsTimeRange(cols)
-
-	// Publish (under lock): add the part copy-on-write and clear e.flushing in the same critical
-	// section, so a fetch sees the samples either in e.flushing or in the part — never neither (no gap)
+	// Publish (under lock): add the parts copy-on-write and clear e.flushing in the same critical
+	// section, so a fetch sees the samples either in e.flushing or in a part — never neither (no gap)
 	// and never both (no double count). The small index writes and WAL checkpoint stay under the lock
 	// so the parts swap and the durable commit remain atomic.
 	e.mu.Lock()
-	e.parts = appendPart(e.parts, p)
+	for _, p := range newParts {
+		e.parts = appendPart(e.parts, p)
+	}
 	e.flushing = nil
-	e.nextSeq = seq + 1
-	err = e.publishLocked(ctx)
+	e.nextSeq = seq + len(ranges)
+	err := e.publishLocked(ctx)
 	e.mu.Unlock()
 
 	if err != nil {
