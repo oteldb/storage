@@ -60,8 +60,19 @@ type Backend struct {
 
 var _ backend.Backend = (*Backend)(nil)
 
-// New returns a [Backend] over store, rooting all keys under keyPrefix (which may be empty).
-func New(store ObjectStore, keyPrefix string) *Backend {
+// New returns a [Backend] over store, rooting all keys under keyPrefix (which may be empty). Pass
+// [WithRetry] to make it resilient to a lossy/slow endpoint (per-attempt timeouts, bounded retries,
+// hedged GETs).
+func New(store ObjectStore, keyPrefix string, opts ...Option) *Backend {
+	var cfg config
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	if cfg.retry.Enabled() {
+		store = newRetryStore(store, cfg.retry)
+	}
+
 	return &Backend{store: store, prefix: keyPrefix}
 }
 
