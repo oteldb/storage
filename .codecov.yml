@@ -1,0 +1,11 @@
+ignore:
+  - "**/main.go"
+  - "**/*_enum.go"
+  - "*_enum.go"
+  - "**/*_gen.go"
+  # Skip non-production code.
+  - "internal/cmd/*"
+coverage:
+  status:
+    project: false
+    patch: false
