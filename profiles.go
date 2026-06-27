@@ -43,7 +43,7 @@ func (s *Storage) WriteProfiles(ctx context.Context, pd profile.Profiles) (acc A
 // Returned rows carry the global content-addressed `stack_id`; resolve it with
 // [Storage.ProfileResolver]. Same tenant scoping as [Storage.TraceFetcher].
 func (s *Storage) ProfileFetcher(tenants ...signal.TenantID) fetch.Fetcher {
-	return s.recordFetcher(tenants, s.profileEngineSnapshot, s.lookupProfileEngine, s.clusterProfileFetcherFor)
+	return s.recordFetcher(signal.Profile, tenants, s.profileEngineSnapshot, s.lookupProfileEngine, s.clusterProfileFetcherFor)
 }
 
 // ProfileSeries returns the identities of a tenant's profile streams matching the label matchers

@@ -40,7 +40,7 @@ func (s *Storage) WriteLogs(ctx context.Context, ld log.Logs) (acc Accepted, err
 // or none ⇒ all tenants with log data. Always usable: an empty fetcher when no tenant matches or
 // after [Close]. Label matchers resolve streams; column Conditions filter records.
 func (s *Storage) LogFetcher(tenants ...signal.TenantID) fetch.Fetcher {
-	return s.recordFetcher(tenants, s.logEngineSnapshot, s.lookupLogEngine, s.clusterLogFetcherFor)
+	return s.recordFetcher(signal.Log, tenants, s.logEngineSnapshot, s.lookupLogEngine, s.clusterLogFetcherFor)
 }
 
 // LogSeries returns the identities of a tenant's log streams matching the label matchers within

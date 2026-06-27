@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/go-faster/sdk/zctx"
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
@@ -243,7 +244,11 @@ func (s *Storage) AdmissionStats(tid signal.TenantID) AdmissionStats {
 // that stamps the result (accepted/rejected counts, any error) on the span and ends it. With the
 // no-op tracer it is free. Use: ctx, finish := s.writeSpan(ctx, "…"); defer finish(&acc, &err).
 func (s *Storage) writeSpan(ctx context.Context, name string) (context.Context, func(*Accepted, *error)) {
+	ctx = s.obs.Base(ctx)
 	ctx, span := s.obs.Tracer.Start(ctx, name) //nolint:spancheck // the returned finish() closure ends the span
+
+	log := zctx.From(ctx)
+	log.Debug("write start", zap.String("op", name))
 
 	return ctx, func(acc *Accepted, err *error) { //nolint:spancheck // span.End is called here, in the returned closure
 		span.SetAttributes(
@@ -253,6 +258,11 @@ func (s *Storage) writeSpan(ctx context.Context, name string) (context.Context, 
 
 		if *err != nil {
 			span.RecordError(*err)
+			log.Error("write failed", zap.String("op", name), zap.Error(*err))
+		} else {
+			log.Debug("write done",
+				zap.String("op", name),
+				zap.Int64("accepted", acc.Accepted), zap.Int64("rejected", acc.Rejected))
 		}
 
 		span.End()
@@ -276,7 +286,7 @@ func (s *Storage) emitAdmission(ctx context.Context, sig signal.Signal, accepted
 	// Shedding is the overload/backpressure event — log it (Warn) so operators see it without
 	// scraping metrics. Only fires when something was actually rejected, so it stays coarse.
 	if total := rej.ooo + rej.rate + rej.cardinality + rej.inflight; total > 0 {
-		s.obs.Log.Warn("admission shed writes",
+		zctx.From(ctx).Warn("admission shed writes",
 			zap.String("signal", name), zap.Int64("rejected", total),
 			zap.Int64("out_of_order", rej.ooo), zap.Int64("rate_limit", rej.rate),
 			zap.Int64("max_series", rej.cardinality), zap.Int64("max_in_flight_bytes", rej.inflight))

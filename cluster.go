@@ -137,7 +137,7 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	}
 
 	mship.SetLogger(s.obs.Log)
-	s.obs.Log.Info("joined cluster",
+	s.obs.Logger(ctx).Info("joined cluster",
 		zap.String("id", cfg.Self.ID), zap.String("zone", cfg.Self.Zone), zap.String("addr", cfg.Self.Addr))
 
 	s.cluster = &clusterNode{
@@ -737,10 +737,13 @@ func (s *Storage) primaryWriteHandler() http.Handler {
 			return
 		}
 
-		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace
+		ctx := s.obs.Base(obs.ExtractHTTP(req.Context(), req.Header)) // join the caller's trace
+		s.obs.Logger(ctx).Debug("primary-write received",
+			zap.Stringer("signal", sig), zap.String("tenant", tenant), zap.Int("wal_bytes", len(walBytes)))
 
 		rejected, err := s.primaryWrite(ctx, sig, tenant, walBytes)
 		if err != nil {
+			s.obs.Logger(ctx).Error("primary-write failed", zap.Stringer("signal", sig), zap.String("tenant", tenant), zap.Error(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 
 			return
@@ -759,6 +762,7 @@ func (s *Storage) sendPrimaryWrite(ctx context.Context, addr string, payload []b
 	}
 
 	obs.InjectHTTP(ctx, req.Header) // carry the trace into the primary-write RPC
+	s.obs.Logger(ctx).Debug("primary-write send", zap.String("addr", addr), zap.Int("bytes", len(payload)))
 
 	resp, err := s.cluster.httpc.Do(req)
 	if err != nil {

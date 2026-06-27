@@ -163,6 +163,7 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 // mode (via clusterFor), else the local engines (snapshot for all tenants, lookup for named ones).
 // Multi-tenant reads concatenate (records are append-only and column-shaped, not ts-deduped).
 func (s *Storage) recordFetcher(
+	sig signal.Signal,
 	tenants []signal.TenantID,
 	snapshot func() []*recordengine.Engine,
 	lookup func(signal.TenantID) (*recordengine.Engine, bool),
@@ -172,13 +173,17 @@ func (s *Storage) recordFetcher(
 		return fetch.Merge()
 	}
 
+	seed := func(f fetch.Fetcher) fetch.Fetcher {
+		return seedFetcher{inner: f, obs: s.obs, signal: sig.String()}
+	}
+
 	if s.cluster != nil && len(tenants) > 0 {
 		fetchers := make([]fetch.Fetcher, 0, len(tenants))
 		for _, t := range tenants {
 			fetchers = append(fetchers, clusterFor(t))
 		}
 
-		return oneOrConcat(fetchers)
+		return seed(oneOrConcat(fetchers))
 	}
 
 	var fetchers []fetch.Fetcher
@@ -195,7 +200,7 @@ func (s *Storage) recordFetcher(
 		}
 	}
 
-	return oneOrConcat(fetchers)
+	return seed(oneOrConcat(fetchers))
 }
 
 // oneOrConcat returns an empty fetcher, the single child, or a concatenating fetcher.

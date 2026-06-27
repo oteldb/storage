@@ -40,7 +40,7 @@ func (s *Storage) WriteTraces(ctx context.Context, td trace.Traces) (acc Accepte
 // data. Label matchers resolve streams (services); column Conditions filter spans (name, kind,
 // status, duration, attributes). Same tenant scoping as [Storage.LogFetcher].
 func (s *Storage) TraceFetcher(tenants ...signal.TenantID) fetch.Fetcher {
-	return s.recordFetcher(tenants, s.traceEngineSnapshot, s.lookupTraceEngine, s.clusterTraceFetcherFor)
+	return s.recordFetcher(signal.Trace, tenants, s.traceEngineSnapshot, s.lookupTraceEngine, s.clusterTraceFetcherFor)
 }
 
 // TraceSeries returns the identities of a tenant's span streams matching the label matchers within
