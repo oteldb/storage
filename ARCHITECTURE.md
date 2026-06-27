@@ -1090,7 +1090,10 @@ the quorum or convergence logic trips it (race-clean under `-race`). `cluster/re
 covers the other half — **ownership handoff under membership change**: across single and rolling ring
 changes (with ongoing ingest), a shard's gained owner opens a fresh engine over the shared backend and
 `LoadParts` reconstructs every flushed sample, proving the object-store-native handoff is lossless and
-stateless (no bytes move; the move stays minimal).
+stateless (no bytes move; the move stays minimal). `cluster/etcd/ownership_chaos_test.go` adds the
+coordination half against a real embedded etcd: a contended claim admits exactly one winner,
+concurrent reconciliation converges to one-owner-per-shard across a membership change, and a node
+death (lease revoke) hands all of its shards to the survivors with none left orphaned.
 
 ---
 
