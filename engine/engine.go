@@ -3,7 +3,6 @@ package engine
 import (
 	"bytes"
 	"context"
-	"slices"
 	"sync"
 	"time"
 
@@ -405,73 +404,185 @@ func (p *enginePlan) releaseParts() {
 	}
 }
 
-// sfval is a sample's value paired with its lossy-sampling weight.
-type sfval struct {
-	value float64
-	sf    float64
+// tsRun is one source's in-window, ascending samples feeding a merge. sf is nil when every weight
+// is 1. The slices alias their source (a pooled decoded part, or a head/flush copy), so collect
+// copies into fresh result buffers — it never returns a run's backing array.
+type tsRun struct {
+	ts   []int64
+	vals []float64
+	sf   []float64
 }
 
-// sampleMerge merges samples from multiple sources for one series, deduplicating by
-// timestamp. Sources are added oldest → newest, so a later add overwrites an earlier value
-// (and its weight) at the same timestamp.
-type sampleMerge struct {
-	byTs map[int64]sfval
-}
-
-// add merges the samples whose timestamps fall in [start, end]. sf carries each sample's weight
-// (nil ⇒ every weight is 1).
-func (m *sampleMerge) add(ts []int64, values, sf []float64, start, end int64) {
-	if m.byTs == nil {
-		m.byTs = make(map[int64]sfval, len(ts))
+func (r tsRun) weight(i int) float64 {
+	if r.sf == nil {
+		return 1
 	}
 
-	for i := range ts {
-		if ts[i] < start || ts[i] > end {
+	return r.sf[i]
+}
+
+// sampleMerge merges one series' samples from several already-sorted sources, deduplicating by
+// timestamp with **freshest-wins**: sources are added oldest → newest, and on a timestamp tie the
+// latest-added source's value (and weight) is kept. It holds the sources as zero-copy run views and
+// merges them once in collect — no per-series map (which dominated the read-path allocations).
+type sampleMerge struct {
+	runs []tsRun // oldest → newest; a higher index wins a timestamp tie
+}
+
+// add registers a source's [start, end] window as a run. ts must be ascending; the window bounds are
+// found by binary search (a no-op clip for an already-windowed head/flush source). Empty windows are
+// skipped. sf carries each sample's weight (nil ⇒ every weight is 1).
+func (m *sampleMerge) add(ts []int64, values, sf []float64, start, end int64) {
+	lo := lowerBound(ts, start) // first i with ts[i] >= start
+	hi := upperBound(ts, end)   // first i with ts[i] > end
+	if lo >= hi {
+		return
+	}
+
+	var sfw []float64
+	if sf != nil {
+		sfw = sf[lo:hi]
+	}
+
+	m.runs = append(m.runs, tsRun{ts: ts[lo:hi], vals: values[lo:hi], sf: sfw})
+}
+
+// collect returns the merged samples sorted ascending by timestamp, in freshly allocated slices.
+// The returned sf slice is nil when every weight is 1 (the unsampled common case), else
+// len == len(ts).
+func (m *sampleMerge) collect() (tsOut []int64, values, sf []float64) {
+	switch len(m.runs) {
+	case 0:
+		return nil, nil, nil
+	case 1:
+		return collectOne(m.runs[0])
+	default:
+		return collectMany(m.runs)
+	}
+}
+
+// collectOne copies a single source's run into fresh result slices, dropping any adjacent
+// duplicate timestamps (keeping the last — matching the map's last-write-wins). No merge needed.
+func collectOne(r tsRun) (tsOut []int64, values, sf []float64) {
+	n := len(r.ts)
+	tsOut = make([]int64, 0, n)
+	values = make([]float64, 0, n)
+
+	for i := range n {
+		if i+1 < n && r.ts[i+1] == r.ts[i] { // keep the last of an equal-ts run
 			continue
 		}
 
-		w := float64(1)
-		if sf != nil {
-			w = sf[i]
-		}
-
-		m.byTs[ts[i]] = sfval{value: values[i], sf: w}
-	}
-}
-
-// collect returns the merged samples sorted ascending by timestamp. The returned sf slice is nil
-// when every weight is 1 (the unsampled common case), else len == len(ts).
-func (m *sampleMerge) collect() (tsOut []int64, values, sf []float64) {
-	if len(m.byTs) == 0 {
-		return nil, nil, nil
-	}
-
-	tsOut = make([]int64, 0, len(m.byTs))
-	for t := range m.byTs {
-		tsOut = append(tsOut, t)
-	}
-
-	slices.Sort(tsOut)
-
-	values = make([]float64, len(tsOut))
-
-	for i, t := range tsOut {
-		v := m.byTs[t]
-		values[i] = v.value
-
-		if v.sf != 1 && sf == nil {
-			sf = make([]float64, i, len(tsOut))
-			for j := range sf {
-				sf[j] = 1
-			}
-		}
-
-		if sf != nil {
-			sf = append(sf, v.sf)
-		}
+		tsOut = append(tsOut, r.ts[i])
+		values = append(values, r.vals[i])
+		sf = appendWeight(sf, r.weight(i), len(values), n)
 	}
 
 	return tsOut, values, sf
+}
+
+// collectMany k-way-merges several sorted runs into fresh result slices: at each step it emits the
+// smallest timestamp once, taking the value/weight from the highest-indexed (freshest) run that
+// holds it and advancing every run positioned there. O(rows × runs); runs is tiny (parts + flush +
+// head), so the linear min-scan beats a heap's overhead and allocations.
+func collectMany(runs []tsRun) (tsOut []int64, values, sf []float64) {
+	total := 0
+	for i := range runs {
+		total += len(runs[i].ts)
+	}
+
+	tsOut = make([]int64, 0, total)
+	values = make([]float64, 0, total)
+
+	// Per-run cursors. Stack-allocated for the common small fan-in; heap only for a huge one.
+	var curArr [16]int
+
+	var cur []int
+	if len(runs) <= len(curArr) {
+		cur = curArr[:len(runs)]
+	} else {
+		cur = make([]int, len(runs))
+	}
+
+	for {
+		minTs := int64(0)
+		found := false
+
+		for i := range runs {
+			if cur[i] < len(runs[i].ts) {
+				if t := runs[i].ts[cur[i]]; !found || t < minTs {
+					minTs, found = t, true
+				}
+			}
+		}
+
+		if !found {
+			break
+		}
+
+		var winVal, winW float64 = 0, 1
+
+		for i := range runs {
+			if cur[i] < len(runs[i].ts) && runs[i].ts[cur[i]] == minTs {
+				winVal, winW = runs[i].vals[cur[i]], runs[i].weight(cur[i])
+				cur[i]++
+			}
+		}
+
+		tsOut = append(tsOut, minTs)
+		values = append(values, winVal)
+		sf = appendWeight(sf, winW, len(values), total)
+	}
+
+	return tsOut, values, sf
+}
+
+// appendWeight appends w to the lazily-materialized sf column: it stays nil until the first non-unit
+// weight (backfilling 1 for the n-1 rows already emitted), keeping the unsampled path allocation-free.
+// n is the result length after this append; capHint sizes the slice on first materialization.
+func appendWeight(sf []float64, w float64, n, capHint int) []float64 {
+	if sf == nil {
+		if w == 1 {
+			return nil
+		}
+
+		sf = make([]float64, n-1, capHint)
+		for j := range sf {
+			sf[j] = 1
+		}
+	}
+
+	return append(sf, w)
+}
+
+// lowerBound returns the first index i in the ascending slice s with s[i] >= x (len(s) if none).
+func lowerBound(s []int64, x int64) int {
+	lo, hi := 0, len(s)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if s[mid] < x {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+
+	return lo
+}
+
+// upperBound returns the first index i in the ascending slice s with s[i] > x (len(s) if none).
+func upperBound(s []int64, x int64) int {
+	lo, hi := 0, len(s)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if s[mid] <= x {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+
+	return lo
 }
 
 // Flush writes the head's buffered samples to a new immutable part and clears the buffers
