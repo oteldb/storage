@@ -29,16 +29,25 @@ In order:
 7. **`sortedWindow` in-order fast path** — skip scratch+sort for ascending head/flush buffers
    (live-head read path; flat on the flush-heavy golden bench).
 
-### What the loop shows is left (structural — needs a decision)
+### P1.3 — opt-in batch-release buffer pooling (DONE)
 
-After the above, the read-path alloc profile is dominated by buffers that **back the returned
-batches**: `engine.collectOne` (~36%, the result ts/value slices) and `planFetch`/`Fetch` (~28%,
-per-series `*fetch.Batch` + head/flush windows). These are unavoidable *unless* the fetch contract
-gains a **batch-release lifecycle** (plan item **P1.3**) so the engine can pool the result + head
-buffers after the caller drains. That is a public-API change (every embedder must release), so it is
-flagged for a design decision rather than done in-loop. CPU is now spread across the inherently
-**serial** DoD/varint decode (delta dependency chains — not SIMD-amenable) and the result copy; the
-one SIMD-amenable spot (the decimal `v*scale` conversion) was already addressed by hoisting the scale.
+The result buffers (`collectOne` ~36% of read allocs) back the returned batches, so pooling them
+needs a release signal. Added `fetch.Request.Recycle` + `fetch.Batch.Release()` (see ARCHITECTURE
+§3g): opt-in, default-off (the non-recycling path is byte-for-byte unchanged — verified by
+`efficiency_test.go` and a `rel0→rel2` benchstat showing `fetch_all` flat, p=0.18). When a caller
+sets `Recycle` and releases each batch, the engine recycles the ts/value buffers via a shared hook
+(no per-batch closure). The multi-child `Merge` and the cluster read handler release their inputs.
+**Recycling read path: B/op −59%, time −24%** (benchstat `fetch_all` vs `fetch_all_release`); a
+`-race` recycle + concurrent test guards correctness.
+
+### What's left
+
+- **Record-signal release hook** — the `Batch.Release` hook is metric-only; the record engine's
+  per-query `recordCols` (the logs FINDINGS' #1 alloc) still GCs. Extending the hook to
+  `recordengine` is the next structural win for logs/traces.
+- **Win1 (pool head/flush windows)** — deferred: golden-flat (the lib bench is flush-heavy with a
+  cold head); it helps only the live-ingestion head path the integration profile sees.
+- CPU is now the inherently **serial** DoD/varint decode (not SIMD-amenable) + the result copy.
 
 ## Diagnosis (what the profiles actually show)
 
