@@ -52,6 +52,8 @@ type Engine struct {
 	// by fetch until the flushed part is published (then cleared, atomically with adding the part) — so
 	// a fetch never loses sight of records mid-flush. nil when no flush is in flight.
 	flushing map[signal.SeriesID]*sampleBuf
+	// walB groups a durable AppendBatch's WAL frames by series (reused under e.mu); nil head-only.
+	walB *walBatch
 }
 
 var _ fetch.Fetcher = (*Engine)(nil)
@@ -62,7 +64,12 @@ func New(cfg Config) *Engine {
 		cfg.Obs = obs.NewNop()
 	}
 
-	return &Engine{cfg: cfg, head: newHead()}
+	e := &Engine{cfg: cfg, head: newHead()}
+	if cfg.WAL != nil {
+		e.walB = newWALBatch()
+	}
+
+	return e
 }
 
 // metricSignal is the signal label for this engine's observability (it is the metrics engine).
@@ -144,17 +151,16 @@ func (e *Engine) AppendBatch(
 			continue
 		}
 
+		// Group the accepted samples by series; the grouped frames are written once after the loop
+		// (one WriteSamples per series, not one write+fsync syscall per sample, all under the lock).
 		if e.cfg.WAL != nil {
-			if isNew {
-				if err := e.cfg.WAL.WriteSeries(ids[i], s); err != nil {
-					return res, err
-				}
-			}
+			e.walB.add(ids[i], ts[i], values[i], isNew, s)
+		}
+	}
 
-			// Slice the columns in place (no per-sample allocation) for the WAL record.
-			if err := e.cfg.WAL.WriteSamples(ids[i], ts[i:i+1], values[i:i+1]); err != nil {
-				return res, err
-			}
+	if e.cfg.WAL != nil && !e.walB.empty() {
+		if err := e.walB.flush(e.cfg.WAL); err != nil {
+			return res, err
 		}
 	}
 

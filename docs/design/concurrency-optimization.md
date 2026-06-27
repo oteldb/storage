@@ -136,15 +136,19 @@ The WAL fsyncs immediately after each framed write when sync is on (`wal/segment
 batched fsync path is the background `syncWALs` sweep (`storage.go:873-891`). The record engine already
 batches frames per batch (`recordengine/engine.go:481`) — metrics should match.
 
-**Design.**
-1. Buffer a batch's WAL frames and emit **one** `WriteSamples`/`WriteRecords` per batch (mirror the
-   record engine), so the lock covers one append, not N.
-2. Release `e.mu` *before* fsync; let a group-commit goroutine coalesce fsyncs across tenants
-   (one fsync serves all writers parked since the last). This trades a tiny latency add for a large
-   syscall-rate and lock-hold reduction under concurrent ingest.
-
-Keep the zero-alloc hot-path contract (`CLAUDE.md`): the per-batch frame buffer must come from the
-existing reusable WAL buffers (`wal/wal.go:44-45`), not a fresh allocation.
+**Design (and what landed).**
+1. **Group the metric batch's WAL frames by series** — one `WriteSamples` per series (and one
+   `WriteSeries` per new series) instead of one write+fsync syscall per sample, all under the lock.
+   This is the concrete fix for the cited evidence and mirrors the record engine. Implemented with a
+   reusable per-engine `walBatch` scratch (`engine/walbatch.go`) so a steady-state durable append
+   allocates **zero** (measured), holding the zero-alloc contract.
+2. ~~Group-commit goroutine coalescing fsyncs across tenants~~ — **not applicable to this
+   architecture.** Each tenant has its own WAL *file*, so fsyncs across tenants target different files
+   and cannot be coalesced into one; and appends within a single engine are already serialized by
+   `e.mu`, so there are never multiple concurrent writers on one WAL to batch. The remaining benefit
+   (decoupling the `WALSyncAlways` fsync from `e.mu` so a fetch/flush isn't blocked during it) is
+   marginal now that fetch is largely lock-free (§3.2), and is **deferred** — it would require moving
+   the fsync off `e.mu` with care around segment rotation / `sw.f` lifetime, for little gain.
 
 ### 3.5 Intra-tenant write sharding (the single-tenant ceiling) — **P2**
 
@@ -254,7 +258,7 @@ churn / cold start.
 | 2 | Parallelize cross-shard read-merge + write-routing (bounded) | 4.3 | High (cluster) | Low-Med | **done** (`fetch.Merge`, cluster write loops) |
 | 3 | Flush/merge I/O outside the engine lock + deferred reclamation | 3.1, 3.3 | Very High | **High** | **done** (both engines; refcounted reclamation, COW parts) |
 | 4 | Fetch reads parts lock-free | 3.2 | High | Med | **done** (both engines; `planFetch`/`readParts`) |
-| 5 | WAL group-commit + lock-free fsync; one frame/batch for metrics | 3.4 | Med | Med | **deferred** (separate follow-up) |
+| 5 | Metrics WAL frames grouped per series (was per sample) | 3.4 | Med | Low | **done** (`engine/walbatch.go`); cross-tenant group-commit is N/A (per-tenant WAL files) |
 | 6 | Parallelize WAL-sync | 4.2 | Low | Low | **done** (`syncWALs`) |
 | 7 | `tmu` off the WAL-create path | 4.4 | Low-Med | Low | **deferred** (tenant-churn only) |
 | 8 | Intra-tenant head striping | 3.5 | Med | High | **deferred** (only on profiling evidence) |

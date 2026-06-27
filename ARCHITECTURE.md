@@ -376,7 +376,10 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   **single map probe** — a present sample buffer means the series is known, so the series
   index is never consulted and no `signal.Series` is built or hashed; only an absent buffer
   falls back to the (authoritative) series index. `Append` (full `signal.Series` in, hash
-  inside) remains for callers that already hold an identity.
+  inside) remains for callers that already hold an identity. When durable, a batch's WAL frames
+  are **grouped by series** (a reusable `walBatch` scratch — zero steady-state allocation): one
+  `WriteSamples` frame per series, one `WriteSeries` per new series, written once after the run —
+  not a write+fsync syscall per sample.
 - **Flush** (`flush.go`) drains the head's buffered samples into one **flat 3-column part**
   `[series:int128, ts:int64, value:float64]`, one row per sample, sorted by `(series, ts)`,
   written via `block.PartWriter` under `{tenant}/metrics/{seq}`. After the part is written,
