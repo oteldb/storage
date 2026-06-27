@@ -94,7 +94,11 @@ func writePart(ctx context.Context, b backend.Backend, schema *Schema, prefix st
 		return errors.Wrapf(err, "write part %q", prefix)
 	}
 
-	return writeBlooms(ctx, b, schema, prefix, f.cols)
+	if err := writeBlooms(ctx, b, schema, prefix, f.cols); err != nil {
+		return err
+	}
+
+	return writeRecordKeys(ctx, b, schema, prefix, f.cols)
 }
 
 // partPrefix is the backend key prefix of the seq-th part of this engine.

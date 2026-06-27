@@ -649,6 +649,15 @@ optional side store differ.
   **key-scoped** `key‖value` (equality) and `key‖word` (contains) tokens per record attribute;
   `Equality` columns hold each value verbatim (the **trace-by-id** path). `Fetch` skips a part whose
   bloom proves a required `Condition.Tokens`/`Condition.Equal` absent, then re-checks per row.
+- **Record-key footer** (`{prefix}/keys.bin`, magic+version+CRC32C): each part persists its distinct
+  per-record **attribute keys** (not values — bounded by the stream schema, so tiny) next to its
+  blooms, written by `writePart` (so flush and merge produce it) and loaded by `openPart`.
+  `Engine.Keys(start, end)` enumerates the distinct attribute keys across head ∪ in-window parts,
+  each tagged with a `KeyScope` bitset (resource / scope / record): stream-identity keys come from
+  the authoritative series index, record keys from the head buffers and the part footers. It is the
+  enumeration twin of `Engine.Series` (identities) and backs the facade's `LogKeys` — letting an
+  embedder list/push-down **record-attribute** labels that `Series`-based resolution cannot see, and
+  authoritatively distinguish a stream label from a record attribute (or both) via the bitset.
 - **WAL** carries a signal-agnostic records frame (`wal.WriteRecords`/`OnRecords`) of an opaque,
   engine-encoded payload, plus an optional **side frame** (`wal.WriteSide`/`OnSide`) carrying the
   side-store delta; `recordengine` owns the rec codec and `EncodeWAL` (the cluster write form, which
@@ -905,7 +914,11 @@ query-language path stays in the embedder. The `Write*` methods take the library
   keeps the recent window uncached so freshly-ingested samples are never served stale.
   **`LogFetcher(tenants...)`** is the logs read seam, the same shape over the log engines
   (multi-tenant reads concatenate rather than timestamp-dedup, since log records are append-only
-  and carry columns); a query supplies stream `Matchers` plus record `Conditions`.
+  and carry columns); a query supplies stream `Matchers` plus record `Conditions`. Two
+  enumeration primitives sit alongside it: **`LogSeries(ctx, tenant, matchers, window)`** (matching
+  stream identities) and **`LogKeys(ctx, tenant, window)`** (distinct attribute keys with their
+  `KeyScope` bitset — the only way to see and push down per-record attribute label names). Both are
+  node-local today; cluster fan-out is a follow-up.
   **`TraceFetcher(tenants...)`** is the identical seam over the trace engines, and
   **`Trace(ctx, tenant, traceID)`** is the trace-by-id convenience: it issues a fetch with an
   equality `Condition` on the `trace_id` column (pruned by that column's equality bloom) and returns
@@ -985,7 +998,8 @@ These hold in the implemented code and must be preserved by changes:
   part formats (manifest `OTPM`, marks `OTMK`, per-column object framing, the
   `{prefix}/manifest|marks|c/{i}` key layout), the **attribute hash/binary encoding** (the
   SeriesID pre-image), the **symbol table** (`OTSY`), the **WAL record framing** (series, sample,
-  records, and side frames), the **metric part column layout** (`[series:int128, ts:int64,
+  records, and side frames), the **record-key footer** (`OTKY`, the per-part `keys.bin` distinct
+  record-attribute keys), the **metric part column layout** (`[series:int128, ts:int64,
   value:float64]` sorted by `(series, ts)`, plus an **optional 4th `sf:float64`** scale-factor column
   present only when lossy sampling occurred — §3k), and the **profile symbol-store table** (`OTSP`, the
   content-addressed side-store sidecars) are all persisted/wire-stable. Changing any of

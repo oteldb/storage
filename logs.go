@@ -62,6 +62,56 @@ func (s *Storage) LogSeries(
 	return eng.Series(matchers, start, end), nil
 }
 
+// KeyScope is a bitset of the scopes an attribute key appears in. A key can appear in more than one
+// (e.g. as a resource attribute on one stream and a record attribute on another).
+type KeyScope uint8
+
+const (
+	// KeyScopeResource marks a resource attribute (stream identity).
+	KeyScopeResource = KeyScope(recordengine.KeyScopeResource)
+	// KeyScopeScope marks an instrumentation-scope attribute (stream identity).
+	KeyScopeScope = KeyScope(recordengine.KeyScopeScope)
+	// KeyScopeRecord marks a per-record attribute (the attrs column).
+	KeyScopeRecord = KeyScope(recordengine.KeyScopeRecord)
+)
+
+// KeyInfo is a distinct attribute key and the scope(s) it was observed in. Key aliases interned,
+// low-cardinality metadata owned by the engine; copy it to retain past the call.
+type KeyInfo struct {
+	Key   []byte
+	Scope KeyScope
+}
+
+// LogKeys returns the distinct attribute keys present in a tenant's log records within [start, end],
+// each tagged with the scope(s) it appears in (resource, scope, record). A zero start AND end
+// disables the time filter. It is the counterpart to [Storage.LogSeries] (which enumerates only
+// stream identities): the per-record [KeyScopeRecord] keys let an embedder list and push down
+// record-attribute labels its [Storage.LogSeries]-based resolution cannot see, and the scope bitset
+// authoritatively distinguishes a stream label from a record attribute (or both). Keys are
+// low-cardinality metadata. Local to this node; cluster fan-out is a follow-up.
+func (s *Storage) LogKeys(_ context.Context, tenant signal.TenantID, start, end int64) ([]KeyInfo, error) {
+	if s.closed.Load() {
+		return nil, errors.Wrap(ErrClosed, "log keys")
+	}
+
+	eng, ok := s.lookupLogEngine(s.normalizeTenant(tenant))
+	if !ok {
+		return nil, nil
+	}
+
+	raw := eng.Keys(start, end)
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	out := make([]KeyInfo, len(raw))
+	for i := range raw {
+		out[i] = KeyInfo{Key: raw[i].Key, Scope: KeyScope(raw[i].Scope)}
+	}
+
+	return out, nil
+}
+
 // concatFetcher runs each child and concatenates their batches. Unlike [fetch.Merge] it does not
 // deduplicate by timestamp — records are append-only and several may share a timestamp, and the
 // metric-shaped merge would drop the record columns. Used for multi-tenant record reads.
