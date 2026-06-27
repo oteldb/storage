@@ -863,10 +863,20 @@ Three valves:
 - **Ingest rate** (`Limits.IngestBytesPerSecond`) — a per-tenant **token bucket** (`tokenBucket`,
   burst = one second of budget) in the facade; an over-budget batch is shed up front. The clock is
   injected (`Storage.now`) for deterministic tests.
-- **Cardinality** (`Limits.MaxSeries`) — enforced **in the head** (`head.appendByID`, race-free under
-  the engine lock): a sample that would mint a *new* series past the cap is shed; samples for
-  already-known series are never blocked, so a query keeps returning what is already admitted. (No
-  hysteresis or `__overflow__`-series routing yet — those are §8a refinements.)
+- **Cardinality** (`Limits.MaxSeries` hard ceiling, optional `Limits.MaxSeriesSoft` soft budget) —
+  enforced **in the head** (`head.appendByID`, race-free under the engine lock): a sample that would
+  mint a *new* series past the hard cap is shed; already-known series are never blocked. With a soft
+  budget set (`0 < MaxSeriesSoft <= MaxSeries`) plus a caller-supplied `AppendLimits.Overflow`
+  remapper, a new metric series in the `[soft, hard)` band is instead **routed to a synthetic
+  overflow series** — the facade's `metricOverflow` collapses it to `{__name__, __overflow__="true"}`,
+  one bucket per metric name — keeping the tenant queryable and its aggregates approximately right
+  under a cardinality spike rather than hard-dropping new series. The overflow series is exempt from
+  the cap; the redirected sample is logged to the WAL under the overflow id (replay-consistent) and
+  counted as **accepted + overflowed** (`AppendResult.Overflowed`, `AdmissionStats.Overflowed`,
+  `storage.ingest.overflowed`). The remapper keeps the head signal-agnostic (it never sees
+  `__name__`). No hysteresis: the head's series index is monotonic within an engine's life, so the
+  budget does not breathe back down (see `docs/design/cardinality-overflow.md`). Metrics only; the
+  record signals keep the hard reject.
 - **In-flight memory** (`Limits.MaxInFlightBytes`) — also head-enforced, against the head's buffered
   **byte measure** (`engine.SampleBytes` = 16 per buffered sample, reset on flush, recomputed on
   replica trim): samples arriving while at the cap are shed until a flush drains the head. This is the
@@ -909,10 +919,12 @@ per-reason `AppendResult`. That breakdown rides the primary-write RPC back to th
 single-node** — but its scale factor is now **WAL-durable**: a sampled batch logs its per-sample
 weights via a dedicated `recordSamplesSF` WAL frame, and replay restores them, so a crash recovers
 unflushed *sampled* data at its representative weight rather than weight 1 (the unsampled path keeps
-the original no-sf frame, byte-for-byte). Not yet built (the rest of §8a): the **cardinality budget
-with hysteresis / `__overflow__` routing** (the cap is a hard reject, not yet a soft budget) and the
-clustered **central→edge budget feedback** (each node's rate valve sees only its own traffic).
-`MaxPartSize` is also not yet enforced.
+the original no-sf frame, byte-for-byte). The **soft cardinality budget with `__overflow__` routing**
+is built (metrics, single-node — see the Cardinality valve above; no hysteresis, as the head's series
+index is monotonic). Not yet built (the rest of §8a): the clustered **central→edge budget feedback**
+(each node's rate valve and soft budget see only their own node's traffic) and **overflow on the
+clustered write path** (the primary applies the hard cap only). `MaxPartSize` is also not yet
+enforced.
 
 ---
 

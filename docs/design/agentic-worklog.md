@@ -34,6 +34,9 @@ more commits; the code of record is the git history and `ARCHITECTURE.md`.
 
 - **3c — fair maintenance scheduling.** Maintenance work-list ordered by head pressure (fullest
   heads flush first).
-- **3a — cardinality budget + `__overflow__` routing.** (in progress — see
-  `docs/design/cardinality-overflow.md`)
+- **3a — cardinality budget + `__overflow__` routing — DONE.** `Limits.MaxSeriesSoft` + a
+  signal-supplied `AppendLimits.Overflow` remapper; past the soft line a new metric series routes to
+  a collapsed `{__name__, __overflow__}` series (head-enforced, WAL-consistent via the effective id),
+  counted as accepted+overflowed (`storage.ingest.overflowed`). No hysteresis (monotonic index). See
+  `docs/design/cardinality-overflow.md`.
 - **3b — per-signal record sharding.** (in progress — see `docs/design/record-sharding.md`)
