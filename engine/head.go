@@ -97,20 +97,21 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 // appendByID adds one sample for the series whose content id is already computed. The full
 // identity is materialized lazily — materialize() is called only on first sight, when the
 // series must be registered and indexed — so the hot path for a repeat series never builds
-// or hashes a [signal.Series]. It enforces limits (OOO window, in-flight bytes, cardinality)
-// and returns the per-sample outcome, whether the series was newly seen, and, when new, the
-// materialized identity (for the caller's WAL series record).
+// or hashes a [signal.Series]. It enforces limits (OOO window, in-flight bytes, cardinality,
+// and the optional soft-budget overflow routing) and returns the per-sample outcome, the
+// *effective* id the sample landed under (the original id, or the overflow series' id), whether
+// that series was newly seen, and, when new, its materialized identity (for the caller's WAL).
 func (h *head) appendByID(
 	id signal.SeriesID, ts int64, value, sf float64, oooWindow int64, limits AppendLimits, materialize func() signal.Series,
-) (out admitOutcome, isNew bool, s signal.Series) {
+) (out admitOutcome, effID signal.SeriesID, isNew bool, s signal.Series) {
 	if h.newest != 0 && oooWindow > 0 && ts < h.newest-oooWindow {
-		return rejectOOO, false, signal.Series{}
+		return rejectOOO, id, false, signal.Series{}
 	}
 
 	// Memory backpressure applies to every sample (known or new): once the head is at the
 	// in-flight cap, shed until a flush drains it.
 	if limits.MaxInFlightBytes > 0 && h.bytes >= limits.MaxInFlightBytes {
-		return rejectBytes, false, signal.Series{}
+		return rejectBytes, id, false, signal.Series{}
 	}
 
 	// One map probe on the hot path: a present sample buffer means the series is already
@@ -120,10 +121,19 @@ func (h *head) appendByID(
 	buf := h.samples[id]
 	if buf == nil {
 		if !h.series.Has(id) {
-			// A new series: reject it if minting it would exceed the cardinality cap. Existing
-			// series are never blocked, so a query keeps returning what is already admitted.
-			if limits.MaxSeries > 0 && int64(h.series.Len()) >= limits.MaxSeries {
-				return rejectCardinality, false, signal.Series{}
+			cardinality := int64(h.series.Len())
+
+			// Hard ceiling: reject a new series that would exceed MaxSeries. Existing series are
+			// never blocked, so a query keeps returning what is already admitted.
+			if limits.MaxSeries > 0 && cardinality >= limits.MaxSeries {
+				return rejectCardinality, id, false, signal.Series{}
+			}
+
+			// Soft budget: between MaxSeriesSoft and MaxSeries a new series is routed to a
+			// caller-built overflow series instead of registered, bounding cardinality while keeping
+			// the tenant's aggregates approximately right. Only on the degraded path — no hot-path cost.
+			if limits.Overflow != nil && limits.MaxSeriesSoft > 0 && cardinality >= limits.MaxSeriesSoft {
+				return h.appendOverflow(limits.Overflow(materialize()), ts, value, sf)
 			}
 
 			isNew = true
@@ -143,7 +153,38 @@ func (h *head) appendByID(
 		h.newest = ts
 	}
 
-	return admitted, isNew, s
+	return admitted, id, isNew, s
+}
+
+// appendOverflow appends a sample to the overflow series ov (the soft-budget redirect target). The
+// overflow series is exempt from the cardinality cap — there are few of them (one per metric name) —
+// so it is registered on first sight regardless. Returns the overflow id so the caller logs the WAL
+// under the overflow identity, matching the head.
+func (h *head) appendOverflow(ov signal.Series, ts int64, value, sf float64) (admitOutcome, signal.SeriesID, bool, signal.Series) {
+	oid := ov.Hash()
+
+	isNew := false
+
+	buf := h.samples[oid]
+	if buf == nil {
+		if !h.series.Has(oid) {
+			isNew = true
+			h.series.Add(ov)
+			h.indexLabels(oid, ov)
+		}
+
+		buf = &sampleBuf{}
+		h.samples[oid] = buf
+	}
+
+	buf.appendSample(ts, value, sf)
+	h.bytes += SampleBytes
+
+	if ts > h.newest {
+		h.newest = ts
+	}
+
+	return admittedOverflow, oid, isNew, ov
 }
 
 // trimBelow drops every buffered sample with timestamp ≤ t (now durable in a flushed part),

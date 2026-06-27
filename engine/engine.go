@@ -147,11 +147,14 @@ func (e *Engine) AppendBatch(
 			w = sf[i]
 		}
 
-		out, isNew, s := e.head.appendByID(ids[i], ts[i], values[i], w, e.cfg.OOOWindow, limits, mat)
+		out, effID, isNew, s := e.head.appendByID(ids[i], ts[i], values[i], w, e.cfg.OOOWindow, limits, mat)
 
 		switch out {
 		case admitted:
 			res.Accepted++
+		case admittedOverflow:
+			res.Accepted++
+			res.Overflowed++
 		case rejectOOO:
 			res.RejectedOOO++
 
@@ -168,8 +171,10 @@ func (e *Engine) AppendBatch(
 
 		// Group the accepted samples by series; the grouped frames are written once after the loop
 		// (one WriteSamples per series, not one write+fsync syscall per sample, all under the lock).
+		// effID is the original id, or the overflow series' id when the sample was redirected — so
+		// the WAL logs the identity the head actually holds, and replay reconstructs it.
 		if e.cfg.WAL != nil {
-			e.walB.add(ids[i], ts[i], values[i], w, isNew, s)
+			e.walB.add(effID, ts[i], values[i], w, isNew, s)
 		}
 	}
 
@@ -570,7 +575,9 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 				// The primary is the shard's single authority, so it makes the admission decision
 				// here (OOO window + cardinality + in-flight memory); secondaries apply the accepted
 				// set verbatim via ApplyReplicated.
-				out, _, _ := e.head.appendByID(id, ts[i], values[i], 1, e.cfg.OOOWindow,
+				// The cluster primary path does not set limits.Overflow, so a new series past the cap
+				// is hard-rejected here (overflow routing is single-node metrics today); effID == id.
+				out, _, _, _ := e.head.appendByID(id, ts[i], values[i], 1, e.cfg.OOOWindow,
 					limits, func() signal.Series { return s })
 
 				switch out {
