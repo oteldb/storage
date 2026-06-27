@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -29,6 +28,7 @@ import (
 	"github.com/oteldb/storage/reliability"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
+	tenantpkg "github.com/oteldb/storage/tenant"
 	"github.com/oteldb/storage/wal"
 )
 
@@ -133,7 +133,8 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	// read fan-out across metric/log/trace/profile signals.
 	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch, s.localLogFetch, s.localTraceFetch, s.localProfileFetch))
 	mux.Handle(cluster.AggregatePath, cluster.AggregateHandler(s.localAggregate)) // metric aggregate pushdown
-	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(s.localProfileSeries))   // profile series enumeration
+	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(s.localSeries))          // record-signal series enumeration (log/trace/profile)
+	mux.Handle(cluster.KeysPath, cluster.KeysHandler(s.localKeys))                // record-signal attribute-key enumeration
 	mux.Handle(cluster.SidePath, cluster.SideHandler(s.localProfileSymbols))      // profile symbol store
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
@@ -524,16 +525,52 @@ func equalitySpecs(matchers []fetch.Matcher) []fetch.EqualMatcher {
 	return eq
 }
 
-// localProfileSeries serves a peer's profile series listing from the local engine.
-func (s *Storage) localProfileSeries(
-	_ context.Context, tenant string, start, end int64, matchers []fetch.Matcher,
+// lookupRecordEngine resolves a tenant's engine for a record signal (log/trace/profile) without
+// creating one. Metrics are not a record signal, so they return (nil, false).
+func (s *Storage) lookupRecordEngine(sig signal.Signal, tid signal.TenantID) (*recordengine.Engine, bool) {
+	switch sig {
+	case signal.Log:
+		return s.lookupLogEngine(tid)
+	case signal.Trace:
+		return s.lookupTraceEngine(tid)
+	case signal.Profile:
+		return s.lookupProfileEngine(tid)
+	default:
+		return nil, false
+	}
+}
+
+// localSeries serves a peer's series listing for any record signal from the local engine,
+// dispatched by the request's signal (one enumeration RPC serves logs/traces/profiles).
+func (s *Storage) localSeries(
+	_ context.Context, sig signal.Signal, tenant string, start, end int64, matchers []fetch.Matcher,
 ) ([]signal.Series, error) {
-	eng, ok := s.lookupProfileEngine(s.normalizeTenant(signal.TenantID(tenant)))
+	eng, ok := s.lookupRecordEngine(sig, s.normalizeTenant(signal.TenantID(tenant)))
 	if !ok {
 		return nil, nil
 	}
 
 	return eng.Series(matchers, start, end), nil
+}
+
+// localKeys serves a peer's distinct attribute-key listing for a record signal from the local
+// engine (the enumeration twin of localSeries, backing LogKeys' cluster fan-out).
+func (s *Storage) localKeys(
+	_ context.Context, sig signal.Signal, tenant string, start, end int64,
+) ([]cluster.KeyInfo, error) {
+	eng, ok := s.lookupRecordEngine(sig, s.normalizeTenant(signal.TenantID(tenant)))
+	if !ok {
+		return nil, nil
+	}
+
+	raw := eng.Keys(start, end)
+
+	out := make([]cluster.KeyInfo, len(raw))
+	for i := range raw {
+		out[i] = cluster.KeyInfo{Key: raw[i].Key, Scope: uint8(raw[i].Scope)}
+	}
+
+	return out, nil
 }
 
 // localProfileSymbols serves a peer's profile symbol store from the local engine.
@@ -546,14 +583,15 @@ func (s *Storage) localProfileSymbols(ctx context.Context, tenant string) (map[s
 	return eng.SideSnapshot(ctx)
 }
 
-// clusterProfileSeries lists a tenant's profile streams in cluster mode: locally if this node owns
-// the tenant, else from an owner (failover), re-applying the non-equality matchers to the superset.
-func (s *Storage) clusterProfileSeries(
-	ctx context.Context, tid signal.TenantID, matchers []fetch.Matcher, start, end int64,
+// clusterSeries lists a record signal's streams for a tenant in cluster mode: locally if this node
+// owns the tenant, else from an owner (hedged failover), re-applying the non-equality matchers to
+// the superset. Shared by the log/trace/profile series enumeration seams.
+func (s *Storage) clusterSeries(
+	ctx context.Context, sig signal.Signal, tid signal.TenantID, matchers []fetch.Matcher, start, end int64,
 ) ([]signal.Series, error) {
 	local, remotes := s.recordOwners(tid)
 	if local {
-		return s.localProfileSeries(ctx, string(tid), start, end, matchers)
+		return s.localSeries(ctx, sig, string(tid), start, end, matchers)
 	}
 
 	if len(remotes) == 0 {
@@ -568,7 +606,7 @@ func (s *Storage) clusterProfileSeries(
 	for i := range remotes {
 		addr := remotes[i]
 		thunks[i] = func(ctx context.Context) ([]signal.Series, error) {
-			series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, signal.Profile,
+			series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, sig,
 				string(s.normalizeTenant(tid)), start, end, eq)
 			if err != nil {
 				return nil, err
@@ -586,6 +624,40 @@ func (s *Storage) clusterProfileSeries(
 	}
 
 	return retry.Hedge(ctx, s.readPolicy(ctx, rpcOpSeries), thunks)
+}
+
+// clusterProfileSeries lists a tenant's profile streams in cluster mode (a thin wrapper over the
+// signal-generic clusterSeries).
+func (s *Storage) clusterProfileSeries(
+	ctx context.Context, tid signal.TenantID, matchers []fetch.Matcher, start, end int64,
+) ([]signal.Series, error) {
+	return s.clusterSeries(ctx, signal.Profile, tid, matchers, start, end)
+}
+
+// clusterKeys lists a record signal tenant's distinct attribute keys in cluster mode: locally if
+// owned, else from an owner (hedged failover). Each owner is a complete replica, so the first
+// successful response is authoritative — no cross-owner merge is needed.
+func (s *Storage) clusterKeys(
+	ctx context.Context, sig signal.Signal, tid signal.TenantID, start, end int64,
+) ([]cluster.KeyInfo, error) {
+	local, remotes := s.recordOwners(tid)
+	if local {
+		return s.localKeys(ctx, sig, string(tid), start, end)
+	}
+
+	if len(remotes) == 0 {
+		return nil, nil
+	}
+
+	thunks := make([]func(context.Context) ([]cluster.KeyInfo, error), len(remotes))
+	for i := range remotes {
+		addr := remotes[i]
+		thunks[i] = func(ctx context.Context) ([]cluster.KeyInfo, error) {
+			return cluster.FetchKeys(ctx, s.cluster.httpc, addr, sig, string(s.normalizeTenant(tid)), start, end)
+		}
+	}
+
+	return retry.Hedge(ctx, s.readPolicy(ctx, rpcOpKeys), thunks)
 }
 
 // clusterProfileSymbols returns a tenant's symbol-store tables in cluster mode: locally if owned,
@@ -803,12 +875,36 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 	n := s.cluster.shardCount()
 	byShard := make(map[signal.TenantID]*shardWAL)
 
+	// The ingest-rate valve is applied at the origin (per real tenant, like the single-node path):
+	// each node rate-limits its own ingest. The cardinality and in-flight-memory valves are
+	// head-enforced, so they are applied by the shard primary in primaryWrite. Cache the last
+	// tenant's admission state across a tenant-contiguous run of batches.
+	var (
+		rateRejected int64
+		lastTenant   signal.TenantID
+		lastAdmit    *tenantAdmission
+		lastLimits   tenantpkg.Limits
+		haveTenant   bool
+	)
+
 	emitted := metric.Project(md, func(b *metric.Batch) {
-		tenant := s.normalizeTenant(s.tenantFor(b.Resource(), b.Scope()))
+		tid := s.normalizeTenant(s.tenantFor(b.Resource(), b.Scope()))
+		if !haveTenant || tid != lastTenant {
+			lastTenant, haveTenant = tid, true
+			lastAdmit = s.admissionFor(tid)
+			lastLimits = s.tenant.Resolve(tid).Limits
+		}
+
+		if !lastAdmit.allowRate(lastLimits, int64(b.Len())*engine.SampleBytes, s.now()) {
+			rateRejected += int64(b.Len())
+			lastAdmit.addRate(int64(b.Len()))
+
+			return // whole over-budget batch shed before framing
+		}
 
 		for i := range b.Len() {
 			id := b.IDs[i]
-			sk := shardKeyOf(tenant, shardOf(id, n), n)
+			sk := shardKeyOf(tid, shardOf(id, n), n)
 
 			sw := byShard[sk]
 			if sw == nil {
@@ -838,10 +934,8 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 		routes = append(routes, route{sk, sw.buf.Bytes()})
 	}
 
-	var (
-		rejected atomic.Int64
-		errs     = make([]error, len(routes))
-	)
+	rejects := make([]primaryReject, len(routes))
+	errs := make([]error, len(routes))
 
 	parallel.ForEach(len(routes), clusterWriteFanOut, func(i int) {
 		rej, err := s.routeToPrimary(ctx, signal.Metric, string(routes[i].key), routes[i].payload)
@@ -851,21 +945,28 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 			return
 		}
 
-		rejected.Add(int64(rej))
+		rejects[i] = rej
 	})
+
+	// Combine the origin rate rejections with each primary's per-reason breakdown.
+	rej := rejectTally{rate: rateRejected}
+	for _, r := range rejects {
+		rej.ooo += int64(r.ooo)
+		rej.cardinality += int64(r.cardinality)
+		rej.inflight += int64(r.inflight)
+	}
 
 	for _, err := range errs { // surface the first error deterministically (by route index)
 		if err != nil {
-			return Accepted{Accepted: int64(emitted) - rejected.Load(), Rejected: rejected.Load()}, err
+			return Accepted{Accepted: int64(emitted) - rej.total(), Rejected: rej.total()}, err
 		}
 	}
 
-	// The primary's rejections are out-of-order drops (admission is applied at the origin today).
-	rej := rejected.Load()
-	accepted := int64(emitted) - rej
-	s.emitAdmission(ctx, signal.Metric, accepted, rejectTally{ooo: rej}, 0)
+	total := rej.total()
+	accepted := int64(emitted) - total
+	s.emitAdmission(ctx, signal.Metric, accepted, rej, 0)
 
-	return Accepted{Accepted: accepted, Rejected: rej}, nil
+	return Accepted{Accepted: accepted, Rejected: total, RejectedReason: rej.reason()}, nil
 }
 
 const primaryWritePath = "/internal/primary-write"
@@ -876,13 +977,13 @@ const primaryWritePath = "/internal/primary-write"
 const clusterWriteFanOut = 16
 
 // routeToPrimary sends a signal's tenant write (WAL-framed records) to the tenant's ring primary
-// and returns how many records the primary rejected as out-of-order. The primary — local or
-// remote — is the single authority for the shard, so the OOO decision and the accepted set are
-// consistent across all replicas. The same path serves metrics and logs, dispatched by sig.
-func (s *Storage) routeToPrimary(ctx context.Context, sig signal.Signal, tenant string, walBytes []byte) (rejected int, err error) {
+// and returns the primary's per-reason rejection breakdown. The primary — local or remote — is the
+// single authority for the shard, so the admission decision and the accepted set are consistent
+// across all replicas. The same path serves every signal, dispatched by sig.
+func (s *Storage) routeToPrimary(ctx context.Context, sig signal.Signal, tenant string, walBytes []byte) (primaryReject, error) {
 	primary, ok := s.cluster.membership.Ring().Primary([]byte(tenant))
 	if !ok {
-		return 0, errors.New("cluster: no primary for tenant (empty ring)")
+		return primaryReject{}, errors.New("cluster: no primary for tenant (empty ring)")
 	}
 
 	if s.cluster.membership.AddrOf(primary.ID) == s.cluster.self {
@@ -892,31 +993,43 @@ func (s *Storage) routeToPrimary(ctx context.Context, sig signal.Signal, tenant 
 	return s.sendPrimaryWrite(ctx, s.cluster.membership.AddrOf(primary.ID), cluster.EncodeWrite(sig, tenant, walBytes))
 }
 
-// primaryWrite applies a write as the tenant's primary (OOO-checked, the authoritative decision)
+// primaryWrite applies a write as the tenant's primary — the shard's single authority, so it
+// makes the admission decision (OOO + the cardinality/in-flight valves from the tenant's policy)
 // and replicates the accepted set to the secondary owners at write quorum (the primary is one
-// durable copy, so it needs RF/2 secondary acks). It returns the rejected count. The applying
-// engine is selected by sig (metrics vs logs).
-func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant string, walBytes []byte) (int, error) {
+// durable copy, so it needs RF/2 secondary acks). It returns the per-reason rejection breakdown.
+// The applying engine is selected by sig (metrics vs the record signals).
+func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant string, walBytes []byte) (primaryReject, error) {
+	// Policy is per real tenant; in sharded-metric mode tenant is a shard key ({tenant}/_s{idx}).
+	limits := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(signal.TenantID(tenant)))).Limits
+
 	var (
 		accepted []byte
-		rejected int
+		rej      primaryReject
 		err      error
 	)
 
 	if sig == signal.Metric {
 		var eng *engine.Engine
 		if eng, err = s.engineFor(signal.TenantID(tenant)); err == nil {
-			accepted, rejected, err = eng.ApplyPrimary(walBytes)
+			var res engine.AppendResult
+			accepted, res, err = eng.ApplyPrimary(walBytes, engine.AppendLimits{
+				MaxSeries: limits.MaxSeries, MaxInFlightBytes: limits.MaxInFlightBytes,
+			})
+			rej = primaryReject{ooo: res.RejectedOOO, cardinality: res.RejectedCardinality, inflight: res.RejectedBytes}
 		}
 	} else {
 		var eng *recordengine.Engine
 		if eng, err = s.recordEngineFor(sig, tenant); err == nil {
-			accepted, rejected, err = eng.ApplyPrimary(walBytes)
+			var res recordengine.AppendResult
+			accepted, res, err = eng.ApplyPrimary(walBytes, recordengine.AppendLimits{
+				MaxSeries: limits.MaxSeries, MaxInFlightBytes: limits.MaxInFlightBytes,
+			})
+			rej = primaryReject{ooo: res.RejectedOOO, cardinality: res.RejectedCardinality, inflight: res.RejectedBytes}
 		}
 	}
 
 	if err != nil {
-		return 0, errors.Wrapf(err, "primary apply for tenant %q", tenant)
+		return primaryReject{}, errors.Wrapf(err, "primary apply for tenant %q", tenant)
 	}
 
 	owners := s.cluster.membership.Ring().Lookup([]byte(tenant), s.cluster.rf)
@@ -932,11 +1045,16 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 	// by how many are actually available (availability over strict durability when nodes are down).
 	needAcks := min(s.cluster.rf/2, len(targets))
 	if err := s.cluster.replicator.ReplicateQuorum(ctx, targets, cluster.EncodeWrite(sig, tenant, accepted), needAcks); err != nil {
-		return rejected, errors.Wrapf(err, "replicate tenant %q", tenant)
+		return rej, errors.Wrapf(err, "replicate tenant %q", tenant)
 	}
 
-	return rejected, nil
+	return rej, nil
 }
+
+// primaryReject is the per-reason rejection breakdown the shard primary reports back to the origin
+// (over the primary-write RPC) so clustered ingest attributes OTLP partial-success exactly like the
+// single-node path. The rate valve is applied at the origin, so it is not carried here.
+type primaryReject struct{ ooo, cardinality, inflight int }
 
 // primaryWriteHandler serves the primary-write endpoint: a peer routes a tenant's write here
 // when this node is the ring primary. The reject count is returned in the response body.
@@ -966,7 +1084,7 @@ func (s *Storage) primaryWriteHandler() http.Handler {
 		s.obs.Logger(ctx).Debug("primary-write received",
 			zap.Stringer("signal", sig), zap.String("tenant", tenant), zap.Int("wal_bytes", len(walBytes)))
 
-		rejected, err := s.primaryWrite(ctx, sig, tenant, walBytes)
+		rej, err := s.primaryWrite(ctx, sig, tenant, walBytes)
 		if err != nil {
 			s.obs.Logger(ctx).Error("primary-write failed", zap.Stringer("signal", sig), zap.String("tenant", tenant), zap.Error(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -974,7 +1092,8 @@ func (s *Storage) primaryWriteHandler() http.Handler {
 			return
 		}
 
-		_, _ = fmt.Fprintf(w, "%d", rejected)
+		// Response body is the per-reason reject breakdown: "ooo cardinality inflight".
+		_, _ = fmt.Fprintf(w, "%d %d %d", rej.ooo, rej.cardinality, rej.inflight)
 	})
 }
 
@@ -982,37 +1101,37 @@ func (s *Storage) primaryWriteHandler() http.Handler {
 // count it reports. It is bounded by the write policy: each attempt has a per-try timeout (so a
 // stuck primary is abandoned), but it retries only when the request provably never reached the
 // server ([retry.ConnFailure]) — a write is never re-sent after the primary may have applied it.
-func (s *Storage) sendPrimaryWrite(ctx context.Context, addr string, payload []byte) (int, error) {
+func (s *Storage) sendPrimaryWrite(ctx context.Context, addr string, payload []byte) (primaryReject, error) {
 	s.obs.Logger(ctx).Debug("primary-write send", zap.String("addr", addr), zap.Int("bytes", len(payload)))
 
-	return retry.Do(ctx, s.writePolicy(ctx, rpcOpWrite), func(ctx context.Context) (int, error) {
+	return retry.Do(ctx, s.writePolicy(ctx, rpcOpWrite), func(ctx context.Context) (primaryReject, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+primaryWritePath, bytes.NewReader(payload))
 		if err != nil {
-			return 0, errors.Wrap(err, "build primary-write request")
+			return primaryReject{}, errors.Wrap(err, "build primary-write request")
 		}
 
 		obs.InjectHTTP(ctx, req.Header) // carry the trace into the primary-write RPC
 
 		resp, err := s.cluster.httpc.Do(req)
 		if err != nil {
-			return 0, errors.Wrapf(err, "primary-write to %q", addr)
+			return primaryReject{}, errors.Wrapf(err, "primary-write to %q", addr)
 		}
 		defer func() { _ = resp.Body.Close() }()
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return 0, errors.Wrap(err, "read primary-write response")
+			return primaryReject{}, errors.Wrap(err, "read primary-write response")
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			return 0, errors.Errorf("cluster: primary %q returned %d: %s", addr, resp.StatusCode, bytes.TrimSpace(body))
+			return primaryReject{}, errors.Errorf("cluster: primary %q returned %d: %s", addr, resp.StatusCode, bytes.TrimSpace(body))
 		}
 
-		rejected, err := strconv.Atoi(string(bytes.TrimSpace(body)))
-		if err != nil {
-			return 0, errors.Wrap(err, "parse reject count")
+		var rej primaryReject
+		if _, err := fmt.Sscanf(string(bytes.TrimSpace(body)), "%d %d %d", &rej.ooo, &rej.cardinality, &rej.inflight); err != nil {
+			return primaryReject{}, errors.Wrap(err, "parse reject breakdown")
 		}
 
-		return rejected, nil
+		return rej, nil
 	})
 }

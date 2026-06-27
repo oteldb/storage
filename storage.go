@@ -398,6 +398,15 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 	}, nil
 }
 
+// Machine-readable admission rejection reasons, shared by the OTLP partial-success reason
+// ([rejectTally.reason]) and the admission meta-metrics ([Storage.emitAdmission]).
+const (
+	reasonOutOfOrder       = "out_of_order"
+	reasonRateLimit        = "rate_limit"
+	reasonMaxSeries        = "max_series"
+	reasonMaxInFlightBytes = "max_in_flight_bytes"
+)
+
 // rejectTally accumulates per-reason rejection counts during a write and renders the dominant
 // OTLP partial-success reason.
 type rejectTally struct {
@@ -419,10 +428,10 @@ func (r rejectTally) reason() string {
 	}
 
 	all := []kv{
-		{"out_of_order", r.ooo},
-		{"rate_limit", r.rate},
-		{"max_series", r.cardinality},
-		{"max_in_flight_bytes", r.inflight},
+		{reasonOutOfOrder, r.ooo},
+		{reasonRateLimit, r.rate},
+		{reasonMaxSeries, r.cardinality},
+		{reasonMaxInFlightBytes, r.inflight},
 	}
 
 	var top kv

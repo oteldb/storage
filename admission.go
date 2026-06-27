@@ -277,10 +277,10 @@ func (s *Storage) emitAdmission(ctx context.Context, sig signal.Signal, accepted
 	name := sig.String()
 	a := s.obs.Admission
 	a.Accepted(ctx, accepted, name)
-	a.Rejected(ctx, rej.ooo, name, "out_of_order")
-	a.Rejected(ctx, rej.rate, name, "rate_limit")
-	a.Rejected(ctx, rej.cardinality, name, "max_series")
-	a.Rejected(ctx, rej.inflight, name, "max_in_flight_bytes")
+	a.Rejected(ctx, rej.ooo, name, reasonOutOfOrder)
+	a.Rejected(ctx, rej.rate, name, reasonRateLimit)
+	a.Rejected(ctx, rej.cardinality, name, reasonMaxSeries)
+	a.Rejected(ctx, rej.inflight, name, reasonMaxInFlightBytes)
 	a.SampledDropped(ctx, sampled, name)
 
 	// Shedding is the overload/backpressure event — log it (Warn) so operators see it without
@@ -288,7 +288,7 @@ func (s *Storage) emitAdmission(ctx context.Context, sig signal.Signal, accepted
 	if total := rej.ooo + rej.rate + rej.cardinality + rej.inflight; total > 0 {
 		zctx.From(ctx).Warn("admission shed writes",
 			zap.String("signal", name), zap.Int64("rejected", total),
-			zap.Int64("out_of_order", rej.ooo), zap.Int64("rate_limit", rej.rate),
-			zap.Int64("max_series", rej.cardinality), zap.Int64("max_in_flight_bytes", rej.inflight))
+			zap.Int64(reasonOutOfOrder, rej.ooo), zap.Int64(reasonRateLimit, rej.rate),
+			zap.Int64(reasonMaxSeries, rej.cardinality), zap.Int64(reasonMaxInFlightBytes, rej.inflight))
 	}
 }
