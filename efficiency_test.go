@@ -54,6 +54,8 @@ var densityBudgets = map[string]densityBudget{
 // TestDensityBudget gates on-disk bytes/point against densityBudgets for every density profile,
 // failing if any value shape regresses past its ceiling. Fully deterministic.
 func TestDensityBudget(t *testing.T) {
+	t.Parallel()
+
 	if testing.Short() {
 		t.Skip("density budget ingests sizable corpora; skipped under -short")
 	}
@@ -82,6 +84,8 @@ const maxIngestAllocsPer100 = 80.0
 // TestIngestAllocBudget guards the zero-alloc ingest hot path: a warm re-append of a fixed batch
 // must not allocate more than maxIngestAllocsPer100. A regression to even one alloc per point
 // (100 points ⇒ +100 allocs) trips this immediately.
+//
+//nolint:paralleltest // AllocsPerRun reads process-global malloc counters; parallel tests corrupt it.
 func TestIngestAllocBudget(t *testing.T) {
 	ctx := context.Background()
 
@@ -111,6 +115,8 @@ const maxFetchAllocsPerRow = 0.10
 
 // TestFetchAllocBudget guards fetch-path allocations per row: select an entire metric over its
 // full range, drain it, and assert allocations-per-row stay under the ratchet ceiling.
+//
+//nolint:paralleltest // AllocsPerRun reads process-global malloc counters; parallel tests corrupt it.
 func TestFetchAllocBudget(t *testing.T) {
 	if testing.Short() {
 		t.Skip("fetch alloc budget builds and scans a corpus; skipped under -short")

@@ -39,6 +39,11 @@ jobs:
           go install golang.org/x/perf/cmd/benchstat@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
+      # Build the report generator from THIS PR's code now (before the tree is switched to the base
+      # commit, which may not have the tool) and stash the binary outside the repo.
+      - name: Build report tool
+        run: go build -o "${RUNNER_TEMP}/benchreport" ./internal/cmd/benchreport
+
       - name: Benchmark PR head
         run: go test ${FLAGS} -bench "${BENCH}" ./ | tee head.txt
 
@@ -55,18 +60,17 @@ jobs:
           cp "${RUNNER_TEMP}/golden_bench_test.go" golden_bench_test.go
           go test ${FLAGS} -bench "${BENCH}" ./ | tee base.txt
 
-      - name: Compare with benchstat
+      - name: Build report
         run: |
           if [ -s base.txt ]; then
-            benchstat base.txt head.txt | tee bench.txt
+            benchstat -format csv base.txt head.txt > bench.csv
+            benchstat base.txt head.txt > bench.txt
           else
-            {
-              echo "Base benchmark unavailable (the base commit did not build the golden set);"
-              echo "showing PR-head numbers only — no delta this run."
-              echo
-              benchstat head.txt
-            } | tee bench.txt
+            benchstat -format csv head.txt > bench.csv
+            benchstat head.txt > bench.txt
           fi
+          "${RUNNER_TEMP}/benchreport" -raw bench.txt < bench.csv > report.md
+          cat report.md
 
       - name: Upload results
         uses: actions/upload-artifact@v4
@@ -75,7 +79,9 @@ jobs:
           path: |
             head.txt
             base.txt
+            bench.csv
             bench.txt
+            report.md
           if-no-files-found: warn
 
       - name: Comment on PR
@@ -85,23 +91,7 @@ jobs:
           script: |
             const fs = require('fs');
             const marker = '<!-- golden-bench -->';
-            const table = fs.readFileSync('bench.txt', 'utf8').trim();
-            const body = [
-              marker,
-              '## 📊 Golden benchmarks',
-              '',
-              '`benchstat base → head` — overall values per metric plus the delta vs base ' +
-              '(`~` = no statistically significant change). Shared CI runners are noisy, so trust ' +
-              'large/repeated deltas over single small ones.',
-              '',
-              '```',
-              table,
-              '```',
-              '',
-              '<sub>Read+write golden set: `write/{head,flush,concurrent}`, `read/{fetch_all,fetch_recent}`, `density`. ' +
-              'Lower `ns/op` / higher `MB/s` / `Mpoints/s` is better; lower `B/point`, `B/op`, `allocs/op` is better.</sub>',
-            ].join('\n');
-
+            const body = fs.readFileSync('report.md', 'utf8');
             const { owner, repo } = context.repo;
             const issue_number = context.payload.pull_request.number;
             const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });

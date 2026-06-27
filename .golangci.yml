@@ -79,6 +79,12 @@ linters:
   exclusions:
     generated: lax
     rules:
+      # Test/bench helpers idiomatically take *testing.{T,B} first; forcing context.Context to be
+      # the first parameter fights that convention. (Excluded by text so the rest of revive — incl.
+      # dot-import — stays active; a revive `rules:` block would replace the whole default set.)
+      - linters:
+          - revive
+        text: context-as-argument
       - linters:
           - dupl
           - errcheck
@@ -106,6 +112,16 @@ linters:
       # untrusted-input risks.
       - linters:
           - gosec
+        path: internal/cmd/
+      # internal/cmd/* are developer-run CLI tools, not the library surface; CLI-shaped code —
+      # printing to stdout, long format strings, branchy formatters, repeated external label
+      # literals (e.g. benchstat unit names) — is inherent, so relax the style linters there.
+      - linters:
+          - forbidigo
+          - funlen
+          - gocognit
+          - goconst
+          - lll
         path: internal/cmd/
     paths:
       - third_party$

@@ -187,7 +187,7 @@ func goldenIsPartKey(key string) bool {
 		return false
 	}
 
-	for i := 0; i < len(last); i++ {
+	for i := range len(last) {
 		if last[i] < '0' || last[i] > '9' {
 			return false
 		}

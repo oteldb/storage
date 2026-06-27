@@ -102,7 +102,7 @@ func TestAutoCodecLosslessEdgeCases(t *testing.T) {
 		assert.Equal(t, chunk.CodecDecimal, codec)
 		require.Len(t, got, len(vals))
 		for i := range vals {
-			assert.Equalf(t, vals[i], got[i], "vals[%d] numerically preserved", i) // -0 == +0
+			assert.InDeltaf(t, vals[i], got[i], 0, "vals[%d] numerically preserved", i) // -0 == +0
 		}
 	})
 }

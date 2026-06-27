@@ -129,6 +129,6 @@ func TestMergeWithPrecisionKeepsRecentLossless(t *testing.T) {
 	require.Len(t, got[0].Values, len(vals)+1)
 
 	for i, v := range vals {
-		assert.Equalf(t, v, got[0].Values[i], "value[%d] must stay bit-exact (part not fully cold)", i)
+		assert.InDeltaf(t, v, got[0].Values[i], 0, "value[%d] must stay bit-exact (part not fully cold)", i)
 	}
 }
