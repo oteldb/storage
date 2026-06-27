@@ -206,7 +206,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 			d.mergeSeriesInto(rng, &m, start, maxInt64)
 		}
 
-		ts, values, sf := m.collect()
+		ts, values, sf := m.collect(nil, nil)
 		ts, values, sf = downsample(ts, values, sf, tiers)
 
 		u := idToU128(id)
