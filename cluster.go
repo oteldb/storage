@@ -964,7 +964,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 
 	total := rej.total()
 	accepted := int64(emitted) - total
-	s.emitAdmission(ctx, signal.Metric, accepted, rej, 0)
+	s.emitAdmission(ctx, signal.Metric, accepted, rej, 0, 0)
 
 	return Accepted{Accepted: accepted, Rejected: total, RejectedReason: rej.reason()}, nil
 }

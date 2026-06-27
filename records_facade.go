@@ -127,7 +127,7 @@ func (s *Storage) writeRecordsLocal(
 
 	total := rej.total()
 	accepted := int64(emitted) - total
-	s.emitAdmission(ctx, sig, accepted, rej, 0) // records are not sampled
+	s.emitAdmission(ctx, sig, accepted, rej, 0, 0) // records are not sampled
 
 	return Accepted{Accepted: accepted, Rejected: total, RejectedReason: rej.reason()}, nil
 }
@@ -209,7 +209,7 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 
 	total := rej.total()
 	accepted := int64(emitted) - total
-	s.emitAdmission(ctx, sig, accepted, rej, 0)
+	s.emitAdmission(ctx, sig, accepted, rej, 0, 0)
 
 	return Accepted{Accepted: accepted, Rejected: total, RejectedReason: rej.reason()}, nil
 }

@@ -286,6 +286,7 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 	var (
 		rej            rejectTally
 		sampledDropped int64
+		overflowed     int64
 	)
 
 	// The tenant (hence the engine) is derived from Resource+Scope, which are constant within
@@ -369,6 +370,8 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 
 		res, err := lastEng.AppendBatch(ids, tss, vals, sf, mat, engine.AppendLimits{
 			MaxSeries:        lastLimits.MaxSeries,
+			MaxSeriesSoft:    lastLimits.MaxSeriesSoft,
+			Overflow:         metricOverflow,
 			MaxInFlightBytes: lastLimits.MaxInFlightBytes,
 		})
 		if err != nil {
@@ -381,6 +384,11 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 		rej.cardinality += int64(res.RejectedCardinality)
 		rej.inflight += int64(res.RejectedBytes)
 		lastAdmit.record(int64(res.Accepted), int64(res.RejectedOOO), int64(res.RejectedCardinality), int64(res.RejectedBytes))
+
+		if res.Overflowed > 0 {
+			overflowed += int64(res.Overflowed)
+			lastAdmit.recordOverflowed(int64(res.Overflowed))
+		}
 	})
 
 	if firstErr != nil {
@@ -389,7 +397,7 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 
 	total := rej.total()
 	accepted := int64(emitted) - total
-	s.emitAdmission(ctx, signal.Metric, accepted, rej, sampledDropped)
+	s.emitAdmission(ctx, signal.Metric, accepted, rej, sampledDropped, overflowed)
 
 	return Accepted{
 		Accepted:       accepted,
@@ -406,6 +414,25 @@ const (
 	reasonMaxSeries        = "max_series"
 	reasonMaxInFlightBytes = "max_in_flight_bytes"
 )
+
+// metricOverflowLabel marks the synthetic series that absorbs a tenant's metric series past the
+// soft cardinality budget (Track 3a).
+var metricOverflowLabel = []byte("__overflow__")
+
+// metricOverflow builds the overflow-series identity for a metric series that crossed the soft
+// cardinality budget: it keeps only the metric name and adds __overflow__="true", dropping every
+// other label (and resource/scope), so all overflowing series of a metric collapse into one bucket.
+// That bounds cardinality to ~one extra series per metric name while keeping the metric's sum/count
+// approximately right; the embedder treats __overflow__ like any label. It is invoked only on the
+// degraded path (a new series past the soft line), so it never costs the steady-state hot path.
+func metricOverflow(s signal.Series) signal.Series {
+	name, _ := s.Attributes.Get(metric.LabelName)
+
+	return signal.Series{Attributes: signal.NewAttributes(
+		signal.KeyValue{Key: metric.LabelName, Value: name},
+		signal.KeyValue{Key: metricOverflowLabel, Value: signal.StringValue([]byte("true"))},
+	)}
+}
 
 // rejectTally accumulates per-reason rejection counts during a write and renders the dominant
 // OTLP partial-success reason.
