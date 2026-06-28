@@ -3,7 +3,7 @@ package recordengine_test
 import (
 	"context"
 	"encoding/json"
-	"sort"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -24,7 +24,7 @@ func allTs(t *testing.T, e *recordengine.Engine, r fetch.Request) []int64 {
 		out = append(out, b.Timestamps...)
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 
 	return out
 }
@@ -170,6 +170,7 @@ func BenchmarkRecordFetchLimit(b *testing.B) {
 	// (the limit adds a per-query selection on top of the same columnar scan), so report rows/op as
 	// the downstream-cost proxy alongside ns/op.
 	bench := func(b *testing.B, r fetch.Request) {
+		b.Helper()
 		b.ReportAllocs()
 		b.ResetTimer()
 
