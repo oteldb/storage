@@ -125,12 +125,25 @@ func collectRecordKeys(schema *Schema, records map[signal.SeriesID]*recordCols, 
 	all := start == 0 && end == 0
 
 	for _, buf := range records {
+		if buf.len() == 0 {
+			continue
+		}
+		// When the window covers the whole buffer, the in-window distinct keys equal the buffer's
+		// distinct keys — serve them from the (append-invalidated) cache instead of decoding every
+		// record's attributes per Keys call.
+		if all || (start <= buf.tsMin && buf.tsMax <= end) {
+			for _, key := range buf.distinctAttrKeys() {
+				emit(key)
+			}
+			continue
+		}
+
+		// Partial overlap: only the in-window records' keys count, so scan them.
 		blobs := buf.bytes[k]
 		for i := range buf.ts {
-			if !all && (buf.ts[i] < start || buf.ts[i] > end) {
+			if buf.ts[i] < start || buf.ts[i] > end {
 				continue
 			}
-
 			forEachAttrKey(blobs[i], emit)
 		}
 	}

@@ -111,7 +111,7 @@ func buildFlushColumns(samples map[signal.SeriesID]*sampleBuf) *flushColumns {
 	for _, id := range ids {
 		buf := samples[id]
 
-		ts, values, sf := sortedWindow(buf, minInt64, maxInt64)
+		ts, values, sf := sortedWindow(buf, minInt64, maxInt64, nil)
 		u := idToU128(id)
 
 		for i := range ts {
