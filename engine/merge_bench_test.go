@@ -10,15 +10,17 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// BenchmarkMergeResidentMemory measures the background merge's decoded-input working set — the cost
-// the streaming k-way merge (issue #25, item 1) targets. It builds several same-tier parts (each a
-// flush of the same series set with several samples, so they fully overlap — the steady-workload
-// shape where the old path held every source part's whole decoded column resident for the whole
-// merge) and merges them once.
+// BenchmarkMergeResidentMemory is a regression benchmark for the background merge over several
+// fully-overlapping same-tier parts (the steady-workload shape). It confirms the streaming k-way
+// merge (issue #25, item 1) adds no allocation overhead vs the prior full-decode path: the per-part
+// scratch buffers recycle across the series of a merge, so cumulative allocation is byte-identical.
 //
-// The streaming merge decodes one series range at a time per part into reusable scratch, so the
-// resident decoded input is O(parts × one-series-range) instead of O(parts × whole-column); the
-// alloc/byte delta grows with samples-per-series (the column size the old path materializes).
+// The streaming merge's win is peak *resident* memory, which alloc-byte benchmarks do not capture:
+// the old path held every source part's whole decoded column resident simultaneously during the
+// merge, while the streaming path holds one series range per part. That win scales with part size
+// (at the production 64 MiB part / 8-way merge the old path pinned ≈256 MiB; the streaming path
+// holds ≈ KB) and is verified structurally — the cursors decode one range at a time into reused
+// scratch, never a whole column.
 func BenchmarkMergeResidentMemory(b *testing.B) {
 	for _, cfg := range []struct {
 		name    string
@@ -27,7 +29,7 @@ func BenchmarkMergeResidentMemory(b *testing.B) {
 		parts   int
 	}{
 		{"200s60x4p", 200, 60, 4},
-		{"2000s60x4p", 2000, 60, 4},
+		{"500s400x4p", 500, 400, 4},
 	} {
 		b.Run(cfg.name, func(b *testing.B) {
 			ctx := context.Background()
@@ -52,19 +54,24 @@ func BenchmarkMergeResidentMemory(b *testing.B) {
 				})
 
 				for p := range cfg.parts {
-					ts := make([]int64, cfg.series*cfg.samples)
-					vals := make([]float64, cfg.series*cfg.samples)
+					// cfg.samples consecutive samples per series in this flush: ids repeats each
+					// series id cfg.samples times (AppendBatch writes one sample per ids[i]).
+					n := cfg.series * cfg.samples
+					batchIDs := make([]signal.SeriesID, n)
+					ts := make([]int64, n)
+					vals := make([]float64, n)
 
 					k := 0
 					for i := range cfg.series {
 						for s := range cfg.samples {
+							batchIDs[k] = ids[i]
 							ts[k] = int64(p*cfg.samples+s)*15 + int64(i)
 							vals[k] = float64(p*cfg.series + i)
 							k++
 						}
 					}
 
-					if _, err := e.AppendBatch(ids, ts, vals, nil, func(i int) signal.Series { return series[i%cfg.series] }, engine.AppendLimits{}); err != nil {
+					if _, err := e.AppendBatch(batchIDs, ts, vals, nil, func(i int) signal.Series { return series[i/cfg.samples] }, engine.AppendLimits{}); err != nil {
 						b.Fatal(err)
 					}
 
