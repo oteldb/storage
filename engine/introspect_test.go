@@ -147,6 +147,9 @@ func TestWALState(t *testing.T) {
 	require.NoError(t, err)
 
 	e := engine.New(engine.Config{WAL: sw, Backend: nil})
+	// Release the open WAL segment handle before the test ends so t.TempDir cleanup can remove it on
+	// Windows (which refuses to delete a file held open by a live process).
+	t.Cleanup(func() { _ = e.CloseWAL() })
 	segs, _, _, ok = e.WALState()
 	require.True(t, ok)
 	assert.Equal(t, 0, segs, "no segment opened before the first write")
