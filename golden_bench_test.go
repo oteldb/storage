@@ -217,6 +217,7 @@ func BenchmarkGolden(b *testing.B) {
 	b.Run("read/fetch_recent", benchGoldenFetchRecent)
 	b.Run("query/promql_count_cpu_cores", benchGoldenPromQLCountCPU)
 	b.Run("query/promql_full_scan_count", benchGoldenPromQLFullScan)
+	b.Run("query/promql_cpu_usage_range", benchGoldenPromQLCPUUsage)
 	b.Run("density", benchGoldenDensity)
 }
 
@@ -241,6 +242,13 @@ var (
 	// metric, so it cannot be pushed to the postings index — the querier enumerates and filters all
 	// series. count_cpu_cores' opposite (an equality matcher prunes; this one scans).
 	fullScanCountExpr = `count({__name__=~"node_.+"})`
+	// cpuUsageExpr is the per-instance CPU usage ratio: the user-mode rate over the total rate. It is
+	// a *range* query exercising irate range-vector iteration, sum-by-instance aggregation, and a
+	// vector-matched division (on(instance) group_left). With every mode an identical ramp, the ratio
+	// is the user share of the modes: 1/nodeModes.
+	cpuUsageExpr = `sum by(instance) (irate(node_cpu_seconds_total{job="node_exporter",mode="user"}[1m]))` +
+		` / on(instance) group_left ` +
+		`sum by(instance) (irate(node_cpu_seconds_total{job="node_exporter"}[1m]))`
 )
 
 // nodeCPUCorpus builds the deterministic node_cpu_seconds_total workload (no RNG): per instance, a
@@ -361,6 +369,73 @@ func goldenPromQLBench(b *testing.B, expr string, want float64) {
 
 	for range b.N {
 		goldenInstantScalar(b, eng, qa, expr, ts)
+	}
+}
+
+// goldenRangeMatrix runs a range query over [start, end] at step and returns the result matrix.
+func goldenRangeMatrix(b *testing.B, eng *promengine.Engine, qa *promadapter.Queryable, expr string, start, end time.Time, step time.Duration) promengine.Matrix {
+	b.Helper()
+
+	ctx := context.Background()
+
+	q, err := eng.NewRangeQuery(ctx, qa, nil, expr, start, end, step)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	defer q.Close()
+
+	res := q.Exec(ctx)
+	if res.Err != nil {
+		b.Fatal(res.Err)
+	}
+
+	m, err := res.Matrix()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	return m
+}
+
+// benchGoldenPromQLCPUUsage measures a range query: the per-instance CPU usage ratio. Unlike the
+// instant counts it iterates range vectors (irate over a 1m window) at every step, aggregates by
+// instance, and divides with vector matching — the realistic dashboard-panel query shape. Every
+// mode is an identical ramp, so each instance's ratio is the user share, 1/nodeModes, at every step.
+func benchGoldenPromQLCPUUsage(b *testing.B) {
+	s := nodeCPUStore(b)
+	defer func() { _ = s.Close(context.Background()) }()
+
+	eng, qa, _ := goldenPromQL(s)
+	// Step across the corpus, leaving a 1m lead-in so irate's [1m] window is always populated.
+	start := time.Unix(0, goldenStartTs+int64(time.Minute))
+	end := time.Unix(0, goldenStartTs+int64(nodeCPUPoints-1)*goldenInterval)
+	step := time.Minute
+
+	want := 1.0 / float64(nodeModes)
+
+	check := func() {
+		m := goldenRangeMatrix(b, eng, qa, cpuUsageExpr, start, end, step)
+		if len(m) != nodeInstances {
+			b.Fatalf("cpu_usage returned %d series, want %d", len(m), nodeInstances)
+		}
+
+		for _, ser := range m {
+			for _, p := range ser.Floats {
+				if p.F < want-1e-6 || p.F > want+1e-6 {
+					b.Fatalf("cpu_usage ratio = %v, want %v", p.F, want)
+				}
+			}
+		}
+	}
+
+	check()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		goldenRangeMatrix(b, eng, qa, cpuUsageExpr, start, end, step)
 	}
 }
 

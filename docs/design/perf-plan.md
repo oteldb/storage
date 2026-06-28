@@ -85,6 +85,14 @@ aggregation: `floatSamples` 19.3%, label projection (`ScratchBuilder`/`PromLabel
 sub-millisecond. Allocs **27.1k → 3.3k (−88%)**, B/op **1.68MB → 0.63MB (−62%)**. Race-clean;
 `TestSelectZeroCopyAndRelease` guards the zero-copy values + Seek + release-on-Close lifecycle.
 
+A third golden, `cpu_usage_range`, is a *range* query (per-instance CPU usage ratio:
+`sum by(instance)(irate(...{mode="user"}[1m])) / on(instance) group_left sum by(instance)(irate(...[1m]))`).
+It rides the same lean adapter (≈3.9k allocs, on par with the instant queries), but at ~1.66ms it is
+**not** sub-millisecond and inherently can't be: ~57% of the time is Prometheus' own range evaluator
+(`matrixIterSlice`/`instantValue`, computing irate at ~12 steps over 512+64 series) — engine-side,
+not the adapter (our `Select`+fetch is ~22%, the iterator ~14%). It's kept as a faithful range-query
+shape; shrinking it sub-ms would mean gaming the corpus (fewer series/steps), not a real win.
+
 ### What's left
 
 - **Record byte columns** (`readBytes` 27.6%, the decoded log/attr bytes) alias into the returned
