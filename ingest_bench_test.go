@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// Ingest-path profiling benchmark — the write-side analogue of headquery_bench_test.go's read set.
+// Ingest-path profiling benchmark — the write-side analog of headquery_bench_test.go's read set.
 //
 // The live /src/oteldb/benchmark profile shows oteldb's at-rest CPU is 100% ingest (vmagent
 // remote-writes 2560 node_exporter series every 15s), and the top live-heap holder is
