@@ -1,6 +1,7 @@
 package recordengine
 
 import (
+	"math"
 	"sort"
 
 	"github.com/oteldb/storage/query/fetch"
@@ -99,9 +100,39 @@ type recordCols struct {
 	ts     []int64
 	ints   [][]int64
 	bytes  [][][]byte
+
+	// keyCache memoizes the buffer's distinct record-attribute keys (see distinctAttrKeys); it is
+	// invalidated on every append. tsMin/tsMax bound the buffer's timestamps so Keys can use the
+	// cache only when the query window fully covers the buffer (else a windowed scan is needed).
+	keyCache      [][]byte
+	keyCacheValid bool
+	tsMin, tsMax  int64
 }
 
 func (c *recordCols) len() int { return len(c.ts) }
+
+// noteTS widens the buffer's tracked timestamp range and invalidates the key cache. Called by every
+// append so distinctAttrKeys recomputes only after the rows it summarizes change.
+func (c *recordCols) noteTS(ts int64) {
+	if ts < c.tsMin {
+		c.tsMin = ts
+	}
+	if ts > c.tsMax {
+		c.tsMax = ts
+	}
+	c.keyCacheValid = false
+}
+
+// distinctAttrKeys returns the buffer's sorted distinct record-attribute keys, decoding the records
+// only when the cache is stale. Keys uses this to avoid re-decoding every head record per call.
+func (c *recordCols) distinctAttrKeys() [][]byte {
+	if c.keyCacheValid {
+		return c.keyCache
+	}
+	c.keyCache = distinctRecordKeys(c.schema, c)
+	c.keyCacheValid = true
+	return c.keyCache
+}
 
 // newRecordCols returns an empty recordCols whose selected columns are pre-sized to n rows (so the
 // accumulation copies never reallocate); unselected columns stay nil.
@@ -112,6 +143,8 @@ func newRecordCols(s *Schema, n int, sel colSel) *recordCols {
 		ts:     make([]int64, 0, n),
 		ints:   make([][]int64, s.numInts()),
 		bytes:  make([][][]byte, s.numBytes()),
+		tsMin:  math.MaxInt64,
+		tsMax:  math.MinInt64,
 	}
 
 	for k := range c.ints {
@@ -139,6 +172,8 @@ func (c *recordCols) prepare(s *Schema, n int, sel colSel) {
 	c.schema = s
 	c.sel = sel
 	c.ts = ensureI64(c.ts, n)
+	c.keyCache, c.keyCacheValid = nil, false
+	c.tsMin, c.tsMax = math.MaxInt64, math.MinInt64
 
 	if len(c.ints) != s.numInts() {
 		c.ints = make([][]int64, s.numInts())
@@ -205,6 +240,7 @@ func (c *recordCols) byteSize() int64 {
 // reference (they alias src's owned bytes). src must populate at least c's selected columns.
 func (c *recordCols) appendRow(src *recordCols, i int) {
 	c.ts = append(c.ts, src.ts[i])
+	c.noteTS(src.ts[i])
 
 	for k := range c.ints {
 		if c.sel.ints[k] {
@@ -222,6 +258,9 @@ func (c *recordCols) appendRow(src *recordCols, i int) {
 // appendRange bulk-appends rows [lo, hi) of src's selected columns — one append per column.
 func (c *recordCols) appendRange(src *recordCols, lo, hi int) {
 	c.ts = append(c.ts, src.ts[lo:hi]...)
+	for _, t := range src.ts[lo:hi] {
+		c.noteTS(t)
+	}
 
 	for k := range c.ints {
 		if c.sel.ints[k] {
@@ -260,6 +299,7 @@ func (c *recordCols) keep(lo, hi int) {
 // caller's batch). Every column is populated — head buffers always carry the full schema.
 func (c *recordCols) appendClone(r rec) {
 	c.ts = append(c.ts, r.ts)
+	c.noteTS(r.ts)
 	for k := range c.ints {
 		c.ints[k] = append(c.ints[k], r.ints[k])
 	}
