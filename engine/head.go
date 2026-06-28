@@ -384,26 +384,54 @@ func drain(p postings.Postings) []signal.SeriesID {
 
 // batch builds a fetch batch for series id within [start, end], or nil if it has no
 // samples in the window.
-func (h *head) batch(id signal.SeriesID, start, end int64) *fetch.Batch {
+func (h *head) batch(id signal.SeriesID, start, end int64, e *Engine) *fetch.Batch {
 	s, _ := h.series.Get(id)
 
-	return bufBatch(h.samples[id], id, s, start, end)
+	return bufBatch(h.samples[id], id, s, start, end, e)
 }
 
 // bufBatch builds a fetch batch from one sample buffer within [start, end] (with the given identity),
 // or nil if buf is nil or has no samples in the window. Used for both the live head and the buffers a
-// flush has detached but not yet published as a part.
-func bufBatch(buf *sampleBuf, id signal.SeriesID, s signal.Series, start, end int64) *fetch.Batch {
+// flush has detached but not yet published as a part. When e is non-nil the per-series ts/value
+// buffers are drawn from its pool (and recycled in [enginePlan.releaseParts]); a nil e allocates
+// fresh — the flush path, whose buffers outlive any one fetch.
+func bufBatch(buf *sampleBuf, id signal.SeriesID, s signal.Series, start, end int64, e *Engine) *fetch.Batch {
 	if buf == nil {
 		return nil
 	}
 
-	ts, values, sf := sortedWindow(buf, start, end)
+	ts, values, sf := sortedWindow(buf, start, end, e)
 	if len(ts) == 0 {
 		return nil
 	}
 
 	return &fetch.Batch{ID: id, Series: s, Timestamps: ts, Values: values, ScaleFactors: sf}
+}
+
+// winBuffers returns reusable, length-0 ts/value buffers for a head-window copy. When e has a warm
+// pool the buffers come from it — recycled by [enginePlan.releaseParts] once the merge has copied
+// their samples out — so the hot fetch path stops allocating a fresh pair per series (the single
+// largest read-path allocator). A cold pool or a nil e (the flush path) makes fresh slices pre-sized
+// to n, exactly the original behavior.
+func winBuffers(e *Engine, n int) ([]int64, []float64) {
+	var (
+		ts   []int64
+		vals []float64
+	)
+
+	if e != nil {
+		ts, vals = e.getI64(), e.getF64()
+	}
+
+	if ts == nil {
+		ts = make([]int64, 0, n)
+	}
+
+	if vals == nil {
+		vals = make([]float64, 0, n)
+	}
+
+	return ts, vals
 }
 
 // detach moves the head's sample buffers aside for a flush and installs fresh empty buffers, so new
@@ -439,11 +467,11 @@ type tsv struct {
 
 // sortedWindow returns the buffer's samples within [start, end], sorted by timestamp. The
 // returned sf slice is nil when every weight is 1 (the unsampled common case), else len == len(ts).
-func sortedWindow(buf *sampleBuf, start, end int64) ([]int64, []float64, []float64) {
+func sortedWindow(buf *sampleBuf, start, end int64, e *Engine) ([]int64, []float64, []float64) {
 	// Fast path: head samples are usually ingested in order, so the buffer is already ascending —
 	// skip the sortable scratch and the sort, window-copying directly.
 	if ascendingInt64(buf.ts) {
-		return windowCopy(buf, start, end)
+		return windowCopy(buf, start, end, e)
 	}
 
 	pairs := make([]tsv, len(buf.ts))
@@ -454,14 +482,20 @@ func sortedWindow(buf *sampleBuf, start, end int64) ([]int64, []float64, []float
 	slices.SortFunc(pairs, func(a, b tsv) int { return cmp.Compare(a.ts, b.ts) })
 
 	var (
-		ts     []int64
-		values []float64
-		sf     []float64
+		ts        []int64
+		values    []float64
+		sf        []float64
+		allocated bool
 	)
 
 	for _, p := range pairs {
 		if p.ts < start || p.ts > end {
 			continue
+		}
+
+		if !allocated {
+			ts, values = winBuffers(e, len(buf.ts))
+			allocated = true
 		}
 
 		ts = append(ts, p.ts)
@@ -506,16 +540,25 @@ func ascendingInt64(s []int64) bool {
 
 // windowCopy copies the buffer's [start, end] samples in order (the buffer is already ascending),
 // pre-sizing the result to the buffer length. The sf slice stays nil until the first non-unit weight.
-func windowCopy(buf *sampleBuf, start, end int64) ([]int64, []float64, []float64) {
-	ts := make([]int64, 0, len(buf.ts))
-	values := make([]float64, 0, len(buf.ts))
-
-	var sf []float64
+func windowCopy(buf *sampleBuf, start, end int64, e *Engine) ([]int64, []float64, []float64) {
+	var (
+		ts        []int64
+		values    []float64
+		sf        []float64
+		allocated bool
+	)
 
 	for i := range buf.ts {
 		t := buf.ts[i]
 		if t < start || t > end {
 			continue
+		}
+
+		// Draw the result buffers lazily on the first in-window sample, so a series with no samples
+		// in the window costs no pool traffic (and returns nil, exactly as before).
+		if !allocated {
+			ts, values = winBuffers(e, len(buf.ts))
+			allocated = true
 		}
 
 		ts = append(ts, t)

@@ -447,6 +447,19 @@ func (p *enginePlan) releaseParts() {
 			p.engine.decPool.Put(dp)
 		}
 	}
+
+	// Recycle the per-series head/flush window buffers drawn by winBuffers. The merge has likewise
+	// copied their samples out, so the backing ts/value slices are dead — returning them to the
+	// engine pool is what stops the head fetch path re-allocating a pair per series each fetch.
+	for _, b := range p.headB {
+		p.engine.putI64(b.Timestamps)
+		p.engine.putF64(b.Values)
+	}
+
+	for _, b := range p.flushB {
+		p.engine.putI64(b.Timestamps)
+		p.engine.putF64(b.Values)
+	}
 }
 
 // tsRun is one source's in-window, ascending samples feeding a merge. sf is nil when every weight
@@ -1041,12 +1054,12 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 			p.series[id] = s
 		}
 
-		if hb := e.head.batch(id, r.Start, r.End); hb != nil {
+		if hb := e.head.batch(id, r.Start, r.End, e); hb != nil {
 			p.headB[id] = hb
 		}
 
 		if buf := e.flushing[id]; buf != nil {
-			if fb := bufBatch(buf, id, p.series[id], r.Start, r.End); fb != nil {
+			if fb := bufBatch(buf, id, p.series[id], r.Start, r.End, e); fb != nil {
 				p.flushB[id] = fb
 			}
 		}
