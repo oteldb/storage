@@ -145,6 +145,7 @@ func TestWALState(t *testing.T) {
 
 	sw, err := wal.Create(t.TempDir(), 0)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = sw.Close() }) // release the segment file so TempDir cleanup works on Windows
 
 	e := engine.New(engine.Config{WAL: sw, Backend: nil})
 	segs, _, _, ok = e.WALState()

@@ -119,6 +119,7 @@ func TestWALState(t *testing.T) {
 
 	sw, err := wal.Create(t.TempDir(), 0)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = sw.Close() }) // release the segment file so TempDir cleanup works on Windows
 
 	e := recordengine.New(recordengine.Config{Schema: testSchema, WAL: sw, Prefix: "t/recs"})
 	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "a"}))

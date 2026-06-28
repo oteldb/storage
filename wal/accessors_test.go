@@ -12,6 +12,7 @@ func TestSegmentWriterAccessors(t *testing.T) {
 
 	sw, err := Create(t.TempDir(), 0)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = sw.Close() }) // release the segment file so TempDir cleanup works on Windows
 
 	// Before the first write no segment is open; the epoch starts at the first generation.
 	assert.Equal(t, 0, sw.Seq())
