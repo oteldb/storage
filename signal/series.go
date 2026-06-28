@@ -57,6 +57,14 @@ func (s Series) Clone() Series {
 	return Series{Resource: s.Resource.Clone(), Scope: s.Scope.Clone(), Attributes: s.Attributes.Clone()}
 }
 
+// Intern returns a copy of the identity with every string/byte payload replaced by fn(payload), so
+// all byte storage is drawn from one shared pool (one owned copy per distinct string). It is the
+// long-lived-storage form of Clone: a series index that interns its identities holds references to
+// a single symbol table instead of a private clone per series. A nil fn yields a plain deep copy.
+func (s Series) Intern(fn func([]byte) []byte) Series {
+	return Series{Resource: s.Resource.Intern(fn), Scope: s.Scope.Intern(fn), Attributes: s.Attributes.Intern(fn)}
+}
+
 // Equal reports whether two resources are deeply equal.
 func (r Resource) Equal(o Resource) bool {
 	return bytes.Equal(r.SchemaURL, o.SchemaURL) && r.Attributes.Equal(o.Attributes)
@@ -65,6 +73,18 @@ func (r Resource) Equal(o Resource) bool {
 // Clone returns a deep copy of the resource.
 func (r Resource) Clone() Resource {
 	return Resource{SchemaURL: bytes.Clone(r.SchemaURL), Attributes: r.Attributes.Clone()}
+}
+
+// Intern returns a copy with every string/byte payload replaced by fn(payload). See [Series.Intern].
+func (r Resource) Intern(fn func([]byte) []byte) Resource {
+	url := r.SchemaURL
+	if fn != nil {
+		url = fn(url)
+	} else {
+		url = bytes.Clone(url)
+	}
+
+	return Resource{SchemaURL: url, Attributes: r.Attributes.Intern(fn)}
 }
 
 // AppendHashInput appends the canonical, length-delimited hash pre-image of the resource
@@ -93,6 +113,23 @@ func (s Scope) Clone() Scope {
 		SchemaURL:  bytes.Clone(s.SchemaURL),
 		Attributes: s.Attributes.Clone(),
 	}
+}
+
+// Intern returns a copy with every string/byte payload replaced by fn(payload). See [Series.Intern].
+func (s Scope) Intern(fn func([]byte) []byte) Scope {
+	clone := fn == nil
+	name, version, url := s.Name, s.Version, s.SchemaURL
+	if clone {
+		name = bytes.Clone(name)
+		version = bytes.Clone(version)
+		url = bytes.Clone(url)
+	} else {
+		name = fn(name)
+		version = fn(version)
+		url = fn(url)
+	}
+
+	return Scope{Name: name, Version: version, SchemaURL: url, Attributes: s.Attributes.Intern(fn)}
 }
 
 // AppendHashInput appends the canonical, length-delimited hash pre-image of the scope

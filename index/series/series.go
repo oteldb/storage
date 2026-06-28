@@ -6,6 +6,7 @@
 package series
 
 import (
+	"github.com/oteldb/storage/index/symbols"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -13,23 +14,29 @@ import (
 // one with [New]. Not safe for concurrent use; callers own synchronization.
 type Index struct {
 	byID map[signal.SeriesID]signal.Series
-	buf  []byte // reused hash pre-image buffer (zero-alloc Add)
+	// sym interns every key/value byte string across all stored identities, so the index holds one
+	// owned copy per distinct label/attribute string (referenced by every series sharing it) instead
+	// of a private clone per series. Under a steady metrics workload the same resource/scope and
+	// many label values repeat across series, so this collapses the dominant identity-storage cost.
+	sym *symbols.Table
+	buf []byte // reused hash pre-image buffer (zero-alloc Add)
 }
 
 // New returns an empty [Index].
 func New() *Index {
-	return &Index{byID: make(map[signal.SeriesID]signal.Series)}
+	return &Index{byID: make(map[signal.SeriesID]signal.Series), sym: symbols.New()}
 }
 
 // Add interns a series identity and returns its [signal.SeriesID]. It is idempotent:
-// re-adding an equal identity returns the same id without storing a second copy. A deep
-// copy of s is retained, so the caller may reuse its buffers.
+// re-adding an equal identity returns the same id without storing a second copy. The identity's
+// byte payloads are interned (not cloned), so the caller may reuse its buffers and each distinct
+// string is stored once across the whole index.
 func (ix *Index) Add(s signal.Series) signal.SeriesID {
 	ix.buf = s.AppendHashInput(ix.buf[:0])
 	id := signal.HashBytes(ix.buf)
 
 	if _, ok := ix.byID[id]; !ok {
-		ix.byID[id] = s.Clone()
+		ix.byID[id] = s.Intern(ix.sym.Bytes)
 	}
 
 	return id

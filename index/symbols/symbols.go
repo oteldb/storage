@@ -66,6 +66,17 @@ func (t *Table) Get(id ID) ([]byte, bool) {
 	return t.syms[id], true
 }
 
+// Bytes returns the interned, table-owned byte slice equal to b, inserting it if new. It is the
+// bytes-returning form of [Table.Intern]: callers reference the returned slice instead of cloning b,
+// so all equal byte strings share one owned copy. The caller may reuse b.
+func (t *Table) Bytes(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+
+	return t.syms[t.Intern(b)]
+}
+
 // Len returns the number of interned symbols.
 func (t *Table) Len() int { return len(t.syms) }
 

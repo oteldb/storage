@@ -228,6 +228,34 @@ func (v Value) Clone() Value {
 	}
 }
 
+// Intern returns a copy of the value with every string/byte payload replaced by fn(payload), so all
+// byte storage is drawn from one shared pool (one owned copy per distinct string, referenced by
+// every value that interns the same bytes). Scalar payloads are copied by value. fn owns and
+// deduplicates the returned slice; a nil fn yields a plain deep copy (equivalent to Clone). It is
+// the allocation-free-identity form of Clone for long-lived storage like a series index.
+func (v Value) Intern(fn func([]byte) []byte) Value {
+	switch v.kind {
+	case KindStr, KindBytes:
+		if fn == nil {
+			return Value{kind: v.kind, b: slices.Clone(v.b)}
+		}
+
+		return Value{kind: v.kind, b: fn(v.b)}
+	case KindSlice:
+		src := v.Slice()
+		out := make([]Value, len(src))
+		for i := range src {
+			out[i] = src[i].Intern(fn)
+		}
+
+		return Value{kind: KindSlice, ref: out}
+	case KindMap:
+		return Value{kind: KindMap, ref: v.Map().Intern(fn)}
+	default:
+		return v
+	}
+}
+
 // AppendText appends a canonical text projection of the value to dst (append-style, so
 // callers reuse one buffer). It is used by the string-keyed matching layer and for
 // display; it is not the identity (that is the typed [Attributes.Hash]).
@@ -402,6 +430,29 @@ func (a Attributes) Clone() Attributes {
 	out := make(Attributes, len(a))
 	for i := range a {
 		out[i] = KeyValue{Key: slices.Clone(a[i].Key), Value: a[i].Value.Clone()}
+	}
+
+	return out
+}
+
+// Intern returns a copy of the attribute set with every key and string/byte value payload replaced
+// by fn(payload), so all byte storage is drawn from one shared pool. See [Value.Intern]. A nil fn
+// yields a plain deep copy (equivalent to Clone).
+func (a Attributes) Intern(fn func([]byte) []byte) Attributes {
+	if a == nil {
+		return nil
+	}
+
+	out := make(Attributes, len(a))
+	for i := range a {
+		key := a[i].Key
+		if fn != nil {
+			key = fn(key)
+		} else {
+			key = slices.Clone(key)
+		}
+
+		out[i] = KeyValue{Key: key, Value: a[i].Value.Intern(fn)}
 	}
 
 	return out

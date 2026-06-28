@@ -140,6 +140,49 @@ func TestCloneIsDeep(t *testing.T) {
 	assert.Equal(t, []byte("orig"), cp[0].Value.Str())
 }
 
+// TestInternDeduplicatesAndIsolates verifies Intern through a symbol callback: equal payloads share
+// one backing slice, and the result is isolated from the caller's buffers (the callback owns its
+// returned bytes). A nil callback yields a plain deep copy.
+func TestInternDeduplicatesAndIsolates(t *testing.T) {
+	t.Parallel()
+
+	pool := map[string][]byte{}
+
+	// The callback hands back an owned copy, deduplicated by content.
+	fn := func(b []byte) []byte {
+		if got, ok := pool[string(b)]; ok {
+			return got
+		}
+
+		owned := append([]byte(nil), b...)
+		pool[string(b)] = owned
+
+		return owned
+	}
+
+	a := Attributes{
+		{Key: []byte("k"), Value: StringValue([]byte("v"))},
+		{Key: []byte("k2"), Value: SliceValue(StringValue([]byte("v")), IntValue(1))},
+	}
+	out := a.Intern(fn)
+
+	// Equal string payloads share one backing array across both occurrences of "v".
+	assert.Same(t, &out[0].Value.b[0], &out[1].Value.Slice()[0].b[0], "equal payloads deduplicated")
+
+	// Mutating the caller's buffers must not affect the interned result.
+	a[0].Value.b[0] = 'X'
+	assert.Equal(t, []byte("v"), out[0].Value.Str(), "intern result owns its bytes")
+
+	// Intern(nil) is a plain deep copy (distinct backing arrays, equal content).
+	cp := a.Clone()
+	cp[0].Value.b[0] = 'v' // undo the mutation above for the comparison
+	nilIntern := Attributes{
+		{Key: []byte("k"), Value: StringValue([]byte("v"))},
+		{Key: []byte("k2"), Value: SliceValue(StringValue([]byte("v")), IntValue(1))},
+	}.Intern(nil)
+	assert.True(t, nilIntern.Equal(cp), "nil callback deep-copies")
+}
+
 func TestValueAppendText(t *testing.T) {
 	t.Parallel()
 

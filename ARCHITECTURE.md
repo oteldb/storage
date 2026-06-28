@@ -277,9 +277,12 @@ The L3 indexing layer maps query matchers to the series that satisfy them.
 - **`index/symbols`** — a `[]byte → uint32` interning table (via `pool.ByteIntMap`,
   no string conversion) with a CRC32C serialize/decode. Names and typed-value encodings
   intern to small ids.
-- **`index/series`** — `SeriesID ↔ Series`. `Add` is idempotent (id is the identity hash)
-  and retains a deep copy, so a query reconstructs labels from an id and replay is
-  dedup-safe.
+- **`index/series`** — `SeriesID ↔ Series`. `Add` is idempotent (id is the identity hash) and
+  **interns** the identity's key/value bytes through a per-index `index/symbols` table (via
+  `signal.Series.Intern`), so each distinct label/attribute string is owned once and referenced by
+  every series that shares it — under a steady workload the same resource/scope and many label values
+  repeat across series, so identity storage stays near the distinct-string count rather than scaling
+  one clone per series. A query reconstructs labels from an id and replay is dedup-safe.
 - **`index/postings`** — the inverted index, keyed on **interned symbol ids** (`nameID →
   valueID → sorted []SeriesID`), so it is zero-alloc and **type-preserving** (the value id
   comes from the value's typed encoding). Lazy set-op iterators (`Intersect`/`Merge`/
