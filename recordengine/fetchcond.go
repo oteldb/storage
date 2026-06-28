@@ -20,7 +20,7 @@ func (c *recordCols) colValue(i int, name string) (signal.Value, bool) {
 			return signal.IntValue(c.ints[ref.idx][i]), true
 		}
 
-		return signal.StringValue(c.bytes[ref.idx][i]), true
+		return signal.StringValue(c.bytes[ref.idx].at(i)), true
 	}
 
 	k, ok := c.schema.attrsByteCol()
@@ -28,7 +28,7 @@ func (c *recordCols) colValue(i int, name string) (signal.Value, bool) {
 		return signal.Value{}, false
 	}
 
-	v, found, err := signal.LookupAttribute(c.bytes[k][i], name)
+	v, found, err := signal.LookupAttribute(c.bytes[k].at(i), name)
 	if err != nil || !found {
 		return signal.Value{}, false
 	}
@@ -48,55 +48,49 @@ func (c *recordCols) rowMatches(i int, conds []fetch.Condition) bool {
 	return true
 }
 
-// filterInPlace compacts the columns to keep only the rows satisfying all conditions (AND),
-// reusing the backing arrays — no new allocation (a select-all filter is a no-op truncate).
+// filterInPlace compacts the columns to keep only the rows satisfying all conditions (AND), reusing
+// the backing arrays — no new allocation (a select-all filter is a no-op). It collects the surviving
+// row indices into the reusable rowScratch, then gathers every selected column to them.
 func (c *recordCols) filterInPlace(conds []fetch.Condition) {
-	w := 0
+	idx := c.rowScratch[:0]
 	for i := range c.ts {
-		if !c.rowMatches(i, conds) {
-			continue
+		if c.rowMatches(i, conds) {
+			idx = append(idx, i)
 		}
-
-		if w != i {
-			c.moveRow(i, w)
-		}
-
-		w++
 	}
 
-	c.truncate(w)
+	c.rowScratch = idx
+	if len(idx) == len(c.ts) {
+		return // every row survived — nothing to compact
+	}
+
+	c.gatherRows(idx)
 }
 
-// moveRow overwrites row to with row from (backward compaction) for the selected columns.
-func (c *recordCols) moveRow(from, to int) {
-	c.ts[to] = c.ts[from]
+// gatherRows compacts every selected column (ts always) to the rows named by idx (strictly
+// increasing), in place. The int/timestamp columns move by index; each byte column rewrites its blob
+// forward via [byteCol.gather].
+func (c *recordCols) gatherRows(idx []int) {
+	for p, i := range idx {
+		c.ts[p] = c.ts[i]
+	}
+
+	c.ts = c.ts[:len(idx)]
 
 	for k := range c.ints {
 		if c.sel.ints[k] {
-			c.ints[k][to] = c.ints[k][from]
+			col := c.ints[k]
+			for p, i := range idx {
+				col[p] = col[i]
+			}
+
+			c.ints[k] = col[:len(idx)]
 		}
 	}
 
 	for k := range c.bytes {
 		if c.sel.bytes[k] {
-			c.bytes[k][to] = c.bytes[k][from]
-		}
-	}
-}
-
-// truncate shortens every selected column to n rows.
-func (c *recordCols) truncate(n int) {
-	c.ts = c.ts[:n]
-
-	for k := range c.ints {
-		if c.sel.ints[k] {
-			c.ints[k] = c.ints[k][:n]
-		}
-	}
-
-	for k := range c.bytes {
-		if c.sel.bytes[k] {
-			c.bytes[k] = c.bytes[k][:n]
+			c.bytes[k].gather(idx)
 		}
 	}
 }

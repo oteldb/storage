@@ -142,7 +142,7 @@ func (p *part) appendWindow(ctx context.Context, id signal.SeriesID, acc *record
 // columns are copied out and then recycled by [Engine.recycleDecodeInts]); pass nil to decode into
 // fresh slices (the merge path, which has no recycle point).
 func (p *part) readCols(ctx context.Context, sel colSel, getI64 func() []int64) (*recordCols, error) {
-	c := &recordCols{schema: p.schema, sel: sel, ints: make([][]int64, p.schema.numInts()), bytes: make([][][]byte, p.schema.numBytes())}
+	c := &recordCols{schema: p.schema, sel: sel, ints: make([][]int64, p.schema.numInts()), bytes: make([]byteCol, p.schema.numBytes())}
 
 	dst := func() []int64 {
 		if getI64 != nil {
@@ -185,20 +185,25 @@ func (p *part) readInt64(ctx context.Context, name string, dst []int64) ([]int64
 	return col.Int64(dst)
 }
 
-func (p *part) readBytes(ctx context.Context, name string) ([][]byte, error) {
+// readBytes decodes the named byte column into the contiguous offsets+blob [byteCol] layout,
+// concatenating the per-row cells (which the dictionary decoder returns as views into its shared
+// entries) into one owned blob so the fetch/scan path reads cells with locality and the GC scans two
+// slice headers per column instead of one per row.
+func (p *part) readBytes(ctx context.Context, name string) (byteCol, error) {
 	col, err := p.reader.Column(ctx, name)
 	if err != nil {
-		return nil, err
+		return byteCol{}, err
 	}
 
 	dc, err := col.Bytes()
 	if err != nil {
-		return nil, err
+		return byteCol{}, err
 	}
 
-	out := make([][]byte, dc.Len())
-	for i := range out {
-		out[i] = dc.At(i)
+	n := dc.Len()
+	out := byteCol{offsets: make([]int32, 1, n+1)}
+	for i := range n {
+		out.appendCell(dc.At(i))
 	}
 
 	return out, nil

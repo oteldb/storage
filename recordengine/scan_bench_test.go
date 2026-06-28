@@ -100,6 +100,56 @@ func BenchmarkHeadByteScan(b *testing.B) {
 	require.Equal(b, scanRows/2, rows)
 }
 
+// BenchmarkHeadByteScanProjected is the realistic log-query shape: it projects a single byte column
+// and recycles the result buffers (Recycle), so the per-fetch accumulator and its materialized views
+// are pooled across iterations rather than re-allocated — the path the offsets+blob layout is tuned
+// for. Each returned batch is released so the next fetch reuses its buffers.
+func BenchmarkHeadByteScanProjected(b *testing.B) {
+	ctx := context.Background()
+	e := recordengine.New(recordengine.Config{Schema: testSchema, Prefix: "t/recs"})
+
+	batch := mkBatch(scanStream, scanCorpus(scanRows)...)
+	if _, err := e.AppendBatch(batch, recordengine.AppendLimits{}); err != nil {
+		b.Fatal(err)
+	}
+
+	want := []byte("GET ")
+	r := fetch.Request{
+		Signal: signal.Log, Start: 0, End: 1 << 60,
+		Matchers: []fetch.Matcher{svcMatcher(scanStream)},
+		Conditions: []fetch.Condition{{
+			Column: "body",
+			Match:  func(v signal.Value) bool { return bytes.HasPrefix(v.Str(), want) },
+		}},
+		AllConditions: true,
+		Projection:    []string{"body"},
+		Recycle:       true,
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		it, err := e.Fetch(ctx, r)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		for {
+			bt, err := it.Next(ctx)
+			if err != nil {
+				break
+			}
+
+			bt.Release()
+		}
+
+		if err := it.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkHeadByteIngest drives the head append path for byte columns: each record clones its
 // body/id/attrs cells into the per-stream buffer. It Resets periodically so the buffers do not grow
 // without bound, mirroring the steady-state head.

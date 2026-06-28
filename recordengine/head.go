@@ -199,9 +199,19 @@ func (h *head) appendWindow(id signal.SeriesID, acc *recordCols, start, end int6
 	appendColsWindow(h.records[id], acc, start, end)
 }
 
-// appendColsWindow appends buf's rows whose timestamp is in [start, end] to acc. No-op when buf is nil.
+// appendColsWindow appends buf's rows whose timestamp is in [start, end] to acc. No-op when buf is
+// nil. When the window fully covers the buffer (the common wide-window case) every row is appended in
+// one bulk [recordCols.appendRange] — one blob copy per byte column instead of a per-row append that
+// re-grows the accumulator's blobs. The buffer is unsorted (arrival order), so the fast path keys off
+// the tracked tsMin/tsMax bounds, not the endpoint rows.
 func appendColsWindow(buf, acc *recordCols, start, end int64) {
-	if buf == nil {
+	if buf == nil || buf.len() == 0 {
+		return
+	}
+
+	if buf.tsMin >= start && buf.tsMax <= end {
+		acc.appendRange(buf, 0, buf.len())
+
 		return
 	}
 
@@ -232,18 +242,17 @@ func bufInRange(buf *recordCols, start, end int64) bool {
 // bounding a replica's head to the still-unflushed window. Each buffer is compacted in place.
 func (h *head) trimBelow(t int64) {
 	for _, buf := range h.records {
-		w := 0
+		idx := buf.rowScratch[:0]
 		for i := range buf.ts {
 			if buf.ts[i] > t {
-				if w != i {
-					buf.moveRow(i, w)
-				}
-
-				w++
+				idx = append(idx, i)
 			}
 		}
 
-		buf.truncate(w)
+		buf.rowScratch = idx
+		if len(idx) != len(buf.ts) {
+			buf.gatherRows(idx)
+		}
 	}
 
 	h.recountBytes()

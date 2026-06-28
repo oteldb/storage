@@ -103,7 +103,7 @@ func writePart(ctx context.Context, b backend.Backend, schema *Schema, prefix st
 
 	for k := range schema.byteCols {
 		col := schema.byteColumn(k)
-		if err := w.AddColumn(block.Column{Name: col.Name, Kind: block.KindBytes, Codec: col.Codec, Bytes: f.cols.bytes[k]}); err != nil {
+		if err := w.AddColumn(block.Column{Name: col.Name, Kind: block.KindBytes, Codec: col.Codec, Bytes: f.cols.byteViews(k)}); err != nil {
 			return err
 		}
 	}

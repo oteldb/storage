@@ -585,8 +585,9 @@ recoverable from the batch alone, so the batch carries it via `Batch.SetReleaseS
 (a pointer handle, no allocation) for the engine's shared `recycle` hook to recover. Independently of
 `Recycle`, the record engine **always** pools its part-decode int columns (`i64Pool`): a part's
 decoded timestamp/int columns are copied by value into the accumulators, so they are dead once a part
-is distributed and reuse carries no aliasing risk (the byte columns, which the accumulators alias,
-are left to the GC / a future decode cache). Measured: metric recycling read `B/op` ~59% / time ~24%;
+is distributed and reuse carries no aliasing risk (the byte columns are concatenated into each
+accumulator's own offsets+blob column, so the part's decoded byte data is likewise dead and left to
+the GC / a future decode cache). Measured: metric recycling read `B/op` ~59% / time ~24%;
 record plain read `B/op` −25% (int pooling), record recycling read `B/op` −63% / time −44%.
 
 **`Merge(fetchers...)`** is the fan-out combinator: it runs a Request
@@ -834,7 +835,14 @@ optional side store differ.
   columns opaquely. It owns the head (per-stream column buffers + the `symbols`+`series`+`postings`
   stream-label index), flush to an immutable columnar part sorted by `(stream, ts)`, the durable
   bucket-index + `streams.bin` stateless-read path, append-only merge with retention, per-column
-  blooms, and `Fetch` implementing `fetch.Fetcher`. `Fetch` is heavily tuned: **lazy column decode**
+  blooms, and `Fetch` implementing `fetch.Fetcher`. **Byte columns** (head buffer, fetch
+  accumulators, and the part read path) use a contiguous **offsets+blob** layout (`byteCol`: one
+  `[]byte` data blob + `[]int32` row end-offsets, cell `i` = `data[offsets[i]:offsets[i+1]]`) rather
+  than a `[][]byte` of per-cell slices — the GC scans two headers per column instead of one per row,
+  and a per-record scan walks one allocation with locality. Cell views alias the blob under the
+  read-only-until-next-append rule (an append that grows the blob may move it, so a value retained
+  past an append is copied); the `fetch.NamedColumn` boundary materializes `[][]byte` views into the
+  blob, pooled across recycled fetches. `Fetch` is heavily tuned: **lazy column decode**
   (materialize only the columns a request's conditions + projection reference — a body search
   projecting body touches just `ts`+`body`), decode each surviving part **once** distributing rows
   to per-stream accumulators, pre-size accumulators from row-range counts, bulk-append in-window

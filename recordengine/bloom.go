@@ -31,23 +31,27 @@ func attrToken(key, value []byte) []byte {
 //   - Equality: each value verbatim (exact-match pruning, e.g. trace-by-id).
 //   - Attrs: per attribute (k,v) of each serialized blob, the equality token k‖v and a full-text
 //     token k‖word per value word.
-func buildColumnBloom(mode BloomMode, values [][]byte) []byte {
+func buildColumnBloom(mode BloomMode, values *byteCol) []byte {
 	var (
 		tokens  [][]byte
 		words   [][]byte
 		scratch []byte
 	)
 
+	rows := values.rows()
+
 	switch mode {
 	case BloomFullText:
-		for _, v := range values {
-			tokens = bloom.Tokenize(tokens, v)
+		for i := range rows {
+			tokens = bloom.Tokenize(tokens, values.at(i))
 		}
 	case BloomEquality:
-		tokens = values // each value is its own token
+		for i := range rows {
+			tokens = append(tokens, values.at(i)) // each value is its own token
+		}
 	case BloomAttrs:
-		for _, blob := range values {
-			a, _, err := signal.DecodeAttributes(blob)
+		for i := range rows {
+			a, _, err := signal.DecodeAttributes(values.at(i))
 			if err != nil {
 				continue
 			}
@@ -83,7 +87,7 @@ func writeBlooms(ctx context.Context, b backend.Backend, schema *Schema, prefix 
 			continue
 		}
 
-		data := buildColumnBloom(col.Bloom, cols.bytes[k])
+		data := buildColumnBloom(col.Bloom, &cols.bytes[k])
 		if err := b.Write(ctx, bloomKey(prefix, col.Name), data); err != nil {
 			return errors.Wrapf(err, "write bloom %q", col.Name)
 		}

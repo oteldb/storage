@@ -139,12 +139,12 @@ func collectRecordKeys(schema *Schema, records map[signal.SeriesID]*recordCols, 
 		}
 
 		// Partial overlap: only the in-window records' keys count, so scan them.
-		blobs := buf.bytes[k]
+		blobs := &buf.bytes[k]
 		for i := range buf.ts {
 			if buf.ts[i] < start || buf.ts[i] > end {
 				continue
 			}
-			forEachAttrKey(blobs[i], emit)
+			forEachAttrKey(blobs.at(i), emit)
 		}
 	}
 }

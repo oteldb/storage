@@ -99,7 +99,7 @@ type recordCols struct {
 	sel    colSel
 	ts     []int64
 	ints   [][]int64
-	bytes  [][][]byte
+	bytes  []byteCol // one offsets+blob column per schema byte column (zero-value when unselected)
 
 	// keyCache memoizes the buffer's distinct record-attribute keys (see distinctAttrKeys); it is
 	// invalidated on every append. tsMin/tsMax bound the buffer's timestamps so Keys can use the
@@ -107,6 +107,13 @@ type recordCols struct {
 	keyCache      [][]byte
 	keyCacheValid bool
 	tsMin, tsMax  int64
+
+	// rowScratch is a reusable kept-row index buffer for the in-place row compactions
+	// (filterInPlace / trimBelow), so they stay allocation-free in a steady loop.
+	rowScratch []int
+	// viewBufs memoizes the per-byte-column [][]byte view slices materialized at the
+	// [fetch.NamedColumn] boundary, reused across fetches when the accumulator is pooled.
+	viewBufs [][][]byte
 }
 
 func (c *recordCols) len() int { return len(c.ts) }
@@ -142,7 +149,7 @@ func newRecordCols(s *Schema, n int, sel colSel) *recordCols {
 		sel:    sel,
 		ts:     make([]int64, 0, n),
 		ints:   make([][]int64, s.numInts()),
-		bytes:  make([][][]byte, s.numBytes()),
+		bytes:  make([]byteCol, s.numBytes()),
 		tsMin:  math.MaxInt64,
 		tsMax:  math.MinInt64,
 	}
@@ -155,7 +162,7 @@ func newRecordCols(s *Schema, n int, sel colSel) *recordCols {
 
 	for k := range c.bytes {
 		if sel.bytes[k] {
-			c.bytes[k] = make([][]byte, 0, n)
+			c.bytes[k].ensure(n)
 		}
 	}
 
@@ -188,14 +195,14 @@ func (c *recordCols) prepare(s *Schema, n int, sel colSel) {
 	}
 
 	if len(c.bytes) != s.numBytes() {
-		c.bytes = make([][][]byte, s.numBytes())
+		c.bytes = make([]byteCol, s.numBytes())
 	}
 
 	for k := range c.bytes {
 		if sel.bytes[k] {
-			c.bytes[k] = ensureBytes(c.bytes[k], n)
+			c.bytes[k].ensure(n)
 		} else {
-			c.bytes[k] = nil
+			c.bytes[k] = byteCol{}
 		}
 	}
 }
@@ -210,17 +217,8 @@ func ensureI64(s []int64, n int) []int64 {
 	return make([]int64, 0, n)
 }
 
-// ensureBytes is [ensureI64] for a byte column's [][]byte vector.
-func ensureBytes(s [][]byte, n int) [][]byte {
-	if cap(s) >= n {
-		return s[:0]
-	}
-
-	return make([][]byte, 0, n)
-}
-
 // byteSize returns the in-flight memory the buffer holds: its timestamps, int columns, and the
-// lengths of its byte columns (the basis for the head's MaxInFlightBytes accounting after a trim).
+// blob bytes of its byte columns (the basis for the head's MaxInFlightBytes accounting after a trim).
 func (c *recordCols) byteSize() int64 {
 	n := int64(8 * len(c.ts))
 	for k := range c.ints {
@@ -228,16 +226,14 @@ func (c *recordCols) byteSize() int64 {
 	}
 
 	for k := range c.bytes {
-		for _, b := range c.bytes[k] {
-			n += int64(len(b))
-		}
+		n += c.bytes[k].byteSize()
 	}
 
 	return n
 }
 
-// appendRow appends row i of src's selected columns (ts always). Byte slices are copied by
-// reference (they alias src's owned bytes). src must populate at least c's selected columns.
+// appendRow appends row i of src's selected columns (ts always). Byte cells are copied into c's
+// blob (they no longer alias src). src must populate at least c's selected columns.
 func (c *recordCols) appendRow(src *recordCols, i int) {
 	c.ts = append(c.ts, src.ts[i])
 	c.noteTS(src.ts[i])
@@ -250,7 +246,7 @@ func (c *recordCols) appendRow(src *recordCols, i int) {
 
 	for k := range c.bytes {
 		if c.sel.bytes[k] {
-			c.bytes[k] = append(c.bytes[k], src.bytes[k][i])
+			c.bytes[k].appendCell(src.bytes[k].at(i))
 		}
 	}
 }
@@ -270,7 +266,7 @@ func (c *recordCols) appendRange(src *recordCols, lo, hi int) {
 
 	for k := range c.bytes {
 		if c.sel.bytes[k] {
-			c.bytes[k] = append(c.bytes[k], src.bytes[k][lo:hi]...)
+			c.bytes[k].appendRange(&src.bytes[k], lo, hi)
 		}
 	}
 }
@@ -290,13 +286,14 @@ func (c *recordCols) keep(lo, hi int) {
 
 	for k := range c.bytes {
 		if c.sel.bytes[k] {
-			c.bytes[k] = c.bytes[k][lo:hi]
+			c.bytes[k].keep(lo, hi)
 		}
 	}
 }
 
-// appendClone appends r to a full (head) buffer, cloning its byte fields (the head outlives the
-// caller's batch). Every column is populated — head buffers always carry the full schema.
+// appendClone appends r to a full (head) buffer. appendCell copies each byte cell into the column's
+// blob, so the head owns its bytes (it outlives the caller's batch). Every column is populated —
+// head buffers always carry the full schema.
 func (c *recordCols) appendClone(r rec) {
 	c.ts = append(c.ts, r.ts)
 	c.noteTS(r.ts)
@@ -305,7 +302,7 @@ func (c *recordCols) appendClone(r rec) {
 	}
 
 	for k := range c.bytes {
-		c.bytes[k] = append(c.bytes[k], cloneBytes(r.bytes[k]))
+		c.bytes[k].appendCell(r.bytes[k])
 	}
 }
 
@@ -344,7 +341,7 @@ func (c *recordCols) sortByTs() {
 
 	for k := range c.bytes {
 		if c.sel.bytes[k] {
-			c.bytes[k] = permute(c.bytes[k], idx)
+			c.bytes[k] = permuteBytes(&c.bytes[k], idx)
 		}
 	}
 }
@@ -379,7 +376,9 @@ func (c *recordCols) toBatch(id signal.SeriesID, s signal.Series, projection []s
 	}
 }
 
-// projectColumns returns the named columns to output (all columns when projection is empty).
+// projectColumns returns the named columns to output (all columns when projection is empty). A byte
+// column is materialized to the [fetch.NamedColumn] [][]byte shape as zero-copy views into its blob
+// (see [recordCols.byteViews]); the views share the accumulator's lifetime via the recycle contract.
 func (c *recordCols) projectColumns(projection []string) []fetch.NamedColumn {
 	if len(projection) == 0 {
 		out := make([]fetch.NamedColumn, 0, c.schema.numInts()+c.schema.numBytes())
@@ -388,7 +387,7 @@ func (c *recordCols) projectColumns(projection []string) []fetch.NamedColumn {
 		}
 
 		for k := range c.bytes {
-			out = append(out, fetch.NamedColumn{Name: c.schema.byteColumn(k).Name, Bytes: c.bytes[k]})
+			out = append(out, fetch.NamedColumn{Name: c.schema.byteColumn(k).Name, Bytes: c.byteViews(k)})
 		}
 
 		return out
@@ -404,9 +403,21 @@ func (c *recordCols) projectColumns(projection []string) []fetch.NamedColumn {
 		if ref.kind == KindInt64 {
 			out = append(out, fetch.NamedColumn{Name: name, Int64: c.ints[ref.idx]})
 		} else {
-			out = append(out, fetch.NamedColumn{Name: name, Bytes: c.bytes[ref.idx]})
+			out = append(out, fetch.NamedColumn{Name: name, Bytes: c.byteViews(ref.idx)})
 		}
 	}
 
 	return out
+}
+
+// byteViews materializes byte column k as a [][]byte of zero-copy views into its blob, reusing the
+// per-column view buffer across fetches when the accumulator is pooled.
+func (c *recordCols) byteViews(k int) [][]byte {
+	if len(c.viewBufs) != len(c.bytes) {
+		c.viewBufs = make([][][]byte, len(c.bytes))
+	}
+
+	c.viewBufs[k] = c.bytes[k].views(c.viewBufs[k])
+
+	return c.viewBufs[k]
 }
