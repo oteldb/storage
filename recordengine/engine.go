@@ -2,6 +2,8 @@ package recordengine
 
 import (
 	"context"
+	"slices"
+	"sort"
 	"sync"
 	"time"
 
@@ -327,10 +329,10 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		return nil, err
 	}
 
-	var (
-		batches []*fetch.Batch
-		rows    int
-	)
+	// Pass 1: filter and ts-sort each matched stream's accumulator, collecting the non-empty
+	// survivors and the running total row count (for the limit pushdown).
+	survivors := make([]matchedStream, 0, len(ids))
+	total := 0
 
 	for _, id := range ids {
 		acc := plan.accs[id]
@@ -344,15 +346,35 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		}
 
 		acc.sortByTs()
+		survivors = append(survivors, matchedStream{id: id, acc: acc})
+		total += acc.len()
+	}
 
-		b := acc.toBatch(id, plan.series[id], r.Projection)
+	// Limit pushdown: trim the survivors to the global top-N records by timestamp (newest when
+	// Reverse, else oldest), keeping boundary ties so the result is a correct superset.
+	if r.Limit > 0 && total > r.Limit {
+		limitTrim(survivors, r.Limit, r.Reverse)
+	}
+
+	// Pass 2: materialize the (trimmed) survivors into batches.
+	var (
+		batches []*fetch.Batch
+		rows    int
+	)
+
+	for _, sv := range survivors {
+		if sv.acc.len() == 0 {
+			continue
+		}
+
+		b := sv.acc.toBatch(sv.id, plan.series[sv.id], r.Projection)
 
 		if r.SecondPass != nil && !r.SecondPass(b) {
 			continue
 		}
 
 		if r.Recycle { // hand the accumulator back to the pool when the consumer releases this batch
-			b.SetReleaseState(acc)
+			b.SetReleaseState(sv.acc)
 			b.SetRelease(e.recycle)
 		}
 
@@ -363,6 +385,57 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	record(rows)
 
 	return fetch.NewSliceIterator(batches), nil
+}
+
+// matchedStream pairs a matched stream's id with its accumulated, ts-sorted records during a fetch.
+type matchedStream struct {
+	id  signal.SeriesID
+	acc *recordCols
+}
+
+// limitScratch pools the []int64 scratch limitTrim uses to find the boundary timestamp, so the
+// per-query selection allocates nothing in steady state.
+var limitScratch = sync.Pool{New: func() any { s := make([]int64, 0, 4096); return &s }}
+
+// limitTrim trims the ts-sorted survivor accumulators in place to the global top-N records by
+// timestamp: the newest `limit` when reverse, else the oldest. It keeps every row tying at the
+// boundary timestamp — so the kept set is a superset of the exact top-N (≥ limit rows), and a caller
+// applying its own ordering+limit never loses a boundary row. Each acc is already ascending by ts.
+// The caller guarantees the survivors hold more than `limit` rows in total.
+func limitTrim(survivors []matchedStream, limit int, reverse bool) {
+	// Find the boundary timestamp: the limit-th value from the kept end across all survivors. A
+	// pooled scratch holds every timestamp; sorting int64s is allocation-free and reflection-free.
+	bufp := limitScratch.Get().(*[]int64)
+	all := (*bufp)[:0]
+
+	for _, sv := range survivors {
+		all = append(all, sv.acc.ts...)
+	}
+
+	slices.Sort(all)
+
+	var threshold int64
+	if reverse {
+		threshold = all[len(all)-limit] // limit-th largest ts
+	} else {
+		threshold = all[limit-1] // limit-th smallest ts
+	}
+
+	*bufp = all
+	limitScratch.Put(bufp)
+
+	for _, sv := range survivors {
+		ts := sv.acc.ts
+		if reverse {
+			// Keep the suffix ts >= threshold.
+			lo := sort.Search(len(ts), func(i int) bool { return ts[i] >= threshold })
+			sv.acc.keep(lo, len(ts))
+		} else {
+			// Keep the prefix ts <= threshold.
+			hi := sort.Search(len(ts), func(i int) bool { return ts[i] > threshold })
+			sv.acc.keep(0, hi)
+		}
+	}
 }
 
 // Series returns the identities of the streams matching matchers that hold at least one record in
