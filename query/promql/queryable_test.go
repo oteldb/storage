@@ -93,6 +93,51 @@ func neq(t *testing.T, name, value string) *labels.Matcher {
 	return m
 }
 
+// TestSelectZeroCopyAndRelease covers the zero-copy series path: iterator values are the batch's
+// ns timeline converted to ms, Seek positions correctly, and the held batches are released only on
+// querier.Close (the Recycle lifecycle), not during Select.
+func TestSelectZeroCopyAndRelease(t *testing.T) {
+	t.Parallel()
+
+	released := 0
+	b := series("node_x", "r0", [2]int64{1, 10}, [2]int64{2, 20}, [2]int64{3, 30})
+	b.SetRelease(func(*fetch.Batch) { released++ })
+	f := &fakeFetcher{batches: []*fetch.Batch{b}}
+
+	q, err := NewQueryable(f, "default").Querier(0, 10_000_000)
+	require.NoError(t, err)
+
+	ss := q.Select(context.Background(), false, nil, eq(t, "__name__", "node_x"))
+
+	var got [][2]float64
+
+	require.True(t, ss.Next())
+	s := ss.At()
+	require.False(t, ss.Next(), "exactly one series")
+
+	it := s.Iterator(nil)
+	for it.Next() != chunkenc.ValNone {
+		ts, v := it.At()
+		got = append(got, [2]float64{float64(ts), v})
+	}
+
+	require.NoError(t, it.Err())
+	// series() stamps ts in ns (×1e9); At() returns ms (÷1e6), so the second is 1000× the input.
+	assert.Equal(t, [][2]float64{{1000, 10}, {2000, 20}, {3000, 30}}, got)
+
+	// Seek lands on the first sample at/after the target (ms).
+	it2 := s.Iterator(nil)
+	require.Equal(t, chunkenc.ValFloat, it2.Seek(2000))
+	ts, v := it2.At()
+	assert.Equal(t, int64(2000), ts)
+	assert.InDelta(t, 20.0, v, 0)
+	assert.Equal(t, chunkenc.ValNone, it2.Seek(9999), "past the last sample ⇒ exhausted")
+
+	assert.Equal(t, 0, released, "batches must stay valid until Close")
+	require.NoError(t, q.Close())
+	assert.Equal(t, 1, released, "Close releases the held batch")
+}
+
 func TestSelectPushesPositiveMatcher(t *testing.T) {
 	t.Parallel()
 

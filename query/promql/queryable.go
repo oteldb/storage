@@ -16,12 +16,12 @@ import (
 	"context"
 	"math"
 	"sort"
+	"sync"
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
-	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/util/annotations"
 
 	"github.com/oteldb/storage/query/fetch"
@@ -48,16 +48,44 @@ var hiddenLabels = map[string]struct{}{
 type Queryable struct {
 	fetcher fetch.Fetcher
 	tenant  signal.TenantID
+	labels  *labelCache
 }
 
-// NewQueryable returns a Prometheus storage.Queryable backed by fetcher for the given tenant.
+// NewQueryable returns a Prometheus storage.Queryable backed by fetcher for the given tenant. A
+// single Queryable reused across queries (the embedder's per-tenant adapter) memoizes label
+// projections, so repeated queries pay the projection cost once per series.
 func NewQueryable(fetcher fetch.Fetcher, tenant signal.TenantID) *Queryable {
-	return &Queryable{fetcher: fetcher, tenant: tenant}
+	return &Queryable{fetcher: fetcher, tenant: tenant, labels: newLabelCache()}
 }
 
 // Querier returns a querier over [mint, maxt] (Prometheus milliseconds).
 func (q *Queryable) Querier(mint, maxt int64) (storage.Querier, error) {
-	return &querier{fetcher: q.fetcher, tenant: q.tenant, mint: mint, maxt: maxt}, nil
+	return &querier{fetcher: q.fetcher, tenant: q.tenant, mint: mint, maxt: maxt, labels: q.labels}, nil
+}
+
+// labelCache memoizes a series identity's projected Prometheus label set. The projection is a pure
+// function of the content-addressed [signal.SeriesID], so a cached entry is always valid; the cache
+// is bounded by series cardinality (the same set Prometheus keeps resident) and shared across the
+// Queryable's queriers.
+type labelCache struct {
+	mu sync.RWMutex
+	m  map[signal.SeriesID]labels.Labels
+}
+
+func newLabelCache() *labelCache { return &labelCache{m: make(map[signal.SeriesID]labels.Labels)} }
+
+func (c *labelCache) get(id signal.SeriesID) (labels.Labels, bool) {
+	c.mu.RLock()
+	l, ok := c.m[id]
+	c.mu.RUnlock()
+
+	return l, ok
+}
+
+func (c *labelCache) put(id signal.SeriesID, l labels.Labels) {
+	c.mu.Lock()
+	c.m[id] = l
+	c.mu.Unlock()
 }
 
 type querier struct {
@@ -65,17 +93,31 @@ type querier struct {
 	tenant  signal.TenantID
 	mint    int64
 	maxt    int64
+	labels  *labelCache
+	// held are the fetched batches whose buffers back the returned series (zero-copy). They are kept
+	// alive until [querier.Close] (after the engine has evaluated) and then released, recycling the
+	// engine's result buffers via the fetch [fetch.Request.Recycle] lifecycle.
+	held []*fetch.Batch
+	// lb / scratch are reused across a Select's series to avoid per-series label-builder and per-label
+	// text allocations.
+	lb      labels.ScratchBuilder
+	scratch []byte
 }
 
 // Select resolves the matchers to series over [mint, maxt]. Index-safe matchers are pushed
 // into the fetch request; every fetched series is then re-checked against all matchers
 // (with absent labels treated as the empty string) for exact Prometheus semantics.
+//
+// The returned series are zero-copy: each one's iterator reads its batch's timestamp/value slices
+// directly (no per-sample copy or interface boxing). Those buffers stay valid until [querier.Close],
+// which releases the batches — opting into the engine's buffer-recycling lifecycle (Recycle).
 func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	req := fetch.Request{
 		Tenant:   q.tenant,
 		Start:    msToNsClamp(q.mint, math.MinInt64),
 		End:      msToNsClamp(q.maxt, math.MaxInt64),
 		Matchers: PushableMatchers(matchers),
+		Recycle:  true,
 	}
 
 	it, err := q.fetcher.Fetch(ctx, req)
@@ -90,12 +132,20 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.Select
 
 	series := make([]storage.Series, 0, len(batches))
 	for _, b := range batches {
-		lset := PromLabels(b.Series)
+		lset, ok := q.labels.get(b.ID)
+		if !ok {
+			lset = q.promLabels(b.Series)
+			q.labels.put(b.ID, lset)
+		}
+
 		if !MatchesAll(lset, matchers) {
+			b.Release() // not part of the result — recycle its buffers now
+
 			continue
 		}
 
-		series = append(series, storage.NewListSeries(lset, floatSamples(b.Timestamps, b.Values)))
+		q.held = append(q.held, b) // keep alive until Close; the series aliases its buffers
+		series = append(series, &batchSeries{labels: lset, ts: b.Timestamps, vs: b.Values})
 	}
 
 	if sortSeries {
@@ -144,7 +194,21 @@ func (q *querier) LabelNames(
 	return sortedKeys(seen), nil, nil
 }
 
-func (q *querier) Close() error { return nil }
+func (q *querier) Close() error {
+	for _, b := range q.held {
+		b.Release() // the engine is done evaluating — recycle the result buffers
+	}
+
+	q.held = nil
+
+	return nil
+}
+
+// promLabels is [PromLabels] reusing the querier's scratch builder + text buffer across a Select's
+// series (the per-series result labels are still freshly cloned by ScratchBuilder.Labels).
+func (q *querier) promLabels(s signal.Series) labels.Labels {
+	return promLabelsInto(&q.lb, &q.scratch, s)
+}
 
 // seriesLabels fetches the matching series over the querier window and projects each to its
 // Prometheus label set. It mirrors Select's matching (push the index-safe matchers, then re-check
@@ -248,14 +312,27 @@ func MatchesAll(lset labels.Labels, ms []*labels.Matcher) bool {
 // alongside an [github.com/oteldb/storage.Storage.AggregateMetrics] result) as PromQL labels
 // without duplicating this projection.
 func PromLabels(s signal.Series) labels.Labels {
-	b := labels.NewScratchBuilder(0)
+	var (
+		b       labels.ScratchBuilder
+		scratch []byte
+	)
+
+	return promLabelsInto(&b, &scratch, s)
+}
+
+// promLabelsInto is [PromLabels] writing through a caller-owned scratch builder and text buffer so a
+// loop over many series reuses both (only ScratchBuilder.Labels' final clone is per-series). The
+// builder is reset on entry; scratch holds the most recent label's encoded text between calls.
+func promLabelsInto(b *labels.ScratchBuilder, scratch *[]byte, s signal.Series) labels.Labels {
+	b.Reset()
 
 	add := func(name string, v signal.Value) {
 		if _, hidden := hiddenLabels[name]; hidden {
 			return
 		}
 
-		b.Add(name, string(v.AppendText(nil)))
+		*scratch = v.AppendText((*scratch)[:0])
+		b.Add(name, string(*scratch))
 	}
 
 	for i := range s.Resource.Attributes {
@@ -283,16 +360,6 @@ func PromLabels(s signal.Series) labels.Labels {
 	return b.Labels()
 }
 
-// floatSamples converts the storage ns timeline to Prometheus float samples (ms).
-func floatSamples(ts []int64, values []float64) []chunks.Sample {
-	out := make([]chunks.Sample, len(ts))
-	for i := range ts {
-		out[i] = chunkSample{t: ts[i] / nsPerMs, v: values[i]}
-	}
-
-	return out
-}
-
 func msToNsClamp(ms, clamp int64) int64 {
 	// Any ms outside the range representable in nanoseconds collapses to the open-ended clamp:
 	// otherwise ms*nsPerMs overflows into a garbage window. This covers the MinInt64/MaxInt64
@@ -305,19 +372,82 @@ func msToNsClamp(ms, clamp int64) int64 {
 	return ms * nsPerMs
 }
 
-// chunkSample is a minimal float-only chunks.Sample.
-type chunkSample struct {
-	t int64
-	v float64
+// batchSeries is a zero-copy storage.Series over a fetch batch: its iterator reads the batch's
+// timestamp/value slices directly (converting the storage ns timeline to Prometheus ms on the fly),
+// so a Select materializes no per-sample copy or interface boxing. The aliased buffers stay valid
+// until the producing querier is closed (which releases the batch).
+type batchSeries struct {
+	labels labels.Labels
+	ts     []int64
+	vs     []float64
 }
 
-func (s chunkSample) T() int64                    { return s.t }
-func (chunkSample) ST() int64                     { return 0 } // no created/start timestamp for float-only samples
-func (s chunkSample) F() float64                  { return s.v }
-func (chunkSample) H() *histogram.Histogram       { return nil }
-func (chunkSample) FH() *histogram.FloatHistogram { return nil }
-func (chunkSample) Type() chunkenc.ValueType      { return chunkenc.ValFloat }
-func (s chunkSample) Copy() chunks.Sample         { return s }
+func (s *batchSeries) Labels() labels.Labels { return s.labels }
+
+func (s *batchSeries) Iterator(it chunkenc.Iterator) chunkenc.Iterator {
+	if r, ok := it.(*batchSeriesIterator); ok { // reuse the engine's recycled iterator
+		r.reset(s.ts, s.vs)
+
+		return r
+	}
+
+	r := &batchSeriesIterator{}
+	r.reset(s.ts, s.vs)
+
+	return r
+}
+
+// batchSeriesIterator is a float-only chunkenc.Iterator over a batch's parallel ts/value slices.
+type batchSeriesIterator struct {
+	ts []int64
+	vs []float64
+	i  int
+}
+
+func (it *batchSeriesIterator) Next() chunkenc.ValueType {
+	if it.i+1 < len(it.ts) {
+		it.i++
+
+		return chunkenc.ValFloat
+	}
+
+	it.i = len(it.ts)
+
+	return chunkenc.ValNone
+}
+
+//nolint:govet // chunkenc.Iterator.Seek's signature (int64) ValueType is not io.Seeker's.
+func (it *batchSeriesIterator) Seek(t int64) chunkenc.ValueType {
+	if it.i < 0 {
+		it.i = 0
+	}
+
+	for ; it.i < len(it.ts); it.i++ {
+		if it.ts[it.i]/nsPerMs >= t {
+			return chunkenc.ValFloat
+		}
+	}
+
+	return chunkenc.ValNone
+}
+
+func (it *batchSeriesIterator) At() (int64, float64) { return it.ts[it.i] / nsPerMs, it.vs[it.i] }
+func (it *batchSeriesIterator) AtT() int64           { return it.ts[it.i] / nsPerMs }
+func (*batchSeriesIterator) AtST() int64             { return 0 } // float-only: no start timestamp
+
+func (*batchSeriesIterator) AtHistogram(*histogram.Histogram) (int64, *histogram.Histogram) {
+	return 0, nil
+}
+
+func (*batchSeriesIterator) AtFloatHistogram(*histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
+	return 0, nil
+}
+
+func (*batchSeriesIterator) Err() error { return nil }
+
+func (it *batchSeriesIterator) reset(ts []int64, vs []float64) {
+	it.ts, it.vs, it.i = ts, vs, -1
+}
 
 // sliceSeriesSet is a storage.SeriesSet over a fixed slice of series.
 type sliceSeriesSet struct {
