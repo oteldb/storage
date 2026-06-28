@@ -50,6 +50,31 @@ func TestAttributesBinaryRoundTrip(t *testing.T) {
 	assert.Equal(t, a.Hash(), got.Hash())
 }
 
+// TestAppendAttributesReuse decodes several blobs through one reused buffer (the row-by-row
+// materialization pattern) and asserts each result matches a fresh DecodeAttributes.
+func TestAppendAttributesReuse(t *testing.T) {
+	t.Parallel()
+
+	sets := []Attributes{
+		NewAttributes(kv("job", sv("api")), kv("n", IntValue(1))),
+		NewAttributes(kv("region", sv("eu")), kv("cpu", sv("0")), kv("mode", sv("user"))),
+		NewAttributes(kv("only", sv("one"))),
+	}
+
+	buf := make(Attributes, 0, 8)
+	for _, want := range sets {
+		blob := want.AppendHashInput(nil)
+
+		got, n, err := AppendAttributes(buf[:0], blob)
+		require.NoError(t, err)
+		assert.Positive(t, n)
+		assert.True(t, want.Equal(got), "reused-buffer decode equals the source set")
+		assert.Equal(t, want.Hash(), got.Hash())
+
+		buf = got // carry the (grown) backing array to the next iteration
+	}
+}
+
 func TestLookupAttribute(t *testing.T) {
 	t.Parallel()
 

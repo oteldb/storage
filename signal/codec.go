@@ -2,6 +2,7 @@ package signal
 
 import (
 	"encoding/binary"
+	"slices"
 
 	"github.com/go-faster/errors"
 )
@@ -120,35 +121,44 @@ func decodeScope(src []byte) (Scope, int, error) {
 // DecodeAttributes parses the canonical binary form produced by
 // [Attributes.AppendHashInput]. Keys and string/byte values alias src.
 func DecodeAttributes(src []byte) (Attributes, int, error) {
+	return AppendAttributes(nil, src)
+}
+
+// AppendAttributes decodes the canonical attribute encoding into dst (reusing its capacity) and
+// returns the extended slice with the number of bytes consumed. Keys and string/byte values alias
+// src. Pass a reused dst[:0] to decode many blobs without the per-call slice allocation that
+// [DecodeAttributes] incurs; the result is consumed before the next call (its keys/values alias src,
+// not dst), so the same buffer can back row-by-row materialization.
+func AppendAttributes(dst Attributes, src []byte) (Attributes, int, error) {
 	count, n := binary.Uvarint(src)
 	if n <= 0 {
-		return nil, 0, errors.Wrap(ErrMalformed, "attribute count")
+		return dst, 0, errors.Wrap(ErrMalformed, "attribute count")
 	}
 
 	off := n
 	if count > uint64(len(src)) { // each attribute needs ≥1 byte; guards against OOM
-		return nil, 0, errors.Wrapf(ErrMalformed, "attribute count %d exceeds input", count)
+		return dst, 0, errors.Wrapf(ErrMalformed, "attribute count %d exceeds input", count)
 	}
 
-	a := make(Attributes, 0, count)
+	dst = slices.Grow(dst, int(count)) // reuse dst's capacity; one growth for a fresh buffer
 	for range count {
 		key, kn, err := readLenBytes(src[off:])
 		if err != nil {
-			return nil, 0, errors.Wrap(err, "attribute key")
+			return dst, 0, errors.Wrap(err, "attribute key")
 		}
 
 		off += kn
 
 		v, vn, err := DecodeValue(src[off:])
 		if err != nil {
-			return nil, 0, err
+			return dst, 0, err
 		}
 
 		off += vn
-		a = append(a, KeyValue{Key: key, Value: v})
+		dst = append(dst, KeyValue{Key: key, Value: v})
 	}
 
-	return a, off, nil
+	return dst, off, nil
 }
 
 // LookupAttribute scans the canonical binary form produced by [Attributes.AppendHashInput] for
