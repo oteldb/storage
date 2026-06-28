@@ -137,14 +137,17 @@ func TestWALState(t *testing.T) {
 	t.Parallel()
 
 	// The ephemeral engine has no WAL.
-	_, _, _, ok := flushEngine().WALState()
+	segs, bytes, epoch, ok := flushEngine().WALState()
 	assert.False(t, ok)
+	assert.Zero(t, segs)
+	assert.Zero(t, bytes)
+	assert.Zero(t, epoch)
 
 	sw, err := wal.Create(t.TempDir(), 0)
 	require.NoError(t, err)
 
 	e := engine.New(engine.Config{WAL: sw, Backend: nil})
-	segs, bytes, epoch, ok := e.WALState()
+	segs, _, _, ok = e.WALState()
 	require.True(t, ok)
 	assert.Equal(t, 0, segs, "no segment opened before the first write")
 

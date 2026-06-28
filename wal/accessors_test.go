@@ -8,6 +8,8 @@ import (
 )
 
 func TestSegmentWriterAccessors(t *testing.T) {
+	t.Parallel()
+
 	sw, err := Create(t.TempDir(), 0)
 	require.NoError(t, err)
 

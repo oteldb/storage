@@ -111,8 +111,11 @@ func TestMergeRunningAndBacklog(t *testing.T) {
 func TestWALState(t *testing.T) {
 	t.Parallel()
 
-	_, _, _, ok := newEngine(t, backend.Memory()).WALState()
+	segs, bytes, epoch, ok := newEngine(t, backend.Memory()).WALState()
 	assert.False(t, ok, "no WAL configured")
+	assert.Zero(t, segs)
+	assert.Zero(t, bytes)
+	assert.Zero(t, epoch)
 
 	sw, err := wal.Create(t.TempDir(), 0)
 	require.NoError(t, err)
@@ -120,7 +123,7 @@ func TestWALState(t *testing.T) {
 	e := recordengine.New(recordengine.Config{Schema: testSchema, WAL: sw, Prefix: "t/recs"})
 	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "a"}))
 
-	segs, bytes, epoch, ok := e.WALState()
+	segs, bytes, epoch, ok = e.WALState()
 	require.True(t, ok)
 	assert.GreaterOrEqual(t, segs, 1, "a write opened a segment")
 	assert.Positive(t, bytes)

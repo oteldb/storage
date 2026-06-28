@@ -23,6 +23,7 @@ type PartStat struct {
 // (the manifest is already cached on the open part, so only Bytes incurs additional I/O).
 type PartDetailStat struct {
 	PartStat
+
 	Bytes   int64        // sum of the part's backend object sizes
 	Chunks  int          // sparse-index granules: ceil(RowCount / GranuleSize)
 	Columns []ColumnStat // per-column physical layout

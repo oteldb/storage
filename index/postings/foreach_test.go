@@ -10,6 +10,8 @@ import (
 )
 
 func TestForEachName(t *testing.T) {
+	t.Parallel()
+
 	p := buildIndex()
 
 	type card struct {
@@ -30,6 +32,8 @@ func TestForEachName(t *testing.T) {
 // TestForEachNameDeduplicates verifies a series added more than once for the same value is counted
 // once (ForEachName deduplicates like any read).
 func TestForEachNameDeduplicates(t *testing.T) {
+	t.Parallel()
+
 	p := NewMemPostings()
 	p.Add(sid(1), nJob, vAPI)
 	p.Add(sid(1), nJob, vAPI) // duplicate triple
@@ -46,6 +50,8 @@ func TestForEachNameDeduplicates(t *testing.T) {
 // each series carries one value per name, so the distinct-series count equals the sum of the
 // deduplicated value buckets.
 func TestForEachNameProperty(t *testing.T) {
+	t.Parallel()
+
 	const (
 		names  = 5
 		values = 4

@@ -25,6 +25,7 @@ type PartInfo struct {
 // size and its column/codec layout and chunk (granule) count.
 type PartDetail struct {
 	PartInfo
+
 	Bytes   int64        // sum of the part's backend object sizes
 	Chunks  int          // sparse-index granules
 	Columns []ColumnInfo // per-column physical layout
