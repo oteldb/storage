@@ -95,6 +95,14 @@ func (m mergeFetcher) Fetch(ctx context.Context, r Request) (Iterator, error) {
 	mpf.Add("batches", int64(len(out)))
 	mpf.End()
 
+	// MergeBatches deep-copies into fresh batches, so the children's buffers are now dead — release
+	// them to recycle the producing engines' pools (the output batches carry no hook).
+	for _, g := range groups {
+		for _, b := range g {
+			b.Release()
+		}
+	}
+
 	return NewSliceIterator(out), nil
 }
 

@@ -61,6 +61,21 @@ type Engine struct {
 	// (persisted in the bucket index). Current head records are written to the WAL at flushedEpoch+1,
 	// so on recovery the engine replays only WAL segments past flushedEpoch — exactly-once.
 	flushedEpoch uint64
+
+	// recPool recycles per-stream fetch accumulators (*recordCols) when a caller opts into batch
+	// reuse via fetch.Request.Recycle and releases each batch. The accumulator's columns back the
+	// returned batch, so they can only be pooled once the consumer signals it is done (see recycle).
+	// Empty unless Recycle is requested — the default path never touches it.
+	recPool sync.Pool
+	// recycle is the single shared batch-release hook (one closure for every batch, so installing it
+	// costs no per-batch allocation). It recovers the accumulator from the batch's release state and
+	// returns it to recPool for the next fetch to re-arm.
+	recycle func(*fetch.Batch)
+	// i64Pool recycles the part-decode int columns (timestamp + int values). A part's decoded int
+	// columns are copied by value into the per-stream accumulators (appendRange/appendRow), so they
+	// are dead once a part is distributed and can always be reused — independent of Recycle and the
+	// byte columns (which the accumulators alias and so must not be pooled here).
+	i64Pool sync.Pool
 }
 
 var _ fetch.Fetcher = (*Engine)(nil)
@@ -76,6 +91,12 @@ func New(cfg Config) *Engine {
 	}
 
 	e := &Engine{cfg: cfg, head: newHead(cfg.Schema)}
+	e.recycle = func(b *fetch.Batch) {
+		if c, ok := b.ReleaseState().(*recordCols); ok {
+			e.recPool.Put(c)
+		}
+	}
+
 	if cfg.WAL != nil {
 		cfg.WAL.SetEpoch(e.flushedEpoch + 1) // first head generation
 	}
@@ -328,6 +349,11 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 		if r.SecondPass != nil && !r.SecondPass(b) {
 			continue
+		}
+
+		if r.Recycle { // hand the accumulator back to the pool when the consumer releases this batch
+			b.SetReleaseState(acc)
+			b.SetRelease(e.recycle)
 		}
 
 		batches = append(batches, b)
@@ -595,6 +621,7 @@ func (e *Engine) streamInRangeLocked(id signal.SeriesID, start, end int64) bool 
 // accumulators already seeded from the head, the acquired (ref-held) live parts still to read, and the
 // captured stream identities. Its [fetchPlan.readParts] does the backend I/O off the lock.
 type fetchPlan struct {
+	e          *Engine
 	sel        colSel
 	ids        []signal.SeriesID
 	accs       map[signal.SeriesID]*recordCols
@@ -607,8 +634,23 @@ type fetchPlan struct {
 // stream in-window (time + bloom + stream prune), seeds each stream's accumulator from the head
 // buffer, and captures stream identities — all under the lock, so the subsequent part reads run
 // lock-free. Caller holds e.mu (read lock). The acquired parts must be released with releaseParts.
+// getRecordCols returns a fetch accumulator pre-sized to n rows for the given selection, reusing a
+// pooled buffer when one is available (recycled by a prior released batch). Used only on the opt-in
+// Recycle path; otherwise [newRecordCols] allocates fresh.
+func (e *Engine) getRecordCols(n int, sel colSel) *recordCols {
+	if v := e.recPool.Get(); v != nil {
+		c, _ := v.(*recordCols)
+		c.prepare(e.cfg.Schema, n, sel)
+
+		return c
+	}
+
+	return newRecordCols(e.cfg.Schema, n, sel)
+}
+
 func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *fetchPlan {
 	p := &fetchPlan{
+		e:      e,
 		sel:    selectColumns(e.cfg.Schema, r),
 		ids:    ids,
 		accs:   make(map[signal.SeriesID]*recordCols, len(ids)),
@@ -639,7 +681,13 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *fetchPlan {
 			}
 		}
 
-		acc := newRecordCols(e.cfg.Schema, n, p.sel)
+		var acc *recordCols
+		if r.Recycle {
+			acc = e.getRecordCols(n, p.sel) // reuse a pooled accumulator; released back on Batch.Release
+		} else {
+			acc = newRecordCols(e.cfg.Schema, n, p.sel)
+		}
+
 		e.head.appendWindow(id, acc, r.Start, r.End) // seed from the live head under the lock
 		if buf := e.flushing[id]; buf != nil {
 			appendColsWindow(buf, acc, r.Start, r.End) // …and from records mid-flush (not yet a part)
@@ -659,7 +707,7 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *fetchPlan {
 // in-window rows to the per-stream accumulators. Runs lock-free: the parts are immutable and ref-held.
 func (p *fetchPlan) readParts(ctx context.Context) error {
 	for _, part := range p.liveParts {
-		cols, err := part.readCols(ctx, p.sel)
+		cols, err := part.readCols(ctx, p.sel, p.e.getI64)
 		if err != nil {
 			return err
 		}
@@ -669,6 +717,8 @@ func (p *fetchPlan) readParts(ctx context.Context) error {
 				appendWindowRows(p.accs[id], cols, rng, p.start, p.end)
 			}
 		}
+
+		p.e.recycleDecodeInts(cols) // the int columns are copied into the accumulators; reuse them
 	}
 
 	return nil
@@ -776,4 +826,30 @@ func (e *Engine) publishLocked(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// getI64 returns a recycled int64 buffer (length 0), or nil when the pool is empty (the caller then
+// decodes into a fresh slice). Used for part-decode int columns on the fetch path.
+func (e *Engine) getI64() []int64 {
+	if v := e.i64Pool.Get(); v != nil {
+		return (*v.(*[]int64))[:0]
+	}
+
+	return nil
+}
+
+func (e *Engine) putI64(s []int64) {
+	if cap(s) > 0 {
+		e.i64Pool.Put(&s)
+	}
+}
+
+// recycleDecodeInts returns a distributed part's decoded int columns (timestamp + int values) to the
+// pool. Their values have already been copied into the per-stream accumulators, so they are dead. The
+// byte columns are left untouched — the accumulators alias them into the returned batches.
+func (e *Engine) recycleDecodeInts(c *recordCols) {
+	e.putI64(c.ts)
+	for k := range c.ints {
+		e.putI64(c.ints[k])
+	}
 }

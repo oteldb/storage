@@ -529,7 +529,30 @@ operator-free. `Fetcher.Fetch` returns an `Iterator` of `*Batch{ID, Series, Time
 Columns}`: metrics populate `Values`, logs populate the named `Columns` (`Projection` narrows
 them, `SecondPass` post-filters). The fields are zero-valued for the other signal, so the metric
 path is unchanged by the log additions. `SliceIterator` and `Drain` are
-the in-memory helpers. **`Merge(fetchers...)`** is the fan-out combinator: it runs a Request
+the in-memory helpers.
+
+**Opt-in buffer reuse (`Request.Recycle` + `Batch.Release`).** A batch's `Timestamps`/`Values`
+slices (and, for record signals, its `Columns`) are the engine's buffers. When a caller sets
+`Request.Recycle` and calls `Batch.Release()` once done with each batch, the engine hands out (and
+recycles) those buffers from a pool via a single shared release hook (no per-batch closure). It is
+**opt-in and default-off**: with `Recycle` unset the engine allocates fresh buffers and the caller
+need not release, so the non-recycling path takes no pool overhead and is byte-for-byte as before.
+After `Release` the batch and its slices must not be read. Pass-through decorators (single-child
+`Merge`, split) forward the hook; a decorator that retains/clones a batch (the results cache, a
+multi-child `Merge`) produces hookless copies and releases its inputs. The cluster read handler sets
+`Recycle` and releases after serializing, so a fan-out read recycles the serving node's buffers.
+
+The metric engine recovers its pooled buffers directly from the batch's own slices. The record
+engine's pool entry is the per-stream accumulator (`*recordCols`, whose columns back `Columns`), not
+recoverable from the batch alone, so the batch carries it via `Batch.SetReleaseState`/`ReleaseState`
+(a pointer handle, no allocation) for the engine's shared `recycle` hook to recover. Independently of
+`Recycle`, the record engine **always** pools its part-decode int columns (`i64Pool`): a part's
+decoded timestamp/int columns are copied by value into the accumulators, so they are dead once a part
+is distributed and reuse carries no aliasing risk (the byte columns, which the accumulators alias,
+are left to the GC / a future decode cache). Measured: metric recycling read `B/op` ~59% / time ~24%;
+record plain read `B/op` −25% (int pooling), record recycling read `B/op` −63% / time −44%.
+
+**`Merge(fetchers...)`** is the fan-out combinator: it runs a Request
 against several fetchers and merges their batches by series id (timestamp-ordered, later child
 wins a duplicate timestamp) — the basis for multi-tenant / cross-tenant reads (via
 `Storage.Fetcher`) and, later, cluster fan-out across replicas. A single child is a
@@ -587,7 +610,15 @@ What the adapter does (the non-trivial, reusable part):
 - **Label projection.** A `signal.Series` becomes a `labels.Labels`: resource/scope/point
   attributes flatten to string labels, scope name/version under `otel.scope.*`, the internal
   reserved labels (`__unit__`/`__kind__`/`__temporality__`/`__monotonic__`) hidden, `__name__`
-  kept. Each fetched batch becomes a Prometheus `SeriesSet` of float samples.
+  kept. The projection is a pure function of the content-addressed `SeriesID`, so a `Queryable`
+  reused across queries **memoizes** it per id (bounded by cardinality — the same label set
+  Prometheus keeps resident) and a Select's series share one scratch builder + text buffer.
+- **Zero-copy samples + buffer recycling.** Each fetched batch becomes a Prometheus series whose
+  iterator reads the batch's `Timestamps`/`Values` slices **directly** (ns→ms on the fly) — no
+  per-sample copy or `chunks.Sample` interface boxing. The aliased buffers stay valid until the
+  querier is closed: Select sets `fetch.Request.Recycle`, holds the matched batches, and
+  `querier.Close` (called by the engine after evaluation) releases them, recycling the engine's
+  result buffers (§3g). A batch that fails the matcher re-check is released immediately.
 - **Time units.** Storage is unix **nanoseconds**, Prometheus is **milliseconds**; the
   adapter converts both directions (querier window and sample timestamps).
 

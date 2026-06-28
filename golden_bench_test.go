@@ -19,9 +19,13 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
+
+	promengine "github.com/prometheus/prometheus/promql"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/query/fetch"
+	promadapter "github.com/oteldb/storage/query/promql"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
 )
@@ -209,8 +213,294 @@ func BenchmarkGolden(b *testing.B) {
 	b.Run("write/flush", benchGoldenWriteFlush)
 	b.Run("write/concurrent", benchGoldenWriteConcurrent)
 	b.Run("read/fetch_all", benchGoldenFetchAll)
+	b.Run("read/fetch_all_release", benchGoldenFetchAllRelease)
 	b.Run("read/fetch_recent", benchGoldenFetchRecent)
+	b.Run("query/promql_count_cpu_cores", benchGoldenPromQLCountCPU)
+	b.Run("query/promql_full_scan_count", benchGoldenPromQLFullScan)
+	b.Run("query/promql_cpu_usage_range", benchGoldenPromQLCPUUsage)
 	b.Run("density", benchGoldenDensity)
+}
+
+// node_cpu_seconds_total benchmark fixture — a node_exporter-shaped counter exercising the realistic
+// nested-aggregation query `count_cpu_cores` from /src/oteldb/benchmark
+// (count(count(node_cpu_seconds_total{job="node_exporter"}) by (cpu))). The corpus has job+instance
+// on the resource and cpu+mode on the data points, so every node_exporter label is matchable.
+const (
+	nodeInstances = 4
+	nodeCPUs      = 16
+	nodeModes     = 8
+	nodeCPUPoints = 50 // ⇒ nodeInstances*nodeCPUs*nodeModes = 512 series
+)
+
+var (
+	nodeCPUName  = []byte("node_cpu_seconds_total")
+	nodeCPUModes = [nodeModes]string{"user", "system", "idle", "iowait", "irq", "softirq", "nice", "steal"}
+	// countCPUCoresExpr is the benchmark query: an inner per-cpu count collapsed by an outer count —
+	// the canonical "how many CPU cores" PromQL expression.
+	countCPUCoresExpr = `count(count(node_cpu_seconds_total{job="node_exporter"}) by (cpu))`
+	// fullScanCountExpr is the worst-case full-series count: a `__name__` regex matches every node_
+	// metric, so it cannot be pushed to the postings index — the querier enumerates and filters all
+	// series. count_cpu_cores' opposite (an equality matcher prunes; this one scans).
+	fullScanCountExpr = `count({__name__=~"node_.+"})`
+	// cpuUsageExpr is the per-instance CPU usage ratio: the user-mode rate over the total rate. It is
+	// a *range* query exercising irate range-vector iteration, sum-by-instance aggregation, and a
+	// vector-matched division (on(instance) group_left). With every mode an identical ramp, the ratio
+	// is the user share of the modes: 1/nodeModes.
+	cpuUsageExpr = `sum by(instance) (irate(node_cpu_seconds_total{job="node_exporter",mode="user"}[1m]))` +
+		` / on(instance) group_left ` +
+		`sum by(instance) (irate(node_cpu_seconds_total{job="node_exporter"}[1m]))`
+)
+
+// nodeCPUCorpus builds the deterministic node_cpu_seconds_total workload (no RNG): per instance, a
+// cumulative monotonic counter over every (cpu, mode) pair, each a ramp of nodeCPUPoints samples.
+func nodeCPUCorpus() metric.Metrics {
+	var md metric.Metrics
+
+	for inst := range nodeInstances {
+		rm := md.AddResource()
+		rm.Resource = signal.Resource{Attributes: signal.NewAttributes(
+			signal.KeyValue{Key: []byte("job"), Value: signal.StringValue([]byte("node_exporter"))},
+			signal.KeyValue{Key: []byte("instance"), Value: signal.StringValue(append([]byte("host-"), itoa(inst)...))},
+		)}
+
+		mt := rm.AddScope().AddMetric()
+		mt.Name = nodeCPUName
+		mt.Kind = metric.KindSum
+		mt.Temporality = metric.TemporalityCumulative
+		mt.Monotonic = true
+
+		for cpu := range nodeCPUs {
+			for mode := range nodeCPUModes {
+				attrs := signal.NewAttributes(
+					signal.KeyValue{Key: []byte("cpu"), Value: signal.StringValue([]byte(itoa(cpu)))},
+					signal.KeyValue{Key: []byte("mode"), Value: signal.StringValue([]byte(nodeCPUModes[mode]))},
+				)
+
+				for p := range nodeCPUPoints {
+					pt := mt.AddPoint()
+					pt.Ts = goldenStartTs + int64(p)*goldenInterval
+					pt.StartTs = goldenStartTs
+					pt.Value = float64(p)
+					pt.Attributes = attrs
+				}
+			}
+		}
+	}
+
+	return md
+}
+
+// nodeCPUStore builds, ingests, and flush+compacts the node_cpu_seconds_total corpus into a memory-
+// backed store — the shared fixture for the PromQL golden queries.
+func nodeCPUStore(b *testing.B) *Storage {
+	b.Helper()
+
+	ctx := context.Background()
+
+	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()), WithDecodeCache(64<<20))
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	if _, err := s.WriteMetrics(ctx, nodeCPUCorpus()); err != nil {
+		b.Fatal(err)
+	}
+
+	goldenFlushMerge(b, s)
+
+	return s
+}
+
+// goldenPromQL builds a Prometheus engine + storage adapter over the store and the instant-eval
+// timestamp at the corpus's last sample.
+func goldenPromQL(s *Storage) (*promengine.Engine, *promadapter.Queryable, time.Time) {
+	eng := promengine.NewEngine(promengine.EngineOpts{MaxSamples: 50_000_000, Timeout: time.Minute, LookbackDelta: 5 * time.Minute})
+	qa := promadapter.NewQueryable(s.Fetcher("default"), "default")
+
+	return eng, qa, time.Unix(0, goldenStartTs+int64(nodeCPUPoints-1)*goldenInterval)
+}
+
+// goldenInstantScalar runs an instant query that must yield a single scalar sample and returns it.
+func goldenInstantScalar(b *testing.B, eng *promengine.Engine, qa *promadapter.Queryable, expr string, ts time.Time) float64 {
+	b.Helper()
+
+	ctx := context.Background()
+
+	q, err := eng.NewInstantQuery(ctx, qa, nil, expr, ts)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	defer q.Close()
+
+	res := q.Exec(ctx)
+	if res.Err != nil {
+		b.Fatal(res.Err)
+	}
+
+	vec, err := res.Vector()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	if len(vec) != 1 {
+		b.Fatalf("expected a single scalar result, got %d samples", len(vec))
+	}
+
+	return vec[0].F
+}
+
+// goldenPromQLBench is the shared body for the instant-query golden benchmarks: it builds the
+// fixture, sanity-checks the expression once against want, then times repeated evaluations.
+func goldenPromQLBench(b *testing.B, expr string, want float64) {
+	b.Helper()
+
+	s := nodeCPUStore(b)
+	defer func() { _ = s.Close(context.Background()) }()
+
+	eng, qa, ts := goldenPromQL(s)
+
+	if got := goldenInstantScalar(b, eng, qa, expr, ts); got != want {
+		b.Fatalf("%s = %v, want %v", expr, got, want)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		goldenInstantScalar(b, eng, qa, expr, ts)
+	}
+}
+
+// goldenRangeMatrix runs a range query over [start, end] at step and returns the result matrix.
+func goldenRangeMatrix(b *testing.B, eng *promengine.Engine, qa *promadapter.Queryable, expr string, start, end time.Time, step time.Duration) promengine.Matrix {
+	b.Helper()
+
+	ctx := context.Background()
+
+	q, err := eng.NewRangeQuery(ctx, qa, nil, expr, start, end, step)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	defer q.Close()
+
+	res := q.Exec(ctx)
+	if res.Err != nil {
+		b.Fatal(res.Err)
+	}
+
+	m, err := res.Matrix()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	return m
+}
+
+// benchGoldenPromQLCPUUsage measures a range query: the per-instance CPU usage ratio. Unlike the
+// instant counts it iterates range vectors (irate over a 1m window) at every step, aggregates by
+// instance, and divides with vector matching — the realistic dashboard-panel query shape. Every
+// mode is an identical ramp, so each instance's ratio is the user share, 1/nodeModes, at every step.
+func benchGoldenPromQLCPUUsage(b *testing.B) {
+	s := nodeCPUStore(b)
+	defer func() { _ = s.Close(context.Background()) }()
+
+	eng, qa, _ := goldenPromQL(s)
+	// Step across the corpus, leaving a 1m lead-in so irate's [1m] window is always populated.
+	start := time.Unix(0, goldenStartTs+int64(time.Minute))
+	end := time.Unix(0, goldenStartTs+int64(nodeCPUPoints-1)*goldenInterval)
+	step := time.Minute
+
+	want := 1.0 / float64(nodeModes)
+
+	check := func() {
+		m := goldenRangeMatrix(b, eng, qa, cpuUsageExpr, start, end, step)
+		if len(m) != nodeInstances {
+			b.Fatalf("cpu_usage returned %d series, want %d", len(m), nodeInstances)
+		}
+
+		for _, ser := range m {
+			for _, p := range ser.Floats {
+				if p.F < want-1e-6 || p.F > want+1e-6 {
+					b.Fatalf("cpu_usage ratio = %v, want %v", p.F, want)
+				}
+			}
+		}
+	}
+
+	check()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		goldenRangeMatrix(b, eng, qa, cpuUsageExpr, start, end, step)
+	}
+}
+
+// benchGoldenPromQLCountCPU measures the end-to-end PromQL path: a Prometheus promql.Engine running
+// the count_cpu_cores nested aggregation over the storage fetch contract via the query/promql
+// adapter. It covers matcher push-down, series fetch + decode, label projection, and the engine's
+// inner+outer count — the realistic embedder query path, not just the fetch seam. The result is the
+// number of distinct cpu values (one group per core).
+func benchGoldenPromQLCountCPU(b *testing.B) {
+	goldenPromQLBench(b, countCPUCoresExpr, float64(nodeCPUs))
+}
+
+// benchGoldenPromQLFullScan is the worst case: a `__name__` regex matches every node_ series, so no
+// matcher prunes the index and the querier fetches and filters all series before the outer count —
+// the antithesis of the equality-pruned count_cpu_cores. The result is the total series count.
+func benchGoldenPromQLFullScan(b *testing.B) {
+	goldenPromQLBench(b, fullScanCountExpr, float64(nodeInstances*nodeCPUs*nodeModes))
+}
+
+// benchGoldenFetchAllRelease is fetch_all where the consumer Releases each batch after use — the
+// realistic embedder pattern (copy out, then release). It measures the Batch.Release buffer pooling:
+// vs fetch_all, the per-query result allocations drop to near zero.
+func benchGoldenFetchAllRelease(b *testing.B) {
+	ctx := context.Background()
+	s, _ := goldenFlushedStore(b)
+	defer func() { _ = s.Close(ctx) }()
+
+	f := s.Fetcher("default")
+	req := fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{goldenMatcher()}, Recycle: true}
+
+	var rows int
+
+	b.SetBytes(goldenLogicalBytes)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		it, err := f.Fetch(ctx, req)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		rows = 0
+
+		for {
+			batch, err := it.Next(ctx)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+
+				b.Fatal(err)
+			}
+
+			rows += len(batch.Timestamps)
+			batch.Release() // done with the batch — recycle its buffers
+		}
+
+		if err := it.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.StopTimer()
+	b.ReportMetric(float64(rows), "rows/op")
 }
 
 func benchGoldenWriteHead(b *testing.B) {

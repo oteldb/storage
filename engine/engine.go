@@ -71,6 +71,19 @@ type Engine struct {
 	// them to decode a part and returns them on releaseParts (safe — the merge copies values out, so
 	// no result aliases them). This kills the per-query decode-buffer allocation (chunk.resize).
 	decPool sync.Pool
+	// i64Pool / f64Pool recycle a fetched batch's result timestamp / value buffers, holding the
+	// buffers as *[]int64 / *[]float64. i64Box / f64Box hold the spare *[]T *boxes* themselves so a
+	// Put reuses a box instead of `Put(&local)` (which heap-escapes a fresh box on every recycle):
+	// a box circulates Pool→(Get)→Box→(Put)→Pool, so steady-state recycling allocates no boxes.
+	// They are fed only when a caller calls [fetch.Batch.Release]; a caller that never releases leaves
+	// them empty, so collect makes fresh slices exactly as before — the default path takes nothing.
+	i64Pool sync.Pool
+	f64Pool sync.Pool
+	i64Box  sync.Pool
+	f64Box  sync.Pool
+	// recycle is the shared per-engine [fetch.Batch.Release] hook (allocated once), so setting it on
+	// a batch costs nothing per batch. It returns the batch's ts/value buffers to the pools above.
+	recycle func(*fetch.Batch)
 }
 
 var _ fetch.Fetcher = (*Engine)(nil)
@@ -83,6 +96,11 @@ func New(cfg Config) *Engine {
 
 	e := &Engine{cfg: cfg, head: newHead()}
 	e.decPool.New = func() any { return &decodedPart{} }
+	// One shared release hook for every batch this engine produces (no per-batch closure alloc).
+	e.recycle = func(b *fetch.Batch) {
+		e.putI64(b.Timestamps)
+		e.putF64(b.Values)
+	}
 
 	if cfg.WAL != nil {
 		e.walB = newWALBatch()
@@ -314,10 +332,33 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 			return nil, err
 		}
 
-		if ts, values, sf := m.collect(); len(ts) > 0 {
-			batches = append(batches, &fetch.Batch{ID: id, Series: plan.series[id], Timestamps: ts, Values: values, ScaleFactors: sf})
-			rows += len(ts)
+		// Buffer pooling is opt-in (Request.Recycle): only then do we touch the pool or set the
+		// release hook, so the default path is exactly as before — no sync.Pool.Get overhead.
+		var tsBuf []int64
+
+		var valBuf []float64
+
+		if r.Recycle {
+			tsBuf, valBuf = e.getI64(), e.getF64()
 		}
+
+		ts, values, sf := m.collect(tsBuf, valBuf)
+		if len(ts) == 0 {
+			if r.Recycle {
+				e.putI64(ts)
+				e.putF64(values)
+			}
+
+			continue
+		}
+
+		b := &fetch.Batch{ID: id, Series: plan.series[id], Timestamps: ts, Values: values, ScaleFactors: sf}
+		if r.Recycle {
+			b.SetRelease(e.recycle) // caller will Release to recycle the ts/value buffers
+		}
+
+		batches = append(batches, b)
+		rows += len(ts)
 	}
 
 	spf.Add("parts_scanned", int64(partsScanned))
@@ -447,26 +488,37 @@ func (m *sampleMerge) add(ts []int64, values, sf []float64, start, end int64) {
 	m.runs = append(m.runs, tsRun{ts: ts[lo:hi], vals: values[lo:hi], sf: sfw})
 }
 
-// collect returns the merged samples sorted ascending by timestamp, in freshly allocated slices.
-// The returned sf slice is nil when every weight is 1 (the unsampled common case), else
-// len == len(ts).
-func (m *sampleMerge) collect() (tsOut []int64, values, sf []float64) {
+// collect merges the runs into the result columns sorted ascending by timestamp. tsBuf/valsBuf are
+// reusable destination buffers (from the engine's pool, or nil to allocate fresh); collect grows
+// them to the needed size. The returned sf slice is nil when every weight is 1 (the unsampled common
+// case), else len == len(ts).
+func (m *sampleMerge) collect(tsBuf []int64, valsBuf []float64) (tsOut []int64, values, sf []float64) {
 	switch len(m.runs) {
 	case 0:
-		return nil, nil, nil
+		return tsBuf[:0], valsBuf[:0], nil
 	case 1:
-		return collectOne(m.runs[0])
+		return collectOne(m.runs[0], tsBuf, valsBuf)
 	default:
-		return collectMany(m.runs)
+		return collectMany(m.runs, tsBuf, valsBuf)
 	}
 }
 
-// collectOne copies a single source's run into fresh result slices, dropping any adjacent
+// ensureCap returns s truncated to length 0 if it already has capacity n, else a fresh slice of
+// capacity n. Lets a decode/merge reuse a pooled buffer while keeping exact pre-sizing.
+func ensureCap[T any](s []T, n int) []T {
+	if cap(s) >= n {
+		return s[:0]
+	}
+
+	return make([]T, 0, n)
+}
+
+// collectOne copies a single source's run into the destination buffers, dropping any adjacent
 // duplicate timestamps (keeping the last — matching the map's last-write-wins). No merge needed.
-func collectOne(r tsRun) (tsOut []int64, values, sf []float64) {
+func collectOne(r tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64, values, sf []float64) {
 	n := len(r.ts)
-	tsOut = make([]int64, 0, n)
-	values = make([]float64, 0, n)
+	tsOut = ensureCap(tsBuf, n)
+	values = ensureCap(valsBuf, n)
 
 	for i := range n {
 		if i+1 < n && r.ts[i+1] == r.ts[i] { // keep the last of an equal-ts run
@@ -481,18 +533,18 @@ func collectOne(r tsRun) (tsOut []int64, values, sf []float64) {
 	return tsOut, values, sf
 }
 
-// collectMany k-way-merges several sorted runs into fresh result slices: at each step it emits the
-// smallest timestamp once, taking the value/weight from the highest-indexed (freshest) run that
+// collectMany k-way-merges several sorted runs into the destination buffers: at each step it emits
+// the smallest timestamp once, taking the value/weight from the highest-indexed (freshest) run that
 // holds it and advancing every run positioned there. O(rows × runs); runs is tiny (parts + flush +
 // head), so the linear min-scan beats a heap's overhead and allocations.
-func collectMany(runs []tsRun) (tsOut []int64, values, sf []float64) {
+func collectMany(runs []tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64, values, sf []float64) {
 	total := 0
 	for i := range runs {
 		total += len(runs[i].ts)
 	}
 
-	tsOut = make([]int64, 0, total)
-	values = make([]float64, 0, total)
+	tsOut = ensureCap(tsBuf, total)
+	values = ensureCap(valsBuf, total)
 
 	// Per-run cursors. Stack-allocated for the common small fan-in; heap only for a huge one.
 	var curArr [16]int
@@ -1020,4 +1072,67 @@ func (e *Engine) replayHandlers() wal.Handlers {
 			return nil
 		},
 	}
+}
+
+// getI64 returns a reusable []int64 (len 0) from the pool, or nil when the pool is empty — so a
+// caller that never releases makes fresh slices (no behavior change). The caller appends into it.
+func (e *Engine) getI64() []int64 {
+	v := e.i64Pool.Get()
+	if v == nil {
+		return nil
+	}
+
+	p := v.(*[]int64)
+	s := *p
+	*p = nil
+	e.i64Box.Put(p) // recycle the emptied box for the next putI64
+
+	return s[:0]
+}
+
+// getF64 is [Engine.getI64] for float64 value buffers.
+func (e *Engine) getF64() []float64 {
+	v := e.f64Pool.Get()
+	if v == nil {
+		return nil
+	}
+
+	p := v.(*[]float64)
+	s := *p
+	*p = nil
+	e.f64Box.Put(p)
+
+	return s[:0]
+}
+
+// putI64 returns a buffer to its pool (only meaningfully reused if it has capacity). It refills a
+// recycled box from i64Box rather than `Put(&s)`, so no *[]int64 box escapes per recycle in steady
+// state. This is the opt-in Release path, never the default.
+func (e *Engine) putI64(s []int64) {
+	if cap(s) == 0 {
+		return
+	}
+
+	p, _ := e.i64Box.Get().(*[]int64)
+	if p == nil {
+		p = new([]int64)
+	}
+
+	*p = s
+	e.i64Pool.Put(p)
+}
+
+// putF64 is [Engine.putI64] for float64 value buffers.
+func (e *Engine) putF64(s []float64) {
+	if cap(s) == 0 {
+		return
+	}
+
+	p, _ := e.f64Box.Get().(*[]float64)
+	if p == nil {
+		p = new([]float64)
+	}
+
+	*p = s
+	e.f64Pool.Put(p)
 }

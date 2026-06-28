@@ -163,3 +163,84 @@ func BenchmarkLogTextSearch(b *testing.B) {
 		})
 	}
 }
+
+// logReadStore builds a multi-part log store (the read fixture for the record-engine read benches).
+func logReadStore(b *testing.B) (*Storage, int64) {
+	b.Helper()
+	ctx := context.Background()
+
+	s, err := InMemory()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.Cleanup(func() { _ = s.Close(ctx) })
+
+	var logical int64
+
+	for round := range 6 {
+		if _, err := s.WriteLogs(ctx, genLogRound(round, 8, 500, &logical)); err != nil {
+			b.Fatal(err)
+		}
+
+		if eng, ok := s.lookupLogEngine("default"); ok {
+			if err := eng.Flush(ctx); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+
+	return s, logical
+}
+
+// BenchmarkLogReadAll fetches every stream (full scan, all columns) and drains — the record-engine
+// read path. BenchmarkLogReadRelease is the same with Recycle + per-batch Release (the realistic
+// embedder pattern), measuring the recordCols buffer pooling.
+func BenchmarkLogReadAll(b *testing.B) {
+	ctx := context.Background()
+	s, logical := logReadStore(b)
+	req := fetch.Request{Signal: signal.Log, Start: 0, End: 1 << 60}
+
+	b.SetBytes(logical)
+	b.ReportAllocs()
+
+	for b.Loop() {
+		it, err := s.LogFetcher("default").Fetch(ctx, req)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		if _, err := fetch.Drain(ctx, it); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkLogReadRelease(b *testing.B) {
+	ctx := context.Background()
+	s, logical := logReadStore(b)
+	req := fetch.Request{Signal: signal.Log, Start: 0, End: 1 << 60, Recycle: true}
+
+	b.SetBytes(logical)
+	b.ReportAllocs()
+
+	for b.Loop() {
+		it, err := s.LogFetcher("default").Fetch(ctx, req)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		for {
+			batch, err := it.Next(ctx)
+			if err != nil {
+				break
+			}
+
+			batch.Release()
+		}
+
+		if err := it.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

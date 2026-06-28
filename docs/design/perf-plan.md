@@ -29,16 +29,99 @@ In order:
 7. **`sortedWindow` in-order fast path** — skip scratch+sort for ascending head/flush buffers
    (live-head read path; flat on the flush-heavy golden bench).
 
-### What the loop shows is left (structural — needs a decision)
+### P1.3 — opt-in batch-release buffer pooling (DONE)
 
-After the above, the read-path alloc profile is dominated by buffers that **back the returned
-batches**: `engine.collectOne` (~36%, the result ts/value slices) and `planFetch`/`Fetch` (~28%,
-per-series `*fetch.Batch` + head/flush windows). These are unavoidable *unless* the fetch contract
-gains a **batch-release lifecycle** (plan item **P1.3**) so the engine can pool the result + head
-buffers after the caller drains. That is a public-API change (every embedder must release), so it is
-flagged for a design decision rather than done in-loop. CPU is now spread across the inherently
-**serial** DoD/varint decode (delta dependency chains — not SIMD-amenable) and the result copy; the
-one SIMD-amenable spot (the decimal `v*scale` conversion) was already addressed by hoisting the scale.
+The result buffers (`collectOne` ~36% of read allocs) back the returned batches, so pooling them
+needs a release signal. Added `fetch.Request.Recycle` + `fetch.Batch.Release()` (see ARCHITECTURE
+§3g): opt-in, default-off (the non-recycling path is byte-for-byte unchanged — verified by
+`efficiency_test.go` and a `rel0→rel2` benchstat showing `fetch_all` flat, p=0.18). When a caller
+sets `Recycle` and releases each batch, the engine recycles the ts/value buffers via a shared hook
+(no per-batch closure). The multi-child `Merge` and the cluster read handler release their inputs.
+**Recycling read path: B/op −59%, time −24%** (benchstat `fetch_all` vs `fetch_all_release`); a
+`-race` recycle + concurrent test guards correctness.
+
+### P1.5 — record engine read-path pooling (DONE)
+
+The logs/traces/profiles read path now pools two of its three dominant allocators (measured by
+`BenchmarkLogReadAll` plain / `BenchmarkLogReadRelease` recycle; profile tops: `newRecordCols` 37%,
+`readBytes` 27.6%, `fillConst[int64]`+`resize` ~25%):
+
+- **Part-decode int columns** (`Engine.i64Pool`, always-on, both paths): a part's decoded timestamp
+  + int columns are copied **by value** into the per-stream accumulators, so they are dead once the
+  part is distributed (`recycleDecodeInts`) and can be reused with no aliasing risk. Targets the
+  `fillConst`/`resize` ~25%. The byte columns are *not* pooled here (the accumulators alias them).
+- **Per-stream accumulators** (`Engine.recPool`, opt-in via `Recycle`): `newRecordCols` (37%, the
+  logs FINDINGS' #1 alloc) backs the returned batches, so it is pooled through the batch-release
+  lifecycle — `fetch.Batch.SetReleaseState` carries the `*recordCols` handle (a pointer, no alloc)
+  to the engine's one shared `recycle` hook, which re-arms it via `recordCols.prepare` on the next
+  fetch. Differing projection/selection across fetches is handled by `prepare` (reuse backing where
+  cap suffices, drop deselected columns to nil).
+
+**Result (baseline → final):** plain read **B/op −25%, allocs −23%** (the int pooling alone, no API
+change); recycle read **B/op −63%, time −44%, throughput +~85%, allocs −33%**. Race-clean; a new
+`TestFetchRecycleMatchesPlain` (multi-part + head, alternating projections, many release→fetch
+rounds) guards that reuse never corrupts a later result.
+
+### P1.6 — PromQL adapter, sub-millisecond instant queries (DONE)
+
+End-to-end golden PromQL benchmarks (`BenchmarkGolden/query/promql_*`, a node_exporter corpus of
+512 series): `count_cpu_cores` (`count(count(node_cpu_seconds_total{job="node_exporter"}) by (cpu))`)
+and `full_scan_count` (`count({__name__=~"node_.+"})`, a non-pushable regex ⇒ worst-case scan). The
+profile of the first cut showed the cost was the adapter materialization + re-decode, not the
+aggregation: `floatSamples` 19.3%, label projection (`ScratchBuilder`/`PromLabels`) ~24%, engine
+`Fetch`/`planFetch`/decode ~35%.
+
+- **Zero-copy series** (`batchSeries`/`batchSeriesIterator`): the Prometheus series iterator reads
+  the batch's ts/value slices directly (ns→ms on the fly) — eliminates `floatSamples` and the
+  per-sample `chunks.Sample` interface boxing entirely.
+- **Buffer recycling**: Select sets `Recycle`, holds matched batches, releases on `querier.Close`
+  (after the engine evaluates) — recycles the engine result buffers (the P1.3 metric pools).
+- **Label memoization**: projection is a pure function of the content-addressed `SeriesID`, so the
+  `Queryable` caches `labels.Labels` per id; a Select's series also share one scratch builder.
+- **Decode cache** enabled in the fixture (`WithDecodeCache`) — repeated queries hit decoded parts
+  instead of re-decoding (the config lever P2.7 flagged for the embedder).
+
+**Result:** `count_cpu_cores` **1.6ms → ~0.61ms**, `full_scan_count` **→ ~0.55ms** — both
+sub-millisecond. Allocs **27.1k → 3.3k (−88%)**, B/op **1.68MB → 0.63MB (−62%)**. Race-clean;
+`TestSelectZeroCopyAndRelease` guards the zero-copy values + Seek + release-on-Close lifecycle.
+
+A third golden, `cpu_usage_range`, is a *range* query (per-instance CPU usage ratio:
+`sum by(instance)(irate(...{mode="user"}[1m])) / on(instance) group_left sum by(instance)(irate(...[1m]))`).
+It rides the same lean adapter (≈3.9k allocs, on par with the instant queries), but at ~1.66ms it is
+**not** sub-millisecond and inherently can't be: ~57% of the time is Prometheus' own range evaluator
+(`matrixIterSlice`/`instantValue`, computing irate at ~12 steps over 512+64 series) — engine-side,
+not the adapter (our `Select`+fetch is ~22%, the iterator ~14%). It's kept as a faithful range-query
+shape; shrinking it sub-ms would mean gaming the corpus (fewer series/steps), not a real win.
+
+### P1.7 — PromQL result-path alloc-count reduction (DONE)
+
+After P1.6 the instant queries were ~0.5ms and **CPU-floor-bound** (GC ~30%, decode/merge/engine
+eval), not latency-bound on a single query — but the per-series alloc *count* still pressured GC
+under concurrent load (the REPORT.md scenario). Two count cuts:
+
+- **Slice-pool box recycling** (`engine.i64Box`/`f64Box`): the metric result pools held buffers as
+  `*[]T` but `Put(&s)` heap-escaped a fresh box on every recycle (31% of query *objects*). A second
+  pool recycles the boxes themselves (Pool→Get→Box→Put→Pool), so steady-state recycling boxes nothing.
+- **Slab-allocated `batchSeries`** (promql adapter): one backing array for a Select's series instead
+  of a `&batchSeries{}` per series (was ~15% of objects).
+
+**Result:** `count_cpu_cores` allocs/op **3333 → ~1807 (−46%)**, B/op −3%; single-query wall-clock
+flat (~0.5ms — it was never alloc-*count*-bound) but GC pressure under load drops. Race + alloc-budget
+gates green. Remaining alloc *bytes* are the per-series `&fetch.Batch{}` (29%) + `planFetch` state
+(26%); cutting those needs pooling the Batch struct + plan state through the Recycle lifecycle
+(invasive, ~10–15% single-query upside) or query-aware **count/aggregate pushdown**
+(`Storage.AggregateMetrics`) that avoids materializing 512 sample windows for a `count` — the real
+lever, but embedder-driven and query-specific, not the generic Queryable.
+
+### What's left
+
+- **Record byte columns** (`readBytes` 27.6%, the decoded log/attr bytes) alias into the returned
+  batches, so pooling them needs either per-part refcounting (release the part-decode bytes once all
+  referencing batches are released) or a record decode cache (like the metric `decodeCache`) — the
+  structural remainder after P1.5.
+- **Win1 (pool head/flush windows)** — deferred: golden-flat (the lib bench is flush-heavy with a
+  cold head); it helps only the live-ingestion head path the integration profile sees.
+- CPU is now the inherently **serial** DoD/varint decode (not SIMD-amenable) + the result copy.
 
 ## Diagnosis (what the profiles actually show)
 

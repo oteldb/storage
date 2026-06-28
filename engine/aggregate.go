@@ -201,7 +201,7 @@ func (e *Engine) bucketSeries(
 			return nil, err
 		}
 
-		ts, values, _ := m.collect()
+		ts, values, _ := m.collect(nil, nil)
 		for i := range ts {
 			addSample(ts[i], values[i])
 		}
@@ -391,7 +391,7 @@ func aggViaDecode(ctx context.Context, plan *enginePlan, id signal.SeriesID) (Se
 		return SeriesAgg{}, err
 	}
 
-	_, values, _ := m.collect()
+	_, values, _ := m.collect(nil, nil)
 
 	var agg SeriesAgg
 	for _, v := range values {
