@@ -59,6 +59,15 @@ func chunkRanges(n, maxRows int) [][2]int {
 	return out
 }
 
+// reset truncates the columns to empty while keeping their backing arrays, so a streaming merge can
+// refill the same buffer for the next output part without reallocating.
+func (c *flushColumns) reset() {
+	c.series = c.series[:0]
+	c.ts = c.ts[:0]
+	c.value = c.value[:0]
+	c.sf = nil // the next part re-materializes sf lazily only if it samples
+}
+
 // slice returns a view of rows [a, b) of the columns (sharing the backing arrays; read-only use).
 func (c *flushColumns) slice(a, b int) *flushColumns {
 	out := &flushColumns{series: c.series[a:b], ts: c.ts[a:b], value: c.value[a:b]}

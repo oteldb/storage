@@ -22,7 +22,10 @@ func reopenDurable(t *testing.T, dataDir, walDir string) *Storage {
 
 	be, err := file.New(dataDir)
 	require.NoError(t, err)
-	s, err := Open(context.Background(), Options{}, WithBackend(be), WithWALDir(walDir))
+	// Disable the background flush loop (negative interval): these tests drive flush/crash manually
+	// and model "crashed before any flush", so an autonomous flush would be nondeterministic and the
+	// abandoned (never-Closed) crash store would leak the loop goroutine.
+	s, err := Open(context.Background(), Options{}, WithBackend(be), WithWALDir(walDir), WithFlushInterval(-1))
 	require.NoError(t, err)
 
 	return s
@@ -123,12 +126,14 @@ func TestWALSyncAlwaysRecovers(t *testing.T) {
 
 	be, err := file.New(dataDir)
 	require.NoError(t, err)
-	s1, err := Open(ctx, Options{}, WithBackend(be), WithWALDir(walDir), WithWALSync(WALSyncAlways))
+	// Disable the background flush loop so the crash below deterministically models "crashed before
+	// any flush" and the abandoned store leaks no loop goroutine.
+	s1, err := Open(ctx, Options{}, WithBackend(be), WithWALDir(walDir), WithWALSync(WALSyncAlways), WithFlushInterval(-1))
 	require.NoError(t, err)
 	_, err = s1.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100}, []float64{1}))
 	require.NoError(t, err)
-	// Crash: release WAL handles without flush/checkpoint (WALSyncAlways starts no background
-	// goroutine, so nothing else leaks).
+	// Crash: release WAL handles without flush/checkpoint (no background flush goroutine, so nothing
+	// else leaks).
 	crash(t, s1)
 
 	s2 := reopenDurable(t, dataDir, walDir)

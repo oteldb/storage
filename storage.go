@@ -415,6 +415,23 @@ const (
 	reasonMaxInFlightBytes = "max_in_flight_bytes"
 )
 
+// defaultMaxPartBytes is the per-part size cap applied when a tenant's policy leaves MaxPartSize
+// unset (0). It bounds a part's approximate uncompressed size (real parts compress well below it) so
+// size-tiered compaction can seal the top tier, keeping a continuously-ingesting tenant's merge
+// working set bounded instead of growing with the dataset (issue 22). An embedder that wants a
+// different cap — or the unbounded single-part behavior — sets tenant.Limits.MaxPartSize explicitly.
+const defaultMaxPartBytes = 64 << 20 // 64 MiB
+
+// partSizeOrDefault returns the configured per-part cap, or defaultMaxPartBytes when unset. A
+// negative value is treated as unset.
+func partSizeOrDefault(maxPartSize int64) int64 {
+	if maxPartSize <= 0 {
+		return defaultMaxPartBytes
+	}
+
+	return maxPartSize
+}
+
 // metricOverflowLabel marks the synthetic series that absorbs a tenant's metric series past the
 // soft cardinality budget (Track 3a).
 var metricOverflowLabel = []byte("__overflow__")
@@ -938,9 +955,12 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		Obs:              s.obs,
 		DecodeCacheBytes: s.opts.DecodeCacheBytes,
 		AggregateStats:   s.opts.AggregateStats,
-		// MaxPartBytes caps each flushed/merged part; resolved from the tenant's policy. It is an
-		// operational/structural cap fixed at engine creation (unlike the per-write admission limits).
-		MaxPartBytes: s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Limits.MaxPartSize,
+		// MaxPartBytes caps each flushed/merged part; resolved from the tenant's policy, falling back
+		// to defaultMaxPartBytes when the policy leaves it unset. It is an operational/structural cap
+		// fixed at engine creation (unlike the per-write admission limits). A bounded part size is what
+		// lets size-tiered compaction seal the top tier — without it a continuously-ingesting tenant's
+		// merge would grow to materialize the whole dataset (see github.com/oteldb/storage issue 22).
+		MaxPartBytes: partSizeOrDefault(s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Limits.MaxPartSize),
 	})
 	s.tenants[tid] = e
 

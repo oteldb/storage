@@ -79,7 +79,13 @@ type Options struct {
 	// storage per series; off by default. AggregateMetrics works without it (by decoding).
 	AggregateStats bool
 
-	// FlushInterval is the max age of unflushed head data. Zero ⇒ default.
+	// FlushInterval is the max age of unflushed head data: the cadence of the background loop that
+	// flushes each head to a part and runs compaction/retention. Zero ⇒ a sane default
+	// ([defaultFlushInterval]) for a durable store — a non-ephemeral engine MUST flush periodically
+	// or its head and WAL grow unbounded in RAM until the process OOMs (and every restart replays the
+	// whole WAL). A negative value explicitly disables the background loop (manual/[Admin]-driven
+	// maintenance only) — the opt-in escape hatch for that unbounded-growth mode. The ephemeral
+	// in-memory engine never flushes, so the default does not apply to it.
 	// (Resolved into a duration internally to keep the API import-light.)
 	FlushInterval int64 // nanoseconds
 
@@ -202,6 +208,12 @@ func WithWALSyncInterval(d time.Duration) Option {
 // explicit interval.
 const defaultWALSyncInterval = 200 * time.Millisecond
 
+// defaultFlushInterval is the background flush + compaction cadence applied to a durable store when
+// [Options.FlushInterval] is left at zero. A non-ephemeral engine must flush periodically or its head
+// and WAL grow unbounded in RAM (issue 23); 10s matches the known-good operational setting and keeps
+// the WAL bounded (it is truncated each flush). It does not apply to the ephemeral in-memory engine.
+const defaultFlushInterval = 10 * time.Second
+
 // walSyncInterval returns the background WAL fsync period, or 0 when background syncing is off (no
 // WAL, or a non-interval sync mode).
 func (o *Options) walSyncInterval() time.Duration {
@@ -233,7 +245,9 @@ func WithDecodeCache(maxBytes int64) Option {
 // answer range-covering aggregates without decoding. See [Options.AggregateStats].
 func WithAggregateStats() Option { return func(o *Options) { o.AggregateStats = true } }
 
-// WithFlushInterval sets the head flush time interval in nanoseconds.
+// WithFlushInterval sets the head flush time interval in nanoseconds. Zero keeps the durable-store
+// default ([defaultFlushInterval]); a negative value disables the background flush/compaction loop
+// entirely (manual/[Admin]-driven maintenance only). See [Options.FlushInterval].
 func WithFlushInterval(ns int64) Option { return func(o *Options) { o.FlushInterval = ns } }
 
 // WithOOOWindow sets the out-of-order ingestion window in nanoseconds.
@@ -314,6 +328,12 @@ func (o *Options) applyDefaults() {
 		// An ephemeral backend (memory) with no explicit durability choice and no
 		// WAL dir ⇒ the in-memory engine.
 		o.Durability = DurabilityEphemeral
+	}
+	if o.Durability != DurabilityEphemeral && o.FlushInterval == 0 {
+		// A durable store with no explicit interval: flush periodically by default. Without a running
+		// maintenance loop the head and WAL grow unbounded until OOM (issue 23); the previous behavior
+		// silently disabled all flushing at the zero value. A negative interval still opts out.
+		o.FlushInterval = int64(defaultFlushInterval)
 	}
 }
 
