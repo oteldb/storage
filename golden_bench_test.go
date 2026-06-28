@@ -216,6 +216,7 @@ func BenchmarkGolden(b *testing.B) {
 	b.Run("read/fetch_all_release", benchGoldenFetchAllRelease)
 	b.Run("read/fetch_recent", benchGoldenFetchRecent)
 	b.Run("query/promql_count_cpu_cores", benchGoldenPromQLCountCPU)
+	b.Run("query/promql_full_scan_count", benchGoldenPromQLFullScan)
 	b.Run("density", benchGoldenDensity)
 }
 
@@ -236,6 +237,10 @@ var (
 	// countCPUCoresExpr is the benchmark query: an inner per-cpu count collapsed by an outer count —
 	// the canonical "how many CPU cores" PromQL expression.
 	countCPUCoresExpr = `count(count(node_cpu_seconds_total{job="node_exporter"}) by (cpu))`
+	// fullScanCountExpr is the worst-case full-series count: a `__name__` regex matches every node_
+	// metric, so it cannot be pushed to the postings index — the querier enumerates and filters all
+	// series. count_cpu_cores' opposite (an equality matcher prunes; this one scans).
+	fullScanCountExpr = `count({__name__=~"node_.+"})`
 )
 
 // nodeCPUCorpus builds the deterministic node_cpu_seconds_total workload (no RNG): per instance, a
@@ -277,11 +282,11 @@ func nodeCPUCorpus() metric.Metrics {
 	return md
 }
 
-// benchGoldenPromQLCountCPU measures the end-to-end PromQL path: a Prometheus promql.Engine running
-// the count_cpu_cores nested aggregation over the storage fetch contract via the query/promql
-// adapter. It covers matcher push-down, series fetch + decode, label projection, and the engine's
-// inner+outer count — the realistic embedder query path, not just the fetch seam.
-func benchGoldenPromQLCountCPU(b *testing.B) {
+// nodeCPUStore builds, ingests, and flush+compacts the node_cpu_seconds_total corpus into a memory-
+// backed store — the shared fixture for the PromQL golden queries.
+func nodeCPUStore(b *testing.B) *Storage {
+	b.Helper()
+
 	ctx := context.Background()
 
 	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()))
@@ -289,54 +294,90 @@ func benchGoldenPromQLCountCPU(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	defer func() { _ = s.Close(ctx) }()
-
 	if _, err := s.WriteMetrics(ctx, nodeCPUCorpus()); err != nil {
 		b.Fatal(err)
 	}
 
 	goldenFlushMerge(b, s)
 
+	return s
+}
+
+// goldenPromQL builds a Prometheus engine + storage adapter over the store and the instant-eval
+// timestamp at the corpus's last sample.
+func goldenPromQL(s *Storage) (*promengine.Engine, *promadapter.Queryable, time.Time) {
 	eng := promengine.NewEngine(promengine.EngineOpts{MaxSamples: 50_000_000, Timeout: time.Minute, LookbackDelta: 5 * time.Minute})
 	qa := promadapter.NewQueryable(s.Fetcher("default"), "default")
-	evalTs := time.Unix(0, goldenStartTs+int64(nodeCPUPoints-1)*goldenInterval)
 
-	run := func() float64 {
-		q, err := eng.NewInstantQuery(ctx, qa, nil, countCPUCoresExpr, evalTs)
-		if err != nil {
-			b.Fatal(err)
-		}
+	return eng, qa, time.Unix(0, goldenStartTs+int64(nodeCPUPoints-1)*goldenInterval)
+}
 
-		defer q.Close()
+// goldenInstantScalar runs an instant query that must yield a single scalar sample and returns it.
+func goldenInstantScalar(b *testing.B, eng *promengine.Engine, qa *promadapter.Queryable, expr string, ts time.Time) float64 {
+	b.Helper()
 
-		res := q.Exec(ctx)
-		if res.Err != nil {
-			b.Fatal(res.Err)
-		}
+	ctx := context.Background()
 
-		vec, err := res.Vector()
-		if err != nil {
-			b.Fatal(err)
-		}
-
-		if len(vec) != 1 {
-			b.Fatalf("expected a single scalar result, got %d samples", len(vec))
-		}
-
-		return vec[0].F
+	q, err := eng.NewInstantQuery(ctx, qa, nil, expr, ts)
+	if err != nil {
+		b.Fatal(err)
 	}
 
-	// Sanity: count(count(... ) by (cpu)) == number of distinct cpu values (one group per core).
-	if got := run(); got != float64(nodeCPUs) {
-		b.Fatalf("count_cpu_cores = %v, want %d", got, nodeCPUs)
+	defer q.Close()
+
+	res := q.Exec(ctx)
+	if res.Err != nil {
+		b.Fatal(res.Err)
+	}
+
+	vec, err := res.Vector()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	if len(vec) != 1 {
+		b.Fatalf("expected a single scalar result, got %d samples", len(vec))
+	}
+
+	return vec[0].F
+}
+
+// goldenPromQLBench is the shared body for the instant-query golden benchmarks: it builds the
+// fixture, sanity-checks the expression once against want, then times repeated evaluations.
+func goldenPromQLBench(b *testing.B, expr string, want float64) {
+	b.Helper()
+
+	s := nodeCPUStore(b)
+	defer func() { _ = s.Close(context.Background()) }()
+
+	eng, qa, ts := goldenPromQL(s)
+
+	if got := goldenInstantScalar(b, eng, qa, expr, ts); got != want {
+		b.Fatalf("%s = %v, want %v", expr, got, want)
 	}
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for range b.N {
-		run()
+		goldenInstantScalar(b, eng, qa, expr, ts)
 	}
+}
+
+// benchGoldenPromQLCountCPU measures the end-to-end PromQL path: a Prometheus promql.Engine running
+// the count_cpu_cores nested aggregation over the storage fetch contract via the query/promql
+// adapter. It covers matcher push-down, series fetch + decode, label projection, and the engine's
+// inner+outer count — the realistic embedder query path, not just the fetch seam. The result is the
+// number of distinct cpu values (one group per core).
+func benchGoldenPromQLCountCPU(b *testing.B) {
+	goldenPromQLBench(b, countCPUCoresExpr, float64(nodeCPUs))
+}
+
+// benchGoldenPromQLFullScan is the worst case: a `__name__` regex matches every node_ series, so no
+// matcher prunes the index and the querier fetches and filters all series before the outer count —
+// the antithesis of the equality-pruned count_cpu_cores. The result is the total series count.
+func benchGoldenPromQLFullScan(b *testing.B) {
+	goldenPromQLBench(b, fullScanCountExpr, float64(nodeInstances*nodeCPUs*nodeModes))
 }
 
 // benchGoldenFetchAllRelease is fetch_all where the consumer Releases each batch after use — the
