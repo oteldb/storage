@@ -1129,8 +1129,10 @@ query-language path stays in the embedder. The `Write*` methods take the library
   admission tally; the read-path decode-cache totals; and, in cluster mode, this node's address, the
   live membership, the shards it holds a compaction claim on, and the last enacted rebalance plan. It
   does **no backend I/O and decodes nothing** (it takes only a brief per-engine read lock to copy
-  counters), so it never touches the ingest/query hot path — poll it at dashboard cadence. On-disk
-  part *byte* sizes are intentionally omitted (they would need backend stat calls); it is a counts +
+  counters), so it never touches the ingest/query hot path — poll it at dashboard cadence. Each
+  per-signal entry also carries merge liveness (`MergeRunning`, `MergeBacklog`) and WAL state
+  (`WAL`, `WALSegments`, `WALBytes`, `WALEpoch`). On-disk part *byte* sizes remain omitted here (they
+  would need backend stat calls) — use `PartsDetailed` for those; `Inspect` stays a counts +
   time-span + state view. Backed by `engine.Stats` / `recordengine.Stats` (per-engine snapshots) and
   the cluster `Ownership.Owned`/`LastPlan` accessors.
 - **`Admin()` → `Admin`** (`admin.go`) — the imperative operator-control surface complementing the
@@ -1141,6 +1143,21 @@ query-language path stays in the embedder. The `Write*` methods take the library
   gated to the shard's **ring-primary** (else `ErrNotOwner`), preserving the single-writer-per-shard
   invariant; single-node owns everything. The `key` is the engine key (tenant id, or a metric shard
   key under `ShardsPerTenant > 1`).
+- **Drill-down introspection** (`introspect.go`) — three pull-based dashboard accessors that scope to a
+  `(tenant, signal)`, complementing the store-wide `Inspect()`:
+  - **`Parts(tenant, signal) []PartInfo`** — one entry per flushed part (id, time bounds, series and
+    row counts) from the engine's in-memory row-range index; **no backend I/O, no decode**.
+  - **`PartsDetailed(ctx, tenant, signal) ([]PartDetail, error)`** — augments each part with its
+    on-backend byte size and column/codec layout + chunk (granule) count from the cached manifest. It
+    sums object sizes via the backend, so it is a drill-down call, not a high-frequency poll; each part
+    is ref-held for the read so a concurrent merge cannot reclaim its objects.
+  - **`Cardinality(tenant, signal, topN) CardinalityStats`** — total series, distinct label names,
+    interned-symbol count, and the top-N highest-cardinality label names (series count + distinct
+    values), computed from the head's inverted index (which spans head ∪ flushed series); no backend
+    I/O. The operator's first stop for a cardinality-explosion incident.
+  Backed by `engine`/`recordengine` `Parts`/`PartsDetailed`/`Cardinality`, the `postings.MemPostings.ForEachName`
+  iterator, and the `wal.SegmentWriter` `Seq`/`Size`/`Epoch` accessors (the latter feed the WAL/merge
+  fields `Inspect()` now carries per signal: `MergeRunning`, `MergeBacklog`, and `WAL{,Segments,Bytes,Epoch}`).
 - **`Options` / `Option`** (`options.go`) — config struct plus functional options
   (`WithBackend`, `WithCluster`, `WithTenancy`, `WithEncoding`, `WithDurability`,
   `WithWALDir`, `WithWALSync`, `WithWALSyncInterval`, `WithFlushThresholdBytes`, `WithFlushInterval`,
@@ -1167,8 +1184,11 @@ query-language path stays in the embedder. The `Write*` methods take the library
   composed `Policy`, resolved per tenant id through a `Resolver` (`ResolverFunc` adapter;
   `Default()` returns an empty-policy resolver). Multi-tenancy, retention, and
   downsampling are consumer-supplied callbacks keyed by tenant id.
-- **`backend`** — the L1 seam (detailed in §3a): `Read`/`Write`/`List`/`Delete` over
-  whole-object keys, with memory and file implementations. s3 + CAS pending.
+- **`backend`** — the L1 seam (detailed in §3a): `Read`/`Write`/`List`/`Delete`/`PutIfAbsent` over
+  whole-object keys, with memory, file, and s3 implementations. The optional **`Sizer`** capability
+  (`Size(ctx, key)`) reports an object's byte size without reading it; `backend.SizeOf` uses it when
+  present and falls back to a full Read otherwise (memory/file implement it cheaply; the wrappers
+  delegate; s3 uses the fallback). Used by `PartsDetailed` for part byte accounting.
 
 ### 4a. Observability handle (`internal/obs`)
 
@@ -1259,7 +1279,8 @@ death (lease revoke) hands all of its shards to the survivors with none left orp
 ```
 .                     storage facade: Storage, Open/InMemory, Options, per-tenant engines, maintenance loop [implemented: metrics+logs+traces+profiles ingest+read; query-lang in embedder]
   admission.go        per-tenant admission control: ingest-rate token bucket + AdmissionStats meta-metrics (§3k) [implemented: all signals; rate at origin + cardinality/in-flight on the shard primary in cluster mode]
-  inspect.go          Inspect() StoreStats: in-memory pull snapshot (per-tenant/signal counts+time-span, admission, decode cache, cluster membership/ownership) for a dashboard/CLI [implemented]
+  inspect.go          Inspect() StoreStats: in-memory pull snapshot (per-tenant/signal counts+time-span, merge/WAL state, admission, decode cache, cluster membership/ownership) for a dashboard/CLI [implemented]
+  introspect.go       Parts/PartsDetailed/Cardinality: per-(tenant,signal) drill-down for a dashboard (part list, part byte/codec/chunk detail, label cardinality) [implemented]
   admin.go            Admin(): on-demand Flush/Compact/Retention/Rebalance/MaintainNow; cluster flush/compact gated to the shard's ring-primary (ErrNotOwner) [implemented]
 encoding/             umbrella doc for the codec layers
   encoding/bitstream  MSB-first bit Writer/Reader                                      [implemented]

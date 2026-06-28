@@ -38,6 +38,9 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 		))
 	defer span.End()
 
+	e.mergeRunning.Store(true)
+	defer e.mergeRunning.Store(false)
+
 	startNs := time.Now()
 	log := zctx.From(ctx)
 	log.Debug("merge requested",

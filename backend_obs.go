@@ -73,6 +73,17 @@ func (b *instrumentedBackend) List(ctx context.Context, prefix string) ([]string
 	return keys, err
 }
 
+func (b *instrumentedBackend) Size(ctx context.Context, key string) (int64, error) {
+	start := time.Now()
+	n, err := backend.SizeOf(ctx, b.inner, key)
+	b.m.Record(ctx, "size", result(err), time.Since(start), 0)
+	zctx.From(ctx).Debug("backend size",
+		zap.String("key", key), zap.Int64("bytes", n),
+		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
+
+	return n, err
+}
+
 func (b *instrumentedBackend) Delete(ctx context.Context, key string) error {
 	start := time.Now()
 	err := b.inner.Delete(ctx, key)

@@ -67,6 +67,18 @@ func Run(t *testing.T, factory func(t *testing.T) backend.Backend) {
 		assert.ErrorIs(t, err, backend.ErrNotExist)
 	})
 
+	t.Run("SizeOf", func(t *testing.T) {
+		b := factory(t)
+		require.NoError(t, b.Write(ctx, "sized", []byte("twelve bytes")))
+
+		n, err := backend.SizeOf(ctx, b, "sized")
+		require.NoError(t, err)
+		assert.Equal(t, int64(len("twelve bytes")), n)
+
+		_, err = backend.SizeOf(ctx, b, "absent")
+		assert.ErrorIs(t, err, backend.ErrNotExist)
+	})
+
 	t.Run("EmptyValue", func(t *testing.T) {
 		b := factory(t)
 		require.NoError(t, b.Write(ctx, "empty", []byte{}))
