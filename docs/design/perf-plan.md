@@ -62,6 +62,29 @@ change); recycle read **B/op −63%, time −44%, throughput +~85%, allocs −33
 `TestFetchRecycleMatchesPlain` (multi-part + head, alternating projections, many release→fetch
 rounds) guards that reuse never corrupts a later result.
 
+### P1.6 — PromQL adapter, sub-millisecond instant queries (DONE)
+
+End-to-end golden PromQL benchmarks (`BenchmarkGolden/query/promql_*`, a node_exporter corpus of
+512 series): `count_cpu_cores` (`count(count(node_cpu_seconds_total{job="node_exporter"}) by (cpu))`)
+and `full_scan_count` (`count({__name__=~"node_.+"})`, a non-pushable regex ⇒ worst-case scan). The
+profile of the first cut showed the cost was the adapter materialization + re-decode, not the
+aggregation: `floatSamples` 19.3%, label projection (`ScratchBuilder`/`PromLabels`) ~24%, engine
+`Fetch`/`planFetch`/decode ~35%.
+
+- **Zero-copy series** (`batchSeries`/`batchSeriesIterator`): the Prometheus series iterator reads
+  the batch's ts/value slices directly (ns→ms on the fly) — eliminates `floatSamples` and the
+  per-sample `chunks.Sample` interface boxing entirely.
+- **Buffer recycling**: Select sets `Recycle`, holds matched batches, releases on `querier.Close`
+  (after the engine evaluates) — recycles the engine result buffers (the P1.3 metric pools).
+- **Label memoization**: projection is a pure function of the content-addressed `SeriesID`, so the
+  `Queryable` caches `labels.Labels` per id; a Select's series also share one scratch builder.
+- **Decode cache** enabled in the fixture (`WithDecodeCache`) — repeated queries hit decoded parts
+  instead of re-decoding (the config lever P2.7 flagged for the embedder).
+
+**Result:** `count_cpu_cores` **1.6ms → ~0.61ms**, `full_scan_count` **→ ~0.55ms** — both
+sub-millisecond. Allocs **27.1k → 3.3k (−88%)**, B/op **1.68MB → 0.63MB (−62%)**. Race-clean;
+`TestSelectZeroCopyAndRelease` guards the zero-copy values + Seek + release-on-Close lifecycle.
+
 ### What's left
 
 - **Record byte columns** (`readBytes` 27.6%, the decoded log/attr bytes) alias into the returned

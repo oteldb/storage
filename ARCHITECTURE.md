@@ -610,7 +610,15 @@ What the adapter does (the non-trivial, reusable part):
 - **Label projection.** A `signal.Series` becomes a `labels.Labels`: resource/scope/point
   attributes flatten to string labels, scope name/version under `otel.scope.*`, the internal
   reserved labels (`__unit__`/`__kind__`/`__temporality__`/`__monotonic__`) hidden, `__name__`
-  kept. Each fetched batch becomes a Prometheus `SeriesSet` of float samples.
+  kept. The projection is a pure function of the content-addressed `SeriesID`, so a `Queryable`
+  reused across queries **memoizes** it per id (bounded by cardinality — the same label set
+  Prometheus keeps resident) and a Select's series share one scratch builder + text buffer.
+- **Zero-copy samples + buffer recycling.** Each fetched batch becomes a Prometheus series whose
+  iterator reads the batch's `Timestamps`/`Values` slices **directly** (ns→ms on the fly) — no
+  per-sample copy or `chunks.Sample` interface boxing. The aliased buffers stay valid until the
+  querier is closed: Select sets `fetch.Request.Recycle`, holds the matched batches, and
+  `querier.Close` (called by the engine after evaluation) releases them, recycling the engine's
+  result buffers (§3g). A batch that fails the matcher re-check is released immediately.
 - **Time units.** Storage is unix **nanoseconds**, Prometheus is **milliseconds**; the
   adapter converts both directions (querier window and sample timestamps).
 

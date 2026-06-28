@@ -64,3 +64,10 @@ Profile-guided via `scripts/bench-pprof.sh` (benchstat + CPU/alloc_space pprof; 
   Plain log read **B/op −25% / allocs −23%**; recycling log read **B/op −63% / time −44% / +85%
   throughput**. `TestFetchRecycleMatchesPlain` guards reuse correctness; race-clean. Remaining record
   allocator is the aliased byte columns (`readBytes`) — needs refcounting or a record decode cache.
+
+- **P1.6 — PromQL adapter sub-millisecond instant queries.** Golden end-to-end benches
+  (count_cpu_cores, full_scan_count over a 512-series node_exporter corpus). Zero-copy Prometheus
+  series over the batch slices (kills floatSamples + per-sample interface boxing), Recycle batches
+  released on querier.Close, SeriesID-keyed label-projection cache + shared scratch builder, decode
+  cache enabled in the fixture. count_cpu_cores 1.6ms → ~0.61ms, full_scan_count → ~0.55ms; allocs
+  −88%, B/op −62%. TestSelectZeroCopyAndRelease guards the lifecycle.

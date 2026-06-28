@@ -289,7 +289,7 @@ func nodeCPUStore(b *testing.B) *Storage {
 
 	ctx := context.Background()
 
-	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()))
+	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()), WithDecodeCache(64<<20))
 	if err != nil {
 		b.Fatal(err)
 	}
