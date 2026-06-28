@@ -12,7 +12,7 @@ import (
 func sortedSeriesIDs(src []*part) []signal.SeriesID {
 	idSet := make(map[signal.SeriesID]struct{})
 	for _, p := range src {
-		for id := range p.ranges {
+		for _, id := range p.index.ids {
 			idSet[id] = struct{}{}
 		}
 	}

@@ -210,7 +210,7 @@ func (e *Engine) bucketSeries(
 	}
 
 	for _, p := range plan.liveParts {
-		rng, ok := p.ranges[id]
+		rng, ok := p.index.lookup(id)
 		if !ok {
 			continue
 		}
@@ -351,7 +351,7 @@ func (e *Engine) aggViaStats(ctx context.Context, plan *enginePlan, id signal.Se
 	var agg SeriesAgg
 
 	for _, p := range plan.liveParts {
-		rng, ok := p.ranges[id]
+		rng, ok := p.index.lookup(id)
 		if !ok {
 			continue
 		}

@@ -29,15 +29,77 @@ func u128ToID(u chunk.U128) signal.SeriesID  { return signal.SeriesID{Hi: u.Hi, 
 // rowRange is the half-open row span [start, end) a series occupies in a part.
 type rowRange struct{ start, end int }
 
-// part is a flushed, immutable metric part: the lazy on-backend [block.PartReader] plus an
-// in-memory SeriesID → row-range index. Because rows are sorted by (series, ts), every
-// series occupies one contiguous run, so the index is one entry per series, built by
-// scanning the series column once on open.
+// partIndex is a part's SeriesID → row-range index: two parallel slices sorted by id, so a lookup is
+// a binary search (O(log series)) and the layout carries no per-entry overhead — vs a resident map's
+// bucket structure (~3× the payload) which dominated live heap under continuous ingestion. Because
+// rows are sorted by (series, ts), every series occupies one contiguous run; the index records each
+// id once in a single pass over the (already sorted) on-disk series column.
+type partIndex struct {
+	ids    []signal.SeriesID
+	ranges []rowRange
+	total  int // sum of every range's length; equals the series column length, cached for an O(1) rows()
+}
+
+// lookup returns id's row range and whether the part holds it.
+func (idx partIndex) lookup(id signal.SeriesID) (rowRange, bool) {
+	i, ok := slices.BinarySearchFunc(idx.ids, id, signal.SeriesID.Compare)
+	if !ok {
+		return rowRange{}, false
+	}
+
+	return idx.ranges[i], true
+}
+
+// has reports whether the part holds id.
+func (idx partIndex) has(id signal.SeriesID) bool {
+	_, ok := slices.BinarySearchFunc(idx.ids, id, signal.SeriesID.Compare)
+
+	return ok
+}
+
+// buildPartIndex scans a sorted series column (each distinct id repeated for its contiguous run) and
+// records one entry per distinct id — the inverse of the on-disk layout. It is what openPart pays
+// once per part open. It counts distinct ids in a first pass so the two output slices are sized
+// exactly (no over-allocation and no regrow), keeping the resident footprint to 24 bytes/series.
+func buildPartIndex(ids []chunk.U128) partIndex {
+	idx := partIndex{total: len(ids)}
+	if len(ids) == 0 {
+		return idx
+	}
+
+	distinct := 1
+	for i := 1; i < len(ids); i++ {
+		if ids[i] != ids[i-1] {
+			distinct++
+		}
+	}
+
+	idx.ids = make([]signal.SeriesID, distinct)
+	idx.ranges = make([]rowRange, distinct)
+
+	k := 0
+	for i := 0; i < len(ids); {
+		j := i + 1
+		for j < len(ids) && ids[j] == ids[i] {
+			j++
+		}
+
+		idx.ids[k] = u128ToID(ids[i])
+		idx.ranges[k] = rowRange{start: i, end: j}
+		k++
+		i = j
+	}
+
+	return idx
+}
+
+// part is a flushed, immutable metric part: the lazy on-backend [block.PartReader] plus an in-memory
+// SeriesID → row-range index ([partIndex]).
 type part struct {
 	reader *block.PartReader
 	be     backend.Backend // for lazily loading the aggregate-pushdown stats sidecar
 	prefix string
-	ranges map[signal.SeriesID]rowRange
+	index  partIndex
 	hasSF  bool // the part carries a scale-factor column (sampling occurred); else every weight is 1
 
 	// statsOnce lazily loads the per-series aggregate sidecar (statsKey) on first aggregate query;
@@ -95,19 +157,13 @@ func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, err
 		return nil, err
 	}
 
-	ranges := make(map[signal.SeriesID]rowRange)
-
-	for i := 0; i < len(ids); {
-		j := i + 1
-		for j < len(ids) && ids[j] == ids[i] {
-			j++
-		}
-
-		ranges[u128ToID(ids[i])] = rowRange{start: i, end: j}
-		i = j
-	}
-
-	return &part{reader: r, be: b, prefix: prefix, ranges: ranges, hasSF: slices.Contains(r.ColumnNames(), colSF)}, nil
+	return &part{
+		reader: r,
+		be:     b,
+		prefix: prefix,
+		index:  buildPartIndex(ids),
+		hasSF:  slices.Contains(r.ColumnNames(), colSF),
+	}, nil
 }
 
 // seriesStat returns id's precomputed aggregate from the part's stats sidecar, lazily loading it.
@@ -152,12 +208,7 @@ func (p *part) compressedWith() compress.Algorithm {
 
 // rows returns the part's total sample count (its series ranges partition [0, rows)).
 func (p *part) rows() int {
-	n := 0
-	for _, r := range p.ranges {
-		n += r.end - r.start
-	}
-
-	return n
+	return p.index.total
 }
 
 // decodedPart is a part's columns decoded once: the full ts and value columns (and the scale

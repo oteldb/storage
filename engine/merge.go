@@ -214,7 +214,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 
 		// Oldest → newest part, so a later part's value wins on a duplicate timestamp.
 		for _, p := range src {
-			rng, ok := p.ranges[id]
+			rng, ok := p.index.lookup(id)
 			if !ok {
 				continue
 			}
@@ -287,7 +287,7 @@ func (e *Engine) compactStream(
 
 		// Oldest → newest part, so a later part's value wins on a duplicate timestamp.
 		for _, p := range src {
-			rng, ok := p.ranges[id]
+			rng, ok := p.index.lookup(id)
 			if !ok {
 				continue
 			}

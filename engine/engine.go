@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -408,7 +409,7 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 	var m sampleMerge
 
 	for _, part := range p.liveParts {
-		rng, ok := part.ranges[id]
+		rng, ok := part.index.lookup(id)
 		if !ok {
 			continue
 		}
@@ -992,12 +993,8 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 	var todo []*part
 
 	for _, pt := range plan.liveParts {
-		for _, id := range plan.ids {
-			if _, ok := pt.ranges[id]; ok {
-				todo = append(todo, pt)
-
-				break
-			}
+		if slices.ContainsFunc(plan.ids, pt.index.has) {
+			todo = append(todo, pt)
 		}
 	}
 

@@ -33,8 +33,8 @@ func makeSortedSeriesColumn(n, samplesPerSeries int) []chunk.U128 {
 }
 
 // BenchmarkPartIndexBuild measures the cost openPart pays once per part: scanning the sorted series
-// column and building the resident SeriesID→row-range index (today a map). This is the per-part
-// resident-heap line item that dominates live heap under continuous ingestion (issue #25 root cause B).
+// column and building the resident SeriesID→row-range index. This is the per-part resident-heap line
+// item that dominates live heap under continuous ingestion (issue #25 root cause B).
 func BenchmarkPartIndexBuild(b *testing.B) {
 	for _, n := range []int{1_000, 10_000, 100_000} {
 		const samplesPerSeries = 4
@@ -47,20 +47,9 @@ func BenchmarkPartIndexBuild(b *testing.B) {
 			b.SetBytes(int64(n) * 16)
 
 			for range b.N {
-				ranges := make(map[signal.SeriesID]rowRange, n)
-
-				for i := 0; i < len(col); {
-					j := i + 1
-					for j < len(col) && col[j] == col[i] {
-						j++
-					}
-
-					ranges[u128ToID(col[i])] = rowRange{start: i, end: j}
-					i = j
-				}
-
-				if len(ranges) != n {
-					b.Fatalf("got %d series, want %d", len(ranges), n)
+				idx := buildPartIndex(col)
+				if len(idx.ids) != n {
+					b.Fatalf("got %d series, want %d", len(idx.ids), n)
 				}
 			}
 		})
@@ -68,29 +57,19 @@ func BenchmarkPartIndexBuild(b *testing.B) {
 }
 
 // BenchmarkPartIndexLookup measures the per-query cost of locating a series' row range in a part's
-// index — paid once per (part × series a query touches). Today a map lookup.
+// index — paid once per (part × series a query touches).
 func BenchmarkPartIndexLookup(b *testing.B) {
 	for _, n := range []int{1_000, 10_000, 100_000} {
 		const samplesPerSeries = 4
 
 		col := makeSortedSeriesColumn(n, samplesPerSeries)
-
-		ranges := make(map[signal.SeriesID]rowRange, n)
-		for i := 0; i < len(col); {
-			j := i + 1
-			for j < len(col) && col[j] == col[i] {
-				j++
-			}
-
-			ranges[u128ToID(col[i])] = rowRange{start: i, end: j}
-			i = j
-		}
+		idx := buildPartIndex(col)
 
 		// A realistic mix: ~half the queries hit a resident series, half miss (a range query over a
 		// time window touches some parts that don't hold a given series).
 		probes := make([]signal.SeriesID, 0, n*2)
 		for i := range n {
-			id := u128ToID(col[i*samplesPerSeries])
+			id := idx.ids[i]
 			probes = append(probes, id) // a hit
 			probes = append(probes, signal.SeriesID{
 				Hi: id.Hi,
@@ -110,8 +89,7 @@ func BenchmarkPartIndexLookup(b *testing.B) {
 			var sink int
 
 			for i := range b.N {
-				id := probes[i%len(probes)]
-				rg, ok := ranges[id]
+				rg, ok := idx.lookup(probes[i%len(probes)])
 				if ok {
 					sink += rg.end - rg.start
 				}
