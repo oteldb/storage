@@ -12,6 +12,8 @@ func TestSegmentWriterAccessors(t *testing.T) {
 
 	sw, err := Create(t.TempDir(), 0)
 	require.NoError(t, err)
+	// Close the open segment before TempDir cleanup, else Windows can't unlink the in-use .wal file.
+	t.Cleanup(func() { _ = sw.Close() })
 
 	// Before the first write no segment is open; the epoch starts at the first generation.
 	assert.Equal(t, 0, sw.Seq())
