@@ -418,6 +418,11 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   (`{prefix}/bucket-index.bin` — part list + per-part time bounds) and the **identity index**
   (`{prefix}/series.bin` — every series' reversible labels). Merge updates both too,
   committing the new part set to the bucket index *before* deleting the source parts.
+  Flush and merge are driven by the facade's single **background maintenance loop**
+  (`storage.runMaintenance`), on the `Options.FlushInterval` cadence. A **durable** store always runs
+  it: a zero `FlushInterval` resolves to `defaultFlushInterval` (10 s), because without a running loop
+  a non-ephemeral head and WAL grow unbounded in RAM until OOM — only a *negative* interval (an
+  explicit opt-out) or the ephemeral in-memory engine disables it.
 - **Stateless reconstruction** (`index.go`) — `Engine.LoadParts` rebuilds a fresh engine's
   durable state from the backend alone: the part set from the bucket index, and the
   postings/series index from the identity object (so matchers resolve and batches carry real
@@ -431,7 +436,8 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   `downsample.go`, `recompress.go`, `precision.go`) is the one background-merge engine; all five modes
   are one pass over the immutable parts (no separate subsystem). `MergeWith(MergeOptions{RetainFrom,
   Downsample, Recompress, Precision})` (and
-  the convenience `Merge(retainFrom)`) compacts every part into one, merging samples per series by
+  the convenience `Merge(retainFrom)`) compacts a **bounded, size-tiered group** of the parts (see
+  *size-tiered compaction* below — not the whole set), merging samples per series by
   timestamp (freshest wins on a tie), dropping samples older than the absolute `retainFrom` cutoff,
   **downsampling** the survivors by the supplied tiers, and — when the merged part is **fully cold**
   (its newest sample predates `Recompress.Before`) — rewriting it with a higher-ratio compression
@@ -465,6 +471,23 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   already at or below the target budget is not rewritten). Records
   (logs/traces/profiles) carry retention only — downsampling, recompression and precision are
   metrics-specific.
+- **Size-tiered compaction — bounded working set** (`compact.go`): a merge does **not** re-read the
+  whole part set each cycle (that re-decoded, re-materialized and re-encoded the entire growing
+  dataset per maintenance tick, with O(dataset) memory and write amplification — what pinned multi-GB
+  of churned RSS on the object-store backend). `selectMergeParts` instead picks only the parts worth
+  merging this cycle: (a) any part a **forced rewrite** must touch — retention/downsample/recompress/
+  precision eligibility, regardless of size, so age-driven work is never starved; plus (b) the largest
+  group of same-size-**tier** *unsealed* parts (`sizeTier` buckets by power-of-two row count above a
+  floor; ties drain the smaller tier first), so small freshly-flushed parts merge up into larger ones.
+  A part that has reached the `MaxPartBytes` row cap is **sealed** — re-merging it only re-splits it
+  into equally-full parts (pure churn), so it is never compacted again, and the top tier therefore
+  stops growing. The chosen group is capped — by cumulative rows (`mergeFanIn × maxRows`) when a part
+  cap is set, else by part count — so a single merge's decoded input stays O(part size). The multi-part
+  path **streams** its output (`compactStream`): merged rows accumulate in one reused buffer that is
+  flushed to a part each time it reaches the cap, so output memory is one part's worth, never the whole
+  merged set. (A lone forced part keeps the in-memory path with its fixed-point skip.) The facade
+  defaults `MaxPartSize` to `defaultMaxPartBytes` (64 MiB) when a tenant leaves it unset, so the sealing
+  bound — and thus the bounded merge — applies by default.
 - **Fetch** (`engine.go`) implements the fetch contract: it resolves matchers to series
   over the index, then merges each series' head buffer ∪ every part by timestamp into one
   batch. Each part is **decoded once per fetch** (a per-fetch memo), and — when a per-tenant

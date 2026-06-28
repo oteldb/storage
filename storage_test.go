@@ -205,7 +205,8 @@ func TestResetClearsData(t *testing.T) {
 func TestResetRequiresEphemeral(t *testing.T) {
 	t.Parallel()
 
-	s, err := Open(context.Background(), Options{}, WithBackend(durableBackend{backend.Memory()}))
+	// Disable the background flush loop (this store is never Closed) so it leaks no loop goroutine.
+	s, err := Open(context.Background(), Options{}, WithBackend(durableBackend{backend.Memory()}), WithFlushInterval(-1))
 	require.NoError(t, err)
 
 	require.ErrorIs(t, s.Reset(context.Background()), ErrNotEphemeral)

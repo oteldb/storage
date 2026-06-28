@@ -2,15 +2,12 @@ package engine
 
 import (
 	"context"
-	"slices"
 	"time"
 
 	"github.com/go-faster/sdk/zctx"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
-
-	"github.com/oteldb/storage/signal"
 )
 
 // Merge compacts every flushed part into a single new part, dropping samples older than
@@ -71,8 +68,10 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 	return nil
 }
 
-// mergeLocked compacts the parts per opts and returns the number of source parts compacted (0 ⇒ a
-// no-op). The caller holds e.mu.
+// merge compacts a bounded, size-tiered group of the engine's parts per opts and returns the number
+// of source parts compacted (0 ⇒ a no-op). It does not re-read the whole part set: [selectMergeParts]
+// picks only the parts worth merging this cycle (a same-size tier group plus any part a forced
+// rewrite must touch), so a single merge's working set is O(part size), not O(dataset).
 func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	// Plan (under lock): snapshot the source parts (immutable backing) and reserve the sequence.
 	e.mu.Lock()
@@ -80,11 +79,10 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	seq := e.nextSeq
 	e.mu.Unlock()
 
-	// A single part with no retention cutoff, nothing old enough to downsample, and nothing to
-	// recompress has nothing to gain — skip without decoding it.
-	if len(src) == 0 || (len(src) == 1 && opts.RetainFrom <= 0 &&
-		!downsampleApplies(opts.Downsample, src[0].minTime) && !recompressApplies(src[0], opts.Recompress) &&
-		!precisionApplies(src[0], opts.Precision)) {
+	maxRows := maxRowsPerPart(e.cfg.MaxPartBytes)
+
+	selected := selectMergeParts(src, opts, maxRows)
+	if len(selected) == 0 {
 		e.reclaimRetired(ctx)
 
 		return 0, nil
@@ -95,57 +93,42 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 		start = opts.RetainFrom
 	}
 
-	// Build (lock-free): read+compact the source parts, downsample, write the merged part, read it
-	// back. The source parts stay live (not retired) until publish, so they can't be reclaimed here.
-	cols, err := e.compactParts(ctx, src, start, opts.Downsample)
-	if err != nil {
+	// Build (lock-free): compact the selected parts into new output part(s), reading them back. The
+	// source parts stay live (not retired) until publish, so they can't be reclaimed here.
+	var (
+		newParts []*part
+		err      error
+	)
+
+	if len(selected) == 1 {
+		// A single forced part: decode it (bounded — one part), apply retention/downsample, and skip
+		// the rewrite if it is already at its target (the fixed point), avoiding backend churn.
+		var cols *flushColumns
+		if cols, err = e.compactParts(ctx, selected, start, opts.Downsample); err != nil {
+			return 0, err
+		}
+
+		p := selected[0]
+		if opts.RetainFrom <= 0 && len(cols.ts) == p.rows() &&
+			!recompressApplies(p, opts.Recompress) && !precisionApplies(p, opts.Precision) {
+			e.reclaimRetired(ctx)
+
+			return 0, nil
+		}
+
+		if newParts, err = e.writeColumns(ctx, cols, seq, maxRows, opts); err != nil {
+			return 0, err
+		}
+	} else if newParts, err = e.compactStream(ctx, selected, start, seq, maxRows, opts); err != nil {
 		return 0, err
 	}
 
-	// Fixed point: a single source part whose row count downsampling did not reduce, and which
-	// needs neither recompression nor precision coarsening, is already at its target — rewriting it
-	// would only churn the backend.
-	if len(src) == 1 && opts.RetainFrom <= 0 && len(cols.ts) == src[0].rows() &&
-		!recompressApplies(src[0], opts.Recompress) && !precisionApplies(src[0], opts.Precision) {
-		e.reclaimRetired(ctx)
-
-		return 0, nil
-	}
-
-	// Split the merged columns into one or more parts, each under MaxPartBytes (one when unlimited).
-	// Each part's cold-tier recompression/precision is decided from its own newest sample.
-	var newParts []*part
-
-	if len(cols.ts) > 0 {
-		ranges := chunkRanges(len(cols.ts), maxRowsPerPart(e.cfg.MaxPartBytes))
-		newParts = make([]*part, 0, len(ranges))
-
-		for i, rg := range ranges {
-			sub := cols.slice(rg[0], rg[1])
-			minT, maxT := colsTimeRange(sub)
-			prefix := e.partPrefix(seq + i)
-
-			if err := writePart(ctx, e.cfg.Backend, prefix, sub,
-				coldProfile(opts.Recompress, maxT), pickPrecision(opts.Precision, maxT), e.cfg.AggregateStats); err != nil {
-				return 0, err
-			}
-
-			p, err := openPart(ctx, e.cfg.Backend, prefix)
-			if err != nil {
-				return 0, err
-			}
-
-			p.minTime, p.maxTime = minT, maxT
-			newParts = append(newParts, p)
-		}
-	}
-
-	// Publish (under lock): swap the source parts for the merged one(s) copy-on-write (keeping any part
-	// a concurrent flush may have added), retire the sources, and commit the index before any deletion —
-	// so a crash mid-merge never leaves the index referencing a deleted part. The retired parts' objects
-	// are deleted by reclaimRetired once their readers drain.
-	removed := make(map[string]struct{}, len(src))
-	for _, p := range src {
+	// Publish (under lock): swap the selected parts for the merged one(s) copy-on-write (keeping every
+	// part not selected — including any a concurrent flush may have added), retire the sources, and
+	// commit the index before any deletion — so a crash mid-merge never leaves the index referencing a
+	// deleted part. The retired parts' objects are deleted by reclaimRetired once their readers drain.
+	removed := make(map[string]struct{}, len(selected))
+	for _, p := range selected {
 		removed[p.prefix] = struct{}{}
 	}
 
@@ -153,17 +136,64 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	e.parts = replaceParts(e.parts, removed, newParts...)
 	e.nextSeq = seq + len(newParts)
 
-	e.retireLocked(src)
+	e.retireLocked(selected)
 	err = e.updateIndexLocked(ctx)
 	e.mu.Unlock()
 
 	if err != nil {
-		return len(src), err
+		return len(selected), err
 	}
 
 	e.reclaimRetired(ctx)
 
-	return len(src), nil
+	return len(selected), nil
+}
+
+// writeColumns splits cols into one or more output parts, each kept under maxRows (a single part when
+// maxRows ≤ 0), writes each, and reads it back. Each part's cold-tier recompression/precision is
+// decided from its own newest sample. Used for the single-part merge path; the multi-part path streams
+// (see compactStream). Returns nil when cols is empty (e.g. retention dropped every sample).
+func (e *Engine) writeColumns(ctx context.Context, cols *flushColumns, seq, maxRows int, opts MergeOptions) ([]*part, error) {
+	if len(cols.ts) == 0 {
+		return nil, nil
+	}
+
+	ranges := chunkRanges(len(cols.ts), maxRows)
+	newParts := make([]*part, 0, len(ranges))
+
+	for i, rg := range ranges {
+		sub := cols.slice(rg[0], rg[1])
+
+		p, err := e.writeMergedPart(ctx, sub, seq+i, opts)
+		if err != nil {
+			return nil, err
+		}
+
+		newParts = append(newParts, p)
+	}
+
+	return newParts, nil
+}
+
+// writeMergedPart writes cols as the seq-th output part with the cold-tier compression/precision its
+// own newest sample selects, reads it back, and stamps its time bounds.
+func (e *Engine) writeMergedPart(ctx context.Context, cols *flushColumns, seq int, opts MergeOptions) (*part, error) {
+	minT, maxT := colsTimeRange(cols)
+	prefix := e.partPrefix(seq)
+
+	if err := writePart(ctx, e.cfg.Backend, prefix, cols,
+		coldProfile(opts.Recompress, maxT), pickPrecision(opts.Precision, maxT), e.cfg.AggregateStats); err != nil {
+		return nil, err
+	}
+
+	p, err := openPart(ctx, e.cfg.Backend, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	p.minTime, p.maxTime = minT, maxT
+
+	return p, nil
 }
 
 // compactParts merges each source part's samples per series (within [start, maxInt64], so
@@ -171,19 +201,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 // columns sorted by (series, ts). The returned columns are empty when no sample survives. It reads
 // the parts off the engine lock; src is the immutable snapshot the caller planned over.
 func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tiers []DownsampleTier) (*flushColumns, error) {
-	idSet := make(map[signal.SeriesID]struct{})
-	for _, p := range src {
-		for id := range p.ranges {
-			idSet[id] = struct{}{}
-		}
-	}
-
-	ids := make([]signal.SeriesID, 0, len(idSet))
-	for id := range idSet {
-		ids = append(ids, id)
-	}
-
-	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
+	ids := sortedSeriesIDs(src)
 
 	cols := &flushColumns{}
 
@@ -224,6 +242,92 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 	}
 
 	return cols, nil
+}
+
+// compactStream merges several source parts and writes the result directly to bounded output parts,
+// never materializing the whole merged dataset: it accumulates merged rows in one reused buffer and
+// flushes a part each time the buffer reaches the per-part row cap. Combined with [selectMergeParts]
+// bounding the decoded input, a merge's output memory stays at one part (≈ MaxPartBytes) regardless
+// of how much data the sources hold — the key to keeping the object-store merge path from churning
+// multi-GB transient buffers. maxRows ≤ 0 (unlimited part size) writes a single output part.
+//
+// It mirrors [compactParts]: series in (series, ts) order, each decoded once and shared across its
+// series, oldest→newest so a later part's value wins a duplicate timestamp, then downsampled.
+func (e *Engine) compactStream(
+	ctx context.Context, src []*part, start int64, seq, maxRows int, opts MergeOptions,
+) ([]*part, error) {
+	ids := sortedSeriesIDs(src)
+
+	// Decode each source part once and reuse across all its series, as compactParts does.
+	decoded := make(partDecodeCache, len(src))
+
+	var (
+		newParts []*part
+		buf      flushColumns // the single reused output buffer
+	)
+
+	emit := func() error {
+		if len(buf.ts) == 0 {
+			return nil
+		}
+
+		p, err := e.writeMergedPart(ctx, &buf, seq+len(newParts), opts)
+		if err != nil {
+			return err
+		}
+
+		newParts = append(newParts, p)
+		buf.reset()
+
+		return nil
+	}
+
+	for _, id := range ids {
+		var m sampleMerge
+
+		// Oldest → newest part, so a later part's value wins on a duplicate timestamp.
+		for _, p := range src {
+			rng, ok := p.ranges[id]
+			if !ok {
+				continue
+			}
+
+			d, err := decoded.get(ctx, p, decodePart)
+			if err != nil {
+				return nil, err
+			}
+
+			d.mergeSeriesInto(rng, &m, start, maxInt64)
+		}
+
+		ts, values, sf := m.collect(nil, nil)
+		ts, values, sf = downsample(ts, values, sf, opts.Downsample)
+
+		u := idToU128(id)
+		for i := range ts {
+			w := float64(1)
+			if sf != nil {
+				w = sf[i]
+			}
+
+			buf.appendRow(u, ts[i], values[i], w)
+		}
+
+		// Flush a full part once the buffer reaches the cap. A series whose own run overshoots the cap
+		// is split at the next series boundary (parts are independent; the read seam merges a series
+		// spanning parts), keeping the buffer at ≈ one part regardless of a heavy series.
+		if maxRows > 0 && len(buf.ts) >= maxRows {
+			if err := emit(); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if err := emit(); err != nil {
+		return nil, err
+	}
+
+	return newParts, nil
 }
 
 // Close flushes any buffered samples to a part and closes the WAL. It does not stop a background

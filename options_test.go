@@ -61,4 +61,27 @@ func TestApplyDefaults(t *testing.T) {
 	assert.NotNil(t, o.Backend)
 	assert.True(t, o.Backend.IsEphemeral())
 	assert.Equal(t, DurabilityEphemeral, o.Durability)
+	assert.Zero(t, o.FlushInterval, "the ephemeral engine never flushes, so no default interval")
+}
+
+// TestApplyDefaultsFlushInterval covers issue 23: a durable store left at the zero FlushInterval must
+// default to a real interval (not silently disable all flushing), while a negative value opts out.
+func TestApplyDefaultsFlushInterval(t *testing.T) {
+	t.Parallel()
+
+	// Durable backend, no explicit interval ⇒ the maintenance loop runs at the default cadence.
+	d := Options{Backend: durableBackend{backend.Memory()}}
+	d.applyDefaults()
+	require.NotEqual(t, DurabilityEphemeral, d.Durability)
+	assert.Equal(t, int64(defaultFlushInterval), d.FlushInterval, "a durable store flushes by default")
+
+	// A negative interval is the explicit opt-out (manual/Admin-driven maintenance) and is preserved.
+	off := Options{Backend: durableBackend{backend.Memory()}, FlushInterval: -1}
+	off.applyDefaults()
+	assert.Equal(t, int64(-1), off.FlushInterval, "a negative interval disables the background loop")
+
+	// An explicit positive interval is honored verbatim.
+	set := Options{Backend: durableBackend{backend.Memory()}, FlushInterval: 22}
+	set.applyDefaults()
+	assert.Equal(t, int64(22), set.FlushInterval)
 }
