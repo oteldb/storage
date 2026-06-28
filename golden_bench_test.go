@@ -19,9 +19,13 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
+
+	promengine "github.com/prometheus/prometheus/promql"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/query/fetch"
+	promadapter "github.com/oteldb/storage/query/promql"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
 )
@@ -211,7 +215,128 @@ func BenchmarkGolden(b *testing.B) {
 	b.Run("read/fetch_all", benchGoldenFetchAll)
 	b.Run("read/fetch_all_release", benchGoldenFetchAllRelease)
 	b.Run("read/fetch_recent", benchGoldenFetchRecent)
+	b.Run("query/promql_count_cpu_cores", benchGoldenPromQLCountCPU)
 	b.Run("density", benchGoldenDensity)
+}
+
+// node_cpu_seconds_total benchmark fixture — a node_exporter-shaped counter exercising the realistic
+// nested-aggregation query `count_cpu_cores` from /src/oteldb/benchmark
+// (count(count(node_cpu_seconds_total{job="node_exporter"}) by (cpu))). The corpus has job+instance
+// on the resource and cpu+mode on the data points, so every node_exporter label is matchable.
+const (
+	nodeInstances = 4
+	nodeCPUs      = 16
+	nodeModes     = 8
+	nodeCPUPoints = 50 // ⇒ nodeInstances*nodeCPUs*nodeModes = 512 series
+)
+
+var (
+	nodeCPUName  = []byte("node_cpu_seconds_total")
+	nodeCPUModes = [nodeModes]string{"user", "system", "idle", "iowait", "irq", "softirq", "nice", "steal"}
+	// countCPUCoresExpr is the benchmark query: an inner per-cpu count collapsed by an outer count —
+	// the canonical "how many CPU cores" PromQL expression.
+	countCPUCoresExpr = `count(count(node_cpu_seconds_total{job="node_exporter"}) by (cpu))`
+)
+
+// nodeCPUCorpus builds the deterministic node_cpu_seconds_total workload (no RNG): per instance, a
+// cumulative monotonic counter over every (cpu, mode) pair, each a ramp of nodeCPUPoints samples.
+func nodeCPUCorpus() metric.Metrics {
+	var md metric.Metrics
+
+	for inst := range nodeInstances {
+		rm := md.AddResource()
+		rm.Resource = signal.Resource{Attributes: signal.NewAttributes(
+			signal.KeyValue{Key: []byte("job"), Value: signal.StringValue([]byte("node_exporter"))},
+			signal.KeyValue{Key: []byte("instance"), Value: signal.StringValue(append([]byte("host-"), itoa(inst)...))},
+		)}
+
+		mt := rm.AddScope().AddMetric()
+		mt.Name = nodeCPUName
+		mt.Kind = metric.KindSum
+		mt.Temporality = metric.TemporalityCumulative
+		mt.Monotonic = true
+
+		for cpu := range nodeCPUs {
+			for mode := range nodeCPUModes {
+				attrs := signal.NewAttributes(
+					signal.KeyValue{Key: []byte("cpu"), Value: signal.StringValue([]byte(itoa(cpu)))},
+					signal.KeyValue{Key: []byte("mode"), Value: signal.StringValue([]byte(nodeCPUModes[mode]))},
+				)
+
+				for p := range nodeCPUPoints {
+					pt := mt.AddPoint()
+					pt.Ts = goldenStartTs + int64(p)*goldenInterval
+					pt.StartTs = goldenStartTs
+					pt.Value = float64(p)
+					pt.Attributes = attrs
+				}
+			}
+		}
+	}
+
+	return md
+}
+
+// benchGoldenPromQLCountCPU measures the end-to-end PromQL path: a Prometheus promql.Engine running
+// the count_cpu_cores nested aggregation over the storage fetch contract via the query/promql
+// adapter. It covers matcher push-down, series fetch + decode, label projection, and the engine's
+// inner+outer count — the realistic embedder query path, not just the fetch seam.
+func benchGoldenPromQLCountCPU(b *testing.B) {
+	ctx := context.Background()
+
+	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()))
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	defer func() { _ = s.Close(ctx) }()
+
+	if _, err := s.WriteMetrics(ctx, nodeCPUCorpus()); err != nil {
+		b.Fatal(err)
+	}
+
+	goldenFlushMerge(b, s)
+
+	eng := promengine.NewEngine(promengine.EngineOpts{MaxSamples: 50_000_000, Timeout: time.Minute, LookbackDelta: 5 * time.Minute})
+	qa := promadapter.NewQueryable(s.Fetcher("default"), "default")
+	evalTs := time.Unix(0, goldenStartTs+int64(nodeCPUPoints-1)*goldenInterval)
+
+	run := func() float64 {
+		q, err := eng.NewInstantQuery(ctx, qa, nil, countCPUCoresExpr, evalTs)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		defer q.Close()
+
+		res := q.Exec(ctx)
+		if res.Err != nil {
+			b.Fatal(res.Err)
+		}
+
+		vec, err := res.Vector()
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		if len(vec) != 1 {
+			b.Fatalf("expected a single scalar result, got %d samples", len(vec))
+		}
+
+		return vec[0].F
+	}
+
+	// Sanity: count(count(... ) by (cpu)) == number of distinct cpu values (one group per core).
+	if got := run(); got != float64(nodeCPUs) {
+		b.Fatalf("count_cpu_cores = %v, want %d", got, nodeCPUs)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		run()
+	}
 }
 
 // benchGoldenFetchAllRelease is fetch_all where the consumer Releases each batch after use — the
