@@ -80,8 +80,9 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	e.mu.Unlock()
 
 	maxRows := maxRowsPerPart(e.cfg.MaxPartBytes)
+	capRows := mergeCapRows(maxRows)
 
-	selected := selectMergeParts(src, opts, maxRows)
+	selected := selectMergeParts(src, opts, capRows)
 	if len(selected) == 0 {
 		e.reclaimRetired(ctx)
 
@@ -116,10 +117,10 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 			return 0, nil
 		}
 
-		if newParts, err = e.writeColumns(ctx, cols, seq, maxRows, opts); err != nil {
+		if newParts, err = e.writeColumns(ctx, cols, seq, capRows, opts); err != nil {
 			return 0, err
 		}
-	} else if newParts, err = e.compactStream(ctx, selected, start, seq, maxRows, opts); err != nil {
+	} else if newParts, err = e.compactStream(ctx, selected, start, seq, capRows, opts); err != nil {
 		return 0, err
 	}
 
@@ -149,16 +150,16 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	return len(selected), nil
 }
 
-// writeColumns splits cols into one or more output parts, each kept under maxRows (a single part when
-// maxRows ≤ 0), writes each, and reads it back. Each part's cold-tier recompression/precision is
-// decided from its own newest sample. Used for the single-part merge path; the multi-part path streams
-// (see compactStream). Returns nil when cols is empty (e.g. retention dropped every sample).
-func (e *Engine) writeColumns(ctx context.Context, cols *flushColumns, seq, maxRows int, opts MergeOptions) ([]*part, error) {
+// writeColumns splits cols into one or more output parts, each kept under capRows (a single part
+// when capRows ≤ 0), writes each, and reads it back. Used for the single-part merge path; the
+// multi-part path streams (see compactStream). Returns nil when cols is empty (e.g. retention
+// dropped every sample).
+func (e *Engine) writeColumns(ctx context.Context, cols *flushColumns, seq, capRows int, opts MergeOptions) ([]*part, error) {
 	if len(cols.ts) == 0 {
 		return nil, nil
 	}
 
-	ranges := chunkRanges(len(cols.ts), maxRows)
+	ranges := chunkRanges(len(cols.ts), capRows)
 	newParts := make([]*part, 0, len(ranges))
 
 	for i, rg := range ranges {
@@ -246,15 +247,18 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 
 // compactStream merges several source parts and writes the result directly to bounded output parts,
 // never materializing the whole merged dataset: it accumulates merged rows in one reused buffer and
-// flushes a part each time the buffer reaches the per-part row cap. Combined with [selectMergeParts]
-// bounding the decoded input, a merge's output memory stays at one part (≈ MaxPartBytes) regardless
-// of how much data the sources hold — the key to keeping the object-store merge path from churning
-// multi-GB transient buffers. maxRows ≤ 0 (unlimited part size) writes a single output part.
+// flushes a part each time the buffer reaches the output cap. Combined with [selectMergeParts]
+// bounding the decoded input, a merge's output memory stays at one part regardless of how much data
+// the sources hold — the key to keeping the object-store merge path from churning multi-GB transient
+// buffers. capRows is the output-part row limit (the merge cap, mergeHeight × MaxPartBytes — larger
+// than the flush cap, so a merge promotes same-tier siblings into a larger part rather than
+// re-splitting them at the flush size); capRows ≤ 0 (unlimited part size) writes a single output
+// part.
 //
 // It mirrors [compactParts]: series in (series, ts) order, each decoded once and shared across its
 // series, oldest→newest so a later part's value wins a duplicate timestamp, then downsampled.
 func (e *Engine) compactStream(
-	ctx context.Context, src []*part, start int64, seq, maxRows int, opts MergeOptions,
+	ctx context.Context, src []*part, start int64, seq, capRows int, opts MergeOptions,
 ) ([]*part, error) {
 	ids := sortedSeriesIDs(src)
 
@@ -313,10 +317,10 @@ func (e *Engine) compactStream(
 			buf.appendRow(u, ts[i], values[i], w)
 		}
 
-		// Flush a full part once the buffer reaches the cap. A series whose own run overshoots the cap
-		// is split at the next series boundary (parts are independent; the read seam merges a series
-		// spanning parts), keeping the buffer at ≈ one part regardless of a heavy series.
-		if maxRows > 0 && len(buf.ts) >= maxRows {
+		// Flush a full part once the buffer reaches the output cap. A series whose own run overshoots
+		// the cap is split at the next series boundary (parts are independent; the read seam merges a
+		// series spanning parts), keeping the buffer at ≈ one part regardless of a heavy series.
+		if capRows > 0 && len(buf.ts) >= capRows {
 			if err := emit(); err != nil {
 				return nil, err
 			}

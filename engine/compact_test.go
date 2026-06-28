@@ -49,28 +49,40 @@ func sortedPartKeys(t *testing.T, b backend.Backend) []string {
 	return keys
 }
 
-// TestMergeDoesNotChurnSealedParts is the core of issue 22: once parts have reached the per-part size
-// cap, a merge must not re-read and rewrite them every cycle (the unbounded write-amplification that
-// pinned multi-GB of RSS). With every part sealed, a merge is a no-op — the part objects are
-// untouched and the merge is idempotent.
+// TestMergeDoesNotChurnSealedParts is the core of issue 22 (refined by issue #25): once parts have
+// been promoted up to the merge cap (mergeHeight × MaxPartBytes), a merge must not re-read and
+// rewrite them every cycle (the unbounded write-amplification that pinned multi-GB of RSS). With
+// every surviving part sealed, a merge is a no-op — the part objects are untouched and idempotent.
+//
+// Below the cap, parts roll up: small freshly-flushed parts merge into larger ones until they reach
+// the cap and seal, so the part count is bounded rather than growing with every flush.
 func TestMergeDoesNotChurnSealedParts(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	// MaxPartBytes ≈ 5 rows per part, so each 5-series flush produces one full (sealed) part.
+	// MaxPartBytes ≈ 5 rows per part (maxRows 5); the merge cap is mergeHeight × maxRows = 40 rows.
 	b := backend.Memory()
 	e := engine.New(engine.Config{Backend: b, Prefix: "default/metrics", MaxPartBytes: 160})
 
-	for k := range 3 {
+	// 16 flushes of 5 distinct series each ⇒ 16 tier-0 parts of 5 rows. Tiered merging promotes them
+	// up toward the 40-row seal cap (8 parts ⇒ one 40-row sealed part per two merges).
+	for k := range 16 {
 		flushDistinct(t, e, k*5, 5, int64(100+k))
 	}
 
-	require.Equal(t, 3, e.PartCount())
+	require.Equal(t, 16, e.PartCount())
+
+	// Merge until the part set stabilizes — parts seal at the cap and further merges stop.
+	for range 8 {
+		require.NoError(t, e.Merge(ctx, 0))
+	}
+
+	count := e.PartCount()
 	before := sortedPartKeys(t, b)
 
-	// Every part is sealed ⇒ the merge compacts nothing and rewrites no object.
+	// Every surviving part is at the seal cap ⇒ the merge compacts nothing and rewrites no object.
 	require.NoError(t, e.Merge(ctx, 0))
-	assert.Equal(t, 3, e.PartCount(), "sealed parts are not re-compacted")
+	assert.Equal(t, count, e.PartCount(), "sealed parts are not re-compacted")
 	assert.Equal(t, before, sortedPartKeys(t, b), "no part object was rewritten (no churn)")
 
 	// And it is idempotent across cycles — the engine does not re-compact the whole set each tick.
@@ -78,13 +90,15 @@ func TestMergeDoesNotChurnSealedParts(t *testing.T) {
 	assert.Equal(t, before, sortedPartKeys(t, b))
 }
 
-// TestMergeCompactsUnsealedTier confirms the other half: parts below the size cap and in the same
-// size tier are compacted together, and the streaming output stays bounded by the cap.
+// TestMergeCompactsUnsealedTier confirms the other half: parts below the merge cap and in the same
+// size tier are compacted together into a larger (promoted) part, and the streaming output stays
+// bounded by the cap.
 func TestMergeCompactsUnsealedTier(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	// maxRows ≈ 5. Three flushes of 2 distinct series each ⇒ three 2-row (unsealed, tier 0) parts.
+	// maxRows 5; merge cap mergeHeight × maxRows = 40. Three flushes of 2 distinct series each ⇒
+	// three 2-row (tier 0, well below the cap) parts.
 	b := backend.Memory()
 	e := engine.New(engine.Config{Backend: b, Prefix: "default/metrics", MaxPartBytes: 160})
 
@@ -98,9 +112,9 @@ func TestMergeCompactsUnsealedTier(t *testing.T) {
 	require.NoError(t, e.Merge(ctx, 0))
 	assert.Less(t, e.PartCount(), 3, "same-tier unsealed parts compact together")
 
-	// Every output part stays within the cap (streaming never builds the whole merged set).
+	// Every output part stays within the merge cap (streaming never builds the whole merged set).
 	for _, p := range e.Parts() {
-		assert.LessOrEqual(t, p.Rows, int64(5), "merged output part respects MaxPartBytes")
+		assert.LessOrEqual(t, p.Rows, int64(40), "merged output part respects the merge cap")
 	}
 
 	// All 6 distinct series survive the compaction.

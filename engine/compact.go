@@ -34,9 +34,12 @@ func sortedSeriesIDs(src []*part) []signal.SeriesID {
 // bounded group of similarly-sized parts and compacts only those, so its working set is O(part
 // size), not O(dataset):
 //
-//   - A part that has reached the per-part row cap (MaxPartBytes) is "sealed": merging sealed parts
-//     only re-splits them into the same number of equally-full parts, which is pure churn — so they
-//     are never compacted again. With a bounded part size the top tier therefore stops growing.
+//   - A part that has reached the merge cap (mergeHeight × MaxPartBytes) is "sealed": re-merging
+//     sealed parts only re-splits them into the same number of equally-full parts, which is pure
+//     churn — so they are never compacted again. Parts below the cap roll up through progressively
+//     taller size tiers (each merge of same-tier siblings produces a larger part), so part count is
+//     bounded at ≈ dataset / (mergeHeight × MaxPartBytes) instead of growing with every flush
+//     (issue #25 root cause A).
 //   - Among the unsealed parts, those of similar size share a tier; a tier is compacted once it
 //     holds at least minTierParts of them, so small freshly-flushed parts merge up into larger ones
 //     without re-reading the already-compacted large parts.
@@ -49,14 +52,31 @@ const (
 	// maxTierParts caps how many parts one merge compacts when a row budget does not apply
 	// (unlimited part size); the rest are picked up on the next cycle.
 	maxTierParts = 16
-	// mergeFanIn bounds a merge's decoded input to mergeFanIn × MaxPartBytes by capping the chosen
-	// tier group's cumulative rows, so the input working set stays a small multiple of one part.
-	mergeFanIn = 4
+	// mergeHeight is how many flush-tier sizes a part may grow to through tiered merging before it is
+	// sealed. A freshly-flushed part is at most MaxPartBytes; the background merge combines
+	// same-tier parts into larger ones, so a promoted part grows toward mergeHeight × MaxPartBytes.
+	// Once it reaches that size it is sealed (re-merging it would only re-split it — pure churn),
+	// bounding part count to ≈ dataset / (mergeHeight × MaxPartBytes) instead of dataset /
+	// MaxPartBytes. The decoded input of one merge is capped at the same mergeHeight × MaxPartBytes,
+	// so the background merge's working set stays bounded regardless of how tall the tier being
+	// compacted is.
+	mergeHeight = 8
 	// tierFloorRows collapses every part below this row count into tier 0, so the many tiny parts of
 	// a test or a low-volume tenant always share a tier and compact together (the power-of-two
 	// bucketing below only differentiates parts large enough for their sizes to matter).
 	tierFloorRows = 1 << 12
 )
+
+// mergeCapRows returns the row count at which a part is sealed (never re-compacted): mergeHeight ×
+// the flush-tier cap. 0 (never seal) when the flush cap is 0 (unlimited part size), so unlimited
+// parts always merge into one.
+func mergeCapRows(maxRows int) int {
+	if maxRows <= 0 {
+		return 0
+	}
+
+	return maxRows * mergeHeight
+}
 
 // sizeTier buckets a part by row count into a tier, so two parts within 2× of each other (above the
 // floor) share a tier. Parts at or below tierFloorRows are all tier 0.
@@ -88,8 +108,8 @@ func forcedRewrite(p *part, opts MergeOptions) bool {
 // union of the parts a forced rewrite (retention/downsample/recompress/precision) must touch and the
 // best same-tier group of unsealed parts. It returns nil when nothing is worth doing — fewer than
 // minTierParts in every tier and no forced part — so the merge is a no-op without decoding anything.
-// maxRows is the per-part row cap (0 ⇒ unlimited, so no part is ever sealed).
-func selectMergeParts(src []*part, opts MergeOptions, maxRows int) []*part {
+// capRows is the seal threshold in rows (0 ⇒ unlimited, so no part is ever sealed).
+func selectMergeParts(src []*part, opts MergeOptions, capRows int) []*part {
 	var (
 		selected []*part
 		chosen   = make(map[*part]struct{}, len(src))
@@ -108,7 +128,7 @@ func selectMergeParts(src []*part, opts MergeOptions, maxRows int) []*part {
 		}
 	}
 
-	for _, p := range pickTierGroup(src, maxRows) {
+	for _, p := range pickTierGroup(src, capRows) {
 		add(p)
 	}
 
@@ -117,11 +137,12 @@ func selectMergeParts(src []*part, opts MergeOptions, maxRows int) []*part {
 
 // pickTierGroup returns the group of unsealed parts to compact for size reduction: the tier holding
 // the most parts (ties broken toward the smaller tier, to drain small parts first), once it holds at
-// least minTierParts. The group is capped — by cumulative rows (mergeFanIn × maxRows) when a part
-// size cap is set, else by maxTierParts — so the merge's decoded input stays bounded. Returns nil
-// when no tier qualifies. Parts keep their src (sequence) order within the group.
-func pickTierGroup(src []*part, maxRows int) []*part {
-	sealed := func(p *part) bool { return maxRows > 0 && p.rows() >= maxRows }
+// least minTierParts. The group is capped by cumulative rows at the seal threshold (so one merge's
+// decoded input is at most one sealed-tier part's worth), or by maxTierParts when part size is
+// unlimited. Returns nil when no tier qualifies. Parts keep their src (sequence) order within the
+// group.
+func pickTierGroup(src []*part, capRows int) []*part {
+	sealed := func(p *part) bool { return capRows > 0 && p.rows() >= capRows }
 
 	byTier := make(map[int][]*part)
 	for _, p := range src {
@@ -144,15 +165,15 @@ func pickTierGroup(src []*part, maxRows int) []*part {
 
 	group := byTier[bestTier]
 
-	if maxRows > 0 {
-		// Cap the group by cumulative rows so the decoded input is ≤ mergeFanIn parts' worth, taking
-		// at least minTierParts so a merge always makes progress even when two parts already exceed it.
-		budget := maxRows * mergeFanIn
+	if capRows > 0 {
+		// Cap the group's cumulative rows at the seal threshold, so the decoded input of one merge is
+		// at most one sealed-tier part's worth — taking at least minTierParts so a merge always makes
+		// progress even when two parts already approach the cap.
 		total := 0
 
 		for i, p := range group {
 			total += p.rows()
-			if i+1 >= minTierParts && total >= budget {
+			if i+1 >= minTierParts && total >= capRows {
 				return group[:i+1]
 			}
 		}

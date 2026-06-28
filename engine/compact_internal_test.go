@@ -61,7 +61,7 @@ func TestPickTierGroupUnlimited(t *testing.T) {
 func TestPickTierGroupSealedExcluded(t *testing.T) {
 	t.Parallel()
 
-	// maxRows 5: a part at the cap is sealed (re-merging it is pure churn) and never selected.
+	// mergeCap 5: a part at the cap is sealed (re-merging it is pure churn) and never selected.
 	full1, full2 := partWithRows(0, 5), partWithRows(1, 5)
 	assert.Nil(t, pickTierGroup([]*part{full1, full2}, 5), "two sealed parts are not re-merged")
 
@@ -84,16 +84,16 @@ func TestPickTierGroupDifferentTiersDoNotMerge(t *testing.T) {
 func TestPickTierGroupRowBudgetCap(t *testing.T) {
 	t.Parallel()
 
-	// maxRows caps the decoded input at mergeFanIn × maxRows: with maxRows 10 (budget 40) and eight
-	// 9-row parts in one tier, only enough to reach the budget are taken this cycle.
-	const maxRows = 10
+	// mergeCap bounds the decoded input: with cap 20 and eight 9-row parts in one tier, only enough
+	// to reach the cap are taken this cycle (the rest wait for the next).
+	const mergeCap = 20
 
 	parts := make([]*part, 0, 8)
 	for i := range 8 {
-		parts = append(parts, partWithRows(i, maxRows-1)) // 9 rows: unsealed, all tier 0
+		parts = append(parts, partWithRows(i, 9)) // 9 rows: all tier 0, all below the cap
 	}
 
-	group := pickTierGroup(parts, maxRows)
+	group := pickTierGroup(parts, mergeCap)
 	total := 0
 	for _, p := range group {
 		total += p.rows()
@@ -101,7 +101,7 @@ func TestPickTierGroupRowBudgetCap(t *testing.T) {
 
 	assert.GreaterOrEqual(t, len(group), minTierParts, "always makes progress")
 	assert.Less(t, len(group), len(parts), "the row budget caps the group below the full tier")
-	assert.GreaterOrEqual(t, total, maxRows*mergeFanIn, "takes parts up to the budget")
+	assert.GreaterOrEqual(t, total, mergeCap, "takes parts up to the cap")
 }
 
 func TestSelectMergePartsForcedRetention(t *testing.T) {

@@ -459,12 +459,15 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   Bucket alignment is to the absolute grid (not ingest time), so the rollup of a range is independent
   of when the merge runs and repeated merges are a **fixed point** for last/first/min/max/sum/avg (a
   one-sample bucket aggregates to itself); count is the documented non-idempotent exception.
-- **MaxPartBytes — part splitting** (`Config.MaxPartBytes`, from `tenant.Limits.MaxPartSize`): both
-  **flush and merge split** their column output into row-bounded chunks (`chunkRanges`/`slice`, a
-  ~32 B/row estimate) so no single immutable part exceeds the cap; 0 ⇒ unlimited (one part,
-  byte-identical to before). Splitting at row boundaries is safe — parts are independent and a series
-  spanning two parts is merged back by the read seam — and a merge decides each split part's cold
-  recompression/precision from its own newest sample. `replaceParts` takes the resulting set.
+- **MaxPartBytes — part splitting** (`Config.MaxPartBytes`, from `tenant.Limits.MaxPartSize`):
+  **flush splits** its column output into row-bounded chunks (`chunkRanges`/`slice`, a ~32 B/row
+  estimate) so no freshly-flushed part exceeds the cap; 0 ⇒ unlimited (one part, byte-identical to
+  before). A **merge promotes**: its output splits at the taller merge cap (`mergeHeight ×
+  MaxPartBytes`), so same-tier siblings combine into a larger part rather than re-splitting at the
+  flush size (see size-tiered compaction below). Splitting at row boundaries is safe — parts are
+  independent and a series spanning two parts is merged back by the read seam — and a merge decides
+  each split part's cold recompression/precision from its own newest sample. `replaceParts` takes the
+  resulting set.
   **Precision** is age-tiered *lossy* float compression: a `PrecisionTier{Before, Bits}` re-encodes a
   **fully-cold** part's value column with the scaled-decimal codec retaining only `Bits` significant
   mantissa bits (fewer ⇒ denser, less accurate), so recent data stays lossless and only old data
@@ -477,18 +480,21 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
 - **Size-tiered compaction — bounded working set** (`compact.go`): a merge does **not** re-read the
   whole part set each cycle (that re-decoded, re-materialized and re-encoded the entire growing
   dataset per maintenance tick, with O(dataset) memory and write amplification — what pinned multi-GB
-  of churned RSS on the object-store backend). `selectMergeParts` instead picks only the parts worth
+  of churned RSS on the object-store backend).   `selectMergeParts` instead picks only the parts worth
   merging this cycle: (a) any part a **forced rewrite** must touch — retention/downsample/recompress/
   precision eligibility, regardless of size, so age-driven work is never starved; plus (b) the largest
   group of same-size-**tier** *unsealed* parts (`sizeTier` buckets by power-of-two row count above a
   floor; ties drain the smaller tier first), so small freshly-flushed parts merge up into larger ones.
-  A part that has reached the `MaxPartBytes` row cap is **sealed** — re-merging it only re-splits it
-  into equally-full parts (pure churn), so it is never compacted again, and the top tier therefore
-  stops growing. The chosen group is capped — by cumulative rows (`mergeFanIn × maxRows`) when a part
-  cap is set, else by part count — so a single merge's decoded input stays O(part size). The multi-part
-  path **streams** its output (`compactStream`): merged rows accumulate in one reused buffer that is
-  flushed to a part each time it reaches the cap, so output memory is one part's worth, never the whole
-  merged set. (A lone forced part keeps the in-memory path with its fixed-point skip.) The facade
+  A part that has reached the merge cap (`mergeHeight × MaxPartBytes`) is **sealed** — re-merging it
+  only re-splits it into equally-full parts (pure churn), so it is never compacted again. Parts below
+  the cap roll up through progressively taller size tiers (each merge of same-tier siblings produces
+  a larger part), so part count is bounded at ≈ dataset / (mergeHeight × MaxPartBytes) instead of
+  growing with every flush. The chosen group is capped — by cumulative rows at the merge cap (so one
+  merge's decoded input is at most one sealed-tier part's worth) when a part cap is set, else by part
+  count — so a single merge's decoded input stays O(part size). The multi-part path **streams** its
+  output (`compactStream`): merged rows accumulate in one reused buffer that is flushed to a part each
+  time it reaches the cap, so output memory is one part's worth, never the whole merged set. (A lone
+  forced part keeps the in-memory path with its fixed-point skip.) The facade
   defaults `MaxPartSize` to `defaultMaxPartBytes` (64 MiB) when a tenant leaves it unset, so the sealing
   bound — and thus the bounded merge — applies by default.
 - **Fetch** (`engine.go`) implements the fetch contract: it resolves matchers to series
