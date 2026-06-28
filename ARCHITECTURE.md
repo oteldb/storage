@@ -493,13 +493,17 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   the cap roll up through progressively taller size tiers (each merge of same-tier siblings produces
   a larger part), so part count is bounded at ≈ dataset / (mergeHeight × MaxPartBytes) instead of
   growing with every flush. The chosen group is capped — by cumulative rows at the merge cap (so one
-  merge's decoded input is at most one sealed-tier part's worth) when a part cap is set, else by part
-  count — so a single merge's decoded input stays O(part size). The multi-part path **streams** its
-  output (`compactStream`): merged rows accumulate in one reused buffer that is flushed to a part each
-  time it reaches the cap, so output memory is one part's worth, never the whole merged set. (A lone
-  forced part keeps the in-memory path with its fixed-point skip.) The facade
-  defaults `MaxPartSize` to `defaultMaxPartBytes` (64 MiB) when a tenant leaves it unset, so the sealing
-  bound — and thus the bounded merge — applies by default.
+  merge's selected input is at most one sealed-tier part's worth) when a part cap is set, else by
+  part count. The multi-part path **streams both its input and its output** (`compactStream`): each
+  source part is read through a forward [partStream] (`block.ColumnReader.TsCursor`/`FloatCursor` →
+  `chunk` forward decoders) that decodes one series range at a time, advancing strictly forward
+  through the part's (series, ts)-sorted rows, so the decoded input resident at any moment is
+  O(parts × one-series-range), not O(parts × whole-column) — the streaming k-way merge, which keeps
+  the background merge's working set bounded regardless of how large the merged parts grow; merged
+  rows accumulate in one reused buffer flushed to a part each time it reaches the cap, so output
+  memory is one part's worth. (A lone forced part keeps the in-memory path with its fixed-point
+  skip.) The facade defaults `MaxPartSize` to `defaultMaxPartBytes` (64 MiB) when a tenant leaves it
+  unset, so the sealing bound — and thus the bounded merge — applies by default.
 - **Fetch** (`engine.go`) implements the fetch contract: it resolves matchers to series
   over the index, then merges each series' head buffer ∪ every part by timestamp into one
   batch. Each part is **decoded once per fetch** (a per-fetch memo), and — when a per-tenant

@@ -446,6 +446,49 @@ func (r *ColumnReader) Bytes() (*chunk.DictColumn, error) {
 	return dc, err
 }
 
+// TsCursor returns a forward cursor over a [KindInt64] timestamp column (delta-of-delta). A
+// constant-collapsed column yields a repeating cursor. It is the streaming-merge form of Int64:
+// same decode, but one row at a time so a merge holds only one series range resident per part.
+func (r *ColumnReader) TsCursor() (chunk.TsCursor, error) {
+	if r.desc.Kind != KindInt64 {
+		return nil, errors.Errorf("block: column %q is %s, not int64", r.desc.Name, r.desc.Kind)
+	}
+
+	if r.desc.Const {
+		return chunk.NewConstTsCursor(r.rows, r.desc.ConstInt64), nil
+	}
+
+	if r.desc.Codec != chunk.CodecDoD {
+		return nil, errors.Errorf("block: codec %s not a streamable timestamp codec for %q", r.desc.Codec, r.desc.Name)
+	}
+
+	stream, err := r.stream()
+	if err != nil {
+		return nil, err
+	}
+
+	return chunk.NewTsDecoder(stream)
+}
+
+// FloatCursor returns a forward cursor over a [KindFloat64] column (Gorilla or scaled-decimal). A
+// constant-collapsed column yields a repeating cursor. It is the streaming-merge form of Float64.
+func (r *ColumnReader) FloatCursor() (chunk.FloatDecoder, error) {
+	if r.desc.Kind != KindFloat64 {
+		return nil, errors.Errorf("block: column %q is %s, not float64", r.desc.Name, r.desc.Kind)
+	}
+
+	if r.desc.Const {
+		return chunk.NewConstFloatDecoder(r.rows, r.desc.ConstFloat64), nil
+	}
+
+	stream, err := r.stream()
+	if err != nil {
+		return nil, err
+	}
+
+	return chunk.NewFloatDecoder(r.desc.Codec, stream)
+}
+
 // stream decompresses the column's block frame into its raw codec stream.
 func (r *ColumnReader) stream() ([]byte, error) {
 	out, err := r.comp.Decompress(nil, r.object)

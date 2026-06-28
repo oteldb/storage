@@ -247,23 +247,36 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 
 // compactStream merges several source parts and writes the result directly to bounded output parts,
 // never materializing the whole merged dataset: it accumulates merged rows in one reused buffer and
-// flushes a part each time the buffer reaches the output cap. Combined with [selectMergeParts]
-// bounding the decoded input, a merge's output memory stays at one part regardless of how much data
-// the sources hold — the key to keeping the object-store merge path from churning multi-GB transient
-// buffers. capRows is the output-part row limit (the merge cap, mergeHeight × MaxPartBytes — larger
-// than the flush cap, so a merge promotes same-tier siblings into a larger part rather than
-// re-splitting them at the flush size); capRows ≤ 0 (unlimited part size) writes a single output
+// flushes a part each time the buffer reaches the output cap.
+//
+// Each source part is read through a forward [partStream] that decodes one series range at a time,
+// advancing strictly forward through the part's (series, ts)-sorted rows. So a merge's resident
+// decoded input is O(parts × one-series-range) rather than O(parts × whole-column): the streaming
+// k-way merge (issue #25, item 1's full fix), which keeps the background merge's working set bounded
+// regardless of how large the merged parts grow — letting the merge cap rise and part count fall
+// toward O(log N) without a decode-memory regression. capRows is the output-part row limit (the
+// merge cap, mergeHeight × MaxPartBytes); capRows ≤ 0 (unlimited part size) writes a single output
 // part.
 //
-// It mirrors [compactParts]: series in (series, ts) order, each decoded once and shared across its
-// series, oldest→newest so a later part's value wins a duplicate timestamp, then downsampled.
+// Series are visited in (series, ts) order; within a series the parts are visited oldest→newest so
+// a later part's value wins a duplicate timestamp, then the result is downsampled.
 func (e *Engine) compactStream(
 	ctx context.Context, src []*part, start int64, seq, capRows int, opts MergeOptions,
 ) ([]*part, error) {
 	ids := sortedSeriesIDs(src)
 
-	// Decode each source part once and reuse across all its series, as compactParts does.
-	decoded := make(partDecodeCache, len(src))
+	// One forward cursor per source part; one reusable per-part destination per series range.
+	streams := make([]*partStream, len(src))
+	for i, p := range src {
+		s, err := newPartStream(ctx, p)
+		if err != nil {
+			return nil, err
+		}
+
+		streams[i] = s
+	}
+
+	scratch := make([]rangeBuf, len(src))
 
 	var (
 		newParts []*part
@@ -290,18 +303,18 @@ func (e *Engine) compactStream(
 		var m sampleMerge
 
 		// Oldest → newest part, so a later part's value wins on a duplicate timestamp.
-		for _, p := range src {
+		for i, p := range src {
 			rng, ok := p.index.lookup(id)
 			if !ok {
 				continue
 			}
 
-			d, err := decoded.get(ctx, p, decodePart)
+			ts, vals, sf, err := streams[i].decodeRange(rng, &scratch[i])
 			if err != nil {
 				return nil, err
 			}
 
-			d.mergeSeriesInto(rng, &m, start, maxInt64)
+			m.add(ts, vals, sf, start, maxInt64)
 		}
 
 		ts, values, sf := m.collect(nil, nil)

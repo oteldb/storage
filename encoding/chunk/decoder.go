@@ -238,6 +238,61 @@ type FloatDecoder interface {
 	Next() (float64, error)
 }
 
+// TsCursor is the forward-cursor interface over an int64 timestamp column ([CodecDoD]).
+type TsCursor interface {
+	Len() int
+	Pos() int
+	Next() (int64, error)
+}
+
+// constFloatDecoder repeats one value for every row of a constant-collapsed float column.
+type constFloatDecoder struct {
+	n     int
+	i     int
+	value float64
+}
+
+// NewConstFloatDecoder returns a cursor that yields value for n rows.
+func NewConstFloatDecoder(n int, value float64) FloatDecoder {
+	return &constFloatDecoder{n: n, value: value}
+}
+
+func (d *constFloatDecoder) Len() int { return d.n }
+func (d *constFloatDecoder) Pos() int { return d.i }
+func (d *constFloatDecoder) Next() (float64, error) {
+	if d.i >= d.n {
+		return 0, errEOF
+	}
+
+	d.i++
+
+	return d.value, nil
+}
+
+// constTsCursor repeats one value for every row of a constant-collapsed timestamp column.
+type constTsCursor struct {
+	n     int
+	i     int
+	value int64
+}
+
+// NewConstTsCursor returns a cursor that yields value for n rows.
+func NewConstTsCursor(n int, value int64) TsCursor {
+	return &constTsCursor{n: n, value: value}
+}
+
+func (d *constTsCursor) Len() int { return d.n }
+func (d *constTsCursor) Pos() int { return d.i }
+func (d *constTsCursor) Next() (int64, error) {
+	if d.i >= d.n {
+		return 0, errEOF
+	}
+
+	d.i++
+
+	return d.value, nil
+}
+
 // NewFloatDecoder returns a forward cursor over a float64 column encoded with codec, or an error if
 // codec is not a float codec ([CodecGorilla], [CodecDecimal]).
 func NewFloatDecoder(codec Codec, src []byte) (FloatDecoder, error) {
