@@ -49,6 +49,21 @@ type SignalStats struct {
 	// over flushed parts, MaxTime includes the head's newest.
 	MinTimeUnixNano int64
 	MaxTimeUnixNano int64
+	// MergeRunning is true while a compaction/merge is executing on this engine.
+	MergeRunning bool
+	// MergeBacklog is the count of flushed parts pending compaction — the backlog proxy (currently
+	// equal to Parts; a separate field so a dashboard can label it as the merge backlog).
+	MergeBacklog int
+	// WAL is true when this engine has a write-ahead log (false for the ephemeral in-memory engine);
+	// the WAL* fields below are meaningful only when it is true.
+	WAL bool
+	// WALSegments is the WAL's current segment sequence number (segments opened so far).
+	WALSegments int
+	// WALBytes is the byte size of the WAL's currently-open segment.
+	WALBytes int64
+	// WALEpoch is the WAL's active flush generation (the epoch stamped onto new segments). The same
+	// generation across both engine families; not the recovery watermark.
+	WALEpoch uint64
 }
 
 // ClusterStats is the cluster-mode view of this node.
@@ -105,10 +120,13 @@ func (s *Storage) Inspect() StoreStats {
 
 	for tid, eng := range s.engineSnapshotByTenant() {
 		es := eng.Stats()
+		segs, walBytes, epoch, hasWAL := eng.WALState()
 		ts := tenantStats(tid)
 		ts.Signals = append(ts.Signals, SignalStats{
 			Signal: signal.Metric, Series: es.Series, HeadItems: es.HeadSamples, HeadBytes: es.HeadBytes,
 			Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
+			MergeRunning: eng.MergeRunning(), MergeBacklog: es.Parts,
+			WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 		})
 
 		if dc, ok := eng.DecodeCacheStats(); ok {
@@ -123,10 +141,13 @@ func (s *Storage) Inspect() StoreStats {
 	addRecord := func(sig signal.Signal, engines map[signal.TenantID]*recordengine.Engine) {
 		for tid, eng := range engines {
 			es := eng.Stats()
+			segs, walBytes, epoch, hasWAL := eng.WALState()
 			ts := tenantStats(tid)
 			ts.Signals = append(ts.Signals, SignalStats{
 				Signal: sig, Series: es.Streams, HeadItems: es.HeadRecords, HeadBytes: es.HeadBytes,
 				Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
+				MergeRunning: eng.MergeRunning(), MergeBacklog: es.Parts,
+				WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 			})
 		}
 	}

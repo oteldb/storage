@@ -162,6 +162,26 @@ func (f *File) Read(_ context.Context, key string) ([]byte, error) {
 	return data, nil
 }
 
+// Size returns the byte size of the object stored under key (os.Stat, no read), or an
+// [backend.ErrNotExist]-wrapping error if absent. It implements [backend.Sizer].
+func (f *File) Size(_ context.Context, key string) (int64, error) {
+	p, err := f.path(key)
+	if err != nil {
+		return 0, err
+	}
+
+	fi, err := os.Stat(p)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, errors.Wrapf(backend.ErrNotExist, "size %q", key)
+		}
+
+		return 0, errors.Wrapf(err, "size %q", key)
+	}
+
+	return fi.Size(), nil
+}
+
 // List returns, sorted ascending, every key with the given prefix.
 func (f *File) List(_ context.Context, prefix string) ([]string, error) {
 	var keys []string

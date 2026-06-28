@@ -211,3 +211,19 @@ func TestCacheConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestCachedSize(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	c := backend.Cached(backend.Memory(), 1<<20)
+	require.NoError(t, c.Write(ctx, "k", []byte("twelve bytes")))
+
+	// Size delegates to the inner backend (via SizeOf) regardless of cache residency.
+	n, err := backend.SizeOf(ctx, c, "k")
+	require.NoError(t, err)
+	assert.Equal(t, int64(len("twelve bytes")), n)
+
+	_, err = backend.SizeOf(ctx, c, "absent")
+	assert.ErrorIs(t, err, backend.ErrNotExist)
+}

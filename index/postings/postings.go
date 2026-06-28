@@ -114,6 +114,27 @@ func (p *MemPostings) LabelValues(nameID uint32) []uint32 {
 	return out
 }
 
+// ForEachName calls fn once per indexed attribute name with its cardinality: distinctValues is
+// the number of distinct value ids seen for the name, and totalSeries is the number of distinct
+// series carrying the name (with any value). It sorts/deduplicates the index in place on first
+// call (like any read), so a series added more than once for the same value is counted once; since
+// a series carries one value per name, summing the deduplicated value buckets yields the distinct
+// series count without a cross-bucket union. Iteration order is map order (nondeterministic); a
+// caller wanting a ranking sorts the collected results. Not safe for concurrent use; the caller
+// owns synchronization.
+func (p *MemPostings) ForEachName(fn func(nameID uint32, distinctValues, totalSeries int)) {
+	p.ensureSorted()
+
+	for nameID, byVal := range p.m {
+		total := 0
+		for _, ids := range byVal {
+			total += len(ids)
+		}
+
+		fn(nameID, len(byVal), total)
+	}
+}
+
 // Select returns the union of the series whose value id for nameID satisfies match. The
 // predicate receives the candidate value id; the caller resolves it to a typed
 // [signal.Value] (via the symbol table) and applies any rule, so storage stays free of

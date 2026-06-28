@@ -58,6 +58,32 @@ type Backend interface {
 	Delete(ctx context.Context, key string) error
 }
 
+// Sizer is an optional [Backend] capability: report an object's stored byte size without reading
+// its contents. Backends that can answer cheaply implement it (memory: the in-RAM length; file:
+// os.Stat). Use [SizeOf] rather than asserting directly — it falls back to a full Read for backends
+// that do not implement Sizer, so callers stay correct everywhere.
+type Sizer interface {
+	// Size returns the stored byte size of key, or an [ErrNotExist]-wrapping error if absent.
+	Size(ctx context.Context, key string) (int64, error)
+}
+
+// SizeOf returns key's stored byte size. It uses the backend's [Sizer] fast path when available and
+// otherwise falls back to reading the whole object and measuring it — so it is correct over any
+// backend, and cheap over those (and the wrappers) that implement Sizer. It is intended for
+// introspection (part byte accounting), not the hot path.
+func SizeOf(ctx context.Context, b Backend, key string) (int64, error) {
+	if s, ok := b.(Sizer); ok {
+		return s.Size(ctx, key)
+	}
+
+	data, err := b.Read(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+
+	return int64(len(data)), nil
+}
+
 // ErrNotExist is the sentinel returned (wrapped) by [Backend.Read] and [Backend.Delete]
 // when a key is absent. Test for it with errors.Is.
 var ErrNotExist = errors.New("backend: key does not exist")
@@ -139,6 +165,18 @@ func (m *memoryBackend) List(_ context.Context, prefix string) ([]string, error)
 	slices.Sort(keys)
 
 	return keys, nil
+}
+
+func (m *memoryBackend) Size(_ context.Context, key string) (int64, error) {
+	m.mu.RLock()
+	v, ok := m.objects[key]
+	m.mu.RUnlock()
+
+	if !ok {
+		return 0, errors.Wrapf(ErrNotExist, "size %q", key)
+	}
+
+	return int64(len(v)), nil
 }
 
 func (m *memoryBackend) Delete(_ context.Context, key string) error {

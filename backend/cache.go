@@ -112,6 +112,13 @@ func (c *cachedBackend) List(ctx context.Context, prefix string) ([]string, erro
 	return c.inner.List(ctx, prefix)
 }
 
+// Size delegates to the inner backend (via [SizeOf], so the inner Sizer fast path is preserved). A
+// resident cache entry's length would also answer it, but most sized objects (columns) are large and
+// not cached, so going to the inner backend is the simpler, consistent path. Implements [Sizer].
+func (c *cachedBackend) Size(ctx context.Context, key string) (int64, error) {
+	return SizeOf(ctx, c.inner, key)
+}
+
 // Stats returns a snapshot of cache effectiveness (for benchmarks and operator visibility).
 func (c *cachedBackend) Stats() CacheStats {
 	c.mu.Lock()

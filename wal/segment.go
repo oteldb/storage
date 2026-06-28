@@ -80,6 +80,18 @@ func Create(dir string, maxBytes int) (*SegmentWriter, error) {
 	return sw, nil
 }
 
+// Seq returns the current segment sequence number — the count of segments opened so far (0 before
+// the first write opens one). A cheap in-memory read for introspection; not safe for concurrent use.
+func (sw *SegmentWriter) Seq() int { return sw.seq }
+
+// Size returns the byte size of the current open segment (0 when none is open). A cheap in-memory
+// read for introspection; not safe for concurrent use.
+func (sw *SegmentWriter) Size() int { return sw.size }
+
+// Epoch returns the flush generation stamped into new segments (see [SegmentWriter.SetEpoch]). A
+// cheap in-memory read for introspection; not safe for concurrent use.
+func (sw *SegmentWriter) Epoch() uint64 { return sw.epoch }
+
 // SetSync enables (or disables) an fsync after every framed write — power-loss durability at a
 // throughput cost. The default is off (records reach the OS page cache, surviving a process crash
 // but not necessarily a power loss).

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -56,6 +57,9 @@ type Engine struct {
 	head    *head
 	parts   []*part
 	nextSeq int
+	// mergeRunning is true while a [Engine.MergeWith] is executing (introspection liveness; see
+	// [Engine.MergeRunning]). Set/cleared around the merge, not held during it.
+	mergeRunning atomic.Bool
 	// retiring holds parts removed from the live set by flush/merge, pending backend deletion once
 	// their in-flight fetch readers drain (deferred reclamation; see reclaim.go).
 	retiring []*part

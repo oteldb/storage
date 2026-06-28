@@ -23,6 +23,9 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
 	defer span.End()
 
+	e.mergeRunning.Store(true)
+	defer e.mergeRunning.Store(false)
+
 	startNs := time.Now()
 	log := zctx.From(ctx)
 	log.Debug("merge requested",
