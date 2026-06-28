@@ -102,6 +102,10 @@ comments instead, and reference `ARCHITECTURE.md` (which is committed) when a po
   hand-written `if got != want { t.Fatalf(...) }`. Fuzz/benchmark bodies stay testify-free where it
   would add overhead to the hot loop.
 - Run `go test ./...` and `go vet ./...`; keep the tree green and formatted (`gofmt`/`goimports`).
+- **Lint before every push.** Run `golangci-lint run ./...` (config: `.golangci.yml`) and fix all
+  issues in changed code before committing/pushing — CI (`.github/workflows/x.yml`) fails the PR
+  otherwise. It is stricter than `go vet` (e.g. `modernize`: prefer `slices.Sort` over `sort.Slice`;
+  `thelper`: test/bench helpers start with `t.Helper()`/`b.Helper()`).
 
 ## Architecture invariants to preserve
 

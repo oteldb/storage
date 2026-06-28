@@ -79,6 +79,19 @@ type Request struct {
 	// decoded from the serialized attrs column). It sees the candidate row's materialized Batch.
 	SecondPass func(*Batch) bool
 
+	// Limit, when > 0, bounds the records returned to the most recent (Reverse) or oldest by
+	// timestamp across all matched streams — the ordered top-N pushdown for limited log queries.
+	// The result is a SUPERSET: the fetcher returns the Limit rows beyond the boundary timestamp
+	// plus any rows that tie at that boundary, so a caller applying its own exact ordering+limit
+	// never loses a boundary row (the fetch contract already permits a superset). It composes with
+	// Matchers/Conditions/SecondPass — filtering happens first, the limit selects over survivors.
+	// 0 ⇒ unlimited (every matching record). Honored by the record engine (logs/traces/profiles);
+	// the metric engine ignores it (PromQL needs every sample).
+	Limit int
+	// Reverse selects the Limit direction: true keeps the newest records (largest timestamps, the
+	// usual log-query default); false keeps the oldest. Ignored when Limit == 0.
+	Reverse bool
+
 	// Recycle opts the fetch into buffer pooling: the caller promises to call [Batch.Release] on
 	// each returned batch once done with it, so the engine may hand out (and later reuse) pooled
 	// result buffers. Default false — the engine allocates fresh buffers and the caller need not

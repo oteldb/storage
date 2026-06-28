@@ -236,6 +236,26 @@ func (c *recordCols) appendRange(src *recordCols, lo, hi int) {
 	}
 }
 
+// keep retains only rows [lo, hi) of every selected column (ts always), discarding the rest in
+// place — the slice dual of [recordCols.appendRange]. It reslices the existing backing arrays (no
+// copy), so a pooled buffer's capacity is preserved for reuse. Used by the fetch limit pushdown to
+// trim a ts-sorted accumulator to the rows that survive the global top-N boundary.
+func (c *recordCols) keep(lo, hi int) {
+	c.ts = c.ts[lo:hi]
+
+	for k := range c.ints {
+		if c.sel.ints[k] {
+			c.ints[k] = c.ints[k][lo:hi]
+		}
+	}
+
+	for k := range c.bytes {
+		if c.sel.bytes[k] {
+			c.bytes[k] = c.bytes[k][lo:hi]
+		}
+	}
+}
+
 // appendClone appends r to a full (head) buffer, cloning its byte fields (the head outlives the
 // caller's batch). Every column is populated — head buffers always carry the full schema.
 func (c *recordCols) appendClone(r rec) {

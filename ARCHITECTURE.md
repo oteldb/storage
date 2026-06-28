@@ -519,7 +519,7 @@ formats.
 ## 3g. Fetch contract (`query/fetch/`)
 
 The **dual-shape** read seam. A `Request{Tenant, Signal, Start, End, Matchers, Conditions,
-AllConditions, Projection, SecondPass}` carries two operator-free predicate families: **callback
+AllConditions, Projection, SecondPass, Limit, Reverse}` carries two operator-free predicate families: **callback
 matchers** — `Matcher{Name, Match func(signal.Value) bool}` — that resolve **identity** over the
 postings index (a metric series, a log stream), and **callback conditions** —
 `Condition{Column, Match, Tokens, Equal}` — that filter the **per-record columns** within that identity
@@ -530,6 +530,20 @@ Columns}`: metrics populate `Values`, logs populate the named `Columns` (`Projec
 them, `SecondPass` post-filters). The fields are zero-valued for the other signal, so the metric
 path is unchanged by the log additions. `SliceIterator` and `Drain` are
 the in-memory helpers.
+
+**Ordered top-N pushdown (`Request.Limit` + `Reverse`).** A limited log query (`{…} | … | limit N`)
+otherwise fetches every matching record and discards all but `N` after the caller materializes them —
+the dominant cost when the selector matches a large window. `Limit > 0` bounds the returned records to
+the most recent (`Reverse`) or oldest by timestamp across all matched streams, so the caller
+materializes ~`N` rows instead of the whole window. It composes with `Matchers`/`Conditions`/
+`SecondPass` (filtering runs first, the limit selects over survivors), so a per-row condition — e.g. a
+`| json | status>=400` filter lowered to a `Condition` over the body column — drops rows *before* the
+limit counts them. The result is a deliberate **superset**: the record engine keeps the `N` rows
+beyond the boundary timestamp plus any rows tying at that boundary, so the caller's own exact
+ordering+limit (which breaks ts ties by label) never loses a boundary row. Honored by the **record
+engine** (`recordengine.Fetch`: per-stream runs are ts-sorted, then a pooled global selection trims
+to the boundary via `recordCols.keep`); the **metric engine ignores it** (PromQL needs every sample).
+`Limit == 0` is unlimited (unchanged behavior).
 
 **Opt-in buffer reuse (`Request.Recycle` + `Batch.Release`).** A batch's `Timestamps`/`Values`
 slices (and, for record signals, its `Columns`) are the engine's buffers. When a caller sets
@@ -801,9 +815,12 @@ optional side store differ.
   (materialize only the columns a request's conditions + projection reference — a body search
   projecting body touches just `ts`+`body`), decode each surviving part **once** distributing rows
   to per-stream accumulators, pre-size accumulators from row-range counts, bulk-append in-window
-  ranges, filter **in place**, and skip the sort when already ts-ordered. Flush/merge materialize
-  the full schema. Conditions over a non-fixed column are per-record **attributes**, resolved by the
-  zero-allocation `signal.LookupAttribute` over the serialized `attrs` column.
+  ranges, filter **in place**, and skip the sort when already ts-ordered. When the request sets
+  `Limit` (§3g), a final pooled global selection trims the ts-sorted survivors to the newest/oldest
+  `Limit` records by timestamp (boundary ties kept) so a limited log query returns ~`Limit` rows, not
+  the whole window. Flush/merge materialize the full schema. Conditions over a non-fixed column are
+  per-record **attributes**, resolved by the zero-allocation `signal.LookupAttribute` over the
+  serialized `attrs` column.
 - **Per-column blooms** (`index/bloom`): a token bloom (bit array, k xxh3-128 double-hash probes,
   versioned+CRC'd, **no false negatives**) per bloom-bearing column, written as `bloom-{col}.bin`.
   `FullText` columns tokenize their value (a `contains` token prunes); `Attrs` columns hold
@@ -1309,7 +1326,7 @@ index/                symbols (intern) · series (id↔attrs) · postings (set-o
 wal/                  CRC-framed segmented WAL: samples (+ scale-factor samples) + opaque records + side delta, resume + checkpoint (truncate-on-flush), facade-wired durability [implemented]
 engine/               head · flush · background-merge · retention · downsampling · recompression · admission limits · fetch (metrics) [implemented]
 recordengine/         shared schema-driven record engine (logs+traces+profiles): head · flush · merge · fetch · conditions · per-column blooms · optional content-addressed side store [implemented]
-query/fetch           dual-shape fetch contract (Matchers + Conditions/Projection/SecondPass) [implemented for metrics + logs + traces + profiles; the library's query surface]
+query/fetch           dual-shape fetch contract (Matchers + Conditions/Projection/SecondPass + Limit/Reverse ordered top-N) [implemented for metrics + logs + traces + profiles; the library's query surface]
 query/scale           fetch-seam scale-out decorators: split-by-interval + results cache  [implemented]
 query/profile         EXPLAIN ANALYZE: concurrency-safe per-query timing tree (ctx-threaded, no-op default) + binary encode/decode for distributed grafting [implemented]
 query/promql          OPTIONAL adapter: fetch → Prometheus storage.Queryable (no engine) [implemented; only package importing prometheus]
