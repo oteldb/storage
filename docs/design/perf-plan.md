@@ -93,6 +93,26 @@ It rides the same lean adapter (≈3.9k allocs, on par with the instant queries)
 not the adapter (our `Select`+fetch is ~22%, the iterator ~14%). It's kept as a faithful range-query
 shape; shrinking it sub-ms would mean gaming the corpus (fewer series/steps), not a real win.
 
+### P1.7 — PromQL result-path alloc-count reduction (DONE)
+
+After P1.6 the instant queries were ~0.5ms and **CPU-floor-bound** (GC ~30%, decode/merge/engine
+eval), not latency-bound on a single query — but the per-series alloc *count* still pressured GC
+under concurrent load (the REPORT.md scenario). Two count cuts:
+
+- **Slice-pool box recycling** (`engine.i64Box`/`f64Box`): the metric result pools held buffers as
+  `*[]T` but `Put(&s)` heap-escaped a fresh box on every recycle (31% of query *objects*). A second
+  pool recycles the boxes themselves (Pool→Get→Box→Put→Pool), so steady-state recycling boxes nothing.
+- **Slab-allocated `batchSeries`** (promql adapter): one backing array for a Select's series instead
+  of a `&batchSeries{}` per series (was ~15% of objects).
+
+**Result:** `count_cpu_cores` allocs/op **3333 → ~1807 (−46%)**, B/op −3%; single-query wall-clock
+flat (~0.5ms — it was never alloc-*count*-bound) but GC pressure under load drops. Race + alloc-budget
+gates green. Remaining alloc *bytes* are the per-series `&fetch.Batch{}` (29%) + `planFetch` state
+(26%); cutting those needs pooling the Batch struct + plan state through the Recycle lifecycle
+(invasive, ~10–15% single-query upside) or query-aware **count/aggregate pushdown**
+(`Storage.AggregateMetrics`) that avoids materializing 512 sample windows for a `count` — the real
+lever, but embedder-driven and query-specific, not the generic Queryable.
+
 ### What's left
 
 - **Record byte columns** (`readBytes` 27.6%, the decoded log/attr bytes) alias into the returned

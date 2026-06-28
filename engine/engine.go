@@ -71,12 +71,16 @@ type Engine struct {
 	// them to decode a part and returns them on releaseParts (safe — the merge copies values out, so
 	// no result aliases them). This kills the per-query decode-buffer allocation (chunk.resize).
 	decPool sync.Pool
-	// i64Pool / f64Pool recycle a fetched batch's result timestamp / value buffers. They hold
-	// *[]int64 / *[]float64 (a pointer, so Put boxes nothing extra). They are fed only when a caller
-	// calls [fetch.Batch.Release]; a caller that never releases leaves them empty, so collect makes
-	// fresh slices exactly as before — the default path takes no extra allocation.
+	// i64Pool / f64Pool recycle a fetched batch's result timestamp / value buffers, holding the
+	// buffers as *[]int64 / *[]float64. i64Box / f64Box hold the spare *[]T *boxes* themselves so a
+	// Put reuses a box instead of `Put(&local)` (which heap-escapes a fresh box on every recycle):
+	// a box circulates Pool→(Get)→Box→(Put)→Pool, so steady-state recycling allocates no boxes.
+	// They are fed only when a caller calls [fetch.Batch.Release]; a caller that never releases leaves
+	// them empty, so collect makes fresh slices exactly as before — the default path takes nothing.
 	i64Pool sync.Pool
 	f64Pool sync.Pool
+	i64Box  sync.Pool
+	f64Box  sync.Pool
 	// recycle is the shared per-engine [fetch.Batch.Release] hook (allocated once), so setting it on
 	// a batch costs nothing per batch. It returns the batch's ts/value buffers to the pools above.
 	recycle func(*fetch.Batch)
@@ -1073,33 +1077,62 @@ func (e *Engine) replayHandlers() wal.Handlers {
 // getI64 returns a reusable []int64 (len 0) from the pool, or nil when the pool is empty — so a
 // caller that never releases makes fresh slices (no behavior change). The caller appends into it.
 func (e *Engine) getI64() []int64 {
-	if v := e.i64Pool.Get(); v != nil {
-		return (*v.(*[]int64))[:0]
+	v := e.i64Pool.Get()
+	if v == nil {
+		return nil
 	}
 
-	return nil
+	p := v.(*[]int64)
+	s := *p
+	*p = nil
+	e.i64Box.Put(p) // recycle the emptied box for the next putI64
+
+	return s[:0]
 }
 
 // getF64 is [Engine.getI64] for float64 value buffers.
 func (e *Engine) getF64() []float64 {
-	if v := e.f64Pool.Get(); v != nil {
-		return (*v.(*[]float64))[:0]
+	v := e.f64Pool.Get()
+	if v == nil {
+		return nil
 	}
 
-	return nil
+	p := v.(*[]float64)
+	s := *p
+	*p = nil
+	e.f64Box.Put(p)
+
+	return s[:0]
 }
 
-// putI64 returns a buffer to its pool (only meaningfully reused if it has capacity). Boxing the
-// *[]slice is the only allocation, and it happens on the opt-in Release path, not the default.
+// putI64 returns a buffer to its pool (only meaningfully reused if it has capacity). It refills a
+// recycled box from i64Box rather than `Put(&s)`, so no *[]int64 box escapes per recycle in steady
+// state. This is the opt-in Release path, never the default.
 func (e *Engine) putI64(s []int64) {
-	if cap(s) > 0 {
-		e.i64Pool.Put(&s)
+	if cap(s) == 0 {
+		return
 	}
+
+	p, _ := e.i64Box.Get().(*[]int64)
+	if p == nil {
+		p = new([]int64)
+	}
+
+	*p = s
+	e.i64Pool.Put(p)
 }
 
 // putF64 is [Engine.putI64] for float64 value buffers.
 func (e *Engine) putF64(s []float64) {
-	if cap(s) > 0 {
-		e.f64Pool.Put(&s)
+	if cap(s) == 0 {
+		return
 	}
+
+	p, _ := e.f64Box.Get().(*[]float64)
+	if p == nil {
+		p = new([]float64)
+	}
+
+	*p = s
+	e.f64Pool.Put(p)
 }

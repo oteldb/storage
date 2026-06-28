@@ -130,7 +130,12 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.Select
 		return storage.ErrSeriesSet(err)
 	}
 
+	// One backing array of batchSeries for the whole result (the series interfaces point into it),
+	// instead of a heap allocation per series. Sized to the upper bound — len(batches) — so appends
+	// never reallocate and the &slab[i] pointers stay valid.
+	slab := make([]batchSeries, len(batches))
 	series := make([]storage.Series, 0, len(batches))
+
 	for _, b := range batches {
 		lset, ok := q.labels.get(b.ID)
 		if !ok {
@@ -145,7 +150,9 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.Select
 		}
 
 		q.held = append(q.held, b) // keep alive until Close; the series aliases its buffers
-		series = append(series, &batchSeries{labels: lset, ts: b.Timestamps, vs: b.Values})
+		bs := &slab[len(series)]
+		*bs = batchSeries{labels: lset, ts: b.Timestamps, vs: b.Values}
+		series = append(series, bs)
 	}
 
 	if sortSeries {
