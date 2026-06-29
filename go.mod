@@ -13,7 +13,7 @@ require (
 	github.com/go-faster/sdk v0.36.0
 	github.com/klauspost/compress v1.18.6
 	github.com/mmcloughlin/avo v0.6.0
-	github.com/pierrec/lz4/v4 v4.1.22
+	github.com/pierrec/lz4/v4 v4.1.27
 	github.com/prometheus/prometheus v0.312.0
 	github.com/stretchr/testify v1.11.1
 	github.com/zeebo/xxh3 v1.1.0
