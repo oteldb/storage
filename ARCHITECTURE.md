@@ -513,7 +513,14 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   merge only reads its column slices), so entries are **shared without copying**, even across
   concurrent fetches. It eliminates the re-decode the object-store read cache (§3a) cannot. With
   the cache on, a fetch also **prefetches** the parts it will touch — decoding them concurrently
-  (bounded fan-out) so their backend reads + decodes overlap instead of running one part at a time
+  (bounded fan-out) so their backend reads + decodes overlap instead of running one part at a time.
+  A **recent tier** (`Config.RecentWindow`, `recent.go`) opt-in mirrors the most recent flush window
+  in RAM across flushes (the head is drained on every flush, but the tier persists), so a query whose
+  `[Start, End]` falls inside the tier's window is served from the tier ∪ the mid-flush buffers ∪ the
+  head and **acquires no part at all** — first-touch recent-range queries skip the decode path the
+  cache only helps on repeats. The tier is populated at flush publish from the detached buffers and
+  trimmed to the window; the same samples live in both the tier and a part, and the freshest-wins
+  timestamp merge dedups the overlap.
   during the merge. `Close` flushes the head.
 - **Aggregate pushdown** (`aggregate.go`, `seriesstats.go`) — `AggregateRange` returns a per-series
   `SeriesAgg` (count/sum/min/max → avg) over a window. With `Config.AggregateStats` (opt-in,

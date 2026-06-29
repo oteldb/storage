@@ -49,6 +49,13 @@ type Config struct {
 	// value column. It costs a little storage per series; off by default. AggregateRange works
 	// without it (via decoding), just without the fast path.
 	AggregateStats bool
+	// RecentWindow enables an in-memory recent tier (nanoseconds): the most recent flush window is
+	// mirrored in RAM across flushes so a query whose [Start, End] falls inside it is answered from
+	// the tier ∪ the head without decoding any file part — first-touch recent-range queries skip the
+	// decode path entirely (the decode cache only helps repeats). It trades a bounded uncompressed
+	// window of resident memory for that latency. 0 disables it (the default); the head is then just
+	// the unflushed tail, drained on every flush as before.
+	RecentWindow int64
 }
 
 // Engine is a single tenant's storage engine. Safe for concurrent use.
@@ -68,6 +75,11 @@ type Engine struct {
 	// by fetch until the flushed part is published (then cleared, atomically with adding the part) — so
 	// a fetch never loses sight of records mid-flush. nil when no flush is in flight.
 	flushing map[signal.SeriesID]*sampleBuf
+	// recent is the in-memory recent tier (issue #25 item 4): a read-side mirror of the most recent
+	// flush window, persisted across flushes, that lets planFetch skip part decode for a query whose
+	// range falls inside it. nil when [Config.RecentWindow] is 0 (disabled).
+	recent    map[signal.SeriesID]*sampleBuf
+	recentMin int64 // oldest ts retained in the recent tier (maxInt64 ⇒ empty ⇒ short-circuit off)
 	// walB groups a durable AppendBatch's WAL frames by series (reused under e.mu); nil head-only.
 	walB *walBatch
 	// decodeCache memoizes decoded part columns across fetches (LRU); nil ⇒ decode every fetch.
@@ -113,6 +125,11 @@ func New(cfg Config) *Engine {
 
 	if cfg.DecodeCacheBytes > 0 {
 		e.decodeCache = newDecodeCache(cfg.DecodeCacheBytes)
+	}
+
+	if cfg.RecentWindow > 0 {
+		e.recent = make(map[signal.SeriesID]*sampleBuf)
+		e.recentMin = maxInt64
 	}
 
 	return e
@@ -307,13 +324,14 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	rpf.Add("series_matched", int64(len(ids)))
 	rpf.End()
 
-	partsScanned := len(e.parts)
-
 	// Plan under the read lock: acquire the in-window parts to read and snapshot each series' head
 	// (and any mid-flush) samples + identity, so the part reads below run lock-free — appends and
 	// flush/merge proceed concurrently, and the acquired parts can't be reclaimed until released.
 	plan := e.planFetch(ids, r)
 	e.mu.RUnlock()
+
+	// Parts actually scanned this fetch — the recent tier may have short-circuited acquisition.
+	partsScanned := len(plan.liveParts)
 
 	defer plan.releaseParts()
 
@@ -396,6 +414,7 @@ type enginePlan struct {
 	series     map[signal.SeriesID]signal.Series
 	headB      map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
 	flushB     map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
+	recentB    map[signal.SeriesID]*fetch.Batch // recent-tier samples (the in-RAM flush window)
 	liveParts  []*part
 	decoded    partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
 	decodeFn   decodeFunc      // how a part is decoded on a per-fetch miss (cache-aware)
@@ -424,6 +443,10 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 
 	if fb := p.flushB[id]; fb != nil {
 		m.add(fb.Timestamps, fb.Values, fb.ScaleFactors, p.start, p.end)
+	}
+
+	if rb := p.recentB[id]; rb != nil {
+		m.add(rb.Timestamps, rb.Values, rb.ScaleFactors, p.start, p.end)
 	}
 
 	if hb := p.headB[id]; hb != nil {
@@ -910,6 +933,9 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	for _, p := range newParts {
 		e.parts = appendPart(e.parts, p)
 	}
+	if e.recentEnabled() {
+		e.populateRecent(detached)
+	}
 	e.flushing = nil
 	e.nextSeq = seq + len(ranges)
 	err := e.publishLocked(ctx)
@@ -1037,18 +1063,34 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 		end:      r.End,
 	}
 
-	for _, part := range e.parts {
-		if part.maxTime < r.Start || part.minTime > r.End { // time-prune
-			continue
-		}
+	// The recent tier short-circuit: when the query range falls inside the tier's window, the tier ∪
+	// the mid-flush buffers ∪ the head cover it entirely, so no part is acquired or decoded.
+	skipParts := e.recentEnabled() && r.Start >= e.recentMin
 
-		part.acquire()
-		p.liveParts = append(p.liveParts, part)
+	if !skipParts {
+		for _, part := range e.parts {
+			if part.maxTime < r.Start || part.minTime > r.End { // time-prune
+				continue
+			}
+
+			part.acquire()
+			p.liveParts = append(p.liveParts, part)
+		}
 	}
 
 	for _, id := range ids {
 		if s, ok := e.head.series.Get(id); ok {
 			p.series[id] = s
+		}
+
+		if e.recentEnabled() {
+			if rb := bufBatch(e.recent[id], id, p.series[id], r.Start, r.End, e); rb != nil {
+				if p.recentB == nil {
+					p.recentB = make(map[signal.SeriesID]*fetch.Batch, len(ids))
+				}
+
+				p.recentB[id] = rb
+			}
 		}
 
 		if hb := e.head.batch(id, r.Start, r.End, e); hb != nil {
