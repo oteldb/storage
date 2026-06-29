@@ -16,6 +16,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/internal/obs"
+	"github.com/oteldb/storage/pool"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
@@ -86,8 +87,12 @@ type Engine struct {
 	decodeCache *decodeCache
 	// decPool recycles decodedPart column buffers on the no-cross-fetch-cache path: a fetch borrows
 	// them to decode a part and returns them on releaseParts (safe — the merge copies values out, so
-	// no result aliases them). This kills the per-query decode-buffer allocation (chunk.resize).
-	decPool sync.Pool
+	// no result aliases them). This kills the per-query decode-buffer allocation (chunk.resize). It is
+	// a GC-stable [pool.FreeList], not a sync.Pool: sync.Pool is cleared on every GC, so under
+	// allocation-driven collection bursts the decode buffers lose their capacity and chunk.resize
+	// reallocates from zero each fetch (the disk_io profile showed ~38 GB/35 s of resize churn).
+	// FreeList entries are rooted live references, so capacity survives GC.
+	decPool *pool.FreeList[decodedPart]
 	// i64Pool / f64Pool recycle a fetched batch's result timestamp / value buffers, holding the
 	// buffers as *[]int64 / *[]float64. i64Box / f64Box hold the spare *[]T *boxes* themselves so a
 	// Put reuses a box instead of `Put(&local)` (which heap-escapes a fresh box on every recycle):
@@ -112,7 +117,11 @@ func New(cfg Config) *Engine {
 	}
 
 	e := &Engine{cfg: cfg, head: newHead()}
-	e.decPool.New = func() any { return &decodedPart{} }
+	// The decode free list covers the peak in-flight decoded parts: prefetch can decode
+	// prefetchConcurrency parts concurrently per fetch, and several fetches overlap, so a
+	// small multiple of GOMAXPROCS bounds the live set without over-retaining. Buffers
+	// beyond this are dropped (GC'd), bounding memory to ≈ cap × part-size.
+	e.decPool = pool.NewFreeList[decodedPart](pool.DefaultCapacity(prefetchConcurrency * 4))
 	// One shared release hook for every batch this engine produces (no per-batch closure alloc).
 	e.recycle = func(b *fetch.Batch) {
 		e.putI64(b.Timestamps)
@@ -972,10 +981,13 @@ func (e *Engine) publishLocked(ctx context.Context) error {
 // (immutable) decoded columns; a miss decodes and caches them. Without a cache it decodes plainly.
 func (e *Engine) decodeOf(ctx context.Context, p *part) (*decodedPart, error) {
 	if e.decodeCache == nil {
-		// No cross-fetch cache: borrow buffers from the pool, decode into them, and mark the result
-		// pooled so the fetch returns it on releaseParts. The merge copies values out, so the buffers
-		// are free to reuse once the fetch ends.
-		dp := e.decPool.Get().(*decodedPart)
+		// No cross-fetch cache: borrow buffers from the free list, decode into them, and mark the
+		// result pooled so the fetch returns it on releaseParts. The merge copies values out, so the
+		// buffers are free to reuse once the fetch ends. Get returns nil when empty — allocate then.
+		dp := e.decPool.Get()
+		if dp == nil {
+			dp = &decodedPart{}
+		}
 
 		dp, err := p.decodeInto(ctx, dp)
 		if err != nil {
