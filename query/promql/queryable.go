@@ -173,7 +173,19 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.Select
 // detects it via interface assertion and routes an instant `count(<selector>)` here instead of
 // building a full SeriesSet. If the backing fetcher does not implement [fetch.Counter], the call
 // errors and the engine falls back to Select.
+//
+// [PushableMatchers] drops any matcher that matches the empty string (e.g. `!=`, `!~`, `=""`)
+// because the postings index cannot apply it without wrongly dropping series that lack the label.
+// The fast [fetch.Counter] path counts over that index-safe subset only, so it would over-count for
+// such selectors. When the matcher set is not fully pushable we fall back to a Fetch-based count
+// that re-checks every resolved series against the full matcher set (mirroring [querier.Select]),
+// preserving exact Prometheus semantics at the cost of label materialization.
 func (q *querier) CountSeries(ctx context.Context, startMs, endMs int64, matchers ...*labels.Matcher) (uint64, error) {
+	pushed := PushableMatchers(matchers)
+	if len(pushed) < len(matchers) {
+		return q.countSeriesRecheck(ctx, startMs, endMs, matchers, pushed)
+	}
+
 	counter := fetch.CounterOf(q.fetcher)
 	if counter == nil {
 		return 0, errCountNotSupported
@@ -183,7 +195,7 @@ func (q *querier) CountSeries(ctx context.Context, startMs, endMs int64, matcher
 		Tenant:   q.tenant,
 		Start:    msToNsClamp(startMs, math.MinInt64),
 		End:      msToNsClamp(endMs, math.MaxInt64),
-		Matchers: PushableMatchers(matchers),
+		Matchers: pushed,
 	}
 
 	n, err := counter.Count(ctx, req)
@@ -247,6 +259,41 @@ func (q *querier) Close() error {
 // series (the per-series result labels are still freshly cloned by ScratchBuilder.Labels).
 func (q *querier) promLabels(s signal.Series) labels.Labels {
 	return promLabelsInto(&q.lb, &q.scratch, s)
+}
+
+// countSeriesRecheck counts matching series by fetching the index-safe subset (pushed) over the
+// window and re-checking each resolved series against the full matcher set. A fetch batch is one
+// series with its in-window samples already filtered, so a batch that passes [MatchesAll] is one
+// matching series with at least one sample in the window.
+func (q *querier) countSeriesRecheck(
+	ctx context.Context, startMs, endMs int64,
+	matchers []*labels.Matcher, pushed []fetch.Matcher,
+) (uint64, error) {
+	req := fetch.Request{
+		Tenant:   q.tenant,
+		Start:    msToNsClamp(startMs, math.MinInt64),
+		End:      msToNsClamp(endMs, math.MaxInt64),
+		Matchers: pushed,
+	}
+
+	it, err := q.fetcher.Fetch(ctx, req)
+	if err != nil {
+		return 0, err
+	}
+
+	batches, err := fetch.Drain(ctx, it)
+	if err != nil {
+		return 0, err
+	}
+
+	var n uint64
+	for _, b := range batches {
+		if MatchesAll(PromLabels(b.Series), matchers) {
+			n++
+		}
+	}
+
+	return n, nil
 }
 
 // seriesLabels fetches the matching series over the querier window and projects each to its
