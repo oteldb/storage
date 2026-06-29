@@ -644,6 +644,10 @@ func (f seedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator
 	return f.inner.Fetch(ctx, r)
 }
 
+// Unwrap exposes the decorated fetcher so [fetch.CounterOf] can reach the engine's Count through
+// the seed layer (which only adds observability) for the count() pushdown.
+func (f seedFetcher) Unwrap() fetch.Fetcher { return f.inner }
+
 // baseFetcher builds the unwrapped read seam for the tenant set: owner-aware per tenant in
 // cluster mode, otherwise the local engines (or a cross-tenant snapshot when none are named).
 func (s *Storage) baseFetcher(tenants []signal.TenantID) fetch.Fetcher {
@@ -719,6 +723,10 @@ func (f scopedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterat
 
 	return f.inner.Fetch(ctx, r)
 }
+
+// Unwrap exposes the decorated fetcher so [fetch.CounterOf] can reach the engine's Count through
+// the tenant-scoping layer for the count() pushdown.
+func (f scopedFetcher) Unwrap() fetch.Fetcher { return f.inner }
 
 // lookupEngine returns the tenant's engine if it exists, without creating one (reads must not
 // materialize empty engines for unknown tenants).

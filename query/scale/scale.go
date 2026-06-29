@@ -88,6 +88,12 @@ func (f SplitFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterato
 	return fetch.NewSliceIterator(fetch.MergeBatches(groups...)), nil
 }
 
+// Unwrap exposes the split fetcher's inner so [fetch.CounterOf] can reach the engine's Count for
+// the count() pushdown: count is evaluated over the full [Start, End] on Inner directly (a count
+// is not a split-friendly aggregate — a series active in two sub-windows counts once for the whole
+// range, so summing per-window counts would over-count).
+func (f SplitFetcher) Unwrap() fetch.Fetcher { return f.Inner }
+
 // window is one inclusive sub-range [lo, hi].
 type window struct{ lo, hi int64 }
 

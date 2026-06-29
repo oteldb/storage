@@ -225,6 +225,42 @@ type Fetcher interface {
 	Fetch(ctx context.Context, r Request) (Iterator, error)
 }
 
+// Counter is an optional [Fetcher] capability: it returns the number of series matching
+// r.Matchers with at least one sample in [r.Start, r.End] without materializing samples or
+// labels. It backs the PromQL `count(<selector>)` pushdown. A Fetcher that does not implement
+// it simply opts out of the pushdown (the caller falls back to Fetch).
+type Counter interface {
+	Count(ctx context.Context, r Request) (int, error)
+}
+
+// Unwraper is implemented by Fetcher decorators that wrap a single inner Fetcher (logging,
+// caching, scoping, splitting). Multi-child fan-outs (merge, remote) are NOT Unwrapers — their
+// count semantics are not a simple delegation, so [CounterOf] opts them out of the pushdown.
+type Unwraper interface {
+	Unwrap() Fetcher
+}
+
+// CounterOf walks the wrapper chain (via [Unwraper]) starting at f and returns the first
+// [Counter] it finds, or nil if none. This lets a queryable reach the engine's Count through
+// the decorators that wrap it (seed/scoped/cache/split) without each one having to re-declare
+// Count, while multi-child fan-outs (which would need dedup-aware counting) correctly opt out.
+func CounterOf(f Fetcher) Counter {
+	for f != nil {
+		if c, ok := f.(Counter); ok {
+			return c
+		}
+
+		u, ok := f.(Unwraper)
+		if !ok {
+			return nil
+		}
+
+		f = u.Unwrap()
+	}
+
+	return nil
+}
+
 // SliceIterator is an [Iterator] over a fixed slice of batches — for simple fetchers and
 // tests.
 type SliceIterator struct {

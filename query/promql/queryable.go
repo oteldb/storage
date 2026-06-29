@@ -14,6 +14,7 @@ package promql
 
 import (
 	"context"
+	"errors"
 	"math"
 	"sort"
 	"sync"
@@ -28,6 +29,10 @@ import (
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
 )
+
+// errCountNotSupported signals a Fetcher that does not implement [fetch.Counter]; the PromQL
+// count() pushdown falls back to Select on this error.
+var errCountNotSupported = errors.New("promql: count pushdown not supported by fetcher")
 
 // msToNs and nsToMs convert between Prometheus' millisecond timeline and the storage
 // nanosecond timeline.
@@ -160,6 +165,33 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.Select
 	}
 
 	return newSliceSeriesSet(series)
+}
+
+// CountSeries returns the number of series matching matchers with at least one sample in
+// [startMs, endMs] (Prometheus milliseconds), without materializing samples or labels. It is the
+// count-pushdown hook for the PromQL `count(<selector>)` fast path: the promql-engine's Scanners
+// detects it via interface assertion and routes an instant `count(<selector>)` here instead of
+// building a full SeriesSet. If the backing fetcher does not implement [fetch.Counter], the call
+// errors and the engine falls back to Select.
+func (q *querier) CountSeries(ctx context.Context, startMs, endMs int64, matchers ...*labels.Matcher) (uint64, error) {
+	counter := fetch.CounterOf(q.fetcher)
+	if counter == nil {
+		return 0, errCountNotSupported
+	}
+
+	req := fetch.Request{
+		Tenant:   q.tenant,
+		Start:    msToNsClamp(startMs, math.MinInt64),
+		End:      msToNsClamp(endMs, math.MaxInt64),
+		Matchers: PushableMatchers(matchers),
+	}
+
+	n, err := counter.Count(ctx, req)
+	if err != nil {
+		return 0, err
+	}
+
+	return uint64(n), nil
 }
 
 // LabelValues returns the distinct values of name across the series matching matchers over the

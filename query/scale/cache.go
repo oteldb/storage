@@ -83,6 +83,10 @@ func (f CacheFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterato
 	return fetch.NewSliceIterator(batches), nil
 }
 
+// Unwrap exposes the cached fetcher so [fetch.CounterOf] can reach the engine's Count for the
+// count() pushdown (count is not cached — it reads through to Inner).
+func (f CacheFetcher) Unwrap() fetch.Fetcher { return f.Inner }
+
 // settled reports whether r's window has aged past the Freshness horizon — i.e. its End is old
 // enough that no new sample will land in it, so the result is safe to cache. With Freshness ≤ 0
 // the guard is off and every (otherwise cacheable) request is settled.
