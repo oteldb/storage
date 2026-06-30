@@ -302,7 +302,9 @@ The L3 indexing layer maps query matchers to the series that satisfy them.
 - **`index/postings`** — the inverted index, keyed on **interned symbol ids** (`nameID →
   valueID → sorted []SeriesID`), so it is zero-alloc and **type-preserving** (the value id
   comes from the value's typed encoding). Lazy set-op iterators (`Intersect`/`Merge`/
-  `Without` with galloping `Seek`, property-tested vs a naive reference) compose lists.
+  `Without` with galloping `Seek`, property-tested vs a naive reference) compose lists; `Merge` is a
+  binary-min-heap k-way union (O(N·log k), not O(N·k)), so a high-cardinality matcher resolving across
+  thousands of value buckets stays fast.
   Matching is **callback-based**: `Select(nameID, func(valueID) bool)` hands the predicate
   a candidate value id, which the caller decodes to a typed `signal.Value` and tests —
   storage imports no query-language operator; negation/equality compose from the

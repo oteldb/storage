@@ -185,11 +185,22 @@ func Merge(ps ...Postings) Postings {
 	}
 }
 
+// mergePostings is a k-way union over its inputs, ordered by a binary min-heap so the per-emitted-id
+// cost is O(log k) (a heap re-sift) rather than O(k) (a linear min-scan): resolving a high-cardinality
+// matcher — `__name__=~"node_.+"` over ~1300 metric-name buckets — drops from O(N×k) to O(N×log k).
+// Each heap entry caches its input's current id, so a sift compares struct values without an At()
+// interface call. Inputs are sorted+deduplicated, so the union is emitted sorted and deduplicated.
 type mergePostings struct {
 	arr     []Postings
-	active  []Postings
+	h       []mergeEntry // min-heap by key (== p.At()); built lazily on the first Next/Seek
 	cur     signal.SeriesID
 	started bool
+}
+
+// mergeEntry is one heap slot: an input and its current id (cached to avoid per-sift At() calls).
+type mergeEntry struct {
+	p   Postings
+	key signal.SeriesID
 }
 
 func (m *mergePostings) Next() bool {
@@ -197,47 +208,54 @@ func (m *mergePostings) Next() bool {
 		m.started = true
 		for _, p := range m.arr {
 			if p.Next() {
-				m.active = append(m.active, p)
+				m.h = append(m.h, mergeEntry{p: p, key: p.At()})
 			}
 		}
+
+		m.heapify()
 	} else {
-		m.advanceAtCur()
+		// Dedup: advance every input sitting at the just-emitted id. They are exactly the heap roots
+		// equal to cur, so advance the root (re-sifting it down, or removing it when exhausted) until
+		// the root id differs — leaving the next distinct id at the root.
+		for len(m.h) > 0 && m.h[0].key == m.cur {
+			if m.h[0].p.Next() {
+				m.h[0].key = m.h[0].p.At()
+				m.siftDown(0)
+			} else {
+				m.removeRoot()
+			}
+		}
 	}
 
-	return m.pickMin()
+	if len(m.h) == 0 {
+		return false
+	}
+
+	m.cur = m.h[0].key
+
+	return true
 }
 
 func (m *mergePostings) Seek(v signal.SeriesID) bool {
-	if m.started && !m.cur.Less(v) {
-		return true
-	}
-
-	if !m.started {
+	switch {
+	case m.started && !m.cur.Less(v):
+		return true // already at or past v
+	case !m.started:
 		m.started = true
-		for _, p := range m.arr {
-			if p.Seek(v) {
-				m.active = append(m.active, p)
-			}
-		}
-
-		return m.pickMin()
+		m.seekInit(v)
+	default:
+		m.seekAdvance(v)
 	}
 
-	w := 0
-	for _, p := range m.active {
-		if p.At().Less(v) {
-			if !p.Seek(v) {
-				continue
-			}
-		}
+	m.heapify()
 
-		m.active[w] = p
-		w++
+	if len(m.h) == 0 {
+		return false
 	}
 
-	m.active = m.active[:w]
+	m.cur = m.h[0].key
 
-	return m.pickMin()
+	return true
 }
 
 func (m *mergePostings) At() signal.SeriesID { return m.cur }
@@ -252,36 +270,76 @@ func (m *mergePostings) Err() error {
 	return nil
 }
 
-// advanceAtCur steps every input currently sitting at the last-emitted id.
-func (m *mergePostings) advanceAtCur() {
+// seekInit seeds the heap on the first read, taking each input's first id ≥ v.
+func (m *mergePostings) seekInit(v signal.SeriesID) {
+	for _, p := range m.arr {
+		if p.Seek(v) {
+			m.h = append(m.h, mergeEntry{p: p, key: p.At()})
+		}
+	}
+}
+
+// seekAdvance moves every active input to its first id ≥ v, dropping those exhausted; the caller
+// rebuilds the heap afterward.
+func (m *mergePostings) seekAdvance(v signal.SeriesID) {
 	w := 0
-	for _, p := range m.active {
-		if p.At() == m.cur && !p.Next() {
-			continue
+
+	for _, e := range m.h {
+		if e.key.Less(v) {
+			if !e.p.Seek(v) {
+				continue
+			}
+
+			e.key = e.p.At()
 		}
 
-		m.active[w] = p
+		m.h[w] = e
 		w++
 	}
 
-	m.active = m.active[:w]
+	m.h = m.h[:w]
 }
 
-func (m *mergePostings) pickMin() bool {
-	if len(m.active) == 0 {
-		return false
+// heapify restores the min-heap invariant over the whole slice (after a bulk build or Seek rebuild).
+func (m *mergePostings) heapify() {
+	for i := len(m.h)/2 - 1; i >= 0; i-- {
+		m.siftDown(i)
 	}
+}
 
-	minID := m.active[0].At()
-	for _, p := range m.active[1:] {
-		if p.At().Less(minID) {
-			minID = p.At()
+// removeRoot drops the root (an exhausted input), moving the last entry up and re-sifting.
+func (m *mergePostings) removeRoot() {
+	last := len(m.h) - 1
+	m.h[0] = m.h[last]
+	m.h = m.h[:last]
+
+	if len(m.h) > 0 {
+		m.siftDown(0)
+	}
+}
+
+// siftDown restores the heap invariant for the subtree rooted at i (the only entry that may be out
+// of order), comparing the cached keys.
+func (m *mergePostings) siftDown(i int) {
+	n := len(m.h)
+	for {
+		l := 2*i + 1
+		if l >= n {
+			return
 		}
+
+		c := l
+		if r := l + 1; r < n && m.h[r].key.Less(m.h[l].key) {
+			c = r
+		}
+
+		if !m.h[c].key.Less(m.h[i].key) {
+			return
+		}
+
+		m.h[i], m.h[c] = m.h[c], m.h[i]
+		i = c
 	}
-
-	m.cur = minID
-
-	return true
 }
 
 // Without returns the set difference a \ b (a AND NOT b).

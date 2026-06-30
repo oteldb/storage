@@ -112,6 +112,63 @@ func TestMergeBasic(t *testing.T) {
 	assert.Equal(t, sortedSet(1, 2, 3, 4, 5), mustSlice(t, Merge(a, b)))
 }
 
+// TestMergeManyBucketsVsNaive exercises the heap-based union at large k (many input buckets), where
+// the heapify / siftDown / removeRoot paths actually run — the small-k property test (k≤3) does not.
+// It checks a full drain and a battery of Seeks against the naive union reference.
+func TestMergeManyBucketsVsNaive(t *testing.T) {
+	t.Parallel()
+
+	rng := rand.New(rand.NewPCG(7, 11))
+
+	for range 200 {
+		k := 2 + rng.IntN(64) // up to 65 input buckets
+
+		sets := make([][]signal.SeriesID, k)
+		its := make([]Postings, k)
+
+		for i := range sets {
+			sets[i] = randSet(rng, 400)
+			its[i] = FromSlice(sets[i])
+		}
+
+		want := naiveUnion(sets...)
+
+		// Full drain matches the naive union.
+		assert.Equal(t, orNil(want), mustSlice(t, Merge(its...)))
+
+		// Seek to several targets matches the first union id ≥ target (heap rebuild path).
+		for range 10 {
+			target := signal.SeriesID{Hi: uint64(rng.IntN(2)), Lo: uint64(rng.IntN(400))}
+
+			freshIts := make([]Postings, k)
+			for i := range sets {
+				freshIts[i] = FromSlice(sets[i])
+			}
+
+			m := Merge(freshIts...)
+			gotOK := m.Seek(target)
+
+			var wantID signal.SeriesID
+
+			wantOK := false
+
+			for _, id := range want {
+				if !id.Less(target) {
+					wantID, wantOK = id, true
+
+					break
+				}
+			}
+
+			require.Equal(t, wantOK, gotOK, "seek presence for target %v", target)
+
+			if wantOK {
+				assert.Equal(t, wantID, m.At(), "seek landed on the wrong id for target %v", target)
+			}
+		}
+	}
+}
+
 func TestWithoutBasic(t *testing.T) {
 	t.Parallel()
 

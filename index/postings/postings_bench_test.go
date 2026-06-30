@@ -95,6 +95,54 @@ func BenchmarkPostingsIntersect(b *testing.B) {
 	})
 }
 
+// BenchmarkPostingsMergeHighCardinality measures the union path a high-cardinality matcher pays —
+// e.g. `__name__=~"node_.+"` resolving to every series across ~1300 distinct metric-name buckets.
+// MemPostings.ForName/Select compose those buckets with Merge; the k-way merge's per-element cost is
+// the lever (a linear min-scan is O(N×buckets); a heap is O(N×log buckets)).
+func BenchmarkPostingsMergeHighCardinality(b *testing.B) {
+	for _, buckets := range []int{64, 1300} {
+		const seriesPerBucket = 110
+
+		n := buckets * seriesPerBucket
+
+		p := NewMemPostings()
+		nameName := uint32(1)
+
+		for i := range n {
+			id := signal.SeriesID{Hi: uint64(i) >> 1, Lo: uint64(i)*0x9e3779b97f4a7c15 | 1}
+			p.Add(id, nameName, uint32(1000+i%buckets)) // one bucket per distinct metric name
+		}
+
+		p.EnsureSorted()
+
+		b.Run(bucketsLabel(buckets), func(b *testing.B) {
+			b.ReportAllocs()
+
+			var sink int
+
+			for range b.N {
+				it := p.ForName(nameName) // union of every value bucket
+				for it.Next() {
+					sink++
+				}
+			}
+
+			if sink/b.N != n {
+				b.Fatalf("union size = %d, want %d", sink/b.N, n)
+			}
+		})
+	}
+}
+
+func bucketsLabel(n int) string {
+	switch n {
+	case 1300:
+		return "1300buckets"
+	default:
+		return "64buckets"
+	}
+}
+
 func hostsLabel(h int) string {
 	switch h {
 	case 100:
