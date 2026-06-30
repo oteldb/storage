@@ -24,7 +24,8 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 - `StoreStats.Tenants` — per tenant: cumulative `Admission` tally, and per-signal `SignalStats`.
 - `StoreStats.Cluster` — cluster mode only (nil single-node): this node's address, live membership,
   owned shards, and the last enacted rebalance plan.
-- `StoreStats.Caches` — read-path decode-cache totals.
+- `StoreStats.Caches` — read-path decode-cache totals (hits/misses/bytes and `Items` = cached
+  decoded **blocks**, the cache being keyed by `(part, column, block)`).
 
 `SignalStats` (one per `(tenant, signal)`):
 

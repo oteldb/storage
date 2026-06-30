@@ -94,8 +94,10 @@ type Engine struct {
 	recentMin int64 // oldest ts retained in the recent tier (maxInt64 ⇒ empty ⇒ short-circuit off)
 	// walB groups a durable AppendBatch's WAL frames by series (reused under e.mu); nil head-only.
 	walB *walBatch
-	// decodeCache memoizes decoded part columns across fetches (LRU); nil ⇒ decode every fetch.
-	decodeCache *decodeCache
+	// blockCache memoizes decoded column blocks across fetches (LRU, keyed by part/column/block); nil
+	// ⇒ decode every fetch. A fetch caches only the blocks its matched series touch, so the resident
+	// set is the useful blocks across live parts rather than every whole part touched.
+	blockCache *blockCache
 	// decPool recycles decodedPart column buffers on the no-cross-fetch-cache path: a fetch borrows
 	// them to decode a part and returns them on releaseParts (safe — the merge copies values out, so
 	// no result aliases them). This kills the per-query decode-buffer allocation (chunk.resize). It is
@@ -144,7 +146,7 @@ func New(cfg Config) *Engine {
 	}
 
 	if cfg.DecodeCacheBytes > 0 {
-		e.decodeCache = newDecodeCache(cfg.DecodeCacheBytes)
+		e.blockCache = newBlockCache(cfg.DecodeCacheBytes)
 	}
 
 	if cfg.RecentWindow > 0 {
@@ -1028,55 +1030,32 @@ func (e *Engine) publishLocked(ctx context.Context) error {
 // decodeOf decodes p through the cross-fetch decode cache when enabled: a hit returns the shared
 // (immutable) decoded columns; a miss decodes and caches them. Without a cache it decodes plainly.
 func (e *Engine) decodeOf(ctx context.Context, p *part, need colNeed, ranges []rowRange) (*decodedPart, error) {
-	if e.decodeCache == nil {
-		// No cross-fetch cache: borrow buffers from the free list, decode into them, and mark the
-		// result pooled so the fetch returns it on releaseParts. The merge copies values out, so the
-		// buffers are free to reuse once the fetch ends. Get returns nil when empty — allocate then.
-		// ranges (the matched series' row runs) lets the decode skip the part's untouched blocks; a
-		// nil ranges or an unblocked column decodes the whole column.
-		dp := e.decPool.Get()
-		if dp == nil {
-			dp = &decodedPart{}
-		}
-
-		dp, err := p.decodeRangesInto(ctx, dp, need, ranges)
-		if err != nil {
-			e.decPool.Put(dp)
-
-			return nil, err
-		}
-
-		dp.pooled = true
-
-		return dp, nil
+	// Borrow a pooled decodedPart (a reclaimed part's recycled buffers when available); the fetch
+	// returns it on releaseParts. The merge copies values out, so the buffers are free to reuse once
+	// the fetch ends. Get returns nil when empty — allocate then. ranges (the matched series' row
+	// runs) lets the decode skip the part's untouched blocks; nil ranges decodes the whole part.
+	dp := e.decPool.Get()
+	if dp == nil {
+		dp = &decodedPart{}
 	}
 
-	if dp, ok := e.decodeCache.get(p.prefix); ok {
-		// A ts-only entry can't satisfy a value-needing read: fall through to a full decode that
-		// replaces it (so subsequent value and ts reads both hit the complete columns). A ts-only
-		// read is happy with any entry, and a value read with a full entry.
-		if !need.values || dp.haveValues {
-			return dp, nil
-		}
+	var err error
+	if e.blockCache != nil {
+		// Cross-fetch block cache: assemble the matched blocks from the cache (decoding+caching the
+		// misses), so a column is decoded once across fetches and only for the blocks it touches.
+		err = e.assembleFromBlocks(ctx, dp, p, need, ranges)
+	} else {
+		// No cache: decode the matched blocks fresh into the pooled buffers each fetch.
+		dp, err = p.decodeRangesInto(ctx, dp, need, ranges)
 	}
 
-	// Cache miss: decode into a buffer borrowed from the pool (a reclaimed part's recycled columns
-	// when one is available), then hand ownership to the cache. Unlike the no-cache path this dp is
-	// NOT marked pooled — the cache holds it until the part is reclaimed (recycleDecoded returns it
-	// to the pool then), so releaseParts must not return it while the cache still shares it.
-	buf := e.decPool.Get()
-	if buf == nil {
-		buf = &decodedPart{}
-	}
-
-	dp, err := p.decodeInto(ctx, buf, need)
 	if err != nil {
-		e.recycleDecoded(buf) // decodeInto returns nil on error; recycle the borrowed buffer, not dp
+		e.recycleDecoded(dp)
 
 		return nil, err
 	}
 
-	e.decodeCache.put(p.prefix, dp)
+	dp.pooled = true
 
 	return dp, nil
 }
@@ -1104,7 +1083,7 @@ const prefetchConcurrency = 8
 // cache or with fewer than two parts to touch (the lazy path is already optimal). Best-effort: a
 // decode error here is ignored; the merge re-decodes and surfaces it.
 func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
-	if e.decodeCache == nil || len(plan.liveParts) < 2 {
+	if e.blockCache == nil || len(plan.liveParts) < 2 {
 		return
 	}
 
@@ -1132,7 +1111,12 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			_, _ = e.decodeOf(ctx, p, colNeed{values: true}, nil)
+			// Warm only the blocks this fetch's matched series touch, then return the throwaway
+			// assembled buffer to the pool (the cache holds the decoded blocks, not this dp).
+			dp, err := e.decodeOf(ctx, p, colNeed{values: true}, plan.rangesFor(p))
+			if err == nil {
+				e.recycleDecoded(dp)
+			}
 		}(pt)
 	}
 
