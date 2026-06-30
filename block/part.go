@@ -128,7 +128,7 @@ func (w *PartWriter) build() (builtPart, error) {
 			alg = w.defaultComp
 		}
 
-		desc, obj, err := buildColumn(*c, w.compressorFor(alg))
+		desc, obj, err := buildColumn(*c, w.compressorFor(alg), w.granuleSize)
 		if err != nil {
 			return builtPart{}, errors.Wrapf(err, "column %q", c.Name)
 		}

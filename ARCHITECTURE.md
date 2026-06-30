@@ -243,13 +243,25 @@ columns it references (projection pushdown without ranged reads):
   its RLE codec already collapses a single-id run to a few bytes. The lazy `ColumnReader`
   decodes on demand: `Int64`/`Float64`/`ID128` into a reusable slice, `Bytes` into
   `chunk.DictColumn` split form, and synthesizes constants with no I/O.
+- **Block-framed columns** (`blockcolumn.go`, opt-in via `Column.Block`) split a per-row sequential
+  column (DoD/T64 int64, Gorilla/decimal float64 — the metric ts/value/sf columns) into granule-sized
+  row blocks, each an **independently decodable** codec stream (the codecs reset their running state at
+  every block's row 0). The object becomes `[uvarint nBlocks][uvarint blockRows][per-block uvarint
+  len][block streams…]`, each stream block-compressed on its own; a blocked column is flagged by
+  `flagBlocked` in its descriptor (additive, no version bump). `ColumnReader.Int64`/`Float64` decode
+  every block in place (no whole-column re-read), and `RangeInt64`/`RangeFloat64` decode **only the
+  blocks spanning a row range** — the sub-part seek primitive (decode a fraction of a column for a
+  selector touching a fraction of its rows). Block boundaries align with the marks granules, so the
+  marks index already carries each block's `[minTime,maxTime]`. The streaming merge cursors
+  (`TsCursor`/`FloatCursor`) do not yet span blocks and reject a blocked column. Unblocked columns keep
+  the prior single-stream layout byte-for-byte.
 - **Manifest** (`manifest.go`) is a versioned binary record (magic `OTPM`, version, row
   count, time range, granule size, per-column descriptors) with a trailing CRC32C. Each column
   descriptor is `[name][kind][codec][compress][flags]` then, **only when `flagLossy` is set**, one
   `FloatPrecisionBits` byte (the lossy precision budget — §2.2/§3f), then the per-kind stats/const.
   The precision byte is flag-gated, so lossless columns and pre-existing parts keep their exact
-  byte-for-byte layout (no version bump, no golden churn). Decode bounds-checks every field and never
-  panics (fuzzed).
+  byte-for-byte layout (no version bump, no golden churn). `flagBlocked` (additive, same way) marks a
+  block-framed column object (above). Decode bounds-checks every field and never panics (fuzzed).
 - **Marks** (`marks.go`) is the sparse granule index over the sort-key (timestamp)
   column: per-granule first row + min/max, delta-encoded, CRC-checked. `Overlapping(lo,hi)`
   prunes granules for a time window (used by the future fetcher).
