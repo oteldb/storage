@@ -537,9 +537,12 @@ func (r *ColumnReader) TsCursor() (chunk.TsCursor, error) {
 	}
 
 	if r.desc.Blocked {
-		// The streaming merge cursors do not yet span block boundaries; a blocked column is read via
-		// Int64/RangeInt64. (Blocked cursors land with the merge integration.)
-		return nil, errors.Errorf("block: column %q is blocked; cursor not supported", r.desc.Name)
+		dir, err := parseBlockDir(r.object)
+		if err != nil {
+			return nil, errors.Wrapf(err, "column %q", r.desc.Name)
+		}
+
+		return newBlockedTsCursor(dir, r.comp, r.rows), nil
 	}
 
 	stream, err := r.stream()
@@ -562,7 +565,12 @@ func (r *ColumnReader) FloatCursor() (chunk.FloatDecoder, error) {
 	}
 
 	if r.desc.Blocked {
-		return nil, errors.Errorf("block: column %q is blocked; cursor not supported", r.desc.Name)
+		dir, err := parseBlockDir(r.object)
+		if err != nil {
+			return nil, errors.Wrapf(err, "column %q", r.desc.Name)
+		}
+
+		return newBlockedFloatCursor(dir, r.comp, r.desc.Codec, r.rows), nil
 	}
 
 	stream, err := r.stream()
@@ -571,6 +579,67 @@ func (r *ColumnReader) FloatCursor() (chunk.FloatDecoder, error) {
 	}
 
 	return chunk.NewFloatDecoder(r.desc.Codec, stream)
+}
+
+// Blocked reports whether the column is block-framed (and so supports DecodeBlocks*/BlockRows).
+func (r *ColumnReader) Blocked() bool { return r.desc.Blocked }
+
+// BlockRows returns the column's block size in rows, or 0 for an unblocked column.
+func (r *ColumnReader) BlockRows() (int, error) {
+	if !r.desc.Blocked {
+		return 0, nil
+	}
+
+	dir, err := parseBlockDir(r.object)
+	if err != nil {
+		return 0, errors.Wrapf(err, "column %q", r.desc.Name)
+	}
+
+	return dir.blockRows, nil
+}
+
+// DecodeBlocksInt64 decodes only the given block indices of a blocked column into dst (reused), and
+// returns a full-length (Len()) slice with those blocks' row spans populated — the rest of dst is
+// left as-is (a caller reads only the rows it selected, which fall in the requested blocks). An
+// unblocked/const column has no blocks to skip, so it decodes whole. blocks must be in range.
+func (r *ColumnReader) DecodeBlocksInt64(dst []int64, blocks []int) ([]int64, error) {
+	if !r.desc.Blocked {
+		return r.Int64(dst)
+	}
+
+	dir, err := parseBlockDir(r.object)
+	if err != nil {
+		return nil, errors.Wrapf(err, "column %q", r.desc.Name)
+	}
+
+	out := growLen(dst, r.rows)
+
+	return out, decodeBlocksInto(dir, r.comp, r.rows, out, blocks, r.int64Decoder())
+}
+
+// DecodeBlocksFloat64 is the float64 analog of [ColumnReader.DecodeBlocksInt64].
+func (r *ColumnReader) DecodeBlocksFloat64(dst []float64, blocks []int) ([]float64, error) {
+	if !r.desc.Blocked {
+		return r.Float64(dst)
+	}
+
+	dir, err := parseBlockDir(r.object)
+	if err != nil {
+		return nil, errors.Wrapf(err, "column %q", r.desc.Name)
+	}
+
+	out := growLen(dst, r.rows)
+
+	return out, decodeBlocksInto(dir, r.comp, r.rows, out, blocks, r.float64Decoder())
+}
+
+// growLen returns a slice of length n reusing dst's backing array when its capacity allows.
+func growLen[T any](dst []T, n int) []T {
+	if cap(dst) < n {
+		return make([]T, n)
+	}
+
+	return dst[:n]
 }
 
 // int64Decoder returns the per-block typed decoder for this column's codec, or nil for a codec that

@@ -183,7 +183,8 @@ func (e *Engine) writeMergedPart(ctx context.Context, cols *flushColumns, seq in
 	prefix := e.partPrefix(seq)
 
 	if err := writePart(ctx, e.cfg.Backend, prefix, cols,
-		coldProfile(opts.Recompress, maxT), pickPrecision(opts.Precision, maxT), e.cfg.AggregateStats); err != nil {
+		coldProfile(opts.Recompress, maxT), pickPrecision(opts.Precision, maxT),
+		e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
 		return nil, err
 	}
 

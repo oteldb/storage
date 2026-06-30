@@ -224,25 +224,54 @@ func TestBlockedPartRoundTrip(t *testing.T) {
 	assert.Equal(t, ts[5:13], rng)
 }
 
-// TestBlockedCursorUnsupported pins that the streaming merge cursors reject a blocked column (they
-// do not yet span block boundaries) rather than silently misdecoding it.
-func TestBlockedCursorUnsupported(t *testing.T) {
+// TestBlockedCursor drives the streaming cursors over a blocked column and checks they yield the
+// same rows as a full decode, transparently crossing block boundaries — the merge path's contract.
+func TestBlockedCursor(t *testing.T) {
 	t.Parallel()
 
-	ts := []int64{1, 2, 3, 4, 5, 6, 7, 8}
-	desc, obj, err := buildColumn(Column{Name: "ts", Kind: KindInt64, Codec: chunk.CodecDoD, Int64: ts, Block: true}, noneComp(), 4)
+	const blockRows, n = 4, 18 // straddles block boundaries (4.5 blocks)
+
+	ts := make([]int64, n)
+	vals := make([]float64, n)
+	for i := range n {
+		ts[i] = int64(1000 + i*15)
+		vals[i] = float64(i)*2.5 + 1
+	}
+
+	tsDesc, tsObj, err := buildColumn(Column{Name: "ts", Kind: KindInt64, Codec: chunk.CodecDoD, Int64: ts, Block: true}, noneComp(), blockRows)
 	require.NoError(t, err)
-	require.True(t, desc.Blocked)
+	require.True(t, tsDesc.Blocked)
 
-	_, err = newColumnReader(desc, obj, noneComp(), len(ts)).TsCursor()
-	require.Error(t, err)
+	cur, err := newColumnReader(tsDesc, tsObj, noneComp(), n).TsCursor()
+	require.NoError(t, err)
+	assert.Equal(t, n, cur.Len())
 
-	vals := []float64{1, 2, 3, 4, 5, 6, 7, 8}
-	fdesc, fobj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Codec: chunk.CodecGorilla, Float64: vals, Block: true}, noneComp(), 4)
+	for i := range n {
+		assert.Equal(t, i, cur.Pos())
+		got, err := cur.Next()
+		require.NoError(t, err)
+		assert.Equal(t, ts[i], got, "row %d", i)
+	}
+
+	_, err = cur.Next()
+	require.Error(t, err, "cursor past the end errors")
+
+	vDesc, vObj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Codec: chunk.CodecGorilla, Float64: vals, Block: true}, noneComp(), blockRows)
 	require.NoError(t, err)
 
-	_, err = newColumnReader(fdesc, fobj, noneComp(), len(vals)).FloatCursor()
-	require.Error(t, err)
+	fcur, err := newColumnReader(vDesc, vObj, noneComp(), n).FloatCursor()
+	require.NoError(t, err)
+
+	gotVals := make([]float64, 0, n)
+
+	for range n {
+		got, err := fcur.Next()
+		require.NoError(t, err)
+
+		gotVals = append(gotVals, got)
+	}
+
+	assert.Equal(t, vals, gotVals)
 }
 
 // FuzzBlockedRoundTrip fuzzes the blocked int64 round-trip: arbitrary values and a block size in
@@ -300,9 +329,19 @@ func FuzzBlockedDecodeNoPanic(f *testing.F) {
 
 	f.Fuzz(func(_ *testing.T, object []byte) {
 		desc := ColumnDesc{Name: "c", Kind: KindInt64, Codec: chunk.CodecDoD, Blocked: true}
-		// Must not panic regardless of the (arbitrary) declared row count.
+		// Must not panic regardless of the (arbitrary) declared row count. Exercise every decode
+		// path that parses the directory: whole-column, range, block-set, and the streaming cursor.
 		_, _ = newColumnReader(desc, object, noneComp(), 32).Int64(nil)
 		_, _ = newColumnReader(desc, object, noneComp(), 32).RangeInt64(nil, 0, 8)
+		_, _ = newColumnReader(desc, object, noneComp(), 32).DecodeBlocksInt64(nil, []int{0, 1, 5})
+
+		if cur, err := newColumnReader(desc, object, noneComp(), 32).TsCursor(); err == nil {
+			for range 40 {
+				if _, err := cur.Next(); err != nil {
+					break
+				}
+			}
+		}
 
 		if dir, err := parseBlockDir(object); err == nil {
 			_ = dir.nBlocks()

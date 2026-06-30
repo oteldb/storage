@@ -57,7 +57,18 @@ type Config struct {
 	// window of resident memory for that latency. 0 disables it (the default); the head is then just
 	// the unflushed tail, drained on every flush as before.
 	RecentWindow int64
+	// MetricBlockRows sets the row block size for metric part columns (ts/value/sf): the columns are
+	// split into independently decodable blocks of this many rows, so a query can decode only the
+	// blocks its matched series' row ranges touch (sub-part seek) instead of the whole column, and
+	// the block boundaries drive the part's marks granules. 0 ⇒ [DefaultMetricBlockRows]. A finer
+	// size skips more on sparse selectors at a small per-block header cost.
+	MetricBlockRows int
 }
+
+// DefaultMetricBlockRows is the metric part block size used when [Config.MetricBlockRows] is 0. It
+// is finer than the historical 8192-row granule so a sparse selector (a small fraction of a part's
+// series, scattered by SeriesID hash) touches a smaller fraction of blocks.
+const DefaultMetricBlockRows = 1024
 
 // Engine is a single tenant's storage engine. Safe for concurrent use.
 type Engine struct {
@@ -106,9 +117,6 @@ type Engine struct {
 	// recycle is the shared per-engine [fetch.Batch.Release] hook (allocated once), so setting it on
 	// a batch costs nothing per batch. It returns the batch's ts/value buffers to the pools above.
 	recycle func(*fetch.Batch)
-	// fetchDecode is the shared per-fetch decode function (allocated once): the value-needing decode
-	// every fetch/merge per-part miss takes, so planFetch wires it without a per-query closure alloc.
-	fetchDecode decodeFunc
 }
 
 var _ fetch.Fetcher = (*Engine)(nil)
@@ -129,11 +137,6 @@ func New(cfg Config) *Engine {
 	e.recycle = func(b *fetch.Batch) {
 		e.putI64(b.Timestamps)
 		e.putF64(b.Values)
-	}
-	// The fetch/merge decode path always materializes values; bind the column-need once so planFetch
-	// reuses it (no per-query closure alloc).
-	e.fetchDecode = func(ctx context.Context, p *part) (*decodedPart, error) {
-		return e.decodeOf(ctx, p, colNeed{values: true})
 	}
 
 	if cfg.WAL != nil {
@@ -434,13 +437,47 @@ type enginePlan struct {
 	recentB    map[signal.SeriesID]*fetch.Batch // recent-tier samples (the in-RAM flush window)
 	liveParts  []*part
 	decoded    partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
-	decodeFn   decodeFunc      // how a part is decoded on a per-fetch miss (cache-aware)
 	engine     *Engine         // for returning pooled decode buffers on release
 	start, end int64
 }
 
 // mergeSeries gathers series id's samples lock-free: each acquired part oldest→newest, then the
 // mid-flush samples, then the head samples last — so on a duplicate timestamp the freshest value wins.
+// decodePart returns part's decoded columns for this fetch, memoized so a part decodes once however
+// many series read it. On the no-cache path it decodes only the blocks the fetch's matched series
+// touch (series-skip): rangesFor gives the part's matched row runs, so a sparse selector decodes a
+// fraction of the part's column blocks. With a cross-fetch cache the part decodes whole (the cache
+// shares it across queries with different matched series; block-keyed caching is a follow-up).
+func (p *enginePlan) decodePart(ctx context.Context, part *part) (*decodedPart, error) {
+	if d, ok := p.decoded[part]; ok {
+		return d, nil
+	}
+
+	d, err := p.engine.decodeOf(ctx, part, colNeed{values: true}, p.rangesFor(part))
+	if err != nil {
+		return nil, err
+	}
+
+	p.decoded[part] = d
+
+	return d, nil
+}
+
+// rangesFor returns the row runs of the plan's matched series that part holds — the input to the
+// series-skip decode. The result is the union of the part's per-series ranges; it need not be sorted
+// (neededBlocks unions their blocks regardless).
+func (p *enginePlan) rangesFor(part *part) []rowRange {
+	out := make([]rowRange, 0, len(p.ids))
+
+	for _, id := range p.ids {
+		if rng, ok := part.index.lookup(id); ok {
+			out = append(out, rng)
+		}
+	}
+
+	return out
+}
+
 func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampleMerge, error) {
 	var m sampleMerge
 
@@ -450,7 +487,7 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 			continue
 		}
 
-		d, err := p.decoded.get(ctx, part, p.decodeFn)
+		d, err := p.decodePart(ctx, part)
 		if err != nil {
 			return m, err
 		}
@@ -932,7 +969,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		sub := cols.slice(rg[0], rg[1])
 		prefix := e.partPrefix(seq + i)
 
-		if err := writePart(ctx, e.cfg.Backend, prefix, sub, nil, 0, e.cfg.AggregateStats); err != nil {
+		if err := writePart(ctx, e.cfg.Backend, prefix, sub, nil, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
 			return 0, err
 		}
 
@@ -990,17 +1027,19 @@ func (e *Engine) publishLocked(ctx context.Context) error {
 
 // decodeOf decodes p through the cross-fetch decode cache when enabled: a hit returns the shared
 // (immutable) decoded columns; a miss decodes and caches them. Without a cache it decodes plainly.
-func (e *Engine) decodeOf(ctx context.Context, p *part, need colNeed) (*decodedPart, error) {
+func (e *Engine) decodeOf(ctx context.Context, p *part, need colNeed, ranges []rowRange) (*decodedPart, error) {
 	if e.decodeCache == nil {
 		// No cross-fetch cache: borrow buffers from the free list, decode into them, and mark the
 		// result pooled so the fetch returns it on releaseParts. The merge copies values out, so the
 		// buffers are free to reuse once the fetch ends. Get returns nil when empty — allocate then.
+		// ranges (the matched series' row runs) lets the decode skip the part's untouched blocks; a
+		// nil ranges or an unblocked column decodes the whole column.
 		dp := e.decPool.Get()
 		if dp == nil {
 			dp = &decodedPart{}
 		}
 
-		dp, err := p.decodeInto(ctx, dp, need)
+		dp, err := p.decodeRangesInto(ctx, dp, need, ranges)
 		if err != nil {
 			e.decPool.Put(dp)
 
@@ -1093,7 +1132,7 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			_, _ = e.decodeOf(ctx, p, colNeed{values: true})
+			_, _ = e.decodeOf(ctx, p, colNeed{values: true}, nil)
 		}(pt)
 	}
 
@@ -1105,15 +1144,14 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 // lock). The acquired parts must be released with releaseParts.
 func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 	p := &enginePlan{
-		ids:      ids,
-		series:   make(map[signal.SeriesID]signal.Series, len(ids)),
-		headB:    make(map[signal.SeriesID]*fetch.Batch, len(ids)),
-		flushB:   make(map[signal.SeriesID]*fetch.Batch, len(ids)),
-		decoded:  make(partDecodeCache),
-		decodeFn: e.fetchDecode,
-		engine:   e,
-		start:    r.Start,
-		end:      r.End,
+		ids:     ids,
+		series:  make(map[signal.SeriesID]signal.Series, len(ids)),
+		headB:   make(map[signal.SeriesID]*fetch.Batch, len(ids)),
+		flushB:  make(map[signal.SeriesID]*fetch.Batch, len(ids)),
+		decoded: make(partDecodeCache),
+		engine:  e,
+		start:   r.Start,
+		end:     r.End,
 	}
 
 	// The recent tier short-circuit: when the query range falls inside the tier's window, the tier ∪

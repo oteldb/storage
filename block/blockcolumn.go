@@ -9,6 +9,11 @@ import (
 	"github.com/oteldb/storage/encoding/compress"
 )
 
+// errCursorEOF is returned by a blocked cursor's Next when every block has been consumed. The
+// streaming merge drives each cursor with a known row count and never over-reads, so this only
+// surfaces a caller bug.
+var errCursorEOF = errors.New("block: blocked cursor exhausted")
+
 // Block-framed columns split a column into fixed-size row blocks, each an independent codec stream
 // (the chunk codecs reset their running state — delta-of-delta, Gorilla leading/trailing — at row 0
 // of every Encode call, so a block over rows [lo,hi) is decodable without touching any earlier row).
@@ -204,6 +209,49 @@ func decodeBlockedColumn[T any](
 	return out[:base], nil
 }
 
+// decodeBlocksInto decodes the given block indices into their row spans of out (sized to rows),
+// leaving rows outside those blocks untouched. It is the engine's series-skip primitive: decode only
+// the blocks a query's matched series touch.
+func decodeBlocksInto[T any](
+	dir blockDir, comp *compress.Compressor, rows int, out []T, blocks []int, dec func([]T, []byte) ([]T, int, error),
+) error {
+	if dec == nil {
+		return errors.New("block: nil decoder")
+	}
+
+	for _, b := range blocks {
+		if b < 0 || b >= dir.nBlocks() {
+			return errors.Errorf("block: block %d out of range [0,%d)", b, dir.nBlocks())
+		}
+
+		lo := b * dir.blockRows
+		// A corrupt/mismatched directory can place a block past the destination's row count; guard
+		// before slicing out[lo:] so a bad object errors rather than panicking.
+		if lo >= rows {
+			return errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", b, lo, rows)
+		}
+
+		hi := min(lo+dir.blockRows, rows)
+
+		stream, err := comp.Decompress(nil, dir.block(b))
+		if err != nil {
+			return errors.Wrapf(err, "decompress block %d", b)
+		}
+
+		// cap(out[lo:]) == rows-lo ≥ this block's row count, so the decoder fills out[lo:hi] in place.
+		sub, _, err := dec(out[lo:lo], stream)
+		if err != nil {
+			return errors.Wrapf(err, "decode block %d", b)
+		}
+
+		if len(sub) != hi-lo {
+			return errors.Wrapf(ErrCorrupt, "block %d decoded %d rows, want %d", b, len(sub), hi-lo)
+		}
+	}
+
+	return nil
+}
+
 // decodeBlockedRange decodes only the blocks spanning rows [lo,hi) and returns that row range. It is
 // the seek primitive: a query touching a fraction of a column decodes a fraction of its blocks. The
 // result is a view into a buffer reusing dst's capacity; lo/hi must satisfy 0 ≤ lo < hi ≤ rows.
@@ -248,4 +296,99 @@ func decodeBlockedRange[T any](
 	}
 
 	return out[relLo:relHi], nil
+}
+
+// blockedTsCursor is a forward [chunk.TsCursor] over a blocked int64 column: it decodes one block at
+// a time, opening the next block when the current is exhausted, so it spans block boundaries
+// transparently. Each block is an independent codec stream (its row 0 is absolute), so crossing a
+// boundary just starts a fresh per-block decoder — no cross-block state.
+type blockedTsCursor struct {
+	dir  blockDir
+	comp *compress.Compressor
+	rows int
+	pos  int
+	blk  int            // index of the open block; -1 before the first
+	cur  chunk.TsCursor // decoder for block blk; advanced past its end opens the next
+}
+
+func newBlockedTsCursor(dir blockDir, comp *compress.Compressor, rows int) *blockedTsCursor {
+	return &blockedTsCursor{dir: dir, comp: comp, rows: rows, blk: -1}
+}
+
+func (c *blockedTsCursor) Len() int { return c.rows }
+func (c *blockedTsCursor) Pos() int { return c.pos }
+
+func (c *blockedTsCursor) Next() (int64, error) {
+	for c.cur == nil || c.cur.Pos() >= c.cur.Len() {
+		c.blk++
+		if c.blk >= c.dir.nBlocks() {
+			return 0, errCursorEOF
+		}
+
+		stream, err := c.comp.Decompress(nil, c.dir.block(c.blk))
+		if err != nil {
+			return 0, errors.Wrapf(err, "decompress block %d", c.blk)
+		}
+
+		c.cur, err = chunk.NewTsDecoder(stream)
+		if err != nil {
+			return 0, errors.Wrapf(err, "block %d", c.blk)
+		}
+	}
+
+	v, err := c.cur.Next()
+	if err != nil {
+		return 0, err
+	}
+
+	c.pos++
+
+	return v, nil
+}
+
+// blockedFloatCursor is the float64 analog of [blockedTsCursor], over a blocked Gorilla/decimal
+// column.
+type blockedFloatCursor struct {
+	dir   blockDir
+	comp  *compress.Compressor
+	codec chunk.Codec
+	rows  int
+	pos   int
+	blk   int
+	cur   chunk.FloatDecoder
+}
+
+func newBlockedFloatCursor(dir blockDir, comp *compress.Compressor, codec chunk.Codec, rows int) *blockedFloatCursor {
+	return &blockedFloatCursor{dir: dir, comp: comp, codec: codec, rows: rows, blk: -1}
+}
+
+func (c *blockedFloatCursor) Len() int { return c.rows }
+func (c *blockedFloatCursor) Pos() int { return c.pos }
+
+func (c *blockedFloatCursor) Next() (float64, error) {
+	for c.cur == nil || c.cur.Pos() >= c.cur.Len() {
+		c.blk++
+		if c.blk >= c.dir.nBlocks() {
+			return 0, errCursorEOF
+		}
+
+		stream, err := c.comp.Decompress(nil, c.dir.block(c.blk))
+		if err != nil {
+			return 0, errors.Wrapf(err, "decompress block %d", c.blk)
+		}
+
+		c.cur, err = chunk.NewFloatDecoder(c.codec, stream)
+		if err != nil {
+			return 0, errors.Wrapf(err, "block %d", c.blk)
+		}
+	}
+
+	v, err := c.cur.Next()
+	if err != nil {
+		return 0, err
+	}
+
+	c.pos++
+
+	return v, nil
 }

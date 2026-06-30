@@ -251,10 +251,14 @@ columns it references (projection pushdown without ranged reads):
   `flagBlocked` in its descriptor (additive, no version bump). `ColumnReader.Int64`/`Float64` decode
   every block in place (no whole-column re-read), and `RangeInt64`/`RangeFloat64` decode **only the
   blocks spanning a row range** — the sub-part seek primitive (decode a fraction of a column for a
-  selector touching a fraction of its rows). Block boundaries align with the marks granules, so the
-  marks index already carries each block's `[minTime,maxTime]`. The streaming merge cursors
-  (`TsCursor`/`FloatCursor`) do not yet span blocks and reject a blocked column. Unblocked columns keep
-  the prior single-stream layout byte-for-byte.
+  selector touching a fraction of its rows). `DecodeBlocksInt64`/`DecodeBlocksFloat64` decode a chosen
+  *set* of blocks into their row spans of a full-length slice — the engine's series-skip primitive.
+  Block boundaries align with the marks granules, so the marks index already carries each block's
+  `[minTime,maxTime]`. The streaming merge cursors (`TsCursor`/`FloatCursor`) decode block-by-block and
+  span boundaries transparently (each block's row 0 is absolute), so the merge reads blocked parts
+  unchanged. Unblocked columns keep the prior single-stream layout byte-for-byte. **Metric parts are
+  blocked by default** (`engine.Config.MetricBlockRows`, default 1024 rows): the ts/value/sf columns
+  are blocked and the block size drives the part's marks granules.
 - **Manifest** (`manifest.go`) is a versioned binary record (magic `OTPM`, version, row
   count, time range, granule size, per-column descriptors) with a trailing CRC32C. Each column
   descriptor is `[name][kind][codec][compress][flags]` then, **only when `flagLossy` is set**, one
@@ -523,9 +527,15 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   fetches: a byte-bounded LRU of decoded columns keyed by part prefix, valid until the part is
   retired (reclaim evicts its prefix) or the budget evicts it. A decoded part is immutable (the
   merge only reads its column slices), so entries are **shared without copying**, even across
-  concurrent fetches. It eliminates the re-decode the object-store read cache (§3a) cannot. With
-  the cache on, a fetch also **prefetches** the parts it will touch — decoding them concurrently
-  (bounded fan-out) so their backend reads + decodes overlap instead of running one part at a time.
+  concurrent fetches. It eliminates the re-decode the object-store read cache (§3a) cannot. On the
+  **no-cache path** the per-part decode is **series-skipped**: it decodes only the column blocks the
+  fetch's matched series' row ranges touch (`neededBlocks` → `DecodeBlocksInt64/Float64`), so a sparse
+  selector over a blocked part decodes a fraction of its columns instead of the whole part (≈3–4× less
+  decode for a single-series selector over a many-series part). The decode-cache path decodes whole
+  parts (an entry is shared across queries whose matched series differ; block-keyed caching is a
+  follow-up). With the cache on, a fetch also **prefetches** the parts it will touch — decoding them
+  concurrently (bounded fan-out) so their backend reads + decodes overlap instead of running one part
+  at a time.
   A **recent tier** (`Config.RecentWindow`, `recent.go`) opt-in mirrors the most recent flush window
   in RAM across flushes (the head is drained on every flush, but the tier persists), so a query whose
   `[Start, End]` falls inside the tier's window is served from the tier ∪ the mid-flush buffers ∪ the
