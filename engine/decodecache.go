@@ -82,14 +82,23 @@ func (c *decodeCache) put(prefix string, dp *decodedPart) {
 	}
 }
 
-// evict drops prefix's entry (called when its part is reclaimed).
-func (c *decodeCache) evict(prefix string) {
+// evict drops prefix's entry (called when its part is reclaimed) and returns its decoded columns, or
+// nil if absent. The caller may recycle the returned buffers: evict fires only for a reclaimed part
+// (refs == 0, already out of the live set), so no in-flight fetch can still be reading them — unlike
+// the LRU eviction in put, whose entry may belong to a live, in-flight part.
+func (c *decodeCache) evict(prefix string) *decodedPart {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if el, ok := c.items[prefix]; ok {
-		c.removeElem(el)
+	el, ok := c.items[prefix]
+	if !ok {
+		return nil
 	}
+
+	dp := el.Value.(*decodeEntry).dp
+	c.removeElem(el)
+
+	return dp
 }
 
 // removeElem drops el from the list and index and decrements the byte total. Caller holds c.mu.

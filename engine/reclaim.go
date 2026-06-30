@@ -77,10 +77,15 @@ func (e *Engine) reclaimRetired(ctx context.Context) {
 		return
 	}
 
-	// A reclaimed part will never be read again — drop its decoded columns from the cache.
+	// A reclaimed part will never be read again — drop its decoded columns from the cache and recycle
+	// their buffers to the decode pool so the next cache-miss decode reuses the capacity instead of
+	// allocating fresh (and the GC need not reclaim them). Safe because the part's refs are 0: no
+	// in-flight fetch still holds the shared decodedPart.
 	if e.decodeCache != nil {
 		for _, p := range deletable {
-			e.decodeCache.evict(p.prefix)
+			if dp := e.decodeCache.evict(p.prefix); dp != nil {
+				e.recycleDecoded(dp)
+			}
 		}
 	}
 

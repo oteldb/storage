@@ -475,18 +475,21 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 
 // releaseParts releases the fetch's hold on its acquired parts, letting a retired part be reclaimed.
 func (p *enginePlan) releaseParts() {
-	for _, part := range p.liveParts {
-		part.release()
-	}
-
 	// Return pooled decode buffers (no-cross-fetch-cache path). The merge has already copied the
-	// values out into the result batches, so these slices are dead and safe to recycle.
+	// values out into the result batches, so these slices are dead and safe to recycle. Cache-path
+	// dps are not pooled (the cache owns them until reclaim), so they are skipped here.
+	//
+	// This MUST run before the part.release() loop below: a cache-path dp is shared with reclaim,
+	// which recycles it once the part's refs reach 0. Touching dp (even reading dp.pooled) after
+	// releasing the part would race that recycle; doing it while the refs are still held cannot.
 	for _, dp := range p.decoded {
 		if dp.pooled {
-			dp.pooled = false
-			dp.ts, dp.vals, dp.sf = dp.ts[:0], dp.vals[:0], dp.sf[:0]
-			p.engine.decPool.Put(dp)
+			p.engine.recycleDecoded(dp)
 		}
+	}
+
+	for _, part := range p.liveParts {
+		part.release()
 	}
 
 	// Recycle the per-series head/flush window buffers drawn by winBuffers. The merge has likewise
@@ -1018,14 +1021,39 @@ func (e *Engine) decodeOf(ctx context.Context, p *part, need colNeed) (*decodedP
 		}
 	}
 
-	dp, err := p.decode(ctx, need)
+	// Cache miss: decode into a buffer borrowed from the pool (a reclaimed part's recycled columns
+	// when one is available), then hand ownership to the cache. Unlike the no-cache path this dp is
+	// NOT marked pooled — the cache holds it until the part is reclaimed (recycleDecoded returns it
+	// to the pool then), so releaseParts must not return it while the cache still shares it.
+	buf := e.decPool.Get()
+	if buf == nil {
+		buf = &decodedPart{}
+	}
+
+	dp, err := p.decodeInto(ctx, buf, need)
 	if err != nil {
+		e.recycleDecoded(buf) // decodeInto returns nil on error; recycle the borrowed buffer, not dp
+
 		return nil, err
 	}
 
 	e.decodeCache.put(p.prefix, dp)
 
 	return dp, nil
+}
+
+// recycleDecoded returns a decodedPart's column buffers to the decode pool (capacity preserved,
+// contents discarded) for the next decode to reuse. Only call it on a dp no fetch can still be
+// reading: a pool-path dp on releaseParts, or a cache dp whose part has been reclaimed (refs == 0).
+func (e *Engine) recycleDecoded(dp *decodedPart) {
+	if dp == nil {
+		return
+	}
+
+	dp.pooled = false
+	dp.haveValues = false
+	dp.ts, dp.vals, dp.sf = dp.ts[:0], dp.vals[:0], dp.sf[:0]
+	e.decPool.Put(dp)
 }
 
 // prefetchConcurrency bounds the parallel part decodes a single fetch's prefetch issues.
