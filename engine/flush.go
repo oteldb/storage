@@ -147,9 +147,16 @@ const (
 // (age-tiered precision, set by the merge engine for cold data); 0 keeps it lossless.
 func writePart(
 	ctx context.Context, b backend.Backend, prefix string, cols *flushColumns,
-	comp *RecompressSpec, precisionBits uint8, writeStats bool,
+	comp *RecompressSpec, precisionBits uint8, writeStats bool, blockRows int,
 ) error {
-	opts := []block.PartOption{block.WithSortKey(colTs)}
+	if blockRows <= 0 {
+		blockRows = DefaultMetricBlockRows
+	}
+
+	// Block the ts/value/sf columns at blockRows so the engine can decode only the blocks a query
+	// touches; the block size also drives the marks granules (WithGranuleSize). The series id column
+	// (RLE) is not blocked — it is read whole when the part is opened to build the row-range index.
+	opts := []block.PartOption{block.WithSortKey(colTs), block.WithGranuleSize(blockRows)}
 	if comp != nil {
 		opts = append(opts, block.WithCompression(comp.Algorithm), block.WithCompressionLevel(comp.Level))
 	}
@@ -159,7 +166,7 @@ func writePart(
 		return err
 	}
 
-	if err := w.AddColumn(block.Column{Name: colTs, Kind: block.KindInt64, Codec: chunk.CodecDoD, Int64: cols.ts}); err != nil {
+	if err := w.AddColumn(block.Column{Name: colTs, Kind: block.KindInt64, Codec: chunk.CodecDoD, Int64: cols.ts, Block: true}); err != nil {
 		return err
 	}
 
@@ -169,7 +176,7 @@ func writePart(
 	// encoding for cold data, traded against lossless Gorilla so it is never worse.
 	if err := w.AddColumn(block.Column{
 		Name: colValue, Kind: block.KindFloat64, Float64: cols.value,
-		AutoCodec: true, FloatPrecisionBits: precisionBits,
+		AutoCodec: true, FloatPrecisionBits: precisionBits, Block: true,
 	}); err != nil {
 		return err
 	}
@@ -179,7 +186,7 @@ func writePart(
 	// column to weight 1). A constant column (e.g. a whole part sampled at one factor) collapses to
 	// a single manifest value with no data object.
 	if cols.sf != nil {
-		if err := w.AddColumn(block.Column{Name: colSF, Kind: block.KindFloat64, Float64: cols.sf}); err != nil {
+		if err := w.AddColumn(block.Column{Name: colSF, Kind: block.KindFloat64, Float64: cols.sf, Block: true}); err != nil {
 			return err
 		}
 	}

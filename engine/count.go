@@ -84,28 +84,8 @@ func (p *enginePlan) countActive(ctx context.Context, ids []signal.SeriesID, e *
 			continue
 		}
 
-		dp, err := e.decodeOf(ctx, part, colNeed{})
-		if err != nil {
+		if err := p.markEdgePart(ctx, e, part, ids, active); err != nil {
 			return 0, err
-		}
-
-		for i, id := range ids {
-			if active[i] {
-				continue
-			}
-
-			rng, ok := part.index.lookup(id)
-			if !ok {
-				continue
-			}
-
-			// dp.ts[rng.start:rng.end] is sorted ascending; lowerBound finds the first index ≥ start.
-			rel := lowerBound(dp.ts[rng.start:rng.end], p.start)
-			abs := rng.start + rel
-
-			if abs < rng.end && dp.ts[abs] <= p.end {
-				active[i] = true
-			}
 		}
 	}
 
@@ -137,6 +117,55 @@ func intersectMark(ids, partIDs []signal.SeriesID, active []bool) {
 			j++
 		}
 	}
+}
+
+// markEdgePart marks every still-inactive matched series in a partially-covered part that has an
+// in-window sample. It decodes only the blocks those series' row runs touch (series-skip) and only
+// the timestamp column (count never reads values), then binary-searches each run for a sample in
+// [start, end].
+func (p *enginePlan) markEdgePart(ctx context.Context, e *Engine, part *part, ids []signal.SeriesID, active []bool) error {
+	type idRange struct {
+		i   int
+		rng rowRange
+	}
+
+	var matched []idRange
+
+	for i, id := range ids {
+		if active[i] {
+			continue
+		}
+
+		if rng, ok := part.index.lookup(id); ok {
+			matched = append(matched, idRange{i: i, rng: rng})
+		}
+	}
+
+	if len(matched) == 0 {
+		return nil
+	}
+
+	ranges := make([]rowRange, len(matched))
+	for k := range matched {
+		ranges[k] = matched[k].rng
+	}
+
+	dp, err := e.decodeOf(ctx, part, colNeed{}, ranges)
+	if err != nil {
+		return err
+	}
+
+	for _, m := range matched {
+		// dp.ts[rng.start:rng.end] is sorted ascending; lowerBound finds the first index ≥ start.
+		rel := lowerBound(dp.ts[m.rng.start:m.rng.end], p.start)
+		abs := m.rng.start + rel
+
+		if abs < m.rng.end && dp.ts[abs] <= p.end {
+			active[m.i] = true
+		}
+	}
+
+	return nil
 }
 
 // seriesIndex returns the index of id in the sorted ids slice, or -1.

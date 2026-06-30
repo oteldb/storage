@@ -311,6 +311,126 @@ func (p *part) decodeInto(ctx context.Context, reuse *decodedPart, need colNeed)
 	return reuse, nil
 }
 
+// decodeRangesInto decodes only the column blocks spanning ranges (the matched series' row runs) into
+// reuse — the series-skip path: a query touching a fraction of a part's series decodes a fraction of
+// its column blocks instead of the whole column. The returned columns are full-length with only the
+// spanned blocks populated; the caller reads only the matched series' rows, which lie in those blocks.
+// A nil ranges, or a part whose ts column is not blocked (a pre-block part, or a tiny constant column),
+// falls back to the whole-column decode.
+func (p *part) decodeRangesInto(ctx context.Context, reuse *decodedPart, need colNeed, ranges []rowRange) (*decodedPart, error) {
+	if ranges == nil {
+		return p.decodeInto(ctx, reuse, need)
+	}
+
+	tsCol, err := p.reader.Column(ctx, colTs)
+	if err != nil {
+		return nil, err
+	}
+
+	if !tsCol.Blocked() {
+		return p.decodeInto(ctx, reuse, need)
+	}
+
+	blockRows, err := tsCol.BlockRows()
+	if err != nil {
+		return nil, err
+	}
+
+	blocks := neededBlocks(ranges, blockRows, p.rows())
+
+	var tsDst []int64
+
+	var valDst, sfDst []float64
+
+	if reuse != nil {
+		tsDst, valDst, sfDst = reuse.ts, reuse.vals, reuse.sf
+	}
+
+	ts, err := tsCol.DecodeBlocksInt64(tsDst, blocks)
+	if err != nil {
+		return nil, err
+	}
+
+	var vals, sf []float64
+
+	if need.values {
+		if vals, sf, err = p.decodeValueBlocks(ctx, valDst, sfDst, blocks); err != nil {
+			return nil, err
+		}
+	}
+
+	if reuse == nil {
+		return &decodedPart{ts: ts, vals: vals, sf: sf, haveValues: need.values}, nil
+	}
+
+	reuse.ts, reuse.haveValues = ts, need.values
+
+	if need.values {
+		reuse.vals, reuse.sf = vals, sf
+	}
+
+	return reuse, nil
+}
+
+// decodeValueBlocks decodes the given blocks of the value column (and the sf column when present)
+// into the reusable destinations, the series-skip analog of [part.decodeValueCols].
+func (p *part) decodeValueBlocks(ctx context.Context, valDst, sfDst []float64, blocks []int) (vals, sf []float64, err error) {
+	valCol, err := p.reader.Column(ctx, colValue)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if vals, err = valCol.DecodeBlocksFloat64(valDst, blocks); err != nil {
+		return nil, nil, err
+	}
+
+	if !p.hasSF {
+		return vals, nil, nil
+	}
+
+	sfCol, err := p.reader.Column(ctx, colSF)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if sf, err = sfCol.DecodeBlocksFloat64(sfDst, blocks); err != nil {
+		return nil, nil, err
+	}
+
+	return vals, sf, nil
+}
+
+// neededBlocks returns the sorted block indices that ranges span, for a column of totalRows rows
+// blocked at blockRows. It is the set of blocks the series-skip decode must materialize.
+func neededBlocks(ranges []rowRange, blockRows, totalRows int) []int {
+	if blockRows <= 0 || totalRows == 0 {
+		return nil
+	}
+
+	nBlocks := (totalRows + blockRows - 1) / blockRows
+	seen := make([]bool, nBlocks)
+
+	for _, rng := range ranges {
+		if rng.start >= rng.end {
+			continue
+		}
+
+		for b := rng.start / blockRows; b <= (rng.end-1)/blockRows; b++ {
+			seen[b] = true
+		}
+	}
+
+	out := make([]int, 0, nBlocks)
+
+	for b, s := range seen {
+		if s {
+			out = append(out, b)
+		}
+	}
+
+	return out
+}
+
 // decodeValueCols decodes the value column — and the scale-factor column when the part carries one —
 // into the given reusable destinations (empty-but-capacity slices on the pooled path, nil for a fresh
 // decode), returning the decoded slices.
