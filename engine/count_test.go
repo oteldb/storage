@@ -66,6 +66,63 @@ func TestCountPushdown(t *testing.T) {
 	assert.Equal(t, want, fetchCount, "Count must match Fetch cardinality")
 }
 
+// TestCountFromIndex exercises the fully-covered-part shortcut: a part whose [minTime, maxTime]
+// falls inside the query window contributes its matched series straight from the part index with no
+// column decode, while a window-edge part still decodes and binary-searches. The scenario spans
+// three parts so a single query hits all three regimes — pruned, fully covered, and partial — and a
+// series living in two parts proves cross-part dedup. Count must agree with a full Fetch+drain in
+// every window, the same contract that guards the decode path.
+func TestCountFromIndex(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := engine.New(engine.Config{Backend: backend.Memory(), Prefix: "t/count-index"})
+
+	a := mkSeries("__name__", "node_x", "host", "a")
+	b := mkSeries("__name__", "node_x", "host", "b")
+	c := mkSeries("__name__", "node_x", "host", "c")
+	d := mkSeries("__name__", "node_x", "host", "d")
+
+	// part1 [100,110]: a, b. part2 [200,210]: a (again), c. part3 [300,310]: b (again), d.
+	mustAppend(t, e, a, 100, 1)
+	mustAppend(t, e, b, 110, 2)
+	require.NoError(t, e.Flush(ctx))
+
+	mustAppend(t, e, a, 200, 3)
+	mustAppend(t, e, c, 210, 4)
+	require.NoError(t, e.Flush(ctx))
+
+	mustAppend(t, e, b, 300, 5)
+	mustAppend(t, e, d, 310, 6)
+	require.NoError(t, e.Flush(ctx))
+
+	require.Equal(t, 3, e.PartCount(), "three flushes ⇒ three parts, so the multi-part regimes are real")
+
+	matcher := []fetch.Matcher{eqMatcher("__name__", "node_x")}
+
+	// Whole range: all three parts fully covered (intersectMark path); a and b each live in two
+	// parts yet count once — distinct series a, b, c, d.
+	all := fetch.Request{Start: 0, End: 1000, Matchers: matcher}
+	got, err := e.Count(ctx, all)
+	require.NoError(t, err)
+	assert.Equal(t, 4, got, "a,b,c,d distinct across fully-covered parts (dedup a,b)")
+	assert.Equal(t, len(fetchAll(t, e, all)), got, "Count must match Fetch over fully-covered parts")
+
+	// [105,250]: part1 partial (a@100 excluded, b@110 kept → decode path), part2 fully covered
+	// (a@200, c@210 → intersectMark), part3 time-pruned (minTime 300 > 250). Distinct: a, b, c.
+	mixed := fetch.Request{Start: 105, End: 250, Matchers: matcher}
+	gotMixed, err := e.Count(ctx, mixed)
+	require.NoError(t, err)
+	assert.Equal(t, 3, gotMixed, "b (part1 edge), a & c (part2 covered); d pruned")
+	assert.Equal(t, len(fetchAll(t, e, mixed)), gotMixed, "Count must match Fetch across edge+covered+pruned")
+
+	// A window landing strictly between parts covers nothing.
+	gap := fetch.Request{Start: 120, End: 190, Matchers: matcher}
+	gotGap, err := e.Count(ctx, gap)
+	require.NoError(t, err)
+	assert.Equal(t, 0, gotGap, "no samples in the inter-part gap")
+}
+
 // reMatcher lowers a PromQL-style regex matcher (value matches re) to a fetch.Matcher over the
 // typed value's canonical text projection — the same lowering query/promql.PushableMatchers applies
 // for `__name__=~"node_.+"` (the full_scan_count query).
