@@ -72,10 +72,11 @@ func (p *enginePlan) countActive(ctx context.Context, ids []signal.SeriesID, e *
 	// present, each with a non-empty row run, and every sample of a present series lies within the
 	// part's [minTime, maxTime] ⊆ [start, end]. So a fully-covered part's contribution is just the
 	// matched ids present in it: a linear intersection of the two sorted id slices with zero column
-	// decode. A partially-overlapping part (a window edge) still decodes its timestamp run and
-	// binary-searches for an in-window sample. Since planFetch already time-prunes disjoint parts, a
-	// typical count's parts are either pruned or fully covered, collapsing decode to at most the two
-	// window-edge parts.
+	// decode. A partially-overlapping part (a window edge) decodes its timestamp column only
+	// (colNeed{} skips the value column count never reads) and binary-searches for an in-window
+	// sample. Since planFetch already time-prunes disjoint parts, a typical count's parts are either
+	// pruned or fully covered, collapsing decode to at most the two window-edge parts — and even
+	// those decode no values.
 	for _, part := range p.liveParts {
 		if part.minTime >= p.start && part.maxTime <= p.end {
 			intersectMark(ids, part.index.ids, active)
@@ -83,7 +84,7 @@ func (p *enginePlan) countActive(ctx context.Context, ids []signal.SeriesID, e *
 			continue
 		}
 
-		dp, err := e.decodeOf(ctx, part)
+		dp, err := e.decodeOf(ctx, part, colNeed{})
 		if err != nil {
 			return 0, err
 		}

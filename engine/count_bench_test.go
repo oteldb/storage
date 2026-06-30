@@ -78,6 +78,49 @@ func BenchmarkCountPushdown(b *testing.B) {
 	}
 }
 
+// BenchmarkCountColumnPrune measures the column-need pruning win on the count decode path. A count
+// whose window only partially overlaps the part (so the fully-covered index shortcut does NOT apply)
+// must decode the part to test in-window existence — but it reads only timestamps, so it skips the
+// Gorilla-XOR value column. The window starts mid-part to force the partial-overlap decode of the
+// whole part.
+func BenchmarkCountColumnPrune(b *testing.B) {
+	ctx := context.Background()
+
+	const series, samples, stepSec, parts = 5000, 30, 15, 1
+
+	ser, ids := buildNamedSeries(series, "node_disk_read_bytes_total")
+	e := engine.New(engine.Config{Backend: backend.Memory(), Prefix: "bench/prune", MaxPartBytes: 0})
+	flushParts(b, ctx, e, ser, ids, samples, stepSec, parts)
+
+	// Start mid-part (> the part's minTime of 0) so the part is partially covered → decode path, not
+	// the zero-decode fully-covered shortcut. End is open so the part's maxTime is inside the window.
+	req := fetch.Request{
+		Start:    int64(samples*stepSec) / 2,
+		End:      1 << 62,
+		Matchers: []fetch.Matcher{eqMatcher("__name__", "node_disk_read_bytes_total")},
+	}
+
+	want, err := e.Count(ctx, req)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	if want == 0 {
+		b.Fatal("window covers no samples; the decode path would be trivial — adjust bounds")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		if n, err := e.Count(ctx, req); err != nil {
+			b.Fatal(err)
+		} else if n != want {
+			b.Fatalf("count=%d want %d", n, want)
+		}
+	}
+}
+
 // countViaFetch is the pre-pushdown path: drain every matched series' batch and count them.
 func countViaFetch(b *testing.B, ctx context.Context, e *engine.Engine, req fetch.Request) int {
 	b.Helper()
