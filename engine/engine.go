@@ -106,6 +106,9 @@ type Engine struct {
 	// recycle is the shared per-engine [fetch.Batch.Release] hook (allocated once), so setting it on
 	// a batch costs nothing per batch. It returns the batch's ts/value buffers to the pools above.
 	recycle func(*fetch.Batch)
+	// fetchDecode is the shared per-fetch decode function (allocated once): the value-needing decode
+	// every fetch/merge per-part miss takes, so planFetch wires it without a per-query closure alloc.
+	fetchDecode decodeFunc
 }
 
 var _ fetch.Fetcher = (*Engine)(nil)
@@ -126,6 +129,11 @@ func New(cfg Config) *Engine {
 	e.recycle = func(b *fetch.Batch) {
 		e.putI64(b.Timestamps)
 		e.putF64(b.Values)
+	}
+	// The fetch/merge decode path always materializes values; bind the column-need once so planFetch
+	// reuses it (no per-query closure alloc).
+	e.fetchDecode = func(ctx context.Context, p *part) (*decodedPart, error) {
+		return e.decodeOf(ctx, p, colNeed{values: true})
 	}
 
 	if cfg.WAL != nil {
@@ -979,7 +987,7 @@ func (e *Engine) publishLocked(ctx context.Context) error {
 
 // decodeOf decodes p through the cross-fetch decode cache when enabled: a hit returns the shared
 // (immutable) decoded columns; a miss decodes and caches them. Without a cache it decodes plainly.
-func (e *Engine) decodeOf(ctx context.Context, p *part) (*decodedPart, error) {
+func (e *Engine) decodeOf(ctx context.Context, p *part, need colNeed) (*decodedPart, error) {
 	if e.decodeCache == nil {
 		// No cross-fetch cache: borrow buffers from the free list, decode into them, and mark the
 		// result pooled so the fetch returns it on releaseParts. The merge copies values out, so the
@@ -989,7 +997,7 @@ func (e *Engine) decodeOf(ctx context.Context, p *part) (*decodedPart, error) {
 			dp = &decodedPart{}
 		}
 
-		dp, err := p.decodeInto(ctx, dp)
+		dp, err := p.decodeInto(ctx, dp, need)
 		if err != nil {
 			e.decPool.Put(dp)
 
@@ -1002,10 +1010,15 @@ func (e *Engine) decodeOf(ctx context.Context, p *part) (*decodedPart, error) {
 	}
 
 	if dp, ok := e.decodeCache.get(p.prefix); ok {
-		return dp, nil
+		// A ts-only entry can't satisfy a value-needing read: fall through to a full decode that
+		// replaces it (so subsequent value and ts reads both hit the complete columns). A ts-only
+		// read is happy with any entry, and a value read with a full entry.
+		if !need.values || dp.haveValues {
+			return dp, nil
+		}
 	}
 
-	dp, err := p.decode(ctx)
+	dp, err := p.decode(ctx, need)
 	if err != nil {
 		return nil, err
 	}
@@ -1052,7 +1065,7 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			_, _ = e.decodeOf(ctx, p)
+			_, _ = e.decodeOf(ctx, p, colNeed{values: true})
 		}(pt)
 	}
 
@@ -1069,7 +1082,7 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 		headB:    make(map[signal.SeriesID]*fetch.Batch, len(ids)),
 		flushB:   make(map[signal.SeriesID]*fetch.Batch, len(ids)),
 		decoded:  make(partDecodeCache),
-		decodeFn: e.decodeOf,
+		decodeFn: e.fetchDecode,
 		engine:   e,
 		start:    r.Start,
 		end:      r.End,

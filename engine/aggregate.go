@@ -227,7 +227,7 @@ func (e *Engine) bucketSeries(
 			}
 		}
 
-		dp, err := e.decodeOf(ctx, p)
+		dp, err := e.decodeOf(ctx, p, colNeed{values: true})
 		if err != nil {
 			return nil, err
 		}
@@ -364,7 +364,7 @@ func (e *Engine) aggViaStats(ctx context.Context, plan *enginePlan, id signal.Se
 
 		// No sidecar (a pre-sidecar or sampled part): decode this part's run and fold it. Coverage
 		// is full (safe), so the whole run is in range.
-		dp, err := e.decodeOf(ctx, p)
+		dp, err := e.decodeOf(ctx, p, colNeed{values: true})
 		if err != nil {
 			return agg, err
 		}
