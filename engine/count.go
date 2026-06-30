@@ -67,9 +67,22 @@ func (p *enginePlan) countActive(ctx context.Context, ids []signal.SeriesID, e *
 		markBatchInWindow(b, p.start, p.end, mark)
 	}
 
-	// Parts: decode once each (shared, pooled), then binary-search each still-inactive matched
-	// series' timestamp run for the first sample ≥ start; if it is also ≤ end the series is active.
+	// Parts: a part whose sample bounds fall entirely inside [start, end] guarantees that every
+	// matched series it holds has an in-window sample — buildPartIndex records only ids actually
+	// present, each with a non-empty row run, and every sample of a present series lies within the
+	// part's [minTime, maxTime] ⊆ [start, end]. So a fully-covered part's contribution is just the
+	// matched ids present in it: a linear intersection of the two sorted id slices with zero column
+	// decode. A partially-overlapping part (a window edge) still decodes its timestamp run and
+	// binary-searches for an in-window sample. Since planFetch already time-prunes disjoint parts, a
+	// typical count's parts are either pruned or fully covered, collapsing decode to at most the two
+	// window-edge parts.
 	for _, part := range p.liveParts {
+		if part.minTime >= p.start && part.maxTime <= p.end {
+			intersectMark(ids, part.index.ids, active)
+
+			continue
+		}
+
 		dp, err := e.decodeOf(ctx, part)
 		if err != nil {
 			return 0, err
@@ -103,6 +116,26 @@ func (p *enginePlan) countActive(ctx context.Context, ids []signal.SeriesID, e *
 	}
 
 	return n, nil
+}
+
+// intersectMark sets active[i]=true for every ids[i] that also appears in partIDs. Both slices are
+// ascending by SeriesID.Compare (ids from head.resolve, partIDs from the part index), so a single
+// linear two-pointer merge suffices — no per-id binary search. It is the fully-covered-part count
+// shortcut: presence in such a part already implies an in-window sample, so no decode is needed.
+func intersectMark(ids, partIDs []signal.SeriesID, active []bool) {
+	i, j := 0, 0
+	for i < len(ids) && j < len(partIDs) {
+		switch c := ids[i].Compare(partIDs[j]); {
+		case c < 0:
+			i++
+		case c > 0:
+			j++
+		default:
+			active[i] = true
+			i++
+			j++
+		}
+	}
 }
 
 // seriesIndex returns the index of id in the sorted ids slice, or -1.
