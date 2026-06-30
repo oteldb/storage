@@ -123,6 +123,50 @@ func TestCountFromIndex(t *testing.T) {
 	assert.Equal(t, 0, gotGap, "no samples in the inter-part gap")
 }
 
+// TestCountColumnPruningCache pins the column-need cache contract: a count over a window-edge part
+// decodes timestamps only (colNeed{}) and may cache a ts-only entry; a later value-needing Fetch
+// hitting the same part must NOT be served that ts-only entry with an absent value column — it must
+// upgrade to a full decode and return correct values. Run with the cross-fetch decode cache enabled
+// so both queries share the part's cache entry.
+func TestCountColumnPruningCache(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := engine.New(engine.Config{
+		Backend: backend.Memory(), Prefix: "t/count-prune", DecodeCacheBytes: 1 << 20,
+	})
+
+	s := mkSeries("__name__", "node_x", "host", "a")
+	mustAppend(t, e, s, 10, 1)
+	mustAppend(t, e, s, 20, 2)
+	mustAppend(t, e, s, 30, 3)
+	require.NoError(t, e.Flush(ctx)) // one part [10,30]
+
+	if _, ok := e.DecodeCacheStats(); !ok {
+		t.Fatal("decode cache must be enabled for this test")
+	}
+
+	matcher := []fetch.Matcher{eqMatcher("__name__", "node_x")}
+
+	// Count over a window that only partially overlaps the part (10 < 15) forces the ts-only decode
+	// path and populates a ts-only cache entry for the part.
+	got, err := e.Count(ctx, fetch.Request{Start: 15, End: 100, Matchers: matcher})
+	require.NoError(t, err)
+	assert.Equal(t, 1, got, "samples at ts=20,30 fall in [15,100]")
+
+	// Now a value-needing Fetch over the same part. If the ts-only entry poisoned the cache, Values
+	// would come back empty/garbage; the upgrade-to-full decode must return the real samples.
+	batches := fetchAll(t, e, fetch.Request{Start: 0, End: 100, Matchers: matcher})
+	require.Len(t, batches, 1)
+	assert.Equal(t, []int64{10, 20, 30}, batches[0].Timestamps)
+	assert.Equal(t, []float64{1, 2, 3}, batches[0].Values, "value column must be present after ts-only count")
+
+	// And a subsequent count hits the now-full entry and still counts correctly (no downgrade).
+	got2, err := e.Count(ctx, fetch.Request{Start: 0, End: 100, Matchers: matcher})
+	require.NoError(t, err)
+	assert.Equal(t, 1, got2)
+}
+
 // reMatcher lowers a PromQL-style regex matcher (value matches re) to a fetch.Matcher over the
 // typed value's canonical text projection — the same lowering query/promql.PushableMatchers applies
 // for `__name__=~"node_.+"` (the full_scan_count query).

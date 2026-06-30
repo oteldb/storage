@@ -211,14 +211,29 @@ func (p *part) rows() int {
 	return p.index.total
 }
 
-// decodedPart is a part's columns decoded once: the full ts and value columns (and the scale
-// factors when present), indexed by the part's per-series row ranges. One decode is shared
-// across every series a fetch or merge reads from the part — decoding the whole column is
-// O(rows), so doing it per series would be O(series × rows), the dominant fetch allocation.
+// colNeed selects which of a part's columns a decode materializes beyond the always-decoded
+// timestamp column. A query reading only sample existence/time (count, count_over_time) needs no
+// values; one reading samples (raw selection, rate, aggregates) needs the value column — and the
+// scale-factor column when the part carries one. The zero value decodes timestamps only, skipping
+// the Gorilla-XOR value decode that such queries never read.
+type colNeed struct {
+	values bool
+}
+
+// decodedPart is a part's columns decoded once: the timestamp column plus the value column (and the
+// scale factors when present) when the decode requested them, indexed by the part's per-series row
+// ranges. One decode is shared across every series a fetch or merge reads from the part — decoding
+// the whole column is O(rows), so doing it per series would be O(series × rows), the dominant fetch
+// allocation.
 type decodedPart struct {
 	ts   []int64
 	vals []float64
 	sf   []float64 // nil when the part has no scale-factor column (every weight is 1)
+	// haveValues reports whether the value (and scale-factor) columns are decoded. A ts-only decode
+	// (colNeed{}) leaves them unpopulated and haveValues false; the cross-fetch decode cache reads
+	// it to tell a ts-only entry from a full one, so a later value-needing query never slices an
+	// absent value column out of a ts-only cache hit.
+	haveValues bool
 	// pooled marks a decodedPart whose slices came from the engine's decode-buffer pool (the
 	// no-cross-fetch-cache path). The fetch returns it to the pool on releaseParts; safe because the
 	// merge copies values out, so no result batch aliases these slices.
@@ -234,25 +249,35 @@ func (d *decodedPart) bytes() int64 {
 // cross-fetch decode cache ([Engine.decodeOf]).
 type decodeFunc func(context.Context, *part) (*decodedPart, error)
 
-// decodePart decodes p with no caching — used by the merge path, whose source parts are about to be
-// retired and so must not populate the decode cache.
-func decodePart(ctx context.Context, p *part) (*decodedPart, error) { return p.decode(ctx) }
-
-// decode reads and decodes the part's ts / value (/ sf) columns once.
-func (p *part) decode(ctx context.Context) (*decodedPart, error) {
-	return p.decodeInto(ctx, nil)
+// decodePart decodes p (all columns) with no caching — used by the merge path, whose source parts
+// are about to be retired and so must not populate the decode cache.
+func decodePart(ctx context.Context, p *part) (*decodedPart, error) {
+	return p.decode(ctx, colNeed{values: true})
 }
 
-// decodeInto decodes the part's columns, reusing reuse's slices as decode destinations when reuse is
-// non-nil (so a pooled buffer of sufficient capacity is filled without allocating). reuse == nil
-// allocates fresh. Returns reuse (mutated) or a new decodedPart.
-func (p *part) decodeInto(ctx context.Context, reuse *decodedPart) (*decodedPart, error) {
+// decode reads and decodes the part's timestamp column (and, when need.values, the value/sf columns)
+// once.
+func (p *part) decode(ctx context.Context, need colNeed) (*decodedPart, error) {
+	return p.decodeInto(ctx, nil, need)
+}
+
+// decodeInto decodes the part's columns per need, reusing reuse's slices as decode destinations when
+// reuse is non-nil (so a pooled buffer of sufficient capacity is filled without allocating). reuse ==
+// nil allocates fresh. A ts-only decode (need.values false) skips the value/sf columns entirely and,
+// on the reuse path, leaves reuse's value/sf buffers intact (unread, since haveValues is false) so
+// their capacity survives for the next value-needing decode that reuses the slot. Returns reuse
+// (mutated) or a new decodedPart.
+func (p *part) decodeInto(ctx context.Context, reuse *decodedPart, need colNeed) (*decodedPart, error) {
 	var tsDst []int64
 
 	var valDst, sfDst []float64
 
 	if reuse != nil {
-		tsDst, valDst, sfDst = reuse.ts[:0], reuse.vals[:0], reuse.sf[:0]
+		tsDst = reuse.ts[:0]
+
+		if need.values {
+			valDst, sfDst = reuse.vals[:0], reuse.sf[:0]
+		}
 	}
 
 	tsCol, err := p.reader.Column(ctx, colTs)
@@ -265,36 +290,54 @@ func (p *part) decodeInto(ctx context.Context, reuse *decodedPart) (*decodedPart
 		return nil, err
 	}
 
-	valCol, err := p.reader.Column(ctx, colValue)
-	if err != nil {
-		return nil, err
-	}
+	var vals, sf []float64
 
-	vals, err := valCol.Float64(valDst)
-	if err != nil {
-		return nil, err
-	}
-
-	var sf []float64
-
-	if p.hasSF {
-		sfCol, err := p.reader.Column(ctx, colSF)
-		if err != nil {
-			return nil, err
-		}
-
-		if sf, err = sfCol.Float64(sfDst); err != nil {
+	if need.values {
+		if vals, sf, err = p.decodeValueCols(ctx, valDst, sfDst); err != nil {
 			return nil, err
 		}
 	}
 
 	if reuse == nil {
-		return &decodedPart{ts: ts, vals: vals, sf: sf}, nil
+		return &decodedPart{ts: ts, vals: vals, sf: sf, haveValues: need.values}, nil
 	}
 
-	reuse.ts, reuse.vals, reuse.sf = ts, vals, sf
+	reuse.ts, reuse.haveValues = ts, need.values
+
+	if need.values {
+		reuse.vals, reuse.sf = vals, sf
+	}
 
 	return reuse, nil
+}
+
+// decodeValueCols decodes the value column — and the scale-factor column when the part carries one —
+// into the given reusable destinations (empty-but-capacity slices on the pooled path, nil for a fresh
+// decode), returning the decoded slices.
+func (p *part) decodeValueCols(ctx context.Context, valDst, sfDst []float64) (vals, sf []float64, err error) {
+	valCol, err := p.reader.Column(ctx, colValue)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if vals, err = valCol.Float64(valDst); err != nil {
+		return nil, nil, err
+	}
+
+	if !p.hasSF {
+		return vals, nil, nil
+	}
+
+	sfCol, err := p.reader.Column(ctx, colSF)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if sf, err = sfCol.Float64(sfDst); err != nil {
+		return nil, nil, err
+	}
+
+	return vals, sf, nil
 }
 
 // mergeSeriesInto adds series row-range rng's samples within [start, end] to m, slicing the

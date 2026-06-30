@@ -66,7 +66,7 @@ func BenchmarkDecodeResident(b *testing.B) {
 			var before runtime.MemStats
 			runtime.ReadMemStats(&before)
 
-			d, err := p.decode(ctx)
+			d, err := p.decode(ctx, colNeed{values: true})
 			if err != nil {
 				b.Fatal(err)
 			}
