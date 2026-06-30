@@ -373,7 +373,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 	// Reserve this fetch's decode footprint from the memory budget (blocks under concurrency
 	// pressure), off the engine lock, before any part is decoded. A fetch materializes ts+value.
-	plan.acquireDecodeBudget(colNeed{values: true})
+	plan.acquireDecodeBudget(colNeed{values: true}, true)
 
 	// Prefetch: decode the parts this fetch will touch concurrently (and cache them), so their
 	// backend reads + decodes overlap instead of happening one part at a time during the merge.
@@ -450,16 +450,20 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 // (ref-held) in-window parts still to read, plus each series' identity and its already-snapshotted head
 // and mid-flush samples. Its [enginePlan.mergeSeries] does the part reads off the lock.
 type enginePlan struct {
-	ids         []signal.SeriesID
-	series      map[signal.SeriesID]signal.Series
-	headB       map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
-	flushB      map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
-	recentB     map[signal.SeriesID]*fetch.Batch // recent-tier samples (the in-RAM flush window)
-	liveParts   []*part
-	decoded     partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
-	engine      *Engine         // for returning pooled decode buffers on release
-	budgetBytes int64           // decode-memory budget reserved for this query; released on releaseParts
-	start, end  int64
+	ids       []signal.SeriesID
+	series    map[signal.SeriesID]signal.Series
+	headB     map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
+	flushB    map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
+	recentB   map[signal.SeriesID]*fetch.Batch // recent-tier samples (the in-RAM flush window)
+	liveParts []*part
+	decoded   partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
+	// blockReaders streams a part's matched series straight from cached column blocks (no whole-part
+	// decodedPart); a part absent from the map (cache off, or a const/legacy-unblocked column) uses
+	// the decoded-part path instead. Built once in planFetch.
+	blockReaders map[*part]*seriesBlockReader
+	engine       *Engine // for returning pooled decode buffers on release
+	budgetBytes  int64   // decode-memory budget reserved for this query; released on releaseParts
+	start, end   int64
 }
 
 // mergeSeries gathers series id's samples lock-free: each acquired part oldest→newest, then the
@@ -508,6 +512,16 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 			continue
 		}
 
+		// Block-sliceable part with a cache: stream the series' rows straight from cached blocks (no
+		// whole-part decodedPart). Otherwise decode the part once (memoized) and slice it.
+		if r := p.blockReaders[part]; r != nil {
+			if err := r.addRange(ctx, rng, &m, p.start, p.end); err != nil {
+				return m, err
+			}
+
+			continue
+		}
+
 		d, err := p.decodePart(ctx, part)
 		if err != nil {
 			return m, err
@@ -536,12 +550,16 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 // decode-memory budget, blocking until it fits (or admitting it alone when it exceeds the whole
 // budget). It must run off the engine lock and after planFetch (it needs liveParts); releaseParts
 // returns the reservation. A nil budget makes it a no-op.
-func (p *enginePlan) acquireDecodeBudget(need colNeed) {
+// acquireDecodeBudget reserves this query's decode footprint. blockSliced is set by the fetch path,
+// which streams from cached blocks and so materializes no whole-part buffer — those parts are
+// excluded from the estimate; the count/aggregate paths (blockSliced false) decode whole parts and
+// count them all.
+func (p *enginePlan) acquireDecodeBudget(need colNeed, blockSliced bool) {
 	if p.engine.budget == nil {
 		return
 	}
 
-	p.budgetBytes = p.decodeEstimate(need)
+	p.budgetBytes = p.decodeEstimate(need, blockSliced)
 	p.engine.budget.acquire(p.budgetBytes)
 }
 
@@ -550,10 +568,16 @@ func (p *enginePlan) acquireDecodeBudget(need colNeed) {
 // A decoded column is one int64/float64 per row, so 8 bytes/row/column. It is an upper bound — the
 // per-fetch decodedPart is sized to the part's full row count even for a sparse selector — so the
 // budget reservation matches the resident footprint it caps.
-func (p *enginePlan) decodeEstimate(need colNeed) int64 {
+func (p *enginePlan) decodeEstimate(need colNeed, blockSliced bool) int64 {
 	var total int64
 
 	for _, part := range p.liveParts {
+		// A block-sliced part holds no whole-part buffer (the merge views cached blocks), so it adds
+		// nothing to the transient the budget caps.
+		if blockSliced && p.blockReaders[part] != nil {
+			continue
+		}
+
 		cols := int64(1) // timestamps
 		if need.values {
 			cols++ // values
@@ -1168,8 +1192,15 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			// Warm only the blocks this fetch's matched series touch, then return the throwaway
-			// assembled buffer to the pool (the cache holds the decoded blocks, not this dp).
+			// Warm only the blocks this fetch's matched series touch. A block-sliceable part decodes
+			// its blocks straight into the cache (no whole-part buffer); otherwise fall back to the
+			// decoded-part path and return the throwaway buffer to the pool.
+			if r := plan.blockReaders[p]; r != nil {
+				_ = r.warm(ctx, plan.rangesFor(p))
+
+				return
+			}
+
 			dp, err := e.decodeOf(ctx, p, colNeed{values: true}, plan.rangesFor(p))
 			if err == nil {
 				e.recycleDecoded(dp)
@@ -1178,6 +1209,28 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 	}
 
 	wg.Wait()
+}
+
+// acquireWindowParts acquires every live part overlapping [start, end] into the plan (time-pruning
+// the rest) and, when the block cache is on, builds a per-part block reader for each block-sliceable
+// part. Caller holds e.mu.
+func (e *Engine) acquireWindowParts(p *enginePlan, start, end int64) {
+	if e.blockCache != nil {
+		p.blockReaders = make(map[*part]*seriesBlockReader, len(e.parts))
+	}
+
+	for _, pt := range e.parts {
+		if pt.maxTime < start || pt.minTime > end { // time-prune
+			continue
+		}
+
+		pt.acquire()
+		p.liveParts = append(p.liveParts, pt)
+
+		if br := e.newSeriesBlockReader(pt); br != nil {
+			p.blockReaders[pt] = br
+		}
+	}
 }
 
 // planFetch selects and acquires the in-window parts and snapshots each series' head + mid-flush
@@ -1197,17 +1250,8 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 
 	// The recent tier short-circuit: when the query range falls inside the tier's window, the tier ∪
 	// the mid-flush buffers ∪ the head cover it entirely, so no part is acquired or decoded.
-	skipParts := e.recentEnabled() && r.Start >= e.recentMin
-
-	if !skipParts {
-		for _, part := range e.parts {
-			if part.maxTime < r.Start || part.minTime > r.End { // time-prune
-				continue
-			}
-
-			part.acquire()
-			p.liveParts = append(p.liveParts, part)
-		}
+	if !e.recentEnabled() || r.Start < e.recentMin {
+		e.acquireWindowParts(p, r.Start, r.End)
 	}
 
 	for _, id := range ids {

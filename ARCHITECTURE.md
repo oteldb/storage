@@ -524,11 +524,17 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   unset, so the sealing bound — and thus the bounded merge — applies by default.
 - **Fetch** (`engine.go`) implements the fetch contract: it resolves matchers to series
   over the index, then merges each series' head buffer ∪ every part by timestamp into one
-  batch. Each part is **decoded once per fetch** (a per-fetch memo), **series-skipped**: it decodes
-  only the column blocks the fetch's matched series' row ranges touch (`neededBlocks` →
-  `DecodeBlocksInt64/Float64`), so a sparse selector over a blocked part decodes a fraction of its
-  columns instead of the whole part (≈3–4× less decode for a single-series selector over a many-series
-  part). When a per-tenant **decode cache** is configured (`Config.DecodeCacheBytes`, `blockcache.go`)
+  batch. With the block cache on and block-framed parts, the merge is **block-sliced**
+  (`seriesblocks.go`): for each matched series it slices the spanning column blocks **straight from
+  the cache** (decoding+caching a miss) and adds them to the per-series merge as *views* into the
+  immutable cached blocks — it **never materializes a whole-part `decodedPart`**, so the per-fetch
+  transient is the result, not the decoded columns (the concurrency RSS cliff `growLen` showed). The
+  cached block stays reachable through the merge run until `collect` copies the samples out; a one
+  block-per-column memo keeps consecutive same-block series from re-locking the cache. A cache-off
+  engine, or a constant/legacy-unblocked column, falls back to decoding the part once per fetch (a
+  per-fetch memo), **series-skipped**: it decodes only the blocks the matched series' row ranges
+  touch (`neededBlocks` → `DecodeBlocksInt64/Float64`), so a sparse selector decodes a fraction of the
+  columns (≈3–4× less for a single-series selector over a many-series part). When a per-tenant **decode cache** is configured (`Config.DecodeCacheBytes`, `blockcache.go`)
   those decoded blocks are also memoized *across* fetches: a byte-bounded LRU keyed by **`(part prefix,
   column, block index)`**, so the resident set is the *useful* blocks across live parts rather than
   every whole part touched, and an overlapping query reuses already-decoded blocks (columns cache
