@@ -298,6 +298,62 @@ func decodeBlockedRange[T any](
 	return out[relLo:relHi], nil
 }
 
+// Decoder decodes individual blocks of a blocked column, parsing the directory once so a caller
+// that decodes several blocks (e.g. a per-block cache filling its misses) does not re-parse it per
+// block. Obtain one via [ColumnReader.Decoder]; it holds the column's already-read object.
+type Decoder struct {
+	dir  blockDir
+	rows int
+	comp *compress.Compressor
+	i64  func([]int64, []byte) ([]int64, int, error)
+	f64  func([]float64, []byte) ([]float64, int, error)
+}
+
+// NumBlocks returns the column's block count.
+func (d *Decoder) NumBlocks() int { return d.dir.nBlocks() }
+
+// BlockRows returns the column's nominal block size in rows.
+func (d *Decoder) BlockRows() int { return d.dir.blockRows }
+
+// BlockSpan returns block blk's half-open row range [lo, hi) in the column.
+func (d *Decoder) BlockSpan(blk int) (lo, hi int) {
+	lo = blk * d.dir.blockRows
+
+	return lo, min(lo+d.dir.blockRows, d.rows)
+}
+
+// DecodeInt64 decodes block blk into a fresh slice (for an int64 column).
+func (d *Decoder) DecodeInt64(blk int) ([]int64, error) {
+	return decodeOneBlock(d.dir, d.comp, blk, d.i64)
+}
+
+// DecodeFloat64 decodes block blk into a fresh slice (for a float64 column).
+func (d *Decoder) DecodeFloat64(blk int) ([]float64, error) {
+	return decodeOneBlock(d.dir, d.comp, blk, d.f64)
+}
+
+// decodeOneBlock decompresses and decodes a single block into a fresh slice.
+func decodeOneBlock[T any](
+	dir blockDir, comp *compress.Compressor, blk int, dec func([]T, []byte) ([]T, int, error),
+) ([]T, error) {
+	if dec == nil {
+		return nil, errors.New("block: nil decoder")
+	}
+
+	if blk < 0 || blk >= dir.nBlocks() {
+		return nil, errors.Errorf("block: block %d out of range [0,%d)", blk, dir.nBlocks())
+	}
+
+	stream, err := comp.Decompress(nil, dir.block(blk))
+	if err != nil {
+		return nil, errors.Wrapf(err, "decompress block %d", blk)
+	}
+
+	out, _, err := dec(nil, stream)
+
+	return out, err
+}
+
 // blockedTsCursor is a forward [chunk.TsCursor] over a blocked int64 column: it decodes one block at
 // a time, opening the next block when the current is exhausted, so it spans block boundaries
 // transparently. Each block is an independent codec stream (its row 0 is absolute), so crossing a

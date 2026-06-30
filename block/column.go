@@ -617,6 +617,27 @@ func (r *ColumnReader) DecodeBlocksInt64(dst []int64, blocks []int) ([]int64, er
 	return out, decodeBlocksInto(dir, r.comp, r.rows, out, blocks, r.int64Decoder())
 }
 
+// BlockDecoder returns a per-block decoder over a blocked column (parsing the directory once), for a
+// caller that decodes individual blocks. It errors on an unblocked column.
+func (r *ColumnReader) BlockDecoder() (*Decoder, error) {
+	if !r.desc.Blocked {
+		return nil, errors.Errorf("block: column %q is not blocked", r.desc.Name)
+	}
+
+	dir, err := parseBlockDir(r.object)
+	if err != nil {
+		return nil, errors.Wrapf(err, "column %q", r.desc.Name)
+	}
+
+	return &Decoder{
+		dir:  dir,
+		rows: r.rows,
+		comp: r.comp,
+		i64:  r.int64Decoder(),
+		f64:  r.float64Decoder(),
+	}, nil
+}
+
 // DecodeBlocksFloat64 is the float64 analog of [ColumnReader.DecodeBlocksInt64].
 func (r *ColumnReader) DecodeBlocksFloat64(dst []float64, blocks []int) ([]float64, error) {
 	if !r.desc.Blocked {

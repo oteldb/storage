@@ -240,11 +240,6 @@ type decodedPart struct {
 	pooled bool
 }
 
-// bytes is the decoded footprint (for the decode cache's budget): 8 bytes per ts/value/sf element.
-func (d *decodedPart) bytes() int64 {
-	return int64(len(d.ts))*8 + int64(len(d.vals))*8 + int64(len(d.sf))*8
-}
-
 // decodeFunc decodes a part's columns — either plainly ([decodePart]) or via the engine's
 // cross-fetch decode cache ([Engine.decodeOf]).
 type decodeFunc func(context.Context, *part) (*decodedPart, error)

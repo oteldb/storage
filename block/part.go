@@ -284,6 +284,18 @@ func (r *PartReader) Column(ctx context.Context, name string) (*ColumnReader, er
 	return newColumnReader(desc, obj, comp, r.manifest.RowCount), nil
 }
 
+// ColumnDescByName returns the named column's descriptor from the already-loaded manifest, without
+// reading the column object — so a caller can check Const/Blocked/Codec before deciding whether to
+// read and decode the column. ok is false for an unknown column.
+func (r *PartReader) ColumnDescByName(name string) (ColumnDesc, bool) {
+	i, ok := r.byName[name]
+	if !ok {
+		return ColumnDesc{}, false
+	}
+
+	return r.manifest.Columns[i], true
+}
+
 // Marks reads and decodes the part's sparse granule index.
 func (r *PartReader) Marks(ctx context.Context) (Marks, error) {
 	raw, err := r.b.Read(ctx, marksKey(r.prefix))

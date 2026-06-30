@@ -33,18 +33,21 @@ func TestDecodeCacheHitsAcrossFetches(t *testing.T) {
 	require.Len(t, first, 1)
 	assert.Len(t, first[0].Timestamps, 50)
 
-	// Re-fetch several times; the part is decoded once and served from the cache thereafter.
+	st0, ok := e.DecodeCacheStats()
+	require.True(t, ok)
+	require.Positive(t, st0.Items, "the fetched part's blocks are cached")
+	missesAfterFirst := st0.Misses
+
+	// Re-fetch several times; the blocks are decoded once and served from the cache thereafter.
 	for range 5 {
 		got := fetchAll(t, e, req)
 		require.Len(t, got, 1)
 		assert.Equal(t, first[0].Values, got[0].Values, "cached decode returns identical data")
 	}
 
-	st, ok := e.DecodeCacheStats()
-	require.True(t, ok)
-	assert.Equal(t, 1, st.Items, "exactly one part cached")
+	st, _ := e.DecodeCacheStats()
 	assert.Positive(t, st.Hits, "later fetches hit the cache")
-	assert.Equal(t, int64(1), st.Misses, "the part is decoded exactly once")
+	assert.Equal(t, missesAfterFirst, st.Misses, "no block is re-decoded after the first fetch")
 }
 
 // TestDecodeCacheEvictsRetiredParts confirms that compaction drops the source parts' decoded
@@ -56,30 +59,34 @@ func TestDecodeCacheEvictsRetiredParts(t *testing.T) {
 	e := cacheEngine()
 	s := mkSeries("job", "api")
 
+	// Two samples per part so the ts/value columns are non-constant (hence block-framed, not collapsed
+	// to a manifest constant — only blocked columns populate the block cache).
 	mustAppend(t, e, s, 10, 1)
+	mustAppend(t, e, s, 11, 2)
 	require.NoError(t, e.Flush(ctx))
-	mustAppend(t, e, s, 20, 2)
+	mustAppend(t, e, s, 20, 3)
+	mustAppend(t, e, s, 21, 4)
 	require.NoError(t, e.Flush(ctx))
 	require.Equal(t, 2, e.PartCount())
 
 	req := fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}}
-	fetchAll(t, e, req) // caches both parts (prefetch warms ≥2 touched parts)
+	fetchAll(t, e, req) // caches both parts' blocks (prefetch warms ≥2 touched parts)
 
 	st, _ := e.DecodeCacheStats()
-	assert.Equal(t, 2, st.Items, "both flushed parts cached")
+	assert.Positive(t, st.Items, "both flushed parts' blocks cached")
 
 	require.NoError(t, e.Merge(ctx, 0)) // compacts to one part, retiring + reclaiming the two sources
 	require.Equal(t, 1, e.PartCount())
 
 	st, _ = e.DecodeCacheStats()
-	assert.Equal(t, 0, st.Items, "retired source parts evicted from the decode cache")
+	assert.Equal(t, 0, st.Items, "retired source parts' blocks evicted from the decode cache")
 
 	got := fetchAll(t, e, req)
 	require.Len(t, got, 1)
-	assert.Equal(t, []int64{10, 20}, got[0].Timestamps, "merged data intact")
+	assert.Equal(t, []int64{10, 11, 20, 21}, got[0].Timestamps, "merged data intact")
 
 	st, _ = e.DecodeCacheStats()
-	assert.Equal(t, 1, st.Items, "the merged part is cached on the next fetch")
+	assert.Positive(t, st.Items, "the merged part's blocks are cached on the next fetch")
 }
 
 // TestDecodeCacheMatchesUncached is a differential check: a cache-enabled engine returns exactly the

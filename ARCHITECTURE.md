@@ -522,20 +522,21 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   unset, so the sealing bound — and thus the bounded merge — applies by default.
 - **Fetch** (`engine.go`) implements the fetch contract: it resolves matchers to series
   over the index, then merges each series' head buffer ∪ every part by timestamp into one
-  batch. Each part is **decoded once per fetch** (a per-fetch memo), and — when a per-tenant
-  **decode cache** is configured (`Config.DecodeCacheBytes`, `decodecache.go`) — once *across*
-  fetches: a byte-bounded LRU of decoded columns keyed by part prefix, valid until the part is
-  retired (reclaim evicts its prefix) or the budget evicts it. A decoded part is immutable (the
-  merge only reads its column slices), so entries are **shared without copying**, even across
-  concurrent fetches. It eliminates the re-decode the object-store read cache (§3a) cannot. On the
-  **no-cache path** the per-part decode is **series-skipped**: it decodes only the column blocks the
-  fetch's matched series' row ranges touch (`neededBlocks` → `DecodeBlocksInt64/Float64`), so a sparse
-  selector over a blocked part decodes a fraction of its columns instead of the whole part (≈3–4× less
-  decode for a single-series selector over a many-series part). The decode-cache path decodes whole
-  parts (an entry is shared across queries whose matched series differ; block-keyed caching is a
-  follow-up). With the cache on, a fetch also **prefetches** the parts it will touch — decoding them
-  concurrently (bounded fan-out) so their backend reads + decodes overlap instead of running one part
-  at a time.
+  batch. Each part is **decoded once per fetch** (a per-fetch memo), **series-skipped**: it decodes
+  only the column blocks the fetch's matched series' row ranges touch (`neededBlocks` →
+  `DecodeBlocksInt64/Float64`), so a sparse selector over a blocked part decodes a fraction of its
+  columns instead of the whole part (≈3–4× less decode for a single-series selector over a many-series
+  part). When a per-tenant **decode cache** is configured (`Config.DecodeCacheBytes`, `blockcache.go`)
+  those decoded blocks are also memoized *across* fetches: a byte-bounded LRU keyed by **`(part prefix,
+  column, block index)`**, so the resident set is the *useful* blocks across live parts rather than
+  every whole part touched, and an overlapping query reuses already-decoded blocks (columns cache
+  independently — a ts-only count and a value-reading fetch over the same part share the ts blocks
+  without the value column ever being decoded). A cached block is an immutable decoded slice; a fetch
+  **copies** the blocks it needs into a pooled per-fetch `decodedPart`, so cache entries are never
+  mutated and stay valid across concurrent fetches. Blocks are dropped when the part is reclaimed
+  (`evictPrefix`) or the budget evicts the coldest. With the cache on, a fetch also **prefetches** the
+  parts it will touch — warming each part's matched blocks concurrently (bounded fan-out) so backend
+  reads + decodes overlap instead of running one part at a time.
   A **recent tier** (`Config.RecentWindow`, `recent.go`) opt-in mirrors the most recent flush window
   in RAM across flushes (the head is drained on every flush, but the tier persists), so a query whose
   `[Start, End]` falls inside the tier's window is served from the tier ∪ the mid-flush buffers ∪ the
