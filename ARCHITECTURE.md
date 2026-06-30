@@ -537,6 +537,14 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   (`evictPrefix`) or the budget evicts the coldest. With the cache on, a fetch also **prefetches** the
   parts it will touch — warming each part's matched blocks concurrently (bounded fan-out) so backend
   reads + decodes overlap instead of running one part at a time.
+  A **decode-memory budget** (`Config.DecodeMemoryBytes`, `budget.go`) caps the total in-flight
+  decoded column bytes across concurrent queries: each query estimates its decode footprint (8 bytes ×
+  rows × needed columns, summed over the parts it touches) and reserves it from a shared byte
+  semaphore before reading any part, releasing on `releaseParts`. It bounds the query-concurrency RSS
+  cliff — N heavy queries serialize through the cap instead of each materializing whole columns at
+  once. The reservation is taken once per query off the engine lock (not incrementally per part, so
+  two queries cannot each hold a partial reservation and deadlock), and a query larger than the whole
+  budget is admitted alone rather than waiting forever. 0 ⇒ unlimited.
   A **recent tier** (`Config.RecentWindow`, `recent.go`) opt-in mirrors the most recent flush window
   in RAM across flushes (the head is drained on every flush, but the tier persists), so a query whose
   `[Start, End]` falls inside the tier's window is served from the tier ∪ the mid-flush buffers ∪ the

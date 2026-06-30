@@ -57,6 +57,13 @@ type Config struct {
 	// window of resident memory for that latency. 0 disables it (the default); the head is then just
 	// the unflushed tail, drained on every flush as before.
 	RecentWindow int64
+	// DecodeMemoryBytes caps the total in-flight decoded column bytes across concurrent queries: a
+	// query reserves its estimated decode footprint before reading parts and releases it when done,
+	// blocking when the budget is exhausted. It bounds the query-concurrency RSS cliff (N heavy
+	// queries each materializing whole columns) by serializing decode through the cap rather than
+	// letting concurrency multiply resident decoded bytes. 0 ⇒ unlimited (no admission control). A
+	// query larger than the whole budget runs alone (it cannot be bounded below its own footprint).
+	DecodeMemoryBytes int64
 	// MetricBlockRows sets the row block size for metric part columns (ts/value/sf): the columns are
 	// split into independently decodable blocks of this many rows, so a query can decode only the
 	// blocks its matched series' row ranges touch (sub-part seek) instead of the whole column, and
@@ -119,6 +126,9 @@ type Engine struct {
 	// recycle is the shared per-engine [fetch.Batch.Release] hook (allocated once), so setting it on
 	// a batch costs nothing per batch. It returns the batch's ts/value buffers to the pools above.
 	recycle func(*fetch.Batch)
+	// budget caps the in-flight decoded bytes across concurrent queries (Config.DecodeMemoryBytes);
+	// nil ⇒ unlimited.
+	budget *decodeBudget
 }
 
 var _ fetch.Fetcher = (*Engine)(nil)
@@ -147,6 +157,10 @@ func New(cfg Config) *Engine {
 
 	if cfg.DecodeCacheBytes > 0 {
 		e.blockCache = newBlockCache(cfg.DecodeCacheBytes)
+	}
+
+	if cfg.DecodeMemoryBytes > 0 {
+		e.budget = newDecodeBudget(cfg.DecodeMemoryBytes)
 	}
 
 	if cfg.RecentWindow > 0 {
@@ -357,6 +371,10 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 	defer plan.releaseParts()
 
+	// Reserve this fetch's decode footprint from the memory budget (blocks under concurrency
+	// pressure), off the engine lock, before any part is decoded. A fetch materializes ts+value.
+	plan.acquireDecodeBudget(colNeed{values: true})
+
 	// Prefetch: decode the parts this fetch will touch concurrently (and cache them), so their
 	// backend reads + decodes overlap instead of happening one part at a time during the merge.
 	e.prefetch(ctx, plan)
@@ -432,15 +450,16 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 // (ref-held) in-window parts still to read, plus each series' identity and its already-snapshotted head
 // and mid-flush samples. Its [enginePlan.mergeSeries] does the part reads off the lock.
 type enginePlan struct {
-	ids        []signal.SeriesID
-	series     map[signal.SeriesID]signal.Series
-	headB      map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
-	flushB     map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
-	recentB    map[signal.SeriesID]*fetch.Batch // recent-tier samples (the in-RAM flush window)
-	liveParts  []*part
-	decoded    partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
-	engine     *Engine         // for returning pooled decode buffers on release
-	start, end int64
+	ids         []signal.SeriesID
+	series      map[signal.SeriesID]signal.Series
+	headB       map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
+	flushB      map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
+	recentB     map[signal.SeriesID]*fetch.Batch // recent-tier samples (the in-RAM flush window)
+	liveParts   []*part
+	decoded     partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
+	engine      *Engine         // for returning pooled decode buffers on release
+	budgetBytes int64           // decode-memory budget reserved for this query; released on releaseParts
+	start, end  int64
 }
 
 // mergeSeries gathers series id's samples lock-free: each acquired part oldest→newest, then the
@@ -513,7 +532,45 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 }
 
 // releaseParts releases the fetch's hold on its acquired parts, letting a retired part be reclaimed.
+// acquireDecodeBudget reserves this query's estimated decode footprint from the engine's
+// decode-memory budget, blocking until it fits (or admitting it alone when it exceeds the whole
+// budget). It must run off the engine lock and after planFetch (it needs liveParts); releaseParts
+// returns the reservation. A nil budget makes it a no-op.
+func (p *enginePlan) acquireDecodeBudget(need colNeed) {
+	if p.engine.budget == nil {
+		return
+	}
+
+	p.budgetBytes = p.decodeEstimate(need)
+	p.engine.budget.acquire(p.budgetBytes)
+}
+
+// decodeEstimate is the bytes this query will materialize across the parts it touches: the full ts
+// column always, plus the value column (and the scale-factor column when present) when need.values.
+// A decoded column is one int64/float64 per row, so 8 bytes/row/column. It is an upper bound — the
+// per-fetch decodedPart is sized to the part's full row count even for a sparse selector — so the
+// budget reservation matches the resident footprint it caps.
+func (p *enginePlan) decodeEstimate(need colNeed) int64 {
+	var total int64
+
+	for _, part := range p.liveParts {
+		cols := int64(1) // timestamps
+		if need.values {
+			cols++ // values
+			if part.hasSF {
+				cols++ // scale factors
+			}
+		}
+
+		total += int64(part.rows()) * 8 * cols
+	}
+
+	return total
+}
+
 func (p *enginePlan) releaseParts() {
+	p.engine.budget.release(p.budgetBytes)
+
 	// Return pooled decode buffers (no-cross-fetch-cache path). The merge has already copied the
 	// values out into the result batches, so these slices are dead and safe to recycle. Cache-path
 	// dps are not pooled (the cache owns them until reclaim), so they are skipped here.

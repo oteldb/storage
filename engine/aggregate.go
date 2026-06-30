@@ -33,6 +33,7 @@ func (e *Engine) AggregateRange(ctx context.Context, r fetch.Request) (map[signa
 
 	defer plan.releaseParts()
 
+	plan.acquireDecodeBudget(colNeed{values: true})
 	safe := aggPushdownSafe(plan)
 
 	out := make(map[signal.SeriesID]SeriesAgg, len(ids))
@@ -95,6 +96,7 @@ func (e *Engine) AggregateStep(ctx context.Context, r fetch.Request, step int64)
 
 	defer plan.releaseParts()
 
+	plan.acquireDecodeBudget(colNeed{values: true})
 	safe := aggPushdownSafe(plan)
 
 	out := make(map[signal.SeriesID][]BucketAgg, len(ids))
@@ -139,6 +141,7 @@ func (e *Engine) AggregateStepNamed(ctx context.Context, r fetch.Request, step i
 
 	defer plan.releaseParts()
 
+	plan.acquireDecodeBudget(colNeed{values: true})
 	safe := aggPushdownSafe(plan)
 
 	out := make([]NamedAgg, 0, len(ids))
