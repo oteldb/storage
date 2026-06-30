@@ -59,6 +59,10 @@ const (
 	// byte (FloatPrecisionBits) follows the flags byte. Absent on lossless columns, so existing
 	// parts and the common path keep their exact layout.
 	flagLossy byte = 1 << 1
+	// flagBlocked marks a block-framed column (its object is a [blockDir] + per-block codec streams
+	// rather than a single stream). Additive like flagLossy: an unblocked column leaves it clear and
+	// keeps the prior byte-for-byte layout, so existing parts read unchanged.
+	flagBlocked byte = 1 << 2
 )
 
 // ErrCorrupt is returned when a manifest (or any part metadata) fails to parse:
@@ -92,6 +96,11 @@ type ColumnDesc struct {
 	// it as the fixed point for age-tiered precision — it never re-coarsens a part already at or
 	// below the target budget.
 	FloatPrecisionBits uint8
+
+	// Blocked marks a block-framed column: its object is a [blockDir] + per-block codec streams
+	// (see blockcolumn.go) instead of a single stream, so a reader can decode one block at a time.
+	// Persisted via [flagBlocked]; clear on the prior single-stream layout.
+	Blocked bool
 }
 
 // Manifest is the part descriptor: format version, row count, time range, granule size,
@@ -140,6 +149,10 @@ func (m Manifest) Encode(dst []byte) []byte {
 
 		if c.FloatPrecisionBits != 0 {
 			flags |= flagLossy
+		}
+
+		if c.Blocked {
+			flags |= flagBlocked
 		}
 
 		_ = w.WriteByte(flags)
@@ -304,6 +317,7 @@ func decodeColumnDesc(r *bitstream.Reader) (ColumnDesc, error) {
 	}
 
 	c.Const = flags&flagConst != 0
+	c.Blocked = flags&flagBlocked != 0
 
 	if flags&flagLossy != 0 {
 		bits, err := r.ReadByte()

@@ -16,7 +16,7 @@ import (
 func buildAuto(t *testing.T, vals []float64, comp *compress.Compressor) (chunk.Codec, []float64) {
 	t.Helper()
 
-	desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: vals, AutoCodec: true}, comp)
+	desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: vals, AutoCodec: true}, comp, defaultGranuleSize)
 	require.NoError(t, err)
 
 	got, err := newColumnReader(desc, obj, comp, len(vals)).Float64(nil)
@@ -112,7 +112,7 @@ func TestAutoCodecLosslessEdgeCases(t *testing.T) {
 func TestAutoCodecConstantCollapses(t *testing.T) {
 	t.Parallel()
 
-	desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: makeConstFloats(64, 7.5), AutoCodec: true}, noneComp())
+	desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: makeConstFloats(64, 7.5), AutoCodec: true}, noneComp(), defaultGranuleSize)
 	require.NoError(t, err)
 	assert.True(t, desc.Const)
 	assert.Nil(t, obj)
@@ -139,11 +139,11 @@ func TestAutoCodecLossyBudget(t *testing.T) {
 		vals[i] = math.Sqrt(float64(i)+0.123456789) * 1000 // full-precision, high-entropy
 	}
 
-	descLossless, objLossless, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: vals, AutoCodec: true}, noneComp())
+	descLossless, objLossless, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: vals, AutoCodec: true}, noneComp(), defaultGranuleSize)
 	require.NoError(t, err)
 	assert.Equal(t, uint8(0), descLossless.FloatPrecisionBits)
 
-	descLossy, objLossy, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: vals, AutoCodec: true, FloatPrecisionBits: 12}, noneComp())
+	descLossy, objLossy, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: vals, AutoCodec: true, FloatPrecisionBits: 12}, noneComp(), defaultGranuleSize)
 	require.NoError(t, err)
 	assert.Equal(t, uint8(12), descLossy.FloatPrecisionBits, "budget recorded for the fixed point")
 	assert.Equal(t, chunk.CodecDecimal, descLossy.Codec, "lossy decimal wins on high-entropy data")
@@ -170,7 +170,7 @@ func TestAutoCodecLossyNonFiniteFallsBack(t *testing.T) {
 	t.Parallel()
 
 	vals := []float64{1.5, math.NaN(), 2.5, math.Inf(1), 3.5}
-	desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: vals, AutoCodec: true, FloatPrecisionBits: 12}, noneComp())
+	desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: vals, AutoCodec: true, FloatPrecisionBits: 12}, noneComp(), defaultGranuleSize)
 	require.NoError(t, err)
 	assert.Equal(t, chunk.CodecGorilla, desc.Codec, "non-finite ⇒ lossless Gorilla")
 	assert.Equal(t, uint8(12), desc.FloatPrecisionBits, "budget still recorded (fixed point)")
@@ -227,7 +227,7 @@ func FuzzAutoCodecLossless(f *testing.F) {
 		}
 
 		for _, comp := range []*compress.Compressor{noneComp(), zstdComp()} {
-			desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: vals, AutoCodec: true}, comp)
+			desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: vals, AutoCodec: true}, comp, defaultGranuleSize)
 			if err != nil {
 				t.Fatalf("buildColumn: %v", err)
 			}
