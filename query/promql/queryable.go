@@ -97,6 +97,15 @@ type LabelCache struct {
 // NewLabelCache returns an empty [LabelCache] ready to share across queries.
 func NewLabelCache() *LabelCache { return &LabelCache{m: make(map[signal.SeriesID]labels.Labels)} }
 
+// Len reports the number of interned series projections. It lets an embedder observe the cache's
+// resident size (e.g. to expose a metric or decide when to swap in a fresh cache on series churn).
+func (c *LabelCache) Len() int {
+	c.mu.RLock()
+	n := len(c.m)
+	c.mu.RUnlock()
+
+	return n
+}
 func (c *LabelCache) get(id signal.SeriesID) (labels.Labels, bool) {
 	c.mu.RLock()
 	l, ok := c.m[id]
@@ -109,16 +118,6 @@ func (c *LabelCache) put(id signal.SeriesID, l labels.Labels) {
 	c.mu.Lock()
 	c.m[id] = l
 	c.mu.Unlock()
-}
-
-// Len reports the number of interned series projections. It lets an embedder observe the cache's
-// resident size (e.g. to expose a metric or decide when to swap in a fresh cache on series churn).
-func (c *LabelCache) Len() int {
-	c.mu.RLock()
-	n := len(c.m)
-	c.mu.RUnlock()
-
-	return n
 }
 
 type querier struct {
