@@ -296,9 +296,13 @@ The L3 indexing layer maps query matchers to the series that satisfy them.
 - **`index/series`** — `SeriesID ↔ Series`. `Add` is idempotent (id is the identity hash) and
   **interns** the identity's key/value bytes through a per-index `index/symbols` table (via
   `signal.Series.Intern`), so each distinct label/attribute string is owned once and referenced by
-  every series that shares it — under a steady workload the same resource/scope and many label values
-  repeat across series, so identity storage stays near the distinct-string count rather than scaling
-  one clone per series. A query reconstructs labels from an id and replay is dedup-safe.
+  every series that shares it. It also **deduplicates whole `Resource` and `Scope` sets** by content
+  (content-keyed caches), so series sharing a resource/scope — node_exporter has a handful of
+  resources and one scope across ~all series — point at one owned `[]KeyValue` rather than a private
+  per-series clone of the *structure* that byte interning alone leaves behind (≈23 % less resident
+  identity storage on the metrics shape). Point attributes are near-unique per series, so they are
+  byte-interned only (a per-set cache there would store keys it could not dedup). A query reconstructs
+  labels from an id and replay is dedup-safe.
 - **`index/postings`** — the inverted index, keyed on **interned symbol ids** (`nameID →
   valueID → sorted []SeriesID`), so it is zero-alloc and **type-preserving** (the value id
   comes from the value's typed encoding). Lazy set-op iterators (`Intersect`/`Merge`/
