@@ -53,14 +53,30 @@ var hiddenLabels = map[string]struct{}{
 type Queryable struct {
 	fetcher fetch.Fetcher
 	tenant  signal.TenantID
-	labels  *labelCache
+	labels  *LabelCache
 }
 
 // NewQueryable returns a Prometheus storage.Queryable backed by fetcher for the given tenant. A
 // single Queryable reused across queries (the embedder's per-tenant adapter) memoizes label
 // projections, so repeated queries pay the projection cost once per series.
+//
+// Each call allocates a fresh [LabelCache]. An embedder that takes a new fetcher per query (to
+// observe the latest head) but wants label projections interned across the engine's lifetime should
+// hold a [LabelCache] itself and use [NewQueryableWithCache].
 func NewQueryable(fetcher fetch.Fetcher, tenant signal.TenantID) *Queryable {
-	return &Queryable{fetcher: fetcher, tenant: tenant, labels: newLabelCache()}
+	return NewQueryableWithCache(fetcher, tenant, NewLabelCache())
+}
+
+// NewQueryableWithCache is [NewQueryable] with an explicit, caller-owned [LabelCache]. The cache is
+// keyed by content-addressed [signal.SeriesID], so an entry is valid for the life of the series and
+// may be shared across Queryables built over different fetchers of the same engine — letting the
+// embedder intern label projections for the engine's lifetime rather than per query. The cache is
+// safe for concurrent use.
+func NewQueryableWithCache(fetcher fetch.Fetcher, tenant signal.TenantID, cache *LabelCache) *Queryable {
+	if cache == nil {
+		cache = NewLabelCache()
+	}
+	return &Queryable{fetcher: fetcher, tenant: tenant, labels: cache}
 }
 
 // Querier returns a querier over [mint, maxt] (Prometheus milliseconds).
@@ -68,18 +84,20 @@ func (q *Queryable) Querier(mint, maxt int64) (storage.Querier, error) {
 	return &querier{fetcher: q.fetcher, tenant: q.tenant, mint: mint, maxt: maxt, labels: q.labels}, nil
 }
 
-// labelCache memoizes a series identity's projected Prometheus label set. The projection is a pure
+// LabelCache memoizes a series identity's projected Prometheus label set. The projection is a pure
 // function of the content-addressed [signal.SeriesID], so a cached entry is always valid; the cache
-// is bounded by series cardinality (the same set Prometheus keeps resident) and shared across the
-// Queryable's queriers.
-type labelCache struct {
+// is bounded by series cardinality (the same set Prometheus keeps resident). It is safe for
+// concurrent use and may be shared across a [Queryable]'s queriers and — via
+// [NewQueryableWithCache] — across successive Queryables over the engine's lifetime.
+type LabelCache struct {
 	mu sync.RWMutex
 	m  map[signal.SeriesID]labels.Labels
 }
 
-func newLabelCache() *labelCache { return &labelCache{m: make(map[signal.SeriesID]labels.Labels)} }
+// NewLabelCache returns an empty [LabelCache] ready to share across queries.
+func NewLabelCache() *LabelCache { return &LabelCache{m: make(map[signal.SeriesID]labels.Labels)} }
 
-func (c *labelCache) get(id signal.SeriesID) (labels.Labels, bool) {
+func (c *LabelCache) get(id signal.SeriesID) (labels.Labels, bool) {
 	c.mu.RLock()
 	l, ok := c.m[id]
 	c.mu.RUnlock()
@@ -87,10 +105,20 @@ func (c *labelCache) get(id signal.SeriesID) (labels.Labels, bool) {
 	return l, ok
 }
 
-func (c *labelCache) put(id signal.SeriesID, l labels.Labels) {
+func (c *LabelCache) put(id signal.SeriesID, l labels.Labels) {
 	c.mu.Lock()
 	c.m[id] = l
 	c.mu.Unlock()
+}
+
+// Len reports the number of interned series projections. It lets an embedder observe the cache's
+// resident size (e.g. to expose a metric or decide when to swap in a fresh cache on series churn).
+func (c *LabelCache) Len() int {
+	c.mu.RLock()
+	n := len(c.m)
+	c.mu.RUnlock()
+
+	return n
 }
 
 type querier struct {
@@ -98,7 +126,7 @@ type querier struct {
 	tenant  signal.TenantID
 	mint    int64
 	maxt    int64
-	labels  *labelCache
+	labels  *LabelCache
 	// held are the fetched batches whose buffers back the returned series (zero-copy). They are kept
 	// alive until [querier.Close] (after the engine has evaluated) and then released, recycling the
 	// engine's result buffers via the fetch [fetch.Request.Recycle] lifecycle.

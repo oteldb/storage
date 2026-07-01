@@ -272,3 +272,57 @@ func TestExportedHelpers(t *testing.T) {
 	assert.Equal(t, []byte("__name__"), pushed[0].Name)
 	assert.NotNil(t, pushed[0].Spec, "equality matcher carries a serializable Spec")
 }
+
+// TestLabelCacheSharedAcrossQueryables covers the engine-lifetime interning contract: a LabelCache
+// shared across successive Queryables (each over a fresh fetcher, as an embedder does per query)
+// projects each series' labels once and reuses the entry, so the resident set is bounded by
+// cardinality rather than rebuilt per query.
+func TestLabelCacheSharedAcrossQueryables(t *testing.T) {
+	t.Parallel()
+
+	cache := NewLabelCache()
+	require.Zero(t, cache.Len())
+
+	batches := []*fetch.Batch{
+		series("node_x", "r0", [2]int64{1, 10}),
+		series("node_x", "r1", [2]int64{1, 20}),
+	}
+
+	drain := func() []labels.Labels {
+		// A fresh fetcher per query, mirroring the embedder taking a new fetcher to see the latest head.
+		q, err := NewQueryableWithCache(&fakeFetcher{batches: batches}, "default", cache).Querier(0, 10_000_000)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = q.Close() })
+
+		ss := q.Select(context.Background(), true, nil, eq(t, "__name__", "node_x"))
+		var out []labels.Labels
+		for ss.Next() {
+			out = append(out, ss.At().Labels())
+		}
+		require.NoError(t, ss.Err())
+
+		return out
+	}
+
+	first := drain()
+	require.Len(t, first, 2)
+	require.Equal(t, 2, cache.Len(), "each distinct series interned once")
+
+	second := drain()
+	require.Len(t, second, 2)
+	require.Equal(t, 2, cache.Len(), "second query reuses entries, no growth")
+
+	// The projections are stable across queries (same content for the same series identity).
+	for i := range first {
+		assert.Equal(t, first[i].String(), second[i].String())
+	}
+}
+
+// TestNewQueryableWithNilCache falls back to a private cache instead of panicking.
+func TestNewQueryableWithNilCache(t *testing.T) {
+	t.Parallel()
+
+	q, err := NewQueryableWithCache(&fakeFetcher{}, "default", nil).Querier(0, 10)
+	require.NoError(t, err)
+	require.NoError(t, q.Close())
+}
