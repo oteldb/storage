@@ -35,7 +35,7 @@ func (e *Engine) Count(ctx context.Context, r fetch.Request) (int, error) {
 	defer plan.releaseParts()
 
 	// Count decodes timestamps only (existence), and only for window-edge parts; reserve that.
-	plan.acquireDecodeBudget(colNeed{})
+	plan.acquireDecodeBudget(colNeed{}, false)
 
 	return plan.countActive(ctx, ids, e)
 }
