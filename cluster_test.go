@@ -802,17 +802,22 @@ func TestClusteredRecordShardingEnumeratesAcrossShards(t *testing.T) {
 	}
 
 	for name, s := range nodes {
-		series, err := s.LogSeries(ctx, "default", nil, 0, 0)
-		require.NoErrorf(t, err, "%s LogSeries", name)
-		assert.Lenf(t, series, streams, "%s enumerates all streams across shards", name)
+		// The cross-shard gather is complete once the reading node's ring has caught up to the full
+		// membership; the writes above are synchronous, but a freshly-joined node's ring view can still
+		// be converging when the reads start, so poll rather than assume the first read sees every shard.
+		require.EventuallyWithTf(t, func(c *assert.CollectT) {
+			series, err := s.LogSeries(ctx, "default", nil, 0, 0)
+			assert.NoErrorf(c, err, "%s LogSeries", name)
+			assert.Lenf(c, series, streams, "%s enumerates all streams across shards", name)
 
-		keys, err := s.LogKeys(ctx, "default", 0, 0)
-		require.NoErrorf(t, err, "%s LogKeys", name)
+			keys, err := s.LogKeys(ctx, "default", 0, 0)
+			assert.NoErrorf(c, err, "%s LogKeys", name)
 
-		got := logKeyScopes(keys)
-		for k := range wantKeys {
-			assert.Containsf(t, got, k, "%s LogKeys union includes %q", name, k)
-		}
+			got := logKeyScopes(keys)
+			for k := range wantKeys {
+				assert.Containsf(c, got, k, "%s LogKeys union includes %q", name, k)
+			}
+		}, 10*time.Second, 50*time.Millisecond, "%s enumerates all streams and keys across shards", name)
 	}
 }
 
