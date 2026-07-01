@@ -121,6 +121,10 @@ func TestWALState(t *testing.T) {
 	require.NoError(t, err)
 
 	e := recordengine.New(recordengine.Config{Schema: testSchema, WAL: sw, Prefix: "t/recs"})
+	// Release the open WAL segment handle before the test ends so t.TempDir cleanup can remove it on
+	// Windows (which refuses to delete a file held open by a live process).
+	t.Cleanup(func() { _ = e.CloseWAL() })
+
 	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "a"}))
 
 	segs, bytes, epoch, ok = e.WALState()
