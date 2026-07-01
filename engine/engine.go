@@ -129,6 +129,9 @@ type Engine struct {
 	// budget caps the in-flight decoded bytes across concurrent queries (Config.DecodeMemoryBytes);
 	// nil ⇒ unlimited.
 	budget *decodeBudget
+	// planMaps recycles the per-fetch plan maps (series identity + head/flush/recent snapshots) so a
+	// fetch reuses cleared maps instead of allocating and growing fresh ones each call.
+	planMaps planMapPools
 }
 
 var _ fetch.Fetcher = (*Engine)(nil)
@@ -386,7 +389,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		rows    int
 	)
 
-	for _, id := range ids {
+	for i, id := range ids {
 		m, err := plan.mergeSeries(ctx, id)
 		if err != nil {
 			span.RecordError(err)
@@ -415,7 +418,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 			continue
 		}
 
-		b := &fetch.Batch{ID: id, Series: plan.series[id], Timestamps: ts, Values: values, ScaleFactors: sf}
+		b := &fetch.Batch{ID: id, Series: plan.series[i], Timestamps: ts, Values: values, ScaleFactors: sf}
 		if r.Recycle {
 			b.SetRelease(e.recycle) // caller will Release to recycle the ts/value buffers
 		}
@@ -451,7 +454,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 // and mid-flush samples. Its [enginePlan.mergeSeries] does the part reads off the lock.
 type enginePlan struct {
 	ids       []signal.SeriesID
-	series    map[signal.SeriesID]signal.Series
+	series    []signal.Series                  // matched-series identities, parallel to ids (zero value when absent)
 	headB     map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
 	flushB    map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
 	recentB   map[signal.SeriesID]*fetch.Batch // recent-tier samples (the in-RAM flush window)
@@ -624,6 +627,13 @@ func (p *enginePlan) releaseParts() {
 		p.engine.putI64(b.Timestamps)
 		p.engine.putF64(b.Values)
 	}
+
+	// The plan maps are dead now: the returned batches copied out their identity and samples. Clear
+	// and recycle the map structures so the next fetch reuses their capacity instead of re-making them.
+	p.engine.putSeriesSlice(p.series)
+	p.engine.putBatchMap(p.headB)
+	p.engine.putBatchMap(p.flushB)
+	p.engine.putBatchMap(p.recentB)
 }
 
 // tsRun is one source's in-window, ascending samples feeding a merge. sf is nil when every weight
@@ -1239,9 +1249,9 @@ func (e *Engine) acquireWindowParts(p *enginePlan, start, end int64) {
 func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 	p := &enginePlan{
 		ids:     ids,
-		series:  make(map[signal.SeriesID]signal.Series, len(ids)),
-		headB:   make(map[signal.SeriesID]*fetch.Batch, len(ids)),
-		flushB:  make(map[signal.SeriesID]*fetch.Batch, len(ids)),
+		series:  e.getSeriesSlice(len(ids)),
+		headB:   e.getBatchMap(len(ids)),
+		flushB:  e.getBatchMap(len(ids)),
 		decoded: make(partDecodeCache),
 		engine:  e,
 		start:   r.Start,
@@ -1254,15 +1264,15 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 		e.acquireWindowParts(p, r.Start, r.End)
 	}
 
-	for _, id := range ids {
+	for i, id := range ids {
 		if s, ok := e.head.series.Get(id); ok {
-			p.series[id] = s
+			p.series[i] = s
 		}
 
 		if e.recentEnabled() {
-			if rb := bufBatch(e.recent[id], id, p.series[id], r.Start, r.End, e); rb != nil {
+			if rb := bufBatch(e.recent[id], id, p.series[i], r.Start, r.End, e); rb != nil {
 				if p.recentB == nil {
-					p.recentB = make(map[signal.SeriesID]*fetch.Batch, len(ids))
+					p.recentB = e.getBatchMap(len(ids))
 				}
 
 				p.recentB[id] = rb
@@ -1274,7 +1284,7 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 		}
 
 		if buf := e.flushing[id]; buf != nil {
-			if fb := bufBatch(buf, id, p.series[id], r.Start, r.End, e); fb != nil {
+			if fb := bufBatch(buf, id, p.series[i], r.Start, r.End, e); fb != nil {
 				p.flushB[id] = fb
 			}
 		}
