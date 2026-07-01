@@ -2,6 +2,7 @@ package series
 
 import (
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,6 +81,31 @@ func TestAddRetainsACopy(t *testing.T) {
 
 	got, _ := ix.Get(id)
 	assert.True(t, got.Equal(mk("api", "route", "/x")), "the index must retain a deep copy")
+}
+
+// TestResourceScopeDeduped checks the set interning: two series sharing a resource (and scope) store
+// one shared copy of that resource/scope structure, while a distinct resource keeps its own — so the
+// dedup neither wastes memory on duplicates nor merges different identities.
+func TestResourceScopeDeduped(t *testing.T) {
+	t.Parallel()
+
+	ix := New()
+	a, _ := ix.Get(ix.Add(mk("api", "route", "/x")))
+	b, _ := ix.Get(ix.Add(mk("api", "route", "/y"))) // same resource+scope, different point attrs
+	c, _ := ix.Get(ix.Add(mk("web", "route", "/x"))) // different resource
+
+	// Same resource ⇒ one shared backing array; same scope ⇒ shared Name bytes.
+	assert.Same(t, unsafe.SliceData(a.Resource.Attributes), unsafe.SliceData(b.Resource.Attributes),
+		"identical resources should share one interned copy")
+	assert.Same(t, unsafe.SliceData(a.Scope.Name), unsafe.SliceData(b.Scope.Name),
+		"identical scopes should share one interned copy")
+
+	// A different resource is not merged into the shared one.
+	assert.NotSame(t, unsafe.SliceData(a.Resource.Attributes), unsafe.SliceData(c.Resource.Attributes))
+	assert.False(t, a.Equal(c))
+
+	// The point attributes remain per series (distinct backing) — they are byte-interned, not set-deduped.
+	assert.NotSame(t, unsafe.SliceData(a.Attributes), unsafe.SliceData(b.Attributes))
 }
 
 func TestForEach(t *testing.T) {

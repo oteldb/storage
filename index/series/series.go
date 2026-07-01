@@ -19,24 +19,44 @@ type Index struct {
 	// of a private clone per series. Under a steady metrics workload the same resource/scope and
 	// many label values repeat across series, so this collapses the dominant identity-storage cost.
 	sym *symbols.Table
-	buf []byte // reused hash pre-image buffer (zero-alloc Add)
+	// res / scope dedup whole Resource / Scope objects by content: node_exporter-shaped ingest has a
+	// handful of resources (one per scrape target) and one scope shared across ~all series, so byte
+	// interning alone still leaves a private []KeyValue structure per series. Interning the *set*
+	// makes every series carrying an identical resource/scope share one owned copy — collapsing the
+	// per-series attribute-set structure that byte interning cannot. Point attributes are near-unique
+	// per series, so they are only byte-interned (a per-set cache there would store keys it cannot
+	// dedup).
+	res   map[string]signal.Resource
+	scope map[string]signal.Scope
+	buf   []byte // reused series hash pre-image buffer (zero-alloc Add)
+	kbuf  []byte // reused resource/scope canonical-bytes buffer for set interning
 }
 
 // New returns an empty [Index].
 func New() *Index {
-	return &Index{byID: make(map[signal.SeriesID]signal.Series), sym: symbols.New()}
+	return &Index{
+		byID:  make(map[signal.SeriesID]signal.Series),
+		sym:   symbols.New(),
+		res:   make(map[string]signal.Resource),
+		scope: make(map[string]signal.Scope),
+	}
 }
 
 // Add interns a series identity and returns its [signal.SeriesID]. It is idempotent:
 // re-adding an equal identity returns the same id without storing a second copy. The identity's
-// byte payloads are interned (not cloned), so the caller may reuse its buffers and each distinct
-// string is stored once across the whole index.
+// byte payloads are interned (not cloned) and its resource/scope sets are deduplicated, so the
+// caller may reuse its buffers and each distinct string — and each distinct resource/scope — is
+// stored once across the whole index.
 func (ix *Index) Add(s signal.Series) signal.SeriesID {
 	ix.buf = s.AppendHashInput(ix.buf[:0])
 	id := signal.HashBytes(ix.buf)
 
 	if _, ok := ix.byID[id]; !ok {
-		ix.byID[id] = s.Intern(ix.sym.Bytes)
+		ix.byID[id] = signal.Series{
+			Resource:   ix.internResource(s.Resource),
+			Scope:      ix.internScope(s.Scope),
+			Attributes: s.Attributes.Intern(ix.sym.Bytes),
+		}
 	}
 
 	return id
@@ -64,4 +84,31 @@ func (ix *Index) ForEach(fn func(id signal.SeriesID, s signal.Series)) {
 	for id := range ix.byID {
 		fn(id, ix.byID[id])
 	}
+}
+
+// internResource returns the shared, byte-interned Resource equal to r, deduplicating identical
+// resources by their canonical content so series sharing a resource hold one owned copy.
+func (ix *Index) internResource(r signal.Resource) signal.Resource {
+	ix.kbuf = r.AppendHashInput(ix.kbuf[:0])
+	if got, ok := ix.res[string(ix.kbuf)]; ok { // alloc-free lookup
+		return got
+	}
+
+	interned := r.Intern(ix.sym.Bytes)
+	ix.res[string(ix.kbuf)] = interned // allocates the key once per distinct resource
+
+	return interned
+}
+
+// internScope is the Scope analog of internResource.
+func (ix *Index) internScope(s signal.Scope) signal.Scope {
+	ix.kbuf = s.AppendHashInput(ix.kbuf[:0])
+	if got, ok := ix.scope[string(ix.kbuf)]; ok {
+		return got
+	}
+
+	interned := s.Intern(ix.sym.Bytes)
+	ix.scope[string(ix.kbuf)] = interned
+
+	return interned
 }
