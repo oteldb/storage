@@ -146,7 +146,7 @@ func (e *Engine) AggregateStepNamed(ctx context.Context, r fetch.Request, step i
 
 	out := make([]NamedAgg, 0, len(ids))
 
-	for _, id := range ids {
+	for i, id := range ids {
 		buckets, err := e.bucketSeries(ctx, plan, id, step, safe)
 		if err != nil {
 			return nil, err
@@ -156,7 +156,7 @@ func (e *Engine) AggregateStepNamed(ctx context.Context, r fetch.Request, step i
 			continue
 		}
 
-		out = append(out, NamedAgg{Series: plan.series[id], Buckets: sortBuckets(buckets)})
+		out = append(out, NamedAgg{Series: plan.series[i], Buckets: sortBuckets(buckets)})
 	}
 
 	return out, nil
