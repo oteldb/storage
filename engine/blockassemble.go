@@ -68,6 +68,7 @@ func (e *Engine) fillIntBlocks(ctx context.Context, dst []int64, p *part, name s
 		key := blockKey{prefix: p.prefix, col: cid, blk: blk}
 		if ent, ok := e.blockCache.get(key); ok {
 			copy(dst[blk*blockRows:], ent.i64)
+			e.blockCache.release(ent)
 
 			continue
 		}
@@ -81,13 +82,16 @@ func (e *Engine) fillIntBlocks(ctx context.Context, dst []int64, p *part, name s
 			bd = d
 		}
 
-		b, err := bd.DecodeInt64(blk)
+		b, err := bd.DecodeInt64Into(blk, e.blockCache.getI64Buf(blockRows))
 		if err != nil {
 			return err
 		}
 
-		e.blockCache.put(&blockEntry{key: key, i64: b, bytes: int64(len(b)) * 8})
-		copy(dst[blk*blockRows:], b)
+		// insert pins the resident entry (ours, or the winner of a concurrent decode); we copy from
+		// it and release immediately — this path materializes into dst, holding no view of the block.
+		ent := e.blockCache.insert(&blockEntry{key: key, i64: b, bytes: int64(len(b)) * 8})
+		copy(dst[blk*blockRows:], ent.i64)
+		e.blockCache.release(ent)
 	}
 
 	return nil
@@ -130,6 +134,7 @@ func (e *Engine) fillFloatColumn(
 		key := blockKey{prefix: p.prefix, col: cid, blk: blk}
 		if ent, ok := e.blockCache.get(key); ok {
 			copy(out[blk*blockRows:], ent.f64)
+			e.blockCache.release(ent)
 
 			continue
 		}
@@ -143,13 +148,14 @@ func (e *Engine) fillFloatColumn(
 			bd = d
 		}
 
-		b, err := bd.DecodeFloat64(blk)
+		b, err := bd.DecodeFloat64Into(blk, e.blockCache.getF64Buf(blockRows))
 		if err != nil {
 			return nil, err
 		}
 
-		e.blockCache.put(&blockEntry{key: key, f64: b, bytes: int64(len(b)) * 8})
-		copy(out[blk*blockRows:], b)
+		ent := e.blockCache.insert(&blockEntry{key: key, f64: b, bytes: int64(len(b)) * 8})
+		copy(out[blk*blockRows:], ent.f64)
+		e.blockCache.release(ent)
 	}
 
 	return out, nil

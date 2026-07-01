@@ -598,6 +598,14 @@ func (p *enginePlan) decodeEstimate(need colNeed, blockSliced bool) int64 {
 func (p *enginePlan) releaseParts() {
 	p.engine.budget.release(p.budgetBytes)
 
+	// Drop the block-slice readers' references on the cache blocks they viewed. The merge has copied
+	// the samples out (collect ran in the scan), so those views are dead; releasing lets a block the
+	// byte budget evicted mid-fetch return its buffer to the decode pool. Must run before part.release
+	// below: a released part can be reclaimed (evictPrefix), which touches the same entries.
+	for _, r := range p.blockReaders {
+		r.releasePins()
+	}
+
 	// Return pooled decode buffers (no-cross-fetch-cache path). The merge has already copied the
 	// values out into the result batches, so these slices are dead and safe to recycle. Cache-path
 	// dps are not pooled (the cache owns them until reclaim), so they are skipped here.

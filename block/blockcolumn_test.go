@@ -3,6 +3,7 @@ package block
 import (
 	"context"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -110,6 +111,68 @@ func TestBlockedRoundTrip(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+// TestDecodeIntoReuse checks the per-block decode-into-dst path (the block cache's miss path): each
+// block decoded into a caller-supplied buffer matches slicing a full decode, and a pre-sized buffer is
+// filled in place without reallocating — the property the decode-buffer pool relies on to cut allocs.
+func TestDecodeIntoReuse(t *testing.T) {
+	t.Parallel()
+
+	const blockRows, n = 4, 17
+
+	for _, tc := range blockCases() {
+		for _, comp := range []struct {
+			name string
+			c    func() *compress.Compressor
+		}{{"none", noneComp}, {"zstd", zstdComp}} {
+			t.Run(tc.name+"/"+comp.name, func(t *testing.T) {
+				t.Parallel()
+
+				c := tc.col(n)
+				desc, obj, err := buildColumn(c, comp.c(), blockRows)
+				require.NoError(t, err)
+				require.True(t, desc.Blocked)
+
+				r := newColumnReader(desc, obj, comp.c(), n)
+
+				dec, err := r.BlockDecoder()
+				require.NoError(t, err)
+
+				nBlocks := dec.NumBlocks()
+
+				if tc.int64 {
+					full, err := r.Int64(nil)
+					require.NoError(t, err)
+
+					dst := make([]int64, 0, blockRows) // sized to hold any block without regrowing
+					backing := unsafe.SliceData(dst[:blockRows])
+
+					for b := range nBlocks {
+						lo, hi := dec.BlockSpan(b)
+						got, err := dec.DecodeInt64Into(b, dst)
+						require.NoError(t, err)
+						assert.Equal(t, full[lo:hi], got, "block %d decodes the same rows", b)
+						assert.Equal(t, backing, unsafe.SliceData(got), "block %d fills dst in place", b)
+					}
+				} else {
+					full, err := r.Float64(nil)
+					require.NoError(t, err)
+
+					dst := make([]float64, 0, blockRows)
+					backing := unsafe.SliceData(dst[:blockRows])
+
+					for b := range nBlocks {
+						lo, hi := dec.BlockSpan(b)
+						got, err := dec.DecodeFloat64Into(b, dst)
+						require.NoError(t, err)
+						assert.Equal(t, full[lo:hi], got, "block %d decodes the same rows", b)
+						assert.Equal(t, backing, unsafe.SliceData(got), "block %d fills dst in place", b)
+					}
+				}
+			})
 		}
 	}
 }

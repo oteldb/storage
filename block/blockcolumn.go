@@ -307,6 +307,12 @@ type Decoder struct {
 	comp *compress.Compressor
 	i64  func([]int64, []byte) ([]int64, int, error)
 	f64  func([]float64, []byte) ([]float64, int, error)
+
+	// scratch is the decompression buffer, reused across this decoder's blocks. A decoder decodes
+	// its column's blocks serially (never concurrently), and each block's decoded output goes to a
+	// separate destination, so scratch is live only during one block's decode and is free to reuse
+	// for the next — turning a per-block decompress allocation into one per decoder.
+	scratch []byte
 }
 
 // NumBlocks returns the column's block count.
@@ -324,17 +330,32 @@ func (d *Decoder) BlockSpan(blk int) (lo, hi int) {
 
 // DecodeInt64 decodes block blk into a fresh slice (for an int64 column).
 func (d *Decoder) DecodeInt64(blk int) ([]int64, error) {
-	return decodeOneBlock(d.dir, d.comp, blk, d.i64)
+	return decodeOneBlockInto(d.dir, d.comp, &d.scratch, blk, nil, d.i64)
+}
+
+// DecodeInt64Into decodes block blk into dst (for an int64 column), reusing dst's backing array when
+// it has room for the block's rows — so a caller drawing dst from a pool decodes without allocating
+// the output. Passing a nil dst is equivalent to [Decoder.DecodeInt64].
+func (d *Decoder) DecodeInt64Into(blk int, dst []int64) ([]int64, error) {
+	return decodeOneBlockInto(d.dir, d.comp, &d.scratch, blk, dst, d.i64)
 }
 
 // DecodeFloat64 decodes block blk into a fresh slice (for a float64 column).
 func (d *Decoder) DecodeFloat64(blk int) ([]float64, error) {
-	return decodeOneBlock(d.dir, d.comp, blk, d.f64)
+	return decodeOneBlockInto(d.dir, d.comp, &d.scratch, blk, nil, d.f64)
 }
 
-// decodeOneBlock decompresses and decodes a single block into a fresh slice.
-func decodeOneBlock[T any](
-	dir blockDir, comp *compress.Compressor, blk int, dec func([]T, []byte) ([]T, int, error),
+// DecodeFloat64Into is the float64 analog of [Decoder.DecodeInt64Into].
+func (d *Decoder) DecodeFloat64Into(blk int, dst []float64) ([]float64, error) {
+	return decodeOneBlockInto(d.dir, d.comp, &d.scratch, blk, dst, d.f64)
+}
+
+// decodeOneBlockInto decompresses and decodes a single block into dst (reusing dst's backing array
+// when its capacity allows), decompressing through *scratch (retained across calls for reuse). A nil
+// dst decodes into a fresh slice.
+func decodeOneBlockInto[T any](
+	dir blockDir, comp *compress.Compressor, scratch *[]byte, blk int, dst []T,
+	dec func([]T, []byte) ([]T, int, error),
 ) ([]T, error) {
 	if dec == nil {
 		return nil, errors.New("block: nil decoder")
@@ -344,12 +365,14 @@ func decodeOneBlock[T any](
 		return nil, errors.Errorf("block: block %d out of range [0,%d)", blk, dir.nBlocks())
 	}
 
-	stream, err := comp.Decompress(nil, dir.block(blk))
+	stream, err := comp.Decompress((*scratch)[:0], dir.block(blk))
 	if err != nil {
 		return nil, errors.Wrapf(err, "decompress block %d", blk)
 	}
 
-	out, _, err := dec(nil, stream)
+	*scratch = stream // retain the (possibly grown) buffer for the next block
+
+	out, _, err := dec(dst[:0], stream)
 
 	return out, err
 }

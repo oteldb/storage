@@ -544,9 +544,18 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   every whole part touched, and an overlapping query reuses already-decoded blocks (columns cache
   independently — a ts-only count and a value-reading fetch over the same part share the ts blocks
   without the value column ever being decoded). A cached block is an immutable decoded slice; a fetch
-  **copies** the blocks it needs into a pooled per-fetch `decodedPart`, so cache entries are never
-  mutated and stay valid across concurrent fetches. Blocks are dropped when the part is reclaimed
-  (`evictPrefix`) or the budget evicts the coldest. With the cache on, a fetch also **prefetches** the
+  either **copies** the blocks it needs into a pooled per-fetch `decodedPart` or (on the block-slice
+  path) holds them as merge *views*, so cache entries are never mutated and stay valid across
+  concurrent fetches. Blocks are dropped when the part is reclaimed (`evictPrefix`) or the budget
+  evicts the coldest. An evicted block's decoded slice is **recycled** into a bounded, GC-stable
+  freelist that the next cache-miss decode draws its destination from (`DecodeInt64Into` /
+  `DecodeFloat64Into`, decompressing through a scratch buffer the per-column `Decoder` reuses across
+  its blocks) — this cuts the miss-path allocation *rate* (the dominant query-path allocation once the
+  live heap is bounded) without enlarging the resident set. Because a fetch may still be viewing a
+  block when the byte budget evicts it, each entry is **reference-counted**: `get`/`insert` pin it, the
+  fetch releases its pins at teardown (`releaseParts` → `releasePins`), and a buffer returns to the
+  freelist only once its entry is both evicted and unpinned — so a reader never sees a block it holds
+  recycled underneath it. With the cache on, a fetch also **prefetches** the
   parts it will touch — warming each part's matched blocks concurrently (bounded fan-out) so backend
   reads + decodes overlap instead of running one part at a time.
   A **decode-memory budget** (`Config.DecodeMemoryBytes`, `budget.go`) caps the total in-flight
