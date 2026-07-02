@@ -461,11 +461,12 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   tenant's flushed data without the (local) WAL. WAL `Replay` is complementary, restoring only
   the *unflushed* head.
 - **Part fetch** (`part.go`) — `openPart` rebuilds a sparse `SeriesID → [rowStart,rowEnd)` index
-  by scanning the sorted series column once (each series is one contiguous run). The index is two
-  parallel sorted slices (`ids` + `rowRanges`, plus a cached total) — a binary-searchable layout with
-  no per-entry overhead, chosen over a resident map so a part's resident footprint is 24 bytes/series
-  regardless of map bucket growth; `mergeInto` decodes a series' `ts`/`value` sub-slice within the
-  window.
+  by scanning the sorted series column once (each series is one contiguous run). The index is a
+  sorted `ids` slice plus an `int32` row-start offsets slice — because the runs partition
+  `[0, rows)`, series k's range is `[starts[k], starts[k+1])`, so no per-entry end or total is
+  stored. A binary-searchable layout with no per-entry overhead, chosen over a resident map, so a
+  part's resident footprint is 20 bytes/series (16 id + 4 offset) regardless of map bucket growth;
+  `mergeInto` decodes a series' `ts`/`value` sub-slice within the window.
 - **Merge — compaction + retention + downsampling + recompression + precision** (`merge.go`,
   `downsample.go`, `recompress.go`, `precision.go`) is the one background-merge engine; all five modes
   are one pass over the immutable parts (no separate subsystem). `MergeWith(MergeOptions{RetainFrom,

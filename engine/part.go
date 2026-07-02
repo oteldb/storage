@@ -29,15 +29,22 @@ func u128ToID(u chunk.U128) signal.SeriesID  { return signal.SeriesID{Hi: u.Hi, 
 // rowRange is the half-open row span [start, end) a series occupies in a part.
 type rowRange struct{ start, end int }
 
-// partIndex is a part's SeriesID → row-range index: two parallel slices sorted by id, so a lookup is
-// a binary search (O(log series)) and the layout carries no per-entry overhead — vs a resident map's
-// bucket structure (~3× the payload) which dominated live heap under continuous ingestion. Because
-// rows are sorted by (series, ts), every series occupies one contiguous run; the index records each
-// id once in a single pass over the (already sorted) on-disk series column.
+// partIndex is a part's SeriesID → row-range index: a sorted id slice plus a row-start offsets
+// slice, so a lookup is a binary search (O(log series)) and the layout carries no per-entry
+// overhead — vs a resident map's bucket structure (~3× the payload) which dominated live heap
+// under continuous ingestion. Because rows are sorted by (series, ts), every series occupies one
+// contiguous run and the runs partition [0, rows): series k's range is
+// [starts[k], starts[k+1]), so no per-entry end (nor a separate total) is stored. That makes the
+// resident cost 20 bytes/series (16 id + 4 offset) — the compact form of the "stop pinning the
+// full SeriesID→rowRange map" work; a further sparse/paged level is deliberately not layered on,
+// as lookup sits on the per-series hot path of every fetch/count/aggregate.
+//
+// int32 offsets cap a part at ~2.1 G rows; openPart materializes the whole series column in RAM
+// (16 B/row) to build this index, so a part anywhere near that bound (32 GiB of ids) is
+// unrepresentable long before the offset overflows.
 type partIndex struct {
 	ids    []signal.SeriesID
-	ranges []rowRange
-	total  int // sum of every range's length; equals the series column length, cached for an O(1) rows()
+	starts []int32 // len == len(ids)+1; starts[0] == 0, starts[len(ids)] == total rows
 }
 
 // lookup returns id's row range and whether the part holds it.
@@ -47,7 +54,7 @@ func (idx partIndex) lookup(id signal.SeriesID) (rowRange, bool) {
 		return rowRange{}, false
 	}
 
-	return idx.ranges[i], true
+	return rowRange{start: int(idx.starts[i]), end: int(idx.starts[i+1])}, true
 }
 
 // has reports whether the part holds id.
@@ -57,12 +64,21 @@ func (idx partIndex) has(id signal.SeriesID) bool {
 	return ok
 }
 
+// rows returns the part's total sample count (the series runs partition [0, rows)).
+func (idx partIndex) rows() int {
+	if len(idx.starts) == 0 {
+		return 0
+	}
+
+	return int(idx.starts[len(idx.starts)-1])
+}
+
 // buildPartIndex scans a sorted series column (each distinct id repeated for its contiguous run) and
 // records one entry per distinct id — the inverse of the on-disk layout. It is what openPart pays
 // once per part open. It counts distinct ids in a first pass so the two output slices are sized
-// exactly (no over-allocation and no regrow), keeping the resident footprint to 24 bytes/series.
+// exactly (no over-allocation and no regrow), keeping the resident footprint to 20 bytes/series.
 func buildPartIndex(ids []chunk.U128) partIndex {
-	idx := partIndex{total: len(ids)}
+	var idx partIndex
 	if len(ids) == 0 {
 		return idx
 	}
@@ -75,7 +91,7 @@ func buildPartIndex(ids []chunk.U128) partIndex {
 	}
 
 	idx.ids = make([]signal.SeriesID, distinct)
-	idx.ranges = make([]rowRange, distinct)
+	idx.starts = make([]int32, distinct+1)
 
 	k := 0
 	for i := 0; i < len(ids); {
@@ -85,10 +101,12 @@ func buildPartIndex(ids []chunk.U128) partIndex {
 		}
 
 		idx.ids[k] = u128ToID(ids[i])
-		idx.ranges[k] = rowRange{start: i, end: j}
+		idx.starts[k] = int32(i)
 		k++
 		i = j
 	}
+
+	idx.starts[distinct] = int32(len(ids))
 
 	return idx
 }
@@ -208,7 +226,7 @@ func (p *part) compressedWith() compress.Algorithm {
 
 // rows returns the part's total sample count (its series ranges partition [0, rows)).
 func (p *part) rows() int {
-	return p.index.total
+	return p.index.rows()
 }
 
 // colNeed selects which of a part's columns a decode materializes beyond the always-decoded

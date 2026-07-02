@@ -17,8 +17,7 @@ func partWithRows(seq, rows int) *part {
 		prefix: string(rune('a' + seq)),
 		index: partIndex{
 			ids:    []signal.SeriesID{{Hi: uint64(seq)}},
-			ranges: []rowRange{{start: 0, end: rows}},
-			total:  rows,
+			starts: []int32{0, int32(rows)},
 		},
 	}
 }
