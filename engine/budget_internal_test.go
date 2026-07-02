@@ -115,3 +115,22 @@ func TestDecodeBudgetConcurrentBounded(t *testing.T) {
 
 	assert.False(t, over.Load(), "in-flight reservations exceeded the cap")
 }
+
+// TestDecodeBudgetSharedAcrossEngines checks Config.DecodeBudget: engines given the same budget
+// adopt it (so the cap is process-wide, not per-tenant), and it takes precedence over
+// DecodeMemoryBytes.
+func TestDecodeBudgetSharedAcrossEngines(t *testing.T) {
+	t.Parallel()
+
+	b := NewDecodeBudget(100)
+	e1 := New(Config{DecodeBudget: b})
+	e2 := New(Config{DecodeBudget: b, DecodeMemoryBytes: 5})
+
+	assert.Same(t, b, e1.budget)
+	assert.Same(t, b, e2.budget, "DecodeBudget must take precedence over DecodeMemoryBytes")
+
+	own := New(Config{DecodeMemoryBytes: 5})
+	if assert.NotNil(t, own.budget) {
+		assert.Equal(t, int64(5), own.budget.maxBytes)
+	}
+}

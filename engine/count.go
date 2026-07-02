@@ -100,7 +100,7 @@ func (e *Engine) planCount(r fetch.Request) ([]signal.SeriesID, *enginePlan) {
 	e.mu.RUnlock()
 
 	// Count decodes timestamps only (existence), and only for window-edge parts; reserve that.
-	plan.acquireDecodeBudget(colNeed{}, false)
+	plan.acquireDecodeBudget(colNeed{})
 
 	return ids, plan
 }
