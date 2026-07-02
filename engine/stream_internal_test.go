@@ -102,8 +102,17 @@ func BenchmarkDecodeResident(b *testing.B) {
 
 			var dst rangeBuf
 
-			for _, id := range p.index.ids {
-				rng, ok := p.index.lookup(id)
+			var partIDs []signal.SeriesID
+			if err := p.index.forEachID(ctx, func(id signal.SeriesID) { partIDs = append(partIDs, id) }); err != nil {
+				b.Fatal(err)
+			}
+
+			for _, id := range partIDs {
+				rng, ok, err := p.index.lookup(ctx, id)
+				if err != nil {
+					b.Fatal(err)
+				}
+
 				if !ok {
 					continue
 				}

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"math/rand/v2"
 	"testing"
 
@@ -42,21 +43,32 @@ func TestBuildPartIndexProperties(t *testing.T) {
 		require.Equal(t, len(col), idx.rows(), "rows() equals the column length")
 		require.Len(t, idx.ids, distinct)
 
+		ctx := context.Background()
+
 		for id, want := range runs {
-			got, ok := idx.lookup(id)
+			got, ok, err := idx.lookup(ctx, id)
+			require.NoError(t, err)
 			require.True(t, ok)
 			assert.Equal(t, want, got)
-			assert.True(t, idx.has(id))
+
+			hasIt, err := idx.has(ctx, id)
+			require.NoError(t, err)
+			assert.True(t, hasIt)
 		}
 
-		_, ok := idx.lookup(signal.SeriesID{Hi: ^uint64(0), Lo: ^uint64(0)})
+		_, ok, err := idx.lookup(ctx, signal.SeriesID{Hi: ^uint64(0), Lo: ^uint64(0)})
+		require.NoError(t, err)
 		assert.False(t, ok, "absent id misses")
-		assert.False(t, idx.has(signal.SeriesID{Hi: ^uint64(0), Lo: ^uint64(0)}))
+
+		hasIt, err := idx.has(ctx, signal.SeriesID{Hi: ^uint64(0), Lo: ^uint64(0)})
+		require.NoError(t, err)
+		assert.False(t, hasIt)
 
 		// The runs partition [0, rows): consecutive lookups over the sorted ids tile the row space.
 		next := 0
 		for _, id := range idx.ids {
-			r, ok := idx.lookup(id)
+			r, ok, err := idx.lookup(ctx, id)
+			require.NoError(t, err)
 			require.True(t, ok)
 			assert.Equal(t, next, r.start, "runs are contiguous")
 			assert.Greater(t, r.end, r.start, "runs are non-empty")

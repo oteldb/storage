@@ -3,7 +3,6 @@ package engine
 import (
 	"bytes"
 	"context"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -493,7 +492,12 @@ func (p *enginePlan) decodePart(ctx context.Context, part *part) (*decodedPart, 
 		return d, nil
 	}
 
-	d, err := p.engine.decodeOf(ctx, part, colNeed{values: true}, p.rangesFor(part))
+	ranges, err := p.rangesFor(ctx, part)
+	if err != nil {
+		return nil, err
+	}
+
+	d, err := p.engine.decodeOf(ctx, part, colNeed{values: true}, ranges)
 	if err != nil {
 		return nil, err
 	}
@@ -506,23 +510,32 @@ func (p *enginePlan) decodePart(ctx context.Context, part *part) (*decodedPart, 
 // rangesFor returns the row runs of the plan's matched series that part holds — the input to the
 // series-skip decode. The result is the union of the part's per-series ranges; it need not be sorted
 // (neededBlocks unions their blocks regardless).
-func (p *enginePlan) rangesFor(part *part) []rowRange {
+func (p *enginePlan) rangesFor(ctx context.Context, part *part) ([]rowRange, error) {
 	out := make([]rowRange, 0, len(p.ids))
 
 	for _, id := range p.ids {
-		if rng, ok := part.index.lookup(id); ok {
+		rng, ok, err := part.index.lookup(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+
+		if ok {
 			out = append(out, rng)
 		}
 	}
 
-	return out
+	return out, nil
 }
 
 func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampleMerge, error) {
 	var m sampleMerge
 
 	for _, part := range p.liveParts {
-		rng, ok := part.index.lookup(id)
+		rng, ok, err := part.index.lookup(ctx, id)
+		if err != nil {
+			return m, err
+		}
+
 		if !ok {
 			continue
 		}
@@ -1213,7 +1226,20 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 	var todo []*part
 
 	for _, pt := range plan.liveParts {
-		if slices.ContainsFunc(plan.ids, pt.index.has) {
+		// Best-effort membership probe: an index read error here includes the part anyway — the
+		// warm/decode below (and ultimately the merge) surfaces any real failure.
+		touched := false
+
+		for _, id := range plan.ids {
+			ok, err := pt.index.has(ctx, id)
+			if err != nil || ok {
+				touched = true
+
+				break
+			}
+		}
+
+		if touched {
 			todo = append(todo, pt)
 		}
 	}
@@ -1237,13 +1263,18 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 			// Warm only the blocks this fetch's matched series touch. A block-sliceable part decodes
 			// its blocks straight into the cache (no whole-part buffer); otherwise fall back to the
 			// decoded-part path and return the throwaway buffer to the pool.
+			ranges, err := plan.rangesFor(ctx, p)
+			if err != nil {
+				return // best-effort: the merge re-reads and surfaces it
+			}
+
 			if r := plan.blockReaders[p]; r != nil {
-				_ = r.warm(ctx, plan.rangesFor(p))
+				_ = r.warm(ctx, ranges)
 
 				return
 			}
 
-			dp, err := e.decodeOf(ctx, p, colNeed{values: true}, plan.rangesFor(p))
+			dp, err := e.decodeOf(ctx, p, colNeed{values: true}, ranges)
 			if err == nil {
 				e.recycleDecoded(dp)
 			}

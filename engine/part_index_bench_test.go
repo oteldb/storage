@@ -1,11 +1,13 @@
 package engine
 
 import (
+	"context"
 	"math/rand/v2"
 	"slices"
 	"strconv"
 	"testing"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/signal"
 )
@@ -57,13 +59,27 @@ func BenchmarkPartIndexBuild(b *testing.B) {
 }
 
 // BenchmarkPartIndexLookup measures the per-query cost of locating a series' row range in a part's
-// index — paid once per (part × series a query touches).
+// index — paid once per (part × series a query touches) — for both index forms: the resident
+// slices and the paged sidecar view (binary search over raw fixed-width entries). The paged form
+// is the hot-path cost the pageable index trades for its zero pinned heap.
 func BenchmarkPartIndexLookup(b *testing.B) {
 	for _, n := range []int{1_000, 10_000, 100_000} {
 		const samplesPerSeries = 4
 
 		col := makeSortedSeriesColumn(n, samplesPerSeries)
 		idx := buildPartIndex(col)
+
+		be := backend.Memory()
+		if err := be.Write(context.Background(), sidxKey("p"), encodeSeriesIndex(col)); err != nil {
+			b.Fatal(err)
+		}
+
+		paged, ok := openPagedIndex(context.Background(), be, "p", len(col))
+		if !ok {
+			b.Fatal("paged index did not open")
+		}
+
+		pagedIdx := partIndex{paged: paged}
 
 		// A realistic mix: ~half the queries hit a resident series, half miss (a range query over a
 		// time window touches some parts that don't hold a given series).
@@ -83,19 +99,23 @@ func BenchmarkPartIndexLookup(b *testing.B) {
 			probes[i], probes[j] = probes[j], probes[i]
 		}
 
-		b.Run(strconv.Itoa(n/1000)+"k", func(b *testing.B) {
-			b.ReportAllocs()
+		for name, ix := range map[string]partIndex{"resident": idx, "paged": pagedIdx} {
+			b.Run(strconv.Itoa(n/1000)+"k/"+name, func(b *testing.B) {
+				b.ReportAllocs()
 
-			var sink int
+				var sink int
 
-			for i := range b.N {
-				rg, ok := idx.lookup(probes[i%len(probes)])
-				if ok {
-					sink += rg.end - rg.start
+				ctx := context.Background()
+
+				for i := range b.N {
+					rg, ok, _ := ix.lookup(ctx, probes[i%len(probes)])
+					if ok {
+						sink += rg.end - rg.start
+					}
 				}
-			}
 
-			_ = sink
-		})
+				_ = sink
+			})
+		}
 	}
 }

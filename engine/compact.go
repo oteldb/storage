@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"math/bits"
 	"slices"
 
@@ -9,11 +10,12 @@ import (
 
 // sortedSeriesIDs returns the union of every series id across src, sorted, so a compaction visits
 // each series once in (series, ts) part order.
-func sortedSeriesIDs(src []*part) []signal.SeriesID {
+func sortedSeriesIDs(ctx context.Context, src []*part) ([]signal.SeriesID, error) {
 	idSet := make(map[signal.SeriesID]struct{})
+
 	for _, p := range src {
-		for _, id := range p.index.ids {
-			idSet[id] = struct{}{}
+		if err := p.index.forEachID(ctx, func(id signal.SeriesID) { idSet[id] = struct{}{} }); err != nil {
+			return nil, err
 		}
 	}
 
@@ -24,7 +26,7 @@ func sortedSeriesIDs(src []*part) []signal.SeriesID {
 
 	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
 
-	return ids
+	return ids, nil
 }
 
 // Size-tiered compaction (DESIGN.md §4). The engine does not re-merge its whole part set on every
