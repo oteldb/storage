@@ -673,8 +673,13 @@ to the boundary via `recordCols.keep`); the **metric engine ignores it** (PromQL
 
 **Count pushdown (`fetch.Counter` / `fetch.GroupCounter`).** Two optional `Fetcher` capabilities
 answer count-shaped PromQL without materializing samples or labels. `Counter.Count` (engine:
-`count.go`) backs `count(<selector>)`: matched ids resolve from postings, and per-series in-window
-existence comes from the part index — a part fully covered by the window contributes its matched
+`count.go`) backs `count(<selector>)`: matched ids resolve from postings; a count-shaped read
+plans through a **lightweight existence plan** (`planExistence`) that computes one in-memory
+existence flag per matched id under the lock by scanning the live head/flush/recent buffers
+directly — no per-series sorted batch copies, no batch maps, no identity slab (snapshotted only
+for `CountBy`'s grouping), no block readers — so a broad concurrent count holds none of the
+fetch-shaped per-plan state that used to top the live heap; per-series in-window
+existence for flushed data comes from the part index — a part fully covered by the window contributes its matched
 ids by a sorted intersection with **zero column decode**; only window-edge parts decode, and only
 their timestamp column. `GroupCounter.CountBy` is the grouped variant backing
 `count by (label)(<selector>)` (and, via the result's length, `count(count by (label)(...))` =

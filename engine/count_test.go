@@ -366,3 +366,63 @@ func TestCountByMatchesFetchAcrossWindows(t *testing.T) {
 		assert.Equal(t, want, got, "window [%d,%d]", w[0], w[1])
 	}
 }
+
+// TestCountRecentTier pins the count paths over the recent-tier short-circuit: a count whose window
+// falls inside the tier must answer from the in-memory existence flags (no part acquired), and
+// counts spanning the tier boundary must still agree with Fetch. Covers the lightweight existence
+// plan's recent/flush scanning (which replaced the per-series batch snapshots).
+func TestCountRecentTier(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	const window = int64(60 * 1e9) // 60s
+	e := engine.New(engine.Config{
+		Backend:      backend.Memory(),
+		Prefix:       "t/count-recent",
+		RecentWindow: window,
+		MaxPartBytes: 0,
+	})
+
+	a := mkSeries("__name__", "cpu", "cpu", "0")
+	b := mkSeries("__name__", "cpu", "cpu", "1")
+
+	appendOne := func(s signal.Series, ts int64) {
+		t.Helper()
+
+		id := s.Hash()
+		_, err := e.AppendBatch(
+			[]signal.SeriesID{id}, []int64{ts}, []float64{1}, nil,
+			func(int) signal.Series { return s }, engine.AppendLimits{},
+		)
+		require.NoError(t, err)
+	}
+
+	appendOne(a, 100)
+	appendOne(b, 110)
+	require.NoError(t, e.Flush(ctx)) // flushed; the recent tier retains [newest-window, newest]
+
+	for _, w := range [][2]int64{
+		{100, 1 << 62}, // whole range (tier short-circuit: inside [newest-60s, ...])
+		{105, 200},     // only b in window
+		{300, 400},     // nothing
+	} {
+		r := fetch.Request{Start: w[0], End: w[1], Matchers: []fetch.Matcher{eqMatcher("__name__", "cpu")}}
+
+		got, err := e.Count(ctx, r)
+		require.NoError(t, err)
+		assert.Equal(t, len(fetchAll(t, e, r)), got, "Count must match Fetch over window [%d,%d]", w[0], w[1])
+
+		gotBy, err := e.CountBy(ctx, r, []byte("cpu"))
+		require.NoError(t, err)
+		assert.Equal(t, groupCountsViaFetch(t, e, r, "cpu"), orEmpty(gotBy), "CountBy must match grouped Fetch")
+	}
+}
+
+// orEmpty normalizes a nil/empty map to the empty map for comparison with the fetch oracle.
+func orEmpty(m map[string]int) map[string]int {
+	if len(m) == 0 {
+		return map[string]int{}
+	}
+
+	return m
+}

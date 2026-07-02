@@ -478,6 +478,11 @@ type enginePlan struct {
 	engine       *Engine // for returning pooled decode buffers on release
 	budgetBytes  int64   // decode-memory budget reserved for this query; released on releaseParts
 	start, end   int64
+	// memActive is the count-shaped plan's replacement for the head/flush/recent batch snapshots:
+	// one existence flag per matched id (any in-memory sample in [start, end]), computed under the
+	// plan lock by scanning the live buffers directly — no per-series sorted copy, no batch maps.
+	// nil on a full fetch plan (which snapshots real batches instead).
+	memActive []bool
 }
 
 // mergeSeries gathers series id's samples lock-free: each acquired part oldest→newest, then the
@@ -1285,10 +1290,12 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 }
 
 // acquireWindowParts acquires every live part overlapping [start, end] into the plan (time-pruning
-// the rest) and, when the block cache is on, builds a per-part block reader for each block-sliceable
-// part. Caller holds e.mu.
-func (e *Engine) acquireWindowParts(p *enginePlan, start, end int64) {
-	if e.blockCache != nil {
+// the rest) and, when withReaders and the block cache is on, builds a per-part block reader for
+// each block-sliceable part. A count-shaped plan passes withReaders=false — it never merges block
+// views (edge parts decode timestamps through the plan decode cache), so the per-part readers and
+// the freelist concurrency registration would be dead weight. Caller holds e.mu.
+func (e *Engine) acquireWindowParts(p *enginePlan, start, end int64, withReaders bool) {
+	if withReaders && e.blockCache != nil {
 		p.blockReaders = make(map[*part]*seriesBlockReader, len(e.parts))
 		// Registered until releaseParts (which keys off p.blockReaders != nil), scaling the decode
 		// freelists with fetch concurrency.
@@ -1303,8 +1310,10 @@ func (e *Engine) acquireWindowParts(p *enginePlan, start, end int64) {
 		pt.acquire()
 		p.liveParts = append(p.liveParts, pt)
 
-		if br := e.newSeriesBlockReader(pt); br != nil {
-			p.blockReaders[pt] = br
+		if p.blockReaders != nil {
+			if br := e.newSeriesBlockReader(pt); br != nil {
+				p.blockReaders[pt] = br
+			}
 		}
 	}
 }
@@ -1327,7 +1336,7 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 	// The recent tier short-circuit: when the query range falls inside the tier's window, the tier ∪
 	// the mid-flush buffers ∪ the head cover it entirely, so no part is acquired or decoded.
 	if !e.recentEnabled() || r.Start < e.recentMin {
-		e.acquireWindowParts(p, r.Start, r.End)
+		e.acquireWindowParts(p, r.Start, r.End, true)
 	}
 
 	for i, id := range ids {
@@ -1357,6 +1366,68 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 	}
 
 	return p
+}
+
+// planExistence is [Engine.planFetch] for count-shaped reads, which need only per-series
+// *existence* in the window: instead of snapshotting a sorted per-series copy of every head/flush/
+// recent buffer into batch maps and materializing the full identity slab (fetch-shaped state a
+// count never reads — under concurrent broad counts those slabs alone were the top live-heap
+// entry), it computes one in-memory existence flag per matched id by scanning the live buffers
+// directly under the lock. Identity is snapshotted only when the caller groups by it (CountBy).
+// Parts are acquired without block readers (edge parts decode timestamps via the plan decode
+// cache). Caller holds e.mu (read lock); release with releaseParts as usual.
+func (e *Engine) planExistence(ids []signal.SeriesID, r fetch.Request, withIdentity bool) *enginePlan {
+	p := &enginePlan{
+		ids:       ids,
+		decoded:   make(partDecodeCache),
+		engine:    e,
+		start:     r.Start,
+		end:       r.End,
+		memActive: make([]bool, len(ids)),
+	}
+
+	if withIdentity {
+		p.series = e.getSeriesSlice(len(ids))
+	}
+
+	// The recent tier short-circuit, as in planFetch: a window inside the tier is fully covered by
+	// the in-memory buffers, so no part is acquired or decoded.
+	if !e.recentEnabled() || r.Start < e.recentMin {
+		e.acquireWindowParts(p, r.Start, r.End, false)
+	}
+
+	recent := e.recentEnabled()
+
+	for i, id := range ids {
+		if withIdentity {
+			if s, ok := e.head.series.Get(id); ok {
+				p.series[i] = s
+			}
+		}
+
+		p.memActive[i] = bufHasInWindow(e.head.samples[id], r.Start, r.End) ||
+			bufHasInWindow(e.flushing[id], r.Start, r.End) ||
+			(recent && bufHasInWindow(e.recent[id], r.Start, r.End))
+	}
+
+	return p
+}
+
+// bufHasInWindow reports whether buf holds any sample in [start, end]. The buffer may be unsorted
+// (head buffers sort lazily on read), so this is a linear scan — but it copies and sorts nothing,
+// which is the point: existence is the only thing a count needs from the in-memory tiers.
+func bufHasInWindow(buf *sampleBuf, start, end int64) bool {
+	if buf == nil {
+		return false
+	}
+
+	for _, ts := range buf.ts {
+		if ts >= start && ts <= end {
+			return true
+		}
+	}
+
+	return false
 }
 
 // replayHandlers returns the WAL handlers that rebuild the head from logged records — registering
