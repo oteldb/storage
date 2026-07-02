@@ -21,11 +21,9 @@ func TestBuildPartIndexProperties(t *testing.T) {
 
 	for _, distinct := range []int{0, 1, 2, 7, 100} {
 		// A sorted series column: ascending ids, each repeated 1..8 times.
-		var col []chunk.U128
+		col := make([]chunk.U128, 0, distinct*8)
 
-		type run struct{ start, end int }
-
-		runs := map[signal.SeriesID]run{}
+		runs := map[signal.SeriesID]rowRange{}
 
 		for k := range distinct {
 			id := chunk.U128{Hi: uint64(k / 3), Lo: uint64(k * 17)}
@@ -36,7 +34,7 @@ func TestBuildPartIndexProperties(t *testing.T) {
 				col = append(col, id)
 			}
 
-			runs[u128ToID(id)] = run{start: start, end: len(col)}
+			runs[u128ToID(id)] = rowRange{start: start, end: len(col)}
 		}
 
 		idx := buildPartIndex(col)
@@ -47,7 +45,7 @@ func TestBuildPartIndexProperties(t *testing.T) {
 		for id, want := range runs {
 			got, ok := idx.lookup(id)
 			require.True(t, ok)
-			assert.Equal(t, rowRange{start: want.start, end: want.end}, got)
+			assert.Equal(t, want, got)
 			assert.True(t, idx.has(id))
 		}
 
