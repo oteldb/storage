@@ -230,3 +230,42 @@ func TestColumnKindAccessors(t *testing.T) {
 	assert.Equal(t, KindInt64, r.Kind())
 	assert.Equal(t, 3, r.Len())
 }
+
+// TestColumnBytesBlobFormMatchesSlices pins the blob+offsets column input to the [][]byte form:
+// the built object and descriptor (const detection included) must be identical, so the two input
+// shapes cannot diverge on disk.
+func TestColumnBytesBlobFormMatchesSlices(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string][][]byte{
+		"varied":   {[]byte("a"), []byte("bb"), []byte("a"), []byte("ccc")},
+		"constant": {[]byte("same"), []byte("same"), []byte("same")},
+		"empty":    {},
+	}
+
+	for name, vals := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var blob []byte
+			offsets := make([]int32, 1, len(vals)+1)
+			for _, v := range vals {
+				blob = append(blob, v...)
+				offsets = append(offsets, int32(len(blob)))
+			}
+
+			comp := compress.NewCompressor(compress.AlgorithmNone, compress.LevelDefault)
+
+			sliceDesc, sliceObj, err := buildColumn(Column{Name: "c", Kind: KindBytes, Bytes: vals}, comp, defaultGranuleSize)
+			require.NoError(t, err)
+
+			blobDesc, blobObj, err := buildColumn(
+				Column{Name: "c", Kind: KindBytes, BytesBlob: blob, BytesOffsets: offsets}, comp, defaultGranuleSize,
+			)
+			require.NoError(t, err)
+
+			assert.Equal(t, sliceDesc, blobDesc, "descriptors (incl. const detection) must match")
+			assert.Equal(t, sliceObj, blobObj, "serialized objects must be byte-identical")
+		})
+	}
+}

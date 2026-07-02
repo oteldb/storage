@@ -58,6 +58,31 @@ type Backend interface {
 	Delete(ctx context.Context, key string) error
 }
 
+// Viewer is an optional [Backend] capability: ReadView returns the value stored under key as a
+// **read-only view** that may alias shared state (a cache entry, the in-memory store) instead of
+// [Backend.Read]'s defensive copy. The caller MUST NOT mutate the returned slice; it MAY retain it
+// indefinitely — a stored value is never mutated in place (Write/Delete replace or drop the map
+// entry, they never rewrite the old array), so a view stays valid even after the key is
+// overwritten, evicted, or deleted. It exists for hot read paths (part column objects, read once
+// per query per column) where the copy is a measured allocation cost; use [ReadView] rather than
+// asserting directly so callers stay correct over any backend.
+type Viewer interface {
+	// ReadView returns the value stored under key as a read-only view (do not mutate). Absent keys
+	// error like [Backend.Read].
+	ReadView(ctx context.Context, key string) ([]byte, error)
+}
+
+// ReadView returns key's value without a defensive copy when b implements [Viewer], falling back
+// to a plain (caller-owned) Read otherwise. Either way the caller must treat the result as
+// read-only — that is the contract that lets implementations skip the copy.
+func ReadView(ctx context.Context, b Backend, key string) ([]byte, error) {
+	if v, ok := b.(Viewer); ok {
+		return v.ReadView(ctx, key)
+	}
+
+	return b.Read(ctx, key)
+}
+
 // Sizer is an optional [Backend] capability: report an object's stored byte size without reading
 // its contents. Backends that can answer cheaply implement it (memory: the in-RAM length; file:
 // os.Stat). Use [SizeOf] rather than asserting directly — it falls back to a full Read for backends
@@ -149,6 +174,20 @@ func (m *memoryBackend) Read(_ context.Context, key string) ([]byte, error) {
 	}
 
 	return slices.Clone(v), nil
+}
+
+// ReadView returns the stored value itself (no copy). Safe because stored values are immutable:
+// Write/PutIfAbsent insert private copies and only ever replace the map entry. Implements [Viewer].
+func (m *memoryBackend) ReadView(_ context.Context, key string) ([]byte, error) {
+	m.mu.RLock()
+	v, ok := m.objects[key]
+	m.mu.RUnlock()
+
+	if !ok {
+		return nil, errors.Wrapf(ErrNotExist, "read %q", key)
+	}
+
+	return v, nil
 }
 
 func (m *memoryBackend) List(_ context.Context, prefix string) ([]string, error) {

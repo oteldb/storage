@@ -233,6 +233,49 @@ func (q *querier) CountSeries(ctx context.Context, startMs, endMs int64, matcher
 	return uint64(n), nil
 }
 
+// CountSeriesBy is [querier.CountSeries] grouped by one label: it returns, per distinct value of
+// label among the matching series, the number of such series with at least one sample in
+// [startMs, endMs] — without materializing samples or label sets. It is the pushdown hook for
+// PromQL `count by (label)(<selector>)` (one group per map entry) and
+// `count(count by (label)(...))` (the map's length = distinct label values). Series without the
+// label are grouped under "" (PromQL's absent-label group).
+//
+// Matcher pushability follows [querier.CountSeries]: a selector whose matchers are not all
+// index-safe falls back to a Fetch-based grouping that re-checks every resolved series against the
+// full matcher set, preserving exact Prometheus semantics.
+func (q *querier) CountSeriesBy(
+	ctx context.Context, startMs, endMs int64, label string, matchers ...*labels.Matcher,
+) (map[string]uint64, error) {
+	pushed := PushableMatchers(matchers)
+	if len(pushed) < len(matchers) {
+		return q.countSeriesByRecheck(ctx, startMs, endMs, label, matchers, pushed)
+	}
+
+	counter := fetch.GroupCounterOf(q.fetcher)
+	if counter == nil {
+		return nil, errCountNotSupported
+	}
+
+	req := fetch.Request{
+		Tenant:   q.tenant,
+		Start:    msToNsClamp(startMs, math.MinInt64),
+		End:      msToNsClamp(endMs, math.MaxInt64),
+		Matchers: pushed,
+	}
+
+	groups, err := counter.CountBy(ctx, req, []byte(label))
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]uint64, len(groups))
+	for v, n := range groups {
+		out[v] = uint64(n)
+	}
+
+	return out, nil
+}
+
 // LabelValues returns the distinct values of name across the series matching matchers over the
 // querier window. It backs the Prometheus /api/v1/label/<name>/values endpoint (and so Grafana's
 // metric/label browser). The promql.Engine never calls it for evaluation.
@@ -321,6 +364,42 @@ func (q *querier) countSeriesRecheck(
 	}
 
 	return n, nil
+}
+
+// countSeriesByRecheck is [querier.countSeriesRecheck] grouped by one label: it fetches the
+// index-safe subset and groups the series that pass the full matcher set by the label's value in
+// their Prometheus label set.
+func (q *querier) countSeriesByRecheck(
+	ctx context.Context, startMs, endMs int64, label string,
+	matchers []*labels.Matcher, pushed []fetch.Matcher,
+) (map[string]uint64, error) {
+	req := fetch.Request{
+		Tenant:   q.tenant,
+		Start:    msToNsClamp(startMs, math.MinInt64),
+		End:      msToNsClamp(endMs, math.MaxInt64),
+		Matchers: pushed,
+	}
+
+	it, err := q.fetcher.Fetch(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	batches, err := fetch.Drain(ctx, it)
+	if err != nil {
+		return nil, err
+	}
+
+	groups := make(map[string]uint64)
+
+	for _, b := range batches {
+		lset := PromLabels(b.Series)
+		if MatchesAll(lset, matchers) {
+			groups[lset.Get(label)]++
+		}
+	}
+
+	return groups, nil
 }
 
 // seriesLabels fetches the matching series over the querier window and projects each to its

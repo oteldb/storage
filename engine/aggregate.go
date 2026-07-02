@@ -205,6 +205,8 @@ func (e *Engine) bucketSeries(
 		}
 
 		ts, values, _ := m.collect(nil, nil)
+		plan.releaseSeriesPins() // samples copied out; recirculate this series' block pins
+
 		for i := range ts {
 			addSample(ts[i], values[i])
 		}
@@ -395,6 +397,7 @@ func aggViaDecode(ctx context.Context, plan *enginePlan, id signal.SeriesID) (Se
 	}
 
 	_, values, _ := m.collect(nil, nil)
+	plan.releaseSeriesPins() // samples copied out; recirculate this series' block pins
 
 	var agg SeriesAgg
 	for _, v := range values {

@@ -7,6 +7,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/signal"
 )
 
 // BenchmarkCountPushdown reproduces the full_scan_count finding: count({...}) over a large
@@ -136,4 +137,83 @@ func countViaFetch(b *testing.B, ctx context.Context, e *engine.Engine, req fetc
 	}
 
 	return len(batches)
+}
+
+// BenchmarkCountByPushdown reproduces the count_cpu_cores finding: `count(count by (cpu)(...))`
+// over a large matched set. The Fetch baseline materializes every matched series' samples and
+// groups afterwards; Engine.CountBy answers group membership from the snapshotted identities and
+// in-window existence from the part index — no sample decode for fully-covered parts. The delta is
+// the grouped pushdown's win.
+func BenchmarkCountByPushdown(b *testing.B) {
+	for _, tc := range []struct {
+		name   string
+		series int
+	}{
+		{"1k", 1000},
+		{"10k", 10000},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			ctx := context.Background()
+
+			const samples, stepSec, parts = 15, 15, 1
+
+			// Series carry a small-cardinality group label (instance is the unique one).
+			ser, ids := buildGroupedSeries(tc.series, "node_cpu_seconds_total", 32)
+			e := engine.New(engine.Config{
+				Backend: backend.Memory(), Prefix: "bench/metrics", MaxPartBytes: 0,
+			})
+			flushParts(b, ctx, e, ser, ids, samples, stepSec, parts)
+
+			req := fetch.Request{
+				Start:    0,
+				End:      int64(parts*samples*stepSec) * 1e9,
+				Matchers: []fetch.Matcher{eqMatcher("__name__", "node_cpu_seconds_total")},
+			}
+
+			want, err := e.CountBy(ctx, req, []byte("cpu"))
+			if err != nil {
+				b.Fatal(err)
+			}
+			if len(want) != 32 {
+				b.Fatalf("groups=%d want 32", len(want))
+			}
+
+			b.Run("Fetch", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					if n := countViaFetch(b, ctx, e, req); n != tc.series {
+						b.Fatalf("series=%d want %d", n, tc.series)
+					}
+				}
+			})
+
+			b.Run("CountBy", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					got, err := e.CountBy(ctx, req, []byte("cpu"))
+					if err != nil {
+						b.Fatal(err)
+					}
+					if len(got) != len(want) {
+						b.Fatalf("groups=%d want %d", len(got), len(want))
+					}
+				}
+			})
+		})
+	}
+}
+
+// buildGroupedSeries is buildNamedSeries with an extra low-cardinality cpu label (i % groups).
+func buildGroupedSeries(n int, name string, groups int) ([]signal.Series, []signal.SeriesID) {
+	ser := make([]signal.Series, n)
+	ids := make([]signal.SeriesID, n)
+
+	for i := range n {
+		ser[i] = mkSeries("__name__", name, "instance", "host-"+itoa(i), "cpu", itoa(i%groups))
+		ids[i] = ser[i].Hash()
+	}
+
+	return ser, ids
 }

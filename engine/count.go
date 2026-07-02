@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/oteldb/storage/query/fetch"
@@ -19,6 +20,72 @@ import (
 // and mid-flush windows are scanned in memory. A series counts if any source holds an
 // in-window sample. Series with no sample in the window are omitted.
 func (e *Engine) Count(ctx context.Context, r fetch.Request) (int, error) {
+	ids, plan := e.planCount(r)
+	defer plan.releaseParts()
+
+	active, err := plan.activeFlags(ctx, ids, e)
+	if err != nil {
+		return 0, err
+	}
+
+	n := 0
+
+	for _, a := range active {
+		if a {
+			n++
+		}
+	}
+
+	return n, nil
+}
+
+// CountBy is the grouped variant of [Engine.Count]: it returns, for each distinct value of the
+// given label among the matched series, how many of them have at least one sample in
+// [r.Start, r.End]. It backs the PromQL `count by (label)(<selector>)` pushdown — and, via the
+// result's length, `count(count by (label)(...))`, i.e. distinct-label-values — with the same
+// zero-decode economics as Count: group membership comes from the snapshotted series identities
+// (no label projection into results) and in-window existence from the part index / timestamp-only
+// edge decode.
+//
+// Grouping key: the label's canonical text (map key), read from the series identity over the same
+// key space the postings index (and matchers) see — point attributes first, then the
+// otel.scope.name/version synthetics, scope attributes, and resource attributes. Matched series
+// without the label group under "" (indistinguishable from an explicit empty-text value, matching
+// PromQL's absent-label grouping). Groups whose every series is empty in the window are omitted.
+func (e *Engine) CountBy(ctx context.Context, r fetch.Request, label []byte) (map[string]int, error) {
+	ids, plan := e.planCount(r)
+	defer plan.releaseParts()
+
+	active, err := plan.activeFlags(ctx, ids, e)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		groups  = make(map[string]int)
+		scratch []byte
+	)
+
+	for i, a := range active {
+		if !a {
+			continue
+		}
+
+		scratch = scratch[:0]
+		if v, ok := seriesLabelValue(plan.series[i], label); ok {
+			scratch = v.AppendText(scratch)
+		}
+
+		groups[string(scratch)]++
+	}
+
+	return groups, nil
+}
+
+// planCount resolves r's matched ids and builds the fetch plan for a count-shaped read (existence
+// only): the decode budget reserves timestamps only, and only window-edge parts ever decode. The
+// caller must releaseParts.
+func (e *Engine) planCount(r fetch.Request) ([]signal.SeriesID, *enginePlan) {
 	e.mu.RLock()
 	for !e.head.indexSorted() {
 		e.mu.RUnlock()
@@ -32,22 +99,48 @@ func (e *Engine) Count(ctx context.Context, r fetch.Request) (int, error) {
 	plan := e.planFetch(ids, r)
 	e.mu.RUnlock()
 
-	defer plan.releaseParts()
-
 	// Count decodes timestamps only (existence), and only for window-edge parts; reserve that.
 	plan.acquireDecodeBudget(colNeed{}, false)
 
-	return plan.countActive(ctx, ids, e)
+	return ids, plan
 }
 
-// countActive counts ids that have at least one sample in [start, end] across every source the
-// plan snapshotted: head/recent/flush windows (in memory) and the decoded parts. It never
-// materializes result buffers — a series is counted as soon as any source yields an in-window
-// sample, so the remaining sources skip it.
+// seriesLabelValue returns the series' value for the queryable label name, over the same flattened
+// key space head.indexLabels registers in the postings index: point attributes take precedence,
+// then the otel.scope.name/version synthetics, scope attributes, and resource attributes. ok is
+// false when the series does not carry the label.
+func seriesLabelValue(s signal.Series, name []byte) (signal.Value, bool) {
+	if v, ok := s.Attributes.Get(name); ok {
+		return v, true
+	}
+
+	if bytes.Equal(name, labelScopeName) && len(s.Scope.Name) > 0 {
+		return signal.StringValue(s.Scope.Name), true
+	}
+
+	if bytes.Equal(name, labelScopeVersion) && len(s.Scope.Version) > 0 {
+		return signal.StringValue(s.Scope.Version), true
+	}
+
+	if v, ok := s.Scope.Attributes.Get(name); ok {
+		return v, true
+	}
+
+	if v, ok := s.Resource.Attributes.Get(name); ok {
+		return v, true
+	}
+
+	return signal.Value{}, false
+}
+
+// activeFlags reports, per matched id, whether it has at least one sample in [start, end] across
+// every source the plan snapshotted: head/recent/flush windows (in memory) and the decoded parts.
+// It never materializes result buffers — a series is flagged as soon as any source yields an
+// in-window sample, so the remaining sources skip it.
 //
 // ids is the sorted, deduplicated output of head.resolve, so id→index lookups for the in-memory
 // batches are a binary search (no per-call map allocation).
-func (p *enginePlan) countActive(ctx context.Context, ids []signal.SeriesID, e *Engine) (int, error) {
+func (p *enginePlan) activeFlags(ctx context.Context, ids []signal.SeriesID, e *Engine) ([]bool, error) {
 	active := make([]bool, len(ids))
 
 	mark := func(id signal.SeriesID) {
@@ -88,18 +181,11 @@ func (p *enginePlan) countActive(ctx context.Context, ids []signal.SeriesID, e *
 		}
 
 		if err := p.markEdgePart(ctx, e, part, ids, active); err != nil {
-			return 0, err
+			return nil, err
 		}
 	}
 
-	n := 0
-	for _, a := range active {
-		if a {
-			n++
-		}
-	}
-
-	return n, nil
+	return active, nil
 }
 
 // intersectMark sets active[i]=true for every ids[i] that also appears in partIDs. Both slices are

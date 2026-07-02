@@ -13,7 +13,7 @@ import (
 func TestDecodeBudgetBlocksAndReleases(t *testing.T) {
 	t.Parallel()
 
-	b := newDecodeBudget(100)
+	b := NewDecodeBudget(100)
 	b.acquire(60) // used = 60
 
 	done := make(chan struct{})
@@ -44,7 +44,7 @@ func TestDecodeBudgetBlocksAndReleases(t *testing.T) {
 func TestDecodeBudgetOverBudgetAdmittedAlone(t *testing.T) {
 	t.Parallel()
 
-	b := newDecodeBudget(100)
+	b := NewDecodeBudget(100)
 
 	done := make(chan struct{})
 	go func() {
@@ -64,12 +64,12 @@ func TestDecodeBudgetOverBudgetAdmittedAlone(t *testing.T) {
 func TestDecodeBudgetDisabled(t *testing.T) {
 	t.Parallel()
 
-	var nilBudget *decodeBudget
+	var nilBudget *DecodeBudget
 
 	nilBudget.acquire(1 << 40)
 	nilBudget.release(1 << 40)
 
-	zero := newDecodeBudget(0)
+	zero := NewDecodeBudget(0)
 	zero.acquire(1 << 40)
 	zero.release(1 << 40)
 
@@ -84,7 +84,7 @@ func TestDecodeBudgetConcurrentBounded(t *testing.T) {
 
 	const limit, workers, each = 100, 16, 20
 
-	b := newDecodeBudget(limit)
+	b := NewDecodeBudget(limit)
 
 	var over atomic.Bool
 

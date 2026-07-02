@@ -40,6 +40,19 @@ func (b *instrumentedBackend) Read(ctx context.Context, key string) ([]byte, err
 	return v, err
 }
 
+// ReadView forwards the no-copy read capability (metered as a read), so wrapping a [backend.Viewer]
+// in metering does not silently reintroduce the defensive copy. Implements [backend.Viewer].
+func (b *instrumentedBackend) ReadView(ctx context.Context, key string) ([]byte, error) {
+	start := time.Now()
+	v, err := backend.ReadView(ctx, b.inner, key)
+	b.m.Record(ctx, "read", result(err), time.Since(start), int64(len(v)))
+	zctx.From(ctx).Debug("backend read",
+		zap.String("key", key), zap.Int("bytes", len(v)),
+		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
+
+	return v, err
+}
+
 func (b *instrumentedBackend) Write(ctx context.Context, key string, data []byte) error {
 	start := time.Now()
 	err := b.inner.Write(ctx, key, data)

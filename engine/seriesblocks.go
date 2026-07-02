@@ -29,15 +29,18 @@ type seriesBlockReader struct {
 	// Last block held per column (index + data), so consecutive matched series that fall in the same
 	// block reuse it instead of re-locking the cache for every series. Series are visited in row
 	// order, so a part's accesses are non-decreasing block indices and this one-entry memo hits the
-	// common run. -1 ⇒ none held.
-	tsB, valB, sfB  int
-	tsHeld          []int64
-	valHeld, sfHeld []float64
+	// common run. -1 ⇒ none held. tsEnt/valEnt/sfEnt are the cache entries backing the held views,
+	// so the per-series pin release can keep exactly those pinned.
+	tsB, valB, sfB       int
+	tsHeld               []int64
+	valHeld, sfHeld      []float64
+	tsEnt, valEnt, sfEnt *blockEntry
 
 	// pins holds every cache entry this reader has taken a reference on. The reader adds the touched
 	// blocks to the merge as *views*, so the entries must stay unrecycled until the fetch's collect
-	// has copied the samples out — the fetch releases them all at teardown (releasePins). One entry
-	// may appear more than once (a block revisited after the memo moved on); each pin has one release.
+	// has copied the samples out — the fetch releases them per series (releaseSeriesPins) and sweeps
+	// the rest at teardown (releasePins). One entry may appear more than once (a block revisited
+	// after the memo moved on); each pin has one release.
 	pins []*blockEntry
 }
 
@@ -152,7 +155,7 @@ func (r *seriesBlockReader) tsBlock(ctx context.Context, b int) ([]int64, error)
 	key := blockKey{prefix: r.part.prefix, col: colTsID, blk: b}
 	if ent, ok := r.engine.blockCache.get(key); ok {
 		r.pins = append(r.pins, ent)
-		r.tsB, r.tsHeld = b, ent.i64
+		r.tsB, r.tsHeld, r.tsEnt = b, ent.i64, ent
 
 		return ent.i64, nil
 	}
@@ -175,7 +178,7 @@ func (r *seriesBlockReader) tsBlock(ctx context.Context, b int) ([]int64, error)
 	// in which case ours was recycled and the winner's slice is the one that stays valid.
 	ent := r.engine.blockCache.insert(&blockEntry{key: key, i64: blk, bytes: int64(len(blk)) * 8})
 	r.pins = append(r.pins, ent)
-	r.tsB, r.tsHeld = b, ent.i64
+	r.tsB, r.tsHeld, r.tsEnt = b, ent.i64, ent
 
 	return ent.i64, nil
 }
@@ -186,12 +189,12 @@ func (r *seriesBlockReader) valBlock(ctx context.Context, b int) ([]float64, err
 		return r.valHeld, nil
 	}
 
-	blk, err := r.floatBlock(ctx, &r.valDec, colValue, colValID, b)
+	blk, ent, err := r.floatBlock(ctx, &r.valDec, colValue, colValID, b)
 	if err != nil {
 		return nil, err
 	}
 
-	r.valB, r.valHeld = b, blk
+	r.valB, r.valHeld, r.valEnt = b, blk, ent
 
 	return blk, nil
 }
@@ -202,29 +205,32 @@ func (r *seriesBlockReader) sfBlock(ctx context.Context, b int) ([]float64, erro
 		return r.sfHeld, nil
 	}
 
-	blk, err := r.floatBlock(ctx, &r.sfDec, colSF, colSFID, b)
+	blk, ent, err := r.floatBlock(ctx, &r.sfDec, colSF, colSFID, b)
 	if err != nil {
 		return nil, err
 	}
 
-	r.sfB, r.sfHeld = b, blk
+	r.sfB, r.sfHeld, r.sfEnt = b, blk, ent
 
 	return blk, nil
 }
 
-// floatBlock fetches block b of a float column from the cache or a fresh decode (cached).
-func (r *seriesBlockReader) floatBlock(ctx context.Context, dec **block.Decoder, name string, cid colID, b int) ([]float64, error) {
+// floatBlock fetches block b of a float column from the cache or a fresh decode (cached), returning
+// the pinned cache entry alongside the data so the caller can memoize it.
+func (r *seriesBlockReader) floatBlock(
+	ctx context.Context, dec **block.Decoder, name string, cid colID, b int,
+) ([]float64, *blockEntry, error) {
 	key := blockKey{prefix: r.part.prefix, col: cid, blk: b}
 	if ent, ok := r.engine.blockCache.get(key); ok {
 		r.pins = append(r.pins, ent)
 
-		return ent.f64, nil
+		return ent.f64, ent, nil
 	}
 
 	if *dec == nil {
 		d, err := r.partDecoder(ctx, name)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		*dec = d
@@ -232,24 +238,61 @@ func (r *seriesBlockReader) floatBlock(ctx context.Context, dec **block.Decoder,
 
 	blk, err := (*dec).DecodeFloat64Into(b, r.engine.blockCache.getF64Buf(r.blockRows))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	ent := r.engine.blockCache.insert(&blockEntry{key: key, f64: blk, bytes: int64(len(blk)) * 8})
 	r.pins = append(r.pins, ent)
 
-	return ent.f64, nil
+	return ent.f64, ent, nil
 }
 
-// releasePins drops the reader's references on every cache block it viewed, letting an evicted block's
-// buffer return to the pool. The fetch calls it at teardown, after collect has copied the samples out
-// of the merge — so no view into these blocks outlives the release.
+// releaseSeriesPins drops the pins taken while merging one series, keeping exactly one pin per
+// currently-memoized block (its held view must stay valid for the next series). The fetch calls it
+// right after collect has copied the series' samples out of the merge, so the released views are
+// dead. Releasing per series — rather than only at fetch teardown — is what keeps the decode
+// freelist fed: a block the byte budget evicted mid-fetch returns its buffer while the fetch is
+// still running instead of holding it hostage until teardown.
+func (r *seriesBlockReader) releaseSeriesPins() {
+	keepTs, keepVal, keepSf := r.tsEnt, r.valEnt, r.sfEnt
+
+	kept := r.pins[:0]
+
+	for _, e := range r.pins {
+		// Retain a single pin per live memo slot; duplicates of a memo entry (a revisited block)
+		// release like any other pin, keeping the refcount balanced.
+		switch e {
+		case keepTs:
+			keepTs = nil
+			kept = append(kept, e)
+		case keepVal:
+			keepVal = nil
+			kept = append(kept, e)
+		case keepSf:
+			keepSf = nil
+			kept = append(kept, e)
+		default:
+			r.engine.blockCache.release(e)
+		}
+	}
+
+	clear(r.pins[len(kept):])
+	r.pins = kept
+}
+
+// releasePins drops the reader's references on every cache block it still holds (the memoized
+// blocks after per-series releases, or everything when the fetch never ran collect), letting an
+// evicted block's buffer return to the pool. The fetch calls it at teardown, after any views into
+// these blocks are dead.
 func (r *seriesBlockReader) releasePins() {
 	for _, e := range r.pins {
 		r.engine.blockCache.release(e)
 	}
 
 	r.pins = r.pins[:0]
+	r.tsB, r.valB, r.sfB = -1, -1, -1
+	r.tsHeld, r.valHeld, r.sfHeld = nil, nil, nil
+	r.tsEnt, r.valEnt, r.sfEnt = nil, nil, nil
 }
 
 // partDecoder reads the named column's object and returns a per-block decoder over it.

@@ -64,6 +64,11 @@ type Config struct {
 	// letting concurrency multiply resident decoded bytes. 0 ⇒ unlimited (no admission control). A
 	// query larger than the whole budget runs alone (it cannot be bounded below its own footprint).
 	DecodeMemoryBytes int64
+	// DecodeBudget, when non-nil, is a pre-built decode-memory budget this engine reserves from
+	// instead of building its own from DecodeMemoryBytes. Share one [DecodeBudget] across engines
+	// (one engine per tenant) so the cap bounds the process-wide in-flight decoded bytes rather
+	// than multiplying per tenant. Takes precedence over DecodeMemoryBytes.
+	DecodeBudget *DecodeBudget
 	// MetricBlockRows sets the row block size for metric part columns (ts/value/sf): the columns are
 	// split into independently decodable blocks of this many rows, so a query can decode only the
 	// blocks its matched series' row ranges touch (sub-part seek) instead of the whole column, and
@@ -113,22 +118,21 @@ type Engine struct {
 	// reallocates from zero each fetch (the disk_io profile showed ~38 GB/35 s of resize churn).
 	// FreeList entries are rooted live references, so capacity survives GC.
 	decPool *pool.FreeList[decodedPart]
-	// i64Pool / f64Pool recycle a fetched batch's result timestamp / value buffers, holding the
-	// buffers as *[]int64 / *[]float64. i64Box / f64Box hold the spare *[]T *boxes* themselves so a
-	// Put reuses a box instead of `Put(&local)` (which heap-escapes a fresh box on every recycle):
-	// a box circulates Pool→(Get)→Box→(Put)→Pool, so steady-state recycling allocates no boxes.
-	// They are fed only when a caller calls [fetch.Batch.Release]; a caller that never releases leaves
-	// them empty, so collect makes fresh slices exactly as before — the default path takes nothing.
-	i64Pool sync.Pool
-	f64Pool sync.Pool
-	i64Box  sync.Pool
-	f64Box  sync.Pool
+	// i64Res / f64Res recycle a fetched batch's result timestamp / value buffers (and the per-series
+	// head/flush window buffers). They are GC-stable [sliceFreeList]s for the same reason as decPool:
+	// a sync.Pool is emptied on every GC, so under allocation-driven collection the result buffers
+	// lost their capacity and collect re-minted them each fetch (the ensureCap churn in the query
+	// alloc profile). They are fed only when a caller calls [fetch.Batch.Release]; a caller that
+	// never releases leaves them empty, so collect makes fresh slices exactly as before — the
+	// default path takes nothing.
+	i64Res resultFreeList[int64]
+	f64Res resultFreeList[float64]
 	// recycle is the shared per-engine [fetch.Batch.Release] hook (allocated once), so setting it on
 	// a batch costs nothing per batch. It returns the batch's ts/value buffers to the pools above.
 	recycle func(*fetch.Batch)
-	// budget caps the in-flight decoded bytes across concurrent queries (Config.DecodeMemoryBytes);
-	// nil ⇒ unlimited.
-	budget *decodeBudget
+	// budget caps the in-flight decoded bytes across concurrent queries (Config.DecodeBudget or
+	// Config.DecodeMemoryBytes); possibly shared with other engines; nil ⇒ unlimited.
+	budget *DecodeBudget
 	// planMaps recycles the per-fetch plan maps (series identity + head/flush/recent snapshots) so a
 	// fetch reuses cleared maps instead of allocating and growing fresh ones each call.
 	planMaps planMapPools
@@ -162,8 +166,11 @@ func New(cfg Config) *Engine {
 		e.blockCache = newBlockCache(cfg.DecodeCacheBytes)
 	}
 
-	if cfg.DecodeMemoryBytes > 0 {
-		e.budget = newDecodeBudget(cfg.DecodeMemoryBytes)
+	switch {
+	case cfg.DecodeBudget != nil:
+		e.budget = cfg.DecodeBudget
+	case cfg.DecodeMemoryBytes > 0:
+		e.budget = NewDecodeBudget(cfg.DecodeMemoryBytes)
 	}
 
 	if cfg.RecentWindow > 0 {
@@ -409,6 +416,11 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		}
 
 		ts, values, sf := m.collect(tsBuf, valBuf)
+
+		// The series' samples are copied out; drop this round's block pins so evicted blocks'
+		// buffers recirculate to later decodes of this same fetch (and concurrent ones).
+		plan.releaseSeriesPins()
+
 		if len(ts) == 0 {
 			if r.Recycle {
 				e.putI64(ts)
@@ -595,15 +607,30 @@ func (p *enginePlan) decodeEstimate(need colNeed, blockSliced bool) int64 {
 	return total
 }
 
+// releaseSeriesPins releases every block reader's per-series pins (keeping the memoized blocks
+// pinned). Call it after a series' collect has copied its samples out of the merge — the views the
+// pins protected are dead — so evicted blocks' buffers recirculate while the fetch is running.
+func (p *enginePlan) releaseSeriesPins() {
+	for _, r := range p.blockReaders {
+		r.releaseSeriesPins()
+	}
+}
+
 func (p *enginePlan) releaseParts() {
 	p.engine.budget.release(p.budgetBytes)
 
-	// Drop the block-slice readers' references on the cache blocks they viewed. The merge has copied
-	// the samples out (collect ran in the scan), so those views are dead; releasing lets a block the
-	// byte budget evicted mid-fetch return its buffer to the decode pool. Must run before part.release
-	// below: a released part can be reclaimed (evictPrefix), which touches the same entries.
+	// Drop the block-slice readers' remaining references on the cache blocks they viewed (the scan
+	// releases per series; this sweeps the memoized leftovers). Any views are dead by now; releasing
+	// lets a block the byte budget evicted mid-fetch return its buffer to the decode pool. Must run
+	// before part.release below: a released part can be reclaimed (evictPrefix), which touches the
+	// same entries.
 	for _, r := range p.blockReaders {
 		r.releasePins()
+	}
+
+	// The fetch stops drawing decode buffers here; shrink the freelist scaling back down.
+	if p.blockReaders != nil {
+		p.engine.blockCache.fetchEnd()
 	}
 
 	// Return pooled decode buffers (no-cross-fetch-cache path). The merge has already copied the
@@ -1235,6 +1262,9 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 func (e *Engine) acquireWindowParts(p *enginePlan, start, end int64) {
 	if e.blockCache != nil {
 		p.blockReaders = make(map[*part]*seriesBlockReader, len(e.parts))
+		// Registered until releaseParts (which keys off p.blockReaders != nil), scaling the decode
+		// freelists with fetch concurrency.
+		e.blockCache.fetchStart()
 	}
 
 	for _, pt := range e.parts {
@@ -1326,63 +1356,14 @@ func (e *Engine) replayHandlers() wal.Handlers {
 
 // getI64 returns a reusable []int64 (len 0) from the pool, or nil when the pool is empty — so a
 // caller that never releases makes fresh slices (no behavior change). The caller appends into it.
-func (e *Engine) getI64() []int64 {
-	v := e.i64Pool.Get()
-	if v == nil {
-		return nil
-	}
-
-	p := v.(*[]int64)
-	s := *p
-	*p = nil
-	e.i64Box.Put(p) // recycle the emptied box for the next putI64
-
-	return s[:0]
-}
+func (e *Engine) getI64() []int64 { return e.i64Res.get() }
 
 // getF64 is [Engine.getI64] for float64 value buffers.
-func (e *Engine) getF64() []float64 {
-	v := e.f64Pool.Get()
-	if v == nil {
-		return nil
-	}
+func (e *Engine) getF64() []float64 { return e.f64Res.get() }
 
-	p := v.(*[]float64)
-	s := *p
-	*p = nil
-	e.f64Box.Put(p)
-
-	return s[:0]
-}
-
-// putI64 returns a buffer to its pool (only meaningfully reused if it has capacity). It refills a
-// recycled box from i64Box rather than `Put(&s)`, so no *[]int64 box escapes per recycle in steady
-// state. This is the opt-in Release path, never the default.
-func (e *Engine) putI64(s []int64) {
-	if cap(s) == 0 {
-		return
-	}
-
-	p, _ := e.i64Box.Get().(*[]int64)
-	if p == nil {
-		p = new([]int64)
-	}
-
-	*p = s
-	e.i64Pool.Put(p)
-}
+// putI64 returns a buffer to its pool (only meaningfully reused if it has capacity). This is the
+// opt-in Release path, never the default.
+func (e *Engine) putI64(s []int64) { e.i64Res.put(s) }
 
 // putF64 is [Engine.putI64] for float64 value buffers.
-func (e *Engine) putF64(s []float64) {
-	if cap(s) == 0 {
-		return
-	}
-
-	p, _ := e.f64Box.Get().(*[]float64)
-	if p == nil {
-		p = new([]float64)
-	}
-
-	*p = s
-	e.f64Pool.Put(p)
-}
+func (e *Engine) putF64(s []float64) { e.f64Res.put(s) }

@@ -77,6 +77,31 @@ func (c *cachedBackend) Read(ctx context.Context, key string) ([]byte, error) {
 	return v, nil
 }
 
+// ReadView is [Backend.Read] without the defensive copies: a hit returns the resident entry's
+// value itself, and a miss stores the freshly read value and returns it — zero copies either way.
+// Safe under the [Viewer] contract: the caller never mutates the view, and the cache never mutates
+// a resident value in place (store replaces the entry's slice, so an outstanding view keeps reading
+// the old, unreachable-from-the-cache array). This is the hot path for part column objects, where
+// the clone-per-hit was a dominant query-path allocation. Implements [Viewer].
+func (c *cachedBackend) ReadView(ctx context.Context, key string) ([]byte, error) {
+	if v, ok := c.loadView(key); ok {
+		c.hits.Add(1)
+
+		return v, nil
+	}
+
+	c.misses.Add(1)
+
+	v, err := c.inner.Read(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+
+	c.storeOwned(key, v) // v is a fresh copy from the inner backend; the cache and the view share it
+
+	return v, nil
+}
+
 func (c *cachedBackend) Write(ctx context.Context, key string, data []byte) error {
 	if err := c.inner.Write(ctx, key, data); err != nil {
 		return err
@@ -130,6 +155,17 @@ func (c *cachedBackend) Stats() CacheStats {
 
 // load returns a private copy of the cached value for key and marks it most-recently-used.
 func (c *cachedBackend) load(key string) ([]byte, bool) {
+	v, ok := c.loadView(key)
+	if !ok {
+		return nil, false
+	}
+
+	return slices.Clone(v), true
+}
+
+// loadView returns the cached value itself (read-only; see [cachedBackend.ReadView]) and marks it
+// most-recently-used.
+func (c *cachedBackend) loadView(key string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -140,11 +176,10 @@ func (c *cachedBackend) load(key string) ([]byte, bool) {
 
 	c.ll.MoveToFront(el)
 
-	return slices.Clone(el.Value.(*cacheEntry).val), true
+	return el.Value.(*cacheEntry).val, true
 }
 
-// store caches a private copy of data under key, evicting LRU entries to stay within budget. An
-// object larger than the whole budget is not cached.
+// store caches a private copy of data under key (see storeOwned).
 func (c *cachedBackend) store(key string, data []byte) {
 	if int64(len(data)) > c.maxBytes {
 		c.evict(key) // a stale smaller entry must not linger under this key
@@ -153,6 +188,24 @@ func (c *cachedBackend) store(key string, data []byte) {
 	}
 
 	cp := slices.Clone(data)
+	if cp == nil {
+		cp = []byte{}
+	}
+
+	c.storeOwned(key, cp)
+}
+
+// storeOwned caches data under key taking ownership of the slice (the caller must not mutate it
+// afterwards — sharing it with read-only views is fine), evicting LRU entries to stay within
+// budget. An object larger than the whole budget is not cached.
+func (c *cachedBackend) storeOwned(key string, data []byte) {
+	if int64(len(data)) > c.maxBytes {
+		c.evict(key) // a stale smaller entry must not linger under this key
+
+		return
+	}
+
+	cp := data
 	if cp == nil {
 		cp = []byte{}
 	}

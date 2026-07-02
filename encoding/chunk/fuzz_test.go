@@ -135,6 +135,12 @@ func FuzzDictRoundTrip(f *testing.F) {
 			}
 		}
 
+		// The blob+offsets input form must produce byte-identical output.
+		blob, offsets := blobForm(vals)
+		if got := EncodeBytesBlob(nil, blob, offsets); !bytes.Equal(got, enc) {
+			t.Fatalf("EncodeBytesBlob output differs from EncodeBytes")
+		}
+
 		// The reusable DictEncoder must produce byte-identical output, and the split
 		// DecodeBytesDict form must agree with the gather-form DecodeBytes.
 		encReuse := NewDictEncoder()
@@ -191,6 +197,10 @@ func FuzzBytesRawRoundTrip(f *testing.F) {
 		}
 
 		enc := EncodeBytesRaw(nil, vals)
+
+		if blob, offsets := blobForm(vals); !bytes.Equal(EncodeBytesRawBlob(nil, blob, offsets), enc) {
+			t.Fatalf("EncodeBytesRawBlob output differs from EncodeBytesRaw")
+		}
 
 		got, consumed, err := DecodeBytes(nil, enc)
 		if err != nil {

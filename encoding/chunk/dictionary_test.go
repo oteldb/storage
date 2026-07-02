@@ -256,3 +256,54 @@ func itoa(n int) string {
 
 // Ensure rand is used (for potential future randomized tests).
 var _ = rand.Int
+
+// blobForm converts cells to the blob+offsets column form.
+func blobForm(vals [][]byte) (blob []byte, offsets []int32) {
+	offsets = make([]int32, 1, len(vals)+1)
+	for _, v := range vals {
+		blob = append(blob, v...)
+		offsets = append(offsets, int32(len(blob)))
+	}
+
+	return blob, offsets
+}
+
+// TestEncodeBytesBlobMatchesSlices pins the blob+offsets encode variants to the [][]byte forms:
+// the outputs must be byte-identical (the on-disk format has one writer, two input shapes) across
+// dict, flat-fallback, fixed-width, mixed-width, empty-cell, and empty-column cases.
+func TestEncodeBytesBlobMatchesSlices(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string][][]byte{
+		"empty column": {},
+		"low cardinality": {
+			[]byte("get"), []byte("post"), []byte("get"), []byte("get"), []byte("put"),
+		},
+		"empty cells":    {[]byte(""), []byte("x"), []byte(""), []byte("")},
+		"uniform width":  {[]byte("aaaa"), []byte("bbbb"), []byte("cccc")},
+		"mixed width":    {[]byte("a"), []byte("bb"), []byte("ccc")},
+		"single row":     {[]byte("only")},
+		"all same value": {[]byte("v"), []byte("v"), []byte("v")},
+	}
+
+	// High cardinality (2-byte ids) and the >65536-distinct flat fallback.
+	big := make([][]byte, 0, 70000)
+	for i := range 70000 {
+		big = append(big, []byte{byte(i), byte(i >> 8), byte(i >> 16)})
+	}
+	cases["flat fallback"] = big
+	cases["two-byte ids"] = big[:1000]
+
+	for name, vals := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			blob, offsets := blobForm(vals)
+
+			assert.Equal(t, EncodeBytes(nil, vals), EncodeBytesBlob(nil, blob, offsets),
+				"dict codec: blob form must be byte-identical")
+			assert.Equal(t, EncodeBytesRaw(nil, vals), EncodeBytesRawBlob(nil, blob, offsets),
+				"raw codec: blob form must be byte-identical")
+		})
+	}
+}

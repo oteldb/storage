@@ -220,7 +220,8 @@ type PartReader struct {
 // an error (wrapping [ErrCorrupt] or [backend.ErrNotExist]) if the manifest is absent or
 // malformed — an incompletely written part (no manifest) is therefore not readable.
 func OpenPart(ctx context.Context, b backend.Backend, prefix string) (*PartReader, error) {
-	raw, err := b.Read(ctx, manifestKey(prefix))
+	// Column/marks/manifest objects are decoded, never mutated, so the no-copy read view is safe.
+	raw, err := backend.ReadView(ctx, b, manifestKey(prefix))
 	if err != nil {
 		return nil, errors.Wrap(err, "read manifest")
 	}
@@ -276,7 +277,7 @@ func (r *PartReader) Column(ctx context.Context, name string) (*ColumnReader, er
 		return newColumnReader(desc, nil, comp, r.manifest.RowCount), nil
 	}
 
-	obj, err := r.b.Read(ctx, columnKey(r.prefix, i))
+	obj, err := backend.ReadView(ctx, r.b, columnKey(r.prefix, i))
 	if err != nil {
 		return nil, errors.Wrapf(err, "read column %q", name)
 	}
@@ -298,7 +299,7 @@ func (r *PartReader) ColumnDescByName(name string) (ColumnDesc, bool) {
 
 // Marks reads and decodes the part's sparse granule index.
 func (r *PartReader) Marks(ctx context.Context) (Marks, error) {
-	raw, err := r.b.Read(ctx, marksKey(r.prefix))
+	raw, err := backend.ReadView(ctx, r.b, marksKey(r.prefix))
 	if err != nil {
 		return Marks{}, errors.Wrap(err, "read marks")
 	}

@@ -186,7 +186,13 @@ conditional-write (CAS) primitive on which atomic manifest / block-list commits 
   part objects are write-once immutable, so a cached value is never stale; the only invalidation is
   eviction, and a `Write`/`Delete` of the same key (manifest/index objects) updates/drops the entry.
   It preserves the copy semantics (stored/returned slices are private), passes `List`/`PutIfAbsent`
-  through, and exposes hit/miss `Stats`. Enabled via `Options.ReadCacheBytes` / `WithReadCache`,
+  through, and exposes hit/miss `Stats`. For hot read paths the copy is optional: **`backend.Viewer`**
+  is an opt-in capability (`ReadView(ctx, key)`) returning the value as a **read-only view** — a hit
+  hands out the resident entry's slice itself (a stored value is never mutated in place, so a view
+  stays valid across overwrite/eviction), removing the clone-per-hit that dominated the query-path
+  allocation profile. The memory backend and the metering wrapper implement/forward it, the
+  `backend.ReadView` helper falls back to a plain `Read` over any other backend, and `block.PartReader`
+  reads manifest/column/marks objects through it. Enabled via `Options.ReadCacheBytes` / `WithReadCache`,
   wrapped **outermost** (a hit skips both metering and the backend) and skipped for an ephemeral
   backend. A hit removes the per-fetch backend-read latency entirely, so the win scales with object-
   store latency × objects-per-query.
@@ -455,11 +461,12 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   tenant's flushed data without the (local) WAL. WAL `Replay` is complementary, restoring only
   the *unflushed* head.
 - **Part fetch** (`part.go`) — `openPart` rebuilds a sparse `SeriesID → [rowStart,rowEnd)` index
-  by scanning the sorted series column once (each series is one contiguous run). The index is two
-  parallel sorted slices (`ids` + `rowRanges`, plus a cached total) — a binary-searchable layout with
-  no per-entry overhead, chosen over a resident map so a part's resident footprint is 24 bytes/series
-  regardless of map bucket growth; `mergeInto` decodes a series' `ts`/`value` sub-slice within the
-  window.
+  by scanning the sorted series column once (each series is one contiguous run). The index is a
+  sorted `ids` slice plus an `int32` row-start offsets slice — because the runs partition
+  `[0, rows)`, series k's range is `[starts[k], starts[k+1])`, so no per-entry end or total is
+  stored. A binary-searchable layout with no per-entry overhead, chosen over a resident map, so a
+  part's resident footprint is 20 bytes/series (16 id + 4 offset) regardless of map bucket growth;
+  `mergeInto` decodes a series' `ts`/`value` sub-slice within the window.
 - **Merge — compaction + retention + downsampling + recompression + precision** (`merge.go`,
   `downsample.go`, `recompress.go`, `precision.go`) is the one background-merge engine; all five modes
   are one pass over the immutable parts (no separate subsystem). `MergeWith(MergeOptions{RetainFrom,
@@ -551,11 +558,16 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   freelist that the next cache-miss decode draws its destination from (`DecodeInt64Into` /
   `DecodeFloat64Into`, decompressing through a scratch buffer the per-column `Decoder` reuses across
   its blocks) — this cuts the miss-path allocation *rate* (the dominant query-path allocation once the
-  live heap is bounded) without enlarging the resident set. Because a fetch may still be viewing a
+  live heap is bounded) without enlarging the resident set. The freelist's bound scales with the
+  number of in-flight fetches (baseline at rest), and a draw scans for a size-fitting buffer instead
+  of discarding a too-small one. Because a fetch may still be viewing a
   block when the byte budget evicts it, each entry is **reference-counted**: `get`/`insert` pin it, the
-  fetch releases its pins at teardown (`releaseParts` → `releasePins`), and a buffer returns to the
+  fetch releases each series' pins as soon as `collect` has copied that series' samples out
+  (`releaseSeriesPins`, keeping only the memoized blocks pinned) and sweeps the rest at teardown
+  (`releaseParts` → `releasePins`), and a buffer returns to the
   freelist only once its entry is both evicted and unpinned — so a reader never sees a block it holds
-  recycled underneath it. With the cache on, a fetch also **prefetches** the
+  recycled underneath it, and a block evicted mid-fetch recirculates while the fetch is still running
+  instead of being held hostage until teardown. With the cache on, a fetch also **prefetches** the
   parts it will touch — warming each part's matched blocks concurrently (bounded fan-out) so backend
   reads + decodes overlap instead of running one part at a time.
   A **decode-memory budget** (`Config.DecodeMemoryBytes`, `budget.go`) caps the total in-flight
@@ -565,7 +577,11 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   cliff — N heavy queries serialize through the cap instead of each materializing whole columns at
   once. The reservation is taken once per query off the engine lock (not incrementally per part, so
   two queries cannot each hold a partial reservation and deadlock), and a query larger than the whole
-  budget is admitted alone rather than waiting forever. 0 ⇒ unlimited.
+  budget is admitted alone rather than waiting forever. 0 ⇒ unlimited. The budget object is
+  shareable (`engine.NewDecodeBudget`, `Config.DecodeBudget`): the storage facade builds **one**
+  budget from `WithDecodeMemory` / `Options.DecodeMemoryBytes` and hands it to every tenant engine,
+  so the cap bounds the process-wide in-flight decoded bytes rather than multiplying per tenant —
+  fit it to the process memory budget (e.g. `GOMEMLIMIT` minus caches and baseline).
   A **recent tier** (`Config.RecentWindow`, `recent.go`) opt-in mirrors the most recent flush window
   in RAM across flushes (the head is drained on every flush, but the tier persists), so a query whose
   `[Start, End]` falls inside the tier's window is served from the tier ∪ the mid-flush buffers ∪ the
@@ -643,10 +659,28 @@ engine** (`recordengine.Fetch`: per-stream runs are ts-sorted, then a pooled glo
 to the boundary via `recordCols.keep`); the **metric engine ignores it** (PromQL needs every sample).
 `Limit == 0` is unlimited (unchanged behavior).
 
+**Count pushdown (`fetch.Counter` / `fetch.GroupCounter`).** Two optional `Fetcher` capabilities
+answer count-shaped PromQL without materializing samples or labels. `Counter.Count` (engine:
+`count.go`) backs `count(<selector>)`: matched ids resolve from postings, and per-series in-window
+existence comes from the part index — a part fully covered by the window contributes its matched
+ids by a sorted intersection with **zero column decode**; only window-edge parts decode, and only
+their timestamp column. `GroupCounter.CountBy` is the grouped variant backing
+`count by (label)(<selector>)` (and, via the result's length, `count(count by (label)(...))` =
+distinct label values): the same existence flags, grouped by the label's canonical text read from
+the snapshotted series identities over the same flattened key space the postings index sees (point
+attrs → `otel.scope.name`/`version` → scope attrs → resource attrs; absent ⇒ the `""` group).
+`CounterOf`/`GroupCounterOf` walk the `Unwraper` decorator chain to find the capability;
+multi-child fan-outs opt out (their counts are not a simple delegation). The PromQL queryable
+exposes both as `CountSeries`/`CountSeriesBy` hooks (interface-asserted by the embedder's engine),
+each falling back to a Fetch-and-recheck path when the selector's matchers are not all index-safe.
+
 **Opt-in buffer reuse (`Request.Recycle` + `Batch.Release`).** A batch's `Timestamps`/`Values`
 slices (and, for record signals, its `Columns`) are the engine's buffers. When a caller sets
 `Request.Recycle` and calls `Batch.Release()` once done with each batch, the engine hands out (and
-recycles) those buffers from a pool via a single shared release hook (no per-batch closure). It is
+recycles) those buffers from a pool via a single shared release hook (no per-batch closure). The
+metric engine's pool is a GC-stable, doubly-bounded freelist (entry count + total retained
+capacity), not a `sync.Pool` — a `sync.Pool` is emptied at every GC, so under allocation-driven
+collections the result buffers lost their capacity and every fetch re-minted its columns. It is
 **opt-in and default-off**: with `Recycle` unset the engine allocates fresh buffers and the caller
 need not release, so the non-recycling path takes no pool overhead and is byte-for-byte as before.
 After `Release` the batch and its slices must not be read. Pass-through decorators (single-child
@@ -917,7 +951,10 @@ optional side store differ.
   and a per-record scan walks one allocation with locality. Cell views alias the blob under the
   read-only-until-next-append rule (an append that grows the blob may move it, so a value retained
   past an append is copied); the `fetch.NamedColumn` boundary materializes `[][]byte` views into the
-  blob, pooled across recycled fetches. `Fetch` is heavily tuned: **lazy column decode**
+  blob, pooled across recycled fetches. Flush is a **pass-through**: `block.Column` accepts the
+  blob+offsets form directly (`BytesBlob`/`BytesOffsets`, encoded byte-identically to the `Bytes`
+  form via `chunk.EncodeBytesBlob`/`EncodeBytesRawBlob`), so writing a part walks the head buffer's
+  blobs without materializing a view per row. `Fetch` is heavily tuned: **lazy column decode**
   (materialize only the columns a request's conditions + projection reference — a body search
   projecting body touches just `ts`+`body`), decode each surviving part **once** distributing rows
   to per-stream accumulators, pre-size accumulators from row-range counts, bulk-append in-window
