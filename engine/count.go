@@ -175,7 +175,9 @@ func (p *enginePlan) activeFlags(ctx context.Context, ids []signal.SeriesID, e *
 	// those decode no values.
 	for _, part := range p.liveParts {
 		if part.minTime >= p.start && part.maxTime <= p.end {
-			intersectMark(ids, part.index.ids, active)
+			if err := part.index.intersectMark(ctx, ids, active); err != nil {
+				return nil, err
+			}
 
 			continue
 		}
@@ -186,26 +188,6 @@ func (p *enginePlan) activeFlags(ctx context.Context, ids []signal.SeriesID, e *
 	}
 
 	return active, nil
-}
-
-// intersectMark sets active[i]=true for every ids[i] that also appears in partIDs. Both slices are
-// ascending by SeriesID.Compare (ids from head.resolve, partIDs from the part index), so a single
-// linear two-pointer merge suffices — no per-id binary search. It is the fully-covered-part count
-// shortcut: presence in such a part already implies an in-window sample, so no decode is needed.
-func intersectMark(ids, partIDs []signal.SeriesID, active []bool) {
-	i, j := 0, 0
-	for i < len(ids) && j < len(partIDs) {
-		switch c := ids[i].Compare(partIDs[j]); {
-		case c < 0:
-			i++
-		case c > 0:
-			j++
-		default:
-			active[i] = true
-			i++
-			j++
-		}
-	}
 }
 
 // markEdgePart marks every still-inactive matched series in a partially-covered part that has an
@@ -225,7 +207,12 @@ func (p *enginePlan) markEdgePart(ctx context.Context, e *Engine, part *part, id
 			continue
 		}
 
-		if rng, ok := part.index.lookup(id); ok {
+		rng, ok, err := part.index.lookup(ctx, id)
+		if err != nil {
+			return err
+		}
+
+		if ok {
 			matched = append(matched, idRange{i: i, rng: rng})
 		}
 	}

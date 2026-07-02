@@ -29,43 +29,161 @@ func u128ToID(u chunk.U128) signal.SeriesID  { return signal.SeriesID{Hi: u.Hi, 
 // rowRange is the half-open row span [start, end) a series occupies in a part.
 type rowRange struct{ start, end int }
 
-// partIndex is a part's SeriesID → row-range index: a sorted id slice plus a row-start offsets
-// slice, so a lookup is a binary search (O(log series)) and the layout carries no per-entry
-// overhead — vs a resident map's bucket structure (~3× the payload) which dominated live heap
-// under continuous ingestion. Because rows are sorted by (series, ts), every series occupies one
-// contiguous run and the runs partition [0, rows): series k's range is
-// [starts[k], starts[k+1]), so no per-entry end (nor a separate total) is stored. That makes the
-// resident cost 20 bytes/series (16 id + 4 offset) — the compact form of the "stop pinning the
-// full SeriesID→rowRange map" work; a further sparse/paged level is deliberately not layered on,
-// as lookup sits on the per-series hot path of every fetch/count/aggregate.
+// partIndex is a part's SeriesID → row-range index, in one of two forms:
 //
-// int32 offsets cap a part at ~2.1 G rows; openPart materializes the whole series column in RAM
-// (16 B/row) to build this index, so a part anywhere near that bound (32 GiB of ids) is
-// unrepresentable long before the offset overflows.
+//   - Resident (ids + starts): a sorted id slice plus a row-start offsets slice, so a lookup is a
+//     binary search (O(log series)) with no per-entry overhead — vs a resident map's bucket
+//     structure (~3× the payload) which dominated live heap under continuous ingestion. Because
+//     rows are sorted by (series, ts), every series occupies one contiguous run and the runs
+//     partition [0, rows): series k's range is [starts[k], starts[k+1]), so the resident cost is
+//     20 bytes/series (16 id + 4 offset). This is the fallback for parts written without a
+//     series-index sidecar. int32 offsets cap a part at ~2.1 G rows; openPart materializes the
+//     whole series column in RAM (16 B/row) to build this form, so a part anywhere near that
+//     bound (32 GiB of ids) is unrepresentable long before the offset overflows.
+//
+//   - Paged (paged != nil, ids/starts nil): lookups binary-search the on-disk sidecar's raw
+//     fixed-width entries in place (see [pagedIndex]); nothing per-series is pinned in the heap —
+//     the index bytes live evictably in the backend read cache, held only while a fetch is
+//     reading the part. Because a paged lookup may read through the backend, the index methods
+//     take a context and can fail; the resident form never errors.
 type partIndex struct {
 	ids    []signal.SeriesID
 	starts []int32 // len == len(ids)+1; starts[0] == 0, starts[len(ids)] == total rows
+	paged  *pagedIndex
 }
 
 // lookup returns id's row range and whether the part holds it.
-func (idx partIndex) lookup(id signal.SeriesID) (rowRange, bool) {
-	i, ok := slices.BinarySearchFunc(idx.ids, id, signal.SeriesID.Compare)
-	if !ok {
-		return rowRange{}, false
+func (idx partIndex) lookup(ctx context.Context, id signal.SeriesID) (rowRange, bool, error) {
+	if p := idx.paged; p != nil {
+		ents, err := p.entries(ctx)
+		if err != nil {
+			return rowRange{}, false, err
+		}
+
+		k, ok := p.search(ents, id)
+		if !ok {
+			return rowRange{}, false, nil
+		}
+
+		return p.rangeAt(ents, k), true, nil
 	}
 
-	return rowRange{start: int(idx.starts[i]), end: int(idx.starts[i+1])}, true
+	i, ok := slices.BinarySearchFunc(idx.ids, id, signal.SeriesID.Compare)
+	if !ok {
+		return rowRange{}, false, nil
+	}
+
+	return rowRange{start: int(idx.starts[i]), end: int(idx.starts[i+1])}, true, nil
 }
 
 // has reports whether the part holds id.
-func (idx partIndex) has(id signal.SeriesID) bool {
+func (idx partIndex) has(ctx context.Context, id signal.SeriesID) (bool, error) {
+	if p := idx.paged; p != nil {
+		ents, err := p.entries(ctx)
+		if err != nil {
+			return false, err
+		}
+
+		_, ok := p.search(ents, id)
+
+		return ok, nil
+	}
+
 	_, ok := slices.BinarySearchFunc(idx.ids, id, signal.SeriesID.Compare)
 
-	return ok
+	return ok, nil
+}
+
+// seriesCount returns the number of distinct series in the part.
+func (idx partIndex) seriesCount() int {
+	if idx.paged != nil {
+		return idx.paged.n
+	}
+
+	return len(idx.ids)
+}
+
+// forEachID calls fn for every series id in the part, ascending.
+func (idx partIndex) forEachID(ctx context.Context, fn func(signal.SeriesID)) error {
+	if p := idx.paged; p != nil {
+		ents, err := p.entries(ctx)
+		if err != nil {
+			return err
+		}
+
+		for k := range p.n {
+			fn(sidxEntryID(ents, k))
+		}
+
+		return nil
+	}
+
+	for _, id := range idx.ids {
+		fn(id)
+	}
+
+	return nil
+}
+
+// intersectMark sets active[i]=true for every ids[i] the part holds. Both id sequences are
+// ascending (ids from head.resolve, the index by construction), so a single linear two-pointer
+// merge suffices — no per-id binary search. It is the fully-covered-part count shortcut: presence
+// in such a part already implies an in-window sample, so no decode is needed.
+func (idx partIndex) intersectMark(ctx context.Context, ids []signal.SeriesID, active []bool) error {
+	if p := idx.paged; p != nil {
+		ents, err := p.entries(ctx)
+		if err != nil {
+			return err
+		}
+
+		i, j := 0, 0
+		for i < len(ids) && j < p.n {
+			switch c := ids[i].Compare(sidxEntryID(ents, j)); {
+			case c < 0:
+				i++
+			case c > 0:
+				j++
+			default:
+				active[i] = true
+				i++
+				j++
+			}
+		}
+
+		return nil
+	}
+
+	i, j := 0, 0
+	for i < len(ids) && j < len(idx.ids) {
+		switch c := ids[i].Compare(idx.ids[j]); {
+		case c < 0:
+			i++
+		case c > 0:
+			j++
+		default:
+			active[i] = true
+			i++
+			j++
+		}
+	}
+
+	return nil
+}
+
+// dropView releases a paged index's held entries view (no-op for the resident form). Called when
+// the part's last in-flight fetch releases it.
+func (idx partIndex) dropView() {
+	if idx.paged != nil {
+		idx.paged.drop()
+	}
 }
 
 // rows returns the part's total sample count (the series runs partition [0, rows)).
 func (idx partIndex) rows() int {
+	if idx.paged != nil {
+		return idx.paged.total
+	}
+
 	if len(idx.starts) == 0 {
 		return 0
 	}
@@ -139,7 +257,15 @@ type part struct {
 }
 
 func (p *part) acquire() { p.refs.Add(1) }
-func (p *part) release() { p.refs.Add(-1) }
+
+// release drops one fetch's hold. When the last in-flight fetch lets go, a paged index's entries
+// view is released too, so between fetches the index bytes stay only in the (evictable) backend
+// read cache rather than pinned in the heap.
+func (p *part) release() {
+	if p.refs.Add(-1) == 0 {
+		p.index.dropView()
+	}
+}
 
 // deletePart removes every backend object of the part at prefix (manifest, marks, and
 // column objects), found by listing the prefix.
@@ -158,28 +284,38 @@ func deletePart(ctx context.Context, b backend.Backend, prefix string) error {
 	return nil
 }
 
-// openPart opens the part at prefix and builds its SeriesID → row-range index.
+// openPart opens the part at prefix and attaches its SeriesID → row-range index: the paged form
+// when the series-index sidecar is present and valid — skipping the series-column read and its
+// resident decode entirely — else the resident form built by scanning the series column.
 func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, error) {
 	r, err := block.OpenPart(ctx, b, prefix)
 	if err != nil {
 		return nil, err
 	}
 
-	col, err := r.Column(ctx, colSeries)
-	if err != nil {
-		return nil, err
-	}
+	var idx partIndex
 
-	ids, err := col.ID128(nil)
-	if err != nil {
-		return nil, err
+	if paged, ok := openPagedIndex(ctx, b, prefix, r.RowCount()); ok {
+		idx = partIndex{paged: paged}
+	} else {
+		col, err := r.Column(ctx, colSeries)
+		if err != nil {
+			return nil, err
+		}
+
+		ids, err := col.ID128(nil)
+		if err != nil {
+			return nil, err
+		}
+
+		idx = buildPartIndex(ids)
 	}
 
 	return &part{
 		reader: r,
 		be:     b,
 		prefix: prefix,
-		index:  buildPartIndex(ids),
+		index:  idx,
 		hasSF:  slices.Contains(r.ColumnNames(), colSF),
 	}, nil
 }

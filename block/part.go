@@ -3,6 +3,7 @@ package block
 import (
 	"context"
 	"strconv"
+	"sync"
 
 	"github.com/go-faster/errors"
 
@@ -212,8 +213,11 @@ type PartReader struct {
 	prefix   string
 	manifest Manifest
 	byName   map[string]int
-	comps    map[compress.Algorithm]*compress.Compressor
-	level    compress.Level
+	// compsMu guards comps: Column is called concurrently (overlapping fetches prefetching the
+	// same part), and the per-algorithm compressor is created lazily on first use.
+	compsMu sync.Mutex
+	comps   map[compress.Algorithm]*compress.Compressor
+	level   compress.Level
 }
 
 // OpenPart reads a part's manifest from b under prefix and returns a reader. It returns
@@ -308,6 +312,9 @@ func (r *PartReader) Marks(ctx context.Context) (Marks, error) {
 }
 
 func (r *PartReader) compressorFor(alg compress.Algorithm) *compress.Compressor {
+	r.compsMu.Lock()
+	defer r.compsMu.Unlock()
+
 	c, ok := r.comps[alg]
 	if !ok {
 		c = compress.NewCompressor(alg, r.level)

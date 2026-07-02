@@ -8,6 +8,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+
+	"github.com/oteldb/storage/signal"
 )
 
 // Merge compacts every flushed part into a single new part, dropping samples older than
@@ -203,7 +205,10 @@ func (e *Engine) writeMergedPart(ctx context.Context, cols *flushColumns, seq in
 // columns sorted by (series, ts). The returned columns are empty when no sample survives. It reads
 // the parts off the engine lock; src is the immutable snapshot the caller planned over.
 func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tiers []DownsampleTier) (*flushColumns, error) {
-	ids := sortedSeriesIDs(src)
+	ids, err := sortedSeriesIDs(ctx, src)
+	if err != nil {
+		return nil, err
+	}
 
 	cols := &flushColumns{}
 
@@ -216,7 +221,11 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 
 		// Oldest → newest part, so a later part's value wins on a duplicate timestamp.
 		for _, p := range src {
-			rng, ok := p.index.lookup(id)
+			rng, ok, err := p.index.lookup(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+
 			if !ok {
 				continue
 			}
@@ -264,7 +273,10 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 func (e *Engine) compactStream(
 	ctx context.Context, src []*part, start int64, seq, capRows int, opts MergeOptions,
 ) ([]*part, error) {
-	ids := sortedSeriesIDs(src)
+	ids, err := sortedSeriesIDs(ctx, src)
+	if err != nil {
+		return nil, err
+	}
 
 	// One forward cursor per source part; one reusable per-part destination per series range.
 	streams := make([]*partStream, len(src))
@@ -301,21 +313,9 @@ func (e *Engine) compactStream(
 	}
 
 	for _, id := range ids {
-		var m sampleMerge
-
-		// Oldest → newest part, so a later part's value wins on a duplicate timestamp.
-		for i, p := range src {
-			rng, ok := p.index.lookup(id)
-			if !ok {
-				continue
-			}
-
-			ts, vals, sf, err := streams[i].decodeRange(rng, &scratch[i])
-			if err != nil {
-				return nil, err
-			}
-
-			m.add(ts, vals, sf, start, maxInt64)
+		m, err := mergeStreamedSeries(ctx, src, streams, scratch, id, start)
+		if err != nil {
+			return nil, err
 		}
 
 		ts, values, sf := m.collect(nil, nil)
@@ -346,6 +346,35 @@ func (e *Engine) compactStream(
 	}
 
 	return newParts, nil
+}
+
+// mergeStreamedSeries gathers one series' samples across the source parts (oldest → newest, so a
+// later part's value wins on a duplicate timestamp), each read through its forward stream cursor.
+func mergeStreamedSeries(
+	ctx context.Context, src []*part, streams []*partStream, scratch []rangeBuf,
+	id signal.SeriesID, start int64,
+) (sampleMerge, error) {
+	var m sampleMerge
+
+	for i, p := range src {
+		rng, ok, err := p.index.lookup(ctx, id)
+		if err != nil {
+			return m, err
+		}
+
+		if !ok {
+			continue
+		}
+
+		ts, vals, sf, err := streams[i].decodeRange(rng, &scratch[i])
+		if err != nil {
+			return m, err
+		}
+
+		m.add(ts, vals, sf, start, maxInt64)
+	}
+
+	return m, nil
 }
 
 // Close flushes any buffered samples to a part and closes the WAL. It does not stop a background

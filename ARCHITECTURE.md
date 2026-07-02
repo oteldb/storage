@@ -460,13 +460,25 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   labels — parts store only ids). This is the object-store-native read path: any node serves a
   tenant's flushed data without the (local) WAL. WAL `Replay` is complementary, restoring only
   the *unflushed* head.
-- **Part fetch** (`part.go`) — `openPart` rebuilds a sparse `SeriesID → [rowStart,rowEnd)` index
-  by scanning the sorted series column once (each series is one contiguous run). The index is a
-  sorted `ids` slice plus an `int32` row-start offsets slice — because the runs partition
-  `[0, rows)`, series k's range is `[starts[k], starts[k+1])`, so no per-entry end or total is
-  stored. A binary-searchable layout with no per-entry overhead, chosen over a resident map, so a
-  part's resident footprint is 20 bytes/series (16 id + 4 offset) regardless of map bucket growth;
-  `mergeInto` decodes a series' `ts`/`value` sub-slice within the window.
+- **Part fetch** (`part.go`, `sidx.go`) — every flushed/merged part carries a **series-index
+  sidecar** (`{prefix}/sidx`): the sorted distinct `SeriesID`s with their run-start rows as
+  fixed-width 20-byte entries (magic/version header, CRC32C tail), so a lookup **binary-searches
+  the raw sidecar bytes in place**. `openPart` validates it once (CRC + ids-ascending +
+  starts-increasing invariants) and attaches the **paged index**: nothing per-series is pinned in
+  the heap — the entries view is held only while at least one fetch is reading the part (dropped
+  when the part's refcount reaches zero) and re-fetched through `backend.ReadView` (a zero-copy
+  cache hit) on the next use, so resident index memory is governed by the read cache's byte budget
+  rather than series count, and opening a part reads no series column at all. Lookup cost is
+  within ~4% of the resident form (same binary search, big-endian entry decode per probe). On a
+  backend without the `Viewer` capability (bare cold tier, read cache off) the view is loaded once
+  and kept — the old footprint, no re-read regression. A part with a missing or invalid sidecar (a
+  part written before the sidecar existed, or a corrupt object) falls back to the **resident
+  index** built by scanning the sorted series column once: a sorted `ids` slice plus an `int32`
+  row-start offsets slice (runs partition `[0, rows)`, so series k's range is
+  `[starts[k], starts[k+1])`) — 20 bytes/series in heap. The sidecar is derived (rebuildable from
+  the column), so it carries no format-migration burden; it costs 20 B/series/part on disk
+  (re-based in the density budgets). `mergeInto` decodes a series' `ts`/`value` sub-slice within
+  the window.
 - **Merge — compaction + retention + downsampling + recompression + precision** (`merge.go`,
   `downsample.go`, `recompress.go`, `precision.go`) is the one background-merge engine; all five modes
   are one pass over the immutable parts (no separate subsystem). `MergeWith(MergeOptions{RetainFrom,

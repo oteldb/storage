@@ -42,13 +42,19 @@ type densityBudget struct {
 // The constant-value profile is held to the project's 0.4–0.8 B/point target on the value parts;
 // the rest document where each value shape currently sits (and how far the codecs still have to
 // go on the random-walk / noisy cases).
+//
+// The maxTotal ceilings include the series-index sidecar (sidx, 20 B/series/part): it trades that
+// on-disk overhead for a part index that is no longer pinned in the heap. On the deep profiles it
+// is well under 1 B/point; on the deliberately pathological wide_shallow shape (few points per
+// series, so per-series overhead dominates) it adds ~10 B/point — the budgets below were re-based
+// when the sidecar landed.
 var densityBudgets = map[string]densityBudget{
-	"counter_200k":        {maxParts: 1.6, maxTotal: 3.5},  // adaptive decimal codec: integer-valued ⇒ ~1.5
-	"gauge_randwalk_200k": {maxParts: 9.2, maxTotal: 11.0}, // full-entropy doubles: near the lossless floor (Gorilla)
-	"gauge_bounded_200k":  {maxParts: 1.6, maxTotal: 3.5},  // realistic 1-decimal gauge ⇒ adaptive decimal ~1.5
-	"gauge_constant_200k": {maxParts: 0.8, maxTotal: 2.5},  // parts held to the B/point target
-	"gauge_noisy_200k":    {maxParts: 8.4, maxTotal: 10.2},
-	"wide_shallow_100k":   {maxParts: 27.0, maxTotal: 120.0},
+	"counter_200k":        {maxParts: 1.6, maxTotal: 3.9},  // adaptive decimal codec: integer-valued ⇒ ~1.5
+	"gauge_randwalk_200k": {maxParts: 9.2, maxTotal: 10.6}, // full-entropy doubles: near the lossless floor (Gorilla)
+	"gauge_bounded_200k":  {maxParts: 1.6, maxTotal: 3.9},  // realistic 1-decimal gauge ⇒ adaptive decimal ~1.5
+	"gauge_constant_200k": {maxParts: 0.8, maxTotal: 2.8},  // parts held to the B/point target
+	"gauge_noisy_200k":    {maxParts: 8.4, maxTotal: 10.9},
+	"wide_shallow_100k":   {maxParts: 27.0, maxTotal: 137.0},
 }
 
 // TestDensityBudget gates on-disk bytes/point against densityBudgets for every density profile,

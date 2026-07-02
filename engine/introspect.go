@@ -64,7 +64,7 @@ func (e *Engine) Parts() []PartStat {
 	for _, p := range e.parts {
 		out = append(out, PartStat{
 			ID: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
-			Series: len(p.index.ids), Rows: int64(p.rows()),
+			Series: p.index.seriesCount(), Rows: int64(p.rows()),
 		})
 	}
 
@@ -111,7 +111,7 @@ func (e *Engine) PartsDetailed(ctx context.Context) ([]PartDetailStat, error) {
 		out = append(out, PartDetailStat{
 			PartStat: PartStat{
 				ID: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
-				Series: len(p.index.ids), Rows: int64(p.rows()),
+				Series: p.index.seriesCount(), Rows: int64(p.rows()),
 			},
 			Bytes:   bytes,
 			Chunks:  granuleCount(man.RowCount, man.GranuleSize),

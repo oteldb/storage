@@ -215,32 +215,8 @@ func (e *Engine) bucketSeries(
 	}
 
 	for _, p := range plan.liveParts {
-		rng, ok := p.index.lookup(id)
-		if !ok {
-			continue
-		}
-
-		// A part wholly inside one bucket contributes entirely to it — fold its sidecar, no decode.
-		if bucketStart(p.minTime, step) == bucketStart(p.maxTime, step) {
-			if st, ok := p.seriesStat(ctx, id); ok {
-				bs := bucketStart(p.minTime, step)
-				a := buckets[bs]
-				a.merge(st)
-				buckets[bs] = a
-
-				continue
-			}
-		}
-
-		dp, err := e.decodeOf(ctx, p, colNeed{values: true}, nil)
-		if err != nil {
+		if err := e.bucketPart(ctx, plan, p, id, step, buckets, addSample); err != nil {
 			return nil, err
-		}
-
-		for i := rng.start; i < rng.end; i++ {
-			if dp.ts[i] >= plan.start && dp.ts[i] <= plan.end {
-				addSample(dp.ts[i], dp.vals[i])
-			}
 		}
 	}
 
@@ -257,6 +233,47 @@ func (e *Engine) bucketSeries(
 	}
 
 	return buckets, nil
+}
+
+// bucketPart folds one part's contribution of series id into the step-aligned buckets: the stats
+// sidecar when the part fits a single bucket, else the decoded in-window rows of the series' run.
+func (e *Engine) bucketPart(
+	ctx context.Context, plan *enginePlan, p *part, id signal.SeriesID, step int64,
+	buckets map[int64]SeriesAgg, addSample func(ts int64, v float64),
+) error {
+	rng, ok, err := p.index.lookup(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	if !ok {
+		return nil
+	}
+
+	// A part wholly inside one bucket contributes entirely to it — fold its sidecar, no decode.
+	if bucketStart(p.minTime, step) == bucketStart(p.maxTime, step) {
+		if st, ok := p.seriesStat(ctx, id); ok {
+			bs := bucketStart(p.minTime, step)
+			a := buckets[bs]
+			a.merge(st)
+			buckets[bs] = a
+
+			return nil
+		}
+	}
+
+	dp, err := e.decodeOf(ctx, p, colNeed{values: true}, nil)
+	if err != nil {
+		return err
+	}
+
+	for i := rng.start; i < rng.end; i++ {
+		if dp.ts[i] >= plan.start && dp.ts[i] <= plan.end {
+			addSample(dp.ts[i], dp.vals[i])
+		}
+	}
+
+	return nil
 }
 
 // bucketStart returns the start of the step-aligned bucket containing ts (floored to a multiple of
@@ -356,7 +373,11 @@ func (e *Engine) aggViaStats(ctx context.Context, plan *enginePlan, id signal.Se
 	var agg SeriesAgg
 
 	for _, p := range plan.liveParts {
-		rng, ok := p.index.lookup(id)
+		rng, ok, err := p.index.lookup(ctx, id)
+		if err != nil {
+			return SeriesAgg{}, err
+		}
+
 		if !ok {
 			continue
 		}

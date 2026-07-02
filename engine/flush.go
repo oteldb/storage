@@ -195,6 +195,14 @@ func writePart(
 		return errors.Wrapf(err, "write part %q", prefix)
 	}
 
+	// Series-index sidecar: the sorted (id, run-start) entries in a binary-searchable fixed-width
+	// layout, so opening the part needs neither the series-column read nor a resident per-series
+	// index (see sidx.go). Written after the manifest commit — a crash in between leaves a valid
+	// part that openPart handles via the resident fallback.
+	if err := b.Write(ctx, sidxKey(prefix), encodeSeriesIndex(cols.series)); err != nil {
+		return errors.Wrapf(err, "write series-index sidecar %q", prefix)
+	}
+
 	// Aggregate-pushdown sidecar: per-series count/sum/min/max over the value column, so a query
 	// whose range fully covers this part answers from it without decoding the column. Opt-in (it
 	// costs a little storage per series) and written only for an unsampled part (raw values); a
