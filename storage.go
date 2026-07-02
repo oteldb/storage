@@ -58,6 +58,11 @@ type Storage struct {
 
 	queryCache scale.Cache // shared results cache for Fetcher; nil ⇒ caching disabled
 
+	// decodeBudget is the process-wide decode-memory admission budget ([Options.DecodeMemoryBytes]),
+	// shared by every tenant engine so concurrent queries cannot multiply resident decoded bytes
+	// past the cap. nil ⇒ unlimited.
+	decodeBudget *engine.DecodeBudget
+
 	admitMu sync.Mutex                           // guards admit
 	admit   map[signal.TenantID]*tenantAdmission // per-tenant admission state (rate valve + counters)
 	now     func() int64                         // unix-nano clock for admission; overridable in tests
@@ -92,6 +97,10 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	}
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
+	}
+
+	if o.DecodeMemoryBytes > 0 {
+		s.decodeBudget = engine.NewDecodeBudget(o.DecodeMemoryBytes)
 	}
 
 	observer, err := obs.New(obs.Config{Logger: o.Logger, TracerProvider: o.TracerProvider, MeterProvider: o.MeterProvider})
@@ -962,7 +971,10 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		WAL:              w,
 		Obs:              s.obs,
 		DecodeCacheBytes: s.opts.DecodeCacheBytes,
-		AggregateStats:   s.opts.AggregateStats,
+		// One budget for every tenant engine, so the decode-admission cap bounds the process-wide
+		// in-flight decoded bytes instead of multiplying per tenant. nil ⇒ unlimited.
+		DecodeBudget:   s.decodeBudget,
+		AggregateStats: s.opts.AggregateStats,
 		// MaxPartBytes caps each flushed/merged part; resolved from the tenant's policy, falling back
 		// to defaultMaxPartBytes when the policy leaves it unset. It is an operational/structural cap
 		// fixed at engine creation (unlike the per-write admission limits). A bounded part size is what

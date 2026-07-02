@@ -227,3 +227,89 @@ func TestCachedSize(t *testing.T) {
 	_, err = backend.SizeOf(ctx, c, "absent")
 	assert.ErrorIs(t, err, backend.ErrNotExist)
 }
+
+func TestCacheReadViewNoCopyOnHit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	inner := newCounting()
+	c := backend.Cached(inner, 1<<20)
+	require.NoError(t, c.Write(ctx, "k", []byte("value")))
+
+	viewer, ok := c.(backend.Viewer)
+	require.True(t, ok, "the cached backend exposes the read-only view capability")
+
+	// Two hits return views of the same resident entry — no per-hit clone.
+	v1, err := viewer.ReadView(ctx, "k")
+	require.NoError(t, err)
+
+	v2, err := viewer.ReadView(ctx, "k")
+	require.NoError(t, err)
+
+	assert.Equal(t, []byte("value"), v1)
+	assert.Same(t, &v1[0], &v2[0], "hits share the resident entry's backing array")
+	assert.Equal(t, int64(0), inner.reads.Load())
+}
+
+func TestCacheReadViewMissStoresAndStaysValidAfterOverwrite(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	inner := newCounting()
+	c := backend.Cached(inner, 1<<20)
+	require.NoError(t, inner.Write(ctx, "k", []byte("old")))
+
+	// The miss reads through once, caches the value, and returns it as a view.
+	v, err := backend.ReadView(ctx, c, "k")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("old"), v)
+	assert.Equal(t, int64(1), inner.reads.Load())
+
+	hit, err := backend.ReadView(ctx, c, "k")
+	require.NoError(t, err)
+	assert.Same(t, &v[0], &hit[0], "the second read hits the entry stored by the miss")
+	assert.Equal(t, int64(1), inner.reads.Load())
+
+	// Overwriting replaces the entry's slice; the outstanding view keeps reading the old bytes.
+	require.NoError(t, c.Write(ctx, "k", []byte("new")))
+	assert.Equal(t, []byte("old"), v, "a retained view is immutable across overwrite")
+
+	cur, err := backend.ReadView(ctx, c, "k")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("new"), cur)
+}
+
+func TestReadViewFallsBackToRead(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// countingBackend embeds the Backend interface, so it does not implement Viewer itself; the
+	// helper must fall back to a plain Read.
+	inner := newCounting()
+	require.NoError(t, inner.Write(ctx, "k", []byte("v")))
+
+	v, err := backend.ReadView(ctx, inner, "k")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v"), v)
+	assert.Equal(t, int64(1), inner.reads.Load())
+}
+
+func TestMemoryReadViewAliasesStore(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	m := backend.Memory()
+	require.NoError(t, m.Write(ctx, "k", []byte("abc")))
+
+	v1, err := backend.ReadView(ctx, m, "k")
+	require.NoError(t, err)
+
+	v2, err := backend.ReadView(ctx, m, "k")
+	require.NoError(t, err)
+	assert.Same(t, &v1[0], &v2[0], "memory views alias the stored object (no copy)")
+
+	// A plain Read still returns a private copy.
+	cp, err := m.Read(ctx, "k")
+	require.NoError(t, err)
+	assert.NotSame(t, &v1[0], &cp[0])
+}

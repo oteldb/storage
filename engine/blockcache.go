@@ -2,6 +2,7 @@ package engine
 
 import (
 	"container/list"
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -31,6 +32,13 @@ type blockCache struct {
 	maxBytes int64
 
 	hits, misses atomic.Int64
+
+	// inflight counts the fetches currently drawing decode buffers (fetchStart/fetchEnd). The
+	// freelists scale their bound with it: a fetch's pins hold evicted buffers back from the pool
+	// until they are released, so under N concurrent fetches the pool must absorb roughly N fetches'
+	// worth of returned buffers at once — a fixed cap sized for the steady state drops most of a
+	// burst's returns on the floor and the next fetch re-allocates them all.
+	inflight atomic.Int64
 
 	mu       sync.Mutex
 	ll       *list.List                       // front = most-recently used; Value is *blockEntry
@@ -75,13 +83,27 @@ type blockEntry struct {
 }
 
 func newBlockCache(maxBytes int64) *blockCache {
-	return &blockCache{
+	c := &blockCache{
 		maxBytes: maxBytes,
 		ll:       list.New(),
 		items:    make(map[blockKey]*list.Element),
 		byPrefix: make(map[string]map[blockKey]struct{}),
 	}
+
+	// Both freelists share one bound, scaled by the fetches currently in flight: the resident
+	// contribution stays a few MiB at rest (blockBufCap buffers) and grows only while a burst is
+	// actually holding that many buffers in play.
+	capNow := func() int { return blockBufCap * (1 + int(c.inflight.Load())) }
+	c.i64Free.capNow = capNow
+	c.f64Free.capNow = capNow
+
+	return c
 }
+
+// fetchStart registers a fetch that will draw decode buffers; fetchEnd unregisters it. The pair
+// scales the freelist bound with concurrency (see blockCache.inflight).
+func (c *blockCache) fetchStart() { c.inflight.Add(1) }
+func (c *blockCache) fetchEnd()   { c.inflight.Add(-1) }
 
 // get returns the cached block for key (shared, read-only), marking it most-recently-used and pinning
 // it against recycling. On a hit the caller MUST call release once it is done reading the block.
@@ -245,27 +267,35 @@ func (c *blockCache) removeElemKeepPrefix(el *list.Element) {
 type bufFreeList[T any] struct {
 	mu   sync.Mutex
 	free [][]T
+	// capNow returns the current entry bound; nil ⇒ the static blockBufCap. The block cache wires
+	// a bound scaled by in-flight fetches, so a concurrency burst's returned buffers are kept for
+	// the next fetch instead of dropped.
+	capNow func() int
 }
 
-// blockBufCap bounds each decode-buffer freelist. A small multiple of the per-fetch parallelism is
-// ample: at steady state each miss frees one buffer (an eviction) as it draws one, so the freelist
-// oscillates near empty; the cap only bounds bursts, keeping the pool's RSS contribution a few MiB.
+// blockBufCap is the freelist's baseline bound (its resident floor, a few MiB of buffers): the
+// per-fetch decode parallelism times a small burst factor. Under concurrent fetches the effective
+// bound scales up with the in-flight count (see blockCache.inflight) and falls back here at rest.
 const blockBufCap = prefetchConcurrency * 4
 
+// get returns a recycled buffer with room for n rows, or a fresh one when none fits. It scans for
+// a fitting buffer instead of popping blindly: a too-small buffer (a smaller-granule part's) stays
+// pooled for a later smaller request rather than being discarded.
 func (p *bufFreeList[T]) get(n int) []T {
 	p.mu.Lock()
 
-	if k := len(p.free); k > 0 {
-		s := p.free[k-1]
-		p.free[k-1] = nil
-		p.free = p.free[:k-1]
-		p.mu.Unlock()
-
-		if cap(s) >= n {
-			return s[:n]
+	for i, s := range slices.Backward(p.free) {
+		if cap(s) < n {
+			continue
 		}
 
-		return make([]T, n) // recycled buffer too small (a smaller-granule part); let it go
+		last := len(p.free) - 1
+		p.free[i] = p.free[last]
+		p.free[last] = nil
+		p.free = p.free[:last]
+		p.mu.Unlock()
+
+		return s[:n]
 	}
 
 	p.mu.Unlock()
@@ -278,8 +308,13 @@ func (p *bufFreeList[T]) put(s []T) {
 		return
 	}
 
+	limit := blockBufCap
+	if p.capNow != nil {
+		limit = p.capNow()
+	}
+
 	p.mu.Lock()
-	if len(p.free) < blockBufCap {
+	if len(p.free) < limit {
 		p.free = append(p.free, s)
 	}
 	p.mu.Unlock()

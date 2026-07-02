@@ -102,7 +102,8 @@ func TestBlockCacheRaceInsertGetEvict(t *testing.T) {
 }
 
 // TestBufFreeListBounded checks the freelist honors its count bound (so pooled-but-free buffers add a
-// bounded amount to RSS) and skips a recycled buffer too small for the requested length.
+// bounded amount to RSS) and that a too-small recycled buffer stays pooled for a later smaller
+// request instead of being discarded.
 func TestBufFreeListBounded(t *testing.T) {
 	t.Parallel()
 
@@ -113,10 +114,83 @@ func TestBufFreeListBounded(t *testing.T) {
 
 	assert.Len(t, p.free, blockBufCap, "the freelist is bounded")
 
-	// A recycled buffer smaller than the request is dropped, not returned undersized.
+	// A recycled buffer smaller than the request is skipped (kept pooled), not returned undersized.
 	var q bufFreeList[int64]
 	q.put(make([]int64, 0, 2))
 	got := q.get(8)
 	assert.GreaterOrEqual(t, cap(got), 8)
+	assert.Len(t, q.free, 1, "the too-small buffer stays pooled for a smaller request")
+
+	small := q.get(2)
+	assert.Equal(t, 2, cap(small), "a later fitting request draws the kept buffer")
 	assert.Empty(t, q.free)
+}
+
+// TestBufFreeListScalesWithInflight checks the block cache's freelist bound grows with the number
+// of registered in-flight fetches (and falls back to the baseline when they end), so a concurrency
+// burst's returned buffers are kept for the next fetch instead of dropped at the static cap.
+func TestBufFreeListScalesWithInflight(t *testing.T) {
+	t.Parallel()
+
+	c := newBlockCache(1 << 20)
+
+	fill := func() int {
+		n := 0
+
+		for {
+			before := len(c.i64Free.free)
+			c.i64Free.put(make([]int64, 8))
+
+			if len(c.i64Free.free) == before {
+				return n
+			}
+
+			n++
+		}
+	}
+
+	require.Equal(t, blockBufCap, fill(), "at rest the bound is the baseline")
+
+	c.fetchStart()
+	c.fetchStart()
+
+	extra := fill()
+	assert.Equal(t, 2*blockBufCap, extra, "two in-flight fetches double the headroom over the baseline")
+
+	c.fetchEnd()
+	c.fetchEnd()
+
+	assert.Equal(t, 0, fill(), "back at rest the (now over-full) list accepts nothing more")
+}
+
+// TestReleaseSeriesPinsKeepsMemo checks the per-series pin release: pins other than the memoized
+// entries are released (refs drop, evicted buffers recycle), while exactly one pin per memoized
+// block survives so its held view stays valid for the next series.
+func TestReleaseSeriesPinsKeepsMemo(t *testing.T) {
+	t.Parallel()
+
+	c := newBlockCache(1 << 20)
+	r := &seriesBlockReader{engine: &Engine{blockCache: c}}
+
+	entA := c.insert(&blockEntry{key: blockKey{prefix: "p", col: colTsID, blk: 0}, i64: make([]int64, 1), bytes: 8})
+	entB := c.insert(&blockEntry{key: blockKey{prefix: "p", col: colTsID, blk: 1}, i64: make([]int64, 1), bytes: 8})
+	entV := c.insert(&blockEntry{key: blockKey{prefix: "p", col: colValID, blk: 1}, f64: make([]float64, 1), bytes: 8})
+
+	// The reader visited ts blocks 0 and 1 (block 1 twice: revisited) and value block 1; the memo
+	// currently holds ts block 1 and value block 1.
+	entB.refs++ // second pin from the revisit
+
+	r.pins = []*blockEntry{entA, entB, entB, entV}
+	r.tsEnt, r.valEnt = entB, entV
+
+	r.releaseSeriesPins()
+
+	assert.Equal(t, 0, entA.refs, "a non-memo pin is released")
+	assert.Equal(t, 1, entB.refs, "exactly one pin survives for a memoized block, duplicates released")
+	assert.Equal(t, 1, entV.refs, "the value memo keeps its pin")
+	assert.Equal(t, []*blockEntry{entB, entV}, r.pins, "pins compact to the retained memo entries")
+
+	r.releasePins()
+	assert.Zero(t, entB.refs)
+	assert.Zero(t, entV.refs)
 }

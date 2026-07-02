@@ -2,7 +2,7 @@ package engine
 
 import "sync"
 
-// decodeBudget caps the total in-flight decoded bytes across concurrent queries, so query concurrency
+// DecodeBudget caps the total in-flight decoded bytes across concurrent queries, so query concurrency
 // cannot drive RSS past a bound. Each query estimates its decode footprint (the column buffers it
 // will materialize across the parts it touches) and acquires that many bytes before decoding,
 // releasing them when the fetch ends; an acquire blocks until enough is free. Under load this trades
@@ -13,17 +13,20 @@ import "sync"
 // its own footprint), so an unsatisfiable request never deadlocks. The budget is acquired once per
 // query (the whole estimate up front), not incrementally per part, so two queries cannot each hold a
 // partial reservation while waiting on the other.
-type decodeBudget struct {
+//
+// One budget may be shared by multiple engines (via [Config.DecodeBudget]) so the cap bounds the
+// process-wide decode footprint rather than a per-engine (per-tenant) one.
+type DecodeBudget struct {
 	maxBytes int64
 	mu       sync.Mutex
 	cond     *sync.Cond
 	used     int64
 }
 
-// newDecodeBudget returns a budget capping in-flight decoded bytes at maxBytes. maxBytes ≤ 0 disables
+// NewDecodeBudget returns a budget capping in-flight decoded bytes at maxBytes. maxBytes ≤ 0 disables
 // it (every acquire/release is a no-op).
-func newDecodeBudget(maxBytes int64) *decodeBudget {
-	b := &decodeBudget{maxBytes: maxBytes}
+func NewDecodeBudget(maxBytes int64) *DecodeBudget {
+	b := &DecodeBudget{maxBytes: maxBytes}
 	b.cond = sync.NewCond(&b.mu)
 
 	return b
@@ -33,7 +36,7 @@ func newDecodeBudget(maxBytes int64) *decodeBudget {
 // immediately when nothing else is in flight (even if n exceeds the whole budget), so an
 // over-budget query runs alone rather than waiting forever. A nil/disabled budget or n ≤ 0 is a
 // no-op.
-func (b *decodeBudget) acquire(n int64) {
+func (b *DecodeBudget) acquire(n int64) {
 	if b == nil || b.maxBytes <= 0 || n <= 0 {
 		return
 	}
@@ -49,7 +52,7 @@ func (b *decodeBudget) acquire(n int64) {
 }
 
 // release returns n bytes to the budget and wakes any waiters.
-func (b *decodeBudget) release(n int64) {
+func (b *DecodeBudget) release(n int64) {
 	if b == nil || b.maxBytes <= 0 || n <= 0 {
 		return
 	}
