@@ -384,7 +384,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 	// Reserve this fetch's decode footprint from the memory budget (blocks under concurrency
 	// pressure), off the engine lock, before any part is decoded. A fetch materializes ts+value.
-	plan.acquireDecodeBudget(colNeed{values: true})
+	plan.acquireDecodeBudget(colNeed{values: true}, true)
 
 	// Prefetch: decode the parts this fetch will touch concurrently (and cache them), so their
 	// backend reads + decodes overlap instead of happening one part at a time during the merge.
@@ -560,29 +560,31 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 // acquireDecodeBudget reserves this query's estimated decode footprint from the engine's
 // decode-memory budget, blocking until it fits (or admitting it alone when it exceeds the whole
 // budget). It must run off the engine lock and after planFetch (it needs liveParts); releaseParts
-// returns the reservation. A nil budget makes it a no-op.
-func (p *enginePlan) acquireDecodeBudget(need colNeed) {
+// returns the reservation. A nil budget makes it a no-op. blockSliced is set by the fetch path,
+// whose block-sliced parts pin only the blocks the matched series touch (see decodeEstimate); the
+// count/aggregate paths decode whole-part buffers and reserve them in full.
+func (p *enginePlan) acquireDecodeBudget(need colNeed, blockSliced bool) {
 	if p.engine.budget == nil {
 		return
 	}
 
-	p.budgetBytes = p.decodeEstimate(need)
+	p.budgetBytes = p.decodeEstimate(need, blockSliced)
 	p.engine.budget.acquire(p.budgetBytes)
 }
 
-// decodeEstimate is the bytes this query will materialize across the parts it touches: the full ts
+// decodeEstimate is the bytes this query will keep resident across the parts it touches: the ts
 // column always, plus the value column (and the scale-factor column when present) when need.values.
-// A decoded column is one int64/float64 per row, so 8 bytes/row/column. It is an upper bound — the
-// per-fetch decodedPart is sized to the part's full row count even for a sparse selector — so the
-// budget reservation matches the resident footprint it caps.
+// A decoded column is one int64/float64 per row, so 8 bytes/row/column.
 //
-// Block-sliced parts (the decode-cache fetch path) count the same as whole-part decodes: the fetch
-// pins every block it touches until releaseParts, and evicted-but-pinned blocks stay live, so N
-// concurrent fetches accumulate the same column bytes through the cache-miss path (bufFreeList.get
-// dominated the live heap under 8-way load — see oteldb/oteldb#1124). Blocks shared between
-// concurrent fetches make this an over-estimate; the budget trades that extra queueing for the
-// memory ceiling actually holding.
-func (p *enginePlan) decodeEstimate(need colNeed) int64 {
+// A whole-part decode is bounded by the part's full row count (the decodedPart buffer is sized to
+// it even for a sparse selector). A block-sliced part (the decode-cache fetch path) holds no
+// whole-part buffer, but the fetch pins every block its matched series touch until releaseParts,
+// and evicted-but-pinned blocks stay live — N concurrent fetches accumulate those column bytes
+// through the cache-miss path just the same (bufFreeList.get held 4 GB of a 5.6 GB live heap under
+// 8-way load when this went unmetered — see oteldb/oteldb#1124). Those parts are bounded by the
+// matched blocks instead, so a sparse selector reserves its actual pinned footprint and keeps its
+// concurrency, while a dense scan reserves the whole column and queues.
+func (p *enginePlan) decodeEstimate(need colNeed, blockSliced bool) int64 {
 	var total int64
 
 	for _, part := range p.liveParts {
@@ -594,10 +596,41 @@ func (p *enginePlan) decodeEstimate(need colNeed) int64 {
 			}
 		}
 
-		total += int64(part.rows()) * 8 * cols
+		rows := int64(part.rows())
+		if blockSliced {
+			if r := p.blockReaders[part]; r != nil {
+				rows = p.pinnedRowsBound(part, r.blockRows)
+			}
+		}
+
+		total += rows * 8 * cols
 	}
 
 	return total
+}
+
+// pinnedRowsBound bounds the rows a block-sliced fetch keeps pinned in part: the matched series'
+// row ranges rounded out to block boundaries (a pinned block is resident whole even when only a
+// few of its rows are matched — the same first..last block walk the reader does), capped at the
+// whole part. Ranges sharing a block double-count toward the bound; the cap keeps that harmless.
+func (p *enginePlan) pinnedRowsBound(part *part, blockRows int) int64 {
+	var blocks int64
+
+	for _, id := range p.ids {
+		rng, ok := part.index.lookup(id)
+		if !ok {
+			continue
+		}
+
+		blocks += int64((rng.end-1)/blockRows - rng.start/blockRows + 1)
+	}
+
+	rows := blocks * int64(blockRows)
+	if whole := int64(part.rows()); rows > whole {
+		return whole
+	}
+
+	return rows
 }
 
 func (p *enginePlan) releaseParts() {
