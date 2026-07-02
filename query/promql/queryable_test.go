@@ -390,8 +390,10 @@ func TestCountSeriesByRecheckFallback(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, map[string]uint64{"a": 1, "a2": 1}, got)
 
-	// A plain fakeFetcher implements no GroupCounter: the pushable path reports unsupported so the
-	// engine falls back to full evaluation.
-	_, err = counter.CountSeriesBy(context.Background(), 0, 10_000, "route", eq(t, "__name__", "http_requests"))
-	assert.ErrorIs(t, err, errCountNotSupported)
+	// A plain fakeFetcher implements no GroupCounter: even with fully pushable matchers the hook
+	// answers via the exact Fetch-based grouping (the engine cannot re-plan mid-query, so this
+	// path must never error on an unsupported chain).
+	all, err := counter.CountSeriesBy(context.Background(), 0, 10_000, "route", eq(t, "__name__", "http_requests"))
+	require.NoError(t, err)
+	assert.Equal(t, map[string]uint64{"a": 1, "a2": 1, "b": 1}, all)
 }

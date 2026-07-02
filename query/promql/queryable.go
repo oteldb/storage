@@ -251,9 +251,12 @@ func (q *querier) CountSeriesBy(
 		return q.countSeriesByRecheck(ctx, startMs, endMs, label, matchers, pushed)
 	}
 
+	// A fetcher chain without the grouped-count capability (e.g. a multi-child fan-out) takes the
+	// exact Fetch-based grouping instead of erroring: the engine picks the pushdown operator at
+	// plan time and cannot re-plan mid-query, so this hook must always answer.
 	counter := fetch.GroupCounterOf(q.fetcher)
 	if counter == nil {
-		return nil, errCountNotSupported
+		return q.countSeriesByRecheck(ctx, startMs, endMs, label, matchers, pushed)
 	}
 
 	req := fetch.Request{
