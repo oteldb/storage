@@ -326,3 +326,72 @@ func TestNewQueryableWithNilCache(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, q.Close())
 }
+
+// groupCountingFetcher implements fetch.GroupCounter, recording the grouped-count request.
+type groupCountingFetcher struct {
+	fakeFetcher
+
+	label  string
+	groups map[string]int
+}
+
+func (f *groupCountingFetcher) CountBy(_ context.Context, r fetch.Request, label []byte) (map[string]int, error) {
+	f.last = r
+	f.label = string(label)
+
+	return f.groups, nil
+}
+
+func TestCountSeriesByPushdown(t *testing.T) {
+	t.Parallel()
+
+	f := &groupCountingFetcher{groups: map[string]int{"0": 2, "1": 1, "": 1}}
+	q, err := NewQueryable(f, "default").Querier(0, 10_000)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = q.Close() })
+
+	counter, ok := q.(interface {
+		CountSeriesBy(ctx context.Context, startMs, endMs int64, label string, matchers ...*labels.Matcher) (map[string]uint64, error)
+	})
+	require.True(t, ok, "querier exposes the grouped-count pushdown hook")
+
+	got, err := counter.CountSeriesBy(context.Background(), 0, 10_000, "cpu", eq(t, "__name__", "node_cpu"))
+	require.NoError(t, err)
+	assert.Equal(t, map[string]uint64{"0": 2, "1": 1, "": 1}, got)
+	assert.Equal(t, "cpu", f.label, "the grouping label reaches the engine primitive")
+	assert.Len(t, f.last.Matchers, 1, "the pushable matcher is pushed")
+}
+
+func TestCountSeriesByRecheckFallback(t *testing.T) {
+	t.Parallel()
+
+	// route=a twice, route=b once; one series matches the metric but will be dropped by the
+	// non-pushable != matcher.
+	f := &fakeFetcher{batches: []*fetch.Batch{
+		series("http_requests", "a", [2]int64{1, 1}),
+		series("http_requests", "a2", [2]int64{2, 2}),
+		series("http_requests", "b", [2]int64{3, 3}),
+	}}
+
+	q, err := NewQueryable(f, "default").Querier(0, 10_000)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = q.Close() })
+
+	counter := q.(interface {
+		CountSeriesBy(ctx context.Context, startMs, endMs int64, label string, matchers ...*labels.Matcher) (map[string]uint64, error)
+	})
+
+	// The != matcher is not pushable, so the fallback fetches and re-checks; grouping by __name__
+	// buckets the two surviving series under the metric name.
+	got, err := counter.CountSeriesBy(
+		context.Background(), 0, 10_000, "route",
+		eq(t, "__name__", "http_requests"), neq(t, "route", "b"),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]uint64{"a": 1, "a2": 1}, got)
+
+	// A plain fakeFetcher implements no GroupCounter: the pushable path reports unsupported so the
+	// engine falls back to full evaluation.
+	_, err = counter.CountSeriesBy(context.Background(), 0, 10_000, "route", eq(t, "__name__", "http_requests"))
+	assert.ErrorIs(t, err, errCountNotSupported)
+}

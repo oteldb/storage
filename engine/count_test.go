@@ -232,3 +232,137 @@ func TestCountPushdownNameRegex(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, none, "no series matches __name__=~node_zzz")
 }
+
+// groupCountsViaFetch is the brute-force oracle for CountBy: fetch every matching series with its
+// in-window samples and group the batches by the label's text value on the series' attributes.
+func groupCountsViaFetch(t *testing.T, e *engine.Engine, r fetch.Request, label string) map[string]int {
+	t.Helper()
+
+	got := map[string]int{}
+
+	for _, b := range fetchAll(t, e, r) {
+		key := ""
+		if v, ok := b.Series.Attributes.Get([]byte(label)); ok {
+			key = string(v.AppendText(nil))
+		}
+
+		got[key]++
+	}
+
+	return got
+}
+
+// TestCountByPushdown verifies Engine.CountBy agrees with a full Fetch+drain grouped by label —
+// the differential oracle the PromQL `count by (label)` pushdown relies on — across head, parts,
+// dedup between them, missing labels, and window edges.
+func TestCountByPushdown(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := engine.New(engine.Config{Backend: backend.Memory(), Prefix: "t/countby"})
+
+	a0 := mkSeries("__name__", "node_cpu", "cpu", "0", "mode", "idle")
+	a1 := mkSeries("__name__", "node_cpu", "cpu", "0", "mode", "user")
+	b0 := mkSeries("__name__", "node_cpu", "cpu", "1", "mode", "idle")
+	nl := mkSeries("__name__", "node_cpu", "mode", "steal") // no cpu label
+	x := mkSeries("__name__", "node_disk", "cpu", "9")      // different metric, excluded
+
+	mustAppend(t, e, a0, 10, 1)
+	mustAppend(t, e, a1, 20, 2)
+	mustAppend(t, e, b0, 15, 3)
+	mustAppend(t, e, nl, 12, 4)
+	mustAppend(t, e, x, 10, 9)
+	require.NoError(t, e.Flush(ctx)) // → one part
+
+	// Head samples after flush: a0 again (dedup across part+head) and b0 at a late timestamp.
+	mustAppend(t, e, a0, 30, 5)
+	mustAppend(t, e, b0, 95, 6)
+
+	matchers := []fetch.Matcher{eqMatcher("__name__", "node_cpu")}
+
+	// Broad window: cpu=0 has two series, cpu=1 one, the label-less series groups under "".
+	broad := fetch.Request{Start: 0, End: 100, Matchers: matchers}
+	got, err := e.CountBy(ctx, broad, []byte("cpu"))
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{"0": 2, "1": 1, "": 1}, got)
+	assert.Equal(t, groupCountsViaFetch(t, e, broad, "cpu"), got, "CountBy must match grouped Fetch")
+
+	// count(count by (cpu)) = distinct cpu values (the absent group counts as its own value here;
+	// the language layer decides whether to keep it).
+	assert.Len(t, got, 3)
+
+	// Edge window [16,30]: a1@20 (part edge decode) and a0@30 (head) → cpu=0 only; b0 (15, 95) and
+	// nl@12 fall outside.
+	edge := fetch.Request{Start: 16, End: 30, Matchers: matchers}
+	gotEdge, err := e.CountBy(ctx, edge, []byte("cpu"))
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{"0": 2}, gotEdge)
+	assert.Equal(t, groupCountsViaFetch(t, e, edge, "cpu"), gotEdge)
+
+	// Empty window: no groups at all.
+	empty, err := e.CountBy(ctx, fetch.Request{Start: 1000, End: 2000, Matchers: matchers}, []byte("cpu"))
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+
+	// Grouping by a label no matched series carries: one "" group holding every active series.
+	none, err := e.CountBy(ctx, broad, []byte("rack"))
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{"": 4}, none)
+}
+
+// TestCountByMatchesFetchAcrossWindows sweeps window permutations over multiple parts (covered,
+// edge, pruned) and asserts CountBy == grouped Fetch for each — including series present in two
+// parts (dedup) and series with no in-window data (omitted from their group).
+func TestCountByMatchesFetchAcrossWindows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := engine.New(engine.Config{Backend: backend.Memory(), Prefix: "t/countby-windows"})
+
+	a := mkSeries("__name__", "node_cpu", "cpu", "0")
+	b := mkSeries("__name__", "node_cpu", "cpu", "1")
+	c := mkSeries("__name__", "node_cpu", "cpu", "1", "mode", "user")
+	d := mkSeries("__name__", "node_cpu", "mode", "steal")
+
+	// part1 [100,110]: a, b. part2 [200,210]: a (again), c. part3 [300,310]: b (again), d.
+	mustAppend(t, e, a, 100, 1)
+	mustAppend(t, e, b, 110, 2)
+	require.NoError(t, e.Flush(ctx))
+
+	mustAppend(t, e, a, 200, 3)
+	mustAppend(t, e, c, 210, 4)
+	require.NoError(t, e.Flush(ctx))
+
+	mustAppend(t, e, b, 300, 5)
+	mustAppend(t, e, d, 310, 6)
+	require.NoError(t, e.Flush(ctx))
+
+	require.Equal(t, 3, e.PartCount())
+
+	matchers := []fetch.Matcher{eqMatcher("__name__", "node_cpu")}
+
+	windows := [][2]int64{
+		{0, 1000},  // all parts fully covered
+		{105, 250}, // part1 edge, part2 covered, part3 pruned
+		{120, 190}, // inter-part gap: nothing
+		{205, 305}, // part2 edge, part3 edge
+		{300, 310}, // one covered part
+		{100, 100}, // single-instant window
+	}
+
+	for _, w := range windows {
+		r := fetch.Request{Start: w[0], End: w[1], Matchers: matchers}
+
+		got, err := e.CountBy(ctx, r, []byte("cpu"))
+		require.NoError(t, err)
+
+		want := groupCountsViaFetch(t, e, r, "cpu")
+		if len(want) == 0 {
+			assert.Empty(t, got, "window [%d,%d]", w[0], w[1])
+
+			continue
+		}
+
+		assert.Equal(t, want, got, "window [%d,%d]", w[0], w[1])
+	}
+}

@@ -233,6 +233,37 @@ type Counter interface {
 	Count(ctx context.Context, r Request) (int, error)
 }
 
+// GroupCounter is an optional [Fetcher] capability, the grouped variant of [Counter]: CountBy
+// returns, for each distinct canonical-text value of the label among the series matching
+// r.Matchers, how many of them have at least one sample in [r.Start, r.End] — without
+// materializing samples or projecting labels into results. It backs the PromQL
+// `count by (label)(<selector>)` pushdown (and, via the map's length,
+// `count(count by (label)(...))` = distinct label values). Matched series without the label group
+// under the "" key. A Fetcher that does not implement it opts out of the pushdown (the caller
+// falls back to Fetch).
+type GroupCounter interface {
+	CountBy(ctx context.Context, r Request, label []byte) (map[string]int, error)
+}
+
+// GroupCounterOf is [CounterOf] for the grouped-count capability: it walks the wrapper chain (via
+// [Unwraper]) starting at f and returns the first [GroupCounter], or nil if none.
+func GroupCounterOf(f Fetcher) GroupCounter {
+	for f != nil {
+		if c, ok := f.(GroupCounter); ok {
+			return c
+		}
+
+		u, ok := f.(Unwraper)
+		if !ok {
+			return nil
+		}
+
+		f = u.Unwrap()
+	}
+
+	return nil
+}
+
 // Unwraper is implemented by Fetcher decorators that wrap a single inner Fetcher (logging,
 // caching, scoping, splitting). Multi-child fan-outs (merge, remote) are NOT Unwrapers — their
 // count semantics are not a simple delegation, so [CounterOf] opts them out of the pushdown.

@@ -658,6 +658,21 @@ engine** (`recordengine.Fetch`: per-stream runs are ts-sorted, then a pooled glo
 to the boundary via `recordCols.keep`); the **metric engine ignores it** (PromQL needs every sample).
 `Limit == 0` is unlimited (unchanged behavior).
 
+**Count pushdown (`fetch.Counter` / `fetch.GroupCounter`).** Two optional `Fetcher` capabilities
+answer count-shaped PromQL without materializing samples or labels. `Counter.Count` (engine:
+`count.go`) backs `count(<selector>)`: matched ids resolve from postings, and per-series in-window
+existence comes from the part index — a part fully covered by the window contributes its matched
+ids by a sorted intersection with **zero column decode**; only window-edge parts decode, and only
+their timestamp column. `GroupCounter.CountBy` is the grouped variant backing
+`count by (label)(<selector>)` (and, via the result's length, `count(count by (label)(...))` =
+distinct label values): the same existence flags, grouped by the label's canonical text read from
+the snapshotted series identities over the same flattened key space the postings index sees (point
+attrs → `otel.scope.name`/`version` → scope attrs → resource attrs; absent ⇒ the `""` group).
+`CounterOf`/`GroupCounterOf` walk the `Unwraper` decorator chain to find the capability;
+multi-child fan-outs opt out (their counts are not a simple delegation). The PromQL queryable
+exposes both as `CountSeries`/`CountSeriesBy` hooks (interface-asserted by the embedder's engine),
+each falling back to a Fetch-and-recheck path when the selector's matchers are not all index-safe.
+
 **Opt-in buffer reuse (`Request.Recycle` + `Batch.Release`).** A batch's `Timestamps`/`Values`
 slices (and, for record signals, its `Columns`) are the engine's buffers. When a caller sets
 `Request.Recycle` and calls `Batch.Release()` once done with each batch, the engine hands out (and
