@@ -565,7 +565,11 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   cliff — N heavy queries serialize through the cap instead of each materializing whole columns at
   once. The reservation is taken once per query off the engine lock (not incrementally per part, so
   two queries cannot each hold a partial reservation and deadlock), and a query larger than the whole
-  budget is admitted alone rather than waiting forever. 0 ⇒ unlimited.
+  budget is admitted alone rather than waiting forever. 0 ⇒ unlimited. The budget object is
+  shareable (`engine.NewDecodeBudget`, `Config.DecodeBudget`): the storage facade builds **one**
+  budget from `WithDecodeMemory` / `Options.DecodeMemoryBytes` and hands it to every tenant engine,
+  so the cap bounds the process-wide in-flight decoded bytes rather than multiplying per tenant —
+  fit it to the process memory budget (e.g. `GOMEMLIMIT` minus caches and baseline).
   A **recent tier** (`Config.RecentWindow`, `recent.go`) opt-in mirrors the most recent flush window
   in RAM across flushes (the head is drained on every flush, but the tier persists), so a query whose
   `[Start, End]` falls inside the tier's window is served from the tier ∪ the mid-flush buffers ∪ the

@@ -64,6 +64,11 @@ type Config struct {
 	// letting concurrency multiply resident decoded bytes. 0 ⇒ unlimited (no admission control). A
 	// query larger than the whole budget runs alone (it cannot be bounded below its own footprint).
 	DecodeMemoryBytes int64
+	// DecodeBudget, when non-nil, is a pre-built decode-memory budget this engine reserves from
+	// instead of building its own from DecodeMemoryBytes. Share one [DecodeBudget] across engines
+	// (one engine per tenant) so the cap bounds the process-wide in-flight decoded bytes rather
+	// than multiplying per tenant. Takes precedence over DecodeMemoryBytes.
+	DecodeBudget *DecodeBudget
 	// MetricBlockRows sets the row block size for metric part columns (ts/value/sf): the columns are
 	// split into independently decodable blocks of this many rows, so a query can decode only the
 	// blocks its matched series' row ranges touch (sub-part seek) instead of the whole column, and
@@ -126,9 +131,9 @@ type Engine struct {
 	// recycle is the shared per-engine [fetch.Batch.Release] hook (allocated once), so setting it on
 	// a batch costs nothing per batch. It returns the batch's ts/value buffers to the pools above.
 	recycle func(*fetch.Batch)
-	// budget caps the in-flight decoded bytes across concurrent queries (Config.DecodeMemoryBytes);
-	// nil ⇒ unlimited.
-	budget *decodeBudget
+	// budget caps the in-flight decoded bytes across concurrent queries (Config.DecodeBudget or
+	// Config.DecodeMemoryBytes); possibly shared with other engines; nil ⇒ unlimited.
+	budget *DecodeBudget
 	// planMaps recycles the per-fetch plan maps (series identity + head/flush/recent snapshots) so a
 	// fetch reuses cleared maps instead of allocating and growing fresh ones each call.
 	planMaps planMapPools
@@ -162,8 +167,11 @@ func New(cfg Config) *Engine {
 		e.blockCache = newBlockCache(cfg.DecodeCacheBytes)
 	}
 
-	if cfg.DecodeMemoryBytes > 0 {
-		e.budget = newDecodeBudget(cfg.DecodeMemoryBytes)
+	switch {
+	case cfg.DecodeBudget != nil:
+		e.budget = cfg.DecodeBudget
+	case cfg.DecodeMemoryBytes > 0:
+		e.budget = NewDecodeBudget(cfg.DecodeMemoryBytes)
 	}
 
 	if cfg.RecentWindow > 0 {

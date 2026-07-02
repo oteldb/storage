@@ -73,6 +73,16 @@ type Options struct {
 	// RAM-fast). With it, a fetch also prefetches its parts' decodes concurrently. Zero disables it.
 	DecodeCacheBytes int64
 
+	// DecodeMemoryBytes caps the total in-flight decoded column bytes across concurrent queries,
+	// process-wide (one budget shared by every tenant engine): a query reserves its estimated
+	// decode footprint before reading any part, blocking while the budget is exhausted, so query
+	// concurrency cannot drive the resident heap past the cap — N heavy queries serialize through
+	// it instead of each materializing whole columns at once. It trades tail latency under
+	// saturation for a memory ceiling; size it to the process memory budget minus the caches and
+	// baseline. Zero disables it (no admission control). A query whose own footprint exceeds the
+	// whole budget is admitted alone (it cannot be bounded below its own footprint).
+	DecodeMemoryBytes int64
+
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each metric
 	// part, so [Storage.AggregateMetrics] answers a range-covering aggregate without decoding the
 	// value column — returning one number per series instead of every sample. It costs a little
@@ -239,6 +249,13 @@ func WithReadCache(maxBytes int64) Option { return func(o *Options) { o.ReadCach
 // concurrent prefetch of a fetch's parts. See [Options.DecodeCacheBytes].
 func WithDecodeCache(maxBytes int64) Option {
 	return func(o *Options) { o.DecodeCacheBytes = maxBytes }
+}
+
+// WithDecodeMemory caps the process-wide in-flight decoded column bytes across concurrent queries
+// (decode admission control), shared by every tenant engine. Zero disables it. See
+// [Options.DecodeMemoryBytes].
+func WithDecodeMemory(maxBytes int64) Option {
+	return func(o *Options) { o.DecodeMemoryBytes = maxBytes }
 }
 
 // WithAggregateStats writes the per-series aggregate sidecar that lets [Storage.AggregateMetrics]
