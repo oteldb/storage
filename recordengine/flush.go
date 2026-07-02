@@ -102,8 +102,14 @@ func writePart(ctx context.Context, b backend.Backend, schema *Schema, prefix st
 	}
 
 	for k := range schema.byteCols {
+		// Blob+offsets pass-through: the head buffer's byte-column layout feeds the encoder
+		// directly, so a flush materializes no per-row [][]byte view.
 		col := schema.byteColumn(k)
-		if err := w.AddColumn(block.Column{Name: col.Name, Kind: block.KindBytes, Codec: col.Codec, Bytes: f.cols.byteViews(k)}); err != nil {
+		bc := &f.cols.bytes[k]
+		if err := w.AddColumn(block.Column{
+			Name: col.Name, Kind: block.KindBytes, Codec: col.Codec,
+			BytesBlob: bc.data, BytesOffsets: bc.offsets,
+		}); err != nil {
 			return err
 		}
 	}

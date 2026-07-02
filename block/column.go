@@ -28,6 +28,13 @@ type Column struct {
 	Int128   []chunk.U128
 	Codec    chunk.Codec
 	Compress compress.Algorithm
+	// BytesBlob/BytesOffsets are the blob+offsets alternative to Bytes for a KindBytes column:
+	// cell i is BytesBlob[BytesOffsets[i]:BytesOffsets[i+1]], with len(BytesOffsets) == rows+1 and
+	// BytesOffsets[0] == 0 — the head-buffer byte-column layout, accepted directly so a flush
+	// encodes straight from the blob without materializing a [][]byte view per row. Used only when
+	// Bytes is nil; the encoded object is byte-identical to the equivalent Bytes input.
+	BytesBlob    []byte
+	BytesOffsets []int32
 	// AutoCodec, when set on a float64 column with no explicit Codec, picks the smaller of the
 	// lossless float codecs (Gorilla XOR vs scaled-decimal+delta) by trial-encoding — so an
 	// integer-valued or low-precision column (e.g. a counter) takes the far denser decimal path
@@ -56,6 +63,10 @@ func (c Column) rows() int {
 	case KindFloat64:
 		return len(c.Float64)
 	case KindBytes:
+		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+			return len(c.BytesOffsets) - 1
+		}
+
 		return len(c.Bytes)
 	case KindInt128:
 		return len(c.Int128)
@@ -101,7 +112,11 @@ func buildColumn(c Column, comp *compress.Compressor, blockRows int) (ColumnDesc
 	case KindFloat64:
 		fillFloat64Stats(&desc, c.Float64)
 	case KindBytes:
-		fillBytesConst(&desc, c.Bytes)
+		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+			fillBytesBlobConst(&desc, c.BytesBlob, c.BytesOffsets)
+		} else {
+			fillBytesConst(&desc, c.Bytes)
+		}
 	case KindInt128:
 		// No stats and never constant-collapsed: the RLE codec already shrinks a
 		// single-id column to a handful of bytes, and id columns carry no min/max.
@@ -232,8 +247,16 @@ func encodeStream(c Column, codec chunk.Codec) ([]byte, error) {
 	case c.Kind == KindFloat64 && codec == chunk.CodecDecimal:
 		return chunk.EncodeFloatsDecimal(nil, c.Float64, decimalPrecisionLossless), nil
 	case c.Kind == KindBytes && codec == chunk.CodecDict:
+		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+			return chunk.EncodeBytesBlob(nil, c.BytesBlob, c.BytesOffsets), nil
+		}
+
 		return chunk.EncodeBytes(nil, c.Bytes), nil
 	case c.Kind == KindBytes && codec == chunk.CodecBytesRaw:
+		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+			return chunk.EncodeBytesRawBlob(nil, c.BytesBlob, c.BytesOffsets), nil
+		}
+
 		return chunk.EncodeBytesRaw(nil, c.Bytes), nil
 	case c.Kind == KindInt128 && codec == chunk.CodecID128:
 		return chunk.EncodeU128(nil, c.Int128), nil
@@ -306,6 +329,24 @@ func fillBytesConst(d *ColumnDesc, vals [][]byte) {
 
 	d.Const = true
 	d.ConstBytes = append([]byte(nil), vals[0]...)
+}
+
+// fillBytesBlobConst is [fillBytesConst] over the blob+offsets column form.
+func fillBytesBlobConst(d *ColumnDesc, blob []byte, offsets []int32) {
+	rows := len(offsets) - 1
+	if rows < 1 {
+		return
+	}
+
+	first := blob[offsets[0]:offsets[1]]
+	for i := 1; i < rows; i++ {
+		if !bytes.Equal(blob[offsets[i]:offsets[i+1]], first) {
+			return
+		}
+	}
+
+	d.Const = true
+	d.ConstBytes = append([]byte(nil), first...)
 }
 
 // ColumnReader gives lazy, decode-on-demand access to one column of a part. Constant

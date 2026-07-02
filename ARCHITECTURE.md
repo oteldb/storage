@@ -950,7 +950,10 @@ optional side store differ.
   and a per-record scan walks one allocation with locality. Cell views alias the blob under the
   read-only-until-next-append rule (an append that grows the blob may move it, so a value retained
   past an append is copied); the `fetch.NamedColumn` boundary materializes `[][]byte` views into the
-  blob, pooled across recycled fetches. `Fetch` is heavily tuned: **lazy column decode**
+  blob, pooled across recycled fetches. Flush is a **pass-through**: `block.Column` accepts the
+  blob+offsets form directly (`BytesBlob`/`BytesOffsets`, encoded byte-identically to the `Bytes`
+  form via `chunk.EncodeBytesBlob`/`EncodeBytesRawBlob`), so writing a part walks the head buffer's
+  blobs without materializing a view per row. `Fetch` is heavily tuned: **lazy column decode**
   (materialize only the columns a request's conditions + projection reference — a body search
   projecting body touches just `ts`+`body`), decode each surviving part **once** distributing rows
   to per-stream accumulators, pre-size accumulators from row-range counts, bulk-append in-window

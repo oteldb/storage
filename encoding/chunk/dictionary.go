@@ -67,6 +67,38 @@ func (s *dictDecodeScratch) putBack() {
 	dictDecodeScratchPool.Put(s)
 }
 
+// cellSeq abstracts a byte column's row access for the encode cores, so the [][]byte form and the
+// blob+offsets (arrow-style) form share one implementation. The cores are generic over it, so each
+// form monomorphizes to direct slice indexing — no per-cell interface call or closure.
+type cellSeq interface {
+	rows() int
+	at(i int) []byte
+}
+
+// sliceCells is the [][]byte form of [cellSeq].
+type sliceCells [][]byte
+
+func (s sliceCells) rows() int       { return len(s) }
+func (s sliceCells) at(i int) []byte { return s[i] }
+
+// blobCells is the blob+offsets form of [cellSeq]: cell i is blob[offsets[i]:offsets[i+1]], with
+// len(offsets) == rows+1 and offsets[0] == 0 — the head-buffer byte-column layout, accepted
+// directly so a flush encodes straight from the blob without materializing a view per row.
+type blobCells struct {
+	blob    []byte
+	offsets []int32
+}
+
+func (b blobCells) rows() int {
+	if len(b.offsets) == 0 {
+		return 0
+	}
+
+	return len(b.offsets) - 1
+}
+
+func (b blobCells) at(i int) []byte { return b.blob[b.offsets[i]:b.offsets[i+1]] }
+
 // EncodeBytes appends a dictionary-encoded []byte column to dst and returns the
 // extended slice (DESIGN.md §6, §14 M0).
 //
@@ -86,7 +118,18 @@ func (s *dictDecodeScratch) putBack() {
 // hash table and scratch slices cache-warm across calls instead of paying the
 // [sync.Pool] Get/Put on each call.
 func EncodeBytes(dst []byte, vals [][]byte) []byte {
-	if len(vals) == 0 {
+	return encodeBytesCells(dst, sliceCells(vals))
+}
+
+// EncodeBytesBlob is [EncodeBytes] over the blob+offsets column form (cell i is
+// blob[offsets[i]:offsets[i+1]]; len(offsets) == rows+1, offsets[0] == 0). The output is
+// byte-identical to EncodeBytes over the equivalent [][]byte, without materializing a view per row.
+func EncodeBytesBlob(dst, blob []byte, offsets []int32) []byte {
+	return encodeBytesCells(dst, blobCells{blob: blob, offsets: offsets})
+}
+
+func encodeBytesCells[C cellSeq](dst []byte, vals C) []byte {
+	if vals.rows() == 0 {
 		return appendEmpty(dst)
 	}
 
@@ -96,7 +139,7 @@ func EncodeBytes(dst []byte, vals [][]byte) []byte {
 	m := pool.NewByteIntMap()
 	defer m.PutBack()
 
-	scratch := newDictEncodeScratch(len(vals))
+	scratch := newDictEncodeScratch(vals.rows())
 	defer scratch.putBack()
 
 	dst, scratch.entries, scratch.ids = appendDictEncoded(dst, vals, m, scratch.entries, scratch.ids)
@@ -124,21 +167,32 @@ func appendEmpty(dst []byte) []byte {
 //	flagFixed payload: [uvarint width] [rows × width bytes]
 //	flagFlat  payload: per row [uvarint len][bytes]
 func EncodeBytesRaw(dst []byte, vals [][]byte) []byte {
-	if len(vals) == 0 {
+	return encodeBytesRawCells(dst, sliceCells(vals))
+}
+
+// EncodeBytesRawBlob is [EncodeBytesRaw] over the blob+offsets column form (see
+// [EncodeBytesBlob]); the output is byte-identical to EncodeBytesRaw over the equivalent [][]byte.
+func EncodeBytesRawBlob(dst, blob []byte, offsets []int32) []byte {
+	return encodeBytesRawCells(dst, blobCells{blob: blob, offsets: offsets})
+}
+
+func encodeBytesRawCells[C cellSeq](dst []byte, vals C) []byte {
+	n := vals.rows()
+	if n == 0 {
 		return appendEmpty(dst)
 	}
 
 	width, uniform := uniformWidth(vals)
 
 	if uniform {
-		dst = slices.Grow(dst, uvarintLen(uint64(len(vals)))+1+uvarintLen(uint64(width))+len(vals)*width)
+		dst = slices.Grow(dst, uvarintLen(uint64(n))+1+uvarintLen(uint64(width))+n*width)
 		w := bitstream.NewWriter(dst)
-		w.WriteUvarint(uint64(len(vals)))
+		w.WriteUvarint(uint64(n))
 		_ = w.WriteByte(flagFixed)
 		w.WriteUvarint(uint64(width))
 
-		for _, v := range vals {
-			w.WriteBytes(v)
+		for i := range n {
+			w.WriteBytes(vals.at(i))
 		}
 
 		w.PadToByte()
@@ -151,10 +205,10 @@ func EncodeBytesRaw(dst []byte, vals [][]byte) []byte {
 
 // uniformWidth reports the common length of vals and whether every value (including the first)
 // shares it. vals is non-empty.
-func uniformWidth(vals [][]byte) (width int, uniform bool) {
-	width = len(vals[0])
-	for _, v := range vals[1:] {
-		if len(v) != width {
+func uniformWidth[C cellSeq](vals C) (width int, uniform bool) {
+	width = len(vals.at(0))
+	for i := 1; i < vals.rows(); i++ {
+		if len(vals.at(i)) != width {
 			return 0, false
 		}
 	}
@@ -164,20 +218,22 @@ func uniformWidth(vals [][]byte) (width int, uniform bool) {
 
 // appendFlat writes the length-prefixed inline form (flagFlat): per row [uvarint len][bytes].
 // Shared by the dictionary codec's >65536-distinct fallback and [EncodeBytesRaw]'s mixed-width path.
-func appendFlat(dst []byte, vals [][]byte) []byte {
+func appendFlat[C cellSeq](dst []byte, vals C) []byte {
+	n := vals.rows()
+
 	payload := 0
-	for _, v := range vals {
-		payload += uvarintLen(uint64(len(v))) + len(v)
+	for i := range n {
+		payload += uvarintLen(uint64(len(vals.at(i)))) + len(vals.at(i))
 	}
 
-	dst = slices.Grow(dst, uvarintLen(uint64(len(vals)))+1+payload)
+	dst = slices.Grow(dst, uvarintLen(uint64(n))+1+payload)
 	w := bitstream.NewWriter(dst)
-	w.WriteUvarint(uint64(len(vals)))
+	w.WriteUvarint(uint64(n))
 	_ = w.WriteByte(flagFlat)
 
-	for _, v := range vals {
-		w.WriteUvarint(uint64(len(v)))
-		w.WriteBytes(v)
+	for i := range n {
+		w.WriteUvarint(uint64(len(vals.at(i))))
+		w.WriteBytes(vals.at(i))
 	}
 
 	w.PadToByte()
@@ -191,20 +247,23 @@ func appendFlat(dst []byte, vals [][]byte) []byte {
 // are returned so the caller can retain their backing arrays for the next batch.
 //
 // m is assumed empty (freshly reset); the caller owns its lifecycle.
-func appendDictEncoded(
-	dst []byte, vals [][]byte, m *pool.ByteIntMap, entries [][]byte, ids []uint16,
+func appendDictEncoded[C cellSeq](
+	dst []byte, vals C, m *pool.ByteIntMap, entries [][]byte, ids []uint16,
 ) (out []byte, entriesOut [][]byte, idsOut []uint16) {
-	if len(vals) == 0 {
+	n := vals.rows()
+	if n == 0 {
 		return appendEmpty(dst), entries[:0], ids[:0]
 	}
 
 	entries = entries[:0]
-	ids = slices.Grow(ids[:0], len(vals))[:len(vals)]
+	ids = slices.Grow(ids[:0], n)[:n]
 
 	dictEntryBytes := 0
 	flat := false
 
-	for i, v := range vals {
+	for i := range n {
+		v := vals.at(i)
+
 		id, existed := m.PutOrGet(v, len(entries))
 		if !existed {
 			if len(entries) == 65536 {
@@ -228,17 +287,17 @@ func appendDictEncoded(
 	}
 
 	// Dictionary mode. Flag is a full byte so everything after stays byte-aligned.
-	rowIDBytes := len(vals)
+	rowIDBytes := n
 	if size > maxDictSize {
 		rowIDBytes *= 2
 	}
 
 	dst = slices.Grow(
 		dst,
-		uvarintLen(uint64(len(vals)))+1+uvarintLen(uint64(size))+dictEntryBytes+rowIDBytes,
+		uvarintLen(uint64(n))+1+uvarintLen(uint64(size))+dictEntryBytes+rowIDBytes,
 	)
 	w := bitstream.NewWriter(dst)
-	w.WriteUvarint(uint64(len(vals)))
+	w.WriteUvarint(uint64(n))
 	_ = w.WriteByte(flagDict)
 	w.WriteUvarint(uint64(size))
 	// Write dictionary entries: length-prefixed (uvarint) + bytes (bulk append).
@@ -290,7 +349,7 @@ func NewDictEncoder() *DictEncoder {
 func (e *DictEncoder) Encode(dst []byte, vals [][]byte) []byte {
 	e.m.Reset()
 
-	dst, e.entries, e.ids = appendDictEncoded(dst, vals, e.m, e.entries, e.ids)
+	dst, e.entries, e.ids = appendDictEncoded(dst, sliceCells(vals), e.m, e.entries, e.ids)
 
 	return dst
 }
