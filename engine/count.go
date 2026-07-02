@@ -20,7 +20,7 @@ import (
 // and mid-flush windows are scanned in memory. A series counts if any source holds an
 // in-window sample. Series with no sample in the window are omitted.
 func (e *Engine) Count(ctx context.Context, r fetch.Request) (int, error) {
-	ids, plan := e.planCount(r)
+	ids, plan := e.planCount(r, false)
 	defer plan.releaseParts()
 
 	active, err := plan.activeFlags(ctx, ids, e)
@@ -53,7 +53,7 @@ func (e *Engine) Count(ctx context.Context, r fetch.Request) (int, error) {
 // without the label group under "" (indistinguishable from an explicit empty-text value, matching
 // PromQL's absent-label grouping). Groups whose every series is empty in the window are omitted.
 func (e *Engine) CountBy(ctx context.Context, r fetch.Request, label []byte) (map[string]int, error) {
-	ids, plan := e.planCount(r)
+	ids, plan := e.planCount(r, true)
 	defer plan.releaseParts()
 
 	active, err := plan.activeFlags(ctx, ids, e)
@@ -82,10 +82,12 @@ func (e *Engine) CountBy(ctx context.Context, r fetch.Request, label []byte) (ma
 	return groups, nil
 }
 
-// planCount resolves r's matched ids and builds the fetch plan for a count-shaped read (existence
-// only): the decode budget reserves timestamps only, and only window-edge parts ever decode. The
-// caller must releaseParts.
-func (e *Engine) planCount(r fetch.Request) ([]signal.SeriesID, *enginePlan) {
+// planCount resolves r's matched ids and builds the lightweight existence plan for a count-shaped
+// read: in-memory existence flags are computed under the lock (no per-series batch copies), the
+// identity slab is snapshotted only when the caller groups by it (withIdentity, for CountBy), the
+// decode budget reserves timestamps only, and only window-edge parts ever decode. The caller must
+// releaseParts.
+func (e *Engine) planCount(r fetch.Request, withIdentity bool) ([]signal.SeriesID, *enginePlan) {
 	e.mu.RLock()
 	for !e.head.indexSorted() {
 		e.mu.RUnlock()
@@ -96,7 +98,7 @@ func (e *Engine) planCount(r fetch.Request) ([]signal.SeriesID, *enginePlan) {
 	}
 
 	ids := e.head.resolve(r.Matchers)
-	plan := e.planFetch(ids, r)
+	plan := e.planExistence(ids, r, withIdentity)
 	e.mu.RUnlock()
 
 	// Count decodes timestamps only (existence), and only for window-edge parts; reserve that.
@@ -134,34 +136,16 @@ func seriesLabelValue(s signal.Series, name []byte) (signal.Value, bool) {
 }
 
 // activeFlags reports, per matched id, whether it has at least one sample in [start, end] across
-// every source the plan snapshotted: head/recent/flush windows (in memory) and the decoded parts.
-// It never materializes result buffers — a series is flagged as soon as any source yields an
-// in-window sample, so the remaining sources skip it.
+// every source: the in-memory windows (head/recent/flush — precomputed under the plan lock as
+// memActive, no batch materialization) and the plan's acquired parts. It never materializes result
+// buffers — a series is flagged as soon as any source yields an in-window sample, so the remaining
+// sources skip it.
 //
-// ids is the sorted, deduplicated output of head.resolve, so id→index lookups for the in-memory
-// batches are a binary search (no per-call map allocation).
+// ids is the sorted, deduplicated output of head.resolve, matching the plan's memActive order.
 func (p *enginePlan) activeFlags(ctx context.Context, ids []signal.SeriesID, e *Engine) ([]bool, error) {
-	active := make([]bool, len(ids))
-
-	mark := func(id signal.SeriesID) {
-		if i := seriesIndex(ids, id); i >= 0 {
-			active[i] = true
-		}
-	}
-
-	// In-memory windows first (cheap): head, recent tier, mid-flush buffers. Each batch present is
-	// a matched series (planFetch seeds these from ids); mark it active if any sample is in window.
-	for _, b := range p.headB {
-		markBatchInWindow(b, p.start, p.end, mark)
-	}
-
-	for _, b := range p.recentB {
-		markBatchInWindow(b, p.start, p.end, mark)
-	}
-
-	for _, b := range p.flushB {
-		markBatchInWindow(b, p.start, p.end, mark)
-	}
+	// The in-memory tiers were already folded in under the lock; the plan owns the slice, so the
+	// part phase marks into it directly.
+	active := p.memActive
 
 	// Parts: a part whose sample bounds fall entirely inside [start, end] guarantees that every
 	// matched series it holds has an in-window sample — buildPartIndex records only ids actually
@@ -242,37 +226,4 @@ func (p *enginePlan) markEdgePart(ctx context.Context, e *Engine, part *part, id
 	}
 
 	return nil
-}
-
-// seriesIndex returns the index of id in the sorted ids slice, or -1.
-func seriesIndex(ids []signal.SeriesID, id signal.SeriesID) int {
-	lo, hi := 0, len(ids)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		switch c := ids[mid].Compare(id); {
-		case c < 0:
-			lo = mid + 1
-		case c > 0:
-			hi = mid
-		default:
-			return mid
-		}
-	}
-
-	return -1
-}
-
-// markBatchInWindow calls mark with the batch's id if any of its samples falls in [start, end].
-func markBatchInWindow(b *fetch.Batch, start, end int64, mark func(signal.SeriesID)) {
-	if b == nil {
-		return
-	}
-
-	for _, ts := range b.Timestamps {
-		if ts >= start && ts <= end {
-			mark(b.ID)
-
-			return
-		}
-	}
 }
