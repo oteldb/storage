@@ -14,7 +14,7 @@ require (
 	github.com/klauspost/compress v1.19.0
 	github.com/mmcloughlin/avo v0.6.0
 	github.com/pierrec/lz4/v4 v4.1.27
-	github.com/prometheus/prometheus v0.312.0
+	github.com/prometheus/prometheus v0.313.1
 	github.com/stretchr/testify v1.11.1
 	github.com/zeebo/xxh3 v1.1.0
 	go.etcd.io/etcd/client/v3 v3.6.13
@@ -72,7 +72,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
-	github.com/prometheus/common v0.67.5 // indirect
+	github.com/prometheus/common v0.69.0 // indirect
 	github.com/prometheus/procfs v0.20.1 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
@@ -96,17 +96,17 @@ require (
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	golang.org/x/crypto v0.51.0 // indirect
+	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/mod v0.36.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/term v0.43.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.45.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260615183401-62b3387ff324 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260610212136-7ab31c22f7ad // indirect
 	google.golang.org/grpc v1.82.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
