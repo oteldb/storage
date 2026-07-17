@@ -14,7 +14,7 @@ require (
 	github.com/klauspost/compress v1.19.0
 	github.com/mmcloughlin/avo v0.6.0
 	github.com/pierrec/lz4/v4 v4.1.27
-	github.com/prometheus/prometheus v0.313.1
+	github.com/prometheus/prometheus v0.312.0
 	github.com/stretchr/testify v1.11.1
 	github.com/zeebo/xxh3 v1.1.0
 	go.etcd.io/etcd/client/v3 v3.6.13
