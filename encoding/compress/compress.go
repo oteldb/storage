@@ -178,6 +178,12 @@ func (c *Compressor) decompressPool(dst, src []byte) []byte {
 	}
 }
 
+// encoderWindowBytes caps the ZSTD match window. This package only ever calls EncodeAll on a single
+// block (a part column, bounded by the part size), so a huge window buys little — but klauspost sizes
+// the encoder's hash tables to the window, so an unbounded one costs tens of MiB of resident state per
+// encoder. 8 MiB covers a block's locality with negligible ratio loss.
+const encoderWindowBytes = 8 << 20
+
 func (c *Compressor) newEncoder() any {
 	// Only ZSTD uses the pool; other algorithms bypass compressPool entirely.
 	level := zstd.SpeedDefault
@@ -187,7 +193,14 @@ func (c *Compressor) newEncoder() any {
 	case c.level >= LevelBest:
 		level = zstd.SpeedBetterCompression
 	}
-	enc, err := zstd.NewWriter(io.Discard, zstd.WithEncoderLevel(level))
+	// WithEncoderConcurrency(1): this pool only does one-shot EncodeAll, so the default GOMAXPROCS
+	// worker set (each preallocating window+hash buffers) is pure resident waste — bounding it to one
+	// cuts encoder state ~6× with no effect on ratio. WithWindowSize bounds it further (see above).
+	enc, err := zstd.NewWriter(io.Discard,
+		zstd.WithEncoderLevel(level),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithWindowSize(encoderWindowBytes),
+	)
 	if err != nil {
 		panic(err)
 	}
@@ -195,8 +208,12 @@ func (c *Compressor) newEncoder() any {
 }
 
 func (c *Compressor) newDecoder() any {
-	// Only ZSTD uses the pool; other algorithms bypass decompressPool entirely.
-	dec, err := zstd.NewReader(io.NopCloser(nilReader{}))
+	// Only ZSTD uses the pool; other algorithms bypass decompressPool entirely. DecodeAll never uses
+	// the streaming worker pool, so bound concurrency to one and take the low-memory buffers.
+	dec, err := zstd.NewReader(io.NopCloser(nilReader{}),
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderLowmem(true),
+	)
 	if err != nil {
 		panic(err)
 	}
