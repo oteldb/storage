@@ -2,21 +2,20 @@ package recordengine
 
 import (
 	"context"
-	"slices"
 	"time"
 
 	"github.com/go-faster/sdk/zctx"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
-
-	"github.com/oteldb/storage/signal"
 )
 
-// Merge compacts every flushed part into a single new part, dropping records older than retainFrom
-// (retention; retainFrom ≤ 0 disables it). No-op when there is nothing to gain — fewer than two
-// parts and no retention cutoff. Records are append-only: a stream's records are concatenated
-// across parts (no value dedup) and re-sorted by timestamp.
+// Merge runs one size-tiered compaction cycle, dropping records older than retainFrom (retention;
+// retainFrom ≤ 0 disables it). It compacts only a bounded group of similarly-sized parts plus any part
+// retention must rewrite (see [selectMergeParts]) — not the whole part set — so a single merge's decoded
+// working set is O(part size), not O(dataset). No-op when no tier has accumulated enough parts and no
+// part needs retention. Records are append-only: a stream's records are concatenated across parts (no
+// value dedup) and re-sorted by timestamp.
 func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 	ctx = e.cfg.Obs.Base(ctx)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "recordengine.merge",
@@ -55,20 +54,25 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 	return nil
 }
 
-// merge compacts every flushed part into one new part, returning the number of source parts compacted
-// (0 ⇒ no-op). Phased like flush: the source-part reads, the compacted-part write/read-back, and the
-// sidecar union happen off the engine lock; only the small metadata publish runs under it. The old
-// parts are retired (not deleted inline) and reclaimed once their in-flight readers drain. Only the
-// background maintenance task calls merge, so the parts mutation has a single writer.
+// merge compacts a bounded, size-tiered group of the engine's parts and returns the number of source
+// parts compacted (0 ⇒ no-op). It does not re-read the whole part set: [selectMergeParts] picks only
+// the parts worth merging this cycle (a same-size tier group plus any part retention must rewrite), so
+// a single merge's working set is O(part size), not O(dataset). Phased like flush: the source-part
+// reads, the compacted-part write/read-back, and the sidecar union happen off the engine lock; only the
+// small metadata publish runs under it. The old parts are retired (not deleted inline) and reclaimed
+// once their in-flight readers drain. Only the background maintenance task calls merge, so the parts
+// mutation has a single writer.
 func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
 	// Plan (under lock): snapshot the source parts (immutable backing) and reserve the sequence.
 	e.mu.Lock()
 	src := e.parts
-	noop := len(src) == 0 || (len(src) == 1 && retainFrom <= 0)
 	seq := e.nextSeq
 	e.mu.Unlock()
 
-	if noop {
+	capRows := mergeCapRows(maxRowsPerPart(e.cfg.MaxPartBytes))
+
+	selected := selectMergeParts(src, retainFrom, capRows)
+	if len(selected) == 0 {
 		e.reclaimRetired(ctx) // nothing to compact, but still sweep pending deletions
 
 		return 0, nil
@@ -79,59 +83,37 @@ func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
 		start = retainFrom
 	}
 
-	// Build (lock-free): read+compact the source parts, write the merged part, read it back, union the
-	// side-store sidecars. A merge reads the source parts; they stay live (not retired) until publish,
-	// so they cannot be reclaimed underneath this read.
-	f, err := e.compactParts(ctx, src, start)
+	// Build (lock-free): compact the selected parts into bounded output part(s), reading them back and
+	// unioning the side-store sidecars. The selected parts stay live (not retired) until publish, so
+	// they cannot be reclaimed underneath this read.
+	newParts, err := e.compactParts(ctx, selected, start, seq, capRows)
 	if err != nil {
 		return 0, err
 	}
 
-	var newPart *part
-
-	if f.len() > 0 {
-		prefix := e.partPrefix(seq)
-		if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f); err != nil {
-			return 0, err
-		}
-
-		newPart, err = openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix)
-		if err != nil {
-			return 0, err
-		}
-
-		newPart.minTime, newPart.maxTime = colsTimeRange(f)
-
-		if err := e.mergeSidecars(ctx, src, prefix); err != nil {
-			return 0, err
-		}
-	}
-
-	// Publish (under lock): swap the source parts for the merged one copy-on-write (keeping any part a
-	// concurrent flush may have added), retire the sources, and persist the index. The retired parts'
-	// objects are deleted by reclaimRetired once their readers drain.
-	removed := make(map[string]struct{}, len(src))
-	for _, p := range src {
+	// Publish (under lock): swap the selected parts for the merged one(s) copy-on-write (keeping every
+	// unselected part, including any a concurrent flush may have added), retire the sources, and persist
+	// the index. The retired parts' objects are deleted by reclaimRetired once their readers drain.
+	removed := make(map[string]struct{}, len(selected))
+	for _, p := range selected {
 		removed[p.prefix] = struct{}{}
 	}
 
 	e.mu.Lock()
-	e.parts = replaceParts(e.parts, removed, newPart)
-	if newPart != nil {
-		e.nextSeq = seq + 1
-	}
+	e.parts = replaceParts(e.parts, removed, newParts...)
+	e.nextSeq = seq + len(newParts)
 
-	e.retireLocked(src)
+	e.retireLocked(selected)
 	err = e.updateIndexLocked(ctx)
 	e.mu.Unlock()
 
 	if err != nil {
-		return len(src), err
+		return len(selected), err
 	}
 
 	e.reclaimRetired(ctx)
 
-	return len(src), nil
+	return len(selected), nil
 }
 
 // mergeSidecars unions the side-store sidecars of the compacted parts and writes the merged tables
@@ -160,33 +142,68 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 	return writeSidecars(ctx, e.cfg.Backend, newPrefix, merged)
 }
 
-// compactParts concatenates each source part's records per stream (within [start, maxInt64], applying
-// retention), returning the combined full columns sorted by (stream, ts). Empty when none survive. It
-// reads the parts off the engine lock; src is the immutable snapshot the caller planned over.
-func (e *Engine) compactParts(ctx context.Context, src []*part, start int64) (*flushColumns, error) {
-	idSet := make(map[signal.SeriesID]struct{})
-	for _, p := range src {
-		for id := range p.ranges {
-			idSet[id] = struct{}{}
+// compactParts compacts the selected source parts into bounded output part(s): it decodes each part
+// once (reused across all its streams), concatenates every stream's in-window records across parts
+// (retention applied via start), re-sorts each stream by ts, and writes a new part whenever the
+// accumulated rows reach capRows — so both the merge's decoded working set and each output part stay
+// O(mergeHeight × MaxPartBytes), never O(dataset). When the engine has a side store (profiles) the
+// output is a single part (no split) so the unioned symbol sidecar has one home. Returns the new parts
+// (empty when retention dropped every record). Reads the parts off the engine lock; src is the
+// immutable snapshot the caller planned over.
+func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, seq, capRows int) ([]*part, error) {
+	// Decode each source part once. A merge reads every stream of every part, so decoding per-stream
+	// (the old appendWindow path) re-decoded the whole part once per stream; decoding up front is
+	// O(selected parts), which selection bounds to ≈ one sealed part's worth.
+	decoded := make([]*recordCols, len(src))
+	for i, p := range src {
+		cols, err := p.readCols(ctx, fullSel(p.schema), nil)
+		if err != nil {
+			return nil, err
 		}
+
+		decoded[i] = cols
 	}
 
-	ids := make([]signal.SeriesID, 0, len(idSet))
-	for id := range idSet {
-		ids = append(ids, id)
+	// Split output only when a part-size cap applies and there is no side store to anchor per-part.
+	split := capRows > 0 && e.cfg.SideStore == nil
+
+	newBuf := func() *flushColumns {
+		return &flushColumns{cols: newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))}
 	}
 
-	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
+	var (
+		newParts []*part
+		buf      = newBuf()
+	)
 
-	f := &flushColumns{cols: newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))}
+	emit := func() error {
+		if buf.len() == 0 {
+			return nil
+		}
 
-	for _, id := range ids {
+		p, err := e.writeMergedPart(ctx, src, buf, seq+len(newParts))
+		if err != nil {
+			return err
+		}
+
+		newParts = append(newParts, p)
+		buf = newBuf()
+
+		return nil
+	}
+
+	for _, id := range idSetOf(src) {
 		acc := newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
 
-		for _, p := range src {
-			if err := p.appendWindow(ctx, id, acc, start, maxInt64); err != nil {
-				return nil, err
+		// Oldest → newest part order; records are append-only (no dedup), so the stream is just
+		// concatenated across parts and re-sorted by ts below.
+		for i, p := range src {
+			rng, ok := p.ranges[id]
+			if !ok {
+				continue
 			}
+
+			appendWindowRows(acc, decoded[i], rng, start, maxInt64)
 		}
 
 		if acc.len() == 0 {
@@ -196,13 +213,50 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64) (*f
 		acc.sortByTs()
 
 		u := idToU128(id)
-		for i := range acc.ts {
-			f.stream = append(f.stream, u)
-			f.cols.appendRow(acc, i)
+		for j := range acc.ts {
+			buf.stream = append(buf.stream, u)
+			buf.cols.appendRow(acc, j)
+		}
+
+		// Flush a full part once the buffer reaches the cap. A stream whose own run overshoots the cap is
+		// split at the next stream boundary (parts are independent; the read seam concatenates a stream
+		// spanning parts), keeping the buffer at ≈ one part regardless of a heavy stream.
+		if split && buf.len() >= capRows {
+			if err := emit(); err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	return f, nil
+	if err := emit(); err != nil {
+		return nil, err
+	}
+
+	return newParts, nil
+}
+
+// writeMergedPart writes f as the seq-th output part, reads it back, stamps its time bounds, and — when
+// the engine has a side store — writes the union of the source parts' sidecars under it.
+func (e *Engine) writeMergedPart(ctx context.Context, src []*part, f *flushColumns, seq int) (*part, error) {
+	prefix := e.partPrefix(seq)
+	if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f); err != nil {
+		return nil, err
+	}
+
+	p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	p.minTime, p.maxTime = colsTimeRange(f)
+
+	if e.cfg.SideStore != nil {
+		if err := e.mergeSidecars(ctx, src, prefix); err != nil {
+			return nil, err
+		}
+	}
+
+	return p, nil
 }
 
 // Close flushes any buffered records to a part and closes the WAL. It does not stop a background

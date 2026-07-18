@@ -43,6 +43,12 @@ type Config struct {
 	// Signal is the signal label for this engine's metrics ("log"/"trace"/"profile"); the facade
 	// sets it per signal. Empty ⇒ "record".
 	Signal string
+	// MaxPartBytes bounds a flushed/merged part's approximate uncompressed size. It is what lets
+	// size-tiered compaction seal large parts and bound both part count and a single merge's decoded
+	// working set (see compact.go) — without it a continuously-ingesting engine's merge grows to
+	// re-materialize the whole dataset every cycle. 0 ⇒ unlimited (merge everything into one part;
+	// the legacy behavior, unbounded working set). The facade resolves it from the tenant policy.
+	MaxPartBytes int64
 }
 
 // Engine is one tenant's record store for a signal. Safe for concurrent use.

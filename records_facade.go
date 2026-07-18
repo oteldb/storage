@@ -51,6 +51,10 @@ func (s *Storage) recordEngineCached(
 		WAL:       w,
 		Obs:       s.obs,
 		Signal:    sig.String(),
+		// Bound part size so size-tiered compaction can seal large parts and keep the merge's working
+		// set O(part size) instead of O(dataset) (records_facade shares this with the metric engine's
+		// engineFor). Resolved from the tenant policy, falling back to defaultMaxPartBytes when unset.
+		MaxPartBytes: partSizeOrDefault(s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Limits.MaxPartSize),
 	})
 	m[tid] = e
 
