@@ -151,17 +151,18 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 // (empty when retention dropped every record). Reads the parts off the engine lock; src is the
 // immutable snapshot the caller planned over.
 func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, seq, capRows int) ([]*part, error) {
-	// Decode each source part once. A merge reads every stream of every part, so decoding per-stream
-	// (the old appendWindow path) re-decoded the whole part once per stream; decoding up front is
-	// O(selected parts), which selection bounds to ≈ one sealed part's worth.
-	decoded := make([]*recordCols, len(src))
+	// Decode each source part once, keeping byte columns dict-compressed (see decodedPart). A merge
+	// reads every stream of every part, so decoding per-stream (the old appendWindow path) re-decoded
+	// the whole part once per stream; decoding up front is O(selected parts), which selection bounds to
+	// ≈ one sealed part's worth, and the dict-compressed byte columns keep the per-part constant small.
+	decoded := make([]*decodedPart, len(src))
 	for i, p := range src {
-		cols, err := p.readCols(ctx, fullSel(p.schema), nil)
+		d, err := p.readForMerge(ctx)
 		if err != nil {
 			return nil, err
 		}
 
-		decoded[i] = cols
+		decoded[i] = d
 	}
 
 	// Split output only when a part-size cap applies and there is no side store to anchor per-part.
@@ -203,7 +204,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, seq
 				continue
 			}
 
-			appendWindowRows(acc, decoded[i], rng, start, maxInt64)
+			appendMergeWindow(acc, decoded[i], rng, start, maxInt64)
 		}
 
 		if acc.len() == 0 {
