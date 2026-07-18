@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/recordengine"
@@ -55,6 +56,11 @@ func (s *Storage) recordEngineCached(
 		// set O(part size) instead of O(dataset) (records_facade shares this with the metric engine's
 		// engineFor). Resolved from the tenant policy, falling back to defaultMaxPartBytes when unset.
 		MaxPartBytes: partSizeOrDefault(s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Limits.MaxPartSize),
+		// ZSTD-compress compacted parts: record byte columns are dict-coded but not entropy-coded, so
+		// the cold, long-lived data is otherwise stored far larger than necessary (≈10× on logs).
+		// Flushes stay codec-only, so ingest is unaffected.
+		MergeCompression:      compress.AlgorithmZSTD,
+		MergeCompressionLevel: compress.LevelBest,
 	})
 	m[tid] = e
 

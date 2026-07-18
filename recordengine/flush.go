@@ -10,6 +10,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -82,9 +83,19 @@ func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols) 
 }
 
 // writePart writes f as a part under prefix via [block.PartWriter]: the stream id column, the
-// timestamp sort key, then every schema column with its codec.
-func writePart(ctx context.Context, b backend.Backend, schema *Schema, prefix string, f *flushColumns) error {
-	w := block.NewPartWriter(block.WithSortKey(colTs))
+// timestamp sort key, then every schema column with its codec. comp block-compresses every column on
+// top of its chunk codec; [compress.AlgorithmNone] writes the columns codec-only (the flush path,
+// kept cheap), while the cold merge passes ZSTD to entropy-code the long-lived compacted data.
+func writePart(
+	ctx context.Context, b backend.Backend, schema *Schema, prefix string, f *flushColumns,
+	comp compress.Algorithm, level compress.Level,
+) error {
+	opts := []block.PartOption{block.WithSortKey(colTs)}
+	if comp != compress.AlgorithmNone {
+		opts = append(opts, block.WithCompression(comp), block.WithCompressionLevel(level))
+	}
+
+	w := block.NewPartWriter(opts...)
 
 	if err := w.AddColumn(block.Column{Name: colStream, Kind: block.KindInt128, Int128: f.stream}); err != nil {
 		return err

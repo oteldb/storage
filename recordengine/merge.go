@@ -240,7 +240,9 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, seq
 // the engine has a side store — writes the union of the source parts' sidecars under it.
 func (e *Engine) writeMergedPart(ctx context.Context, src []*part, f *flushColumns, seq int) (*part, error) {
 	prefix := e.partPrefix(seq)
-	if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f); err != nil {
+	// Compacted parts are the cold, long-lived data — block-compress them (typically ZSTD) so the
+	// dict/DoD-coded columns are also entropy-coded. Defaults to AlgorithmNone (legacy, uncompressed).
+	if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f, e.cfg.MergeCompression, e.cfg.MergeCompressionLevel); err != nil {
 		return nil, err
 	}
 
