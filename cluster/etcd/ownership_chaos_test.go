@@ -60,7 +60,7 @@ func readClaims(t *testing.T, client *clientv3.Client, shards []string) map[stri
 		require.NoError(t, err)
 
 		if len(resp.Kvs) == 1 {
-			out[s] = string(resp.Kvs[0].Value)
+			out[s] = string(resp.Kvs[0].GetValue())
 		}
 	}
 

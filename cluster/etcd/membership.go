@@ -142,7 +142,7 @@ func Join(ctx context.Context, client *clientv3.Client, root string, self Member
 	}
 
 	for _, kv := range resp.Kvs {
-		if mem, err := decodeMember(kv.Value); err == nil {
+		if mem, err := decodeMember(kv.GetValue()); err == nil {
 			m.members[mem.ID] = mem
 		}
 	}
@@ -156,8 +156,8 @@ func Join(ctx context.Context, client *clientv3.Client, root string, self Member
 	m.cancel = cancel
 	m.wg.Add(2)
 
-	go m.keepAlive(bg)                     //nolint:contextcheck // lifetime-scoped, see above
-	go m.watch(bg, resp.Header.Revision+1) //nolint:contextcheck // lifetime-scoped, see above
+	go m.keepAlive(bg)                          //nolint:contextcheck // lifetime-scoped, see above
+	go m.watch(bg, resp.Header.GetRevision()+1) //nolint:contextcheck // lifetime-scoped, see above
 
 	return m, nil
 }
@@ -249,14 +249,14 @@ func (m *Membership) watch(ctx context.Context, rev int64) {
 		for _, ev := range resp.Events {
 			switch ev.Type {
 			case clientv3.EventTypePut:
-				if mem, err := decodeMember(ev.Kv.Value); err == nil {
+				if mem, err := decodeMember(ev.Kv.GetValue()); err == nil {
 					m.set(mem)
 					changed = true
 					m.logger().Info("member joined",
 						zap.String("id", mem.ID), zap.String("zone", mem.Zone), zap.String("addr", mem.Addr))
 				}
 			case clientv3.EventTypeDelete:
-				id := strings.TrimPrefix(string(ev.Kv.Key), m.prefix)
+				id := strings.TrimPrefix(string(ev.Kv.GetKey()), m.prefix)
 				m.remove(id)
 				changed = true
 				m.logger().Info("member left", zap.String("id", id))
