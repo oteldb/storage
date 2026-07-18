@@ -840,10 +840,11 @@ func benchGoldenLogWriteFlush(b *testing.B) {
 	}
 }
 
-// benchGoldenLogMerge times only the merge over a freshly-built goldenLogPartCount-part store (the
-// setup is untimed). It is the regression gate for size-tiered compaction: the pre-fix merge compacted
-// every part into one (re-materializing the whole set), so this reports both the merge wall time
-// (MB/s over the logical bytes compacted) and its allocations.
+// benchGoldenLogMerge times only the merge over a freshly-built goldenLogPartCount-part store (setup
+// is untimed, so ns/op and the reported MB/s are merge-only). It is the regression gate for size-tiered
+// compaction: the pre-fix merge compacted every part into one, re-materializing the whole set. Note:
+// b.ReportAllocs's B/op and allocs/op include the untimed setup (identical on both sides of the
+// base-vs-head comparison), so read them as deltas, not absolutes.
 func benchGoldenLogMerge(b *testing.B) {
 	ctx := context.Background()
 

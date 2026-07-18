@@ -37,6 +37,35 @@ func recordColsByteBytes(c *recordCols) int {
 	return n
 }
 
+// TestNewMergeByteColForms covers both decode forms of a merge byte column: a real dictionary
+// (IDWidth > 0) is kept compressed, while the flat fallback (IDWidth 0 — a column the writer found no
+// dedup for) is expanded into a packed byteCol. Both must return the same cells through at().
+func TestNewMergeByteColForms(t *testing.T) {
+	t.Parallel()
+
+	// Dict form: two unique entries referenced by 1-byte ids — kept as-is.
+	dict := newMergeByteCol(&chunk.DictColumn{
+		Entries: [][]byte{[]byte("a"), []byte("bb")},
+		IDs:     []byte{0, 1, 0, 1},
+		IDWidth: 1,
+	})
+	require.NotNil(t, dict.dict, "a real dictionary must stay compressed")
+	for i, want := range []string{"a", "bb", "a", "bb"} {
+		assert.Equal(t, want, string(dict.at(i)))
+	}
+
+	// Flat fallback: Entries holds one value per row (IDWidth 0) — must expand to a packed byteCol,
+	// which is smaller than one []byte header per row.
+	flat := newMergeByteCol(&chunk.DictColumn{
+		Entries: [][]byte{[]byte("x"), []byte("yy"), []byte("zzz")},
+		IDWidth: 0,
+	})
+	require.Nil(t, flat.dict, "the flat fallback must expand, not keep the dict")
+	for i, want := range []string{"x", "yy", "zzz"} {
+		assert.Equal(t, want, string(flat.at(i)))
+	}
+}
+
 // TestMergeDecodeDictCompact verifies the merge's dict-compressed decode ([part.readForMerge]) holds a
 // far smaller resident set than the fetch-path whole-blob decode ([part.readCols]) when byte values
 // repeat — the common log case (templated bodies, low-cardinality attributes). This is the constant the
