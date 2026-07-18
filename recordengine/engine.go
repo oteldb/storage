@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/profile"
@@ -49,6 +50,14 @@ type Config struct {
 	// re-materialize the whole dataset every cycle. 0 ⇒ unlimited (merge everything into one part;
 	// the legacy behavior, unbounded working set). The facade resolves it from the tenant policy.
 	MaxPartBytes int64
+	// MergeCompression block-compresses the columns of merged (compacted) parts on top of their chunk
+	// codecs — the cold, long-lived data. Flushed parts stay codec-only so ingest is cheap; the
+	// background merge is where recompression is amortized. Record byte columns are dict-coded but not
+	// entropy-coded, so ZSTD here is a large on-disk win (≈10× on log-shaped data). AlgorithmNone (the
+	// default) keeps the legacy uncompressed behavior.
+	MergeCompression compress.Algorithm
+	// MergeCompressionLevel is the level for MergeCompression (ZSTD only). 0 ⇒ the algorithm default.
+	MergeCompressionLevel compress.Level
 }
 
 // Engine is one tenant's record store for a signal. Safe for concurrent use.
@@ -850,7 +859,9 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	rows := len(f.stream)
 	prefix := e.partPrefix(seq)
 
-	if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f); err != nil {
+	// Flush writes columns codec-only (no block compression) to keep ingest cheap; the cold merge
+	// recompresses. See [Config.MergeCompression].
+	if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f, compress.AlgorithmNone, 0); err != nil {
 		return 0, err
 	}
 
