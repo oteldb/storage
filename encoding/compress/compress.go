@@ -2,12 +2,23 @@ package compress
 
 import (
 	"encoding/binary"
-	"io"
 	"sync"
 
-	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 )
+
+// zstdEncoder / zstdDecoder abstract the ZSTD backend so it can be swapped at build time: pure-Go
+// klauspost by default, or libzstd via gozstd under -tags gozstd (higher ratio at high levels, at the
+// cost of cgo — see zstd_klauspost.go / zstd_gozstd.go). encodeAll appends the compressed form of src
+// to dst; decodeAll appends the decompressed form. Both produce/consume standard zstd frames, so a
+// part written by one backend is readable by the other.
+type zstdEncoder interface {
+	encodeAll(dst, src []byte) []byte
+}
+
+type zstdDecoder interface {
+	decodeAll(dst, src []byte) ([]byte, error)
+}
 
 // Algorithm identifies a general-purpose compression algorithm.
 type Algorithm uint8
@@ -118,10 +129,9 @@ const (
 func (c *Compressor) compressPool(dst, src []byte) []byte {
 	switch c.alg {
 	case AlgorithmZSTD:
-		enc := c.encPool.Get().(*zstd.Encoder)
+		enc := c.encPool.Get().(zstdEncoder)
 		defer c.encPool.Put(enc)
-		out := enc.EncodeAll(src, append(dst, FlagCompressed))
-		return out
+		return enc.encodeAll(append(dst, FlagCompressed), src)
 	case AlgorithmNone:
 		// Identity: store raw (Compress already short-circuits this case).
 		return append(append(dst, FlagRaw), src...)
@@ -150,9 +160,9 @@ func (c *Compressor) compressPool(dst, src []byte) []byte {
 func (c *Compressor) decompressPool(dst, src []byte) []byte {
 	switch c.alg {
 	case AlgorithmZSTD:
-		dec := c.decPool.Get().(*zstd.Decoder)
+		dec := c.decPool.Get().(zstdDecoder)
 		defer c.decPool.Put(dec)
-		out, _ := dec.DecodeAll(src, dst)
+		out, _ := dec.decodeAll(dst, src)
 		return out
 	case AlgorithmLZ4:
 		// Body is [uvarint origLen][lz4 block]. Size the destination from origLen, bounding it
@@ -178,36 +188,11 @@ func (c *Compressor) decompressPool(dst, src []byte) []byte {
 	}
 }
 
-func (c *Compressor) newEncoder() any {
-	// Only ZSTD uses the pool; other algorithms bypass compressPool entirely.
-	level := zstd.SpeedDefault
-	switch {
-	case c.level == LevelFast:
-		level = zstd.SpeedFastest
-	case c.level >= LevelBest:
-		level = zstd.SpeedBetterCompression
-	}
-	enc, err := zstd.NewWriter(io.Discard, zstd.WithEncoderLevel(level))
-	if err != nil {
-		panic(err)
-	}
-	return enc
-}
-
-func (c *Compressor) newDecoder() any {
-	// Only ZSTD uses the pool; other algorithms bypass decompressPool entirely.
-	dec, err := zstd.NewReader(io.NopCloser(nilReader{}))
-	if err != nil {
-		panic(err)
-	}
-	return dec
-}
-
-// nilReader is a zero-length reader for constructing a Decoder (DecodeAll doesn't use
-// the reader, but NewReader requires a non-nil one).
-type nilReader struct{}
-
-func (nilReader) Read([]byte) (int, error) { return 0, io.EOF }
+// newEncoder / newDecoder build the pooled ZSTD backend for this compressor's level; the concrete
+// implementation is selected at build time (see zstd_klauspost.go / zstd_gozstd.go). Only ZSTD uses
+// the pools; other algorithms bypass compressPool/decompressPool entirely.
+func (c *Compressor) newEncoder() any { return newZstdEncoder(c.level) }
+func (c *Compressor) newDecoder() any { return newZstdDecoder() }
 
 // badFlagError is returned when the decompressor sees an unknown flag byte.
 type badFlagError struct{ flag byte }
