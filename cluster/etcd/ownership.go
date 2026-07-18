@@ -70,9 +70,9 @@ func (o *Ownership) Acquire(ctx context.Context, shard string) (bool, error) {
 	}
 
 	// The key already exists: the claim is ours only if we wrote it.
-	kvs := resp.Responses[0].GetResponseRange().Kvs
+	kvs := resp.Responses[0].GetResponseRange().GetKvs()
 
-	return len(kvs) == 1 && string(kvs[0].Value) == o.id, nil
+	return len(kvs) == 1 && string(kvs[0].GetValue()) == o.id, nil
 }
 
 // Release relinquishes shard, but only if this node still holds the claim (a guarded delete,
