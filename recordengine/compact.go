@@ -41,11 +41,14 @@ const (
 	tierFloorRows = 1 << 12
 
 	// recordRowBytes is the assumed average uncompressed size of one record, used to convert the
-	// byte-denominated MaxPartBytes into a row cap (records are variable-width, so — unlike the
-	// metric engine's exact 32 B/row — this is a rough model; MaxPartBytes remains the tuning knob).
-	// It is deliberately a modest estimate: too-large biases toward fewer, bigger parts (larger merge
-	// working set), too-small toward many tiny parts (slower queries).
-	recordRowBytes = 256
+	// byte-denominated MaxPartBytes into a row cap (records are variable-width, so — unlike the metric
+	// engine's exact 32 B/row — this is a rough model; MaxPartBytes remains the tuning knob). It is
+	// calibrated to a realistic structured-log row (body + attributes + resource): a real homelab logs
+	// table averaged ~950 B/row, and at 256 B the seal threshold (mergeHeight × MaxPartBytes / 256)
+	// worked out ~4× too many rows, so a bulk merge decoded multiple GB before sealing. 1 KiB keeps a
+	// default-64-MiB part near its byte budget for typical logs; a backfill of unusually large or small
+	// rows tunes MaxPartBytes (via tenant policy) accordingly. Byte-exact sizing is tracked separately.
+	recordRowBytes = 1024
 )
 
 // maxRowsPerPart converts the byte cap MaxPartBytes into a row cap (0 ⇒ unlimited). At least one row,
