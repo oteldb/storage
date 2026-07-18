@@ -114,28 +114,6 @@ func (p *part) holdsAny(ids []signal.SeriesID) bool {
 	return false
 }
 
-// appendWindow appends stream id's records whose timestamp is in [start, end] to acc, decoding the
-// full column set (used by merge, which rewrites every column). No-op if the part lacks the stream.
-func (p *part) appendWindow(ctx context.Context, id signal.SeriesID, acc *recordCols, start, end int64) error {
-	rng, ok := p.ranges[id]
-	if !ok {
-		return nil
-	}
-
-	cols, err := p.readCols(ctx, fullSel(p.schema), nil)
-	if err != nil {
-		return err
-	}
-
-	for i := rng.start; i < rng.end; i++ {
-		if cols.ts[i] >= start && cols.ts[i] <= end {
-			acc.appendRow(cols, i)
-		}
-	}
-
-	return nil
-}
-
 // readCols decodes the part's timestamp column plus the schema columns selected by sel (unselected
 // stay nil — lazy decode). Returned byte slices are freshly decoded (owned by the caller). getI64,
 // when non-nil, supplies reusable int-column scratch from a pool (the fetch path, whose decoded int

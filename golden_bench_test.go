@@ -27,6 +27,7 @@ import (
 	"github.com/oteldb/storage/query/fetch"
 	promadapter "github.com/oteldb/storage/query/promql"
 	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/signal/log"
 	"github.com/oteldb/storage/signal/metric"
 )
 
@@ -219,6 +220,8 @@ func BenchmarkGolden(b *testing.B) {
 	b.Run("query/promql_full_scan_count", benchGoldenPromQLFullScan)
 	b.Run("query/promql_cpu_usage_range", benchGoldenPromQLCPUUsage)
 	b.Run("density", benchGoldenDensity)
+	b.Run("logs/write_flush", benchGoldenLogWriteFlush)
+	b.Run("logs/merge", benchGoldenLogMerge)
 }
 
 // node_cpu_seconds_total benchmark fixture — a node_exporter-shaped counter exercising the realistic
@@ -712,4 +715,167 @@ func benchGoldenDensity(b *testing.B) {
 	}
 
 	b.ReportMetric(float64(partBytes)/float64(goldenTotal), "B/point")
+}
+
+// ---- Record-signal (logs) golden benchmarks ----
+//
+// The record engine (logs/traces/profiles) shares one path, so the log benchmarks stand in for all
+// three. logs/write_flush tracks the record write path (projection + encode, including dictionary
+// compression of the body); logs/merge tracks size-tiered compaction — the merge is the record
+// engine's O(dataset) hazard, so this is the regression gate for it.
+
+const (
+	goldenLogStreams   = 50 // distinct streams (service.name)
+	goldenLogPerStream = 40 // records per stream per part
+	goldenLogPartCount = 8  // flushed parts a merge compacts
+	goldenLogTemplates = 16 // distinct body templates ⇒ heavy repetition (the log shape dict encoding is for)
+
+	goldenLogRecords = goldenLogStreams * goldenLogPerStream // records per part
+)
+
+// goldenLogRound builds one part's worth of the canonical log workload: goldenLogStreams streams, each
+// with goldenLogPerStream records whose body is drawn from a small template set (heavy repetition — the
+// realistic log shape). round offsets the timestamps so each part occupies a distinct time span. It
+// adds the logical (uncompressed) searched bytes to logical. Fully deterministic (no RNG).
+func goldenLogRound(round int, logical *int64) log.Logs {
+	var ld log.Logs
+
+	for s := range goldenLogStreams {
+		rl := ld.AddResource()
+		rl.Resource = signal.Resource{Attributes: signal.NewAttributes(
+			signal.KeyValue{Key: []byte("service.name"), Value: signal.StringValue(append([]byte("svc-"), itoa(s)...))},
+		)}
+		sl := rl.AddScope()
+
+		for i := range goldenLogPerStream {
+			body := append([]byte("GET /route/"), itoa(i%goldenLogTemplates)...)
+			body = append(body, " status=200 latency=5ms done"...)
+			msg := append([]byte("processed region="), itoa(round)...)
+
+			r := sl.AddRecord()
+			r.Timestamp = int64(round*goldenLogPerStream+i) * goldenInterval
+			r.SeverityNumber = int32(9 + i%9)
+			r.Body = body
+			r.Attributes = signal.NewAttributes(
+				signal.KeyValue{Key: []byte("msg"), Value: signal.StringValue(msg)},
+			)
+
+			*logical += int64(len(body)+len(msg)) + 16 // body + attr + ts/sev
+		}
+	}
+
+	return ld
+}
+
+// goldenLogFlushed builds a store on a memory backend and ingests `parts` rounds, flushing each to its
+// own part (no merge) — the merge benchmark's fixture. Returns the store and the logical bytes ingested.
+func goldenLogFlushed(b *testing.B, parts int) (*Storage, int64) {
+	b.Helper()
+
+	ctx := context.Background()
+
+	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()))
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	var logical int64
+
+	for round := range parts {
+		if _, err := s.WriteLogs(ctx, goldenLogRound(round, &logical)); err != nil {
+			b.Fatal(err)
+		}
+
+		eng, ok := s.lookupLogEngine("default")
+		if !ok {
+			b.Fatal("no log engine")
+		}
+
+		if err := eng.Flush(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	return s, logical
+}
+
+func benchGoldenLogWriteFlush(b *testing.B) {
+	ctx := context.Background()
+
+	var oneRound int64
+	ld := goldenLogRound(0, &oneRound)
+	resetEvery := max((1<<20)/goldenLogRecords, 1)
+
+	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = s.Close(ctx) }()
+
+	b.SetBytes(oneRound)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := range b.N {
+		if _, err := s.WriteLogs(ctx, ld); err != nil {
+			b.Fatal(err)
+		}
+
+		eng, ok := s.lookupLogEngine("default")
+		if !ok {
+			b.Fatal("no log engine")
+		}
+
+		if err := eng.Flush(ctx); err != nil {
+			b.Fatal(err)
+		}
+
+		if (i+1)%resetEvery == 0 {
+			b.StopTimer()
+			if err := s.Reset(ctx); err != nil {
+				b.Fatal(err)
+			}
+			b.StartTimer()
+		}
+	}
+}
+
+// benchGoldenLogMerge times only the merge over a freshly-built goldenLogPartCount-part store (setup
+// is untimed, so ns/op and the reported MB/s are merge-only). It is the regression gate for size-tiered
+// compaction: the pre-fix merge compacted every part into one, re-materializing the whole set. Note:
+// b.ReportAllocs's B/op and allocs/op include the untimed setup (identical on both sides of the
+// base-vs-head comparison), so read them as deltas, not absolutes.
+func benchGoldenLogMerge(b *testing.B) {
+	ctx := context.Background()
+
+	var logical int64
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		b.StopTimer()
+		s, lb := goldenLogFlushed(b, goldenLogPartCount)
+		logical = lb
+
+		eng, ok := s.lookupLogEngine("default")
+		if !ok {
+			b.Fatal("no log engine")
+		}
+		b.StartTimer()
+
+		if err := eng.Merge(ctx, 0); err != nil {
+			b.Fatal(err)
+		}
+
+		b.StopTimer()
+		if err := s.Close(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	// Merge-only throughput: b.Elapsed() is the accumulated timed (merge) window across b.N.
+	if secs := b.Elapsed().Seconds(); secs > 0 {
+		b.ReportMetric(float64(logical)*float64(b.N)/secs/1e6, "MB/s")
+	}
 }
