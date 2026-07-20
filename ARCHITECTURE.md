@@ -987,6 +987,14 @@ optional side store differ.
   **key-scoped** `key‖value` (equality) and `key‖word` (contains) tokens per record attribute;
   `Equality` columns hold each value verbatim (the **trace-by-id** path). `Fetch` skips a part whose
   bloom proves a required `Condition.Tokens`/`Condition.Equal` absent, then re-checks per row.
+- **Two-phase filtered fetch** (`fetchlazy.go`, taken when `AllConditions` + conditions — the
+  by-id lookups): a surviving part is read in two phases so a high-selectivity query never
+  materializes the projected byte columns for rows it discards. Phase 1 decodes only the timestamp,
+  the int columns, and the **condition** byte columns (as lazy `chunk.DictColumn`s, O(1) `At`, no
+  copy) and scans for matching rows; a part with no match (a bloom false positive) is dropped without
+  decoding its projected byte columns at all. Phase 2 decodes the remaining projected byte columns
+  and gathers **only the matched rows'** cells. (The unfiltered matcher path stays bulk-decode, since
+  it returns whole per-stream ranges.)
 - **Record-key footer** (`{prefix}/keys.bin`, magic+version+CRC32C): each part persists its distinct
   per-record **attribute keys** (not values — bounded by the stream schema, so tiny) next to its
   blooms, written by `writePart` (so flush and merge produce it) and loaded by `openPart`.
@@ -1008,14 +1016,18 @@ optional side store differ.
   Content-addressing (an entry's id is a hash of its content) makes the union a plain dedup with no
   id remap. Profiles is the first user (its symbol store).
 - **Logs** (`signal/log`): schema = `observed`/`severity`/`flags`/`dropped`(int) +
-  `severity_text`/`body`(FullText)/`trace_id`/`span_id`/`attrs`(Attrs)(bytes). `WriteLogs` /
-  `LogFetcher`.
+  `severity_text`/`body`(FullText)/`trace_id`(Equality)/`span_id`/`attrs`(Attrs)(bytes). `WriteLogs` /
+  `LogFetcher`, plus **`LogsForTrace(tenant, id)`** — logs-by-trace-id as an equality condition on
+  `trace_id`, pruned by its equality bloom (mirrors traces' `Trace`, for "logs for this trace").
 - **Traces** (`signal/trace`): a span is a record. Schema = `duration`/`kind`/`status_code` +
   ingest-computed nested-set ids `parent_id`/`nested_set_left`/`nested_set_right` (int) +
   `trace_id`(Equality)/`span_id`/`parent_span_id`/`name`(FullText)/`status_message`/`attrs`(Attrs) +
-  serialized `events`/`links` (bytes). `span_id` is near-unique, so it uses the dictionary-free
-  fixed-width `CodecBytesRaw` (≈30% smaller than a dictionary for that column); `trace_id` keeps the
-  dictionary codec — it repeats once per span of a trace, which the dictionary exploits.
+  serialized `events`/`links` (bytes). `span_id` and `trace_id` are high-cardinality id columns, so
+  both use the dictionary-free fixed-width `CodecBytesRaw`: at production cardinality (hundreds of
+  thousands of distinct ids per part, far above the dictionary's 65536 cap) the dictionary codec
+  degrades to its flat length-prefixed fallback (17 B/row for a 16-byte id), whereas the fixed-width
+  form stores 16 B/row and decodes far faster (no dictionary reconstruction). `trace_id` still carries
+  the equality bloom for trace-by-id pruning.
   `Project` computes nested-set ids per trace within the batch
   (group by trace id across services, build the parent→child tree, preorder-DFS assign left/right/
   parent), so an embedder's TraceQL does ancestor/descendant/sibling as range comparisons on the

@@ -23,8 +23,9 @@ const (
 )
 
 // Schema is the logs vertical's record-engine column schema: four small int columns, the body
-// (full-text bloom), the trace/span ids, severity text, and the serialized per-record attributes
-// (attribute bloom). The primary timestamp (the record's event time) is the implicit sort key.
+// (full-text bloom), the trace/span ids (trace_id carries an equality bloom for logs-by-trace-id
+// pruning), severity text, and the serialized per-record attributes (attribute bloom). The primary
+// timestamp (the record's event time) is the implicit sort key.
 var Schema = recordengine.NewSchema(
 	recordengine.Column{Name: ColObserved, Kind: recordengine.KindInt64, Codec: chunk.CodecT64},
 	recordengine.Column{Name: ColSeverity, Kind: recordengine.KindInt64, Codec: chunk.CodecT64},
@@ -32,7 +33,7 @@ var Schema = recordengine.NewSchema(
 	recordengine.Column{Name: ColDropped, Kind: recordengine.KindInt64, Codec: chunk.CodecT64},
 	recordengine.Column{Name: ColSeverityText, Kind: recordengine.KindBytes, Codec: chunk.CodecDict},
 	recordengine.Column{Name: ColBody, Kind: recordengine.KindBytes, Codec: chunk.CodecDict, Bloom: recordengine.BloomFullText},
-	recordengine.Column{Name: ColTraceID, Kind: recordengine.KindBytes, Codec: chunk.CodecDict},
+	recordengine.Column{Name: ColTraceID, Kind: recordengine.KindBytes, Codec: chunk.CodecDict, Bloom: recordengine.BloomEquality},
 	recordengine.Column{Name: ColSpanID, Kind: recordengine.KindBytes, Codec: chunk.CodecDict},
 	recordengine.Column{Name: ColAttrs, Kind: recordengine.KindBytes, Codec: chunk.CodecDict, Bloom: recordengine.BloomAttrs},
 )

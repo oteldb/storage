@@ -44,6 +44,18 @@ func (s *Storage) LogFetcher(tenants ...signal.TenantID) fetch.Fetcher {
 	return s.recordFetcher(signal.Log, tenants, s.logEngineSnapshot, s.lookupLogEngine, s.clusterLogFetcherFor)
 }
 
+// LogsForTrace fetches every log record correlated to a trace id from a tenant: an equality condition
+// on the trace_id column, pruned by its per-part equality bloom. It returns one batch per stream
+// (service) carrying that trace's log records. It mirrors [Storage.Trace] for the logs vertical — the
+// "logs for this trace" correlation an embedder's trace view issues.
+func (s *Storage) LogsForTrace(ctx context.Context, tenant signal.TenantID, traceID []byte) ([]*fetch.Batch, error) {
+	if s.closed.Load() {
+		return nil, errors.Wrap(ErrClosed, "logs for trace")
+	}
+
+	return s.fetchByEquality(ctx, s.LogFetcher(tenant), signal.Log, log.ColTraceID, traceID)
+}
+
 // LogSeries returns the identities of a tenant's log streams matching the label matchers within
 // [start, end] (zero start AND end disables the time filter). It mirrors [Storage.ProfileSeries]
 // for the logs vertical, so an embedder can build LabelNames/LabelValues/Series responses without

@@ -205,3 +205,55 @@ func TestWriteLogsAdmissionMaxSeries(t *testing.T) {
 	assert.Equal(t, "max_series", b.RejectedReason)
 	assert.Equal(t, int64(1), s.AdmissionStats("default").RejectedCardinality)
 }
+
+// TestFacadeLogsForTrace verifies logs-by-trace-id returns exactly the records correlated to the
+// queried trace across services (the equality bloom prunes the rest after a flush).
+func TestFacadeLogsForTrace(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	s, err := InMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close(ctx) })
+
+	// (traceID, body) records under one service.
+	build := func(svc string, recs ...[2]string) log.Logs {
+		var ld log.Logs
+		rl := ld.AddResource()
+		rl.Resource = signal.Resource{Attributes: signal.NewAttributes(
+			signal.KeyValue{Key: []byte("service.name"), Value: signal.StringValue([]byte(svc))},
+		)}
+		sl := rl.AddScope()
+
+		for i, r := range recs {
+			rec := sl.AddRecord()
+			rec.Timestamp = int64(i + 1)
+			rec.TraceID = []byte(r[0])
+			rec.Body = []byte(r[1])
+		}
+
+		return ld
+	}
+
+	_, err = s.WriteLogs(ctx, build("api", [2]string{"trace-A", "a1"}, [2]string{"trace-B", "b1"}))
+	require.NoError(t, err)
+	_, err = s.WriteLogs(ctx, build("worker", [2]string{"trace-A", "a2"}, [2]string{"trace-B", "b2"}))
+	require.NoError(t, err)
+
+	s.maintain(ctx) // flush so the trace_id equality bloom prunes parts
+
+	got, err := s.LogsForTrace(ctx, "default", []byte("trace-A"))
+	require.NoError(t, err)
+
+	var bodies []string
+
+	for _, b := range got {
+		col, _ := b.Column(log.ColBody)
+		for _, v := range col.Bytes {
+			bodies = append(bodies, string(v))
+		}
+	}
+
+	assert.ElementsMatch(t, []string{"a1", "a2"}, bodies, "logs-by-trace returns the trace's records across services, not trace-B")
+}

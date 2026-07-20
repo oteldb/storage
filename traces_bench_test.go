@@ -3,19 +3,43 @@ package storage
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"strconv"
 	"testing"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/index/bloom"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/trace"
 )
 
+// traceID16 builds the fixed 16-byte trace id for (round, svc, tr) and spanID8 the fixed 8-byte span
+// id for (svc, tr, sp) — the real OTLP id widths, so the trace_id/span_id columns exercise the
+// fixed-width (flagFixed) encoding path rather than falling to the variable-length flat fallback.
+func traceID16(round, svc, tr int) []byte {
+	id := make([]byte, 16)
+	binary.BigEndian.PutUint64(id[0:8], uint64(round))
+	binary.BigEndian.PutUint32(id[8:12], uint32(svc))
+	binary.BigEndian.PutUint32(id[12:16], uint32(tr))
+
+	return id
+}
+
+func spanID8(svc, tr, sp int) []byte {
+	id := make([]byte, 8)
+	binary.BigEndian.PutUint16(id[0:2], uint16(svc))
+	binary.BigEndian.PutUint16(id[2:4], uint16(tr))
+	binary.BigEndian.PutUint32(id[4:8], uint32(sp))
+
+	return id
+}
+
 // genTraceRound builds one round's spans: services × tracesPerSvc traces, each a root + children.
 // Each round stamps a round-specific token (evt{round}) into the span name and a round-specific
 // region attribute, so a query for a rare token matches one part (the others bloom-prune) while a
-// common token (e.g. "GET") and a common status scan everything. The known trace id "trace-{round}-0"
+// common token (e.g. "GET") and a common status scan everything. The known trace id traceID16(round,0,0)
 // in each round feeds the by-id benchmark. It accumulates the logical (uncompressed) searched bytes
 // into total, sized by the columns a span search actually reads.
 func genTraceRound(round, services, tracesPerSvc, spansPerTrace int, total *int64) trace.Traces {
@@ -29,25 +53,25 @@ func genTraceRound(round, services, tracesPerSvc, spansPerTrace int, total *int6
 		ss := rs.AddScope()
 
 		for tr := range tracesPerSvc {
-			traceID := fmt.Sprintf("trace-%d-%d-%d", round, svc, tr)
+			traceID := traceID16(round, svc, tr)
 			region := fmt.Sprintf("r%d", round)
-			rootID := traceID + "-root"
+			rootID := spanID8(svc, tr, 0)
 
 			for sp := range spansPerTrace {
 				name := fmt.Sprintf("GET /api/v1/op%d evt%d", sp%20, round)
 
 				s := ss.AddSpan()
-				s.TraceID = []byte(traceID)
+				s.TraceID = traceID
 				s.Name = []byte(name)
 				s.Start = int64(round*1_000_000 + tr*100 + sp)
 				s.End = s.Start + int64(50+sp)
 				s.StatusCode = int32(sp % 3)
 
 				if sp == 0 {
-					s.SpanID = []byte(rootID)
+					s.SpanID = rootID
 				} else {
-					s.SpanID = fmt.Appendf(nil, "%s-%d", traceID, sp)
-					s.ParentSpanID = []byte(rootID)
+					s.SpanID = spanID8(svc, tr, sp)
+					s.ParentSpanID = rootID
 				}
 
 				s.Attributes = signal.NewAttributes(
@@ -110,6 +134,49 @@ func loadTraceStore(b *testing.B, services, tracesPerSvc, spansPerTrace, rounds 
 	}
 
 	return s, logical
+}
+
+// traceIDStoredBytes sums the on-backend size of the trace_id column object ({part}/c/{i}) and its
+// equality bloom across the default tenant's flushed trace parts — the direct storage cost of the
+// trace_id encoding, reported by the by-id benchmark so a codec change shows as a size delta.
+func traceIDStoredBytes(b *testing.B, s *Storage) int64 {
+	b.Helper()
+	ctx := context.Background()
+
+	eng, ok := s.lookupTraceEngine("default")
+	if !ok {
+		return 0
+	}
+
+	details, err := eng.PartsDetailed(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	var total int64
+
+	for _, p := range details {
+		col := -1
+		for i := range p.Columns {
+			if p.Columns[i].Name == trace.ColTraceID {
+				col = i
+
+				break
+			}
+		}
+
+		if col >= 0 {
+			if n, err := backend.SizeOf(ctx, s.backend, p.ID+"/c/"+strconv.Itoa(col)); err == nil {
+				total += n
+			}
+		}
+
+		if n, err := backend.SizeOf(ctx, s.backend, p.ID+"/bloom-"+trace.ColTraceID+".bin"); err == nil {
+			total += n
+		}
+	}
+
+	return total
 }
 
 // BenchmarkTraceSearch is the end-to-end span-search benchmark: resource matchers resolve streams,
@@ -176,25 +243,33 @@ func BenchmarkTraceSearch(b *testing.B) {
 // by that column's Equality bloom. A present id touches the one part holding it (the rest prune);
 // an absent id prunes every part. Throughput is sized by the full logical dataset so the pruning
 // shows as a high effective rate.
+//
+// The per-part trace_id cardinality (services × tracesPerSvc) is deliberately kept above the
+// dictionary codec's 65536-distinct cap, matching real trace stores where a part holds hundreds of
+// thousands of distinct ids. Below that cap a synthetic run would let CodecDict dictionary-encode
+// trace_id and mis-rank it against the fixed-width CodecBytesRaw; above it (as here, and in
+// production) CodecDict degrades to its flat length-prefixed fallback, which the traceid_bytes
+// metric reflects.
 func BenchmarkTraceByID(b *testing.B) {
 	ctx := context.Background()
 
 	const (
 		services      = 8
-		tracesPerSvc  = 40
-		spansPerTrace = 8
-		rounds        = 10
-		hitRound      = 5
+		tracesPerSvc  = 9000 // 72k distinct trace ids per round part (> the 65536 dict cap)
+		spansPerTrace = 2
+		rounds        = 4
+		hitRound      = 2
 	)
 
 	s, logical := loadTraceStore(b, services, tracesPerSvc, spansPerTrace, rounds)
+	idBytes := traceIDStoredBytes(b, s)
 
 	cases := []struct {
 		name string
 		id   []byte
 	}{
-		{"Present_prune", fmt.Appendf(nil, "trace-%d-0-0", hitRound)}, // one part holds it
-		{"Absent_prune", []byte("trace-no-such-id")},                  // all parts prune
+		{"Present_prune", traceID16(hitRound, 0, 0)},     // one part holds it
+		{"Absent_prune", bytes.Repeat([]byte{0xFF}, 16)}, // all parts prune
 	}
 
 	for i := range cases {
@@ -211,6 +286,134 @@ func BenchmarkTraceByID(b *testing.B) {
 
 				_ = got
 			}
+
+			b.ReportMetric(float64(idBytes), "traceid_bytes")
 		})
+	}
+}
+
+// BenchmarkTraceByService measures the by-service span lookup: a resource matcher on service.name
+// resolves one service's stream over the postings index, and the fetch returns that stream's spans
+// across every part (its per-part row range). Unlike the by-id path (a column Condition scanned per
+// row), this exercises stream resolution + the per-stream row-range index, and the lazy column
+// decode: the all-columns case decodes every span column, the name-only projection just the name.
+func BenchmarkTraceByService(b *testing.B) {
+	ctx := context.Background()
+
+	const (
+		services      = 8
+		tracesPerSvc  = 200
+		spansPerTrace = 8
+		rounds        = 10 // ⇒ 10 parts; each service's spans span all parts
+	)
+
+	s, logical := loadTraceStore(b, services, tracesPerSvc, spansPerTrace, rounds)
+
+	req := func(projection ...string) fetch.Request {
+		return fetch.Request{
+			Signal: signal.Trace, Start: 0, End: 1 << 60,
+			Matchers: []fetch.Matcher{nameMatcherSvc("svc-3")}, Projection: projection,
+		}
+	}
+
+	cases := []struct {
+		name string
+		req  fetch.Request
+	}{
+		{"AllCols", req()},
+		{"ProjName", req(trace.ColName)},
+	}
+
+	for i := range cases {
+		tc := &cases[i]
+		b.Run(tc.name, func(b *testing.B) {
+			b.SetBytes(logical)
+			b.ReportAllocs()
+
+			for b.Loop() {
+				it, err := s.TraceFetcher("default").Fetch(ctx, tc.req)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				if _, err := fetch.Drain(ctx, it); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkWriteTraces measures the trace ingest write path: projecting the span model (nested-set
+// ids, event/link serialization), deriving the tenant, indexing streams, and buffering records into
+// the head. The Flush variant adds the flush-to-part cost (column encode + bloom build + backend
+// write). Reported Mspans/s isolates the per-span ingest cost; the store is reset periodically so
+// the head does not grow unbounded across b.N.
+func BenchmarkWriteTraces(b *testing.B) {
+	shapes := []struct {
+		name                                  string
+		services, tracesPerSvc, spansPerTrace int
+	}{
+		{"8svc_50traces_8spans", 8, 50, 8},
+		{"32svc_100traces_4spans", 32, 100, 4},
+	}
+
+	for _, sh := range shapes {
+		b.Run(sh.name, func(b *testing.B) {
+			benchmarkWriteTraces(b, sh.services, sh.tracesPerSvc, sh.spansPerTrace, false)
+		})
+		b.Run(sh.name+"/Flush", func(b *testing.B) {
+			benchmarkWriteTraces(b, sh.services, sh.tracesPerSvc, sh.spansPerTrace, true)
+		})
+	}
+}
+
+func benchmarkWriteTraces(b *testing.B, services, tracesPerSvc, spansPerTrace int, flush bool) {
+	b.Helper()
+
+	ctx := context.Background()
+
+	var logical int64
+
+	td := genTraceRound(0, services, tracesPerSvc, spansPerTrace, &logical)
+	totalSpans := services * tracesPerSvc * spansPerTrace
+	resetEvery := max((1<<20)/totalSpans, 1)
+
+	s, err := InMemory()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.Cleanup(func() { _ = s.Close(ctx) })
+	b.SetBytes(logical)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := range b.N {
+		if _, err := s.WriteTraces(ctx, td); err != nil {
+			b.Fatal(err)
+		}
+
+		if flush {
+			if eng, ok := s.lookupTraceEngine("default"); ok {
+				if err := eng.Flush(ctx); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+
+		if (i+1)%resetEvery == 0 {
+			b.StopTimer()
+
+			if err := s.Reset(ctx); err != nil {
+				b.Fatal(err)
+			}
+
+			b.StartTimer()
+		}
+	}
+
+	if secs := b.Elapsed().Seconds(); secs > 0 {
+		b.ReportMetric(float64(totalSpans)*float64(b.N)/secs/1e6, "Mspans/s")
 	}
 }

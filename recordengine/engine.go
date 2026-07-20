@@ -720,6 +720,11 @@ type fetchPlan struct {
 	series     map[signal.SeriesID]signal.Series
 	liveParts  []*part
 	start, end int64
+
+	// Filtered path (AllConditions with conditions): conds are applied during the part scan so only
+	// matching rows materialize; condSel is the columns those conditions read (see fetchlazy.go).
+	conds   []fetch.Condition
+	condSel colSel
 }
 
 // planFetch builds the fetch plan: it selects and acquires the live parts that may hold a requested
@@ -749,6 +754,11 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *fetchPlan {
 		series: make(map[signal.SeriesID]signal.Series, len(ids)),
 		start:  r.Start,
 		end:    r.End,
+	}
+
+	if r.AllConditions && len(r.Conditions) > 0 {
+		p.conds = r.Conditions
+		p.condSel = conditionSel(e.cfg.Schema, r.Conditions)
 	}
 
 	for _, part := range e.parts {
@@ -798,6 +808,10 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *fetchPlan {
 // readParts decodes each acquired part (only the referenced columns — lazy decode) and appends its
 // in-window rows to the per-stream accumulators. Runs lock-free: the parts are immutable and ref-held.
 func (p *fetchPlan) readParts(ctx context.Context) error {
+	if len(p.conds) > 0 {
+		return p.readPartsLazy(ctx) // filtered path: materialize only matching rows (fetchlazy.go)
+	}
+
 	for _, part := range p.liveParts {
 		cols, err := part.readCols(ctx, p.sel, p.e.getI64)
 		if err != nil {
