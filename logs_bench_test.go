@@ -36,6 +36,9 @@ func genLogRound(round, services, perService int, total *int64) log.Logs {
 			r.Timestamp = int64(round*1_000_000 + i)
 			r.SeverityNumber = int32(9 + i%9)
 			r.Body = []byte(body)
+			// Correlate ~4 log records to one trace id (a trace emits several logs), giving the
+			// trace_id column realistic repetition for the by-trace-id lookup and codec/bloom paths.
+			r.TraceID = traceID16(round, svc, i/4)
 			r.Attributes = signal.NewAttributes(
 				signal.KeyValue{Key: []byte("region"), Value: signal.StringValue([]byte(region))},
 				signal.KeyValue{Key: []byte("user"), Value: signal.StringValue(fmt.Appendf(nil, "user-%d", i%1000))},
@@ -242,5 +245,79 @@ func BenchmarkLogReadRelease(b *testing.B) {
 		if err := it.Close(); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkWriteLogs measures the log ingest write path: projecting the log model (serializing
+// per-record attributes, trace/span ids), deriving the tenant, indexing streams, and buffering
+// records into the head. The Flush variant adds the flush-to-part cost (column encode + body/attr
+// bloom build + backend write). Reported Mrecords/s isolates the per-record ingest cost; the store
+// is reset periodically so the head does not grow unbounded across b.N.
+func BenchmarkWriteLogs(b *testing.B) {
+	shapes := []struct {
+		name                 string
+		services, perService int
+	}{
+		{"8svc_1000recs", 8, 1000},
+		{"32svc_2000recs", 32, 2000},
+	}
+
+	for _, sh := range shapes {
+		b.Run(sh.name, func(b *testing.B) {
+			benchmarkWriteLogs(b, sh.services, sh.perService, false)
+		})
+		b.Run(sh.name+"/Flush", func(b *testing.B) {
+			benchmarkWriteLogs(b, sh.services, sh.perService, true)
+		})
+	}
+}
+
+func benchmarkWriteLogs(b *testing.B, services, perService int, flush bool) {
+	b.Helper()
+
+	ctx := context.Background()
+
+	var logical int64
+
+	ld := genLogRound(0, services, perService, &logical)
+	totalRecords := services * perService
+	resetEvery := max((1<<20)/totalRecords, 1)
+
+	s, err := InMemory()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.Cleanup(func() { _ = s.Close(ctx) })
+	b.SetBytes(logical)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := range b.N {
+		if _, err := s.WriteLogs(ctx, ld); err != nil {
+			b.Fatal(err)
+		}
+
+		if flush {
+			if eng, ok := s.lookupLogEngine("default"); ok {
+				if err := eng.Flush(ctx); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+
+		if (i+1)%resetEvery == 0 {
+			b.StopTimer()
+
+			if err := s.Reset(ctx); err != nil {
+				b.Fatal(err)
+			}
+
+			b.StartTimer()
+		}
+	}
+
+	if secs := b.Elapsed().Seconds(); secs > 0 {
+		b.ReportMetric(float64(totalRecords)*float64(b.N)/secs/1e6, "Mrecords/s")
 	}
 }
