@@ -1013,9 +1013,12 @@ optional side store differ.
 - **Traces** (`signal/trace`): a span is a record. Schema = `duration`/`kind`/`status_code` +
   ingest-computed nested-set ids `parent_id`/`nested_set_left`/`nested_set_right` (int) +
   `trace_id`(Equality)/`span_id`/`parent_span_id`/`name`(FullText)/`status_message`/`attrs`(Attrs) +
-  serialized `events`/`links` (bytes). `span_id` is near-unique, so it uses the dictionary-free
-  fixed-width `CodecBytesRaw` (≈30% smaller than a dictionary for that column); `trace_id` keeps the
-  dictionary codec — it repeats once per span of a trace, which the dictionary exploits.
+  serialized `events`/`links` (bytes). `span_id` and `trace_id` are high-cardinality id columns, so
+  both use the dictionary-free fixed-width `CodecBytesRaw`: at production cardinality (hundreds of
+  thousands of distinct ids per part, far above the dictionary's 65536 cap) the dictionary codec
+  degrades to its flat length-prefixed fallback (17 B/row for a 16-byte id), whereas the fixed-width
+  form stores 16 B/row and decodes far faster (no dictionary reconstruction). `trace_id` still carries
+  the equality bloom for trace-by-id pruning.
   `Project` computes nested-set ids per trace within the batch
   (group by trace id across services, build the parent→child tree, preorder-DFS assign left/right/
   parent), so an embedder's TraceQL does ancestor/descendant/sibling as range comparisons on the

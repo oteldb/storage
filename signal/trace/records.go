@@ -36,7 +36,7 @@ var Schema = recordengine.NewSchema(
 	recordengine.Column{Name: ColParentID, Kind: recordengine.KindInt64, Codec: chunk.CodecT64},
 	recordengine.Column{Name: ColNestedLeft, Kind: recordengine.KindInt64, Codec: chunk.CodecT64},
 	recordengine.Column{Name: ColNestedRight, Kind: recordengine.KindInt64, Codec: chunk.CodecT64},
-	recordengine.Column{Name: ColTraceID, Kind: recordengine.KindBytes, Codec: chunk.CodecDict, Bloom: recordengine.BloomEquality},
+	recordengine.Column{Name: ColTraceID, Kind: recordengine.KindBytes, Codec: chunk.CodecBytesRaw, Bloom: recordengine.BloomEquality},
 	recordengine.Column{Name: ColSpanID, Kind: recordengine.KindBytes, Codec: chunk.CodecBytesRaw},
 	recordengine.Column{Name: ColParentSpanID, Kind: recordengine.KindBytes, Codec: chunk.CodecDict},
 	recordengine.Column{Name: ColName, Kind: recordengine.KindBytes, Codec: chunk.CodecDict, Bloom: recordengine.BloomFullText},
