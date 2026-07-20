@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/oteldb/storage/encoding/compress"
@@ -10,6 +11,30 @@ import (
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
 )
+
+// fetchByEquality fetches every record whose byte column equals value from f, pruned by that
+// column's per-part equality bloom. It is the shared body of the by-id lookups ([Storage.Trace],
+// [Storage.LogsForTrace]): an operator-free equality Condition carrying the serializable Equal hint.
+func (s *Storage) fetchByEquality(
+	ctx context.Context, f fetch.Fetcher, sig signal.Signal, column string, value []byte,
+) ([]*fetch.Batch, error) {
+	want := bytes.Clone(value)
+	cond := fetch.Condition{
+		Column: column,
+		Match:  func(v signal.Value) bool { return bytes.Equal(v.Str(), want) },
+		Equal:  &fetch.EqualMatcher{Name: column, Value: string(want)},
+	}
+
+	it, err := f.Fetch(ctx, fetch.Request{
+		Signal: sig, Start: 0, End: 1<<63 - 1,
+		Conditions: []fetch.Condition{cond}, AllConditions: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return fetch.Drain(ctx, it)
+}
 
 // The logs and traces facades are structurally identical — both are record signals over
 // recordengine — so their write and read paths share these helpers, parameterized by the signal's

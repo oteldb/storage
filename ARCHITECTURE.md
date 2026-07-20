@@ -1009,7 +1009,8 @@ optional side store differ.
   id remap. Profiles is the first user (its symbol store).
 - **Logs** (`signal/log`): schema = `observed`/`severity`/`flags`/`dropped`(int) +
   `severity_text`/`body`(FullText)/`trace_id`(Equality)/`span_id`/`attrs`(Attrs)(bytes). `WriteLogs` /
-  `LogFetcher`.
+  `LogFetcher`, plus **`LogsForTrace(tenant, id)`** — logs-by-trace-id as an equality condition on
+  `trace_id`, pruned by its equality bloom (mirrors traces' `Trace`, for "logs for this trace").
 - **Traces** (`signal/trace`): a span is a record. Schema = `duration`/`kind`/`status_code` +
   ingest-computed nested-set ids `parent_id`/`nested_set_left`/`nested_set_right` (int) +
   `trace_id`(Equality)/`span_id`/`parent_span_id`/`name`(FullText)/`status_message`/`attrs`(Attrs) +

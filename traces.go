@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"bytes"
 	"context"
 	"maps"
 
@@ -76,22 +75,7 @@ func (s *Storage) Trace(ctx context.Context, tenant signal.TenantID, traceID []b
 		return nil, errors.Wrap(ErrClosed, "trace")
 	}
 
-	want := bytes.Clone(traceID)
-	cond := fetch.Condition{
-		Column: trace.ColTraceID,
-		Match:  func(v signal.Value) bool { return bytes.Equal(v.Str(), want) },
-		Equal:  &fetch.EqualMatcher{Name: trace.ColTraceID, Value: string(want)},
-	}
-
-	it, err := s.TraceFetcher(tenant).Fetch(ctx, fetch.Request{
-		Signal: signal.Trace, Start: 0, End: 1<<63 - 1,
-		Conditions: []fetch.Condition{cond}, AllConditions: true,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return fetch.Drain(ctx, it)
+	return s.fetchByEquality(ctx, s.TraceFetcher(tenant), signal.Trace, trace.ColTraceID, traceID)
 }
 
 // traceEngineFor returns the traces engine for a tenant, creating it (with a WAL when
