@@ -1008,7 +1008,7 @@ optional side store differ.
   Content-addressing (an entry's id is a hash of its content) makes the union a plain dedup with no
   id remap. Profiles is the first user (its symbol store).
 - **Logs** (`signal/log`): schema = `observed`/`severity`/`flags`/`dropped`(int) +
-  `severity_text`/`body`(FullText)/`trace_id`/`span_id`/`attrs`(Attrs)(bytes). `WriteLogs` /
+  `severity_text`/`body`(FullText)/`trace_id`(Equality)/`span_id`/`attrs`(Attrs)(bytes). `WriteLogs` /
   `LogFetcher`.
 - **Traces** (`signal/trace`): a span is a record. Schema = `duration`/`kind`/`status_code` +
   ingest-computed nested-set ids `parent_id`/`nested_set_left`/`nested_set_right` (int) +
