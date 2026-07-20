@@ -123,6 +123,47 @@ func TestLazyProjectionDecodesReferencedColumnsOnly(t *testing.T) {
 	assert.Equal(t, []int64{100}, got[0].Timestamps)
 }
 
+func TestLazyFilteredMultiStreamWindowAbsentAttr(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := newEngine(t, backend.Memory())
+
+	// Two streams flushed to separate parts, so each part lacks the other stream (exercises the
+	// per-stream range lookup miss in the lazy scan). One api record has no "user" attribute.
+	ingest(t, e, mkBatch("api",
+		rrec{ts: 100, sev: 17, body: "a1", attr: [2]string{"user", "alice"}},
+		rrec{ts: 200, sev: 17, body: "a2"}, // no user attr
+	))
+	require.NoError(t, e.Flush(ctx))
+	ingest(t, e, mkBatch("web",
+		rrec{ts: 150, sev: 17, body: "w1", attr: [2]string{"user", "alice"}},
+	))
+	require.NoError(t, e.Flush(ctx))
+
+	// No matcher ⇒ all streams resolve; both parts are scanned though each holds only one stream.
+	all := func(start, end int64, conds ...fetch.Condition) fetch.Request {
+		return fetch.Request{Start: start, End: end, AllConditions: true, Conditions: conds}
+	}
+	collect := func(bs []*fetch.Batch) []string {
+		out := make([]string, 0, len(bs))
+		for _, b := range bs {
+			out = append(out, bodies(b)...)
+		}
+
+		return out
+	}
+
+	// Full window: every stream's matching rows across both parts.
+	assert.ElementsMatch(t, []string{"a1", "a2", "w1"}, collect(fetchAll(t, e, all(0, 1<<60, sevAtLeast(17)))))
+
+	// Narrow window drops a1 (ts 100) and a2 (ts 200), keeps only w1 (ts 150).
+	assert.ElementsMatch(t, []string{"w1"}, collect(fetchAll(t, e, all(120, 180, sevAtLeast(17)))))
+
+	// Attribute condition: a2 has no "user" attribute, so the lazy lookup misses and it is excluded.
+	assert.ElementsMatch(t, []string{"a1", "w1"}, collect(fetchAll(t, e, all(0, 1<<60, attrEquals("user", "alice")))))
+}
+
 func TestSecondPassDropsBatch(t *testing.T) {
 	t.Parallel()
 
