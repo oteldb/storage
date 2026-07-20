@@ -47,7 +47,13 @@ func buildColumnBloom(mode BloomMode, values *byteCol) []byte {
 		}
 	case BloomEquality:
 		for i := range rows {
-			tokens = append(tokens, values.at(i)) // each value is its own token
+			if v := values.at(i); len(v) > 0 {
+				// Each non-empty value is its own token. Empty values (e.g. a log record with no
+				// trace_id) are skipped: they are never an equality lookup target, and indexing them
+				// would size the filter to the row count and hash a value per row for nothing — the
+				// dominant cost when a column is mostly empty.
+				tokens = append(tokens, v)
+			}
 		}
 	case BloomAttrs:
 		for i := range rows {
