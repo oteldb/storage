@@ -987,6 +987,14 @@ optional side store differ.
   **key-scoped** `key‖value` (equality) and `key‖word` (contains) tokens per record attribute;
   `Equality` columns hold each value verbatim (the **trace-by-id** path). `Fetch` skips a part whose
   bloom proves a required `Condition.Tokens`/`Condition.Equal` absent, then re-checks per row.
+- **Two-phase filtered fetch** (`fetchlazy.go`, taken when `AllConditions` + conditions — the
+  by-id lookups): a surviving part is read in two phases so a high-selectivity query never
+  materializes the projected byte columns for rows it discards. Phase 1 decodes only the timestamp,
+  the int columns, and the **condition** byte columns (as lazy `chunk.DictColumn`s, O(1) `At`, no
+  copy) and scans for matching rows; a part with no match (a bloom false positive) is dropped without
+  decoding its projected byte columns at all. Phase 2 decodes the remaining projected byte columns
+  and gathers **only the matched rows'** cells. (The unfiltered matcher path stays bulk-decode, since
+  it returns whole per-stream ranges.)
 - **Record-key footer** (`{prefix}/keys.bin`, magic+version+CRC32C): each part persists its distinct
   per-record **attribute keys** (not values — bounded by the stream schema, so tiny) next to its
   blooms, written by `writePart` (so flush and merge produce it) and loaded by `openPart`.
