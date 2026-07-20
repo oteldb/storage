@@ -321,3 +321,82 @@ func benchmarkWriteLogs(b *testing.B, services, perService int, flush bool) {
 		b.ReportMetric(float64(totalRecords)*float64(b.N)/secs/1e6, "Mrecords/s")
 	}
 }
+
+// logByTraceIDCond is the equality condition a logs-by-trace-id lookup issues on the log trace_id
+// column, carrying the Equal hint so a trace_id equality bloom (once present) can prune parts.
+func logByTraceIDCond(traceID []byte) fetch.Condition {
+	want := bytes.Clone(traceID)
+
+	return fetch.Condition{
+		Column: log.ColTraceID,
+		Match:  func(v signal.Value) bool { return bytes.Equal(v.Str(), want) },
+		Equal:  &fetch.EqualMatcher{Name: log.ColTraceID, Value: string(want)},
+	}
+}
+
+// BenchmarkLogByTraceID measures the logs-by-trace-id lookup: an equality Condition on the log
+// trace_id column. Without an equality bloom on that column every part is scanned; with one, a
+// present id touches only the part holding it and an absent id prunes everything. Throughput is
+// sized by the full logical dataset so pruning shows as a higher effective rate.
+func BenchmarkLogByTraceID(b *testing.B) {
+	ctx := context.Background()
+
+	const (
+		services   = 8
+		perService = 2000
+		rounds     = 6
+		hitRound   = 3
+	)
+
+	s, err := InMemory()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.Cleanup(func() { _ = s.Close(ctx) })
+
+	var logical int64
+
+	for round := range rounds {
+		if _, err := s.WriteLogs(ctx, genLogRound(round, services, perService, &logical)); err != nil {
+			b.Fatal(err)
+		}
+
+		if eng, ok := s.lookupLogEngine("default"); ok {
+			if err := eng.Flush(ctx); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+
+	cases := []struct {
+		name string
+		id   []byte
+	}{
+		{"Present", traceID16(hitRound, 0, 0)},
+		{"Absent", bytes.Repeat([]byte{0xFF}, 16)},
+	}
+
+	for i := range cases {
+		tc := &cases[i]
+		b.Run(tc.name, func(b *testing.B) {
+			req := fetch.Request{
+				Signal: signal.Log, Start: 0, End: 1 << 60,
+				Conditions: []fetch.Condition{logByTraceIDCond(tc.id)}, AllConditions: true,
+			}
+			b.SetBytes(logical)
+			b.ReportAllocs()
+
+			for b.Loop() {
+				it, err := s.LogFetcher("default").Fetch(ctx, req)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				if _, err := fetch.Drain(ctx, it); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
