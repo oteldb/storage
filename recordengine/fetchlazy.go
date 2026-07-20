@@ -2,6 +2,7 @@ package recordengine
 
 import (
 	"context"
+	"slices"
 
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/query/fetch"
@@ -211,9 +212,25 @@ func (p *fetchPlan) readPartsLazy(ctx context.Context) error {
 	return nil
 }
 
-// rowMatch reports whether row i is in the query window and satisfies all conditions.
-func (p *fetchPlan) rowMatch(lz *lazyCols, i int) bool {
-	return lz.ts[i] >= p.start && lz.ts[i] <= p.end && lz.rowMatches(i, p.conds)
+// tsWindow narrows a stream's part range [rng.start, rng.end) to the sub-range whose timestamps fall
+// in [start, end]. Part rows are (stream, ts)-sorted, so each stream's range is ts-ascending and the
+// two bounds are found by binary search — the scan then evaluates conditions on in-window rows only,
+// with no per-row timestamp compare.
+func tsWindow(ts []int64, rng rowRange, start, end int64) rowRange {
+	sub := ts[rng.start:rng.end]
+
+	// lo: first ts >= start. hi: first ts > end — expressed via a comparator (not BinarySearch of
+	// end+1, which overflows at end == math.MaxInt64, the open-ended query upper bound).
+	lo, _ := slices.BinarySearch(sub, start)
+	hi, _ := slices.BinarySearchFunc(sub, end, func(e, target int64) int {
+		if e > target {
+			return +1
+		}
+
+		return -1
+	})
+
+	return rowRange{start: rng.start + lo, end: rng.start + hi}
 }
 
 // partHasMatch reports whether any requested stream holds an in-window matching row, short-circuiting
@@ -225,8 +242,9 @@ func (p *fetchPlan) partHasMatch(part *part, lz *lazyCols) bool {
 			continue
 		}
 
-		for i := rng.start; i < rng.end; i++ {
-			if p.rowMatch(lz, i) {
+		w := tsWindow(lz.ts, rng, p.start, p.end)
+		for i := w.start; i < w.end; i++ {
+			if lz.rowMatches(i, p.conds) {
 				return true
 			}
 		}
@@ -243,9 +261,10 @@ func (p *fetchPlan) gatherMatches(part *part, lz *lazyCols) {
 			continue
 		}
 
+		w := tsWindow(lz.ts, rng, p.start, p.end)
 		acc := p.accs[id]
-		for i := rng.start; i < rng.end; i++ {
-			if p.rowMatch(lz, i) {
+		for i := w.start; i < w.end; i++ {
+			if lz.rowMatches(i, p.conds) {
 				acc.appendLazyRow(lz, i)
 			}
 		}
