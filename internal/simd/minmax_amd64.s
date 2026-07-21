@@ -141,3 +141,37 @@ done:
 	MOVSD X0, rmin+24(FP)
 	MOVSD X1, rmax+32(FP)
 	RET
+
+// func equalFixed16AVX2(blob []byte, needle []byte, dst []byte)
+// Requires: AVX, AVX2
+TEXT ·equalFixed16AVX2(SB), NOSPLIT, $0-72
+	MOVQ           blob_base+0(FP), AX
+	MOVQ           needle_base+24(FP), CX
+	MOVQ           dst_base+48(FP), DX
+	MOVQ           dst_len+56(FP), BX
+	VBROADCASTI128 (CX), Y0
+	XORQ           CX, CX
+	XORQ           SI, SI
+
+loop:
+	CMPQ      CX, BX
+	JGE       done
+	VMOVDQU   (AX)(SI*1), Y1
+	VPCMPEQB  Y0, Y1, Y1
+	VPMOVMSKB Y1, DI
+	MOVL      DI, R8
+	ANDL      $0x0000ffff, R8
+	CMPL      R8, $0x0000ffff
+	SETEQ     (DX)(CX*1)
+	MOVQ      CX, R8
+	ADDQ      $0x01, R8
+	SHRL      $0x10, DI
+	CMPL      DI, $0x0000ffff
+	SETEQ     (DX)(R8*1)
+	ADDQ      $0x02, CX
+	ADDQ      $0x20, SI
+	JMP       loop
+
+done:
+	VZEROUPPER
+	RET
