@@ -304,3 +304,30 @@ func TestHandlersRejectHostileKeys(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, keys, 1)
 }
+
+func TestClientNotify(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var got []string
+
+	mux := http.NewServeMux()
+	mux.Handle(partsync.NotifyPath, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		got = append(got, req.URL.Query().Get("prefix"))
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	c := &partsync.Client{}
+	require.NoError(t, c.Notify(ctx, addr, "default/metrics"))
+	assert.Equal(t, []string{"default/metrics"}, got)
+
+	// An erroring peer surfaces (the caller treats it as advisory).
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	t.Cleanup(bad.Close)
+	require.Error(t, c.Notify(ctx, strings.TrimPrefix(bad.URL, "http://"), "default/metrics"))
+}

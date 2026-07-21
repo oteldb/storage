@@ -46,6 +46,10 @@ const (
 	ListPath = "/internal/parts/list"
 	// ObjectPath is the HTTP path serving one backend object verbatim.
 	ObjectPath = "/internal/parts/object"
+	// NotifyPath is the HTTP path an owner POSTs to after a flush/merge so a secondary mirrors
+	// immediately instead of waiting for its next maintenance tick. Advisory and best-effort —
+	// the periodic pull remains the anti-entropy source of truth.
+	NotifyPath = "/internal/parts/notify"
 
 	// checksumHeader carries the xxh3 hash of the object body, verified by the client.
 	checksumHeader = "X-Checksum-Xxh3"
@@ -189,6 +193,32 @@ func (c *Client) Fetch(ctx context.Context, addr, key string) ([]byte, error) {
 	return data, nil
 }
 
+// Notify tells the peer at addr that enginePrefix has new flushed parts, so it can mirror
+// immediately. Fire-and-forget semantics: an error just means the peer will catch up on its
+// next maintenance tick.
+func (c *Client) Notify(ctx context.Context, addr, enginePrefix string) error {
+	u := "http://" + addr + NotifyPath + "?" + url.Values{"prefix": []string{enginePrefix}}.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, http.NoBody)
+	if err != nil {
+		return errors.Wrap(err, "build request")
+	}
+
+	obs.InjectHTTP(ctx, req.Header)
+
+	resp, err := c.http().Do(req)
+	if err != nil {
+		return errors.Wrapf(err, "notify %q", addr)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		return errors.Errorf("notify: %q returned %d", addr, resp.StatusCode)
+	}
+
+	return nil
+}
+
 func (c *Client) http() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
@@ -295,9 +325,12 @@ func (s *Syncer) Totals() Totals {
 	return s.totals
 }
 
-// prefixState is the prune bookkeeping for one engine prefix: the peer's key set from the last
-// pass and, per local key, how many consecutive passes it has been absent from the peer.
+// prefixState is the per-engine-prefix sync state: a pass-serialization lock (a notify-driven
+// sync may race the maintenance-loop sync on the same prefix; racing installs could put an
+// older index over a newer one), the peer's key set from the last pass, and — per local key —
+// how many consecutive passes it has been absent from the peer.
 type prefixState struct {
+	pass   sync.Mutex // serializes Sync passes for this prefix
 	remote map[string]struct{}
 	miss   map[string]int
 }
@@ -313,6 +346,15 @@ func New(local backend.Backend, client *Client) *Syncer {
 // peer copy at least as new is installed. Unreachable peers are skipped; having no usable peer
 // index is a no-op, not an error.
 func (s *Syncer) Sync(ctx context.Context, enginePrefix string, peers []string, strict bool) (Stats, error) {
+	s.mu.Lock()
+	ps := s.stateFor(enginePrefix)
+	s.mu.Unlock()
+
+	// One pass at a time per prefix: concurrent passes (a flush notify racing the maintenance
+	// tick) could install an older peer index over a newer one.
+	ps.pass.Lock()
+	defer ps.pass.Unlock()
+
 	st, err := s.sync(ctx, enginePrefix, peers, strict)
 	s.account(st, err)
 

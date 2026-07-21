@@ -748,8 +748,12 @@ func (s *Storage) lookupEngine(tid signal.TenantID) (*engine.Engine, bool) {
 	return e, ok
 }
 
+// defaultTenant is the tenant id used when no routing callback is configured or a callback
+// returns the empty id.
+const defaultTenant signal.TenantID = "default"
+
 // tenantFor derives a record's tenant from its resource and scope via the configured
-// callback, defaulting to "default".
+// callback, defaulting to [defaultTenant].
 func (s *Storage) tenantFor(r signal.Resource, sc signal.Scope) signal.TenantID {
 	if s.opts.Tenant != nil {
 		if tid := s.opts.Tenant(r, sc); tid != "" {
@@ -757,12 +761,12 @@ func (s *Storage) tenantFor(r signal.Resource, sc signal.Scope) signal.TenantID 
 		}
 	}
 
-	return "default"
+	return defaultTenant
 }
 
 func (s *Storage) normalizeTenant(t signal.TenantID) signal.TenantID {
 	if t == "" {
-		return "default"
+		return defaultTenant
 	}
 
 	return t
@@ -1160,6 +1164,11 @@ func (s *Storage) maintain(ctx context.Context) {
 
 		_ = flush()
 		_ = merge()
+
+		// Shared-nothing: nudge the shard's secondaries to mirror the freshly flushed/merged
+		// parts now instead of on their next tick. Best-effort — pull remains the source of
+		// truth, so a lost notify only costs latency.
+		s.notifyPeers(ctx, tid, signalPrefix)
 	}
 
 	// Each engine is an independent shard (per tenant, per signal) with its own lock, so flush/merge
