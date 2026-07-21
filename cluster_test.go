@@ -45,8 +45,8 @@ func freeAddr(t *testing.T) string {
 func startEtcd(t *testing.T) string {
 	t.Helper()
 
-	lc := url.URL{Scheme: "http", Host: freeAddr(t)}
-	lp := url.URL{Scheme: "http", Host: freeAddr(t)}
+	lc := url.URL{Scheme: httpScheme, Host: freeAddr(t)}
+	lp := url.URL{Scheme: httpScheme, Host: freeAddr(t)}
 
 	cfg := embed.NewConfig()
 	cfg.Dir = t.TempDir()

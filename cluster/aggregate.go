@@ -251,7 +251,7 @@ func (a *RemoteAggregator) Aggregate(
 ) ([]engine.NamedAgg, error) {
 	payload := EncodeAggregateRequest(tenant, start, end, step, eq)
 
-	u := (&url.URL{Scheme: "http", Host: a.addr}).JoinPath(AggregatePath)
+	u := (&url.URL{Scheme: httpScheme, Host: a.addr}).JoinPath(AggregatePath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
 	if err != nil {
 		return nil, errors.Wrap(err, "build request")

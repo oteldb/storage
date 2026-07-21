@@ -13,6 +13,8 @@ import (
 	"go.etcd.io/etcd/server/v3/embed"
 )
 
+const httpScheme = "http"
+
 func TestMemberEncodeDecodeRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -46,8 +48,8 @@ func freeAddr(t *testing.T) string {
 func startEtcd(t *testing.T) *clientv3.Client {
 	t.Helper()
 
-	lc := url.URL{Scheme: "http", Host: freeAddr(t)}
-	lp := url.URL{Scheme: "http", Host: freeAddr(t)}
+	lc := url.URL{Scheme: httpScheme, Host: freeAddr(t)}
+	lp := url.URL{Scheme: httpScheme, Host: freeAddr(t)}
 
 	cfg := embed.NewConfig()
 	cfg.Dir = t.TempDir()

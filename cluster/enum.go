@@ -324,7 +324,7 @@ func postEnum(ctx context.Context, client *http.Client, addr, path string, paylo
 		client = http.DefaultClient
 	}
 
-	u := (&url.URL{Scheme: "http", Host: addr}).JoinPath(path)
+	u := (&url.URL{Scheme: httpScheme, Host: addr}).JoinPath(path)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
 	if err != nil {
 		return nil, errors.Wrap(err, "build request")

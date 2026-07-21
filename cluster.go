@@ -36,6 +36,8 @@ import (
 	"github.com/oteldb/storage/wal"
 )
 
+const httpScheme = "http"
+
 // clusterNode is the cluster runtime a [Storage] owns in cluster mode: the etcd client and
 // membership, the replica server, and the routed write path.
 type clusterNode struct {

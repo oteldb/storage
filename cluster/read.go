@@ -18,7 +18,10 @@ import (
 )
 
 // ReadPath is the HTTP path the cluster read (fetch fan-out) server serves.
-const ReadPath = "/internal/fetch"
+const (
+	ReadPath   = "/internal/fetch"
+	httpScheme = "http"
+)
 
 // The cluster read RPC carries only a tenant and a time window — not the fetch matchers, which
 // are opaque Go predicates (not serializable). A peer returns every series in the window (a
@@ -478,7 +481,7 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Itera
 
 	payload := EncodeFetchRequest(f.sig, string(r.Tenant), r.Start, r.End, eq)
 
-	u := (&url.URL{Scheme: "http", Host: f.addr}).JoinPath(ReadPath)
+	u := (&url.URL{Scheme: httpScheme, Host: f.addr}).JoinPath(ReadPath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
 	if err != nil {
 		return nil, errors.Wrap(err, "build request")
