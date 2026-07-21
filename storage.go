@@ -71,6 +71,9 @@ type Storage struct {
 
 	stopCh chan struct{}  // closed by Close to stop the maintenance loop
 	wg     sync.WaitGroup // tracks the maintenance goroutine
+
+	ecStats    ecCounters    // cumulative erasure-coding activity (Inspect → ClusterStats.EC)
+	maintStats maintCounters // cumulative maintenance-loop activity (Inspect → StoreStats.Maintenance)
 }
 
 // Open constructs a [Storage] from [Options] (DESIGN.md §5). If [Options.Backend] is
@@ -1105,6 +1108,13 @@ type maintTask struct {
 func (s *Storage) maintain(ctx context.Context) {
 	ctx = s.obs.Base(ctx)
 
+	cycleStart := time.Now()
+	s.maintStats.lastStartNano.Store(cycleStart.UnixNano())
+	defer func() {
+		s.maintStats.lastDurationNano.Store(int64(time.Since(cycleStart)))
+		s.maintStats.cycles.Add(1)
+	}()
+
 	metricEngines := s.engineSnapshotByTenant()
 	logEngines := s.logEngineSnapshotByTenant()
 	traceEngines := s.traceEngineSnapshotByTenant()
@@ -1234,6 +1244,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	addRecord(traceEngines, tracesPrefix)
 	addRecord(profileEngines, profilesPrefix)
 
+	s.maintStats.lastTasks.Store(int64(len(tasks)))
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].pressure > tasks[j].pressure })
 
 	parallel.ForEach(len(tasks), s.maintenanceConcurrency(), func(i int) { tasks[i].run() })

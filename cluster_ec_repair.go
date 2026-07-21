@@ -53,11 +53,13 @@ func (s *Storage) repairEcShards(ctx context.Context, shardKey signal.TenantID, 
 		}
 
 		if err := s.rebuildSlot(ctx, client, p.prefix, meta, scheme, owners, mySlot); err != nil {
+			s.ecStats.repairErrors.Add(1)
 			log.Warn("ec: shard repair failed",
 				zap.String("part", p.prefix), zap.Int("slot", mySlot), zap.Error(err))
 
 			continue
 		}
+		s.ecStats.repairedSlots.Add(1)
 
 		log.Debug("ec: repaired shard slot", zap.String("part", p.prefix), zap.Int("slot", mySlot))
 	}

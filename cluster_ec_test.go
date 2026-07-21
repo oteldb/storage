@@ -346,6 +346,24 @@ func TestClusterECSlotFiltering(t *testing.T) {
 		require.Lenf(t, got, 1, "%s serves the series", id)
 		assert.Equalf(t, vals, got[0].Values, "%s values", id)
 	}
+
+	// The EC lifecycle shows up in the operator stats: the owner converted and pruned; the
+	// replicas' reads reconstructed; nobody errored.
+	oec := primary.Inspect().Cluster.EC
+	require.NotNil(t, oec, "private backend ⇒ EC stats present")
+	assert.Positive(t, oec.Converted, "owner converted the cold part")
+	assert.Positive(t, oec.PrunedStagedParts, "owner pruned its staged shards")
+	assert.Zero(t, oec.ConvertErrors)
+	assert.Zero(t, oec.RepairErrors)
+
+	var reconstructs int64
+	for _, s := range nodes {
+		if st := s.Inspect().Cluster.EC; st != nil {
+			reconstructs += st.Reconstructs
+			assert.Zero(t, st.ReconstructErrors)
+		}
+	}
+	assert.Positive(t, reconstructs, "the sharded value column was reconstructed on read")
 }
 
 // shardSlotsPresent returns the set of EC shard slots that have any object in be.
