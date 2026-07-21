@@ -493,20 +493,13 @@ func (e *Engine) Series(matchers []fetch.Matcher, start, end int64) []signal.Ser
 // appendWindowRows appends rows of cols in [rng.start, rng.end) whose timestamp is in [start, end]
 // to acc, bulk-appending the whole range when it falls entirely in the window.
 func appendWindowRows(acc, cols *recordCols, rng rowRange, start, end int64) {
-	if rng.start >= rng.end {
-		return
-	}
-
-	if cols.ts[rng.start] >= start && cols.ts[rng.end-1] <= end {
-		acc.appendRange(cols, rng.start, rng.end)
-
-		return
-	}
-
-	for i := rng.start; i < rng.end; i++ {
-		if cols.ts[i] >= start && cols.ts[i] <= end {
-			acc.appendRow(cols, i)
-		}
+	// A stream's range is ts-ascending (rows are (stream, ts)-sorted), so binary-search the [start,end]
+	// sub-range and append it in one contiguous copy — instead of a per-row timestamp compare over the
+	// whole range, which is O(range) even when the window selects only a slice of it. This mirrors the
+	// filtered path's [fetchPlan.gatherMatches], which already narrows via [tsWindow].
+	w := tsWindow(cols.ts, rng, start, end)
+	if w.start < w.end {
+		acc.appendRange(cols, w.start, w.end)
 	}
 }
 
