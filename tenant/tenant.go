@@ -139,6 +139,12 @@ type ECScheme struct {
 	// Parity is the number of parity shards (m); the scheme tolerates Parity node losses.
 	// Must be ≥ 1.
 	Parity int
+	// After is the age past which a fully-cold part is erasure-coded, at merge, in place of
+	// full-copy replication — recent parts stay full-copy for fast local reads, and only cold
+	// parts trade a reconstruct-on-read cost for the storage saving. It mirrors [Recompress.After]
+	// and rides the same background-merge engine. Zero ⇒ EC every part (accept the read cost
+	// everywhere for the cheapest storage).
+	After time.Duration
 }
 
 // Durability is the per-tenant replication policy for the cluster layer: how many ring-owners
