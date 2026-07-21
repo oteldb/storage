@@ -198,3 +198,30 @@ func TestSplitKey(t *testing.T) {
 		assert.Falsef(t, ok, "key %q rejected", key)
 	}
 }
+
+func TestShardSlotOf(t *testing.T) {
+	t.Parallel()
+
+	for key, want := range map[string]int{
+		"default/metrics/0000000007/ecshard/0/c/0":      0,
+		"default/metrics/0000000007/ecshard/3/manifest": 3,
+		"t/logs/0000000001/ecshard/11/bloom-x.bin":      11,
+	} {
+		slot, ok := ec.ShardSlotOf(key)
+		require.Truef(t, ok, "key %q is a shard", key)
+		assert.Equal(t, want, slot)
+	}
+
+	// Non-shard keys (full copies, sidecar, index) are not shards.
+	for _, key := range []string{
+		"default/metrics/0000000007/c/0",
+		"default/metrics/0000000007/manifest",
+		"default/metrics/0000000007/ecmeta",
+		"default/metrics/bucket-index.bin",
+		"default/metrics/0000000007/ecshard/x/c/0", // non-numeric slot
+		"default/metrics/0000000007/ecshard/",      // no slot/object
+	} {
+		_, ok := ec.ShardSlotOf(key)
+		assert.Falsef(t, ok, "key %q is not a shard slot", key)
+	}
+}

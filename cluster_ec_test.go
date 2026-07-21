@@ -277,3 +277,86 @@ func TestECSchemeForGating(t *testing.T) {
 	assert.False(t, ok, "EC needs a private backend")
 	assert.Same(t, shared.backend, shared.backendFor("default"), "shared backend is not wrapped")
 }
+
+// TestClusterECSlotFiltering proves shard distribution: on a 3-node ec(2,1) cluster with private
+// backends, after the owner converts a part each replica mirrors ONLY its own shard slot (plus
+// the ecmeta sidecar), not the whole shard set — the per-node storage EC is meant to deliver.
+// Every node still reconstructs the full series.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterECSlotFiltering(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	// ec(2,1) over three racks: one shard per node, one node per rack.
+	nodes := map[string]*Storage{
+		"n1": openClusterNodeECDomains(t, endpoint, "n1", []string{"rack1"}, 2, 1),
+		"n2": openClusterNodeECDomains(t, endpoint, "n2", []string{"rack2"}, 2, 1),
+		"n3": openClusterNodeECDomains(t, endpoint, "n3", []string{"rack3"}, 2, 1),
+	}
+	n1 := nodes["n1"]
+
+	require.Eventually(t, func() bool {
+		return len(n1.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond)
+
+	ts, vals := ecPayload(4096, 3)
+	_, err := n1.WriteMetrics(ctx, gaugeBatch("api", "http.requests", ts, vals))
+	require.NoError(t, err)
+
+	scheme := ec.Scheme{Data: 2, Parity: 1}
+	owners := n1.cluster.membership.Ring().LookupBalanced([]byte("default"), scheme.Shards())
+	require.Len(t, owners, 3)
+
+	// Identify the compaction primary (slot 0) and run its maintenance: flush + convert.
+	primaryID := owners[0].ID
+	nodes[primaryID].maintain(ctx)
+
+	// The primary (slot 0) staged all three shard slots locally after conversion.
+	assert.Equal(t, 3, distinctSlots(t, ctx, nodes[primaryID].backend), "owner holds every slot (the source)")
+
+	// Each replica syncs and ends up with ONLY its own slot's shards.
+	for slot := 1; slot < 3; slot++ {
+		rep := nodes[owners[slot].ID]
+
+		require.Eventuallyf(t, func() bool {
+			rep.maintain(ctx)
+			slots := shardSlotsPresent(t, ctx, rep.backend)
+
+			return len(slots) == 1 && slots[slot]
+		}, 10*time.Second, 100*time.Millisecond, "slot-%d replica mirrors only its own slot", slot)
+	}
+
+	// Every node still serves the full series (own slot local + peers reconstruct).
+	for id, s := range nodes {
+		eng, ok := s.lookupEngine("default")
+		require.Truef(t, ok, "%s has the engine", id)
+		got := queryEngine(t, eng, nameMatcher("http.requests"))
+		require.Lenf(t, got, 1, "%s serves the series", id)
+		assert.Equalf(t, vals, got[0].Values, "%s values", id)
+	}
+}
+
+// shardSlotsPresent returns the set of EC shard slots that have any object in be.
+func shardSlotsPresent(t *testing.T, ctx context.Context, be backend.Backend) map[int]bool {
+	t.Helper()
+
+	keys, err := be.List(ctx, "default/metrics/")
+	require.NoError(t, err)
+
+	slots := map[int]bool{}
+	for _, k := range keys {
+		if slot, ok := ec.ShardSlotOf(k); ok {
+			slots[slot] = true
+		}
+	}
+
+	return slots
+}
+
+// distinctSlots counts the distinct EC shard slots present in be.
+func distinctSlots(t *testing.T, ctx context.Context, be backend.Backend) int {
+	t.Helper()
+
+	return len(shardSlotsPresent(t, ctx, be))
+}

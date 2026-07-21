@@ -19,6 +19,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/cluster"
+	"github.com/oteldb/storage/cluster/ec"
 	"github.com/oteldb/storage/cluster/etcd"
 	"github.com/oteldb/storage/cluster/partsync"
 	"github.com/oteldb/storage/cluster/replica"
@@ -65,8 +66,18 @@ type clusterNode struct {
 // so every shard of a tenant shares one RF. The ring clamps the result to the membership
 // size at lookup time.
 func (s *Storage) rfFor(shardKey signal.TenantID) int {
-	if rf := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(shardKey))).Durability.RF; rf > 0 {
-		return rf
+	d := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(shardKey))).Durability
+
+	// Erasure coding fixes the owner set at Data+Parity: the head is full-copy replicated to
+	// every shard owner (so each can flush/convert or hold its shard), and RF is ignored.
+	if d.EC != nil {
+		if scheme := (ec.Scheme{Data: d.EC.Data, Parity: d.EC.Parity}); scheme.Validate() == nil {
+			return scheme.Shards()
+		}
+	}
+
+	if d.RF > 0 {
+		return d.RF
 	}
 
 	return s.cluster.rf
@@ -92,7 +103,7 @@ func (s *Storage) syncParts(ctx context.Context, tid signal.TenantID, signalPref
 
 	enginePrefix := string(s.normalizeTenant(tid)) + signalPrefix
 
-	st, err := s.cluster.psync.Sync(ctx, enginePrefix, remotes, strict)
+	st, err := s.cluster.psync.Sync(ctx, enginePrefix, remotes, strict, s.ecKeepFilter(tid))
 	if err != nil {
 		s.obs.Logger(ctx).Warn("part sync failed",
 			zap.String("prefix", enginePrefix), zap.Bool("strict", strict), zap.Error(err))
@@ -415,7 +426,7 @@ func (s *Storage) clusterFetcherFor(tid signal.TenantID) fetch.Fetcher {
 // copy is complete; matchers are re-applied to the returned superset).
 func (s *Storage) shardFetcher(shardKey signal.TenantID) fetch.Fetcher {
 	cn := s.cluster
-	owners := cn.membership.Ring().Lookup([]byte(shardKey), s.rfFor(shardKey))
+	owners := s.ownerLookup(shardKey)
 
 	var remotes []fetch.Fetcher
 	for _, o := range owners {
@@ -528,7 +539,7 @@ func (s *Storage) shardAggregate(
 	ctx context.Context, shardKey signal.TenantID, r fetch.Request, step int64,
 ) ([]engine.NamedAgg, error) {
 	cn := s.cluster
-	owners := cn.membership.Ring().Lookup([]byte(shardKey), s.rfFor(shardKey))
+	owners := s.ownerLookup(shardKey)
 
 	for _, o := range owners {
 		if cn.membership.AddrOf(o.ID) == cn.self { // owner: serve locally
@@ -706,7 +717,7 @@ func (s *Storage) clusterProfileFetcherFor(tid signal.TenantID) fetch.Fetcher {
 // of the remote owners. The key is used verbatim (already normalized, possibly a shard key).
 func (s *Storage) shardOwners(shardKey signal.TenantID) (local bool, remotes []string) {
 	cn := s.cluster
-	for _, o := range cn.membership.Ring().Lookup([]byte(shardKey), s.rfFor(shardKey)) {
+	for _, o := range s.ownerLookup(shardKey) {
 		addr := cn.membership.AddrOf(o.ID)
 
 		switch {
@@ -1006,7 +1017,7 @@ func (s *Storage) shardRecordFetcher(
 	sig signal.Signal, shardKey signal.TenantID, lookup func(signal.TenantID) (*recordengine.Engine, bool),
 ) fetch.Fetcher {
 	cn := s.cluster
-	owners := cn.membership.Ring().Lookup([]byte(shardKey), s.rfFor(shardKey))
+	owners := s.ownerLookup(shardKey)
 
 	var remotes []fetch.Fetcher
 	for _, o := range owners {
@@ -1347,7 +1358,7 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 	}
 
 	rf := s.rfFor(signal.TenantID(tenant))
-	owners := s.cluster.membership.Ring().Lookup([]byte(tenant), rf)
+	owners := s.ownerLookup(signal.TenantID(tenant))
 
 	var targets []replica.Target
 	for _, o := range owners {

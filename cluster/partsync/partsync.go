@@ -275,6 +275,15 @@ func decodeKeyList(data []byte) ([]string, error) {
 	return keys, nil
 }
 
+// KeepFunc decides whether a peer-listed object key should be mirrored into this node. It lets
+// the caller narrow a pull to a subset of a part's objects — erasure coding passes one that
+// keeps only this node's own shard slot (plus every non-shard object), so a replica stores one
+// shard per part instead of the whole k+m set. A nil KeepFunc keeps everything.
+type KeepFunc func(key string) bool
+
+// keepAll is the default: mirror every object.
+func keepAll(string) bool { return true }
+
 // Stats reports what one [Syncer.Sync] pass did.
 type Stats struct {
 	// Synced is true when a newer peer copy was found and mirrored (Copied may still be zero
@@ -350,7 +359,7 @@ func New(local backend.Backend, client *Client) *Syncer {
 // strictly newer than the local one; otherwise (a replica mirroring its owner) any differing
 // peer copy at least as new is installed. Unreachable peers are skipped; having no usable peer
 // index is a no-op, not an error.
-func (s *Syncer) Sync(ctx context.Context, enginePrefix string, peers []string, strict bool) (Stats, error) {
+func (s *Syncer) Sync(ctx context.Context, enginePrefix string, peers []string, strict bool, keep KeepFunc) (Stats, error) {
 	if enginePrefix == "" || !ValidKey(enginePrefix) {
 		return Stats{}, errors.Errorf("invalid engine prefix %q", enginePrefix)
 	}
@@ -364,7 +373,7 @@ func (s *Syncer) Sync(ctx context.Context, enginePrefix string, peers []string, 
 	ps.pass.Lock()
 	defer ps.pass.Unlock()
 
-	st, err := s.sync(ctx, enginePrefix, peers, strict)
+	st, err := s.sync(ctx, enginePrefix, peers, strict, keep)
 	s.account(st, err)
 
 	return st, err
@@ -390,7 +399,16 @@ func (s *Syncer) account(st Stats, err error) {
 }
 
 // sync is one uncounted mirroring pass; see [Syncer.Sync].
-func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, strict bool) (Stats, error) {
+func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, strict bool, keep KeepFunc) (Stats, error) {
+	// An object filter (EC slot filtering) means the pull reconciles by object *presence*, not
+	// just by index generation: erasure-coding a part rewrites its objects (full copies →
+	// shards) without changing the bucket index, so an index-only gate would never re-mirror the
+	// new layout. The reconcile is idempotent — once converged it copies and prunes nothing.
+	forced := keep != nil
+	if keep == nil {
+		keep = keepAll
+	}
+
 	indexKey := enginePrefix + "/" + bucketindex.Object
 
 	addr, peerIndexRaw, peerIndex := s.newestPeer(ctx, indexKey, peers)
@@ -410,26 +428,35 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 		} // a corrupt local index is treated as empty and overwritten by the mirror
 	}
 
-	if cmp := compareIndexes(peerIndex, localIndex); cmp < 0 || (cmp == 0 && (strict || bytes.Equal(peerIndexRaw, localRaw))) {
-		return Stats{}, nil // peer is older, or not newer enough for this mode
+	cmp := compareIndexes(peerIndex, localIndex)
+	newer := cmp > 0 || (cmp == 0 && !strict && !bytes.Equal(peerIndexRaw, localRaw))
+
+	if !newer && !forced {
+		return Stats{}, nil // peer is older, or not newer enough, and no object-level reconcile
 	}
 
-	st := Stats{Synced: true}
+	st := Stats{}
 
-	if err := s.copyMissing(ctx, &st, addr, enginePrefix, indexKey); err != nil {
+	if err := s.copyMissing(ctx, &st, addr, enginePrefix, indexKey, keep); err != nil {
 		return st, err
 	}
 
-	// Install the index last: it only ever references parts whose objects are already local.
-	if err := s.local.Write(ctx, indexKey, peerIndexRaw); err != nil {
-		return st, errors.Wrap(err, "install index")
+	// Install the index last (the commit point) when it actually differs — it only ever
+	// references parts whose objects are already local.
+	if !bytes.Equal(peerIndexRaw, localRaw) {
+		if err := s.local.Write(ctx, indexKey, peerIndexRaw); err != nil {
+			return st, errors.Wrap(err, "install index")
+		}
+
+		st.Copied++
+		st.CopiedBytes += int64(len(peerIndexRaw))
 	}
-	st.Copied++
-	st.CopiedBytes += int64(len(peerIndexRaw))
 
 	if err := s.prune(ctx, &st, enginePrefix); err != nil {
 		return st, err
 	}
+
+	st.Synced = newer || st.Copied > 0 || st.Pruned > 0
 
 	return st, nil
 }
@@ -470,10 +497,20 @@ func (s *Syncer) newestPeer(ctx context.Context, indexKey string, peers []string
 // copyMissing fetches from addr every object under enginePrefix the local backend lacks,
 // ordering manifests after their part's other objects and re-fetching the mutable identity
 // objects; the bucket index itself is excluded (installed by the caller, last).
-func (s *Syncer) copyMissing(ctx context.Context, st *Stats, addr, enginePrefix, indexKey string) error {
-	remote, err := s.client.List(ctx, addr, enginePrefix)
+func (s *Syncer) copyMissing(ctx context.Context, st *Stats, addr, enginePrefix, indexKey string, keep KeepFunc) error {
+	listed, err := s.client.List(ctx, addr, enginePrefix)
 	if err != nil {
 		return errors.Wrap(err, "list peer")
+	}
+
+	// Apply the caller's object filter (EC slot filtering) up front, so both the copy set and
+	// the prune bookkeeping (remote set below) see only the objects this node should hold — a
+	// filtered-out shard the node still has locally is then pruned as "absent from remote".
+	remote := listed[:0]
+	for _, k := range listed {
+		if keep(k) {
+			remote = append(remote, k)
+		}
 	}
 
 	local, err := s.local.List(ctx, enginePrefix)
@@ -486,32 +523,7 @@ func (s *Syncer) copyMissing(ctx context.Context, st *Stats, addr, enginePrefix,
 		have[k] = struct{}{}
 	}
 
-	var immutable, manifests, mutable []string
-
-	for _, k := range remote {
-		// A peer's listing is remote input: accept only well-formed keys under the prefix
-		// being synced. Anything else is dropped — a correct peer never produces it.
-		if !ValidKey(k) || !strings.HasPrefix(k, enginePrefix+"/") {
-			continue
-		}
-
-		switch {
-		case k == indexKey:
-			// installed by the caller, last
-		case isMutableAux(k):
-			mutable = append(mutable, k) // re-fetch: content changes across flushes
-		default:
-			if _, ok := have[k]; ok {
-				continue // immutable and already local
-			}
-
-			if path.Base(k) == "manifest" {
-				manifests = append(manifests, k)
-			} else {
-				immutable = append(immutable, k)
-			}
-		}
-	}
+	immutable, manifests, mutable := classifyFetch(remote, enginePrefix, indexKey, have)
 
 	for _, group := range [][]string{immutable, manifests, mutable} {
 		for _, k := range group {
@@ -539,6 +551,38 @@ func (s *Syncer) copyMissing(ctx context.Context, st *Stats, addr, enginePrefix,
 	s.mu.Unlock()
 
 	return nil
+}
+
+// classifyFetch splits a peer's (already slot-filtered) key listing into the objects to fetch,
+// ordered so the manifest lands after its part's other objects: immutable objects the node
+// lacks, manifests, and the mutable identity objects (always re-fetched). The bucket index is
+// excluded (the caller installs it last). Keys outside the prefix or malformed are dropped —
+// a correct peer never produces them.
+func classifyFetch(remote []string, enginePrefix, indexKey string, have map[string]struct{}) (immutable, manifests, mutable []string) {
+	for _, k := range remote {
+		if !ValidKey(k) || !strings.HasPrefix(k, enginePrefix+"/") {
+			continue
+		}
+
+		switch {
+		case k == indexKey:
+			// installed by the caller, last
+		case isMutableAux(k):
+			mutable = append(mutable, k)
+		default:
+			if _, ok := have[k]; ok {
+				continue // immutable and already local
+			}
+
+			if path.Base(k) == "manifest" {
+				manifests = append(manifests, k)
+			} else {
+				immutable = append(immutable, k)
+			}
+		}
+	}
+
+	return immutable, manifests, mutable
 }
 
 // prune deletes local objects the peer no longer has, but only after they have been absent for

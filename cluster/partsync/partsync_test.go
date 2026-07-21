@@ -12,6 +12,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/cluster/ec"
 	"github.com/oteldb/storage/cluster/partsync"
 )
 
@@ -62,7 +63,7 @@ func TestSyncMirrorsNewerPeer(t *testing.T) {
 	require.NoError(t, owner.Write(ctx, "default/metrics/series.bin", []byte("series-v1")))
 
 	s := partsync.New(replica, &partsync.Client{})
-	st, err := s.Sync(ctx, "default/metrics", []string{serve(t, owner)}, false)
+	st, err := s.Sync(ctx, "default/metrics", []string{serve(t, owner)}, false, nil)
 	require.NoError(t, err)
 	require.True(t, st.Synced)
 	assert.Equal(t, 8, st.Copied, "2 parts × 3 objects + series.bin (mutable) + the index installed last")
@@ -81,7 +82,7 @@ func TestSyncMirrorsNewerPeer(t *testing.T) {
 	}
 
 	// A second pass is the fast path: nothing new.
-	st, err = s.Sync(ctx, "default/metrics", []string{serve(t, owner)}, false)
+	st, err = s.Sync(ctx, "default/metrics", []string{serve(t, owner)}, false, nil)
 	require.NoError(t, err)
 	assert.False(t, st.Synced, "identical index ⇒ no-op")
 	assert.Zero(t, st.Copied)
@@ -106,7 +107,7 @@ func TestSyncSkipsOlderPeer(t *testing.T) {
 	s := partsync.New(local, &partsync.Client{})
 
 	for _, strict := range []bool{false, true} {
-		st, err := s.Sync(ctx, "default/metrics", []string{serve(t, stale)}, strict)
+		st, err := s.Sync(ctx, "default/metrics", []string{serve(t, stale)}, strict, nil)
 		require.NoError(t, err)
 		assert.Falsef(t, st.Synced, "strict=%v: an older peer never overwrites a newer local copy", strict)
 	}
@@ -128,12 +129,12 @@ func TestSyncStrictRequiresStrictlyNewer(t *testing.T) {
 
 	// Local has the same generation (same index bytes).
 	s := partsync.New(local, &partsync.Client{})
-	st, err := s.Sync(ctx, "default/metrics", []string{serve(t, peer)}, false)
+	st, err := s.Sync(ctx, "default/metrics", []string{serve(t, peer)}, false, nil)
 	require.NoError(t, err)
 	require.True(t, st.Synced, "bootstrap mirror")
 
 	// Same-generation peer: strict (owner) skips, non-strict is the byte-equal fast path.
-	st, err = s.Sync(ctx, "default/metrics", []string{serve(t, peer)}, true)
+	st, err = s.Sync(ctx, "default/metrics", []string{serve(t, peer)}, true, nil)
 	require.NoError(t, err)
 	assert.False(t, st.Synced, "strict: equal generation is not newer")
 }
@@ -154,7 +155,7 @@ func TestSyncPicksNewestPeer(t *testing.T) {
 	saveIndex(t, cur, "t/metrics", cix)
 
 	s := partsync.New(local, &partsync.Client{})
-	st, err := s.Sync(ctx, "t/metrics", []string{serve(t, old), serve(t, cur), "127.0.0.1:1"}, false)
+	st, err := s.Sync(ctx, "t/metrics", []string{serve(t, old), serve(t, cur), "127.0.0.1:1"}, false, nil)
 	require.NoError(t, err)
 	require.True(t, st.Synced)
 
@@ -176,7 +177,7 @@ func TestSyncPrunesAfterTwoMisses(t *testing.T) {
 	addr := serve(t, owner)
 
 	s := partsync.New(replica, &partsync.Client{})
-	_, err := s.Sync(ctx, "t/metrics", []string{addr}, false)
+	_, err := s.Sync(ctx, "t/metrics", []string{addr}, false, nil)
 	require.NoError(t, err)
 
 	// The owner merges parts 1+2 into part 3: old objects go away, a new index appears.
@@ -190,7 +191,7 @@ func TestSyncPrunesAfterTwoMisses(t *testing.T) {
 	saveIndex(t, owner, "t/metrics", mix)
 
 	// Pass 1 after the merge: the replica mirrors part 3; stale objects are counted, not deleted.
-	st, err := s.Sync(ctx, "t/metrics", []string{addr}, false)
+	st, err := s.Sync(ctx, "t/metrics", []string{addr}, false, nil)
 	require.NoError(t, err)
 	require.True(t, st.Synced)
 	assert.Zero(t, st.Pruned, "first absence: quarantined, not pruned")
@@ -205,7 +206,7 @@ func TestSyncPrunesAfterTwoMisses(t *testing.T) {
 	saveIndex(t, owner, "t/metrics", fix)
 
 	// Pass 2: second consecutive absence ⇒ pruned.
-	st, err = s.Sync(ctx, "t/metrics", []string{addr}, false)
+	st, err = s.Sync(ctx, "t/metrics", []string{addr}, false, nil)
 	require.NoError(t, err)
 	require.True(t, st.Synced)
 	assert.Equal(t, 6, st.Pruned, "both stale parts' objects deleted on the second miss")
@@ -267,12 +268,12 @@ func TestSyncNoPeersIsNoop(t *testing.T) {
 	t.Parallel()
 
 	s := partsync.New(backend.Memory(), &partsync.Client{})
-	st, err := s.Sync(context.Background(), "t/metrics", nil, false)
+	st, err := s.Sync(context.Background(), "t/metrics", nil, false, nil)
 	require.NoError(t, err)
 	assert.False(t, st.Synced)
 
 	// Unreachable-only peers are also a clean no-op.
-	st, err = s.Sync(context.Background(), "t/metrics", []string{"127.0.0.1:1"}, false)
+	st, err = s.Sync(context.Background(), "t/metrics", []string{"127.0.0.1:1"}, false, nil)
 	require.NoError(t, err)
 	assert.False(t, st.Synced)
 }
@@ -338,7 +339,7 @@ func TestSyncRejectsHostilePrefix(t *testing.T) {
 	s := partsync.New(backend.Memory(), &partsync.Client{})
 
 	for _, prefix := range []string{"", "../etc", "/abs/metrics", "a/../b/metrics"} {
-		_, err := s.Sync(context.Background(), prefix, []string{"127.0.0.1:1"}, false)
+		_, err := s.Sync(context.Background(), prefix, []string{"127.0.0.1:1"}, false, nil)
 		require.Errorf(t, err, "prefix %q rejected before any peer traffic", prefix)
 	}
 }
@@ -377,7 +378,7 @@ func TestSyncDropsHostilePeerKeys(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	s := partsync.New(replica, &partsync.Client{})
-	st, err := s.Sync(ctx, "t/metrics", []string{strings.TrimPrefix(srv.URL, "http://")}, false)
+	st, err := s.Sync(ctx, "t/metrics", []string{strings.TrimPrefix(srv.URL, "http://")}, false, nil)
 	require.NoError(t, err)
 	require.True(t, st.Synced)
 
@@ -393,3 +394,90 @@ func TestSyncDropsHostilePeerKeys(t *testing.T) {
 		assert.Truef(t, strings.HasPrefix(k, "t/metrics/"), "only synced-prefix keys exist locally, got %q", k)
 	}
 }
+
+func TestSyncKeepFilterMirrorsSubset(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	owner, replica := backend.Memory(), backend.Memory()
+
+	// A part whose objects were erasure-coded: three shard slots + a sidecar, no full copies.
+	ix := &bucketindex.Index{}
+	ix.Add(bucketindex.Entry{Prefix: "t/metrics/0000000001", MinTime: 1, MaxTime: 9})
+	for slot := range 3 {
+		require.NoError(t, owner.Write(ctx, "t/metrics/0000000001/ecshard/"+itoa(slot)+"/c/0", []byte("shard-"+itoa(slot))))
+	}
+	require.NoError(t, owner.Write(ctx, "t/metrics/0000000001/ecmeta", []byte("meta")))
+	saveIndex(t, owner, "t/metrics", ix)
+
+	// keep only slot 1's shards (plus every non-shard object).
+	keep := func(key string) bool {
+		slot, isShard := ec.ShardSlotOf(key)
+
+		return !isShard || slot == 1
+	}
+
+	s := partsync.New(replica, &partsync.Client{})
+	st, err := s.Sync(ctx, "t/metrics", []string{serve(t, owner)}, false, keep)
+	require.NoError(t, err)
+	require.True(t, st.Synced)
+
+	// Only slot 1's shard mirrored; slots 0 and 2 did not; the sidecar did.
+	_, err = replica.Read(ctx, "t/metrics/0000000001/ecshard/1/c/0")
+	require.NoError(t, err, "own slot mirrored")
+	_, err = replica.Read(ctx, "t/metrics/0000000001/ecmeta")
+	require.NoError(t, err, "sidecar mirrored")
+	for _, slot := range []int{0, 2} {
+		_, err = replica.Read(ctx, "t/metrics/0000000001/ecshard/"+itoa(slot)+"/c/0")
+		require.ErrorIsf(t, err, backend.ErrNotExist, "slot %d not mirrored", slot)
+	}
+
+	// A forced (filtered) re-run with nothing new is a no-op.
+	st, err = s.Sync(ctx, "t/metrics", []string{serve(t, owner)}, false, keep)
+	require.NoError(t, err)
+	assert.False(t, st.Synced, "converged ⇒ no-op")
+}
+
+// TestSyncFilterPrunesForeignShards checks that switching a replica to slot filtering prunes the
+// other slots' shards it may already hold (absent from the filtered remote view).
+func TestSyncFilterPrunesForeignShards(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	owner, replica := backend.Memory(), backend.Memory()
+
+	ix := &bucketindex.Index{}
+	ix.Add(bucketindex.Entry{Prefix: "t/metrics/0000000001", MinTime: 1, MaxTime: 9})
+	for slot := range 3 {
+		require.NoError(t, owner.Write(ctx, "t/metrics/0000000001/ecshard/"+itoa(slot)+"/c/0", []byte("s"+itoa(slot))))
+		// The replica already holds every slot (from an earlier unfiltered mirror).
+		require.NoError(t, replica.Write(ctx, "t/metrics/0000000001/ecshard/"+itoa(slot)+"/c/0", []byte("s"+itoa(slot))))
+	}
+	require.NoError(t, owner.Write(ctx, "t/metrics/0000000001/ecmeta", []byte("meta")))
+	require.NoError(t, replica.Write(ctx, "t/metrics/0000000001/ecmeta", []byte("meta")))
+	saveIndex(t, owner, "t/metrics", ix)
+	saveIndex(t, replica, "t/metrics", ix)
+
+	keep := func(key string) bool {
+		slot, isShard := ec.ShardSlotOf(key)
+
+		return !isShard || slot == 2
+	}
+
+	s := partsync.New(replica, &partsync.Client{})
+
+	// Two passes: the quarantine-by-delay prune deletes the foreign slots on the second miss.
+	for range 2 {
+		_, err := s.Sync(ctx, "t/metrics", []string{serve(t, owner)}, false, keep)
+		require.NoError(t, err)
+	}
+
+	_, err := replica.Read(ctx, "t/metrics/0000000001/ecshard/2/c/0")
+	require.NoError(t, err, "own slot kept")
+	for _, slot := range []int{0, 1} {
+		_, err = replica.Read(ctx, "t/metrics/0000000001/ecshard/"+itoa(slot)+"/c/0")
+		require.ErrorIsf(t, err, backend.ErrNotExist, "foreign slot %d pruned", slot)
+	}
+}
+
+func itoa(n int) string { return string(rune('0' + n)) }

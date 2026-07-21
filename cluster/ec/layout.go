@@ -29,6 +29,32 @@ func ShardKey(partPrefix string, slot int, object string) string {
 	return partPrefix + "/ecshard/" + strconv.Itoa(slot) + "/" + object
 }
 
+// shardMarker separates a part prefix from a shard slot in an EC shard key.
+const shardMarker = "/ecshard/"
+
+// ShardSlotOf reports whether key is an EC shard object and, if so, its slot index. It is how
+// the mirror path filters a peer's listing down to the shards a node should hold (its own
+// slot), leaving every non-shard object — full copies, the ecmeta sidecar, the bucket index —
+// kept (ok=false).
+func ShardSlotOf(key string) (slot int, ok bool) {
+	_, rest, found := strings.Cut(key, shardMarker)
+	if !found {
+		return 0, false
+	}
+
+	num, _, ok := strings.Cut(rest, "/") // "{slot}/{object}"
+	if !ok {
+		return 0, false
+	}
+
+	n, err := strconv.Atoi(num)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+
+	return n, true
+}
+
 // SplitKey splits a backend key into its part prefix and part-relative object name, keyed off
 // the engine's fixed-width numeric part-sequence segment ("{enginePrefix}/{seq:010d}/{object}").
 // It reports ok=false for keys not under a part (e.g. the engine's bucket index or identity
