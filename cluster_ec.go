@@ -10,6 +10,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/cluster/ec"
 	"github.com/oteldb/storage/cluster/partsync"
+	"github.com/oteldb/storage/cluster/ring"
 	"github.com/oteldb/storage/signal"
 	tenantpkg "github.com/oteldb/storage/tenant"
 )
@@ -50,6 +51,20 @@ func (s *Storage) ecSchemeFor(shardKey signal.TenantID) (ec.Scheme, bool) {
 	return scheme, true
 }
 
+// ownerLookup returns the ring owners for a shard key, using the erasure-coding balanced
+// placement (rack/server/disk spread across all Data+Parity slots) for an EC tenant and the
+// zone-aware replica placement otherwise. It is the single source of the owner *set* so the
+// head-replication targets, the sync peers, and the EC shard placement all agree on the same
+// nodes in the same slot order.
+func (s *Storage) ownerLookup(shardKey signal.TenantID) []ring.Node {
+	r := s.cluster.membership.Ring()
+	if _, isEC := s.ecSchemeFor(shardKey); isEC {
+		return r.LookupBalanced([]byte(shardKey), s.rfFor(shardKey))
+	}
+
+	return r.Lookup([]byte(shardKey), s.rfFor(shardKey))
+}
+
 // ecOwners returns the addresses of shardKey's n shard owners in slot order (slot i is owner i),
 // used both to place shards and to fetch them for reconstruction. Placement is **rack-aware**:
 // [ring.Ring.LookupBalanced] spreads the shards across zones (failure domains) as evenly as
@@ -82,6 +97,39 @@ func (s *Storage) ecZoneShortfall(shardKey signal.TenantID, scheme ec.Scheme) (z
 	}
 
 	return len(seen), len(seen) >= scheme.MinZones()
+}
+
+// ecKeepFilter returns the partsync object filter for shardKey: it keeps every non-shard
+// object (full copies, the ecmeta sidecar, the bucket index) and, of the erasure-coded shards,
+// only this node's own slot — so a replica mirrors one shard per part instead of the whole k+m
+// set (each node converges to a single shard, the EC storage target). Returns nil (no filtering)
+// when EC does not apply to the tenant, preserving the plain full-copy mirror.
+func (s *Storage) ecKeepFilter(shardKey signal.TenantID) partsync.KeepFunc {
+	scheme, ok := s.ecSchemeFor(shardKey)
+	if !ok {
+		return nil
+	}
+
+	owners := s.ecOwners(shardKey, scheme.Shards())
+
+	mySlot := -1
+
+	for i, addr := range owners {
+		if addr == s.cluster.self {
+			mySlot = i
+
+			break
+		}
+	}
+
+	return func(key string) bool {
+		slot, isShard := ec.ShardSlotOf(key)
+		if !isShard {
+			return true // full copies, ecmeta, index: always mirrored
+		}
+
+		return slot == mySlot // of the shards, keep only this node's slot
+	}
 }
 
 // ecBackend wraps the raw backend for an EC-policy tenant's engine: reads of an erasure-coded

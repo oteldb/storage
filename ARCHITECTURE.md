@@ -1036,9 +1036,19 @@ pass through to the raw backend, so flush, partsync mirroring, and the converter
 plain layout. The compaction owner runs `ec.Convert` on cold parts from the owned branch of the
 maintenance loop (after merge, before the flush notify), skipping already-converted parts.
 Everything is gated on shared-nothing mode + an EC policy, so a non-EC tenant's engine uses the
-raw backend unchanged. Remaining milestones: partsync slot filtering (a replica mirrors only its
-slot's shards) + shard repair after node loss, and the chaos e2e — today every mirroring replica
-still pulls all shards, so EC is correct but not yet at its target per-node storage.
+raw backend unchanged. **Slot filtering.** A replica mirrors only **its own shard slot** (plus every non-shard object —
+the ecmeta sidecar, the bucket index): `partsync.Sync` takes a `KeepFunc`, and the EC engine
+passes one that keeps a shard key only when its slot matches this node's index in the owner set,
+so each node converges to one shard per part (the EC storage target) instead of the whole k+m
+set. Because erasure-coding a part rewrites its objects without changing the bucket index, the
+filtered pull **reconciles by object presence** (idempotent) rather than gating on the index
+generation. The owner set is consistent across the head-replication targets, the sync peers, and
+the shard placement: for an EC tenant `rfFor` returns Data+Parity (the head is full-copy
+replicated to every shard owner so each can hold its shard) and every owner lookup goes through
+`ownerLookup`, which uses the balanced (rack/server/disk-aware) placement. The compaction owner
+(the ring primary) still holds all shards as the distribution source; pruning it to its own slot
+and repairing a lost slot after node loss are the remaining milestones, along with the chaos
+e2e.
 
 Closed parity items: the write path is primary-authoritative, so the OOO decision is made once
 by the shard primary (`engine.ApplyPrimary`) and secondaries apply the accepted set verbatim
