@@ -561,6 +561,53 @@ func (r *ColumnReader) Bytes() (*chunk.DictColumn, error) {
 	return dc, err
 }
 
+// BytesRaw decodes a [chunk.CodecBytesRaw]-encoded [KindBytes] column into its flat fixed-width
+// form: the contiguous rows×width blob and width, with no per-row [][]byte headers built over it
+// (unlike [ColumnReader.Bytes]) — the shape a stride/SIMD equality scan (e.g.
+// [github.com/oteldb/storage/internal/simd.EqualFixed16]) operates on directly. It errors if the
+// column is not [KindBytes], its codec is not [chunk.CodecBytesRaw], or it is block-framed (no
+// blocked encoder exists yet for byte columns — see [ColumnReader.DecodeBlocksInt64] for the
+// int64/float64 precedent this would follow).
+func (r *ColumnReader) BytesRaw() (blob []byte, width int, err error) {
+	if r.desc.Kind != KindBytes {
+		return nil, 0, errors.Errorf("block: column %q is %s, not bytes", r.desc.Name, r.desc.Kind)
+	}
+
+	if r.desc.Codec != chunk.CodecBytesRaw {
+		return nil, 0, errors.Errorf("block: column %q codec %s is not %s", r.desc.Name, r.desc.Codec, chunk.CodecBytesRaw)
+	}
+
+	if r.desc.Const {
+		width = len(r.desc.ConstBytes)
+		blob = make([]byte, width*r.rows)
+		for i := range r.rows {
+			copy(blob[i*width:(i+1)*width], r.desc.ConstBytes)
+		}
+
+		return blob, width, nil
+	}
+
+	if r.desc.Blocked {
+		return nil, 0, errors.Errorf("block: column %q is block-framed; BytesRaw does not support blocked bytes columns yet", r.desc.Name)
+	}
+
+	stream, err := r.stream()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	blob, width, rows, err := chunk.DecodeBytesRawBlob(stream)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if rows != r.rows {
+		return nil, 0, errors.Wrapf(ErrCorrupt, "column %q decoded %d rows, want %d", r.desc.Name, rows, r.rows)
+	}
+
+	return blob, width, nil
+}
+
 // TsCursor returns a forward cursor over a [KindInt64] timestamp column (delta-of-delta). A
 // constant-collapsed column yields a repeating cursor. It is the streaming-merge form of Int64:
 // same decode, but one row at a time so a merge holds only one series range resident per part.
