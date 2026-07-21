@@ -1003,10 +1003,18 @@ is served as-is; otherwise the key is split at the fixed-width part-sequence seg
 (`SplitKey`), the sidecar consulted, and any Data checksum-valid shards gathered (own slot
 locally first, then peers via a slot-addressed `PeerFetch`) and reconstructed — a corrupt or
 unreachable shard is skipped, tolerating Parity failures, and sub-floor/full-copy objects
-never pay the gather. `EncodeObject`/`ShouldShard` are the writer-side helpers the converter
-and repair use. Remaining milestones: the merge re-encode tier (cold parts → EC at the
-compaction owner), partsync slot filtering + repair, and the chaos e2e — the engines do not
-read through `ec.Reader` yet.
+never pay the gather. The **converter** (`ec.Convert`) is the compaction owner's cold-part
+re-encode step: it shards every at-or-above-floor object, writes the sidecar as the commit
+point, and deletes the full copies it replaced — crash-safe (a crash before the sidecar leaves
+a readable full-copy part; a crash mid-delete leaves a still-readable part; a re-run of an
+already-converted part only sweeps leftover full copies, never re-reads them). All Data+Parity
+shards are written into the owner's own backend (the staging area from which peers pull their
+slot and the owner prunes to its own — a later milestone). Which parts convert is a **per-tenant
+age tier**: `tenant.ECScheme.After` (mirroring `Recompress.After`) EC-codes only parts fully
+older than the threshold, so recent data stays full-copy for fast reads. Remaining milestones:
+wiring `ec.Reader` as the engine's backend + triggering `Convert` from the maintenance loop,
+partsync slot filtering + repair, and the chaos e2e — the engines do not read through
+`ec.Reader` yet.
 
 Closed parity items: the write path is primary-authoritative, so the OOO decision is made once
 by the shard primary (`engine.ApplyPrimary`) and secondaries apply the accepted set verbatim
@@ -1454,8 +1462,9 @@ query-language path stays in the embedder. The `Write*` methods take the library
   (a list of `PrecisionTier{After, Bits}` age-banded *lossy* float-precision budgets, applied at merge
   so only old data trades accuracy for size — §3f), `Durability` (per-tenant replication
   policy: `RF` overrides the cluster-wide replication factor for the tenant's shards, zero ⇒
-  the cluster default; `EC *ECScheme{Data, Parity}` reserves the erasure-coding scheme for
-  flushed parts, not yet consumed by the engine), and the
+  the cluster default; `EC *ECScheme{Data, Parity, After}` erasure-codes the tenant's flushed
+  parts older than `After` at (Data+Parity)/Data storage instead of RF full copies — the
+  `cluster/ec` converter enacts it at merge, not yet wired into the engine), and the
   composed `Policy`, resolved per tenant id through a `Resolver` (`ResolverFunc` adapter;
   `Default()` returns an empty-policy resolver). Multi-tenancy, retention, and
   downsampling are consumer-supplied callbacks keyed by tenant id.
@@ -1593,7 +1602,7 @@ cluster/              L0 distribution: ring + membership + (later) replication �
   cluster/etcd        etcd-backed live membership (lease + watch → atomic ring)          [implemented; embedded-etcd tested]
   cluster/replica     quorum write-replication + node-to-node HTTP transport             [implemented]
   cluster/partsync    shared-nothing flushed-part mirroring between private backends     [implemented]
-  cluster/ec          Reed-Solomon codec + Meta sidecar + layout + reconstructing Reader  [codec+read implemented; convert/repair pending]
+  cluster/ec          Reed-Solomon codec + Meta sidecar + layout + reconstructing Reader + cold-part converter [codec+read+convert done; engine-wiring/repair pending]
   cluster/rebalance   minimal ownership-handoff plan from a ring diff (pure)              [implemented]
   cluster/etcd (ownership.go) exclusive compaction claims (CAS+lease) — the rebalance executor [implemented]
   cluster/            cluster write path: EncodeWrite codec + Writer + Config             [implemented]

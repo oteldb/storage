@@ -86,12 +86,11 @@ func (r *Reader) assemble(ctx context.Context, partPrefix string, s Scheme, om O
 	get := func(slot int) []byte {
 		key := ShardKey(partPrefix, slot, om.Name)
 
-		if slot == r.Slot {
-			data, err := backend.ReadView(ctx, r.Local, key)
-			if err != nil {
-				return nil
-			}
-
+		// Local first for any slot: a node normally holds only its own slot, but right after a
+		// conversion (before pruning) or during repair staging it may hold others — reading them
+		// locally avoids a needless network hop and makes a fully-local part reconstructible with
+		// no Fetch at all.
+		if data, err := backend.ReadView(ctx, r.Local, key); err == nil {
 			return data
 		}
 
