@@ -74,7 +74,8 @@ type ClusterStats struct {
 	Members []MemberStats
 	// Owned is the shards this node currently holds a compaction claim on (sorted).
 	Owned []string
-	// LastRebalance is the primary handoffs enacted at the most recent ring change (empty if none).
+	// LastRebalance is the owner-set handoffs enacted at the most recent ring change (empty if
+	// none), at each shard's per-tenant replication factor.
 	LastRebalance []RebalanceMove
 	// PartSync is the shared-nothing part-mirroring activity (cluster/partsync), cumulative since
 	// process start; nil unless the cluster runs with a private (per-node) backend.
@@ -108,8 +109,9 @@ type MemberStats struct {
 	Addr string
 }
 
-// RebalanceMove is one shard's primary handoff at a ring change: the node ids that gained it and
-// those that lost it.
+// RebalanceMove is one shard's owner-set change at a ring change: the node ids that gained it
+// and those that lost it, at the shard's per-tenant replication factor (so it names the
+// replicas that must backfill, not just the compaction primary).
 type RebalanceMove struct {
 	Shard   string
 	Added   []string

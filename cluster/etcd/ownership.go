@@ -35,7 +35,8 @@ type Ownership struct {
 	mu       sync.Mutex
 	held     map[string]struct{}      // shards this node currently holds a claim on
 	prevRing *ring.Ring               // ring at the last Reconcile (pointer-compared for "unchanged")
-	lastPlan []rebalance.Reassignment // the primary handoffs enacted at the last ring change
+	lastPlan []rebalance.Reassignment // the owner-set handoffs enacted at the last ring change
+	planRF   func(shard string) int   // per-shard rf for LastPlan recording; nil ⇒ 1 (primary only)
 }
 
 // NewOwnership returns an ownership coordinator for node id, claiming under root with the
@@ -145,11 +146,19 @@ func (o *Ownership) Reconcile(ctx context.Context, r *ring.Ring, shards []string
 		delete(o.held, shard)
 	}
 
-	// Record the primary handoffs this ring change implied (rf=1: compaction ownership tracks the
-	// primary only), so an operator can see/preview what moved. The membership layer republishes
-	// the ring via an atomic pointer only on a real change, so pointer inequality means "changed".
+	// Record the owner-set handoffs this ring change implied, so an operator can see/preview
+	// what moved. With a plan-RF resolver ([Ownership.SetPlanRF]) the plan covers each shard's
+	// full owner set at its tenant's replication factor — the replicas that must backfill, not
+	// just the compaction primary; without one it falls back to rf=1 (primary handoffs only,
+	// matching the claims this reconciler actually moves). The membership layer republishes the
+	// ring via an atomic pointer only on a real change, so pointer inequality means "changed".
 	if o.prevRing != nil && o.prevRing != r {
-		o.lastPlan = rebalance.Plan(shards, o.prevRing, r, 1)
+		rfOf := o.planRF
+		if rfOf == nil {
+			rfOf = func(string) int { return 1 }
+		}
+
+		o.lastPlan = rebalance.PlanWith(shards, o.prevRing, r, rfOf)
 	}
 
 	o.prevRing = r
@@ -165,9 +174,20 @@ func (o *Ownership) Owned() []string {
 	return o.ownedLocked()
 }
 
-// LastPlan returns the primary handoffs enacted at the most recent ring change (empty if the
+// SetPlanRF sets the per-shard replication factor used when recording [Ownership.LastPlan]
+// (e.g. the tenant durability policy's RF), so the recorded plan reflects each shard's full
+// owner-set diff rather than only the primary handoff. It does not affect claim reconciliation
+// — compaction ownership always tracks the primary alone. Call before the first Reconcile;
+// a nil resolver (the default) records primary-only (rf=1) plans.
+func (o *Ownership) SetPlanRF(rfOf func(shard string) int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.planRF = rfOf
+}
+
+// LastPlan returns the owner-set handoffs enacted at the most recent ring change (empty if the
 // ring has not changed since open). It is informational — a preview of what the last rebalance
-// moved — for an operator dashboard.
+// moved — for an operator dashboard. See [Ownership.SetPlanRF] for the owner-set breadth.
 func (o *Ownership) LastPlan() []rebalance.Reassignment {
 	o.mu.Lock()
 	defer o.mu.Unlock()

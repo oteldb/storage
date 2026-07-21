@@ -179,3 +179,41 @@ func TestOwnershipHandoffOnLeaseExpiry(t *testing.T) {
 		return err == nil && ok
 	}, 5*time.Second, 100*time.Millisecond, "the surviving node takes over the orphaned shard")
 }
+
+// TestOwnershipLastPlanPerShardRF verifies SetPlanRF: with a per-shard rf resolver the recorded
+// handoff plan covers each shard's full owner set at its tenant's replication factor (the
+// replicas that must backfill), while claim reconciliation itself stays primary-only.
+//
+//nolint:paralleltest // owns an embedded etcd
+func TestOwnershipLastPlanPerShardRF(t *testing.T) {
+	ctx, a, b := twoOwners(t)
+
+	// Every shard replicates at RF=2: on a two-node ring both nodes own every shard.
+	a.SetPlanRF(func(string) int { return 2 })
+
+	r1 := ring.New(ring.Node{ID: "node-a"}, ring.Node{ID: "node-b"})
+	shards := []string{"t1", "t2", "t3", "t4", "t5", "t6"}
+
+	_, err := a.Reconcile(ctx, r1, shards)
+	require.NoError(t, err)
+	ownedB, err := b.Reconcile(ctx, r1, shards)
+	require.NoError(t, err)
+
+	// Claims are unaffected by the plan rf: the two nodes still split the shards by primary.
+	assert.Len(t, ownedB, len(shards)-len(a.Owned()), "claims split by primary, not by rf")
+
+	r2 := r1.Without("node-b")
+
+	_, err = a.Reconcile(ctx, r2, shards)
+	require.NoError(t, err)
+
+	// At rf=2 node-b was an owner of EVERY shard, so every shard appears in the plan with
+	// node-b removed — not just the ones it was primary of (the rf=1 plan).
+	plan := a.LastPlan()
+	assert.ElementsMatch(t, shards, shardsOf(plan), "full owner-set plan covers every shard")
+
+	for _, r := range plan {
+		assert.Empty(t, r.Added, "node-a already owned every shard at rf=2")
+		assert.Equal(t, []string{"node-b"}, r.Removed, "node-b leaves every shard's owner set")
+	}
+}
