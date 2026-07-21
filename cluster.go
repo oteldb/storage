@@ -227,6 +227,12 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 		psync:      partsync.New(s.backend, &partsync.Client{HTTP: httpc}),
 	}
 
+	// Record rebalance plans at each shard's own (per-tenant) replication factor, so
+	// LastRebalance in the operator stats shows the full owner-set moves — the replicas that
+	// must backfill — not just the compaction-primary handoff. Claims stay primary-only.
+	// Safe here: Reconcile first runs from the maintenance loop, after s.cluster is set.
+	s.cluster.ownership.SetPlanRF(func(shard string) int { return s.rfFor(signal.TenantID(shard)) })
+
 	return nil
 }
 

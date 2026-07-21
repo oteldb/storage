@@ -850,10 +850,14 @@ parts from S3 via the bucket index; the loser stops), not a copy — and HRW gua
 makes exactly one node compact a shard at a time is the compaction-claim executor (§3j). That
 executor is now **event-driven and minimal-move**: it tracks the claims it holds and on each
 pass issues an etcd write only for a shard whose ring-primary actually changed (steady state is
-zero round-trips), and it **records the `rebalance.Plan` it enacted** at each ring change
+zero round-trips), and it **records the plan it enacted** at each ring change
 (`Ownership.LastPlan`) so an operator can preview what moved. `Plan` is therefore no longer
 informational-only — it is the published handoff record (and the same pure diff a preview API
-can compute against two rings).
+can compute against two rings). The plan honors **per-tenant RF**: `rebalance.PlanWith` takes a
+per-shard replication factor (`Plan` is the constant-rf wrapper), and the facade wires
+`Ownership.SetPlanRF` to the tenant durability resolver, so the recorded plan is each shard's
+full owner-set diff at its own RF — the replicas that must backfill under shared-nothing — not
+just the compaction-primary move. Claim reconciliation itself stays primary-only.
 
 **RF is resolved per tenant.** Every owner lookup (write replication, read fan-out, failover
 address lists) resolves the shard's replication factor through `rfFor`: the tenant's
@@ -928,8 +932,9 @@ and issues an etcd write only to acquire a wanted-but-unheld shard or release a 
 one. Steady state (unchanged ring, no new tenants) is therefore **zero etcd round-trips** instead
 of one acquire/release per shard per tick; retrying the wanted-but-unheld acquires every pass is
 what converges a handoff once the prior owner releases. It returns the full owned set and, on a
-ring change, records the enacted `rebalance.Plan` (`Ownership.LastPlan`, rf=1 primary handoffs)
-for operator preview. In cluster mode the maintenance loop flushes/merges **only owned tenants**,
+ring change, records the enacted plan (`Ownership.LastPlan` — full owner-set diffs at each
+shard's per-tenant RF via `SetPlanRF`, or rf=1 primary handoffs without a resolver) for
+operator preview. In cluster mode the maintenance loop flushes/merges **only owned tenants**,
 so a tenant's parts are written to the shared object store by exactly one node — even during
 ring-disagreement windows, the claim arbitrates. A departed node's claims auto-free with its
 lease and the new primary takes over (tested via lease revoke). A two-node test confirms only the

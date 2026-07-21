@@ -28,10 +28,18 @@ type Reassignment struct {
 // replication factor rf, omitting shards whose owner set is unchanged. The result is ordered
 // by shard, so it is deterministic.
 func Plan(shards []string, prev, next *ring.Ring, rf int) []Reassignment {
+	return PlanWith(shards, prev, next, func(string) int { return rf })
+}
+
+// PlanWith is [Plan] with a per-shard replication factor: rfOf(shard) returns the owner count
+// for that shard, so tenants with different durability policies (per-tenant RF) produce their
+// actual owner-set diffs in one plan. rfOf must be pure for the duration of the call.
+func PlanWith(shards []string, prev, next *ring.Ring, rfOf func(shard string) int) []Reassignment {
 	var out []Reassignment
 
 	for _, shard := range shards {
 		key := []byte(shard)
+		rf := rfOf(shard)
 		before := ownerIDs(prev.Lookup(key, rf))
 		after := ownerIDs(next.Lookup(key, rf))
 
