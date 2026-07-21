@@ -976,7 +976,13 @@ peer no longer lists (superseded by a merge) are pruned only after **two consecu
 passes** — quarantine-by-delay, giving in-flight readers a full maintenance cycle to drain.
 Sync is **signal-agnostic** (it mirrors whatever objects live under `{tenant}/{signal}`), so
 metric parts with their `sidx`/`stats` sidecars and record parts with blooms/`keys.bin`/symbol
-sidecars replicate identically. End-to-end tests cover metric and log part mirroring over
+sidecars replicate identically. Convergence is **push-accelerated**: after an owner's
+flush/merge pass it POSTs a notify (`partsync.NotifyPath`) to the shard's secondaries, whose
+handler mirrors the prefix immediately (async, coalesced per prefix — a notify arriving while a
+notify-triggered sync is in flight is dropped) and refreshes the engine; the notify is advisory
+and best-effort, the periodic pull remains the anti-entropy source of truth, and Sync passes
+are serialized per prefix so a notify-driven sync can never race the maintenance tick into
+installing an older index over a newer one. End-to-end tests cover metric and log part mirroring over
 private backends and the durability capstone: RF=3 over three private disks, the primary
 flushes and is permanently lost, and every flushed sample stays queryable from each survivor's
 own backend.

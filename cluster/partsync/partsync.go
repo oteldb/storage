@@ -46,6 +46,10 @@ const (
 	ListPath = "/internal/parts/list"
 	// ObjectPath is the HTTP path serving one backend object verbatim.
 	ObjectPath = "/internal/parts/object"
+	// NotifyPath is the HTTP path an owner POSTs to after a flush/merge so a secondary mirrors
+	// immediately instead of waiting for its next maintenance tick. Advisory and best-effort —
+	// the periodic pull remains the anti-entropy source of truth.
+	NotifyPath = "/internal/parts/notify"
 
 	// checksumHeader carries the xxh3 hash of the object body, verified by the client.
 	checksumHeader = "X-Checksum-Xxh3"
@@ -55,11 +59,12 @@ const (
 	pruneAfterMisses = 2
 )
 
-// validKey reports whether a peer-supplied key or prefix is safe to hand to the backend:
+// ValidKey reports whether a remotely-supplied key or prefix is safe to hand to a backend:
 // relative, slash-delimited, and free of traversal or NUL. Backends validate again (the file
-// backend keeps every path under its root); this check is defense-in-depth at the network
-// boundary, rejecting hostile input before it reaches any backend.
-func validKey(k string) bool {
+// backend keeps every path under its root); this check is defense-in-depth at every network
+// boundary — the serving handlers reject hostile request parameters, and the syncer rejects
+// hostile key names a compromised peer could return.
+func ValidKey(k string) bool {
 	return !strings.Contains(k, "..") && !strings.HasPrefix(k, "/") &&
 		!strings.ContainsAny(k, "\\\x00")
 }
@@ -69,7 +74,7 @@ func validKey(k string) bool {
 func ListHandler(be backend.Backend) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		prefix := req.URL.Query().Get("prefix")
-		if !validKey(prefix) {
+		if !ValidKey(prefix) {
 			http.Error(w, "invalid prefix", http.StatusBadRequest)
 
 			return
@@ -98,7 +103,7 @@ func ListHandler(be backend.Backend) http.Handler {
 func ObjectHandler(be backend.Backend) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		key := req.URL.Query().Get("key")
-		if key == "" || !validKey(key) {
+		if key == "" || !ValidKey(key) {
 			http.Error(w, "invalid key", http.StatusBadRequest)
 
 			return
@@ -187,6 +192,32 @@ func (c *Client) Fetch(ctx context.Context, addr, key string) ([]byte, error) {
 	}
 
 	return data, nil
+}
+
+// Notify tells the peer at addr that enginePrefix has new flushed parts, so it can mirror
+// immediately. Fire-and-forget semantics: an error just means the peer will catch up on its
+// next maintenance tick.
+func (c *Client) Notify(ctx context.Context, addr, enginePrefix string) error {
+	u := "http://" + addr + NotifyPath + "?" + url.Values{"prefix": []string{enginePrefix}}.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, http.NoBody)
+	if err != nil {
+		return errors.Wrap(err, "build request")
+	}
+
+	obs.InjectHTTP(ctx, req.Header)
+
+	resp, err := c.http().Do(req)
+	if err != nil {
+		return errors.Wrapf(err, "notify %q", addr)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		return errors.Errorf("notify: %q returned %d", addr, resp.StatusCode)
+	}
+
+	return nil
 }
 
 func (c *Client) http() *http.Client {
@@ -295,9 +326,12 @@ func (s *Syncer) Totals() Totals {
 	return s.totals
 }
 
-// prefixState is the prune bookkeeping for one engine prefix: the peer's key set from the last
-// pass and, per local key, how many consecutive passes it has been absent from the peer.
+// prefixState is the per-engine-prefix sync state: a pass-serialization lock (a notify-driven
+// sync may race the maintenance-loop sync on the same prefix; racing installs could put an
+// older index over a newer one), the peer's key set from the last pass, and — per local key —
+// how many consecutive passes it has been absent from the peer.
 type prefixState struct {
+	pass   sync.Mutex // serializes Sync passes for this prefix
 	remote map[string]struct{}
 	miss   map[string]int
 }
@@ -313,6 +347,19 @@ func New(local backend.Backend, client *Client) *Syncer {
 // peer copy at least as new is installed. Unreachable peers are skipped; having no usable peer
 // index is a no-op, not an error.
 func (s *Syncer) Sync(ctx context.Context, enginePrefix string, peers []string, strict bool) (Stats, error) {
+	if enginePrefix == "" || !ValidKey(enginePrefix) {
+		return Stats{}, errors.Errorf("invalid engine prefix %q", enginePrefix)
+	}
+
+	s.mu.Lock()
+	ps := s.stateFor(enginePrefix)
+	s.mu.Unlock()
+
+	// One pass at a time per prefix: concurrent passes (a flush notify racing the maintenance
+	// tick) could install an older peer index over a newer one.
+	ps.pass.Lock()
+	defer ps.pass.Unlock()
+
 	st, err := s.sync(ctx, enginePrefix, peers, strict)
 	s.account(st, err)
 
@@ -438,6 +485,12 @@ func (s *Syncer) copyMissing(ctx context.Context, st *Stats, addr, enginePrefix,
 	var immutable, manifests, mutable []string
 
 	for _, k := range remote {
+		// A peer's listing is remote input: accept only well-formed keys under the prefix
+		// being synced. Anything else is dropped — a correct peer never produces it.
+		if !ValidKey(k) || !strings.HasPrefix(k, enginePrefix+"/") {
+			continue
+		}
+
 		switch {
 		case k == indexKey:
 			// installed by the caller, last

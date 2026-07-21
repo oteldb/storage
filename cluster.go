@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -50,6 +51,9 @@ type clusterNode struct {
 	retry      reliability.RetryConfig // transport reliability profile (timeouts, retries, hedging)
 	private    bool                    // per-node private backend: flushed parts sync node-to-node
 	psync      *partsync.Syncer        // part mirroring for private backends (nil when shared)
+
+	notifyMu   sync.Mutex          // guards notifyBusy
+	notifyBusy map[string]struct{} // engine prefixes with a notify-triggered sync in flight
 }
 
 // rfFor resolves the replication factor for one shard key: the tenant's
@@ -100,6 +104,133 @@ func (s *Storage) syncParts(ctx context.Context, tid signal.TenantID, signalPref
 	}
 
 	return st.Synced
+}
+
+// splitEnginePrefix parses an engine prefix ("{tenant}{signalPrefix}", e.g. "default/metrics")
+// back into the engine-map tenant key and its signal, rejecting anything else.
+func splitEnginePrefix(prefix string) (tid signal.TenantID, sig signal.Signal, ok bool) {
+	i := strings.LastIndex(prefix, "/")
+	if i <= 0 { // no separator, or empty tenant
+		return "", 0, false
+	}
+
+	switch "/" + prefix[i+1:] {
+	case metricsPrefix:
+		sig = signal.Metric
+	case logsPrefix:
+		sig = signal.Log
+	case tracesPrefix:
+		sig = signal.Trace
+	case profilesPrefix:
+		sig = signal.Profile
+	default:
+		return "", 0, false
+	}
+
+	return signal.TenantID(prefix[:i]), sig, true
+}
+
+// partsNotifyHandler receives an owner's flush notification (shared-nothing mode) and mirrors
+// the named engine prefix immediately — a replica converges right after the owner's flush
+// instead of on its next maintenance tick. The mirror runs asynchronously (202) and coalesces:
+// a prefix with a notify-triggered sync already in flight is dropped, since the periodic pull
+// is the anti-entropy source of truth anyway.
+func (s *Storage) partsNotifyHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
+			return
+		}
+
+		prefix := req.URL.Query().Get("prefix")
+
+		tid, sig, ok := splitEnginePrefix(prefix)
+		if !ok || !partsync.ValidKey(prefix) {
+			http.Error(w, "invalid prefix", http.StatusBadRequest)
+
+			return
+		}
+
+		cn := s.cluster
+		if cn == nil || !cn.private {
+			w.WriteHeader(http.StatusOK) // shared store: nothing to mirror, flush is already visible
+
+			return
+		}
+
+		cn.notifyMu.Lock()
+		if _, busy := cn.notifyBusy[prefix]; busy {
+			cn.notifyMu.Unlock()
+			w.WriteHeader(http.StatusAccepted) // coalesced: a sync for this prefix is in flight
+
+			return
+		}
+		cn.notifyBusy[prefix] = struct{}{}
+		cn.notifyMu.Unlock()
+
+		// The mirror deliberately detaches from the request context: the 202 returns now and
+		// the sync outlives the request (bounded by its own timeout below).
+		//nolint:contextcheck // intentional detach, see above
+		go func() {
+			defer func() {
+				cn.notifyMu.Lock()
+				delete(cn.notifyBusy, prefix)
+				cn.notifyMu.Unlock()
+			}()
+
+			ctx, cancel := context.WithTimeout(s.obs.Base(context.Background()), time.Minute)
+			defer cancel()
+
+			if !s.syncParts(ctx, tid, "/"+prefix[strings.LastIndex(prefix, "/")+1:], false) {
+				return
+			}
+
+			// Mirrored something: load it and trim the head, like the maintenance refresh.
+			if sig == signal.Metric {
+				if eng, ok := s.lookupEngine(tid); ok {
+					_ = eng.RefreshReplica(ctx)
+				}
+			} else if eng, ok := s.lookupRecordEngine(sig, tid); ok {
+				_ = eng.RefreshReplica(ctx)
+			}
+		}()
+
+		w.WriteHeader(http.StatusAccepted)
+	})
+}
+
+// notifyPeers tells the shard's secondary owners that this node just flushed/merged the engine
+// prefix, so their replicas mirror immediately (shared-nothing mode only). Best-effort and
+// asynchronous — an unreachable peer converges on its next maintenance tick.
+func (s *Storage) notifyPeers(ctx context.Context, tid signal.TenantID, signalPrefix string) {
+	if s.cluster == nil || !s.cluster.private {
+		return
+	}
+
+	_, remotes := s.shardOwners(tid)
+	if len(remotes) == 0 {
+		return
+	}
+
+	enginePrefix := string(s.normalizeTenant(tid)) + signalPrefix
+	client := &partsync.Client{HTTP: s.cluster.httpc}
+	log := s.obs.Logger(ctx)
+
+	for _, addr := range remotes {
+		// Detached on purpose: the notify must not block the maintenance pass, and its
+		// lifetime is its own short timeout, not the caller's.
+		//nolint:gosec,contextcheck // G118 / context: intentional detach, see above
+		go func() {
+			nctx, cancel := context.WithTimeout(s.obs.Base(context.Background()), 10*time.Second)
+			defer cancel()
+
+			if err := client.Notify(nctx, addr, enginePrefix); err != nil {
+				log.Debug("flush notify failed", zap.String("peer", addr),
+					zap.String("prefix", enginePrefix), zap.Error(err))
+			}
+		}()
+	}
 }
 
 // shardCount is the configured metric shards per tenant, clamped to a minimum of 1.
@@ -195,6 +326,7 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	// maintenance loop only when Config.PrivateBackend is set.
 	mux.Handle(partsync.ListPath, partsync.ListHandler(s.backend))
 	mux.Handle(partsync.ObjectPath, partsync.ObjectHandler(s.backend))
+	mux.Handle(partsync.NotifyPath, s.partsNotifyHandler())
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	go func() { _ = srv.Serve(ln) }()
@@ -225,6 +357,7 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 		retry:      rc,
 		private:    cfg.PrivateBackend,
 		psync:      partsync.New(s.backend, &partsync.Client{HTTP: httpc}),
+		notifyBusy: make(map[string]struct{}),
 	}
 
 	// Record rebalance plans at each shard's own (per-tenant) replication factor, so

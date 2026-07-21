@@ -1258,3 +1258,76 @@ func TestClusterSharedNothingReplicatesLogParts(t *testing.T) {
 	got := logBodies(t, replica.LogFetcher("default"), fetch.Request{Start: 0, End: 1 << 60})
 	assert.Equal(t, []string{"first", "second"}, got, "replica serves the logs from its own backend")
 }
+
+func TestSplitEnginePrefix(t *testing.T) {
+	t.Parallel()
+
+	for prefix, want := range map[string]struct {
+		tid signal.TenantID
+		sig signal.Signal
+	}{
+		"default/metrics":  {"default", signal.Metric},
+		"acme/logs":        {"acme", signal.Log},
+		"acme/_s3/traces":  {"acme/_s3", signal.Trace},
+		"default/profiles": {"default", signal.Profile},
+	} {
+		tid, sig, ok := splitEnginePrefix(prefix)
+		require.Truef(t, ok, "prefix %q parses", prefix)
+		assert.Equal(t, want.tid, tid)
+		assert.Equal(t, want.sig, sig)
+	}
+
+	for _, bad := range []string{"", "metrics", "/metrics", "default/unknown", "default/"} {
+		_, _, ok := splitEnginePrefix(bad)
+		assert.Falsef(t, ok, "prefix %q rejected", bad)
+	}
+}
+
+// TestClusterSharedNothingPushNotify proves the flush push-notification: after the primary's
+// maintenance pass, the replica mirrors the flushed part and trims its head WITHOUT running its
+// own maintenance — the owner's notify triggered the sync.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterSharedNothingPushNotify(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodePrivate(t, endpoint, "node-a", 2),
+		"node-b": openClusterNodePrivate(t, endpoint, "node-b", 2),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 2
+	}, 10*time.Second, 50*time.Millisecond)
+
+	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
+	require.NoError(t, err)
+
+	p, ok := a.cluster.membership.Ring().Primary([]byte("default"))
+	require.True(t, ok)
+	primary := nodes[p.ID]
+
+	var replica *Storage
+	for id, s := range nodes {
+		if id != p.ID {
+			replica = s
+		}
+	}
+
+	re, ok := replica.lookupEngine("default")
+	require.True(t, ok)
+	require.Equal(t, 0, re.PartCount(), "replica has no parts before the primary flushes")
+
+	primary.maintain(ctx) // flush + notify; the replica runs NO maintenance of its own
+
+	require.Eventually(t, func() bool {
+		return re.PartCount() == 1 && re.HeadSampleCount() == 0
+	}, 5*time.Second, 20*time.Millisecond,
+		"the notify-triggered sync mirrors the part and trims the replica head")
+
+	got := queryEngine(t, re, nameMatcher("http.requests"))
+	require.Len(t, got, 1)
+	assert.Equal(t, []int64{100, 200}, got[0].Timestamps, "replica serves the pushed part")
+}

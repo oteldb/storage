@@ -304,3 +304,92 @@ func TestHandlersRejectHostileKeys(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, keys, 1)
 }
+
+func TestClientNotify(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var got []string
+
+	mux := http.NewServeMux()
+	mux.Handle(partsync.NotifyPath, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		got = append(got, req.URL.Query().Get("prefix"))
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	c := &partsync.Client{}
+	require.NoError(t, c.Notify(ctx, addr, "default/metrics"))
+	assert.Equal(t, []string{"default/metrics"}, got)
+
+	// An erroring peer surfaces (the caller treats it as advisory).
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	t.Cleanup(bad.Close)
+	require.Error(t, c.Notify(ctx, strings.TrimPrefix(bad.URL, "http://"), "default/metrics"))
+}
+
+func TestSyncRejectsHostilePrefix(t *testing.T) {
+	t.Parallel()
+
+	s := partsync.New(backend.Memory(), &partsync.Client{})
+
+	for _, prefix := range []string{"", "../etc", "/abs/metrics", "a/../b/metrics"} {
+		_, err := s.Sync(context.Background(), prefix, []string{"127.0.0.1:1"}, false)
+		require.Errorf(t, err, "prefix %q rejected before any peer traffic", prefix)
+	}
+}
+
+func TestSyncDropsHostilePeerKeys(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	owner, replica := backend.Memory(), backend.Memory()
+
+	ix := &bucketindex.Index{}
+	writePart(t, owner, ix, "t/metrics", 1, 100, 200)
+	saveIndex(t, owner, "t/metrics", ix)
+
+	// A compromised peer lists keys outside the synced prefix and traversal-shaped names.
+	// The real ListHandler would never produce these; serve a hostile listing directly.
+	hostile := []string{
+		"t/metrics/0000000001/c/0", "t/metrics/0000000001/marks", "t/metrics/0000000001/manifest",
+		"t/metrics/" + bucketindex.Object,
+		"other-tenant/metrics/0000000009/manifest", // outside the synced prefix
+		"t/metrics/../../etc/passwd",               // traversal
+		"/abs/path",                                // absolute
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle(partsync.ListPath, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		buf := []byte{byte(len(hostile))}
+		for _, k := range hostile {
+			buf = append(buf, byte(len(k)))
+			buf = append(buf, k...)
+		}
+		_, _ = w.Write(buf)
+	}))
+	mux.Handle(partsync.ObjectPath, partsync.ObjectHandler(owner))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	s := partsync.New(replica, &partsync.Client{})
+	st, err := s.Sync(ctx, "t/metrics", []string{strings.TrimPrefix(srv.URL, "http://")}, false)
+	require.NoError(t, err)
+	require.True(t, st.Synced)
+
+	// The legitimate part mirrored; the out-of-prefix and traversal keys were dropped.
+	_, err = replica.Read(ctx, "t/metrics/0000000001/manifest")
+	require.NoError(t, err)
+	_, err = replica.Read(ctx, "other-tenant/metrics/0000000009/manifest")
+	require.ErrorIs(t, err, backend.ErrNotExist, "out-of-prefix key not mirrored")
+
+	keys, err := replica.List(ctx, "")
+	require.NoError(t, err)
+	for _, k := range keys {
+		assert.Truef(t, strings.HasPrefix(k, "t/metrics/"), "only synced-prefix keys exist locally, got %q", k)
+	}
+}
