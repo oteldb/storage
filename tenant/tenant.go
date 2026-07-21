@@ -127,8 +127,35 @@ type Precision struct {
 	Tiers []PrecisionTier
 }
 
+// ECScheme is a Reed-Solomon erasure-coding scheme for a tenant's flushed parts: each part
+// object is split into Data shards plus Parity parity shards, spread across Data+Parity
+// distinct owners; any Data of them reconstruct the object. It trades reconstruct-on-miss
+// read cost for storage: (Data+Parity)/Data of the logical size instead of RF full copies
+// (e.g. {4,2} survives 2 node losses at 1.5x). Applies only to flushed, immutable parts —
+// the unflushed head is always full-copy replicated. A nil *ECScheme means full-copy.
+type ECScheme struct {
+	// Data is the number of data shards (k). Must be ≥ 1.
+	Data int
+	// Parity is the number of parity shards (m); the scheme tolerates Parity node losses.
+	// Must be ≥ 1.
+	Parity int
+}
+
+// Durability is the per-tenant replication policy for the cluster layer: how many ring-owners
+// hold a tenant's data and how flushed parts are stored across them. Zero value ⇒ the
+// cluster-wide defaults (cluster.Config.RF, full-copy). Ignored in single-node mode.
+type Durability struct {
+	// RF is the replication factor: the number of ring-owners for the tenant's shards
+	// (primary + RF-1 replicas). Zero ⇒ the cluster default; values are clamped to the
+	// membership size at lookup time.
+	RF int
+	// EC, when non-nil, erasure-codes the tenant's flushed parts instead of storing RF
+	// full copies. Nil ⇒ full-copy replication.
+	EC *ECScheme
+}
+
 // Policy is the resolved policy for a tenant: limits, retention, downsampling, sampling,
-// recompression, and routing. It is the return value of [Resolver.Resolve].
+// recompression, durability, and routing. It is the return value of [Resolver.Resolve].
 type Policy struct {
 	Limits     Limits
 	Retention  Retention
@@ -136,6 +163,7 @@ type Policy struct {
 	Sampling   Sampling
 	Recompress Recompress
 	Precision  Precision
+	Durability Durability
 	// RoutingHints TODO(M6): per-tenant shard placement / zone preferences.
 }
 

@@ -49,6 +49,19 @@ type clusterNode struct {
 	retry      reliability.RetryConfig // transport reliability profile (timeouts, retries, hedging)
 }
 
+// rfFor resolves the replication factor for one shard key: the tenant's
+// [tenant.Durability] RF when set, else the cluster-wide default (cluster.Config.RF).
+// Policy is per real tenant — a shard key ({tenant}/_s{idx}) collapses via tenantOfShard —
+// so every shard of a tenant shares one RF. The ring clamps the result to the membership
+// size at lookup time.
+func (s *Storage) rfFor(shardKey signal.TenantID) int {
+	if rf := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(shardKey))).Durability.RF; rf > 0 {
+		return rf
+	}
+
+	return s.cluster.rf
+}
+
 // shardCount is the configured metric shards per tenant, clamped to a minimum of 1.
 func (n *clusterNode) shardCount() int {
 	if n.shards < 1 {
@@ -213,7 +226,7 @@ func (s *Storage) clusterFetcherFor(tid signal.TenantID) fetch.Fetcher {
 // copy is complete; matchers are re-applied to the returned superset).
 func (s *Storage) shardFetcher(shardKey signal.TenantID) fetch.Fetcher {
 	cn := s.cluster
-	owners := cn.membership.Ring().Lookup([]byte(shardKey), cn.rf)
+	owners := cn.membership.Ring().Lookup([]byte(shardKey), s.rfFor(shardKey))
 
 	var remotes []fetch.Fetcher
 	for _, o := range owners {
@@ -326,7 +339,7 @@ func (s *Storage) shardAggregate(
 	ctx context.Context, shardKey signal.TenantID, r fetch.Request, step int64,
 ) ([]engine.NamedAgg, error) {
 	cn := s.cluster
-	owners := cn.membership.Ring().Lookup([]byte(shardKey), cn.rf)
+	owners := cn.membership.Ring().Lookup([]byte(shardKey), s.rfFor(shardKey))
 
 	for _, o := range owners {
 		if cn.membership.AddrOf(o.ID) == cn.self { // owner: serve locally
@@ -504,7 +517,7 @@ func (s *Storage) clusterProfileFetcherFor(tid signal.TenantID) fetch.Fetcher {
 // of the remote owners. The key is used verbatim (already normalized, possibly a shard key).
 func (s *Storage) shardOwners(shardKey signal.TenantID) (local bool, remotes []string) {
 	cn := s.cluster
-	for _, o := range cn.membership.Ring().Lookup([]byte(shardKey), cn.rf) {
+	for _, o := range cn.membership.Ring().Lookup([]byte(shardKey), s.rfFor(shardKey)) {
 		addr := cn.membership.AddrOf(o.ID)
 
 		switch {
@@ -804,7 +817,7 @@ func (s *Storage) shardRecordFetcher(
 	sig signal.Signal, shardKey signal.TenantID, lookup func(signal.TenantID) (*recordengine.Engine, bool),
 ) fetch.Fetcher {
 	cn := s.cluster
-	owners := cn.membership.Ring().Lookup([]byte(shardKey), cn.rf)
+	owners := cn.membership.Ring().Lookup([]byte(shardKey), s.rfFor(shardKey))
 
 	var remotes []fetch.Fetcher
 	for _, o := range owners {
@@ -1144,7 +1157,8 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 		return primaryReject{}, errors.Wrapf(err, "primary apply for tenant %q", tenant)
 	}
 
-	owners := s.cluster.membership.Ring().Lookup([]byte(tenant), s.cluster.rf)
+	rf := s.rfFor(signal.TenantID(tenant))
+	owners := s.cluster.membership.Ring().Lookup([]byte(tenant), rf)
 
 	var targets []replica.Target
 	for _, o := range owners {
@@ -1155,7 +1169,7 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 
 	// The primary already holds one durable copy; it needs RF/2 more from secondaries, bounded
 	// by how many are actually available (availability over strict durability when nodes are down).
-	needAcks := min(s.cluster.rf/2, len(targets))
+	needAcks := min(rf/2, len(targets))
 	if err := s.cluster.replicator.ReplicateQuorum(ctx, targets, cluster.EncodeWrite(sig, tenant, accepted), needAcks); err != nil {
 		return rej, errors.Wrapf(err, "replicate tenant %q", tenant)
 	}
