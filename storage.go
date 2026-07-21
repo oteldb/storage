@@ -1135,15 +1135,27 @@ func (s *Storage) maintain(ctx context.Context) {
 	// maintainEngine flushes then merges one engine, unless this node is a non-owning replica (then
 	// it only refreshes from the shared store). merge is signal-specific: metrics carry downsampling
 	// (engine.MergeWith), the record signals carry retention only.
-	maintainEngine := func(tid signal.TenantID, flush, merge, refresh func() error) {
+	//
+	// With a private (per-node) backend, flushed parts are not visible through a shared store, so
+	// the replica first mirrors the owner's backend objects (partsync) and then refreshes from its
+	// own backend; the owner backfills strictly-newer peer parts before compacting, so a
+	// newly-gained owner never restarts a shard's part sequence from scratch.
+	maintainEngine := func(tid signal.TenantID, signalPrefix string, flush, merge, refresh func() error) {
 		if owned != nil {
 			if _, ok := owned[tid]; !ok {
 				// A replica, not the compaction owner: pull the owner's flushed parts and trim the
 				// head to the unflushed window, bounding memory.
+				s.syncParts(ctx, tid, signalPrefix, false)
 				_ = refresh()
 
 				return
 			}
+		}
+
+		if s.syncParts(ctx, tid, signalPrefix, true) {
+			// Backfilled parts from a peer (this node just gained the shard): reload them before
+			// flushing so the part sequence advances past the synced parts.
+			_ = refresh()
 		}
 
 		_ = flush()
@@ -1162,25 +1174,25 @@ func (s *Storage) maintain(ctx context.Context) {
 
 	for tid, eng := range metricEngines {
 		tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
-			maintainEngine(tid, func() error { return eng.Flush(ctx) },
+			maintainEngine(tid, metricsPrefix, func() error { return eng.Flush(ctx) },
 				func() error { return eng.MergeWith(ctx, s.metricMergeOptions(tid)) },
 				func() error { return eng.RefreshReplica(ctx) })
 		}})
 	}
 
-	addRecord := func(engines map[signal.TenantID]*recordengine.Engine) {
+	addRecord := func(engines map[signal.TenantID]*recordengine.Engine, signalPrefix string) {
 		for tid, eng := range engines {
 			tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
-				maintainEngine(tid, func() error { return eng.Flush(ctx) },
+				maintainEngine(tid, signalPrefix, func() error { return eng.Flush(ctx) },
 					func() error { return eng.Merge(ctx, s.retainFrom(tid)) },
 					func() error { return eng.RefreshReplica(ctx) })
 			}})
 		}
 	}
 
-	addRecord(logEngines)
-	addRecord(traceEngines)
-	addRecord(profileEngines)
+	addRecord(logEngines, logsPrefix)
+	addRecord(traceEngines, tracesPrefix)
+	addRecord(profileEngines, profilesPrefix)
 
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].pressure > tasks[j].pressure })
 

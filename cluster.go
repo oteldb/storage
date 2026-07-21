@@ -18,6 +18,7 @@ import (
 
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
+	"github.com/oteldb/storage/cluster/partsync"
 	"github.com/oteldb/storage/cluster/replica"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/obs"
@@ -47,6 +48,8 @@ type clusterNode struct {
 	rf         int
 	shards     int                     // metric shards per tenant (≤1 ⇒ one shard = the tenant)
 	retry      reliability.RetryConfig // transport reliability profile (timeouts, retries, hedging)
+	private    bool                    // per-node private backend: flushed parts sync node-to-node
+	psync      *partsync.Syncer        // part mirroring for private backends (nil when shared)
 }
 
 // rfFor resolves the replication factor for one shard key: the tenant's
@@ -60,6 +63,43 @@ func (s *Storage) rfFor(shardKey signal.TenantID) int {
 	}
 
 	return s.cluster.rf
+}
+
+// syncParts mirrors one engine prefix from the shard's peer owners into this node's private
+// backend (cluster/partsync), reporting whether anything was mirrored. It is the shared-nothing
+// counterpart of reading flushed parts from a shared store: a replica mirrors its owner's
+// objects before each refresh (strict=false), and a compaction owner backfills strictly-newer
+// peer parts before it flushes (strict=true — a stale peer copy must never overwrite the
+// owner's own newer index). A no-op in single-node mode, with a shared backend, or when the
+// shard has no reachable peers; errors are swallowed like the rest of the maintenance loop
+// (the next pass retries).
+func (s *Storage) syncParts(ctx context.Context, tid signal.TenantID, signalPrefix string, strict bool) bool {
+	if s.cluster == nil || !s.cluster.private {
+		return false
+	}
+
+	_, remotes := s.shardOwners(tid)
+	if len(remotes) == 0 {
+		return false
+	}
+
+	enginePrefix := string(s.normalizeTenant(tid)) + signalPrefix
+
+	st, err := s.cluster.psync.Sync(ctx, enginePrefix, remotes, strict)
+	if err != nil {
+		s.obs.Logger(ctx).Warn("part sync failed",
+			zap.String("prefix", enginePrefix), zap.Bool("strict", strict), zap.Error(err))
+
+		return false
+	}
+
+	if st.Synced && st.Copied > 0 {
+		s.obs.Logger(ctx).Debug("part sync mirrored peer objects",
+			zap.String("prefix", enginePrefix), zap.Bool("strict", strict),
+			zap.Int("copied", st.Copied), zap.Int64("bytes", st.CopiedBytes), zap.Int("pruned", st.Pruned))
+	}
+
+	return st.Synced
 }
 
 // shardCount is the configured metric shards per tenant, clamped to a minimum of 1.
@@ -150,6 +190,11 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(s.localSeries))          // record-signal series enumeration (log/trace/profile)
 	mux.Handle(cluster.KeysPath, cluster.KeysHandler(s.localKeys))                // record-signal attribute-key enumeration
 	mux.Handle(cluster.SidePath, cluster.SideHandler(s.localProfileSymbols))      // profile symbol store
+	// Part mirroring for per-node private backends: peers list and fetch this node's backend
+	// objects. Mounted unconditionally (read-only; useful for operator inspection), used by the
+	// maintenance loop only when Config.PrivateBackend is set.
+	mux.Handle(partsync.ListPath, partsync.ListHandler(s.backend))
+	mux.Handle(partsync.ObjectPath, partsync.ObjectHandler(s.backend))
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	go func() { _ = srv.Serve(ln) }()
@@ -178,6 +223,8 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 		rf:         rf,
 		shards:     cfg.ShardsPerTenant,
 		retry:      rc,
+		private:    cfg.PrivateBackend,
+		psync:      partsync.New(s.backend, &partsync.Client{HTTP: httpc}),
 	}
 
 	return nil
