@@ -987,6 +987,16 @@ private backends and the durability capstone: RF=3 over three private disks, the
 flushes and is permanently lost, and every flushed sample stays queryable from each survivor's
 own backend.
 
+**Erasure coding (in progress).** `cluster/ec` is the codec-and-framing layer for
+erasure-coded flushed parts (`tenant.Durability.EC`): systematic Reed-Solomon over
+`klauspost/reedsolomon` behind a small package surface (`Encode`/`Reconstruct`/`Join`,
+`Scheme{Data,Parity}` capped at 256 total shards), plus the per-part `Meta` sidecar
+(scheme + each coded object's size and per-shard xxh3 checksums, whole-payload
+checksummed, fuzzed and golden-tested). An object split into Data+Parity shards survives
+any Parity losses at (Data+Parity)/Data storage. Placement (shard slot per ring owner),
+the reconstructing read path, and repair are later milestones — no engine or partsync
+code consumes the codec yet.
+
 Closed parity items: the write path is primary-authoritative, so the OOO decision is made once
 by the shard primary (`engine.ApplyPrimary`) and secondaries apply the accepted set verbatim
 (`engine.ApplyReplicated`); replica heads are trimmed to the unflushed window after the owner
@@ -1562,6 +1572,7 @@ cluster/              L0 distribution: ring + membership + (later) replication �
   cluster/etcd        etcd-backed live membership (lease + watch → atomic ring)          [implemented; embedded-etcd tested]
   cluster/replica     quorum write-replication + node-to-node HTTP transport             [implemented]
   cluster/partsync    shared-nothing flushed-part mirroring between private backends     [implemented]
+  cluster/ec          Reed-Solomon codec + per-part Meta sidecar for erasure-coded parts [codec implemented; placement/read/repair pending]
   cluster/rebalance   minimal ownership-handoff plan from a ring diff (pure)              [implemented]
   cluster/etcd (ownership.go) exclusive compaction claims (CAS+lease) — the rebalance executor [implemented]
   cluster/            cluster write path: EncodeWrite codec + Writer + Config             [implemented]
