@@ -690,6 +690,7 @@ func TestInspectClusterSection(t *testing.T) {
 	require.Len(t, ss.Cluster.Members, 1)
 	assert.Equal(t, "node-a", ss.Cluster.Members[0].ID)
 	assert.Contains(t, ss.Cluster.Owned, "default", "the sole node owns the tenant's shard")
+	assert.Nil(t, ss.Cluster.PartSync, "shared backend ⇒ no part-sync section")
 }
 
 // TestAdminCompactOwnershipGate verifies the Admin flush/compact ownership gate: a node that is not
@@ -1129,6 +1130,21 @@ func TestClusterSharedNothingReplicatesParts(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Equal(t, []int64{100, 200}, got[0].Timestamps)
 	assert.Equal(t, []float64{1, 2}, got[0].Values)
+
+	// The mirroring shows up in the replica's operator stats (Inspect → Cluster.PartSync).
+	ps := replica.Inspect().Cluster.PartSync
+	require.NotNil(t, ps, "private backend ⇒ part-sync stats present")
+	assert.Positive(t, ps.Passes, "sync loop ran")
+	assert.Positive(t, ps.Mirrored, "a peer copy was installed")
+	assert.Positive(t, ps.Copied, "objects were fetched")
+	assert.Positive(t, ps.CopiedBytes)
+	assert.Positive(t, ps.LastSyncUnixNano, "staleness probe set")
+	assert.Zero(t, ps.Errors)
+
+	// The shared-store primary path reports too (its strict backfill passes are no-ops).
+	pps := primary.Inspect().Cluster.PartSync
+	require.NotNil(t, pps)
+	assert.Zero(t, pps.Mirrored, "the owner had nothing to backfill")
 }
 
 // TestClusterSharedNothingSurvivesNodeLoss is the durability capstone for shared-nothing mode:
