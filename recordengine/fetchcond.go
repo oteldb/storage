@@ -14,8 +14,6 @@ import (
 // [lazyCols.colValue] is the deliberate byte-for-byte twin of this over a lazy dictionary-column
 // source; the two are kept separate (not factored through a shared accessor) because this runs in
 // the per-row scan hot path, where accessor closures measurably regress it.
-//
-//nolint:dupl // intentional hot-path twin of lazyCols.colValue; see the doc above.
 func (c *recordCols) colValue(i int, name string) (signal.Value, bool) {
 	if name == colTs {
 		return signal.IntValue(c.ts[i]), true

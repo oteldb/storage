@@ -5,6 +5,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/query/fetch"
 )
 
 func TestTSWindow(t *testing.T) {
@@ -45,6 +48,80 @@ func TestTSWindow(t *testing.T) {
 				assert.GreaterOrEqual(t, ts[i], tt.start, "row %d in window", i)
 				assert.LessOrEqual(t, ts[i], tt.end, "row %d in window", i)
 			}
+		})
+	}
+}
+
+// eqFastPathSchema has two raw fixed-width byte columns (rawA, rawB) and one dict-coded one
+// (dictC), for exercising every way [eqFastPathCols] can accept or reject a condition.
+var eqFastPathSchema = NewSchema(
+	Column{Name: "rawA", Kind: KindBytes, Codec: chunk.CodecBytesRaw},
+	Column{Name: "rawB", Kind: KindBytes, Codec: chunk.CodecBytesRaw},
+	Column{Name: "dictC", Kind: KindBytes, Codec: chunk.CodecDict},
+)
+
+func eqCond(column, value string) fetch.Condition {
+	return fetch.Condition{Column: column, Equal: &fetch.EqualMatcher{Name: column, Value: value}}
+}
+
+func TestEqFastPathCols(t *testing.T) {
+	t.Parallel()
+
+	need16 := "0123456789abcdef" // exactly 16 bytes, the EqualFixed16 kernel width
+
+	tests := []struct {
+		name  string
+		conds []fetch.Condition
+		want  map[int]int // byte column idx -> condition idx
+	}{
+		{
+			name:  "qualifies",
+			conds: []fetch.Condition{eqCond("rawA", need16)},
+			want:  map[int]int{0: 0},
+		},
+		{
+			name:  "wrong codec (dict) is rejected",
+			conds: []fetch.Condition{eqCond("dictC", need16)},
+			want:  map[int]int{},
+		},
+		{
+			name:  "needle not 16 bytes is rejected",
+			conds: []fetch.Condition{eqCond("rawA", "short")},
+			want:  map[int]int{},
+		},
+		{
+			name:  "no Equal hint is rejected",
+			conds: []fetch.Condition{{Column: "rawA"}},
+			want:  map[int]int{},
+		},
+		{
+			name:  "column also projected still qualifies (rawBlob serves phase 2 too)",
+			conds: []fetch.Condition{eqCond("rawA", need16)},
+			want:  map[int]int{0: 0},
+		},
+		{
+			name:  "column targeted by two conditions is rejected for both",
+			conds: []fetch.Condition{eqCond("rawB", need16), eqCond("rawB", need16)},
+			want:  map[int]int{},
+		},
+		{
+			name:  "unrelated column (attrs key) is ignored, not a panic",
+			conds: []fetch.Condition{eqCond("not-a-column", need16)},
+			want:  map[int]int{},
+		},
+		{
+			name:  "two independent qualifying columns both fast-path",
+			conds: []fetch.Condition{eqCond("rawA", need16), eqCond("rawB", need16)},
+			want:  map[int]int{0: 0, 1: 1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := eqFastPathCols(eqFastPathSchema, tt.conds)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
