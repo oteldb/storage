@@ -997,3 +997,63 @@ func TestClusterExplainAnalyzeRemote(t *testing.T) {
 	require.NotNil(t, remote, "the peer's subtree was grafted")
 	require.NotNil(t, findNode(remote, "engine.fetch"), "owner's engine.fetch nests under the remote node")
 }
+
+// TestClusterPerTenantRF verifies the per-tenant durability policy: a tenant whose
+// [tenant.Durability] sets RF=3 is replicated to every node of a 3-node cluster even though the
+// cluster-wide default is RF=2, and rfFor falls back to the cluster default for a tenant with a
+// zero policy.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterPerTenantRF(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	// Every tenant resolves to RF=3 (the "gold" durability tier); the cluster default stays 2.
+	gold := WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+		return tenant.Policy{Durability: tenant.Durability{RF: 3}}
+	}))
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodeWith(t, endpoint, "node-a", backend.Memory(), gold),
+		"node-b": openClusterNodeWith(t, endpoint, "node-b", backend.Memory(), gold),
+		"node-c": openClusterNodeWith(t, endpoint, "node-c", backend.Memory(), gold),
+	}
+
+	require.Eventually(t, func() bool {
+		for _, s := range nodes {
+			if len(s.cluster.membership.Members()) != 3 {
+				return false
+			}
+		}
+
+		return true
+	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+
+	a := nodes["node-a"]
+	require.Equal(t, 3, a.rfFor("default"), "policy RF overrides the cluster default")
+	require.Equal(t, 3, a.rfFor("default/_s1"), "a shard key resolves its tenant's RF")
+
+	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
+	require.NoError(t, err)
+
+	// With RF=3 every node is an owner: each node's local engine independently holds the series
+	// (localFetch never fans out, so this proves replication, not read fan-out).
+	for name, s := range nodes {
+		require.Eventuallyf(t, func() bool {
+			got, err := s.localFetch(ctx, "default", 0, 1<<60, []fetch.Matcher{nameMatcher("http.requests")})
+
+			return err == nil && len(got) == 1
+		}, 10*time.Second, 50*time.Millisecond, "%s holds the replicated series locally", name)
+	}
+}
+
+// TestClusterRFDefaultsWithoutPolicy pins the fallback: with no tenancy resolver the cluster-wide
+// RF applies unchanged.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterRFDefaultsWithoutPolicy(t *testing.T) {
+	endpoint := startEtcd(t)
+
+	s := openClusterNode(t, endpoint, "node-a") // cluster.Config.RF = 2, no Tenancy
+	require.Equal(t, 2, s.rfFor("default"), "zero durability policy falls back to cluster RF")
+}

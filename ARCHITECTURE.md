@@ -855,6 +855,14 @@ zero round-trips), and it **records the `rebalance.Plan` it enacted** at each ri
 informational-only — it is the published handoff record (and the same pure diff a preview API
 can compute against two rings).
 
+**RF is resolved per tenant.** Every owner lookup (write replication, read fan-out, failover
+address lists) resolves the shard's replication factor through `rfFor`: the tenant's
+`tenant.Durability.RF` when set, else the cluster-wide `Config.RF` default — so one cluster can
+hold RF=3 "gold" tenants next to RF=1 throwaway tenants. Policy is per real tenant (a shard key
+collapses via `tenantOfShard`, like retention/downsampling), so all of a tenant's shards share
+one RF; `ring.Lookup(key, rf)` takes rf per call, so placement needs no ring change. The
+compaction-claim executor still tracks the primary only (rf=1), independent of replica RF.
+
 **The cluster write path is primary-authoritative.** A write is framed as `EncodeWrite`
 (tenant ‖ WAL-encoded series+samples) and routed to the tenant's **ring-primary** — the single
 authority for the shard. The primary applies it via `engine.ApplyPrimary`, which OOO-checks each
@@ -1369,7 +1377,10 @@ query-language path stays in the embedder. The `Write*` methods take the library
   of `DownsampleTier{After, Interval, Agg}` rollup bands, applied at merge time — §3f), `Sampling`
   (the lossy budget — §3k), `Recompress` (cold-data zstd recompression at merge — §3f), `Precision`
   (a list of `PrecisionTier{After, Bits}` age-banded *lossy* float-precision budgets, applied at merge
-  so only old data trades accuracy for size — §3f), and the
+  so only old data trades accuracy for size — §3f), `Durability` (per-tenant replication
+  policy: `RF` overrides the cluster-wide replication factor for the tenant's shards, zero ⇒
+  the cluster default; `EC *ECScheme{Data, Parity}` reserves the erasure-coding scheme for
+  flushed parts, not yet consumed by the engine), and the
   composed `Policy`, resolved per tenant id through a `Resolver` (`ResolverFunc` adapter;
   `Default()` returns an empty-policy resolver). Multi-tenancy, retention, and
   downsampling are consumer-supplied callbacks keyed by tenant id.
@@ -1487,7 +1498,7 @@ signal/               typed Attributes/Value, Resource/Scope/Series identity, 12
   signal/trace        []byte-based OTLP-shaped Traces ingest batch (resettable/pooled) + span schema + projection (nested-set, events/links) [implemented]
   signal/profile      []byte-based OTLP-shaped Profiles ingest batch + sample schema (type folded into identity) + projection + content-addressed symbol store (SideStore) + stack Resolver [implemented]
 otlp/pdataconv        optional OTel-Go bridge: pmetric.Metrics → metric.Metrics; gauge/sum direct + histogram/exp-histogram/summary classic decomposition (only package importing pdata) [implemented]
-tenant/               Limits/Retention/Downsample/Sampling/Recompress/Precision/Policy, Resolver     [implemented]
+tenant/               Limits/Retention/Downsample/Sampling/Recompress/Precision/Durability/Policy, Resolver [implemented]
 backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + memory + read cache (root) [implemented]
   backend/file        directory-tree backend; atomic write + exclusive PutIfAbsent (os.Link) [implemented]
   backend/s3          object-store-native backend over ObjectStore + aws-sdk-go-v2 adapter   [implemented; in-process go-faster/fs S3 integration test]
