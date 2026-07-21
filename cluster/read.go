@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 
 	"github.com/go-faster/errors"
 
@@ -477,7 +478,8 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Itera
 
 	payload := EncodeFetchRequest(f.sig, string(r.Tenant), r.Start, r.End, eq)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+f.addr+ReadPath, bytes.NewReader(payload))
+	u := (&url.URL{Scheme: "http", Host: f.addr}).JoinPath(ReadPath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
 	if err != nil {
 		return nil, errors.Wrap(err, "build request")
 	}

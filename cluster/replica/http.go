@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/url"
 
 	"github.com/go-faster/errors"
 
@@ -31,9 +32,9 @@ func NewHTTPTransport(client *http.Client) Transport {
 }
 
 func (t *httpTransport) Send(ctx context.Context, addr string, payload []byte) error {
-	url := "http://" + addr + ReplicatePath
+	u := (&url.URL{Scheme: "http", Host: addr}).JoinPath(ReplicatePath)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
 	if err != nil {
 		return errors.Wrap(err, "build request")
 	}

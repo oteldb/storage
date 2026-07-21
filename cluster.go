@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -1417,7 +1418,8 @@ func (s *Storage) sendPrimaryWrite(ctx context.Context, addr string, payload []b
 	s.obs.Logger(ctx).Debug("primary-write send", zap.String("addr", addr), zap.Int("bytes", len(payload)))
 
 	return retry.Do(ctx, s.writePolicy(ctx, rpcOpWrite), func(ctx context.Context) (primaryReject, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+primaryWritePath, bytes.NewReader(payload))
+		u := (&url.URL{Scheme: "http", Host: addr}).JoinPath(primaryWritePath)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
 		if err != nil {
 			return primaryReject{}, errors.Wrap(err, "build primary-write request")
 		}

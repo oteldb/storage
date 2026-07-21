@@ -45,19 +45,17 @@ func freeAddr(t *testing.T) string {
 func startEtcd(t *testing.T) string {
 	t.Helper()
 
-	clientURL := "http://" + freeAddr(t)
-	peerURL := "http://" + freeAddr(t)
-	lc, _ := url.Parse(clientURL)
-	lp, _ := url.Parse(peerURL)
+	lc := url.URL{Scheme: "http", Host: freeAddr(t)}
+	lp := url.URL{Scheme: "http", Host: freeAddr(t)}
 
 	cfg := embed.NewConfig()
 	cfg.Dir = t.TempDir()
 	cfg.LogLevel = "error"
-	cfg.ListenClientUrls = []url.URL{*lc}
-	cfg.AdvertiseClientUrls = []url.URL{*lc}
-	cfg.ListenPeerUrls = []url.URL{*lp}
-	cfg.AdvertisePeerUrls = []url.URL{*lp}
-	cfg.InitialCluster = cfg.Name + "=" + peerURL
+	cfg.ListenClientUrls = []url.URL{lc}
+	cfg.AdvertiseClientUrls = []url.URL{lc}
+	cfg.ListenPeerUrls = []url.URL{lp}
+	cfg.AdvertisePeerUrls = []url.URL{lp}
+	cfg.InitialCluster = cfg.Name + "=" + lp.String()
 
 	e, err := embed.StartEtcd(cfg)
 	require.NoError(t, err)
@@ -69,7 +67,7 @@ func startEtcd(t *testing.T) string {
 		t.Fatal("embedded etcd did not become ready")
 	}
 
-	return clientURL
+	return lc.String()
 }
 
 func openClusterNode(t *testing.T, endpoint, id string) *Storage {
