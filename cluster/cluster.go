@@ -22,6 +22,14 @@ type Config struct {
 	ShardsPerTenant int
 	// Root is the etcd key prefix for this cluster's state. Empty ⇒ "/oteldb".
 	Root string
+	// PrivateBackend declares that this node's backend is private to it (a local disk, not a
+	// shared object store): peers cannot read the parts this node flushes. The cluster then
+	// replicates flushed parts node-to-node — replicas mirror their owner's backend objects
+	// over the parts endpoints (cluster/partsync) instead of loading them from a shared store,
+	// and an owner backfills from its peers before compacting. False (the default) keeps the
+	// shared-store model: flushed parts are exchanged through the backend, never over the
+	// cluster transport.
+	PrivateBackend bool
 }
 
 // DefaultRF is the replication factor used when [Config.RF] is unset.

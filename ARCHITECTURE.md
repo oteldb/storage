@@ -943,6 +943,39 @@ sets it for `=` matchers). The read RPC forwards the equality specs; the peer re
 `__name__="metric"` on the owner instead of pulling the whole window. Non-equality matchers are
 not forwarded; the requester's re-check still applies them.
 
+**Shared-nothing part replication** (`cluster/partsync`, `Config.PrivateBackend`). The default
+cluster model assumes a **shared** object store: only the unflushed head crosses the cluster
+transport, and flushed parts are exchanged through the backend (a replica `RefreshReplica`s from
+the store; a rebalance is an ownership handoff with no data copy). Setting
+`Config.PrivateBackend` declares the backend **per-node private** (a local disk): peers cannot
+read this node's flushed parts, so the cluster replicates them node-to-node instead. Two
+read-only HTTP endpoints (mounted on the node's internal server next to the replicate/read
+handlers) serve the node's backend: `partsync.ListPath` (key listing under a prefix, uvarint
+framing, fuzzed) and `partsync.ObjectPath` (one object verbatim, with an xxh3 checksum header
+the client verifies — ClickHouse's `DataPartsExchange` checksum discipline). A
+`partsync.Syncer` **mirrors an engine prefix from the newest peer copy**: it fetches every
+peer's bucket index, picks the newest (highest part sequence, then flushed epoch), copies the
+objects it lacks — within a part the manifest is copied after the part's other objects, and the
+bucket index is installed after everything, so the local index only ever references
+fully-copied parts (the flush commit-point discipline; a crashed sync leaves an unreferenced
+orphan retried next pass) — and re-fetches the mutable identity objects
+(`series.bin`/`streams.bin`). The engine layer is untouched: partsync moves backend objects,
+then the ordinary `RefreshReplica`/`LoadParts` path loads them, and because the head is trimmed
+only below parts the engine actually loaded, pull-before-trim can never drop an unflushed
+sample. In the maintenance loop a **replica mirrors before each refresh** (any differing peer
+copy at least as new is installed), while a **compaction owner backfills before it flushes**,
+strictly — a peer copy must be strictly newer than the local one, so a stale replica can never
+regress the owner's index, but a newly-gained owner adopts the previous owner's parts (and its
+part-sequence watermark) instead of restarting the shard from scratch. Stale local objects the
+peer no longer lists (superseded by a merge) are pruned only after **two consecutive absent
+passes** — quarantine-by-delay, giving in-flight readers a full maintenance cycle to drain.
+Sync is **signal-agnostic** (it mirrors whatever objects live under `{tenant}/{signal}`), so
+metric parts with their `sidx`/`stats` sidecars and record parts with blooms/`keys.bin`/symbol
+sidecars replicate identically. End-to-end tests cover metric and log part mirroring over
+private backends and the durability capstone: RF=3 over three private disks, the primary
+flushes and is permanently lost, and every flushed sample stays queryable from each survivor's
+own backend.
+
 Closed parity items: the write path is primary-authoritative, so the OOO decision is made once
 by the shard primary (`engine.ApplyPrimary`) and secondaries apply the accepted set verbatim
 (`engine.ApplyReplicated`); replica heads are trimmed to the unflushed window after the owner
@@ -1517,6 +1550,7 @@ cluster/              L0 distribution: ring + membership + (later) replication �
   cluster/ring        rendezvous (HRW) hashing: deterministic placement, ~1/N movement, zone-aware replica spread [implemented]
   cluster/etcd        etcd-backed live membership (lease + watch → atomic ring)          [implemented; embedded-etcd tested]
   cluster/replica     quorum write-replication + node-to-node HTTP transport             [implemented]
+  cluster/partsync    shared-nothing flushed-part mirroring between private backends     [implemented]
   cluster/rebalance   minimal ownership-handoff plan from a ring diff (pure)              [implemented]
   cluster/etcd (ownership.go) exclusive compaction claims (CAS+lease) — the rebalance executor [implemented]
   cluster/            cluster write path: EncodeWrite codec + Writer + Config             [implemented]

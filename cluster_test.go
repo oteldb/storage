@@ -1057,3 +1057,188 @@ func TestClusterRFDefaultsWithoutPolicy(t *testing.T) {
 	s := openClusterNode(t, endpoint, "node-a") // cluster.Config.RF = 2, no Tenancy
 	require.Equal(t, 2, s.rfFor("default"), "zero durability policy falls back to cluster RF")
 }
+
+// openClusterNodePrivate opens a clustered node with its own private in-memory backend and
+// PrivateBackend set: the shared-nothing mode, where flushed parts replicate node-to-node.
+func openClusterNodePrivate(t *testing.T, endpoint, id string, rf int) *Storage {
+	t.Helper()
+
+	s, err := Open(context.Background(), Options{}, WithBackend(backend.Memory()), WithCluster(&cluster.Config{
+		Etcd:           []string{endpoint},
+		Self:           etcd.Member{ID: id, Addr: freeAddr(t)},
+		RF:             rf,
+		PrivateBackend: true,
+	}))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	return s
+}
+
+// TestClusterSharedNothingReplicatesParts is the shared-nothing analog of
+// TestClusterReplicaTrimsHeadAfterOwnerFlush: with per-node PRIVATE backends (no shared store),
+// after the primary flushes, the replica's maintenance pass mirrors the flushed part objects
+// over the partsync endpoints into its own backend, loads them, and trims its head — same
+// convergence, no shared store involved.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterSharedNothingReplicatesParts(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodePrivate(t, endpoint, "node-a", 2),
+		"node-b": openClusterNodePrivate(t, endpoint, "node-b", 2),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 2
+	}, 10*time.Second, 50*time.Millisecond)
+
+	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
+	require.NoError(t, err)
+
+	p, ok := a.cluster.membership.Ring().Primary([]byte("default"))
+	require.True(t, ok)
+	primary := nodes[p.ID]
+
+	var replica *Storage
+	for id, s := range nodes {
+		if id != p.ID {
+			replica = s
+		}
+	}
+
+	primary.maintain(ctx) // primary flushes to its own private backend
+	pe, _ := primary.lookupEngine("default")
+	require.Equal(t, 1, pe.PartCount(), "primary flushed a part")
+
+	replica.maintain(ctx) // replica mirrors the part objects and trims its head
+	re, _ := replica.lookupEngine("default")
+	assert.Equal(t, 1, re.PartCount(), "replica mirrored the part into its private backend")
+	assert.Equal(t, 0, re.HeadSampleCount(), "replica head trimmed to the unflushed window")
+
+	// The replica serves the full series from its own backend — no shared store anywhere.
+	it, err := replica.Fetcher("default").Fetch(ctx, fetch.Request{
+		Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{nameMatcher("http.requests")},
+	})
+	require.NoError(t, err)
+	got, err := fetch.Drain(ctx, it)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, []int64{100, 200}, got[0].Timestamps)
+	assert.Equal(t, []float64{1, 2}, got[0].Values)
+}
+
+// TestClusterSharedNothingSurvivesNodeLoss is the durability capstone for shared-nothing mode:
+// RF=3 over three private backends, the primary flushes and is then lost for good — every
+// flushed sample stays queryable from each survivor's own local disk.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterSharedNothingSurvivesNodeLoss(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodePrivate(t, endpoint, "node-a", 3),
+		"node-b": openClusterNodePrivate(t, endpoint, "node-b", 3),
+		"node-c": openClusterNodePrivate(t, endpoint, "node-c", 3),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		for _, s := range nodes {
+			if len(s.cluster.membership.Members()) != 3 {
+				return false
+			}
+		}
+
+		return true
+	}, 10*time.Second, 50*time.Millisecond)
+
+	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200, 300}, []float64{1, 2, 3}))
+	require.NoError(t, err)
+
+	p, ok := a.cluster.membership.Ring().Primary([]byte("default"))
+	require.True(t, ok)
+	primary := nodes[p.ID]
+
+	primary.maintain(ctx) // flush on the primary's private disk
+	pe, _ := primary.lookupEngine("default")
+	require.Equal(t, 1, pe.PartCount())
+
+	// Both replicas mirror the flushed part before the primary dies.
+	for id, s := range nodes {
+		if id != p.ID {
+			s.maintain(ctx)
+			re, _ := s.lookupEngine("default")
+			require.Equalf(t, 1, re.PartCount(), "%s mirrored the part", id)
+		}
+	}
+
+	// The primary is permanently lost (its private backend goes with it).
+	require.NoError(t, primary.Close(ctx))
+	delete(nodes, p.ID)
+
+	// Every survivor still serves all flushed samples from its own backend.
+	for id, s := range nodes {
+		it, err := s.Fetcher("default").Fetch(ctx, fetch.Request{
+			Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{nameMatcher("http.requests")},
+		})
+		require.NoError(t, err)
+		got, err := fetch.Drain(ctx, it)
+		require.NoError(t, err)
+		require.Lenf(t, got, 1, "%s serves the series after primary loss", id)
+		assert.Equalf(t, []int64{100, 200, 300}, got[0].Timestamps, "%s: no flushed sample lost", id)
+		assert.Equalf(t, []float64{1, 2, 3}, got[0].Values, "%s values", id)
+	}
+}
+
+// TestClusterSharedNothingReplicatesLogParts proves the record-signal path of shared-nothing
+// part replication: the partsync mirror is signal-agnostic (it moves backend objects under the
+// engine prefix), so a flushed log part — columns, blooms, keys.bin, streams.bin — mirrors to
+// the replica's private backend the same way a metric part does.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterSharedNothingReplicatesLogParts(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodePrivate(t, endpoint, "node-a", 2),
+		"node-b": openClusterNodePrivate(t, endpoint, "node-b", 2),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 2
+	}, 10*time.Second, 50*time.Millisecond)
+
+	_, err := a.WriteLogs(ctx, logBatch("api", [3]any{100, 9, "first"}, [3]any{200, 17, "second"}))
+	require.NoError(t, err)
+
+	p, ok := a.cluster.membership.Ring().Primary([]byte("default"))
+	require.True(t, ok)
+	primary := nodes[p.ID]
+
+	var replica *Storage
+	for id, s := range nodes {
+		if id != p.ID {
+			replica = s
+		}
+	}
+
+	primary.maintain(ctx)
+	pe, ok := primary.lookupLogEngine("default")
+	require.True(t, ok)
+	require.Equal(t, 1, pe.PartCount(), "primary flushed the log part")
+
+	replica.maintain(ctx)
+	re, ok := replica.lookupLogEngine("default")
+	require.True(t, ok)
+	assert.Equal(t, 1, re.PartCount(), "replica mirrored the log part into its private backend")
+
+	got := logBodies(t, replica.LogFetcher("default"), fetch.Request{Start: 0, End: 1 << 60})
+	assert.Equal(t, []string{"first", "second"}, got, "replica serves the logs from its own backend")
+}
