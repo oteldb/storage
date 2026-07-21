@@ -31,9 +31,18 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
   "is the sync loop running?" probe), `Mirrored` (passes that installed a newer peer copy),
   `Copied`/`CopiedBytes` (objects fetched from peers), `Pruned` (stale local objects deleted after
   the quarantine delay), `Errors` (failed passes, retried next tick), and `LastSyncUnixNano` (when
-  the last mirroring pass completed — the replication-staleness probe).
+  the last mirroring pass completed — the replication-staleness probe). `Cluster.EC` (same
+  gating) reports the erasure-coding activity, cumulative: `Converted`/`ConvertErrors` (cold parts
+  coded by this node as compaction owner), `RepairedSlots`/`RepairErrors` (shard slots rebuilt
+  after a loss), `PrunedStagedParts` (staged shards dropped after distribution — each one converges
+  a part to one shard per node), and `Reconstructs`/`ReconstructErrors` (read-path object
+  reconstructions; a high reconstruct rate on cold reads is expected, growing errors are not).
 - `StoreStats.Caches` — read-path decode-cache totals (hits/misses/bytes and `Items` = cached
   decoded **blocks**, the cache being keyed by `(part, column, block)`).
+- `StoreStats.Maintenance` — the background maintenance loop: cumulative `Cycles` (the loop-
+  liveness probe), `LastCycleStartUnixNano` / `LastCycleDurationNano` (a growing duration means
+  compaction is falling behind ingest), and `LastCycleTasks` (engine tasks dispatched in the most
+  recent cycle).
 
 `SignalStats` (one per `(tenant, signal)`):
 
@@ -66,6 +75,13 @@ Part *byte* sizes are intentionally omitted from `Inspect` (they would need back
   symbols), and `TopLabelNames` (the top-N label names by series count, each with `Series` and
   `DistinctValues`). `topN ≤ 0` returns every label name. Computed from the head's inverted index
   (which spans head ∪ flushed series); no backend I/O.
+- **`EfficiencyStats(ctx) ([]TenantEfficiency, error)`** (`efficiency.go`) — the capacity/
+  efficiency view: per `(tenant, signal)`, `Series`, `Parts`, `Points` (samples/records),
+  `StoredBytes` (this node's on-disk footprint — under erasure coding with slot filtering that is
+  the local shard, not the cluster-wide total), `BytesPerPoint` (the per-sample storage cost), and
+  for metrics `LogicalBytes` (`Points × 16`) with `CompressionRatio` (logical/stored; 0 for the
+  record signals, whose per-record logical size is not recorded). Reads object sizes from the
+  backend like `PartsDetailed` — dashboard cadence, not per request.
 
 ### `Storage.AdmissionStats(tenant) AdmissionStats` (`admission.go`)
 

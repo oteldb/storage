@@ -21,6 +21,8 @@ type StoreStats struct {
 	Cluster *ClusterStats
 	// Caches aggregates the read-path caches.
 	Caches CacheStats
+	// Maintenance describes the background maintenance loop (cycles, recency, last-cycle size).
+	Maintenance MaintenanceStats
 }
 
 // TenantStats is one tenant's per-signal breakdown plus its (cross-signal) admission counters.
@@ -80,6 +82,10 @@ type ClusterStats struct {
 	// PartSync is the shared-nothing part-mirroring activity (cluster/partsync), cumulative since
 	// process start; nil unless the cluster runs with a private (per-node) backend.
 	PartSync *PartSyncStats
+	// EC is the erasure-coding activity (convert/repair/prune/reconstruct), cumulative since
+	// process start; nil unless the cluster runs with a private (per-node) backend. All zeros
+	// when no tenant has an EC policy.
+	EC *ECStats
 }
 
 // PartSyncStats is the cumulative shared-nothing part-mirroring activity of this node: how the
@@ -193,6 +199,12 @@ func (s *Storage) Inspect() StoreStats {
 	sort.Slice(out.Tenants, func(i, j int) bool { return out.Tenants[i].Tenant < out.Tenants[j].Tenant })
 
 	out.Cluster = s.clusterStats()
+	out.Maintenance = MaintenanceStats{
+		Cycles:                 s.maintStats.cycles.Load(),
+		LastCycleStartUnixNano: s.maintStats.lastStartNano.Load(),
+		LastCycleDurationNano:  s.maintStats.lastDurationNano.Load(),
+		LastCycleTasks:         s.maintStats.lastTasks.Load(),
+	}
 
 	return out
 }
@@ -222,6 +234,15 @@ func (s *Storage) clusterStats() *ClusterStats {
 			Copied: t.Copied, CopiedBytes: t.CopiedBytes,
 			Pruned: t.Pruned, Errors: t.Errors,
 			LastSyncUnixNano: t.LastSyncUnixNano,
+		}
+		cs.EC = &ECStats{
+			Converted:         s.ecStats.converted.Load(),
+			ConvertErrors:     s.ecStats.convertErrors.Load(),
+			RepairedSlots:     s.ecStats.repairedSlots.Load(),
+			RepairErrors:      s.ecStats.repairErrors.Load(),
+			PrunedStagedParts: s.ecStats.prunedStaged.Load(),
+			Reconstructs:      s.ecStats.reconstructs.Load(),
+			ReconstructErrors: s.ecStats.reconstructErr.Load(),
 		}
 	}
 

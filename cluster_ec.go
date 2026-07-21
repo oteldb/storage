@@ -162,7 +162,7 @@ func (e *ecBackend) Read(ctx context.Context, key string) ([]byte, error) {
 		return nil, err
 	}
 
-	return e.reader().Read(ctx, key)
+	return e.reconstruct(ctx, key)
 }
 
 // ReadView serves a full-copy object as a zero-copy view (the common hot-part path) and
@@ -177,7 +177,7 @@ func (e *ecBackend) ReadView(ctx context.Context, key string) ([]byte, error) {
 		return nil, err
 	}
 
-	return e.reader().Read(ctx, key)
+	return e.reconstruct(ctx, key)
 }
 
 func (e *ecBackend) Write(ctx context.Context, key string, data []byte) error {
@@ -197,6 +197,24 @@ func (e *ecBackend) PutIfAbsent(ctx context.Context, key string, data []byte) (b
 }
 
 func (e *ecBackend) IsEphemeral() bool { return e.inner.IsEphemeral() }
+
+// reconstruct is the counted reader fallback: an object with no local full copy is reassembled
+// from shards, and the outcome lands in the EC operator stats (a missing object is not an
+// error of the reconstruction machinery and is not counted as one).
+func (e *ecBackend) reconstruct(ctx context.Context, key string) ([]byte, error) {
+	data, err := e.reader().Read(ctx, key)
+	if err != nil {
+		if !errors.Is(err, backend.ErrNotExist) {
+			e.s.ecStats.reconstructErr.Add(1)
+		}
+
+		return nil, err
+	}
+
+	e.s.ecStats.reconstructs.Add(1)
+
+	return data, nil
+}
 
 // reader builds an [ec.Reader] over the current ring: this node's shard slot (its index in the
 // owner list, or -1 when it is not an owner) and a peer fetch that reads the slot-owner's copy.
@@ -285,10 +303,12 @@ func (s *Storage) convertColdParts(ctx context.Context, shardKey signal.TenantID
 			}
 
 			if meta, err = ec.Convert(ctx, s.backend, p.prefix, scheme); err != nil {
+				s.ecStats.convertErrors.Add(1)
 				log.Warn("ec: convert failed", zap.String("part", p.prefix), zap.Error(err))
 
 				continue
 			}
+			s.ecStats.converted.Add(1)
 
 			log.Debug("ec: converted cold part",
 				zap.String("part", p.prefix), zap.Int("data", scheme.Data),
@@ -343,6 +363,7 @@ func (s *Storage) pruneStagedShards(
 		}
 	}
 
+	s.ecStats.prunedStaged.Add(1)
 	s.obs.Logger(ctx).Debug("ec: pruned staged shards to own slot",
 		zap.String("part", prefix), zap.Int("slot", mySlot))
 }
