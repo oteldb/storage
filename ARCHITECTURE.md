@@ -1051,8 +1051,20 @@ source); once each slot-owner peer holds its shard — the owner confirms by lis
 own. Every node then holds exactly one shard per part: (Data+Parity)/Data storage (1.5× at
 ec(4,2)), the EC target. The prune never drops the last copy of a slot (it confirms first) and
 is skipped when the ring is smaller than Data+Parity (the extra copies stay as redundancy);
-reconstruction fetches a pruned foreign slot from its owner. Repairing a lost slot after node
-loss and the chaos e2e are the remaining milestones (before geo-replication).
+reconstruction fetches a pruned foreign slot from its owner. **Shard repair.** When an owner is
+missing its shard slot for a converted part — a disk failure, or a membership change that
+reassigned the slot — the maintenance loop rebuilds it: `repairEcShards` gathers **by content**
+(it lists each current owner's `ecshard/` objects to discover which slots physically survive,
+not by position, since balanced placement can renumber slots), fetches any Data valid shards,
+RS-reconstructs the missing slot, and writes it (checksum-verified). Because a node loss removes
+an owner but never pushes another out, the surviving owners always hold ≥ Data shards, so a read
+reconstructs even before repair runs and repair always has enough to rebuild. This makes
+own-slot shards **authoritative locally**: partsync's prune protects a shard whose part is still
+in the index from the source-absence quarantine (`livePart`) — otherwise a replica would drop
+its own shard right after the owner prunes its staged copy, and both would lose it. Two gaps
+remain before this is complete node-loss durability: a **newly-promoted owner** (a spare that
+never held the tenant) has no engine to serve until a bootstrap path creates one, and the chaos
+e2e — then geo-replication.
 
 Closed parity items: the write path is primary-authoritative, so the OOO decision is made once
 by the shard primary (`engine.ApplyPrimary`) and secondaries apply the accepted set verbatim

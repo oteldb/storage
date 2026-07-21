@@ -481,3 +481,55 @@ func TestSyncFilterPrunesForeignShards(t *testing.T) {
 }
 
 func itoa(n int) string { return string(rune('0' + n)) }
+
+// TestSyncProtectsOwnSlotShard pins the fix for the owner-prune/slot-filter interaction: a
+// replica's own-slot shard for a LIVE part must never be pruned just because the source (the
+// compaction owner) dropped its staged copy after distribution — otherwise both lose it.
+func TestSyncProtectsOwnSlotShard(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	owner, replica := backend.Memory(), backend.Memory()
+
+	// A live part; the owner has already pruned its staged copy of slot 1 (only slot 0 remains),
+	// while the replica holds slot 1 — its authoritative shard.
+	ix := &bucketindex.Index{}
+	ix.Add(bucketindex.Entry{Prefix: "t/metrics/0000000001", MinTime: 1, MaxTime: 9})
+	require.NoError(t, owner.Write(ctx, "t/metrics/0000000001/ecshard/0/c/0", []byte("s0")))
+	require.NoError(t, owner.Write(ctx, "t/metrics/0000000001/ecmeta", []byte("meta")))
+	saveIndex(t, owner, "t/metrics", ix)
+
+	require.NoError(t, replica.Write(ctx, "t/metrics/0000000001/ecshard/1/c/0", []byte("s1")))
+	require.NoError(t, replica.Write(ctx, "t/metrics/0000000001/ecmeta", []byte("meta")))
+	saveIndex(t, replica, "t/metrics", ix)
+
+	keep := func(key string) bool {
+		slot, isShard := ec.ShardSlotOf(key)
+
+		return !isShard || slot == 1
+	}
+
+	s := partsync.New(replica, &partsync.Client{})
+
+	// Many passes: the replica's slot-1 shard is absent from the owner's (filtered) listing, but
+	// it belongs to a live part, so it must survive every quarantine cycle.
+	for range pruneRounds {
+		_, err := s.Sync(ctx, "t/metrics", []string{serve(t, owner)}, false, keep)
+		require.NoError(t, err)
+	}
+
+	_, err := replica.Read(ctx, "t/metrics/0000000001/ecshard/1/c/0")
+	require.NoError(t, err, "the replica keeps its own-slot shard for a live part")
+
+	// But a superseded part's shard (dropped from the index) is still pruned.
+	require.NoError(t, replica.Write(ctx, "t/metrics/0000000000/ecshard/1/c/0", []byte("old")))
+	require.NoError(t, replica.Write(ctx, "t/metrics/0000000000/ecmeta", []byte("meta")))
+	for range pruneRounds {
+		_, err := s.Sync(ctx, "t/metrics", []string{serve(t, owner)}, false, keep)
+		require.NoError(t, err)
+	}
+	_, err = replica.Read(ctx, "t/metrics/0000000000/ecshard/1/c/0")
+	require.ErrorIs(t, err, backend.ErrNotExist, "a superseded part's shard is pruned")
+}
+
+const pruneRounds = 4

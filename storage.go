@@ -1144,13 +1144,16 @@ func (s *Storage) maintain(ctx context.Context) {
 	// the replica first mirrors the owner's backend objects (partsync) and then refreshes from its
 	// own backend; the owner backfills strictly-newer peer parts before compacting, so a
 	// newly-gained owner never restarts a shard's part sequence from scratch.
-	maintainEngine := func(tid signal.TenantID, signalPrefix string, flush, merge, refresh func() error, convertCold func()) {
+	maintainEngine := func(tid signal.TenantID, signalPrefix string, flush, merge, refresh func() error, ecParts func() []ecPartRef) {
 		if owned != nil {
 			if _, ok := owned[tid]; !ok {
 				// A replica, not the compaction owner: pull the owner's flushed parts and trim the
 				// head to the unflushed window, bounding memory.
 				s.syncParts(ctx, tid, signalPrefix, false)
 				_ = refresh()
+				// Rebuild this node's erasure-coded shard slot if a membership change left it
+				// missing (a no-op when not an EC owner or the shard is already present).
+				s.repairEcShards(ctx, tid, ecParts())
 
 				return
 			}
@@ -1166,8 +1169,10 @@ func (s *Storage) maintain(ctx context.Context) {
 		_ = merge()
 
 		// Erasure-code the tenant's now-cold parts (shared-nothing + EC policy only; a no-op
-		// otherwise), replacing their full copies with shards before the secondaries mirror them.
-		convertCold()
+		// otherwise), replacing their full copies with shards, then prune the owner's staged
+		// shards once distributed and rebuild this node's slot if a membership change lost it.
+		s.convertColdParts(ctx, tid, ecParts())
+		s.repairEcShards(ctx, tid, ecParts())
 
 		// Shared-nothing: nudge the shard's secondaries to mirror the freshly flushed/merged
 		// parts now instead of on their next tick. Best-effort — pull remains the source of
@@ -1210,7 +1215,7 @@ func (s *Storage) maintain(ctx context.Context) {
 			maintainEngine(tid, metricsPrefix, func() error { return eng.Flush(ctx) },
 				func() error { return eng.MergeWith(ctx, s.metricMergeOptions(tid)) },
 				func() error { return eng.RefreshReplica(ctx) },
-				func() { s.convertColdParts(ctx, tid, coldMetric(eng)) })
+				func() []ecPartRef { return coldMetric(eng) })
 		}})
 	}
 
@@ -1220,7 +1225,7 @@ func (s *Storage) maintain(ctx context.Context) {
 				maintainEngine(tid, signalPrefix, func() error { return eng.Flush(ctx) },
 					func() error { return eng.Merge(ctx, s.retainFrom(tid)) },
 					func() error { return eng.RefreshReplica(ctx) },
-					func() { s.convertColdParts(ctx, tid, coldRecord(eng)) })
+					func() []ecPartRef { return coldRecord(eng) })
 			}})
 		}
 	}

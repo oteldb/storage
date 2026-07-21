@@ -452,7 +452,12 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 		st.CopiedBytes += int64(len(peerIndexRaw))
 	}
 
-	if err := s.prune(ctx, &st, enginePrefix); err != nil {
+	liveParts := make(map[string]struct{}, len(peerIndex.Entries))
+	for _, e := range peerIndex.Entries {
+		liveParts[e.Prefix] = struct{}{}
+	}
+
+	if err := s.prune(ctx, &st, enginePrefix, keep, liveParts); err != nil {
 		return st, err
 	}
 
@@ -588,7 +593,7 @@ func classifyFetch(remote []string, enginePrefix, indexKey string, have map[stri
 // prune deletes local objects the peer no longer has, but only after they have been absent for
 // [pruneAfterMisses] consecutive passes — an in-flight reader gets a full maintenance cycle to
 // drain before a superseded part's objects go away.
-func (s *Syncer) prune(ctx context.Context, st *Stats, enginePrefix string) error {
+func (s *Syncer) prune(ctx context.Context, st *Stats, enginePrefix string, keep KeepFunc, liveParts map[string]struct{}) error {
 	local, err := s.local.List(ctx, enginePrefix)
 	if err != nil {
 		return errors.Wrap(err, "list local for prune")
@@ -604,6 +609,17 @@ func (s *Syncer) prune(ctx context.Context, st *Stats, enginePrefix string) erro
 
 	for _, k := range local {
 		seen[k] = struct{}{}
+
+		// An object this node should hold (keep) whose part is still live in the index is
+		// authoritative locally — a shard the source legitimately dropped after distribution, or
+		// a full copy — and must never be pruned just because it is absent from the (filtered)
+		// remote view. Superseded-part objects (part gone from the index) and objects this node
+		// should not hold fall through to the remote-absence quarantine below.
+		if keep(k) && livePart(k, liveParts) {
+			delete(counts, k)
+
+			continue
+		}
 
 		if _, ok := remote[k]; ok {
 			delete(counts, k) // present again: reset
@@ -635,6 +651,26 @@ func (s *Syncer) prune(ctx context.Context, st *Stats, enginePrefix string) erro
 	}
 
 	return nil
+}
+
+// livePart reports whether key belongs to a part still listed in the index. A shard key
+// (`{part}/ecshard/{slot}/{obj}`) is checked by its part prefix; any other key under a live
+// part prefix also qualifies. A key belonging to no live part (superseded by a merge) is not
+// protected and falls through to pruning.
+func livePart(key string, liveParts map[string]struct{}) bool {
+	if part, _, ok := strings.Cut(key, "/ecshard/"); ok {
+		_, live := liveParts[part]
+
+		return live
+	}
+
+	for part := range liveParts {
+		if strings.HasPrefix(key, part+"/") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // compareIndexes orders two bucket indexes by recency: the higher max part sequence wins, then
