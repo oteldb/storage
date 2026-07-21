@@ -970,7 +970,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 
 	e := engine.New(engine.Config{
 		OOOWindow:        s.opts.OOOWindow,
-		Backend:          s.backend,
+		Backend:          s.backendFor(tid),
 		Prefix:           prefix,
 		WAL:              w,
 		Obs:              s.obs,
@@ -1144,7 +1144,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	// the replica first mirrors the owner's backend objects (partsync) and then refreshes from its
 	// own backend; the owner backfills strictly-newer peer parts before compacting, so a
 	// newly-gained owner never restarts a shard's part sequence from scratch.
-	maintainEngine := func(tid signal.TenantID, signalPrefix string, flush, merge, refresh func() error) {
+	maintainEngine := func(tid signal.TenantID, signalPrefix string, flush, merge, refresh func() error, convertCold func()) {
 		if owned != nil {
 			if _, ok := owned[tid]; !ok {
 				// A replica, not the compaction owner: pull the owner's flushed parts and trim the
@@ -1165,10 +1165,34 @@ func (s *Storage) maintain(ctx context.Context) {
 		_ = flush()
 		_ = merge()
 
+		// Erasure-code the tenant's now-cold parts (shared-nothing + EC policy only; a no-op
+		// otherwise), replacing their full copies with shards before the secondaries mirror them.
+		convertCold()
+
 		// Shared-nothing: nudge the shard's secondaries to mirror the freshly flushed/merged
 		// parts now instead of on their next tick. Best-effort — pull remains the source of
 		// truth, so a lost notify only costs latency.
 		s.notifyPeers(ctx, tid, signalPrefix)
+	}
+
+	// coldParts snapshots an engine's parts as [ecPartRef]s (prefix + max time) for the converter.
+	coldMetric := func(eng *engine.Engine) []ecPartRef {
+		ps := eng.Parts()
+		refs := make([]ecPartRef, len(ps))
+		for i, p := range ps {
+			refs[i] = ecPartRef{prefix: p.ID, maxTime: p.MaxTime}
+		}
+
+		return refs
+	}
+	coldRecord := func(eng *recordengine.Engine) []ecPartRef {
+		ps := eng.Parts()
+		refs := make([]ecPartRef, len(ps))
+		for i, p := range ps {
+			refs[i] = ecPartRef{prefix: p.ID, maxTime: p.MaxTime}
+		}
+
+		return refs
 	}
 
 	// Each engine is an independent shard (per tenant, per signal) with its own lock, so flush/merge
@@ -1185,7 +1209,8 @@ func (s *Storage) maintain(ctx context.Context) {
 		tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
 			maintainEngine(tid, metricsPrefix, func() error { return eng.Flush(ctx) },
 				func() error { return eng.MergeWith(ctx, s.metricMergeOptions(tid)) },
-				func() error { return eng.RefreshReplica(ctx) })
+				func() error { return eng.RefreshReplica(ctx) },
+				func() { s.convertColdParts(ctx, tid, coldMetric(eng)) })
 		}})
 	}
 
@@ -1194,7 +1219,8 @@ func (s *Storage) maintain(ctx context.Context) {
 			tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
 				maintainEngine(tid, signalPrefix, func() error { return eng.Flush(ctx) },
 					func() error { return eng.Merge(ctx, s.retainFrom(tid)) },
-					func() error { return eng.RefreshReplica(ctx) })
+					func() error { return eng.RefreshReplica(ctx) },
+					func() { s.convertColdParts(ctx, tid, coldRecord(eng)) })
 			}})
 		}
 	}

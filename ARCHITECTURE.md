@@ -1011,10 +1011,23 @@ already-converted part only sweeps leftover full copies, never re-reads them). A
 shards are written into the owner's own backend (the staging area from which peers pull their
 slot and the owner prunes to its own — a later milestone). Which parts convert is a **per-tenant
 age tier**: `tenant.ECScheme.After` (mirroring `Recompress.After`) EC-codes only parts fully
-older than the threshold, so recent data stays full-copy for fast reads. Remaining milestones:
-wiring `ec.Reader` as the engine's backend + triggering `Convert` from the maintenance loop,
-partsync slot filtering + repair, and the chaos e2e — the engines do not read through
-`ec.Reader` yet.
+older than the threshold, so recent data stays full-copy for fast reads.
+
+The engine reads erasure-coded parts **transparently**: an EC-policy tenant's engine is built
+over an `ecBackend` wrapper (`backendFor`) instead of the raw backend. Every part-object read
+(`block.PartReader` goes through `backend.ReadView`) hits the wrapper: a surviving full copy —
+a hot part not yet converted, or a sub-floor object — is returned as a zero-copy view, and a
+converted object is reconstructed via `ec.Reader` (this node's shard slot from the local
+backend, the rest fetched from the slot-owning peers over the partsync object endpoint), keyed
+off the part's `ecmeta`. Owner count is exactly Data+Parity (the tenant's RF is ignored under
+EC); the shard slot is this node's index in `Lookup(shardKey, Data+Parity)`. Writes/list/delete
+pass through to the raw backend, so flush, partsync mirroring, and the converter still see the
+plain layout. The compaction owner runs `ec.Convert` on cold parts from the owned branch of the
+maintenance loop (after merge, before the flush notify), skipping already-converted parts.
+Everything is gated on shared-nothing mode + an EC policy, so a non-EC tenant's engine uses the
+raw backend unchanged. Remaining milestones: partsync slot filtering (a replica mirrors only its
+slot's shards) + shard repair after node loss, and the chaos e2e — today every mirroring replica
+still pulls all shards, so EC is correct but not yet at its target per-node storage.
 
 Closed parity items: the write path is primary-authoritative, so the OOO decision is made once
 by the shard primary (`engine.ApplyPrimary`) and secondaries apply the accepted set verbatim
@@ -1464,7 +1477,8 @@ query-language path stays in the embedder. The `Write*` methods take the library
   policy: `RF` overrides the cluster-wide replication factor for the tenant's shards, zero ⇒
   the cluster default; `EC *ECScheme{Data, Parity, After}` erasure-codes the tenant's flushed
   parts older than `After` at (Data+Parity)/Data storage instead of RF full copies — the
-  `cluster/ec` converter enacts it at merge, not yet wired into the engine), and the
+  `cluster/ec` converter enacts it at merge and the engine reads it back transparently through
+  an `ecBackend` wrapper), and the
   composed `Policy`, resolved per tenant id through a `Resolver` (`ResolverFunc` adapter;
   `Default()` returns an empty-policy resolver). Multi-tenancy, retention, and
   downsampling are consumer-supplied callbacks keyed by tenant id.
@@ -1602,7 +1616,7 @@ cluster/              L0 distribution: ring + membership + (later) replication �
   cluster/etcd        etcd-backed live membership (lease + watch → atomic ring)          [implemented; embedded-etcd tested]
   cluster/replica     quorum write-replication + node-to-node HTTP transport             [implemented]
   cluster/partsync    shared-nothing flushed-part mirroring between private backends     [implemented]
-  cluster/ec          Reed-Solomon codec + Meta sidecar + layout + reconstructing Reader + cold-part converter [codec+read+convert done; engine-wiring/repair pending]
+  cluster/ec          Reed-Solomon codec + Meta sidecar + layout + reconstructing Reader + cold-part converter [codec+read+convert+engine-wiring done; slot-filtering/repair pending]
   cluster/rebalance   minimal ownership-handoff plan from a ring diff (pure)              [implemented]
   cluster/etcd (ownership.go) exclusive compaction claims (CAS+lease) — the rebalance executor [implemented]
   cluster/            cluster write path: EncodeWrite codec + Writer + Config             [implemented]
