@@ -141,3 +141,77 @@ done:
 	MOVSD X0, rmin+24(FP)
 	MOVSD X1, rmax+32(FP)
 	RET
+
+// func equalFixed16AVX2(blob []byte, needle []byte, dst []byte)
+// Requires: AVX, AVX2
+TEXT ·equalFixed16AVX2(SB), NOSPLIT, $0-72
+	MOVQ           blob_base+0(FP), AX
+	MOVQ           needle_base+24(FP), CX
+	MOVQ           dst_base+48(FP), DX
+	MOVQ           dst_len+56(FP), BX
+	VBROADCASTI128 (CX), Y0
+	XORQ           CX, CX
+	XORQ           SI, SI
+	MOVQ           BX, DI
+	SUBQ           $0x07, DI
+
+loop8:
+	CMPQ      CX, DI
+	JGE       tail2setup
+	VMOVDQU   (AX)(SI*1), Y1
+	VPCMPEQB  Y0, Y1, Y1
+	VPMOVMSKB Y1, R8
+	NOTL      R8
+	TESTL     $0x0000ffff, R8
+	SETEQ     (DX)(CX*1)
+	TESTL     $0xffff0000, R8
+	SETEQ     1(DX)(CX*1)
+	VMOVDQU   32(AX)(SI*1), Y1
+	VPCMPEQB  Y0, Y1, Y1
+	VPMOVMSKB Y1, R8
+	NOTL      R8
+	TESTL     $0x0000ffff, R8
+	SETEQ     2(DX)(CX*1)
+	TESTL     $0xffff0000, R8
+	SETEQ     3(DX)(CX*1)
+	VMOVDQU   64(AX)(SI*1), Y1
+	VPCMPEQB  Y0, Y1, Y1
+	VPMOVMSKB Y1, R8
+	NOTL      R8
+	TESTL     $0x0000ffff, R8
+	SETEQ     4(DX)(CX*1)
+	TESTL     $0xffff0000, R8
+	SETEQ     5(DX)(CX*1)
+	VMOVDQU   96(AX)(SI*1), Y1
+	VPCMPEQB  Y0, Y1, Y1
+	VPMOVMSKB Y1, R8
+	NOTL      R8
+	TESTL     $0x0000ffff, R8
+	SETEQ     6(DX)(CX*1)
+	TESTL     $0xffff0000, R8
+	SETEQ     7(DX)(CX*1)
+	ADDQ      $0x08, CX
+	ADDQ      $0x80, SI
+	JMP       loop8
+
+tail2setup:
+	SUBQ $0x01, BX
+
+loop2:
+	CMPQ      CX, BX
+	JGE       done
+	VMOVDQU   (AX)(SI*1), Y1
+	VPCMPEQB  Y0, Y1, Y1
+	VPMOVMSKB Y1, DI
+	NOTL      DI
+	TESTL     $0x0000ffff, DI
+	SETEQ     (DX)(CX*1)
+	TESTL     $0xffff0000, DI
+	SETEQ     1(DX)(CX*1)
+	ADDQ      $0x02, CX
+	ADDQ      $0x20, SI
+	JMP       loop2
+
+done:
+	VZEROUPPER
+	RET

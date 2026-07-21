@@ -71,6 +71,71 @@ func TestColumnBytesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestColumnBytesRawRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	vals := [][]byte{
+		{0, 0, 0, 1}, {0, 0, 0, 2}, {0, 0, 0, 1}, {0, 0, 0, 3},
+	}
+	desc, obj, err := buildColumn(Column{Name: "id", Kind: KindBytes, Bytes: vals, Codec: chunk.CodecBytesRaw}, noneComp(), defaultGranuleSize)
+	require.NoError(t, err)
+	assert.Equal(t, chunk.CodecBytesRaw, desc.Codec)
+	assert.False(t, desc.Const)
+
+	r := newColumnReader(desc, obj, noneComp(), len(vals))
+	blob, width, err := r.BytesRaw()
+	require.NoError(t, err)
+	assert.Equal(t, 4, width)
+	require.Len(t, blob, len(vals)*width)
+	for i, want := range vals {
+		assert.Equal(t, want, blob[i*width:(i+1)*width])
+	}
+}
+
+func TestColumnBytesRawConst(t *testing.T) {
+	t.Parallel()
+
+	vals := [][]byte{{1, 2, 3, 4}, {1, 2, 3, 4}, {1, 2, 3, 4}}
+	desc, obj, err := buildColumn(Column{Name: "id", Kind: KindBytes, Bytes: vals, Codec: chunk.CodecBytesRaw}, noneComp(), defaultGranuleSize)
+	require.NoError(t, err)
+	assert.True(t, desc.Const)
+	assert.Nil(t, obj)
+
+	blob, width, err := newColumnReader(desc, nil, noneComp(), len(vals)).BytesRaw()
+	require.NoError(t, err)
+	assert.Equal(t, 4, width)
+	require.Len(t, blob, len(vals)*width)
+	for i := range vals {
+		assert.Equal(t, []byte{1, 2, 3, 4}, blob[i*width:(i+1)*width])
+	}
+}
+
+func TestColumnBytesRawErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("wrong kind", func(t *testing.T) {
+		t.Parallel()
+
+		desc, obj, err := buildColumn(Column{Name: "c", Kind: KindInt64, Int64: []int64{1, 2}}, noneComp(), defaultGranuleSize)
+		require.NoError(t, err)
+
+		_, _, err = newColumnReader(desc, obj, noneComp(), 2).BytesRaw()
+		assert.Error(t, err)
+	})
+
+	t.Run("dict codec, not raw", func(t *testing.T) {
+		t.Parallel()
+
+		vals := [][]byte{[]byte("a"), []byte("b"), []byte("a")}
+		desc, obj, err := buildColumn(Column{Name: "k", Kind: KindBytes, Bytes: vals}, noneComp(), defaultGranuleSize)
+		require.NoError(t, err)
+		assert.Equal(t, chunk.CodecDict, desc.Codec)
+
+		_, _, err = newColumnReader(desc, obj, noneComp(), len(vals)).BytesRaw()
+		assert.Error(t, err)
+	})
+}
+
 func TestColumnZSTDCompressed(t *testing.T) {
 	t.Parallel()
 

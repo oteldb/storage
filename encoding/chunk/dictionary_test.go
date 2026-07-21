@@ -1,6 +1,7 @@
 package chunk
 
 import (
+	"bytes"
 	"math/rand/v2"
 	"testing"
 
@@ -306,4 +307,95 @@ func TestEncodeBytesBlobMatchesSlices(t *testing.T) {
 				"raw codec: blob form must be byte-identical")
 		})
 	}
+}
+
+// TestDecodeBytesRawBlob verifies EncodeBytesRaw∘DecodeBytesRawBlob recovers the flat blob for a
+// uniform-width column, and that a mixed-width column (which EncodeBytesRaw falls back to flagFlat
+// for) is rejected with errNotFixedWidth rather than silently misread.
+func TestDecodeBytesRawBlob(t *testing.T) {
+	t.Parallel()
+
+	t.Run("uniform width", func(t *testing.T) {
+		t.Parallel()
+
+		vals := makeIDs(200, 16)
+		enc := EncodeBytesRaw(nil, vals)
+
+		blob, width, rows, err := DecodeBytesRawBlob(enc)
+		require.NoError(t, err)
+		assert.Equal(t, 16, width)
+		assert.Equal(t, 200, rows)
+		require.Len(t, blob, 200*16)
+		for i, v := range vals {
+			assert.Equalf(t, v, blob[i*width:(i+1)*width], "row %d", i)
+		}
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		t.Parallel()
+
+		blob, width, rows, err := DecodeBytesRawBlob(EncodeBytesRaw(nil, nil))
+		require.NoError(t, err)
+		assert.Nil(t, blob)
+		assert.Zero(t, width)
+		assert.Zero(t, rows)
+	})
+
+	t.Run("mixed width falls back to flat, rejected", func(t *testing.T) {
+		t.Parallel()
+
+		vals := [][]byte{[]byte("a"), []byte("bb"), []byte("ccc")}
+		enc := EncodeBytesRaw(nil, vals)
+
+		_, _, _, err := DecodeBytesRawBlob(enc)
+		assert.ErrorIs(t, err, errNotFixedWidth)
+	})
+}
+
+// makeIDs builds n distinct-ish width-byte ids (round-robin over n/2 distinct values, or all
+// distinct if n < 2), the shape a trace_id column takes.
+func makeIDs(n, width int) [][]byte {
+	distinct := max(n/2, 1)
+	out := make([][]byte, n)
+	for i := range n {
+		v := make([]byte, width)
+		for j := range v {
+			v[j] = byte((i % distinct) >> (8 * (j % 8)))
+		}
+		out[i] = v
+	}
+
+	return out
+}
+
+// FuzzDecodeBytesRawBlob checks EncodeBytesRaw∘DecodeBytesRawBlob never panics and, when it
+// succeeds, recovers exactly the encoded rows.
+func FuzzDecodeBytesRawBlob(f *testing.F) {
+	f.Add(16, 50)
+	f.Add(1, 1)
+	f.Add(0, 0)
+
+	f.Fuzz(func(t *testing.T, width, rows int) {
+		if width < 0 || width > 64 || rows < 0 || rows > 1000 {
+			return
+		}
+
+		vals := makeIDs(rows, width)
+		enc := EncodeBytesRaw(nil, vals)
+
+		blob, gotWidth, gotRows, err := DecodeBytesRawBlob(enc)
+		if rows == 0 {
+			require.NoError(t, err)
+			return
+		}
+
+		require.NoError(t, err)
+		require.Equal(t, width, gotWidth)
+		require.Equal(t, rows, gotRows)
+		for i, v := range vals {
+			// bytes.Equal, not require.Equal: a zero-width row decodes to a nil slice, which
+			// require.Equal treats as distinct from v's []byte{} — both are the same empty value.
+			require.Truef(t, bytes.Equal(v, blob[i*gotWidth:(i+1)*gotWidth]), "row %d", i)
+		}
+	})
 }
