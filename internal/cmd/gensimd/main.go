@@ -245,63 +245,112 @@ func genMinMaxFloat64() {
 }
 
 // genEqualFixed16 emits equalFixed16AVX2(blob, needle, dst []byte): dst[i] = 1 where the i-th
-// 16-byte row of blob equals needle, else 0. Two rows (32 bytes) are compared per iteration by
-// broadcasting needle into both 128-bit lanes of a YMM register, VPCMPEQB against the loaded
-// rows, and testing each lane's 16-bit VPMOVMSKB half for all-ones. The caller guarantees
-// len(dst) is even and len(blob) == len(dst)*16 (an odd tail row is handled by the Go wrapper via
-// the generic reference).
+// 16-byte row of blob equals needle, else 0. Rows are compared 2 at a time (one 32-byte YMM
+// register holds needle broadcast into both 128-bit lanes, VPCMPEQB against 2 loaded rows,
+// VPMOVMSKB's two 16-bit halves each test for all-ones), but — unlike a naive single-vector loop —
+// the main loop runs 4 of these 2-row compares per iteration (8 rows / 128 bytes), each against
+// its own fresh set of registers. The four compares have no data dependency on each other (each
+// only reads blobPtr/blobOff/needleVec/i/dstPtr and writes its own registers/dst bytes), so even
+// though avo's register allocator may reuse the same physical registers across the four call
+// sites, the CPU's out-of-order engine still runs them concurrently via register renaming — the
+// 4-wide unroll exists to give it 4 independent load→compare→store chains to overlap across
+// multiple load/ALU ports, instead of forcing one chain's latency to serialize behind the next.
+// The caller guarantees len(dst) is even and len(blob) == len(dst)*16 (an odd tail row is handled
+// by the Go wrapper via the generic reference).
 func genEqualFixed16() {
 	TEXT("equalFixed16AVX2", NOSPLIT, "func(blob []byte, needle []byte, dst []byte)")
 	Doc("equalFixed16AVX2 sets dst[i]=1 where blob's i-th 16-byte row equals needle, 0 otherwise. len(dst) must be even.")
 
+	// Load the three slice base pointers, plus dst's length — the row count to compare (blob and
+	// needle carry no useful length here: blob's is rows*16, needle's is always exactly 16).
 	blobPtr := Load(Param("blob").Base(), GP64())
 	needlePtr := Load(Param("needle").Base(), GP64())
 	dstPtr := Load(Param("dst").Base(), GP64())
 	n := Load(Param("dst").Len(), GP64())
 
+	// needleVec = [needle(16B) | needle(16B)]: one 16-byte load, broadcast into both 128-bit lanes
+	// of a YMM register, so a single 32-byte vector compare checks two rows against it at once.
+	// Loaded once and reused (read-only) by every pair below.
 	needleVec := YMM()
 	VBROADCASTI128(Mem{Base: needlePtr}, needleVec)
 
-	i := GP64()
-	XORQ(i, i)
-	blobOff := GP64()
-	XORQ(blobOff, blobOff)
+	i := GP64() // row index (dst[i]); advances by however many rows the current loop stage compares
+	XORQ(i, i)  // i = 0
 
-	v := YMM()
-	cmp := YMM()
-	mask := GP32()
+	blobOff := GP64()      // byte offset into blob; kept as i*16 incrementally
+	XORQ(blobOff, blobOff) // blobOff = 0
 
-	Label("loop")
-	CMPQ(i, n)
+	// cmpPair emits one 32-byte (2-row) compare at byte offset blobDisp from blobOff, writing
+	// dst[i+rowDisp] and dst[i+rowDisp+1]. blobDisp/rowDisp are Go-time constants (0, 32, 64, 96 /
+	// 0, 2, 4, 6 for the unrolled main loop; both 0 for the 2-row tail loop below) baked into the
+	// memory operands' displacement — Mem.Offset — so no extra address-computing instruction (and
+	// so no flags-clobber hazard: an earlier version computed dst[i+1]'s address via a runtime
+	// ADDQ sitting between the CMPL and the SETEQ that reads its flags, which clobbered them for
+	// odd rows; addressing via a constant displacement instead sidesteps the hazard entirely).
+	// Every call allocates fresh v/cmp/mask/low registers, so independent calls carry no false
+	// dependency (see the func doc above).
+	cmpPair := func(blobDisp, rowDisp int) {
+		v := YMM()     // this pair's 2-row (32-byte) load from blob
+		cmp := YMM()   // per-byte equality: cmp's byte k = 0xFF if v's byte k == needleVec's byte k
+		mask := GP32() // VPMOVMSKB(cmp): bit k = the sign (top) bit of cmp's byte k — 1 bit/byte
+
+		VMOVDQU(Mem{Base: blobPtr, Index: blobOff, Scale: 1}.Offset(blobDisp), v)
+		VPCMPEQB(needleVec, v, cmp)
+		VPMOVMSKB(cmp, mask)
+
+		// Row 0 of the pair matches iff all 16 of its bits (mask's low 16 bits) are set — every
+		// byte compared equal. Copy into low before masking (rather than masking mask itself) so
+		// mask is still intact for row 1's check below.
+		low := GP32()
+		MOVL(mask, low)
+		ANDL(U32(0xFFFF), low)                                       // low &= 0x0000FFFF: keep only row 0's 16 bits
+		CMPL(low, U32(0xFFFF))                                       // sets ZF iff low == 0xFFFF (all 16 bytes matched)
+		SETEQ(Mem{Base: dstPtr, Index: i, Scale: 1}.Offset(rowDisp)) // dst[i+rowDisp] = ZF ? 1 : 0
+
+		// Row 1's 16 bits are mask's top half (bits 16-31); shift down to bits 0-15 so the same
+		// 0xFFFF comparison serves both rows. mask is dead after this (last use), so shifting it
+		// in place — instead of copying to a fresh register, as row 0 did — costs nothing extra.
+		SHRL(Imm(16), mask)
+		CMPL(mask, U32(0xFFFF))                                          // ZF iff row 1's 16 bytes all matched
+		SETEQ(Mem{Base: dstPtr, Index: i, Scale: 1}.Offset(rowDisp + 1)) // dst[i+rowDisp+1] = ZF ? 1 : 0
+	}
+
+	// Main loop: 4 independent pairs (8 rows / 128 bytes) per iteration.
+	limit8 := GP64()
+	MOVQ(n, limit8)
+	SUBQ(Imm(7), limit8) // i < n-7  ⇔  i+8 <= n
+
+	Label("loop8")
+	CMPQ(i, limit8)
+	JGE(LabelRef("tail2setup"))
+
+	cmpPair(0, 0)
+	cmpPair(32, 2)
+	cmpPair(64, 4)
+	cmpPair(96, 6)
+
+	ADDQ(Imm(8), i)
+	ADDQ(Imm(128), blobOff)
+	JMP(LabelRef("loop8"))
+
+	// Tail: fewer than 8 rows remain. n is even and 8 is a multiple of 2, so the remainder (0, 2,
+	// 4, or 6 rows) is always even too — finish it 2 rows (one pair) at a time.
+	Label("tail2setup")
+	limit2 := GP64()
+	MOVQ(n, limit2)
+	SUBQ(Imm(1), limit2) // i < n-1  ⇔  i+2 <= n
+
+	Label("loop2")
+	CMPQ(i, limit2)
 	JGE(LabelRef("done"))
 
-	VMOVDQU(Mem{Base: blobPtr, Index: blobOff, Scale: 1}, v)
-	VPCMPEQB(needleVec, v, cmp)
-	VPMOVMSKB(cmp, mask)
-
-	// Row 0 (low 16 bits of the byte mask) matches iff all 16 bytes compared equal. mask is kept
-	// intact (copied into low before masking) so row 1 can still read it below.
-	low := GP32()
-	MOVL(mask, low)
-	ANDL(U32(0xFFFF), low)
-	CMPL(low, U32(0xFFFF))
-	SETEQ(Mem{Base: dstPtr, Index: i, Scale: 1})
-
-	// Row 1's index and CMPL must sit back-to-back with no flags-clobbering instruction (e.g.
-	// ADDQ) between CMPL and SETEQ, so compute the index first.
-	dstRow1 := GP64()
-	MOVQ(i, dstRow1)
-	ADDQ(Imm(1), dstRow1)
-
-	SHRL(Imm(16), mask) // mask now holds row 1's 16 mask bits (high 16 bits of the original).
-	CMPL(mask, U32(0xFFFF))
-	SETEQ(Mem{Base: dstPtr, Index: dstRow1, Scale: 1})
+	cmpPair(0, 0)
 
 	ADDQ(Imm(2), i)
 	ADDQ(Imm(32), blobOff)
-	JMP(LabelRef("loop"))
+	JMP(LabelRef("loop2"))
 
 	Label("done")
-	VZEROUPPER()
+	VZEROUPPER() // clear the YMM upper halves before returning to Go (avoids an AVX/SSE transition penalty)
 	RET()
 }
