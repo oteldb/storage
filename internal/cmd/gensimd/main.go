@@ -298,20 +298,20 @@ func genEqualFixed16() {
 		VPCMPEQB(needleVec, v, cmp)
 		VPMOVMSKB(cmp, mask)
 
-		// Row 0 of the pair matches iff all 16 of its bits (mask's low 16 bits) are set — every
-		// byte compared equal. Copy into low before masking (rather than masking mask itself) so
-		// mask is still intact for row 1's check below.
+		// Row 0 of the pair matches if and only if all 16 of its bits (mask's low 16 bits) are set
+		// — every byte compared equal. Copy into low before masking (rather than masking mask
+		// itself) so mask is still intact for row 1's check below.
 		low := GP32()
 		MOVL(mask, low)
 		ANDL(U32(0xFFFF), low)                                       // low &= 0x0000FFFF: keep only row 0's 16 bits
-		CMPL(low, U32(0xFFFF))                                       // sets ZF iff low == 0xFFFF (all 16 bytes matched)
+		CMPL(low, U32(0xFFFF))                                       // sets ZF when low == 0xFFFF (all 16 bytes matched)
 		SETEQ(Mem{Base: dstPtr, Index: i, Scale: 1}.Offset(rowDisp)) // dst[i+rowDisp] = ZF ? 1 : 0
 
 		// Row 1's 16 bits are mask's top half (bits 16-31); shift down to bits 0-15 so the same
 		// 0xFFFF comparison serves both rows. mask is dead after this (last use), so shifting it
 		// in place — instead of copying to a fresh register, as row 0 did — costs nothing extra.
 		SHRL(Imm(16), mask)
-		CMPL(mask, U32(0xFFFF))                                          // ZF iff row 1's 16 bytes all matched
+		CMPL(mask, U32(0xFFFF))                                          // ZF set when row 1's 16 bytes all matched
 		SETEQ(Mem{Base: dstPtr, Index: i, Scale: 1}.Offset(rowDisp + 1)) // dst[i+rowDisp+1] = ZF ? 1 : 0
 	}
 

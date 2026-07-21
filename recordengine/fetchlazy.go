@@ -38,8 +38,8 @@ type lazyCols struct {
 	rawBlob []rawBytesCol
 
 	// eqMask holds, per condition (parallel to the request's conds), a precomputed whole-column
-	// equality bitmap (rowMatches[i] == 1 iff row i matches) from a [simd.EqualFixed16] scan — the
-	// fast path [eqFastPathCols] selects when a condition is an exact match against a
+	// equality bitmap (rowMatches[i] == 1 if and only if row i matches) from a [simd.EqualFixed16]
+	// scan — the fast path [eqFastPathCols] selects when a condition is an exact match against a
 	// [chunk.CodecBytesRaw] column with no other condition targeting it. nil, or a nil entry, means
 	// that condition falls back to the normal colValue+Match per-row check.
 	eqMask [][]byte
