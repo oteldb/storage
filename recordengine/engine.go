@@ -310,6 +310,11 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 	partsScanned := len(e.parts)
 
+	// plan is set once planFetch runs (nil when len(ids)==0 short-circuits before it); record reads
+	// its per-prune-reason counts when available so the EXPLAIN ANALYZE / pprof-visible counters
+	// (parts_pruned_time, parts_pruned_bloom, parts_live) reflect this fetch even on the empty path.
+	var plan *fetchPlan
+
 	record := func(rows int) {
 		pf.Add("series_matched", int64(len(ids)))
 		pf.Add("parts_scanned", int64(partsScanned))
@@ -319,6 +324,22 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 			attribute.Int("storage.parts_scanned", partsScanned),
 			attribute.Int("storage.rows", rows),
 		)
+
+		if plan != nil {
+			pf.Add("parts_pruned_time", int64(plan.partsPrunedTime))
+			pf.Add("parts_pruned_bloom", int64(plan.partsPrunedBloom))
+			pf.Add("parts_live", int64(len(plan.liveParts)))
+			pf.Add("rows_total", plan.rowsTotal)
+			pf.Add("rows_live", plan.rowsLive)
+			span.SetAttributes(
+				attribute.Int("storage.parts_pruned_time", plan.partsPrunedTime),
+				attribute.Int("storage.parts_pruned_bloom", plan.partsPrunedBloom),
+				attribute.Int("storage.parts_live", len(plan.liveParts)),
+				attribute.Int64("storage.rows_total", plan.rowsTotal),
+				attribute.Int64("storage.rows_live", plan.rowsLive),
+			)
+		}
+
 		e.cfg.Obs.Fetch.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(len(ids)), int64(partsScanned), int64(rows))
 		log.Debug("fetch done",
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
@@ -337,7 +358,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	// live parts to read, and capture stream identities. Releasing the lock before the backend reads
 	// lets appends and flush/merge proceed concurrently — the acquired parts can't be reclaimed until
 	// we release them, so the lock-free reads never race a delete.
-	plan := e.planFetch(ids, r)
+	plan = e.planFetch(ids, r)
 	e.mu.RUnlock()
 
 	defer plan.releaseParts()
@@ -721,6 +742,22 @@ type fetchPlan struct {
 	liveParts  []*part
 	start, end int64
 
+	// Per-prune-reason counts from the [planFetch] part scan (EXPLAIN ANALYZE / pprof
+	// instrumentation): how many of e.parts were dropped by the time window, dropped by the
+	// AllConditions equality/full-text bloom, or kept as live (len(liveParts)). Together with
+	// liveParts' row counts these answer "how much did pruning actually cut, and how big are the
+	// parts that survived" — e.g. whether a part is too small for a whole-column SIMD scan to
+	// matter relative to per-part fixed costs (decompression, bloom decode, stream setup).
+	partsTotal, partsPrunedTime, partsPrunedBloom int
+
+	// rowsTotal/rowsLive sum every scanned part's [block.PartReader.RowCount] (cheap: cached from
+	// the manifest at part-open, no extra backend I/O) — rowsTotal over every part considered,
+	// rowsLive over just the ones that survived pruning. The ratio and rowsLive/len(liveParts)
+	// (mean live-part size) are what actually answer "are parts too small for a whole-column scan
+	// to pay off" — a few-hundred-row part amortizes a SIMD kernel's dispatch/setup poorly; a
+	// several-thousand-row one does not.
+	rowsTotal, rowsLive int64
+
 	// Filtered path (AllConditions with conditions): conds are applied during the part scan so only
 	// matching rows materialize; condSel is the columns those conditions read (see fetchlazy.go).
 	conds   []fetch.Condition
@@ -761,13 +798,21 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *fetchPlan {
 		p.condSel = conditionSel(e.cfg.Schema, r.Conditions)
 	}
 
+	p.partsTotal = len(e.parts)
+
 	for _, part := range e.parts {
+		rows := int64(part.reader.RowCount()) // cached from the manifest at part-open; no extra I/O
+		p.rowsTotal += rows
+
 		switch {
 		case part.maxTime < r.Start || part.minTime > r.End: // time-prune
+			p.partsPrunedTime++
 		case r.AllConditions && !part.mayContain(r.Conditions): // bloom-prune
+			p.partsPrunedBloom++
 		case part.holdsAny(ids):
 			part.acquire()
 			p.liveParts = append(p.liveParts, part)
+			p.rowsLive += rows
 		}
 	}
 
