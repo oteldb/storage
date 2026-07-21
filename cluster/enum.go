@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net/http"
+	"net/url"
 	"slices"
 
 	"github.com/go-faster/errors"
@@ -323,7 +324,8 @@ func postEnum(ctx context.Context, client *http.Client, addr, path string, paylo
 		client = http.DefaultClient
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+path, bytes.NewReader(payload))
+	u := (&url.URL{Scheme: httpScheme, Host: addr}).JoinPath(path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
 	if err != nil {
 		return nil, errors.Wrap(err, "build request")
 	}

@@ -5,14 +5,18 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/url"
 
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/internal/obs"
 )
 
-// ReplicatePath is the HTTP path the replication server serves and the transport posts to.
-const ReplicatePath = "/internal/replicate"
+const (
+	// ReplicatePath is the HTTP path the replication server serves and the transport posts to.
+	ReplicatePath = "/internal/replicate"
+	httpScheme    = "http"
+)
 
 // httpTransport sends replicated writes to peers over HTTP POST.
 type httpTransport struct {
@@ -31,9 +35,9 @@ func NewHTTPTransport(client *http.Client) Transport {
 }
 
 func (t *httpTransport) Send(ctx context.Context, addr string, payload []byte) error {
-	url := "http://" + addr + ReplicatePath
+	u := (&url.URL{Scheme: httpScheme, Host: addr}).JoinPath(ReplicatePath)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
 	if err != nil {
 		return errors.Wrap(err, "build request")
 	}

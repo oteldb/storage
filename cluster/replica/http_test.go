@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -95,7 +96,8 @@ func TestHTTPHandlerRejectsGet(t *testing.T) {
 	t.Parallel()
 
 	addr := serve(t, (&node{}).apply)
-	resp, err := http.Get("http://" + addr + replica.ReplicatePath) //nolint:noctx // simple test request
+	u := (&url.URL{Scheme: "http", Host: addr}).JoinPath(replica.ReplicatePath)
+	resp, err := http.Get(u.String()) //nolint:noctx // simple test request
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)

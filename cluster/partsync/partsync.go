@@ -42,6 +42,8 @@ import (
 )
 
 const (
+	httpScheme = "http"
+
 	// ListPath is the HTTP path serving a node's backend key listing under a prefix.
 	ListPath = "/internal/parts/list"
 	// ObjectPath is the HTTP path serving one backend object verbatim.
@@ -198,9 +200,10 @@ func (c *Client) Fetch(ctx context.Context, addr, key string) ([]byte, error) {
 // immediately. Fire-and-forget semantics: an error just means the peer will catch up on its
 // next maintenance tick.
 func (c *Client) Notify(ctx context.Context, addr, enginePrefix string) error {
-	u := "http://" + addr + NotifyPath + "?" + url.Values{"prefix": []string{enginePrefix}}.Encode()
+	u := (&url.URL{Scheme: httpScheme, Host: addr}).JoinPath(NotifyPath)
+	u.RawQuery = url.Values{"prefix": []string{enginePrefix}}.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), http.NoBody)
 	if err != nil {
 		return errors.Wrap(err, "build request")
 	}
@@ -229,9 +232,10 @@ func (c *Client) http() *http.Client {
 }
 
 func (c *Client) get(ctx context.Context, addr, p string, q url.Values) (*http.Response, error) {
-	u := "http://" + addr + p + "?" + q.Encode()
+	u := (&url.URL{Scheme: httpScheme, Host: addr}).JoinPath(p)
+	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), http.NoBody)
 	if err != nil {
 		return nil, errors.Wrap(err, "build request")
 	}
