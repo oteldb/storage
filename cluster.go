@@ -146,7 +146,7 @@ func (s *Storage) partsNotifyHandler() http.Handler {
 		prefix := req.URL.Query().Get("prefix")
 
 		tid, sig, ok := splitEnginePrefix(prefix)
-		if !ok {
+		if !ok || !partsync.ValidKey(prefix) {
 			http.Error(w, "invalid prefix", http.StatusBadRequest)
 
 			return

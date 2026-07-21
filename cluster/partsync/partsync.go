@@ -59,11 +59,12 @@ const (
 	pruneAfterMisses = 2
 )
 
-// validKey reports whether a peer-supplied key or prefix is safe to hand to the backend:
+// ValidKey reports whether a remotely-supplied key or prefix is safe to hand to a backend:
 // relative, slash-delimited, and free of traversal or NUL. Backends validate again (the file
-// backend keeps every path under its root); this check is defense-in-depth at the network
-// boundary, rejecting hostile input before it reaches any backend.
-func validKey(k string) bool {
+// backend keeps every path under its root); this check is defense-in-depth at every network
+// boundary — the serving handlers reject hostile request parameters, and the syncer rejects
+// hostile key names a compromised peer could return.
+func ValidKey(k string) bool {
 	return !strings.Contains(k, "..") && !strings.HasPrefix(k, "/") &&
 		!strings.ContainsAny(k, "\\\x00")
 }
@@ -73,7 +74,7 @@ func validKey(k string) bool {
 func ListHandler(be backend.Backend) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		prefix := req.URL.Query().Get("prefix")
-		if !validKey(prefix) {
+		if !ValidKey(prefix) {
 			http.Error(w, "invalid prefix", http.StatusBadRequest)
 
 			return
@@ -102,7 +103,7 @@ func ListHandler(be backend.Backend) http.Handler {
 func ObjectHandler(be backend.Backend) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		key := req.URL.Query().Get("key")
-		if key == "" || !validKey(key) {
+		if key == "" || !ValidKey(key) {
 			http.Error(w, "invalid key", http.StatusBadRequest)
 
 			return
@@ -346,6 +347,10 @@ func New(local backend.Backend, client *Client) *Syncer {
 // peer copy at least as new is installed. Unreachable peers are skipped; having no usable peer
 // index is a no-op, not an error.
 func (s *Syncer) Sync(ctx context.Context, enginePrefix string, peers []string, strict bool) (Stats, error) {
+	if enginePrefix == "" || !ValidKey(enginePrefix) {
+		return Stats{}, errors.Errorf("invalid engine prefix %q", enginePrefix)
+	}
+
 	s.mu.Lock()
 	ps := s.stateFor(enginePrefix)
 	s.mu.Unlock()
@@ -480,6 +485,12 @@ func (s *Syncer) copyMissing(ctx context.Context, st *Stats, addr, enginePrefix,
 	var immutable, manifests, mutable []string
 
 	for _, k := range remote {
+		// A peer's listing is remote input: accept only well-formed keys under the prefix
+		// being synced. Anything else is dropped — a correct peer never produces it.
+		if !ValidKey(k) || !strings.HasPrefix(k, enginePrefix+"/") {
+			continue
+		}
+
 		switch {
 		case k == indexKey:
 			// installed by the caller, last
