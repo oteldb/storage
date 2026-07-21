@@ -85,6 +85,101 @@ func ecPayload(n int, seed uint64) (ts []int64, vals []float64) {
 	return ts, vals
 }
 
+// openClusterNodeECDomains is openClusterNodeEC with an explicit failure-domain path
+// (coarsest first, e.g. {rack, server}), for the topology-aware placement tests.
+func openClusterNodeECDomains(t *testing.T, endpoint, id string, domains []string, k, m int) *Storage {
+	t.Helper()
+
+	ecPol := WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+		return tenant.Policy{Durability: tenant.Durability{EC: &tenant.ECScheme{Data: k, Parity: m}}}
+	}))
+
+	s, err := Open(context.Background(), Options{}, WithBackend(backend.Memory()), ecPol, WithCluster(&cluster.Config{
+		Etcd:           []string{endpoint},
+		Self:           etcd.Member{ID: id, Domains: domains, Addr: freeAddr(t)},
+		RF:             1,
+		PrivateBackend: true,
+	}))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	return s
+}
+
+// TestClusterECRackAwarePlacement checks that EC shard owners are spread across failure domains:
+// three nodes in three distinct zones place an ec(2,1) part one-shard-per-rack (rack-safe), while
+// three nodes in one zone cannot and are flagged.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterECRackAwarePlacement(t *testing.T) {
+	endpoint := startEtcd(t)
+
+	// Six nodes: 3 racks × 2 servers, one node (disk) each.
+	a := openClusterNodeECDomains(t, endpoint, "n1", []string{"rack1", "s1"}, 4, 2)
+	openClusterNodeECDomains(t, endpoint, "n2", []string{"rack1", "s2"}, 4, 2)
+	openClusterNodeECDomains(t, endpoint, "n3", []string{"rack2", "s3"}, 4, 2)
+	openClusterNodeECDomains(t, endpoint, "n4", []string{"rack2", "s4"}, 4, 2)
+	openClusterNodeECDomains(t, endpoint, "n5", []string{"rack3", "s5"}, 4, 2)
+	openClusterNodeECDomains(t, endpoint, "n6", []string{"rack3", "s6"}, 4, 2)
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 6
+	}, 10*time.Second, 50*time.Millisecond)
+
+	scheme := ec.Scheme{Data: 4, Parity: 2}
+
+	// The six ec(4,2) shards spread two-per-rack (≤ Parity), and within each rack across both
+	// servers — so a whole-rack failure loses exactly 2 shards and is recoverable.
+	owners := a.cluster.membership.Ring().LookupBalanced([]byte("default"), scheme.Shards())
+	require.Len(t, owners, 6)
+
+	perRack := map[string]int{}
+	perServer := map[string]int{}
+	for _, o := range owners {
+		perRack[o.DomainAt(0)]++
+		perServer[o.DomainAt(0)+"/"+o.DomainAt(1)]++
+	}
+	for rack, c := range perRack {
+		assert.LessOrEqualf(t, c, 2, "rack %s holds ≤ Parity shards", rack)
+	}
+	for srv, c := range perServer {
+		assert.LessOrEqualf(t, c, 1, "server %s holds ≤ 1 shard (balanced within rack)", srv)
+	}
+
+	n, safe := a.ecZoneShortfall("default", scheme)
+	assert.Equal(t, 3, n, "three racks")
+	assert.True(t, safe, "3 racks ≥ MinZones(ec(4,2))=3 ⇒ rack-safe")
+}
+
+// TestClusterECRackShortfallDetected checks the unsafe-topology flag: three nodes in one zone
+// cannot place ec(2,1) rack-safely (a single rack holds all three shards).
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterECRackShortfallDetected(t *testing.T) {
+	endpoint := startEtcd(t)
+
+	// Three nodes, all in one rack (different servers) — cannot be rack-safe for ec(2,1).
+	a := openClusterNodeECDomains(t, endpoint, "n1", []string{"rack1", "s1"}, 2, 1)
+	openClusterNodeECDomains(t, endpoint, "n2", []string{"rack1", "s2"}, 2, 1)
+	openClusterNodeECDomains(t, endpoint, "n3", []string{"rack1", "s3"}, 2, 1)
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond)
+
+	n, safe := a.ecZoneShortfall("default", ec.Scheme{Data: 2, Parity: 1})
+	assert.Equal(t, 1, n, "all in one rack")
+	assert.False(t, safe, "one rack < MinZones=3 ⇒ not rack-safe")
+
+	// The shards still spread across the three servers within that rack (best effort).
+	owners := a.cluster.membership.Ring().LookupBalanced([]byte("default"), 3)
+	servers := map[string]struct{}{}
+	for _, o := range owners {
+		servers[o.DomainAt(1)] = struct{}{}
+	}
+	assert.Len(t, servers, 3, "spread across all servers in the rack")
+}
+
 // TestClusterECSingleNodeConvertsAndServes is the end-to-end EC path on one node: with a private
 // backend and an ec(2,1)/After=0 policy, a maintenance pass converts the flushed part to shards
 // (all slots local on the sole owner) and the engine keeps serving queries by reconstructing —

@@ -22,6 +22,17 @@ func TestMemberEncodeDecodeRoundTrip(t *testing.T) {
 	out, err := decodeMember(in.encode())
 	require.NoError(t, err)
 	assert.Equal(t, in, out)
+
+	// The hierarchical failure-domain path round-trips too.
+	hier := Member{ID: "node-7", Zone: "rack1", Addr: "10.0.0.7:9000", Domains: []string{"rack1", "srv3"}}
+	out, err = decodeMember(hier.encode())
+	require.NoError(t, err)
+	assert.Equal(t, hier, out)
+
+	// A member without domains decodes with a nil Domains (the old wire form stays valid).
+	noDomains, err := decodeMember(in.encode())
+	require.NoError(t, err)
+	assert.Nil(t, noDomains.Domains)
 }
 
 func TestDecodeMemberRejectsGarbage(t *testing.T) {

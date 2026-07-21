@@ -284,3 +284,162 @@ func dedup(s []string) []string {
 
 	return out
 }
+
+// maxPerZone returns the largest number of nodes sharing any one zone.
+func maxPerZone(ns []ring.Node) int {
+	counts := map[string]int{}
+	most := 0
+	for _, n := range ns {
+		counts[n.Zone]++
+		if counts[n.Zone] > most {
+			most = counts[n.Zone]
+		}
+	}
+
+	return most
+}
+
+// TestLookupBalancedSpreadsEvenly checks the rack-aware placement: with 3 zones of 2 nodes and
+// rf=6 (an ec(4,2) part), every node is selected and no zone holds more than ceil(6/3)=2 shards
+// — so losing a whole rack costs at most Parity=2 shards, keeping the part recoverable.
+func TestLookupBalancedSpreadsEvenly(t *testing.T) {
+	t.Parallel()
+
+	r := ring.New(zoned(
+		[2]string{"a1", "z1"}, [2]string{"a2", "z1"},
+		[2]string{"b1", "z2"}, [2]string{"b2", "z2"},
+		[2]string{"c1", "z3"}, [2]string{"c2", "z3"},
+	)...)
+
+	for _, k := range keys(500) {
+		got := r.LookupBalanced(k, 6)
+		require.Len(t, got, 6)
+		assert.Len(t, dedup(ids(got)), 6, "all distinct nodes")
+		assert.LessOrEqual(t, maxPerZone(got), 2, "no zone holds more than ceil(6/3) shards")
+
+		// out[0] is the primary, matching Lookup(k,1).
+		assert.Equal(t, ids(r.Lookup(k, 1)), ids(got[:1]), "primary is out[0]")
+
+		// Balanced is never worse than Lookup's pass-2 zone-blind fill.
+		assert.LessOrEqual(t, maxPerZone(got), maxPerZone(r.Lookup(k, 6)),
+			"balanced max-per-zone ≤ plain Lookup's")
+	}
+}
+
+// TestLookupBalancedMinimizesMaxZone checks the general minimization: for a smaller rf the
+// spread stays ceil(rf/zones), and for a subset the primary's zone is used first.
+func TestLookupBalancedMinimizesMaxZone(t *testing.T) {
+	t.Parallel()
+
+	r := ring.New(zoned(
+		[2]string{"a1", "z1"}, [2]string{"a2", "z1"}, [2]string{"a3", "z1"},
+		[2]string{"b1", "z2"}, [2]string{"b2", "z2"}, [2]string{"b3", "z2"},
+		[2]string{"c1", "z3"}, [2]string{"c2", "z3"}, [2]string{"c3", "z3"},
+	)...)
+
+	for _, k := range keys(300) {
+		for _, rf := range []int{2, 3, 4, 5, 6, 9} {
+			got := r.LookupBalanced(k, rf)
+			require.Len(t, got, rf)
+			want := (rf + 2) / 3 // ceil(rf/3 zones)
+			assert.LessOrEqualf(t, maxPerZone(got), want, "rf=%d: max-per-zone ≤ ceil(rf/3)", rf)
+		}
+	}
+}
+
+// TestLookupBalancedEmptyZonesIsPureHRW confirms the placement is a no-op when zones are unset:
+// it reduces to score order, keeping the HRW prefix property, identical to Lookup.
+func TestLookupBalancedEmptyZonesIsPureHRW(t *testing.T) {
+	t.Parallel()
+
+	r := ring.New(nodes("a", "b", "c", "d", "e")...)
+	for _, k := range keys(300) {
+		for rf := 1; rf <= 5; rf++ {
+			assert.Equalf(t, ids(r.Lookup(k, rf)), ids(r.LookupBalanced(k, rf)),
+				"empty-zone LookupBalanced == Lookup (pure HRW), rf=%d", rf)
+		}
+	}
+}
+
+// TestLookupBalancedDeterministicAndBounded pins determinism and the small-ring bound.
+func TestLookupBalancedDeterministicAndBounded(t *testing.T) {
+	t.Parallel()
+
+	r := ring.New(zoned([2]string{"a1", "z1"}, [2]string{"b1", "z2"}, [2]string{"c1", "z3"})...)
+	for _, k := range keys(100) {
+		got := r.LookupBalanced(k, 10) // rf > ring size
+		assert.Len(t, got, 3, "capped at ring size")
+		assert.Equal(t, ids(got), ids(r.LookupBalanced(k, 10)), "deterministic")
+		assert.Equal(t, 3, distinctZones(got), "all three zones used")
+	}
+
+	assert.Nil(t, r.LookupBalanced(keys(1)[0], 0), "rf ≤ 0 ⇒ nil")
+	assert.Nil(t, (&ring.Ring{}).LookupBalanced(keys(1)[0], 3), "empty ring ⇒ nil")
+}
+
+// hierNode builds a node with a rack/server domain path.
+func hierNode(id, rack, server string) ring.Node {
+	return ring.Node{ID: id, Domains: []string{rack, server}}
+}
+
+// maxPerLevel returns the largest number of nodes sharing any one domain at the given level.
+func maxPerLevel(ns []ring.Node, level int) int {
+	counts := map[string]int{}
+	most := 0
+	for _, n := range ns {
+		counts[n.DomainAt(level)]++
+		if counts[n.DomainAt(level)] > most {
+			most = counts[n.DomainAt(level)]
+		}
+	}
+
+	return most
+}
+
+// TestLookupBalancedHierarchical checks the disk/server/rack-aware spread: 2 racks × 2 servers ×
+// 2 nodes (disks). Placing an ec(4,2) part (rf=6, taking 6 of 8 nodes) must balance at every
+// level — at most 3 per rack, and within a rack the shards spread across both servers.
+func TestLookupBalancedHierarchical(t *testing.T) {
+	t.Parallel()
+
+	r := ring.New(
+		hierNode("r1s1d1", "rack1", "srv1"), hierNode("r1s1d2", "rack1", "srv1"),
+		hierNode("r1s2d1", "rack1", "srv2"), hierNode("r1s2d2", "rack1", "srv2"),
+		hierNode("r2s1d1", "rack2", "srv3"), hierNode("r2s1d2", "rack2", "srv3"),
+		hierNode("r2s2d1", "rack2", "srv4"), hierNode("r2s2d2", "rack2", "srv4"),
+	)
+
+	for _, k := range keys(500) {
+		got := r.LookupBalanced(k, 6)
+		require.Len(t, got, 6)
+		assert.Len(t, dedup(ids(got)), 6, "distinct nodes (disks)")
+		assert.LessOrEqual(t, maxPerLevel(got, 0), 3, "≤ ceil(6/2) per rack")
+
+		// Within each rack the 3 shards spread across its two servers (2+1, never 3+0).
+		perServer := map[string]int{}
+		for _, n := range got {
+			perServer[n.DomainAt(0)+"/"+n.DomainAt(1)]++
+		}
+		for srv, c := range perServer {
+			assert.LessOrEqualf(t, c, 2, "server %s holds ≤ 2 shards (balanced within rack)", srv)
+		}
+	}
+}
+
+// TestLookupBalancedRackDominatesServer confirms the level priority: with 3 racks the part
+// spreads one-per-rack first (rack failure is worst), even though servers differ.
+func TestLookupBalancedRackDominatesServer(t *testing.T) {
+	t.Parallel()
+
+	r := ring.New(
+		hierNode("a", "rack1", "s1"), hierNode("b", "rack1", "s2"),
+		hierNode("c", "rack2", "s3"), hierNode("d", "rack2", "s4"),
+		hierNode("e", "rack3", "s5"), hierNode("f", "rack3", "s6"),
+	)
+
+	for _, k := range keys(300) {
+		got := r.LookupBalanced(k, 3)
+		require.Len(t, got, 3)
+		assert.Equal(t, 1, maxPerLevel(got, 0), "3 shards over 3 racks ⇒ one per rack")
+	}
+}

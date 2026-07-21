@@ -171,3 +171,16 @@ func TestGoldenMetaEncoding(t *testing.T) {
 	}
 	assert.Equal(t, want, m.AppendBinary(nil))
 }
+
+func TestSchemeMinZones(t *testing.T) {
+	t.Parallel()
+
+	// ec(4,2): 6 shards, tolerate 2 losses ⇒ need ceil(6/2)=3 zones for rack safety.
+	assert.Equal(t, 3, ec.Scheme{Data: 4, Parity: 2}.MinZones())
+	// ec(2,1): 3 shards, tolerate 1 ⇒ 3 zones (one shard per rack).
+	assert.Equal(t, 3, ec.Scheme{Data: 2, Parity: 1}.MinZones())
+	// ec(6,3): 9 shards, tolerate 3 ⇒ 3 zones.
+	assert.Equal(t, 3, ec.Scheme{Data: 6, Parity: 3}.MinZones())
+	// ec(4,4): 8 shards, tolerate 4 ⇒ 2 zones.
+	assert.Equal(t, 2, ec.Scheme{Data: 4, Parity: 4}.MinZones())
+}

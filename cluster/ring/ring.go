@@ -20,13 +20,48 @@ import (
 )
 
 // Node is a cluster member. ID is its stable, unique identity (the only thing that affects a
-// node's HRW score). Zone is an optional failure domain: [Ring.Lookup] spreads a key's replicas
-// across distinct zones where possible, so a single zone failure cannot take out every replica.
-// An empty Zone means "unspecified"; when every node's zone is empty (the default) placement is
-// pure HRW, identical to a zone-unaware ring.
+// node's HRW score).
+//
+// Failure domains are hierarchical, coarsest first: Domains holds the node's location as a path
+// such as {"rack1", "hostA"} — rack, then server — with the node itself the finest domain (a
+// disk). [Ring.LookupBalanced] spreads a key's shards to minimize how many land in any one
+// domain at each level (fewest per rack, then per server, then one per node/disk), so a whole
+// rack, server, or disk failure loses as few shards as the topology allows. Zone is the
+// single-level shorthand — equivalent to Domains == {Zone} — kept for the replica path
+// ([Ring.Lookup], which spreads across the coarsest domain only). When Domains is set it
+// supersedes Zone; when both are empty placement is pure HRW.
 type Node struct {
-	ID   string
-	Zone string
+	ID      string
+	Zone    string
+	Domains []string
+}
+
+// DomainAt returns the node's failure-domain label at the given level (0 = coarsest, e.g. the
+// rack), or "" when the node has no domain that deep.
+func (n Node) DomainAt(level int) string {
+	d := n.domains()
+	if level < len(d) {
+		return d[level]
+	}
+
+	return ""
+}
+
+// Depth returns the number of failure-domain levels the node declares.
+func (n Node) Depth() int { return len(n.domains()) }
+
+// domains returns the node's failure-domain path (coarsest first), falling back to the
+// single-level Zone shorthand, or nil when neither is set.
+func (n Node) domains() []string {
+	if len(n.Domains) > 0 {
+		return n.Domains
+	}
+
+	if n.Zone != "" {
+		return []string{n.Zone}
+	}
+
+	return nil
 }
 
 // Ring is an immutable set of nodes over which keys are placed by HRW hashing. The zero value
@@ -103,7 +138,7 @@ func (r *Ring) Lookup(key []byte, rf int) []Node {
 			break
 		}
 
-		zone := scored[i].node.Zone
+		zone := scored[i].node.DomainAt(0)
 		if _, used := usedZones[zone]; used {
 			continue
 		}
@@ -129,6 +164,109 @@ func (r *Ring) Lookup(key []byte, rf int) []Node {
 				out = append(out, scored[i].node)
 			}
 		}
+	}
+
+	return out
+}
+
+// LookupBalanced returns up to rf nodes for key, spread across the failure-domain hierarchy
+// **as evenly as possible** — it minimizes the maximum number of returned nodes in any one
+// domain at each level (fewest per rack, then per server, then one per node/disk), rather than
+// only guaranteeing distinct coarse domains up front like [Ring.Lookup]. This is the placement
+// erasure coding needs: an ec(k,m) part must not lose more than m of its k+m shards to a single
+// failure at any level, so the shards have to be balanced across the whole topology. With
+// enough racks the maximum per rack is `ceil(rf / racks)`, and within a rack the shards
+// balance across its servers the same way.
+//
+// out[0] is always the primary (the single highest-scoring node), so the compaction owner is
+// always among the returned set. When every node's domains are empty (the default), the result
+// is exactly score order — identical to [Ring.Lookup] / pure HRW. Fully deterministic; returns
+// fewer than rf nodes only when the ring is smaller, and nil for an empty ring or rf ≤ 0.
+func (r *Ring) LookupBalanced(key []byte, rf int) []Node {
+	if rf <= 0 || len(r.nodes) == 0 {
+		return nil
+	}
+
+	rf = min(rf, len(r.nodes))
+
+	return balancedOrder(r.scoreSorted(key), 0)[:rf]
+}
+
+// balancedOrder reorders score-sorted nodes so that any prefix is spread as evenly as possible
+// across the failure-domain hierarchy from `level` down: it groups the nodes by their domain
+// label at `level` (preserving score order, groups ranked by their best node), recursively
+// balances each group at the next finer level, then round-robins across the groups. Taking the
+// first N of the result therefore minimizes the count in any one domain at the coarsest level
+// first, then the next, and so on — with the nodes themselves (distinct disks) the finest
+// level. At or past the deepest declared level it is plain score order.
+func balancedOrder(nodes []scoredNode, level int) []Node {
+	if len(nodes) <= 1 || level >= maxDepth(nodes) {
+		return justNodes(nodes)
+	}
+
+	groups := make(map[string][]scoredNode, len(nodes))
+
+	var order []string // group labels in best-score order
+
+	for _, n := range nodes {
+		label := n.node.DomainAt(level)
+		if _, seen := groups[label]; !seen {
+			order = append(order, label)
+		}
+
+		groups[label] = append(groups[label], n)
+	}
+
+	// A single group at this level carries no diversity: descend to the next finer level.
+	if len(order) == 1 {
+		return balancedOrder(nodes, level+1)
+	}
+
+	ordered := make(map[string][]Node, len(order))
+	for _, label := range order {
+		ordered[label] = balancedOrder(groups[label], level+1)
+	}
+
+	// Round r takes the r-th balanced pick of every group (groups in best-score order), so the
+	// coarsest split is even and finer levels stay balanced within it.
+	out := make([]Node, 0, len(nodes))
+	for round := 0; ; round++ {
+		progressed := false
+
+		for _, label := range order {
+			if round >= len(ordered[label]) {
+				continue
+			}
+
+			out = append(out, ordered[label][round])
+			progressed = true
+		}
+
+		if !progressed {
+			break
+		}
+	}
+
+	return out
+}
+
+// maxDepth is the deepest failure-domain level any node in the set declares.
+func maxDepth(nodes []scoredNode) int {
+	d := 0
+	for _, n := range nodes {
+		if dd := n.node.Depth(); dd > d {
+			d = dd
+		}
+	}
+
+	return d
+}
+
+// justNodes strips the scores, preserving order.
+func justNodes(nodes []scoredNode) []Node {
+	out := make([]Node, len(nodes))
+	for i := range nodes {
+		out[i] = nodes[i].node
 	}
 
 	return out

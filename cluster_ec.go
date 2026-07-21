@@ -50,10 +50,13 @@ func (s *Storage) ecSchemeFor(shardKey signal.TenantID) (ec.Scheme, bool) {
 	return scheme, true
 }
 
-// ecOwners returns the addresses of shardKey's n ring-owners in slot order (slot i is owner i),
-// used both to place shards and to fetch them for reconstruction.
+// ecOwners returns the addresses of shardKey's n shard owners in slot order (slot i is owner i),
+// used both to place shards and to fetch them for reconstruction. Placement is **rack-aware**:
+// [ring.Ring.LookupBalanced] spreads the shards across zones (failure domains) as evenly as
+// possible, so losing one rack costs at most ceil(n/zones) shards — kept ≤ Parity when the
+// cluster has at least [ec.Scheme.MinZones] zones.
 func (s *Storage) ecOwners(shardKey signal.TenantID, n int) []string {
-	nodes := s.cluster.membership.Ring().Lookup([]byte(shardKey), n)
+	nodes := s.cluster.membership.Ring().LookupBalanced([]byte(shardKey), n)
 
 	addrs := make([]string, len(nodes))
 	for i, node := range nodes {
@@ -61,6 +64,24 @@ func (s *Storage) ecOwners(shardKey signal.TenantID, n int) []string {
 	}
 
 	return addrs
+}
+
+// ecZoneShortfall reports the distinct failure domains among shardKey's shard owners and whether
+// they meet the scheme's rack-safety floor (scheme.MinZones). Fewer zones than that means some
+// rack necessarily holds more than Parity shards, so a whole-rack failure could be
+// unrecoverable — the caller warns, but placement still proceeds (best-effort even spread).
+func (s *Storage) ecZoneShortfall(shardKey signal.TenantID, scheme ec.Scheme) (zones int, safe bool) {
+	nodes := s.cluster.membership.Ring().LookupBalanced([]byte(shardKey), scheme.Shards())
+
+	// Count distinct coarsest-level domains (racks): a rack failure is the worst case, so
+	// rack-safety (≤ Parity shards per rack) is the binding constraint. Finer levels (server,
+	// disk) balance within that via LookupBalanced.
+	seen := make(map[string]struct{}, len(nodes))
+	for _, n := range nodes {
+		seen[n.DomainAt(0)] = struct{}{}
+	}
+
+	return len(seen), len(seen) >= scheme.MinZones()
 }
 
 // ecBackend wraps the raw backend for an EC-policy tenant's engine: reads of an erasure-coded
@@ -186,6 +207,7 @@ func (s *Storage) convertColdParts(ctx context.Context, shardKey signal.TenantID
 	cutoff := time.Now().Add(-durationOf(pol)).UnixNano()
 
 	log := s.obs.Logger(ctx)
+	zones, rackSafe := s.ecZoneShortfall(shardKey, scheme)
 
 	for _, p := range parts {
 		if p.maxTime >= cutoff {
@@ -200,6 +222,15 @@ func (s *Storage) convertColdParts(ctx context.Context, shardKey signal.TenantID
 			continue
 		}
 
+		if !rackSafe {
+			// The topology cannot place this scheme rack-safely (a zone holds > Parity shards),
+			// so a whole-rack failure may be unrecoverable. Convert anyway — the shards are still
+			// spread as evenly as the zones allow — but make the shortfall visible.
+			log.Warn("ec: placement not rack-safe; a single zone failure may be unrecoverable",
+				zap.String("part", p.prefix), zap.Int("zones", zones),
+				zap.Int("need_zones", scheme.MinZones()), zap.Int("parity", scheme.Parity))
+		}
+
 		if _, err := ec.Convert(ctx, s.backend, p.prefix, scheme); err != nil {
 			log.Warn("ec: convert failed", zap.String("part", p.prefix), zap.Error(err))
 
@@ -207,7 +238,8 @@ func (s *Storage) convertColdParts(ctx context.Context, shardKey signal.TenantID
 		}
 
 		log.Debug("ec: converted cold part",
-			zap.String("part", p.prefix), zap.Int("data", scheme.Data), zap.Int("parity", scheme.Parity))
+			zap.String("part", p.prefix), zap.Int("data", scheme.Data),
+			zap.Int("parity", scheme.Parity), zap.Int("zones", zones))
 	}
 }
 
