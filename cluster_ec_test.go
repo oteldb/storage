@@ -371,3 +371,81 @@ func distinctSlots(t *testing.T, ctx context.Context, be backend.Backend) int {
 
 	return len(shardSlotsPresent(t, ctx, be))
 }
+
+// TestClusterECShardRepair proves in-place durability: on a 3-node ec(2,1) cluster the part is
+// coded so each owner holds one shard slot; one owner's shard is then destroyed (a disk failure
+// that keeps the node in the ring), and its maintenance pass rebuilds the shard by gathering the
+// k survivors and RS-reconstructing it — restoring the full shard set, with reads correct
+// throughout (the survivors reconstruct even before the repair completes).
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterECShardRepair(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"n1": openClusterNodeECDomains(t, endpoint, "n1", []string{"rack1"}, 2, 1),
+		"n2": openClusterNodeECDomains(t, endpoint, "n2", []string{"rack2"}, 2, 1),
+		"n3": openClusterNodeECDomains(t, endpoint, "n3", []string{"rack3"}, 2, 1),
+	}
+	n1 := nodes["n1"]
+
+	require.Eventually(t, func() bool {
+		return len(n1.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond)
+
+	scheme := ec.Scheme{Data: 2, Parity: 1}
+	owners := n1.cluster.membership.Ring().LookupBalanced([]byte("default"), scheme.Shards())
+	require.Len(t, owners, 3)
+
+	// Write to the shard's primary directly (a routed write from a non-primary is a separate
+	// concern), then drive to the coded, one-shard-per-owner steady state.
+	ts, vals := ecPayload(4096, 9)
+	_, err := nodes[owners[0].ID].WriteMetrics(ctx, gaugeBatch("api", "http.requests", ts, vals))
+	require.NoError(t, err)
+
+	settle := func() {
+		for range 6 {
+			for _, o := range owners {
+				nodes[o.ID].maintain(ctx)
+			}
+		}
+	}
+	settle()
+	for _, o := range owners {
+		require.Equalf(t, 1, distinctSlots(t, ctx, nodes[o.ID].backend), "%s holds one slot before the failure", o.ID)
+	}
+
+	// A disk failure destroys the slot-2 owner's shard (its node stays in the cluster).
+	victim := nodes[owners[2].ID]
+	vkeys, err := victim.backend.List(ctx, "default/metrics/0000000000/ecshard/")
+	require.NoError(t, err)
+	require.NotEmpty(t, vkeys)
+	for _, k := range vkeys {
+		require.NoError(t, victim.backend.Delete(ctx, k))
+	}
+	require.Equal(t, 0, distinctSlots(t, ctx, victim.backend), "victim's shard is gone")
+
+	// Reads still work immediately — the two surviving shards reconstruct the value column.
+	veng, ok := victim.lookupEngine("default")
+	require.True(t, ok)
+	got := queryEngine(t, veng, nameMatcher("http.requests"))
+	require.Len(t, got, 1)
+	assert.Equal(t, vals, got[0].Values, "reads survive the shard loss via reconstruction")
+
+	// The maintenance loop repairs: the victim rebuilds its own slot from the k survivors.
+	require.Eventually(t, func() bool {
+		victim.maintain(ctx)
+
+		return distinctSlots(t, ctx, victim.backend) == 1
+	}, 10*time.Second, 100*time.Millisecond, "the victim reconstructs its shard slot")
+
+	// Every node serves the full series after repair.
+	for id, s := range nodes {
+		eng, ok := s.lookupEngine("default")
+		require.Truef(t, ok, "%s has the engine", id)
+		got := queryEngine(t, eng, nameMatcher("http.requests"))
+		require.Lenf(t, got, 1, "%s serves the series post-repair", id)
+		assert.Equalf(t, vals, got[0].Values, "%s values", id)
+	}
+}
