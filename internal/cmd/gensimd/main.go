@@ -19,6 +19,7 @@ func main() {
 
 	genMinMaxInt64()
 	genMinMaxFloat64()
+	genEqualFixed16()
 
 	Generate()
 }
@@ -240,5 +241,67 @@ func genMinMaxFloat64() {
 	Label("done")
 	Store(rmin, ReturnIndex(0))
 	Store(rmax, ReturnIndex(1))
+	RET()
+}
+
+// genEqualFixed16 emits equalFixed16AVX2(blob, needle, dst []byte): dst[i] = 1 where the i-th
+// 16-byte row of blob equals needle, else 0. Two rows (32 bytes) are compared per iteration by
+// broadcasting needle into both 128-bit lanes of a YMM register, VPCMPEQB against the loaded
+// rows, and testing each lane's 16-bit VPMOVMSKB half for all-ones. The caller guarantees
+// len(dst) is even and len(blob) == len(dst)*16 (an odd tail row is handled by the Go wrapper via
+// the generic reference).
+func genEqualFixed16() {
+	TEXT("equalFixed16AVX2", NOSPLIT, "func(blob []byte, needle []byte, dst []byte)")
+	Doc("equalFixed16AVX2 sets dst[i]=1 where blob's i-th 16-byte row equals needle, 0 otherwise. len(dst) must be even.")
+
+	blobPtr := Load(Param("blob").Base(), GP64())
+	needlePtr := Load(Param("needle").Base(), GP64())
+	dstPtr := Load(Param("dst").Base(), GP64())
+	n := Load(Param("dst").Len(), GP64())
+
+	needleVec := YMM()
+	VBROADCASTI128(Mem{Base: needlePtr}, needleVec)
+
+	i := GP64()
+	XORQ(i, i)
+	blobOff := GP64()
+	XORQ(blobOff, blobOff)
+
+	v := YMM()
+	cmp := YMM()
+	mask := GP32()
+
+	Label("loop")
+	CMPQ(i, n)
+	JGE(LabelRef("done"))
+
+	VMOVDQU(Mem{Base: blobPtr, Index: blobOff, Scale: 1}, v)
+	VPCMPEQB(needleVec, v, cmp)
+	VPMOVMSKB(cmp, mask)
+
+	// Row 0 (low 16 bits of the byte mask) matches iff all 16 bytes compared equal. mask is kept
+	// intact (copied into low before masking) so row 1 can still read it below.
+	low := GP32()
+	MOVL(mask, low)
+	ANDL(U32(0xFFFF), low)
+	CMPL(low, U32(0xFFFF))
+	SETEQ(Mem{Base: dstPtr, Index: i, Scale: 1})
+
+	// Row 1's index and CMPL must sit back-to-back with no flags-clobbering instruction (e.g.
+	// ADDQ) between CMPL and SETEQ, so compute the index first.
+	dstRow1 := GP64()
+	MOVQ(i, dstRow1)
+	ADDQ(Imm(1), dstRow1)
+
+	SHRL(Imm(16), mask) // mask now holds row 1's 16 mask bits (high 16 bits of the original).
+	CMPL(mask, U32(0xFFFF))
+	SETEQ(Mem{Base: dstPtr, Index: dstRow1, Scale: 1})
+
+	ADDQ(Imm(2), i)
+	ADDQ(Imm(32), blobOff)
+	JMP(LabelRef("loop"))
+
+	Label("done")
+	VZEROUPPER()
 	RET()
 }
