@@ -152,8 +152,60 @@ TEXT ·equalFixed16AVX2(SB), NOSPLIT, $0-72
 	VBROADCASTI128 (CX), Y0
 	XORQ           CX, CX
 	XORQ           SI, SI
+	MOVQ           BX, DI
+	SUBQ           $0x07, DI
 
-loop:
+loop8:
+	CMPQ      CX, DI
+	JGE       tail2setup
+	VMOVDQU   (AX)(SI*1), Y1
+	VPCMPEQB  Y0, Y1, Y1
+	VPMOVMSKB Y1, R8
+	MOVL      R8, R9
+	ANDL      $0x0000ffff, R9
+	CMPL      R9, $0x0000ffff
+	SETEQ     (DX)(CX*1)
+	SHRL      $0x10, R8
+	CMPL      R8, $0x0000ffff
+	SETEQ     1(DX)(CX*1)
+	VMOVDQU   32(AX)(SI*1), Y1
+	VPCMPEQB  Y0, Y1, Y1
+	VPMOVMSKB Y1, R8
+	MOVL      R8, R9
+	ANDL      $0x0000ffff, R9
+	CMPL      R9, $0x0000ffff
+	SETEQ     2(DX)(CX*1)
+	SHRL      $0x10, R8
+	CMPL      R8, $0x0000ffff
+	SETEQ     3(DX)(CX*1)
+	VMOVDQU   64(AX)(SI*1), Y1
+	VPCMPEQB  Y0, Y1, Y1
+	VPMOVMSKB Y1, R8
+	MOVL      R8, R9
+	ANDL      $0x0000ffff, R9
+	CMPL      R9, $0x0000ffff
+	SETEQ     4(DX)(CX*1)
+	SHRL      $0x10, R8
+	CMPL      R8, $0x0000ffff
+	SETEQ     5(DX)(CX*1)
+	VMOVDQU   96(AX)(SI*1), Y1
+	VPCMPEQB  Y0, Y1, Y1
+	VPMOVMSKB Y1, R8
+	MOVL      R8, R9
+	ANDL      $0x0000ffff, R9
+	CMPL      R9, $0x0000ffff
+	SETEQ     6(DX)(CX*1)
+	SHRL      $0x10, R8
+	CMPL      R8, $0x0000ffff
+	SETEQ     7(DX)(CX*1)
+	ADDQ      $0x08, CX
+	ADDQ      $0x80, SI
+	JMP       loop8
+
+tail2setup:
+	SUBQ $0x01, BX
+
+loop2:
 	CMPQ      CX, BX
 	JGE       done
 	VMOVDQU   (AX)(SI*1), Y1
@@ -163,14 +215,12 @@ loop:
 	ANDL      $0x0000ffff, R8
 	CMPL      R8, $0x0000ffff
 	SETEQ     (DX)(CX*1)
-	MOVQ      CX, R8
-	ADDQ      $0x01, R8
 	SHRL      $0x10, DI
 	CMPL      DI, $0x0000ffff
-	SETEQ     (DX)(R8*1)
+	SETEQ     1(DX)(CX*1)
 	ADDQ      $0x02, CX
 	ADDQ      $0x20, SI
-	JMP       loop
+	JMP       loop2
 
 done:
 	VZEROUPPER
