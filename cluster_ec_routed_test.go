@@ -33,9 +33,19 @@ func TestClusterECRoutedWritePreservesValues(t *testing.T) {
 		"n3": openClusterNodeECDomains(t, endpoint, "n3", []string{"rack3"}, 2, 1),
 	}
 	n1 := nodes["n1"]
+
+	// Every node must see the full membership before we route: a routed write uses the origin
+	// node's own ring view to pick the primary, so if the origin has not converged it routes
+	// elsewhere and the primary we compute never receives it.
 	require.Eventually(t, func() bool {
-		return len(n1.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond)
+		for _, s := range nodes {
+			if len(s.cluster.membership.Members()) != 3 {
+				return false
+			}
+		}
+
+		return true
+	}, 15*time.Second, 50*time.Millisecond)
 
 	primary, _ := n1.cluster.membership.Ring().Primary([]byte("default"))
 
