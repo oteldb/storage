@@ -26,7 +26,14 @@ func MetaKey(partPrefix string) string { return partPrefix + "/" + MetaObject }
 // ShardKey returns the backend key under which shard slot holds object (a part-relative name
 // like "c/0") for the part at partPrefix.
 func ShardKey(partPrefix string, slot int, object string) string {
-	return partPrefix + "/ecshard/" + strconv.Itoa(slot) + "/" + object
+	return ShardSlotPrefix(partPrefix, slot) + object
+}
+
+// ShardSlotPrefix is the backend key prefix under which shard slot's objects live for the part
+// at partPrefix — a List of it enumerates exactly that slot's shards (used to confirm a peer
+// holds its slot before the owner prunes its staged copy).
+func ShardSlotPrefix(partPrefix string, slot int) string {
+	return partPrefix + "/ecshard/" + strconv.Itoa(slot) + "/"
 }
 
 // shardMarker separates a part prefix from a shard slot in an EC shard key.

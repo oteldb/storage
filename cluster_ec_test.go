@@ -327,6 +327,17 @@ func TestClusterECSlotFiltering(t *testing.T) {
 		}, 10*time.Second, 100*time.Millisecond, "slot-%d replica mirrors only its own slot", slot)
 	}
 
+	// Now that every replica holds its slot, the owner prunes its staged copies: a further
+	// maintenance pass confirms each peer and drops the foreign shards, leaving it slot-0 only —
+	// so every node (owner included) holds exactly one shard: the 1.5× storage target.
+	primary := nodes[primaryID]
+	require.Eventually(t, func() bool {
+		primary.maintain(ctx)
+		slots := shardSlotsPresent(t, ctx, primary.backend)
+
+		return len(slots) == 1 && slots[0]
+	}, 10*time.Second, 100*time.Millisecond, "owner prunes staged shards to its own slot")
+
 	// Every node still serves the full series (own slot local + peers reconstruct).
 	for id, s := range nodes {
 		eng, ok := s.lookupEngine("default")

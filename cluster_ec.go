@@ -257,38 +257,144 @@ func (s *Storage) convertColdParts(ctx context.Context, shardKey signal.TenantID
 	log := s.obs.Logger(ctx)
 	zones, rackSafe := s.ecZoneShortfall(shardKey, scheme)
 
-	for _, p := range parts {
-		if p.maxTime >= cutoff {
-			continue // still hot: keep full-copy for fast reads
-		}
+	owners := s.ecOwners(shardKey, scheme.Shards())
 
-		if _, converted, err := ec.Converted(ctx, s.backend, p.prefix); err != nil {
+	mySlot := indexOfString(owners, s.cluster.self)
+	client := &partsync.Client{HTTP: s.cluster.httpc}
+
+	for _, p := range parts {
+		meta, converted, err := ec.Converted(ctx, s.backend, p.prefix)
+		if err != nil {
 			log.Warn("ec: sidecar probe failed", zap.String("part", p.prefix), zap.Error(err))
 
 			continue
-		} else if converted {
-			continue
 		}
 
-		if !rackSafe {
-			// The topology cannot place this scheme rack-safely (a zone holds > Parity shards),
-			// so a whole-rack failure may be unrecoverable. Convert anyway — the shards are still
-			// spread as evenly as the zones allow — but make the shortfall visible.
-			log.Warn("ec: placement not rack-safe; a single zone failure may be unrecoverable",
-				zap.String("part", p.prefix), zap.Int("zones", zones),
-				zap.Int("need_zones", scheme.MinZones()), zap.Int("parity", scheme.Parity))
+		if !converted {
+			if p.maxTime >= cutoff {
+				continue // still hot: keep full-copy for fast reads
+			}
+
+			if !rackSafe {
+				// The topology cannot place this scheme rack-safely (a zone holds > Parity
+				// shards), so a whole-rack failure may be unrecoverable. Convert anyway — the
+				// shards are still spread as evenly as the zones allow — but flag the shortfall.
+				log.Warn("ec: placement not rack-safe; a single zone failure may be unrecoverable",
+					zap.String("part", p.prefix), zap.Int("zones", zones),
+					zap.Int("need_zones", scheme.MinZones()), zap.Int("parity", scheme.Parity))
+			}
+
+			if meta, err = ec.Convert(ctx, s.backend, p.prefix, scheme); err != nil {
+				log.Warn("ec: convert failed", zap.String("part", p.prefix), zap.Error(err))
+
+				continue
+			}
+
+			log.Debug("ec: converted cold part",
+				zap.String("part", p.prefix), zap.Int("data", scheme.Data),
+				zap.Int("parity", scheme.Parity), zap.Int("zones", zones))
 		}
 
-		if _, err := ec.Convert(ctx, s.backend, p.prefix, scheme); err != nil {
-			log.Warn("ec: convert failed", zap.String("part", p.prefix), zap.Error(err))
-
-			continue
-		}
-
-		log.Debug("ec: converted cold part",
-			zap.String("part", p.prefix), zap.Int("data", scheme.Data),
-			zap.Int("parity", scheme.Parity), zap.Int("zones", zones))
+		// The compaction owner stages every shard on conversion; once each slot-owner peer holds
+		// its shard, drop the staged foreign copies so this node keeps only its own slot — the
+		// EC storage target. Reconstruction then fetches a foreign slot from its owner.
+		s.pruneStagedShards(ctx, client, p.prefix, meta, scheme, owners, mySlot)
 	}
+}
+
+// pruneStagedShards deletes the owner's staged copies of every slot it does not own, but only
+// after confirming each of those slots is present on its own owner (so a prune never drops the
+// last copy of a shard). A no-op when this node holds no foreign shards, when it is not an owner,
+// or when the ring is too small to place every slot (the extra copies stay as redundancy).
+func (s *Storage) pruneStagedShards(
+	ctx context.Context, client *partsync.Client, prefix string, meta *ec.Meta,
+	scheme ec.Scheme, owners []string, mySlot int,
+) {
+	if mySlot < 0 || !s.ownerHasForeignShards(ctx, prefix, mySlot) {
+		return
+	}
+
+	for slot := range scheme.Shards() {
+		if slot == mySlot {
+			continue
+		}
+
+		if slot >= len(owners) || owners[slot] == s.cluster.self {
+			return // slot unplaced (ring smaller than k+m) or aliased to self: keep the staged copy
+		}
+
+		if !peerHoldsSlot(ctx, client, owners[slot], prefix, slot, meta) {
+			return // not yet confirmed on its owner — keep every staged copy for now
+		}
+	}
+
+	for slot := range scheme.Shards() {
+		if slot == mySlot {
+			continue
+		}
+
+		for _, o := range meta.Objects {
+			if err := s.backend.Delete(ctx, ec.ShardKey(prefix, slot, o.Name)); err != nil && !errors.Is(err, backend.ErrNotExist) {
+				s.obs.Logger(ctx).Warn("ec: prune staged shard failed",
+					zap.String("part", prefix), zap.Int("slot", slot), zap.Error(err))
+
+				return
+			}
+		}
+	}
+
+	s.obs.Logger(ctx).Debug("ec: pruned staged shards to own slot",
+		zap.String("part", prefix), zap.Int("slot", mySlot))
+}
+
+// ownerHasForeignShards reports whether this node's backend still holds any shard slot other
+// than its own for the part (i.e. staged copies pending distribution).
+func (s *Storage) ownerHasForeignShards(ctx context.Context, prefix string, mySlot int) bool {
+	keys, err := s.backend.List(ctx, prefix+"/ecshard/")
+	if err != nil {
+		return false
+	}
+
+	for _, k := range keys {
+		if slot, ok := ec.ShardSlotOf(k); ok && slot != mySlot {
+			return true
+		}
+	}
+
+	return false
+}
+
+// peerHoldsSlot reports whether the peer at addr holds every object of the part's given shard
+// slot (an unreachable peer or a missing object reads as "not yet").
+func peerHoldsSlot(ctx context.Context, client *partsync.Client, addr, prefix string, slot int, meta *ec.Meta) bool {
+	keys, err := client.List(ctx, addr, ec.ShardSlotPrefix(prefix, slot))
+	if err != nil {
+		return false
+	}
+
+	have := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		have[k] = struct{}{}
+	}
+
+	for _, o := range meta.Objects {
+		if _, ok := have[ec.ShardKey(prefix, slot, o.Name)]; !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
+// indexOfString returns the index of v in s, or -1.
+func indexOfString(s []string, v string) int {
+	for i, x := range s {
+		if x == v {
+			return i
+		}
+	}
+
+	return -1
 }
 
 // durationOf is the EC age threshold; a nil policy (EC disabled) yields zero (which would

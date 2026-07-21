@@ -1045,10 +1045,14 @@ filtered pull **reconciles by object presence** (idempotent) rather than gating 
 generation. The owner set is consistent across the head-replication targets, the sync peers, and
 the shard placement: for an EC tenant `rfFor` returns Data+Parity (the head is full-copy
 replicated to every shard owner so each can hold its shard) and every owner lookup goes through
-`ownerLookup`, which uses the balanced (rack/server/disk-aware) placement. The compaction owner
-(the ring primary) still holds all shards as the distribution source; pruning it to its own slot
-and repairing a lost slot after node loss are the remaining milestones, along with the chaos
-e2e.
+`ownerLookup`, which uses the balanced (rack/server/disk-aware) placement. **Owner prune.** The compaction owner stages every shard on conversion (the distribution
+source); once each slot-owner peer holds its shard — the owner confirms by listing the peer's
+`ecshard/{slot}/` objects — it deletes its staged copies of every foreign slot, keeping only its
+own. Every node then holds exactly one shard per part: (Data+Parity)/Data storage (1.5× at
+ec(4,2)), the EC target. The prune never drops the last copy of a slot (it confirms first) and
+is skipped when the ring is smaller than Data+Parity (the extra copies stay as redundancy);
+reconstruction fetches a pruned foreign slot from its owner. Repairing a lost slot after node
+loss and the chaos e2e are the remaining milestones (before geo-replication).
 
 Closed parity items: the write path is primary-authoritative, so the OOO decision is made once
 by the shard primary (`engine.ApplyPrimary`) and secondaries apply the accepted set verbatim
