@@ -161,42 +161,34 @@ loop8:
 	VMOVDQU   (AX)(SI*1), Y1
 	VPCMPEQB  Y0, Y1, Y1
 	VPMOVMSKB Y1, R8
-	MOVL      R8, R9
-	ANDL      $0x0000ffff, R9
-	CMPL      R9, $0x0000ffff
+	NOTL      R8
+	TESTL     $0x0000ffff, R8
 	SETEQ     (DX)(CX*1)
-	SHRL      $0x10, R8
-	CMPL      R8, $0x0000ffff
+	TESTL     $0xffff0000, R8
 	SETEQ     1(DX)(CX*1)
 	VMOVDQU   32(AX)(SI*1), Y1
 	VPCMPEQB  Y0, Y1, Y1
 	VPMOVMSKB Y1, R8
-	MOVL      R8, R9
-	ANDL      $0x0000ffff, R9
-	CMPL      R9, $0x0000ffff
+	NOTL      R8
+	TESTL     $0x0000ffff, R8
 	SETEQ     2(DX)(CX*1)
-	SHRL      $0x10, R8
-	CMPL      R8, $0x0000ffff
+	TESTL     $0xffff0000, R8
 	SETEQ     3(DX)(CX*1)
 	VMOVDQU   64(AX)(SI*1), Y1
 	VPCMPEQB  Y0, Y1, Y1
 	VPMOVMSKB Y1, R8
-	MOVL      R8, R9
-	ANDL      $0x0000ffff, R9
-	CMPL      R9, $0x0000ffff
+	NOTL      R8
+	TESTL     $0x0000ffff, R8
 	SETEQ     4(DX)(CX*1)
-	SHRL      $0x10, R8
-	CMPL      R8, $0x0000ffff
+	TESTL     $0xffff0000, R8
 	SETEQ     5(DX)(CX*1)
 	VMOVDQU   96(AX)(SI*1), Y1
 	VPCMPEQB  Y0, Y1, Y1
 	VPMOVMSKB Y1, R8
-	MOVL      R8, R9
-	ANDL      $0x0000ffff, R9
-	CMPL      R9, $0x0000ffff
+	NOTL      R8
+	TESTL     $0x0000ffff, R8
 	SETEQ     6(DX)(CX*1)
-	SHRL      $0x10, R8
-	CMPL      R8, $0x0000ffff
+	TESTL     $0xffff0000, R8
 	SETEQ     7(DX)(CX*1)
 	ADDQ      $0x08, CX
 	ADDQ      $0x80, SI
@@ -211,12 +203,10 @@ loop2:
 	VMOVDQU   (AX)(SI*1), Y1
 	VPCMPEQB  Y0, Y1, Y1
 	VPMOVMSKB Y1, DI
-	MOVL      DI, R8
-	ANDL      $0x0000ffff, R8
-	CMPL      R8, $0x0000ffff
+	NOTL      DI
+	TESTL     $0x0000ffff, DI
 	SETEQ     (DX)(CX*1)
-	SHRL      $0x10, DI
-	CMPL      DI, $0x0000ffff
+	TESTL     $0xffff0000, DI
 	SETEQ     1(DX)(CX*1)
 	ADDQ      $0x02, CX
 	ADDQ      $0x20, SI

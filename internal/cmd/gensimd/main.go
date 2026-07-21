@@ -247,7 +247,8 @@ func genMinMaxFloat64() {
 // genEqualFixed16 emits equalFixed16AVX2(blob, needle, dst []byte): dst[i] = 1 where the i-th
 // 16-byte row of blob equals needle, else 0. Rows are compared 2 at a time (one 32-byte YMM
 // register holds needle broadcast into both 128-bit lanes, VPCMPEQB against 2 loaded rows,
-// VPMOVMSKB's two 16-bit halves each test for all-ones), but — unlike a naive single-vector loop —
+// VPMOVMSKB's two 16-bit halves each test — after inverting, so a set bit means mismatch — for
+// all-zero), but — unlike a naive single-vector loop —
 // the main loop runs 4 of these 2-row compares per iteration (8 rows / 128 bytes), each against
 // its own fresh set of registers. The four compares have no data dependency on each other (each
 // only reads blobPtr/blobOff/needleVec/i/dstPtr and writes its own registers/dst bytes), so even
@@ -287,7 +288,7 @@ func genEqualFixed16() {
 	// so no flags-clobber hazard: an earlier version computed dst[i+1]'s address via a runtime
 	// ADDQ sitting between the CMPL and the SETEQ that reads its flags, which clobbered them for
 	// odd rows; addressing via a constant displacement instead sidesteps the hazard entirely).
-	// Every call allocates fresh v/cmp/mask/low registers, so independent calls carry no false
+	// Every call allocates fresh v/cmp/mask registers, so independent calls carry no false
 	// dependency (see the func doc above).
 	cmpPair := func(blobDisp, rowDisp int) {
 		v := YMM()     // this pair's 2-row (32-byte) load from blob
@@ -298,20 +299,16 @@ func genEqualFixed16() {
 		VPCMPEQB(needleVec, v, cmp)
 		VPMOVMSKB(cmp, mask)
 
-		// Row 0 of the pair matches if and only if all 16 of its bits (mask's low 16 bits) are set
-		// — every byte compared equal. Copy into low before masking (rather than masking mask
-		// itself) so mask is still intact for row 1's check below.
-		low := GP32()
-		MOVL(mask, low)
-		ANDL(U32(0xFFFF), low)                                       // low &= 0x0000FFFF: keep only row 0's 16 bits
-		CMPL(low, U32(0xFFFF))                                       // sets ZF when low == 0xFFFF (all 16 bytes matched)
+		// Invert once so a bit means "byte k did NOT match" instead of "did match": row 0
+		// matched in full iff none of its 16 (now-inverted) bits are set, which TESTL answers
+		// directly (TEST computes an AND and only sets flags — it never writes back to mask), so
+		// both rows below test the very same register with no copy and no shift.
+		NOTL(mask)
+
+		TESTL(U32(0x0000FFFF), mask)                                 // ZF set iff row 0's 16 bytes all matched (no mismatch bit set)
 		SETEQ(Mem{Base: dstPtr, Index: i, Scale: 1}.Offset(rowDisp)) // dst[i+rowDisp] = ZF ? 1 : 0
 
-		// Row 1's 16 bits are mask's top half (bits 16-31); shift down to bits 0-15 so the same
-		// 0xFFFF comparison serves both rows. mask is dead after this (last use), so shifting it
-		// in place — instead of copying to a fresh register, as row 0 did — costs nothing extra.
-		SHRL(Imm(16), mask)
-		CMPL(mask, U32(0xFFFF))                                          // ZF set when row 1's 16 bytes all matched
+		TESTL(U32(0xFFFF0000), mask)                                     // ZF set iff row 1's 16 bytes all matched
 		SETEQ(Mem{Base: dstPtr, Index: i, Scale: 1}.Offset(rowDisp + 1)) // dst[i+rowDisp+1] = ZF ? 1 : 0
 	}
 
