@@ -71,7 +71,7 @@ func (s *Storage) recordEngineCached(
 	e := recordengine.New(recordengine.Config{
 		Schema:    schema,
 		OOOWindow: s.opts.OOOWindow,
-		Backend:   s.backend,
+		Backend:   s.backendFor(tid),
 		Prefix:    prefix,
 		SideStore: side,
 		WAL:       w,
