@@ -54,11 +54,27 @@ const (
 	pruneAfterMisses = 2
 )
 
+// validKey reports whether a peer-supplied key or prefix is safe to hand to the backend:
+// relative, slash-delimited, and free of traversal or NUL. Backends validate again (the file
+// backend keeps every path under its root); this check is defense-in-depth at the network
+// boundary, rejecting hostile input before it reaches any backend.
+func validKey(k string) bool {
+	return !strings.Contains(k, "..") && !strings.HasPrefix(k, "/") &&
+		!strings.ContainsAny(k, "\\\x00")
+}
+
 // ListHandler serves the backend keys under the "prefix" query parameter, framed as a uvarint
 // count followed by uvarint-length-prefixed keys.
 func ListHandler(be backend.Backend) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		keys, err := be.List(req.Context(), req.URL.Query().Get("prefix"))
+		prefix := req.URL.Query().Get("prefix")
+		if !validKey(prefix) {
+			http.Error(w, "invalid prefix", http.StatusBadRequest)
+
+			return
+		}
+
+		keys, err := be.List(req.Context(), prefix)
 		if err != nil {
 			http.Error(w, "list: "+err.Error(), http.StatusInternalServerError)
 
@@ -80,7 +96,14 @@ func ListHandler(be backend.Backend) http.Handler {
 // checksum in a response header. A missing key is a 404.
 func ObjectHandler(be backend.Backend) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		data, err := backend.ReadView(req.Context(), be, req.URL.Query().Get("key"))
+		key := req.URL.Query().Get("key")
+		if key == "" || !validKey(key) {
+			http.Error(w, "invalid key", http.StatusBadRequest)
+
+			return
+		}
+
+		data, err := backend.ReadView(req.Context(), be, key)
 		if err != nil {
 			if errors.Is(err, backend.ErrNotExist) {
 				http.Error(w, "no such object", http.StatusNotFound)

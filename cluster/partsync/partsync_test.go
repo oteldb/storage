@@ -276,3 +276,31 @@ func TestSyncNoPeersIsNoop(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, st.Synced)
 }
+
+func TestHandlersRejectHostileKeys(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	be := backend.Memory()
+	require.NoError(t, be.Write(ctx, "t/metrics/secret", []byte("data")))
+	addr := serve(t, be)
+	c := &partsync.Client{}
+
+	// Traversal, absolute, backslash, and empty keys are rejected at the boundary — before any
+	// backend touch — regardless of the backend's own validation.
+	for _, key := range []string{"../etc/passwd", "t/../../etc/passwd", "/etc/passwd", `t\metrics`, ""} {
+		_, err := c.Fetch(ctx, addr, key)
+		require.Errorf(t, err, "key %q rejected", key)
+		require.NotErrorIsf(t, err, partsync.ErrNotExist, "key %q is a 400, not a 404", key)
+	}
+
+	for _, prefix := range []string{"../", "a/../../b", "/abs", `a\b`} {
+		_, err := c.List(ctx, addr, prefix)
+		require.Errorf(t, err, "prefix %q rejected", prefix)
+	}
+
+	// The empty prefix (full listing) stays allowed.
+	keys, err := c.List(ctx, addr, "")
+	require.NoError(t, err)
+	assert.Len(t, keys, 1)
+}
