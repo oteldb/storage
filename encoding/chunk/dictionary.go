@@ -1,6 +1,7 @@
 package chunk
 
 import (
+	"errors"
 	"slices"
 	"sync"
 
@@ -496,6 +497,64 @@ func decodeFlatGather(r *bitstream.Reader, dst [][]byte, rows, avail int) ([][]b
 	}
 
 	return dst, nil
+}
+
+// errNotFixedWidth is returned by [DecodeBytesRawBlob] for a stream that was not written by
+// [EncodeBytesRaw]/[EncodeBytesRawBlob] (dictionary or flat-fallback streams have no flat blob to
+// hand back — callers of those must use [DecodeBytesDict]/[DecodeBytes] instead).
+var errNotFixedWidth = errors.New("chunk: not a fixed-width (flagFixed) bytes stream")
+
+// DecodeBytesRawBlob decodes a flagFixed-encoded column (as written by [EncodeBytesRaw]/
+// [EncodeBytesRawBlob]) into its flat form: the contiguous rows×width backing blob, width, and row
+// count — with no per-row [][]byte slice headers built over it, unlike [DecodeBytes]/
+// [DecodeBytesDict]. This is the shape a stride/SIMD equality scan operates on directly. The
+// returned blob aliases src. It returns [errNotFixedWidth] if the stream is not flagFixed (e.g. a
+// dictionary or flat-fallback stream from a low- or mixed-width column).
+func DecodeBytesRawBlob(src []byte) (blob []byte, width, rows int, err error) {
+	var r bitstream.Reader
+
+	rows, _, err = readHeaderInto(src, &r)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+
+	if rows == 0 {
+		return nil, 0, 0, nil
+	}
+
+	if rows < 0 { // a row count above maxInt wraps negative via int(uvarint): corrupt
+		return nil, 0, 0, errUnexpectedEOF
+	}
+
+	flag, err := r.ReadByte()
+	if err != nil {
+		return nil, 0, 0, err
+	}
+
+	if flag != flagFixed {
+		return nil, 0, 0, errNotFixedWidth
+	}
+
+	w, err := r.ReadUvarint()
+	if err != nil {
+		return nil, 0, 0, err
+	}
+
+	if w == 0 && rows > maxEmptyFixedRows {
+		return nil, 0, 0, errUnexpectedEOF
+	}
+
+	total, err := fixedTotal(rows, w)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+
+	blob, err = r.ReadBytesView(total)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+
+	return blob, int(w), rows, nil
 }
 
 // decodeFixedGather fills dst from a flagFixed payload: [uvarint width][rows×width bytes].
