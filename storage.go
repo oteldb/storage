@@ -1115,6 +1115,11 @@ func (s *Storage) maintain(ctx context.Context) {
 		s.maintStats.cycles.Add(1)
 	}()
 
+	// A node promoted into an owner set it never held (a spare) has no engine for the tenant,
+	// so the engine snapshots below would never surface it: discover and bootstrap such shards
+	// first (etcd claims → peer mirror → engine load), then maintain as usual.
+	s.bootstrapGainedTenants(ctx)
+
 	metricEngines := s.engineSnapshotByTenant()
 	logEngines := s.logEngineSnapshotByTenant()
 	traceEngines := s.traceEngineSnapshotByTenant()

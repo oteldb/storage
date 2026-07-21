@@ -1061,10 +1061,18 @@ an owner but never pushes another out, the surviving owners always hold ≥ Data
 reconstructs even before repair runs and repair always has enough to rebuild. This makes
 own-slot shards **authoritative locally**: partsync's prune protects a shard whose part is still
 in the index from the source-absence quarantine (`livePart`) — otherwise a replica would drop
-its own shard right after the owner prunes its staged copy, and both would lose it. Two gaps
-remain before this is complete node-loss durability: a **newly-promoted owner** (a spare that
-never held the tenant) has no engine to serve until a bootstrap path creates one, and the chaos
-e2e — then geo-replication.
+its own shard right after the owner prunes its staged copy, and both would lose it. **Gained-owner bootstrap.** A spare promoted into an owner set it never held has no engine (the
+head only reaches existing owners) — and since the maintenance loop iterates local engines, it
+would never even look at the tenant. Each maintenance cycle therefore first discovers such
+shards: one etcd range read over the compaction claims (`Ownership.Claims` — any live shard has
+a claiming owner) yields the cluster's shard list; for each shard this node owns per the ring
+but has no engine for, it mirrors the shard's data from its peers (partsync, EC-slot-filtered
+where the policy applies), then creates the engine over whichever signal prefixes now have a
+bucket index locally — the same backend-driven discovery startup recovery uses — and loads its
+parts. After a pass the spare serves the shard's flushed data; the head converges through the
+normal write/flush/mirror path. A shard whose every owner died has no claim and is not
+discoverable this way (its data is only on the lost nodes' disks). Remaining: the chaos e2e —
+then geo-replication.
 
 Closed parity items: the write path is primary-authoritative, so the OOO decision is made once
 by the shard primary (`engine.ApplyPrimary`) and secondaries apply the accepted set verbatim
