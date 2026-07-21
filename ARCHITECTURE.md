@@ -993,9 +993,20 @@ erasure-coded flushed parts (`tenant.Durability.EC`): systematic Reed-Solomon ov
 `Scheme{Data,Parity}` capped at 256 total shards), plus the per-part `Meta` sidecar
 (scheme + each coded object's size and per-shard xxh3 checksums, whole-payload
 checksummed, fuzzed and golden-tested). An object split into Data+Parity shards survives
-any Parity losses at (Data+Parity)/Data storage. Placement (shard slot per ring owner),
-the reconstructing read path, and repair are later milestones — no engine or partsync
-code consumes the codec yet.
+any Parity losses at (Data+Parity)/Data storage. The **layout** is fixed: shard slot i of a
+part object lives at `{partPrefix}/ecshard/{i}/{object}` on ring-owner i (owner count is
+exactly Data+Parity; the tenant's RF is ignored when EC is set), the sidecar at
+`{partPrefix}/ecmeta` on every owner, and objects under a 4 KiB floor (`FullCopyFloor`)
+stay full-copy everywhere — k+m shards of a tiny object cost more than they save. The
+**reconstructing read path** (`ec.Reader`) wraps a node's private backend: a local full copy
+is served as-is; otherwise the key is split at the fixed-width part-sequence segment
+(`SplitKey`), the sidecar consulted, and any Data checksum-valid shards gathered (own slot
+locally first, then peers via a slot-addressed `PeerFetch`) and reconstructed — a corrupt or
+unreachable shard is skipped, tolerating Parity failures, and sub-floor/full-copy objects
+never pay the gather. `EncodeObject`/`ShouldShard` are the writer-side helpers the converter
+and repair use. Remaining milestones: the merge re-encode tier (cold parts → EC at the
+compaction owner), partsync slot filtering + repair, and the chaos e2e — the engines do not
+read through `ec.Reader` yet.
 
 Closed parity items: the write path is primary-authoritative, so the OOO decision is made once
 by the shard primary (`engine.ApplyPrimary`) and secondaries apply the accepted set verbatim
@@ -1582,7 +1593,7 @@ cluster/              L0 distribution: ring + membership + (later) replication �
   cluster/etcd        etcd-backed live membership (lease + watch → atomic ring)          [implemented; embedded-etcd tested]
   cluster/replica     quorum write-replication + node-to-node HTTP transport             [implemented]
   cluster/partsync    shared-nothing flushed-part mirroring between private backends     [implemented]
-  cluster/ec          Reed-Solomon codec + per-part Meta sidecar for erasure-coded parts [codec implemented; placement/read/repair pending]
+  cluster/ec          Reed-Solomon codec + Meta sidecar + layout + reconstructing Reader  [codec+read implemented; convert/repair pending]
   cluster/rebalance   minimal ownership-handoff plan from a ring diff (pure)              [implemented]
   cluster/etcd (ownership.go) exclusive compaction claims (CAS+lease) — the rebalance executor [implemented]
   cluster/            cluster write path: EncodeWrite codec + Writer + Config             [implemented]
