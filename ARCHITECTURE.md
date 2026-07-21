@@ -816,7 +816,12 @@ properties make it the sharding base:
   The primary is still the single highest-scoring node. When every zone is empty (the default) the
   result is exactly the score-ordered top-`rf` — pure HRW, no behavior change — so zone-awareness
   costs nothing until an operator sets zones (`Config.Self.Zone`, plumbed membership→ring). A
-  property test pins the spread and the empty-zone equivalence.
+  property test pins the spread and the empty-zone equivalence. **Hierarchical placement** —
+  `LookupBalanced` (used by erasure coding) generalizes this to a failure-domain *hierarchy*
+  (`Node.Domains`, coarsest first: rack, server, with the node the finest — a disk): it minimizes
+  the shards in any one domain at each level (fewest per rack, then per server), which EC needs
+  since an ec(k,m) part must lose at most m shards to any single failure. `Zone` is the
+  single-level shorthand (`Domains == {Zone}`); both are plumbed `Config.Self`→membership→ring.
 
 The `Ring` is immutable (`With`/`Without` return a new ring).
 
@@ -1020,7 +1025,13 @@ a hot part not yet converted, or a sub-floor object — is returned as a zero-co
 converted object is reconstructed via `ec.Reader` (this node's shard slot from the local
 backend, the rest fetched from the slot-owning peers over the partsync object endpoint), keyed
 off the part's `ecmeta`. Owner count is exactly Data+Parity (the tenant's RF is ignored under
-EC); the shard slot is this node's index in `Lookup(shardKey, Data+Parity)`. Writes/list/delete
+EC); the shard slot is this node's index in `LookupBalanced(shardKey, Data+Parity)` — a
+**topology-aware** placement that spreads the shards across the failure-domain hierarchy
+(`Node.Domains`, coarsest first: rack, then server, with the node itself the finest domain — a
+disk), minimizing how many land in any one rack, then server, so a whole-rack/server/disk
+failure loses the fewest shards. A scheme is rack-safe when the cluster has at least
+`ec.Scheme.MinZones` = `ceil(Shards/Parity)` racks (≤ Parity shards per rack); the converter logs
+a warning when the topology falls short but still places as evenly as it can. Writes/list/delete
 pass through to the raw backend, so flush, partsync mirroring, and the converter still see the
 plain layout. The compaction owner runs `ec.Convert` on cold parts from the owned branch of the
 maintenance loop (after merge, before the flush notify), skipping already-converted parts.
@@ -1612,7 +1623,7 @@ query/scale           fetch-seam scale-out decorators: split-by-interval + resul
 query/profile         EXPLAIN ANALYZE: concurrency-safe per-query timing tree (ctx-threaded, no-op default) + binary encode/decode for distributed grafting [implemented]
 query/promql          OPTIONAL adapter: fetch → Prometheus storage.Queryable (no engine) [implemented; only package importing prometheus]
 cluster/              L0 distribution: ring + membership + (later) replication · rebalance [partly implemented]
-  cluster/ring        rendezvous (HRW) hashing: deterministic placement, ~1/N movement, zone-aware replica spread [implemented]
+  cluster/ring        rendezvous (HRW) hashing: deterministic placement, ~1/N movement, hierarchical (rack/server/disk) balanced spread [implemented]
   cluster/etcd        etcd-backed live membership (lease + watch → atomic ring)          [implemented; embedded-etcd tested]
   cluster/replica     quorum write-replication + node-to-node HTTP transport             [implemented]
   cluster/partsync    shared-nothing flushed-part mirroring between private backends     [implemented]

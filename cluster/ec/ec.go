@@ -42,6 +42,19 @@ func (s Scheme) Validate() error {
 // Shards is the total shard count.
 func (s Scheme) Shards() int { return s.Data + s.Parity }
 
+// MinZones is the number of distinct failure domains (racks/zones) needed to place the shards
+// so that losing any one zone costs at most Parity shards — i.e. the placement stays
+// recoverable through a whole-rack failure. It is `ceil(Shards / Parity)`: with that many
+// zones a balanced placement holds at most Parity shards per zone. Fewer zones cannot be made
+// rack-safe for this scheme (a zone must then hold more than Parity shards).
+func (s Scheme) MinZones() int {
+	if s.Parity < 1 {
+		return s.Shards()
+	}
+
+	return (s.Shards() + s.Parity - 1) / s.Parity
+}
+
 // encoderFor returns a reedsolomon encoder for the scheme. Encoders are stateless and cached
 // internally by the library per (data,parity) via New's option defaults; construction is cheap
 // relative to encoding, so no pool is kept here.

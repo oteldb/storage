@@ -26,12 +26,15 @@ import (
 // ring. It bounds failure-detection latency.
 const DefaultTTL = 10 * time.Second
 
-// Member is a cluster node's advertised identity: its ring ID, failure-domain Zone, and the
-// Addr its peers reach it on (used by the replication transport later).
+// Member is a cluster node's advertised identity: its ring ID, failure-domain location, and
+// the Addr its peers reach it on. Zone is the single-level failure domain (a rack); Domains is
+// the hierarchical form (coarsest first, e.g. {rack, server}) that supersedes Zone when set —
+// erasure-coded shards balance across it so a rack/server/disk failure loses the fewest shards.
 type Member struct {
-	ID   string
-	Zone string
-	Addr string
+	ID      string
+	Zone    string
+	Addr    string
+	Domains []string
 }
 
 func (m Member) encode() []byte {
@@ -43,6 +46,18 @@ func (m Member) encode() []byte {
 	e.Str(m.Zone)
 	e.FieldStart("addr")
 	e.Str(m.Addr)
+
+	if len(m.Domains) > 0 {
+		e.FieldStart("domains")
+		e.ArrStart()
+
+		for _, d := range m.Domains {
+			e.Str(d)
+		}
+
+		e.ArrEnd()
+	}
+
 	e.ObjEnd()
 
 	return e.Bytes()
@@ -61,6 +76,17 @@ func decodeMember(data []byte) (Member, error) {
 			m.Zone, err = d.Str()
 		case "addr":
 			m.Addr, err = d.Str()
+		case "domains":
+			err = d.Arr(func(d *jx.Decoder) error {
+				s, err := d.Str()
+				if err != nil {
+					return err
+				}
+
+				m.Domains = append(m.Domains, s)
+
+				return nil
+			})
 		default:
 			return d.Skip()
 		}
@@ -287,7 +313,7 @@ func (m *Membership) rebuild() {
 	m.mu.RLock()
 	nodes := make([]ring.Node, 0, len(m.members))
 	for _, mem := range m.members {
-		nodes = append(nodes, ring.Node{ID: mem.ID, Zone: mem.Zone})
+		nodes = append(nodes, ring.Node{ID: mem.ID, Zone: mem.Zone, Domains: mem.Domains})
 	}
 	m.mu.RUnlock()
 
