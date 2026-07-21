@@ -23,7 +23,13 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 
 - `StoreStats.Tenants` — per tenant: cumulative `Admission` tally, and per-signal `SignalStats`.
 - `StoreStats.Cluster` — cluster mode only (nil single-node): this node's address, live membership,
-  owned shards, and the last enacted rebalance plan.
+  owned shards, and the last enacted rebalance plan. With a private (per-node) backend
+  (`cluster.Config.PrivateBackend`), `Cluster.PartSync` additionally reports the shared-nothing
+  part-mirroring activity (nil otherwise): cumulative `Passes` (every sync attempt — the
+  "is the sync loop running?" probe), `Mirrored` (passes that installed a newer peer copy),
+  `Copied`/`CopiedBytes` (objects fetched from peers), `Pruned` (stale local objects deleted after
+  the quarantine delay), `Errors` (failed passes, retried next tick), and `LastSyncUnixNano` (when
+  the last mirroring pass completed — the replication-staleness probe).
 - `StoreStats.Caches` — read-path decode-cache totals (hits/misses/bytes and `Items` = cached
   decoded **blocks**, the cache being keyed by `(part, column, block)`).
 

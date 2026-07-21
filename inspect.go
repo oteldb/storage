@@ -76,6 +76,29 @@ type ClusterStats struct {
 	Owned []string
 	// LastRebalance is the primary handoffs enacted at the most recent ring change (empty if none).
 	LastRebalance []RebalanceMove
+	// PartSync is the shared-nothing part-mirroring activity (cluster/partsync), cumulative since
+	// process start; nil unless the cluster runs with a private (per-node) backend.
+	PartSync *PartSyncStats
+}
+
+// PartSyncStats is the cumulative shared-nothing part-mirroring activity of this node: how the
+// flushed parts of shards it replicates (or gained) arrived over the parts endpoints. Counters
+// only (a copy of the syncer's totals — no backend I/O).
+type PartSyncStats struct {
+	// Passes is every sync attempt, including no-ops — the "is the sync loop running?" probe.
+	Passes int64
+	// Mirrored is the passes that installed a newer peer copy.
+	Mirrored int64
+	// Copied is the objects fetched from peers; CopiedBytes their total size.
+	Copied      int64
+	CopiedBytes int64
+	// Pruned is the stale local objects deleted after the quarantine delay.
+	Pruned int64
+	// Errors is the passes that failed part-way (retried next maintenance tick).
+	Errors int64
+	// LastSyncUnixNano is when the last mirroring pass completed (zero until one has) — the
+	// replication-staleness probe.
+	LastSyncUnixNano int64
 }
 
 // MemberStats is one cluster member's identity.
@@ -188,6 +211,16 @@ func (s *Storage) clusterStats() *ClusterStats {
 
 	for _, r := range s.cluster.ownership.LastPlan() {
 		cs.LastRebalance = append(cs.LastRebalance, RebalanceMove{Shard: r.Shard, Added: r.Added, Removed: r.Removed})
+	}
+
+	if s.cluster.private {
+		t := s.cluster.psync.Totals()
+		cs.PartSync = &PartSyncStats{
+			Passes: t.Passes, Mirrored: t.Mirrored,
+			Copied: t.Copied, CopiedBytes: t.CopiedBytes,
+			Pruned: t.Pruned, Errors: t.Errors,
+			LastSyncUnixNano: t.LastSyncUnixNano,
+		}
 	}
 
 	return cs

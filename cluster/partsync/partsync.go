@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-faster/errors"
 	"github.com/zeebo/xxh3"
@@ -252,6 +253,26 @@ type Stats struct {
 	Pruned int
 }
 
+// Totals is a Syncer's cumulative activity across every prefix and pass, for the operator
+// stats surface (storage.StoreStats). Counters only — reading it does no I/O.
+type Totals struct {
+	// Passes is every Sync attempt, including no-ops (no usable peer index, nothing newer) —
+	// the "is the sync loop running?" liveness probe.
+	Passes int64
+	// Mirrored is the passes that installed a newer peer copy.
+	Mirrored int64
+	// Copied is the objects fetched from peers, CopiedBytes their total size.
+	Copied      int64
+	CopiedBytes int64
+	// Pruned is the stale local objects deleted (after the quarantine delay).
+	Pruned int64
+	// Errors is the passes that failed part-way (retried by the next maintenance tick).
+	Errors int64
+	// LastSyncUnixNano is the wall-clock completion time of the most recent mirroring pass
+	// (zero until one succeeds) — the "is replication current?" staleness probe.
+	LastSyncUnixNano int64
+}
+
 // Syncer mirrors engine prefixes of a per-node private backend from cluster peers. Safe for
 // concurrent use across distinct prefixes; per-prefix passes are expected to be serial (the
 // maintenance loop runs one task per engine).
@@ -262,6 +283,16 @@ type Syncer struct {
 	mu sync.Mutex
 	// state is the per-engine-prefix prune bookkeeping.
 	state map[string]*prefixState
+	// totals is the cumulative activity across every prefix and pass.
+	totals Totals
+}
+
+// Totals returns a snapshot of the Syncer's cumulative activity.
+func (s *Syncer) Totals() Totals {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.totals
 }
 
 // prefixState is the prune bookkeeping for one engine prefix: the peer's key set from the last
@@ -282,6 +313,33 @@ func New(local backend.Backend, client *Client) *Syncer {
 // peer copy at least as new is installed. Unreachable peers are skipped; having no usable peer
 // index is a no-op, not an error.
 func (s *Syncer) Sync(ctx context.Context, enginePrefix string, peers []string, strict bool) (Stats, error) {
+	st, err := s.sync(ctx, enginePrefix, peers, strict)
+	s.account(st, err)
+
+	return st, err
+}
+
+// account folds one pass's outcome into the cumulative totals.
+func (s *Syncer) account(st Stats, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.totals.Passes++
+	s.totals.Copied += int64(st.Copied)
+	s.totals.CopiedBytes += st.CopiedBytes
+	s.totals.Pruned += int64(st.Pruned)
+
+	switch {
+	case err != nil:
+		s.totals.Errors++
+	case st.Synced:
+		s.totals.Mirrored++
+		s.totals.LastSyncUnixNano = time.Now().UnixNano()
+	}
+}
+
+// sync is one uncounted mirroring pass; see [Syncer.Sync].
+func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, strict bool) (Stats, error) {
 	indexKey := enginePrefix + "/" + bucketindex.Object
 
 	addr, peerIndexRaw, peerIndex := s.newestPeer(ctx, indexKey, peers)
