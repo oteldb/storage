@@ -95,7 +95,7 @@ persisted/wire-stable and must never be reordered. `IsEOF` classifies truncation
 | `CodecGorilla` | values (`float64`) | `EncodeFloats` / `DecodeFloats` | Gorilla XOR (leading/trailing-zero reuse) |
 | `CodecT64` | low-range `int64` | `EncodeIntsT64` / `DecodeIntsT64` | ClickHouse T64 bit-transpose + crop |
 | `CodecDict` | low-cardinality `[][]byte` | `EncodeBytes` / `DecodeBytes` | dictionary; 1 byte/row ≤256 distinct, 2 bytes ≤65536, flat fallback above |
-| `CodecBytesRaw` | high-cardinality `[][]byte` (ids) | `EncodeBytesRaw` / `DecodeBytes` | no dictionary: fixed-width block when all values share a length (e.g. a span id, ~unique → a dictionary is pure overhead), else length-prefixed inline |
+| `CodecBytesRaw` | high-cardinality `[][]byte` (ids) | `EncodeBytesRaw` / `DecodeBytes`, or `DecodeBytesRawBlob` for the flat fixed-width blob (no `[][]byte` header fragmentation) | no dictionary: fixed-width block when all values share a length (e.g. a span id, ~unique → a dictionary is pure overhead), else length-prefixed inline |
 | `CodecDecimal` | `float64` | `EncodeFloatsDecimal` / `DecodeFloatsDecimal` | scaled-decimal + nearest-delta, optionally lossy |
 | `CodecID128` | 128-bit ids (`[]U128`) | `EncodeU128` / `DecodeU128` | run-length (distinct id + run length); optimal for a sorted SeriesID sort key |
 
@@ -995,6 +995,16 @@ optional side store differ.
   decoding its projected byte columns at all. Phase 2 decodes the remaining projected byte columns
   and gathers **only the matched rows'** cells. (The unfiltered matcher path stays bulk-decode, since
   it returns whole per-stream ranges.)
+  - **Equality fast path** (`eqFastPathCols`): a condition that is an exact match
+    (`Condition.Equal`) against a `chunk.CodecBytesRaw` column no other condition targets skips the
+    `chunk.DictColumn` decode entirely — the column's flat blob is decoded once
+    (`block.ColumnReader.BytesRaw`) and scanned with `internal/simd.EqualFixed16` (AVX2 stride
+    compare) into a per-row match bitmap (`lazyCols.eqMask`), so `rowMatches` reads a bit instead of
+    calling `Match` per row. The decoded blob (`lazyCols.rawBlob`) also serves phase 2's per-row
+    gather directly, so a fast-pathed column may still be projected. Relies on `Condition.Equal`
+    being byte-identical to `Match` for that column (true for every current caller — the by-id
+    facades) — a future caller that sets `Equal` as a lossy/approximate prune hint on a
+    `CodecBytesRaw` column would need this to stay exact, since the fast path never re-checks `Match`.
 - **Record-key footer** (`{prefix}/keys.bin`, magic+version+CRC32C): each part persists its distinct
   per-record **attribute keys** (not values — bounded by the stream schema, so tiny) next to its
   blooms, written by `writePart` (so flush and merge produce it) and loaded by `openPart`.
@@ -1476,7 +1486,7 @@ encoding/             umbrella doc for the codec layers
   encoding/chunk      DoD / Gorilla / T64 / dict / bytesraw / decimal / id128 column codecs [implemented]
   encoding/compress   zstd / lz4 (pierrec/lz4) / none block wrapper                   [implemented]
 pool/                 ByteIntMap (xxh3) for dict building                              [implemented]
-internal/simd         vectorized columnar kernels (AVX2) + pure-Go fallback + runtime CPU dispatch [implemented: int64 + float64 min/max]
+internal/simd         vectorized columnar kernels (AVX2) + pure-Go fallback + runtime CPU dispatch [implemented: int64 + float64 min/max, 16-byte fixed-width equality scan (EqualFixed16)]
 internal/cmd/gensimd  avo generator for internal/simd's committed *_amd64.s (//go:generate)   [implemented]
 internal/obs          injected observability handle: zap logger (context-plumbed via go-faster/sdk/zctx, trace-correlated) + OTel tracer + per-layer metric instruments (admission/flush/merge/fetch/backend/WAL/rpc) + W3C trace propagation; no-op default [implemented]
 internal/retry        transport reliability primitives: Do (retry+per-try timeout+backoff), Hedge (opportunistic concurrent retries), HTTP error classifiers [implemented]
