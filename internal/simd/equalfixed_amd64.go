@@ -20,9 +20,9 @@ const equalFixed16MinRows = 32
 func EqualFixed16(blob, needle, dst []byte) {
 	if len(dst) >= equalFixed16MinRows && cpu.X86.HasAVX2 {
 		even := len(dst) &^ 1
-		equalFixed16AVX2(blob[:even*16], needle, dst[:even])
+		equalFixed16AVX2(blob[:even*EqualFixed16Width], needle, dst[:even])
 		if even < len(dst) {
-			equalFixed16Generic(blob[even*16:], needle, dst[even:])
+			equalFixed16Generic(blob[even*EqualFixed16Width:], needle, dst[even:])
 		}
 		return
 	}

@@ -94,8 +94,8 @@ func conditionSel(s *Schema, conds []fetch.Condition) colSel {
 // eqFastPathCols returns, for each byte column index a fast whole-column equality scan may
 // replace its dictionary decode for, the index of the one condition (in conds) it serves — as
 // long as that's safe for every consumer of the column:
-//   - the condition is an exact match ([fetch.Condition.Equal]) with a 16-byte value, the width
-//     [simd.EqualFixed16] scans;
+//   - the condition is an exact match ([fetch.Condition.Equal]) with a [simd.EqualFixed16Width]-byte
+//     value — the fixed width the kernel scans;
 //   - the column's on-disk codec is [chunk.CodecBytesRaw] (a contiguous fixed-width blob, not a
 //     dictionary — [block.ColumnReader.BytesRaw] errors otherwise, so this is a static
 //     pre-check, not a guarantee); and
@@ -126,7 +126,7 @@ func eqFastPathCols(schema *Schema, conds []fetch.Condition) map[int]int {
 	fast := make(map[int]int)
 	for j := range conds {
 		cond := &conds[j]
-		if cond.Equal == nil || len(cond.Equal.Value) != 16 {
+		if cond.Equal == nil || len(cond.Equal.Value) != simd.EqualFixed16Width {
 			continue
 		}
 
@@ -217,7 +217,11 @@ func (p *part) readLazyConds(ctx context.Context, sel, condSel colSel, conds []f
 				return nil, err
 			}
 
-			if ok && width == len(needle) {
+			// width must be exactly simd.EqualFixed16Width — the kernel's real, hardcoded
+			// precondition — not merely equal to needle's length (eqFastPathCols already fixes
+			// that at 16 separately; comparing against len(needle) here would assert the wrong
+			// thing if that ever changed).
+			if ok && width == simd.EqualFixed16Width {
 				mask := make([]byte, len(blob)/width)
 				simd.EqualFixed16(blob, needle, mask)
 
