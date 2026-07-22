@@ -1071,8 +1071,28 @@ where the policy applies), then creates the engine over whichever signal prefixe
 bucket index locally — the same backend-driven discovery startup recovery uses — and loads its
 parts. After a pass the spare serves the shard's flushed data; the head converges through the
 normal write/flush/mirror path. A shard whose every owner died has no claim and is not
-discoverable this way (its data is only on the lost nodes' disks). Remaining: the chaos e2e —
-then geo-replication.
+discoverable this way (its data is only on the lost nodes' disks).
+
+**Refresh trim is series-scoped.** `RefreshReplica` trims a replica's head only for the series
+**actually present in the flushed parts** (the metric engine enumerates each part's series
+index; the record engine its in-memory stream ranges) — not globally below the part-set max
+time. A series whose timestamps overlap already-flushed data but which is not itself flushed
+anywhere (ordinary backfill, or a series registered between two flushes) keeps its replicated
+head: a global trim would silently leave the primary as the sole holder of quorum-acked
+samples until its next flush — a durability hole the chaos test exposed. Similarly,
+**live-part shards are never pruned by source absence**: a membership change renumbers shard
+slots, so a "foreign" shard on a replica may be one of a part's last surviving copies that
+repair still needs — the source-absence quarantine deletes only superseded-part objects, and
+live shards are deleted exclusively by the confirm-first owner-prune (the residue after churn
+is bounded by part turnover and reclaimed when the part is superseded).
+
+**Chaos e2e.** The closing test of the line (`TestClusterECChaos`, seed-parameterized): a
+6-node ec(4,2) cluster over private backends and three racks ingests multiple high-entropy
+series, converges to one-shard-per-node, loses two RANDOM nodes (possibly a whole rack,
+possibly the compaction primary), and every survivor still serves every sample; a fresh
+replacement then joins, bootstraps from the claims, and serves everything itself. Maintenance
+scheduling is shuffled per round — the adversarial interleaving that exposed both the
+prune/livePart and the trim-scope bugs. Remaining: geo-replication.
 
 Closed parity items: the write path is primary-authoritative, so the OOO decision is made once
 by the shard primary (`engine.ApplyPrimary`) and secondaries apply the accepted set verbatim

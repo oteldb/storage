@@ -610,12 +610,17 @@ func (s *Syncer) prune(ctx context.Context, st *Stats, enginePrefix string, keep
 	for _, k := range local {
 		seen[k] = struct{}{}
 
-		// An object this node should hold (keep) whose part is still live in the index is
-		// authoritative locally — a shard the source legitimately dropped after distribution, or
-		// a full copy — and must never be pruned just because it is absent from the (filtered)
-		// remote view. Superseded-part objects (part gone from the index) and objects this node
-		// should not hold fall through to the remote-absence quarantine below.
-		if keep(k) && livePart(k, liveParts) {
+		// A live part's protected objects must never be pruned by source absence:
+		//   - objects this node should hold (keep) — its own shard slot, full copies — are
+		//     authoritative locally even when the source legitimately dropped them;
+		//   - ANY erasure-coded shard, own slot or not: a membership change renumbers slots, so
+		//     a "foreign" shard here may be one of the part's last surviving copies that repair
+		//     still needs to gather. Live-part shards are deleted only by the owner-prune path,
+		//     which confirms the slot's owner holds it first. The cost is a stale-shard residue
+		//     after churn (bounded by part turnover), reclaimed when the part is superseded.
+		// Superseded-part objects (part gone from the index) always fall through to the
+		// remote-absence quarantine below.
+		if livePart(k, liveParts) && (keep(k) || strings.Contains(k, shardMarker)) {
 			delete(counts, k)
 
 			continue
@@ -657,8 +662,12 @@ func (s *Syncer) prune(ctx context.Context, st *Stats, enginePrefix string, keep
 // (`{part}/ecshard/{slot}/{obj}`) is checked by its part prefix; any other key under a live
 // part prefix also qualifies. A key belonging to no live part (superseded by a merge) is not
 // protected and falls through to pruning.
+// shardMarker separates a part prefix from a shard slot in an erasure-coded shard key (kept in
+// sync with the cluster/ec layout).
+const shardMarker = "/ecshard/"
+
 func livePart(key string, liveParts map[string]struct{}) bool {
-	if part, _, ok := strings.Cut(key, "/ecshard/"); ok {
+	if part, _, ok := strings.Cut(key, shardMarker); ok {
 		_, live := liveParts[part]
 
 		return live

@@ -438,9 +438,11 @@ func TestSyncKeepFilterMirrorsSubset(t *testing.T) {
 	assert.False(t, st.Synced, "converged ⇒ no-op")
 }
 
-// TestSyncFilterPrunesForeignShards checks that switching a replica to slot filtering prunes the
-// other slots' shards it may already hold (absent from the filtered remote view).
-func TestSyncFilterPrunesForeignShards(t *testing.T) {
+// TestSyncFilterKeepsLiveForeignShards pins the shard-safety rule: a LIVE part's foreign-slot
+// shards are NEVER pruned by source absence — a membership change renumbers slots, so a foreign
+// shard may be one of the part's last copies that repair still needs; only the owner-prune path
+// (confirm-first) deletes live shards. A SUPERSEDED part's shards still prune normally.
+func TestSyncFilterKeepsLiveForeignShards(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -466,18 +468,26 @@ func TestSyncFilterPrunesForeignShards(t *testing.T) {
 
 	s := partsync.New(replica, &partsync.Client{})
 
-	// Two passes: the quarantine-by-delay prune deletes the foreign slots on the second miss.
-	for range 2 {
+	// Many passes: live-part shards — own slot AND foreign slots — survive every quarantine
+	// cycle (foreign ones may be the part's last copies after a slot renumbering).
+	for range pruneRounds {
 		_, err := s.Sync(ctx, "t/metrics", []string{serve(t, owner)}, false, keep)
 		require.NoError(t, err)
 	}
 
-	_, err := replica.Read(ctx, "t/metrics/0000000001/ecshard/2/c/0")
-	require.NoError(t, err, "own slot kept")
-	for _, slot := range []int{0, 1} {
-		_, err = replica.Read(ctx, "t/metrics/0000000001/ecshard/"+itoa(slot)+"/c/0")
-		require.ErrorIsf(t, err, backend.ErrNotExist, "foreign slot %d pruned", slot)
+	for slot := range 3 {
+		_, err := replica.Read(ctx, "t/metrics/0000000001/ecshard/"+itoa(slot)+"/c/0")
+		require.NoErrorf(t, err, "live-part slot %d kept", slot)
 	}
+
+	// A superseded part (absent from the index) still prunes: shards and all.
+	require.NoError(t, replica.Write(ctx, "t/metrics/0000000000/ecshard/1/c/0", []byte("old")))
+	for range pruneRounds {
+		_, err := s.Sync(ctx, "t/metrics", []string{serve(t, owner)}, false, keep)
+		require.NoError(t, err)
+	}
+	_, err := replica.Read(ctx, "t/metrics/0000000000/ecshard/1/c/0")
+	require.ErrorIs(t, err, backend.ErrNotExist, "superseded part's shard pruned")
 }
 
 func itoa(n int) string { return string(rune('0' + n)) }
