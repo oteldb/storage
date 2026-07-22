@@ -30,9 +30,15 @@ import (
 	"github.com/oteldb/storage/tenant"
 )
 
+// freeAddr returns a free localhost host:port for the embedded etcd's advertise URLs (etcd
+// needs concrete URLs up front, unlike the cluster nodes, which bind ":0" and advertise the
+// listener's actual port). Probe-then-rebind is racy in principle; etcd is the only remaining
+// user, two ports per test.
 func freeAddr(t *testing.T) string {
 	t.Helper()
+
 	var lc net.ListenConfig
+
 	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	addr := l.Addr().String()
@@ -81,7 +87,7 @@ func openClusterNodeWith(t *testing.T, endpoint, id string, be backend.Backend, 
 
 	all := append([]Option{WithBackend(be), WithCluster(&cluster.Config{
 		Etcd: []string{endpoint},
-		Self: etcd.Member{ID: id, Addr: freeAddr(t)},
+		Self: etcd.Member{ID: id, Addr: "127.0.0.1:0"},
 		RF:   2,
 	})}, opts...)
 
@@ -98,7 +104,7 @@ func openClusterNodeSharded(t *testing.T, endpoint, id string, shards int) *Stor
 
 	s, err := Open(context.Background(), Options{}, WithBackend(backend.Memory()), WithCluster(&cluster.Config{
 		Etcd:            []string{endpoint},
-		Self:            etcd.Member{ID: id, Addr: freeAddr(t)},
+		Self:            etcd.Member{ID: id, Addr: "127.0.0.1:0"},
 		RF:              2,
 		ShardsPerTenant: shards,
 	}))
@@ -1064,7 +1070,7 @@ func openClusterNodePrivate(t *testing.T, endpoint, id string, rf int) *Storage 
 
 	s, err := Open(context.Background(), Options{}, WithBackend(backend.Memory()), WithCluster(&cluster.Config{
 		Etcd:           []string{endpoint},
-		Self:           etcd.Member{ID: id, Addr: freeAddr(t)},
+		Self:           etcd.Member{ID: id, Addr: "127.0.0.1:0"},
 		RF:             rf,
 		PrivateBackend: true,
 	}))

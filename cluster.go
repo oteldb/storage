@@ -313,10 +313,6 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	rc := s.opts.retryConfig()
 	httpc := newClusterHTTPClient(rc)
 
-	// The replicator applies an inbound (or local) write to the addressed tenant's engine. Its
-	// transport shares the tuned client (connection timeouts) so replication tolerates a slow peer.
-	rp := replica.New(cfg.Self.Addr, replica.NewHTTPTransport(httpc), s.applyReplicated)
-
 	var lc net.ListenConfig
 
 	ln, err := lc.Listen(ctx, "tcp", cfg.Self.Addr)
@@ -325,6 +321,19 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 
 		return errors.Wrapf(err, "listen on %q", cfg.Self.Addr)
 	}
+
+	// An ephemeral bind (port 0) advertises the port the kernel actually assigned — the caller
+	// asked for "any port", so the listener is the only source of truth. This also removes the
+	// probe-then-rebind race from tests that need throwaway ports. An explicit port advertises
+	// the configured address verbatim.
+	self := cfg.Self
+	if _, port, err := net.SplitHostPort(self.Addr); err == nil && port == "0" {
+		self.Addr = ln.Addr().String()
+	}
+
+	// The replicator applies an inbound (or local) write to the addressed tenant's engine. Its
+	// transport shares the tuned client (connection timeouts) so replication tolerates a slow peer.
+	rp := replica.New(self.Addr, replica.NewHTTPTransport(httpc), s.applyReplicated)
 
 	mux := http.NewServeMux()
 	mux.Handle(replica.ReplicatePath, rp.Handler())       // secondary: trusting apply
@@ -345,7 +354,7 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 
 	go func() { _ = srv.Serve(ln) }()
 
-	mship, err := etcd.Join(ctx, client, root, cfg.Self, 0)
+	mship, err := etcd.Join(ctx, client, root, self, 0)
 	if err != nil {
 		_ = srv.Close()
 		_ = client.Close()
@@ -355,7 +364,7 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 
 	mship.SetLogger(s.obs.Log)
 	s.obs.Logger(ctx).Info("joined cluster",
-		zap.String("id", cfg.Self.ID), zap.String("zone", cfg.Self.Zone), zap.String("addr", cfg.Self.Addr))
+		zap.String("id", self.ID), zap.String("zone", self.Zone), zap.String("addr", self.Addr))
 
 	s.cluster = &clusterNode{
 		client:     client,
@@ -365,7 +374,7 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 		httpc:      httpc,
 		server:     srv,
 		listener:   ln,
-		self:       cfg.Self.Addr,
+		self:       self.Addr,
 		rf:         rf,
 		shards:     cfg.ShardsPerTenant,
 		retry:      rc,

@@ -29,7 +29,7 @@ func openClusterNodeEC(t *testing.T, endpoint, id string, k, m int, after time.D
 
 	s, err := Open(context.Background(), Options{}, WithBackend(backend.Memory()), ecPol, WithCluster(&cluster.Config{
 		Etcd:           []string{endpoint},
-		Self:           etcd.Member{ID: id, Addr: freeAddr(t)},
+		Self:           etcd.Member{ID: id, Addr: "127.0.0.1:0"},
 		RF:             1,
 		PrivateBackend: true,
 	}))
@@ -96,7 +96,7 @@ func openClusterNodeECDomains(t *testing.T, endpoint, id string, domains []strin
 
 	s, err := Open(context.Background(), Options{}, WithBackend(backend.Memory()), ecPol, WithCluster(&cluster.Config{
 		Etcd:           []string{endpoint},
-		Self:           etcd.Member{ID: id, Domains: domains, Addr: freeAddr(t)},
+		Self:           etcd.Member{ID: id, Domains: domains, Addr: "127.0.0.1:0"},
 		RF:             1,
 		PrivateBackend: true,
 	}))
