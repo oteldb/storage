@@ -20,6 +20,7 @@ import (
 	"go.etcd.io/etcd/server/v3/embed"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/s3"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
@@ -190,7 +191,7 @@ func sharedS3(t *testing.T) func() backend.Backend {
 
 	store := storagemem.New()
 	require.NoError(t, store.CreateBucket(context.Background(), "oteldb"))
-	srv := httptest.NewServer(fsserver.NewHandler(store))
+	srv := httptest.NewServer(backendtest.AtomicConditionalPut(fsserver.NewHandler(store)))
 	t.Cleanup(srv.Close)
 
 	client := awss3.New(awss3.Options{

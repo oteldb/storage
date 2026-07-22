@@ -6,6 +6,7 @@ package backendtest
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -238,5 +239,25 @@ func Run(t *testing.T, factory func(t *testing.T) backend.Backend) {
 
 		wg.Wait()
 		assert.Equal(t, int64(1), wins.Load(), "exactly one writer claims the key")
+	})
+}
+
+// AtomicConditionalPut wraps an S3-compatible test server's handler, serializing every request
+// that carries an If-None-Match precondition. Real S3 evaluates a conditional PUT atomically;
+// the embeddable go-faster/fs server (as of v0.3.0) checks the precondition and performs the
+// write as two separate steps, so two concurrent "If-None-Match: *" PUTs can both observe the
+// key absent and both succeed — a TOCTOU race the conformance suite's single-winner CAS test
+// rightly rejects. Serializing just the conditional requests restores real-S3 semantics for
+// the tests without patching the fake. (Worth fixing upstream; this wrapper is then a no-op.)
+func AtomicConditionalPut(h http.Handler) http.Handler {
+	var mu sync.Mutex
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.Header.Get("If-None-Match") != "" {
+			mu.Lock()
+			defer mu.Unlock()
+		}
+
+		h.ServeHTTP(w, r)
 	})
 }
