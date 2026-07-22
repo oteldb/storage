@@ -102,13 +102,21 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 	}
 
 	maxT := minInt64
+	covered := make(map[signal.SeriesID]struct{})
+
 	for _, p := range e.parts {
 		if p.maxTime > maxT {
 			maxT = p.maxTime
 		}
+
+		// Trim only streams the parts hold (in-memory ranges — no I/O); an unflushed stream's
+		// head must survive the refresh, or the primary becomes its sole holder.
+		for id := range p.ranges {
+			covered[id] = struct{}{}
+		}
 	}
 
-	e.head.trimBelow(maxT)
+	e.head.trimBelowCovered(maxT, covered)
 
 	return nil
 }

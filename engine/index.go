@@ -112,13 +112,23 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 	}
 
 	maxT := minInt64
+	covered := make(map[signal.SeriesID]struct{})
+
 	for _, p := range e.parts {
 		if p.maxTime > maxT {
 			maxT = p.maxTime
 		}
+
+		// The trim must only touch series the parts actually hold: a head series that is not
+		// flushed anywhere (a late-registered series whose timestamps overlap already-flushed
+		// data — ordinary backfill) would otherwise lose its only replicated copies, leaving the
+		// primary as the sole holder of quorum-acked samples until its next flush.
+		if err := p.index.forEachID(ctx, func(id signal.SeriesID) { covered[id] = struct{}{} }); err != nil {
+			return errors.Wrapf(err, "enumerate series of part %q", p.prefix)
+		}
 	}
 
-	e.head.trimBelow(maxT)
+	e.head.trimBelowCovered(maxT, covered)
 
 	return nil
 }

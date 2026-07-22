@@ -238,10 +238,18 @@ func bufInRange(buf *recordCols, start, end int64) bool {
 	return false
 }
 
-// trimBelow drops every buffered record with timestamp ≤ t (now durable in a flushed part),
-// bounding a replica's head to the still-unflushed window. Each buffer is compacted in place.
-func (h *head) trimBelow(t int64) {
-	for _, buf := range h.records {
+// trimBelowCovered drops every buffered record with timestamp ≤ t (now durable in a flushed
+// part) for the streams in covered (nil ⇒ every stream), bounding a replica's head to the
+// still-unflushed window; each buffer is compacted in place. See the metric head's
+// trimBelowCovered for why the replica refresh must not trim a stream absent from the flushed
+// parts.
+func (h *head) trimBelowCovered(t int64, covered map[signal.SeriesID]struct{}) {
+	for id, buf := range h.records {
+		if covered != nil {
+			if _, ok := covered[id]; !ok {
+				continue
+			}
+		}
 		idx := buf.rowScratch[:0]
 		for i := range buf.ts {
 			if buf.ts[i] > t {
