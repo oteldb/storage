@@ -51,6 +51,28 @@ func NewOwnership(client *clientv3.Client, root, id string, leaseID clientv3.Lea
 	}
 }
 
+// Claims returns every currently-claimed shard across the cluster (sorted), from one etcd
+// range read. It is the cluster-wide tenant/shard discovery a node needs when it is promoted
+// into a shard's owner set without ever having held the shard locally (a spare): its own
+// engine maps do not know the tenant, but any live shard has a compaction owner whose claim
+// names it. A shard whose every owner died has no claim and is not discoverable here — its
+// data is only recoverable through the backend (shared store) or peer listings.
+func (o *Ownership) Claims(ctx context.Context) ([]string, error) {
+	resp, err := o.client.Get(ctx, o.prefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
+	if err != nil {
+		return nil, errors.Wrap(err, "list claims")
+	}
+
+	out := make([]string, 0, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		out = append(out, string(kv.GetKey()[len(o.prefix):]))
+	}
+
+	sort.Strings(out)
+
+	return out, nil
+}
+
 // Acquire tries to claim shard for this node. It returns true if the claim is now held by this
 // node (newly acquired or already ours), false if another live node holds it. The claim is a
 // CAS: create the key only if absent; otherwise it belongs to whoever already created it.
