@@ -27,7 +27,7 @@ func embeddedS3(t *testing.T, bucket string) *awss3.Client {
 	store := storagemem.New()
 	require.NoError(t, store.CreateBucket(context.Background(), bucket))
 
-	srv := httptest.NewServer(fsserver.NewHandler(store))
+	srv := httptest.NewServer(backendtest.AtomicConditionalPut(fsserver.NewHandler(store)))
 	t.Cleanup(srv.Close)
 
 	return awss3.New(awss3.Options{
