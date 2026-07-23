@@ -34,53 +34,43 @@ func appendAttrToken(dst, key, value []byte) []byte {
 // bloomBuilder holds the reusable scratch one column's bloom build needs, so walking a column
 // allocates nothing per token or per row.
 type bloomBuilder struct {
-	words bloom.Scanner     // token scanner, keeps its case-folding buffer
-	attrs signal.Attributes // reused attribute-decode buffer
-	text  []byte            // reused rendered attribute value
-	token []byte            // reused key-scoped token
+	words    bloom.Scanner     // token scanner, keeps its case-folding buffer
+	attrs    signal.Attributes // reused attribute-decode buffer
+	text     []byte            // reused rendered attribute value
+	token    []byte            // reused key-scoped token
+	distinct bloom.Sketch      // reused distinct-token estimator (constant 4 KiB)
 }
 
-// countTokens returns how many tokens [bloomBuilder.forEachToken] emits for the column, counting
-// per row rather than per token — [bloom.CountTokens] scores a whole value in one call, where
-// counting through forEachToken would pay an indirect call per token.
+// Per-part filters are consulted once per part, so a query over a store with thousands of parts
+// pays the false-positive rate that many times: at p=0.01 and 200 parts a token absent from the
+// whole store still scans ~2 parts. A filter's size is only logarithmic in p (bits per item =
+// -ln p / ln²2 ⇒ 9.6 at 1e-2, 14.4 at 1e-3, 28.8 at 1e-6), so pruning-critical columns buy near
+// exact pruning cheaply once the filter is sized by DISTINCT tokens ([bloomBuilder.distinctTokens]):
 //
-// It must stay in step with forEachToken: an undercount saturates the filter (more false positives,
-// never a false negative), an overcount wastes space, and either changes the encoded bytes. That is
-// exactly what TestBuildColumnBloomMatchesReference and FuzzBuildColumnBloomMatchesReference detect
-// — they compare against a single-pass build that counts by materializing, so any drift between
-// this and forEachToken shows up as a differing filter.
-func (bb *bloomBuilder) countTokens(mode BloomMode, values *byteCol) int {
-	n := 0
-
-	switch mode {
-	case BloomFullText:
-		for i := range values.rows() {
-			n += bloom.CountTokens(values.at(i))
-		}
-	case BloomEquality:
-		for i := range values.rows() {
-			if len(values.at(i)) > 0 {
-				n++
-			}
-		}
-	case BloomAttrs:
-		for i := range values.rows() {
-			a, _, err := signal.AppendAttributes(bb.attrs[:0], values.at(i))
-			if err != nil {
-				continue
-			}
-
-			bb.attrs = a
-			for j := range a {
-				// One key‖value token per attribute, plus one key‖word token per word.
-				bb.text = a[j].Value.AppendText(bb.text[:0])
-				n += 1 + bloom.CountTokens(bb.text)
-			}
-		}
-	case BloomNone:
+//   - Equality (trace_id): few distinct values per part (thousands) and the lookup that must not
+//     touch an irrelevant part at all — 1e-6 costs single-digit KiB.
+//   - FullText / Attrs: tens to hundreds of thousands of distinct tokens per part; 1e-3 keeps the
+//     expected false-positive parts well under one for a realistic part count.
+func falsePositiveRate(mode BloomMode) float64 {
+	if mode == BloomEquality {
+		return 1e-6
 	}
 
-	return n
+	return 1e-3
+}
+
+// distinctTokens estimates how many DISTINCT tokens [bloomBuilder.forEachToken] emits for the
+// column — the count [bloom.New] must be sized by. Counting occurrences instead over-allocates the
+// filter by the column's repetition factor, which on real log text is 60–340× (the same words recur
+// in every row), inflating both the on-disk sidecar and the resident filter by that factor.
+//
+// It walks the same token stream forEachToken does, so the two cannot drift; the estimate costs one
+// hash per token and constant space.
+func (bb *bloomBuilder) distinctTokens(mode BloomMode, values *byteCol) int {
+	bb.distinct.Reset()
+	bb.forEachToken(mode, values, bb.distinct.Add)
+
+	return bb.distinct.Estimate()
 }
 
 // forEachToken calls fn once per bloom token of the column under mode. Tokens passed to fn alias
@@ -162,10 +152,10 @@ func (bb *bloomBuilder) eachAttrs(values *byteCol, fn func(token []byte)) {
 //   - Attrs: per attribute (k,v) of each serialized blob, the equality token k‖v and a full-text
 //     token k‖word per value word.
 //
-// The column is walked twice — once to count tokens, once to hash them — rather than materializing
-// every token to learn the count [bloom.New] needs. Both passes see the same token set, so the
-// filter is byte-identical to a single-pass build; the second walk is far cheaper than the
-// per-token allocations (and the live [][]byte holding them) it replaces.
+// The column is walked twice — once to estimate the distinct token count [bloom.New] must be sized
+// by, once to hash the tokens in — rather than materializing every token to learn that count. Both
+// passes see the same token set, so the filter matches a single-pass build; the second walk is far
+// cheaper than the per-token allocations (and the live [][]byte holding them) it replaces.
 func buildColumnBloom(mode BloomMode, values *byteCol) []byte {
 	if mode == BloomNone {
 		return nil
@@ -173,7 +163,7 @@ func buildColumnBloom(mode BloomMode, values *byteCol) []byte {
 
 	var bb bloomBuilder
 
-	f := bloom.New(bb.countTokens(mode, values), 0.01)
+	f := bloom.New(bb.distinctTokens(mode, values), falsePositiveRate(mode))
 	bb.forEachToken(mode, values, f.Add)
 
 	return f.Encode(nil)
