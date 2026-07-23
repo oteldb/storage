@@ -27,9 +27,11 @@ type Sketch struct {
 func (s *Sketch) Reset() { s.reg = [sketchRegisters]uint8{} }
 
 // Add records item.
-func (s *Sketch) Add(item []byte) {
-	h := xxh3.Hash(item)
+func (s *Sketch) Add(item []byte) { s.AddHash(xxh3.Hash(item)) }
 
+// AddHash records an item by its hash, for a caller that already hashed it (e.g. through
+// [Hashes]). Any well-distributed 64-bit hash works, as long as one item always yields one hash.
+func (s *Sketch) AddHash(h uint64) {
 	idx := h >> (64 - sketchPrecision)
 	// Rank of the first set bit among the remaining bits; the trailing sentinel bit bounds the
 	// rank when the remainder is all zeros.

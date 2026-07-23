@@ -1146,11 +1146,15 @@ optional side store differ.
   **key-scoped** `key‖value` (equality) and `key‖word` (contains) tokens per record attribute;
   `Equality` columns hold each value verbatim (the **trace-by-id** path). `Fetch` skips a part whose
   bloom proves a required `Condition.Tokens`/`Condition.Equal` absent, then re-checks per row.
-  Each filter is sized from a **distinct**-token estimate (`bloom.Sketch`, a constant-space
-  HyperLogLog walked over the same token stream as the build) at a per-mode false-positive target
-  (`1e-6` equality, `1e-3` full-text/attrs) — sizing by token *occurrences* instead inflates both the
-  sidecar and the resident filter by the column's repetition factor (60–340× on real log text). The
-  sidecar is self-describing (`k`, `m` encoded), so parts written under any sizing stay readable.
+  Each filter is sized by **distinct** tokens, not token *occurrences* — the latter inflates both the
+  sidecar and the resident filter by the column's repetition factor (60–340× on real log text). A
+  filter that would be small anyway (≤ 32 KiB) is left sized by the cheap occurrence count; a larger
+  one is sized from a constant-space HyperLogLog estimate (`bloom.Sketch`) walked over the same token
+  stream. False-positive targets are per mode: `1e-6` equality (few values per part, and the
+  trace-by-id path must not touch an irrelevant part), `1e-2` full-text/attrs. Both walks skip rows
+  repeating a value already walked — a bloom is a set, so the filter is bit-identical and the build
+  is several times faster on real log columns. The sidecar is self-describing (`k`, `m` encoded), so
+  parts written under any sizing stay readable.
 - **Two-phase filtered fetch** (`fetchlazy.go`, taken when `AllConditions` + conditions — the
   by-id lookups): a surviving part is read in two phases so a high-selectivity query never
   materializes the projected byte columns for rows it discards. Phase 1 decodes only the timestamp,

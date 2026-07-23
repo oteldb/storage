@@ -58,12 +58,17 @@ func buildColumnBloomReference(mode BloomMode, values *byteCol) []byte {
 		return nil
 	}
 
-	var sk bloom.Sketch
-	for _, tk := range tokens {
-		sk.Add(tk)
+	n := len(tokens)
+	if len(values.data) > 1<<20 || bloom.Bits(n, falsePositiveRate(mode))/8 > smallFilterBytes {
+		var sk bloom.Sketch
+		for _, tk := range tokens {
+			sk.Add(tk)
+		}
+
+		n = sk.Estimate()
 	}
 
-	f := bloom.New(sk.Estimate(), falsePositiveRate(mode))
+	f := bloom.New(n, falsePositiveRate(mode))
 	for _, tk := range tokens {
 		f.Add(tk)
 	}

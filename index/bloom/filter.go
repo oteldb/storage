@@ -32,6 +32,17 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 // standard m = -n·ln p / (ln2)² and k = (m/n)·ln2, with m rounded up to a multiple of 64 and both
 // m and k clamped to at least their minimums.
 func New(n int, p float64) *Filter {
+	m := Bits(n, p)
+	n = max(n, 1)
+
+	k := max(int(math.Round(float64(m)/float64(n)*math.Ln2)), 1)
+
+	return &Filter{bits: make([]uint64, m/64), m: m, k: k}
+}
+
+// Bits returns the bit count [New] would allocate for n items at rate p, so a caller can price a
+// filter (its bytes are Bits/8 plus a small header) before deciding how carefully to count n.
+func Bits(n int, p float64) uint64 {
 	if n < 1 {
 		n = 1
 	}
@@ -41,21 +52,30 @@ func New(n int, p float64) *Filter {
 	}
 
 	m := max(uint64(math.Ceil(-float64(n)*math.Log(p)/(math.Ln2*math.Ln2))), 64)
-	m = (m + 63) &^ 63 // round up to a whole 64-bit word
 
-	k := max(int(math.Round(float64(m)/float64(n)*math.Ln2)), 1)
-
-	return &Filter{bits: make([]uint64, m/64), m: m, k: k}
+	return (m + 63) &^ 63 // round up to a whole 64-bit word
 }
 
 // Add records item in the filter.
 func (f *Filter) Add(item []byte) {
 	h1, h2 := hashes(item)
+	f.AddHashes(h1, h2)
+}
+
+// AddHashes records the item whose [Hashes] are h1, h2 — the same bits [Filter.Add] would set, for
+// a caller that already hashed the item (e.g. a builder that hashes once and sizes the filter
+// afterwards, rather than hashing the column twice).
+func (f *Filter) AddHashes(h1, h2 uint64) {
 	for i := range f.k {
 		pos := (h1 + uint64(i)*h2) % f.m
 		f.bits[pos/64] |= 1 << (pos % 64)
 	}
 }
+
+// Hashes returns the pair of hashes identifying item, for use with [Filter.AddHashes]. It is the
+// hash [Filter.Add] and [Filter.Test] derive their probes from, so a caller that caches these
+// reproduces exactly the same filter.
+func Hashes(item []byte) (h1, h2 uint64) { return hashes(item) }
 
 // Test reports whether item may be present: true if every probe bit is set (possibly a false
 // positive), false if any is clear (definitely absent — no false negatives).
