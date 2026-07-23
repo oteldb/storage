@@ -453,7 +453,13 @@ their large reads/writes run lock-free, exploiting that parts are immutable. Bot
   (`storage.runMaintenance`), on the `Options.FlushInterval` cadence. A **durable** store always runs
   it: a zero `FlushInterval` resolves to `defaultFlushInterval` (10 s), because without a running loop
   a non-ephemeral head and WAL grow unbounded in RAM until OOM — only a *negative* interval (an
-  explicit opt-out) or the ephemeral in-memory engine disables it.
+  explicit opt-out) or the ephemeral in-memory engine disables it. The loop also carries a
+  **head-size flush trigger**: a write that leaves an engine's head at or above
+  `Options.FlushThresholdBytes` (zero ⇒ `defaultFlushThresholdBytes`, 64 MiB; negative ⇒ off) pokes
+  the loop through a capacity-1 channel, and it flushes just the over-threshold engines
+  (`flushPressured`, counted as `MaintenanceStats.PressureFlushes`) without running merge or the
+  cluster work. So a burst is bounded by bytes as well as by cadence, and because both paths run on
+  the one loop goroutine an engine is never flushed twice concurrently.
 - **Stateless reconstruction** (`index.go`) — `Engine.LoadParts` rebuilds a fresh engine's
   durable state from the backend alone: the part set from the bucket index, and the
   postings/series index from the identity object (so matchers resolve and batches carry real

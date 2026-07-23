@@ -41,8 +41,10 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
   decoded **blocks**, the cache being keyed by `(part, column, block)`).
 - `StoreStats.Maintenance` — the background maintenance loop: cumulative `Cycles` (the loop-
   liveness probe), `LastCycleStartUnixNano` / `LastCycleDurationNano` (a growing duration means
-  compaction is falling behind ingest), and `LastCycleTasks` (engine tasks dispatched in the most
-  recent cycle).
+  compaction is falling behind ingest), `LastCycleTasks` (engine tasks dispatched in the most
+  recent cycle), and `PressureFlushes` (engines flushed by the head-size trigger
+  `Options.FlushThresholdBytes` rather than by the interval — a rising count means ingestion is
+  filling heads faster than the flush cadence drains them).
 
 `SignalStats` (one per `(tenant, signal)`):
 

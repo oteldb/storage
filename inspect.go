@@ -204,6 +204,7 @@ func (s *Storage) Inspect() StoreStats {
 		LastCycleStartUnixNano: s.maintStats.lastStartNano.Load(),
 		LastCycleDurationNano:  s.maintStats.lastDurationNano.Load(),
 		LastCycleTasks:         s.maintStats.lastTasks.Load(),
+		PressureFlushes:        s.maintStats.pressureFlushes.Load(),
 	}
 
 	return out
