@@ -37,8 +37,17 @@ func newMergeByteCol(dc *chunk.DictColumn) mergeByteCol {
 	}
 
 	n := dc.Len()
+
+	// The flat form holds one entry per row, so the expanded blob's exact size is a walk over the
+	// entry headers — no data touched. Reserving it keeps the copy below from re-growing (and
+	// re-copying) the blob as it fills.
+	blob := 0
+	for _, e := range dc.Entries {
+		blob += len(e)
+	}
+
 	bc := byteCol{}
-	bc.ensure(n)
+	bc.ensureBytes(n, blob)
 
 	for i := range n {
 		bc.appendCell(dc.At(i))

@@ -31,13 +31,31 @@ func (b *byteCol) rows() int {
 func (b *byteCol) at(i int) []byte { return b.data[b.offsets[i]:b.offsets[i+1]] }
 
 // ensure re-arms the column for a fresh accumulation of up to n cells, reusing the backing arrays
-// when their capacity suffices (so a steady same-shape loop reallocates nothing).
-func (b *byteCol) ensure(n int) {
+// when their capacity suffices (so a steady same-shape loop reallocates nothing). It sizes the row
+// index only — see [byteCol.ensureBytes] for the callers that also know how many bytes are coming.
+func (b *byteCol) ensure(n int) { b.ensureBytes(n, 0) }
+
+// ensureBytes is [byteCol.ensure] with a blob capacity hint. Without one the blob grows by doubling
+// from whatever capacity it had, so a fresh accumulation re-copies its own bytes ~log₂(size) times
+// and overshoots its final capacity by up to 2× — CPU on the flush/merge hot path, and transient
+// memory on exactly the columns (a part's worth of log bodies) that make it hurt. Every bulk caller
+// knows the byte count: a dictionary's blob length, a source column's blob length, or the head's
+// tracked per-stream byteSize.
+func (b *byteCol) ensureBytes(n, bytes int) {
 	if cap(b.offsets) >= n+1 {
 		b.offsets = b.offsets[:1]
 		b.offsets[0] = 0
 	} else {
 		b.offsets = make([]int32, 1, n+1)
+	}
+
+	if bytes > cap(b.data) {
+		// Grow to at least the hint, but never by less than doubling: consecutive flushes differ in
+		// size by a few percent, and an exact-fit allocation would be a few bytes short next time,
+		// reallocating (and re-zeroing) the whole blob on every single flush.
+		b.data = make([]byte, 0, max(bytes, 2*cap(b.data)))
+
+		return
 	}
 
 	b.data = b.data[:0]

@@ -78,6 +78,11 @@ type Engine struct {
 	// closes the visibility gap a flush would otherwise open between draining the head and the part
 	// becoming live. nil when no flush is in flight.
 	flushing map[signal.SeriesID]*recordCols
+
+	// flushBuf is the part-column buffer the last flush used, kept for the next one: the engine has a
+	// single flusher and a part is fully written before the next flush begins, so its arrays can be
+	// re-armed instead of reallocated and re-zeroed each time.
+	flushBuf *flushColumns
 	// flushedEpoch is the WAL flush watermark: the generation of the most recently flushed head
 	// (persisted in the bucket index). Current head records are written to the WAL at flushedEpoch+1,
 	// so on recovery the engine replays only WAL segments past flushedEpoch — exactly-once.
@@ -907,7 +912,8 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	// Build (lock-free): lay out the detached buffers as part columns, write the part (columns +
 	// blooms + record-key footer), read it back, and write the side-store sidecars. These are the
 	// large I/Os that previously blocked the whole engine. The detached buffers are immutable here.
-	f := buildFlushColumns(e.cfg.Schema, detached)
+	f := buildFlushColumns(e.cfg.Schema, detached, e.flushBuf)
+	e.flushBuf = f // reused by the next flush; only this single flusher touches it
 	rows := len(f.stream)
 	prefix := e.partPrefix(seq)
 
