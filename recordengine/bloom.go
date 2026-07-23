@@ -378,31 +378,43 @@ func (p *part) mayContain(conds []fetch.Condition) bool {
 	return true
 }
 
-func (p *part) conditionMayMatch(c *fetch.Condition) bool {
-	// Attribute condition (column is not a fixed schema column): consult the Attrs-column bloom
-	// with key-scoped tokens.
-	if _, ok := p.schema.ref(c.Column); !ok {
-		k, has := p.schema.attrsByteCol()
-		if !has {
-			return true
-		}
+// attrsBloomMayMatch reports whether one [BloomAttrs] column's bloom may hold the condition's key.
+// A nil filter (the column has no bloom) proves nothing, so it may.
+func (p *part) attrsBloomMayMatch(f *bloom.Filter, c *fetch.Condition) bool {
+	if f == nil {
+		return true
+	}
 
-		f := p.blooms[p.schema.byteColumn(k).Name]
-		if f == nil {
-			return true
-		}
+	if c.Equal != nil && !f.Test(attrToken([]byte(c.Equal.Name), []byte(c.Equal.Value))) {
+		return false
+	}
 
-		if c.Equal != nil && !f.Test(attrToken([]byte(c.Equal.Name), []byte(c.Equal.Value))) {
+	for _, tok := range c.Tokens {
+		if !f.Test(attrToken([]byte(c.Column), tok)) {
 			return false
 		}
+	}
 
-		for _, tok := range c.Tokens {
-			if !f.Test(attrToken([]byte(c.Column), tok)) {
-				return false
+	return true
+}
+
+func (p *part) conditionMayMatch(c *fetch.Condition) bool {
+	// Attribute condition (column is not a fixed schema column): consult the Attrs-column blooms
+	// with key-scoped tokens. The key may live in any one of them, so the part survives if *some*
+	// attrs column may hold it — a column that proves the key absent only rules out that column.
+	if _, ok := p.schema.ref(c.Column); !ok {
+		cols := p.schema.attrsByteCols()
+		if len(cols) == 0 {
+			return true
+		}
+
+		for _, k := range cols {
+			if p.attrsBloomMayMatch(p.blooms[p.schema.byteColumn(k).Name], c) {
+				return true
 			}
 		}
 
-		return true
+		return false
 	}
 
 	// Fixed-column condition: consult that column's bloom (FullText tokens or Equality value).

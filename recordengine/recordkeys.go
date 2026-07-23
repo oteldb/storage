@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"hash/crc32"
-	"sort"
 
 	"github.com/go-faster/errors"
 
@@ -12,15 +11,19 @@ import (
 )
 
 // A part's distinct per-record attribute keys are persisted next to its column blooms as a small
-// footer sidecar at "{prefix}/keys.bin", so [Engine.Keys] can enumerate record-attribute keys
-// without scanning the part's attrs column. The set is bounded by the stream schema (keys, not
-// values), so the sidecar is tiny. Stream-identity keys are NOT stored here — they are recovered
-// from the authoritative series index.
+// footer sidecar at "{prefix}/keys.bin", so [Engine.Keys] can enumerate them without scanning the
+// part's attrs columns. The set is bounded by the stream schema (keys, not values), so the sidecar
+// is tiny. Each key carries the [KeyScope] of the column it came from, so a schema that stores a
+// stream's resource attributes per record reports them as resource keys rather than record ones.
+// Stream-identity keys are NOT stored here — they are recovered from the authoritative series index.
 func recordKeysKey(prefix string) string { return prefix + "/keys.bin" }
 
 const (
-	recordKeysMagic   uint32 = 0x4F544B59 // "OTKY"
-	recordKeysVersion uint32 = 1
+	recordKeysMagic uint32 = 0x4F544B59 // "OTKY"
+	// recordKeysVersion 2 appends a scope byte per key; version 1 (scope-less) is still read, its
+	// keys taken as [KeyScopeRecord] — the only scope that version could store.
+	recordKeysVersion   uint32 = 2
+	recordKeysVersionV1 uint32 = 1
 )
 
 // ErrCorruptKeys is returned when a serialized record-keys footer fails to parse.
@@ -28,47 +31,38 @@ var ErrCorruptKeys = errors.New("recordengine: corrupt record-keys footer")
 
 var recordKeysCRC = crc32.MakeTable(crc32.Castagnoli)
 
-// distinctRecordKeys decodes the serialized-attributes blobs of a part's attrs column (if any) and
-// returns their distinct keys, sorted, as owned copies. Empty when the schema has no attrs column.
-func distinctRecordKeys(schema *Schema, cols *recordCols) [][]byte {
-	k, ok := schema.attrsByteCol()
-	if !ok {
-		return nil
+// distinctRecordKeys decodes the serialized-attributes blobs of a part's [BloomAttrs] columns and
+// returns their distinct keys, sorted, as owned copies, each tagged with its column's [KeyScope] (a
+// key found in several columns carries the union). Empty when the schema has no attrs column.
+func distinctRecordKeys(schema *Schema, cols *recordCols) []KeyInfo {
+	seen := make(map[string]KeyScope)
+
+	for _, k := range schema.attrsByteCols() {
+		sc := schema.keyScope(k)
+		bc := &cols.bytes[k]
+
+		for i := range bc.rows() {
+			forEachAttrKey(bc.at(i), func(key []byte) { seen[string(key)] |= sc })
+		}
 	}
 
-	seen := make(map[string]struct{})
-	bc := &cols.bytes[k]
-	for i := range bc.rows() {
-		forEachAttrKey(bc.at(i), func(key []byte) { seen[string(key)] = struct{}{} })
-	}
-
-	if len(seen) == 0 {
-		return nil
-	}
-
-	out := make([][]byte, 0, len(seen))
-	for key := range seen {
-		out = append(out, []byte(key))
-	}
-
-	sort.Slice(out, func(i, j int) bool { return string(out[i]) < string(out[j]) })
-
-	return out
+	return keyInfoSlice(seen)
 }
 
 // encodeRecordKeys serializes a part's distinct record-attribute keys. Layout:
 //
 //	[u32 magic][uvarint version][uvarint count]
-//	  per key in sorted order: [uvarint len][bytes]
+//	  per key in sorted order: [uvarint len][bytes][u8 scope]
 //	[u32 CRC32C]
-func encodeRecordKeys(keys [][]byte) []byte {
+func encodeRecordKeys(keys []KeyInfo) []byte {
 	dst := binary.BigEndian.AppendUint32(nil, recordKeysMagic)
 	dst = binary.AppendUvarint(dst, uint64(recordKeysVersion))
 	dst = binary.AppendUvarint(dst, uint64(len(keys)))
 
-	for _, key := range keys {
-		dst = binary.AppendUvarint(dst, uint64(len(key)))
-		dst = append(dst, key...)
+	for _, k := range keys {
+		dst = binary.AppendUvarint(dst, uint64(len(k.Key)))
+		dst = append(dst, k.Key...)
+		dst = append(dst, byte(k.Scope))
 	}
 
 	crc := crc32.Checksum(dst, recordKeysCRC)
@@ -79,7 +73,7 @@ func encodeRecordKeys(keys [][]byte) []byte {
 // decodeRecordKeys parses [encodeRecordKeys] output. It verifies the CRC and bounds-checks every
 // field, returning an [ErrCorruptKeys]-wrapping error on malformed input; it never panics. Returned
 // keys are owned copies (do not alias src).
-func decodeRecordKeys(src []byte) ([][]byte, error) {
+func decodeRecordKeys(src []byte) ([]KeyInfo, error) {
 	if len(src) < 8 {
 		return nil, errors.Wrap(ErrCorruptKeys, "too short")
 	}
@@ -96,10 +90,11 @@ func decodeRecordKeys(src []byte) ([][]byte, error) {
 	body = body[4:]
 
 	version, n := binary.Uvarint(body)
-	if n <= 0 || version != uint64(recordKeysVersion) {
+	if n <= 0 || (version != uint64(recordKeysVersion) && version != uint64(recordKeysVersionV1)) {
 		return nil, errors.Wrap(ErrCorruptKeys, "version")
 	}
 
+	scoped := version == uint64(recordKeysVersion)
 	body = body[n:]
 
 	count, n := binary.Uvarint(body)
@@ -109,7 +104,7 @@ func decodeRecordKeys(src []byte) ([][]byte, error) {
 
 	body = body[n:]
 
-	out := make([][]byte, 0, count)
+	out := make([]KeyInfo, 0, count)
 	for range count {
 		l, n := binary.Uvarint(body)
 		if n <= 0 || l > uint64(len(body)-n) {
@@ -117,8 +112,19 @@ func decodeRecordKeys(src []byte) ([][]byte, error) {
 		}
 
 		body = body[n:]
-		out = append(out, append([]byte(nil), body[:l]...))
+		info := KeyInfo{Key: append([]byte(nil), body[:l]...), Scope: KeyScopeRecord}
 		body = body[l:]
+
+		if scoped {
+			if len(body) == 0 {
+				return nil, errors.Wrap(ErrCorruptKeys, "key scope")
+			}
+
+			info.Scope = KeyScope(body[0])
+			body = body[1:]
+		}
+
+		out = append(out, info)
 	}
 
 	return out, nil
@@ -141,7 +147,7 @@ func writeRecordKeys(ctx context.Context, b backend.Backend, schema *Schema, pre
 
 // loadRecordKeys reads the part's record-keys footer. A missing sidecar yields nil (an older part,
 // or one with no record attributes) — the part simply contributes no record-scope keys.
-func loadRecordKeys(ctx context.Context, b backend.Backend, prefix string) ([][]byte, error) {
+func loadRecordKeys(ctx context.Context, b backend.Backend, prefix string) ([]KeyInfo, error) {
 	data, err := b.Read(ctx, recordKeysKey(prefix))
 	if err != nil {
 		if errors.Is(err, backend.ErrNotExist) {

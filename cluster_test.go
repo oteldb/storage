@@ -664,7 +664,7 @@ func TestClusteredLogEnumerationFansOut(t *testing.T) {
 	require.NoError(t, err)
 
 	got := logKeyScopes(keys)
-	assert.Equal(t, KeyScopeResource, got["service.name"], "resource attribute (a stream label)")
+	assert.Equal(t, KeyScopeResource|KeyScopeIndexed, got["service.name"], "identifying resource attribute")
 	assert.Equal(t, KeyScopeRecord, got["http.method"], "record attribute served via fan-out")
 	assert.Equal(t, KeyScopeRecord, got["http.status_code"])
 }

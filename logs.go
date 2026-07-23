@@ -27,13 +27,23 @@ func (s *Storage) WriteLogs(ctx context.Context, ld log.Logs) (acc Accepted, err
 		return Accepted{}, errors.Wrap(ErrClosed, "write logs")
 	}
 
-	project := func(emit func(*recordengine.Batch)) int { return log.Project(ld, emit) }
+	fields := s.logStreamFields()
+	project := func(emit func(*recordengine.Batch)) int { return log.Project(ld, fields, emit) }
 
 	if s.cluster != nil {
 		return s.writeRecordsClustered(ctx, signal.Log, project)
 	}
 
 	return s.writeRecordsLocal(ctx, signal.Log, project, s.logEngineFor)
+}
+
+// logStreamFields returns the per-stream identity classifier [log.Project] narrows the stream key
+// with: it derives the stream's tenant from its Resource+Scope (the same derivation the batch is
+// routed by) and resolves that tenant's [tenant.Streams] policy.
+func (s *Storage) logStreamFields() log.StreamFields {
+	return func(res signal.Resource, scope signal.Scope) ([]string, bool) {
+		return s.tenant.Resolve(s.normalizeTenant(s.tenantFor(res, scope))).Streams.Resolve()
+	}
 }
 
 // LogFetcher returns the read seam for logs — a [fetch.Fetcher] over the named tenants' log data
@@ -80,17 +90,27 @@ func (s *Storage) LogSeries(
 	return eng.Series(matchers, start, end), nil
 }
 
-// KeyScope is a bitset of the scopes an attribute key appears in. A key can appear in more than one
-// (e.g. as a resource attribute on one stream and a record attribute on another).
+// KeyScope is a bitset describing an attribute key: its OTLP provenance (resource, scope, record —
+// a key can have more than one, e.g. a resource attribute on one stream and a record attribute on
+// another) and the mechanism a filter on it pushes down through (indexed ⇒ a Matcher, record ⇒ a
+// Condition).
 type KeyScope uint8
 
 const (
-	// KeyScopeResource marks a resource attribute (stream identity).
+	// KeyScopeResource marks a resource attribute.
 	KeyScopeResource = KeyScope(recordengine.KeyScopeResource)
-	// KeyScopeScope marks an instrumentation-scope attribute (stream identity).
+	// KeyScopeScope marks an instrumentation-scope attribute.
 	KeyScopeScope = KeyScope(recordengine.KeyScopeScope)
-	// KeyScopeRecord marks a per-record attribute (the attrs column).
+	// KeyScopeRecord marks a key that must be pushed down as a column Condition: it is stored per
+	// record and is not resolvable through the postings index. A resource attribute the tenant's
+	// stream-field policy (tenant.Streams) excludes from stream identity carries
+	// KeyScopeResource|KeyScopeRecord — resource by provenance, condition by mechanism.
 	KeyScopeRecord = KeyScope(recordengine.KeyScopeRecord)
+	// KeyScopeIndexed marks a key that is part of the stream identity, so a label Matcher on it
+	// resolves through the postings index. A key stored per record purely because it duplicates the
+	// stream key does not also carry KeyScopeRecord. Both bits together mean the key is genuinely
+	// both, and neither pushdown is sound on its own.
+	KeyScopeIndexed = KeyScope(recordengine.KeyScopeIndexed)
 )
 
 // KeyInfo is a distinct attribute key and the scope(s) it was observed in. Key aliases interned,
@@ -101,11 +121,12 @@ type KeyInfo struct {
 }
 
 // LogKeys returns the distinct attribute keys present in a tenant's log records within [start, end],
-// each tagged with the scope(s) it appears in (resource, scope, record). A zero start AND end
-// disables the time filter. It is the counterpart to [Storage.LogSeries] (which enumerates only
-// stream identities): the per-record [KeyScopeRecord] keys let an embedder list and push down
-// record-attribute labels its [Storage.LogSeries]-based resolution cannot see, and the scope bitset
-// authoritatively distinguishes a stream label from a record attribute (or both). Keys are
+// each tagged with its [KeyScope]. A zero start AND end disables the time filter. It is the
+// counterpart to [Storage.LogSeries] (which enumerates only stream identities): the
+// [KeyScopeRecord] keys let an embedder list and push down the labels its [Storage.LogSeries]-based
+// resolution cannot see — record attributes, and the resource attributes the tenant's stream-field
+// policy keeps out of the stream key — while [KeyScopeIndexed] names the keys a label matcher
+// resolves through the postings index. The bitset is the authoritative routing input. Keys are
 // low-cardinality metadata. In cluster mode it serves locally when this node owns the tenant, else
 // it fans out to an owner (hedged); each owner is a complete replica, so one response is
 // authoritative.

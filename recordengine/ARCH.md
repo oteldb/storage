@@ -134,14 +134,26 @@ Heavily tuned around decoding as little as possible:
 Conditions over a non-fixed column are per-record **attributes**, resolved by the zero-allocation
 `signal.LookupAttribute` over the serialized `attrs` column.
 
+A schema may declare **several `BloomAttrs` columns** (`Schema.attrsByteCols`, each with a
+`Column.KeyScope` naming the provenance its keys are reported under). An attribute condition resolves
+against them in declaration order — first hit wins, so the narrower scope is declared first (logs:
+`attrs` before `resource`, i.e. a record attribute shadows a resource attribute of the same name) —
+and a part survives pruning if *any* of their blooms may hold the key.
+
 ## Part sidecars
 
 - `bloom-{col}.bin` — per-column token blooms.
 - `keys.bin` (`OTKY`, magic+version+CRC32C) — the part's distinct per-record **attribute keys**
-  (not values — bounded by the schema, so tiny). `Engine.Keys` enumerates keys across head ∪
-  in-window parts tagged with a `KeyScope` bitset (resource/scope/record), so an embedder can list
-  and push down record-attribute labels that `Series`-based resolution cannot see. It is the
-  enumeration twin of `Engine.Series`.
+  (not values — bounded by the schema, so tiny). **Version 2** appends a scope byte per key, so a key
+  is reported with the OTLP provenance of the column it came from; version 1 is still read, its keys
+  taken as record-scoped. `Engine.Keys` enumerates keys across head ∪ in-window parts tagged with a
+  `KeyScope` bitset carrying both provenance (resource/scope/record) and the sound pushdown mechanism
+  — `KeyScopeIndexed` ⇒ a postings matcher, `KeyScopeRecord` ⇒ a column condition. Stream-identity
+  keys come from the authoritative series index, column keys from the head buffers and part footers.
+  A key duplicated into an attrs column purely because it is also the stream key does **not** get
+  `KeyScopeRecord`, so a caller routes on exactly one mechanism; both bits together mean the key is
+  genuinely both (resource on one stream, record on another) and neither pushdown is sound alone. It
+  is the enumeration twin of `Engine.Series`.
 - `sym-{name}.bin` (`OTSP`) — the optional **side store**: a content-addressed auxiliary store a
   signal attaches per batch (`Batch.Side`) that rides the part lifecycle — absorbed into a live
   accumulator, written as sidecars on flush, **unioned** on merge (content addressing makes the

@@ -27,9 +27,10 @@ type part struct {
 	ranges map[signal.SeriesID]rowRange
 	blooms map[string]*bloom.Filter // column name → its bloom (FullText/Attrs/Equality); absent ⇒ scan
 
-	// recordKeys is the part's distinct per-record attribute keys (the "keys.bin" footer), for
-	// [Engine.Keys] enumeration. nil when the part has no record attributes (or predates the footer).
-	recordKeys [][]byte
+	// recordKeys is the part's distinct per-record attribute keys and their scopes (the "keys.bin"
+	// footer), for [Engine.Keys] enumeration. nil when the part has no record attributes (or
+	// predates the footer).
+	recordKeys []KeyInfo
 
 	// minTime, maxTime are the inclusive unix-ns record bounds of the part (from the columns when
 	// written, from the bucket index when reconstructed), for time pruning.

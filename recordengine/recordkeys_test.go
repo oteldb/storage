@@ -15,11 +15,14 @@ import (
 func TestRecordKeysRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	cases := [][][]byte{
+	cases := [][]KeyInfo{
 		nil,
-		{[]byte("http.method")},
-		{[]byte("a"), []byte("bb"), []byte("ccc")},
-		{[]byte("job"), []byte("filename"), []byte("http.status_code")},
+		{{Key: []byte("http.method"), Scope: KeyScopeRecord}},
+		{
+			{Key: []byte("a"), Scope: KeyScopeRecord},
+			{Key: []byte("bb"), Scope: KeyScopeResource},
+			{Key: []byte("ccc"), Scope: KeyScopeResource | KeyScopeRecord},
+		},
 	}
 
 	for _, keys := range cases {
@@ -40,13 +43,14 @@ func TestRecordKeysRoundTrip(t *testing.T) {
 func TestRecordKeysGoldenBytes(t *testing.T) {
 	t.Parallel()
 
-	got := encodeRecordKeys([][]byte{[]byte("ab")})
+	got := encodeRecordKeys([]KeyInfo{{Key: []byte("ab"), Scope: KeyScopeRecord}})
 	want := []byte{
 		0x4F, 0x54, 0x4B, 0x59, // magic "OTKY"
-		0x01,           // version
+		0x02,           // version
 		0x01,           // count
 		0x02, 'a', 'b', // key len + bytes
-		0xDE, 0x06, 0x73, 0x17, // CRC32C(Castagnoli) over the body
+		0x04,                   // scope (KeyScopeRecord)
+		0x65, 0x11, 0xAA, 0x63, // CRC32C(Castagnoli) over the body
 	}
 	require.Equal(t, want, got)
 }
@@ -54,7 +58,7 @@ func TestRecordKeysGoldenBytes(t *testing.T) {
 func TestRecordKeysDecodeRejectsCorruption(t *testing.T) {
 	t.Parallel()
 
-	good := encodeRecordKeys([][]byte{[]byte("a"), []byte("bb")})
+	good := encodeRecordKeys([]KeyInfo{{Key: []byte("a")}, {Key: []byte("bb")}})
 
 	_, err := decodeRecordKeys(good[:3])
 	require.ErrorIs(t, err, ErrCorruptKeys, "truncated")
@@ -115,7 +119,7 @@ func TestRecordKeysDecodeFieldErrors(t *testing.T) {
 func TestRecordKeysDecodeTruncationSweep(t *testing.T) {
 	t.Parallel()
 
-	good := encodeRecordKeys([][]byte{[]byte("alpha"), []byte("beta"), []byte("gamma")})
+	good := encodeRecordKeys([]KeyInfo{{Key: []byte("alpha")}, {Key: []byte("beta")}, {Key: []byte("gamma")}})
 	for i := range good {
 		_, _ = decodeRecordKeys(good[:i]) // must not panic
 	}
@@ -141,7 +145,10 @@ func TestLoadRecordKeysRejectsCorruptSidecar(t *testing.T) {
 
 func FuzzRecordKeysDecode(f *testing.F) {
 	f.Add(encodeRecordKeys(nil))
-	f.Add(encodeRecordKeys([][]byte{[]byte("http.method"), []byte("job")}))
+	f.Add(encodeRecordKeys([]KeyInfo{
+		{Key: []byte("http.method"), Scope: KeyScopeRecord},
+		{Key: []byte("job"), Scope: KeyScopeResource},
+	}))
 	f.Add([]byte("garbage"))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
