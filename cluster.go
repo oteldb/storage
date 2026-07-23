@@ -1350,7 +1350,7 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 				MaxSeries: limits.MaxSeries, MaxInFlightBytes: limits.MaxInFlightBytes,
 			})
 			rej = primaryReject{ooo: res.RejectedOOO, cardinality: res.RejectedCardinality, inflight: res.RejectedBytes}
-			s.pokeFlush(eng.HeadBytes())
+			s.pokeFlush(eng)
 		}
 	} else {
 		var eng *recordengine.Engine
@@ -1360,7 +1360,7 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 				MaxSeries: limits.MaxSeries, MaxInFlightBytes: limits.MaxInFlightBytes,
 			})
 			rej = primaryReject{ooo: res.RejectedOOO, cardinality: res.RejectedCardinality, inflight: res.RejectedBytes}
-			s.pokeFlush(eng.HeadBytes())
+			s.pokeFlush(eng)
 		}
 	}
 

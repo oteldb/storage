@@ -413,7 +413,7 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 			lastAdmit.recordOverflowed(int64(res.Overflowed))
 		}
 
-		s.pokeFlush(lastEng.HeadBytes())
+		s.pokeFlush(lastEng)
 	})
 
 	if firstErr != nil {
@@ -1063,11 +1063,17 @@ func (s *Storage) runMaintenance(interval time.Duration) {
 	}
 }
 
-// pokeFlush signals the maintenance loop that headBytes has reached the flush threshold. Called
-// from the write path after an append; non-blocking, so ingestion never waits on the loop (a poke
-// already queued covers this one). No-op when the size trigger is off or there is no loop.
-func (s *Storage) pokeFlush(headBytes int64) {
-	if s.flushWake == nil || headBytes < s.opts.flushThresholdBytes() {
+// headSized is an engine that reports its buffered head bytes ([engine.Engine],
+// [recordengine.Engine]), so the write path can hand [Storage.pokeFlush] the engine rather than a
+// measurement it would have to take on every batch.
+type headSized interface{ HeadBytes() int64 }
+
+// pokeFlush signals the maintenance loop that eng's head may have reached the flush threshold.
+// Called from the write path after an append; non-blocking, so ingestion never waits on the loop (a
+// poke already queued covers this one). When the size trigger is off or there is no loop it returns
+// on a nil check, without measuring the head — the write path must not pay for a disabled trigger.
+func (s *Storage) pokeFlush(eng headSized) {
+	if s.flushWake == nil || eng.HeadBytes() < s.opts.flushThresholdBytes() {
 		return
 	}
 
