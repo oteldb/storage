@@ -193,8 +193,14 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, seq
 		return nil
 	}
 
+	// One accumulator, re-armed per stream: a merge visits every stream of the selected parts (tens of
+	// thousands on real log data), so allocating one per stream churned a fresh set of column buffers
+	// — and their doubling growth — through the GC for each. [recordCols.prepare] keeps the backing
+	// arrays.
+	acc := newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
+
 	for _, id := range idSetOf(src) {
-		acc := newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
+		acc.prepare(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
 
 		// Oldest → newest part order; records are append-only (no dedup), so the stream is just
 		// concatenated across parts and re-sorted by ts below.

@@ -12,7 +12,8 @@ import (
 )
 
 // buildColumnBloomReference is the single-pass build that [buildColumnBloom] replaced: it
-// materializes every token to learn the count and hashes them in a second loop. It is kept here
+// materializes every token, sketches the materialized set to size the filter, and hashes them in a
+// second loop. It is kept here
 // purely as the oracle for the two-pass build — the encoded filter must be byte-identical, since
 // blooms are persisted per part and an old part must stay readable by the new code (and vice
 // versa).
@@ -57,7 +58,17 @@ func buildColumnBloomReference(mode BloomMode, values *byteCol) []byte {
 		return nil
 	}
 
-	f := bloom.New(len(tokens), 0.01)
+	n := len(tokens)
+	if len(values.data) > 1<<20 || bloom.Bits(n, falsePositiveRate(mode))/8 > smallFilterBytes {
+		var sk bloom.Sketch
+		for _, tk := range tokens {
+			sk.Add(tk)
+		}
+
+		n = sk.Estimate()
+	}
+
+	f := bloom.New(n, falsePositiveRate(mode))
 	for _, tk := range tokens {
 		f.Add(tk)
 	}
