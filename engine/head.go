@@ -355,6 +355,11 @@ func (h *head) ensureIndexSorted() { h.post.EnsureSorted() }
 
 // resolve returns the SeriesIDs matching all matchers (their intersection), lowering each
 // callback matcher to a postings value scan over the typed value.
+//
+// A series that does not carry the label at all is offered [signal.EmptyValue], the same contract
+// [fetch.Condition] has per row: the matcher is operator-free, so only the language knows whether
+// absence satisfies it (a negation or an is-unset matcher does). Such a matcher unions the value
+// scan with the series lacking the label ([postings.MemPostings.WithoutName]).
 func (h *head) resolve(matchers []fetch.Matcher) []signal.SeriesID {
 	if len(matchers) == 0 {
 		return drain(h.post.All())
@@ -362,12 +367,21 @@ func (h *head) resolve(matchers []fetch.Matcher) []signal.SeriesID {
 
 	its := make([]postings.Postings, len(matchers))
 	for i := range matchers {
+		match := matchers[i].Match
+		absent := match(signal.EmptyValue())
+
 		nameID, ok := h.sym.Lookup(matchers[i].Name)
 		if !ok {
-			return nil // no series carries this label
+			// No series carries this label, so every series is an absent one.
+			if !absent {
+				return nil
+			}
+
+			its[i] = h.post.All()
+
+			continue
 		}
 
-		match := matchers[i].Match
 		its[i] = h.post.Select(uint32(nameID), func(valueID uint32) bool {
 			raw, ok := h.sym.Get(symbols.ID(valueID))
 			if !ok {
@@ -381,6 +395,10 @@ func (h *head) resolve(matchers []fetch.Matcher) []signal.SeriesID {
 
 			return match(v)
 		})
+
+		if absent {
+			its[i] = postings.Merge(its[i], h.post.WithoutName(uint32(nameID)))
+		}
 	}
 
 	return drain(postings.Intersect(its...))
