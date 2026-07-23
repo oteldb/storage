@@ -15,6 +15,17 @@ import (
 
 // byteColBytes is the resident footprint of one decoded byte column: the blob plus its offset index
 // (readCols form) or the dictionary entries + slice headers + packed ids (readForMerge dict form).
+// flatColumnBytes is what the column would cost with no dedup at all: every row's cell, plus the
+// offset index.
+func flatColumnBytes(rows, templates int) int {
+	n := 0
+	for i := range rows {
+		n += len(fmt.Appendf(nil, "GET /api/v1/resource/%d status=200 handler=template done", i%templates))
+	}
+
+	return n + 4*(rows+1)
+}
+
 func mergeByteColBytes(m mergeByteCol) int {
 	if m.dict != nil {
 		n := len(m.dict.IDs) + 24*len(m.dict.Entries) // 24B per []byte header
@@ -28,10 +39,13 @@ func mergeByteColBytes(m mergeByteCol) int {
 	return len(m.flat.data) + 4*len(m.flat.offsets)
 }
 
+// recordColsByteBytes is the resident byte cost of a read accumulator's byte columns — storedSize
+// plus the offset index, so an interned column is counted with its id index and is comparable to
+// mergeByteColBytes.
 func recordColsByteBytes(c *recordCols) int {
 	n := 0
 	for k := range c.bytes {
-		n += len(c.bytes[k].data) + 4*len(c.bytes[k].offsets)
+		n += int(c.bytes[k].storedSize()) + 4*len(c.bytes[k].offsets)
 	}
 
 	return n
@@ -130,7 +144,9 @@ func TestMergeDecodeDictCompact(t *testing.T) {
 	t.Logf("byte column resident: expanded=%d B, dict=%d B (%.1fx smaller)",
 		expanded, dictBytes, float64(expanded)/float64(dictBytes))
 
-	// With 16 distinct bodies across 20k rows the dictionary is ~16 entries + 20k×1B ids, vs a 20k-cell
-	// blob — a large reduction. Require at least 4x to guard the property without being brittle.
-	assert.Less(t, dictBytes*4, expanded, "dict decode must hold far less than the expanded blob")
+	// Both forms now dictionary-encode a repetitive column — the merge path from the part's own
+	// dictionary, the read path by interning on append — so neither should be anywhere near the
+	// 20k-cell flat blob. Guard that they stay within the same order of each other.
+	assert.Less(t, dictBytes, expanded*4, "the merge dict form must not blow up against the read form")
+	assert.Less(t, expanded, flatColumnBytes(rows, templates), "the read form must not be flat")
 }

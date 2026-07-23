@@ -1142,7 +1142,18 @@ optional side store differ.
   and a per-record scan walks one allocation with locality. Cell views alias the blob under the
   read-only-until-next-append rule (an append that grows the blob may move it, so a value retained
   past an append is copied); the `fetch.NamedColumn` boundary materializes `[][]byte` views into the
-  blob, pooled across recycled fetches. Flush is a **pass-through**: `block.Column` accepts the
+  blob, pooled across recycled fetches. Repeated values are common — a part is sorted (stream, ts),
+  and a stream's serialized resource attributes or a severity text take a handful of distinct values
+  over hundreds of thousands of rows — so a column is held **interned** by default: the blob holds the
+  distinct values and a 4-byte id per row indexes them (measured on real log parts: 149 MB → 108 KB
+  for `resource`, 1.5 MB → 134 B for `severity_text`). A near-unique column — a span id, a trace id,
+  a verbose body — would pay a hash per row for nothing, so interning is abandoned, permanently, once
+  the distinct bytes exceed half the logical bytes, re-tested every 512 rows because a column can
+  start repetitive and diverge. `byteSize` reports the logical bytes in either form, so accounting is
+  unaffected. The flush buffer opts out (`noIntern`): it feeds the encoder, which wants a flat blob,
+  and `CodecDict` is what dedups the data on disk. The ts sort permutes an interned column's id index
+  alone, and otherwise through **one scratch column** shared across a whole flush.
+  Flush is a **pass-through**: `block.Column` accepts the
   blob+offsets form directly (`BytesBlob`/`BytesOffsets`, encoded byte-identically to the `Bytes`
   form via `chunk.EncodeBytesBlob`/`EncodeBytesRawBlob`), so writing a part walks the head buffer's
   blobs without materializing a view per row. `Fetch` is heavily tuned: **lazy column decode**

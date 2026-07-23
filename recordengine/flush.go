@@ -19,6 +19,8 @@ import (
 type flushColumns struct {
 	stream []chunk.U128
 	cols   *recordCols // full column set (every schema column)
+	// sortScratch is the reusable permutation destination shared by every stream's ts sort.
+	sortScratch byteCol
 }
 
 func (f *flushColumns) len() int { return len(f.stream) }
@@ -38,6 +40,10 @@ func (f *flushColumns) reset(schema *Schema, rows int, blob []int) {
 
 	for k := range f.cols.bytes {
 		f.cols.bytes[k].ensureBytes(rows, blob[k])
+		// The flush buffer feeds the part encoder, which wants a flat blob, so an interned column
+		// would have to be expanded again at writePart — paying for the dictionary *and* the flat
+		// copy. The encoder's own CodecDict is what dedups this data on disk.
+		f.cols.bytes[k].noIntern = true
 	}
 }
 
@@ -87,6 +93,16 @@ func (f *flushColumns) slice(lo, hi int) *flushColumns {
 	for k := range src.bytes {
 		bc := &src.bytes[k]
 		if bc.rows() == 0 {
+			continue
+		}
+
+		if bc.interned {
+			// An interned column slices to a row range of its id index; the split parts share the
+			// dictionary. The nil map marks it read-only — an append would expand it first.
+			sliced := byteCol{data: bc.data, offsets: bc.offsets, ids: bc.ids[lo:hi], interned: true}
+			sliced.recountLogical()
+			cols.bytes[k] = sliced
+
 			continue
 		}
 
@@ -144,7 +160,7 @@ func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols, 
 
 	for _, id := range ids {
 		buf := records[id]
-		buf.sortByTs() // order each stream's records by ts so the part is (stream, ts)-sorted
+		buf.sortByTsWith(&f.sortScratch) // order each stream's records by ts so the part is (stream, ts)-sorted
 
 		u := idToU128(id)
 		for i := range buf.ts {
@@ -208,9 +224,12 @@ func writePart(
 
 	for k := range schema.byteCols {
 		// Blob+offsets pass-through: the head buffer's byte-column layout feeds the encoder
-		// directly, so a flush materializes no per-row [][]byte view.
+		// directly, so a flush materializes no per-row [][]byte view. A run is the one case that must
+		// be materialized: the encoder takes a flat blob, and its dictionary re-collapses it on disk.
 		col := schema.byteColumn(k)
 		bc := &f.cols.bytes[k]
+
+		bc.expand()
 		if err := w.AddColumn(block.Column{
 			Name: col.Name, Kind: block.KindBytes, Codec: col.Codec,
 			BytesBlob: bc.data, BytesOffsets: bc.offsets,
