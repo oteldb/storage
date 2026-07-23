@@ -417,7 +417,14 @@ func (p *part) conditionMayMatch(c *fetch.Condition) bool {
 		}
 	}
 
-	if c.Equal != nil && !f.Test([]byte(c.Equal.Value)) {
+	// An equality hint may only be tested against a filter that holds whole values. A
+	// [BloomFullText] column holds the *tokens* of each value, so a multi-token value it does hold
+	// would test absent and prune a part that matches; such a condition prunes by its Tokens above.
+	// The empty value is skipped by the Equality build (see eachEquality), so it is never provably
+	// absent either.
+	ref, _ := p.schema.ref(c.Column) // present: the no-such-column case returned above
+	if c.Equal != nil && c.Equal.Value != "" && p.schema.byteColumn(ref.idx).Bloom == BloomEquality &&
+		!f.Test([]byte(c.Equal.Value)) {
 		return false
 	}
 

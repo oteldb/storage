@@ -302,7 +302,8 @@ func (lz *lazyCols) colValue(i int, name string) (signal.Value, bool) {
 
 // rowMatches reports whether row i satisfies every condition (logical AND). A condition with a
 // precomputed [lazyCols.eqMask] entry (see [eqFastPathCols]) reads its row's bit instead of going
-// through colValue+Match.
+// through colValue+Match. Absent columns follow [recordCols.rowMatches]: the predicate is offered
+// [signal.EmptyValue] rather than short-circuited to a non-match.
 func (lz *lazyCols) rowMatches(i int, conds []fetch.Condition) bool {
 	for j := range conds {
 		if len(lz.eqMask) != 0 && lz.eqMask[j] != nil {
@@ -314,7 +315,11 @@ func (lz *lazyCols) rowMatches(i int, conds []fetch.Condition) bool {
 		}
 
 		v, ok := lz.colValue(i, conds[j].Column)
-		if !ok || !conds[j].Match(v) {
+		if !ok {
+			v = signal.EmptyValue()
+		}
+
+		if !conds[j].Match(v) {
 			return false
 		}
 	}
