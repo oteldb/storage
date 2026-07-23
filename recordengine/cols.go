@@ -322,7 +322,14 @@ func cloneBytes(b []byte) []byte {
 // sortByTs reorders every selected column by ascending timestamp (stable). Records arrive
 // part-ordered and a part's rows are ts-sorted, so the accumulated window is very often already
 // ordered — an O(n) check skips the O(n log n) sort and its permute allocations.
-func (c *recordCols) sortByTs() {
+func (c *recordCols) sortByTs() { c.sortByTsWith(nil) }
+
+// sortByTsWith is [recordCols.sortByTs] with a caller-owned scratch column. A variable-width byte
+// column cannot be permuted in place, so each needs a destination array; swapping the permuted
+// result with the column's old array hands that array on as the next column's destination, so a
+// whole flush allocates one buffer instead of one per byte column per unsorted stream. A nil scratch
+// allocates a fresh destination per column (the metric/merge callers, which sort one accumulator).
+func (c *recordCols) sortByTsWith(scratch *byteCol) {
 	if c.isSortedByTs() {
 		return
 	}
@@ -342,9 +349,18 @@ func (c *recordCols) sortByTs() {
 	}
 
 	for k := range c.bytes {
-		if c.sel.bytes[k] {
-			c.bytes[k] = permuteBytes(&c.bytes[k], idx)
+		if !c.sel.bytes[k] {
+			continue
 		}
+
+		if scratch == nil {
+			c.bytes[k] = permuteBytes(&c.bytes[k], idx)
+
+			continue
+		}
+
+		permuteBytesInto(scratch, &c.bytes[k], idx)
+		c.bytes[k], *scratch = *scratch, c.bytes[k]
 	}
 }
 

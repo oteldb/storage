@@ -160,3 +160,25 @@ func permuteBytes(src *byteCol, idx []int) byteCol {
 
 	return out
 }
+
+// permuteBytesInto writes src's cells reordered by idx into dst, reusing dst's backing arrays. It is
+// [permuteBytes] with a caller-supplied destination (see [recordCols.sortByTsWith]). dst is sized to
+// src exactly — it is a scratch shared across columns of differing widths, where a doubling growth
+// rule would compound into a multiple of the largest.
+func permuteBytesInto(dst, src *byteCol, idx []int) {
+	if cap(dst.data) < len(src.data) {
+		dst.data = make([]byte, 0, len(src.data))
+	} else {
+		dst.data = dst.data[:0]
+	}
+
+	if cap(dst.offsets) < len(idx)+1 {
+		dst.offsets = make([]int32, 0, len(idx)+1)
+	} else {
+		dst.offsets = dst.offsets[:0]
+	}
+
+	for _, j := range idx {
+		dst.appendCell(src.at(j))
+	}
+}
