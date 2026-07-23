@@ -165,3 +165,26 @@ func BenchmarkTokenize(b *testing.B) {
 
 	_ = dst
 }
+
+// TestAlnumLowerTable pins the lookup table to the range comparisons it replaced, exhaustively over
+// all 256 bytes. Scanner and Tokenize both read this table, so nothing else cross-checks the
+// classification itself — a wrong entry would silently change what gets indexed and queried.
+func TestAlnumLowerTable(t *testing.T) {
+	t.Parallel()
+
+	for i := range 256 {
+		c := byte(i)
+
+		var want byte
+
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+			want = c
+		case c >= 'A' && c <= 'Z':
+			want = c + 'a' - 'A'
+		}
+
+		require.Equalf(t, want, alnumLower[i], "alnumLower[%d] (%q)", i, c)
+		require.Equalf(t, want != 0, isAlnum(c), "isAlnum(%q)", c)
+	}
+}
