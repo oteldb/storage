@@ -334,12 +334,14 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 			pf.Add("parts_pruned_time", int64(plan.partsPrunedTime))
 			pf.Add("parts_pruned_bloom", int64(plan.partsPrunedBloom))
 			pf.Add("parts_live", int64(len(plan.liveParts)))
+			pf.Add("parts_skipped_limit", int64(plan.partsSkippedLimit))
 			pf.Add("rows_total", plan.rowsTotal)
 			pf.Add("rows_live", plan.rowsLive)
 			span.SetAttributes(
 				attribute.Int("storage.parts_pruned_time", plan.partsPrunedTime),
 				attribute.Int("storage.parts_pruned_bloom", plan.partsPrunedBloom),
 				attribute.Int("storage.parts_live", len(plan.liveParts)),
+				attribute.Int("storage.parts_skipped_limit", plan.partsSkippedLimit),
 				attribute.Int64("storage.rows_total", plan.rowsTotal),
 				attribute.Int64("storage.rows_live", plan.rowsLive),
 			)
@@ -760,6 +762,12 @@ type fetchPlan struct {
 	// matching rows materialize; condSel is the columns those conditions read (see fetchlazy.go).
 	conds   []fetch.Condition
 	condSel colSel
+
+	// Top-N scan (see limitscan.go): limit/reverse mirror the request, and partsSkippedLimit counts
+	// the live parts the watermark let the scan stop before reading.
+	limit             int
+	reverse           bool
+	partsSkippedLimit int
 }
 
 // planFetch builds the fetch plan: it selects and acquires the live parts that may hold a requested
@@ -794,6 +802,12 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *fetchPlan {
 	if r.AllConditions && len(r.Conditions) > 0 {
 		p.conds = r.Conditions
 		p.condSel = conditionSel(e.cfg.Schema, r.Conditions)
+	}
+
+	// The top-N scan needs to know a part's contribution the moment it is read, which conditions
+	// defer to the filter pass — so it applies only to unfiltered requests (see limitscan.go).
+	if len(p.conds) == 0 {
+		p.limit, p.reverse = r.Limit, r.Reverse
 	}
 
 	p.partsTotal = len(e.parts)
@@ -855,7 +869,11 @@ func (p *fetchPlan) readParts(ctx context.Context) error {
 		return p.readPartsLazy(ctx) // filtered path: materialize only matching rows (fetchlazy.go)
 	}
 
-	for _, part := range p.liveParts {
+	if p.limit > 0 {
+		p.orderPartsForLimit(p.reverse) // newest-first (or oldest-first), so the scan can stop early
+	}
+
+	for i, part := range p.liveParts {
 		cols, err := part.readCols(ctx, p.sel, p.e.getI64)
 		if err != nil {
 			return err
@@ -868,9 +886,31 @@ func (p *fetchPlan) readParts(ctx context.Context) error {
 		}
 
 		p.e.recycleDecodeInts(cols) // the int columns are copied into the accumulators; reuse them
+
+		if p.stopAfter(i) {
+			p.partsSkippedLimit = len(p.liveParts) - i - 1
+
+			break
+		}
 	}
 
 	return nil
+}
+
+// stopAfter reports whether, having read liveParts[i], the remaining parts are all beyond the top-N
+// watermark and can be skipped. The parts are time-ordered, so the next one bounds every one after
+// it (see limitscan.go).
+func (p *fetchPlan) stopAfter(i int) bool {
+	if p.limit <= 0 || i+1 >= len(p.liveParts) {
+		return false
+	}
+
+	watermark, ok := limitWatermark(p.accs, p.ids, p.limit, p.reverse)
+	if !ok {
+		return false
+	}
+
+	return beyondWatermark(p.liveParts[i+1], watermark, p.reverse)
 }
 
 // releaseParts releases the fetch's hold on its acquired parts, letting a retired part be reclaimed.

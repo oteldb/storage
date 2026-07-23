@@ -1145,7 +1145,13 @@ optional side store differ.
   blob, pooled across recycled fetches. Flush is a **pass-through**: `block.Column` accepts the
   blob+offsets form directly (`BytesBlob`/`BytesOffsets`, encoded byte-identically to the `Bytes`
   form via `chunk.EncodeBytesBlob`/`EncodeBytesRawBlob`), so writing a part walks the head buffer's
-  blobs without materializing a view per row. `Fetch` is heavily tuned: **lazy column decode**
+  blobs without materializing a view per row. `**Top-N pushdown**: an unfiltered `Limit`+`Reverse` request reads the live parts in time order
+  (newest-first, else oldest-first) and stops once it holds `Limit` rows whose watermark timestamp is
+  strictly past the `maxTime`/`minTime` of every unread part — since the parts are time-ordered, one
+  bounds all that follow. The comparison is strict so boundary ties are still read (`limitTrim` keeps
+  ties, so the result stays a correct superset), and it is disabled when the request carries
+  conditions, whose per-part survivor count is unknown until the filter runs (`recordengine/limitscan.go`,
+  `parts_skipped_limit` in EXPLAIN ANALYZE). Fetch` is heavily tuned: **lazy column decode**
   (materialize only the columns a request's conditions + projection reference — a body search
   projecting body touches just `ts`+`body`), decode each surviving part **once** distributing rows
   to per-stream accumulators, pre-size accumulators from row-range counts, bulk-append in-window
