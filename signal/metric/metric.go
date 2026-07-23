@@ -201,11 +201,15 @@ func Project(md Metrics, emit func(*Batch)) (accepted int) {
 // hashing allocates nothing. buf[:prefixLen] holds the resource‖scope hash pre-image
 // (hoisted per scope group and kept resident, so it is never re-copied per point); each
 // point's attributes are appended after it in place. reserved is the metric's five folded
-// labels in sorted-by-key order (hoisted per metric).
+// labels in sorted-by-key order, and reservedBuf their serialized pre-image (both hoisted
+// per metric).
 type projector struct {
 	buf       []byte
 	prefixLen int
 	reserved  [5]signal.KeyValue
+	// reservedBuf is the hash pre-image of reserved, serialized once per metric so the common
+	// case can copy it per point instead of re-encoding five key/value pairs. See [projector.id].
+	reservedBuf []byte
 }
 
 // setGroup rebuilds the hoisted resource‖scope prefix at the front of buf for a new scope
@@ -223,6 +227,11 @@ func (p *projector) setMetric(m *Metric) {
 	p.reserved[2] = signal.KeyValue{Key: LabelName, Value: signal.StringValue(m.Name)}
 	p.reserved[3] = signal.KeyValue{Key: LabelTemporality, Value: signal.IntValue(int64(m.Temporality))}
 	p.reserved[4] = signal.KeyValue{Key: LabelUnit, Value: signal.StringValue(m.Unit)}
+
+	p.reservedBuf = p.reservedBuf[:0]
+	for i := range p.reserved {
+		p.reservedBuf = signal.AppendKeyValueHashInput(p.reservedBuf, p.reserved[i].Key, p.reserved[i].Value)
+	}
 }
 
 // id computes the series id for a point with the given already-sorted attributes, reusing
@@ -234,7 +243,23 @@ func (p *projector) id(attrs signal.Attributes) signal.SeriesID {
 	// in place (keeping the grown capacity), so the prefix is never re-copied.
 	buf := p.buf[:p.prefixLen]
 	buf = binary.AppendUvarint(buf, uint64(len(attrs)+len(p.reserved)))
-	buf = appendMergedHashInput(buf, attrs, p.reserved[:])
+
+	// Both sequences are sorted, so comparing the last reserved key to the first attribute key
+	// decides whether every reserved label sorts before every attribute. When it does, the merge
+	// degenerates to "reserved labels, then attributes" and the reserved block — constant across
+	// the metric's points — is copied wholesale instead of re-encoding five key/value pairs per
+	// point. The reserved keys are __-prefixed and attribute keys conventionally start with a
+	// letter, so this holds for essentially all real input; the strict < leaves equal keys to the
+	// general merge, which resolves such ties to attrs first.
+	if len(attrs) == 0 || bytes.Compare(p.reserved[len(p.reserved)-1].Key, attrs[0].Key) < 0 {
+		buf = append(buf, p.reservedBuf...)
+		for i := range attrs {
+			buf = signal.AppendKeyValueHashInput(buf, attrs[i].Key, attrs[i].Value)
+		}
+	} else {
+		buf = appendMergedHashInput(buf, attrs, p.reserved[:])
+	}
+
 	p.buf = buf
 
 	return signal.HashBytes(buf)
