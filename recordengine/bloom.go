@@ -19,11 +19,141 @@ func bloomKey(prefix, column string) string { return prefix + "/bloom-" + column
 // attrToken builds the key-scoped token key ‖ 0x00 ‖ value used by [BloomAttrs] columns (and the
 // query side). A separator collision can only cause a false positive (an extra scan).
 func attrToken(key, value []byte) []byte {
-	dst := make([]byte, 0, len(key)+1+len(value))
+	return appendAttrToken(make([]byte, 0, len(key)+1+len(value)), key, value)
+}
+
+// appendAttrToken is [attrToken] appending into a caller-owned buffer, so a build that emits one
+// token per attribute per row reuses a single allocation.
+func appendAttrToken(dst, key, value []byte) []byte {
 	dst = append(dst, key...)
 	dst = append(dst, 0x00)
 
 	return append(dst, value...)
+}
+
+// bloomBuilder holds the reusable scratch one column's bloom build needs, so walking a column
+// allocates nothing per token or per row.
+type bloomBuilder struct {
+	words bloom.Scanner     // token scanner, keeps its case-folding buffer
+	attrs signal.Attributes // reused attribute-decode buffer
+	text  []byte            // reused rendered attribute value
+	token []byte            // reused key-scoped token
+}
+
+// countTokens returns how many tokens [bloomBuilder.forEachToken] emits for the column, counting
+// per row rather than per token — [bloom.CountTokens] scores a whole value in one call, where
+// counting through forEachToken would pay an indirect call per token.
+//
+// It must stay in step with forEachToken: an undercount saturates the filter (more false positives,
+// never a false negative), an overcount wastes space, and either changes the encoded bytes. That is
+// exactly what TestBuildColumnBloomMatchesReference and FuzzBuildColumnBloomMatchesReference detect
+// — they compare against a single-pass build that counts by materializing, so any drift between
+// this and forEachToken shows up as a differing filter.
+func (bb *bloomBuilder) countTokens(mode BloomMode, values *byteCol) int {
+	n := 0
+
+	switch mode {
+	case BloomFullText:
+		for i := range values.rows() {
+			n += bloom.CountTokens(values.at(i))
+		}
+	case BloomEquality:
+		for i := range values.rows() {
+			if len(values.at(i)) > 0 {
+				n++
+			}
+		}
+	case BloomAttrs:
+		for i := range values.rows() {
+			a, _, err := signal.AppendAttributes(bb.attrs[:0], values.at(i))
+			if err != nil {
+				continue
+			}
+
+			bb.attrs = a
+			for j := range a {
+				// One key‖value token per attribute, plus one key‖word token per word.
+				bb.text = a[j].Value.AppendText(bb.text[:0])
+				n += 1 + bloom.CountTokens(bb.text)
+			}
+		}
+	case BloomNone:
+	}
+
+	return n
+}
+
+// forEachToken calls fn once per bloom token of the column under mode. Tokens passed to fn alias
+// the builder's scratch and are invalid after fn returns.
+func (bb *bloomBuilder) forEachToken(mode BloomMode, values *byteCol, fn func(token []byte)) {
+	switch mode {
+	case BloomFullText:
+		bb.eachFullText(values, fn)
+	case BloomEquality:
+		eachEquality(values, fn)
+	case BloomAttrs:
+		bb.eachAttrs(values, fn)
+	case BloomNone:
+	}
+}
+
+// eachFullText emits a token per lowercased word of each value.
+func (bb *bloomBuilder) eachFullText(values *byteCol, fn func(token []byte)) {
+	for i := range values.rows() {
+		bb.words.Reset(values.at(i))
+		for {
+			tok, ok := bb.words.Next()
+			if !ok {
+				break
+			}
+
+			fn(tok)
+		}
+	}
+}
+
+// eachEquality emits each non-empty value verbatim. Empty values (e.g. a log record with no
+// trace_id) are skipped: they are never an equality lookup target, and indexing them would size the
+// filter to the row count and hash a value per row for nothing — the dominant cost when a column is
+// mostly empty.
+func eachEquality(values *byteCol, fn func(token []byte)) {
+	for i := range values.rows() {
+		if v := values.at(i); len(v) > 0 {
+			fn(v)
+		}
+	}
+}
+
+// eachAttrs emits, per attribute of each serialized blob, the equality token key‖value and a
+// key‖word token per word of the rendered value. A blob that fails to decode is skipped.
+func (bb *bloomBuilder) eachAttrs(values *byteCol, fn func(token []byte)) {
+	for i := range values.rows() {
+		a, _, err := signal.AppendAttributes(bb.attrs[:0], values.at(i))
+		if err != nil {
+			continue
+		}
+
+		bb.attrs = a
+		for j := range a {
+			bb.text = a[j].Value.AppendText(bb.text[:0])
+
+			bb.token = appendAttrToken(bb.token[:0], a[j].Key, bb.text)
+			fn(bb.token)
+
+			// The rendered text is scanned in place; the key-scoped token is rebuilt per word into
+			// the same buffer, which fn has finished with by then.
+			bb.words.Reset(bb.text)
+			for {
+				w, ok := bb.words.Next()
+				if !ok {
+					break
+				}
+
+				bb.token = appendAttrToken(bb.token[:0], a[j].Key, w)
+				fn(bb.token)
+			}
+		}
+	}
 }
 
 // buildColumnBloom builds the bloom for one bloom-bearing column over its per-record values.
@@ -31,55 +161,20 @@ func attrToken(key, value []byte) []byte {
 //   - Equality: each value verbatim (exact-match pruning, e.g. trace-by-id).
 //   - Attrs: per attribute (k,v) of each serialized blob, the equality token k‖v and a full-text
 //     token k‖word per value word.
+//
+// The column is walked twice — once to count tokens, once to hash them — rather than materializing
+// every token to learn the count [bloom.New] needs. Both passes see the same token set, so the
+// filter is byte-identical to a single-pass build; the second walk is far cheaper than the
+// per-token allocations (and the live [][]byte holding them) it replaces.
 func buildColumnBloom(mode BloomMode, values *byteCol) []byte {
-	var (
-		tokens  [][]byte
-		words   [][]byte
-		scratch []byte
-	)
-
-	rows := values.rows()
-
-	switch mode {
-	case BloomFullText:
-		for i := range rows {
-			tokens = bloom.Tokenize(tokens, values.at(i))
-		}
-	case BloomEquality:
-		for i := range rows {
-			if v := values.at(i); len(v) > 0 {
-				// Each non-empty value is its own token. Empty values (e.g. a log record with no
-				// trace_id) are skipped: they are never an equality lookup target, and indexing them
-				// would size the filter to the row count and hash a value per row for nothing — the
-				// dominant cost when a column is mostly empty.
-				tokens = append(tokens, v)
-			}
-		}
-	case BloomAttrs:
-		for i := range rows {
-			a, _, err := signal.DecodeAttributes(values.at(i))
-			if err != nil {
-				continue
-			}
-
-			for i := range a {
-				scratch = a[i].Value.AppendText(scratch[:0])
-				tokens = append(tokens, attrToken(a[i].Key, scratch))
-
-				words = bloom.Tokenize(words[:0], scratch)
-				for _, w := range words {
-					tokens = append(tokens, attrToken(a[i].Key, w))
-				}
-			}
-		}
-	case BloomNone:
+	if mode == BloomNone {
 		return nil
 	}
 
-	f := bloom.New(len(tokens), 0.01)
-	for _, tk := range tokens {
-		f.Add(tk)
-	}
+	var bb bloomBuilder
+
+	f := bloom.New(bb.countTokens(mode, values), 0.01)
+	bb.forEachToken(mode, values, f.Add)
 
 	return f.Encode(nil)
 }
