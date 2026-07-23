@@ -23,6 +23,24 @@ type flushColumns struct {
 
 func (f *flushColumns) len() int { return len(f.stream) }
 
+// reset re-arms the buffer for another flush at the given shape, keeping the backing arrays. A part
+// is written and read back before the next flush starts (the engine has a single flusher), so the
+// buffer that fed one part is free to feed the next — and after the first flush its arrays are
+// already the right size, so a steady ingest rate stops allocating and re-zeroing them entirely.
+func (f *flushColumns) reset(schema *Schema, rows int, blob []int) {
+	if cap(f.stream) >= rows {
+		f.stream = f.stream[:0]
+	} else {
+		f.stream = make([]chunk.U128, 0, max(rows, 2*cap(f.stream)))
+	}
+
+	f.cols.prepare(schema, rows, fullSel(schema))
+
+	for k := range f.cols.bytes {
+		f.cols.bytes[k].ensureBytes(rows, blob[k])
+	}
+}
+
 const (
 	minInt64 = int64(-1 << 63)
 	maxInt64 = int64(1<<63 - 1)
@@ -56,7 +74,7 @@ func (h *head) detach() map[signal.SeriesID]*recordCols {
 
 // buildFlushColumns lays the detached record buffers out as part columns sorted by (stream, ts). It
 // reads the (now immutable) detached buffers off the engine lock.
-func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols) *flushColumns {
+func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols, reuse *flushColumns) *flushColumns {
 	ids := make([]signal.SeriesID, 0, len(records))
 	for id, buf := range records {
 		if buf.len() > 0 {
@@ -66,7 +84,13 @@ func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols) 
 
 	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
 
-	f := &flushColumns{cols: newRecordCols(schema, 0, fullSel(schema))}
+	f := reuse
+	if f == nil {
+		f = &flushColumns{cols: newRecordCols(schema, 0, fullSel(schema))}
+	}
+
+	rows, blob := flushShape(schema, records, ids)
+	f.reset(schema, rows, blob)
 
 	for _, id := range ids {
 		buf := records[id]
@@ -80,6 +104,26 @@ func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols) 
 	}
 
 	return f
+}
+
+// flushShape measures the detached head: its total row count and, per byte column, its total blob
+// bytes. Both are already known — the head holds the buffers — and sizing the flush buffer from them
+// keeps it from growing each column out of nothing, re-copying every blob ~log₂(size) times and
+// ending up with as much as 2× the capacity it needs, on the path whose whole job is to hand memory
+// back.
+func flushShape(schema *Schema, records map[signal.SeriesID]*recordCols, ids []signal.SeriesID) (rows int, blob []int) {
+	blob = make([]int, schema.numBytes())
+
+	for _, id := range ids {
+		buf := records[id]
+		rows += buf.len()
+
+		for k := range buf.bytes {
+			blob[k] += int(buf.bytes[k].byteSize())
+		}
+	}
+
+	return rows, blob
 }
 
 // writePart writes f as a part under prefix via [block.PartWriter]: the stream id column, the

@@ -214,7 +214,9 @@ func ensureI64(s []int64, n int) []int64 {
 		return s[:0]
 	}
 
-	return make([]int64, 0, n)
+	// At least doubling, so a reused buffer whose shape creeps up by a few rows per round does not
+	// reallocate every round (see [byteCol.ensureBytes]).
+	return make([]int64, 0, max(n, 2*cap(s)))
 }
 
 // byteSize returns the in-flight memory the buffer holds: its timestamps, int columns, and the
