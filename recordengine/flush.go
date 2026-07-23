@@ -46,6 +46,56 @@ const (
 	maxInt64 = int64(1<<63 - 1)
 )
 
+// chunkRanges splits n rows into [lo, hi) ranges of at most maxRows each (maxRows ≤ 0 ⇒ a single
+// full-width range). Splitting at arbitrary row boundaries is safe: parts are independent and a
+// stream spanning two parts is merged back by the read seam. Mirrors the metric engine's flush split.
+func chunkRanges(n, maxRows int) [][2]int {
+	if maxRows <= 0 || n <= maxRows {
+		return [][2]int{{0, n}}
+	}
+
+	out := make([][2]int, 0, (n+maxRows-1)/maxRows)
+	for lo := 0; lo < n; lo += maxRows {
+		out = append(out, [2]int{lo, min(lo+maxRows, n)})
+	}
+
+	return out
+}
+
+// slice returns a read-only view of rows [lo, hi) of f, sharing every backing array (no copy). The
+// byte columns keep the whole blob and reslice their offset index instead of rebasing it — cell i of
+// the view is data[offsets[i]:offsets[i+1]] either way, so an offset index that does not start at 0
+// is a valid column everywhere it is read or encoded (see [byteCol]).
+func (f *flushColumns) slice(lo, hi int) *flushColumns {
+	src := f.cols
+	cols := &recordCols{
+		schema: src.schema,
+		sel:    src.sel,
+		ts:     src.ts[lo:hi],
+		ints:   make([][]int64, len(src.ints)),
+		bytes:  make([]byteCol, len(src.bytes)),
+		tsMin:  maxInt64,
+		tsMax:  minInt64,
+	}
+
+	for k, col := range src.ints {
+		if col != nil {
+			cols.ints[k] = col[lo:hi]
+		}
+	}
+
+	for k := range src.bytes {
+		bc := &src.bytes[k]
+		if bc.rows() == 0 {
+			continue
+		}
+
+		cols.bytes[k] = byteCol{data: bc.data, offsets: bc.offsets[lo : hi+1]}
+	}
+
+	return &flushColumns{stream: f.stream[lo:hi], cols: cols}
+}
+
 // detach moves the head's record buffers aside for a flush and installs fresh empty buffers, so new
 // appends are unaffected, returning the detached buffers (nil if no stream holds a record). The stream
 // index is retained — identities outlive a flush. The caller (the engine) keeps the detached buffers

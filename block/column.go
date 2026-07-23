@@ -29,9 +29,10 @@ type Column struct {
 	Codec    chunk.Codec
 	Compress compress.Algorithm
 	// BytesBlob/BytesOffsets are the blob+offsets alternative to Bytes for a KindBytes column:
-	// cell i is BytesBlob[BytesOffsets[i]:BytesOffsets[i+1]], with len(BytesOffsets) == rows+1 and
-	// BytesOffsets[0] == 0 — the head-buffer byte-column layout, accepted directly so a flush
-	// encodes straight from the blob without materializing a [][]byte view per row. Used only when
+	// cell i is BytesBlob[BytesOffsets[i]:BytesOffsets[i+1]], with len(BytesOffsets) == rows+1 —
+	// the head-buffer byte-column layout, accepted directly so a flush encodes straight from the
+	// blob without materializing a [][]byte view per row. Offsets index the whole blob and need not
+	// start at 0, so a row range of a larger column is a valid input. Used only when
 	// Bytes is nil; the encoded object is byte-identical to the equivalent Bytes input.
 	BytesBlob    []byte
 	BytesOffsets []int32
