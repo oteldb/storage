@@ -1124,9 +1124,18 @@ optional side store differ.
   timestamp sort key and the int128 stream id are implicit). A signal supplies the schema and
   projects its model into the engine's column vectors (`recordengine.Batch`); the engine treats the
   columns opaquely. It owns the head (per-stream column buffers + the `symbols`+`series`+`postings`
-  stream-label index), flush to an immutable columnar part sorted by `(stream, ts)`, the durable
+  stream-label index), flush to immutable columnar parts sorted by `(stream, ts)`, the durable
   bucket-index + `streams.bin` stateless-read path, append-only merge with retention, per-column
-  blooms, and `Fetch` implementing `fetch.Fetcher`. **Byte columns** (head buffer, fetch
+  blooms, and `Fetch` implementing `fetch.Fetcher`. **`MaxPartBytes` bounds a record part** the way
+  it bounds a metric one (§3f): flush splits its rows into parts under the cap (`chunkRanges` +
+  `flushColumns.slice`, a zero-copy row-range view — a sliced byte column keeps the whole blob and
+  reslices its offset index, since every reader and the part encoder index the blob absolutely), and
+  the merge splits at the taller merge cap so same-tier siblings promote instead of re-splitting.
+  Records are variable-width, so the byte cap converts to a row cap at an assumed average row size
+  (`recordRowBytes`, 1 KiB — calibrated to a real structured-log row) rather than the metric engine's
+  exact 32 B/row; `MaxPartBytes` stays the tuning knob. Without the flush split a part was sized only
+  by the flush cadence, and one oversized part distorted the size-tiered selection it feeds — sealing
+  on arrival, or pairing into a ~2× cap merge input. **Byte columns** (head buffer, fetch
   accumulators, and the part read path) use a contiguous **offsets+blob** layout (`byteCol`: one
   `[]byte` data blob + `[]int32` row end-offsets, cell `i` = `data[offsets[i]:offsets[i+1]]`) rather
   than a `[][]byte` of per-cell slices — the GC scans two headers per column instead of one per row,
@@ -1343,8 +1352,10 @@ the original no-sf frame, byte-for-byte). The **soft cardinality budget with `__
 is built (metrics, single-node — see the Cardinality valve above; no hysteresis, as the head's series
 index is monotonic). Not yet built (the rest of §8a): the clustered **central→edge budget feedback**
 (each node's rate valve and soft budget see only their own node's traffic) and **overflow on the
-clustered write path** (the primary applies the hard cap only). `MaxPartSize` **is** now enforced —
-flush and merge split their output so no part exceeds it (§3f, `engine.Config.MaxPartBytes`).
+clustered write path** (the primary applies the hard cap only). `MaxPartSize` **is** now enforced for
+every signal — flush and merge split their output so no part exceeds it (§3f/§3j,
+`engine.Config.MaxPartBytes` and `recordengine.Config.MaxPartBytes`; exact for metrics, at an assumed
+average row size for the variable-width record signals).
 
 ---
 

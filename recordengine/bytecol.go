@@ -5,7 +5,10 @@ package recordengine
 // slice headers instead of N, and a per-row scan reads cells sequentially out of one allocation
 // instead of chasing a pointer per row.
 //
-// offsets has len == rows+1 with offsets[0] == 0; cell i is data[offsets[i]:offsets[i+1]]. A cell
+// offsets has len == rows+1; cell i is data[offsets[i]:offsets[i+1]]. offsets[0] is 0 for a column
+// that owns its blob, and non-zero for a read-only row-range view of a larger one ([flushColumns.slice]
+// takes one per output part of a split flush): every reader indexes the blob absolutely, so both
+// forms are valid inputs to the part encoder. Only the appending paths assume a 0 origin. A cell
 // view returned by [byteCol.at] aliases data and is invalidated by any append that grows or
 // reallocates data — the same read-only-until-next-append rule the rest of the engine relies on; a
 // caller that retains a value past an append must copy.

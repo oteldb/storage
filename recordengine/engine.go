@@ -915,25 +915,45 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	f := buildFlushColumns(e.cfg.Schema, detached, e.flushBuf)
 	e.flushBuf = f // reused by the next flush; only this single flusher touches it
 	rows := len(f.stream)
-	prefix := e.partPrefix(seq)
 
-	// Flush writes columns codec-only (no block compression) to keep ingest cheap; the cold merge
-	// recompresses. See [Config.MergeCompression].
-	if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f, compress.AlgorithmNone, 0); err != nil {
-		return 0, err
-	}
+	// Split the flushed rows into parts of at most MaxPartBytes (a single part when unlimited), so a
+	// long flush interval or a large head cannot produce one oversized part — which would distort the
+	// size-tiered selection (sealing on arrival, or pairing into a ~2× cap merge input) and unbound
+	// the merge working set that tiering exists to keep at O(part size).
+	ranges := chunkRanges(rows, maxRowsPerPart(e.cfg.MaxPartBytes))
 
-	p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix)
-	if err != nil {
-		return 0, err
-	}
+	newParts := make([]*part, 0, len(ranges))
 
-	p.minTime, p.maxTime = colsTimeRange(f)
-
-	if side != nil {
-		if err := writeSidecars(ctx, e.cfg.Backend, prefix, side); err != nil {
-			return rows, err
+	for i, rg := range ranges {
+		sub := f
+		if len(ranges) > 1 {
+			sub = f.slice(rg[0], rg[1])
 		}
+
+		prefix := e.partPrefix(seq + i)
+
+		// Flush writes columns codec-only (no block compression) to keep ingest cheap; the cold merge
+		// recompresses. See [Config.MergeCompression].
+		if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, sub, compress.AlgorithmNone, 0); err != nil {
+			return 0, err
+		}
+
+		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix)
+		if err != nil {
+			return 0, err
+		}
+
+		p.minTime, p.maxTime = colsTimeRange(sub)
+
+		// Each part carries its own copy of the side-store delta: a part's columns reference symbols
+		// by id, so every part a split produces must resolve them on its own.
+		if side != nil {
+			if err := writeSidecars(ctx, e.cfg.Backend, prefix, side); err != nil {
+				return rows, err
+			}
+		}
+
+		newParts = append(newParts, p)
 	}
 
 	// Publish (under lock): add the part copy-on-write and clear e.flushing in the same critical
@@ -944,11 +964,13 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	// crash-consistency ordering (index commits the watermark, then the WAL checkpoint discards the
 	// now-obsolete segments).
 	e.mu.Lock()
-	e.parts = appendPart(e.parts, p)
+	for _, p := range newParts {
+		e.parts = appendPart(e.parts, p)
+	}
 	e.flushing = nil
-	e.nextSeq = seq + 1
+	e.nextSeq = seq + len(ranges)
 	e.flushedEpoch++
-	err = e.publishLocked(ctx)
+	err := e.publishLocked(ctx)
 	e.mu.Unlock()
 
 	if err != nil {

@@ -32,7 +32,9 @@ type Limits struct {
 	MaxSeriesSoft int64
 	// MaxPartSize caps an immutable part's (approximate, uncompressed) size: flush and merge split
 	// their output so no single part exceeds it. It is a structural cap fixed when a tenant's engine
-	// is first created. Zero ⇒ unlimited (one part). Metrics only.
+	// is first created. Zero ⇒ unlimited (one part). It applies to every signal, exactly for metrics
+	// (fixed 32 B/row) and approximately for the record signals (logs/traces/profiles), whose rows
+	// are variable-width and are converted at an assumed average row size.
 	MaxPartSize int64
 }
 

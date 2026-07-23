@@ -83,8 +83,9 @@ func (s sliceCells) rows() int       { return len(s) }
 func (s sliceCells) at(i int) []byte { return s[i] }
 
 // blobCells is the blob+offsets form of [cellSeq]: cell i is blob[offsets[i]:offsets[i+1]], with
-// len(offsets) == rows+1 and offsets[0] == 0 — the head-buffer byte-column layout, accepted
-// directly so a flush encodes straight from the blob without materializing a view per row.
+// len(offsets) == rows+1 — the head-buffer byte-column layout, accepted directly so a flush encodes
+// straight from the blob without materializing a view per row. Offsets index the whole blob and
+// need not start at 0, so a row range of a larger column encodes without rebasing its index.
 type blobCells struct {
 	blob    []byte
 	offsets []int32
