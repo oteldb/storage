@@ -104,6 +104,13 @@ type Request struct {
 // Condition is one columnar predicate (logs): the rows whose value in column Column satisfy
 // Match. Like [Matcher] it is operator-free — the language layer supplies the predicate.
 //
+// A row that does not carry Column at all (no such fixed column, or no such per-record attribute)
+// is offered to Match as [signal.EmptyValue] — which [signal.Value.Kind] reports as
+// [signal.KindEmpty], distinct from an empty string. Absence is a value the predicate judges, not a
+// non-match the engine decides: a negation ("column != x") or an is-unset predicate must see those
+// rows. A predicate that only accepts a concrete value must therefore reject [signal.KindEmpty] —
+// which also keeps the hints below sound, since a pruning hint asserts a value is present.
+//
 // Two optional, serializable hints let a fetcher prune whole parts before scanning (the engine
 // always re-checks Match per row, so a hint only ever skips work, never changes results):
 //   - Tokens: the full-text tokens the column value must contain (lowered) — consulted against a

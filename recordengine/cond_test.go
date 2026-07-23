@@ -48,6 +48,65 @@ func attrEquals(key, val string) fetch.Condition {
 	}
 }
 
+func attrNotEquals(key, val string) fetch.Condition {
+	want := []byte(val)
+
+	// No Equal/Tokens hint: a negation asserts nothing is present, so nothing may be bloom-pruned.
+	return fetch.Condition{
+		Column: key,
+		Match:  func(v signal.Value) bool { return !bytes.Equal(v.Str(), want) },
+	}
+}
+
+func attrUnset(key string) fetch.Condition {
+	return fetch.Condition{
+		Column: key,
+		Match:  func(v signal.Value) bool { return v.Kind() == signal.KindEmpty },
+	}
+}
+
+// A row that lacks the condition's column must reach the predicate as [signal.EmptyValue] rather
+// than being dropped before it — otherwise every negation and is-unset condition silently loses the
+// rows it is supposed to select. Covers both scan paths: the flushed part (lazy scan) and the head.
+func TestConditionMatchesRowsMissingTheColumn(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := newEngine(t, backend.Memory())
+
+	ingest(t, e, mkBatch("api",
+		rrec{ts: 100, body: "part-alice", attr: [2]string{"user", "alice"}},
+		rrec{ts: 200, body: "part-bob", attr: [2]string{"user", "bob"}},
+		rrec{ts: 300, body: "part-none"}, // no user attribute
+	))
+	require.NoError(t, e.Flush(ctx))
+
+	ingest(t, e, mkBatch("api",
+		rrec{ts: 400, body: "head-alice", attr: [2]string{"user", "alice"}},
+		rrec{ts: 500, body: "head-none"}, // no user attribute
+	))
+
+	// Negation: the rows carrying another value AND the rows carrying no "user" at all.
+	got := fetchAll(t, e, req("api", attrNotEquals("user", "alice")))
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"part-bob", "part-none", "head-none"}, bodies(got[0]))
+
+	// Is-unset: only the rows with no "user" attribute.
+	got = fetchAll(t, e, req("api", attrUnset("user")))
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"part-none", "head-none"}, bodies(got[0]))
+
+	// A key no row carries (and that is not a schema column) is unset everywhere.
+	got = fetchAll(t, e, req("api", attrUnset("nosuchkey")))
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"part-alice", "part-bob", "part-none", "head-alice", "head-none"}, bodies(got[0]))
+
+	// A positive equality still rejects the absent rows — absence is a value the predicate judges.
+	got = fetchAll(t, e, req("api", attrEquals("user", "alice")))
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"part-alice", "head-alice"}, bodies(got[0]))
+}
+
 func TestConditionsFilterColumnsAndAttributes(t *testing.T) {
 	t.Parallel()
 

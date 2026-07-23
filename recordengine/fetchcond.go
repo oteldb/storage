@@ -40,11 +40,18 @@ func (c *recordCols) colValue(i int, name string) (signal.Value, bool) {
 	return v, true
 }
 
-// rowMatches reports whether row i satisfies every condition (logical AND).
+// rowMatches reports whether row i satisfies every condition (logical AND). A column the row does
+// not carry is offered to the predicate as [signal.EmptyValue], never treated as a non-match: the
+// condition is operator-free, so only the language knows whether an absent value satisfies it (a
+// negation or an is-unset predicate does).
 func (c *recordCols) rowMatches(i int, conds []fetch.Condition) bool {
 	for j := range conds {
 		v, ok := c.colValue(i, conds[j].Column)
-		if !ok || !conds[j].Match(v) {
+		if !ok {
+			v = signal.EmptyValue()
+		}
+
+		if !conds[j].Match(v) {
 			return false
 		}
 	}
