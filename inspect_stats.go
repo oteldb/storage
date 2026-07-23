@@ -21,6 +21,7 @@ type maintCounters struct {
 	lastStartNano    atomic.Int64 // wall-clock start of the most recent cycle
 	lastDurationNano atomic.Int64 // duration of the most recent completed cycle
 	lastTasks        atomic.Int64 // engine tasks (flush/merge or replica refresh) in that cycle
+	pressureFlushes  atomic.Int64 // engines flushed by the head-size trigger, not the interval
 }
 
 // ECStats is the cumulative erasure-coding activity of this node since process start: the
@@ -58,4 +59,8 @@ type MaintenanceStats struct {
 	// LastCycleTasks is the engine tasks (per tenant, per signal: flush+merge on owners,
 	// refresh on replicas) dispatched in the most recent cycle.
 	LastCycleTasks int64
+	// PressureFlushes is the engines flushed by the head-size trigger
+	// ([Options.FlushThresholdBytes]) rather than by the interval, since process start. A rising
+	// count means ingestion is filling heads faster than the flush cadence drains them.
+	PressureFlushes int64
 }

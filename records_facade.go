@@ -154,6 +154,7 @@ func (s *Storage) writeRecordsLocal(
 		rej.cardinality += int64(res.RejectedCardinality)
 		rej.inflight += int64(res.RejectedBytes)
 		lastAdmit.record(int64(res.Accepted), int64(res.RejectedOOO), int64(res.RejectedCardinality), int64(res.RejectedBytes))
+		s.pokeFlush(lastEng)
 	})
 
 	if firstErr != nil {

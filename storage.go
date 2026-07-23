@@ -72,6 +72,13 @@ type Storage struct {
 	stopCh chan struct{}  // closed by Close to stop the maintenance loop
 	wg     sync.WaitGroup // tracks the maintenance goroutine
 
+	// flushWake carries the head-size flush trigger ([Options.FlushThresholdBytes]) from the write
+	// path to the maintenance loop: a write that leaves an engine's head at or above the threshold
+	// pokes it (non-blocking, capacity 1 — a pending poke already covers this one) and the loop
+	// flushes the over-threshold engines without waiting out the interval. The loop stays the only
+	// flusher, so an engine never has two concurrent flushes reserving the same part sequence.
+	flushWake chan struct{}
+
 	ecStats    ecCounters    // cumulative erasure-coding activity (Inspect → ClusterStats.EC)
 	maintStats maintCounters // cumulative maintenance-loop activity (Inspect → StoreStats.Maintenance)
 }
@@ -147,6 +154,10 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 
 	if o.FlushInterval > 0 {
 		s.wg.Add(1)
+
+		if o.flushThresholdBytes() > 0 {
+			s.flushWake = make(chan struct{}, 1)
+		}
 
 		// The maintenance loop's context is created inside the goroutine and scoped to
 		// its own lifetime (stopped via stopCh), not to this Open call.
@@ -401,6 +412,8 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 			overflowed += int64(res.Overflowed)
 			lastAdmit.recordOverflowed(int64(res.Overflowed))
 		}
+
+		s.pokeFlush(lastEng)
 	})
 
 	if firstErr != nil {
@@ -1024,7 +1037,9 @@ func (s *Storage) walFor(prefix string) (*wal.SegmentWriter, error) {
 }
 
 // runMaintenance periodically flushes and compacts every tenant engine until Close stops
-// it. It is the single background loop driving flush (age) and merge+retention.
+// it. It is the single background loop driving flush (age), merge+retention, and — poked by the
+// write path via flushWake — the head-size flush trigger ([Options.FlushThresholdBytes]). Both
+// paths run on this one goroutine, so an engine is never flushed twice concurrently.
 func (s *Storage) runMaintenance(interval time.Duration) {
 	defer s.wg.Done()
 
@@ -1039,8 +1054,76 @@ func (s *Storage) runMaintenance(interval time.Duration) {
 			// The loop owns its lifetime (stopped via stopCh, not a request), so a
 			// background context is correct here.
 			s.maintain(context.Background())
+		case <-s.flushWake:
+			// Size-triggered: flush only the over-threshold engines. Merge and the cluster work
+			// stay on the interval tick — this path exists to give memory back promptly, and a
+			// burst must not turn every write into a compaction cycle.
+			s.flushPressured(context.Background())
 		}
 	}
+}
+
+// headSized is an engine that reports its buffered head bytes ([engine.Engine],
+// [recordengine.Engine]), so the write path can hand [Storage.pokeFlush] the engine rather than a
+// measurement it would have to take on every batch.
+type headSized interface{ HeadBytes() int64 }
+
+// pokeFlush signals the maintenance loop that eng's head may have reached the flush threshold.
+// Called from the write path after an append; non-blocking, so ingestion never waits on the loop (a
+// poke already queued covers this one). When the size trigger is off or there is no loop it returns
+// on a nil check, without measuring the head — the write path must not pay for a disabled trigger.
+func (s *Storage) pokeFlush(eng headSized) {
+	if s.flushWake == nil || eng.HeadBytes() < s.opts.flushThresholdBytes() {
+		return
+	}
+
+	select {
+	case s.flushWake <- struct{}{}:
+	default:
+	}
+}
+
+// flushPressured flushes every engine whose head has reached [Options.FlushThresholdBytes], and
+// nothing else. Engines are independent shards, so the flushes fan out under the same bound as the
+// maintenance cycle. A replica (non-owning node) is skipped: its head is trimmed by the refresh
+// path, and flushing there would fork the shard's part sequence.
+func (s *Storage) flushPressured(ctx context.Context) {
+	ctx = s.obs.Base(ctx)
+	threshold := s.opts.flushThresholdBytes()
+
+	var flushes []func()
+
+	for _, eng := range s.engineSnapshot() {
+		if eng.HeadBytes() >= threshold {
+			flushes = append(flushes, func() { _ = eng.Flush(ctx) })
+		}
+	}
+
+	for _, eng := range s.recordEngineSnapshot() {
+		if eng.HeadBytes() >= threshold {
+			flushes = append(flushes, func() { _ = eng.Flush(ctx) })
+		}
+	}
+
+	if len(flushes) == 0 {
+		return
+	}
+
+	s.maintStats.pressureFlushes.Add(int64(len(flushes)))
+	parallel.ForEach(len(flushes), s.maintenanceConcurrency(), func(i int) { flushes[i]() })
+}
+
+// recordEngineSnapshot is every record engine (logs, traces, profiles) across tenants.
+func (s *Storage) recordEngineSnapshot() []*recordengine.Engine {
+	logs := s.logEngineSnapshot()
+	traces := s.traceEngineSnapshot()
+	profiles := s.profileEngineSnapshot()
+
+	out := make([]*recordengine.Engine, 0, len(logs)+len(traces)+len(profiles))
+	out = append(out, logs...)
+	out = append(out, traces...)
+
+	return append(out, profiles...)
 }
 
 // runWALSync periodically fsyncs every engine's WAL until Close stops it ([WALSyncInterval] mode).

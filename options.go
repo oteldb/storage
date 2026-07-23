@@ -56,8 +56,12 @@ type Options struct {
 	// default. (Resolved into a duration internally.)
 	WALSyncInterval int64 // nanoseconds
 
-	// FlushThresholdBytes is the head size at which a flush to an immutable part is
-	// triggered. Zero ⇒ default.
+	// FlushThresholdBytes is the per-engine head size (buffered record/sample bytes) at which a
+	// flush to an immutable part is triggered ahead of [FlushInterval], so an ingest burst is
+	// bounded by bytes and not only by the flush cadence. The write path pokes the maintenance
+	// loop when a write leaves a head at or above it; the loop stays the only flusher.
+	// Zero ⇒ [defaultFlushThresholdBytes]; negative ⇒ no size trigger (interval only). It is not
+	// a reject limit — see [tenant.Limits.MaxInFlightBytes] for that.
 	FlushThresholdBytes int64
 
 	// ReadCacheBytes enables an in-memory LRU cache over backend read objects (immutable part
@@ -238,7 +242,28 @@ func (o *Options) walSyncInterval() time.Duration {
 	return defaultWALSyncInterval
 }
 
-// WithFlushThresholdBytes sets the head flush size threshold.
+// defaultFlushThresholdBytes is the per-engine head size that triggers a flush ahead of the
+// interval when [Options.FlushThresholdBytes] is left at zero. It matches [defaultMaxPartBytes], so
+// the size trigger fires just as the head has grown into a full part: an ingest burst is bounded by
+// bytes rather than by the flush cadence alone.
+const defaultFlushThresholdBytes = 64 << 20 // 64 MiB
+
+// flushThresholdBytes returns the head size that triggers an early flush, or 0 when the size
+// trigger is disabled (a negative [Options.FlushThresholdBytes]).
+func (o *Options) flushThresholdBytes() int64 {
+	switch {
+	case o.FlushThresholdBytes > 0:
+		return o.FlushThresholdBytes
+	case o.FlushThresholdBytes < 0:
+		return 0
+	default:
+		return defaultFlushThresholdBytes
+	}
+}
+
+// WithFlushThresholdBytes sets the head flush size threshold. Zero keeps
+// [defaultFlushThresholdBytes]; a negative value disables the size trigger, leaving
+// [Options.FlushInterval] as the only one. See [Options.FlushThresholdBytes].
 func WithFlushThresholdBytes(n int64) Option { return func(o *Options) { o.FlushThresholdBytes = n } }
 
 // WithReadCache enables an in-memory LRU object cache over the backend, sized to maxBytes (the
