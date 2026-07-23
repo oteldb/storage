@@ -83,7 +83,7 @@ func conditionSel(s *Schema, conds []fetch.Condition) colSel {
 			continue
 		}
 
-		if k, ok := s.attrsByteCol(); ok {
+		for _, k := range s.attrsByteCols() {
 			sel.bytes[k] = true
 		}
 	}
@@ -287,17 +287,14 @@ func (lz *lazyCols) colValue(i int, name string) (signal.Value, bool) {
 		return signal.StringValue(lz.bytes[ref.idx].At(i)), true
 	}
 
-	k, ok := lz.schema.attrsByteCol()
-	if !ok {
-		return signal.Value{}, false
+	for _, k := range lz.schema.attrsByteCols() {
+		v, found, err := signal.LookupAttribute(lz.bytes[k].At(i), name)
+		if err == nil && found {
+			return v, true
+		}
 	}
 
-	v, found, err := signal.LookupAttribute(lz.bytes[k].At(i), name)
-	if err != nil || !found {
-		return signal.Value{}, false
-	}
-
-	return v, true
+	return signal.Value{}, false
 }
 
 // rowMatches reports whether row i satisfies every condition (logical AND). A condition with a

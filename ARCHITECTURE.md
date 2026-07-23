@@ -1190,13 +1190,21 @@ optional side store differ.
     `CodecBytesRaw` column would need this to stay exact, since the fast path never re-checks `Match`.
 - **Record-key footer** (`{prefix}/keys.bin`, magic+version+CRC32C): each part persists its distinct
   per-record **attribute keys** (not values — bounded by the stream schema, so tiny) next to its
-  blooms, written by `writePart` (so flush and merge produce it) and loaded by `openPart`.
+  blooms, written by `writePart` (so flush and merge produce it) and loaded by `openPart`. Version 2
+  appends a scope byte per key (version 1 is still read, its keys taken as record-scoped), so a key
+  is reported with the OTLP provenance of the column it came from.
   `Engine.Keys(start, end)` enumerates the distinct attribute keys across head ∪ in-window parts,
-  each tagged with a `KeyScope` bitset (resource / scope / record): stream-identity keys come from
-  the authoritative series index, record keys from the head buffers and the part footers. It is the
-  enumeration twin of `Engine.Series` (identities) and backs the facade's `LogKeys` — letting an
-  embedder list/push-down **record-attribute** labels that `Series`-based resolution cannot see, and
-  authoritatively distinguish a stream label from a record attribute (or both) via the bitset.
+  each tagged with a `KeyScope` bitset — provenance (resource / scope / record) plus the pushdown
+  mechanism (`KeyScopeIndexed` ⇒ postings matcher, `KeyScopeRecord` ⇒ column condition).
+  Stream-identity keys come from the authoritative series index, column keys from the head buffers
+  and the part footers. It is the enumeration twin of `Engine.Series` (identities) and backs the
+  facade's `LogKeys` — letting an embedder list/push-down labels `Series`-based resolution cannot
+  see, and authoritatively pick the sound pushdown per key.
+- **A schema may declare several `BloomAttrs` columns** (`Schema.attrsByteCols`, each with a
+  `Column.KeyScope` naming the provenance its keys are reported under). An attribute condition
+  resolves against them in declaration order — the first hit wins, so a narrower scope is declared
+  first (logs: `attrs` before `resource`, i.e. a record attribute shadows a resource attribute of the
+  same name) — and a part survives pruning if *any* of their blooms may hold the key.
 - **WAL** carries a signal-agnostic records frame (`wal.WriteRecords`/`OnRecords`) of an opaque,
   engine-encoded payload, plus an optional **side frame** (`wal.WriteSide`/`OnSide`) carrying the
   side-store delta; `recordengine` owns the rec codec and `EncodeWAL` (the cluster write form, which
@@ -1209,9 +1217,37 @@ optional side store differ.
   Content-addressing (an entry's id is a hash of its content) makes the union a plain dedup with no
   id remap. Profiles is the first user (its symbol store).
 - **Logs** (`signal/log`): schema = `observed`/`severity`/`flags`/`dropped`(int) +
-  `severity_text`/`body`(FullText)/`trace_id`(Equality)/`span_id`/`attrs`(Attrs)(bytes). `WriteLogs` /
-  `LogFetcher`, plus **`LogsForTrace(tenant, id)`** — logs-by-trace-id as an equality condition on
-  `trace_id`, pruned by its equality bloom (mirrors traces' `Trace`, for "logs for this trace").
+  `severity_text`/`body`(FullText)/`trace_id`(Equality)/`span_id`/`attrs`(Attrs)/`resource`(Attrs)
+  (bytes). `WriteLogs` / `LogFetcher`, plus **`LogsForTrace(tenant, id)`** — logs-by-trace-id as an
+  equality condition on `trace_id`, pruned by its equality bloom (mirrors traces' `Trace`, for
+  "logs for this trace").
+- **Log stream identity is a per-tenant policy** (`tenant.Streams`, resolved through the existing
+  `tenant.Resolver` callback). Only the resource attributes named by `Streams.Fields` (default
+  `tenant.DefaultStreamFields`: `service.name`/`service.namespace` + `k8s.namespace.name`/
+  `k8s.node.name`/`k8s.deployment.name`/`k8s.pod.name`) are hashed into the stream id; `AllFields`
+  restores hashing every attribute. High-churn attributes (`service.instance.id`, `k8s.pod.uid`,
+  start timestamps) therefore stop minting a stream per process restart — the cost they impose is
+  per-stream, not per-row (postings resolution, one accumulator and one `part.ranges[id]` lookup per
+  id per part). The set must be **static per tenant**: identity derived from observed cardinality
+  would give one logical stream different ids over time, and written parts cannot be re-keyed.
+  - **Every resource attribute is stored on every record** in the `resource` column, identifying
+    ones included (VictoriaLogs' model: a stream field is both hashed *and* stored). So excluding a
+    key changes only how it is indexed — `log.Resource(stream, blob)` reassembles the complete OTLP
+    resource on read, and a condition on any key answers correctly whether or not it is in the
+    stream key. That duplication is what makes the field set **editable**: after a change, old parts
+    keep their ids and a condition still answers across the boundary. The storage cost is near zero
+    — record parts sort by `(stream, ts)` and the column is `CodecDict`, so a part holds roughly one
+    entry per stream (the same win VictoriaLogs gets from per-block `constColumns`).
+  - **Routing contract.** `Engine.Keys`/`LogKeys` report `KeyScopeIndexed` for a key in the stream
+    identity (push a `fetch.Matcher`) and `KeyScopeRecord` for one that is condition-only (push a
+    `fetch.Condition`), alongside the OTLP provenance bits. A key duplicated into the `resource`
+    column purely because it is also the stream key does **not** get `KeyScopeRecord`, so a caller
+    routes on exactly one mechanism; both bits together mean the key is genuinely both (resource on
+    one stream, record on another) and neither pushdown is sound alone.
+  - **Ingest plumbing.** `log.Project(ld, fields, emit)` takes a `StreamFields` classifier, called
+    once per stream immediately before its `emit`; `Batch.Identity` carries the narrowed identity
+    (what the index and WAL store) and `Batch.Route` the full one, so `Batch.RoutingIdentity()`
+    still derives the tenant from every resource attribute.
 - **Traces** (`signal/trace`): a span is a record. Schema = `duration`/`kind`/`status_code` +
   ingest-computed nested-set ids `parent_id`/`nested_set_left`/`nested_set_right` (int) +
   `trace_id`(Equality)/`span_id`/`parent_span_id`/`name`(FullText)/`status_message`/`attrs`(Attrs) +
@@ -1493,7 +1529,9 @@ query-language path stays in the embedder. The `Write*` methods take the library
   and carry columns); a query supplies stream `Matchers` plus record `Conditions`. Two
   enumeration primitives sit alongside it: **`LogSeries(ctx, tenant, matchers, window)`** (matching
   stream identities) and **`LogKeys(ctx, tenant, window)`** (distinct attribute keys with their
-  `KeyScope` bitset — the only way to see and push down per-record attribute label names). Both
+  `KeyScope` bitset — the only way to see and push down the label names `LogSeries` cannot: record
+  attributes, and the resource attributes the tenant's stream-field policy keeps out of the stream
+  key; the bitset says which pushdown is sound per key). Both
   **fan out in cluster mode** (a non-owner serves them from an owner, hedged), over the shared
   signal-dispatched enumeration RPCs (`cluster.SeriesPath` for `LogSeries`/`TraceSeries`, the new
   `cluster.KeysPath` for `LogKeys`); `LogSeries` re-applies non-equality matchers to the owner's
@@ -1569,7 +1607,9 @@ query-language path stays in the embedder. The `Write*` methods take the library
   the cluster default; `EC *ECScheme{Data, Parity, After}` erasure-codes the tenant's flushed
   parts older than `After` at (Data+Parity)/Data storage instead of RF full copies — the
   `cluster/ec` converter enacts it at merge and the engine reads it back transparently through
-  an `ecBackend` wrapper), and the
+  an `ecBackend` wrapper), `Streams` (log-stream identity: the resource-attribute keys that are
+  hashed into the stream id, defaulting to the semantic-convention `DefaultStreamFields`, with
+  `AllFields` to hash them all — §3, Logs), and the
   composed `Policy`, resolved per tenant id through a `Resolver` (`ResolverFunc` adapter;
   `Default()` returns an empty-policy resolver). Multi-tenancy, retention, and
   downsampling are consumer-supplied callbacks keyed by tenant id.
@@ -1687,7 +1727,7 @@ signal/               typed Attributes/Value, Resource/Scope/Series identity, 12
   signal/trace        []byte-based OTLP-shaped Traces ingest batch (resettable/pooled) + span schema + projection (nested-set, events/links) [implemented]
   signal/profile      []byte-based OTLP-shaped Profiles ingest batch + sample schema (type folded into identity) + projection + content-addressed symbol store (SideStore) + stack Resolver [implemented]
 otlp/pdataconv        optional OTel-Go bridge: pmetric.Metrics → metric.Metrics; gauge/sum direct + histogram/exp-histogram/summary classic decomposition (only package importing pdata) [implemented]
-tenant/               Limits/Retention/Downsample/Sampling/Recompress/Precision/Durability/Policy, Resolver [implemented]
+tenant/               Limits/Retention/Downsample/Sampling/Recompress/Precision/Durability/Streams/Policy, Resolver [implemented]
 backend/              Backend interface (Read/Write/List/Delete/PutIfAbsent) + memory + read cache (root) [implemented]
   backend/file        directory-tree backend; atomic write + exclusive PutIfAbsent (os.Link) [implemented]
   backend/s3          object-store-native backend over ObjectStore + aws-sdk-go-v2 adapter   [implemented; in-process go-faster/fs S3 integration test]

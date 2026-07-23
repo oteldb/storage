@@ -162,8 +162,56 @@ type Durability struct {
 	EC *ECScheme
 }
 
+// DefaultStreamFields is the resource-attribute key set that identifies a log stream when a tenant
+// states no [Streams.Fields]: the OpenTelemetry semantic-convention keys that are low-cardinality
+// and constant for a workload's lifetime. Every other resource attribute stays out of the stream
+// key and is queried per record, so a high-churn attribute (`service.instance.id`, `k8s.pod.uid`,
+// a start timestamp) no longer mints a stream per process restart. It is sorted; do not mutate it.
+var DefaultStreamFields = []string{
+	"k8s.deployment.name",
+	"k8s.namespace.name",
+	"k8s.node.name",
+	"k8s.pod.name",
+	"service.name",
+	"service.namespace",
+}
+
+// Streams is the per-tenant log-stream identity policy: which resource attributes are *identifying*
+// (hashed into the stream id and resolved by a label matcher through the postings index) and which
+// are merely *stored* (written on every record and answered by a column condition). Both kinds
+// round-trip: a stream's complete resource attribute set is stored per record regardless, so
+// excluding a key changes only how it is indexed, never what an OTLP read reconstructs.
+//
+// The set must be fixed per tenant, not derived from observed cardinality: identity that moves with
+// the data would give one logical stream different ids over time, splitting postings and breaking
+// part merges with no way to re-key already-written parts. Changing it is nonetheless safe — old
+// parts keep their ids and stay queryable, and a condition on the key answers across the change.
+type Streams struct {
+	// Fields is the sorted set of identifying resource-attribute keys. nil ⇒
+	// [DefaultStreamFields]. A non-nil empty slice makes every resource attribute non-identifying
+	// (one stream per instrumentation scope).
+	Fields []string
+	// AllFields, when true, ignores Fields and keeps every resource attribute in the stream key.
+	// It is the escape hatch for a tenant whose resource attributes are known to be bounded.
+	AllFields bool
+}
+
+// Resolve applies the defaults: it returns the identifying resource-attribute keys (sorted) and
+// whether every resource attribute identifies the stream, in which case the keys are meaningless.
+func (s Streams) Resolve() (fields []string, all bool) {
+	switch {
+	case s.AllFields:
+		return nil, true
+	case s.Fields == nil:
+		return DefaultStreamFields, false
+	default:
+		return s.Fields, false
+	}
+}
+
 // Policy is the resolved policy for a tenant: limits, retention, downsampling, sampling,
-// recompression, durability, and routing. It is the return value of [Resolver.Resolve].
+// recompression, durability, stream identity, and routing. It is the return value of
+// [Resolver.Resolve].
 type Policy struct {
 	Limits     Limits
 	Retention  Retention
@@ -172,6 +220,7 @@ type Policy struct {
 	Recompress Recompress
 	Precision  Precision
 	Durability Durability
+	Streams    Streams
 	// RoutingHints TODO(M6): per-tenant shard placement / zone preferences.
 }
 
