@@ -67,9 +67,9 @@ func TestKeysHeadScopes(t *testing.T) {
 
 	got := keyScopes(e.Keys(0, 0))
 
-	assert.Equal(t, recordengine.KeyScopeResource, got["service.name"])
-	assert.Equal(t, recordengine.KeyScopeScope, got["scope.kind"])
-	assert.Equal(t, recordengine.KeyScopeScope, got["otel.scope.name"])
+	assert.Equal(t, recordengine.KeyScopeResource|recordengine.KeyScopeIndexed, got["service.name"])
+	assert.Equal(t, recordengine.KeyScopeScope|recordengine.KeyScopeIndexed, got["scope.kind"])
+	assert.Equal(t, recordengine.KeyScopeScope|recordengine.KeyScopeIndexed, got["otel.scope.name"])
 	assert.Equal(t, recordengine.KeyScopeRecord, got["http.method"])
 	assert.Equal(t, recordengine.KeyScopeRecord, got["http.status_code"])
 	assert.NotContains(t, got, "otel.scope.version", "no version ⇒ no key")
@@ -101,7 +101,11 @@ func TestKeysMixedScope(t *testing.T) {
 	ingest(t, e, mkScopedBatch("other", rrec{ts: 150, attr: [2]string{"env", "dev"}}))
 
 	got := keyScopes(e.Keys(0, 0))
-	assert.Equal(t, recordengine.KeyScopeResource|recordengine.KeyScopeRecord, got["env"], "env spans both scopes")
+	assert.Equal(t,
+		recordengine.KeyScopeResource|recordengine.KeyScopeIndexed|recordengine.KeyScopeRecord,
+		got["env"],
+		"env spans both scopes: indexed on one stream, condition-only on the other",
+	)
 }
 
 func TestKeysWindowFilter(t *testing.T) {
@@ -133,7 +137,7 @@ func TestKeysAcrossFlushAndMerge(t *testing.T) {
 	assert.Equal(t, recordengine.KeyScopeRecord, got["part1.key"], "from flushed part footer")
 	assert.Equal(t, recordengine.KeyScopeRecord, got["part2.key"], "from flushed part footer")
 	assert.Equal(t, recordengine.KeyScopeRecord, got["head.key"], "from the live head")
-	assert.Equal(t, recordengine.KeyScopeResource, got["service.name"])
+	assert.Equal(t, recordengine.KeyScopeResource|recordengine.KeyScopeIndexed, got["service.name"])
 
 	// Merge compacts the parts; the merged part's footer must still carry both record keys.
 	require.NoError(t, e.Merge(ctx, 0))
@@ -160,8 +164,8 @@ func TestKeysStatelessReload(t *testing.T) {
 
 	got := keyScopes(r.Keys(0, 0))
 	assert.Equal(t, recordengine.KeyScopeRecord, got["http.method"], "record key recovered from the part footer")
-	assert.Equal(t, recordengine.KeyScopeResource, got["service.name"], "resource key recovered from streams.bin")
-	assert.Equal(t, recordengine.KeyScopeScope, got["scope.kind"])
+	assert.Equal(t, recordengine.KeyScopeResource|recordengine.KeyScopeIndexed, got["service.name"], "resource key recovered from streams.bin")
+	assert.Equal(t, recordengine.KeyScopeScope|recordengine.KeyScopeIndexed, got["scope.kind"])
 }
 
 func TestKeysWindowPrunesPart(t *testing.T) {
@@ -197,7 +201,7 @@ func TestKeysPartWithoutRecordAttrs(t *testing.T) {
 	require.NoError(t, r.LoadParts(ctx)) // exercises loadRecordKeys' ErrNotExist path
 
 	got := keyScopes(r.Keys(0, 0))
-	assert.Equal(t, recordengine.KeyScopeResource, got["service.name"])
+	assert.Equal(t, recordengine.KeyScopeResource|recordengine.KeyScopeIndexed, got["service.name"])
 	assert.NotContains(t, got, "http.method")
 }
 

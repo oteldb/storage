@@ -8,8 +8,9 @@ import (
 // colValue returns the typed value of the named column for row i. The implicit timestamp and any
 // fixed schema column read their vector directly (int → IntValue, bytes → StringValue: the raw
 // bytes, which v.Str interprets and a language predicate matches as it sees fit). A name that is
-// not a fixed column is looked up in the serialized attributes blob (the schema's [BloomAttrs]
-// column) — a per-record attribute key, found via the zero-allocation [signal.LookupAttribute].
+// not a fixed column is looked up in the serialized attributes blobs (the schema's [BloomAttrs]
+// columns, in declaration order — the first hit wins) via the zero-allocation
+// [signal.LookupAttribute].
 //
 // [lazyCols.colValue] is the deliberate byte-for-byte twin of this over a lazy dictionary-column
 // source; the two are kept separate (not factored through a shared accessor) because this runs in
@@ -27,17 +28,14 @@ func (c *recordCols) colValue(i int, name string) (signal.Value, bool) {
 		return signal.StringValue(c.bytes[ref.idx].at(i)), true
 	}
 
-	k, ok := c.schema.attrsByteCol()
-	if !ok {
-		return signal.Value{}, false
+	for _, k := range c.schema.attrsByteCols() {
+		v, found, err := signal.LookupAttribute(c.bytes[k].at(i), name)
+		if err == nil && found {
+			return v, true
+		}
 	}
 
-	v, found, err := signal.LookupAttribute(c.bytes[k].at(i), name)
-	if err != nil || !found {
-		return signal.Value{}, false
-	}
-
-	return v, true
+	return signal.Value{}, false
 }
 
 // rowMatches reports whether row i satisfies every condition (logical AND). A column the row does

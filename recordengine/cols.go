@@ -81,7 +81,7 @@ func selectColumns(s *Schema, r fetch.Request) colSel {
 
 	for i := range r.Conditions {
 		if !mark(r.Conditions[i].Column) {
-			if k, ok := s.attrsByteCol(); ok { // attribute predicate reads the serialized blob
+			for _, k := range s.attrsByteCols() { // attribute predicate reads the serialized blobs
 				sel.bytes[k] = true
 			}
 		}
@@ -104,7 +104,7 @@ type recordCols struct {
 	// keyCache memoizes the buffer's distinct record-attribute keys (see distinctAttrKeys); it is
 	// invalidated on every append. tsMin/tsMax bound the buffer's timestamps so Keys can use the
 	// cache only when the query window fully covers the buffer (else a windowed scan is needed).
-	keyCache      [][]byte
+	keyCache      []KeyInfo
 	keyCacheValid bool
 	tsMin, tsMax  int64
 
@@ -132,7 +132,7 @@ func (c *recordCols) noteTS(ts int64) {
 
 // distinctAttrKeys returns the buffer's sorted distinct record-attribute keys, decoding the records
 // only when the cache is stale. Keys uses this to avoid re-decoding every head record per call.
-func (c *recordCols) distinctAttrKeys() [][]byte {
+func (c *recordCols) distinctAttrKeys() []KeyInfo {
 	if c.keyCacheValid {
 		return c.keyCache
 	}

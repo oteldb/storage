@@ -12,12 +12,21 @@ import (
 type KeyScope uint8
 
 const (
-	// KeyScopeResource marks a resource attribute (part of the stream identity, postings-indexed).
+	// KeyScopeResource marks a resource attribute.
 	KeyScopeResource KeyScope = 1 << iota
-	// KeyScopeScope marks an instrumentation-scope attribute (also stream identity).
+	// KeyScopeScope marks an instrumentation-scope attribute.
 	KeyScopeScope
-	// KeyScopeRecord marks a per-record attribute (the serialized attrs column).
+	// KeyScopeRecord marks a key that must be queried as a per-record column condition: it is
+	// stored in a serialized attributes column and is *not* resolvable through the postings index.
+	// A resource attribute the tenant's stream-field policy excludes from identity carries
+	// KeyScopeResource|KeyScopeRecord — resource by provenance, per-record by query mechanism.
 	KeyScopeRecord
+	// KeyScopeIndexed marks a key that is part of the stream identity, so a label matcher on it
+	// resolves through the postings index. A key stored per record purely because it duplicates the
+	// stream key does not also carry KeyScopeRecord, so a caller routes it to the postings index
+	// alone. Both bits together mean the key is genuinely both (a resource attribute on one stream,
+	// a record attribute on another) and neither pushdown is sound by itself.
+	KeyScopeIndexed
 )
 
 // KeyInfo is a distinct attribute key and the union of the scopes it was observed in. Key aliases
@@ -52,39 +61,73 @@ func (e *Engine) Keys(start, end int64) []KeyInfo {
 		}
 
 		for i := range s.Resource.Attributes {
-			add(s.Resource.Attributes[i].Key, KeyScopeResource)
+			add(s.Resource.Attributes[i].Key, KeyScopeResource|KeyScopeIndexed)
 		}
 
 		for i := range s.Scope.Attributes {
-			add(s.Scope.Attributes[i].Key, KeyScopeScope)
+			add(s.Scope.Attributes[i].Key, KeyScopeScope|KeyScopeIndexed)
 		}
 
 		if len(s.Scope.Name) > 0 {
-			add(labelScopeName, KeyScopeScope)
+			add(labelScopeName, KeyScopeScope|KeyScopeIndexed)
 		}
 
 		if len(s.Scope.Version) > 0 {
-			add(labelScopeVersion, KeyScopeScope)
+			add(labelScopeVersion, KeyScopeScope|KeyScopeIndexed)
 		}
 	})
 
-	// Record-attribute keys: the head's still-buffered records (plus any detached mid-flush) and each
-	// in-window part's footer.
-	emitRecord := func(key []byte) { add(key, KeyScopeRecord) }
-	collectRecordKeys(e.cfg.Schema, e.head.records, start, end, emitRecord)
-	collectRecordKeys(e.cfg.Schema, e.flushing, start, end, emitRecord)
+	// Column-stored keys: the head's still-buffered records (plus any detached mid-flush) and each
+	// in-window part's footer. These are collected apart from the identity keys because a column's
+	// scope is its OTLP *provenance*, not its query mechanism — see mergeColumnScopes.
+	colScopes := make(map[string]KeyScope)
+	collect := func(k KeyInfo) {
+		if len(k.Key) > 0 {
+			colScopes[string(k.Key)] |= k.Scope
+		}
+	}
+
+	collectRecordKeys(e.cfg.Schema, e.head.records, start, end, collect)
+	collectRecordKeys(e.cfg.Schema, e.flushing, start, end, collect)
 
 	for _, p := range e.parts {
 		if !partInWindow(p, start, end) {
 			continue
 		}
 
-		for _, key := range p.recordKeys {
-			add(key, KeyScopeRecord)
+		for _, k := range p.recordKeys {
+			collect(k)
 		}
 	}
 
+	mergeColumnScopes(scopes, colScopes)
+
 	return keyInfoSlice(scopes)
+}
+
+// mergeColumnScopes folds the serialized-attribute columns' keys (colScopes, keyed by the OTLP
+// provenance of the column each came from) into the identity keys collected from the series index.
+//
+// A record-provenance key is condition-only, always. A resource-provenance key is a schema storing
+// a stream's resource attributes on every record: it is condition-answerable only where it is *not*
+// already in the stream key, so it takes [KeyScopeRecord] only when the series index did not report
+// it as [KeyScopeIndexed]. A key that is genuinely both — a resource attribute on one stream and a
+// record attribute on another — still ends up with both bits, which tells a caller neither pushdown
+// is sound on its own.
+func mergeColumnScopes(scopes, colScopes map[string]KeyScope) {
+	for key, sc := range colScopes {
+		if sc&KeyScopeRecord != 0 {
+			scopes[key] |= KeyScopeRecord
+		}
+
+		if sc&KeyScopeResource != 0 {
+			scopes[key] |= KeyScopeResource
+
+			if scopes[key]&KeyScopeIndexed == 0 {
+				scopes[key] |= KeyScopeRecord
+			}
+		}
+	}
 }
 
 // partInWindow reports whether part p's record bounds overlap [start, end]. A zero start AND end
@@ -113,12 +156,13 @@ func keyInfoSlice(scopes map[string]KeyScope) []KeyInfo {
 	return out
 }
 
-// collectRecordKeys calls emit for every per-record attribute key buffered in records whose record
-// falls in [start, end] (a zero start AND end disables the filter). No-op when the schema has no
-// serialized-attributes column or records is nil. Caller holds the engine lock.
-func collectRecordKeys(schema *Schema, records map[signal.SeriesID]*recordCols, start, end int64, emit func(key []byte)) {
-	k, ok := schema.attrsByteCol()
-	if !ok {
+// collectRecordKeys calls emit for every attribute key buffered in the schema's serialized-attribute
+// columns, for records falling in [start, end] (a zero start AND end disables the filter), tagged
+// with the emitting column's scope. No-op when the schema has no such column or records is nil.
+// Caller holds the engine lock.
+func collectRecordKeys(schema *Schema, records map[signal.SeriesID]*recordCols, start, end int64, emit func(KeyInfo)) {
+	cols := schema.attrsByteCols()
+	if len(cols) == 0 {
 		return
 	}
 
@@ -132,19 +176,23 @@ func collectRecordKeys(schema *Schema, records map[signal.SeriesID]*recordCols, 
 		// distinct keys — serve them from the (append-invalidated) cache instead of decoding every
 		// record's attributes per Keys call.
 		if all || (start <= buf.tsMin && buf.tsMax <= end) {
-			for _, key := range buf.distinctAttrKeys() {
-				emit(key)
+			for _, k := range buf.distinctAttrKeys() {
+				emit(k)
 			}
 			continue
 		}
 
 		// Partial overlap: only the in-window records' keys count, so scan them.
-		blobs := &buf.bytes[k]
-		for i := range buf.ts {
-			if buf.ts[i] < start || buf.ts[i] > end {
-				continue
+		for _, k := range cols {
+			sc := schema.keyScope(k)
+			blobs := &buf.bytes[k]
+
+			for i := range buf.ts {
+				if buf.ts[i] < start || buf.ts[i] > end {
+					continue
+				}
+				forEachAttrKey(blobs.at(i), func(key []byte) { emit(KeyInfo{Key: key, Scope: sc}) })
 			}
-			forEachAttrKey(blobs.at(i), emit)
 		}
 	}
 }

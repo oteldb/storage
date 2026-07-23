@@ -87,7 +87,7 @@ func TestProjectEmitsOneBatchPerStream(t *testing.T) {
 		accepted int
 	)
 
-	accepted = Project(mkLogs(), func(b *recordengine.Batch) {
+	accepted = Project(mkLogs(), nil, func(b *recordengine.Batch) {
 		streams = append(streams, b.Stream)
 		lens = append(lens, b.Len())
 		bodies = append(bodies, b.Bytes[bBody]...)
@@ -103,7 +103,7 @@ func TestProjectEmitsOneBatchPerStream(t *testing.T) {
 func TestProjectStreamIDMatchesIdentity(t *testing.T) {
 	t.Parallel()
 
-	Project(mkLogs(), func(b *recordengine.Batch) {
+	Project(mkLogs(), nil, func(b *recordengine.Batch) {
 		assert.Equal(t, b.Identity().Hash(), b.Stream, "Stream equals the identity hash")
 	})
 }
@@ -122,7 +122,7 @@ func TestProjectFillsSchemaColumns(t *testing.T) {
 	r.SeverityText, r.Body, r.TraceID = []byte("INFO"), []byte("hello"), []byte("tid")
 	r.Attributes = signal.NewAttributes(signal.KeyValue{Key: []byte("k"), Value: signal.StringValue([]byte("v"))})
 
-	Project(ld, func(b *recordengine.Batch) {
+	Project(ld, nil, func(b *recordengine.Batch) {
 		require.Equal(t, []int64{100}, b.Ts)
 		assert.Equal(t, int64(101), b.Ints[iObserved][0])
 		assert.Equal(t, int64(9), b.Ints[iSeverity][0])
@@ -156,7 +156,7 @@ func BenchmarkProject(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		Project(ld, func(*recordengine.Batch) {})
+		Project(ld, nil, func(*recordengine.Batch) {})
 	}
 }
 
@@ -170,7 +170,7 @@ func TestProjectSkipsEmptyScopes(t *testing.T) {
 	sl.AddRecord().Body = []byte("x")
 
 	n := 0
-	accepted := Project(ld, func(*recordengine.Batch) { n++ })
+	accepted := Project(ld, nil, func(*recordengine.Batch) { n++ })
 	assert.Equal(t, 1, n, "empty scope groups emit nothing")
 	assert.Equal(t, 1, accepted)
 }

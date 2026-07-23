@@ -137,9 +137,15 @@ func New(cfg Config) *Engine {
 type Batch struct {
 	Stream   signal.SeriesID
 	Identity func() signal.Series // materialized only when the stream is newly seen
-	Ts       []int64
-	Ints     [][]int64  // len == schema int count; Ints[k][row]
-	Bytes    [][][]byte // len == schema byte count; Bytes[k][row]
+	// Route, when non-nil, is the batch's pre-classification identity: the complete Resource and
+	// Scope, before a stream-field policy narrowed Identity to the identifying subset. The engine
+	// ignores it — it exists so the ingest facade derives a tenant from every resource attribute,
+	// including those the policy keeps out of the stream key. nil ⇒ Identity is the routing
+	// identity (see [Batch.RoutingIdentity]).
+	Route func() signal.Series
+	Ts    []int64
+	Ints  [][]int64  // len == schema int count; Ints[k][row]
+	Bytes [][][]byte // len == schema byte count; Bytes[k][row]
 	// Side is an optional encoded side-store delta (the content-addressed symbols this batch's
 	// records reference) absorbed by [Config.SideStore]. nil when the engine has no side store.
 	Side []byte
@@ -147,6 +153,16 @@ type Batch struct {
 
 // Len returns the number of records in the batch.
 func (b *Batch) Len() int { return len(b.Ts) }
+
+// RoutingIdentity returns the identity a caller derives the batch's tenant from: [Batch.Route] when
+// the projector narrowed the stream key, else [Batch.Identity].
+func (b *Batch) RoutingIdentity() signal.Series {
+	if b.Route != nil {
+		return b.Route()
+	}
+
+	return b.Identity()
+}
 
 // ByteSize returns the in-flight memory the batch's records occupy (timestamps, int columns, and
 // the lengths of the byte columns) — the size a caller charges against an ingest-rate budget.

@@ -50,6 +50,11 @@ type Column struct {
 	Kind  Kind
 	Codec chunk.Codec
 	Bloom BloomMode
+	// KeyScope is the OTLP provenance a [BloomAttrs] column's keys are reported with by
+	// [Engine.Keys]. Zero ⇒ [KeyScopeRecord] (the record's own attributes). A schema that stores a
+	// stream's resource attributes per record — so a condition can answer a key the stream key
+	// does not carry — marks that column [KeyScopeResource]. Ignored for non-[BloomAttrs] columns.
+	KeyScope KeyScope
 }
 
 // colRef locates a column within its kind's vector (recordCols.ints or recordCols.bytes).
@@ -65,6 +70,7 @@ type Schema struct {
 	byName   map[string]colRef
 	intCols  []int // indices into cols of the Int64 columns, in declaration order
 	byteCols []int // indices into cols of the Bytes columns, in declaration order
+	attrCols []int // byte-vector indices of the BloomAttrs columns, in declaration order
 }
 
 // NewSchema builds a [Schema] from its columns (declaration order is preserved within each kind).
@@ -77,6 +83,11 @@ func NewSchema(cols ...Column) *Schema {
 			s.intCols = append(s.intCols, i)
 		case KindBytes:
 			s.byName[cols[i].Name] = colRef{KindBytes, len(s.byteCols)}
+
+			if cols[i].Bloom == BloomAttrs {
+				s.attrCols = append(s.attrCols, len(s.byteCols))
+			}
+
 			s.byteCols = append(s.byteCols, i)
 		}
 	}
@@ -99,15 +110,17 @@ func (s *Schema) ref(name string) (colRef, bool) {
 func (s *Schema) intColumn(k int) Column  { return s.cols[s.intCols[k]] }
 func (s *Schema) byteColumn(k int) Column { return s.cols[s.byteCols[k]] }
 
-// attrsByteCol returns the index (within the byte vector) of the column marked [BloomAttrs] — the
-// serialized per-record attributes — and whether the schema has one. Attribute conditions resolve
-// against it.
-func (s *Schema) attrsByteCol() (int, bool) {
-	for k := range s.byteCols {
-		if s.byteColumn(k).Bloom == BloomAttrs {
-			return k, true
-		}
+// attrsByteCols returns the byte-vector indices of every column marked [BloomAttrs] — the
+// serialized attribute blobs — in declaration order. Attribute conditions resolve against them, and
+// a key present in more than one is taken from the first (so a schema declares the narrower scope
+// first: a record attribute shadows a resource attribute of the same name).
+func (s *Schema) attrsByteCols() []int { return s.attrCols }
+
+// keyScope returns the scope [Engine.Keys] reports the k-th byte column's attribute keys under.
+func (s *Schema) keyScope(k int) KeyScope {
+	if sc := s.byteColumn(k).KeyScope; sc != 0 {
+		return sc
 	}
 
-	return 0, false
+	return KeyScopeRecord
 }
