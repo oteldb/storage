@@ -40,12 +40,51 @@ type bloomBuilder struct {
 	token []byte            // reused key-scoped token
 }
 
-// forEachToken calls fn once per bloom token of the column under mode.
+// countTokens returns how many tokens [bloomBuilder.forEachToken] emits for the column, counting
+// per row rather than per token — [bloom.CountTokens] scores a whole value in one call, where
+// counting through forEachToken would pay an indirect call per token.
 //
-// [buildColumnBloom] runs it twice — once to count, once to fill — so keeping the token set in one
-// place is what guarantees the two passes agree; a filter sized by one walk and filled by a
-// different one would silently over- or under-saturate. Tokens passed to fn alias the builder's
-// scratch and are invalid after fn returns.
+// It must stay in step with forEachToken: an undercount saturates the filter (more false positives,
+// never a false negative), an overcount wastes space, and either changes the encoded bytes. That is
+// exactly what TestBuildColumnBloomMatchesReference and FuzzBuildColumnBloomMatchesReference detect
+// — they compare against a single-pass build that counts by materializing, so any drift between
+// this and forEachToken shows up as a differing filter.
+func (bb *bloomBuilder) countTokens(mode BloomMode, values *byteCol) int {
+	n := 0
+
+	switch mode {
+	case BloomFullText:
+		for i := range values.rows() {
+			n += bloom.CountTokens(values.at(i))
+		}
+	case BloomEquality:
+		for i := range values.rows() {
+			if len(values.at(i)) > 0 {
+				n++
+			}
+		}
+	case BloomAttrs:
+		for i := range values.rows() {
+			a, _, err := signal.AppendAttributes(bb.attrs[:0], values.at(i))
+			if err != nil {
+				continue
+			}
+
+			bb.attrs = a
+			for j := range a {
+				// One key‖value token per attribute, plus one key‖word token per word.
+				bb.text = a[j].Value.AppendText(bb.text[:0])
+				n += 1 + bloom.CountTokens(bb.text)
+			}
+		}
+	case BloomNone:
+	}
+
+	return n
+}
+
+// forEachToken calls fn once per bloom token of the column under mode. Tokens passed to fn alias
+// the builder's scratch and are invalid after fn returns.
 func (bb *bloomBuilder) forEachToken(mode BloomMode, values *byteCol, fn func(token []byte)) {
 	switch mode {
 	case BloomFullText:
@@ -134,10 +173,7 @@ func buildColumnBloom(mode BloomMode, values *byteCol) []byte {
 
 	var bb bloomBuilder
 
-	n := 0
-	bb.forEachToken(mode, values, func([]byte) { n++ })
-
-	f := bloom.New(n, 0.01)
+	f := bloom.New(bb.countTokens(mode, values), 0.01)
 	bb.forEachToken(mode, values, f.Add)
 
 	return f.Encode(nil)
