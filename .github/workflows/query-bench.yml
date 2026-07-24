@@ -28,7 +28,8 @@ env:
   PKG: './internal/storagebackend/'
   FLAGS: '-run=^$ -benchmem -benchtime=300ms -count=6 -timeout=30m'
   # oteldb ref to benchmark against. Both sides use it, so the delta stays valid as it moves.
-  OTELDB_REF: main
+  # TEMPORARY: pinned to the branch adding the benchmarks until oteldb#1170 merges; flip to main.
+  OTELDB_REF: test/golden-query-benchmarks
 
 jobs:
   query:
@@ -73,8 +74,13 @@ jobs:
       - name: Benchmark PR head
         working-directory: oteldb
         run: |
+          set -o pipefail # else `go test | tee` reports tee's status and a failed run looks green
           go work init . "${GITHUB_WORKSPACE}/storage"
           go test ${FLAGS} -bench "${BENCH}" ${PKG} | tee "${GITHUB_WORKSPACE}/head.txt"
+          # A benchmark set that matches nothing exits 0 in ~10ms. Without this the job is green,
+          # the report renders its empty-results caution, and the gate silently measures nothing.
+          grep -q '^Benchmark' "${GITHUB_WORKSPACE}/head.txt" \
+            || { echo "::error::no benchmarks matched ${BENCH} in ${PKG} at oteldb@${OTELDB_REF}"; exit 1; }
 
       # Non-fatal: if the base doesn't build against oteldb, report head only. A failure here on a
       # PR that changes the public surface is itself the signal — it means the embedder contract moved.
@@ -84,9 +90,13 @@ jobs:
         continue-on-error: true
         working-directory: oteldb
         run: |
+          set -o pipefail
           rm -f go.work go.work.sum
           go work init . "${GITHUB_WORKSPACE}/storage-base"
           go test ${FLAGS} -bench "${BENCH}" ${PKG} | tee "${GITHUB_WORKSPACE}/base.txt"
+          # Drop a result-less base so the report falls back to head-only rather than diffing a
+          # file that holds only the goos/goarch preamble (which is non-empty, so -s would pass).
+          grep -q '^Benchmark' "${GITHUB_WORKSPACE}/base.txt" || rm -f "${GITHUB_WORKSPACE}/base.txt"
 
       - name: Build report
         run: |
