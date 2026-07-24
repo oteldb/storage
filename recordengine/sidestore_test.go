@@ -23,6 +23,7 @@ type fakeSide struct {
 	absorbed int
 	encoded  int
 	resets   int
+	restores int
 	unions   int
 }
 
@@ -75,6 +76,17 @@ func (f *fakeSide) Encode() map[string][]byte {
 func (f *fakeSide) Reset() {
 	f.resets++
 	f.acc = map[uint64][]byte{}
+}
+
+func (f *fakeSide) Restore(snapshot map[string][]byte) error {
+	f.restores++
+
+	data, ok := snapshot["table"]
+	if !ok {
+		return nil
+	}
+
+	return decodeSide(data, f.acc)
 }
 
 func (f *fakeSide) Names() []string { return []string{"table"} }

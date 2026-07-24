@@ -29,6 +29,11 @@ type SideStore interface {
 	Encode() map[string][]byte
 	// Reset clears the live accumulator (after a flush drains the head).
 	Reset()
+	// Restore merges an [SideStore.Encode] snapshot back into the live accumulator. The engine calls
+	// it when a flush fails after the snapshot+Reset: the records return to the head, so their side
+	// data must too. Content-addressing makes the merge a plain dedup with whatever the accumulator
+	// gained meanwhile.
+	Restore(snapshot map[string][]byte) error
 	// Names returns the sidecar names to read back for a part on merge (the keys [SideStore.Encode]
 	// may produce). A part missing a named sidecar is skipped.
 	Names() []string
