@@ -75,6 +75,9 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 // picks only the parts worth merging this cycle (a same-size tier group plus any part a forced
 // rewrite must touch), so a single merge's working set is O(part size), not O(dataset).
 func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
+	e.flushMu.Lock()
+	defer e.flushMu.Unlock()
+
 	// Plan (under lock): snapshot the source parts (immutable backing). Output part sequences are
 	// reserved one at a time, as the parts are written.
 	e.mu.Lock()

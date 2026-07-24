@@ -63,6 +63,24 @@ guarantee survives a restart, where the index alone would hand the orphan's sequ
 The sweep assumes this node **owns** the prefix, so a replica's `RefreshReplica` skips it: it shares
 the store with the owner, whose in-flight part is not in the index yet.
 
+## Lifecycle guards
+
+Flush and merge run under one `flushMu` held across their whole body — both mutate the parts slice,
+reserve part sequences, and reuse the flush column buffer off the engine lock. The facade drives them
+from a single maintenance goroutine, but `Engine` is exported and `Close`/`Reset` are callable from
+anywhere, so the single-mutator invariant is enforced rather than assumed.
+
+`Reset` takes it too: it drains an in-flight flush/merge (which would otherwise publish its part —
+and a stale sequence — into the emptied engine), drops the detached `flushing` buffers with the head,
+and **retires** the live parts instead of deleting their objects outright, so a concurrent fetch that
+already acquired one is not read out from under it. The deferred reclaim deletes them once the reader
+drains.
+
+The head has a hard byte ceiling of `headByteCap` (2 GiB) independent of `MaxInFlightBytes`: a flush
+concatenates every stream's cells into one blob per byte column, indexed by `byteCol`'s int32
+offsets. Past the cap records are rejected as memory backpressure — overflowing would write negative
+offsets into a part.
+
 ## Fetch
 
 Heavily tuned around decoding as little as possible:
