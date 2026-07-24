@@ -166,8 +166,8 @@ func TestResetKeepsPartsUnderRead(t *testing.T) {
 }
 
 // TestConcurrentFlushIsSerialized exercises the single-flusher guard: concurrent Flush calls (which
-// the exported API allows, and Close makes reachable) share e.flushBuf and the part sequence off the
-// engine lock. Run with -race.
+// the exported API allows, and Close makes reachable) share e.flushBuf, e.bloomBuf and the part
+// sequence off the engine lock. Run with -race.
 func TestConcurrentFlushIsSerialized(t *testing.T) {
 	t.Parallel()
 

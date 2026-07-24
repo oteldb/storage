@@ -2,6 +2,7 @@ package recordengine
 
 import (
 	"bytes"
+	"encoding/binary"
 	"strconv"
 	"testing"
 
@@ -193,6 +194,108 @@ func TestBuildColumnBloomAttrsMatchesReference(t *testing.T) {
 	}
 }
 
+// bloomCorpus is a set of repetitive, realistically shaped columns per mode — repetitive so that the
+// first-occurrence skip actually has duplicates to drop.
+func bloomCorpus(tb testing.TB) []struct {
+	name   string
+	mode   BloomMode
+	values *byteCol
+} {
+	tb.Helper()
+
+	kv := func(k, v string) signal.KeyValue {
+		return signal.KeyValue{Key: []byte(k), Value: signal.StringValue([]byte(v))}
+	}
+
+	var logs byteCol
+	for i := range 2000 {
+		logs.appendCell([]byte("2026-07-23T09:45:37Z INFO checkout-service handler=CreateOrder user=" +
+			strconv.Itoa(i%11) + " status=OK"))
+	}
+
+	var attrs byteCol
+	for i := range 2000 {
+		attrs.appendCell(attrsCell(tb,
+			kv("service.name", "checkout-service"),
+			kv("http.route", "/api/v1/orders/"+strconv.Itoa(i%13)),
+		))
+	}
+
+	var eqDup byteCol
+	for i := range 2000 {
+		eqDup.appendCell([]byte("trace-" + strconv.Itoa(i%9)))
+	}
+
+	return []struct {
+		name   string
+		mode   BloomMode
+		values *byteCol
+	}{
+		{"none", BloomNone, colOf([]byte("x"))},
+		{"fulltext empty", BloomFullText, &byteCol{}},
+		{"fulltext repetitive", BloomFullText, &logs},
+		{"attrs empty", BloomAttrs, &byteCol{}},
+		{"attrs repetitive", BloomAttrs, &attrs},
+		{"equality repetitive", BloomEquality, &eqDup},
+		{"equality distinct", BloomEquality, traceIDCol(2000)},
+		{"equality with empties", BloomEquality, colOf(nil, []byte("abc"), nil, []byte("abc"))},
+	}
+}
+
+// TestBuildColumnBloomDedupIsBitIdentical pins the property the mode-gated dedup rests on: which
+// rows are walked never changes the encoded filter. A repeated value re-derives tokens the filter
+// and the distinct-count sketch already hold, and both are idempotent per token — so forcing the
+// first-occurrence skip on, or off, must produce the same bytes as the build's own choice, for every
+// mode. (Without this, gating the pass off for [BloomEquality] would be a format change.)
+func TestBuildColumnBloomDedupIsBitIdentical(t *testing.T) {
+	t.Parallel()
+
+	// forced walks the rows the caller picked rather than the ones build would.
+	forced := func(dedup bool, mode BloomMode, values *byteCol) []byte {
+		if mode == BloomNone {
+			return nil
+		}
+
+		var bb bloomBuilder
+		if dedup {
+			bb.markRows(values)
+		}
+
+		f := bloom.New(bb.sizeTokens(mode, values), falsePositiveRate(mode))
+		bb.forEachToken(mode, values, f.Add)
+
+		return f.Encode(nil)
+	}
+
+	for _, tt := range bloomCorpus(t) {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			want := buildColumnBloom(tt.mode, tt.values)
+			require.Equal(t, want, forced(true, tt.mode, tt.values), "with dedup")
+			require.Equal(t, want, forced(false, tt.mode, tt.values), "without dedup")
+		})
+	}
+}
+
+// TestBloomBuilderReuseMatchesFresh runs every corpus column through one shared builder — the
+// flush/merge path's shape — and requires each filter to match a throwaway-builder build, so a
+// scratch buffer left un-armed between columns (notably the first-occurrence row set) is caught.
+func TestBloomBuilderReuseMatchesFresh(t *testing.T) {
+	t.Parallel()
+
+	corpus := bloomCorpus(t)
+
+	var bb bloomBuilder
+
+	// Twice, so a column also sees the state a *previous* pass left behind.
+	for range 2 {
+		for _, tt := range corpus {
+			require.Equal(t, buildColumnBloom(tt.mode, tt.values), bb.build(tt.mode, tt.values), tt.name)
+		}
+	}
+}
+
 // FuzzBuildColumnBloomMatchesReference fuzzes arbitrary column bytes through both builds; the
 // encoded filters must not diverge for any input, including malformed attribute blobs.
 func FuzzBuildColumnBloomMatchesReference(f *testing.F) {
@@ -203,37 +306,62 @@ func FuzzBuildColumnBloomMatchesReference(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, a, b []byte) {
 		values := colOf(a, b)
-		for _, mode := range []BloomMode{BloomFullText, BloomEquality, BloomAttrs, BloomNone} {
-			want := buildColumnBloomReference(mode, values)
-			if got := buildColumnBloom(mode, values); !bytes.Equal(want, got) {
-				t.Fatalf("mode %v: filter diverged from reference", mode)
+
+		// One shared builder walked twice over every mode: the filters must match the reference
+		// whatever scratch the previous column (and the previous mode) left behind.
+		var bb bloomBuilder
+
+		for range 2 {
+			for _, mode := range []BloomMode{BloomFullText, BloomEquality, BloomAttrs, BloomNone} {
+				want := buildColumnBloomReference(mode, values)
+				if got := buildColumnBloom(mode, values); !bytes.Equal(want, got) {
+					t.Fatalf("mode %v: filter diverged from reference", mode)
+				}
+
+				if got := bb.build(mode, values); !bytes.Equal(want, got) {
+					t.Fatalf("mode %v: reused builder diverged from reference", mode)
+				}
 			}
 		}
 	})
 }
 
-// benchBuild runs the two-pass build against the single-pass reference it replaced, so the
-// difference is measurable in-tree (benchstat the two sub-benchmarks). Throughput is sized by the
-// column's uncompressed bytes.
+// benchBuild runs the build in its two callable shapes — a throwaway builder per column
+// (impl=fresh) and one re-armed builder (impl=reused, the flush/merge path) — against the
+// single-pass reference it replaced, so both the per-column scratch cost and the two-pass win are
+// measurable in one run (`benchstat -col /impl`). Throughput is sized by the column's uncompressed
+// bytes.
 func benchBuild(b *testing.B, mode BloomMode, c *byteCol) {
 	b.Helper()
 
-	for _, tt := range []struct {
-		name  string
-		build func(BloomMode, *byteCol) []byte
-	}{
-		{"current", buildColumnBloom},
-		{"reference", buildColumnBloomReference},
-	} {
-		b.Run(tt.name, func(b *testing.B) {
-			b.ReportAllocs()
-			b.SetBytes(int64(len(c.data)))
+	b.Run("impl=fresh", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(c.data)))
 
-			for b.Loop() {
-				tt.build(mode, c)
-			}
-		})
-	}
+		for b.Loop() {
+			buildColumnBloom(mode, c)
+		}
+	})
+
+	b.Run("impl=reused", func(b *testing.B) {
+		var bb bloomBuilder
+
+		b.ReportAllocs()
+		b.SetBytes(int64(len(c.data)))
+
+		for b.Loop() {
+			bb.build(mode, c)
+		}
+	})
+
+	b.Run("impl=reference", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(c.data)))
+
+		for b.Loop() {
+			buildColumnBloomReference(mode, c)
+		}
+	})
 }
 
 func BenchmarkBuildColumnBloomFullText(b *testing.B) {
@@ -244,6 +372,33 @@ func BenchmarkBuildColumnBloomFullText(b *testing.B) {
 	}
 
 	benchBuild(b, BloomFullText, &c)
+}
+
+// traceIDCol builds a trace_id-shaped equality column: 16 raw bytes per row, ~82% of rows distinct
+// (real trace data is dominated by single-span traces), so the repeated-value dedup has almost
+// nothing to skip and its per-row hash + map insert is pure cost.
+func traceIDCol(rows int) *byteCol {
+	var (
+		c  byteCol
+		id [16]byte
+		n  uint64
+	)
+
+	for i := range rows {
+		if i%100 < 82 {
+			n++
+		}
+
+		binary.BigEndian.PutUint64(id[:8], n*0x9e3779b97f4a7c15)
+		binary.BigEndian.PutUint64(id[8:], n)
+		c.appendCell(id[:])
+	}
+
+	return &c
+}
+
+func BenchmarkBuildColumnBloomEquality(b *testing.B) {
+	benchBuild(b, BloomEquality, traceIDCol(50000))
 }
 
 func BenchmarkBuildColumnBloomAttrs(b *testing.B) {
