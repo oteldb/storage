@@ -3,6 +3,8 @@ package engine
 import (
 	"bytes"
 	"context"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -83,8 +85,13 @@ const DefaultMetricBlockRows = 1024
 
 // Engine is a single tenant's storage engine. Safe for concurrent use.
 type Engine struct {
-	cfg     Config
-	mu      sync.RWMutex
+	cfg Config
+	mu  sync.RWMutex
+	// flushMu serializes the *whole* body of a flush or merge (both mutate parts and reserve part
+	// sequences off e.mu). The facade drives them from one maintenance goroutine, but the type is
+	// exported and Close/Reset are callable from anywhere, so the single-mutator invariant is enforced
+	// here rather than assumed. Always taken before e.mu, never while holding it.
+	flushMu sync.Mutex
 	head    *head
 	parts   []*part
 	nextSeq int
@@ -914,31 +921,57 @@ func (e *Engine) Flush(ctx context.Context) error {
 
 // Reset discards all of the engine's data — the in-memory head (samples + series index)
 // and every flushed part — returning it to the empty state of a freshly [New]'d engine,
-// without reallocating the engine itself. Flushed part objects are deleted from the backend
-// so none are orphaned. It is destructive (it wipes this engine's parts under
-// [Config.Prefix]) and is meant for the ephemeral in-memory engine in tests and benchmarks,
+// without reallocating the engine itself. It waits for an in-flight flush or merge to finish
+// first, so that operation cannot publish its part into the reset engine. Flushed part objects
+// are deleted from the backend so none are orphaned — except those a concurrent fetch is still
+// reading, which are retired and deleted by the deferred reclaim once the reader drains. It is
+// destructive (it wipes this engine's parts under [Config.Prefix]) and is meant for the ephemeral
+// in-memory engine in tests and benchmarks,
 // letting a long-lived engine be reused across runs. Safe for concurrent use.
 func (e *Engine) Reset(ctx context.Context) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.flushMu.Lock() // drain an in-flight flush/merge; it would otherwise publish into the empty engine
+	defer e.flushMu.Unlock()
 
+	e.mu.Lock()
 	e.head = newHead()
-	e.parts = nil
-	e.retiring = nil // the List+Delete below removes their objects too
+	e.flushing = nil // discarded with the head: Reset drops the samples, it does not flush them
 	e.nextSeq = 0
 
 	if e.cfg.Backend == nil {
+		e.parts, e.retiring = nil, nil
+		e.mu.Unlock()
+
 		return nil
 	}
 
-	// Delete every object this engine wrote: all part keys are "{Prefix}/{seq}/...", so the
-	// "{Prefix}/" scope catches them without touching a sibling engine's keys.
+	e.retireLocked(e.parts)
+	e.parts = nil
+	e.mu.Unlock()
+
+	// Delete the drained parts' objects (and re-queue the ones a fetch still holds), then sweep
+	// whatever is left: all part keys are "{Prefix}/{seq}/...", so the "{Prefix}/" scope catches them
+	// — plus the index objects — without touching a sibling engine's keys.
+	e.reclaimRetired(ctx)
+
+	e.mu.RLock()
+	pending := make([]string, 0, len(e.retiring))
+
+	for _, p := range e.retiring {
+		pending = append(pending, p.prefix+"/")
+	}
+
+	e.mu.RUnlock()
+
 	keys, err := e.cfg.Backend.List(ctx, e.cfg.Prefix+"/")
 	if err != nil {
 		return errors.Wrap(err, "list parts")
 	}
 
 	for _, k := range keys {
+		if slices.ContainsFunc(pending, func(p string) bool { return strings.HasPrefix(k, p) }) {
+			continue // a fetch still holds this part; reclaimRetired deletes it once the reader drains
+		}
+
 		if err := e.cfg.Backend.Delete(ctx, k); err != nil && !errors.Is(err, backend.ErrNotExist) {
 			return errors.Wrapf(err, "delete %q", k)
 		}
@@ -1075,6 +1108,9 @@ func (e *Engine) SeriesCount() int {
 // head detach and the metadata publish run under it. Only the background maintenance task (or Close)
 // calls flush, so the parts mutation has a single writer.
 func (e *Engine) flush(ctx context.Context) (int, error) {
+	e.flushMu.Lock()
+	defer e.flushMu.Unlock()
+
 	// Plan (under lock): detach the head's sample buffers, keeping them readable via e.flushing so a
 	// concurrent fetch never loses them, and reserve the part sequence.
 	e.mu.Lock()

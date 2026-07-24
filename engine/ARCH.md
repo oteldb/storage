@@ -47,8 +47,15 @@ row boundaries is safe — parts are independent and a series spanning two is me
 seam.
 
 Driven by the facade's single background maintenance loop, plus a head-bytes pressure trigger that
-flushes just the over-threshold engines. Because both paths run on one goroutine, an engine is
-never flushed twice concurrently.
+flushes just the over-threshold engines. Concurrency is nonetheless enforced, not assumed: flush and
+merge run under one `flushMu` held across their whole body, since `Engine` is exported and
+`Close`/`Reset` are callable from anywhere.
+
+`Reset` takes it too — it drains an in-flight flush/merge (which would otherwise publish its part,
+and a stale sequence, into the emptied engine), drops the detached flushing buffers with the head,
+and **retires** the live parts instead of deleting their objects outright, so a fetch that already
+acquired one is not read out from under it; the deferred reclaim deletes them once the reader
+drains.
 
 **Part sequences are append-only.** Flush and merge reserve each output part's `{seq}` as they write
 it and advance the counter immediately, so an attempt that failed after writing some objects burns

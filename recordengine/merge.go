@@ -63,6 +63,9 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 // once their in-flight readers drain. Only the background maintenance task calls merge, so the parts
 // mutation has a single writer.
 func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
+	e.flushMu.Lock()
+	defer e.flushMu.Unlock()
+
 	// Plan (under lock): snapshot the source parts (immutable backing). Output part sequences are
 	// reserved one at a time, as the parts are written.
 	e.mu.Lock()

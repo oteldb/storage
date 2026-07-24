@@ -1,6 +1,8 @@
 package recordengine
 
 import (
+	"math"
+
 	"github.com/oteldb/storage/index/postings"
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/index/symbols"
@@ -61,6 +63,15 @@ func (h *head) ensureStream(id signal.SeriesID, materialize func() signal.Series
 	return isNew, true
 }
 
+// headByteCap is the hard ceiling on a head's buffered record bytes, enforced regardless of
+// [AppendLimits.MaxInFlightBytes] (which may be unset). A flush concatenates every stream's cells
+// into one blob per byte column, indexed by the int32 offsets of [byteCol] — so a column blob cannot
+// exceed 2 GiB, and h.bytes (which counts every column's bytes) bounds any single one of them.
+// Overflowing would be silent corruption: negative offsets written into a part. Reaching it takes a
+// raised or disabled FlushThresholdBytes; past it records are rejected as [rejectBytes], the same
+// memory-backpressure reason the configurable cap uses.
+const headByteCap = math.MaxInt32
+
 // appendRecord appends r to stream id's buffer (already ensured, or created on demand for the
 // replica apply path), rejecting it as out-of-order when older than newest-oooWindow
 // (oooWindow > 0). It returns whether the record was accepted.
@@ -69,7 +80,7 @@ func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow, maxBytes int64
 		return rejectOOO
 	}
 
-	if maxBytes > 0 && h.bytes >= maxBytes {
+	if h.bytes >= headByteCap || (maxBytes > 0 && h.bytes >= maxBytes) {
 		return rejectBytes
 	}
 
@@ -106,7 +117,9 @@ func (h *head) replayRecords(id signal.SeriesID, recs []rec) {
 	}
 
 	for i := range recs {
-		h.appendRecord(id, recs[i], 0, 0) // replay/replica: authoritative, no admission limits
+		// Replay/replica records are authoritative: no admission limits. [headByteCap] still applies —
+		// it is a format bound, not a policy, and past it the head cannot be flushed at all.
+		h.appendRecord(id, recs[i], 0, 0)
 	}
 }
 

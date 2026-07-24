@@ -14,7 +14,9 @@ package recordengine
 // caller that retains a value past an append must copy.
 //
 // int32 offsets cap a column blob at 2 GiB, which is ample for a head buffer bounded by the flush
-// size and half the footprint of int64 offsets; a blob that would overflow simply forces a flush.
+// size and half the footprint of int64 offsets. The appending paths do not check it — the bound is
+// enforced upstream by [headByteCap], which stops the head accepting records before its buffered
+// bytes (an upper bound on any single column's blob) can reach it.
 type byteCol struct {
 	data    []byte
 	offsets []int32

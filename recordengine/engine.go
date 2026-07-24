@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,8 +63,14 @@ type Config struct {
 
 // Engine is one tenant's record store for a signal. Safe for concurrent use.
 type Engine struct {
-	cfg     Config
-	mu      sync.RWMutex
+	cfg Config
+	mu  sync.RWMutex
+	// flushMu serializes the *whole* body of a flush or merge (both mutate parts and reserve part
+	// sequences, and a flush reuses e.flushBuf off e.mu). The facade drives them from one maintenance
+	// goroutine, but the type is exported and Close/Reset are callable from anywhere, so the
+	// single-mutator invariant is enforced here rather than assumed. Always taken before e.mu, never
+	// while holding it.
+	flushMu sync.Mutex
 	head    *head
 	parts   []*part
 	nextSeq int
@@ -566,20 +573,44 @@ func (e *Engine) Flush(ctx context.Context) error {
 	return nil
 }
 
-// Reset discards all data (head + parts) and deletes this engine's part objects, returning it to
-// the empty state without reallocating. Safe for concurrent use.
+// Reset discards all data (head + parts, including the records an in-flight flush detached) and
+// deletes this engine's objects, returning it to the empty state without reallocating. It waits for
+// an in-flight flush or merge to finish first, so that operation cannot publish its part into the
+// reset engine. Objects of parts a concurrent fetch is still reading are left for the deferred
+// reclaim ([reclaimRetired], run by the next flush/merge cycle) rather than deleted underneath the
+// reader. Safe for concurrent use.
 func (e *Engine) Reset(ctx context.Context) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.flushMu.Lock() // drain an in-flight flush/merge; it would otherwise publish into the empty engine
+	defer e.flushMu.Unlock()
 
+	e.mu.Lock()
 	e.head = newHead(e.cfg.Schema)
-	e.parts = nil
-	e.retiring = nil // the List+Delete below removes their objects too
+	e.flushing = nil // discarded with the head: Reset drops the records, it does not flush them
 	e.nextSeq = 0
 
 	if e.cfg.Backend == nil {
+		e.parts, e.retiring = nil, nil
+		e.mu.Unlock()
+
 		return nil
 	}
+
+	e.retireLocked(e.parts)
+	e.parts = nil
+	e.mu.Unlock()
+
+	// Delete the drained parts' objects (and re-queue the ones still being read), then sweep whatever
+	// is left under the prefix — the index, the stream index, and any part with no live reader.
+	e.reclaimRetired(ctx)
+
+	e.mu.RLock()
+	pending := make([]string, 0, len(e.retiring))
+
+	for _, p := range e.retiring {
+		pending = append(pending, p.prefix+"/")
+	}
+
+	e.mu.RUnlock()
 
 	keys, err := e.cfg.Backend.List(ctx, e.cfg.Prefix+"/")
 	if err != nil {
@@ -587,6 +618,10 @@ func (e *Engine) Reset(ctx context.Context) error {
 	}
 
 	for _, k := range keys {
+		if slices.ContainsFunc(pending, func(p string) bool { return strings.HasPrefix(k, p) }) {
+			continue // a fetch still holds this part; reclaimRetired deletes it once the reader drains
+		}
+
 		if err := e.cfg.Backend.Delete(ctx, k); err != nil && !errors.Is(err, backend.ErrNotExist) {
 			return errors.Wrapf(err, "delete %q", k)
 		}
@@ -926,6 +961,9 @@ func (p *fetchPlan) releaseParts() {
 // metadata publish run under it. Only the background maintenance task (or Close) calls flush, so the
 // parts mutation has a single writer.
 func (e *Engine) flush(ctx context.Context) (int, error) {
+	e.flushMu.Lock()
+	defer e.flushMu.Unlock()
+
 	// Plan (under lock): detach the head's record buffers (keeping them readable via e.flushing so a
 	// concurrent fetch never loses them), snapshot the side-store delta atomically with the detach (so
 	// a concurrent append's symbols aren't lost by the Reset). Part sequences are reserved per part
