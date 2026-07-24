@@ -20,10 +20,16 @@ Read these before designing or implementing:
   for *what* to build.
 - **`DESIGN.md`** — the architecture of record: layers, package layout, the fetch contract, write/
   read paths, the milestone plan (M0–M7). The source of truth for *how* (forward-looking).
-- **`ARCHITECTURE.md`** — the architecture *as currently built* (no roadmap/TODOs). The source of
-  truth for *what exists today*. **Keep it current:** any architectural change — a new package or
-  layer, a new public type/interface, a new or changed on-disk/wire format or codec framing, a moved
-  layer boundary, or a new cross-cutting invariant — must update `ARCHITECTURE.md` in the same change.
+- **`ARCHITECTURE.md`** — the architecture *as currently built* (no roadmap/TODOs), kept **brief**:
+  the layer map, the public surface, cross-cutting invariants, and the package map. Per-package
+  detail lives in that package's own **`ARCH.md`** (`encoding/`, `backend/`, `block/`, `index/`,
+  `wal/`, `signal/`, `engine/`, `recordengine/`, `query/`, `cluster/`), linked from the root doc.
+  Together they are the source of truth for *what exists today*. **Keep them current:** any
+  architectural change — a new package or layer, a new public type/interface, a new or changed
+  on-disk/wire format or codec framing, a moved layer boundary, or a new cross-cutting invariant —
+  must update the relevant `ARCH.md` (and `ARCHITECTURE.md` when the map or an invariant changes) in
+  the same change. Document *why* and the non-obvious contracts; never restate what the source
+  already says.
 - **`ADMIN.md`** — the operator/observability surface as built: `Inspect`/`StoreStats`, `Admin`,
   `AdmissionStats`, the `Parts`/`PartsDetailed`/`Cardinality` drill-downs, and the injected `obs`
   metrics catalog + EXPLAIN ANALYZE. **Keep it current:** any change to the admin/observability surface

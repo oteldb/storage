@@ -9,5 +9,5 @@
 //     storage.Queryable, for embedders that drive the Prometheus PromQL engine. It is the
 //     only package importing github.com/prometheus/prometheus.
 //
-// See ARCHITECTURE.md for the query layer's current state.
+// See query/ARCH.md for the query layer's current state.
 package query

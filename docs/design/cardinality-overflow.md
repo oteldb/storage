@@ -2,7 +2,7 @@
 
 **Status:** proposal (design only — no code yet). For review before implementation.
 
-This designs the replacement of the hard `MaxSeries` reject (ARCHITECTURE.md §3k) with a soft
+This designs the replacement of the hard `MaxSeries` reject (`ARCHITECTURE.md`, "Admission control") with a soft
 budget that, once exceeded, **routes new series into a synthetic overflow series** rather than
 dropping them — keeping a tenant queryable and its aggregates approximately correct under a
 cardinality spike.
@@ -22,8 +22,9 @@ The roadmap entry (`docs/design/improvement-roadmap.md` §3a) assumed a Promethe
 
 2. **Overflow identity can't be built in the head.** Routing overflow to a per-metric
    `{__name__, __overflow__="true"}` series needs `__name__` — a **metric** concept. The head and
-   `recordengine` are deliberately signal-agnostic (ARCHITECTURE.md §5: "storage-layer code must not
-   learn a signal's concepts"). So the overflow *identity* must be supplied by the caller via a
+   `recordengine` are deliberately signal-agnostic (`ARCHITECTURE.md`, "Cross-cutting invariants":
+   "Storage never learns a language's or signal's concepts"). So the overflow *identity* must be
+   supplied by the caller via a
    callback; the head only decides *when* to overflow and appends to the id the caller hands it.
 
 ## Proposed design
@@ -120,5 +121,5 @@ model (a future item).
 `tenant/tenant.go` (soft limit), `engine/admission.go` (AppendLimits + AppendResult fields),
 `engine/head.go` (appendByID overflow branch + effective-id return), `engine/engine.go`
 (AppendBatch/Append WAL-id threading), `admission.go` + `storage.go` (facade remapper + accounting),
-`internal/obs` (overflowed counter), `inspect.go` (surface it). Plus tests + an ARCHITECTURE.md §3k
-update.
+`internal/obs` (overflowed counter), `inspect.go` (surface it). Plus tests + an `ARCHITECTURE.md`
+("Admission control") update.

@@ -3,7 +3,7 @@
 **Status:** proposal (design only — no code yet). For review before implementation.
 
 Today `Config.ShardsPerTenant` (per-series sharding across the ring) is **metrics-only**
-(ARCHITECTURE.md §3i). Logs/traces/profiles pin a whole tenant to one owner set
+(`cluster/ARCH.md`, "Sharding"). Logs/traces/profiles pin a whole tenant to one owner set
 (`Ring().Primary(tenant)`), so one large record tenant cannot scale out. This generalizes the
 existing shard-key machinery to the record signals.
 
@@ -69,4 +69,4 @@ existing shard-key machinery to the record signals.
 `cluster.go` (`writeRecordsClustered` grouping, `clusterRecordFetcherFor`, `recordOwners` →
 per-shard, `clusterProfileSymbols`/`clusterSeries`/`clusterKeys` cross-shard), `records_facade.go`,
 `traces.go` (`Trace` cross-shard), `profiles.go` (`ProfileResolver` cross-shard), plus tests and an
-ARCHITECTURE.md §3i/§3j update.
+update to `cluster/ARCH.md` + `recordengine/ARCH.md`.
