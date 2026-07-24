@@ -1006,7 +1006,8 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 
 	// Build (lock-free): lay out the detached buffers as part columns, write the part (columns +
 	// blooms + record-key footer), read it back, and write the side-store sidecars. These are the
-	// large I/Os that previously blocked the whole engine. The detached buffers are immutable here.
+	// large I/Os that previously blocked the whole engine. The detached buffers must be treated as
+	// read-only here: a concurrent fetch still reads them through e.flushing until the part publishes.
 	f := buildFlushColumns(e.cfg.Schema, detached, e.flushBuf)
 	e.flushBuf = f // reused by the next flush; only this single flusher touches it
 	rows := len(f.stream)

@@ -35,8 +35,11 @@ boundary, pooled across recycled fetches.
 
 Flush is a **pass-through**: `block.Column` accepts the blob+offsets form directly, encoded
 byte-identically to the per-row form, so writing a part never materializes a view per row. The
-per-stream ts sort permutes byte columns through **one scratch column** shared across every column
-and stream; an already-ordered stream skips the permute entirely.
+per-stream ts ordering is applied **at copy time**: the flush computes each stream's ts permutation
+and gathers rows into the flush buffer through it, never sorting the source. That is a correctness
+requirement, not a preference — the detached buffers stay fetchable through `e.flushing` while the
+part is written off the lock, so a concurrent fetch is reading them (§ Flush failure). An
+already-ordered stream — the common case — computes no permutation at all.
 
 ## Flush failure
 

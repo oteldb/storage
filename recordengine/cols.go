@@ -1,8 +1,9 @@
 package recordengine
 
 import (
+	"cmp"
 	"math"
-	"sort"
+	"slices"
 
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -319,27 +320,35 @@ func cloneBytes(b []byte) []byte {
 	return out
 }
 
-// sortByTs reorders every selected column by ascending timestamp (stable). Records arrive
-// part-ordered and a part's rows are ts-sorted, so the accumulated window is very often already
-// ordered — an O(n) check skips the O(n log n) sort and its permute allocations.
-func (c *recordCols) sortByTs() { c.sortByTsWith(nil) }
-
-// sortByTsWith is [recordCols.sortByTs] with a caller-owned scratch column. A variable-width byte
-// column cannot be permuted in place, so each needs a destination array; swapping the permuted
-// result with the column's old array hands that array on as the next column's destination, so a
-// whole flush allocates one buffer instead of one per byte column per unsorted stream. A nil scratch
-// allocates a fresh destination per column (the metric/merge callers, which sort one accumulator).
-func (c *recordCols) sortByTsWith(scratch *byteCol) {
+// tsOrder returns c's rows in stable ascending-timestamp order, appended to dst (reusing its
+// capacity), or nil when c is already ordered — callers then read rows in their natural order.
+// Records arrive part-ordered and a part's rows are ts-sorted, so the accumulated window is very
+// often already ordered, and the O(n) check skips the O(n log n) sort and its allocation.
+//
+// It only reads c, so a buffer that a concurrent reader may still hold (the head buffers a flush has
+// detached) can be gathered in ts order without being mutated.
+func (c *recordCols) tsOrder(dst []int) []int {
 	if c.isSortedByTs() {
-		return
+		return nil
 	}
 
-	idx := make([]int, c.len())
+	idx := slices.Grow(dst, c.len())[:c.len()]
 	for i := range idx {
 		idx[i] = i
 	}
 
-	sort.SliceStable(idx, func(a, b int) bool { return c.ts[idx[a]] < c.ts[idx[b]] })
+	slices.SortStableFunc(idx, func(a, b int) int { return cmp.Compare(c.ts[a], c.ts[b]) })
+
+	return idx
+}
+
+// sortByTs reorders every selected column by ascending timestamp (stable), in place. Only for
+// buffers the caller exclusively owns — see [recordCols.tsOrder] for the read-only alternative.
+func (c *recordCols) sortByTs() {
+	idx := c.tsOrder(nil)
+	if idx == nil {
+		return
+	}
 
 	c.ts = permute(c.ts, idx)
 	for k := range c.ints {
@@ -349,18 +358,9 @@ func (c *recordCols) sortByTsWith(scratch *byteCol) {
 	}
 
 	for k := range c.bytes {
-		if !c.sel.bytes[k] {
-			continue
-		}
-
-		if scratch == nil {
+		if c.sel.bytes[k] {
 			c.bytes[k] = permuteBytes(&c.bytes[k], idx)
-
-			continue
 		}
-
-		permuteBytesInto(scratch, &c.bytes[k], idx)
-		c.bytes[k], *scratch = *scratch, c.bytes[k]
 	}
 }
 

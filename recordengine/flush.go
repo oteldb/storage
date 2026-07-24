@@ -19,9 +19,9 @@ import (
 type flushColumns struct {
 	stream []chunk.U128
 	cols   *recordCols // full column set (every schema column)
-	// sortScratch is the reusable permutation destination shared by every stream's ts sort — see
-	// [recordCols.sortByTsWith]. It rides the flush buffer because it has the same lifetime.
-	sortScratch byteCol
+	// sortIdx is the reusable row-order buffer shared by every stream's ts gather — see
+	// [recordCols.tsOrder]. It rides the flush buffer because it has the same lifetime.
+	sortIdx []int
 }
 
 func (f *flushColumns) len() int { return len(f.stream) }
@@ -158,7 +158,10 @@ func (h *head) reattach(detached map[signal.SeriesID]*recordCols, bytes int64) {
 }
 
 // buildFlushColumns lays the detached record buffers out as part columns sorted by (stream, ts). It
-// reads the (now immutable) detached buffers off the engine lock.
+// runs off the engine lock and must therefore only *read* the detached buffers: the engine keeps
+// them fetchable until the part is published, so a concurrent fetch is reading the very same
+// buffers. Ordering is applied at copy time — rows are gathered into the flush buffer through each
+// stream's ts permutation ([recordCols.tsOrder]) instead of the source being sorted in place.
 func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols, reuse *flushColumns) *flushColumns {
 	ids := make([]signal.SeriesID, 0, len(records))
 	for id, buf := range records {
@@ -167,7 +170,7 @@ func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols, 
 		}
 	}
 
-	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
+	slices.SortFunc(ids, signal.SeriesID.Compare)
 
 	f := reuse
 	if f == nil {
@@ -179,12 +182,23 @@ func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols, 
 
 	for _, id := range ids {
 		buf := records[id]
-		buf.sortByTsWith(&f.sortScratch) // order each stream's records by ts so the part is (stream, ts)-sorted
-
 		u := idToU128(id)
+
+		// Gather each stream's records in ts order so the part is (stream, ts)-sorted. A nil order
+		// means the buffer is already ascending, the common case.
+		order := buf.tsOrder(f.sortIdx[:0])
+		if order != nil {
+			f.sortIdx = order
+		}
+
 		for i := range buf.ts {
+			row := i
+			if order != nil {
+				row = order[i]
+			}
+
 			f.stream = append(f.stream, u)
-			f.cols.appendRow(buf, i)
+			f.cols.appendRow(buf, row)
 		}
 	}
 
