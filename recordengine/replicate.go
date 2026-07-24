@@ -32,7 +32,7 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 			// The primary is the shard's single authority, so it makes the cardinality decision
 			// here: a new stream that would exceed MaxSeries is shed (its records are counted as
 			// cardinality rejections in OnRecords below).
-			if _, ok := e.head.ensureStream(id, func() signal.Series { return s }, limits.MaxSeries); !ok {
+			if ok := e.head.ensureStream(id, func() signal.Series { return s }, limits.MaxSeries); !ok {
 				overCard[id] = struct{}{}
 			}
 

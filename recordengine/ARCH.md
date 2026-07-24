@@ -133,3 +133,11 @@ The WAL frame is signal-agnostic (an opaque engine-encoded payload) plus an opti
 `recordengine` owns the codec and `EncodeWAL` (the cluster write form, which appends the side frame
 so the profile symbol store replicates). `ApplyPrimary`/`ApplyReplicated` mirror the metric engine's
 primary-authoritative contract.
+
+A stream's identity frame is logged when the head **registers** the stream, not when it first has an
+accepted record: a stream is new exactly once, and replay drops records it cannot attribute to a
+registered stream — so a first batch rejected in full (OOO window, in-flight bytes) would otherwise
+strand every later record of that stream. The identity is written before the head commits the
+registration (`head.admitStream` decides, `head.ensureStream` commits), so a failed write never
+leaves a registered stream claiming a durability it does not have. An identity frame for a stream
+that never gets rows is cheap and harmless.
