@@ -59,22 +59,33 @@ func (c *recordCols) rowMatches(i int, conds []fetch.Condition) bool {
 	return true
 }
 
-// filterInPlace compacts the columns to keep only the rows satisfying all conditions (AND), reusing
-// the backing arrays — no new allocation (a select-all filter is a no-op). It collects the surviving
-// row indices into the reusable rowScratch, then gathers every selected column to them.
-func (c *recordCols) filterInPlace(conds []fetch.Condition) {
+// filterPrefix compacts the columns to keep the first n rows satisfying all conditions (AND) plus
+// every row at or after n unconditionally, reusing the backing arrays — no new allocation (a
+// select-all filter is a no-op). It collects the surviving row indices into the reusable rowScratch,
+// then gathers every selected column to them.
+//
+// The prefix bound exists because the filtered fetch path evaluates the conditions during the part
+// scan (fetchlazy.go): only the head/flushing-seeded prefix an accumulator was planned with still
+// needs them applied. Pass len(c.ts) to filter every row.
+func (c *recordCols) filterPrefix(conds []fetch.Condition, n int) {
 	idx := c.rowScratch[:0]
-	for i := range c.ts {
+	for i := range n {
 		if c.rowMatches(i, conds) {
 			idx = append(idx, i)
 		}
 	}
 
-	c.rowScratch = idx
-	if len(idx) == len(c.ts) {
-		return // every row survived — nothing to compact
+	if len(idx) == n {
+		c.rowScratch = idx
+
+		return // the whole prefix survived, and the rest is kept as-is — nothing to compact
 	}
 
+	for i := n; i < len(c.ts); i++ {
+		idx = append(idx, i)
+	}
+
+	c.rowScratch = idx
 	c.gatherRows(idx)
 }
 

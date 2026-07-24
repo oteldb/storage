@@ -110,7 +110,7 @@ type recordCols struct {
 	tsMin, tsMax  int64
 
 	// rowScratch is a reusable kept-row index buffer for the in-place row compactions
-	// (filterInPlace / trimBelow), so they stay allocation-free in a steady loop.
+	// (filterPrefix / trimBelow), so they stay allocation-free in a steady loop.
 	rowScratch []int
 	// viewBufs memoizes the per-byte-column [][]byte view slices materialized at the
 	// [fetch.NamedColumn] boundary, reused across fetches when the accumulator is pooled.

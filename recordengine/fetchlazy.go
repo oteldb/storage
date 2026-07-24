@@ -11,12 +11,13 @@ import (
 )
 
 // The filtered fetch path (AllConditions with conditions) reads a part in two phases so a
-// high-selectivity lookup (e.g. trace-by-id) never materializes the projected byte columns for rows
-// it will discard. Phase 1 decodes only the timestamp, the int columns, and the *condition* byte
-// columns (as lazy [chunk.DictColumn]s, whose per-row At is O(1) and copies nothing) and scans for
-// matching rows; a part with no match (a bloom false positive) is dropped without touching its
-// projected byte columns at all. Phase 2 decodes the remaining projected byte columns and gathers
-// only the matched rows' cells into the per-stream accumulators.
+// high-selectivity lookup (e.g. trace-by-id) never materializes the projected columns for rows it
+// will discard. Phase 1 decodes only the timestamp and the *condition* columns (byte columns as lazy
+// [chunk.DictColumn]s, whose per-row At is O(1) and copies nothing) and records the matching rows; a
+// part with no match (a bloom false positive) is dropped without touching its projected columns at
+// all. Phase 2 decodes the remaining projected columns and gathers the rows phase 1 recorded into
+// the per-stream accumulators — the conditions are evaluated exactly once per row (see fetcheval.go
+// for how each condition is compiled and how often its predicate actually runs).
 //
 // This complements the unfiltered path ([fetchPlan.readParts]), which bulk-decodes every selected
 // column because a pure matcher fetch returns whole per-stream ranges.
@@ -38,10 +39,10 @@ type lazyCols struct {
 	rawBlob []rawBytesCol
 
 	// eqMask holds, per condition (parallel to the request's conds), a precomputed whole-column
-	// equality bitmap (rowMatches[i] == 1 if and only if row i matches) from a [simd.EqualFixed16]
-	// scan — the fast path [eqFastPathCols] selects when a condition is an exact match against a
+	// equality bitmap (entry i is 1 if and only if row i matches) from a [simd.EqualFixed16] scan —
+	// the fast path [eqFastPathCols] selects when a condition is an exact match against a
 	// [chunk.CodecBytesRaw] column with no other condition targeting it. nil, or a nil entry, means
-	// that condition falls back to the normal colValue+Match per-row check.
+	// that condition compiles to one of the other [evalKind]s instead.
 	eqMask [][]byte
 }
 
@@ -109,7 +110,7 @@ func conditionSel(s *Schema, conds []fetch.Condition) colSel {
 // (every column, trace_id included, is selected), which is exactly the common case this optimizes.
 //
 // Precondition this relies on: a fast-pathed condition's [fetch.Condition.Match] is never called —
-// [lazyCols.rowMatches] takes the precomputed [lazyCols.eqMask] bit instead. [fetch.Condition]'s own
+// it compiles to [evalEqMask], which reads the precomputed [lazyCols.eqMask] bit instead. [fetch.Condition]'s own
 // contract says Equal is only ever a prune *hint* ("the engine always re-checks Match per row, so a
 // hint only ever skips work, never changes results"); this function's caller must only set Equal
 // when it is byte-identical to Match for every row of this column (true of every current caller —
@@ -168,9 +169,11 @@ func (p *part) rawBytesBlob(ctx context.Context, name string) (blob []byte, widt
 	return blob, width, true, nil
 }
 
-// readLazyConds decodes phase 1: the timestamp, every selected int column, and the condition byte
-// columns (condSel). getI64 supplies pooled int scratch (recycled by [Engine.recycleLazyInts]).
-func (p *part) readLazyConds(ctx context.Context, sel, condSel colSel, conds []fetch.Condition, getI64 func() []int64) (*lazyCols, error) {
+// readLazyConds decodes phase 1: the timestamp plus the columns the conditions read (condSel) and
+// nothing else — a projected column the conditions don't touch waits for [part.decodeProjected], so a
+// part that turns out to be a bloom false positive is dropped having decoded only what it took to
+// find that out. getI64 supplies pooled int scratch (recycled by [Engine.recycleLazyInts]).
+func (p *part) readLazyConds(ctx context.Context, condSel colSel, conds []fetch.Condition, getI64 func() []int64) (*lazyCols, error) {
 	lz := &lazyCols{
 		schema:  p.schema,
 		ints:    make([][]int64, p.schema.numInts()),
@@ -181,22 +184,14 @@ func (p *part) readLazyConds(ctx context.Context, sel, condSel colSel, conds []f
 		lz.eqMask = make([][]byte, len(conds))
 	}
 
-	dst := func() []int64 {
-		if getI64 != nil {
-			return getI64()
-		}
-
-		return nil
-	}
-
 	var err error
-	if lz.ts, err = p.readInt64(ctx, colTs, dst()); err != nil {
+	if lz.ts, err = p.readInt64(ctx, colTs, i64Scratch(getI64)); err != nil {
 		return nil, err
 	}
 
 	for k := range lz.ints {
-		if sel.ints[k] {
-			if lz.ints[k], err = p.readInt64(ctx, p.schema.intColumn(k).Name, dst()); err != nil {
+		if condSel.ints[k] {
+			if lz.ints[k], err = p.readInt64(ctx, p.schema.intColumn(k).Name, i64Scratch(getI64)); err != nil {
 				return nil, err
 			}
 		}
@@ -240,9 +235,29 @@ func (p *part) readLazyConds(ctx context.Context, sel, condSel colSel, conds []f
 	return lz, nil
 }
 
-// decodeProjected decodes phase 2: the selected byte columns not already decoded in phase 1. Called
-// only when the part holds at least one matching row.
-func (p *part) decodeProjected(ctx context.Context, lz *lazyCols, sel, condSel colSel) error {
+// i64Scratch returns a pooled int64 buffer, or nil when the caller supplied no pool.
+func i64Scratch(getI64 func() []int64) []int64 {
+	if getI64 == nil {
+		return nil
+	}
+
+	return getI64()
+}
+
+// decodeProjected decodes phase 2: the selected columns not already decoded in phase 1. Called only
+// when the part holds at least one matching row.
+func (p *part) decodeProjected(ctx context.Context, lz *lazyCols, sel, condSel colSel, getI64 func() []int64) error {
+	for k := range lz.ints {
+		if sel.ints[k] && !condSel.ints[k] {
+			col, err := p.readInt64(ctx, p.schema.intColumn(k).Name, i64Scratch(getI64))
+			if err != nil {
+				return err
+			}
+
+			lz.ints[k] = col
+		}
+	}
+
 	for k := range lz.bytes {
 		if sel.bytes[k] && !condSel.bytes[k] && lz.bytes[k] == nil {
 			dc, err := p.readDict(ctx, p.schema.byteColumn(k).Name)
@@ -300,33 +315,6 @@ func (lz *lazyCols) colValue(i int, name string) (signal.Value, bool) {
 	return v, true
 }
 
-// rowMatches reports whether row i satisfies every condition (logical AND). A condition with a
-// precomputed [lazyCols.eqMask] entry (see [eqFastPathCols]) reads its row's bit instead of going
-// through colValue+Match. Absent columns follow [recordCols.rowMatches]: the predicate is offered
-// [signal.EmptyValue] rather than short-circuited to a non-match.
-func (lz *lazyCols) rowMatches(i int, conds []fetch.Condition) bool {
-	for j := range conds {
-		if len(lz.eqMask) != 0 && lz.eqMask[j] != nil {
-			if lz.eqMask[j][i] == 0 {
-				return false
-			}
-
-			continue
-		}
-
-		v, ok := lz.colValue(i, conds[j].Column)
-		if !ok {
-			v = signal.EmptyValue()
-		}
-
-		if !conds[j].Match(v) {
-			return false
-		}
-	}
-
-	return true
-}
-
 // appendLazyRow appends row i of lz's selected columns (ts always) to c, copying byte cells (via
 // [chunk.DictColumn.At], or the flat blob directly for an [eqFastPathCols] column) into c's blob
 // so they no longer alias the part.
@@ -355,23 +343,23 @@ func (c *recordCols) appendLazyRow(lz *lazyCols, i int) {
 }
 
 // readPartsLazy is the two-phase filtered part scan (see file doc). It appends only matching,
-// in-window rows to the per-stream accumulators; the caller's post-scan filterInPlace re-applies the
-// conditions to the head-seeded rows (part rows already pass, so it only compacts).
+// in-window rows to the per-stream accumulators; the caller's post-scan [recordCols.filterPrefix]
+// applies the conditions to the head-seeded prefix only (part rows already pass by construction).
 func (p *fetchPlan) readPartsLazy(ctx context.Context) error {
 	for _, part := range p.liveParts {
-		lz, err := part.readLazyConds(ctx, p.sel, p.condSel, p.conds, p.e.getI64)
+		lz, err := part.readLazyConds(ctx, p.condSel, p.conds, p.e.getI64)
 		if err != nil {
 			return err
 		}
 
 		// Phase 1: a non-matching part (a bloom false positive) never decodes its projected columns.
-		if p.partHasMatch(part, lz) {
-			// Phase 2: decode the projected byte columns and gather only the matched rows.
-			if err := part.decodeProjected(ctx, lz, p.sel, p.condSel); err != nil {
+		if p.scanMatches(part, lz) {
+			// Phase 2: decode the projected columns and gather the rows phase 1 recorded.
+			if err := part.decodeProjected(ctx, lz, p.sel, p.condSel, p.e.getI64); err != nil {
 				return err
 			}
 
-			p.gatherMatches(part, lz)
+			p.gatherHits(lz)
 		}
 
 		p.e.recycleLazyInts(lz)
@@ -401,9 +389,21 @@ func tsWindow(ts []int64, rng rowRange, start, end int64) rowRange {
 	return rowRange{start: rng.start + lo, end: rng.start + hi}
 }
 
-// partHasMatch reports whether any requested stream holds an in-window matching row, short-circuiting
-// on the first hit so a matching part decodes its projected columns exactly once.
-func (p *fetchPlan) partHasMatch(part *part, lz *lazyCols) bool {
+// hitRun is one stream's slice of a part's phase-1 match list: p.hits[lo:hi] are the matching row
+// indices belonging to id, in ascending order.
+type hitRun struct {
+	id     signal.SeriesID
+	lo, hi int
+}
+
+// scanMatches is phase 1: it records every requested stream's matching, in-window rows in p.hits (as
+// one contiguous run per stream, p.hitRuns) and reports whether the part holds any. Recording the
+// matches instead of a boolean is what lets phase 2 gather them without re-running the conditions —
+// a match used to be evaluated twice, once here and once in the gather.
+func (p *fetchPlan) scanMatches(part *part, lz *lazyCols) bool {
+	evals := p.compileConds(lz)
+	p.hits, p.hitRuns = p.hits[:0], p.hitRuns[:0]
+
 	for _, id := range p.ids {
 		rng, ok := part.ranges[id]
 		if !ok {
@@ -411,30 +411,29 @@ func (p *fetchPlan) partHasMatch(part *part, lz *lazyCols) bool {
 		}
 
 		w := tsWindow(lz.ts, rng, p.start, p.end)
+		lo := len(p.hits)
+
 		for i := w.start; i < w.end; i++ {
-			if lz.rowMatches(i, p.conds) {
-				return true
+			if evalMatches(lz, evals, i) {
+				p.hits = append(p.hits, i)
 			}
+		}
+
+		if len(p.hits) > lo {
+			p.hitRuns = append(p.hitRuns, hitRun{id: id, lo: lo, hi: len(p.hits)})
 		}
 	}
 
-	return false
+	return len(p.hits) > 0
 }
 
-// gatherMatches appends every requested stream's matching, in-window rows to its accumulator.
-func (p *fetchPlan) gatherMatches(part *part, lz *lazyCols) {
-	for _, id := range p.ids {
-		rng, ok := part.ranges[id]
-		if !ok {
-			continue
-		}
-
-		w := tsWindow(lz.ts, rng, p.start, p.end)
-		acc := p.accs[id]
-		for i := w.start; i < w.end; i++ {
-			if lz.rowMatches(i, p.conds) {
-				acc.appendLazyRow(lz, i)
-			}
+// gatherHits is phase 2: it appends the rows [fetchPlan.scanMatches] recorded to their streams'
+// accumulators, now that the projected columns are decoded.
+func (p *fetchPlan) gatherHits(lz *lazyCols) {
+	for _, run := range p.hitRuns {
+		acc := p.accs[run.id]
+		for _, i := range p.hits[run.lo:run.hi] {
+			acc.appendLazyRow(lz, i)
 		}
 	}
 }
