@@ -37,7 +37,30 @@ is used only when the engine reports a new series. This is what makes ingest ~ze
 ## `log`
 
 Schema: `observed`/`severity`/`flags`/`dropped` (int) + `severity_text`/`body`(FullText)/
-`trace_id`(Equality)/`span_id`/`attrs`(Attrs) (bytes).
+`trace_id`(Equality)/`span_id`/`attrs`(Attrs)/`resource`(Attrs) (bytes).
+
+**Stream identity is a per-tenant policy** (`tenant.Streams`, resolved through the existing
+`tenant.Resolver`). Only the resource attributes named by `Streams.Fields` (default
+`tenant.DefaultStreamFields`: `service.name`/`service.namespace` + `k8s.namespace.name`/
+`k8s.node.name`/`k8s.deployment.name`/`k8s.pod.name`) are hashed into the stream id; `AllFields`
+restores hashing every attribute. High-churn attributes (`service.instance.id`, `k8s.pod.uid`,
+start timestamps) therefore stop minting a stream per process restart — their cost is per-stream,
+not per-row (postings resolution, one accumulator and one `part.ranges[id]` lookup per id per part).
+The set must be **static per tenant**: identity derived from observed cardinality would give one
+logical stream different ids over time, and written parts cannot be re-keyed.
+
+Every resource attribute is stored on every record in the `resource` column, identity-bearing ones
+included — a stream field is both hashed *and* stored. Excluding a key therefore changes only how it
+is indexed: `log.Resource(stream, blob)` reassembles the complete OTLP resource on read, and a
+condition on any key answers correctly whether or not it is in the stream key. That duplication is
+what makes the field set **editable** — after a change, old parts keep their ids and a condition
+still answers across the boundary. The storage cost is near zero: record parts sort by `(stream, ts)`
+and the column is `CodecDict`, so a part holds roughly one entry per stream.
+
+`log.Project(ld, fields, emit)` takes a `StreamFields` classifier, called once per stream immediately
+before its `emit`. `Batch.Identity` carries the narrowed identity (what the index and WAL store) and
+`Batch.Route` the full one, so `Batch.RoutingIdentity()` still derives the tenant from every resource
+attribute.
 
 ## `trace`
 

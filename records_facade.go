@@ -114,7 +114,7 @@ func (s *Storage) writeRecordsLocal(
 			return
 		}
 
-		id := b.Identity()
+		id := b.RoutingIdentity()
 		tid := s.tenantFor(id.Resource, id.Scope)
 		if lastEng == nil || tid != lastTenant {
 			eng, err := engineFor(tid)
@@ -188,7 +188,7 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 	)
 
 	emitted := project(func(b *recordengine.Batch) {
-		id := b.Identity()
+		id := b.RoutingIdentity()
 		tid := s.normalizeTenant(s.tenantFor(id.Resource, id.Scope))
 		if !haveTenant || tid != lastTenant {
 			lastTenant, haveTenant = tid, true

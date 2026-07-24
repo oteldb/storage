@@ -70,7 +70,8 @@ engines over the fetch seam (`query/fetch`).
 - **Operator surface** — `Inspect`, `Admin`, `Parts`/`PartsDetailed`/`Cardinality`,
   `AdmissionStats`. See `ADMIN.md`.
 - **Policy** — `tenant.Policy` (limits, retention, downsample, sampling, recompress,
-  precision, durability/EC) resolved per tenant id through a consumer-supplied `Resolver`.
+  precision, durability/EC, log-stream fields) resolved per tenant id through a
+  consumer-supplied `Resolver`.
 
 ### Admission control (`admission.go`, `engine/admission.go`)
 

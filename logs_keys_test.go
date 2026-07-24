@@ -65,8 +65,8 @@ func TestFacadeLogKeys(t *testing.T) {
 	require.NoError(t, err)
 
 	got := logKeyScopes(keys)
-	assert.Equal(t, KeyScopeResource, got["service.name"], "resource attribute (a stream label)")
-	assert.Equal(t, KeyScopeScope, got["otel.scope.name"], "scope name is a stream label")
+	assert.Equal(t, KeyScopeResource|KeyScopeIndexed, got["service.name"], "identifying resource attribute")
+	assert.Equal(t, KeyScopeScope|KeyScopeIndexed, got["otel.scope.name"], "scope name is a stream label")
 	assert.Equal(t, KeyScopeRecord, got["http.method"], "record attribute — invisible to LogSeries")
 	assert.Equal(t, KeyScopeRecord, got["http.status_code"])
 }
