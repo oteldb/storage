@@ -38,6 +38,15 @@ byte-identically to the per-row form, so writing a part never materializes a vie
 per-stream ts sort permutes byte columns through **one scratch column** shared across every column
 and stream; an already-ordered stream skips the permute entirely.
 
+## Flush failure
+
+A flush detaches the head, then writes the part off the lock — so every step after the detach must be
+**undoable**. Any error before the publish folds the detached buffers back into the head (merging with
+whatever arrived meanwhile) and restores the side-store snapshot via `SideStore.Restore`, then clears
+`e.flushing`. Nothing else holds those records: the part was never published, and the WAL checkpoint
+only runs on a successful publish, so without the fold-back the rows would be lost the moment the next
+flush overwrote the in-flight buffer.
+
 ## Fetch
 
 Heavily tuned around decoding as little as possible:
@@ -81,8 +90,8 @@ Conditions over a non-fixed column are per-record **attributes**, resolved by th
 - `sym-{name}.bin` (`OTSP`) — the optional **side store**: a content-addressed auxiliary store a
   signal attaches per batch (`Batch.Side`) that rides the part lifecycle — absorbed into a live
   accumulator, written as sidecars on flush, **unioned** on merge (content addressing makes the
-  union a plain dedup with no id remap). Profiles' symbol store is the first user; nil for
-  logs/traces.
+  union a plain dedup with no id remap), and **restored** into the accumulator when a flush fails.
+  Profiles' symbol store is the first user; nil for logs/traces.
 
 ## WAL & cluster
 

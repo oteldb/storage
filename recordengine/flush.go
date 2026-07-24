@@ -100,11 +100,12 @@ func (f *flushColumns) slice(lo, hi int) *flushColumns {
 }
 
 // detach moves the head's record buffers aside for a flush and installs fresh empty buffers, so new
-// appends are unaffected, returning the detached buffers (nil if no stream holds a record). The stream
-// index is retained — identities outlive a flush. The caller (the engine) keeps the detached buffers
-// readable until the flushed part is published, so a concurrent fetch never loses sight of the records
-// mid-flush.
-func (h *head) detach() map[signal.SeriesID]*recordCols {
+// appends are unaffected, returning the detached buffers (nil if no stream holds a record) and the
+// buffered byte count they carried. The stream index is retained — identities outlive a flush. The
+// caller (the engine) keeps the detached buffers readable until the flushed part is published, so a
+// concurrent fetch never loses sight of the records mid-flush; on a failed flush it hands them back
+// via [head.reattach].
+func (h *head) detach() (map[signal.SeriesID]*recordCols, int64) {
 	hasRows := false
 	for _, buf := range h.records {
 		if buf.len() > 0 {
@@ -115,14 +116,35 @@ func (h *head) detach() map[signal.SeriesID]*recordCols {
 	}
 
 	if !hasRows {
-		return nil
+		return nil, 0
 	}
 
-	detached := h.records
+	detached, bytes := h.records, h.bytes
 	h.records = make(map[signal.SeriesID]*recordCols)
 	h.bytes = 0
 
-	return detached
+	return detached, bytes
+}
+
+// reattach folds buffers detached by a failed flush back into the head, so the records are retried by
+// the next flush instead of being dropped: the part was never published, so nothing else holds them.
+// Rows appended while the flush was in flight are concatenated after the detached ones (a flush sorts
+// by (stream, ts) anyway, so arrival order across the two carries no meaning). bytes is the count
+// [head.detach] took away.
+func (h *head) reattach(detached map[signal.SeriesID]*recordCols, bytes int64) {
+	for id, buf := range detached {
+		if buf.len() == 0 {
+			continue
+		}
+
+		if live := h.records[id]; live != nil && live.len() > 0 {
+			buf.appendRange(live, 0, live.len())
+		}
+
+		h.records[id] = buf
+	}
+
+	h.bytes += bytes
 }
 
 // buildFlushColumns lays the detached record buffers out as part columns sorted by (stream, ts). It

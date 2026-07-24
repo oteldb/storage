@@ -930,7 +930,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	// concurrent fetch never loses them), snapshot the side-store delta atomically with the detach (so
 	// a concurrent append's symbols aren't lost by the Reset), and reserve the part sequence.
 	e.mu.Lock()
-	detached := e.head.detach()
+	detached, detachedBytes := e.head.detach()
 	if detached == nil {
 		e.mu.Unlock()
 		e.reclaimRetired(ctx) // nothing to flush, but still sweep pending deletions
@@ -975,12 +975,12 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		// Flush writes columns codec-only (no block compression) to keep ingest cheap; the cold merge
 		// recompresses. See [Config.MergeCompression].
 		if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, sub, compress.AlgorithmNone, 0); err != nil {
-			return 0, err
+			return 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
 		}
 
 		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix)
 		if err != nil {
-			return 0, err
+			return 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
 		}
 
 		p.minTime, p.maxTime = colsTimeRange(sub)
@@ -989,7 +989,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		// by id, so every part a split produces must resolve them on its own.
 		if side != nil {
 			if err := writeSidecars(ctx, e.cfg.Backend, prefix, side); err != nil {
-				return rows, err
+				return 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
 			}
 		}
 
@@ -1020,6 +1020,37 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	e.reclaimRetired(ctx)
 
 	return rows, nil
+}
+
+// abortFlush undoes the plan phase of a flush that failed before publishing a part: the detached
+// buffers are folded back into the head and the side-store snapshot restored into the live
+// accumulator, so the records are retried by the next flush instead of being stranded in e.flushing
+// (which the next flush overwrites). It returns cause, so callers can `return e.abortFlush(…, err)`.
+func (e *Engine) abortFlush(
+	ctx context.Context,
+	detached map[signal.SeriesID]*recordCols,
+	bytes int64,
+	side map[string][]byte,
+	cause error,
+) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.head.reattach(detached, bytes)
+	e.flushing = nil
+
+	if side != nil && e.cfg.SideStore != nil {
+		if err := e.cfg.SideStore.Restore(side); err != nil {
+			// The rows are back in the head but their side data is not: report it rather than let the
+			// next flush write a part whose sidecars are missing entries the records reference.
+			zctx.From(ctx).Error("restore side store after failed flush",
+				zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix), zap.Error(err))
+
+			return errors.Wrapf(err, "restore side store after failed flush (%v)", cause)
+		}
+	}
+
+	return cause
 }
 
 // publishLocked persists the engine's part set (bucket index + stream identity index) and, for a

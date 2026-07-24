@@ -351,6 +351,22 @@ func (s *SymbolStore) Encode() map[string][]byte {
 // Reset clears the accumulator.
 func (s *SymbolStore) Reset() { s.acc = newSymTables() }
 
+// Restore merges an [SymbolStore.Encode] snapshot back into the accumulator (after a failed flush).
+func (s *SymbolStore) Restore(snapshot map[string][]byte) error {
+	for i, name := range tableNames {
+		data, ok := snapshot[name]
+		if !ok {
+			continue
+		}
+
+		if err := decodeTable(s.acc.t[i], data); err != nil {
+			return errors.Wrapf(err, "restore table %q", name)
+		}
+	}
+
+	return nil
+}
+
 // Names returns the sidecar table names.
 func (s *SymbolStore) Names() []string { return tableNames }
 
