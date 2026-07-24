@@ -43,18 +43,28 @@ func newHead(schema *Schema) *head {
 	}
 }
 
+// admitStream reports whether the head has yet to see the stream (isNew) and whether registering it
+// is allowed: a new stream is refused when minting it would exceed the cardinality cap. Existing
+// streams are never blocked, so a query keeps returning what is already admitted. It does not
+// mutate, so a caller can make the stream's identity durable before [head.ensureStream] commits it.
+func (h *head) admitStream(id signal.SeriesID, maxSeries int64) (isNew, ok bool) {
+	if h.series.Has(id) {
+		return false, true
+	}
+
+	return true, maxSeries <= 0 || int64(h.series.Len()) < maxSeries
+}
+
 // ensureStream registers and indexes the stream on first sight and makes sure its (full-column)
 // record buffer exists. materialize is called only when the stream identity is newly seen. It
-// returns whether the identity was newly registered (so the caller logs a stream record to the WAL).
-func (h *head) ensureStream(id signal.SeriesID, materialize func() signal.Series, maxSeries int64) (isNew, ok bool) {
-	if !h.series.Has(id) {
-		// A new stream: reject it if minting it would exceed the cardinality cap. Existing streams
-		// are never blocked, so a query keeps returning what is already admitted.
-		if maxSeries > 0 && int64(h.series.Len()) >= maxSeries {
-			return false, false
-		}
+// returns whether the stream is admitted, i.e. [head.admitStream]'s cardinality verdict.
+func (h *head) ensureStream(id signal.SeriesID, materialize func() signal.Series, maxSeries int64) bool {
+	isNew, ok := h.admitStream(id, maxSeries)
+	if !ok {
+		return false
+	}
 
-		isNew = true
+	if isNew {
 		s := materialize()
 		h.series.Add(s)
 		h.indexLabels(id, s)
@@ -64,7 +74,7 @@ func (h *head) ensureStream(id signal.SeriesID, materialize func() signal.Series
 		h.records[id] = newRecordCols(h.schema, 0, fullSel(h.schema))
 	}
 
-	return isNew, true
+	return true
 }
 
 // headByteCap is the hard ceiling on a head's buffered record bytes, enforced regardless of

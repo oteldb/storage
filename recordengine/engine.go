@@ -182,10 +182,30 @@ func (e *Engine) AppendBatch(b *Batch, limits AppendLimits) (AppendResult, error
 
 	// Cardinality is a per-batch decision (a batch is one stream): if this stream is new and the
 	// head is at the cap, the whole batch is rejected and the stream is not registered.
-	isNew, ok := e.head.ensureStream(b.Stream, b.Identity, limits.MaxSeries)
+	isNew, ok := e.head.admitStream(b.Stream, limits.MaxSeries)
 	if !ok {
 		return AppendResult{RejectedCardinality: len(b.Ts)}, nil
 	}
+
+	// The stream's identity is logged when the stream is registered, not when it first has an
+	// accepted record: a stream reports as new exactly once, so a first batch rejected in full (OOO
+	// window, in-flight bytes) would leave the head holding a stream with no durable identity, and
+	// replay drops records it cannot attribute to a registered stream. The record is written before
+	// the head commits the registration, so a failed write leaves no stream claiming a durability it
+	// does not have; a series record for a stream that never gets rows is cheap and harmless.
+	identity := b.Identity
+	if isNew {
+		s := b.Identity()
+		identity = func() signal.Series { return s }
+
+		if e.cfg.WAL != nil {
+			if err := e.cfg.WAL.WriteSeries(b.Stream, s); err != nil {
+				return AppendResult{}, errors.Wrap(err, "log stream identity")
+			}
+		}
+	}
+
+	e.head.ensureStream(b.Stream, identity, limits.MaxSeries)
 
 	scratch := rec{ints: make([]int64, len(b.Ints)), bytes: make([][]byte, len(b.Bytes))}
 
@@ -223,7 +243,7 @@ func (e *Engine) AppendBatch(b *Batch, limits AppendLimits) (AppendResult, error
 	}
 
 	if e.cfg.WAL != nil && res.Accepted > 0 {
-		if err := e.logWAL(b, walRecs, isNew); err != nil {
+		if err := e.logWAL(b, walRecs); err != nil {
 			return res, err
 		}
 	}
@@ -697,15 +717,10 @@ func (e *Engine) HeadRecordCount() int {
 	return n
 }
 
-// logWAL durably logs a batch's series (on first sight), its accepted records, and — when present —
-// its side-store delta, so a WAL replay reconstructs the head and the symbols those records reference.
-func (e *Engine) logWAL(b *Batch, walRecs []rec, isNew bool) error {
-	if isNew {
-		if err := e.cfg.WAL.WriteSeries(b.Stream, b.Identity()); err != nil {
-			return err
-		}
-	}
-
+// logWAL durably logs a batch's accepted records and — when present — its side-store delta, so a WAL
+// replay reconstructs the head and the symbols those records reference. The stream's identity is
+// logged separately, at registration time (see [Engine.AppendBatch]).
+func (e *Engine) logWAL(b *Batch, walRecs []rec) error {
 	if err := e.cfg.WAL.WriteRecords(b.Stream, encodeRecs(walRecs)); err != nil {
 		return err
 	}
