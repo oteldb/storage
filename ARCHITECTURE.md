@@ -117,6 +117,11 @@ jittered backoff; **idempotent reads hedge** across replicas, **writes stay at-m
   publish under lock; parts are copy-on-write and refcounted with deferred reclamation.
 - **Coordination is external/minimal.** etcd for membership/claims, backend CAS for commits. No
   homegrown Raft; single-node works with the cluster layer absent.
+- **The bucket index commits last.** It carries the flush watermark (the WAL replay floor), so its
+  write is the commit point: everything a committed part needs to stay readable — its objects, and
+  the identity index that names its streams — must be durable first. Publish order is chosen so a
+  crash leaves recoverable slack (unreferenced objects, identities with no rows), never rows the
+  watermark declares flushed but nothing can resolve.
 - **Injected, no-op-default observability** (above).
 - **Stable formats.** Golden-tested and version-guarded: the `Codec` enum and per-codec framing,
   part manifest (`OTPM`) / marks (`OTMK`) / column object framing and key layout, the attribute

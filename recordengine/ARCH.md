@@ -50,6 +50,16 @@ whatever arrived meanwhile) and restores the side-store snapshot via `SideStore.
 only runs on a successful publish, so without the fold-back the rows would be lost the moment the next
 flush overwrote the in-flight buffer.
 
+## Publish ordering
+
+Publishing a flush writes `streams.bin` **first** and the bucket index **last**, then checkpoints the
+WAL. The bucket index carries `FlushedEpoch` — the watermark replay starts from — so writing it is the
+commit point, and only what is already durable may be committed. The stream set is superset-safe: an
+identity persisted with no rows behind it resolves to a `SeriesID` no part range holds, so it costs a
+lookup and contributes nothing. The reverse is unrecoverable — a committed part whose streams are
+missing from `streams.bin` holds rows no matcher can name, while the advanced watermark makes replay
+skip the WAL records that would have re-registered them.
+
 ## Merge publish ordering
 
 A merge retires its source parts — queues them for backend deletion — **only after** the bucket index
