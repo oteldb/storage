@@ -1,7 +1,8 @@
 package recordengine
 
 import (
-	"sort"
+	"bytes"
+	"slices"
 
 	"github.com/oteldb/storage/signal"
 )
@@ -108,7 +109,7 @@ func keyInfoSlice(scopes map[string]KeyScope) []KeyInfo {
 		out = append(out, KeyInfo{Key: []byte(k), Scope: sc})
 	}
 
-	sort.Slice(out, func(i, j int) bool { return string(out[i].Key) < string(out[j].Key) })
+	slices.SortFunc(out, func(a, b KeyInfo) int { return bytes.Compare(a.Key, b.Key) })
 
 	return out
 }

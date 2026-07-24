@@ -1,10 +1,11 @@
 package recordengine
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"hash/crc32"
-	"sort"
+	"slices"
 
 	"github.com/go-faster/errors"
 
@@ -51,7 +52,7 @@ func distinctRecordKeys(schema *Schema, cols *recordCols) [][]byte {
 		out = append(out, []byte(key))
 	}
 
-	sort.Slice(out, func(i, j int) bool { return string(out[i]) < string(out[j]) })
+	slices.SortFunc(out, bytes.Compare)
 
 	return out
 }
