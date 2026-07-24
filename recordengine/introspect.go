@@ -1,8 +1,9 @@
 package recordengine
 
 import (
+	"cmp"
 	"context"
-	"sort"
+	"slices"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/index/symbols"
@@ -221,12 +222,12 @@ func (e *Engine) Cardinality(topN int) CardinalityStat {
 
 	cs.DistinctLabelNames = len(cs.Top)
 
-	sort.Slice(cs.Top, func(i, j int) bool {
-		if cs.Top[i].Series != cs.Top[j].Series {
-			return cs.Top[i].Series > cs.Top[j].Series
+	slices.SortFunc(cs.Top, func(a, b LabelCard) int {
+		if a.Series != b.Series {
+			return cmp.Compare(b.Series, a.Series)
 		}
 
-		return cs.Top[i].Name < cs.Top[j].Name
+		return cmp.Compare(a.Name, b.Name)
 	})
 
 	if topN > 0 && len(cs.Top) > topN {

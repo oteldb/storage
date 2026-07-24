@@ -3,7 +3,6 @@ package recordengine
 import (
 	"context"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -504,12 +503,26 @@ func limitTrim(survivors []matchedStream, limit int, reverse bool) {
 	for _, sv := range survivors {
 		ts := sv.acc.ts
 		if reverse {
-			// Keep the suffix ts >= threshold.
-			lo := sort.Search(len(ts), func(i int) bool { return ts[i] >= threshold })
+			// Keep the suffix ts >= threshold: find the leftmost index at or past threshold by
+			// never reporting equality, forcing the search past every smaller element.
+			lo, _ := slices.BinarySearchFunc(ts, threshold, func(t, target int64) int {
+				if t < target {
+					return -1
+				}
+
+				return 1
+			})
 			sv.acc.keep(lo, len(ts))
 		} else {
-			// Keep the prefix ts <= threshold.
-			hi := sort.Search(len(ts), func(i int) bool { return ts[i] > threshold })
+			// Keep the prefix ts <= threshold: find the leftmost index strictly past threshold,
+			// same never-equal trick as above but on the other side of the boundary.
+			hi, _ := slices.BinarySearchFunc(ts, threshold, func(t, target int64) int {
+				if t <= target {
+					return -1
+				}
+
+				return 1
+			})
 			sv.acc.keep(0, hi)
 		}
 	}
