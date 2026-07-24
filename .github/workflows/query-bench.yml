@@ -35,6 +35,14 @@ jobs:
   query:
     runs-on: [Linux]
     steps:
+      # The runner is self-hosted: GITHUB_WORKSPACE survives between runs and actions/checkout only
+      # cleans the path it manages. Without this the base worktree collides with the last run's, and
+      # — worse — a failed benchmark step could leave the report built from a previous PR's results.
+      - name: Clean stale workspace state
+        run: |
+          cd "${GITHUB_WORKSPACE}"
+          rm -rf storage-base head.txt base.txt bench.csv bench.txt report.md
+
       - name: Checkout storage (PR head)
         uses: actions/checkout@v7
         with:
@@ -69,7 +77,9 @@ jobs:
       - name: Add base worktree
         if: github.event_name == 'pull_request'
         working-directory: storage
-        run: git worktree add "${GITHUB_WORKSPACE}/storage-base" ${{ github.event.pull_request.base.sha }}
+        run: |
+          git worktree prune # drop registrations left by a previous run's now-deleted worktree
+          git worktree add --detach "${GITHUB_WORKSPACE}/storage-base" ${{ github.event.pull_request.base.sha }}
 
       - name: Benchmark PR head
         working-directory: oteldb
