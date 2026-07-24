@@ -22,6 +22,8 @@ import (
 
 func main() {
 	raw := flag.String("raw", "", "path to a plain-text benchstat table to embed in a <details> block")
+	marker := flag.String("marker", defaultMarker, "slug for the hidden HTML comment the workflow finds its sticky comment by; must be unique per workflow")
+	title := flag.String("title", defaultTitle, "report heading")
 	flag.Parse()
 
 	var rawText string
@@ -34,7 +36,7 @@ func main() {
 		rawText = string(b)
 	}
 
-	md, err := render(os.Stdin, rawText)
+	md, err := render(os.Stdin, rawText, *marker, *title)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "benchreport:", err)
 		os.Exit(1)
@@ -43,8 +45,13 @@ func main() {
 	fmt.Print(md)
 }
 
-// marker is the hidden HTML comment the PR workflow uses to find and update its sticky comment.
-const marker = "<!-- golden-bench -->"
+// Defaults for the sticky-comment marker and heading, matching .github/workflows/bench.yml. A
+// second workflow reporting into the same PR (e.g. the downstream query-engine benchmarks) MUST
+// pass its own -marker, or the two runs overwrite each other's comment.
+const (
+	defaultMarker = "golden-bench"
+	defaultTitle  = "Golden benchmarks"
+)
 
 type benchRow struct {
 	name        string
@@ -67,15 +74,14 @@ type report struct {
 	n       int // samples per benchmark, parsed from the "n=" suffix
 }
 
-func render(r io.Reader, rawText string) (string, error) {
+func render(r io.Reader, rawText, marker, title string) (string, error) {
 	rep, err := parse(r)
 	if err != nil {
 		return "", err
 	}
 
 	var b strings.Builder
-	b.WriteString(marker)
-	b.WriteString("\n## 📊 Golden benchmarks\n\n")
+	fmt.Fprintf(&b, "<!-- %s -->\n## 📊 %s\n\n", marker, title)
 
 	if len(rep.groups) == 0 {
 		b.WriteString("> [!CAUTION]\n> No benchmark results were parsed — the benchmark step may have failed.\n")

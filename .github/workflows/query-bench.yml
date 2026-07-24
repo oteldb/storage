@@ -1,0 +1,131 @@
+name: query-bench
+
+# Downstream query-engine benchmarks: the LogQL / TraceQL / ProfileQL engines live in
+# github.com/oteldb/oteldb (under internal/, so this repo cannot import them), but they are the
+# realest read workload this library has. This job checks oteldb out, points it at THIS PR's storage
+# via a go.work, and runs its golden query benchmarks against both the PR head and the base commit.
+#
+# The same oteldb checkout serves both runs, so oteldb's own drift moves the absolute numbers but
+# cancels out of the delta — which is the only thing this gate reads.
+#
+# Complements bench.yml (BenchmarkGolden, in-repo, includes PromQL via the public Prometheus engine).
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: query-bench-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The golden query set in oteldb: BenchmarkGoldenLogQL / …TraceQL / …ProfileQL.
+  BENCH: '^BenchmarkGolden'
+  PKG: './internal/storagebackend/'
+  FLAGS: '-run=^$ -benchmem -benchtime=300ms -count=6 -timeout=30m'
+  # oteldb ref to benchmark against. Both sides use it, so the delta stays valid as it moves.
+  OTELDB_REF: main
+
+jobs:
+  query:
+    runs-on: [Linux]
+    steps:
+      - name: Checkout storage (PR head)
+        uses: actions/checkout@v7
+        with:
+          path: storage
+          fetch-depth: 0 # need the base commit to benchmark it too
+
+      - name: Checkout oteldb
+        uses: actions/checkout@v7
+        with:
+          repository: oteldb/oteldb
+          ref: ${{ env.OTELDB_REF }}
+          path: oteldb
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Install benchstat
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # Built from THIS PR's code, before the storage tree is rewound for the base run.
+      - name: Build report tool
+        working-directory: storage
+        run: go build -o "${RUNNER_TEMP}/benchreport" ./internal/cmd/benchreport
+
+      # A worktree pinned at the base commit, so both storage versions exist side by side and the
+      # run switches between them by rewriting one line of go.work — no checkout churn between runs.
+      - name: Add base worktree
+        if: github.event_name == 'pull_request'
+        working-directory: storage
+        run: git worktree add "${GITHUB_WORKSPACE}/storage-base" ${{ github.event.pull_request.base.sha }}
+
+      - name: Benchmark PR head
+        working-directory: oteldb
+        run: |
+          go work init . "${GITHUB_WORKSPACE}/storage"
+          go test ${FLAGS} -bench "${BENCH}" ${PKG} | tee "${GITHUB_WORKSPACE}/head.txt"
+
+      # Non-fatal: if the base doesn't build against oteldb, report head only. A failure here on a
+      # PR that changes the public surface is itself the signal — it means the embedder contract moved.
+      - name: Benchmark base
+        id: base
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        working-directory: oteldb
+        run: |
+          rm -f go.work go.work.sum
+          go work init . "${GITHUB_WORKSPACE}/storage-base"
+          go test ${FLAGS} -bench "${BENCH}" ${PKG} | tee "${GITHUB_WORKSPACE}/base.txt"
+
+      - name: Build report
+        run: |
+          if [ -s base.txt ]; then
+            benchstat -format csv base.txt head.txt > bench.csv
+            benchstat base.txt head.txt > bench.txt
+          else
+            benchstat -format csv head.txt > bench.csv
+            benchstat head.txt > bench.txt
+          fi
+          "${RUNNER_TEMP}/benchreport" -marker query-bench -title 'Query engine benchmarks (oteldb)' -raw bench.txt < bench.csv > report.md
+          cat report.md
+
+      - name: Upload results
+        uses: actions/upload-artifact@v7
+        with:
+          name: query-bench
+          path: |
+            head.txt
+            base.txt
+            bench.csv
+            bench.txt
+            report.md
+          if-no-files-found: warn
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- query-bench -->';
+            const body = fs.readFileSync('report.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

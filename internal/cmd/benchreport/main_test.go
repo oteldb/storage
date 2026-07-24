@@ -37,13 +37,13 @@ geomean,1.5,,1.2,,-20.00%,
 func TestRenderVerdictAndTables(t *testing.T) {
 	t.Parallel()
 
-	out, err := render(strings.NewReader(fixtureCSV), "RAW-TABLE-PLACEHOLDER")
+	out, err := render(strings.NewReader(fixtureCSV), "RAW-TABLE-PLACEHOLDER", defaultMarker, defaultTitle)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	want := []string{
-		marker,
+		"<!-- " + defaultMarker + " -->",
 		"> [!WARNING]",
 		// Distinct-benchmark counting (not per-metric): 1 regressed (write/head), 2 improved.
 		"**1 benchmark regressed** and **2 improved**",
@@ -78,7 +78,7 @@ goarch: amd64
 Golden/write/head-4,1e-06,0%,1e-06,0%,~,p=1.000 n=6
 geomean,1e-06,,1e-06,,~,
 `
-	out, err := render(strings.NewReader(csv), "")
+	out, err := render(strings.NewReader(csv), "", defaultMarker, defaultTitle)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ geomean,1e-06,,1e-06,,~,
 func TestRenderEmpty(t *testing.T) {
 	t.Parallel()
 
-	out, err := render(strings.NewReader(""), "")
+	out, err := render(strings.NewReader(""), "", defaultMarker, defaultTitle)
 	if err != nil {
 		t.Fatal(err)
 	}
