@@ -112,6 +112,12 @@ It is cleared at the publish, or handed back to the live count by `head.reattach
 never both. Without it the measure would read zero for the whole duration of a slow flush, and
 `MaxInFlightBytes` would admit a second full head on top of the one still being written out.
 
+`OOOWindow` is a **per-stream** lateness bound, not a head-global one: each stream carries its own
+newest-admitted watermark (`head.streamNewest`), so a fast or clock-skewed-ahead stream cannot shed
+the slower streams sharing the head, and a stream's first record is never out of order. The
+watermarks outlive a flush — records becoming durable does not reset a stream's lateness bound — and
+are cleared only with the head. (The metrics engine still compares against a head-global `newest`.)
+
 ## Fetch
 
 Heavily tuned around decoding as little as possible:
