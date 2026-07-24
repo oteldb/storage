@@ -32,8 +32,8 @@ In order:
 ### P1.3 — opt-in batch-release buffer pooling (DONE)
 
 The result buffers (`collectOne` ~36% of read allocs) back the returned batches, so pooling them
-needs a release signal. Added `fetch.Request.Recycle` + `fetch.Batch.Release()` (see ARCHITECTURE
-§3g): opt-in, default-off (the non-recycling path is byte-for-byte unchanged — verified by
+needs a release signal. Added `fetch.Request.Recycle` + `fetch.Batch.Release()` (see
+`query/ARCH.md`): opt-in, default-off (the non-recycling path is byte-for-byte unchanged — verified by
 `efficiency_test.go` and a `rel0→rel2` benchstat showing `fetch_all` flat, p=0.18). When a caller
 sets `Recycle` and releases each batch, the engine recycles the ts/value buffers via a shared hook
 (no per-batch closure). The multi-child `Merge` and the cluster read handler release their inputs.

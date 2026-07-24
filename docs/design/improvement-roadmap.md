@@ -41,7 +41,7 @@ Recommended sequencing: **4 → 1 → 3-isolation → 2 → 3-rest**. The wire-u
 holes cheaply and unblock #2; introspection is the foundation a CLI/UI *and* our own
 debugging both need; it is also low-risk aggregation over existing methods.
 
-Cross-cutting invariants every track must preserve (from `ARCHITECTURE.md` §5): zero-alloc
+Cross-cutting invariants every track must preserve (from `ARCHITECTURE.md`, "Cross-cutting invariants"): zero-alloc
 hot paths (telemetry/introspection at operation granularity only, never per-sample);
 in-memory-first (every feature works with no disk/S3); injected no-op observability; library
 not binary (we expose Go structs/methods, never a UI or process); language-agnostic storage
@@ -214,7 +214,7 @@ under cardinality spikes); (b) and (c) improve isolation/scaling.
 
 ### 3a. Cardinality budget with hysteresis + `__overflow__` routing
 **Current:** `Limits.MaxSeries` is a *hard reject* in `head.appendByID` — a sample minting a
-new series past the cap is shed (ARCHITECTURE §3k). A cardinality spike makes a tenant lose
+new series past the cap is shed (`ARCHITECTURE.md`, "Admission control"). A cardinality spike makes a tenant lose
 *new* data abruptly with no soft landing.
 
 **Proposed:** turn the cap into a soft budget (Mimir/StatsHouse-style):
@@ -235,7 +235,7 @@ treats `__overflow__` like any series.
 
 ### 3b. Per-signal sharding (extend `ShardsPerTenant` to records)
 **Current:** per-series sharding (`Config.ShardsPerTenant`) is **metrics-only**; logs/traces/
-profiles pin a big tenant to one owner set (`Ring().Primary(tenant)`), ARCHITECTURE §3i.
+profiles pin a big tenant to one owner set (`Ring().Primary(tenant)`), `cluster/ARCH.md`.
 
 **Proposed:** generalize the shard-key machinery (`{tenant}/_s{idx}`, collapses to bare tenant
 at N=1) to the record engines. The write path already groups+routes per shard for metrics
@@ -273,14 +273,14 @@ Cheap, high-ROI, closes real correctness holes. Each has the hard part already b
 ### 4a. Consume `rebalance.Plan` in the executor
 `cluster/rebalance.Plan(shards, prev, next, rf)` computes the minimal one-in/one-out ownership
 diff and is fully tested, but `etcd/ownership.go:Reconcile` ignores it and re-derives from the
-ring (ARCHITECTURE §3i/§3j: "the minimal-move diff is currently informational only").
+ring (the minimal-move diff was informational only; see `cluster/ARCH.md`).
 **Wire it:** on a membership change, compute `Plan(prevRing, nextRing)` and reconcile only the
 shards that moved, instead of acquiring/releasing the entire owned set. Event-driven, less
 etcd churn, and it gives `Admin().Rebalance` + `Inspect().Cluster.RebalancePending` real data.
 
 ### 4b. Admission on the clustered write path
 **Current:** the cluster primary only does the OOO check (`ApplyPrimary`); rate / cardinality /
-in-flight valves and budgeted sampling are **single-node only** (ARCHITECTURE §3k). A clustered
+in-flight valves and budgeted sampling are **single-node only** (`ARCHITECTURE.md`, "Admission control"). A clustered
 tenant has *no overload protection* — a real stability gap.
 **Wire it:** run the facade admission stage on the primary before `ApplyPrimary` (the primary
 is the single authority for the shard, so it's the right place to meter rate/cardinality). The
@@ -288,13 +288,13 @@ reject/sampled counts already flow back into `Accepted` — extend that to carry
 reasons over the primary-write RPC.
 
 ### 4c. Cluster fan-out for `LogSeries` / `LogKeys`
-**Current:** both are **node-local** (ARCHITECTURE §4: "cluster fan-out is a follow-up"), so on
+**Current:** both are **node-local** (cluster fan-out was a follow-up; see `ARCHITECTURE.md`, "Public surface"), so on
 a non-owner they return wrong/empty enumeration. `ProfileSeries`/`ProfileResolver` already fan
 out via `cluster/enum.go` — **copy that pattern** for log series/keys (re-apply non-equality
 matchers to the superset, hedge across owners).
 
 ### 4d. WAL-persist the scale factor
-**Current:** a crash recovers unflushed *sampled* data as weight 1 (ARCHITECTURE §3k) — a
+**Current:** a crash recovers unflushed *sampled* data as weight 1 (`ARCHITECTURE.md`, "Admission control") — a
 correctness window in the unbiased-sampling path.
 **Wire it:** add the `sf` value to the WAL sample frame (it already exists as the optional 4th
 part column), so replay restores the representative weight. Format change → bump WAL version,
@@ -311,7 +311,7 @@ add golden + round-trip fuzz.
 ## Cross-track testing & rollout discipline
 - Every track ships with ≥90% coverage in the same change (CLAUDE.md).
 - Format changes (4d) get golden + fuzz round-trip and a version bump.
-- New public surface (`Inspect`, `Admin`) documented in `ARCHITECTURE.md` §4 when landed.
+- New public surface (`Inspect`, `Admin`) documented in `ARCHITECTURE.md` ("Public surface") and `ADMIN.md` when landed.
 - Bench gate: confirm `Inspect`/`Admin` add no hot-path allocs (`efficiency_test.go` ceilings
   unchanged; `Inspect` runs zero part decodes).
 ```
