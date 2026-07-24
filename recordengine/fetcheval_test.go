@@ -109,6 +109,45 @@ func TestPartConditionEvaluatesOnlyTouchedEntries(t *testing.T) {
 	assert.Equal(t, 3, calls, "only the entries the scanned rows reference are evaluated")
 }
 
+// An int column has no dictionary, but an enum-shaped one (a severity, a status code) covers a tiny
+// value range — narrow enough to memoize per distinct value. A column too wide for that must fall
+// back to the per-row call rather than allocate a memo it cannot use.
+func TestIntConditionRunsPerDistinctValue(t *testing.T) {
+	t.Parallel()
+
+	const rows = 500
+
+	for _, tt := range []struct {
+		name      string
+		sev       func(i int) int64
+		wantCalls int
+	}{
+		{name: "narrow range memoizes", sev: func(i int) int64 { return int64(i%5 + 1) }, wantCalls: 5},
+		{name: "wide range falls back per row", sev: func(i int) int64 { return int64(i) * 10_000 }, wantCalls: rows},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			recs := make([]rrec, rows)
+			for i := range recs {
+				recs[i] = rrec{ts: int64(i + 1), sev: tt.sev(i)}
+			}
+
+			e := newEngine(t, backend.Memory())
+			ingest(t, e, mkBatch("api", recs...))
+			require.NoError(t, e.Flush(context.Background()))
+
+			calls := 0
+			cond := countingCond("sev", &calls, func(v signal.Value) bool { return v.Int() >= 0 })
+
+			got := fetchAll(t, e, req("api", cond))
+			require.Len(t, got, 1)
+			assert.Len(t, got[0].Timestamps, rows)
+			assert.Equal(t, tt.wantCalls, calls)
+		})
+	}
+}
+
 // Part rows are matched during the scan, so the post-scan filter must re-check only the head-seeded
 // prefix — and must still drop the head rows that do not match.
 func TestHeadPrefixIsFilteredWithoutRecheckingPartRows(t *testing.T) {

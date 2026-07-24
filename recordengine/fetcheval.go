@@ -21,8 +21,10 @@ import (
 //     high-selectivity scan that touches five rows still pays only five calls. Attributes benefit
 //     most: without the memo, [signal.LookupAttribute] re-parses the attrs blob per condition per
 //     row.
+//   - An int column's predicate is memoized per distinct value over a small fixed domain, which is
+//     where enum-shaped columns (severity, status codes) live.
 //   - Conditions run cheap-first (the PREWHERE analog): a precomputed equality bitmap rejects a
-//     row before a memoized dictionary probe, which rejects it before a per-row predicate call.
+//     row before a memoized dictionary or value probe, which rejects it before a per-row call.
 //
 // Reordering is sound because the conditions are a logical AND of pure predicates; a condition's
 // [fetch.Condition.Match] is a callback, so this changes only how often it is called, never with
@@ -39,8 +41,13 @@ const (
 	// evalDict indexes a dictionary column's per-entry memo: an id load plus a byte load, with the
 	// predicate called at most once per distinct entry.
 	evalDict
-	// evalRow calls the predicate per row over a directly indexable int vector (the timestamp or an
-	// int64 column).
+	// evalIntMemo indexes an int column's per-value memo: a value load, a range check and a byte
+	// load, with the predicate called at most once per distinct in-domain value (see maxIntMemo).
+	// Placed after evalDict because a byte column is usually the more selective of the two (an id or
+	// a body match) and costs a byte per row to probe rather than eight.
+	evalIntMemo
+	// evalRow calls the predicate per row over a directly indexable int vector — the timestamp,
+	// whose values never fall in the memo's domain.
 	evalRow
 	// evalGeneric calls the predicate per row through [lazyCols.colValue]: the fallback for a byte
 	// column with no dictionary to memoize (the flat/fixed decode forms, or a raw fixed-width blob)
@@ -48,13 +55,25 @@ const (
 	evalGeneric
 )
 
-// Per-entry memo states for [evalDict]. The zero value is "not yet evaluated", so a memo is reset
-// for a new part by zeroing it.
+// Per-entry memo states for [evalDict] and [evalIntMemo]. The zero value is "not yet evaluated", so
+// a memo is reset for a new part by zeroing it.
 const (
 	memoUnknown uint8 = iota
 	memoMatch
 	memoNoMatch
 )
+
+// maxIntMemo is the exclusive upper bound of the int values [evalIntMemo] memoizes: a value in
+// [0, maxIntMemo) indexes the memo directly, anything else (negative, or larger) falls through to a
+// per-row predicate call. Enum-shaped columns — OTel severities (1–24), HTTP/gRPC status codes —
+// live entirely inside it; timestamps, durations and byte counts live entirely outside it and pay
+// only the range check.
+//
+// A fixed domain rather than the column's own [min, max]: deriving the real range costs a
+// [simd.MinMaxInt64] pass over the whole column, which measured as a net loss (~2% on a multi-
+// condition fetch) because a condition that a more selective one short-circuits ahead of it may
+// never be evaluated at all — the memo must cost nothing until its first probe.
+const maxIntMemo = 4096
 
 // condEval is one condition compiled against a single part's decoded columns ([lazyCols]).
 type condEval struct {
@@ -63,9 +82,9 @@ type condEval struct {
 
 	mask []byte            // evalEqMask: the per-row bitmap
 	dict *chunk.DictColumn // evalDict: the column holding the condition's cells
-	memo []uint8           // evalDict: per-entry tri-state, filled lazily
+	memo []uint8           // evalDict/evalIntMemo: per-entry tri-state, filled lazily
 	attr string            // evalDict: when set, the entry is an attrs blob and this key is looked up in it
-	ints []int64           // evalRow: the column's values
+	ints []int64           // evalIntMemo/evalRow: the column's values
 }
 
 // match reports whether row i satisfies this condition.
@@ -82,15 +101,21 @@ func (ce *condEval) match(lz *lazyCols, i int) bool {
 			return false
 		}
 
-		if ce.matchEntry(ce.dict.Entries[id]) {
-			ce.memo[id] = memoMatch
-
-			return true
+		return ce.remember(id, ce.matchEntry(ce.dict.Entries[id]))
+	case evalIntMemo:
+		v := ce.ints[i]
+		if uint64(v) >= maxIntMemo { // negative or out of the memoized domain
+			return ce.cond.Match(signal.IntValue(v))
 		}
 
-		ce.memo[id] = memoNoMatch
+		switch ce.memo[v] {
+		case memoMatch:
+			return true
+		case memoNoMatch:
+			return false
+		}
 
-		return false
+		return ce.remember(int(v), ce.cond.Match(signal.IntValue(v)))
 	case evalRow:
 		return ce.cond.Match(signal.IntValue(ce.ints[i]))
 	default:
@@ -101,6 +126,17 @@ func (ce *condEval) match(lz *lazyCols, i int) bool {
 
 		return ce.cond.Match(v)
 	}
+}
+
+// remember records a freshly evaluated memo slot and returns the verdict.
+func (ce *condEval) remember(slot int, matched bool) bool {
+	if matched {
+		ce.memo[slot] = memoMatch
+	} else {
+		ce.memo[slot] = memoNoMatch
+	}
+
+	return matched
 }
 
 // matchEntry evaluates the predicate against one dictionary entry: the cell itself for a fixed
@@ -164,7 +200,7 @@ func (p *fetchPlan) compileCond(lz *lazyCols, j int) condEval {
 
 	if ref, ok := lz.schema.ref(cond.Column); ok {
 		if ref.kind == KindInt64 {
-			ce.kind, ce.ints = evalRow, lz.ints[ref.idx]
+			ce.kind, ce.ints, ce.memo = evalIntMemo, lz.ints[ref.idx], p.memo(j, maxIntMemo)
 
 			return ce
 		}
