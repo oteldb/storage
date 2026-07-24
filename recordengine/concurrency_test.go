@@ -126,6 +126,82 @@ func TestConcurrentAppendFetchFlushMerge(t *testing.T) {
 	assert.Equal(t, services*perService, total, "no records lost across concurrent flush/merge/fetch")
 }
 
+// TestConcurrentUnsortedFlushFetch covers the flush path's (stream, ts) ordering against a concurrent
+// fetch. [TestConcurrentAppendFetchFlushMerge] appends strictly increasing timestamps, so every head
+// buffer is already ts-ascending and the flush's reordering never runs; here each batch is descending,
+// so every stream is reordered while fetchers read the same detached buffers through the engine's
+// in-flight flush view. The flush must not mutate them. Run with -race.
+func TestConcurrentUnsortedFlushFetch(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := newEngine(t, backend.Memory())
+
+	const (
+		streams  = 4
+		rows     = 200
+		rounds   = 10
+		fetchers = 4
+	)
+
+	var (
+		wg   sync.WaitGroup
+		stop atomic.Bool
+	)
+
+	for range fetchers {
+		wg.Go(func() {
+			for !stop.Load() {
+				it, err := e.Fetch(ctx, fetch.Request{Start: 0, End: 1 << 60})
+				if err != nil {
+					t.Errorf("fetch: %v", err)
+
+					return
+				}
+
+				if _, err := fetch.Drain(ctx, it); err != nil {
+					t.Errorf("drain: %v", err)
+
+					return
+				}
+			}
+		})
+	}
+
+	for round := range rounds {
+		for s := range streams {
+			svc := fmt.Sprintf("svc-%d", s)
+
+			recs := make([]rrec, 0, rows)
+			for i := range rows {
+				// Descending within the batch ⇒ the head buffer is unsorted ⇒ the flush reorders it.
+				recs = append(recs, rrec{
+					ts:   int64(round*1_000_000 + (rows - i)),
+					sev:  int64(i),
+					body: fmt.Sprintf("%s-%d-%d", svc, round, i),
+				})
+			}
+
+			ingest(t, e, mkBatch(svc, recs...))
+		}
+
+		require.NoError(t, e.Flush(ctx))
+	}
+
+	stop.Store(true)
+	wg.Wait()
+
+	total := 0
+	for s := range streams {
+		for _, b := range fetchAll(t, e, req(fmt.Sprintf("svc-%d", s))) {
+			total += len(b.Timestamps)
+			assert.IsIncreasing(t, b.Timestamps, "records come back ts-ordered")
+		}
+	}
+
+	assert.Equal(t, streams*rows*rounds, total, "no records lost")
+}
+
 // TestFetchDuringMergeNoDataLoss checks the snapshot semantics directly: a fetch that overlaps a merge
 // returns a consistent view (every record present), never a torn old/new part set.
 func TestFetchDuringMergeNoDataLoss(t *testing.T) {
