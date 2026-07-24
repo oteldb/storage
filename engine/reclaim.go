@@ -1,6 +1,15 @@
 package engine
 
-import "context"
+import (
+	"context"
+	"strings"
+
+	"github.com/go-faster/errors"
+	"github.com/go-faster/sdk/zctx"
+	"go.uber.org/zap"
+
+	"github.com/oteldb/storage/backend"
+)
 
 // The engine's `parts` slice is the only mutable handle onto its immutable parts; flush/merge replace
 // it copy-on-write so a fetch that snapshotted the slice header under the lock keeps reading a stable
@@ -46,10 +55,75 @@ func (e *Engine) retireLocked(parts []*part) {
 	e.retiring = append(e.retiring, parts...)
 }
 
+// sweepOrphansLocked deletes every object under the engine's prefix that belongs to a part the loaded
+// bucket index does not name: the residue of a flush or merge that wrote a part's objects and then
+// failed before committing it, or of a reclaim whose delete failed. It returns the sequence to resume
+// at — one past the highest sequence seen on the backend, not just in the index — so a part never
+// lands on leftovers even when a delete fails or the process restarted mid-attempt. Deletes are
+// best-effort (a failure leaves the object for a later open); a failed List is fatal, since silently
+// skipping the sweep would also skip the sequence seed. Caller holds e.mu.
+func (e *Engine) sweepOrphansLocked(ctx context.Context, maxSeq int) (int, error) {
+	root := e.cfg.Prefix + "/"
+
+	keys, err := e.cfg.Backend.List(ctx, root)
+	if err != nil {
+		return 0, errors.Wrap(err, "list objects")
+	}
+
+	live := make(map[string]struct{}, len(e.parts))
+	for _, p := range e.parts {
+		live[p.prefix] = struct{}{}
+	}
+
+	next := maxSeq + 1
+
+	var orphans []string
+
+	for _, k := range keys {
+		dir, _, ok := strings.Cut(strings.TrimPrefix(k, root), "/")
+		if !ok {
+			continue // an engine-level object (bucket index, series index), not part of a part
+		}
+
+		seq := seqOfPrefix(dir)
+		if seq < 0 {
+			continue
+		}
+
+		if _, ok := live[root+dir]; ok {
+			continue
+		}
+
+		if seq >= next {
+			next = seq + 1
+		}
+
+		orphans = append(orphans, k)
+	}
+
+	if len(orphans) == 0 {
+		return next, nil
+	}
+
+	var failed int
+
+	for _, k := range orphans {
+		if err := e.cfg.Backend.Delete(ctx, k); err != nil && !errors.Is(err, backend.ErrNotExist) {
+			failed++
+		}
+	}
+
+	zctx.From(ctx).Debug("swept orphan part objects",
+		zap.String("prefix", e.cfg.Prefix),
+		zap.Int("objects", len(orphans)), zap.Int("failed", failed), zap.Int("next_seq", next))
+
+	return next, nil
+}
+
 // reclaimRetired deletes the backend objects of retired parts whose readers have all drained, doing the
 // delete I/O outside e.mu. A part still being read stays pending for a later cycle. Best-effort: a
 // failed delete is re-queued (it leaves an orphan object meanwhile, unreferenced by the bucket index
-// and ignored on reload). No-op for a head-only engine.
+// and swept by the next [Engine.LoadParts]). No-op for a head-only engine.
 func (e *Engine) reclaimRetired(ctx context.Context) {
 	if e.cfg.Backend == nil {
 		return

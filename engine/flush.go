@@ -225,3 +225,19 @@ func statsKey(prefix string) string { return prefix + "/stats" }
 func (e *Engine) partPrefix(seq int) string {
 	return fmt.Sprintf("%s/%010d", e.cfg.Prefix, seq)
 }
+
+// reserveSeq allocates the next part sequence and advances the counter immediately, so part prefixes
+// are append-only: an attempt that fails after writing some of its objects burns its sequence instead
+// of leaving it for the retry. Reuse would be unsound — the retry overwrites only the objects it
+// itself produces, so a part whose object set differs from the failed attempt's (a different column
+// framing, or no aggregate-stats sidecar) silently inherits the leftovers. The orphaned objects are
+// swept at open by [Engine.LoadParts]. Safe for concurrent use.
+func (e *Engine) reserveSeq() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	seq := e.nextSeq
+	e.nextSeq++
+
+	return seq
+}

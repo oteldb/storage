@@ -75,10 +75,10 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 // picks only the parts worth merging this cycle (a same-size tier group plus any part a forced
 // rewrite must touch), so a single merge's working set is O(part size), not O(dataset).
 func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
-	// Plan (under lock): snapshot the source parts (immutable backing) and reserve the sequence.
+	// Plan (under lock): snapshot the source parts (immutable backing). Output part sequences are
+	// reserved one at a time, as the parts are written.
 	e.mu.Lock()
 	src := e.parts
-	seq := e.nextSeq
 	e.mu.Unlock()
 
 	maxRows := maxRowsPerPart(e.cfg.MaxPartBytes)
@@ -119,10 +119,10 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 			return 0, nil
 		}
 
-		if newParts, err = e.writeColumns(ctx, cols, seq, capRows, opts); err != nil {
+		if newParts, err = e.writeColumns(ctx, cols, capRows, opts); err != nil {
 			return 0, err
 		}
-	} else if newParts, err = e.compactStream(ctx, selected, start, seq, capRows, opts); err != nil {
+	} else if newParts, err = e.compactStream(ctx, selected, start, capRows, opts); err != nil {
 		return 0, err
 	}
 
@@ -137,7 +137,6 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 
 	e.mu.Lock()
 	e.parts = replaceParts(e.parts, removed, newParts...)
-	e.nextSeq = seq + len(newParts)
 
 	e.retireLocked(selected)
 	err = e.updateIndexLocked(ctx)
@@ -156,7 +155,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 // when capRows ≤ 0), writes each, and reads it back. Used for the single-part merge path; the
 // multi-part path streams (see compactStream). Returns nil when cols is empty (e.g. retention
 // dropped every sample).
-func (e *Engine) writeColumns(ctx context.Context, cols *flushColumns, seq, capRows int, opts MergeOptions) ([]*part, error) {
+func (e *Engine) writeColumns(ctx context.Context, cols *flushColumns, capRows int, opts MergeOptions) ([]*part, error) {
 	if len(cols.ts) == 0 {
 		return nil, nil
 	}
@@ -164,10 +163,10 @@ func (e *Engine) writeColumns(ctx context.Context, cols *flushColumns, seq, capR
 	ranges := chunkRanges(len(cols.ts), capRows)
 	newParts := make([]*part, 0, len(ranges))
 
-	for i, rg := range ranges {
+	for _, rg := range ranges {
 		sub := cols.slice(rg[0], rg[1])
 
-		p, err := e.writeMergedPart(ctx, sub, seq+i, opts)
+		p, err := e.writeMergedPart(ctx, sub, e.reserveSeq(), opts)
 		if err != nil {
 			return nil, err
 		}
@@ -271,7 +270,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 // Series are visited in (series, ts) order; within a series the parts are visited oldest→newest so
 // a later part's value wins a duplicate timestamp, then the result is downsampled.
 func (e *Engine) compactStream(
-	ctx context.Context, src []*part, start int64, seq, capRows int, opts MergeOptions,
+	ctx context.Context, src []*part, start int64, capRows int, opts MergeOptions,
 ) ([]*part, error) {
 	ids, err := sortedSeriesIDs(ctx, src)
 	if err != nil {
@@ -301,7 +300,7 @@ func (e *Engine) compactStream(
 			return nil
 		}
 
-		p, err := e.writeMergedPart(ctx, &buf, seq+len(newParts), opts)
+		p, err := e.writeMergedPart(ctx, &buf, e.reserveSeq(), opts)
 		if err != nil {
 			return err
 		}

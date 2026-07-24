@@ -1087,7 +1087,6 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	}
 
 	e.flushing = detached
-	seq := e.nextSeq
 	e.mu.Unlock()
 
 	// Build (lock-free): lay out the detached buffers and write the part. Flush writes freshly-ingested
@@ -1108,9 +1107,9 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	ranges := chunkRanges(rows, maxRowsPerPart(e.cfg.MaxPartBytes))
 
 	newParts := make([]*part, 0, len(ranges))
-	for i, rg := range ranges {
+	for _, rg := range ranges {
 		sub := cols.slice(rg[0], rg[1])
-		prefix := e.partPrefix(seq + i)
+		prefix := e.partPrefix(e.reserveSeq())
 
 		if err := writePart(ctx, e.cfg.Backend, prefix, sub, nil, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
 			return 0, err
@@ -1137,7 +1136,6 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		e.populateRecent(detached)
 	}
 	e.flushing = nil
-	e.nextSeq = seq + len(ranges)
 	err := e.publishLocked(ctx)
 	e.mu.Unlock()
 
