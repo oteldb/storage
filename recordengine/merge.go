@@ -63,10 +63,10 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 // once their in-flight readers drain. Only the background maintenance task calls merge, so the parts
 // mutation has a single writer.
 func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
-	// Plan (under lock): snapshot the source parts (immutable backing) and reserve the sequence.
+	// Plan (under lock): snapshot the source parts (immutable backing). Output part sequences are
+	// reserved one at a time, as the parts are written.
 	e.mu.Lock()
 	src := e.parts
-	seq := e.nextSeq
 	e.mu.Unlock()
 
 	capRows := mergeCapRows(maxRowsPerPart(e.cfg.MaxPartBytes))
@@ -86,7 +86,7 @@ func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
 	// Build (lock-free): compact the selected parts into bounded output part(s), reading them back and
 	// unioning the side-store sidecars. The selected parts stay live (not retired) until publish, so
 	// they cannot be reclaimed underneath this read.
-	newParts, err := e.compactParts(ctx, selected, start, seq, capRows)
+	newParts, err := e.compactParts(ctx, selected, start, capRows)
 	if err != nil {
 		return 0, err
 	}
@@ -101,7 +101,6 @@ func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
 
 	e.mu.Lock()
 	e.parts = replaceParts(e.parts, removed, newParts...)
-	e.nextSeq = seq + len(newParts)
 
 	e.retireLocked(selected)
 	err = e.updateIndexLocked(ctx)
@@ -150,7 +149,7 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 // output is a single part (no split) so the unioned symbol sidecar has one home. Returns the new parts
 // (empty when retention dropped every record). Reads the parts off the engine lock; src is the
 // immutable snapshot the caller planned over.
-func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, seq, capRows int) ([]*part, error) {
+func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, capRows int) ([]*part, error) {
 	// Decode each source part once, keeping byte columns dict-compressed (see decodedPart). A merge
 	// reads every stream of every part, so decoding per-stream (the old appendWindow path) re-decoded
 	// the whole part once per stream; decoding up front is O(selected parts), which selection bounds to
@@ -182,7 +181,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, seq
 			return nil
 		}
 
-		p, err := e.writeMergedPart(ctx, src, buf, seq+len(newParts))
+		p, err := e.writeMergedPart(ctx, src, buf, e.reserveSeq())
 		if err != nil {
 			return err
 		}
