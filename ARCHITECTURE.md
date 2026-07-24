@@ -1142,7 +1142,10 @@ optional side store differ.
   and a per-record scan walks one allocation with locality. Cell views alias the blob under the
   read-only-until-next-append rule (an append that grows the blob may move it, so a value retained
   past an append is copied); the `fetch.NamedColumn` boundary materializes `[][]byte` views into the
-  blob, pooled across recycled fetches. Flush is a **pass-through**: `block.Column` accepts the
+  blob, pooled across recycled fetches. The per-stream ts sort at flush permutes byte columns through **one scratch column** shared across
+  every column and stream (swapping the permuted result with the column's old array), so an
+  out-of-order flush allocates one destination instead of one per byte column per unsorted stream;
+  an already-ordered stream skips the permute entirely. Flush is a **pass-through**: `block.Column` accepts the
   blob+offsets form directly (`BytesBlob`/`BytesOffsets`, encoded byte-identically to the `Bytes`
   form via `chunk.EncodeBytesBlob`/`EncodeBytesRawBlob`), so writing a part walks the head buffer's
   blobs without materializing a view per row. `**Top-N pushdown**: an unfiltered `Limit`+`Reverse` request reads the live parts in time order

@@ -19,6 +19,9 @@ import (
 type flushColumns struct {
 	stream []chunk.U128
 	cols   *recordCols // full column set (every schema column)
+	// sortScratch is the reusable permutation destination shared by every stream's ts sort — see
+	// [recordCols.sortByTsWith]. It rides the flush buffer because it has the same lifetime.
+	sortScratch byteCol
 }
 
 func (f *flushColumns) len() int { return len(f.stream) }
@@ -144,7 +147,7 @@ func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols, 
 
 	for _, id := range ids {
 		buf := records[id]
-		buf.sortByTs() // order each stream's records by ts so the part is (stream, ts)-sorted
+		buf.sortByTsWith(&f.sortScratch) // order each stream's records by ts so the part is (stream, ts)-sorted
 
 		u := idToU128(id)
 		for i := range buf.ts {
