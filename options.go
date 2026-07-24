@@ -103,8 +103,11 @@ type Options struct {
 	// (Resolved into a duration internally to keep the API import-light.)
 	FlushInterval int64 // nanoseconds
 
-	// OOOWindow is the out-of-order ingestion window in nanoseconds (DESIGN.md §8).
-	// Samples older than (newest - OOOWindow) are rejected (counted). Zero ⇒ default.
+	// OOOWindow is the out-of-order ingestion window in nanoseconds: a per-series (per-stream, on
+	// the record path) lateness bound. A sample or record older than OOOWindow behind its *own*
+	// series' newest admitted timestamp is rejected (and counted), so a lagging series is never shed
+	// because a faster one ran ahead, and a series' first data point is never out of order.
+	// Zero ⇒ default.
 	OOOWindow int64 // nanoseconds
 
 	// MaintenanceConcurrency caps how many engines the background maintenance loop flushes/merges

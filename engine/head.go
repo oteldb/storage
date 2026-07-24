@@ -27,8 +27,17 @@ type head struct {
 	series  *series.Index
 	post    *postings.MemPostings
 	samples map[signal.SeriesID]*sampleBuf
-	newest  int64 // newest timestamp seen, for the OOO window
-	bytes   int64 // buffered sample bytes (SampleBytes each); the in-flight memory measure
+	newest  int64 // newest timestamp across every series (reported as Inspect.MaxTime)
+
+	// seriesNewest is each series' own newest admitted timestamp: the OOO window is a per-series
+	// lateness bound, not a cross-series one, so a high-rate (or clock-skewed-ahead) series cannot
+	// drag the watermark forward for the slower series sharing the head. It outlives a flush —
+	// [head.detach] replaces the sample buffers, but a series' lateness bound is not reset by its
+	// samples becoming durable — and is cleared only with the head itself, so it grows with the same
+	// all-time series set the identity index already retains.
+	seriesNewest map[signal.SeriesID]int64
+
+	bytes int64 // buffered sample bytes (SampleBytes each); the in-flight memory measure
 }
 
 type sampleBuf struct {
@@ -63,16 +72,41 @@ func newHead() *head {
 		series:  series.New(),
 		post:    postings.NewMemPostings(),
 		samples: make(map[signal.SeriesID]*sampleBuf),
+
+		seriesNewest: make(map[signal.SeriesID]int64),
+	}
+}
+
+// outOfOrder reports whether ts is more than oooWindow behind series id's own newest admitted
+// sample. A series' first sample is never out of order, however far behind its neighbors it is.
+func (h *head) outOfOrder(id signal.SeriesID, ts, oooWindow int64) bool {
+	if oooWindow <= 0 {
+		return false
+	}
+
+	newest, seen := h.seriesNewest[id]
+
+	return seen && ts < newest-oooWindow
+}
+
+// noteTS advances series id's own watermark and the head-global one after a sample is admitted.
+func (h *head) noteTS(id signal.SeriesID, ts int64) {
+	if newest, seen := h.seriesNewest[id]; !seen || ts > newest {
+		h.seriesNewest[id] = ts
+	}
+
+	if ts > h.newest {
+		h.newest = ts
 	}
 }
 
 // append adds one sample for series s, registering and indexing it on first sight. A
-// sample older than newest-oooWindow (when oooWindow > 0) is rejected. It returns the
+// sample more than oooWindow behind that series' own newest admitted sample is rejected. It returns the
 // series id, whether the sample was accepted, and whether the series was newly seen (so
 // the caller logs a series record to the WAL).
 func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64) (id signal.SeriesID, accepted, isNew bool) {
 	id = s.Hash()
-	if h.newest != 0 && oooWindow > 0 && ts < h.newest-oooWindow {
+	if h.outOfOrder(id, ts, oooWindow) {
 		return id, false, false
 	}
 
@@ -86,10 +120,7 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 	buf := h.bufFor(id)
 	buf.appendSample(ts, value, 1)
 	h.bytes += SampleBytes
-
-	if ts > h.newest {
-		h.newest = ts
-	}
+	h.noteTS(id, ts)
 
 	return id, true, isNew
 }
@@ -104,7 +135,7 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 func (h *head) appendByID(
 	id signal.SeriesID, ts int64, value, sf float64, oooWindow int64, limits AppendLimits, materialize func() signal.Series,
 ) (out admitOutcome, effID signal.SeriesID, isNew bool, s signal.Series) {
-	if h.newest != 0 && oooWindow > 0 && ts < h.newest-oooWindow {
+	if h.outOfOrder(id, ts, oooWindow) {
 		return rejectOOO, id, false, signal.Series{}
 	}
 
@@ -135,10 +166,7 @@ func (h *head) appendByID(
 
 	buf.appendSample(ts, value, sf)
 	h.bytes += SampleBytes
-
-	if ts > h.newest {
-		h.newest = ts
-	}
+	h.noteTS(id, ts)
 
 	return admitted, id, isNew, s
 }
@@ -197,10 +225,9 @@ func (h *head) appendOverflow(ov signal.Series, ts int64, value, sf float64) (ad
 
 	buf.appendSample(ts, value, sf)
 	h.bytes += SampleBytes
-
-	if ts > h.newest {
-		h.newest = ts
-	}
+	// The sample lands under the overflow identity, so that is the series whose lateness bound it
+	// advances — the shed series never gets one.
+	h.noteTS(oid, ts)
 
 	return admittedOverflow, oid, isNew, ov
 }
@@ -288,9 +315,7 @@ func (h *head) replaySamples(id signal.SeriesID, ts []int64, values []float64) {
 	h.bytes += int64(len(ts)) * SampleBytes
 
 	for _, t := range ts {
-		if t > h.newest {
-			h.newest = t
-		}
+		h.noteTS(id, t)
 	}
 }
 
@@ -306,10 +331,7 @@ func (h *head) replaySamplesSF(id signal.SeriesID, ts []int64, values, sf []floa
 	buf := h.bufFor(id)
 	for i := range ts {
 		buf.appendSample(ts[i], values[i], sf[i])
-
-		if ts[i] > h.newest {
-			h.newest = ts[i]
-		}
+		h.noteTS(id, ts[i])
 	}
 
 	h.bytes += int64(len(ts)) * SampleBytes

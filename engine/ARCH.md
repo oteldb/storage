@@ -26,8 +26,12 @@ splits into plan-under-lock → I/O off-lock → publish-under-lock:
 ## Head
 
 In-memory write buffer: the index (`symbols`+`series`+`postings`) plus per-series `(ts, value)`
-append buffers. Samples older than `newest − OOOWindow` are rejected. **The series index outlives a
-flush** (only sample buffers drain), so flushed series stay queryable and re-appends don't re-index.
+append buffers. `OOOWindow` is a **per-series** lateness bound: a sample more than `OOOWindow` behind
+*that series'* own newest admitted sample is rejected (`head.seriesNewest`), so a fast or
+clock-skewed-ahead series cannot shed the slower series sharing the head, and a series' first sample
+is never out of order. The watermarks outlive a flush — samples becoming durable does not reset a
+series' lateness bound. **The series index outlives a flush** (only sample buffers drain), so flushed
+series stay queryable and re-appends don't re-index.
 
 `AppendBatch` is the hot path: a metric's **precomputed** `SeriesID` + columns + a `materialize`
 callback invoked only on first sight, ingested under a **single lock**. Per sample `appendByID`

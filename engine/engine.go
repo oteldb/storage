@@ -26,7 +26,8 @@ import (
 
 // Config configures an [Engine].
 type Config struct {
-	// OOOWindow rejects samples older than newest-OOOWindow (nanoseconds). 0 disables.
+	// OOOWindow is a per-series lateness bound: a sample older than OOOWindow (nanoseconds) behind
+	// the series' own newest admitted sample is rejected. 0 disables.
 	OOOWindow int64
 	// WAL, when non-nil, durably logs series and samples for crash recovery. nil is the
 	// ephemeral in-memory engine.
