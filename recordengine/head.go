@@ -26,7 +26,11 @@ type head struct {
 	post    *postings.MemPostings
 	records map[signal.SeriesID]*recordCols
 	newest  int64 // newest record timestamp, for the OOO window
-	bytes   int64 // buffered record bytes; the in-flight memory measure
+	bytes   int64 // buffered record bytes
+	// detachedBytes is the byte count [head.detach] moved aside for an in-flight flush. Those buffers
+	// stay fully resident (and the flush builds a second copy from them) until the part is published,
+	// so they belong to the in-flight measure — see [head.inFlightBytes].
+	detachedBytes int64
 }
 
 func newHead(schema *Schema) *head {
@@ -80,7 +84,9 @@ func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow, maxBytes int64
 		return rejectOOO
 	}
 
-	if h.bytes >= headByteCap || (maxBytes > 0 && h.bytes >= maxBytes) {
+	// headByteCap is a format bound on the *next* part's column blobs, so it applies to the live
+	// buffers only; MaxInFlightBytes is memory backpressure, so it applies to everything resident.
+	if h.bytes >= headByteCap || (maxBytes > 0 && h.inFlightBytes() >= maxBytes) {
 		return rejectBytes
 	}
 
@@ -296,6 +302,12 @@ func (h *head) trimBelowCovered(t int64, covered map[signal.SeriesID]struct{}) {
 
 	h.recountBytes()
 }
+
+// inFlightBytes is the engine's resident record bytes: the live head plus whatever a flush has
+// detached but not yet published. It is what [AppendLimits.MaxInFlightBytes] and the flush-pressure
+// trigger meter — dropping the detached part would let a whole second head in on top of the one
+// still being written out.
+func (h *head) inFlightBytes() int64 { return h.bytes + h.detachedBytes }
 
 // recountBytes resets the in-flight byte measure from the current buffers (used after a bulk
 // mutation like trimBelow that does not track per-record deltas).

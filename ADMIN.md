@@ -51,7 +51,7 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 | Field | Meaning |
 |------|---------|
 | `Series` | distinct series/streams ever seen (head ∪ flushed) |
-| `HeadItems` / `HeadBytes` | unflushed samples/records and their in-flight bytes |
+| `HeadItems` / `HeadBytes` | unflushed samples/records and their in-flight bytes. For a record engine `HeadBytes` also counts the buffers an in-flight flush has detached but not yet published — they stay resident, and they are what `MaxInFlightBytes` and `FlushThresholdBytes` meter |
 | `Parts` | flushed immutable part count |
 | `MinTimeUnixNano` / `MaxTimeUnixNano` | data time span (min over parts; max includes the head) |
 | `MergeRunning` | a compaction is executing on this engine right now |
