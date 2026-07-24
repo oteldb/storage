@@ -160,7 +160,7 @@ func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols, 
 		}
 	}
 
-	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
+	slices.SortFunc(ids, signal.SeriesID.Compare)
 
 	f := reuse
 	if f == nil {

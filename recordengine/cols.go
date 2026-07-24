@@ -1,8 +1,9 @@
 package recordengine
 
 import (
+	"cmp"
 	"math"
-	"sort"
+	"slices"
 
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -331,12 +332,12 @@ func (c *recordCols) tsOrder(dst []int) []int {
 		return nil
 	}
 
-	idx := dst
-	for i := range c.len() {
-		idx = append(idx, i)
+	idx := slices.Grow(dst, c.len())[:c.len()]
+	for i := range idx {
+		idx[i] = i
 	}
 
-	sort.SliceStable(idx, func(a, b int) bool { return c.ts[idx[a]] < c.ts[idx[b]] })
+	slices.SortStableFunc(idx, func(a, b int) int { return cmp.Compare(c.ts[a], c.ts[b]) })
 
 	return idx
 }
