@@ -142,7 +142,9 @@ Heavily tuned around decoding as little as possible:
   live parts in time order and stops once it holds `Limit` rows whose watermark is strictly past
   every unread part's bounds. Strict comparison keeps boundary ties, so the result stays a correct
   **superset** for the caller's own exact ordering. Disabled with conditions, whose per-part
-  survivor count is unknown until the filter runs.
+  survivor count is unknown until the filter runs. The watermark heap lives for the whole scan and
+  is fed only the rows each part appends — the accumulators are append-only during a scan, so the
+  bounded top-`Limit` heap is exact incrementally and the scan stays linear in rows read.
 - **Recycling** — `Recycle` pools the per-stream accumulator via `Batch.SetReleaseState`.
   Independently, part-decode int columns are **always** pooled: they are copied by value into
   accumulators, so they are dead once a part is distributed.
