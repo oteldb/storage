@@ -26,10 +26,11 @@ env:
   # The golden query set in oteldb: BenchmarkGoldenLogQL / …TraceQL / …ProfileQL.
   BENCH: '^BenchmarkGolden'
   PKG: './internal/storagebackend/'
-  FLAGS: '-run=^$ -benchmem -benchtime=300ms -count=6 -timeout=30m'
+  # -count=10/-benchtime=500ms rather than the in-repo set's 6/300ms: this runs on a shared runner
+  # where an A/A comparison showed ±4% swings, and more samples is what tightens benchstat's CIs.
+  FLAGS: '-run=^$ -benchmem -benchtime=500ms -count=10 -timeout=45m'
   # oteldb ref to benchmark against. Both sides use it, so the delta stays valid as it moves.
-  # TEMPORARY: pinned to the branch adding the benchmarks until oteldb#1170 merges; flip to main.
-  OTELDB_REF: test/golden-query-benchmarks
+  OTELDB_REF: main
 
 jobs:
   query:

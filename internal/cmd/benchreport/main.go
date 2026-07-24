@@ -188,14 +188,25 @@ func direction(unit string) int {
 	}
 }
 
+// minEffectPct is the effect-size floor a change must clear before it is called an improvement or a
+// regression, on top of benchstat's significance test. The p-value answers "is this difference
+// real", not "is it large enough to act on" — and with enough samples a difference that is pure
+// machine noise still tests as real. Measured on a CI-only PR (no library code in the measured
+// path, so every true delta is zero), 15 of 33 benchmarks came back "significant" at up to ±4%. A
+// gate that reports a regression on every PR gets ignored, so anything under the floor stays
+// neutral in both the verdict and the per-row status.
+const minEffectPct = 5.0
+
+func exceedsFloor(r benchRow) bool { return math.Abs(r.pct) >= minEffectPct }
+
 func isImprovement(r benchRow, unit string) bool {
 	d := direction(unit)
-	return r.significant && ((d < 0 && r.pct < 0) || (d > 0 && r.pct > 0))
+	return r.significant && exceedsFloor(r) && ((d < 0 && r.pct < 0) || (d > 0 && r.pct > 0))
 }
 
 func isRegression(r benchRow, unit string) bool {
 	d := direction(unit)
-	return r.significant && ((d < 0 && r.pct > 0) || (d > 0 && r.pct < 0))
+	return r.significant && exceedsFloor(r) && ((d < 0 && r.pct > 0) || (d > 0 && r.pct < 0))
 }
 
 func writeVerdict(b *strings.Builder, rep report) {
@@ -307,6 +318,7 @@ func writeMeta(b *strings.Builder, rep report) {
 		parts = append(parts, fmt.Sprintf("n=%d/benchmark", rep.n))
 	}
 	parts = append(parts, "`~` = not significant (p≥0.05)")
+	parts = append(parts, fmt.Sprintf("changes under ±%.0f%% treated as noise", minEffectPct))
 
 	fmt.Fprintf(b, "<sub>%s</sub>\n\n", strings.Join(parts, " · "))
 }

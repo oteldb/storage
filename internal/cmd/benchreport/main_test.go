@@ -102,3 +102,31 @@ func TestRenderEmpty(t *testing.T) {
 		t.Errorf("empty input should yield a CAUTION verdict, got:\n%s", out)
 	}
 }
+
+// benchstat's significance test says "this difference is real", not "this difference is large
+// enough to act on". On a shared CI runner a couple of percent tests as real while being pure
+// machine noise, so a change under minEffectPct must not be reported as a regression — see the
+// constant's comment for the A/A measurement that set the floor.
+func TestRenderNoiseFloor(t *testing.T) {
+	t.Parallel()
+
+	const csv = `goos: linux
+goarch: amd64
+,base.txt,,head.txt,,,
+,sec/op,CI,sec/op,CI,vs base,P
+Golden/noisy-4,1e-06,0%,1.04e-06,0%,+4.00%,p=0.002 n=6
+geomean,1e-06,,1.04e-06,,+4.00%,
+`
+
+	out, err := render(strings.NewReader(csv), "", defaultMarker, defaultTitle)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(out, "[!WARNING]") || strings.Contains(out, "regressed") {
+		t.Errorf("a +4%% significant change must stay below the ±%.0f%% floor, got:\n%s", minEffectPct, out)
+	}
+	if !strings.Contains(out, "No statistically significant change") {
+		t.Errorf("expected the neutral verdict, got:\n%s", out)
+	}
+}
