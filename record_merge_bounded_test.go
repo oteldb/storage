@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"runtime"
+	"runtime/debug"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -24,6 +25,14 @@ import (
 //nolint:paralleltest // measures process-global runtime.MemStats; a parallel test's allocations add noise.
 func TestRecordMergeBoundedWorkingSet(t *testing.T) {
 	ctx := context.Background()
+
+	// Measure merge allocation with the collector off. Each round already forces a GC before its
+	// window, which drains the engine's sync.Pools, so every merge pays exactly one pool refill. A GC
+	// landing *inside* the window drains them again and charges a second refill (~25 MiB here) to that
+	// round — noise that is pure GC timing, unrelated to the merge working set this asserts on. With
+	// the collector off each round pays one refill and the measurement is deterministic; TotalAlloc
+	// counts allocation volume, not live heap, so no real merge allocation is hidden.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 
 	fb, err := backendfile.New(t.TempDir())
 	require.NoError(t, err)
