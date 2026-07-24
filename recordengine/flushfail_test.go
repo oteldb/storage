@@ -2,6 +2,7 @@ package recordengine_test
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -14,15 +15,17 @@ import (
 )
 
 // rejectWrites wraps a backend and fails Write while armed — the routine case a flush must survive:
-// a transient object-store error.
+// a transient object-store error. A non-empty only restricts the failure to keys with that suffix,
+// which models a crash at one specific point of the publish sequence.
 type rejectWrites struct {
 	backend.Backend
 
 	armed atomic.Bool
+	only  string
 }
 
 func (r *rejectWrites) Write(ctx context.Context, key string, data []byte) error {
-	if r.armed.Load() {
+	if r.armed.Load() && (r.only == "" || strings.HasSuffix(key, r.only)) {
 		return errors.New("injected write failure")
 	}
 

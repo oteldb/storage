@@ -1112,11 +1112,18 @@ func (e *Engine) abortFlush(
 // publishLocked persists the engine's part set (bucket index + stream identity index) and, for a
 // flush, checkpoints the WAL to the advanced watermark. Caller holds e.mu.
 func (e *Engine) publishLocked(ctx context.Context) error {
-	if err := e.updateIndexLocked(ctx); err != nil {
+	// Ordering is a durability invariant: the stream index goes first, the bucket index last. The
+	// bucket index carries the flush watermark (the WAL replay floor), so writing it is the commit
+	// point. The stream set is superset-safe — an identity persisted with no rows behind it is inert,
+	// as every part range lookup misses it — whereas a committed part whose identities are missing
+	// from the stream index holds rows no matcher can ever resolve, while the advanced watermark
+	// makes replay skip them: permanent loss. Crashing between the two must leave extra identities,
+	// never orphaned rows.
+	if err := e.writeStreamIndexLocked(ctx); err != nil {
 		return err
 	}
 
-	if err := e.writeStreamIndexLocked(ctx); err != nil {
+	if err := e.updateIndexLocked(ctx); err != nil {
 		return err
 	}
 

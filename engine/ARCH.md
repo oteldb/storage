@@ -41,6 +41,17 @@ sample, sorted by `(series, ts)`, under `{tenant}/metrics/{seq}`. It then update
 index objects: the **bucket index** (part list + time bounds) and the **identity index**
 (`series.bin`). Merge updates both too, committing the new part set *before* deleting sources.
 
+**Publish order: `series.bin` first, the bucket index last.** The bucket index is what makes a part
+durably visible, so writing it is the commit point, and a part is only readable once its series'
+identities are durable — a stateless reader rebuilds them from `series.bin` alone, so a committed
+part whose identities are missing holds samples no matcher can reach. The reverse is harmless: the
+identity set is superset-safe (it only grows across flushes, so it already carries identities with no
+live rows), and one whose part never committed resolves to a series id no part range covers, yielding
+no batch. Unlike `recordengine`, the metrics bucket index carries no `FlushedEpoch` — the WAL
+`Checkpoint` (which runs last, after both) is the WAL's commit point, so with durability enabled
+replay still recovers a part that failed to publish. The unreadable-commit window bites the
+backend-only configuration (a persistent backend with no `WALDir`), where nothing else holds the rows.
+
 `MaxPartBytes` bounds output: flush splits at the cap, a merge splits at the taller
 `mergeHeight × MaxPartBytes` so same-tier siblings promote instead of re-splitting. Splitting at
 row boundaries is safe — parts are independent and a series spanning two is merged back by the read
