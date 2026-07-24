@@ -47,6 +47,22 @@ whatever arrived meanwhile) and restores the side-store snapshot via `SideStore.
 only runs on a successful publish, so without the fold-back the rows would be lost the moment the next
 flush overwrote the in-flight buffer.
 
+## Part sequences & orphans
+
+Part prefixes (`<prefix>/%010d`) are **append-only**: flush and merge reserve each output part's
+sequence as they write it and advance the counter immediately, so an attempt that failed after
+writing some objects burns its sequence rather than handing it to the retry. Reuse would be
+unsound — a rewrite replaces only the objects it itself produces, and two of a part's objects are
+conditional (`keys.bin` is skipped when the rows carry no record attributes, the `sym-*.bin`
+sidecars when there is no side data), so the new part would silently adopt the failed attempt's.
+
+The leftovers are **swept at open**: `LoadParts` lists the engine prefix and deletes every object
+under a part directory the bucket index does not name (a failed attempt's, or a retired part whose
+reclaim delete failed), and resumes the sequence past the highest one seen on the backend — so the
+guarantee survives a restart, where the index alone would hand the orphan's sequence back out.
+The sweep assumes this node **owns** the prefix, so a replica's `RefreshReplica` skips it: it shares
+the store with the owner, whose in-flight part is not in the index yet.
+
 ## Fetch
 
 Heavily tuned around decoding as little as possible:

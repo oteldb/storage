@@ -57,11 +57,19 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 // unflushed head samples — but is not required to query flushed data.
 //
 // It replaces any current parts and advances the part sequence past the highest existing
-// part. A head-only engine (no backend) is a no-op.
+// part. A head-only engine (no backend) is a no-op. It assumes this node owns the prefix — it
+// sweeps the part objects the index does not name (see [Engine.sweepOrphansLocked]).
 func (e *Engine) LoadParts(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	return e.loadPartsLocked(ctx, true)
+}
+
+// loadPartsLocked is [Engine.LoadParts] with the orphan sweep made optional: a replica shares the
+// prefix with the owner, whose in-flight (not yet committed) part must not be deleted underneath it.
+// Caller holds e.mu.
+func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 	if e.cfg.Backend == nil {
 		return nil
 	}
@@ -91,6 +99,15 @@ func (e *Engine) LoadParts(ctx context.Context) error {
 	e.parts = parts
 	e.nextSeq = maxSeq + 1
 
+	if sweep {
+		next, err := e.sweepOrphansLocked(ctx, maxSeq)
+		if err != nil {
+			return err
+		}
+
+		e.nextSeq = next
+	}
+
 	return e.loadSeriesIndexLocked(ctx)
 }
 
@@ -100,12 +117,12 @@ func (e *Engine) LoadParts(ctx context.Context) error {
 // dropped, bounding replica memory. With no shared store (this node cannot see the parts), it
 // is a safe no-op: nothing loads, so nothing is trimmed.
 func (e *Engine) RefreshReplica(ctx context.Context) error {
-	if err := e.LoadParts(ctx); err != nil {
-		return err
-	}
-
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	if err := e.loadPartsLocked(ctx, false); err != nil {
+		return err
+	}
 
 	if len(e.parts) == 0 {
 		return nil

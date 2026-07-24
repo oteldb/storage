@@ -928,7 +928,8 @@ func (p *fetchPlan) releaseParts() {
 func (e *Engine) flush(ctx context.Context) (int, error) {
 	// Plan (under lock): detach the head's record buffers (keeping them readable via e.flushing so a
 	// concurrent fetch never loses them), snapshot the side-store delta atomically with the detach (so
-	// a concurrent append's symbols aren't lost by the Reset), and reserve the part sequence.
+	// a concurrent append's symbols aren't lost by the Reset). Part sequences are reserved per part
+	// below, as the parts are written.
 	e.mu.Lock()
 	detached, detachedBytes := e.head.detach()
 	if detached == nil {
@@ -939,7 +940,6 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	}
 
 	e.flushing = detached
-	seq := e.nextSeq
 
 	var side map[string][]byte
 	if e.cfg.SideStore != nil {
@@ -964,13 +964,13 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 
 	newParts := make([]*part, 0, len(ranges))
 
-	for i, rg := range ranges {
+	for _, rg := range ranges {
 		sub := f
 		if len(ranges) > 1 {
 			sub = f.slice(rg[0], rg[1])
 		}
 
-		prefix := e.partPrefix(seq + i)
+		prefix := e.partPrefix(e.reserveSeq())
 
 		// Flush writes columns codec-only (no block compression) to keep ingest cheap; the cold merge
 		// recompresses. See [Config.MergeCompression].
@@ -998,7 +998,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 
 	// Publish (under lock): add the part copy-on-write and clear e.flushing in the same critical
 	// section — so a fetch sees the records either in e.flushing or in the part, never neither (no gap)
-	// and never both (no double count). Bump the sequence and the flush watermark, then persist the
+	// and never both (no double count). Bump the flush watermark, then persist the
 	// index/stream-index and checkpoint the WAL — small metadata writes kept under the lock so the
 	// parts swap and the durable watermark commit stay atomic, preserving the exactly-once
 	// crash-consistency ordering (index commits the watermark, then the WAL checkpoint discards the
@@ -1008,7 +1008,6 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		e.parts = appendPart(e.parts, p)
 	}
 	e.flushing = nil
-	e.nextSeq = seq + len(ranges)
 	e.flushedEpoch++
 	err := e.publishLocked(ctx)
 	e.mu.Unlock()

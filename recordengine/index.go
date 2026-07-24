@@ -42,11 +42,19 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 
 // LoadParts reconstructs the engine's durable state from the object store: the part set from the
 // bucket index and the stream identity index from the persisted object. A head-only engine is a
-// no-op. Replaces current parts and advances the sequence.
+// no-op. Replaces current parts and advances the sequence. It assumes this node owns the prefix — it
+// sweeps the part objects the index does not name (see [Engine.sweepOrphansLocked]).
 func (e *Engine) LoadParts(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	return e.loadPartsLocked(ctx, true)
+}
+
+// loadPartsLocked is [Engine.LoadParts] with the orphan sweep made optional: a replica shares the
+// prefix with the owner, whose in-flight (not yet committed) part must not be deleted underneath it.
+// Caller holds e.mu.
+func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 	if e.cfg.Backend == nil {
 		return nil
 	}
@@ -77,6 +85,15 @@ func (e *Engine) LoadParts(ctx context.Context) error {
 	e.nextSeq = maxSeq + 1
 	e.flushedEpoch = ix.FlushedEpoch
 
+	if sweep {
+		next, err := e.sweepOrphansLocked(ctx, maxSeq)
+		if err != nil {
+			return err
+		}
+
+		e.nextSeq = next
+	}
+
 	// New head records belong to the generation past the recovered watermark; replay (which the
 	// facade runs next) then skips everything the loaded parts already hold.
 	if e.cfg.WAL != nil {
@@ -90,12 +107,12 @@ func (e *Engine) LoadParts(ctx context.Context) error {
 // reconstructs the flushed parts and trims its head to the still-unflushed window. With no shared
 // store, a safe no-op.
 func (e *Engine) RefreshReplica(ctx context.Context) error {
-	if err := e.LoadParts(ctx); err != nil {
-		return err
-	}
-
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	if err := e.loadPartsLocked(ctx, false); err != nil {
+		return err
+	}
 
 	if len(e.parts) == 0 {
 		return nil

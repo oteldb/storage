@@ -50,6 +50,16 @@ Driven by the facade's single background maintenance loop, plus a head-bytes pre
 flushes just the over-threshold engines. Because both paths run on one goroutine, an engine is
 never flushed twice concurrently.
 
+**Part sequences are append-only.** Flush and merge reserve each output part's `{seq}` as they write
+it and advance the counter immediately, so an attempt that failed after writing some objects burns
+its sequence rather than handing it to the retry — a rewrite replaces only the objects it itself
+produces, so a part landing on the leftovers inherits objects it never wrote. `LoadParts` sweeps the
+residue: it lists the prefix, deletes every object under a part directory the bucket index does not
+name (a failed attempt's, or a retired part whose reclaim delete failed), and resumes the sequence
+past the highest one seen on the backend — so the guarantee survives a restart, where the index
+alone would hand the orphan's sequence back out. The sweep assumes this node **owns** the prefix, so
+a replica's `RefreshReplica` skips it: the owner's in-flight part is not in the index yet.
+
 ## Merge — one pass, five modes
 
 `MergeWith(MergeOptions{RetainFrom, Downsample, Recompress, Precision})` compacts a **bounded,

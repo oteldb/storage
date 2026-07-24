@@ -260,6 +260,23 @@ func (e *Engine) partPrefix(seq int) string {
 	return fmt.Sprintf("%s/%010d", e.cfg.Prefix, seq)
 }
 
+// reserveSeq allocates the next part sequence and advances the counter immediately, so part prefixes
+// are append-only: an attempt that fails after writing some of its objects burns its sequence instead
+// of leaving it for the retry. Reuse would be unsound — the retry overwrites only the objects it
+// itself produces, and two of a part's objects are conditional (the record-key footer is skipped when
+// the rows carry no attributes, the side-store sidecars when the flush has no side data), so a
+// reusing part silently adopts the failed attempt's keys.bin / symbol tables. The leftovers are swept
+// at open by [Engine.LoadParts]. Safe for concurrent use.
+func (e *Engine) reserveSeq() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	seq := e.nextSeq
+	e.nextSeq++
+
+	return seq
+}
+
 // colsTimeRange returns the inclusive min/max timestamp across f (≥ 1 record when a part is written).
 func colsTimeRange(f *flushColumns) (minTime, maxTime int64) {
 	minTime, maxTime = maxInt64, minInt64
