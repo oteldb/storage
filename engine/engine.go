@@ -1187,11 +1187,19 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 // publishLocked persists the engine's part set (bucket index + series identity index) and checkpoints
 // the WAL — the now-durable part makes its WAL records obsolete. Caller holds e.mu.
 func (e *Engine) publishLocked(ctx context.Context) error {
-	if err := e.updateIndexLocked(ctx); err != nil {
+	// Ordering is a durability invariant: the series index goes first, the bucket index last. The
+	// bucket index is what makes a part durably visible, so writing it is the commit point, and a
+	// part is only readable once the identities of its series are durable — a stateless reader
+	// rebuilds them from series.bin alone. The series set is superset-safe: an identity persisted
+	// whose part never committed resolves to a series id no part range covers and yields no batch
+	// (the steady state already carries such identities, since the set only grows across flushes),
+	// whereas a committed part whose identities are missing holds samples no matcher can reach.
+	// Crashing between the two must leave extra identities, never an unreadable part.
+	if err := e.writeSeriesIndexLocked(ctx); err != nil {
 		return err
 	}
 
-	if err := e.writeSeriesIndexLocked(ctx); err != nil {
+	if err := e.updateIndexLocked(ctx); err != nil {
 		return err
 	}
 
