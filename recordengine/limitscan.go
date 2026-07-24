@@ -63,45 +63,32 @@ func beyondWatermark(pt *part, watermark int64, reverse bool) bool {
 	return pt.minTime > watermark
 }
 
-// limitWatermark returns the limit-th newest (reverse) or oldest timestamp among the rows collected
-// so far, and whether that many rows exist. It selects through a bounded heap, so the cost is
-// O(rows · log limit) with no allocation beyond the heap itself.
-func limitWatermark(accs map[signal.SeriesID]*recordCols, ids []signal.SeriesID, limit int, reverse bool) (int64, bool) {
-	if limit <= 0 {
-		return 0, false
-	}
-
-	h := &tsHeap{reverse: reverse, ts: make([]int64, 0, limit)}
-
-	for _, id := range ids {
-		acc := accs[id]
-		if acc == nil {
-			continue
-		}
-
-		for _, t := range acc.ts {
-			switch {
-			case len(h.ts) < limit:
-				heap.Push(h, t)
-			case h.better(t, h.ts[0]):
-				h.ts[0] = t
-				heap.Fix(h, 0)
-			}
-		}
-	}
-
-	if len(h.ts) < limit {
-		return 0, false
-	}
-
-	return h.ts[0], true
-}
-
 // tsHeap keeps the limit best timestamps seen, with the *worst* of them at the root so a new
 // candidate is compared and swapped in O(log limit). "Best" is newest when reverse, else oldest.
 type tsHeap struct {
 	ts      []int64
+	limit   int
 	reverse bool
+}
+
+// newLimitWatermark returns a watermark tracker for a limit-row top-N in the given direction, seeded
+// with the rows the plan already holds (head + in-flight flush buffers).
+//
+// The tracker is kept for the whole scan and fed only the rows each part appends: rows are never
+// removed from an accumulator during the scan, so a bounded top-limit heap can be maintained
+// incrementally. Rebuilding it per part would re-scan every row accumulated so far, making the scan
+// quadratic in the number of parts. Feed order does not matter — the limit best timestamps, and so
+// the watermark, are the same set either way.
+func newLimitWatermark(accs map[signal.SeriesID]*recordCols, ids []signal.SeriesID, limit int, reverse bool) *tsHeap {
+	h := &tsHeap{reverse: reverse, limit: limit, ts: make([]int64, 0, max(limit, 0))}
+
+	for _, id := range ids {
+		if acc := accs[id]; acc != nil {
+			h.add(acc.ts)
+		}
+	}
+
+	return h
 }
 
 func (h *tsHeap) Len() int           { return len(h.ts) }
@@ -109,6 +96,39 @@ func (h *tsHeap) Less(i, j int) bool { return h.better(h.ts[j], h.ts[i]) } // wo
 func (h *tsHeap) Swap(i, j int)      { h.ts[i], h.ts[j] = h.ts[j], h.ts[i] }
 func (h *tsHeap) Push(x any)         { v, _ := x.(int64); h.ts = append(h.ts, v) }
 func (h *tsHeap) Pop() any           { v := h.ts[len(h.ts)-1]; h.ts = h.ts[:len(h.ts)-1]; return v }
+
+// add offers each timestamp to the heap, keeping the limit best seen so far. Cost is
+// O(len(ts) · log limit) with no allocation.
+func (h *tsHeap) add(ts []int64) {
+	if h.limit <= 0 {
+		return
+	}
+
+	for _, t := range ts {
+		switch {
+		case len(h.ts) < h.limit:
+			// Below capacity the heap invariant is not needed yet (nothing is evicted), so append and
+			// establish it once, on the row that fills it — this also avoids heap.Push's boxing.
+			h.ts = append(h.ts, t)
+			if len(h.ts) == h.limit {
+				heap.Init(h)
+			}
+		case h.better(t, h.ts[0]):
+			h.ts[0] = t
+			heap.Fix(h, 0)
+		}
+	}
+}
+
+// watermark returns the limit-th newest (reverse) or oldest timestamp collected so far, and whether
+// that many rows exist.
+func (h *tsHeap) watermark() (int64, bool) {
+	if h.limit <= 0 || len(h.ts) < h.limit {
+		return 0, false
+	}
+
+	return h.ts[0], true
+}
 
 // better reports whether a ranks ahead of b for this request's direction.
 func (h *tsHeap) better(a, b int64) bool {

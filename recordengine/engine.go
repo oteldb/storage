@@ -821,6 +821,9 @@ type fetchPlan struct {
 	limit             int
 	reverse           bool
 	partsSkippedLimit int
+	// wm is the top-N watermark heap, maintained incrementally across the part scan (nil until
+	// readParts starts a limited scan).
+	wm *tsHeap
 }
 
 // planFetch builds the fetch plan: it selects and acquires the live parts that may hold a requested
@@ -924,6 +927,9 @@ func (p *fetchPlan) readParts(ctx context.Context) error {
 
 	if p.limit > 0 {
 		p.orderPartsForLimit(p.reverse) // newest-first (or oldest-first), so the scan can stop early
+		// Seeded from the head rows planFetch already accumulated; each part then feeds it just the
+		// rows it appends, so the watermark costs O(rows · log limit) over the whole scan.
+		p.wm = newLimitWatermark(p.accs, p.ids, p.limit, p.reverse)
 	}
 
 	for i, part := range p.liveParts {
@@ -933,8 +939,14 @@ func (p *fetchPlan) readParts(ctx context.Context) error {
 		}
 
 		for _, id := range p.ids {
-			if rng, ok := part.ranges[id]; ok {
-				appendWindowRows(p.accs[id], cols, rng, p.start, p.end)
+			acc := p.accs[id]
+			if rng, ok := part.ranges[id]; ok && acc != nil {
+				n := acc.len()
+				appendWindowRows(acc, cols, rng, p.start, p.end)
+
+				if p.wm != nil {
+					p.wm.add(acc.ts[n:])
+				}
 			}
 		}
 
@@ -954,11 +966,11 @@ func (p *fetchPlan) readParts(ctx context.Context) error {
 // watermark and can be skipped. The parts are time-ordered, so the next one bounds every one after
 // it (see limitscan.go).
 func (p *fetchPlan) stopAfter(i int) bool {
-	if p.limit <= 0 || i+1 >= len(p.liveParts) {
+	if p.wm == nil || i+1 >= len(p.liveParts) {
 		return false
 	}
 
-	watermark, ok := limitWatermark(p.accs, p.ids, p.limit, p.reverse)
+	watermark, ok := p.wm.watermark()
 	if !ok {
 		return false
 	}
