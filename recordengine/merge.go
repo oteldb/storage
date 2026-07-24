@@ -257,7 +257,8 @@ func (e *Engine) writeMergedPart(ctx context.Context, src []*part, f *flushColum
 	prefix := e.partPrefix(seq)
 	// Compacted parts are the cold, long-lived data — block-compress them (typically ZSTD) so the
 	// dict/DoD-coded columns are also entropy-coded. Defaults to AlgorithmNone (legacy, uncompressed).
-	if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f, e.cfg.MergeCompression, e.cfg.MergeCompressionLevel); err != nil {
+	if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f, e.cfg.MergeCompression, e.cfg.MergeCompressionLevel,
+		e.blooms()); err != nil {
 		return nil, err
 	}
 

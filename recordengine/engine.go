@@ -90,6 +90,10 @@ type Engine struct {
 	// single flusher and a part is fully written before the next flush begins, so its arrays can be
 	// re-armed instead of reallocated and re-zeroed each time.
 	flushBuf *flushColumns
+	// bloomBuf is the scratch the bloom build of the last written part used, kept for the next one.
+	// A part is written by a flush or a merge, both of which run under flushMu, so the same
+	// single-writer argument as flushBuf applies — see [Engine.blooms].
+	bloomBuf *bloomBuilder
 	// flushedEpoch is the WAL flush watermark: the generation of the most recently flushed head
 	// (persisted in the bucket index). Current head records are written to the WAL at flushedEpoch+1,
 	// so on recovery the engine replays only WAL segments past flushedEpoch — exactly-once.
@@ -1056,7 +1060,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 
 		// Flush writes columns codec-only (no block compression) to keep ingest cheap; the cold merge
 		// recompresses. See [Config.MergeCompression].
-		if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, sub, compress.AlgorithmNone, 0); err != nil {
+		if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, sub, compress.AlgorithmNone, 0, e.blooms()); err != nil {
 			return 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
 		}
 

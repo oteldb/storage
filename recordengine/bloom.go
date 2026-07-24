@@ -35,7 +35,9 @@ func appendAttrToken(dst, key, value []byte) []byte {
 }
 
 // bloomBuilder holds the reusable scratch one column's bloom build needs, so walking a column
-// allocates nothing per token or per row.
+// allocates nothing per token or per row — and, since the scratch outlives a single column
+// ([bloomBuilder.build] re-arms it), nothing per column of a part either. One builder is owned by the
+// engine and re-armed per column, exactly like flushColumns: see [Engine.blooms].
 type bloomBuilder struct {
 	words    bloom.Scanner       // token scanner, keeps its case-folding buffer
 	attrs    signal.Attributes   // reused attribute-decode buffer
@@ -43,6 +45,7 @@ type bloomBuilder struct {
 	token    []byte              // reused key-scoped token
 	distinct bloom.Sketch        // reused distinct-token estimator (constant 4 KiB)
 	seen     map[uint64]struct{} // value hashes already walked, for the repeated-value skip
+	rowsBuf  []int               // backing array of rows, kept across columns
 	rows     []int               // rows holding a value's first occurrence; nil ⇒ walk every row
 }
 
@@ -173,12 +176,30 @@ func (bb *bloomBuilder) forEachToken(mode BloomMode, values *byteCol, fn func(to
 // value is still walked), it just stops growing.
 const maxDedupRows = 1 << 18
 
-// markRows fills bb.rows with the rows holding a value's first occurrence, or leaves it nil when the
-// column has too many distinct values for the dedup to be worth its map. Values are compared by
+// selectRows decides which rows the build walks. The dedup pass costs a hash and a map probe per
+// row, so it is only run for the modes whose columns actually repeat: log bodies are templated and
+// one attribute blob is shared by a whole stream, so skipping duplicates there removes most of the
+// tokenization work. [BloomEquality] columns are the opposite — trace_id, where real data is ~82%
+// distinct — so the pass would pay a full-column hash to skip almost nothing.
+//
+// Which rows are walked never changes the filter: a repeated value re-derives tokens the filter and
+// the distinct-count sketch already hold, and both are idempotent per token (see
+// TestBuildColumnBloomDedupIsBitIdentical).
+func (bb *bloomBuilder) selectRows(mode BloomMode, values *byteCol) {
+	if mode == BloomEquality {
+		bb.rows = nil // walk every row
+
+		return
+	}
+
+	bb.markRows(values)
+}
+
+// markRows fills bb.rows with the rows holding a value's first occurrence. Values are compared by
 // 64-bit hash: a collision would drop a row (a marginally smaller token set, never a false
 // negative for the values that were walked), at a probability far below the filter's own.
 func (bb *bloomBuilder) markRows(values *byteCol) {
-	bb.rows = bb.rows[:0]
+	rows := bb.rowsBuf[:0]
 
 	if bb.seen == nil {
 		bb.seen = make(map[uint64]struct{}, 1024)
@@ -196,15 +217,17 @@ func (bb *bloomBuilder) markRows(values *byteCol) {
 			// The set is full: keep every remaining row rather than dropping the dedup entirely,
 			// so the rows walked so far still skip their duplicates.
 			for ; i < values.rows(); i++ {
-				bb.rows = append(bb.rows, i)
+				rows = append(rows, i)
 			}
 
-			return
+			break
 		}
 
 		bb.seen[h] = struct{}{}
-		bb.rows = append(bb.rows, i)
+		rows = append(rows, i)
 	}
+
+	bb.rowsBuf, bb.rows = rows, rows
 }
 
 // each walks the rows the builder selected: the first-occurrence set when markRows built one, every
@@ -296,15 +319,13 @@ func (bb *bloomBuilder) eachAttrs(values *byteCol, fn func(token []byte)) {
 // by, once to hash the tokens in — rather than materializing every token to learn that count. Both
 // passes see the same token set, so the filter matches a single-pass build; the second walk is far
 // cheaper than the per-token allocations (and the live [][]byte holding them) it replaces.
-func buildColumnBloom(mode BloomMode, values *byteCol) []byte {
+func (bb *bloomBuilder) build(mode BloomMode, values *byteCol) []byte {
 	if mode == BloomNone {
 		return nil
 	}
 
-	var bb bloomBuilder
-
-	// The first-occurrence set is computed once and drives both the sizing walk and the filling one.
-	bb.markRows(values)
+	// The row selection is computed once and drives both the sizing walk and the filling one.
+	bb.selectRows(mode, values)
 
 	f := bloom.New(bb.sizeTokens(mode, values), falsePositiveRate(mode))
 	bb.forEachToken(mode, values, f.Add)
@@ -312,22 +333,47 @@ func buildColumnBloom(mode BloomMode, values *byteCol) []byte {
 	return f.Encode(nil)
 }
 
+// buildColumnBloom is [bloomBuilder.build] on a throwaway builder, for callers with a single column
+// to build and no builder to re-arm.
+func buildColumnBloom(mode BloomMode, values *byteCol) []byte {
+	var bb bloomBuilder
+
+	return bb.build(mode, values)
+}
+
 // writeBlooms writes a bloom sidecar for each bloom-bearing column of the schema, over the flushed
-// columns. The blooms share the part prefix, so deletePart / Reset clean them up.
-func writeBlooms(ctx context.Context, b backend.Backend, schema *Schema, prefix string, cols *recordCols) error {
+// columns. The blooms share the part prefix, so deletePart / Reset clean them up. bb is re-armed per
+// column, so a part's whole bloom set is built out of one set of scratch buffers.
+func writeBlooms(
+	ctx context.Context, b backend.Backend, schema *Schema, prefix string, cols *recordCols, bb *bloomBuilder,
+) error {
 	for k := range schema.byteCols {
 		col := schema.byteColumn(k)
 		if col.Bloom == BloomNone {
 			continue
 		}
 
-		data := buildColumnBloom(col.Bloom, &cols.bytes[k])
+		data := bb.build(col.Bloom, &cols.bytes[k])
 		if err := b.Write(ctx, bloomKey(prefix, col.Name), data); err != nil {
 			return errors.Wrapf(err, "write bloom %q", col.Name)
 		}
 	}
 
 	return nil
+}
+
+// blooms returns the engine's reusable bloom builder, allocating it on the first part written. Every
+// part write goes through a flush or a merge, and both hold flushMu for their whole body, so the
+// builder has one user at a time — the same ownership as [Engine.flushBuf]; call it under flushMu.
+// It keeps its scratch (the token/attribute buffers and the first-occurrence map, bounded by
+// maxDedupRows) between parts, which is the point: otherwise every bloom-bearing column of every
+// flush reallocates all of it.
+func (e *Engine) blooms() *bloomBuilder {
+	if e.bloomBuf == nil {
+		e.bloomBuf = &bloomBuilder{}
+	}
+
+	return e.bloomBuf
 }
 
 // loadBlooms reads the bloom sidecar of each bloom-bearing column. A missing sidecar is skipped

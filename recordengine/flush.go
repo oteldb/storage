@@ -231,7 +231,7 @@ func flushShape(schema *Schema, records map[signal.SeriesID]*recordCols, ids []s
 // kept cheap), while the cold merge passes ZSTD to entropy-code the long-lived compacted data.
 func writePart(
 	ctx context.Context, b backend.Backend, schema *Schema, prefix string, f *flushColumns,
-	comp compress.Algorithm, level compress.Level,
+	comp compress.Algorithm, level compress.Level, bb *bloomBuilder,
 ) error {
 	opts := []block.PartOption{block.WithSortKey(colTs)}
 	if comp != compress.AlgorithmNone {
@@ -272,7 +272,7 @@ func writePart(
 		return errors.Wrapf(err, "write part %q", prefix)
 	}
 
-	if err := writeBlooms(ctx, b, schema, prefix, f.cols); err != nil {
+	if err := writeBlooms(ctx, b, schema, prefix, f.cols, bb); err != nil {
 		return err
 	}
 
