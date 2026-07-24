@@ -122,9 +122,16 @@ func (h *head) detach() (map[signal.SeriesID]*recordCols, int64) {
 	detached, bytes := h.records, h.bytes
 	h.records = make(map[signal.SeriesID]*recordCols)
 	h.bytes = 0
+	// The detached buffers are still resident: keep their bytes in the in-flight measure until the
+	// part is published ([head.releaseDetached]) or they are folded back in ([head.reattach]).
+	h.detachedBytes = bytes
 
 	return detached, bytes
 }
+
+// releaseDetached drops the detached buffers' bytes from the in-flight measure. Called when the
+// flushed part is published — the point at which the engine lets go of the buffers.
+func (h *head) releaseDetached() { h.detachedBytes = 0 }
 
 // reattach folds buffers detached by a failed flush back into the head, so the records are retried by
 // the next flush instead of being dropped: the part was never published, so nothing else holds them.
@@ -144,7 +151,10 @@ func (h *head) reattach(detached map[signal.SeriesID]*recordCols, bytes int64) {
 		h.records[id] = buf
 	}
 
+	// The bytes move back from the detached side of the measure to the live one; counting them in
+	// both would permanently inflate the in-flight total.
 	h.bytes += bytes
+	h.detachedBytes = 0
 }
 
 // buildFlushColumns lays the detached record buffers out as part columns sorted by (stream, ts). It

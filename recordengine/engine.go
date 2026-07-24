@@ -237,20 +237,22 @@ func (e *Engine) AppendBatch(b *Batch, limits AppendLimits) (AppendResult, error
 	return res, nil
 }
 
-// HeadBytes returns the head's current buffered record bytes — the in-flight memory measure for
-// [AppendLimits.MaxInFlightBytes].
+// HeadBytes returns the engine's buffered record bytes — the in-flight memory measure for
+// [AppendLimits.MaxInFlightBytes]. It counts the live head plus the buffers an in-flight flush has
+// detached but not yet published: those stay resident, so the measure must not dip to zero (and let
+// a second head in) for the duration of a slow flush.
 func (e *Engine) HeadBytes() int64 {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	return e.head.bytes
+	return e.head.inFlightBytes()
 }
 
 // Stats is an in-memory snapshot of a record engine's state for introspection (no backend I/O).
 type Stats struct {
 	Streams     int64 // distinct streams ever seen (index span: head ∪ flushed)
 	HeadRecords int64 // records currently buffered in the head (unflushed)
-	HeadBytes   int64 // head's buffered record bytes (the in-flight memory measure)
+	HeadBytes   int64 // buffered record bytes, head + in-flight flush (the in-flight memory measure)
 	Parts       int   // flushed immutable parts
 	MinTime     int64 // oldest flushed record time (unix ns); 0 when no parts
 	MaxTime     int64 // newest record time across parts and the head (unix ns); 0 when empty
@@ -264,7 +266,7 @@ func (e *Engine) Stats() Stats {
 
 	s := Stats{
 		Streams:   int64(e.head.series.Len()),
-		HeadBytes: e.head.bytes,
+		HeadBytes: e.head.inFlightBytes(),
 		Parts:     len(e.parts),
 		MaxTime:   e.head.newest,
 	}
@@ -1046,6 +1048,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		e.parts = appendPart(e.parts, p)
 	}
 	e.flushing = nil
+	e.head.releaseDetached() // the buffers are gone with e.flushing: drop them from the in-flight measure
 	e.flushedEpoch++
 	err := e.publishLocked(ctx)
 	e.mu.Unlock()

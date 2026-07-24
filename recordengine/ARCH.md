@@ -79,7 +79,15 @@ drains.
 The head has a hard byte ceiling of `headByteCap` (2 GiB) independent of `MaxInFlightBytes`: a flush
 concatenates every stream's cells into one blob per byte column, indexed by `byteCol`'s int32
 offsets. Past the cap records are rejected as memory backpressure — overflowing would write negative
-offsets into a part.
+offsets into a part. The cap is a bound on the *next* part's blobs, so it meters the live buffers
+only; `MaxInFlightBytes` is memory backpressure, so it meters everything resident.
+
+"Resident" includes the detached buffers: `head.detach` moves them aside but they (and the flush
+columns built from them) live until the part is published, so their size is parked in
+`head.detachedBytes` and `head.inFlightBytes` (= `HeadBytes` = `Stats.HeadBytes`) keeps counting it.
+It is cleared at the publish, or handed back to the live count by `head.reattach` on a failed flush —
+never both. Without it the measure would read zero for the whole duration of a slow flush, and
+`MaxInFlightBytes` would admit a second full head on top of the one still being written out.
 
 ## Fetch
 
