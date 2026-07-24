@@ -50,6 +50,16 @@ whatever arrived meanwhile) and restores the side-store snapshot via `SideStore.
 only runs on a successful publish, so without the fold-back the rows would be lost the moment the next
 flush overwrote the in-flight buffer.
 
+## Merge publish ordering
+
+A merge retires its source parts — queues them for backend deletion — **only after** the bucket index
+naming their replacement is committed. The index is what a restart and every other replica read, so a
+part the persisted index still names must never become reclaimable; retiring first would let the next
+maintenance tick's reclaim delete objects the index references, and `LoadParts` hard-fails the whole
+engine on a missing part. A failed commit rolls the in-memory part swap back to the committed set, so
+the uncommitted output is never observable as published; its objects are orphans, swept at the next
+open.
+
 ## Part sequences & orphans
 
 Part prefixes (`<prefix>/%010d`) are **append-only**: flush and merge reserve each output part's

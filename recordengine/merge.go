@@ -95,23 +95,30 @@ func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
 	}
 
 	// Publish (under lock): swap the selected parts for the merged one(s) copy-on-write (keeping every
-	// unselected part, including any a concurrent flush may have added), retire the sources, and persist
-	// the index. The retired parts' objects are deleted by reclaimRetired once their readers drain.
+	// unselected part, including any a concurrent flush may have added) and persist the index. The
+	// sources are retired — queued for backend deletion — only once that commit succeeds: the persisted
+	// index is what a restart and every other replica read, so a part it still names must never become
+	// reclaimable. A failed commit rolls the swap back to the committed set, leaving the merge output as
+	// orphan objects the next [Engine.LoadParts] sweeps. The retired parts' objects are deleted by
+	// reclaimRetired once their readers drain.
 	removed := make(map[string]struct{}, len(selected))
 	for _, p := range selected {
 		removed[p.prefix] = struct{}{}
 	}
 
 	e.mu.Lock()
+	committed := e.parts
 	e.parts = replaceParts(e.parts, removed, newParts...)
 
-	e.retireLocked(selected)
-	err = e.updateIndexLocked(ctx)
-	e.mu.Unlock()
+	if err = e.updateIndexLocked(ctx); err != nil {
+		e.parts = committed
+		e.mu.Unlock()
 
-	if err != nil {
 		return len(selected), err
 	}
+
+	e.retireLocked(selected)
+	e.mu.Unlock()
 
 	e.reclaimRetired(ctx)
 

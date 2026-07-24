@@ -95,6 +95,16 @@ merge engine; no parallel subsystem.
   so working set is O(parts × one series range) + one part's output, not O(dataset). This is what
   keeps background merge memory bounded as parts grow.
 
+### Publish ordering
+
+A merge retires its source parts — queues them for backend deletion — **only after** the bucket index
+naming their replacement is committed. The index is what a restart and every other replica read, so a
+part the persisted index still names must never become reclaimable; retiring first would let the next
+maintenance tick's reclaim delete objects the index references, and `LoadParts` hard-fails the whole
+engine on a missing part. A failed commit rolls the in-memory part swap back to the committed set, so
+the uncommitted output is never observable as published; its objects are orphans, swept by the
+`LoadParts` orphan sweep at the next open.
+
 ## Read path
 
 `Fetch` resolves matchers over the index, then merges each series' head buffer ∪ every part by
