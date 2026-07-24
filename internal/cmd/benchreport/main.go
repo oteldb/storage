@@ -317,8 +317,9 @@ func writeMeta(b *strings.Builder, rep report) {
 	if rep.n > 0 {
 		parts = append(parts, fmt.Sprintf("n=%d/benchmark", rep.n))
 	}
-	parts = append(parts, "`~` = not significant (p≥0.05)")
-	parts = append(parts, fmt.Sprintf("changes under ±%.0f%% treated as noise", minEffectPct))
+	parts = append(parts,
+		"`~` = not significant (p≥0.05)",
+		fmt.Sprintf("changes under ±%.0f%% treated as noise", minEffectPct))
 
 	fmt.Fprintf(b, "<sub>%s</sub>\n\n", strings.Join(parts, " · "))
 }
