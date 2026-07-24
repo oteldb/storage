@@ -185,6 +185,49 @@ func TestOutOfOrderRejected(t *testing.T) {
 	assert.Equal(t, []int64{80, 100}, got[0].Timestamps)
 }
 
+// TestOutOfOrderIsPerStream checks the OOO window is a per-stream lateness bound: a stream far
+// behind a faster neighbor is admitted on its own timeline, and only its own progress can shed it.
+func TestOutOfOrderIsPerStream(t *testing.T) {
+	t.Parallel()
+
+	e := recordengine.New(recordengine.Config{Schema: testSchema, OOOWindow: 50})
+
+	// "api" runs far ahead; it must not decide anything for "web".
+	ingest(t, e, mkBatch("api", rrec{ts: 10000, body: "api"}))
+
+	res, err := e.AppendBatch(mkBatch("web", rrec{ts: 100, body: "web-1"}, rrec{ts: 120, body: "web-2"}), recordengine.AppendLimits{})
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.Accepted, "a lagging stream is admitted on its own timeline")
+	assert.Equal(t, 0, res.RejectedOOO)
+
+	// Its own newest (120) is the bound: 60 is outside the window, 90 is inside.
+	res, err = e.AppendBatch(mkBatch("web", rrec{ts: 60, body: "too-late"}, rrec{ts: 90, body: "late-ok"}), recordengine.AppendLimits{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.Accepted)
+	assert.Equal(t, 1, res.RejectedOOO, "60 < web's newest(120)-50 ⇒ rejected")
+
+	got := fetchAll(t, e, req("web"))
+	require.Len(t, got, 1)
+	assert.Equal(t, []int64{90, 100, 120}, got[0].Timestamps)
+}
+
+// TestOutOfOrderWindowSurvivesFlush checks a stream's lateness bound is not reset by its records
+// becoming durable: the head's record buffers are replaced by a flush, the watermarks are not.
+func TestOutOfOrderWindowSurvivesFlush(t *testing.T) {
+	t.Parallel()
+
+	e := recordengine.New(recordengine.Config{
+		Schema: testSchema, Backend: backend.Memory(), Prefix: "t/recs", OOOWindow: 50,
+	})
+	ingest(t, e, mkBatch("api", rrec{ts: 10000, body: "a"}))
+	require.NoError(t, e.Flush(context.Background()))
+
+	res, err := e.AppendBatch(mkBatch("api", rrec{ts: 9000, body: "stale"}), recordengine.AppendLimits{})
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.Accepted)
+	assert.Equal(t, 1, res.RejectedOOO, "the flushed stream's watermark still bounds lateness")
+}
+
 func TestStatelessLoadParts(t *testing.T) {
 	t.Parallel()
 

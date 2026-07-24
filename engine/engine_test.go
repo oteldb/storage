@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -113,6 +114,48 @@ func TestOutOfOrderRejected(t *testing.T) {
 	got := fetchAll(t, e, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
 	require.Len(t, got, 1)
 	assert.Equal(t, []int64{80, 100}, got[0].Timestamps, "the OOO sample was dropped")
+}
+
+// TestOutOfOrderIsPerSeries checks the OOO window is a per-series lateness bound: a series far
+// behind a faster one is admitted on its own timeline, and only its own progress can shed it.
+func TestOutOfOrderIsPerSeries(t *testing.T) {
+	t.Parallel()
+
+	e := engine.New(engine.Config{OOOWindow: 50})
+
+	// "api" runs far ahead; it must not decide anything for "auth".
+	mustAppend(t, e, mkSeries("job", "api"), 10000, 1.0)
+
+	auth := mkSeries("job", "auth")
+	mustAppend(t, e, auth, 100, 2.0) // a lagging series is admitted on its own timeline
+	mustAppend(t, e, auth, 120, 3.0)
+
+	// Its own newest (120) is the bound: 90 is inside the window, 60 is not.
+	mustAppend(t, e, auth, 90, 4.0)
+
+	ok, err := e.Append(auth, 60, 5.0)
+	require.NoError(t, err)
+	assert.False(t, ok, "60 < auth's newest(120)-50 ⇒ rejected")
+
+	got := fetchAll(t, e, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "auth")}})
+	require.Len(t, got, 1)
+	assert.Equal(t, []int64{90, 100, 120}, got[0].Timestamps)
+}
+
+// TestOutOfOrderWindowSurvivesFlush checks a series' lateness bound is not reset by its samples
+// becoming durable: a flush replaces the head's sample buffers, not the watermarks.
+func TestOutOfOrderWindowSurvivesFlush(t *testing.T) {
+	t.Parallel()
+
+	e := engine.New(engine.Config{OOOWindow: 50, Backend: backend.Memory(), Prefix: "t/m"})
+	s := mkSeries("job", "api")
+
+	mustAppend(t, e, s, 10000, 1.0)
+	require.NoError(t, e.Flush(context.Background()))
+
+	ok, err := e.Append(s, 9000, 2.0)
+	require.NoError(t, err)
+	assert.False(t, ok, "the flushed series' watermark still bounds lateness")
 }
 
 func TestWALReplayReconstructs(t *testing.T) {

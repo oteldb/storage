@@ -25,8 +25,16 @@ type head struct {
 	series  *series.Index
 	post    *postings.MemPostings
 	records map[signal.SeriesID]*recordCols
-	newest  int64 // newest record timestamp, for the OOO window
-	bytes   int64 // buffered record bytes
+	newest  int64 // newest record timestamp across every stream (reported as Inspect.MaxTime)
+
+	// streamNewest is each stream's own newest admitted timestamp: the OOO window is a per-stream
+	// lateness bound, not a cross-stream one, so a high-rate (or clock-skewed-ahead) stream cannot
+	// drag the watermark forward for the low-rate streams sharing the head. It outlives a flush —
+	// [head.detach] replaces the record buffers but a stream's lateness bound is not reset by its
+	// records becoming durable — and is cleared only with the head itself.
+	streamNewest map[signal.SeriesID]int64
+
+	bytes int64 // buffered record bytes
 	// detachedBytes is the byte count [head.detach] moved aside for an in-flight flush. Those buffers
 	// stay fully resident (and the flush builds a second copy from them) until the part is published,
 	// so they belong to the in-flight measure — see [head.inFlightBytes].
@@ -35,11 +43,12 @@ type head struct {
 
 func newHead(schema *Schema) *head {
 	return &head{
-		schema:  schema,
-		sym:     symbols.New(),
-		series:  series.New(),
-		post:    postings.NewMemPostings(),
-		records: make(map[signal.SeriesID]*recordCols),
+		schema:       schema,
+		sym:          symbols.New(),
+		series:       series.New(),
+		post:         postings.NewMemPostings(),
+		records:      make(map[signal.SeriesID]*recordCols),
+		streamNewest: make(map[signal.SeriesID]int64),
 	}
 }
 
@@ -87,10 +96,12 @@ func (h *head) ensureStream(id signal.SeriesID, materialize func() signal.Series
 const headByteCap = math.MaxInt32
 
 // appendRecord appends r to stream id's buffer (already ensured, or created on demand for the
-// replica apply path), rejecting it as out-of-order when older than newest-oooWindow
-// (oooWindow > 0). It returns whether the record was accepted.
+// replica apply path), rejecting it as out-of-order when older than oooWindow behind *that stream's*
+// newest admitted record (oooWindow > 0). A stream's first record is therefore never out of order,
+// however far behind its neighbors it is. It returns whether the record was accepted.
 func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow, maxBytes int64) admitOutcome {
-	if h.newest != 0 && oooWindow > 0 && r.ts < h.newest-oooWindow {
+	streamNewest, seen := h.streamNewest[id]
+	if seen && oooWindow > 0 && r.ts < streamNewest-oooWindow {
 		return rejectOOO
 	}
 
@@ -108,6 +119,10 @@ func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow, maxBytes int64
 
 	buf.appendClone(r)
 	h.bytes += recByteSize(r)
+
+	if !seen || r.ts > streamNewest {
+		h.streamNewest[id] = r.ts
+	}
 
 	if r.ts > h.newest {
 		h.newest = r.ts

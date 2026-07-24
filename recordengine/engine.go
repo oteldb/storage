@@ -28,7 +28,8 @@ import (
 type Config struct {
 	// Schema is the per-record column set this engine stores (required; the signal supplies it).
 	Schema *Schema
-	// OOOWindow rejects records older than newest-OOOWindow (nanoseconds). 0 disables.
+	// OOOWindow is a per-stream lateness bound: a record older than OOOWindow (nanoseconds) behind
+	// the stream's own newest admitted record is rejected. 0 disables.
 	OOOWindow int64
 	// WAL, when non-nil, durably logs streams and records for crash recovery. nil ⇒ ephemeral.
 	WAL *wal.SegmentWriter
