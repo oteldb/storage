@@ -130,9 +130,23 @@ Heavily tuned around decoding as little as possible:
 - **Bloom pruning** — skip a part whose per-column bloom proves a required `Condition.Tokens`/
   `Condition.Equal` absent, then re-check per row. See [`../index/ARCH.md`](../index/ARCH.md).
 - **Two-phase filtered fetch** (`fetchlazy.go`, taken for `AllConditions` + conditions — the by-id
-  lookups): phase 1 decodes only ts, int columns and the *condition* byte columns (lazy
-  `chunk.DictColumn`, O(1) `At`) and scans; a part with no match (a bloom false positive) never
-  decodes its projected byte columns. Phase 2 decodes the rest and gathers only matched rows.
+  lookups): phase 1 decodes only ts and the *condition* columns (byte columns as lazy
+  `chunk.DictColumn`, O(1) `At`) and records the matching rows; a part with no match (a bloom false
+  positive) never decodes its projected columns. Phase 2 decodes the rest and gathers the recorded
+  rows. Each row is matched **once**: phase 2 replays phase 1's hit list, and the post-scan
+  `filterPrefix` re-applies the conditions only to the head/flushing-seeded accumulator prefix (part
+  rows pass by construction).
+  - **Compiled conditions** (`fetcheval.go`): each condition is resolved to its column once per part,
+    then evaluated cheap-first (equality bitmap → dictionary memo → int-value memo → per-row call).
+    A dictionary-encoded column's predicate is memoized per *distinct entry* (≤ 65536 of them,
+    filled lazily so a high-selectivity scan still pays only per touched entry), which is what keeps
+    a regex — or an attribute lookup that re-parses the `attrs` blob — off the per-row path. An int
+    column memoizes per *distinct value* over a small fixed non-negative domain — where enum-shaped
+    columns (`severity`, status codes) live; a value outside it costs only a range check. The domain
+    is fixed rather than derived from the column's own min/max because the deriving pass measured as
+    a net loss: a condition an earlier, more selective one short-circuits may never be probed at
+    all, so a memo must cost nothing until its first use. Reordering is sound because conditions are
+    an AND of pure predicates; `Match` stays an opaque callback.
   - **Equality fast path**: an exact-match condition against a `CodecBytesRaw` column no other
     condition targets skips the dict decode — the flat blob is decoded once and scanned with
     `internal/simd.EqualFixed16` into a per-row match bitmap, which also serves phase 2's gather.

@@ -418,7 +418,9 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		acc := plan.accs[id]
 
 		if r.AllConditions && len(r.Conditions) > 0 {
-			acc.filterInPlace(r.Conditions)
+			// Only the head/flushing-seeded prefix needs filtering: the part rows appended after it
+			// were matched during the scan itself (fetchlazy.go).
+			acc.filterPrefix(r.Conditions, plan.headRows[id])
 		}
 
 		if acc.len() == 0 {
@@ -571,7 +573,7 @@ func appendWindowRows(acc, cols *recordCols, rng rowRange, start, end int64) {
 	// A stream's range is ts-ascending (rows are (stream, ts)-sorted), so binary-search the [start,end]
 	// sub-range and append it in one contiguous copy — instead of a per-row timestamp compare over the
 	// whole range, which is O(range) even when the window selects only a slice of it. This mirrors the
-	// filtered path's [fetchPlan.gatherMatches], which already narrows via [tsWindow].
+	// filtered path's [fetchPlan.scanMatches], which already narrows via [tsWindow].
 	w := tsWindow(cols.ts, rng, start, end)
 	if w.start < w.end {
 		acc.appendRange(cols, w.start, w.end)
@@ -833,6 +835,19 @@ type fetchPlan struct {
 	conds   []fetch.Condition
 	condSel colSel
 
+	// headRows is each stream's head/flushing-seeded prefix length, captured before the part scan
+	// appends to the accumulator. The post-scan filter applies the conditions to that prefix only —
+	// the part rows below it were matched during the scan and pass by construction.
+	headRows map[signal.SeriesID]int
+
+	// Filtered-scan scratch, reused across parts (valid only within one part's scan): hits/hitRuns
+	// carry phase 1's matching row indices to phase 2's gather, evalScratch the per-part compiled
+	// conditions, and memoScratch each condition's per-dictionary-entry memo (see fetcheval.go).
+	hits        []int
+	hitRuns     []hitRun
+	evalScratch []condEval
+	memoScratch [][]uint8
+
 	// Top-N scan (see limitscan.go): limit/reverse mirror the request, and partsSkippedLimit counts
 	// the live parts the watermark let the scan stop before reading.
 	limit             int
@@ -875,6 +890,8 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *fetchPlan {
 	if r.AllConditions && len(r.Conditions) > 0 {
 		p.conds = r.Conditions
 		p.condSel = conditionSel(e.cfg.Schema, r.Conditions)
+		p.headRows = make(map[signal.SeriesID]int, len(ids))
+		p.memoScratch = make([][]uint8, len(r.Conditions))
 	}
 
 	// The top-N scan needs to know a part's contribution the moment it is read, which conditions
@@ -926,6 +943,9 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *fetchPlan {
 		}
 
 		p.accs[id] = acc
+		if p.headRows != nil {
+			p.headRows[id] = acc.len() // everything seeded so far; the part scan appends past it
+		}
 
 		if s, ok := e.head.series.Get(id); ok {
 			p.series[id] = s
