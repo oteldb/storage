@@ -535,11 +535,11 @@ func promLabelsInto(b *labels.ScratchBuilder, scratch *[]byte, s signal.Series) 
 	}
 
 	if len(s.Scope.Name) > 0 {
-		b.Add("otel.scope.name", string(s.Scope.Name))
+		b.Add(signal.LabelScopeName, string(s.Scope.Name))
 	}
 
 	if len(s.Scope.Version) > 0 {
-		b.Add("otel.scope.version", string(s.Scope.Version))
+		b.Add(signal.LabelScopeVersion, string(s.Scope.Version))
 	}
 
 	for i := range s.Scope.Attributes {

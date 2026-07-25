@@ -1158,11 +1158,11 @@ func lookupSeriesLabel(s signal.Series, name []byte) (signal.Value, bool) {
 	}
 
 	switch string(name) {
-	case "otel.scope.name":
+	case signal.LabelScopeName:
 		if len(s.Scope.Name) > 0 {
 			return signal.StringValue(s.Scope.Name), true
 		}
-	case "otel.scope.version":
+	case signal.LabelScopeVersion:
 		if len(s.Scope.Version) > 0 {
 			return signal.StringValue(s.Scope.Version), true
 		}

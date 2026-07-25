@@ -12,8 +12,8 @@ import (
 
 // Reserved label keys: a stream's scope identity is indexed as labels so a query can match it.
 var (
-	labelScopeName    = []byte("otel.scope.name")
-	labelScopeVersion = []byte("otel.scope.version")
+	labelScopeName    = []byte(signal.LabelScopeName)
+	labelScopeVersion = []byte(signal.LabelScopeVersion)
 )
 
 // head is the engine's in-memory write buffer: the identity index (symbols + series + postings

@@ -15,8 +15,8 @@ import (
 // them (the metric name/unit/etc. are already folded into the series attributes by
 // signal/metric).
 var (
-	labelScopeName    = []byte("otel.scope.name")
-	labelScopeVersion = []byte("otel.scope.version")
+	labelScopeName    = []byte(signal.LabelScopeName)
+	labelScopeVersion = []byte(signal.LabelScopeVersion)
 )
 
 // head is the in-memory, mutable write buffer: the index (symbols + series + postings)
