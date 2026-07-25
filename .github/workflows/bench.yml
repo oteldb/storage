@@ -22,6 +22,12 @@ env:
 jobs:
   golden:
     runs-on: [Linux]
+    # Serialize against every other benchmark job in the repo (including query-bench, which shares
+    # this group): they share one self-hosted runner, and a concurrent run makes the numbers noise.
+    # No cancel-in-progress here — later runs queue rather than kill a measurement in flight.
+    concurrency:
+      group: bench-runner
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@v7
