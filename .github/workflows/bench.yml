@@ -45,7 +45,13 @@ jobs:
         run: go build -o "${RUNNER_TEMP}/benchreport" ./internal/cmd/benchreport
 
       - name: Benchmark PR head
-        run: go test ${FLAGS} -bench "${BENCH}" ./ | tee head.txt
+        run: |
+          set -o pipefail # else `go test | tee` reports tee's status and a failed run looks green
+          go test ${FLAGS} -bench "${BENCH}" ./ | tee head.txt
+          # A -bench pattern that matches nothing exits 0 in milliseconds. Without this the job is
+          # green, the report renders its empty-results caution, and the gate measures nothing.
+          grep -q '^Benchmark' head.txt \
+            || { echo "::error::no benchmarks matched ${BENCH}"; exit 1; }
 
       # Run the SAME golden benchmark file against the base commit's library code, by copying this
       # PR's golden_bench_test.go onto a checkout of the base SHA. The golden set is self-contained,
@@ -55,14 +61,18 @@ jobs:
         if: github.event_name == 'pull_request'
         continue-on-error: true
         run: |
+          set -o pipefail
           cp golden_bench_test.go "${RUNNER_TEMP}/golden_bench_test.go"
           git checkout --quiet --force ${{ github.event.pull_request.base.sha }}
           cp "${RUNNER_TEMP}/golden_bench_test.go" golden_bench_test.go
           go test ${FLAGS} -bench "${BENCH}" ./ | tee base.txt
+          # Drop a result-less base so the report falls back to head-only rather than diffing a file
+          # that holds only the goos/goarch preamble (which is non-empty, so -s would pass).
+          grep -q '^Benchmark' base.txt || rm -f base.txt
 
       - name: Build report
         run: |
-          if [ -s base.txt ]; then
+          if [ -f base.txt ]; then
             benchstat -format csv base.txt head.txt > bench.csv
             benchstat base.txt head.txt > bench.txt
           else

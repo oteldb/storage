@@ -22,6 +22,8 @@ import (
 
 func main() {
 	raw := flag.String("raw", "", "path to a plain-text benchstat table to embed in a <details> block")
+	marker := flag.String("marker", defaultMarker, "slug for the hidden HTML comment the workflow finds its sticky comment by; must be unique per workflow")
+	title := flag.String("title", defaultTitle, "report heading")
 	flag.Parse()
 
 	var rawText string
@@ -34,7 +36,7 @@ func main() {
 		rawText = string(b)
 	}
 
-	md, err := render(os.Stdin, rawText)
+	md, err := render(os.Stdin, rawText, *marker, *title)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "benchreport:", err)
 		os.Exit(1)
@@ -43,8 +45,13 @@ func main() {
 	fmt.Print(md)
 }
 
-// marker is the hidden HTML comment the PR workflow uses to find and update its sticky comment.
-const marker = "<!-- golden-bench -->"
+// Defaults for the sticky-comment marker and heading, matching .github/workflows/bench.yml. A
+// second workflow reporting into the same PR (e.g. the downstream query-engine benchmarks) MUST
+// pass its own -marker, or the two runs overwrite each other's comment.
+const (
+	defaultMarker = "golden-bench"
+	defaultTitle  = "Golden benchmarks"
+)
 
 type benchRow struct {
 	name        string
@@ -67,15 +74,14 @@ type report struct {
 	n       int // samples per benchmark, parsed from the "n=" suffix
 }
 
-func render(r io.Reader, rawText string) (string, error) {
+func render(r io.Reader, rawText, marker, title string) (string, error) {
 	rep, err := parse(r)
 	if err != nil {
 		return "", err
 	}
 
 	var b strings.Builder
-	b.WriteString(marker)
-	b.WriteString("\n## 📊 Golden benchmarks\n\n")
+	fmt.Fprintf(&b, "<!-- %s -->\n## 📊 %s\n\n", marker, title)
 
 	if len(rep.groups) == 0 {
 		b.WriteString("> [!CAUTION]\n> No benchmark results were parsed — the benchmark step may have failed.\n")
@@ -182,14 +188,25 @@ func direction(unit string) int {
 	}
 }
 
+// minEffectPct is the effect-size floor a change must clear before it is called an improvement or a
+// regression, on top of benchstat's significance test. The p-value answers "is this difference
+// real", not "is it large enough to act on" — and with enough samples a difference that is pure
+// machine noise still tests as real. Measured on a CI-only PR (no library code in the measured
+// path, so every true delta is zero), 15 of 33 benchmarks came back "significant" at up to ±4%. A
+// gate that reports a regression on every PR gets ignored, so anything under the floor stays
+// neutral in both the verdict and the per-row status.
+const minEffectPct = 5.0
+
+func exceedsFloor(r benchRow) bool { return math.Abs(r.pct) >= minEffectPct }
+
 func isImprovement(r benchRow, unit string) bool {
 	d := direction(unit)
-	return r.significant && ((d < 0 && r.pct < 0) || (d > 0 && r.pct > 0))
+	return r.significant && exceedsFloor(r) && ((d < 0 && r.pct < 0) || (d > 0 && r.pct > 0))
 }
 
 func isRegression(r benchRow, unit string) bool {
 	d := direction(unit)
-	return r.significant && ((d < 0 && r.pct > 0) || (d > 0 && r.pct < 0))
+	return r.significant && exceedsFloor(r) && ((d < 0 && r.pct > 0) || (d > 0 && r.pct < 0))
 }
 
 func writeVerdict(b *strings.Builder, rep report) {
@@ -300,7 +317,9 @@ func writeMeta(b *strings.Builder, rep report) {
 	if rep.n > 0 {
 		parts = append(parts, fmt.Sprintf("n=%d/benchmark", rep.n))
 	}
-	parts = append(parts, "`~` = not significant (p≥0.05)")
+	parts = append(parts,
+		"`~` = not significant (p≥0.05)",
+		fmt.Sprintf("changes under ±%.0f%% treated as noise", minEffectPct))
 
 	fmt.Fprintf(b, "<sub>%s</sub>\n\n", strings.Join(parts, " · "))
 }
