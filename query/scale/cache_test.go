@@ -159,6 +159,96 @@ func TestMemoryCacheSnapshotsAgainstMutation(t *testing.T) {
 	require.Len(t, again, 1, "a caller reslicing its result does not shrink the cached entry")
 }
 
+// recordBatch is a materialized record (log/trace) result: rows carry their data in Columns, not in
+// Values.
+func recordBatch() *fetch.Batch {
+	return &fetch.Batch{
+		ID:         signal.SeriesID{Lo: 7},
+		Timestamps: []int64{10, 20},
+		Columns: []fetch.NamedColumn{
+			{Name: "severity", Bytes: [][]byte{[]byte("ERROR"), nil}},
+			{Name: "body", Bytes: [][]byte{[]byte("boom"), []byte("ok")}},
+			{Name: "code", Int64: []int64{500, 200}},
+		},
+	}
+}
+
+func TestMemoryCacheKeepsRecordColumns(t *testing.T) {
+	t.Parallel()
+
+	c := scale.NewMemoryCache(8)
+	c.Put("k", []*fetch.Batch{recordBatch()})
+
+	got, ok := c.Get("k")
+	require.True(t, ok)
+	require.Len(t, got, 1)
+
+	// A record result whose columns were dropped comes back as the right number of rows with no
+	// data at all — the failure this guards against.
+	require.Len(t, got[0].Columns, 3, "cached record result kept its columns")
+
+	body, ok := got[0].Column("body")
+	require.True(t, ok)
+	assert.Equal(t, [][]byte{[]byte("boom"), []byte("ok")}, body.Bytes)
+
+	sev, ok := got[0].Column("severity")
+	require.True(t, ok)
+	assert.Nil(t, sev.Bytes[1], "an absent cell stays absent, not empty")
+
+	code, ok := got[0].Column("code")
+	require.True(t, ok)
+	assert.Equal(t, []int64{500, 200}, code.Int64)
+}
+
+func TestMemoryCacheSnapshotsColumnsAgainstMutation(t *testing.T) {
+	t.Parallel()
+
+	c := scale.NewMemoryCache(8)
+	original := recordBatch()
+	c.Put("k", []*fetch.Batch{original})
+
+	// The producing engine hands out cells that view a pooled blob it reuses, so the snapshot must
+	// survive the producer overwriting them in place.
+	copy(original.Columns[1].Bytes[0], "zzzz")
+	original.Columns[2].Int64[0] = 999
+
+	got, ok := c.Get("k")
+	require.True(t, ok)
+
+	body, ok := got[0].Column("body")
+	require.True(t, ok)
+	assert.Equal(t, []byte("boom"), body.Bytes[0], "cached cell is independent of the producer's buffer")
+
+	code, ok := got[0].Column("code")
+	require.True(t, ok)
+	assert.Equal(t, int64(500), code.Int64[0])
+}
+
+func TestMemoryCacheKeepsScaleFactors(t *testing.T) {
+	t.Parallel()
+
+	c := scale.NewMemoryCache(8)
+	b := sample(1, 10, 1)
+	b.ScaleFactors = []float64{4}
+	c.Put("k", []*fetch.Batch{b})
+
+	b.ScaleFactors[0] = 999
+
+	got, ok := c.Get("k")
+	require.True(t, ok)
+
+	// Dropping the weights would serve a sampled result as if every sample counted once.
+	assert.Equal(t, []float64{4}, got[0].ScaleFactors)
+	assert.InDelta(t, 4.0, got[0].ScaleFactor(0), 0)
+
+	// A batch that was never sampled stays unsampled (nil), not weight-zero.
+	c.Put("plain", []*fetch.Batch{sample(2, 10, 1)})
+	plain, ok := c.Get("plain")
+	require.True(t, ok)
+	assert.Nil(t, plain[0].ScaleFactors)
+	assert.InDelta(t, 1.0, plain[0].ScaleFactor(0), 0)
+}
+
 func TestCacheNilCacheAndErrorPassThrough(t *testing.T) {
 	t.Parallel()
 
