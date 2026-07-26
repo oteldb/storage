@@ -219,9 +219,26 @@ func TestGramCacheSingleFlight(t *testing.T) {
 	}
 }
 
+// TestGramWeight pins the weigher, which is the part of the byte bound this package owns: a real
+// filter is priced by its resident bytes, a cached miss costs nothing. Deterministic — otter's
+// accounting is amortized, so anything asserted through the cache has to be polled instead.
+func TestGramWeight(t *testing.T) {
+	t.Parallel()
+
+	assert.Zero(t, gramWeight("k", nil), "a cached miss is weightless")
+
+	data := buildColumnGrams(colOf([]byte("checkout-service handler=CreateOrder")))
+	require.NotNil(t, data)
+
+	f, err := decodeGramFilter(data)
+	require.NoError(t, err)
+	require.NotZero(t, f.Bytes())
+
+	assert.Equal(t, uint32(f.Bytes()), gramWeight("k", f), "a filter is priced by its resident bytes")
+}
+
 // TestGramCacheEvicts pins that the cache honors its byte bound rather than growing with part count
-// — the whole reason gram filters are not resident. The eviction policy itself is otter's business;
-// what this asserts is that the weigher is wired to real filter bytes, so the bound means something.
+// — the whole reason gram filters are not resident. The eviction policy itself is otter's business.
 func TestGramCacheEvicts(t *testing.T) {
 	t.Parallel()
 
@@ -256,13 +273,16 @@ func TestGramCacheEvicts(t *testing.T) {
 		require.NotNil(t, got, "every part has a readable sidecar")
 	}
 
-	// Eviction is amortized, so the bound is honored eventually rather than on the instant of the
-	// overflowing Put.
+	// Eviction is amortized: otter drains its write buffer from a maintenance task, so neither
+	// counter is exact the instant the overflowing load returns. Both conditions are polled
+	// together, and the resident-count one is checked because it *starts false* — polling only the
+	// weight would pass vacuously on the stale zero a not-yet-drained cache reports.
+	// WeightedSize is read first: unlike EstimatedSize it forces a pending drain.
 	require.Eventually(t, func() bool {
-		return cache.WeightedSize() <= uint64(maxBytes)
-	}, time.Second, 10*time.Millisecond, "weighted size stayed above the bound")
+		withinBound := cache.WeightedSize() <= uint64(maxBytes)
 
-	assert.Less(t, cache.EstimatedSize(), parts, "the cache did not grow with the part count")
+		return withinBound && cache.EstimatedSize() < parts
+	}, 10*time.Second, 5*time.Millisecond, "the cache never evicted down to its byte bound")
 }
 
 // TestGramCacheWeighsMissesFree pins that a cached "no sidecar here" verdict costs no weight: a
@@ -280,6 +300,10 @@ func TestGramCacheWeighsMissesFree(t *testing.T) {
 		require.Nil(t, f)
 	}
 
+	// The verdicts are cached (that is what stops the re-probing) but weigh nothing, so they can
+	// never evict a real filter. Resident count is asserted too: a zero weight alone would also be
+	// what an empty cache reports.
+	assert.Positive(t, cache.EstimatedSize(), "the negative verdicts are cached")
 	assert.Zero(t, cache.WeightedSize(), "negative entries are weightless")
 }
 
