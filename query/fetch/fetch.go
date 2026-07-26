@@ -115,17 +115,31 @@ type Request struct {
 // rows. A predicate that only accepts a concrete value must therefore reject [signal.KindEmpty] —
 // which also keeps the hints below sound, since a pruning hint asserts a value is present.
 //
-// Two optional, serializable hints let a fetcher prune whole parts before scanning (the engine
+// Three optional, serializable hints let a fetcher prune whole parts before scanning (the engine
 // always re-checks Match per row, so a hint only ever skips work, never changes results):
 //   - Tokens: the full-text tokens the column value must contain (lowered) — consulted against a
 //     per-part token bloom for a `contains` condition (an empty Tokens ⇒ not full-text).
+//   - Substrings: byte sequences the column value must contain **verbatim** — consulted against a
+//     per-part gram bloom, which prunes literals a token hint cannot express (see Substrings).
 //   - Equal: an exact column=value equality — consulted against a per-part value bloom. For a
 //     per-record attribute condition, Column is the attribute key and Equal carries key=value.
 type Condition struct {
 	Column string
 	Match  func(value signal.Value) bool
 	Tokens [][]byte
-	Equal  *EqualMatcher
+
+	// Substrings are literals every matching value contains verbatim, as raw (case-sensitive,
+	// un-tokenized) bytes. Unlike Tokens they need no safety trimming: the gram index is built on a
+	// rule that reads only the bytes inside a gram, so a gram of the literal is a gram of every value
+	// containing it, whatever surrounds it. A language lowering a substring/regexp filter therefore
+	// passes the required literal straight through — no edge stripping, no word-boundary reasoning.
+	//
+	// Only columns whose schema opts into a gram index prune by this; elsewhere it is ignored. A
+	// literal shorter than the index's minimum gram length yields no grams and so prunes nothing
+	// (a full scan, still correct). Multiple entries are ANDed: every literal must be present.
+	Substrings [][]byte
+
+	Equal *EqualMatcher
 }
 
 // Batch is one matching identity (a metric series, or a log stream) and its rows within the

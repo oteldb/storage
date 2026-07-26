@@ -117,6 +117,15 @@ RPCs) with W3C trace-context propagation across the cluster transport. Logs are 
 **EXPLAIN ANALYZE** (`query/profile`): `profile.WithCollector(ctx)` opts a single query into a
 per-operator timing tree; distributed reads graft each peer's subtree under a `remote {addr}` node.
 
+A record fetch reports its pruning breakdown as counters on the `recordengine.fetch` node:
+`parts_total`, `parts_pruned_time`, `parts_pruned_bloom`, `parts_pruned_gram`, `parts_live`,
+`parts_skipped_limit`, `rows_total`, `rows_live`. The two filter counters are deliberately distinct:
+`parts_pruned_bloom` is dropped during planning from resident token/equality blooms (no I/O), while
+`parts_pruned_gram` is dropped later in the scan, after the part was acquired and its demand-loaded
+sparse-gram sidecar read — cheaper than reading the part, but not free. A high `parts_pruned_gram`
+with a low `parts_pruned_bloom` is the intended shape for substring queries; the reverse means the
+substring hint is not reaching the engine.
+
 ## Act
 
 ### `Storage.Admin() Admin` (`admin.go`)

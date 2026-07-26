@@ -14,8 +14,11 @@
 // This is the scheme GitHub's code search calls "sparse grams" and ClickHouse ships as
 // `sparseGrams`; see ARCHITECTURE.md for where it sits relative to index/bloom.
 //
-// The package is EXPERIMENTAL and not wired into the write or read path. It exists to measure
-// whether a gram index earns its size before any on-disk format commits to one.
+// The record engine builds a per-part gram filter out of this for columns that opt in
+// (recordengine.Column.Grams), which makes the emitted gram set — the bigram weighting in weigh and
+// the caller's length bounds — part of the on-disk format: changing either changes what a sidecar
+// means. The sidecar stamps the bounds so a mismatch is detected rather than misread, but the
+// weighting has no such tag; a change to it must go through a format version bump.
 package sparsegram
 
 import (

@@ -129,6 +129,29 @@ Heavily tuned around decoding as little as possible:
   ts-ordered.
 - **Bloom pruning** — skip a part whose per-column bloom proves a required `Condition.Tokens`/
   `Condition.Equal` absent, then re-check per row. See [`../index/ARCH.md`](../index/ARCH.md).
+- **Gram pruning** (`gram.go` + `gramcache.go`, opt-in per column via `Column.Grams`) — a second
+  filter over the column's **sparse n-grams**, probed by `Condition.Substrings`. It answers what the
+  token bloom cannot: a substring literal holding no whole token (`trace[deadbeef…]`) yields no safe
+  tokens, so it prunes nothing. Grams are chosen by a rule that reads only the bytes *inside* the
+  gram, so a gram of the literal is a gram of every value containing it — no edge stripping, no
+  anchoring needed. The two filters are independent and live in separate sidecars: a gram probe
+  against a token bloom would report absent for a gram the column holds, pruning a matching part.
+  Bounds (4–16 bytes) are format, stamped into the sidecar; a mismatch reads as absent, never
+  misread. A literal shorter than the minimum prunes nothing (a scan, still correct). Costly enough
+  to be opt-in: measured on real log bodies, 4–5× the token bloom's bytes and ~4.6× slower to build.
+  - **Demand-loaded, unlike the blooms.** At 3.4–5.9% of a part's on-disk bytes, holding one per
+    live part would make gram filters the largest resident term in the process. They are instead
+    read per query through a weight-bounded loading cache (`Config.GramCacheBytes`, 64 MiB default)
+    shared by all fetches — so memory tracks the queried working set, not the part count. The cache
+    is `maypok86/otter` (Apache-2.0, no transitive deps): the byte bound, the collapsing of
+    concurrent misses into one backend read, and the caching of a negative verdict (this part has no
+    sidecar — don't re-probe it) are all things a plain LRU would have to grow. Dedup is best-effort,
+    which is sound here because sidecars are immutable.
+  - This is why the probe runs in the **lock-free scan** (`readPartsLazy`) rather than in `planFetch`
+    beside the bloom prune: it does backend I/O, and the plan phase holds the engine lock. The hints
+    themselves are extracted once per request, not once per part. A pruned part is counted in
+    `parts_pruned_gram`, kept separate from `parts_pruned_bloom` because it is a later, costlier
+    prune (the part was acquired and its sidecar read); a sidecar read error degrades to a scan.
 - **Two-phase filtered fetch** (`fetchlazy.go`, taken for `AllConditions` + conditions — the by-id
   lookups): phase 1 decodes only ts and the *condition* columns (byte columns as lazy
   `chunk.DictColumn`, O(1) `At`) and records the matching rows; a part with no match (a bloom false
@@ -169,6 +192,9 @@ Conditions over a non-fixed column are per-record **attributes**, resolved by th
 ## Part sidecars
 
 - `bloom-{col}.bin` — per-column token blooms.
+- `grams-{col}.bin` (version + gram bounds + a `bloom.Filter`) — per-column **sparse-gram** filter
+  for substring pruning, written only for columns with `Column.Grams`. Deliberately a separate key
+  from the token bloom: the two hold different sets and must never be probed interchangeably.
 - `keys.bin` (`OTKY`, magic+version+CRC32C) — the part's distinct per-record **attribute keys**
   (not values — bounded by the schema, so tiny). `Engine.Keys` enumerates keys across head ∪
   in-window parts tagged with a `KeyScope` bitset (resource/scope/record), so an embedder can list

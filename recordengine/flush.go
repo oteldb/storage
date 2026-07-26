@@ -276,6 +276,10 @@ func writePart(
 		return err
 	}
 
+	if err := writeGrams(ctx, b, schema, prefix, f.cols, bb); err != nil {
+		return err
+	}
+
 	return writeRecordKeys(ctx, b, schema, prefix, f.cols)
 }
 
