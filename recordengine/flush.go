@@ -337,6 +337,10 @@ func writePart(
 		return err
 	}
 
+	if err := writeGrams(ctx, b, schema, prefix, f.cols, bb); err != nil {
+		return err
+	}
+
 	// Watermark sidecar: the newest timestamp per stream, so a replica refresh trims its head
 	// against this part without decoding the timestamp column (see part.streamWatermarks).
 	if err := b.Write(ctx, watermark.Key(prefix), watermark.Encode(nil, computeWatermarks(f))); err != nil {

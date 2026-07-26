@@ -104,6 +104,11 @@ type Config struct {
 	// an owner set of one. nil concludes nothing, so an outstanding want stays outstanding. See
 	// [PartFetcher].
 	Repair PartFetcher
+	// GramCacheBytes bounds the decoded sparse-gram filters ([Column.Grams]) held in memory. Unlike
+	// the token blooms, which are resident per live part, gram filters are demand-loaded per query
+	// and cached: they are 4–5× larger, so keeping every part's would dominate process memory.
+	// 0 ⇒ [defaultGramCacheBytes]. Ignored when no column has Grams.
+	GramCacheBytes int64
 }
 
 // PartFetcher makes the objects of the parts discharging a repair cycle's wants local, so the
@@ -189,6 +194,11 @@ type Engine struct {
 	// A part is written by a flush or a merge, both of which run under flushMu, so the same
 	// single-writer argument as flushBuf applies — see [Engine.blooms].
 	bloomBuf *bloomBuilder
+	// gramCache holds the demand-loaded sparse-gram filters ([Config.GramCacheBytes]). Unlike the
+	// blooms, it is not per-part state: it is shared by every fetch and bounded independently of the
+	// part count. Allocated on first use — engines whose schema has no gram column never build one.
+	gramCache *gramCache
+	gramOnce  sync.Once
 	// flushedEpoch is the WAL flush watermark: the generation of the most recently flushed head
 	// (persisted in the bucket index, under this writer's [Config.WriterID] slot). Current head
 	// records are written to the WAL at flushedEpoch+1,
@@ -584,6 +594,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, 
 		if plan != nil {
 			pf.Add("parts_pruned_time", int64(plan.partsPrunedTime))
 			pf.Add("parts_pruned_bloom", int64(plan.partsPrunedBloom))
+			pf.Add("parts_pruned_gram", int64(plan.partsPrunedGram))
 			pf.Add("parts_live", int64(len(plan.liveParts)))
 			pf.Add("parts_skipped_limit", int64(plan.partsSkippedLimit))
 			pf.Add("rows_total", plan.rowsTotal)
@@ -591,6 +602,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, 
 			span.SetAttributes(
 				attribute.Int("storage.parts_pruned_time", plan.partsPrunedTime),
 				attribute.Int("storage.parts_pruned_bloom", plan.partsPrunedBloom),
+				attribute.Int("storage.parts_pruned_gram", plan.partsPrunedGram),
 				attribute.Int("storage.parts_live", len(plan.liveParts)),
 				attribute.Int("storage.parts_skipped_limit", plan.partsSkippedLimit),
 				attribute.Int64("storage.rows_total", plan.rowsTotal),
@@ -874,6 +886,12 @@ func (e *Engine) Reset(ctx context.Context) error {
 	e.flushing = nil // discarded with the head: Reset drops the records, it does not flush them
 	e.flushingSide = nil
 
+	// Every part is dropped, so every cached gram filter is garbage: free it now rather than
+	// leaving it to eviction.
+	if e.gramCache != nil {
+		e.gramCache.InvalidateAll()
+	}
+
 	if e.cfg.Backend == nil {
 		e.parts, e.retiring = nil, nil
 		e.mu.Unlock()
@@ -1079,6 +1097,14 @@ type fetchPlan struct {
 	// matter relative to per-part fixed costs (decompression, bloom decode, stream setup).
 	partsTotal, partsPrunedTime, partsPrunedBloom int
 
+	// gramHints are the per-condition substring grams, extracted once by [planFetch] and probed
+	// during the scan (see [part.gramsMayMatch]); nil when no condition asks for substring pruning.
+	// partsPrunedGram counts the acquired parts the gram filters dropped before any column was read.
+	// It is a *later* prune than partsPrunedBloom — those parts were still acquired and their gram
+	// sidecar read — so the two counters are reported separately rather than summed.
+	gramHints       gramHints
+	partsPrunedGram int
+
 	// rowsTotal/rowsLive sum every scanned part's [block.PartReader.RowCount] (cheap: cached from
 	// the manifest at part-open, no extra backend I/O) — rowsTotal over every part considered,
 	// rowsLive over just the ones that survived pruning. The ratio and rowsLive/len(liveParts)
@@ -1162,6 +1188,9 @@ func (e *Engine) planFetch(ctx context.Context, ids []signal.SeriesID, r fetch.R
 		p.condSel = conditionSel(e.cfg.Schema, r.Conditions)
 		p.headRows = make(map[signal.SeriesID]int, len(ids))
 		p.memoScratch = make([][]uint8, len(r.Conditions))
+		// Substring grams depend only on the request, so they are extracted once here rather than
+		// per part. The probe itself happens in the lock-free scan (the filters are demand-loaded).
+		p.gramHints = buildGramHints(p.conds)
 	}
 
 	// The top-N scan needs to know a part's contribution the moment it is read, which conditions

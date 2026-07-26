@@ -52,6 +52,8 @@ type bloomBuilder struct {
 	// view is the column currently being built, held here so [bloomBuilder.build] can take it by
 	// value and still hand the walk a pointer without the local escaping to the heap once per column.
 	view cells
+	// gram is the reused sparse-gram extractor state, for [Column.Grams] columns.
+	gram gramScratch
 }
 
 // Per-part filters are consulted once per part, so a query over a store with thousands of parts
@@ -539,6 +541,10 @@ func loadBlooms(ctx context.Context, b backend.Backend, schema *Schema, prefix s
 // mayContain reports whether the part can hold a record satisfying every condition's serializable
 // hint — false ⇒ a bloom proved a required equality value or full-text/attribute token absent, so
 // the part is pruned. Conditions whose column has no bloom (or no hint) never prune.
+//
+// It reads only resident state, which is what lets the plan phase call it under the engine lock.
+// Substring pruning is not here for exactly that reason: its filters are demand-loaded, so it runs
+// later, in the lock-free part scan (see [part.gramsMayMatch]).
 func (p *part) mayContain(conds []fetch.Condition) bool {
 	for i := range conds {
 		if !p.conditionMayMatch(&conds[i]) {

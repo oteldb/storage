@@ -43,6 +43,10 @@ type part struct {
 	// a merge-join ([part.heldStreams]) rather than one hash probe per (part, stream) pair.
 	ranges []streamRange
 	blooms map[string]*bloom.Filter // column name → its bloom (FullText/Attrs/Equality); absent ⇒ scan
+	//
+	// The sparse-gram filters ([Column.Grams]) are deliberately NOT here: they are several times
+	// larger than the blooms, so they are demand-loaded per query through the engine's bounded
+	// [gramCache] rather than held for every live part.
 
 	// recordKeys is the part's distinct per-record attribute keys (the "keys.bin" footer), for
 	// [Engine.Keys] enumeration. nil when the part has no record attributes (or predates the footer).
