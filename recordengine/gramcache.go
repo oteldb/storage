@@ -45,16 +45,19 @@ func newGramCache(maxBytes int64) *gramCache {
 
 	return otter.Must(&otter.Options[string, *bloom.Filter]{
 		MaximumWeight: uint64(maxBytes),
-		// A cached miss (no usable sidecar) is a nil filter: it costs nothing resident and must not
-		// be weighed as if it did, or a store full of gram-less parts would evict real filters.
-		Weigher: func(_ string, f *bloom.Filter) uint32 {
-			if f == nil {
-				return 0
-			}
-
-			return uint32(f.Bytes())
-		},
+		Weigher:       gramWeight,
 	})
+}
+
+// gramWeight prices a cache entry by the filter's resident bytes, which is what [Config.GramCacheBytes]
+// bounds. A cached miss (no usable sidecar) is a nil filter: it costs nothing resident and must not
+// be weighed as if it did, or a store full of gram-less parts would evict the real filters.
+func gramWeight(_ string, f *bloom.Filter) uint32 {
+	if f == nil {
+		return 0
+	}
+
+	return uint32(f.Bytes())
 }
 
 // gramFilterFor returns the gram filter for the part column at key, reading it through the cache. A
