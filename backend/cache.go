@@ -1,14 +1,15 @@
 package backend
 
 import (
-	"container/list"
 	"context"
+	"math"
 	"slices"
-	"sync"
-	"sync/atomic"
+
+	"github.com/maypok86/otter/v2"
+	"github.com/maypok86/otter/v2/stats"
 )
 
-// Cached wraps a [Backend] with a bounded in-memory LRU over read objects — the object-store read
+// Cached wraps a [Backend] with a bounded in-memory cache over read objects — the object-store read
 // cache. It targets the cold tier (file/S3), where a part column is otherwise re-read over the
 // network on every query: because part objects are write-once immutable, a cached value is never
 // stale, so the only invalidation is eviction (by byte budget) and an explicit Write/Delete of the
@@ -18,18 +19,59 @@ import (
 // maxBytes is the cache's total value-byte budget; objects larger than it are not cached (they
 // would evict everything else). maxBytes ≤ 0 disables caching (the inner backend is returned
 // unchanged). The wrapper preserves the [Backend] copy semantics: stored and returned slices are
-// private copies, so a caller may retain or mutate them freely.
+// private copies, so a caller may retain or mutate them freely — except [cachedBackend.ReadView],
+// which returns the resident value under the read-only [Viewer] contract.
+//
+// The cache is otter's weight-bounded loading cache rather than a strict LRU, for three reasons
+// measured against a real corpus:
+//
+//   - Concurrent misses on the same key collapse into ONE inner read. A dashboard refresh or a
+//     multi-shard read that touches the same part column previously issued one object-store GET per
+//     in-flight query (64 concurrent readers of one object → 64 GETs; now 1).
+//   - Scan resistance. Part objects are the access pattern a strict LRU handles worst: a historical
+//     query streams cold objects once and flushes the hot working set, and a repeating scan slightly
+//     larger than the budget evicts exactly the object about to be reused. Replaying a captured
+//     query trace, LRU sat at a 2.9–23.7% hit rate below its working set where W-TinyLFU reached
+//     30–59%, roughly halving the inner reads. Above the working set the order reverses slightly:
+//     admission needs frequency evidence, so a cache that could hold everything gives up a few
+//     points to a strict LRU.
+//   - Hits scale with cores instead of serializing on one mutex and a list splice (16 cores: ~4.6
+//     ns/op versus ~90 ns/op).
 func Cached(inner Backend, maxBytes int64) Backend {
 	if maxBytes <= 0 {
 		return inner
 	}
 
-	return &cachedBackend{
+	c := &cachedBackend{
 		inner:    inner,
 		maxBytes: maxBytes,
-		items:    make(map[string]*list.Element),
-		ll:       list.New(),
+		stats:    stats.NewCounter(),
 	}
+
+	c.values = otter.Must(&otter.Options[string, []byte]{
+		MaximumWeight: uint64(maxBytes),
+		Weigher:       weighValue,
+		StatsRecorder: c.stats,
+	})
+
+	// Built once: converting a capturing closure to otter.LoaderFunc at the call site boxes it,
+	// which is an allocation on every read — hits included.
+	c.load = otter.LoaderFunc[string, []byte](func(ctx context.Context, key string) ([]byte, error) {
+		return c.inner.Read(ctx, key)
+	})
+
+	return c
+}
+
+// weighValue prices an entry by its value bytes, which is what maxBytes bounds. The weight is
+// capped rather than truncated: an object above 4 GiB must read as "heavier than any budget" so the
+// policy drops it, not wrap around to a small weight and pin it resident.
+func weighValue(_ string, v []byte) uint32 {
+	if len(v) > math.MaxUint32 {
+		return math.MaxUint32
+	}
+
+	return uint32(len(v))
 }
 
 // CacheStats is a snapshot of a cached backend's effectiveness.
@@ -43,61 +85,44 @@ type cachedBackend struct {
 	inner    Backend
 	maxBytes int64
 
-	hits, misses atomic.Int64
-
-	mu    sync.Mutex
-	items map[string]*list.Element // key → element in ll
-	ll    *list.List               // front = most-recently used; Value is *cacheEntry
-	bytes int64
-}
-
-type cacheEntry struct {
-	key string
-	val []byte
+	values *otter.Cache[string, []byte]
+	load   otter.Loader[string, []byte]
+	stats  *stats.Counter
 }
 
 func (c *cachedBackend) IsEphemeral() bool { return c.inner.IsEphemeral() }
 
 func (c *cachedBackend) Read(ctx context.Context, key string) ([]byte, error) {
-	if v, ok := c.load(key); ok {
-		c.hits.Add(1)
-
-		return v, nil
-	}
-
-	c.misses.Add(1)
-
-	v, err := c.inner.Read(ctx, key)
+	v, err := c.ReadView(ctx, key)
 	if err != nil {
 		return nil, err
 	}
 
-	c.store(key, v) // store a copy; v is already a fresh copy owned by us, returned to the caller
-
-	return v, nil
+	return slices.Clone(v), nil
 }
 
-// ReadView is [Backend.Read] without the defensive copies: a hit returns the resident entry's
-// value itself, and a miss stores the freshly read value and returns it — zero copies either way.
-// Safe under the [Viewer] contract: the caller never mutates the view, and the cache never mutates
-// a resident value in place (store replaces the entry's slice, so an outstanding view keeps reading
-// the old, unreachable-from-the-cache array). This is the hot path for part column objects, where
-// the clone-per-hit was a dominant query-path allocation. Implements [Viewer].
+// ReadView is [Backend.Read] without the defensive copy: it returns the resident value itself, and
+// on a miss the freshly read value that was just cached — zero copies either way. Safe under the
+// [Viewer] contract: the caller never mutates the view, and the cache never mutates a resident
+// value in place (a store replaces the entry's slice, so an outstanding view keeps reading the old,
+// unreachable-from-the-cache array). This is the hot path for part column objects, where the
+// clone-per-hit was a dominant query-path allocation. Implements [Viewer].
+//
+// Concurrent misses on one key share a single inner read; the loader's error is propagated, never
+// cached, so the next call retries.
 func (c *cachedBackend) ReadView(ctx context.Context, key string) ([]byte, error) {
-	if v, ok := c.loadView(key); ok {
-		c.hits.Add(1)
-
-		return v, nil
-	}
-
-	c.misses.Add(1)
-
-	v, err := c.inner.Read(ctx, key)
+	v, err := c.values.Get(ctx, key, c.load)
 	if err != nil {
 		return nil, err
 	}
 
-	c.storeOwned(key, v) // v is a fresh copy from the inner backend; the cache and the view share it
+	// An object larger than the whole budget is not cached. The policy drops an over-weight entry
+	// on its own, but only when it next runs maintenance — until then the entry is resident and
+	// over budget, which for a part column can be hundreds of MiB. Dropping it here bounds that to
+	// this call and keeps the rule the same on the read and write paths.
+	if int64(len(v)) > c.maxBytes {
+		c.values.Invalidate(key)
+	}
 
 	return v, nil
 }
@@ -127,7 +152,7 @@ func (c *cachedBackend) PutIfAbsent(ctx context.Context, key string, data []byte
 
 func (c *cachedBackend) Delete(ctx context.Context, key string) error {
 	err := c.inner.Delete(ctx, key)
-	c.evict(key) // drop the entry whether or not the object existed
+	c.values.Invalidate(key) // drop the entry whether or not the object existed
 
 	return err
 }
@@ -144,45 +169,28 @@ func (c *cachedBackend) Size(ctx context.Context, key string) (int64, error) {
 	return SizeOf(ctx, c.inner, key)
 }
 
-// Stats returns a snapshot of cache effectiveness (for benchmarks and operator visibility).
+// Stats returns a snapshot of cache effectiveness (for benchmarks and operator visibility). It
+// settles pending maintenance first, so the resident figures reflect the writes already made rather
+// than the policy's backlog.
 func (c *cachedBackend) Stats() CacheStats {
-	c.mu.Lock()
-	bytes, items := c.bytes, len(c.items)
-	c.mu.Unlock()
+	c.values.CleanUp()
 
-	return CacheStats{Hits: c.hits.Load(), Misses: c.misses.Load(), Bytes: bytes, Items: items}
-}
+	s := c.stats.Snapshot()
 
-// load returns a private copy of the cached value for key and marks it most-recently-used.
-func (c *cachedBackend) load(key string) ([]byte, bool) {
-	v, ok := c.loadView(key)
-	if !ok {
-		return nil, false
+	return CacheStats{
+		Hits:   int64(s.Hits),
+		Misses: int64(s.Misses),
+		Bytes:  int64(c.values.WeightedSize()),
+		Items:  c.values.EstimatedSize(),
 	}
-
-	return slices.Clone(v), true
 }
 
-// loadView returns the cached value itself (read-only; see [cachedBackend.ReadView]) and marks it
-// most-recently-used.
-func (c *cachedBackend) loadView(key string) ([]byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	el, ok := c.items[key]
-	if !ok {
-		return nil, false
-	}
-
-	c.ll.MoveToFront(el)
-
-	return el.Value.(*cacheEntry).val, true
-}
-
-// store caches a private copy of data under key (see storeOwned).
+// store caches a private copy of data under key, taking a copy because the caller may reuse its
+// buffer after Write returns. An object larger than the whole budget is not cached — and any stale
+// smaller entry under that key is dropped, so a reader cannot be served the superseded value.
 func (c *cachedBackend) store(key string, data []byte) {
 	if int64(len(data)) > c.maxBytes {
-		c.evict(key) // a stale smaller entry must not linger under this key
+		c.values.Invalidate(key)
 
 		return
 	}
@@ -192,60 +200,5 @@ func (c *cachedBackend) store(key string, data []byte) {
 		cp = []byte{}
 	}
 
-	c.storeOwned(key, cp)
-}
-
-// storeOwned caches data under key taking ownership of the slice (the caller must not mutate it
-// afterwards — sharing it with read-only views is fine), evicting LRU entries to stay within
-// budget. An object larger than the whole budget is not cached.
-func (c *cachedBackend) storeOwned(key string, data []byte) {
-	if int64(len(data)) > c.maxBytes {
-		c.evict(key) // a stale smaller entry must not linger under this key
-
-		return
-	}
-
-	cp := data
-	if cp == nil {
-		cp = []byte{}
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if el, ok := c.items[key]; ok {
-		ent := el.Value.(*cacheEntry)
-		c.bytes += int64(len(cp)) - int64(len(ent.val))
-		ent.val = cp
-		c.ll.MoveToFront(el)
-	} else {
-		c.items[key] = c.ll.PushFront(&cacheEntry{key: key, val: cp})
-		c.bytes += int64(len(cp))
-	}
-
-	for c.bytes > c.maxBytes {
-		back := c.ll.Back()
-		if back == nil {
-			break
-		}
-
-		c.removeElem(back)
-	}
-}
-
-func (c *cachedBackend) evict(key string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if el, ok := c.items[key]; ok {
-		c.removeElem(el)
-	}
-}
-
-// removeElem drops el from the list and index and decrements the byte total. Caller holds c.mu.
-func (c *cachedBackend) removeElem(el *list.Element) {
-	ent := el.Value.(*cacheEntry)
-	c.bytes -= int64(len(ent.val))
-	delete(c.items, ent.key)
-	c.ll.Remove(el)
+	c.values.Set(key, cp)
 }

@@ -64,7 +64,7 @@ type Options struct {
 	// a reject limit — see [tenant.Limits.MaxInFlightBytes] for that.
 	FlushThresholdBytes int64
 
-	// ReadCacheBytes enables an in-memory LRU cache over backend read objects (immutable part
+	// ReadCacheBytes enables an in-memory cache over backend read objects (immutable part
 	// columns/manifests/marks/index), sized to this many bytes. It targets the cold tier
 	// (file/S3), where a part is otherwise re-read on every query; recommended for those
 	// deployments. Zero disables it, and it is always skipped for an ephemeral (in-memory)
@@ -269,7 +269,7 @@ func (o *Options) flushThresholdBytes() int64 {
 // [Options.FlushInterval] as the only one. See [Options.FlushThresholdBytes].
 func WithFlushThresholdBytes(n int64) Option { return func(o *Options) { o.FlushThresholdBytes = n } }
 
-// WithReadCache enables an in-memory LRU object cache over the backend, sized to maxBytes (the
+// WithReadCache enables an in-memory object cache over the backend, sized to maxBytes (the
 // object-store read cache for the cold tier). Skipped for an ephemeral backend. See [Options.ReadCacheBytes].
 func WithReadCache(maxBytes int64) Option { return func(o *Options) { o.ReadCacheBytes = maxBytes } }
 

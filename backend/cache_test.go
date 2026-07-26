@@ -118,11 +118,16 @@ func TestCacheEvictsByByteBudget(t *testing.T) {
 	}
 	assert.LessOrEqual(t, cs.Stats().Bytes, int64(100), "resident bytes stay within budget")
 
-	// The oldest key was evicted; reading it falls through to the backend.
+	// Most of the 50 keys are therefore not resident and fall through to the backend. Which ones
+	// survive is the policy's choice — a strict LRU keeps the newest, W-TinyLFU keeps whichever it
+	// has frequency evidence for — so assert the budget, not an eviction order.
 	before := inner.reads.Load()
-	_, err := c.Read(ctx, "k0")
-	require.NoError(t, err)
-	assert.Equal(t, before+1, inner.reads.Load(), "evicted key missed the cache")
+	for i := range 50 {
+		_, err := c.Read(ctx, "k"+strconv.Itoa(i))
+		require.NoError(t, err)
+	}
+	assert.GreaterOrEqual(t, inner.reads.Load()-before, int64(35),
+		"a 100-byte budget holds ~10 of the 50 values; the rest miss")
 }
 
 func TestCacheSkipsOversizeObjects(t *testing.T) {
@@ -210,6 +215,90 @@ func TestCacheConcurrent(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
+}
+
+// blockingBackend holds every inner read until the gate opens, so a burst of readers is guaranteed
+// to overlap on the same cold key.
+type blockingBackend struct {
+	backend.Backend
+
+	reads atomic.Int64
+	gate  chan struct{}
+}
+
+func (b *blockingBackend) Read(ctx context.Context, key string) ([]byte, error) {
+	b.reads.Add(1)
+	<-b.gate
+
+	return b.Backend.Read(ctx, key)
+}
+
+func TestCacheDedupsConcurrentMisses(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	const readers = 32
+
+	inner := &blockingBackend{Backend: backend.Memory(), gate: make(chan struct{})}
+	require.NoError(t, inner.Write(ctx, "k", []byte("value")))
+
+	c := backend.Cached(inner, 1<<20)
+
+	var wg, started sync.WaitGroup
+
+	wg.Add(readers)
+	started.Add(readers)
+
+	for range readers {
+		go func() {
+			defer wg.Done()
+			started.Done()
+
+			v, err := backend.ReadView(ctx, c, "k")
+			assert.NoError(t, err)
+			assert.Equal(t, []byte("value"), v)
+		}()
+	}
+
+	go func() {
+		started.Wait()
+		close(inner.gate) // release only once every reader is in flight
+	}()
+
+	wg.Wait()
+
+	// The point of a loading cache: on an object store this is one GET instead of one per query.
+	// The collapse is best-effort, not exclusive: the cache checks the map and then starts the
+	// load, so a caller arriving in that window loads again. Harmless (a part object is immutable,
+	// so a duplicate read returns identical bytes) — but it means the count is not deterministically
+	// 1. It is 1 in the large majority of runs and a low single digit otherwise, so the bound here
+	// is loose enough never to flake while still failing loudly if dedup regresses.
+	assert.LessOrEqual(t, inner.reads.Load(), int64(readers/2),
+		"concurrent misses on one key collapse to ~1 read, not %d", readers)
+}
+
+func TestCacheOversizeDoesNotDropWorkingSet(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	inner := newCounting()
+	c := backend.Cached(inner, 1<<10)
+
+	for i := range 4 {
+		require.NoError(t, c.Write(ctx, "k"+strconv.Itoa(i), make([]byte, 64)))
+	}
+
+	// A single object above the whole budget must not take the resident set with it.
+	require.NoError(t, inner.Write(ctx, "big", make([]byte, 4<<10)))
+	_, err := c.Read(ctx, "big")
+	require.NoError(t, err)
+
+	before := inner.reads.Load()
+	for i := range 4 {
+		_, err := c.Read(ctx, "k"+strconv.Itoa(i))
+		require.NoError(t, err)
+	}
+	assert.Equal(t, before, inner.reads.Load(), "the small working set survived the oversize read")
 }
 
 func TestCachedSize(t *testing.T) {

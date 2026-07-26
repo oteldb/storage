@@ -18,10 +18,14 @@ conformance suite all of them pass under `-race`.
   delete) is testable over a fake. `NewAWS` adapts aws-sdk-go-v2 — **the only package importing
   the AWS SDK**. An always-on integration test runs the suite over a real S3 protocol server
   (embeddable `go-faster/fs` on `httptest`, no Docker).
-- **`backend.Cached(inner, maxBytes)`** — byte-bounded LRU read cache for the cold tier. Correct by
+- **`backend.Cached(inner, maxBytes)`** — byte-bounded read cache for the cold tier. Correct by
   construction: part objects are write-once immutable, so a hit is never stale; a write/delete of
   the same key updates/drops the entry. Wrapped **outermost** (a hit skips metering and the
-  backend), skipped for ephemeral backends.
+  backend), skipped for ephemeral backends. It is otter's weight-bounded **loading** cache, not a
+  strict LRU: concurrent misses on one key collapse into a single inner read (one object-store GET
+  per cold object, not one per in-flight query), and W-TinyLFU admission keeps a cold historical
+  scan from flushing the hot working set — the pattern a strict LRU handles worst. An object
+  larger than the whole budget is never retained.
 - **`backend.Viewer`** — opt-in `ReadView(ctx,key)` returning a **read-only view** instead of a
   copy (a stored value is never mutated in place, so a view survives overwrite/eviction). This
   removes the clone-per-hit that dominated the query-path allocation profile; `backend.ReadView`
