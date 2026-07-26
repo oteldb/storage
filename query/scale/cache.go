@@ -210,17 +210,72 @@ func (c *MemoryCache) Len() int {
 	return c.ll.Len()
 }
 
-// cloneBatches deep-copies a batch slice — each batch's sample columns are cloned so the snapshot
-// is independent of any buffer the producer reuses. The series identity is shared (immutable).
+// cloneBatches deep-copies a batch slice — every per-sample buffer is cloned so the snapshot is
+// independent of any buffer the producer reuses. The series identity is shared (immutable).
+//
+// Every payload field must be copied, not just the metric ones: dropping [fetch.Batch.Columns]
+// would serve a record (log/trace) hit as the right number of rows with no data, and dropping
+// [fetch.Batch.ScaleFactors] would serve a sampled metric hit as if every sample weighed 1, biasing
+// the embedder's counts and rates. A nil field stays nil — that is the "not present" signal for
+// both, and [slices.Clone] preserves it.
 func cloneBatches(batches []*fetch.Batch) []*fetch.Batch {
 	out := make([]*fetch.Batch, len(batches))
 	for i, b := range batches {
 		out[i] = &fetch.Batch{
-			ID:         b.ID,
-			Series:     b.Series,
-			Timestamps: slices.Clone(b.Timestamps),
-			Values:     slices.Clone(b.Values),
+			ID:           b.ID,
+			Series:       b.Series,
+			Timestamps:   slices.Clone(b.Timestamps),
+			Values:       slices.Clone(b.Values),
+			ScaleFactors: slices.Clone(b.ScaleFactors),
+			Columns:      cloneColumns(b.Columns),
 		}
+	}
+
+	return out
+}
+
+// cloneColumns deep-copies materialized record columns, including each byte cell: the producing
+// engine hands out cells that are views into a pooled per-part blob, so retaining them would let a
+// later fetch overwrite a cached result in place.
+func cloneColumns(cols []fetch.NamedColumn) []fetch.NamedColumn {
+	if cols == nil {
+		return nil
+	}
+
+	out := make([]fetch.NamedColumn, len(cols))
+
+	for i, c := range cols {
+		out[i] = fetch.NamedColumn{
+			Name:    c.Name,
+			Int64:   slices.Clone(c.Int64),
+			Float64: slices.Clone(c.Float64),
+		}
+
+		if c.Bytes == nil {
+			continue
+		}
+
+		// One backing blob per column: the cells are contiguous in the snapshot, so a cached
+		// result costs two allocations instead of one per row.
+		var n int
+		for _, v := range c.Bytes {
+			n += len(v)
+		}
+
+		blob := make([]byte, 0, n)
+		cells := make([][]byte, len(c.Bytes))
+
+		for j, v := range c.Bytes {
+			if v == nil { // an absent cell is not an empty one
+				continue
+			}
+
+			start := len(blob)
+			blob = append(blob, v...)
+			cells[j] = blob[start:len(blob):len(blob)]
+		}
+
+		out[i].Bytes = cells
 	}
 
 	return out
