@@ -2,8 +2,8 @@
 // any embedder's query engine composes over [fetch.Fetcher] (a per-tenant engine, a cluster
 // fan-out, a cross-tenant [fetch.Merge]) without the library owning a query language.
 //
-//   - [SplitFetcher] splits a wide time window into aligned sub-intervals fetched in parallel,
-//     the query-frontend "split by interval" technique applied to the fetch contract.
+//   - [SplitFetcher] splits a wide time window into aligned sub-intervals fetched in parallel under
+//     a bound, the query-frontend "split by interval" technique applied to the fetch contract.
 //   - [CacheFetcher] memoizes results of fully-pushable (serializable-equality) requests.
 //
 // Both implement [fetch.Fetcher], so they nest freely — e.g. a SplitFetcher over a CacheFetcher
@@ -12,14 +12,23 @@ package scale
 
 import (
 	"context"
-	"sync"
 
+	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/fetch"
 )
 
+// splitConcurrency bounds how many sub-window fetches a split runs at once. A split is unbounded in
+// the *request* (a 30-day window at hourly interval is 720 sub-windows), and each in-flight sub-fetch
+// pins its parts and reserves its decode footprint from the engine's memory budget — so running them
+// all at once contends on exactly the resource that budget exists to protect, buying no throughput.
+// Matched to the fan-out cap in query/fetch for the same reason: reads are I/O-bound, so a handful
+// above the CPU count overlaps latency without swamping the backend.
+const splitConcurrency = 16
+
 // SplitFetcher fetches a [fetch.Request] as a set of aligned sub-windows of width Interval,
-// run concurrently against Inner and merged by series. Splitting on a fixed grid (aligned to
-// multiples of Interval) makes each sub-window's bounds independent of the overall request, so
+// run concurrently (at most [splitConcurrency] at a time) against Inner and merged by series.
+// Splitting on a fixed grid (aligned to multiples of Interval) makes each sub-window's bounds
+// independent of the overall request, so
 // overlapping queries reuse the same sub-windows — the property a downstream [CacheFetcher]
 // relies on for hits across shifting ranges.
 type SplitFetcher struct {
@@ -29,8 +38,8 @@ type SplitFetcher struct {
 
 var _ fetch.Fetcher = SplitFetcher{}
 
-// Fetch splits r's window into aligned sub-windows, fetches them concurrently from Inner, and
-// returns their merged batches. A request spanning a single sub-window (or with Interval ≤ 0)
+// Fetch splits r's window into aligned sub-windows, fetches them from Inner under a concurrency
+// bound, and returns their merged batches. A request spanning a single sub-window (or with Interval ≤ 0)
 // passes straight through, so splitting never adds overhead to a narrow query.
 func (f SplitFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
 	if f.Interval <= 0 || r.End < r.Start {
@@ -45,39 +54,29 @@ func (f SplitFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterato
 	groups := make([][]*fetch.Batch, len(windows))
 	errs := make([]error, len(windows))
 
-	var wg sync.WaitGroup
+	// Bounded: at most splitConcurrency sub-fetches are in flight, collected into per-index slots so
+	// the group order (which decides the duplicate-timestamp winner in MergeBatches) is independent of
+	// completion order.
+	parallel.ForEach(len(windows), splitConcurrency, func(i int) {
+		sub := r
+		sub.Start, sub.End = windows[i].lo, windows[i].hi
 
-	for i, w := range windows {
-		wg.Add(1)
+		it, err := f.Inner.Fetch(ctx, sub)
+		if err != nil {
+			errs[i] = err
 
-		go func(i int, w window) {
-			defer wg.Done()
+			return
+		}
 
-			sub := r
-			sub.Start, sub.End = w.lo, w.hi
+		batches, derr := fetch.Drain(ctx, it) // Drain closes the iterator
+		if derr != nil {
+			errs[i] = derr
 
-			it, err := f.Inner.Fetch(ctx, sub)
-			if err != nil {
-				errs[i] = err
+			return
+		}
 
-				return
-			}
-
-			batches, derr := fetch.Drain(ctx, it)
-			cerr := it.Close()
-
-			switch {
-			case derr != nil:
-				errs[i] = derr
-			case cerr != nil:
-				errs[i] = cerr
-			default:
-				groups[i] = batches
-			}
-		}(i, w)
-	}
-
-	wg.Wait()
+		groups[i] = batches
+	})
 
 	for _, err := range errs {
 		if err != nil {
