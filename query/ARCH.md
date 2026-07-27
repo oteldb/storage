@@ -33,10 +33,21 @@ Optional capabilities, discovered by walking the `Unwraper` decorator chain:
   Pass-through decorators forward it; a decorator that retains or clones a batch emits hookless
   copies and releases its inputs.
 
+The iterator is **streaming by contract**: a batch is produced per `Next`, so a consumer that folds
+and releases stays O(1) in matched series. The flip side is that the producer's resources live until
+`Close` — the metric engine's iterator pins its parts and holds its decode-memory reservation for the
+whole iteration — so **every caller must Close** (`Drain` does it for you, at the cost of
+materializing the result set it was meant to avoid).
+
 `Merge(fetchers...)` is the fan-out combinator (union by series id, timestamp-ordered, later child
-wins a duplicate) backing multi-tenant and cluster reads; `MergeBatches` is its batch-level form.
-Children are fetched concurrently under a bound, collected into per-index slots so the
-duplicate-timestamp winner stays order-deterministic.
+wins a duplicate) backing multi-tenant and cluster reads; `MergeBatches` is its batch-level form (a
+materializing merge over already-drained groups, used by `SplitFetcher`). Children are opened
+concurrently under a bound into per-index slots — child order decides the duplicate-timestamp winner
+— then merged **lazily**: a k-way merge holds one pending batch per child and emits the smallest id,
+so peak resident is O(children), not O(children × series). It relies on each child yielding ascending
+series ids (every producer does; postings resolution is sorted). A series only one child carries is
+passed through untouched, hook and columns intact; a federated one is cloned and its contributors
+released.
 
 ## `scale` — scale-out decorators
 
