@@ -56,7 +56,8 @@ it without the library owning a language:
 
 - **`SplitFetcher`** splits a window into sub-windows **aligned to multiples of Interval** — grid
   alignment (not request-relative) is what makes overlapping queries share sub-windows — fetches
-  them concurrently and merges. A narrow window is a transparent pass-through.
+  them concurrently **under a bound** (a 30-day range at hourly interval is 720 sub-windows, each
+  pinning parts and reserving decode memory while in flight) and merges. A narrow window is a transparent pass-through.
 - **`CacheFetcher`** memoizes only **fully-pushable** requests: every matcher must carry a
   serializable equality `Spec`, so the key (tenant ‖ window ‖ sorted specs) is exact and a hit can
   never drop a matching series. An opaque matcher bypasses. There is no invalidation, so a
