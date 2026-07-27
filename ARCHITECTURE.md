@@ -115,6 +115,11 @@ jittered backoff; **idempotent reads hedge** across replicas, **writes stay at-m
   must work with no disk or object store.
 - **Engine locks are never held across object-store I/O.** Plan under lock → read/write off lock →
   publish under lock; parts are copy-on-write and refcounted with deferred reclamation.
+- **Reads stream; the consumer must `Close`.** A `fetch.Iterator` produces a batch per `Next` —
+  never a pre-built result set — so a consumer that folds and releases each batch stays O(1) in
+  matched series (the metric engine and the fan-out `Merge` both hold one series at a time). The
+  producer therefore holds the iteration's resources (pinned parts, decode-memory reservation, child
+  iterators) until `Close`, which every caller owes it; `fetch.Drain` closes what it drains.
 - **Coordination is external/minimal.** etcd for membership/claims, backend CAS for commits. No
   homegrown Raft; single-node works with the cluster layer absent.
 - **The bucket index commits last.** It is what makes a part durably visible — and in

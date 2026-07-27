@@ -15,6 +15,14 @@ import (
 // replicas across nodes (cluster fan-out) — are combined into one batch with samples in
 // timestamp order, the value from the later child winning on a duplicate timestamp.
 //
+// The merge is **streaming**: children are opened concurrently but not drained, and one output
+// batch is assembled per Next, so peak memory is O(children) batches rather than
+// O(children x matched series) — the property the fetch contract promises a consumer that folds
+// and releases each batch. This requires each child to yield batches in ascending
+// [signal.SeriesID] order, which every producer does (an engine emits in the sorted order its
+// postings resolution returns). An id a child emits out of order is not merged with its
+// duplicate; it is emitted as its own batch.
+//
 // With a single child it is a transparent pass-through (no copy or re-sort). The children are
 // already bound to their data (a per-tenant engine, a remote node), so each receives the same
 // Request and its [Request.Tenant] field is advisory. nil/empty input yields an empty fetcher.
@@ -53,14 +61,13 @@ type mergeAcc struct {
 
 func (m mergeFetcher) Fetch(ctx context.Context, r Request) (Iterator, error) {
 	ctx, pf := profile.Begin(ctx, "fan-out")
-	defer pf.End()
 	pf.Add("children", int64(len(m)))
 
-	// Children are independent shards/tenants/replicas; fetch them concurrently and collect into
-	// per-index slots so the group order (which decides the duplicate-timestamp winner in
-	// MergeBatches) is preserved regardless of completion order. Bounded so a wide fan-out can't
-	// spawn an unbounded number of in-flight backend/RPC requests.
-	groups := make([][]*Batch, len(m))
+	// Children are independent shards/tenants/replicas; open them concurrently (bounded, so a wide
+	// fan-out can't spawn an unbounded number of in-flight backend/RPC requests) but keep their
+	// iterators: the merge below pulls from them lazily. The per-index slots preserve child order,
+	// which decides the duplicate-timestamp winner, regardless of completion order.
+	its := make([]Iterator, len(m))
 	errs := make([]error, len(m))
 
 	parallel.ForEach(len(m), fanOutConcurrency, func(i int) {
@@ -71,39 +78,38 @@ func (m mergeFetcher) Fetch(ctx context.Context, r Request) (Iterator, error) {
 			return
 		}
 
-		batches, derr := Drain(ctx, it)
-		cerr := it.Close()
-
-		switch {
-		case derr != nil:
-			errs[i] = derr
-		case cerr != nil:
-			errs[i] = cerr
-		default:
-			groups[i] = batches
-		}
+		its[i] = it
 	})
 
 	for _, err := range errs { // surface the first error deterministically (by child index)
 		if err != nil {
+			closeAll(its)
+			pf.End()
+
 			return nil, err
 		}
 	}
 
-	_, mpf := profile.Begin(ctx, "merge")
-	out := MergeBatches(groups...)
-	mpf.Add("batches", int64(len(out)))
-	mpf.End()
-
-	// MergeBatches deep-copies into fresh batches, so the children's buffers are now dead — release
-	// them to recycle the producing engines' pools (the output batches carry no hook).
-	for _, g := range groups {
-		for _, b := range g {
-			b.Release()
-		}
+	it := &mergeIter{
+		children: its,
+		cur:      make([]*Batch, len(its)),
+		advance:  make([]bool, len(its)),
+		errs:     errs,
+		pf:       pf,
+	}
+	for i := range it.advance {
+		it.advance[i] = true // nothing pulled yet: the first Next primes every child
 	}
 
-	return NewSliceIterator(out), nil
+	return it, nil
+}
+
+func closeAll(its []Iterator) {
+	for _, it := range its {
+		if it != nil {
+			_ = it.Close()
+		}
+	}
 }
 
 // MergeBatches merges batches from multiple result groups by [signal.SeriesID] into one slice,

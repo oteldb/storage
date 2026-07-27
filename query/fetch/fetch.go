@@ -330,7 +330,14 @@ func (it *SliceIterator) Next(context.Context) (*Batch, error) {
 // Close releases the iterator (a no-op for a slice).
 func (it *SliceIterator) Close() error { return nil }
 
-// Drain reads an iterator to completion and returns all batches.
+// Drain reads an iterator to completion and returns all batches. It **closes** the iterator: a
+// streaming producer holds resources for the whole iteration (an engine fetch pins the parts it
+// reads and reserves decode memory until Close), and draining is the end of it. Close is
+// idempotent, so a caller with its own `defer it.Close()` stays correct. The returned batches
+// remain valid — a producer's Close never touches the buffers it handed out.
+//
+// Draining defeats the streaming contract by design (it materializes every batch); use it only
+// where the consumer genuinely needs the whole result set at once.
 func Drain(ctx context.Context, it Iterator) ([]*Batch, error) {
 	var out []*Batch
 
@@ -338,8 +345,10 @@ func Drain(ctx context.Context, it Iterator) ([]*Batch, error) {
 		b, err := it.Next(ctx)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return out, nil
+				return out, it.Close()
 			}
+
+			_ = it.Close()
 
 			return out, err
 		}
