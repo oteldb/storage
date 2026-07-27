@@ -93,12 +93,13 @@ func (m mergeFetcher) Fetch(ctx context.Context, r Request) (Iterator, error) {
 	it := &mergeIter{
 		children: its,
 		cur:      make([]*Batch, len(its)),
-		advance:  make([]bool, len(its)),
+		heap:     make([]int32, 0, len(its)),
+		refill:   make([]int32, len(its)),
 		errs:     errs,
 		pf:       pf,
 	}
-	for i := range it.advance {
-		it.advance[i] = true // nothing pulled yet: the first Next primes every child
+	for i := range it.refill {
+		it.refill[i] = int32(i) // nothing pulled yet: the first Next primes every child
 	}
 
 	return it, nil

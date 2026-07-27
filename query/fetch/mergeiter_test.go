@@ -249,3 +249,44 @@ func TestDrainClosesIterator(t *testing.T) {
 	assert.Len(t, got, 2)
 	assert.Equal(t, 1, child.closed, "Drain closes what it drained")
 }
+
+// TestMergeWideFanOutOrdering exercises the heap over a fan-out wide enough that the ordering is not
+// incidentally correct: 64 children whose ids interleave, every child live until the very end, plus
+// one id every child carries so the pop-all-contributors path runs at full width.
+func TestMergeWideFanOutOrdering(t *testing.T) {
+	t.Parallel()
+
+	const (
+		children = 64
+		perChild = 16
+		shared   = uint64(1 << 20) // an id every child holds, after all the interleaved ones
+	)
+
+	fetchers := make([]fetch.Fetcher, children)
+	want := make([]uint64, 0, children*perChild+1)
+
+	for c := range children {
+		list := make([]uint64, 0, perChild)
+		for i := range perChild {
+			list = append(list, uint64(i*children+c))
+		}
+
+		batches := series(list...)
+		// The shared id carries one sample per child, valued by child index, so the winner is visible.
+		batches = append(batches, batch(shared, [2]int64{99, int64(c)}))
+		fetchers[c] = fakeFetcher{batches: batches}
+	}
+
+	for i := range perChild * children { // interleaved ids come out simply ascending
+		want = append(want, uint64(i))
+	}
+
+	want = append(want, shared)
+
+	got := drain(t, fetch.Merge(fetchers...))
+	require.Equal(t, want, ids(got), "ascending ids across a wide fan-out")
+
+	last := got[len(got)-1]
+	assert.Equal(t, []int64{99}, last.Timestamps, "the shared id is one federated batch")
+	assert.Equal(t, []float64{children - 1}, last.Values, "the last child wins the duplicate timestamp")
+}
