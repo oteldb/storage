@@ -2,9 +2,10 @@ package fetch
 
 import (
 	"context"
-	"errors"
 	"io"
 	"slices"
+
+	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/profile"
@@ -31,6 +32,12 @@ type mergeIter struct {
 	heap     []int32  // child indices ordered by (cur[i].ID, i); children with no pending batch are absent
 	refill   []int32  // children consumed by the last step, to be pulled again on the next one
 	errs     []error  // scratch for the concurrent refill, reused per step
+	// last is each child's previously yielded id (valid once seen[i]), the failsafe for the
+	// ascending-order requirement the heap relies on. Checked per pull, so a child that breaks it
+	// fails the read loudly instead of silently splitting a series into two batches and skipping its
+	// cross-child dedup. The zero SeriesID is a legal id, hence seen rather than a sentinel.
+	last []signal.SeriesID
+	seen []bool
 
 	pf      *profile.Handle
 	err     error // sticky: a child's iteration error ends the merge for every later Next
@@ -178,7 +185,9 @@ func (it *mergeIter) fill(ctx context.Context) error {
 	return nil
 }
 
-// pull reads child i's next batch into its pending slot, leaving it nil at EOF (exhausted).
+// pull reads child i's next batch into its pending slot, leaving it nil at EOF (exhausted). A batch
+// whose id does not advance breaks the merge's precondition, so it is reported rather than merged:
+// the batch is still parked in the slot so Close releases it.
 func (it *mergeIter) pull(ctx context.Context, i int) {
 	b, err := it.children[i].Next(ctx)
 	if err != nil {
@@ -190,6 +199,16 @@ func (it *mergeIter) pull(ctx context.Context, i int) {
 	}
 
 	it.cur[i] = b
+
+	if prev := it.last[i]; it.seen[i] && b.ID.Compare(prev) <= 0 {
+		it.errs[i] = errors.Errorf(
+			"fetch: merge child %d yielded series %s after %s: children must yield ascending series ids",
+			i, b.ID, prev)
+
+		return
+	}
+
+	it.last[i], it.seen[i] = b.ID, true
 }
 
 // less orders the heap: by pending series id, child index breaking a tie (so equal ids pop in child

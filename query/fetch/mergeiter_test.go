@@ -290,3 +290,61 @@ func TestMergeWideFanOutOrdering(t *testing.T) {
 	assert.Equal(t, []int64{99}, last.Timestamps, "the shared id is one federated batch")
 	assert.Equal(t, []float64{children - 1}, last.Values, "the last child wins the duplicate timestamp")
 }
+
+// TestMergeRejectsUnsortedChild is the failsafe: the streaming merge's correctness rests on each
+// child yielding ascending ids, so a child that regresses (or repeats) an id fails the read instead
+// of silently emitting the series twice and skipping its cross-child dedup.
+func TestMergeRejectsUnsortedChild(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	for _, tt := range []struct {
+		name string
+		ids  []uint64
+	}{
+		{"descending", []uint64{5, 3}},
+		{"repeated", []uint64{5, 5}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			bad := &lazyIter{batches: series(tt.ids...)}
+
+			it, err := fetch.Merge(&lazyFetcher{it: bad}, fakeFetcher{batches: series(9)}).Fetch(ctx, fetch.Request{})
+			require.NoError(t, err)
+
+			// The first batch is fine — the violation is only visible on the child's next pull.
+			first, err := it.Next(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, signal.SeriesID{Lo: tt.ids[0]}, first.ID)
+
+			_, err = it.Next(ctx)
+			require.ErrorContains(t, err, "ascending series ids")
+
+			require.NoError(t, it.Close())
+			assert.Equal(t, 1, bad.closed, "a rejected merge still closes its children")
+		})
+	}
+}
+
+// TestMergeAcceptsZeroSeriesID guards the failsafe's own edge: the zero SeriesID is a legal id, so a
+// child starting at it must not read as a violation.
+func TestMergeAcceptsZeroSeriesID(t *testing.T) {
+	t.Parallel()
+
+	got := drain(t, fetch.Merge(
+		fakeFetcher{batches: series(0, 2)},
+		fakeFetcher{batches: series(1, 3)},
+	))
+	assert.Equal(t, []uint64{0, 1, 2, 3}, ids(got))
+}
+
+// TestMergeBatchesSortsByID pins the batch-level form to the same ascending order, so the slice a
+// split-by-interval fetch serves is a legal child of a streaming Merge.
+func TestMergeBatchesSortsByID(t *testing.T) {
+	t.Parallel()
+
+	// Groups are individually sorted, but first appearance would interleave them as 1, 5, 9, 3, 7.
+	got := fetch.MergeBatches(series(1, 5, 9), series(3, 7))
+	assert.Equal(t, []uint64{1, 3, 5, 7, 9}, ids(got))
+}

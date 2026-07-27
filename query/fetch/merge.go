@@ -19,9 +19,10 @@ import (
 // batch is assembled per Next, so peak memory is O(children) batches rather than
 // O(children x matched series) — the property the fetch contract promises a consumer that folds
 // and releases each batch. This requires each child to yield batches in ascending
-// [signal.SeriesID] order, which every producer does (an engine emits in the sorted order its
-// postings resolution returns). An id a child emits out of order is not merged with its
-// duplicate; it is emitted as its own batch.
+// [signal.SeriesID] order, which every producer here does (an engine emits in the sorted order its
+// postings resolution returns; [MergeBatches] sorts). A child that breaks it is **reported, not
+// silently mis-merged**: the merge fails the iteration rather than emitting one series as two
+// batches with its cross-child dedup skipped.
 //
 // With a single child it is a transparent pass-through (no copy or re-sort). The children are
 // already bound to their data (a per-tenant engine, a remote node), so each receives the same
@@ -95,6 +96,8 @@ func (m mergeFetcher) Fetch(ctx context.Context, r Request) (Iterator, error) {
 		cur:      make([]*Batch, len(its)),
 		heap:     make([]int32, 0, len(its)),
 		refill:   make([]int32, len(its)),
+		last:     make([]signal.SeriesID, len(its)),
+		seen:     make([]bool, len(its)),
 		errs:     errs,
 		pf:       pf,
 	}
@@ -114,12 +117,13 @@ func closeAll(its []Iterator) {
 }
 
 // MergeBatches merges batches from multiple result groups by [signal.SeriesID] into one slice,
-// ordered by first appearance. Batches that share an id — the same series in more than one
+// **ascending by id** — the order every [Iterator] in this package yields, so a merged slice served
+// as one (a split-by-interval fetch) is a legal child of a streaming [Merge]. Batches that share an id — the same series in more than one
 // group (cluster fan-out across replicas, or the sub-windows of a split-by-interval fetch) —
 // are combined into one batch with samples in timestamp order, the value from the later group
 // winning on a duplicate timestamp. It is the batch-level form of [Merge]; a series present in
-// a single group is copied through unchanged (no re-sort/dedup). Input batches are never
-// mutated (a merged batch holds cloned sample columns).
+// a single group is copied through unchanged (no re-sort/dedup of its samples). Input batches are
+// never mutated (a merged batch holds cloned sample columns).
 func MergeBatches(groups ...[]*Batch) []*Batch {
 	byID := make(map[signal.SeriesID]*mergeAcc)
 
@@ -147,6 +151,8 @@ func MergeBatches(groups ...[]*Batch) []*Batch {
 			order = append(order, b.ID)
 		}
 	}
+
+	slices.SortFunc(order, signal.SeriesID.Compare)
 
 	out := make([]*Batch, 0, len(order))
 	for _, id := range order {
