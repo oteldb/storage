@@ -44,10 +44,15 @@ wins a duplicate) backing multi-tenant and cluster reads; `MergeBatches` is its 
 materializing merge over already-drained groups, used by `SplitFetcher`). Children are opened
 concurrently under a bound into per-index slots — child order decides the duplicate-timestamp winner
 — then merged **lazily**: a k-way merge holds one pending batch per child and emits the smallest id,
-so peak resident is O(children), not O(children × series). It relies on each child yielding ascending
-series ids (every producer does; postings resolution is sorted). A series only one child carries is
-passed through untouched, hook and columns intact; a federated one is cloned and its contributors
-released.
+so peak resident is O(children), not O(children × series). The ordering is a **min-heap** keyed on
+`(pending id, child index)` — O(log children) a step, since a cross-tenant or wide-shard fan-out has
+one child per engine — and the index tie-break is what preserves the later-child-wins rule. It relies
+on each child yielding ascending series ids — every producer here does (postings resolution is
+sorted, and `MergeBatches` sorts too), and a child that breaks it fails the iteration with an error
+rather than being silently mis-merged.
+A series only one child carries is passed through untouched, hook and columns intact; a federated one
+is cloned and its contributors released, carrying each sample's sampling weight (`ScaleFactors`) with
+it — a merged sampled series that lost its weights would under-report every count/sum/rate over it.
 
 ## `scale` — scale-out decorators
 
