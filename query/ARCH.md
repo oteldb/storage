@@ -51,7 +51,8 @@ on each child yielding ascending series ids — every producer here does (postin
 sorted, and `MergeBatches` sorts too), and a child that breaks it fails the iteration with an error
 rather than being silently mis-merged.
 A series only one child carries is passed through untouched, hook and columns intact; a federated one
-is cloned and its contributors released.
+is cloned and its contributors released, carrying each sample's sampling weight (`ScaleFactors`) with
+it — a merged sampled series that lost its weights would under-report every count/sum/rate over it.
 
 ## `scale` — scale-out decorators
 
