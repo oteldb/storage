@@ -105,7 +105,7 @@ Metric instruments (all prefixed `storage.`):
 | `ingest.sampled_dropped` / `ingest.overflowed` | `signal` | budgeted sampling / overflow routing |
 | `flush.total` / `flush.duration` / `flush.rows` | `signal` | head flushes |
 | `merge.total` / `merge.duration` / `merge.parts_in` | `signal` | background merges |
-| `fetch.total` / `fetch.duration` / `fetch.series_matched` / `fetch.rows_returned` / `fetch.parts_scanned` | `signal` | reads |
+| `fetch.total` / `fetch.duration` / `fetch.series_matched` / `fetch.rows_returned` / `fetch.parts_scanned` | `signal` | reads; the metric engine's reads are streaming, so these are recorded when the iterator is **closed** — `duration` covers the whole iteration (the consumer's own per-batch work included) and `rows_returned` counts what was actually consumed |
 | `backend.ops` / `backend.bytes` / `backend.latency` | `op`(, `result`) | ops: read/write/list/delete/cas/size; results: ok/not_found/error |
 | `rpc.attempts` / `rpc.retries` / `rpc.hedges` | `op` | cluster RPCs |
 | `wal.appends` / `wal.fsyncs` / `wal.rotations` | — | WAL activity |

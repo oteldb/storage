@@ -123,7 +123,15 @@ the uncommitted output is never observable as published; its objects are orphans
 ## Read path
 
 `Fetch` resolves matchers over the index, then merges each series' head buffer ∪ every part by
-timestamp. Layered optimizations, each opt-in:
+timestamp — **one series per `Next`**, so a consumer that folds and releases each batch never has
+more than one series' samples resident, whatever the matched count. The plan (acquired parts, decode
+reservation, head snapshots) and the fetch's span/profile/metrics therefore span the whole iteration
+and are settled by `Close`, which the caller owes even when it stops early. What remains O(matched
+series) is the plan itself: one identity per matched series, and the head/mid-flush snapshots — those
+must be copied under the lock, since a concurrent flush moves a series' head buffer into a part the
+plan did not acquire.
+
+Layered optimizations, each opt-in:
 
 - **Series index sidecar** (`{prefix}/sidx`) — sorted distinct SeriesIDs + run-start rows as
   fixed-width entries, binary-searched **in the raw bytes**, held only while a fetch is reading the

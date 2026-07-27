@@ -341,16 +341,21 @@ func (e *Engine) Stats() Stats {
 
 // Fetch implements [fetch.Fetcher] over the head ∪ flushed parts: it resolves the
 // request's matchers to series (the index spans every series ever seen, flushed or not)
-// and returns one batch per series with its samples in the window, merged across the head
+// and yields one batch per series with its samples in the window, merged across the head
 // buffer and every part by timestamp.
+//
+// The iterator is **streaming**: a series' samples are gathered on the [fetch.Iterator.Next] that
+// yields them, so a consumer that folds and releases each batch stays O(1) in matched series
+// instead of O(matched series x samples). The acquired parts, the decode-memory reservation and
+// the profiling/observability accounting therefore live for the whole iteration and are settled by
+// [fetch.Iterator.Close] — a caller **must** Close (directly or via [fetch.Drain]), otherwise the
+// parts stay pinned and the decode budget stays reserved.
 func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
 	ctx = e.cfg.Obs.Base(ctx)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.fetch",
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
-	defer span.End()
 
 	ctx, pf := profile.Begin(ctx, "engine.fetch")
-	defer pf.End()
 
 	startNs := time.Now()
 	log := zctx.From(ctx)
@@ -383,11 +388,6 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	plan := e.planFetch(ids, r)
 	e.mu.RUnlock()
 
-	// Parts actually scanned this fetch — the recent tier may have short-circuited acquisition.
-	partsScanned := len(plan.liveParts)
-
-	defer plan.releaseParts()
-
 	// Reserve this fetch's decode footprint from the memory budget (blocks under concurrency
 	// pressure), off the engine lock, before any part is decoded. A fetch materializes ts+value.
 	plan.acquireDecodeBudget(colNeed{values: true})
@@ -398,74 +398,19 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 	_, spf := profile.Begin(ctx, "scan")
 
-	var (
-		batches []*fetch.Batch
-		rows    int
-	)
-
-	for i, id := range ids {
-		m, err := plan.mergeSeries(ctx, id)
-		if err != nil {
-			span.RecordError(err)
-			spf.End()
-
-			return nil, err
-		}
-
-		// Buffer pooling is opt-in (Request.Recycle): only then do we touch the pool or set the
-		// release hook, so the default path is exactly as before — no sync.Pool.Get overhead.
-		var tsBuf []int64
-
-		var valBuf []float64
-
-		if r.Recycle {
-			tsBuf, valBuf = e.getI64(), e.getF64()
-		}
-
-		ts, values, sf := m.collect(tsBuf, valBuf)
-
-		// The series' samples are copied out; drop this round's block pins so evicted blocks'
-		// buffers recirculate to later decodes of this same fetch (and concurrent ones).
-		plan.releaseSeriesPins()
-
-		if len(ts) == 0 {
-			if r.Recycle {
-				e.putI64(ts)
-				e.putF64(values)
-			}
-
-			continue
-		}
-
-		b := &fetch.Batch{ID: id, Series: plan.series[i], Timestamps: ts, Values: values, ScaleFactors: sf}
-		if r.Recycle {
-			b.SetRelease(e.recycle) // caller will Release to recycle the ts/value buffers
-		}
-
-		batches = append(batches, b)
-		rows += len(ts)
-	}
-
-	spf.Add("parts_scanned", int64(partsScanned))
-	spf.Add("rows", int64(rows))
-	spf.End()
-
-	pf.Add("series_matched", int64(len(ids)))
-	pf.Add("parts_scanned", int64(partsScanned))
-	pf.Add("rows", int64(rows))
-
-	span.SetAttributes(
-		attribute.Int("storage.series_matched", len(ids)),
-		attribute.Int("storage.parts_scanned", partsScanned),
-		attribute.Int("storage.rows", rows),
-	)
-	e.cfg.Obs.Fetch.Record(ctx, metricSignal, time.Since(startNs), int64(len(ids)), int64(partsScanned), int64(rows))
-	log.Debug("fetch done",
-		zap.String("prefix", e.cfg.Prefix), zap.Int("series_matched", len(ids)),
-		zap.Int("parts_scanned", partsScanned), zap.Int("rows", rows),
-		zap.Duration("took", time.Since(startNs)))
-
-	return fetch.NewSliceIterator(batches), nil
+	return &fetchIter{
+		e:       e,
+		plan:    plan,
+		recycle: r.Recycle,
+		ctx:     ctx,
+		span:    span,
+		pf:      pf,
+		spf:     spf,
+		log:     log,
+		startNs: startNs,
+		// Parts actually scanned this fetch — the recent tier may have short-circuited acquisition.
+		partsScanned: len(plan.liveParts),
+	}, nil
 }
 
 // enginePlan is the lock-free-readable plan a fetch builds under the engine read lock: the acquired
