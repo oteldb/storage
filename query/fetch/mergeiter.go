@@ -3,7 +3,6 @@ package fetch
 import (
 	"context"
 	"io"
-	"slices"
 
 	"github.com/go-faster/errors"
 
@@ -117,27 +116,26 @@ func (it *mergeIter) Close() error {
 	return err
 }
 
-// combine merges the batches of the children just popped for id — all of them, held in refill — into
-// one owned batch (cloned sample columns, so the children's buffers stay untouched and are released
-// here). Columns are not carried: only the metric fan-out federates an id across children — the
-// record signals concatenate instead — so a merged batch is samples only, as before.
+// combine merges the batches of the children just popped for id — all of them, held in refill —
+// into one owned batch (cloned sample columns, so the children's buffers stay untouched and are
+// released here). Columns are not carried: only the metric fan-out federates an id across children —
+// the record signals concatenate instead — so a merged batch is samples only, as before.
 func (it *mergeIter) combine(id signal.SeriesID) *Batch {
-	first := it.cur[it.refill[0]]
+	rows := 0
+	for _, i := range it.refill {
+		rows += len(it.cur[i].Timestamps)
+	}
 
 	out := &Batch{
 		ID:         id,
-		Series:     first.Series,
-		Timestamps: slices.Clone(first.Timestamps),
-		Values:     slices.Clone(first.Values),
+		Series:     it.cur[it.refill[0]].Series,
+		Timestamps: make([]int64, 0, rows),
+		Values:     make([]float64, 0, rows),
 	}
 
-	for n, i := range it.refill {
+	for _, i := range it.refill {
 		b := it.cur[i]
-
-		if n > 0 {
-			out.Timestamps = append(out.Timestamps, b.Timestamps...)
-			out.Values = append(out.Values, b.Values...)
-		}
+		out.Timestamps, out.Values, out.ScaleFactors = appendSamples(out.Timestamps, out.Values, out.ScaleFactors, b)
 
 		// The samples are copied out, so the child's buffers are dead: release them to recycle the
 		// producing engine's pools (the merged batch carries no hook).
@@ -145,7 +143,7 @@ func (it *mergeIter) combine(id signal.SeriesID) *Batch {
 		it.cur[i] = nil
 	}
 
-	out.Timestamps, out.Values = dedupByTimestamp(out.Timestamps, out.Values)
+	out.Timestamps, out.Values, out.ScaleFactors = dedupByTimestamp(out.Timestamps, out.Values, out.ScaleFactors)
 
 	return out
 }
