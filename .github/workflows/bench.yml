@@ -25,9 +25,15 @@ jobs:
     # Serialize against every other benchmark job in the repo (including query-bench, which shares
     # this group): they share one self-hosted runner, and a concurrent run makes the numbers noise.
     # No cancel-in-progress here — later runs queue rather than kill a measurement in flight.
+    #
+    # queue: max, because the default (`single`) holds exactly ONE job pending per group and cancels
+    # whichever was waiting before: with a measurement running and two PRs behind it, the older
+    # waiter is cancelled rather than run, and that PR simply never gets its benchmark. `max` queues
+    # up to 100 in FIFO order instead.
     concurrency:
       group: bench-runner
       cancel-in-progress: false
+      queue: max
     steps:
       - name: Checkout
         uses: actions/checkout@v7
