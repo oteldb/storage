@@ -131,6 +131,12 @@ Imperative operator control, complementing the background maintenance loop (it h
 - `Rebalance(ctx)` — reconcile cluster ownership immediately (no-op single-node).
 - `MaintainNow(ctx)` — run one full maintenance cycle (flush + merge + retention across owned engines).
 
+The retention cutoff both paths pass to the merge is `max(age cutoff, size cutoff)`. The size cutoff
+comes from `tenant.Retention.MaxBytes`: the tenant's parts across all signals/shards on this node are
+summed and dropped oldest-first until the total fits the budget (`retention.go`). Resolving it reads
+per-part object sizes from the backend, like `PartsDetailed` — so a cycle only pays that I/O for
+tenants that actually set `MaxBytes`, and the cutoff is resolved once per tenant per cycle.
+
 In **cluster mode**, `Flush`/`Compact` act only on shards this node is the ring-primary of, returning
 `ErrNotOwner` otherwise — so a shard's parts are still written by exactly one node, the invariant the
 maintenance loop preserves. Single-node owns everything.

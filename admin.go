@@ -58,7 +58,7 @@ func (a Admin) Compact(ctx context.Context, key signal.TenantID, sig signal.Sign
 		return err
 	}
 
-	fn, ok := a.compactFn(sig, key)
+	fn, ok := a.compactFn(ctx, sig, key)
 	if !ok {
 		return nil
 	}
@@ -130,15 +130,15 @@ func (a Admin) flushFn(sig signal.Signal, key signal.TenantID) (func(context.Con
 }
 
 // compactFn resolves the compaction closure for a key+signal (with the tenant's resolved merge
-// policy), or (nil, false) when no engine exists.
-func (a Admin) compactFn(sig signal.Signal, key signal.TenantID) (func(context.Context) error, bool) {
+// policy, size retention included), or (nil, false) when no engine exists.
+func (a Admin) compactFn(ctx context.Context, sig signal.Signal, key signal.TenantID) (func(context.Context) error, bool) {
 	if sig == signal.Metric {
 		eng, ok := a.s.lookupEngine(a.s.normalizeTenant(key))
 		if !ok {
 			return nil, false
 		}
 
-		opts := a.s.metricMergeOptions(key)
+		opts := a.s.metricMergeOptions(key, a.s.sizeCutoffFor(ctx, tenantOfShard(key)))
 
 		return func(ctx context.Context) error { return eng.MergeWith(ctx, opts) }, true
 	}
@@ -148,7 +148,7 @@ func (a Admin) compactFn(sig signal.Signal, key signal.TenantID) (func(context.C
 		return nil, false
 	}
 
-	cutoff := a.s.retainFrom(key)
+	cutoff := a.s.retainFrom(key, a.s.sizeCutoffFor(ctx, tenantOfShard(key)))
 
 	return func(ctx context.Context) error { return eng.Merge(ctx, cutoff) }, true
 }
