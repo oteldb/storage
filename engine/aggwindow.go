@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"iter"
-	"math"
 
 	"github.com/go-faster/errors"
 
@@ -11,14 +10,10 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// WindowAgg is one evaluation step's range-vector aggregate: the count/sum of the samples in the
-// half-open window (End-window, End], keyed by the evaluation timestamp End. Unlike [BucketAgg],
-// consecutive windows overlap whenever the window is wider than the step, so a sample contributes
-// to window/step of them.
-//
-// Min and Max are NaN: the sliding accumulator that keeps the overlapping case cheap can add and
-// subtract a count and a sum, but not an extremum. Use Count, Sum and Sum/Count (count/sum/avg/
-// present_over_time); min/max need a separate pass that is not implemented yet.
+// WindowAgg is one evaluation step's range-vector aggregate: the count/sum/min/max of the samples
+// in the half-open window (End-window, End], keyed by the evaluation timestamp End. Unlike
+// [BucketAgg], consecutive windows overlap whenever the window is wider than the step, so a sample
+// contributes to window/step of them.
 type WindowAgg struct {
 	SeriesAgg
 
@@ -45,7 +40,9 @@ var errWindowStep = errors.New("engine: aggregate window needs step > 0")
 // fold once into disjoint step-wide fine buckets (reusing the sidecar pushdown of
 // [Engine.AggregateStep] — a part wholly inside one fine bucket never decodes), and a sliding
 // accumulator then walks those buckets once per series, adding the bucket that enters each window
-// and subtracting the one that leaves. Advancing a step is O(1) regardless of how wide the window is.
+// and subtracting the one that leaves — and, since an extremum cannot be subtracted back out,
+// tracking min/max on monotonic deques. Advancing a step is O(1) regardless of how wide the window
+// is.
 //
 // Windows align to the absolute grid (End is a multiple of step) and are returned sorted ascending
 // by End; empty windows and series with no sample are omitted. The window is half-open on the left:
@@ -55,7 +52,7 @@ var errWindowStep = errors.New("engine: aggregate window needs step > 0")
 // so a caller wanting complete windows from its first evaluation point must fetch a window's worth
 // of lead-in before it, as a PromQL engine does.
 //
-// window ≤ 0 means window = step (disjoint windows). Min/Max are not computed; see [WindowAgg].
+// window ≤ 0 means window = step (disjoint windows).
 func (e *Engine) AggregateWindow(
 	ctx context.Context, r fetch.Request, step, window int64,
 ) (map[signal.SeriesID][]WindowAgg, error) {
@@ -155,6 +152,8 @@ func (e *Engine) aggregateWindowSeq(
 // over them individually; it is the same decode fallback the disjoint path already takes for a part
 // that straddles a bucket boundary, and it stays exact at any window width.
 type windower struct {
+	windowSlider
+
 	step, window int64
 
 	grid *stepGrid // fine step-wide buckets; nil ⇒ the misaligned per-sample fallback
@@ -201,16 +200,7 @@ func (w *windower) series(ctx context.Context, e *Engine, plan *enginePlan, id s
 		w.ents = sampleEntries(w.ents[:0], w.ts, w.vals)
 	}
 
-	return slideWindows(nil, w.ents, w.step, w.window, plan.end), nil
-}
-
-// windowEnt is one contribution to the sliding accumulator: an aggregate that enters a window when
-// the evaluation timestamp reaches end, and leaves it once the window's open lower bound passes it.
-// A fine bucket (b, b+step] enters at b+step; a single sample enters at its own timestamp.
-type windowEnt struct {
-	end   int64
-	count int64
-	sum   float64
+	return w.slide(w.ents, w.step, w.window, plan.end), nil
 }
 
 // bucketEntries rewrites fine left-open buckets — (Start, Start+step], ascending — as accumulator
@@ -218,7 +208,7 @@ type windowEnt struct {
 func bucketEntries(dst []windowEnt, fine []BucketAgg, step int64) []windowEnt {
 	for i := range fine {
 		b := &fine[i]
-		dst = append(dst, windowEnt{end: b.Start + step, count: b.Count, sum: b.Sum})
+		dst = append(dst, windowEnt{end: b.Start + step, count: b.Count, sum: b.Sum, min: b.Min, max: b.Max})
 	}
 
 	return dst
@@ -229,88 +219,9 @@ func bucketEntries(dst []windowEnt, fine []BucketAgg, step int64) []windowEnt {
 // membership is exact.
 func sampleEntries(dst []windowEnt, ts []int64, vals []float64) []windowEnt {
 	for i, t := range ts {
-		dst = append(dst, windowEnt{end: t, count: 1, sum: vals[i]})
+		v := vals[i]
+		dst = append(dst, windowEnt{end: t, count: 1, sum: v, min: v, max: v})
 	}
 
 	return dst
-}
-
-// slideWindows folds ents — ascending by end — into one aggregate per step-aligned evaluation
-// timestamp t whose window (t-window, t] is non-empty, appending them to dst in ascending order.
-//
-// An entry is in the window exactly when t-window < end ≤ t, so as t advances the running total
-// gains the entries whose end it has reached and loses those the lower bound has passed: each entry
-// is added once and subtracted once over the whole walk, making a step O(1) no matter how many
-// windows overlap. Runs of empty windows are skipped rather than walked, so a sparse series costs
-// its samples, not its span.
-//
-// end bounds the evaluation grid at the request's end: a window ending past it would be missing the
-// data that follows, so it is not reported.
-func slideWindows(dst []WindowAgg, ents []windowEnt, step, window, end int64) []WindowAgg {
-	if len(ents) == 0 {
-		return dst
-	}
-
-	// The evaluation timestamps that can see any entry: from the first step at or after the earliest
-	// entry's end, through the last step that still holds the latest entry (t-window < end).
-	lo := ceilStep(ents[0].end, step)
-
-	last := ents[len(ents)-1].end
-	horizon := last + window - 1
-	if horizon < last { // window so wide it overflows; nothing beyond the end of time to evaluate at
-		horizon = math.MaxInt64
-	}
-
-	hi := bucketStart(min(horizon, end), step)
-
-	var (
-		acc  SeriesAgg
-		head int // entries already added
-		tail int // entries already subtracted
-	)
-
-	for t := lo; t <= hi; t += step {
-		for head < len(ents) && ents[head].end <= t {
-			acc.Count += ents[head].count
-			acc.Sum += ents[head].sum
-			head++
-		}
-
-		for tail < head && ents[tail].end <= t-window {
-			acc.Count -= ents[tail].count
-			acc.Sum -= ents[tail].sum
-			tail++
-		}
-
-		if acc.Count > 0 {
-			dst = append(dst, WindowAgg{
-				End:       t,
-				SeriesAgg: SeriesAgg{Count: acc.Count, Sum: acc.Sum, Min: math.NaN(), Max: math.NaN()},
-			})
-
-			continue
-		}
-
-		acc.Sum = 0 // the window emptied: drop whatever rounding the add/subtract pairs left behind
-
-		if head == len(ents) {
-			break // every entry has expired and none is left to enter
-		}
-
-		if next := ceilStep(ents[head].end, step); next > t {
-			t = next - step // jump the gap; the loop's post statement lands us on next
-		}
-	}
-
-	return dst
-}
-
-// ceilStep rounds ts up to a multiple of step.
-func ceilStep(ts, step int64) int64 {
-	b := bucketStart(ts, step)
-	if b == ts {
-		return b
-	}
-
-	return b + step
 }

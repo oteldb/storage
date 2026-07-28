@@ -187,10 +187,14 @@ and a **sliding accumulator** then walks each series' buckets once, adding the b
 window and subtracting the one that leaves. The fine grid is **left-open** (`(b, b+step]`, unlike the
 `[b, b+step)` of `AggregateStep`) — the only convention a half-open window edge never splits.
 
+Count and sum slide by arithmetic; an extremum cannot be subtracted back out (dropping the current
+minimum would force a rescan), so min/max ride **monotonic deques** of entry indices — an arrival
+pops every tail entry it dominates, since such an entry is no better *and* expires no later, leaving
+the front as the window's answer. Each entry is pushed and popped once, so a step stays O(1)
+amortized.
+
 The decomposition is exact only when `W` is a multiple of the step; otherwise a window edge can fall
-inside a bucket, and the call falls back to sliding over the merged raw samples of each series. Only
-`Count`/`Sum` (hence avg) are produced — an extremum cannot be subtracted out of a running window,
-so `Min`/`Max` are `NaN` pending a monotonic-deque pass.
+inside a bucket, and the call falls back to sliding over the merged raw samples of each series.
 
 Both forms drain one internal `iter.Seq2`, so only one series' windows are resident while it is
 computed rather than series × steps of them.

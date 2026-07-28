@@ -3,7 +3,6 @@ package engine_test
 import (
 	"context"
 	"fmt"
-	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -58,17 +57,22 @@ func windowFold(b *fetch.Batch, step, window, end int64) []engine.WindowAgg {
 		var a engine.SeriesAgg
 
 		for i, ts := range b.Timestamps {
-			if ts > t-window && ts <= t {
-				a.Count++
-				a.Sum += b.Values[i]
+			if ts <= t-window || ts > t {
+				continue
 			}
+
+			v := b.Values[i]
+			if a.Count == 0 {
+				a.Min, a.Max = v, v
+			}
+
+			a.Min, a.Max = min(a.Min, v), max(a.Max, v)
+			a.Count++
+			a.Sum += v
 		}
 
 		if a.Count > 0 {
-			out = append(out, engine.WindowAgg{
-				End:       t,
-				SeriesAgg: engine.SeriesAgg{Count: a.Count, Sum: a.Sum, Min: math.NaN(), Max: math.NaN()},
-			})
+			out = append(out, engine.WindowAgg{End: t, SeriesAgg: a})
 		}
 	}
 
@@ -86,8 +90,8 @@ func windowsFromBatches(batches []*fetch.Batch, step, window, end int64) map[sig
 	return out
 }
 
-// assertWindows compares window-for-window. Min/Max are compared structurally by neither: they are
-// NaN by contract, and NaN is not equal to itself.
+// assertWindows compares window-for-window, field by field: the sliding sum is not bit-identical to
+// a fold (it adds and subtracts), so sums compare within a delta.
 func assertWindows(t *testing.T, want, got []engine.WindowAgg, msg string) {
 	t.Helper()
 
@@ -97,18 +101,26 @@ func assertWindows(t *testing.T, want, got []engine.WindowAgg, msg string) {
 		assert.Equalf(t, want[i].End, got[i].End, "%s: window %d end", msg, i)
 		assert.Equalf(t, want[i].Count, got[i].Count, "%s: window %d count", msg, i)
 		assert.InDeltaf(t, want[i].Sum, got[i].Sum, 1e-9, "%s: window %d sum", msg, i)
-		assert.Truef(t, math.IsNaN(got[i].Min), "%s: window %d min must be NaN", msg, i)
-		assert.Truef(t, math.IsNaN(got[i].Max), "%s: window %d max must be NaN", msg, i)
+		assert.InDeltaf(t, want[i].Min, got[i].Min, 0, "%s: window %d min", msg, i)
+		assert.InDeltaf(t, want[i].Max, got[i].Max, 0, "%s: window %d max", msg, i)
 	}
 }
 
 func assertWindowsMatchFetch(t *testing.T, e *engine.Engine, r fetch.Request, step, window int64) {
 	t.Helper()
 
-	got, err := e.AggregateWindow(context.Background(), r, step, window)
+	ctx := context.Background()
+
+	got, err := e.AggregateWindow(ctx, r, step, window)
 	require.NoError(t, err)
 
-	want := windowsFromBatches(fetchAll(t, e, r), step, window, r.End)
+	it, err := e.Fetch(ctx, r)
+	require.NoError(t, err)
+
+	batches, err := fetch.Drain(ctx, it)
+	require.NoError(t, err)
+
+	want := windowsFromBatches(batches, step, window, r.End)
 	require.Len(t, got, len(want))
 
 	for id, w := range want {
@@ -190,6 +202,45 @@ func TestAggregateWindowDefaultsToStep(t *testing.T) {
 	}
 }
 
+// TestAggregateWindowMinMaxOrderings exercises the monotonic deques on the orderings that break a
+// naive sliding extremum: a run that only rises (the front never expires early), one that only
+// falls (every arrival evicts the whole deque), an oscillation, and a plateau of equal values (ties
+// must not leave a stale index at the front).
+func TestAggregateWindowMinMaxOrderings(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		val  func(i int64) float64
+	}{
+		{"increasing", func(i int64) float64 { return float64(i) }},
+		{"decreasing", func(i int64) float64 { return float64(-i) }},
+		{"oscillating", func(i int64) float64 { return float64((i % 7) * (1 - 2*(i%2))) }},
+		{"plateau", func(i int64) float64 { return float64(i / 20) }},
+		{"constant", func(int64) float64 { return 42 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			e := aggEngine()
+			s := mkSeries("job", "api")
+
+			for i := range int64(120) {
+				mustAppend(t, e, s, i*10+5, tc.val(i))
+			}
+
+			require.NoError(t, e.Flush(context.Background()))
+
+			req := fetch.Request{Start: 0, End: 1500, Matchers: []fetch.Matcher{eqMatcher("job", "api")}}
+			for _, w := range []struct{ step, window int64 }{
+				{10, 10}, {10, 100}, {50, 500}, {100, 1000}, {10, 45}, // last is misaligned
+			} {
+				assertWindowsMatchFetch(t, e, req, w.step, w.window)
+			}
+		})
+	}
+}
+
 func TestAggregateWindowPartialRange(t *testing.T) {
 	t.Parallel()
 
@@ -227,12 +278,11 @@ func TestAggregateWindowHalfOpen(t *testing.T) {
 	}, 10, 20)
 	require.NoError(t, err)
 
-	nan := math.NaN()
 	assertWindows(t, []engine.WindowAgg{
-		{End: 10, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 1, Min: nan, Max: nan}}, // (-10,10]: 10
-		{End: 20, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 3, Min: nan, Max: nan}}, // (0,20]: 10,20
-		{End: 30, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 5, Min: nan, Max: nan}}, // (10,30]: 20,30 — not 10
-		{End: 40, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 3, Min: nan, Max: nan}}, // (20,40]: 30
+		{End: 10, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 1, Min: 1, Max: 1}}, // (-10,10]: 10
+		{End: 20, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 3, Min: 1, Max: 2}}, // (0,20]: 10,20
+		{End: 30, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 5, Min: 2, Max: 3}}, // (10,30]: 20,30 — not 10
+		{End: 40, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 3, Min: 3, Max: 3}}, // (20,40]: 30
 	}, got[s.Hash()], "half-open window")
 }
 
