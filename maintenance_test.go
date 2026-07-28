@@ -203,7 +203,7 @@ func TestMetricMergeOptionsRecompress(t *testing.T) {
 	require.NoError(t, err)
 
 	now := time.Now().UnixNano()
-	opts := s.metricMergeOptions("default")
+	opts := s.metricMergeOptions("default", 0)
 	require.NotNil(t, opts.Recompress, "policy with Recompress.After yields a recompression spec")
 	assert.Equal(t, compress.AlgorithmZSTD, opts.Recompress.Algorithm)
 	assert.Equal(t, compress.Level(7), opts.Recompress.Level)
@@ -212,5 +212,5 @@ func TestMetricMergeOptionsRecompress(t *testing.T) {
 	// No policy ⇒ no recompression.
 	s2, err := InMemory()
 	require.NoError(t, err)
-	assert.Nil(t, s2.metricMergeOptions("default").Recompress)
+	assert.Nil(t, s2.metricMergeOptions("default", 0).Recompress)
 }

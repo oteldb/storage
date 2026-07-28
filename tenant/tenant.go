@@ -44,6 +44,16 @@ type Retention struct {
 	// MaxAge is the maximum age of retained data. Zero ⇒ retain forever.
 	MaxAge time.Duration
 	// MaxBytes is the maximum total retained bytes. Zero ⇒ unlimited.
+	//
+	// It bounds the stored (compressed, on-backend) bytes of the tenant's flushed parts across every
+	// signal and every shard the node holds — not its unflushed heads, which [Limits.MaxInFlightBytes]
+	// bounds. Over budget, maintenance drops whole parts oldest-first, exactly as MaxAge does; whichever
+	// budget binds first wins. Two consequences of dropping whole parts:
+	//
+	//   - Enforcement is per node and eventual: it is evaluated once per maintenance cycle, from the
+	//     part sizes at the start of the cycle, so the total can overshoot between cycles.
+	//   - The newest part is never dropped, so the effective floor is one part. Pair a byte budget with
+	//     [Limits.MaxPartSize] to make the granularity — and the overshoot — small enough to matter.
 	MaxBytes int64
 }
 

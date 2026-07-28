@@ -1252,6 +1252,17 @@ func (s *Storage) maintain(ctx context.Context) {
 
 	owned := s.ownedTenants(ctx, tids)
 
+	// Size retention is resolved once per cycle, per tenant: the byte budget spans every signal, so
+	// it cannot be decided inside a single engine's merge. Empty (and free) unless a tenant sets
+	// Retention.MaxBytes — resolving it reads per-part object sizes from the backend, so it is scoped
+	// to the shards this node compacts (a replica applies no cutoff of its own).
+	budgeted := tids
+	if owned != nil {
+		budgeted = owned
+	}
+
+	sizeCutoffs := s.sizeCutoffs(ctx, budgeted)
+
 	// maintainEngine flushes then merges one engine, unless this node is a non-owning replica (then
 	// it only refreshes from the shared store). merge is signal-specific: metrics carry downsampling
 	// (engine.MergeWith), the record signals carry retention only.
@@ -1329,7 +1340,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	for tid, eng := range metricEngines {
 		tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
 			maintainEngine(tid, metricsPrefix, func() error { return eng.Flush(ctx) },
-				func() error { return eng.MergeWith(ctx, s.metricMergeOptions(tid)) },
+				func() error { return eng.MergeWith(ctx, s.metricMergeOptions(tid, sizeCutoffs[tid])) },
 				func() error { return eng.RefreshReplica(ctx) },
 				func() []ecPartRef { return coldMetric(eng) })
 		}})
@@ -1339,7 +1350,7 @@ func (s *Storage) maintain(ctx context.Context) {
 		for tid, eng := range engines {
 			tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
 				maintainEngine(tid, signalPrefix, func() error { return eng.Flush(ctx) },
-					func() error { return eng.Merge(ctx, s.retainFrom(tid)) },
+					func() error { return eng.Merge(ctx, s.retainFrom(tid, sizeCutoffs[tid])) },
 					func() error { return eng.RefreshReplica(ctx) },
 					func() []ecPartRef { return coldRecord(eng) })
 			}})
@@ -1391,28 +1402,24 @@ func (s *Storage) ownedTenants(ctx context.Context, tids map[signal.TenantID]str
 	return out
 }
 
-// retainFrom converts a tenant's retention window into an absolute cutoff timestamp (unix
-// nanoseconds); 0 means retain forever.
-func (s *Storage) retainFrom(tid signal.TenantID) int64 {
+// retainFrom converts a tenant's retention policy into an absolute cutoff timestamp (unix
+// nanoseconds); 0 means retain forever. sizeCutoff is the tenant's size-budget cutoff (0 when it has
+// no MaxBytes budget or is under it, see [Storage.sizeCutoffFor]): whichever budget binds first —
+// age or bytes — wins.
+func (s *Storage) retainFrom(tid signal.TenantID, sizeCutoff int64) int64 {
 	// tid may be a shard key ({tenant}/_s{idx}) when a signal is sharded; policy is per real tenant.
-	return retentionCutoff(s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Retention, time.Now().UnixNano())
-}
+	age := retentionCutoff(s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Retention, time.Now().UnixNano())
 
-// retentionCutoff converts a retention window into an absolute cutoff at the given now (unix
-// nanoseconds); 0 means retain forever.
-func retentionCutoff(r tenant.Retention, now int64) int64 {
-	if r.MaxAge <= 0 {
-		return 0
-	}
-
-	return now - r.MaxAge.Nanoseconds()
+	return max(age, sizeCutoff)
 }
 
 // metricMergeOptions resolves a metric tenant's policy into the absolute merge parameters —
 // retention cutoff plus downsampling tiers — for one maintenance pass. Resolving against a single
 // now keeps the whole merge deterministic (the engine reads no clock). Downsampling applies to
 // metrics only (the record signals are append-only event data; rolling them up would destroy them).
-func (s *Storage) metricMergeOptions(tid signal.TenantID) engine.MergeOptions {
+// sizeCutoff is the tenant's size-budget cutoff, folded into RetainFrom the same way (see
+// [Storage.retainFrom]).
+func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engine.MergeOptions {
 	now := time.Now().UnixNano()
 	// In cluster mode tid is a shard key ({tenant}/_s{idx}); policy is per real tenant.
 	p := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid)))
@@ -1460,7 +1467,7 @@ func (s *Storage) metricMergeOptions(tid signal.TenantID) engine.MergeOptions {
 	}
 
 	return engine.MergeOptions{
-		RetainFrom: retentionCutoff(p.Retention, now),
+		RetainFrom: max(retentionCutoff(p.Retention, now), sizeCutoff),
 		Downsample: tiers,
 		Recompress: recompress,
 		Precision:  precision,
