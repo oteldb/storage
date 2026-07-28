@@ -67,6 +67,7 @@ func (s *windowSlider) slide(ents []windowEnt, step, window, end int64) []Window
 	)
 
 	for t := lo; t <= hi; t += step {
+		// An entry enters the window once t reaches its end, and stays until the lower bound does.
 		for head < len(ents) && ents[head].end <= t {
 			acc.Count += ents[head].count
 			acc.Sum += ents[head].sum
@@ -74,6 +75,7 @@ func (s *windowSlider) slide(ents []windowEnt, step, window, end int64) []Window
 			head++
 		}
 
+		// An entry whose end has fallen to the window's open lower bound has left it: (t-window, t].
 		for tail < head && ents[tail].end <= t-window {
 			acc.Count -= ents[tail].count
 			acc.Sum -= ents[tail].sum

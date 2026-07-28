@@ -104,22 +104,8 @@ func (e *Engine) aggregateWindowSeq(
 			return
 		}
 
-		e.mu.RLock()
-		for !e.head.indexSorted() {
-			e.mu.RUnlock()
-			e.mu.Lock()
-			e.head.ensureIndexSorted()
-			e.mu.Unlock()
-			e.mu.RLock()
-		}
-
-		ids := e.head.resolve(r.Matchers)
-		plan := e.planFetch(ids, r)
-		e.mu.RUnlock()
-
+		ids, plan := e.planAggregate(r)
 		defer plan.releaseParts()
-
-		plan.acquireDecodeBudget(colNeed{values: true})
 
 		w := newWindower(plan, step, window)
 
