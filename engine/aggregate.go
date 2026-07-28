@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"slices"
 
@@ -100,15 +101,15 @@ func (e *Engine) AggregateStep(ctx context.Context, r fetch.Request, step int64)
 	safe := aggPushdownSafe(plan)
 
 	out := make(map[signal.SeriesID][]BucketAgg, len(ids))
+	grid := newStepGrid(plan, step)
 
 	for _, id := range ids {
-		buckets, err := e.bucketSeries(ctx, plan, id, step, safe)
-		if err != nil {
+		if err := e.bucketSeries(ctx, plan, id, grid, safe); err != nil {
 			return nil, err
 		}
 
-		if len(buckets) > 0 {
-			out[id] = sortBuckets(buckets)
+		if buckets := grid.collect(nil); len(buckets) > 0 {
+			out[id] = buckets
 		}
 	}
 
@@ -145,78 +146,49 @@ func (e *Engine) AggregateStepNamed(ctx context.Context, r fetch.Request, step i
 	safe := aggPushdownSafe(plan)
 
 	out := make([]NamedAgg, 0, len(ids))
+	grid := newStepGrid(plan, step)
 
 	for i, id := range ids {
-		buckets, err := e.bucketSeries(ctx, plan, id, step, safe)
-		if err != nil {
+		if err := e.bucketSeries(ctx, plan, id, grid, safe); err != nil {
 			return nil, err
 		}
 
+		buckets := grid.collect(nil)
 		if len(buckets) == 0 {
 			continue
 		}
 
-		out = append(out, NamedAgg{Series: plan.series[i], Buckets: sortBuckets(buckets)})
+		out = append(out, NamedAgg{Series: plan.series[i], Buckets: buckets})
 	}
 
 	return out, nil
 }
 
-// sortBuckets turns a bucket-start→aggregate map into a slice sorted ascending by start.
-func sortBuckets(buckets map[int64]SeriesAgg) []BucketAgg {
-	list := make([]BucketAgg, 0, len(buckets))
-	for start, agg := range buckets {
-		list = append(list, BucketAgg{Start: start, SeriesAgg: agg})
-	}
-
-	slices.SortFunc(list, func(a, b BucketAgg) int {
-		switch {
-		case a.Start < b.Start:
-			return -1
-		case a.Start > b.Start:
-			return 1
-		default:
-			return 0
-		}
-	})
-
-	return list
-}
-
-// bucketSeries folds id's samples into step-aligned buckets. On a pushdown-safe plan it buckets each
-// part independently (sidecar when the part fits one bucket, else decode); otherwise it merges first
-// (deduping by timestamp) and buckets the result.
+// bucketSeries folds id's samples into grid's step-aligned buckets. On a pushdown-safe plan it
+// buckets each part independently (sidecar when the part fits one bucket, else decode); otherwise it
+// merges first (deduping by timestamp) and buckets the result. The caller drains grid afterwards.
 func (e *Engine) bucketSeries(
-	ctx context.Context, plan *enginePlan, id signal.SeriesID, step int64, safe bool,
-) (map[int64]SeriesAgg, error) {
-	buckets := map[int64]SeriesAgg{}
-
-	addSample := func(ts int64, v float64) {
-		bs := bucketStart(ts, step)
-		a := buckets[bs]
-		a.addSample(v)
-		buckets[bs] = a
-	}
-
+	ctx context.Context, plan *enginePlan, id signal.SeriesID, grid *stepGrid, safe bool,
+) error {
 	if !safe {
 		m, err := plan.mergeSeries(ctx, id)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		ts, values, _ := m.collect(nil, nil)
 		plan.releaseSeriesPins() // samples copied out; recirculate this series' block pins
 
 		for i := range ts {
-			addSample(ts[i], values[i])
+			grid.addSample(ts[i], values[i])
 		}
 
-		return buckets, nil
+		return nil
 	}
 
 	for _, p := range plan.liveParts {
-		if err := e.bucketPart(ctx, plan, p, id, step, buckets, addSample); err != nil {
-			return nil, err
+		if err := e.bucketPart(ctx, plan, p, id, grid); err != nil {
+			return err
 		}
 	}
 
@@ -227,20 +199,17 @@ func (e *Engine) bucketSeries(
 
 		for i, ts := range b.Timestamps {
 			if ts >= plan.start && ts <= plan.end {
-				addSample(ts, b.Values[i])
+				grid.addSample(ts, b.Values[i])
 			}
 		}
 	}
 
-	return buckets, nil
+	return nil
 }
 
-// bucketPart folds one part's contribution of series id into the step-aligned buckets: the stats
-// sidecar when the part fits a single bucket, else the decoded in-window rows of the series' run.
-func (e *Engine) bucketPart(
-	ctx context.Context, plan *enginePlan, p *part, id signal.SeriesID, step int64,
-	buckets map[int64]SeriesAgg, addSample func(ts int64, v float64),
-) error {
+// bucketPart folds one part's contribution of series id into grid: the stats sidecar when the part
+// fits a single bucket, else the decoded in-window rows of the series' run.
+func (e *Engine) bucketPart(ctx context.Context, plan *enginePlan, p *part, id signal.SeriesID, grid *stepGrid) error {
 	rng, ok, err := p.index.lookup(ctx, id)
 	if err != nil {
 		return err
@@ -251,12 +220,9 @@ func (e *Engine) bucketPart(
 	}
 
 	// A part wholly inside one bucket contributes entirely to it — fold its sidecar, no decode.
-	if bucketStart(p.minTime, step) == bucketStart(p.maxTime, step) {
+	if bucketStart(p.minTime, grid.step) == bucketStart(p.maxTime, grid.step) {
 		if st, ok := p.seriesStat(ctx, id); ok {
-			bs := bucketStart(p.minTime, step)
-			a := buckets[bs]
-			a.merge(st)
-			buckets[bs] = a
+			grid.mergeStat(p.minTime, st)
 
 			return nil
 		}
@@ -269,7 +235,7 @@ func (e *Engine) bucketPart(
 
 	for i := rng.start; i < rng.end; i++ {
 		if dp.ts[i] >= plan.start && dp.ts[i] <= plan.end {
-			addSample(dp.ts[i], dp.vals[i])
+			grid.addSample(dp.ts[i], dp.vals[i])
 		}
 	}
 
@@ -314,16 +280,7 @@ func aggPushdownSafe(plan *enginePlan) bool {
 		spans = append(spans, span{lo, hi})
 	}
 
-	slices.SortFunc(spans, func(a, b span) int {
-		switch {
-		case a.lo < b.lo:
-			return -1
-		case a.lo > b.lo:
-			return 1
-		default:
-			return 0
-		}
-	})
+	slices.SortFunc(spans, func(a, b span) int { return cmp.Compare(a.lo, b.lo) })
 
 	for i := 1; i < len(spans); i++ {
 		if spans[i].lo <= spans[i-1].hi {
