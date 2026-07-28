@@ -1,6 +1,7 @@
 package engine_test
 
 import (
+	"cmp"
 	"context"
 	"slices"
 	"testing"
@@ -156,7 +157,7 @@ func stepFromBatches(batches []*fetch.Batch, step int64) map[signal.SeriesID][]e
 		for start, a := range m {
 			list = append(list, engine.BucketAgg{Start: start, SeriesAgg: a})
 		}
-		slices.SortFunc(list, func(x, y engine.BucketAgg) int { return int(x.Start - y.Start) })
+		slices.SortFunc(list, func(x, y engine.BucketAgg) int { return cmp.Compare(x.Start, y.Start) })
 		out[b.ID] = list
 	}
 
@@ -189,6 +190,33 @@ func TestAggregateStepMatchesFetch(t *testing.T) {
 		require.NoError(t, err)
 		want := stepFromBatches(fetchAll(t, e, req), step)
 		assert.Equalf(t, want, got, "step=%d buckets must match the bucketed fetch", step)
+	}
+}
+
+// TestAggregateStepSparseGrid covers the fallback the dense step grid takes when the data span
+// divided by the step exceeds what can be indexed densely: the samples here are 1e6 apart and the
+// step is 1, so the grid would need millions of slots for a handful of buckets.
+func TestAggregateStepSparseGrid(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	e := aggEngine()
+	s := mkSeries("job", "api")
+
+	for i := range int64(8) {
+		mustAppend(t, e, s, i*1_000_000, float64(i))
+	}
+	require.NoError(t, e.Flush(ctx))
+	mustAppend(t, e, s, 9_000_000, 9) // head, past the flushed part
+
+	req := fetch.Request{Start: 0, End: 1 << 40, Matchers: []fetch.Matcher{eqMatcher("job", "api")}}
+
+	// step 1 ⇒ span/step far past maxDenseBuckets ⇒ the map path; step 2_000_000 stays dense. Both
+	// must match the bucketed fetch.
+	for _, step := range []int64{1, 2_000_000} {
+		got, err := e.AggregateStep(ctx, req, step)
+		require.NoError(t, err)
+		assert.Equalf(t, stepFromBatches(fetchAll(t, e, req), step), got, "step=%d", step)
 	}
 }
 

@@ -170,6 +170,12 @@ time-disjoint — else it falls back to decode+merge, which dedups. Derived, so 
 decode. In cluster mode the pushdown survives the network: each owner aggregates locally and ships
 per-series identity + buckets, so only aggregates cross the wire.
 
+Buckets accumulate in a **`stepGrid`** allocated once per call and reused across every series in
+it — a dense array indexed by arithmetic on the timestamp, so filling costs no hashing and draining
+costs no sort of aggregate structs. It spans the plan's *data* (parts' ranges ∪ head span, clipped
+to the request), not the request, which is routinely unbounded on one side; a grid too wide to index
+densely (a fine step over a long span) falls back to a map, sized by the samples instead.
+
 ## Cluster surface
 
 `ApplyPrimary(walBytes)` OOO-checks and admission-checks each sample and returns the accepted set

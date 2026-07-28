@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,7 +14,12 @@ import (
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/promql"
 	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/signal/metric"
 )
+
+// aggStep is a bucket width the corpus epoch (1.6e18 ns) divides evenly, so bucket starts on the
+// absolute grid line up with the first sample and the assertions stay readable.
+const aggStep = int64(100_000_000_000) // 100s
 
 func aggJobSeries(job string) signal.Series {
 	return signal.Series{Attributes: signal.NewAttributes(
@@ -148,4 +154,222 @@ func TestAggregateMetricsNamed(t *testing.T) {
 		lset := promql.PromLabels(la.Series)
 		assert.Equal(t, "bench.metric", lset.Get("__name__"))
 	}
+}
+
+// TestAggregateMetricsStepNamed checks the stepped facade returns in one call exactly what the
+// per-step calls it replaces would: every bucket must equal a whole-range aggregate over that
+// bucket's window, and the buckets must fold back into the whole-range aggregate.
+func TestAggregateMetricsStepNamed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()), WithAggregateStats())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close(ctx)) }()
+
+	const series = 20
+
+	_, err = s.WriteMetrics(ctx, buildCorpus(corpusProfile{
+		name: "c", series: series, points: 50, interval: 15_000_000_000, pattern: patCounter,
+	}, 1))
+	require.NoError(t, err)
+	require.NoError(t, mustEngine(s.engineFor("default")).Flush(ctx))
+
+	req := fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{nameMatcher("bench.metric")}}
+
+	got, err := s.AggregateMetricsStepNamed(ctx, "default", req, aggStep)
+	require.NoError(t, err)
+	require.Len(t, got, series, "one entry per series")
+
+	whole, err := s.AggregateMetricsNamed(ctx, "default", req)
+	require.NoError(t, err)
+	require.Len(t, whole, series)
+
+	for _, na := range got {
+		require.NotEmpty(t, na.Buckets)
+
+		var total engine.SeriesAgg
+		for i, b := range na.Buckets {
+			if i > 0 {
+				assert.Greater(t, b.Start, na.Buckets[i-1].Start, "buckets sorted ascending by start")
+			}
+			assert.Zero(t, b.Start%aggStep, "buckets align to the absolute grid")
+
+			// The N-call form this replaces: one whole-range aggregate per bucket window.
+			perStep, err := s.AggregateMetricsNamed(ctx, "default",
+				fetch.Request{Start: b.Start, End: b.Start + aggStep - 1, Matchers: req.Matchers})
+			require.NoError(t, err)
+
+			want, ok := findAggregate(perStep, na.Series.Hash())
+			require.Truef(t, ok, "series absent from the narrowed window at %d", b.Start)
+			assert.Equalf(t, want, b.SeriesAgg, "bucket %d matches the narrowed whole-range call", b.Start)
+
+			foldAgg(&total, b.SeriesAgg)
+		}
+
+		want, ok := findAggregate(whole, na.Series.Hash())
+		require.True(t, ok)
+		assert.Equal(t, want, total, "the buckets fold back into the whole-range aggregate")
+	}
+}
+
+// TestAggregateMetricsStepNamedWholeRange checks step ≤ 0 collapses to the single whole-range
+// bucket [Storage.AggregateMetricsNamed] is defined in terms of.
+func TestAggregateMetricsStepNamedWholeRange(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()), WithAggregateStats())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close(ctx)) }()
+
+	_, err = s.WriteMetrics(ctx, buildCorpus(corpusProfile{
+		name: "c", series: 10, points: 50, interval: 15_000_000_000, pattern: patCounter,
+	}, 1))
+	require.NoError(t, err)
+	require.NoError(t, mustEngine(s.engineFor("default")).Flush(ctx))
+
+	req := fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{nameMatcher("bench.metric")}}
+
+	whole, err := s.AggregateMetricsNamed(ctx, "default", req)
+	require.NoError(t, err)
+	require.Len(t, whole, 10)
+
+	for _, step := range []int64{0, -1} {
+		got, err := s.AggregateMetricsStepNamed(ctx, "default", req, step)
+		require.NoError(t, err)
+		require.Lenf(t, got, len(whole), "step=%d", step)
+
+		for _, na := range got {
+			require.Lenf(t, na.Buckets, 1, "step=%d ⇒ one bucket per series", step)
+
+			want, ok := findAggregate(whole, na.Series.Hash())
+			require.True(t, ok)
+			assert.Equal(t, want, na.Buckets[0].SeriesAgg)
+		}
+	}
+}
+
+// TestAggregateMetricsStepNamedUnknownTenant checks an unknown tenant (and a closed store) yield no
+// results rather than an error, matching the unstepped facades.
+func TestAggregateMetricsStepNamedUnknownTenant(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()), WithAggregateStats())
+	require.NoError(t, err)
+
+	req := fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{nameMatcher("bench.metric")}}
+
+	got, err := s.AggregateMetricsStepNamed(ctx, "nosuch", req, aggStep)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+
+	require.NoError(t, s.Close(ctx))
+
+	got, err = s.AggregateMetricsStepNamed(ctx, "default", req, aggStep)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
+// findAggregate looks a series' whole-range aggregate up by identity hash.
+func findAggregate(list []SeriesAggregate, id signal.SeriesID) (engine.SeriesAgg, bool) {
+	for i := range list {
+		if list[i].Series.Hash() == id {
+			return list[i].SeriesAgg, true
+		}
+	}
+
+	return engine.SeriesAgg{}, false
+}
+
+// foldAgg merges one bucket's aggregate into a running total, mirroring what a caller summing the
+// stepped result back to a whole-range answer would do.
+func foldAgg(dst *engine.SeriesAgg, src engine.SeriesAgg) {
+	if dst.Count == 0 {
+		*dst = src
+
+		return
+	}
+
+	dst.Count += src.Count
+	dst.Sum += src.Sum
+	dst.Min = min(dst.Min, src.Min)
+	dst.Max = max(dst.Max, src.Max)
+}
+
+// BenchmarkAggregateMetricsStepNamed measures the stepped aggregate over a corpus laid out one part
+// per bucket — the containment case the sidecar pushdown is built for. It fails if the run decodes
+// a value column at all: with every part inside a single bucket, the answer comes from the
+// per-part stats sidecars and the decode cache must stay untouched.
+func BenchmarkAggregateMetricsStepNamed(b *testing.B) {
+	ctx := context.Background()
+
+	const (
+		series  = 200
+		buckets = 8
+		points  = 5
+	)
+
+	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()), WithAggregateStats(), WithDecodeCache(64<<20))
+	require.NoError(b, err)
+	defer func() { require.NoError(b, s.Close(ctx)) }()
+
+	// One flush per bucket ⇒ each part lies wholly inside one step-aligned bucket.
+	for k := range int64(buckets) {
+		start := int64(1_600_000_000_000_000_000) + k*aggStep
+		_, err := s.WriteMetrics(ctx, stepBucketCorpus(series, points, start, aggStep/(points+1)))
+		require.NoError(b, err)
+		require.NoError(b, mustEngine(s.engineFor("default")).Flush(ctx))
+	}
+
+	eng := mustEngine(s.engineFor("default"))
+	req := fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{nameMatcher("bench.metric")}}
+
+	got, err := s.AggregateMetricsStepNamed(ctx, "default", req, aggStep)
+	require.NoError(b, err)
+	require.Len(b, got, series)
+	require.Len(b, got[0].Buckets, buckets, "one bucket per part")
+
+	base, _ := eng.DecodeCacheStats()
+	require.Zero(b, base.Hits+base.Misses, "contained parts answer from the sidecar, no value decode")
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		if _, err := s.AggregateMetricsStepNamed(ctx, "default", req, aggStep); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.StopTimer()
+
+	if st, _ := eng.DecodeCacheStats(); st.Hits+st.Misses != 0 {
+		b.Fatalf("value column decoded: %d hits, %d misses", st.Hits, st.Misses)
+	}
+}
+
+// stepBucketCorpus builds one gauge metric with `series` distinct label sets, each carrying
+// `points` samples from start at interval — sized by the caller so the whole batch lands inside a
+// single step bucket.
+func stepBucketCorpus(series, points int, start, interval int64) metric.Metrics {
+	var md metric.Metrics
+	mt := md.AddResource().AddScope().AddMetric()
+	mt.Name = []byte("bench.metric")
+	mt.Kind = metric.KindGauge
+
+	for s := range series {
+		attrs := signal.NewAttributes(signal.KeyValue{
+			Key: []byte("pod"), Value: signal.StringValue([]byte("pod-" + strconv.Itoa(s))),
+		})
+
+		for i := range points {
+			p := mt.AddPoint()
+			p.Ts = start + int64(i)*interval
+			p.Attributes = attrs
+			p.Value = float64(i)
+		}
+	}
+
+	return md
 }
