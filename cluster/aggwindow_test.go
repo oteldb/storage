@@ -20,17 +20,18 @@ func TestAggregateWindowRequestCodec(t *testing.T) {
 
 	eq := []fetch.EqualMatcher{{Name: "__name__", Value: "http_requests"}, {Name: "job", Value: "api"}}
 
-	tenant, start, end, step, window, gotEq, err := cluster.DecodeAggregateWindowRequest(
-		cluster.EncodeAggregateWindowRequest("acme", -5, 1_700_000_000, 300_000, 3_600_000, eq))
+	spec := engine.WindowSpec{Step: 300_000, Window: 3_600_000, Anchor: 1_700_000_000_000}
+
+	tenant, start, end, gotSpec, gotEq, err := cluster.DecodeAggregateWindowRequest(
+		cluster.EncodeAggregateWindowRequest("acme", -5, 1_700_000_000, spec, eq))
 	require.NoError(t, err)
 	assert.Equal(t, "acme", tenant)
 	assert.Equal(t, int64(-5), start)
 	assert.Equal(t, int64(1_700_000_000), end)
-	assert.Equal(t, int64(300_000), step)
-	assert.Equal(t, int64(3_600_000), window, "the window rides independently of the step")
+	assert.Equal(t, spec, gotSpec, "the whole evaluation grid crosses the wire, anchor included")
 	assert.Equal(t, eq, gotEq)
 
-	_, _, _, _, _, _, err = cluster.DecodeAggregateWindowRequest([]byte{0xff}) //nolint:dogsled // only the error matters
+	_, _, _, _, _, err = cluster.DecodeAggregateWindowRequest([]byte{0xff}) //nolint:dogsled // only the error matters
 	require.Error(t, err)
 }
 
@@ -40,7 +41,7 @@ func TestAggregateWindowRequestIsNotABucketRequest(t *testing.T) {
 	t.Parallel()
 
 	eq := []fetch.EqualMatcher{{Name: "job", Value: "api"}}
-	payload := cluster.EncodeAggregateWindowRequest("acme", 0, 100, 10, 50, eq)
+	payload := cluster.EncodeAggregateWindowRequest("acme", 0, 100, engine.WindowSpec{Step: 10, Window: 50}, eq)
 
 	_, _, _, step, gotEq, err := cluster.DecodeAggregateRequest(payload) //nolint:dogsled // only step and the matchers matter
 	if err == nil {
@@ -88,15 +89,16 @@ func TestRemoteAggregatorWindowOverHTTP(t *testing.T) {
 	}}}
 
 	var (
-		gotTenant                        string
-		gotStart, gotEnd, gotStep, gotWn int64
-		gotMatchers                      int
+		gotTenant        string
+		gotStart, gotEnd int64
+		gotSpec          engine.WindowSpec
+		gotMatchers      int
 	)
 
 	fn := func(
-		_ context.Context, tenant string, start, end, step, window int64, matchers []fetch.Matcher,
+		_ context.Context, tenant string, start, end int64, spec engine.WindowSpec, matchers []fetch.Matcher,
 	) ([]engine.NamedWindowAgg, error) {
-		gotTenant, gotStart, gotEnd, gotStep, gotWn, gotMatchers = tenant, start, end, step, window, len(matchers)
+		gotTenant, gotStart, gotEnd, gotSpec, gotMatchers = tenant, start, end, spec, len(matchers)
 
 		return want, nil
 	}
@@ -107,15 +109,16 @@ func TestRemoteAggregatorWindowOverHTTP(t *testing.T) {
 	t.Cleanup(srv.Close)
 	addr := strings.TrimPrefix(srv.URL, "http://")
 
+	spec := engine.WindowSpec{Step: 20, Window: 60, Anchor: 7}
+
 	got, err := cluster.NewRemoteAggregator(addr, nil).AggregateWindow(
-		context.Background(), "acme", 10, 200, 20, 60, []fetch.EqualMatcher{{Name: "job", Value: "api"}})
+		context.Background(), "acme", 10, 200, spec, []fetch.EqualMatcher{{Name: "job", Value: "api"}})
 	require.NoError(t, err)
 
 	assert.Equal(t, "acme", gotTenant)
 	assert.Equal(t, int64(10), gotStart)
 	assert.Equal(t, int64(200), gotEnd)
-	assert.Equal(t, int64(20), gotStep)
-	assert.Equal(t, int64(60), gotWn)
+	assert.Equal(t, spec, gotSpec)
 	assert.Equal(t, 1, gotMatchers, "the equality matcher was pushed to the peer")
 	require.Len(t, got, 1)
 	assert.True(t, want[0].Series.Equal(got[0].Series))
@@ -137,6 +140,6 @@ func TestRemoteAggregatorWindowFailsOnBucketOnlyPeer(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	_, err := cluster.NewRemoteAggregator(strings.TrimPrefix(srv.URL, "http://"), nil).
-		AggregateWindow(context.Background(), "acme", 0, 100, 10, 50, nil)
+		AggregateWindow(context.Background(), "acme", 0, 100, engine.WindowSpec{Step: 10, Window: 50}, nil)
 	require.Error(t, err)
 }

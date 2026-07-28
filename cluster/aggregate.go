@@ -232,20 +232,45 @@ func takePointAgg(data []byte) (key int64, a engine.SeriesAgg, rest []byte, err 
 	}, data[24:], nil
 }
 
+// aggregateRequestBody reads a POST body for an aggregate endpoint, writing the error response
+// itself and reporting false when the request is unusable. Both aggregate handlers start here.
+func aggregateRequestBody(w http.ResponseWriter, req *http.Request) ([]byte, bool) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
+		return nil, false
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+
+		return nil, false
+	}
+
+	return body, true
+}
+
+// matchersFromEq rebuilds the pushed-down equality predicates a peer can apply locally. The Spec
+// rides along so a further hop keeps the pushdown.
+func matchersFromEq(eq []fetch.EqualMatcher) []fetch.Matcher {
+	matchers := make([]fetch.Matcher, len(eq))
+	for i := range eq {
+		matchers[i] = fetch.Matcher{Name: []byte(eq[i].Name), Match: eq[i].Predicate(), Spec: &eq[i]}
+	}
+
+	return matchers
+}
+
 // AggregateHandler returns the HTTP handler that serves an aggregate from the local store. Mount it
 // at [AggregatePath].
+// the shared halves (body read, matcher rebuild) are already factored out.
+//
+//nolint:dupl // same shape as the sibling handler, but the decoded request types differ;
 func AggregateHandler(fn AggregateFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-
-			return
-		}
-
-		body, err := io.ReadAll(req.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-
+		body, ok := aggregateRequestBody(w, req)
+		if !ok {
 			return
 		}
 
@@ -256,14 +281,9 @@ func AggregateHandler(fn AggregateFunc) http.Handler {
 			return
 		}
 
-		matchers := make([]fetch.Matcher, len(eq))
-		for i := range eq {
-			matchers[i] = fetch.Matcher{Name: []byte(eq[i].Name), Match: eq[i].Predicate(), Spec: &eq[i]}
-		}
-
 		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace
 
-		aggs, err := fn(ctx, tenant, start, end, step, matchers)
+		aggs, err := fn(ctx, tenant, start, end, step, matchersFromEq(eq))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 
@@ -295,9 +315,19 @@ func NewRemoteAggregator(addr string, client *http.Client) *RemoteAggregator {
 func (a *RemoteAggregator) Aggregate(
 	ctx context.Context, tenant string, start, end, step int64, eq []fetch.EqualMatcher,
 ) ([]engine.NamedAgg, error) {
-	payload := EncodeAggregateRequest(tenant, start, end, step, eq)
+	body, err := a.post(ctx, AggregatePath, EncodeAggregateRequest(tenant, start, end, step, eq), "aggregate")
+	if err != nil {
+		return nil, err
+	}
 
-	u := (&url.URL{Scheme: httpScheme, Host: a.addr}).JoinPath(AggregatePath)
+	return DecodeAggregates(body)
+}
+
+// post sends payload to the peer's path, joining the caller's trace, and returns the response body.
+// what names the operation in any error.
+func (a *RemoteAggregator) post(ctx context.Context, path string, payload []byte, what string) ([]byte, error) {
+	u := (&url.URL{Scheme: httpScheme, Host: a.addr}).JoinPath(path)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
 	if err != nil {
 		return nil, errors.Wrap(err, "build request")
@@ -307,7 +337,7 @@ func (a *RemoteAggregator) Aggregate(
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return nil, errors.Wrapf(err, "aggregate from %q", a.addr)
+		return nil, errors.Wrapf(err, "%s from %q", what, a.addr)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -317,8 +347,8 @@ func (a *RemoteAggregator) Aggregate(
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.Errorf("cluster: %q aggregate returned %d: %s", a.addr, resp.StatusCode, bytes.TrimSpace(body))
+		return nil, errors.Errorf("cluster: %q %s returned %d: %s", a.addr, what, resp.StatusCode, bytes.TrimSpace(body))
 	}
 
-	return DecodeAggregates(body)
+	return body, nil
 }

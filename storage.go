@@ -680,24 +680,25 @@ func (s *Storage) AggregateMetricsStepNamed(
 // step-wide buckets (the sidecar pushdown still applies) and a sliding accumulator produces every
 // window from them in a single pass per series.
 //
-// Windows align to the absolute grid (End is a multiple of step) and are sorted ascending by End;
+// Windows align to the grid spec.Anchor pins (End ≡ Anchor mod Step) and are sorted ascending by End;
 // empty windows and series with no sample are omitted. A sample exactly at End-window is excluded,
 // one exactly at End included. Only windows ending within [r.Start, r.End] are returned and each
 // sees only the fetched data, so a caller wanting complete windows from its first evaluation point
-// must fetch a window's worth of lead-in before it, as a PromQL engine does. window ≤ 0 means
-// window = step (no overlap); step must be > 0.
+// must fetch a window's worth of lead-in before it, as a PromQL engine does. spec.Window ≤ 0 means
+// no overlap; spec.Step must be > 0; spec.Anchor pins the evaluation grid (a PromQL range query is
+// anchored at its start, not at a multiple of the step).
 //
 // In cluster mode each shard's owner slides its own windows and ships them, and the coordinator
 // re-filters and unions — so only aggregates cross the wire, as with the stepped form.
 func (s *Storage) AggregateMetricsWindowNamed(
-	ctx context.Context, t signal.TenantID, r fetch.Request, step, window int64,
+	ctx context.Context, t signal.TenantID, r fetch.Request, spec engine.WindowSpec,
 ) ([]engine.NamedWindowAgg, error) {
 	if s.closed.Load() {
 		return nil, nil
 	}
 
 	if s.cluster != nil {
-		return s.clusterAggregateWindowNamedFor(ctx, t, r, step, window)
+		return s.clusterAggregateWindowNamedFor(ctx, t, r, spec)
 	}
 
 	eng, ok := s.lookupEngine(s.normalizeTenant(t))
@@ -705,7 +706,7 @@ func (s *Storage) AggregateMetricsWindowNamed(
 		return nil, nil
 	}
 
-	return eng.AggregateWindowNamed(ctx, r, step, window)
+	return eng.AggregateWindowNamed(ctx, r, spec)
 }
 
 // seedFetcher is the outermost read wrapper: it installs the injected logger as the zctx base so

@@ -38,8 +38,9 @@ type windowSlider struct {
 //
 // Runs of empty windows are skipped rather than walked, so a sparse series costs its samples, not
 // its span. end bounds the evaluation grid at the request's end: a window past it would be missing
-// the data that follows, so it is not reported.
-func (s *windowSlider) slide(ents []windowEnt, step, window, end int64) []WindowAgg {
+// the data that follows, so it is not reported. phase offsets the evaluation grid from the absolute
+// one (t ≡ phase mod step) — a caller's grid is anchored wherever its query starts.
+func (s *windowSlider) slide(ents []windowEnt, step, window, phase, end int64) []WindowAgg {
 	if len(ents) == 0 {
 		return nil
 	}
@@ -48,7 +49,7 @@ func (s *windowSlider) slide(ents []windowEnt, step, window, end int64) []Window
 
 	// The evaluation timestamps that can see any entry: from the first step at or after the earliest
 	// entry's end, through the last step that still holds the latest entry (t-window < end).
-	lo := ceilStep(ents[0].end, step)
+	lo := phase + ceilStep(ents[0].end-phase, step)
 
 	latest := ents[len(ents)-1].end
 
@@ -57,7 +58,7 @@ func (s *windowSlider) slide(ents []windowEnt, step, window, end int64) []Window
 		horizon = math.MaxInt64
 	}
 
-	hi := bucketStart(min(horizon, end), step)
+	hi := phase + bucketStart(min(horizon, end)-phase, step)
 
 	var (
 		dst  []WindowAgg
@@ -104,7 +105,7 @@ func (s *windowSlider) slide(ents []windowEnt, step, window, end int64) []Window
 			break // every entry has expired and none is left to enter
 		}
 
-		if next := ceilStep(ents[head].end, step); next > t {
+		if next := phase + ceilStep(ents[head].end-phase, step); next > t {
 			t = next - step // jump the gap; the loop's post statement lands us on next
 		}
 	}

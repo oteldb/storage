@@ -27,6 +27,41 @@ type NamedWindowAgg struct {
 	Windows []WindowAgg
 }
 
+// WindowSpec is the evaluation grid of an overlapping range-vector aggregate.
+type WindowSpec struct {
+	// Step is the distance between evaluation timestamps. Must be > 0.
+	Step int64
+
+	// Window is the width of each evaluation window, (t-Window, t]. A value ≤ 0 means Step: one
+	// aggregate per step over disjoint windows, no overlap.
+	Window int64
+
+	// Anchor is any timestamp on the evaluation grid — windows end at Anchor + k*Step. The zero
+	// value anchors on the absolute grid (multiples of Step). A PromQL range query's grid is
+	// anchored at the query's start, which is only a multiple of the step by coincidence, so an
+	// embedder must pass it: the answer is otherwise computed at timestamps nobody asked about.
+	Anchor int64
+}
+
+// window returns the effective window width (Step when unset).
+func (w WindowSpec) window() int64 {
+	if w.Window <= 0 {
+		return w.Step
+	}
+
+	return w.Window
+}
+
+// phase returns the grid's offset from the absolute one, in [0, Step).
+func (w WindowSpec) phase() int64 {
+	p := w.Anchor % w.Step
+	if p < 0 {
+		p += w.Step
+	}
+
+	return p
+}
+
 // errWindowStep rejects a non-positive step: unlike [Engine.AggregateStep], where step ≤ 0 has the
 // sensible meaning "one whole-range bucket", a stepped window has no evaluation grid without it.
 var errWindowStep = errors.New("engine: aggregate window needs step > 0")
@@ -54,11 +89,11 @@ var errWindowStep = errors.New("engine: aggregate window needs step > 0")
 //
 // window ≤ 0 means window = step (disjoint windows).
 func (e *Engine) AggregateWindow(
-	ctx context.Context, r fetch.Request, step, window int64,
+	ctx context.Context, r fetch.Request, spec WindowSpec,
 ) (map[signal.SeriesID][]WindowAgg, error) {
 	out := map[signal.SeriesID][]WindowAgg{}
 
-	for na, err := range e.aggregateWindowSeq(ctx, r, step, window) {
+	for na, err := range e.aggregateWindowSeq(ctx, r, spec) {
 		if err != nil {
 			return nil, err
 		}
@@ -72,11 +107,11 @@ func (e *Engine) AggregateWindow(
 // AggregateWindowNamed is [Engine.AggregateWindow] returning each series' identity alongside its
 // windows, for a caller that must re-check matchers or render labels (the cluster aggregate RPC).
 func (e *Engine) AggregateWindowNamed(
-	ctx context.Context, r fetch.Request, step, window int64,
+	ctx context.Context, r fetch.Request, spec WindowSpec,
 ) ([]NamedWindowAgg, error) {
 	var out []NamedWindowAgg
 
-	for na, err := range e.aggregateWindowSeq(ctx, r, step, window) {
+	for na, err := range e.aggregateWindowSeq(ctx, r, spec) {
 		if err != nil {
 			return nil, err
 		}
@@ -95,10 +130,10 @@ func (e *Engine) AggregateWindowNamed(
 // The fetch plan lives for the whole iteration and is released when it ends, including on an early
 // break.
 func (e *Engine) aggregateWindowSeq(
-	ctx context.Context, r fetch.Request, step, window int64,
+	ctx context.Context, r fetch.Request, spec WindowSpec,
 ) iter.Seq2[NamedWindowAgg, error] {
 	return func(yield func(NamedWindowAgg, error) bool) {
-		if step <= 0 {
+		if spec.Step <= 0 {
 			yield(NamedWindowAgg{}, errWindowStep)
 
 			return
@@ -107,7 +142,7 @@ func (e *Engine) aggregateWindowSeq(
 		ids, plan := e.planAggregate(r)
 		defer plan.releaseParts()
 
-		w := newWindower(plan, step, window)
+		w := newWindower(plan, spec)
 
 		for i, id := range ids {
 			windows, err := w.series(ctx, e, plan, id)
@@ -140,7 +175,7 @@ func (e *Engine) aggregateWindowSeq(
 type windower struct {
 	windowSlider
 
-	step, window int64
+	step, window, phase int64
 
 	grid *stepGrid // fine step-wide buckets; nil ⇒ the misaligned per-sample fallback
 	safe bool      // grid path: whether the plan's parts can be folded from their stats sidecars
@@ -151,14 +186,10 @@ type windower struct {
 	vals []float64   // scratch: merged values, fallback path only
 }
 
-func newWindower(plan *enginePlan, step, window int64) *windower {
-	if window <= 0 {
-		window = step
-	}
-
-	w := &windower{step: step, window: window}
-	if window%step == 0 {
-		w.grid, w.safe = newWindowGrid(plan, step), aggPushdownSafe(plan)
+func newWindower(plan *enginePlan, spec WindowSpec) *windower {
+	w := &windower{step: spec.Step, window: spec.window(), phase: spec.phase()}
+	if w.window%w.step == 0 {
+		w.grid, w.safe = newWindowGrid(plan, w.step, w.phase), aggPushdownSafe(plan)
 	}
 
 	return w
@@ -186,7 +217,7 @@ func (w *windower) series(ctx context.Context, e *Engine, plan *enginePlan, id s
 		w.ents = sampleEntries(w.ents[:0], w.ts, w.vals)
 	}
 
-	return w.slide(w.ents, w.step, w.window, plan.end), nil
+	return w.slide(w.ents, w.step, w.window, w.phase, plan.end), nil
 }
 
 // bucketEntries rewrites fine left-open buckets — (Start, Start+step], ascending — as accumulator

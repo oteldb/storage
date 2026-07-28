@@ -10,14 +10,15 @@ import (
 
 // bruteSlide is the O(steps × entries) definition the sliding accumulator has to reproduce: for
 // every step-aligned t, fold the entries with t-window < end ≤ t.
-func bruteSlide(ents []windowEnt, step, window, end int64) []WindowAgg {
+func bruteSlide(ents []windowEnt, step, window, phase, end int64) []WindowAgg {
 	if len(ents) == 0 {
 		return nil
 	}
 
 	var out []WindowAgg
 
-	for t := ceilStep(ents[0].end, step); t <= min(ents[len(ents)-1].end+window-1, end); t += step {
+	first := phase + ceilStep(ents[0].end-phase, step)
+	for t := first; t <= min(ents[len(ents)-1].end+window-1, end); t += step {
 		var a SeriesAgg
 
 		for _, e := range ents {
@@ -74,11 +75,12 @@ func TestWindowSliderMatchesBrute(t *testing.T) {
 		for _, mult := range []int64{1, 2, 3, 8, 25} {
 			window := step * mult
 			last := ents[len(ents)-1].end
+			phase := int64(rnd.IntN(int(step))) // an arbitrary evaluation-grid anchor, as PromQL has
 
-			got := s.slide(ents, step, window, last+window)
-			want := bruteSlide(ents, step, window, last+window)
+			got := s.slide(ents, step, window, phase, last+window)
+			want := bruteSlide(ents, step, window, phase, last+window)
 
-			require.Lenf(t, got, len(want), "step=%d window=%d", step, window)
+			require.Lenf(t, got, len(want), "step=%d window=%d phase=%d", step, window, phase)
 
 			for i := range want {
 				assert.Equalf(t, want[i].End, got[i].End, "step=%d window=%d window %d end", step, window, i)
@@ -100,9 +102,9 @@ func TestWindowSliderClipsToEnd(t *testing.T) {
 
 	var s windowSlider
 
-	got := s.slide(ents, 10, 50, 30)
+	got := s.slide(ents, 10, 50, 0, 30)
 	require.Len(t, got, 3) // t = 10, 20, 30 — not the 40 and 50 the window would still cover
 
 	assert.Equal(t, int64(30), got[len(got)-1].End)
-	assert.Empty(t, s.slide(ents, 10, 50, 0), "an end before the first entry yields nothing")
+	assert.Empty(t, s.slide(ents, 10, 50, 0, 0), "an end before the first entry yields nothing")
 }

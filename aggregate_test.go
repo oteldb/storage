@@ -295,7 +295,7 @@ func TestAggregateMetricsWindowNamed(t *testing.T) {
 
 	const window = 4 * aggStep // a 4x overlap at the step
 
-	got, err := s.AggregateMetricsWindowNamed(ctx, "default", req, aggStep, window)
+	got, err := s.AggregateMetricsWindowNamed(ctx, "default", req, engine.WindowSpec{Step: aggStep, Window: window})
 	require.NoError(t, err)
 	require.Len(t, got, series, "one entry per series")
 
@@ -344,7 +344,7 @@ func TestAggregateMetricsWindowNamedDegenerate(t *testing.T) {
 	stepped, err := s.AggregateMetricsStepNamed(ctx, "default", req, aggStep)
 	require.NoError(t, err)
 
-	windowed, err := s.AggregateMetricsWindowNamed(ctx, "default", req, aggStep, 0)
+	windowed, err := s.AggregateMetricsWindowNamed(ctx, "default", req, engine.WindowSpec{Step: aggStep, Window: 0})
 	require.NoError(t, err)
 	require.Len(t, windowed, len(stepped))
 
@@ -379,17 +379,17 @@ func TestAggregateMetricsWindowNamedDegenerate(t *testing.T) {
 		assert.LessOrEqual(t, count[na.Series.Hash()]-len(na.Buckets), 1, "at most one extra window at the head")
 	}
 
-	_, err = s.AggregateMetricsWindowNamed(ctx, "default", req, 0, aggStep)
+	_, err = s.AggregateMetricsWindowNamed(ctx, "default", req, engine.WindowSpec{Step: 0, Window: aggStep})
 	require.Error(t, err, "a stepped window has no evaluation grid without a step")
 
 	// An unknown tenant, and a closed store, yield no results rather than an error.
-	got, err := s.AggregateMetricsWindowNamed(ctx, "nosuch", req, aggStep, aggStep)
+	got, err := s.AggregateMetricsWindowNamed(ctx, "nosuch", req, engine.WindowSpec{Step: aggStep, Window: aggStep})
 	require.NoError(t, err)
 	assert.Empty(t, got)
 
 	require.NoError(t, s.Close(ctx))
 
-	got, err = s.AggregateMetricsWindowNamed(ctx, "default", req, aggStep, aggStep)
+	got, err = s.AggregateMetricsWindowNamed(ctx, "default", req, engine.WindowSpec{Step: aggStep, Window: aggStep})
 	require.NoError(t, err)
 	assert.Empty(t, got)
 }

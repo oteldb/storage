@@ -478,7 +478,7 @@ func (s *Storage) localAggregate(
 // localAggregateWindow serves a peer's overlapping-window aggregate from the local shard engine —
 // the receiving side of [cluster.AggregateWindowHandler], the window form of [Storage.localAggregate].
 func (s *Storage) localAggregateWindow(
-	ctx context.Context, tenant string, start, end, step, window int64, matchers []fetch.Matcher,
+	ctx context.Context, tenant string, start, end int64, spec engine.WindowSpec, matchers []fetch.Matcher,
 ) ([]engine.NamedWindowAgg, error) {
 	eng, ok := s.lookupEngine(s.normalizeTenant(signal.TenantID(tenant)))
 	if !ok {
@@ -487,94 +487,7 @@ func (s *Storage) localAggregateWindow(
 
 	return eng.AggregateWindowNamed(ctx, fetch.Request{
 		Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers,
-	}, step, window)
-}
-
-// clusterAggregateWindowNamedFor computes a tenant's overlapping-window aggregate across all its
-// shards, the window form of [Storage.clusterAggregateNamedFor]: each shard's owner slides its
-// own windows (keeping the sidecar pushdown local) and ships one compact entry per series, which the
-// coordinator re-checks against the full matcher set and unions. A series that surfaces from more
-// than one shard has its windows merged by evaluation timestamp — exact, since the shards hold
-// disjoint samples.
-func (s *Storage) clusterAggregateWindowNamedFor(
-	ctx context.Context, tid signal.TenantID, r fetch.Request, step, window int64,
-) ([]engine.NamedWindowAgg, error) {
-	cn := s.cluster
-	tenant := s.normalizeTenant(tid)
-	n := cn.shardCount()
-
-	var out []engine.NamedWindowAgg
-
-	index := make(map[signal.SeriesID]int, n) // id → position in out, to merge a series seen twice
-
-	for idx := range n {
-		sk := shardKeyOf(tenant, idx, n)
-
-		named, err := s.shardAggregateWindow(ctx, sk, r, step, window)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := range named {
-			na := &named[i]
-			if !matchesAllSeries(na.Series, r.Matchers) {
-				continue
-			}
-
-			id := na.Series.Hash()
-			if j, ok := index[id]; ok {
-				out[j].Windows = mergeWindowLists(out[j].Windows, na.Windows)
-			} else {
-				index[id] = len(out)
-				out = append(out, engine.NamedWindowAgg{Series: na.Series, Windows: na.Windows})
-			}
-		}
-	}
-
-	return out, nil
-}
-
-// shardAggregateWindow gets one metric shard's per-series windows: locally (full matcher pushdown)
-// if this node owns it, else from a remote owner with sequential failover.
-func (s *Storage) shardAggregateWindow(
-	ctx context.Context, shardKey signal.TenantID, r fetch.Request, step, window int64,
-) ([]engine.NamedWindowAgg, error) {
-	cn := s.cluster
-	owners := s.ownerLookup(shardKey)
-
-	for _, o := range owners {
-		if cn.membership.AddrOf(o.ID) == cn.self { // owner: serve locally
-			eng, ok := s.lookupEngine(shardKey)
-			if !ok {
-				return nil, nil // owner, no data yet
-			}
-
-			return eng.AggregateWindowNamed(ctx, fetch.Request{
-				Tenant: shardKey, Start: r.Start, End: r.End, Matchers: r.Matchers,
-			}, step, window)
-		}
-	}
-
-	eq := equalityMatchers(r.Matchers)
-
-	var lastErr error
-
-	for _, o := range owners {
-		addr := cn.membership.AddrOf(o.ID)
-		if addr == "" || addr == cn.self {
-			continue
-		}
-
-		named, err := cluster.NewRemoteAggregator(addr, cn.httpc).
-			AggregateWindow(ctx, string(shardKey), r.Start, r.End, step, window, eq)
-		if err == nil {
-			return named, nil
-		}
-
-		lastErr = err
-	}
-
-	return nil, lastErr // nil when there were no reachable owners (treated as no data)
+	}, spec)
 }
 
 // mergeWindowLists combines two per-series window lists by aligned evaluation timestamp, summing
@@ -645,54 +558,127 @@ func (s *Storage) clusterAggregateFor(
 	return out, nil
 }
 
-// clusterAggregateNamedFor is the labeled variant of [clusterAggregateFor]: it computes a tenant's
-// step-bucketed aggregate across all its shards but keeps each series' identity (so the coordinator
-// can render labels), re-checking the full matcher set against each shard's returned identities and
-// merging buckets for any series that surfaces from more than one shard. It backs the labeled
-// [Storage.AggregateMetricsNamed] pushdown path in cluster mode.
+// clusterAggregateNamedFor is the labeled variant of [Storage.clusterAggregateFor]: it computes a
+// tenant's step-bucketed aggregate across all its shards but keeps each series' identity (so the
+// coordinator can render labels). It backs the labeled [Storage.AggregateMetricsNamed] pushdown
+// path in cluster mode.
 func (s *Storage) clusterAggregateNamedFor(
 	ctx context.Context, tid signal.TenantID, r fetch.Request, step int64,
 ) ([]engine.NamedAgg, error) {
-	cn := s.cluster
-	tenant := s.normalizeTenant(tid)
-	n := cn.shardCount()
+	return gatherShards(s, tid, r.Matchers,
+		func(sk signal.TenantID) ([]engine.NamedAgg, error) { return s.shardAggregate(ctx, sk, r, step) },
+		func(a *engine.NamedAgg) signal.Series { return a.Series },
+		func(dst, src *engine.NamedAgg) { dst.Buckets = mergeBucketLists(dst.Buckets, src.Buckets) })
+}
 
-	var out []engine.NamedAgg
+// clusterAggregateWindowNamedFor computes a tenant's overlapping-window aggregate across all its
+// shards, the window form of [Storage.clusterAggregateNamedFor]: each shard's owner slides its own
+// windows (keeping the sidecar pushdown local) and ships one compact entry per series. A series that
+// surfaces from more than one shard has its windows merged by evaluation timestamp — exact, since
+// the shards hold disjoint samples.
+func (s *Storage) clusterAggregateWindowNamedFor(
+	ctx context.Context, tid signal.TenantID, r fetch.Request, spec engine.WindowSpec,
+) ([]engine.NamedWindowAgg, error) {
+	return gatherShards(s, tid, r.Matchers,
+		func(sk signal.TenantID) ([]engine.NamedWindowAgg, error) {
+			return s.shardAggregateWindow(ctx, sk, r, spec)
+		},
+		func(a *engine.NamedWindowAgg) signal.Series { return a.Series },
+		func(dst, src *engine.NamedWindowAgg) { dst.Windows = mergeWindowLists(dst.Windows, src.Windows) })
+}
+
+// gatherShards folds every shard of a tenant into one per-series list: shard fetches a shard's
+// entries (locally or from a remote owner), the coordinator drops series that fail the full matcher
+// set — a remote peer applied only the equality subset — and merges any series that surfaces from
+// more than one shard. Series are shard-partitioned, so the merge is rare, but it runs defensively.
+// It is the shared body of the stepped and windowed fan-outs, which differ only in what one series'
+// aggregates look like.
+func gatherShards[T any](
+	s *Storage, tid signal.TenantID, matchers []fetch.Matcher,
+	shard func(shardKey signal.TenantID) ([]T, error),
+	seriesOf func(*T) signal.Series,
+	merge func(dst, src *T),
+) ([]T, error) {
+	tenant := s.normalizeTenant(tid)
+	n := s.cluster.shardCount()
+
+	var out []T
+
 	index := make(map[signal.SeriesID]int, n) // id → position in out, to merge a series seen twice
 
 	for idx := range n {
-		sk := shardKeyOf(tenant, idx, n)
-
-		named, err := s.shardAggregate(ctx, sk, r, step)
+		named, err := shard(shardKeyOf(tenant, idx, n))
 		if err != nil {
 			return nil, err
 		}
 
 		for i := range named {
 			na := &named[i]
-			if !matchesAllSeries(na.Series, r.Matchers) {
+
+			series := seriesOf(na)
+			if !matchesAllSeries(series, matchers) {
 				continue
 			}
 
-			id := na.Series.Hash()
+			id := series.Hash()
 			if j, ok := index[id]; ok {
-				out[j].Buckets = mergeBucketLists(out[j].Buckets, na.Buckets)
-			} else {
-				index[id] = len(out)
-				out = append(out, engine.NamedAgg{Series: na.Series, Buckets: na.Buckets})
+				merge(&out[j], na)
+
+				continue
 			}
+
+			index[id] = len(out)
+			out = append(out, *na)
 		}
 	}
 
 	return out, nil
 }
 
-// shardAggregate gets one metric shard's per-series aggregates: locally (full matcher pushdown) if
-// this node owns it, else from a remote owner with sequential failover (equality matchers pushed;
-// the coordinator re-checks the full set on the returned identities).
+// shardAggregate gets one metric shard's per-series step buckets.
 func (s *Storage) shardAggregate(
 	ctx context.Context, shardKey signal.TenantID, r fetch.Request, step int64,
 ) ([]engine.NamedAgg, error) {
+	eq := equalityMatchers(r.Matchers)
+
+	return shardAggregateWith(s, shardKey,
+		func(eng *engine.Engine) ([]engine.NamedAgg, error) {
+			return eng.AggregateStepNamed(ctx, fetch.Request{
+				Tenant: shardKey, Start: r.Start, End: r.End, Matchers: r.Matchers,
+			}, step)
+		},
+		func(addr string) ([]engine.NamedAgg, error) {
+			return cluster.NewRemoteAggregator(addr, s.cluster.httpc).
+				Aggregate(ctx, string(shardKey), r.Start, r.End, step, eq)
+		})
+}
+
+// shardAggregateWindow gets one metric shard's per-series evaluation windows.
+func (s *Storage) shardAggregateWindow(
+	ctx context.Context, shardKey signal.TenantID, r fetch.Request, spec engine.WindowSpec,
+) ([]engine.NamedWindowAgg, error) {
+	eq := equalityMatchers(r.Matchers)
+
+	return shardAggregateWith(s, shardKey,
+		func(eng *engine.Engine) ([]engine.NamedWindowAgg, error) {
+			return eng.AggregateWindowNamed(ctx, fetch.Request{
+				Tenant: shardKey, Start: r.Start, End: r.End, Matchers: r.Matchers,
+			}, spec)
+		},
+		func(addr string) ([]engine.NamedWindowAgg, error) {
+			return cluster.NewRemoteAggregator(addr, s.cluster.httpc).
+				AggregateWindow(ctx, string(shardKey), r.Start, r.End, spec, eq)
+		})
+}
+
+// shardAggregateWith serves one shard's aggregates: locally (full matcher pushdown) if this node
+// owns the shard, else from a remote owner with sequential failover (equality matchers pushed; the
+// coordinator re-checks the full set on the returned identities).
+func shardAggregateWith[T any](
+	s *Storage, shardKey signal.TenantID,
+	local func(*engine.Engine) ([]T, error),
+	remote func(addr string) ([]T, error),
+) ([]T, error) {
 	cn := s.cluster
 	owners := s.ownerLookup(shardKey)
 
@@ -703,24 +689,21 @@ func (s *Storage) shardAggregate(
 				return nil, nil // owner, no data yet
 			}
 
-			return eng.AggregateStepNamed(ctx, fetch.Request{
-				Tenant: shardKey, Start: r.Start, End: r.End, Matchers: r.Matchers,
-			}, step)
+			return local(eng)
 		}
 	}
 
-	eq := equalityMatchers(r.Matchers)
-
 	var lastErr error
+
 	for _, o := range owners {
 		addr := cn.membership.AddrOf(o.ID)
 		if addr == "" || addr == cn.self {
 			continue
 		}
 
-		named, err := cluster.NewRemoteAggregator(addr, cn.httpc).Aggregate(ctx, string(shardKey), r.Start, r.End, step, eq)
+		got, err := remote(addr)
 		if err == nil {
-			return named, nil
+			return got, nil
 		}
 
 		lastErr = err

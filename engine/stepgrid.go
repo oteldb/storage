@@ -34,26 +34,32 @@ type stepGrid struct {
 	// range vector's window is half-open on the left, so only left-open fine buckets are never split
 	// by a window edge.
 	openLeft bool
+
+	// phase shifts the grid off the absolute one: bucket edges sit at phase + k*step rather than at
+	// multiples of step. Always in [0, step). An evaluation grid is anchored at the query's start,
+	// which is rarely a multiple of the step, and a fine bucket must not straddle a window edge.
+	phase int64
 }
 
 // newStepGrid sizes a grid for the plan's data span at the given step, with buckets [b, b+step).
 // step ≤ 0 collapses to a single bucket at 0, matching [bucketStart].
 func newStepGrid(plan *enginePlan, step int64) *stepGrid {
-	return newBucketGrid(plan, step, false)
+	return newBucketGrid(plan, step, false, 0)
 }
 
-// newWindowGrid is [newStepGrid] with left-open buckets (b, b+step] — the fine grid the sliding
-// range-vector accumulator folds, so that a window (t-W, t] is exactly the union of W/step of them.
-func newWindowGrid(plan *enginePlan, step int64) *stepGrid {
-	return newBucketGrid(plan, step, true)
+// newWindowGrid is [newStepGrid] with left-open buckets (b, b+step] on the evaluation grid anchored
+// at phase — the fine grid the sliding range-vector accumulator folds, so that a window (t-W, t] is
+// exactly the union of W/step of them, none of which a window edge splits.
+func newWindowGrid(plan *enginePlan, step, phase int64) *stepGrid {
+	return newBucketGrid(plan, step, true, phase)
 }
 
-func newBucketGrid(plan *enginePlan, step int64, openLeft bool) *stepGrid {
+func newBucketGrid(plan *enginePlan, step int64, openLeft bool, phase int64) *stepGrid {
 	if step <= 0 {
 		return &stepGrid{slots: make([]SeriesAgg, 1)}
 	}
 
-	g := &stepGrid{step: step, openLeft: openLeft}
+	g := &stepGrid{step: step, openLeft: openLeft, phase: phase}
 
 	lo, hi, ok := planDataSpan(plan)
 	if !ok {
@@ -77,13 +83,17 @@ func newBucketGrid(plan *enginePlan, step int64, openLeft bool) *stepGrid {
 }
 
 // bucketOf returns the key of the bucket holding ts: [b, b+step) normally, (b, b+step] on a
-// left-open grid.
+// left-open grid, with edges at phase + k*step.
 func (g *stepGrid) bucketOf(ts int64) int64 {
 	if g.openLeft && ts != math.MinInt64 {
 		ts--
 	}
 
-	return bucketStart(ts, g.step)
+	if g.phase == 0 {
+		return bucketStart(ts, g.step)
+	}
+
+	return g.phase + bucketStart(ts-g.phase, g.step)
 }
 
 // addSample folds one sample into its bucket.

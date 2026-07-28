@@ -225,7 +225,7 @@ func TestClusterAggregateWindowGathersAcrossShards(t *testing.T) {
 	req := fetch.Request{Start: 0, End: 400, Matchers: []fetch.Matcher{nameMatcher("metric_0")}}
 
 	for name, s := range nodes {
-		got, err := s.AggregateMetricsWindowNamed(ctx, "default", req, step, window)
+		got, err := s.AggregateMetricsWindowNamed(ctx, "default", req, engine.WindowSpec{Step: step, Window: window})
 		require.NoErrorf(t, err, "%s aggregates windows across shards", name)
 		require.Lenf(t, got, 1, "%s finds the series", name)
 
@@ -244,7 +244,7 @@ func TestClusterAggregateWindowGathersAcrossShards(t *testing.T) {
 		for _, m := range names {
 			got, err := s.AggregateMetricsWindowNamed(ctx, "default", fetch.Request{
 				Start: 0, End: 400, Matchers: []fetch.Matcher{nameMatcher(m)},
-			}, step, window)
+			}, engine.WindowSpec{Step: step, Window: window})
 			require.NoErrorf(t, err, "%s: %s", name, m)
 			require.Lenf(t, got, 1, "%s reads %s across shards", name, m)
 			assert.Lenf(t, got[0].Windows, 4, "%s: %s", name, m)

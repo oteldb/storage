@@ -40,7 +40,16 @@ func ceilTo(ts, step int64) int64 {
 // windowFold is the brute-force reference: for every step-aligned evaluation timestamp t, fold the
 // samples in the half-open window (t-window, t]. Windows past the request end are not evaluated —
 // their data is not all fetched.
-func windowFold(b *fetch.Batch, step, window, end int64) []engine.WindowAgg {
+func windowFold(b *fetch.Batch, spec engine.WindowSpec, end int64) []engine.WindowAgg {
+	step := spec.Step
+
+	window := spec.Window
+	if window <= 0 {
+		window = step
+	}
+
+	phase := ((spec.Anchor % step) + step) % step
+
 	if len(b.Timestamps) == 0 {
 		return nil
 	}
@@ -53,7 +62,7 @@ func windowFold(b *fetch.Batch, step, window, end int64) []engine.WindowAgg {
 	var out []engine.WindowAgg
 
 	last := min(end, hi+window-1)
-	for t := ceilTo(lo, step); t <= last; t += step {
+	for t := phase + ceilTo(lo-phase, step); t <= last; t += step {
 		var a engine.SeriesAgg
 
 		for i, ts := range b.Timestamps {
@@ -79,10 +88,10 @@ func windowFold(b *fetch.Batch, step, window, end int64) []engine.WindowAgg {
 	return out
 }
 
-func windowsFromBatches(batches []*fetch.Batch, step, window, end int64) map[signal.SeriesID][]engine.WindowAgg {
+func windowsFromBatches(batches []*fetch.Batch, spec engine.WindowSpec, end int64) map[signal.SeriesID][]engine.WindowAgg {
 	out := make(map[signal.SeriesID][]engine.WindowAgg, len(batches))
 	for _, b := range batches {
-		if w := windowFold(b, step, window, end); len(w) > 0 {
+		if w := windowFold(b, spec, end); len(w) > 0 {
 			out[b.ID] = w
 		}
 	}
@@ -106,12 +115,12 @@ func assertWindows(t *testing.T, want, got []engine.WindowAgg, msg string) {
 	}
 }
 
-func assertWindowsMatchFetch(t *testing.T, e *engine.Engine, r fetch.Request, step, window int64) {
+func assertWindowsMatchFetch(t *testing.T, e *engine.Engine, r fetch.Request, spec engine.WindowSpec) {
 	t.Helper()
 
 	ctx := context.Background()
 
-	got, err := e.AggregateWindow(ctx, r, step, window)
+	got, err := e.AggregateWindow(ctx, r, spec)
 	require.NoError(t, err)
 
 	it, err := e.Fetch(ctx, r)
@@ -120,11 +129,11 @@ func assertWindowsMatchFetch(t *testing.T, e *engine.Engine, r fetch.Request, st
 	batches, err := fetch.Drain(ctx, it)
 	require.NoError(t, err)
 
-	want := windowsFromBatches(batches, step, window, r.End)
+	want := windowsFromBatches(batches, spec, r.End)
 	require.Len(t, got, len(want))
 
 	for id, w := range want {
-		assertWindows(t, w, got[id], fmt.Sprintf("step=%d window=%d series=%v", step, window, id))
+		assertWindows(t, w, got[id], fmt.Sprintf("%+v series=%v", spec, id))
 	}
 }
 
@@ -177,7 +186,7 @@ func TestAggregateWindowMatchesFetch(t *testing.T) {
 		{100, 250}, // misaligned ⇒ per-sample fallback
 		{30, 100},  // misaligned, window not a multiple of a finer step either
 	} {
-		assertWindowsMatchFetch(t, e, req, tc.step, tc.window)
+		assertWindowsMatchFetch(t, e, req, engine.WindowSpec{Step: tc.step, Window: tc.window})
 	}
 }
 
@@ -188,11 +197,11 @@ func TestAggregateWindowDefaultsToStep(t *testing.T) {
 
 	e, req := windowEngine(t)
 
-	want, err := e.AggregateWindow(ctx, req, 100, 100)
+	want, err := e.AggregateWindow(ctx, req, engine.WindowSpec{Step: 100, Window: 100})
 	require.NoError(t, err)
 
 	for _, window := range []int64{0, -1} {
-		got, err := e.AggregateWindow(ctx, req, 100, window)
+		got, err := e.AggregateWindow(ctx, req, engine.WindowSpec{Step: 100, Window: window})
 		require.NoError(t, err)
 		require.Len(t, got, len(want))
 
@@ -235,9 +244,38 @@ func TestAggregateWindowMinMaxOrderings(t *testing.T) {
 			for _, w := range []struct{ step, window int64 }{
 				{10, 10}, {10, 100}, {50, 500}, {100, 1000}, {10, 45}, // last is misaligned
 			} {
-				assertWindowsMatchFetch(t, e, req, w.step, w.window)
+				assertWindowsMatchFetch(t, e, req, engine.WindowSpec{Step: w.step, Window: w.window})
 			}
 		})
+	}
+}
+
+// TestAggregateWindowAnchored covers an evaluation grid that is not a multiple of the step — which
+// is what a PromQL range query always has, since its grid is anchored at the query's start. Without
+// an anchor the windows land on timestamps the caller never asked about.
+func TestAggregateWindowAnchored(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	e, req := windowEngine(t)
+
+	for _, anchor := range []int64{0, 7, 33, 100, -13, 1 << 40} {
+		spec := engine.WindowSpec{Step: 100, Window: 300, Anchor: anchor}
+		assertWindowsMatchFetch(t, e, req, spec)
+
+		got, err := e.AggregateWindow(ctx, req, spec)
+		require.NoError(t, err)
+		require.NotEmpty(t, got)
+
+		want := ((anchor % spec.Step) + spec.Step) % spec.Step
+		for _, windows := range got {
+			require.NotEmpty(t, windows)
+
+			for _, w := range windows {
+				assert.Equalf(t, want, ((w.End%spec.Step)+spec.Step)%spec.Step,
+					"anchor=%d: every window ends on the anchored grid, not the absolute one", anchor)
+			}
+		}
 	}
 }
 
@@ -253,8 +291,8 @@ func TestAggregateWindowPartialRange(t *testing.T) {
 		{Start: 0, End: 250, Matchers: req.Matchers},
 		{Start: 45, End: 400, Matchers: req.Matchers},
 	} {
-		assertWindowsMatchFetch(t, e, r, 100, 300)
-		assertWindowsMatchFetch(t, e, r, 50, 150)
+		assertWindowsMatchFetch(t, e, r, engine.WindowSpec{Step: 100, Window: 300})
+		assertWindowsMatchFetch(t, e, r, engine.WindowSpec{Step: 50, Window: 150})
 	}
 }
 
@@ -275,7 +313,7 @@ func TestAggregateWindowHalfOpen(t *testing.T) {
 
 	got, err := e.AggregateWindow(ctx, fetch.Request{
 		Start: 0, End: 100, Matchers: []fetch.Matcher{eqMatcher("job", "api")},
-	}, 10, 20)
+	}, engine.WindowSpec{Step: 10, Window: 20})
 	require.NoError(t, err)
 
 	assertWindows(t, []engine.WindowAgg{
@@ -308,7 +346,7 @@ func TestAggregateWindowMatchesStep(t *testing.T) {
 	buckets, err := e.AggregateStep(ctx, req, 10)
 	require.NoError(t, err)
 
-	windows, err := e.AggregateWindow(ctx, req, 10, 10)
+	windows, err := e.AggregateWindow(ctx, req, engine.WindowSpec{Step: 10, Window: 10})
 	require.NoError(t, err)
 
 	want := buckets[s.Hash()]
@@ -337,8 +375,8 @@ func TestAggregateWindowDedupsOverlappingParts(t *testing.T) {
 	require.NoError(t, e.Flush(ctx))
 
 	req := fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}}
-	assertWindowsMatchFetch(t, e, req, 50, 200)
-	assertWindowsMatchFetch(t, e, req, 50, 175) // misaligned fallback on the same unsafe plan
+	assertWindowsMatchFetch(t, e, req, engine.WindowSpec{Step: 50, Window: 200})
+	assertWindowsMatchFetch(t, e, req, engine.WindowSpec{Step: 50, Window: 175}) // misaligned fallback on the same unsafe plan
 }
 
 // TestAggregateWindowSparseGrid covers the map-backed fine grid: samples 1e6 apart at a step of 1
@@ -358,8 +396,8 @@ func TestAggregateWindowSparseGrid(t *testing.T) {
 	mustAppend(t, e, s, 9_000_000, 9) // head, past the flushed part
 
 	req := fetch.Request{Start: 0, End: 10_000_000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}}
-	assertWindowsMatchFetch(t, e, req, 1_000_000, 3_000_000)
-	assertWindowsMatchFetch(t, e, req, 2_000_000, 2_000_000)
+	assertWindowsMatchFetch(t, e, req, engine.WindowSpec{Step: 1_000_000, Window: 3_000_000})
+	assertWindowsMatchFetch(t, e, req, engine.WindowSpec{Step: 2_000_000, Window: 2_000_000})
 }
 
 // TestAggregateWindowSkipsGaps guards the empty-window jump: a long gap between samples must not be
@@ -377,13 +415,13 @@ func TestAggregateWindowSkipsGaps(t *testing.T) {
 
 	req := fetch.Request{Start: 0, End: 2_000_000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}}
 
-	got, err := e.AggregateWindow(ctx, req, 10, 30)
+	got, err := e.AggregateWindow(ctx, req, engine.WindowSpec{Step: 10, Window: 30})
 	require.NoError(t, err)
 
 	// Three windows per sample (the sample enters at its own step and expires 30 later), none in
 	// between — not the 200,000 the span would hold.
 	require.Len(t, got[s.Hash()], 6)
-	assertWindows(t, windowFold(fetchAll(t, e, req)[0], 10, 30, req.End), got[s.Hash()], "gap")
+	assertWindows(t, windowFold(fetchAll(t, e, req)[0], engine.WindowSpec{Step: 10, Window: 30}, req.End), got[s.Hash()], "gap")
 }
 
 // TestAggregateWindowPushdown proves the sidecar still answers the overlapping case: a part wholly
@@ -405,13 +443,13 @@ func TestAggregateWindowPushdown(t *testing.T) {
 
 	req := fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}}
 
-	_, err := e.AggregateWindow(ctx, req, 100, 1000) // 10x overlap
+	_, err := e.AggregateWindow(ctx, req, engine.WindowSpec{Step: 100, Window: 1000}) // 10x overlap
 	require.NoError(t, err)
 
 	st, _ := e.DecodeCacheStats()
 	assert.Equal(t, int64(0), st.Misses, "a contained part feeds every overlapping window from its sidecar")
 
-	_, err = e.AggregateWindow(ctx, req, 100, 150) // misaligned ⇒ per-sample fallback ⇒ decode
+	_, err = e.AggregateWindow(ctx, req, engine.WindowSpec{Step: 100, Window: 150}) // misaligned ⇒ per-sample fallback ⇒ decode
 	require.NoError(t, err)
 
 	st, _ = e.DecodeCacheStats()
@@ -424,10 +462,10 @@ func TestAggregateWindowNamed(t *testing.T) {
 
 	e, req := windowEngine(t)
 
-	named, err := e.AggregateWindowNamed(ctx, req, 100, 300)
+	named, err := e.AggregateWindowNamed(ctx, req, engine.WindowSpec{Step: 100, Window: 300})
 	require.NoError(t, err)
 
-	byID, err := e.AggregateWindow(ctx, req, 100, 300)
+	byID, err := e.AggregateWindow(ctx, req, engine.WindowSpec{Step: 100, Window: 300})
 	require.NoError(t, err)
 
 	require.Len(t, named, len(byID))
@@ -444,10 +482,10 @@ func TestAggregateWindowRejectsNonPositiveStep(t *testing.T) {
 	e, req := windowEngine(t)
 
 	for _, step := range []int64{0, -1} {
-		_, err := e.AggregateWindow(ctx, req, step, 100)
+		_, err := e.AggregateWindow(ctx, req, engine.WindowSpec{Step: step, Window: 100})
 		require.Errorf(t, err, "step=%d", step)
 
-		_, err = e.AggregateWindowNamed(ctx, req, step, 100)
+		_, err = e.AggregateWindowNamed(ctx, req, engine.WindowSpec{Step: step, Window: 100})
 		require.Errorf(t, err, "step=%d", step)
 	}
 }
@@ -486,7 +524,7 @@ func BenchmarkAggregateWindow(b *testing.B) {
 			b.ReportAllocs()
 
 			for b.Loop() {
-				out, err := e.AggregateWindow(ctx, req, step, step*overlap)
+				out, err := e.AggregateWindow(ctx, req, engine.WindowSpec{Step: step, Window: step * overlap})
 				if err != nil {
 					b.Fatal(err)
 				}

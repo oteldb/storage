@@ -1,12 +1,9 @@
 package cluster
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
-	"io"
 	"net/http"
-	"net/url"
 
 	"github.com/go-faster/errors"
 
@@ -27,18 +24,19 @@ const AggregateWindowPath = "/internal/aggregate/window"
 // matching the (pushed-down equality) matchers: one aggregate per step-aligned evaluation timestamp
 // over the half-open window (t-window, t]. It is what [AggregateWindowHandler] serves.
 type AggregateWindowFunc func(
-	ctx context.Context, tenant string, start, end, step, window int64, matchers []fetch.Matcher,
+	ctx context.Context, tenant string, start, end int64, spec engine.WindowSpec, matchers []fetch.Matcher,
 ) ([]engine.NamedWindowAgg, error)
 
-// EncodeAggregateWindowRequest frames a window-aggregate request: tenant, range, step, window width,
-// and the serializable equality matchers to push to the peer (the coordinator re-checks the full set
-// on the response).
-func EncodeAggregateWindowRequest(tenant string, start, end, step, window int64, eq []fetch.EqualMatcher) []byte {
+// EncodeAggregateWindowRequest frames a window-aggregate request: tenant, range, the evaluation
+// grid (step, window width, anchor), and the serializable equality matchers to push to the peer
+// (the coordinator re-checks the full set on the response).
+func EncodeAggregateWindowRequest(tenant string, start, end int64, spec engine.WindowSpec, eq []fetch.EqualMatcher) []byte {
 	buf := appendString(nil, tenant)
 	buf = binary.AppendVarint(buf, start)
 	buf = binary.AppendVarint(buf, end)
-	buf = binary.AppendVarint(buf, step)
-	buf = binary.AppendVarint(buf, window)
+	buf = binary.AppendVarint(buf, spec.Step)
+	buf = binary.AppendVarint(buf, spec.Window)
+	buf = binary.AppendVarint(buf, spec.Anchor)
 	buf = binary.AppendUvarint(buf, uint64(len(eq)))
 
 	for _, m := range eq {
@@ -51,26 +49,26 @@ func EncodeAggregateWindowRequest(tenant string, start, end, step, window int64,
 
 // DecodeAggregateWindowRequest parses a request made by [EncodeAggregateWindowRequest].
 //
-//nolint:gocritic // the wire shape is tenant+range+step+window+matchers+err; a struct would obscure it
+//nolint:gocritic // the wire shape is tenant+range+grid+matchers+err; a struct would obscure it
 func DecodeAggregateWindowRequest(data []byte) (
-	tenant string, start, end, step, window int64, eq []fetch.EqualMatcher, err error,
+	tenant string, start, end int64, spec engine.WindowSpec, eq []fetch.EqualMatcher, err error,
 ) {
 	if tenant, data, err = takeString(data); err != nil {
-		return "", 0, 0, 0, 0, nil, errors.Wrap(err, "tenant")
+		return "", 0, 0, spec, nil, errors.Wrap(err, "tenant")
 	}
 
 	for _, f := range []struct {
 		dst  *int64
 		what string
-	}{{&start, "start"}, {&end, "end"}, {&step, "step"}, {&window, "window"}} {
+	}{{&start, "start"}, {&end, "end"}, {&spec.Step, "step"}, {&spec.Window, "window"}, {&spec.Anchor, "anchor"}} {
 		if *f.dst, data, err = takeVarint(data, f.what); err != nil {
-			return "", 0, 0, 0, 0, nil, err
+			return "", 0, 0, spec, nil, err
 		}
 	}
 
 	count, m := binary.Uvarint(data)
 	if m <= 0 {
-		return "", 0, 0, 0, 0, nil, errors.New("cluster: malformed matcher count")
+		return "", 0, 0, spec, nil, errors.New("cluster: malformed matcher count")
 	}
 	data = data[m:]
 
@@ -79,17 +77,17 @@ func DecodeAggregateWindowRequest(data []byte) (
 	for range count {
 		var name, value string
 		if name, data, err = takeString(data); err != nil {
-			return "", 0, 0, 0, 0, nil, errors.Wrap(err, "matcher name")
+			return "", 0, 0, spec, nil, errors.Wrap(err, "matcher name")
 		}
 
 		if value, data, err = takeString(data); err != nil {
-			return "", 0, 0, 0, 0, nil, errors.Wrap(err, "matcher value")
+			return "", 0, 0, spec, nil, errors.Wrap(err, "matcher value")
 		}
 
 		eq = append(eq, fetch.EqualMatcher{Name: name, Value: value})
 	}
 
-	return tenant, start, end, step, window, eq, nil
+	return tenant, start, end, spec, eq, nil
 }
 
 // EncodeWindowAggregates serializes per-series window aggregates: a count, then per series the
@@ -126,36 +124,26 @@ func DecodeWindowAggregates(data []byte) ([]engine.NamedWindowAgg, error) {
 
 // AggregateWindowHandler returns the HTTP handler that serves an overlapping-window aggregate from
 // the local store. Mount it at [AggregateWindowPath].
+// the shared halves (body read, matcher rebuild) are already factored out.
+//
+//nolint:dupl // same shape as the sibling handler, but the decoded request types differ;
 func AggregateWindowHandler(fn AggregateWindowFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-
+		body, ok := aggregateRequestBody(w, req)
+		if !ok {
 			return
 		}
 
-		body, err := io.ReadAll(req.Body)
+		tenant, start, end, spec, eq, err := DecodeAggregateWindowRequest(body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 
 			return
-		}
-
-		tenant, start, end, step, window, eq, err := DecodeAggregateWindowRequest(body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-
-			return
-		}
-
-		matchers := make([]fetch.Matcher, len(eq))
-		for i := range eq {
-			matchers[i] = fetch.Matcher{Name: []byte(eq[i].Name), Match: eq[i].Predicate(), Spec: &eq[i]}
 		}
 
 		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace
 
-		aggs, err := fn(ctx, tenant, start, end, step, window, matchers)
+		aggs, err := fn(ctx, tenant, start, end, spec, matchersFromEq(eq))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 
@@ -166,36 +154,16 @@ func AggregateWindowHandler(fn AggregateWindowFunc) http.Handler {
 	})
 }
 
-// AggregateWindow pushes the tenant, range, step, window width and equality matchers to the peer and
+// AggregateWindow pushes the tenant, range, evaluation grid and equality matchers to the peer and
 // returns its per-series evaluation windows.
 func (a *RemoteAggregator) AggregateWindow(
-	ctx context.Context, tenant string, start, end, step, window int64, eq []fetch.EqualMatcher,
+	ctx context.Context, tenant string, start, end int64, spec engine.WindowSpec, eq []fetch.EqualMatcher,
 ) ([]engine.NamedWindowAgg, error) {
-	payload := EncodeAggregateWindowRequest(tenant, start, end, step, window, eq)
+	payload := EncodeAggregateWindowRequest(tenant, start, end, spec, eq)
 
-	u := (&url.URL{Scheme: httpScheme, Host: a.addr}).JoinPath(AggregateWindowPath)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
+	body, err := a.post(ctx, AggregateWindowPath, payload, "window aggregate")
 	if err != nil {
-		return nil, errors.Wrap(err, "build request")
-	}
-
-	obs.InjectHTTP(ctx, req.Header)
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, errors.Wrapf(err, "window aggregate from %q", a.addr)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, errors.Wrap(err, "read response")
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, errors.Errorf("cluster: %q window aggregate returned %d: %s",
-			a.addr, resp.StatusCode, bytes.TrimSpace(body))
+		return nil, err
 	}
 
 	return DecodeWindowAggregates(body)

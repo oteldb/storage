@@ -196,6 +196,11 @@ amortized.
 The decomposition is exact only when `W` is a multiple of the step; otherwise a window edge can fall
 inside a bucket, and the call falls back to sliding over the merged raw samples of each series.
 
+The grid is **anchored**: `WindowSpec.Anchor` names a timestamp on it, and windows end at
+`Anchor + k*Step`. An evaluation grid belongs to the query, not to the clock — PromQL anchors at the
+query's start, which is a multiple of the step only by coincidence — so the fine buckets are phased
+to match, since a window edge must never fall inside one. The zero value is the absolute grid.
+
 Both forms drain one internal `iter.Seq2`, so only one series' windows are resident while it is
 computed rather than series × steps of them.
 
