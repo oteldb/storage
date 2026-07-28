@@ -612,30 +612,9 @@ type SeriesAggregate struct {
 // `*_over_time` pushdown); use [Storage.AggregateMetrics] when only the aggregate is needed. Series
 // with no sample in the window are omitted.
 func (s *Storage) AggregateMetricsNamed(ctx context.Context, t signal.TenantID, r fetch.Request) ([]SeriesAggregate, error) {
-	if s.closed.Load() {
-		return nil, nil
-	}
-
-	var named []engine.NamedAgg
-	if s.cluster != nil {
-		got, err := s.clusterAggregateNamedFor(ctx, t, r, 0) // step 0 ⇒ one whole-range bucket per series
-		if err != nil {
-			return nil, err
-		}
-
-		named = got
-	} else {
-		eng, ok := s.lookupEngine(s.normalizeTenant(t))
-		if !ok {
-			return nil, nil
-		}
-
-		got, err := eng.AggregateStepNamed(ctx, r, 0)
-		if err != nil {
-			return nil, err
-		}
-
-		named = got
+	named, err := s.AggregateMetricsStepNamed(ctx, t, r, 0) // step 0 ⇒ one whole-range bucket per series
+	if err != nil {
+		return nil, err
 	}
 
 	out := make([]SeriesAggregate, 0, len(named))
@@ -649,6 +628,45 @@ func (s *Storage) AggregateMetricsNamed(ctx context.Context, t signal.TenantID, 
 	}
 
 	return out, nil
+}
+
+// AggregateMetricsStepNamed is the stepped form of [Storage.AggregateMetricsNamed]: for each
+// matching series it returns *every* step-aligned bucket in the request window in one call, rather
+// than one aggregate over the whole range. It is the series-major shape a step-grid query engine
+// wants — a range of N steps over S series costs one call, not N — and the result arrives already
+// grouped by series, so a PromQL range evaluation needs no window-major pivot (which would hold
+// O(series × steps) results resident until the last window lands).
+//
+// Buckets align to the absolute grid (multiples of step), so a range's bucketing is independent of
+// when it runs, and each series' buckets are sorted ascending by Start. step ≤ 0 collapses to a
+// single whole-range bucket, which is what [Storage.AggregateMetricsNamed] asks for. Series with no
+// sample in the window are omitted, as are empty buckets.
+//
+// Buckets are disjoint: each sample lands in exactly one. That covers `<fn>_over_time(m[W])` at a
+// step of W and every recording rule shaped like it; a range vector wider than the step (windows
+// that overlap) is not this call.
+//
+// The sidecar pushdown of [Storage.AggregateMetrics] still applies per bucket: on a pushdown-safe
+// plan a part that falls wholly inside one bucket folds from its precomputed stats with no
+// value-column decode. In cluster mode each shard's owner buckets locally and ships compact
+// per-series buckets, which the coordinator re-filters and unions.
+func (s *Storage) AggregateMetricsStepNamed(
+	ctx context.Context, t signal.TenantID, r fetch.Request, step int64,
+) ([]engine.NamedAgg, error) {
+	if s.closed.Load() {
+		return nil, nil
+	}
+
+	if s.cluster != nil {
+		return s.clusterAggregateNamedFor(ctx, t, r, step)
+	}
+
+	eng, ok := s.lookupEngine(s.normalizeTenant(t))
+	if !ok {
+		return nil, nil
+	}
+
+	return eng.AggregateStepNamed(ctx, r, step)
 }
 
 // seedFetcher is the outermost read wrapper: it installs the injected logger as the zctx base so
