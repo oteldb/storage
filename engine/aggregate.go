@@ -220,7 +220,7 @@ func (e *Engine) bucketPart(ctx context.Context, plan *enginePlan, p *part, id s
 	}
 
 	// A part wholly inside one bucket contributes entirely to it — fold its sidecar, no decode.
-	if bucketStart(p.minTime, grid.step) == bucketStart(p.maxTime, grid.step) {
+	if grid.bucketOf(p.minTime) == grid.bucketOf(p.maxTime) {
 		if st, ok := p.seriesStat(ctx, id); ok {
 			grid.mergeStat(p.minTime, st)
 

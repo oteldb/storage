@@ -176,6 +176,25 @@ costs no sort of aggregate structs. It spans the plan's *data* (parts' ranges �
 to the request), not the request, which is routinely unbounded on one side; a grid too wide to index
 densely (a fine step over a long span) falls back to a map, sized by the samples instead.
 
+### Overlapping windows
+
+`AggregateWindow`/`AggregateWindowNamed` answer the *overlapping* range-vector shape — one aggregate
+per step-aligned evaluation timestamp `t` over the half-open window `(t-W, t]`, where `W` may be
+many steps wide (a 1h range at a 5m step is a 12x overlap). Cost stays proportional to the data in
+the request, not to the overlap factor: samples fold **once** into disjoint fine buckets on the same
+`stepGrid` (so the sidecar pushdown still applies — a part inside one fine bucket never decodes),
+and a **sliding accumulator** then walks each series' buckets once, adding the bucket that enters a
+window and subtracting the one that leaves. The fine grid is **left-open** (`(b, b+step]`, unlike the
+`[b, b+step)` of `AggregateStep`) — the only convention a half-open window edge never splits.
+
+The decomposition is exact only when `W` is a multiple of the step; otherwise a window edge can fall
+inside a bucket, and the call falls back to sliding over the merged raw samples of each series. Only
+`Count`/`Sum` (hence avg) are produced — an extremum cannot be subtracted out of a running window,
+so `Min`/`Max` are `NaN` pending a monotonic-deque pass.
+
+Both forms drain one internal `iter.Seq2`, so only one series' windows are resident while it is
+computed rather than series × steps of them.
+
 ## Cluster surface
 
 `ApplyPrimary(walBytes)` OOO-checks and admission-checks each sample and returns the accepted set
