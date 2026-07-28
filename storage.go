@@ -669,6 +669,45 @@ func (s *Storage) AggregateMetricsStepNamed(
 	return eng.AggregateStepNamed(ctx, r, step)
 }
 
+// AggregateMetricsWindowNamed is the *overlapping* form of [Storage.AggregateMetricsStepNamed]: it
+// evaluates a range-vector at every step-aligned timestamp t over the half-open window (t-window, t],
+// where window may be many steps wide. That is the shape `<fn>_over_time(m[1h])` plotted at a 5m
+// step needs — a 12x overlap, where each raw sample belongs to twelve consecutive windows and the
+// disjoint buckets of AggregateMetricsStepNamed cannot express the answer.
+//
+// It costs one call per series-set, not one per evaluation point, and the work is proportional to
+// the data in the request window rather than to the overlap factor: samples fold once into disjoint
+// step-wide buckets (the sidecar pushdown still applies) and a sliding accumulator produces every
+// window from them in a single pass per series.
+//
+// Windows align to the absolute grid (End is a multiple of step) and are sorted ascending by End;
+// empty windows and series with no sample are omitted. A sample exactly at End-window is excluded,
+// one exactly at End included. Only windows ending within [r.Start, r.End] are returned and each
+// sees only the fetched data, so a caller wanting complete windows from its first evaluation point
+// must fetch a window's worth of lead-in before it, as a PromQL engine does. window ≤ 0 means
+// window = step (no overlap); step must be > 0.
+//
+// In cluster mode each shard's owner slides its own windows and ships them, and the coordinator
+// re-filters and unions — so only aggregates cross the wire, as with the stepped form.
+func (s *Storage) AggregateMetricsWindowNamed(
+	ctx context.Context, t signal.TenantID, r fetch.Request, step, window int64,
+) ([]engine.NamedWindowAgg, error) {
+	if s.closed.Load() {
+		return nil, nil
+	}
+
+	if s.cluster != nil {
+		return s.clusterAggregateWindowNamedFor(ctx, t, r, step, window)
+	}
+
+	eng, ok := s.lookupEngine(s.normalizeTenant(t))
+	if !ok {
+		return nil, nil
+	}
+
+	return eng.AggregateWindowNamed(ctx, r, step, window)
+}
+
 // seedFetcher is the outermost read wrapper: it installs the injected logger as the zctx base so
 // every downstream fetcher (fan-out, remote, engine) can log a trace-correlated line, and emits one
 // Debug at the query boundary. It does not touch the request.

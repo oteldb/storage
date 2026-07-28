@@ -2,12 +2,14 @@ package storage
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -340,10 +342,12 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	mux.Handle(primaryWritePath, s.primaryWriteHandler()) // primary: OOO apply + replicate
 	// read fan-out across metric/log/trace/profile signals.
 	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch, s.localLogFetch, s.localTraceFetch, s.localProfileFetch))
-	mux.Handle(cluster.AggregatePath, cluster.AggregateHandler(s.localAggregate)) // metric aggregate pushdown
-	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(s.localSeries))          // record-signal series enumeration (log/trace/profile)
-	mux.Handle(cluster.KeysPath, cluster.KeysHandler(s.localKeys))                // record-signal attribute-key enumeration
-	mux.Handle(cluster.SidePath, cluster.SideHandler(s.localProfileSymbols))      // profile symbol store
+	// Metric aggregate pushdown: disjoint step buckets, and the overlapping-window variant.
+	mux.Handle(cluster.AggregatePath, cluster.AggregateHandler(s.localAggregate))
+	mux.Handle(cluster.AggregateWindowPath, cluster.AggregateWindowHandler(s.localAggregateWindow))
+	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(s.localSeries))     // record-signal series enumeration (log/trace/profile)
+	mux.Handle(cluster.KeysPath, cluster.KeysHandler(s.localKeys))           // record-signal attribute-key enumeration
+	mux.Handle(cluster.SidePath, cluster.SideHandler(s.localProfileSymbols)) // profile symbol store
 	// Part mirroring for per-node private backends: peers list and fetch this node's backend
 	// objects. Mounted unconditionally (read-only; useful for operator inspection), used by the
 	// maintenance loop only when Config.PrivateBackend is set.
@@ -469,6 +473,148 @@ func (s *Storage) localAggregate(
 	return eng.AggregateStepNamed(ctx, fetch.Request{
 		Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers,
 	}, step)
+}
+
+// localAggregateWindow serves a peer's overlapping-window aggregate from the local shard engine —
+// the receiving side of [cluster.AggregateWindowHandler], the window form of [Storage.localAggregate].
+func (s *Storage) localAggregateWindow(
+	ctx context.Context, tenant string, start, end, step, window int64, matchers []fetch.Matcher,
+) ([]engine.NamedWindowAgg, error) {
+	eng, ok := s.lookupEngine(s.normalizeTenant(signal.TenantID(tenant)))
+	if !ok {
+		return nil, nil
+	}
+
+	return eng.AggregateWindowNamed(ctx, fetch.Request{
+		Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers,
+	}, step, window)
+}
+
+// clusterAggregateWindowNamedFor computes a tenant's overlapping-window aggregate across all its
+// shards, the window form of [Storage.clusterAggregateNamedFor]: each shard's owner slides its
+// own windows (keeping the sidecar pushdown local) and ships one compact entry per series, which the
+// coordinator re-checks against the full matcher set and unions. A series that surfaces from more
+// than one shard has its windows merged by evaluation timestamp — exact, since the shards hold
+// disjoint samples.
+func (s *Storage) clusterAggregateWindowNamedFor(
+	ctx context.Context, tid signal.TenantID, r fetch.Request, step, window int64,
+) ([]engine.NamedWindowAgg, error) {
+	cn := s.cluster
+	tenant := s.normalizeTenant(tid)
+	n := cn.shardCount()
+
+	var out []engine.NamedWindowAgg
+
+	index := make(map[signal.SeriesID]int, n) // id → position in out, to merge a series seen twice
+
+	for idx := range n {
+		sk := shardKeyOf(tenant, idx, n)
+
+		named, err := s.shardAggregateWindow(ctx, sk, r, step, window)
+		if err != nil {
+			return nil, err
+		}
+
+		for i := range named {
+			na := &named[i]
+			if !matchesAllSeries(na.Series, r.Matchers) {
+				continue
+			}
+
+			id := na.Series.Hash()
+			if j, ok := index[id]; ok {
+				out[j].Windows = mergeWindowLists(out[j].Windows, na.Windows)
+			} else {
+				index[id] = len(out)
+				out = append(out, engine.NamedWindowAgg{Series: na.Series, Windows: na.Windows})
+			}
+		}
+	}
+
+	return out, nil
+}
+
+// shardAggregateWindow gets one metric shard's per-series windows: locally (full matcher pushdown)
+// if this node owns it, else from a remote owner with sequential failover.
+func (s *Storage) shardAggregateWindow(
+	ctx context.Context, shardKey signal.TenantID, r fetch.Request, step, window int64,
+) ([]engine.NamedWindowAgg, error) {
+	cn := s.cluster
+	owners := s.ownerLookup(shardKey)
+
+	for _, o := range owners {
+		if cn.membership.AddrOf(o.ID) == cn.self { // owner: serve locally
+			eng, ok := s.lookupEngine(shardKey)
+			if !ok {
+				return nil, nil // owner, no data yet
+			}
+
+			return eng.AggregateWindowNamed(ctx, fetch.Request{
+				Tenant: shardKey, Start: r.Start, End: r.End, Matchers: r.Matchers,
+			}, step, window)
+		}
+	}
+
+	eq := equalityMatchers(r.Matchers)
+
+	var lastErr error
+
+	for _, o := range owners {
+		addr := cn.membership.AddrOf(o.ID)
+		if addr == "" || addr == cn.self {
+			continue
+		}
+
+		named, err := cluster.NewRemoteAggregator(addr, cn.httpc).
+			AggregateWindow(ctx, string(shardKey), r.Start, r.End, step, window, eq)
+		if err == nil {
+			return named, nil
+		}
+
+		lastErr = err
+	}
+
+	return nil, lastErr // nil when there were no reachable owners (treated as no data)
+}
+
+// mergeWindowLists combines two per-series window lists by aligned evaluation timestamp, summing
+// counts/sums and taking min/max — used only where a series surfaces from more than one shard. Each
+// input window is non-empty (Count > 0), so its Min/Max are valid.
+func mergeWindowLists(a, b []engine.WindowAgg) []engine.WindowAgg {
+	byEnd := make(map[int64]engine.SeriesAgg, len(a)+len(b))
+
+	fold := func(x engine.WindowAgg) {
+		e, ok := byEnd[x.End]
+		if !ok {
+			byEnd[x.End] = x.SeriesAgg
+
+			return
+		}
+
+		byEnd[x.End] = engine.SeriesAgg{
+			Count: e.Count + x.Count,
+			Sum:   e.Sum + x.Sum,
+			Min:   min(e.Min, x.Min),
+			Max:   max(e.Max, x.Max),
+		}
+	}
+
+	for _, x := range a {
+		fold(x)
+	}
+
+	for _, x := range b {
+		fold(x)
+	}
+
+	out := make([]engine.WindowAgg, 0, len(byEnd))
+	for end, agg := range byEnd {
+		out = append(out, engine.WindowAgg{End: end, SeriesAgg: agg})
+	}
+
+	slices.SortFunc(out, func(x, y engine.WindowAgg) int { return cmp.Compare(x.End, y.End) })
+
+	return out
 }
 
 // clusterAggregateFor computes a tenant's step-bucketed aggregate across all its shards in cluster

@@ -66,6 +66,15 @@ spec, forwarded and pushed down on the peer, so a non-owner read narrows by `__n
 pulling the whole window. Enumeration RPCs (series, keys, side store, aggregate) fan out the same
 hedged way.
 
+The metric **aggregate pushdown** has two endpoints: `/internal/aggregate` returns disjoint step
+buckets, `/internal/aggregate/window` the overlapping evaluation windows of a range vector. Both
+ship one compact entry per series — identity + aggregates, never raw samples — which the coordinator
+re-filters against the full matcher set and unions, merging by bucket start / evaluation timestamp
+where a series surfaces from more than one shard (exact, since shards hold disjoint samples). They
+are deliberately **separate paths** rather than one widened request: a peer that predates windows
+answers 404, which fails over, instead of silently returning disjoint buckets for an overlapping
+question.
+
 ## Sharding
 
 `Config.ShardsPerTenant` splits a tenant into N shards; a series/stream maps to
