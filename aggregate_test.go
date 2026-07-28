@@ -272,6 +272,128 @@ func TestAggregateMetricsStepNamedUnknownTenant(t *testing.T) {
 	assert.Empty(t, got)
 }
 
+// TestAggregateMetricsWindowNamed checks the overlapping facade against the narrowed whole-range
+// calls it replaces: each window must equal an aggregate over exactly (End-window, End], which is
+// also what makes the half-open boundary visible.
+func TestAggregateMetricsWindowNamed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()), WithAggregateStats())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close(ctx)) }()
+
+	const series = 8
+
+	_, err = s.WriteMetrics(ctx, buildCorpus(corpusProfile{
+		name: "c", series: series, points: 50, interval: 15_000_000_000, pattern: patCounter,
+	}, 1))
+	require.NoError(t, err)
+	require.NoError(t, mustEngine(s.engineFor("default")).Flush(ctx))
+
+	req := fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{nameMatcher("bench.metric")}}
+
+	const window = 4 * aggStep // a 4x overlap at the step
+
+	got, err := s.AggregateMetricsWindowNamed(ctx, "default", req, engine.WindowSpec{Step: aggStep, Window: window})
+	require.NoError(t, err)
+	require.Len(t, got, series, "one entry per series")
+
+	for _, na := range got {
+		require.NotEmpty(t, na.Windows)
+
+		for i, w := range na.Windows {
+			if i > 0 {
+				assert.Greater(t, w.End, na.Windows[i-1].End, "windows sorted ascending by end")
+			}
+
+			assert.Zero(t, w.End%aggStep, "windows align to the absolute grid")
+
+			// The N-call form this replaces: one whole-range aggregate over (End-window, End].
+			perWindow, err := s.AggregateMetricsNamed(ctx, "default",
+				fetch.Request{Start: w.End - window + 1, End: w.End, Matchers: req.Matchers})
+			require.NoError(t, err)
+
+			want, ok := findAggregate(perWindow, na.Series.Hash())
+			require.Truef(t, ok, "series absent from the narrowed window ending at %d", w.End)
+			assert.InDeltaf(t, want.Sum, w.Sum, 1e-6, "window ending %d sum", w.End)
+			assert.Equalf(t, want.Count, w.Count, "window ending %d count", w.End)
+			assert.InDeltaf(t, want.Min, w.Min, 0, "window ending %d min", w.End)
+			assert.InDeltaf(t, want.Max, w.Max, 0, "window ending %d max", w.End)
+		}
+	}
+}
+
+// TestAggregateMetricsWindowNamedDegenerate checks window ≤ 0 reduces to the disjoint stepped form,
+// and that a non-positive step is rejected rather than silently reinterpreted.
+func TestAggregateMetricsWindowNamedDegenerate(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	s, err := Open(ctx, Options{}, WithBackend(backend.Memory()), WithAggregateStats())
+	require.NoError(t, err)
+
+	_, err = s.WriteMetrics(ctx, buildCorpus(corpusProfile{
+		name: "c", series: 4, points: 50, interval: 15_000_000_000, pattern: patCounter,
+	}, 1))
+	require.NoError(t, err)
+	require.NoError(t, mustEngine(s.engineFor("default")).Flush(ctx))
+
+	req := fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{nameMatcher("bench.metric")}}
+
+	stepped, err := s.AggregateMetricsStepNamed(ctx, "default", req, aggStep)
+	require.NoError(t, err)
+
+	windowed, err := s.AggregateMetricsWindowNamed(ctx, "default", req, engine.WindowSpec{Step: aggStep, Window: 0})
+	require.NoError(t, err)
+	require.Len(t, windowed, len(stepped))
+
+	// Buckets are [b, b+step); windows at window == step are (t-step, t]. Both partition the samples
+	// exactly once, so their folds agree — but they are not bucket-for-bucket identical: a sample
+	// exactly on a grid multiple (the corpus epoch is one) closes the window ending there instead of
+	// opening the bucket starting there, which can add one window at the head.
+	folded := map[signal.SeriesID]engine.SeriesAgg{}
+	count := map[signal.SeriesID]int{}
+
+	for _, na := range windowed {
+		var a engine.SeriesAgg
+		for _, w := range na.Windows {
+			foldAgg(&a, w.SeriesAgg)
+		}
+
+		folded[na.Series.Hash()] = a
+		count[na.Series.Hash()] = len(na.Windows)
+	}
+
+	for _, na := range stepped {
+		var a engine.SeriesAgg
+		for _, b := range na.Buckets {
+			foldAgg(&a, b.SeriesAgg)
+		}
+
+		got := folded[na.Series.Hash()]
+		assert.Equal(t, a.Count, got.Count, "window == step partitions the samples exactly once")
+		assert.InDelta(t, a.Sum, got.Sum, 1e-6)
+		assert.InDelta(t, a.Min, got.Min, 0)
+		assert.InDelta(t, a.Max, got.Max, 0)
+		assert.LessOrEqual(t, count[na.Series.Hash()]-len(na.Buckets), 1, "at most one extra window at the head")
+	}
+
+	_, err = s.AggregateMetricsWindowNamed(ctx, "default", req, engine.WindowSpec{Step: 0, Window: aggStep})
+	require.Error(t, err, "a stepped window has no evaluation grid without a step")
+
+	// An unknown tenant, and a closed store, yield no results rather than an error.
+	got, err := s.AggregateMetricsWindowNamed(ctx, "nosuch", req, engine.WindowSpec{Step: aggStep, Window: aggStep})
+	require.NoError(t, err)
+	assert.Empty(t, got)
+
+	require.NoError(t, s.Close(ctx))
+
+	got, err = s.AggregateMetricsWindowNamed(ctx, "default", req, engine.WindowSpec{Step: aggStep, Window: aggStep})
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
 // findAggregate looks a series' whole-range aggregate up by identity hash.
 func findAggregate(list []SeriesAggregate, id signal.SeriesID) (engine.SeriesAgg, bool) {
 	for i := range list {

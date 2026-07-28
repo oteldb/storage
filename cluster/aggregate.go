@@ -110,11 +110,7 @@ func EncodeAggregates(aggs []engine.NamedAgg) []byte {
 
 		buf = binary.AppendUvarint(buf, uint64(len(a.Buckets)))
 		for _, bk := range a.Buckets {
-			buf = binary.AppendVarint(buf, bk.Start)
-			buf = binary.AppendVarint(buf, bk.Count)
-			buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(bk.Sum))
-			buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(bk.Min))
-			buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(bk.Max))
+			buf = appendPointAgg(buf, bk.Start, bk.SeriesAgg)
 		}
 	}
 
@@ -124,82 +120,157 @@ func EncodeAggregates(aggs []engine.NamedAgg) []byte {
 // DecodeAggregates parses an [EncodeAggregates] payload. It bounds-checks every length before
 // slicing, so it never panics on a malformed or truncated response.
 func DecodeAggregates(data []byte) ([]engine.NamedAgg, error) {
+	return decodeNamedAggs(data,
+		func(start int64, a engine.SeriesAgg) engine.BucketAgg {
+			return engine.BucketAgg{Start: start, SeriesAgg: a}
+		},
+		func(s signal.Series, buckets []engine.BucketAgg) engine.NamedAgg {
+			return engine.NamedAgg{Series: s, Buckets: buckets}
+		})
+}
+
+// decodeNamedAggs parses the payload shape both aggregate RPCs share — a series count, then per
+// series an envelope and its keyed aggregates — building each point with point and each entry with
+// series. The two differ only in what a key means (bucket start vs evaluation timestamp), so the
+// framing lives here once.
+func decodeNamedAggs[P, T any](
+	data []byte,
+	point func(key int64, a engine.SeriesAgg) P,
+	series func(signal.Series, []P) T,
+) ([]T, error) {
 	n, m := binary.Uvarint(data)
 	if m <= 0 {
 		return nil, errors.New("cluster: malformed aggregate count")
 	}
 	data = data[m:]
 
-	out := make([]engine.NamedAgg, 0, min(n, uint64(len(data))))
+	out := make([]T, 0, min(n, uint64(len(data))))
+
 	for range n {
-		sl, m := binary.Uvarint(data)
-		if m <= 0 || sl > uint64(len(data)-m) {
-			return nil, errors.New("cluster: malformed series length")
-		}
-		data = data[m:]
-
-		s, _, err := signal.DecodeSeries(data[:sl])
+		s, pn, rest, err := takeSeriesEnvelope(data)
 		if err != nil {
-			return nil, errors.Wrap(err, "decode series")
+			return nil, err
 		}
-		data = data[sl:]
+		data = rest
 
-		bn, m := binary.Uvarint(data)
-		if m <= 0 {
-			return nil, errors.New("cluster: malformed bucket count")
-		}
-		data = data[m:]
+		points := make([]P, 0, min(pn, uint64(len(data))))
 
-		buckets := make([]engine.BucketAgg, 0, min(bn, uint64(len(data))))
-		for range bn {
-			start, mm := binary.Varint(data)
-			if mm <= 0 {
-				return nil, errors.New("cluster: malformed bucket start")
-			}
-			data = data[mm:]
-
-			count, mm := binary.Varint(data)
-			if mm <= 0 {
-				return nil, errors.New("cluster: malformed bucket count value")
-			}
-			data = data[mm:]
-
-			if len(data) < 24 {
-				return nil, errors.New("cluster: truncated bucket")
+		for range pn {
+			key, agg, rest, err := takePointAgg(data)
+			if err != nil {
+				return nil, err
 			}
 
-			buckets = append(buckets, engine.BucketAgg{
-				Start: start,
-				SeriesAgg: engine.SeriesAgg{
-					Count: count,
-					Sum:   math.Float64frombits(binary.BigEndian.Uint64(data[:8])),
-					Min:   math.Float64frombits(binary.BigEndian.Uint64(data[8:16])),
-					Max:   math.Float64frombits(binary.BigEndian.Uint64(data[16:24])),
-				},
-			})
-			data = data[24:]
+			points = append(points, point(key, agg))
+			data = rest
 		}
 
-		out = append(out, engine.NamedAgg{Series: s, Buckets: buckets})
+		out = append(out, series(s, points))
 	}
 
 	return out, nil
 }
 
+// takeSeriesEnvelope parses the per-series header both aggregate payloads share — [uvarint len]
+// [series hash pre-image][uvarint count] — returning the identity and how many aggregates follow.
+func takeSeriesEnvelope(data []byte) (s signal.Series, n uint64, rest []byte, err error) {
+	sl, m := binary.Uvarint(data)
+	if m <= 0 || sl > uint64(len(data)-m) {
+		return s, 0, nil, errors.New("cluster: malformed series length")
+	}
+	data = data[m:]
+
+	s, _, err = signal.DecodeSeries(data[:sl])
+	if err != nil {
+		return s, 0, nil, errors.Wrap(err, "decode series")
+	}
+	data = data[sl:]
+
+	n, m = binary.Uvarint(data)
+	if m <= 0 {
+		return s, 0, nil, errors.New("cluster: malformed aggregate count")
+	}
+
+	return s, n, data[m:], nil
+}
+
+// appendPointAgg appends one keyed aggregate — [varint key][varint count][f64 sum][f64 min][f64 max].
+// The key is a bucket start ([engine.BucketAgg]) or an evaluation timestamp ([engine.WindowAgg]);
+// the two aggregate shapes share this body.
+func appendPointAgg(buf []byte, key int64, a engine.SeriesAgg) []byte {
+	buf = binary.AppendVarint(buf, key)
+	buf = binary.AppendVarint(buf, a.Count)
+	buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(a.Sum))
+	buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(a.Min))
+
+	return binary.BigEndian.AppendUint64(buf, math.Float64bits(a.Max))
+}
+
+// takePointAgg parses one aggregate written by [appendPointAgg], bounds-checking before it slices.
+func takePointAgg(data []byte) (key int64, a engine.SeriesAgg, rest []byte, err error) {
+	key, m := binary.Varint(data)
+	if m <= 0 {
+		return 0, a, nil, errors.New("cluster: malformed key")
+	}
+	data = data[m:]
+
+	count, m := binary.Varint(data)
+	if m <= 0 {
+		return 0, a, nil, errors.New("cluster: malformed count")
+	}
+	data = data[m:]
+
+	if len(data) < 24 {
+		return 0, a, nil, errors.New("cluster: truncated aggregate")
+	}
+
+	return key, engine.SeriesAgg{
+		Count: count,
+		Sum:   math.Float64frombits(binary.BigEndian.Uint64(data[:8])),
+		Min:   math.Float64frombits(binary.BigEndian.Uint64(data[8:16])),
+		Max:   math.Float64frombits(binary.BigEndian.Uint64(data[16:24])),
+	}, data[24:], nil
+}
+
+// aggregateRequestBody reads a POST body for an aggregate endpoint, writing the error response
+// itself and reporting false when the request is unusable. Both aggregate handlers start here.
+func aggregateRequestBody(w http.ResponseWriter, req *http.Request) ([]byte, bool) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
+		return nil, false
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+
+		return nil, false
+	}
+
+	return body, true
+}
+
+// matchersFromEq rebuilds the pushed-down equality predicates a peer can apply locally. The Spec
+// rides along so a further hop keeps the pushdown.
+func matchersFromEq(eq []fetch.EqualMatcher) []fetch.Matcher {
+	matchers := make([]fetch.Matcher, len(eq))
+	for i := range eq {
+		matchers[i] = fetch.Matcher{Name: []byte(eq[i].Name), Match: eq[i].Predicate(), Spec: &eq[i]}
+	}
+
+	return matchers
+}
+
 // AggregateHandler returns the HTTP handler that serves an aggregate from the local store. Mount it
 // at [AggregatePath].
+// the shared halves (body read, matcher rebuild) are already factored out.
+//
+//nolint:dupl // same shape as the sibling handler, but the decoded request types differ;
 func AggregateHandler(fn AggregateFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-
-			return
-		}
-
-		body, err := io.ReadAll(req.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-
+		body, ok := aggregateRequestBody(w, req)
+		if !ok {
 			return
 		}
 
@@ -210,14 +281,9 @@ func AggregateHandler(fn AggregateFunc) http.Handler {
 			return
 		}
 
-		matchers := make([]fetch.Matcher, len(eq))
-		for i := range eq {
-			matchers[i] = fetch.Matcher{Name: []byte(eq[i].Name), Match: eq[i].Predicate(), Spec: &eq[i]}
-		}
-
 		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace
 
-		aggs, err := fn(ctx, tenant, start, end, step, matchers)
+		aggs, err := fn(ctx, tenant, start, end, step, matchersFromEq(eq))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 
@@ -249,9 +315,19 @@ func NewRemoteAggregator(addr string, client *http.Client) *RemoteAggregator {
 func (a *RemoteAggregator) Aggregate(
 	ctx context.Context, tenant string, start, end, step int64, eq []fetch.EqualMatcher,
 ) ([]engine.NamedAgg, error) {
-	payload := EncodeAggregateRequest(tenant, start, end, step, eq)
+	body, err := a.post(ctx, AggregatePath, EncodeAggregateRequest(tenant, start, end, step, eq), "aggregate")
+	if err != nil {
+		return nil, err
+	}
 
-	u := (&url.URL{Scheme: httpScheme, Host: a.addr}).JoinPath(AggregatePath)
+	return DecodeAggregates(body)
+}
+
+// post sends payload to the peer's path, joining the caller's trace, and returns the response body.
+// what names the operation in any error.
+func (a *RemoteAggregator) post(ctx context.Context, path string, payload []byte, what string) ([]byte, error) {
+	u := (&url.URL{Scheme: httpScheme, Host: a.addr}).JoinPath(path)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
 	if err != nil {
 		return nil, errors.Wrap(err, "build request")
@@ -261,7 +337,7 @@ func (a *RemoteAggregator) Aggregate(
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return nil, errors.Wrapf(err, "aggregate from %q", a.addr)
+		return nil, errors.Wrapf(err, "%s from %q", what, a.addr)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -271,8 +347,8 @@ func (a *RemoteAggregator) Aggregate(
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.Errorf("cluster: %q aggregate returned %d: %s", a.addr, resp.StatusCode, bytes.TrimSpace(body))
+		return nil, errors.Errorf("cluster: %q %s returned %d: %s", a.addr, what, resp.StatusCode, bytes.TrimSpace(body))
 	}
 
-	return DecodeAggregates(body)
+	return body, nil
 }

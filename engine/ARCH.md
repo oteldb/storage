@@ -176,6 +176,34 @@ costs no sort of aggregate structs. It spans the plan's *data* (parts' ranges �
 to the request), not the request, which is routinely unbounded on one side; a grid too wide to index
 densely (a fine step over a long span) falls back to a map, sized by the samples instead.
 
+### Overlapping windows
+
+`AggregateWindow`/`AggregateWindowNamed` answer the *overlapping* range-vector shape — one aggregate
+per step-aligned evaluation timestamp `t` over the half-open window `(t-W, t]`, where `W` may be
+many steps wide (a 1h range at a 5m step is a 12x overlap). Cost stays proportional to the data in
+the request, not to the overlap factor: samples fold **once** into disjoint fine buckets on the same
+`stepGrid` (so the sidecar pushdown still applies — a part inside one fine bucket never decodes),
+and a **sliding accumulator** then walks each series' buckets once, adding the bucket that enters a
+window and subtracting the one that leaves. The fine grid is **left-open** (`(b, b+step]`, unlike the
+`[b, b+step)` of `AggregateStep`) — the only convention a half-open window edge never splits.
+
+Count and sum slide by arithmetic; an extremum cannot be subtracted back out (dropping the current
+minimum would force a rescan), so min/max ride **monotonic deques** of entry indices — an arrival
+pops every tail entry it dominates, since such an entry is no better *and* expires no later, leaving
+the front as the window's answer. Each entry is pushed and popped once, so a step stays O(1)
+amortized.
+
+The decomposition is exact only when `W` is a multiple of the step; otherwise a window edge can fall
+inside a bucket, and the call falls back to sliding over the merged raw samples of each series.
+
+The grid is **anchored**: `WindowSpec.Anchor` names a timestamp on it, and windows end at
+`Anchor + k*Step`. An evaluation grid belongs to the query, not to the clock — PromQL anchors at the
+query's start, which is a multiple of the step only by coincidence — so the fine buckets are phased
+to match, since a window edge must never fall inside one. The zero value is the absolute grid.
+
+Both forms drain one internal `iter.Seq2`, so only one series' windows are resident while it is
+computed rather than series × steps of them.
+
 ## Cluster surface
 
 `ApplyPrimary(walBytes)` OOO-checks and admission-checks each sample and returns the accepted set

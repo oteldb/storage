@@ -24,6 +24,7 @@ import (
 	"github.com/oteldb/storage/backend/s3"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
+	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	qprofile "github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
@@ -182,6 +183,73 @@ func TestClusterPerSeriesShardingSpreadsAndGathers(t *testing.T) {
 		s.tmu.Unlock()
 	}
 	assert.Greaterf(t, total, shards, "shards are replicated across nodes (%d engine instances over %d shards)", total, shards)
+}
+
+// TestClusterAggregateWindowGathersAcrossShards exercises the overlapping-window pushdown across
+// the network: series are spread over shards owned by different nodes, so every node answering the
+// query must gather from remote owners over [cluster.AggregateWindowPath] and union the result.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterAggregateWindowGathersAcrossShards(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	const (
+		shards  = 4
+		nSeries = 12
+		step    = int64(100)
+		window  = 4 * step // a 4x overlap
+	)
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodeSharded(t, endpoint, "node-a", shards),
+		"node-b": openClusterNodeSharded(t, endpoint, "node-b", shards),
+		"node-c": openClusterNodeSharded(t, endpoint, "node-c", shards),
+	}
+	a := nodes["node-a"]
+
+	require.Eventually(t, func() bool {
+		return len(a.cluster.membership.Members()) == 3
+	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+
+	// Four samples per series, one per step, so every series has overlapping windows to slide.
+	ts := []int64{50, 150, 250, 350}
+
+	names := make([]string, nSeries)
+	for i := range names {
+		names[i] = "metric_" + strconv.Itoa(i)
+		_, err := a.WriteMetrics(ctx, gaugeBatch("svc", names[i], ts, []float64{1, 2, 3, 4}))
+		require.NoError(t, err)
+	}
+
+	req := fetch.Request{Start: 0, End: 400, Matchers: []fetch.Matcher{nameMatcher("metric_0")}}
+
+	for name, s := range nodes {
+		got, err := s.AggregateMetricsWindowNamed(ctx, "default", req, engine.WindowSpec{Step: step, Window: window})
+		require.NoErrorf(t, err, "%s aggregates windows across shards", name)
+		require.Lenf(t, got, 1, "%s finds the series", name)
+
+		// Windows at 100..400 over (t-400, t]: the samples accumulate, none has expired by 400.
+		want := []engine.WindowAgg{
+			{End: 100, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 1, Min: 1, Max: 1}},
+			{End: 200, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 3, Min: 1, Max: 2}},
+			{End: 300, SeriesAgg: engine.SeriesAgg{Count: 3, Sum: 6, Min: 1, Max: 3}},
+			{End: 400, SeriesAgg: engine.SeriesAgg{Count: 4, Sum: 10, Min: 1, Max: 4}},
+		}
+		assert.Equalf(t, want, got[0].Windows, "%s", name)
+	}
+
+	// Every series is answerable from every node, whichever shard owns it.
+	for name, s := range nodes {
+		for _, m := range names {
+			got, err := s.AggregateMetricsWindowNamed(ctx, "default", fetch.Request{
+				Start: 0, End: 400, Matchers: []fetch.Matcher{nameMatcher(m)},
+			}, engine.WindowSpec{Step: step, Window: window})
+			require.NoErrorf(t, err, "%s: %s", name, m)
+			require.Lenf(t, got, 1, "%s reads %s across shards", name, m)
+			assert.Lenf(t, got[0].Windows, 4, "%s: %s", name, m)
+		}
+	}
 }
 
 // sharedS3 starts one in-process S3 server and returns a factory of backends over the same

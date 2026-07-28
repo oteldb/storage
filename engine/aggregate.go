@@ -19,22 +19,8 @@ import (
 //
 // Series with no sample in the window are omitted from the result.
 func (e *Engine) AggregateRange(ctx context.Context, r fetch.Request) (map[signal.SeriesID]SeriesAgg, error) {
-	e.mu.RLock()
-	for !e.head.indexSorted() {
-		e.mu.RUnlock()
-		e.mu.Lock()
-		e.head.ensureIndexSorted()
-		e.mu.Unlock()
-		e.mu.RLock()
-	}
-
-	ids := e.head.resolve(r.Matchers)
-	plan := e.planFetch(ids, r)
-	e.mu.RUnlock()
-
+	ids, plan := e.planAggregate(r)
 	defer plan.releaseParts()
-
-	plan.acquireDecodeBudget(colNeed{values: true})
 	safe := aggPushdownSafe(plan)
 
 	out := make(map[signal.SeriesID]SeriesAgg, len(ids))
@@ -63,6 +49,31 @@ func (e *Engine) AggregateRange(ctx context.Context, r fetch.Request) (map[signa
 	return out, nil
 }
 
+// planAggregate resolves r's matched ids and builds the fetch plan for an aggregate read, reserving
+// the value column the fold needs. It is the aggregate counterpart of [Engine.planCount], and it
+// owns the read lock's whole lifetime: the label index sorts lazily on the first read after a write,
+// so it holds the shared lock and, while the index is still unsorted, upgrades to sort and re-checks
+// — once it holds the read lock over a sorted index no writer can be running. The caller must
+// releaseParts.
+func (e *Engine) planAggregate(r fetch.Request) ([]signal.SeriesID, *enginePlan) {
+	e.mu.RLock()
+	for !e.head.indexSorted() {
+		e.mu.RUnlock()
+		e.mu.Lock()
+		e.head.ensureIndexSorted()
+		e.mu.Unlock()
+		e.mu.RLock()
+	}
+
+	ids := e.head.resolve(r.Matchers)
+	plan := e.planFetch(ids, r)
+	e.mu.RUnlock()
+
+	plan.acquireDecodeBudget(colNeed{values: true})
+
+	return ids, plan
+}
+
 // BucketAgg is one step-aligned bucket's aggregate for a series: the bucket's start timestamp and
 // the count/sum/min/max of the samples that fall in it.
 type BucketAgg struct {
@@ -82,22 +93,8 @@ type BucketAgg struct {
 // part's sidecar without decoding. Parts that straddle buckets, or an unsafe plan, decode (and an
 // unsafe plan merges first, to dedup by timestamp).
 func (e *Engine) AggregateStep(ctx context.Context, r fetch.Request, step int64) (map[signal.SeriesID][]BucketAgg, error) {
-	e.mu.RLock()
-	for !e.head.indexSorted() {
-		e.mu.RUnlock()
-		e.mu.Lock()
-		e.head.ensureIndexSorted()
-		e.mu.Unlock()
-		e.mu.RLock()
-	}
-
-	ids := e.head.resolve(r.Matchers)
-	plan := e.planFetch(ids, r)
-	e.mu.RUnlock()
-
+	ids, plan := e.planAggregate(r)
 	defer plan.releaseParts()
-
-	plan.acquireDecodeBudget(colNeed{values: true})
 	safe := aggPushdownSafe(plan)
 
 	out := make(map[signal.SeriesID][]BucketAgg, len(ids))
@@ -127,22 +124,8 @@ type NamedAgg struct {
 // buckets, for the cluster aggregate RPC (a peer pushes the aggregate down and ships identities so
 // the coordinator can re-filter and union).
 func (e *Engine) AggregateStepNamed(ctx context.Context, r fetch.Request, step int64) ([]NamedAgg, error) {
-	e.mu.RLock()
-	for !e.head.indexSorted() {
-		e.mu.RUnlock()
-		e.mu.Lock()
-		e.head.ensureIndexSorted()
-		e.mu.Unlock()
-		e.mu.RLock()
-	}
-
-	ids := e.head.resolve(r.Matchers)
-	plan := e.planFetch(ids, r)
-	e.mu.RUnlock()
-
+	ids, plan := e.planAggregate(r)
 	defer plan.releaseParts()
-
-	plan.acquireDecodeBudget(colNeed{values: true})
 	safe := aggPushdownSafe(plan)
 
 	out := make([]NamedAgg, 0, len(ids))
@@ -220,7 +203,7 @@ func (e *Engine) bucketPart(ctx context.Context, plan *enginePlan, p *part, id s
 	}
 
 	// A part wholly inside one bucket contributes entirely to it — fold its sidecar, no decode.
-	if bucketStart(p.minTime, grid.step) == bucketStart(p.maxTime, grid.step) {
+	if grid.bucketOf(p.minTime) == grid.bucketOf(p.maxTime) {
 		if st, ok := p.seriesStat(ctx, id); ok {
 			grid.mergeStat(p.minTime, st)
 

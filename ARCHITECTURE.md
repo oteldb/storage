@@ -63,9 +63,11 @@ engines over the fetch seam (`query/fetch`).
 - **Read** — `Fetcher(tenants...)` and the per-signal variants return a `fetch.Fetcher` over
   head ∪ parts; no tenants ⇒ all (cross-tenant fan-out, merged by series id). Plus the
   convenience/enumeration primitives: `Trace`, `LogsForTrace`, `LogSeries`, `LogKeys`,
-  `ProfileSeries`, `ProfileResolver`, `AggregateMetrics{,Named,StepNamed}` — the last is the
-  series-major stepped form (every step bucket for every series in one call), so a step-grid
-  range query costs one call rather than one per step.
+  `ProfileSeries`, `ProfileResolver`, `AggregateMetrics{,Named,StepNamed,WindowNamed}` — the last
+  two are series-major (every step bucket, or every evaluation window, for every series in one
+  call), so a step-grid range query costs one call rather than one per step. `WindowNamed` is the
+  overlapping form: a window wider than the step (a 1h range at a 5m step) at a cost proportional
+  to the data, not to the overlap.
 - **Maintenance** — one background loop flushes+merges every (tenant, signal) engine on
   `FlushInterval`, concurrently under a bound, ordered by head pressure. A head-bytes
   threshold pokes it early. A durable store always runs it (an unbounded head OOMs).

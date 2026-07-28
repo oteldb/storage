@@ -2,6 +2,7 @@ package engine
 
 import (
 	"cmp"
+	"math"
 	"slices"
 )
 
@@ -28,34 +29,77 @@ type stepGrid struct {
 	touched []int32     // indices of the non-empty slots of the series being accumulated
 
 	sparse map[int64]SeriesAgg // bucket start → aggregate; nil ⇒ use slots
+
+	// openLeft makes buckets (b, b+step] instead of [b, b+step). The window path needs it: a PromQL
+	// range vector's window is half-open on the left, so only left-open fine buckets are never split
+	// by a window edge.
+	openLeft bool
+
+	// phase shifts the grid off the absolute one: bucket edges sit at phase + k*step rather than at
+	// multiples of step. Always in [0, step). An evaluation grid is anchored at the query's start,
+	// which is rarely a multiple of the step, and a fine bucket must not straddle a window edge.
+	phase int64
 }
 
-// newStepGrid sizes a grid for the plan's data span at the given step. step ≤ 0 collapses to a
-// single bucket at 0, matching [bucketStart].
+// newStepGrid sizes a grid for the plan's data span at the given step, with buckets [b, b+step).
+// step ≤ 0 collapses to a single bucket at 0, matching [bucketStart].
 func newStepGrid(plan *enginePlan, step int64) *stepGrid {
+	return newBucketGrid(plan, step, false, 0)
+}
+
+// newWindowGrid is [newStepGrid] with left-open buckets (b, b+step] on the evaluation grid anchored
+// at phase — the fine grid the sliding range-vector accumulator folds, so that a window (t-W, t] is
+// exactly the union of W/step of them, none of which a window edge splits.
+func newWindowGrid(plan *enginePlan, step, phase int64) *stepGrid {
+	return newBucketGrid(plan, step, true, phase)
+}
+
+func newBucketGrid(plan *enginePlan, step int64, openLeft bool, phase int64) *stepGrid {
 	if step <= 0 {
 		return &stepGrid{slots: make([]SeriesAgg, 1)}
 	}
 
+	g := &stepGrid{step: step, openLeft: openLeft, phase: phase}
+
 	lo, hi, ok := planDataSpan(plan)
 	if !ok {
-		return &stepGrid{step: step, slots: make([]SeriesAgg, 1)} // nothing in window; nothing will be added
+		g.slots = make([]SeriesAgg, 1) // nothing in window; nothing will be added
+
+		return g
 	}
 
-	first := bucketStart(lo, step)
-	n := (bucketStart(hi, step)-first)/step + 1
+	g.first = g.bucketOf(lo)
+	n := (g.bucketOf(hi)-g.first)/step + 1
 
 	if n > maxDenseBuckets {
-		return &stepGrid{first: first, step: step, sparse: map[int64]SeriesAgg{}}
+		g.sparse = map[int64]SeriesAgg{}
+
+		return g
 	}
 
-	return &stepGrid{first: first, step: step, slots: make([]SeriesAgg, n)}
+	g.slots = make([]SeriesAgg, n)
+
+	return g
+}
+
+// bucketOf returns the key of the bucket holding ts: [b, b+step) normally, (b, b+step] on a
+// left-open grid, with edges at phase + k*step.
+func (g *stepGrid) bucketOf(ts int64) int64 {
+	if g.openLeft && ts != math.MinInt64 {
+		ts--
+	}
+
+	if g.phase == 0 {
+		return bucketStart(ts, g.step)
+	}
+
+	return g.phase + bucketStart(ts-g.phase, g.step)
 }
 
 // addSample folds one sample into its bucket.
 func (g *stepGrid) addSample(ts int64, v float64) {
 	if g.sparse != nil {
-		bs := bucketStart(ts, g.step)
+		bs := g.bucketOf(ts)
 		a := g.sparse[bs]
 		a.addSample(v)
 		g.sparse[bs] = a
@@ -81,7 +125,7 @@ func (g *stepGrid) mergeStat(ts int64, st SeriesAgg) {
 	}
 
 	if g.sparse != nil {
-		bs := bucketStart(ts, g.step)
+		bs := g.bucketOf(ts)
 		a := g.sparse[bs]
 		a.merge(st)
 		g.sparse[bs] = a
@@ -148,7 +192,7 @@ func (g *stepGrid) indexOf(ts int64) int32 {
 		return 0
 	}
 
-	return int32((bucketStart(ts, g.step) - g.first) / g.step)
+	return int32((g.bucketOf(ts) - g.first) / g.step)
 }
 
 // slot returns the dense slot for ts. A timestamp outside the grid cannot occur — the grid spans
