@@ -77,6 +77,10 @@ func (f *Filter) AddHashes(h1, h2 uint64) {
 // reproduces exactly the same filter.
 func Hashes(item []byte) (h1, h2 uint64) { return hashes(item) }
 
+// Bytes returns the size of the filter's bit array, which is what a decoded filter costs in memory
+// (the rest of the struct is two words). For a cache that bounds itself by resident bytes.
+func (f *Filter) Bytes() int { return len(f.bits) * 8 }
+
 // Test reports whether item may be present: true if every probe bit is set (possibly a false
 // positive), false if any is clear (definitely absent — no false negatives).
 func (f *Filter) Test(item []byte) bool {

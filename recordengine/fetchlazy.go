@@ -347,6 +347,16 @@ func (c *recordCols) appendLazyRow(lz *lazyCols, i int) {
 // applies the conditions to the head-seeded prefix only (part rows already pass by construction).
 func (p *fetchPlan) readPartsLazy(ctx context.Context) error {
 	for _, part := range p.liveParts {
+		// Substring pruning happens here rather than in the plan phase because its filters are
+		// demand-loaded: reading a sidecar under the engine lock would block writers. A pruned part
+		// costs one sidecar read (usually a cache hit) and skips every column of the part.
+		if p.gramHints != nil &&
+			!part.gramsMayMatch(ctx, p.e.cfg.Backend, p.e.grams(), p.conds, p.gramHints) {
+			p.partsPrunedGram++
+
+			continue
+		}
+
 		lz, err := part.readLazyConds(ctx, p.condSel, p.conds, p.e.getI64)
 		if err != nil {
 			return err
