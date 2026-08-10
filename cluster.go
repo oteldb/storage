@@ -234,6 +234,8 @@ func splitEnginePrefix(prefix string) (tid signal.TenantID, sig signal.Signal, o
 		sig = signal.Trace
 	case profilesPrefix:
 		sig = signal.Profile
+	case exemplarsPrefix:
+		sig = signal.Exemplar
 	default:
 		return "", 0, false
 	}
@@ -1010,6 +1012,11 @@ func (s *Storage) clusterProfileFetcherFor(tid signal.TenantID) fetch.Fetcher {
 	return s.clusterRecordFetcherFor(signal.Profile, tid, s.lookupProfileEngine)
 }
 
+// clusterExemplarFetcherFor is the exemplars analog of [Storage.clusterLogFetcherFor].
+func (s *Storage) clusterExemplarFetcherFor(tid signal.TenantID) fetch.Fetcher {
+	return s.clusterRecordFetcherFor(signal.Exemplar, tid, s.lookupExemplarEngine)
+}
+
 // recordOwners reports whether this node owns the tenant and the addresses of its other owners.
 // shardOwners reports whether this node owns shardKey (is among its ring owners) and the addresses
 // of the remote owners. The key is used verbatim (already normalized, possibly a shard key).
@@ -1029,7 +1036,7 @@ func (s *Storage) shardOwners(shardKey signal.TenantID) (local bool, remotes []s
 	return local, remotes
 }
 
-// lookupRecordEngine resolves a tenant's engine for a record signal (log/trace/profile) without
+// lookupRecordEngine resolves a tenant's engine for a record signal (log/trace/profile/exemplar) without
 // creating one. Metrics are not a record signal, so they return (nil, false).
 func (s *Storage) lookupRecordEngine(sig signal.Signal, tid signal.TenantID) (*recordengine.Engine, bool) {
 	switch sig {
@@ -1039,6 +1046,8 @@ func (s *Storage) lookupRecordEngine(sig signal.Signal, tid signal.TenantID) (*r
 		return s.lookupTraceEngine(tid)
 	case signal.Profile:
 		return s.lookupProfileEngine(tid)
+	case signal.Exemplar:
+		return s.lookupExemplarEngine(tid)
 	default:
 		return nil, false
 	}
@@ -1421,7 +1430,7 @@ func (s *Storage) shardRecordFetcher(
 	})
 }
 
-// recordEngineFor returns the local record engine (logs, traces, or profiles) for a signal+tenant,
+// recordEngineFor returns the local record engine (logs, traces, profiles, or exemplars) for a signal+tenant,
 // creating it (with a WAL when configured) on first use.
 func (s *Storage) recordEngineFor(sig signal.Signal, tenant string) (*recordengine.Engine, error) {
 	switch sig {
@@ -1429,6 +1438,8 @@ func (s *Storage) recordEngineFor(sig signal.Signal, tenant string) (*recordengi
 		return s.traceEngineFor(signal.TenantID(tenant))
 	case signal.Profile:
 		return s.profileEngineFor(signal.TenantID(tenant))
+	case signal.Exemplar:
+		return s.exemplarEngineFor(signal.TenantID(tenant))
 	default:
 		return s.logEngineFor(signal.TenantID(tenant))
 	}

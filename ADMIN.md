@@ -22,6 +22,10 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 (seconds), never on a per-request path.
 
 - `StoreStats.Tenants` — per tenant: cumulative `Admission` tally, and per-signal `SignalStats`.
+  Exemplars report as their own signal (`exemplar`), separate from the metrics they hang off: they
+  are a separate engine with an independent part lifecycle, so their `Series`/`Parts`/`HeadBytes`
+  are counted and compacted on their own. Note their write is best-effort and their accept/reject
+  counts stay out of the tenant `Admission` tally, which reports data points.
 - `StoreStats.Cluster` — cluster mode only (nil single-node): this node's address, live membership,
   owned shards, and the last enacted rebalance plan (`LastRebalance`: each changed shard's full
   owner-set diff at its per-tenant replication factor — the replicas that must backfill, not just
