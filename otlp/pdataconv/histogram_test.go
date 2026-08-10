@@ -67,7 +67,7 @@ func TestAppendHistogram(t *testing.T) {
 	dp.BucketCounts().FromRaw([]uint64{2, 3, 5}) // ≤1:2, (1,5]:3, >5:5
 
 	var out metric.Metrics
-	require.Equal(t, 0, AppendMetrics(&out, md))
+	require.Equal(t, Dropped{}, AppendMetrics(&out, md))
 
 	assert.InDelta(t, 10, mustSeries(t, out, "lat_count", nil), 0)
 	assert.InDelta(t, 42.5, mustSeries(t, out, "lat_sum", nil), 0)
@@ -99,7 +99,7 @@ func TestAppendHistogramKeepsPointAttributes(t *testing.T) {
 	dp.BucketCounts().FromRaw([]uint64{1, 2})
 
 	var out metric.Metrics
-	require.Equal(t, 0, AppendMetrics(&out, md))
+	require.Equal(t, Dropped{}, AppendMetrics(&out, md))
 
 	// The bucket series carries both the original attribute and the synthetic le label.
 	assert.InDelta(t, 1, mustSeries(t, out, "lat_bucket", map[string]string{"route": "/x", "le": "1"}), 0)
@@ -124,7 +124,7 @@ func TestAppendSummary(t *testing.T) {
 	q2.SetValue(9)
 
 	var out metric.Metrics
-	require.Equal(t, 0, AppendMetrics(&out, md))
+	require.Equal(t, Dropped{}, AppendMetrics(&out, md))
 
 	assert.InDelta(t, 4, mustSeries(t, out, "rpc_count", nil), 0)
 	assert.InDelta(t, 20, mustSeries(t, out, "rpc_sum", nil), 0)
@@ -154,7 +154,7 @@ func TestAppendExpHistogram(t *testing.T) {
 	dp.Positive().BucketCounts().FromRaw([]uint64{1, 2}) // (1,2]:1 → le 2; (2,4]:2 → le 4
 
 	var out metric.Metrics
-	require.Equal(t, 0, AppendMetrics(&out, md))
+	require.Equal(t, Dropped{}, AppendMetrics(&out, md))
 
 	assert.InDelta(t, 6, mustSeries(t, out, "dur_count", nil), 0)
 	assert.InDelta(t, 13, mustSeries(t, out, "dur_sum", nil), 0)
@@ -183,7 +183,7 @@ func TestHistogramEndToEnd(t *testing.T) {
 	dp.BucketCounts().FromRaw([]uint64{3, 4})
 
 	var out metric.Metrics
-	require.Equal(t, 0, AppendMetrics(&out, md))
+	require.Equal(t, Dropped{}, AppendMetrics(&out, md))
 
 	// Every decomposed point projects to a real series id (no panics, all accepted).
 	var ids int

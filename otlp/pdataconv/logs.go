@@ -10,7 +10,8 @@ import (
 
 // AppendLogs converts an OTLP logs batch into dst, reusing dst's retained capacity (call
 // [log.Logs.Reset] or use [log.GetLogs] for a recycled batch). Every record is representable, so
-// dropped is always 0; it is returned for symmetry with [AppendMetrics]. Non-string record bodies
+// dropped is always 0; it is returned for symmetry with [AppendMetrics]'s point count
+// ([Dropped.Points]). Non-string record bodies
 // are rendered to their textual form, since the internal model stores a body as text bytes.
 //
 //nolint:dupl // per-signal OTLP converter; identical resource/scope walk, types differ

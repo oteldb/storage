@@ -12,7 +12,8 @@ import (
 // [profile.Profiles.Reset] or use [profile.GetProfiles] for a recycled batch). The OTLP shared
 // ProfilesDictionary maps one-to-one onto [profile.Dictionary], so its tables are copied
 // index-preserving (samples/stacks/locations keep referencing the same indices). Everything is
-// representable, so dropped is always 0; it is returned for symmetry with [AppendMetrics].
+// representable, so dropped is always 0; it is returned for symmetry with [AppendMetrics]'s point
+// count ([Dropped.Points]).
 //
 //nolint:dupl // per-signal OTLP converter; identical resource/scope walk, types differ
 func AppendProfiles(dst *profile.Profiles, pd pprofile.Profiles) (dropped int) {
