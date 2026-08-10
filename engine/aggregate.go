@@ -5,9 +5,32 @@ import (
 	"context"
 	"slices"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
+
+// startAggregateSpan opens the span for an aggregate read. Every aggregate path shares the same
+// shape — plan, decide whether the stats sidecars can answer it, then fold each series — so they
+// share one span helper and one attribute vocabulary with [Engine.Fetch]'s.
+func (e *Engine) startAggregateSpan(ctx context.Context, name string) (context.Context, trace.Span) {
+	//nolint:spancheck // the caller ends the returned span.
+	return e.cfg.Obs.Tracer.Start(ctx, name,
+		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
+}
+
+// aggregatePlanAttrs describes what an aggregate read is about to do. storage.stats_pushdown is
+// the one that matters when it is slow: false means every matched series decodes its value column
+// instead of folding the parts' precomputed sidecars.
+func aggregatePlanAttrs(ids []signal.SeriesID, plan *enginePlan, safe bool) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.Int("storage.series_matched", len(ids)),
+		attribute.Int("storage.parts_scanned", len(plan.liveParts)),
+		attribute.Bool("storage.stats_pushdown", safe),
+	}
+}
 
 // AggregateRange returns a per-series aggregate (count, sum, min, max — enough for avg) over
 // [r.Start, r.End] for the series matching r.Matchers. It is the aggregate-pushdown read path:
@@ -19,9 +42,14 @@ import (
 //
 // Series with no sample in the window are omitted from the result.
 func (e *Engine) AggregateRange(ctx context.Context, r fetch.Request) (map[signal.SeriesID]SeriesAgg, error) {
+	ctx, span := e.startAggregateSpan(ctx, "engine.aggregateRange")
+	defer span.End()
+
 	ids, plan := e.planAggregate(r)
 	defer plan.releaseParts()
 	safe := aggPushdownSafe(plan)
+
+	span.SetAttributes(aggregatePlanAttrs(ids, plan, safe)...)
 
 	out := make(map[signal.SeriesID]SeriesAgg, len(ids))
 
@@ -93,9 +121,15 @@ type BucketAgg struct {
 // part's sidecar without decoding. Parts that straddle buckets, or an unsafe plan, decode (and an
 // unsafe plan merges first, to dedup by timestamp).
 func (e *Engine) AggregateStep(ctx context.Context, r fetch.Request, step int64) (map[signal.SeriesID][]BucketAgg, error) {
+	ctx, span := e.startAggregateSpan(ctx, "engine.aggregateStep")
+	defer span.End()
+
 	ids, plan := e.planAggregate(r)
 	defer plan.releaseParts()
 	safe := aggPushdownSafe(plan)
+
+	span.SetAttributes(append(aggregatePlanAttrs(ids, plan, safe),
+		attribute.Int64("storage.step", step))...)
 
 	out := make(map[signal.SeriesID][]BucketAgg, len(ids))
 	grid := newStepGrid(plan, step)
@@ -124,9 +158,15 @@ type NamedAgg struct {
 // buckets, for the cluster aggregate RPC (a peer pushes the aggregate down and ships identities so
 // the coordinator can re-filter and union).
 func (e *Engine) AggregateStepNamed(ctx context.Context, r fetch.Request, step int64) ([]NamedAgg, error) {
+	ctx, span := e.startAggregateSpan(ctx, "engine.aggregateStepNamed")
+	defer span.End()
+
 	ids, plan := e.planAggregate(r)
 	defer plan.releaseParts()
 	safe := aggPushdownSafe(plan)
+
+	span.SetAttributes(append(aggregatePlanAttrs(ids, plan, safe),
+		attribute.Int64("storage.step", step))...)
 
 	out := make([]NamedAgg, 0, len(ids))
 	grid := newStepGrid(plan, step)

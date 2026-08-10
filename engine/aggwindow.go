@@ -5,6 +5,7 @@ import (
 	"iter"
 
 	"github.com/go-faster/errors"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -133,7 +134,34 @@ func (e *Engine) aggregateWindowSeq(
 	ctx context.Context, r fetch.Request, spec WindowSpec,
 ) iter.Seq2[NamedWindowAgg, error] {
 	return func(yield func(NamedWindowAgg, error) bool) {
+		// The span covers the whole iteration rather than just the plan: the per-series work is
+		// where the time goes, and it only runs as the caller drains the sequence. Ending it here
+		// also covers an early break, which is when the caller stops mid-iteration.
+		ctx, span := e.startAggregateSpan(ctx, "engine.aggregateWindow")
+
+		// The result counters are only final once iteration stops — which happens by running out
+		// of series, by the caller breaking, or by an error — so they are recorded in one place on
+		// the way out rather than at each of those exits.
+		var windowsEmitted, seriesEmitted int
+
+		stoppedEarly := false
+
+		defer func() {
+			span.SetAttributes(
+				attribute.Int("storage.series_emitted", seriesEmitted),
+				attribute.Int("storage.windows_emitted", windowsEmitted),
+				attribute.Bool("storage.stopped_early", stoppedEarly),
+			)
+			span.End()
+		}()
+
+		span.SetAttributes(
+			attribute.Int64("storage.step", spec.Step),
+			attribute.Int64("storage.window", spec.window()),
+		)
+
 		if spec.Step <= 0 {
+			span.RecordError(errWindowStep)
 			yield(NamedWindowAgg{}, errWindowStep)
 
 			return
@@ -144,9 +172,20 @@ func (e *Engine) aggregateWindowSeq(
 
 		w := newWindower(plan, spec)
 
+		// Which path this call takes is the first thing to know when it is slow: the grid path
+		// folds each series from step-wide buckets (and, when safe, straight from the parts' stats
+		// sidecars without decoding a sample), while a window that is not a whole multiple of the
+		// step falls back to decoding and merging every sample. Recording it as an attribute means
+		// a slow call says *why* rather than only how long.
+		span.SetAttributes(append(
+			aggregatePlanAttrs(ids, plan, w.grid != nil && w.safe),
+			attribute.Bool("storage.window_grid", w.grid != nil),
+		)...)
+
 		for i, id := range ids {
 			windows, err := w.series(ctx, e, plan, id)
 			if err != nil {
+				span.RecordError(err)
 				yield(NamedWindowAgg{}, err)
 
 				return
@@ -156,7 +195,12 @@ func (e *Engine) aggregateWindowSeq(
 				continue
 			}
 
+			windowsEmitted += len(windows)
+			seriesEmitted++
+
 			if !yield(NamedWindowAgg{Series: plan.series[i], Windows: windows}, nil) {
+				stoppedEarly = true
+
 				return
 			}
 		}
