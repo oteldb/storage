@@ -131,6 +131,10 @@ func (b *Batch) Identity(i int) Identity {
 // lazy materializer the engine calls only when registering a newly-seen series.
 func (b *Batch) Series(i int) signal.Series { return b.Identity(i).ToSeries() }
 
+// Exemplars returns the i-th point's exemplars (usually none). The slice aliases the source
+// [Metrics] and is valid only for the duration of the emit call, like the rest of the batch.
+func (b *Batch) Exemplars(i int) []Exemplar { return b.points[i].Exemplars }
+
 // Sample returns the i-th point's [Sample].
 func (b *Batch) Sample(i int) Sample {
 	pt := &b.points[i]
