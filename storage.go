@@ -43,7 +43,9 @@ import (
 //
 // All four signals are wired end-to-end: metrics ([Storage.WriteMetrics]/[Storage.Fetcher]) on the
 // float-sample engine, and logs, traces, and profiles ([Storage.WriteLogs]/[Storage.WriteTraces]/
-// [Storage.WriteProfiles] and their fetchers) on the shared record engine.
+// [Storage.WriteProfiles] and their fetchers) on the shared record engine. Metric exemplars ride the
+// metrics write and read back through [Storage.ExemplarFetcher] — also a record engine, keyed by the
+// metric series identity.
 type Storage struct {
 	opts    Options
 	backend backend.Backend
@@ -313,6 +315,12 @@ func (s *Storage) Reset(ctx context.Context) error {
 	for _, eng := range s.profileEngineSnapshot() {
 		if err := eng.Reset(ctx); err != nil {
 			return errors.Wrap(err, "reset profile engine")
+		}
+	}
+
+	for _, eng := range s.exemplarEngineSnapshot() {
+		if err := eng.Reset(ctx); err != nil {
+			return errors.Wrap(err, "reset exemplar engine")
 		}
 	}
 
@@ -878,7 +886,8 @@ type engineCloser interface {
 // the first error while still closing the rest.
 func (s *Storage) closeEngines(ctx context.Context) error {
 	all := make([]engineCloser, 0,
-		len(s.engineSnapshot())+len(s.logEngineSnapshot())+len(s.traceEngineSnapshot())+len(s.profileEngineSnapshot()))
+		len(s.engineSnapshot())+len(s.logEngineSnapshot())+len(s.traceEngineSnapshot())+len(s.profileEngineSnapshot())+
+			len(s.exemplarEngineSnapshot()))
 
 	for _, eng := range s.engineSnapshot() {
 		all = append(all, eng)
@@ -893,6 +902,10 @@ func (s *Storage) closeEngines(ctx context.Context) error {
 	}
 
 	for _, eng := range s.profileEngineSnapshot() {
+		all = append(all, eng)
+	}
+
+	for _, eng := range s.exemplarEngineSnapshot() {
 		all = append(all, eng)
 	}
 
@@ -1072,6 +1085,7 @@ func (s *Storage) recover(ctx context.Context) error {
 	logSuffix := logsPrefix + "/" + bucketindex.Object
 	traceSuffix := tracesPrefix + "/" + bucketindex.Object
 	profileSuffix := profilesPrefix + "/" + bucketindex.Object
+	exemplarSuffix := exemplarsPrefix + "/" + bucketindex.Object
 
 	for _, k := range keys {
 		switch {
@@ -1094,6 +1108,11 @@ func (s *Storage) recover(ctx context.Context) error {
 			tid := signal.TenantID(strings.TrimSuffix(k, profileSuffix))
 			if err := load(s.profileEngineFor(tid)); err != nil {
 				return errors.Wrapf(err, "recover profiles tenant %q", tid)
+			}
+		case strings.HasSuffix(k, exemplarSuffix):
+			tid := signal.TenantID(strings.TrimSuffix(k, exemplarSuffix))
+			if err := load(s.exemplarEngineFor(tid)); err != nil {
+				return errors.Wrapf(err, "recover exemplars tenant %q", tid)
 			}
 		}
 	}
@@ -1188,6 +1207,15 @@ func (s *Storage) walReplayerFor(name string) (func(context.Context, signal.Tena
 	case profilesPrefix:
 		return func(_ context.Context, tid signal.TenantID, dir string) error {
 			e, err := s.profileEngineFor(tid)
+			if err != nil {
+				return err
+			}
+
+			return e.Replay(dir)
+		}, true
+	case exemplarsPrefix:
+		return func(_ context.Context, tid signal.TenantID, dir string) error {
+			e, err := s.exemplarEngineFor(tid)
 			if err != nil {
 				return err
 			}
@@ -1429,6 +1457,7 @@ func (s *Storage) flushPressured(ctx context.Context) {
 		s.logEngineSnapshotByTenant(),
 		s.traceEngineSnapshotByTenant(),
 		s.profileEngineSnapshotByTenant(),
+		s.exemplarEngineSnapshotByTenant(),
 	} {
 		for tid, eng := range engines {
 			collect(tid, eng.HeadBytes(), eng.Flush)
@@ -1469,8 +1498,9 @@ func (s *Storage) syncWALs() {
 	logs := s.logEngineSnapshot()
 	traces := s.traceEngineSnapshot()
 	profiles := s.profileEngineSnapshot()
+	exemplars := s.exemplarEngineSnapshot()
 
-	wals := make([]walSyncer, 0, len(metrics)+len(logs)+len(traces)+len(profiles))
+	wals := make([]walSyncer, 0, len(metrics)+len(logs)+len(traces)+len(profiles)+len(exemplars))
 	for _, e := range metrics {
 		wals = append(wals, e)
 	}
@@ -1484,6 +1514,10 @@ func (s *Storage) syncWALs() {
 	}
 
 	for _, e := range profiles {
+		wals = append(wals, e)
+	}
+
+	for _, e := range exemplars {
 		wals = append(wals, e)
 	}
 
@@ -1524,10 +1558,12 @@ func (s *Storage) maintain(ctx context.Context) {
 	logEngines := s.logEngineSnapshotByTenant()
 	traceEngines := s.traceEngineSnapshotByTenant()
 	profileEngines := s.profileEngineSnapshotByTenant()
+	exemplarEngines := s.exemplarEngineSnapshotByTenant()
 
 	s.obs.Logger(ctx).Debug("maintenance cycle start",
 		zap.Int("metric_tenants", len(metricEngines)), zap.Int("log_tenants", len(logEngines)),
-		zap.Int("trace_tenants", len(traceEngines)), zap.Int("profile_tenants", len(profileEngines)))
+		zap.Int("trace_tenants", len(traceEngines)), zap.Int("profile_tenants", len(profileEngines)),
+		zap.Int("exemplar_tenants", len(exemplarEngines)))
 
 	// Before the flushes, not after: this is the cycle's high-water mark for everything the heads
 	// hold. Published after the drain, the gauges would report a head that is empty by construction
@@ -1537,7 +1573,8 @@ func (s *Storage) maintain(ctx context.Context) {
 	// Compaction ownership is per-tenant and shared across signals, so reconcile it once over the
 	// union of all signals' tenants (reconciling per-signal would have each release the others'
 	// claims). nil ⇒ single-node: own everything.
-	tids := make(map[signal.TenantID]struct{}, len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines))
+	tids := make(map[signal.TenantID]struct{},
+		len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines)+len(exemplarEngines))
 	for tid := range metricEngines {
 		tids[tid] = struct{}{}
 	}
@@ -1551,6 +1588,10 @@ func (s *Storage) maintain(ctx context.Context) {
 	}
 
 	for tid := range profileEngines {
+		tids[tid] = struct{}{}
+	}
+
+	for tid := range exemplarEngines {
 		tids[tid] = struct{}{}
 	}
 
@@ -1614,7 +1655,8 @@ func (s *Storage) maintain(ctx context.Context) {
 	// parallel.ForEach dispatches in index order, so the fullest heads flush first within a cycle.
 	// This keeps one noisy tenant from delaying the relief of others when the work exceeds the
 	// concurrency bound, and drains the most in-flight memory soonest.
-	tasks := make([]maintTask, 0, len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines))
+	tasks := make([]maintTask, 0,
+		len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines)+len(exemplarEngines))
 
 	// mergeMetrics compacts a metric tenant and then prunes the identities its retention just left
 	// without data. The prune belongs to the merge step because that is the only thing that kills an
@@ -1692,6 +1734,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	addRecord(logEngines, signal.Log, logsPrefix)
 	addRecord(traceEngines, signal.Trace, tracesPrefix)
 	addRecord(profileEngines, signal.Profile, profilesPrefix)
+	addRecord(exemplarEngines, signal.Exemplar, exemplarsPrefix)
 
 	s.maintStats.lastTasks.Store(int64(len(tasks)))
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].pressure > tasks[j].pressure })
@@ -1814,7 +1857,7 @@ func (s *Storage) recordHeadShape(ctx context.Context) {
 
 // recordSignals are the signals served by a record engine, in a form a loop can range over without
 // allocating (unlike [Storage.recordEnginesBySignal], which builds a map).
-var recordSignals = [...]signal.Signal{signal.Log, signal.Trace, signal.Profile}
+var recordSignals = [...]signal.Signal{signal.Log, signal.Trace, signal.Profile, signal.Exemplar}
 
 // recordEngineSnapshot snapshots the record engines this node holds for one signal; nil for a
 // signal no record engine serves. It lets a caller that walks only some signals pay for only those
@@ -1827,6 +1870,8 @@ func (s *Storage) recordEngineSnapshot(sig signal.Signal) map[signal.TenantID]*r
 		return s.traceEngineSnapshotByTenant()
 	case signal.Profile:
 		return s.profileEngineSnapshotByTenant()
+	case signal.Exemplar:
+		return s.exemplarEngineSnapshotByTenant()
 	default:
 		return nil
 	}
@@ -1849,7 +1894,7 @@ func (s *Storage) recordEnginesBySignal() map[signal.Signal]map[signal.TenantID]
 // loop merges them through the same fan-out.
 func (s *Storage) mergeConcurrency() int {
 	s.tmu.Lock()
-	n := len(s.tenants) + len(s.logTenants) + len(s.traceTenants) + len(s.profileTenants)
+	n := len(s.tenants) + len(s.logTenants) + len(s.traceTenants) + len(s.profileTenants) + len(s.exemplarTenants)
 	s.tmu.Unlock()
 
 	return max(min(s.maintenanceConcurrency(), n), 1)

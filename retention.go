@@ -23,7 +23,7 @@ func retentionCutoff(r tenant.Retention, now int64) int64 {
 
 // signalCount is one past the highest [signal.Signal] value, so a [signal.Signal] indexes a
 // bySignal array directly. Index 0 is unused (no signal has that value).
-const signalCount = int(signal.Profile) + 1
+const signalCount = int(signal.Exemplar) + 1
 
 // bySignal is one int64 per signal, indexed by [signal.Signal]. It carries both a tenant's
 // per-signal byte budgets and the cutoffs they resolve to, which is why it is a plain array: the

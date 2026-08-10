@@ -152,7 +152,7 @@ func (a Admin) PruneIdentities(ctx context.Context, key signal.TenantID) (int, e
 		total += n
 	}
 
-	for _, sig := range []signal.Signal{signal.Log, signal.Trace, signal.Profile} {
+	for _, sig := range recordSignals {
 		eng, ok := a.s.lookupRecordEngine(sig, norm)
 		if !ok {
 			continue
@@ -306,6 +306,10 @@ func (s *Storage) allEngineKeys() []string {
 	}
 
 	for tid := range s.profileEngineSnapshotByTenant() {
+		seen[tid] = struct{}{}
+	}
+
+	for tid := range s.exemplarEngineSnapshotByTenant() {
 		seen[tid] = struct{}{}
 	}
 
