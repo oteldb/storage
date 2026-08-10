@@ -50,6 +50,30 @@ stays present to reconcile). `trace_id`/`span_id` use the dictionary-free fixed-
 for a 16-byte id) while fixed-width stores 16 B/row and decodes far faster. `trace_id` still
 carries an equality bloom for trace-by-id pruning.
 
+## `exemplar`
+
+An exemplar is record-shaped (zero or more per data point, variable-width payload), so it lives in
+the record engine rather than the dense metrics engine, whose one-row-per-point layout and
+downsampling merge cannot express it.
+
+**An exemplar stream *is* its metric series.** The stream id is the point's
+`metric.Identity.SeriesID`, byte for byte, and it is not recomputed: `Project` takes an
+already-projected `*metric.Batch` and reads the id the metrics path resolved, so the two cannot
+drift. That is what makes the series index, tenant routing, and shard placement fall out for free —
+a matcher set selecting metric series selects exactly the matching exemplar streams. One `emit` is
+one point (within a metric, points have distinct attribute sets, so a point is a stream); points
+with no exemplars — nearly all of them — never reach the engine.
+
+Schema: `value` (int) + `trace_id`(Equality)/`span_id`/`attrs`(Attrs) (bytes). `trace_id` is
+near-unique by construction, so it takes the dictionary-free `CodecBytesRaw`; its equality bloom is
+what prunes a trace-to-metrics lookup. The record engine has no float kind, so `value` carries the
+float64 **bit pattern** in an int64 column (`EncodeValue`/`DecodeValue`) — lossless, but it forfeits
+compression and the float-precision recompression policy; issue #251 tracks the proper fix.
+
+Exemplars on histogram, exponential-histogram, and summary points are **rejected and counted**, not
+stored: classic decomposition splits those into several series, leaving an exemplar with no
+unambiguous home. Issue #252 holds the decision for when native histograms land.
+
 ## `profile`
 
 A profile is a pprof-style graph with a large shared symbol dictionary — Pyroscope's **two-table
