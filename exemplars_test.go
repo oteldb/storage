@@ -255,3 +255,41 @@ func TestFacadeExemplarsSurviveFlush(t *testing.T) {
 	assert.InDeltaSlice(t, []float64{12.5}, exemplarValues(got[0]), 0)
 	assert.Equal(t, []string{"trace-aaaaaaaaaa1"}, exemplarTraceIDs(got[0]))
 }
+
+// Exemplar streams must stay matchable after a reopen: the postings entries for the metric's
+// labels are rebuilt from the persisted identity (streams.bin / WAL replay), not from the live
+// head, so this is what proves the Series.Attributes indexing is not head-only.
+func TestExemplarsMatchableAfterReopen(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	dataDir, walDir := t.TempDir(), t.TempDir()
+
+	s1 := reopenDurable(t, dataDir, walDir)
+	_, err := s1.WriteMetrics(ctx, exemplarBatch("api", "http.duration", 1000, map[string][]exemplarSpec{
+		"/a": {{ts: 1001, value: 12.5, traceID: "trace-aaaaaaaaaa1"}},
+		"/b": {{ts: 1002, value: 7.25, traceID: "trace-bbbbbbbbbb1"}},
+	}))
+	require.NoError(t, err)
+
+	eng, ok := s1.lookupExemplarEngine("default")
+	require.True(t, ok)
+	require.NoError(t, eng.Flush(ctx))
+	require.NoError(t, s1.Close(ctx))
+
+	s2 := reopenDurable(t, dataDir, walDir)
+	t.Cleanup(func() { _ = s2.Close(ctx) })
+
+	// Reserved-label and point-attribute matchers both resolve against the reloaded index.
+	got, err := fetch.Drain(ctx, must(s2.ExemplarFetcher("default").Fetch(ctx, fetch.Request{
+		Signal: signal.Exemplar, Start: 0, End: 1 << 60,
+		Matchers: []fetch.Matcher{
+			labelMatcher(metric.LabelName, "http.duration"),
+			labelMatcher([]byte("http.route"), "/b"),
+		},
+	})))
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.InDeltaSlice(t, []float64{7.25}, exemplarValues(got[0]), 0)
+	assert.Equal(t, []string{"trace-bbbbbbbbbb1"}, exemplarTraceIDs(got[0]))
+}

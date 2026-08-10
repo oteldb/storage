@@ -41,7 +41,9 @@ import (
 //
 // All four signals are wired end-to-end: metrics ([Storage.WriteMetrics]/[Storage.Fetcher]) on the
 // float-sample engine, and logs, traces, and profiles ([Storage.WriteLogs]/[Storage.WriteTraces]/
-// [Storage.WriteProfiles] and their fetchers) on the shared record engine.
+// [Storage.WriteProfiles] and their fetchers) on the shared record engine. Metric exemplars ride the
+// metrics write and read back through [Storage.ExemplarFetcher] — also a record engine, keyed by the
+// metric series identity.
 type Storage struct {
 	opts    Options
 	backend backend.Backend
@@ -242,6 +244,12 @@ func (s *Storage) Close(ctx context.Context) error {
 		}
 	}
 
+	for _, eng := range s.exemplarEngineSnapshot() {
+		if err := eng.Close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
 	if firstErr != nil {
 		s.obs.Logger(ctx).Warn("storage closed with errors", zap.Error(firstErr))
 	} else {
@@ -287,6 +295,12 @@ func (s *Storage) Reset(ctx context.Context) error {
 	for _, eng := range s.profileEngineSnapshot() {
 		if err := eng.Reset(ctx); err != nil {
 			return errors.Wrap(err, "reset profile engine")
+		}
+	}
+
+	for _, eng := range s.exemplarEngineSnapshot() {
+		if err := eng.Reset(ctx); err != nil {
+			return errors.Wrap(err, "reset exemplar engine")
 		}
 	}
 
@@ -898,6 +912,7 @@ func (s *Storage) recover(ctx context.Context) error {
 	logSuffix := logsPrefix + "/" + bucketindex.Object
 	traceSuffix := tracesPrefix + "/" + bucketindex.Object
 	profileSuffix := profilesPrefix + "/" + bucketindex.Object
+	exemplarSuffix := exemplarsPrefix + "/" + bucketindex.Object
 
 	for _, k := range keys {
 		switch {
@@ -920,6 +935,11 @@ func (s *Storage) recover(ctx context.Context) error {
 			tid := signal.TenantID(strings.TrimSuffix(k, profileSuffix))
 			if err := load(s.profileEngineFor(tid)); err != nil {
 				return errors.Wrapf(err, "recover profiles tenant %q", tid)
+			}
+		case strings.HasSuffix(k, exemplarSuffix):
+			tid := signal.TenantID(strings.TrimSuffix(k, exemplarSuffix))
+			if err := load(s.exemplarEngineFor(tid)); err != nil {
+				return errors.Wrapf(err, "recover exemplars tenant %q", tid)
 			}
 		}
 	}
@@ -1012,6 +1032,15 @@ func (s *Storage) walReplayerFor(name string) (func(context.Context, signal.Tena
 	case profilesPrefix:
 		return func(_ context.Context, tid signal.TenantID, dir string) error {
 			e, err := s.profileEngineFor(tid)
+			if err != nil {
+				return err
+			}
+
+			return e.Replay(dir)
+		}, true
+	case exemplarsPrefix:
+		return func(_ context.Context, tid signal.TenantID, dir string) error {
+			e, err := s.exemplarEngineFor(tid)
 			if err != nil {
 				return err
 			}
@@ -1185,17 +1214,19 @@ func (s *Storage) flushPressured(ctx context.Context) {
 	parallel.ForEach(len(flushes), s.maintenanceConcurrency(), func(i int) { flushes[i]() })
 }
 
-// recordEngineSnapshot is every record engine (logs, traces, profiles) across tenants.
+// recordEngineSnapshot is every record engine (logs, traces, profiles, exemplars) across tenants.
 func (s *Storage) recordEngineSnapshot() []*recordengine.Engine {
 	logs := s.logEngineSnapshot()
 	traces := s.traceEngineSnapshot()
 	profiles := s.profileEngineSnapshot()
+	exemplars := s.exemplarEngineSnapshot()
 
-	out := make([]*recordengine.Engine, 0, len(logs)+len(traces)+len(profiles))
+	out := make([]*recordengine.Engine, 0, len(logs)+len(traces)+len(profiles)+len(exemplars))
 	out = append(out, logs...)
 	out = append(out, traces...)
+	out = append(out, profiles...)
 
-	return append(out, profiles...)
+	return append(out, exemplars...)
 }
 
 // runWALSync periodically fsyncs every engine's WAL until Close stops it ([WALSyncInterval] mode).
@@ -1224,8 +1255,9 @@ func (s *Storage) syncWALs() {
 	logs := s.logEngineSnapshot()
 	traces := s.traceEngineSnapshot()
 	profiles := s.profileEngineSnapshot()
+	exemplars := s.exemplarEngineSnapshot()
 
-	wals := make([]walSyncer, 0, len(metrics)+len(logs)+len(traces)+len(profiles))
+	wals := make([]walSyncer, 0, len(metrics)+len(logs)+len(traces)+len(profiles)+len(exemplars))
 	for _, e := range metrics {
 		wals = append(wals, e)
 	}
@@ -1239,6 +1271,10 @@ func (s *Storage) syncWALs() {
 	}
 
 	for _, e := range profiles {
+		wals = append(wals, e)
+	}
+
+	for _, e := range exemplars {
 		wals = append(wals, e)
 	}
 
@@ -1279,6 +1315,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	logEngines := s.logEngineSnapshotByTenant()
 	traceEngines := s.traceEngineSnapshotByTenant()
 	profileEngines := s.profileEngineSnapshotByTenant()
+	exemplarEngines := s.exemplarEngineSnapshotByTenant()
 
 	s.obs.Logger(ctx).Debug("maintenance cycle start",
 		zap.Int("metric_tenants", len(metricEngines)), zap.Int("log_tenants", len(logEngines)),
@@ -1389,7 +1426,8 @@ func (s *Storage) maintain(ctx context.Context) {
 	// parallel.ForEach dispatches in index order, so the fullest heads flush first within a cycle.
 	// This keeps one noisy tenant from delaying the relief of others when the work exceeds the
 	// concurrency bound, and drains the most in-flight memory soonest.
-	tasks := make([]maintTask, 0, len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines))
+	tasks := make([]maintTask, 0,
+		len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines)+len(exemplarEngines))
 
 	for tid, eng := range metricEngines {
 		tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
@@ -1414,6 +1452,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	addRecord(logEngines, logsPrefix)
 	addRecord(traceEngines, tracesPrefix)
 	addRecord(profileEngines, profilesPrefix)
+	addRecord(exemplarEngines, exemplarsPrefix)
 
 	s.maintStats.lastTasks.Store(int64(len(tasks)))
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].pressure > tasks[j].pressure })
