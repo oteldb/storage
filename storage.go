@@ -1438,21 +1438,21 @@ func (s *Storage) maintain(ctx context.Context) {
 		}})
 	}
 
-	addRecord := func(engines map[signal.TenantID]*recordengine.Engine, signalPrefix string) {
+	addRecord := func(engines map[signal.TenantID]*recordengine.Engine, signalPrefix string, sig signal.Signal) {
 		for tid, eng := range engines {
 			tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
 				maintainEngine(tid, signalPrefix, func() error { return eng.Flush(ctx) },
-					func() error { return eng.Merge(ctx, s.retainFrom(tid, sizeCutoffs[tid])) },
+					func() error { return eng.Merge(ctx, s.retainFrom(tid, sig, sizeCutoffs[tid])) },
 					func() error { return eng.RefreshReplica(ctx) },
 					func() []ecPartRef { return coldRecord(eng) })
 			}})
 		}
 	}
 
-	addRecord(logEngines, logsPrefix)
-	addRecord(traceEngines, tracesPrefix)
-	addRecord(profileEngines, profilesPrefix)
-	addRecord(exemplarEngines, exemplarsPrefix)
+	addRecord(logEngines, logsPrefix, signal.Log)
+	addRecord(traceEngines, tracesPrefix, signal.Trace)
+	addRecord(profileEngines, profilesPrefix, signal.Profile)
+	addRecord(exemplarEngines, exemplarsPrefix, signal.Exemplar)
 
 	s.maintStats.lastTasks.Store(int64(len(tasks)))
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].pressure > tasks[j].pressure })
@@ -1496,14 +1496,15 @@ func (s *Storage) ownedTenants(ctx context.Context, tids map[signal.TenantID]str
 }
 
 // retainFrom converts a tenant's retention policy into an absolute cutoff timestamp (unix
-// nanoseconds); 0 means retain forever. sizeCutoff is the tenant's size-budget cutoff (0 when it has
-// no MaxBytes budget or is under it, see [Storage.sizeCutoffFor]): whichever budget binds first —
-// age or bytes — wins.
-func (s *Storage) retainFrom(tid signal.TenantID, sizeCutoff int64) int64 {
+// nanoseconds) for one signal; 0 means retain forever. sizeCutoff is the tenant's size-budget cutoff
+// (0 when it has no MaxBytes budget or is under it, see [Storage.sizeCutoffFor]): whichever budget
+// binds first — age or bytes — wins. The age window is per signal, so exemplars can expire ahead of
+// everything else ([tenant.Retention.ExemplarMaxAge]); the byte budget stays tenant-wide.
+func (s *Storage) retainFrom(tid signal.TenantID, sig signal.Signal, sizeCutoff int64) int64 {
 	// tid may be a shard key ({tenant}/_s{idx}) when a signal is sharded; policy is per real tenant.
-	age := retentionCutoff(s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Retention, time.Now().UnixNano())
+	ret := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Retention
 
-	return max(age, sizeCutoff)
+	return max(retentionCutoff(ret, sig, time.Now().UnixNano()), sizeCutoff)
 }
 
 // metricMergeOptions resolves a metric tenant's policy into the absolute merge parameters —
@@ -1560,7 +1561,7 @@ func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engi
 	}
 
 	return engine.MergeOptions{
-		RetainFrom: max(retentionCutoff(p.Retention, now), sizeCutoff),
+		RetainFrom: max(retentionCutoff(p.Retention, signal.Metric, now), sizeCutoff),
 		Downsample: tiers,
 		Recompress: recompress,
 		Precision:  precision,

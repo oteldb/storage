@@ -148,7 +148,7 @@ func (a Admin) compactFn(ctx context.Context, sig signal.Signal, key signal.Tena
 		return nil, false
 	}
 
-	cutoff := a.s.retainFrom(key, a.s.sizeCutoffFor(ctx, tenantOfShard(key)))
+	cutoff := a.s.retainFrom(key, sig, a.s.sizeCutoffFor(ctx, tenantOfShard(key)))
 
 	return func(ctx context.Context) error { return eng.Merge(ctx, cutoff) }, true
 }

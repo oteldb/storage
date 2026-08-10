@@ -218,3 +218,78 @@ func TestMaintainNoSizeRetentionWithoutBudget(t *testing.T) {
 	require.Len(t, batches, 1)
 	assert.Equal(t, []int64{old, now}, batches[0].Timestamps, "everything is retained")
 }
+
+// TestExemplarMaxAgeExpiresAheadOfSamples pins the knob's whole point: with ExemplarMaxAge shorter
+// than MaxAge, a maintenance pass drops old exemplars while the samples they hang off survive.
+func TestExemplarMaxAgeExpiresAheadOfSamples(t *testing.T) {
+	t.Parallel()
+
+	s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+		return tenant.Policy{Retention: tenant.Retention{
+			MaxAge:         24 * time.Hour,
+			ExemplarMaxAge: time.Hour,
+		}}
+	})))
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	t.Cleanup(func() { _ = s.Close(ctx) })
+
+	now := time.Now()
+	old := now.Add(-6 * time.Hour).UnixNano() // past ExemplarMaxAge, within MaxAge
+	fresh := now.Add(-time.Minute).UnixNano() // within both
+
+	for _, ts := range []int64{old, fresh} {
+		_, err := s.WriteMetrics(ctx, exemplarBatch("api", "http.duration", ts, map[string][]exemplarSpec{
+			"/a": {{ts: ts, value: 1, traceID: "trace-" + strconv.FormatInt(ts, 10)}},
+		}))
+		require.NoError(t, err)
+	}
+
+	s.maintain(ctx)
+	s.maintain(ctx)
+
+	// The old exemplar is gone; the fresh one survives.
+	got, err := fetch.Drain(ctx, must(s.ExemplarFetcher("default").Fetch(ctx, fetch.Request{
+		Signal: signal.Exemplar, Start: 0, End: 1 << 62,
+		Matchers: []fetch.Matcher{nameMatcherSvc("api")},
+	})))
+	require.NoError(t, err)
+
+	ids := make([]string, 0, len(got))
+	for _, b := range got {
+		ids = append(ids, exemplarTraceIDs(b)...)
+	}
+
+	assert.NotContains(t, ids, "trace-"+strconv.FormatInt(old, 10), "exemplar past ExemplarMaxAge is dropped")
+	assert.Contains(t, ids, "trace-"+strconv.FormatInt(fresh, 10), "exemplar within ExemplarMaxAge is retained")
+
+	// The metric samples themselves are governed by MaxAge and both survive.
+	samples, err := fetch.Drain(ctx, must(s.Fetcher("default").Fetch(ctx, fetch.Request{
+		Signal: signal.Metric, Start: 0, End: 1 << 62,
+		Matchers: []fetch.Matcher{nameMatcherSvc("api")},
+	})))
+	require.NoError(t, err)
+
+	total := 0
+	for _, b := range samples {
+		total += len(b.Timestamps)
+	}
+
+	assert.Equal(t, 2, total, "samples outlive their exemplars under the longer MaxAge")
+}
+
+// Without ExemplarMaxAge, exemplars follow MaxAge like every other signal.
+func TestExemplarRetentionFallsBackToMaxAge(t *testing.T) {
+	t.Parallel()
+
+	r := tenant.Retention{MaxAge: 24 * time.Hour}
+	assert.Equal(t, 24*time.Hour, r.AgeFor(signal.Exemplar))
+	assert.Equal(t, 24*time.Hour, r.AgeFor(signal.Metric))
+
+	r.ExemplarMaxAge = time.Hour
+	assert.Equal(t, time.Hour, r.AgeFor(signal.Exemplar), "the override applies to exemplars only")
+	assert.Equal(t, 24*time.Hour, r.AgeFor(signal.Metric))
+	assert.Equal(t, 24*time.Hour, r.AgeFor(signal.Log))
+}

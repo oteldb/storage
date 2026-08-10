@@ -135,8 +135,12 @@ Imperative operator control, complementing the background maintenance loop (it h
 - `Rebalance(ctx)` — reconcile cluster ownership immediately (no-op single-node).
 - `MaintainNow(ctx)` — run one full maintenance cycle (flush + merge + retention across owned engines).
 
-The retention cutoff both paths pass to the merge is `max(age cutoff, size cutoff)`. The size cutoff
-comes from `tenant.Retention.MaxBytes`: the tenant's parts across all signals/shards on this node are
+The retention cutoff both paths pass to the merge is `max(age cutoff, size cutoff)`. The **age cutoff
+is per signal** (`tenant.Retention.AgeFor`): `MaxAge` for everything, except exemplars when
+`tenant.Retention.ExemplarMaxAge` is set — exemplars are a sampled debugging aid whose value ends
+with the trace they point at, so they are the natural first thing to expire, and setting this to the
+trace retention stops them outliving their referents. The size cutoff stays tenant-wide and comes
+from `tenant.Retention.MaxBytes`: the tenant's parts across all signals/shards on this node are
 summed and dropped oldest-first until the total fits the budget (`retention.go`). Resolving it reads
 per-part object sizes from the backend, like `PartsDetailed` — so a cycle only pays that I/O for
 tenants that actually set `MaxBytes`, and the cutoff is resolved once per tenant per cycle.
