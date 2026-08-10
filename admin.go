@@ -106,7 +106,7 @@ func (a Admin) CompactNow(ctx context.Context, key signal.TenantID, sig signal.S
 		return nil
 	}
 
-	cutoff := a.s.retainFrom(key, a.s.sizeCutoffFor(ctx, tenantOfShard(key)).at(sig))
+	cutoff := a.s.retainFrom(key, sig, a.s.sizeCutoffFor(ctx, tenantOfShard(key)).at(sig))
 
 	return eng.MergeWith(ctx, recordengine.MergeOptions{RetainFrom: cutoff, Force: true})
 }
@@ -257,7 +257,7 @@ func (a Admin) compactFn(ctx context.Context, sig signal.Signal, key signal.Tena
 		return nil, false
 	}
 
-	cutoff := a.s.retainFrom(key, a.s.sizeCutoffFor(ctx, tenantOfShard(key)).at(sig))
+	cutoff := a.s.retainFrom(key, sig, a.s.sizeCutoffFor(ctx, tenantOfShard(key)).at(sig))
 
 	return func(ctx context.Context) error { return eng.Merge(ctx, cutoff) }, true
 }

@@ -1700,7 +1700,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	// part set, since that is the only thing that kills a stream identity. A replica reaches it
 	// only through the refresh — it never merges.
 	mergeRecords := func(tid signal.TenantID, eng *recordengine.Engine, sig signal.Signal) error {
-		if err := eng.Merge(ctx, s.retainFrom(tid, sizeCutoffs[tid].at(sig))); err != nil {
+		if err := eng.Merge(ctx, s.retainFrom(tid, sig, sizeCutoffs[tid].at(sig))); err != nil {
 			return err
 		}
 
@@ -1937,14 +1937,15 @@ func (s *Storage) ownedTenants(ctx context.Context, tids map[signal.TenantID]str
 }
 
 // retainFrom converts a tenant's retention policy into an absolute cutoff timestamp (unix
-// nanoseconds); 0 means retain forever. sizeCutoff is the tenant's size-budget cutoff (0 when it has
-// no MaxBytes budget or is under it, see [Storage.sizeCutoffFor]): whichever budget binds first —
-// age or bytes — wins.
-func (s *Storage) retainFrom(tid signal.TenantID, sizeCutoff int64) int64 {
+// nanoseconds) for one signal; 0 means retain forever. sizeCutoff is that signal's size-budget cutoff
+// (0 when no byte budget binds it, see [Storage.sizeCutoffFor]): whichever budget binds first — age
+// or bytes — wins. The age window is per signal too, so exemplars can expire ahead of everything else
+// ([tenant.Retention.ExemplarMaxAge]).
+func (s *Storage) retainFrom(tid signal.TenantID, sig signal.Signal, sizeCutoff int64) int64 {
 	// tid may be a shard key ({tenant}/_s{idx}) when a signal is sharded; policy is per real tenant.
-	age := retentionCutoff(s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Retention, time.Now().UnixNano())
+	ret := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Retention
 
-	return max(age, sizeCutoff)
+	return max(retentionCutoff(ret, sig, time.Now().UnixNano()), sizeCutoff)
 }
 
 // metricMergeOptions resolves a metric tenant's policy into the absolute merge parameters —
@@ -2001,7 +2002,7 @@ func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engi
 	}
 
 	return engine.MergeOptions{
-		RetainFrom: max(retentionCutoff(p.Retention, now), sizeCutoff),
+		RetainFrom: max(retentionCutoff(p.Retention, signal.Metric, now), sizeCutoff),
 		Downsample: tiers,
 		Recompress: recompress,
 		Precision:  precision,

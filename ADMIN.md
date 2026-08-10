@@ -330,8 +330,13 @@ error wrapping `ErrReadOnly` (as do the `Write*` methods and `Reset`); the read 
 `Parts`/`PartsDetailed`/`Cardinality`/`StreamCosts`, `AdmissionStats` and the fetchers — is
 unaffected, which is what makes a read-only handle the right shape for an offline inspector.
 
-The retention cutoff both paths pass to the merge is `max(age cutoff, size cutoff)`. The size cutoff
-comes from the tenant's byte budgets, and there are two, both enforced (`retention.go`):
+The retention cutoff both paths pass to the merge is `max(age cutoff, size cutoff)`. The **age cutoff
+is per signal** (`tenant.Retention.AgeFor`): `MaxAge` for everything, except exemplars when
+`tenant.Retention.ExemplarMaxAge` is set — exemplars are a sampled debugging aid whose value ends
+with the trace they point at, so they are the natural first thing to expire, and setting this to the
+trace retention stops them outliving their referents.
+
+The size cutoff comes from the tenant's byte budgets, and there are two, both enforced (`retention.go`):
 
 - `tenant.Retention.MaxBytes` is **pooled**: the tenant's parts across all signals/shards on this
   node are summed and dropped oldest-first until the total fits. It is the tenant-wide outer bound.

@@ -83,6 +83,25 @@ type Retention struct {
 	// newest part of *each* budgeted signal is never dropped, so the floor is one part per signal
 	// rather than one per tenant. Pair it with [Limits.MaxPartSize] for the same reason.
 	MaxBytesPerSignal map[signal.Signal]int64
+	// ExemplarMaxAge caps the age of retained **exemplars**, overriding MaxAge for that signal
+	// alone. Zero ⇒ exemplars are retained for MaxAge like everything else.
+	//
+	// Exemplars are the natural first thing to expire: they are a sampled debugging aid whose value
+	// is highest while the trace they point at still exists, and a trace store is usually kept far
+	// shorter than metrics. Setting this to the trace retention keeps exemplars useful and stops
+	// them outliving the traces they reference. A value larger than MaxAge is allowed (exemplars
+	// then outlive the samples), on the same reasoning that the two budgets are independent.
+	ExemplarMaxAge time.Duration
+}
+
+// AgeFor returns the retention window that applies to a signal: [Retention.ExemplarMaxAge] for
+// [signal.Exemplar] when set, otherwise [Retention.MaxAge]. Zero ⇒ retain forever.
+func (r Retention) AgeFor(sig signal.Signal) time.Duration {
+	if sig == signal.Exemplar && r.ExemplarMaxAge > 0 {
+		return r.ExemplarMaxAge
+	}
+
+	return r.MaxAge
 }
 
 // DownsampleTier rolls up samples once they reach a given age: every sample older than
