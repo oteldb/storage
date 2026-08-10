@@ -93,10 +93,13 @@ rides the part lifecycle through the record engine's side-store hook.
 ## `otlp/pdataconv`
 
 **The only package importing `go.opentelemetry.io/collector/pdata`**, and optional. Converts
-`pmetric.Metrics` → `metric.Metrics`. Gauge/Sum convert directly; **Histogram,
+`pmetric.Metrics` → `metric.Metrics`, returning a `Dropped{Points, Exemplars}` — split because a
+dropped point feeds OTLP partial-success (the producer should retry) while a dropped exemplar only
+degrades correlation and must not inflate that count. Gauge/Sum convert directly; **Histogram,
 ExponentialHistogram and Summary are stored by classic decomposition** into ordinary float series
 (`_count`, `_sum`, cumulative `_bucket{le=…}` per the Prometheus convention; `{quantile=…}` for
 summaries). An exponential histogram is first converted to explicit `le` bounds from its scale.
 So all three reuse the engine, merge, downsample and fetch paths with **no histogram-specific
-storage code**. Conversion necessarily allocates (pdata holds Go strings), which is why it sits
+storage code**. Number-point exemplars convert; exemplars on the decomposed types are dropped and
+counted, since no single decomposed series owns them (see `exemplar` above). Conversion necessarily allocates (pdata holds Go strings), which is why it sits
 off the hot path — embedders owning their OTLP decoder build the internal batch directly.
