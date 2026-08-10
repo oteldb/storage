@@ -208,8 +208,16 @@ func TestClusterAggregateWindowGathersAcrossShards(t *testing.T) {
 	}
 	a := nodes["node-a"]
 
+	// Every node gathers over its own ring view, so all three must converge before the reads
+	// below: a node that still sees a partial membership routes a series to the wrong owner.
 	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
+		for _, s := range nodes {
+			if len(s.cluster.membership.Members()) != 3 {
+				return false
+			}
+		}
+
+		return true
 	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
 
 	// Four samples per series, one per step, so every series has overlapping windows to slide.
