@@ -53,6 +53,9 @@ type Storage struct {
 	logTenants     map[signal.TenantID]*recordengine.Engine
 	traceTenants   map[signal.TenantID]*recordengine.Engine
 	profileTenants map[signal.TenantID]*recordengine.Engine
+	// exemplarTenants holds the exemplar engines, keyed like the others. Exemplars ride the metrics
+	// write path but land in their own record engine (see exemplars.go).
+	exemplarTenants map[signal.TenantID]*recordengine.Engine
 
 	cluster *clusterNode // cluster runtime (membership + replica server + routed writes); nil ⇒ single-node
 
@@ -95,15 +98,16 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	}
 	o.applyDefaults()
 	s := &Storage{
-		opts:           o,
-		backend:        o.Backend,
-		tenant:         o.Tenancy,
-		tenants:        make(map[signal.TenantID]*engine.Engine),
-		logTenants:     make(map[signal.TenantID]*recordengine.Engine),
-		traceTenants:   make(map[signal.TenantID]*recordengine.Engine),
-		profileTenants: make(map[signal.TenantID]*recordengine.Engine),
-		admit:          make(map[signal.TenantID]*tenantAdmission),
-		now:            func() int64 { return time.Now().UnixNano() },
+		opts:            o,
+		backend:         o.Backend,
+		tenant:          o.Tenancy,
+		tenants:         make(map[signal.TenantID]*engine.Engine),
+		logTenants:      make(map[signal.TenantID]*recordengine.Engine),
+		traceTenants:    make(map[signal.TenantID]*recordengine.Engine),
+		profileTenants:  make(map[signal.TenantID]*recordengine.Engine),
+		exemplarTenants: make(map[signal.TenantID]*recordengine.Engine),
+		admit:           make(map[signal.TenantID]*tenantAdmission),
+		now:             func() int64 { return time.Now().UnixNano() },
 	}
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
@@ -301,6 +305,16 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 	if s.closed.Load() {
 		return Accepted{}, errors.Wrap(ErrClosed, "write metrics")
 	}
+
+	// Exemplars ride the same batch but land in their own engine, best-effort: their counts stay
+	// out of the returned Accepted, which reports data points for OTLP partial-success. Deferred so
+	// the one call covers both the clustered and local return paths, and skipped when the samples
+	// themselves failed — there is nothing to correlate against.
+	defer func() {
+		if err == nil {
+			s.writeExemplars(ctx, md)
+		}
+	}()
 
 	if s.cluster != nil {
 		return s.writeMetricsClustered(ctx, md)

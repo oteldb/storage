@@ -139,6 +139,8 @@ func splitEnginePrefix(prefix string) (tid signal.TenantID, sig signal.Signal, o
 		sig = signal.Trace
 	case profilesPrefix:
 		sig = signal.Profile
+	case exemplarsPrefix:
+		sig = signal.Exemplar
 	default:
 		return "", 0, false
 	}
@@ -341,7 +343,9 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	mux.Handle(replica.ReplicatePath, rp.Handler())       // secondary: trusting apply
 	mux.Handle(primaryWritePath, s.primaryWriteHandler()) // primary: OOO apply + replicate
 	// read fan-out across metric/log/trace/profile signals.
-	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch, s.localLogFetch, s.localTraceFetch, s.localProfileFetch))
+	mux.Handle(cluster.ReadPath, cluster.ReadHandler(
+		s.localFetch, s.localLogFetch, s.localTraceFetch, s.localProfileFetch, s.localExemplarFetch,
+	))
 	// Metric aggregate pushdown: disjoint step buckets, and the overlapping-window variant.
 	mux.Handle(cluster.AggregatePath, cluster.AggregateHandler(s.localAggregate))
 	mux.Handle(cluster.AggregateWindowPath, cluster.AggregateWindowHandler(s.localAggregateWindow))
@@ -850,6 +854,30 @@ func (s *Storage) clusterProfileFetcherFor(tid signal.TenantID) fetch.Fetcher {
 	return s.clusterRecordFetcherFor(signal.Profile, tid, s.lookupProfileEngine)
 }
 
+// localExemplarFetch serves a peer's exemplar fetch from the local exemplars engine.
+func (s *Storage) localExemplarFetch(
+	ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher,
+) ([]*fetch.Batch, error) {
+	eng, ok := s.lookupExemplarEngine(s.normalizeTenant(signal.TenantID(tenant)))
+	if !ok {
+		return nil, nil
+	}
+
+	it, err := eng.Fetch(ctx, fetch.Request{
+		Signal: signal.Exemplar, Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return fetch.Drain(ctx, it)
+}
+
+// clusterExemplarFetcherFor is the exemplars analog of [Storage.clusterLogFetcherFor].
+func (s *Storage) clusterExemplarFetcherFor(tid signal.TenantID) fetch.Fetcher {
+	return s.clusterRecordFetcherFor(signal.Exemplar, tid, s.lookupExemplarEngine)
+}
+
 // recordOwners reports whether this node owns the tenant and the addresses of its other owners.
 // shardOwners reports whether this node owns shardKey (is among its ring owners) and the addresses
 // of the remote owners. The key is used verbatim (already normalized, possibly a shard key).
@@ -881,7 +909,7 @@ func equalitySpecs(matchers []fetch.Matcher) []fetch.EqualMatcher {
 	return eq
 }
 
-// lookupRecordEngine resolves a tenant's engine for a record signal (log/trace/profile) without
+// lookupRecordEngine resolves a tenant's engine for a record signal (log/trace/profile/exemplar) without
 // creating one. Metrics are not a record signal, so they return (nil, false).
 func (s *Storage) lookupRecordEngine(sig signal.Signal, tid signal.TenantID) (*recordengine.Engine, bool) {
 	switch sig {
@@ -891,6 +919,8 @@ func (s *Storage) lookupRecordEngine(sig signal.Signal, tid signal.TenantID) (*r
 		return s.lookupTraceEngine(tid)
 	case signal.Profile:
 		return s.lookupProfileEngine(tid)
+	case signal.Exemplar:
+		return s.lookupExemplarEngine(tid)
 	default:
 		return nil, false
 	}
@@ -1176,7 +1206,7 @@ func (s *Storage) shardRecordFetcher(
 	return &filteringFetcher{inner: hedgedFetcher{store: s, op: rpcOpRead, remotes: remotes}}
 }
 
-// recordEngineFor returns the local record engine (logs, traces, or profiles) for a signal+tenant,
+// recordEngineFor returns the local record engine (logs, traces, profiles, or exemplars) for a signal+tenant,
 // creating it (with a WAL when configured) on first use.
 func (s *Storage) recordEngineFor(sig signal.Signal, tenant string) (*recordengine.Engine, error) {
 	switch sig {
@@ -1184,6 +1214,8 @@ func (s *Storage) recordEngineFor(sig signal.Signal, tenant string) (*recordengi
 		return s.traceEngineFor(signal.TenantID(tenant))
 	case signal.Profile:
 		return s.profileEngineFor(signal.TenantID(tenant))
+	case signal.Exemplar:
+		return s.exemplarEngineFor(signal.TenantID(tenant))
 	default:
 		return s.logEngineFor(signal.TenantID(tenant))
 	}

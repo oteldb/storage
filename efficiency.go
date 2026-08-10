@@ -107,6 +107,10 @@ func (s *Storage) EfficiencyStats(ctx context.Context) ([]TenantEfficiency, erro
 		return nil, err
 	}
 
+	if err := addRecord(signal.Exemplar, s.exemplarEngineSnapshotByTenant()); err != nil {
+		return nil, err
+	}
+
 	out := make([]TenantEfficiency, 0, len(byTenant))
 	for _, te := range byTenant {
 		sort.Slice(te.Signals, func(i, j int) bool { return te.Signals[i].Signal < te.Signals[j].Signal })

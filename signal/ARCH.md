@@ -64,6 +64,11 @@ a matcher set selecting metric series selects exactly the matching exemplar stre
 one point (within a metric, points have distinct attribute sets, so a point is a stream); points
 with no exemplars — nearly all of them — never reach the engine.
 
+Because the metric identity puts its labels in `Series.Attributes` — where a log/trace stream has
+nothing — the record engine had to start indexing that third attribute set for a metric selector to
+resolve exemplar streams at all. It is a no-op for the other record signals; see
+[`../recordengine/ARCH.md`](../recordengine/ARCH.md).
+
 Schema: `value` (int) + `trace_id`(Equality)/`span_id`/`attrs`(Attrs) (bytes). `trace_id` is
 near-unique by construction, so it takes the dictionary-free `CodecBytesRaw`; its equality bloom is
 what prunes a trace-to-metrics lookup. The record engine has no float kind, so `value` carries the

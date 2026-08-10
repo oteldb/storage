@@ -1,12 +1,12 @@
-# `recordengine/` — the shared record engine (logs · traces · profiles)
+# `recordengine/` — the shared record engine (logs · traces · profiles · exemplars)
 
-Record-shaped signals are a **stream** (a Resource+Scope identity, indexed by postings exactly like
+Record-shaped signals are a **stream** (a `signal.Series` identity, indexed by postings exactly like
 a metric series) of rows carrying a primary timestamp plus a fixed set of typed columns. Unlike a
 metric's `(ts, float)` sample, a record's fields vary *within* the stream, so they are **columns
 filtered by predicate**, not identity — the dual-shape contract: **Matchers resolve the stream,
 Conditions filter its records** (see [`../query/ARCH.md`](../query/ARCH.md)).
 
-All three signals share this engine; only the column schema, the projection, and (profiles) a side
+All four signals share this engine; only the column schema, the projection, and (profiles) a side
 store differ. It is the metrics engine's structural twin — head, flush, size-tiered merge with
 retention, durable bucket-index + `streams.bin` stateless read path, `MaxPartBytes` splitting, and
 the same lock discipline (see [`../engine/ARCH.md`](../engine/ARCH.md)). Notable divergences:
@@ -17,6 +17,12 @@ the same lock discipline (see [`../engine/ARCH.md`](../engine/ARCH.md)). Notable
   (`recordRowBytes`, calibrated to a real structured-log row) rather than the metric engine's exact
   per-row size. Without a flush split a part was sized only by flush cadence, and one oversized
   part distorted the size-tiered selection it feeds.
+
+**All three of the identity's attribute sets are postings-indexed** — resource, scope, and the
+signal-level `Series.Attributes`. Logs, traces and profiles leave the last empty (their per-record
+attributes are a column, and profiles fold their type labels into the resource), so it costs them
+nothing. Exemplars carry the metric's data-point attributes and reserved labels (`__name__`, …)
+there, and a metric selector resolves exemplar streams only because those are matchable.
 
 ## Schema
 
@@ -171,7 +177,7 @@ Conditions over a non-fixed column are per-record **attributes**, resolved by th
 - `bloom-{col}.bin` — per-column token blooms.
 - `keys.bin` (`OTKY`, magic+version+CRC32C) — the part's distinct per-record **attribute keys**
   (not values — bounded by the schema, so tiny). `Engine.Keys` enumerates keys across head ∪
-  in-window parts tagged with a `KeyScope` bitset (resource/scope/record), so an embedder can list
+  in-window parts tagged with a `KeyScope` bitset (resource/scope/series/record), so an embedder can list
   and push down record-attribute labels that `Series`-based resolution cannot see. It is the
   enumeration twin of `Engine.Series`.
 - `sym-{name}.bin` (`OTSP`) — the optional **side store**: a content-addressed auxiliary store a

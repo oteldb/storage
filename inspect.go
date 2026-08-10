@@ -186,6 +186,7 @@ func (s *Storage) Inspect() StoreStats {
 	addRecord(signal.Log, s.logEngineSnapshotByTenant())
 	addRecord(signal.Trace, s.traceEngineSnapshotByTenant())
 	addRecord(signal.Profile, s.profileEngineSnapshotByTenant())
+	addRecord(signal.Exemplar, s.exemplarEngineSnapshotByTenant())
 
 	// Attach per-tenant admission and order each tenant's signals deterministically.
 	out := StoreStats{Caches: CacheStats{Decode: decode}}

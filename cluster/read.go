@@ -370,10 +370,10 @@ func decodeColumn(data []byte) (fetch.NamedColumn, []byte, error) {
 type FetchFunc func(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error)
 
 // ReadHandler returns the HTTP handler that serves fetches from the local store, reconstructing
-// the pushed-down equality matchers and dispatching to the metric, log, trace, or profile fetch by
+// the pushed-down equality matchers and dispatching to the metric, log, trace, profile or exemplar fetch by
 // the request's signal (encoding the result with the matching batch codec — samples for metrics,
 // columns for the record signals). Mount it at [ReadPath].
-func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc) http.Handler {
+func ReadHandler(metricFn, logFn, traceFn, profileFn, exemplarFn FetchFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -408,6 +408,8 @@ func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc) http.Handler {
 			fn, encode = traceFn, EncodeLogBatches // record signals share the column codec
 		case signal.Profile:
 			fn, encode = profileFn, EncodeLogBatches
+		case signal.Exemplar:
+			fn, encode = exemplarFn, EncodeLogBatches
 		}
 
 		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace (peer fetch spans nest)

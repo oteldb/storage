@@ -69,7 +69,7 @@ func (a Admin) Compact(ctx context.Context, key signal.TenantID, sig signal.Sign
 // Retention forces a retention sweep across all of a tenant/shard's signals by compacting each
 // (a merge drops parts older than the policy's cutoff). Signals this node does not own are skipped.
 func (a Admin) Retention(ctx context.Context, key signal.TenantID) error {
-	for _, sig := range []signal.Signal{signal.Metric, signal.Log, signal.Trace, signal.Profile} {
+	for _, sig := range []signal.Signal{signal.Metric, signal.Log, signal.Trace, signal.Profile, signal.Exemplar} {
 		if err := a.Compact(ctx, key, sig); err != nil && !errors.Is(err, ErrNotOwner) {
 			return err
 		}

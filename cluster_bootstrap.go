@@ -72,7 +72,8 @@ func (s *Storage) hasAnyEngine(tid signal.TenantID) bool {
 	defer s.tmu.Unlock()
 
 	return s.tenants[tid] != nil ||
-		s.logTenants[tid] != nil || s.traceTenants[tid] != nil || s.profileTenants[tid] != nil
+		s.logTenants[tid] != nil || s.traceTenants[tid] != nil || s.profileTenants[tid] != nil ||
+		s.exemplarTenants[tid] != nil
 }
 
 // bootstrapShard mirrors one gained shard's data from its peers and creates the engines over
@@ -88,6 +89,7 @@ func (s *Storage) bootstrapShard(ctx context.Context, tid signal.TenantID) {
 		{logsPrefix, signal.Log},
 		{tracesPrefix, signal.Trace},
 		{profilesPrefix, signal.Profile},
+		{exemplarsPrefix, signal.Exemplar},
 	} {
 		// Shared-nothing: pull the shard's objects from its peers first. A shared backend
 		// already has them (syncParts is a no-op there).
