@@ -408,9 +408,18 @@ func TestClusterECShardRepair(t *testing.T) {
 	}
 	n1 := nodes["n1"]
 
+	// Every node must see the full membership before we compute the owner set: each node derives
+	// its own shard slot from its own ring view, so a node that has not converged repairs a
+	// different slot than the one its peers expect it to hold, and the owner cannot prune.
 	require.Eventually(t, func() bool {
-		return len(n1.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond)
+		for _, s := range nodes {
+			if len(s.cluster.membership.Members()) != 3 {
+				return false
+			}
+		}
+
+		return true
+	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
 
 	scheme := ec.Scheme{Data: 2, Parity: 1}
 	owners := n1.cluster.membership.Ring().LookupBalanced([]byte("default"), scheme.Shards())
@@ -422,17 +431,22 @@ func TestClusterECShardRepair(t *testing.T) {
 	_, err := nodes[owners[0].ID].WriteMetrics(ctx, gaugeBatch("api", "http.requests", ts, vals))
 	require.NoError(t, err)
 
-	settle := func() {
-		for range 6 {
-			for _, o := range owners {
-				nodes[o.ID].maintain(ctx)
+	// Convert → distribute → prune spans several maintenance passes, and each pass depends on
+	// what the peers did in the previous one, so drive the cycle until it converges rather than
+	// for a fixed number of rounds.
+	require.Eventually(t, func() bool {
+		for _, o := range owners {
+			nodes[o.ID].maintain(ctx)
+		}
+
+		for _, o := range owners {
+			if distinctSlots(t, ctx, nodes[o.ID].backend) != 1 {
+				return false
 			}
 		}
-	}
-	settle()
-	for _, o := range owners {
-		require.Equalf(t, 1, distinctSlots(t, ctx, nodes[o.ID].backend), "%s holds one slot before the failure", o.ID)
-	}
+
+		return true
+	}, 10*time.Second, 50*time.Millisecond, "each owner settles on exactly its own shard slot")
 
 	// A disk failure destroys the slot-2 owner's shard (its node stays in the cluster).
 	victim := nodes[owners[2].ID]
