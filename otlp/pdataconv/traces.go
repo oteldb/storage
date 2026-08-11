@@ -10,7 +10,8 @@ import (
 
 // AppendTraces converts an OTLP traces batch into dst, reusing dst's retained capacity (call
 // [trace.Traces.Reset] or use [trace.GetTraces] for a recycled batch). Every span, event, and link
-// is representable, so dropped is always 0; it is returned for symmetry with [AppendMetrics] and to
+// is representable, so dropped is always 0; it is returned for symmetry with [AppendMetrics]'s
+// point count ([Dropped.Points]) and to
 // leave room for future unrepresentable cases.
 //
 //nolint:dupl // per-signal OTLP converter; identical resource/scope walk, types differ

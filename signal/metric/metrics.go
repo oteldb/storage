@@ -62,9 +62,29 @@ type NumberPoint struct {
 	// [signal.NewAttributes]): [Project] hashes them by a one-pass merge with the reserved
 	// labels that assumes both sides are sorted, so an unsorted slice yields a wrong id.
 	Attributes signal.Attributes
-	StartTs    int64
-	Ts         int64
-	Value      float64
+	// Exemplars are the point's exemplars, usually empty. They are not part of the point's
+	// identity or value stream: they are projected separately (see the signal/exemplar
+	// package) into their own record signal, keyed by this point's [Identity.SeriesID].
+	Exemplars []Exemplar
+	StartTs   int64
+	Ts        int64
+	Value     float64
+}
+
+// Exemplar is one exemplar of a [NumberPoint]: a sampled observation carrying the trace context
+// that produced it. TraceID/SpanID are the raw 16/8-byte ids (empty when the producer had no
+// active span), and FilteredAttributes are the attributes dropped by the metric's aggregation —
+// they must be sorted by key (use [signal.NewAttributes]).
+//
+// Exemplars on histogram, exponential-histogram, and summary points are not represented here:
+// those are stored by classic decomposition into several series, which leaves an exemplar with no
+// unambiguous home, so the producer rejects and counts them.
+type Exemplar struct {
+	FilteredAttributes signal.Attributes
+	TraceID            []byte
+	SpanID             []byte
+	Ts                 int64
+	Value              float64
 }
 
 // Reset clears the batch for reuse while retaining the capacity of all backing arrays
@@ -116,9 +136,21 @@ func (sm *ScopeMetrics) AddMetric() *Metric {
 func (mt *Metric) AddPoint() *NumberPoint {
 	mt.Points = grow(mt.Points)
 	p := &mt.Points[len(mt.Points)-1]
+	exs := p.Exemplars[:0]
 	*p = NumberPoint{}
+	p.Exemplars = exs
 
 	return p
+}
+
+// AddExemplar appends a fresh [Exemplar] to the point and returns a pointer to it for the caller
+// to populate (FilteredAttributes, TraceID, SpanID, Ts, Value).
+func (p *NumberPoint) AddExemplar() *Exemplar {
+	p.Exemplars = grow(p.Exemplars)
+	e := &p.Exemplars[len(p.Exemplars)-1]
+	*e = Exemplar{}
+
+	return e
 }
 
 // grow extends s by one element, reusing the retained backing array when len < cap (the

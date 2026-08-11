@@ -12,14 +12,16 @@ import (
 	"github.com/oteldb/storage/tenant"
 )
 
-// retentionCutoff converts a retention window into an absolute cutoff at the given now (unix
-// nanoseconds); 0 means retain forever.
-func retentionCutoff(r tenant.Retention, now int64) int64 {
-	if r.MaxAge <= 0 {
+// retentionCutoff converts a signal's retention window into an absolute cutoff at the given now
+// (unix nanoseconds); 0 means retain forever. The window is per signal ([tenant.Retention.AgeFor]),
+// so exemplars can expire ahead of the samples they hang off.
+func retentionCutoff(r tenant.Retention, sig signal.Signal, now int64) int64 {
+	age := r.AgeFor(sig)
+	if age <= 0 {
 		return 0
 	}
 
-	return now - r.MaxAge.Nanoseconds()
+	return now - age.Nanoseconds()
 }
 
 // sizedPart is one flushed part's contribution to a tenant's size budget: its inclusive upper time

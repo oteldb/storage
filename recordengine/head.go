@@ -154,8 +154,8 @@ func (h *head) replayRecords(id signal.SeriesID, recs []rec) {
 	}
 }
 
-// indexLabels interns and registers every queryable label of the stream — resource and scope
-// attributes plus the scope name/version — into the postings index under id.
+// indexLabels interns and registers every queryable label of the stream — resource, scope and
+// signal-level attributes plus the scope name/version — into the postings index under id.
 func (h *head) indexLabels(id signal.SeriesID, s signal.Series) {
 	// Register the series in the all-set so it is resolvable even when it carries no labels at all
 	// (e.g. a log stream whose resource and scope are empty); otherwise resolve(nil) would skip it.
@@ -167,6 +167,13 @@ func (h *head) indexLabels(id signal.SeriesID, s signal.Series) {
 
 	for i := range s.Scope.Attributes {
 		h.addLabel(id, s.Scope.Attributes[i].Key, s.Scope.Attributes[i].Value)
+	}
+
+	// Signal-level identity attributes. Empty for logs/traces/profiles, which carry per-record
+	// attributes in a column instead; exemplars put the metric's data-point attributes and reserved
+	// labels here, and they must be matchable for a metric selector to resolve exemplar streams.
+	for i := range s.Attributes {
+		h.addLabel(id, s.Attributes[i].Key, s.Attributes[i].Value)
 	}
 
 	if len(s.Scope.Name) > 0 {

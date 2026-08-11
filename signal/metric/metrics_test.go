@@ -54,6 +54,23 @@ func TestResetRetainsCapacity(t *testing.T) {
 	assert.GreaterOrEqual(t, cap(mt2.Points), 2, "the point backing array is recycled")
 }
 
+func TestAddPointRetainsExemplarCapacity(t *testing.T) {
+	t.Parallel()
+
+	var md Metrics
+	mt := md.AddResource().AddScope().AddMetric()
+
+	p := mt.AddPoint()
+	p.AddExemplar()
+	p.AddExemplar()
+
+	md.Reset()
+
+	p2 := md.AddResource().AddScope().AddMetric().AddPoint()
+	assert.Empty(t, p2.Exemplars, "a recycled point starts with no exemplars")
+	assert.GreaterOrEqual(t, cap(p2.Exemplars), 2, "the exemplar backing array is recycled")
+}
+
 //nolint:paralleltest // testing.AllocsPerRun must not run during a parallel test.
 func TestBuilderReuseZeroAlloc(t *testing.T) {
 	name := []byte("m")

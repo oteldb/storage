@@ -19,6 +19,11 @@ const (
 	KeyScopeScope
 	// KeyScopeRecord marks a per-record attribute (the serialized attrs column).
 	KeyScopeRecord
+	// KeyScopeSeries marks a signal-level identity attribute — [signal.Series].Attributes, which sits
+	// alongside resource and scope in the stream identity and is postings-indexed like them. Logs,
+	// traces and profiles leave it empty (their per-record attributes are a column); exemplars carry
+	// the metric's data-point attributes and reserved labels (__name__, …) there.
+	KeyScopeSeries
 )
 
 // KeyInfo is a distinct attribute key and the union of the scopes it was observed in. Key aliases
@@ -45,7 +50,7 @@ func (e *Engine) Keys(start, end int64) []KeyInfo {
 		}
 	}
 
-	// Stream-identity keys: resource/scope attributes of every in-window stream. The series index is
+	// Stream-identity keys: resource/scope/series attributes of every in-window stream. The series index is
 	// authoritative (it survives flush and a stateless reload), so this is sound on all backends.
 	e.head.series.ForEach(func(id signal.SeriesID, s signal.Series) {
 		if !e.streamInRangeLocked(id, start, end) {
@@ -58,6 +63,10 @@ func (e *Engine) Keys(start, end int64) []KeyInfo {
 
 		for i := range s.Scope.Attributes {
 			add(s.Scope.Attributes[i].Key, KeyScopeScope)
+		}
+
+		for i := range s.Attributes {
+			add(s.Attributes[i].Key, KeyScopeSeries)
 		}
 
 		if len(s.Scope.Name) > 0 {

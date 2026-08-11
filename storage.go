@@ -41,7 +41,9 @@ import (
 //
 // All four signals are wired end-to-end: metrics ([Storage.WriteMetrics]/[Storage.Fetcher]) on the
 // float-sample engine, and logs, traces, and profiles ([Storage.WriteLogs]/[Storage.WriteTraces]/
-// [Storage.WriteProfiles] and their fetchers) on the shared record engine.
+// [Storage.WriteProfiles] and their fetchers) on the shared record engine. Metric exemplars ride the
+// metrics write and read back through [Storage.ExemplarFetcher] — also a record engine, keyed by the
+// metric series identity.
 type Storage struct {
 	opts    Options
 	backend backend.Backend
@@ -53,6 +55,9 @@ type Storage struct {
 	logTenants     map[signal.TenantID]*recordengine.Engine
 	traceTenants   map[signal.TenantID]*recordengine.Engine
 	profileTenants map[signal.TenantID]*recordengine.Engine
+	// exemplarTenants holds the exemplar engines, keyed like the others. Exemplars ride the metrics
+	// write path but land in their own record engine (see exemplars.go).
+	exemplarTenants map[signal.TenantID]*recordengine.Engine
 
 	cluster *clusterNode // cluster runtime (membership + replica server + routed writes); nil ⇒ single-node
 
@@ -99,15 +104,16 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	}
 	o.applyDefaults()
 	s := &Storage{
-		opts:           o,
-		backend:        o.Backend,
-		tenant:         o.Tenancy,
-		tenants:        make(map[signal.TenantID]*engine.Engine),
-		logTenants:     make(map[signal.TenantID]*recordengine.Engine),
-		traceTenants:   make(map[signal.TenantID]*recordengine.Engine),
-		profileTenants: make(map[signal.TenantID]*recordengine.Engine),
-		admit:          make(map[signal.TenantID]*tenantAdmission),
-		now:            func() int64 { return time.Now().UnixNano() },
+		opts:            o,
+		backend:         o.Backend,
+		tenant:          o.Tenancy,
+		tenants:         make(map[signal.TenantID]*engine.Engine),
+		logTenants:      make(map[signal.TenantID]*recordengine.Engine),
+		traceTenants:    make(map[signal.TenantID]*recordengine.Engine),
+		profileTenants:  make(map[signal.TenantID]*recordengine.Engine),
+		exemplarTenants: make(map[signal.TenantID]*recordengine.Engine),
+		admit:           make(map[signal.TenantID]*tenantAdmission),
+		now:             func() int64 { return time.Now().UnixNano() },
 	}
 	if s.tenant == nil {
 		s.tenant = tenant.Default()
@@ -242,6 +248,12 @@ func (s *Storage) Close(ctx context.Context) error {
 		}
 	}
 
+	for _, eng := range s.exemplarEngineSnapshot() {
+		if err := eng.Close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
 	if firstErr != nil {
 		s.obs.Logger(ctx).Warn("storage closed with errors", zap.Error(firstErr))
 	} else {
@@ -290,6 +302,12 @@ func (s *Storage) Reset(ctx context.Context) error {
 		}
 	}
 
+	for _, eng := range s.exemplarEngineSnapshot() {
+		if err := eng.Reset(ctx); err != nil {
+			return errors.Wrap(err, "reset exemplar engine")
+		}
+	}
+
 	return nil
 }
 
@@ -305,6 +323,16 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 	if s.closed.Load() {
 		return Accepted{}, errors.Wrap(ErrClosed, "write metrics")
 	}
+
+	// Exemplars ride the same batch but land in their own engine, best-effort: their counts stay
+	// out of the returned Accepted, which reports data points for OTLP partial-success. Deferred so
+	// the one call covers both the clustered and local return paths, and skipped when the samples
+	// themselves failed — there is nothing to correlate against.
+	defer func() {
+		if err == nil {
+			s.writeExemplars(ctx, md)
+		}
+	}()
 
 	if s.cluster != nil {
 		return s.writeMetricsClustered(ctx, md)
@@ -888,6 +916,7 @@ func (s *Storage) recover(ctx context.Context) error {
 	logSuffix := logsPrefix + "/" + bucketindex.Object
 	traceSuffix := tracesPrefix + "/" + bucketindex.Object
 	profileSuffix := profilesPrefix + "/" + bucketindex.Object
+	exemplarSuffix := exemplarsPrefix + "/" + bucketindex.Object
 
 	for _, k := range keys {
 		switch {
@@ -910,6 +939,11 @@ func (s *Storage) recover(ctx context.Context) error {
 			tid := signal.TenantID(strings.TrimSuffix(k, profileSuffix))
 			if err := load(s.profileEngineFor(tid)); err != nil {
 				return errors.Wrapf(err, "recover profiles tenant %q", tid)
+			}
+		case strings.HasSuffix(k, exemplarSuffix):
+			tid := signal.TenantID(strings.TrimSuffix(k, exemplarSuffix))
+			if err := load(s.exemplarEngineFor(tid)); err != nil {
+				return errors.Wrapf(err, "recover exemplars tenant %q", tid)
 			}
 		}
 	}
@@ -1002,6 +1036,15 @@ func (s *Storage) walReplayerFor(name string) (func(context.Context, signal.Tena
 	case profilesPrefix:
 		return func(_ context.Context, tid signal.TenantID, dir string) error {
 			e, err := s.profileEngineFor(tid)
+			if err != nil {
+				return err
+			}
+
+			return e.Replay(dir)
+		}, true
+	case exemplarsPrefix:
+		return func(_ context.Context, tid signal.TenantID, dir string) error {
+			e, err := s.exemplarEngineFor(tid)
 			if err != nil {
 				return err
 			}
@@ -1175,17 +1218,19 @@ func (s *Storage) flushPressured(ctx context.Context) {
 	parallel.ForEach(len(flushes), s.maintenanceConcurrency(), func(i int) { flushes[i]() })
 }
 
-// recordEngineSnapshot is every record engine (logs, traces, profiles) across tenants.
+// recordEngineSnapshot is every record engine (logs, traces, profiles, exemplars) across tenants.
 func (s *Storage) recordEngineSnapshot() []*recordengine.Engine {
 	logs := s.logEngineSnapshot()
 	traces := s.traceEngineSnapshot()
 	profiles := s.profileEngineSnapshot()
+	exemplars := s.exemplarEngineSnapshot()
 
-	out := make([]*recordengine.Engine, 0, len(logs)+len(traces)+len(profiles))
+	out := make([]*recordengine.Engine, 0, len(logs)+len(traces)+len(profiles)+len(exemplars))
 	out = append(out, logs...)
 	out = append(out, traces...)
+	out = append(out, profiles...)
 
-	return append(out, profiles...)
+	return append(out, exemplars...)
 }
 
 // runWALSync periodically fsyncs every engine's WAL until Close stops it ([WALSyncInterval] mode).
@@ -1214,8 +1259,9 @@ func (s *Storage) syncWALs() {
 	logs := s.logEngineSnapshot()
 	traces := s.traceEngineSnapshot()
 	profiles := s.profileEngineSnapshot()
+	exemplars := s.exemplarEngineSnapshot()
 
-	wals := make([]walSyncer, 0, len(metrics)+len(logs)+len(traces)+len(profiles))
+	wals := make([]walSyncer, 0, len(metrics)+len(logs)+len(traces)+len(profiles)+len(exemplars))
 	for _, e := range metrics {
 		wals = append(wals, e)
 	}
@@ -1229,6 +1275,10 @@ func (s *Storage) syncWALs() {
 	}
 
 	for _, e := range profiles {
+		wals = append(wals, e)
+	}
+
+	for _, e := range exemplars {
 		wals = append(wals, e)
 	}
 
@@ -1269,6 +1319,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	logEngines := s.logEngineSnapshotByTenant()
 	traceEngines := s.traceEngineSnapshotByTenant()
 	profileEngines := s.profileEngineSnapshotByTenant()
+	exemplarEngines := s.exemplarEngineSnapshotByTenant()
 
 	s.obs.Logger(ctx).Debug("maintenance cycle start",
 		zap.Int("metric_tenants", len(metricEngines)), zap.Int("log_tenants", len(logEngines)),
@@ -1379,7 +1430,8 @@ func (s *Storage) maintain(ctx context.Context) {
 	// parallel.ForEach dispatches in index order, so the fullest heads flush first within a cycle.
 	// This keeps one noisy tenant from delaying the relief of others when the work exceeds the
 	// concurrency bound, and drains the most in-flight memory soonest.
-	tasks := make([]maintTask, 0, len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines))
+	tasks := make([]maintTask, 0,
+		len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines)+len(exemplarEngines))
 
 	for tid, eng := range metricEngines {
 		tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
@@ -1390,20 +1442,21 @@ func (s *Storage) maintain(ctx context.Context) {
 		}})
 	}
 
-	addRecord := func(engines map[signal.TenantID]*recordengine.Engine, signalPrefix string) {
+	addRecord := func(engines map[signal.TenantID]*recordengine.Engine, signalPrefix string, sig signal.Signal) {
 		for tid, eng := range engines {
 			tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
 				maintainEngine(tid, signalPrefix, func() error { return eng.Flush(ctx) },
-					func() error { return eng.Merge(ctx, s.retainFrom(tid, sizeCutoffs[tid])) },
+					func() error { return eng.Merge(ctx, s.retainFrom(tid, sig, sizeCutoffs[tid])) },
 					func() error { return eng.RefreshReplica(ctx) },
 					func() []ecPartRef { return coldRecord(eng) })
 			}})
 		}
 	}
 
-	addRecord(logEngines, logsPrefix)
-	addRecord(traceEngines, tracesPrefix)
-	addRecord(profileEngines, profilesPrefix)
+	addRecord(logEngines, logsPrefix, signal.Log)
+	addRecord(traceEngines, tracesPrefix, signal.Trace)
+	addRecord(profileEngines, profilesPrefix, signal.Profile)
+	addRecord(exemplarEngines, exemplarsPrefix, signal.Exemplar)
 
 	s.maintStats.lastTasks.Store(int64(len(tasks)))
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].pressure > tasks[j].pressure })
@@ -1447,14 +1500,15 @@ func (s *Storage) ownedTenants(ctx context.Context, tids map[signal.TenantID]str
 }
 
 // retainFrom converts a tenant's retention policy into an absolute cutoff timestamp (unix
-// nanoseconds); 0 means retain forever. sizeCutoff is the tenant's size-budget cutoff (0 when it has
-// no MaxBytes budget or is under it, see [Storage.sizeCutoffFor]): whichever budget binds first —
-// age or bytes — wins.
-func (s *Storage) retainFrom(tid signal.TenantID, sizeCutoff int64) int64 {
+// nanoseconds) for one signal; 0 means retain forever. sizeCutoff is the tenant's size-budget cutoff
+// (0 when it has no MaxBytes budget or is under it, see [Storage.sizeCutoffFor]): whichever budget
+// binds first — age or bytes — wins. The age window is per signal, so exemplars can expire ahead of
+// everything else ([tenant.Retention.ExemplarMaxAge]); the byte budget stays tenant-wide.
+func (s *Storage) retainFrom(tid signal.TenantID, sig signal.Signal, sizeCutoff int64) int64 {
 	// tid may be a shard key ({tenant}/_s{idx}) when a signal is sharded; policy is per real tenant.
-	age := retentionCutoff(s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Retention, time.Now().UnixNano())
+	ret := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Retention
 
-	return max(age, sizeCutoff)
+	return max(retentionCutoff(ret, sig, time.Now().UnixNano()), sizeCutoff)
 }
 
 // metricMergeOptions resolves a metric tenant's policy into the absolute merge parameters —
@@ -1511,7 +1565,7 @@ func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engi
 	}
 
 	return engine.MergeOptions{
-		RetainFrom: max(retentionCutoff(p.Retention, now), sizeCutoff),
+		RetainFrom: max(retentionCutoff(p.Retention, signal.Metric, now), sizeCutoff),
 		Downsample: tiers,
 		Recompress: recompress,
 		Precision:  precision,

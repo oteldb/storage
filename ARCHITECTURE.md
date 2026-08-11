@@ -13,7 +13,7 @@
 owns the process and calls the `storage` facade.
 
 All four signals have a working ingest+read path: **metrics** on the float-sample engine
-(`engine`), **logs/traces/profiles** on the shared schema-driven record engine
+(`engine`), **logs/traces/profiles/exemplars** on the shared schema-driven record engine
 (`recordengine`). Query languages are **not** in the library — the embedder drives its own
 engines over the fetch seam (`query/fetch`).
 
@@ -25,7 +25,7 @@ engines over the fetch seam (`query/fetch`).
 |---|---|---|
 | L6 Query languages | promql/logql/traceql | **embedder's** — `query/promql` is an optional fetch→Prometheus-Queryable adapter |
 | L5 Query engine | plan · exec · cache | **embedder's** — except split-by-interval + results cache, expressible over the seam (`query/scale`) |
-| L4 **Fetch contract** | matchers + column conditions + window → batch iterator | `query/fetch`, exposed as `Storage.{,Log,Trace,Profile}Fetcher` |
+| L4 **Fetch contract** | matchers + column conditions + window → batch iterator | `query/fetch`, exposed as `Storage.{,Log,Trace,Profile,Exemplar}Fetcher` |
 | L3 Engine / Index / WAL | head · flush · merge · retention / symbols · series · postings · blooms / WAL | `engine`, `recordengine`, `index`, `wal` |
 | L2 Part / Encoding | immutable parts · per-column objects · manifest / bitstream · codecs · compress | `block`, `encoding` |
 | L1 Backend | memory · file · s3 behind one interface, CAS via `PutIfAbsent` | `backend` |
@@ -44,7 +44,7 @@ engines over the fetch seam (`query/fetch`).
 | [`wal/ARCH.md`](wal/ARCH.md) | segmented CRC-framed WAL, epochs, exactly-once recovery |
 | [`signal/ARCH.md`](signal/ARCH.md) | per-signal ingest models + projection, `otlp/pdataconv` |
 | [`engine/ARCH.md`](engine/ARCH.md) | the metrics vertical: head, flush, merge/retention/downsample, fetch, caches |
-| [`recordengine/ARCH.md`](recordengine/ARCH.md) | the shared record engine for logs/traces/profiles |
+| [`recordengine/ARCH.md`](recordengine/ARCH.md) | the shared record engine for logs/traces/profiles/exemplars |
 | [`query/ARCH.md`](query/ARCH.md) | fetch contract, scale decorators, PromQL adapter, EXPLAIN ANALYZE |
 | [`cluster/ARCH.md`](cluster/ARCH.md) | ring, membership, replication, rebalance, sharding, partsync, erasure coding |
 | [`ADMIN.md`](ADMIN.md) | operator surface: `Inspect`, `Admin`, drill-downs, metrics catalog |
@@ -58,6 +58,8 @@ engines over the fetch seam (`query/fetch`).
 
 - **Write** — `WriteMetrics`/`WriteLogs`/`WriteTraces`/`WriteProfiles` take the library's
   internal `[]byte`-based batches (`signal/{metric,log,trace,profile}`), **not pdata**.
+  `WriteMetrics` also stores any exemplars its points carry, best-effort, into the separate
+  exemplars record engine (`signal/exemplar`) — see below.
   Tenant is **derived** from Resource+Scope by the `Options.Tenant` callback, never passed.
   Returns `Accepted{Accepted, Rejected, RejectedReason}` (OTLP partial success).
 - **Read** — `Fetcher(tenants...)` and the per-signal variants return a `fetch.Fetcher` over
@@ -160,7 +162,7 @@ Distributed safety is covered by fault-injection chaos tests (`cluster/chaos_tes
 encoding/{bitstream,chunk,compress}   bit stream · column codecs · block compression
 pool/                 ByteIntMap (xxh3) for dict building
 signal/               identity model (Value/KeyValue/Attributes/SeriesID) + Signal/TenantID/Aggregation
-  signal/{metric,log,trace,profile}   per-signal ingest batch + projection
+  signal/{metric,log,trace,profile,exemplar}   per-signal ingest batch + projection
 otlp/pdataconv        optional OTel-Go bridge (only package importing pdata)
 tenant/               policy model + Resolver
 backend/{,file,s3,bucketindex,backendtest}   L1 seam, implementations, part index, conformance suite
@@ -168,7 +170,7 @@ block/                immutable columnar part format
 index/{symbols,series,postings,bloom}        identity index + inverted index + token blooms
 wal/                  segmented CRC-framed WAL
 engine/               metrics vertical
-recordengine/         shared record engine (logs/traces/profiles)
+recordengine/         shared record engine (logs/traces/profiles/exemplars)
 query/{fetch,scale,profile,promql}           read seam · scale-out decorators · EXPLAIN ANALYZE · Prom adapter
 cluster/{,ring,etcd,replica,rebalance,partsync,ec}   L0 distribution
 internal/{obs,retry,simd,parallel,cmd/gensimd}       injected observability · reliability · AVX2 kernels · fan-out

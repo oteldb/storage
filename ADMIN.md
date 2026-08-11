@@ -22,6 +22,10 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 (seconds), never on a per-request path.
 
 - `StoreStats.Tenants` — per tenant: cumulative `Admission` tally, and per-signal `SignalStats`.
+  Exemplars report as their own signal (`exemplar`), separate from the metrics they hang off: they
+  are a separate engine with an independent part lifecycle, so their `Series`/`Parts`/`HeadBytes`
+  are counted and compacted on their own. Note their write is best-effort and their accept/reject
+  counts stay out of the tenant `Admission` tally, which reports data points.
 - `StoreStats.Cluster` — cluster mode only (nil single-node): this node's address, live membership,
   owned shards, and the last enacted rebalance plan (`LastRebalance`: each changed shard's full
   owner-set diff at its per-tenant replication factor — the replicas that must backfill, not just
@@ -131,8 +135,12 @@ Imperative operator control, complementing the background maintenance loop (it h
 - `Rebalance(ctx)` — reconcile cluster ownership immediately (no-op single-node).
 - `MaintainNow(ctx)` — run one full maintenance cycle (flush + merge + retention across owned engines).
 
-The retention cutoff both paths pass to the merge is `max(age cutoff, size cutoff)`. The size cutoff
-comes from `tenant.Retention.MaxBytes`: the tenant's parts across all signals/shards on this node are
+The retention cutoff both paths pass to the merge is `max(age cutoff, size cutoff)`. The **age cutoff
+is per signal** (`tenant.Retention.AgeFor`): `MaxAge` for everything, except exemplars when
+`tenant.Retention.ExemplarMaxAge` is set — exemplars are a sampled debugging aid whose value ends
+with the trace they point at, so they are the natural first thing to expire, and setting this to the
+trace retention stops them outliving their referents. The size cutoff stays tenant-wide and comes
+from `tenant.Retention.MaxBytes`: the tenant's parts across all signals/shards on this node are
 summed and dropped oldest-first until the total fits the budget (`retention.go`). Resolving it reads
 per-part object sizes from the backend, like `PartsDetailed` — so a cycle only pays that I/O for
 tenants that actually set `MaxBytes`, and the cutoff is resolved once per tenant per cycle. It is
