@@ -160,6 +160,36 @@ Layered optimizations, each opt-in:
   come from a GC-stable doubly-bounded freelist (not `sync.Pool`, which empties at every GC and
   lost the capacity under allocation-driven collections).
 
+## Count and series enumeration
+
+`Count`/`CountBy`/`Series` share one **existence plan**: matched ids from the head index (which
+outlives a flush) and in-window existence from the live buffers, with no batch, no value column and
+no label projection. They differ in what they ask of the parts:
+
+- `Count`/`CountBy` are **exact**: a part fully inside the window contributes by sorted intersection
+  against its series index (**no** decode); a window-edge part decodes its timestamp column only and
+  binary-searches. So at most the two edge parts decode.
+- `Series` is **series-only**: every window-overlapping part contributes the matched ids its series
+  index holds — no column is ever read, so the cost is proportional to matched cardinality alone, not
+  to the window's depth. The window filter is therefore **part-granular** (a series in an overlapping
+  part is listed even if its samples sit just outside), the same granularity `recordengine.Series`
+  and Prometheus' own label endpoints have. It is the primitive the metrics label endpoints need,
+  whose fetch-based answer would decode and discard every sample of every matching series.
+
+## Label metadata
+
+`LabelNames`/`LabelValues` answer from the **index**, not from series. With no matchers the walk is
+over the postings' (name → values) map — O(distinct values), no identity materialized; with matchers
+it narrows to the matched ids and reads only the requested name off each identity (never a whole
+label set).
+
+The head's series index is **all-time**: it outlives flushes, and retention prunes samples and parts
+but never identities, so the index alone would keep offering the labels of series whose data is long
+gone. Every value is therefore **liveness-probed** — an in-window in-memory sample, or membership in
+a part overlapping the window — stopping at the first live series, so a live value costs one probe
+rather than a scan of its postings list. The part indexes are warmed *before* the engine lock is
+taken, keeping the probe I/O-free under the lock.
+
 ## Aggregate pushdown
 
 `AggregateRange`/`AggregateStep` return per-series count/sum/min/max (→avg) over a window or a

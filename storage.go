@@ -560,6 +560,37 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 	return seedFetcher{inner: s.scaleWrap(s.baseFetcher(tenants), tenants), obs: s.obs, signal: signal.Metric.String()}
 }
 
+// MetricSeries returns the identities of a tenant's metric series matching the label matchers with
+// at least one sample in [start, end] (nanoseconds; a zero start AND end disables the time filter).
+// It is the metrics twin of [Storage.LogSeries] / [Storage.ProfileSeries], so an embedder can build
+// label-name/label-value/series responses without materializing samples — the same answer through
+// [Storage.Fetcher] would decode and discard every sample of every matching series, costing
+// (cardinality x window) for a list of identities.
+//
+// In cluster mode it gathers across the tenant's shards: each shard is served locally when this node
+// owns it, else from an owner (hedged), re-applying the non-equality matchers to the owner's
+// superset. The returned identities alias engine-owned memory; copy them to retain.
+func (s *Storage) MetricSeries(
+	ctx context.Context, t signal.TenantID, matchers []fetch.Matcher, start, end int64,
+) ([]signal.Series, error) {
+	if s.closed.Load() {
+		return nil, errors.Wrap(ErrClosed, "metric series")
+	}
+
+	tid := s.normalizeTenant(t)
+
+	if s.cluster != nil {
+		return s.clusterSeries(ctx, signal.Metric, tid, matchers, start, end)
+	}
+
+	eng, ok := s.lookupEngine(tid)
+	if !ok {
+		return nil, nil
+	}
+
+	return eng.Series(ctx, metricSeriesRequest(tid, matchers, start, end))
+}
+
 // AggregateMetrics returns a per-series aggregate (count/sum/min/max — enough for avg) of one
 // tenant's metric series over the request window. An embedder's PromQL engine can use it to
 // evaluate `*_over_time` cheaply.

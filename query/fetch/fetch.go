@@ -303,6 +303,93 @@ func CounterOf(f Fetcher) Counter {
 	return nil
 }
 
+// SeriesLister is an optional [Fetcher] capability: it returns the identities of the series
+// matching r.Matchers that hold samples in [r.Start, r.End], **ascending by series id** (the
+// content hash of the identity) and deduplicated — the same order and dedup [Iterator] promises, so
+// a lister's output composes as a child of another lister. [SortSeries] restores that order for a
+// producer that gathers out of order.
+//
+// The window filter may be **coarser than exact** (a producer may answer at part granularity, so a
+// series whose samples sit just outside the window can be listed); the capability is for metadata,
+// where Prometheus itself is block-granular. A caller needing the exact "has a sample in the window"
+// test must fetch (or use [Counter]).
+// It backs the label endpoints (label names/values, /series), whose answer is a list of strings but
+// whose fetch-based implementation would decode every sample of every matching series — an
+// unmatched selector then costs (cardinality x window). A Fetcher that does not implement it opts
+// out (the caller falls back to Fetch).
+//
+// The returned identities may alias source-owned memory; copy them to retain.
+type SeriesLister interface {
+	Series(ctx context.Context, r Request) ([]signal.Series, error)
+}
+
+// SortSeries sorts identities ascending by series id (the content hash of the identity), in place,
+// and returns the slice — the order [SeriesLister] promises. It is exported for producers that
+// gather identities out of order (a cluster shard gather concatenates per-shard results).
+func SortSeries(series []signal.Series) []signal.Series {
+	l := newSeriesList(series)
+
+	return l.series
+}
+
+// SeriesListerOf is [CounterOf] for the series-enumeration capability: it walks the wrapper chain
+// (via [Unwraper]) starting at f and returns the first [SeriesLister], or nil if none.
+func SeriesListerOf(f Fetcher) SeriesLister {
+	for f != nil {
+		if l, ok := f.(SeriesLister); ok {
+			return l
+		}
+
+		u, ok := f.(Unwraper)
+		if !ok {
+			return nil
+		}
+
+		f = u.Unwrap()
+	}
+
+	return nil
+}
+
+// LabelLister is an optional [Fetcher] capability, the label-metadata twin of [SeriesLister]: it
+// returns the distinct label names, or one name's distinct canonical-text values, across the series
+// matching r.Matchers that hold samples in [r.Start, r.End] — sorted and deduplicated.
+//
+// It exists because the answer is a handful of strings while the identity set behind it can be
+// millions: a producer backed by an inverted index answers an unmatched query in O(distinct values)
+// without materializing a single identity. Callers must therefore pass **only pushable matchers**
+// (the producer returns no identities, so the caller cannot re-check a matcher it could not push);
+// with a non-pushable matcher, fall back to [SeriesLister] or Fetch. The window filter is coarse in
+// the same way [SeriesLister]'s is.
+type LabelLister interface {
+	LabelNames(ctx context.Context, r Request) ([]string, error)
+	LabelValues(ctx context.Context, r Request, name []byte) ([]string, error)
+}
+
+// ErrLabelsUnsupported reports that a [LabelLister] cannot answer this chain — a fan-out whose
+// children are not all capable, where answering from the capable subset would silently drop the
+// others' labels. The caller falls back to an identity- or fetch-based path.
+var ErrLabelsUnsupported = errors.New("fetch: label listing unsupported by this fetcher")
+
+// LabelListerOf is [CounterOf] for the label-metadata capability: it walks the wrapper chain (via
+// [Unwraper]) starting at f and returns the first [LabelLister], or nil if none.
+func LabelListerOf(f Fetcher) LabelLister {
+	for f != nil {
+		if l, ok := f.(LabelLister); ok {
+			return l
+		}
+
+		u, ok := f.(Unwraper)
+		if !ok {
+			return nil
+		}
+
+		f = u.Unwrap()
+	}
+
+	return nil
+}
+
 // SliceIterator is an [Iterator] over a fixed slice of batches — for simple fetchers and
 // tests.
 type SliceIterator struct {
