@@ -397,3 +397,217 @@ func TestCountSeriesByRecheckFallback(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, map[string]uint64{"a": 1, "a2": 1, "b": 1}, all)
 }
+
+// listingFetcher implements fetch.SeriesLister, returning identities without samples and recording
+// whether the sample path was taken. Its batches back the Fetch fallback, so a test can tell the two
+// paths apart by giving them different contents.
+type listingFetcher struct {
+	fakeFetcher
+
+	series  []signal.Series
+	lastReq fetch.Request
+	calls   int
+}
+
+func (f *listingFetcher) Series(_ context.Context, r fetch.Request) ([]signal.Series, error) {
+	f.lastReq = r
+	f.calls++
+
+	return f.series, nil
+}
+
+// TestLabelMetadataUsesSeriesLister pins the enumeration pushdown: with a [fetch.SeriesLister] in
+// the chain, the label endpoints answer from identities alone — no fetch, no sample materialization
+// — while still re-checking the non-pushable matchers.
+func TestLabelMetadataUsesSeriesLister(t *testing.T) {
+	t.Parallel()
+
+	f := &listingFetcher{series: []signal.Series{
+		series("http.requests", "/a").Series,
+		series("http.requests", "/b").Series,
+		series("cpu.seconds", "/a").Series,
+	}}
+	// Distinct contents on the sample path: anything sourced from it would show up as "/x".
+	f.batches = []*fetch.Batch{series("http.requests", "/x", [2]int64{1, 1})}
+
+	q, err := NewQueryable(f, "default").Querier(0, 10_000_000)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = q.Close() })
+	ctx := context.Background()
+
+	names, _, err := q.LabelNames(ctx, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"__name__", "route"}, names)
+
+	vals, _, err := q.LabelValues(ctx, "__name__", nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"cpu.seconds", "http.requests"}, vals)
+
+	// The pushable matcher reaches the enumeration request; the negated one is re-checked here.
+	vals, _, err = q.LabelValues(ctx, "route", nil, eq(t, "__name__", "http.requests"), neq(t, "route", "/b"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/a"}, vals)
+	require.Len(t, f.lastReq.Matchers, 1, "only the index-safe matcher is pushed")
+	assert.Equal(t, []byte("__name__"), f.lastReq.Matchers[0].Name)
+	assert.Equal(t, 3, f.calls, "every label call went through the enumeration seam")
+	assert.Zero(t, f.last.End, "the sample path was never taken")
+}
+
+// TestCountSeriesRecheckStaysExact guards the semantic boundary of the enumeration seam: it is
+// part-granular (a series in a window-overlapping part is listed even with no sample inside), which
+// is fine for metadata but not for a count, which is a query result. The count rechecks must keep
+// fetching — here the lister offers an extra series the fetch does not, and it must not be counted.
+func TestCountSeriesRecheckStaysExact(t *testing.T) {
+	t.Parallel()
+
+	f := &listingFetcher{series: []signal.Series{
+		series("http.requests", "/a").Series,
+		series("http.requests", "/b").Series, // no sample in the window ⇒ not fetched
+	}}
+	f.batches = []*fetch.Batch{series("http.requests", "/a", [2]int64{1, 1})}
+
+	q, err := NewQueryable(f, "default").Querier(0, 10_000_000)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = q.Close() })
+
+	counter := q.(interface {
+		CountSeries(ctx context.Context, startMs, endMs int64, matchers ...*labels.Matcher) (uint64, error)
+		CountSeriesBy(ctx context.Context, startMs, endMs int64, label string, matchers ...*labels.Matcher) (map[string]uint64, error)
+	})
+
+	// A non-pushable matcher forces the recheck path (the exact one).
+	ms := []*labels.Matcher{eq(t, "__name__", "http.requests"), neq(t, "route", "/zzz")}
+
+	n, err := counter.CountSeries(context.Background(), 0, 10_000, ms...)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), n, "only the series with an in-window sample counts")
+
+	groups, err := counter.CountSeriesBy(context.Background(), 0, 10_000, "route", ms...)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]uint64{"/a": 1}, groups)
+	assert.Zero(t, f.calls, "the count rechecks never take the part-granular enumeration seam")
+}
+
+// TestSeriesListerDiscovery pins the capability discovery: a lister is found, a plain fetcher opts
+// out (and the label endpoints then fall back to the fetch path).
+func TestSeriesListerDiscovery(t *testing.T) {
+	t.Parallel()
+
+	assert.NotNil(t, fetch.SeriesListerOf(&listingFetcher{}))
+	assert.Nil(t, fetch.SeriesListerOf(&fakeFetcher{}), "a plain fetcher opts out")
+
+	// The fallback still answers the label endpoints exactly.
+	f := &fakeFetcher{batches: []*fetch.Batch{
+		series("http.requests", "/a", [2]int64{1, 1}),
+		series("http.requests", "/b", [2]int64{1, 2}),
+	}}
+	q, err := NewQueryable(f, "default").Querier(0, 10_000_000)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = q.Close() })
+
+	vals, _, err := q.LabelValues(context.Background(), "route", nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/a", "/b"}, vals)
+}
+
+// labelingFetcher implements fetch.LabelLister on top of the identity lister, so a test can tell
+// which of the three paths (index metadata / identity enumeration / fetch) answered.
+type labelingFetcher struct {
+	listingFetcher
+
+	names       []string
+	values      []string
+	lastReq     fetch.Request
+	nameCalls   int
+	valCalls    int
+	unsupported bool
+}
+
+func (f *labelingFetcher) LabelNames(_ context.Context, r fetch.Request) ([]string, error) {
+	if f.unsupported {
+		return nil, fetch.ErrLabelsUnsupported
+	}
+
+	f.lastReq = r
+	f.nameCalls++
+
+	return f.names, nil
+}
+
+func (f *labelingFetcher) LabelValues(_ context.Context, r fetch.Request, _ []byte) ([]string, error) {
+	if f.unsupported {
+		return nil, fetch.ErrLabelsUnsupported
+	}
+
+	f.lastReq = r
+	f.valCalls++
+
+	return f.values, nil
+}
+
+// TestLabelMetadataUsesLabelLister pins the label-metadata pushdown: with the capability present the
+// endpoints answer from the index — no identities, no samples — with the reserved internal labels
+// and the empty value filtered out on the way through.
+func TestLabelMetadataUsesLabelLister(t *testing.T) {
+	t.Parallel()
+
+	f := &labelingFetcher{
+		names:  []string{"__name__", "__unit__", "route"},
+		values: []string{"", "/a", "/b"},
+	}
+	f.series = []signal.Series{series("http.requests", "/x").Series} // the identity path, if taken
+
+	q, err := NewQueryable(f, "default").Querier(0, 10_000_000)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = q.Close() })
+	ctx := context.Background()
+
+	names, _, err := q.LabelNames(ctx, nil, eq(t, "__name__", "http.requests"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"__name__", "route"}, names, "the reserved __unit__ is not a PromQL label")
+
+	vals, _, err := q.LabelValues(ctx, "route", nil, eq(t, "__name__", "http.requests"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/a", "/b"}, vals, "the empty value is an absent label, not a value")
+
+	require.Len(t, f.lastReq.Matchers, 1, "the pushable matcher reaches the index")
+	assert.Equal(t, 1, f.nameCalls)
+	assert.Equal(t, 1, f.valCalls)
+	assert.Zero(t, f.calls, "the identity seam was not needed")
+}
+
+// TestLabelMetadataFallsBackFromLabelLister covers the two ways the metadata pushdown steps aside:
+// a matcher that cannot be pushed (nothing would re-check it, since the capability returns strings,
+// not identities) and a chain that reports the capability unsupported.
+func TestLabelMetadataFallsBackFromLabelLister(t *testing.T) {
+	t.Parallel()
+
+	f := &labelingFetcher{names: []string{"wrong"}, values: []string{"wrong"}}
+	f.series = []signal.Series{
+		series("http.requests", "/a").Series,
+		series("http.requests", "/b").Series,
+	}
+
+	q, err := NewQueryable(f, "default").Querier(0, 10_000_000)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = q.Close() })
+	ctx := context.Background()
+
+	// Non-pushable matcher ⇒ the identity path, which re-checks it.
+	vals, _, err := q.LabelValues(ctx, "route", nil, neq(t, "route", "/b"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/a"}, vals)
+	assert.Zero(t, f.valCalls, "the metadata capability cannot re-check a non-pushable matcher")
+	assert.Equal(t, 1, f.calls, "the identity seam answered")
+
+	// Capability present but unsupported for this chain ⇒ same fallback, no error surfaced.
+	f.unsupported = true
+
+	vals, _, err = q.LabelValues(ctx, "route", nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/a", "/b"}, vals)
+
+	names, _, err := q.LabelNames(ctx, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"__name__", "route"}, names)
+}

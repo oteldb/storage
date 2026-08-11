@@ -686,6 +686,22 @@ func TestClusteredReadFansOutToOwners(t *testing.T) {
 	require.Lenf(t, got, 1, "%s served the series via read fan-out", nonOwnerName)
 	assert.Equal(t, []int64{100, 200}, got[0].Timestamps)
 	assert.Equal(t, []float64{1, 2}, got[0].Values)
+
+	// The metric enumeration seam fans out the same way — the label endpoints must not have to
+	// drain samples in cluster mode either.
+	series, err := nonOwner.MetricSeries(ctx, "default", []fetch.Matcher{nameMatcher("http.requests")}, 0, 0)
+	require.NoError(t, err)
+	require.Lenf(t, series, 1, "%s served MetricSeries via fan-out", nonOwnerName)
+
+	// ...and it is reachable as a fetcher capability, so the PromQL label endpoints find it.
+	lister := fetch.SeriesListerOf(nonOwner.Fetcher("default"))
+	require.NotNil(t, lister, "the cluster read seam exposes the enumeration capability")
+
+	listed, err := lister.Series(ctx, fetch.Request{
+		Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{nameMatcher("http.requests")},
+	})
+	require.NoError(t, err)
+	assert.Len(t, listed, 1)
 }
 
 // TestClusteredLogEnumerationFansOut covers the LogSeries/LogKeys cluster fan-out: a non-owner,

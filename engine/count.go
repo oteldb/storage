@@ -88,6 +88,18 @@ func (e *Engine) CountBy(ctx context.Context, r fetch.Request, label []byte) (ma
 // decode budget reserves timestamps only, and only window-edge parts ever decode. The caller must
 // releaseParts.
 func (e *Engine) planCount(r fetch.Request, withIdentity bool) ([]signal.SeriesID, *enginePlan) {
+	ids, plan := e.planLookup(r, withIdentity)
+
+	// Count decodes timestamps only (existence), and only for window-edge parts; reserve that.
+	plan.acquireDecodeBudget(colNeed{})
+
+	return ids, plan
+}
+
+// planLookup resolves r's matched ids under the read lock and builds the existence plan over them.
+// It reserves no decode budget: the caller adds one for the columns it will actually decode (none,
+// for the index-only [Engine.Series]). The caller must releaseParts.
+func (e *Engine) planLookup(r fetch.Request, withIdentity bool) ([]signal.SeriesID, *enginePlan) {
 	e.mu.RLock()
 	for !e.head.indexSorted() {
 		e.mu.RUnlock()
@@ -100,9 +112,6 @@ func (e *Engine) planCount(r fetch.Request, withIdentity bool) ([]signal.SeriesI
 	ids := e.head.resolve(r.Matchers)
 	plan := e.planExistence(ids, r, withIdentity)
 	e.mu.RUnlock()
-
-	// Count decodes timestamps only (existence), and only for window-edge parts; reserve that.
-	plan.acquireDecodeBudget(colNeed{})
 
 	return ids, plan
 }

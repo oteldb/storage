@@ -64,7 +64,10 @@ complete). Matchers are opaque Go closures and **not serializable**, so the RPC 
 permits). **Equality is the exception**: `fetch.Matcher` may carry a serializable `EqualMatcher`
 spec, forwarded and pushed down on the peer, so a non-owner read narrows by `__name__` instead of
 pulling the whole window. Enumeration RPCs (series, keys, side store, aggregate) fan out the same
-hedged way.
+hedged way. The series RPC is **signal-dispatched**: one endpoint enumerates stream identities for
+logs/traces/profiles and metric series alike, so the metrics label endpoints answer from identities
+in cluster mode too, and the read seam re-exposes that gather as the `fetch.SeriesLister` capability
+the shard merge underneath it cannot provide.
 
 The metric **aggregate pushdown** has two endpoints: `/internal/aggregate` returns disjoint step
 buckets, `/internal/aggregate/window` the overlapping evaluation windows of a range vector. Both

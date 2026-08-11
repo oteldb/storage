@@ -134,6 +134,9 @@ type querier struct {
 	// text allocations.
 	lb      labels.ScratchBuilder
 	scratch []byte
+	// hashBuf is the reused hash pre-image buffer for the enumeration paths, which receive bare
+	// identities (no batch, so no precomputed [signal.SeriesID]) and must re-derive the cache key.
+	hashBuf []byte
 }
 
 // Select resolves the matchers to series over [mint, maxt]. Index-safe matchers are pushed
@@ -285,6 +288,17 @@ func (q *querier) CountSeriesBy(
 func (q *querier) LabelValues(
 	ctx context.Context, name string, _ *storage.LabelHints, matchers ...*labels.Matcher,
 ) ([]string, annotations.Annotations, error) {
+	if lister, pushed, ok := q.labelLister(matchers); ok {
+		vals, err := lister.LabelValues(ctx, q.labelRequest(q.mint, q.maxt, pushed), []byte(name))
+		if err == nil {
+			return nonEmpty(vals), nil, nil
+		}
+
+		if !errors.Is(err, fetch.ErrLabelsUnsupported) {
+			return nil, nil, err
+		}
+	}
+
 	sets, err := q.seriesLabels(ctx, matchers)
 	if err != nil {
 		return nil, nil, err
@@ -305,6 +319,17 @@ func (q *querier) LabelValues(
 func (q *querier) LabelNames(
 	ctx context.Context, _ *storage.LabelHints, matchers ...*labels.Matcher,
 ) ([]string, annotations.Annotations, error) {
+	if lister, pushed, ok := q.labelLister(matchers); ok {
+		names, err := lister.LabelNames(ctx, q.labelRequest(q.mint, q.maxt, pushed))
+		if err == nil {
+			return visibleLabels(names), nil, nil
+		}
+
+		if !errors.Is(err, fetch.ErrLabelsUnsupported) {
+			return nil, nil, err
+		}
+	}
+
 	sets, err := q.seriesLabels(ctx, matchers)
 	if err != nil {
 		return nil, nil, err
@@ -318,6 +343,33 @@ func (q *querier) LabelNames(
 	return sortedKeys(seen), nil, nil
 }
 
+// nonEmpty drops the empty value from a listing: PromQL treats an empty label value as an absent
+// label, so it is never a value of the label (the projection-based path drops it the same way).
+func nonEmpty(values []string) []string {
+	out := values[:0]
+	for _, v := range values {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+
+	return out
+}
+
+// visibleLabels drops the internal reserved labels from a storage-side name listing, mirroring what
+// the label projection strips when rendering a series (see hiddenLabels). The listing comes from the
+// index, which knows nothing of the PromQL label set.
+func visibleLabels(names []string) []string {
+	out := names[:0]
+	for _, n := range names {
+		if _, hidden := hiddenLabels[n]; !hidden {
+			out = append(out, n)
+		}
+	}
+
+	return out
+}
+
 func (q *querier) Close() error {
 	for _, b := range q.held {
 		b.Release() // the engine is done evaluating — recycle the result buffers
@@ -326,6 +378,21 @@ func (q *querier) Close() error {
 	q.held = nil
 
 	return nil
+}
+
+// labelLister returns the fetcher's label-metadata capability and the lowered matchers, and whether
+// it may be used at all: the capability returns strings, not identities, so a matcher that could not
+// be pushed into the index has nowhere to be re-checked and the caller must take an identity-based
+// path instead (the same rule [querier.CountSeries]' pushdown follows).
+func (q *querier) labelLister(matchers []*labels.Matcher) (fetch.LabelLister, []fetch.Matcher, bool) {
+	pushed := PushableMatchers(matchers)
+	if len(pushed) < len(matchers) {
+		return nil, nil, false
+	}
+
+	lister := fetch.LabelListerOf(q.fetcher)
+
+	return lister, pushed, lister != nil
 }
 
 // promLabels is [PromLabels] reusing the querier's scratch builder + text buffer across a Select's
@@ -342,31 +409,12 @@ func (q *querier) countSeriesRecheck(
 	ctx context.Context, startMs, endMs int64,
 	matchers []*labels.Matcher, pushed []fetch.Matcher,
 ) (uint64, error) {
-	req := fetch.Request{
-		Tenant:   q.tenant,
-		Start:    msToNsClamp(startMs, math.MinInt64),
-		End:      msToNsClamp(endMs, math.MaxInt64),
-		Matchers: pushed,
-	}
-
-	it, err := q.fetcher.Fetch(ctx, req)
+	sets, err := q.fetchedLabels(ctx, startMs, endMs, matchers, pushed)
 	if err != nil {
 		return 0, err
 	}
 
-	batches, err := fetch.Drain(ctx, it)
-	if err != nil {
-		return 0, err
-	}
-
-	var n uint64
-	for _, b := range batches {
-		if MatchesAll(PromLabels(b.Series), matchers) {
-			n++
-		}
-	}
-
-	return n, nil
+	return uint64(len(sets)), nil
 }
 
 // countSeriesByRecheck is [querier.countSeriesRecheck] grouped by one label: it fetches the
@@ -376,45 +424,76 @@ func (q *querier) countSeriesByRecheck(
 	ctx context.Context, startMs, endMs int64, label string,
 	matchers []*labels.Matcher, pushed []fetch.Matcher,
 ) (map[string]uint64, error) {
-	req := fetch.Request{
-		Tenant:   q.tenant,
-		Start:    msToNsClamp(startMs, math.MinInt64),
-		End:      msToNsClamp(endMs, math.MaxInt64),
-		Matchers: pushed,
-	}
-
-	it, err := q.fetcher.Fetch(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	batches, err := fetch.Drain(ctx, it)
+	sets, err := q.fetchedLabels(ctx, startMs, endMs, matchers, pushed)
 	if err != nil {
 		return nil, err
 	}
 
 	groups := make(map[string]uint64)
-
-	for _, b := range batches {
-		lset := PromLabels(b.Series)
-		if MatchesAll(lset, matchers) {
-			groups[lset.Get(label)]++
-		}
+	for _, lset := range sets {
+		groups[lset.Get(label)]++
 	}
 
 	return groups, nil
 }
 
-// seriesLabels fetches the matching series over the querier window and projects each to its
+// seriesLabels resolves the matching series over the querier window and projects each to its
 // Prometheus label set. It mirrors Select's matching (push the index-safe matchers, then re-check
 // every series against the full set) but keeps only the identities, not the samples.
+//
+// It prefers the fetcher's [fetch.SeriesLister] capability, which answers from the series index
+// alone: the label endpoints need identities only, so a fetch-based answer would decode and copy
+// every sample of every matching series to then discard them — cost proportional to
+// (cardinality x window) for a list of label values. The seam's time filter is part-granular (a
+// series in a window-overlapping part is listed even if its samples sit just outside), which is what
+// Prometheus' own block-granular label endpoints return; the exact "has a sample in the window"
+// test lives in the count paths, which keep fetching.
 func (q *querier) seriesLabels(ctx context.Context, matchers []*labels.Matcher) ([]labels.Labels, error) {
-	req := fetch.Request{
-		Tenant:   q.tenant,
-		Start:    msToNsClamp(q.mint, math.MinInt64),
-		End:      msToNsClamp(q.maxt, math.MaxInt64),
-		Matchers: PushableMatchers(matchers),
+	pushed := PushableMatchers(matchers)
+
+	lister := fetch.SeriesListerOf(q.fetcher)
+	if lister == nil {
+		return q.fetchedLabels(ctx, q.mint, q.maxt, matchers, pushed)
 	}
+
+	series, err := lister.Series(ctx, q.labelRequest(q.mint, q.maxt, pushed))
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]labels.Labels, 0, len(series))
+
+	for i := range series {
+		// The enumeration seam yields bare identities, so the cache key is re-derived here
+		// (through a reused buffer) instead of coming from the batch.
+		q.hashBuf = series[i].AppendHashInput(q.hashBuf[:0])
+
+		if lset, ok := q.matchedLabels(signal.HashBytes(q.hashBuf), series[i], matchers); ok {
+			out = append(out, lset)
+		}
+	}
+
+	return out, nil
+}
+
+// labelRequest is the identity-shaped fetch request the enumeration paths share.
+func (q *querier) labelRequest(startMs, endMs int64, pushed []fetch.Matcher) fetch.Request {
+	return fetch.Request{
+		Tenant:   q.tenant,
+		Start:    msToNsClamp(startMs, math.MinInt64),
+		End:      msToNsClamp(endMs, math.MaxInt64),
+		Matchers: pushed,
+	}
+}
+
+// fetchedLabels resolves the series matching pushed (the index-safe subset) that have at least one
+// sample in [startMs, endMs] — exactly, by fetching them — re-checks each against the full matcher
+// set, and returns the label sets that pass, memoized through the querier's [LabelCache]. The count
+// rechecks answer a query, not metadata, so they pay the fetch for that exactness.
+func (q *querier) fetchedLabels(
+	ctx context.Context, startMs, endMs int64, matchers []*labels.Matcher, pushed []fetch.Matcher,
+) ([]labels.Labels, error) {
+	req := q.labelRequest(startMs, endMs, pushed)
 
 	it, err := q.fetcher.Fetch(ctx, req)
 	if err != nil {
@@ -427,16 +506,28 @@ func (q *querier) seriesLabels(ctx context.Context, matchers []*labels.Matcher) 
 	}
 
 	out := make([]labels.Labels, 0, len(batches))
-	for _, b := range batches {
-		lset := PromLabels(b.Series)
-		if !MatchesAll(lset, matchers) {
-			continue
-		}
 
-		out = append(out, lset)
+	for _, b := range batches {
+		if lset, ok := q.matchedLabels(b.ID, b.Series, matchers); ok {
+			out = append(out, lset)
+		}
 	}
 
 	return out, nil
+}
+
+// matchedLabels projects s to its Prometheus label set (through the [LabelCache], keyed by the
+// content-addressed id) and reports whether it passes the full matcher set.
+func (q *querier) matchedLabels(
+	id signal.SeriesID, s signal.Series, matchers []*labels.Matcher,
+) (labels.Labels, bool) {
+	lset, ok := q.labels.get(id)
+	if !ok {
+		lset = q.promLabels(s)
+		q.labels.put(id, lset)
+	}
+
+	return lset, MatchesAll(lset, matchers)
 }
 
 // sortedKeys returns the keys of set in sorted order (Prometheus label APIs return sorted results).

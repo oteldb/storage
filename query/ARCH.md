@@ -29,6 +29,24 @@ Optional capabilities, discovered by walking the `Unwraper` decorator chain:
   intersection against the part index (a fully-covered part decodes **nothing**; only window-edge
   parts decode, and only their timestamp column). `CountBy` groups by a label's canonical text over
   the same flattened key space postings sees.
+- **`SeriesLister`** — identity enumeration, **series-only**: matched ids from the postings index
+  plus the matched ids each window-overlapping part's series index holds. No column is read, so the
+  cost is proportional to matched cardinality alone, not to the window's depth. It backs the label
+  endpoints (`LabelNames`/`LabelValues`/`/series`), whose answer is a set of identities — a
+  fetch-based answer decodes every sample of every matching series, so an unmatched selector cost
+  (cardinality × window). The price is a **part-granular** window (a series in an overlapping part is
+  listed even with no sample inside), which is what Prometheus' block-granular label endpoints
+  return; anything needing the exact "has a sample in the window" test (the count rechecks) keeps
+  fetching. Unlike counting, enumeration **composes across a fan-out** — identities are
+  content-addressed, so `Merge` unions and dedups them (a child without the capability contributes
+  the identities of a plain fetch), and the cluster read seam re-exposes its shard gather.
+- **`LabelLister`** — the label-metadata twin, answered from the **inverted index** rather than from
+  series: with no matchers the walk is over the postings' (name → values) map, so a template
+  variable's `/api/v1/label/<name>/values` costs O(distinct values) instead of O(series) — microseconds
+  where the identity path takes seconds at high cardinality. Callers must push **every** matcher
+  (the answer is strings, so a matcher that could not be pushed has nowhere to be re-checked); a
+  fan-out with an incapable child returns `ErrLabelsUnsupported` rather than answering from a subset,
+  and the caller drops to `SeriesLister` and then to Fetch.
 - **`Recycle` + `Batch.Release`** — opt-in buffer reuse through a shared release hook.
   Pass-through decorators forward it; a decorator that retains or clones a batch emits hookless
   copies and releases its inputs.

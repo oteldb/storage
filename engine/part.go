@@ -94,6 +94,20 @@ func (idx partIndex) has(ctx context.Context, id signal.SeriesID) (bool, error) 
 	return ok, nil
 }
 
+// warm resolves the paged index's entries, so subsequent [partIndex.has] probes are pure in-memory
+// binary searches. It is how the label enumeration keeps its backend I/O off the engine lock: warm
+// every part first, then probe under the read lock (the ARCH invariant that the lock is never held
+// across object-store I/O).
+func (idx partIndex) warm(ctx context.Context) error {
+	if p := idx.paged; p != nil {
+		_, err := p.entries(ctx)
+
+		return err
+	}
+
+	return nil
+}
+
 // seriesCount returns the number of distinct series in the part.
 func (idx partIndex) seriesCount() int {
 	if idx.paged != nil {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -431,7 +432,31 @@ func (s *Storage) clusterFetcherFor(tid signal.TenantID) fetch.Fetcher {
 		shardFetchers = append(shardFetchers, scopedFetcher{inner: s.shardFetcher(sk), scope: sk})
 	}
 
-	return fetch.Merge(shardFetchers...)
+	return clusterSeriesFetcher{Fetcher: fetch.Merge(shardFetchers...), store: s, tenant: tenant}
+}
+
+// clusterSeriesFetcher adds the [fetch.SeriesLister] capability to a tenant's cluster read seam.
+// The shard fan-out under it is a multi-child merge, which opts out of the fetcher capabilities
+// (their per-child semantics do not compose), so without this layer the label endpoints would fall
+// back to draining every sample of every matching series. Series enumeration *does* compose: shards
+// partition a tenant's series, so the gather is a concatenation — exactly what
+// [Storage.clusterSeries] already does for the record signals.
+type clusterSeriesFetcher struct {
+	fetch.Fetcher
+
+	store  *Storage
+	tenant signal.TenantID
+}
+
+func (f clusterSeriesFetcher) Series(ctx context.Context, r fetch.Request) ([]signal.Series, error) {
+	series, err := f.store.clusterSeries(ctx, signal.Metric, f.tenant, r.Matchers, r.Start, r.End)
+	if err != nil {
+		return nil, err
+	}
+
+	// The gather concatenates per-shard results (each ascending, the shards disjoint); the
+	// capability promises one ascending stream.
+	return fetch.SortSeries(series), nil
 }
 
 // shardFetcher returns the read seam for one metric shard: the local engine if this node is an
@@ -896,17 +921,44 @@ func (s *Storage) lookupRecordEngine(sig signal.Signal, tid signal.TenantID) (*r
 	}
 }
 
-// localSeries serves a peer's series listing for any record signal from the local engine,
-// dispatched by the request's signal (one enumeration RPC serves logs/traces/profiles).
+// localSeries serves a peer's series listing from the local engine, dispatched by the request's
+// signal (one enumeration RPC serves metrics and logs/traces/profiles alike).
 func (s *Storage) localSeries(
-	_ context.Context, sig signal.Signal, tenant string, start, end int64, matchers []fetch.Matcher,
+	ctx context.Context, sig signal.Signal, tenant string, start, end int64, matchers []fetch.Matcher,
 ) ([]signal.Series, error) {
-	eng, ok := s.lookupRecordEngine(sig, s.normalizeTenant(signal.TenantID(tenant)))
+	tid := s.normalizeTenant(signal.TenantID(tenant))
+
+	if sig == signal.Metric {
+		eng, ok := s.lookupEngine(tid)
+		if !ok {
+			return nil, nil
+		}
+
+		return eng.Series(ctx, metricSeriesRequest(tid, matchers, start, end))
+	}
+
+	eng, ok := s.lookupRecordEngine(sig, tid)
 	if !ok {
 		return nil, nil
 	}
 
 	return eng.Series(matchers, start, end), nil
+}
+
+// metricSeriesRequest builds the enumeration request for the metrics engine, applying the
+// record-engine convention the series seam shares: a zero start AND end disables the time filter.
+func metricSeriesRequest(tid signal.TenantID, matchers []fetch.Matcher, start, end int64) fetch.Request {
+	if start == 0 && end == 0 {
+		start, end = math.MinInt64, math.MaxInt64
+	}
+
+	return fetch.Request{
+		Signal:   signal.Metric,
+		Tenant:   tid,
+		Start:    start,
+		End:      end,
+		Matchers: matchers,
+	}
 }
 
 // localKeys serves a peer's distinct attribute-key listing for a record signal from the local
