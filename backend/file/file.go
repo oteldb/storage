@@ -8,6 +8,7 @@ import (
 	"context"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -37,6 +38,11 @@ func New(dir string) (*File, error) {
 		return nil, errors.Wrapf(err, "create root %q", abs)
 	}
 
+	// Directories left behind by a version without Delete-time pruning (or by a crash between
+	// an object delete and its rmdir) make every List traverse dead subtrees forever. Sweep
+	// them once at open; best-effort, an unreadable subtree is not a reason to fail.
+	pruneEmpty(abs)
+
 	return &File{root: abs}, nil
 }
 
@@ -51,14 +57,9 @@ func (f *File) Write(_ context.Context, key string, data []byte) (rerr error) {
 		return err
 	}
 
-	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return errors.Wrapf(err, "mkdir %q", dir)
-	}
-
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	tmp, err := createTemp(filepath.Dir(p))
 	if err != nil {
-		return errors.Wrap(err, "create temp")
+		return err
 	}
 
 	tmpName := tmp.Name()
@@ -103,14 +104,9 @@ func (f *File) PutIfAbsent(_ context.Context, key string, data []byte) (written 
 		return false, err
 	}
 
-	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return false, errors.Wrapf(err, "mkdir %q", dir)
-	}
-
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	tmp, err := createTemp(filepath.Dir(p))
 	if err != nil {
-		return false, errors.Wrap(err, "create temp")
+		return false, err
 	}
 
 	tmpName := tmp.Name()
@@ -183,15 +179,35 @@ func (f *File) Size(_ context.Context, key string) (int64, error) {
 }
 
 // List returns, sorted ascending, every key with the given prefix.
+//
+// The prefix bounds the work, not just the result: keys map to paths, so only the subtree
+// under the prefix's directory component is traversed, and within it only the children whose
+// name can still extend into the prefix's final (possibly partial) segment.
 func (f *File) List(_ context.Context, prefix string) ([]string, error) {
+	dirKey, leaf := path.Split(prefix)
+
+	base, err := f.path(dirKey)
+	if err != nil {
+		return nil, err
+	}
+
 	var keys []string
 
-	err := filepath.WalkDir(f.root, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// A prefix whose directory does not exist lists empty, as on an object store.
+			if p == base && errors.Is(err, fs.ErrNotExist) {
+				return fs.SkipAll
+			}
+
 			return err
 		}
 
 		if d.IsDir() {
+			if leaf != "" && p != base && filepath.Dir(p) == base && !strings.HasPrefix(d.Name(), leaf) {
+				return fs.SkipDir
+			}
+
 			return nil
 		}
 
@@ -200,9 +216,9 @@ func (f *File) List(_ context.Context, prefix string) ([]string, error) {
 			return nil
 		}
 
-		rel, err := filepath.Rel(f.root, path)
+		rel, err := filepath.Rel(f.root, p)
 		if err != nil {
-			return errors.Wrapf(err, "relativize %q", path)
+			return errors.Wrapf(err, "relativize %q", p)
 		}
 
 		key := filepath.ToSlash(rel)
@@ -236,7 +252,68 @@ func (f *File) Delete(_ context.Context, key string) error {
 		return errors.Wrapf(err, "delete %q", key)
 	}
 
+	f.pruneParents(p)
+
 	return nil
+}
+
+// pruneParents removes the directories left empty by deleting p, up to (but never including)
+// the root. Without it a deleted part leaves its directories behind forever, and every List
+// keeps paying for them: the traversal cost grows with parts ever created, not parts retained.
+func (f *File) pruneParents(p string) {
+	for dir := filepath.Dir(p); strings.HasPrefix(dir, f.root+string(os.PathSeparator)); dir = filepath.Dir(dir) {
+		// Fails with ENOTEMPTY as soon as a directory still holds objects.
+		if err := os.Remove(dir); err != nil {
+			return
+		}
+	}
+}
+
+// pruneEmpty removes every empty directory under dir (not dir itself), reporting whether dir
+// is empty afterwards. Errors are ignored: it is an optimization, not a correctness step.
+func pruneEmpty(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+
+	empty := true
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			empty = false
+
+			continue
+		}
+
+		sub := filepath.Join(dir, e.Name())
+		if pruneEmpty(sub) && os.Remove(sub) == nil {
+			continue
+		}
+
+		empty = false
+	}
+
+	return empty
+}
+
+// createTemp creates a temp file in dir, creating dir first. It retries once when dir vanishes
+// between the two: a concurrent [File.Delete] prunes directories its last object leaves empty.
+func createTemp(dir string) (*os.File, error) {
+	for attempt := 0; ; attempt++ {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return nil, errors.Wrapf(err, "mkdir %q", dir)
+		}
+
+		tmp, err := os.CreateTemp(dir, ".tmp-*")
+		if err == nil {
+			return tmp, nil
+		}
+
+		if attempt > 0 || !errors.Is(err, fs.ErrNotExist) {
+			return nil, errors.Wrap(err, "create temp")
+		}
+	}
 }
 
 // path maps a slash-delimited key to an absolute filesystem path under root, rejecting

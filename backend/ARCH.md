@@ -12,7 +12,10 @@ conformance suite all of them pass under `-race`.
 - **`backend.Memory()`** — ephemeral reference backend; copies on both read and write so stored
   objects never alias a caller's buffer. The default in tests.
 - **`backend/file`** — directory tree with a `..` traversal guard; atomic write via temp+fsync+
-  rename, `PutIfAbsent` via temp + `os.Link`.
+  rename, `PutIfAbsent` via temp + `os.Link`. **The key prefix bounds the traversal, not just the
+  result**: `List` walks only the prefix's subtree, and `Delete` rmdirs the directories its object
+  leaves empty (`New` sweeps pre-existing ones once). Otherwise a listing costs a full-tree walk
+  whose size grows with parts *ever created* — maintenance lists per tenant/signal every tick.
 - **`backend/s3`** — store-specific calls sit behind a small `ObjectStore` interface so the
   contract logic (root prefixing, sorted listing, 404→`ErrNotExist`, conditional put, idempotent
   delete) is testable over a fake. `NewAWS` adapts aws-sdk-go-v2 — **the only package importing
