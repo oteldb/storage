@@ -63,6 +63,10 @@ const (
 	// rather than a single stream). Additive like flagLossy: an unblocked column leaves it clear and
 	// keeps the prior byte-for-byte layout, so existing parts read unchanged.
 	flagBlocked byte = 1 << 2
+	// flagFramed marks a blocked column whose object uses the frame-packed directory (several decode
+	// granules per compression frame). Clear on the older one-compressed-block-per-granule layout,
+	// which the reader still parses. Meaningful only together with flagBlocked.
+	flagFramed byte = 1 << 3
 )
 
 // ErrCorrupt is returned when a manifest (or any part metadata) fails to parse:
@@ -101,6 +105,12 @@ type ColumnDesc struct {
 	// (see blockcolumn.go) instead of a single stream, so a reader can decode one block at a time.
 	// Persisted via [flagBlocked]; clear on the prior single-stream layout.
 	Blocked bool
+
+	// Framed marks a blocked column written with the frame-packed directory, where a compression
+	// frame spans several decode granules so the compressor sees more than one granule of context.
+	// Persisted via [flagFramed]; clear on the older one-block-per-granule layout, which is still
+	// read. Set by the writer on every blocked column it produces.
+	Framed bool
 }
 
 // Manifest is the part descriptor: format version, row count, time range, granule size,
@@ -153,6 +163,10 @@ func (m Manifest) Encode(dst []byte) []byte {
 
 		if c.Blocked {
 			flags |= flagBlocked
+		}
+
+		if c.Framed {
+			flags |= flagFramed
 		}
 
 		_ = w.WriteByte(flags)
@@ -318,6 +332,7 @@ func decodeColumnDesc(r *bitstream.Reader) (ColumnDesc, error) {
 
 	c.Const = flags&flagConst != 0
 	c.Blocked = flags&flagBlocked != 0
+	c.Framed = flags&flagFramed != 0
 
 	if flags&flagLossy != 0 {
 		bits, err := r.ReadByte()

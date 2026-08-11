@@ -30,14 +30,15 @@ func columnKey(prefix string, i int) string {
 // added in order; their ordinal is their object key. The sort-key column (timestamp for
 // metrics) drives the marks index and the manifest time range.
 type PartWriter struct {
-	sortKey     string
-	granuleSize int
-	defaultComp compress.Algorithm
-	level       compress.Level
-	columns     []Column
-	rows        int
-	haveRows    bool
-	comps       map[compress.Algorithm]*compress.Compressor
+	sortKey       string
+	granuleSize   int
+	compressBytes int
+	defaultComp   compress.Algorithm
+	level         compress.Level
+	columns       []Column
+	rows          int
+	haveRows      bool
+	comps         map[compress.Algorithm]*compress.Compressor
 }
 
 // PartOption configures a [PartWriter].
@@ -45,6 +46,15 @@ type PartOption func(*PartWriter)
 
 // WithGranuleSize sets the sparse-index granularity in rows (default 8192).
 func WithGranuleSize(n int) PartOption { return func(w *PartWriter) { w.granuleSize = n } }
+
+// WithCompressBlockBytes sets the minimum uncompressed bytes packed into one compression frame of a
+// block-framed column (default [defaultCompressBlockBytes]). It decouples the compression unit from
+// the decode granule ([WithGranuleSize]): a granule stays the smallest decodable slice, while a frame
+// gathers enough consecutive granules to give the compressor real context. Decode-compatible either
+// way — the directory records the packing.
+func WithCompressBlockBytes(n int) PartOption {
+	return func(w *PartWriter) { w.compressBytes = n }
+}
 
 // WithSortKey names the int64 column that the marks index and time range are built over.
 // If unset, the first int64 column is used.
@@ -67,9 +77,10 @@ func WithCompressionLevel(level compress.Level) PartOption {
 // NewPartWriter returns a [PartWriter] with the given options applied.
 func NewPartWriter(opts ...PartOption) *PartWriter {
 	w := &PartWriter{
-		granuleSize: defaultGranuleSize,
-		level:       compress.LevelDefault,
-		comps:       make(map[compress.Algorithm]*compress.Compressor),
+		granuleSize:   defaultGranuleSize,
+		compressBytes: defaultCompressBlockBytes,
+		level:         compress.LevelDefault,
+		comps:         make(map[compress.Algorithm]*compress.Compressor),
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -129,7 +140,7 @@ func (w *PartWriter) build() (builtPart, error) {
 			alg = w.defaultComp
 		}
 
-		desc, obj, err := buildColumn(*c, w.compressorFor(alg), w.granuleSize)
+		desc, obj, err := buildColumn(*c, w.compressorFor(alg), w.granuleSize, w.compressBytes)
 		if err != nil {
 			return builtPart{}, errors.Wrapf(err, "column %q", c.Name)
 		}

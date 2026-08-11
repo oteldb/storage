@@ -25,8 +25,8 @@ collapses a single-id run. `ColumnReader` is lazy and synthesizes constants with
 
 Opt-in (`Column.Block`): a per-row sequential column is split into granule-sized row blocks, each
 an **independently decodable** stream (codecs reset their running state at every block's row 0),
-each compressed on its own, flagged `flagBlocked` in the descriptor (additive, no version bump).
-This buys the sub-part primitives the engines need:
+flagged `flagBlocked` in the descriptor (additive, no version bump). This buys the sub-part
+primitives the engines need:
 
 - `RangeInt64`/`RangeFloat64` — decode only the blocks spanning a row range (seek).
 - `DecodeBlocksInt64/Float64` — decode a chosen *set* of blocks into a full-length slice (the
@@ -38,13 +38,27 @@ Block boundaries align with marks granules, so marks already carry each block's 
 Unblocked columns keep the prior single-stream layout byte-for-byte. Metric parts are blocked by
 default.
 
+**The decode granule is not the compression unit.** A granule is ~1.6 KB of stream — far too little
+context for an entropy coder, which would restart its state every granule. Consecutive granules are
+therefore concatenated into a *compression frame* of at least `WithCompressBlockBytes` (64 KiB
+default, ClickHouse's `min_compress_block_size`) and compressed as a unit; the directory records the
+frame spans plus each granule's span inside its decompressed frame, so a single granule is still
+decodable on its own. Decode granularity stays `WithGranuleSize`; compression granularity is the
+frame. Reads decompress one frame at a time and cache it (`blockStreams`), so any walk in granule
+order — whole column, row range, block set, cursor — decompresses each frame exactly once.
+
+The frame-packed directory is marked `flagFramed`; the older one-compressed-block-per-granule
+layout has `flagBlocked` without it and is still read, so parts written before framing need no
+rewrite. The writer only emits the framed form.
+
 ## Manifest & marks
 
 - **Manifest** — versioned binary record (magic `OTPM`, row count, time range, granule size,
   per-column descriptors) + trailing CRC32C. A descriptor is `[name][kind][codec][compress][flags]`,
   then a `FloatPrecisionBits` byte **only when `flagLossy` is set**, then per-kind stats/const. The
   flag-gating is what keeps lossless and pre-existing parts byte-identical (no version bump, no
-  golden churn); `flagBlocked` is additive the same way. Decode bounds-checks every field (fuzzed).
+  golden churn); `flagBlocked`/`flagFramed` are additive the same way. Decode bounds-checks every
+  field (fuzzed).
 - **Marks** — sparse granule index over the sort-key column (per-granule first row + min/max,
   delta-encoded, CRC-checked). `Overlapping(lo,hi)` prunes granules for a time window.
 

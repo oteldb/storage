@@ -95,7 +95,7 @@ func defaultCodec(k Kind) chunk.Codec {
 // collapses to its descriptor with no object (the value lives in the manifest); every
 // other column is a chunk-codec stream wrapped in comp's block frame. comp selects the
 // block-compression algorithm recorded in the descriptor.
-func buildColumn(c Column, comp *compress.Compressor, blockRows int) (ColumnDesc, []byte, error) {
+func buildColumn(c Column, comp *compress.Compressor, blockRows, compressBytes int) (ColumnDesc, []byte, error) {
 	if !c.Kind.valid() {
 		return ColumnDesc{}, nil, errors.Errorf("block: column %q has invalid kind %d", c.Name, c.Kind)
 	}
@@ -148,9 +148,9 @@ func buildColumn(c Column, comp *compress.Compressor, blockRows int) (ColumnDesc
 	}
 
 	if c.Block {
-		desc.Blocked = true
+		desc.Blocked, desc.Framed = true, true
 
-		obj, err := encodeBlocked(c, codec, budget, comp, blockRows)
+		obj, err := encodeBlocked(c, codec, budget, comp, blockRows, compressBytes)
 		if err != nil {
 			return ColumnDesc{}, nil, err
 		}
@@ -454,7 +454,7 @@ func decodeColumn[T any](r *ColumnReader, dst []T, dec func([]T, []byte) ([]T, i
 	}
 
 	if r.desc.Blocked {
-		dir, err := parseBlockDir(r.object)
+		dir, err := r.blockDir()
 		if err != nil {
 			return nil, errors.Wrapf(err, "column %q", r.desc.Name)
 		}
@@ -509,7 +509,7 @@ func decodeRange[T any](r *ColumnReader, dst []T, lo, hi int, constVal T, dec fu
 	}
 
 	if r.desc.Blocked {
-		dir, err := parseBlockDir(r.object)
+		dir, err := r.blockDir()
 		if err != nil {
 			return nil, errors.Wrapf(err, "column %q", r.desc.Name)
 		}
@@ -626,7 +626,7 @@ func (r *ColumnReader) TsCursor() (chunk.TsCursor, error) {
 	}
 
 	if r.desc.Blocked {
-		dir, err := parseBlockDir(r.object)
+		dir, err := r.blockDir()
 		if err != nil {
 			return nil, errors.Wrapf(err, "column %q", r.desc.Name)
 		}
@@ -654,7 +654,7 @@ func (r *ColumnReader) FloatCursor() (chunk.FloatDecoder, error) {
 	}
 
 	if r.desc.Blocked {
-		dir, err := parseBlockDir(r.object)
+		dir, err := r.blockDir()
 		if err != nil {
 			return nil, errors.Wrapf(err, "column %q", r.desc.Name)
 		}
@@ -679,7 +679,7 @@ func (r *ColumnReader) BlockRows() (int, error) {
 		return 0, nil
 	}
 
-	dir, err := parseBlockDir(r.object)
+	dir, err := r.blockDir()
 	if err != nil {
 		return 0, errors.Wrapf(err, "column %q", r.desc.Name)
 	}
@@ -696,7 +696,7 @@ func (r *ColumnReader) DecodeBlocksInt64(dst []int64, blocks []int) ([]int64, er
 		return r.Int64(dst)
 	}
 
-	dir, err := parseBlockDir(r.object)
+	dir, err := r.blockDir()
 	if err != nil {
 		return nil, errors.Wrapf(err, "column %q", r.desc.Name)
 	}
@@ -713,17 +713,16 @@ func (r *ColumnReader) BlockDecoder() (*Decoder, error) {
 		return nil, errors.Errorf("block: column %q is not blocked", r.desc.Name)
 	}
 
-	dir, err := parseBlockDir(r.object)
+	dir, err := r.blockDir()
 	if err != nil {
 		return nil, errors.Wrapf(err, "column %q", r.desc.Name)
 	}
 
 	return &Decoder{
-		dir:  dir,
-		rows: r.rows,
-		comp: r.comp,
-		i64:  r.int64Decoder(),
-		f64:  r.float64Decoder(),
+		rows:    r.rows,
+		i64:     r.int64Decoder(),
+		f64:     r.float64Decoder(),
+		streams: newBlockStreams(dir, r.comp),
 	}, nil
 }
 
@@ -733,7 +732,7 @@ func (r *ColumnReader) DecodeBlocksFloat64(dst []float64, blocks []int) ([]float
 		return r.Float64(dst)
 	}
 
-	dir, err := parseBlockDir(r.object)
+	dir, err := r.blockDir()
 	if err != nil {
 		return nil, errors.Wrapf(err, "column %q", r.desc.Name)
 	}
@@ -776,6 +775,11 @@ func (r *ColumnReader) float64Decoder() func([]float64, []byte) ([]float64, int,
 	default:
 		return nil
 	}
+}
+
+// blockDir parses the column's block directory, selecting the layout the descriptor records.
+func (r *ColumnReader) blockDir() (blockDir, error) {
+	return parseBlockDir(r.object, r.desc.Framed)
 }
 
 // stream decompresses the column's block frame into its raw codec stream.

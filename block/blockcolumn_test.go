@@ -81,7 +81,7 @@ func TestBlockedRoundTrip(t *testing.T) {
 
 					c := tc.col(n)
 
-					blockedDesc, blockedObj, err := buildColumn(c, comp.c(), blockRows)
+					blockedDesc, blockedObj, err := buildColumn(c, comp.c(), blockRows, defaultCompressBlockBytes)
 					require.NoError(t, err)
 					// A single-value column constant-collapses (no data object), so it is never
 					// blocked; every other non-empty column is.
@@ -92,7 +92,7 @@ func TestBlockedRoundTrip(t *testing.T) {
 					// Unblocked reference (same column, Block off).
 					ref := c
 					ref.Block = false
-					refDesc, refObj, err := buildColumn(ref, comp.c(), blockRows)
+					refDesc, refObj, err := buildColumn(ref, comp.c(), blockRows, defaultCompressBlockBytes)
 					require.NoError(t, err)
 					assert.False(t, refDesc.Blocked)
 
@@ -132,7 +132,7 @@ func TestDecodeIntoReuse(t *testing.T) {
 				t.Parallel()
 
 				c := tc.col(n)
-				desc, obj, err := buildColumn(c, comp.c(), blockRows)
+				desc, obj, err := buildColumn(c, comp.c(), blockRows, defaultCompressBlockBytes)
 				require.NoError(t, err)
 				require.True(t, desc.Blocked)
 
@@ -190,12 +190,12 @@ func TestBlockedRange(t *testing.T) {
 			t.Parallel()
 
 			c := tc.col(n)
-			desc, obj, err := buildColumn(c, noneComp(), blockRows)
+			desc, obj, err := buildColumn(c, noneComp(), blockRows, defaultCompressBlockBytes)
 			require.NoError(t, err)
 
 			ref := c
 			ref.Block = false
-			refDesc, refObj, err := buildColumn(ref, noneComp(), blockRows)
+			refDesc, refObj, err := buildColumn(ref, noneComp(), blockRows, defaultCompressBlockBytes)
 			require.NoError(t, err)
 
 			for lo := range n {
@@ -301,7 +301,7 @@ func TestBlockedCursor(t *testing.T) {
 		vals[i] = float64(i)*2.5 + 1
 	}
 
-	tsDesc, tsObj, err := buildColumn(Column{Name: "ts", Kind: KindInt64, Codec: chunk.CodecDoD, Int64: ts, Block: true}, noneComp(), blockRows)
+	tsDesc, tsObj, err := buildColumn(Column{Name: "ts", Kind: KindInt64, Codec: chunk.CodecDoD, Int64: ts, Block: true}, noneComp(), blockRows, defaultCompressBlockBytes)
 	require.NoError(t, err)
 	require.True(t, tsDesc.Blocked)
 
@@ -319,7 +319,7 @@ func TestBlockedCursor(t *testing.T) {
 	_, err = cur.Next()
 	require.Error(t, err, "cursor past the end errors")
 
-	vDesc, vObj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Codec: chunk.CodecGorilla, Float64: vals, Block: true}, noneComp(), blockRows)
+	vDesc, vObj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Codec: chunk.CodecGorilla, Float64: vals, Block: true}, noneComp(), blockRows, defaultCompressBlockBytes)
 	require.NoError(t, err)
 
 	fcur, err := newColumnReader(vDesc, vObj, noneComp(), n).FloatCursor()
@@ -358,7 +358,7 @@ func FuzzBlockedRoundTrip(f *testing.F) {
 
 		c := Column{Name: "c", Kind: KindInt64, Codec: chunk.CodecT64, Int64: vals, Block: true}
 
-		desc, obj, err := buildColumn(c, noneComp(), blockRows)
+		desc, obj, err := buildColumn(c, noneComp(), blockRows, defaultCompressBlockBytes)
 		if err != nil {
 			t.Fatalf("encode: %v", err)
 		}
@@ -391,14 +391,24 @@ func FuzzBlockedDecodeNoPanic(f *testing.F) {
 	f.Add([]byte{2, 4, 1, 1, 0xff})
 
 	f.Fuzz(func(_ *testing.T, object []byte) {
-		desc := ColumnDesc{Name: "c", Kind: KindInt64, Codec: chunk.CodecDoD, Blocked: true}
+		desc := ColumnDesc{Name: "c", Kind: KindInt64, Codec: chunk.CodecDoD, Blocked: true, Framed: true}
+		legacy := ColumnDesc{Name: "c", Kind: KindInt64, Codec: chunk.CodecDoD, Blocked: true}
 		// Must not panic regardless of the (arbitrary) declared row count. Exercise every decode
 		// path that parses the directory: whole-column, range, block-set, and the streaming cursor.
 		_, _ = newColumnReader(desc, object, noneComp(), 32).Int64(nil)
 		_, _ = newColumnReader(desc, object, noneComp(), 32).RangeInt64(nil, 0, 8)
 		_, _ = newColumnReader(desc, object, noneComp(), 32).DecodeBlocksInt64(nil, []int{0, 1, 5})
 
-		if cur, err := newColumnReader(desc, object, noneComp(), 32).TsCursor(); err == nil {
+		_, _ = newColumnReader(legacy, object, noneComp(), 32).Int64(nil)
+		_, _ = newColumnReader(legacy, object, noneComp(), 32).RangeInt64(nil, 0, 8)
+		_, _ = newColumnReader(legacy, object, noneComp(), 32).DecodeBlocksInt64(nil, []int{0, 1, 5})
+
+		for _, d := range []ColumnDesc{desc, legacy} {
+			cur, err := newColumnReader(d, object, noneComp(), 32).TsCursor()
+			if err != nil {
+				continue
+			}
+
 			for range 40 {
 				if _, err := cur.Next(); err != nil {
 					break
@@ -406,8 +416,10 @@ func FuzzBlockedDecodeNoPanic(f *testing.F) {
 			}
 		}
 
-		if dir, err := parseBlockDir(object); err == nil {
-			_ = dir.nBlocks()
+		for _, framed := range []bool{false, true} {
+			if dir, err := parseBlockDir(object, framed); err == nil {
+				_ = dir.nBlocks()
+			}
 		}
 	})
 }

@@ -23,7 +23,7 @@ func TestColumnInt64RoundTrip(t *testing.T) {
 
 	for _, codec := range []chunk.Codec{chunk.CodecT64, chunk.CodecDoD} {
 		vals := []int64{5, 7, 9, 2, 100, -3}
-		desc, obj, err := buildColumn(Column{Name: "c", Kind: KindInt64, Int64: vals, Codec: codec}, noneComp(), defaultGranuleSize)
+		desc, obj, err := buildColumn(Column{Name: "c", Kind: KindInt64, Int64: vals, Codec: codec}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 		require.NoError(t, err)
 		assert.False(t, desc.Const)
 		assert.Equal(t, int64(-3), desc.MinInt64)
@@ -41,7 +41,7 @@ func TestColumnFloat64RoundTrip(t *testing.T) {
 
 	for _, codec := range []chunk.Codec{chunk.CodecGorilla, chunk.CodecDecimal} {
 		vals := []float64{1.5, 2.5, 1.5, 9.0, -4.25}
-		desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: vals, Codec: codec}, noneComp(), defaultGranuleSize)
+		desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: vals, Codec: codec}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 		require.NoError(t, err)
 		assert.InDelta(t, -4.25, desc.MinFloat64, 0)
 		assert.InDelta(t, 9.0, desc.MaxFloat64, 0)
@@ -57,7 +57,7 @@ func TestColumnBytesRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	vals := [][]byte{[]byte("a"), []byte("b"), []byte("a"), []byte("c")}
-	desc, obj, err := buildColumn(Column{Name: "k", Kind: KindBytes, Bytes: vals}, noneComp(), defaultGranuleSize)
+	desc, obj, err := buildColumn(Column{Name: "k", Kind: KindBytes, Bytes: vals}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 	require.NoError(t, err)
 	assert.Equal(t, chunk.CodecDict, desc.Codec)
 	assert.False(t, desc.Const)
@@ -77,7 +77,7 @@ func TestColumnBytesRawRoundTrip(t *testing.T) {
 	vals := [][]byte{
 		{0, 0, 0, 1}, {0, 0, 0, 2}, {0, 0, 0, 1}, {0, 0, 0, 3},
 	}
-	desc, obj, err := buildColumn(Column{Name: "id", Kind: KindBytes, Bytes: vals, Codec: chunk.CodecBytesRaw}, noneComp(), defaultGranuleSize)
+	desc, obj, err := buildColumn(Column{Name: "id", Kind: KindBytes, Bytes: vals, Codec: chunk.CodecBytesRaw}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 	require.NoError(t, err)
 	assert.Equal(t, chunk.CodecBytesRaw, desc.Codec)
 	assert.False(t, desc.Const)
@@ -96,7 +96,7 @@ func TestColumnBytesRawConst(t *testing.T) {
 	t.Parallel()
 
 	vals := [][]byte{{1, 2, 3, 4}, {1, 2, 3, 4}, {1, 2, 3, 4}}
-	desc, obj, err := buildColumn(Column{Name: "id", Kind: KindBytes, Bytes: vals, Codec: chunk.CodecBytesRaw}, noneComp(), defaultGranuleSize)
+	desc, obj, err := buildColumn(Column{Name: "id", Kind: KindBytes, Bytes: vals, Codec: chunk.CodecBytesRaw}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 	require.NoError(t, err)
 	assert.True(t, desc.Const)
 	assert.Nil(t, obj)
@@ -116,7 +116,7 @@ func TestColumnBytesRawErrors(t *testing.T) {
 	t.Run("wrong kind", func(t *testing.T) {
 		t.Parallel()
 
-		desc, obj, err := buildColumn(Column{Name: "c", Kind: KindInt64, Int64: []int64{1, 2}}, noneComp(), defaultGranuleSize)
+		desc, obj, err := buildColumn(Column{Name: "c", Kind: KindInt64, Int64: []int64{1, 2}}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 		require.NoError(t, err)
 
 		_, _, err = newColumnReader(desc, obj, noneComp(), 2).BytesRaw()
@@ -127,7 +127,7 @@ func TestColumnBytesRawErrors(t *testing.T) {
 		t.Parallel()
 
 		vals := [][]byte{[]byte("a"), []byte("b"), []byte("a")}
-		desc, obj, err := buildColumn(Column{Name: "k", Kind: KindBytes, Bytes: vals}, noneComp(), defaultGranuleSize)
+		desc, obj, err := buildColumn(Column{Name: "k", Kind: KindBytes, Bytes: vals}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 		require.NoError(t, err)
 		assert.Equal(t, chunk.CodecDict, desc.Codec)
 
@@ -144,7 +144,7 @@ func TestColumnZSTDCompressed(t *testing.T) {
 		vals[i] = int64(i % 7)
 	}
 
-	desc, obj, err := buildColumn(Column{Name: "c", Kind: KindInt64, Int64: vals, Codec: chunk.CodecT64}, zstdComp(), defaultGranuleSize)
+	desc, obj, err := buildColumn(Column{Name: "c", Kind: KindInt64, Int64: vals, Codec: chunk.CodecT64}, zstdComp(), defaultGranuleSize, defaultCompressBlockBytes)
 	require.NoError(t, err)
 	assert.Equal(t, compress.AlgorithmZSTD, desc.Compress)
 
@@ -156,7 +156,7 @@ func TestColumnZSTDCompressed(t *testing.T) {
 func TestColumnConstInt64(t *testing.T) {
 	t.Parallel()
 
-	desc, obj, err := buildColumn(Column{Name: "shard", Kind: KindInt64, Int64: []int64{7, 7, 7, 7}}, noneComp(), defaultGranuleSize)
+	desc, obj, err := buildColumn(Column{Name: "shard", Kind: KindInt64, Int64: []int64{7, 7, 7, 7}}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 	require.NoError(t, err)
 	assert.True(t, desc.Const, "all-equal int64 collapses")
 	assert.Equal(t, int64(7), desc.ConstInt64)
@@ -176,7 +176,7 @@ func TestColumnConstFloat64NaN(t *testing.T) {
 	t.Parallel()
 
 	nan := math.NaN()
-	desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: []float64{nan, nan, nan}}, noneComp(), defaultGranuleSize)
+	desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: []float64{nan, nan, nan}}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 	require.NoError(t, err)
 	assert.True(t, desc.Const, "all-NaN (same bits) collapses")
 	assert.Nil(t, obj)
@@ -192,7 +192,7 @@ func TestColumnConstFloat64NaN(t *testing.T) {
 func TestColumnConstBytes(t *testing.T) {
 	t.Parallel()
 
-	desc, obj, err := buildColumn(Column{Name: "unit", Kind: KindBytes, Bytes: [][]byte{[]byte("ms"), []byte("ms"), []byte("ms")}}, noneComp(), defaultGranuleSize)
+	desc, obj, err := buildColumn(Column{Name: "unit", Kind: KindBytes, Bytes: [][]byte{[]byte("ms"), []byte("ms"), []byte("ms")}}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 	require.NoError(t, err)
 	assert.True(t, desc.Const)
 	assert.Equal(t, []byte("ms"), desc.ConstBytes)
@@ -209,7 +209,7 @@ func TestColumnConstBytes(t *testing.T) {
 func TestColumnEmpty(t *testing.T) {
 	t.Parallel()
 
-	desc, obj, err := buildColumn(Column{Name: "c", Kind: KindInt64, Int64: nil}, noneComp(), defaultGranuleSize)
+	desc, obj, err := buildColumn(Column{Name: "c", Kind: KindInt64, Int64: nil}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 	require.NoError(t, err)
 	assert.False(t, desc.Const, "empty column is not constant")
 
@@ -221,7 +221,7 @@ func TestColumnEmpty(t *testing.T) {
 func TestColumnInvalidKind(t *testing.T) {
 	t.Parallel()
 
-	_, _, err := buildColumn(Column{Name: "x", Kind: Kind(99)}, noneComp(), defaultGranuleSize)
+	_, _, err := buildColumn(Column{Name: "x", Kind: Kind(99)}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 	require.Error(t, err)
 }
 
@@ -229,14 +229,14 @@ func TestColumnCodecKindMismatch(t *testing.T) {
 	t.Parallel()
 
 	// Gorilla is a float codec; applying it to an int64 column must error.
-	_, _, err := buildColumn(Column{Name: "c", Kind: KindInt64, Int64: []int64{1, 2, 3}, Codec: chunk.CodecGorilla}, noneComp(), defaultGranuleSize)
+	_, _, err := buildColumn(Column{Name: "c", Kind: KindInt64, Int64: []int64{1, 2, 3}, Codec: chunk.CodecGorilla}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 	require.Error(t, err)
 }
 
 func TestColumnWrongAccessor(t *testing.T) {
 	t.Parallel()
 
-	desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: []float64{1, 2, 3}}, noneComp(), defaultGranuleSize)
+	desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: []float64{1, 2, 3}}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 	require.NoError(t, err)
 	r := newColumnReader(desc, obj, noneComp(), 3)
 
@@ -256,7 +256,7 @@ func TestColumnInt128RoundTrip(t *testing.T) {
 	// Runs of one id then another — the metric series sort-key shape.
 	vals := []chunk.U128{{Lo: 5}, {Lo: 5}, {Lo: 5}, {Hi: 1, Lo: 0}, {Hi: 9, Lo: 9}}
 	for _, comp := range []*compress.Compressor{noneComp(), zstdComp()} {
-		desc, obj, err := buildColumn(Column{Name: "series", Kind: KindInt128, Int128: vals}, comp, defaultGranuleSize)
+		desc, obj, err := buildColumn(Column{Name: "series", Kind: KindInt128, Int128: vals}, comp, defaultGranuleSize, defaultCompressBlockBytes)
 		require.NoError(t, err)
 		assert.False(t, desc.Const, "id columns are never constant-collapsed")
 		assert.Equal(t, chunk.CodecID128, desc.Codec)
@@ -279,7 +279,7 @@ func TestColumnInt128RoundTrip(t *testing.T) {
 func TestColumnInt128WrongAccessor(t *testing.T) {
 	t.Parallel()
 
-	desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: []float64{1, 2}}, noneComp(), defaultGranuleSize)
+	desc, obj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: []float64{1, 2}}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 	require.NoError(t, err)
 
 	_, err = newColumnReader(desc, obj, noneComp(), 2).ID128(nil)
@@ -289,7 +289,7 @@ func TestColumnInt128WrongAccessor(t *testing.T) {
 func TestColumnKindAccessors(t *testing.T) {
 	t.Parallel()
 
-	desc, obj, err := buildColumn(Column{Name: "c", Kind: KindInt64, Int64: []int64{1, 2, 9}}, noneComp(), defaultGranuleSize)
+	desc, obj, err := buildColumn(Column{Name: "c", Kind: KindInt64, Int64: []int64{1, 2, 9}}, noneComp(), defaultGranuleSize, defaultCompressBlockBytes)
 	require.NoError(t, err)
 	r := newColumnReader(desc, obj, noneComp(), 3)
 	assert.Equal(t, KindInt64, r.Kind())
@@ -321,11 +321,12 @@ func TestColumnBytesBlobFormMatchesSlices(t *testing.T) {
 
 			comp := compress.NewCompressor(compress.AlgorithmNone, compress.LevelDefault)
 
-			sliceDesc, sliceObj, err := buildColumn(Column{Name: "c", Kind: KindBytes, Bytes: vals}, comp, defaultGranuleSize)
+			sliceDesc, sliceObj, err := buildColumn(Column{Name: "c", Kind: KindBytes, Bytes: vals}, comp, defaultGranuleSize, defaultCompressBlockBytes)
 			require.NoError(t, err)
 
 			blobDesc, blobObj, err := buildColumn(
 				Column{Name: "c", Kind: KindBytes, BytesBlob: blob, BytesOffsets: offsets}, comp, defaultGranuleSize,
+				defaultCompressBlockBytes,
 			)
 			require.NoError(t, err)
 
