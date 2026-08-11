@@ -29,6 +29,12 @@ conformance suite all of them pass under `-race`.
   per cold object, not one per in-flight query), and W-TinyLFU admission keeps a cold historical
   scan from flushing the hot working set — the pattern a strict LRU handles worst. An object
   larger than the whole budget is never retained.
+- **`backend.WriteUncached` / `backend.ReadUncached`** — the escape hatch from that cache for the
+  few *mutable* objects rewritten far more often than they are read: the engines' identity sets,
+  written when identity changes and read only on recovery. Caching one is pure eviction pressure (at
+  real cardinality a single identity object is a large fraction of the budget), and it is the one
+  object class where the write-once-immutable premise above does not hold. `WriteUncached` still
+  invalidates the key, so a reader never sees a superseded value.
 - **`backend.Viewer`** — opt-in `ReadView(ctx,key)` returning a **read-only view** instead of a
   copy (a stored value is never mutated in place, so a view survives overwrite/eviction). This
   removes the clone-per-hit that dominated the query-path allocation profile; `backend.ReadView`

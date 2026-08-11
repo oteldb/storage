@@ -185,6 +185,37 @@ func (c *cachedBackend) Stats() CacheStats {
 	}
 }
 
+// WriteUncached writes through b, keeping data out of the read cache while still dropping any
+// stale entry under key (a reader must never be served the superseded value). Use it for the few
+// objects that are rewritten far more often than they are read — the engines' identity sets, which
+// are written on every flush and read only on recovery: caching one is pure eviction pressure, and
+// a single large one can occupy most of the budget. Every other object goes through [Backend.Write].
+func WriteUncached(ctx context.Context, b Backend, key string, data []byte) error {
+	c, ok := b.(*cachedBackend)
+	if !ok {
+		return b.Write(ctx, key, data)
+	}
+
+	if err := c.inner.Write(ctx, key, data); err != nil {
+		return err
+	}
+
+	c.values.Invalidate(key)
+
+	return nil
+}
+
+// ReadUncached reads key from b without caching the value (and without consulting the cache — the
+// inner backend is the truth). It is the read half of [WriteUncached]: an object written uncached
+// would otherwise land in the cache the first time it is read.
+func ReadUncached(ctx context.Context, b Backend, key string) ([]byte, error) {
+	if c, ok := b.(*cachedBackend); ok {
+		return c.inner.Read(ctx, key)
+	}
+
+	return b.Read(ctx, key)
+}
+
 // store caches a private copy of data under key, taking a copy because the caller may reuse its
 // buffer after Write returns. An object larger than the whole budget is not cached — and any stale
 // smaller entry under that key is dropped, so a reader cannot be served the superseded value.
