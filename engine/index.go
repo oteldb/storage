@@ -154,25 +154,53 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 // can rebuild the postings/series index. Written on flush; the identity set only grows
 // (identities outlive a flush), so a full rewrite is correct. Caller holds e.mu.
 //
-// TODO: this rewrites every identity on each flush — fine single-node, but a per-part
+// The set only ever grows, so an unchanged identity count means the persisted object is already
+// byte-identical and the write is skipped: a steady state that registers no new series costs
+// nothing, instead of re-serializing and rewriting every identity every flush interval. The object
+// is written uncached — it is rewritten at flush frequency and read only on recovery, so caching it
+// only evicts part data.
+//
+// TODO: this rewrites every identity when the set does change — fine single-node, but a per-part
 // identity object (incremental) is the scale-out form.
 func (e *Engine) writeSeriesIndexLocked(ctx context.Context) error {
 	if e.cfg.Backend == nil {
 		return nil
 	}
 
-	if err := e.cfg.Backend.Write(ctx, e.seriesKey(), encodeSeriesSet(e.head.series)); err != nil {
+	n := e.head.series.Len()
+	if n == e.seriesWritten {
+		return nil
+	}
+
+	buf := encodeSeriesSet(make([]byte, 0, seriesSetSizeHint(e.seriesBytes, e.seriesWritten, n)), e.head.series)
+	if err := backend.WriteUncached(ctx, e.cfg.Backend, e.seriesKey(), buf); err != nil {
 		return errors.Wrap(err, "write series index")
 	}
 
+	e.seriesWritten, e.seriesBytes = n, len(buf)
+
 	return nil
+}
+
+// seriesSetSizeHint estimates the encoded size of an identity set of n series from the previous
+// encode (prevBytes over prevCount), with a margin so the encode does not reallocate near the end.
+// Without it the buffer reaches its final size by append-doubling, whose transient peak is a
+// multiple of a result that is hundreds of MiB at real cardinality.
+func seriesSetSizeHint(prevBytes, prevCount, n int) int {
+	if prevBytes <= 0 || prevCount <= 0 {
+		return 0
+	}
+
+	est := prevBytes / prevCount * n
+
+	return est + est/16 + 64
 }
 
 // loadSeriesIndexLocked rebuilds the head's series/postings index from the persisted identity
 // object, registering each identity. A missing object (nothing flushed yet) is a no-op.
 // Caller holds e.mu.
 func (e *Engine) loadSeriesIndexLocked(ctx context.Context) error {
-	data, err := e.cfg.Backend.Read(ctx, e.seriesKey())
+	data, err := backend.ReadUncached(ctx, e.cfg.Backend, e.seriesKey())
 	if err != nil {
 		if errors.Is(err, backend.ErrNotExist) {
 			return nil
@@ -181,20 +209,35 @@ func (e *Engine) loadSeriesIndexLocked(ctx context.Context) error {
 		return errors.Wrap(err, "read series index")
 	}
 
-	if err := decodeSeriesSet(data, e.head.registerSeries); err != nil {
+	var count int
+
+	if err := decodeSeriesSet(data, func(s signal.Series) {
+		e.head.registerSeries(s)
+		count++
+	}); err != nil {
 		return errors.Wrap(err, "decode series index")
+	}
+
+	// Only when the head holds exactly what the object holds is the object current — a replica
+	// refreshing mid-ingest already has identities of its own, which still need persisting.
+	if e.head.series.Len() == count {
+		e.seriesWritten, e.seriesBytes = count, len(data)
 	}
 
 	return nil
 }
 
-// encodeSeriesSet serializes every identity in ix as a count followed by length-delimited
+// encodeSeriesSet appends to dst every identity in ix as a count followed by length-delimited
 // [signal.Series.AppendHashInput] records (the reversible wire form read by
-// [signal.DecodeSeries]).
-func encodeSeriesSet(ix *series.Index) []byte {
-	buf := binary.AppendUvarint(nil, uint64(ix.Len()))
+// [signal.DecodeSeries]). One scratch buffer is reused across identities: encoding each into a
+// fresh one made the whole set's worth of garbage per call.
+func encodeSeriesSet(dst []byte, ix *series.Index) []byte {
+	buf := binary.AppendUvarint(dst, uint64(ix.Len()))
+
+	var enc []byte
+
 	ix.ForEach(func(_ signal.SeriesID, s signal.Series) {
-		enc := s.AppendHashInput(nil)
+		enc = s.AppendHashInput(enc[:0])
 		buf = binary.AppendUvarint(buf, uint64(len(enc)))
 		buf = append(buf, enc...)
 	})

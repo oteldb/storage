@@ -140,6 +140,11 @@ type Engine struct {
 	// budget caps the in-flight decoded bytes across concurrent queries (Config.DecodeBudget or
 	// Config.DecodeMemoryBytes); possibly shared with other engines; nil ⇒ unlimited.
 	budget *DecodeBudget
+	// seriesWritten is the identity count persisted to series.bin by the last publish, and
+	// seriesBytes that object's encoded size. The set only grows, so an unchanged count means the
+	// object is still current (the rewrite is skipped); the size is the next encode's buffer hint.
+	seriesWritten int
+	seriesBytes   int
 	// planMaps recycles the per-fetch plan maps (series identity + head/flush/recent snapshots) so a
 	// fetch reuses cleared maps instead of allocating and growing fresh ones each call.
 	planMaps planMapPools
@@ -882,6 +887,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 	e.head = newHead()
 	e.flushing = nil // discarded with the head: Reset drops the samples, it does not flush them
 	e.nextSeq = 0
+	e.seriesWritten, e.seriesBytes = 0, 0 // the identity object is swept below with the parts
 
 	if e.cfg.Backend == nil {
 		e.parts, e.retiring = nil, nil

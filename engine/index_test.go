@@ -145,6 +145,85 @@ func TestFlushIndexWriteErrorsPropagate(t *testing.T) {
 	}
 }
 
+// countKeyWrite counts Writes of keys ending in suffix.
+type countKeyWrite struct {
+	backend.Backend
+
+	suffix string
+	n      int
+}
+
+func (c *countKeyWrite) Write(ctx context.Context, key string, data []byte) error {
+	if strings.HasSuffix(key, c.suffix) {
+		c.n++
+	}
+
+	return c.Backend.Write(ctx, key, data)
+}
+
+// TestSeriesIndexWrittenOnlyWhenChanged checks the flush skips the identity rewrite while the set
+// is unchanged: at real cardinality that object is hundreds of MiB re-serialized every flush
+// interval, byte-identical, under the engine lock.
+func TestSeriesIndexWrittenOnlyWhenChanged(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := &countKeyWrite{Backend: backend.Memory(), suffix: "series.bin"}
+	cfg := engine.Config{Backend: be, Prefix: "default/metrics"}
+
+	e := engine.New(cfg)
+	api := mkSeries("job", "api")
+	mustAppend(t, e, api, 100, 1.0)
+	require.NoError(t, e.Flush(ctx))
+	require.Equal(t, 1, be.n)
+
+	for ts := int64(200); ts <= 400; ts += 100 {
+		mustAppend(t, e, api, ts, 1.0)
+		require.NoError(t, e.Flush(ctx))
+	}
+
+	assert.Equal(t, 1, be.n, "flushing known series must not rewrite the identity set")
+
+	mustAppend(t, e, mkSeries("job", "web"), 500, 2.0)
+	require.NoError(t, e.Flush(ctx))
+	assert.Equal(t, 2, be.n, "a new identity must be persisted")
+
+	// The skipping must not lose identities: a stateless reader still sees both.
+	r := engine.New(cfg)
+	require.NoError(t, r.LoadParts(ctx))
+	assert.Equal(t, 2, r.SeriesCount())
+
+	// A reloaded engine knows the object is current, so its next flush skips it too.
+	mustAppend(t, r, api, 600, 3.0)
+	require.NoError(t, r.Flush(ctx))
+	assert.Equal(t, 2, be.n)
+}
+
+// TestSeriesIndexNotCached checks series.bin stays out of the object read cache: it is rewritten
+// on every identity change and read only on recovery, so caching it evicts part data for no hit.
+func TestSeriesIndexNotCached(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	// A budget of one byte caches nothing but the smallest object, so any resident bytes here would
+	// be the identity object itself.
+	be := backend.Cached(backend.Memory(), 1<<20)
+	cfg := engine.Config{Backend: be, Prefix: "default/metrics"}
+
+	e := engine.New(cfg)
+	mustAppend(t, e, mkSeries("job", "api"), 100, 1.0)
+	require.NoError(t, e.Flush(ctx))
+	require.NoError(t, engine.New(cfg).LoadParts(ctx))
+
+	data, err := backend.ReadUncached(ctx, be, "default/metrics/series.bin")
+	require.NoError(t, err)
+	require.NotEmpty(t, data)
+
+	before := be.(interface{ Stats() backend.CacheStats }).Stats().Bytes
+	require.NoError(t, backend.WriteUncached(ctx, be, "default/metrics/series.bin", data))
+	assert.Equal(t, before, be.(interface{ Stats() backend.CacheStats }).Stats().Bytes)
+}
+
 func TestLoadPartsHeadOnlyNoop(t *testing.T) {
 	t.Parallel()
 

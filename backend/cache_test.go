@@ -430,3 +430,47 @@ func TestMemoryReadViewAliasesStore(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotSame(t, &v1[0], &cp[0])
 }
+
+func TestWriteUncachedKeepsValueOutOfCache(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	inner := newCounting()
+	c := backend.Cached(inner, 1<<20)
+
+	require.NoError(t, backend.WriteUncached(ctx, c, "k", []byte("value")))
+	assert.Zero(t, c.(interface{ Stats() backend.CacheStats }).Stats().Items)
+
+	// The value is durable, and reading it back goes to the inner backend.
+	v, err := backend.ReadUncached(ctx, c, "k")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("value"), v)
+	assert.Equal(t, int64(1), inner.reads.Load())
+	assert.Zero(t, c.(interface{ Stats() backend.CacheStats }).Stats().Items, "an uncached read must not populate the cache")
+}
+
+func TestWriteUncachedDropsStaleEntry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	c := backend.Cached(newCounting(), 1<<20)
+	require.NoError(t, c.Write(ctx, "k", []byte("old"))) // cached by the ordinary write path
+
+	require.NoError(t, backend.WriteUncached(ctx, c, "k", []byte("new")))
+
+	v, err := c.Read(ctx, "k")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("new"), v, "a reader must never be served the superseded value")
+}
+
+func TestUncachedHelpersOnPlainBackend(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	m := backend.Memory()
+	require.NoError(t, backend.WriteUncached(ctx, m, "k", []byte("v")))
+
+	v, err := backend.ReadUncached(ctx, m, "k")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v"), v)
+}
