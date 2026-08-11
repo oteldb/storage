@@ -10,6 +10,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
@@ -189,6 +191,180 @@ func TestMaintainAppliesSizeRetentionToLogs(t *testing.T) {
 	require.NotEmpty(t, bodies)
 	assert.NotContains(t, bodies, "body-1", "the oldest log records were dropped by the byte budget")
 	assert.Contains(t, bodies, "body-1200", "the newest log records are retained")
+}
+
+// listCountingBackend counts the List calls the part-size enumeration makes.
+type listCountingBackend struct {
+	backend.Backend
+
+	lists atomic.Int64
+}
+
+func (b *listCountingBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	b.lists.Add(1)
+
+	return b.Backend.List(ctx, prefix)
+}
+
+// TestSizeCutoffsSkipsUnchangedPartSet pins the memoization: the cutoff is a pure function of the
+// part set and the budget, so a cycle that follows one with no flush, merge, or delete in between
+// must not re-enumerate part sizes on the backend.
+func TestSizeCutoffsSkipsUnchangedPartSet(t *testing.T) {
+	t.Parallel()
+
+	be := &listCountingBackend{Backend: backend.Memory()}
+	s, err := Open(context.Background(), Options{},
+		WithBackend(be),
+		WithFlushInterval(-1), // no background loop: this test drives maintain itself
+		WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+			return tenant.Policy{Retention: tenant.Retention{MaxBytes: 1 << 30}}
+		})))
+	require.NoError(t, err)
+
+	t.Cleanup(func() { require.NoError(t, s.Close(context.Background())) })
+
+	ctx := context.Background()
+	now := time.Now().UnixNano()
+
+	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{now}, []float64{1}))
+	require.NoError(t, err)
+	s.maintain(ctx) // flushes the head into a part
+
+	tids := map[signal.TenantID]struct{}{"default": {}}
+
+	be.lists.Store(0)
+	s.sizeCutoffs(ctx, tids)
+	require.Positive(t, be.lists.Load(), "the first resolution enumerates the parts")
+
+	be.lists.Store(0)
+	s.sizeCutoffs(ctx, tids)
+	s.sizeCutoffs(ctx, tids)
+	assert.Zero(t, be.lists.Load(), "an unchanged part set must not re-enumerate part sizes")
+
+	// A new part changes the fingerprint, so the cutoff is resolved again.
+	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{now + 1}, []float64{2}))
+	require.NoError(t, err)
+	s.maintain(ctx)
+
+	be.lists.Store(0)
+	s.sizeCutoffs(ctx, tids)
+	assert.Positive(t, be.lists.Load(), "a changed part set must re-enumerate")
+}
+
+// TestSizeRetentionMemoDropsUnheldTenants covers the cache prune: a tenant that stops appearing in
+// a cycle must not pin its entry.
+func TestSizeRetentionMemoDropsUnheldTenants(t *testing.T) {
+	t.Parallel()
+
+	var c sizeRetentionCache
+
+	c.store("a", 1, 10)
+	c.store("b", 2, 20)
+
+	got, ok := c.lookup("a", 1)
+	require.True(t, ok)
+	assert.Equal(t, int64(10), got)
+
+	_, ok = c.lookup("a", 99)
+	assert.False(t, ok, "a different part set is a miss")
+
+	c.retain(map[signal.TenantID]struct{}{"a": {}})
+	_, ok = c.lookup("b", 2)
+	assert.False(t, ok, "a tenant outside the retained set is dropped")
+
+	c.forget("a")
+	_, ok = c.lookup("a", 1)
+	assert.False(t, ok, "forget drops the entry")
+}
+
+func TestPartSetFingerprintOrderIndependent(t *testing.T) {
+	t.Parallel()
+
+	a := hashPartID("0000000001", 10)
+	b := hashPartID("0000000002", 20)
+
+	assert.Equal(t, a^b, b^a)
+	assert.NotEqual(t, a, hashPartID("0000000001", 11), "the time bound is part of the identity")
+	assert.NotEqual(t, a, hashPartID("0000000002", 10), "the prefix is part of the identity")
+	assert.NotEqual(t, hashUint64(a, 1), hashUint64(a, 2), "the budget is folded in")
+}
+
+// BenchmarkSizeCutoffsIdle is the maintenance-loop cost of size retention on a node where nothing
+// changed since the last cycle — the shape of an idle deployment's background CPU. "recomputed" is
+// what every cycle cost before the memo; the file backend is the deployed shape, where the
+// enumeration is syscalls rather than map lookups.
+func BenchmarkSizeCutoffsIdle(b *testing.B) {
+	backends := []struct {
+		name string
+		open func(b *testing.B) backend.Backend
+	}{
+		{"memory", func(*testing.B) backend.Backend { return backend.Memory() }},
+		{"file", func(b *testing.B) backend.Backend {
+			b.Helper()
+
+			be, err := file.New(b.TempDir())
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			return be
+		}},
+	}
+
+	for _, bk := range backends {
+		b.Run(bk.name, func(b *testing.B) {
+			ctx := context.Background()
+
+			s, err := Open(ctx, Options{},
+				WithBackend(bk.open(b)),
+				WithFlushInterval(-1), // no background loop: the benchmark drives maintenance
+				WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+					return tenant.Policy{
+						Limits:    tenant.Limits{MaxPartSize: 4 << 10},
+						Retention: tenant.Retention{MaxBytes: 1 << 30},
+					}
+				})))
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			defer func() { _ = s.Close(ctx) }()
+
+			now := time.Now().UnixNano()
+			for i := range 32 {
+				ts, vals := make([]int64, 128), make([]float64, 128)
+				for j := range ts {
+					ts[j] = now + int64(i*128+j)*int64(time.Second)
+					vals[j] = float64(j)
+				}
+
+				if _, err := s.WriteMetrics(ctx, gaugeBatch("api", "m", ts, vals)); err != nil {
+					b.Fatal(err)
+				}
+
+				s.maintain(ctx)
+			}
+
+			tids := map[signal.TenantID]struct{}{"default": {}}
+
+			b.Run("recomputed", func(b *testing.B) {
+				b.ReportAllocs()
+
+				for b.Loop() {
+					s.sizeRetention.forget("default")
+					s.sizeCutoffs(ctx, tids)
+				}
+			})
+
+			b.Run("memoized", func(b *testing.B) {
+				b.ReportAllocs()
+
+				for b.Loop() {
+					s.sizeCutoffs(ctx, tids)
+				}
+			})
+		})
+	}
 }
 
 func TestMaintainNoSizeRetentionWithoutBudget(t *testing.T) {

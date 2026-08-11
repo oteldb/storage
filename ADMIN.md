@@ -135,7 +135,11 @@ The retention cutoff both paths pass to the merge is `max(age cutoff, size cutof
 comes from `tenant.Retention.MaxBytes`: the tenant's parts across all signals/shards on this node are
 summed and dropped oldest-first until the total fits the budget (`retention.go`). Resolving it reads
 per-part object sizes from the backend, like `PartsDetailed` — so a cycle only pays that I/O for
-tenants that actually set `MaxBytes`, and the cutoff is resolved once per tenant per cycle.
+tenants that actually set `MaxBytes`, and the cutoff is resolved once per tenant per cycle. It is
+also **memoized against the tenant's part set**: parts are immutable, so the cutoff can only change
+when a flush, merge, or drop changes the part set (or the budget itself moves), and a cycle that
+follows an idle one does no part enumeration at all. Erasure-coding a part rewrites its stored bytes
+under the same identity, so the converter drops the tenant's memo.
 
 In **cluster mode**, `Flush`/`Compact` act only on shards this node is the ring-primary of, returning
 `ErrNotOwner` otherwise — so a shard's parts are still written by exactly one node, the invariant the

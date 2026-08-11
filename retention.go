@@ -76,13 +76,22 @@ func sizeRetentionCutoff(parts []sizedPart, maxBytes int64) int64 {
 // the bytes this node stores for it.
 //
 // It reads per-part object sizes from the backend (like [Storage.EfficiencyStats]), so it is only
-// called for tenants that actually set a budget, once per maintenance cycle.
+// called for tenants that actually set a budget — and, within that, only when the answer can have
+// changed: the cutoff is a pure function of the tenant's part set and its budget, so it is memoized
+// against a fingerprint of both ([Storage.partSetFingerprint], in-memory and I/O-free). Parts are
+// immutable, so on a node where nothing flushed, merged, or was dropped since the last cycle the
+// enumeration would re-read every part's object sizes to arrive at the same number.
 func (s *Storage) sizeCutoffFor(ctx context.Context, t signal.TenantID) int64 {
 	t = s.normalizeTenant(t) // engines are keyed by the normalized id
 	maxBytes := s.tenant.Resolve(t).Retention.MaxBytes
 
 	if maxBytes <= 0 {
 		return 0
+	}
+
+	fp := s.partSetFingerprint(t, maxBytes)
+	if cutoff, ok := s.sizeRetention.lookup(t, fp); ok {
+		return cutoff
 	}
 
 	parts, err := s.sizedParts(ctx, t)
@@ -95,7 +104,10 @@ func (s *Storage) sizeCutoffFor(ctx context.Context, t signal.TenantID) int64 {
 		return 0
 	}
 
-	return sizeRetentionCutoff(parts, maxBytes)
+	cutoff := sizeRetentionCutoff(parts, maxBytes)
+	s.sizeRetention.store(t, fp, cutoff)
+
+	return cutoff
 }
 
 // sizedParts collects every flushed part this node holds for a tenant, across signals and shards.
@@ -158,8 +170,11 @@ func (s *Storage) sizeCutoffs(ctx context.Context, tids map[signal.TenantID]stru
 		out      map[signal.TenantID]int64
 	)
 
+	resolved := make(map[signal.TenantID]struct{}, len(tids))
+
 	for tid := range tids {
 		t := tenantOfShard(tid)
+		resolved[s.normalizeTenant(t)] = struct{}{} // the memo is keyed by the normalized id
 
 		cutoff, ok := byTenant[t]
 		if !ok {
@@ -180,6 +195,8 @@ func (s *Storage) sizeCutoffs(ctx context.Context, tids map[signal.TenantID]stru
 			out[tid] = cutoff
 		}
 	}
+
+	s.sizeRetention.retain(resolved)
 
 	return out
 }

@@ -79,6 +79,10 @@ type Storage struct {
 	// flusher, so an engine never has two concurrent flushes reserving the same part sequence.
 	flushWake chan struct{}
 
+	// sizeRetention memoizes each tenant's size-retention cutoff against the part set it was
+	// computed from, so an idle cycle costs no part enumeration (see sizeCutoffFor).
+	sizeRetention sizeRetentionCache
+
 	ecStats    ecCounters    // cumulative erasure-coding activity (Inspect → ClusterStats.EC)
 	maintStats maintCounters // cumulative maintenance-loop activity (Inspect → StoreStats.Maintenance)
 }
