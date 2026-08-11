@@ -69,7 +69,8 @@ Part *byte* sizes are intentionally omitted from `Inspect` (they would need back
   bounds, `Series`, `Rows`. In-memory, no backend I/O — safe to poll.
 - **`PartsDetailed(ctx, tenant, signal) ([]PartDetail, error)`** — augments each part with `Bytes`
   (summed backend object sizes), `Chunks` (sparse-index granules), and `Columns` (`Name`, `Kind`,
-  `Codec`, `Compress`). Reads object sizes from the backend, so call it for a drill-down view, not a
+  `Codec`, `Compress`, `Level` — the compression level, which for merged metric parts climbs a
+  size-graduated ladder). Reads object sizes from the backend, so call it for a drill-down view, not a
   high-frequency poll; each part is ref-held for the read so a concurrent merge cannot reclaim it.
   Returns `nil` (no error) when the tenant has no engine for the signal.
 - **`Cardinality(tenant, signal, topN) CardinalityStats`** — the first stop for a

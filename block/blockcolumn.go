@@ -341,10 +341,9 @@ func readGranuleLens(c *dirCursor, d *blockDir) error {
 			return err
 		}
 
-		if l > uint64(len(c.object)) {
-			return errors.Wrapf(ErrCorrupt, "granule %d len too large", i)
-		}
-
+		// A granule length is measured in the *decompressed* frame, so it is not bounded by the
+		// object; only the running offset is bounded here, and [blockDir.granuleStream] checks the
+		// resulting span against the frame it actually decompressed.
 		if d.gFrame[i] != prevFrame {
 			off, prevFrame = 0, d.gFrame[i]
 		}

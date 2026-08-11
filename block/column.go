@@ -106,6 +106,9 @@ func buildColumn(c Column, comp *compress.Compressor, blockRows, compressBytes i
 	}
 
 	desc := ColumnDesc{Name: c.Name, Kind: c.Kind, Codec: codec, Compress: comp.Algorithm()}
+	if desc.Compress != compress.AlgorithmNone {
+		desc.Level = comp.Level()
+	}
 
 	switch c.Kind {
 	case KindInt64:

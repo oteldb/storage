@@ -310,6 +310,69 @@ func BenchmarkBlockedColumn(b *testing.B) {
 	}
 }
 
+// TestFramePackingHighlyCompressible covers the case where a frame compresses to far less than the
+// granule streams it holds: the directory's granule lengths are measured in the *decompressed*
+// frame, so they are not bounded by the object length and must not be rejected as such.
+func TestFramePackingHighlyCompressible(t *testing.T) {
+	t.Parallel()
+
+	const blockRows, n = 64, 1 << 14
+
+	vals := make([]int64, n)
+	for i := range vals {
+		vals[i] = int64(i % 8) // trivially compressible, so the object is far smaller than the streams
+	}
+
+	c := Column{Name: "c", Kind: KindInt64, Codec: chunk.CodecT64, Int64: vals, Block: true}
+
+	desc, obj, err := buildColumn(c, zstdComp(), blockRows, defaultCompressBlockBytes)
+	require.NoError(t, err)
+
+	dir, err := parseBlockDir(obj, true)
+	require.NoError(t, err)
+	require.Greater(t, int(dir.gLen[0])*dir.nBlocks(), len(obj), "the test needs streams larger than the object")
+
+	got, err := newColumnReader(desc, obj, zstdComp(), n).Int64(nil)
+	require.NoError(t, err)
+	assert.Equal(t, vals, got)
+}
+
+// TestCompressionLevelManifest pins that the written compression level round-trips through the
+// manifest (the fixed point of the merge engine's compression ladder) and that an uncompressed
+// column records none.
+func TestCompressionLevelManifest(t *testing.T) {
+	t.Parallel()
+
+	vals := []float64{1, 2, 3, 4}
+
+	for _, tc := range []struct {
+		name string
+		comp *compress.Compressor
+		want compress.Level
+		alg  compress.Algorithm
+	}{
+		{"zstd/level3", compress.NewCompressor(compress.AlgorithmZSTD, 3), 3, compress.AlgorithmZSTD},
+		{"zstd/default", compress.NewCompressor(compress.AlgorithmZSTD, compress.LevelDefault), 0, compress.AlgorithmZSTD},
+		{"none/level3", compress.NewCompressor(compress.AlgorithmNone, 3), 0, compress.AlgorithmNone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			desc, _, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Float64: vals}, tc.comp,
+				defaultGranuleSize, defaultCompressBlockBytes)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, desc.Level)
+
+			m := Manifest{Version: manifestVersion, RowCount: len(vals), Columns: []ColumnDesc{desc}}
+
+			got, err := DecodeManifest(m.Encode(nil))
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got.Columns[0].Level)
+			assert.Equal(t, tc.alg, got.Columns[0].Compress)
+		})
+	}
+}
+
 // TestLegacyBlockedLayout checks that a column written before frame packing (Blocked, not Framed)
 // still decodes through every read path.
 func TestLegacyBlockedLayout(t *testing.T) {

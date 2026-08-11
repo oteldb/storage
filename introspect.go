@@ -37,6 +37,9 @@ type ColumnInfo struct {
 	Kind     string // physical type: int64 / float64 / bytes / int128
 	Codec    string // value codec
 	Compress string // block-compression algorithm
+	// Level is the block-compression level the column was written at (0 ⇒ the algorithm default, or
+	// uncompressed). Merged metric parts climb a size-graduated ladder, so it varies across parts.
+	Level int
 }
 
 // CardinalityStats summarizes a (tenant, signal) engine's label cardinality — the operator's first
@@ -194,7 +197,7 @@ func recordPartDetails(ds []recordengine.PartDetailStat) []PartDetail {
 func metricColumns(cs []engine.ColumnStat) []ColumnInfo {
 	out := make([]ColumnInfo, len(cs))
 	for i, c := range cs {
-		out[i] = ColumnInfo{Name: c.Name, Kind: c.Kind, Codec: c.Codec, Compress: c.Compress}
+		out[i] = ColumnInfo{Name: c.Name, Kind: c.Kind, Codec: c.Codec, Compress: c.Compress, Level: c.Level}
 	}
 
 	return out
@@ -203,7 +206,7 @@ func metricColumns(cs []engine.ColumnStat) []ColumnInfo {
 func recordColumns(cs []recordengine.ColumnStat) []ColumnInfo {
 	out := make([]ColumnInfo, len(cs))
 	for i, c := range cs {
-		out[i] = ColumnInfo{Name: c.Name, Kind: c.Kind, Codec: c.Codec, Compress: c.Compress}
+		out[i] = ColumnInfo{Name: c.Name, Kind: c.Kind, Codec: c.Codec, Compress: c.Compress, Level: c.Level}
 	}
 
 	return out

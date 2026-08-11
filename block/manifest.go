@@ -67,6 +67,12 @@ const (
 	// granules per compression frame). Clear on the older one-compressed-block-per-granule layout,
 	// which the reader still parses. Meaningful only together with flagBlocked.
 	flagFramed byte = 1 << 3
+	// flagLevel marks a column carrying a non-zero compression level; when set, one byte (Level)
+	// follows the flags byte (after the flagLossy byte, when both are present). The level is
+	// decode-irrelevant — the reader reconstructs the decompressor from the algorithm alone — and is
+	// recorded purely so the merge engine can tell a part already at the target level from one below
+	// it, the fixed point of the graduated compression ladder.
+	flagLevel byte = 1 << 4
 )
 
 // ErrCorrupt is returned when a manifest (or any part metadata) fails to parse:
@@ -111,6 +117,11 @@ type ColumnDesc struct {
 	// Persisted via [flagFramed]; clear on the older one-block-per-granule layout, which is still
 	// read. Set by the writer on every blocked column it produces.
 	Framed bool
+
+	// Level is the compression level the column's data was written at (0 ⇒ the algorithm default, or
+	// no compression). Persisted only when non-zero, via [flagLevel]. Decode ignores it; the merge
+	// engine reads it as the fixed point of the compression ladder.
+	Level compress.Level
 }
 
 // Manifest is the part descriptor: format version, row count, time range, granule size,
@@ -130,7 +141,8 @@ type Manifest struct {
 //	[u32 magic][uvarint version][uvarint rowCount][varint minTime][varint maxTime]
 //	[uvarint granuleSize][uvarint colCount]
 //	  per column: [uvarint nameLen][name][byte kind][byte codec][byte compress][byte flags]
-//	              [byte precisionBits if flagLossy][numeric min/max per kind][const value per kind if flagConst]
+//	              [byte precisionBits if flagLossy][byte level if flagLevel]
+//	              [numeric min/max per kind][const value per kind if flagConst]
 //	[u32 CRC32C over all the above]
 func (m Manifest) Encode(dst []byte) []byte {
 	start := len(dst)
@@ -169,10 +181,18 @@ func (m Manifest) Encode(dst []byte) []byte {
 			flags |= flagFramed
 		}
 
+		if c.Level != 0 {
+			flags |= flagLevel
+		}
+
 		_ = w.WriteByte(flags)
 
 		if flags&flagLossy != 0 {
 			_ = w.WriteByte(c.FloatPrecisionBits)
+		}
+
+		if flags&flagLevel != 0 {
+			_ = w.WriteByte(byte(c.Level))
 		}
 
 		switch c.Kind {
@@ -341,6 +361,15 @@ func decodeColumnDesc(r *bitstream.Reader) (ColumnDesc, error) {
 		}
 
 		c.FloatPrecisionBits = bits
+	}
+
+	if flags&flagLevel != 0 {
+		level, err := r.ReadByte()
+		if err != nil {
+			return c, errors.Wrap(ErrCorrupt, "level")
+		}
+
+		c.Level = compress.Level(level)
 	}
 
 	switch c.Kind {

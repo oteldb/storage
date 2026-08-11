@@ -1099,7 +1099,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		sub := cols.slice(rg[0], rg[1])
 		prefix := e.partPrefix(e.reserveSeq())
 
-		if err := writePart(ctx, e.cfg.Backend, prefix, sub, nil, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
+		if err := writePart(ctx, e.cfg.Backend, prefix, sub, compressProfile{}, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
 			return 0, err
 		}
 

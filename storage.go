@@ -1516,7 +1516,7 @@ func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engi
 	var recompress *engine.RecompressSpec
 
 	if p.Recompress.After > 0 {
-		level := compress.LevelBest
+		level := compress.Level(tenant.DefaultRecompressLevel)
 		if p.Recompress.Level > 0 {
 			level = compress.Level(p.Recompress.Level)
 		}

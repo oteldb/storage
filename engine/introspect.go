@@ -35,6 +35,7 @@ type ColumnStat struct {
 	Kind     string // physical type: int64 / float64 / bytes / int128
 	Codec    string // value codec
 	Compress string // block-compression algorithm
+	Level    int    // block-compression level (0 ⇒ algorithm default or uncompressed)
 }
 
 // CardinalityStat summarizes the engine's label cardinality (the head's index spans head ∪ flushed
@@ -100,6 +101,7 @@ func (e *Engine) PartsDetailed(ctx context.Context) ([]PartDetailStat, error) {
 		for _, c := range man.Columns {
 			cols = append(cols, ColumnStat{
 				Name: c.Name, Kind: c.Kind.String(), Codec: c.Codec.String(), Compress: c.Compress.String(),
+				Level: int(c.Level),
 			})
 		}
 

@@ -55,7 +55,9 @@ rewrite. The writer only emits the framed form.
 
 - **Manifest** — versioned binary record (magic `OTPM`, row count, time range, granule size,
   per-column descriptors) + trailing CRC32C. A descriptor is `[name][kind][codec][compress][flags]`,
-  then a `FloatPrecisionBits` byte **only when `flagLossy` is set**, then per-kind stats/const. The
+  then a `FloatPrecisionBits` byte **only when `flagLossy` is set** and a compression-level byte
+  **only when `flagLevel` is set** (decode-irrelevant — it exists so the merge engine can tell a part
+  already at its target level from one below it), then per-kind stats/const. The
   flag-gating is what keeps lossless and pre-existing parts byte-identical (no version bump, no
   golden churn); `flagBlocked`/`flagFramed` are additive the same way. Decode bounds-checks every
   field (fuzzed).

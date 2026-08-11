@@ -82,6 +82,9 @@ func NewCompressor(alg Algorithm, level Level) *Compressor {
 // Algorithm returns the compressor's algorithm.
 func (c *Compressor) Algorithm() Algorithm { return c.alg }
 
+// Level returns the compressor's level (0 ⇒ the algorithm default).
+func (c *Compressor) Level() Level { return c.level }
+
 // Compress appends the compressed form of src to dst and returns the extended slice.
 // If compression does not reduce the size (rare for small inputs), the raw bytes are
 // stored with a 1-byte prefix [FlagRaw].
