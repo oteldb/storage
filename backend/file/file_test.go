@@ -209,6 +209,127 @@ func TestFileListWalkError(t *testing.T) {
 	require.Error(t, err, "walk over an unreadable subdir must error")
 }
 
+// TestFileListPrefixBoundsTraversal asserts the prefix bounds the work, not just the result:
+// an unreadable sibling subtree — which fails the walk when visited — must not be visited.
+func TestFileListPrefixBoundsTraversal(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX directory permission bits do not block directory walks on Windows")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	b, err := file.New(root)
+	require.NoError(t, err)
+
+	require.NoError(t, b.Write(ctx, "default/metrics/0/manifest", []byte("v")))
+	require.NoError(t, b.Write(ctx, "default/logs/0/manifest", []byte("v")))
+
+	other := filepath.Join(root, "default", "logs")
+	require.NoError(t, os.Chmod(other, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(other, 0o700) })
+
+	keys, err := b.List(ctx, "default/metrics/")
+	require.NoError(t, err, "listing one signal must not traverse the others")
+	assert.Equal(t, []string{"default/metrics/0/manifest"}, keys)
+}
+
+func TestFileListPartialSegmentPrefix(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	b, err := file.New(t.TempDir())
+	require.NoError(t, err)
+
+	for _, k := range []string{
+		"default/metrics/a", "default/metadata/b", "default/logs/c", "other/metrics/d",
+	} {
+		require.NoError(t, b.Write(ctx, k, []byte("v")))
+	}
+
+	// "met" is a partial final segment: both sibling directories still match.
+	keys, err := b.List(ctx, "default/met")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"default/metadata/b", "default/metrics/a"}, keys)
+
+	keys, err = b.List(ctx, "def")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"default/logs/c", "default/metadata/b", "default/metrics/a"}, keys)
+}
+
+func TestFileListMissingPrefix(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	b, err := file.New(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, b.Write(ctx, "a/b", []byte("v")))
+
+	keys, err := b.List(ctx, "nope/deeper/")
+	require.NoError(t, err, "a prefix with no objects lists empty, as on an object store")
+	assert.Empty(t, keys)
+}
+
+// TestFileDeletePrunesEmptyDirs pins the second half of the fix: a deleted part must not leave
+// its directories behind, or every later List keeps paying for them.
+func TestFileDeletePrunesEmptyDirs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	b, err := file.New(root)
+	require.NoError(t, err)
+
+	require.NoError(t, b.Write(ctx, "t/metrics/0000000001/c/col", []byte("v")))
+	require.NoError(t, b.Write(ctx, "t/metrics/0000000001/manifest", []byte("v")))
+	require.NoError(t, b.Write(ctx, "t/metrics/0000000002/manifest", []byte("v")))
+
+	require.NoError(t, b.Delete(ctx, "t/metrics/0000000001/c/col"))
+	_, err = os.Stat(filepath.Join(root, "t", "metrics", "0000000001", "c"))
+	require.ErrorIs(t, err, os.ErrNotExist, "emptied column dir must be removed")
+
+	require.NoError(t, b.Delete(ctx, "t/metrics/0000000001/manifest"))
+	_, err = os.Stat(filepath.Join(root, "t", "metrics", "0000000001"))
+	require.ErrorIs(t, err, os.ErrNotExist, "emptied part dir must be removed")
+
+	// Directories still holding objects survive, up to the root itself.
+	_, err = os.Stat(filepath.Join(root, "t", "metrics"))
+	require.NoError(t, err)
+
+	require.NoError(t, b.Delete(ctx, "t/metrics/0000000002/manifest"))
+	_, err = os.Stat(root)
+	require.NoError(t, err, "root is never pruned")
+
+	keys, err := b.List(ctx, "")
+	require.NoError(t, err)
+	assert.Empty(t, keys)
+}
+
+// TestFileNewSweepsEmptyDirs covers the one-time sweep for deployments that already leaked
+// directories under a pre-pruning version.
+func TestFileNewSweepsEmptyDirs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "t", "metrics", "0000000001", "c"), 0o750))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "t", "logs", "0000000002"), 0o750))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "t", "traces", "0000000003"), 0o750))
+	live := filepath.Join(root, "t", "traces", "0000000003", "manifest")
+	require.NoError(t, os.WriteFile(live, []byte("v"), 0o600))
+
+	b, err := file.New(root)
+	require.NoError(t, err)
+
+	for _, dead := range []string{
+		filepath.Join(root, "t", "metrics"),
+		filepath.Join(root, "t", "logs"),
+	} {
+		_, serr := os.Stat(dead)
+		require.ErrorIs(t, serr, os.ErrNotExist, "empty subtree must be swept: %s", dead)
+	}
+
+	keys, err := b.List(ctx, "")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"t/traces/0000000003/manifest"}, keys)
+}
+
 func TestFileAtomicWriteLeavesNoTemp(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
