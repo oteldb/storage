@@ -361,17 +361,18 @@ func (p *part) seriesStat(ctx context.Context, id signal.SeriesID) (SeriesAgg, b
 	return a, ok
 }
 
-// compressedWith returns the block-compression algorithm the part's value column was written with
-// (representative of the part — all columns share the writer's default algorithm). It is the basis
-// for the recompression fixed point: a part already at the cold algorithm is not rewritten again.
-func (p *part) compressedWith() compress.Algorithm {
+// compressedAt returns the block-compression algorithm and level the part's value column was written
+// with (representative of the part — all columns share the writer's default profile). It is the
+// basis for the recompression fixed point: a part already at the target algorithm and level is not
+// rewritten again.
+func (p *part) compressedAt() (compress.Algorithm, compress.Level) {
 	for _, c := range p.reader.Manifest().Columns {
 		if c.Name == colValue {
-			return c.Compress
+			return c.Compress, c.Level
 		}
 	}
 
-	return compress.AlgorithmNone
+	return compress.AlgorithmNone, 0
 }
 
 // rows returns the part's total sample count (its series ranges partition [0, rows)).

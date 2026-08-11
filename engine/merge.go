@@ -186,14 +186,15 @@ func (e *Engine) writeColumns(ctx context.Context, cols *flushColumns, capRows i
 	return newParts, nil
 }
 
-// writeMergedPart writes cols as the seq-th output part with the cold-tier compression/precision its
-// own newest sample selects, reads it back, and stamps its time bounds.
+// writeMergedPart writes cols as the seq-th output part with the compression its size and age select
+// ([mergeProfile]) and the precision its own newest sample selects, reads it back, and stamps its
+// time bounds.
 func (e *Engine) writeMergedPart(ctx context.Context, cols *flushColumns, seq int, opts MergeOptions) (*part, error) {
 	minT, maxT := colsTimeRange(cols)
 	prefix := e.partPrefix(seq)
 
 	if err := writePart(ctx, e.cfg.Backend, prefix, cols,
-		coldProfile(opts.Recompress, maxT), pickPrecision(opts.Precision, maxT),
+		mergeProfile(opts.Recompress, maxT, len(cols.ts)), pickPrecision(opts.Precision, maxT),
 		e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
 		return nil, err
 	}

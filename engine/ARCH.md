@@ -93,20 +93,29 @@ a replica's `RefreshReplica` skips it: the owner's in-flight part is not in the 
 
 `MergeWith(MergeOptions{RetainFrom, Downsample, Recompress, Precision})` compacts a **bounded,
 size-tiered group** of parts (not the whole set), merging per series by timestamp (freshest wins),
-dropping samples past the retention cutoff, downsampling by tier, and — when the merged part is
-**fully cold** — recompressing and/or re-encoding at a lossy precision budget. All five are the one
-merge engine; no parallel subsystem.
+dropping samples past the retention cutoff, downsampling by tier, compressing the output at a
+size-graduated level, and — when the merged part is **fully cold** — recompressing at the age tier
+and/or re-encoding at a lossy precision budget. All of it is the one merge engine; no parallel
+subsystem.
 
 - **Determinism:** `Before`/`retainFrom` are absolute timestamps, never clock reads; the caller
   resolves policy against one `now` per pass. Downsample buckets align to the absolute grid, so a
   rollup is independent of when the merge runs.
 - **Fixed points:** repeated merges are stable for last/first/min/max/sum/avg (count is the
-  documented exception); recompression checks the part's recorded algorithm and precision checks
-  the manifest's recorded budget, so re-merges don't churn.
+  documented exception); recompression checks the part's recorded algorithm *and level* and precision
+  checks the manifest's recorded budget, so re-merges don't churn. Only an upgrade forces a rewrite —
+  a part denser than the target is left alone.
 - **Weight-aware:** compaction and rollup both honor the lossy-sampling scale factor, so a sampled
   series stays unbiased.
+- **Graduated compression** (`recompress.go`): a merge always compresses its output, at a level its
+  row count selects (zstd 1 ≤ 64k rows, 2 ≤ 1M, else 3 — VictoriaMetrics' ladder, capped the same
+  way). A merge rewrites the data regardless, so the only cost is the level's own CPU, and a bigger
+  part — older, read less per byte, merged again less often — earns a denser level. Above the ladder
+  sits at most one *age* tier, `RecompressSpec`, applied to a fully cold part. A hot flush is
+  unaffected: it still writes codec-only framing.
 - **Recompression is decode-transparent** — the reader keys off the per-column algorithm in the
-  manifest, so it is a pure ratio/CPU trade with no format change.
+  manifest, so it is a pure ratio/CPU trade with no format change. The *level* is recorded too, but
+  only so the merge can tell a part already at the target from one below it; nothing reads it back.
 - **Size-tiered selection** (`compact.go`) picks only what is worth merging: any part a forced
   rewrite must touch (retention/downsample/recompress/precision — so age-driven work is never
   starved), plus the largest group of same-tier *unsealed* parts. A part at the merge cap is

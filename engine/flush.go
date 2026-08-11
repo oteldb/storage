@@ -10,6 +10,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -141,13 +142,14 @@ const (
 	maxInt64 = int64(1<<63 - 1)
 )
 
-// writePart writes cols as a metric part under prefix via [block.PartWriter]. A non-nil comp
-// rewrites the part with a higher-ratio compression profile (recompression of cold data); nil
-// keeps the default codec-only framing. precisionBits in 1..63 encodes the value column lossily
-// (age-tiered precision, set by the merge engine for cold data); 0 keeps it lossless.
+// writePart writes cols as a metric part under prefix via [block.PartWriter]. comp selects the block
+// compression: the zero profile is codec-only framing (what a hot flush writes), and a merge passes
+// the ladder/cold profile [mergeProfile] picked for the part. precisionBits in 1..63 encodes the
+// value column lossily (age-tiered precision, set by the merge engine for cold data); 0 keeps it
+// lossless.
 func writePart(
 	ctx context.Context, b backend.Backend, prefix string, cols *flushColumns,
-	comp *RecompressSpec, precisionBits uint8, writeStats bool, blockRows int,
+	comp compressProfile, precisionBits uint8, writeStats bool, blockRows int,
 ) error {
 	if blockRows <= 0 {
 		blockRows = DefaultMetricBlockRows
@@ -157,7 +159,7 @@ func writePart(
 	// touches; the block size also drives the marks granules (WithGranuleSize). The series id column
 	// (RLE) is not blocked — it is read whole when the part is opened to build the row-range index.
 	opts := []block.PartOption{block.WithSortKey(colTs), block.WithGranuleSize(blockRows)}
-	if comp != nil {
+	if comp.Algorithm != compress.AlgorithmNone {
 		opts = append(opts, block.WithCompression(comp.Algorithm), block.WithCompressionLevel(comp.Level))
 	}
 

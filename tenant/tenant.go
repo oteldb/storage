@@ -98,15 +98,23 @@ type Sampling struct {
 }
 
 // Recompress is the per-tenant cold-data recompression policy: once a part's data is older than
-// After, the merge engine rewrites it with a higher-ratio (Zstandard) profile, trading merge CPU
-// for storage. It is decode-transparent (the reader keys off the recorded algorithm), so it costs
-// nothing to read. Optional; a zero After disables it.
+// After, the merge engine rewrites it at a higher Zstandard level than the size ladder would pick,
+// trading merge CPU for storage. It is decode-transparent (the reader keys off the recorded
+// algorithm), so it costs nothing to read. Optional; a zero After disables it — merged parts are
+// still compressed, at the ladder level their size earns.
+//
+// This is the *archival* tier and should be the only one: levels past ~9 buy single-digit percent
+// for roughly an order of magnitude more CPU, which competes with merge and retention.
 type Recompress struct {
 	// After is the age past which a fully-cold part is recompressed at merge. Zero ⇒ disabled.
 	After time.Duration
-	// Level is the Zstandard level (1 fastest … 19 best ratio). Zero ⇒ the best-ratio default.
+	// Level is the Zstandard level (1 fastest … 19 best ratio). Zero ⇒ [DefaultRecompressLevel].
 	Level int
 }
+
+// DefaultRecompressLevel is the Zstandard level a [Recompress] policy uses when Level is unset: the
+// archival end of the useful range, not the extreme one.
+const DefaultRecompressLevel = 9
 
 // PrecisionTier makes a part's value column lossy once its data reaches a given age: a part fully
 // older than After is re-encoded, at merge, retaining only Bits significant mantissa bits
