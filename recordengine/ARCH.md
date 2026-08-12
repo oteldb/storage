@@ -66,6 +66,25 @@ identity was first seen is gone afterwards; a record is logged again whenever a 
 Without it, a record logged after a checkpoint would reference a stream the log no longer describes,
 and with identity in the parts (which retention can drop) nothing else would name it.
 
+## Identity prune
+
+Retention drops records and whole parts; `PruneIdentities` drops the identities they leave behind,
+which otherwise accumulate for the process' lifetime under stream churn (the `instance.id`-shaped
+attributes that turned ~24 stable streams into ~15k). The **live set** is the union of every live
+part's stream ids — resident already, in `part.ranges`, so unlike the metrics engine it costs no I/O
+— with the head and the mid-flush detachment.
+
+Symbol ids are dense and referenced by the postings, so the survivors are **rebuilt** into fresh
+structures rather than deleted in place: off the engine lock, against `series.Index.Snapshot()`
+(the append-only entry log, which registration only extends), then swapped in under the lock. The
+swap re-registers what changed meanwhile — entries past the snapshot's end, and streams the prune
+found dead that regained buffered records — and drops the rest's out-of-order watermarks by key.
+
+It runs after a merge, and on a replica after the refresh that adopts a new part set, and only when
+parts actually went away. No ownership rule: identity is scoped to the part, so a node's live set
+means exactly "what this node can still serve". `Admin.PruneIdentities` forces a sweep past the
+size/dead-fraction thresholds for an operator.
+
 ## Publish ordering
 
 Publishing a flush writes the part's objects — identity included — **first** and the bucket index

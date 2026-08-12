@@ -106,9 +106,9 @@ The WAL needs no `walExpiries` equivalent: it is checkpointed at every flush and
 record whenever a series starts a buffer, so its live records name only series it describes itself.
 The prune writes nothing durable — the identities it drops went with the parts that held them.
 
-Not yet pruned: the record engines' **resident** stream index. Their durable half is part-scoped as
-of #168's first half; the prune itself, and the union-only merged symbol sidecars, still need the
-same treatment.
+The record engines have the same prune (`recordengine/prune.go`), reaching the live set from their
+resident `part.ranges` instead of a sidecar read. What is still unbounded there is the **union-only
+merged symbol sidecars**, which need a shrink path of their own.
 
 **Publish order: the part's objects first, the bucket index last.** The bucket index is what makes a
 part durably visible, so writing it is the commit point, and a readable part always carries the

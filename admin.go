@@ -5,6 +5,8 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -76,6 +78,52 @@ func (a Admin) Retention(ctx context.Context, key signal.TenantID) error {
 	}
 
 	return nil
+}
+
+// PruneIdentities drops the identities retention has left without data across every one of a
+// tenant/shard's signals, and returns how many it removed in total. The background maintenance does
+// this after anything that changed the part set, but only once enough has died to pay for the
+// rebuild; this ignores those thresholds, so an operator can reclaim immediately — after a
+// cardinality incident, say — and see the number rather than a silent no-op. Watch the effect on
+// `SignalStats.IdentityBytes`.
+//
+// Signals with no engine on this node contribute 0; ones it does not own are refused.
+func (a Admin) PruneIdentities(ctx context.Context, key signal.TenantID) (int, error) {
+	if a.s.closed.Load() {
+		return 0, errors.Wrap(ErrClosed, "admin prune identities")
+	}
+
+	if err := a.s.adminOwns(key); err != nil {
+		return 0, err
+	}
+
+	norm := a.s.normalizeTenant(key)
+	total := 0
+
+	if eng, ok := a.s.lookupEngine(norm); ok {
+		n, err := eng.PruneIdentitiesWith(ctx, engine.PruneOptions{Force: true})
+		if err != nil {
+			return total, errors.Wrap(err, "prune metric identities")
+		}
+
+		total += n
+	}
+
+	for _, sig := range []signal.Signal{signal.Log, signal.Trace, signal.Profile} {
+		eng, ok := a.s.lookupRecordEngine(sig, norm)
+		if !ok {
+			continue
+		}
+
+		n, err := eng.PruneIdentitiesWith(ctx, recordengine.PruneOptions{Force: true})
+		if err != nil {
+			return total, errors.Wrapf(err, "prune %s identities", sig)
+		}
+
+		total += n
+	}
+
+	return total, nil
 }
 
 // Rebalance triggers an immediate cluster ownership reconciliation (the maintenance loop otherwise

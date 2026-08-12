@@ -118,6 +118,13 @@ func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
 	}
 
 	e.retireLocked(selected)
+	// Rows that did not survive the merge are retention's work: the records are gone, so the
+	// identities naming them may be dead too. Merging without dropping rows leaves every identity
+	// backed, so it arms nothing.
+	if partRows(newParts) < partRows(selected) {
+		e.identityDirty = true
+	}
+
 	e.mu.Unlock()
 
 	e.reclaimRetired(ctx)

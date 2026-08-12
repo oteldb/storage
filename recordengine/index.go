@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"path"
+	"slices"
 	"strconv"
 
 	"github.com/go-faster/errors"
@@ -77,6 +78,16 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 
 		if s := seqOfPrefix(ent.Prefix); s > maxSeq {
 			maxSeq = s
+		}
+	}
+
+	// A part disappearing means identities may have died with it, which is what arms the identity
+	// prune on a node that never merges (a replica adopting the owner's part set).
+	for _, p := range e.parts {
+		if !slices.ContainsFunc(parts, func(n *part) bool { return n.prefix == p.prefix }) {
+			e.identityDirty = true
+
+			break
 		}
 	}
 

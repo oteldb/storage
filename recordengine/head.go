@@ -65,6 +65,70 @@ func (h *head) admitStream(id signal.SeriesID, maxSeries int64) (isNew, ok bool)
 	return true, maxSeries <= 0 || int64(h.series.Len()) < maxSeries
 }
 
+// rebuildIdentity returns fresh symbol, series and postings structures holding only the identities
+// of snap that are in live — the identity prune (see prune.go). It is a rebuild rather than a
+// deletion because symbol ids are dense and referenced by the postings lists, so removing one
+// symbol would renumber every id above it.
+//
+// It reads nothing but its arguments, so it runs **off the engine lock**: snap is the series index's
+// append-only entry log, which registration only extends. The caller installs the result and
+// replays whatever was registered meanwhile ([head.swapIdentity]).
+func rebuildIdentity(schema *Schema, snap []series.Entry, live map[signal.SeriesID]struct{}) *head {
+	out := &head{schema: schema, sym: symbols.New(), series: series.New(), post: postings.NewMemPostings()}
+
+	for i := range snap {
+		if _, ok := live[snap[i].ID]; !ok {
+			continue
+		}
+
+		out.register(snap[i].ID, snap[i].Series)
+	}
+
+	// Sort now, while the index is still private: a reader would otherwise trigger the lazy in-place
+	// sort under the engine's read lock.
+	out.post.EnsureSorted()
+
+	return out
+}
+
+// swapIdentity installs the rebuilt identity structures, and is where the prune becomes atomic
+// against ingest. Two sets of identities must survive a rebuild that decided without them:
+//
+//   - tail — registered after the snapshot was taken, so they are past its end in the same
+//     append-only log and are live by construction.
+//   - revived — snapshot entries the prune found dead that hold buffered records again. A stream
+//     whose identity the *old* index still had is not re-registered when a record arrives, so it
+//     leaves no tail entry; dropping it would strand records the next flush would then write into a
+//     part with no identity naming them.
+//
+// Every other dead stream loses its out-of-order watermark here: it means nothing without an
+// identity, while a live stream must keep its own or a late record slips back in. The record
+// buffers and the byte measures are untouched — they describe live data. Caller holds the engine lock.
+func (h *head) swapIdentity(rebuilt *head, snap, tail []series.Entry, dead []int32) {
+	for i := range tail {
+		rebuilt.register(tail[i].ID, tail[i].Series)
+	}
+
+	for _, pos := range dead {
+		e := snap[pos]
+		if _, revived := h.records[e.ID]; revived {
+			rebuilt.register(e.ID, e.Series)
+
+			continue
+		}
+
+		delete(h.streamNewest, e.ID)
+	}
+
+	h.sym, h.series, h.post = rebuilt.sym, rebuilt.series, rebuilt.post
+}
+
+// register records and indexes an identity known not to be present.
+func (h *head) register(id signal.SeriesID, s signal.Series) {
+	h.series.Add(s)
+	h.indexLabels(id, s)
+}
+
 // needsStreamRecord reports whether the WAL must be told about this stream again. A flush
 // checkpoints the log — every segment written before it is discarded — and detaches every record
 // buffer, so a stream record logged when the identity was first seen is gone after the next flush
