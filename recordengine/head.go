@@ -6,6 +6,7 @@ import (
 	"github.com/oteldb/storage/index/postings"
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/index/symbols"
+	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -333,6 +334,19 @@ func (h *head) trimBelowCovered(t int64, covered map[signal.SeriesID]struct{}) {
 // trigger meter — dropping the detached part would let a whole second head in on top of the one
 // still being written out.
 func (h *head) inFlightBytes() int64 { return h.bytes + h.detachedBytes }
+
+// identityBytes is the resident footprint of the head's identity state — symbols, the stream
+// index, the postings lists and the per-stream OOO watermarks. It is deliberately **not** part of
+// [head.inFlightBytes]: a flush drains buffered records but not identities, so folding the two
+// would make a size-triggered flush chase a number it cannot lower. Identity is reported on its
+// own ([Stats.IdentityBytes]) because nothing else counts it, and it only grows.
+func (h *head) identityBytes() int64 {
+	return h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
+		int64(len(h.streamNewest))*watermarkEntryBytes
+}
+
+// watermarkEntryBytes is one streamNewest map entry (stream id → timestamp).
+var watermarkEntryBytes = memsize.MapEntry[signal.SeriesID, int64]()
 
 // recountBytes resets the in-flight byte measure from the current buffers (used after a bulk
 // mutation like trimBelow that does not track per-record deltas).

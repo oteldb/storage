@@ -303,14 +303,29 @@ func (e *Engine) HeadBytes() int64 {
 	return e.head.bytes
 }
 
+// IdentityBytes returns the resident bytes of the engine's identity state — the symbol table, the
+// series index, the postings lists and the per-series out-of-order watermarks. It is reported
+// separately from [Engine.HeadBytes] because a flush does not drain it: identities outlive their
+// samples and are cleared only by [Engine.Reset], so this number tracks the engine's all-time
+// series count, not its buffered data.
+func (e *Engine) IdentityBytes() int64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	return e.head.identityBytes()
+}
+
 // Stats is an in-memory snapshot of an engine's state for introspection (no backend I/O, no decode).
 type Stats struct {
 	Series      int64 // distinct series ever seen (index span: head ∪ flushed)
 	HeadSamples int64 // samples currently buffered in the head (unflushed)
 	HeadBytes   int64 // head's buffered sample bytes (the in-flight memory measure)
-	Parts       int   // flushed immutable parts
-	MinTime     int64 // oldest flushed sample time (unix ns); 0 when no parts
-	MaxTime     int64 // newest sample time across parts and the head (unix ns); 0 when empty
+	// IdentityBytes is the resident identity state (symbols + series index + postings + OOO
+	// watermarks) — memory a flush does not drain, and which no other counter here reports.
+	IdentityBytes int64
+	Parts         int   // flushed immutable parts
+	MinTime       int64 // oldest flushed sample time (unix ns); 0 when no parts
+	MaxTime       int64 // newest sample time across parts and the head (unix ns); 0 when empty
 }
 
 // Stats returns an in-memory snapshot of the engine's state under a single read lock. It does no
@@ -321,10 +336,11 @@ func (e *Engine) Stats() Stats {
 	defer e.mu.RUnlock()
 
 	s := Stats{
-		Series:    int64(e.head.series.Len()),
-		HeadBytes: e.head.bytes,
-		Parts:     len(e.parts),
-		MaxTime:   e.head.newest,
+		Series:        int64(e.head.series.Len()),
+		HeadBytes:     e.head.bytes,
+		IdentityBytes: e.head.identityBytes(),
+		Parts:         len(e.parts),
+		MaxTime:       e.head.newest,
 	}
 
 	for _, buf := range e.head.samples {

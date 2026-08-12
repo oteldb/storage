@@ -52,6 +52,7 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 |------|---------|
 | `Series` | distinct series/streams ever seen (head ∪ flushed) |
 | `HeadItems` / `HeadBytes` | unflushed samples/records and their in-flight bytes. For a record engine `HeadBytes` also counts the buffers an in-flight flush has detached but not yet published — they stay resident, and they are what `MaxInFlightBytes` and `FlushThresholdBytes` meter |
+| `IdentityBytes` | resident identity state: the symbol table, the series/stream index, the postings lists and the per-series out-of-order watermarks. A flush does **not** drain it — identities outlive the data they named and are reclaimed only by `Reset` — so it is reported beside `HeadBytes` rather than folded into it (`MaxInFlightBytes` / `FlushThresholdBytes` would otherwise chase a number a flush cannot lower). It scales with `Series` (all-time), so on a churning tenant it is the memory that grows without bound and that no other field here shows |
 | `Parts` | flushed immutable part count |
 | `MinTimeUnixNano` / `MaxTimeUnixNano` | data time span (min over parts; max includes the head) |
 | `MergeRunning` | a compaction is executing on this engine right now |

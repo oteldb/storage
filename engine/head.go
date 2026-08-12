@@ -7,6 +7,7 @@ import (
 	"github.com/oteldb/storage/index/postings"
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/index/symbols"
+	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -76,6 +77,19 @@ func newHead() *head {
 		seriesNewest: make(map[signal.SeriesID]int64),
 	}
 }
+
+// identityBytes is the resident footprint of the head's identity state — symbols, the series
+// index, the postings lists and the per-series OOO watermarks. It is deliberately **not** part of
+// [head.bytes]: a flush drains buffered samples but not identities, so folding the two would make
+// a size-triggered flush chase a number it cannot lower. Identity is reported on its own
+// ([Stats.IdentityBytes]) because nothing else counts it, and it only grows.
+func (h *head) identityBytes() int64 {
+	return h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
+		int64(len(h.seriesNewest))*watermarkEntryBytes
+}
+
+// watermarkEntryBytes is one seriesNewest map entry (series id → timestamp).
+var watermarkEntryBytes = memsize.MapEntry[signal.SeriesID, int64]()
 
 // outOfOrder reports whether ts is more than oooWindow behind series id's own newest admitted
 // sample. A series' first sample is never out of order, however far behind its neighbors it is.

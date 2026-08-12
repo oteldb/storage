@@ -52,6 +52,12 @@ written and read uncached (`backend.WriteUncached`): it is read only on recovery
 never hit and only evicts part data. Both are stopgaps — the identity object is still whole-set, and
 per-part identity is the scale-out form.
 
+The resident half of that identity state — the head's symbol table, series index, postings lists and
+per-series OOO watermarks — is **metered but never reclaimed**: `Stats.IdentityBytes` reports it
+separately from `HeadBytes` because a flush drains samples, not identities, so folding the two would
+have the size-triggered flush chase a number it cannot lower. It grows with the all-time series
+count and is released only by `Reset`.
+
 **Publish order: `series.bin` first, the bucket index last.** The bucket index is what makes a part
 durably visible, so writing it is the commit point, and a part is only readable once its series'
 identities are durable — a stateless reader rebuilds them from `series.bin` alone, so a committed

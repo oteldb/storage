@@ -15,6 +15,7 @@ package postings
 import (
 	"slices"
 
+	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -26,12 +27,31 @@ type MemPostings struct {
 	m      map[uint32]map[uint32][]signal.SeriesID
 	all    []signal.SeriesID
 	sorted bool
+	// bytes accumulates the index's owned memory (map entries and posting-list capacity) as it is
+	// added, so [MemPostings.SizeBytes] does not walk every list. The index is identity state that
+	// outlives every flush, so its size is metered.
+	bytes int64
 }
+
+// Sizes of the index's owned structures. Posting lists are counted by capacity, which the in-place
+// sort/dedup on first read shrinks the length of but never the capacity.
+var (
+	// A name entry costs its slot in p.m — whose value is one pointer word, since a map value *is*
+	// a pointer to the runtime's map header — plus that header, allocated once per label name.
+	nameEntryBytes  = memsize.MapEntry[uint32, map[uint32][]signal.SeriesID]() + memsize.MapBase
+	valueEntryBytes = memsize.MapEntry[uint32, []signal.SeriesID]()
+	seriesIDBytes   = memsize.Of[signal.SeriesID]()
+)
 
 // NewMemPostings returns an empty index.
 func NewMemPostings() *MemPostings {
 	return &MemPostings{m: make(map[uint32]map[uint32][]signal.SeriesID)}
 }
+
+// SizeBytes returns the index's resident footprint: the name→value maps and every posting list's
+// backing array (the all-set included). Symbol ids are the keys, so no label bytes are counted
+// here — they belong to the symbol table.
+func (p *MemPostings) SizeBytes() int64 { return p.bytes }
 
 // Add records that series carries the attribute nameID=valueID (both interned symbol
 // ids). Re-adding the same triple is fine; duplicates are removed on the first read.
@@ -40,10 +60,22 @@ func (p *MemPostings) Add(series signal.SeriesID, nameID, valueID uint32) {
 	if byVal == nil {
 		byVal = make(map[uint32][]signal.SeriesID)
 		p.m[nameID] = byVal
+		p.bytes += nameEntryBytes
 	}
 
-	byVal[valueID] = append(byVal[valueID], series)
-	p.all = append(p.all, series)
+	// A bucket, once created, always holds at least one id, so a nil list means a new value —
+	// checked without the second-result map probe the hot path would otherwise pay per Add.
+	ids := byVal[valueID]
+	if ids == nil {
+		p.bytes += valueEntryBytes
+	}
+
+	grown := cap(ids)
+	ids = append(ids, series)
+	byVal[valueID] = ids
+	p.bytes += int64(cap(ids)-grown) * seriesIDBytes
+
+	p.addAll(series)
 	p.sorted = false
 }
 
@@ -52,7 +84,7 @@ func (p *MemPostings) Add(series signal.SeriesID, nameID, valueID uint32) {
 // by [MemPostings.All] and by [MemPostings.Resolve] with no matchers. Idempotent: duplicates are
 // removed on the first read.
 func (p *MemPostings) AddSeries(series signal.SeriesID) {
-	p.all = append(p.all, series)
+	p.addAll(series)
 	p.sorted = false
 }
 
@@ -195,6 +227,13 @@ func (p *MemPostings) Sorted() bool { return p.sorted }
 // lock calls it after writes so that subsequent **concurrent** reads (which only inspect the
 // already-sorted lists) never trigger the in-place mutation. See [MemPostings.Sorted].
 func (p *MemPostings) EnsureSorted() { p.ensureSorted() }
+
+// addAll appends to the all-set, accounting for the backing array's growth.
+func (p *MemPostings) addAll(series signal.SeriesID) {
+	grown := cap(p.all)
+	p.all = append(p.all, series)
+	p.bytes += int64(cap(p.all)-grown) * seriesIDBytes
+}
 
 // ensureSorted sorts and deduplicates every list (and the all-set) in place. It runs on
 // the first read after a write; set-op iterators require sorted, deduplicated inputs.

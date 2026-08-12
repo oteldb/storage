@@ -42,6 +42,16 @@ it is zero-alloc and **type-preserving** (the value id comes from the value's ty
 - Sorting is lazy and caller-synchronized (`Sorted()`/`EnsureSorted()`), so a reader can upgrade to
   the write lock exactly once after a write.
 
+## Metering
+
+Each structure reports its resident footprint (`SizeBytes`), accumulated on insert rather than
+walked, so the engine can meter identity state — which no sample/record byte counter sees and which
+a flush does not drain (see `ADMIN.md`'s `IdentityBytes`). Every byte is charged once, where it is
+owned: interned payloads to the symbol table, so an identity referencing them is not double-counted.
+Estimates come from `internal/memsize`, the one place that needs `unsafe.Sizeof`; they are
+structural (map slots, backing-array capacity, interned bytes) and ignore size-class rounding —
+measured within a few percent of the heap delta at 200k series.
+
 ## `bloom`
 
 Token bloom filter (bit array, k xxh3-128 double-hash probes, versioned + CRC'd, **no false

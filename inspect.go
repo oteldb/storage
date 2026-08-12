@@ -44,6 +44,12 @@ type SignalStats struct {
 	HeadItems int64
 	// HeadBytes is the head's buffered bytes — the in-flight memory measure a flush drains.
 	HeadBytes int64
+	// IdentityBytes is the resident bytes of this engine's identity state: the symbol table, the
+	// series/stream index, the postings lists and the per-series out-of-order watermarks. A flush
+	// does **not** drain it — identities outlive their data — so it is reported separately from
+	// HeadBytes rather than folded into it, and it grows with Series (all-time), not with the
+	// buffered data.
+	IdentityBytes int64
 	// Parts is the number of flushed immutable parts (the compaction-backlog proxy: many small
 	// parts means merge is behind).
 	Parts int
@@ -155,7 +161,7 @@ func (s *Storage) Inspect() StoreStats {
 		ts := tenantStats(tid)
 		ts.Signals = append(ts.Signals, SignalStats{
 			Signal: signal.Metric, Series: es.Series, HeadItems: es.HeadSamples, HeadBytes: es.HeadBytes,
-			Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
+			IdentityBytes: es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
 			MergeRunning: eng.MergeRunning(), MergeBacklog: es.Parts,
 			WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 		})
@@ -176,7 +182,7 @@ func (s *Storage) Inspect() StoreStats {
 			ts := tenantStats(tid)
 			ts.Signals = append(ts.Signals, SignalStats{
 				Signal: sig, Series: es.Streams, HeadItems: es.HeadRecords, HeadBytes: es.HeadBytes,
-				Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
+				IdentityBytes: es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
 				MergeRunning: eng.MergeRunning(), MergeBacklog: es.Parts,
 				WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 			})

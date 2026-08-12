@@ -7,6 +7,7 @@ package series
 
 import (
 	"github.com/oteldb/storage/index/symbols"
+	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -30,6 +31,11 @@ type Index struct {
 	scope map[string]signal.Scope
 	buf   []byte // reused series hash pre-image buffer (zero-alloc Add)
 	kbuf  []byte // reused resource/scope canonical-bytes buffer for set interning
+	// bytes accumulates the structures this index owns outside the symbol table — the byID entries,
+	// each identity's attribute slice, and the resource/scope dedup maps — on insert, so
+	// [Index.SizeBytes] is O(1). The index is identity state that outlives every flush, so its size
+	// is metered rather than walked.
+	bytes int64
 }
 
 // New returns an empty [Index].
@@ -52,11 +58,15 @@ func (ix *Index) Add(s signal.Series) signal.SeriesID {
 	id := signal.HashBytes(ix.buf)
 
 	if _, ok := ix.byID[id]; !ok {
-		ix.byID[id] = signal.Series{
+		stored := signal.Series{
 			Resource:   ix.internResource(s.Resource),
 			Scope:      ix.internScope(s.Scope),
 			Attributes: s.Attributes.Intern(ix.sym.Bytes),
 		}
+		ix.byID[id] = stored
+		// The resource/scope attribute sets are shared (counted once, where they are interned); only
+		// the point attributes are this identity's own.
+		ix.bytes += seriesEntryBytes + attrBytes(stored.Attributes)
 	}
 
 	return id
@@ -79,6 +89,25 @@ func (ix *Index) Has(id signal.SeriesID) bool {
 // Len returns the number of distinct series.
 func (ix *Index) Len() int { return len(ix.byID) }
 
+// Sizes of the index's owned structures. The identity payloads themselves (label bytes) live in
+// the symbol table and are counted there.
+var (
+	seriesEntryBytes = memsize.MapEntry[signal.SeriesID, signal.Series]()
+	resEntryBytes    = memsize.MapEntry[string, signal.Resource]()
+	scopeEntryBytes  = memsize.MapEntry[string, signal.Scope]()
+)
+
+// attrBytes returns the bytes of an attribute set's backing array. A nested (slice- or map-valued)
+// attribute is counted by its header only — identity attributes are flat in practice.
+func attrBytes(a signal.Attributes) int64 { return memsize.Slice(a) }
+
+// SizeBytes returns the index's resident footprint: the interned symbol table, the id→identity
+// entries, the deduplicated resource/scope sets, and the reusable scratch buffers. It is the
+// index's share of the engine's identity state, which no sample/record byte counter sees.
+func (ix *Index) SizeBytes() int64 {
+	return ix.bytes + ix.sym.SizeBytes() + memsize.Slice(ix.buf) + memsize.Slice(ix.kbuf)
+}
+
 // ForEach calls fn for each (id, identity) pair. Iteration order is unspecified.
 func (ix *Index) ForEach(fn func(id signal.SeriesID, s signal.Series)) {
 	for id := range ix.byID {
@@ -96,6 +125,7 @@ func (ix *Index) internResource(r signal.Resource) signal.Resource {
 
 	interned := r.Intern(ix.sym.Bytes)
 	ix.res[string(ix.kbuf)] = interned // allocates the key once per distinct resource
+	ix.bytes += resEntryBytes + int64(len(ix.kbuf)) + attrBytes(interned.Attributes)
 
 	return interned
 }
@@ -109,6 +139,7 @@ func (ix *Index) internScope(s signal.Scope) signal.Scope {
 
 	interned := s.Intern(ix.sym.Bytes)
 	ix.scope[string(ix.kbuf)] = interned
+	ix.bytes += scopeEntryBytes + int64(len(ix.kbuf)) + attrBytes(interned.Attributes)
 
 	return interned
 }
