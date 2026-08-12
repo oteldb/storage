@@ -148,7 +148,7 @@ const (
 // value column lossily (age-tiered precision, set by the merge engine for cold data); 0 keeps it
 // lossless.
 func writePart(
-	ctx context.Context, b backend.Backend, prefix string, cols *flushColumns,
+	ctx context.Context, b backend.Backend, prefix string, cols *flushColumns, idents identitySet,
 	comp compressProfile, precisionBits uint8, writeStats bool, blockRows int,
 ) error {
 	if blockRows <= 0 {
@@ -203,6 +203,13 @@ func writePart(
 	// part that openPart handles via the resident fallback.
 	if err := b.Write(ctx, sidxKey(prefix), encodeSeriesIndex(cols.series)); err != nil {
 		return errors.Wrapf(err, "write series-index sidecar %q", prefix)
+	}
+
+	// Identity object: the identities of this part's series, so the part carries what names its own
+	// rows (see partidentity.go). Written before the part is committed to the bucket index, which is
+	// what makes it visible — a readable part always has its identities.
+	if err := writeIdentity(ctx, b, prefix, idents.entriesFor(cols.series)); err != nil {
+		return err
 	}
 
 	// Aggregate-pushdown sidecar: per-series count/sum/min/max over the value column, so a query

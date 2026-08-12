@@ -129,11 +129,15 @@ jittered backoff; **idempotent reads hedge** across replicas, **writes stay at-m
   homegrown Raft; single-node works with the cluster layer absent.
 - **The bucket index commits last.** It is what makes a part durably visible — and in
   `recordengine` it also carries the flush watermark (the WAL replay floor) — so its write is the
-  commit point in both engines: everything a committed part needs to stay readable, its objects and
-  the identity index naming its series/streams (`series.bin` / `streams.bin`), must be durable
-  first. Identity sets are superset-safe (an identity with no rows resolves to an id no part range
-  covers, and contributes nothing), so publish order is chosen to leave recoverable slack on a crash
-  — unreferenced objects, identities with no rows — never rows that are committed but unresolvable.
+  commit point in both engines: everything a committed part needs to stay readable must be durable
+  first — its column objects and, in `engine`, the part's own identity object naming its series.
+  Publish order is chosen to leave recoverable slack on a crash — unreferenced objects, an orphan
+  part swept at the next open — never rows that are committed but unresolvable.
+- **Identity is scoped to the part that holds it** (`engine`; `recordengine` still keeps a whole-set
+  `streams.bin`). Each part carries the identities of its own series, so retention is self-cleaning
+  (dropping a part drops them), a flush persists what it wrote rather than the whole set, and every
+  node — owner or replica — derives its live identity set from its own parts. The resident index is
+  the union over live parts plus the unflushed head, and is metered as `IdentityBytes`.
 - **Injected, no-op-default observability** (above).
 - **Stable formats.** Golden-tested and version-guarded: the `Codec` enum and per-codec framing,
   part manifest (`OTPM`) / marks (`OTMK`) / column object framing and key layout, the attribute
@@ -166,7 +170,7 @@ otlp/pdataconv        optional OTel-Go bridge (only package importing pdata)
 tenant/               policy model + Resolver
 backend/{,file,s3,bucketindex,backendtest}   L1 seam, implementations, part index, conformance suite
 block/                immutable columnar part format
-index/{symbols,series,postings,bloom}        identity index + inverted index + token blooms
+index/{symbols,series,postings,identity,bloom}  identity index + inverted index + per-part identity object + token blooms
 wal/                  segmented CRC-framed WAL
 engine/               metrics vertical
 recordengine/         shared record engine (logs/traces/profiles)

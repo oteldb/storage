@@ -199,8 +199,11 @@ func (e *Engine) writeColumns(ctx context.Context, cols *flushColumns, capRows i
 func (e *Engine) writeMergedPart(ctx context.Context, cols *flushColumns, seq int, opts MergeOptions) (*part, error) {
 	minT, maxT := colsTimeRange(cols)
 	prefix := e.partPrefix(seq)
+	// The merged part's identities come from the resident index, which spans every live series —
+	// snapshotted here (a brief read lock, off the flush path) because the write itself is off-lock.
+	idents := e.identitiesForColumn(cols.series)
 
-	if err := writePart(ctx, e.cfg.Backend, prefix, cols,
+	if err := writePart(ctx, e.cfg.Backend, prefix, cols, idents,
 		mergeProfile(opts.Recompress, maxT, len(cols.ts)), pickPrecision(opts.Precision, maxT),
 		e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
 		return nil, err

@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/binary"
 	"path"
+	"slices"
 	"strconv"
 
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
-	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -96,6 +96,16 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 		}
 	}
 
+	// A part disappearing means identities may have died with it, which is what arms the identity
+	// prune on a node that never merges (a replica adopting the owner's part set).
+	for _, p := range e.parts {
+		if !slices.ContainsFunc(parts, func(n *part) bool { return n.prefix == p.prefix }) {
+			e.identityDirty = true
+
+			break
+		}
+	}
+
 	e.parts = parts
 	e.nextSeq = maxSeq + 1
 
@@ -108,7 +118,22 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 		e.nextSeq = next
 	}
 
-	return e.loadSeriesIndexLocked(ctx)
+	complete, err := e.loadIdentitiesLocked(ctx, parts)
+	if err != nil {
+		return err
+	}
+
+	// Once every live part carries its own identities, the legacy whole-set object holds nothing
+	// live that the parts do not — only identities whose data is gone. Deleting it completes the
+	// migration for a prefix written by an older build, and stops recovery from resurrecting dead
+	// identities on every restart.
+	if complete && sweep {
+		if err := e.cfg.Backend.Delete(ctx, e.seriesKey()); err != nil && !errors.Is(err, backend.ErrNotExist) {
+			return errors.Wrap(err, "delete legacy series index")
+		}
+	}
+
+	return nil
 }
 
 // RefreshReplica brings a replica node's view up to date with the shared object store: it
@@ -150,57 +175,10 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 	return nil
 }
 
-// writeSeriesIndexLocked persists the head's full series identity set so a stateless reader
-// can rebuild the postings/series index. Written on flush; identities outlive a flush, so a full
-// rewrite is correct. Caller holds e.mu.
-//
-// Between prunes the set only grows, so an unchanged identity count means the persisted object is
-// already byte-identical and the write is skipped: a steady state that registers no new series costs
-// nothing, instead of re-serializing and rewriting every identity every flush interval. An identity
-// prune ([Engine.PruneIdentities]) is the one path that removes entries, and a set that shrank and
-// regrew to the same count is not the same set — so it forces the next write by clearing
-// seriesWritten rather than leaving the count to imply it. The object is written uncached — it is
-// rewritten at flush frequency and read only on recovery, so caching it only evicts part data.
-//
-// TODO: this rewrites every identity when the set does change — fine single-node, but a per-part
-// identity object (incremental) is the scale-out form.
-func (e *Engine) writeSeriesIndexLocked(ctx context.Context) error {
-	if e.cfg.Backend == nil {
-		return nil
-	}
-
-	n := e.head.series.Len()
-	if n == e.seriesWritten {
-		return nil
-	}
-
-	buf := encodeSeriesSet(make([]byte, 0, seriesSetSizeHint(e.seriesBytes, e.seriesWritten, n)), e.head.series)
-	if err := backend.WriteUncached(ctx, e.cfg.Backend, e.seriesKey(), buf); err != nil {
-		return errors.Wrap(err, "write series index")
-	}
-
-	e.seriesWritten, e.seriesBytes = n, len(buf)
-
-	return nil
-}
-
-// seriesSetSizeHint estimates the encoded size of an identity set of n series from the previous
-// encode (prevBytes over prevCount), with a margin so the encode does not reallocate near the end.
-// Without it the buffer reaches its final size by append-doubling, whose transient peak is a
-// multiple of a result that is hundreds of MiB at real cardinality.
-func seriesSetSizeHint(prevBytes, prevCount, n int) int {
-	if prevBytes <= 0 || prevCount <= 0 {
-		return 0
-	}
-
-	est := prevBytes / prevCount * n
-
-	return est + est/16 + 64
-}
-
-// loadSeriesIndexLocked rebuilds the head's series/postings index from the persisted identity
-// object, registering each identity. A missing object (nothing flushed yet) is a no-op.
-// Caller holds e.mu.
+// loadSeriesIndexLocked registers the identities of the **legacy** whole-set object written by
+// builds before identity was part-scoped. A missing object — every prefix this build wrote — is a
+// no-op. It is read once per open and deleted as soon as every live part carries its own
+// identities (see [Engine.loadIdentitiesLocked]). Caller holds e.mu.
 func (e *Engine) loadSeriesIndexLocked(ctx context.Context) error {
 	data, err := backend.ReadUncached(ctx, e.cfg.Backend, e.seriesKey())
 	if err != nil {
@@ -211,44 +189,16 @@ func (e *Engine) loadSeriesIndexLocked(ctx context.Context) error {
 		return errors.Wrap(err, "read series index")
 	}
 
-	var count int
-
-	if err := decodeSeriesSet(data, func(s signal.Series) {
-		e.head.registerSeries(s)
-		count++
-	}); err != nil {
+	if err := decodeSeriesSet(data, e.head.registerSeries); err != nil {
 		return errors.Wrap(err, "decode series index")
-	}
-
-	// Only when the head holds exactly what the object holds is the object current — a replica
-	// refreshing mid-ingest already has identities of its own, which still need persisting.
-	if e.head.series.Len() == count {
-		e.seriesWritten, e.seriesBytes = count, len(data)
 	}
 
 	return nil
 }
 
-// encodeSeriesSet appends to dst every identity in ix as a count followed by length-delimited
-// [signal.Series.AppendHashInput] records (the reversible wire form read by
-// [signal.DecodeSeries]). One scratch buffer is reused across identities: encoding each into a
-// fresh one made the whole set's worth of garbage per call.
-func encodeSeriesSet(dst []byte, ix *series.Index) []byte {
-	buf := binary.AppendUvarint(dst, uint64(ix.Len()))
-
-	var enc []byte
-
-	ix.ForEach(func(_ signal.SeriesID, s signal.Series) {
-		enc = s.AppendHashInput(enc[:0])
-		buf = binary.AppendUvarint(buf, uint64(len(enc)))
-		buf = append(buf, enc...)
-	})
-
-	return buf
-}
-
-// decodeSeriesSet parses encodeSeriesSet output, calling fn for each identity. It is
-// defensive against truncated input.
+// decodeSeriesSet parses the legacy whole-set identity object, calling fn for each identity. It is
+// defensive against truncated input. Nothing writes this format any more; it is read to migrate a
+// prefix written by an older build.
 func decodeSeriesSet(data []byte, fn func(signal.Series)) error {
 	count, n := binary.Uvarint(data)
 	if n <= 0 {

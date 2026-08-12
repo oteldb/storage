@@ -206,13 +206,13 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	id, accepted, isNew := e.head.append(s, ts, value, e.cfg.OOOWindow)
+	id, accepted, logSeries := e.head.append(s, ts, value, e.cfg.OOOWindow)
 	if !accepted {
 		return false, nil
 	}
 
 	if e.cfg.WAL != nil {
-		if isNew {
+		if logSeries {
 			if err := e.cfg.WAL.WriteSeries(id, s); err != nil {
 				return true, err
 			}
@@ -257,7 +257,7 @@ func (e *Engine) AppendBatch(
 			w = sf[i]
 		}
 
-		out, effID, isNew, s := e.head.appendByID(ids[i], ts[i], values[i], w, e.cfg.OOOWindow, limits, mat)
+		out, effID, logSeries, s := e.head.appendByID(ids[i], ts[i], values[i], w, e.cfg.OOOWindow, limits, mat)
 
 		switch out {
 		case admitted:
@@ -284,7 +284,7 @@ func (e *Engine) AppendBatch(
 		// effID is the original id, or the overflow series' id when the sample was redirected — so
 		// the WAL logs the identity the head actually holds, and replay reconstructs it.
 		if e.cfg.WAL != nil {
-			e.walB.add(effID, ts[i], values[i], w, isNew, s)
+			e.walB.add(effID, ts[i], values[i], w, logSeries, s)
 		}
 	}
 
@@ -1096,6 +1096,9 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	}
 
 	e.flushing = detached
+	// Snapshot the flushed series' identities while still under the lock: the part write runs
+	// off-lock, and the resident index keeps being mutated by ingest.
+	idents := e.head.identitiesOf(detached)
 	e.mu.Unlock()
 
 	// Build (lock-free): lay out the detached buffers and write the part. Flush writes freshly-ingested
@@ -1120,7 +1123,8 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		sub := cols.slice(rg[0], rg[1])
 		prefix := e.partPrefix(e.reserveSeq())
 
-		if err := writePart(ctx, e.cfg.Backend, prefix, sub, compressProfile{}, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
+		if err := writePart(ctx, e.cfg.Backend, prefix, sub, idents,
+			compressProfile{}, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
 			return 0, err
 		}
 
@@ -1157,21 +1161,14 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	return rows, nil
 }
 
-// publishLocked persists the engine's part set (bucket index + series identity index) and checkpoints
-// the WAL — the now-durable part makes its WAL records obsolete. Caller holds e.mu.
+// publishLocked persists the engine's part set (the bucket index) and checkpoints the WAL — the
+// now-durable part makes its WAL records obsolete. Caller holds e.mu.
 func (e *Engine) publishLocked(ctx context.Context) error {
-	// Ordering is a durability invariant: the series index goes first, the bucket index last. The
-	// bucket index is what makes a part durably visible, so writing it is the commit point, and a
-	// part is only readable once the identities of its series are durable — a stateless reader
-	// rebuilds them from series.bin alone. The series set is superset-safe: an identity persisted
-	// whose part never committed resolves to a series id no part range covers and yields no batch
-	// (the steady state already carries such identities, since the set only grows across flushes),
-	// whereas a committed part whose identities are missing holds samples no matcher can reach.
-	// Crashing between the two must leave extra identities, never an unreadable part.
-	if err := e.writeSeriesIndexLocked(ctx); err != nil {
-		return err
-	}
-
+	// Ordering is a durability invariant: a part's own objects — including the identity object
+	// naming its series — are all written before the bucket index, which is what makes the part
+	// durably visible, so a readable part always has the identities its rows resolve through. The
+	// reverse leftover is harmless: a part whose objects were written but never committed is an
+	// orphan the next open sweeps, and its identities were never loaded.
 	if err := e.updateIndexLocked(ctx); err != nil {
 		return err
 	}

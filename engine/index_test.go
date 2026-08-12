@@ -132,7 +132,7 @@ func (f failKeyWrite) Write(ctx context.Context, key string, data []byte) error 
 func TestFlushIndexWriteErrorsPropagate(t *testing.T) {
 	t.Parallel()
 
-	for _, suffix := range []string{"bucket-index.bin", "series.bin"} {
+	for _, suffix := range []string{"bucket-index.bin", "/identity"} {
 		t.Run(suffix, func(t *testing.T) {
 			t.Parallel()
 
@@ -161,52 +161,44 @@ func (c *countKeyWrite) Write(ctx context.Context, key string, data []byte) erro
 	return c.Backend.Write(ctx, key, data)
 }
 
-// TestSeriesIndexWrittenOnlyWhenChanged checks the flush skips the identity rewrite while the set
-// is unchanged: at real cardinality that object is hundreds of MiB re-serialized every flush
-// interval, byte-identical, under the engine lock.
-func TestSeriesIndexWrittenOnlyWhenChanged(t *testing.T) {
+// TestPartIdentityIsPerPart checks identity is scoped to the part that holds it: every flush writes
+// its part's own identity object, and the engine prefix keeps no whole-set object to rewrite.
+func TestPartIdentityIsPerPart(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &countKeyWrite{Backend: backend.Memory(), suffix: "series.bin"}
+	be := &countKeyWrite{Backend: backend.Memory(), suffix: "/identity"}
 	cfg := engine.Config{Backend: be, Prefix: "default/metrics"}
 
 	e := engine.New(cfg)
 	api := mkSeries("job", "api")
-	mustAppend(t, e, api, 100, 1.0)
-	require.NoError(t, e.Flush(ctx))
-	require.Equal(t, 1, be.n)
 
-	for ts := int64(200); ts <= 400; ts += 100 {
+	for ts := int64(100); ts <= 400; ts += 100 {
 		mustAppend(t, e, api, ts, 1.0)
 		require.NoError(t, e.Flush(ctx))
 	}
 
-	assert.Equal(t, 1, be.n, "flushing known series must not rewrite the identity set")
+	assert.Equal(t, 4, be.n, "one identity object per flushed part")
 
+	_, err := backend.ReadUncached(ctx, be, "default/metrics/series.bin")
+	require.ErrorIs(t, err, backend.ErrNotExist, "no whole-set identity object is written")
+
+	// The parts carry what a stateless reader needs.
 	mustAppend(t, e, mkSeries("job", "web"), 500, 2.0)
 	require.NoError(t, e.Flush(ctx))
-	assert.Equal(t, 2, be.n, "a new identity must be persisted")
 
-	// The skipping must not lose identities: a stateless reader still sees both.
 	r := engine.New(cfg)
 	require.NoError(t, r.LoadParts(ctx))
 	assert.Equal(t, 2, r.SeriesCount())
-
-	// A reloaded engine knows the object is current, so its next flush skips it too.
-	mustAppend(t, r, api, 600, 3.0)
-	require.NoError(t, r.Flush(ctx))
-	assert.Equal(t, 2, be.n)
 }
 
-// TestSeriesIndexNotCached checks series.bin stays out of the object read cache: it is rewritten
-// on every identity change and read only on recovery, so caching it evicts part data for no hit.
-func TestSeriesIndexNotCached(t *testing.T) {
+// TestPartIdentityNotCached checks a part's identity object stays out of the object read cache: it
+// is read on recovery and by a replica adopting the part, never on the query path, so caching it
+// would evict part data for no hit.
+func TestPartIdentityNotCached(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	// A budget of one byte caches nothing but the smallest object, so any resident bytes here would
-	// be the identity object itself.
 	be := backend.Cached(backend.Memory(), 1<<20)
 	cfg := engine.Config{Backend: be, Prefix: "default/metrics"}
 
@@ -215,12 +207,14 @@ func TestSeriesIndexNotCached(t *testing.T) {
 	require.NoError(t, e.Flush(ctx))
 	require.NoError(t, engine.New(cfg).LoadParts(ctx))
 
-	data, err := backend.ReadUncached(ctx, be, "default/metrics/series.bin")
+	key := "default/metrics/0000000000/identity"
+
+	data, err := backend.ReadUncached(ctx, be, key)
 	require.NoError(t, err)
 	require.NotEmpty(t, data)
 
 	before := be.(interface{ Stats() backend.CacheStats }).Stats().Bytes
-	require.NoError(t, backend.WriteUncached(ctx, be, "default/metrics/series.bin", data))
+	require.NoError(t, backend.WriteUncached(ctx, be, key, data))
 	assert.Equal(t, before, be.(interface{ Stats() backend.CacheStats }).Stats().Bytes)
 }
 
