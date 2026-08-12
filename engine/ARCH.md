@@ -41,16 +41,35 @@ hashed. WAL frames are grouped by series and written once per batch, not per sam
 ## Flush
 
 Drains the head into one flat 3-column part `[series:int128, ts:int64, value:float64]`, one row per
-sample, sorted by `(series, ts)`, under `{tenant}/metrics/{seq}`. It then updates the two durable
-index objects: the **bucket index** (part list + time bounds) and the **identity index**
-(`series.bin`). Merge updates both too, committing the new part set *before* deleting sources.
+sample, sorted by `(series, ts)`, under `{tenant}/metrics/{seq}`, together with the part's sidecars —
+the series index (`sidx`), the optional aggregate stats, and the part's **identity object**. It then
+updates the **bucket index** (part list + time bounds). Merge does the same, committing the new part
+set *before* deleting sources.
 
-The identity index is rewritten **only when the identity set changed** — it only ever grows, so an
-unchanged count means the object is already byte-identical; a steady state that registers no new
-series pays nothing instead of re-serializing every identity under `e.mu` each flush interval. It is
-written and read uncached (`backend.WriteUncached`): it is read only on recovery, so a cache entry is
-never hit and only evicts part data. Both are stopgaps — the identity object is still whole-set, and
-per-part identity is the scale-out form.
+### Identity is part-scoped
+
+Each part carries the identities of the series it holds (`{part}/identity`, format in
+`index/identity`), written with the part's other objects and deleted with them. Three properties
+follow, and they are why the whole-set `series.bin` this replaces is gone:
+
+- **Retention is self-cleaning.** Dropping a part drops the identities that named its rows.
+- **A flush persists what it wrote**, not the whole set — 88 B for a flush adding one series to a
+  20k-series tenant, where the old object was re-serialized in full whenever the set changed
+  (~40 B/series interned, against ~218 B/series repeating the label bytes per series).
+- **Every node derives its own live set**, so a replica prunes identity from its own parts with no
+  ownership rule (it reaches the prune through its refresh, since it never merges).
+
+A prefix written by an older build still has `series.bin`: it is read at open and **deleted once
+every live part carries its own identities**, completing the migration and stopping recovery from
+resurrecting identities whose data is gone. Identity objects are written and read uncached — read on
+recovery and by a replica adopting a part, never on the query path.
+
+**The WAL must therefore carry its own identities.** A flush checkpoints it, discarding the series
+records written when identities were first seen, so a series record is logged whenever a series
+starts a **new sample buffer** — once per actively-appending series per flush window — not only when
+its identity is new. Otherwise a sample logged after a checkpoint would reference a series the log no
+longer describes, and with identity in the parts (which retention can drop at any time) there is no
+whole-set object left to resolve it through.
 
 The resident half of that identity state — the head's symbol table, series index, postings lists and
 per-series OOO watermarks — is metered separately as `Stats.IdentityBytes`, not folded into
@@ -63,9 +82,11 @@ Retention drops samples and whole parts; `PruneIdentities` drops the identities 
 which otherwise accumulate for the process' lifetime under series churn. It needs no new on-disk
 format — a part's `sidx` sidecar already lists its series ids, so the **live set** is the union of
 the live parts' id sets with the in-memory tiers (head, mid-flush detachment, recent). It runs after
-a merge, on the compaction **owner** only (a replica mid-sync has not loaded parts whose identities
-it still needs), and only when a merge actually dropped rows — identities die no other way, so an
-engine whose data only grew skips even the live-set walk.
+a merge — and, on a replica, after the refresh that adopts a new part set — and only when parts
+actually went away: identities die no other way, so an engine whose data only grew skips even the
+live-set walk. No ownership rule is needed now that identity is scoped to the part: a node's live set
+means exactly "what this node can still serve", and a part a replica has not synced yet brings its
+identities with it.
 
 Symbol ids are dense and referenced by the postings lists, so nothing can be removed in place:
 the survivors are **rebuilt** into fresh structures. That rebuild is ~0.6 s per 200k identities
@@ -81,21 +102,19 @@ log entry, and dropping it would strand samples the next flush would write into 
 identity naming them. A dead series' OOO watermark is deleted by key (cost tracks what died, not
 cardinality); a live one keeps its own, or a late sample would be re-admitted.
 
-The WAL needs no `walExpiries` equivalent: it is checkpointed at every flush, so its live records
-name only series with buffered samples — live by definition. `series.bin` is rewritten immediately
-after the swap (the "unchanged count ⇒ identical object" skip cannot see a set that shrank and
-regrew, so the prune forces the write).
+The WAL needs no `walExpiries` equivalent: it is checkpointed at every flush and re-logs a series
+record whenever a series starts a buffer, so its live records name only series it describes itself.
+The prune writes nothing durable — the identities it drops went with the parts that held them.
 
-Not yet pruned: a **replica's** index, which grows until the node becomes an owner, and the record
-engines' streams (same shape, plus union-only symbol sidecars).
+Not yet pruned: the record engines' streams (same shape, plus a whole-set `streams.bin` and
+union-only symbol sidecars).
 
-**Publish order: `series.bin` first, the bucket index last.** The bucket index is what makes a part
-durably visible, so writing it is the commit point, and a part is only readable once its series'
-identities are durable — a stateless reader rebuilds them from `series.bin` alone, so a committed
-part whose identities are missing holds samples no matcher can reach. The reverse is harmless: the
-identity set is superset-safe (it only grows across flushes, so it already carries identities with no
-live rows), and one whose part never committed resolves to a series id no part range covers, yielding
-no batch. Unlike `recordengine`, the metrics bucket index carries no `FlushedEpoch` — the WAL
+**Publish order: the part's objects first, the bucket index last.** The bucket index is what makes a
+part durably visible, so writing it is the commit point, and a readable part always carries the
+identities its rows resolve through — a committed part whose identities are missing would hold
+samples no matcher can reach. A crash in between leaves an orphan part, objects and identity
+together, swept at the next open, so a failed publish strands nothing (with a whole-set object its
+identity was instead left behind permanently, resolvable and backed by nothing). Unlike `recordengine`, the metrics bucket index carries no `FlushedEpoch` — the WAL
 `Checkpoint` (which runs last, after both) is the WAL's commit point, so with durability enabled
 replay still recovers a part that failed to publish. The unreadable-commit window bites the
 backend-only configuration (a persistent backend with no `WALDir`), where nothing else holds the rows.

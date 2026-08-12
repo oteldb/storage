@@ -46,6 +46,21 @@ it is zero-alloc and **type-preserving** (the value id comes from the value's ty
 - Sorting is lazy and caller-synchronized (`Sorted()`/`EnsureSorted()`), so a reader can upgrade to
   the write lock exactly once after a write.
 
+## `identity`
+
+The **on-disk** form of a part's identity set — the `{part}/identity` object — encoded against a
+symbol table private to the object (measured ~3.8× smaller than repeating the label bytes per
+series; ~40 B/series on a churn-shaped set). Sections are addressed by a trailing TOC whose own
+offset is the last fixed-width field, so a section can be fetched by byte range without reading the
+object and a new section kind (the postings and offset tables a per-part *index* would need) can be
+added without breaking a reader. Deliberately uncompressed: interning already removes the repetition
+a compressor would find, and a compressed body would defeat that range-addressability.
+
+Scoping identity to the part is what makes retention self-cleaning and gives each node a live
+identity set derived from its own parts — the shape Prometheus/Mimir blocks and VictoriaMetrics'
+per-partition indexDB have. Fuzzed (decode never panics; encode∘decode is the identity and the
+decoded identity still hashes to its id) and golden-tested.
+
 ## Metering
 
 Each structure reports its resident footprint (`SizeBytes`), accumulated on insert rather than

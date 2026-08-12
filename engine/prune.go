@@ -52,11 +52,11 @@ const (
 // identity object to match. It returns the number of identities removed (0 when nothing could have
 // died, when too few have, or when the engine holds no parts).
 //
-// Only the owner of the data may call it: the live set is derived from *this node's* parts, so a
-// replica that has not yet synced a part would prune identities the owner still serves. It takes
-// the same flush/merge exclusion as those paths, so no publish can add an identity underneath it,
-// and it holds the engine lock across the rebuild — the same order as the full-set walk a flush
-// already performs under that lock, and the swap must be atomic against ingest regardless.
+// Every node may call it, owner or replica: identity is scoped to the part that holds it, so the
+// live set is derived from *this node's* parts and means exactly "what this node can still serve".
+// A part a replica has not yet synced brings its identities with it when it arrives, so pruning
+// ahead of a sync loses nothing. It takes the same flush/merge exclusion as those paths, so no
+// publish can add an identity underneath it.
 func (e *Engine) PruneIdentities(ctx context.Context) (int, error) {
 	if e.cfg.Backend == nil {
 		return 0, nil // head-only: nothing is flushed, so no identity can have outlived its data
@@ -103,20 +103,14 @@ func (e *Engine) PruneIdentities(ctx context.Context) (int, error) {
 	// append-only log; a series that merely regained samples leaves no such entry, so the swap
 	// re-checks the dead set against the live buffers too.
 	e.head.swapIdentity(rebuilt, snap, e.head.series.Snapshot()[len(snap):], dead)
-	// The durable object is no longer a superset of what it should hold, and the "identity count
-	// unchanged ⇒ already byte-identical" skip cannot see a set that shrank and regrew to the same
-	// size, so the next write is forced rather than inferred.
-	e.seriesWritten = -1
-	err = e.writeSeriesIndexLocked(ctx)
 	e.identityDirty = false
 	remaining := e.head.series.Len()
 	e.mu.Unlock()
 
 	removed := len(dead)
 
-	if err != nil {
-		return removed, err
-	}
+	// Nothing durable to rewrite: the identities live in the parts, and the ones this dropped went
+	// with the parts that held them.
 
 	zctx.From(ctx).Debug("pruned dead identities",
 		zap.String("prefix", e.cfg.Prefix), zap.Int("removed", removed), zap.Int("live", remaining))

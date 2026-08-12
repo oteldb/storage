@@ -1426,11 +1426,25 @@ func (s *Storage) maintain(ctx context.Context) {
 		return err
 	}
 
+	// refreshMetrics reconciles a node's part set with the object store and then prunes the
+	// identities the reconcile left without data. A replica reaches identity pruning only here: it
+	// never merges, and identity is scoped to its own parts, so adopting a part set that dropped one
+	// is exactly when its identities can have died.
+	refreshMetrics := func(eng *engine.Engine) error {
+		if err := eng.RefreshReplica(ctx); err != nil {
+			return err
+		}
+
+		_, err := eng.PruneIdentities(ctx)
+
+		return err
+	}
+
 	for tid, eng := range metricEngines {
 		tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
 			maintainEngine(tid, metricsPrefix, func() error { return eng.Flush(ctx) },
 				func() error { return mergeMetrics(tid, eng) },
-				func() error { return eng.RefreshReplica(ctx) },
+				func() error { return refreshMetrics(eng) },
 				func() []ecPartRef { return coldMetric(eng) })
 		}})
 	}

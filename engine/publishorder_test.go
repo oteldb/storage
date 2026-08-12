@@ -35,9 +35,9 @@ func (r *rejectWrites) Write(ctx context.Context, key string, data []byte) error
 
 // TestPublishCommitsBucketIndexLast verifies the publish ordering: the bucket index is what makes a
 // part durably visible, so it must be written after everything that part needs to stay readable —
-// here the series identity index. A crash between the two must not leave a committed part behind,
-// because a stateless reader rebuilds identities from series.bin alone and cannot resolve a series
-// that never made it there: the part's samples would be listed but unreachable forever.
+// including the part's own identity object. A crash between the two must not leave a committed part
+// behind, because a stateless reader resolves the part's rows through the identities the part
+// carries: without them the samples would be listed but unreachable forever.
 //
 // The engine is configured without a WAL (a persistent backend and no WALDir — flushed parts are
 // durable, the unflushed head is not), which is where the inconsistent commit is unrecoverable.
@@ -45,30 +45,31 @@ func TestPublishCommitsBucketIndexLast(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectWrites{Backend: backend.Memory(), only: "/series.bin"}
+	be := &rejectWrites{Backend: backend.Memory(), only: "/identity"}
 	cfg := engine.Config{Backend: be, Prefix: "t/metrics"}
 
 	w := engine.New(cfg)
 	mustAppend(t, w, mkSeries("job", "api"), 100, 1.0)
 
 	be.armed.Store(true)
-	require.Error(t, w.Flush(ctx), "flush must fail while the series index cannot be written")
+	require.Error(t, w.Flush(ctx), "flush must fail while the part's identities cannot be written")
 	be.armed.Store(false)
 
 	// A fresh reader reconstructs purely from the object store.
 	r := engine.New(cfg)
 	require.NoError(t, r.LoadParts(ctx))
 
-	require.Zero(t, r.SeriesCount(), "the series index write failed, so no identity is durable")
+	require.Zero(t, r.SeriesCount(), "the identity write failed, so no identity is durable")
 	require.Zero(t, r.PartCount(),
-		"nothing may be committed once the series index failed: the bucket index is the commit point")
+		"nothing may be committed once the identity write failed: the bucket index is the commit point")
 }
 
-// TestPublishedSeriesWithoutPartIsInert verifies the property that makes the ordering safe: the
-// series index may be a superset of what the committed parts hold. An identity persisted whose part
-// never committed resolves to a series id no part range covers, so it contributes no batch — the
-// reverse (rows with no identity) is the unrecoverable direction.
-func TestPublishedSeriesWithoutPartIsInert(t *testing.T) {
+// TestUncommittedPartIdentityIsNotLoaded verifies the other half of the ordering. The identity
+// object lands but the bucket index does not, so the part was never committed: because identity is
+// scoped to the part, the orphan carries its identities with it and recovery loads neither. (With a
+// whole-set identity object at the engine prefix, the identity would instead have been stranded
+// there — resolvable but backed by nothing, forever.)
+func TestUncommittedPartIdentityIsNotLoaded(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -78,16 +79,16 @@ func TestPublishedSeriesWithoutPartIsInert(t *testing.T) {
 	w := engine.New(cfg)
 	mustAppend(t, w, mkSeries("job", "api"), 100, 1.0)
 
-	// series.bin lands, the bucket index does not: the durable state carries an identity with no part.
+	// The part's objects land, the bucket index does not: an orphan part, swept at the next open.
 	be.armed.Store(true)
 	require.Error(t, w.Flush(ctx))
 	be.armed.Store(false)
 
 	r := engine.New(cfg)
 	require.NoError(t, r.LoadParts(ctx))
-	require.Equal(t, 1, r.SeriesCount(), "the identity is durable")
-	require.Zero(t, r.PartCount(), "its part was never committed")
+	require.Zero(t, r.PartCount(), "the part was never committed")
+	require.Zero(t, r.SeriesCount(), "its identities were never loaded — they live with the part")
 
 	got := fetchAll(t, r, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
-	assert.Empty(t, got, "a resolvable identity with no rows behind it yields no batch")
+	assert.Empty(t, got, "nothing resolves to the uncommitted part")
 }

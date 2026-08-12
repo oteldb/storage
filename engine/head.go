@@ -186,18 +186,18 @@ func (h *head) noteTS(id signal.SeriesID, ts int64) {
 }
 
 // append adds one sample for series s, registering and indexing it on first sight. A
-// sample more than oooWindow behind that series' own newest admitted sample is rejected. It returns the
-// series id, whether the sample was accepted, and whether the series was newly seen (so
-// the caller logs a series record to the WAL).
-func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64) (id signal.SeriesID, accepted, isNew bool) {
+// sample more than oooWindow behind that series' own newest admitted sample is rejected. It returns
+// the series id, whether the sample was accepted, and whether the caller must log a series record
+// to the WAL (see [head.needsSeriesRecord]).
+func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64) (id signal.SeriesID, accepted, logSeries bool) {
 	id = s.Hash()
 	if h.outOfOrder(id, ts, oooWindow) {
 		return id, false, false
 	}
 
-	if !h.series.Has(id) {
-		isNew = true
+	logSeries = h.samples[id] == nil
 
+	if !h.series.Has(id) {
 		h.series.Add(s)
 		h.indexLabels(id, s)
 	}
@@ -207,8 +207,23 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 	h.bytes += SampleBytes
 	h.noteTS(id, ts)
 
-	return id, true, isNew
+	return id, true, logSeries
 }
+
+// needsSeriesRecord explains when an append tells its caller to write a WAL series record: not on a
+// new *identity*, but whenever a series starts a new sample buffer.
+//
+// The WAL has to be self-contained, because a flush checkpoints it — every segment written before
+// the flush is discarded. A series record logged when the identity was first seen is therefore gone
+// after the next flush, while the identity itself survives in the resident index, so a later sample
+// for that series would log samples referencing a series the log no longer describes. It went
+// unnoticed while a whole-set identity object was rewritten at the engine prefix on every flush:
+// replay resolved such a reference through that object. With identity scoped to the parts, an
+// identity whose parts retention has dropped exists nowhere durable but the log — so the log must
+// carry it.
+//
+// A buffer is created once per series per flush window (a flush detaches them all), so this costs
+// one series record per actively-appending series per flush, and nothing on the repeat-sample path.
 
 // appendByID adds one sample for the series whose content id is already computed. The full
 // identity is materialized lazily — materialize() is called only on first sight, when the
@@ -216,10 +231,10 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 // or hashes a [signal.Series]. It enforces limits (OOO window, in-flight bytes, cardinality,
 // and the optional soft-budget overflow routing) and returns the per-sample outcome, the
 // *effective* id the sample landed under (the original id, or the overflow series' id), whether
-// that series was newly seen, and, when new, its materialized identity (for the caller's WAL).
+// the caller must log a series record ([head.needsSeriesRecord]), and the identity to log.
 func (h *head) appendByID(
 	id signal.SeriesID, ts int64, value, sf float64, oooWindow int64, limits AppendLimits, materialize func() signal.Series,
-) (out admitOutcome, effID signal.SeriesID, isNew bool, s signal.Series) {
+) (out admitOutcome, effID signal.SeriesID, logSeries bool, s signal.Series) {
 	if h.outOfOrder(id, ts, oooWindow) {
 		return rejectOOO, id, false, signal.Series{}
 	}
@@ -240,10 +255,16 @@ func (h *head) appendByID(
 		// one (WAL replay registered it before its first live sample) just needs a buffer.
 		if !h.series.Has(id) {
 			var done bool
-			if out, effID, isNew, s, done = h.admitNew(id, ts, value, sf, limits, materialize); done {
-				return out, effID, isNew, s
+			if out, effID, logSeries, s, done = h.admitNew(id, ts, value, sf, limits, materialize); done {
+				return out, effID, logSeries, s
 			}
+		} else {
+			// Known identity starting a fresh buffer: the log needs its record again, and the
+			// resident index already has the identity, so nothing is materialized.
+			s, _ = h.series.Get(id)
 		}
+
+		logSeries = true
 
 		buf = &sampleBuf{}
 		h.samples[id] = buf
@@ -253,7 +274,7 @@ func (h *head) appendByID(
 	h.bytes += SampleBytes
 	h.noteTS(id, ts)
 
-	return admitted, id, isNew, s
+	return admitted, id, logSeries, s
 }
 
 // admitNew decides admission for a series not yet in the index. done=true means the returned outcome
@@ -294,16 +315,16 @@ func (h *head) admitNew(
 func (h *head) appendOverflow(ov signal.Series, ts int64, value, sf float64) (admitOutcome, signal.SeriesID, bool, signal.Series) {
 	oid := ov.Hash()
 
-	isNew := false
+	logSeries := false
 
 	buf := h.samples[oid]
 	if buf == nil {
 		if !h.series.Has(oid) {
-			isNew = true
 			h.series.Add(ov)
 			h.indexLabels(oid, ov)
 		}
 
+		logSeries = true
 		buf = &sampleBuf{}
 		h.samples[oid] = buf
 	}
@@ -314,7 +335,7 @@ func (h *head) appendOverflow(ov signal.Series, ts int64, value, sf float64) (ad
 	// advances — the shed series never gets one.
 	h.noteTS(oid, ts)
 
-	return admittedOverflow, oid, isNew, ov
+	return admittedOverflow, oid, logSeries, ov
 }
 
 // trimBelowCovered drops every buffered sample with timestamp ≤ t (now durable in a flushed
