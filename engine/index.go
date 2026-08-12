@@ -151,14 +151,16 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 }
 
 // writeSeriesIndexLocked persists the head's full series identity set so a stateless reader
-// can rebuild the postings/series index. Written on flush; the identity set only grows
-// (identities outlive a flush), so a full rewrite is correct. Caller holds e.mu.
+// can rebuild the postings/series index. Written on flush; identities outlive a flush, so a full
+// rewrite is correct. Caller holds e.mu.
 //
-// The set only ever grows, so an unchanged identity count means the persisted object is already
-// byte-identical and the write is skipped: a steady state that registers no new series costs
-// nothing, instead of re-serializing and rewriting every identity every flush interval. The object
-// is written uncached — it is rewritten at flush frequency and read only on recovery, so caching it
-// only evicts part data.
+// Between prunes the set only grows, so an unchanged identity count means the persisted object is
+// already byte-identical and the write is skipped: a steady state that registers no new series costs
+// nothing, instead of re-serializing and rewriting every identity every flush interval. An identity
+// prune ([Engine.PruneIdentities]) is the one path that removes entries, and a set that shrank and
+// regrew to the same count is not the same set — so it forces the next write by clearing
+// seriesWritten rather than leaving the count to imply it. The object is written uncached — it is
+// rewritten at flush frequency and read only on recovery, so caching it only evicts part data.
 //
 // TODO: this rewrites every identity when the set does change — fine single-node, but a per-part
 // identity object (incremental) is the scale-out form.

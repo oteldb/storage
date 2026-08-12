@@ -23,7 +23,11 @@ temporality, profile type) folds into the pre-image as reserved labels at the si
 ## `series`
 
 `SeriesID ↔ Series`. `Add` is idempotent (the id *is* the identity hash) and interns key/value
-bytes through the per-index symbol table. It also **deduplicates whole Resource and Scope sets by
+bytes through the per-index symbol table. Identities live in an **append-only entry log** (the map
+holds positions into it, keeping map slots narrow), so `Snapshot` hands out an immutable view
+without the caller's lock: later `Add`s write past its end or move to a new array, never into it.
+That is what lets the engine rebuild the index off its lock and pick up whatever registered
+meanwhile as the tail past the snapshot's length. It also **deduplicates whole Resource and Scope sets by
 content**, so series sharing a resource/scope point at one owned `[]KeyValue` rather than a
 private clone of the structure that byte interning alone leaves behind. Point attributes are
 near-unique per series, so they are byte-interned only.
@@ -49,8 +53,8 @@ walked, so the engine can meter identity state — which no sample/record byte c
 a flush does not drain (see `ADMIN.md`'s `IdentityBytes`). Every byte is charged once, where it is
 owned: interned payloads to the symbol table, so an identity referencing them is not double-counted.
 Estimates come from `internal/memsize`, the one place that needs `unsafe.Sizeof`; they are
-structural (map slots, backing-array capacity, interned bytes) and ignore size-class rounding —
-measured within a few percent of the heap delta at 200k series.
+structural (map slots, backing-array capacity, interned bytes) and ignore size-class rounding and
+map-slot padding — measured ~10 % under the heap delta at 200k series.
 
 ## `bloom`
 

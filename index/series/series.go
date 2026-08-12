@@ -14,7 +14,15 @@ import (
 // Index maps [signal.SeriesID] → [signal.Series]. The zero value is not usable; create
 // one with [New]. Not safe for concurrent use; callers own synchronization.
 type Index struct {
-	byID map[signal.SeriesID]signal.Series
+	// byID maps an id to its position in entries. Holding a position rather than the identity keeps
+	// the map small (a wide value inflates every slot, live or empty) and makes the identities
+	// themselves live in one append-only log — see entries.
+	byID map[signal.SeriesID]int32
+	// entries is the append-only registration log, in insertion order: an entry is never moved,
+	// mutated or removed, so a slice of it is a stable, immutable view of the identities registered
+	// up to that point ([Index.Snapshot]) — which is what lets an identity rebuild run without the
+	// caller's lock while registration continues.
+	entries []Entry
 	// sym interns every key/value byte string across all stored identities, so the index holds one
 	// owned copy per distinct label/attribute string (referenced by every series sharing it) instead
 	// of a private clone per series. Under a steady metrics workload the same resource/scope and
@@ -38,10 +46,16 @@ type Index struct {
 	bytes int64
 }
 
+// Entry is one registered identity: its content-addressed id and the identity itself.
+type Entry struct {
+	ID     signal.SeriesID
+	Series signal.Series
+}
+
 // New returns an empty [Index].
 func New() *Index {
 	return &Index{
-		byID:  make(map[signal.SeriesID]signal.Series),
+		byID:  make(map[signal.SeriesID]int32),
 		sym:   symbols.New(),
 		res:   make(map[string]signal.Resource),
 		scope: make(map[string]signal.Scope),
@@ -63,20 +77,33 @@ func (ix *Index) Add(s signal.Series) signal.SeriesID {
 			Scope:      ix.internScope(s.Scope),
 			Attributes: s.Attributes.Intern(ix.sym.Bytes),
 		}
-		ix.byID[id] = stored
+
+		before := memsize.Slice(ix.entries)
+		ix.byID[id] = int32(len(ix.entries))
+		ix.entries = append(ix.entries, Entry{ID: id, Series: stored})
 		// The resource/scope attribute sets are shared (counted once, where they are interned); only
 		// the point attributes are this identity's own.
-		ix.bytes += seriesEntryBytes + attrBytes(stored.Attributes)
+		ix.bytes += seriesEntryBytes + attrBytes(stored.Attributes) + memsize.Slice(ix.entries) - before
 	}
 
 	return id
 }
 
+// Snapshot returns the identities registered so far, in registration order. The result stays valid
+// and immutable **without the caller's lock**: entries are only ever appended, so a later [Index.Add]
+// either writes past the returned slice's end or moves to a new array, and never touches what this
+// one refers to. A caller rebuilding the index off-lock snapshots here, and picks up whatever was
+// registered meanwhile as the tail past its length. It must not mutate the entries.
+func (ix *Index) Snapshot() []Entry { return ix.entries }
+
 // Get returns the identity for id and whether it is known.
 func (ix *Index) Get(id signal.SeriesID) (signal.Series, bool) {
-	s, ok := ix.byID[id]
+	pos, ok := ix.byID[id]
+	if !ok {
+		return signal.Series{}, false
+	}
 
-	return s, ok
+	return ix.entries[pos].Series, true
 }
 
 // Has reports whether id is known.
@@ -87,12 +114,12 @@ func (ix *Index) Has(id signal.SeriesID) bool {
 }
 
 // Len returns the number of distinct series.
-func (ix *Index) Len() int { return len(ix.byID) }
+func (ix *Index) Len() int { return len(ix.entries) }
 
 // Sizes of the index's owned structures. The identity payloads themselves (label bytes) live in
 // the symbol table and are counted there.
 var (
-	seriesEntryBytes = memsize.MapEntry[signal.SeriesID, signal.Series]()
+	seriesEntryBytes = memsize.MapEntry[signal.SeriesID, int32]()
 	resEntryBytes    = memsize.MapEntry[string, signal.Resource]()
 	scopeEntryBytes  = memsize.MapEntry[string, signal.Scope]()
 )
@@ -108,10 +135,10 @@ func (ix *Index) SizeBytes() int64 {
 	return ix.bytes + ix.sym.SizeBytes() + memsize.Slice(ix.buf) + memsize.Slice(ix.kbuf)
 }
 
-// ForEach calls fn for each (id, identity) pair. Iteration order is unspecified.
+// ForEach calls fn for each (id, identity) pair, in registration order.
 func (ix *Index) ForEach(fn func(id signal.SeriesID, s signal.Series)) {
-	for id := range ix.byID {
-		fn(id, ix.byID[id])
+	for i := range ix.entries {
+		fn(ix.entries[i].ID, ix.entries[i].Series)
 	}
 }
 
