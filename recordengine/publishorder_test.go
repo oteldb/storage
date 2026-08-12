@@ -11,16 +11,16 @@ import (
 	"github.com/oteldb/storage/wal"
 )
 
-// TestPublishWritesStreamIndexBeforeCommit verifies the publish ordering that keeps a committed
-// part's rows reachable: the stream identity index must be durable before the bucket index, which
-// carries the flush watermark and is therefore the commit point. Here the stream-index write fails,
-// so the flush must not commit — otherwise the watermark makes replay skip the records while their
-// stream identity is missing from the series index, leaving the rows unreachable forever.
-func TestPublishWritesStreamIndexBeforeCommit(t *testing.T) {
+// TestPublishWritesIdentityBeforeCommit verifies the publish ordering that keeps a committed part's
+// rows reachable: the part's identity object must be durable before the bucket index, which carries
+// the flush watermark and is therefore the commit point. Here the identity write fails, so the
+// flush must not commit — otherwise the watermark would make replay skip the records while the
+// identities naming them are missing, leaving the rows unreachable forever.
+func TestPublishWritesIdentityBeforeCommit(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectWrites{Backend: backend.Memory(), only: "/streams.bin"}
+	be := &rejectWrites{Backend: backend.Memory(), only: "/identity"}
 	walDir := t.TempDir()
 
 	w, err := wal.Create(walDir, 0)
@@ -33,7 +33,7 @@ func TestPublishWritesStreamIndexBeforeCommit(t *testing.T) {
 	require.NoError(t, w.Sync())
 
 	be.armed.Store(true)
-	require.Error(t, e.Flush(ctx), "flush must fail while the stream index cannot be written")
+	require.Error(t, e.Flush(ctx), "flush must fail while the part's identities cannot be written")
 	be.armed.Store(false)
 
 	// Restart: recover the part set and watermark from the bucket index, then replay the WAL.
@@ -46,5 +46,5 @@ func TestPublishWritesStreamIndexBeforeCommit(t *testing.T) {
 	require.NoError(t, r.Replay(walDir))
 
 	require.Equal(t, []string{"stranded"}, streamBodies(t, r),
-		"rows must stay reachable after a crash between the stream index and the bucket index")
+		"rows must stay reachable after a crash between the identity object and the bucket index")
 }

@@ -133,8 +133,7 @@ jittered backoff; **idempotent reads hedge** across replicas, **writes stay at-m
   first — its column objects and, in `engine`, the part's own identity object naming its series.
   Publish order is chosen to leave recoverable slack on a crash — unreferenced objects, an orphan
   part swept at the next open — never rows that are committed but unresolvable.
-- **Identity is scoped to the part that holds it** (`engine`; `recordengine` still keeps a whole-set
-  `streams.bin`). Each part carries the identities of its own series, so retention is self-cleaning
+- **Identity is scoped to the part that holds it** (both engines). Each part carries the identities of its own series, so retention is self-cleaning
   (dropping a part drops them), a flush persists what it wrote rather than the whole set, and every
   node — owner or replica — derives its live identity set from its own parts. The resident index is
   the union over live parts plus the unflushed head, and is metered as `IdentityBytes`.

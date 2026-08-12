@@ -257,7 +257,10 @@ func (e *Engine) writeMergedPart(ctx context.Context, src []*part, f *flushColum
 	prefix := e.partPrefix(seq)
 	// Compacted parts are the cold, long-lived data — block-compress them (typically ZSTD) so the
 	// dict/DoD-coded columns are also entropy-coded. Defaults to AlgorithmNone (legacy, uncompressed).
-	if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f, e.cfg.MergeCompression, e.cfg.MergeCompressionLevel,
+	// The merged part's identities come from the resident index, which spans every live stream —
+	// snapshotted here (a brief read lock, off the flush path) because the write itself is off-lock.
+	if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, f, e.identitiesForColumn(f.stream),
+		e.cfg.MergeCompression, e.cfg.MergeCompressionLevel,
 		e.blooms()); err != nil {
 		return nil, err
 	}

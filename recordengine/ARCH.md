@@ -8,8 +8,8 @@ Conditions filter its records** (see [`../query/ARCH.md`](../query/ARCH.md)).
 
 All three signals share this engine; only the column schema, the projection, and (profiles) a side
 store differ. It is the metrics engine's structural twin — head, flush, size-tiered merge with
-retention, durable bucket-index + `streams.bin` stateless read path, `MaxPartBytes` splitting, and
-the same lock discipline (see [`../engine/ARCH.md`](../engine/ARCH.md)). Notable divergences:
+retention, durable bucket-index + part-scoped identity stateless read path, `MaxPartBytes` splitting,
+and the same lock discipline (see [`../engine/ARCH.md`](../engine/ARCH.md)). Notable divergences:
 
 - Merge is **append-only**: retention only. Downsampling, recompression and precision are
   metrics-specific.
@@ -50,15 +50,31 @@ whatever arrived meanwhile) and restores the side-store snapshot via `SideStore.
 only runs on a successful publish, so without the fold-back the rows would be lost the moment the next
 flush overwrote the in-flight buffer.
 
+## Stream identity is part-scoped
+
+Each part carries the identities of the streams it holds (`{part}/identity`, format in
+`index/identity`), written with the part's other objects and deleted with them — the same shape as
+the metrics engine. Retention is therefore self-cleaning, a flush persists the identities it wrote
+(88 B for one new stream, ~40 B/stream, against a whole-set `streams.bin` re-encoded and rewritten on
+**every** flush and merge whether or not the set changed), and every node derives its live identity
+set from its own parts. A prefix written by an older build still has `streams.bin`: it is read at
+open and **deleted once every live part carries its own identities**.
+
+**The WAL must carry its own identities.** A flush checkpoints it, so a stream record logged when the
+identity was first seen is gone afterwards; a record is logged again whenever a stream starts a fresh
+**record buffer** (`head.needsStreamRecord`) — once per actively-appending stream per flush window.
+Without it, a record logged after a checkpoint would reference a stream the log no longer describes,
+and with identity in the parts (which retention can drop) nothing else would name it.
+
 ## Publish ordering
 
-Publishing a flush writes `streams.bin` **first** and the bucket index **last**, then checkpoints the
-WAL. The bucket index carries `FlushedEpoch` — the watermark replay starts from — so writing it is the
-commit point, and only what is already durable may be committed. The stream set is superset-safe: an
-identity persisted with no rows behind it resolves to a `SeriesID` no part range holds, so it costs a
-lookup and contributes nothing. The reverse is unrecoverable — a committed part whose streams are
-missing from `streams.bin` holds rows no matcher can name, while the advanced watermark makes replay
-skip the WAL records that would have re-registered them.
+Publishing a flush writes the part's objects — identity included — **first** and the bucket index
+**last**, then checkpoints the WAL. The bucket index carries `FlushedEpoch` — the watermark replay
+starts from — so writing it is the commit point, and only what is already durable may be committed. A
+committed part whose identities were missing would be unrecoverable: it holds rows no matcher can
+name, while the advanced watermark makes replay skip the WAL records that would have re-registered
+them. The reverse leftover is harmless — an uncommitted part is an orphan the next open sweeps, and
+its identities were never loaded.
 
 ## Merge publish ordering
 

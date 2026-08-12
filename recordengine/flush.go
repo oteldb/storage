@@ -231,7 +231,7 @@ func flushShape(schema *Schema, records map[signal.SeriesID]*recordCols, ids []s
 // kept cheap), while the cold merge passes ZSTD to entropy-code the long-lived compacted data.
 func writePart(
 	ctx context.Context, b backend.Backend, schema *Schema, prefix string, f *flushColumns,
-	comp compress.Algorithm, level compress.Level, bb *bloomBuilder,
+	idents identitySet, comp compress.Algorithm, level compress.Level, bb *bloomBuilder,
 ) error {
 	opts := []block.PartOption{block.WithSortKey(colTs)}
 	if comp != compress.AlgorithmNone {
@@ -270,6 +270,13 @@ func writePart(
 
 	if err := block.WritePart(ctx, b, prefix, w); err != nil {
 		return errors.Wrapf(err, "write part %q", prefix)
+	}
+
+	// Identity object: the identities of this part's streams, so the part carries what names its
+	// own rows (see partidentity.go). Written before the part is committed to the bucket index,
+	// which is what makes it visible — a readable part always has its identities.
+	if err := writeIdentity(ctx, b, prefix, idents.entriesFor(f.stream)); err != nil {
+		return err
 	}
 
 	if err := writeBlooms(ctx, b, schema, prefix, f.cols, bb); err != nil {

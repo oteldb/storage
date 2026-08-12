@@ -10,7 +10,6 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
-	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -100,7 +99,22 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 		e.cfg.WAL.SetEpoch(e.flushedEpoch + 1)
 	}
 
-	return e.loadStreamIndexLocked(ctx)
+	complete, err := e.loadIdentitiesLocked(ctx, parts)
+	if err != nil {
+		return err
+	}
+
+	// Once every live part carries its own identities, the legacy whole-set object holds nothing
+	// live that the parts do not — only identities whose data is gone. Deleting it completes the
+	// migration for a prefix written by an older build, and stops recovery from resurrecting dead
+	// identities on every restart.
+	if complete && sweep {
+		if err := e.cfg.Backend.Delete(ctx, e.streamKey()); err != nil && !errors.Is(err, backend.ErrNotExist) {
+			return errors.Wrap(err, "delete legacy stream index")
+		}
+	}
+
+	return nil
 }
 
 // RefreshReplica brings a replica node's view up to date with the shared object store: it
@@ -138,22 +152,10 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 	return nil
 }
 
-// writeStreamIndexLocked persists the head's full stream identity set so a stateless reader can
-// rebuild the postings/series index. Caller holds e.mu.
-func (e *Engine) writeStreamIndexLocked(ctx context.Context) error {
-	if e.cfg.Backend == nil {
-		return nil
-	}
-
-	if err := e.cfg.Backend.Write(ctx, e.streamKey(), encodeSeriesSet(e.head.series)); err != nil {
-		return errors.Wrap(err, "write stream index")
-	}
-
-	return nil
-}
-
-// loadStreamIndexLocked rebuilds the head's series/postings index from the persisted object. A
-// missing object is a no-op. Caller holds e.mu.
+// loadStreamIndexLocked registers the identities of the **legacy** whole-set object written by
+// builds before identity was part-scoped. A missing object — every prefix this build wrote — is a
+// no-op. It is read once per open and deleted as soon as every live part carries its own
+// identities (see [Engine.loadIdentitiesLocked]). Caller holds e.mu.
 func (e *Engine) loadStreamIndexLocked(ctx context.Context) error {
 	data, err := e.cfg.Backend.Read(ctx, e.streamKey())
 	if err != nil {
@@ -171,20 +173,8 @@ func (e *Engine) loadStreamIndexLocked(ctx context.Context) error {
 	return nil
 }
 
-// encodeSeriesSet serializes every identity in ix as a count followed by length-delimited
-// reversible [signal.Series] records (read back by [signal.DecodeSeries]).
-func encodeSeriesSet(ix *series.Index) []byte {
-	buf := binary.AppendUvarint(nil, uint64(ix.Len()))
-	ix.ForEach(func(_ signal.SeriesID, s signal.Series) {
-		enc := s.AppendHashInput(nil)
-		buf = binary.AppendUvarint(buf, uint64(len(enc)))
-		buf = append(buf, enc...)
-	})
-
-	return buf
-}
-
-// decodeSeriesSet parses encodeSeriesSet output, calling fn for each identity.
+// decodeSeriesSet parses the legacy whole-set stream identity object, calling fn for each identity.
+// Nothing writes this format any more; it is read to migrate a prefix written by an older build.
 func decodeSeriesSet(data []byte, fn func(signal.Series)) error {
 	count, n := binary.Uvarint(data)
 	if n <= 0 {
