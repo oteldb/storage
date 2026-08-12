@@ -130,12 +130,12 @@ Imperative operator control, complementing the background maintenance loop (it h
   (retention cutoff, plus downsampling/recompression/precision for metrics). The same merge engine
   the loop runs — no parallel path.
 - `Retention(ctx, key)` — compact every signal for a tenant (drops parts past the policy cutoff).
-- `PruneIdentities(ctx, key) (int, error)` — drop the identities retention left without data for a
-  tenant/shard's **metric** engine and report how many went. The background loop does this after any
-  merge that dropped rows, but only past its thresholds (a minimum index size, and a quarter of it
-  dead), so this forces a sweep now — after a cardinality incident, say — and returns the count
-  rather than a silent no-op. Watch `SignalStats.IdentityBytes` for the effect. Record signals carry
-  part-scoped identity but no prune yet, so they are not covered; an unknown tenant is a quiet `0`.
+- `PruneIdentities(ctx, key) (int, error)` — drop the identities retention left without data across
+  **every** of a tenant/shard's signals and report how many went in total. The background loop does
+  this after anything that changed the part set, but only past its thresholds (a minimum index size,
+  and a quarter of it dead), so this forces a sweep now — after a cardinality incident, say — and
+  returns the count rather than a silent no-op. Watch `SignalStats.IdentityBytes` for the effect;
+  signals with no engine on this node contribute `0`.
 - `Rebalance(ctx)` — reconcile cluster ownership immediately (no-op single-node).
 - `MaintainNow(ctx)` — run one full maintenance cycle (flush + merge + retention across owned engines).
 

@@ -85,6 +85,11 @@ type Engine struct {
 	// closes the visibility gap a flush would otherwise open between draining the head and the part
 	// becoming live. nil when no flush is in flight.
 	flushing map[signal.SeriesID]*recordCols
+	// identityDirty is set when a merge dropped rows or parts, or when a refresh adopted a part set
+	// that lost one, so identities may now be dead and an identity prune
+	// ([Engine.PruneIdentities]) has something to look for. Identities die no other way, so an
+	// engine whose data has only grown skips the work entirely.
+	identityDirty bool
 
 	// flushBuf is the part-column buffer the last flush used, kept for the next one: the engine has a
 	// single flusher and a part is fully written before the next flush begins, so its arrays can be

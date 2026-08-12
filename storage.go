@@ -1449,12 +1449,35 @@ func (s *Storage) maintain(ctx context.Context) {
 		}})
 	}
 
+	// mergeRecords / refreshRecords mirror the metric pair: the prune follows whatever changed the
+	// part set, since that is the only thing that kills a stream identity. A replica reaches it
+	// only through the refresh — it never merges.
+	mergeRecords := func(tid signal.TenantID, eng *recordengine.Engine) error {
+		if err := eng.Merge(ctx, s.retainFrom(tid, sizeCutoffs[tid])); err != nil {
+			return err
+		}
+
+		_, err := eng.PruneIdentities(ctx)
+
+		return err
+	}
+
+	refreshRecords := func(eng *recordengine.Engine) error {
+		if err := eng.RefreshReplica(ctx); err != nil {
+			return err
+		}
+
+		_, err := eng.PruneIdentities(ctx)
+
+		return err
+	}
+
 	addRecord := func(engines map[signal.TenantID]*recordengine.Engine, signalPrefix string) {
 		for tid, eng := range engines {
 			tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
 				maintainEngine(tid, signalPrefix, func() error { return eng.Flush(ctx) },
-					func() error { return eng.Merge(ctx, s.retainFrom(tid, sizeCutoffs[tid])) },
-					func() error { return eng.RefreshReplica(ctx) },
+					func() error { return mergeRecords(tid, eng) },
+					func() error { return refreshRecords(eng) },
 					func() []ecPartRef { return coldRecord(eng) })
 			}})
 		}
