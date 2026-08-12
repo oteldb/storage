@@ -191,14 +191,16 @@ func (e *Engine) AppendBatch(b *Batch, limits AppendLimits) (AppendResult, error
 		return AppendResult{RejectedCardinality: len(b.Ts)}, nil
 	}
 
-	// The stream's identity is logged when the stream is registered, not when it first has an
+	// The stream's identity is logged when the stream is registered — not when it first has an
 	// accepted record: a stream reports as new exactly once, so a first batch rejected in full (OOO
 	// window, in-flight bytes) would leave the head holding a stream with no durable identity, and
-	// replay drops records it cannot attribute to a registered stream. The record is written before
-	// the head commits the registration, so a failed write leaves no stream claiming a durability it
-	// does not have; a series record for a stream that never gets rows is cheap and harmless.
+	// replay drops records it cannot attribute to a registered stream — and again whenever it starts
+	// a fresh record buffer, which is what keeps the log self-contained across the checkpoint a flush
+	// performs (see [head.needsStreamRecord]). The record is written before the head commits the
+	// registration, so a failed write leaves no stream claiming a durability it does not have; a
+	// series record for a stream that never gets rows is cheap and harmless.
 	identity := b.Identity
-	if isNew {
+	if isNew || e.head.needsStreamRecord(b.Stream) {
 		s := b.Identity()
 		identity = func() signal.Series { return s }
 
@@ -1061,6 +1063,9 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	}
 
 	e.flushing = detached
+	// Snapshot the flushed streams' identities while still under the lock: the part write runs
+	// off-lock, and the resident index keeps being mutated by ingest.
+	idents := e.head.identitiesOf(detached)
 
 	var side map[string][]byte
 	if e.cfg.SideStore != nil {
@@ -1096,7 +1101,8 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 
 		// Flush writes columns codec-only (no block compression) to keep ingest cheap; the cold merge
 		// recompresses. See [Config.MergeCompression].
-		if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, sub, compress.AlgorithmNone, 0, e.blooms()); err != nil {
+		if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, sub, idents,
+			compress.AlgorithmNone, 0, e.blooms()); err != nil {
 			return 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
 		}
 
@@ -1175,19 +1181,16 @@ func (e *Engine) abortFlush(
 	return cause
 }
 
-// publishLocked persists the engine's part set (bucket index + stream identity index) and, for a
-// flush, checkpoints the WAL to the advanced watermark. Caller holds e.mu.
+// publishLocked persists the engine's part set (the bucket index) and, for a flush, checkpoints the
+// WAL to the advanced watermark. Caller holds e.mu.
 func (e *Engine) publishLocked(ctx context.Context) error {
-	// Ordering is a durability invariant: the stream index goes first, the bucket index last. The
-	// bucket index carries the flush watermark (the WAL replay floor), so writing it is the commit
-	// point. The stream set is superset-safe — an identity persisted with no rows behind it is inert,
-	// as every part range lookup misses it — whereas a committed part whose identities are missing
-	// from the stream index holds rows no matcher can ever resolve, while the advanced watermark
-	// makes replay skip them: permanent loss. Crashing between the two must leave extra identities,
-	// never orphaned rows.
-	if err := e.writeStreamIndexLocked(ctx); err != nil {
-		return err
-	}
+	// Ordering is a durability invariant: a part's own objects — including the identity object
+	// naming its streams — are all written before the bucket index, which carries the flush
+	// watermark (the WAL replay floor) and is therefore the commit point. A committed part whose
+	// identities were missing would hold rows no matcher can resolve while the advanced watermark
+	// makes replay skip them: permanent loss. The reverse leftover is harmless — a part whose
+	// objects were written but never committed is an orphan the next open sweeps, and its
+	// identities were never loaded.
 
 	if err := e.updateIndexLocked(ctx); err != nil {
 		return err

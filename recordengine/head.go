@@ -65,6 +65,17 @@ func (h *head) admitStream(id signal.SeriesID, maxSeries int64) (isNew, ok bool)
 	return true, maxSeries <= 0 || int64(h.series.Len()) < maxSeries
 }
 
+// needsStreamRecord reports whether the WAL must be told about this stream again. A flush
+// checkpoints the log — every segment written before it is discarded — and detaches every record
+// buffer, so a stream record logged when the identity was first seen is gone after the next flush
+// while the identity itself survives in the resident index. Logging records again for a stream that
+// is starting a fresh buffer keeps the log self-contained, which matters because identity is scoped
+// to the parts: one whose parts retention has dropped exists nowhere durable but the log.
+//
+// A buffer is created once per stream per flush window, so this costs one stream record per
+// actively-appending stream per flush, and nothing on the repeat-record path.
+func (h *head) needsStreamRecord(id signal.SeriesID) bool { return h.records[id] == nil }
+
 // ensureStream registers and indexes the stream on first sight and makes sure its (full-column)
 // record buffer exists. materialize is called only when the stream identity is newly seen. It
 // returns whether the stream is admitted, i.e. [head.admitStream]'s cardinality verdict.
