@@ -12,6 +12,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/encoding/bitstream"
+	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/pool"
 )
 
@@ -33,6 +34,9 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 type Table struct {
 	ids  *pool.ByteIntMap // bytes → id
 	syms [][]byte         // id → bytes (owned copies)
+	// payload is the total length of the owned symbol copies, accumulated on insert: the table is
+	// long-lived identity state, so its size is metered ([Table.SizeBytes]) rather than walked.
+	payload int64
 }
 
 // New returns an empty [Table].
@@ -79,6 +83,18 @@ func (t *Table) Bytes(b []byte) []byte {
 
 // Len returns the number of interned symbols.
 func (t *Table) Len() int { return len(t.syms) }
+
+// SizeBytes returns the table's resident footprint: the interned payloads it owns, the id→bytes
+// slice, and the lookup map's backing arrays. Callers holding references *into* the table (an
+// interned identity) are not double-counted — every byte is owned here.
+func (t *Table) SizeBytes() int64 {
+	n := t.payload + memsize.Slice(t.syms)
+	if t.ids != nil {
+		n += t.ids.SizeBytes()
+	}
+
+	return n
+}
 
 // Release returns the underlying map to the shared pool. After Release the table must
 // not be used.
@@ -173,6 +189,7 @@ func (t *Table) add(b []byte) ID {
 	id := ID(len(t.syms))
 	t.syms = append(t.syms, stable)
 	t.ids.Put(stable, int(id))
+	t.payload += int64(len(stable))
 
 	return id
 }

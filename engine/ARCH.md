@@ -52,6 +52,43 @@ written and read uncached (`backend.WriteUncached`): it is read only on recovery
 never hit and only evicts part data. Both are stopgaps — the identity object is still whole-set, and
 per-part identity is the scale-out form.
 
+The resident half of that identity state — the head's symbol table, series index, postings lists and
+per-series OOO watermarks — is metered separately as `Stats.IdentityBytes`, not folded into
+`HeadBytes`: a flush drains samples, not identities, so folding the two would have the
+size-triggered flush chase a number it cannot lower.
+
+## Identity prune
+
+Retention drops samples and whole parts; `PruneIdentities` drops the identities they leave behind,
+which otherwise accumulate for the process' lifetime under series churn. It needs no new on-disk
+format — a part's `sidx` sidecar already lists its series ids, so the **live set** is the union of
+the live parts' id sets with the in-memory tiers (head, mid-flush detachment, recent). It runs after
+a merge, on the compaction **owner** only (a replica mid-sync has not loaded parts whose identities
+it still needs), and only when a merge actually dropped rows — identities die no other way, so an
+engine whose data only grew skips even the live-set walk.
+
+Symbol ids are dense and referenced by the postings lists, so nothing can be removed in place:
+the survivors are **rebuilt** into fresh structures. That rebuild is ~0.6 s per 200k identities
+(~3.4 s at 1M), far too long to hold `e.mu`, so it runs **off-lock** against
+`series.Index.Snapshot()` — the index's append-only entry log, which registration only extends, so
+a snapshot of it is immutable without the lock. Under the lock the swap then reconciles what changed
+meanwhile and installs the result: ~5 ms per 200k pruned identities, ~40 ms at 1M, allocation-free.
+
+Two sets must survive a rebuild that decided without them: entries registered *after* the snapshot
+(past its end in the same log), and series the prune found dead that **regained samples** — a series
+whose identity the old index still held is not re-registered when a sample arrives, so it leaves no
+log entry, and dropping it would strand samples the next flush would write into a part with no
+identity naming them. A dead series' OOO watermark is deleted by key (cost tracks what died, not
+cardinality); a live one keeps its own, or a late sample would be re-admitted.
+
+The WAL needs no `walExpiries` equivalent: it is checkpointed at every flush, so its live records
+name only series with buffered samples — live by definition. `series.bin` is rewritten immediately
+after the swap (the "unchanged count ⇒ identical object" skip cannot see a set that shrank and
+regrew, so the prune forces the write).
+
+Not yet pruned: a **replica's** index, which grows until the node becomes an owner, and the record
+engines' streams (same shape, plus union-only symbol sidecars).
+
 **Publish order: `series.bin` first, the bucket index last.** The bucket index is what makes a part
 durably visible, so writing it is the commit point, and a part is only readable once its series'
 identities are durable — a stateless reader rebuilds them from `series.bin` alone, so a committed

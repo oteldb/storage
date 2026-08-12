@@ -7,6 +7,7 @@ import (
 	"github.com/oteldb/storage/index/postings"
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/index/symbols"
+	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -75,6 +76,90 @@ func newHead() *head {
 
 		seriesNewest: make(map[signal.SeriesID]int64),
 	}
+}
+
+// identityBytes is the resident footprint of the head's identity state — symbols, the series
+// index, the postings lists and the per-series OOO watermarks. It is deliberately **not** part of
+// [head.bytes]: a flush drains buffered samples but not identities, so folding the two would make
+// a size-triggered flush chase a number it cannot lower. Identity is reported on its own
+// ([Stats.IdentityBytes]) because nothing else counts it, and it only grows.
+func (h *head) identityBytes() int64 {
+	return h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
+		int64(len(h.seriesNewest))*watermarkEntryBytes
+}
+
+// watermarkEntryBytes is one seriesNewest map entry (series id → timestamp).
+var watermarkEntryBytes = memsize.MapEntry[signal.SeriesID, int64]()
+
+// rebuildIdentity returns fresh symbol, series and postings structures holding only the identities
+// of snap that are in live — the identity prune (see prune.go). It is a rebuild rather than a
+// deletion because symbol ids are dense and referenced by the postings lists, so removing one
+// symbol would renumber every id above it.
+//
+// It reads nothing but its arguments, so it runs **off the engine lock**: snap is the series index's
+// append-only entry log, which registration only extends. The caller installs the result and
+// replays whatever was registered meanwhile ([head.adopt]).
+//
+// An id in live whose identity snap does not hold is simply absent: it is already unresolvable
+// (only a lost or truncated identity object can produce one), and inventing an entry for it would
+// be worse than leaving the postings without it.
+func rebuildIdentity(snap []series.Entry, live map[signal.SeriesID]struct{}) *head {
+	out := &head{sym: symbols.New(), series: series.New(), post: postings.NewMemPostings()}
+
+	for i := range snap {
+		if _, ok := live[snap[i].ID]; !ok {
+			continue
+		}
+
+		out.series.Add(snap[i].Series)
+		out.indexLabels(snap[i].ID, snap[i].Series)
+	}
+
+	// Sort now, while the index is still private: a reader would otherwise trigger the lazy in-place
+	// sort under the engine's read lock.
+	out.post.EnsureSorted()
+
+	return out
+}
+
+// swapIdentity installs the rebuilt identity structures, and is where the prune becomes atomic
+// against ingest. Two sets of identities must survive a rebuild that decided without them:
+//
+//   - tail — registered after the snapshot was taken, so they are past its end in the same
+//     append-only log and are live by construction.
+//   - revived — snapshot entries the prune found dead that hold buffered samples again. A series
+//     whose identity the *old* index still had is not re-registered when a sample arrives, so it
+//     leaves no tail entry; dropping it would strand samples the next flush would then write into a
+//     part with no identity naming them.
+//
+// Every other dead series loses its out-of-order watermark here: it means nothing without an
+// identity, while a live series must keep its own or a late sample slips back in. The sample
+// buffers, the byte measure and the head-global watermark are untouched — they describe live data.
+//
+// Caller holds the engine lock.
+func (h *head) swapIdentity(rebuilt *head, snap, tail []series.Entry, dead []int32) {
+	for i := range tail {
+		rebuilt.register(tail[i].ID, tail[i].Series)
+	}
+
+	for _, pos := range dead {
+		e := snap[pos]
+		if _, revived := h.samples[e.ID]; revived {
+			rebuilt.register(e.ID, e.Series)
+
+			continue
+		}
+
+		delete(h.seriesNewest, e.ID)
+	}
+
+	h.sym, h.series, h.post = rebuilt.sym, rebuilt.series, rebuilt.post
+}
+
+// register records and indexes an identity known not to be present.
+func (h *head) register(id signal.SeriesID, s signal.Series) {
+	h.series.Add(s)
+	h.indexLabels(id, s)
 }
 
 // outOfOrder reports whether ts is more than oooWindow behind series id's own newest admitted

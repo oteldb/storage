@@ -48,6 +48,19 @@ func replaceParts(parts []*part, removed map[string]struct{}, add ...*part) []*p
 	return out
 }
 
+// partRows totals the rows of a part set (nil entries skipped, as [replaceParts] allows).
+func partRows(parts []*part) int {
+	n := 0
+
+	for _, p := range parts {
+		if p != nil {
+			n += p.rows()
+		}
+	}
+
+	return n
+}
+
 // retireLocked moves parts onto the pending-deletion list. They have left the live set, so no new
 // fetch can acquire them; their backend objects are deleted by [reclaimRetired] once their current
 // readers drain. Caller holds e.mu.

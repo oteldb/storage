@@ -1412,10 +1412,24 @@ func (s *Storage) maintain(ctx context.Context) {
 	// concurrency bound, and drains the most in-flight memory soonest.
 	tasks := make([]maintTask, 0, len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines))
 
+	// mergeMetrics compacts a metric tenant and then prunes the identities its retention just left
+	// without data. The prune belongs to the merge step because that is the only thing that kills an
+	// identity, and because it runs on the owned path only — the live set is derived from this node's
+	// parts, so a replica mid-sync must not decide what is dead.
+	mergeMetrics := func(tid signal.TenantID, eng *engine.Engine) error {
+		if err := eng.MergeWith(ctx, s.metricMergeOptions(tid, sizeCutoffs[tid])); err != nil {
+			return err
+		}
+
+		_, err := eng.PruneIdentities(ctx)
+
+		return err
+	}
+
 	for tid, eng := range metricEngines {
 		tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
 			maintainEngine(tid, metricsPrefix, func() error { return eng.Flush(ctx) },
-				func() error { return eng.MergeWith(ctx, s.metricMergeOptions(tid, sizeCutoffs[tid])) },
+				func() error { return mergeMetrics(tid, eng) },
 				func() error { return eng.RefreshReplica(ctx) },
 				func() []ecPartRef { return coldMetric(eng) })
 		}})

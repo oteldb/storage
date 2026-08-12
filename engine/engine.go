@@ -140,6 +140,10 @@ type Engine struct {
 	// budget caps the in-flight decoded bytes across concurrent queries (Config.DecodeBudget or
 	// Config.DecodeMemoryBytes); possibly shared with other engines; nil ⇒ unlimited.
 	budget *DecodeBudget
+	// identityDirty is set when a merge dropped rows or parts, so identities may now be dead and an
+	// identity prune ([Engine.PruneIdentities]) has something to look for. Identities die no other
+	// way, so an engine whose data has only grown skips even the live-set walk.
+	identityDirty bool
 	// seriesWritten is the identity count persisted to series.bin by the last publish, and
 	// seriesBytes that object's encoded size. The set only grows, so an unchanged count means the
 	// object is still current (the rewrite is skipped); the size is the next encode's buffer hint.
@@ -303,14 +307,29 @@ func (e *Engine) HeadBytes() int64 {
 	return e.head.bytes
 }
 
+// IdentityBytes returns the resident bytes of the engine's identity state — the symbol table, the
+// series index, the postings lists and the per-series out-of-order watermarks. It is reported
+// separately from [Engine.HeadBytes] because a flush does not drain it: identities outlive their
+// samples and are cleared only by [Engine.Reset], so this number tracks the engine's all-time
+// series count, not its buffered data.
+func (e *Engine) IdentityBytes() int64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	return e.head.identityBytes()
+}
+
 // Stats is an in-memory snapshot of an engine's state for introspection (no backend I/O, no decode).
 type Stats struct {
 	Series      int64 // distinct series ever seen (index span: head ∪ flushed)
 	HeadSamples int64 // samples currently buffered in the head (unflushed)
 	HeadBytes   int64 // head's buffered sample bytes (the in-flight memory measure)
-	Parts       int   // flushed immutable parts
-	MinTime     int64 // oldest flushed sample time (unix ns); 0 when no parts
-	MaxTime     int64 // newest sample time across parts and the head (unix ns); 0 when empty
+	// IdentityBytes is the resident identity state (symbols + series index + postings + OOO
+	// watermarks) — memory a flush does not drain, and which no other counter here reports.
+	IdentityBytes int64
+	Parts         int   // flushed immutable parts
+	MinTime       int64 // oldest flushed sample time (unix ns); 0 when no parts
+	MaxTime       int64 // newest sample time across parts and the head (unix ns); 0 when empty
 }
 
 // Stats returns an in-memory snapshot of the engine's state under a single read lock. It does no
@@ -321,10 +340,11 @@ func (e *Engine) Stats() Stats {
 	defer e.mu.RUnlock()
 
 	s := Stats{
-		Series:    int64(e.head.series.Len()),
-		HeadBytes: e.head.bytes,
-		Parts:     len(e.parts),
-		MaxTime:   e.head.newest,
+		Series:        int64(e.head.series.Len()),
+		HeadBytes:     e.head.bytes,
+		IdentityBytes: e.head.identityBytes(),
+		Parts:         len(e.parts),
+		MaxTime:       e.head.newest,
 	}
 
 	for _, buf := range e.head.samples {
@@ -888,6 +908,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 	e.flushing = nil // discarded with the head: Reset drops the samples, it does not flush them
 	e.nextSeq = 0
 	e.seriesWritten, e.seriesBytes = 0, 0 // the identity object is swept below with the parts
+	e.identityDirty = false               // nothing is left to prune
 
 	if e.cfg.Backend == nil {
 		e.parts, e.retiring = nil, nil

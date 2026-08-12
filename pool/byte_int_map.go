@@ -5,6 +5,8 @@ import (
 	"sync"
 
 	"github.com/zeebo/xxh3"
+
+	"github.com/oteldb/storage/internal/memsize"
 )
 
 // byteIntMapPool is the sync.Pool backing [*ByteIntMap] reuse. Declared via an init
@@ -64,6 +66,13 @@ func (m *ByteIntMap) Reset() {
 
 // Len returns the number of live entries in the map.
 func (m *ByteIntMap) Len() int { return m.count }
+
+// SizeBytes returns the bytes held by the map's backing arrays. Key payloads are excluded — the
+// map stores the caller's slice headers, not copies, so their bytes belong to whoever owns them
+// (for a symbol table, the table itself).
+func (m *ByteIntMap) SizeBytes() int64 {
+	return memsize.Slice(m.keys) + memsize.Slice(m.values) + memsize.Slice(m.hashes)
+}
 
 // hashKey returns the xxh3 hash of b, ensuring it's never 0 (reserved for empty slot).
 // Inlined by the compiler.

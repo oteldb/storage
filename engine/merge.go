@@ -153,6 +153,13 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	}
 
 	e.retireLocked(selected)
+	// Rows that did not survive the merge are retention's work: the samples are gone, so the
+	// identities naming them may be dead too and an identity prune has something to find. Merging
+	// without dropping rows (a plain compaction) leaves every identity backed, so it arms nothing.
+	if partRows(newParts) < partRows(selected) {
+		e.identityDirty = true
+	}
+
 	e.mu.Unlock()
 
 	e.reclaimRetired(ctx)

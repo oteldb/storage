@@ -63,6 +63,7 @@ func TestInspectInMemory(t *testing.T) {
 	assert.Equal(t, int64(2), mstat.Series, "two distinct metric series")
 	assert.Equal(t, int64(3), mstat.HeadItems, "three samples buffered in the head")
 	assert.Positive(t, mstat.HeadBytes)
+	assert.Positive(t, mstat.IdentityBytes, "identity state is metered separately from the head")
 	assert.Equal(t, int64(0), mstat.MinTimeUnixNano, "no flushed parts yet ⇒ no part-based min")
 	assert.Equal(t, int64(300), mstat.MaxTimeUnixNano, "newest sample (from the head)")
 
