@@ -47,6 +47,15 @@ const (
 	pruneDeadDen = 4
 )
 
+// PruneOptions tunes an identity prune.
+type PruneOptions struct {
+	// Force runs the prune even when the background thresholds would skip it — an engine that has
+	// merged nothing away since the last pass, or one whose dead set is too small to pay for the
+	// rebuild. It is what an operator-triggered sweep wants: "prune now", with the count it removed
+	// as the answer, rather than a silent no-op whose reason is a threshold.
+	Force bool
+}
+
 // PruneIdentities drops the identities no live data names any more — those the retention side of a
 // merge left behind — rebuilding the resident index around the survivors and shrinking the durable
 // identity object to match. It returns the number of identities removed (0 when nothing could have
@@ -58,6 +67,11 @@ const (
 // ahead of a sync loses nothing. It takes the same flush/merge exclusion as those paths, so no
 // publish can add an identity underneath it.
 func (e *Engine) PruneIdentities(ctx context.Context) (int, error) {
+	return e.PruneIdentitiesWith(ctx, PruneOptions{})
+}
+
+// PruneIdentitiesWith is [Engine.PruneIdentities] with explicit options.
+func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (int, error) {
 	if e.cfg.Backend == nil {
 		return 0, nil // head-only: nothing is flushed, so no identity can have outlived its data
 	}
@@ -71,7 +85,7 @@ func (e *Engine) PruneIdentities(ctx context.Context) (int, error) {
 
 	// Identities die only when retention drops rows or parts, so an engine that has merged nothing
 	// away since the last prune skips even the live-set walk. An idle tenant pays nothing.
-	if !dirty || total < pruneMinIdentities {
+	if !opts.Force && (!dirty || total < pruneMinIdentities) {
 		return 0, nil
 	}
 
@@ -85,7 +99,13 @@ func (e *Engine) PruneIdentities(ctx context.Context) (int, error) {
 	e.mu.RUnlock()
 
 	dead := deadPositions(snap, live)
-	if len(dead)*pruneDeadDen < total*pruneDeadNum {
+	if len(dead) == 0 {
+		e.clearIdentityDirty()
+
+		return 0, nil
+	}
+
+	if !opts.Force && len(dead)*pruneDeadDen < total*pruneDeadNum {
 		// Too little to reclaim for the rebuild's cost. The flag stays clear: the next merge that
 		// drops data sets it again, and until then the answer cannot change.
 		e.clearIdentityDirty()
