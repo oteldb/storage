@@ -97,7 +97,7 @@ func (e *Engine) planAggregate(r fetch.Request) ([]signal.SeriesID, *enginePlan)
 	plan := e.planFetch(ids, r)
 	e.mu.RUnlock()
 
-	plan.acquireDecodeBudget(colNeed{values: true})
+	plan.acquireDecodeBudget(r.Scope, colNeed{values: true})
 
 	return ids, plan
 }

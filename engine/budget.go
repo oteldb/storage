@@ -1,6 +1,10 @@
 package engine
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/oteldb/storage/query/fetch"
+)
 
 // DecodeBudget caps the total in-flight decoded bytes across concurrent queries, so query concurrency
 // cannot drive RSS past a bound. Each query estimates its decode footprint (the column buffers it
@@ -49,6 +53,52 @@ func (b *DecodeBudget) acquire(n int64) {
 	}
 
 	b.used += n
+}
+
+// acquireFor is [DecodeBudget.acquire] for a read carrying a [fetch.Scope]: the scope's first
+// read blocks as usual, and while it still holds a reservation any later read is charged without
+// queueing. A nil scope is exactly acquire.
+//
+// Skipping the queue is what keeps the budget deadlock-free for a caller that holds several reads
+// open at once: blocking there would be hold-and-wait against the query's own reservation, and
+// acquire's admit-alone escape cannot fire because `used` is non-zero precisely because this
+// query holds it. The accounting stays exact — only the waiting is skipped — so such a query may
+// overshoot the ceiling by its own later estimates, the latitude a single over-budget read has.
+func (b *DecodeBudget) acquireFor(s *fetch.Scope, n int64) {
+	if b == nil || b.maxBytes <= 0 || n <= 0 {
+		return
+	}
+
+	if !s.Enter() {
+		b.acquire(n)
+		s.Charge(n)
+
+		return
+	}
+
+	b.mu.Lock()
+	b.used += n
+	b.mu.Unlock()
+
+	s.Charge(n)
+}
+
+// releaseFor returns n bytes charged through [DecodeBudget.acquireFor].
+func (b *DecodeBudget) releaseFor(s *fetch.Scope, n int64) {
+	s.Release(n)
+	b.release(n)
+}
+
+// inFlight reports the currently reserved bytes. It is for tests and introspection.
+func (b *DecodeBudget) inFlight() int64 {
+	if b == nil {
+		return 0
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.used
 }
 
 // release returns n bytes to the budget and wakes any waiters.

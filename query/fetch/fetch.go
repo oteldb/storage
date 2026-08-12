@@ -103,6 +103,11 @@ type Request struct {
 	// after Release, or not releasing while Recycle is set) only forfeits the reuse, except that
 	// reading after Release is undefined — never do it.
 	Recycle bool
+
+	// Scope names the logical query this read belongs to, so admission control can recognize a
+	// caller that keeps several reads open at once instead of treating each as a stranger. Nil
+	// (the default) is one read standing alone. See [Scope].
+	Scope *Scope
 }
 
 // Condition is one columnar predicate (logs): the rows whose value in column Column satisfy

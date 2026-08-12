@@ -91,7 +91,7 @@ func (e *Engine) planCount(r fetch.Request, withIdentity bool) ([]signal.SeriesI
 	ids, plan := e.planLookup(r, withIdentity)
 
 	// Count decodes timestamps only (existence), and only for window-edge parts; reserve that.
-	plan.acquireDecodeBudget(colNeed{})
+	plan.acquireDecodeBudget(r.Scope, colNeed{})
 
 	return ids, plan
 }

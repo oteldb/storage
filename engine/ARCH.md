@@ -222,10 +222,20 @@ Layered optimizations, each opt-in:
   only the blocks the matched row ranges touch. With the cache on a fetch also **prefetches** the
   parts it will touch, so backend reads and decodes overlap.
 - **Decode-memory budget** (`Config.DecodeMemoryBytes`) — a shared byte semaphore over in-flight
-  decoded column bytes, reserved once per query off the lock (never incrementally, so two queries
-  can't deadlock holding partial reservations); a query bigger than the whole budget is admitted
-  alone. The facade builds **one** budget for all tenants, so the cap is process-wide. It bounds
-  the query-concurrency RSS cliff.
+  decoded column bytes, reserved once per *fetch* off the lock (never incrementally per part, so
+  two queries can't deadlock holding partial reservations); a fetch bigger than the whole budget is
+  admitted alone. The facade builds **one** budget for all tenants, so the cap is process-wide. It
+  bounds the query-concurrency RSS cliff.
+  - Per-fetch is only deadlock-free while a caller keeps **one** fetch open at a time — true of a
+    drain-then-close consumer, false of a streaming one that holds several iterators across an
+    evaluation. There the second acquire is hold-and-wait against the query's own reservation, and
+    the admit-alone escape cannot fire: `used` is non-zero precisely because this query holds it.
+  - `Request.Scope` (a `fetch.Scope`) names the logical query, the read-side analogue of
+    Prometheus' `Storage.Querier`: the caller makes one per request and passes it on every read
+    under it. Its first read blocks as usual; while it still holds, later reads sharing the scope
+    are charged **without queueing**. Accounting stays exact — only the waiting is skipped — so
+    such a query may overshoot the ceiling by its own later estimates, the same latitude a single
+    over-budget read already has. A nil scope is unchanged.
 - **Recent tier** (`Config.RecentWindow`) — mirrors the most recent flush window in RAM across
   flushes, so a query inside the window acquires **no part at all**; overlap with the part is
   deduped by the freshest-wins timestamp merge.
