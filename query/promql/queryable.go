@@ -81,7 +81,17 @@ func NewQueryableWithCache(fetcher fetch.Fetcher, tenant signal.TenantID, cache 
 
 // Querier returns a querier over [mint, maxt] (Prometheus milliseconds).
 func (q *Queryable) Querier(mint, maxt int64) (storage.Querier, error) {
-	return &querier{fetcher: q.fetcher, tenant: q.tenant, mint: mint, maxt: maxt, labels: q.labels}, nil
+	return q.QuerierWithScope(mint, maxt, fetch.NewScope())
+}
+
+// QuerierWithScope is [Queryable.Querier] bound to a caller-supplied [fetch.Scope], for an embedder
+// whose logical query spans more than this querier — its own reads plus the ones it makes here.
+// Sharing the scope is what keeps admission from treating those as unrelated queries and blocking
+// the caller against its own reservation.
+func (q *Queryable) QuerierWithScope(mint, maxt int64, scope *fetch.Scope) (storage.Querier, error) {
+	return &querier{
+		fetcher: q.fetcher, tenant: q.tenant, mint: mint, maxt: maxt, labels: q.labels, scope: scope,
+	}, nil
 }
 
 // LabelCache memoizes a series identity's projected Prometheus label set. The projection is a pure
@@ -126,6 +136,9 @@ type querier struct {
 	mint    int64
 	maxt    int64
 	labels  *LabelCache
+	// scope names the logical query every request below belongs to. One querier is one session,
+	// unless the embedder bound its own via [Queryable.QuerierWithScope].
+	scope *fetch.Scope
 	// held are the fetched batches whose buffers back the returned series (zero-copy). They are kept
 	// alive until [querier.Close] (after the engine has evaluated) and then released, recycling the
 	// engine's result buffers via the fetch [fetch.Request.Recycle] lifecycle.
@@ -153,6 +166,7 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.Select
 		End:      msToNsClamp(q.maxt, math.MaxInt64),
 		Matchers: PushableMatchers(matchers),
 		Recycle:  true,
+		Scope:    q.scope,
 	}
 
 	it, err := q.fetcher.Fetch(ctx, req)
@@ -226,6 +240,7 @@ func (q *querier) CountSeries(ctx context.Context, startMs, endMs int64, matcher
 		Start:    msToNsClamp(startMs, math.MinInt64),
 		End:      msToNsClamp(endMs, math.MaxInt64),
 		Matchers: pushed,
+		Scope:    q.scope,
 	}
 
 	n, err := counter.Count(ctx, req)
@@ -267,6 +282,7 @@ func (q *querier) CountSeriesBy(
 		Start:    msToNsClamp(startMs, math.MinInt64),
 		End:      msToNsClamp(endMs, math.MaxInt64),
 		Matchers: pushed,
+		Scope:    q.scope,
 	}
 
 	groups, err := counter.CountBy(ctx, req, []byte(label))
@@ -483,6 +499,7 @@ func (q *querier) labelRequest(startMs, endMs int64, pushed []fetch.Matcher) fet
 		Start:    msToNsClamp(startMs, math.MinInt64),
 		End:      msToNsClamp(endMs, math.MaxInt64),
 		Matchers: pushed,
+		Scope:    q.scope,
 	}
 }
 
