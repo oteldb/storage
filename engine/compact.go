@@ -189,3 +189,28 @@ func pickTierGroup(src []*part, capRows int) []*part {
 
 	return group
 }
+
+// tierShape summarizes why a merge selected nothing: how many parts are sealed, how many distinct
+// size tiers the unsealed ones occupy, and the largest tier's part count — which is the number
+// [pickTierGroup] compares against minTierParts.
+func tierShape(src []*part, capRows int) (sealed, tiers, largestTier int) {
+	byTier := make(map[int]int, len(src))
+
+	for _, p := range src {
+		if capRows > 0 && p.rows() >= capRows {
+			sealed++
+
+			continue
+		}
+
+		byTier[sizeTier(p.rows())]++
+	}
+
+	for _, n := range byTier {
+		if n > largestTier {
+			largestTier = n
+		}
+	}
+
+	return sealed, len(byTier), largestTier
+}
