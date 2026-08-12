@@ -1,13 +1,14 @@
 package engine
 
 import (
-	"context"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/oteldb/storage/query/fetch"
 )
 
 // done reports whether f finished within the timeout. It is how these tests distinguish "blocked"
@@ -39,14 +40,13 @@ func TestQueryScopeSecondFetchDoesNotBlock(t *testing.T) {
 	t.Parallel()
 
 	b := NewDecodeBudget(100)
-	ctx := WithQueryScope(context.Background())
+	scope := fetch.NewScope()
 
-	first := b.acquireFor(ctx, 80)
-	require.NotNil(t, first)
+	b.acquireFor(scope, 80)
 
 	// 80 + 40 > 100, so an unscoped acquire would queue here forever: nothing can release while
 	// this same query is the only holder.
-	require.True(t, done(t, 5*time.Second, func() { b.acquireFor(ctx, 40) }),
+	require.True(t, done(t, 5*time.Second, func() { b.acquireFor(scope, 40) }),
 		"a second fetch in the same query must not block on the first")
 
 	assert.Equal(t, int64(120), b.inFlight(), "accounting stays exact even when queueing is skipped")
@@ -58,12 +58,12 @@ func TestQueryScopeConcurrentFirstAdmission(t *testing.T) {
 	t.Parallel()
 
 	b := NewDecodeBudget(100)
-	ctx := WithQueryScope(context.Background())
+	scope := fetch.NewScope()
 
 	require.True(t, done(t, 5*time.Second, func() {
 		var wg sync.WaitGroup
 		for range 8 {
-			wg.Go(func() { b.acquireFor(ctx, 60) })
+			wg.Go(func() { b.acquireFor(scope, 60) })
 		}
 		wg.Wait()
 	}), "concurrent fetches of one query must not deadlock against each other")
@@ -78,10 +78,10 @@ func TestQueryScopeStillBoundsOtherQueries(t *testing.T) {
 
 	b := NewDecodeBudget(100)
 
-	held := b.acquireFor(WithQueryScope(context.Background()), 80)
-	require.NotNil(t, held)
+	held := fetch.NewScope()
+	b.acquireFor(held, 80)
 
-	other := WithQueryScope(context.Background())
+	other := fetch.NewScope()
 	assert.False(t, done(t, 200*time.Millisecond, func() { b.acquireFor(other, 40) }),
 		"an unrelated query must still wait for the ceiling")
 
@@ -100,19 +100,19 @@ func TestQueryScopeReleaseRestoresBudget(t *testing.T) {
 	t.Parallel()
 
 	b := NewDecodeBudget(100)
-	ctx := WithQueryScope(context.Background())
+	scope := fetch.NewScope()
 
-	a := b.acquireFor(ctx, 60)
-	c := b.acquireFor(ctx, 60)
+	b.acquireFor(scope, 60)
+	b.acquireFor(scope, 60)
 
-	b.releaseFor(a, 60)
-	b.releaseFor(c, 60)
+	b.releaseFor(scope, 60)
+	b.releaseFor(scope, 60)
 
 	assert.Zero(t, b.inFlight())
 
 	// With the scope drained, a fresh fetch under it takes the blocking path again rather than
 	// inheriting a stale "already admitted".
-	require.True(t, done(t, 5*time.Second, func() { b.acquireFor(ctx, 90) }))
+	require.True(t, done(t, 5*time.Second, func() { b.acquireFor(scope, 90) }))
 	assert.Equal(t, int64(90), b.inFlight())
 }
 
@@ -123,15 +123,7 @@ func TestQueryScopeUnscopedUnchanged(t *testing.T) {
 
 	b := NewDecodeBudget(100)
 
-	require.True(t, done(t, 5*time.Second, func() { b.acquireFor(context.Background(), 500) }),
+	require.True(t, done(t, 5*time.Second, func() { b.acquireFor(nil, 500) }),
 		"an over-budget fetch is still admitted alone")
 	assert.Equal(t, int64(500), b.inFlight())
-}
-
-func TestWithQueryScopeIsIdempotent(t *testing.T) {
-	t.Parallel()
-
-	ctx := WithQueryScope(context.Background())
-	assert.Same(t, queryScopeFrom(ctx), queryScopeFrom(WithQueryScope(ctx)),
-		"nesting must not split one query's reservation in two")
 }

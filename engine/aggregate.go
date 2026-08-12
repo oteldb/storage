@@ -45,7 +45,7 @@ func (e *Engine) AggregateRange(ctx context.Context, r fetch.Request) (map[signa
 	ctx, span := e.startAggregateSpan(ctx, "engine.aggregateRange")
 	defer span.End()
 
-	ids, plan := e.planAggregate(ctx, r)
+	ids, plan := e.planAggregate(r)
 	defer plan.releaseParts()
 	safe := aggPushdownSafe(plan)
 
@@ -83,7 +83,7 @@ func (e *Engine) AggregateRange(ctx context.Context, r fetch.Request) (map[signa
 // so it holds the shared lock and, while the index is still unsorted, upgrades to sort and re-checks
 // — once it holds the read lock over a sorted index no writer can be running. The caller must
 // releaseParts.
-func (e *Engine) planAggregate(ctx context.Context, r fetch.Request) ([]signal.SeriesID, *enginePlan) {
+func (e *Engine) planAggregate(r fetch.Request) ([]signal.SeriesID, *enginePlan) {
 	e.mu.RLock()
 	for !e.head.indexSorted() {
 		e.mu.RUnlock()
@@ -97,7 +97,7 @@ func (e *Engine) planAggregate(ctx context.Context, r fetch.Request) ([]signal.S
 	plan := e.planFetch(ids, r)
 	e.mu.RUnlock()
 
-	plan.acquireDecodeBudget(ctx, colNeed{values: true})
+	plan.acquireDecodeBudget(r.Scope, colNeed{values: true})
 
 	return ids, plan
 }
@@ -124,7 +124,7 @@ func (e *Engine) AggregateStep(ctx context.Context, r fetch.Request, step int64)
 	ctx, span := e.startAggregateSpan(ctx, "engine.aggregateStep")
 	defer span.End()
 
-	ids, plan := e.planAggregate(ctx, r)
+	ids, plan := e.planAggregate(r)
 	defer plan.releaseParts()
 	safe := aggPushdownSafe(plan)
 
@@ -161,7 +161,7 @@ func (e *Engine) AggregateStepNamed(ctx context.Context, r fetch.Request, step i
 	ctx, span := e.startAggregateSpan(ctx, "engine.aggregateStepNamed")
 	defer span.End()
 
-	ids, plan := e.planAggregate(ctx, r)
+	ids, plan := e.planAggregate(r)
 	defer plan.releaseParts()
 	safe := aggPushdownSafe(plan)
 

@@ -167,7 +167,7 @@ func (e *Engine) aggregateWindowSeq(
 			return
 		}
 
-		ids, plan := e.planAggregate(ctx, r)
+		ids, plan := e.planAggregate(r)
 		defer plan.releaseParts()
 
 		w := newWindower(plan, spec)

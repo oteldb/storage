@@ -20,7 +20,7 @@ import (
 // and mid-flush windows are scanned in memory. A series counts if any source holds an
 // in-window sample. Series with no sample in the window are omitted.
 func (e *Engine) Count(ctx context.Context, r fetch.Request) (int, error) {
-	ids, plan := e.planCount(ctx, r, false)
+	ids, plan := e.planCount(r, false)
 	defer plan.releaseParts()
 
 	active, err := plan.activeFlags(ctx, ids, e)
@@ -53,7 +53,7 @@ func (e *Engine) Count(ctx context.Context, r fetch.Request) (int, error) {
 // without the label group under "" (indistinguishable from an explicit empty-text value, matching
 // PromQL's absent-label grouping). Groups whose every series is empty in the window are omitted.
 func (e *Engine) CountBy(ctx context.Context, r fetch.Request, label []byte) (map[string]int, error) {
-	ids, plan := e.planCount(ctx, r, true)
+	ids, plan := e.planCount(r, true)
 	defer plan.releaseParts()
 
 	active, err := plan.activeFlags(ctx, ids, e)
@@ -87,11 +87,11 @@ func (e *Engine) CountBy(ctx context.Context, r fetch.Request, label []byte) (ma
 // identity slab is snapshotted only when the caller groups by it (withIdentity, for CountBy), the
 // decode budget reserves timestamps only, and only window-edge parts ever decode. The caller must
 // releaseParts.
-func (e *Engine) planCount(ctx context.Context, r fetch.Request, withIdentity bool) ([]signal.SeriesID, *enginePlan) {
+func (e *Engine) planCount(r fetch.Request, withIdentity bool) ([]signal.SeriesID, *enginePlan) {
 	ids, plan := e.planLookup(r, withIdentity)
 
 	// Count decodes timestamps only (existence), and only for window-edge parts; reserve that.
-	plan.acquireDecodeBudget(ctx, colNeed{})
+	plan.acquireDecodeBudget(r.Scope, colNeed{})
 
 	return ids, plan
 }
