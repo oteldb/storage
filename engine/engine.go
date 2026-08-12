@@ -410,7 +410,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 	// Reserve this fetch's decode footprint from the memory budget (blocks under concurrency
 	// pressure), off the engine lock, before any part is decoded. A fetch materializes ts+value.
-	plan.acquireDecodeBudget(colNeed{values: true})
+	plan.acquireDecodeBudget(ctx, colNeed{values: true})
 
 	// Prefetch: decode the parts this fetch will touch concurrently (and cache them), so their
 	// backend reads + decodes overlap instead of happening one part at a time during the merge.
@@ -448,8 +448,9 @@ type enginePlan struct {
 	// decodedPart); a part absent from the map (cache off, or a const/legacy-unblocked column) uses
 	// the decoded-part path instead. Built once in planFetch.
 	blockReaders map[*part]*seriesBlockReader
-	engine       *Engine // for returning pooled decode buffers on release
-	budgetBytes  int64   // decode-memory budget reserved for this query; released on releaseParts
+	engine       *Engine     // for returning pooled decode buffers on release
+	budgetBytes  int64       // decode-memory budget reserved for this query; released on releaseParts
+	budgetScope  *queryScope // the [WithQueryScope] hold budgetBytes was charged against, if any
 	start, end   int64
 	// memActive is the count-shaped plan's replacement for the head/flush/recent batch snapshots:
 	// one existence flag per matched id (any in-memory sample in [start, end]), computed under the
@@ -556,13 +557,13 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 // decode-memory budget, blocking until it fits (or admitting it alone when it exceeds the whole
 // budget). It must run off the engine lock and after planFetch (it needs liveParts); releaseParts
 // returns the reservation. A nil budget makes it a no-op.
-func (p *enginePlan) acquireDecodeBudget(need colNeed) {
+func (p *enginePlan) acquireDecodeBudget(ctx context.Context, need colNeed) {
 	if p.engine.budget == nil {
 		return
 	}
 
 	p.budgetBytes = p.decodeEstimate(need)
-	p.engine.budget.acquire(p.budgetBytes)
+	p.budgetScope = p.engine.budget.acquireFor(ctx, p.budgetBytes)
 }
 
 // decodeEstimate is the bytes this query will materialize across the parts it touches: the full ts
@@ -605,7 +606,7 @@ func (p *enginePlan) releaseSeriesPins() {
 }
 
 func (p *enginePlan) releaseParts() {
-	p.engine.budget.release(p.budgetBytes)
+	p.engine.budget.releaseFor(p.budgetScope, p.budgetBytes)
 
 	// Drop the block-slice readers' remaining references on the cache blocks they viewed (the scan
 	// releases per series; this sweeps the memoized leftovers). Any views are dead by now; releasing
