@@ -144,11 +144,6 @@ type Engine struct {
 	// identity prune ([Engine.PruneIdentities]) has something to look for. Identities die no other
 	// way, so an engine whose data has only grown skips even the live-set walk.
 	identityDirty bool
-	// seriesWritten is the identity count persisted to series.bin by the last publish, and
-	// seriesBytes that object's encoded size. The set only grows, so an unchanged count means the
-	// object is still current (the rewrite is skipped); the size is the next encode's buffer hint.
-	seriesWritten int
-	seriesBytes   int
 	// planMaps recycles the per-fetch plan maps (series identity + head/flush/recent snapshots) so a
 	// fetch reuses cleared maps instead of allocating and growing fresh ones each call.
 	planMaps planMapPools
@@ -907,8 +902,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 	e.head = newHead()
 	e.flushing = nil // discarded with the head: Reset drops the samples, it does not flush them
 	e.nextSeq = 0
-	e.seriesWritten, e.seriesBytes = 0, 0 // the identity object is swept below with the parts
-	e.identityDirty = false               // nothing is left to prune
+	e.identityDirty = false // nothing is left to prune
 
 	if e.cfg.Backend == nil {
 		e.parts, e.retiring = nil, nil

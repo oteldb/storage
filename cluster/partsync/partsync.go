@@ -12,9 +12,10 @@
 // only ever references fully-copied parts (the same commit-point discipline flush uses). A
 // half-copied part is an unreferenced orphan retried on the next pass.
 //
-// Objects are content-immutable except the bucket index and the head-identity objects
-// (series.bin / streams.bin), so a plain presence diff drives the copy; the mutable objects
-// are re-fetched whenever the index changed. Every fetched object is verified against the
+// Objects are content-immutable except the bucket index and the record engines' whole-set stream
+// identity object (streams.bin, plus the metrics series.bin a prefix written before identity became
+// part-scoped still has), so a plain presence diff drives the copy; the mutable objects are
+// re-fetched whenever the index changed. Every fetched object is verified against the
 // sender's checksum. Local objects the peer no longer has are pruned only after being absent
 // for two consecutive passes, giving in-flight readers a full maintenance cycle to drain
 // (quarantine-by-delay rather than immediate delete).
@@ -718,8 +719,10 @@ func maxSeq(ix *bucketindex.Index) int {
 	return m
 }
 
-// isMutableAux reports whether key is one of the engine's mutable (rewritten-on-flush)
-// auxiliary objects: the head-identity sets series.bin (metrics) / streams.bin (records).
+// isMutableAux reports whether key is one of the engine's mutable (rewritten-on-flush) auxiliary
+// objects: the record engines' streams.bin, and the metrics series.bin that only a prefix written
+// before identity became part-scoped still carries — it must keep being mirrored until the owner
+// deletes it, which the ordinary absence quarantine then propagates.
 func isMutableAux(key string) bool {
 	switch path.Base(key) {
 	case "series.bin", "streams.bin":
