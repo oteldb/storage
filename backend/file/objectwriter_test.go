@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -40,8 +41,16 @@ func TestCreateObjectReachesDiskBeforeCommit(t *testing.T) {
 	_, err = w.Write(chunk)
 	require.NoError(t, err)
 
-	assert.GreaterOrEqual(t, tempBytes(t, filepath.Join(dir, "part", "c")), int64(len(chunk))/2,
-		"the bytes written so far must be on disk, not held in the writer")
+	// The writer is file-backed, so the bytes it has accepted are in the filesystem rather than in
+	// the writer. How much of that is observable differs by platform: NTFS reports a stale size for a
+	// file with an open handle, so only the temp file's existence is portable and the byte count is
+	// checked where it means something.
+	require.NotEmpty(t, tempFiles(t, filepath.Join(dir, "part", "c")), "the object is built in a temp file")
+
+	if runtime.GOOS != "windows" {
+		assert.GreaterOrEqual(t, tempBytes(t, filepath.Join(dir, "part", "c")), int64(len(chunk))/2,
+			"the bytes written so far must be on disk, not held in the writer")
+	}
 
 	_, err = b.Read(ctx, "part/c/0")
 	require.ErrorIs(t, err, backend.ErrNotExist, "the object is not published until commit")
@@ -52,7 +61,7 @@ func TestCreateObjectReachesDiskBeforeCommit(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, chunk, got)
 
-	assert.Zero(t, tempBytes(t, filepath.Join(dir, "part", "c")), "the temp file is renamed, not left")
+	assert.Empty(t, tempFiles(t, filepath.Join(dir, "part", "c")), "the temp file is renamed, not left")
 }
 
 // TestCreateObjectAbortRemovesTemp guards the merge-abandoned path: a temp file that survives an
@@ -74,7 +83,7 @@ func TestCreateObjectAbortRemovesTemp(t *testing.T) {
 	w.Abort()
 	w.Abort() // idempotent
 
-	assert.Zero(t, tempBytes(t, filepath.Join(dir, "part", "c")))
+	assert.Empty(t, tempFiles(t, filepath.Join(dir, "part", "c")))
 }
 
 // TestCreateObjectRejectsEscapingKey keeps the incremental path under the same root check as
@@ -89,24 +98,36 @@ func TestCreateObjectRejectsEscapingKey(t *testing.T) {
 	require.Error(t, err)
 }
 
-// tempBytes totals the bytes held by the temp files in dir (0 if dir does not exist).
-func tempBytes(t *testing.T, dir string) int64 {
+// tempFiles returns the writer temp files present in dir (none if dir does not exist).
+func tempFiles(t *testing.T, dir string) []os.DirEntry {
 	t.Helper()
 
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
-		return 0
+		return nil
 	}
 
 	require.NoError(t, err)
 
-	var total int64
+	var out []os.DirEntry
 
 	for _, e := range entries {
-		if !strings.HasPrefix(e.Name(), ".tmp-") {
-			continue
+		if strings.HasPrefix(e.Name(), ".tmp-") {
+			out = append(out, e)
 		}
+	}
 
+	return out
+}
+
+// tempBytes totals the bytes those temp files hold. Meaningful only where the filesystem keeps an
+// open file's reported size current — see [TestCreateObjectReachesDiskBeforeCommit].
+func tempBytes(t *testing.T, dir string) int64 {
+	t.Helper()
+
+	var total int64
+
+	for _, e := range tempFiles(t, dir) {
 		info, err := e.Info()
 		require.NoError(t, err)
 
