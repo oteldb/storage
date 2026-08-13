@@ -96,6 +96,16 @@ func (b *DecodeBudget) acquire(ctx context.Context, n int64) (forced bool, _ err
 		return false, nil
 	}
 
+	// This queue is deliberately not golang.org/x/sync/semaphore.Weighted, whose Acquire is exactly
+	// this shape (context-aware, weighted, FIFO hand-off). Weighted enforces a *hard* cap: nothing
+	// can push `cur` past `size`, and Release panics past zero. This budget's cap is soft by design
+	// and has to be exceeded on three paths — a query bigger than the whole budget admitted alone, a
+	// scoped query's later reads charged without queueing, and a stalled waiter force-admitted — so a
+	// semaphore could only be the waiting half, with a shadow counter holding the real in-flight
+	// bytes beside it. That splits the accounting in two (they disagree exactly when the ceiling is
+	// exceeded, which is when the number matters), makes releases need a per-reservation "how much of
+	// this was semaphore-held" token the release site does not carry, and still leaves the head/drain
+	// state the force rule reads unexposed. One counter with the escapes built in is less to own.
 	w := &budgetWaiter{n: n, ready: make(chan struct{})}
 	b.waiters = append(b.waiters, w)
 	seen := b.releases
@@ -109,7 +119,7 @@ func (b *DecodeBudget) acquire(ctx context.Context, n int64) (forced bool, _ err
 		case <-w.ready:
 			return false, nil
 		case <-ctx.Done():
-			return false, b.abandon(w, ctx.Err())
+			return false, b.abandon(ctx, w)
 		case <-t.C:
 			admitted, progressed := b.forceAdmit(w, &seen)
 			if admitted {
@@ -131,9 +141,9 @@ func (b *DecodeBudget) fitsLocked(n int64) bool {
 	return b.used == 0 || b.used+n <= b.maxBytes
 }
 
-// abandon drops w from the queue and returns cause. If w was admitted in the instant before the
-// context ended, its reservation is returned to the budget instead of leaking.
-func (b *DecodeBudget) abandon(w *budgetWaiter, cause error) error {
+// abandon drops w from the queue and returns why ctx ended. If w was admitted in the instant before
+// the context did, its reservation is returned to the budget instead of leaking.
+func (b *DecodeBudget) abandon(ctx context.Context, w *budgetWaiter) error {
 	b.mu.Lock()
 
 	if w.admitted {
@@ -143,6 +153,11 @@ func (b *DecodeBudget) abandon(w *budgetWaiter, cause error) error {
 	}
 
 	b.mu.Unlock()
+
+	cause := ctx.Err()
+	if cause == nil {
+		cause = context.Canceled
+	}
 
 	return errors.Wrap(cause, "acquire decode budget")
 }
