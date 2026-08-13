@@ -24,10 +24,71 @@ type instrumentedBackend struct {
 // instrumentBackend wraps b so its operations are metered. It is applied only when a meter is
 // configured, so the default path is the bare backend.
 func instrumentBackend(b backend.Backend, m *obs.Backend) backend.Backend {
-	return &instrumentedBackend{inner: b, m: m}
+	i := &instrumentedBackend{inner: b, m: m}
+
+	// Forwarded by a distinct type rather than a method, so metering claims the incremental-write
+	// capability only when the wrapped backend actually has it — a method would make
+	// [backend.StreamsWrites] report a streaming write over a backend that buffers.
+	if backend.StreamsWrites(b) {
+		return &instrumentedStreamBackend{instrumentedBackend: i}
+	}
+
+	return i
+}
+
+// instrumentedStreamBackend is [instrumentedBackend] over a backend that streams object writes.
+type instrumentedStreamBackend struct {
+	*instrumentedBackend
+}
+
+var _ backend.ObjectCreator = (*instrumentedStreamBackend)(nil)
+
+// CreateObject forwards the incremental write, metering the object once it commits — the point at
+// which its bytes become an object, and the only point at which their total is known.
+func (b *instrumentedStreamBackend) CreateObject(ctx context.Context, key string) (backend.ObjectWriter, error) {
+	w, err := backend.CreateObject(ctx, b.inner, key)
+	if err != nil {
+		return nil, err
+	}
+
+	return &instrumentedObjectWriter{ObjectWriter: w, b: b.instrumentedBackend, key: key}, nil
+}
+
+// instrumentedObjectWriter records a streamed object as one write of its total bytes.
+type instrumentedObjectWriter struct {
+	backend.ObjectWriter
+
+	b       *instrumentedBackend
+	key     string
+	written int64
+}
+
+func (w *instrumentedObjectWriter) Write(p []byte) (int, error) {
+	n, err := w.ObjectWriter.Write(p)
+	w.written += int64(n)
+
+	return n, err
+}
+
+func (w *instrumentedObjectWriter) Commit(ctx context.Context) error {
+	start := time.Now()
+	err := w.ObjectWriter.Commit(ctx)
+	w.b.m.Record(ctx, "write", result(err), time.Since(start), w.written)
+	zctx.From(ctx).Debug("backend write",
+		zap.String("key", w.key), zap.Int64("bytes", w.written), zap.Bool("streamed", true),
+		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
+
+	return err
 }
 
 func (b *instrumentedBackend) IsEphemeral() bool { return b.inner.IsEphemeral() }
+
+// FreeSpace forwards the [backend.SpaceReporter] capability, unmetered — it is a statfs, not an
+// object operation. Without it a metered backend would hide the disk from the merge cap and every
+// merge would fall back to the ceiling.
+func (b *instrumentedBackend) FreeSpace(ctx context.Context) (int64, error) {
+	return backend.FreeSpace(ctx, b.inner)
+}
 
 func (b *instrumentedBackend) Read(ctx context.Context, key string) ([]byte, error) {
 	start := time.Now()

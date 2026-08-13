@@ -44,6 +44,19 @@ conformance suite all of them pass under `-race`.
   tenant's parts without a full `List`. Fuzzed + golden-tested.
 - **`backend.Sizer`** — optional `Size(ctx,key)` for byte accounting without reading (used by
   `PartsDetailed`); `backend.SizeOf` falls back to a full read.
+- **`backend.ObjectCreator`** — optional `CreateObject(ctx,key) → ObjectWriter`, an object built
+  incrementally: `Write` appends, `Commit` publishes atomically (nothing is visible under the key
+  before it), `Abort` discards and is a no-op after a commit. `file` implements it with the same
+  temp+fsync+rename it writes whole objects with, so the bytes reach the filesystem as they are
+  produced; `Memory` and `s3` do not, and `backend.CreateObject` buffers into a single `Write` for
+  them, so callers stream unconditionally. Several writers may target one key — that is how a
+  part's rival codecs race, only the winner committing. It exists for the one object class far
+  larger than the writer wants resident: a merged part's column (`block/ARCH.md`, "Two writers").
+  `backend.StreamsWrites(b)` answers whether the fallback would be taken, which is a *sizing*
+  question — the merge cap stops pricing part size against memory when it would not be
+  (`engine/ARCH.md`). **A wrapper must forward it**, and must not claim it over an inner backend
+  that lacks it: `Cached` returns a second type that carries `CreateObject` only in that case,
+  rather than a method that would always answer yes.
 - **`backend.SpaceReporter`** — optional `FreeSpace(ctx)`, implemented by `file` (statfs, and
   reporting the *unprivileged* figure so the root reserve is never counted as usable). The merge
   engine sizes its output parts against it instead of a constant, so part size tracks the disk the

@@ -73,6 +73,12 @@ const (
 	// recorded purely so the merge engine can tell a part already at the target level from one below
 	// it, the fixed point of the graduated compression ladder.
 	flagLevel byte = 1 << 4
+	// flagFooter marks a framed column whose directory sits at the END of the object, after the
+	// frames, with a fixed 4-byte little-endian directory length closing it. It is what lets a writer
+	// hand each compression frame to the backend as it seals instead of holding the whole column:
+	// with the directory leading, no byte of the object is final until the last frame is. Decode is
+	// otherwise identical — same directory fields, same frames. Meaningful only with flagFramed.
+	flagFooter byte = 1 << 5
 )
 
 // ErrCorrupt is returned when a manifest (or any part metadata) fails to parse:
@@ -117,6 +123,11 @@ type ColumnDesc struct {
 	// Persisted via [flagFramed]; clear on the older one-block-per-granule layout, which is still
 	// read. Set by the writer on every blocked column it produces.
 	Framed bool
+
+	// Footer marks a framed column whose directory trails the frames instead of leading them, the
+	// layout a streaming writer emits (see [flagFooter]). Persisted via [flagFooter]; clear on a
+	// column written whole, which keeps the directory-first layout byte for byte.
+	Footer bool
 
 	// Level is the compression level the column's data was written at (0 ⇒ the algorithm default, or
 	// no compression). Persisted only when non-zero, via [flagLevel]. Decode ignores it; the merge
@@ -193,6 +204,10 @@ func (m Manifest) Encode(dst []byte) []byte {
 
 		if c.Framed {
 			flags |= flagFramed
+		}
+
+		if c.Footer {
+			flags |= flagFooter
 		}
 
 		if c.Level != 0 {
@@ -379,6 +394,7 @@ func decodeColumnDesc(r *bitstream.Reader) (ColumnDesc, error) {
 	c.Const = flags&flagConst != 0
 	c.Blocked = flags&flagBlocked != 0
 	c.Framed = flags&flagFramed != 0
+	c.Footer = flags&flagFooter != 0
 
 	if flags&flagLossy != 0 {
 		bits, err := r.ReadByte()

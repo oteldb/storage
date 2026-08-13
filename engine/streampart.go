@@ -26,9 +26,10 @@ const (
 //
 // Rows must arrive in the part's sort order, one whole series per appendSeries call.
 type partStreamWriter struct {
-	e   *Engine
-	w   *block.StreamWriter
-	seq int
+	e      *Engine
+	w      *block.StreamWriter
+	seq    int
+	prefix string
 
 	// runs is the series column's run-length form: one entry per series, feeding both the id column
 	// and the series-index sidecar.
@@ -54,8 +55,13 @@ type partStreamWriter struct {
 // chosen per merge, see mergeEncoding — because a streamed column cannot be re-encoded once the
 // part is under way. withSF declares the weight column, dropped again at finish if every weight
 // turned out to be 1.
+//
+// ctx spans the part, not just its construction: the writer hands each sealed compression frame to
+// the backend as it is produced, so the part's size is bounded by the disk it lands on rather than
+// by the memory this process can spare for it. A writer that will not reach finish must be released
+// with abort.
 func newPartStreamWriter(
-	e *Engine, seq int, comp compressProfile, precisionBits uint8, withSF, withStats bool,
+	ctx context.Context, e *Engine, seq int, comp compressProfile, precisionBits uint8, withSF, withStats bool,
 ) (*partStreamWriter, error) {
 	blockRows := e.cfg.MetricBlockRows
 	if blockRows <= 0 {
@@ -67,7 +73,8 @@ func newPartStreamWriter(
 		opts = append(opts, block.WithCompression(comp.Algorithm), block.WithCompressionLevel(comp.Level))
 	}
 
-	w := block.NewStreamWriter(opts...)
+	prefix := e.partPrefix(seq)
+	w := block.NewStreamWriterTo(ctx, e.cfg.Backend, prefix, opts...)
 
 	if err := w.AddColumn(block.Column{Name: colSeries, Kind: block.KindInt128}); err != nil {
 		return nil, err
@@ -95,7 +102,7 @@ func newPartStreamWriter(
 		}
 	}
 
-	return &partStreamWriter{e: e, w: w, seq: seq, withSF: withSF, withStats: withStats}, nil
+	return &partStreamWriter{e: e, w: w, seq: seq, prefix: prefix, withSF: withSF, withStats: withStats}, nil
 }
 
 // appendSeries appends one series' samples; a nil sf means every weight is 1.
@@ -149,6 +156,28 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 
 func (p *partStreamWriter) encodedBytes() int64 { return p.w.EncodedBytes() }
 
+// residentBytes is what the part holds in RAM: the block writer's buffers plus the sidecars this
+// type accumulates, which are O(distinct series) rather than O(rows). Once the column frames stream
+// out, the sidecars are what is left — and a merge of very short series can hold more of them per
+// encoded byte than a merge of long ones, so they are the term worth sealing on.
+func (p *partStreamWriter) residentBytes() int64 {
+	const (
+		runBytes = 24 // chunk.U128Run
+		idBytes  = 16 // chunk.U128
+		aggBytes = 32 // SeriesAgg
+	)
+
+	total := p.w.ResidentBytes() + int64(cap(p.runs))*runBytes
+	total += int64(cap(p.statsIDs))*idBytes + int64(cap(p.stats))*aggBytes
+	total += int64(cap(p.ones)) * 8
+
+	return total
+}
+
+// abort releases the part's in-flight column objects, so an abandoned merge leaves no half-written
+// object behind. Idempotent, and a no-op once the part has been written.
+func (p *partStreamWriter) abort() { p.w.Abort() }
+
 // weights materializes the unit vector for an unsampled series, so a declared weight column stays
 // aligned with the other columns.
 func (p *partStreamWriter) weights(sf []float64, n int) []float64 {
@@ -182,7 +211,7 @@ func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 		return nil, errors.New("engine: finishing a merge output part with no rows")
 	}
 
-	prefix := p.e.partPrefix(p.seq)
+	prefix := p.prefix
 
 	if err := block.WriteStreamPart(ctx, p.e.cfg.Backend, prefix, p.w); err != nil {
 		return nil, errors.Wrapf(err, "write part %q", prefix)

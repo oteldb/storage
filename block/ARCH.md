@@ -47,6 +47,12 @@ decodable on its own. Decode granularity stays `WithGranuleSize`; compression gr
 frame. Reads decompress one frame at a time and cache it (`blockStreams`), so any walk in granule
 order — whole column, row range, block set, cursor — decompresses each frame exactly once.
 
+A framed column's directory normally *leads* its frames. `flagFooter` marks the one case it trails
+them, closed by a fixed 4-byte little-endian directory length so a reader finds its start from the
+object's end. The directory fields are identical either way; only where they sit differs. It exists
+because with the directory leading, no byte of the object is final until the last frame seals — which
+is exactly what a writer streaming its output to the backend cannot accept.
+
 The frame-packed directory is marked `flagFramed`; the older one-compressed-block-per-granule
 layout has `flagBlocked` without it and is still read, so parts written before framing need no
 rewrite. The writer only emits the framed form.
@@ -60,12 +66,29 @@ granule of raw rows per column is ever resident, so the writer's working set is 
 rather than its uncompressed rows. Output is byte-identical to `PartWriter`'s from the same rows,
 tested case-by-case and by fuzz.
 
-**The encoded part is still fully resident**, and `build` then serializes each column's frames into
-one buffer, so the writer's peak is about twice the part it is producing. Streaming bounds a merge by
-its *output* size instead of its input size; it does not make output size free. That is why the merge
-cap is bounded by memory and not by free space alone (`engine/ARCH.md`), and why `blockAccum.finish`
-allocates its buffer at the exact final size and releases each frame as it copies it — a growing
-buffer would hold a second copy of a hundreds-of-MiB column.
+`NewStreamWriter` still holds **the whole encoded part**, and `build` then serializes each column's
+frames into one buffer, so its peak is about twice the part it is producing — which made part size a
+memory question rather than a disk one (`blockAccum.finish` therefore allocates at the exact final
+size and releases each frame as it copies it; a growing buffer would hold a second copy of a
+hundreds-of-MiB column).
+
+`NewStreamWriterTo(ctx, b, prefix, …)` removes that: each column opens a `backend.ObjectWriter` and
+hands over every frame as it seals, so what stays resident is one unsealed frame per column plus the
+block directory — two ints per frame and one per granule, kilobytes against a column of hundreds of
+MiB. Those columns carry `flagFooter`, since a streamed directory cannot lead the frames it
+describes. Two consequences worth stating:
+
+- **A column cannot stream from its first granule.** A column that turns out constant collapses into
+  the manifest and has *no* object, and an object cannot be un-created once bytes are on their way.
+  So a column buffers until the rows prove it non-constant — which is monotone (two differing values
+  can never become one) and, for real data, the second row. Constant data is also where buffering
+  costs least: a run of one value is what these codecs compress hardest.
+- **`AutoCodec` opens two writers over one key.** Both candidates stream; the denser commits and the
+  loser aborts, so the choice is still made over the whole column rather than a prefix. The backend
+  seam is what makes this affordable — the loser's bytes were never in RAM either.
+
+`StreamWriter.ResidentBytes()` reports the footprint directly, so a caller bounded by memory rather
+than by disk seals on the thing it is actually bounded by (`engine/ARCH.md`).
 
 Only encodings that restart per granule can stream, which is the same property block framing needs:
 blocked `Int64`/`Float64`, plus `Int128` whose RLE codec is fed runs directly and never materializes

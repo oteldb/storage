@@ -195,7 +195,7 @@ func TestFramePackingDirectory(t *testing.T) {
 		_, obj, err := buildColumn(c, noneComp(), blockRows, tc.compressBytes)
 		require.NoError(t, err)
 
-		dir, err := parseBlockDir(obj, true)
+		dir, err := parseBlockDir(obj, true, false)
 		require.NoError(t, err)
 
 		assert.Equal(t, granules, dir.nBlocks(), "decode granularity is independent of the frame size")
@@ -328,7 +328,7 @@ func TestFramePackingHighlyCompressible(t *testing.T) {
 	desc, obj, err := buildColumn(c, zstdComp(), blockRows, defaultCompressBlockBytes)
 	require.NoError(t, err)
 
-	dir, err := parseBlockDir(obj, true)
+	dir, err := parseBlockDir(obj, true, false)
 	require.NoError(t, err)
 	require.Greater(t, int(dir.gLen[0])*dir.nBlocks(), len(obj), "the test needs streams larger than the object")
 

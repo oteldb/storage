@@ -823,7 +823,7 @@ func (r *ColumnReader) float64Decoder() func([]float64, []byte) ([]float64, int,
 
 // blockDir parses the column's block directory, selecting the layout the descriptor records.
 func (r *ColumnReader) blockDir() (blockDir, error) {
-	return parseBlockDir(r.object, r.desc.Framed)
+	return parseBlockDir(r.object, r.desc.Framed, r.desc.Footer)
 }
 
 // stream decompresses the column's block frame into its raw codec stream.

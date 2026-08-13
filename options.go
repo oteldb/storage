@@ -87,13 +87,15 @@ type Options struct {
 	// whole budget is admitted alone (it cannot be bounded below its own footprint).
 	DecodeMemoryBytes int64
 
-	// MergeMemoryBytes caps how much memory all concurrent merges together may hold as output
-	// buffers, and through that how large a merged part may grow: a merge buffers its output part
-	// *encoded* in RAM until it is sealed, so part size and merge memory are the same number. Free
-	// space cannot bound it — a small process over a large volume would size parts it cannot hold —
-	// so this is what keeps compaction inside the memory budget. Zero ⇒ a share of GOMEMLIMIT (a
-	// fixed default when the process declares no limit); negative ⇒ unbounded, for an embedder that
-	// bounds merge memory itself.
+	// MergeMemoryBytes caps how much memory all concurrent merges together may hold. What that
+	// bounds depends on the backend: one that takes objects whole makes a merge buffer its output
+	// part *encoded* in RAM until it is sealed, so part size and merge memory are the same number and
+	// free space cannot bound it — a small process over a large volume would size parts it cannot
+	// hold. A backend that builds objects incrementally (the file backend) is handed each column as
+	// it is encoded, so the disk sizes the part and this bounds only the per-series state the merge
+	// still holds. Either way it is what keeps compaction inside the memory budget. Zero ⇒ a share of
+	// GOMEMLIMIT (a fixed default when the process declares no limit); negative ⇒ unbounded, for an
+	// embedder that bounds merge memory itself.
 	MergeMemoryBytes int64
 
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each metric

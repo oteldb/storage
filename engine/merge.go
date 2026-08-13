@@ -317,11 +317,20 @@ func (e *Engine) compactStream(
 
 	scratch := make([]rangeBuf, len(src))
 	comp, precision, withSF := mergeEncoding(src, capBytes, opts)
+	memBytes := e.mergeMemoryBudgetBytes()
 
 	var (
 		newParts []*part
 		cur      *partStreamWriter
 	)
+
+	// A part under way holds column objects the backend has not published yet; leaving on any path
+	// but emit must release them rather than strand them.
+	defer func() {
+		if cur != nil {
+			cur.abort()
+		}
+	}()
 
 	emit := func() error {
 		if cur == nil {
@@ -355,7 +364,7 @@ func (e *Engine) compactStream(
 
 		if cur == nil {
 			if cur, err = newPartStreamWriter(
-				e, e.reserveSeq(), comp, precision, withSF, e.cfg.AggregateStats,
+				ctx, e, e.reserveSeq(), comp, precision, withSF, e.cfg.AggregateStats,
 			); err != nil {
 				return nil, err
 			}
@@ -369,7 +378,11 @@ func (e *Engine) compactStream(
 		// bytes-per-row, is what makes the cap comparable to the free space it comes from. A series
 		// overshooting the cap is split at the next series boundary — parts are independent, and
 		// the read seam merges a series spanning two.
-		if capBytes > 0 && cur.encodedBytes() >= capBytes {
+		//
+		// The second bound is the part's resident footprint, which is not a function of its size on
+		// disk: the per-series sidecars grow with distinct series, so a merge of very short series
+		// reaches the memory budget long before the disk cap.
+		if (capBytes > 0 && cur.encodedBytes() >= capBytes) || cur.residentBytes() >= memBytes {
 			if err := emit(); err != nil {
 				return nil, err
 			}

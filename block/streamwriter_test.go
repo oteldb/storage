@@ -134,18 +134,18 @@ func gen(nSeries, samplesPer int, value func(rng *rand.Rand, s, i int) float64, 
 	return m
 }
 
-// TestStreamWriterMatchesPartWriter is the invariant the engine's merge relies on: streaming a
-// part's rows in produces the same part as handing the whole columns to [PartWriter]. With an
-// explicit codec the objects must be byte-identical; the layouts, marks and manifest must match
-// in every case.
-func TestStreamWriterMatchesPartWriter(t *testing.T) {
-	t.Parallel()
+// metricCase is one corpus the writers are compared over.
+type metricCase struct {
+	name  string
+	rows  metricRows
+	gsize int
+}
 
-	cases := []struct {
-		name  string
-		rows  metricRows
-		gsize int
-	}{
+// metricCases spans the shapes the granule packing and the codec choice turn on: empty, sub-granule,
+// granule-aligned, series spanning granules, constant, and the float values the decimal codec cannot
+// represent.
+func metricCases() []metricCase {
+	return []metricCase{
 		{"empty", metricRows{}, 4},
 		{"single row", gen(1, 1, func(*rand.Rand, int, int) float64 { return 1.5 }, 1), 4},
 		{"one series many granules", gen(1, 100, func(r *rand.Rand, _, _ int) float64 { return r.Float64() }, 2), 8},
@@ -173,6 +173,16 @@ func TestStreamWriterMatchesPartWriter(t *testing.T) {
 			return float64(i)
 		}, 10), 4},
 	}
+}
+
+// TestStreamWriterMatchesPartWriter is the invariant the engine's merge relies on: streaming a
+// part's rows in produces the same part as handing the whole columns to [PartWriter]. With an
+// explicit codec the objects must be byte-identical; the layouts, marks and manifest must match
+// in every case.
+func TestStreamWriterMatchesPartWriter(t *testing.T) {
+	t.Parallel()
+
+	cases := metricCases()
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
