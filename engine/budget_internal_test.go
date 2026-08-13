@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,11 +15,11 @@ func TestDecodeBudgetBlocksAndReleases(t *testing.T) {
 	t.Parallel()
 
 	b := NewDecodeBudget(100)
-	b.acquire(60) // used = 60
+	b.acquire(context.Background(), 60) // used = 60
 
 	done := make(chan struct{})
 	go func() {
-		b.acquire(60) // 60+60 > 100 with used>0 ⇒ blocks
+		b.acquire(context.Background(), 60) // 60+60 > 100 with used>0 ⇒ blocks
 		close(done)
 	}()
 
@@ -48,7 +49,7 @@ func TestDecodeBudgetOverBudgetAdmittedAlone(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		b.acquire(500) // 500 > 100 but used == 0 ⇒ admitted
+		b.acquire(context.Background(), 500) // 500 > 100 but used == 0 ⇒ admitted
 		b.release(500)
 		close(done)
 	}()
@@ -66,11 +67,11 @@ func TestDecodeBudgetDisabled(t *testing.T) {
 
 	var nilBudget *DecodeBudget
 
-	nilBudget.acquire(1 << 40)
+	nilBudget.acquire(context.Background(), 1<<40)
 	nilBudget.release(1 << 40)
 
 	zero := NewDecodeBudget(0)
-	zero.acquire(1 << 40)
+	zero.acquire(context.Background(), 1<<40)
 	zero.release(1 << 40)
 
 	assert.Zero(t, zero.used)
@@ -92,7 +93,7 @@ func TestDecodeBudgetConcurrentBounded(t *testing.T) {
 	for range workers {
 		go func() {
 			for range each {
-				b.acquire(40) // 40 ≤ limit; at most two fit at once
+				b.acquire(context.Background(), 40) // 40 ≤ limit; at most two fit at once
 				b.mu.Lock()
 				if b.used > limit {
 					over.Store(true)

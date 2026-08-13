@@ -69,7 +69,11 @@ func (e *Engine) AggregateRange(ctx context.Context, r fetch.Request) (map[signa
 	ctx, span := e.startAggregateSpan(ctx, "engine.aggregateRange")
 	defer span.End()
 
-	ids, plan := e.planAggregate(r)
+	ids, plan, err := e.planAggregate(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+
 	defer plan.releaseParts()
 	defer func() { span.SetAttributes(samplesDecodedAttr(plan)) }()
 
@@ -109,8 +113,8 @@ func (e *Engine) AggregateRange(ctx context.Context, r fetch.Request) (map[signa
 // owns the read lock's whole lifetime: the label index sorts lazily on the first read after a write,
 // so it holds the shared lock and, while the index is still unsorted, upgrades to sort and re-checks
 // — once it holds the read lock over a sorted index no writer can be running. The caller must
-// releaseParts.
-func (e *Engine) planAggregate(r fetch.Request) ([]signal.SeriesID, *enginePlan) {
+// releaseParts, unless it returned an error (the plan is released here).
+func (e *Engine) planAggregate(ctx context.Context, r fetch.Request) ([]signal.SeriesID, *enginePlan, error) {
 	e.mu.RLock()
 	for !e.head.indexSorted() {
 		e.mu.RUnlock()
@@ -124,9 +128,13 @@ func (e *Engine) planAggregate(r fetch.Request) ([]signal.SeriesID, *enginePlan)
 	plan := e.planFetch(ids, r)
 	e.mu.RUnlock()
 
-	plan.acquireDecodeBudget(r.Scope, colNeed{values: true})
+	if err := plan.acquireDecodeBudget(ctx, r, colNeed{values: true}); err != nil {
+		plan.releaseParts()
 
-	return ids, plan
+		return nil, nil, err
+	}
+
+	return ids, plan, nil
 }
 
 // BucketAgg is one step-aligned bucket's aggregate for a series: the bucket's start timestamp and
@@ -151,7 +159,11 @@ func (e *Engine) AggregateStep(ctx context.Context, r fetch.Request, step int64)
 	ctx, span := e.startAggregateSpan(ctx, "engine.aggregateStep")
 	defer span.End()
 
-	ids, plan := e.planAggregate(r)
+	ids, plan, err := e.planAggregate(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+
 	defer plan.releaseParts()
 	defer func() { span.SetAttributes(samplesDecodedAttr(plan)) }()
 
@@ -191,7 +203,11 @@ func (e *Engine) AggregateStepNamed(ctx context.Context, r fetch.Request, step i
 	ctx, span := e.startAggregateSpan(ctx, "engine.aggregateStepNamed")
 	defer span.End()
 
-	ids, plan := e.planAggregate(r)
+	ids, plan, err := e.planAggregate(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+
 	defer plan.releaseParts()
 	defer func() { span.SetAttributes(samplesDecodedAttr(plan)) }()
 

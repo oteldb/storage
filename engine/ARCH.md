@@ -314,7 +314,23 @@ Layered optimizations, each opt-in:
     under it. Its first read blocks as usual; while it still holds, later reads sharing the scope
     are charged **without queueing**. Accounting stays exact — only the waiting is skipped — so
     such a query may overshoot the ceiling by its own later estimates, the same latitude a single
-    over-budget read already has. A nil scope is unchanged.
+    over-budget read already has. A nil scope is unchanged; `fetch.WithScope` installs one on the
+    request context for a call path that cannot thread it through every `Request`.
+  - A scope is an optimization, never a correctness requirement: the library cannot verify "one
+    fetch at a time", so **the wait itself is bounded twice** and a missing scope costs latency and
+    memory, never liveness.
+    - **Cancellable.** Admission takes the fetch's `ctx`; a done context aborts the wait with an
+      error and reserves nothing, so a query deadline or a client disconnect always recovers the
+      goroutine (an unscoped hold-and-wait degrades to one failed query, not a wedged engine).
+      Consequently `Engine.Fetch`/`Count`/`Aggregate*` can fail before reading anything, and the
+      plan is released on that path.
+    - **Force-admitted.** A waiter that sits for `DefaultDecodeBudgetForceAfter` as the queue head
+      without the budget draining is admitted over the ceiling, counted
+      (`storage.fetch.decode_budget_forced_admissions`) and logged. The ceiling is already soft
+      (admit-alone), so trading an RSS overshoot for liveness is the same trade.
+    - Waiters queue **FIFO** with hand-off admission (the releaser reserves on the waiter's behalf
+      before waking it): a cancellable waiter must not have to hand a turn back, and a barging
+      arrival must not starve a large query. `used == 0` is still an unconditional admit.
 - **Recent tier** (`Config.RecentWindow`) — mirrors the most recent flush window in RAM across
   flushes, so a query inside the window acquires **no part at all**; overlap with the part is
   deduped by the freshest-wins timestamp merge.

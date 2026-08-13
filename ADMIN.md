@@ -114,6 +114,7 @@ Metric instruments (all prefixed `storage.`):
 | `flush.total` / `flush.duration` / `flush.rows` | `signal` | head flushes |
 | `merge.total` / `merge.duration` / `merge.parts_in` | `signal` | background merges |
 | `fetch.total` / `fetch.duration` / `fetch.series_matched` / `fetch.rows_returned` / `fetch.parts_scanned` | `signal` | reads; the metric engine's reads are streaming, so these are recorded when the iterator is **closed** — `duration` covers the whole iteration (the consumer's own per-batch work included) and `rows_returned` counts what was actually consumed |
+| `fetch.decode_budget_forced_admissions` | `signal` | queries admitted **over** the decode-memory ceiling after their wait stalled (see below); a non-zero rate means the ceiling is not holding |
 | `backend.ops` / `backend.bytes` / `backend.latency` | `op`(, `result`) | ops: read/write/list/delete/cas/size; results: ok/not_found/error |
 | `rpc.attempts` / `rpc.retries` / `rpc.hedges` | `op` | cluster RPCs |
 | `wal.appends` / `wal.fsyncs` / `wal.rotations` | — | WAL activity |
@@ -121,6 +122,15 @@ Metric instruments (all prefixed `storage.`):
 Tracing emits coarse spans (`engine.flush`, `engine.merge`, `engine.fetch`, backend ops, cluster
 RPCs) with W3C trace-context propagation across the cluster transport. Logs are context-plumbed via
 `go-faster/sdk/zctx` (trace-correlated); admission shed events log at Warn only when rejections occur.
+
+**Decode-budget forced admissions.** `Options.DecodeMemoryBytes` caps in-flight decoded bytes; a
+query reserves its estimate before reading parts and blocks while it does not fit. That wait is
+bounded on purpose: it ends on the query's context, and a waiter that is the queue head for
+`engine.DefaultDecodeBudgetForceAfter` without the budget draining is admitted anyway — logged at
+Warn (with the estimate, the in-flight bytes and whether the read carried a `fetch.Scope`) and
+counted here. A steady rate means either the budget is undersized for the query mix, or an embedder
+holds several iterators open per query without passing a `fetch.Scope` — the latter shows up as
+`scoped=false` in the log line.
 
 #### Aggregate read spans
 

@@ -435,7 +435,14 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 	// Reserve this fetch's decode footprint from the memory budget (blocks under concurrency
 	// pressure), off the engine lock, before any part is decoded. A fetch materializes ts+value.
-	plan.acquireDecodeBudget(r.Scope, colNeed{values: true})
+	if err := plan.acquireDecodeBudget(ctx, r, colNeed{values: true}); err != nil {
+		plan.releaseParts()
+		span.RecordError(err)
+		span.End()
+		pf.End()
+
+		return nil, err
+	}
 
 	// Prefetch: decode the parts this fetch will touch concurrently (and cache them), so their
 	// backend reads + decodes overlap instead of happening one part at a time during the merge.
@@ -587,14 +594,41 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 // decode-memory budget, blocking until it fits (or admitting it alone when it exceeds the whole
 // budget). It must run off the engine lock and after planFetch (it needs liveParts); releaseParts
 // returns the reservation. A nil budget makes it a no-op.
-func (p *enginePlan) acquireDecodeBudget(scope *fetch.Scope, need colNeed) {
+//
+// It fails when ctx ends first, holding nothing: the caller must releaseParts and abandon the
+// query. Nothing else aborts the wait — a wait that outlasts the budget's force interval is
+// admitted over the ceiling instead (counted, and logged here with the estimate that overshot it).
+func (p *enginePlan) acquireDecodeBudget(ctx context.Context, r fetch.Request, need colNeed) error {
 	if p.engine.budget == nil {
-		return
+		return nil
+	}
+
+	scope := r.Scope
+	if scope == nil {
+		scope = fetch.ScopeFrom(ctx)
 	}
 
 	p.budgetBytes = p.decodeEstimate(need)
 	p.budgetScope = scope
-	p.engine.budget.acquireFor(scope, p.budgetBytes)
+
+	forced, err := p.engine.budget.acquireFor(ctx, scope, p.budgetBytes)
+	if err != nil {
+		// Nothing was reserved; make releaseParts a no-op on the budget rather than a double release.
+		p.budgetBytes, p.budgetScope = 0, nil
+
+		return err
+	}
+
+	if forced {
+		p.engine.cfg.Obs.Fetch.ForcedAdmission(ctx, metricSignal)
+		zctx.From(ctx).Warn("decode budget forced admission: waited past the force interval with no progress",
+			zap.Int64("estimate_bytes", p.budgetBytes),
+			zap.Int64("in_flight_bytes", p.engine.budget.inFlight()),
+			zap.Bool("scoped", scope != nil),
+		)
+	}
+
+	return nil
 }
 
 // decodeEstimate is the bytes this query will materialize across the parts it touches: the full ts

@@ -20,7 +20,11 @@ import (
 // and mid-flush windows are scanned in memory. A series counts if any source holds an
 // in-window sample. Series with no sample in the window are omitted.
 func (e *Engine) Count(ctx context.Context, r fetch.Request) (int, error) {
-	ids, plan := e.planCount(r, false)
+	ids, plan, err := e.planCount(ctx, r, false)
+	if err != nil {
+		return 0, err
+	}
+
 	defer plan.releaseParts()
 
 	active, err := plan.activeFlags(ctx, ids, e)
@@ -53,7 +57,11 @@ func (e *Engine) Count(ctx context.Context, r fetch.Request) (int, error) {
 // without the label group under "" (indistinguishable from an explicit empty-text value, matching
 // PromQL's absent-label grouping). Groups whose every series is empty in the window are omitted.
 func (e *Engine) CountBy(ctx context.Context, r fetch.Request, label []byte) (map[string]int, error) {
-	ids, plan := e.planCount(r, true)
+	ids, plan, err := e.planCount(ctx, r, true)
+	if err != nil {
+		return nil, err
+	}
+
 	defer plan.releaseParts()
 
 	active, err := plan.activeFlags(ctx, ids, e)
@@ -86,14 +94,18 @@ func (e *Engine) CountBy(ctx context.Context, r fetch.Request, label []byte) (ma
 // read: in-memory existence flags are computed under the lock (no per-series batch copies), the
 // identity slab is snapshotted only when the caller groups by it (withIdentity, for CountBy), the
 // decode budget reserves timestamps only, and only window-edge parts ever decode. The caller must
-// releaseParts.
-func (e *Engine) planCount(r fetch.Request, withIdentity bool) ([]signal.SeriesID, *enginePlan) {
+// releaseParts, unless it returned an error (the plan is released here).
+func (e *Engine) planCount(ctx context.Context, r fetch.Request, withIdentity bool) ([]signal.SeriesID, *enginePlan, error) {
 	ids, plan := e.planLookup(r, withIdentity)
 
 	// Count decodes timestamps only (existence), and only for window-edge parts; reserve that.
-	plan.acquireDecodeBudget(r.Scope, colNeed{})
+	if err := plan.acquireDecodeBudget(ctx, r, colNeed{}); err != nil {
+		plan.releaseParts()
 
-	return ids, plan
+		return nil, nil, err
+	}
+
+	return ids, plan, nil
 }
 
 // planLookup resolves r's matched ids under the read lock and builds the existence plan over them.

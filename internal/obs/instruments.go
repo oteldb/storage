@@ -97,6 +97,14 @@ type Fetch struct {
 	series       metric.Int64Histogram
 	rows         metric.Int64Histogram
 	partsScanned metric.Int64Counter
+	budgetForced metric.Int64Counter
+}
+
+// ForcedAdmission accounts one query admitted over the decode-memory ceiling because its wait made
+// no progress. It is a liveness escape, so a non-zero rate means the budget is oversubscribed (or a
+// caller holds several unscoped reads open) and the ceiling is not holding.
+func (f *Fetch) ForcedAdmission(ctx context.Context, sig string) {
+	f.budgetForced.Add(ctx, 1, sigAttr(sig))
 }
 
 // Record accounts one fetch (matched `series` series, scanned `partsScanned` parts, returned
@@ -224,6 +232,8 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 		series:       b.i64hist("storage.fetch.series_matched", "series matched per fetch", "{series}"),
 		rows:         b.i64hist("storage.fetch.rows_returned", "rows returned per fetch", "{row}"),
 		partsScanned: b.counter("storage.fetch.parts_scanned", "parts scanned across fetches", "{part}"),
+		budgetForced: b.counter("storage.fetch.decode_budget_forced_admissions",
+			"queries admitted over the decode-memory ceiling after a stalled wait", "{admission}"),
 	}
 
 	return flush, merge, fetch, b.err
