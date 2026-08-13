@@ -102,7 +102,10 @@ tree that grafts a peer's subtree across the cluster read RPC.
 The two transports leaving the process (cluster RPC, S3) retry with per-attempt timeouts and
 jittered backoff; **idempotent reads hedge** across replicas, **writes stay at-most-once**
 (retried only when the request provably never reached the server, never hedged).
-`reliability.RetryConfig` is the public knob (`Default`, `LossyEnvironment`).
+`reliability.RetryConfig` is the public knob (`Default`, `LossyEnvironment`). A shard read is
+routed to a **holder**, not to a ring owner: an owner that has no data for the shard answers
+`cluster.ErrShardAbsent`, which fails over to an owner that does, so a ring/data disagreement never
+degrades into a silently partial result.
 
 ---
 

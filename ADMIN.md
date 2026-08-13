@@ -117,6 +117,7 @@ Metric instruments (all prefixed `storage.`):
 | `fetch.decode_budget_forced_admissions` | `signal` | queries admitted **over** the decode-memory ceiling after their wait stalled (see below); a non-zero rate means the ceiling is not holding |
 | `backend.ops` / `backend.bytes` / `backend.latency` | `op`(, `result`) | ops: read/write/list/delete/cas/size; results: ok/not_found/error |
 | `rpc.attempts` / `rpc.retries` / `rpc.hedges` | `op` | cluster RPCs |
+| `rpc.shard_absent` | `op` | shard reads that failed over because an owner holds no data for the shard (a rebalance backfill that has not caught up, or a lagging membership view); a sustained rate means the ring and the data disagree |
 | `wal.appends` / `wal.fsyncs` / `wal.rotations` | — | WAL activity |
 
 Tracing emits coarse spans (`engine.flush`, `engine.merge`, `engine.fetch`, backend ops, cluster

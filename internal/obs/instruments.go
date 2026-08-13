@@ -148,6 +148,7 @@ type RPC struct {
 	attempts metric.Int64Counter
 	retries  metric.Int64Counter
 	hedges   metric.Int64Counter
+	absent   metric.Int64Counter
 }
 
 func opAttr(op string) metric.MeasurementOption {
@@ -160,6 +161,11 @@ func (r *RPC) Attempt(ctx context.Context, op string) { r.attempts.Add(ctx, 1, o
 // Retry accounts one sequential retry for op.
 func (r *RPC) Retry(ctx context.Context, op string) { r.retries.Add(ctx, 1, opAttr(op)) }
 
+// ShardAbsent accounts one read of a shard this node is a ring owner of but holds no data for, so
+// the read failed over to another owner instead of answering empty. A sustained rate means the ring
+// and the data disagree — a rebalance whose backfill has not caught up, or a lagging membership view.
+func (r *RPC) ShardAbsent(ctx context.Context, op string) { r.absent.Add(ctx, 1, opAttr(op)) }
+
 // Hedge accounts one hedged (opportunistic concurrent) attempt for op.
 func (r *RPC) Hedge(ctx context.Context, op string) { r.hedges.Add(ctx, 1, opAttr(op)) }
 
@@ -169,6 +175,7 @@ func newRPC(m metric.Meter) (*RPC, error) {
 		attempts: b.counter("storage.rpc.attempts", "cluster RPC attempts (incl. first)", "{attempt}"),
 		retries:  b.counter("storage.rpc.retries", "cluster RPC sequential retries", "{retry}"),
 		hedges:   b.counter("storage.rpc.hedges", "cluster RPC hedged (concurrent) attempts", "{hedge}"),
+		absent:   b.counter("storage.rpc.shard_absent", "shard reads failed over because the owner holds no data", "{read}"),
 	}
 
 	return r, b.err

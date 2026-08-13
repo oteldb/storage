@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -145,4 +146,62 @@ func TestRemoteFetcherOverHTTP(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.True(t, want[0].Series.Equal(got[0].Series))
 	assert.Equal(t, want[0].Timestamps, got[0].Timestamps)
+}
+
+// TestShardAbsentOverHTTP: a peer that holds no data for the shard says so distinguishably — the
+// caller gets ErrShardAbsent (to fail over with) rather than an empty, successful result (#305).
+func TestShardAbsentOverHTTP(t *testing.T) {
+	t.Parallel()
+
+	absentFn := func(context.Context, string, int64, int64, []fetch.Matcher) ([]*fetch.Batch, error) {
+		return nil, cluster.ErrShardAbsent
+	}
+	brokenFn := func(context.Context, string, int64, int64, []fetch.Matcher) ([]*fetch.Batch, error) {
+		return nil, errors.New("engine exploded")
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle(cluster.ReadPath, cluster.ReadHandler(absentFn, brokenFn, absentFn, absentFn))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	_, err := cluster.NewRemoteFetcher(signal.Metric, addr, nil).Fetch(context.Background(), fetch.Request{Tenant: "acme"})
+	require.ErrorIs(t, err, cluster.ErrShardAbsent)
+
+	_, err = cluster.NewRemoteFetcher(signal.Log, addr, nil).Fetch(context.Background(), fetch.Request{Tenant: "acme"})
+	require.Error(t, err)
+	require.NotErrorIs(t, err, cluster.ErrShardAbsent, "a real failure is not an absent shard")
+}
+
+// TestEnumShardAbsentOverHTTP is [TestShardAbsentOverHTTP] for the enumeration RPCs, which share one
+// response path.
+func TestEnumShardAbsentOverHTTP(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(
+		func(context.Context, signal.Signal, string, int64, int64, []fetch.Matcher) ([]signal.Series, error) {
+			return nil, cluster.ErrShardAbsent
+		}))
+	mux.Handle(cluster.KeysPath, cluster.KeysHandler(
+		func(context.Context, signal.Signal, string, int64, int64) ([]cluster.KeyInfo, error) {
+			return nil, cluster.ErrShardAbsent
+		}))
+	mux.Handle(cluster.SidePath, cluster.SideHandler(
+		func(context.Context, string) (map[string][]byte, error) { return nil, cluster.ErrShardAbsent }))
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	ctx := context.Background()
+
+	_, err := cluster.FetchSeries(ctx, nil, addr, signal.Log, "acme", 0, 0, nil)
+	require.ErrorIs(t, err, cluster.ErrShardAbsent)
+
+	_, err = cluster.FetchKeys(ctx, nil, addr, signal.Log, "acme", 0, 0)
+	require.ErrorIs(t, err, cluster.ErrShardAbsent)
+
+	_, err = cluster.FetchSide(ctx, nil, addr, signal.Profile, "acme")
+	require.ErrorIs(t, err, cluster.ErrShardAbsent)
 }

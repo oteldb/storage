@@ -421,7 +421,7 @@ func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc) http.Handler {
 
 		batches, err := fn(ctx, tenant, start, end, matchers)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeRPCError(w, err)
 
 			return
 		}
@@ -506,7 +506,7 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Itera
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.Errorf("cluster: %q fetch returned %d: %s", f.addr, resp.StatusCode, bytes.TrimSpace(body))
+		return nil, statusError(f.addr, "fetch", resp.StatusCode, body)
 	}
 
 	if wantProfile {

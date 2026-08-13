@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/reliability"
@@ -268,4 +269,57 @@ func TestClusterProfileEnumSurvivesDownOwner(t *testing.T) {
 	stacks, _ := got[0].Column(profile.ColStackID)
 	frames := resolver.Resolve(stacks.Bytes[0])
 	require.NotEmpty(t, frames, "stack resolved via the hedged symbol-store fetch")
+}
+
+// TestHedgedFetcherFailsOverFromAbsentShard: an owner that holds no data for the shard is a
+// failover, not an answer — the owner that does hold it wins (#305).
+func TestHedgedFetcherFailsOverFromAbsentShard(t *testing.T) {
+	t.Parallel()
+
+	absent := &fakeFetcher{id: 1, err: cluster.ErrShardAbsent}
+	holder := &fakeFetcher{id: 2}
+	s := hedgeTestStore(reliability.RetryConfig{HedgeDelay: time.Hour, PerTryTimeout: 5 * time.Second, MaxAttempts: 2})
+
+	h := hedgedFetcher{store: s, op: "read", remotes: []fetch.Fetcher{absent, holder}}
+
+	it, err := h.Fetch(context.Background(), fetch.Request{})
+	assert.Equal(t, uint64(2), wonByID(t, it, err))
+}
+
+// TestHedgedFetcherAllOwnersAbsent: when every owner disclaims the shard it genuinely has no data,
+// so the read is an empty success rather than an error.
+func TestHedgedFetcherAllOwnersAbsent(t *testing.T) {
+	t.Parallel()
+
+	a := &fakeFetcher{id: 1, err: cluster.ErrShardAbsent}
+	b := &fakeFetcher{id: 2, err: cluster.ErrShardAbsent}
+	s := hedgeTestStore(reliability.RetryConfig{HedgeDelay: 10 * time.Millisecond, PerTryTimeout: time.Second, MaxAttempts: 2})
+
+	h := hedgedFetcher{store: s, op: "read", remotes: []fetch.Fetcher{a, b}}
+
+	it, err := h.Fetch(context.Background(), fetch.Request{})
+	require.NoError(t, err)
+
+	batches, err := fetch.Drain(context.Background(), it)
+	require.NoError(t, err)
+	assert.Empty(t, batches)
+}
+
+// TestHedgedFetcherSingleAbsentOwnerNotRetried: a lone owner's "I don't hold this shard" is final,
+// so it is not retried (and still reads as empty, not as an error).
+func TestHedgedFetcherSingleAbsentOwnerNotRetried(t *testing.T) {
+	t.Parallel()
+
+	absent := &fakeFetcher{id: 1, err: cluster.ErrShardAbsent}
+	s := hedgeTestStore(reliability.RetryConfig{MaxAttempts: 3, PerTryTimeout: time.Second})
+
+	h := hedgedFetcher{store: s, op: "read", remotes: []fetch.Fetcher{absent}}
+
+	it, err := h.Fetch(context.Background(), fetch.Request{})
+	require.NoError(t, err)
+
+	batches, err := fetch.Drain(context.Background(), it)
+	require.NoError(t, err)
+	assert.Empty(t, batches)
+	assert.Equal(t, int32(1), absent.calls.Load(), "an absent owner is asked once")
 }
