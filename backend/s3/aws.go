@@ -3,6 +3,7 @@ package s3
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -54,6 +55,39 @@ func (s *awsStore) GetObject(ctx context.Context, key string) ([]byte, error) {
 	data, err := io.ReadAll(out.Body)
 	if err != nil {
 		return nil, errors.Wrapf(err, "read body %q", key)
+	}
+
+	return data, nil
+}
+
+// GetObjectRange fetches the object's [off, off+n) bytes with an HTTP Range header. S3 answers a
+// range starting past the object's end with 416, which under the clamping contract is an empty
+// result rather than an error. Implements [RangeObjectStore].
+func (s *awsStore) GetObjectRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	if n == 0 {
+		return []byte{}, nil
+	}
+
+	// HTTP byte ranges are inclusive on both ends, and the server clamps the upper bound to the
+	// object, so asking past the end is how a caller takes a trailer without knowing the size.
+	rng := fmt.Sprintf("bytes=%d-%d", off, off+n-1)
+
+	out, err := s.api.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key, Range: &rng})
+	if err != nil {
+		switch {
+		case isNotFound(err):
+			return nil, errors.Wrapf(ErrObjectNotFound, "get %q", key)
+		case isRangeNotSatisfiable(err):
+			return []byte{}, nil
+		default:
+			return nil, errors.Wrapf(err, "get %q range %s", key, rng)
+		}
+	}
+	defer func() { _ = out.Body.Close() }()
+
+	data, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, errors.Wrapf(err, "read body %q range %s", key, rng)
 	}
 
 	return data, nil
@@ -136,6 +170,17 @@ func isNotFound(err error) bool {
 		case "NoSuchKey", "NotFound":
 			return true
 		}
+	}
+
+	return false
+}
+
+// isRangeNotSatisfiable reports whether err is a 416 — a range starting at or past the object's
+// end, which the clamping contract treats as "no bytes there", not as a failure.
+func isRangeNotSatisfiable(err error) bool {
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		return ae.ErrorCode() == "InvalidRange" || ae.ErrorCode() == "RequestedRangeNotSatisfiable"
 	}
 
 	return false

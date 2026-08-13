@@ -19,9 +19,10 @@ import (
 // so whole-object Read/Write is sufficient and gives per-object write atomicity.
 // All methods are safe for concurrent use.
 //
-// Ranged/streaming reads are deliberately not part of this interface: a part column is
-// read whole, and the multi-key layout already gives projection pushdown (read only the
-// referenced column objects) without ranged reads.
+// Ranged reads are not part of this interface, but they are available as the optional
+// [ReaderAt] capability: the multi-key layout gives projection pushdown (read only the
+// referenced column objects), and [ReaderAt] gives the pushdown *within* a column that keeps a
+// query touching a few granules from paying for the whole thing.
 //
 // [Backend.PutIfAbsent] is the conditional-write primitive (added in M5) on which atomic
 // manifest / block-list commits build: a versioned manifest key is written only if no
@@ -204,6 +205,21 @@ func (m *memoryBackend) List(_ context.Context, prefix string) ([]string, error)
 	slices.Sort(keys)
 
 	return keys, nil
+}
+
+// ReadAt returns a copy of the stored value's [off, off+n) range, clamped to its end. Implemented
+// so a caller taking a small slice of a large object does not clone the object to get it — the same
+// reason the durable backends range. Implements [ReaderAt].
+func (m *memoryBackend) ReadAt(_ context.Context, key string, off, n int64) ([]byte, error) {
+	m.mu.RLock()
+	v, ok := m.objects[key]
+	m.mu.RUnlock()
+
+	if !ok {
+		return nil, errors.Wrapf(ErrNotExist, "read %q", key)
+	}
+
+	return slices.Clone(clampRange(v, off, n)), nil
 }
 
 func (m *memoryBackend) Size(_ context.Context, key string) (int64, error) {

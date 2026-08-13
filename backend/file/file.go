@@ -158,6 +158,46 @@ func (f *File) Read(_ context.Context, key string) ([]byte, error) {
 	return data, nil
 }
 
+// ReadAt returns the object's [off, off+n) range, clamped to its end, with one pread — the file
+// backend never maps a part column into memory to hand back a slice of it. Implements
+// [backend.ReaderAt].
+func (f *File) ReadAt(_ context.Context, key string, off, n int64) ([]byte, error) {
+	p, err := f.path(key)
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := os.Open(p) //nolint:gosec // p is validated by f.path to stay within root
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, errors.Wrapf(backend.ErrNotExist, "read %q", key)
+		}
+
+		return nil, errors.Wrapf(err, "open %q", key)
+	}
+	defer func() { _ = file.Close() }()
+
+	// Sized against the file so a clamped request allocates what it can actually return, not what it
+	// asked for: callers take an object's trailer by asking for more than may be there.
+	fi, err := file.Stat()
+	if err != nil {
+		return nil, errors.Wrapf(err, "stat %q", key)
+	}
+
+	if off >= fi.Size() {
+		return []byte{}, nil
+	}
+
+	buf := make([]byte, min(n, fi.Size()-off))
+
+	// ReadAt reports io.EOF only on a short read, which the size bound above already rules out.
+	if _, err := file.ReadAt(buf, off); err != nil {
+		return nil, errors.Wrapf(err, "read %q at [%d,+%d)", key, off, len(buf))
+	}
+
+	return buf, nil
+}
+
 // Size returns the byte size of the object stored under key (os.Stat, no read), or an
 // [backend.ErrNotExist]-wrapping error if absent. It implements [backend.Sizer].
 func (f *File) Size(_ context.Context, key string) (int64, error) {

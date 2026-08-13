@@ -242,6 +242,114 @@ func Run(t *testing.T, factory func(t *testing.T) backend.Backend) {
 	})
 
 	runObjectWriter(t, ctx, factory)
+	runReadAt(t, ctx, factory)
+}
+
+// runReadAt covers the ranged-read seam ([backend.ReadAt]). Like the writer suite it runs over every
+// backend, native implementation and whole-object fallback alike: callers range unconditionally, so
+// the two must be indistinguishable.
+func runReadAt(t *testing.T, ctx context.Context, factory func(t *testing.T) backend.Backend) {
+	t.Helper()
+
+	const value = "0123456789"
+
+	t.Run("ReadAtRanges", func(t *testing.T) {
+		b := factory(t)
+		require.NoError(t, b.Write(ctx, "r/a", []byte(value)))
+
+		cases := []struct {
+			name   string
+			off, n int64
+			want   string
+		}{
+			{"whole object", 0, 10, value},
+			{"prefix", 0, 3, "012"},
+			{"middle", 4, 3, "456"},
+			{"suffix", 7, 3, "789"},
+			{"single byte", 5, 1, "5"},
+			{"zero length", 4, 0, ""},
+			// Clamping is the contract that lets a reader take a trailer in one round trip, without
+			// first learning the object's size.
+			{"past the end is clamped", 8, 100, "89"},
+			{"the whole object is clamped", 0, 1 << 20, value},
+			{"starting at the end is empty", 10, 5, ""},
+			{"starting past the end is empty", 50, 5, ""},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := backend.ReadAt(ctx, b, "r/a", tc.off, tc.n)
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, string(got))
+			})
+		}
+	})
+
+	t.Run("ReadAtMissing", func(t *testing.T) {
+		b := factory(t)
+
+		_, err := backend.ReadAt(ctx, b, "r/nope", 0, 4)
+		assert.ErrorIs(t, err, backend.ErrNotExist)
+	})
+
+	t.Run("ReadAtEmptyObject", func(t *testing.T) {
+		b := factory(t)
+		require.NoError(t, b.Write(ctx, "r/empty", nil))
+
+		got, err := backend.ReadAt(ctx, b, "r/empty", 0, 4)
+		require.NoError(t, err, "a stored empty object is present, so a range of it is empty, not absent")
+		assert.Empty(t, got)
+	})
+
+	t.Run("ReadAtNegative", func(t *testing.T) {
+		b := factory(t)
+		require.NoError(t, b.Write(ctx, "r/a", []byte(value)))
+
+		_, err := backend.ReadAt(ctx, b, "r/a", -1, 4)
+		require.Error(t, err)
+
+		_, err = backend.ReadAt(ctx, b, "r/a", 0, -4)
+		require.Error(t, err)
+	})
+
+	// The result is the caller's: a backend that returned a view of shared state here would let one
+	// reader corrupt another's object.
+	t.Run("ReadAtReturnsIsolatedCopy", func(t *testing.T) {
+		b := factory(t)
+		require.NoError(t, b.Write(ctx, "r/a", []byte(value)))
+
+		got, err := backend.ReadAt(ctx, b, "r/a", 0, 4)
+		require.NoError(t, err)
+
+		for i := range got {
+			got[i] = 'x'
+		}
+
+		again, err := backend.ReadAt(ctx, b, "r/a", 0, 4)
+		require.NoError(t, err)
+		assert.Equal(t, "0123", string(again))
+
+		whole, err := b.Read(ctx, "r/a")
+		require.NoError(t, err)
+		assert.Equal(t, value, string(whole))
+	})
+
+	t.Run("ReadAtLargeObject", func(t *testing.T) {
+		b := factory(t)
+
+		want := make([]byte, 1<<20)
+		for i := range want {
+			want[i] = byte(i)
+		}
+
+		require.NoError(t, b.Write(ctx, "r/big", want))
+
+		const off, n = 700 << 10, 64 << 10
+
+		got, err := backend.ReadAt(ctx, b, "r/big", off, n)
+		require.NoError(t, err)
+		assert.Equal(t, want[off:off+n], got)
+	})
 }
 
 // runObjectWriter covers the incremental-write seam ([backend.CreateObject]). It runs over every

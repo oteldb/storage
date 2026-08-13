@@ -3,6 +3,7 @@ package s3_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"slices"
 	"strconv"
@@ -44,7 +45,30 @@ func (f *fakeAWS) GetObject(_ context.Context, in *awss3.GetObjectInput, _ ...fu
 		return nil, apiErr("NoSuchKey")
 	}
 
+	if in.Range != nil {
+		var err error
+		if v, err = sliceRange(v, *in.Range); err != nil {
+			return nil, err
+		}
+	}
+
 	return &awss3.GetObjectOutput{Body: io.NopCloser(bytes.NewReader(clone(v)))}, nil
+}
+
+// sliceRange models S3's handling of an inclusive "bytes=lo-hi" header: the upper bound is clamped
+// to the object, and a lower bound at or past its end is a 416. Without it the fake would answer
+// every ranged GET with the whole object and the adapter's range arithmetic would go untested.
+func sliceRange(v []byte, header string) ([]byte, error) {
+	var lo, hi int64
+	if _, err := fmt.Sscanf(header, "bytes=%d-%d", &lo, &hi); err != nil {
+		return nil, apiErr("InvalidArgument")
+	}
+
+	if lo >= int64(len(v)) {
+		return nil, apiErr("InvalidRange")
+	}
+
+	return v[lo:min(hi+1, int64(len(v)))], nil
 }
 
 func (f *fakeAWS) PutObject(_ context.Context, in *awss3.PutObjectInput, _ ...func(*awss3.Options)) (*awss3.PutObjectOutput, error) {

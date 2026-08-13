@@ -51,6 +51,15 @@ type ObjectStore interface {
 	ListObjects(ctx context.Context, prefix string) ([]string, error)
 }
 
+// RangeObjectStore is an optional [ObjectStore] capability: fetch a byte range of an object (S3's
+// Range header). [NewAWS]'s adapter implements it — every S3-compatible store does — so it is
+// optional only so that a fake ObjectStore need not.
+type RangeObjectStore interface {
+	// GetObjectRange returns the object's [off, off+n) bytes, clamped to its end. Absent keys error
+	// like [ObjectStore.GetObject].
+	GetObjectRange(ctx context.Context, key string, off, n int64) ([]byte, error)
+}
+
 // Backend is a [backend.Backend] over an [ObjectStore]. Keys are stored under an optional
 // root prefix so several datasets can share one bucket.
 type Backend struct {
@@ -107,6 +116,37 @@ func (b *Backend) Read(ctx context.Context, key string) ([]byte, error) {
 		}
 
 		return nil, errors.Wrapf(err, "read %q", key)
+	}
+
+	return data, nil
+}
+
+// ReadAt returns the object's [off, off+n) bytes with a ranged GET, so a reader taking one granule
+// of a part column does not transfer the column. A store that does not implement [RangeObjectStore]
+// falls back to fetching the object and slicing — correct, just not cheaper. Implements
+// [backend.ReaderAt].
+func (b *Backend) ReadAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	rs, ok := b.store.(RangeObjectStore)
+	if !ok {
+		data, err := b.Read(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+
+		if off >= int64(len(data)) {
+			return []byte{}, nil
+		}
+
+		return data[off:min(off+n, int64(len(data)))], nil
+	}
+
+	data, err := rs.GetObjectRange(ctx, b.key(key), off, n)
+	if err != nil {
+		if errors.Is(err, ErrObjectNotFound) {
+			return nil, errors.Wrapf(backend.ErrNotExist, "read %q", key)
+		}
+
+		return nil, errors.Wrapf(err, "read %q at [%d,+%d)", key, off, n)
 	}
 
 	return data, nil
