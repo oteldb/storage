@@ -89,6 +89,16 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 
 	selected := selectMergeParts(src, opts, capRows)
 	if len(selected) == 0 {
+		// A no-op is indistinguishable from a healthy engine without the shape of what it looked
+		// at: 59 parts sat uncompacted for hours logging only "nothing to compact". These are the
+		// exact inputs to that decision.
+		sealedN, tiers, largest := tierShape(src, capRows)
+		zctx.From(ctx).Debug("merge selected nothing",
+			zap.String("prefix", e.cfg.Prefix), zap.Int("parts", len(src)),
+			zap.Int("sealed", sealedN), zap.Int("cap_rows", capRows),
+			zap.Int("tiers", tiers), zap.Int("largest_tier_parts", largest),
+			zap.Int("min_tier_parts", minTierParts))
+
 		e.reclaimRetired(ctx)
 
 		return 0, nil
