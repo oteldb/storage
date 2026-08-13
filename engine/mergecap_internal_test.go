@@ -30,6 +30,20 @@ func (s spaceBackend) FreeSpace(context.Context) (int64, error) {
 	return s.free, nil
 }
 
+// streamBackend builds objects incrementally, so a merge over it does not hold its output part.
+// What it writes does not matter here — only that the capability is visible.
+type streamBackend struct {
+	backend.Backend
+
+	free int64
+}
+
+func (s streamBackend) FreeSpace(context.Context) (int64, error) { return s.free, nil }
+
+func (streamBackend) CreateObject(context.Context, string) (backend.ObjectWriter, error) {
+	return nil, errors.New("not used")
+}
+
 // concurrencyFunc adapts a fixed count to the config callback; 0 means unset.
 func concurrencyFunc(n int) func() int {
 	if n == 0 {
@@ -144,6 +158,24 @@ func TestMergeCapBytes(t *testing.T) {
 			want:    1 << 30,
 		},
 		{
+			// The whole point of #296: over a backend that takes the part incrementally, the writer
+			// no longer holds it, so the disk sizes the part again — half of 8 GiB, not the memory
+			// share (256 MiB) that would otherwise bind.
+			name:    "streaming writes leave the disk in charge",
+			ceiling: 1 << 40,
+			memory:  512 << 20,
+			backend: streamBackend{Backend: backend.Memory(), free: 8 << 30},
+			want:    4 << 30,
+		},
+		{
+			// Memory dropping out does not make the cap unbounded: the ceiling is still the last word.
+			name:    "streaming writes still respect the ceiling",
+			ceiling: 1 << 30,
+			memory:  512 << 20,
+			backend: streamBackend{Backend: backend.Memory(), free: 1 << 45},
+			want:    1 << 30,
+		},
+		{
 			name:    "a reporting error keeps the ceiling",
 			ceiling: 1 << 30,
 			backend: spaceBackend{Backend: backend.Memory(), err: errors.New("statfs failed")},
@@ -196,6 +228,30 @@ func TestMergeCapFitsThePodThatOOMed(t *testing.T) {
 		"the cap must fit the merge's share of the pod's memory, not the volume behind it")
 	assert.Less(t, capBytes, int64(podLimit),
 		"a part the pod cannot hold is what OOMKilled it")
+}
+
+// TestMergeCapRecoversTheVolumeWhenWritesStream is the incident's numbers again, over a backend that
+// builds objects incrementally: the part the pod could not hold is no longer held, so the 464 GiB
+// volume sizes it and the cap returns to the ceiling — the widening #286 asked for and the memory
+// bound had to take back.
+//
+//nolint:paralleltest // GOMEMLIMIT is process-wide, so this case cannot run alongside the others
+func TestMergeCapRecoversTheVolumeWhenWritesStream(t *testing.T) {
+	const podLimit = 3865470566
+
+	restore := debug.SetMemoryLimit(podLimit)
+	t.Cleanup(func() { debug.SetMemoryLimit(restore) })
+
+	e := New(Config{
+		Backend: streamBackend{Backend: backend.Memory(), free: 464 << 30},
+		Prefix:  "t",
+	})
+
+	capBytes := e.mergeCapBytes(context.Background())
+
+	assert.Equal(t, int64(defaultMergeCeilingBytes), capBytes)
+	assert.Greater(t, capBytes, memlimit.MergeShare(0, 1, mergeBufferAmplification),
+		"the cap must no longer be held down by memory the writer does not spend")
 }
 
 // TestMergeCapUsesRecordedPartSize pins the other half: sealing compares a part's recorded on-disk
