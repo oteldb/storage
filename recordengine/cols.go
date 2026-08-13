@@ -235,6 +235,25 @@ func (c *recordCols) byteSize() int64 {
 	return n
 }
 
+// rowBytes is row i's decoded footprint: the fixed-width cells plus the byte cells it holds. It is
+// what the flush and merge splits measure, so a part's byte cap means the bytes the part is made of
+// rather than a row count times an assumed record size.
+func (c *recordCols) rowBytes(i int) int64 {
+	n := int64(8)
+
+	for k := range c.ints {
+		if c.ints[k] != nil {
+			n += 8
+		}
+	}
+
+	for k := range c.bytes {
+		n += int64(len(c.bytes[k].at(i)))
+	}
+
+	return n
+}
+
 // appendRow appends row i of src's selected columns (ts always). Byte cells are copied into c's
 // blob (they no longer alias src). src must populate at least c's selected columns.
 func (c *recordCols) appendRow(src *recordCols, i int) {

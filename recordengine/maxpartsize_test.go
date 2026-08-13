@@ -46,7 +46,7 @@ func TestMaxPartSizeSplitsFlush(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	e := splitEngine(t, 4<<10) // ~4 rows per part
+	e := splitEngine(t, 256) // a few rows per part, measured in the bytes they hold
 
 	const n = 20
 	recs := splitRecs(n)
@@ -100,7 +100,7 @@ func TestMaxPartSizeSplitPartsPrune(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	e := splitEngine(t, 4<<10)
+	e := splitEngine(t, 256)
 
 	const n = 20
 	recs := splitRecs(n)

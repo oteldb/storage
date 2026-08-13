@@ -151,12 +151,12 @@ func TestManifestTruncationSweep(t *testing.T) {
 
 		got, err := DecodeManifest(truncated)
 		if err == nil {
-			// DiskBytes is a trailing optional field, so the one prefix that drops exactly it is a
-			// valid manifest in the older layout — that is what makes the field readable both ways.
-			// Every other prefix must be rejected.
+			// DiskBytes and RawBytes are trailing optional fields, so the prefixes that drop
+			// exactly them are valid manifests in the older layouts — that is what makes the fields
+			// readable both ways. Every other prefix must be rejected.
 			want := sampleManifest()
-			want.DiskBytes = 0
-			require.Equalf(t, want, got, "prefix len %d decoded, so it must be the manifest without DiskBytes", n)
+			want.DiskBytes, want.RawBytes = 0, 0
+			require.Equalf(t, want, got, "prefix len %d decoded, so it must be an older-layout manifest", n)
 
 			continue
 		}
@@ -206,7 +206,7 @@ func TestManifestGolden(t *testing.T) {
 		}},
 	}
 
-	const golden = "4f54504d0102c801900380400102747300010000c8019003001536e671"
+	const golden = "4f54504d0102c801900380400102747300010000c80190030000d19bb2b9"
 	assert.Equal(t, golden, hex.EncodeToString(m.Encode(nil)))
 
 	// And it must round-trip from the golden bytes.
@@ -225,6 +225,23 @@ func TestManifestGolden(t *testing.T) {
 	got, err = DecodeManifest(raw)
 	require.NoError(t, err)
 	assert.Equal(t, m, got, "an older manifest reads identically, with DiskBytes zero")
+
+	// The generation between the two: DiskBytes present, RawBytes not yet.
+	const beforeRawBytes = "4f54504d0102c801900380400102747300010000c8019003001536e671"
+
+	raw, err = hex.DecodeString(beforeRawBytes)
+	require.NoError(t, err)
+	got, err = DecodeManifest(raw)
+	require.NoError(t, err)
+	assert.Equal(t, m, got, "a manifest predating RawBytes reads identically, with RawBytes zero")
+
+	// Both trailing sizes round-trip when set.
+	sized := m
+	sized.DiskBytes, sized.RawBytes = 4096, 65536
+
+	got, err = DecodeManifest(sized.Encode(nil))
+	require.NoError(t, err)
+	assert.Equal(t, sized, got)
 }
 
 func TestKindString(t *testing.T) {

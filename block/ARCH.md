@@ -57,9 +57,15 @@ rewrite. The writer only emits the framed form.
 part incrementally: the schema is declared up front, rows arrive through `AppendInt64` /
 `AppendFloat64` / `AppendU128Run`, and each column encodes a granule as soon as one fills. Only one
 granule of raw rows per column is ever resident, so the writer's working set is the *encoded* part
-rather than its uncompressed rows — which is what lets the merge engine write parts far larger than
-its memory budget (see `engine/ARCH.md`). Output is byte-identical to `PartWriter`'s from the same
-rows, tested case-by-case and by fuzz.
+rather than its uncompressed rows. Output is byte-identical to `PartWriter`'s from the same rows,
+tested case-by-case and by fuzz.
+
+**The encoded part is still fully resident**, and `build` then serializes each column's frames into
+one buffer, so the writer's peak is about twice the part it is producing. Streaming bounds a merge by
+its *output* size instead of its input size; it does not make output size free. That is why the merge
+cap is bounded by memory and not by free space alone (`engine/ARCH.md`), and why `blockAccum.finish`
+allocates its buffer at the exact final size and releases each frame as it copies it — a growing
+buffer would hold a second copy of a hundreds-of-MiB column.
 
 Only encodings that restart per granule can stream, which is the same property block framing needs:
 blocked `Int64`/`Float64`, plus `Int128` whose RLE codec is fed runs directly and never materializes
@@ -82,10 +88,13 @@ Two things the batch writer settles by looking at a finished column, a streaming
 ## Manifest & marks
 
 - **Manifest** — versioned binary record (magic `OTPM`, row count, time range, granule size,
-  per-column descriptors, then `DiskBytes` — the encoded size of the part's column and marks
-  objects, which is what the merge engine's size cap is denominated in) + trailing CRC32C.
-  `DiskBytes` is written *after* the columns and read optionally, so a manifest without it decodes
-  as 0 and an older reader ignores it: additive, no version bump, matching the flag-bit precedent. A descriptor is `[name][kind][codec][compress][flags]`,
+  per-column descriptors, then the two sizes) + trailing CRC32C. `DiskBytes` is the encoded size of
+  the part's column and marks objects; `RawBytes` is its **decoded** footprint, the bytes its values
+  occupy in memory. Both exist because a merge is bounded by both and the ratio between them is the
+  compression ratio, which varies per column and per dataset: the metric merge seals on bytes it
+  writes, the record merge on bytes it holds. Each is written *after* the columns and read
+  optionally, so a manifest without them decodes as 0 and an older reader ignores them: additive, no
+  version bump, matching the flag-bit precedent. A descriptor is `[name][kind][codec][compress][flags]`,
   then a `FloatPrecisionBits` byte **only when `flagLossy` is set** and a compression-level byte
   **only when `flagLevel` is set** (decode-irrelevant — it exists so the merge engine can tell a part
   already at its target level from one below it), then per-kind stats/const. The

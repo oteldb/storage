@@ -51,6 +51,15 @@ type Config struct {
 	// re-materialize the whole dataset every cycle. 0 ⇒ unlimited (merge everything into one part;
 	// the legacy behavior, unbounded working set). The facade resolves it from the tenant policy.
 	MaxPartBytes int64
+	// MergeMemoryBytes is how much memory all concurrent merges together may hold. A merge holds its
+	// selected sources decoded plus the output buffer it is filling, so this bounds the merge cap
+	// (see mergecap.go) independently of MaxPartBytes — a tiering target sized for the disk must not
+	// size a working set the process cannot hold. 0 ⇒ a share of the process memory budget
+	// (GOMEMLIMIT, else the cgroup limit, else host memory); negative ⇒ unbounded.
+	MergeMemoryBytes int64
+	// MergeConcurrency reports how many merges may run concurrently in this process, dividing the
+	// merge memory allowance so they cannot collectively exceed it. nil or ≤ 1 ⇒ no division.
+	MergeConcurrency func() int
 	// MergeCompression block-compresses the columns of merged (compacted) parts on top of their chunk
 	// codecs — the cold, long-lived data. Flushed parts stay codec-only so ingest is cheap; the
 	// background merge is where recompression is amortized. Record byte columns are dict-coded but not
@@ -1086,13 +1095,13 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	// read-only here: a concurrent fetch still reads them through e.flushing until the part publishes.
 	f := buildFlushColumns(e.cfg.Schema, detached, e.flushBuf)
 	e.flushBuf = f // reused by the next flush; only this single flusher touches it
-	rows := len(f.stream)
+	rows := f.len()
 
 	// Split the flushed rows into parts of at most MaxPartBytes (a single part when unlimited), so a
 	// long flush interval or a large head cannot produce one oversized part — which would distort the
 	// size-tiered selection (sealing on arrival, or pairing into a ~2× cap merge input) and unbound
 	// the merge working set that tiering exists to keep at O(part size).
-	ranges := chunkRanges(rows, maxRowsPerPart(e.cfg.MaxPartBytes))
+	ranges := byteRanges(f, e.cfg.MaxPartBytes)
 
 	newParts := make([]*part, 0, len(ranges))
 

@@ -150,7 +150,7 @@ func TestMaintainAppliesSizeRetentionToLogs(t *testing.T) {
 
 	s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
 		return tenant.Policy{
-			Limits:    tenant.Limits{MaxPartSize: 10 << 10}, // ~10 records per part
+			Limits:    tenant.Limits{MaxPartSize: 512}, // a handful of records per part
 			Retention: tenant.Retention{MaxBytes: budget.Load()},
 		}
 	})))

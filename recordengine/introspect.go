@@ -17,6 +17,12 @@ type PartStat struct {
 	MaxTime int64
 	Series  int   // distinct streams in the part (len of its row-range index)
 	Rows    int64 // total records (sum of the per-stream row spans)
+	// SizeBytes is the part's *decoded* footprint as recorded in its manifest — what the merge cap
+	// compares against, and so what explains why a part is or is not sealed. It needs no I/O. Unlike
+	// the metric engine's [engine.PartStat.SizeBytes], which is a size on disk, this is the size in
+	// memory: the record merge is bounded by what it holds, not by what it writes. 0 for a part
+	// written before the manifest recorded it (the row estimate then stands in internally).
+	SizeBytes int64
 }
 
 // PartDetailStat augments [PartStat] with fields that need a backend read: the on-backend byte size
@@ -66,6 +72,18 @@ func (p *part) rows() int64 {
 	return n
 }
 
+// sizeBytes is the part's decoded footprint, as recorded in its manifest: what holding its columns
+// costs a merge, which is the currency the merge cap and the size tiers are denominated in. Records
+// are variable-width, so a part written before the manifest carried the figure falls back to the
+// per-row model — the estimate the exact number replaces.
+func (p *part) sizeBytes() int64 {
+	if p.rawBytes > 0 {
+		return p.rawBytes
+	}
+
+	return p.rows() * recordRowBytes
+}
+
 // Parts returns an in-memory snapshot of the engine's flushed parts under a read lock — no backend
 // I/O and no decode, safe to poll. For byte sizes, codecs, and chunk counts, use [Engine.PartsDetailed].
 func (e *Engine) Parts() []PartStat {
@@ -76,7 +94,7 @@ func (e *Engine) Parts() []PartStat {
 	for _, p := range e.parts {
 		out = append(out, PartStat{
 			ID: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
-			Series: len(p.ranges), Rows: p.rows(),
+			Series: len(p.ranges), Rows: p.rows(), SizeBytes: p.rawBytes,
 		})
 	}
 
@@ -125,7 +143,7 @@ func (e *Engine) PartsDetailed(ctx context.Context) ([]PartDetailStat, error) {
 		out = append(out, PartDetailStat{
 			PartStat: PartStat{
 				ID: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
-				Series: len(p.ranges), Rows: p.rows(),
+				Series: len(p.ranges), Rows: p.rows(), SizeBytes: p.rawBytes,
 			},
 			Bytes:   bytes,
 			Chunks:  granuleCount(man.RowCount, man.GranuleSize),

@@ -165,6 +165,7 @@ func (w *StreamWriter) AppendU128Run(i int, v chunk.U128, count int) error {
 
 	c.runs = append(c.runs, chunk.U128Run{Value: v, Count: count})
 	c.rows += count
+	c.raw += int64(count) * 16
 
 	return nil
 }
@@ -254,6 +255,12 @@ func (w *StreamWriter) build() (builtPart, error) {
 	encodedMarks := marks.Encode(nil)
 	m.DiskBytes = objectBytes(objects, encodedMarks)
 
+	// Only the columns the part keeps: an omitted const column contributes no decoded bytes to a
+	// reader of this part.
+	for _, c := range w.cols[:len(descs)] {
+		m.RawBytes += c.raw
+	}
+
 	return builtPart{objects: objects, marks: encodedMarks, manifest: m.Encode(nil)}, nil
 }
 
@@ -319,6 +326,9 @@ type streamColumn struct {
 	blocked bool
 
 	rows int
+	// raw is the decoded footprint of the rows appended so far, recorded in the manifest because a
+	// merge's working set is made of decoded bytes, not encoded ones.
+	raw int64
 	// encoded is the rows already packed into granules: the FirstRow of the next one.
 	encoded int
 
@@ -364,6 +374,7 @@ func (c *streamColumn) appendInt64(vals []int64, granuleSize int) error {
 
 	c.stageI64 = append(c.stageI64, vals...)
 	c.rows += len(vals)
+	c.raw += int64(len(vals)) * 8
 
 	// Drain by offset and compact once: a batch spanning many granules must not re-copy the staging
 	// buffer per granule.
@@ -404,6 +415,7 @@ func (c *streamColumn) appendFloat64(vals []float64, granuleSize int) error {
 
 	c.stageF64 = append(c.stageF64, vals...)
 	c.rows += len(vals)
+	c.raw += int64(len(vals)) * 8
 
 	off := 0
 	for len(c.stageF64)-off >= granuleSize {
@@ -674,22 +686,31 @@ func (a *blockAccum) seal() {
 func (a *blockAccum) finish(blockRows int) []byte {
 	a.seal()
 
-	dst := binary.AppendUvarint(nil, uint64(len(a.gLens)))
-	dst = binary.AppendUvarint(dst, uint64(blockRows))
-	dst = binary.AppendUvarint(dst, uint64(len(a.frames)))
+	dir := binary.AppendUvarint(nil, uint64(len(a.gLens)))
+	dir = binary.AppendUvarint(dir, uint64(blockRows))
+	dir = binary.AppendUvarint(dir, uint64(len(a.frames)))
 
 	for i, f := range a.frames {
-		dst = binary.AppendUvarint(dst, uint64(a.frameLens[i]))
-		dst = binary.AppendUvarint(dst, uint64(len(f)))
+		dir = binary.AppendUvarint(dir, uint64(a.frameLens[i]))
+		dir = binary.AppendUvarint(dir, uint64(len(f)))
 	}
 
 	for _, l := range a.gLens {
-		dst = binary.AppendUvarint(dst, uint64(l))
+		dir = binary.AppendUvarint(dir, uint64(l))
 	}
 
-	for _, f := range a.frames {
+	// Allocated to the exact final size and drained frame by frame. On a merged part's column this
+	// buffer is hundreds of MiB: appending into a growing one would transiently hold two copies of
+	// it, and keeping the frames alive past their copy a third.
+	dst := make([]byte, 0, len(dir)+a.bytes)
+	dst = append(dst, dir...)
+
+	for i, f := range a.frames {
 		dst = append(dst, f...)
+		a.frames[i] = nil
 	}
+
+	a.pending = nil
 
 	return dst
 }

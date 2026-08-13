@@ -178,6 +178,7 @@ func (w *PartWriter) build() (builtPart, error) {
 
 	encodedMarks := marks.Encode(nil)
 	m.DiskBytes = objectBytes(objects, encodedMarks)
+	m.RawBytes = rawBytes(w.columns)
 
 	return builtPart{objects: objects, marks: encodedMarks, manifest: m.Encode(nil)}, nil
 }

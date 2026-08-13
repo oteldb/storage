@@ -52,7 +52,8 @@ func TestMaxPartSizeUnlimitedSinglePart(t *testing.T) {
 
 // TestMergeCeilingSplitsMerge pins the merge cap, which is a size on disk and is configured
 // separately from the flush cap: a merge whose output exceeds it is kept split into bounded parts.
-// The memory backend cannot report free space, so the ceiling applies unmodified.
+// The memory backend cannot report free space, and the ceiling here is far under the memory bound,
+// so it is the ceiling that applies.
 func TestMergeCeilingSplitsMerge(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

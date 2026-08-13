@@ -35,6 +35,10 @@ type part struct {
 	// written, from the bucket index when reconstructed), for time pruning.
 	minTime, maxTime int64
 
+	// rawBytes is the part's decoded footprint per its manifest, 0 for a part written before the
+	// manifest carried one. See [part.sizeBytes].
+	rawBytes int64
+
 	// refs counts in-flight fetches reading this part lock-free. A fetch acquires (under the engine
 	// lock, while the part is still live) the parts it will read, releases them when done, and reads
 	// the backend objects between. A retired part (removed from the live set by flush/merge) is not
@@ -100,7 +104,10 @@ func openPart(ctx context.Context, b backend.Backend, schema *Schema, prefix str
 		return nil, err
 	}
 
-	return &part{schema: schema, reader: r, prefix: prefix, ranges: ranges, blooms: blooms, recordKeys: recordKeys}, nil
+	return &part{
+		schema: schema, reader: r, prefix: prefix, ranges: ranges,
+		blooms: blooms, recordKeys: recordKeys, rawBytes: r.Manifest().RawBytes,
+	}, nil
 }
 
 // holdsAny reports whether the part carries any of the requested streams.

@@ -87,6 +87,15 @@ type Options struct {
 	// whole budget is admitted alone (it cannot be bounded below its own footprint).
 	DecodeMemoryBytes int64
 
+	// MergeMemoryBytes caps how much memory all concurrent merges together may hold as output
+	// buffers, and through that how large a merged part may grow: a merge buffers its output part
+	// *encoded* in RAM until it is sealed, so part size and merge memory are the same number. Free
+	// space cannot bound it — a small process over a large volume would size parts it cannot hold —
+	// so this is what keeps compaction inside the memory budget. Zero ⇒ a share of GOMEMLIMIT (a
+	// fixed default when the process declares no limit); negative ⇒ unbounded, for an embedder that
+	// bounds merge memory itself.
+	MergeMemoryBytes int64
+
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each metric
 	// part, so [Storage.AggregateMetrics] answers a range-covering aggregate without decoding the
 	// value column — returning one number per series instead of every sample. It costs a little
@@ -284,6 +293,13 @@ func WithDecodeCache(maxBytes int64) Option {
 // [Options.DecodeMemoryBytes].
 func WithDecodeMemory(maxBytes int64) Option {
 	return func(o *Options) { o.DecodeMemoryBytes = maxBytes }
+}
+
+// WithMergeMemory caps the memory concurrent merges may hold as output buffers, and through that
+// the size a merged part grows to before it is sealed. Zero derives it from GOMEMLIMIT. See
+// [Options.MergeMemoryBytes].
+func WithMergeMemory(maxBytes int64) Option {
+	return func(o *Options) { o.MergeMemoryBytes = maxBytes }
 }
 
 // WithAggregateStats writes the per-series aggregate sidecar that lets [Storage.AggregateMetrics]
