@@ -674,22 +674,31 @@ func (a *blockAccum) seal() {
 func (a *blockAccum) finish(blockRows int) []byte {
 	a.seal()
 
-	dst := binary.AppendUvarint(nil, uint64(len(a.gLens)))
-	dst = binary.AppendUvarint(dst, uint64(blockRows))
-	dst = binary.AppendUvarint(dst, uint64(len(a.frames)))
+	dir := binary.AppendUvarint(nil, uint64(len(a.gLens)))
+	dir = binary.AppendUvarint(dir, uint64(blockRows))
+	dir = binary.AppendUvarint(dir, uint64(len(a.frames)))
 
 	for i, f := range a.frames {
-		dst = binary.AppendUvarint(dst, uint64(a.frameLens[i]))
-		dst = binary.AppendUvarint(dst, uint64(len(f)))
+		dir = binary.AppendUvarint(dir, uint64(a.frameLens[i]))
+		dir = binary.AppendUvarint(dir, uint64(len(f)))
 	}
 
 	for _, l := range a.gLens {
-		dst = binary.AppendUvarint(dst, uint64(l))
+		dir = binary.AppendUvarint(dir, uint64(l))
 	}
 
-	for _, f := range a.frames {
+	// Allocated to the exact final size and drained frame by frame. On a merged part's column this
+	// buffer is hundreds of MiB: appending into a growing one would transiently hold two copies of
+	// it, and keeping the frames alive past their copy a third.
+	dst := make([]byte, 0, len(dir)+a.bytes)
+	dst = append(dst, dir...)
+
+	for i, f := range a.frames {
 		dst = append(dst, f...)
+		a.frames[i] = nil
 	}
+
+	a.pending = nil
 
 	return dst
 }

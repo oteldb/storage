@@ -1098,6 +1098,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		// and the part count a query opens — tracks the deployment rather than a constant.
 		MergeCeilingBytes: limits.MaxMergePartSize,
 		MergeConcurrency:  s.mergeConcurrency,
+		MergeMemoryBytes:  s.opts.MergeMemoryBytes,
 	})
 	s.tenants[tid] = e
 

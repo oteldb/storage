@@ -125,8 +125,8 @@ Flush and merge are bounded separately, because they answer different questions.
 head. A merge splits at `mergeCapBytes`, a size **on disk**, measured against what the streaming
 writer has actually encoded (`mergecap.go`).
 
-That cap is derived from the backend's free space rather than held at a constant:
-`min(MergeCeilingBytes, free / MergeConcurrency / 2)`. A byte constant is correct at exactly one
+That cap is derived from the resources the merge actually consumes rather than held at a constant:
+`min(MergeCeilingBytes, free / MergeConcurrency / 2, mergeMemory / MergeConcurrency / 2)`. A byte constant is correct at exactly one
 deployment size — cardinality consumes a byte budget in *breadth*, so under a fixed cap the time
 span a part covers is inversely proportional to active series and a fixed-range query opens
 proportionally more parts as cardinality grows. Both references size against the storage instead
@@ -143,7 +143,20 @@ the constant this replaces, on the exact deployment shape the change is for.
 A backend that cannot report free space — `Memory`, object stores, where local free space has no
 meaning — keeps the ceiling, so every backend still works. A nearly full disk falls to
 `minMergeCapBytes` rather than sealing everything, since stranding the part count high is worst
-exactly when compaction matters most.
+exactly when compaction matters most. The floor applies to the *derived* bounds only: a ceiling
+configured below it is honored, since an embedder that sets one means it.
+
+**Memory bounds the cap independently of disk, and usually binds first.** `block.StreamWriter`
+streams the *inputs*, not the output: the encoded output part accumulates in RAM until it is sealed,
+and `build` then serializes it into one buffer per column, so a merge's peak resident is about twice
+the part it is writing. Free space says nothing about that — a 4 GiB pod over a 464 GiB volume
+derives a 232 GiB share, clamps it to the 16 GiB ceiling, and OOMs building the part. So the cap is
+also lowered by `MergeMemoryBytes / MergeConcurrency / 2`: the merge allowance divided across the
+merges that may run at once, halved for the serialize step. The allowance defaults to an eighth of
+the process's memory budget — `GOMEMLIMIT`, else the cgroup limit, else host memory
+(`internal/memlimit`) — leaving the rest to the head, the caches and the decode budget. Until the
+writer can spill a part to the backend incrementally, part size *is* merge memory, and no disk-derived
+figure may override that.
 
 Splitting at row boundaries is safe — parts are independent and a series spanning two is merged back
 by the read seam.

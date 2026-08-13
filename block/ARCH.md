@@ -57,9 +57,15 @@ rewrite. The writer only emits the framed form.
 part incrementally: the schema is declared up front, rows arrive through `AppendInt64` /
 `AppendFloat64` / `AppendU128Run`, and each column encodes a granule as soon as one fills. Only one
 granule of raw rows per column is ever resident, so the writer's working set is the *encoded* part
-rather than its uncompressed rows — which is what lets the merge engine write parts far larger than
-its memory budget (see `engine/ARCH.md`). Output is byte-identical to `PartWriter`'s from the same
-rows, tested case-by-case and by fuzz.
+rather than its uncompressed rows. Output is byte-identical to `PartWriter`'s from the same rows,
+tested case-by-case and by fuzz.
+
+**The encoded part is still fully resident**, and `build` then serializes each column's frames into
+one buffer, so the writer's peak is about twice the part it is producing. Streaming bounds a merge by
+its *output* size instead of its input size; it does not make output size free. That is why the merge
+cap is bounded by memory and not by free space alone (`engine/ARCH.md`), and why `blockAccum.finish`
+allocates its buffer at the exact final size and releases each frame as it copies it — a growing
+buffer would hold a second copy of a hundreds-of-MiB column.
 
 Only encodings that restart per granule can stream, which is the same property block framing needs:
 blocked `Int64`/`Float64`, plus `Int128` whose RLE codec is fed runs directly and never materializes
