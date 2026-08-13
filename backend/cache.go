@@ -190,6 +190,16 @@ func (c *cachedBackend) ReadAt(ctx context.Context, key string, off, n int64) ([
 	return ReadAt(ctx, c.inner, key, off, n)
 }
 
+// ReadViewAt is [cachedBackend.ReadAt] without the copy, under the [Viewer] contract: a resident
+// entry is never mutated in place, so a slice of one stays valid. Implements [ViewerAt].
+func (c *cachedBackend) ReadViewAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	if v, ok := c.values.GetIfPresent(key); ok {
+		return clampRange(v, off, n), nil
+	}
+
+	return ReadViewAt(ctx, c.inner, key, off, n)
+}
+
 func (c *cachedBackend) Write(ctx context.Context, key string, data []byte) error {
 	if err := c.inner.Write(ctx, key, data); err != nil {
 		return err

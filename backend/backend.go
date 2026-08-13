@@ -222,6 +222,20 @@ func (m *memoryBackend) ReadAt(_ context.Context, key string, off, n int64) ([]b
 	return slices.Clone(clampRange(v, off, n)), nil
 }
 
+// ReadViewAt returns the range as a view of the stored value, no copy — safe for the same reason
+// [memoryBackend.ReadView] is: stored values are immutable. Implements [ViewerAt].
+func (m *memoryBackend) ReadViewAt(_ context.Context, key string, off, n int64) ([]byte, error) {
+	m.mu.RLock()
+	v, ok := m.objects[key]
+	m.mu.RUnlock()
+
+	if !ok {
+		return nil, errors.Wrapf(ErrNotExist, "read %q", key)
+	}
+
+	return clampRange(v, off, n), nil
+}
+
 func (m *memoryBackend) Size(_ context.Context, key string) (int64, error) {
 	m.mu.RLock()
 	v, ok := m.objects[key]

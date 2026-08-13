@@ -48,6 +48,54 @@ func ReadAt(ctx context.Context, b Backend, key string, off, n int64) ([]byte, e
 	return clampRange(data, off, n), nil
 }
 
+// ViewerAt is [ReaderAt]'s no-copy counterpart, the ranged form of [Viewer]: it returns the range as
+// a **read-only view** that may alias shared state instead of a caller-owned copy. The same contract
+// applies — never mutate it, and it stays valid indefinitely because a stored value is never mutated
+// in place.
+//
+// Only a backend already holding the object in memory can offer it ([Memory], and the read cache
+// over a resident entry); file and s3 must materialize the bytes to return them, so for those
+// [ReadViewAt] falls through to [ReadAt].
+type ViewerAt interface {
+	// ReadViewAt returns key's [off, off+n) range as a read-only view, clamped like [ReadAt].
+	ReadViewAt(ctx context.Context, key string, off, n int64) ([]byte, error)
+}
+
+// ReadViewAt returns key's [off, off+n) range without a copy where the backend can manage one,
+// falling back to [ReadAt] and finally to slicing a whole-object read. Either way the caller must
+// treat the result as read-only — that is the contract that lets implementations skip the copy.
+//
+// It exists so that ranging does not cost the in-memory backend the zero-copy read it had when
+// callers took whole columns: a decompressor reads its input and never retains it, so a view is
+// exactly as safe there as it is for [ReadView].
+func ReadViewAt(ctx context.Context, b Backend, key string, off, n int64) ([]byte, error) {
+	if off < 0 || n < 0 {
+		return nil, errors.Errorf("backend: read %q at [%d,+%d): negative range", key, off, n)
+	}
+
+	switch v := b.(type) {
+	case ViewerAt:
+		return v.ReadViewAt(ctx, key, off, n)
+	case ReaderAt:
+		return v.ReadAt(ctx, key, off, n)
+	case Viewer:
+		// A whole-object view still beats ReadAt's fallback, which copies the object to slice it.
+		data, err := v.ReadView(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+
+		return clampRange(data, off, n), nil
+	}
+
+	data, err := b.Read(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+
+	return clampRange(data, off, n), nil
+}
+
 // clampRange slices data to [off, off+n) under [ReadAt]'s clamping contract. It is the shared
 // implementation of that contract for backends holding the object in memory.
 func clampRange(data []byte, off, n int64) []byte {

@@ -129,6 +129,16 @@ func (b *instrumentedBackend) ReadAt(ctx context.Context, key string, off, n int
 	return v, err
 }
 
+// ReadViewAt forwards the no-copy ranged read, so metering does not reintroduce a copy per frame on
+// the query path. Implements [backend.ViewerAt].
+func (b *instrumentedBackend) ReadViewAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	start := time.Now()
+	v, err := backend.ReadViewAt(ctx, b.inner, key, off, n)
+	b.m.Record(ctx, "read", result(err), time.Since(start), int64(len(v)))
+
+	return v, err
+}
+
 func (b *instrumentedBackend) Write(ctx context.Context, key string, data []byte) error {
 	start := time.Now()
 	err := b.inner.Write(ctx, key, data)
