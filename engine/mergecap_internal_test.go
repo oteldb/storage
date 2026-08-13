@@ -11,8 +11,8 @@ import (
 	"github.com/oteldb/storage/backend"
 )
 
-// spaceBackend wraps a backend with a fixed free-space report, so the cap derivation can be
-// exercised without depending on the test machine's actual disk.
+// spaceBackend reports a fixed free-space figure, so the cap derivation does not depend on the test
+// machine's disk.
 type spaceBackend struct {
 	backend.Backend
 
@@ -28,7 +28,7 @@ func (s spaceBackend) FreeSpace(context.Context) (int64, error) {
 	return s.free, nil
 }
 
-// concurrencyFunc adapts a fixed count to the config callback; 0 means "unset".
+// concurrencyFunc adapts a fixed count to the config callback; 0 means unset.
 func concurrencyFunc(n int) func() int {
 	if n == 0 {
 		return nil
@@ -119,9 +119,8 @@ func TestMergeCapBytes(t *testing.T) {
 	}
 }
 
-// TestMergeCapUsesRecordedPartSize pins the other half: the cap is compared against a part's
-// recorded on-disk size, so sealing means "this part is big on disk" rather than "this part has
-// many rows". A part written before the manifest carried a size falls back to the row estimate.
+// TestMergeCapUsesRecordedPartSize pins the other half: sealing compares a part's recorded on-disk
+// size, falling back to the row estimate for a part written before the manifest carried one.
 func TestMergeCapUsesRecordedPartSize(t *testing.T) {
 	t.Parallel()
 

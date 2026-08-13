@@ -20,8 +20,8 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// mergeCorpus flushes `parts` parts of `series` series × `samples` samples, with value the sample
-// generator, and returns the engine and the total row count.
+// mergeCorpus flushes `parts` parts of `series` series × `samples` samples and returns the engine
+// and the total row count.
 func mergeCorpus(t *testing.T, series, samples, parts int, value func(r *rand.Rand, s, i int) float64) (*engine.Engine, int) {
 	t.Helper()
 
@@ -65,16 +65,11 @@ func mergeCorpus(t *testing.T, series, samples, parts int, value func(r *rand.Ra
 }
 
 // TestMergeAllocatesBelowRawRows pins the property the streaming merge exists for: a merge must not
-// allocate on the order of its output part's *uncompressed* rows.
+// allocate on the order of its output part's uncompressed rows, which is what used to couple part
+// granularity to peak merge memory.
 //
-// The old merge accumulated every merged row in one flushColumns buffer before encoding, so its
-// working set was rows × partRowBytes (32 B) — 512 MiB at the default cap, which is what coupled
-// part granularity to peak merge memory. Streaming the output holds the encoded part instead.
-//
-// The bound is deliberately loose (it counts total bytes allocated, not peak resident, and the
-// merge legitimately allocates decode buffers per series) — it is here to catch a regression back
-// to whole-column buffering, which would blow past it by an order of magnitude, not to pin an
-// exact figure.
+// The bound is deliberately loose — total bytes allocated, not peak resident. It is here to catch a
+// regression to whole-column buffering, which overshoots it by an order of magnitude.
 //
 //nolint:paralleltest // measures process-wide allocation counters, so it must not run concurrently
 func TestMergeAllocatesBelowRawRows(t *testing.T) {

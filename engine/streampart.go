@@ -20,21 +20,18 @@ const (
 	colSFIdx
 )
 
-// partStreamWriter writes one output part of a merge a series at a time, so the merge never holds
-// a whole part's uncompressed rows. It wraps a [block.StreamWriter] for the columns and builds the
-// part's sidecars — series index, identities, aggregate stats — from the same per-series calls,
-// each of which is run- or series-shaped and so costs O(distinct series) rather than O(rows).
+// partStreamWriter writes one output part of a merge a series at a time: a [block.StreamWriter] for
+// the columns, plus the part's sidecars built from the same per-series calls, so they cost
+// O(distinct series) rather than O(rows).
 //
-// Rows must arrive in the part's sort order — series ascending, timestamps ascending within a
-// series — one whole series per [partStreamWriter.appendSeries] call, which is what the streaming
-// merge produces.
+// Rows must arrive in the part's sort order, one whole series per appendSeries call.
 type partStreamWriter struct {
 	e   *Engine
 	w   *block.StreamWriter
 	seq int
 
-	// runs is the series column's run-length form: one entry per series, and the input to both the
-	// id column and the series-index sidecar.
+	// runs is the series column's run-length form: one entry per series, feeding both the id column
+	// and the series-index sidecar.
 	runs []chunk.U128Run
 
 	statsIDs []chunk.U128
@@ -42,24 +39,21 @@ type partStreamWriter struct {
 
 	withSF    bool
 	withStats bool
-	// sampled records that some weight was not 1, which is what decides both whether the weight
-	// column survives ([block.StreamWriter.OmitConstColumn]) and whether the aggregate sidecar is
-	// written (it holds raw values, so a sampled part falls back to the weighted decode path).
+	// sampled decides both whether the weight column survives (OmitConstColumn) and whether the
+	// aggregate sidecar is written — it holds raw values, so a sampled part must fall back to the
+	// weighted decode path.
 	sampled bool
-	// ones backs the unit weights an unsampled series contributes to a declared weight column.
-	ones []float64
+	ones    []float64 // unit weights an unsampled series contributes to a declared weight column
 
 	rows       int
 	minT, maxT int64
 	haveTime   bool
 }
 
-// newPartStreamWriter starts an output part. comp and precisionBits are fixed for the whole part
-// (chosen per merge — see [Engine.compactStream]) because a streamed column is encoded as its rows
-// arrive and cannot be re-encoded once the part is under way.
-//
-// withSF declares the lossy-sampling weight column. It is dropped again at finish if every weight
-// turned out to be 1, so an unsampled part keeps the three-column layout it has today.
+// newPartStreamWriter starts an output part. comp and precisionBits are fixed for the whole part —
+// chosen per merge, see mergeEncoding — because a streamed column cannot be re-encoded once the
+// part is under way. withSF declares the weight column, dropped again at finish if every weight
+// turned out to be 1.
 func newPartStreamWriter(
 	e *Engine, seq int, comp compressProfile, precisionBits uint8, withSF, withStats bool,
 ) (*partStreamWriter, error) {
@@ -104,8 +98,7 @@ func newPartStreamWriter(
 	return &partStreamWriter{e: e, w: w, seq: seq, withSF: withSF, withStats: withStats}, nil
 }
 
-// appendSeries appends one series' samples. sf carries the per-sample weights and may be nil, in
-// which case every weight is 1.
+// appendSeries appends one series' samples; a nil sf means every weight is 1.
 func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []float64) error {
 	if len(ts) == 0 {
 		return nil
@@ -132,8 +125,8 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 	p.runs = append(p.runs, chunk.U128Run{Value: id, Count: len(ts)})
 	p.rows += len(ts)
 
-	// Rows arrive series-major, not time-major, so the part's time bounds are the running extremes
-	// over every series rather than the first and last row.
+	// Rows arrive series-major, so the part's bounds are the running extremes over every series
+	// rather than the first and last row.
 	lo, hi := ts[0], ts[len(ts)-1]
 	if !p.haveTime {
 		p.minT, p.maxT, p.haveTime = lo, hi, true
@@ -154,11 +147,10 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 	return nil
 }
 
-// encodedBytes is the compressed size the part has accumulated so far, what the merge seals on.
 func (p *partStreamWriter) encodedBytes() int64 { return p.w.EncodedBytes() }
 
-// weights returns n per-sample weights, materializing the unit vector for an unsampled series so a
-// declared weight column stays aligned with the other columns.
+// weights materializes the unit vector for an unsampled series, so a declared weight column stays
+// aligned with the other columns.
 func (p *partStreamWriter) weights(sf []float64, n int) []float64 {
 	if len(sf) != n {
 		if cap(p.ones) < n {
@@ -182,9 +174,8 @@ func (p *partStreamWriter) weights(sf []float64, n int) []float64 {
 	return sf
 }
 
-// finish serializes and writes the part with its sidecars, then opens it and stamps its time
-// bounds — the streaming counterpart of [Engine.writeMergedPart]. At least one series must have
-// been appended: the caller starts a writer only when it has a series to put in it, so an empty
+// finish writes the part with its sidecars, opens it and stamps its time bounds — the streaming
+// counterpart of [Engine.writeMergedPart]. At least one series must have been appended: an empty
 // part would mean a burnt sequence number and an unreadable prefix.
 func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 	if p.rows == 0 {
@@ -197,13 +188,10 @@ func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 		return nil, errors.Wrapf(err, "write part %q", prefix)
 	}
 
-	// Series-index sidecar, from the runs the append calls already produced.
 	if err := p.e.cfg.Backend.Write(ctx, sidxKey(prefix), encodeSeriesIndexRuns(p.runs)); err != nil {
 		return nil, errors.Wrapf(err, "write series-index sidecar %q", prefix)
 	}
 
-	// Identity object: the identities of this part's series, snapshotted once for the whole part
-	// rather than per series, so the merge takes the engine's read lock a single time.
 	if err := writeIdentity(ctx, p.e.cfg.Backend, prefix, p.identityEntries()); err != nil {
 		return nil, err
 	}
@@ -224,7 +212,8 @@ func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 	return part, nil
 }
 
-// identityEntries resolves the part's distinct series to their identities under one read lock.
+// identityEntries resolves the part's distinct series under a single read lock, rather than one per
+// series.
 func (p *partStreamWriter) identityEntries() []series.Entry {
 	p.e.mu.RLock()
 	defer p.e.mu.RUnlock()

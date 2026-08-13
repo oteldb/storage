@@ -215,8 +215,7 @@ func WritePart(ctx context.Context, b backend.Backend, prefix string, w *PartWri
 	return built.write(ctx, b, prefix)
 }
 
-// objectBytes totals the bytes a part's column and marks objects occupy. Constant-collapsed
-// columns have no object and contribute nothing.
+// objectBytes totals the part's column and marks objects; a constant-collapsed column has none.
 func objectBytes(objects [][]byte, marks []byte) int64 {
 	total := int64(len(marks))
 	for _, obj := range objects {
@@ -226,8 +225,8 @@ func objectBytes(objects [][]byte, marks []byte) int64 {
 	return total
 }
 
-// write stores the part's objects under prefix on b. Column and marks objects are written first;
-// the manifest is written LAST so the part only becomes readable once fully committed.
+// write stores the part's objects under prefix on b, manifest LAST so the part only becomes
+// readable once fully committed.
 func (p builtPart) write(ctx context.Context, b backend.Backend, prefix string) error {
 	for i, obj := range p.objects {
 		if obj == nil {

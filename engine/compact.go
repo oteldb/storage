@@ -50,13 +50,11 @@ const (
 	// minTierParts is the number of same-tier parts that must accumulate before they are compacted.
 	// Two keeps the part count low under continuous flushing without over-eager single-part merges.
 	minTierParts = 2
-	// maxTierParts caps how many parts one merge compacts, so a single merge stays bounded in
-	// inputs (and in wall-clock) however large the byte budget grows; the rest are picked up on the
-	// next cycle. VictoriaMetrics bounds a merge the same way, by parts as well as by bytes.
+	// maxTierParts keeps one merge bounded in inputs (and wall-clock) however large the byte budget
+	// grows; the rest are picked up next cycle. VictoriaMetrics bounds by parts as well as bytes too.
 	maxTierParts = 16
 	// tierFloorBytes collapses every part below this size into tier 0, so the many tiny parts of a
-	// test or a low-volume tenant always share a tier and compact together (the power-of-two
-	// bucketing below only differentiates parts large enough for their sizes to matter).
+	// low-volume tenant share a tier and compact together.
 	tierFloorBytes = 128 << 10
 )
 
@@ -147,9 +145,8 @@ func pickTierGroup(src []*part, capBytes int64) []*part {
 	group := byTier[bestTier]
 
 	if capBytes > 0 {
-		// Bound the group's cumulative size at the seal threshold, so one merge produces at most one
-		// full-size part — taking at least minTierParts so a merge always makes progress even when
-		// two parts already approach the cap.
+		// One merge produces at most one full-size part, but always takes minTierParts so it makes
+		// progress even when two parts already approach the cap.
 		var total int64
 
 		for i, p := range group {

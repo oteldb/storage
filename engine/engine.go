@@ -45,23 +45,19 @@ type Config struct {
 	// every backend (a decode is CPU even when the read is RAM-fast). Zero disables it.
 	DecodeCacheBytes int64
 	// MaxPartBytes caps a *flushed* part's (approximate, uncompressed) size: a flush splits its
-	// output into multiple parts so no single one exceeds it. 0 ⇒ unlimited (one part). A merged
-	// part is sized by the disk-derived cap below instead — see [Engine.mergeCapBytes].
+	// output so no single part exceeds it. 0 ⇒ unlimited. A merged part is sized by
+	// MergeCeilingBytes instead.
 	MaxPartBytes int64
-	// MergeCeilingBytes is the upper bound on a merged part's size *on disk*. The effective cap is
-	// the lesser of it and the backend's free space divided by MergeConcurrency, so part size
-	// tracks the disk the data lands on rather than a constant that is only right at one deployment
-	// size (VictoriaMetrics' maxBigPartSize, ClickHouse's max_bytes_to_merge_at_max_space_in_pool).
-	// 0 ⇒ defaultMergeCeilingBytes; negative ⇒ unlimited (never seal, merge everything into one).
+	// MergeCeilingBytes is the upper bound on a merged part's size *on disk*; the effective cap is
+	// the lesser of it and this merge's share of the backend's free space (see mergecap.go). 0 ⇒
+	// defaultMergeCeilingBytes; negative ⇒ unlimited (never seal).
 	MergeCeilingBytes int64
-	// MergeConcurrency reports how many merges the owner may run concurrently against this backend.
-	// It divides the free space so concurrent merges cannot collectively exhaust the disk. nil, or a
-	// value ≤ 1, ⇒ no division.
+	// MergeConcurrency reports how many merges may run concurrently against this backend, dividing
+	// the free space so they cannot collectively exhaust the disk. nil or ≤ 1 ⇒ no division.
 	//
-	// It is a callback rather than a number because the answer moves: a node's merge fan-out is
-	// bounded by its engine count as much as by its worker limit, and engines are created lazily as
-	// tenants appear. Sizing it once at engine creation would divide a single-tenant node's disk by
-	// its core count and hand back most of the cap this is meant to widen.
+	// A callback because the answer moves: fan-out is bounded by the node's engine count as much as
+	// by its worker limit, and engines appear lazily. Fixing it at engine creation would divide a
+	// single-tenant node's disk by its core count, undoing most of the widening.
 	MergeConcurrency func() int
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each part,
 	// so [Engine.AggregateRange] answers a range-covering aggregate from it without decoding the

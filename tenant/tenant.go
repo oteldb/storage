@@ -39,15 +39,13 @@ type Limits struct {
 	// It no longer bounds *merged* parts; see MaxMergePartSize.
 	MaxPartSize int64
 	// MaxMergePartSize caps a merged part's size **on disk** — compressed bytes, unlike
-	// MaxPartSize. Zero ⇒ the engine derives it from the backend's free space (the default, and
-	// what makes part size track the deployment); negative ⇒ unlimited, never seal.
+	// MaxPartSize. Zero ⇒ derived from the backend's free space, which is the default and what
+	// makes part size track the deployment; negative ⇒ unlimited, never seal.
 	//
-	// A merged part is sized separately from a flushed one because the two answer different
-	// questions. A flush is bounded so the head's buffered rows land promptly; a merge is bounded
-	// so that part *count* stays low, which is what keeps a query from opening more parts as
-	// cardinality grows. Holding the merge to a byte constant makes the time span a part covers
-	// inversely proportional to active series, so a fixed-range query touches proportionally more
-	// parts the more series a tenant has.
+	// Merged parts are sized separately because the two caps answer different questions: a flush is
+	// bounded so the head's rows land promptly, a merge so that part *count* stays low. Under a byte
+	// constant the time span a part covers is inversely proportional to active series, so a
+	// fixed-range query opens proportionally more parts the more series a tenant has.
 	MaxMergePartSize int64
 }
 

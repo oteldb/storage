@@ -13,9 +13,8 @@ import (
 
 var _ backend.SpaceReporter = (*File)(nil)
 
-// FreeSpace reports the bytes available to an unprivileged writer on the filesystem holding the
-// root directory. It uses the unprivileged figure (not the total free blocks), so the reserved
-// root allowance is never counted as usable.
+// FreeSpace reports the bytes available on the filesystem holding the root directory. It takes the
+// unprivileged figure, so the reserved root allowance is never counted as usable.
 func (f *File) FreeSpace(context.Context) (int64, error) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(f.root, &st); err != nil {

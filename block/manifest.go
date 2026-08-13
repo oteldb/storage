@@ -135,11 +135,10 @@ type Manifest struct {
 	GranuleSize int
 	Columns     []ColumnDesc
 	// DiskBytes is the encoded size of the part's column and marks objects, excluding the manifest
-	// itself (which cannot size itself) and the engine's sidecars. It is what the merge engine's
-	// size cap is denominated in, so the cap means bytes on disk rather than a row estimate.
+	// itself (which cannot size itself) and the engine's sidecars. The merge cap is denominated in
+	// it, so the cap means bytes on disk rather than a row estimate.
 	//
-	// Written as a trailing field: the decoder stops at the last column, so a manifest without it
-	// reads as 0 and an older reader ignores it.
+	// Trailing, so a manifest without it reads as 0 and an older reader ignores it.
 	DiskBytes int64
 }
 
@@ -313,7 +312,7 @@ func DecodeManifest(src []byte) (Manifest, error) {
 		m.Columns = append(m.Columns, c)
 	}
 
-	// Trailing and optional: absent in a manifest written before it existed, which reads as 0.
+	// Optional: absent in a manifest written before it existed, which reads as 0.
 	if diskBytes, err := r.ReadUvarint(); err == nil {
 		m.DiskBytes = int64(diskBytes)
 	}

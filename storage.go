@@ -1094,15 +1094,10 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		// defaultMaxPartBytes when the policy leaves it unset. It is an operational/structural cap
 		// fixed at engine creation (unlike the per-write admission limits).
 		MaxPartBytes: partSizeOrDefault(limits.MaxPartSize),
-		// MergeCeilingBytes bounds a *merged* part, in bytes on disk. Left at the policy's zero the
-		// engine derives the cap from the backend's free space, so part size — and therefore the
-		// part count a query opens — tracks the deployment rather than a constant.
+		// Left at the policy's zero, the engine derives the merge cap from free space, so part size —
+		// and the part count a query opens — tracks the deployment rather than a constant.
 		MergeCeilingBytes: limits.MaxMergePartSize,
-		// Concurrent merges share one disk, so each merge may claim only its share of the free
-		// space (VictoriaMetrics divides by its merge worker count for the same reason). The fan-out
-		// is bounded by the engine count as well as the worker limit, so a single-tenant node
-		// divides by one rather than by its core count.
-		MergeConcurrency: s.mergeConcurrency,
+		MergeConcurrency:  s.mergeConcurrency,
 	})
 	s.tenants[tid] = e
 
@@ -1504,8 +1499,9 @@ func (s *Storage) maintain(ctx context.Context) {
 
 // maintenanceConcurrency is the parallel flush/merge/fsync fan-out cap for the background loops,
 // from [Options.MaintenanceConcurrency] or a CPU-derived default.
-// mergeConcurrency is how many merges may realistically run at once: the maintenance fan-out,
-// bounded by the number of engines there are to merge.
+// mergeConcurrency is how many merges may realistically run at once — the maintenance fan-out,
+// bounded by the number of engines there are to merge. It divides the free space the merge cap is
+// derived from, so a single-tenant node divides by one rather than by its core count.
 func (s *Storage) mergeConcurrency() int {
 	s.tmu.Lock()
 	n := len(s.tenants)

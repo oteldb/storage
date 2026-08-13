@@ -14,8 +14,7 @@ import (
 	"github.com/oteldb/storage/encoding/compress"
 )
 
-// metricRows is a metric part's columns in the layout the engine writes: an id sort key in runs,
-// a DoD timestamp column, and a float value column.
+// metricRows is a metric part's columns in the layout the engine writes.
 type metricRows struct {
 	series []chunk.U128
 	ts     []int64
@@ -58,8 +57,8 @@ func (m metricRows) writeBatch(t *testing.T, autoCodec bool, opts ...PartOption)
 	return built
 }
 
-// writeStream builds the same part with the incremental [StreamWriter], appending one series at a
-// time — the shape a merge produces.
+// writeStream builds the same part with [StreamWriter], one series at a time — the shape a merge
+// produces.
 func (m metricRows) writeStream(t *testing.T, autoCodec bool, opts ...PartOption) builtPart {
 	t.Helper()
 
@@ -86,7 +85,7 @@ func (m metricRows) writeStream(t *testing.T, autoCodec bool, opts ...PartOption
 	return built
 }
 
-// decodeParts writes a built part to a backend and reads its three columns back.
+// decodeBuilt writes a built part to a backend and reads its three columns back.
 func decodeBuilt(t *testing.T, built builtPart) metricRows {
 	t.Helper()
 

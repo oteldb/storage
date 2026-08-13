@@ -252,9 +252,7 @@ type part struct {
 	index  partIndex
 	hasSF  bool // the part carries a scale-factor column (sampling occurred); else every weight is 1
 
-	// diskBytes is the part's size on disk, from its manifest. 0 for a part written before the
-	// manifest recorded it; see sizeBytes.
-	diskBytes int64
+	diskBytes int64 // from the manifest; 0 for a part predating the field, see sizeBytes
 
 	// statsOnce lazily loads the per-series aggregate sidecar (statsKey) on first aggregate query;
 	// stats is nil when the sidecar is absent/corrupt or the part is sampled, signaling the
@@ -385,12 +383,9 @@ func (p *part) rows() int {
 	return p.index.rows()
 }
 
-// sizeBytes is the part's size on disk — the unit the merge cap and the size tiers are expressed
-// in, so both mean bytes actually occupied rather than a row estimate.
-//
-// A part written before the manifest recorded it reports 0; those fall back to the uncompressed
-// row estimate, which is the quantity the cap used to be expressed in, so such a part is tiered and
-// sealed as it was before. It gets a real size the first time it is merged.
+// sizeBytes is the part's size on disk, the unit the merge cap and the size tiers are expressed in.
+// A part predating the manifest field falls back to the uncompressed row estimate — the quantity
+// the cap used to be in, so it tiers and seals as before — and gets a real size on first merge.
 func (p *part) sizeBytes() int64 {
 	if p.diskBytes > 0 {
 		return p.diskBytes

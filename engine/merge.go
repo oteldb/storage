@@ -283,21 +283,11 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 	return cols, nil
 }
 
-// compactStream merges several source parts and writes the result directly to bounded output parts,
-// never materializing the whole merged dataset on either side.
-//
-// Each source part is read through a forward [partStream] that decodes one series range at a time,
-// advancing strictly forward through the part's (series, ts)-sorted rows. So a merge's resident
-// decoded input is O(parts × one-series-range) rather than O(parts × whole-column): the streaming
-// k-way merge (issue #25, item 1's full fix).
-//
-// The output is streamed the same way. Each merged series is handed straight to a
-// [partStreamWriter], which codec-encodes a granule as soon as one fills, so what the merge holds
-// is the *encoded* output part rather than its uncompressed rows — several times smaller on
-// high-entropy gauges and orders of magnitude smaller on counter-shaped data. That is what
-// decouples the two jobs the cap used to do at once: it still decides part granularity, but it no
-// longer sets the merge's peak memory — which is what lets the cap be sized from free space rather
-// than held at a constant. capBytes ≤ 0 (unlimited part size) writes a single output part.
+// compactStream merges several source parts, streaming both sides so neither the whole merged
+// dataset nor a whole output part is ever materialized: each source is read through a forward
+// [partStream] decoding one series range at a time, and each merged series is handed straight to a
+// [partStreamWriter]. The merge therefore holds O(parts × one series range) + the *encoded* output
+// part. capBytes ≤ 0 writes a single output part.
 //
 // Series are visited in (series, ts) order; within a series the parts are visited oldest→newest so
 // a later part's value wins a duplicate timestamp, then the result is downsampled.
@@ -370,11 +360,10 @@ func (e *Engine) compactStream(
 			return nil, err
 		}
 
-		// Finish a part once its encoded size reaches the cap. Measuring what has actually been
-		// written — rather than a row count times an assumed bytes-per-row — is what makes the cap
-		// comparable to the free space it is derived from. A series whose own run overshoots the
-		// cap is split at the next series boundary (parts are independent; the read seam merges a
-		// series spanning parts).
+		// Sealing on what has actually been written, rather than on rows times an assumed
+		// bytes-per-row, is what makes the cap comparable to the free space it comes from. A series
+		// overshooting the cap is split at the next series boundary — parts are independent, and
+		// the read seam merges a series spanning two.
 		if capBytes > 0 && cur.encodedBytes() >= capBytes {
 			if err := emit(); err != nil {
 				return nil, err
@@ -389,23 +378,21 @@ func (e *Engine) compactStream(
 	return newParts, nil
 }
 
-// mergeEncoding fixes the encoding decisions a streamed merge's output parts are written under.
-// They must be settled before the first row is encoded, so they are derived from the source parts
-// rather than from each output part's own contents the way [Engine.writeMergedPart] derives them:
+// mergeEncoding fixes what a streamed merge's output parts are encoded under. The decisions must be
+// settled before the first row is encoded, so they come from the source parts rather than from each
+// output part's own contents the way [Engine.writeMergedPart] takes them:
 //
-//   - Compression and precision key off the source group's newest sample. Splitting a
-//     (series, ts)-sorted stream by row count divides it by *series*, not by time, so every output
-//     part spans essentially the group's whole time range anyway. Where it differs — an output part
-//     made up only of series that stopped reporting early — the group's maxTime is the newer of the
-//     two, so the part is treated as hotter: it keeps more precision and a cheaper level than it
-//     strictly needs, never less. The next merge sees that part's own stamped maxTime and settles
-//     it, so the estimate is self-correcting rather than sticky.
-//   - The compression ladder is a step function of row count, so it is estimated from the source
-//     rows scaled by the share of the group's bytes one output part will hold.
-//   - The weight column is declared if any source carries one. It cannot appear from nowhere: with
+//   - Compression and precision key off the group's newest sample. Splitting a (series, ts)-sorted
+//     stream by size divides it by *series*, not by time, so every output part spans essentially the
+//     group's whole range anyway. Where it differs — a part made only of series that stopped
+//     reporting early — the group's maxTime is the newer, so the part is treated as hotter: more
+//     precision and a cheaper level than it needs, never less. The next merge sees that part's own
+//     stamped maxTime, so the estimate is self-correcting rather than sticky.
+//   - The compression ladder is a step function of row count, estimated from the source rows scaled
+//     by the share of the group's bytes one output part will hold.
+//   - The weight column is declared if any source carries one, and cannot appear from nowhere: with
 //     no sampled input every collected weight is 1, and downsample returns a nil weight vector when
-//     every output weight is 1. If the weights all turn out to be 1 anyway, the column is dropped
-//     again at finish.
+//     every output weight is 1. If they all turn out to be 1 anyway, the column is dropped at finish.
 func mergeEncoding(src []*part, capBytes int64, opts MergeOptions) (compressProfile, uint8, bool) {
 	var (
 		maxT     = minInt64
@@ -428,9 +415,9 @@ func mergeEncoding(src []*part, capBytes int64, opts MergeOptions) (compressProf
 	return mergeProfile(opts.Recompress, maxT, rows), pickPrecision(opts.Precision, maxT), withSF
 }
 
-// rowCapFor converts the byte cap into the row cap the whole-column rewrite path splits on, using
-// the part's own bytes-per-row. That path holds decoded columns, so it can only split by row; the
-// part being rewritten is the best available estimate of how its own rewrite will compress.
+// rowCapFor converts the byte cap into a row cap for the whole-column rewrite path, which holds
+// decoded columns and so can only split by row. The part being rewritten is the best available
+// estimate of how its own rewrite will compress.
 func rowCapFor(p *part, capBytes int64) int {
 	if capBytes <= 0 {
 		return 0

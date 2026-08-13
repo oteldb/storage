@@ -43,11 +43,10 @@ type U128Run struct {
 	Count int
 }
 
-// EncodeU128Runs is [EncodeU128] over an already run-length-encoded column, so a writer that
-// produces its rows a run at a time never has to materialize the expanded []U128 (16 bytes per
-// row) just to have the encoder collapse it again. Runs with a zero count are skipped and adjacent
-// runs of equal value are coalesced, so the output is byte-identical to EncodeU128 over the
-// expanded column.
+// EncodeU128Runs is [EncodeU128] over an already run-length-encoded column, so a writer producing
+// its rows a run at a time never materializes the expanded []U128 just to have the encoder collapse
+// it again. Zero-count runs are skipped and adjacent equal runs coalesced, so the output is
+// byte-identical to EncodeU128 over the expanded column.
 func EncodeU128Runs(dst []byte, runs []U128Run) []byte {
 	rows := 0
 	for _, r := range runs {
