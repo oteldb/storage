@@ -1,8 +1,8 @@
 package engine
 
 import (
+	"cmp"
 	"context"
-	"math/bits"
 	"slices"
 
 	"github.com/oteldb/storage/signal"
@@ -33,41 +33,43 @@ func sortedSeriesIDs(ctx context.Context, src []*part) ([]signal.SeriesID, error
 // maintenance tick — that re-reads, re-materializes, and re-encodes the entire (growing) dataset
 // each cycle, so a single merge's working set and write amplification grow with the dataset (it is
 // what made the object-store backend pin multi-GB of churned garbage). Instead a merge selects a
-// bounded group of similarly-sized parts and compacts only those, so its working set is O(part
-// size), not O(dataset):
+// bounded run of similarly-sized parts and compacts only those:
 //
-//   - A part that has reached the merge cap is "sealed": re-merging sealed parts only re-splits
-//     them into the same number of equally-full parts, which is pure churn — so they are never
-//     compacted again. Parts below the cap roll up through progressively taller size tiers (each
-//     merge of same-tier siblings produces a larger part), so part count is bounded at
-//     ≈ dataset / cap instead of growing with every flush (issue #25 root cause A).
-//   - Among the unsealed parts, those of similar size share a tier; a tier is compacted once it
-//     holds at least minTierParts of them, so small freshly-flushed parts merge up into larger ones
-//     without re-reading the already-compacted large parts.
+//   - A part at the merge cap is "sealed": re-merging it only re-splits it into the same number of
+//     equally-full parts, pure churn. Parts below the cap roll up through progressively larger
+//     merges, so part count is bounded at ≈ dataset / cap instead of growing with every flush
+//     (issue #25 root cause A).
+//   - Among the unsealed parts, [pickMergeRun] scores runs of similarly-sized parts and takes the
+//     one that reduces part count for the least rewriting.
 //   - A part that retention, downsampling, recompression, or precision coarsening must rewrite is
-//     selected regardless of its tier (forced), so that age-driven work is never starved by sealing.
+//     selected regardless (forced), so age-driven work is never starved by sealing.
 const (
-	// minTierParts is the number of same-tier parts that must accumulate before they are compacted.
-	// Two keeps the part count low under continuous flushing without over-eager single-part merges.
-	minTierParts = 2
-	// maxTierParts keeps one merge bounded in inputs (and wall-clock) however large the byte budget
+	// minMergeParts is the smallest run worth merging. Two keeps part count low under continuous
+	// flushing without over-eager single-part merges.
+	minMergeParts = 2
+	// maxMergeParts keeps one merge bounded in inputs (and wall-clock) however large the byte budget
 	// grows; the rest are picked up next cycle. VictoriaMetrics bounds by parts as well as bytes too.
-	maxTierParts = 16
-	// tierFloorBytes collapses every part below this size into tier 0, so the many tiny parts of a
-	// low-volume tenant share a tier and compact together.
-	tierFloorBytes = 128 << 10
+	maxMergeParts = 16
+	// minMergeMultiplier is the least output-to-largest-input ratio a run must reach to be worth
+	// merging, the write-amplification guard: folding a 1 MiB part into a 1 GiB one rewrites a
+	// gigabyte to remove one part. VictoriaMetrics uses the same constant and name
+	// (lib/storage/partition.go).
+	minMergeMultiplier = 1.7
+	// smallRunBytes is the total size below which the ratio guard is skipped. The guard reasons
+	// about the *proportion* of bytes rewritten, which says nothing about a run this small — the
+	// whole rewrite is cheap in absolute terms, and refusing it would leave a low-volume tenant's
+	// many tiny parts uncompacted, which is what the guard is meant to prevent.
+	smallRunBytes = 128 << 10
+	// mergeIdleRounds is how many consecutive no-op merges must pass before the guard above is
+	// waived. See [pickMergeRun] for why waiving it is required, not merely nice.
+	mergeIdleRounds = 3
 )
 
-// sizeTier buckets a part by size on disk into a tier, so two parts within 2× of each other (above
-// the floor) share a tier. Parts at or below tierFloorBytes are all tier 0.
-func sizeTier(size int64) int {
-	if size <= tierFloorBytes {
-		return 0
-	}
-
-	// bits.Len(size) − bits.Len(floor) is ⌊log2(size)⌋ − ⌊log2(floor)⌋: how many size-doublings above
-	// the floor, i.e. the power-of-two tier.
-	return bits.Len64(uint64(size)) - bits.Len64(uint64(tierFloorBytes))
+// sealed reports whether p is too large to be a useful merge input. The bound is the cap divided by
+// [minMergeMultiplier] rather than the cap itself: a part just under the cap can only merge into
+// something over it, which would be sealed immediately — maximum rewriting for no lasting gain.
+func sealed(p *part, capBytes int64) bool {
+	return capBytes > 0 && float64(p.sizeBytes()) >= float64(capBytes)/minMergeMultiplier
 }
 
 // forcedRewrite reports whether a part must be rewritten this merge regardless of its size: it holds
@@ -84,12 +86,12 @@ func forcedRewrite(p *part, opts MergeOptions) bool {
 		precisionApplies(p, opts.Precision)
 }
 
-// selectMergeParts chooses the source parts to compact this cycle (size-tiered compaction): the
-// union of the parts a forced rewrite (retention/downsample/recompress/precision) must touch and the
-// best same-tier group of unsealed parts. It returns nil when nothing is worth doing — fewer than
-// minTierParts in every tier and no forced part — so the merge is a no-op without decoding anything.
-// capBytes is the seal threshold in bytes on disk (0 ⇒ unlimited, so no part is ever sealed).
-func selectMergeParts(src []*part, opts MergeOptions, capBytes int64) []*part {
+// selectMergeParts chooses the source parts to compact this cycle: the union of the parts a forced
+// rewrite (retention/downsample/recompress/precision) must touch and the best run of unsealed
+// parts. It returns nil when nothing is worth doing, so the merge is a no-op without decoding
+// anything. capBytes is the seal threshold in bytes on disk (0 ⇒ unlimited, nothing is ever
+// sealed); idle is the number of consecutive no-op merges that preceded this one.
+func selectMergeParts(src []*part, opts MergeOptions, capBytes int64, idle int) []*part {
 	var (
 		selected []*part
 		chosen   = make(map[*part]struct{}, len(src))
@@ -108,83 +110,143 @@ func selectMergeParts(src []*part, opts MergeOptions, capBytes int64) []*part {
 		}
 	}
 
-	for _, p := range pickTierGroup(src, capBytes) {
+	for _, p := range pickMergeRun(src, capBytes, idle) {
 		add(p)
 	}
 
 	return selected
 }
 
-// pickTierGroup returns the group of unsealed parts to compact for size reduction: the tier holding
-// the most parts (ties broken toward the smaller tier, to drain small parts first), once it holds at
-// least minTierParts. The group is bounded both by cumulative bytes at the seal threshold (so one
-// merge produces at most one full-size part) and by maxTierParts. Returns nil when no tier
-// qualifies. Parts keep their src (sequence) order within the group.
-func pickTierGroup(src []*part, capBytes int64) []*part {
-	sealed := func(p *part) bool { return capBytes > 0 && p.sizeBytes() >= capBytes }
-
-	byTier := make(map[int][]*part)
-	for _, p := range src {
-		if !sealed(p) {
-			t := sizeTier(p.sizeBytes())
-			byTier[t] = append(byTier[t], p)
-		}
-	}
-
-	bestTier, bestN := -1, 0
-	for t, ps := range byTier {
-		if len(ps) > bestN || (len(ps) == bestN && (bestTier < 0 || t < bestTier)) {
-			bestTier, bestN = t, len(ps)
-		}
-	}
-
-	if bestN < minTierParts {
+// pickMergeRun returns the unsealed parts to compact for size reduction, or nil when none are worth
+// it. Parts are ordered by size and every run of [minMergeParts, maxMergeParts] adjacent parts is
+// scored by m = output size / largest input — the inverse of write amplification, so the winning run
+// removes the most parts for the least rewriting. Runs over capBytes are rejected, as are runs whose
+// smallest member cannot carry its share of the largest (VictoriaMetrics' appendPartsToMerge).
+//
+// Ordering by size rather than bucketing by it is what fixes the stranding: a part alone in its size
+// class used to be unmergeable, because the selector required two parts inside one power-of-two
+// tier and nothing would ever land in exactly that tier again (#285).
+//
+// That alone is not enough, which is why idle exists. Leftovers are spread geometrically — one per
+// former tier — so every run over them either fails the spread test or scores below
+// minMergeMultiplier, and a purely score-driven selector strands them just as permanently. After
+// mergeIdleRounds cycles with nothing else to do, the best run is taken regardless of its score:
+// rewriting a large part once to absorb a stray costs far less than carrying that stray in every
+// query for the lifetime of the engine.
+func pickMergeRun(src []*part, capBytes int64, idle int) []*part {
+	bySize, order := eligibleBySize(src, capBytes)
+	if len(bySize) < minMergeParts {
 		return nil
 	}
 
-	group := byTier[bestTier]
+	best, fallback, _ := scanRuns(bySize, capBytes)
+	if best == nil {
+		if idle < mergeIdleRounds {
+			return nil
+		}
 
-	if capBytes > 0 {
-		// One merge produces at most one full-size part, but always takes minTierParts so it makes
-		// progress even when two parts already approach the cap.
-		var total int64
+		best = fallback
+	}
 
-		for i, p := range group {
-			total += p.sizeBytes()
-			if i+1 >= minTierParts && total >= capBytes {
-				return group[:i+1]
+	return inSrcOrder(best, order)
+}
+
+// eligibleBySize returns the unsealed parts ordered by size, plus each part's position in src so
+// the chosen run can be restored to that order.
+func eligibleBySize(src []*part, capBytes int64) ([]*part, map[*part]int) {
+	bySize := make([]*part, 0, len(src))
+	order := make(map[*part]int, len(src))
+
+	for i, p := range src {
+		order[p] = i
+
+		if !sealed(p, capBytes) {
+			bySize = append(bySize, p)
+		}
+	}
+
+	slices.SortFunc(bySize, func(a, b *part) int {
+		if c := cmp.Compare(a.sizeBytes(), b.sizeBytes()); c != 0 {
+			return c
+		}
+
+		return cmp.Compare(order[a], order[b])
+	})
+
+	return bySize, order
+}
+
+// scanRuns scores every run of [minMergeParts, maxMergeParts] adjacent parts that fits the cap and
+// returns the best qualifying run, the best run ignoring the guards (what the idle escape falls
+// back on), and that run's score.
+func scanRuns(bySize []*part, capBytes int64) (best, fallback []*part, fallbackM float64) {
+	bestM := 0.0
+
+	for n := minMergeParts; n <= min(maxMergeParts, len(bySize)); n++ {
+		for i := 0; i+n <= len(bySize); i++ {
+			run := bySize[i : i+n]
+
+			var total int64
+			for _, p := range run {
+				total += p.sizeBytes()
+			}
+
+			if capBytes > 0 && total > capBytes {
+				break // runs further along this row are only larger
+			}
+
+			m := float64(total) / float64(run[n-1].sizeBytes())
+			if m > fallbackM {
+				fallbackM, fallback = m, run
+			}
+
+			if m > bestM && runQualifies(run, total, m) {
+				bestM, best = m, run
 			}
 		}
 	}
 
-	if len(group) > maxTierParts {
-		return group[:maxTierParts]
-	}
-
-	return group
+	return best, fallback, fallbackM
 }
 
-// tierShape summarizes why a merge selected nothing: how many parts are sealed, how many distinct
-// size tiers the unsealed ones occupy, and the largest tier's part count — which is the number
-// [pickTierGroup] compares against minTierParts.
-func tierShape(src []*part, capBytes int64) (sealed, tiers, largestTier int) {
-	byTier := make(map[int]int, len(src))
-
-	for _, p := range src {
-		if capBytes > 0 && p.sizeBytes() >= capBytes {
-			sealed++
-
-			continue
-		}
-
-		byTier[sizeTier(p.sizeBytes())]++
+// runQualifies reports whether a run is worth merging on its own merits. Both tests argue about the
+// *proportion* of bytes rewritten, which says nothing about a run whose whole rewrite is cheap —
+// refusing those would leave a low-volume tenant's many tiny parts uncompacted forever.
+func runQualifies(run []*part, total int64, m float64) bool {
+	if total <= smallRunBytes {
+		return true
 	}
 
-	for _, n := range byTier {
-		if n > largestTier {
-			largestTier = n
-		}
+	// A run whose smallest member cannot carry its share of the largest is unbalanced: it rewrites
+	// the large part to absorb parts that barely change its size.
+	if run[0].sizeBytes()*int64(len(run)) < run[len(run)-1].sizeBytes() {
+		return false
 	}
 
-	return sealed, len(byTier), largestTier
+	return m >= minMergeMultiplier
+}
+
+// inSrcOrder restores a run to the caller's part order. The merge visits its sources oldest → newest
+// so a later part's value wins a duplicate timestamp, so the size ordering used to choose the run
+// must not leak into the result.
+func inSrcOrder(run []*part, order map[*part]int) []*part {
+	if len(run) == 0 {
+		return nil
+	}
+
+	out := slices.Clone(run)
+	slices.SortFunc(out, func(a, b *part) int { return cmp.Compare(order[a], order[b]) })
+
+	return out
+}
+
+// mergeShape summarizes why a merge selected nothing: how many parts are sealed, how many remain
+// eligible, and the best score any run of them reached — the number [runQualifies] compares against
+// minMergeMultiplier.
+func mergeShape(src []*part, capBytes int64) (sealedN, eligible int, bestM float64) {
+	bySize, _ := eligibleBySize(src, capBytes)
+
+	_, _, bestM = scanRuns(bySize, capBytes)
+
+	return len(src) - len(bySize), len(bySize), bestM
 }

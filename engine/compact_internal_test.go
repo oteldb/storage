@@ -9,9 +9,9 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// partOfSize builds a bare part of the given size on disk under one series, enough for the
-// size-tiered selection logic (which only reads sizeBytes()/minTime/maxTime). seq disambiguates the
-// series key so a group can hold several distinct parts.
+// partOfSize builds a bare part of the given size on disk under one series, enough for the merge
+// selection logic (which only reads sizeBytes()/minTime/maxTime). seq disambiguates the series key
+// so a group can hold several distinct parts, and is also the part's order in src.
 func partOfSize(seq int, size int64) *part {
 	return &part{
 		prefix:    string(rune('a' + seq)),
@@ -23,112 +23,165 @@ func partOfSize(seq int, size int64) *part {
 	}
 }
 
-func TestSizeTier(t *testing.T) {
-	t.Parallel()
-
-	// Everything at or below the floor collapses to tier 0, so many tiny parts always share a tier.
-	assert.Equal(t, 0, sizeTier(0))
-	assert.Equal(t, 0, sizeTier(1))
-	assert.Equal(t, 0, sizeTier(tierFloorBytes))
-
-	// Above the floor, tiers advance at power-of-two size boundaries (⌊log2(n)⌋ − ⌊log2(floor)⌋).
-	assert.Equal(t, 0, sizeTier(tierFloorBytes+1))
-	assert.Equal(t, 1, sizeTier(2*tierFloorBytes))
-	assert.Equal(t, 1, sizeTier(2*tierFloorBytes+1))
-	assert.Equal(t, 2, sizeTier(4*tierFloorBytes))
-
-	// Monotonic non-decreasing in size.
-	prev := 0
-	for n := int64(1); n < 64*tierFloorBytes; n *= 2 {
-		got := sizeTier(n)
-		assert.GreaterOrEqual(t, got, prev)
-		prev = got
-	}
-}
-
-func TestPickTierGroupUnlimited(t *testing.T) {
-	t.Parallel()
-
-	// Unlimited part size (cap 0): nothing is sealed, tiny parts share tier 0 and compact together.
-	p0, p1, p2 := partOfSize(0, 1), partOfSize(1, 2), partOfSize(2, 3)
-	group := pickTierGroup([]*part{p0, p1, p2}, 0)
-	assert.ElementsMatch(t, []*part{p0, p1, p2}, group, "tiny parts all land in tier 0 and merge")
-
-	// A single part is below the minimum group size, so there is nothing to compact.
-	assert.Nil(t, pickTierGroup([]*part{p0}, 0))
-}
-
-func TestPickTierGroupSealedExcluded(t *testing.T) {
-	t.Parallel()
-
-	// cap 5: a part at the cap is sealed (re-merging it is pure churn) and never selected.
-	full1, full2 := partOfSize(0, 5), partOfSize(1, 5)
-	assert.Nil(t, pickTierGroup([]*part{full1, full2}, 5), "two sealed parts are not re-merged")
-
-	// Unsealed parts of the same tier still compact, sealed siblings ignored.
-	small1, small2 := partOfSize(2, 2), partOfSize(3, 2)
-	group := pickTierGroup([]*part{full1, small1, full2, small2}, 5)
-	assert.ElementsMatch(t, []*part{small1, small2}, group)
-}
-
-func TestPickTierGroupDifferentTiersDoNotMerge(t *testing.T) {
-	t.Parallel()
-
-	// One big part (its own tier) and one small part (tier 0): neither tier reaches the threshold, so
-	// no compaction — the hallmark of size-tiered selection (don't merge across size classes).
-	big := partOfSize(0, 8*tierFloorBytes)
-	small := partOfSize(1, 1)
-	assert.Nil(t, pickTierGroup([]*part{big, small}, 0))
-}
-
-func TestPickTierGroupByteBudgetCap(t *testing.T) {
-	t.Parallel()
-
-	// The cap bounds one merge's output: with cap 20 and eight 9-byte parts in one tier, only enough
-	// to reach the cap are taken this cycle (the rest wait for the next).
-	const mergeCap = 20
-
-	parts := make([]*part, 0, 8)
-	for i := range 8 {
-		parts = append(parts, partOfSize(i, 9)) // all tier 0, all below the cap
+func sizesOf(parts []*part) []int64 {
+	out := make([]int64, len(parts))
+	for i, p := range parts {
+		out[i] = p.sizeBytes()
 	}
 
-	group := pickTierGroup(parts, mergeCap)
-
-	var total int64
-	for _, p := range group {
-		total += p.sizeBytes()
-	}
-
-	assert.GreaterOrEqual(t, len(group), minTierParts, "always makes progress")
-	assert.Less(t, len(group), len(parts), "the byte budget caps the group below the full tier")
-	assert.GreaterOrEqual(t, total, int64(mergeCap), "takes parts up to the cap")
+	return out
 }
 
-// TestPickTierGroupPartCountCap pins the second bound: however large the byte budget grows, one
-// merge never takes more than maxTierParts inputs, so a disk-derived cap cannot turn a single merge
-// into an unbounded one.
-func TestPickTierGroupPartCountCap(t *testing.T) {
+// TestPickMergeRunStrandedTiers is #285: five leftover parts, one per former power-of-two size
+// tier, that the tier selector could never pair because each was alone in its tier.
+//
+// Geometric spacing is what makes this hard — every run over them scores below minMergeMultiplier,
+// so a purely score-driven selector strands them just as permanently as the tier one did. They must
+// merge once the engine has nothing better to do.
+func TestPickMergeRunStrandedTiers(t *testing.T) {
 	t.Parallel()
 
-	parts := make([]*part, 0, maxTierParts*3)
-	for i := range maxTierParts * 3 {
-		parts = append(parts, partOfSize(i, 1))
+	const capBytes = 1 << 30
+
+	strays := []*part{
+		partOfSize(0, 1<<20),
+		partOfSize(1, 4<<20),
+		partOfSize(2, 16<<20),
+		partOfSize(3, 64<<20),
+		partOfSize(4, 256<<20),
 	}
 
-	assert.Len(t, pickTierGroup(parts, 1<<40), maxTierParts, "a huge budget is still bounded by parts")
-	assert.Len(t, pickTierGroup(parts, 0), maxTierParts, "as is an unlimited one")
+	assert.Nil(t, pickMergeRun(strays, capBytes, 0),
+		"while there is other work, the write-amplification guard still applies")
+
+	got := pickMergeRun(strays, capBytes, mergeIdleRounds)
+	require.NotEmpty(t, got, "after idling, stranded parts must merge rather than persist forever")
+	assert.Equal(t, strays, got, "the whole stray set merges in one pass, in src order")
+}
+
+// TestPickMergeRunPrefersLowAmplification pins the scoring: given both a balanced run and a lone
+// large part, the selector takes the balanced run and leaves the large one alone.
+func TestPickMergeRunPrefersLowAmplification(t *testing.T) {
+	t.Parallel()
+
+	small1, small2, small3 := partOfSize(0, 10<<20), partOfSize(1, 11<<20), partOfSize(2, 9<<20)
+	big := partOfSize(3, 500<<20)
+
+	got := pickMergeRun([]*part{small1, small2, small3, big}, 1<<30, 0)
+	assert.Equal(t, []*part{small1, small2, small3}, got,
+		"the similarly-sized run wins; folding them into the big part would rewrite it for little gain")
+}
+
+// TestPickMergeRunSpansSizeClasses is the property the tier selector lacked: parts of *different*
+// sizes merge, so long as the run stays balanced enough to be worth it.
+func TestPickMergeRunSpansSizeClasses(t *testing.T) {
+	t.Parallel()
+
+	parts := []*part{partOfSize(0, 10<<20), partOfSize(1, 15<<20), partOfSize(2, 20<<20)}
+
+	got := pickMergeRun(parts, 1<<30, 0)
+	assert.Equal(t, parts, got, "adjacent size classes merge; they never shared a power-of-two tier")
+}
+
+func TestPickMergeRunSealedExcluded(t *testing.T) {
+	t.Parallel()
+
+	// The seal bound is cap/minMergeMultiplier: a part above it can only merge into something over
+	// the cap, which would be sealed at once — maximum rewriting for no lasting gain.
+	const capBytes = 100
+
+	full1, full2 := partOfSize(0, 90), partOfSize(1, 95)
+	assert.Nil(t, pickMergeRun([]*part{full1, full2}, capBytes, mergeIdleRounds), "sealed parts never merge")
+
+	small1, small2 := partOfSize(2, 20), partOfSize(3, 20)
+	assert.Equal(t, []*part{small1, small2}, pickMergeRun([]*part{full1, small1, full2, small2}, capBytes, 0),
+		"unsealed parts still merge, sealed siblings ignored")
+}
+
+func TestPickMergeRunBounds(t *testing.T) {
+	t.Parallel()
+
+	t.Run("byte budget", func(t *testing.T) {
+		t.Parallel()
+
+		// Eight 9-byte parts against a cap of 20: only what fits is taken this cycle.
+		parts := make([]*part, 0, 8)
+		for i := range 8 {
+			parts = append(parts, partOfSize(i, 9))
+		}
+
+		got := pickMergeRun(parts, 20, 0)
+
+		var total int64
+		for _, p := range got {
+			total += p.sizeBytes()
+		}
+
+		assert.GreaterOrEqual(t, len(got), minMergeParts, "always makes progress")
+		assert.LessOrEqual(t, total, int64(20), "never exceeds the cap")
+	})
+
+	t.Run("part count", func(t *testing.T) {
+		t.Parallel()
+
+		// However large the budget, one merge stays bounded in inputs.
+		parts := make([]*part, 0, maxMergeParts*3)
+		for i := range maxMergeParts * 3 {
+			parts = append(parts, partOfSize(i, 1))
+		}
+
+		assert.Len(t, pickMergeRun(parts, 1<<40, 0), maxMergeParts)
+		assert.Len(t, pickMergeRun(parts, 0, 0), maxMergeParts, "unlimited cap is still bounded by parts")
+	})
+
+	t.Run("too few parts", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Nil(t, pickMergeRun([]*part{partOfSize(0, 1)}, 0, mergeIdleRounds), "one part is not a run")
+		assert.Nil(t, pickMergeRun(nil, 0, mergeIdleRounds))
+	})
+}
+
+// TestPickMergeRunReturnsSrcOrder guards a correctness dependency: the merge visits its sources
+// oldest → newest so a later part's value wins a duplicate timestamp, so the size ordering the
+// selector works in must not leak into the result.
+func TestPickMergeRunReturnsSrcOrder(t *testing.T) {
+	t.Parallel()
+
+	// Deliberately src-ordered opposite to size order.
+	newest, middle, oldest := partOfSize(0, 12), partOfSize(1, 11), partOfSize(2, 10)
+
+	got := pickMergeRun([]*part{newest, middle, oldest}, 1<<30, 0)
+	require.Len(t, got, 3)
+	assert.Equal(t, []*part{newest, middle, oldest}, got, "src order, not size order")
+	assert.Equal(t, []int64{12, 11, 10}, sizesOf(got))
 }
 
 func TestSelectMergePartsForcedRetention(t *testing.T) {
 	t.Parallel()
 
-	// A lone part below the tier threshold is still selected when retention must drop some of its data.
+	// A lone part is still selected when retention must drop some of its data.
 	p := partOfSize(0, 1)
 	p.minTime, p.maxTime = 100, 300
 
-	assert.Nil(t, selectMergeParts([]*part{p}, MergeOptions{}, 0), "nothing forced, one part ⇒ no-op")
+	assert.Nil(t, selectMergeParts([]*part{p}, MergeOptions{}, 0, 0), "nothing forced, one part ⇒ no-op")
 
-	got := selectMergeParts([]*part{p}, MergeOptions{RetainFrom: 200}, 0)
+	got := selectMergeParts([]*part{p}, MergeOptions{RetainFrom: 200}, 0, 0)
 	require.Equal(t, []*part{p}, got, "retention forces the straddling part to be rewritten")
+}
+
+// TestMergeShapeExplainsNoOp pins the diagnostic the no-op log carries: an operator must be able to
+// tell "everything is sealed" from "nothing scores well enough yet".
+func TestMergeShapeExplainsNoOp(t *testing.T) {
+	t.Parallel()
+
+	sealedN, eligible, bestM := mergeShape([]*part{
+		partOfSize(0, 90), // sealed: 90 >= 100/1.7
+		partOfSize(1, 10),
+		partOfSize(2, 10),
+	}, 100)
+
+	assert.Equal(t, 1, sealedN)
+	assert.Equal(t, 2, eligible)
+	assert.InDelta(t, 2.0, bestM, 0.001, "two equal parts score exactly 2x")
 }
