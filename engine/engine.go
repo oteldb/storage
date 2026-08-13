@@ -479,6 +479,11 @@ type enginePlan struct {
 	// plan lock by scanning the live buffers directly — no per-series sorted copy, no batch maps.
 	// nil on a full fetch plan (which snapshots real batches instead).
 	memActive []bool
+	// samplesDecoded counts the samples an aggregate read decoded and folded, as opposed to answered
+	// from a part's stats sidecar. It is the input quantity that explains the read's cost — the
+	// emitted windows say nothing about it — and it is a plain int, not an atomic: an aggregate read
+	// drains its plan on one goroutine, and the count must be free to keep in the fold loop.
+	samplesDecoded int
 }
 
 // mergeSeries gathers series id's samples lock-free: each acquired part oldest→newest, then the

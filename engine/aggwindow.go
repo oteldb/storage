@@ -3,9 +3,11 @@ package engine
 import (
 	"context"
 	"iter"
+	"time"
 
 	"github.com/go-faster/errors"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -142,7 +144,11 @@ func (e *Engine) aggregateWindowSeq(
 		// The result counters are only final once iteration stops — which happens by running out
 		// of series, by the caller breaking, or by an error — so they are recorded in one place on
 		// the way out rather than at each of those exits.
-		var windowsEmitted, seriesEmitted int
+		var (
+			windowsEmitted, seriesEmitted int
+			plan                          *enginePlan
+			w                             *windower
+		)
 
 		stoppedEarly := false
 
@@ -152,6 +158,18 @@ func (e *Engine) aggregateWindowSeq(
 				attribute.Int("storage.windows_emitted", windowsEmitted),
 				attribute.Bool("storage.stopped_early", stoppedEarly),
 			)
+
+			if plan != nil {
+				span.SetAttributes(samplesDecodedAttr(plan))
+			}
+
+			if w != nil && w.timed {
+				span.SetAttributes(
+					attribute.Float64("storage.decode_duration_ms", w.decodeDur.Seconds()*1000),
+					attribute.Float64("storage.fold_duration_ms", w.foldDur.Seconds()*1000),
+				)
+			}
+
 			span.End()
 		}()
 
@@ -167,10 +185,22 @@ func (e *Engine) aggregateWindowSeq(
 			return
 		}
 
-		ids, plan := e.planAggregate(r)
-		defer plan.releaseParts()
+		// Planning is the one phase of this call that is contiguous, so it is the one that gets a
+		// child span. It is opened only when the parent records: an untraced read must not pay even
+		// a no-op span's allocation.
+		var planSpan trace.Span
+		if span.IsRecording() {
+			_, planSpan = e.cfg.Obs.Tracer.Start(ctx, "engine.aggregateWindow.plan")
+		}
 
-		w := newWindower(plan, spec)
+		ids, plan := e.planAggregate(r)
+		w = newWindower(plan, spec)
+
+		if planSpan != nil {
+			planSpan.End()
+		}
+
+		defer plan.releaseParts()
 
 		// Which path this call takes is the first thing to know when it is slow: the grid path
 		// folds each series from step-wide buckets (and, when safe, straight from the parts' stats
@@ -178,9 +208,17 @@ func (e *Engine) aggregateWindowSeq(
 		// step falls back to decoding and merging every sample. Recording it as an attribute means
 		// a slow call says *why* rather than only how long.
 		span.SetAttributes(append(
-			aggregatePlanAttrs(ids, plan, w.grid != nil && w.safe),
+			aggregatePlanAttrs(ids, plan, w.push),
 			attribute.Bool("storage.window_grid", w.grid != nil),
 		)...)
+
+		// The per-series work is split into decode and fold, but as accumulated durations rather
+		// than sub-spans: the two phases interleave once per series (this is a streaming, series-
+		// major iteration), so a pair of contiguous child spans could not describe them without
+		// lying about when each ran, and a span per series or per part would put thousands of spans
+		// in a trace of one query. Planning is the one contiguous phase, so it does get a child
+		// span. Timing is read only when the span records, so an untraced call takes no clock reads.
+		w.timed = span.IsRecording()
 
 		for i, id := range ids {
 			windows, err := w.series(ctx, e, plan, id)
@@ -221,27 +259,62 @@ type windower struct {
 
 	step, window, phase int64
 
-	grid *stepGrid // fine step-wide buckets; nil ⇒ the misaligned per-sample fallback
-	safe bool      // grid path: whether the plan's parts can be folded from their stats sidecars
+	grid *stepGrid        // fine step-wide buckets; nil ⇒ the misaligned per-sample fallback
+	push pushdownDecision // why the parts can (or cannot) be folded from their stats sidecars
+	safe bool             // grid path: whether that pushdown applies
 
 	fine []BucketAgg // scratch: the current series' fine buckets
 	ents []windowEnt // scratch: those buckets (or raw samples) as accumulator entries
 	ts   []int64     // scratch: merged timestamps, fallback path only
 	vals []float64   // scratch: merged values, fallback path only
+
+	timed              bool // read the clock around each series' phases (only when the span records)
+	decodeDur, foldDur time.Duration
 }
 
 func newWindower(plan *enginePlan, spec WindowSpec) *windower {
 	w := &windower{step: spec.Step, window: spec.window(), phase: spec.phase()}
-	if w.window%w.step == 0 {
-		w.grid, w.safe = newWindowGrid(plan, w.step, w.phase), aggPushdownSafe(plan)
+	if w.window%w.step != 0 {
+		// No fine grid at all: a window edge can fall inside a bucket, so nothing is foldable from
+		// the sidecars regardless of how the parts are laid out.
+		w.push = pushdownDecision{reason: pushdownGridUnusable}
+
+		return w
 	}
 
+	w.grid = newWindowGrid(plan, w.step, w.phase)
+	w.push = aggPushdownCheck(plan)
+	w.safe = w.push.safe()
+
 	return w
+}
+
+// mark returns the current time when timing is on, and the zero time otherwise.
+func (w *windower) mark() time.Time {
+	if !w.timed {
+		return time.Time{}
+	}
+
+	return time.Now()
+}
+
+// add charges the time since from to dst and returns the new mark.
+func (w *windower) add(dst *time.Duration, from time.Time) time.Time {
+	if !w.timed {
+		return time.Time{}
+	}
+
+	now := time.Now()
+	*dst += now.Sub(from)
+
+	return now
 }
 
 // series returns id's non-empty evaluation windows, ascending by End. The returned slice is freshly
 // allocated (it outlives the call); everything else is scratch reused across series.
 func (w *windower) series(ctx context.Context, e *Engine, plan *enginePlan, id signal.SeriesID) ([]WindowAgg, error) {
+	started := w.mark()
+
 	if w.grid != nil {
 		if err := e.bucketSeries(ctx, plan, id, w.grid, w.safe); err != nil {
 			return nil, err
@@ -257,11 +330,17 @@ func (w *windower) series(ctx context.Context, e *Engine, plan *enginePlan, id s
 
 		w.ts, w.vals, _ = m.collect(w.ts[:0], w.vals[:0])
 		plan.releaseSeriesPins() // samples copied out; recirculate this series' block pins
+		plan.samplesDecoded += len(w.ts)
 
 		w.ents = sampleEntries(w.ents[:0], w.ts, w.vals)
 	}
 
-	return w.slide(w.ents, w.step, w.window, w.phase, plan.end), nil
+	decoded := w.add(&w.decodeDur, started)
+
+	out := w.slide(w.ents, w.step, w.window, w.phase, plan.end)
+	w.add(&w.foldDur, decoded)
+
+	return out, nil
 }
 
 // bucketEntries rewrites fine left-open buckets — (Start, Start+step], ascending — as accumulator

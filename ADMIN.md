@@ -122,6 +122,44 @@ Tracing emits coarse spans (`engine.flush`, `engine.merge`, `engine.fetch`, back
 RPCs) with W3C trace-context propagation across the cluster transport. Logs are context-plumbed via
 `go-faster/sdk/zctx` (trace-correlated); admission shed events log at Warn only when rejections occur.
 
+#### Aggregate read spans
+
+`engine.aggregateRange` / `engine.aggregateStep` / `engine.aggregateStepNamed` /
+`engine.aggregateWindow` carry the attributes that say **why** an aggregate read was slow, not only
+how long it took:
+
+| Attribute | Meaning |
+|-----------|---------|
+| `storage.series_matched` / `storage.parts_scanned` | plan size |
+| `storage.stats_pushdown_reason` | `ok`, `grid_unusable`, `partial_coverage`, `overlapping_parts` |
+| `storage.stats_pushdown_parts` | how many sources tripped the reason (0 for `ok`/`grid_unusable`) |
+| `storage.samples_decoded` | samples decoded **and** folded — the input quantity that explains the duration |
+| `storage.step` / `storage.window` | the requested grid (window form only) |
+| `storage.window_grid` | whether the fine-bucket grid was usable (window form only) |
+| `storage.series_emitted` / `storage.windows_emitted` / `storage.stopped_early` | outputs, recorded when the iteration ends (window form only) |
+| `storage.decode_duration_ms` / `storage.fold_duration_ms` | coarse phase split of the per-series work (window form only) |
+
+`engine.aggregateWindow` also emits one child span, `engine.aggregateWindow.plan`, around matcher
+resolution and plan construction. Decode and fold get accumulated durations instead of spans: they
+interleave once per series in a streaming, series-major iteration, so neither is a contiguous
+interval, and a span per series or per part would put thousands of spans in one query's trace. Both
+the clock reads and the child span are skipped entirely when the parent span is not recording.
+
+**Reading `stats_pushdown_reason`.** Anything but `ok` means every matched series decoded its value
+column rather than folding the parts' precomputed stats:
+
+- `grid_unusable` — the requested window is not a whole multiple of the step, so a window edge can
+  fall inside a fine bucket and no bucket-level shortcut is exact. A query-shape problem: round the
+  range to a multiple of the step.
+- `partial_coverage` — `storage.stats_pushdown_parts` parts reach outside the query range, so their
+  whole-part stats would count out-of-range samples. **This is the one compaction makes worse** — see
+  the trade-off note in `engine/ARCH.md` ("Aggregate pushdown"): fewer, larger parts are less likely
+  to be contained in a dashboard's window, so a store compacted from 71 parts to 3 can lose pushdown
+  eligibility entirely for a 6h query.
+- `overlapping_parts` — `storage.stats_pushdown_parts` sources overlap a predecessor in time (the
+  head/mid-flush samples count as one such source), so a timestamp could be double-counted. A layout
+  property, not a query one; backfill and out-of-order ingest produce it.
+
 **EXPLAIN ANALYZE** (`query/profile`): `profile.WithCollector(ctx)` opts a single query into a
 per-operator timing tree; distributed reads graft each peer's subtree under a `remote {addr}` node.
 
