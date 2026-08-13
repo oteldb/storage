@@ -240,6 +240,145 @@ func Run(t *testing.T, factory func(t *testing.T) backend.Backend) {
 		wg.Wait()
 		assert.Equal(t, int64(1), wins.Load(), "exactly one writer claims the key")
 	})
+
+	runObjectWriter(t, ctx, factory)
+}
+
+// runObjectWriter covers the incremental-write seam ([backend.CreateObject]). It runs over every
+// backend, not only those implementing [backend.ObjectCreator]: the buffering fallback must be
+// indistinguishable from a native implementation, since that is what lets callers stream
+// unconditionally.
+func runObjectWriter(t *testing.T, ctx context.Context, factory func(t *testing.T) backend.Backend) {
+	t.Helper()
+
+	t.Run("ObjectWriterCommits", func(t *testing.T) {
+		b := factory(t)
+
+		w, err := backend.CreateObject(ctx, b, "obj/a")
+		require.NoError(t, err)
+
+		for _, chunk := range []string{"one", "two", "three"} {
+			n, err := w.Write([]byte(chunk))
+			require.NoError(t, err)
+			assert.Equal(t, len(chunk), n, "Write must report every byte it accepted")
+		}
+
+		_, err = b.Read(ctx, "obj/a")
+		require.ErrorIs(t, err, backend.ErrNotExist, "nothing is stored before the commit")
+
+		require.NoError(t, w.Commit(ctx))
+
+		got, err := b.Read(ctx, "obj/a")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("onetwothree"), got)
+
+		w.Abort() // idempotent after a commit, so `defer w.Abort()` is safe cleanup
+
+		got, err = b.Read(ctx, "obj/a")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("onetwothree"), got, "abort after commit must not undo it")
+	})
+
+	t.Run("ObjectWriterAborts", func(t *testing.T) {
+		b := factory(t)
+		require.NoError(t, b.Write(ctx, "obj/b", []byte("original")))
+
+		w, err := backend.CreateObject(ctx, b, "obj/b")
+		require.NoError(t, err)
+
+		_, err = w.Write([]byte("replacement"))
+		require.NoError(t, err)
+
+		w.Abort()
+
+		got, err := b.Read(ctx, "obj/b")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("original"), got, "an aborted write leaves the key as it was")
+
+		keys, err := b.List(ctx, "")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"obj/b"}, keys, "an aborted write leaves no debris behind")
+	})
+
+	t.Run("ObjectWriterOverwrites", func(t *testing.T) {
+		b := factory(t)
+		require.NoError(t, b.Write(ctx, "obj/c", []byte("original")))
+
+		w, err := backend.CreateObject(ctx, b, "obj/c")
+		require.NoError(t, err)
+
+		_, err = w.Write([]byte("replacement"))
+		require.NoError(t, err)
+		require.NoError(t, w.Commit(ctx))
+
+		got, err := b.Read(ctx, "obj/c")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("replacement"), got)
+	})
+
+	// Two writers over one key is how a part's rival codecs race: both encode, only the denser one
+	// commits. Whichever loses must leave no trace of itself.
+	t.Run("ObjectWriterRivalsOverOneKey", func(t *testing.T) {
+		b := factory(t)
+
+		winner, err := backend.CreateObject(ctx, b, "obj/d")
+		require.NoError(t, err)
+
+		loser, err := backend.CreateObject(ctx, b, "obj/d")
+		require.NoError(t, err)
+
+		_, err = winner.Write([]byte("kept"))
+		require.NoError(t, err)
+
+		_, err = loser.Write([]byte("discarded"))
+		require.NoError(t, err)
+
+		loser.Abort()
+		require.NoError(t, winner.Commit(ctx))
+
+		got, err := b.Read(ctx, "obj/d")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("kept"), got)
+
+		keys, err := b.List(ctx, "")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"obj/d"}, keys)
+	})
+
+	t.Run("ObjectWriterEmpty", func(t *testing.T) {
+		b := factory(t)
+
+		w, err := backend.CreateObject(ctx, b, "obj/e")
+		require.NoError(t, err)
+		require.NoError(t, w.Commit(ctx))
+
+		got, err := b.Read(ctx, "obj/e")
+		require.NoError(t, err)
+		assert.Empty(t, got, "a committed empty object exists and is empty, not absent")
+	})
+
+	t.Run("ObjectWriterLargeValue", func(t *testing.T) {
+		b := factory(t)
+
+		want := make([]byte, 1<<20)
+		for i := range want {
+			want[i] = byte(i)
+		}
+
+		w, err := backend.CreateObject(ctx, b, "obj/f")
+		require.NoError(t, err)
+
+		for off := 0; off < len(want); off += 4096 {
+			_, err := w.Write(want[off:min(off+4096, len(want))])
+			require.NoError(t, err)
+		}
+
+		require.NoError(t, w.Commit(ctx))
+
+		got, err := b.Read(ctx, "obj/f")
+		require.NoError(t, err)
+		assert.Equal(t, want, got)
+	})
 }
 
 // AtomicConditionalPut wraps an S3-compatible test server's handler, serializing every request
