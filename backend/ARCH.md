@@ -42,8 +42,22 @@ conformance suite all of them pass under `-race`.
 - **`backend/bucketindex`** — compact versioned index (part list + per-part time bounds + the WAL
   flushed-epoch watermark) in one object, so a stateless reader enumerates and time-prunes a
   tenant's parts without a full `List`. Fuzzed + golden-tested.
+- **`backend.ReaderAt`** — optional `ReadAt(ctx,key,off,n)`, the read counterpart of
+  `ObjectCreator` and the reason a query touching a few granules no longer pays for the whole
+  column (`block/ARCH.md`, "Reading a column by range"). The range is **clamped to the object's
+  end**, so a reader takes a trailer without first learning the size — one round trip, not two, and
+  a short result is not an error. `file` uses `pread`, `s3` a `Range` header (via the optional
+  `RangeObjectStore`, so a fake need not), `Memory` a copy of the range rather than of the object.
+  `backend.ReadAt` falls back to reading the object and slicing, so callers range unconditionally
+  and a wrapper that forgets to forward costs bytes rather than correctness. The read cache serves a
+  range from a resident whole-object entry and otherwise forwards **without caching** — going
+  through the loading path would fetch the whole object to answer a range, which is the cost being
+  avoided.
 - **`backend.Sizer`** — optional `Size(ctx,key)` for byte accounting without reading (used by
-  `PartsDetailed`); `backend.SizeOf` falls back to a full read.
+  `PartsDetailed`); `backend.SizeOf` falls back to a full read. **That fallback is a trap on the
+  ranged read path**: a wrapper that hides `Sizer` would make opening a column read the whole
+  column to learn its length, silently undoing the ranging. The manifest records each column's size
+  (`flagBytes`) so the common path never asks.
 - **`backend.ObjectCreator`** — optional `CreateObject(ctx,key) → ObjectWriter`, an object built
   incrementally: `Write` appends, `Commit` publishes atomically (nothing is visible under the key
   before it), `Abort` discards and is a no-op after a commit. `file` implements it with the same

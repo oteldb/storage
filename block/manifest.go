@@ -79,6 +79,12 @@ const (
 	// with the directory leading, no byte of the object is final until the last frame is. Decode is
 	// otherwise identical — same directory fields, same frames. Meaningful only with flagFramed.
 	flagFooter byte = 1 << 5
+	// flagBytes marks a column carrying its object's byte size; when set, a uvarint follows the
+	// flags byte (after the flagLossy and flagLevel bytes, when present). It lets a ranged reader
+	// locate the object's trailer without asking the backend how big the object is — a question
+	// whose fallback answer is "read the whole object", which is the cost the ranged read exists to
+	// avoid. Absent on parts written before it existed, which fall back to that question.
+	flagBytes byte = 1 << 6
 )
 
 // ErrCorrupt is returned when a manifest (or any part metadata) fails to parse:
@@ -129,6 +135,11 @@ type ColumnDesc struct {
 	// column written whole, which keeps the directory-first layout byte for byte.
 	Footer bool
 
+	// Bytes is the size of the column's backend object, 0 when unknown (a constant column has no
+	// object, and a part written before [flagBytes] existed did not record one). Persisted only when
+	// non-zero. It exists so opening a column for ranged reads costs no round trip of its own.
+	Bytes int64
+
 	// Level is the compression level the column's data was written at (0 ⇒ the algorithm default, or
 	// no compression). Persisted only when non-zero, via [flagLevel]. Decode ignores it; the merge
 	// engine reads it as the fixed point of the compression ladder.
@@ -160,12 +171,39 @@ type Manifest struct {
 	RawBytes int64
 }
 
+// flags packs the descriptor's flag-gated fields into the manifest flags byte. Each optional field
+// is present in the encoding only when its bit is set, which is what keeps a column that does not
+// use one byte-identical to how an earlier writer would have laid it out.
+func (c *ColumnDesc) flags() byte {
+	var flags byte
+
+	for _, f := range []struct {
+		set bool
+		bit byte
+	}{
+		{c.Const, flagConst},
+		{c.FloatPrecisionBits != 0, flagLossy},
+		{c.Blocked, flagBlocked},
+		{c.Framed, flagFramed},
+		{c.Footer, flagFooter},
+		{c.Level != 0, flagLevel},
+		{c.Bytes != 0, flagBytes},
+	} {
+		if f.set {
+			flags |= f.bit
+		}
+	}
+
+	return flags
+}
+
 // Encode appends the binary manifest to dst and returns the extended slice. Layout:
 //
 //	[u32 magic][uvarint version][uvarint rowCount][varint minTime][varint maxTime]
 //	[uvarint granuleSize][uvarint colCount]
 //	  per column: [uvarint nameLen][name][byte kind][byte codec][byte compress][byte flags]
 //	              [byte precisionBits if flagLossy][byte level if flagLevel]
+//	              [uvarint objectBytes if flagBytes]
 //	              [numeric min/max per kind][const value per kind if flagConst]
 //	[uvarint diskBytes][uvarint rawBytes]
 //	[u32 CRC32C over all the above]
@@ -189,31 +227,7 @@ func (m Manifest) Encode(dst []byte) []byte {
 		_ = w.WriteByte(byte(c.Codec))
 		_ = w.WriteByte(byte(c.Compress))
 
-		var flags byte
-		if c.Const {
-			flags |= flagConst
-		}
-
-		if c.FloatPrecisionBits != 0 {
-			flags |= flagLossy
-		}
-
-		if c.Blocked {
-			flags |= flagBlocked
-		}
-
-		if c.Framed {
-			flags |= flagFramed
-		}
-
-		if c.Footer {
-			flags |= flagFooter
-		}
-
-		if c.Level != 0 {
-			flags |= flagLevel
-		}
-
+		flags := c.flags()
 		_ = w.WriteByte(flags)
 
 		if flags&flagLossy != 0 {
@@ -222,6 +236,10 @@ func (m Manifest) Encode(dst []byte) []byte {
 
 		if flags&flagLevel != 0 {
 			_ = w.WriteByte(byte(c.Level))
+		}
+
+		if flags&flagBytes != 0 {
+			w.WriteUvarint(uint64(c.Bytes))
 		}
 
 		switch c.Kind {
@@ -412,6 +430,15 @@ func decodeColumnDesc(r *bitstream.Reader) (ColumnDesc, error) {
 		}
 
 		c.Level = compress.Level(level)
+	}
+
+	if flags&flagBytes != 0 {
+		n, err := r.ReadUvarint()
+		if err != nil {
+			return c, errors.Wrap(ErrCorrupt, "objectBytes")
+		}
+
+		c.Bytes = int64(n)
 	}
 
 	switch c.Kind {

@@ -163,14 +163,27 @@ type blockDir struct {
 	gFrame    []int32 // per granule: owning frame; nil in the legacy layout
 	gOff      []int32 // per granule: byte offset within the decompressed frame
 	gLen      []int32 // per granule: byte length within the decompressed frame
-	data      []byte
+
+	// The frames themselves, either resident (data) or fetched per frame from the backend (src).
+	// Exactly one is set; dataOff is the data region's offset within the object, meaningful to src.
+	data    []byte
+	src     *frameSource
+	dataOff int64
 }
 
 // nBlocks returns the number of decode granules.
 func (d blockDir) nBlocks() int { return d.granules }
 
-// frame returns frame f's raw (still compressed) bytes.
-func (d blockDir) frame(f int) []byte { return d.data[d.frameOff[f]:d.frameOff[f+1]] }
+// frame returns frame f's raw (still compressed) bytes: a view into the resident object, or a
+// ranged read of just that frame.
+func (d blockDir) frame(f int) ([]byte, error) {
+	lo, hi := d.frameOff[f], d.frameOff[f+1]
+	if d.src == nil {
+		return d.data[lo:hi], nil
+	}
+
+	return d.src.frame(int64(lo), int64(hi-lo))
+}
 
 // frameOf returns the frame holding granule g.
 func (d blockDir) frameOf(g int) int {
@@ -523,7 +536,12 @@ func newBlockStreams(dir blockDir, comp *compress.Compressor) blockStreams {
 func (s *blockStreams) granule(g int) ([]byte, error) {
 	f := s.dir.frameOf(g)
 	if f != s.frame {
-		buf, err := s.comp.Decompress(s.buf[:0], s.dir.frame(f))
+		raw, err := s.dir.frame(f)
+		if err != nil {
+			return nil, errors.Wrapf(err, "frame %d", f)
+		}
+
+		buf, err := s.comp.Decompress(s.buf[:0], raw)
 		if err != nil {
 			return nil, errors.Wrapf(err, "decompress frame %d", f)
 		}

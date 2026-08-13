@@ -178,6 +178,28 @@ func (c *cachedBackend) ReadView(ctx context.Context, key string) ([]byte, error
 	return v, nil
 }
 
+// ReadAt serves the range from a resident whole-object entry when there is one, and otherwise
+// forwards the ranged read **without caching it**. Neither half may go through the loading path: it
+// would fetch the whole object to answer a range, which is exactly the cost the range exists to
+// avoid — and for a part column, one that does not fit the budget anyway. Implements [ReaderAt].
+func (c *cachedBackend) ReadAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	if v, ok := c.values.GetIfPresent(key); ok {
+		return slices.Clone(clampRange(v, off, n)), nil
+	}
+
+	return ReadAt(ctx, c.inner, key, off, n)
+}
+
+// ReadViewAt is [cachedBackend.ReadAt] without the copy, under the [Viewer] contract: a resident
+// entry is never mutated in place, so a slice of one stays valid. Implements [ViewerAt].
+func (c *cachedBackend) ReadViewAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	if v, ok := c.values.GetIfPresent(key); ok {
+		return clampRange(v, off, n), nil
+	}
+
+	return ReadViewAt(ctx, c.inner, key, off, n)
+}
+
 func (c *cachedBackend) Write(ctx context.Context, key string, data []byte) error {
 	if err := c.inner.Write(ctx, key, data); err != nil {
 		return err

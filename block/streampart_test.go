@@ -165,7 +165,9 @@ func assertManifestsAgree(t *testing.T, want, got Manifest) {
 
 			assert.True(t, g.Framed, "column %q: a footer directory is a framed one", g.Name)
 
+			// The footer layout costs the 4-byte directory length and nothing else.
 			g.Footer = false
+			g.Bytes -= footerLenBytes
 		}
 
 		assert.Equal(t, canonicalNaN(w), canonicalNaN(g), "column %d descriptor", i)
@@ -431,7 +433,11 @@ func FuzzParseFooterDir(f *testing.F) {
 		}
 
 		for g := range d.nBlocks() {
-			frame := d.frame(d.frameOf(g))
+			frame, err := d.frame(d.frameOf(g))
+			if err != nil {
+				return
+			}
+
 			if _, err := d.granuleStream(g, frame); err != nil {
 				return
 			}

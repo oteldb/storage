@@ -108,6 +108,34 @@ Two things the batch writer settles by looking at a finished column, a streaming
   column is dropped entirely instead. Only the last column may be omitted; dropping an earlier one
   would renumber the object keys after it.
 
+## Reading a column by range
+
+`PartReader.Column` reads a column object whole; `PartReader.ColumnBlocks(ctx, name)` reads only its
+**directory** and then fetches each compression frame with `backend.ReadAt` as blocks are decoded.
+Both are right for different callers: the whole-object form when a caller decodes the whole column,
+the ranged form on the query path, where the matched series' rows lie in a handful of granules.
+
+Whole-column reads made read cost independent of selectivity — a selector matching 16 of 210k series
+still transferred every column byte — so **part size bounded process memory rather than disk**. The
+engine already decoded only the granules it needed (`engine/ARCH.md`, the block-sliced fetch); the
+missing piece was purely the ability to fetch a byte range.
+
+- The **directory** is read up front and kept: two integers per frame and one per granule, ~1.4 MB
+  for an 833 MB column. Everything else is derived from it.
+- Finding it needs the object's size, and asking the backend for one costs a round trip whose
+  fallback (`backend.SizeOf` over a backend without `Sizer`) is *reading the whole object*. So the
+  manifest records each column's object size (`flagBytes`); only a part written before that falls
+  back to asking.
+- The **footer** layout (`flagFooter`, what the streaming writer emits) puts the directory length at
+  a known offset from the end, so one tail read usually lands the whole directory. The
+  directory-leading layout has no recorded length, so its extent is bounded from the counts in its
+  own header — one probe read, then one exact read.
+- That bound must allow for a granule length being measured in the **decompressed** frame, which can
+  dwarf the compressed object holding it (200k rows can be a 1.1 KB object). A bound derived from
+  the object size would come up short and the directory would parse as corrupt.
+- The **compression frame is the floor**: it is the smallest unit a ranged read can fetch, so a
+  single-series fetch pays one frame per column however few rows it wants.
+
 ## Manifest & marks
 
 - **Manifest** — versioned binary record (magic `OTPM`, row count, time range, granule size,
@@ -122,8 +150,9 @@ Two things the batch writer settles by looking at a finished column, a streaming
   **only when `flagLevel` is set** (decode-irrelevant — it exists so the merge engine can tell a part
   already at its target level from one below it), then per-kind stats/const. The
   flag-gating is what keeps lossless and pre-existing parts byte-identical (no version bump, no
-  golden churn); `flagBlocked`/`flagFramed` are additive the same way. Decode bounds-checks every
-  field (fuzzed).
+  golden churn); `flagBlocked`/`flagFramed`/`flagFooter`/`flagBytes` are additive the same way.
+  `flagBytes` carries the column object's own byte size, so a ranged open needs no size round trip.
+  Decode bounds-checks every field (fuzzed).
 - **Marks** — sparse granule index over the sort-key column (per-granule first row + min/max,
   delta-encoded, CRC-checked). `Overlapping(lo,hi)` prunes granules for a time window.
 

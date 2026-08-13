@@ -161,12 +161,9 @@ func (e *Engine) fillFloatColumn(
 	return out, nil
 }
 
-// partBlockDecoder reads the named column's object and returns a per-block decoder over it.
+// partBlockDecoder returns a per-block decoder over the named column, reading its directory rather
+// than its bytes: this path decodes the blocks a query's matched series fall in, so the column
+// object is fetched one compression frame at a time.
 func (e *Engine) partBlockDecoder(ctx context.Context, p *part, name string) (*block.Decoder, error) {
-	col, err := p.reader.Column(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-
-	return col.BlockDecoder()
+	return p.reader.ColumnBlocks(ctx, name)
 }

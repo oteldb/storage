@@ -197,6 +197,26 @@ In **cluster mode**, `Flush`/`Compact` act only on shards this node is the ring-
 `ErrNotOwner` otherwise — so a shard's parts are still written by exactly one node, the invariant the
 maintenance loop preserves. Single-node owns everything.
 
+## Ranged column reads (`backend.ReaderAt`)
+
+A part stores one object per column. Without ranged reads, touching any block of a column transfers
+the whole column, so **read cost was independent of selectivity** and part size bounded process
+memory rather than disk: a selector matching 16 of 210k series still paid for all 210k.
+
+`file` and `s3` read ranges natively (`pread`, the `Range` header); `Memory` copies the range. The
+block-sliced query path opens a column with `PartReader.ColumnBlocks`, which reads the column's
+directory and then only the compression frames holding the matched rows.
+
+Two things an operator should know:
+
+- **The compression frame is the read floor** (`WithCompressBlockBytes`, 64 KiB uncompressed by
+  default). A single-series fetch pays one frame per column however few rows it wants, so on a part
+  small enough to fit in a frame there is nothing to save.
+- **A backend wrapper that hides `backend.Sizer` or `backend.ReaderAt` silently reverts this.**
+  `backend.ReadAt` falls back to a whole-object read, and `backend.SizeOf` to reading the object to
+  measure it. Both are correct and both are the cost this avoids. The in-tree wrappers (read cache,
+  metering) forward them.
+
 ## Backend object sizing (`backend.Sizer`)
 
 `PartsDetailed` needs per-object byte sizes. The `backend.Backend` seam exposes none directly; the

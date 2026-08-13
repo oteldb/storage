@@ -300,6 +300,7 @@ func (w *StreamWriter) build() (builtPart, error) {
 			return builtPart{}, errors.Wrapf(err, "column %q", c.name)
 		}
 
+		desc.Bytes = n
 		descs[i], objects[i], sizes[i] = desc, obj, n
 	}
 

@@ -295,12 +295,10 @@ func (r *seriesBlockReader) releasePins() {
 	r.tsEnt, r.valEnt, r.sfEnt = nil, nil, nil
 }
 
-// partDecoder reads the named column's object and returns a per-block decoder over it.
+// partDecoder returns a per-block decoder over the named column. It reads the column's block
+// directory, not the column: a series' rows lie in one or a few granules, and the frames holding
+// them are fetched as blocks are decoded. Reading the object whole here is what made a selector
+// matching 16 series pay for all of them.
 func (r *seriesBlockReader) partDecoder(ctx context.Context, name string) (*block.Decoder, error) {
-	col, err := r.part.reader.Column(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-
-	return col.BlockDecoder()
+	return r.part.reader.ColumnBlocks(ctx, name)
 }
