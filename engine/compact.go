@@ -36,12 +36,11 @@ func sortedSeriesIDs(ctx context.Context, src []*part) ([]signal.SeriesID, error
 // bounded group of similarly-sized parts and compacts only those, so its working set is O(part
 // size), not O(dataset):
 //
-//   - A part that has reached the merge cap (mergeHeight × MaxPartBytes) is "sealed": re-merging
-//     sealed parts only re-splits them into the same number of equally-full parts, which is pure
-//     churn — so they are never compacted again. Parts below the cap roll up through progressively
-//     taller size tiers (each merge of same-tier siblings produces a larger part), so part count is
-//     bounded at ≈ dataset / (mergeHeight × MaxPartBytes) instead of growing with every flush
-//     (issue #25 root cause A).
+//   - A part that has reached the merge cap is "sealed": re-merging sealed parts only re-splits
+//     them into the same number of equally-full parts, which is pure churn — so they are never
+//     compacted again. Parts below the cap roll up through progressively taller size tiers (each
+//     merge of same-tier siblings produces a larger part), so part count is bounded at
+//     ≈ dataset / cap instead of growing with every flush (issue #25 root cause A).
 //   - Among the unsealed parts, those of similar size share a tier; a tier is compacted once it
 //     holds at least minTierParts of them, so small freshly-flushed parts merge up into larger ones
 //     without re-reading the already-compacted large parts.
@@ -51,45 +50,24 @@ const (
 	// minTierParts is the number of same-tier parts that must accumulate before they are compacted.
 	// Two keeps the part count low under continuous flushing without over-eager single-part merges.
 	minTierParts = 2
-	// maxTierParts caps how many parts one merge compacts when a row budget does not apply
-	// (unlimited part size); the rest are picked up on the next cycle.
+	// maxTierParts keeps one merge bounded in inputs (and wall-clock) however large the byte budget
+	// grows; the rest are picked up next cycle. VictoriaMetrics bounds by parts as well as bytes too.
 	maxTierParts = 16
-	// mergeHeight is how many flush-tier sizes a part may grow to through tiered merging before it is
-	// sealed. A freshly-flushed part is at most MaxPartBytes; the background merge combines
-	// same-tier parts into larger ones, so a promoted part grows toward mergeHeight × MaxPartBytes.
-	// Once it reaches that size it is sealed (re-merging it would only re-split it — pure churn),
-	// bounding part count to ≈ dataset / (mergeHeight × MaxPartBytes) instead of dataset /
-	// MaxPartBytes. The decoded input of one merge is capped at the same mergeHeight × MaxPartBytes,
-	// so the background merge's working set stays bounded regardless of how tall the tier being
-	// compacted is.
-	mergeHeight = 8
-	// tierFloorRows collapses every part below this row count into tier 0, so the many tiny parts of
-	// a test or a low-volume tenant always share a tier and compact together (the power-of-two
-	// bucketing below only differentiates parts large enough for their sizes to matter).
-	tierFloorRows = 1 << 12
+	// tierFloorBytes collapses every part below this size into tier 0, so the many tiny parts of a
+	// low-volume tenant share a tier and compact together.
+	tierFloorBytes = 128 << 10
 )
 
-// mergeCapRows returns the row count at which a part is sealed (never re-compacted): mergeHeight ×
-// the flush-tier cap. 0 (never seal) when the flush cap is 0 (unlimited part size), so unlimited
-// parts always merge into one.
-func mergeCapRows(maxRows int) int {
-	if maxRows <= 0 {
+// sizeTier buckets a part by size on disk into a tier, so two parts within 2× of each other (above
+// the floor) share a tier. Parts at or below tierFloorBytes are all tier 0.
+func sizeTier(size int64) int {
+	if size <= tierFloorBytes {
 		return 0
 	}
 
-	return maxRows * mergeHeight
-}
-
-// sizeTier buckets a part by row count into a tier, so two parts within 2× of each other (above the
-// floor) share a tier. Parts at or below tierFloorRows are all tier 0.
-func sizeTier(rows int) int {
-	if rows <= tierFloorRows {
-		return 0
-	}
-
-	// bits.Len(rows) − bits.Len(floor) is ⌊log2(rows)⌋ − ⌊log2(floor)⌋: how many size-doublings above
+	// bits.Len(size) − bits.Len(floor) is ⌊log2(size)⌋ − ⌊log2(floor)⌋: how many size-doublings above
 	// the floor, i.e. the power-of-two tier.
-	return bits.Len(uint(rows)) - bits.Len(uint(tierFloorRows))
+	return bits.Len64(uint64(size)) - bits.Len64(uint64(tierFloorBytes))
 }
 
 // forcedRewrite reports whether a part must be rewritten this merge regardless of its size: it holds
@@ -110,8 +88,8 @@ func forcedRewrite(p *part, opts MergeOptions) bool {
 // union of the parts a forced rewrite (retention/downsample/recompress/precision) must touch and the
 // best same-tier group of unsealed parts. It returns nil when nothing is worth doing — fewer than
 // minTierParts in every tier and no forced part — so the merge is a no-op without decoding anything.
-// capRows is the seal threshold in rows (0 ⇒ unlimited, so no part is ever sealed).
-func selectMergeParts(src []*part, opts MergeOptions, capRows int) []*part {
+// capBytes is the seal threshold in bytes on disk (0 ⇒ unlimited, so no part is ever sealed).
+func selectMergeParts(src []*part, opts MergeOptions, capBytes int64) []*part {
 	var (
 		selected []*part
 		chosen   = make(map[*part]struct{}, len(src))
@@ -130,7 +108,7 @@ func selectMergeParts(src []*part, opts MergeOptions, capRows int) []*part {
 		}
 	}
 
-	for _, p := range pickTierGroup(src, capRows) {
+	for _, p := range pickTierGroup(src, capBytes) {
 		add(p)
 	}
 
@@ -139,17 +117,16 @@ func selectMergeParts(src []*part, opts MergeOptions, capRows int) []*part {
 
 // pickTierGroup returns the group of unsealed parts to compact for size reduction: the tier holding
 // the most parts (ties broken toward the smaller tier, to drain small parts first), once it holds at
-// least minTierParts. The group is capped by cumulative rows at the seal threshold (so one merge's
-// decoded input is at most one sealed-tier part's worth), or by maxTierParts when part size is
-// unlimited. Returns nil when no tier qualifies. Parts keep their src (sequence) order within the
-// group.
-func pickTierGroup(src []*part, capRows int) []*part {
-	sealed := func(p *part) bool { return capRows > 0 && p.rows() >= capRows }
+// least minTierParts. The group is bounded both by cumulative bytes at the seal threshold (so one
+// merge produces at most one full-size part) and by maxTierParts. Returns nil when no tier
+// qualifies. Parts keep their src (sequence) order within the group.
+func pickTierGroup(src []*part, capBytes int64) []*part {
+	sealed := func(p *part) bool { return capBytes > 0 && p.sizeBytes() >= capBytes }
 
 	byTier := make(map[int][]*part)
 	for _, p := range src {
 		if !sealed(p) {
-			t := sizeTier(p.rows())
+			t := sizeTier(p.sizeBytes())
 			byTier[t] = append(byTier[t], p)
 		}
 	}
@@ -167,20 +144,17 @@ func pickTierGroup(src []*part, capRows int) []*part {
 
 	group := byTier[bestTier]
 
-	if capRows > 0 {
-		// Cap the group's cumulative rows at the seal threshold, so the decoded input of one merge is
-		// at most one sealed-tier part's worth — taking at least minTierParts so a merge always makes
+	if capBytes > 0 {
+		// One merge produces at most one full-size part, but always takes minTierParts so it makes
 		// progress even when two parts already approach the cap.
-		total := 0
+		var total int64
 
 		for i, p := range group {
-			total += p.rows()
-			if i+1 >= minTierParts && total >= capRows {
+			total += p.sizeBytes()
+			if i+1 >= minTierParts && total >= capBytes {
 				return group[:i+1]
 			}
 		}
-
-		return group
 	}
 
 	if len(group) > maxTierParts {
@@ -193,17 +167,17 @@ func pickTierGroup(src []*part, capRows int) []*part {
 // tierShape summarizes why a merge selected nothing: how many parts are sealed, how many distinct
 // size tiers the unsealed ones occupy, and the largest tier's part count — which is the number
 // [pickTierGroup] compares against minTierParts.
-func tierShape(src []*part, capRows int) (sealed, tiers, largestTier int) {
+func tierShape(src []*part, capBytes int64) (sealed, tiers, largestTier int) {
 	byTier := make(map[int]int, len(src))
 
 	for _, p := range src {
-		if capRows > 0 && p.rows() >= capRows {
+		if capBytes > 0 && p.sizeBytes() >= capBytes {
 			sealed++
 
 			continue
 		}
 
-		byTier[sizeTier(p.rows())]++
+		byTier[sizeTier(p.sizeBytes())]++
 	}
 
 	for _, n := range byTier {

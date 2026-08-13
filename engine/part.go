@@ -252,6 +252,8 @@ type part struct {
 	index  partIndex
 	hasSF  bool // the part carries a scale-factor column (sampling occurred); else every weight is 1
 
+	diskBytes int64 // from the manifest; 0 for a part predating the field, see sizeBytes
+
 	// statsOnce lazily loads the per-series aggregate sidecar (statsKey) on first aggregate query;
 	// stats is nil when the sidecar is absent/corrupt or the part is sampled, signaling the
 	// aggregate path to fall back to decoding this part.
@@ -326,11 +328,12 @@ func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, err
 	}
 
 	return &part{
-		reader: r,
-		be:     b,
-		prefix: prefix,
-		index:  idx,
-		hasSF:  slices.Contains(r.ColumnNames(), colSF),
+		reader:    r,
+		be:        b,
+		prefix:    prefix,
+		index:     idx,
+		hasSF:     slices.Contains(r.ColumnNames(), colSF),
+		diskBytes: r.Manifest().DiskBytes,
 	}, nil
 }
 
@@ -378,6 +381,17 @@ func (p *part) compressedAt() (compress.Algorithm, compress.Level) {
 // rows returns the part's total sample count (its series ranges partition [0, rows)).
 func (p *part) rows() int {
 	return p.index.rows()
+}
+
+// sizeBytes is the part's size on disk, the unit the merge cap and the size tiers are expressed in.
+// A part predating the manifest field falls back to the uncompressed row estimate — the quantity
+// the cap used to be in, so it tiers and seals as before — and gets a real size on first merge.
+func (p *part) sizeBytes() int64 {
+	if p.diskBytes > 0 {
+		return p.diskBytes
+	}
+
+	return int64(p.rows()) * partRowBytes
 }
 
 // colNeed selects which of a part's columns a decode materializes beyond the always-decoded

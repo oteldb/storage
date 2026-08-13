@@ -303,3 +303,38 @@ func TestOpenPartUsesSidecarAndFallsBack(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, pBad.index.paged, "corrupt sidecar ⇒ resident fallback")
 }
+
+// TestSeriesIndexRunsMatchesColumn pins the run-fed sidecar encoder — what the streaming merge
+// writes, since it never materializes the expanded series column — against the column-fed one.
+func TestSeriesIndexRunsMatchesColumn(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		runs []chunk.U128Run
+	}{
+		{"empty", nil},
+		{"single", []chunk.U128Run{{Value: chunk.U128{Hi: 1, Lo: 2}, Count: 1}}},
+		{"long run", []chunk.U128Run{{Value: chunk.U128{Lo: 5}, Count: 1000}}},
+		{"many", []chunk.U128Run{
+			{Value: chunk.U128{Lo: 1}, Count: 3},
+			{Value: chunk.U128{Lo: 2}, Count: 1},
+			{Value: chunk.U128{Hi: 1, Lo: 0}, Count: 7},
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var col []chunk.U128
+			for _, r := range tc.runs {
+				for range r.Count {
+					col = append(col, r.Value)
+				}
+			}
+
+			assert.Equal(t, encodeSeriesIndex(col), encodeSeriesIndexRuns(tc.runs))
+		})
+	}
+}

@@ -44,9 +44,21 @@ type Config struct {
 	// bytes (LRU). It skips the column re-decode that the backend read cache cannot, and applies to
 	// every backend (a decode is CPU even when the read is RAM-fast). Zero disables it.
 	DecodeCacheBytes int64
-	// MaxPartBytes caps an immutable part's (approximate, uncompressed) size: flush and merge split
-	// their output into multiple parts so no single part exceeds it. 0 ⇒ unlimited (one part).
+	// MaxPartBytes caps a *flushed* part's (approximate, uncompressed) size: a flush splits its
+	// output so no single part exceeds it. 0 ⇒ unlimited. A merged part is sized by
+	// MergeCeilingBytes instead.
 	MaxPartBytes int64
+	// MergeCeilingBytes is the upper bound on a merged part's size *on disk*; the effective cap is
+	// the lesser of it and this merge's share of the backend's free space (see mergecap.go). 0 ⇒
+	// defaultMergeCeilingBytes; negative ⇒ unlimited (never seal).
+	MergeCeilingBytes int64
+	// MergeConcurrency reports how many merges may run concurrently against this backend, dividing
+	// the free space so they cannot collectively exhaust the disk. nil or ≤ 1 ⇒ no division.
+	//
+	// A callback because the answer moves: fan-out is bounded by the node's engine count as much as
+	// by its worker limit, and engines appear lazily. Fixing it at engine creation would divide a
+	// single-tenant node's disk by its core count, undoing most of the widening.
+	MergeConcurrency func() int
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each part,
 	// so [Engine.AggregateRange] answers a range-covering aggregate from it without decoding the
 	// value column. It costs a little storage per series; off by default. AggregateRange works

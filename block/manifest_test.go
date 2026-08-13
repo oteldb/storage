@@ -149,8 +149,18 @@ func TestManifestTruncationSweep(t *testing.T) {
 		copy(truncated, body[:n])
 		binary.BigEndian.PutUint32(truncated[n:], crc32.Checksum(body[:n], castagnoli))
 
-		_, err := DecodeManifest(truncated)
-		require.Errorf(t, err, "prefix len %d should be rejected", n)
+		got, err := DecodeManifest(truncated)
+		if err == nil {
+			// DiskBytes is a trailing optional field, so the one prefix that drops exactly it is a
+			// valid manifest in the older layout — that is what makes the field readable both ways.
+			// Every other prefix must be rejected.
+			want := sampleManifest()
+			want.DiskBytes = 0
+			require.Equalf(t, want, got, "prefix len %d decoded, so it must be the manifest without DiskBytes", n)
+
+			continue
+		}
+
 		require.ErrorIsf(t, err, ErrCorrupt, "prefix len %d", n)
 	}
 
@@ -182,8 +192,9 @@ func TestManifestRejectsHugeColCount(t *testing.T) {
 }
 
 // TestManifestGolden pins the exact on-disk bytes of a fixed manifest so an accidental
-// format change is caught (DESIGN.md §13). If the format changes intentionally, bump
-// manifestVersion and update this golden.
+// format change is caught. A purely additive change (a trailing field, a new flag bit) keeps the
+// version and updates this golden; only a change that an existing reader cannot parse bumps
+// manifestVersion.
 func TestManifestGolden(t *testing.T) {
 	t.Parallel()
 
@@ -195,7 +206,7 @@ func TestManifestGolden(t *testing.T) {
 		}},
 	}
 
-	const golden = "4f54504d0102c801900380400102747300010000c80190032cc1aa66"
+	const golden = "4f54504d0102c801900380400102747300010000c8019003001536e671"
 	assert.Equal(t, golden, hex.EncodeToString(m.Encode(nil)))
 
 	// And it must round-trip from the golden bytes.
@@ -204,6 +215,16 @@ func TestManifestGolden(t *testing.T) {
 	got, err := DecodeManifest(raw)
 	require.NoError(t, err)
 	assert.Equal(t, m, got)
+
+	// A manifest written before DiskBytes existed — the same bytes without the trailing field —
+	// must still decode, reporting an unknown size rather than failing.
+	const beforeDiskBytes = "4f54504d0102c801900380400102747300010000c80190032cc1aa66"
+
+	raw, err = hex.DecodeString(beforeDiskBytes)
+	require.NoError(t, err)
+	got, err = DecodeManifest(raw)
+	require.NoError(t, err)
+	assert.Equal(t, m, got, "an older manifest reads identically, with DiskBytes zero")
 }
 
 func TestKindString(t *testing.T) {

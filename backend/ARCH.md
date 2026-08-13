@@ -44,6 +44,13 @@ conformance suite all of them pass under `-race`.
   tenant's parts without a full `List`. Fuzzed + golden-tested.
 - **`backend.Sizer`** — optional `Size(ctx,key)` for byte accounting without reading (used by
   `PartsDetailed`); `backend.SizeOf` falls back to a full read.
+- **`backend.SpaceReporter`** — optional `FreeSpace(ctx)`, implemented by `file` (statfs, and
+  reporting the *unprivileged* figure so the root reserve is never counted as usable). The merge
+  engine sizes its output parts against it instead of a constant, so part size tracks the disk the
+  data lands on. `backend.FreeSpace` returns `ErrSpaceUnknown` for a backend without it — `Memory`
+  and object stores, where local free space has no meaning — and the caller then falls back to its
+  configured ceiling. **A wrapper must forward it**: `cachedBackend` does, or every cached backend
+  would silently lose the capability.
 
 ## Stateless read path
 

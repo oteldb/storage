@@ -45,6 +45,33 @@ var errSidxCorrupt = errors.New("engine: corrupt series-index sidecar")
 // deletePart lists and removes everything under the prefix).
 func sidxKey(prefix string) string { return prefix + "/sidx" }
 
+// encodeSeriesIndexRuns is [encodeSeriesIndex] over the series column's run-length form, for a
+// streaming writer that never materializes the expanded column. Runs must be in row order with
+// distinct adjacent ids and a positive count — the shape a merge emits, one run per series.
+func encodeSeriesIndexRuns(runs []chunk.U128Run) []byte {
+	rows := 0
+	for _, r := range runs {
+		rows += r.Count
+	}
+
+	buf := make([]byte, 0, 5+2*binary.MaxVarintLen64+len(runs)*sidxEntryW+4)
+	buf = binary.BigEndian.AppendUint32(buf, sidxMagic)
+	buf = append(buf, sidxVersion)
+	buf = binary.AppendUvarint(buf, uint64(len(runs)))
+	buf = binary.AppendUvarint(buf, uint64(rows))
+
+	start := 0
+
+	for _, r := range runs {
+		buf = binary.BigEndian.AppendUint64(buf, r.Value.Hi)
+		buf = binary.BigEndian.AppendUint64(buf, r.Value.Lo)
+		buf = binary.BigEndian.AppendUint32(buf, uint32(start))
+		start += r.Count
+	}
+
+	return binary.BigEndian.AppendUint32(buf, crc32.Checksum(buf, sidxCRC))
+}
+
 // encodeSeriesIndex serializes the series-index sidecar from a part's sorted series column (each
 // distinct id repeated for its contiguous run) — the same single pass as buildPartIndex, emitted
 // as fixed-width entries instead of resident slices.
