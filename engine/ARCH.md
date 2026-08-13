@@ -196,13 +196,28 @@ subsystem.
 - **Recompression is decode-transparent** — the reader keys off the per-column algorithm in the
   manifest, so it is a pure ratio/CPU trade with no format change. The *level* is recorded too, but
   only so the merge can tell a part already at the target from one below it; nothing reads it back.
-- **Size-tiered selection** (`compact.go`) picks only what is worth merging: any part a forced
-  rewrite must touch (retention/downsample/recompress/precision — so age-driven work is never
-  starved), plus the largest group of same-tier *unsealed* parts. A part whose size on disk has
-  reached the merge cap is **sealed** — re-merging it would only re-split it. Part count is bounded
-  at ≈ dataset / cap instead of growing per flush. Tiers, sealing and the group budget are all in
-  on-disk bytes (`part.sizeBytes`, from the manifest); a group is bounded by `maxTierParts` as well,
-  so a large disk-derived budget cannot turn one merge into an unbounded one.
+- **Run selection** (`compact.go`) picks only what is worth merging: any part a forced rewrite must
+  touch (retention/downsample/recompress/precision — so age-driven work is never starved), plus the
+  best run of *unsealed* parts. A part at the merge cap is **sealed** — re-merging it would only
+  re-split it — so part count is bounded at ≈ dataset / cap instead of growing per flush. Sealing
+  and the run budget are in on-disk bytes (`part.sizeBytes`); a run is bounded by `maxMergeParts` as
+  well, so a large disk-derived budget cannot turn one merge into an unbounded one.
+
+  Parts are **ordered** by size and every run of adjacent ones is scored `m = output / largest
+  input`, the inverse of write amplification (VictoriaMetrics' `appendPartsToMerge`). They are not
+  *bucketed* by size, which is what used to strand leftovers: a part alone in its power-of-two tier
+  could never reach the two-per-tier threshold, and nothing would ever land in exactly that tier
+  again, so it was carried by every query for the engine's lifetime (#285).
+
+  Ordering alone does not fix it, because those leftovers are spread geometrically — one per former
+  tier — so every run over them fails the balance test or scores under `minMergeMultiplier`. Two
+  escapes close it: a run whose *total* is under `smallRunBytes` skips both guards (they argue about
+  the proportion of bytes rewritten, which is meaningless when the whole rewrite is cheap), and
+  after `mergeIdleRounds` merges that selected nothing, the best run is taken regardless of score.
+  Rewriting a large part once to absorb a stray is far cheaper than carrying that stray forever.
+
+  The selector works in size order but returns the run in the engine's part order: the merge visits
+  its sources oldest → newest so a later part's value wins a duplicate timestamp.
 - **Streaming both ways** (`compactStream`): each source is read through a forward cursor decoding
   one series range at a time, and each merged series is handed straight to a `partStreamWriter`
   (`streampart.go`) wrapping a `block.StreamWriter`, which encodes a granule as soon as one fills.

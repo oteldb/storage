@@ -86,22 +86,27 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 
 	capBytes := e.mergeCapBytes(ctx)
 
-	selected := selectMergeParts(src, opts, capBytes)
+	selected := selectMergeParts(src, opts, capBytes, e.idleMerges)
 	if len(selected) == 0 {
+		e.idleMerges++
+
 		// A no-op is indistinguishable from a healthy engine without the shape of what it looked
 		// at: 59 parts sat uncompacted for hours logging only "nothing to compact". These are the
 		// exact inputs to that decision.
-		sealedN, tiers, largest := tierShape(src, capBytes)
+		sealedN, eligible, bestM := mergeShape(src, capBytes)
 		zctx.From(ctx).Debug("merge selected nothing",
 			zap.String("prefix", e.cfg.Prefix), zap.Int("parts", len(src)),
 			zap.Int("sealed", sealedN), zap.Int64("cap_bytes", capBytes),
-			zap.Int("tiers", tiers), zap.Int("largest_tier_parts", largest),
-			zap.Int("min_tier_parts", minTierParts))
+			zap.Int("eligible", eligible), zap.Float64("best_multiplier", bestM),
+			zap.Float64("min_multiplier", minMergeMultiplier),
+			zap.Int("idle_rounds", e.idleMerges), zap.Int("waive_after", mergeIdleRounds))
 
 		e.reclaimRetired(ctx)
 
 		return 0, nil
 	}
+
+	e.idleMerges = 0
 
 	start := minInt64
 	if opts.RetainFrom > 0 {

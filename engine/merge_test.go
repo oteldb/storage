@@ -10,6 +10,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/signal"
 )
 
 func TestMergeCompactsParts(t *testing.T) {
@@ -149,4 +150,57 @@ func TestCloseFlushesHead(t *testing.T) {
 	mustAppend(t, e, mkSeries("job", "api"), 100, 1.0)
 	require.NoError(t, e.Close(context.Background()))
 	assert.Equal(t, 1, e.PartCount(), "Close flushes the head")
+}
+
+// TestMergeEventuallyCompactsStrays is #285 end-to-end: parts of geometrically increasing size —
+// what tiered compaction leaves behind, one per size class — must not sit uncompacted forever.
+// Repeated maintenance ticks with no other work must eventually fold them together.
+func TestMergeEventuallyCompactsStrays(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	e := engine.New(engine.Config{Backend: backend.Memory(), Prefix: "default/metrics"})
+
+	// Each flush is ~4x the previous, so no two parts are close in size.
+	base := int64(0)
+	for _, samples := range []int{1, 4, 16, 64, 256} {
+		ids, series, ts, vals := seriesWithSamples(samples, base)
+		_, err := e.AppendBatch(ids, ts, vals, nil, func(i int) signal.Series { return series[i] }, engine.AppendLimits{})
+		require.NoError(t, err)
+		require.NoError(t, e.Flush(ctx))
+
+		base += int64(samples)
+	}
+
+	require.Equal(t, 5, e.PartCount(), "five parts of unlike size")
+
+	// Idle ticks: the write-amplification guard holds at first, then gives way rather than
+	// stranding them. Comfortably more ticks than the engine's waive threshold.
+	for range 8 {
+		require.NoError(t, e.Merge(ctx, 0))
+	}
+
+	assert.Less(t, e.PartCount(), 5, "strays must eventually merge")
+
+	// Every sample is still readable afterwards.
+	got := fetchAll(t, e, fetch.Request{Start: 0, End: 1 << 62})
+	assert.NotEmpty(t, got)
+}
+
+// seriesWithSamples builds one series carrying n samples starting at tsBase.
+func seriesWithSamples(n int, tsBase int64) ([]signal.SeriesID, []signal.Series, []int64, []float64) {
+	s := mkSeries("__name__", "m", "job", "api")
+
+	ids := make([]signal.SeriesID, n)
+	series := make([]signal.Series, n)
+	ts := make([]int64, n)
+	vals := make([]float64, n)
+
+	for i := range n {
+		ids[i], series[i] = s.Hash(), s
+		ts[i] = tsBase + int64(i)
+		vals[i] = float64(i)
+	}
+
+	return ids, series, ts, vals
 }

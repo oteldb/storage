@@ -108,6 +108,10 @@ type Engine struct {
 	head    *head
 	parts   []*part
 	nextSeq int
+	// idleMerges counts consecutive merges that selected nothing, so the selector can waive its
+	// write-amplification guard for parts that would otherwise never merge (see pickMergeRun).
+	// Guarded by flushMu, which a merge holds across its whole body.
+	idleMerges int
 	// mergeRunning is true while a [Engine.MergeWith] is executing (introspection liveness; see
 	// [Engine.MergeRunning]). Set/cleared around the merge, not held during it.
 	mergeRunning atomic.Bool
