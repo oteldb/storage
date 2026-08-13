@@ -67,7 +67,10 @@ Part *byte* sizes are intentionally omitted from `Inspect` (they would need back
 ### Drill-down per `(tenant, signal)` (`introspect.go`)
 
 - **`Parts(tenant, signal) []PartInfo`** — one entry per flushed part: `ID` (key prefix), time
-  bounds, `Series`, `Rows`. In-memory, no backend I/O — safe to poll.
+  bounds, `Series`, `Rows`. In-memory, no backend I/O — safe to poll. (The metric engine's own
+  `engine.PartStat` additionally carries `SizeBytes`, the part's recorded on-disk size — the figure
+  the merge cap compares against, and so the one that explains why a part is or is not sealed. It is
+  not yet on the cross-signal `PartInfo`, since the record engines do not record it.)
 - **`PartsDetailed(ctx, tenant, signal) ([]PartDetail, error)`** — augments each part with `Bytes`
   (summed backend object sizes), `Chunks` (sparse-index granules), and `Columns` (`Name`, `Kind`,
   `Codec`, `Compress`, `Level` — the compression level, which for merged metric parts climbs a

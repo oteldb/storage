@@ -154,6 +154,9 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 	return nil
 }
 
+// encodedBytes is the compressed size the part has accumulated so far, what the merge seals on.
+func (p *partStreamWriter) encodedBytes() int64 { return p.w.EncodedBytes() }
+
 // weights returns n per-sample weights, materializing the unit vector for an unsampled series so a
 // declared weight column stays aligned with the other columns.
 func (p *partStreamWriter) weights(sf []float64, n int) []float64 {

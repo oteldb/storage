@@ -16,6 +16,12 @@ type PartStat struct {
 	MaxTime int64
 	Series  int   // distinct series in the part (len of its row-range index)
 	Rows    int64 // total samples (sum of the per-series row spans)
+	// SizeBytes is the part's size on disk as recorded in its manifest — the figure the merge cap
+	// compares against, so it is what explains why a part is or is not sealed. It needs no I/O.
+	// It counts the column and marks objects only; [PartDetailStat.Bytes] measures every object,
+	// sidecars included, at the cost of a backend read. 0 for a part written before the manifest
+	// recorded it.
+	SizeBytes int64
 }
 
 // PartDetailStat augments [PartStat] with fields that need a backend read: the on-backend byte size
@@ -66,6 +72,7 @@ func (e *Engine) Parts() []PartStat {
 		out = append(out, PartStat{
 			ID: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
 			Series: p.index.seriesCount(), Rows: int64(p.rows()),
+			SizeBytes: p.diskBytes,
 		})
 	}
 
@@ -114,6 +121,7 @@ func (e *Engine) PartsDetailed(ctx context.Context) ([]PartDetailStat, error) {
 			PartStat: PartStat{
 				ID: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
 				Series: p.index.seriesCount(), Rows: int64(p.rows()),
+				SizeBytes: p.diskBytes,
 			},
 			Bytes:   bytes,
 			Chunks:  granuleCount(man.RowCount, man.GranuleSize),

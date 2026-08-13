@@ -92,6 +92,13 @@ type cachedBackend struct {
 
 func (c *cachedBackend) IsEphemeral() bool { return c.inner.IsEphemeral() }
 
+// FreeSpace forwards the [SpaceReporter] capability, which caching neither provides nor changes.
+// Without this the wrapper would silently hide it and the merge engine would fall back to its
+// ceiling on every cached backend.
+func (c *cachedBackend) FreeSpace(ctx context.Context) (int64, error) {
+	return FreeSpace(ctx, c.inner)
+}
+
 func (c *cachedBackend) Read(ctx context.Context, key string) ([]byte, error) {
 	v, err := c.ReadView(ctx, key)
 	if err != nil {

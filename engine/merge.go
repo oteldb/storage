@@ -84,18 +84,17 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	src := e.parts
 	e.mu.Unlock()
 
-	maxRows := maxRowsPerPart(e.cfg.MaxPartBytes)
-	capRows := mergeCapRows(maxRows)
+	capBytes := e.mergeCapBytes(ctx)
 
-	selected := selectMergeParts(src, opts, capRows)
+	selected := selectMergeParts(src, opts, capBytes)
 	if len(selected) == 0 {
 		// A no-op is indistinguishable from a healthy engine without the shape of what it looked
 		// at: 59 parts sat uncompacted for hours logging only "nothing to compact". These are the
 		// exact inputs to that decision.
-		sealedN, tiers, largest := tierShape(src, capRows)
+		sealedN, tiers, largest := tierShape(src, capBytes)
 		zctx.From(ctx).Debug("merge selected nothing",
 			zap.String("prefix", e.cfg.Prefix), zap.Int("parts", len(src)),
-			zap.Int("sealed", sealedN), zap.Int("cap_rows", capRows),
+			zap.Int("sealed", sealedN), zap.Int64("cap_bytes", capBytes),
 			zap.Int("tiers", tiers), zap.Int("largest_tier_parts", largest),
 			zap.Int("min_tier_parts", minTierParts))
 
@@ -132,10 +131,10 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 			return 0, nil
 		}
 
-		if newParts, err = e.writeColumns(ctx, cols, capRows, opts); err != nil {
+		if newParts, err = e.writeColumns(ctx, cols, rowCapFor(p, capBytes), opts); err != nil {
 			return 0, err
 		}
-	} else if newParts, err = e.compactStream(ctx, selected, start, capRows, opts); err != nil {
+	} else if newParts, err = e.compactStream(ctx, selected, start, capBytes, opts); err != nil {
 		return 0, err
 	}
 
@@ -296,14 +295,14 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 // [partStreamWriter], which codec-encodes a granule as soon as one fills, so what the merge holds
 // is the *encoded* output part rather than its uncompressed rows — several times smaller on
 // high-entropy gauges and orders of magnitude smaller on counter-shaped data. That is what
-// decouples the two jobs the row cap used to do at once: capRows still decides part granularity,
-// but it no longer sets the merge's peak memory, so the cap can rise (and part count fall) without
-// a memory regression. capRows ≤ 0 (unlimited part size) writes a single output part.
+// decouples the two jobs the cap used to do at once: it still decides part granularity, but it no
+// longer sets the merge's peak memory — which is what lets the cap be sized from free space rather
+// than held at a constant. capBytes ≤ 0 (unlimited part size) writes a single output part.
 //
 // Series are visited in (series, ts) order; within a series the parts are visited oldest→newest so
 // a later part's value wins a duplicate timestamp, then the result is downsampled.
 func (e *Engine) compactStream(
-	ctx context.Context, src []*part, start int64, capRows int, opts MergeOptions,
+	ctx context.Context, src []*part, start int64, capBytes int64, opts MergeOptions,
 ) ([]*part, error) {
 	ids, err := sortedSeriesIDs(ctx, src)
 	if err != nil {
@@ -322,7 +321,7 @@ func (e *Engine) compactStream(
 	}
 
 	scratch := make([]rangeBuf, len(src))
-	comp, precision, withSF := mergeEncoding(src, capRows, opts)
+	comp, precision, withSF := mergeEncoding(src, capBytes, opts)
 
 	var (
 		newParts []*part
@@ -371,10 +370,12 @@ func (e *Engine) compactStream(
 			return nil, err
 		}
 
-		// Finish a part once it reaches the output cap. A series whose own run overshoots the cap
-		// is split at the next series boundary (parts are independent; the read seam merges a
+		// Finish a part once its encoded size reaches the cap. Measuring what has actually been
+		// written — rather than a row count times an assumed bytes-per-row — is what makes the cap
+		// comparable to the free space it is derived from. A series whose own run overshoots the
+		// cap is split at the next series boundary (parts are independent; the read seam merges a
 		// series spanning parts).
-		if capRows > 0 && cur.rows >= capRows {
+		if capBytes > 0 && cur.encodedBytes() >= capBytes {
 			if err := emit(); err != nil {
 				return nil, err
 			}
@@ -399,30 +400,48 @@ func (e *Engine) compactStream(
 //     two, so the part is treated as hotter: it keeps more precision and a cheaper level than it
 //     strictly needs, never less. The next merge sees that part's own stamped maxTime and settles
 //     it, so the estimate is self-correcting rather than sticky.
-//   - The compression ladder is a step function of part size, so the cap (or the whole group, when
-//     it is smaller) is the row count every output part but the last will have exactly.
+//   - The compression ladder is a step function of row count, so it is estimated from the source
+//     rows scaled by the share of the group's bytes one output part will hold.
 //   - The weight column is declared if any source carries one. It cannot appear from nowhere: with
 //     no sampled input every collected weight is 1, and downsample returns a nil weight vector when
 //     every output weight is 1. If the weights all turn out to be 1 anyway, the column is dropped
 //     again at finish.
-func mergeEncoding(src []*part, capRows int, opts MergeOptions) (compressProfile, uint8, bool) {
+func mergeEncoding(src []*part, capBytes int64, opts MergeOptions) (compressProfile, uint8, bool) {
 	var (
-		maxT   = minInt64
-		rows   int
-		withSF bool
+		maxT     = minInt64
+		rows     int
+		srcBytes int64
+		withSF   bool
 	)
 
 	for _, p := range src {
 		maxT = max(maxT, p.maxTime)
 		rows += p.rows()
+		srcBytes += p.sizeBytes()
 		withSF = withSF || p.hasSF
 	}
 
-	if capRows > 0 {
-		rows = min(rows, capRows)
+	if capBytes > 0 && srcBytes > capBytes {
+		rows = int(int64(rows) * capBytes / srcBytes)
 	}
 
 	return mergeProfile(opts.Recompress, maxT, rows), pickPrecision(opts.Precision, maxT), withSF
+}
+
+// rowCapFor converts the byte cap into the row cap the whole-column rewrite path splits on, using
+// the part's own bytes-per-row. That path holds decoded columns, so it can only split by row; the
+// part being rewritten is the best available estimate of how its own rewrite will compress.
+func rowCapFor(p *part, capBytes int64) int {
+	if capBytes <= 0 {
+		return 0
+	}
+
+	size, rows := p.sizeBytes(), p.rows()
+	if size <= 0 || rows <= 0 {
+		return 0
+	}
+
+	return max(int(capBytes*int64(rows)/size), 1)
 }
 
 // mergeStreamedSeries gathers one series' samples across the source parts (oldest → newest, so a

@@ -1077,6 +1077,8 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		return nil, err
 	}
 
+	limits := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Limits
+
 	e := engine.New(engine.Config{
 		OOOWindow:        s.opts.OOOWindow,
 		Backend:          s.backendFor(tid),
@@ -1088,12 +1090,19 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		// in-flight decoded bytes instead of multiplying per tenant. nil ⇒ unlimited.
 		DecodeBudget:   s.decodeBudget,
 		AggregateStats: s.opts.AggregateStats,
-		// MaxPartBytes caps each flushed/merged part; resolved from the tenant's policy, falling back
-		// to defaultMaxPartBytes when the policy leaves it unset. It is an operational/structural cap
-		// fixed at engine creation (unlike the per-write admission limits). A bounded part size is what
-		// lets size-tiered compaction seal the top tier — without it a continuously-ingesting tenant's
-		// merge would grow to materialize the whole dataset (see github.com/oteldb/storage issue 22).
-		MaxPartBytes: partSizeOrDefault(s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Limits.MaxPartSize),
+		// MaxPartBytes caps each flushed part; resolved from the tenant's policy, falling back to
+		// defaultMaxPartBytes when the policy leaves it unset. It is an operational/structural cap
+		// fixed at engine creation (unlike the per-write admission limits).
+		MaxPartBytes: partSizeOrDefault(limits.MaxPartSize),
+		// MergeCeilingBytes bounds a *merged* part, in bytes on disk. Left at the policy's zero the
+		// engine derives the cap from the backend's free space, so part size — and therefore the
+		// part count a query opens — tracks the deployment rather than a constant.
+		MergeCeilingBytes: limits.MaxMergePartSize,
+		// Concurrent merges share one disk, so each merge may claim only its share of the free
+		// space (VictoriaMetrics divides by its merge worker count for the same reason). The fan-out
+		// is bounded by the engine count as well as the worker limit, so a single-tenant node
+		// divides by one rather than by its core count.
+		MergeConcurrency: s.mergeConcurrency,
 	})
 	s.tenants[tid] = e
 
@@ -1495,6 +1504,16 @@ func (s *Storage) maintain(ctx context.Context) {
 
 // maintenanceConcurrency is the parallel flush/merge/fsync fan-out cap for the background loops,
 // from [Options.MaintenanceConcurrency] or a CPU-derived default.
+// mergeConcurrency is how many merges may realistically run at once: the maintenance fan-out,
+// bounded by the number of engines there are to merge.
+func (s *Storage) mergeConcurrency() int {
+	s.tmu.Lock()
+	n := len(s.tenants)
+	s.tmu.Unlock()
+
+	return max(min(s.maintenanceConcurrency(), n), 1)
+}
+
 func (s *Storage) maintenanceConcurrency() int {
 	if s.opts.MaintenanceConcurrency > 0 {
 		return s.opts.MaintenanceConcurrency

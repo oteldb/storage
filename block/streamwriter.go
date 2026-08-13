@@ -203,6 +203,32 @@ func (w *StreamWriter) Rows() int {
 	return w.cols[0].rows
 }
 
+// EncodedBytes returns the compressed bytes the part's columns have accumulated so far. It is what
+// a caller seals a part on when the target is a size on disk rather than a row count.
+//
+// It is a lower bound, low by at most one unsealed compression frame per column plus the id
+// column's RLE stream (not encoded until the part is built) — tens of KiB against a cap in the
+// hundreds of MiB. For an AutoCodec column it counts the smaller candidate, which is the one the
+// part will keep.
+func (w *StreamWriter) EncodedBytes() int64 {
+	var total int64
+
+	for _, c := range w.cols {
+		if c.blk == nil {
+			continue // an id column has no accumulator; its stream is built at the end
+		}
+
+		n := c.blk.bytes
+		if c.autoCodec && c.altOK && c.alt.bytes < n {
+			n = c.alt.bytes
+		}
+
+		total += int64(n)
+	}
+
+	return total
+}
+
 // build serializes the part: it encodes each column's trailing partial granule, seals the
 // compression frames, and builds the marks index and manifest. Every column must have received
 // the same number of rows. The writer must not be appended to afterwards.
@@ -254,7 +280,10 @@ func (w *StreamWriter) build() (builtPart, error) {
 		m.MinTime, m.MaxTime = descs[idx].MinInt64, descs[idx].MaxInt64
 	}
 
-	return builtPart{objects: objects, marks: marks.Encode(nil), manifest: m.Encode(nil)}, nil
+	encodedMarks := marks.Encode(nil)
+	m.DiskBytes = objectBytes(objects, encodedMarks)
+
+	return builtPart{objects: objects, marks: encodedMarks, manifest: m.Encode(nil)}, nil
 }
 
 func (w *StreamWriter) compressorFor(alg compress.Algorithm) *compress.Compressor {

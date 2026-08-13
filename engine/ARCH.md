@@ -120,10 +120,33 @@ identity was instead left behind permanently, resolvable and backed by nothing).
 replay still recovers a part that failed to publish. The unreadable-commit window bites the
 backend-only configuration (a persistent backend with no `WALDir`), where nothing else holds the rows.
 
-`MaxPartBytes` bounds output: flush splits at the cap, a merge splits at the taller
-`mergeHeight × MaxPartBytes` so same-tier siblings promote instead of re-splitting. Splitting at
-row boundaries is safe — parts are independent and a series spanning two is merged back by the read
-seam.
+Flush and merge are bounded separately, because they answer different questions. A flush splits at
+`MaxPartBytes` — approximate *uncompressed* bytes, since it is sizing rows it already holds in the
+head. A merge splits at `mergeCapBytes`, a size **on disk**, measured against what the streaming
+writer has actually encoded (`mergecap.go`).
+
+That cap is derived from the backend's free space rather than held at a constant:
+`min(MergeCeilingBytes, free / MergeConcurrency / 2)`. A byte constant is correct at exactly one
+deployment size — cardinality consumes a byte budget in *breadth*, so under a fixed cap the time
+span a part covers is inversely proportional to active series and a fixed-range query opens
+proportionally more parts as cardinality grows. Both references size against the storage instead
+(VictoriaMetrics `getMaxOutBytes`, ClickHouse `max_bytes_to_merge_at_max_space_in_pool` lowered by
+free space); dividing by the merge worker count is what stops concurrent merges from collectively
+filling the disk, and the further halving leaves room for a merge's output to coexist with the
+inputs it has not yet retired.
+
+`MergeConcurrency` is a callback, not a number, because the fan-out is bounded by the node's engine
+count as much as by its worker limit and engines appear lazily. Fixing it at engine creation would
+divide a single-tenant node's disk by its core count — on a 32-core box that lands back at roughly
+the constant this replaces, on the exact deployment shape the change is for.
+
+A backend that cannot report free space — `Memory`, object stores, where local free space has no
+meaning — keeps the ceiling, so every backend still works. A nearly full disk falls to
+`minMergeCapBytes` rather than sealing everything, since stranding the part count high is worst
+exactly when compaction matters most.
+
+Splitting at row boundaries is safe — parts are independent and a series spanning two is merged back
+by the read seam.
 
 Driven by the facade's single background maintenance loop, plus a head-bytes pressure trigger that
 flushes just the over-threshold engines. Concurrency is nonetheless enforced, not assumed: flush and
@@ -175,9 +198,11 @@ subsystem.
   only so the merge can tell a part already at the target from one below it; nothing reads it back.
 - **Size-tiered selection** (`compact.go`) picks only what is worth merging: any part a forced
   rewrite must touch (retention/downsample/recompress/precision — so age-driven work is never
-  starved), plus the largest group of same-tier *unsealed* parts. A part at the merge cap is
-  **sealed** — re-merging it would only re-split it. Part count is bounded at
-  ≈ dataset / (mergeHeight × MaxPartBytes) instead of growing per flush.
+  starved), plus the largest group of same-tier *unsealed* parts. A part whose size on disk has
+  reached the merge cap is **sealed** — re-merging it would only re-split it. Part count is bounded
+  at ≈ dataset / cap instead of growing per flush. Tiers, sealing and the group budget are all in
+  on-disk bytes (`part.sizeBytes`, from the manifest); a group is bounded by `maxTierParts` as well,
+  so a large disk-derived budget cannot turn one merge into an unbounded one.
 - **Streaming both ways** (`compactStream`): each source is read through a forward cursor decoding
   one series range at a time, and each merged series is handed straight to a `partStreamWriter`
   (`streampart.go`) wrapping a `block.StreamWriter`, which encodes a granule as soon as one fills.

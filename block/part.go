@@ -176,7 +176,10 @@ func (w *PartWriter) build() (builtPart, error) {
 		m.MinTime, m.MaxTime = descs[idx].MinInt64, descs[idx].MaxInt64
 	}
 
-	return builtPart{objects: objects, marks: marks.Encode(nil), manifest: m.Encode(nil)}, nil
+	encodedMarks := marks.Encode(nil)
+	m.DiskBytes = objectBytes(objects, encodedMarks)
+
+	return builtPart{objects: objects, marks: encodedMarks, manifest: m.Encode(nil)}, nil
 }
 
 // sortKeyIndex returns the index of the sort-key column: the one named by [WithSortKey],
@@ -210,6 +213,17 @@ func WritePart(ctx context.Context, b backend.Backend, prefix string, w *PartWri
 	}
 
 	return built.write(ctx, b, prefix)
+}
+
+// objectBytes totals the bytes a part's column and marks objects occupy. Constant-collapsed
+// columns have no object and contribute nothing.
+func objectBytes(objects [][]byte, marks []byte) int64 {
+	total := int64(len(marks))
+	for _, obj := range objects {
+		total += int64(len(obj))
+	}
+
+	return total
 }
 
 // write stores the part's objects under prefix on b. Column and marks objects are written first;

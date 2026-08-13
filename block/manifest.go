@@ -134,6 +134,13 @@ type Manifest struct {
 	MaxTime     int64
 	GranuleSize int
 	Columns     []ColumnDesc
+	// DiskBytes is the encoded size of the part's column and marks objects, excluding the manifest
+	// itself (which cannot size itself) and the engine's sidecars. It is what the merge engine's
+	// size cap is denominated in, so the cap means bytes on disk rather than a row estimate.
+	//
+	// Written as a trailing field: the decoder stops at the last column, so a manifest without it
+	// reads as 0 and an older reader ignores it.
+	DiskBytes int64
 }
 
 // Encode appends the binary manifest to dst and returns the extended slice. Layout:
@@ -143,6 +150,7 @@ type Manifest struct {
 //	  per column: [uvarint nameLen][name][byte kind][byte codec][byte compress][byte flags]
 //	              [byte precisionBits if flagLossy][byte level if flagLevel]
 //	              [numeric min/max per kind][const value per kind if flagConst]
+//	[uvarint diskBytes]
 //	[u32 CRC32C over all the above]
 func (m Manifest) Encode(dst []byte) []byte {
 	start := len(dst)
@@ -219,6 +227,8 @@ func (m Manifest) Encode(dst []byte) []byte {
 			// No min/max or constant value: id columns are never constant-collapsed.
 		}
 	}
+
+	w.WriteUvarint(uint64(m.DiskBytes))
 
 	w.PadToByte()
 	out := w.Bytes()
@@ -301,6 +311,11 @@ func DecodeManifest(src []byte) (Manifest, error) {
 		}
 
 		m.Columns = append(m.Columns, c)
+	}
+
+	// Trailing and optional: absent in a manifest written before it existed, which reads as 0.
+	if diskBytes, err := r.ReadUvarint(); err == nil {
+		m.DiskBytes = int64(diskBytes)
 	}
 
 	return m, nil

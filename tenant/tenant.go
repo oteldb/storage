@@ -30,12 +30,25 @@ type Limits struct {
 	// monotonic within an engine's lifetime, so once crossed the budget stays in overflow (no
 	// hysteresis); see docs/design/cardinality-overflow.md.
 	MaxSeriesSoft int64
-	// MaxPartSize caps an immutable part's (approximate, uncompressed) size: flush and merge split
-	// their output so no single part exceeds it. It is a structural cap fixed when a tenant's engine
-	// is first created. Zero ⇒ unlimited (one part). It applies to every signal, exactly for metrics
+	// MaxPartSize caps a *flushed* part's (approximate, uncompressed) size: a flush splits its
+	// output so no single part exceeds it. It is a structural cap fixed when a tenant's engine is
+	// first created. Zero ⇒ unlimited (one part). It applies to every signal, exactly for metrics
 	// (fixed 32 B/row) and approximately for the record signals (logs/traces/profiles), whose rows
 	// are variable-width and are converted at an assumed average row size.
+	//
+	// It no longer bounds *merged* parts; see MaxMergePartSize.
 	MaxPartSize int64
+	// MaxMergePartSize caps a merged part's size **on disk** — compressed bytes, unlike
+	// MaxPartSize. Zero ⇒ the engine derives it from the backend's free space (the default, and
+	// what makes part size track the deployment); negative ⇒ unlimited, never seal.
+	//
+	// A merged part is sized separately from a flushed one because the two answer different
+	// questions. A flush is bounded so the head's buffered rows land promptly; a merge is bounded
+	// so that part *count* stays low, which is what keeps a query from opening more parts as
+	// cardinality grows. Holding the merge to a byte constant makes the time span a part covers
+	// inversely proportional to active series, so a fixed-range query touches proportionally more
+	// parts the more series a tenant has.
+	MaxMergePartSize int64
 }
 
 // Retention is the per-tenant retention policy (DESIGN.md §10): whole-partition drops,

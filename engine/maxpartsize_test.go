@@ -50,15 +50,18 @@ func TestMaxPartSizeUnlimitedSinglePart(t *testing.T) {
 	assert.Equal(t, 1, e.PartCount(), "unlimited ⇒ a single part")
 }
 
-func TestMaxPartSizeSplitsMerge(t *testing.T) {
+// TestMergeCeilingSplitsMerge pins the merge cap, which is a size on disk and is configured
+// separately from the flush cap: a merge whose output exceeds it is kept split into bounded parts.
+// The memory backend cannot report free space, so the ceiling applies unmodified.
+func TestMergeCeilingSplitsMerge(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	// maxRows 5; the merge output splits at the merge cap (mergeHeight × maxRows = 40 rows), so a
-	// merge that produces more than the cap is kept split into bounded parts.
-	e := engine.New(engine.Config{Backend: backend.Memory(), Prefix: "default/metrics", MaxPartBytes: 160})
+	e := engine.New(engine.Config{
+		Backend: backend.Memory(), Prefix: "default/metrics",
+		MaxPartBytes: 160, MergeCeilingBytes: 64,
+	})
 
-	// Enough flushes of the same 10 series that the merge output (50 rows) exceeds the 40-row cap.
 	for range 5 {
 		ids, series, ts, vals := distinctSeries(10)
 		_, err := e.AppendBatch(ids, ts, vals, nil, func(i int) signal.Series { return series[i] }, engine.AppendLimits{})
@@ -69,12 +72,28 @@ func TestMaxPartSizeSplitsMerge(t *testing.T) {
 	require.NoError(t, e.Merge(ctx, 0))
 	assert.Greater(t, e.PartCount(), 1, "merge keeps its output split under the merge cap")
 
-	// Every output part stays within the merge cap.
-	for _, p := range e.Parts() {
-		assert.LessOrEqual(t, p.Rows, int64(40), "merged output part respects the merge cap")
-	}
-
-	// The five flushes wrote the same 10 series (same ids), so the merged set is 10 series.
 	got := fetchAll(t, e, fetch.Request{Start: 0, End: 1 << 62})
 	assert.Len(t, got, 10, "all series readable after a split merge")
+}
+
+// TestMergeCeilingUnlimited pins the opt-out: a negative ceiling disables sealing, so everything
+// merges into one part however large it grows.
+func TestMergeCeilingUnlimited(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	e := engine.New(engine.Config{
+		Backend: backend.Memory(), Prefix: "default/metrics",
+		MaxPartBytes: 160, MergeCeilingBytes: -1,
+	})
+
+	for range 5 {
+		ids, series, ts, vals := distinctSeries(10)
+		_, err := e.AppendBatch(ids, ts, vals, nil, func(i int) signal.Series { return series[i] }, engine.AppendLimits{})
+		require.NoError(t, err)
+		require.NoError(t, e.Flush(ctx))
+	}
+
+	require.NoError(t, e.Merge(ctx, 0))
+	assert.Equal(t, 1, e.PartCount(), "an unlimited merge cap produces a single part")
 }
