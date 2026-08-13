@@ -159,6 +159,7 @@ func (w *PartWriter) build() (builtPart, error) {
 			return builtPart{}, errors.Wrapf(err, "column %q", c.Name)
 		}
 
+		desc.Bytes = int64(len(obj))
 		descs[i] = desc
 		objects[i] = obj
 	}
