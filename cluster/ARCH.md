@@ -59,7 +59,17 @@ and the reject count is exact, flowing back into `Accepted{Accepted, Rejected, R
 
 An owner serves locally with full matcher pushdown. A non-owner fans out to owners, **hedged**
 (first owner immediately, a second raced once it is slow or errors — a single owner's copy is
-complete). Matchers are opaque Go closures and **not serializable**, so the RPC carries the tenant
+complete).
+
+Ownership alone is not enough to serve: the ring and the data can disagree — a node promoted into
+the owner set by a rebalance holds nothing until it backfills, and a node whose membership view lags
+the writer's derives a different owner set entirely. So a read resolves to a **holder**: a node that
+owns a shard but has no engine for it routes to the shard's other owners instead of serving its own
+empty copy, and a peer asked for a shard it does not hold answers `ErrShardAbsent` (HTTP 409, not
+404 — an unknown endpoint must stay distinguishable) rather than an empty success. An absent answer
+is a failover, not a result; only when *every* owner disclaims the shard does the read report empty.
+Both the local skip and the all-owners-absent case are metered (`storage.rpc.shard_absent`) and
+logged, since either means committed data is temporarily unreachable from this node. Matchers are opaque Go closures and **not serializable**, so the RPC carries the tenant
 + window and the requester **re-applies the matchers** to the returned superset (which the contract
 permits). **Equality is the exception**: `fetch.Matcher` may carry a serializable `EqualMatcher`
 spec, forwarded and pushed down on the peer, so a non-owner read narrows by `__name__` instead of

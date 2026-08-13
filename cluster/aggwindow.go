@@ -145,7 +145,7 @@ func AggregateWindowHandler(fn AggregateWindowFunc) http.Handler {
 
 		aggs, err := fn(ctx, tenant, start, end, spec, matchersFromEq(eq))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeRPCError(w, err)
 
 			return
 		}

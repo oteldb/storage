@@ -285,7 +285,7 @@ func AggregateHandler(fn AggregateFunc) http.Handler {
 
 		aggs, err := fn(ctx, tenant, start, end, step, matchersFromEq(eq))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeRPCError(w, err)
 
 			return
 		}
@@ -347,7 +347,7 @@ func (a *RemoteAggregator) post(ctx context.Context, path string, payload []byte
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.Errorf("cluster: %q %s returned %d: %s", a.addr, what, resp.StatusCode, bytes.TrimSpace(body))
+		return nil, statusError(a.addr, what, resp.StatusCode, body)
 	}
 
 	return body, nil

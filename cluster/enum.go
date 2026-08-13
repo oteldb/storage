@@ -197,7 +197,7 @@ func SeriesHandler(fn SeriesFunc) http.Handler {
 
 		series, err := fn(obs.ExtractHTTP(req.Context(), req.Header), r.sig, r.tenant, r.start, r.end, r.matchers)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeRPCError(w, err)
 
 			return
 		}
@@ -219,7 +219,7 @@ func KeysHandler(fn KeysFunc) http.Handler {
 
 		keys, err := fn(obs.ExtractHTTP(req.Context(), req.Header), r.sig, r.tenant, r.start, r.end)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeRPCError(w, err)
 
 			return
 		}
@@ -240,7 +240,7 @@ func SideHandler(fn SideFunc) http.Handler {
 
 		tables, err := fn(obs.ExtractHTTP(req.Context(), req.Header), r.tenant)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeRPCError(w, err)
 
 			return
 		}
@@ -345,7 +345,7 @@ func postEnum(ctx context.Context, client *http.Client, addr, path string, paylo
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.Errorf("cluster: %q returned %d: %s", addr, resp.StatusCode, bytes.TrimSpace(body))
+		return nil, statusError(addr, path, resp.StatusCode, body)
 	}
 
 	return body, nil

@@ -402,7 +402,7 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 func (s *Storage) localFetch(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
 	eng, ok := s.lookupEngine(s.normalizeTenant(signal.TenantID(tenant)))
 	if !ok {
-		return nil, nil
+		return nil, cluster.ErrShardAbsent
 	}
 
 	// Recycle: the read handler serializes the batches and discards them, so it releases them right
@@ -459,30 +459,51 @@ func (f clusterSeriesFetcher) Series(ctx context.Context, r fetch.Request) ([]si
 	return fetch.SortSeries(series), nil
 }
 
-// shardFetcher returns the read seam for one metric shard: the local engine if this node is an
-// owner (full matcher pushdown), else a fail-over across the shard's remote owners (each owner's
+// shardFetcher returns the read seam for one metric shard: the local engine if this node holds the
+// shard (full matcher pushdown), else a fail-over across the shard's other owners (each owner's
 // copy is complete; matchers are re-applied to the returned superset).
 func (s *Storage) shardFetcher(shardKey signal.TenantID) fetch.Fetcher {
-	cn := s.cluster
-	owners := s.ownerLookup(shardKey)
-
-	var remotes []fetch.Fetcher
-	for _, o := range owners {
-		addr := cn.membership.AddrOf(o.ID)
-		if addr == cn.self { // this node is an owner: serve locally
-			if e, ok := s.lookupEngine(shardKey); ok {
-				return e
-			}
-
-			return fetch.Merge() // owner but no data yet
-		}
-
-		if addr != "" {
-			remotes = append(remotes, cluster.NewRemoteFetcher(signal.Metric, addr, cn.httpc))
+	local, remotes, absent := s.shardReadTargets(signal.Metric, shardKey)
+	if local {
+		if e, ok := s.lookupEngine(shardKey); ok {
+			return e
 		}
 	}
 
-	return &filteringFetcher{inner: hedgedFetcher{store: s, op: rpcOpRead, remotes: remotes}}
+	if len(remotes) == 0 {
+		return fetch.Merge() // no owner holds the shard: it has no data anywhere
+	}
+
+	return &filteringFetcher{inner: hedgedFetcher{
+		store: s, op: rpcOpRead, remotes: remotes, absentShard: absentOf(absent, signal.Metric, shardKey),
+	}}
+}
+
+// shardReadTargets resolves a shard's read targets: whether this node holds the shard itself, and a
+// remote fetcher per other owner to fail over to. A node the ring points at but that holds no data
+// reports local=false and absent=true, so the read reaches an owner that does instead of answering
+// empty (the caller reports the anomaly once it has a request context).
+func (s *Storage) shardReadTargets(
+	sig signal.Signal, shardKey signal.TenantID,
+) (local bool, remotes []fetch.Fetcher, absent bool) {
+	cn := s.cluster
+
+	for _, o := range s.ownerLookup(shardKey) {
+		addr := cn.membership.AddrOf(o.ID)
+
+		switch {
+		case addr == cn.self:
+			if s.holdsShard(sig, shardKey) {
+				local = true
+			} else {
+				absent = true
+			}
+		case addr != "":
+			remotes = append(remotes, cluster.NewRemoteFetcher(sig, addr, cn.httpc))
+		}
+	}
+
+	return local, remotes, absent
 }
 
 // localAggregate serves a peer's metric aggregate from the local shard engine, pushing down the
@@ -492,7 +513,7 @@ func (s *Storage) localAggregate(
 ) ([]engine.NamedAgg, error) {
 	eng, ok := s.lookupEngine(s.normalizeTenant(signal.TenantID(tenant)))
 	if !ok {
-		return nil, nil
+		return nil, cluster.ErrShardAbsent
 	}
 
 	return eng.AggregateStepNamed(ctx, fetch.Request{
@@ -507,7 +528,7 @@ func (s *Storage) localAggregateWindow(
 ) ([]engine.NamedWindowAgg, error) {
 	eng, ok := s.lookupEngine(s.normalizeTenant(signal.TenantID(tenant)))
 	if !ok {
-		return nil, nil
+		return nil, cluster.ErrShardAbsent
 	}
 
 	return eng.AggregateWindowNamed(ctx, fetch.Request{
@@ -666,7 +687,7 @@ func (s *Storage) shardAggregate(
 ) ([]engine.NamedAgg, error) {
 	eq := equalityMatchers(r.Matchers)
 
-	return shardAggregateWith(s, shardKey,
+	return shardAggregateWith(ctx, s, shardKey,
 		func(eng *engine.Engine) ([]engine.NamedAgg, error) {
 			return eng.AggregateStepNamed(ctx, fetch.Request{
 				Tenant: shardKey, Start: r.Start, End: r.End, Matchers: r.Matchers,
@@ -684,7 +705,7 @@ func (s *Storage) shardAggregateWindow(
 ) ([]engine.NamedWindowAgg, error) {
 	eq := equalityMatchers(r.Matchers)
 
-	return shardAggregateWith(s, shardKey,
+	return shardAggregateWith(ctx, s, shardKey,
 		func(eng *engine.Engine) ([]engine.NamedWindowAgg, error) {
 			return eng.AggregateWindowNamed(ctx, fetch.Request{
 				Tenant: shardKey, Start: r.Start, End: r.End, Matchers: r.Matchers,
@@ -697,41 +718,43 @@ func (s *Storage) shardAggregateWindow(
 }
 
 // shardAggregateWith serves one shard's aggregates: locally (full matcher pushdown) if this node
-// owns the shard, else from a remote owner with sequential failover (equality matchers pushed; the
+// holds the shard, else from another owner with sequential failover (equality matchers pushed; the
 // coordinator re-checks the full set on the returned identities).
 func shardAggregateWith[T any](
-	s *Storage, shardKey signal.TenantID,
+	ctx context.Context, s *Storage, shardKey signal.TenantID,
 	local func(*engine.Engine) ([]T, error),
 	remote func(addr string) ([]T, error),
 ) ([]T, error) {
-	cn := s.cluster
-	owners := s.ownerLookup(shardKey)
-
-	for _, o := range owners {
-		if cn.membership.AddrOf(o.ID) == cn.self { // owner: serve locally
-			eng, ok := s.lookupEngine(shardKey)
-			if !ok {
-				return nil, nil // owner, no data yet
-			}
-
-			return local(eng)
+	isLocal, remotes := s.shardPlacement(ctx, rpcOpRead, signal.Metric, shardKey)
+	if isLocal {
+		eng, ok := s.lookupEngine(shardKey)
+		if !ok {
+			return nil, nil
 		}
+
+		return local(eng)
 	}
 
-	var lastErr error
+	var (
+		lastErr error
+		absent  int
+	)
 
-	for _, o := range owners {
-		addr := cn.membership.AddrOf(o.ID)
-		if addr == "" || addr == cn.self {
-			continue
-		}
-
+	for _, addr := range remotes {
 		got, err := remote(addr)
 		if err == nil {
 			return got, nil
 		}
 
+		if errors.Is(err, cluster.ErrShardAbsent) {
+			absent++ // an owner that holds nothing is no answer at all, not an empty one
+		}
+
 		lastErr = err
+	}
+
+	if absent == len(remotes) { // every owner disclaims the shard: it has no data anywhere
+		return nil, nil
 	}
 
 	return nil, lastErr // nil when there were no reachable owners (treated as no data)
@@ -813,7 +836,7 @@ func mergeBucketLists(a, b []engine.BucketAgg) []engine.BucketAgg {
 func (s *Storage) localLogFetch(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
 	eng, ok := s.lookupLogEngine(s.normalizeTenant(signal.TenantID(tenant)))
 	if !ok {
-		return nil, nil
+		return nil, cluster.ErrShardAbsent
 	}
 
 	it, err := eng.Fetch(ctx, fetch.Request{Signal: signal.Log, Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers})
@@ -835,7 +858,7 @@ func (s *Storage) clusterLogFetcherFor(tid signal.TenantID) fetch.Fetcher {
 func (s *Storage) localTraceFetch(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
 	eng, ok := s.lookupTraceEngine(s.normalizeTenant(signal.TenantID(tenant)))
 	if !ok {
-		return nil, nil
+		return nil, cluster.ErrShardAbsent
 	}
 
 	it, err := eng.Fetch(ctx, fetch.Request{Signal: signal.Trace, Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers})
@@ -857,7 +880,7 @@ func (s *Storage) localProfileFetch(
 ) ([]*fetch.Batch, error) {
 	eng, ok := s.lookupProfileEngine(s.normalizeTenant(signal.TenantID(tenant)))
 	if !ok {
-		return nil, nil
+		return nil, cluster.ErrShardAbsent
 	}
 
 	it, err := eng.Fetch(ctx, fetch.Request{
@@ -931,7 +954,7 @@ func (s *Storage) localSeries(
 	if sig == signal.Metric {
 		eng, ok := s.lookupEngine(tid)
 		if !ok {
-			return nil, nil
+			return nil, cluster.ErrShardAbsent
 		}
 
 		return eng.Series(ctx, metricSeriesRequest(tid, matchers, start, end))
@@ -939,7 +962,7 @@ func (s *Storage) localSeries(
 
 	eng, ok := s.lookupRecordEngine(sig, tid)
 	if !ok {
-		return nil, nil
+		return nil, cluster.ErrShardAbsent
 	}
 
 	return eng.Series(matchers, start, end), nil
@@ -968,7 +991,7 @@ func (s *Storage) localKeys(
 ) ([]cluster.KeyInfo, error) {
 	eng, ok := s.lookupRecordEngine(sig, s.normalizeTenant(signal.TenantID(tenant)))
 	if !ok {
-		return nil, nil
+		return nil, cluster.ErrShardAbsent
 	}
 
 	raw := eng.Keys(start, end)
@@ -985,7 +1008,7 @@ func (s *Storage) localKeys(
 func (s *Storage) localProfileSymbols(ctx context.Context, tenant string) (map[string][]byte, error) {
 	eng, ok := s.lookupProfileEngine(s.normalizeTenant(signal.TenantID(tenant)))
 	if !ok {
-		return map[string][]byte{}, nil
+		return nil, cluster.ErrShardAbsent
 	}
 
 	return eng.SideSnapshot(ctx)
@@ -1023,36 +1046,26 @@ func (s *Storage) shardSeries(
 	ctx context.Context, sig signal.Signal, shardKey signal.TenantID, matchers []fetch.Matcher,
 	eq []fetch.EqualMatcher, start, end int64,
 ) ([]signal.Series, error) {
-	local, remotes := s.shardOwners(shardKey)
+	local, remotes := s.shardPlacement(ctx, rpcOpSeries, sig, shardKey)
 	if local {
 		return s.localSeries(ctx, sig, string(shardKey), start, end, matchers)
 	}
 
-	if len(remotes) == 0 {
-		return nil, nil
-	}
-
-	thunks := make([]func(context.Context) ([]signal.Series, error), len(remotes))
-	for i := range remotes {
-		addr := remotes[i]
-		thunks[i] = func(ctx context.Context) ([]signal.Series, error) {
-			series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end, eq)
-			if err != nil {
-				return nil, err
-			}
-
-			kept := series[:0]
-			for i := range series {
-				if matchesAllSeries(series[i], matchers) {
-					kept = append(kept, series[i])
-				}
-			}
-
-			return kept, nil
+	return hedgeOwners(ctx, s, rpcOpSeries, remotes, func(ctx context.Context, addr string) ([]signal.Series, error) {
+		series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end, eq)
+		if err != nil {
+			return nil, err
 		}
-	}
 
-	return retry.Hedge(ctx, s.readPolicy(ctx, rpcOpSeries), thunks)
+		kept := series[:0]
+		for i := range series {
+			if matchesAllSeries(series[i], matchers) {
+				kept = append(kept, series[i])
+			}
+		}
+
+		return kept, nil
+	})
 }
 
 // clusterProfileSeries lists a tenant's profile streams in cluster mode (a thin wrapper over the
@@ -1107,24 +1120,14 @@ func (s *Storage) clusterKeys(
 func (s *Storage) shardKeys(
 	ctx context.Context, sig signal.Signal, shardKey signal.TenantID, start, end int64,
 ) ([]cluster.KeyInfo, error) {
-	local, remotes := s.shardOwners(shardKey)
+	local, remotes := s.shardPlacement(ctx, rpcOpKeys, sig, shardKey)
 	if local {
 		return s.localKeys(ctx, sig, string(shardKey), start, end)
 	}
 
-	if len(remotes) == 0 {
-		return nil, nil
-	}
-
-	thunks := make([]func(context.Context) ([]cluster.KeyInfo, error), len(remotes))
-	for i := range remotes {
-		addr := remotes[i]
-		thunks[i] = func(ctx context.Context) ([]cluster.KeyInfo, error) {
-			return cluster.FetchKeys(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end)
-		}
-	}
-
-	return retry.Hedge(ctx, s.readPolicy(ctx, rpcOpKeys), thunks)
+	return hedgeOwners(ctx, s, rpcOpKeys, remotes, func(ctx context.Context, addr string) ([]cluster.KeyInfo, error) {
+		return cluster.FetchKeys(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end)
+	})
 }
 
 // clusterProfileSymbols returns a tenant's symbol-store tables in cluster mode: locally if owned,
@@ -1155,24 +1158,14 @@ func (s *Storage) clusterProfileSymbols(ctx context.Context, tid signal.TenantID
 // shardSymbols returns one profile shard's unioned symbol tables: locally if owned, else hedged
 // across its remote owners (each a complete replica — symbols ride the write path).
 func (s *Storage) shardSymbols(ctx context.Context, shardKey signal.TenantID) (map[string][]byte, error) {
-	local, remotes := s.shardOwners(shardKey)
+	local, remotes := s.shardPlacement(ctx, rpcOpSide, signal.Profile, shardKey)
 	if local {
 		return s.localProfileSymbols(ctx, string(shardKey))
 	}
 
-	if len(remotes) == 0 {
-		return map[string][]byte{}, nil
-	}
-
-	thunks := make([]func(context.Context) (map[string][]byte, error), len(remotes))
-	for i := range remotes {
-		addr := remotes[i]
-		thunks[i] = func(ctx context.Context) (map[string][]byte, error) {
-			return cluster.FetchSide(ctx, s.cluster.httpc, addr, signal.Profile, string(shardKey))
-		}
-	}
-
-	return retry.Hedge(ctx, s.readPolicy(ctx, rpcOpSide), thunks)
+	return hedgeOwners(ctx, s, rpcOpSide, remotes, func(ctx context.Context, addr string) (map[string][]byte, error) {
+		return cluster.FetchSide(ctx, s.cluster.httpc, addr, signal.Profile, string(shardKey))
+	})
 }
 
 // clusterRecordFetcherFor returns a record signal's read seam for one tenant in cluster mode. A
@@ -1201,31 +1194,25 @@ func (s *Storage) clusterRecordFetcherFor(
 	return concatFetcher(shardFetchers)
 }
 
-// shardRecordFetcher returns the read seam for one record shard: the local engine if this node is an
-// owner, else a hedged fan-out across the shard's remote owners (each owner's copy is complete).
+// shardRecordFetcher returns the read seam for one record shard: the local engine if this node holds
+// the shard, else a hedged fan-out across the shard's other owners (each owner's copy is complete).
 func (s *Storage) shardRecordFetcher(
 	sig signal.Signal, shardKey signal.TenantID, lookup func(signal.TenantID) (*recordengine.Engine, bool),
 ) fetch.Fetcher {
-	cn := s.cluster
-	owners := s.ownerLookup(shardKey)
-
-	var remotes []fetch.Fetcher
-	for _, o := range owners {
-		addr := cn.membership.AddrOf(o.ID)
-		if addr == cn.self { // owner: serve locally
-			if e, ok := lookup(shardKey); ok {
-				return e
-			}
-
-			return fetch.Merge() // owner but no data yet
-		}
-
-		if addr != "" {
-			remotes = append(remotes, cluster.NewRemoteFetcher(sig, addr, cn.httpc))
+	local, remotes, absent := s.shardReadTargets(sig, shardKey)
+	if local {
+		if e, ok := lookup(shardKey); ok {
+			return e
 		}
 	}
 
-	return &filteringFetcher{inner: hedgedFetcher{store: s, op: rpcOpRead, remotes: remotes}}
+	if len(remotes) == 0 {
+		return fetch.Merge() // no owner holds the shard: it has no data anywhere
+	}
+
+	return &filteringFetcher{inner: hedgedFetcher{
+		store: s, op: rpcOpRead, remotes: remotes, absentShard: absentOf(absent, sig, shardKey),
+	}}
 }
 
 // recordEngineFor returns the local record engine (logs, traces, or profiles) for a signal+tenant,

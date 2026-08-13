@@ -1039,6 +1039,42 @@ func TestClusteredShardedProfileResolver(t *testing.T) {
 	}
 }
 
+// TestClusterReadFailsOverFromShardlessOwner covers #305: a node the ring points at but that holds
+// no data for the shard must fail over to an owner that does, not answer an empty result. Scaling
+// out reproduces it — the ring hands node-b shards whose data was written before it joined, and no
+// data has moved yet, so every node's read has to route around it.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterReadFailsOverFromShardlessOwner(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	const shards = 4
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodeSharded(t, endpoint, "node-a", shards),
+		"node-c": openClusterNodeSharded(t, endpoint, "node-c", shards),
+	}
+	awaitMembership(t, nodes)
+
+	for _, svc := range []string{"svc-a", "svc-b", "svc-c"} {
+		_, err := nodes["node-a"].WriteProfiles(ctx, profileBatch(svc, 1000, sampleSpec{"cpu", "nanoseconds", 50}))
+		require.NoError(t, err)
+	}
+
+	// node-b joins *after* the write: the ring re-assigns shards to it, but no data moves.
+	nodes["node-b"] = openClusterNodeSharded(t, endpoint, "node-b", shards)
+	awaitMembership(t, nodes)
+
+	for name, s := range nodes {
+		got, err := fetch.Drain(ctx, must(s.ProfileFetcher("default").Fetch(ctx, fetch.Request{
+			Signal: signal.Profile, Start: 0, End: 1 << 60,
+		})))
+		require.NoErrorf(t, err, "%s profile search", name)
+		assert.GreaterOrEqualf(t, len(got), 3, "%s still sees every stream after the rebalance", name)
+	}
+}
+
 func TestShardHelpers(t *testing.T) {
 	t.Parallel()
 

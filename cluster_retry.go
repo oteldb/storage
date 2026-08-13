@@ -4,11 +4,13 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-faster/errors"
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/internal/retry"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/reliability"
@@ -101,10 +103,18 @@ func (s *Storage) bindPolicyObs(ctx context.Context, op string, p *retry.Policy)
 // owner is tried immediately, and a second is raced once the first passes the hedge delay or fails —
 // first success wins, the rest are canceled. Each owner's copy is complete (replicas), so any single
 // success is authoritative. It subsumes a plain sequential failover (HedgeDelay 0).
+//
+// An owner answering [cluster.ErrShardAbsent] (the ring points at it, but it holds no data for the
+// shard) is a failover, not a result: only when every owner disclaims the shard does the fetch yield
+// an empty iterator.
 type hedgedFetcher struct {
 	store   *Storage
 	op      string
 	remotes []fetch.Fetcher
+
+	// absentShard, when set, is the shard this node owns per the ring but holds no data for — the
+	// reason the fan-out exists at all. Reported here, where a request context finally exists.
+	absentShard *absentShard
 }
 
 func (h hedgedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
@@ -112,19 +122,50 @@ func (h hedgedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterat
 		return nil, errors.New("cluster: no reachable owners for tenant")
 	}
 
+	if a := h.absentShard; a != nil {
+		h.store.reportAbsentShard(ctx, h.op, a.sig, a.shard, len(h.remotes))
+	}
+
+	var absent atomic.Int64
+
+	attempt := func(f fetch.Fetcher) func(context.Context) (fetch.Iterator, error) {
+		return func(c context.Context) (fetch.Iterator, error) {
+			it, err := f.Fetch(c, r)
+			if errors.Is(err, cluster.ErrShardAbsent) {
+				absent.Add(1)
+			}
+
+			return it, err
+		}
+	}
+
+	var (
+		it  fetch.Iterator
+		err error
+	)
+
 	if len(h.remotes) == 1 { // single owner: nothing to hedge against, just a bounded retry
-		f := h.remotes[0]
+		p := h.store.readPolicy(ctx, h.op)
+		// The lone owner's "I don't hold this shard" is final — retrying it only burns the budget.
+		p.Retryable = func(err error) bool {
+			return !errors.Is(err, cluster.ErrShardAbsent) && retry.Transient(err)
+		}
 
-		return retry.Do(ctx, h.store.readPolicy(ctx, h.op), func(c context.Context) (fetch.Iterator, error) {
-			return f.Fetch(c, r)
-		})
+		it, err = retry.Do(ctx, p, attempt(h.remotes[0]))
+	} else {
+		thunks := make([]func(context.Context) (fetch.Iterator, error), len(h.remotes))
+		for i := range h.remotes {
+			thunks[i] = attempt(h.remotes[i])
+		}
+
+		it, err = retry.Hedge(ctx, h.store.readPolicy(ctx, h.op), thunks)
 	}
 
-	thunks := make([]func(context.Context) (fetch.Iterator, error), len(h.remotes))
-	for i := range h.remotes {
-		f := h.remotes[i]
-		thunks[i] = func(c context.Context) (fetch.Iterator, error) { return f.Fetch(c, r) }
+	if err != nil && int(absent.Load()) >= len(h.remotes) {
+		h.store.obs.RPC.ShardAbsent(ctx, h.op)
+
+		return fetch.NewSliceIterator(nil), nil
 	}
 
-	return retry.Hedge(ctx, h.store.readPolicy(ctx, h.op), thunks)
+	return it, err
 }
