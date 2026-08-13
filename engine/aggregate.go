@@ -21,16 +21,40 @@ func (e *Engine) startAggregateSpan(ctx context.Context, name string) (context.C
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
 }
 
-// aggregatePlanAttrs describes what an aggregate read is about to do. storage.stats_pushdown is
-// the one that matters when it is slow: false means every matched series decodes its value column
-// instead of folding the parts' precomputed sidecars.
-func aggregatePlanAttrs(ids []signal.SeriesID, plan *enginePlan, safe bool) []attribute.KeyValue {
+// aggregatePlanAttrs describes what an aggregate read is about to do. storage.stats_pushdown_reason
+// is the one that matters when it is slow: anything but "ok" means every matched series decodes its
+// value column instead of folding the parts' precomputed sidecars, and the value names which of the
+// three unrelated conditions caused it. storage.stats_pushdown_parts counts the sources that
+// tripped it, so an operator can tell one straggling part from a store whose layout never pushes
+// down.
+func aggregatePlanAttrs(ids []signal.SeriesID, plan *enginePlan, d pushdownDecision) []attribute.KeyValue {
 	return []attribute.KeyValue{
 		attribute.Int("storage.series_matched", len(ids)),
 		attribute.Int("storage.parts_scanned", len(plan.liveParts)),
-		attribute.Bool("storage.stats_pushdown", safe),
+		attribute.String("storage.stats_pushdown_reason", string(d.reason)),
+		attribute.Int("storage.stats_pushdown_parts", d.parts),
 	}
 }
+
+// pushdownReason names why an aggregate read does or does not fold parts from their stats sidecars.
+type pushdownReason string
+
+const (
+	pushdownOK               pushdownReason = "ok"
+	pushdownGridUnusable     pushdownReason = "grid_unusable"     // window is not a whole multiple of the step
+	pushdownPartialCoverage  pushdownReason = "partial_coverage"  // a part reaches outside the request range
+	pushdownOverlappingParts pushdownReason = "overlapping_parts" // sources overlap in time
+)
+
+// pushdownDecision is [aggPushdownCheck]'s verdict together with how many sources tripped it: the
+// partially covered parts, or the sources that overlap their predecessor in time (the head/mid-flush
+// samples count as one such source). Zero for "ok" and for a grid that cannot be used at all.
+type pushdownDecision struct {
+	reason pushdownReason
+	parts  int
+}
+
+func (d pushdownDecision) safe() bool { return d.reason == pushdownOK }
 
 // AggregateRange returns a per-series aggregate (count, sum, min, max — enough for avg) over
 // [r.Start, r.End] for the series matching r.Matchers. It is the aggregate-pushdown read path:
@@ -47,9 +71,12 @@ func (e *Engine) AggregateRange(ctx context.Context, r fetch.Request) (map[signa
 
 	ids, plan := e.planAggregate(r)
 	defer plan.releaseParts()
-	safe := aggPushdownSafe(plan)
+	defer func() { span.SetAttributes(samplesDecodedAttr(plan)) }()
 
-	span.SetAttributes(aggregatePlanAttrs(ids, plan, safe)...)
+	push := aggPushdownCheck(plan)
+	safe := push.safe()
+
+	span.SetAttributes(aggregatePlanAttrs(ids, plan, push)...)
 
 	out := make(map[signal.SeriesID]SeriesAgg, len(ids))
 
@@ -126,9 +153,12 @@ func (e *Engine) AggregateStep(ctx context.Context, r fetch.Request, step int64)
 
 	ids, plan := e.planAggregate(r)
 	defer plan.releaseParts()
-	safe := aggPushdownSafe(plan)
+	defer func() { span.SetAttributes(samplesDecodedAttr(plan)) }()
 
-	span.SetAttributes(append(aggregatePlanAttrs(ids, plan, safe),
+	push := aggPushdownCheck(plan)
+	safe := push.safe()
+
+	span.SetAttributes(append(aggregatePlanAttrs(ids, plan, push),
 		attribute.Int64("storage.step", step))...)
 
 	out := make(map[signal.SeriesID][]BucketAgg, len(ids))
@@ -163,9 +193,12 @@ func (e *Engine) AggregateStepNamed(ctx context.Context, r fetch.Request, step i
 
 	ids, plan := e.planAggregate(r)
 	defer plan.releaseParts()
-	safe := aggPushdownSafe(plan)
+	defer func() { span.SetAttributes(samplesDecodedAttr(plan)) }()
 
-	span.SetAttributes(append(aggregatePlanAttrs(ids, plan, safe),
+	push := aggPushdownCheck(plan)
+	safe := push.safe()
+
+	span.SetAttributes(append(aggregatePlanAttrs(ids, plan, push),
 		attribute.Int64("storage.step", step))...)
 
 	out := make([]NamedAgg, 0, len(ids))
@@ -205,6 +238,8 @@ func (e *Engine) bucketSeries(
 		for i := range ts {
 			grid.addSample(ts[i], values[i])
 		}
+
+		plan.samplesDecoded += len(ts)
 
 		return nil
 	}
@@ -256,11 +291,16 @@ func (e *Engine) bucketPart(ctx context.Context, plan *enginePlan, p *part, id s
 		return err
 	}
 
+	n := 0
+
 	for i := rng.start; i < rng.end; i++ {
 		if dp.ts[i] >= plan.start && dp.ts[i] <= plan.end {
 			grid.addSample(dp.ts[i], dp.vals[i])
+			n++
 		}
 	}
+
+	plan.samplesDecoded += n
 
 	return nil
 }
@@ -280,22 +320,33 @@ func bucketStart(ts, step int64) int64 {
 	return ts - r
 }
 
-// aggPushdownSafe reports whether the plan's parts can be aggregated from their stats sidecars
+// aggPushdownCheck reports whether the plan's parts can be aggregated from their stats sidecars
 // without risking a wrong count/sum: every in-window part must be fully inside [start, end] (else
 // its whole-part stats would include out-of-range samples) and the parts — plus any head/mid-flush
 // samples — must be pairwise time-disjoint (else a timestamp could appear in two sources and be
-// counted twice). When false, the caller decodes and merges, which dedups by timestamp.
-func aggPushdownSafe(plan *enginePlan) bool {
+// counted twice). When it is not safe, the caller decodes and merges, which dedups by timestamp.
+//
+// The two rejections are reported apart because they call for opposite operator responses: partial
+// coverage is a query-window/part-boundary mismatch that compaction into ever larger parts makes
+// *worse*, while overlap is a layout property of the store.
+func aggPushdownCheck(plan *enginePlan) pushdownDecision {
 	type span struct{ lo, hi int64 }
 
 	spans := make([]span, 0, len(plan.liveParts)+1)
+	partial := 0
 
 	for _, p := range plan.liveParts {
 		if p.minTime < plan.start || p.maxTime > plan.end {
-			return false // partially covered: whole-part stats are not range-exact
+			partial++ // partially covered: whole-part stats are not range-exact
+
+			continue
 		}
 
 		spans = append(spans, span{p.minTime, p.maxTime})
+	}
+
+	if partial > 0 {
+		return pushdownDecision{reason: pushdownPartialCoverage, parts: partial}
 	}
 
 	// The head + mid-flush samples in window form one more span (they are newer, unflushed data).
@@ -305,13 +356,19 @@ func aggPushdownSafe(plan *enginePlan) bool {
 
 	slices.SortFunc(spans, func(a, b span) int { return cmp.Compare(a.lo, b.lo) })
 
+	overlapping := 0
+
 	for i := 1; i < len(spans); i++ {
 		if spans[i].lo <= spans[i-1].hi {
-			return false // overlapping time ranges ⇒ a timestamp could be duplicated across sources
+			overlapping++ // a timestamp could be duplicated across sources
 		}
 	}
 
-	return true
+	if overlapping > 0 {
+		return pushdownDecision{reason: pushdownOverlappingParts, parts: overlapping}
+	}
+
+	return pushdownDecision{reason: pushdownOK}
 }
 
 // planHeadSpan returns the [min, max] timestamp of the plan's in-window head + mid-flush samples,
@@ -375,7 +432,7 @@ func (e *Engine) aggViaStats(ctx context.Context, plan *enginePlan, id signal.Se
 			return agg, err
 		}
 
-		foldRange(&agg, dp, rng, plan.start, plan.end)
+		plan.samplesDecoded += foldRange(&agg, dp, rng, plan.start, plan.end)
 	}
 
 	if hb := plan.headB[id]; hb != nil {
@@ -405,18 +462,32 @@ func aggViaDecode(ctx context.Context, plan *enginePlan, id signal.SeriesID) (Se
 		agg.addSample(v)
 	}
 
+	plan.samplesDecoded += len(values)
+
 	return agg, nil
 }
 
-// foldRange folds dp's value rows [rng.start, rng.end) whose timestamp is within [start, end].
-func foldRange(agg *SeriesAgg, dp *decodedPart, rng rowRange, start, end int64) {
+// samplesDecodedAttr reports the plan's decoded-sample count. It is recorded once on the way out
+// rather than as the fold runs: the number is only final when the read is.
+func samplesDecodedAttr(plan *enginePlan) attribute.KeyValue {
+	return attribute.Int("storage.samples_decoded", plan.samplesDecoded)
+}
+
+// foldRange folds dp's value rows [rng.start, rng.end) whose timestamp is within [start, end], and
+// returns how many it folded.
+func foldRange(agg *SeriesAgg, dp *decodedPart, rng rowRange, start, end int64) int {
+	n := 0
+
 	for i := rng.start; i < rng.end; i++ {
 		if dp.ts[i] < start || dp.ts[i] > end {
 			continue
 		}
 
 		agg.addSample(dp.vals[i])
+		n++
 	}
+
+	return n
 }
 
 // foldBatch folds a fetch batch's values whose timestamp is within [start, end].

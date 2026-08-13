@@ -353,6 +353,25 @@ time-disjoint — else it falls back to decode+merge, which dedups. Derived, so 
 decode. In cluster mode the pushdown survives the network: each owner aggregates locally and ships
 per-series identity + buckets, so only aggregates cross the wire.
 
+The rejection is **reported, not just taken**: `aggPushdownCheck` returns a reason
+(`ok` / `grid_unusable` / `partial_coverage` / `overlapping_parts`) plus the number of sources that
+tripped it, which every aggregate span records as `storage.stats_pushdown_reason` /
+`storage.stats_pushdown_parts` (`ADMIN.md`). The three causes are unrelated and need separating: a
+misaligned window is a query shape, overlap is a store layout, and partial coverage is a boundary
+mismatch — which is where a **trade-off worth knowing about** hides.
+
+A whole-part stat is exact only for a part that lies *entirely* inside the query range, so pushdown
+eligibility falls as parts grow. Compaction, which is otherwise strictly good — fewer parts, less
+per-part overhead, better compression — therefore works *against* this pushdown: 71 small parts give
+a 6h dashboard window many parts it wholly contains, while the same data compacted into 3 large parts
+gives it none, and every such query drops to decoding every sample. The engine deliberately does not
+try to arbitrate this (a merge policy that kept parts small enough for a *particular* window would be
+guessing at the query mix, and would give up the compaction wins for every other read). Instead the
+reason is visible per query, so an operator who sees `partial_coverage` dominate after a compaction
+change can weigh it, rather than watching aggregate latency rise with no attributable cause. The
+per-query counter to read alongside it is `storage.samples_decoded`, which is what the fallback
+actually costs.
+
 Buckets accumulate in a **`stepGrid`** allocated once per call and reused across every series in
 it — a dense array indexed by arithmetic on the timestamp, so filling costs no hashing and draining
 costs no sort of aggregate structs. It spans the plan's *data* (parts' ranges ∪ head span, clipped
@@ -385,7 +404,9 @@ query's start, which is a multiple of the step only by coincidence — so the fi
 to match, since a window edge must never fall inside one. The zero value is the absolute grid.
 
 Both forms drain one internal `iter.Seq2`, so only one series' windows are resident while it is
-computed rather than series × steps of them.
+computed rather than series × steps of them. That streaming shape also fixes the instrumentation:
+decode and fold alternate per series, so they are reported as accumulated durations on the one span
+(plus a child span for the contiguous planning phase) rather than as sub-spans — see `ADMIN.md`.
 
 ## Cluster surface
 
