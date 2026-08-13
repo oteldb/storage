@@ -81,6 +81,10 @@ func (s *Storage) recordEngineCached(
 		// set O(part size) instead of O(dataset) (records_facade shares this with the metric engine's
 		// engineFor). Resolved from the tenant policy, falling back to defaultMaxPartBytes when unset.
 		MaxPartBytes: partSizeOrDefault(s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Limits.MaxPartSize),
+		// And bound what the merge may hold while doing it: the tiering target is a multiple of the
+		// part size, which says nothing about the memory this process has.
+		MergeMemoryBytes: s.opts.MergeMemoryBytes,
+		MergeConcurrency: s.mergeConcurrency,
 		// ZSTD-compress compacted parts: record byte columns are dict-coded but not entropy-coded, so
 		// the cold, long-lived data is otherwise stored far larger than necessary (≈10× on logs).
 		// Flushes stay codec-only, so ingest is unaffected.

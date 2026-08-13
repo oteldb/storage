@@ -13,10 +13,23 @@ and the same lock discipline (see [`../engine/ARCH.md`](../engine/ARCH.md)). Not
 
 - Merge is **append-only**: retention only. Downsampling, recompression and precision are
   metrics-specific.
-- Records are variable-width, so the byte cap converts to a row cap at an assumed average row size
-  (`recordRowBytes`, calibrated to a real structured-log row) rather than the metric engine's exact
-  per-row size. Without a flush split a part was sized only by flush cadence, and one oversized
-  part distorted the size-tiered selection it feeds.
+- Records are variable-width, so every size is **measured, not modeled**. `MaxPartBytes` is spent in
+  the *decoded* bytes a row holds (`flushColumns.rowBytes`), the flush splits on them
+  (`byteRanges`), a part records its decoded footprint in its manifest (`Manifest.RawBytes` →
+  `part.sizeBytes`), and the size tiers and the seal threshold compare those. A row count cannot
+  stand in for any of it: the same count is ten 1 MiB records or ten thousand 1 KiB ones, and the
+  assumed-average-row-size model that preceded this was wrong by that ratio — a 256 B assumption
+  against ~950 B real rows decoded ~4× the intended bytes per merge. `recordRowBytes` survives only
+  as the fallback for a part written before the manifest carried the figure.
+
+- The merge cap is `min(mergeHeight × MaxPartBytes, MergeMemoryBytes / MergeConcurrency / 3)`,
+  floored at one flushed part so retention can always rewrite one. The memory term is the one the
+  metric engine also grew (see [`../engine/ARCH.md`](../engine/ARCH.md)) and for the same reason: a
+  cap sized against storage says nothing about what the process can hold. It is *decoded* bytes
+  here rather than bytes on disk, because that is what this merge holds — the selected sources are
+  decoded up front and the output accumulates decoded before it is encoded, hence dividing by three
+  (sources + output buffer + the encode of it). Free space does not enter into it; the flush cap
+  and the tiering target bound the disk.
 
 ## Schema
 

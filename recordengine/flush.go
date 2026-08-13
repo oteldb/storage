@@ -26,6 +26,18 @@ type flushColumns struct {
 
 func (f *flushColumns) len() int { return len(f.stream) }
 
+// byteSize is the buffer's resident footprint: the columns plus the stream ids they are keyed by.
+// It is what a merge seals an output part on, so a variable-width record is measured, not modeled.
+func (f *flushColumns) byteSize() int64 {
+	return f.cols.byteSize() + int64(len(f.stream))*streamIDBytes
+}
+
+// rowBytes is row i's footprint, its stream id included.
+func (f *flushColumns) rowBytes(i int) int64 { return f.cols.rowBytes(i) + streamIDBytes }
+
+// streamIDBytes is one row's share of the stream id column (a 128-bit id per row).
+const streamIDBytes = 16
+
 // reset re-arms the buffer for another flush at the given shape, keeping the backing arrays. A part
 // is written and read back before the next flush starts (the engine has a single flusher), so the
 // buffer that fed one part is free to feed the next — and after the first flush its arrays are
@@ -49,20 +61,39 @@ const (
 	maxInt64 = int64(1<<63 - 1)
 )
 
-// chunkRanges splits n rows into [lo, hi) ranges of at most maxRows each (maxRows ≤ 0 ⇒ a single
-// full-width range). Splitting at arbitrary row boundaries is safe: parts are independent and a
-// stream spanning two parts is merged back by the read seam. Mirrors the metric engine's flush split.
-func chunkRanges(n, maxRows int) [][2]int {
-	if maxRows <= 0 || n <= maxRows {
+// byteRanges splits f into [lo, hi) row ranges each holding at most capBytes of decoded record
+// bytes (capBytes ≤ 0 ⇒ a single full-width range). Splitting at arbitrary row boundaries is safe:
+// parts are independent and a stream spanning two is concatenated by the read seam.
+//
+// Records are variable-width, so a row count cannot stand in for a byte budget — the same cap holds
+// ten 1 MiB rows or ten thousand 1 KiB ones. A range always holds at least one row, so a record
+// larger than the whole cap still makes progress.
+func byteRanges(f *flushColumns, capBytes int64) [][2]int {
+	n := f.len()
+	if capBytes <= 0 || n == 0 {
 		return [][2]int{{0, n}}
 	}
 
-	out := make([][2]int, 0, (n+maxRows-1)/maxRows)
-	for lo := 0; lo < n; lo += maxRows {
-		out = append(out, [2]int{lo, min(lo+maxRows, n)})
+	var (
+		out [][2]int
+		lo  int
+		acc int64
+	)
+
+	for i := range n {
+		b := f.rowBytes(i)
+
+		// Closed before the row that would exceed the cap, not after: the cap bounds a buffer the
+		// process must hold, so overshooting it by a whole record is the one thing it must not do.
+		if acc > 0 && acc+b > capBytes {
+			out = append(out, [2]int{lo, i})
+			lo, acc = i, 0
+		}
+
+		acc += b
 	}
 
-	return out
+	return append(out, [2]int{lo, n})
 }
 
 // slice returns a read-only view of rows [lo, hi) of f, sharing every backing array (no copy). The

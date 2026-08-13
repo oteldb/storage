@@ -88,10 +88,13 @@ Two things the batch writer settles by looking at a finished column, a streaming
 ## Manifest & marks
 
 - **Manifest** — versioned binary record (magic `OTPM`, row count, time range, granule size,
-  per-column descriptors, then `DiskBytes` — the encoded size of the part's column and marks
-  objects, which is what the merge engine's size cap is denominated in) + trailing CRC32C.
-  `DiskBytes` is written *after* the columns and read optionally, so a manifest without it decodes
-  as 0 and an older reader ignores it: additive, no version bump, matching the flag-bit precedent. A descriptor is `[name][kind][codec][compress][flags]`,
+  per-column descriptors, then the two sizes) + trailing CRC32C. `DiskBytes` is the encoded size of
+  the part's column and marks objects; `RawBytes` is its **decoded** footprint, the bytes its values
+  occupy in memory. Both exist because a merge is bounded by both and the ratio between them is the
+  compression ratio, which varies per column and per dataset: the metric merge seals on bytes it
+  writes, the record merge on bytes it holds. Each is written *after* the columns and read
+  optionally, so a manifest without them decodes as 0 and an older reader ignores them: additive, no
+  version bump, matching the flag-bit precedent. A descriptor is `[name][kind][codec][compress][flags]`,
   then a `FloatPrecisionBits` byte **only when `flagLossy` is set** and a compression-level byte
   **only when `flagLevel` is set** (decode-irrelevant — it exists so the merge engine can tell a part
   already at its target level from one below it), then per-kind stats/const. The

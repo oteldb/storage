@@ -140,6 +140,13 @@ type Manifest struct {
 	//
 	// Trailing, so a manifest without it reads as 0 and an older reader ignores it.
 	DiskBytes int64
+	// RawBytes is the part's *decoded* footprint: the bytes its column values occupy in memory,
+	// which is what a merge's working set is made of. DiskBytes cannot stand in for it — the ratio
+	// between them is the compression ratio, which varies per column and per dataset — so a merge
+	// bounded by memory is denominated in this instead.
+	//
+	// Trailing, like DiskBytes, and 0 in a manifest written before it existed.
+	RawBytes int64
 }
 
 // Encode appends the binary manifest to dst and returns the extended slice. Layout:
@@ -149,7 +156,7 @@ type Manifest struct {
 //	  per column: [uvarint nameLen][name][byte kind][byte codec][byte compress][byte flags]
 //	              [byte precisionBits if flagLossy][byte level if flagLevel]
 //	              [numeric min/max per kind][const value per kind if flagConst]
-//	[uvarint diskBytes]
+//	[uvarint diskBytes][uvarint rawBytes]
 //	[u32 CRC32C over all the above]
 func (m Manifest) Encode(dst []byte) []byte {
 	start := len(dst)
@@ -228,6 +235,7 @@ func (m Manifest) Encode(dst []byte) []byte {
 	}
 
 	w.WriteUvarint(uint64(m.DiskBytes))
+	w.WriteUvarint(uint64(m.RawBytes))
 
 	w.PadToByte()
 	out := w.Bytes()
@@ -312,9 +320,13 @@ func DecodeManifest(src []byte) (Manifest, error) {
 		m.Columns = append(m.Columns, c)
 	}
 
-	// Optional: absent in a manifest written before it existed, which reads as 0.
+	// Optional, in order: absent in a manifest written before they existed, which reads as 0.
 	if diskBytes, err := r.ReadUvarint(); err == nil {
 		m.DiskBytes = int64(diskBytes)
+
+		if raw, err := r.ReadUvarint(); err == nil {
+			m.RawBytes = int64(raw)
+		}
 	}
 
 	return m, nil

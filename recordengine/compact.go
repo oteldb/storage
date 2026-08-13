@@ -27,7 +27,7 @@ import (
 const (
 	// minTierParts is the number of same-tier parts that must accumulate before they are compacted.
 	minTierParts = 2
-	// maxTierParts caps how many parts one merge compacts when no row budget applies (unlimited part
+	// maxTierParts caps how many parts one merge compacts when no byte budget applies (unlimited part
 	// size); the rest are picked up next cycle.
 	maxTierParts = 16
 	// mergeHeight is how many flush-tier sizes a part may grow to through tiered merging before it is
@@ -36,54 +36,30 @@ const (
 	// bounds part count to ≈ dataset / (mergeHeight × MaxPartBytes), and one merge's decoded input to
 	// mergeHeight × MaxPartBytes regardless of how tall the tier being compacted is.
 	mergeHeight = 8
-	// tierFloorRows collapses every part below this row count into tier 0, so the many tiny parts of a
+	// tierFloorBytes collapses every part below this size into tier 0, so the many tiny parts of a
 	// test or a low-volume engine always share a tier and compact together.
-	tierFloorRows = 1 << 12
+	tierFloorBytes = 4 << 20
 
-	// recordRowBytes is the assumed average uncompressed size of one record, used to convert the
-	// byte-denominated MaxPartBytes into a row cap (records are variable-width, so — unlike the metric
-	// engine's exact 32 B/row — this is a rough model; MaxPartBytes remains the tuning knob). It is
-	// calibrated to a realistic structured-log row (body + attributes + resource): a real homelab logs
-	// table averaged ~950 B/row, and at 256 B the seal threshold (mergeHeight × MaxPartBytes / 256)
-	// worked out ~4× too many rows, so a bulk merge decoded multiple GB before sealing. 1 KiB keeps a
-	// default-64-MiB part near its byte budget for typical logs; a backfill of unusually large or small
-	// rows tunes MaxPartBytes (via tenant policy) accordingly. Byte-exact sizing is tracked separately.
+	// mergeBufferAmplification converts the merge's memory allowance into a cap on the bytes it may
+	// hold. A merge holds its selected sources decoded *and* the output buffer it is filling from
+	// them, and the write then encodes that buffer, so the peak is about three times the cap.
+	mergeBufferAmplification = 3
+
+	// recordRowBytes is the assumed average uncompressed size of one record. It survives only for a
+	// part written before the manifest recorded its decoded size ([part.sizeBytes]); every other
+	// path measures. Calibrated to a realistic structured-log row (body + attributes + resource): a
+	// real homelab logs table averaged ~950 B/row.
 	recordRowBytes = 1024
 )
 
-// maxRowsPerPart converts the byte cap MaxPartBytes into a row cap (0 ⇒ unlimited). At least one row,
-// so a cap smaller than a single record still makes progress.
-func maxRowsPerPart(maxBytes int64) int {
-	if maxBytes <= 0 {
+// sizeTier buckets a part by its decoded size into a tier, so two parts within 2× of each other
+// (above the floor) share a tier. Parts at or below tierFloorBytes are all tier 0.
+func sizeTier(bytes int64) int {
+	if bytes <= tierFloorBytes {
 		return 0
 	}
 
-	if r := int(maxBytes / recordRowBytes); r >= 1 {
-		return r
-	}
-
-	return 1
-}
-
-// mergeCapRows returns the row count at which a part is sealed (never re-compacted): mergeHeight × the
-// flush-tier cap. 0 (never seal) when maxRows is 0 (unlimited part size), so unlimited parts merge into
-// one — the legacy behavior.
-func mergeCapRows(maxRows int) int {
-	if maxRows <= 0 {
-		return 0
-	}
-
-	return maxRows * mergeHeight
-}
-
-// sizeTier buckets a part by row count into a tier, so two parts within 2× of each other (above the
-// floor) share a tier. Parts at or below tierFloorRows are all tier 0.
-func sizeTier(rows int) int {
-	if rows <= tierFloorRows {
-		return 0
-	}
-
-	return bits.Len(uint(rows)) - bits.Len(uint(tierFloorRows))
+	return bits.Len64(uint64(bytes)) - bits.Len64(uint64(tierFloorBytes))
 }
 
 // retentionForces reports whether retention must rewrite part p this merge (it holds a record old
@@ -95,9 +71,9 @@ func retentionForces(p *part, retainFrom int64) bool {
 // selectMergeParts chooses the source parts to compact this cycle (size-tiered compaction): the union
 // of the parts retention must rewrite and the best same-tier group of unsealed parts. It returns nil
 // when nothing is worth doing — fewer than minTierParts in every tier and no retention-forced part —
-// so the merge is a no-op without decoding anything. capRows is the seal threshold in rows (0 ⇒
-// unlimited, so no part is ever sealed and the whole set is one tier).
-func selectMergeParts(src []*part, retainFrom int64, capRows int) []*part {
+// so the merge is a no-op without decoding anything. capBytes is the seal threshold in decoded bytes
+// (0 ⇒ unlimited, so no part is ever sealed and the whole set is one tier).
+func selectMergeParts(src []*part, retainFrom, capBytes int64) []*part {
 	var (
 		selected []*part
 		chosen   = make(map[*part]struct{}, len(src))
@@ -116,7 +92,7 @@ func selectMergeParts(src []*part, retainFrom int64, capRows int) []*part {
 		}
 	}
 
-	for _, p := range pickTierGroup(src, capRows) {
+	for _, p := range pickTierGroup(src, capBytes) {
 		add(p)
 	}
 
@@ -125,16 +101,16 @@ func selectMergeParts(src []*part, retainFrom int64, capRows int) []*part {
 
 // pickTierGroup returns the group of unsealed parts to compact for size reduction: the tier holding the
 // most parts (ties broken toward the smaller tier, to drain small parts first), once it holds at least
-// minTierParts. The group is capped by cumulative rows at the seal threshold (so one merge's decoded
-// input is at most one sealed-tier part's worth), or by maxTierParts when part size is unlimited.
-// Returns nil when no tier qualifies. Parts keep their src (sequence) order within the group.
-func pickTierGroup(src []*part, capRows int) []*part {
-	sealed := func(p *part) bool { return capRows > 0 && int(p.rows()) >= capRows }
+// minTierParts. The group is capped by cumulative decoded bytes at the seal threshold (so one merge's
+// decoded input is at most one sealed-tier part's worth), or by maxTierParts when part size is
+// unlimited. Returns nil when no tier qualifies. Parts keep their src (sequence) order within the group.
+func pickTierGroup(src []*part, capBytes int64) []*part {
+	sealed := func(p *part) bool { return capBytes > 0 && p.sizeBytes() >= capBytes }
 
 	byTier := make(map[int][]*part)
 	for _, p := range src {
 		if !sealed(p) {
-			t := sizeTier(int(p.rows()))
+			t := sizeTier(p.sizeBytes())
 			byTier[t] = append(byTier[t], p)
 		}
 	}
@@ -152,14 +128,14 @@ func pickTierGroup(src []*part, capRows int) []*part {
 
 	group := byTier[bestTier]
 
-	if capRows > 0 {
-		// Cap the group's cumulative rows at the seal threshold, taking at least minTierParts so a
-		// merge always makes progress even when two parts already approach the cap.
-		total := 0
+	if capBytes > 0 {
+		// Cap the group's cumulative decoded bytes at the seal threshold, taking at least minTierParts
+		// so a merge always makes progress even when two parts already approach the cap.
+		var total int64
 
 		for i, p := range group {
-			total += int(p.rows())
-			if i+1 >= minTierParts && total >= capRows {
+			total += p.sizeBytes()
+			if i+1 >= minTierParts && total >= capBytes {
 				return group[:i+1]
 			}
 		}

@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/memlimit"
 )
 
 // spaceBackend reports a fixed free-space figure, so the cap derivation does not depend on the test
@@ -175,6 +176,8 @@ func TestMergeCapBytes(t *testing.T) {
 // TestMergeCapFitsThePodThatOOMed replays the incident with its real numbers: a 3.6 GiB GOMEMLIMIT
 // over a 464 GiB volume, where the disk-derived share (232 GiB) clamped to the 16 GiB ceiling and
 // the merge OOMed building a part the pod could not hold. Not parallel: GOMEMLIMIT is process-wide.
+//
+//nolint:paralleltest // GOMEMLIMIT is process-wide, so this case cannot run alongside the others
 func TestMergeCapFitsThePodThatOOMed(t *testing.T) {
 	const podLimit = 3865470566
 
@@ -189,8 +192,10 @@ func TestMergeCapFitsThePodThatOOMed(t *testing.T) {
 	capBytes := e.mergeCapBytes(context.Background())
 
 	assert.Positive(t, capBytes)
-	assert.LessOrEqual(t, capBytes, int64(podLimit/mergeMemoryFraction/mergeBufferAmplification),
+	assert.LessOrEqual(t, capBytes, memlimit.MergeShare(0, 1, mergeBufferAmplification),
 		"the cap must fit the merge's share of the pod's memory, not the volume behind it")
+	assert.Less(t, capBytes, int64(podLimit),
+		"a part the pod cannot hold is what OOMKilled it")
 }
 
 // TestMergeCapUsesRecordedPartSize pins the other half: sealing compares a part's recorded on-disk

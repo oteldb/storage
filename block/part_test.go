@@ -283,3 +283,47 @@ func buildBenchWriter() (*PartWriter, int) {
 
 	return w, n
 }
+
+// TestPartRawBytes pins the manifest's decoded footprint: the merge cap is denominated in it, so a
+// column that compresses well must not report a small figure — the bytes are what a merge holds in
+// memory, not what it writes.
+func TestPartRawBytes(t *testing.T) {
+	t.Parallel()
+
+	w := NewPartWriter(WithSortKey("ts"))
+	require.NoError(t, w.AddColumn(Column{Name: "ts", Kind: KindInt64, Int64: []int64{1, 2, 3, 4}}))
+	require.NoError(t, w.AddColumn(Column{
+		Name: "body", Kind: KindBytes,
+		Bytes: [][]byte{[]byte("aaaa"), []byte("aaaa"), []byte("aaaa"), []byte("aaaa")},
+	}))
+
+	built, err := w.build()
+	require.NoError(t, err)
+
+	m, err := DecodeManifest(built.manifest)
+	require.NoError(t, err)
+
+	// 4 timestamps at 8 B + 4 cells of 4 B, whatever the dictionary collapses them to on disk.
+	assert.Equal(t, int64(4*8+4*4), m.RawBytes)
+}
+
+// TestPartRawBytesFromBlob covers the blob+offsets byte-column input, where a row range of a larger
+// column is a valid input and the footprint is the range, not the whole blob.
+func TestPartRawBytesFromBlob(t *testing.T) {
+	t.Parallel()
+
+	w := NewPartWriter(WithSortKey("ts"))
+	require.NoError(t, w.AddColumn(Column{Name: "ts", Kind: KindInt64, Int64: []int64{1, 2}}))
+	require.NoError(t, w.AddColumn(Column{
+		Name: "body", Kind: KindBytes,
+		BytesBlob: []byte("skipmeABCDEF"), BytesOffsets: []int32{6, 9, 12},
+	}))
+
+	built, err := w.build()
+	require.NoError(t, err)
+
+	m, err := DecodeManifest(built.manifest)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(2*8+6), m.RawBytes)
+}

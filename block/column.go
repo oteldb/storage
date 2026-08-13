@@ -76,6 +76,47 @@ func (c Column) rows() int {
 	}
 }
 
+// rawBytes returns the column's *decoded* footprint: what holding its values in memory costs,
+// which is what a merge's working set is made of — unlike the encoded object size, which says
+// nothing about the buffers a merge holds while producing it.
+func (c Column) rawBytes() int64 {
+	switch c.Kind {
+	case KindInt64:
+		return int64(len(c.Int64)) * 8
+	case KindFloat64:
+		return int64(len(c.Float64)) * 8
+	case KindBytes:
+		if c.Bytes == nil {
+			if n := len(c.BytesOffsets); n > 0 {
+				return int64(c.BytesOffsets[n-1] - c.BytesOffsets[0])
+			}
+
+			return 0
+		}
+
+		var n int64
+		for _, v := range c.Bytes {
+			n += int64(len(v))
+		}
+
+		return n
+	case KindInt128:
+		return int64(len(c.Int128)) * 16
+	default:
+		return 0
+	}
+}
+
+// rawBytes totals the decoded footprint of a part's columns.
+func rawBytes(cols []Column) int64 {
+	var n int64
+	for i := range cols {
+		n += cols[i].rawBytes()
+	}
+
+	return n
+}
+
 // defaultCodec is the codec used when [Column.Codec] is unset (CodecNone). The
 // timestamp/sort column overrides this to [chunk.CodecDoD] via the part writer.
 func defaultCodec(k Kind) chunk.Codec {

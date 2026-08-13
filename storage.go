@@ -1498,18 +1498,21 @@ func (s *Storage) maintain(ctx context.Context) {
 	parallel.ForEach(len(tasks), s.maintenanceConcurrency(), func(i int) { tasks[i].run() })
 }
 
-// maintenanceConcurrency is the parallel flush/merge/fsync fan-out cap for the background loops,
-// from [Options.MaintenanceConcurrency] or a CPU-derived default.
 // mergeConcurrency is how many merges may realistically run at once — the maintenance fan-out,
-// bounded by the number of engines there are to merge. It divides the free space the merge cap is
-// derived from, so a single-tenant node divides by one rather than by its core count.
+// bounded by the number of engines there are to merge. It divides both the free space and the
+// memory a single merge may claim, so a single-engine node divides by one rather than by its core
+// count. Every signal's engines count: they share one process and one disk, and the maintenance
+// loop merges them through the same fan-out.
 func (s *Storage) mergeConcurrency() int {
 	s.tmu.Lock()
-	n := len(s.tenants)
+	n := len(s.tenants) + len(s.logTenants) + len(s.traceTenants) + len(s.profileTenants)
 	s.tmu.Unlock()
 
 	return max(min(s.maintenanceConcurrency(), n), 1)
 }
+
+// maintenanceConcurrency is the parallel flush/merge/fsync fan-out cap for the background loops,
+// from [Options.MaintenanceConcurrency] or a CPU-derived default.
 
 func (s *Storage) maintenanceConcurrency() int {
 	if s.opts.MaintenanceConcurrency > 0 {

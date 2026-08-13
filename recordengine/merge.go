@@ -72,9 +72,9 @@ func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
 	src := e.parts
 	e.mu.Unlock()
 
-	capRows := mergeCapRows(maxRowsPerPart(e.cfg.MaxPartBytes))
+	capBytes := e.mergeCapBytes()
 
-	selected := selectMergeParts(src, retainFrom, capRows)
+	selected := selectMergeParts(src, retainFrom, capBytes)
 	if len(selected) == 0 {
 		e.reclaimRetired(ctx) // nothing to compact, but still sweep pending deletions
 
@@ -89,7 +89,7 @@ func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
 	// Build (lock-free): compact the selected parts into bounded output part(s), reading them back and
 	// unioning the side-store sidecars. The selected parts stay live (not retired) until publish, so
 	// they cannot be reclaimed underneath this read.
-	newParts, err := e.compactParts(ctx, selected, start, capRows)
+	newParts, err := e.compactParts(ctx, selected, start, capBytes)
 	if err != nil {
 		return 0, err
 	}
@@ -161,12 +161,12 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 // compactParts compacts the selected source parts into bounded output part(s): it decodes each part
 // once (reused across all its streams), concatenates every stream's in-window records across parts
 // (retention applied via start), re-sorts each stream by ts, and writes a new part whenever the
-// accumulated rows reach capRows — so both the merge's decoded working set and each output part stay
-// O(mergeHeight × MaxPartBytes), never O(dataset). When the engine has a side store (profiles) the
+// accumulated *decoded* bytes reach capBytes — so both the merge's decoded working set and each
+// output part stay within the cap, never O(dataset). When the engine has a side store (profiles) the
 // output is a single part (no split) so the unioned symbol sidecar has one home. Returns the new parts
 // (empty when retention dropped every record). Reads the parts off the engine lock; src is the
 // immutable snapshot the caller planned over.
-func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, capRows int) ([]*part, error) {
+func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes int64) ([]*part, error) {
 	// Decode each source part once, keeping byte columns dict-compressed (see decodedPart). A merge
 	// reads every stream of every part, so decoding per-stream (the old appendWindow path) re-decoded
 	// the whole part once per stream; decoding up front is O(selected parts), which selection bounds to
@@ -182,7 +182,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, cap
 	}
 
 	// Split output only when a part-size cap applies and there is no side store to anchor per-part.
-	split := capRows > 0 && e.cfg.SideStore == nil
+	split := capBytes > 0 && e.cfg.SideStore == nil
 
 	newBuf := func() *flushColumns {
 		return &flushColumns{cols: newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))}
@@ -241,10 +241,12 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, cap
 			buf.cols.appendRow(acc, j)
 		}
 
-		// Flush a full part once the buffer reaches the cap. A stream whose own run overshoots the cap is
-		// split at the next stream boundary (parts are independent; the read seam concatenates a stream
+		// Flush a full part once the buffer reaches the cap, measured in the decoded bytes it actually
+		// holds rather than in rows times an assumed row size — records are variable-width, so a row
+		// count is only as good as that assumption. A stream whose own run overshoots the cap is split
+		// at the next stream boundary (parts are independent; the read seam concatenates a stream
 		// spanning parts), keeping the buffer at ≈ one part regardless of a heavy stream.
-		if split && buf.len() >= capRows {
+		if split && buf.byteSize() >= capBytes {
 			if err := emit(); err != nil {
 				return nil, err
 			}
