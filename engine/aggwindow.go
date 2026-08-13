@@ -193,12 +193,20 @@ func (e *Engine) aggregateWindowSeq(
 			_, planSpan = e.cfg.Obs.Tracer.Start(ctx, "engine.aggregateWindow.plan")
 		}
 
-		ids, plan := e.planAggregate(r)
-		w = newWindower(plan, spec)
+		ids, plan, err := e.planAggregate(ctx, r)
 
 		if planSpan != nil {
 			planSpan.End()
 		}
+
+		if err != nil {
+			span.RecordError(err)
+			yield(NamedWindowAgg{}, err)
+
+			return
+		}
+
+		w = newWindower(plan, spec)
 
 		defer plan.releaseParts()
 

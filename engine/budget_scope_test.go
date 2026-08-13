@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -42,11 +43,11 @@ func TestQueryScopeSecondFetchDoesNotBlock(t *testing.T) {
 	b := NewDecodeBudget(100)
 	scope := fetch.NewScope()
 
-	b.acquireFor(scope, 80)
+	b.acquireFor(context.Background(), scope, 80)
 
 	// 80 + 40 > 100, so an unscoped acquire would queue here forever: nothing can release while
 	// this same query is the only holder.
-	require.True(t, done(t, 5*time.Second, func() { b.acquireFor(scope, 40) }),
+	require.True(t, done(t, 5*time.Second, func() { b.acquireFor(context.Background(), scope, 40) }),
 		"a second fetch in the same query must not block on the first")
 
 	assert.Equal(t, int64(120), b.inFlight(), "accounting stays exact even when queueing is skipped")
@@ -63,7 +64,7 @@ func TestQueryScopeConcurrentFirstAdmission(t *testing.T) {
 	require.True(t, done(t, 5*time.Second, func() {
 		var wg sync.WaitGroup
 		for range 8 {
-			wg.Go(func() { b.acquireFor(scope, 60) })
+			wg.Go(func() { b.acquireFor(context.Background(), scope, 60) })
 		}
 		wg.Wait()
 	}), "concurrent fetches of one query must not deadlock against each other")
@@ -79,10 +80,10 @@ func TestQueryScopeStillBoundsOtherQueries(t *testing.T) {
 	b := NewDecodeBudget(100)
 
 	held := fetch.NewScope()
-	b.acquireFor(held, 80)
+	b.acquireFor(context.Background(), held, 80)
 
 	other := fetch.NewScope()
-	assert.False(t, done(t, 200*time.Millisecond, func() { b.acquireFor(other, 40) }),
+	assert.False(t, done(t, 200*time.Millisecond, func() { b.acquireFor(context.Background(), other, 40) }),
 		"an unrelated query must still wait for the ceiling")
 
 	// Releasing the first admits the waiter, so the test leaves nothing blocked.
@@ -102,8 +103,8 @@ func TestQueryScopeReleaseRestoresBudget(t *testing.T) {
 	b := NewDecodeBudget(100)
 	scope := fetch.NewScope()
 
-	b.acquireFor(scope, 60)
-	b.acquireFor(scope, 60)
+	b.acquireFor(context.Background(), scope, 60)
+	b.acquireFor(context.Background(), scope, 60)
 
 	b.releaseFor(scope, 60)
 	b.releaseFor(scope, 60)
@@ -112,7 +113,7 @@ func TestQueryScopeReleaseRestoresBudget(t *testing.T) {
 
 	// With the scope drained, a fresh fetch under it takes the blocking path again rather than
 	// inheriting a stale "already admitted".
-	require.True(t, done(t, 5*time.Second, func() { b.acquireFor(scope, 90) }))
+	require.True(t, done(t, 5*time.Second, func() { b.acquireFor(context.Background(), scope, 90) }))
 	assert.Equal(t, int64(90), b.inFlight())
 }
 
@@ -123,7 +124,7 @@ func TestQueryScopeUnscopedUnchanged(t *testing.T) {
 
 	b := NewDecodeBudget(100)
 
-	require.True(t, done(t, 5*time.Second, func() { b.acquireFor(nil, 500) }),
+	require.True(t, done(t, 5*time.Second, func() { b.acquireFor(context.Background(), nil, 500) }),
 		"an over-budget fetch is still admitted alone")
 	assert.Equal(t, int64(500), b.inFlight())
 }

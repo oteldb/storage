@@ -1,13 +1,21 @@
 package fetch
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 // Scope ties several reads to one logical query — a PromQL request and every selector, chunk and
 // subquery under it — so admission control can tell "this query again" from "another query".
 //
 // It is the read-side analog of Prometheus' `Storage.Querier`: the caller creates one per
 // request, passes it on every [Request] it issues, and drops it when the request ends. An
-// embedder whose reads are one fetch each can leave it nil; the unscoped path is unchanged.
+// embedder that cannot thread it through every [Request] can install one on the request context
+// instead ([WithScope]), which a [Fetcher] uses when Request.Scope is nil.
+//
+// An embedder whose reads are one fetch each can leave it nil; the unscoped path is unchanged, and
+// is no longer able to wedge: an unscoped read that hold-and-waits against its own reservation is
+// released by its context, or force-admitted, rather than blocking forever.
 //
 // It exists because the decode budget is reserved per fetch and released when that fetch ends,
 // which is deadlock-free only while a caller keeps one fetch open at a time. A streaming consumer
@@ -25,6 +33,25 @@ type Scope struct {
 
 // NewScope returns a scope for one logical query.
 func NewScope() *Scope { return &Scope{} }
+
+type scopeKey struct{}
+
+// WithScope returns ctx carrying s, so reads made under it are admitted as one logical query even
+// when the [Request] they travel on has no Scope. Install it once at the request boundary — the
+// scope must not outlive the query, or every later read inherits its reservation and the decode
+// budget stops bounding anything.
+//
+// A Request's own Scope always wins; this is the fallback for a call path that cannot thread one.
+func WithScope(ctx context.Context, s *Scope) context.Context {
+	return context.WithValue(ctx, scopeKey{}, s)
+}
+
+// ScopeFrom returns the scope installed by [WithScope], or nil.
+func ScopeFrom(ctx context.Context) *Scope {
+	s, _ := ctx.Value(scopeKey{}).(*Scope)
+
+	return s
+}
 
 // Enter locks the scope and reports whether it already holds a reservation. The caller MUST end
 // the section with [Scope.Charge] or [Scope.Abort].
