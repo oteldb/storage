@@ -151,6 +151,27 @@ func openClusterNodeSharded(t *testing.T, endpoint, id string, shards int) *Stor
 	return s
 }
 
+// awaitMembership blocks until every node sees the whole cluster.
+//
+// Waiting on one node is not enough. A shard's owners are computed from the membership *that node*
+// can see, so a node still catching up derives a different owner set than the writer used — and
+// where it wrongly concludes it is an owner it serves its own empty shard instead of failing over
+// (issue #305). Such a read succeeds with rows missing, so waiting on the writer alone leaves every
+// reader assertion racing convergence.
+func awaitMembership(t *testing.T, nodes map[string]*Storage) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		for _, s := range nodes {
+			if len(s.cluster.membership.Members()) != len(nodes) {
+				return false
+			}
+		}
+
+		return true
+	}, 10*time.Second, 50*time.Millisecond, "every node's membership converges to %d nodes", len(nodes))
+}
+
 // TestClusterPerSeriesShardingSpreadsAndGathers verifies sharded-tenant placement: one tenant's
 // series spread across the ring by shard, every series is readable from any node (the read gathers
 // across shards), and the shards are genuinely distributed (no single node owns them all).
@@ -169,9 +190,7 @@ func TestClusterPerSeriesShardingSpreadsAndGathers(t *testing.T) {
 	}
 	a := nodes["node-a"]
 
-	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+	awaitMembership(t, nodes)
 
 	// Write many distinct series through node A; each routes to its shard's primary.
 	const nSeries = 24
@@ -472,9 +491,7 @@ func TestClusteredLogsReplicateAndRead(t *testing.T) {
 	}
 	a := nodes["node-a"]
 
-	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+	awaitMembership(t, nodes)
 
 	_, err := a.WriteLogs(ctx, logBatch("api", [3]any{100, 9, "first"}, [3]any{200, 17, "second"}))
 	require.NoError(t, err)
@@ -502,9 +519,7 @@ func TestClusteredTracesReplicateAndRead(t *testing.T) {
 	}
 	a := nodes["node-a"]
 
-	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+	awaitMembership(t, nodes)
 
 	_, err := a.WriteTraces(ctx, traceBatch("api",
 		spanSpec{traceID: "T", spanID: "root", name: "GET /", start: 100, end: 900},
@@ -543,9 +558,7 @@ func TestClusteredProfilesReplicateAndRead(t *testing.T) {
 	}
 	a := nodes["node-a"]
 
-	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+	awaitMembership(t, nodes)
 
 	// profileBatch stacks main→work; this lets us check resolution end to end.
 	_, err := a.WriteProfiles(ctx, profileBatch("api", 1000,
@@ -685,9 +698,7 @@ func TestClusteredReadFansOutToOwners(t *testing.T) {
 	}
 	a := nodes["node-a"]
 
-	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+	awaitMembership(t, nodes)
 
 	// Write via node A; it routes to the tenant's two owners.
 	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
@@ -754,9 +765,7 @@ func TestClusteredLogEnumerationFansOut(t *testing.T) {
 	}
 	a := nodes["node-a"]
 
-	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+	awaitMembership(t, nodes)
 
 	// Write logs (with a record attribute) via node A; it routes to the tenant's two owners.
 	_, err := a.WriteLogs(ctx, logBatchWithAttrs("api",
@@ -841,9 +850,7 @@ func TestAdminCompactOwnershipGate(t *testing.T) {
 	}
 	a := nodes["node-a"]
 
-	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond)
+	awaitMembership(t, nodes)
 
 	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "m1", []int64{1}, []float64{1}))
 	require.NoError(t, err)
@@ -880,9 +887,7 @@ func TestClusteredRecordShardingGathersAllStreams(t *testing.T) {
 	}
 	a := nodes["node-a"]
 
-	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond, "membership converges to three nodes")
+	awaitMembership(t, nodes)
 
 	// Write 8 distinct log streams (distinct service.name ⇒ distinct stream ids ⇒ scattered shards).
 	const streams = 8
@@ -918,9 +923,7 @@ func TestClusteredRecordShardingEnumeratesAcrossShards(t *testing.T) {
 	}
 	a := nodes["node-a"]
 
-	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond)
+	awaitMembership(t, nodes)
 
 	// Each service is a distinct stream (scattered across shards) carrying a distinct attribute key.
 	const streams = 6
@@ -971,9 +974,7 @@ func TestClusteredShardedTraceByID(t *testing.T) {
 	}
 	a := nodes["node-a"]
 
-	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond)
+	awaitMembership(t, nodes)
 
 	// One trace "t" with spans in three services (three streams that scatter across shards).
 	for i, svc := range []string{"frontend", "backend", "db"} {
@@ -1013,9 +1014,7 @@ func TestClusteredShardedProfileResolver(t *testing.T) {
 	}
 	a := nodes["node-a"]
 
-	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond)
+	awaitMembership(t, nodes)
 
 	// Profiles for three services (distinct streams ⇒ scattered shards), each with a stack.
 	for _, svc := range []string{"svc-a", "svc-b", "svc-c"} {
@@ -1085,9 +1084,7 @@ func TestClusterExplainAnalyzeRemote(t *testing.T) {
 	}
 	a := nodes["node-a"]
 
-	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
-	}, 10*time.Second, 50*time.Millisecond)
+	awaitMembership(t, nodes)
 
 	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
 	require.NoError(t, err)
