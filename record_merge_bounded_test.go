@@ -23,14 +23,26 @@ import (
 // similarly-sized tier group and seals large parts, so the per-merge working set plateaus instead of
 // climbing with cumulative rows, while no records are lost.
 //
-// trimmedPeakMiB is the largest per-merge allocation of a run of rounds ignoring the single largest
-// — the peak with room for one round to have absorbed a GC. The plain peak is what the merge working
-// set must be judged by (the regression shows up as occasional huge merges over a normal floor, so a
-// median or mean would miss it), but as a raw max one noisy round decides the whole verdict.
-func trimmedPeakMiB(xs []float64) float64 {
+// medianMiB is the typical per-merge allocation of a run of rounds.
+//
+// This was a peak (max, less the single largest round, to leave room for one round to have absorbed
+// a GC). A peak is the wrong statistic here: a round that pays a second sync.Pool refill costs ~25
+// MiB over a ~40 MiB merge, and how many rounds do so is pure GC timing — Linux shows none at all,
+// while a Windows CI run produced one in the first half and three in the second, so trimming exactly
+// one flipped the verdict. See #293.
+//
+// The median is immune to any minority of such rounds, and for the regression this test guards it is
+// also strictly more sensitive: the pre-fix merge cost grew with the cumulative dataset, so *every*
+// round in the second half grew, not an occasional one. Against a synthetic proportional regression
+// the median separates the halves by 2.85x where the trimmed peak managed 2.09x.
+func medianMiB(xs []float64) float64 {
 	sorted := slices.Sorted(slices.Values(xs))
 
-	return sorted[len(sorted)-2]
+	if n := len(sorted); n%2 == 0 {
+		return (sorted[n/2-1] + sorted[n/2]) / 2
+	}
+
+	return sorted[len(sorted)/2]
 }
 
 //nolint:paralleltest // measures process-global runtime.MemStats; a parallel test's allocations add noise.
@@ -94,13 +106,7 @@ func TestRecordMergeBoundedWorkingSet(t *testing.T) {
 
 	// The defining property of the fix: a merge late in the run (far more cumulative data behind it)
 	// costs no more than one early on. Pre-fix this ratio grew without bound (merge ∝ dataset).
-	//
-	// The peak of each half, less its single largest round. Disabling the collector removes the common
-	// case of a GC landing inside a measurement window, but not every case: one round in a run still
-	// occasionally pays a second pool refill (~25 MiB over a ~40 MiB merge), which as a raw max decides
-	// the whole half and fails the test on GC timing alone. Unbounded merges spike more than once per
-	// half and by more than a refill, so trimming one round keeps the signal.
-	firstHalf, secondHalf := trimmedPeakMiB(allocs[:rounds/2]), trimmedPeakMiB(allocs[rounds/2:])
+	firstHalf, secondHalf := medianMiB(allocs[:rounds/2]), medianMiB(allocs[rounds/2:])
 	assert.LessOrEqualf(t, secondHalf, firstHalf*1.5,
 		"per-merge working set must not grow with cumulative rows (first-half peak %.1f MiB, second-half peak %.1f MiB, all rounds %.1f)",
 		firstHalf, secondHalf, allocs)
@@ -116,4 +122,39 @@ func TestRecordMergeBoundedWorkingSet(t *testing.T) {
 		total += len(b.Timestamps)
 	}
 	assert.Equal(t, rounds*services*perService, total, "no records lost across tiered merges")
+}
+
+// TestMedianSeparatesRegressionFromGCNoise pins the statistic itself, so the flake fixed in #293
+// cannot come back unnoticed and the sensitivity claim above is checkable without a Windows runner.
+//
+// The samples are real: `windows` is the per-round series from the CI run that failed, `linux` a
+// local run of the same test. `regression` is synthetic — merge cost growing with the cumulative
+// dataset, which is what this test exists to catch.
+func TestMedianSeparatesRegressionFromGCNoise(t *testing.T) {
+	t.Parallel()
+
+	const rounds = 24
+
+	windows := []float64{
+		35.9, 39.8, 40.6, 40.5, 36.8, 40.0, 40.4, 65.4, 36.8, 40.0, 40.6, 40.7,
+		62.0, 40.0, 40.7, 40.7, 37.1, 40.0, 65.5, 40.8, 37.1, 40.0, 40.7, 65.6,
+	}
+	linux := []float64{
+		35.7, 39.7, 40.2, 40.4, 36.6, 39.9, 40.2, 40.4, 36.7, 39.8, 40.3, 40.5,
+		36.9, 39.9, 40.5, 40.5, 36.9, 39.9, 40.5, 40.5, 36.9, 39.9, 40.5, 40.5,
+	}
+
+	regression := make([]float64, rounds)
+	for i := range regression {
+		regression[i] = 35.7 * float64(i+1) / 4 // merge cost ∝ cumulative rows
+	}
+
+	ratio := func(xs []float64) float64 {
+		return medianMiB(xs[rounds/2:]) / medianMiB(xs[:rounds/2])
+	}
+
+	assert.Less(t, ratio(windows), 1.5,
+		"GC noise (three ~25 MiB pool refills in one half) must not read as growth")
+	assert.Less(t, ratio(linux), 1.5, "a clean run must pass comfortably")
+	assert.Greater(t, ratio(regression), 1.5, "a merge that grows with the dataset must still fail")
 }
