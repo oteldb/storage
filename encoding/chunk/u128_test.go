@@ -86,3 +86,83 @@ func orNilU128(s []U128) []U128 {
 
 	return s
 }
+
+// TestEncodeU128RunsMatchesExpanded pins the run-fed encoder against the expanded-column encoder:
+// a streaming part writer feeds runs instead of rows, so the two must produce the same bytes.
+func TestEncodeU128RunsMatchesExpanded(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		runs []U128Run
+	}{
+		{"empty", nil},
+		{"single", []U128Run{{Value: U128{Hi: 1, Lo: 2}, Count: 1}}},
+		{"long run", []U128Run{{Value: U128{Lo: 5}, Count: 1000}}},
+		{"many runs", []U128Run{
+			{Value: U128{Lo: 5}, Count: 3},
+			{Value: U128{Hi: 1}, Count: 2},
+			{Value: U128{Hi: 9, Lo: 9}, Count: 1},
+		}},
+		// Degenerate inputs a streaming writer can hand it: zero-count runs (a series that
+		// contributed no surviving sample) and adjacent equal values (a series split across two
+		// Append calls) must both collapse exactly as the expanded encoder would.
+		{"zero counts", []U128Run{
+			{Value: U128{Lo: 1}, Count: 0},
+			{Value: U128{Lo: 2}, Count: 4},
+			{Value: U128{Lo: 3}, Count: 0},
+		}},
+		{"adjacent equal", []U128Run{
+			{Value: U128{Lo: 7}, Count: 2},
+			{Value: U128{Lo: 7}, Count: 3},
+			{Value: U128{Lo: 8}, Count: 1},
+		}},
+		{"zero count between equal", []U128Run{
+			{Value: U128{Lo: 7}, Count: 2},
+			{Value: U128{Lo: 9}, Count: 0},
+			{Value: U128{Lo: 7}, Count: 3},
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, EncodeU128(nil, expandRuns(tc.runs)), EncodeU128Runs(nil, tc.runs))
+		})
+	}
+}
+
+func FuzzEncodeU128Runs(f *testing.F) {
+	f.Add(uint64(1), uint64(2), 8)
+	f.Add(uint64(7), uint64(11), 64)
+
+	f.Fuzz(func(t *testing.T, hiSeed, loSeed uint64, n int) {
+		if n < 0 || n > 512 {
+			t.Skip()
+		}
+
+		rng := rand.New(rand.NewPCG(hiSeed, loSeed))
+
+		runs := make([]U128Run, n)
+		for i := range runs {
+			runs[i] = U128Run{
+				Value: U128{Hi: rng.Uint64() % 3, Lo: rng.Uint64() % 5},
+				Count: rng.IntN(4), // includes 0
+			}
+		}
+
+		require.Equal(t, EncodeU128(nil, expandRuns(runs)), EncodeU128Runs(nil, runs))
+	})
+}
+
+func expandRuns(runs []U128Run) []U128 {
+	var out []U128
+	for _, r := range runs {
+		for range r.Count {
+			out = append(out, r.Value)
+		}
+	}
+
+	return out
+}

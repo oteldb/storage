@@ -26,26 +26,47 @@ func columnKey(prefix string, i int) string {
 	return prefix + "/c/" + strconv.Itoa(i)
 }
 
-// PartWriter accumulates columns and serializes them into a part's objects. Columns are
-// added in order; their ordinal is their object key. The sort-key column (timestamp for
-// metrics) drives the marks index and the manifest time range.
-type PartWriter struct {
+// partConfig is the layout configuration a [PartOption] sets. It is shared by the batch
+// [PartWriter] and the incremental [StreamWriter] so both accept the same options and lay a part
+// out identically.
+type partConfig struct {
 	sortKey       string
 	granuleSize   int
 	compressBytes int
 	defaultComp   compress.Algorithm
 	level         compress.Level
-	columns       []Column
-	rows          int
-	haveRows      bool
-	comps         map[compress.Algorithm]*compress.Compressor
 }
 
-// PartOption configures a [PartWriter].
-type PartOption func(*PartWriter)
+func newPartConfig(opts []PartOption) partConfig {
+	c := partConfig{
+		granuleSize:   defaultGranuleSize,
+		compressBytes: defaultCompressBlockBytes,
+		level:         compress.LevelDefault,
+	}
+	for _, opt := range opts {
+		opt(&c)
+	}
+
+	return c
+}
+
+// PartWriter accumulates columns and serializes them into a part's objects. Columns are
+// added in order; their ordinal is their object key. The sort-key column (timestamp for
+// metrics) drives the marks index and the manifest time range.
+type PartWriter struct {
+	partConfig
+
+	columns  []Column
+	rows     int
+	haveRows bool
+	comps    map[compress.Algorithm]*compress.Compressor
+}
+
+// PartOption configures a [PartWriter] or a [StreamWriter].
+type PartOption func(*partConfig)
 
 // WithGranuleSize sets the sparse-index granularity in rows (default 8192).
-func WithGranuleSize(n int) PartOption { return func(w *PartWriter) { w.granuleSize = n } }
+func WithGranuleSize(n int) PartOption { return func(c *partConfig) { c.granuleSize = n } }
 
 // WithCompressBlockBytes sets the minimum uncompressed bytes packed into one compression frame of a
 // block-framed column (default [defaultCompressBlockBytes]). It decouples the compression unit from
@@ -53,17 +74,17 @@ func WithGranuleSize(n int) PartOption { return func(w *PartWriter) { w.granuleS
 // gathers enough consecutive granules to give the compressor real context. Decode-compatible either
 // way — the directory records the packing.
 func WithCompressBlockBytes(n int) PartOption {
-	return func(w *PartWriter) { w.compressBytes = n }
+	return func(c *partConfig) { c.compressBytes = n }
 }
 
 // WithSortKey names the int64 column that the marks index and time range are built over.
 // If unset, the first int64 column is used.
-func WithSortKey(name string) PartOption { return func(w *PartWriter) { w.sortKey = name } }
+func WithSortKey(name string) PartOption { return func(c *partConfig) { c.sortKey = name } }
 
 // WithCompression sets the default block-compression algorithm for columns that do not
 // set [Column.Compress] (default none — the chunk codecs already compress well).
 func WithCompression(alg compress.Algorithm) PartOption {
-	return func(w *PartWriter) { w.defaultComp = alg }
+	return func(c *partConfig) { c.defaultComp = alg }
 }
 
 // WithCompressionLevel sets the compression level used by the block compressors (default
@@ -71,22 +92,15 @@ func WithCompression(alg compress.Algorithm) PartOption {
 // from the per-column algorithm recorded in the manifest, regardless of the level data was written
 // at — so a merge can rewrite cold parts at a higher ratio with no format change.
 func WithCompressionLevel(level compress.Level) PartOption {
-	return func(w *PartWriter) { w.level = level }
+	return func(c *partConfig) { c.level = level }
 }
 
 // NewPartWriter returns a [PartWriter] with the given options applied.
 func NewPartWriter(opts ...PartOption) *PartWriter {
-	w := &PartWriter{
-		granuleSize:   defaultGranuleSize,
-		compressBytes: defaultCompressBlockBytes,
-		level:         compress.LevelDefault,
-		comps:         make(map[compress.Algorithm]*compress.Compressor),
+	return &PartWriter{
+		partConfig: newPartConfig(opts),
+		comps:      make(map[compress.Algorithm]*compress.Compressor),
 	}
-	for _, opt := range opts {
-		opt(w)
-	}
-
-	return w
 }
 
 // AddColumn appends a column. All columns in a part must have the same row count.
@@ -195,7 +209,13 @@ func WritePart(ctx context.Context, b backend.Backend, prefix string, w *PartWri
 		return err
 	}
 
-	for i, obj := range built.objects {
+	return built.write(ctx, b, prefix)
+}
+
+// write stores the part's objects under prefix on b. Column and marks objects are written first;
+// the manifest is written LAST so the part only becomes readable once fully committed.
+func (p builtPart) write(ctx context.Context, b backend.Backend, prefix string) error {
+	for i, obj := range p.objects {
 		if obj == nil {
 			continue // constant column: value lives in the manifest
 		}
@@ -205,11 +225,11 @@ func WritePart(ctx context.Context, b backend.Backend, prefix string, w *PartWri
 		}
 	}
 
-	if err := b.Write(ctx, marksKey(prefix), built.marks); err != nil {
+	if err := b.Write(ctx, marksKey(prefix), p.marks); err != nil {
 		return errors.Wrap(err, "write marks")
 	}
 
-	if err := b.Write(ctx, manifestKey(prefix), built.manifest); err != nil {
+	if err := b.Write(ctx, manifestKey(prefix), p.manifest); err != nil {
 		return errors.Wrap(err, "write manifest")
 	}
 

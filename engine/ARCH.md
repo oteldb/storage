@@ -179,9 +179,26 @@ subsystem.
   **sealed** — re-merging it would only re-split it. Part count is bounded at
   ≈ dataset / (mergeHeight × MaxPartBytes) instead of growing per flush.
 - **Streaming both ways** (`compactStream`): each source is read through a forward cursor decoding
-  one series range at a time, and merged rows accumulate in one reused buffer flushed at the cap —
-  so working set is O(parts × one series range) + one part's output, not O(dataset). This is what
-  keeps background merge memory bounded as parts grow.
+  one series range at a time, and each merged series is handed straight to a `partStreamWriter`
+  (`streampart.go`) wrapping a `block.StreamWriter`, which encodes a granule as soon as one fills.
+  So the working set is O(parts × one series range) + the *encoded* output part — not O(dataset),
+  and not the output part's uncompressed rows either. That second half matters for granularity: the
+  row cap used to set peak merge memory as well as part size (`capRows × 32 B`, 512 MiB at the
+  default cap), so a cap raised to widen parts raised merge RSS with it. Now it only sets part size.
+  Measured on a 2M-row merge, streaming the output cut total allocation 3.7–5.4× and peak heap
+  2.9–3.8×, the wider margin on counter-shaped data that encodes densest.
+
+  The sidecars stream with it: the series index, identities and aggregate stats are all built from
+  the same per-series calls, each run- or series-shaped, so they cost O(distinct series) not O(rows).
+  Encoding decisions that the batch writer takes per output part — compression profile, precision
+  budget, whether a weight column exists — must instead be fixed before the first row is encoded, so
+  `mergeEncoding` derives them from the source parts; see its doc for why that is equivalent (and
+  self-correcting where it is not exact).
+
+  The **single-part forced-rewrite path** (`writeColumns`, one part selected for
+  retention/downsample/recompress/precision) still buffers whole columns: its fixed-point check —
+  skip the rewrite if the part is already at its target — needs the post-downsample row count before
+  it can decide to write at all. It is bounded by one part, and is not the routine compaction tick.
 
 ### Publish ordering
 

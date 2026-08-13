@@ -51,6 +51,34 @@ The frame-packed directory is marked `flagFramed`; the older one-compressed-bloc
 layout has `flagBlocked` without it and is still read, so parts written before framing need no
 rewrite. The writer only emits the framed form.
 
+## Two writers
+
+`PartWriter` takes whole columns and serializes them in one pass. `StreamWriter` builds the same
+part incrementally: the schema is declared up front, rows arrive through `AppendInt64` /
+`AppendFloat64` / `AppendU128Run`, and each column encodes a granule as soon as one fills. Only one
+granule of raw rows per column is ever resident, so the writer's working set is the *encoded* part
+rather than its uncompressed rows — which is what lets the merge engine write parts far larger than
+its memory budget (see `engine/ARCH.md`). Output is byte-identical to `PartWriter`'s from the same
+rows, tested case-by-case and by fuzz.
+
+Only encodings that restart per granule can stream, which is the same property block framing needs:
+blocked `Int64`/`Float64`, plus `Int128` whose RLE codec is fed runs directly and never materializes
+its rows. An unblocked int64/float64 column is rejected rather than silently buffered — its single
+codec stream cannot resume across appends.
+
+Two things the batch writer settles by looking at a finished column, a streaming one cannot:
+
+- **`AutoCodec`** picks between Gorilla and scaled-decimal by trial-encoding. `StreamWriter` runs
+  *both* candidates as it streams and keeps the denser at the end, so the choice is still made over
+  the whole column, not a prefix. It compares block-framed sizes where `PartWriter` compares
+  whole-column ones, so the two can pick differently in a marginal case — both lossless, so the part
+  decodes the same either way. (It also drops one redundant encode pass the batch path does.)
+- **`OmitConstColumn`** covers a column the format leaves *absent* rather than constant — the
+  sampling weight column, which a reader defaults to 1. A present-but-constant column is not
+  block-framed, which would drop readers onto the whole-part decode path, so an all-unit weight
+  column is dropped entirely instead. Only the last column may be omitted; dropping an earlier one
+  would renumber the object keys after it.
+
 ## Manifest & marks
 
 - **Manifest** — versioned binary record (magic `OTPM`, row count, time range, granule size,

@@ -2,12 +2,14 @@ package engine_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -78,4 +80,66 @@ func TestUnsampledNoScaleFactors(t *testing.T) {
 
 	require.NoError(t, e.Flush(ctx))
 	assert.Nil(t, fetchOne(t, e, "api").ScaleFactors, "no scale-factor column written")
+}
+
+// TestMergeDropsCollapsedScaleFactors covers the seam the streaming writer adds: a weight column
+// has to be declared before the first row is encoded, but the part format leaves it *absent* rather
+// than constant when nothing is sampled. Downsampling a sampled series with Sum emits weight 1 for
+// every output, so the sources carry weights the output does not — the writer must drop the column
+// again rather than leave a constant one behind, which would not be block-framed and would cost
+// every reader of the part the block-sliced decode path.
+func TestMergeDropsCollapsedScaleFactors(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	b := backend.Memory()
+	e := engine.New(engine.Config{Backend: b, Prefix: "default/metrics"})
+	s := mkSeries("job", "api")
+	mat := func(int) signal.Series { return s }
+
+	// Three sampled parts, all samples old enough for the tier below. Three so the merge takes the
+	// multi-part streaming path rather than the single-part rewrite.
+	for _, base := range []int64{10, 20, 30} {
+		_, err := e.AppendBatch(
+			[]signal.SeriesID{s.Hash(), s.Hash()},
+			[]int64{base, base + 1}, []float64{float64(base), float64(base * 2)}, []float64{4, 4},
+			mat, engine.AppendLimits{})
+		require.NoError(t, err)
+		require.NoError(t, e.Flush(ctx))
+	}
+
+	require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{
+		Downsample: []engine.DownsampleTier{{Before: 1 << 40, Interval: 1000, Agg: signal.AggSum}},
+	}))
+	require.Equal(t, 1, e.PartCount())
+
+	// Sum folds each weight into its value, so every surviving weight is 1 and the column must not
+	// be in the part at all — the layout an unsampled part has.
+	assert.NotContains(t, mergedPartColumns(t, ctx, b), "sf",
+		"an all-unit weight column must be dropped, not written as a constant")
+
+	assert.Nil(t, fetchOne(t, e, "api").ScaleFactors, "and the read reports no weights")
+}
+
+// mergedPartColumns opens the single part under the engine's prefix and returns its column names.
+func mergedPartColumns(t *testing.T, ctx context.Context, b backend.Backend) []string {
+	t.Helper()
+
+	keys, err := b.List(ctx, "default/metrics/")
+	require.NoError(t, err)
+
+	var prefixes []string
+
+	for _, k := range keys {
+		if p, ok := strings.CutSuffix(k, "/manifest"); ok {
+			prefixes = append(prefixes, p)
+		}
+	}
+
+	require.Len(t, prefixes, 1, "expected exactly one live part")
+
+	r, err := block.OpenPart(ctx, b, prefixes[0])
+	require.NoError(t, err)
+
+	return r.ColumnNames()
 }

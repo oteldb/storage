@@ -37,6 +37,55 @@ func EncodeU128(dst []byte, vals []U128) []byte {
 	return w.Bytes()
 }
 
+// U128Run is one run of a run-length-encoded [U128] column: a value repeated Count times.
+type U128Run struct {
+	Value U128
+	Count int
+}
+
+// EncodeU128Runs is [EncodeU128] over an already run-length-encoded column, so a writer that
+// produces its rows a run at a time never has to materialize the expanded []U128 (16 bytes per
+// row) just to have the encoder collapse it again. Runs with a zero count are skipped and adjacent
+// runs of equal value are coalesced, so the output is byte-identical to EncodeU128 over the
+// expanded column.
+func EncodeU128Runs(dst []byte, runs []U128Run) []byte {
+	rows := 0
+	for _, r := range runs {
+		if r.Count > 0 {
+			rows += r.Count
+		}
+	}
+
+	w, _ := writeHeader(dst, rows)
+
+	for i := 0; i < len(runs); {
+		if runs[i].Count <= 0 {
+			i++
+
+			continue
+		}
+
+		n := runs[i].Count
+
+		j := i + 1
+		for j < len(runs) && (runs[j].Count <= 0 || runs[j].Value == runs[i].Value) {
+			n += max(runs[j].Count, 0)
+			j++
+		}
+
+		b := w.AppendBytes(16)
+		binary.BigEndian.PutUint64(b[:8], runs[i].Value.Hi)
+		binary.BigEndian.PutUint64(b[8:], runs[i].Value.Lo)
+		w.WriteUvarint(uint64(n))
+
+		i = j
+	}
+
+	w.PadToByte()
+
+	return w.Bytes()
+}
+
 // DecodeU128 decodes a [U128] column into dst (reusing its capacity), returning the
 // result and bytes consumed.
 func DecodeU128(dst []U128, src []byte) ([]U128, int, error) {
