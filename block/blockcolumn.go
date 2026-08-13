@@ -195,15 +195,51 @@ func (d blockDir) granuleStream(g int, frame []byte) ([]byte, error) {
 	return frame[lo:hi], nil
 }
 
-// parseBlockDir reads the directory from a blocked column object. framed selects the layout: the
-// current frame-packed one, or the legacy one-compressed-block-per-granule form. It bounds-checks
-// every field against the object length so a corrupt object errors rather than panics.
-func parseBlockDir(object []byte, framed bool) (blockDir, error) {
-	if framed {
+// footerLenBytes is the fixed little-endian uint32 closing a footer-directory column, giving the
+// directory's byte length so a reader can find its start from the object's end.
+const footerLenBytes = 4
+
+// parseBlockDir reads the directory from a blocked column object. framed and footer select the
+// layout: the frame-packed directory leading the frames, the same directory trailing them, or the
+// legacy one-compressed-block-per-granule form. It bounds-checks every field against the object
+// length so a corrupt object errors rather than panics.
+func parseBlockDir(object []byte, framed, footer bool) (blockDir, error) {
+	switch {
+	case footer:
+		return parseFooterDir(object)
+	case framed:
 		return parseFramedDir(object)
+	default:
+		return parseLegacyDir(object)
+	}
+}
+
+// parseFooterDir parses a column whose frames lead and whose directory trails:
+//
+//	[frame0][frame1]…[directory][uint32 dirLen]
+//
+// The directory bytes are the frame-packed ones [parseFramedDir] reads, so the two layouts differ
+// only in where the reader finds them and where each frame's offset is measured from.
+func parseFooterDir(object []byte) (blockDir, error) {
+	if len(object) < footerLenBytes {
+		return blockDir{}, errors.Wrap(ErrCorrupt, "block dir footer truncated")
 	}
 
-	return parseLegacyDir(object)
+	end := len(object) - footerLenBytes
+
+	dirLen := int(binary.LittleEndian.Uint32(object[end:]))
+	if dirLen > end {
+		return blockDir{}, errors.Wrapf(ErrCorrupt, "block dir footer len %d exceeds object", dirLen)
+	}
+
+	dataEnd := end - dirLen
+
+	d, err := parseFramedDirAt(object[dataEnd:end], object[:dataEnd])
+	if err != nil {
+		return blockDir{}, err
+	}
+
+	return d, nil
 }
 
 // dirCursor reads the uvarint fields of a block directory, tracking the read position and turning a
@@ -211,6 +247,9 @@ func parseBlockDir(object []byte, framed bool) (blockDir, error) {
 type dirCursor struct {
 	object []byte
 	pos    int
+	// dataMax bounds the frames' total compressed length. It is not len(object) in general: under
+	// the footer layout the cursor reads a directory that is a fraction of the bytes it describes.
+	dataMax int
 }
 
 func (c *dirCursor) uvarint(what string) (uint64, error) {
@@ -224,33 +263,76 @@ func (c *dirCursor) uvarint(what string) (uint64, error) {
 	return v, nil
 }
 
-// parseFramedDir parses the frame-packed directory (see the layout comment above).
+// parseFramedDir parses the frame-packed directory leading the frames it describes (see the layout
+// comment above).
 func parseFramedDir(object []byte) (blockDir, error) {
-	c := dirCursor{object: object}
+	d, pos, total, err := parseFramedDirFields(object, len(object))
+	if err != nil {
+		return blockDir{}, err
+	}
+
+	if pos+total > len(object) {
+		return blockDir{}, errors.Wrap(ErrCorrupt, "block dir data exceeds object")
+	}
+
+	d.data = object[pos : pos+total]
+
+	return d, nil
+}
+
+// parseFramedDirAt parses the same directory read out of a separate region — the footer layout,
+// where dir trails the frames in data rather than leading them. The frames' lengths must account for
+// data exactly: a directory describing fewer bytes than the object holds is as corrupt as one
+// describing more.
+func parseFramedDirAt(dir, data []byte) (blockDir, error) {
+	d, pos, total, err := parseFramedDirFields(dir, len(data))
+	if err != nil {
+		return blockDir{}, err
+	}
+
+	if pos != len(dir) {
+		return blockDir{}, errors.Wrapf(ErrCorrupt, "block dir footer has %d trailing bytes", len(dir)-pos)
+	}
+
+	if total != len(data) {
+		return blockDir{}, errors.Wrapf(ErrCorrupt, "block dir frames total %d, want %d", total, len(data))
+	}
+
+	d.data = data
+
+	return d, nil
+}
+
+// parseFramedDirFields reads the frame-packed directory fields out of dir, returning the parsed
+// directory (without its data), the byte position just past the fields, and the frames' total
+// compressed length. dataMax bounds that total — the byte count available to the frames, which is
+// the object itself in the leading layout and the region before the directory in the footer one.
+func parseFramedDirFields(dir []byte, dataMax int) (blockDir, int, int, error) {
+	c := dirCursor{object: dir, dataMax: dataMax}
 
 	nGranules64, err := c.uvarint("nGranules")
 	if err != nil {
-		return blockDir{}, err
+		return blockDir{}, 0, 0, err
 	}
 
 	blockRows64, err := c.uvarint("blockRows")
 	if err != nil {
-		return blockDir{}, err
+		return blockDir{}, 0, 0, err
 	}
 
 	if blockRows64 == 0 {
-		return blockDir{}, errors.Wrap(ErrCorrupt, "block dir blockRows is 0")
+		return blockDir{}, 0, 0, errors.Wrap(ErrCorrupt, "block dir blockRows is 0")
 	}
 
 	nFrames64, err := c.uvarint("nFrames")
 	if err != nil {
-		return blockDir{}, err
+		return blockDir{}, 0, 0, err
 	}
 
 	// Every granule and frame costs at least one directory byte, so neither count can exceed the
-	// object length — the guard that keeps a corrupt count from driving a huge allocation.
-	if nGranules64 > uint64(len(object)) || nFrames64 > uint64(len(object)) {
-		return blockDir{}, errors.Wrapf(ErrCorrupt, "block dir counts %d/%d exceed object", nGranules64, nFrames64)
+	// directory length — the guard that keeps a corrupt count from driving a huge allocation.
+	if nGranules64 > uint64(len(dir)) || nFrames64 > uint64(len(dir)) {
+		return blockDir{}, 0, 0, errors.Wrapf(ErrCorrupt, "block dir counts %d/%d exceed object", nGranules64, nFrames64)
 	}
 
 	nGranules, nFrames := int(nGranules64), int(nFrames64)
@@ -268,20 +350,14 @@ func parseFramedDir(object []byte) (blockDir, error) {
 
 	total, err := readFrameTable(&c, &d, nFrames)
 	if err != nil {
-		return blockDir{}, err
+		return blockDir{}, 0, 0, err
 	}
 
 	if err := readGranuleLens(&c, &d); err != nil {
-		return blockDir{}, err
+		return blockDir{}, 0, 0, err
 	}
 
-	if c.pos+total > len(object) {
-		return blockDir{}, errors.Wrap(ErrCorrupt, "block dir data exceeds object")
-	}
-
-	d.data = object[c.pos : c.pos+total]
-
-	return d, nil
+	return d, c.pos, total, nil
 }
 
 // readFrameTable reads the per-frame (granule count, compressed length) pairs, filling d.frameOff and
@@ -309,14 +385,15 @@ func readFrameTable(c *dirCursor, d *blockDir, nFrames int) (int, error) {
 			g++
 		}
 
-		// Bound each length and the running total against the object so a corrupt uvarint cannot
-		// overflow into a negative span (which would panic the data slice in the caller).
-		if clen > uint64(len(c.object)) {
+		// Bound each length and the running total against the bytes available to the frames so a
+		// corrupt uvarint cannot overflow into a negative span (which would panic the data slice in
+		// the caller).
+		if clen > uint64(c.dataMax) {
 			return 0, errors.Wrapf(ErrCorrupt, "frame %d len too large", f)
 		}
 
 		total += int(clen)
-		if total < 0 || total > len(c.object) {
+		if total < 0 || total > c.dataMax {
 			return 0, errors.Wrapf(ErrCorrupt, "frame %d data exceeds object", f)
 		}
 

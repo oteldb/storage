@@ -417,7 +417,7 @@ func FuzzBlockedDecodeNoPanic(f *testing.F) {
 		}
 
 		for _, framed := range []bool{false, true} {
-			if dir, err := parseBlockDir(object, framed); err == nil {
+			if dir, err := parseBlockDir(object, framed, false); err == nil {
 				_ = dir.nBlocks()
 			}
 		}

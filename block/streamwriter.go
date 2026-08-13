@@ -19,11 +19,21 @@ import (
 // Only encodings that restart per granule can stream: blocked [KindInt64]/[KindFloat64], and
 // [KindInt128], whose RLE codec is fed runs. Output matches [PartWriter]'s byte for byte except for
 // an [Column.AutoCodec] column.
+//
+// Constructed with [NewStreamWriter] it still accumulates the *encoded* part in memory, which caps
+// the part at what the process can hold. [NewStreamWriterTo] removes that ceiling: sealed
+// compression frames go to the backend as they seal, leaving only one frame per column resident.
 type StreamWriter struct {
 	partConfig
 
 	comps map[compress.Algorithm]*compress.Compressor
 	cols  []*streamColumn
+
+	// Set by NewStreamWriterTo: where a column's sealed frames go. ctx is held because rows arrive
+	// through the Append methods, which take none; it spans the writer's life, which is one merge's.
+	ctx    context.Context //nolint:containedctx // appends carry no ctx, and they are what writes
+	b      backend.Backend
+	prefix string
 
 	// omitConstAt is -1 when OmitConstColumn was not called.
 	omitConstAt  int
@@ -36,7 +46,38 @@ func NewStreamWriter(opts ...PartOption) *StreamWriter {
 	return &StreamWriter{
 		partConfig:  newPartConfig(opts),
 		comps:       make(map[compress.Algorithm]*compress.Compressor),
+		ctx:         context.Background(),
 		omitConstAt: -1,
+	}
+}
+
+// NewStreamWriterTo returns a [StreamWriter] that hands each column's compression frames to b under
+// prefix as they seal, rather than holding the encoded part until the end. Resident memory becomes
+// one unsealed frame per column plus the column directories (kilobytes per column, one entry per
+// granule and frame) instead of the whole part, so the part's size stops being bounded by the
+// process's memory.
+//
+// The column objects it produces carry their directory as a footer ([ColumnDesc.Footer]) — with the
+// directory leading, no byte of the object could be final until the last frame sealed. A column that
+// turns out to be constant is written under neither layout: it collapses into the manifest, so it
+// stays buffered until it is known non-constant (which for real data is the second row).
+//
+// ctx spans the writer's whole life, appends included. Nothing is stored under prefix until the
+// writer finishes; a writer that will not finish must be released with [StreamWriter.Abort].
+// [WriteStreamPart] must be called with the same b and prefix.
+func NewStreamWriterTo(ctx context.Context, b backend.Backend, prefix string, opts ...PartOption) *StreamWriter {
+	w := NewStreamWriter(opts...)
+	w.ctx, w.b, w.prefix = ctx, b, prefix
+
+	return w
+}
+
+// Abort releases every object a streaming writer has under way without publishing any of them. It
+// is idempotent, and a no-op on a writer that finished or never streamed, so `defer w.Abort()` is
+// the correct cleanup.
+func (w *StreamWriter) Abort() {
+	for _, c := range w.cols {
+		c.abort()
 	}
 }
 
@@ -122,6 +163,7 @@ func (w *StreamWriter) AddColumn(c Column) error {
 		}
 
 		sc.blk = newBlockAccum(sc.comp, w.compressBytes)
+		sc.open = w.objectOpener(len(w.cols))
 	default:
 		return errors.Errorf("block: column %q: kind %s is not streamable; use PartWriter", c.Name, c.Kind)
 	}
@@ -203,6 +245,35 @@ func (w *StreamWriter) EncodedBytes() int64 {
 	return total
 }
 
+// ResidentBytes returns what the writer is holding in RAM right now: per column, the frame still
+// being filled, the block directory it is building, and — for a buffered writer, or a column not yet
+// proven non-constant — the frames sealed so far.
+//
+// It is what a caller seals a part on when the bound is memory rather than a size on disk. For a
+// [NewStreamWriterTo] writer it settles at a few hundred KiB per column and stops tracking the part;
+// for a buffered one it tracks [StreamWriter.EncodedBytes] and grows without limit.
+func (w *StreamWriter) ResidentBytes() int64 {
+	var total int64
+	for _, c := range w.cols {
+		total += c.residentBytes()
+	}
+
+	return total
+}
+
+// objectOpener returns the factory for column i's object writer, or nil when the writer buffers.
+// The id column gets none: its RLE stream is built from runs at the end and is already O(distinct
+// series), not O(rows).
+func (w *StreamWriter) objectOpener(i int) func() (backend.ObjectWriter, error) {
+	if w.b == nil {
+		return nil
+	}
+
+	return func() (backend.ObjectWriter, error) {
+		return backend.CreateObject(w.ctx, w.b, columnKey(w.prefix, i))
+	}
+}
+
 // build serializes the part. Every column must have received the same number of rows, and the
 // writer must not be appended to afterwards.
 func (w *StreamWriter) build() (builtPart, error) {
@@ -219,20 +290,23 @@ func (w *StreamWriter) build() (builtPart, error) {
 
 	descs := make([]ColumnDesc, len(w.cols))
 	objects := make([][]byte, len(w.cols))
+	// A streamed column's object is committed by finish rather than returned, so its byte size is
+	// carried separately: objects[i] is nil for it exactly as it is for a constant column.
+	sizes := make([]int64, len(w.cols))
 
 	for i, c := range w.cols {
-		desc, obj, err := c.finish(w.granuleSize)
+		desc, obj, n, err := c.finish(w.ctx, w.granuleSize)
 		if err != nil {
 			return builtPart{}, errors.Wrapf(err, "column %q", c.name)
 		}
 
-		descs[i], objects[i] = desc, obj
+		descs[i], objects[i], sizes[i] = desc, obj, n
 	}
 
 	// Dropped whole, so the part looks as if the column had never been declared; always the last
 	// one, so the rest keep their object keys.
 	if i := w.omitConstAt; i == len(descs)-1 && descs[i].Const && descs[i].ConstFloat64 == w.omitConstVal {
-		descs, objects = descs[:i], objects[:i]
+		descs, objects, sizes = descs[:i], objects[:i], sizes[:i]
 	}
 
 	if len(descs) == 0 {
@@ -253,7 +327,11 @@ func (w *StreamWriter) build() (builtPart, error) {
 	}
 
 	encodedMarks := marks.Encode(nil)
-	m.DiskBytes = objectBytes(objects, encodedMarks)
+
+	m.DiskBytes = int64(len(encodedMarks))
+	for _, n := range sizes {
+		m.DiskBytes += n
+	}
 
 	// Only the columns the part keeps: an omitted const column contributes no decoded bytes to a
 	// reader of this part.
@@ -307,9 +385,20 @@ func (w *StreamWriter) sortKeyIndex() int {
 
 // WriteStreamPart serializes w and writes the part under prefix on b, in the same order and under
 // the same keys as [WritePart] — manifest last, so the part becomes readable only once committed.
+//
+// For a writer from [NewStreamWriterTo], b and prefix must be the ones it was given: its column
+// objects commit here, and only the marks and manifest are written from memory. A failure leaves
+// the part uncommitted (no manifest) but may leave column objects behind, exactly as a failure
+// partway through [WritePart] does.
 func WriteStreamPart(ctx context.Context, b backend.Backend, prefix string, w *StreamWriter) error {
+	if w.b != nil && prefix != w.prefix {
+		return errors.Errorf("block: stream writer targets prefix %q, not %q", w.prefix, prefix)
+	}
+
 	built, err := w.build()
 	if err != nil {
+		w.Abort()
+
 		return err
 	}
 
@@ -341,6 +430,13 @@ type streamColumn struct {
 	altOK     bool
 	autoCodec bool
 	budget    uint8
+
+	// open creates this column's object writer; nil when the part is buffered. It is called once, at
+	// the granule that proves the column non-constant — a constant column has no object at all, so
+	// frames cannot be handed out before that is settled. Both accumulators get their own writer over
+	// the same key: only the codec that wins commits, the loser is aborted.
+	open      func() (backend.ObjectWriter, error)
+	streaming bool
 
 	stageI64 []int64
 	stageF64 []float64
@@ -403,9 +499,13 @@ func (c *streamColumn) flushGranuleInt64(vals []int64) error {
 	c.granules = append(c.granules, Granule{FirstRow: c.encoded, MinKey: lo, MaxKey: hi})
 	c.encoded += len(vals)
 
-	return c.blk.addGranule(func(dst []byte) ([]byte, error) {
+	if err := c.blk.addGranule(func(dst []byte) ([]byte, error) {
 		return appendInt64Granule(dst, c.codec, vals)
-	})
+	}); err != nil {
+		return err
+	}
+
+	return c.maybeAttach()
 }
 
 func (c *streamColumn) appendFloat64(vals []float64, granuleSize int) error {
@@ -470,7 +570,7 @@ func (c *streamColumn) flushGranuleFloat64(vals []float64) error {
 	}
 
 	if c.alt == nil || !c.altOK {
-		return nil
+		return c.maybeAttach()
 	}
 
 	if err := c.alt.addGranule(func(dst []byte) ([]byte, error) {
@@ -482,10 +582,96 @@ func (c *streamColumn) flushGranuleFloat64(vals []float64) error {
 	// One granule the decimal codec cannot reproduce disqualifies it for the whole column, matching
 	// the whole-column round-trip guard.
 	if c.budget == 0 && !c.decimalGranuleRoundTrips(vals) {
-		c.altOK = false
+		c.disableAlt()
+	}
+
+	return c.maybeAttach()
+}
+
+// disableAlt retires the rival scaled-decimal candidate, releasing what it accumulated: its frames
+// are dead weight the moment it is inadmissible, and on a streamed column its object writer would
+// otherwise hold a temp file open for the rest of the merge.
+func (c *streamColumn) disableAlt() {
+	if !c.altOK {
+		return
+	}
+
+	c.altOK = false
+
+	if c.alt != nil {
+		c.alt.discard()
+	}
+}
+
+// maybeAttach hands the column's accumulators their object writers the first time the rows prove it
+// non-constant. Before that the frames must stay in memory: a constant column collapses into the
+// manifest and has no object, and an object cannot be un-created once its bytes are on their way to
+// the backend. Constant data is also the case where buffering costs least — a run of one value is
+// what every codec here compresses hardest.
+func (c *streamColumn) maybeAttach() error {
+	if c.open == nil || c.streaming || !c.knownNonConst() {
+		return nil
+	}
+
+	c.streaming = true
+
+	if err := c.blk.attach(c.open); err != nil {
+		return err
+	}
+
+	if c.alt != nil && c.altOK {
+		return c.alt.attach(c.open)
 	}
 
 	return nil
+}
+
+// knownNonConst reports whether the rows appended so far already rule out the constant collapse that
+// [streamColumn.finish] applies. It is monotone: once two values differ, no later row can restore
+// the column to constant.
+func (c *streamColumn) knownNonConst() bool {
+	if !c.haveStats {
+		return false
+	}
+
+	switch c.kind {
+	case KindInt64:
+		return c.minI64 != c.maxI64
+	case KindFloat64:
+		return !c.allSame
+	case KindBytes, KindInt128:
+		return false
+	default:
+		return false
+	}
+}
+
+// residentBytes is the column's share of [StreamWriter.ResidentBytes]: its staging rows, its
+// accumulators, its marks granules, and — for the id column — its run list, which is O(distinct
+// series) and the one term a streamed part cannot shed.
+func (c *streamColumn) residentBytes() int64 {
+	const (
+		runBytes     = 24 // chunk.U128Run: a 16-byte value and a count
+		granuleBytes = 24 // Granule: FirstRow and the key range
+	)
+
+	total := int64(cap(c.stageI64))*8 + int64(cap(c.stageF64))*8
+	total += int64(cap(c.runs)) * runBytes
+	total += int64(cap(c.granules)) * granuleBytes
+	total += c.blk.residentBytes() + c.alt.residentBytes()
+
+	return total
+}
+
+// abort releases the column's in-flight object writers without publishing them.
+func (c *streamColumn) abort() {
+	if c.blk != nil {
+		c.blk.discard()
+	}
+
+	if c.alt != nil {
+		c.alt.discard()
+	}
 }
 
 // decimalGranuleRoundTrips re-encodes into scratch rather than reading back the granule just
@@ -512,8 +698,10 @@ func (c *streamColumn) decimalGranuleRoundTrips(vals []float64) bool {
 	return true
 }
 
-// finish encodes the trailing partial granule and returns the column's descriptor and object.
-func (c *streamColumn) finish(granuleSize int) (ColumnDesc, []byte, error) {
+// finish encodes the trailing partial granule and returns the column's descriptor, its object, and
+// the object's byte size. A streamed column commits its object to the backend here and returns a nil
+// one — the size is what the caller needs, since the bytes are already gone.
+func (c *streamColumn) finish(ctx context.Context, granuleSize int) (ColumnDesc, []byte, int64, error) {
 	desc := ColumnDesc{Name: c.name, Kind: c.kind, Codec: c.codec, Compress: c.comp.Algorithm()}
 	if desc.Compress != compress.AlgorithmNone {
 		desc.Level = c.comp.Level()
@@ -522,12 +710,14 @@ func (c *streamColumn) finish(granuleSize int) (ColumnDesc, []byte, error) {
 	if c.kind == KindInt128 {
 		// No stats and never constant-collapsed: the RLE codec already shrinks a single-id column
 		// to a handful of bytes.
-		return desc, c.comp.Compress(nil, chunk.EncodeU128Runs(nil, c.runs)), nil
+		obj := c.comp.Compress(nil, chunk.EncodeU128Runs(nil, c.runs))
+
+		return desc, obj, int64(len(obj)), nil
 	}
 
 	if len(c.stageI64) > 0 {
 		if err := c.flushGranuleInt64(c.stageI64); err != nil {
-			return ColumnDesc{}, nil, err
+			return ColumnDesc{}, nil, 0, err
 		}
 
 		c.stageI64 = c.stageI64[:0]
@@ -535,7 +725,7 @@ func (c *streamColumn) finish(granuleSize int) (ColumnDesc, []byte, error) {
 
 	if len(c.stageF64) > 0 {
 		if err := c.flushGranuleFloat64(c.stageF64); err != nil {
-			return ColumnDesc{}, nil, err
+			return ColumnDesc{}, nil, 0, err
 		}
 
 		c.stageF64 = c.stageF64[:0]
@@ -556,21 +746,35 @@ func (c *streamColumn) finish(granuleSize int) (ColumnDesc, []byte, error) {
 	}
 
 	if desc.Const {
-		return desc, nil, nil
+		// A constant column never attaches, so there is nothing committed to undo.
+		c.abort()
+
+		return desc, nil, 0, nil
 	}
 
 	desc.Blocked, desc.Framed = true, true
 
-	acc := c.blk
+	acc, loser := c.blk, c.alt
 	if c.autoCodec && c.altOK && c.alt.bytes < c.blk.bytes {
-		desc.Codec, acc = chunk.CodecDecimal, c.alt
+		desc.Codec, acc, loser = chunk.CodecDecimal, c.alt, c.blk
+	}
+
+	if loser != nil {
+		loser.discard()
 	}
 
 	if c.autoCodec {
 		desc.FloatPrecisionBits = c.budget
 	}
 
-	return desc, acc.finish(granuleSize), nil
+	desc.Footer = acc.streams()
+
+	obj, n, err := acc.finish(ctx, granuleSize)
+	if err != nil {
+		return ColumnDesc{}, nil, 0, err
+	}
+
+	return desc, obj, n, nil
 }
 
 // fillFloatDesc is the incremental form of [fillFloat64Stats], down to its NaN handling: an
@@ -598,7 +802,7 @@ func (c *streamColumn) fillFloatDesc(desc *ColumnDesc) {
 
 	// The lossy scaled-decimal codec cannot represent NaN/±Inf.
 	if c.budget != 0 && c.sawNonFinite {
-		c.altOK = false
+		c.disableAlt()
 	}
 }
 
@@ -627,16 +831,27 @@ func appendFloat64Granule(dst []byte, codec chunk.Codec, budget uint8, vals []fl
 // blockAccum is the streaming form of [encodeBlocked], emitting the identical layout: granules are
 // packed into compression frames of at least compressBytes and each frame is compressed as it
 // seals, so only the frame being filled is held uncompressed.
+//
+// With a sink attached ([blockAccum.attach]) a sealed frame is handed to the backend instead of
+// retained, and the directory — which then cannot lead the frames, since it is only complete once
+// they all are — is written after them as a footer. Either way the directory itself stays in memory:
+// it is two integers per frame and one per granule, kilobytes against a column of hundreds of MiB.
 type blockAccum struct {
 	comp          *compress.Compressor
 	compressBytes int
 
-	frames    [][]byte
-	frameLens []int // granules per frame
-	gLens     []int // per-granule stream length within its frame
-	pending   []byte
-	inFrame   int
-	bytes     int // compressed bytes sealed so far, the size the codec choice compares on
+	frames [][]byte // retained frames; empty once a sink is attached
+	// Per sealed frame: its granule count and its compressed byte length. Kept apart from frames
+	// because a streamed frame is gone by the time the directory is written.
+	frameGranules []int
+	frameBytes    []int
+	gLens         []int // per-granule stream length within its frame
+	pending       []byte
+	inFrame       int
+	bytes         int // compressed bytes sealed so far, the size the codec choice compares on
+
+	sink    backend.ObjectWriter
+	written int64 // bytes handed to the sink
 }
 
 func newBlockAccum(comp *compress.Compressor, compressBytes int) *blockAccum {
@@ -645,6 +860,65 @@ func newBlockAccum(comp *compress.Compressor, compressBytes int) *blockAccum {
 	}
 
 	return &blockAccum{comp: comp, compressBytes: compressBytes}
+}
+
+// streams reports whether the accumulator drains to a sink rather than retaining its frames.
+func (a *blockAccum) streams() bool { return a.sink != nil }
+
+// residentBytes is what the accumulator holds: the frame being filled, the directory, and any frames
+// it has not handed to a sink. A nil accumulator (a column with no rival codec) holds nothing.
+func (a *blockAccum) residentBytes() int64 {
+	if a == nil {
+		return 0
+	}
+
+	// Two ints per frame and one per granule, all in slices that grow amortized.
+	dir := int64(cap(a.frameGranules)+cap(a.frameBytes)+cap(a.gLens)) * 8
+
+	resident := int64(cap(a.pending)) + dir + int64(cap(a.frames))*8
+	if a.sink == nil {
+		resident += int64(a.bytes)
+	}
+
+	return resident
+}
+
+// attach opens the accumulator's object writer and drains everything sealed so far into it, so the
+// frames that predate the attach are not held any longer than the ones after it.
+func (a *blockAccum) attach(open func() (backend.ObjectWriter, error)) error {
+	w, err := open()
+	if err != nil {
+		return errors.Wrap(err, "create column object")
+	}
+
+	a.sink = w
+
+	for i, f := range a.frames {
+		if err := a.emit(f); err != nil {
+			return err
+		}
+
+		a.frames[i] = nil
+	}
+
+	a.frames = nil
+
+	return nil
+}
+
+// discard releases the accumulator: its retained frames, and its object writer if one is open and
+// uncommitted. Used for the losing codec candidate and for an abandoned part.
+func (a *blockAccum) discard() {
+	if a == nil {
+		return
+	}
+
+	if a.sink != nil {
+		a.sink.Abort()
+		a.sink = nil
+	}
+
+	a.frames, a.pending = nil, nil
 }
 
 // addGranule appends one granule's codec stream, produced by enc onto the pending frame buffer, and
@@ -662,41 +936,58 @@ func (a *blockAccum) addGranule(enc func([]byte) ([]byte, error)) error {
 	a.inFrame++
 
 	if len(a.pending) >= a.compressBytes {
-		a.seal()
+		return a.seal()
 	}
 
 	return nil
 }
 
-func (a *blockAccum) seal() {
+func (a *blockAccum) seal() error {
 	if a.inFrame == 0 {
-		return
+		return nil
 	}
 
 	f := a.comp.Compress(nil, a.pending)
 
-	a.frames = append(a.frames, f)
-	a.frameLens = append(a.frameLens, a.inFrame)
+	a.frameGranules = append(a.frameGranules, a.inFrame)
+	a.frameBytes = append(a.frameBytes, len(f))
 	a.bytes += len(f)
 	a.pending, a.inFrame = a.pending[:0], 0
-}
 
-// finish seals the trailing frame and serializes the directory + data, per the layout documented in
-// blockcolumn.go.
-func (a *blockAccum) finish(blockRows int) []byte {
-	a.seal()
+	if a.sink == nil {
+		a.frames = append(a.frames, f)
 
-	dir := binary.AppendUvarint(nil, uint64(len(a.gLens)))
-	dir = binary.AppendUvarint(dir, uint64(blockRows))
-	dir = binary.AppendUvarint(dir, uint64(len(a.frames)))
-
-	for i, f := range a.frames {
-		dir = binary.AppendUvarint(dir, uint64(a.frameLens[i]))
-		dir = binary.AppendUvarint(dir, uint64(len(f)))
+		return nil
 	}
 
-	for _, l := range a.gLens {
-		dir = binary.AppendUvarint(dir, uint64(l))
+	return a.emit(f)
+}
+
+func (a *blockAccum) emit(f []byte) error {
+	n, err := a.sink.Write(f)
+	a.written += int64(n)
+
+	if err != nil {
+		return errors.Wrap(err, "write column frame")
+	}
+
+	return nil
+}
+
+// finish seals the trailing frame and completes the column object: serialized into one buffer under
+// the directory-first layout, or written to the sink as a footer under the streaming one. It returns
+// the object (nil when it went to the sink) and its byte size.
+func (a *blockAccum) finish(ctx context.Context, blockRows int) ([]byte, int64, error) {
+	if err := a.seal(); err != nil {
+		return nil, 0, err
+	}
+
+	dir := a.encodeDir(blockRows)
+
+	if a.sink != nil {
+		n, err := a.finishStreamed(ctx, dir)
+
+		return nil, n, err
 	}
 
 	// Allocated to the exact final size and drained frame by frame. On a merged part's column this
@@ -712,5 +1003,44 @@ func (a *blockAccum) finish(blockRows int) []byte {
 
 	a.pending = nil
 
-	return dst
+	return dst, int64(len(dst)), nil
+}
+
+// finishStreamed writes the directory after the frames, closes it with its own little-endian length
+// so a reader can find its start from the object's end, and commits.
+func (a *blockAccum) finishStreamed(ctx context.Context, dir []byte) (int64, error) {
+	dir = binary.LittleEndian.AppendUint32(dir, uint32(len(dir)))
+
+	if err := a.emit(dir); err != nil {
+		return 0, err
+	}
+
+	n := a.written
+
+	sink := a.sink
+	a.sink, a.pending = nil, nil
+
+	if err := sink.Commit(ctx); err != nil {
+		return 0, errors.Wrap(err, "commit column object")
+	}
+
+	return n, nil
+}
+
+// encodeDir serializes the frame/granule directory, the same bytes under both layouts.
+func (a *blockAccum) encodeDir(blockRows int) []byte {
+	dir := binary.AppendUvarint(nil, uint64(len(a.gLens)))
+	dir = binary.AppendUvarint(dir, uint64(blockRows))
+	dir = binary.AppendUvarint(dir, uint64(len(a.frameGranules)))
+
+	for i, n := range a.frameGranules {
+		dir = binary.AppendUvarint(dir, uint64(n))
+		dir = binary.AppendUvarint(dir, uint64(a.frameBytes[i]))
+	}
+
+	for _, l := range a.gLens {
+		dir = binary.AppendUvarint(dir, uint64(l))
+	}
+
+	return dir
 }
