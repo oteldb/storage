@@ -86,35 +86,23 @@ func forcedRewrite(p *part, opts MergeOptions) bool {
 		precisionApplies(p, opts.Precision)
 }
 
-// selectMergeParts chooses the source parts to compact this cycle: the union of the parts a forced
-// rewrite (retention/downsample/recompress/precision) must touch and the best run of unsealed
-// parts. It returns nil when nothing is worth doing, so the merge is a no-op without decoding
-// anything. capBytes is the seal threshold in bytes on disk (0 ⇒ unlimited, nothing is ever
-// sealed); idle is the number of consecutive no-op merges that preceded this one.
+// selectMergeParts chooses the source parts to compact this cycle. Both paths — the forced rewrite
+// (retention/downsample/recompress/precision) and the size-tiered run — are confined to one aligned
+// time bucket, so a merge can never emit a part wider than a ladder level and time locality
+// survives compaction (see timebucket.go). It returns nil when nothing is worth doing, so the merge
+// is a no-op without decoding anything. capBytes is the seal threshold in bytes on disk
+// (0 ⇒ unlimited, nothing is ever sealed); idle is the number of consecutive no-op merges that
+// preceded this one.
+//
+// Forced work wins the cycle outright rather than being unioned with a size-tiered run, because the
+// two are now in general in different buckets and merging across them is the widening this exists to
+// prevent. The size-tiered run is picked up on the next cycle.
 func selectMergeParts(src []*part, opts MergeOptions, capBytes int64, idle int) []*part {
-	var (
-		selected []*part
-		chosen   = make(map[*part]struct{}, len(src))
-	)
-
-	add := func(p *part) {
-		if _, ok := chosen[p]; !ok {
-			chosen[p] = struct{}{}
-			selected = append(selected, p)
-		}
+	if forced := selectForced(src, opts, capBytes); len(forced) > 0 {
+		return forced
 	}
 
-	for _, p := range src {
-		if forcedRewrite(p, opts) {
-			add(p)
-		}
-	}
-
-	for _, p := range pickMergeRun(src, capBytes, idle) {
-		add(p)
-	}
-
-	return selected
+	return selectLadderRun(src, capBytes, idle)
 }
 
 // pickMergeRun returns the unsealed parts to compact for size reduction, or nil when none are worth
