@@ -57,7 +57,7 @@ func TestClusterTracePropagationCorrelatesLogs(t *testing.T) {
 
 	a := nodes["node-a"]
 	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
+		return ringSize(a) == 3
 	}, 10*time.Second, 50*time.Millisecond)
 
 	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))

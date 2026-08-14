@@ -29,7 +29,7 @@ func TestClusterGainedOwnerBootstrap(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		for _, s := range nodes {
-			if len(s.cluster.membership.Members()) != 3 {
+			if ringSize(s) != 3 {
 				return false
 			}
 		}
@@ -67,7 +67,7 @@ func TestClusterGainedOwnerBootstrap(t *testing.T) {
 	delete(nodes, owners[1].ID)
 
 	require.Eventually(t, func() bool {
-		return len(spare.cluster.membership.Members()) == 2
+		return ringSize(spare) == 2
 	}, 15*time.Second, 100*time.Millisecond, "membership drops the lost owner")
 
 	newOwners := spare.cluster.membership.Ring().Lookup([]byte("default"), 2)
