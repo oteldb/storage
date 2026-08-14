@@ -218,6 +218,14 @@ subsystem.
 - **Recompression is decode-transparent** — the reader keys off the per-column algorithm in the
   manifest, so it is a pure ratio/CPU trade with no format change. The *level* is recorded too, but
   only so the merge can tell a part already at the target from one below it; nothing reads it back.
+- **Retention drops whole parts first.** A part whose `maxTime` is already past the cutoff holds no
+  row retention would keep, so it is retired on the manifest alone (`dropExpired`) — no decode, no
+  re-encode, no output part. Only a part *straddling* the cutoff is rewritten. This makes retention
+  cost O(1) in the expired data rather than O(bytes), the property every reference system leans on
+  (Prometheus deletes whole blocks, VictoriaMetrics whole partitions). The drop publishes like any
+  merge — copy-on-write swap, index commit, then retire — so a failed commit rolls back and the
+  parts stay live. Since the size-based cutoff shares `RetainFrom`, disk-pressure eviction drops
+  whole parts too.
 - **Run selection** (`compact.go`) picks only what is worth merging: any part a forced rewrite must
   touch (retention/downsample/recompress/precision — so age-driven work is never starved), plus the
   best run of *unsealed* parts. A part at the merge cap is **sealed** — re-merging it would only

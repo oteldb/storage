@@ -86,24 +86,33 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 
 	capBytes := e.mergeCapBytes(ctx)
 
+	// Retention first, and without decoding: a part every one of whose samples is older than the
+	// cutoff is dropped whole rather than rewritten into nothing.
+	src, dropped, err := e.dropExpired(ctx, src, opts)
+	if err != nil {
+		return 0, err
+	}
+
 	selected := selectMergeParts(src, opts, capBytes, e.idleMerges)
 	if len(selected) == 0 {
-		e.idleMerges++
+		if dropped == 0 {
+			e.idleMerges++
 
-		// A no-op is indistinguishable from a healthy engine without the shape of what it looked
-		// at: 59 parts sat uncompacted for hours logging only "nothing to compact". These are the
-		// exact inputs to that decision.
-		sealedN, eligible, bestM := mergeShape(src, capBytes)
-		zctx.From(ctx).Debug("merge selected nothing",
-			zap.String("prefix", e.cfg.Prefix), zap.Int("parts", len(src)),
-			zap.Int("sealed", sealedN), zap.Int64("cap_bytes", capBytes),
-			zap.Int("eligible", eligible), zap.Float64("best_multiplier", bestM),
-			zap.Float64("min_multiplier", minMergeMultiplier),
-			zap.Int("idle_rounds", e.idleMerges), zap.Int("waive_after", mergeIdleRounds))
+			// A no-op is indistinguishable from a healthy engine without the shape of what it looked
+			// at: 59 parts sat uncompacted for hours logging only "nothing to compact". These are the
+			// exact inputs to that decision.
+			sealedN, eligible, bestM := mergeShape(src, capBytes)
+			zctx.From(ctx).Debug("merge selected nothing",
+				zap.String("prefix", e.cfg.Prefix), zap.Int("parts", len(src)),
+				zap.Int("sealed", sealedN), zap.Int64("cap_bytes", capBytes),
+				zap.Int("eligible", eligible), zap.Float64("best_multiplier", bestM),
+				zap.Float64("min_multiplier", minMergeMultiplier),
+				zap.Int("idle_rounds", e.idleMerges), zap.Int("waive_after", mergeIdleRounds))
+		}
 
 		e.reclaimRetired(ctx)
 
-		return 0, nil
+		return dropped, nil
 	}
 
 	e.idleMerges = 0
@@ -115,17 +124,14 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 
 	// Build (lock-free): compact the selected parts into new output part(s), reading them back. The
 	// source parts stay live (not retired) until publish, so they can't be reclaimed here.
-	var (
-		newParts []*part
-		err      error
-	)
+	var newParts []*part
 
 	if len(selected) == 1 {
 		// A single forced part: decode it (bounded — one part), apply retention/downsample, and skip
 		// the rewrite if it is already at its target (the fixed point), avoiding backend churn.
 		var cols *flushColumns
 		if cols, err = e.compactParts(ctx, selected, start, opts.Downsample); err != nil {
-			return 0, err
+			return dropped, err
 		}
 
 		p := selected[0]
@@ -133,14 +139,14 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 			!recompressApplies(p, opts.Recompress) && !precisionApplies(p, opts.Precision) {
 			e.reclaimRetired(ctx)
 
-			return 0, nil
+			return dropped, nil
 		}
 
 		if newParts, err = e.writeColumns(ctx, cols, rowCapFor(p, capBytes), opts); err != nil {
-			return 0, err
+			return dropped, err
 		}
 	} else if newParts, err = e.compactStream(ctx, selected, start, capBytes, opts); err != nil {
-		return 0, err
+		return dropped, err
 	}
 
 	// Publish (under lock): swap the selected parts for the merged one(s) copy-on-write (keeping every
@@ -163,7 +169,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 		e.parts = committed
 		e.mu.Unlock()
 
-		return len(selected), err
+		return dropped + len(selected), err
 	}
 
 	e.retireLocked(selected)
@@ -178,7 +184,71 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 
 	e.reclaimRetired(ctx)
 
-	return len(selected), nil
+	return dropped + len(selected), nil
+}
+
+// dropExpired retires every part retention has emptied — one whose newest sample is already older
+// than the cutoff, so not a single row would survive a rewrite — and returns the parts that remain
+// plus the number dropped. Retention on such a part is a manifest edit, not a decode: the merge
+// path would otherwise read it whole, re-encode nothing, and write an empty result. It is also what
+// makes retention cost O(1) in the expired data rather than O(bytes), the property every reference
+// system relies on (Prometheus deletes whole blocks, VictoriaMetrics whole partitions).
+//
+// The drop is published like any merge — copy-on-write swap, index commit, then retire — so a
+// failed commit rolls back and the parts stay live. src is the caller's snapshot; e.parts is
+// re-read under the lock, so a part a concurrent flush added is preserved.
+func (e *Engine) dropExpired(ctx context.Context, src []*part, opts MergeOptions) ([]*part, int, error) {
+	if opts.RetainFrom <= 0 {
+		return src, 0, nil
+	}
+
+	var expired []*part
+
+	for _, p := range src {
+		if p.maxTime < opts.RetainFrom {
+			expired = append(expired, p)
+		}
+	}
+
+	if len(expired) == 0 {
+		return src, 0, nil
+	}
+
+	removed := make(map[string]struct{}, len(expired))
+	for _, p := range expired {
+		removed[p.prefix] = struct{}{}
+	}
+
+	e.mu.Lock()
+	committed := e.parts
+	e.parts = replaceParts(e.parts, removed)
+
+	if err := e.updateIndexLocked(ctx); err != nil {
+		e.parts = committed
+		e.mu.Unlock()
+
+		return nil, 0, err
+	}
+
+	e.retireLocked(expired)
+	// Every sample these parts held is gone, so the identities naming them may be dead — the same
+	// reasoning as a merge that drops rows, and the identity prune has something to find.
+	e.identityDirty = true
+	e.mu.Unlock()
+
+	remaining := make([]*part, 0, len(src)-len(expired))
+
+	for _, p := range src {
+		if _, drop := removed[p.prefix]; !drop {
+			remaining = append(remaining, p)
+		}
+	}
+
+	zctx.From(ctx).Debug("dropped expired parts",
+		zap.String("prefix", e.cfg.Prefix), zap.Int("parts", len(expired)),
+		zap.Int64("retain_from", opts.RetainFrom))
+
+	return remaining, len(expired), nil
 }
 
 // writeColumns splits cols into one or more output parts, each kept under capRows (a single part
