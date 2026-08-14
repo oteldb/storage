@@ -74,11 +74,18 @@ func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
 
 	capBytes := e.mergeCapBytes()
 
+	// Retention first, and without decoding: a part every one of whose records is older than the
+	// cutoff is dropped whole rather than rewritten into nothing.
+	src, dropped, err := e.dropExpired(ctx, src, retainFrom)
+	if err != nil {
+		return 0, err
+	}
+
 	selected := selectMergeParts(src, retainFrom, capBytes)
 	if len(selected) == 0 {
 		e.reclaimRetired(ctx) // nothing to compact, but still sweep pending deletions
 
-		return 0, nil
+		return dropped, nil
 	}
 
 	start := minInt64
@@ -91,7 +98,7 @@ func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
 	// they cannot be reclaimed underneath this read.
 	newParts, err := e.compactParts(ctx, selected, start, capBytes)
 	if err != nil {
-		return 0, err
+		return dropped, err
 	}
 
 	// Publish (under lock): swap the selected parts for the merged one(s) copy-on-write (keeping every
@@ -114,7 +121,7 @@ func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
 		e.parts = committed
 		e.mu.Unlock()
 
-		return len(selected), err
+		return dropped + len(selected), err
 	}
 
 	e.retireLocked(selected)
@@ -129,7 +136,70 @@ func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
 
 	e.reclaimRetired(ctx)
 
-	return len(selected), nil
+	return dropped + len(selected), nil
+}
+
+// dropExpired retires every part retention has emptied — one whose newest record is already older
+// than the cutoff, so not a single row would survive a rewrite — and returns the parts that remain
+// plus the number dropped. Retention on such a part is a manifest edit, not a decode: the merge
+// path would otherwise read it whole, re-encode nothing, and write an empty result. It is what
+// makes retention cost O(1) in the expired data rather than O(bytes).
+//
+// The drop publishes like any merge — copy-on-write swap, index commit, then retire — so a failed
+// commit rolls back and the parts stay live. The retired parts' objects, including their side-store
+// and bloom sidecars (all written under the part prefix), are reclaimed by [deletePart].
+func (e *Engine) dropExpired(ctx context.Context, src []*part, retainFrom int64) ([]*part, int, error) {
+	if retainFrom <= 0 {
+		return src, 0, nil
+	}
+
+	var expired []*part
+
+	for _, p := range src {
+		if p.maxTime < retainFrom {
+			expired = append(expired, p)
+		}
+	}
+
+	if len(expired) == 0 {
+		return src, 0, nil
+	}
+
+	removed := make(map[string]struct{}, len(expired))
+	for _, p := range expired {
+		removed[p.prefix] = struct{}{}
+	}
+
+	e.mu.Lock()
+	committed := e.parts
+	e.parts = replaceParts(e.parts, removed)
+
+	if err := e.updateIndexLocked(ctx); err != nil {
+		e.parts = committed
+		e.mu.Unlock()
+
+		return nil, 0, err
+	}
+
+	e.retireLocked(expired)
+	// Every record these parts held is gone, so the identities naming them may be dead — the same
+	// reasoning as a merge that drops rows, and the identity prune has something to find.
+	e.identityDirty = true
+	e.mu.Unlock()
+
+	remaining := make([]*part, 0, len(src)-len(expired))
+
+	for _, p := range src {
+		if _, drop := removed[p.prefix]; !drop {
+			remaining = append(remaining, p)
+		}
+	}
+
+	zctx.From(ctx).Debug("dropped expired parts",
+		zap.String("prefix", e.cfg.Prefix), zap.Int("parts", len(expired)),
+		zap.Int64("retain_from", retainFrom))
+
+	return remaining, len(expired), nil
 }
 
 // mergeSidecars unions the side-store sidecars of the compacted parts and writes the merged tables
