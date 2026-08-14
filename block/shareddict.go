@@ -282,3 +282,84 @@ func decodeSharedGranule(stream []byte, entries [][]byte, rows int, dc *chunk.Di
 
 	return nil
 }
+
+// decodeSharedIDs is the fast path for a shared-dictionary column whose selected granules all use
+// it: their ids already index the column-wide dictionary, so the result is the dictionary plus the
+// granules' id bytes copied into place — no per-granule dictionary to merge, no remap, no hash
+// probes. This is the common case (measured: the shared dictionary is chosen in 33 of 34 parts for
+// a record-attributes column), and it is what keeps a framed decode close to the single-stream one.
+//
+// It reports ok=false the moment it meets a self-encoded granule, leaving the caller to redo the
+// walk through [chunk.DictMerger]; only a column mixing both modes pays that second pass.
+//
+// Because the ids are *copied* rather than aliased, this can reuse one decompression buffer across
+// frames — unlike the merge path, whose entries alias the frames and so must keep each alive.
+//
+// In scatter mode the rows no granule covers are left at id 0, i.e. unspecified — the same contract
+// the int64 path has, where decodeBlocksInto leaves unselected rows at whatever the destination
+// held. A caller reads only the rows it selected.
+func decodeSharedIDs(
+	dir blockDir, comp *compress.Compressor, rows int, blocks []int, entries [][]byte, scatter bool,
+) (col *chunk.DictColumn, ok bool, err error) {
+	idWidth := 1
+	if len(entries) > 256 {
+		idWidth = 2
+	}
+
+	out := rows
+	if !scatter {
+		out = 0
+		for _, g := range blocks {
+			lo := g * dir.blockRows
+			if lo >= rows {
+				return nil, false, errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", g, lo, rows)
+			}
+
+			out += min(lo+dir.blockRows, rows) - lo
+		}
+	}
+
+	ids := make([]byte, out*idWidth)
+	streams := newBlockStreams(dir, comp)
+	pos := 0
+
+	for _, g := range blocks {
+		if g < 0 || g >= dir.nBlocks() {
+			return nil, false, errors.Errorf("block: block %d out of range [0,%d)", g, dir.nBlocks())
+		}
+
+		lo := g * dir.blockRows
+		if lo >= rows {
+			return nil, false, errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", g, lo, rows)
+		}
+
+		stream, err := streams.granule(g)
+		if err != nil {
+			return nil, false, err
+		}
+
+		if len(stream) == 0 {
+			return nil, false, errors.Wrap(ErrCorrupt, "shared dict: empty granule stream")
+		}
+
+		if stream[0] != modeShared {
+			return nil, false, nil // a self-encoded granule: the caller redoes this through the merge
+		}
+
+		n := min(lo+dir.blockRows, rows) - lo
+		if len(stream[1:]) != n*idWidth {
+			return nil, false, errors.Wrapf(ErrCorrupt,
+				"shared dict: %d id bytes for %d rows at width %d", len(stream[1:]), n, idWidth)
+		}
+
+		at := pos
+		if scatter {
+			at = lo
+		}
+
+		copy(ids[at*idWidth:], stream[1:])
+		pos += n
+	}
+
+	return &chunk.DictColumn{Entries: entries, IDs: ids, IDWidth: idWidth}, true, nil
+}

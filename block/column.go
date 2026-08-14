@@ -667,12 +667,17 @@ func (r *ColumnReader) DecodeBlocksBytes(blocks []int) (*chunk.DictColumn, error
 }
 
 // DecodeBlocksBytesIntoColumn decodes the named granules into a column spanning *every* row of the
-// part, each granule at its own row offset and the rest empty.
+// part, each granule at its own row offset.
 //
 // Unlike [ColumnReader.DecodeBlocksBytes], which packs the selection, this keeps part row indices
 // valid — the property the int64 path gets for free by decoding into the destination at absolute
 // offsets. A fetch that located its rows through the part's row-range index and its marks can then
 // prune the decode without renumbering anything it already resolved.
+//
+// Rows outside the selected granules hold an **unspecified** value: the caller asked for these
+// granules and reads only their rows. This matches [ColumnReader.DecodeBlocksInt64], where
+// unselected rows keep whatever the destination held. Zeroing them would cost a pass over the rows
+// the pruning exists to avoid touching.
 func (r *ColumnReader) DecodeBlocksBytesIntoColumn(blocks []int) (*chunk.DictColumn, error) {
 	dir, shared, err := r.blockedBytes()
 	if err != nil {

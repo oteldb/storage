@@ -40,7 +40,7 @@ const maxDictEntries = 1 << 16
 
 // Scatter puts the merge in whole-column mode: the result spans the column, and each appended
 // granule lands at its own offset rather than being packed against its predecessor. Rows no
-// granule covers decode to an empty value.
+// granule covers hold an unspecified value — the caller reads only the rows it selected.
 //
 // This is what lets a pruned read keep working in *part row indices*. A packed result would
 // renumber every row a query already located through the part's row-range index and its marks, so
@@ -50,6 +50,12 @@ const maxDictEntries = 1 << 16
 // values those rows would otherwise have decoded.
 func (d *DictMerger) Scatter(rows int) {
 	d.scatter, d.rows = true, rows
+
+	// Sized up front: grow would otherwise extend one row at a time, reallocating its way to the
+	// column's length on the first granule that lands past the start.
+	if cap(d.ids) < rows {
+		d.ids = make([]int32, 0, rows)
+	}
 }
 
 // Reset returns m to its empty state, keeping its buffers for reuse.
@@ -82,6 +88,15 @@ func (d *DictMerger) Append(c *DictColumn) {
 	// into a shared dictionary would build one the size of the column to no purpose. This is the
 	// common case for a high-cardinality column (a log body), where every granule encodes flat.
 	if c.IDWidth == 0 {
+		d.degrade()
+	}
+
+	// A granule whose dictionary holds one entry per row has no internal repeats. Merging it can
+	// only pay if its values repeat in *other* granules — and the writer already decided they do
+	// not, since it self-encoded rather than joining the column's shared dictionary. Probing every
+	// value into the merge would build a dictionary the size of the column and then degrade anyway,
+	// which is what a near-unique column (a log body) did on every whole-column decode.
+	if c.IDWidth > 0 && len(c.Entries) == rows {
 		d.degrade()
 	}
 
@@ -197,15 +212,15 @@ func (d *DictMerger) putFlat(c *DictColumn, rows int) {
 // gap with the sentinel entry (id 0, the empty value reserved at Scatter time).
 func (d *DictMerger) grow(off, n int) {
 	if d.isFlat {
-		for len(d.flat) < off+n {
-			d.flat = append(d.flat, nil)
+		if need := off + n; need > len(d.flat) {
+			d.flat = append(d.flat, make([][]byte, need-len(d.flat))...)
 		}
 
 		return
 	}
 
-	for len(d.ids) < off+n {
-		d.ids = append(d.ids, 0)
+	if need := off + n; need > len(d.ids) {
+		d.ids = append(d.ids, make([]int32, need-len(d.ids))...)
 	}
 }
 

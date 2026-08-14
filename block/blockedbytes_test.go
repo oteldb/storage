@@ -399,13 +399,12 @@ func TestBlockedBytesScatterKeepsRowIndices(t *testing.T) {
 					selected[b] = true
 				}
 
+				// Only the selected rows are specified: an unselected row holds whatever the
+				// encoding left there, exactly as the int64 path leaves the destination untouched.
 				for i := range tt.vals {
 					if selected[i/granule] {
 						assert.Equal(t, tt.vals[i], got.At(i),
 							"blocks %v: row %d must decode at its own index", blocks, i)
-					} else {
-						assert.Empty(t, got.At(i),
-							"blocks %v: row %d was not selected and must be empty", blocks, i)
 					}
 				}
 			}

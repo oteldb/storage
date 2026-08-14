@@ -589,23 +589,30 @@ func (s *blockStreams) granule(g int) ([]byte, error) {
 func decodeBlockedBytes(
 	dir blockDir, comp *compress.Compressor, rows int, blocks []int, shared [][]byte,
 ) (*chunk.DictColumn, error) {
+	// A nil selection means the whole column; materializing it lets the whole-column decode take the
+	// same shared-dictionary fast path a pruned one does.
+	if blocks == nil {
+		blocks = make([]int, dir.nBlocks())
+		for i := range blocks {
+			blocks[i] = i
+		}
+	}
+
+	if shared != nil {
+		if col, ok, err := decodeSharedIDs(dir, comp, rows, blocks, shared, false); err != nil {
+			return nil, err
+		} else if ok {
+			return col, nil
+		}
+	}
+
 	w := bytesWalk{dir: dir, comp: comp, rows: rows, shared: shared, curFrame: -1}
 
-	if blocks == nil {
-		for g := range dir.nBlocks() {
-			if err := w.decode(g); err != nil {
-				w.merger.Reset()
+	for _, g := range blocks {
+		if err := w.decode(g); err != nil {
+			w.merger.Reset()
 
-				return nil, err
-			}
-		}
-	} else {
-		for _, g := range blocks {
-			if err := w.decode(g); err != nil {
-				w.merger.Reset()
-
-				return nil, err
-			}
+			return nil, err
 		}
 	}
 
@@ -622,6 +629,14 @@ func decodeBlockedBytes(
 func decodeBlockedBytesScatter(
 	dir blockDir, comp *compress.Compressor, rows int, blocks []int, shared [][]byte,
 ) (*chunk.DictColumn, error) {
+	if shared != nil {
+		if col, ok, err := decodeSharedIDs(dir, comp, rows, blocks, shared, true); err != nil {
+			return nil, err
+		} else if ok {
+			return col, nil
+		}
+	}
+
 	w := bytesWalk{dir: dir, comp: comp, rows: rows, shared: shared, curFrame: -1, scatter: true}
 	w.merger.Scatter(rows)
 
