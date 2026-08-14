@@ -629,100 +629,92 @@ func blockInWindow(gran []block.Granule, b int, start, end int64) bool {
 	return g.MaxKey >= start && g.MinKey <= end
 }
 
-// pruneBlocks drops the blocks whose granule bounds cannot intersect [start, end]. The input is
-// returned untouched when the part has no usable granule index.
-func pruneBlocks(blocks []int, gran []block.Granule, start, end int64) []int {
-	if len(gran) == 0 {
-		return blocks
-	}
-
-	out := make([]int, 0, len(blocks))
-
-	for _, b := range blocks {
-		if blockInWindow(gran, b, start, end) {
-			out = append(out, b)
-		}
-	}
-
-	return out
-}
-
-// rowsInBlocks counts the rows of ranges that lie in the given blocks — the matched rows that
-// survive time pruning. Charging the budget for the rows in blocks it will not decode is what made
-// a narrow query on a wide part reserve the whole part.
-func rowsInBlocks(ranges []rowRange, blockRows int, blocks []int, totalRows int) int64 {
+// windowBlocks returns the blocks of a part that the given row ranges span **and** whose granule
+// bounds can hold a sample in [start, end], together with the number of matched rows lying inside
+// those blocks. Both halves come from one pass because the decode estimate needs both and they walk
+// the same ranges.
+//
+// It is deliberately O(blocks the ranges touch), never O(blocks in the part): a billion-row part
+// holds millions of granules, and an intermediate sized to the part (a seen/keep bitmap) allocated
+// and scanned megabytes per query no matter how selective the query was — which made the fixed cost
+// of a fetch scale with part size rather than with the answer.
+//
+// gran nil ⇒ nothing is pruned. Rows are counted per range against every surviving block it
+// overlaps, so a block two ranges share is counted once per range (the rows differ) while the block
+// list still names it once.
+func windowBlocks(
+	ranges []rowRange, blockRows, totalRows int, gran []block.Granule, start, end int64,
+) ([]int, int64) {
 	if blockRows <= 0 || totalRows == 0 {
-		return 0
+		return nil, 0
 	}
 
-	keep := make([]bool, (totalRows+blockRows-1)/blockRows)
-	for _, b := range blocks {
-		if b >= 0 && b < len(keep) {
-			keep[b] = true
+	nBlocks := (totalRows + blockRows - 1) / blockRows
+
+	// The ranges come from the matched series in index order, and a part is (series, ts)-sorted, so
+	// they normally ascend and one watermark dedups the block list without sorting. A caller that
+	// passes them out of order still gets a correct answer, at the cost of a sort.
+	ordered := true
+
+	for i := 1; i < len(ranges); i++ {
+		if ranges[i].start < ranges[i-1].start {
+			ordered = false
+
+			break
 		}
 	}
 
-	var rows int64
+	var (
+		out       []int
+		rows      int64
+		watermark = -1
+	)
 
 	for _, rng := range ranges {
 		if rng.start >= rng.end {
 			continue
 		}
 
-		for b := rng.start / blockRows; b <= (rng.end-1)/blockRows; b++ {
-			if !keep[b] {
+		first := rng.start / blockRows
+		last := min((rng.end-1)/blockRows, nBlocks-1)
+
+		for b := first; b <= last; b++ {
+			if !blockInWindow(gran, b, start, end) {
 				continue
 			}
 
 			blockStart := b * blockRows
-			lo := max(rng.start, blockStart)
-			hi := min(rng.end, blockStart+blockRows)
 
-			if lo < hi {
+			if lo, hi := max(rng.start, blockStart), min(rng.end, blockStart+blockRows); lo < hi {
 				rows += int64(hi - lo)
 			}
+
+			if !ordered || b > watermark {
+				out = append(out, b)
+			}
+		}
+
+		if last > watermark {
+			watermark = last
 		}
 	}
 
-	return rows
+	if !ordered {
+		slices.Sort(out)
+		out = slices.Compact(out)
+	}
+
+	return out, rows
 }
 
 // neededBlocks returns the sorted block indices that ranges span, for a column of totalRows rows
-// blocked at blockRows. It is the set of blocks the series-skip decode must materialize.
+// blocked at blockRows — the blocks a series-skip decode must materialize, with no time pruning.
+// The whole-part decode path uses it: it fills a part-sized buffer whose consumers read by row
+// index, so a block skipped there would leave a hole rather than save work.
 func neededBlocks(ranges []rowRange, blockRows, totalRows int) []int {
-	if blockRows <= 0 || totalRows == 0 {
-		return nil
-	}
+	blocks, _ := windowBlocks(ranges, blockRows, totalRows, nil, minInt64, maxInt64)
 
-	nBlocks := (totalRows + blockRows - 1) / blockRows
-	seen := make([]bool, nBlocks)
-
-	n := 0
-
-	for _, rng := range ranges {
-		if rng.start >= rng.end {
-			continue
-		}
-
-		for b := rng.start / blockRows; b <= (rng.end-1)/blockRows; b++ {
-			if !seen[b] {
-				seen[b] = true
-				n++
-			}
-		}
-	}
-
-	// Sized to the blocks actually touched, not to the part: a selective query over a large part
-	// spans a handful of blocks, and capacity nBlocks made the throwaway result dwarf it.
-	out := make([]int, 0, n)
-
-	for b, s := range seen {
-		if s {
-			out = append(out, b)
-		}
-	}
-
-	return out
+	return blocks
 }
 
 // decodeValueCols decodes the value column — and the scale-factor column when the part carries one —

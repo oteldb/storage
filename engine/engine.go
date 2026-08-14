@@ -563,7 +563,9 @@ func (p *enginePlan) blocksFor(ctx context.Context, pt *part, r *seriesBlockRead
 		return blks
 	}
 
-	return pruneBlocks(neededBlocks(ranges, r.blockRows, pt.rows()), r.granules(ctx), p.start, p.end)
+	blks, _ := windowBlocks(ranges, r.blockRows, pt.rows(), r.granules(ctx), p.start, p.end)
+
+	return blks
 }
 
 func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampleMerge, error) {
@@ -710,11 +712,10 @@ func (p *enginePlan) decodeEstimate(ctx context.Context, need colNeed) (int64, e
 			return 0, err
 		}
 
-		blks := pruneBlocks(neededBlocks(rngs, r.blockRows, pt.rows()), r.granules(ctx), p.start, p.end)
+		blks, matched := windowBlocks(rngs, r.blockRows, pt.rows(), r.granules(ctx), p.start, p.end)
 		ranges[pt], blocks[pt] = rngs, blks
 
 		pinned := min(int64(len(blks))*int64(r.blockRows), int64(pt.rows()))
-		matched := rowsInBlocks(rngs, r.blockRows, blks, pt.rows())
 
 		total += (pinned + matched) * 8 * cols
 	}

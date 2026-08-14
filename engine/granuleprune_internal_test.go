@@ -52,7 +52,7 @@ func TestBlockInWindow(t *testing.T) {
 	}
 }
 
-func TestPruneBlocks(t *testing.T) {
+func TestWindowBlocksPrunes(t *testing.T) {
 	t.Parallel()
 
 	g := gran(10, [2]int64{100, 199}, [2]int64{200, 299}, [2]int64{300, 399}, [2]int64{400, 499})
@@ -77,7 +77,7 @@ func TestPruneBlocks(t *testing.T) {
 		{
 			name:   "a window matching no block prunes everything",
 			blocks: []int{0, 1, 2, 3}, gran: g, start: 600, end: 700,
-			want: []int{},
+			want: nil,
 		},
 		{
 			name:   "without an index the input is returned untouched",
@@ -90,12 +90,17 @@ func TestPruneBlocks(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			require.Equal(t, tt.want, pruneBlocks(tt.blocks, tt.gran, tt.start, tt.end))
+			// One range spanning every block, so the only thing that can remove a block is the
+			// window test.
+			ranges := []rowRange{{start: 0, end: len(tt.blocks) * 10}}
+
+			got, _ := windowBlocks(ranges, 10, len(tt.blocks)*10, tt.gran, tt.start, tt.end)
+			require.Equal(t, tt.want, got)
 		})
 	}
 }
 
-func TestRowsInBlocks(t *testing.T) {
+func TestWindowBlocksCountsRows(t *testing.T) {
 	t.Parallel()
 
 	const blockRows, totalRows = 10, 100
@@ -142,7 +147,19 @@ func TestRowsInBlocks(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			require.Equal(t, tt.want, rowsInBlocks(tt.ranges, blockRows, tt.blocks, totalRows))
+			// Select exactly tt.blocks by giving each block a granule whose bounds sit inside the
+			// window only for the wanted ones.
+			gran := make([]block.Granule, totalRows/blockRows)
+			for i := range gran {
+				gran[i] = block.Granule{FirstRow: i * blockRows, MinKey: 1000, MaxKey: 1000}
+			}
+
+			for _, b := range tt.blocks {
+				gran[b] = block.Granule{FirstRow: b * blockRows, MinKey: 1, MaxKey: 1}
+			}
+
+			_, got := windowBlocks(tt.ranges, blockRows, totalRows, gran, 0, 10)
+			require.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -150,19 +167,78 @@ func TestRowsInBlocks(t *testing.T) {
 // TestRowsInBlocksMatchesRangesWhenNothingPruned pins the pre-pruning behavior as the upper bound:
 // with every block surviving, the count must equal the plain sum of the ranges' lengths, which is
 // what the decode estimate charged before granule pruning existed.
-func TestRowsInBlocksMatchesRangesWhenNothingPruned(t *testing.T) {
+func TestWindowBlocksCountsEveryRowWhenNothingPruned(t *testing.T) {
 	t.Parallel()
 
 	const blockRows, totalRows = 8, 64
 
 	ranges := []rowRange{{start: 3, end: 19}, {start: 40, end: 61}}
 
-	all := neededBlocks(ranges, blockRows, totalRows)
-
 	var want int64
 	for _, r := range ranges {
 		want += int64(r.end - r.start)
 	}
 
-	require.Equal(t, want, rowsInBlocks(ranges, blockRows, all, totalRows))
+	_, got := windowBlocks(ranges, blockRows, totalRows, nil, minInt64, maxInt64)
+	require.Equal(t, want, got)
+}
+
+// TestWindowBlocksHandlesUnorderedRanges checks the sorted-input fast path degrades correctly: the
+// watermark dedup is only valid for ascending ranges, so out-of-order input must fall back to a
+// sort rather than silently dropping blocks.
+func TestWindowBlocksHandlesUnorderedRanges(t *testing.T) {
+	t.Parallel()
+
+	const blockRows, totalRows = 10, 100
+
+	ordered := []rowRange{{start: 5, end: 15}, {start: 60, end: 65}}
+	reversed := []rowRange{{start: 60, end: 65}, {start: 5, end: 15}}
+
+	wantBlocks, wantRows := windowBlocks(ordered, blockRows, totalRows, nil, minInt64, maxInt64)
+
+	gotBlocks, gotRows := windowBlocks(reversed, blockRows, totalRows, nil, minInt64, maxInt64)
+
+	require.Equal(t, []int{0, 1, 6}, wantBlocks)
+	require.Equal(t, wantBlocks, gotBlocks, "block order must not depend on range order")
+	require.Equal(t, wantRows, gotRows)
+}
+
+// TestWindowBlocksSharedBoundaryBlock checks the two halves disagree on purpose: a block two ranges
+// straddle is decoded once (named once) but holds rows for both, so the row count must not dedup.
+func TestWindowBlocksSharedBoundaryBlock(t *testing.T) {
+	t.Parallel()
+
+	const blockRows, totalRows = 10, 100
+
+	// Both ranges live in block 1; together they hold 6 rows.
+	ranges := []rowRange{{start: 11, end: 14}, {start: 15, end: 18}}
+
+	blocks, rows := windowBlocks(ranges, blockRows, totalRows, nil, minInt64, maxInt64)
+
+	require.Equal(t, []int{1}, blocks, "the shared block is decoded once")
+	require.Equal(t, int64(6), rows, "but holds both ranges' rows")
+}
+
+// TestWindowBlocksDoesNotScaleWithPartSize is the regression guard for the cost this function
+// replaced. The previous implementation sized an intermediate to the part's *total* block count, so
+// a one-block query against a billion-row part allocated and scanned megabytes. Work must depend on
+// the blocks the query touches, not on how large the part is.
+//
+//nolint:paralleltest // AllocsPerRun requires exclusive use of the process.
+func TestWindowBlocksDoesNotScaleWithPartSize(t *testing.T) {
+	const blockRows = 1024
+
+	// The same single-block query against a small part and against a part a thousand times larger.
+	ranges := []rowRange{{start: 0, end: 10}}
+
+	small := testing.AllocsPerRun(100, func() {
+		windowBlocks(ranges, blockRows, 1<<20, nil, minInt64, maxInt64)
+	})
+
+	huge := testing.AllocsPerRun(100, func() {
+		windowBlocks(ranges, blockRows, 1<<30, nil, minInt64, maxInt64)
+	})
+
+	require.InDelta(t, small, huge, 0, "allocation must not grow with the part's block count")
+	require.LessOrEqual(t, huge, 2.0, "a one-block query should allocate the result slice, not an index over the part")
 }
