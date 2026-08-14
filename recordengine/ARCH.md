@@ -209,10 +209,26 @@ Heavily tuned around decoding as little as possible:
   granules. `nil` means "decode everything", returned both when marks are unusable and when nothing
   pruned, so the whole-column path stays on its simpler route.
 
+  Selection walks whichever is smaller, the requested ids or the part's own streams (the latter via
+  the plan's id set, built once per query). Both yield the same granules; a query with no matchers
+  requests every stream in the tenant, so walking the request would cost hundreds of thousands of
+  lookups per part to skip a handful of granules.
+
   Decoded rows land at their **part row offsets**, pruned or not, so the row-range index and
-  `tsWindow` keep working unchanged. Rows outside the selected granules are *unspecified* — the
-  caller derived the selection from the very ranges it will read. The stream id column stays unframed:
-  a fetch resolves streams through the row-range index and never decodes it.
+  `tsWindow` keep working unchanged. Rows outside the selected granules are *unspecified*.
+
+  **The timestamp column is therefore never pruned** — it is decoded whole however narrow the window.
+  Row selection reads timestamps directly (binary search over each stream's ts-ascending run, see
+  `tsWindow`), so unspecified timestamps break the search's precondition and let it return rows the
+  window never covered, whose value columns are equally unspecified. Measured on the real log corpus,
+  pruning the timestamp column made a 15-minute level filter report 889,390 rows where the true answer
+  is 483,076. Decoding it whole restores the invariant everything else rests on: selection is driven by
+  real timestamps, and every row selection can reach lies in a granule overlapping the window — which
+  is a granule pruning always keeps. The column is delta-of-delta int64 and tiny next to the bodies and
+  attributes the pruning exists to skip.
+
+  The stream id column stays unframed: a fetch resolves streams through the row-range index and never
+  decodes it.
 - **Lazy column decode** — materialize only the columns the request's conditions + projection
   reference (a body search projecting body touches just `ts`+`body`).
 - Decode each surviving part **once**, distributing rows to per-stream accumulators pre-sized from

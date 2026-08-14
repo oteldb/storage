@@ -3,6 +3,7 @@ package recordengine
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -14,8 +15,18 @@ import (
 )
 
 // granuleTestPart flushes one part holding rows records per stream, one record per unit of time, and
-// returns it with the streams' ids in ingest order.
+// returns it with the streams' ids in ingest order. Every stream covers the same time range.
 func granuleTestPart(t *testing.T, streams, rows int) (*part, []signal.SeriesID) {
+	t.Helper()
+
+	return granuleTestPartAt(t, streams, rows, 0)
+}
+
+// granuleTestPartAt is [granuleTestPart] with each stream's records offset by stride from the last,
+// so the streams occupy disjoint time ranges. Rows are laid out by (stream, ts), so the granules
+// then carry distinct bounds and a time window can actually prune — with every stream sharing one
+// range, every granule spans it and nothing is prunable.
+func granuleTestPartAt(t *testing.T, streams, rows int, stride int64) (*part, []signal.SeriesID) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -39,7 +50,7 @@ func granuleTestPart(t *testing.T, streams, rows int) (*part, []signal.SeriesID)
 		bodies := make([][]byte, rows)
 
 		for i := range rows {
-			ts[i] = int64(i)
+			ts[i] = int64(s)*stride + int64(i)
 			sev[i] = int64(i % 9)
 			bodies[i] = fmt.Appendf(nil, "request %d handler=template done", i%16)
 		}
@@ -74,18 +85,18 @@ func TestWindowGranulesPrunesByTime(t *testing.T) {
 
 	// A window covering everything prunes nothing, and says so with nil rather than naming every
 	// granule.
-	assert.Nil(t, p.windowGranules(ctx, ids, minInt64, maxInt64),
+	assert.Nil(t, p.windowGranules(ctx, ids, nil, minInt64, maxInt64),
 		"a whole-part window must not prune")
 
 	// A window over a tenth of the records selects roughly a tenth of the granules.
-	narrow := p.windowGranules(ctx, ids, 0, rows/10)
+	narrow := p.windowGranules(ctx, ids, nil, 0, rows/10)
 	require.NotEmpty(t, narrow)
 	assert.Less(t, len(narrow), total/2,
 		"a tenth of the time range must select well under half the granules (got %d of %d)",
 		len(narrow), total)
 
 	// A window past every record selects nothing.
-	assert.Empty(t, p.windowGranules(ctx, ids, int64(rows)*10, int64(rows)*20),
+	assert.Empty(t, p.windowGranules(ctx, ids, nil, int64(rows)*10, int64(rows)*20),
 		"a window past the part's records selects no granule")
 }
 
@@ -104,13 +115,76 @@ func TestWindowGranulesScopesToRequestedStreams(t *testing.T) {
 	total := len(p.granuleTimes(ctx))
 	require.Greater(t, total, 3)
 
-	one := p.windowGranules(ctx, ids[:1], minInt64, maxInt64)
+	one := p.windowGranules(ctx, ids[:1], nil, minInt64, maxInt64)
 	require.NotEmpty(t, one, "one stream of three must not cover the part")
 	assert.Less(t, len(one), total,
 		"one stream must select fewer granules than the part holds (got %d of %d)", len(one), total)
 
 	// Asking for an id the part does not hold selects nothing.
-	assert.Empty(t, p.windowGranules(ctx, []signal.SeriesID{{Hi: 1, Lo: 2}}, minInt64, maxInt64))
+	assert.Empty(t, p.windowGranules(ctx, []signal.SeriesID{{Hi: 1, Lo: 2}}, nil, minInt64, maxInt64))
+}
+
+// TestWindowGranulesWideIDSetMatchesStreamWalk pins the property that makes the two enumerations
+// interchangeable: walking the part's own streams must select exactly what walking the requested ids
+// selects. A query with no matchers requests every stream in the tenant, so the selection takes
+// whichever side is smaller — a choice that is only safe if it changes nothing but the cost.
+func TestWindowGranulesWideIDSetMatchesStreamWalk(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	const (
+		streams = 40
+		rows    = 2_000
+		stride  = 10_000
+	)
+
+	p, ids := granuleTestPartAt(t, streams, rows, stride)
+
+	gran := p.granuleTimes(ctx)
+	require.Greater(t, len(gran), 1)
+
+	// Pad the request with ids the part does not hold, as a tenant-wide request does: the part-side
+	// walk is chosen only when the request is wider than the part's own stream set.
+	wide := slices.Clone(ids)
+	for i := range 500 {
+		wide = append(wide, signal.SeriesID{Hi: 1 << 40, Lo: uint64(i)})
+	}
+
+	require.Greater(t, len(wide), len(p.ranges), "the test must exercise the part-side walk")
+
+	set := make(map[signal.SeriesID]struct{}, len(wide))
+	for _, id := range wide {
+		set[id] = struct{}{}
+	}
+
+	// A window over one stream's slice of time must prune, and both walks must agree on it.
+	start, end := int64(3)*stride, int64(3)*stride+int64(rows)
+
+	viaStreams := p.windowGranules(ctx, wide, nil, start, end)
+	viaPart := p.windowGranules(ctx, wide, set, start, end)
+
+	require.NotEmpty(t, viaStreams, "a narrow window must still prune")
+	assert.Less(t, len(viaStreams), len(gran),
+		"the window must select fewer granules than the part holds (got %d of %d)", len(viaStreams), len(gran))
+	assert.Equal(t, viaStreams, viaPart, "the two enumerations must select the same granules")
+
+	// Soundness: every granule holding a row in the window must survive.
+	selected := map[int]bool{}
+	for _, g := range viaPart {
+		selected[g] = true
+	}
+
+	full, err := p.readCols(ctx, fullSel(p.schema), nil, nil)
+	require.NoError(t, err)
+
+	size := p.reader.Manifest().GranuleSize
+	for i, ts := range full.ts {
+		if ts >= start && ts <= end {
+			require.True(t, selected[i/size],
+				"row %d (ts %d) is in the window but its granule %d was pruned away", i, ts, i/size)
+		}
+	}
 }
 
 // TestWindowGranulesWithoutMarksPrunesNothing checks the guard: a part whose marks are unusable must
@@ -126,7 +200,7 @@ func TestWindowGranulesWithoutMarksPrunesNothing(t *testing.T) {
 	p.marksOnce.Do(func() {})
 	require.Nil(t, p.granuleTimes(ctx))
 
-	assert.Nil(t, p.windowGranules(ctx, ids, 0, 1))
+	assert.Nil(t, p.windowGranules(ctx, ids, nil, 0, 1))
 }
 
 // TestPrunedDecodeMatchesFullDecode is the correctness backstop: reading a part through a pruned
@@ -147,7 +221,7 @@ func TestPrunedDecodeMatchesFullDecode(t *testing.T) {
 
 	const lo, hi = 100, 900
 
-	blocks := p.windowGranules(ctx, ids, lo, hi)
+	blocks := p.windowGranules(ctx, ids, nil, lo, hi)
 	require.NotEmpty(t, blocks, "the window must prune to a real subset")
 
 	pruned, err := p.readCols(ctx, sel, nil, blocks)

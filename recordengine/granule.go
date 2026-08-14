@@ -50,6 +50,19 @@ func (p *part) granuleTimes(ctx context.Context) []block.Granule {
 	return p.granules
 }
 
+// idLookupSet returns the plan's requested ids as a set, building it once. Granule selection uses it
+// to walk whichever of (requested ids, the part's streams) is smaller.
+func (p *fetchPlan) idLookupSet() map[signal.SeriesID]struct{} {
+	if p.idLookup == nil {
+		p.idLookup = make(map[signal.SeriesID]struct{}, len(p.ids))
+		for _, id := range p.ids {
+			p.idLookup[id] = struct{}{}
+		}
+	}
+
+	return p.idLookup
+}
+
 // granuleInWindow reports whether granule g can hold a record in [start, end]. A granule outside the
 // index is always a candidate, so pruning can only ever remove granules it can prove empty.
 func granuleInWindow(gran []block.Granule, g int, start, end int64) bool {
@@ -65,7 +78,7 @@ func granuleInWindow(gran []block.Granule, g int, start, end int64) bool {
 //
 // nil means "decode everything" — either pruning is unavailable, or every granule survived, in which
 // case naming them all would only cost the caller a list to walk.
-func (p *part) windowGranules(ctx context.Context, ids []signal.SeriesID, start, end int64) []int {
+func (p *part) windowGranules(ctx context.Context, ids []signal.SeriesID, idSet map[signal.SeriesID]struct{}, start, end int64) []int {
 	gran := p.granuleTimes(ctx)
 	if gran == nil || p.reader == nil {
 		return nil
@@ -78,10 +91,9 @@ func (p *part) windowGranules(ctx context.Context, ids []signal.SeriesID, start,
 
 	var out []int
 
-	for _, id := range ids {
-		rng, ok := p.ranges[id]
-		if !ok || rng.start >= rng.end {
-			continue
+	addRange := func(rng rowRange) {
+		if rng.start >= rng.end {
+			return
 		}
 
 		first := rng.start / size
@@ -90,6 +102,26 @@ func (p *part) windowGranules(ctx context.Context, ids []signal.SeriesID, start,
 		for g := first; g <= last; g++ {
 			if granuleInWindow(gran, g, start, end) {
 				out = append(out, g)
+			}
+		}
+	}
+
+	// Selecting granules must not cost more than the decode it saves, and this runs once per part.
+	// Walking the requested streams costs one lookup each — fine for a service filter, ruinous for a
+	// query with no matchers, which requests every stream in the tenant (hundreds of thousands) to
+	// skip a handful of granules. Walking the part's own streams instead costs one lookup each and
+	// yields exactly the same granules, so take whichever side is smaller. Precision is never traded
+	// away: both walks see the same requested-and-present streams.
+	if idSet != nil && len(p.ranges) < len(ids) {
+		for id, rng := range p.ranges {
+			if _, ok := idSet[id]; ok {
+				addRange(rng)
+			}
+		}
+	} else {
+		for _, id := range ids {
+			if rng, ok := p.ranges[id]; ok {
+				addRange(rng)
 			}
 		}
 	}

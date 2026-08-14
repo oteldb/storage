@@ -189,8 +189,9 @@ func (p *part) readLazyConds(
 		lz.eqMask = make([][]byte, len(conds))
 	}
 
+	// The timestamp column is never pruned — see [part.readCols].
 	var err error
-	if lz.ts, err = p.readInt64(ctx, colTs, i64Scratch(getI64), blocks); err != nil {
+	if lz.ts, err = p.readInt64(ctx, colTs, i64Scratch(getI64), nil); err != nil {
 		return nil, err
 	}
 
@@ -359,7 +360,7 @@ func (p *fetchPlan) readPartsLazy(ctx context.Context) error {
 	for _, part := range p.liveParts {
 		// Granules the requested streams' rows occupy that the window can intersect; nil when
 		// nothing prunes, which keeps the whole-column decode on its simpler path.
-		blocks := part.windowGranules(ctx, p.ids, p.start, p.end)
+		blocks := part.windowGranules(ctx, p.ids, p.idLookupSet(), p.start, p.end)
 
 		lz, err := part.readLazyConds(ctx, p.condSel, p.conds, p.e.getI64, blocks)
 		if err != nil {

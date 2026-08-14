@@ -145,8 +145,20 @@ func (p *part) readCols(ctx context.Context, sel colSel, getI64 func() []int64, 
 		return nil
 	}
 
+	// The timestamp column is decoded whole, never pruned, however narrow the window.
+	//
+	// Pruning leaves the rows of unselected granules *unspecified* — that is the blocked decoder's
+	// contract, and it is what makes pruning cheap. Row selection reads the timestamps directly
+	// (binary search over each stream's ts-ascending range, see [tsWindow]), so unspecified
+	// timestamps would break the search's precondition and let it return rows the window never
+	// covered — with the value columns of those rows equally unspecified.
+	//
+	// Decoding it whole restores the invariant the rest of the pruning rests on: selection is driven
+	// by real timestamps, and every row that selection can reach lies in a granule overlapping the
+	// window, which is a granule pruning always keeps. The column is int64 delta-of-delta and tiny
+	// next to the bodies and attributes the pruning is actually there to skip.
 	var err error
-	if c.ts, err = p.readInt64(ctx, colTs, dst(), blocks); err != nil {
+	if c.ts, err = p.readInt64(ctx, colTs, dst(), nil); err != nil {
 		return nil, err
 	}
 
