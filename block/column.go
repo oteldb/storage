@@ -596,6 +596,15 @@ func (r *ColumnReader) Bytes() (*chunk.DictColumn, error) {
 		}, nil
 	}
 
+	if r.desc.Blocked {
+		dir, err := r.blockDir()
+		if err != nil {
+			return nil, errors.Wrapf(err, "column %q", r.desc.Name)
+		}
+
+		return decodeBlockedBytes(dir, r.comp, r.rows, nil)
+	}
+
 	stream, err := r.stream()
 	if err != nil {
 		return nil, err
@@ -604,6 +613,30 @@ func (r *ColumnReader) Bytes() (*chunk.DictColumn, error) {
 	dc, _, err := chunk.DecodeBytesDict(stream)
 
 	return dc, err
+}
+
+// DecodeBlocksBytes decodes only the named granules of a block-framed bytes column, merged into one
+// [chunk.DictColumn] over their concatenated rows. It is the bytes counterpart of
+// [ColumnReader.DecodeBlocksInt64] — the seek primitive a time-pruned query uses to read a fraction
+// of a column instead of all of it.
+//
+// The returned column covers the selected rows *packed together*, not their positions in the part:
+// a caller working in part row indices must map through the block spans itself.
+func (r *ColumnReader) DecodeBlocksBytes(blocks []int) (*chunk.DictColumn, error) {
+	if r.desc.Kind != KindBytes {
+		return nil, errors.Errorf("block: column %q is %s, not bytes", r.desc.Name, r.desc.Kind)
+	}
+
+	if !r.desc.Blocked {
+		return nil, errors.Errorf("block: column %q is not block-framed", r.desc.Name)
+	}
+
+	dir, err := r.blockDir()
+	if err != nil {
+		return nil, errors.Wrapf(err, "column %q", r.desc.Name)
+	}
+
+	return decodeBlockedBytes(dir, r.comp, r.rows, blocks)
 }
 
 // BytesRaw decodes a [chunk.CodecBytesRaw]-encoded [KindBytes] column into its flat fixed-width

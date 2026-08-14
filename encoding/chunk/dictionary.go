@@ -178,6 +178,25 @@ func EncodeBytesRawBlob(dst, blob []byte, offsets []int32) []byte {
 	return encodeBytesRawCells(dst, blobCells{blob: blob, offsets: offsets})
 }
 
+// EncodeBytesBlobRange is [EncodeBytesBlob] over rows [lo,hi) of a blob column, for block-framed
+// encoding where each granule is an independent stream. Offsets are absolute into blob, so the
+// sub-range needs no rebasing — cell i of the range is blob[offsets[lo+i]:offsets[lo+i+1]] either
+// way — which is what keeps per-granule encoding allocation-free.
+//
+// Each granule builds its own dictionary, so a granule of low-cardinality values dictionary-encodes
+// while one of near-unique values degrades to the flat form independently. That is what makes the
+// choice per granule rather than per column: a part whose column is mostly structured but holds one
+// stretch of unique values (a stack trace among clean log lines) keeps the dictionary everywhere
+// else, where a per-column decision would drop it for the whole part.
+func EncodeBytesBlobRange(dst, blob []byte, offsets []int32, lo, hi int) []byte {
+	return encodeBytesCells(dst, blobCells{blob: blob, offsets: offsets[lo : hi+1]})
+}
+
+// EncodeBytesRawBlobRange is [EncodeBytesRawBlob] over rows [lo,hi) of a blob column.
+func EncodeBytesRawBlobRange(dst, blob []byte, offsets []int32, lo, hi int) []byte {
+	return encodeBytesRawCells(dst, blobCells{blob: blob, offsets: offsets[lo : hi+1]})
+}
+
 func encodeBytesRawCells[C cellSeq](dst []byte, vals C) []byte {
 	n := vals.rows()
 	if n == 0 {

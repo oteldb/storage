@@ -125,8 +125,9 @@ func encodeBlocked(
 	return dst, nil
 }
 
-// appendBlockStream codec-encodes c's rows [lo,hi) onto dst as a single chunk stream. Only the
-// per-row sequential codecs used by the metric ts/value/sf columns are blockable; other codecs error.
+// appendBlockStream codec-encodes c's rows [lo,hi) onto dst as a single chunk stream: the per-row
+// sequential codecs (DoD/T64 int64, Gorilla/decimal float64) and the bytes codecs, each granule
+// carrying its own dictionary. Other codecs error.
 func appendBlockStream(dst []byte, c Column, codec chunk.Codec, budget uint8, lo, hi int) ([]byte, error) {
 	switch {
 	case c.Kind == KindInt64 && codec == chunk.CodecDoD:
@@ -137,6 +138,18 @@ func appendBlockStream(dst []byte, c Column, codec chunk.Codec, budget uint8, lo
 		return chunk.EncodeFloats(dst, c.Float64[lo:hi]), nil
 	case c.Kind == KindFloat64 && codec == chunk.CodecDecimal:
 		return chunk.EncodeFloatsDecimal(dst, c.Float64[lo:hi], decimalPrecision(budget)), nil
+	case c.Kind == KindBytes && codec == chunk.CodecDict:
+		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+			return chunk.EncodeBytesBlobRange(dst, c.BytesBlob, c.BytesOffsets, lo, hi), nil
+		}
+
+		return chunk.EncodeBytes(dst, c.Bytes[lo:hi]), nil
+	case c.Kind == KindBytes && codec == chunk.CodecBytesRaw:
+		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+			return chunk.EncodeBytesRawBlobRange(dst, c.BytesBlob, c.BytesOffsets, lo, hi), nil
+		}
+
+		return chunk.EncodeBytesRaw(dst, c.Bytes[lo:hi]), nil
 	default:
 		return nil, errors.Errorf("block: codec %s for kind %s is not blockable", codec, c.Kind)
 	}
@@ -550,6 +563,97 @@ func (s *blockStreams) granule(g int) ([]byte, error) {
 	}
 
 	return s.dir.granuleStream(g, s.buf)
+}
+
+// decodeBlockedBytes decodes a block-framed bytes column into one merged [chunk.DictColumn]. blocks
+// selects the granules to decode, in ascending order; nil decodes the whole column.
+//
+// Unlike the int64/float64 paths this cannot decode into a preallocated destination: each granule
+// carries its own dictionary, so the ids only become comparable after [chunk.DictMerger] remaps
+// them into a shared one.
+//
+// Frames are decompressed into a fresh buffer each — not the recycled one [blockStreams] uses —
+// because the merged column's entries *alias* the decoded frames rather than copying them. Copying
+// instead would cost a second pass over every byte of a high-cardinality column; letting the merged
+// column hold the frames alive costs the same allocation the decompression needed anyway.
+func decodeBlockedBytes(
+	dir blockDir, comp *compress.Compressor, rows int, blocks []int,
+) (*chunk.DictColumn, error) {
+	var (
+		merger   chunk.DictMerger
+		frameBuf []byte
+		curFrame = -1
+		want     int
+	)
+
+	decode := func(g int) error {
+		if g < 0 || g >= dir.nBlocks() {
+			return errors.Errorf("block: block %d out of range [0,%d)", g, dir.nBlocks())
+		}
+
+		lo := g * dir.blockRows
+		if lo >= rows {
+			return errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", g, lo, rows)
+		}
+
+		if f := dir.frameOf(g); f != curFrame {
+			raw, err := dir.frame(f)
+			if err != nil {
+				return errors.Wrapf(err, "frame %d", f)
+			}
+
+			buf, err := comp.Decompress(nil, raw)
+			if err != nil {
+				return errors.Wrapf(err, "decompress frame %d", f)
+			}
+
+			frameBuf, curFrame = buf, f
+		}
+
+		stream, err := dir.granuleStream(g, frameBuf)
+		if err != nil {
+			return err
+		}
+
+		var dc chunk.DictColumn
+		if _, err := dc.DecodeBytes(stream); err != nil {
+			return errors.Wrapf(err, "decode block %d", g)
+		}
+
+		if n := min(lo+dir.blockRows, rows) - lo; dc.Len() != n {
+			return errors.Wrapf(ErrCorrupt, "block %d decoded %d rows, want %d", g, dc.Len(), n)
+		}
+
+		want += dc.Len()
+		merger.Append(&dc)
+
+		return nil
+	}
+
+	if blocks == nil {
+		for g := range dir.nBlocks() {
+			if err := decode(g); err != nil {
+				merger.Reset()
+
+				return nil, err
+			}
+		}
+	} else {
+		for _, g := range blocks {
+			if err := decode(g); err != nil {
+				merger.Reset()
+
+				return nil, err
+			}
+		}
+	}
+
+	out := merger.Build()
+	if out.Len() != want {
+		return nil, errors.Wrapf(ErrCorrupt, "merged %d rows, want %d", out.Len(), want)
+	}
+
+	return out, nil
 }
 
 // decodeBlockedColumn decodes every block of a blocked column into dst (sized to rows) in place: each
