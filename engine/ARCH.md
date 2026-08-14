@@ -218,6 +218,14 @@ subsystem.
 - **Recompression is decode-transparent** — the reader keys off the per-column algorithm in the
   manifest, so it is a pure ratio/CPU trade with no format change. The *level* is recorded too, but
   only so the merge can tell a part already at the target from one below it; nothing reads it back.
+- **Retention drops whole parts first.** A part whose `maxTime` is already past the cutoff holds no
+  row retention would keep, so it is retired on the manifest alone (`dropExpired`) — no decode, no
+  re-encode, no output part. Only a part *straddling* the cutoff is rewritten. This makes retention
+  cost O(1) in the expired data rather than O(bytes), the property every reference system leans on
+  (Prometheus deletes whole blocks, VictoriaMetrics whole partitions). The drop publishes like any
+  merge — copy-on-write swap, index commit, then retire — so a failed commit rolls back and the
+  parts stay live. Since the size-based cutoff shares `RetainFrom`, disk-pressure eviction drops
+  whole parts too.
 - **Run selection** (`compact.go`) picks only what is worth merging: any part a forced rewrite must
   touch (retention/downsample/recompress/precision — so age-driven work is never starved), plus the
   best run of *unsealed* parts. A part at the merge cap is **sealed** — re-merging it would only
@@ -300,6 +308,15 @@ Layered optimizations, each opt-in:
   Cache-off (or constant/unblocked columns) falls back to a per-fetch decode, **series-skipped** —
   only the blocks the matched row ranges touch. With the cache on a fetch also **prefetches** the
   parts it will touch, so backend reads and decodes overlap.
+- **Granule time pruning** — block boundaries align with the part's marks granules, so the marks
+  index already carries each block's `[MinKey, MaxKey]` sample times (`block/ARCH.md`). A
+  block-sliced fetch drops the blocks whose bounds cannot intersect the request window *before*
+  reading or decoding them, and the decode reservation is sized over the survivors. Rows are sorted
+  by `(series, ts)`, so granule bounds are not monotonic across a part — but they are inside one
+  series' row range, which is where the test is applied. Without it a series spanning far more time
+  than the query was decoded whole and discarded row by row, making a narrow window cost the same
+  as a full scan of the part. The index is derived and advisory: absent, corrupt, or mismatched
+  against the part's block framing, nothing is pruned and every block stays a candidate.
 - **Decode-memory budget** (`Config.DecodeMemoryBytes`) — a shared byte semaphore over in-flight
   decoded column bytes, reserved once per *fetch* off the lock (never incrementally per part, so
   two queries can't deadlock holding partial reservations); a fetch bigger than the whole budget is

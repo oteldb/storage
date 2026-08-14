@@ -36,6 +36,12 @@ type seriesBlockReader struct {
 	valHeld, sfHeld      []float64
 	tsEnt, valEnt, sfEnt *blockEntry
 
+	// gran is the part's per-block sample-time bounds, loaded once per reader, used to skip blocks
+	// that cannot hold an in-window sample before they are read or decoded. nil ⇒ unavailable, so
+	// every block the series spans is read. granLoaded separates "not yet loaded" from "unusable".
+	gran       []block.Granule
+	granLoaded bool
+
 	// pins holds every cache entry this reader has taken a reference on. The reader adds the touched
 	// blocks to the merge as *views*, so the entries must stay unrecycled until the fetch's collect
 	// has copied the samples out — the fetch releases them per series (releaseSeriesPins) and sweeps
@@ -85,8 +91,16 @@ func (p *part) blockSliceable() bool {
 func (r *seriesBlockReader) addRange(ctx context.Context, rng rowRange, m *sampleMerge, start, end int64) error {
 	first := rng.start / r.blockRows
 	last := (rng.end - 1) / r.blockRows
+	gran := r.granules(ctx)
 
 	for b := first; b <= last; b++ {
+		// Skip a block whose granule bounds put every one of its rows outside the window, before it
+		// is fetched or decoded. A series spanning far more time than the query is otherwise read
+		// whole and discarded row by row in m.add.
+		if !blockInWindow(gran, b, start, end) {
+			continue
+		}
+
 		tsBlk, err := r.tsBlock(ctx, b)
 		if err != nil {
 			return err
@@ -121,6 +135,16 @@ func (r *seriesBlockReader) addRange(ctx context.Context, rng rowRange, m *sampl
 	}
 
 	return nil
+}
+
+// granules returns the part's per-block time bounds, loading them on first use. One load per reader
+// (so one per part per fetch at most) keeps the marks read off the per-series path.
+func (r *seriesBlockReader) granules(ctx context.Context) []block.Granule {
+	if !r.granLoaded {
+		r.gran, r.granLoaded = r.part.granuleTimes(ctx), true
+	}
+
+	return r.gran
 }
 
 // warm decodes (and caches) the given blocks without slicing — the block-cache analog of the old

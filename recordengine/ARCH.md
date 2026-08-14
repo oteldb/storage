@@ -12,7 +12,10 @@ retention, durable bucket-index + part-scoped identity stateless read path, `Max
 and the same lock discipline (see [`../engine/ARCH.md`](../engine/ARCH.md)). Notable divergences:
 
 - Merge is **append-only**: retention only. Downsampling, recompression and precision are
-  metrics-specific.
+  metrics-specific. As in the metric engine, retention **drops whole parts first** (`dropExpired`):
+  a part whose `maxTime` is already past the cutoff is retired on the manifest alone, with no
+  decode and no output part, so only a part *straddling* the cutoff is rewritten. A record part's
+  side-store and bloom sidecars live under its own prefix, so `deletePart` reclaims them with it.
 - Records are variable-width, so every size is **measured, not modeled**. `MaxPartBytes` is spent in
   the *decoded* bytes a row holds (`flushColumns.rowBytes`), the flush splits on them
   (`byteRanges`), a part records its decoded footprint in its manifest (`Manifest.RawBytes` →

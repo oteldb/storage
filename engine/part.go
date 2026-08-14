@@ -260,6 +260,12 @@ type part struct {
 	statsOnce sync.Once
 	stats     map[signal.SeriesID]SeriesAgg
 
+	// marksOnce lazily loads the sparse granule index on the first fetch that can prune with it;
+	// granules is nil when the object is absent/corrupt or its granularity does not line up with the
+	// part's block framing, which leaves every block a candidate.
+	marksOnce sync.Once
+	granules  []block.Granule
+
 	// minTime, maxTime are the inclusive unix-ns sample bounds of the part, recorded in the
 	// bucket index for time pruning. Set from the flush/merge columns when written and from
 	// the index entry when reconstructed (see engine/index.go).
@@ -576,6 +582,109 @@ func (p *part) decodeValueBlocks(ctx context.Context, valDst, sfDst []float64, b
 	}
 
 	return vals, sf, nil
+}
+
+// granuleTimes returns the part's per-block sample-time bounds, lazily loading the marks index.
+// Marks are built at the part's block granularity, so granule b bounds block b and a caller prunes
+// by indexing. nil ⇒ the index is unusable and no block can be pruned.
+//
+// Rows are sorted by (series, ts), so a granule's bounds are not monotonic across the part — but
+// within one series' row range they are, which is where the pruning is applied.
+func (p *part) granuleTimes(ctx context.Context) []block.Granule {
+	p.marksOnce.Do(func() {
+		if p.reader == nil {
+			return
+		}
+
+		man := p.reader.Manifest()
+		if man.GranuleSize <= 0 {
+			return
+		}
+
+		m, err := p.reader.Marks(ctx)
+		if err != nil || m.GranuleSize != man.GranuleSize {
+			return // absent/corrupt ⇒ prune nothing
+		}
+
+		if len(m.Granules) != (man.RowCount+man.GranuleSize-1)/man.GranuleSize {
+			return
+		}
+
+		p.granules = m.Granules
+	})
+
+	return p.granules
+}
+
+// blockInWindow reports whether block b can hold a sample in [start, end], from the part's granule
+// bounds. A block outside gran (an unusable or short index) is always a candidate, so pruning can
+// only ever remove blocks it can prove empty.
+func blockInWindow(gran []block.Granule, b int, start, end int64) bool {
+	if b < 0 || b >= len(gran) {
+		return true
+	}
+
+	g := gran[b]
+
+	return g.MaxKey >= start && g.MinKey <= end
+}
+
+// pruneBlocks drops the blocks whose granule bounds cannot intersect [start, end]. The input is
+// returned untouched when the part has no usable granule index.
+func pruneBlocks(blocks []int, gran []block.Granule, start, end int64) []int {
+	if len(gran) == 0 {
+		return blocks
+	}
+
+	out := make([]int, 0, len(blocks))
+
+	for _, b := range blocks {
+		if blockInWindow(gran, b, start, end) {
+			out = append(out, b)
+		}
+	}
+
+	return out
+}
+
+// rowsInBlocks counts the rows of ranges that lie in the given blocks — the matched rows that
+// survive time pruning. Charging the budget for the rows in blocks it will not decode is what made
+// a narrow query on a wide part reserve the whole part.
+func rowsInBlocks(ranges []rowRange, blockRows int, blocks []int, totalRows int) int64 {
+	if blockRows <= 0 || totalRows == 0 {
+		return 0
+	}
+
+	keep := make([]bool, (totalRows+blockRows-1)/blockRows)
+	for _, b := range blocks {
+		if b >= 0 && b < len(keep) {
+			keep[b] = true
+		}
+	}
+
+	var rows int64
+
+	for _, rng := range ranges {
+		if rng.start >= rng.end {
+			continue
+		}
+
+		for b := rng.start / blockRows; b <= (rng.end-1)/blockRows; b++ {
+			if !keep[b] {
+				continue
+			}
+
+			blockStart := b * blockRows
+			lo := max(rng.start, blockStart)
+			hi := min(rng.end, blockStart+blockRows)
+
+			if lo < hi {
+				rows += int64(hi - lo)
+			}
+		}
+	}
+
+	return rows
 }
 
 // neededBlocks returns the sorted block indices that ranges span, for a column of totalRows rows

@@ -121,5 +121,5 @@ func TestDecodeEstimateMemoizesRanges(t *testing.T) {
 
 	require.Equal(t, []rowRange{{start: 300, end: 400}}, plan.partRanges[pt])
 	require.Equal(t, []int{6, 7}, plan.partBlocks[pt])
-	require.Equal(t, []int{6, 7}, plan.blocksFor(pt, r, nil))
+	require.Equal(t, []int{6, 7}, plan.blocksFor(context.Background(), pt, r, nil))
 }
