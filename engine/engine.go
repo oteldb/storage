@@ -813,10 +813,16 @@ func collectOne(r tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64, value
 	return tsOut, values, sf
 }
 
-// collectMany k-way-merges several sorted runs into the destination buffers: at each step it emits
-// the smallest timestamp once, taking the value/weight from the highest-indexed (freshest) run that
-// holds it and advancing every run positioned there. O(rows × runs); runs is tiny (parts + flush +
-// head), so the linear min-scan beats a heap's overhead and allocations.
+// collectMany k-way-merges several sorted runs into the destination buffers, emitting each
+// timestamp once and taking its value/weight from the highest-indexed (freshest) run that holds it.
+//
+// The scan finds the two smallest heads rather than just the smallest, which turns the common case
+// into a copy: while the leading run's timestamps stay strictly below every other head, no other run
+// can tie or win, so that whole stretch is the answer verbatim and moves in one append. Only an
+// actual tie falls back to a per-row step. That matters because the fan-in is not "parts + flush +
+// head" — a block-sliced part contributes one run per block ([seriesBlockReader.addRange]), so a
+// two-day range over six parts arrives as ~40 runs whose stretches are hundreds of rows long. Per
+// row the old O(rows × runs) scan re-derived what one comparison per stretch establishes.
 func collectMany(runs []tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64, values, sf []float64) {
 	total := 0
 	for i := range runs {
@@ -826,8 +832,8 @@ func collectMany(runs []tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64,
 	tsOut = ensureCap(tsBuf, total)
 	values = ensureCap(valsBuf, total)
 
-	// Per-run cursors. Stack-allocated for the common small fan-in; heap only for a huge one.
-	var curArr [16]int
+	// Per-run cursors. Sized for a block-sliced fan-in so the usual query stays off the heap.
+	var curArr [64]int
 
 	var cur []int
 	if len(runs) <= len(curArr) {
@@ -837,33 +843,82 @@ func collectMany(runs []tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64,
 	}
 
 	for {
-		minTs := int64(0)
-		found := false
-
-		for i := range runs {
-			if cur[i] < len(runs[i].ts) {
-				if t := runs[i].ts[cur[i]]; !found || t < minTs {
-					minTs, found = t, true
-				}
-			}
-		}
-
-		if !found {
+		lead, leadTs, rivalTs, rival := leadRun(runs, cur)
+		if lead < 0 {
 			break
 		}
 
-		var winVal, winW float64 = 0, 1
+		if rival && leadTs == rivalTs {
+			// Tie: every run sitting on this timestamp advances, and the freshest supplies the value.
+			var winVal, winW float64 = 0, 1
 
-		for i := range runs {
-			if cur[i] < len(runs[i].ts) && runs[i].ts[cur[i]] == minTs {
-				winVal, winW = runs[i].vals[cur[i]], runs[i].weight(cur[i])
-				cur[i]++
+			for i := range runs {
+				if cur[i] < len(runs[i].ts) && runs[i].ts[cur[i]] == leadTs {
+					winVal, winW = runs[i].vals[cur[i]], runs[i].weight(cur[i])
+					cur[i]++
+				}
 			}
+
+			tsOut = append(tsOut, leadTs)
+			values = append(values, winVal)
+			sf = appendWeight(sf, winW, len(values), total)
+
+			continue
 		}
 
-		tsOut = append(tsOut, minTs)
-		values = append(values, winVal)
-		sf = appendWeight(sf, winW, len(values), total)
+		r, lo := &runs[lead], cur[lead]
+
+		hi := len(r.ts)
+		if rival {
+			hi = lo + lowerBound(r.ts[lo:], rivalTs)
+		}
+
+		tsOut, values, sf = emitRange(r, lo, hi, tsOut, values, sf, total)
+		cur[lead] = hi
+	}
+
+	return tsOut, values, sf
+}
+
+// leadRun returns the run holding the smallest unconsumed timestamp, that timestamp, and the
+// smallest timestamp among the other runs — the exclusive bound the leader may run to unchallenged.
+// lead is -1 when every run is consumed; rival is false when only the leader has rows left.
+func leadRun(runs []tsRun, cur []int) (lead int, leadTs, rivalTs int64, rival bool) {
+	lead = -1
+
+	for i := range runs {
+		if cur[i] >= len(runs[i].ts) {
+			continue
+		}
+
+		switch t := runs[i].ts[cur[i]]; {
+		case lead < 0 || t < leadTs:
+			if lead >= 0 && (!rival || leadTs < rivalTs) {
+				rivalTs, rival = leadTs, true
+			}
+
+			lead, leadTs = i, t
+		case !rival || t < rivalTs:
+			rivalTs, rival = t, true
+		}
+	}
+
+	return lead, leadTs, rivalTs, rival
+}
+
+// emitRange appends r's [lo, hi) rows, which the caller has established no other run can tie or
+// beat. Unweighted rows go out as a bulk copy; weights force the per-row path that materializes sf.
+func emitRange(
+	r *tsRun, lo, hi int, tsOut []int64, values, sf []float64, capHint int,
+) ([]int64, []float64, []float64) {
+	if r.sf == nil && sf == nil {
+		return append(tsOut, r.ts[lo:hi]...), append(values, r.vals[lo:hi]...), nil
+	}
+
+	for k := lo; k < hi; k++ {
+		tsOut = append(tsOut, r.ts[k])
+		values = append(values, r.vals[k])
+		sf = appendWeight(sf, r.weight(k), len(values), capHint)
 	}
 
 	return tsOut, values, sf
