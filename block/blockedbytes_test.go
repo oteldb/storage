@@ -366,3 +366,77 @@ func TestSharedDictBlobInput(t *testing.T) {
 	assert.Equal(t, fromSlices.SharedDict, fromBlob.SharedDict)
 	assert.Equal(t, objA, objB, "the two input forms must encode byte-identically")
 }
+
+// TestBlockedBytesScatterKeepsRowIndices is the property the record fetch path depends on: a pruned
+// decode must leave part row indices valid. A fetch resolves its rows through the part's row-range
+// index and the marks before any column is read, so a packed result would renumber everything it
+// already located.
+func TestBlockedBytesScatterKeepsRowIndices(t *testing.T) {
+	t.Parallel()
+
+	const granule = 1024
+
+	for _, tt := range []struct {
+		name string
+		vals [][]byte
+	}{
+		{"shared dictionary", repeatVals(granule*8, 30)},
+		{"self-encoded", uniqueVals(granule * 8)},
+		{"mixed", append(repeatVals(granule*4, 6), uniqueVals(granule*4)...)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := bytesColumn(t, tt.vals, chunk.CodecDict, granule)
+
+			for _, blocks := range [][]int{{0}, {3}, {7}, {0, 7}, {2, 3, 4}} {
+				got, err := r.DecodeBlocksBytesIntoColumn(blocks)
+				require.NoError(t, err, "blocks %v", blocks)
+				require.Equal(t, len(tt.vals), got.Len(), "blocks %v: must span the whole column", blocks)
+
+				selected := map[int]bool{}
+				for _, b := range blocks {
+					selected[b] = true
+				}
+
+				for i := range tt.vals {
+					if selected[i/granule] {
+						assert.Equal(t, tt.vals[i], got.At(i),
+							"blocks %v: row %d must decode at its own index", blocks, i)
+					} else {
+						assert.Empty(t, got.At(i),
+							"blocks %v: row %d was not selected and must be empty", blocks, i)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestBlockedBytesScatterMatchesFullDecode checks the pruned path and the whole-column path agree on
+// the rows they share — the decode must not depend on which granules were asked for.
+func TestBlockedBytesScatterMatchesFullDecode(t *testing.T) {
+	t.Parallel()
+
+	const granule = 512
+
+	vals := append(repeatVals(granule*3, 9), uniqueVals(granule*3)...)
+	r := bytesColumn(t, vals, chunk.CodecDict, granule)
+
+	full, err := r.Bytes()
+	require.NoError(t, err)
+
+	all := make([]int, (len(vals)+granule-1)/granule)
+	for i := range all {
+		all[i] = i
+	}
+
+	scattered, err := r.DecodeBlocksBytesIntoColumn(all)
+	require.NoError(t, err)
+
+	require.Equal(t, full.Len(), scattered.Len())
+
+	for i := range full.Len() {
+		assert.Equal(t, full.At(i), scattered.At(i), "row %d", i)
+	}
+}

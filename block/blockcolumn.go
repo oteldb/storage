@@ -617,6 +617,30 @@ func decodeBlockedBytes(
 	return out, nil
 }
 
+// decodeBlockedBytesScatter is [decodeBlockedBytes] placing each granule at its own row offset, so
+// the result spans the whole column and part row indices stay valid through a pruned decode.
+func decodeBlockedBytesScatter(
+	dir blockDir, comp *compress.Compressor, rows int, blocks []int, shared [][]byte,
+) (*chunk.DictColumn, error) {
+	w := bytesWalk{dir: dir, comp: comp, rows: rows, shared: shared, curFrame: -1, scatter: true}
+	w.merger.Scatter(rows)
+
+	for _, g := range blocks {
+		if err := w.decode(g); err != nil {
+			w.merger.Reset()
+
+			return nil, err
+		}
+	}
+
+	out := w.merger.Build()
+	if out.Len() != rows {
+		return nil, errors.Wrapf(ErrCorrupt, "scattered %d rows, want %d", out.Len(), rows)
+	}
+
+	return out, nil
+}
+
 // bytesWalk carries the state of one decode walk over a block-framed bytes column: the current
 // decompressed frame and the merge accumulating the granules decoded so far.
 type bytesWalk struct {
@@ -629,6 +653,7 @@ type bytesWalk struct {
 	frameBuf []byte
 	curFrame int
 	want     int
+	scatter  bool
 }
 
 // frame returns granule g's codec stream, decompressing its frame if it is not the current one.
@@ -685,7 +710,12 @@ func (w *bytesWalk) decode(g int) error {
 	}
 
 	w.want += n
-	w.merger.Append(&dc)
+
+	if w.scatter {
+		w.merger.AppendAt(&dc, lo)
+	} else {
+		w.merger.Append(&dc)
+	}
 
 	return nil
 }

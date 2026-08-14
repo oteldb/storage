@@ -655,28 +655,31 @@ func (r *ColumnReader) Bytes() (*chunk.DictColumn, error) {
 // [ColumnReader.DecodeBlocksInt64] — the seek primitive a time-pruned query uses to read a fraction
 // of a column instead of all of it.
 //
-// The returned column covers the selected rows *packed together*, not their positions in the part:
-// a caller working in part row indices must map through the block spans itself.
+// The returned column covers the selected rows *packed together*, not their positions in the part.
+// Use [ColumnReader.DecodeBlocksBytesIntoColumn] when part row indices must stay valid.
 func (r *ColumnReader) DecodeBlocksBytes(blocks []int) (*chunk.DictColumn, error) {
-	if r.desc.Kind != KindBytes {
-		return nil, errors.Errorf("block: column %q is %s, not bytes", r.desc.Name, r.desc.Kind)
-	}
-
-	if !r.desc.Blocked {
-		return nil, errors.Errorf("block: column %q is not block-framed", r.desc.Name)
-	}
-
-	dir, err := r.blockDir()
-	if err != nil {
-		return nil, errors.Wrapf(err, "column %q", r.desc.Name)
-	}
-
-	shared, err := r.sharedEntries()
+	dir, shared, err := r.blockedBytes()
 	if err != nil {
 		return nil, err
 	}
 
 	return decodeBlockedBytes(dir, r.comp, r.rows, blocks, shared)
+}
+
+// DecodeBlocksBytesIntoColumn decodes the named granules into a column spanning *every* row of the
+// part, each granule at its own row offset and the rest empty.
+//
+// Unlike [ColumnReader.DecodeBlocksBytes], which packs the selection, this keeps part row indices
+// valid — the property the int64 path gets for free by decoding into the destination at absolute
+// offsets. A fetch that located its rows through the part's row-range index and its marks can then
+// prune the decode without renumbering anything it already resolved.
+func (r *ColumnReader) DecodeBlocksBytesIntoColumn(blocks []int) (*chunk.DictColumn, error) {
+	dir, shared, err := r.blockedBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	return decodeBlockedBytesScatter(dir, r.comp, r.rows, blocks, shared)
 }
 
 // BytesRaw decodes a [chunk.CodecBytesRaw]-encoded [KindBytes] column into its flat fixed-width
@@ -866,6 +869,30 @@ func growLen[T any](dst []T, n int) []T {
 	}
 
 	return dst[:n]
+}
+
+// blockedBytes resolves the directory and shared dictionary of a block-framed bytes column, the
+// setup both granule-decode entry points need.
+func (r *ColumnReader) blockedBytes() (blockDir, [][]byte, error) {
+	if r.desc.Kind != KindBytes {
+		return blockDir{}, nil, errors.Errorf("block: column %q is %s, not bytes", r.desc.Name, r.desc.Kind)
+	}
+
+	if !r.desc.Blocked {
+		return blockDir{}, nil, errors.Errorf("block: column %q is not block-framed", r.desc.Name)
+	}
+
+	dir, err := r.blockDir()
+	if err != nil {
+		return blockDir{}, nil, errors.Wrapf(err, "column %q", r.desc.Name)
+	}
+
+	shared, err := r.sharedEntries()
+	if err != nil {
+		return blockDir{}, nil, err
+	}
+
+	return dir, shared, nil
 }
 
 // int64Decoder returns the per-block typed decoder for this column's codec, or nil for a codec that
