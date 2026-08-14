@@ -39,7 +39,7 @@ func TestClusterECRoutedWritePreservesValues(t *testing.T) {
 	// elsewhere and the primary we compute never receives it.
 	require.Eventually(t, func() bool {
 		for _, s := range nodes {
-			if len(s.cluster.membership.Members()) != 3 {
+			if ringSize(s) != 3 {
 				return false
 			}
 		}

@@ -68,7 +68,7 @@ func runECChaos(t *testing.T, seed uint64) {
 
 	require.Eventually(t, func() bool {
 		for _, s := range nodes {
-			if len(s.cluster.membership.Members()) != 6 {
+			if ringSize(s) != 6 {
 				return false
 			}
 		}
@@ -172,7 +172,7 @@ func runECChaos(t *testing.T, seed uint64) {
 	}
 
 	require.Eventually(t, func() bool {
-		return len(survivor.cluster.membership.Members()) == 4
+		return ringSize(survivor) == 4
 	}, 25*time.Second, 200*time.Millisecond, "membership drops both killed nodes")
 
 	// Every survivor still serves every sample: reads reconstruct from any Data reachable
@@ -205,7 +205,7 @@ func runECChaos(t *testing.T, seed uint64) {
 	nodes["n7"] = replacement
 
 	require.Eventually(t, func() bool {
-		return len(replacement.cluster.membership.Members()) == 5
+		return ringSize(replacement) == 5
 	}, 20*time.Second, 200*time.Millisecond, "the replacement joins the membership")
 
 	require.Eventually(t, func() bool {

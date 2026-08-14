@@ -163,7 +163,7 @@ func awaitMembership(t *testing.T, nodes map[string]*Storage) {
 
 	require.Eventually(t, func() bool {
 		for _, s := range nodes {
-			if len(s.cluster.membership.Members()) != len(nodes) {
+			if ringSize(s) != len(nodes) {
 				return false
 			}
 		}
@@ -266,7 +266,7 @@ func TestClusterAggregateWindowGathersAcrossShards(t *testing.T) {
 	// below: a node that still sees a partial membership routes a series to the wrong owner.
 	require.Eventually(t, func() bool {
 		for _, s := range nodes {
-			if len(s.cluster.membership.Members()) != 3 {
+			if ringSize(s) != 3 {
 				return false
 			}
 		}
@@ -348,7 +348,7 @@ func TestClusteredStorageReplicatesAcrossNodes(t *testing.T) {
 
 	// Wait for both nodes to see the full 2-node membership before writing.
 	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 2 && len(b.cluster.membership.Members()) == 2
+		return ringSize(a) == 2 && ringSize(b) == 2
 	}, 10*time.Second, 50*time.Millisecond, "membership converges to two nodes")
 
 	// Write to node A; with RF=2 the tenant's owners are both nodes (quorum 2 ⇒ both apply).
@@ -385,7 +385,7 @@ func TestClusterOnlyPrimaryCompacts(t *testing.T) {
 	a := nodes["node-a"]
 
 	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 2
+		return ringSize(a) == 2
 	}, 10*time.Second, 50*time.Millisecond)
 
 	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
@@ -434,7 +434,7 @@ func TestClusterReplicaTrimsHeadAfterOwnerFlush(t *testing.T) {
 	a := nodes["node-a"]
 
 	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 2
+		return ringSize(a) == 2
 	}, 10*time.Second, 50*time.Millisecond)
 
 	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
@@ -609,7 +609,7 @@ func TestClusteredLogsAccountForRejected(t *testing.T) {
 	s := openClusterNodeWith(t, endpoint, "node-a", backend.Memory(), WithOOOWindow(50))
 
 	require.Eventually(t, func() bool {
-		return len(s.cluster.membership.Members()) == 1
+		return ringSize(s) == 1
 	}, 10*time.Second, 50*time.Millisecond)
 
 	acc, err := s.WriteLogs(ctx, logBatch("api", [3]any{2000, 9, "a"}))
@@ -636,7 +636,7 @@ func TestClusterPrimaryAccountsForRejectedSamples(t *testing.T) {
 	s := openClusterNodeWith(t, endpoint, "node-a", backend.Memory(), WithOOOWindow(50))
 
 	require.Eventually(t, func() bool {
-		return len(s.cluster.membership.Members()) == 1
+		return ringSize(s) == 1
 	}, 10*time.Second, 50*time.Millisecond)
 
 	// First write establishes the head's newest timestamp at 2000.
@@ -667,7 +667,7 @@ func TestClusterPrimaryAppliesCardinalityLimit(t *testing.T) {
 		})))
 
 	require.Eventually(t, func() bool {
-		return len(s.cluster.membership.Members()) == 1
+		return ringSize(s) == 1
 	}, 10*time.Second, 50*time.Millisecond)
 
 	// First series fills the cardinality budget.
@@ -816,7 +816,7 @@ func TestInspectClusterSection(t *testing.T) {
 	s := openClusterNodeWith(t, endpoint, "node-a", backend.Memory())
 
 	require.Eventually(t, func() bool {
-		return len(s.cluster.membership.Members()) == 1
+		return ringSize(s) == 1
 	}, 10*time.Second, 50*time.Millisecond)
 
 	_, err := s.WriteMetrics(ctx, gaugeBatch("api", "m1", []int64{1}, []float64{1}))
@@ -1187,7 +1187,7 @@ func TestClusterPerTenantRF(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		for _, s := range nodes {
-			if len(s.cluster.membership.Members()) != 3 {
+			if ringSize(s) != 3 {
 				return false
 			}
 		}
@@ -1259,7 +1259,7 @@ func TestClusterSharedNothingReplicatesParts(t *testing.T) {
 	a := nodes["node-a"]
 
 	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 2
+		return ringSize(a) == 2
 	}, 10*time.Second, 50*time.Millisecond)
 
 	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
@@ -1330,7 +1330,7 @@ func TestClusterSharedNothingSurvivesNodeLoss(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		for _, s := range nodes {
-			if len(s.cluster.membership.Members()) != 3 {
+			if ringSize(s) != 3 {
 				return false
 			}
 		}
@@ -1393,7 +1393,7 @@ func TestClusterSharedNothingReplicatesLogParts(t *testing.T) {
 	a := nodes["node-a"]
 
 	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 2
+		return ringSize(a) == 2
 	}, 10*time.Second, 50*time.Millisecond)
 
 	_, err := a.WriteLogs(ctx, logBatch("api", [3]any{100, 9, "first"}, [3]any{200, 17, "second"}))
@@ -1464,7 +1464,7 @@ func TestClusterSharedNothingPushNotify(t *testing.T) {
 	a := nodes["node-a"]
 
 	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 2
+		return ringSize(a) == 2
 	}, 10*time.Second, 50*time.Millisecond)
 
 	_, err := a.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))

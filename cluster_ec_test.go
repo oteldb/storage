@@ -123,7 +123,7 @@ func TestClusterECRackAwarePlacement(t *testing.T) {
 	openClusterNodeECDomains(t, endpoint, "n6", []string{"rack3", "s6"}, 4, 2)
 
 	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 6
+		return ringSize(a) == 6
 	}, 10*time.Second, 50*time.Millisecond)
 
 	scheme := ec.Scheme{Data: 4, Parity: 2}
@@ -164,7 +164,7 @@ func TestClusterECRackShortfallDetected(t *testing.T) {
 	openClusterNodeECDomains(t, endpoint, "n3", []string{"rack1", "s3"}, 2, 1)
 
 	require.Eventually(t, func() bool {
-		return len(a.cluster.membership.Members()) == 3
+		return ringSize(a) == 3
 	}, 10*time.Second, 50*time.Millisecond)
 
 	n, safe := a.ecZoneShortfall("default", ec.Scheme{Data: 2, Parity: 1})
@@ -194,7 +194,7 @@ func TestClusterECSingleNodeConvertsAndServes(t *testing.T) {
 	s := openClusterNodeEC(t, endpoint, "node-a", 2, 1, 0)
 
 	require.Eventually(t, func() bool {
-		return len(s.cluster.membership.Members()) == 1
+		return ringSize(s) == 1
 	}, 10*time.Second, 50*time.Millisecond)
 
 	ts, vals := ecPayload(4096, 1)
@@ -231,7 +231,7 @@ func TestClusterECHotPartStaysFullCopy(t *testing.T) {
 	s := openClusterNodeEC(t, endpoint, "node-a", 2, 1, time.Hour) // hot window: 1h
 
 	require.Eventually(t, func() bool {
-		return len(s.cluster.membership.Members()) == 1
+		return ringSize(s) == 1
 	}, 10*time.Second, 50*time.Millisecond)
 
 	now := time.Now().UnixNano()
@@ -297,7 +297,7 @@ func TestClusterECSlotFiltering(t *testing.T) {
 	n1 := nodes["n1"]
 
 	require.Eventually(t, func() bool {
-		return len(n1.cluster.membership.Members()) == 3
+		return ringSize(n1) == 3
 	}, 10*time.Second, 50*time.Millisecond)
 
 	ts, vals := ecPayload(4096, 3)
@@ -413,7 +413,7 @@ func TestClusterECShardRepair(t *testing.T) {
 	// different slot than the one its peers expect it to hold, and the owner cannot prune.
 	require.Eventually(t, func() bool {
 		for _, s := range nodes {
-			if len(s.cluster.membership.Members()) != 3 {
+			if ringSize(s) != 3 {
 				return false
 			}
 		}
