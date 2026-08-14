@@ -300,6 +300,15 @@ Layered optimizations, each opt-in:
   Cache-off (or constant/unblocked columns) falls back to a per-fetch decode, **series-skipped** —
   only the blocks the matched row ranges touch. With the cache on a fetch also **prefetches** the
   parts it will touch, so backend reads and decodes overlap.
+- **Granule time pruning** — block boundaries align with the part's marks granules, so the marks
+  index already carries each block's `[MinKey, MaxKey]` sample times (`block/ARCH.md`). A
+  block-sliced fetch drops the blocks whose bounds cannot intersect the request window *before*
+  reading or decoding them, and the decode reservation is sized over the survivors. Rows are sorted
+  by `(series, ts)`, so granule bounds are not monotonic across a part — but they are inside one
+  series' row range, which is where the test is applied. Without it a series spanning far more time
+  than the query was decoded whole and discarded row by row, making a narrow window cost the same
+  as a full scan of the part. The index is derived and advisory: absent, corrupt, or mismatched
+  against the part's block framing, nothing is pruned and every block stays a candidate.
 - **Decode-memory budget** (`Config.DecodeMemoryBytes`) — a shared byte semaphore over in-flight
   decoded column bytes, reserved once per *fetch* off the lock (never incrementally per part, so
   two queries can't deadlock holding partial reservations); a fetch bigger than the whole budget is

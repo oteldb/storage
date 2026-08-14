@@ -555,15 +555,15 @@ func (p *enginePlan) rangesFor(ctx context.Context, part *part) ([]rowRange, err
 	return out, nil
 }
 
-// blocksFor returns the blocks of pt that the plan's matched series span, from the budget
-// estimate's memo when it ran (it needs the same set to size the reservation) and computed
-// otherwise — a nil budget leaves nothing memoized.
-func (p *enginePlan) blocksFor(pt *part, r *seriesBlockReader, ranges []rowRange) []int {
+// blocksFor returns the blocks of pt that the plan's matched series span and that can hold an
+// in-window sample, from the budget estimate's memo when it ran (it needs the same set to size the
+// reservation) and computed otherwise — a nil budget leaves nothing memoized.
+func (p *enginePlan) blocksFor(ctx context.Context, pt *part, r *seriesBlockReader, ranges []rowRange) []int {
 	if blks, ok := p.partBlocks[pt]; ok {
 		return blks
 	}
 
-	return neededBlocks(ranges, r.blockRows, pt.rows())
+	return pruneBlocks(neededBlocks(ranges, r.blockRows, pt.rows()), r.granules(ctx), p.start, p.end)
 }
 
 func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampleMerge, error) {
@@ -678,6 +678,9 @@ func (p *enginePlan) acquireDecodeBudget(ctx context.Context, r fetch.Request, n
 // the pins measured 4.9x low under 32-way load — the pins are the smaller half on a selective query
 // that spans many blocks.
 //
+// Both halves are counted over the blocks that survive granule time pruning, which is what keeps a
+// narrow query on a time-wide part from reserving the whole part.
+//
 // It still over-estimates elsewhere: blocks shared between concurrent fetches are counted once per
 // fetch. The budget trades that extra queueing for the ceiling actually holding.
 func (p *enginePlan) decodeEstimate(ctx context.Context, need colNeed) (int64, error) {
@@ -707,15 +710,11 @@ func (p *enginePlan) decodeEstimate(ctx context.Context, need colNeed) (int64, e
 			return 0, err
 		}
 
-		blks := neededBlocks(rngs, r.blockRows, pt.rows())
+		blks := pruneBlocks(neededBlocks(rngs, r.blockRows, pt.rows()), r.granules(ctx), p.start, p.end)
 		ranges[pt], blocks[pt] = rngs, blks
 
 		pinned := min(int64(len(blks))*int64(r.blockRows), int64(pt.rows()))
-
-		var matched int64
-		for _, rng := range rngs {
-			matched += int64(rng.end - rng.start)
-		}
+		matched := rowsInBlocks(rngs, r.blockRows, blks, pt.rows())
 
 		total += (pinned + matched) * 8 * cols
 	}
@@ -1465,7 +1464,7 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 			}
 
 			if r := plan.blockReaders[p]; r != nil {
-				_ = r.warm(ctx, plan.blocksFor(p, r, ranges))
+				_ = r.warm(ctx, plan.blocksFor(ctx, p, r, ranges))
 
 				return
 			}
