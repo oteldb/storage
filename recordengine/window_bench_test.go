@@ -46,7 +46,7 @@ func BenchmarkAppendWindow(b *testing.B) {
 
 	sel := fullSel(schema)
 
-	cols, err := e.parts[0].readCols(ctx, sel, nil)
+	cols, err := e.parts[0].readCols(ctx, sel, nil, nil)
 	if err != nil {
 		b.Fatal(err)
 	}

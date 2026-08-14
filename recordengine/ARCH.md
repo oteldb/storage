@@ -197,6 +197,22 @@ are cleared only with the head. (The metrics engine still compares against a hea
 
 Heavily tuned around decoding as little as possible:
 
+- **Granule time pruning** (`granule.go`) — every column of a part is **block-framed**, so a reader
+  decodes one granule at a time, and the marks sidecar carries each granule's `[minTime, maxTime]`.
+  A windowed fetch decodes only the granules its rows occupy. Without it part span was the *only*
+  time filter records had — a 15-minute query against a day-wide part decoded the day, measured at
+  286× the rows needed on a real log corpus.
+
+  The selection is taken from the **requested streams'** row ranges, not the whole part. Rows are
+  `(stream, ts)`-ordered, so granule bounds are not monotonic across a part, but each stream owns one
+  contiguous ts-ascending run — which is what makes a service-filtered query touch a handful of
+  granules. `nil` means "decode everything", returned both when marks are unusable and when nothing
+  pruned, so the whole-column path stays on its simpler route.
+
+  Decoded rows land at their **part row offsets**, pruned or not, so the row-range index and
+  `tsWindow` keep working unchanged. Rows outside the selected granules are *unspecified* — the
+  caller derived the selection from the very ranges it will read. The stream id column stays unframed:
+  a fetch resolves streams through the row-range index and never decodes it.
 - **Lazy column decode** — materialize only the columns the request's conditions + projection
   reference (a body search projecting body touches just `ts`+`body`).
 - Decode each surviving part **once**, distributing rows to per-stream accumulators pre-sized from

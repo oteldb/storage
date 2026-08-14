@@ -161,9 +161,12 @@ func (p *part) rawBytesBlob(ctx context.Context, name string) (blob []byte, widt
 		return nil, 0, false, err
 	}
 
+	// A block-framed column has no flat blob to scan, so it takes the dictionary path below like any
+	// non-fixed-width column. Only CodecBytesRaw columns reach here (see eqFastPathCols), and those
+	// are not framed today.
 	blob, width, err = col.BytesRaw()
 	if err != nil {
-		return nil, 0, false, nil //nolint:nilerr // not fixed-width: fall back to dict decode
+		return nil, 0, false, nil //nolint:nilerr // not fixed-width or framed: fall back to dict decode
 	}
 
 	return blob, width, true, nil
@@ -173,7 +176,9 @@ func (p *part) rawBytesBlob(ctx context.Context, name string) (blob []byte, widt
 // nothing else — a projected column the conditions don't touch waits for [part.decodeProjected], so a
 // part that turns out to be a bloom false positive is dropped having decoded only what it took to
 // find that out. getI64 supplies pooled int scratch (recycled by [Engine.recycleLazyInts]).
-func (p *part) readLazyConds(ctx context.Context, condSel colSel, conds []fetch.Condition, getI64 func() []int64) (*lazyCols, error) {
+func (p *part) readLazyConds(
+	ctx context.Context, condSel colSel, conds []fetch.Condition, getI64 func() []int64, blocks []int,
+) (*lazyCols, error) {
 	lz := &lazyCols{
 		schema:  p.schema,
 		ints:    make([][]int64, p.schema.numInts()),
@@ -185,13 +190,13 @@ func (p *part) readLazyConds(ctx context.Context, condSel colSel, conds []fetch.
 	}
 
 	var err error
-	if lz.ts, err = p.readInt64(ctx, colTs, i64Scratch(getI64)); err != nil {
+	if lz.ts, err = p.readInt64(ctx, colTs, i64Scratch(getI64), blocks); err != nil {
 		return nil, err
 	}
 
 	for k := range lz.ints {
 		if condSel.ints[k] {
-			if lz.ints[k], err = p.readInt64(ctx, p.schema.intColumn(k).Name, i64Scratch(getI64)); err != nil {
+			if lz.ints[k], err = p.readInt64(ctx, p.schema.intColumn(k).Name, i64Scratch(getI64), blocks); err != nil {
 				return nil, err
 			}
 		}
@@ -227,7 +232,7 @@ func (p *part) readLazyConds(ctx context.Context, condSel colSel, conds []fetch.
 			}
 		}
 
-		if lz.bytes[k], err = p.readDict(ctx, p.schema.byteColumn(k).Name); err != nil {
+		if lz.bytes[k], err = p.readDict(ctx, p.schema.byteColumn(k).Name, blocks); err != nil {
 			return nil, err
 		}
 	}
@@ -246,10 +251,12 @@ func i64Scratch(getI64 func() []int64) []int64 {
 
 // decodeProjected decodes phase 2: the selected columns not already decoded in phase 1. Called only
 // when the part holds at least one matching row.
-func (p *part) decodeProjected(ctx context.Context, lz *lazyCols, sel, condSel colSel, getI64 func() []int64) error {
+func (p *part) decodeProjected(
+	ctx context.Context, lz *lazyCols, sel, condSel colSel, getI64 func() []int64, blocks []int,
+) error {
 	for k := range lz.ints {
 		if sel.ints[k] && !condSel.ints[k] {
-			col, err := p.readInt64(ctx, p.schema.intColumn(k).Name, i64Scratch(getI64))
+			col, err := p.readInt64(ctx, p.schema.intColumn(k).Name, i64Scratch(getI64), blocks)
 			if err != nil {
 				return err
 			}
@@ -260,7 +267,7 @@ func (p *part) decodeProjected(ctx context.Context, lz *lazyCols, sel, condSel c
 
 	for k := range lz.bytes {
 		if sel.bytes[k] && !condSel.bytes[k] && lz.bytes[k] == nil {
-			dc, err := p.readDict(ctx, p.schema.byteColumn(k).Name)
+			dc, err := p.readDict(ctx, p.schema.byteColumn(k).Name, blocks)
 			if err != nil {
 				return err
 			}
@@ -272,13 +279,16 @@ func (p *part) decodeProjected(ctx context.Context, lz *lazyCols, sel, condSel c
 	return nil
 }
 
-func (p *part) readDict(ctx context.Context, name string) (*chunk.DictColumn, error) {
+// readDict decodes the named byte column. blocks selects the granules to decode (nil ⇒ all); rows
+// outside them are unspecified, which is safe because the caller derived blocks from the very row
+// ranges it will read.
+func (p *part) readDict(ctx context.Context, name string, blocks []int) (*chunk.DictColumn, error) {
 	col, err := p.reader.Column(ctx, name)
 	if err != nil {
 		return nil, err
 	}
 
-	return col.Bytes()
+	return decodeDict(col, blocks)
 }
 
 // colValue is the twin of [recordCols.colValue] over the lazy dictionary-column source (byte cells
@@ -347,7 +357,11 @@ func (c *recordCols) appendLazyRow(lz *lazyCols, i int) {
 // applies the conditions to the head-seeded prefix only (part rows already pass by construction).
 func (p *fetchPlan) readPartsLazy(ctx context.Context) error {
 	for _, part := range p.liveParts {
-		lz, err := part.readLazyConds(ctx, p.condSel, p.conds, p.e.getI64)
+		// Granules the requested streams' rows occupy that the window can intersect; nil when
+		// nothing prunes, which keeps the whole-column decode on its simpler path.
+		blocks := part.windowGranules(ctx, p.ids, p.start, p.end)
+
+		lz, err := part.readLazyConds(ctx, p.condSel, p.conds, p.e.getI64, blocks)
 		if err != nil {
 			return err
 		}
@@ -355,7 +369,7 @@ func (p *fetchPlan) readPartsLazy(ctx context.Context) error {
 		// Phase 1: a non-matching part (a bloom false positive) never decodes its projected columns.
 		if p.scanMatches(part, lz) {
 			// Phase 2: decode the projected columns and gather the rows phase 1 recorded.
-			if err := part.decodeProjected(ctx, lz, p.sel, p.condSel, p.e.getI64); err != nil {
+			if err := part.decodeProjected(ctx, lz, p.sel, p.condSel, p.e.getI64, blocks); err != nil {
 				return err
 			}
 

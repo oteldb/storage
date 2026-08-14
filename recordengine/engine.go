@@ -1002,7 +1002,7 @@ func (p *fetchPlan) readParts(ctx context.Context) error {
 	}
 
 	for i, part := range p.liveParts {
-		cols, err := part.readCols(ctx, p.sel, p.e.getI64)
+		cols, err := part.readCols(ctx, p.sel, p.e.getI64, part.windowGranules(ctx, p.ids, p.start, p.end))
 		if err != nil {
 			return err
 		}
