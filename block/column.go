@@ -132,6 +132,18 @@ func defaultCodec(k Kind) chunk.Codec {
 	}
 }
 
+// trySharedDict encodes c with a column-wide bytes dictionary when the codec allows and at least one
+// granule repeats enough to benefit; ok is false when the caller should use the per-granule path.
+func trySharedDict(
+	c Column, codec chunk.Codec, comp *compress.Compressor, blockRows, compressBytes int,
+) (obj []byte, ok bool, err error) {
+	if c.Kind != KindBytes || codec != chunk.CodecDict {
+		return nil, false, nil
+	}
+
+	return encodeSharedDictBytes(c, comp, blockRows, compressBytes)
+}
+
 // buildColumn computes a column's descriptor and serialized object. A constant column
 // collapses to its descriptor with no object (the value lives in the manifest); every
 // other column is a chunk-codec stream wrapped in comp's block frame. comp selects the
@@ -193,6 +205,18 @@ func buildColumn(c Column, comp *compress.Compressor, blockRows, compressBytes i
 
 	if c.Block {
 		desc.Blocked, desc.Framed = true, true
+
+		// A dictionary bytes column tries the shared dictionary first: per-granule dictionaries lose
+		// every repeat that crosses a granule boundary, which is most of them for a column of
+		// repeating blobs. It declines when no granule repeats enough to benefit, leaving a
+		// near-unique column on the per-granule path with no dictionary header to carry.
+		if obj, ok, err := trySharedDict(c, codec, comp, blockRows, compressBytes); err != nil {
+			return ColumnDesc{}, nil, err
+		} else if ok {
+			desc.SharedDict = true
+
+			return desc, obj, nil
+		}
 
 		obj, err := encodeBlocked(c, codec, budget, comp, blockRows, compressBytes)
 		if err != nil {
@@ -403,6 +427,12 @@ type ColumnReader struct {
 	object []byte // compress-framed stream; nil for a constant column
 	comp   *compress.Compressor
 	rows   int
+
+	// Parsed shared-dictionary header, for a bytes column carrying one (see shareddict.go). Peeled
+	// once and kept, since every granule of the column resolves its ids against the same entries.
+	sharedEnt  [][]byte
+	sharedRest []byte
+	sharedDone bool
 }
 
 func newColumnReader(desc ColumnDesc, object []byte, comp *compress.Compressor, rows int) *ColumnReader {
@@ -602,7 +632,12 @@ func (r *ColumnReader) Bytes() (*chunk.DictColumn, error) {
 			return nil, errors.Wrapf(err, "column %q", r.desc.Name)
 		}
 
-		return decodeBlockedBytes(dir, r.comp, r.rows, nil)
+		shared, err := r.sharedEntries()
+		if err != nil {
+			return nil, err
+		}
+
+		return decodeBlockedBytes(dir, r.comp, r.rows, nil, shared)
 	}
 
 	stream, err := r.stream()
@@ -636,7 +671,12 @@ func (r *ColumnReader) DecodeBlocksBytes(blocks []int) (*chunk.DictColumn, error
 		return nil, errors.Wrapf(err, "column %q", r.desc.Name)
 	}
 
-	return decodeBlockedBytes(dir, r.comp, r.rows, blocks)
+	shared, err := r.sharedEntries()
+	if err != nil {
+		return nil, err
+	}
+
+	return decodeBlockedBytes(dir, r.comp, r.rows, blocks, shared)
 }
 
 // BytesRaw decodes a [chunk.CodecBytesRaw]-encoded [KindBytes] column into its flat fixed-width
@@ -856,7 +896,39 @@ func (r *ColumnReader) float64Decoder() func([]float64, []byte) ([]float64, int,
 
 // blockDir parses the column's block directory, selecting the layout the descriptor records.
 func (r *ColumnReader) blockDir() (blockDir, error) {
-	return parseBlockDir(r.object, r.desc.Framed, r.desc.Footer)
+	object := r.object
+
+	if r.desc.SharedDict {
+		if _, err := r.sharedEntries(); err != nil {
+			return blockDir{}, err
+		}
+
+		object = r.sharedRest
+	}
+
+	return parseBlockDir(object, r.desc.Framed, r.desc.Footer)
+}
+
+// sharedEntries returns the column's shared dictionary, nil for a column without one. The header is
+// peeled once: the entries and the block-framed remainder are both kept, since the directory sits
+// after the dictionary in the same object.
+func (r *ColumnReader) sharedEntries() ([][]byte, error) {
+	if !r.desc.SharedDict {
+		return nil, nil
+	}
+
+	if r.sharedDone {
+		return r.sharedEnt, nil
+	}
+
+	entries, rest, err := parseSharedDict(r.object, r.comp)
+	if err != nil {
+		return nil, errors.Wrapf(err, "column %q", r.desc.Name)
+	}
+
+	r.sharedEnt, r.sharedRest, r.sharedDone = entries, rest, true
+
+	return entries, nil
 }
 
 // stream decompresses the column's block frame into its raw codec stream.

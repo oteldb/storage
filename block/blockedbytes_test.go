@@ -274,3 +274,95 @@ func FuzzBlockedBytesRoundTrip(f *testing.F) {
 		}
 	})
 }
+
+// sharedDesc reports whether a block-framed bytes column chose the shared dictionary.
+func sharedDesc(t *testing.T, vals [][]byte, granule int) bool {
+	t.Helper()
+
+	desc, _, err := buildColumn(
+		Column{Name: "c", Kind: KindBytes, Codec: chunk.CodecDict, Bytes: vals, Block: true},
+		noneComp(), granule, defaultCompressBlockBytes,
+	)
+	require.NoError(t, err)
+
+	return desc.SharedDict
+}
+
+// TestSharedDictChosenByRepetition pins the encoder's decision. A column whose values repeat across
+// granules must put its dictionary in one place, or every repeat crossing a granule boundary is
+// stored again — measured at +74% on a real record-attributes column. A near-unique column must
+// decline it, or the dictionary becomes the column with an id array bolted on.
+func TestSharedDictChosenByRepetition(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, sharedDesc(t, repeatVals(8192, 20), 1024),
+		"repeating values must share one dictionary across granules")
+	assert.False(t, sharedDesc(t, uniqueVals(8192), 1024),
+		"near-unique values must decline the shared dictionary")
+}
+
+// TestSharedDictMixedGranules is the graceful-degradation case: one column holding both shapes, as a
+// service that logs clean structured lines and then dumps a stack trace does. The repeating granules
+// must use the shared dictionary while the unique ones self-encode, and every row must survive.
+func TestSharedDictMixedGranules(t *testing.T) {
+	t.Parallel()
+
+	const granule = 1024
+
+	vals := make([][]byte, 0, granule*4)
+	vals = append(vals, repeatVals(granule, 5)...)
+	vals = append(vals, uniqueVals(granule)...)
+	vals = append(vals, repeatVals(granule, 5)...)
+	vals = append(vals, uniqueVals(granule)...)
+
+	desc, obj, err := buildColumn(
+		Column{Name: "c", Kind: KindBytes, Codec: chunk.CodecDict, Bytes: vals, Block: true},
+		noneComp(), granule, defaultCompressBlockBytes,
+	)
+	require.NoError(t, err)
+	require.True(t, desc.SharedDict, "the repeating granules must opt in even with unique neighbors")
+
+	r := newColumnReader(desc, obj, noneComp(), len(vals))
+
+	got, err := r.Bytes()
+	require.NoError(t, err)
+	assert.Equal(t, vals, gather(t, got))
+
+	// Each granule decodes on its own, whichever mode it chose.
+	for _, g := range []int{0, 1, 2, 3} {
+		part, err := r.DecodeBlocksBytes([]int{g})
+		require.NoError(t, err, "granule %d", g)
+		assert.Equal(t, vals[g*granule:(g+1)*granule], gather(t, part), "granule %d", g)
+	}
+}
+
+// TestSharedDictBlobInput checks the blob+offsets input form encodes identically to the [][]byte
+// one — the flush path feeds the blob directly, so a divergence would only show in production.
+func TestSharedDictBlobInput(t *testing.T) {
+	t.Parallel()
+
+	vals := repeatVals(4096, 12)
+
+	blob := make([]byte, 0, 16*len(vals))
+	offsets := make([]int32, 1, len(vals)+1)
+
+	for _, v := range vals {
+		blob = append(blob, v...)
+		offsets = append(offsets, int32(len(blob)))
+	}
+
+	fromSlices, objA, err := buildColumn(
+		Column{Name: "c", Kind: KindBytes, Codec: chunk.CodecDict, Bytes: vals, Block: true},
+		noneComp(), 1024, defaultCompressBlockBytes,
+	)
+	require.NoError(t, err)
+
+	fromBlob, objB, err := buildColumn(
+		Column{Name: "c", Kind: KindBytes, Codec: chunk.CodecDict, BytesBlob: blob, BytesOffsets: offsets, Block: true},
+		noneComp(), 1024, defaultCompressBlockBytes,
+	)
+	require.NoError(t, err)
+
+	assert.Equal(t, fromSlices.SharedDict, fromBlob.SharedDict)
+	assert.Equal(t, objA, objB, "the two input forms must encode byte-identically")
+}
