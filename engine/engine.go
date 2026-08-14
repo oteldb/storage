@@ -483,7 +483,13 @@ type enginePlan struct {
 	engine       *Engine      // for returning pooled decode buffers on release
 	budgetBytes  int64        // decode-memory budget reserved for this query; released on releaseParts
 	budgetScope  *fetch.Scope // the query scope budgetBytes was charged against, if any
-	start, end   int64
+	// partRanges and partBlocks memoize each block-sliced part's matched row runs and the blocks
+	// they span — what the budget estimate must know and what the prefetch then warms. Both are
+	// filled once, serially, by decodeEstimate and only read afterwards (by the prefetch's per-part
+	// goroutines and the scan), so they need no lock; nil maps just mean every reader recomputes.
+	partRanges map[*part][]rowRange
+	partBlocks map[*part][]int
+	start, end int64
 	// memActive is the count-shaped plan's replacement for the head/flush/recent batch snapshots:
 	// one existence flag per matched id (any in-memory sample in [start, end]), computed under the
 	// plan lock by scanning the live buffers directly — no per-series sorted copy, no batch maps.
@@ -525,8 +531,14 @@ func (p *enginePlan) decodePart(ctx context.Context, part *part) (*decodedPart, 
 
 // rangesFor returns the row runs of the plan's matched series that part holds — the input to the
 // series-skip decode. The result is the union of the part's per-series ranges; it need not be sorted
-// (neededBlocks unions their blocks regardless).
+// (neededBlocks unions their blocks regardless). The budget estimate already looks these up for a
+// block-sliced part, so the answer is served from that memo when it is there rather than repeating
+// one index lookup per matched series.
 func (p *enginePlan) rangesFor(ctx context.Context, part *part) ([]rowRange, error) {
+	if rngs, ok := p.partRanges[part]; ok {
+		return rngs, nil
+	}
+
 	out := make([]rowRange, 0, len(p.ids))
 
 	for _, id := range p.ids {
@@ -541,6 +553,17 @@ func (p *enginePlan) rangesFor(ctx context.Context, part *part) ([]rowRange, err
 	}
 
 	return out, nil
+}
+
+// blocksFor returns the blocks of pt that the plan's matched series span, from the budget
+// estimate's memo when it ran (it needs the same set to size the reservation) and computed
+// otherwise — a nil budget leaves nothing memoized.
+func (p *enginePlan) blocksFor(pt *part, r *seriesBlockReader, ranges []rowRange) []int {
+	if blks, ok := p.partBlocks[pt]; ok {
+		return blks
+	}
+
+	return neededBlocks(ranges, r.blockRows, pt.rows())
 }
 
 func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampleMerge, error) {
@@ -608,7 +631,12 @@ func (p *enginePlan) acquireDecodeBudget(ctx context.Context, r fetch.Request, n
 		scope = fetch.ScopeFrom(ctx)
 	}
 
-	p.budgetBytes = p.decodeEstimate(need)
+	est, err := p.decodeEstimate(ctx, need)
+	if err != nil {
+		return err
+	}
+
+	p.budgetBytes = est
 	p.budgetScope = scope
 
 	forced, err := p.engine.budget.acquireFor(ctx, scope, p.budgetBytes)
@@ -633,32 +661,68 @@ func (p *enginePlan) acquireDecodeBudget(ctx context.Context, r fetch.Request, n
 
 // decodeEstimate is the bytes this query will materialize across the parts it touches: the full ts
 // column always, plus the value column (and the scale-factor column when present) when need.values.
-// A decoded column is one int64/float64 per row, so 8 bytes/row/column. It is an upper bound — the
-// per-fetch decodedPart is sized to the part's full row count even for a sparse selector — so the
-// budget reservation matches the resident footprint it caps.
+// A decoded column is one int64/float64 per row, so 8 bytes/row/column.
 //
-// Block-sliced parts (the decode-cache fetch path) count the same as whole-part decodes: the fetch
-// pins every block it touches until releaseParts, and evicted-but-pinned blocks stay live, so N
-// concurrent fetches accumulate the same column bytes through the cache-miss path (bufFreeList.get
-// dominated the live heap under 8-way load — see oteldb/oteldb#1124). Blocks shared between
-// concurrent fetches make this an over-estimate; the budget trades that extra queueing for the
-// memory ceiling actually holding.
-func (p *enginePlan) decodeEstimate(need colNeed) int64 {
+// What a part costs depends on how it will be read. A whole-part decode is sized to the part's row
+// count even for a sparse selector, so the part's rows are the honest number. A block-sliced part
+// materializes only the blocks its matched series fall in — it pins each one whole until
+// releaseParts, and an evicted-but-pinned block stays live, so the block is the right unit but the
+// slice inside it is not (bufFreeList.get dominated the live heap under 8-way load, see
+// oteldb/oteldb#1124). Charging those parts for the whole store made the estimate grow with the
+// data while the footprint stayed with the query, and any query on a large store then exceeded the
+// whole budget and was admitted alone — turning the ceiling into a global query lock.
+//
+// A block-sliced part is charged twice over, for the blocks it pins *and* for the matched rows
+// inside them, because both are live at once: collect copies a series' samples into the result
+// buffers while the blocks they came from are still pinned for the rest of the scan. Counting only
+// the pins measured 4.9x low under 32-way load — the pins are the smaller half on a selective query
+// that spans many blocks.
+//
+// It still over-estimates elsewhere: blocks shared between concurrent fetches are counted once per
+// fetch. The budget trades that extra queueing for the ceiling actually holding.
+func (p *enginePlan) decodeEstimate(ctx context.Context, need colNeed) (int64, error) {
 	var total int64
 
-	for _, part := range p.liveParts {
+	ranges := make(map[*part][]rowRange, len(p.liveParts))
+	blocks := make(map[*part][]int, len(p.liveParts))
+
+	for _, pt := range p.liveParts {
 		cols := int64(1) // timestamps
 		if need.values {
 			cols++ // values
-			if part.hasSF {
+			if pt.hasSF {
 				cols++ // scale factors
 			}
 		}
 
-		total += int64(part.rows()) * 8 * cols
+		r := p.blockReaders[pt]
+		if r == nil {
+			total += int64(pt.rows()) * 8 * cols
+
+			continue
+		}
+
+		rngs, err := p.rangesFor(ctx, pt)
+		if err != nil {
+			return 0, err
+		}
+
+		blks := neededBlocks(rngs, r.blockRows, pt.rows())
+		ranges[pt], blocks[pt] = rngs, blks
+
+		pinned := min(int64(len(blks))*int64(r.blockRows), int64(pt.rows()))
+
+		var matched int64
+		for _, rng := range rngs {
+			matched += int64(rng.end - rng.start)
+		}
+
+		total += (pinned + matched) * 8 * cols
 	}
 
-	return total
+	p.partRanges, p.partBlocks = ranges, blocks
+
+	return total, nil
 }
 
 // releaseSeriesPins releases every block reader's per-series pins (keeping the memoized blocks
@@ -1401,7 +1465,7 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 			}
 
 			if r := plan.blockReaders[p]; r != nil {
-				_ = r.warm(ctx, ranges)
+				_ = r.warm(ctx, plan.blocksFor(p, r, ranges))
 
 				return
 			}
