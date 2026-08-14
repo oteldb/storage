@@ -213,8 +213,41 @@ func (p *part) readBytes(ctx context.Context, name string, blocks []int) (byteCo
 
 	n := dc.Len()
 	out := byteCol{offsets: make([]int32, 1, n+1)}
+
+	if blocks == nil {
+		for i := range n {
+			out.appendCell(dc.At(i))
+		}
+
+		return out, nil
+	}
+
+	// Only the selected granules hold values this query will read. Unselected rows still get a cell
+	// — the blob is indexed by part row, and shifting it would invalidate the row ranges the fetch
+	// already resolved — but an empty one, so the copy costs what the selection covers rather than
+	// what the part holds. Without this the decode prunes and the materialization undoes it.
+	size := p.reader.Manifest().GranuleSize
+	if size <= 0 {
+		for i := range n {
+			out.appendCell(dc.At(i))
+		}
+
+		return out, nil
+	}
+
+	keep := make([]bool, (n+size-1)/size)
+	for _, g := range blocks {
+		if g >= 0 && g < len(keep) {
+			keep[g] = true
+		}
+	}
+
 	for i := range n {
-		out.appendCell(dc.At(i))
+		if keep[i/size] {
+			out.appendCell(dc.At(i))
+		} else {
+			out.appendCell(nil)
+		}
 	}
 
 	return out, nil
