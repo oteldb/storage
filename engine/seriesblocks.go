@@ -123,10 +123,11 @@ func (r *seriesBlockReader) addRange(ctx context.Context, rng rowRange, m *sampl
 	return nil
 }
 
-// warm decodes (and caches) the blocks spanning ranges without slicing — the block-cache analog of
-// the old whole-part prefetch, run concurrently per part so its reads/decodes overlap before the scan.
-func (r *seriesBlockReader) warm(ctx context.Context, ranges []rowRange) error {
-	for _, b := range neededBlocks(ranges, r.blockRows, r.part.rows()) {
+// warm decodes (and caches) the given blocks without slicing — the block-cache analog of the old
+// whole-part prefetch, run concurrently per part so its reads/decodes overlap before the scan. The
+// blocks come from [enginePlan.blocksFor], which the budget estimate has usually already computed.
+func (r *seriesBlockReader) warm(ctx context.Context, blocks []int) error {
+	for _, b := range blocks {
 		if _, err := r.tsBlock(ctx, b); err != nil {
 			return err
 		}

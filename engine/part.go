@@ -588,17 +588,24 @@ func neededBlocks(ranges []rowRange, blockRows, totalRows int) []int {
 	nBlocks := (totalRows + blockRows - 1) / blockRows
 	seen := make([]bool, nBlocks)
 
+	n := 0
+
 	for _, rng := range ranges {
 		if rng.start >= rng.end {
 			continue
 		}
 
 		for b := rng.start / blockRows; b <= (rng.end-1)/blockRows; b++ {
-			seen[b] = true
+			if !seen[b] {
+				seen[b] = true
+				n++
+			}
 		}
 	}
 
-	out := make([]int, 0, nBlocks)
+	// Sized to the blocks actually touched, not to the part: a selective query over a large part
+	// spans a handful of blocks, and capacity nBlocks made the throwaway result dwarf it.
+	out := make([]int, 0, n)
 
 	for b, s := range seen {
 		if s {
