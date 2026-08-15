@@ -1,6 +1,7 @@
 package recordengine
 
 import (
+	"cmp"
 	"math/bits"
 	"slices"
 
@@ -79,12 +80,15 @@ func retentionForces(p *part, retainFrom int64) bool {
 // Forced work wins the cycle outright rather than being unioned with a tier group, because the two
 // are now in general in different buckets and merging across them is the widening this prevents. The
 // tier group is picked up on the next cycle.
-func selectMergeParts(src []*part, retainFrom, capBytes int64) []*part {
+// force takes a bucket's unsealed parts whatever their tiers, so an operator can compact a part set
+// the tier rule declines to touch; the seal threshold and the cumulative-bytes cap still bound the
+// merge, and the ladder still confines it to one time bucket.
+func selectMergeParts(src []*part, retainFrom, capBytes int64, force bool) []*part {
 	if forced := selectForced(src, retainFrom, capBytes); len(forced) > 0 {
 		return forced
 	}
 
-	return selectLadderGroup(src, capBytes)
+	return selectLadderGroup(src, capBytes, force)
 }
 
 // pickTierGroup returns the group of unsealed parts to compact for size reduction: the tier holding the
@@ -93,14 +97,10 @@ func selectMergeParts(src []*part, retainFrom, capBytes int64) []*part {
 // decoded input is at most one sealed-tier part's worth), or by maxTierParts when part size is
 // unlimited. Returns nil when no tier qualifies. Parts keep their src (sequence) order within the group.
 func pickTierGroup(src []*part, capBytes int64) []*part {
-	sealed := func(p *part) bool { return capBytes > 0 && p.sizeBytes() >= capBytes }
-
 	byTier := make(map[int][]*part)
-	for _, p := range src {
-		if !sealed(p) {
-			t := sizeTier(p.sizeBytes())
-			byTier[t] = append(byTier[t], p)
-		}
+	for _, p := range unsealedOf(src, capBytes) {
+		t := sizeTier(p.sizeBytes())
+		byTier[t] = append(byTier[t], p)
 	}
 
 	bestTier, bestN := -1, 0
@@ -114,25 +114,69 @@ func pickTierGroup(src []*part, capBytes int64) []*part {
 		return nil
 	}
 
-	group := byTier[bestTier]
+	return capGroup(byTier[bestTier], capBytes)
+}
 
-	if capBytes > 0 {
-		// Cap the group's cumulative decoded bytes at the seal threshold, taking at least minTierParts
-		// so a merge always makes progress even when two parts already approach the cap.
-		var total int64
-
-		for i, p := range group {
-			total += p.sizeBytes()
-			if i+1 >= minTierParts && total >= capBytes {
-				return group[:i+1]
-			}
-		}
-
-		return group
+// pickForcedGroup returns the unsealed parts to compact when the tier rule has selected nothing and
+// the caller wants a merge anyway: the smallest ones first (they cost the least to rewrite and
+// reduce the part count the most per byte), taken across tiers up to the same cumulative-bytes cap
+// the tiered path obeys, then restored to src order — the merge visits its sources in sequence
+// order. nil when fewer than minTierParts parts remain unsealed, where no merge can help.
+func pickForcedGroup(src []*part, capBytes int64) []*part {
+	eligible := unsealedOf(src, capBytes)
+	if len(eligible) < minTierParts {
+		return nil
 	}
 
-	if len(group) > maxTierParts {
-		return group[:maxTierParts]
+	order := make(map[*part]int, len(eligible))
+	for i, p := range eligible {
+		order[p] = i
+	}
+
+	bySize := slices.Clone(eligible)
+	slices.SortFunc(bySize, func(a, b *part) int {
+		if c := cmp.Compare(a.sizeBytes(), b.sizeBytes()); c != 0 {
+			return c
+		}
+
+		return cmp.Compare(order[a], order[b])
+	})
+
+	group := slices.Clone(capGroup(bySize, capBytes))
+	slices.SortFunc(group, func(a, b *part) int { return cmp.Compare(order[a], order[b]) })
+
+	return group
+}
+
+// unsealedOf returns the parts below the seal threshold, in src order. A sealed part is at the cap
+// already: re-merging it would only re-split it into equally-full parts.
+func unsealedOf(src []*part, capBytes int64) []*part {
+	out := make([]*part, 0, len(src))
+
+	for _, p := range src {
+		if capBytes <= 0 || p.sizeBytes() < capBytes {
+			out = append(out, p)
+		}
+	}
+
+	return out
+}
+
+// capGroup truncates a group at what one merge may hold: its cumulative decoded bytes at the seal
+// threshold (taking at least minTierParts, so a merge always makes progress even when two parts
+// already approach the cap), or maxTierParts when part size is unlimited.
+func capGroup(group []*part, capBytes int64) []*part {
+	if capBytes <= 0 {
+		return group[:min(len(group), maxTierParts)]
+	}
+
+	var total int64
+
+	for i, p := range group {
+		total += p.sizeBytes()
+		if i+1 >= minTierParts && total >= capBytes {
+			return group[:i+1]
+		}
 	}
 
 	return group

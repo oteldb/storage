@@ -38,6 +38,7 @@ type Obs struct {
 	Admission *Admission
 	Flush     *Flush
 	Merge     *Merge
+	Parts     *Parts
 	Fetch     *Fetch
 	Backend   *Backend
 	WAL       *WAL
@@ -89,12 +90,18 @@ func New(cfg Config) (*Obs, error) {
 		return nil, err
 	}
 
+	parts, err := newParts(meter)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Obs{
 		Log:       log,
 		Tracer:    tp.Tracer(scope),
 		Admission: adm,
 		Flush:     flush,
 		Merge:     merge,
+		Parts:     parts,
 		Fetch:     fetch,
 		Backend:   backend,
 		WAL:       wal,

@@ -173,14 +173,10 @@ func granuleCount(rowCount, granuleSize int) int {
 // in-memory liveness flag for introspection).
 func (e *Engine) MergeRunning() bool { return e.mergeRunning.Load() }
 
-// MergeBacklog returns the number of flushed parts — the compaction-backlog proxy (many small parts
-// means merge is behind). It takes a brief read lock.
-func (e *Engine) MergeBacklog() int {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	return len(e.parts)
-}
+// MergeBacklog returns the parts a merge may still take — the flushed parts less the sealed ones,
+// which no merge will reconsider. It is [MergeShape.Backlog]; use [Engine.MergeShape] for the rest
+// of the selector's inputs.
+func (e *Engine) MergeBacklog() int { return e.MergeShape().Backlog }
 
 // WALState returns the current WAL segment count, the open segment's byte size, and the active flush
 // epoch. ok is false when the engine has no WAL (the ephemeral in-memory engine). It takes a read

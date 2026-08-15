@@ -53,6 +53,14 @@ and the same lock discipline (see [`../engine/ARCH.md`](../engine/ARCH.md)). Not
   (sources + output buffer + the encode of it). Free space does not enter into it; the flush cap
   and the tiering target bound the disk.
 
+- **Merge shape and forcing** (`mergeshape.go`). `Engine.MergeShape` reports the selector's inputs —
+  parts, sealed, the unsealed remainder (the real backlog), what the next merge would take, the cap
+  in effect, and the tier spread — because a no-op merge is otherwise indistinguishable from an idle
+  engine. This engine has no idle waiver: two parts in different tiers of one bucket are a
+  *permanent* fixed point, and `MergeOptions.Force` is the only way out. It takes a bucket's
+  unsealed parts smallest-first whatever their tiers, still truncated at the same cumulative-bytes
+  cap and still confined to one time bucket — the tier rule is waived, the memory bound is not.
+
 ## Schema
 
 `Schema` of `Column{Name, Kind(Int64|Bytes), Codec, Bloom(None|FullText|Attrs|Equality)}`; the

@@ -85,6 +85,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	e.mu.Unlock()
 
 	capBytes := e.mergeCapBytes(ctx)
+	e.lastMergeCap.Store(capBytes)
 
 	// Retention first, and without decoding: a part every one of whose samples is older than the
 	// cutoff is dropped whole rather than rewritten into nothing.
@@ -93,10 +94,10 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 		return 0, err
 	}
 
-	selected := selectMergeParts(src, opts, capBytes, e.idleMerges)
+	selected := selectMergeParts(src, opts, capBytes, e.mergeIdle(opts))
 	if len(selected) == 0 {
 		if dropped == 0 {
-			e.idleMerges++
+			idle := int(e.idleMerges.Add(1))
 
 			// A no-op is indistinguishable from a healthy engine without the shape of what it looked
 			// at: 59 parts sat uncompacted for hours logging only "nothing to compact". These are the
@@ -107,7 +108,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 				zap.Int("sealed", sealedN), zap.Int64("cap_bytes", capBytes),
 				zap.Int("eligible", eligible), zap.Float64("best_multiplier", bestM),
 				zap.Float64("min_multiplier", minMergeMultiplier),
-				zap.Int("idle_rounds", e.idleMerges), zap.Int("waive_after", mergeIdleRounds))
+				zap.Int("idle_rounds", idle), zap.Int("waive_after", mergeIdleRounds))
 		}
 
 		e.reclaimRetired(ctx)
@@ -115,7 +116,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 		return dropped, nil
 	}
 
-	e.idleMerges = 0
+	e.idleMerges.Store(0)
 
 	start := minInt64
 	if opts.RetainFrom > 0 {

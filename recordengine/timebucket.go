@@ -104,7 +104,7 @@ func partitionGroups(src []*part, level int64) ([]int64, [][]*part) {
 // found in any bucket. Narrowest-first is what makes the ladder a ladder: a bucket's parts are
 // collapsed at level L before the result is eligible to merge with its neighbors at level L+1, so
 // each part is rewritten once per level rather than repeatedly at the widest one.
-func selectLadderGroup(src []*part, capBytes int64) []*part {
+func selectLadderGroup(src []*part, capBytes int64, force bool) []*part {
 	for _, level := range mergeLadder {
 		_, groups := partitionGroups(src, level)
 
@@ -116,6 +116,12 @@ func selectLadderGroup(src []*part, capBytes int64) []*part {
 
 			if picked := pickTierGroup(group, capBytes); len(picked) > 0 {
 				return picked
+			}
+
+			if force {
+				if picked := pickForcedGroup(group, capBytes); len(picked) > 0 {
+					return picked
+				}
 			}
 		}
 	}

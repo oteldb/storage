@@ -54,9 +54,9 @@ func metricStat(t *testing.T, s *Storage) SignalStats {
 	t.Helper()
 
 	for _, ts := range s.Inspect().Tenants {
-		for _, sig := range ts.Signals {
-			if sig.Signal == signal.Metric {
-				return sig
+		for i := range ts.Signals {
+			if ts.Signals[i].Signal == signal.Metric {
+				return ts.Signals[i]
 			}
 		}
 	}

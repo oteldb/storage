@@ -275,6 +275,19 @@ subsystem.
 
   The selector works in size order but returns the run in the engine's part order: the merge visits
   its sources oldest → newest so a later part's value wins a duplicate timestamp.
+
+  `MergeOptions.Force` is the operator's version of the idle escape: it hands the selector an
+  idle count that has already reached `mergeIdleRounds`, so a forced compaction is *the same*
+  selection the engine would make on its own after that many fruitless cycles — one code path, and
+  the seal threshold and run budget still bound it. Bypassing the heuristic is the point; bypassing
+  the memory/size bound is not.
+- **Merge shape** (`mergeshape.go`) is that decision's inputs, read off the merge path:
+  `Engine.MergeShape` reports the parts, how many are sealed, how many remain (the real backlog),
+  how many the next merge would take, the cap in effect, and the score the best run reached. A
+  no-op merge is otherwise indistinguishable from an idle engine, and a store can sit at a part
+  count it will never reduce for thousands of cycles without any counter saying so. The cap is
+  reported from the last merge rather than derived on demand: deriving it reads the backend's free
+  space, and introspection does no I/O.
 - **Streaming both ways** (`compactStream`): each source is read through a forward cursor decoding
   one series range at a time, and each merged series is handed straight to a `partStreamWriter`
   (`streampart.go`) wrapping a `block.StreamWriter`, which encodes a granule as soon as one fills.

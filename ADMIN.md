@@ -56,13 +56,33 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 | `Parts` | flushed immutable part count |
 | `MinTimeUnixNano` / `MaxTimeUnixNano` | data time span (min over parts; max includes the head) |
 | `MergeRunning` | a compaction is executing on this engine right now |
-| `MergeBacklog` | parts pending compaction (the backlog proxy; currently equals `Parts`) |
+| `SealedParts` | parts already at the merge cap. A merge never reconsiders them, so this is the share of `Parts` no compaction will reduce |
+| `MergeBacklog` | parts a merge may still take (`Parts − SealedParts`) — the backlog in the literal sense, not the part count |
+| `MergeCandidates` | parts the **next** merge would select. `0` with a non-zero `MergeBacklog` is the stuck state a maintenance cycle cannot fix by itself; `Admin.CompactNow` is the override |
+| `MergeCapBytes` | the seal threshold in effect. Derived per merge for metrics (from free space and the merge memory allowance), so it reads `0` until that engine's first merge; a static function of configuration for the record signals |
 | `WAL` | the engine has a write-ahead log (false for the ephemeral in-memory engine) |
 | `WALSegments` / `WALBytes` | WAL segment sequence number and open-segment byte size |
 | `WALEpoch` | WAL active flush generation (not the recovery watermark) |
 
 Part *byte* sizes are intentionally omitted from `Inspect` (they would need backend stat calls) — use
 `PartsDetailed` for those.
+
+**Diagnosing a part count that never falls.** `Parts` alone cannot tell a healthy idle engine from
+one wedged at a fixed point — a deployment sat at 59 parts for thousands of cycles looking exactly
+like an idle one. The three numbers beside it answer it directly:
+
+- `SealedParts == Parts` — everything is at the cap; the count is the floor and nothing is wrong.
+- `MergeBacklog > 0`, `MergeCandidates > 0` — a merge is coming on the next cycle.
+- `MergeBacklog > 0`, `MergeCandidates == 0` — **stuck**: parts remain mergeable but none qualify.
+  The metric engine waives its write-amplification guard after a few idle cycles and unwedges
+  itself; the record engines do not. `Admin.CompactNow` breaks it either way.
+
+Each engine's own `MergeShape()` (`engine`, `recordengine`) carries the rest of the selector's
+inputs behind these fields — the metric engine's `BestMultiplier`/`MinMultiplier`/`IdleRounds`/
+`WaiveAfter`, the record engines' `Tiers`/`LargestTierParts`/`MinTierParts`. They are per-engine
+because the two selectors reason differently: the metric engine orders parts by size and scores runs
+(it has had no size tiers since the tiering that stranded parts was removed), while the record
+engines still bucket by tier and wait for `MinTierParts` of them.
 
 ### Drill-down per `(tenant, signal)` (`introspect.go`)
 
@@ -119,6 +139,7 @@ Metric instruments (all prefixed `storage.`):
 | `rpc.attempts` / `rpc.retries` / `rpc.hedges` | `op` | cluster RPCs |
 | `rpc.shard_absent` | `op` | shard reads that failed over because an owner holds no data for the shard (a rebalance backfill that has not caught up, or a lagging membership view); a sustained rate means the ring and the data disagree |
 | `wal.appends` / `wal.fsyncs` / `wal.rotations` | — | WAL activity |
+| `parts.total` / `parts.sealed` / `parts.merge_backlog` / `parts.merge_candidates` / `merge.cap_bytes` | `signal` | gauges: the merge selector's view of the parts, published once per maintenance cycle, summed over this node's tenants (`cap_bytes` is the largest threshold in effect, not a sum — it is a threshold, not a quantity). `merge_backlog` flat with `merge_candidates` pinned at 0 is the stuck engine above. Per-tenant detail is `Inspect`, which needs no meter |
 
 Tracing emits coarse spans (`engine.flush`, `engine.merge`, `engine.fetch`, backend ops, cluster
 RPCs) with W3C trace-context propagation across the cluster transport. Logs are context-plumbed via
@@ -184,6 +205,12 @@ Imperative operator control, complementing the background maintenance loop (it h
 - `Compact(ctx, key, signal)` — merge a signal's parts now, applying the tenant's resolved policy
   (retention cutoff, plus downsampling/recompression/precision for metrics). The same merge engine
   the loop runs — no parallel path.
+- `CompactNow(ctx, key, signal)` — compact even when the selector would decline: the escape from the
+  fixed point above (`MergeBacklog > 0`, `MergeCandidates == 0`), which `Compact`/`MaintainNow`
+  cannot break because a cycle that selects nothing is a no-op. It overrides the **selection
+  heuristic only** — the seal threshold, the run's cumulative-bytes cap and the merge memory bound
+  still apply, so a forced merge reads, writes and holds no more than a background one, and never
+  takes a sealed part. One call compacts one group; call it again to make further progress.
 - `Retention(ctx, key)` — compact every signal for a tenant (drops parts past the policy cutoff).
 - `PruneIdentities(ctx, key) (int, error)` — drop the identities retention left without data across
   **every** of a tenant/shard's signals and report how many went in total. The background loop does
@@ -204,7 +231,7 @@ when a flush, merge, or drop changes the part set (or the budget itself moves), 
 follows an idle one does no part enumeration at all. Erasure-coding a part rewrites its stored bytes
 under the same identity, so the converter drops the tenant's memo.
 
-In **cluster mode**, `Flush`/`Compact` act only on shards this node is the ring-primary of, returning
+In **cluster mode**, `Flush`/`Compact`/`CompactNow` act only on shards this node is the ring-primary of, returning
 `ErrNotOwner` otherwise — so a shard's parts are still written by exactly one node, the invariant the
 maintenance loop preserves. Single-node owns everything.
 

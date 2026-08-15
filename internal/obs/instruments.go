@@ -90,6 +90,31 @@ func (m *Merge) Record(ctx context.Context, sig string, dur time.Duration, parts
 	}
 }
 
+// Parts reports the merge selector's view of a signal's flushed parts as gauges: how many parts
+// there are, how many are sealed (no merge will reconsider them), how many a merge may still take,
+// how many the next merge would select, and the seal threshold in effect. Gauges rather than a log
+// line because the question they answer — is compaction ever going to reduce this part count? — is
+// asked of a dashboard over time, not of one cycle.
+type Parts struct {
+	total      metric.Int64Gauge
+	sealed     metric.Int64Gauge
+	backlog    metric.Int64Gauge
+	candidates metric.Int64Gauge
+	capBytes   metric.Int64Gauge
+}
+
+// Record publishes one signal's part shape, summed over the tenants this node holds. The values are
+// tagged by signal only: tenant ids are unbounded, and [storage.Storage.Inspect] is the per-tenant
+// surface.
+func (p *Parts) Record(ctx context.Context, sig string, total, sealed, backlog, candidates, capBytes int64) {
+	a := sigAttr(sig)
+	p.total.Record(ctx, total, a)
+	p.sealed.Record(ctx, sealed, a)
+	p.backlog.Record(ctx, backlog, a)
+	p.candidates.Record(ctx, candidates, a)
+	p.capBytes.Record(ctx, capBytes, a)
+}
+
 // Fetch instruments a fetch over the head ∪ parts.
 type Fetch struct {
 	total        metric.Int64Counter
@@ -218,6 +243,30 @@ func newWAL(m metric.Meter) (*WAL, error) {
 	}
 
 	return w, b.err
+}
+
+func (b *imb) gauge(name, desc, unit string) metric.Int64Gauge {
+	if b.err != nil {
+		return nil
+	}
+
+	g, err := b.m.Int64Gauge(name, metric.WithDescription(desc), metric.WithUnit(unit))
+	b.err = err
+
+	return g
+}
+
+func newParts(m metric.Meter) (*Parts, error) {
+	b := &imb{m: m}
+	p := &Parts{
+		total:      b.gauge("storage.parts.total", "flushed immutable parts", "{part}"),
+		sealed:     b.gauge("storage.parts.sealed", "parts at the merge cap, which no merge reconsiders", "{part}"),
+		backlog:    b.gauge("storage.parts.merge_backlog", "unsealed parts a merge may still take", "{part}"),
+		candidates: b.gauge("storage.parts.merge_candidates", "parts the next merge would select", "{part}"),
+		capBytes:   b.gauge("storage.merge.cap_bytes", "seal threshold in effect for a merged part", "By"),
+	}
+
+	return p, b.err
 }
 
 func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {

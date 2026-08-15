@@ -22,9 +22,9 @@ func findTenant(ss StoreStats, tid signal.TenantID) (TenantStats, bool) {
 }
 
 func findSignal(ts TenantStats, sig signal.Signal) (SignalStats, bool) {
-	for _, s := range ts.Signals {
-		if s.Signal == sig {
-			return s, true
+	for i := range ts.Signals {
+		if ts.Signals[i].Signal == sig {
+			return ts.Signals[i], true
 		}
 	}
 

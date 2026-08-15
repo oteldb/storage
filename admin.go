@@ -68,6 +68,49 @@ func (a Admin) Compact(ctx context.Context, key signal.TenantID, sig signal.Sign
 	return fn(ctx)
 }
 
+// CompactNow compacts a tenant/shard's parts for one signal even when the selector would decline —
+// the escape from the fixed point where parts remain mergeable ([SignalStats.MergeBacklog] > 0) but
+// none of them qualify ([SignalStats.MergeCandidates] == 0), which a plain [Admin.Compact] or
+// [Admin.MaintainNow] cannot break because a cycle that selects nothing is a no-op.
+//
+// It is the same merge, with the *selection heuristic* overridden and nothing else: the seal
+// threshold, the cumulative-bytes cap and the merge memory bound still apply, so a forced compaction
+// reads, writes and holds no more than a background one. One call compacts one group; call it again
+// to make further progress. No-op when nothing is ingested for the key+signal; [ErrNotOwner] in
+// cluster mode unless this node is the shard's ring-primary.
+func (a Admin) CompactNow(ctx context.Context, key signal.TenantID, sig signal.Signal) error {
+	if a.s.closed.Load() {
+		return errors.Wrap(ErrClosed, "admin compact now")
+	}
+
+	if err := a.s.adminOwns(key); err != nil {
+		return err
+	}
+
+	norm := a.s.normalizeTenant(key)
+
+	if sig == signal.Metric {
+		eng, ok := a.s.lookupEngine(norm)
+		if !ok {
+			return nil
+		}
+
+		opts := a.s.metricMergeOptions(key, a.s.sizeCutoffFor(ctx, tenantOfShard(key)))
+		opts.Force = true
+
+		return eng.MergeWith(ctx, opts)
+	}
+
+	eng, ok := a.s.lookupRecordEngine(sig, norm)
+	if !ok {
+		return nil
+	}
+
+	cutoff := a.s.retainFrom(key, a.s.sizeCutoffFor(ctx, tenantOfShard(key)))
+
+	return eng.MergeWith(ctx, recordengine.MergeOptions{RetainFrom: cutoff, Force: true})
+}
+
 // Retention forces a retention sweep across all of a tenant/shard's signals by compacting each
 // (a merge drops parts older than the policy's cutoff). Signals this node does not own are skipped.
 func (a Admin) Retention(ctx context.Context, key signal.TenantID) error {
