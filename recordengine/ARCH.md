@@ -295,6 +295,31 @@ Conditions over a non-fixed column are per-record **attributes**, resolved by th
   union a plain dedup with no id remap), and **restored** into the accumulator when a flush fails.
   Profiles' symbol store is the first user; nil for logs/traces.
 
+## Cost attribution
+
+`Engine.StreamCost` (`streamcost.go`) attributes the live parts to streams — or to a label's values
+— with rows, decoded bytes, an apportioned compressed share, and per-column distinct estimates. Two
+decisions shape it:
+
+- **It reads, it does not accumulate.** Every input exists at write time, so accumulating it there
+  looks free — it is not. Measured on real log bodies, the per-row work (one value hash, the digit
+  collapse, one collapsed hash) costs 350 ns/row against a 2288 ns/row record merge: **+15% on the
+  merge**, for one column, where bloom construction already takes ~21%. A write-time figure would
+  also have to be *persisted* to survive a restart or describe parts this process did not write,
+  which means a new sidecar and a format addition. Reading instead makes the report a decode the
+  operator pays for once, on data of any age, and leaves flush and merge byte-for-byte unchanged.
+- **Only byte columns are decoded.** An int column's rows are a fixed width, so its raw share
+  follows from the row ranges alone; the same is true of the implicit ts and stream columns. The
+  `(stream, ts)` sort order is what makes the whole pass tractable: a stream is one contiguous run,
+  so the row ranges and the columns' compression frames (`block.ColumnReader.Frames`) both tile
+  `[0, rows)` and one merged walk covers them.
+
+`DiskBytes` is an estimate and says so: a frame's compressed size is split across the streams whose
+rows it holds by their raw-byte share, because compression is per column per frame and the frame is
+the floor of what is separable. Distinct counts reuse `bloom.Sketch` — the same estimator the bloom
+builder sizes its filters with, not a second one — held one pair per group for one column at a time
+and bounded by `MaxSketchGroups`, so the sketch state is a budget rather than groups × columns.
+
 ## WAL & cluster
 
 The WAL frame is signal-agnostic (an opaque engine-encoded payload) plus an optional side frame;

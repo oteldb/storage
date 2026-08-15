@@ -57,6 +57,14 @@ The frame-packed directory is marked `flagFramed`; the older one-compressed-bloc
 layout has `flagBlocked` without it and is still read, so parts written before framing need no
 rewrite. The writer only emits the framed form.
 
+`ColumnReader.Frames` exposes that map — each frame's row span and compressed size — for a caller
+attributing a column's *compressed* bytes to a subset of its rows. The frame is the floor: nothing
+below it is separable, since the entropy coder shares state across the whole frame, so a per-row
+attribution is necessarily an apportionment of a frame (see `StreamCosts` in `ADMIN.md`). An
+unframed or constant column reports one extent covering every row, so the caller needs no special
+case; the extents' bytes sum to less than `ObjectBytes` by the directory and any shared dictionary,
+which belong to no single frame.
+
 ## Two writers
 
 `PartWriter` takes whole columns and serializes them in one pass. `StreamWriter` builds the same

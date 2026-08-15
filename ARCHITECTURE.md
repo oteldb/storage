@@ -72,7 +72,7 @@ engines over the fetch seam (`query/fetch`).
 - **Maintenance** — one background loop flushes+merges every (tenant, signal) engine on
   `FlushInterval`, concurrently under a bound, ordered by head pressure. A head-bytes
   threshold pokes it early. A durable store always runs it (an unbounded head OOMs).
-- **Operator surface** — `Inspect`, `Admin`, `Parts`/`PartsDetailed`/`Cardinality`,
+- **Operator surface** — `Inspect`, `Admin`, `Parts`/`PartsDetailed`/`Cardinality`/`StreamCosts`,
   `AdmissionStats`. See `ADMIN.md`.
 - **Policy** — `tenant.Policy` (limits, retention, downsample, sampling, recompress,
   precision, durability/EC) resolved per tenant id through a consumer-supplied `Resolver`.

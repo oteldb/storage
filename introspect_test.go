@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -100,6 +101,64 @@ func TestStorageIntrospectLogs(t *testing.T) {
 	assert.Positive(t, ds[0].Bytes)
 	assert.GreaterOrEqual(t, ds[0].Chunks, 1)
 	assert.NotEmpty(t, ds[0].Columns)
+}
+
+func TestStorageStreamCosts(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := InMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close(ctx) })
+
+	tmpl := make([][3]any, 0, 200)
+	for i := range 200 {
+		tmpl = append(tmpl, [3]any{100 + i, 9, fmt.Sprintf("reconciling pvc-%d at 10:00:%02d", i, i%60)})
+	}
+
+	_, err = s.WriteLogs(ctx, logBatch("klog", tmpl...))
+	require.NoError(t, err)
+	_, err = s.WriteLogs(ctx, logBatch("web", [3]any{100, 9, "GET / 200"}))
+	require.NoError(t, err)
+
+	// Metrics carry no per-record columns to attribute.
+	_, err = s.StreamCosts(ctx, "default", signal.Metric, StreamCostOptions{})
+	require.Error(t, err)
+
+	// A signal with no engine for the tenant is an empty, non-error result.
+	none, err := s.StreamCosts(ctx, "default", signal.Trace, StreamCostOptions{})
+	require.NoError(t, err)
+	assert.Nil(t, none)
+
+	require.NoError(t, s.Admin().Flush(ctx, "default", signal.Log))
+
+	cs, err := s.StreamCosts(ctx, "", signal.Log, StreamCostOptions{GroupBy: "service.name"})
+	require.NoError(t, err)
+	require.Len(t, cs, 2)
+
+	top := cs[0]
+	assert.Equal(t, "klog", top.Key)
+	assert.Equal(t, int64(200), top.Rows)
+	assert.Equal(t, 1, top.Streams)
+	assert.Positive(t, top.RawBytes)
+	assert.Positive(t, top.DiskBytes)
+	require.True(t, top.DistinctEstimated)
+
+	var body ColumnCost
+
+	for _, c := range top.Columns {
+		if c.Name == "body" {
+			body = c
+		}
+	}
+
+	require.Equal(t, "body", body.Name)
+	assert.InEpsilon(t, 200.0, float64(body.Distinct), 0.1, "every line differs")
+	assert.LessOrEqual(t, body.DistinctNormalized, int64(4), "one template behind the digits")
+
+	require.NoError(t, s.Close(ctx))
+	_, err = s.StreamCosts(ctx, "default", signal.Log, StreamCostOptions{})
+	assert.ErrorIs(t, err, ErrClosed)
 }
 
 func TestStorageCardinality(t *testing.T) {
