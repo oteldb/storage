@@ -85,6 +85,52 @@ Part *byte* sizes are intentionally omitted from `Inspect` (they would need back
   symbols), and `TopLabelNames` (the top-N label names by series count, each with `Series` and
   `DistinctValues`). `topN ≤ 0` returns every label name. Computed from the head's inverted index
   (which spans head ∪ flushed series); no backend I/O.
+- **`StreamCosts(ctx, tenant, signal, StreamCostOptions) ([]StreamCost, error)`** (`introspect.go`,
+  record signals only) — the "**which service is costing me, and why**" drill-down: the flushed
+  parts attributed to streams, or (with `GroupBy`, e.g. `service.name`) to a label's values.
+  `Cardinality` reports *label* cardinality and `PartsDetailed` reports *per-part* layout; neither
+  attributes bytes to a stream, nor says anything about the cardinality of the values inside
+  `body`/`attrs`, which is what drives the cost. Per group: `Streams`, `Rows`, `RawBytes`,
+  `DiskBytes`, and per column `RawBytes` / `DiskBytes` / `Distinct` / `DistinctNormalized`. Sorted
+  by `RawBytes` descending; `TopN` truncates. Errors for `signal.Metric` (no per-record columns);
+  returns nil for a tenant with no engine.
+
+  - **`DistinctNormalized` is the field to read first.** It is `Distinct` over values with every run
+    of ASCII digits collapsed to `#`. A group whose `Distinct` is large and whose
+    `DistinctNormalized` is tiny is *mis-parsed at the source*, not expensive by nature — one
+    templated line with an embedded timestamp or id, never turned into fields. On a real corpus one
+    service read as 4,564,470 distinct bodies and 184 normalized templates: nothing to fix in
+    storage, everything to fix in the pipeline. Both are HyperLogLog estimates from the same sketch
+    the bloom builder uses to size its filters; measured against exact counts on that service's
+    4,513,535 distinct bodies the estimate was **−2.4%**, and on its 184 templates **−0.5%**.
+    `RawBytes` is not an estimate — it matched the exact byte count to the byte.
+  - **`DiskBytes` is APPROXIMATE, by construction.** Compression is per column per frame and a frame
+    spans whatever streams its rows fall in, so a stream's compressed footprint is not directly
+    measurable — an exact number would mean compressing each stream separately, which would cost
+    most of the ratio. Each frame's compressed size is apportioned across the groups holding its
+    rows by their raw-byte share. Rows are `(stream, ts)`-ordered, so most frames hold one stream
+    and the estimate is close; a group narrower than one frame is where it is not. `RawBytes` (the
+    decoded footprint) is exact.
+  - **Cost.** This is the heaviest introspection call in the library: every accounted byte column of
+    every live part is read and decoded once (int columns and the timestamp are accounted
+    arithmetically — a row is a fixed width there — so they cost nothing). It runs on operator
+    demand, never on a schedule, and `Columns` narrows the decode to the columns in question.
+    Nothing is accumulated on the ingest or merge path, deliberately: measured on real log bodies
+    the per-row sketch work costs 350 ns against a 2288 ns/row record merge — **+15% on the merge,
+    for one column**, on top of the ~21% bloom construction already takes. The trade is that the report costs a
+    scan, and that it covers **flushed parts only** — the head holds no compressed bytes to
+    attribute. Measured on a real 303M-row / 135 GiB-decoded log store (665 parts, 2256 services):
+    **2m58s single-threaded**, ~8 GiB resident.
+  - **Distinct estimates are budgeted.** `MaxSketchGroups` (default 4096, 8 KiB of sketch per group)
+    bounds how many groups carry them; the budget goes to the groups with the most rows, which is
+    free to rank because row counts come from the parts' in-memory row-range index. A group outside
+    it reports `DistinctEstimated == false` and full byte attribution — the counts are absent, not
+    zero. The cap is there for the pathological case (grouping a million-stream store by raw stream
+    id), not to ration memory: a real corpus grouped by a pod-suffixed `service.name` yielded 2256
+    groups, 18 MiB of sketch, against the ~8 GiB the decode itself holds.
+  - Grouping by label rather than by stream id is the intended use: what an operator can act on is a
+    service, and stream identity is a field policy that can change under them. An empty `GroupBy`
+    groups by stream id (32 hex digits); a stream lacking the label lands in the empty key.
 - **`EfficiencyStats(ctx) ([]TenantEfficiency, error)`** (`efficiency.go`) — the capacity/
   efficiency view: per `(tenant, signal)`, `Series`, `Parts`, `Points` (samples/records),
   `StoredBytes` (this node's on-disk footprint — under erasure coding with slot filtering that is

@@ -65,6 +65,54 @@ type LabelCardinality struct {
 	DistinctValues int
 }
 
+// StreamCostOptions selects what [Storage.StreamCosts] attributes and how much of it to estimate.
+type StreamCostOptions struct {
+	// GroupBy is the stream label (a resource or scope attribute name, e.g. "service.name") whose
+	// value keys the report. Empty groups by raw stream id.
+	GroupBy string
+	// Columns restricts the byte columns that are decoded and attributed (nil ⇒ every byte column).
+	Columns []string
+	// TopN keeps only the N costliest groups by RawBytes (≤0 ⇒ every group).
+	TopN int
+	// MaxSketchGroups bounds how many groups carry distinct estimates (≤0 ⇒ the engine default of
+	// 4096). The budget goes to the groups with the most rows.
+	MaxSketchGroups int
+}
+
+// StreamCost is one group's (one label value's, or one stream's) share of a record signal's storage:
+// the per-service cost attribution that [Storage.Cardinality] (label cardinality) and
+// [Storage.PartsDetailed] (per-part layout) cannot give. See [Storage.StreamCosts].
+type StreamCost struct {
+	Key     string // the GroupBy label's value, or the stream id; empty ⇒ the label is absent
+	Streams int    // distinct streams folded into this group
+	Rows    int64
+	// RawBytes is the decoded footprint of the group's rows over the accounted columns.
+	RawBytes int64
+	// DiskBytes is APPROXIMATE: compression is per column per frame and a frame spans whatever
+	// streams its rows fall in, so each frame's compressed size is apportioned across the groups
+	// holding its rows by their raw-byte share.
+	DiskBytes int64
+	// DistinctEstimated reports whether the per-column distinct counts were computed for this group
+	// (see [StreamCostOptions.MaxSketchGroups]). False ⇒ they are 0 because they were not measured.
+	DistinctEstimated bool
+	Columns           []ColumnCost
+}
+
+// ColumnCost is one column's share of a [StreamCost].
+type ColumnCost struct {
+	Name      string
+	RawBytes  int64
+	DiskBytes int64 // approximate, as [StreamCost.DiskBytes]
+	// Distinct estimates the distinct values the group's rows hold in this column (HyperLogLog,
+	// ~1.6% standard error). 0 for an int column and for a group outside the sketch budget.
+	Distinct int64
+	// DistinctNormalized is Distinct over values with every run of ASCII digits collapsed to '#'.
+	// A group whose Distinct is large and whose DistinctNormalized is tiny is mis-parsed at the
+	// source — one templated line with an embedded timestamp or id, never turned into fields — which
+	// is a fixable diagnosis rather than a number to stare at.
+	DistinctNormalized int64
+}
+
 // Parts returns an in-memory snapshot of a (tenant, signal) engine's flushed parts. It does no
 // backend I/O and decodes nothing — safe to poll at dashboard cadence — and returns nil when the
 // tenant has no engine for the signal. For byte sizes, codecs, and chunk counts, use
@@ -125,6 +173,63 @@ func (s *Storage) PartsDetailed(ctx context.Context, tenant signal.TenantID, sig
 	}
 
 	return recordPartDetails(ds), nil
+}
+
+// StreamCosts attributes a record signal's flushed parts to streams — or, with
+// [StreamCostOptions.GroupBy], to a label's values: rows, decoded bytes, an approximate compressed
+// share, and per-column distinct estimates. It is the "which service is costing me, and why"
+// drill-down.
+//
+// It is the heaviest introspection call in the library: every accounted byte column of every live
+// part is read and decoded once. Run it on operator demand, not on a schedule, and narrow it with
+// [StreamCostOptions.Columns] when only one column is in question. It returns nil (no error) when
+// the tenant has no engine for the signal, and an error for [signal.Metric], whose samples carry no
+// per-record columns to attribute (use [Storage.Cardinality] there).
+func (s *Storage) StreamCosts(
+	ctx context.Context, tenant signal.TenantID, sig signal.Signal, opts StreamCostOptions,
+) ([]StreamCost, error) {
+	if s.closed.Load() {
+		return nil, errors.Wrap(ErrClosed, "stream costs")
+	}
+
+	if sig == signal.Metric {
+		return nil, errors.New("stream costs: metrics have no per-record columns to attribute")
+	}
+
+	eng, ok := s.lookupRecordEngine(sig, s.normalizeTenant(tenant))
+	if !ok {
+		return nil, nil
+	}
+
+	cs, err := eng.StreamCost(ctx, recordengine.StreamCostOptions{
+		GroupBy: opts.GroupBy, Columns: opts.Columns, TopN: opts.TopN, MaxSketchGroups: opts.MaxSketchGroups,
+	})
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s stream costs", sig)
+	}
+
+	return recordStreamCosts(cs), nil
+}
+
+func recordStreamCosts(cs []recordengine.StreamCostStat) []StreamCost {
+	out := make([]StreamCost, len(cs))
+
+	for i, c := range cs {
+		cols := make([]ColumnCost, len(c.Columns))
+		for j, cc := range c.Columns {
+			cols[j] = ColumnCost{
+				Name: cc.Name, RawBytes: cc.RawBytes, DiskBytes: cc.DiskBytes,
+				Distinct: cc.Distinct, DistinctNormalized: cc.DistinctNormalized,
+			}
+		}
+
+		out[i] = StreamCost{
+			Key: c.Key, Streams: c.Streams, Rows: c.Rows, RawBytes: c.RawBytes, DiskBytes: c.DiskBytes,
+			DistinctEstimated: c.DistinctEstimated, Columns: cols,
+		}
+	}
+
+	return out
 }
 
 // Cardinality summarizes a (tenant, signal) engine's label cardinality. topN bounds the returned
