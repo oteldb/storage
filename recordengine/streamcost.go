@@ -164,51 +164,79 @@ func (e *Engine) StreamCost(ctx context.Context, opts StreamCostOptions) ([]Stre
 }
 
 // streamCostPlan snapshots the live parts (ref-held) and resolves every stream they hold to its
-// group, under one read lock. Row counts come from the parts' in-memory row-range index, so the
-// group set and its row counts are known before anything is decoded — which is what lets the sketch
-// budget go to the groups that matter.
+// group. Row counts come from the parts' in-memory row-range index, so the group set and its row
+// counts are known before anything is decoded — which is what lets the sketch budget go to the
+// groups that matter.
+//
+// Resolution takes the read lock once per part rather than once for the whole plan: the work is
+// proportional to the store's total stream count, so a single lock would stall the maintenance loop
+// for as long as that takes (102 ms at 337k streams, and it grows linearly). Sorting happens off
+// lock. An identity pruned between two parts falls back to the stream id, which
+// [Engine.groupKeyLocked] already does for identities retention has dropped.
 func (e *Engine) streamCostPlan(opts StreamCostOptions) (parts []*part, spans [][]streamSpan, groups []costGroup) {
+	parts = e.acquireParts()
+
+	pl := costPlanner{e: e, byKey: make(map[string]int), groupBy: []byte(opts.GroupBy)}
+	spans = make([][]streamSpan, len(parts))
+
+	for pi, p := range parts {
+		ss := pl.planPart(p)
+
+		slices.SortFunc(ss, func(a, b streamSpan) int { return cmp.Compare(a.start, b.start) })
+		spans[pi] = ss
+	}
+
+	return parts, spans, pl.groups
+}
+
+// acquireParts snapshots the live parts and ref-holds each, so a concurrent merge cannot reclaim one
+// mid-read.
+func (e *Engine) acquireParts() []*part {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	parts = make([]*part, len(e.parts))
+	parts := make([]*part, len(e.parts))
 	copy(parts, e.parts)
 
 	for _, p := range parts {
 		p.acquire()
 	}
 
-	byKey := make(map[string]int)
-	spans = make([][]streamSpan, len(parts))
+	return parts
+}
 
-	var keyBuf []byte
+// costPlanner carries the group set across per-part resolutions.
+type costPlanner struct {
+	e       *Engine
+	byKey   map[string]int
+	groups  []costGroup
+	keyBuf  []byte
+	groupBy []byte
+}
 
-	groupBy := []byte(opts.GroupBy)
+func (pl *costPlanner) planPart(p *part) []streamSpan {
+	pl.e.mu.RLock()
+	defer pl.e.mu.RUnlock()
 
-	for pi, p := range parts {
-		ss := make([]streamSpan, 0, len(p.ranges))
+	ss := make([]streamSpan, 0, len(p.ranges))
 
-		for id, r := range p.ranges {
-			keyBuf = e.groupKeyLocked(keyBuf[:0], id, groupBy)
+	for id, r := range p.ranges {
+		pl.keyBuf = pl.e.groupKeyLocked(pl.keyBuf[:0], id, pl.groupBy)
 
-			gi, ok := byKey[string(keyBuf)]
-			if !ok {
-				gi = len(groups)
-				byKey[string(keyBuf)] = gi
-				groups = append(groups, costGroup{key: string(keyBuf)})
-			}
-
-			groups[gi].streams++
-			groups[gi].rows += int64(r.end - r.start)
-
-			ss = append(ss, streamSpan{rowRange: r, group: gi})
+		gi, ok := pl.byKey[string(pl.keyBuf)]
+		if !ok {
+			gi = len(pl.groups)
+			pl.byKey[string(pl.keyBuf)] = gi
+			pl.groups = append(pl.groups, costGroup{key: string(pl.keyBuf)})
 		}
 
-		slices.SortFunc(ss, func(a, b streamSpan) int { return cmp.Compare(a.start, b.start) })
-		spans[pi] = ss
+		pl.groups[gi].streams++
+		pl.groups[gi].rows += int64(r.end - r.start)
+
+		ss = append(ss, streamSpan{rowRange: r, group: gi})
 	}
 
-	return parts, spans, groups
+	return ss
 }
 
 // groupKeyLocked renders the stream's grouping key into dst: the named resource/scope attribute's

@@ -298,8 +298,8 @@ Conditions over a non-fixed column are per-record **attributes**, resolved by th
 ## Cost attribution
 
 `Engine.StreamCost` (`streamcost.go`) attributes the live parts to streams — or to a label's values
-— with rows, decoded bytes, an apportioned compressed share, and per-column distinct estimates. Two
-decisions shape it:
+— with rows, decoded bytes, an apportioned compressed share, and per-column distinct estimates.
+Three decisions shape it:
 
 - **It reads, it does not accumulate.** Every input exists at write time, so accumulating it there
   looks free — it is not. Measured on real log bodies, the per-row work (one value hash, the digit
@@ -313,6 +313,10 @@ decisions shape it:
   `(stream, ts)` sort order is what makes the whole pass tractable: a stream is one contiguous run,
   so the row ranges and the columns' compression frames (`block.ColumnReader.Frames`) both tile
   `[0, rows)` and one merged walk covers them.
+- **The plan locks per part, not once.** Resolving streams to groups is proportional to the store's
+  total stream count, so one lock over the whole plan stalls writers for as long as that takes
+  (102 ms at 337k streams, growing linearly); per part it is 1.7 ms. Sorting happens off lock, and an
+  identity pruned mid-plan falls back to the stream id, as it already does after a retention prune.
 
 `DiskBytes` is an estimate and says so: a frame's compressed size is split across the streams whose
 rows it holds by their raw-byte share, because compression is per column per frame and the frame is
