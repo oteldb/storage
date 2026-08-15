@@ -204,26 +204,7 @@ func buildColumn(c Column, comp *compress.Compressor, blockRows, compressBytes i
 	}
 
 	if c.Block {
-		desc.Blocked, desc.Framed = true, true
-
-		// A dictionary bytes column tries the shared dictionary first: per-granule dictionaries lose
-		// every repeat that crosses a granule boundary, which is most of them for a column of
-		// repeating blobs. It declines when no granule repeats enough to benefit, leaving a
-		// near-unique column on the per-granule path with no dictionary header to carry.
-		if obj, ok, err := trySharedDict(c, codec, comp, blockRows, compressBytes); err != nil {
-			return ColumnDesc{}, nil, err
-		} else if ok {
-			desc.SharedDict = true
-
-			return desc, obj, nil
-		}
-
-		obj, err := encodeBlocked(c, codec, budget, comp, blockRows, compressBytes)
-		if err != nil {
-			return ColumnDesc{}, nil, err
-		}
-
-		return desc, obj, nil
+		return buildFramedColumn(c, desc, codec, budget, comp, blockRows, compressBytes)
 	}
 
 	stream, err := encodeStream(c, codec)
@@ -971,4 +952,53 @@ func (r *ColumnReader) stream() ([]byte, error) {
 	}
 
 	return out, nil
+}
+
+// buildFramedColumn encodes a column that asked for block framing, granting it only where it pays.
+//
+// A dictionary bytes column tries the shared dictionary first: per-granule dictionaries lose every
+// repeat that crosses a granule boundary, which is most of them for a column of repeating blobs. It
+// declines when no granule repeats enough to benefit — which is the same thing as saying the values
+// are near-unique, and framing a near-unique bytes column is a net loss. Measured on a 200k-row
+// column, a *whole*-column decode of the framed form costs ~2.5x the time and ~2.9x the allocations
+// of the single-stream form (8.63ms / 26.1MB against 3.40ms / 9.08MB), because every granule carries
+// and rebuilds its own dictionary. A pruned read would have to skip most of the column just to break
+// even, and the queries that reach these columns — a trace id, a span attribute — are exactly the
+// ones with no time window to prune by.
+//
+// So such a column is written as a single stream instead. A part then mixes framed and unframed
+// columns, which the reader has always handled: that is how a part written before framing reads.
+func buildFramedColumn(
+	c Column, desc ColumnDesc, codec chunk.Codec, budget uint8,
+	comp *compress.Compressor, blockRows, compressBytes int,
+) (ColumnDesc, []byte, error) {
+	// [CodecBytesRaw] has no dictionary to decline and is cheap to frame, so it always frames.
+	if c.Kind == KindBytes && codec == chunk.CodecDict {
+		obj, ok, err := trySharedDict(c, codec, comp, blockRows, compressBytes)
+		if err != nil {
+			return ColumnDesc{}, nil, err
+		}
+
+		if ok {
+			desc.Blocked, desc.Framed, desc.SharedDict = true, true, true
+
+			return desc, obj, nil
+		}
+
+		stream, err := encodeStream(c, codec)
+		if err != nil {
+			return ColumnDesc{}, nil, err
+		}
+
+		return desc, comp.Compress(nil, stream), nil
+	}
+
+	desc.Blocked, desc.Framed = true, true
+
+	obj, err := encodeBlocked(c, codec, budget, comp, blockRows, compressBytes)
+	if err != nil {
+		return ColumnDesc{}, nil, err
+	}
+
+	return desc, obj, nil
 }

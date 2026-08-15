@@ -12,18 +12,35 @@ import (
 	"github.com/oteldb/storage/encoding/chunk"
 )
 
-// bytesColumn builds a block-framed bytes column from vals and returns its reader.
+// bytesColumn builds a block-framed bytes column, trying the shared dictionary first and falling back
+// to per-granule encoding — the framed layout in full.
+//
+// It does not go through [buildColumn], because buildColumn no longer frames every column it is asked
+// to: a near-unique dictionary column is written as a single stream instead, since framing one decodes
+// ~2.5× slower and allocates ~2.9× more (see the gate there, and
+// [TestBuildColumnSkipsFramingWhenItDoesNotPay] for the policy). The tests in this file are about the
+// framed *decode* paths, which every part written before that gate still uses, so they construct the
+// framed layout directly rather than asking for it and getting a policy decision.
 func bytesColumn(t *testing.T, vals [][]byte, codec chunk.Codec, granule int) *ColumnReader {
 	t.Helper()
 
-	desc, obj, err := buildColumn(
-		Column{Name: "c", Kind: KindBytes, Codec: codec, Bytes: vals, Block: true},
-		noneComp(), granule, defaultCompressBlockBytes,
-	)
+	c := Column{Name: "c", Kind: KindBytes, Codec: codec, Bytes: vals, Block: true}
+	desc := ColumnDesc{
+		Name: "c", Kind: KindBytes, Codec: codec,
+		Compress: noneComp().Algorithm(), Blocked: true, Framed: true,
+	}
+
+	obj, ok, err := trySharedDict(c, codec, noneComp(), granule, defaultCompressBlockBytes)
 	require.NoError(t, err)
-	// A single-valued column is stored as a constant in the manifest and never framed; every other
-	// shape must be block-framed.
-	require.True(t, desc.Blocked || desc.Const, "the column must be block-framed or constant")
+
+	if ok {
+		desc.SharedDict = true
+
+		return newColumnReader(desc, obj, noneComp(), len(vals))
+	}
+
+	obj, err = encodeBlocked(c, codec, 0, noneComp(), granule, defaultCompressBlockBytes)
+	require.NoError(t, err)
 
 	return newColumnReader(desc, obj, noneComp(), len(vals))
 }
@@ -437,5 +454,47 @@ func TestBlockedBytesScatterMatchesFullDecode(t *testing.T) {
 
 	for i := range full.Len() {
 		assert.Equal(t, full.At(i), scattered.At(i), "row %d", i)
+	}
+}
+
+// TestBuildColumnSkipsFramingWhenItDoesNotPay pins the write-time policy. Framing is what lets a
+// windowed query decode a fraction of a column, and on a low-cardinality column it is free — the
+// shared dictionary is written once and each granule carries only ids. On a near-unique column it is
+// not: every granule has to carry and rebuild its own dictionary, and a *whole*-column decode (which
+// is what a query with no time window does — a trace id, a span attribute) then costs ~2.5x the time
+// and ~2.9x the allocations of a single stream.
+//
+// The shared dictionary declining is exactly that signal, and the writer already computes it, so the
+// column is framed only when it will pay. A part therefore mixes framed and unframed columns, which
+// the reader has always had to handle for parts written before framing existed.
+func TestBuildColumnSkipsFramingWhenItDoesNotPay(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name     string
+		vals     [][]byte
+		codec    chunk.Codec
+		wantFrmd bool
+	}{
+		{"low cardinality dict frames", repeatVals(50_000, 64), chunk.CodecDict, true},
+		{"near unique dict does not", uniqueVals(50_000), chunk.CodecDict, false},
+		{"raw always frames", uniqueVals(50_000), chunk.CodecBytesRaw, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			desc, obj, err := buildColumn(
+				Column{Name: "c", Kind: KindBytes, Codec: tt.codec, Bytes: tt.vals, Block: true},
+				zstdComp(), 8192, defaultCompressBlockBytes,
+			)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantFrmd, desc.Blocked, "framing decision")
+			assert.Equal(t, tt.wantFrmd, desc.Framed, "Framed must track Blocked")
+
+			// Whichever shape it picked, the column must read back identically.
+			got, err := newColumnReader(desc, obj, zstdComp(), len(tt.vals)).Bytes()
+			require.NoError(t, err)
+			assert.Equal(t, tt.vals, gather(t, got))
+		})
 	}
 }

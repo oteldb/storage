@@ -37,13 +37,42 @@ func logicalBytes(vals [][]byte) int64 {
 	return n
 }
 
+// benchColumn builds the column in the requested layout. When blocked, it constructs the framed form
+// directly rather than going through [buildColumn], which grants framing only where it pays and would
+// otherwise hand back a single stream for the near-unique shapes below — leaving the benchmark
+// comparing a column against itself and the pruned cases with no granules to select. Forcing it is
+// what keeps the trade-off this file exists to measure visible.
 func benchColumn(b *testing.B, vals [][]byte, blocked bool, granule int) *ColumnReader {
 	b.Helper()
 
-	desc, obj, err := buildColumn(
-		Column{Name: "c", Kind: KindBytes, Codec: chunk.CodecDict, Bytes: vals, Block: blocked},
-		zstdComp(), granule, defaultCompressBlockBytes,
-	)
+	c := Column{Name: "c", Kind: KindBytes, Codec: chunk.CodecDict, Bytes: vals, Block: blocked}
+
+	if !blocked {
+		desc, obj, err := buildColumn(c, zstdComp(), granule, defaultCompressBlockBytes)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		return newColumnReader(desc, obj, zstdComp(), len(vals))
+	}
+
+	desc := ColumnDesc{
+		Name: "c", Kind: KindBytes, Codec: chunk.CodecDict,
+		Compress: zstdComp().Algorithm(), Level: zstdComp().Level(), Blocked: true, Framed: true,
+	}
+
+	obj, ok, err := trySharedDict(c, chunk.CodecDict, zstdComp(), granule, defaultCompressBlockBytes)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	if ok {
+		desc.SharedDict = true
+
+		return newColumnReader(desc, obj, zstdComp(), len(vals))
+	}
+
+	obj, err = encodeBlocked(c, chunk.CodecDict, 0, zstdComp(), granule, defaultCompressBlockBytes)
 	if err != nil {
 		b.Fatal(err)
 	}
