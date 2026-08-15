@@ -1,499 +1,514 @@
 # `engine/` — the metrics vertical
 
-One `Engine` per tenant (or per metric shard) ties index, parts and WAL into a working
-ingest+query path. Its structural twin for logs/traces/profiles is
-[`../recordengine/ARCH.md`](../recordengine/ARCH.md); both share the locking discipline below.
+One `Engine` per tenant (or metric shard) ties index, parts and WAL into an ingest+query path. Its
+twin for logs/traces/profiles is [`../recordengine/ARCH.md`](../recordengine/ARCH.md), which shares
+the locking discipline below.
 
 ## Locking discipline (shared with `recordengine`)
 
-**The engine lock is never held across object-store I/O.** Parts are immutable, so every phase
-splits into plan-under-lock → I/O off-lock → publish-under-lock:
+**Invariant: the engine lock is never held across object-store I/O.** Parts are immutable, so every
+phase is `plan under lock → I/O off lock → publish under lock`.
 
-- The `parts` slice is **copy-on-write**, so a reader that snapshots under the lock keeps a stable
-  backing array after releasing it.
-- **Fetch** plans under the read lock (resolve matchers, snapshot + `acquire()` in-window parts,
-  seed from the head), then reads columns lock-free and releases.
-- **Flush/merge** plan under the lock, build the part off the lock, then publish under it —
-  swapping the parts slice *and* committing the small bucket-index + WAL checkpoint together, so
-  the durable watermark stays atomic with part discoverability (exactly-once crash consistency).
-  Only the maintenance loop mutates `parts`, so the swap is single-writer.
-- Retired parts are **refcounted and reclaimed deferred**, so a lock-free fetch never races a
-  delete.
-- A flush **detaches** the head buffers into a `flushing` set that fetches still read, swapped for
-  the part atomically at publish — a record is visible in exactly one of the two, never neither
-  (visibility gap) nor both (double count).
+| element | rule |
+|---|---|
+| `parts` slice | copy-on-write; a snapshot stays valid after unlock |
+| fetch | plans under RLock (matchers, `acquire()`, head seed), then reads lock-free |
+| flush/merge | parts swap, index commit and WAL checkpoint publish atomically |
+| writers | only the maintenance loop mutates `parts` |
+| retired parts | refcounted, reclaimed deferred, so a fetch never races a delete |
+| head detach | detached buffers stay readable via `flushing` until the part lands |
+
+Publishing atomically keeps the durable watermark in step with part discoverability: exactly-once
+crash consistency.
+
+**Invariant:** a record is visible in exactly one of head / `flushing` / part. Never neither
+(visibility gap), never both (double count).
 
 ## Head
 
-In-memory write buffer: the index (`symbols`+`series`+`postings`) plus per-series `(ts, value)`
-append buffers. `OOOWindow` is a **per-series** lateness bound: a sample more than `OOOWindow` behind
-*that series'* own newest admitted sample is rejected (`head.seriesNewest`), so a fast or
-clock-skewed-ahead series cannot shed the slower series sharing the head, and a series' first sample
-is never out of order. The watermarks outlive a flush — samples becoming durable does not reset a
-series' lateness bound. **The series index outlives a flush** (only sample buffers drain), so flushed
-series stay queryable and re-appends don't re-index.
+The index (`symbols`+`series`+`postings`) plus per-series `(ts, value)` buffers.
 
-`AppendBatch` is the hot path: a metric's **precomputed** `SeriesID` + columns + a `materialize`
-callback invoked only on first sight, ingested under a **single lock**. Per sample `appendByID`
-does one map probe — a present buffer means the series is known, so no `signal.Series` is built or
-hashed. WAL frames are grouped by series and written once per batch, not per sample.
+**`OOOWindow` is per-series** (`head.seriesNewest`): a sample more than `OOOWindow` behind *that
+series'* newest admitted sample is rejected, so a fast or clock-skewed series cannot shed the slower
+ones sharing the head, and a first sample is never late. Watermarks outlive a flush.
+
+**The series index outlives a flush** — only sample buffers drain, so flushed series stay queryable
+and re-appends do not re-index.
+
+**`AppendBatch`** takes a precomputed `SeriesID`, columns, and a `materialize` callback used only on
+first sight, under one lock. `appendByID` does one map probe: a present buffer means the series is
+known, so no `signal.Series` is built or hashed. WAL frames group by series, one write a batch.
 
 ## Flush
 
-Drains the head into one flat 3-column part `[series:int128, ts:int64, value:float64]`, one row per
-sample, sorted by `(series, ts)`, under `{tenant}/metrics/{seq}`, together with the part's sidecars —
-the series index (`sidx`), the optional aggregate stats, and the part's **identity object**. It then
-updates the **bucket index** (part list + time bounds). Merge does the same, committing the new part
-set *before* deleting sources.
+Drains the head into one flat part, one row per sample:
+
+```
+{tenant}/metrics/{seq}/
+  columns    [series:int128, ts:int64, value:float64]   sorted by (series, ts)
+  sidx       series index sidecar
+  stats      aggregate stats sidecar        (optional, Config.AggregateStats)
+  identity   this part's series identities  (format in index/identity)
+bucket index (part list + time bounds)      ← written last: the commit point
+```
+
+Merge writes the same shape, committing the new part set before deleting sources.
 
 ### Identity is part-scoped
 
-Each part carries the identities of the series it holds (`{part}/identity`, format in
-`index/identity`), written with the part's other objects and deleted with them. Three properties
-follow, and they are why the whole-set `series.bin` this replaces is gone:
+Each part carries its own series' identities, written and deleted with its other objects. Three
+properties follow, and they are what a whole-set identity object cannot give:
 
-- **Retention is self-cleaning.** Dropping a part drops the identities that named its rows.
-- **A flush persists what it wrote**, not the whole set — 88 B for a flush adding one series to a
-  20k-series tenant, where the old object was re-serialized in full whenever the set changed
-  (~40 B/series interned, against ~218 B/series repeating the label bytes per series).
-- **Every node derives its own live set**, so a replica prunes identity from its own parts with no
-  ownership rule (it reaches the prune through its refresh, since it never merges).
+| property | consequence |
+|---|---|
+| retention self-cleans | dropping a part drops the identities naming its rows |
+| a flush persists only what it wrote | 88 B to add one series to a 20k-series tenant |
+| every node derives its own live set | a replica prunes its own parts, no ownership rule |
 
-A prefix written by an older build still has `series.bin`: it is read at open and **deleted once
-every live part carries its own identities**, completing the migration and stopping recovery from
-resurrecting identities whose data is gone. Identity objects are written and read uncached — read on
-recovery and by a replica adopting a part, never on the query path.
+A whole-set object has to be re-serialized in full on any change, and costs ~218 B/series by repeating
+the label bytes, against ~40 B/series interned here. A prefix carrying one (`series.bin`) is read at
+open and deleted once every live part carries its own identities, so recovery cannot resurrect
+identities whose data is gone. Identity is read on recovery and by a replica adopting a part, never by
+a query.
 
-**The WAL must therefore carry its own identities.** A flush checkpoints it, discarding the series
-records written when identities were first seen, so a series record is logged whenever a series
-starts a **new sample buffer** — once per actively-appending series per flush window — not only when
-its identity is new. Otherwise a sample logged after a checkpoint would reference a series the log no
-longer describes, and with identity in the parts (which retention can drop at any time) there is no
-whole-set object left to resolve it through.
+**The WAL carries its own identities.** A flush checkpoints it, discarding the series records written
+when identities were first seen, so a record is logged whenever a series starts a **new sample
+buffer** — once per actively-appending series per flush window, not only when its identity is new.
+Otherwise a sample logged after a checkpoint names a series the log no longer describes, and identity
+now lives in parts retention can drop at any time.
 
-The resident half of that identity state — the head's symbol table, series index, postings lists and
-per-series OOO watermarks — is metered separately as `Stats.IdentityBytes`, not folded into
-`HeadBytes`: a flush drains samples, not identities, so folding the two would have the
-size-triggered flush chase a number it cannot lower.
+**Metered apart.** The resident half — symbol table, series index, postings, OOO watermarks — is
+`Stats.IdentityBytes`, not `HeadBytes`: a flush drains samples, not identities, so folding them would
+have the size-triggered flush chase a number it cannot lower.
+
+### Publish order: the part's objects first, the bucket index last
+
+The bucket index makes a part durably visible, so writing it is the commit point and a readable part
+always carries the identities its rows resolve through. A crash in between leaves an orphan — objects
+and identity together — swept at the next open, stranding nothing.
+
+**No `FlushedEpoch`** here, unlike `recordengine`: the WAL `Checkpoint` runs last and is the WAL's
+commit point, so replay recovers a part that failed to publish. The unreadable-commit window bites
+only a persistent backend with no `WALDir`, where nothing else holds the rows.
 
 ## Identity prune
 
-Retention drops samples and whole parts; `PruneIdentities` drops the identities they leave behind,
-which otherwise accumulate for the process' lifetime under series churn. It needs no new on-disk
-format — a part's `sidx` sidecar already lists its series ids, so the **live set** is the union of
-the live parts' id sets with the in-memory tiers (head, mid-flush detachment, recent). It runs after
-a merge — and, on a replica, after the refresh that adopts a new part set — and only when parts
-actually went away: identities die no other way, so an engine whose data only grew skips even the
-live-set walk. No ownership rule is needed now that identity is scoped to the part: a node's live set
-means exactly "what this node can still serve", and a part a replica has not synced yet brings its
-identities with it.
+`PruneIdentities` drops the identities retention leaves behind, which otherwise accumulate for the
+process' lifetime under series churn.
 
-Symbol ids are dense and referenced by the postings lists, so nothing can be removed in place:
-the survivors are **rebuilt** into fresh structures. That rebuild is ~0.6 s per 200k identities
-(~3.4 s at 1M), far too long to hold `e.mu`, so it runs **off-lock** against
-`series.Index.Snapshot()` — the index's append-only entry log, which registration only extends, so
-a snapshot of it is immutable without the lock. Under the lock the swap then reconciles what changed
-meanwhile and installs the result: ~5 ms per 200k pruned identities, ~40 ms at 1M, allocation-free.
+| | |
+|---|---|
+| live set | the live parts' id sets ∪ head ∪ mid-flush detachment ∪ recent |
+| when | after a merge, or a replica's refresh — and only if parts went away |
+| ownership | none needed: the live set is what this node can still serve |
 
-Two sets must survive a rebuild that decided without them: entries registered *after* the snapshot
-(past its end in the same log), and series the prune found dead that **regained samples** — a series
-whose identity the old index still held is not re-registered when a sample arrives, so it leaves no
-log entry, and dropping it would strand samples the next flush would write into a part with no
-identity naming them. A dead series' OOO watermark is deleted by key (cost tracks what died, not
-cardinality); a live one keeps its own, or a late sample would be re-admitted.
+Each `sidx` already lists its part's ids, so no new on-disk format. Identities die no other way, so an
+engine whose data only grew skips even the live-set walk.
 
-The WAL needs no `walExpiries` equivalent: it is checkpointed at every flush and re-logs a series
-record whenever a series starts a buffer, so its live records name only series it describes itself.
-The prune writes nothing durable — the identities it drops went with the parts that held them.
+Symbol ids are dense and referenced by the postings, so nothing is removed in place. Survivors are
+**rebuilt** off-lock against `series.Index.Snapshot()` — the append-only entry log, immutable without
+the lock because registration only extends it — then swapped in under the lock.
 
-The record engines have the same prune (`recordengine/prune.go`), reaching the live set from their
-resident `part.ranges` instead of a sidecar read. What is still unbounded there is the **union-only
-merged symbol sidecars**, which need a shrink path of their own.
+| step | 200k identities | 1M |
+|---|---|---|
+| rebuild, off-lock, far too long to hold `e.mu` | ~0.6 s | ~3.4 s |
+| swap, under lock, allocation-free | ~5 ms per 200k pruned | ~40 ms |
 
-**Publish order: the part's objects first, the bucket index last.** The bucket index is what makes a
-part durably visible, so writing it is the commit point, and a readable part always carries the
-identities its rows resolve through — a committed part whose identities are missing would hold
-samples no matcher can reach. A crash in between leaves an orphan part, objects and identity
-together, swept at the next open, so a failed publish strands nothing (with a whole-set object its
-identity was instead left behind permanently, resolvable and backed by nothing). Unlike `recordengine`, the metrics bucket index carries no `FlushedEpoch` — the WAL
-`Checkpoint` (which runs last, after both) is the WAL's commit point, so with durability enabled
-replay still recovers a part that failed to publish. The unreadable-commit window bites the
-backend-only configuration (a persistent backend with no `WALDir`), where nothing else holds the rows.
+**Two sets must survive a rebuild that decided without them:** entries registered past the snapshot's
+end, and dead-found series that **regained samples** — not re-registered on a new sample, so leaving no
+log entry, and dropping them would strand samples the next flush writes into a part with no identity
+naming them. A dead series' OOO watermark is deleted by key, so cost tracks what died, not cardinality;
+a live one keeps its own, or a late sample would be re-admitted.
 
-Flush and merge are bounded separately, because they answer different questions. A flush splits at
-`MaxPartBytes` — approximate *uncompressed* bytes, since it is sizing rows it already holds in the
-head. A merge splits at `mergeCapBytes`, a size **on disk**, measured against what the streaming
-writer has actually encoded (`mergecap.go`).
+The WAL needs no `walExpiries` equivalent: checkpointed every flush and re-logging a series record when
+a series starts a buffer, its live records name only series it describes. The prune writes nothing
+durable. `recordengine/prune.go` is the same prune over resident `part.ranges`; **known gap there:**
+merged symbol sidecars stay unbounded.
 
-That cap is derived from the resources the merge actually consumes rather than held at a constant:
-`min(MergeCeilingBytes, free / MergeConcurrency / 2, mergeMemory / MergeConcurrency / 2)` — the last
-term only over a backend that takes objects whole, see below. A byte constant is correct at exactly one
-deployment size — cardinality consumes a byte budget in *breadth*, so under a fixed cap the time
-span a part covers is inversely proportional to active series and a fixed-range query opens
-proportionally more parts as cardinality grows. Both references size against the storage instead
-(VictoriaMetrics `getMaxOutBytes`, ClickHouse `max_bytes_to_merge_at_max_space_in_pool` lowered by
-free space); dividing by the merge worker count is what stops concurrent merges from collectively
-filling the disk, and the further halving leaves room for a merge's output to coexist with the
-inputs it has not yet retired.
+## Lifecycle and part sequences
 
-`MergeConcurrency` is a callback, not a number, because the fan-out is bounded by the node's engine
-count as much as by its worker limit and engines appear lazily. Fixing it at engine creation would
-divide a single-tenant node's disk by its core count — on a 32-core box that lands back at roughly
-the constant this replaces, on the exact deployment shape the change is for.
+Driven by the facade's single maintenance loop, plus a head-bytes trigger flushing only the
+over-threshold engines. `Engine` is exported and `Close`/`Reset` callable from anywhere, so
+concurrency is enforced, not assumed: flush and merge hold one `flushMu` across their whole body.
+`Reset` takes it too, draining an in-flight flush/merge that would otherwise publish its part — and a
+stale sequence — into the emptied engine, dropping detached buffers with the head, and **retiring**
+live parts rather than deleting their objects, so a fetch holding one is not read out from under it.
 
-A backend that cannot report free space — `Memory`, object stores, where local free space has no
-meaning — keeps the ceiling, so every backend still works. A nearly full disk falls to
-`minMergeCapBytes` rather than sealing everything, since stranding the part count high is worst
-exactly when compaction matters most. The floor applies to the *derived* bounds only: a ceiling
-configured below it is honored, since an embedder that sets one means it.
+**Invariant: part sequences are append-only.** Flush and merge reserve `{seq}` as they write and
+advance immediately, so a failed attempt burns its sequence rather than handing it to the retry: a
+rewrite replaces only the objects it produces, so a part reusing the sequence inherits leftovers it
+never wrote.
 
-**Whether memory bounds the cap at all depends on the backend.** Over one that takes objects whole,
-the output part accumulates in RAM until it is sealed and `build` then serializes it into one buffer
-per column, so a merge's peak resident is about twice the part it is writing. Free space says nothing
-about that — a 4 GiB pod over a 464 GiB volume derives a 232 GiB share, clamps it to the 16 GiB
-ceiling, and OOMs building the part. So over such a backend the cap is also lowered by
-`MergeMemoryBytes / MergeConcurrency / 2`: the merge allowance divided across the merges that may run
-at once, halved for the serialize step. The allowance defaults to an eighth of the process's memory
-budget — `GOMEMLIMIT`, else the cgroup limit, else host memory (`internal/memlimit`) — leaving the
-rest to the head, the caches and the decode budget.
+`LoadParts` sweeps that residue — a failed attempt's objects, or a retired part whose reclaim delete
+failed. It lists the prefix, deletes every object under a part directory the bucket index does not
+name, and resumes past the highest sequence seen *on the backend*, which is what makes the guarantee
+survive a restart. The sweep assumes this node **owns** the prefix, so a replica's `RefreshReplica`
+skips it: the owner's in-flight part is not in the index yet.
 
-Over a backend implementing `backend.ObjectCreator` (`file`) the writer hands each column's frames
-over as they seal (`block/ARCH.md`, "Two writers"), so it never holds the part and that term drops
-out: the disk sizes the part again, which is what it should size. Memory is then bounded where it is
-actually spent. What a streamed merge still holds is **per-series** state — the id runs, the series
-index, the aggregate sidecar — which is O(distinct series) and so is not a function of the part's
-bytes at all: a merge of very short series holds far more of it per encoded byte than a merge of long
-ones. The loop therefore seals on `partStreamWriter.residentBytes()` against
-`mergeMemoryBudgetBytes()` (the same allowance, taken at face value rather than doubled) in addition
-to the disk cap, bounding memory directly instead of pricing part size against it.
+## Flush and merge are bounded separately
 
-Splitting at row boundaries is safe — parts are independent and a series spanning two is merged back
+| phase | splits at | measured in | why |
+|---|---|---|---|
+| flush | `MaxPartBytes` | approximate uncompressed bytes | it sizes rows already in the head |
+| merge | `mergeCapBytes` (`mergecap.go`) | bytes on disk | what the writer actually encoded |
+
+Splitting at row boundaries is safe: parts are independent, and a series spanning two is merged back
 by the read seam.
 
-Driven by the facade's single background maintenance loop, plus a head-bytes pressure trigger that
-flushes just the over-threshold engines. Concurrency is nonetheless enforced, not assumed: flush and
-merge run under one `flushMu` held across their whole body, since `Engine` is exported and
-`Close`/`Reset` are callable from anywhere.
+```
+mergeCapBytes = min( MergeCeilingBytes,
+                     free        / MergeConcurrency / 2,
+                     mergeMemory / MergeConcurrency / 2 )  ← whole-object backends only
+```
 
-`Reset` takes it too — it drains an in-flight flush/merge (which would otherwise publish its part,
-and a stale sequence, into the emptied engine), drops the detached flushing buffers with the head,
-and **retires** the live parts instead of deleting their objects outright, so a fetch that already
-acquired one is not read out from under it; the deferred reclaim deletes them once the reader
-drains.
+**Why not a constant:** cardinality spends the budget in *breadth*, so a fixed cap shrinks a part's
+time span as active series grow, and a fixed-range query opens proportionally more parts. Both
+references size against storage instead (VictoriaMetrics `getMaxOutBytes`, ClickHouse
+`max_bytes_to_merge_at_max_space_in_pool` lowered by free space).
 
-**Part sequences are append-only.** Flush and merge reserve each output part's `{seq}` as they write
-it and advance the counter immediately, so an attempt that failed after writing some objects burns
-its sequence rather than handing it to the retry — a rewrite replaces only the objects it itself
-produces, so a part landing on the leftovers inherits objects it never wrote. `LoadParts` sweeps the
-residue: it lists the prefix, deletes every object under a part directory the bucket index does not
-name (a failed attempt's, or a retired part whose reclaim delete failed), and resumes the sequence
-past the highest one seen on the backend — so the guarantee survives a restart, where the index
-alone would hand the orphan's sequence back out. The sweep assumes this node **owns** the prefix, so
-a replica's `RefreshReplica` skips it: the owner's in-flight part is not in the index yet.
+**Why divided:** by `MergeConcurrency`, so concurrent merges cannot collectively fill the disk; halved
+again to let a merge's output coexist with inputs it has not yet retired. `MergeConcurrency` is a
+**callback**, since fan-out is bounded by the node's engine count as much as by the worker limit and
+engines appear lazily; fixed at engine creation it would divide a single-tenant node's disk by its core
+count, leaving a 32-core box a thirty-second of it.
+
+**Degenerate cases.** Backends that cannot report free space (`Memory`, object stores) keep the
+ceiling. A nearly full disk falls to `minMergeCapBytes` rather than sealing everything, since stranding
+the part count high is worst when compaction matters most; that floor binds derived bounds only, so a
+configured ceiling below it is honored.
+
+**Memory bounds the cap only over a backend that takes objects whole.** There the output accumulates in
+RAM until sealed and `build` serializes it into one buffer per column, so peak resident ≈ 2× the part.
+Free space says nothing about that: a 4 GiB pod on a 464 GiB volume derives 232 GiB, clamps to the
+16 GiB ceiling, and OOMs. Hence the third term, split across concurrent merges and halved for the
+serialize step; the allowance defaults to an eighth of the process budget (`GOMEMLIMIT`, else the
+cgroup limit, else host memory — `internal/memlimit`).
+
+Over a `backend.ObjectCreator` (`file`) the term drops: the writer hands each column's frames over as
+they seal (`block/ARCH.md`, "Two writers") and never holds the part. A streamed merge still holds
+**per-series** state — id runs, series index, aggregate sidecar — which is O(distinct series), not a
+function of part bytes; a merge of very short series holds far more per encoded byte. So the loop also
+seals on `partStreamWriter.residentBytes()` against `mergeMemoryBudgetBytes()`, the same allowance at
+face value, bounding memory directly.
 
 ## Merge — one pass, five modes
 
-`MergeWith(MergeOptions{RetainFrom, Downsample, Recompress, Precision})` compacts a **bounded,
-size-tiered group** of parts (not the whole set), merging per series by timestamp (freshest wins),
-dropping samples past the retention cutoff, downsampling by tier, compressing the output at a
-size-graduated level, and — when the merged part is **fully cold** — recompressing at the age tier
-and/or re-encoding at a lossy precision budget. All of it is the one merge engine; no parallel
-subsystem.
+```go
+MergeWith(MergeOptions{RetainFrom, Downsample, Recompress, Precision})
+```
 
-- **Determinism:** `Before`/`retainFrom` are absolute timestamps, never clock reads; the caller
-  resolves policy against one `now` per pass. Downsample buckets align to the absolute grid, so a
-  rollup is independent of when the merge runs.
-- **Fixed points:** repeated merges are stable for last/first/min/max/sum/avg (count is the
-  documented exception); recompression checks the part's recorded algorithm *and level* and precision
-  checks the manifest's recorded budget, so re-merges don't churn. Only an upgrade forces a rewrite —
-  a part denser than the target is left alone.
-- **Weight-aware:** compaction and rollup both honor the lossy-sampling scale factor, so a sampled
-  series stays unbiased.
-- **Graduated compression** (`recompress.go`): a merge always compresses its output, at a level its
-  row count selects (zstd 1 ≤ 64k rows, 2 ≤ 1M, else 3 — VictoriaMetrics' ladder, capped the same
-  way). A merge rewrites the data regardless, so the only cost is the level's own CPU, and a bigger
-  part — older, read less per byte, merged again less often — earns a denser level. Above the ladder
-  sits at most one *age* tier, `RecompressSpec`, applied to a fully cold part. A hot flush is
-  unaffected: it still writes codec-only framing.
-- **Recompression is decode-transparent** — the reader keys off the per-column algorithm in the
-  manifest, so it is a pure ratio/CPU trade with no format change. The *level* is recorded too, but
-  only so the merge can tell a part already at the target from one below it; nothing reads it back.
-- **Retention drops whole parts first.** A part whose `maxTime` is already past the cutoff holds no
-  row retention would keep, so it is retired on the manifest alone (`dropExpired`) — no decode, no
-  re-encode, no output part. Only a part *straddling* the cutoff is rewritten. This makes retention
-  cost O(1) in the expired data rather than O(bytes), the property every reference system leans on
-  (Prometheus deletes whole blocks, VictoriaMetrics whole partitions). The drop publishes like any
-  merge — copy-on-write swap, index commit, then retire — so a failed commit rolls back and the
-  parts stay live. Since the size-based cutoff shares `RetainFrom`, disk-pressure eviction drops
-  whole parts too.
-- **Selection is confined to an aligned time bucket** (`timebucket.go`). Size-tiered selection has
-  no notion of time, so it happily merged a part covering hour 3 into one covering hours 0–48 and
-  the output spanned the whole store; every part then overlapped every query window (#308). Parts
-  are grouped by their aligned bucket on the `mergeLadder` (1h → 6h → 24h, each level dividing the
-  next so buckets nest), and the size-tiered selector below runs **unchanged inside one group**, as
-  in ClickHouse where the size selector is only ever fed one partition. The top level is therefore
-  the widest part the engine will build, and the coarsest time locality a query can rely on.
+Compacts a bounded, size-tiered group of parts, never the whole set. All five modes are the one merge
+engine; no parallel subsystem.
 
-  The ladder is walked narrowest-first, so a bucket collapses at 1h before its result is eligible to
-  merge with neighbors at 6h — each part is rewritten once per level, not repeatedly at the widest.
-  Above the finest level the still-filling newest bucket is skipped (merging it now guarantees
-  merging it again); the finest level is exempt, since that is where flushes land and letting them
-  accumulate is the part-count growth sealing exists to bound.
+| mode | effect |
+|---|---|
+| compact | merge per series by timestamp, freshest wins |
+| retention | drop samples past `RetainFrom` |
+| downsample | roll up by tier |
+| recompress | size-graduated level; the age tier only on a fully cold part |
+| precision | re-encode at a lossy budget, fully cold parts only |
 
-  **Forced rewrites are confined too, and win the cycle outright.** The forced set used to be
-  unioned with the size-tiered run and merged as one part, so a retention pass over a store with any
-  age spread rewrote parts from opposite ends of it into a single part spanning both — re-widening
-  on the cycle most likely to run. The oldest forced part now picks the bucket, the rest of that
-  bucket rides along when it fits the cap (merging inside a bucket cannot widen), and the
-  size-tiered run waits for the next cycle. A part straddling every level belongs to no bucket and
-  is rewritten *alone* rather than skipped: retention correctness does not wait on straddle
-  splitting.
+**Determinism:** absolute timestamps, never clock reads — the caller resolves policy against one `now`
+per pass — and grid-aligned downsample buckets, so a rollup does not depend on when the merge runs.
 
-  A part that straddles a boundary at every level is otherwise left out of ladder groups — it cannot
-  join one without widening its group's output. Parts written before bucketing existed are mostly of
-  this shape, so the ladder narrows *new* parts and leaves old wide ones as they are until
-  flush-time and merge-time straddle splitting lands.
-- **Run selection** (`compact.go`) picks only what is worth merging: any part a forced rewrite must
-  touch (retention/downsample/recompress/precision — so age-driven work is never starved), plus the
-  best run of *unsealed* parts. A part at the merge cap is **sealed** — re-merging it would only
-  re-split it — so part count is bounded at ≈ dataset / cap instead of growing per flush. Sealing
-  and the run budget are in on-disk bytes (`part.sizeBytes`); a run is bounded by `maxMergeParts` as
-  well, so a large disk-derived budget cannot turn one merge into an unbounded one.
+**Fixed points:** repeated merges are stable for last/first/min/max/sum/avg, count being the documented
+exception. Recompression checks the part's recorded algorithm *and* level, precision the manifest's
+recorded budget; only an upgrade rewrites, and a part denser than the target is left alone.
 
-  Parts are **ordered** by size and every run of adjacent ones is scored `m = output / largest
-  input`, the inverse of write amplification (VictoriaMetrics' `appendPartsToMerge`). They are not
-  *bucketed* by size, which is what used to strand leftovers: a part alone in its power-of-two tier
-  could never reach the two-per-tier threshold, and nothing would ever land in exactly that tier
-  again, so it was carried by every query for the engine's lifetime (#285).
+**Weight-aware:** compaction and rollup honor the lossy-sampling scale factor, keeping a sampled series
+unbiased.
 
-  Ordering alone does not fix it, because those leftovers are spread geometrically — one per former
-  tier — so every run over them fails the balance test or scores under `minMergeMultiplier`. Two
-  escapes close it: a run whose *total* is under `smallRunBytes` skips both guards (they argue about
-  the proportion of bytes rewritten, which is meaningless when the whole rewrite is cheap), and
-  after `mergeIdleRounds` merges that selected nothing, the best run is taken regardless of score.
-  Rewriting a large part once to absorb a stray is far cheaper than carrying that stray forever.
+### Graduated compression (`recompress.go`)
 
-  The selector works in size order but returns the run in the engine's part order: the merge visits
-  its sources oldest → newest so a later part's value wins a duplicate timestamp.
+| tier | level |
+|---|---|
+| row-count ladder, every merge output | zstd 1 ≤ 64k rows, 2 ≤ 1M, else 3 |
+| age tier `RecompressSpec` | at most one, above the ladder, fully cold only |
+| flush | codec-only framing; a hot flush is unaffected |
 
-  `MergeOptions.Force` is the operator's version of the idle escape: it hands the selector an
-  idle count that has already reached `mergeIdleRounds`, so a forced compaction is *the same*
-  selection the engine would make on its own after that many fruitless cycles — one code path, and
-  the seal threshold and run budget still bound it. Bypassing the heuristic is the point; bypassing
-  the memory/size bound is not.
-- **Merge shape** (`mergeshape.go`) is that decision's inputs, read off the merge path:
-  `Engine.MergeShape` reports the parts, how many are sealed, how many remain (the real backlog),
-  how many the next merge would take, the cap in effect, and the score the best run reached. A
-  no-op merge is otherwise indistinguishable from an idle engine, and a store can sit at a part
-  count it will never reduce for thousands of cycles without any counter saying so. The cap is
-  reported from the last merge rather than derived on demand: deriving it reads the backend's free
-  space, and introspection does no I/O.
-- **Streaming both ways** (`compactStream`): each source is read through a forward cursor decoding
-  one series range at a time, and each merged series is handed straight to a `partStreamWriter`
-  (`streampart.go`) wrapping a `block.StreamWriter`, which encodes a granule as soon as one fills.
-  So the working set is O(parts × one series range) + the *encoded* output part — not O(dataset),
-  and not the output part's uncompressed rows either. That second half matters for granularity: the
-  row cap used to set peak merge memory as well as part size (`capRows × 32 B`, 512 MiB at the
-  default cap), so a cap raised to widen parts raised merge RSS with it. Now it only sets part size.
-  Measured on a 2M-row merge, streaming the output cut total allocation 3.7–5.4× and peak heap
-  2.9–3.8×, the wider margin on counter-shaped data that encodes densest.
+The ladder is VictoriaMetrics', capped the same way. A merge rewrites the data regardless, so the only
+cost is the level's CPU, and a bigger part — older, read less per byte, merged less often — earns a
+denser level. **Recompression is decode-transparent:** the reader keys off the manifest's per-column
+algorithm, a pure ratio/CPU trade with no format change. The level is recorded only so a merge can tell
+a part at the target from one below it.
 
-  The sidecars stream with it: the series index, identities and aggregate stats are all built from
-  the same per-series calls, each run- or series-shaped, so they cost O(distinct series) not O(rows).
-  Encoding decisions that the batch writer takes per output part — compression profile, precision
-  budget, whether a weight column exists — must instead be fixed before the first row is encoded, so
-  `mergeEncoding` derives them from the source parts; see its doc for why that is equivalent (and
-  self-correcting where it is not exact).
+### Retention drops whole parts first
 
-  The **single-part forced-rewrite path** (`writeColumns`, one part selected for
-  retention/downsample/recompress/precision) still buffers whole columns: its fixed-point check —
-  skip the rewrite if the part is already at its target — needs the post-downsample row count before
-  it can decide to write at all. It is bounded by one part, and is not the routine compaction tick.
+A part whose `maxTime` is past the cutoff holds no row retention would keep, so `dropExpired` retires
+it on the manifest alone: no decode, no output part, only a straddler rewritten. Retention is then O(1)
+in the expired data rather than O(bytes), as in Prometheus (whole blocks) and VictoriaMetrics (whole
+partitions). The drop publishes like any merge, so a failed commit rolls back and the parts stay live.
+Disk-pressure eviction shares `RetainFrom`, so it drops whole parts too.
+
+### Selection is confined to an aligned time bucket (`timebucket.go`)
+
+Selection is bucketed by time, not by size alone: size tiers have no notion of time, so an unbucketed
+selector folds an hour-wide part into a day-wide one until every part overlaps every query window.
+
+```
+mergeLadder:  1h  →  6h  →  24h      each level divides the next, so buckets nest
+              ↑ flushes land here    ↑ widest part built; the coarsest locality a query can rely on
+```
+
+Parts are grouped by aligned bucket, and the size-tiered selector runs unchanged inside one group — as
+in ClickHouse, where the size selector is only ever fed one partition. The ladder is walked
+narrowest-first, so each part is rewritten once per level rather than repeatedly at the widest.
+
+**The still-filling newest bucket is skipped**, since merging it now guarantees merging it again. The
+finest level is exempt: flushes land there, and letting them accumulate is the part-count growth
+sealing exists to bound.
+
+**Forced rewrites are confined too, and win the cycle.** The oldest forced part picks the bucket, the
+rest of that bucket rides along if it fits the cap, and the size-tiered run waits — unioning the two
+would merge parts from opposite ends of the store into one spanning both. Merging inside a bucket
+cannot widen.
+
+**A straddler belongs to no bucket** and cannot join one without widening the output, so it is left out
+of ladder groups, and a store can hold wide parts the ladder never narrows. A forced straddler is
+rewritten *alone* rather than skipped: retention correctness does not depend on splitting it.
+
+### Run selection (`compact.go`)
+
+Picks only what is worth merging: any part a forced rewrite must touch, so age-driven work is never
+starved, plus the best run of *unsealed* parts.
+
+| rule | effect |
+|---|---|
+| a part at the merge cap is sealed | part count ≈ dataset / cap, not growing per flush |
+| runs score `m = output / largest input` | the inverse of write amplification |
+| escape: total under `smallRunBytes` | skips both guards |
+| escape: `mergeIdleRounds` fruitless merges | best run taken regardless of score |
+| `MergeOptions.Force` | the operator's version of the idle escape |
+
+Re-merging a sealed part would only re-split it. Sealing and the run budget are in on-disk bytes
+(`part.sizeBytes`), and `maxMergeParts` bounds a run too, so a large disk-derived budget cannot make
+one merge unbounded. Scoring follows VictoriaMetrics' `appendPartsToMerge`.
+
+**Ordered by size, not bucketed into size tiers:** a tier scheme strands a part alone in its
+power-of-two tier, where it never reaches the two-per-tier threshold and is carried by every query for
+the engine's lifetime. Ordering alone is not enough, because such strays sit geometrically apart and
+every run over them fails the balance test or scores under `minMergeMultiplier` — hence the two
+escapes. The guards reason about the proportion of bytes rewritten, which is meaningless when the whole
+rewrite is cheap, and rewriting a large part once to absorb a stray beats carrying it forever. `Force`
+supplies an idle count already at `mergeIdleRounds`, so it is the same selection the engine reaches on
+its own — bypassing the heuristic, never the memory bound.
+
+The selector works in size order but returns the run in engine part order, so the merge visits sources
+oldest → newest and a later part's value wins a duplicate timestamp.
+
+### Merge shape (`mergeshape.go`)
+
+`Engine.MergeShape` reports the selector's inputs off the merge path (fields in `ADMIN.md`). A no-op
+merge is otherwise indistinguishable from an idle engine, and a store can sit at a part count it will
+never reduce for thousands of cycles with nothing saying so. The cap comes from the last merge rather
+than being derived on demand: deriving it reads free space, and introspection does no I/O.
+
+### Streaming both ways (`compactStream`)
+
+```
+source part ─ forward cursor ┐
+source part ─ forward cursor ┼→ merge per series → partStreamWriter → block.StreamWriter
+source part ─ forward cursor ┘  (one series range   (streampart.go)    encodes a full granule
+                                 at a time)
+```
+
+Working set is O(parts × one series range) plus the *encoded* output — not O(dataset), and not the
+output's uncompressed rows. That second half decouples granularity from memory: the row cap sets part
+size only, where buffering the output would also make it the peak-memory knob (`capRows × 32 B`, 512
+MiB at the default), so a cap raised to widen parts would raise merge RSS with it. On a 2M-row merge
+streaming costs 3.7–5.4× less total allocation and 2.9–3.8× less peak heap than buffering, the wider
+margin on counter-shaped data.
+
+Sidecars stream with it: series index, identities and aggregate stats come from the same per-series
+calls, each run- or series-shaped, so they cost O(distinct series), not O(rows). Encoding decisions
+must be fixed before the first row — compression profile, precision budget, whether a weight column
+exists — so `mergeEncoding` derives them from the sources up front; its doc has why that is equivalent.
+
+The single-part forced-rewrite path (`writeColumns`) buffers whole columns: its fixed-point check needs
+the post-downsample row count before deciding to write at all. It is bounded by one part, and is not
+the routine compaction tick.
 
 ### Publish ordering
 
-A merge retires its source parts — queues them for backend deletion — **only after** the bucket index
-naming their replacement is committed. The index is what a restart and every other replica read, so a
-part the persisted index still names must never become reclaimable; retiring first would let the next
-maintenance tick's reclaim delete objects the index references, and `LoadParts` hard-fails the whole
-engine on a missing part. A failed commit rolls the in-memory part swap back to the committed set, so
-the uncommitted output is never observable as published; its objects are orphans, swept by the
-`LoadParts` orphan sweep at the next open.
+A merge retires its sources only after the bucket index naming their replacement is committed. The
+index is what a restart and every replica read, so a part it still names must never become reclaimable:
+retiring first would let the next reclaim delete referenced objects, and `LoadParts` hard-fails the
+engine on a missing part. A failed commit rolls the in-memory swap back, so the uncommitted output is
+never observable as published; its objects are orphans, swept at the next open.
 
 ## Read path
 
 `Fetch` resolves matchers over the index, then merges each series' head buffer ∪ every part by
-timestamp — **one series per `Next`**, so a consumer that folds and releases each batch never has
-more than one series' samples resident, whatever the matched count. The plan (acquired parts, decode
-reservation, head snapshots) and the fetch's span/profile/metrics therefore span the whole iteration
-and are settled by `Close`, which the caller owes even when it stops early. What remains O(matched
-series) is the plan itself: one identity per matched series, and the head/mid-flush snapshots — those
-must be copied under the lock, since a concurrent flush moves a series' head buffer into a part the
-plan did not acquire.
+timestamp — **one series per `Next`**, so a consumer that folds and releases each batch never holds
+more than one series' samples, whatever the matched count.
+
+The plan (acquired parts, decode reservation, head snapshots) and the fetch's span, profile and metrics
+span the whole iteration, settled by `Close` — **which the caller owes even when it stops early**. What
+stays O(matched series) is the plan: one identity per matched series, plus head and mid-flush
+snapshots, copied under the lock because a concurrent flush moves a series' buffer into a part the plan
+did not acquire.
 
 Layered optimizations, each opt-in:
 
-- **Series index sidecar** (`{prefix}/sidx`) — sorted distinct SeriesIDs + run-start rows as
-  fixed-width entries, binary-searched **in the raw bytes**, held only while a fetch is reading the
-  part (re-fetched through `backend.ReadView`, a zero-copy cache hit). So resident index memory is
-  governed by the read cache budget rather than series count, and opening a part reads no series
-  column. It is derived — a missing/corrupt sidecar falls back to scanning the series column once
-  into a resident index — so it carries no format-migration burden.
-- **Block slicing + decode cache** (`Config.DecodeCacheBytes`) — with block-framed parts, a fetch
-  slices the spanning column blocks straight from a byte-bounded LRU keyed by
-  `(part, column, block)` and adds them to the merge as **views**, never materializing a whole
-  decoded part. Entries are immutable and **reference-counted**, released per series as soon as the
-  samples are copied out; an evicted+unpinned buffer recirculates through a bounded freelist that
-  the next miss decodes into, cutting miss-path allocation rate without enlarging the resident set.
-  Cache-off (or constant/unblocked columns) falls back to a per-fetch decode, **series-skipped** —
-  only the blocks the matched row ranges touch. With the cache on a fetch also **prefetches** the
-  parts it will touch, so backend reads and decodes overlap.
-- **Granule time pruning** — block boundaries align with the part's marks granules, so the marks
-  index already carries each block's `[MinKey, MaxKey]` sample times (`block/ARCH.md`). A
-  block-sliced fetch drops the blocks whose bounds cannot intersect the request window *before*
-  reading or decoding them, and the decode reservation is sized over the survivors. Rows are sorted
-  by `(series, ts)`, so granule bounds are not monotonic across a part — but they are inside one
-  series' row range, which is where the test is applied. Without it a series spanning far more time
-  than the query was decoded whole and discarded row by row, making a narrow window cost the same
-  as a full scan of the part. The index is derived and advisory: absent, corrupt, or mismatched
-  against the part's block framing, nothing is pruned and every block stays a candidate.
-- **Decode-memory budget** (`Config.DecodeMemoryBytes`) — a shared byte semaphore over in-flight
-  decoded column bytes, reserved once per *fetch* off the lock (never incrementally per part, so
-  two queries can't deadlock holding partial reservations); a fetch bigger than the whole budget is
-  admitted alone. The facade builds **one** budget for all tenants, so the cap is process-wide. It
-  bounds the query-concurrency RSS cliff.
-  - Per-fetch is only deadlock-free while a caller keeps **one** fetch open at a time — true of a
-    drain-then-close consumer, false of a streaming one that holds several iterators across an
-    evaluation. There the second acquire is hold-and-wait against the query's own reservation, and
-    the admit-alone escape cannot fire: `used` is non-zero precisely because this query holds it.
-  - `Request.Scope` (a `fetch.Scope`) names the logical query, the read-side analogue of
-    Prometheus' `Storage.Querier`: the caller makes one per request and passes it on every read
-    under it. Its first read blocks as usual; while it still holds, later reads sharing the scope
-    are charged **without queueing**. Accounting stays exact — only the waiting is skipped — so
-    such a query may overshoot the ceiling by its own later estimates, the same latitude a single
-    over-budget read already has. A nil scope is unchanged; `fetch.WithScope` installs one on the
-    request context for a call path that cannot thread it through every `Request`.
-  - A scope is an optimization, never a correctness requirement: the library cannot verify "one
-    fetch at a time", so **the wait itself is bounded twice** and a missing scope costs latency and
-    memory, never liveness.
-    - **Cancellable.** Admission takes the fetch's `ctx`; a done context aborts the wait with an
-      error and reserves nothing, so a query deadline or a client disconnect always recovers the
-      goroutine (an unscoped hold-and-wait degrades to one failed query, not a wedged engine).
-      Consequently `Engine.Fetch`/`Count`/`Aggregate*` can fail before reading anything, and the
-      plan is released on that path.
-    - **Force-admitted.** A waiter that sits for `DefaultDecodeBudgetForceAfter` as the queue head
-      without the budget draining is admitted over the ceiling, counted
-      (`storage.fetch.decode_budget_forced_admissions`) and logged. The ceiling is already soft
-      (admit-alone), so trading an RSS overshoot for liveness is the same trade.
-    - Waiters queue **FIFO** with hand-off admission (the releaser reserves on the waiter's behalf
-      before waking it): a cancellable waiter must not have to hand a turn back, and a barging
-      arrival must not starve a large query. `used == 0` is still an unconditional admit.
-- **Recent tier** (`Config.RecentWindow`) — mirrors the most recent flush window in RAM across
-  flushes, so a query inside the window acquires **no part at all**; overlap with the part is
-  deduped by the freshest-wins timestamp merge.
-- **Buffer recycling** (`Request.Recycle` + `Batch.Release`) — opt-in, default-off. Result buffers
-  come from a GC-stable doubly-bounded freelist (not `sync.Pool`, which empties at every GC and
-  lost the capacity under allocation-driven collections).
+**Series index sidecar** (`{prefix}/sidx`) — sorted distinct SeriesIDs and run-start rows, fixed-width,
+binary-searched in the raw bytes and held only while a fetch reads the part, re-fetched through
+`backend.ReadView` as a zero-copy cache hit. Resident index memory then follows the read cache budget
+rather than series count, and opening a part reads no series column. Derived: a missing or corrupt
+sidecar scans the series column once instead, so no migration burden.
+
+**Block slicing + decode cache** (`Config.DecodeCacheBytes`) — column blocks are sliced from a
+byte-bounded LRU keyed by `(part, column, block)` and added to the merge as **views**, never
+materializing a decoded part. Entries are immutable and refcounted, released per series after copy-out;
+an evicted, unpinned buffer recirculates through a bounded freelist, cutting miss-path allocation
+without enlarging the resident set. Cache-off, or constant/unblocked columns, decodes per fetch,
+series-skipped to the blocks the matched row ranges touch. With the cache on a fetch also prefetches
+the parts it will touch.
+
+**Granule time pruning** — block boundaries align with the part's marks granules, so the marks index
+already carries each block's `[MinKey, MaxKey]` sample times (`block/ARCH.md`). A block-sliced fetch
+drops blocks that cannot intersect the window before reading them, and sizes the decode reservation
+over the survivors. Rows are `(series, ts)`-sorted, so granule bounds are not monotonic across a part,
+but they are inside one series' row range — where the test applies. Without it a narrow window costs a
+full part scan, a long series being decoded whole and discarded row by row. Derived and advisory —
+absent, corrupt or mismatched marks prune nothing.
+
+**Recent tier** (`Config.RecentWindow`) — mirrors the most recent flush window in RAM across flushes,
+so a query inside the window acquires no part at all; overlap is deduped by the freshest-wins merge.
+
+**Buffer recycling** (`Request.Recycle` + `Batch.Release`) — default-off. Result buffers come from a
+GC-stable doubly-bounded freelist, not `sync.Pool`, which empties at every GC and lost the capacity
+under allocation-driven collections.
+
+### Decode-memory budget (`Config.DecodeMemoryBytes`)
+
+A shared byte semaphore over in-flight decoded column bytes, bounding the query-concurrency RSS cliff.
+Reserved once per *fetch* off the lock — never incrementally per part, so two queries cannot deadlock
+holding partial reservations — with a fetch larger than the whole budget admitted alone. The facade
+builds one budget for all tenants, so the cap is process-wide.
+
+**Per-fetch is only deadlock-free while a caller keeps one fetch open at a time.** True of a
+drain-then-close consumer, false of a streaming one holding several iterators across an evaluation:
+there the second acquire is hold-and-wait against the query's own reservation, and admit-alone cannot
+fire, `used` being non-zero precisely because this query holds it.
+
+**`Request.Scope`** (a `fetch.Scope`) names the logical query — the read-side analogue of Prometheus'
+`Storage.Querier`, one per request, passed on every read under it. Its first read blocks as usual;
+while it holds, later reads sharing the scope are charged without queueing. Accounting stays exact,
+only the waiting is skipped, so such a query may overshoot the ceiling by its own later estimates — the
+same latitude a single over-budget read has. A nil scope is unchanged; `fetch.WithScope` installs one
+on the request context where a call path cannot thread it through every `Request`.
+
+**A scope is an optimization, never a correctness requirement.** The library cannot verify "one fetch
+at a time", so the wait is bounded twice and a missing scope costs latency and memory, never liveness:
+
+- **Cancellable.** Admission takes the fetch's `ctx`; a done context aborts and reserves nothing, so a
+  deadline or disconnect always recovers the goroutine and an unscoped hold-and-wait degrades to one
+  failed query, not a wedged engine. `Fetch`/`Count`/`Aggregate*` can therefore fail before reading
+  anything, releasing the plan on that path.
+- **Force-admitted.** A queue head starved for `DefaultDecodeBudgetForceAfter` goes over the ceiling,
+  counted and logged (`ADMIN.md`). The ceiling is already soft, so trading an RSS overshoot for
+  liveness is the same trade.
+- **FIFO with hand-off** — the releaser reserves on the waiter's behalf before waking it, since a
+  cancellable waiter must not have to hand a turn back and a barging arrival must not starve a large
+  query. `used == 0` still admits unconditionally.
 
 ## Count and series enumeration
 
-`Count`/`CountBy`/`Series` share one **existence plan**: matched ids from the head index (which
-outlives a flush) and in-window existence from the live buffers, with no batch, no value column and
-no label projection. They differ in what they ask of the parts:
+`Count`/`CountBy`/`Series` share one **existence plan**: matched ids from the head index, which
+outlives a flush, and in-window existence from the live buffers. No batch, no value column, no label
+projection. They differ in what they ask of the parts:
 
-- `Count`/`CountBy` are **exact**: a part fully inside the window contributes by sorted intersection
-  against its series index (**no** decode); a window-edge part decodes its timestamp column only and
-  binary-searches. So at most the two edge parts decode.
-- `Series` is **series-only**: every window-overlapping part contributes the matched ids its series
-  index holds — no column is ever read, so the cost is proportional to matched cardinality alone, not
-  to the window's depth. The window filter is therefore **part-granular** (a series in an overlapping
-  part is listed even if its samples sit just outside), the same granularity `recordengine.Series`
-  and Prometheus' own label endpoints have. It is the primitive the metrics label endpoints need,
-  whose fetch-based answer would decode and discard every sample of every matching series.
+| call | parts contribute by | decode |
+|---|---|---|
+| `Count`/`CountBy`, exact | sorted intersection, or binary search at a window edge | the two edge parts, ts only |
+| `Series`, series-only | the matched ids the part's series index holds | never |
+
+The intersection applies to a part fully inside the window. `Series` therefore costs matched
+cardinality alone, not the window's depth, and its window filter is **part-granular**: a series in an
+overlapping part is listed even if its samples sit just outside — the granularity `recordengine.Series`
+and Prometheus' label endpoints also have. It is the primitive the metrics label endpoints need, whose
+fetch-based answer would decode and discard every sample of every match.
 
 ## Label metadata
 
-`LabelNames`/`LabelValues` answer from the **index**, not from series. With no matchers the walk is
-over the postings' (name → values) map — O(distinct values), no identity materialized; with matchers
-it narrows to the matched ids and reads only the requested name off each identity (never a whole
-label set).
+`LabelNames`/`LabelValues` answer from the index, not from series. With no matchers the walk is over
+the postings' (name → values) map, O(distinct values), materializing no identity; with matchers it
+narrows to the matched ids and reads only the requested name off each identity.
 
 The head's series index is **all-time**: it outlives flushes, and retention prunes samples and parts
-but never identities, so the index alone would keep offering the labels of series whose data is long
-gone. Every value is therefore **liveness-probed** — an in-window in-memory sample, or membership in
-a part overlapping the window — stopping at the first live series, so a live value costs one probe
-rather than a scan of its postings list. The part indexes are warmed *before* the engine lock is
-taken, keeping the probe I/O-free under the lock.
+but never identities, so the index alone would keep offering labels of series whose data is long gone.
+Every value is therefore **liveness-probed** — an in-window in-memory sample, or membership in a part
+overlapping the window — stopping at the first live series, so a live value costs one probe rather than
+a scan of its postings list. Part indexes are warmed before the engine lock is taken, keeping the probe
+I/O-free under it.
 
 ## Aggregate pushdown
 
 `AggregateRange`/`AggregateStep` return per-series count/sum/min/max (→avg) over a window or a
-step-aligned grid. With `Config.AggregateStats`, each part writes a small **stats sidecar**
-(`{prefix}/stats`), and a range that **fully covers** a part folds it **without decoding the value
-column**. Taken only when provably exact — in-window parts fully covered *and* pairwise
-time-disjoint — else it falls back to decode+merge, which dedups. Derived, so absent/corrupt ⇒
-decode. In cluster mode the pushdown survives the network: each owner aggregates locally and ships
-per-series identity + buckets, so only aggregates cross the wire.
+step-aligned grid. With `Config.AggregateStats` each part writes a small stats sidecar
+(`{prefix}/stats`), and a range **fully covering** a part folds it without decoding the value column.
 
-The rejection is **reported, not just taken**: `aggPushdownCheck` returns a reason
-(`ok` / `grid_unusable` / `partial_coverage` / `overlapping_parts`) plus the number of sources that
-tripped it, which every aggregate span records as `storage.stats_pushdown_reason` /
-`storage.stats_pushdown_parts` (`ADMIN.md`). The three causes are unrelated and need separating: a
-misaligned window is a query shape, overlap is a store layout, and partial coverage is a boundary
-mismatch — which is where a **trade-off worth knowing about** hides.
+Taken only when provably exact: in-window parts fully covered *and* pairwise time-disjoint, else it
+falls back to decode+merge, which dedups. Derived, so absent or corrupt means decode. In cluster mode
+it survives the network — each owner aggregates locally and ships per-series identity plus buckets, so
+only aggregates cross the wire.
 
-A whole-part stat is exact only for a part that lies *entirely* inside the query range, so pushdown
-eligibility falls as parts grow. Compaction, which is otherwise strictly good — fewer parts, less
-per-part overhead, better compression — therefore works *against* this pushdown: 71 small parts give
-a 6h dashboard window many parts it wholly contains, while the same data compacted into 3 large parts
-gives it none, and every such query drops to decoding every sample. The engine deliberately does not
-try to arbitrate this (a merge policy that kept parts small enough for a *particular* window would be
-guessing at the query mix, and would give up the compaction wins for every other read). Instead the
-reason is visible per query, so an operator who sees `partial_coverage` dominate after a compaction
-change can weigh it, rather than watching aggregate latency rise with no attributable cause. The
-per-query counter to read alongside it is `storage.samples_decoded`, which is what the fallback
-actually costs.
+**The rejection is reported, not just taken.** `aggPushdownCheck` returns a reason and the number of
+sources that tripped it, on every aggregate span. The three causes — query shape, store layout,
+boundary mismatch — are unrelated and need separating; `ADMIN.md` reads them operationally.
 
-Buckets accumulate in a **`stepGrid`** allocated once per call and reused across every series in
-it — a dense array indexed by arithmetic on the timestamp, so filling costs no hashing and draining
-costs no sort of aggregate structs. It spans the plan's *data* (parts' ranges ∪ head span, clipped
-to the request), not the request, which is routinely unbounded on one side; a grid too wide to index
-densely (a fine step over a long span) falls back to a map, sized by the samples instead.
+**Trade-off worth knowing about.** A whole-part stat is exact only for a part lying entirely inside the
+query range, so eligibility falls as parts grow: compaction — otherwise strictly good, giving fewer
+parts, less per-part overhead and better compression — works against this pushdown. 71 small parts give
+a 6h dashboard window many parts it wholly contains; the same data compacted to 3 gives it none, and
+every such query drops to decoding every sample. The engine deliberately does not arbitrate: a merge
+policy keeping parts small enough for a *particular* window would guess at the query mix and give up
+the compaction wins for every other read. Reporting the reason instead lets an operator weigh it.
+
+**Buckets accumulate in a `stepGrid`,** allocated once per call and reused across every series in it: a
+dense array indexed by arithmetic on the timestamp, so filling costs no hashing and draining no sort of
+aggregate structs. It spans the plan's *data* — parts' ranges ∪ head span, clipped to the request — not
+the request, routinely unbounded on one side. A grid too wide to index densely, a fine step over a long
+span, falls back to a map sized by the samples.
 
 ### Overlapping windows
 
-`AggregateWindow`/`AggregateWindowNamed` answer the *overlapping* range-vector shape — one aggregate
-per step-aligned evaluation timestamp `t` over the half-open window `(t-W, t]`, where `W` may be
-many steps wide (a 1h range at a 5m step is a 12x overlap). Cost stays proportional to the data in
-the request, not to the overlap factor: samples fold **once** into disjoint fine buckets on the same
-`stepGrid` (so the sidecar pushdown still applies — a part inside one fine bucket never decodes),
-and a **sliding accumulator** then walks each series' buckets once, adding the bucket that enters a
-window and subtracting the one that leaves. The fine grid is **left-open** (`(b, b+step]`, unlike the
-`[b, b+step)` of `AggregateStep`) — the only convention a half-open window edge never splits.
+`AggregateWindow`/`AggregateWindowNamed` answer the *overlapping* range-vector shape: one aggregate per
+step-aligned evaluation timestamp `t` over the half-open window `(t-W, t]`, where `W` may be many steps
+wide — a 1h range at a 5m step is a 12× overlap. Cost stays proportional to the data in the request,
+not to the overlap factor:
 
-Count and sum slide by arithmetic; an extremum cannot be subtracted back out (dropping the current
-minimum would force a rescan), so min/max ride **monotonic deques** of entry indices — an arrival
-pops every tail entry it dominates, since such an entry is no better *and* expires no later, leaving
-the front as the window's answer. Each entry is pushed and popped once, so a step stays O(1)
-amortized.
+1. Samples fold **once** into disjoint fine buckets on the same `stepGrid`, so the sidecar pushdown
+   still applies and a part inside one fine bucket never decodes.
+2. A **sliding accumulator** walks each series' buckets once, adding the bucket entering a window and
+   subtracting the one leaving.
 
-The decomposition is exact only when `W` is a multiple of the step; otherwise a window edge can fall
-inside a bucket, and the call falls back to sliding over the merged raw samples of each series.
+Count and sum slide by arithmetic. An extremum cannot be subtracted back out — dropping the current
+minimum would force a rescan — so min/max ride **monotonic deques** of entry indices: an arrival pops
+every tail entry it dominates, such an entry being no better *and* expiring no later, leaving the front
+as the answer, each entry pushed and popped once for O(1) amortized steps.
 
-The grid is **anchored**: `WindowSpec.Anchor` names a timestamp on it, and windows end at
-`Anchor + k*Step`. An evaluation grid belongs to the query, not to the clock — PromQL anchors at the
-query's start, which is a multiple of the step only by coincidence — so the fine buckets are phased
-to match, since a window edge must never fall inside one. The zero value is the absolute grid.
+**The fine grid is left-open** (`(b, b+step]`, unlike `AggregateStep`'s `[b, b+step)`), the only
+convention a half-open window edge never splits. The decomposition is exact only when `W` is a multiple
+of the step; otherwise an edge falls inside a bucket and the call slides over merged raw samples.
 
-Both forms drain one internal `iter.Seq2`, so only one series' windows are resident while it is
-computed rather than series × steps of them. That streaming shape also fixes the instrumentation:
-decode and fold alternate per series, so they are reported as accumulated durations on the one span
-(plus a child span for the contiguous planning phase) rather than as sub-spans — see `ADMIN.md`.
+**The grid is anchored.** `WindowSpec.Anchor` names a timestamp on it and windows end at
+`Anchor + k*Step`. An evaluation grid belongs to the query, not the clock — PromQL anchors at the
+query's start, a multiple of the step only by coincidence — so the fine buckets are phased to match, a
+window edge never falling inside one. The zero value is the absolute grid.
+
+Both forms drain one internal `iter.Seq2`, so only one series' windows are resident rather than
+series × steps. That also shapes the instrumentation: decode and fold alternate per series, so they are
+accumulated durations on one span plus a planning child span, not sub-spans (`ADMIN.md`).
 
 ## Cluster surface
 
-`ApplyPrimary(walBytes)` OOO-checks and admission-checks each sample and returns the accepted set
-re-framed plus a per-reason reject breakdown — the shard's **single authoritative decision**.
-`ApplyReplicated` applies a payload verbatim (like WAL replay). `RefreshReplica` reloads parts from
-the store and trims the head — **series-scoped**: only for series actually present in the flushed
-parts, since a global trim would leave the primary the sole holder of quorum-acked backfill.
+| call | contract |
+|---|---|
+| `ApplyPrimary(walBytes)` | the shard's single authoritative accept/reject decision |
+| `ApplyReplicated` | applies a payload verbatim, like WAL replay |
+| `RefreshReplica` | reloads parts from the store and trims the head, series-scoped |
+
+`ApplyPrimary` OOO-checks and admission-checks each sample, returning the accepted set re-framed plus a
+per-reason reject breakdown. `RefreshReplica` trims only series actually present in the flushed parts;
+a global trim would leave the primary the sole holder of quorum-acked backfill.
