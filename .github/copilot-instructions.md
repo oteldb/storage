@@ -67,13 +67,16 @@ One rule, by destination: the *why* goes in `ARCH.md`; code comments only what t
 
 | where | what belongs there |
 |---|---|
-| `ARCH.md` | rationale, trade-offs, alternatives rejected, cross-package contracts, measured numbers |
+| `ARCH.md` | rationale, trade-offs, cross-package contracts, measured numbers — present tense, no change history |
 | godoc | 1–2 lines per exported symbol (revive's `exported` rule is active — not optional), plus what an embedder cannot infer from the signature |
 | inline | non-obvious mechanics only: platform-dependent code, silent-failure traps, complexity hazards, deliberate deviations from the obvious implementation |
 
 - **Never restate the code.** Prefer self-documenting names; a comment a reader could get from the
   line below it is bloat.
 - **Density is not a style to match.** Apply the table, not the neighbouring file's comment volume.
+- **No history.** `ARCH.md` describes the system as it stands. State a rejected alternative as a
+  present-tense cost, not a chronology; keep a measured number even when an incident produced it.
+  Where the current design looks arbitrary without it, one sentence of cause — not a paragraph.
 - **Public config/policy surface is exempt** — `tenant/`, `options.go`, `query/fetch/` are
   embedder-facing API documentation, not implementation commentary. Their density is correct as-is;
   do not trim it.
