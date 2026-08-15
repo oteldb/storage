@@ -72,11 +72,11 @@ func TestHTTPReplicationRoundTrip(t *testing.T) {
 	err := rp.Replicate(context.Background(), targets("local", addrB, addrC), []byte("payload"))
 	require.NoError(t, err)
 
-	// Quorum is 2 of 3; A always applies locally, so at least one remote also applied. Give
-	// the best-effort third a moment, then assert every replica eventually has the write.
-	assert.Equal(t, 1, a.count(), "local applied")
-	assert.Eventually(t, func() bool { return b.count() == 1 && c.count() == 1 }, time.Second, 20*time.Millisecond,
-		"both remotes received the replicated write over HTTP")
+	// Quorum is 2 of 3 and every target — the local one included — is applied in its own
+	// goroutine, so Replicate can return on the two remotes' acks before the local apply has run.
+	// The non-quorum remainder is best-effort, so all three are eventual.
+	assert.Eventually(t, func() bool { return a.count() == 1 && b.count() == 1 && c.count() == 1 },
+		time.Second, 20*time.Millisecond, "every replica received the write over HTTP")
 }
 
 func TestHTTPRemoteApplyErrorFailsSend(t *testing.T) {
