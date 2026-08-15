@@ -58,8 +58,29 @@ comments instead, and reference `ARCHITECTURE.md` (which is committed) when a po
   transport-free (the embedder still owns those).
 - **Follow the milestone order** in `DESIGN.md` §14. Don't build a layer before the one it
   depends on exists and is tested. Current target: M0 (encoding foundations), metrics vertical first.
-- **Match the surrounding code** — its naming, comment density, and idioms. Don't introduce a new
-  style or dependency without reason.
+- **Match the surrounding code** — its naming and idioms. Don't introduce a new style or dependency
+  without reason. Comment volume is not part of that; see "Comments".
+
+## Comments
+
+One rule, by destination: the *why* goes in `ARCH.md`; code comments only what the code cannot say.
+
+| where | what belongs there |
+|---|---|
+| `ARCH.md` | rationale, trade-offs, cross-package contracts, measured numbers — present tense, no change history |
+| godoc | 1–2 lines per exported symbol (revive's `exported` rule is active — not optional), plus what an embedder cannot infer from the signature |
+| inline | non-obvious mechanics only: platform-dependent code, silent-failure traps, complexity hazards, deliberate deviations from the obvious implementation |
+
+- **Never restate the code.** Prefer self-documenting names; a comment a reader could get from the
+  line below it is bloat.
+- **Density is not a style to match.** Apply the table, not the neighbouring file's comment volume.
+- **No history.** `ARCH.md` describes the system as it stands. State a rejected alternative as a
+  present-tense cost, not a chronology; keep a measured number even when an incident produced it.
+  Where the current design looks arbitrary without it, one sentence of cause — not a paragraph.
+- **Public config/policy surface is exempt** — `tenant/`, `options.go`, `query/fetch/` are
+  embedder-facing API documentation, not implementation commentary. Their density is correct as-is;
+  do not trim it.
+- **No repo-wide comment sweeps.** Trim only inside the change you are already making.
 
 ## Go conventions
 
