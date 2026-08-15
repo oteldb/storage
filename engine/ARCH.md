@@ -57,7 +57,7 @@ Merge writes the same shape, committing the new part set before deleting sources
 ### Identity is part-scoped
 
 Each part carries its own series' identities, written and deleted with its other objects. Three
-properties follow, and they are why the whole-set `series.bin` is gone:
+properties follow, and they are what a whole-set identity object cannot give:
 
 | property | consequence |
 |---|---|
@@ -65,10 +65,11 @@ properties follow, and they are why the whole-set `series.bin` is gone:
 | a flush persists only what it wrote | 88 B to add one series to a 20k-series tenant |
 | every node derives its own live set | a replica prunes its own parts, no ownership rule |
 
-The old object was re-serialized in full on any change: ~40 B/series interned, against ~218 B/series
-repeating the label bytes. An older prefix's `series.bin` is read at open, then deleted once every live
-part carries its own identities, so recovery cannot resurrect identities whose data is gone. Identity
-is read on recovery and by a replica adopting a part, never by a query.
+A whole-set object has to be re-serialized in full on any change, and costs ~218 B/series by repeating
+the label bytes, against ~40 B/series interned here. A prefix carrying one (`series.bin`) is read at
+open and deleted once every live part carries its own identities, so recovery cannot resurrect
+identities whose data is gone. Identity is read on recovery and by a replica adopting a part, never by
+a query.
 
 **The WAL carries its own identities.** A flush checkpoints it, discarding the series records written
 when identities were first seen, so a record is logged whenever a series starts a **new sample
@@ -169,7 +170,7 @@ references size against storage instead (VictoriaMetrics `getMaxOutBytes`, Click
 again to let a merge's output coexist with inputs it has not yet retired. `MergeConcurrency` is a
 **callback**, since fan-out is bounded by the node's engine count as much as by the worker limit and
 engines appear lazily; fixed at engine creation it would divide a single-tenant node's disk by its core
-count, landing a 32-core box back at the constant it replaces.
+count, leaving a 32-core box a thirty-second of it.
 
 **Degenerate cases.** Backends that cannot report free space (`Memory`, object stores) keep the
 ceiling. A nearly full disk falls to `minMergeCapBytes` rather than sealing everything, since stranding
@@ -241,8 +242,8 @@ Disk-pressure eviction shares `RetainFrom`, so it drops whole parts too.
 
 ### Selection is confined to an aligned time bucket (`timebucket.go`)
 
-Size tiers have no notion of time, so selection merged a part covering hour 3 into one covering hours
-0–48; the output spanned the whole store and every part then overlapped every query window (#308).
+Selection is bucketed by time, not by size alone: size tiers have no notion of time, so an unbucketed
+selector folds an hour-wide part into a day-wide one until every part overlaps every query window.
 
 ```
 mergeLadder:  1h  →  6h  →  24h      each level divides the next, so buckets nest
@@ -257,15 +258,14 @@ narrowest-first, so each part is rewritten once per level rather than repeatedly
 finest level is exempt: flushes land there, and letting them accumulate is the part-count growth
 sealing exists to bound.
 
-**Forced rewrites are confined too, and win the cycle.** Unioned with the size-tiered run they merged
-parts from opposite ends of the store into one spanning both, on the cycle most likely to run. Now the
-oldest forced part picks the bucket, the rest of that bucket rides along if it fits the cap (merging
-inside a bucket cannot widen), and the size-tiered run waits.
+**Forced rewrites are confined too, and win the cycle.** The oldest forced part picks the bucket, the
+rest of that bucket rides along if it fits the cap, and the size-tiered run waits — unioning the two
+would merge parts from opposite ends of the store into one spanning both. Merging inside a bucket
+cannot widen.
 
 **A straddler belongs to no bucket** and cannot join one without widening the output, so it is left out
-of ladder groups — but rewritten *alone* when forced, since retention correctness does not wait on
-straddle splitting. Parts written before bucketing are mostly straddlers, so the ladder narrows new
-parts and leaves old wide ones until straddle splitting lands.
+of ladder groups, and a store can hold wide parts the ladder never narrows. A forced straddler is
+rewritten *alone* rather than skipped: retention correctness does not depend on splitting it.
 
 ### Run selection (`compact.go`)
 
@@ -284,14 +284,14 @@ Re-merging a sealed part would only re-split it. Sealing and the run budget are 
 (`part.sizeBytes`), and `maxMergeParts` bounds a run too, so a large disk-derived budget cannot make
 one merge unbounded. Scoring follows VictoriaMetrics' `appendPartsToMerge`.
 
-**Ordered by size, not bucketed.** Bucketing stranded leftovers: a part alone in its power-of-two tier
-never reached the two-per-tier threshold, nothing landed in that tier again, and it was carried by
-every query for the engine's lifetime (#285). Ordering alone does not fix it — leftovers spread
-geometrically, one per former tier, so every run over them fails the balance test or scores under
-`minMergeMultiplier`. Hence the escapes: the guards argue about the proportion of bytes rewritten,
-meaningless when the whole rewrite is cheap, and rewriting a large part once to absorb a stray beats
-carrying it forever. `Force` supplies an idle count already at `mergeIdleRounds`, so it is the same
-selection the engine would reach on its own — bypassing the heuristic, never the memory bound.
+**Ordered by size, not bucketed into size tiers:** a tier scheme strands a part alone in its
+power-of-two tier, where it never reaches the two-per-tier threshold and is carried by every query for
+the engine's lifetime. Ordering alone is not enough, because such strays sit geometrically apart and
+every run over them fails the balance test or scores under `minMergeMultiplier` — hence the two
+escapes. The guards reason about the proportion of bytes rewritten, which is meaningless when the whole
+rewrite is cheap, and rewriting a large part once to absorb a stray beats carrying it forever. `Force`
+supplies an idle count already at `mergeIdleRounds`, so it is the same selection the engine reaches on
+its own — bypassing the heuristic, never the memory bound.
 
 The selector works in size order but returns the run in engine part order, so the merge visits sources
 oldest → newest and a later part's value wins a duplicate timestamp.
@@ -313,19 +313,20 @@ source part ─ forward cursor ┘  (one series range   (streampart.go)    encod
 ```
 
 Working set is O(parts × one series range) plus the *encoded* output — not O(dataset), and not the
-output's uncompressed rows. That second half matters for granularity: the row cap used to set peak
-merge memory as well as part size (`capRows × 32 B`, 512 MiB at the default), so raising it to widen
-parts raised merge RSS; now it only sets part size. Measured on a 2M-row merge, total allocation fell
-3.7–5.4× and peak heap 2.9–3.8×, the wider margin on counter-shaped data.
+output's uncompressed rows. That second half decouples granularity from memory: the row cap sets part
+size only, where buffering the output would also make it the peak-memory knob (`capRows × 32 B`, 512
+MiB at the default), so a cap raised to widen parts would raise merge RSS with it. On a 2M-row merge
+streaming costs 3.7–5.4× less total allocation and 2.9–3.8× less peak heap than buffering, the wider
+margin on counter-shaped data.
 
 Sidecars stream with it: series index, identities and aggregate stats come from the same per-series
 calls, each run- or series-shaped, so they cost O(distinct series), not O(rows). Encoding decisions
 must be fixed before the first row — compression profile, precision budget, whether a weight column
 exists — so `mergeEncoding` derives them from the sources up front; its doc has why that is equivalent.
 
-The single-part forced-rewrite path (`writeColumns`) still buffers whole columns: its fixed-point check
-needs the post-downsample row count before deciding to write at all. It is bounded by one part, and is
-not the routine compaction tick.
+The single-part forced-rewrite path (`writeColumns`) buffers whole columns: its fixed-point check needs
+the post-downsample row count before deciding to write at all. It is bounded by one part, and is not
+the routine compaction tick.
 
 ### Publish ordering
 
@@ -367,8 +368,8 @@ the parts it will touch.
 already carries each block's `[MinKey, MaxKey]` sample times (`block/ARCH.md`). A block-sliced fetch
 drops blocks that cannot intersect the window before reading them, and sizes the decode reservation
 over the survivors. Rows are `(series, ts)`-sorted, so granule bounds are not monotonic across a part,
-but they are inside one series' row range — where the test applies. Without it a narrow window cost a
-full part scan: a long series was decoded whole and discarded row by row. Derived and advisory —
+but they are inside one series' row range — where the test applies. Without it a narrow window costs a
+full part scan, a long series being decoded whole and discarded row by row. Derived and advisory —
 absent, corrupt or mismatched marks prune nothing.
 
 **Recent tier** (`Config.RecentWindow`) — mirrors the most recent flush window in RAM across flushes,

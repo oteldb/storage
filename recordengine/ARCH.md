@@ -27,13 +27,11 @@ sidecars live under its own prefix, so `deletePart` reclaims them with it.
 **Merge selection is confined to an aligned time bucket** (`timebucket.go`) — the same `mergeLadder`
 (1h → 6h → 24h, nesting), walked narrowest-first, newest bucket skipped above the finest level, forced
 rewrites confined to one bucket and winning the cycle. [`../engine/ARCH.md`](../engine/ARCH.md),
-"Selection is confined to an aligned time bucket", has the mechanics and the failure each rule fixes;
-here `pickTierGroup` is the selector that runs unchanged inside one group.
+"Selection is confined to an aligned time bucket", has the mechanics and what each rule prevents; here
+`pickTierGroup` is the selector that runs unchanged inside one group.
 
 It matters more here than for metrics: record queries are overwhelmingly narrow and recent, and a
-record row carries far more bytes than a sample, so opening an unneeded part costs more. Before
-bucketing, a merge folded a one-hour part into one covering the whole retention, and every part then
-overlapped every query window.
+record row carries far more bytes than a sample, so opening an unneeded part costs more.
 
 ### Every size is measured
 
@@ -44,10 +42,9 @@ overlapped every query window.
 | a part's footprint | `Manifest.RawBytes` → `part.sizeBytes`, recorded at write |
 | size tiers, seal threshold | compare those |
 
-A row count cannot stand in: the same count is ten 1 MiB records or ten thousand 1 KiB ones. The
-assumed-average-row-size model that preceded this was wrong by that ratio — a 256 B assumption against
-~950 B real rows decoded ~4× the intended bytes per merge. `recordRowBytes` survives only as the
-fallback for a part written before the manifest carried the figure.
+A row count cannot stand in: the same count is ten 1 MiB records or ten thousand 1 KiB ones. Nor can an
+assumed average row size — a 256 B assumption against ~950 B real rows decodes ~4× the intended bytes
+per merge. `recordRowBytes` is the fallback for a part whose manifest does not carry the figure.
 
 ### Merge cap
 
@@ -57,8 +54,8 @@ cap = max( one flushed part,                              ← floor: retention m
                 MergeMemoryBytes / MergeConcurrency / 3 ) )
 ```
 
-The memory term is the one the metric engine also grew, for the same reason: a cap sized against
-storage says nothing about what the process can hold. It is *decoded* bytes here, because that is what
+The metric engine has the same memory term, for the same reason: a cap sized against storage says
+nothing about what the process can hold. It is *decoded* bytes here, because that is what
 this merge holds — sources are decoded up front and the output accumulates decoded before it is
 encoded, hence dividing by three (sources + output buffer + the encode of it). Free space does not
 enter; the flush cap and the tiering target bound the disk.
@@ -126,8 +123,7 @@ with identity in the parts (which retention can drop) nothing else would name it
 ## Identity prune
 
 `PruneIdentities` drops the identities retention leaves behind, which otherwise accumulate for the
-process' lifetime under stream churn — the `instance.id`-shaped attributes that turned ~24 stable
-streams into ~15k.
+process' lifetime under stream churn: `instance.id`-shaped attributes turn ~24 stable streams into ~15k.
 
 The **live set** is every live part's stream ids, resident already in `part.ranges` (so unlike the
 metrics engine it costs no I/O), plus the head and the mid-flush detachment. Symbol ids are dense and
@@ -206,8 +202,8 @@ Heavily tuned around decoding as little as possible.
 
 Every column of a part is **block-framed**, so a reader decodes one granule at a time, and the marks
 sidecar carries each granule's `[minTime, maxTime]`. A windowed fetch decodes only the granules its
-rows occupy. Without it part span was the *only* time filter records had — a 15-minute query against a
-day-wide part decoded the day, measured at **286× the rows needed** on a real log corpus.
+rows occupy. Without it part span is the *only* time filter records have, and a 15-minute query against
+a day-wide part decodes the day: **286× the rows needed** on a real log corpus.
 
 Selection comes from the **requested streams'** row ranges, not the whole part. Rows are
 `(stream, ts)`-ordered, so granule bounds are not monotonic across a part, but each stream owns one
@@ -222,12 +218,12 @@ so the row-range index and `tsWindow` work unchanged; rows outside selected gran
 **Invariant: the timestamp column is never pruned** — it is decoded whole however narrow the window.
 Row selection reads timestamps directly (binary search over each stream's ts-ascending run, see
 `tsWindow`), so unspecified timestamps break the search's precondition and let it return rows the
-window never covered, whose value columns are equally unspecified. Measured on the real log corpus,
-pruning the timestamp column made a 15-minute level filter report **889,390 rows where the true answer
-is 483,076**. Decoding it whole restores the invariant everything else rests on: selection is driven by
-real timestamps, and every row selection can reach lies in a granule overlapping the window — which is
-a granule pruning always keeps. The column is delta-of-delta int64 and tiny next to the bodies and
-attributes the pruning exists to skip.
+window never covered, whose value columns are equally unspecified. On the real log corpus, pruning the
+timestamp column makes a 15-minute level filter report **889,390 rows where the true answer is
+483,076**. Decoding it whole is what everything else rests on: selection is driven by real timestamps,
+so every row selection can reach lies in a granule overlapping the window — which is a granule pruning
+always keeps. The column is delta-of-delta int64 and tiny next to the bodies and attributes the pruning
+exists to skip.
 
 The stream id column stays unframed: a fetch resolves streams through the row-range index and never
 decodes it.
@@ -277,10 +273,10 @@ A dictionary column memoizes per *distinct entry* (≤ 65536, filled lazily so a
 pays only per touched entry), keeping a regex — or an attribute lookup that re-parses the `attrs` blob
 — off the per-row path. An int column memoizes per *distinct value* over a small fixed non-negative
 domain, where enum-shaped columns live (`severity`, status codes); a value outside it costs only a
-range check. The domain is fixed rather than derived from the column's min/max because deriving
-measured as a net loss: a condition short-circuited by an earlier, more selective one may never be
-probed, so a memo must cost nothing until first use. Reordering is sound because conditions are an AND
-of pure predicates; `Match` stays an opaque callback.
+range check. The domain is fixed, not derived from the column's own min/max: a deriving pass costs more
+than it saves, since a condition short-circuited by an earlier, more selective one may never be probed
+at all, so a memo must cost nothing until its first use. Reordering is sound because conditions are an
+AND of pure predicates; `Match` stays an opaque callback.
 
 **Equality fast path.** An exact-match condition against a `CodecBytesRaw` column no other condition
 targets skips the dict decode: the flat blob is decoded once and scanned with
