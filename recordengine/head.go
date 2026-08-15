@@ -333,8 +333,8 @@ func (h *head) recordCount(id signal.SeriesID) int {
 }
 
 // appendWindow appends stream id's buffered records whose timestamp is in [start, end] to acc.
-func (h *head) appendWindow(id signal.SeriesID, acc *recordCols, start, end int64) {
-	appendColsWindow(h.records[id], acc, start, end)
+func (h *head) appendWindow(id signal.SeriesID, acc *recordCols, start, end int64) error {
+	return appendColsWindow(h.records[id], acc, start, end)
 }
 
 // appendColsWindow appends buf's rows whose timestamp is in [start, end] to acc. No-op when buf is
@@ -342,22 +342,40 @@ func (h *head) appendWindow(id signal.SeriesID, acc *recordCols, start, end int6
 // one bulk [recordCols.appendRange] — one blob copy per byte column instead of a per-row append that
 // re-grows the accumulator's blobs. The buffer is unsorted (arrival order), so the fast path keys off
 // the tracked tsMin/tsMax bounds, not the endpoint rows.
-func appendColsWindow(buf, acc *recordCols, start, end int64) {
+func appendColsWindow(buf, acc *recordCols, start, end int64) error {
 	if buf == nil || buf.len() == 0 {
-		return
+		return nil
 	}
 
+	// Appending every row bounds any subset of them, so this one check leaves the row loop below
+	// unguarded whenever the buffer cannot overflow the accumulator however the window falls.
+	name, over := acc.appendRangeOverflows(buf, 0, buf.len())
+
 	if buf.tsMin >= start && buf.tsMax <= end {
+		if over {
+			return errColumnTooLarge(name)
+		}
+
 		acc.appendRange(buf, 0, buf.len())
 
-		return
+		return nil
 	}
 
 	for i := range buf.ts {
-		if buf.ts[i] >= start && buf.ts[i] <= end {
-			acc.appendRow(buf, i)
+		if buf.ts[i] < start || buf.ts[i] > end {
+			continue
 		}
+
+		if over {
+			if n, rowOver := acc.appendRangeOverflows(buf, i, i+1); rowOver {
+				return errColumnTooLarge(n)
+			}
+		}
+
+		acc.appendRow(buf, i)
 	}
+
+	return nil
 }
 
 // bufInRange reports whether buf holds any record with timestamp in [start, end]. No-op (false) when

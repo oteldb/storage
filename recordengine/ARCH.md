@@ -175,10 +175,18 @@ enforced rather than assumed.
 |---|---|
 | `headByteCap` (2 GiB, hard) | the live buffers: a bound on the *next* part's blobs |
 | `MaxInFlightBytes` | everything resident |
+| `byteColCap` (2 GiB, hard) | one fetch accumulator's blob per byte column |
 
 A flush concatenates every stream's cells into one blob per byte column, indexed by `byteCol`'s int32
 offsets, so overflowing `headByteCap` would write **negative offsets** into a part; past the cap
 records are rejected as backpressure.
+
+**Invariant: every accumulation into a `byteCol` is bounded by its caller.** A fetch accumulator is
+the second one. It merges the head, the in-flight flush buffer and every part the stream appears in,
+so neither `headByteCap` (one buffer) nor `MaxPartBytes` (one part) bounds it, and a wide window over
+a hot stream can exceed 2 GiB. The append paths do not check, so `appendColsWindow` and
+`appendWindowRows` reject first: an overflow is otherwise silent at the append and surfaces as a
+slice-bounds panic in `byteCol.at` once the accumulator is ts-sorted.
 
 **"Resident" includes the detached buffers.** `head.detach` moves them aside, but they — and the flush
 columns built from them — live until the part is published, so their size is parked in
