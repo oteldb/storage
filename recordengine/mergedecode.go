@@ -76,12 +76,12 @@ func (p *part) readForMerge(ctx context.Context) (*decodedPart, error) {
 	}
 
 	var err error
-	if d.ts, err = p.readInt64(ctx, colTs, nil); err != nil {
+	if d.ts, err = p.readInt64(ctx, colTs, nil, nil); err != nil {
 		return nil, err
 	}
 
 	for k := range d.ints {
-		if d.ints[k], err = p.readInt64(ctx, p.schema.intColumn(k).Name, nil); err != nil {
+		if d.ints[k], err = p.readInt64(ctx, p.schema.intColumn(k).Name, nil, nil); err != nil {
 			return nil, err
 		}
 	}

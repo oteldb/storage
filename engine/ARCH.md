@@ -226,6 +226,33 @@ subsystem.
   merge — copy-on-write swap, index commit, then retire — so a failed commit rolls back and the
   parts stay live. Since the size-based cutoff shares `RetainFrom`, disk-pressure eviction drops
   whole parts too.
+- **Selection is confined to an aligned time bucket** (`timebucket.go`). Size-tiered selection has
+  no notion of time, so it happily merged a part covering hour 3 into one covering hours 0–48 and
+  the output spanned the whole store; every part then overlapped every query window (#308). Parts
+  are grouped by their aligned bucket on the `mergeLadder` (1h → 6h → 24h, each level dividing the
+  next so buckets nest), and the size-tiered selector below runs **unchanged inside one group**, as
+  in ClickHouse where the size selector is only ever fed one partition. The top level is therefore
+  the widest part the engine will build, and the coarsest time locality a query can rely on.
+
+  The ladder is walked narrowest-first, so a bucket collapses at 1h before its result is eligible to
+  merge with neighbors at 6h — each part is rewritten once per level, not repeatedly at the widest.
+  Above the finest level the still-filling newest bucket is skipped (merging it now guarantees
+  merging it again); the finest level is exempt, since that is where flushes land and letting them
+  accumulate is the part-count growth sealing exists to bound.
+
+  **Forced rewrites are confined too, and win the cycle outright.** The forced set used to be
+  unioned with the size-tiered run and merged as one part, so a retention pass over a store with any
+  age spread rewrote parts from opposite ends of it into a single part spanning both — re-widening
+  on the cycle most likely to run. The oldest forced part now picks the bucket, the rest of that
+  bucket rides along when it fits the cap (merging inside a bucket cannot widen), and the
+  size-tiered run waits for the next cycle. A part straddling every level belongs to no bucket and
+  is rewritten *alone* rather than skipped: retention correctness does not wait on straddle
+  splitting.
+
+  A part that straddles a boundary at every level is otherwise left out of ladder groups — it cannot
+  join one without widening its group's output. Parts written before bucketing existed are mostly of
+  this shape, so the ladder narrows *new* parts and leaves old wide ones as they are until
+  flush-time and merge-time straddle splitting lands.
 - **Run selection** (`compact.go`) picks only what is worth merging: any part a forced rewrite must
   touch (retention/downsample/recompress/precision — so age-driven work is never starved), plus the
   best run of *unsealed* parts. A part at the merge cap is **sealed** — re-merging it would only

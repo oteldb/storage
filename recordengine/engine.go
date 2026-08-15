@@ -880,6 +880,11 @@ type fetchPlan struct {
 	evalScratch []condEval
 	memoScratch [][]uint8
 
+	// idLookup is ids as a set, built once on first use and reused across parts. Granule selection
+	// needs membership tests per part; building the set per part would cost exactly what the set is
+	// there to avoid (see [part.windowGranules]).
+	idLookup map[signal.SeriesID]struct{}
+
 	// Top-N scan (see limitscan.go): limit/reverse mirror the request, and partsSkippedLimit counts
 	// the live parts the watermark let the scan stop before reading.
 	limit             int
@@ -1002,7 +1007,7 @@ func (p *fetchPlan) readParts(ctx context.Context) error {
 	}
 
 	for i, part := range p.liveParts {
-		cols, err := part.readCols(ctx, p.sel, p.e.getI64)
+		cols, err := part.readCols(ctx, p.sel, p.e.getI64, part.windowGranules(ctx, p.ids, p.idLookupSet(), p.start, p.end))
 		if err != nil {
 			return err
 		}

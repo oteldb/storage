@@ -117,7 +117,7 @@ func TestMergeDecodeDictCompact(t *testing.T) {
 
 	p := e.parts[0]
 
-	full, err := p.readCols(ctx, fullSel(schema), nil)
+	full, err := p.readCols(ctx, fullSel(schema), nil, nil)
 	require.NoError(t, err)
 	expanded := recordColsByteBytes(full)
 

@@ -16,6 +16,25 @@ and the same lock discipline (see [`../engine/ARCH.md`](../engine/ARCH.md)). Not
   a part whose `maxTime` is already past the cutoff is retired on the manifest alone, with no
   decode and no output part, so only a part *straddling* the cutoff is rewritten. A record part's
   side-store and bloom sidecars live under its own prefix, so `deletePart` reclaims them with it.
+- **Merge selection is confined to an aligned time bucket** (`timebucket.go`), mirroring the metric
+  engine. Size tiers have no notion of time, so a merge folded a part covering one hour into one
+  covering the whole retention and every part then overlapped every query window. Parts are grouped
+  by their aligned bucket on the `mergeLadder` (1h → 6h → 24h, each level dividing the next so
+  buckets nest) and `pickTierGroup` runs **unchanged inside one group**; the ladder is walked
+  narrowest-first, so a part is rewritten once per level rather than repeatedly at the widest. Above
+  the finest level the still-filling newest bucket is skipped; the finest level is exempt, since
+  that is where flushes land.
+
+  This matters more here than for metrics: record queries are overwhelmingly narrow and recent, and
+  a record row carries far more bytes than a sample, so opening a part the window did not need costs
+  more.
+
+  **Retention-forced rewrites are confined too, and win the cycle** rather than being unioned with a
+  tier group — that union merged parts from opposite ends of the store into one spanning both, on
+  the cycle most likely to run. The oldest forced part picks the bucket and the rest of that bucket
+  rides along when it fits the cap (merging inside a bucket cannot widen). A part straddling every
+  level belongs to no bucket and is rewritten *alone* rather than skipped: retention correctness
+  does not wait on straddle splitting.
 - Records are variable-width, so every size is **measured, not modeled**. `MaxPartBytes` is spent in
   the *decoded* bytes a row holds (`flushColumns.rowBytes`), the flush splits on them
   (`byteRanges`), a part records its decoded footprint in its manifest (`Manifest.RawBytes` →
@@ -178,6 +197,38 @@ are cleared only with the head. (The metrics engine still compares against a hea
 
 Heavily tuned around decoding as little as possible:
 
+- **Granule time pruning** (`granule.go`) — every column of a part is **block-framed**, so a reader
+  decodes one granule at a time, and the marks sidecar carries each granule's `[minTime, maxTime]`.
+  A windowed fetch decodes only the granules its rows occupy. Without it part span was the *only*
+  time filter records had — a 15-minute query against a day-wide part decoded the day, measured at
+  286× the rows needed on a real log corpus.
+
+  The selection is taken from the **requested streams'** row ranges, not the whole part. Rows are
+  `(stream, ts)`-ordered, so granule bounds are not monotonic across a part, but each stream owns one
+  contiguous ts-ascending run — which is what makes a service-filtered query touch a handful of
+  granules. `nil` means "decode everything", returned both when marks are unusable and when nothing
+  pruned, so the whole-column path stays on its simpler route.
+
+  Selection walks whichever is smaller, the requested ids or the part's own streams (the latter via
+  the plan's id set, built once per query). Both yield the same granules; a query with no matchers
+  requests every stream in the tenant, so walking the request would cost hundreds of thousands of
+  lookups per part to skip a handful of granules.
+
+  Decoded rows land at their **part row offsets**, pruned or not, so the row-range index and
+  `tsWindow` keep working unchanged. Rows outside the selected granules are *unspecified*.
+
+  **The timestamp column is therefore never pruned** — it is decoded whole however narrow the window.
+  Row selection reads timestamps directly (binary search over each stream's ts-ascending run, see
+  `tsWindow`), so unspecified timestamps break the search's precondition and let it return rows the
+  window never covered, whose value columns are equally unspecified. Measured on the real log corpus,
+  pruning the timestamp column made a 15-minute level filter report 889,390 rows where the true answer
+  is 483,076. Decoding it whole restores the invariant everything else rests on: selection is driven by
+  real timestamps, and every row selection can reach lies in a granule overlapping the window — which
+  is a granule pruning always keeps. The column is delta-of-delta int64 and tiny next to the bodies and
+  attributes the pruning exists to skip.
+
+  The stream id column stays unframed: a fetch resolves streams through the row-range index and never
+  decodes it.
 - **Lazy column decode** — materialize only the columns the request's conditions + projection
   reference (a body search projecting body touches just `ts`+`body`).
 - Decode each surviving part **once**, distributing rows to per-stream accumulators pre-sized from

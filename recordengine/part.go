@@ -2,6 +2,7 @@ package recordengine
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 
 	"github.com/oteldb/storage/backend"
@@ -30,6 +31,12 @@ type part struct {
 	// recordKeys is the part's distinct per-record attribute keys (the "keys.bin" footer), for
 	// [Engine.Keys] enumeration. nil when the part has no record attributes (or predates the footer).
 	recordKeys [][]byte
+
+	// marksOnce lazily loads the sparse granule index on the first fetch that can prune with it;
+	// granules is nil when the object is absent/corrupt or its granularity does not line up with the
+	// part's framing, which leaves every granule a candidate. See granule.go.
+	marksOnce sync.Once
+	granules  []block.Granule
 
 	// minTime, maxTime are the inclusive unix-ns record bounds of the part (from the columns when
 	// written, from the bucket index when reconstructed), for time pruning.
@@ -125,8 +132,9 @@ func (p *part) holdsAny(ids []signal.SeriesID) bool {
 // stay nil — lazy decode). Returned byte slices are freshly decoded (owned by the caller). getI64,
 // when non-nil, supplies reusable int-column scratch from a pool (the fetch path, whose decoded int
 // columns are copied out and then recycled by [Engine.recycleDecodeInts]); pass nil to decode into
-// fresh slices (the merge path, which has no recycle point).
-func (p *part) readCols(ctx context.Context, sel colSel, getI64 func() []int64) (*recordCols, error) {
+// fresh slices (the merge path, which has no recycle point). blocks selects the granules to decode
+// (nil ⇒ all), so a windowed fetch reads only the granules its rows occupy.
+func (p *part) readCols(ctx context.Context, sel colSel, getI64 func() []int64, blocks []int) (*recordCols, error) {
 	c := &recordCols{schema: p.schema, sel: sel, ints: make([][]int64, p.schema.numInts()), bytes: make([]byteCol, p.schema.numBytes())}
 
 	dst := func() []int64 {
@@ -137,14 +145,26 @@ func (p *part) readCols(ctx context.Context, sel colSel, getI64 func() []int64) 
 		return nil
 	}
 
+	// The timestamp column is decoded whole, never pruned, however narrow the window.
+	//
+	// Pruning leaves the rows of unselected granules *unspecified* — that is the blocked decoder's
+	// contract, and it is what makes pruning cheap. Row selection reads the timestamps directly
+	// (binary search over each stream's ts-ascending range, see [tsWindow]), so unspecified
+	// timestamps would break the search's precondition and let it return rows the window never
+	// covered — with the value columns of those rows equally unspecified.
+	//
+	// Decoding it whole restores the invariant the rest of the pruning rests on: selection is driven
+	// by real timestamps, and every row that selection can reach lies in a granule overlapping the
+	// window, which is a granule pruning always keeps. The column is int64 delta-of-delta and tiny
+	// next to the bodies and attributes the pruning is actually there to skip.
 	var err error
-	if c.ts, err = p.readInt64(ctx, colTs, dst()); err != nil {
+	if c.ts, err = p.readInt64(ctx, colTs, dst(), nil); err != nil {
 		return nil, err
 	}
 
 	for k := range c.ints {
 		if sel.ints[k] {
-			if c.ints[k], err = p.readInt64(ctx, p.schema.intColumn(k).Name, dst()); err != nil {
+			if c.ints[k], err = p.readInt64(ctx, p.schema.intColumn(k).Name, dst(), blocks); err != nil {
 				return nil, err
 			}
 		}
@@ -152,7 +172,7 @@ func (p *part) readCols(ctx context.Context, sel colSel, getI64 func() []int64) 
 
 	for k := range c.bytes {
 		if sel.bytes[k] {
-			if c.bytes[k], err = p.readBytes(ctx, p.schema.byteColumn(k).Name); err != nil {
+			if c.bytes[k], err = p.readBytes(ctx, p.schema.byteColumn(k).Name, blocks); err != nil {
 				return nil, err
 			}
 		}
@@ -161,34 +181,85 @@ func (p *part) readCols(ctx context.Context, sel colSel, getI64 func() []int64) 
 	return c, nil
 }
 
-func (p *part) readInt64(ctx context.Context, name string, dst []int64) ([]int64, error) {
+// readInt64 decodes the named int column. blocks selects the granules to decode (nil ⇒ all); an
+// unblocked column ignores it and decodes whole, so a part written before framing still reads.
+// Decoded rows land at their part row offsets either way, so a caller's row indices stay valid.
+func (p *part) readInt64(ctx context.Context, name string, dst []int64, blocks []int) ([]int64, error) {
 	col, err := p.reader.Column(ctx, name)
 	if err != nil {
 		return nil, err
 	}
 
-	return col.Int64(dst)
+	if blocks == nil {
+		return col.Int64(dst)
+	}
+
+	return col.DecodeBlocksInt64(dst, blocks)
+}
+
+// decodeDict decodes a byte column, restricted to the given granules when the caller pruned (nil ⇒
+// the whole column). An unblocked column decodes whole either way, so a part written before framing
+// still reads.
+func decodeDict(col *block.ColumnReader, blocks []int) (*chunk.DictColumn, error) {
+	if blocks == nil || !col.Blocked() {
+		return col.Bytes()
+	}
+
+	return col.DecodeBlocksBytesIntoColumn(blocks)
 }
 
 // readBytes decodes the named byte column into the contiguous offsets+blob [byteCol] layout,
 // concatenating the per-row cells (which the dictionary decoder returns as views into its shared
 // entries) into one owned blob so the fetch/scan path reads cells with locality and the GC scans two
 // slice headers per column instead of one per row.
-func (p *part) readBytes(ctx context.Context, name string) (byteCol, error) {
+func (p *part) readBytes(ctx context.Context, name string, blocks []int) (byteCol, error) {
 	col, err := p.reader.Column(ctx, name)
 	if err != nil {
 		return byteCol{}, err
 	}
 
-	dc, err := col.Bytes()
+	dc, err := decodeDict(col, blocks)
 	if err != nil {
 		return byteCol{}, err
 	}
 
 	n := dc.Len()
 	out := byteCol{offsets: make([]int32, 1, n+1)}
+
+	if blocks == nil {
+		for i := range n {
+			out.appendCell(dc.At(i))
+		}
+
+		return out, nil
+	}
+
+	// Only the selected granules hold values this query will read. Unselected rows still get a cell
+	// — the blob is indexed by part row, and shifting it would invalidate the row ranges the fetch
+	// already resolved — but an empty one, so the copy costs what the selection covers rather than
+	// what the part holds. Without this the decode prunes and the materialization undoes it.
+	size := p.reader.Manifest().GranuleSize
+	if size <= 0 {
+		for i := range n {
+			out.appendCell(dc.At(i))
+		}
+
+		return out, nil
+	}
+
+	keep := make([]bool, (n+size-1)/size)
+	for _, g := range blocks {
+		if g >= 0 && g < len(keep) {
+			keep[g] = true
+		}
+	}
+
 	for i := range n {
-		out.appendCell(dc.At(i))
+		if keep[i/size] {
+			out.appendCell(dc.At(i))
+		} else {
+			out.appendCell(nil)
+		}
 	}
 
 	return out, nil

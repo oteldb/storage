@@ -132,6 +132,18 @@ func defaultCodec(k Kind) chunk.Codec {
 	}
 }
 
+// trySharedDict encodes c with a column-wide bytes dictionary when the codec allows and at least one
+// granule repeats enough to benefit; ok is false when the caller should use the per-granule path.
+func trySharedDict(
+	c Column, codec chunk.Codec, comp *compress.Compressor, blockRows, compressBytes int,
+) (obj []byte, ok bool, err error) {
+	if c.Kind != KindBytes || codec != chunk.CodecDict {
+		return nil, false, nil
+	}
+
+	return encodeSharedDictBytes(c, comp, blockRows, compressBytes)
+}
+
 // buildColumn computes a column's descriptor and serialized object. A constant column
 // collapses to its descriptor with no object (the value lives in the manifest); every
 // other column is a chunk-codec stream wrapped in comp's block frame. comp selects the
@@ -193,6 +205,18 @@ func buildColumn(c Column, comp *compress.Compressor, blockRows, compressBytes i
 
 	if c.Block {
 		desc.Blocked, desc.Framed = true, true
+
+		// A dictionary bytes column tries the shared dictionary first: per-granule dictionaries lose
+		// every repeat that crosses a granule boundary, which is most of them for a column of
+		// repeating blobs. It declines when no granule repeats enough to benefit, leaving a
+		// near-unique column on the per-granule path with no dictionary header to carry.
+		if obj, ok, err := trySharedDict(c, codec, comp, blockRows, compressBytes); err != nil {
+			return ColumnDesc{}, nil, err
+		} else if ok {
+			desc.SharedDict = true
+
+			return desc, obj, nil
+		}
 
 		obj, err := encodeBlocked(c, codec, budget, comp, blockRows, compressBytes)
 		if err != nil {
@@ -403,6 +427,12 @@ type ColumnReader struct {
 	object []byte // compress-framed stream; nil for a constant column
 	comp   *compress.Compressor
 	rows   int
+
+	// Parsed shared-dictionary header, for a bytes column carrying one (see shareddict.go). Peeled
+	// once and kept, since every granule of the column resolves its ids against the same entries.
+	sharedEnt  [][]byte
+	sharedRest []byte
+	sharedDone bool
 }
 
 func newColumnReader(desc ColumnDesc, object []byte, comp *compress.Compressor, rows int) *ColumnReader {
@@ -596,6 +626,20 @@ func (r *ColumnReader) Bytes() (*chunk.DictColumn, error) {
 		}, nil
 	}
 
+	if r.desc.Blocked {
+		dir, err := r.blockDir()
+		if err != nil {
+			return nil, errors.Wrapf(err, "column %q", r.desc.Name)
+		}
+
+		shared, err := r.sharedEntries()
+		if err != nil {
+			return nil, err
+		}
+
+		return decodeBlockedBytes(dir, r.comp, r.rows, nil, shared)
+	}
+
 	stream, err := r.stream()
 	if err != nil {
 		return nil, err
@@ -604,6 +648,43 @@ func (r *ColumnReader) Bytes() (*chunk.DictColumn, error) {
 	dc, _, err := chunk.DecodeBytesDict(stream)
 
 	return dc, err
+}
+
+// DecodeBlocksBytes decodes only the named granules of a block-framed bytes column, merged into one
+// [chunk.DictColumn] over their concatenated rows. It is the bytes counterpart of
+// [ColumnReader.DecodeBlocksInt64] — the seek primitive a time-pruned query uses to read a fraction
+// of a column instead of all of it.
+//
+// The returned column covers the selected rows *packed together*, not their positions in the part.
+// Use [ColumnReader.DecodeBlocksBytesIntoColumn] when part row indices must stay valid.
+func (r *ColumnReader) DecodeBlocksBytes(blocks []int) (*chunk.DictColumn, error) {
+	dir, shared, err := r.blockedBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	return decodeBlockedBytes(dir, r.comp, r.rows, blocks, shared)
+}
+
+// DecodeBlocksBytesIntoColumn decodes the named granules into a column spanning *every* row of the
+// part, each granule at its own row offset.
+//
+// Unlike [ColumnReader.DecodeBlocksBytes], which packs the selection, this keeps part row indices
+// valid — the property the int64 path gets for free by decoding into the destination at absolute
+// offsets. A fetch that located its rows through the part's row-range index and its marks can then
+// prune the decode without renumbering anything it already resolved.
+//
+// Rows outside the selected granules hold an **unspecified** value: the caller asked for these
+// granules and reads only their rows. This matches [ColumnReader.DecodeBlocksInt64], where
+// unselected rows keep whatever the destination held. Zeroing them would cost a pass over the rows
+// the pruning exists to avoid touching.
+func (r *ColumnReader) DecodeBlocksBytesIntoColumn(blocks []int) (*chunk.DictColumn, error) {
+	dir, shared, err := r.blockedBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	return decodeBlockedBytesScatter(dir, r.comp, r.rows, blocks, shared)
 }
 
 // BytesRaw decodes a [chunk.CodecBytesRaw]-encoded [KindBytes] column into its flat fixed-width
@@ -795,6 +876,30 @@ func growLen[T any](dst []T, n int) []T {
 	return dst[:n]
 }
 
+// blockedBytes resolves the directory and shared dictionary of a block-framed bytes column, the
+// setup both granule-decode entry points need.
+func (r *ColumnReader) blockedBytes() (blockDir, [][]byte, error) {
+	if r.desc.Kind != KindBytes {
+		return blockDir{}, nil, errors.Errorf("block: column %q is %s, not bytes", r.desc.Name, r.desc.Kind)
+	}
+
+	if !r.desc.Blocked {
+		return blockDir{}, nil, errors.Errorf("block: column %q is not block-framed", r.desc.Name)
+	}
+
+	dir, err := r.blockDir()
+	if err != nil {
+		return blockDir{}, nil, errors.Wrapf(err, "column %q", r.desc.Name)
+	}
+
+	shared, err := r.sharedEntries()
+	if err != nil {
+		return blockDir{}, nil, err
+	}
+
+	return dir, shared, nil
+}
+
 // int64Decoder returns the per-block typed decoder for this column's codec, or nil for a codec that
 // is not an int64 codec (the caller reports the mismatch).
 func (r *ColumnReader) int64Decoder() func([]int64, []byte) ([]int64, int, error) {
@@ -823,7 +928,39 @@ func (r *ColumnReader) float64Decoder() func([]float64, []byte) ([]float64, int,
 
 // blockDir parses the column's block directory, selecting the layout the descriptor records.
 func (r *ColumnReader) blockDir() (blockDir, error) {
-	return parseBlockDir(r.object, r.desc.Framed, r.desc.Footer)
+	object := r.object
+
+	if r.desc.SharedDict {
+		if _, err := r.sharedEntries(); err != nil {
+			return blockDir{}, err
+		}
+
+		object = r.sharedRest
+	}
+
+	return parseBlockDir(object, r.desc.Framed, r.desc.Footer)
+}
+
+// sharedEntries returns the column's shared dictionary, nil for a column without one. The header is
+// peeled once: the entries and the block-framed remainder are both kept, since the directory sits
+// after the dictionary in the same object.
+func (r *ColumnReader) sharedEntries() ([][]byte, error) {
+	if !r.desc.SharedDict {
+		return nil, nil
+	}
+
+	if r.sharedDone {
+		return r.sharedEnt, nil
+	}
+
+	entries, rest, err := parseSharedDict(r.object, r.comp)
+	if err != nil {
+		return nil, errors.Wrapf(err, "column %q", r.desc.Name)
+	}
+
+	r.sharedEnt, r.sharedRest, r.sharedDone = entries, rest, true
+
+	return entries, nil
 }
 
 // stream decompresses the column's block frame into its raw codec stream.

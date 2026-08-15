@@ -57,6 +57,18 @@ const defaultCompressBlockBytes = 64 << 10
 func encodeBlocked(
 	c Column, codec chunk.Codec, budget uint8, comp *compress.Compressor, blockRows, compressBytes int,
 ) ([]byte, error) {
+	return encodeBlockedWith(c.rows(), comp, blockRows, compressBytes,
+		func(dst []byte, lo, hi int) ([]byte, error) {
+			return appendBlockStream(dst, c, codec, budget, lo, hi)
+		})
+}
+
+// encodeBlockedWith is [encodeBlocked] over an arbitrary per-granule stream builder, so an encoding
+// that needs column-wide state (the shared bytes dictionary) can reuse the framing and directory.
+func encodeBlockedWith(
+	n int, comp *compress.Compressor, blockRows, compressBytes int,
+	appendStream func(dst []byte, lo, hi int) ([]byte, error),
+) ([]byte, error) {
 	if blockRows <= 0 {
 		return nil, errors.Errorf("block: blockRows must be > 0, got %d", blockRows)
 	}
@@ -64,8 +76,6 @@ func encodeBlocked(
 	if compressBytes <= 0 {
 		compressBytes = defaultCompressBlockBytes
 	}
-
-	n := c.rows()
 
 	var (
 		frames    [][]byte
@@ -91,7 +101,7 @@ func encodeBlocked(
 		before := len(pending)
 
 		var err error
-		if pending, err = appendBlockStream(pending, c, codec, budget, lo, hi); err != nil {
+		if pending, err = appendStream(pending, lo, hi); err != nil {
 			return nil, err
 		}
 
@@ -125,8 +135,9 @@ func encodeBlocked(
 	return dst, nil
 }
 
-// appendBlockStream codec-encodes c's rows [lo,hi) onto dst as a single chunk stream. Only the
-// per-row sequential codecs used by the metric ts/value/sf columns are blockable; other codecs error.
+// appendBlockStream codec-encodes c's rows [lo,hi) onto dst as a single chunk stream: the per-row
+// sequential codecs (DoD/T64 int64, Gorilla/decimal float64) and the bytes codecs, each granule
+// carrying its own dictionary. Other codecs error.
 func appendBlockStream(dst []byte, c Column, codec chunk.Codec, budget uint8, lo, hi int) ([]byte, error) {
 	switch {
 	case c.Kind == KindInt64 && codec == chunk.CodecDoD:
@@ -137,6 +148,18 @@ func appendBlockStream(dst []byte, c Column, codec chunk.Codec, budget uint8, lo
 		return chunk.EncodeFloats(dst, c.Float64[lo:hi]), nil
 	case c.Kind == KindFloat64 && codec == chunk.CodecDecimal:
 		return chunk.EncodeFloatsDecimal(dst, c.Float64[lo:hi], decimalPrecision(budget)), nil
+	case c.Kind == KindBytes && codec == chunk.CodecDict:
+		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+			return chunk.EncodeBytesBlobRange(dst, c.BytesBlob, c.BytesOffsets, lo, hi), nil
+		}
+
+		return chunk.EncodeBytes(dst, c.Bytes[lo:hi]), nil
+	case c.Kind == KindBytes && codec == chunk.CodecBytesRaw:
+		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+			return chunk.EncodeBytesRawBlobRange(dst, c.BytesBlob, c.BytesOffsets, lo, hi), nil
+		}
+
+		return chunk.EncodeBytesRaw(dst, c.Bytes[lo:hi]), nil
 	default:
 		return nil, errors.Errorf("block: codec %s for kind %s is not blockable", codec, c.Kind)
 	}
@@ -550,6 +573,166 @@ func (s *blockStreams) granule(g int) ([]byte, error) {
 	}
 
 	return s.dir.granuleStream(g, s.buf)
+}
+
+// decodeBlockedBytes decodes a block-framed bytes column into one merged [chunk.DictColumn]. blocks
+// selects the granules to decode, in ascending order; nil decodes the whole column.
+//
+// Unlike the int64/float64 paths this cannot decode into a preallocated destination: each granule
+// carries its own dictionary, so the ids only become comparable after [chunk.DictMerger] remaps
+// them into a shared one.
+//
+// Frames are decompressed into a fresh buffer each — not the recycled one [blockStreams] uses —
+// because the merged column's entries *alias* the decoded frames rather than copying them. Copying
+// instead would cost a second pass over every byte of a high-cardinality column; letting the merged
+// column hold the frames alive costs the same allocation the decompression needed anyway.
+func decodeBlockedBytes(
+	dir blockDir, comp *compress.Compressor, rows int, blocks []int, shared [][]byte,
+) (*chunk.DictColumn, error) {
+	// A nil selection means the whole column; materializing it lets the whole-column decode take the
+	// same shared-dictionary fast path a pruned one does.
+	if blocks == nil {
+		blocks = make([]int, dir.nBlocks())
+		for i := range blocks {
+			blocks[i] = i
+		}
+	}
+
+	if shared != nil {
+		if col, ok, err := decodeSharedIDs(dir, comp, rows, blocks, shared, false); err != nil {
+			return nil, err
+		} else if ok {
+			return col, nil
+		}
+	}
+
+	w := bytesWalk{dir: dir, comp: comp, rows: rows, shared: shared, curFrame: -1}
+
+	for _, g := range blocks {
+		if err := w.decode(g); err != nil {
+			w.merger.Reset()
+
+			return nil, err
+		}
+	}
+
+	out := w.merger.Build()
+	if out.Len() != w.want {
+		return nil, errors.Wrapf(ErrCorrupt, "merged %d rows, want %d", out.Len(), w.want)
+	}
+
+	return out, nil
+}
+
+// decodeBlockedBytesScatter is [decodeBlockedBytes] placing each granule at its own row offset, so
+// the result spans the whole column and part row indices stay valid through a pruned decode.
+func decodeBlockedBytesScatter(
+	dir blockDir, comp *compress.Compressor, rows int, blocks []int, shared [][]byte,
+) (*chunk.DictColumn, error) {
+	if shared != nil {
+		if col, ok, err := decodeSharedIDs(dir, comp, rows, blocks, shared, true); err != nil {
+			return nil, err
+		} else if ok {
+			return col, nil
+		}
+	}
+
+	w := bytesWalk{dir: dir, comp: comp, rows: rows, shared: shared, curFrame: -1, scatter: true}
+	w.merger.Scatter(rows)
+
+	for _, g := range blocks {
+		if err := w.decode(g); err != nil {
+			w.merger.Reset()
+
+			return nil, err
+		}
+	}
+
+	out := w.merger.Build()
+	if out.Len() != rows {
+		return nil, errors.Wrapf(ErrCorrupt, "scattered %d rows, want %d", out.Len(), rows)
+	}
+
+	return out, nil
+}
+
+// bytesWalk carries the state of one decode walk over a block-framed bytes column: the current
+// decompressed frame and the merge accumulating the granules decoded so far.
+type bytesWalk struct {
+	dir    blockDir
+	comp   *compress.Compressor
+	rows   int
+	shared [][]byte
+
+	merger   chunk.DictMerger
+	frameBuf []byte
+	curFrame int
+	want     int
+	scatter  bool
+}
+
+// frame returns granule g's codec stream, decompressing its frame if it is not the current one.
+func (w *bytesWalk) frame(g int) ([]byte, error) {
+	if f := w.dir.frameOf(g); f != w.curFrame {
+		raw, err := w.dir.frame(f)
+		if err != nil {
+			return nil, errors.Wrapf(err, "frame %d", f)
+		}
+
+		buf, err := w.comp.Decompress(nil, raw)
+		if err != nil {
+			return nil, errors.Wrapf(err, "decompress frame %d", f)
+		}
+
+		w.frameBuf, w.curFrame = buf, f
+	}
+
+	return w.dir.granuleStream(g, w.frameBuf)
+}
+
+// decode appends granule g's rows to the walk's merge.
+func (w *bytesWalk) decode(g int) error {
+	if g < 0 || g >= w.dir.nBlocks() {
+		return errors.Errorf("block: block %d out of range [0,%d)", g, w.dir.nBlocks())
+	}
+
+	lo := g * w.dir.blockRows
+	if lo >= w.rows {
+		return errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", g, lo, w.rows)
+	}
+
+	stream, err := w.frame(g)
+	if err != nil {
+		return err
+	}
+
+	n := min(lo+w.dir.blockRows, w.rows) - lo
+
+	var dc chunk.DictColumn
+
+	if w.shared != nil {
+		err = decodeSharedGranule(stream, w.shared, n, &dc)
+	} else {
+		_, err = dc.DecodeBytes(stream)
+	}
+
+	if err != nil {
+		return errors.Wrapf(err, "decode block %d", g)
+	}
+
+	if dc.Len() != n {
+		return errors.Wrapf(ErrCorrupt, "block %d decoded %d rows, want %d", g, dc.Len(), n)
+	}
+
+	w.want += n
+
+	if w.scatter {
+		w.merger.AppendAt(&dc, lo)
+	} else {
+		w.merger.Append(&dc)
+	}
+
+	return nil
 }
 
 // decodeBlockedColumn decodes every block of a blocked column into dst (sized to rows) in place: each

@@ -85,6 +85,11 @@ const (
 	// whose fallback answer is "read the whole object", which is the cost the ranged read exists to
 	// avoid. Absent on parts written before it existed, which fall back to that question.
 	flagBytes byte = 1 << 6
+	// flagSharedDict marks a block-framed bytes column whose dictionary is written once for the
+	// column, ahead of the frames, with each granule holding ids into it (or opting out and
+	// self-encoding). Per-granule dictionaries lose every repeat crossing a granule boundary, which
+	// on a column of repeating blobs is most of them. Meaningful only with flagBlocked.
+	flagSharedDict byte = 1 << 7
 )
 
 // ErrCorrupt is returned when a manifest (or any part metadata) fails to parse:
@@ -129,6 +134,11 @@ type ColumnDesc struct {
 	// Persisted via [flagFramed]; clear on the older one-block-per-granule layout, which is still
 	// read. Set by the writer on every blocked column it produces.
 	Framed bool
+
+	// SharedDict marks a block-framed bytes column carrying one dictionary for the whole column
+	// ahead of its frames, each granule holding ids into it or self-encoding. Persisted via
+	// [flagSharedDict].
+	SharedDict bool
 
 	// Footer marks a framed column whose directory trails the frames instead of leading them, the
 	// layout a streaming writer emits (see [flagFooter]). Persisted via [flagFooter]; clear on a
@@ -188,6 +198,7 @@ func (c *ColumnDesc) flags() byte {
 		{c.Footer, flagFooter},
 		{c.Level != 0, flagLevel},
 		{c.Bytes != 0, flagBytes},
+		{c.SharedDict, flagSharedDict},
 	} {
 		if f.set {
 			flags |= f.bit
@@ -412,6 +423,7 @@ func decodeColumnDesc(r *bitstream.Reader) (ColumnDesc, error) {
 	c.Const = flags&flagConst != 0
 	c.Blocked = flags&flagBlocked != 0
 	c.Framed = flags&flagFramed != 0
+	c.SharedDict = flags&flagSharedDict != 0
 	c.Footer = flags&flagFooter != 0
 
 	if flags&flagLossy != 0 {

@@ -275,13 +275,20 @@ func writePart(
 		return err
 	}
 
-	if err := w.AddColumn(block.Column{Name: colTs, Kind: block.KindInt64, Codec: chunk.CodecDoD, Int64: f.cols.ts}); err != nil {
+	// Block-framed from here down, so a windowed fetch decodes only the granules its rows occupy
+	// rather than the whole column (see granule.go). The stream id column stays unframed: a fetch
+	// resolves streams through the part's row-range index and never decodes it.
+	if err := w.AddColumn(block.Column{
+		Name: colTs, Kind: block.KindInt64, Codec: chunk.CodecDoD, Int64: f.cols.ts, Block: true,
+	}); err != nil {
 		return err
 	}
 
 	for k := range schema.intCols {
 		col := schema.intColumn(k)
-		if err := w.AddColumn(block.Column{Name: col.Name, Kind: block.KindInt64, Codec: col.Codec, Int64: f.cols.ints[k]}); err != nil {
+		if err := w.AddColumn(block.Column{
+			Name: col.Name, Kind: block.KindInt64, Codec: col.Codec, Int64: f.cols.ints[k], Block: true,
+		}); err != nil {
 			return err
 		}
 	}
@@ -293,7 +300,7 @@ func writePart(
 		bc := &f.cols.bytes[k]
 		if err := w.AddColumn(block.Column{
 			Name: col.Name, Kind: block.KindBytes, Codec: col.Codec,
-			BytesBlob: bc.data, BytesOffsets: bc.offsets,
+			BytesBlob: bc.data, BytesOffsets: bc.offsets, Block: true,
 		}); err != nil {
 			return err
 		}
