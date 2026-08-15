@@ -1496,6 +1496,56 @@ func (s *Storage) maintain(ctx context.Context) {
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].pressure > tasks[j].pressure })
 
 	parallel.ForEach(len(tasks), s.maintenanceConcurrency(), func(i int) { tasks[i].run() })
+
+	s.recordPartShape(ctx)
+}
+
+// recordPartShape publishes the merge selector's view of every engine's parts as gauges, once per
+// maintenance cycle — right after the merges, so the numbers describe the set the next cycle will
+// look at. It is the durable form of the "why did nothing merge?" diagnostic: an engine whose merge
+// backlog never falls while its candidates sit at zero is stuck, which no counter or log line at
+// this cadence shows. Summed over tenants, tagged by signal (tenant ids are unbounded; per-tenant
+// detail is [Storage.Inspect]).
+func (s *Storage) recordPartShape(ctx context.Context) {
+	type shape struct{ total, sealed, backlog, candidates, capBytes int64 }
+
+	shapes := make(map[signal.Signal]*shape, 4)
+
+	add := func(sig signal.Signal, total, sealed, backlog, candidates, capBytes int64) {
+		sh, ok := shapes[sig]
+		if !ok {
+			sh = &shape{}
+			shapes[sig] = sh
+		}
+
+		sh.total += total
+		sh.sealed += sealed
+		sh.backlog += backlog
+		sh.candidates += candidates
+		// The cap is a per-engine threshold, not a quantity: the largest in effect is the one that
+		// explains the sealed counts, and summing it would be meaningless.
+		sh.capBytes = max(sh.capBytes, capBytes)
+	}
+
+	for _, eng := range s.engineSnapshotByTenant() {
+		m := eng.MergeShape()
+		add(signal.Metric, int64(m.Parts), int64(m.Sealed), int64(m.Backlog), int64(m.Candidates), m.CapBytes)
+	}
+
+	for sig, engines := range map[signal.Signal]map[signal.TenantID]*recordengine.Engine{
+		signal.Log:     s.logEngineSnapshotByTenant(),
+		signal.Trace:   s.traceEngineSnapshotByTenant(),
+		signal.Profile: s.profileEngineSnapshotByTenant(),
+	} {
+		for _, eng := range engines {
+			m := eng.MergeShape()
+			add(sig, int64(m.Parts), int64(m.Sealed), int64(m.Backlog), int64(m.Candidates), m.CapBytes)
+		}
+	}
+
+	for sig, sh := range shapes {
+		s.obs.Parts.Record(ctx, sig.String(), sh.total, sh.sealed, sh.backlog, sh.candidates, sh.capBytes)
+	}
 }
 
 // mergeConcurrency is how many merges may realistically run at once — the maintenance fan-out,

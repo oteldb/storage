@@ -28,6 +28,12 @@ type MergeOptions struct {
 	// pass. The cutoffs are absolute (the caller resolves now − After into Before). Empty keeps
 	// every part lossless.
 	Precision []PrecisionTier
+	// Force takes the best run of unsealed parts even when it does not earn its rewrite, instead of
+	// selecting nothing — the operator escape from a fixed point where every run scores below
+	// [minMergeMultiplier] and the engine would sit on its part count until the idle waiver fires.
+	// It bypasses the selection heuristic only: the seal threshold and the run's cumulative-bytes
+	// cap still bound what one merge reads, writes, and holds.
+	Force bool
 }
 
 // DownsampleTier is the absolute (wall-clock-free) form of a tenant downsampling tier: every

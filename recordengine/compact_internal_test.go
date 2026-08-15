@@ -133,9 +133,9 @@ func TestSelectMergePartsForcedRetention(t *testing.T) {
 	p := partOfSize(0, 1)
 	p.minTime, p.maxTime = 100, 300
 
-	assert.Nil(t, selectMergeParts([]*part{p}, 0, 0), "nothing forced, one part ⇒ no-op")
+	assert.Nil(t, selectMergeParts([]*part{p}, 0, 0, false), "nothing forced, one part ⇒ no-op")
 
-	got := selectMergeParts([]*part{p}, 200, 0)
+	got := selectMergeParts([]*part{p}, 200, 0, false)
 	require.Equal(t, []*part{p}, got, "retention forces the straddling part to be rewritten")
 }
 

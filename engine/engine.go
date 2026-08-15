@@ -119,8 +119,13 @@ type Engine struct {
 	nextSeq int
 	// idleMerges counts consecutive merges that selected nothing, so the selector can waive its
 	// write-amplification guard for parts that would otherwise never merge (see pickMergeRun).
-	// Guarded by flushMu, which a merge holds across its whole body.
-	idleMerges int
+	// Written only under flushMu, which a merge holds across its whole body; atomic so
+	// [Engine.MergeShape] can read it off that lock.
+	idleMerges atomic.Int64
+	// lastMergeCap is the seal threshold the most recent merge derived (0 until one has run, or when
+	// sealing is disabled). [Engine.MergeShape] reports and reasons against it because deriving the
+	// cap reads the backend's free space, which an introspection call must not do.
+	lastMergeCap atomic.Int64
 	// mergeRunning is true while a [Engine.MergeWith] is executing (introspection liveness; see
 	// [Engine.MergeRunning]). Set/cleared around the merge, not held during it.
 	mergeRunning atomic.Bool

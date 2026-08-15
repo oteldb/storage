@@ -59,9 +59,21 @@ type SignalStats struct {
 	MaxTimeUnixNano int64
 	// MergeRunning is true while a compaction/merge is executing on this engine.
 	MergeRunning bool
-	// MergeBacklog is the count of flushed parts pending compaction — the backlog proxy (currently
-	// equal to Parts; a separate field so a dashboard can label it as the merge backlog).
+	// SealedParts is the parts already at the merge cap. A merge never reconsiders them, so they are
+	// the share of Parts no compaction will ever reduce.
+	SealedParts int
+	// MergeBacklog is the parts a merge may still take (Parts − SealedParts). It is the backlog in
+	// the literal sense — work compaction still has to do — not the part count.
 	MergeBacklog int
+	// MergeCandidates is how many parts the next merge would select. Zero with a non-zero
+	// MergeBacklog is the stuck state that a cycle cannot fix by itself: parts remain mergeable but
+	// none of them qualify, which is what [Admin.CompactNow] overrides.
+	MergeCandidates int
+	// MergeCapBytes is the seal threshold in effect — the size at which a merged part is sealed, and
+	// the bound on what one merge may hold. It is derived per merge (from free space and the merge
+	// memory allowance) for metrics, so it reads 0 until the engine's first merge; for the record
+	// signals it is a function of configuration and is always populated.
+	MergeCapBytes int64
 	// WAL is true when this engine has a write-ahead log (false for the ephemeral in-memory engine);
 	// the WAL* fields below are meaningful only when it is true.
 	WAL bool
@@ -158,12 +170,15 @@ func (s *Storage) Inspect() StoreStats {
 	for tid, eng := range s.engineSnapshotByTenant() {
 		es := eng.Stats()
 		segs, walBytes, epoch, hasWAL := eng.WALState()
+		sh := eng.MergeShape()
 		ts := tenantStats(tid)
 		ts.Signals = append(ts.Signals, SignalStats{
 			Signal: signal.Metric, Series: es.Series, HeadItems: es.HeadSamples, HeadBytes: es.HeadBytes,
 			IdentityBytes: es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
-			MergeRunning: eng.MergeRunning(), MergeBacklog: es.Parts,
-			WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
+			MergeRunning: eng.MergeRunning(),
+			SealedParts:  sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
+			MergeCapBytes: sh.CapBytes,
+			WAL:           hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 		})
 
 		if dc, ok := eng.DecodeCacheStats(); ok {
@@ -179,12 +194,15 @@ func (s *Storage) Inspect() StoreStats {
 		for tid, eng := range engines {
 			es := eng.Stats()
 			segs, walBytes, epoch, hasWAL := eng.WALState()
+			sh := eng.MergeShape()
 			ts := tenantStats(tid)
 			ts.Signals = append(ts.Signals, SignalStats{
 				Signal: sig, Series: es.Streams, HeadItems: es.HeadRecords, HeadBytes: es.HeadBytes,
 				IdentityBytes: es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
-				MergeRunning: eng.MergeRunning(), MergeBacklog: es.Parts,
-				WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
+				MergeRunning: eng.MergeRunning(),
+				SealedParts:  sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
+				MergeCapBytes: sh.CapBytes,
+				WAL:           hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 			})
 		}
 	}

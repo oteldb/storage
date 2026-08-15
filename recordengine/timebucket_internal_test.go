@@ -115,7 +115,7 @@ func TestSelectMergePartsNeverWidensPastTopLevel(t *testing.T) {
 		src = append(src, partAt(int64(1<<uint(10+i%7)), start, start+hour-1))
 	}
 
-	selected := selectMergeParts(src, 0, 64<<20)
+	selected := selectMergeParts(src, 0, 64<<20, false)
 	if len(selected) == 0 {
 		return
 	}
@@ -137,7 +137,7 @@ func TestSelectMergePartsRefusesDistantParts(t *testing.T) {
 		partAt(1<<20, 47*hour, 48*hour),
 	}
 
-	assert.Empty(t, selectMergeParts(src, 0, 64<<20),
+	assert.Empty(t, selectMergeParts(src, 0, 64<<20, false),
 		"parts two days apart share no bucket at any level, so no merge may pair them")
 }
 
@@ -154,7 +154,7 @@ func TestSelectLadderGroupPrefersNarrowestLevel(t *testing.T) {
 		partAt(1<<20, 3*hour, 4*hour-1),
 	}
 
-	got := selectLadderGroup(spread, 64<<20)
+	got := selectLadderGroup(spread, 64<<20, false)
 	require.Len(t, got, 2)
 
 	lo, hi := spanOf(got)
@@ -223,6 +223,6 @@ func TestSelectForcedWinsTheCycle(t *testing.T) {
 	pairA := partAt(1<<20, 30*hour, 30*hour+60)
 	pairB := partAt(1<<20, 30*hour+61, 31*hour-1)
 
-	got := selectMergeParts([]*part{old, pairA, pairB}, int64(30*time.Minute), 64<<20)
+	got := selectMergeParts([]*part{old, pairA, pairB}, int64(30*time.Minute), 64<<20, false)
 	assert.Equal(t, []*part{old}, got, "the tier group waits for the next cycle")
 }

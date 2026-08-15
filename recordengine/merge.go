@@ -17,6 +17,25 @@ import (
 // part needs retention. Records are append-only: a stream's records are concatenated across parts (no
 // value dedup) and re-sorted by timestamp.
 func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
+	return e.MergeWith(ctx, MergeOptions{RetainFrom: retainFrom})
+}
+
+// MergeOptions parameterizes a merge. The zero value is a plain compaction.
+type MergeOptions struct {
+	// RetainFrom drops records older than this absolute unix-nanosecond cutoff (retention);
+	// ≤ 0 disables it.
+	RetainFrom int64
+	// Force compacts a bucket's unsealed parts whatever their tiers, instead of waiting for one tier
+	// to accumulate minTierParts of them — the operator escape from a part set the tier rule will
+	// never select. It bypasses the selection heuristic only: sealing, the time-bucket ladder, and
+	// the cumulative-bytes cap still bound what one merge decodes and holds.
+	Force bool
+}
+
+// MergeWith is [Engine.Merge] with the merge parameterized: the one background-merge entry point,
+// so compaction, retention, and a forced compaction are the same pass over the immutable parts.
+func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
+	retainFrom := opts.RetainFrom
 	ctx = e.cfg.Obs.Base(ctx)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "recordengine.merge",
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
@@ -29,9 +48,9 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 	log := zctx.From(ctx)
 	log.Debug("merge requested",
 		zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
-		zap.Int64("retain_from", retainFrom))
+		zap.Int64("retain_from", retainFrom), zap.Bool("force", opts.Force))
 
-	compacted, err := e.merge(ctx, retainFrom)
+	compacted, err := e.merge(ctx, opts)
 	if err != nil {
 		span.RecordError(err)
 		log.Error("merge failed",
@@ -62,7 +81,9 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 // small metadata publish runs under it. The old parts are retired (not deleted inline) and reclaimed
 // once their in-flight readers drain. Only the background maintenance task calls merge, so the parts
 // mutation has a single writer.
-func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
+func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
+	retainFrom := opts.RetainFrom
+
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
 
@@ -81,8 +102,19 @@ func (e *Engine) merge(ctx context.Context, retainFrom int64) (int, error) {
 		return 0, err
 	}
 
-	selected := selectMergeParts(src, retainFrom, capBytes)
+	selected := selectMergeParts(src, retainFrom, capBytes, opts.Force)
 	if len(selected) == 0 {
+		if dropped == 0 {
+			// A no-op is indistinguishable from a healthy engine without the shape of what it looked
+			// at; these are the exact inputs to that decision (mirrors the metric engine).
+			sh := shapeOf(src, capBytes)
+			zctx.From(ctx).Debug("merge selected nothing",
+				zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
+				zap.Int("parts", sh.Parts), zap.Int("sealed", sh.Sealed),
+				zap.Int64("cap_bytes", sh.CapBytes), zap.Int("eligible", sh.Backlog),
+				zap.Int("tiers", sh.Tiers), zap.Int("largest_tier_parts", sh.LargestTierParts))
+		}
+
 		e.reclaimRetired(ctx) // nothing to compact, but still sweep pending deletions
 
 		return dropped, nil
