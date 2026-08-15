@@ -430,10 +430,16 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	// live parts to read, and capture stream identities. Releasing the lock before the backend reads
 	// lets appends and flush/merge proceed concurrently — the acquired parts can't be reclaimed until
 	// we release them, so the lock-free reads never race a delete.
-	plan = e.planFetch(ids, r)
+	plan, planErr := e.planFetch(ids, r)
 	e.mu.RUnlock()
 
 	defer plan.releaseParts()
+
+	if planErr != nil {
+		span.RecordError(planErr)
+
+		return nil, planErr
+	}
 
 	if err := plan.readParts(ctx); err != nil {
 		span.RecordError(err)
@@ -600,16 +606,25 @@ func (e *Engine) Series(matchers []fetch.Matcher, start, end int64) []signal.Ser
 }
 
 // appendWindowRows appends rows of cols in [rng.start, rng.end) whose timestamp is in [start, end]
-// to acc, bulk-appending the whole range when it falls entirely in the window.
-func appendWindowRows(acc, cols *recordCols, rng rowRange, start, end int64) {
+// to acc, bulk-appending the whole range when it falls entirely in the window. It errors rather than
+// overflowing a byte column's int32 offsets, which would otherwise surface as a slice-bounds panic
+// once the accumulator is sorted or read.
+func appendWindowRows(acc, cols *recordCols, rng rowRange, start, end int64) error {
 	// A stream's range is ts-ascending (rows are (stream, ts)-sorted), so binary-search the [start,end]
 	// sub-range and append it in one contiguous copy — instead of a per-row timestamp compare over the
 	// whole range, which is O(range) even when the window selects only a slice of it. This mirrors the
 	// filtered path's [fetchPlan.scanMatches], which already narrows via [tsWindow].
 	w := tsWindow(cols.ts, rng, start, end)
 	if w.start < w.end {
+		if name, over := acc.appendRangeOverflows(cols, w.start, w.end); over {
+			return errors.Errorf("fetch result too large: column %q exceeds %d bytes for one stream; "+
+				"narrow the time window or set a limit", name, byteColCap)
+		}
+
 		acc.appendRange(cols, w.start, w.end)
 	}
+
+	return nil
 }
 
 // Flush writes the head's buffered records to a new immutable part and clears the buffers. No-op if
@@ -913,7 +928,7 @@ func (e *Engine) getRecordCols(n int, sel colSel) *recordCols {
 	return newRecordCols(e.cfg.Schema, n, sel)
 }
 
-func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *fetchPlan {
+func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) (*fetchPlan, error) {
 	p := &fetchPlan{
 		e:      e,
 		sel:    selectColumns(e.cfg.Schema, r),
@@ -974,9 +989,16 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *fetchPlan {
 			acc = newRecordCols(e.cfg.Schema, n, p.sel)
 		}
 
-		e.head.appendWindow(id, acc, r.Start, r.End) // seed from the live head under the lock
+		// Seed from the live head under the lock, and from records mid-flush (not yet a part). The
+		// plan is returned even on error so the caller's deferred release still runs.
+		if err := e.head.appendWindow(id, acc, r.Start, r.End); err != nil {
+			return p, err
+		}
+
 		if buf := e.flushing[id]; buf != nil {
-			appendColsWindow(buf, acc, r.Start, r.End) // …and from records mid-flush (not yet a part)
+			if err := appendColsWindow(buf, acc, r.Start, r.End); err != nil {
+				return p, err
+			}
 		}
 
 		p.accs[id] = acc
@@ -989,7 +1011,7 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *fetchPlan {
 		}
 	}
 
-	return p
+	return p, nil
 }
 
 // readParts decodes each acquired part (only the referenced columns — lazy decode) and appends its
@@ -1016,7 +1038,9 @@ func (p *fetchPlan) readParts(ctx context.Context) error {
 			acc := p.accs[id]
 			if rng, ok := part.ranges[id]; ok && acc != nil {
 				n := acc.len()
-				appendWindowRows(acc, cols, rng, p.start, p.end)
+				if err := appendWindowRows(acc, cols, rng, p.start, p.end); err != nil {
+					return err
+				}
 
 				if p.wm != nil {
 					p.wm.add(acc.ts[n:])

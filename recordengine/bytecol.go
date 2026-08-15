@@ -1,5 +1,7 @@
 package recordengine
 
+import "math"
+
 // byteCol is one byte column of a [recordCols], laid out as a contiguous blob plus row end-offsets
 // (arrow-style) rather than a [][]byte of per-cell slices. For an N-row column the GC scans two
 // slice headers instead of N, and a per-row scan reads cells sequentially out of one allocation
@@ -13,10 +15,12 @@ package recordengine
 // reallocates data — the same read-only-until-next-append rule the rest of the engine relies on; a
 // caller that retains a value past an append must copy.
 //
-// int32 offsets cap a column blob at 2 GiB, which is ample for a head buffer bounded by the flush
-// size and half the footprint of int64 offsets. The appending paths do not check it — the bound is
-// enforced upstream by [headByteCap], which stops the head accepting records before its buffered
-// bytes (an upper bound on any single column's blob) can reach it.
+// int32 offsets cap a column blob at [byteColCap] (2 GiB), half the footprint of int64 offsets. The
+// appending paths do not check it, so every caller must bound its own accumulation: the head is
+// bounded by [headByteCap], and a fetch accumulator — which merges the head with any number of parts
+// and so is not bounded by either — by [recordCols.appendRangeOverflows]. Appending past the cap
+// truncates an offset to a negative value, which surfaces later as a slice-bounds panic in
+// [byteCol.at] rather than at the append that caused it.
 type byteCol struct {
 	data    []byte
 	offsets []int32
@@ -75,6 +79,16 @@ func (b *byteCol) appendCell(cell []byte) {
 
 	b.data = append(b.data, cell...)
 	b.offsets = append(b.offsets, int32(len(b.data)))
+}
+
+// byteColCap is the largest blob an int32 offset can address. A var, not a const, so a test can
+// lower it instead of allocating 2 GiB to reach it.
+var byteColCap = int64(math.MaxInt32)
+
+// appendRangeOverflows reports whether appending cells [lo, hi) of src would push the blob past
+// [byteColCap].
+func (b *byteCol) appendRangeOverflows(src *byteCol, lo, hi int) bool {
+	return int64(len(b.data))+int64(src.offsets[hi]-src.offsets[lo]) > byteColCap
 }
 
 // appendRange bulk-appends cells [lo, hi) of src in one blob copy plus a rebased offset per cell.

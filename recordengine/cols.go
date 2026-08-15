@@ -5,6 +5,8 @@ import (
 	"math"
 	"slices"
 
+	"github.com/go-faster/errors"
+
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -274,6 +276,25 @@ func (c *recordCols) appendRow(src *recordCols, i int) {
 }
 
 // appendRange bulk-appends rows [lo, hi) of src's selected columns — one append per column.
+// errColumnTooLarge reports an accumulation that would overflow a byte column's int32 offsets.
+func errColumnTooLarge(name string) error {
+	return errors.Errorf("fetch result too large: column %q exceeds %d bytes for one stream; "+
+		"narrow the time window or set a limit", name, byteColCap)
+}
+
+// appendRangeOverflows reports the first selected byte column whose blob appending rows [lo, hi) of
+// src would push past [byteColCap], and whether there is one. A fetch accumulator merges the head
+// with every part a stream appears in, so neither [headByteCap] nor the part format bounds it.
+func (c *recordCols) appendRangeOverflows(src *recordCols, lo, hi int) (string, bool) {
+	for k := range c.bytes {
+		if c.sel.bytes[k] && c.bytes[k].appendRangeOverflows(&src.bytes[k], lo, hi) {
+			return c.schema.byteColumn(k).Name, true
+		}
+	}
+
+	return "", false
+}
+
 func (c *recordCols) appendRange(src *recordCols, lo, hi int) {
 	c.ts = append(c.ts, src.ts[lo:hi]...)
 	for _, t := range src.ts[lo:hi] {
