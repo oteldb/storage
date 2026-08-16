@@ -26,7 +26,13 @@ func mergeCorpus(t *testing.T, series, samples, parts int, value func(r *rand.Ra
 	t.Helper()
 
 	ctx := context.Background()
-	e := engine.New(engine.Config{Backend: backend.Memory(), Prefix: "m", MaxPartBytes: 0})
+	// MergeMemoryBytes is pinned because the merge cap is otherwise derived from the host's memory
+	// (GOMEMLIMIT, else the cgroup or machine figure), which decides how many parts the merge seals —
+	// so whether it produces the single part this test asserts on would depend on the runner. A
+	// gigabyte is far above the ~62 MiB of raw rows the corpus holds, so the cap never binds.
+	e := engine.New(engine.Config{
+		Backend: backend.Memory(), Prefix: "m", MaxPartBytes: 0, MergeMemoryBytes: 1 << 30,
+	})
 
 	r := rand.New(rand.NewPCG(1, 2))
 
