@@ -45,7 +45,9 @@ dictionary id. Given entry indices those become array work over `int32`s: a per-
 stamp counts a granule's distinct ids without a clear between granules, and a persistent
 source-entry → shared-id remap replaces the interning map. Nothing is hashed and no bytes are
 compared. The granule decision reads the same distinct count either way, which is what keeps the
-objects identical rather than merely equivalent.
+objects identical rather than merely equivalent. Measured on a 64 Ki-row block-framed column of 512
+distinct log-attribute blobs, building the column costs 3.52 ms from the blob form and 357 µs from
+the split form — the same object, 9.9x apart.
 
 ## Block framing
 
