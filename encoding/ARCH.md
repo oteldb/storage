@@ -43,6 +43,16 @@ Rules that matter beyond the code:
   **delta domain**, so it accumulates mildly along a long series.
 - **Split dictionary form** (`DictColumn`): unique entries + raw per-row ids, deferring the
   per-row gather so a caller can filter on ids first. All returned slices alias the source.
+- **Split-form encode** (`EncodeBytesDict`/`EncodeBytesDictRange`): a caller that already holds a
+  deduplicated entry table plus one entry index per row skips the per-row hashing — indices are
+  remapped to output dictionary ids through an array. Output is byte-identical to `EncodeBytes`
+  over the materialized rows, flat fallback included: both walk the rows in order and both append
+  a newly-seen value to the dictionary on first occurrence, so entry order, id width, and the row
+  the 65537th distinct value trips the fallback all coincide. The identity holds only if the
+  entry table is distinct by value — deduplicating by index is not deduplicating by value. One
+  writer (`appendDictPayload`) emits the stream for both entry points, so the two cannot drift.
+  The remap is invalidated by a generation stamp rather than a refill: a granule's row range is
+  small against a whole column's entry table, so a per-call fill would dominate the encode.
 
 ## `compress`
 

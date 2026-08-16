@@ -287,7 +287,7 @@ func appendDictEncoded[C cellSeq](
 
 		id, existed := m.PutOrGet(v, len(entries))
 		if !existed {
-			if len(entries) == 65536 {
+			if len(entries) == maxDictEntries {
 				flat = true
 
 				break
@@ -300,14 +300,24 @@ func appendDictEncoded[C cellSeq](
 		ids[i] = uint16(id)
 	}
 
-	size := len(entries)
-
 	if flat {
 		// Flat fallback (>65536 distinct): no dictionary, store each value inline.
 		return appendFlat(dst, vals), entries, ids
 	}
 
-	// Dictionary mode. Flag is a full byte so everything after stays byte-aligned.
+	return appendDictPayload(dst, entries, ids, dictEntryBytes), entries, ids
+}
+
+// appendDictPayload writes the flagDict form: the dictionary entries in first-occurrence order
+// followed by the packed row ids. dictEntryBytes is the exact encoded size of the entries, used only
+// to pre-size dst. It is the single writer of the dictionary stream, so every entry point that
+// builds (entries, ids) — whether by hashing values or by remapping caller-supplied ids — emits
+// byte-identical output.
+func appendDictPayload(dst []byte, entries [][]byte, ids []uint16, dictEntryBytes int) []byte {
+	n := len(ids)
+	size := len(entries)
+
+	// Flag is a full byte so everything after stays byte-aligned.
 	rowIDBytes := n
 	if size > maxDictSize {
 		rowIDBytes *= 2
@@ -328,12 +338,12 @@ func appendDictEncoded[C cellSeq](
 	}
 	// Write row ids directly into the writer buffer (byte-aligned here).
 	if size <= maxDictSize {
-		idBytes := w.AppendBytes(len(ids))
+		idBytes := w.AppendBytes(n)
 		for i, id := range ids {
 			idBytes[i] = byte(id)
 		}
 	} else {
-		idBytes := w.AppendBytes(len(ids) * 2)
+		idBytes := w.AppendBytes(n * 2)
 		for i, id := range ids {
 			idBytes[i*2] = byte(id >> 8)
 			idBytes[i*2+1] = byte(id)
@@ -342,7 +352,7 @@ func appendDictEncoded[C cellSeq](
 
 	w.PadToByte()
 
-	return w.Bytes(), entries, ids
+	return w.Bytes()
 }
 
 // DictEncoder is a reusable dictionary-column encoder. Unlike the standalone
