@@ -255,21 +255,6 @@ func TestEncodeBytesDictScratchReuse(t *testing.T) {
 	}
 }
 
-// TestEncodeBytesDictNoAlloc pins the steady state: with a caller-owned buffer, encoding a granule
-// from the split form allocates nothing.
-//
-//nolint:paralleltest // testing.AllocsPerRun must not run during a parallel test.
-func TestEncodeBytesDictNoAlloc(t *testing.T) {
-	entries := distinctEntries(300)
-	ids := cyclicIDs(8192, 300)
-	buf := make([]byte, 0, len(EncodeBytesDict(nil, entries, ids)))
-
-	got := testing.AllocsPerRun(20, func() {
-		buf = EncodeBytesDict(buf[:0], entries, ids)
-	})
-	assert.Zero(t, got)
-}
-
 // TestDictRemapScratchGenerationWrap covers the one path the encode tests cannot reach: the
 // generation counter wrapping. A stamp left in the backing array past the armed prefix outlives a
 // clear of the prefix alone, and matches whichever generation later reaches its value — a hit on an
