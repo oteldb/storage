@@ -322,3 +322,36 @@ func FuzzColumnBytesDictForm(f *testing.F) {
 		}
 	})
 }
+
+// TestColumnBytesDictRejectsBadIDs pins the guards on the split form's two halves. They reach the
+// writer from different places in the caller, so a mismatch must name the column or the row rather
+// than raise a bare bounds error from inside the encoder.
+func TestColumnBytesDictRejectsBadIDs(t *testing.T) {
+	t.Parallel()
+
+	comp := compress.NewCompressor(compress.AlgorithmNone, compress.LevelDefault)
+
+	build := func(c Column, blockRows int) error {
+		c.Name, c.Kind = "c", KindBytes
+
+		_, _, err := buildColumn(c, comp, blockRows, defaultCompressBlockBytes)
+
+		return err
+	}
+
+	// Empty entry table under a live id stream: caught by name, as an error.
+	err := build(Column{BytesDict: nil, BytesIDs: []int32{0, 0}}, defaultGranuleSize)
+	require.ErrorContains(t, err, `column "c" has 2 BytesIDs but an empty BytesDict`)
+
+	// An id past the table, through the shared-dictionary path (repetitive, block-framed).
+	ids := make([]int32, 64)
+	ids[40] = 7
+
+	assert.PanicsWithValue(t,
+		"block: dictionary id 7 at row 40 is out of range for 2 entries",
+		func() {
+			_ = build(Column{
+				BytesDict: [][]byte{[]byte("aa"), []byte("bb")}, BytesIDs: ids, Block: true,
+			}, 16)
+		})
+}

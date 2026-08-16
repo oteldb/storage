@@ -191,10 +191,20 @@ func buildColumn(c Column, comp *compress.Compressor, blockRows, compressBytes i
 		codec = defaultCodec(c.Kind)
 	}
 
-	if c.Kind == KindBytes && codec != chunk.CodecDict && c.bytesSplitForm() {
-		return ColumnDesc{}, nil, errors.Errorf(
-			"block: column %q carries BytesDict, which codec %s does not accept (only %s)",
-			c.Name, codec, chunk.CodecDict)
+	if c.Kind == KindBytes && c.bytesSplitForm() {
+		if codec != chunk.CodecDict {
+			return ColumnDesc{}, nil, errors.Errorf(
+				"block: column %q carries BytesDict, which codec %s does not accept (only %s)",
+				c.Name, codec, chunk.CodecDict)
+		}
+
+		// An empty entry table under a non-empty id stream is the shape a caller lands on when it
+		// wires up the two halves from different places, and every id is then out of range. Say so
+		// here, naming the column, rather than leaving it to the per-row guard further down.
+		if len(c.BytesDict) == 0 && len(c.BytesIDs) > 0 {
+			return ColumnDesc{}, nil, errors.Errorf(
+				"block: column %q has %d BytesIDs but an empty BytesDict", c.Name, len(c.BytesIDs))
+		}
 	}
 
 	desc := ColumnDesc{Name: c.Name, Kind: c.Kind, Codec: codec, Compress: comp.Algorithm()}

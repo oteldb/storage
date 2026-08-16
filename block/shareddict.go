@@ -2,6 +2,7 @@ package block
 
 import (
 	"encoding/binary"
+	"fmt"
 
 	"github.com/go-faster/errors"
 
@@ -165,6 +166,16 @@ func buildSharedDictFromIDs(dict [][]byte, src []int32, blockRows int, shared []
 
 		for i := lo; i < hi; i++ {
 			e := src[i]
+
+			// The shared-dictionary path never reaches the chunk encoder's equivalent guard, so it
+			// carries its own, naming the row and the table instead of raising a bare bounds error
+			// from inside the stamp array. Compared against len(stamp) rather than the equal
+			// len(dict) so the compiler can see it dominates the indexing below.
+			if uint32(e) >= uint32(len(stamp)) {
+				panic(fmt.Sprintf(
+					"block: dictionary id %d at row %d is out of range for %d entries", e, i, len(dict)))
+			}
+
 			if stamp[e] != gen {
 				stamp[e] = gen
 
