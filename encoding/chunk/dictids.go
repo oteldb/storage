@@ -1,6 +1,9 @@
 package chunk
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 // dictCells is the (entries, ids) form of [cellSeq]: cell i is entries[ids[i]].
 type dictCells struct {
@@ -88,16 +91,22 @@ func (s *dictRemapScratch) putBack() {
 //   - entries must be distinct by value. EncodeBytes deduplicates by value; this deduplicates by
 //     index, so two indices holding equal bytes produce two dictionary entries — a valid stream, but
 //     not the same one.
-//   - every ids[i] must be in [0, len(entries)). An out-of-range index panics with the ordinary Go
-//     bounds error; it is not validated.
+//   - every ids[i] must be in [0, len(entries)). This one *is* checked, and panics naming the row,
+//     the id and the table size — the two halves come from different places in the caller, so the
+//     bare bounds error it replaces was the hard kind to debug. Distinctness is not checked: it
+//     costs a hash per entry, which is most of what this function exists to avoid.
 func EncodeBytesDict(dst []byte, entries [][]byte, ids []int32) []byte {
 	return encodeBytesDict(dst, entries, ids)
 }
 
 // EncodeBytesDictRange is [EncodeBytesDict] over rows [lo,hi) of ids, for block-framed encoding
 // where each granule is an independent stream with its own dictionary (see [EncodeBytesBlobRange]).
-// It requires lo <= hi <= len(ids).
+// It panics unless 0 <= lo <= hi <= len(ids).
 func EncodeBytesDictRange(dst []byte, entries [][]byte, ids []int32, lo, hi int) []byte {
+	if lo < 0 || hi < lo || hi > len(ids) {
+		panic(fmt.Sprintf("chunk: dictionary id range [%d,%d) is invalid for %d rows", lo, hi, len(ids)))
+	}
+
 	return encodeBytesDict(dst, entries, ids[lo:hi])
 }
 
@@ -120,6 +129,15 @@ func encodeBytesDict(dst []byte, entries [][]byte, ids []int32) []byte {
 	flat := false
 
 	for i, entry := range ids {
+		// Explicit rather than left to the remap's own bounds check: the caller supplies the entry
+		// table and the ids separately, and an "index out of range" raised deep inside the scratch
+		// names neither the row nor the table it disagrees with. One unsigned compare per row — the
+		// same one the bounds check already makes — for a panic that says what the caller got wrong.
+		if uint32(entry) >= uint32(len(entries)) {
+			panic(fmt.Sprintf(
+				"chunk: dictionary id %d at row %d is out of range for %d entries", entry, i, len(entries)))
+		}
+
 		out, seen := remap.get(entry)
 		if !seen {
 			if len(dict) == maxDictEntries {

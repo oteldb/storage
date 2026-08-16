@@ -314,3 +314,50 @@ func BenchmarkDictEncodeFromValues(b *testing.B) {
 		buf = EncodeBytes(buf[:0], cells)
 	}
 }
+
+// TestEncodeBytesDictRejectsBadInput pins the guards on the caller's two halves: an id table and an
+// entry table come from different places, so a mismatch must name what disagreed rather than raise a
+// bare bounds error from inside the scratch.
+func TestEncodeBytesDictRejectsBadInput(t *testing.T) {
+	t.Parallel()
+
+	entries := distinctEntries(3)
+
+	for _, tt := range []struct {
+		name string
+		call func()
+		want string
+	}{
+		{
+			name: "id past the entry table",
+			call: func() { EncodeBytesDict(nil, entries, []int32{0, 3}) },
+			want: "id 3 at row 1 is out of range for 3 entries",
+		},
+		{
+			name: "negative id",
+			call: func() { EncodeBytesDict(nil, entries, []int32{-1}) },
+			want: "id -1 at row 0 is out of range for 3 entries",
+		},
+		{
+			name: "no entries at all",
+			call: func() { EncodeBytesDict(nil, nil, []int32{0}) },
+			want: "id 0 at row 0 is out of range for 0 entries",
+		},
+		{
+			name: "range past the ids",
+			call: func() { EncodeBytesDictRange(nil, entries, []int32{0, 1}, 0, 3) },
+			want: "id range [0,3) is invalid for 2 rows",
+		},
+		{
+			name: "inverted range",
+			call: func() { EncodeBytesDictRange(nil, entries, []int32{0, 1}, 2, 1) },
+			want: "id range [2,1) is invalid for 2 rows",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.PanicsWithValue(t, "chunk: dictionary "+tt.want, tt.call)
+		})
+	}
+}
