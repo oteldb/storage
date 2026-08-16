@@ -87,9 +87,11 @@ The bucket index makes a part durably visible, so writing it is the commit point
 always carries the identities its rows resolve through. A crash in between leaves an orphan — objects
 and identity together — swept at the next open, stranding nothing.
 
-**No `FlushedEpoch`** here, unlike `recordengine`: the WAL `Checkpoint` runs last and is the WAL's
-commit point, so replay recovers a part that failed to publish. The unreadable-commit window bites
-only a persistent backend with no `WALDir`, where nothing else holds the rows.
+`Checkpoint` runs last and is the WAL's commit point, so replay recovers a part that failed to
+publish. The index also carries a `FlushedEpoch` watermark (as `recordengine` does) and replay skips
+segments at or below it: a checkpoint only reaches segments this node wrote, and in a cluster the
+shard's compaction owner can flush records another owner logged — those segments are never
+checkpointed away, so the watermark is what keeps recovery exactly-once.
 
 ## Identity prune
 
@@ -505,10 +507,17 @@ accumulated durations on one span plus a planning child span, not sub-spans (`AD
 
 | call | contract |
 |---|---|
-| `ApplyPrimary(walBytes)` | the shard's single authoritative accept/reject decision |
+| `ApplyPrimary(walBytes)` | the shard's single authoritative accept/reject decision, logged to the WAL |
 | `ApplyReplicated` | applies a payload verbatim, like WAL replay |
 | `RefreshReplica` | reloads parts from the store and trims the head, series-scoped |
 
 `ApplyPrimary` OOO-checks and admission-checks each sample, returning the accepted set re-framed plus a
 per-reason reject breakdown. `RefreshReplica` trims only series actually present in the flushed parts;
 a global trim would leave the primary the sole holder of quorum-acked backfill.
+
+**The primary logs the accepted set** — the frames it already built to replicate, written to the WAL
+verbatim (`wal.WriteFrames`). That is what makes the quorum's "one durable copy at the primary" true:
+without it a restarted node recovers only flushed parts and then answers as a ring owner, serving
+everything written since its last flush as absent. `ApplyReplicated` does **not** log: a secondary
+neither flushes nor checkpoints, so its log would grow without bound: its head is memory-resident,
+recovered by catching up rather than by replay.

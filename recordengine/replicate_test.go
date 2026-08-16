@@ -8,6 +8,7 @@ import (
 
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/recordengine"
+	"github.com/oteldb/storage/wal"
 )
 
 func TestApplyPrimaryRejectsOOOAndConverges(t *testing.T) {
@@ -32,6 +33,33 @@ func TestApplyPrimaryRejectsOOOAndConverges(t *testing.T) {
 		assert.Equalf(t, []int64{2000}, got[0].Timestamps, "%s holds only the accepted record", name)
 		assert.Equalf(t, []string{"a"}, bodies(got[0]), "%s body", name)
 	}
+}
+
+// TestApplyPrimaryLogsAcceptedToWAL: the shard primary's copy of the unflushed head is durable, so a
+// restart replays it instead of answering as a ring owner with everything since the last flush
+// missing. Only the accepted set is logged — a rejected record must not come back on replay.
+func TestApplyPrimaryLogsAcceptedToWAL(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	sw, err := wal.Create(dir, 0)
+	require.NoError(t, err)
+
+	primary := recordengine.New(recordengine.Config{Schema: testSchema, OOOWindow: 50, WAL: sw})
+	_, res, err := primary.ApplyPrimary(recordengine.EncodeWAL(
+		mkBatch("api", rrec{ts: 2000, body: "a"}, rrec{ts: 900, body: "old"}),
+	), recordengine.AppendLimits{})
+	require.NoError(t, err)
+	require.Equal(t, 1, res.RejectedOOO)
+	require.NoError(t, sw.Close())
+
+	recovered := recordengine.New(recordengine.Config{Schema: testSchema})
+	require.NoError(t, recovered.Replay(dir))
+
+	got := fetchAll(t, recovered, req("api"))
+	require.Len(t, got, 1, "the primary's unflushed head is recovered from its WAL")
+	assert.Equal(t, []int64{2000}, got[0].Timestamps)
+	assert.Equal(t, []string{"a"}, bodies(got[0]))
 }
 
 func TestApplyReplicatedMultiStream(t *testing.T) {

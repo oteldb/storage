@@ -55,6 +55,13 @@ for the shard), re-frames the **accepted** set, and replicates that verbatim to 
 receives the same accepted set from one authority: replicas converge even under concurrent writers
 and the reject count is exact, flowing back into `Accepted{Accepted, Rejected, RejectedReason}`.
 
+The primary also **logs** the accepted set to its own WAL, which is what the quorum's "one durable
+copy at the primary" rests on: a restart replays its unflushed head instead of coming back as a ring
+owner that answers with everything since its last flush missing. So a clustered node on a durable
+backend requires `WALDir` — `Open` refuses the combination. Secondaries hold the head in memory only
+(they neither flush nor checkpoint, so a log there would grow without bound); a secondary that
+restarts catches up from the shard's parts.
+
 ## Read path — owner-aware fan-out
 
 An owner serves locally with full matcher pushdown. A non-owner fans out to owners, **hedged**

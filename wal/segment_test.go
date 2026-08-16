@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -182,6 +183,42 @@ func TestSegmentSamplesRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []int64{1, 2, 3}, gotTs)
 	assert.Equal(t, []float64{10, 20, 30}, gotVal)
+}
+
+// TestSegmentWriteFrames: pre-framed records (what the cluster write path hands the log) land
+// byte-identical to writing them one call at a time, and an empty run opens no segment.
+func TestSegmentWriteFrames(t *testing.T) {
+	t.Parallel()
+
+	s := mkSeries("a", "b")
+	id := s.Hash()
+
+	perCall := t.TempDir()
+	sw, err := Create(perCall, 0)
+	require.NoError(t, err)
+	require.NoError(t, sw.WriteSeries(id, s))
+	require.NoError(t, sw.WriteSamples(id, []int64{1, 2}, []float64{10, 20}))
+	require.NoError(t, sw.Close())
+
+	var framed bytes.Buffer
+
+	w := NewWriter(&framed)
+	require.NoError(t, w.WriteSeries(id, s))
+	require.NoError(t, w.WriteSamples(id, []int64{1, 2}, []float64{10, 20}))
+
+	frames := t.TempDir()
+	fw, err := Create(frames, 0)
+	require.NoError(t, err)
+	require.NoError(t, fw.WriteFrames(nil), "an empty run writes nothing")
+	assert.Zero(t, fw.Seq(), "and opens no segment")
+	require.NoError(t, fw.WriteFrames(framed.Bytes()))
+	require.NoError(t, fw.Close())
+
+	want, err := os.ReadFile(filepath.Join(perCall, segmentName(1, 1)))
+	require.NoError(t, err)
+	got, err := os.ReadFile(filepath.Join(frames, segmentName(1, 1)))
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
 }
 
 func TestReplayDirCorruptSegment(t *testing.T) {
