@@ -84,6 +84,15 @@ type SignalStats struct {
 	// WALEpoch is the WAL's active flush generation (the epoch stamped onto new segments). The same
 	// generation across both engine families; not the recovery watermark.
 	WALEpoch uint64
+	// HasReadGap is true while this node holds the shard but cannot answer for all of it: it recovered
+	// (or was handed the shard) without the head the shard held unflushed, so a query reaching past
+	// ReadGapAfterUnixNano fails over to another owner instead of answering short. It clears once a
+	// flush by the shard's compaction owner puts newer data in this node's parts.
+	HasReadGap bool
+	// ReadGapAfterUnixNano is the newest data this node's parts held when it came back without a head:
+	// everything after it is missing here. math.MinInt64 when the shard had no parts at all — nothing
+	// here is known to be complete. Meaningful only while HasReadGap.
+	ReadGapAfterUnixNano int64
 }
 
 // ClusterStats is the cluster-mode view of this node.
@@ -180,6 +189,7 @@ func (s *Storage) Inspect() StoreStats {
 			MergeCapBytes: sh.CapBytes,
 			WAL:           hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 		})
+		s.attachReadGap(&ts.Signals[len(ts.Signals)-1], signal.Metric, tid)
 
 		if dc, ok := eng.DecodeCacheStats(); ok {
 			decode.Hits += dc.Hits
@@ -204,6 +214,7 @@ func (s *Storage) Inspect() StoreStats {
 				MergeCapBytes: sh.CapBytes,
 				WAL:           hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 			})
+			s.attachReadGap(&ts.Signals[len(ts.Signals)-1], sig, tid)
 		}
 	}
 

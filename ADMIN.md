@@ -63,6 +63,7 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 | `WAL` | the engine has a write-ahead log (false for the ephemeral in-memory engine) |
 | `WALSegments` / `WALBytes` | WAL segment sequence number and open-segment byte size |
 | `WALEpoch` | WAL active flush generation (not the recovery watermark) |
+| `HasReadGap` / `ReadGapAfterUnixNano` | this node holds the shard but came back without its unflushed head (a restart, or a rebalance handing it over), so it disclaims reads at or past that timestamp and lets another owner answer. Clears when a flush by the shard's compaction owner puts newer data in this node's parts. `math.MinInt64` means the shard had no parts at all — nothing here is known to be complete |
 
 Part *byte* sizes are intentionally omitted from `Inspect` (they would need backend stat calls) — use
 `PartsDetailed` for those.
@@ -184,6 +185,7 @@ Metric instruments (all prefixed `storage.`):
 | `backend.ops` / `backend.bytes` / `backend.latency` | `op`(, `result`) | ops: read/write/list/delete/cas/size; results: ok/not_found/error |
 | `rpc.attempts` / `rpc.retries` / `rpc.hedges` | `op` | cluster RPCs |
 | `rpc.shard_absent` | `op` | shard reads that failed over because an owner holds no data for the shard (a rebalance backfill that has not caught up, or a lagging membership view); a sustained rate means the ring and the data disagree |
+| `rpc.shard_incomplete` | `op` | shard reads that failed over because this node holds the shard but is missing the head it held unflushed (see `HasReadGap` above). Expected briefly after a restart or a rebalance; sustained means no owner is flushing the shard |
 | `wal.appends` / `wal.fsyncs` / `wal.rotations` | — | WAL activity |
 | `parts.total` / `parts.sealed` / `parts.merge_backlog` / `parts.merge_candidates` / `merge.cap_bytes` | `signal` | gauges: the merge selector's view of the parts, published once per maintenance cycle, summed over this node's tenants (`cap_bytes` is the largest threshold in effect, not a sum — it is a threshold, not a quantity). `merge_backlog` flat with `merge_candidates` pinned at 0 is the stuck engine above. Per-tenant detail is `Inspect`, which needs no meter |
 

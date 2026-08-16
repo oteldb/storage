@@ -76,7 +76,23 @@ empty copy, and a peer asked for a shard it does not hold answers `ErrShardAbsen
 404 — an unknown endpoint must stay distinguishable) rather than an empty success. An absent answer
 is a failover, not a result; only when *every* owner disclaims the shard does the read report empty.
 Both the local skip and the all-owners-absent case are metered (`storage.rpc.shard_absent`) and
-logged, since either means committed data is temporarily unreachable from this node. Matchers are opaque Go closures and **not serializable**, so the RPC carries the tenant
+logged, since either means committed data is temporarily unreachable from this node.
+
+**Holding a shard is not the same as being able to answer for it.** A node that restarts without
+recovering the shard's head — a secondary's head is never logged, so a restart always loses it — or
+one a rebalance just handed the shard to, comes back with the flushed parts alone. It is a ring
+owner, and one owner's answer is taken as complete, so serving it returns a hole nothing can see.
+Such an engine carries a **read gap**: it disclaims (the same `ErrShardAbsent` failover) any query
+reaching at or past the newest timestamp its parts held when it came back, and serves everything
+older locally. The bound is in the data's own time domain, not the wall clock, so it holds for
+backfilled ingest; it is inclusive because the lost head may hold more rows at that same timestamp.
+The gap closes when the parts advance past it, which only a flush by the shard's compaction owner
+does — a merge preserves its inputs' time range and so cannot close it by accident. Metered as
+`storage.rpc.shard_incomplete` and reported per shard in `Inspect` (`ADMIN.md`). The cost is
+conservative in one direction only: a node whose head was genuinely empty still fails over for
+recent windows until the next flush.
+
+Matchers are opaque Go closures and **not serializable**, so the RPC carries the tenant
 + window and the requester **re-applies the matchers** to the returned superset (which the contract
 permits). **Equality is the exception**: `fetch.Matcher` may carry a serializable `EqualMatcher`
 spec, forwarded and pushed down on the peer, so a non-owner read narrows by `__name__` instead of

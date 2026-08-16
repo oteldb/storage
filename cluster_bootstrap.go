@@ -112,7 +112,10 @@ func (s *Storage) bootstrapShard(ctx context.Context, tid signal.TenantID) {
 	}
 }
 
-// bootstrapEngine creates the tenant's engine for one signal and loads its flushed parts.
+// bootstrapEngine creates the tenant's engine for one signal and loads its flushed parts. The shard
+// arrives with its flushed data only, so the engine starts with a read gap over the head the
+// previous owners still hold: until a flush covers it, this node disclaims reads into that window
+// rather than answering them short (cluster_completeness.go).
 func (s *Storage) bootstrapEngine(ctx context.Context, tid signal.TenantID, sig signal.Signal) error {
 	if sig == signal.Metric {
 		eng, err := s.engineFor(tid)
@@ -120,7 +123,13 @@ func (s *Storage) bootstrapEngine(ctx context.Context, tid signal.TenantID, sig 
 			return err
 		}
 
-		return eng.RefreshReplica(ctx)
+		if err := eng.RefreshReplica(ctx); err != nil {
+			return err
+		}
+
+		s.noteReadGap(sig, tid, metricPartsMax(eng))
+
+		return nil
 	}
 
 	eng, err := s.recordEngineFor(sig, string(tid))
@@ -128,5 +137,11 @@ func (s *Storage) bootstrapEngine(ctx context.Context, tid signal.TenantID, sig 
 		return err
 	}
 
-	return eng.RefreshReplica(ctx)
+	if err := eng.RefreshReplica(ctx); err != nil {
+		return err
+	}
+
+	s.noteReadGap(sig, tid, recordPartsMax(eng))
+
+	return nil
 }
