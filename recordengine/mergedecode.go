@@ -56,6 +56,40 @@ func newMergeByteCol(dc *chunk.DictColumn) mergeByteCol {
 	return mergeByteCol{flat: bc}
 }
 
+// expandedBytes is the blob the column's cells occupy once materialized: what it already holds in
+// the flat form, and the sum of its rows' entry lengths for a dictionary. It sizes the merge output
+// buffer, which would otherwise grow each byte column out of nothing. Walking a dictionary costs one
+// table lookup per row over the packed ids — no cell is touched — against the ~log₂(size) full blob
+// re-copies the sizing avoids.
+func (m *mergeByteCol) expandedBytes() int64 {
+	if m.dict == nil {
+		return m.flat.byteSize()
+	}
+
+	dc := m.dict
+
+	lens := make([]int32, len(dc.Entries))
+	for i, e := range dc.Entries {
+		lens[i] = int32(len(e))
+	}
+
+	var total int64
+
+	if dc.IDWidth == 1 {
+		for _, id := range dc.IDs {
+			total += int64(lens[id])
+		}
+
+		return total
+	}
+
+	for i := 0; i+1 < len(dc.IDs); i += 2 {
+		total += int64(lens[uint16(dc.IDs[i])<<8|uint16(dc.IDs[i+1])])
+	}
+
+	return total
+}
+
 // at returns a view of cell i (aliasing the dictionary entry or the flat blob; valid until the flat
 // blob's next append, which the merge never does after decode).
 func (m *mergeByteCol) at(i int) []byte {
@@ -101,6 +135,46 @@ func (p *part) readForMerge(ctx context.Context) (*decodedPart, error) {
 	}
 
 	return d, nil
+}
+
+// decodedShape sizes a merge's output buffer from its decoded sources: their total row count and,
+// per byte column, the blob their cells expand to. capBytes (0 ⇒ no seal) scales it down to what one
+// output part holds, so a merge emitting many parts does not size its buffer for all of them.
+//
+// The estimate is an upper bound — retention drops rows the sources still carry — and the buffer
+// grows past it as normal if it is short.
+func decodedShape(decoded []*decodedPart, capBytes int64) (rows int, blob []int) {
+	if len(decoded) == 0 {
+		return 0, nil
+	}
+
+	blob = make([]int, len(decoded[0].bytes))
+
+	var total int64
+
+	for _, d := range decoded {
+		rows += len(d.ts)
+		total += int64(len(d.ts)) * int64(8+8*len(d.ints)+streamIDBytes)
+
+		for k := range d.bytes {
+			n := d.bytes[k].expandedBytes()
+			blob[k] += int(n)
+			total += n
+		}
+	}
+
+	if capBytes <= 0 || total <= capBytes {
+		return rows, blob
+	}
+
+	scale := float64(capBytes) / float64(total)
+	rows = int(float64(rows) * scale)
+
+	for k := range blob {
+		blob[k] = int(float64(blob[k]) * scale)
+	}
+
+	return rows, blob
 }
 
 // appendMergeRow appends row i of a decoded source part to c (every schema column; the merge rewrites

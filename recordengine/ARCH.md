@@ -85,9 +85,19 @@ Head buffers, fetch accumulators and the part read path use a contiguous **offse
 two headers per column instead of one per row, and a scan walks one allocation with locality.
 
 Cell views alias the blob under a **read-only-until-next-append** rule, since an append may move it; a
-value retained past one is copied. `fetch.NamedColumn` materializes views at the boundary, pooled
-across recycled fetches. Flush is a **pass-through**: `block.Column` accepts blob+offsets directly,
-encoded byte-identically to the per-row form, so writing a part never materializes a view per row.
+value retained past one is copied. A ts sort counts as one: it permutes into per-column scratch and
+swaps, so the array a sort leaves behind is the one the next sort of that buffer writes into.
+`fetch.NamedColumn` materializes views at the boundary, pooled across recycled fetches. Flush is a
+**pass-through**: `block.Column` accepts blob+offsets directly, encoded byte-identically to the
+per-row form, so writing a part never materializes a view per row.
+
+**Every bulk accumulation is pre-sized.** A `byteCol` grown from nothing doubles its way to size,
+re-copying its blob ~log₂(size) times and leaving each intermediate for the collector — and merge
+accumulates a whole part's worth of bodies. So the flush buffer is sized from the head's tracked
+per-stream byte counts, and the merge output buffer from `decodedShape`: the sources' expanded blob
+per column (a walk over a dictionary's packed ids, touching no cell), scaled down to `capBytes` when
+the merge will emit more than one part. That buffer is then re-armed after each part rather than
+reallocated — the part is read back from the backend, so nothing outlives the write holding it.
 
 **Per-stream ts ordering is applied at copy time:** the flush computes each stream's ts permutation and
 gathers rows into the flush buffer through it, never sorting the source. That is a correctness

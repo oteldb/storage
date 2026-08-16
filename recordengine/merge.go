@@ -286,14 +286,16 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 	// Split output only when a part-size cap applies and there is no side store to anchor per-part.
 	split := capBytes > 0 && e.cfg.SideStore == nil
 
-	newBuf := func() *flushColumns {
-		return &flushColumns{cols: newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))}
-	}
+	// One output buffer, pre-sized from the sources and re-armed after each part instead of allocated
+	// fresh. A byte column starting from nothing doubles its way to the seal threshold, re-copying a
+	// part's worth of bodies at every step and leaving each intermediate blob for the GC — the single
+	// largest allocation site in the engine, and most of the collector time a compaction spends.
+	bufRows, bufBlob := decodedShape(decoded, capBytes)
 
-	var (
-		newParts []*part
-		buf      = newBuf()
-	)
+	buf := &flushColumns{cols: newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))}
+	buf.reset(e.cfg.Schema, bufRows, bufBlob)
+
+	var newParts []*part
 
 	emit := func() error {
 		if buf.len() == 0 {
@@ -306,7 +308,9 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 		}
 
 		newParts = append(newParts, p)
-		buf = newBuf()
+		// The written part is read back from the backend, so nothing outlives the call holding the
+		// buffer's arrays: the next part reuses them at the size the first one settled on.
+		buf.reset(e.cfg.Schema, bufRows, bufBlob)
 
 		return nil
 	}
@@ -338,10 +342,13 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 		acc.sortByTs()
 
 		u := idToU128(id)
-		for j := range acc.ts {
+		for range acc.ts {
 			buf.stream = append(buf.stream, u)
-			buf.cols.appendRow(acc, j)
 		}
+
+		// The stream's rows are contiguous in both buffers, so they move as one blob copy per column
+		// rather than a cell-at-a-time append.
+		buf.cols.appendRange(acc, 0, acc.len())
 
 		// Flush a full part once the buffer reaches the cap, measured in the decoded bytes it actually
 		// holds rather than in rows times an assumed row size — records are variable-width, so a row

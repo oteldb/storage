@@ -163,16 +163,13 @@ func (b *byteCol) views(dst [][]byte) [][]byte {
 	return dst
 }
 
-// permuteBytes returns a new column holding src's cells reordered by idx (used by the ts sort).
-func permuteBytes(src *byteCol, idx []int) byteCol {
-	out := byteCol{
-		data:    make([]byte, 0, len(src.data)),
-		offsets: make([]int32, 1, len(idx)+1),
-	}
+// permuteBytesInto fills dst with src's cells reordered by idx (used by the ts sort), reusing dst's
+// backing arrays. A permutation cannot be done in place, so the sort swaps the two columns rather
+// than allocating a fresh one per sort.
+func permuteBytesInto(dst, src *byteCol, idx []int) {
+	dst.ensureBytes(len(idx), len(src.data))
 
 	for _, j := range idx {
-		out.appendCell(src.at(j))
+		dst.appendCell(src.at(j))
 	}
-
-	return out
 }
