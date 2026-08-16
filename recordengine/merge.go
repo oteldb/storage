@@ -286,13 +286,20 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 	// Split output only when a part-size cap applies and there is no side store to anchor per-part.
 	split := capBytes > 0 && e.cfg.SideStore == nil
 
+	// Union the sources' byte-column dictionaries once, before any row moves: a column every source
+	// dictionary-encoded is then carried through the merge as ids into that union and handed to the
+	// writer in split form, so no cell is copied and no row is re-hashed to rebuild a dictionary the
+	// sources already had.
+	dicts := buildMergeDicts(e.cfg.Schema, decoded)
+
 	// One output buffer, pre-sized from the sources and re-armed after each part instead of allocated
 	// fresh. A byte column starting from nothing doubles its way to the seal threshold, re-copying a
 	// part's worth of bodies at every step and leaving each intermediate blob for the GC — the single
 	// largest allocation site in the engine, and most of the collector time a compaction spends.
-	bufRows, bufBlob := decodedShape(decoded, capBytes)
+	bufRows, bufBlob := decodedShape(decoded, dicts, capBytes)
 
 	buf := &flushColumns{cols: newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))}
+	buf.cols.armSplit(dicts)
 	buf.reset(e.cfg.Schema, bufRows, bufBlob)
 
 	var newParts []*part
@@ -320,6 +327,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 	// — and their doubling growth — through the GC for each. [recordCols.prepare] keeps the backing
 	// arrays.
 	acc := newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
+	acc.armSplit(dicts)
 
 	for _, id := range idSetOf(src) {
 		acc.prepare(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
@@ -332,7 +340,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 				continue
 			}
 
-			appendMergeWindow(acc, decoded[i], rng, start, maxInt64)
+			appendMergeWindow(acc, decoded[i], i, rng, start, maxInt64)
 		}
 
 		if acc.len() == 0 {

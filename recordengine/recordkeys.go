@@ -38,7 +38,8 @@ func distinctRecordKeys(schema *Schema, cols *recordCols) [][]byte {
 	}
 
 	seen := make(map[string]struct{})
-	bc := &cols.bytes[k]
+
+	bc := cols.cellsAt(k)
 	for i := range bc.rows() {
 		forEachAttrKey(bc.at(i), func(key []byte) { seen[string(key)] = struct{}{} })
 	}

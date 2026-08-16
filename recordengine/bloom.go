@@ -47,6 +47,9 @@ type bloomBuilder struct {
 	seen     map[uint64]struct{} // value hashes already walked, for the repeated-value skip
 	rowsBuf  []int               // backing array of rows, kept across columns
 	rows     []int               // rows holding a value's first occurrence; nil ⇒ walk every row
+	// view is the column currently being built, held here so [bloomBuilder.build] can take it by
+	// value and still hand the walk a pointer without the local escaping to the heap once per column.
+	view cells
 }
 
 // Per-part filters are consulted once per part, so a query over a store with thousands of parts
@@ -83,13 +86,13 @@ const smallFilterBytes = 32 << 10
 // already small in absolute terms, that is the answer — an oversized-but-tiny filter is simply a
 // lower false-positive rate than asked for. Only when it is not small does the builder walk the
 // column a second time to estimate the DISTINCT count the filter should really be sized by.
-func (bb *bloomBuilder) sizeTokens(mode BloomMode, values *byteCol) int {
+func (bb *bloomBuilder) sizeTokens(mode BloomMode, values *cells) int {
 	// Above this the counting pass is wasted work: a column this large only implies a small filter
 	// when its tokens average tens of bytes each, which log text and attribute values do not, so go
 	// straight to the distinct estimate and keep the build at two passes over the column.
 	const countingWorthwhileBytes = 1 << 20
 
-	if len(values.data) > countingWorthwhileBytes {
+	if values.byteSize() > countingWorthwhileBytes {
 		return bb.distinctTokens(mode, values)
 	}
 
@@ -105,7 +108,7 @@ func (bb *bloomBuilder) sizeTokens(mode BloomMode, values *byteCol) int {
 // column — the count [bloom.New] must be sized by once the filter is big enough to matter. It walks
 // the same token stream forEachToken does, so the two cannot drift; the estimate costs one hash per
 // token and constant space.
-func (bb *bloomBuilder) distinctTokens(mode BloomMode, values *byteCol) int {
+func (bb *bloomBuilder) distinctTokens(mode BloomMode, values *cells) int {
 	bb.distinct.Reset()
 	bb.forEachToken(mode, values, bb.distinct.Add)
 
@@ -119,25 +122,38 @@ func (bb *bloomBuilder) distinctTokens(mode BloomMode, values *byteCol) int {
 // It must stay in step with forEachToken: it decides both the small-filter shortcut and, when taken,
 // the filter's size. TestBuildColumnBloomMatchesReference / FuzzBuildColumnBloomMatchesReference
 // detect any drift — they compare against a single-pass build that counts by materializing.
-func (bb *bloomBuilder) countTokens(mode BloomMode, values *byteCol) int {
+func (bb *bloomBuilder) countTokens(mode BloomMode, values *cells) int {
 	n := 0
 
 	switch mode {
 	case BloomFullText:
-		for i := range values.rows() {
-			n += bloom.CountTokens(values.at(i))
-		}
+		eachValue(values, nil, func(val []byte) { n += bloom.CountTokens(val) })
 	case BloomEquality:
-		for i := range values.rows() {
-			if len(values.at(i)) > 0 {
+		// Straight-line per form rather than through eachValue: the body is a length test, so a
+		// closure call per row would dominate it. This is the column shape (trace ids, one short
+		// value per row) whose count actually runs — the larger columns skip it entirely.
+		if sc := values.split; sc != nil {
+			entries, ids := sc.dict.entries, sc.ids
+			for _, id := range ids {
+				if len(entries[id]) > 0 {
+					n++
+				}
+			}
+
+			break
+		}
+
+		flat := values.flat
+		for i := range flat.rows() {
+			if len(flat.at(i)) > 0 {
 				n++
 			}
 		}
 	case BloomAttrs:
-		for i := range values.rows() {
-			a, _, err := signal.AppendAttributes(bb.attrs[:0], values.at(i))
+		eachValue(values, nil, func(val []byte) {
+			a, _, err := signal.AppendAttributes(bb.attrs[:0], val)
 			if err != nil {
-				continue
+				return
 			}
 
 			bb.attrs = a
@@ -146,7 +162,7 @@ func (bb *bloomBuilder) countTokens(mode BloomMode, values *byteCol) int {
 				bb.text = a[j].Value.AppendText(bb.text[:0])
 				n += 1 + bloom.CountTokens(bb.text)
 			}
-		}
+		})
 	case BloomNone:
 	}
 
@@ -159,7 +175,7 @@ func (bb *bloomBuilder) countTokens(mode BloomMode, values *byteCol) int {
 // Rows whose value was already walked are skipped ([bloomBuilder.markRows]): a bloom is a set, so
 // re-walking a repeated value re-derives tokens that are already in it — and log columns repeat
 // heavily (templated bodies, one attribute blob per stream). The filter is bit-identical either way.
-func (bb *bloomBuilder) forEachToken(mode BloomMode, values *byteCol, fn func(token []byte)) {
+func (bb *bloomBuilder) forEachToken(mode BloomMode, values *cells, fn func(token []byte)) {
 	switch mode {
 	case BloomFullText:
 		bb.eachFullText(values, fn)
@@ -185,7 +201,7 @@ const maxDedupRows = 1 << 18
 // Which rows are walked never changes the filter: a repeated value re-derives tokens the filter and
 // the distinct-count sketch already hold, and both are idempotent per token (see
 // TestBuildColumnBloomDedupIsBitIdentical).
-func (bb *bloomBuilder) selectRows(mode BloomMode, values *byteCol) {
+func (bb *bloomBuilder) selectRows(mode BloomMode, values *cells) {
 	if mode == BloomEquality {
 		bb.rows = nil // walk every row
 
@@ -198,17 +214,48 @@ func (bb *bloomBuilder) selectRows(mode BloomMode, values *byteCol) {
 // markRows fills bb.rows with the rows holding a value's first occurrence. Values are compared by
 // 64-bit hash: a collision would drop a row (a marginally smaller token set, never a false
 // negative for the values that were walked), at a probability far below the filter's own.
-func (bb *bloomBuilder) markRows(values *byteCol) {
-	rows := bb.rowsBuf[:0]
-
+// It is the dominant cost of a heavily repeated column's build (one hash and one map probe per row,
+// against a token walk over only the distinct values that survive), so the two forms get their own
+// loops rather than a shared one testing the form per row. Both hash the value, so the row set — and
+// with it the filter — does not depend on the form.
+func (bb *bloomBuilder) markRows(values *cells) {
 	if bb.seen == nil {
 		bb.seen = make(map[uint64]struct{}, 1024)
 	}
 
 	clear(bb.seen)
 
-	for i := range values.rows() {
-		h := xxh3.Hash(values.at(i))
+	rows := bb.rowsBuf[:0]
+	if sc := values.split; sc != nil {
+		entries, ids := sc.dict.entries, sc.ids
+		for i, id := range ids {
+			h := xxh3.Hash(entries[id])
+			if _, dup := bb.seen[h]; dup {
+				continue
+			}
+
+			if len(bb.seen) >= maxDedupRows {
+				for ; i < len(ids); i++ {
+					rows = append(rows, i)
+				}
+
+				break
+			}
+
+			bb.seen[h] = struct{}{}
+			rows = append(rows, i)
+		}
+
+		bb.rowsBuf, bb.rows = rows, rows
+
+		return
+	}
+
+	flat := values.flat
+
+	n := flat.rows()
+	for i := range n {
+		h := xxh3.Hash(flat.at(i))
 		if _, dup := bb.seen[h]; dup {
 			continue
 		}
@@ -216,7 +263,7 @@ func (bb *bloomBuilder) markRows(values *byteCol) {
 		if len(bb.seen) >= maxDedupRows {
 			// The set is full: keep every remaining row rather than dropping the dedup entirely,
 			// so the rows walked so far still skip their duplicates.
-			for ; i < values.rows(); i++ {
+			for ; i < n; i++ {
 				rows = append(rows, i)
 			}
 
@@ -230,30 +277,60 @@ func (bb *bloomBuilder) markRows(values *byteCol) {
 	bb.rowsBuf, bb.rows = rows, rows
 }
 
-// each walks the rows the builder selected: the first-occurrence set when markRows built one, every
-// row otherwise.
-func (bb *bloomBuilder) each(values *byteCol, fn func(i int)) {
-	eachRow(values, bb.rows, fn)
+// each walks the values of the rows the builder selected: the first-occurrence set when markRows
+// built one, every row otherwise.
+func (bb *bloomBuilder) each(values *cells, fn func(val []byte)) {
+	eachValue(values, bb.rows, fn)
 }
 
-func eachRow(values *byteCol, rows []int, fn func(i int)) {
+// eachValue calls fn with each selected row's value (rows nil ⇒ every row). The column's form is
+// branched on once, here, so each form's row loop is straight-line; the two walkers are kept
+// separate and small so both they and the caller's per-row closure still inline, which is what the
+// walk cost before the split form existed. The bloom build is ~20% of merge CPU and its per-row
+// bodies are small, so an extra indirect call or branch per row is measurable.
+func eachValue(values *cells, rows []int, fn func(val []byte)) {
+	if sc := values.split; sc != nil {
+		eachSplitValue(sc, rows, fn)
+
+		return
+	}
+
+	eachFlatValue(values.flat, rows, fn)
+}
+
+func eachFlatValue(b *byteCol, rows []int, fn func(val []byte)) {
 	if rows == nil {
-		for i := range values.rows() {
-			fn(i)
+		for i := range b.rows() {
+			fn(b.at(i))
 		}
 
 		return
 	}
 
 	for _, i := range rows {
-		fn(i)
+		fn(b.at(i))
+	}
+}
+
+func eachSplitValue(s *splitCol, rows []int, fn func(val []byte)) {
+	entries, ids := s.dict.entries, s.ids
+	if rows == nil {
+		for _, id := range ids {
+			fn(entries[id])
+		}
+
+		return
+	}
+
+	for _, i := range rows {
+		fn(entries[ids[i]])
 	}
 }
 
 // eachFullText emits a token per lowercased word of each value.
-func (bb *bloomBuilder) eachFullText(values *byteCol, fn func(token []byte)) {
-	bb.each(values, func(i int) {
-		bb.words.Reset(values.at(i))
+func (bb *bloomBuilder) eachFullText(values *cells, fn func(token []byte)) {
+	bb.each(values, func(val []byte) {
+		bb.words.Reset(val)
 		for {
 			tok, ok := bb.words.Next()
 			if !ok {
@@ -269,19 +346,54 @@ func (bb *bloomBuilder) eachFullText(values *byteCol, fn func(token []byte)) {
 // trace_id) are skipped: they are never an equality lookup target, and indexing them would size the
 // filter to the row count and hash a value per row for nothing — the dominant cost when a column is
 // mostly empty.
-func eachEquality(values *byteCol, rows []int, fn func(token []byte)) {
-	eachRow(values, rows, func(i int) {
-		if v := values.at(i); len(v) > 0 {
+//
+// Its per-row body is a length test, so it walks each form directly rather than through
+// [eachValue]'s closure: one indirect call per row instead of two.
+func eachEquality(values *cells, rows []int, fn func(token []byte)) {
+	if sc := values.split; sc != nil {
+		entries, ids := sc.dict.entries, sc.ids
+		if rows == nil {
+			for _, id := range ids {
+				if v := entries[id]; len(v) > 0 {
+					fn(v)
+				}
+			}
+
+			return
+		}
+
+		for _, i := range rows {
+			if v := entries[ids[i]]; len(v) > 0 {
+				fn(v)
+			}
+		}
+
+		return
+	}
+
+	flat := values.flat
+	if rows == nil {
+		for i := range flat.rows() {
+			if v := flat.at(i); len(v) > 0 {
+				fn(v)
+			}
+		}
+
+		return
+	}
+
+	for _, i := range rows {
+		if v := flat.at(i); len(v) > 0 {
 			fn(v)
 		}
-	})
+	}
 }
 
 // eachAttrs emits, per attribute of each serialized blob, the equality token key‖value and a
 // key‖word token per word of the rendered value. A blob that fails to decode is skipped.
-func (bb *bloomBuilder) eachAttrs(values *byteCol, fn func(token []byte)) {
-	bb.each(values, func(i int) {
-		a, _, err := signal.AppendAttributes(bb.attrs[:0], values.at(i))
+func (bb *bloomBuilder) eachAttrs(values *cells, fn func(token []byte)) {
+	bb.each(values, func(val []byte) {
+		a, _, err := signal.AppendAttributes(bb.attrs[:0], val)
 		if err != nil {
 			return
 		}
@@ -319,16 +431,21 @@ func (bb *bloomBuilder) eachAttrs(values *byteCol, fn func(token []byte)) {
 // by, once to hash the tokens in — rather than materializing every token to learn that count. Both
 // passes see the same token set, so the filter matches a single-pass build; the second walk is far
 // cheaper than the per-token allocations (and the live [][]byte holding them) it replaces.
-func (bb *bloomBuilder) build(mode BloomMode, values *byteCol) []byte {
+// The column is taken in either the flat or the split form ([cells]); the filter is identical
+// either way, since both yield the same value per row.
+func (bb *bloomBuilder) build(mode BloomMode, values cells) []byte {
 	if mode == BloomNone {
 		return nil
 	}
 
-	// The row selection is computed once and drives both the sizing walk and the filling one.
-	bb.selectRows(mode, values)
+	bb.view = values
+	v := &bb.view
 
-	f := bloom.New(bb.sizeTokens(mode, values), falsePositiveRate(mode))
-	bb.forEachToken(mode, values, f.Add)
+	// The row selection is computed once and drives both the sizing walk and the filling one.
+	bb.selectRows(mode, v)
+
+	f := bloom.New(bb.sizeTokens(mode, v), falsePositiveRate(mode))
+	bb.forEachToken(mode, v, f.Add)
 
 	return f.Encode(nil)
 }
@@ -338,7 +455,7 @@ func (bb *bloomBuilder) build(mode BloomMode, values *byteCol) []byte {
 func buildColumnBloom(mode BloomMode, values *byteCol) []byte {
 	var bb bloomBuilder
 
-	return bb.build(mode, values)
+	return bb.build(mode, cells{flat: values})
 }
 
 // writeBlooms writes a bloom sidecar for each bloom-bearing column of the schema, over the flushed
@@ -353,7 +470,7 @@ func writeBlooms(
 			continue
 		}
 
-		data := bb.build(col.Bloom, &cols.bytes[k])
+		data := bb.build(col.Bloom, cols.cellsAt(k))
 		if err := b.Write(ctx, bloomKey(prefix, col.Name), data); err != nil {
 			return errors.Wrapf(err, "write bloom %q", col.Name)
 		}

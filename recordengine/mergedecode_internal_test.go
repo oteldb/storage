@@ -146,19 +146,19 @@ func TestDecodedShapeScalesToCap(t *testing.T) {
 	// 100 rows × (8 ts + 8 int + 16 stream id) + 100 × 10 blob bytes.
 	const total = 100*32 + 1000
 
-	rows, blob := decodedShape(src, 0)
+	rows, blob := decodedShape(src, nil, 0)
 	assert.Equal(t, 100, rows)
 	assert.Equal(t, []int{1000}, blob)
 
-	rows, blob = decodedShape(src, total)
+	rows, blob = decodedShape(src, nil, total)
 	assert.Equal(t, 100, rows)
 	assert.Equal(t, []int{1000}, blob)
 
-	rows, blob = decodedShape(src, total/4)
+	rows, blob = decodedShape(src, nil, total/4)
 	assert.Equal(t, 25, rows)
 	assert.Equal(t, []int{250}, blob)
 
-	rows, blob = decodedShape(nil, 0)
+	rows, blob = decodedShape(nil, nil, 0)
 	assert.Zero(t, rows)
 	assert.Nil(t, blob)
 }

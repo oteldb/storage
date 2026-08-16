@@ -99,6 +99,40 @@ per column (a walk over a dictionary's packed ids, touching no cell), scaled dow
 the merge will emit more than one part. That buffer is then re-armed after each part rather than
 reallocated — the part is read back from the backend, so nothing outlives the write holding it.
 
+### The merge carries byte columns as a dictionary and ids
+
+A merge never expands a byte column it was handed dictionary-encoded. It **unions the selected
+sources' dictionaries once**, before any row moves (`mergeDict`: entries distinct by value, plus a
+source-entry → union-id table per source part), and the accumulator then carries the column as ids
+into that union (`splitCol`) instead of copying cells into a blob. `writePart` hands `BytesDict` +
+`BytesIDs` straight to `block.Column`, which encodes it byte-identically to the blob form. So a merge
+copies no cell and re-hashes no row to rebuild a dictionary its sources already had: the union costs
+one hash probe per distinct entry per source part — a few thousand probes for a column of tens of
+millions of rows — where expanding cost one map probe and one blob copy per row, the engine's largest
+allocation site.
+
+The union is unbounded: above 65536 entries the writer's per-granule renumbering still keeps the
+emitted id width bounded by a granule's distinct count.
+
+**The decision is per column and made once.** A column takes this path only when *every* selected
+source decoded to a real dictionary and the schema's codec accepts the split form. One flat source —
+the >65536-distinct dictionary fallback, or a `CodecBytesRaw` column such as `trace_id`, both of
+which decode with `IDWidth 0` — leaves that column on the flat blob path for the whole merge; there
+is no entry table to union and synthesizing one would be the copy this avoids. A mixed set is the
+normal case: `body` and `attrs` carry ids while `trace_id` carries a blob, in the same accumulator.
+
+**Size accounting stays expanded.** `byteSize`/`rowBytes` are what seal an output part
+(`buf.byteSize() >= capBytes`) and what bound the merge's working set, and the merge cap is
+denominated in *decoded* bytes. A split column therefore reports `Σ len(entries[ids[i]])`, never its
+id array — reporting ids would inflate every output part by the column's compression ratio and remove
+the memory bound the cap exists for. The total is maintained on append (O(1) per row) because
+`byteSize` is called once per stream, so recomputing it would be O(rows × streams).
+
+Consumers that walk the accumulator's values per row — the bloom build, the record-keys footer —
+read through `cells`, a pointer-passed view over either form. Those walks branch on the form once and
+then run a straight-line loop per form: the bloom build is ~20% of merge CPU and its per-row bodies
+are small enough that a form test per row is measurable.
+
 **Per-stream ts ordering is applied at copy time:** the flush computes each stream's ts permutation and
 gathers rows into the flush buffer through it, never sorting the source. That is a correctness
 requirement — the detached buffers stay fetchable through `e.flushing` while the part is written off
