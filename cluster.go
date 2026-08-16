@@ -400,8 +400,10 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 // localFetch serves a peer's fetch from the local engine, pushing down the (equality) matchers
 // it forwarded — the read-fan-out server's view of this node's data.
 func (s *Storage) localFetch(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
-	eng, ok := s.lookupEngine(s.normalizeTenant(signal.TenantID(tenant)))
-	if !ok {
+	tid := s.normalizeTenant(signal.TenantID(tenant))
+
+	eng, ok := s.lookupEngine(tid)
+	if !ok || !s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, start, end) {
 		return nil, cluster.ErrShardAbsent
 	}
 
@@ -466,7 +468,7 @@ func (s *Storage) shardFetcher(shardKey signal.TenantID) fetch.Fetcher {
 	local, remotes, absent := s.shardReadTargets(signal.Metric, shardKey)
 	if local {
 		if e, ok := s.lookupEngine(shardKey); ok {
-			return e
+			return s.gapGuarded(signal.Metric, shardKey, e, remotes)
 		}
 	}
 
@@ -511,8 +513,10 @@ func (s *Storage) shardReadTargets(
 func (s *Storage) localAggregate(
 	ctx context.Context, tenant string, start, end, step int64, matchers []fetch.Matcher,
 ) ([]engine.NamedAgg, error) {
-	eng, ok := s.lookupEngine(s.normalizeTenant(signal.TenantID(tenant)))
-	if !ok {
+	tid := s.normalizeTenant(signal.TenantID(tenant))
+
+	eng, ok := s.lookupEngine(tid)
+	if !ok || !s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, start, end) {
 		return nil, cluster.ErrShardAbsent
 	}
 
@@ -526,8 +530,10 @@ func (s *Storage) localAggregate(
 func (s *Storage) localAggregateWindow(
 	ctx context.Context, tenant string, start, end int64, spec engine.WindowSpec, matchers []fetch.Matcher,
 ) ([]engine.NamedWindowAgg, error) {
-	eng, ok := s.lookupEngine(s.normalizeTenant(signal.TenantID(tenant)))
-	if !ok {
+	tid := s.normalizeTenant(signal.TenantID(tenant))
+
+	eng, ok := s.lookupEngine(tid)
+	if !ok || !s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, start, end) {
 		return nil, cluster.ErrShardAbsent
 	}
 
@@ -834,8 +840,10 @@ func mergeBucketLists(a, b []engine.BucketAgg) []engine.BucketAgg {
 // localLogFetch serves a peer's log fetch from the local log engine, pushing down the (equality)
 // stream matchers it forwarded.
 func (s *Storage) localLogFetch(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
-	eng, ok := s.lookupLogEngine(s.normalizeTenant(signal.TenantID(tenant)))
-	if !ok {
+	tid := s.normalizeTenant(signal.TenantID(tenant))
+
+	eng, ok := s.lookupLogEngine(tid)
+	if !ok || !s.canAnswer(ctx, rpcOpRead, signal.Log, tid, start, end) {
 		return nil, cluster.ErrShardAbsent
 	}
 
@@ -856,8 +864,10 @@ func (s *Storage) clusterLogFetcherFor(tid signal.TenantID) fetch.Fetcher {
 
 // localTraceFetch serves a peer's span fetch from the local traces engine.
 func (s *Storage) localTraceFetch(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
-	eng, ok := s.lookupTraceEngine(s.normalizeTenant(signal.TenantID(tenant)))
-	if !ok {
+	tid := s.normalizeTenant(signal.TenantID(tenant))
+
+	eng, ok := s.lookupTraceEngine(tid)
+	if !ok || !s.canAnswer(ctx, rpcOpRead, signal.Trace, tid, start, end) {
 		return nil, cluster.ErrShardAbsent
 	}
 
@@ -878,8 +888,10 @@ func (s *Storage) clusterTraceFetcherFor(tid signal.TenantID) fetch.Fetcher {
 func (s *Storage) localProfileFetch(
 	ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher,
 ) ([]*fetch.Batch, error) {
-	eng, ok := s.lookupProfileEngine(s.normalizeTenant(signal.TenantID(tenant)))
-	if !ok {
+	tid := s.normalizeTenant(signal.TenantID(tenant))
+
+	eng, ok := s.lookupProfileEngine(tid)
+	if !ok || !s.canAnswer(ctx, rpcOpRead, signal.Profile, tid, start, end) {
 		return nil, cluster.ErrShardAbsent
 	}
 
@@ -953,7 +965,7 @@ func (s *Storage) localSeries(
 
 	if sig == signal.Metric {
 		eng, ok := s.lookupEngine(tid)
-		if !ok {
+		if !ok || !s.canAnswer(ctx, rpcOpSeries, sig, tid, start, end) {
 			return nil, cluster.ErrShardAbsent
 		}
 
@@ -961,7 +973,7 @@ func (s *Storage) localSeries(
 	}
 
 	eng, ok := s.lookupRecordEngine(sig, tid)
-	if !ok {
+	if !ok || !s.canAnswer(ctx, rpcOpSeries, sig, tid, start, end) {
 		return nil, cluster.ErrShardAbsent
 	}
 
@@ -987,10 +999,12 @@ func metricSeriesRequest(tid signal.TenantID, matchers []fetch.Matcher, start, e
 // localKeys serves a peer's distinct attribute-key listing for a record signal from the local
 // engine (the enumeration twin of localSeries, backing LogKeys' cluster fan-out).
 func (s *Storage) localKeys(
-	_ context.Context, sig signal.Signal, tenant string, start, end int64,
+	ctx context.Context, sig signal.Signal, tenant string, start, end int64,
 ) ([]cluster.KeyInfo, error) {
-	eng, ok := s.lookupRecordEngine(sig, s.normalizeTenant(signal.TenantID(tenant)))
-	if !ok {
+	tid := s.normalizeTenant(signal.TenantID(tenant))
+
+	eng, ok := s.lookupRecordEngine(sig, tid)
+	if !ok || !s.canAnswer(ctx, rpcOpSeries, sig, tid, start, end) {
 		return nil, cluster.ErrShardAbsent
 	}
 
@@ -1202,7 +1216,7 @@ func (s *Storage) shardRecordFetcher(
 	local, remotes, absent := s.shardReadTargets(sig, shardKey)
 	if local {
 		if e, ok := lookup(shardKey); ok {
-			return e
+			return s.gapGuarded(sig, shardKey, e, remotes)
 		}
 	}
 

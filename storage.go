@@ -56,6 +56,12 @@ type Storage struct {
 
 	cluster *clusterNode // cluster runtime (membership + replica server + routed writes); nil ⇒ single-node
 
+	// gaps holds, per shard engine, the time range this node recovered without a head and therefore
+	// cannot answer for (see cluster_completeness.go). Empty in the steady state and in single-node
+	// mode, where there is no other owner to fail over to.
+	gapMu sync.RWMutex
+	gaps  map[gapKey]readGap
+
 	queryCache scale.Cache // shared results cache for Fetcher; nil ⇒ caching disabled
 
 	// decodeBudget is the process-wide decode-memory admission budget ([Options.DecodeMemoryBytes]),
@@ -146,6 +152,11 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 
 	// Join the cluster (membership + replica server + routed writes) when configured.
 	if o.Cluster != nil {
+		// Recovery restores flushed parts and the WAL's head; whatever the shard held unflushed and
+		// unlogged here is missing. Record it before joining, so the node never serves a read as a
+		// ring owner with a hole in it (cluster_completeness.go).
+		s.noteRecoveryGaps()
+
 		if err := s.startCluster(ctx, o.Cluster); err != nil {
 			return nil, errors.Wrap(err, "start cluster")
 		}
@@ -1496,6 +1507,10 @@ func (s *Storage) maintain(ctx context.Context) {
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].pressure > tasks[j].pressure })
 
 	parallel.ForEach(len(tasks), s.maintenanceConcurrency(), func(i int) { tasks[i].run() })
+
+	// The pass above is what brings the owner's freshly flushed parts here, so this is where a shard
+	// recovered without its head can stop disclaiming reads.
+	s.closeCoveredGaps(ctx)
 
 	s.recordPartShape(ctx)
 }

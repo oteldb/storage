@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/query/fetch"
 )
 
@@ -87,10 +88,15 @@ func TestClusterGainedOwnerBootstrap(t *testing.T) {
 		return ok && eng.PartCount() == 1
 	}, 15*time.Second, 200*time.Millisecond, "the spare bootstraps the engine and mirrors the part")
 
-	// The spare serves the flushed data from its OWN backend (localFetch does not fan out).
-	got, err := spare.localFetch(ctx, "default", 0, 1<<60, []fetch.Matcher{nameMatcher("http.requests")})
+	// The spare serves the flushed window from its OWN backend (localFetch does not fan out).
+	got, err := spare.localFetch(ctx, "default", 0, ts[len(ts)-1]-1, []fetch.Matcher{nameMatcher("http.requests")})
 	require.NoError(t, err)
-	require.Len(t, got, 1, "the spare serves the series locally")
-	assert.Equal(t, ts, got[0].Timestamps)
-	assert.Equal(t, vals, got[0].Values)
+	require.Len(t, got, 1, "the spare serves the mirrored window locally")
+	assert.Equal(t, ts[:len(ts)-1], got[0].Timestamps)
+	assert.Equal(t, vals[:len(vals)-1], got[0].Values)
+
+	// Past that window it disclaims: what a shard held unflushed stayed with the previous owners, and
+	// only their next flush brings it here, so answering would be answering short (#340).
+	_, err = spare.localFetch(ctx, "default", 0, 1<<60, []fetch.Matcher{nameMatcher("http.requests")})
+	require.ErrorIs(t, err, cluster.ErrShardAbsent, "the backfilled spare disclaims the unflushed window")
 }

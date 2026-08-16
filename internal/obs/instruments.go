@@ -170,10 +170,11 @@ func (b *Backend) Record(ctx context.Context, op, result string, dur time.Durati
 // was slow). Counts are tagged by op ("read"/"write"/"series"/"side"), so a rising retry/hedge rate
 // localizes a degrading link or peer.
 type RPC struct {
-	attempts metric.Int64Counter
-	retries  metric.Int64Counter
-	hedges   metric.Int64Counter
-	absent   metric.Int64Counter
+	attempts   metric.Int64Counter
+	retries    metric.Int64Counter
+	hedges     metric.Int64Counter
+	absent     metric.Int64Counter
+	incomplete metric.Int64Counter
 }
 
 func opAttr(op string) metric.MeasurementOption {
@@ -191,6 +192,12 @@ func (r *RPC) Retry(ctx context.Context, op string) { r.retries.Add(ctx, 1, opAt
 // and the data disagree — a rebalance whose backfill has not caught up, or a lagging membership view.
 func (r *RPC) ShardAbsent(ctx context.Context, op string) { r.absent.Add(ctx, 1, opAttr(op)) }
 
+// ShardIncomplete accounts one read of a shard this node holds but cannot fully answer for: it came
+// back from a restart (or a rebalance) without the head the shard held unflushed, so the query
+// window overlaps data only another owner has, and the read failed over. It clears once the shard's
+// parts cover that window; a sustained rate means no owner is flushing.
+func (r *RPC) ShardIncomplete(ctx context.Context, op string) { r.incomplete.Add(ctx, 1, opAttr(op)) }
+
 // Hedge accounts one hedged (opportunistic concurrent) attempt for op.
 func (r *RPC) Hedge(ctx context.Context, op string) { r.hedges.Add(ctx, 1, opAttr(op)) }
 
@@ -201,6 +208,8 @@ func newRPC(m metric.Meter) (*RPC, error) {
 		retries:  b.counter("storage.rpc.retries", "cluster RPC sequential retries", "{retry}"),
 		hedges:   b.counter("storage.rpc.hedges", "cluster RPC hedged (concurrent) attempts", "{hedge}"),
 		absent:   b.counter("storage.rpc.shard_absent", "shard reads failed over because the owner holds no data", "{read}"),
+		incomplete: b.counter("storage.rpc.shard_incomplete",
+			"shard reads failed over because the owner's copy is missing its unflushed head", "{read}"),
 	}
 
 	return r, b.err
