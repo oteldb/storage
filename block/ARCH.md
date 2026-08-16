@@ -21,6 +21,32 @@ One physical `Kind` per column (`Int64`/`Float64`/`Bytes`/`Int128`), a codec sel
 resource-attribute win. `Int128` (the metric SeriesID sort key) is exempt: its RLE codec already
 collapses a single-id run. `ColumnReader` is lazy and synthesizes constants with no I/O.
 
+### Bytes column input forms
+
+A `KindBytes` `Column` accepts its cells in three interchangeable shapes, so a writer's caller hands
+over whatever it already holds instead of materializing a form the encoder happens to want:
+
+- `Bytes` — one `[]byte` per row.
+- `BytesBlob` + `BytesOffsets` — the head buffer's layout, so a flush encodes straight from the blob.
+- `BytesDict` + `BytesIDs` — the split (dictionary) form, cell *i* being `BytesDict[BytesIDs[i]]`,
+  which is what a merge holds after reading a dictionary-encoded column. `chunk.CodecDict` only:
+  the merge keeps raw columns (trace ids) flat, so a raw split-form encoder would have no caller.
+
+All three produce **byte-identical** objects and descriptors, which is what makes the choice a
+performance decision and never a format one. That holds because every path — const collapse, the
+single-stream encode, the per-granule encode, and the shared-dictionary build — walks the rows in
+order and appends a value on first occurrence, so entry order and id width coincide. It requires
+`BytesDict` to be distinct by value: the split-form encoders dedup by index, so a duplicated entry
+would emit a second dictionary entry — still a valid stream, no longer the same one.
+
+The split form is the cheap one. The other two hash and compare every row twice while building a
+shared dictionary — once to count a granule's distinct values, once to assign each row its
+dictionary id. Given entry indices those become array work over `int32`s: a per-entry generation
+stamp counts a granule's distinct ids without a clear between granules, and a persistent
+source-entry → shared-id remap replaces the interning map. Nothing is hashed and no bytes are
+compared. The granule decision reads the same distinct count either way, which is what keeps the
+objects identical rather than merely equivalent.
+
 ## Block framing
 
 Opt-in (`Column.Block`): a per-row sequential column is split into granule-sized row blocks, each

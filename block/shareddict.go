@@ -50,40 +50,46 @@ const (
 // and a threshold in between costs nothing to either.
 const sharedDictMinRepeat = 2
 
-// byteAt returns row i of a bytes column in either of its input forms.
+// byteAt returns row i of a bytes column in any of its input forms.
 func (c Column) byteAt(i int) []byte {
 	if c.Bytes != nil {
 		return c.Bytes[i]
 	}
 
-	return c.BytesBlob[c.BytesOffsets[i]:c.BytesOffsets[i+1]]
+	if len(c.BytesOffsets) > 0 {
+		return c.BytesBlob[c.BytesOffsets[i]:c.BytesOffsets[i+1]]
+	}
+
+	return c.BytesDict[c.BytesIDs[i]]
 }
 
-// encodeSharedDictBytes serializes a bytes column as a shared-dictionary block-framed object. It
-// reports ok=false when no granule chose the shared dictionary, leaving the caller on the ordinary
-// per-granule path rather than paying an empty dictionary's header for nothing.
-func encodeSharedDictBytes(
-	c Column, comp *compress.Compressor, blockRows, compressBytes int,
-) (obj []byte, ok bool, err error) {
-	n := c.rows()
-	if n == 0 || blockRows <= 0 {
-		return nil, false, nil
-	}
+// sharedDictJoins applies the granule decision: whether a granule of the given row and distinct-value
+// counts joins a column-wide dictionary already holding entries values. Near-unique granules stay out
+// — they would grow the shared dictionary by their whole distinct set to serve themselves alone.
+//
+// The two input forms reach it with the same numbers (entries are distinct by value, so counting
+// distinct indices counts distinct values), which is what keeps their objects byte-identical.
+func sharedDictJoins(distinct, rows, entries int) bool {
+	return distinct*sharedDictMinRepeat <= rows && entries+distinct <= maxSharedEntries
+}
+
+// buildSharedDictFromValues decides each granule and builds the column dictionary for a column whose
+// cells are flat values, hashing each row twice: once to count the granule's distinct values, once to
+// assign its shared-dictionary id. It fills shared (per granule) and ids (per row, -1 where the
+// granule self-encodes), and reports whether any granule joined.
+func buildSharedDictFromValues(c Column, blockRows int, shared []bool, ids []int32) ([][]byte, bool) {
+	n := len(ids)
 
 	m := pool.NewByteIntMap()
 	defer m.PutBack()
 
-	var (
-		entries [][]byte
-		ids     = make([]int32, n) // global entry id per row; -1 where the granule self-encodes
-		shared  = make([]bool, (n+blockRows-1)/blockRows)
-		used    bool
-	)
-
-	// Pass 1: decide per granule and build the dictionary. The decision needs the granule's distinct
-	// count, which is the same probe that assigns its ids, so the ids are kept rather than recomputed.
 	seen := pool.NewByteIntMap()
 	defer seen.PutBack()
+
+	var (
+		entries [][]byte
+		used    bool
+	)
 
 	for g := range shared {
 		lo := g * blockRows
@@ -101,9 +107,7 @@ func encodeSharedDictBytes(
 			}
 		}
 
-		// Near-unique granules stay out: they would grow the shared dictionary by their whole
-		// distinct set to serve themselves alone.
-		if distinct*sharedDictMinRepeat > hi-lo || len(entries)+distinct > maxSharedEntries {
+		if !sharedDictJoins(distinct, hi-lo, len(entries)) {
 			for i := lo; i < hi; i++ {
 				ids[i] = -1
 			}
@@ -125,6 +129,99 @@ func encodeSharedDictBytes(
 
 			ids[i] = int32(id)
 		}
+	}
+
+	return entries, used
+}
+
+// buildSharedDictFromIDs is [buildSharedDictFromValues] for a column already in split form. Both
+// passes become array work over int32s: a per-source-entry stamp counts a granule's distinct ids
+// without clearing between granules, and remap carries a source entry's shared-dictionary id once
+// assigned. No value is hashed or compared.
+func buildSharedDictFromIDs(dict [][]byte, src []int32, blockRows int, shared []bool, ids []int32) ([][]byte, bool) {
+	n := len(ids)
+
+	// stamp is freshly zeroed and gen starts at 1, so no generation ever wraps onto a stale stamp:
+	// gen advances once per granule and a column cannot hold 2³² of them.
+	stamp := make([]uint32, len(dict))
+	remap := make([]int32, len(dict))
+
+	for i := range remap {
+		remap[i] = -1
+	}
+
+	var (
+		entries [][]byte
+		used    bool
+		gen     uint32
+	)
+
+	for g := range shared {
+		lo := g * blockRows
+		hi := min(lo+blockRows, n)
+
+		distinct := 0
+		gen++
+
+		for i := lo; i < hi; i++ {
+			e := src[i]
+			if stamp[e] != gen {
+				stamp[e] = gen
+
+				distinct++
+			}
+		}
+
+		if !sharedDictJoins(distinct, hi-lo, len(entries)) {
+			for i := lo; i < hi; i++ {
+				ids[i] = -1
+			}
+
+			continue
+		}
+
+		shared[g], used = true, true
+
+		for i := lo; i < hi; i++ {
+			e := src[i]
+
+			id := remap[e]
+			if id < 0 {
+				id = int32(len(entries))
+				remap[e] = id
+				entries = append(entries, dict[e])
+			}
+
+			ids[i] = id
+		}
+	}
+
+	return entries, used
+}
+
+// encodeSharedDictBytes serializes a bytes column as a shared-dictionary block-framed object. It
+// reports ok=false when no granule chose the shared dictionary, leaving the caller on the ordinary
+// per-granule path rather than paying an empty dictionary's header for nothing.
+func encodeSharedDictBytes(
+	c Column, comp *compress.Compressor, blockRows, compressBytes int,
+) (obj []byte, ok bool, err error) {
+	n := c.rows()
+	if n == 0 || blockRows <= 0 {
+		return nil, false, nil
+	}
+
+	ids := make([]int32, n) // shared-dictionary id per row; -1 where the granule self-encodes
+	shared := make([]bool, (n+blockRows-1)/blockRows)
+
+	var (
+		entries [][]byte
+		used    bool
+	)
+
+	if c.bytesSplitForm() {
+		entries, used = buildSharedDictFromIDs(c.BytesDict, c.BytesIDs, blockRows, shared, ids)
+	} else {
+		entries, used = buildSharedDictFromValues(c, blockRows, shared, ids)
 	}
 
 	if !used {

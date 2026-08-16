@@ -149,13 +149,17 @@ func appendBlockStream(dst []byte, c Column, codec chunk.Codec, budget uint8, lo
 	case c.Kind == KindFloat64 && codec == chunk.CodecDecimal:
 		return chunk.EncodeFloatsDecimal(dst, c.Float64[lo:hi], decimalPrecision(budget)), nil
 	case c.Kind == KindBytes && codec == chunk.CodecDict:
-		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+		if c.bytesBlobForm() {
 			return chunk.EncodeBytesBlobRange(dst, c.BytesBlob, c.BytesOffsets, lo, hi), nil
+		}
+
+		if c.bytesSplitForm() {
+			return chunk.EncodeBytesDictRange(dst, c.BytesDict, c.BytesIDs, lo, hi), nil
 		}
 
 		return chunk.EncodeBytes(dst, c.Bytes[lo:hi]), nil
 	case c.Kind == KindBytes && codec == chunk.CodecBytesRaw:
-		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+		if c.bytesBlobForm() {
 			return chunk.EncodeBytesRawBlobRange(dst, c.BytesBlob, c.BytesOffsets, lo, hi), nil
 		}
 

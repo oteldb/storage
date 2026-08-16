@@ -36,6 +36,17 @@ type Column struct {
 	// Bytes is nil; the encoded object is byte-identical to the equivalent Bytes input.
 	BytesBlob    []byte
 	BytesOffsets []int32
+	// BytesDict/BytesIDs are the split (dictionary) alternative to Bytes for a KindBytes column:
+	// cell i is BytesDict[BytesIDs[i]] — the shape a merge already holds when it reads a
+	// dictionary-encoded byte column, accepted directly so the writers build their dictionaries by
+	// remapping entry indices instead of re-hashing every row. Used only when Bytes is nil and
+	// BytesOffsets is empty; the encoded object is byte-identical to the equivalent Bytes input.
+	//
+	// BytesDict must be distinct by value: the encoders deduplicate by index, so two entries holding
+	// equal bytes yield two dictionary entries — a valid stream, but not the same one. Only
+	// [chunk.CodecDict] accepts this form.
+	BytesDict [][]byte
+	BytesIDs  []int32
 	// AutoCodec, when set on a float64 column with no explicit Codec, picks the smaller of the
 	// lossless float codecs (Gorilla XOR vs scaled-decimal+delta) by trial-encoding — so an
 	// integer-valued or low-precision column (e.g. a counter) takes the far denser decimal path
@@ -64,16 +75,27 @@ func (c Column) rows() int {
 	case KindFloat64:
 		return len(c.Float64)
 	case KindBytes:
-		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+		switch {
+		case c.bytesBlobForm():
 			return len(c.BytesOffsets) - 1
+		case c.bytesSplitForm():
+			return len(c.BytesIDs)
+		default:
+			return len(c.Bytes)
 		}
-
-		return len(c.Bytes)
 	case KindInt128:
 		return len(c.Int128)
 	default:
 		return 0
 	}
+}
+
+// bytesBlobForm reports whether a KindBytes column carries its cells as BytesBlob+BytesOffsets.
+func (c Column) bytesBlobForm() bool { return c.Bytes == nil && len(c.BytesOffsets) > 0 }
+
+// bytesSplitForm reports whether a KindBytes column carries its cells as BytesDict+BytesIDs.
+func (c Column) bytesSplitForm() bool {
+	return c.Bytes == nil && len(c.BytesOffsets) == 0 && c.BytesIDs != nil
 }
 
 // rawBytes returns the column's *decoded* footprint: what holding its values in memory costs,
@@ -86,15 +108,26 @@ func (c Column) rawBytes() int64 {
 	case KindFloat64:
 		return int64(len(c.Float64)) * 8
 	case KindBytes:
-		if c.Bytes == nil {
-			if n := len(c.BytesOffsets); n > 0 {
-				return int64(c.BytesOffsets[n-1] - c.BytesOffsets[0])
-			}
+		if c.bytesBlobForm() {
+			n := len(c.BytesOffsets)
 
-			return 0
+			return int64(c.BytesOffsets[n-1] - c.BytesOffsets[0])
 		}
 
 		var n int64
+
+		// The split form's footprint is the *expanded* one, summed over the rows: this feeds the
+		// manifest's RawBytes, which sizes parts for merge tiering. Charging the id array instead
+		// would report a deduplicated column as a fraction of its decoded size and let the tiering
+		// select far too many parts into one merge.
+		if c.bytesSplitForm() {
+			for _, id := range c.BytesIDs {
+				n += int64(len(c.BytesDict[id]))
+			}
+
+			return n
+		}
+
 		for _, v := range c.Bytes {
 			n += int64(len(v))
 		}
@@ -158,6 +191,12 @@ func buildColumn(c Column, comp *compress.Compressor, blockRows, compressBytes i
 		codec = defaultCodec(c.Kind)
 	}
 
+	if c.Kind == KindBytes && codec != chunk.CodecDict && c.bytesSplitForm() {
+		return ColumnDesc{}, nil, errors.Errorf(
+			"block: column %q carries BytesDict, which codec %s does not accept (only %s)",
+			c.Name, codec, chunk.CodecDict)
+	}
+
 	desc := ColumnDesc{Name: c.Name, Kind: c.Kind, Codec: codec, Compress: comp.Algorithm()}
 	if desc.Compress != compress.AlgorithmNone {
 		desc.Level = comp.Level()
@@ -169,9 +208,12 @@ func buildColumn(c Column, comp *compress.Compressor, blockRows, compressBytes i
 	case KindFloat64:
 		fillFloat64Stats(&desc, c.Float64)
 	case KindBytes:
-		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+		switch {
+		case c.bytesBlobForm():
 			fillBytesBlobConst(&desc, c.BytesBlob, c.BytesOffsets)
-		} else {
+		case c.bytesSplitForm():
+			fillBytesDictConst(&desc, c.BytesDict, c.BytesIDs)
+		default:
 			fillBytesConst(&desc, c.Bytes)
 		}
 	case KindInt128:
@@ -297,13 +339,17 @@ func encodeStream(c Column, codec chunk.Codec) ([]byte, error) {
 	case c.Kind == KindFloat64 && codec == chunk.CodecDecimal:
 		return chunk.EncodeFloatsDecimal(nil, c.Float64, decimalPrecisionLossless), nil
 	case c.Kind == KindBytes && codec == chunk.CodecDict:
-		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+		if c.bytesBlobForm() {
 			return chunk.EncodeBytesBlob(nil, c.BytesBlob, c.BytesOffsets), nil
+		}
+
+		if c.bytesSplitForm() {
+			return chunk.EncodeBytesDict(nil, c.BytesDict, c.BytesIDs), nil
 		}
 
 		return chunk.EncodeBytes(nil, c.Bytes), nil
 	case c.Kind == KindBytes && codec == chunk.CodecBytesRaw:
-		if c.Bytes == nil && len(c.BytesOffsets) > 0 {
+		if c.bytesBlobForm() {
 			return chunk.EncodeBytesRawBlob(nil, c.BytesBlob, c.BytesOffsets), nil
 		}
 
@@ -397,6 +443,23 @@ func fillBytesBlobConst(d *ColumnDesc, blob []byte, offsets []int32) {
 
 	d.Const = true
 	d.ConstBytes = append([]byte(nil), first...)
+}
+
+// fillBytesDictConst is [fillBytesConst] over the split column form. Entries are distinct by value,
+// so every cell being equal is exactly every id being equal — no byte comparison needed.
+func fillBytesDictConst(d *ColumnDesc, entries [][]byte, ids []int32) {
+	if len(ids) == 0 {
+		return
+	}
+
+	for _, id := range ids[1:] {
+		if id != ids[0] {
+			return
+		}
+	}
+
+	d.Const = true
+	d.ConstBytes = append([]byte(nil), entries[ids[0]]...)
 }
 
 // ColumnReader gives lazy, decode-on-demand access to one column of a part. Constant
