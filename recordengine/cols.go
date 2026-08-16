@@ -117,6 +117,10 @@ type recordCols struct {
 	// viewBufs memoizes the per-byte-column [][]byte view slices materialized at the
 	// [fetch.NamedColumn] boundary, reused across fetches when the accumulator is pooled.
 	viewBufs [][][]byte
+	// permBufs is the per-byte-column scratch [recordCols.sortByTs] permutes into; the sorted column
+	// and its scratch then swap, so a merge sorting tens of thousands of streams cycles two blobs per
+	// column instead of leaving one behind per stream.
+	permBufs []byteCol
 }
 
 func (c *recordCols) len() int { return len(c.ts) }
@@ -384,6 +388,11 @@ func (c *recordCols) tsOrder(dst []int) []int {
 
 // sortByTs reorders every selected column by ascending timestamp (stable), in place. Only for
 // buffers the caller exclusively owns — see [recordCols.tsOrder] for the read-only alternative.
+//
+// Byte columns are permuted into per-column scratch and swapped with it, so the array a sort leaves
+// behind is the one the next sort of the same buffer writes into. That is the same rule the rest of
+// the buffer follows: a cell view is valid until the buffer is next appended to or re-armed, and a
+// sort is both.
 func (c *recordCols) sortByTs() {
 	idx := c.tsOrder(nil)
 	if idx == nil {
@@ -397,10 +406,17 @@ func (c *recordCols) sortByTs() {
 		}
 	}
 
+	if len(c.permBufs) != len(c.bytes) {
+		c.permBufs = make([]byteCol, len(c.bytes))
+	}
+
 	for k := range c.bytes {
-		if c.sel.bytes[k] {
-			c.bytes[k] = permuteBytes(&c.bytes[k], idx)
+		if !c.sel.bytes[k] {
+			continue
 		}
+
+		permuteBytesInto(&c.permBufs[k], &c.bytes[k], idx)
+		c.bytes[k], c.permBufs[k] = c.permBufs[k], c.bytes[k]
 	}
 }
 

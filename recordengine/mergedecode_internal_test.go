@@ -66,6 +66,103 @@ func TestNewMergeByteColForms(t *testing.T) {
 	}
 }
 
+// TestMergeByteColExpandedBytes pins the sizing measure the merge output buffer is pre-allocated
+// from: the blob the column's cells expand to, across both decode forms and both dictionary id
+// widths. An undercount puts the buffer back on doubling growth, an overcount wastes a part's worth
+// of memory, and neither shows up as a test failure anywhere else.
+func TestMergeByteColExpandedBytes(t *testing.T) {
+	t.Parallel()
+
+	wide := &chunk.DictColumn{IDs: make([]byte, 0, 6), IDWidth: 2}
+	for i := range 300 {
+		wide.Entries = append(wide.Entries, fmt.Appendf(nil, "e%03d", i)) // 4 bytes each
+	}
+
+	for _, id := range []int{0, 299, 150} {
+		wide.IDs = append(wide.IDs, byte(id>>8), byte(id))
+	}
+
+	for _, tt := range []struct {
+		name string
+		col  mergeByteCol
+		want int64
+	}{
+		{
+			name: "dict_1b_ids",
+			col: newMergeByteCol(&chunk.DictColumn{
+				Entries: [][]byte{[]byte("a"), []byte("bbb")},
+				IDs:     []byte{0, 1, 1, 0},
+				IDWidth: 1,
+			}),
+			want: 8, // a + bbb + bbb + a
+		},
+		{name: "dict_2b_ids", col: newMergeByteCol(wide), want: 12},
+		{
+			name: "flat_fallback",
+			col: newMergeByteCol(&chunk.DictColumn{
+				Entries: [][]byte{[]byte("x"), []byte("yy"), []byte("zzz")},
+			}),
+			want: 6,
+		},
+		{name: "empty", col: newMergeByteCol(&chunk.DictColumn{}), want: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.want, tt.col.expandedBytes())
+
+			// Cross-check against the cells themselves: the measure must equal what a walk would copy.
+			rows := tt.col.flat.rows()
+			if tt.col.dict != nil {
+				rows = tt.col.dict.Len()
+			}
+
+			var sum int64
+			for i := range rows {
+				sum += int64(len(tt.col.at(i)))
+			}
+
+			assert.Equal(t, sum, tt.col.expandedBytes())
+		})
+	}
+}
+
+// TestDecodedShapeScalesToCap covers the two regimes of the output-buffer sizing: sources that fit
+// one part are sized whole, and sources that outgrow the seal threshold are scaled down to what a
+// single output part holds — otherwise a merge emitting a dozen parts would reserve all of them.
+func TestDecodedShapeScalesToCap(t *testing.T) {
+	t.Parallel()
+
+	src := []*decodedPart{{
+		ts:   make([]int64, 100),
+		ints: [][]int64{make([]int64, 100)},
+		bytes: []mergeByteCol{newMergeByteCol(&chunk.DictColumn{
+			Entries: [][]byte{make([]byte, 10)},
+			IDs:     make([]byte, 100), // every row the single 10-byte entry
+			IDWidth: 1,
+		})},
+	}}
+
+	// 100 rows × (8 ts + 8 int + 16 stream id) + 100 × 10 blob bytes.
+	const total = 100*32 + 1000
+
+	rows, blob := decodedShape(src, 0)
+	assert.Equal(t, 100, rows)
+	assert.Equal(t, []int{1000}, blob)
+
+	rows, blob = decodedShape(src, total)
+	assert.Equal(t, 100, rows)
+	assert.Equal(t, []int{1000}, blob)
+
+	rows, blob = decodedShape(src, total/4)
+	assert.Equal(t, 25, rows)
+	assert.Equal(t, []int{250}, blob)
+
+	rows, blob = decodedShape(nil, 0)
+	assert.Zero(t, rows)
+	assert.Nil(t, blob)
+}
+
 // TestMergeDecodeDictCompact verifies the merge's dict-compressed decode ([part.readForMerge]) holds a
 // far smaller resident set than the fetch-path whole-blob decode ([part.readCols]) when byte values
 // repeat — the common log case (templated bodies, low-cardinality attributes). This is the constant the
