@@ -278,7 +278,10 @@ func encodeSharedDictBytes(
 // keeps its later granules on the self-encoded path rather than rolling over to a second dictionary:
 // a column that has already produced 65536 distinct values is one whose repeats have stopped paying,
 // which is the case the self-encoded path exists for.
-const maxSharedEntries = 1 << 16
+//
+// A var, not a const, so a test can lower it instead of building the 130k-row column it otherwise
+// takes to reach the ceiling (the same reason [byteColCap] is one in recordengine).
+var maxSharedEntries = 1 << 16
 
 // parseSharedDict peels the dictionary header off a shared-dictionary column object, returning the
 // decoded entries and the ordinary block-framed container that follows.

@@ -197,13 +197,22 @@ func TestColumnBytesDictSharedModes(t *testing.T) {
 // TestColumnBytesDictOverflowsSharedEntries drives the union of granule dictionaries past the
 // 2-byte id ceiling while every granule stays repetitive enough to want in: the shared dictionary
 // closes partway through the column and the remaining granules self-encode.
+//
+// The ceiling is lowered for the test: reaching the real one takes a ~130k-row column built through
+// every input form, which is minutes of work under coverage instrumentation for a property that
+// does not depend on where the ceiling sits.
+//
+//nolint:paralleltest // mutates the package-level ceiling.
 func TestColumnBytesDictOverflowsSharedEntries(t *testing.T) {
-	t.Parallel()
+	defer func(v int) { maxSharedEntries = v }(maxSharedEntries)
 
-	const (
-		blockRows = 16
-		perGran   = blockRows / sharedDictMinRepeat
-		granules  = maxSharedEntries/perGran + 4
+	maxSharedEntries = 512
+
+	const blockRows = 16
+
+	var (
+		perGran  = blockRows / sharedDictMinRepeat
+		granules = maxSharedEntries/perGran + 4
 	)
 
 	cells := make([][]byte, 0, granules*blockRows)

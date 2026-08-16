@@ -37,15 +37,17 @@ func BenchmarkBuildColumnBytesForm(b *testing.B) {
 	logical := int64(len(blob))
 	comp := compress.NewCompressor(compress.AlgorithmNone, compress.LevelDefault)
 
-	for _, tc := range []struct {
+	forms := []struct {
 		name string
 		col  Column
 	}{
 		{name: "blob", col: Column{BytesBlob: blob, BytesOffsets: offsets}},
 		{name: "split", col: Column{BytesDict: entries, BytesIDs: ids}},
-	} {
-		b.Run(tc.name, func(b *testing.B) {
-			c := tc.col
+	}
+
+	for i := range forms {
+		b.Run(forms[i].name, func(b *testing.B) {
+			c := forms[i].col
 			c.Name, c.Kind, c.Block = "c", KindBytes, true
 
 			b.SetBytes(logical)
