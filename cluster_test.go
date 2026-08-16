@@ -128,6 +128,12 @@ func openClusterNodeWith(t *testing.T, endpoint, id string, be backend.Backend, 
 		RF:   2,
 	})}, opts...)
 
+	// A clustered node on a durable backend must be able to recover its unflushed head, so Open
+	// requires a WAL there (issue #340). Ephemeral backends take none: WALDir is invalid with them.
+	if !be.IsEphemeral() {
+		all = append(all, WithWALDir(t.TempDir()))
+	}
+
 	s, err := Open(context.Background(), Options{}, all...)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close(context.Background()) })

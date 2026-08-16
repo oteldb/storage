@@ -143,6 +143,12 @@ type Engine struct {
 	recentMin int64 // oldest ts retained in the recent tier (maxInt64 ⇒ empty ⇒ short-circuit off)
 	// walB groups a durable AppendBatch's WAL frames by series (reused under e.mu); nil head-only.
 	walB *walBatch
+	// flushedEpoch is the WAL flush watermark: the generation of the most recently flushed head
+	// (persisted in the bucket index). Current head records are written to the WAL at flushedEpoch+1,
+	// so on recovery the engine replays only WAL segments past flushedEpoch — exactly-once even when
+	// the segments outlive their checkpoint (a node that stops being the shard's compaction owner
+	// stops checkpointing, but its parts still arrive from the owner).
+	flushedEpoch uint64
 	// blockCache memoizes decoded column blocks across fetches (LRU, keyed by part/column/block); nil
 	// ⇒ decode every fetch. A fetch caches only the blocks its matched series touch, so the resident
 	// set is the useful blocks across live parts rather than every whole part touched.
@@ -201,6 +207,7 @@ func New(cfg Config) *Engine {
 
 	if cfg.WAL != nil {
 		e.walB = newWALBatch()
+		cfg.WAL.SetEpoch(e.flushedEpoch + 1) // first head generation
 	}
 
 	if cfg.DecodeCacheBytes > 0 {
@@ -1145,12 +1152,14 @@ func (e *Engine) PartCount() int {
 	return len(e.parts)
 }
 
-// Replay rebuilds the head from the WAL segments in dir (durable restart).
+// Replay rebuilds the head from the WAL segments in dir (durable restart). It skips segments at or
+// below the flush watermark recovered by [Engine.LoadParts] (call LoadParts first), so records
+// already in a flushed part are not re-applied — exactly-once recovery.
 func (e *Engine) Replay(dir string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return wal.ReplayDir(dir, e.replayHandlers())
+	return wal.ReplayDirFrom(dir, e.flushedEpoch, e.replayHandlers())
 }
 
 // ApplyPrimary applies a write as the shard's **primary**: it runs each sample through the
@@ -1222,6 +1231,13 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 			return w.WriteSamples(id, accTs, accVals)
 		},
 	})
+
+	// The accepted frames are the primary's durable copy of the shard's unflushed head, the one the
+	// quorum ack counts on: a restart replays them, instead of serving a hole for everything written
+	// since the last flush. They are already framed for replication, so the log takes them verbatim.
+	if err == nil && e.cfg.WAL != nil {
+		err = e.cfg.WAL.WriteFrames(buf.Bytes())
+	}
 
 	return buf.Bytes(), res, err
 }
@@ -1333,6 +1349,9 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		e.populateRecent(detached)
 	}
 	e.flushing = nil
+	// The parts about to be committed supersede every WAL record logged so far, so the watermark
+	// they carry retires that generation and the next head records open a new one.
+	e.flushedEpoch++
 	err := e.publishLocked(ctx)
 	e.mu.Unlock()
 
@@ -1358,6 +1377,8 @@ func (e *Engine) publishLocked(ctx context.Context) error {
 	}
 
 	if e.cfg.WAL != nil {
+		e.cfg.WAL.SetEpoch(e.flushedEpoch + 1)
+
 		return e.cfg.WAL.Checkpoint()
 	}
 

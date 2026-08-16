@@ -46,7 +46,9 @@ type Options struct {
 	Durability Durability
 
 	// WALDir is the WAL directory for the file backend with durability enabled.
-	// Ignored when [Durability] is [DurabilityEphemeral].
+	// Ignored when [Durability] is [DurabilityEphemeral]; required in cluster mode
+	// ([Cluster]) on a durable backend, where a node that cannot restore its unflushed
+	// head on restart would serve reads as a ring owner with that head missing.
 	WALDir string
 
 	// WALSync is the WAL fsync policy (default [WALSyncNone]). Ignored without a WAL.
@@ -379,6 +381,17 @@ func (o *Options) validate() error {
 	if o.Durability == DurabilityEphemeral && o.WALDir != "" {
 		return errOptionInvalid("WALDir must be empty when Durability is Ephemeral")
 	}
+
+	// A clustered node answers reads as a ring owner as soon as [Open] returns, and the read path
+	// treats one owner's answer as complete. On a durable backend without a WAL, recovery restores
+	// only the flushed parts: the node would serve everything written since its last flush as
+	// missing, indistinguishable from real absence to the caller. Requiring the WAL keeps the head
+	// recoverable, so the node is complete before it serves.
+	if o.Cluster != nil && o.WALDir == "" && o.Backend != nil && !o.Backend.IsEphemeral() {
+		return errOptionInvalid("WALDir is required in cluster mode on a durable backend: " +
+			"without it a restarted node serves reads with its unflushed head missing")
+	}
+
 	return nil
 }
 

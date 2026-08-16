@@ -91,6 +91,13 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 		},
 	})
 
+	// The accepted frames are the primary's durable copy of the shard's unflushed head, the one the
+	// quorum ack counts on: a restart replays them, instead of serving a hole for everything written
+	// since the last flush. They are already framed for replication, so the log takes them verbatim.
+	if err == nil && e.cfg.WAL != nil {
+		err = e.cfg.WAL.WriteFrames(buf.Bytes())
+	}
+
 	return buf.Bytes(), res, err
 }
 

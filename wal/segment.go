@@ -223,6 +223,23 @@ func (sw *SegmentWriter) WriteRecords(id signal.SeriesID, payload []byte) error 
 	return sw.afterWrite(sw.w.WriteRecords(id, payload))
 }
 
+// WriteFrames logs a run of records that is **already framed** by a [Writer] — the form the cluster
+// write path builds to replicate the accepted set. It is byte-identical to writing those records one
+// call at a time, without re-encoding them. p must end on a frame boundary; an empty p is a no-op.
+func (sw *SegmentWriter) WriteFrames(p []byte) error {
+	if len(p) == 0 {
+		return nil
+	}
+
+	if err := sw.prepare(); err != nil {
+		return err
+	}
+
+	_, err := sw.Write(p)
+
+	return sw.afterWrite(err)
+}
+
 // WriteSide logs an opaque engine-encoded side-store delta.
 func (sw *SegmentWriter) WriteSide(payload []byte) error {
 	if err := sw.prepare(); err != nil {
