@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"math"
@@ -32,7 +31,6 @@ import (
 	"github.com/oteldb/storage/signal/metric"
 	"github.com/oteldb/storage/signal/profile"
 	tenantpkg "github.com/oteldb/storage/tenant"
-	"github.com/oteldb/storage/wal"
 )
 
 const httpScheme = "http"
@@ -1321,64 +1319,35 @@ func (n *clusterNode) close(ctx context.Context) error {
 // rejected count back here, and replicates the accepted set to the secondary owners — so the
 // returned [Accepted] accounting matches the single-node path and every replica converges.
 func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) (Accepted, error) {
-	type shardWAL struct {
-		buf  bytes.Buffer
-		w    *wal.Writer
-		seen map[signal.SeriesID]struct{}
-	}
-
-	// Group each point by its shard key — the (tenant, hash(seriesID) % N) routing/storage unit —
-	// so a tenant's series spread across the ring instead of pinning to one owner set. With a
-	// single shard the key is the tenant, identical to the unsharded path.
-	n := s.cluster.shardCount()
-	byShard := make(map[signal.TenantID]*shardWAL)
-
 	// The ingest-rate valve is applied at the origin (per real tenant, like the single-node path):
 	// each node rate-limits its own ingest. The cardinality and in-flight-memory valves are
-	// head-enforced, so they are applied by the shard primary in primaryWrite. Cache the last
-	// tenant's admission state across a tenant-contiguous run of batches.
+	// head-enforced, so they are applied by the shard primary in primaryWrite. Batches arrive in
+	// projection order, so the last tenant's admission state is cached across a contiguous run.
 	var (
-		rateRejected int64
-		lastTenant   signal.TenantID
-		lastAdmit    *tenantAdmission
-		lastLimits   tenantpkg.Limits
-		haveTenant   bool
+		lastTenant signal.TenantID
+		lastAdmit  *tenantAdmission
+		lastLimits tenantpkg.Limits
+		haveTenant bool
 	)
 
-	emitted := metric.Project(md, func(b *metric.Batch) {
-		tid := s.normalizeTenant(s.tenantFor(b.Resource(), b.Scope()))
-		if !haveTenant || tid != lastTenant {
-			lastTenant, haveTenant = tid, true
-			lastAdmit = s.admissionFor(tid)
-			lastLimits = s.tenant.Resolve(tid).Limits
-		}
+	frames := cluster.FrameMetrics(md, s.cluster.shardCount(), s.opts.Tenant,
+		func(tid signal.TenantID, b *metric.Batch) bool {
+			if !haveTenant || tid != lastTenant {
+				lastTenant, haveTenant = tid, true
+				lastAdmit = s.admissionFor(tid)
+				lastLimits = s.tenant.Resolve(tid).Limits
+			}
 
-		if !lastAdmit.allowRate(lastLimits, int64(b.Len())*engine.SampleBytes, s.now()) {
-			rateRejected += int64(b.Len())
+			if lastAdmit.allowRate(lastLimits, int64(b.Len())*engine.SampleBytes, s.now()) {
+				return true
+			}
+
 			lastAdmit.addRate(int64(b.Len()))
 
-			return // whole over-budget batch shed before framing
-		}
+			return false // whole over-budget batch shed before framing
+		})
 
-		for i := range b.Len() {
-			id := b.IDs[i]
-			sk := shardKeyOf(tid, shardOf(id, n), n)
-
-			sw := byShard[sk]
-			if sw == nil {
-				sw = &shardWAL{seen: make(map[signal.SeriesID]struct{})}
-				sw.w = wal.NewWriter(&sw.buf)
-				byShard[sk] = sw
-			}
-
-			if _, ok := sw.seen[id]; !ok { // register each series once per shard
-				sw.seen[id] = struct{}{}
-				_ = sw.w.WriteSeries(id, b.Series(i))
-			}
-
-			_ = sw.w.WriteSamples(id, b.Ts[i:i+1], b.Values[i:i+1])
-		}
-	})
+	byShard, emitted, rateRejected := frames.Shards, frames.Emitted, int64(frames.Shed)
 
 	// Each shard routes to its own ring primary independently; fan the routes out under a bound
 	// rather than paying the sum of per-primary round-trips.
@@ -1388,8 +1357,8 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 	}
 
 	routes := make([]route, 0, len(byShard))
-	for sk, sw := range byShard {
-		routes = append(routes, route{sk, sw.buf.Bytes()})
+	for sk, payload := range byShard {
+		routes = append(routes, route{sk, payload})
 	}
 
 	rejects := make([]cluster.Reject, len(routes))
