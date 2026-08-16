@@ -222,10 +222,14 @@ func (m *Membership) Members() []Member {
 
 // Close stops watching, revokes this node's lease (so its peers drop it immediately rather
 // than after the TTL), and waits for the background goroutines to exit. The revoke is bounded
-// by a derived timeout.
+// by a derived timeout. An observer ([Watch]) holds no lease, so it only stops watching.
 func (m *Membership) Close(ctx context.Context) error {
 	m.cancel()
 	m.wg.Wait()
+
+	if m.leaseID == clientv3.NoLease {
+		return nil
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

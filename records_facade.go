@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 
+	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/fetch"
@@ -224,7 +225,7 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 		routes = append(routes, route{sk, payload})
 	}
 
-	rejects := make([]primaryReject, len(routes))
+	rejects := make([]cluster.Reject, len(routes))
 	errs := make([]error, len(routes))
 
 	parallel.ForEach(len(routes), clusterWriteFanOut, func(i int) {
@@ -241,9 +242,9 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 	// Combine the origin rate rejections with each primary's per-reason breakdown.
 	rej := rejectTally{rate: rateRejected}
 	for _, r := range rejects {
-		rej.ooo += int64(r.ooo)
-		rej.cardinality += int64(r.cardinality)
-		rej.inflight += int64(r.inflight)
+		rej.ooo += int64(r.OOO)
+		rej.cardinality += int64(r.Cardinality)
+		rej.inflight += int64(r.InFlight)
 	}
 
 	for _, err := range errs { // surface the first error deterministically (by route index)

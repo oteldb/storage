@@ -4,15 +4,11 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"fmt"
-	"io"
 	"math"
 	"net"
 	"net/http"
-	"net/url"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,7 +23,6 @@ import (
 	"github.com/oteldb/storage/cluster/partsync"
 	"github.com/oteldb/storage/cluster/replica"
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/internal/retry"
 	"github.com/oteldb/storage/query/fetch"
@@ -251,49 +246,20 @@ func (s *Storage) notifyPeers(ctx context.Context, tid signal.TenantID, signalPr
 }
 
 // shardCount is the configured metric shards per tenant, clamped to a minimum of 1.
-func (n *clusterNode) shardCount() int {
-	if n.shards < 1 {
-		return 1
-	}
+func (n *clusterNode) shardCount() int { return cluster.ShardCount(n.shards) }
 
-	return n.shards
-}
+// The shard-key vocabulary lives in [cluster] so every tier that routes derives it identically;
+// these are the node's names for it.
 
-// shardSep separates a tenant from its shard index in a shard key. It is chosen so a shard key is
-// a valid backend path segment and never collides with a real tenant id (which the embedder keeps
-// free of this marker).
-const shardSep = "/_s"
-
-// shardKeyOf returns the routing/storage key for tenant's shard idx. With a single shard it is the
-// bare (already-normalized) tenant, so ring placement and on-disk prefixes are byte-identical to
-// the unsharded path; with N>1 it suffixes the shard index.
 func shardKeyOf(tenant signal.TenantID, idx, n int) signal.TenantID {
-	if n <= 1 {
-		return tenant
-	}
-
-	return tenant + signal.TenantID(shardSep+strconv.Itoa(idx))
+	return cluster.ShardKeyOf(tenant, idx, n)
 }
 
-// tenantOfShard recovers the tenant id from a shard key (the inverse of [shardKeyOf]), for policy
-// resolution. A key without the shard marker (the single-shard case) is returned unchanged.
 func tenantOfShard(shardKey signal.TenantID) signal.TenantID {
-	if i := strings.LastIndex(string(shardKey), shardSep); i >= 0 {
-		return shardKey[:i]
-	}
-
-	return shardKey
+	return cluster.TenantOfShard(shardKey)
 }
 
-// shardOf maps a series id to a shard index in [0, n). The series id is already a uniform content
-// hash, so the low word modulo n distributes evenly.
-func shardOf(id signal.SeriesID, n int) int {
-	if n <= 1 {
-		return 0
-	}
-
-	return int(id.Lo % uint64(n))
-}
+func shardOf(id signal.SeriesID, n int) int { return cluster.ShardOf(id, n) }
 
 // startCluster joins the etcd-coordinated cluster, runs the replica server on Self.Addr, and
 // builds the routed write path. A replicated write received from a peer is applied to the
@@ -339,8 +305,8 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	rp := replica.New(self.Addr, replica.NewHTTPTransport(httpc), s.applyReplicated)
 
 	mux := http.NewServeMux()
-	mux.Handle(replica.ReplicatePath, rp.Handler())       // secondary: trusting apply
-	mux.Handle(primaryWritePath, s.primaryWriteHandler()) // primary: OOO apply + replicate
+	mux.Handle(replica.ReplicatePath, rp.Handler())               // secondary: trusting apply
+	mux.Handle(cluster.PrimaryWritePath, s.primaryWriteHandler()) // primary: OOO apply + replicate
 	// read fan-out across metric/log/trace/profile signals.
 	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch,
 		s.recordFetchFunc(signal.Log), s.recordFetchFunc(signal.Trace), s.recordFetchFunc(signal.Profile)))
@@ -1426,7 +1392,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 		routes = append(routes, route{sk, sw.buf.Bytes()})
 	}
 
-	rejects := make([]primaryReject, len(routes))
+	rejects := make([]cluster.Reject, len(routes))
 	errs := make([]error, len(routes))
 
 	parallel.ForEach(len(routes), clusterWriteFanOut, func(i int) {
@@ -1443,9 +1409,9 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 	// Combine the origin rate rejections with each primary's per-reason breakdown.
 	rej := rejectTally{rate: rateRejected}
 	for _, r := range rejects {
-		rej.ooo += int64(r.ooo)
-		rej.cardinality += int64(r.cardinality)
-		rej.inflight += int64(r.inflight)
+		rej.ooo += int64(r.OOO)
+		rej.cardinality += int64(r.Cardinality)
+		rej.inflight += int64(r.InFlight)
 	}
 
 	for _, err := range errs { // surface the first error deterministically (by route index)
@@ -1461,8 +1427,6 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 	return Accepted{Accepted: accepted, Rejected: total, RejectedReason: rej.reason()}, nil
 }
 
-const primaryWritePath = "/internal/primary-write"
-
 // clusterWriteFanOut bounds how many shard/tenant primaries a clustered write routes to at once.
 // Writes are RPC-bound, so this is set above the CPU count to overlap round-trips while capping
 // in-flight requests on a wide fan-out.
@@ -1472,10 +1436,10 @@ const clusterWriteFanOut = 16
 // and returns the primary's per-reason rejection breakdown. The primary — local or remote — is the
 // single authority for the shard, so the admission decision and the accepted set are consistent
 // across all replicas. The same path serves every signal, dispatched by sig.
-func (s *Storage) routeToPrimary(ctx context.Context, sig signal.Signal, tenant string, walBytes []byte) (primaryReject, error) {
+func (s *Storage) routeToPrimary(ctx context.Context, sig signal.Signal, tenant string, walBytes []byte) (cluster.Reject, error) {
 	primary, ok := s.cluster.membership.Ring().Primary([]byte(tenant))
 	if !ok {
-		return primaryReject{}, errors.New("cluster: no primary for tenant (empty ring)")
+		return cluster.Reject{}, errors.New("cluster: no primary for tenant (empty ring)")
 	}
 
 	if s.cluster.membership.AddrOf(primary.ID) == s.cluster.self {
@@ -1490,13 +1454,13 @@ func (s *Storage) routeToPrimary(ctx context.Context, sig signal.Signal, tenant 
 // and replicates the accepted set to the secondary owners at write quorum (the primary is one
 // durable copy, so it needs RF/2 secondary acks). It returns the per-reason rejection breakdown.
 // The applying engine is selected by sig (metrics vs the record signals).
-func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant string, walBytes []byte) (primaryReject, error) {
+func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant string, walBytes []byte) (cluster.Reject, error) {
 	// Policy is per real tenant; in sharded-metric mode tenant is a shard key ({tenant}/_s{idx}).
 	limits := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(signal.TenantID(tenant)))).Limits
 
 	var (
 		accepted []byte
-		rej      primaryReject
+		rej      cluster.Reject
 		err      error
 	)
 
@@ -1507,7 +1471,7 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 			accepted, res, err = eng.ApplyPrimary(walBytes, engine.AppendLimits{
 				MaxSeries: limits.MaxSeries, MaxInFlightBytes: limits.MaxInFlightBytes,
 			})
-			rej = primaryReject{ooo: res.RejectedOOO, cardinality: res.RejectedCardinality, inflight: res.RejectedBytes}
+			rej = cluster.Reject{OOO: res.RejectedOOO, Cardinality: res.RejectedCardinality, InFlight: res.RejectedBytes}
 			s.pokeFlush(eng)
 		}
 	} else {
@@ -1517,13 +1481,13 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 			accepted, res, err = eng.ApplyPrimary(walBytes, recordengine.AppendLimits{
 				MaxSeries: limits.MaxSeries, MaxInFlightBytes: limits.MaxInFlightBytes,
 			})
-			rej = primaryReject{ooo: res.RejectedOOO, cardinality: res.RejectedCardinality, inflight: res.RejectedBytes}
+			rej = cluster.Reject{OOO: res.RejectedOOO, Cardinality: res.RejectedCardinality, InFlight: res.RejectedBytes}
 			s.pokeFlush(eng)
 		}
 	}
 
 	if err != nil {
-		return primaryReject{}, errors.Wrapf(err, "primary apply for tenant %q", tenant)
+		return cluster.Reject{}, errors.Wrapf(err, "primary apply for tenant %q", tenant)
 	}
 
 	rf := s.rfFor(signal.TenantID(tenant))
@@ -1546,49 +1510,25 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 	return rej, nil
 }
 
-// primaryReject is the per-reason rejection breakdown the shard primary reports back to the origin
-// (over the primary-write RPC) so clustered ingest attributes OTLP partial-success exactly like the
-// single-node path. The rate valve is applied at the origin, so it is not carried here.
-type primaryReject struct{ ooo, cardinality, inflight int }
-
 // primaryWriteHandler serves the primary-write endpoint: a peer routes a tenant's write here
 // when this node is the ring primary. The reject count is returned in the response body.
 func (s *Storage) primaryWriteHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-
-			return
-		}
-
-		payload, err := io.ReadAll(req.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-
-			return
-		}
-
-		sig, tenant, walBytes, err := cluster.DecodeWrite(payload)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-
-			return
-		}
-
-		ctx := s.obs.Base(obs.ExtractHTTP(req.Context(), req.Header)) // join the caller's trace
+	return cluster.PrimaryWriteHandler(func(
+		ctx context.Context, sig signal.Signal, shardKey string, walBytes []byte,
+	) (cluster.Reject, error) {
+		ctx = s.obs.Base(ctx)
 		s.obs.Logger(ctx).Debug("primary-write received",
-			zap.Stringer("signal", sig), zap.String("tenant", tenant), zap.Int("wal_bytes", len(walBytes)))
+			zap.Stringer("signal", sig), zap.String("tenant", shardKey), zap.Int("wal_bytes", len(walBytes)))
 
-		rej, err := s.primaryWrite(ctx, sig, tenant, walBytes)
+		rej, err := s.primaryWrite(ctx, sig, shardKey, walBytes)
 		if err != nil {
-			s.obs.Logger(ctx).Error("primary-write failed", zap.Stringer("signal", sig), zap.String("tenant", tenant), zap.Error(err))
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			s.obs.Logger(ctx).Error("primary-write failed",
+				zap.Stringer("signal", sig), zap.String("tenant", shardKey), zap.Error(err))
 
-			return
+			return cluster.Reject{}, err
 		}
 
-		// Response body is the per-reason reject breakdown: "ooo cardinality inflight".
-		_, _ = fmt.Fprintf(w, "%d %d %d", rej.ooo, rej.cardinality, rej.inflight)
+		return rej, nil
 	})
 }
 
@@ -1596,38 +1536,10 @@ func (s *Storage) primaryWriteHandler() http.Handler {
 // count it reports. It is bounded by the write policy: each attempt has a per-try timeout (so a
 // stuck primary is abandoned), but it retries only when the request provably never reached the
 // server ([retry.ConnFailure]) — a write is never re-sent after the primary may have applied it.
-func (s *Storage) sendPrimaryWrite(ctx context.Context, addr string, payload []byte) (primaryReject, error) {
+func (s *Storage) sendPrimaryWrite(ctx context.Context, addr string, payload []byte) (cluster.Reject, error) {
 	s.obs.Logger(ctx).Debug("primary-write send", zap.String("addr", addr), zap.Int("bytes", len(payload)))
 
-	return retry.Do(ctx, s.writePolicy(ctx, rpcOpWrite), func(ctx context.Context) (primaryReject, error) {
-		u := (&url.URL{Scheme: "http", Host: addr}).JoinPath(primaryWritePath)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
-		if err != nil {
-			return primaryReject{}, errors.Wrap(err, "build primary-write request")
-		}
-
-		obs.InjectHTTP(ctx, req.Header) // carry the trace into the primary-write RPC
-
-		resp, err := s.cluster.httpc.Do(req)
-		if err != nil {
-			return primaryReject{}, errors.Wrapf(err, "primary-write to %q", addr)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return primaryReject{}, errors.Wrap(err, "read primary-write response")
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return primaryReject{}, errors.Errorf("cluster: primary %q returned %d: %s", addr, resp.StatusCode, bytes.TrimSpace(body))
-		}
-
-		var rej primaryReject
-		if _, err := fmt.Sscanf(string(bytes.TrimSpace(body)), "%d %d %d", &rej.ooo, &rej.cardinality, &rej.inflight); err != nil {
-			return primaryReject{}, errors.Wrap(err, "parse reject breakdown")
-		}
-
-		return rej, nil
+	return retry.Do(ctx, s.writePolicy(ctx, rpcOpWrite), func(ctx context.Context) (cluster.Reject, error) {
+		return cluster.SendPrimaryWrite(ctx, s.cluster.httpc, addr, payload)
 	})
 }
