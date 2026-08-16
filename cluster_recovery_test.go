@@ -196,3 +196,68 @@ func TestClusterRestartedReplicaFailsOverInsteadOfServingAHole(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Equal(t, []int64{100, 200, 300}, got[0].Timestamps, "and serves the whole shard itself")
 }
+
+// TestClusterLaggingMirrorReplicaAnswersCompletely closes the sub-question #340 raised but left
+// unverified: in shared-nothing mode a replica's parts arrive by mirroring, so between the owner's
+// flush and that mirror the replica's part set is stale — and it answers reads as an owner the whole
+// time. Staleness there is not a hole: a replica holds every write in its head from the moment it was
+// replicated, and only ever trims against the parts it has itself (engine's
+// TestRefreshReplicaKeepsHeadTheLaggingPartsMissed pins that bound), so its answer stays complete
+// while the mirror catches up. The mirror runs on a notify from the owner, so how far behind it is at
+// any instant is deliberately not asserted — the completeness below must hold either way.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterLaggingMirrorReplicaAnswersCompletely(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodePrivate(t, endpoint, "node-a", 2),
+		"node-b": openClusterNodePrivate(t, endpoint, "node-b", 2),
+	}
+	awaitMembership(t, nodes)
+
+	_, err := nodes["node-a"].WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
+	require.NoError(t, err)
+
+	p, ok := nodes["node-a"].cluster.membership.Ring().Primary([]byte("default"))
+	require.True(t, ok)
+
+	replicaID := "node-a"
+	if p.ID == replicaID {
+		replicaID = "node-b"
+	}
+
+	primary, replica := nodes[p.ID], nodes[replicaID]
+
+	// The owner flushes twice while the replica's own maintenance never runs, so its mirror is behind
+	// by whatever the owner's notify has not (yet) pushed across.
+	primary.maintain(ctx)
+
+	_, err = primary.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{300}, []float64{3}))
+	require.NoError(t, err)
+	primary.maintain(ctx)
+
+	// localFetch never fans out, so this is the replica's own copy answering, not a failover.
+	assertReplicaComplete := func(stage string) {
+		t.Helper()
+
+		got, err := replica.localFetch(ctx, "default", 0, 1<<60, []fetch.Matcher{nameMatcher("http.requests")})
+		require.NoErrorf(t, err, "%s: the replica does not disclaim a shard it holds in full", stage)
+		require.Lenf(t, got, 1, "%s: the replica serves the series", stage)
+		assert.Equalf(t, []int64{100, 200, 300}, got[0].Timestamps, "%s: no sample missing", stage)
+		assert.Equalf(t, []float64{1, 2, 3}, got[0].Values, "%s: values", stage)
+	}
+
+	re, ok := replica.lookupEngine("default")
+	require.True(t, ok)
+	pe, ok := primary.lookupEngine("default")
+	require.True(t, ok)
+	t.Logf("replica holds %d of the owner's %d parts", re.PartCount(), pe.PartCount())
+	assertReplicaComplete("mirror behind")
+
+	// And once it does catch up — mirroring the parts and trimming its head against them — the answer
+	// is the same one, now served from parts ∪ the still-unflushed remainder.
+	replica.maintain(ctx)
+	assertReplicaComplete("mirror caught up")
+}
