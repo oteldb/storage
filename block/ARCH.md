@@ -23,31 +23,60 @@ collapses a single-id run. `ColumnReader` is lazy and synthesizes constants with
 
 ### Bytes column input forms
 
-A `KindBytes` `Column` accepts its cells in three interchangeable shapes, so a writer's caller hands
-over whatever it already holds instead of materializing a form the encoder happens to want:
+A `KindBytes` `Column` carries its cells in one of three shapes, so a caller hands over whatever it
+already holds instead of materializing the one the encoder happens to want. Exactly one is set; the
+writer picks by `bytesBlobForm()` / `bytesSplitForm()`, falling back to `Bytes`.
 
-- `Bytes` — one `[]byte` per row.
-- `BytesBlob` + `BytesOffsets` — the head buffer's layout, so a flush encodes straight from the blob.
-- `BytesDict` + `BytesIDs` — the split (dictionary) form, cell *i* being `BytesDict[BytesIDs[i]]`,
-  which is what a merge holds after reading a dictionary-encoded column. `chunk.CodecDict` only:
-  the merge keeps raw columns (trace ids) flat, so a raw split-form encoder would have no caller.
+| form | fields | cell *i* | who produces it |
+|---|---|---|---|
+| slices | `Bytes [][]byte` | `Bytes[i]` | callers holding per-row values (tests, ad-hoc writers) |
+| blob | `BytesBlob []byte`, `BytesOffsets []int32` | `BytesBlob[BytesOffsets[i]:BytesOffsets[i+1]]` | a flush — the head buffer's `byteCol` layout, passed straight through |
+| split | `BytesDict [][]byte`, `BytesIDs []int32` | `BytesDict[BytesIDs[i]]` | a merge — what reading a dictionary-encoded column already gives it |
 
-All three produce **byte-identical** objects and descriptors, which is what makes the choice a
-performance decision and never a format one. That holds because every path — const collapse, the
-single-stream encode, the per-granule encode, and the shared-dictionary build — walks the rows in
-order and appends a value on first occurrence, so entry order and id width coincide. It requires
-`BytesDict` to be distinct by value: the split-form encoders dedup by index, so a duplicated entry
-would emit a second dictionary entry — still a valid stream, no longer the same one.
+```
+slices   ["GET /a"] ["GET /a"] ["POST /b"] ["GET /a"]      one header per row
 
-The split form is the cheap one. The other two hash and compare every row twice while building a
-shared dictionary — once to count a granule's distinct values, once to assign each row its
-dictionary id. Given entry indices those become array work over `int32`s: a per-entry generation
-stamp counts a granule's distinct ids without a clear between granules, and a persistent
-source-entry → shared-id remap replaces the interning map. Nothing is hashed and no bytes are
-compared. The granule decision reads the same distinct count either way, which is what keeps the
-objects identical rather than merely equivalent. Measured on a 64 Ki-row block-framed column of 512
-distinct log-attribute blobs, building the column costs 3.52 ms from the blob form and 357 µs from
-the split form — the same object, 9.9x apart.
+blob     offsets  0 ──── 6 ──── 12 ─────── 19 ──── 25      one blob, one offset per row
+         data     GET /a GET /a POST /b    GET /a
+
+split    dict     0:"GET /a"  1:"POST /b"                  one entry per distinct value,
+         ids      0    0    1    0                         one int32 per row
+```
+
+The split form is `chunk.CodecDict` only, and `BytesDict` must be **distinct by value**. Both are
+validated or documented at the seam: the merge keeps raw columns (trace ids) flat, so a raw
+split-form encoder would have no caller, and the encoders dedup by *index*, so a duplicated entry
+would emit a second dictionary entry — a valid stream, but no longer the identical one.
+
+**All three produce byte-identical objects and descriptors.** That is what makes the choice a
+performance decision and never a format one, and it is what the tests assert (including a variant
+whose entry table is reversed and ids renumbered, pinning that dictionary order comes from row order
+rather than from the caller's table). It holds because every path that reads cells — const collapse,
+the single-stream encode, the per-granule encode, and the shared-dictionary build — walks the rows in
+order and appends a value on first occurrence, so entry order, id width, and the row a fallback trips
+on all coincide.
+
+Two consumers pay for the form, and the split one is cheap in both:
+
+- The **shared-dictionary build** (below) otherwise hashes every row twice — once to count a
+  granule's distinct values for the join decision, once to assign each row its dictionary id. Given
+  entry indices both become array work over `int32`s: a per-entry generation stamp counts distinct
+  ids without a clear between granules, and a persistent source-entry → shared-id remap replaces the
+  interning map.
+- The **per-granule chunk encode** (`chunk.EncodeBytesDictRange`, for granules that decline the
+  shared dictionary) otherwise probes a hash map per row; from the split form it renumbers indices
+  through an array.
+
+Measured on a 64 Ki-row block-framed column, blob input against split, same object either way:
+
+| column shape | blob | split | |
+|---|---:|---:|---|
+| 512 distinct attribute blobs — every granule joins the shared dictionary | 3.33 ms | 290 µs | 11.5x |
+| near-unique message bodies — every granule declines and self-encodes | 11.17 ms | 1.65 ms | 6.8x |
+
+The first isolates the shared-dictionary build: its granules hold raw ids, so no chunk stream is
+written at all. The second is dominated by the per-granule encode, plus the shared-dictionary scan
+that runs and then declines.
 
 ## Block framing
 
