@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -236,4 +237,33 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(buf[i:])
+}
+
+// TestByteIntMapDropsOversizedOnPutBack pins that a map which grew past [maxPooledSlots] is not
+// recycled: otherwise its arrays are cleared on every later acquisition, however small the next use,
+// and stay resident until then.
+//
+//nolint:paralleltest // shares the process-wide map pool with every other test; runs serially.
+func TestByteIntMapDropsOversizedOnPutBack(t *testing.T) {
+	big := NewByteIntMap()
+
+	key := make([]byte, 8)
+	for i := range maxPooledSlots + 1 {
+		binary.LittleEndian.PutUint64(key, uint64(i))
+		big.Put(key, i)
+	}
+
+	grown := big.SizeBytes()
+	require.Greater(t, grown, int64(maxPooledSlots*8), "the map must have grown past the bound")
+
+	big.PutBack()
+
+	// Sampled rather than asserted on a single Get: sync.Pool may hand back a per-P entry from an
+	// unrelated slot, so one small map proves nothing on its own.
+	for range 8 {
+		m := NewByteIntMap()
+		require.LessOrEqual(t, m.SizeBytes(), grown/2,
+			"an oversized map must not come back out of the pool")
+		m.PutBack()
+	}
 }

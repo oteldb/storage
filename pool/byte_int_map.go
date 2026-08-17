@@ -208,8 +208,27 @@ func (m *ByteIntMap) PutRaw(b []byte, v int, h uint64) {
 	}
 }
 
+// maxPooledSlots bounds the arrays a map may carry back into the pool.
+//
+// A recycled map is [ByteIntMap.Reset] on acquisition, which clears every slot — so one that grew
+// large taxes every later user with a clear proportional to the *previous* user's size, however few
+// keys the new one holds, and pins those arrays in the meantime. The symbol table is the extreme: it
+// returns its map when the table is discarded, after interning every symbol an engine ever saw.
+//
+// The bound sits above what any dictionary path can need and below that: a dictionary holds at most
+// 65536 entries, which at the 0.75 load factor is 131072 slots, so every hot-path user keeps its
+// reuse. Measured at this bound, no dictionary benchmark moves (all ~, geomean -0.63%); at 1<<13 the
+// high-cardinality encoders lose 15-17% because they reallocate what they would have reused.
+const maxPooledSlots = 1 << 18
+
 // PutBack returns m to the pool for reuse. After this, m must not be used.
-func (m *ByteIntMap) PutBack() { byteIntMapPool.Put(m) }
+func (m *ByteIntMap) PutBack() {
+	if len(m.hashes) > maxPooledSlots {
+		*m = ByteIntMap{} // dropped, not recycled: the next Get allocates at the initial capacity
+	}
+
+	byteIntMapPool.Put(m)
+}
 
 // ForEach calls fn for each (key, value) pair. Iteration order is unspecified.
 func (m *ByteIntMap) ForEach(fn func(key []byte, value int)) {
