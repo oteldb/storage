@@ -61,7 +61,17 @@ func TestPruneIdentitiesDropsDeadStreams(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, total-keep, removed)
 	assert.EqualValues(t, keep, e.Stats().Streams, "only streams with surviving records remain")
-	assert.Less(t, e.Stats().IdentityBytes, before/4, "the reclaimed memory is reported")
+	// Compared against an engine that only ever held the survivors, not against a fraction of `before`.
+	// IdentityBytes counts the *capacity* of the interning maps, and those come from a pool — so a
+	// pruned engine's floor depends on how large a map the pool happened to hand its rebuilt table,
+	// which depends on what else ran in this process. Both sides here draw from the same pool, so the
+	// comparison is like-for-like; a fraction of `before` is not (it failed CI at 31.6% of before,
+	// where the same code measures 13.0% in a quiet process).
+	fresh := pruneEngine(t, keep, keep).Stats().IdentityBytes
+
+	assert.Less(t, e.Stats().IdentityBytes, before/2, "the reclaimed memory is reported")
+	assert.Lessf(t, e.Stats().IdentityBytes, fresh*3/2,
+		"a pruned engine holds about what an engine of %d streams holds (fresh %d)", keep, fresh)
 
 	// A surviving stream still resolves, with its records; a pruned one matches nothing.
 	live := fetchAll(t, e, req("svc-"+strconv.Itoa(total-1)))
