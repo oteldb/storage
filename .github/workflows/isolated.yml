@@ -1,0 +1,94 @@
+name: isolated
+
+# Tests that cannot share a process with the rest of the suite, each in a job of its own.
+#
+# `go test ./...` runs packages concurrently and leaves background goroutines alive across tests,
+# which breaks two kinds of test for reasons unrelated to what they assert: one measures allocation
+# as a process-global runtime.MemStats delta, the other drives six cluster nodes through
+# timing-sensitive convergence waits. Both are skipped by default and enabled here by env var.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  alloc:
+    name: alloc guards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Get Go environment
+        shell: bash
+        run: |
+          echo "cache=$(go env GOCACHE)" >> $GITHUB_ENV
+          echo "modcache=$(go env GOMODCACHE)" >> $GITHUB_ENV
+
+      - name: Set up cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.cache }}
+            ${{ env.modcache }}
+          key: ${{ runner.os }}-${{ runner.arch }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-
+
+      # No -race: the detector allocates per access, which both inflates the numbers and stretches
+      # each measurement window. -p 1 keeps a second package's tests from running alongside.
+      - name: Run allocation guards
+        env:
+          OTELDB_ALLOC_GUARDS: "1"
+        run: go test -timeout 10m -count 1 -p 1 -v -run 'TestRecordMergeBoundedWorkingSet' .
+
+  chaos:
+    name: EC chaos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Get Go environment
+        shell: bash
+        run: |
+          echo "cache=$(go env GOCACHE)" >> $GITHUB_ENV
+          echo "modcache=$(go env GOMODCACHE)" >> $GITHUB_ENV
+
+      - name: Set up cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.cache }}
+            ${{ env.modcache }}
+          key: ${{ runner.os }}-${{ runner.arch }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-
+
+      # The only end-to-end proof of EC reconstruction and replacement-node bootstrap. It was
+      # disabled because it fails on a loaded runner; alone it takes ~7s.
+      - name: Run EC chaos
+        env:
+          OTELDB_EC_CHAOS: "1"
+        run: go test -timeout 15m -count 1 -p 1 -v -run 'TestClusterECChaos' .
