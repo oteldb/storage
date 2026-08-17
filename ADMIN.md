@@ -25,7 +25,13 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 - `StoreStats.Cluster` — cluster mode only (nil single-node): this node's address, live membership,
   owned shards, and the last enacted rebalance plan (`LastRebalance`: each changed shard's full
   owner-set diff at its per-tenant replication factor — the replicas that must backfill, not just
-  the compaction-primary move). With a private (per-node) backend
+  the compaction-primary move). `PrivateBackend` echoes the configured
+  `cluster.Config.PrivateBackend`, and `NodeLocalBackendUnshared` is the standing form of the
+  warning `Open` logs once: the backend looks node-private (`backend.NodeLocal`) while
+  `PrivateBackend` is unset, so no flushed part replicates and a shard gained in a rebalance — or a
+  restarted replica — answers reads missing whatever only its peers hold, indistinguishable from
+  real absence. A shared network mount trips it too, so treat it as "confirm the backend is really
+  shared, or set `PrivateBackend`", not as a fault. With a private (per-node) backend
   (`cluster.Config.PrivateBackend`), `Cluster.PartSync` additionally reports the shared-nothing
   part-mirroring activity (nil otherwise): cumulative `Passes` (every sync attempt — the
   "is the sync loop running?" probe), `Mirrored` (passes that installed a newer peer copy),

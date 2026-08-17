@@ -136,7 +136,13 @@ backfill under shared-nothing.
 ## `partsync` — shared-nothing part replication
 
 `Config.PrivateBackend` declares the backend per-node private (a local disk), so peers cannot read
-this node's flushed parts and the cluster must replicate them node-to-node. Two read-only HTTP
+this node's flushed parts and the cluster must replicate them node-to-node. Leaving it unset on a
+private backend is silent: writes still reach every replica through the primary path, so the
+cluster looks healthy until a handoff or a replica restart serves a shard whose parts live only on
+another node's disk — absence the read path cannot distinguish from real absence. `Open` warns when
+the backend reports `backend.NodeLocal` and this flag is unset, and `Inspect` keeps that visible as
+`ClusterStats.NodeLocalBackendUnshared`; both are advisory, because a `file` backend on a shared
+mount is a legitimate shared store that trips the same check. Two read-only HTTP
 endpoints serve the node's backend (key listing; one object verbatim with an xxh3 checksum header
 the client verifies). A `Syncer` **mirrors an engine prefix from the newest peer copy**: fetch each
 peer's bucket index, pick the newest, copy missing objects — **manifest after the part's other

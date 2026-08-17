@@ -395,6 +395,18 @@ func (o *Options) validate() error {
 	return nil
 }
 
+// nodeLocalBackendUnshared reports the misconfiguration [Open] warns about: a clustered node whose
+// backend looks node-private (see [backend.NodeLocal]) while [cluster.Config.PrivateBackend] is
+// false. Peers then cannot read this node's flushed parts and nothing replicates them, so a
+// rebalance handoff or a replica restart answers from parts that only another node holds — a hole
+// the read path cannot tell apart from real absence.
+//
+// It warns instead of refusing because the premise is a heuristic in one direction only: a `file`
+// backend rooted on a shared mount is a valid shared-store deployment and lands here too.
+func (o *Options) nodeLocalBackendUnshared() bool {
+	return o.Cluster != nil && !o.Cluster.PrivateBackend && backend.IsNodeLocal(o.Backend)
+}
+
 // applyDefaults fills nil/zero fields with the documented defaults.
 func (o *Options) applyDefaults() {
 	if o.Backend == nil {

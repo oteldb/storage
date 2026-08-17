@@ -198,6 +198,9 @@ func (e *ecBackend) PutIfAbsent(ctx context.Context, key string, data []byte) (b
 
 func (e *ecBackend) IsEphemeral() bool { return e.inner.IsEphemeral() }
 
+// IsNodeLocal forwards the [backend.NodeLocal] capability.
+func (e *ecBackend) IsNodeLocal() bool { return backend.IsNodeLocal(e.inner) }
+
 // reconstruct is the counted reader fallback: an object with no local full copy is reassembled
 // from shards, and the outcome lands in the EC operator stats (a missing object is not an
 // error of the reconstruction machinery and is not counted as one).

@@ -49,6 +49,10 @@ func New(dir string) (*File, error) {
 // IsEphemeral reports false: data persists on disk.
 func (*File) IsEphemeral() bool { return false }
 
+// IsNodeLocal reports true: a directory tree is private to its node unless the root happens to be a
+// shared mount, which the backend cannot tell. See [backend.NodeLocal] for how to read that.
+func (*File) IsNodeLocal() bool { return true }
+
 // Write stores data under key atomically: it writes a temp file in the destination
 // directory, fsyncs it, and renames it over the final path.
 func (f *File) Write(_ context.Context, key string, data []byte) (rerr error) {
