@@ -155,9 +155,9 @@ func TestSharedDictMixedDecodeDictionaryShape(t *testing.T) {
 
 	require.Len(t, whole.Entries, len(distinct), "merged dictionary must hold each distinct value once")
 
-	// A *fully unique* self-encoded granule still flattens the whole decode: [chunk.DictMerger.Append]
-	// degrades when a source granule holds one entry per row. That predates this seam and is left
-	// alone here — it costs a mixed column its predicate memo, which is worth its own change.
+	// A *fully unique* self-encoded granule keeps the dictionary too. It has no repeats of its own, but
+	// flattening for its sake would take the ids away from every other granule in the column — the
+	// merge only degrades when the dictionary genuinely cannot hold the values.
 	uniq := mixedSharedValues(granules, rows, map[int]bool{2: true}, rows)
 
 	uDesc, uObj, err := buildColumn(
@@ -165,9 +165,13 @@ func TestSharedDictMixedDecodeDictionaryShape(t *testing.T) {
 		zstdComp(), rows, defaultCompressBlockBytes)
 	require.NoError(t, err)
 
-	flat, err := newColumnReader(uDesc, uObj, zstdComp(), len(uniq)).Bytes()
+	whole2, err := newColumnReader(uDesc, uObj, zstdComp(), len(uniq)).Bytes()
 	require.NoError(t, err)
-	require.Zero(t, flat.IDWidth, "a fully unique self-encoded granule degrades the merge to flat")
+	require.Positive(t, whole2.IDWidth, "one unique granule must not flatten the whole column")
+
+	for i, want := range uniq {
+		require.Equalf(t, want, whole2.At(i), "row %d", i)
+	}
 }
 
 // BenchmarkSharedDictMixedDecode measures the whole-column decode of a shared-dictionary column with

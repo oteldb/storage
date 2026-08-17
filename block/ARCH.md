@@ -145,9 +145,15 @@ On real p90 columns: attributes 42.3 ms → 28.1 ms, bodies 5.88 ms → 2.73 ms.
 runs on the first shared granule of a selection, not at the start of the merge, so a selection holding
 only self-encoded granules puts no unreferenced entries in the merged dictionary.
 
-A self-encoded granule holding one entry per row still degrades the merged column to the flat form:
-that is `DictMerger.Append`'s rule for a source with no internal repeats, and it costs an otherwise
-dictionary-encoded column its per-entry predicate memo for the whole decode.
+A seeded merge also keeps the dictionary where an unseeded one would abandon it. `DictMerger.Append`
+flattens on a granule holding one entry per row — with nothing to repeat into, merging it would build a
+column-sized dictionary and then overflow anyway — but that reasoning inverts once a column-wide
+dictionary is seeded: the other granules index it, so flattening for one unique granule takes *their*
+ids away too, and with them the per-distinct-entry predicate memo for every row of the column. Seeded,
+the unique granule's entries are merged like any others and only the 65536-entry ceiling flattens the
+result. Measured on a real attributes column, whole-column decode: 324699 flat rows before, a
+60509-entry dictionary after — 5.4x fewer predicate evaluations for a scan that filters on it, and
+1.5 MB of entry headers instead of 7.8 MB.
 
 ## Two writers
 

@@ -163,16 +163,32 @@ func (d *DictMerger) Append(c *DictColumn) {
 		d.degrade()
 	}
 
-	// A granule whose dictionary holds one entry per row has no internal repeats. Merging it can
-	// only pay if its values repeat in *other* granules — and the writer already decided they do
-	// not, since it self-encoded rather than joining the column's shared dictionary. Probing every
-	// value into the merge would build a dictionary the size of the column and then degrade anyway,
-	// which is what a near-unique column (a log body) did on every whole-column decode.
-	if c.IDWidth > 0 && len(c.Entries) == rows {
+	// A granule whose dictionary holds one entry per row has no internal repeats, so merging it can
+	// only pay if its values repeat in *other* granules — and with no seeded dictionary to repeat
+	// into, they cannot: probing every value would build a dictionary the size of the column and then
+	// degrade anyway, which is what a near-unique column (a log body) did on every whole-column
+	// decode.
+	//
+	// A seeded merge is the opposite case. Its other granules index a column-wide dictionary, so
+	// flattening for the sake of one unique granule discards *their* ids too — every row of the column
+	// loses the per-distinct-entry predicate memo because one granule in forty had no repeats. There
+	// the unique granule's entries are merged like any others and the ceiling below decides, which it
+	// can do exactly.
+	if c.IDWidth > 0 && len(c.Entries) == rows && !d.seeded {
 		d.degrade()
 	}
 
 	if d.isFlat {
+		d.putFlat(c, rows)
+
+		return
+	}
+
+	// Decided before the entry loop rather than inside it: a granule that cannot fit whatever room is
+	// left would otherwise be hashed entry by entry until it tripped the same ceiling, and every probe
+	// up to that point is discarded by the degrade. Both counts are known here.
+	if len(d.entries)+len(c.Entries) > maxDictEntries {
+		d.degrade()
 		d.putFlat(c, rows)
 
 		return
@@ -186,16 +202,11 @@ func (d *DictMerger) Append(c *DictColumn) {
 	// index a dictionary of at most 65536 entries, so the per-row loop below is an array lookup.
 	local := make([]int32, len(c.Entries))
 
+	// No ceiling check in the loop: the guard above admitted the granule's whole entry table, so the
+	// dictionary cannot overflow inside it.
 	for i, e := range c.Entries {
 		id, ok := d.m.Get(e)
 		if !ok {
-			if len(d.entries) >= maxDictEntries {
-				d.degrade()
-				d.putFlat(c, rows)
-
-				return
-			}
-
 			id = len(d.entries)
 			d.m.Put(e, id)
 			d.entries = append(d.entries, e)
