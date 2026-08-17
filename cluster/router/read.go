@@ -12,6 +12,11 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
+// The router carries the read RPCs itself — the fetch fan-out below, and the enumeration and
+// aggregate clients in enum.go / aggregate.go — so an off-ring reader shares one HTTP client,
+// one retry profile and one hedging policy with it, instead of pairing the router with a client
+// of its own and failing over sequentially.
+
 // Fetcher returns a [fetch.Fetcher] over one shard, racing its owners under the hedged read policy.
 // Every owner holds a complete copy, so the first success is authoritative.
 //
@@ -20,6 +25,11 @@ import (
 // whose membership view lags, one that has not backfilled). Accepting its empty answer would drop
 // every row the shard holds elsewhere, so the read moves to the next owner and reports empty only
 // when all of them disclaim it.
+//
+// The owner applies only the serializable ([fetch.Matcher].Spec) subset of a request's matchers, so
+// its answer is a superset; the returned fetcher re-applies the full set ([fetch.Filter]) before
+// yielding, exactly as the node's own fan-out does. A caller therefore gets what it asked for and
+// not a superset it has to know to narrow itself.
 func (r *Router) Fetcher(sig signal.Signal, shardKey signal.TenantID) fetch.Fetcher {
 	addrs := r.Owners(shardKey)
 
@@ -28,7 +38,47 @@ func (r *Router) Fetcher(sig signal.Signal, shardKey signal.TenantID) fetch.Fetc
 		remotes[i] = cluster.NewRemoteFetcher(sig, addr, r.httpc)
 	}
 
-	return hedgedFetcher{policy: r.readPolicy(), remotes: remotes}
+	return fetch.Filter(hedgedFetcher{policy: r.readPolicy(), remotes: remotes})
+}
+
+// hedgeOwners races a call across a shard's owners under the hedged read policy — the enumeration
+// and aggregate twin of [Router.Fetcher]'s fan-out, and the same policy the node's own read path
+// uses, so an off-ring reader fails over as fast as a member does.
+//
+// An owner's [cluster.ErrShardAbsent] is no answer rather than an empty one: the call fails over to
+// the next owner and returns the zero value only when every owner disclaims the shard (nothing holds
+// it) or the ring has no owner to ask.
+func hedgeOwners[T any](
+	ctx context.Context, r *Router, shardKey signal.TenantID, call func(context.Context, string) (T, error),
+) (T, error) {
+	var zero T
+
+	addrs := r.Owners(shardKey)
+	if len(addrs) == 0 {
+		return zero, nil
+	}
+
+	var absent atomic.Int64
+
+	thunks := make([]func(context.Context) (T, error), len(addrs))
+	for i := range addrs {
+		addr := addrs[i]
+		thunks[i] = func(ctx context.Context) (T, error) {
+			v, err := call(ctx, addr)
+			if errors.Is(err, cluster.ErrShardAbsent) {
+				absent.Add(1)
+			}
+
+			return v, err
+		}
+	}
+
+	v, err := retry.Hedge(ctx, r.readPolicy(), thunks)
+	if err != nil && int(absent.Load()) >= len(addrs) {
+		return zero, nil
+	}
+
+	return v, err
 }
 
 // hedgedFetcher races a shard's owners, treating absence as no answer. It is the client-side twin

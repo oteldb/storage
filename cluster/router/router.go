@@ -3,8 +3,12 @@
 // A storage node holds shards, so it obtains the ring as a side effect of registering itself as a
 // member. The other tiers — a query front end, an ingester — need the same routing view while
 // owning no data: they must resolve a shard's primary and its owners, but must never be placed as
-// one. [etcd.Watch] gives them a ring without a lease, and this package turns it into the two
-// clients that ring is for.
+// one. [etcd.Watch] gives them a ring without a lease, and this package turns it into the clients
+// that ring is for: the primary write, and the read surface — [Router.Fetcher], the enumeration
+// ([Router.Series], [Router.Keys], [Router.Side]) and the metric aggregate pushdown
+// ([Router.Aggregate], [Router.AggregateWindow]). Each carries the RPC over the Router's own HTTP
+// client under its own retry/hedge profile, so an off-ring reader fails over between a shard's
+// owners exactly as a member node does.
 //
 // A Router is safe for concurrent use and follows membership live: a node joining or failing is
 // reflected in the next placement lookup, with no reconnect on the caller's part.

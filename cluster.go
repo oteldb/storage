@@ -441,9 +441,9 @@ func (s *Storage) shardFetcher(shardKey signal.TenantID) fetch.Fetcher {
 		return fetch.Merge() // no owner holds the shard: it has no data anywhere
 	}
 
-	return &filteringFetcher{inner: hedgedFetcher{
+	return fetch.Filter(hedgedFetcher{
 		store: s, op: rpcOpRead, remotes: remotes, absentShard: absentOf(absent, signal.Metric, shardKey),
-	}}
+	})
 }
 
 // shardReadTargets resolves a shard's read targets: whether this node holds the shard itself, and a
@@ -633,7 +633,7 @@ func gatherShards[T any](
 			na := &named[i]
 
 			series := seriesOf(na)
-			if !matchesAllSeries(series, matchers) {
+			if !fetch.MatchesSeries(series, matchers) {
 				continue
 			}
 
@@ -749,7 +749,7 @@ func equalityMatchers(matchers []fetch.Matcher) []fetch.EqualMatcher {
 func unionNamed(out map[signal.SeriesID][]engine.BucketAgg, named []engine.NamedAgg, matchers []fetch.Matcher) {
 	for i := range named {
 		na := &named[i]
-		if !matchesAllSeries(na.Series, matchers) {
+		if !fetch.MatchesSeries(na.Series, matchers) {
 			continue
 		}
 
@@ -869,18 +869,6 @@ func (s *Storage) shardOwners(shardKey signal.TenantID) (local bool, remotes []s
 	return local, remotes
 }
 
-// equalitySpecs extracts the serializable (equality) matchers to push down to a peer.
-func equalitySpecs(matchers []fetch.Matcher) []fetch.EqualMatcher {
-	var eq []fetch.EqualMatcher
-	for i := range matchers {
-		if matchers[i].Spec != nil {
-			eq = append(eq, *matchers[i].Spec)
-		}
-	}
-
-	return eq
-}
-
 // lookupRecordEngine resolves a tenant's engine for a record signal (log/trace/profile) without
 // creating one. Metrics are not a record signal, so they return (nil, false).
 func (s *Storage) lookupRecordEngine(sig signal.Signal, tid signal.TenantID) (*recordengine.Engine, bool) {
@@ -976,7 +964,7 @@ func (s *Storage) clusterSeries(
 ) ([]signal.Series, error) {
 	tenant := s.normalizeTenant(tid)
 	n := s.cluster.shardCount()
-	eq := equalitySpecs(matchers)
+	eq := fetch.EqualitySpecs(matchers)
 
 	// A tenant's streams are spread across N shards, so enumerate every shard and concatenate (a
 	// stream lives in exactly one shard, so the sets are disjoint — no dedup needed).
@@ -1011,14 +999,7 @@ func (s *Storage) shardSeries(
 			return nil, err
 		}
 
-		kept := series[:0]
-		for i := range series {
-			if matchesAllSeries(series[i], matchers) {
-				kept = append(kept, series[i])
-			}
-		}
-
-		return kept, nil
+		return fetch.FilterSeries(series, matchers), nil
 	})
 }
 
@@ -1164,9 +1145,9 @@ func (s *Storage) shardRecordFetcher(
 		return fetch.Merge() // no owner holds the shard: it has no data anywhere
 	}
 
-	return &filteringFetcher{inner: hedgedFetcher{
+	return fetch.Filter(hedgedFetcher{
 		store: s, op: rpcOpRead, remotes: remotes, absentShard: absentOf(absent, sig, shardKey),
-	}}
+	})
 }
 
 // recordEngineFor returns the local record engine (logs, traces, or profiles) for a signal+tenant,
@@ -1214,83 +1195,6 @@ func (s *Storage) applyReplicated(_ context.Context, payload []byte) error {
 	}
 
 	return nil
-}
-
-// filteringFetcher re-applies a request's matchers to the inner result, which may be a superset
-// (a remote owner returns its whole window since matchers are not serializable). A series is
-// kept iff every matcher matches a present attribute of that name — the same positive semantics
-// the engine's postings resolution applies; absent/negated handling stays in the language layer.
-type filteringFetcher struct {
-	inner fetch.Fetcher
-}
-
-func (f *filteringFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
-	it, err := f.inner.Fetch(ctx, r)
-	if err != nil {
-		return nil, err
-	}
-
-	batches, err := fetch.Drain(ctx, it)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(r.Matchers) == 0 {
-		return fetch.NewSliceIterator(batches), nil
-	}
-
-	kept := batches[:0]
-	for _, b := range batches {
-		if matchesAllSeries(b.Series, r.Matchers) {
-			kept = append(kept, b)
-		}
-	}
-
-	return fetch.NewSliceIterator(kept), nil
-}
-
-// matchesAllSeries reports whether s satisfies every matcher (each over the present value of
-// its named label).
-func matchesAllSeries(s signal.Series, matchers []fetch.Matcher) bool {
-	for i := range matchers {
-		v, ok := lookupSeriesLabel(s, matchers[i].Name)
-		if !ok || !matchers[i].Match(v) {
-			return false
-		}
-	}
-
-	return true
-}
-
-// lookupSeriesLabel resolves a label value from a series the way the engine indexes it for matching
-// (recordengine's indexLabels / metric's series labels): the series' own attributes, then the
-// resource and scope attributes, then the reserved scope name/version labels. This is what lets a
-// fan-out matcher on a resource label (e.g. service.name) re-filter correctly for the record signals.
-func lookupSeriesLabel(s signal.Series, name []byte) (signal.Value, bool) {
-	if v, ok := s.Attributes.Get(name); ok {
-		return v, true
-	}
-
-	if v, ok := s.Resource.Attributes.Get(name); ok {
-		return v, true
-	}
-
-	if v, ok := s.Scope.Attributes.Get(name); ok {
-		return v, true
-	}
-
-	switch string(name) {
-	case signal.LabelScopeName:
-		if len(s.Scope.Name) > 0 {
-			return signal.StringValue(s.Scope.Name), true
-		}
-	case signal.LabelScopeVersion:
-		if len(s.Scope.Version) > 0 {
-			return signal.StringValue(s.Scope.Version), true
-		}
-	}
-
-	return signal.Value{}, false
 }
 
 // close tears down the cluster runtime: deregister (revoke lease), stop the server, close the
