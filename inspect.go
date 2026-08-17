@@ -106,6 +106,16 @@ type ClusterStats struct {
 	// LastRebalance is the owner-set handoffs enacted at the most recent ring change (empty if
 	// none), at each shard's per-tenant replication factor.
 	LastRebalance []RebalanceMove
+	// PrivateBackend is [cluster.Config.PrivateBackend] as configured: set, this node mirrors
+	// flushed parts to and from its peers (see PartSync); unset, parts are exchanged through a
+	// backend every node can read.
+	PrivateBackend bool
+	// NodeLocalBackendUnshared is the standing form of the diagnostic [Open] logs once: the backend
+	// looks node-private (see [backend.NodeLocal]) while PrivateBackend is unset, so nothing
+	// replicates flushed parts and a node that gained a shard — or restarted as a replica — serves
+	// reads missing whatever only its peers hold. A shared mount answers true here as well, so read
+	// it as "confirm the backend really is shared", not as a fault.
+	NodeLocalBackendUnshared bool
 	// PartSync is the shared-nothing part-mirroring activity (cluster/partsync), cumulative since
 	// process start; nil unless the cluster runs with a private (per-node) backend.
 	PartSync *PartSyncStats
@@ -251,7 +261,12 @@ func (s *Storage) clusterStats() *ClusterStats {
 		return nil
 	}
 
-	cs := &ClusterStats{Self: s.cluster.self, Owned: s.cluster.ownership.Owned()}
+	cs := &ClusterStats{
+		Self:                     s.cluster.self,
+		Owned:                    s.cluster.ownership.Owned(),
+		PrivateBackend:           s.cluster.private,
+		NodeLocalBackendUnshared: s.opts.nodeLocalBackendUnshared(),
+	}
 
 	for _, m := range s.cluster.membership.Members() {
 		cs.Members = append(cs.Members, MemberStats{ID: m.ID, Zone: m.Zone, Addr: m.Addr})

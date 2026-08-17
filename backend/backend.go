@@ -133,6 +133,9 @@ func newMemory() *memoryBackend {
 
 func (*memoryBackend) IsEphemeral() bool { return true }
 
+// IsNodeLocal reports true: the objects are this process's heap, unreachable by any peer.
+func (*memoryBackend) IsNodeLocal() bool { return true }
+
 func (m *memoryBackend) Write(_ context.Context, key string, data []byte) error {
 	cp := slices.Clone(data)
 	if cp == nil {

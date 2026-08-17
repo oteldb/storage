@@ -33,6 +33,13 @@ func TestFileIsNotEphemeral(t *testing.T) {
 	assert.False(t, b.IsEphemeral())
 }
 
+func TestFileIsNodeLocal(t *testing.T) {
+	t.Parallel()
+	b, err := file.New(t.TempDir())
+	require.NoError(t, err)
+	assert.True(t, backend.IsNodeLocal(b))
+}
+
 func TestFilePersistsAcrossReopen(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

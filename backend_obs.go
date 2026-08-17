@@ -83,6 +83,10 @@ func (w *instrumentedObjectWriter) Commit(ctx context.Context) error {
 
 func (b *instrumentedBackend) IsEphemeral() bool { return b.inner.IsEphemeral() }
 
+// IsNodeLocal forwards the [backend.NodeLocal] capability; without it a metered backend would look
+// shared.
+func (b *instrumentedBackend) IsNodeLocal() bool { return backend.IsNodeLocal(b.inner) }
+
 // FreeSpace forwards the [backend.SpaceReporter] capability, unmetered — it is a statfs, not an
 // object operation. Without it a metered backend would hide the disk from the merge cap and every
 // merge would fall back to the ceiling.

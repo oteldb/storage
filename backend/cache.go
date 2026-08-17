@@ -137,6 +137,9 @@ type cachedBackend struct {
 
 func (c *cachedBackend) IsEphemeral() bool { return c.inner.IsEphemeral() }
 
+// IsNodeLocal forwards the [NodeLocal] capability; without it a cached backend would look shared.
+func (c *cachedBackend) IsNodeLocal() bool { return IsNodeLocal(c.inner) }
+
 // FreeSpace forwards the [SpaceReporter] capability. Without this the wrapper would hide it and
 // every cached backend would silently fall back to the merge ceiling.
 func (c *cachedBackend) FreeSpace(ctx context.Context) (int64, error) {
