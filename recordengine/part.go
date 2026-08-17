@@ -2,6 +2,7 @@ package recordengine
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -18,6 +19,13 @@ func u128ToID(u chunk.U128) signal.SeriesID  { return signal.SeriesID{Hi: u.Hi, 
 // rowRange is the half-open row span [start, end) a stream occupies in a part.
 type rowRange struct{ start, end int }
 
+// streamRange binds a stream id to the row span it occupies in a part.
+type streamRange struct {
+	rowRange
+
+	id signal.SeriesID
+}
+
 // part is a flushed, immutable part: the lazy on-backend [block.PartReader], an in-memory
 // StreamID → row-range index (rows are sorted by (stream, ts), so each stream is one contiguous
 // run), and the per-column blooms for predicate pruning.
@@ -25,7 +33,10 @@ type part struct {
 	schema *Schema
 	reader *block.PartReader
 	prefix string
-	ranges map[signal.SeriesID]rowRange
+
+	// ranges is the stream → row-span index, sorted by stream id, so a query resolves its streams by
+	// a merge-join ([part.heldStreams]) rather than one hash probe per (part, stream) pair.
+	ranges []streamRange
 	blooms map[string]*bloom.Filter // column name → its bloom (FullText/Attrs/Equality); absent ⇒ scan
 
 	// recordKeys is the part's distinct per-record attribute keys (the "keys.bin" footer), for
@@ -89,17 +100,7 @@ func openPart(ctx context.Context, b backend.Backend, schema *Schema, prefix str
 		return nil, err
 	}
 
-	ranges := make(map[signal.SeriesID]rowRange)
-
-	for i := 0; i < len(ids); {
-		j := i + 1
-		for j < len(ids) && ids[j] == ids[i] {
-			j++
-		}
-
-		ranges[u128ToID(ids[i])] = rowRange{start: i, end: j}
-		i = j
-	}
+	ranges := buildRanges(ids)
 
 	blooms, err := loadBlooms(ctx, b, schema, prefix)
 	if err != nil {
@@ -117,15 +118,81 @@ func openPart(ctx context.Context, b backend.Backend, schema *Schema, prefix str
 	}, nil
 }
 
-// holdsAny reports whether the part carries any of the requested streams.
-func (p *part) holdsAny(ids []signal.SeriesID) bool {
+// buildRanges turns a part's stream column into the sorted stream → row-span index. A part written
+// by flush or merge is already (stream, ts)-ordered, so the runs come out ascending; a part whose
+// stream column is ordered otherwise is sorted here, once, rather than at every query.
+func buildRanges(ids []chunk.U128) []streamRange {
+	ranges := make([]streamRange, 0, 64)
+
+	for i := 0; i < len(ids); {
+		j := i + 1
+		for j < len(ids) && ids[j] == ids[i] {
+			j++
+		}
+
+		ranges = append(ranges, streamRange{id: u128ToID(ids[i]), rowRange: rowRange{start: i, end: j}})
+		i = j
+	}
+
+	if !slices.IsSortedFunc(ranges, func(a, b streamRange) int { return a.id.Compare(b.id) }) {
+		slices.SortFunc(ranges, func(a, b streamRange) int { return a.id.Compare(b.id) })
+	}
+
+	return ranges
+}
+
+// disjointIDs reports whether a sorted id set and a part's sorted stream list cannot overlap, so a
+// fragmented store's many irrelevant parts are rejected in two comparisons instead of a walk. Both
+// slices must be non-empty and ascending.
+func disjointIDs(ids []signal.SeriesID, rs []streamRange) bool {
+	wantFirst, wantLast := ids[0], ids[len(ids)-1]
+	heldFirst, heldLast := rs[0].id, rs[len(rs)-1].id
+
+	return wantLast.Compare(heldFirst) < 0 || wantFirst.Compare(heldLast) > 0
+}
+
+// lookup returns the row span stream id occupies in the part.
+func (p *part) lookup(id signal.SeriesID) (rowRange, bool) {
+	i, ok := slices.BinarySearchFunc(p.ranges, id, func(sr streamRange, target signal.SeriesID) int {
+		return sr.id.Compare(target)
+	})
+	if !ok {
+		return rowRange{}, false
+	}
+
+	return p.ranges[i].rowRange, true
+}
+
+// heldStreams appends to dst the entries of the requested streams the part holds. ids must be sorted
+// ascending (duplicates allowed); the walk is a merge-join against the part's own sorted stream list,
+// so it costs O(len(ids) + len(p.ranges)) comparisons and no hashing.
+func (p *part) heldStreams(dst []streamRange, ids []signal.SeriesID) []streamRange {
+	rs := p.ranges
+	if len(rs) == 0 || len(ids) == 0 {
+		return dst
+	}
+
+	if disjointIDs(ids, rs) {
+		return dst
+	}
+
+	j := 0
+
 	for _, id := range ids {
-		if _, ok := p.ranges[id]; ok {
-			return true
+		for j < len(rs) && rs[j].id.Compare(id) < 0 {
+			j++
+		}
+
+		if j == len(rs) {
+			break
+		}
+
+		if rs[j].id == id {
+			dst = append(dst, rs[j])
 		}
 	}
 
-	return false
+	return dst
 }
 
 // readCols decodes the part's timestamp column plus the schema columns selected by sel (unselected

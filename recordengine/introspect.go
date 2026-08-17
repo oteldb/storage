@@ -65,8 +65,8 @@ type LabelCard struct {
 // rows returns the part's total record count (its stream ranges partition [0, rows)).
 func (p *part) rows() int64 {
 	var n int64
-	for _, r := range p.ranges {
-		n += int64(r.end - r.start)
+	for _, sr := range p.ranges {
+		n += int64(sr.end - sr.start)
 	}
 
 	return n

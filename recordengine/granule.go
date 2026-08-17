@@ -50,19 +50,6 @@ func (p *part) granuleTimes(ctx context.Context) []block.Granule {
 	return p.granules
 }
 
-// idLookupSet returns the plan's requested ids as a set, building it once. Granule selection uses it
-// to walk whichever of (requested ids, the part's streams) is smaller.
-func (p *fetchPlan) idLookupSet() map[signal.SeriesID]struct{} {
-	if p.idLookup == nil {
-		p.idLookup = make(map[signal.SeriesID]struct{}, len(p.ids))
-		for _, id := range p.ids {
-			p.idLookup[id] = struct{}{}
-		}
-	}
-
-	return p.idLookup
-}
-
 // granuleInWindow reports whether granule g can hold a record in [start, end]. A granule outside the
 // index is always a candidate, so pruning can only ever remove granules it can prove empty.
 func granuleInWindow(gran []block.Granule, g int, start, end int64) bool {
@@ -77,8 +64,8 @@ func granuleInWindow(gran []block.Granule, g int, start, end int64) bool {
 // span whose bounds can hold a record in [start, end].
 //
 // nil means "decode everything" — either pruning is unavailable, or every granule survived, in which
-// case naming them all would only cost the caller a list to walk.
-func (p *part) windowGranules(ctx context.Context, ids []signal.SeriesID, idSet map[signal.SeriesID]struct{}, start, end int64) []int {
+// case naming them all would only cost the caller a list to walk. ids must be sorted ascending.
+func (p *part) windowGranules(ctx context.Context, ids []signal.SeriesID, start, end int64) []int {
 	gran := p.granuleTimes(ctx)
 	if gran == nil || p.reader == nil {
 		return nil
@@ -106,24 +93,23 @@ func (p *part) windowGranules(ctx context.Context, ids []signal.SeriesID, idSet 
 		}
 	}
 
-	// Selecting granules must not cost more than the decode it saves, and this runs once per part.
-	// Walking the requested streams costs one lookup each — fine for a service filter, ruinous for a
-	// query with no matchers, which requests every stream in the tenant (hundreds of thousands) to
-	// skip a handful of granules. Walking the part's own streams instead costs one lookup each and
-	// yields exactly the same granules, so take whichever side is smaller. Precision is never traded
-	// away: both walks see the same requested-and-present streams.
-	if idSet != nil && len(p.ranges) < len(ids) {
-		for id, rng := range p.ranges {
-			if _, ok := idSet[id]; ok {
-				addRange(rng)
-			}
+	// Selecting granules must not cost more than the decode it saves, and this runs once per part. The
+	// merge-join walks each list once, so a query with no matchers — which requests every stream in
+	// the tenant, hundreds of thousands of them, to skip a handful of granules — costs a scan of the
+	// two sorted lists rather than a lookup per requested stream.
+	rs := p.ranges
+
+	for j := 0; j < len(rs) && len(ids) > 0; {
+		if rs[j].id.Compare(ids[0]) < 0 {
+			j++
+			continue
 		}
-	} else {
-		for _, id := range ids {
-			if rng, ok := p.ranges[id]; ok {
-				addRange(rng)
-			}
+
+		if rs[j].id == ids[0] {
+			addRange(rs[j].rowRange)
 		}
+
+		ids = ids[1:]
 	}
 
 	if len(out) == 0 {

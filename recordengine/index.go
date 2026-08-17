@@ -153,8 +153,8 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 
 		// Trim only streams the parts hold (in-memory ranges — no I/O); an unflushed stream's
 		// head must survive the refresh, or the primary becomes its sole holder.
-		for id := range p.ranges {
-			covered[id] = struct{}{}
+		for _, sr := range p.ranges {
+			covered[sr.id] = struct{}{}
 		}
 	}
 

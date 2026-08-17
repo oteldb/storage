@@ -51,7 +51,11 @@ func BenchmarkAppendWindow(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	rng := e.parts[0].ranges[series.Hash()]
+	rng, ok := e.parts[0].lookup(series.Hash())
+	if !ok {
+		b.Fatal("part must hold the stream")
+	}
+
 	start, end := int64(n/2), int64(n/2+99) // 100 rows in the middle
 
 	b.ReportAllocs()
