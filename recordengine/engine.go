@@ -1029,9 +1029,7 @@ func (p *fetchPlan) sizeStreams(part *part, rows []int) bool {
 		return false
 	}
 
-	// Disjoint id spaces are the common case in a fragmented store: reject the part before walking
-	// either list.
-	if p.sortedIDs[len(p.sortedIDs)-1].Compare(rs[0].id) < 0 || p.sortedIDs[0].Compare(rs[len(rs)-1].id) > 0 {
+	if disjointIDs(p.sortedIDs, rs) {
 		return false
 	}
 

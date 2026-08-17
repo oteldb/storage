@@ -141,6 +141,16 @@ func buildRanges(ids []chunk.U128) []streamRange {
 	return ranges
 }
 
+// disjointIDs reports whether a sorted id set and a part's sorted stream list cannot overlap, so a
+// fragmented store's many irrelevant parts are rejected in two comparisons instead of a walk. Both
+// slices must be non-empty and ascending.
+func disjointIDs(ids []signal.SeriesID, rs []streamRange) bool {
+	wantFirst, wantLast := ids[0], ids[len(ids)-1]
+	heldFirst, heldLast := rs[0].id, rs[len(rs)-1].id
+
+	return wantLast.Compare(heldFirst) < 0 || wantFirst.Compare(heldLast) > 0
+}
+
 // lookup returns the row span stream id occupies in the part.
 func (p *part) lookup(id signal.SeriesID) (rowRange, bool) {
 	i, ok := slices.BinarySearchFunc(p.ranges, id, func(sr streamRange, target signal.SeriesID) int {
@@ -162,9 +172,7 @@ func (p *part) heldStreams(dst []streamRange, ids []signal.SeriesID) []streamRan
 		return dst
 	}
 
-	// Disjoint id spaces are the common case in a fragmented store: reject the part before touching
-	// either list.
-	if ids[len(ids)-1].Compare(rs[0].id) < 0 || ids[0].Compare(rs[len(rs)-1].id) > 0 {
+	if disjointIDs(ids, rs) {
 		return dst
 	}
 
