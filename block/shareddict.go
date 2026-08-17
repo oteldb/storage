@@ -345,53 +345,37 @@ func parseSharedDict(object []byte, comp *compress.Compressor) (entries [][]byte
 	return entries, object[packedLen:], nil
 }
 
-// decodeSharedGranule decodes one granule of a shared-dictionary column into dc, resolving shared
-// ids against entries. rows is the granule's row count.
-func decodeSharedGranule(stream []byte, entries [][]byte, rows int, dc *chunk.DictColumn) error {
-	if len(stream) == 0 {
-		return errors.Wrap(ErrCorrupt, "shared dict: empty granule stream")
-	}
-
-	mode, payload := stream[0], stream[1:]
-
-	if mode == modeSelf {
-		if _, err := dc.DecodeBytes(payload); err != nil {
-			return err
-		}
-
-		return nil
-	}
-
-	if mode != modeShared {
-		return errors.Wrapf(ErrCorrupt, "shared dict: unknown granule mode %d", mode)
-	}
-
-	idWidth := 1
+// sharedIDWidth is the bytes per row a granule spends on ids into a dictionary of the given size.
+func sharedIDWidth(entries [][]byte) int {
 	if len(entries) > 256 {
-		idWidth = 2
+		return 2
 	}
 
-	if len(payload) != rows*idWidth {
-		return errors.Wrapf(ErrCorrupt, "shared dict: %d id bytes for %d rows at width %d",
-			len(payload), rows, idWidth)
+	return 1
+}
+
+// sharedIDAt reads row r out of a granule's packed big-endian id array.
+func sharedIDAt(ids []byte, idWidth, r int) int {
+	if idWidth == 1 {
+		return int(ids[r])
 	}
 
-	for i := range rows {
-		id := int(payload[i])
-		if idWidth == 2 {
-			id = int(payload[i*2])<<8 | int(payload[i*2+1])
-		}
+	return int(uint16(ids[r*2])<<8 | uint16(ids[r*2+1]))
+}
 
-		if id >= len(entries) {
-			return errors.Wrapf(ErrCorrupt, "shared dict: id %d past %d entries", id, len(entries))
-		}
+// splitSharedGranule peels a granule stream's leading mode byte, rejecting a mode this reader does
+// not know rather than treating its payload as one of the two it does.
+func splitSharedGranule(stream []byte) (mode byte, payload []byte, err error) {
+	if len(stream) == 0 {
+		return 0, nil, errors.Wrap(ErrCorrupt, "shared dict: empty granule stream")
 	}
 
-	// The ids index the column-wide dictionary directly, so the granule needs no remap: hand the
-	// shared entries straight through as the granule's own.
-	dc.Entries, dc.IDs, dc.IDWidth = entries, payload, idWidth
-
-	return nil
+	switch mode = stream[0]; mode {
+	case modeShared, modeSelf:
+		return mode, stream[1:], nil
+	default:
+		return 0, nil, errors.Wrapf(ErrCorrupt, "shared dict: unknown granule mode %d", mode)
+	}
 }
 
 // decodeSharedIDs is the fast path for a shared-dictionary column whose selected granules all use

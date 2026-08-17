@@ -694,6 +694,54 @@ func (w *bytesWalk) frame(g int) ([]byte, error) {
 	return w.dir.granuleStream(g, w.frameBuf)
 }
 
+// decodeSharedMode handles a granule of a shared-dictionary column, reporting whether it consumed it.
+//
+// A granule that uses the shared dictionary carries only ids into it, so it is appended through the
+// merge's one-time seed rather than as a dictionary of its own. Handing the merge the column
+// dictionary per granule instead costs a hash probe per entry *per granule*, which is what made a
+// column mixing both modes several times slower to decode whole than one using either mode alone.
+func (w *bytesWalk) decodeSharedMode(stream []byte, rows, lo int) (bool, error) {
+	mode, payload, err := splitSharedGranule(stream)
+	if err != nil {
+		return false, err
+	}
+
+	if mode != modeShared {
+		return false, nil
+	}
+
+	return true, w.appendShared(payload, rows, lo)
+}
+
+// appendShared validates a shared-dictionary granule's ids and appends them to the merge through its
+// one-time seed of the column dictionary. lo is the granule's first row, used in scatter mode.
+func (w *bytesWalk) appendShared(ids []byte, rows, lo int) error {
+	idWidth := sharedIDWidth(w.shared)
+
+	if len(ids) != rows*idWidth {
+		return errors.Wrapf(ErrCorrupt,
+			"shared dict: %d id bytes for %d rows at width %d", len(ids), rows, idWidth)
+	}
+
+	// Bounds-checked here rather than left to the merge's remap lookup: a corrupt id would otherwise
+	// panic inside the merger with nothing naming the granule it came from.
+	for r := range rows {
+		if id := sharedIDAt(ids, idWidth, r); id >= len(w.shared) {
+			return errors.Wrapf(ErrCorrupt, "shared dict: id %d past %d entries", id, len(w.shared))
+		}
+	}
+
+	w.merger.SeedShared(w.shared)
+
+	if w.scatter {
+		w.merger.AppendSharedAt(ids, idWidth, rows, lo)
+	} else {
+		w.merger.AppendShared(ids, idWidth, rows)
+	}
+
+	return nil
+}
+
 // decode appends granule g's rows to the walk's merge.
 func (w *bytesWalk) decode(g int) error {
 	if g < 0 || g >= w.dir.nBlocks() {
@@ -712,15 +760,24 @@ func (w *bytesWalk) decode(g int) error {
 
 	n := min(lo+w.dir.blockRows, w.rows) - lo
 
-	var dc chunk.DictColumn
-
 	if w.shared != nil {
-		err = decodeSharedGranule(stream, w.shared, n, &dc)
-	} else {
-		_, err = dc.DecodeBytes(stream)
+		done, err := w.decodeSharedMode(stream, n, lo)
+		if err != nil {
+			return errors.Wrapf(err, "decode block %d", g)
+		}
+
+		if done {
+			w.want += n
+
+			return nil
+		}
+
+		stream = stream[1:] // a self-encoded granule: its own chunk stream follows the mode byte
 	}
 
-	if err != nil {
+	var dc chunk.DictColumn
+
+	if _, err := dc.DecodeBytes(stream); err != nil {
 		return errors.Wrapf(err, "decode block %d", g)
 	}
 
