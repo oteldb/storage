@@ -200,7 +200,7 @@ func (s *Storage) gapGuarded(
 
 	return gapFetcher{
 		store: s, sig: sig, shard: shard, local: local,
-		remote: &filteringFetcher{inner: hedgedFetcher{store: s, op: rpcOpRead, remotes: remotes}},
+		remote: fetch.Filter(hedgedFetcher{store: s, op: rpcOpRead, remotes: remotes}),
 	}
 }
 

@@ -94,7 +94,9 @@ recent windows until the next flush.
 
 Matchers are opaque Go closures and **not serializable**, so the RPC carries the tenant
 + window and the requester **re-applies the matchers** to the returned superset (which the contract
-permits). **Equality is the exception**: `fetch.Matcher` may carry a serializable `EqualMatcher`
+permits). Re-applying is `fetch.Filter` / `fetch.MatchesSeries` — one implementation on the seam,
+shared by the node's fan-out and by `router`, since a superset every consumer must narrow the same
+way is a shared obligation, not a per-consumer one. **Equality is the exception**: `fetch.Matcher` may carry a serializable `EqualMatcher`
 spec, forwarded and pushed down on the peer, so a non-owner read narrows by `__name__` instead of
 pulling the whole window. Enumeration RPCs (series, keys, side store, aggregate) fan out the same
 hedged way. The series RPC is **signal-dispatched**: one endpoint enumerates stream identities for
