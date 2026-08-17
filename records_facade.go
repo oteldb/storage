@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 
+	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/fetch"
@@ -175,41 +176,33 @@ func (s *Storage) writeRecordsLocal(
 // writeRecordsClustered frames each tenant's streams+records as a WAL payload and routes it to the
 // tenant's ring primary (primary-authoritative replication); the reject count flows back.
 func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, project recordProjector) (Accepted, error) {
-	// Group each stream by its shard key — (tenant, hash(streamID) % N) — so a tenant's streams
-	// spread across the ring instead of pinning to one owner set (with N=1 the key is the tenant,
-	// byte-identical to the unsharded path).
-	n := s.cluster.shardCount()
-	byShard := make(map[signal.TenantID][]byte)
-
 	// The ingest-rate valve is applied at the origin (per real tenant, like the single-node path);
 	// cardinality and in-flight memory are head-enforced by the shard primary in primaryWrite.
 	var (
-		rateRejected int64
-		lastTenant   signal.TenantID
-		lastAdmit    *tenantAdmission
-		lastLimits   tenant.Limits
-		haveTenant   bool
+		lastTenant signal.TenantID
+		lastAdmit  *tenantAdmission
+		lastLimits tenant.Limits
+		haveTenant bool
 	)
 
-	emitted := project(func(b *recordengine.Batch) {
-		id := b.Identity()
-		tid := s.normalizeTenant(s.tenantFor(id.Resource, id.Scope))
-		if !haveTenant || tid != lastTenant {
-			lastTenant, haveTenant = tid, true
-			lastAdmit = s.admissionFor(tid)
-			lastLimits = s.tenant.Resolve(tid).Limits
-		}
+	frames := cluster.FrameRecords(cluster.RecordProjector(project), s.cluster.shardCount(), s.opts.Tenant,
+		func(tid signal.TenantID, b *recordengine.Batch) bool {
+			if !haveTenant || tid != lastTenant {
+				lastTenant, haveTenant = tid, true
+				lastAdmit = s.admissionFor(tid)
+				lastLimits = s.tenant.Resolve(tid).Limits
+			}
 
-		if !lastAdmit.allowRate(lastLimits, b.ByteSize(), s.now()) {
-			rateRejected += int64(b.Len())
+			if lastAdmit.allowRate(lastLimits, b.ByteSize(), s.now()) {
+				return true
+			}
+
 			lastAdmit.addRate(int64(b.Len()))
 
-			return // whole over-budget stream batch shed before framing
-		}
+			return false // whole over-budget stream batch shed before framing
+		})
 
-		sk := shardKeyOf(tid, shardOf(b.Stream, n), n)
-		byShard[sk] = append(byShard[sk], recordengine.EncodeWAL(b)...)
-	})
+	byShard, emitted, rateRejected := frames.Shards, frames.Emitted, int64(frames.Shed)
 
 	// Each shard routes to its own ring primary independently; fan the routes out under a bound
 	// rather than paying the sum of per-primary round-trips. Order-independent: results accumulate
@@ -224,7 +217,7 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 		routes = append(routes, route{sk, payload})
 	}
 
-	rejects := make([]primaryReject, len(routes))
+	rejects := make([]cluster.Reject, len(routes))
 	errs := make([]error, len(routes))
 
 	parallel.ForEach(len(routes), clusterWriteFanOut, func(i int) {
@@ -241,9 +234,9 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 	// Combine the origin rate rejections with each primary's per-reason breakdown.
 	rej := rejectTally{rate: rateRejected}
 	for _, r := range rejects {
-		rej.ooo += int64(r.ooo)
-		rej.cardinality += int64(r.cardinality)
-		rej.inflight += int64(r.inflight)
+		rej.ooo += int64(r.OOO)
+		rej.cardinality += int64(r.Cardinality)
+		rej.inflight += int64(r.InFlight)
 	}
 
 	for _, err := range errs { // surface the first error deterministically (by route index)
