@@ -104,6 +104,11 @@ type recordCols struct {
 	ints   [][]int64
 	bytes  []byteCol // one offsets+blob column per schema byte column (zero-value when unselected)
 
+	// splitBytes[k], when non-nil, carries byte column k as ids into a merge-wide union dictionary
+	// instead of as bytes[k]'s blob (see [splitCol]). The whole slice is nil except during a merge:
+	// only [recordCols.armSplit] sets it, and the head and every fetch accumulator leave it nil.
+	splitBytes []*splitCol
+
 	// keyCache memoizes the buffer's distinct record-attribute keys (see distinctAttrKeys); it is
 	// invalidated on every append. tsMin/tsMax bound the buffer's timestamps so Keys can use the
 	// cache only when the query window fully covers the buffer (else a windowed scan is needed).
@@ -205,13 +210,73 @@ func (c *recordCols) prepare(s *Schema, n int, sel colSel) {
 		c.bytes = make([]byteCol, s.numBytes())
 	}
 
+	if len(c.splitBytes) != s.numBytes() {
+		c.splitBytes = nil
+	}
+
 	for k := range c.bytes {
+		// A split column keeps its arming across a re-arm even when deselected: a merge re-arms one
+		// accumulator per stream, and the output buffer it feeds must stay in the same form.
+		if sc := c.splitAt(k); sc != nil {
+			if sel.bytes[k] {
+				sc.ensure(n)
+			} else {
+				sc.ensure(0)
+			}
+
+			continue
+		}
+
 		if sel.bytes[k] {
 			c.bytes[k].ensure(n)
 		} else {
 			c.bytes[k] = byteCol{}
 		}
 	}
+}
+
+// armSplit installs a merge's per-column union dictionaries on the buffer: column k carries ids
+// into dicts[k] where that is non-nil, and stays on the flat blob path where it is nil (see
+// [buildMergeDicts]). A nil dicts puts every column back on the flat path. Call it before the first
+// [recordCols.prepare] of the merge; the arming survives every later prepare, since a merge re-arms
+// one accumulator per stream.
+func (c *recordCols) armSplit(dicts []*mergeDict) {
+	if dicts == nil {
+		c.splitBytes = nil
+
+		return
+	}
+
+	if len(c.splitBytes) != len(dicts) {
+		c.splitBytes = make([]*splitCol, len(dicts))
+	}
+
+	for k, d := range dicts {
+		switch {
+		case d == nil:
+			c.splitBytes[k] = nil
+		case c.splitBytes[k] == nil || c.splitBytes[k].dict != d:
+			c.splitBytes[k] = &splitCol{dict: d}
+		}
+	}
+}
+
+// splitAt returns byte column k's split carrier, or nil when it is on the flat path.
+func (c *recordCols) splitAt(k int) *splitCol {
+	if c.splitBytes == nil {
+		return nil
+	}
+
+	return c.splitBytes[k]
+}
+
+// cellsAt is the read-only per-row view of byte column k in whichever form it holds.
+func (c *recordCols) cellsAt(k int) cells {
+	if sc := c.splitAt(k); sc != nil {
+		return cells{split: sc}
+	}
+
+	return cells{flat: &c.bytes[k]}
 }
 
 // ensureI64 returns s truncated to length 0 if it already has capacity for n, else a fresh slice
@@ -228,6 +293,10 @@ func ensureI64(s []int64, n int) []int64 {
 
 // byteSize returns the in-flight memory the buffer holds: its timestamps, int columns, and the
 // blob bytes of its byte columns (the basis for the head's MaxInFlightBytes accounting after a trim).
+//
+// A split byte column reports its *expanded* bytes, not its id array — see [splitCol]. The merge
+// calls this once per stream, which is why the split total is maintained on append rather than
+// summed here.
 func (c *recordCols) byteSize() int64 {
 	n := int64(8 * len(c.ts))
 	for k := range c.ints {
@@ -235,6 +304,12 @@ func (c *recordCols) byteSize() int64 {
 	}
 
 	for k := range c.bytes {
+		if sc := c.splitAt(k); sc != nil {
+			n += sc.bytes
+
+			continue
+		}
+
 		n += c.bytes[k].byteSize()
 	}
 
@@ -254,6 +329,12 @@ func (c *recordCols) rowBytes(i int) int64 {
 	}
 
 	for k := range c.bytes {
+		if sc := c.splitAt(k); sc != nil {
+			n += int64(len(sc.at(i)))
+
+			continue
+		}
+
 		n += int64(len(c.bytes[k].at(i)))
 	}
 
@@ -291,7 +372,8 @@ func errColumnTooLarge(name string) error {
 // with every part a stream appears in, so neither [headByteCap] nor the part format bounds it.
 func (c *recordCols) appendRangeOverflows(src *recordCols, lo, hi int) (string, bool) {
 	for k := range c.bytes {
-		if c.sel.bytes[k] && c.bytes[k].appendRangeOverflows(&src.bytes[k], lo, hi) {
+		// A split column holds no blob, so no int32 offset can overflow.
+		if c.sel.bytes[k] && c.splitAt(k) == nil && c.bytes[k].appendRangeOverflows(&src.bytes[k], lo, hi) {
 			return c.schema.byteColumn(k).Name, true
 		}
 	}
@@ -312,9 +394,19 @@ func (c *recordCols) appendRange(src *recordCols, lo, hi int) {
 	}
 
 	for k := range c.bytes {
-		if c.sel.bytes[k] {
-			c.bytes[k].appendRange(&src.bytes[k], lo, hi)
+		if !c.sel.bytes[k] {
+			continue
 		}
+
+		// Both buffers of a merge are armed with the same union dictionaries, so the ids move across
+		// unchanged.
+		if sc := c.splitAt(k); sc != nil {
+			sc.appendIDs(src.splitBytes[k].ids[lo:hi])
+
+			continue
+		}
+
+		c.bytes[k].appendRange(&src.bytes[k], lo, hi)
 	}
 }
 
@@ -332,9 +424,17 @@ func (c *recordCols) keep(lo, hi int) {
 	}
 
 	for k := range c.bytes {
-		if c.sel.bytes[k] {
-			c.bytes[k].keep(lo, hi)
+		if !c.sel.bytes[k] {
+			continue
 		}
+
+		if sc := c.splitAt(k); sc != nil {
+			sc.keep(lo, hi)
+
+			continue
+		}
+
+		c.bytes[k].keep(lo, hi)
 	}
 }
 
@@ -412,6 +512,12 @@ func (c *recordCols) sortByTs() {
 
 	for k := range c.bytes {
 		if !c.sel.bytes[k] {
+			continue
+		}
+
+		if sc := c.splitAt(k); sc != nil {
+			sc.permute(idx)
+
 			continue
 		}
 

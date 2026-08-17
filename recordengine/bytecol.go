@@ -163,6 +163,45 @@ func (b *byteCol) views(dst [][]byte) [][]byte {
 	return dst
 }
 
+// cells is a read-only per-row view of one byte column of a [recordCols], over either the flat
+// offsets+blob form or the merge's split (dictionary + ids) form ([splitCol]), so a consumer that
+// walks a column's values sees the same bytes through either.
+//
+// Every walk takes it by pointer: [bloomBuilder.build] copies it once into the builder and the
+// per-row consumers read it from there. That is not a style choice — the bloom build captures the
+// view in a per-row closure, and passing it by value costs 6–8% of a build that is ~20% of merge
+// CPU, where a pointer costs exactly what the *byteCol it replaces did.
+type cells struct {
+	flat  *byteCol
+	split *splitCol
+}
+
+func (c *cells) rows() int {
+	if c.split != nil {
+		return c.split.rows()
+	}
+
+	return c.flat.rows()
+}
+
+func (c *cells) at(i int) []byte {
+	if c.split != nil {
+		return c.split.at(i)
+	}
+
+	return c.flat.at(i)
+}
+
+// byteSize is the column's expanded value bytes — for the split form the sum of its rows' entry
+// lengths, not the id array. Consumers size their work by the data they will walk.
+func (c *cells) byteSize() int64 {
+	if c.split != nil {
+		return c.split.bytes
+	}
+
+	return c.flat.byteSize()
+}
+
 // permuteBytesInto fills dst with src's cells reordered by idx (used by the ts sort), reusing dst's
 // backing arrays. A permutation cannot be done in place, so the sort swaps the two columns rather
 // than allocating a fresh one per sort.

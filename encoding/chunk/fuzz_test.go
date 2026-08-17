@@ -308,3 +308,59 @@ func decodeSeedToStrings(seed []byte, maxStrings, maxLen int) [][]byte {
 }
 
 func isNaN(f float64) bool { return f != f }
+
+// FuzzEncodeBytesDict fuzzes the split-form encode against the value-hashing one: byte-identical
+// output for the same rows, and a stream that decodes back to those rows.
+func FuzzEncodeBytesDict(f *testing.F) {
+	f.Add([]byte("a"), []byte{0})
+	f.Add([]byte("a\x00bb\x00ccc"), []byte{0, 1, 2, 2, 0})
+	f.Add([]byte("dup\x00dup\x00x"), []byte{0, 1, 2, 1})
+	f.Add([]byte("svc\x00"), []byte{0, 0, 0, 0, 0, 0, 0, 0})
+
+	f.Fuzz(func(t *testing.T, seed, idSeed []byte) {
+		entries, _ := dedupEntries(decodeSeedToStrings(seed, 64, 16))
+		if len(entries) == 0 {
+			t.Skip("no entries")
+		}
+
+		ids := make([]int32, len(idSeed))
+		for i, b := range idSeed {
+			ids[i] = int32(int(b) % len(entries))
+		}
+
+		cells := materializeDict(entries, ids)
+
+		enc := EncodeBytesDict(nil, entries, ids)
+		if want := EncodeBytes(nil, cells); !bytes.Equal(enc, want) {
+			t.Fatalf("EncodeBytesDict output differs from EncodeBytes")
+		}
+
+		lo := len(ids) / 3
+		hi := len(ids) - len(ids)/4
+
+		if want := EncodeBytes(nil, cells[lo:hi]); !bytes.Equal(
+			EncodeBytesDictRange(nil, entries, ids, lo, hi), want,
+		) {
+			t.Fatalf("EncodeBytesDictRange output differs from EncodeBytes over [%d,%d)", lo, hi)
+		}
+
+		got, consumed, err := DecodeBytes(nil, enc)
+		if err != nil {
+			t.Fatalf("DecodeBytes: %v", err)
+		}
+
+		if consumed != len(enc) {
+			t.Fatalf("DecodeBytes consumed = %d, want %d", consumed, len(enc))
+		}
+
+		if len(got) != len(cells) {
+			t.Fatalf("len = %d, want %d", len(got), len(cells))
+		}
+
+		for i := range cells {
+			if !bytes.Equal(got[i], cells[i]) {
+				t.Fatalf("row %d = %q, want %q", i, got[i], cells[i])
+			}
+		}
+	})
+}
