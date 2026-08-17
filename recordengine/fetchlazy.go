@@ -360,7 +360,7 @@ func (p *fetchPlan) readPartsLazy(ctx context.Context) error {
 	for _, part := range p.liveParts {
 		// Granules the requested streams' rows occupy that the window can intersect; nil when
 		// nothing prunes, which keeps the whole-column decode on its simpler path.
-		blocks := part.windowGranules(ctx, p.ids, p.idLookupSet(), p.start, p.end)
+		blocks := part.windowGranules(ctx, p.sortedIDs, p.start, p.end)
 
 		lz, err := part.readLazyConds(ctx, p.condSel, p.conds, p.e.getI64, blocks)
 		if err != nil {
@@ -419,13 +419,11 @@ func (p *fetchPlan) scanMatches(part *part, lz *lazyCols) bool {
 	evals := p.compileConds(lz)
 	p.hits, p.hitRuns = p.hits[:0], p.hitRuns[:0]
 
-	for _, id := range p.ids {
-		rng, ok := part.ranges[id]
-		if !ok {
-			continue
-		}
+	p.matched = part.heldStreams(p.matched[:0], p.sortedIDs)
 
-		w := tsWindow(lz.ts, rng, p.start, p.end)
+	for _, sr := range p.matched {
+		id := sr.id
+		w := tsWindow(lz.ts, sr.rowRange, p.start, p.end)
 		lo := len(p.hits)
 
 		for i := w.start; i < w.end; i++ {

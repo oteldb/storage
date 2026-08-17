@@ -841,7 +841,7 @@ func (e *Engine) streamInRangeLocked(id signal.SeriesID, start, end int64) bool 
 	}
 
 	for _, p := range e.parts {
-		if rng, ok := p.ranges[id]; ok && rng.start < rng.end && p.maxTime >= start && p.minTime <= end {
+		if rng, ok := p.lookup(id); ok && rng.start < rng.end && p.maxTime >= start && p.minTime <= end {
 			return true
 		}
 	}
@@ -895,10 +895,12 @@ type fetchPlan struct {
 	evalScratch []condEval
 	memoScratch [][]uint8
 
-	// idLookup is ids as a set, built once on first use and reused across parts. Granule selection
-	// needs membership tests per part; building the set per part would cost exactly what the set is
-	// there to avoid (see [part.windowGranules]).
-	idLookup map[signal.SeriesID]struct{}
+	// sortedIDs is ids in ascending id order, sorted once per query: every per-part stream resolution
+	// is a merge-join against the part's own sorted stream list (see [part.heldStreams]).
+	sortedIDs []signal.SeriesID
+
+	// matched is the per-part merge-join result, reused across parts.
+	matched []streamRange
 
 	// Top-N scan (see limitscan.go): limit/reverse mirror the request, and partsSkippedLimit counts
 	// the live parts the watermark let the scan stop before reading.
@@ -954,6 +956,15 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) (*fetchPlan, 
 
 	p.partsTotal = len(e.parts)
 
+	// Resolving the query's streams against a part is the whole cost of planning a fetch on a
+	// fragmented store (parts × streams). Sorting the ids once turns each part's resolution into a
+	// merge-join that both selects the part and sizes its contribution in one pass, so no (part,
+	// stream) pair is resolved twice.
+	p.sortedIDs = slices.Clone(ids)
+	slices.SortFunc(p.sortedIDs, signal.SeriesID.Compare)
+
+	partRows := make([]int, len(p.sortedIDs))
+
 	for _, part := range e.parts {
 		rows := int64(part.reader.RowCount()) // cached from the manifest at part-open; no extra I/O
 		p.rowsTotal += rows
@@ -963,23 +974,17 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) (*fetchPlan, 
 			p.partsPrunedTime++
 		case r.AllConditions && !part.mayContain(r.Conditions): // bloom-prune
 			p.partsPrunedBloom++
-		case part.holdsAny(ids):
+		case p.sizeStreams(part, partRows):
 			part.acquire()
 			p.liveParts = append(p.liveParts, part)
 			p.rowsLive += rows
 		}
 	}
 
-	for _, id := range ids {
-		n := e.head.recordCount(id)
+	for k, id := range p.sortedIDs {
+		n := partRows[k] + e.head.recordCount(id)
 		if buf := e.flushing[id]; buf != nil {
 			n += buf.len()
-		}
-
-		for _, part := range p.liveParts {
-			if rng, ok := part.ranges[id]; ok {
-				n += rng.end - rng.start
-			}
 		}
 
 		var acc *recordCols
@@ -1014,6 +1019,42 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) (*fetchPlan, 
 	return p, nil
 }
 
+// sizeStreams merge-joins the plan's sorted ids against part's stream list, adding each held
+// stream's row count to rows (indexed by position in [fetchPlan.sortedIDs]), and reports whether the
+// part holds any requested stream — i.e. whether it is live for this fetch. A part that holds none
+// leaves rows untouched.
+func (p *fetchPlan) sizeStreams(part *part, rows []int) bool {
+	rs := part.ranges
+	if len(rs) == 0 || len(p.sortedIDs) == 0 {
+		return false
+	}
+
+	// Disjoint id spaces are the common case in a fragmented store: reject the part before walking
+	// either list.
+	if p.sortedIDs[len(p.sortedIDs)-1].Compare(rs[0].id) < 0 || p.sortedIDs[0].Compare(rs[len(rs)-1].id) > 0 {
+		return false
+	}
+
+	held, j := false, 0
+
+	for k, id := range p.sortedIDs {
+		for j < len(rs) && rs[j].id.Compare(id) < 0 {
+			j++
+		}
+
+		if j == len(rs) {
+			break
+		}
+
+		if rs[j].id == id {
+			rows[k] += rs[j].end - rs[j].start
+			held = true
+		}
+	}
+
+	return held
+}
+
 // readParts decodes each acquired part (only the referenced columns — lazy decode) and appends its
 // in-window rows to the per-stream accumulators. Runs lock-free: the parts are immutable and ref-held.
 func (p *fetchPlan) readParts(ctx context.Context) error {
@@ -1029,22 +1070,26 @@ func (p *fetchPlan) readParts(ctx context.Context) error {
 	}
 
 	for i, part := range p.liveParts {
-		cols, err := part.readCols(ctx, p.sel, p.e.getI64, part.windowGranules(ctx, p.ids, p.idLookupSet(), p.start, p.end))
+		cols, err := part.readCols(ctx, p.sel, p.e.getI64, part.windowGranules(ctx, p.sortedIDs, p.start, p.end))
 		if err != nil {
 			return err
 		}
 
-		for _, id := range p.ids {
-			acc := p.accs[id]
-			if rng, ok := part.ranges[id]; ok && acc != nil {
-				n := acc.len()
-				if err := appendWindowRows(acc, cols, rng, p.start, p.end); err != nil {
-					return err
-				}
+		p.matched = part.heldStreams(p.matched[:0], p.sortedIDs)
 
-				if p.wm != nil {
-					p.wm.add(acc.ts[n:])
-				}
+		for _, sr := range p.matched {
+			acc := p.accs[sr.id]
+			if acc == nil {
+				continue
+			}
+
+			n := acc.len()
+			if err := appendWindowRows(acc, cols, sr.rowRange, p.start, p.end); err != nil {
+				return err
+			}
+
+			if p.wm != nil {
+				p.wm.add(acc.ts[n:])
 			}
 		}
 

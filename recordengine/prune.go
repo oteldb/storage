@@ -114,8 +114,8 @@ func (e *Engine) liveIdentitiesLocked() map[signal.SeriesID]struct{} {
 	live := make(map[signal.SeriesID]struct{})
 
 	for _, p := range e.parts {
-		for id := range p.ranges {
-			live[id] = struct{}{}
+		for _, sr := range p.ranges {
+			live[sr.id] = struct{}{}
 		}
 	}
 

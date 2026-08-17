@@ -335,7 +335,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 		// Oldest → newest part order; records are append-only (no dedup), so the stream is just
 		// concatenated across parts and re-sorted by ts below.
 		for i, p := range src {
-			rng, ok := p.ranges[id]
+			rng, ok := p.lookup(id)
 			if !ok {
 				continue
 			}

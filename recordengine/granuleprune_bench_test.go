@@ -62,7 +62,7 @@ func BenchmarkGranulePrunedFetch(b *testing.B) {
 		{"tenth", 0, rows / 10},
 		{"hundredth", 0, rows / 100},
 	} {
-		blocks := p.windowGranules(ctx, ids, nil, w.lo, w.hi)
+		blocks := p.windowGranules(ctx, ids, w.lo, w.hi)
 		b.Run(fmt.Sprintf("%s_%dof%d", w.name, len(blocks), total), func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {

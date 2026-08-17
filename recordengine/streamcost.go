@@ -220,8 +220,8 @@ func (pl *costPlanner) planPart(p *part) []streamSpan {
 
 	ss := make([]streamSpan, 0, len(p.ranges))
 
-	for id, r := range p.ranges {
-		pl.keyBuf = pl.e.groupKeyLocked(pl.keyBuf[:0], id, pl.groupBy)
+	for _, sr := range p.ranges {
+		pl.keyBuf = pl.e.groupKeyLocked(pl.keyBuf[:0], sr.id, pl.groupBy)
 
 		gi, ok := pl.byKey[string(pl.keyBuf)]
 		if !ok {
@@ -231,9 +231,9 @@ func (pl *costPlanner) planPart(p *part) []streamSpan {
 		}
 
 		pl.groups[gi].streams++
-		pl.groups[gi].rows += int64(r.end - r.start)
+		pl.groups[gi].rows += int64(sr.end - sr.start)
 
-		ss = append(ss, streamSpan{rowRange: r, group: gi})
+		ss = append(ss, streamSpan{rowRange: sr.rowRange, group: gi})
 	}
 
 	return ss

@@ -187,8 +187,8 @@ func capGroup(group []*part, capBytes int64) []*part {
 func idSetOf(parts []*part) []signal.SeriesID {
 	set := make(map[signal.SeriesID]struct{})
 	for _, p := range parts {
-		for id := range p.ranges {
-			set[id] = struct{}{}
+		for _, sr := range p.ranges {
+			set[sr.id] = struct{}{}
 		}
 	}
 

@@ -15,7 +15,7 @@ import (
 func partOfSize(seq int, bytes int64) *part {
 	return &part{
 		prefix:   string(rune('a' + seq)),
-		ranges:   map[signal.SeriesID]rowRange{{Hi: uint64(seq)}: {start: 0, end: 1}},
+		ranges:   []streamRange{{id: signal.SeriesID{Hi: uint64(seq)}, rowRange: rowRange{start: 0, end: 1}}},
 		rawBytes: bytes,
 	}
 }
@@ -48,7 +48,7 @@ func TestPartSizeBytesFallsBackToRows(t *testing.T) {
 	sized := partOfSize(0, 4096)
 	assert.Equal(t, int64(4096), sized.sizeBytes())
 
-	legacy := &part{ranges: map[signal.SeriesID]rowRange{{Hi: 1}: {start: 0, end: 10}}}
+	legacy := &part{ranges: []streamRange{{id: signal.SeriesID{Hi: 1}, rowRange: rowRange{start: 0, end: 10}}}}
 	assert.Equal(t, int64(10*recordRowBytes), legacy.sizeBytes())
 }
 
