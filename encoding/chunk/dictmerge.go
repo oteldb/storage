@@ -27,6 +27,13 @@ type DictMerger struct {
 	flat    [][]byte
 	isFlat  bool
 
+	// A column-wide dictionary registered once by [DictMerger.SeedShared], so the granules encoded
+	// against it append through sharedRemap instead of re-merging its entries. sharedEntries is kept
+	// for the flat form, which needs the values themselves rather than ids.
+	sharedEntries [][]byte
+	sharedRemap   []int32
+	seeded        bool
+
 	// scatter mode: the result spans the whole column and each granule lands at its own offset. See
 	// [DictMerger.Scatter].
 	scatter bool
@@ -67,6 +74,71 @@ func (d *DictMerger) Reset() {
 
 	d.entries, d.ids, d.flat, d.isFlat = d.entries[:0], d.ids[:0], d.flat[:0], false
 	d.scatter, d.rows, d.at = false, 0, 0
+	d.sharedEntries, d.sharedRemap, d.seeded = nil, d.sharedRemap[:0], false
+}
+
+// SeedShared registers a column-wide dictionary, remapping its entries into the merge once so that
+// every granule encoded against it costs an id lookup per row and no hashing at all. Idempotent:
+// only the first call for a merge does the work.
+//
+// This is what keeps a column that mixes both granule modes off a cliff. Without it, a granule
+// carrying the shared dictionary as its own reaches [DictMerger.Append], which hashes every entry of
+// it — so a column with one self-encoded granule paid granules x sharedEntries probes (measured:
+// 2.4M for a 40-granule, 60509-entry attributes column, against zero for the same column with no
+// self-encoded granule).
+//
+// Call it before appending the first shared granule, not at the start of the merge: seeding assigns
+// ids, so seeding a selection that turns out to hold no shared granule would put unreferenced entries
+// in the merged dictionary.
+func (d *DictMerger) SeedShared(entries [][]byte) {
+	if d.seeded {
+		return
+	}
+
+	d.seeded, d.sharedEntries = true, entries
+
+	if d.isFlat {
+		return // the flat form reads sharedEntries directly; no ids to assign
+	}
+
+	d.initMap()
+
+	if cap(d.sharedRemap) < len(entries) {
+		d.sharedRemap = make([]int32, len(entries))
+	}
+
+	d.sharedRemap = d.sharedRemap[:len(entries)]
+
+	for i, e := range entries {
+		id, ok := d.m.Get(e)
+		if !ok {
+			// Same ceiling as [DictMerger.Append]: past it the merge cannot address an entry, so it
+			// degrades and the shared granules materialize their values like any flat source.
+			if len(d.entries) >= maxDictEntries {
+				d.degrade()
+
+				return
+			}
+
+			id = len(d.entries)
+			d.m.Put(e, id)
+			d.entries = append(d.entries, e)
+		}
+
+		d.sharedRemap[i] = int32(id)
+	}
+}
+
+// AppendShared adds rows of a granule encoded as ids into the dictionary given to
+// [DictMerger.SeedShared]. ids is the granule's packed big-endian id array at idWidth bytes per row;
+// every id must be within the seeded dictionary, which the caller validates.
+func (d *DictMerger) AppendShared(ids []byte, idWidth, rows int) {
+	d.appendShared(ids, idWidth, rows, -1)
+}
+
+// AppendSharedAt is [DictMerger.AppendShared] landing at row offset off. Scatter mode only.
+func (d *DictMerger) AppendSharedAt(ids []byte, idWidth, rows, off int) {
+	d.appendShared(ids, idWidth, rows, off)
 }
 
 // AppendAt adds every row of c to the merge, landing at row offset off. Scatter mode only.
@@ -91,12 +163,18 @@ func (d *DictMerger) Append(c *DictColumn) {
 		d.degrade()
 	}
 
-	// A granule whose dictionary holds one entry per row has no internal repeats. Merging it can
-	// only pay if its values repeat in *other* granules — and the writer already decided they do
-	// not, since it self-encoded rather than joining the column's shared dictionary. Probing every
-	// value into the merge would build a dictionary the size of the column and then degrade anyway,
-	// which is what a near-unique column (a log body) did on every whole-column decode.
-	if c.IDWidth > 0 && len(c.Entries) == rows {
+	// A granule whose dictionary holds one entry per row has no internal repeats, so merging it can
+	// only pay if its values repeat in *other* granules — and with no seeded dictionary to repeat
+	// into, they cannot: probing every value would build a dictionary the size of the column and then
+	// degrade anyway, which is what a near-unique column (a log body) did on every whole-column
+	// decode.
+	//
+	// A seeded merge is the opposite case. Its other granules index a column-wide dictionary, so
+	// flattening for the sake of one unique granule discards *their* ids too — every row of the column
+	// loses the per-distinct-entry predicate memo because one granule in forty had no repeats. There
+	// the unique granule's entries are merged like any others and the ceiling below decides, which it
+	// can do exactly.
+	if c.IDWidth > 0 && len(c.Entries) == rows && !d.seeded {
 		d.degrade()
 	}
 
@@ -106,31 +184,29 @@ func (d *DictMerger) Append(c *DictColumn) {
 		return
 	}
 
-	if d.m == nil {
-		d.m = pool.NewByteIntMap()
+	// Decided before the entry loop rather than inside it: a granule that cannot fit whatever room is
+	// left would otherwise be hashed entry by entry until it tripped the same ceiling, and every probe
+	// up to that point is discarded by the degrade. Both counts are known here.
+	if len(d.entries)+len(c.Entries) > maxDictEntries {
+		d.degrade()
+		d.putFlat(c, rows)
 
-		// Scatter mode reserves id 0 for the rows no granule covers, so a skipped row decodes to an
-		// empty value rather than indexing past the dictionary.
-		if d.scatter && len(d.entries) == 0 {
-			d.entries = append(d.entries, nil)
-			d.m.Put(nil, 0)
-		}
+		return
 	}
+
+	// Scatter mode reserves id 0 for the rows no granule covers, so a skipped row decodes to an empty
+	// value rather than indexing past the dictionary.
+	d.initMap()
 
 	// Remap the granule's local ids to global ones once per *entry*, not per row: a granule's rows
 	// index a dictionary of at most 65536 entries, so the per-row loop below is an array lookup.
 	local := make([]int32, len(c.Entries))
 
+	// No ceiling check in the loop: the guard above admitted the granule's whole entry table, so the
+	// dictionary cannot overflow inside it.
 	for i, e := range c.Entries {
 		id, ok := d.m.Get(e)
 		if !ok {
-			if len(d.entries) >= maxDictEntries {
-				d.degrade()
-				d.putFlat(c, rows)
-
-				return
-			}
-
 			id = len(d.entries)
 			d.m.Put(e, id)
 			d.entries = append(d.entries, e)
@@ -189,6 +265,67 @@ func (d *DictMerger) Build() *DictColumn {
 	}
 
 	return &DictColumn{Entries: d.entries, IDs: ids, IDWidth: 2}
+}
+
+func (d *DictMerger) appendShared(ids []byte, idWidth, rows, off int) {
+	if rows == 0 {
+		return
+	}
+
+	if d.isFlat {
+		if d.scatter {
+			d.grow(off, rows)
+
+			for r := range rows {
+				d.flat[off+r] = d.sharedEntries[sharedID(ids, idWidth, r)]
+			}
+
+			return
+		}
+
+		for r := range rows {
+			d.flat = append(d.flat, d.sharedEntries[sharedID(ids, idWidth, r)])
+		}
+
+		return
+	}
+
+	if d.scatter {
+		d.grow(off, rows)
+
+		for r := range rows {
+			d.ids[off+r] = d.sharedRemap[sharedID(ids, idWidth, r)]
+		}
+
+		return
+	}
+
+	for r := range rows {
+		d.ids = append(d.ids, d.sharedRemap[sharedID(ids, idWidth, r)])
+	}
+}
+
+// sharedID reads row r out of a packed big-endian id array.
+func sharedID(ids []byte, idWidth, r int) int {
+	if idWidth == 1 {
+		return int(ids[r])
+	}
+
+	return int(uint16(ids[r*2])<<8 | uint16(ids[r*2+1]))
+}
+
+// initMap arms the entry map, reserving scatter mode's sentinel id 0 (see [DictMerger.Append]).
+func (d *DictMerger) initMap() {
+	if d.m != nil {
+		return
+	}
+
+	d.m = pool.NewByteIntMap()
+
+	if d.scatter && len(d.entries) == 0 {
+		d.entries = append(d.entries, nil)
+		d.m.Put(nil, 0)
+	}
 }
 
 // putFlat writes c's rows into the flat form, at the granule's own offset in scatter mode.

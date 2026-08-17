@@ -122,6 +122,39 @@ unframed or constant column reports one extent covering every row, so the caller
 case; the extents' bytes sum to less than `ObjectBytes` by the directory and any shared dictionary,
 which belong to no single frame.
 
+### Decoding a shared-dictionary column
+
+Granules that encode ids into the column-wide dictionary decode by copying those ids
+(`decodeSharedIDs`): no per-granule dictionary, no hashing, one reusable decompression buffer. A
+granule that declined it carries its own stream, so a column mixing both modes cannot take that path
+for the whole selection and merges through `chunk.DictMerger` instead.
+
+That merge is seeded with the column dictionary once (`DictMerger.SeedShared`), after which a shared
+granule costs one array lookup per row. Seeding is what makes the mixed path a *constant* extra cost
+rather than a cliff: without it each shared granule reached the merge carrying the whole column
+dictionary as its own, and the merge hashed every entry of it once **per granule** — granules ×
+entries probes, against zero on the fast path.
+
+| whole-column decode, 40 granules × 1024 rows | unseeded | seeded |
+|---|---:|---:|
+| every granule shares (fast path, unchanged) | 259 µs | 259 µs |
+| one self-encoded granule | 7.48 ms | 1.21 ms |
+| five self-encoded granules | 5.84 ms | 1.40 ms |
+
+On real p90 columns: attributes 42.3 ms → 28.1 ms, bodies 5.88 ms → 2.73 ms. The seed is lazy — it
+runs on the first shared granule of a selection, not at the start of the merge, so a selection holding
+only self-encoded granules puts no unreferenced entries in the merged dictionary.
+
+A seeded merge also keeps the dictionary where an unseeded one would abandon it. `DictMerger.Append`
+flattens on a granule holding one entry per row — with nothing to repeat into, merging it would build a
+column-sized dictionary and then overflow anyway — but that reasoning inverts once a column-wide
+dictionary is seeded: the other granules index it, so flattening for one unique granule takes *their*
+ids away too, and with them the per-distinct-entry predicate memo for every row of the column. Seeded,
+the unique granule's entries are merged like any others and only the 65536-entry ceiling flattens the
+result. Measured on a real attributes column, whole-column decode: 324699 flat rows before, a
+60509-entry dictionary after — 5.4x fewer predicate evaluations for a scan that filters on it, and
+1.5 MB of entry headers instead of 7.8 MB.
+
 ## Two writers
 
 `PartWriter` takes whole columns and serializes them in one pass. `StreamWriter` builds the same
