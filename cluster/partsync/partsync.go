@@ -296,6 +296,11 @@ type Stats struct {
 	CopiedBytes int64
 	// Pruned is the number of stale local objects deleted.
 	Pruned int
+	// Withheld is the number of local objects a prune declined to delete because nothing
+	// authorized it: their part is absent from the peer's index and the peer did not say it
+	// removed one. That is a peer missing data it should hold, so a non-zero value is a repair
+	// signal, not a tuning knob.
+	Withheld int
 }
 
 // Totals is a Syncer's cumulative activity across every prefix and pass, for the operator
@@ -311,6 +316,10 @@ type Totals struct {
 	CopiedBytes int64
 	// Pruned is the stale local objects deleted (after the quarantine delay).
 	Pruned int64
+	// Withheld is the local objects a prune declined to delete because no peer claimed to have
+	// removed their part — a peer missing data it should hold. It is a repair signal: steady
+	// state is zero, and a value that keeps climbing names a damaged owner.
+	Withheld int64
 	// Errors is the passes that failed part-way (retried by the next maintenance tick).
 	Errors int64
 	// LastSyncUnixNano is the wall-clock completion time of the most recent mirroring pass
@@ -389,6 +398,7 @@ func (s *Syncer) account(st Stats, err error) {
 	s.totals.Copied += int64(st.Copied)
 	s.totals.CopiedBytes += st.CopiedBytes
 	s.totals.Pruned += int64(st.Pruned)
+	s.totals.Withheld += int64(st.Withheld)
 
 	switch {
 	case err != nil:
@@ -469,13 +479,73 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 		st.CopiedBytes += int64(len(peerIndexRaw))
 	}
 
-	if err := s.prune(ctx, &st, enginePrefix, keep, livePartSet(peerIndex, localIndex, supersedes)); err != nil {
+	del := deletion{
+		live:    livePartSet(peerIndex, localIndex, supersedes),
+		removed: peerIndex.Removals(),
+		stated:  peerIndex.RecordsRemovals(),
+	}
+	if err := s.prune(ctx, &st, enginePrefix, keep, del); err != nil {
 		return st, err
 	}
 
 	st.Synced = newer || st.Copied > 0 || st.Pruned > 0
 
 	return st, nil
+}
+
+// deletion is what a pass is allowed to delete, which is a narrower question than what it is
+// worth mirroring.
+//
+// live are the parts to protect outright. removed are the parts the peer *said* it removed; a
+// part absent from both is one the peer no longer has and never claimed to have dropped, which is
+// a peer missing data rather than an instruction. stated reports whether the peer records removals
+// at all — an index predating the format states none, and there absence is all there is to go on,
+// which is the pre-tombstone behavior kept for the transition.
+type deletion struct {
+	live    map[string]struct{}
+	removed map[string]struct{}
+	stated  bool
+}
+
+// authorizes reports whether key may be considered for deletion at all.
+func (d deletion) authorizes(key, enginePrefix string) bool {
+	part := partOf(key, enginePrefix)
+	if part == "" {
+		// Not a part object — the bucket index, an engine sidecar. Those are reconciled by the
+		// peer's listing alone, as they always were: they have no part to be tombstoned.
+		return true
+	}
+
+	if _, ok := d.live[part]; ok {
+		return false
+	}
+
+	if !d.stated {
+		return true
+	}
+
+	_, ok := d.removed[part]
+
+	return ok
+}
+
+// partOf returns the part prefix key belongs to, or "" for an object that belongs to no part.
+func partOf(key, enginePrefix string) string {
+	if part, _, ok := strings.Cut(key, shardMarker); ok {
+		return part
+	}
+
+	rest, ok := strings.CutPrefix(key, enginePrefix+"/")
+	if !ok {
+		return ""
+	}
+
+	seg, _, ok := strings.Cut(rest, "/")
+	if !ok {
+		return "" // a direct child of the engine prefix is a sidecar, not a part.
+	}
+
+	return enginePrefix + "/" + seg
 }
 
 // livePartSet is the set of part prefixes prune must protect: the peer's index when that index
@@ -632,7 +702,7 @@ func classifyFetch(remote []string, enginePrefix, indexKey string, have map[stri
 // prune deletes local objects the peer no longer has, but only after they have been absent for
 // [pruneAfterMisses] consecutive passes — an in-flight reader gets a full maintenance cycle to
 // drain before a superseded part's objects go away.
-func (s *Syncer) prune(ctx context.Context, st *Stats, enginePrefix string, keep KeepFunc, liveParts map[string]struct{}) error {
+func (s *Syncer) prune(ctx context.Context, st *Stats, enginePrefix string, keep KeepFunc, del deletion) error {
 	local, err := s.local.List(ctx, enginePrefix)
 	if err != nil {
 		return errors.Wrap(err, "list local for prune")
@@ -642,7 +712,10 @@ func (s *Syncer) prune(ctx context.Context, st *Stats, enginePrefix string, keep
 	ps := s.stateFor(enginePrefix)
 	remote, counts := ps.remote, ps.miss
 
-	var doomed []string
+	var (
+		doomed   []string
+		withheld int
+	)
 
 	seen := make(map[string]struct{}, len(local))
 
@@ -659,8 +732,19 @@ func (s *Syncer) prune(ctx context.Context, st *Stats, enginePrefix string, keep
 		//     after churn (bounded by part turnover), reclaimed when the part is superseded.
 		// Superseded-part objects (part gone from the index) always fall through to the
 		// remote-absence quarantine below.
-		if livePart(k, liveParts) && (keep(k) || strings.Contains(k, shardMarker)) {
+		if livePart(k, del.live) && (keep(k) || strings.Contains(k, shardMarker)) {
 			delete(counts, k)
+
+			continue
+		}
+
+		// A superseded part's objects fall through to the absence quarantine below only if the
+		// peer actually said it removed the part. Otherwise the peer is missing data it should
+		// hold, and deleting the local copy on that basis is how one node's loss becomes the
+		// cluster's.
+		if !del.authorizes(k, enginePrefix) {
+			delete(counts, k)
+			withheld++
 
 			continue
 		}
@@ -685,6 +769,8 @@ func (s *Syncer) prune(ctx context.Context, st *Stats, enginePrefix string, keep
 		}
 	}
 	s.mu.Unlock()
+
+	st.Withheld += withheld
 
 	for _, k := range doomed {
 		if err := s.local.Delete(ctx, k); err != nil && !errors.Is(err, backend.ErrNotExist) {
