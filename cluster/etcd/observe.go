@@ -4,7 +4,6 @@ import (
 	"context"
 	"path"
 
-	"github.com/go-faster/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -27,24 +26,16 @@ func Watch(ctx context.Context, client *clientv3.Client, root string) (*Membersh
 
 	// Snapshot first, then watch from the snapshot revision, so no change falls into the gap
 	// between the two — the same ordering [Join] relies on.
-	resp, err := client.Get(ctx, prefix, clientv3.WithPrefix())
+	rev, err := m.resync(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "list members")
+		return nil, err
 	}
-
-	for _, kv := range resp.Kvs {
-		if mem, err := decodeMember(kv.GetValue()); err == nil {
-			m.members[mem.ID] = mem
-		}
-	}
-
-	m.rebuild()
 
 	bg, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	m.wg.Add(1)
 
-	go m.watch(bg, resp.Header.GetRevision()+1) //nolint:contextcheck // lifetime-scoped, as in Join
+	go m.watch(bg, rev) //nolint:contextcheck // lifetime-scoped, as in Join
 
 	return m, nil
 }

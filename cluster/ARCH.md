@@ -37,6 +37,16 @@ event, which is a contradiction) and re-registers under a fresh lease, with back
 claims hang off that lease, so `Membership.OnRejoin` rebinds `Ownership` to the new one
 (`SetLease`, which also drops the held set the dead lease took with it).
 
+The **watch** is maintained the same way. etcd cancels a watch of its own accord — a compacted
+start revision above all, which is what an outage longer than the compaction interval leaves —
+and clientv3 reconnects a broken stream but does not resubscribe a canceled one. A cancellation
+is answered with a fresh snapshot (taken whole: a stream that ended left an unknown number of
+changes unseen) and a new watch from its revision, with backoff; otherwise the member set would
+freeze at its last view and never resynchronize, silently routing to peers that had left. The
+snapshot doubles as a second eviction check, since a key deleted while nothing was watching
+produces no `DELETE` for anyone to see. This applies equally to `Watch` observers, whose only
+membership input is that stream.
+
 An absent node **keeps serving**: it still holds its shards, and a secondary's head is memory-only,
 so restarting it would trade a routing problem for lost writes and a read gap on every node at
 once. The state is reported instead — `ClusterStats.SelfAbsent`/`Rejoins`, the

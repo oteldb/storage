@@ -31,13 +31,14 @@ import (
 // happens. [Join] takes a per-cluster override.
 const DefaultTTL = 30 * time.Second
 
-// Re-registration backoff bounds. The first attempt is immediate — the common case is a lease
-// expiry against a healthy etcd, which one Put repairs — and only repeated failures back off,
-// up to a cap that keeps a long outage cheap without leaving the node absent for long after
-// etcd returns.
+// Recovery backoff bounds, shared by re-registration and watch resynchronization. The first
+// attempt is immediate — the common case is a lease expiry or a stream cancellation against an
+// otherwise healthy etcd, which one round-trip repairs — and only repeated failures back off,
+// up to a cap that keeps a long outage cheap without leaving the node stale for long after etcd
+// returns.
 const (
-	rejoinMinBackoff = 100 * time.Millisecond
-	rejoinMaxBackoff = 5 * time.Second
+	retryMinBackoff = 100 * time.Millisecond
+	retryMaxBackoff = 5 * time.Second
 )
 
 // Member is a cluster node's advertised identity: its ring ID, failure-domain location, and
@@ -214,18 +215,10 @@ func Join(ctx context.Context, client *clientv3.Client, root string, self Member
 
 	// Snapshot the current members, then watch from the snapshot revision so no change is
 	// missed in the gap between the Get and the Watch.
-	resp, err := client.Get(ctx, prefix, clientv3.WithPrefix())
+	rev, err := m.resync(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "list members")
+		return nil, err
 	}
-
-	for _, kv := range resp.Kvs {
-		if mem, err := decodeMember(kv.GetValue()); err == nil {
-			m.members[mem.ID] = mem
-		}
-	}
-
-	m.rebuild()
 
 	// The lease keep-alive and watch must outlive this Join call, so their context is rooted
 	// at Background and scoped to the Membership's own lifetime (canceled by Close), not to
@@ -234,8 +227,8 @@ func Join(ctx context.Context, client *clientv3.Client, root string, self Member
 	m.cancel = cancel
 	m.wg.Add(2)
 
-	go m.maintain(bg)                           //nolint:contextcheck // lifetime-scoped, see above
-	go m.watch(bg, resp.Header.GetRevision()+1) //nolint:contextcheck // lifetime-scoped, see above
+	go m.maintain(bg)   //nolint:contextcheck // lifetime-scoped, see above
+	go m.watch(bg, rev) //nolint:contextcheck // lifetime-scoped, see above
 
 	return m, nil
 }
@@ -379,7 +372,7 @@ func (m *Membership) follow(ctx context.Context) bool {
 func (m *Membership) rejoin(ctx context.Context) bool {
 	old := m.LeaseID()
 
-	for delay := time.Duration(0); ; delay = min(max(delay*2, rejoinMinBackoff), rejoinMaxBackoff) {
+	for delay := time.Duration(0); ; delay = min(max(delay*2, retryMinBackoff), retryMaxBackoff) {
 		if delay > 0 && !sleepCtx(ctx, delay) {
 			return false
 		}
@@ -437,16 +430,118 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// watch applies member PUT/DELETE events to the local set and rebuilds the ring on each
-// change, starting from rev.
+// watch keeps the local member set in step with etcd for as long as it runs. A watch is not a
+// one-shot subscription: etcd cancels one of its own accord — a compacted start revision above
+// all, which is exactly what an outage longer than etcd's compaction interval leaves behind —
+// and clientv3 reconnects a broken stream but does not resubscribe a canceled one. Without this
+// loop the member set would freeze at whatever it last saw and never resynchronize, silently:
+// the node would go on routing to peers that have since left and never see ones that joined.
+//
+// A cancellation is therefore answered with a fresh snapshot and a new watch from its revision,
+// with backoff, rather than with an exit. The snapshot is taken whole because a stream that ends
+// leaves an unknown number of changes unseen, so there is nothing to patch onto.
 func (m *Membership) watch(ctx context.Context, rev int64) {
 	defer m.wg.Done()
 
+	var delay time.Duration
+	for {
+		if rev != 0 {
+			if m.consume(ctx, rev) {
+				// The stream did deliver before it ended, so etcd is not what is failing and
+				// the next attempt need not inherit an earlier failure's backoff.
+				delay = 0
+			}
+
+			if ctx.Err() != nil {
+				return
+			}
+
+			m.logger().Warn("member watch canceled, resynchronizing", zap.Int64("rev", rev))
+
+			rev = 0
+		}
+
+		delay = min(max(delay*2, retryMinBackoff), retryMaxBackoff)
+		if !sleepCtx(ctx, delay) {
+			return
+		}
+
+		next, err := m.resync(ctx)
+		if err != nil {
+			m.logger().Warn("member resynchronization failed", zap.Error(err))
+
+			continue
+		}
+
+		rev = next
+
+		m.logger().Info("member set resynchronized",
+			zap.Int64("rev", rev), zap.Int("members", len(m.Members())))
+		m.checkSelf()
+	}
+}
+
+// resync replaces the local member set with a fresh snapshot and reports the revision to watch
+// from. It is both the initial load and the repair after a cancellation.
+func (m *Membership) resync(ctx context.Context) (int64, error) {
+	resp, err := m.client.Get(ctx, m.prefix, clientv3.WithPrefix())
+	if err != nil {
+		return 0, errors.Wrap(err, "list members")
+	}
+
+	members := make(map[string]Member, len(resp.Kvs))
+
+	for _, kv := range resp.Kvs {
+		if mem, err := decodeMember(kv.GetValue()); err == nil {
+			members[mem.ID] = mem
+		}
+	}
+
+	m.mu.Lock()
+	m.members = members
+	m.mu.Unlock()
+
+	m.rebuild()
+
+	return resp.Header.GetRevision() + 1, nil
+}
+
+// checkSelf signals eviction when this node is missing from a snapshot just taken. The DELETE
+// that removed it may have fallen in the window no watch was covering, and the keep-alive does
+// not cover a key deleted out from under a lease that is otherwise healthy — so a resync is the
+// only place the absence would be noticed at all.
+func (m *Membership) checkSelf() {
+	if m.evicted == nil {
+		return // An observer registers nothing and so cannot be evicted.
+	}
+
+	m.mu.RLock()
+	_, ok := m.members[m.self.ID]
+	m.mu.RUnlock()
+
+	if ok {
+		return
+	}
+
+	m.logger().Warn("absent from resynchronized cluster member set", zap.String("id", m.self.ID))
+
+	select {
+	case m.evicted <- struct{}{}:
+	default:
+	}
+}
+
+// consume applies member PUT/DELETE events to the local set and rebuilds the ring on each
+// change, starting from rev. It returns when the stream ends, reporting whether it delivered
+// anything at all before it did.
+func (m *Membership) consume(ctx context.Context, rev int64) (delivered bool) {
 	wch := m.client.Watch(ctx, m.prefix, clientv3.WithPrefix(), clientv3.WithRev(rev))
 	for resp := range wch {
 		if resp.Canceled {
-			return
+			return delivered
 		}
+
+		delivered = true
 
 		changed := false
 		for _, ev := range resp.Events {
@@ -486,6 +581,8 @@ func (m *Membership) watch(ctx context.Context, rev int64) {
 			m.logger().Info("ring rebuilt", zap.Int("members", len(m.Members())))
 		}
 	}
+
+	return delivered
 }
 
 func (m *Membership) set(mem Member) {
