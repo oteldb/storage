@@ -175,8 +175,9 @@ objects, bucket index after everything**, so the local index only ever reference
 parts (the same commit-point discipline as flush; a crashed sync leaves an orphan retried next
 pass).
 
-**Absence is not an instruction.** Mirroring a peer and obeying its deletions are separate claims,
-and only an index that *supersedes* the local one may do the second. Ordering comes from the bucket
+**Absence is not an instruction.** Mirroring a peer, obeying its deletions, and deleting a
+particular part are three separate claims. Only an index that *supersedes* the local one may do the
+second, and only a part the peer says it **removed** may be deleted at all. Ordering comes from the bucket
 index's commit generation — a `(term, counter)` pair the writing engine stamps on every index write,
 where the term is the etcd revision the writer's compaction claim was created at
 (`Ownership.Acquire`). Neither the part names nor `FlushedEpoch` can play that role: both are
@@ -191,6 +192,18 @@ permanently unable to supersede its own replicas, where reacquiring the shard ra
 the tenure that intervened. An index predating format v3 carries no generation, sorts below every
 one that does, and falls back to the old `maxSeq`/`FlushedEpoch` ranking only when neither side has
 one.
+
+Supersession alone is not enough, because a damaged owner goes on writing: it reloads from what it
+has left and flushes again, and those writes legitimately supersede while legitimately not naming
+the part it lost. So the index also carries **tombstones** — each removed part and the generation
+that removed it — recorded by the engine from the diff against the index it last wrote. Pruning
+requires one: a part absent from a peer's index that the peer never claimed to have removed is a
+peer missing data, and its objects are withheld and counted (`Stats.Withheld`, a repair signal that
+is zero in steady state) rather than deleted. This is the shape Mimir gets from `deletion-mark.json`
+and ClickHouse from an explicit `DROP_RANGE`; with no shared bucket to hold it, the statement rides
+in the index. Tombstones are bounded (`bucketindex.MaxRemovals`, newest kept), so a replica further
+behind than that keeps garbage instead of guessing, and a legacy index states no removals at all,
+where absence is all there is and the pre-tombstone behavior stands.
 
 The engine layer is untouched: partsync moves objects, then the ordinary `RefreshReplica`/
 `LoadParts` path loads them. Because the head is trimmed only below parts the engine actually

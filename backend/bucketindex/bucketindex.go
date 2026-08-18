@@ -45,6 +45,9 @@ type Index struct {
 	// Zero in an index written before format v3, which is below every generation a writer
 	// produces. Added in format v3.
 	Generation Generation
+	// Removed are the parts this writer deliberately took out, newest-bounded — see [Removal].
+	// Kept sorted by prefix. Added in format v3.
+	Removed []Removal
 }
 
 // Add inserts e, replacing any existing entry with the same prefix, keeping the index sorted.
@@ -90,7 +93,9 @@ func (ix *Index) Overlapping(start, end int64) []Entry {
 
 const (
 	magic0, magic1 = 'B', 'I'
-	version        = 3 // v3 appends Generation; v2 (epoch only) and v1 (neither) still decode.
+
+	// v3 appends Generation and Removed; v2 (epoch only) and v1 (neither) still decode.
+	version = 3
 )
 
 // AppendBinary appends the versioned binary encoding of the index to dst (append-style for
@@ -108,8 +113,18 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 
 	dst = binary.AppendUvarint(dst, ix.FlushedEpoch)
 	dst = binary.AppendUvarint(dst, ix.Generation.Term)
+	dst = binary.AppendUvarint(dst, ix.Generation.Counter)
 
-	return binary.AppendUvarint(dst, ix.Generation.Counter)
+	dst = binary.AppendUvarint(dst, uint64(len(ix.Removed)))
+	for i := range ix.Removed {
+		r := &ix.Removed[i]
+		dst = binary.AppendUvarint(dst, uint64(len(r.Prefix)))
+		dst = append(dst, r.Prefix...)
+		dst = binary.AppendUvarint(dst, r.Generation.Term)
+		dst = binary.AppendUvarint(dst, r.Generation.Counter)
+	}
+
+	return dst
 }
 
 // ErrCorrupt is returned (wrapped) by [Decode] for malformed input.
@@ -189,10 +204,60 @@ func Decode(data []byte) (*Index, error) {
 			return nil, errors.Wrap(ErrCorrupt, "bad generation counter")
 		}
 
+		buf = buf[m:]
+
 		ix.Generation = Generation{Term: term, Counter: counter}
+
+		removed, err := decodeRemovals(buf)
+		if err != nil {
+			return nil, err
+		}
+
+		ix.Removed = removed
 	}
 
 	return ix, nil
+}
+
+// decodeRemovals parses the tombstone list, defensively: the count is bounded by what the buffer
+// could hold, as the entry count is.
+func decodeRemovals(buf []byte) ([]Removal, error) {
+	n, m := binary.Uvarint(buf)
+	if m <= 0 {
+		return nil, errors.Wrap(ErrCorrupt, "bad removal count")
+	}
+	buf = buf[m:]
+
+	if n > uint64(len(buf)) {
+		return nil, errors.Wrap(ErrCorrupt, "removal count exceeds input")
+	}
+
+	out := make([]Removal, 0, n)
+	for range n {
+		var r Removal
+
+		l, m := binary.Uvarint(buf)
+		if m <= 0 || l > uint64(len(buf)-m) {
+			return nil, errors.Wrap(ErrCorrupt, "bad removal prefix length")
+		}
+		buf = buf[m:]
+		r.Prefix = string(buf[:l])
+		buf = buf[l:]
+
+		if r.Generation.Term, m = binary.Uvarint(buf); m <= 0 {
+			return nil, errors.Wrap(ErrCorrupt, "bad removal term")
+		}
+		buf = buf[m:]
+
+		if r.Generation.Counter, m = binary.Uvarint(buf); m <= 0 {
+			return nil, errors.Wrap(ErrCorrupt, "bad removal counter")
+		}
+		buf = buf[m:]
+
+		out = append(out, r)
+	}
+
+	return out, nil
 }
 
 func readVarint(buf []byte) (int64, []byte, bool) {
