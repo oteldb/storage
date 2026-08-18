@@ -30,21 +30,21 @@ func twoOwners(t *testing.T) (ctx context.Context, a, b *Ownership) {
 func TestOwnershipExclusiveAndIdempotent(t *testing.T) {
 	ctx, a, b := twoOwners(t)
 
-	ok, err := a.Acquire(ctx, "t1")
+	_, ok, err := a.Acquire(ctx, "t1")
 	require.NoError(t, err)
 	assert.True(t, ok, "first claim succeeds")
 
-	ok, err = a.Acquire(ctx, "t1")
+	_, ok, err = a.Acquire(ctx, "t1")
 	require.NoError(t, err)
 	assert.True(t, ok, "re-claim by the holder is idempotent")
 
-	ok, err = b.Acquire(ctx, "t1")
+	_, ok, err = b.Acquire(ctx, "t1")
 	require.NoError(t, err)
 	assert.False(t, ok, "another node cannot claim a held shard")
 
 	// Release frees it for the other node.
 	require.NoError(t, a.Release(ctx, "t1"))
-	ok, err = b.Acquire(ctx, "t1")
+	_, ok, err = b.Acquire(ctx, "t1")
 	require.NoError(t, err)
 	assert.True(t, ok, "after release the other node claims it")
 }
@@ -53,12 +53,12 @@ func TestOwnershipExclusiveAndIdempotent(t *testing.T) {
 func TestOwnershipReleaseIsGuarded(t *testing.T) {
 	ctx, a, b := twoOwners(t)
 
-	_, err := a.Acquire(ctx, "t1")
+	_, _, err := a.Acquire(ctx, "t1")
 	require.NoError(t, err)
 
 	// B releasing a shard it does not hold must not free A's claim.
 	require.NoError(t, b.Release(ctx, "t1"))
-	ok, err := b.Acquire(ctx, "t1")
+	_, ok, err := b.Acquire(ctx, "t1")
 	require.NoError(t, err)
 	assert.False(t, ok, "A still holds the shard")
 }
@@ -165,7 +165,7 @@ func TestOwnershipHandoffOnLeaseExpiry(t *testing.T) {
 	a := NewOwnership(client, "/oteldb", "node-a", la.ID)
 	b := NewOwnership(client, "/oteldb", "node-b", lb.ID)
 
-	ok, err := a.Acquire(ctx, "t1")
+	_, ok, err := a.Acquire(ctx, "t1")
 	require.NoError(t, err)
 	require.True(t, ok)
 
@@ -174,7 +174,7 @@ func TestOwnershipHandoffOnLeaseExpiry(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
-		ok, err := b.Acquire(ctx, "t1")
+		_, ok, err := b.Acquire(ctx, "t1")
 
 		return err == nil && ok
 	}, 5*time.Second, 100*time.Millisecond, "the surviving node takes over the orphaned shard")
@@ -216,4 +216,38 @@ func TestOwnershipLastPlanPerShardRF(t *testing.T) {
 		assert.Empty(t, r.Added, "node-a already owned every shard at rf=2")
 		assert.Equal(t, []string{"node-b"}, r.Removed, "node-b leaves every shard's owner set")
 	}
+}
+
+// The term is the claim's creation revision: stable while a tenure lasts, and strictly higher
+// for the tenure that follows it. Both properties are load-bearing for the commit generation —
+// a term that moved every pass would restart the counter for nothing, and one that did not rise
+// on handoff would leave a restored node unable to supersede its own replicas.
+//
+//nolint:paralleltest // owns an embedded etcd
+func TestOwnershipTermIsStableAndRises(t *testing.T) {
+	ctx, a, b := twoOwners(t)
+
+	first, ok, err := a.Acquire(ctx, "t1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NotZero(t, first)
+
+	again, ok, err := a.Acquire(ctx, "t1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, first, again, "reacquiring a held claim reports the same term")
+
+	// Another node's failed acquire reports no term at all.
+	term, ok, err := b.Acquire(ctx, "t1")
+	require.NoError(t, err)
+	require.False(t, ok)
+	assert.Zero(t, term)
+
+	// A new tenure is above the one it replaced.
+	require.NoError(t, a.Release(ctx, "t1"))
+
+	next, ok, err := b.Acquire(ctx, "t1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Greater(t, next, first, "the tenure that follows supersedes the one before it")
 }

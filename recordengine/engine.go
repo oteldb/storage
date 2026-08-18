@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
@@ -36,6 +37,12 @@ type Config struct {
 	Backend backend.Backend
 	// Prefix is the backend key prefix under which this engine's parts are written.
 	Prefix string
+	// Term reports this writer's current ownership term for Prefix — which tenure of the shard
+	// this engine is writing as. It is stamped into every bucket index written, so a reader can
+	// order two indexes of the same prefix even when neither the part names nor FlushedEpoch
+	// moved; see [github.com/oteldb/storage/backend/bucketindex.Generation]. nil is a writer with
+	// no cluster, whose generation is then a plain local counter.
+	Term func() uint64
 	// SideStore, when non-nil, is a signal-supplied content-addressed auxiliary store (e.g. the
 	// profiles symbol store) that the engine persists as part sidecars on flush and unions on merge.
 	// nil ⇒ no side data (logs, traces).
@@ -112,6 +119,10 @@ type Engine struct {
 	// (persisted in the bucket index). Current head records are written to the WAL at flushedEpoch+1,
 	// so on recovery the engine replays only WAL segments past flushedEpoch — exactly-once.
 	flushedEpoch uint64
+	// generation is the commit generation of the last bucket index this engine wrote, advanced on
+	// every write. It is deliberately *not* reset by Reset: dropping the data does not entitle the
+	// engine to write an index a replica would refuse as stale.
+	generation bucketindex.Generation
 
 	// recPool recycles per-stream fetch accumulators (*recordCols) when a caller opts into batch
 	// reuse via fetch.Request.Recycle and releases each batch. The accumulator's columns back the
@@ -1315,4 +1326,13 @@ func (e *Engine) recycleDecodeInts(c *recordCols) {
 	for k := range c.ints {
 		e.putI64(c.ints[k])
 	}
+}
+
+// term is this writer's ownership term, or 0 with no cluster to ask.
+func (e *Engine) term() uint64 {
+	if e.cfg.Term == nil {
+		return 0
+	}
+
+	return e.cfg.Term()
 }

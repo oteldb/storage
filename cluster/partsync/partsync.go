@@ -432,6 +432,18 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 	cmp := compareIndexes(peerIndex, localIndex)
 	newer := cmp > 0 || (cmp == 0 && !strict && !bytes.Equal(peerIndexRaw, localRaw))
 
+	// Whether the peer's index may *authorize a deletion*, which is a stronger claim than whether
+	// it is worth mirroring. Only a peer that provably supersedes may. An index that merely
+	// differs says nothing about what is missing from it: an owner that silently lost an older
+	// part — bit rot, a partial rm, a restore from a stale snapshot — still holds the newest, so
+	// nothing but the commit generation separates that from a deliberate shrink. Taking its word
+	// there would leave a replica's own good copies unprotected, and prune would delete them two
+	// passes later: the damage propagating from the broken node to the healthy ones.
+	//
+	// This is the one place the design inverts ClickHouse, where deletion is always an explicit
+	// DROP_RANGE and a replica that finds a part missing fetches it rather than dropping its own.
+	supersedes := cmp > 0
+
 	if !newer && !forced {
 		return Stats{}, nil // peer is older, or not newer enough, and no object-level reconcile
 	}
@@ -442,9 +454,13 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 		return st, err
 	}
 
-	// Install the index last (the commit point) when it actually differs — it only ever
-	// references parts whose objects are already local.
-	if !bytes.Equal(peerIndexRaw, localRaw) {
+	// Adopting the peer's index is what makes its absences ours, so it is gated on the same
+	// claim pruning is: a non-superseding index is not installed, and the local one goes on
+	// naming what this node holds. Copying stays unconditional — it is additive, and a peer that
+	// has an object we lack is worth taking whichever way the indexes order.
+	if supersedes && !bytes.Equal(peerIndexRaw, localRaw) {
+		// Installed last (the commit point) — it only ever references parts whose objects are
+		// already local.
 		if err := s.local.Write(ctx, indexKey, peerIndexRaw); err != nil {
 			return st, errors.Wrap(err, "install index")
 		}
@@ -453,18 +469,40 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 		st.CopiedBytes += int64(len(peerIndexRaw))
 	}
 
-	liveParts := make(map[string]struct{}, len(peerIndex.Entries))
-	for _, e := range peerIndex.Entries {
-		liveParts[e.Prefix] = struct{}{}
-	}
-
-	if err := s.prune(ctx, &st, enginePrefix, keep, liveParts); err != nil {
+	if err := s.prune(ctx, &st, enginePrefix, keep, livePartSet(peerIndex, localIndex, supersedes)); err != nil {
 		return st, err
 	}
 
 	st.Synced = newer || st.Copied > 0 || st.Pruned > 0
 
 	return st, nil
+}
+
+// livePartSet is the set of part prefixes prune must protect: the peer's index when that index
+// supersedes the local one, and the union of the two otherwise.
+//
+// The union is the second half of not taking a non-superseding peer's word for a deletion. Not
+// adopting its index is what makes the protection last — the local index goes on naming the part,
+// so every later pass unions it back in — but the pass that discovered the shrink still has to
+// protect it, and an object-level reconcile (EC slot filtering) prunes on a tie by design and
+// would otherwise quarantine it on the way past.
+//
+// Where the two indexes agree, which is every ordinary pass, the union is the peer's set.
+func livePartSet(peerIndex, localIndex *bucketindex.Index, supersedes bool) map[string]struct{} {
+	live := make(map[string]struct{}, len(peerIndex.Entries))
+	for _, e := range peerIndex.Entries {
+		live[e.Prefix] = struct{}{}
+	}
+
+	if supersedes {
+		return live
+	}
+
+	for _, e := range localIndex.Entries {
+		live[e.Prefix] = struct{}{}
+	}
+
+	return live
 }
 
 // stateFor returns (creating if needed) the prune bookkeeping for enginePrefix. Caller holds s.mu.
@@ -686,6 +724,20 @@ func livePart(key string, liveParts map[string]struct{}) bool {
 // compareIndexes orders two bucket indexes by recency: the higher max part sequence wins, then
 // the higher flushed epoch. Zero means indistinguishable (same generation).
 func compareIndexes(a, b *bucketindex.Index) int {
+	// The commit generation is the only thing that orders index *states*: it advances on a
+	// rewrite that merely removes parts, which is precisely the rewrite the fallbacks below
+	// cannot see. An index that has one is therefore ranked by it alone.
+	ag, bg := a.Generation, b.Generation
+	if !ag.Zero() || !bg.Zero() {
+		// One side predating the format is older by construction — a writer that stamps a
+		// generation has, by definition, written since the other one did.
+		return ag.Compare(bg)
+	}
+
+	// Neither side carries one: both were written before format v3, so fall back to what those
+	// writers did express. This is the pre-#278 ranking, kept only for the transition, and it
+	// cannot tell a shrunk index from a damaged one — which is why the caller treats a
+	// non-superseding index as unable to authorize a deletion.
 	as, bs := maxSeq(a), maxSeq(b)
 
 	switch {
@@ -706,7 +758,6 @@ func compareIndexes(a, b *bucketindex.Index) int {
 	}
 }
 
-// maxSeq is the highest trailing part-sequence number referenced by ix, or -1 for none.
 func maxSeq(ix *bucketindex.Index) int {
 	m := -1
 

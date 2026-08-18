@@ -1441,3 +1441,30 @@ func (s *Storage) sendPrimaryWrite(ctx context.Context, addr string, payload []b
 		return cluster.SendPrimaryWrite(ctx, s.cluster.httpc, addr, payload)
 	})
 }
+
+// termFor returns a function reporting this node's current ownership term for tid's shard — the
+// etcd revision its compaction claim was created at — which the engine stamps into every bucket
+// index it writes.
+//
+// It is read per index write rather than captured, because ownership outlives no engine: a shard
+// handed to another node and back gives the same engine a new term, and the term is what says the
+// index it then writes supersedes whatever the intervening owner left.
+//
+// nil in single-node mode, where the engine's generation is a plain local counter — there is no
+// second writer for a term to order it against.
+func (s *Storage) termFor(tid signal.TenantID) func() uint64 {
+	if s.cluster == nil {
+		return nil
+	}
+
+	shard := string(s.normalizeTenant(tid))
+
+	return func() uint64 {
+		term, _ := s.cluster.ownership.Term(shard)
+
+		// A shard this node does not hold a claim on reports 0, which keeps the generation on the
+		// counter alone. It is the honest answer: an engine writing without a claim is not writing
+		// as any tenure of the shard, and must not be able to supersede one that is.
+		return term
+	}
+}

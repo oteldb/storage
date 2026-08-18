@@ -36,8 +36,10 @@ type Ownership struct {
 	// after losing its lease ([Membership.OnRejoin]), so it is read atomically.
 	leaseID atomic.Int64
 
-	mu       sync.Mutex
-	held     map[string]struct{}      // shards this node currently holds a claim on
+	mu sync.Mutex
+	// held maps each shard this node holds a claim on to that claim's term — the etcd revision
+	// the claim was created at. See [Ownership.Term].
+	held     map[string]uint64
 	prevRing *ring.Ring               // ring at the last Reconcile (pointer-compared for "unchanged")
 	lastPlan []rebalance.Reassignment // the owner-set handoffs enacted at the last ring change
 	planRF   func(shard string) int   // per-shard rf for LastPlan recording; nil ⇒ 1 (primary only)
@@ -50,7 +52,7 @@ func NewOwnership(client *clientv3.Client, root, id string, leaseID clientv3.Lea
 		client: client,
 		prefix: joinKey(root, "owners"),
 		id:     id,
-		held:   make(map[string]struct{}),
+		held:   make(map[string]uint64),
 	}
 	o.leaseID.Store(int64(leaseID))
 
@@ -67,7 +69,7 @@ func (o *Ownership) SetLease(id clientv3.LeaseID) {
 	defer o.mu.Unlock()
 
 	o.leaseID.Store(int64(id))
-	o.held = make(map[string]struct{})
+	o.held = make(map[string]uint64)
 }
 
 // Claims returns every currently-claimed shard across the cluster (sorted), from one etcd
@@ -92,10 +94,21 @@ func (o *Ownership) Claims(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
-// Acquire tries to claim shard for this node. It returns true if the claim is now held by this
-// node (newly acquired or already ours), false if another live node holds it. The claim is a
-// CAS: create the key only if absent; otherwise it belongs to whoever already created it.
-func (o *Ownership) Acquire(ctx context.Context, shard string) (bool, error) {
+// Acquire tries to claim shard for this node. It reports whether the claim is now held by this
+// node (newly acquired or already ours), and the claim's term. The claim is a CAS: create the
+// key only if absent; otherwise it belongs to whoever already created it.
+//
+// The term is the etcd revision the claim key was created at, which costs nothing — it is in the
+// response either way. etcd revisions are cluster-wide monotonic, so a term orders every
+// ownership tenure of a shard against every other, and it is *stable* for the life of one tenure:
+// reacquiring a claim this node already holds reports the revision it was created at, not the
+// current one, so repeated [Ownership.Reconcile] passes do not keep moving it.
+//
+// That is what the bucket index's commit generation needs to survive a node restored from an
+// old snapshot:
+// reacquiring the shard puts its writes above everything its replicas hold, and a node that lost
+// the shard keeps the lower term of a tenure that has ended.
+func (o *Ownership) Acquire(ctx context.Context, shard string) (term uint64, ok bool, err error) {
 	key := o.prefix + shard
 
 	resp, err := o.client.Txn(ctx).
@@ -104,17 +117,33 @@ func (o *Ownership) Acquire(ctx context.Context, shard string) (bool, error) {
 		Else(clientv3.OpGet(key)).
 		Commit()
 	if err != nil {
-		return false, errors.Wrapf(err, "acquire %q", shard)
+		return 0, false, errors.Wrapf(err, "acquire %q", shard)
 	}
 
 	if resp.Succeeded {
-		return true, nil // we created the claim
+		// We created the claim, so the transaction's revision is the one it was created at.
+		return uint64(resp.Header.GetRevision()), true, nil
 	}
 
 	// The key already exists: the claim is ours only if we wrote it.
 	kvs := resp.Responses[0].GetResponseRange().GetKvs()
+	if len(kvs) != 1 || string(kvs[0].GetValue()) != o.id {
+		return 0, false, nil
+	}
 
-	return len(kvs) == 1 && string(kvs[0].GetValue()) == o.id, nil
+	return uint64(kvs[0].GetCreateRevision()), true, nil
+}
+
+// Term returns the term of this node's claim on shard — the etcd revision it was created at —
+// and whether the shard is held at all. It is what a writer stamps into the indexes it writes
+// for that shard, so a shrunk index can be told from a damaged one.
+func (o *Ownership) Term(shard string) (uint64, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	term, ok := o.held[shard]
+
+	return term, ok
 }
 
 // Release relinquishes shard, but only if this node still holds the claim (a guarded delete,
@@ -164,13 +193,13 @@ func (o *Ownership) Reconcile(ctx context.Context, r *ring.Ring, shards []string
 			continue
 		}
 
-		acquired, err := o.Acquire(ctx, shard)
+		term, acquired, err := o.Acquire(ctx, shard)
 		if err != nil {
 			return o.ownedLocked(), err
 		}
 
 		if acquired {
-			o.held[shard] = struct{}{}
+			o.held[shard] = term
 		}
 	}
 

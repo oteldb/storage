@@ -41,6 +41,10 @@ type Index struct {
 	// already holds — advanced atomically with the part list, so exactly-once replay survives a
 	// crash between a flush committing and its WAL being truncated. Added in format v2.
 	FlushedEpoch uint64
+	// Generation orders index states — see [Generation], which is the whole of why it exists.
+	// Zero in an index written before format v3, which is below every generation a writer
+	// produces. Added in format v3.
+	Generation Generation
 }
 
 // Add inserts e, replacing any existing entry with the same prefix, keeping the index sorted.
@@ -86,7 +90,7 @@ func (ix *Index) Overlapping(start, end int64) []Entry {
 
 const (
 	magic0, magic1 = 'B', 'I'
-	version        = 2 // v2 appends FlushedEpoch; v1 (no epoch) still decodes.
+	version        = 3 // v3 appends Generation; v2 (epoch only) and v1 (neither) still decode.
 )
 
 // AppendBinary appends the versioned binary encoding of the index to dst (append-style for
@@ -102,7 +106,10 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 		dst = binary.AppendVarint(dst, e.MaxTime)
 	}
 
-	return binary.AppendUvarint(dst, ix.FlushedEpoch)
+	dst = binary.AppendUvarint(dst, ix.FlushedEpoch)
+	dst = binary.AppendUvarint(dst, ix.Generation.Term)
+
+	return binary.AppendUvarint(dst, ix.Generation.Counter)
 }
 
 // ErrCorrupt is returned (wrapped) by [Decode] for malformed input.
@@ -163,8 +170,26 @@ func Decode(data []byte) (*Index, error) {
 		if m <= 0 {
 			return nil, errors.Wrap(ErrCorrupt, "bad flushed epoch")
 		}
+		buf = buf[m:]
 
 		ix.FlushedEpoch = epoch
+	}
+
+	// v3+ appends the commit generation; earlier versions leave it zero, which orders below
+	// every generation a writer produces.
+	if ver >= 3 {
+		term, m := binary.Uvarint(buf)
+		if m <= 0 {
+			return nil, errors.Wrap(ErrCorrupt, "bad generation term")
+		}
+		buf = buf[m:]
+
+		counter, m := binary.Uvarint(buf)
+		if m <= 0 {
+			return nil, errors.Wrap(ErrCorrupt, "bad generation counter")
+		}
+
+		ix.Generation = Generation{Term: term, Counter: counter}
 	}
 
 	return ix, nil

@@ -37,7 +37,11 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 		return nil
 	}
 
-	ix := &bucketindex.Index{FlushedEpoch: e.flushedEpoch}
+	// The generation advances on every write, including one that only removes parts — which is
+	// the whole point of it, since that is exactly the rewrite the part names cannot express.
+	e.generation = e.generation.Next(e.term())
+
+	ix := &bucketindex.Index{FlushedEpoch: e.flushedEpoch, Generation: e.generation}
 	for _, p := range e.parts {
 		ix.Add(bucketindex.Entry{Prefix: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime})
 	}
@@ -109,6 +113,7 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 	e.parts = parts
 	e.nextSeq = maxSeq + 1
 	e.flushedEpoch = ix.FlushedEpoch
+	e.generation = ix.Generation
 
 	// New head records belong to the generation past the recovered watermark; replay (which the
 	// facade runs next) then skips everything the loaded parts already hold.
