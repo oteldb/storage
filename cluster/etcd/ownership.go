@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/go-faster/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -27,10 +28,13 @@ import (
 // of one acquire/release per shard every tick. When the ring does change it records the
 // [rebalance.Plan] it enacted (see [Ownership.LastPlan]) for observability/preview.
 type Ownership struct {
-	client  *clientv3.Client
-	prefix  string // "{root}/owners/"
-	id      string // this node's ring ID
-	leaseID clientv3.LeaseID
+	client *clientv3.Client
+	prefix string // "{root}/owners/"
+	id     string // this node's ring ID
+
+	// leaseID is the membership lease claims bind to. It changes when the node re-registers
+	// after losing its lease ([Membership.OnRejoin]), so it is read atomically.
+	leaseID atomic.Int64
 
 	mu       sync.Mutex
 	held     map[string]struct{}      // shards this node currently holds a claim on
@@ -42,13 +46,28 @@ type Ownership struct {
 // NewOwnership returns an ownership coordinator for node id, claiming under root with the
 // node's membership lease (see [Membership.LeaseID]).
 func NewOwnership(client *clientv3.Client, root, id string, leaseID clientv3.LeaseID) *Ownership {
-	return &Ownership{
-		client:  client,
-		prefix:  joinKey(root, "owners"),
-		id:      id,
-		leaseID: leaseID,
-		held:    make(map[string]struct{}),
+	o := &Ownership{
+		client: client,
+		prefix: joinKey(root, "owners"),
+		id:     id,
+		held:   make(map[string]struct{}),
 	}
+	o.leaseID.Store(int64(leaseID))
+
+	return o
+}
+
+// SetLease rebinds claims to a new membership lease, after the node lost its old one and
+// re-registered (wire it with [Membership.OnRejoin]). Every claim written under the old lease
+// went with it, so the held set is dropped too: it would otherwise record ownership this node
+// no longer has, and Reconcile only writes for shards it does not already believe it holds.
+// The next Reconcile re-acquires under the new lease.
+func (o *Ownership) SetLease(id clientv3.LeaseID) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.leaseID.Store(int64(id))
+	o.held = make(map[string]struct{})
 }
 
 // Claims returns every currently-claimed shard across the cluster (sorted), from one etcd
@@ -81,7 +100,7 @@ func (o *Ownership) Acquire(ctx context.Context, shard string) (bool, error) {
 
 	resp, err := o.client.Txn(ctx).
 		If(clientv3.Compare(clientv3.CreateRevision(key), "=", 0)).
-		Then(clientv3.OpPut(key, o.id, clientv3.WithLease(o.leaseID))).
+		Then(clientv3.OpPut(key, o.id, clientv3.WithLease(clientv3.LeaseID(o.leaseID.Load())))).
 		Else(clientv3.OpGet(key)).
 		Commit()
 	if err != nil {

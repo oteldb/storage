@@ -30,6 +30,19 @@ The `Ring` is immutable (`With`/`Without` return a new one).
 into an `atomic.Pointer`, so `Membership.Ring()` is a lock-free read. A crashed node drops out of
 every peer's ring within the TTL. etcd distributes membership only — placement stays local.
 
+Registration is **maintained, not one-shot**. A stall longer than the TTL loses the lease and etcd
+deletes the member key, which is indistinguishable from a crash to every peer — so a live node
+watches for its own disappearance (the keep-alive channel closing, or its own id in a `DELETE`
+event, which is a contradiction) and re-registers under a fresh lease, with backoff. Compaction
+claims hang off that lease, so `Membership.OnRejoin` rebinds `Ownership` to the new one
+(`SetLease`, which also drops the held set the dead lease took with it).
+
+An absent node **keeps serving**: it still holds its shards, and a secondary's head is memory-only,
+so restarting it would trade a routing problem for lost writes and a read gap on every node at
+once. The state is reported instead — `ClusterStats.SelfAbsent`/`Rejoins`, the
+`storage.cluster.self_absent` gauge, and a warning log — while the routing tier's readiness gate
+reports the routing side.
+
 `Ownership` is the **rebalance executor**: exclusive compaction claims via etcd CAS bound to the
 node's lease. `Reconcile` is stateful and minimal-move — it tracks held shards and writes only to
 acquire a wanted-unheld or release a held-unwanted shard, so steady state is **zero round-trips**;

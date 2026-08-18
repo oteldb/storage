@@ -254,6 +254,42 @@ func newWAL(m metric.Meter) (*WAL, error) {
 	return w, b.err
 }
 
+// Cluster instruments this node's standing in the cluster member set — the state that decides
+// whether any peer routes anything here at all. self_absent is the alertable form of a node
+// that is up and serving but missing from etcd: the failure this cannot be inferred from any
+// other signal, because the node itself looks perfectly healthy while it is happening.
+type Cluster struct {
+	selfAbsent metric.Int64Gauge
+	rejoins    metric.Int64Counter
+}
+
+// Record publishes this node's membership standing: absent is whether it is currently missing
+// from the member set, rejoins the re-registrations since the previous call.
+func (c *Cluster) Record(ctx context.Context, absent bool, rejoins int64) {
+	var v int64
+	if absent {
+		v = 1
+	}
+
+	c.selfAbsent.Record(ctx, v)
+
+	if rejoins > 0 {
+		c.rejoins.Add(ctx, rejoins)
+	}
+}
+
+func newCluster(m metric.Meter) (*Cluster, error) {
+	b := &imb{m: m}
+	c := &Cluster{
+		selfAbsent: b.gauge("storage.cluster.self_absent",
+			"1 while this node is running but missing from the cluster member set", "{node}"),
+		rejoins: b.counter("storage.cluster.rejoins",
+			"times this node re-registered after losing its membership lease", "{rejoin}"),
+	}
+
+	return c, b.err
+}
+
 func (b *imb) gauge(name, desc, unit string) metric.Int64Gauge {
 	if b.err != nil {
 		return nil
