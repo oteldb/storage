@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -54,6 +55,24 @@ type clusterNode struct {
 
 	notifyMu   sync.Mutex          // guards notifyBusy
 	notifyBusy map[string]struct{} // engine prefixes with a notify-triggered sync in flight
+
+	// reportedRejoins is the re-registration total already published as a counter delta.
+	reportedRejoins atomic.Int64
+}
+
+// recordMembershipHealth publishes this node's standing in the cluster member set once per
+// maintenance cycle. A node absent from etcd stays up and keeps serving — that is deliberate,
+// since restarting it would lose a secondary's in-memory head and open a read gap — so nothing
+// about the node itself reports the state. This is what makes it alertable.
+func (s *Storage) recordMembershipHealth(ctx context.Context) {
+	if s.cluster == nil {
+		return
+	}
+
+	total := s.cluster.membership.Rejoins()
+	delta := total - s.cluster.reportedRejoins.Swap(total)
+
+	s.obs.Cluster.Record(ctx, s.cluster.membership.SelfAbsent(), delta)
 }
 
 // rfFor resolves the replication factor for one shard key: the tenant's
@@ -324,7 +343,7 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 
 	go func() { _ = srv.Serve(ln) }()
 
-	mship, err := etcd.Join(ctx, client, root, self, 0)
+	mship, err := etcd.Join(ctx, client, root, self, cfg.MemberTTL)
 	if err != nil {
 		_ = srv.Close()
 		_ = client.Close()
@@ -336,10 +355,16 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	s.obs.Logger(ctx).Info("joined cluster",
 		zap.String("id", self.ID), zap.String("zone", self.Zone), zap.String("addr", self.Addr))
 
+	own := etcd.NewOwnership(client, root, cfg.Self.ID, mship.LeaseID())
+
+	// Losing the membership lease takes the compaction claims bound to it with it, so the
+	// claims have to follow the node's new lease when it re-registers.
+	mship.OnRejoin(own.SetLease)
+
 	s.cluster = &clusterNode{
 		client:     client,
 		membership: mship,
-		ownership:  etcd.NewOwnership(client, root, cfg.Self.ID, mship.LeaseID()),
+		ownership:  own,
 		replicator: rp,
 		httpc:      httpc,
 		server:     srv,

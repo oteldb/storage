@@ -23,8 +23,23 @@ import (
 )
 
 // DefaultTTL is the lease TTL: a node absent for this long (no keepalive) is evicted from the
-// ring. It bounds failure-detection latency.
-const DefaultTTL = 10 * time.Second
+// ring. It bounds failure-detection latency, and it is equally the blast radius of a hiccup — a
+// GC pause, a CPU-starved node or a brief etcd stall longer than the TTL costs the node its
+// lease. 30s trades slower failure detection for not evicting healthy nodes: the ring only has
+// to be right within a rebalance, while a spurious eviction moves ownership for nothing.
+// Re-registration is what makes an eviction survivable at all; the TTL only sets how often one
+// happens. [Join] takes a per-cluster override.
+const DefaultTTL = 30 * time.Second
+
+// Recovery backoff bounds, shared by re-registration and watch resynchronization. The first
+// attempt is immediate — the common case is a lease expiry or a stream cancellation against an
+// otherwise healthy etcd, which one round-trip repairs — and only repeated failures back off,
+// up to a cap that keeps a long outage cheap without leaving the node stale for long after etcd
+// returns.
+const (
+	retryMinBackoff = 100 * time.Millisecond
+	retryMaxBackoff = 5 * time.Second
+)
 
 // Member is a cluster node's advertised identity: its ring ID, failure-domain location, and
 // the Addr its peers reach it on. Zone is the single-level failure domain (a rack); Domains is
@@ -104,10 +119,24 @@ func decodeMember(data []byte) (Member, error) {
 // a keep-alive'd lease) and watches the member set, exposing the current [ring.Ring]. Safe for
 // concurrent use; [Membership.Ring] and [Membership.Members] are lock-free / cheap.
 type Membership struct {
-	client  *clientv3.Client
-	prefix  string // "{root}/members/"
-	self    Member
-	leaseID clientv3.LeaseID
+	client *clientv3.Client
+	prefix string // "{root}/members/"
+	self   Member
+	ttl    time.Duration
+
+	// leaseID is the lease the member key currently hangs off. Re-registration replaces it
+	// rather than reusing it, so it is read atomically instead of captured once.
+	leaseID atomic.Int64
+
+	// evicted carries "this node is no longer registered" from the watch to the maintainer.
+	// Buffered by one and sent to non-blockingly: it is a level, not a queue. nil for an
+	// observer ([Watch]), which registers nothing and so cannot be evicted.
+	evicted chan struct{}
+
+	selfAbsent atomic.Bool
+	rejoins    atomic.Int64
+
+	onRejoin atomic.Pointer[func(clientv3.LeaseID)]
 
 	current atomic.Pointer[ring.Ring]
 
@@ -117,7 +146,7 @@ type Membership struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	log *zap.Logger // membership-change logging; nil ⇒ no-op
+	log atomic.Pointer[zap.Logger] // membership-change logging; unset ⇒ no-op
 }
 
 // SetLogger attaches a logger that records member joins and leaves (Info on each change). It must
@@ -125,9 +154,34 @@ type Membership struct {
 // nil disables logging. Safe only before the watch observes its first event.
 func (m *Membership) SetLogger(l *zap.Logger) {
 	if l != nil {
-		m.log = l
+		m.log.Store(l)
 	}
 }
+
+// OnRejoin registers a hook invoked after this node re-registers under a fresh lease. Anything
+// bound to the old lease died with it — compaction claims above all (see [Ownership.SetLease])
+// — so the hook is how a dependent rebinds. It runs on the maintainer goroutine and must not
+// block. A nil hook clears it.
+func (m *Membership) OnRejoin(fn func(clientv3.LeaseID)) {
+	if fn == nil {
+		m.onRejoin.Store(nil)
+
+		return
+	}
+
+	m.onRejoin.Store(&fn)
+}
+
+// SelfAbsent reports that this node believes it is missing from the cluster member set: its
+// lease was lost (or its key deleted) and re-registration has not yet succeeded. It is a
+// contradiction — the node is running — and while it holds, the node is invisible to every
+// peer's ring, so it takes no writes and owns no shards. It clears on the next successful
+// registration.
+func (m *Membership) SelfAbsent() bool { return m.selfAbsent.Load() }
+
+// Rejoins counts the times this node re-registered after losing its registration. A value that
+// keeps climbing means the lease TTL is too tight for the environment.
+func (m *Membership) Rejoins() int64 { return m.rejoins.Load() }
 
 // Join registers self in the cluster rooted at root (an etcd key prefix) under a lease of ttl
 // (≤ 0 ⇒ [DefaultTTL]), snapshots the current members, and starts watching for changes. The
@@ -141,39 +195,30 @@ func Join(ctx context.Context, client *clientv3.Client, root string, self Member
 		ttl = DefaultTTL
 	}
 
-	lease, err := client.Grant(ctx, int64(ttl.Seconds()))
-	if err != nil {
-		return nil, errors.Wrap(err, "grant lease")
-	}
-
 	prefix := path.Join(root, "members") + "/"
-
-	if _, err := client.Put(ctx, prefix+self.ID, string(self.encode()), clientv3.WithLease(lease.ID)); err != nil {
-		return nil, errors.Wrap(err, "register member")
-	}
 
 	m := &Membership{
 		client:  client,
 		prefix:  prefix,
 		self:    self,
-		leaseID: lease.ID,
+		ttl:     ttl,
+		evicted: make(chan struct{}, 1),
 		members: make(map[string]Member),
 	}
 
+	lease, err := m.register(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	m.leaseID.Store(int64(lease))
+
 	// Snapshot the current members, then watch from the snapshot revision so no change is
 	// missed in the gap between the Get and the Watch.
-	resp, err := client.Get(ctx, prefix, clientv3.WithPrefix())
+	rev, err := m.resync(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "list members")
+		return nil, err
 	}
-
-	for _, kv := range resp.Kvs {
-		if mem, err := decodeMember(kv.GetValue()); err == nil {
-			m.members[mem.ID] = mem
-		}
-	}
-
-	m.rebuild()
 
 	// The lease keep-alive and watch must outlive this Join call, so their context is rooted
 	// at Background and scoped to the Membership's own lifetime (canceled by Close), not to
@@ -182,8 +227,8 @@ func Join(ctx context.Context, client *clientv3.Client, root string, self Member
 	m.cancel = cancel
 	m.wg.Add(2)
 
-	go m.keepAlive(bg)                          //nolint:contextcheck // lifetime-scoped, see above
-	go m.watch(bg, resp.Header.GetRevision()+1) //nolint:contextcheck // lifetime-scoped, see above
+	go m.maintain(bg)   //nolint:contextcheck // lifetime-scoped, see above
+	go m.watch(bg, rev) //nolint:contextcheck // lifetime-scoped, see above
 
 	return m, nil
 }
@@ -193,7 +238,7 @@ func (m *Membership) Ring() *ring.Ring { return m.current.Load() }
 
 // LeaseID is this node's membership lease. Ownership claims bind to it so they auto-release
 // when the node dies (the basis for the rebalance handoff).
-func (m *Membership) LeaseID() clientv3.LeaseID { return m.leaseID }
+func (m *Membership) LeaseID() clientv3.LeaseID { return clientv3.LeaseID(m.leaseID.Load()) }
 
 // AddrOf returns the network address of the member with the given ring node ID, or "" if the
 // member is unknown. It is the resolver the cluster write path uses to turn ring owners into
@@ -227,53 +272,276 @@ func (m *Membership) Close(ctx context.Context) error {
 	m.cancel()
 	m.wg.Wait()
 
-	if m.leaseID == clientv3.NoLease {
+	lease := m.LeaseID()
+	if lease == clientv3.NoLease {
 		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if _, err := m.client.Revoke(ctx, m.leaseID); err != nil {
+	if _, err := m.client.Revoke(ctx, lease); err != nil {
 		return errors.Wrap(err, "revoke lease")
 	}
 
 	return nil
 }
 
-// keepAlive renews the lease until the context is canceled. If renewal ends (lease lost,
-// e.g. an etcd partition longer than the TTL), the goroutine exits and the node is evicted;
-// re-registration on lease loss is a later refinement.
-func (m *Membership) keepAlive(ctx context.Context) {
+// register grants a fresh lease and puts this node's member key under it. That pair is the
+// whole of "being in the cluster", and it is idempotent: the key is overwritten, so a stale
+// copy left by an earlier registration is replaced rather than duplicated.
+func (m *Membership) register(ctx context.Context) (clientv3.LeaseID, error) {
+	lease, err := m.client.Grant(ctx, int64(m.ttl.Seconds()))
+	if err != nil {
+		return clientv3.NoLease, errors.Wrap(err, "grant lease")
+	}
+
+	if _, err := m.client.Put(ctx, m.prefix+m.self.ID, string(m.self.encode()), clientv3.WithLease(lease.ID)); err != nil {
+		return clientv3.NoLease, errors.Wrap(err, "register member")
+	}
+
+	return lease.ID, nil
+}
+
+// maintain keeps this node registered for as long as it runs. Registration is not a one-shot
+// startup step: any stall longer than the TTL loses the lease, etcd then deletes the member
+// key, and the node is gone from every peer's ring — without this loop, permanently, since
+// nothing else ever writes the key again. Losing it is therefore an ordinary event, answered
+// with a new lease and a new key rather than with an exit.
+//
+// The node deliberately does **not** fail its own readiness while absent. It still holds every
+// shard it held a moment ago and can still answer for them, and a secondary's head lives in
+// memory only, so restarting it would trade a routing problem for lost writes and a read gap —
+// on every node at once, since they lose their leases together. The absence is surfaced
+// instead ([Membership.SelfAbsent] and a warning log); the routing tier's own health signal
+// already reports the routing side of it.
+func (m *Membership) maintain(ctx context.Context) {
 	defer m.wg.Done()
 
-	ch, err := m.client.KeepAlive(ctx, m.leaseID)
+	for {
+		if !m.follow(ctx) {
+			return // Deliberate shutdown.
+		}
+
+		m.selfAbsent.Store(true)
+		m.logger().Warn("absent from cluster member set, re-registering",
+			zap.String("id", m.self.ID), zap.Int64("lease", m.leaseID.Load()))
+
+		if !m.rejoin(ctx) {
+			return
+		}
+	}
+}
+
+// follow renews the current lease until this node's registration is gone, reporting whether it
+// was lost (true) rather than the node shutting down (false). Two things end it: the clientv3
+// keep-alive channel closing, the proactive signal that the lease is gone; and the watch
+// reporting this node's own key deleted, which covers a key removed out from under a lease
+// that is otherwise still healthy.
+func (m *Membership) follow(ctx context.Context) bool {
+	// Drop an eviction signal left over from the loss just repaired, so one loss is not
+	// answered twice.
+	select {
+	case <-m.evicted:
+	default:
+	}
+
+	ch, err := m.client.KeepAlive(ctx, m.LeaseID())
 	if err != nil {
-		return
+		return ctx.Err() == nil
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return false
+		case <-m.evicted:
+			return true
 		case _, ok := <-ch:
 			if !ok {
-				return
+				return ctx.Err() == nil
 			}
 		}
 	}
 }
 
-// watch applies member PUT/DELETE events to the local set and rebuilds the ring on each
-// change, starting from rev.
+// rejoin re-registers under a fresh lease, retrying with backoff until it succeeds or the node
+// shuts down; it reports whether registration was restored. The superseded lease is revoked
+// best-effort afterwards so whatever hung off it (compaction claims) is released now rather
+// than at the end of its TTL — nothing renews it any more, so this only makes it prompt.
+func (m *Membership) rejoin(ctx context.Context) bool {
+	old := m.LeaseID()
+
+	for delay := time.Duration(0); ; delay = min(max(delay*2, retryMinBackoff), retryMaxBackoff) {
+		if delay > 0 && !sleepCtx(ctx, delay) {
+			return false
+		}
+
+		lease, err := m.register(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
+
+			m.logger().Warn("re-registration failed", zap.String("id", m.self.ID), zap.Error(err))
+
+			continue
+		}
+
+		m.leaseID.Store(int64(lease))
+		m.selfAbsent.Store(false)
+		m.rejoins.Add(1)
+		m.revoke(ctx, old)
+
+		m.logger().Warn("re-registered in cluster member set",
+			zap.String("id", m.self.ID), zap.Int64("lease", int64(lease)),
+			zap.Int64("rejoins", m.rejoins.Load()))
+
+		if fn := m.onRejoin.Load(); fn != nil {
+			(*fn)(lease)
+		}
+
+		return true
+	}
+}
+
+// revoke drops a superseded lease, ignoring the error: the usual reason it fails is that the
+// lease had already expired, which is the outcome being asked for.
+func (m *Membership) revoke(ctx context.Context, lease clientv3.LeaseID) {
+	if lease == clientv3.NoLease {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	_, _ = m.client.Revoke(ctx, lease)
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// watch keeps the local member set in step with etcd for as long as it runs. A watch is not a
+// one-shot subscription: etcd cancels one of its own accord — a compacted start revision above
+// all, which is exactly what an outage longer than etcd's compaction interval leaves behind —
+// and clientv3 reconnects a broken stream but does not resubscribe a canceled one. Without this
+// loop the member set would freeze at whatever it last saw and never resynchronize, silently:
+// the node would go on routing to peers that have since left and never see ones that joined.
+//
+// A cancellation is therefore answered with a fresh snapshot and a new watch from its revision,
+// with backoff, rather than with an exit. The snapshot is taken whole because a stream that ends
+// leaves an unknown number of changes unseen, so there is nothing to patch onto.
 func (m *Membership) watch(ctx context.Context, rev int64) {
 	defer m.wg.Done()
 
+	var delay time.Duration
+	for {
+		if rev != 0 {
+			if m.consume(ctx, rev) {
+				// The stream did deliver before it ended, so etcd is not what is failing and
+				// the next attempt need not inherit an earlier failure's backoff.
+				delay = 0
+			}
+
+			if ctx.Err() != nil {
+				return
+			}
+
+			m.logger().Warn("member watch canceled, resynchronizing", zap.Int64("rev", rev))
+
+			rev = 0
+		}
+
+		delay = min(max(delay*2, retryMinBackoff), retryMaxBackoff)
+		if !sleepCtx(ctx, delay) {
+			return
+		}
+
+		next, err := m.resync(ctx)
+		if err != nil {
+			m.logger().Warn("member resynchronization failed", zap.Error(err))
+
+			continue
+		}
+
+		rev = next
+
+		m.logger().Info("member set resynchronized",
+			zap.Int64("rev", rev), zap.Int("members", len(m.Members())))
+		m.checkSelf()
+	}
+}
+
+// resync replaces the local member set with a fresh snapshot and reports the revision to watch
+// from. It is both the initial load and the repair after a cancellation.
+func (m *Membership) resync(ctx context.Context) (int64, error) {
+	resp, err := m.client.Get(ctx, m.prefix, clientv3.WithPrefix())
+	if err != nil {
+		return 0, errors.Wrap(err, "list members")
+	}
+
+	members := make(map[string]Member, len(resp.Kvs))
+
+	for _, kv := range resp.Kvs {
+		if mem, err := decodeMember(kv.GetValue()); err == nil {
+			members[mem.ID] = mem
+		}
+	}
+
+	m.mu.Lock()
+	m.members = members
+	m.mu.Unlock()
+
+	m.rebuild()
+
+	return resp.Header.GetRevision() + 1, nil
+}
+
+// checkSelf signals eviction when this node is missing from a snapshot just taken. The DELETE
+// that removed it may have fallen in the window no watch was covering, and the keep-alive does
+// not cover a key deleted out from under a lease that is otherwise healthy — so a resync is the
+// only place the absence would be noticed at all.
+func (m *Membership) checkSelf() {
+	if m.evicted == nil {
+		return // An observer registers nothing and so cannot be evicted.
+	}
+
+	m.mu.RLock()
+	_, ok := m.members[m.self.ID]
+	m.mu.RUnlock()
+
+	if ok {
+		return
+	}
+
+	m.logger().Warn("absent from resynchronized cluster member set", zap.String("id", m.self.ID))
+
+	select {
+	case m.evicted <- struct{}{}:
+	default:
+	}
+}
+
+// consume applies member PUT/DELETE events to the local set and rebuilds the ring on each
+// change, starting from rev. It returns when the stream ends, reporting whether it delivered
+// anything at all before it did.
+func (m *Membership) consume(ctx context.Context, rev int64) (delivered bool) {
 	wch := m.client.Watch(ctx, m.prefix, clientv3.WithPrefix(), clientv3.WithRev(rev))
 	for resp := range wch {
 		if resp.Canceled {
-			return
+			return delivered
 		}
+
+		delivered = true
 
 		changed := false
 		for _, ev := range resp.Events {
@@ -289,6 +557,21 @@ func (m *Membership) watch(ctx context.Context, rev int64) {
 				id := strings.TrimPrefix(string(ev.Kv.GetKey()), m.prefix)
 				m.remove(id)
 				changed = true
+
+				if m.evicted != nil && id == m.self.ID {
+					// A node is authoritative about its own liveness, so seeing its own
+					// departure is a contradiction — and a free second detection point
+					// alongside the keep-alive, covering an externally deleted key.
+					m.logger().Warn("observed own departure from cluster member set", zap.String("id", id))
+
+					select {
+					case m.evicted <- struct{}{}:
+					default:
+					}
+
+					break
+				}
+
 				m.logger().Info("member left", zap.String("id", id))
 			}
 		}
@@ -298,6 +581,8 @@ func (m *Membership) watch(ctx context.Context, rev int64) {
 			m.logger().Info("ring rebuilt", zap.Int("members", len(m.Members())))
 		}
 	}
+
+	return delivered
 }
 
 func (m *Membership) set(mem Member) {
@@ -325,9 +610,9 @@ func (m *Membership) rebuild() {
 }
 
 func (m *Membership) logger() *zap.Logger {
-	if m.log == nil {
-		return zap.NewNop()
+	if l := m.log.Load(); l != nil {
+		return l
 	}
 
-	return m.log
+	return zap.NewNop()
 }

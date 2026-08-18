@@ -116,6 +116,17 @@ type ClusterStats struct {
 	// reads missing whatever only its peers hold. A shared mount answers true here as well, so read
 	// it as "confirm the backend really is shared", not as a fault.
 	NodeLocalBackendUnshared bool
+	// SelfAbsent reports that this node is missing from the cluster member set while still
+	// running: its etcd lease was lost (or its member key deleted) and re-registration has not
+	// yet succeeded. While it holds, no peer routes anything here and this node owns no shards
+	// — the node is up but invisible. It is transient by design (the node re-registers), so a
+	// value that is true for more than a few seconds means etcd is unreachable from here.
+	SelfAbsent bool
+	// Rejoins counts how many times this node has had to re-register after losing its
+	// membership registration. Non-zero is survivable — that is the repair working — but a
+	// number that keeps climbing means the lease TTL (cluster.Config.MemberTTL) is too tight
+	// for this environment.
+	Rejoins int64
 	// PartSync is the shared-nothing part-mirroring activity (cluster/partsync), cumulative since
 	// process start; nil unless the cluster runs with a private (per-node) backend.
 	PartSync *PartSyncStats
@@ -266,6 +277,8 @@ func (s *Storage) clusterStats() *ClusterStats {
 		Owned:                    s.cluster.ownership.Owned(),
 		PrivateBackend:           s.cluster.private,
 		NodeLocalBackendUnshared: s.opts.nodeLocalBackendUnshared(),
+		SelfAbsent:               s.cluster.membership.SelfAbsent(),
+		Rejoins:                  s.cluster.membership.Rejoins(),
 	}
 
 	for _, m := range s.cluster.membership.Members() {

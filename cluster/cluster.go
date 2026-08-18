@@ -1,6 +1,10 @@
 package cluster
 
-import "github.com/oteldb/storage/cluster/etcd"
+import (
+	"time"
+
+	"github.com/oteldb/storage/cluster/etcd"
+)
 
 // Config is the cluster configuration. It is optional: a nil [storage.Options].Cluster means
 // single-node mode (the cluster layer is absent). When set, the storage facade joins the
@@ -22,6 +26,13 @@ type Config struct {
 	ShardsPerTenant int
 	// Root is the etcd key prefix for this cluster's state. Empty ⇒ "/oteldb".
 	Root string
+	// MemberTTL is the TTL of the etcd lease this node's membership registration hangs off:
+	// how long the node may be unable to reach etcd before its peers evict it from the ring.
+	// Lowering it detects a dead node sooner at the cost of evicting a live but stalled one
+	// (a GC pause, a starved CPU, an etcd blip). An evicted node re-registers on its own, so
+	// this sets how often that happens, not whether the cluster recovers. Zero ⇒
+	// [etcd.DefaultTTL].
+	MemberTTL time.Duration
 	// PrivateBackend declares that this node's backend is private to it (a local disk, not a
 	// shared object store): peers cannot read the parts this node flushes. The cluster then
 	// replicates flushed parts node-to-node — replicas mirror their owner's backend objects
