@@ -146,8 +146,11 @@ func TestLegacyIdentityObjectStillResolves(t *testing.T) {
 	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "hello"}))
 	require.NoError(t, e.Flush(ctx))
 
+	dirs := partDirs(t, be)
+	require.Len(t, dirs, 1)
+
 	// Age the prefix: drop the part's identity object, leave the whole-set one in its place.
-	require.NoError(t, be.Delete(ctx, "t/recs/0000000000/identity"))
+	require.NoError(t, be.Delete(ctx, "t/recs/"+dirs[0]+"/identity"))
 	require.NoError(t, be.Write(ctx, "t/recs/streams.bin", legacyStreamsBin(streamIdentity("api"))))
 
 	r := recordengine.New(cfg)

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"math/rand/v2"
+	"strings"
 	"testing"
 	"time"
 
@@ -450,10 +451,20 @@ func TestClusterECShardRepair(t *testing.T) {
 
 	// A disk failure destroys the slot-2 owner's shard (its node stays in the cluster).
 	victim := nodes[owners[2].ID]
-	vkeys, err := victim.backend.List(ctx, "default/metrics/0000000000/ecshard/")
+	vkeys, err := victim.backend.List(ctx, "default/metrics/")
 	require.NoError(t, err)
-	require.NotEmpty(t, vkeys)
+
+	var shards []string
+
 	for _, k := range vkeys {
+		if strings.Contains(k, "/ecshard/") {
+			shards = append(shards, k)
+		}
+	}
+
+	require.NotEmpty(t, shards)
+
+	for _, k := range shards {
 		require.NoError(t, victim.backend.Delete(ctx, k))
 	}
 	require.Equal(t, 0, distinctSlots(t, ctx, victim.backend), "victim's shard is gone")

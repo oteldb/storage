@@ -207,7 +207,10 @@ func TestPartIdentityNotCached(t *testing.T) {
 	require.NoError(t, e.Flush(ctx))
 	require.NoError(t, engine.New(cfg).LoadParts(ctx))
 
-	key := "default/metrics/0000000000/identity"
+	dirs := partDirs(t, be, "default/metrics")
+	require.Len(t, dirs, 1)
+
+	key := "default/metrics/" + dirs[0] + "/identity"
 
 	data, err := backend.ReadUncached(ctx, be, key)
 	require.NoError(t, err)

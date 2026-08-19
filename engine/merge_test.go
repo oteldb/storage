@@ -28,16 +28,20 @@ func TestMergeCompactsParts(t *testing.T) {
 	require.NoError(t, e.Flush(context.Background()))
 	assert.Equal(t, 3, e.PartCount())
 
+	sources := partDirs(t, b, "default/metrics")
+	require.Len(t, sources, 3)
+
 	require.NoError(t, e.Merge(context.Background(), 0))
 	assert.Equal(t, 1, e.PartCount(), "three parts compact to one")
 
 	// The merged part has been written; the three source parts are gone from the backend.
 	keys, err := b.List(context.Background(), "default/metrics")
 	require.NoError(t, err)
-	for _, k := range keys {
-		assert.NotContains(t, k, "/0000000000/", "source part 0 deleted")
-		assert.NotContains(t, k, "/0000000001/", "source part 1 deleted")
-		assert.NotContains(t, k, "/0000000002/", "source part 2 deleted")
+
+	for i, src := range sources {
+		for _, k := range keys {
+			assert.NotContains(t, k, "/"+src+"/", "source part %d deleted", i)
+		}
 	}
 
 	got := fetchAll(t, e, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})

@@ -28,7 +28,6 @@ const (
 type partStreamWriter struct {
 	e      *Engine
 	w      *block.StreamWriter
-	seq    int
 	prefix string
 
 	// runs is the series column's run-length form: one entry per series, feeding both the id column
@@ -61,7 +60,7 @@ type partStreamWriter struct {
 // by the memory this process can spare for it. A writer that will not reach finish must be released
 // with abort.
 func newPartStreamWriter(
-	ctx context.Context, e *Engine, seq int, comp compressProfile, precisionBits uint8, withSF, withStats bool,
+	ctx context.Context, e *Engine, comp compressProfile, precisionBits uint8, withSF, withStats bool,
 ) (*partStreamWriter, error) {
 	blockRows := e.cfg.MetricBlockRows
 	if blockRows <= 0 {
@@ -73,7 +72,7 @@ func newPartStreamWriter(
 		opts = append(opts, block.WithCompression(comp.Algorithm), block.WithCompressionLevel(comp.Level))
 	}
 
-	prefix := e.partPrefix(seq)
+	prefix := e.newPartPrefix()
 	w := block.NewStreamWriterTo(ctx, e.cfg.Backend, prefix, opts...)
 
 	if err := w.AddColumn(block.Column{Name: colSeries, Kind: block.KindInt128}); err != nil {
@@ -102,7 +101,7 @@ func newPartStreamWriter(
 		}
 	}
 
-	return &partStreamWriter{e: e, w: w, seq: seq, prefix: prefix, withSF: withSF, withStats: withStats}, nil
+	return &partStreamWriter{e: e, w: w, prefix: prefix, withSF: withSF, withStats: withStats}, nil
 }
 
 // appendSeries appends one series' samples; a nil sf means every weight is 1.
@@ -205,7 +204,7 @@ func (p *partStreamWriter) weights(sf []float64, n int) []float64 {
 
 // finish writes the part with its sidecars, opens it and stamps its time bounds — the streaming
 // counterpart of [Engine.writeMergedPart]. At least one series must have been appended: an empty
-// part would mean a burnt sequence number and an unreadable prefix.
+// part would mean a burnt part id and an unreadable prefix.
 func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 	if p.rows == 0 {
 		return nil, errors.New("engine: finishing a merge output part with no rows")

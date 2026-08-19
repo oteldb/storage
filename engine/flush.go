@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"fmt"
 	"slices"
 
 	"github.com/go-faster/errors"
@@ -11,6 +10,7 @@ import (
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
+	"github.com/oteldb/storage/internal/partid"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -221,23 +221,16 @@ func writePart(
 // deletePart lists and removes everything under the prefix).
 func statsKey(prefix string) string { return prefix + "/stats" }
 
-// partPrefix is the backend key prefix of the seq-th part of this engine.
-func (e *Engine) partPrefix(seq int) string {
-	return fmt.Sprintf("%s/%010d", e.cfg.Prefix, seq)
-}
-
-// reserveSeq allocates the next part sequence and advances the counter immediately, so part prefixes
-// are append-only: an attempt that fails after writing some of its objects burns its sequence instead
-// of leaving it for the retry. Reuse would be unsound — the retry overwrites only the objects it
-// itself produces, so a part whose object set differs from the failed attempt's (a different column
-// framing, or no aggregate-stats sidecar) silently inherits the leftovers. The orphaned objects are
-// swept at open by [Engine.LoadParts]. Safe for concurrent use.
-func (e *Engine) reserveSeq() int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	seq := e.nextSeq
-	e.nextSeq++
-
-	return seq
+// newPartPrefix mints the backend key prefix of a new part: the engine prefix plus a globally unique
+// part id ([partid.New]). The id is minted, never derived from what this node holds, so two engines
+// over one prefix — an ownership handoff, a restore from a stale index, a rejoin after a lease loss —
+// cannot name different content with the same key and overwrite each other's objects.
+//
+// It also keeps part prefixes append-only: an attempt that fails after writing some of its objects
+// burns its prefix instead of leaving it for the retry. Reuse would be unsound — the retry overwrites
+// only the objects it itself produces, so a part whose object set differs from the failed attempt's
+// (a different column framing, or no aggregate-stats sidecar) silently inherits the leftovers. The
+// orphaned objects are swept at open by [Engine.LoadParts]. Safe for concurrent use.
+func (e *Engine) newPartPrefix() string {
+	return e.cfg.Prefix + "/" + partid.New().String()
 }

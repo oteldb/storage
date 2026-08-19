@@ -116,14 +116,13 @@ const DefaultMetricBlockRows = 1024
 type Engine struct {
 	cfg Config
 	mu  sync.RWMutex
-	// flushMu serializes the *whole* body of a flush or merge (both mutate parts and reserve part
-	// sequences off e.mu). The facade drives them from one maintenance goroutine, but the type is
-	// exported and Close/Reset are callable from anywhere, so the single-mutator invariant is enforced
-	// here rather than assumed. Always taken before e.mu, never while holding it.
+	// flushMu serializes the *whole* body of a flush or merge (both mutate parts off e.mu). The facade
+	// drives them from one maintenance goroutine, but the type is exported and Close/Reset are callable
+	// from anywhere, so the single-mutator invariant is enforced here rather than assumed. Always taken
+	// before e.mu, never while holding it.
 	flushMu sync.Mutex
 	head    *head
 	parts   []*part
-	nextSeq int
 	// idleMerges counts consecutive merges that selected nothing, so the selector can waive its
 	// write-amplification guard for parts that would otherwise never merge (see pickMergeRun).
 	// Written only under flushMu, which a merge holds across its whole body; atomic so
@@ -1114,8 +1113,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 
 	e.mu.Lock()
 	e.head = newHead()
-	e.flushing = nil // discarded with the head: Reset drops the samples, it does not flush them
-	e.nextSeq = 0
+	e.flushing = nil        // discarded with the head: Reset drops the samples, it does not flush them
 	e.identityDirty = false // nothing is left to prune
 
 	if e.cfg.Backend == nil {
@@ -1302,7 +1300,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	defer e.flushMu.Unlock()
 
 	// Plan (under lock): detach the head's sample buffers, keeping them readable via e.flushing so a
-	// concurrent fetch never loses them, and reserve the part sequence.
+	// concurrent fetch never loses them.
 	e.mu.Lock()
 	detached := e.head.detach()
 	if detached == nil {
@@ -1338,7 +1336,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	newParts := make([]*part, 0, len(ranges))
 	for _, rg := range ranges {
 		sub := cols.slice(rg[0], rg[1])
-		prefix := e.partPrefix(e.reserveSeq())
+		prefix := e.newPartPrefix()
 
 		if err := writePart(ctx, e.cfg.Backend, prefix, sub, idents,
 			compressProfile{}, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {

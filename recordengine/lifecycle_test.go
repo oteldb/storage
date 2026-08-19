@@ -25,7 +25,7 @@ type gateWrites struct {
 }
 
 func (g *gateWrites) Write(ctx context.Context, key string, data []byte) error {
-	if strings.Contains(key, "/0000000000/") {
+	if isPartObject(key) {
 		g.once.Do(func() { close(g.entered) })
 		<-g.release
 	}
@@ -115,6 +115,10 @@ func TestResetKeepsPartsUnderRead(t *testing.T) {
 
 	ingest(t, e, mkBatch("api", recs...))
 	require.NoError(t, e.Flush(ctx))
+
+	dirs := partDirs(t, be)
+	require.Len(t, dirs, 1)
+
 	be.armed.Store(true)
 
 	type result struct {
@@ -150,7 +154,7 @@ func TestResetKeepsPartsUnderRead(t *testing.T) {
 	<-be.entered // the fetch holds the part and is reading its columns
 
 	require.NoError(t, e.Reset(ctx))
-	require.Positive(t, objectCount(t, be, "t/recs/0000000000/"),
+	require.Positive(t, objectCount(t, be, "t/recs/"+dirs[0]+"/"),
 		"a part a fetch is reading must outlive the reset")
 
 	be.armed.Store(false)

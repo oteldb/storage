@@ -807,8 +807,8 @@ func livePart(key string, liveParts map[string]struct{}) bool {
 	return false
 }
 
-// compareIndexes orders two bucket indexes by recency: the higher max part sequence wins, then
-// the higher flushed epoch. Zero means indistinguishable (same generation).
+// compareIndexes orders two bucket indexes by recency: the lexicographically higher max part
+// prefix wins, then the higher flushed epoch. Zero means indistinguishable (same generation).
 func compareIndexes(a, b *bucketindex.Index) int {
 	// The commit generation is the only thing that orders index *states*: it advances on a
 	// rewrite that merely removes parts, which is precisely the rewrite the fallbacks below
@@ -824,7 +824,7 @@ func compareIndexes(a, b *bucketindex.Index) int {
 	// writers did express. This is the pre-#278 ranking, kept only for the transition, and it
 	// cannot tell a shrunk index from a damaged one — which is why the caller treats a
 	// non-superseding index as unable to authorize a deletion.
-	as, bs := maxSeq(a), maxSeq(b)
+	as, bs := maxPartPrefix(a), maxPartPrefix(b)
 
 	switch {
 	case as != bs:
@@ -844,11 +844,13 @@ func compareIndexes(a, b *bucketindex.Index) int {
 	}
 }
 
-func maxSeq(ix *bucketindex.Index) int {
-	m := -1
+// maxPartPrefix is the highest part id in ix. Part ids sort lexicographically in creation order, so
+// the highest one names the index's newest part.
+func maxPartPrefix(ix *bucketindex.Index) string {
+	var m string
 
 	for _, e := range ix.Entries {
-		if n, err := strconv.Atoi(path.Base(e.Prefix)); err == nil && n > m {
+		if n := path.Base(e.Prefix); n > m {
 			m = n
 		}
 	}

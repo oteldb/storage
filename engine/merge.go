@@ -78,8 +78,8 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
 
-	// Plan (under lock): snapshot the source parts (immutable backing). Output part sequences are
-	// reserved one at a time, as the parts are written.
+	// Plan (under lock): snapshot the source parts (immutable backing). Output part ids are minted one
+	// at a time, as the parts are written.
 	e.mu.Lock()
 	src := e.parts
 	e.mu.Unlock()
@@ -267,7 +267,7 @@ func (e *Engine) writeColumns(ctx context.Context, cols *flushColumns, capRows i
 	for _, rg := range ranges {
 		sub := cols.slice(rg[0], rg[1])
 
-		p, err := e.writeMergedPart(ctx, sub, e.reserveSeq(), opts)
+		p, err := e.writeMergedPart(ctx, sub, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -278,12 +278,12 @@ func (e *Engine) writeColumns(ctx context.Context, cols *flushColumns, capRows i
 	return newParts, nil
 }
 
-// writeMergedPart writes cols as the seq-th output part with the compression its size and age select
+// writeMergedPart writes cols as an output part with the compression its size and age select
 // ([mergeProfile]) and the precision its own newest sample selects, reads it back, and stamps its
 // time bounds.
-func (e *Engine) writeMergedPart(ctx context.Context, cols *flushColumns, seq int, opts MergeOptions) (*part, error) {
+func (e *Engine) writeMergedPart(ctx context.Context, cols *flushColumns, opts MergeOptions) (*part, error) {
 	minT, maxT := colsTimeRange(cols)
-	prefix := e.partPrefix(seq)
+	prefix := e.newPartPrefix()
 	// The merged part's identities come from the resident index, which spans every live series —
 	// snapshotted here (a brief read lock, off the flush path) because the write itself is off-lock.
 	idents := e.identitiesForColumn(cols.series)
@@ -435,7 +435,7 @@ func (e *Engine) compactStream(
 
 		if cur == nil {
 			if cur, err = newPartStreamWriter(
-				ctx, e, e.reserveSeq(), comp, precision, withSF, e.cfg.AggregateStats,
+				ctx, e, comp, precision, withSF, e.cfg.AggregateStats,
 			); err != nil {
 				return nil, err
 			}

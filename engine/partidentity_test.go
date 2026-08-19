@@ -106,8 +106,11 @@ func TestLegacyIdentityObjectStillResolves(t *testing.T) {
 	mustAppend(t, e, api, 100, 1)
 	require.NoError(t, e.Flush(ctx))
 
+	dirs := partDirs(t, be, "t/legacy")
+	require.Len(t, dirs, 1)
+
 	// Age the prefix: drop the part's identity object and leave the whole-set one in its place.
-	require.NoError(t, be.Delete(ctx, "t/legacy/0000000000/identity"))
+	require.NoError(t, be.Delete(ctx, "t/legacy/"+dirs[0]+"/identity"))
 	require.NoError(t, be.Write(ctx, "t/legacy/series.bin", legacySeriesBin(api)))
 
 	r := engine.New(cfg)

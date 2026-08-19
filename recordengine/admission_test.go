@@ -2,7 +2,6 @@ package recordengine_test
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"testing"
 
@@ -74,7 +73,7 @@ type blockWrite struct {
 }
 
 func (b *blockWrite) Write(ctx context.Context, key string, data []byte) error {
-	if strings.Contains(key, "/0000000000/") {
+	if isPartObject(key) {
 		b.once.Do(func() { close(b.entered) })
 		<-b.release
 	}
