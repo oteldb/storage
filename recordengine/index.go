@@ -21,18 +21,49 @@ import (
 func (e *Engine) indexKey() string  { return e.cfg.Prefix + "/" + bucketindex.Object }
 func (e *Engine) streamKey() string { return e.cfg.Prefix + "/streams.bin" }
 
-// updateIndexLocked rewrites the bucket index to match the engine's current parts. No-op for a
-// head-only engine. Caller holds e.mu.
+// updateIndexLocked commits a bucket index matching the engine's current parts. It is a no-op for
+// a head-only engine (no backend). Caller holds e.mu.
+//
+// The commit claims a generation-named object, so a peer writing the same prefix — every replica
+// of a shard does, over a shared store — cannot silently overwrite it. Losing the claim reloads
+// and rebuilds on what did get committed, which is why the build is a closure ([bucketindex.Commit]
+// runs it once per attempt); an exhausted retry returns an error, so a flush never reports a
+// success whose index is not in the store.
 func (e *Engine) updateIndexLocked(ctx context.Context) error {
 	if e.cfg.Backend == nil {
 		return nil
 	}
 
-	// The generation advances on every write, including one that only removes parts — which is
-	// the whole point of it, since that is exactly the rewrite the part names cannot express.
-	e.generation = e.generation.Next(e.term())
+	// The part set this engine last saw committed, held across retries: entries it names that
+	// this engine no longer has are the ones *it* removed, whichever index a retry rebuilds on.
+	known := make(map[string]struct{})
+	if e.committed != nil {
+		for _, ent := range e.committed.Entries {
+			known[ent.Prefix] = struct{}{}
+		}
+	}
 
-	ix := &bucketindex.Index{FlushedEpoch: e.flushedEpoch, Generation: e.generation}
+	ix, err := bucketindex.Commit(ctx, e.cfg.Backend, e.indexKey(), e.term(), e.committed,
+		func(base *bucketindex.Index, g bucketindex.Generation) *bucketindex.Index {
+			return e.buildIndexLocked(base, g, known)
+		})
+	if err != nil {
+		return errors.Wrap(err, "commit bucket index")
+	}
+
+	e.committed = ix
+
+	return nil
+}
+
+// buildIndexLocked renders the index this engine's parts imply on top of base, the state actually
+// committed. known is the part set this engine last saw committed. Caller holds e.mu.
+func (e *Engine) buildIndexLocked(
+	base *bucketindex.Index,
+	g bucketindex.Generation,
+	known map[string]struct{},
+) *bucketindex.Index {
+	ix := &bucketindex.Index{FlushedEpoch: e.flushedEpoch, Generation: g}
 
 	live := make(map[string]struct{}, len(e.parts))
 	for _, p := range e.parts {
@@ -40,24 +71,37 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 		live[p.prefix] = struct{}{}
 	}
 
+	removals := slices.Clone(base.Removed)
+
 	// A part the last index named and this one does not was removed here, and says so. Absence
 	// on its own is not evidence — a part missing from an index is either one a merge consumed
 	// or one the node lost, and a reader cannot tell those apart without being told.
-	for prefix := range e.indexed {
+	for prefix := range known {
 		if _, ok := live[prefix]; !ok {
-			e.removals = append(e.removals, bucketindex.Removal{Prefix: prefix, Generation: e.generation})
+			removals = append(removals, bucketindex.Removal{Prefix: prefix, Generation: g})
 		}
 	}
 
-	e.removals = bucketindex.TrimRemovals(e.removals, live, bucketindex.MaxRemovals)
-	ix.Removed = e.removals
-	e.indexed = live
+	// Everything else the committed index names belongs to another writer over the same prefix,
+	// and is carried forward: this engine cannot serve those parts, but rewriting the index from
+	// its own part set alone would unlink parts whose objects are in the store, and the next
+	// orphan sweep would then delete them.
+	for _, ent := range base.Entries {
+		if _, ok := live[ent.Prefix]; ok {
+			continue
+		}
 
-	if err := ix.Save(ctx, e.cfg.Backend, e.indexKey()); err != nil {
-		return errors.Wrap(err, "save bucket index")
+		if _, ok := known[ent.Prefix]; ok {
+			continue
+		}
+
+		ix.Add(ent)
+		live[ent.Prefix] = struct{}{}
 	}
 
-	return nil
+	ix.Removed = bucketindex.TrimRemovals(removals, live, bucketindex.MaxRemovals)
+
+	return ix
 }
 
 // LoadParts reconstructs the engine's durable state from the object store: the part set from the
@@ -114,13 +158,7 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 	e.parts = parts
 	e.nextSeq = maxSeq + 1
 	e.flushedEpoch = ix.FlushedEpoch
-	e.generation = ix.Generation
-	e.removals = ix.Removed
-	e.indexed = make(map[string]struct{}, len(ix.Entries))
-
-	for _, entry := range ix.Entries {
-		e.indexed[entry.Prefix] = struct{}{}
-	}
+	e.committed = ix
 
 	if sweep {
 		next, err := e.sweepOrphansLocked(ctx, maxSeq)

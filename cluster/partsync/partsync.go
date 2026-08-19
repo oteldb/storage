@@ -681,6 +681,8 @@ func classifyFetch(remote []string, enginePrefix, indexKey string, have map[stri
 		switch {
 		case k == indexKey:
 			// installed by the caller, last
+		case bucketindex.IsGenerationKey(k):
+			// the peer's commit tokens: its claim sequence over its own store, not part data
 		case isMutableAux(k):
 			mutable = append(mutable, k)
 		default:
@@ -721,6 +723,14 @@ func (s *Syncer) prune(ctx context.Context, st *Stats, enginePrefix string, keep
 
 	for _, k := range local {
 		seen[k] = struct{}{}
+
+		// This node's own commit tokens. They are never mirrored, so remote absence says nothing
+		// about them, and deleting one would drop a generation a load still resolves through.
+		if bucketindex.IsGenerationKey(k) {
+			delete(counts, k)
+
+			continue
+		}
 
 		// A live part's protected objects must never be pruned by source absence:
 		//   - objects this node should hold (keep) — its own shard slot, full copies — are

@@ -47,8 +47,9 @@ mandatory fallback, so a wrapped backend runs the same code, only slower.
   removes the clone-per-hit that dominated the query-path allocation profile; `backend.ReadView`
   falls back to `Read` on backends without it, and `block.PartReader` reads through it.
 - **`backend/bucketindex`** — compact versioned index (part list + per-part time bounds + the WAL
-  flushed-epoch watermark) in one object, so a stateless reader enumerates and time-prunes a
-  tenant's parts without a full `List`. Fuzzed + golden-tested.
+  flushed-epoch watermark + the commit generation and its removal tombstones) in one object, so a
+  stateless reader enumerates and time-prunes a tenant's parts without a full `List`. Fuzzed +
+  golden-tested. Committing it is a CAS, not an overwrite — see below.
 - **`backend.ReaderAt`** — optional `ReadAt(ctx,key,off,n)`, the read counterpart of
   `ObjectCreator` and the reason a query touching a few granules no longer pays for the whole
   column (`block/ARCH.md`, "Reading a column by range"). The range is **clamped to the object's
@@ -93,6 +94,47 @@ mandatory fallback, so a wrapped backend runs the same code, only slower.
   and object stores, where local free space has no meaning — and the caller then falls back to its
   configured ceiling. **A wrapper must forward it**: `cachedBackend` does, or every cached backend
   would silently lose the capability.
+
+## Committing the bucket index
+
+The index is the commit point of a flush or a merge, and the shared-store deployment
+(`cluster.Config.PrivateBackend` false) runs **every replica of a shard over one bucket under one
+prefix**. An unconditional `Write` there is last-writer-wins: two writers that loaded the same index
+each commit a part set naming only their own part, and the loser's part is left durable, unreachable,
+and deleted by the next open's orphan sweep. So the commit is a claim, and `PutIfAbsent` is what
+makes it one.
+
+**Layout.** `{prefix}/bucket-index.bin` is joined by `{prefix}/bucket-index/{term}-{counter}.bin`,
+one object per committed generation, named in fixed-width hex so key order *is* generation order.
+A commit claims the object for the successor of the generation the writer **observed** and, having
+won it, refreshes `bucket-index.bin` with the same bytes.
+
+**`bucket-index.bin` is a full copy, not a pointer.** It is what every reader that knows only the
+conventional key goes on reading — a prefix written by an older build, the per-signal existence
+marker `Storage.recover` scans for, the object `cluster/partsync` mirrors between peers — so there
+is no migration step and no flag day: an upgraded writer's first commit supersedes what it finds,
+and a rollback to a build that only overwrites the key stays readable (`Load` takes whichever of the
+key and the newest claim is newer). Correctness never rests on it; a load that resolves past it
+repairs it, which is how a crash between a claim and that refresh heals.
+
+**Load** costs one `Read` plus one `List` of a directory bounded by the reclamation window — not a
+`List` of the prefix, and nothing on the query path: only opening, recovery, and a replica refresh
+resolve the index. Reclamation drops generations the newest supersedes by the full window, once
+every window commits, so the listing stays small. It cannot delete an object a load is about to
+read: a load resolves the *newest* generation it listed, and one that far behind reads a missing
+object and re-resolves onto a newer one.
+
+**The loser is told.** `Save` returns an `ErrConflict`-wrapping error; `bucketindex.Commit` — what
+both engines' `updateIndexLocked` call — reloads, re-runs the caller's build closure against what
+actually got committed, and claims again, up to a bounded number of attempts, after which it returns
+the conflict. A flush therefore never reports success on a commit that is not in the store, and the
+rebuild carries forward entries the reloaded index names and this engine never had: they are a peer's
+parts, and rewriting the index from one node's part set alone is the loss this protocol exists to
+stop. A failed refresh of `bucket-index.bin` drops the claim again, keeping the commit point single.
+
+The generation objects are **commit state, not part data**: `bucketindex.IsGenerationKey` marks them
+so a sweep or a replication pass that walks the prefix leaves them alone (`partsync` neither mirrors
+nor prunes them — a peer's claim sequence says nothing about this node's).
 
 ## Stateless read path
 

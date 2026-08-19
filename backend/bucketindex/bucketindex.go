@@ -269,32 +269,62 @@ func readVarint(buf []byte) (int64, []byte, bool) {
 	return v, buf[m:], true
 }
 
-// Load reads the index stored under key from b. A missing object is reported as an empty
-// index (the read path starts before any flush has written one).
+// Load returns the committed index at key, resolving the newest generation a writer claimed
+// (see [Commit]). A prefix with no index at all is reported as an empty index — the read path
+// starts before any flush has written one.
+//
+// It costs one Read and one LIST of a directory bounded by [keepGenerations]: the object at key
+// carries the whole index, so the listing only has to answer whether a newer generation was
+// claimed than the one that object holds. That happens when a writer crashed between claiming a
+// generation and refreshing key, and when a peer sharing the prefix committed last; the object at
+// key is repaired to what resolved, so every reader that knows only that key catches up.
 func Load(ctx context.Context, b backend.Backend, key string) (*Index, error) {
-	data, err := b.Read(ctx, key)
-	if err != nil {
-		if errors.Is(err, backend.ErrNotExist) {
-			return &Index{}, nil
+	for range maxResolveAttempts {
+		current, found, err := read(ctx, b, key)
+		if err != nil {
+			return nil, err
 		}
 
-		return nil, errors.Wrapf(err, "read index %q", key)
+		g, ok, err := newest(ctx, b, key)
+		if err != nil {
+			return nil, err
+		}
+
+		if !ok || (found && current.Generation.Compare(g) >= 0) {
+			if !found {
+				return &Index{}, nil
+			}
+
+			return current, nil
+		}
+
+		ix, found, err := read(ctx, b, GenerationKey(key, g))
+		if err != nil {
+			return nil, err
+		}
+
+		if !found {
+			continue // reclaimed under us: a newer generation exists, resolve again
+		}
+
+		if err := b.Write(ctx, key, ix.AppendBinary(nil)); err != nil {
+			return nil, errors.Wrapf(err, "repair index %q", key)
+		}
+
+		return ix, nil
 	}
 
-	ix, err := Decode(data)
-	if err != nil {
-		return nil, errors.Wrapf(err, "decode index %q", key)
-	}
-
-	return ix, nil
+	return nil, errors.Wrapf(ErrConflict, "index %q did not resolve in %d attempts", key, maxResolveAttempts)
 }
 
-// Save writes the index under key in b (overwriting the previous version atomically per the
-// backend's per-object write atomicity).
+// Save commits ix as the successor of the state it was loaded from, within the same term: it
+// claims the generation after the one ix carries, and stamps ix with it (see [Commit], which is
+// this with the reload-and-retry a writer needs to make progress against a peer).
+//
+// A writer whose generation was claimed since it loaded gets an [ErrConflict]-wrapping error and
+// must not treat its index as written.
 func (ix *Index) Save(ctx context.Context, b backend.Backend, key string) error {
-	if err := b.Write(ctx, key, ix.AppendBinary(nil)); err != nil {
-		return errors.Wrapf(err, "write index %q", key)
-	}
+	ix.Generation = ix.Generation.Next(ix.Generation.Term)
 
-	return nil
+	return ix.commit(ctx, b, key)
 }

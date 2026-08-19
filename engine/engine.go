@@ -156,16 +156,12 @@ type Engine struct {
 	// the segments outlive their checkpoint (a node that stops being the shard's compaction owner
 	// stops checkpointing, but its parts still arrive from the owner).
 	flushedEpoch uint64
-	// generation is the commit generation of the last bucket index this engine wrote, advanced on
-	// every write. It is deliberately *not* reset by Reset: dropping the data does not entitle the
-	// engine to write an index a replica would refuse as stale.
-	generation bucketindex.Generation
-	// indexed is the part set of the last bucket index this engine wrote, and removals the
-	// tombstones it carried. Together they turn the next write's diff into a statement: a part
-	// that was indexed and is not any more was removed *by this writer*, which is what lets a
-	// replica tell a compaction from a loss.
-	indexed  map[string]struct{}
-	removals []bucketindex.Removal
+	// committed is the newest bucket index this engine saw committed — the one it wrote, or the one
+	// it loaded — and the state its next commit builds on. It carries the generation to succeed, the
+	// part set whose diff makes this writer's removals a statement rather than an absence, and the
+	// tombstones stating them. It is deliberately *not* reset by Reset: dropping the data does not
+	// entitle the engine to write an index a replica would refuse as stale.
+	committed *bucketindex.Index
 	// blockCache memoizes decoded column blocks across fetches (LRU, keyed by part/column/block); nil
 	// ⇒ decode every fetch. A fetch caches only the blocks its matched series touch, so the resident
 	// set is the useful blocks across live parts rather than every whole part touched.

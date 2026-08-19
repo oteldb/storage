@@ -173,7 +173,9 @@ the client verifies). A `Syncer` **mirrors an engine prefix from the newest peer
 peer's bucket index, pick the newest, copy missing objects — **manifest after the part's other
 objects, bucket index after everything**, so the local index only ever references fully-copied
 parts (the same commit-point discipline as flush; a crashed sync leaves an orphan retried next
-pass).
+pass). The bucket index's **generation objects are neither mirrored nor pruned**: they are one
+store's claim sequence, and a peer's says nothing about which of this node's a load still resolves
+through (`backend/ARCH.md`, "Committing the bucket index").
 
 **Absence is not an instruction.** Mirroring a peer, obeying its deletions, and deleting a
 particular part are three separate claims. Only an index that *supersedes* the local one may do the

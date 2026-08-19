@@ -135,7 +135,10 @@ degrades into a silently partial result.
   commit point in both engines: everything a committed part needs to stay readable must be durable
   first — its column objects and, in `engine`, the part's own identity object naming its series.
   Publish order is chosen to leave recoverable slack on a crash — unreferenced objects, an orphan
-  part swept at the next open — never rows that are committed but unresolvable.
+  part swept at the next open — never rows that are committed but unresolvable. That commit is a
+  **claim, not an overwrite**: it is `PutIfAbsent` on a generation-named object, so a writer sharing
+  the prefix is told it lost and rebuilds instead of unlinking a peer's part
+  ([`backend/ARCH.md`](backend/ARCH.md), "Committing the bucket index").
 - **Identity is scoped to the part that holds it** (both engines). Each part carries the identities of its own series, so retention is self-cleaning
   (dropping a part drops them), a flush persists what it wrote rather than the whole set, and every
   node — owner or replica — derives its live identity set from its own parts. The resident index is

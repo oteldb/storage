@@ -47,7 +47,7 @@ func writePart(t *testing.T, be backend.Backend, ix *bucketindex.Index, prefix s
 // saveIndex persists ix as prefix's bucket index.
 func saveIndex(t *testing.T, be backend.Backend, prefix string, ix *bucketindex.Index) {
 	t.Helper()
-	require.NoError(t, ix.Save(context.Background(), be, prefix+"/"+bucketindex.Object))
+	require.NoError(t, be.Write(context.Background(), prefix+"/"+bucketindex.Object, ix.AppendBinary(nil)))
 }
 
 func TestSyncMirrorsNewerPeer(t *testing.T) {
