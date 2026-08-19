@@ -1,22 +1,51 @@
 # `backend/` — the L1 storage seam
 
 One interface over whole-object, slash-delimited keys: `Read`/`Write`/`List`/`Delete`/
-`PutIfAbsent`, plus `IsEphemeral`. Absent keys return `backend.ErrNotExist`.
-**`PutIfAbsent` is the CAS primitive** every atomic manifest/index commit builds on
-(single-writer-wins, no Raft): guarded map insert (memory), exclusive `os.Link` (file),
-`If-None-Match: *` (s3).
+`PutIfAbsent`/`CompareAndSwap`/`ReadVersioned`, plus `IsEphemeral`. Absent keys return
+`backend.ErrNotExist`.
+
+**Two conditional-write primitives** carry every atomic manifest/index commit, so multi-writer
+coordination over one prefix needs no Raft. `PutIfAbsent` claims an *absent* key — guarded map
+insert (memory), exclusive `os.Link` (file), `If-None-Match: *` (s3). `CompareAndSwap` replaces an
+*existing* one only if it still holds the `backend.Version` the committer read, which is the case
+an absent-key claim cannot express: a shared store where every replica of a shard rewrites one
+index object under one prefix, and an unconditional `Write` silently drops whichever entry lost
+(#392 — the part objects stay durable, unreferenced, and the next open-time orphan sweep deletes
+them).
+
+### The version token
+
+`Version` is opaque and compared only for equality — never ordered. `ReadVersioned` hands back the
+value and its version together, `CompareAndSwap` returns the version its write produced, so a
+committer holds a token across commits and pays no read per commit. Absence is itself a version
+(`VersionAbsent`), which makes a first commit the same call as every later one.
+
+It identifies **contents, not writes**: memory and file derive it as a truncated SHA-256 of the
+stored bytes (`backend.ContentVersion`), s3 uses the object's ETag. Rewriting a key with the bytes
+it already holds may therefore leave the version unchanged — which is safety, not exposure to ABA:
+the state a committer conditions on *is* the object, so a version that came back means the bytes
+came back.
+
+**A lost race is `(false, nil)`, not an error.** Nothing failed and nothing is broken — the
+committer holds a stale version and must reload, rebuild, and retry. Returning an error would put
+contention on the path every caller funnels into "the backend is unhealthy", which is how a busy
+prefix becomes an outage. An error means the operation could not be evaluated at all and says
+nothing about whether the write landed. One layer up, `bucketindex.Index.Save` *does* wrap
+`ErrConflict` for a lost race: its caller holds a part nothing references yet, and anything short
+of an error there would let a flush report success over a dropped entry.
 
 Implementations are **interchangeable** — `backend/backendtest.Run(t, factory)` is the shared
 conformance suite all of them pass under `-race`.
 
 **`backend/faultbackend`** is the fault-injection wrapper for tests: rules match an operation by
-kind and key and either fail it, rewrite the bytes a read returns, or run a hook before it. The
-rewrite models the failure an error cannot — a store handing back data that is not what was written,
-and saying nothing. The hook is the point of the package — a `Gate` suspends the matching operation
-*inside* the backend until the test releases it, so a test states a distributed interleaving instead
-of racing for one with sleeps, and the code under test needs no seams of its own. It forwards none
-of the optional capabilities below: each has a mandatory fallback, so a wrapped backend runs the
-same code, only slower.
+kind and key (`CompareAndSwap` and `ReadVersioned` included — a gate there is how a test states the
+commit-protocol interleaving) and either fail it, rewrite the bytes a read returns, or run a hook
+before it. The rewrite models the failure an error cannot — a store handing back data that is not
+what was written, and saying nothing. The hook is the point of the package — a
+`Gate` suspends the matching operation *inside* the backend until the test releases it, so a test
+states a distributed interleaving instead of racing for one with sleeps, and the code under test
+needs no seams of its own. It forwards none of the optional capabilities below: each has a
+mandatory fallback, so a wrapped backend runs the same code, only slower.
 
 The tests it drives that describe an *unfixed* defect are gated by `internal/reproduce`: they skip
 unless `OTELDB_STORAGE_REPRODUCE=1`, so CI stays green while the defect stays one command away from
@@ -31,7 +60,12 @@ a demonstration.
   whose size grows with parts *ever created* — maintenance lists per tenant/signal every tick.
 - **`backend/s3`** — store-specific calls sit behind a small `ObjectStore` interface so the
   contract logic (root prefixing, sorted listing, 404→`ErrNotExist`, conditional put, idempotent
-  delete) is testable over a fake. `NewAWS` adapts aws-sdk-go-v2 — **the only package importing
+  delete) is testable over a fake. `CompareAndSwap` is `If-Match` on the object's ETag (and
+  `If-None-Match: *` for the create), evaluated by the store itself — a genuine CAS across
+  processes, not a read-then-write. S3 answers a failed precondition with 412 and an `If-Match`
+  against an absent key with 404; both are a lost race, not an error. A store that reports no ETag
+  on a successful conditional put is rejected outright, since an empty token is indistinguishable
+  from `VersionAbsent` and would wedge the committer's next write forever. `NewAWS` adapts aws-sdk-go-v2 — **the only package importing
   the AWS SDK**. An always-on integration test runs the suite over a real S3 protocol server
   (embeddable `go-faster/fs` on `httptest`, no Docker).
 - **`backend.Cached(inner, maxBytes)`** — byte-bounded read cache for the cold tier. Correct by
@@ -44,7 +78,11 @@ a demonstration.
   larger than the whole budget is never retained.
 - **`backend.WriteUncached` / `backend.ReadUncached`** — the escape hatch from that cache for the
   few *mutable* objects rewritten far more often than they are read: the engines' identity sets,
-  written when identity changes and read only on recovery. Caching one is pure eviction pressure (at
+  written when identity changes and read only on recovery. `ReadVersioned` bypasses the cache for
+  the same reason and always: the version it returns is what a commit conditions on, and a resident
+  copy only proves what *this* process last saw — the objects committed conditionally are exactly
+  the mutable ones another writer rewrites. It refreshes the entry with what it read, so the
+  pass-through costs one read, not two. Caching one is pure eviction pressure (at
   real cardinality a single identity object is a large fraction of the budget), and it is the one
   object class where the write-once-immutable premise above does not hold. `WriteUncached` still
   invalidates the key, so a reader never sees a superseded value.
@@ -54,7 +92,14 @@ a demonstration.
   falls back to `Read` on backends without it, and `block.PartReader` reads through it.
 - **`backend/bucketindex`** — compact versioned index (part list + per-part time bounds + the WAL
   flushed-epoch watermark) in one object, so a stateless reader enumerates and time-prunes a
-  tenant's parts without a full `List`. Fuzzed + golden-tested.
+  tenant's parts without a full `List`. Fuzzed + golden-tested. **It is committed through
+  `CompareAndSwap`**: `LoadVersioned` returns the index with the version it was read at, `Save`
+  commits against that version, and a loser wraps `ErrConflict`. The engines
+  (`engine`/`recordengine`, `updateIndexLocked`) run the loop: on a conflict they reload, raise
+  their generation above the winner's, record the winner's entries as *foreign* — entries they
+  neither wrote nor removed, carried into every later commit so they are never dropped — and retry,
+  bounded at 8 attempts. Exhausting the bound fails the flush or merge that asked for the commit,
+  because a part whose entry never landed is unreachable.
 - **`backend.ReaderAt`** — optional `ReadAt(ctx,key,off,n)`, the read counterpart of
   `ObjectCreator` and the reason a query touching a few granules no longer pays for the whole
   column (`block/ARCH.md`, "Reading a column by range"). The range is **clamped to the object's

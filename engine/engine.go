@@ -165,6 +165,15 @@ type Engine struct {
 	// replica tell a compaction from a loss.
 	indexed  map[string]struct{}
 	removals []bucketindex.Removal
+	// indexVersion is the backend version of the bucket index this engine last read or committed —
+	// the token its next commit conditions on, so a rewrite that another writer got in front of is
+	// refused rather than silently overwriting it (#392).
+	indexVersion backend.Version
+	// foreign are index entries a *concurrent* writer committed over this prefix, learned when a
+	// commit lost the race and reloaded. They are carried into every later commit: this engine
+	// knows nothing about those parts but must not drop them, because the entry is all that keeps
+	// the part reachable. Empty for the single-writer case, which never reloads.
+	foreign []bucketindex.Entry
 	// blockCache memoizes decoded column blocks across fetches (LRU, keyed by part/column/block); nil
 	// ⇒ decode every fetch. A fetch caches only the blocks its matched series touch, so the resident
 	// set is the useful blocks across live parts rather than every whole part touched.

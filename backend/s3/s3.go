@@ -39,6 +39,17 @@ type ObjectStore interface {
 	// was created (the conditional write — S3 If-None-Match: *).
 	PutObjectIfAbsent(ctx context.Context, key string, data []byte) (bool, error)
 
+	// PutObjectIfVersion stores data under key only if the object's current ETag is etag, and
+	// returns the ETag the object then has. An empty etag demands that the object not exist
+	// (If-None-Match: *); a non-empty one is S3's If-Match. ok is false — with a nil error —
+	// when the condition did not hold, including an If-Match against an absent key, which S3
+	// answers 404 rather than 412.
+	PutObjectIfVersion(ctx context.Context, key string, data []byte, etag string) (newETag string, ok bool, err error)
+
+	// GetObjectVersion returns the object bytes and its ETag, or an error wrapping
+	// [ErrObjectNotFound] if absent.
+	GetObjectVersion(ctx context.Context, key string) ([]byte, string, error)
+
 	// HeadObject reports whether key exists.
 	HeadObject(ctx context.Context, key string) (bool, error)
 

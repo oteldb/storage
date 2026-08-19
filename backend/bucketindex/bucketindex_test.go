@@ -165,7 +165,8 @@ func TestLoadSave(t *testing.T) {
 	assert.Empty(t, empty.Entries)
 
 	ix := &bucketindex.Index{Entries: []bucketindex.Entry{{Prefix: "default/metrics/0", MinTime: 1, MaxTime: 9}}}
-	require.NoError(t, ix.Save(ctx, b, key))
+	_, err = ix.Save(ctx, b, key, backend.VersionAbsent)
+	require.NoError(t, err)
 
 	got, err := bucketindex.Load(ctx, b, key)
 	require.NoError(t, err)
@@ -184,18 +185,20 @@ func TestLoadCorruptErrors(t *testing.T) {
 	require.ErrorIs(t, err, bucketindex.ErrCorrupt)
 }
 
-// failWrite is a backend whose Write always fails, to exercise Save's error path.
+// failWrite is a backend whose conditional write always fails, to exercise Save's error path.
 type failWrite struct{ backend.Backend }
 
-func (failWrite) Write(context.Context, string, []byte) error {
-	return assert.AnError
+func (failWrite) CompareAndSwap(
+	context.Context, string, backend.Version, []byte,
+) (backend.Version, bool, error) {
+	return backend.VersionAbsent, false, assert.AnError
 }
 
 func TestSaveError(t *testing.T) {
 	t.Parallel()
 
 	ix := &bucketindex.Index{Entries: []bucketindex.Entry{{Prefix: "p"}}}
-	err := ix.Save(context.Background(), failWrite{backend.Memory()}, "k")
+	_, err := ix.Save(context.Background(), failWrite{backend.Memory()}, "k", backend.VersionAbsent)
 	require.Error(t, err)
 }
 

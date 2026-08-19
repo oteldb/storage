@@ -2,6 +2,8 @@ package s3_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"slices"
 	"sync"
 	"testing"
@@ -64,6 +66,48 @@ func (f *fakeStore) PutObjectIfAbsent(_ context.Context, key string, data []byte
 	f.objs[key] = clone(data)
 
 	return true, nil
+}
+
+// etagOf mirrors a real store's ETag closely enough for the conditional put: a digest of the
+// stored bytes, so the fake never hands out a token the next write could not reproduce.
+func etagOf(data []byte) string {
+	sum := sha256.Sum256(data)
+
+	return hex.EncodeToString(sum[:])
+}
+
+func (f *fakeStore) GetObjectVersion(_ context.Context, key string) ([]byte, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	v, ok := f.objs[key]
+	if !ok {
+		return nil, "", s3.ErrObjectNotFound
+	}
+
+	return clone(v), etagOf(v), nil
+}
+
+// PutObjectIfVersion evaluates the precondition under the same lock as the store, as S3 does.
+func (f *fakeStore) PutObjectIfVersion(
+	_ context.Context, key string, data []byte, etag string,
+) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	current := ""
+	if v, ok := f.objs[key]; ok {
+		current = etagOf(v)
+	}
+
+	if current != etag {
+		return "", false, nil
+	}
+
+	stored := clone(data)
+	f.objs[key] = stored
+
+	return etagOf(stored), true, nil
 }
 
 func (f *fakeStore) HeadObject(_ context.Context, key string) (bool, error) {

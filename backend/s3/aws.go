@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -118,6 +119,73 @@ func (s *awsStore) PutObjectIfAbsent(ctx context.Context, key string, data []byt
 	}
 
 	return true, nil
+}
+
+// GetObjectVersion fetches the object together with its ETag, the token the conditional PUT
+// below matches on.
+func (s *awsStore) GetObjectVersion(ctx context.Context, key string) ([]byte, string, error) {
+	out, err := s.api.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, "", errors.Wrapf(ErrObjectNotFound, "get %q", key)
+		}
+
+		return nil, "", errors.Wrapf(err, "get %q", key)
+	}
+	defer func() { _ = out.Body.Close() }()
+
+	data, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, "", errors.Wrapf(err, "read body %q", key)
+	}
+
+	return data, unquoteETag(out.ETag), nil
+}
+
+// PutObjectIfVersion is the conditional replace: If-Match on the ETag the committer read, or
+// If-None-Match: * when it expects no object at all. S3 evaluates the precondition atomically
+// with the write, so concurrent committers resolve to one winner; the losers get 412
+// PreconditionFailed, or 404 NoSuchKey when they matched an ETag on a key that has since been
+// deleted.
+func (s *awsStore) PutObjectIfVersion(
+	ctx context.Context, key string, data []byte, etag string,
+) (string, bool, error) {
+	in := &awss3.PutObjectInput{Bucket: &s.bucket, Key: &key, Body: bytes.NewReader(data)}
+	if etag == "" {
+		in.IfNoneMatch = aws.String("*")
+	} else {
+		in.IfMatch = aws.String(quoteETag(etag))
+	}
+
+	out, err := s.api.PutObject(ctx, in)
+	if err != nil {
+		if isPreconditionFailed(err) || isNotFound(err) {
+			return "", false, nil
+		}
+
+		return "", false, errors.Wrapf(err, "put-if-version %q", key)
+	}
+
+	return unquoteETag(out.ETag), true, nil
+}
+
+// quoteETag renders an ETag as the conditional headers require it, quoted.
+func quoteETag(etag string) string {
+	if strings.HasPrefix(etag, `"`) {
+		return etag
+	}
+
+	return `"` + etag + `"`
+}
+
+// unquoteETag strips the quoting S3 puts around an ETag, so the token stored as a
+// [backend.Version] is stable however the SDK rendered it.
+func unquoteETag(etag *string) string {
+	if etag == nil {
+		return ""
+	}
+
+	return strings.Trim(*etag, `"`)
 }
 
 func (s *awsStore) HeadObject(ctx context.Context, key string) (bool, error) {
