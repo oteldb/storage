@@ -9,6 +9,13 @@ One interface over whole-object, slash-delimited keys: `Read`/`Write`/`List`/`De
 Implementations are **interchangeable** — `backend/backendtest.Run(t, factory)` is the shared
 conformance suite all of them pass under `-race`.
 
+**`backend/faultbackend`** is the fault-injection wrapper for tests: rules match an operation by
+kind and key and either fail it or run a hook before it. The hook is the point of the package — a
+`Gate` suspends the matching operation *inside* the backend until the test releases it, so a test
+states a distributed interleaving instead of racing for one with sleeps, and the code under test
+needs no seams of its own. It forwards none of the optional capabilities below: each has a
+mandatory fallback, so a wrapped backend runs the same code, only slower.
+
 - **`backend.Memory()`** — ephemeral reference backend; copies on both read and write so stored
   objects never alias a caller's buffer. The default in tests.
 - **`backend/file`** — directory tree with a `..` traversal guard; atomic write via temp+fsync+
