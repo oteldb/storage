@@ -10,7 +10,7 @@ require (
 	github.com/go-faster/errors v0.8.0
 	github.com/go-faster/fs v0.13.1
 	github.com/go-faster/jx v1.2.0
-	github.com/go-faster/sdk v0.39.0
+	github.com/go-faster/sdk v0.39.1
 	github.com/klauspost/compress v1.19.2
 	github.com/klauspost/reedsolomon v1.14.1
 	github.com/maypok86/otter/v2 v2.3.0
