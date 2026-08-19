@@ -90,6 +90,31 @@ func (f *faultStore) PutObjectIfAbsent(_ context.Context, key string, data []byt
 	return true, nil
 }
 
+func (f *faultStore) GetObjectVersion(ctx context.Context, key string) ([]byte, string, error) {
+	data, err := f.GetObject(ctx, key)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return data, "v", nil
+}
+
+func (f *faultStore) PutObjectIfVersion(
+	_ context.Context, key string, data []byte, _ string,
+) (string, bool, error) {
+	f.casN.Add(1)
+
+	if f.casErr != nil {
+		return "", false, f.casErr
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.objs[key] = data
+
+	return "v", true, nil
+}
+
 func (f *faultStore) HeadObject(_ context.Context, key string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

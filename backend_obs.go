@@ -165,6 +165,31 @@ func (b *instrumentedBackend) PutIfAbsent(ctx context.Context, key string, data 
 	return ok, err
 }
 
+func (b *instrumentedBackend) CompareAndSwap(
+	ctx context.Context, key string, expected backend.Version, data []byte,
+) (backend.Version, bool, error) {
+	start := time.Now()
+	v, ok, err := b.inner.CompareAndSwap(ctx, key, expected, data)
+	b.m.Record(ctx, "cas", result(err), time.Since(start), int64(len(data)))
+	zctx.From(ctx).Debug("backend cas",
+		zap.String("key", key), zap.Int("bytes", len(data)), zap.Bool("stored", ok),
+		zap.String("expected", string(expected)),
+		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
+
+	return v, ok, err
+}
+
+func (b *instrumentedBackend) ReadVersioned(ctx context.Context, key string) ([]byte, backend.Version, error) {
+	start := time.Now()
+	data, v, err := b.inner.ReadVersioned(ctx, key)
+	b.m.Record(ctx, "read", result(err), time.Since(start), int64(len(data)))
+	zctx.From(ctx).Debug("backend read versioned",
+		zap.String("key", key), zap.Int("bytes", len(data)), zap.String("version", string(v)),
+		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
+
+	return data, v, err
+}
+
 func (b *instrumentedBackend) List(ctx context.Context, prefix string) ([]string, error) {
 	start := time.Now()
 	keys, err := b.inner.List(ctx, prefix)

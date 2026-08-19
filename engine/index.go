@@ -14,8 +14,8 @@ import (
 
 // The engine maintains a [bucketindex] alongside its parts so the part set is durable and a
 // node can reconstruct it from the object store without local state (the object-store-native
-// read path). The index is rewritten on every flush and merge; a single-node engine
-// overwrites it (multi-writer commits would use backend CAS, a later milestone).
+// read path). The index is rewritten on every flush and merge, through the backend's
+// compare-and-swap, so two writers over one prefix cannot overwrite each other's parts.
 
 // indexKey is the backend key of this engine's bucket index.
 func (e *Engine) indexKey() string {
@@ -28,18 +28,78 @@ func (e *Engine) indexKey() string {
 // without the (local) WAL.
 func (e *Engine) seriesKey() string { return e.cfg.Prefix + "/series.bin" }
 
-// updateIndexLocked rewrites the bucket index to match the engine's current parts. It is a
-// no-op for a head-only engine (no backend). Caller holds e.mu.
+// indexCommitAttempts bounds the reload-and-retry loop of [Engine.updateIndexLocked]. A retry
+// only happens after a rival writer committed, so the loop makes progress; the bound is there so
+// pathological contention ends in a reported error instead of an unbounded spin. Exhausting it
+// fails the flush or merge that asked for the commit, which is the point: a part whose entry
+// never landed is unreachable, and reporting success over it is what loses data.
+const indexCommitAttempts = 8
+
+// updateIndexLocked commits a bucket index matching the engine's current parts, conditionally on
+// the version this engine last saw. A rival writer over the same prefix (a shared object store,
+// where every replica of a shard writes one index object) makes the commit fail rather than
+// overwrite: the loser then rebases on what was committed and tries again, so neither writer's
+// part is dropped from the index that survives. It is a no-op for a head-only engine (no
+// backend). Caller holds e.mu.
 func (e *Engine) updateIndexLocked(ctx context.Context) error {
 	if e.cfg.Backend == nil {
 		return nil
 	}
 
+	for range indexCommitAttempts {
+		version, err := e.nextIndexLocked().Save(ctx, e.cfg.Backend, e.indexKey(), e.indexVersion)
+		if err == nil {
+			e.indexVersion = version
+
+			return nil
+		}
+
+		if !errors.Is(err, bucketindex.ErrConflict) {
+			return errors.Wrap(err, "save bucket index")
+		}
+
+		if err := e.adoptIndexLocked(ctx); err != nil {
+			return err
+		}
+	}
+
+	return errors.Wrapf(bucketindex.ErrConflict,
+		"commit bucket index after %d attempts", indexCommitAttempts)
+}
+
+// adoptIndexLocked rebases this engine on the index a rival writer committed: it takes that
+// index's version (so the retry conditions on it), raises the generation above the rival's (so
+// the retry supersedes rather than reads as stale), and records the entries the rival added as
+// [Engine.foreign] so the retry carries them instead of dropping them. Caller holds e.mu.
+func (e *Engine) adoptIndexLocked(ctx context.Context) error {
+	ix, version, err := bucketindex.LoadVersioned(ctx, e.cfg.Backend, e.indexKey())
+	if err != nil {
+		return errors.Wrap(err, "reload bucket index")
+	}
+
+	e.indexVersion = version
+	if ix.Generation.Compare(e.generation) > 0 {
+		e.generation = ix.Generation
+	}
+
+	e.foreign = foreignEntries(ix.Entries, e.indexed, e.removals)
+
+	return nil
+}
+
+// nextIndexLocked builds the index state this engine wants committed and advances the
+// bookkeeping the next one is diffed against. Caller holds e.mu.
+func (e *Engine) nextIndexLocked() *bucketindex.Index {
 	// The generation advances on every write, including one that only removes parts — which is
 	// the whole point of it, since that is exactly the rewrite the part names cannot express.
 	e.generation = e.generation.Next(e.term())
 
 	ix := &bucketindex.Index{FlushedEpoch: e.flushedEpoch, Generation: e.generation}
+
+	// A rival writer's entries go in first, so this engine's own parts win any prefix collision.
+	for _, ent := range e.foreign {
+		ix.Add(ent)
+	}
 
 	live := make(map[string]struct{}, len(e.parts))
 	for _, p := range e.parts {
@@ -60,11 +120,31 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 	ix.Removed = e.removals
 	e.indexed = live
 
-	if err := ix.Save(ctx, e.cfg.Backend, e.indexKey()); err != nil {
-		return errors.Wrap(err, "save bucket index")
+	return ix
+}
+
+// foreignEntries returns the entries of a committed index that belong to another writer: neither
+// a part this engine has ever indexed nor one it removed. Only that writer knows whether they are
+// still live, so this engine's job is to carry them across its own commits — an entry dropped
+// here leaves durable part objects unreferenced, and the next open-time orphan sweep deletes them.
+func foreignEntries(
+	entries []bucketindex.Entry, indexed map[string]struct{}, removals []bucketindex.Removal,
+) []bucketindex.Entry {
+	var out []bucketindex.Entry
+
+	for _, e := range entries {
+		if _, ours := indexed[e.Prefix]; ours {
+			continue
+		}
+
+		if slices.ContainsFunc(removals, func(r bucketindex.Removal) bool { return r.Prefix == e.Prefix }) {
+			continue
+		}
+
+		out = append(out, e)
 	}
 
-	return nil
+	return out
 }
 
 // LoadParts reconstructs the engine's durable state from the object store: the part set from
@@ -91,10 +171,15 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 		return nil
 	}
 
-	ix, err := bucketindex.Load(ctx, e.cfg.Backend, e.indexKey())
+	ix, version, err := bucketindex.LoadVersioned(ctx, e.cfg.Backend, e.indexKey())
 	if err != nil {
 		return errors.Wrap(err, "load bucket index")
 	}
+
+	// The loaded state is now the one this engine's next commit conditions on, and it accounts
+	// for every entry the index names, so nothing is foreign any more.
+	e.indexVersion = version
+	e.foreign = nil
 
 	parts := make([]*part, 0, len(ix.Entries))
 

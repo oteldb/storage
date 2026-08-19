@@ -33,6 +33,18 @@ func (r *rejectWrites) Write(ctx context.Context, key string, data []byte) error
 	return r.Backend.Write(ctx, key, data)
 }
 
+// CompareAndSwap is the path the bucket-index commit takes, so a suffix naming the index must
+// reject it too.
+func (r *rejectWrites) CompareAndSwap(
+	ctx context.Context, key string, expected backend.Version, data []byte,
+) (backend.Version, bool, error) {
+	if r.armed.Load() && (r.only == "" || strings.HasSuffix(key, r.only)) {
+		return backend.VersionAbsent, false, errors.New("injected write failure")
+	}
+
+	return r.Backend.CompareAndSwap(ctx, key, expected, data)
+}
+
 // TestPublishCommitsBucketIndexLast verifies the publish ordering: the bucket index is what makes a
 // part durably visible, so it must be written after everything that part needs to stay readable —
 // including the part's own identity object. A crash between the two must not leave a committed part

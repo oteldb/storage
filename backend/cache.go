@@ -226,6 +226,46 @@ func (c *cachedBackend) PutIfAbsent(ctx context.Context, key string, data []byte
 	return ok, nil
 }
 
+// CompareAndSwap forwards the conditional replace and refreshes the entry on a win, so a reader
+// through this cache sees the value the commit just published. Implements [Backend].
+func (c *cachedBackend) CompareAndSwap(
+	ctx context.Context, key string, expected Version, data []byte,
+) (Version, bool, error) {
+	v, ok, err := c.inner.CompareAndSwap(ctx, key, expected, data)
+	if err != nil {
+		return VersionAbsent, false, err
+	}
+
+	if ok {
+		c.store(key, data)
+	}
+
+	return v, ok, nil
+}
+
+// ReadVersioned bypasses the cache entirely. The version it hands back is the one a commit will
+// condition on, and a cached copy only proves what *this* process last saw — the objects
+// committed this way (bucket index, manifests) are exactly the mutable ones another writer over
+// the same store rewrites. Serving a resident copy here would hand back a version already
+// superseded, and the commit built on it would fail forever rather than converge. The fresh value
+// refreshes the entry, so the pass-through costs one read, not two. Implements [Backend].
+func (c *cachedBackend) ReadVersioned(ctx context.Context, key string) ([]byte, Version, error) {
+	data, v, err := c.inner.ReadVersioned(ctx, key)
+	if err != nil {
+		return nil, VersionAbsent, err
+	}
+
+	if v == VersionAbsent {
+		c.values.Invalidate(key)
+
+		return data, v, nil
+	}
+
+	c.store(key, data)
+
+	return data, v, nil
+}
+
 func (c *cachedBackend) Delete(ctx context.Context, key string) error {
 	err := c.inner.Delete(ctx, key)
 	c.values.Invalidate(key) // drop the entry whether or not the object existed

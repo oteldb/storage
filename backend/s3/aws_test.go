@@ -52,7 +52,10 @@ func (f *fakeAWS) GetObject(_ context.Context, in *awss3.GetObjectInput, _ ...fu
 		}
 	}
 
-	return &awss3.GetObjectOutput{Body: io.NopCloser(bytes.NewReader(clone(v)))}, nil
+	return &awss3.GetObjectOutput{
+		Body: io.NopCloser(bytes.NewReader(clone(v))),
+		ETag: aws.String(`"` + etagOf(v) + `"`), // real S3 quotes the ETag; the adapter must unquote it
+	}, nil
 }
 
 // sliceRange models S3's handling of an inclusive "bytes=lo-hi" header: the upper bound is clamped
@@ -80,15 +83,27 @@ func (f *fakeAWS) PutObject(_ context.Context, in *awss3.PutObjectInput, _ ...fu
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if in.IfNoneMatch != nil {
-		if _, exists := f.objs[*in.Key]; exists {
+	current, exists := f.objs[*in.Key]
+
+	if in.IfNoneMatch != nil && exists {
+		return nil, apiErr("PreconditionFailed")
+	}
+
+	// S3 answers an If-Match against an absent key with 404, not 412.
+	if in.IfMatch != nil {
+		if !exists {
+			return nil, apiErr("NoSuchKey")
+		}
+
+		if strings.Trim(*in.IfMatch, `"`) != etagOf(current) {
 			return nil, apiErr("PreconditionFailed")
 		}
 	}
 
-	f.objs[*in.Key] = clone(data)
+	stored := clone(data)
+	f.objs[*in.Key] = stored
 
-	return &awss3.PutObjectOutput{}, nil
+	return &awss3.PutObjectOutput{ETag: aws.String(`"` + etagOf(stored) + `"`)}, nil
 }
 
 func (f *fakeAWS) HeadObject(_ context.Context, in *awss3.HeadObjectInput, _ ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error) {

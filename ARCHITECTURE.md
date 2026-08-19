@@ -28,7 +28,7 @@ engines over the fetch seam (`query/fetch`).
 | L4 **Fetch contract** | matchers + column conditions + window → batch iterator | `query/fetch`, exposed as `Storage.{,Log,Trace,Profile}Fetcher` |
 | L3 Engine / Index / WAL | head · flush · merge · retention / symbols · series · postings · blooms / WAL | `engine`, `recordengine`, `index`, `wal` |
 | L2 Part / Encoding | immutable parts · per-column objects · manifest / bitstream · codecs · compress | `block`, `encoding` |
-| L1 Backend | memory · file · s3 behind one interface, CAS via `PutIfAbsent` | `backend` |
+| L1 Backend | memory · file · s3 behind one interface, CAS via `PutIfAbsent`/`CompareAndSwap` | `backend` |
 | L0 Cluster | etcd ring · HRW · replication · rebalance · EC | `cluster` |
 
 ---
@@ -130,12 +130,14 @@ degrades into a silently partial result.
   iterators) until `Close`, which every caller owes it; `fetch.Drain` closes what it drains.
 - **Coordination is external/minimal.** etcd for membership/claims, backend CAS for commits. No
   homegrown Raft; single-node works with the cluster layer absent.
-- **The bucket index commits last.** It is what makes a part durably visible — and in
+- **The bucket index commits last, conditionally.** It is what makes a part durably visible — and in
   `recordengine` it also carries the flush watermark (the WAL replay floor) — so its write is the
   commit point in both engines: everything a committed part needs to stay readable must be durable
   first — its column objects and, in `engine`, the part's own identity object naming its series.
   Publish order is chosen to leave recoverable slack on a crash — unreferenced objects, an orphan
-  part swept at the next open — never rows that are committed but unresolvable.
+  part swept at the next open — never rows that are committed but unresolvable. The commit is a
+  `backend.CompareAndSwap` against the version the writer read, so two writers over one prefix (a
+  shared store) cannot overwrite each other's entries; the loser reloads and retries.
 - **A part id is globally unique** (both engines). A part's backend key is `{enginePrefix}/{partid}`,
   where `partid` is a minted ULID-shaped id (`internal/partid`), not a per-node counter: replicas of a
   shard can share one object store under one prefix, so only an id no local state participates in

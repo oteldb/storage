@@ -129,6 +129,16 @@ func (f failKeyWrite) Write(ctx context.Context, key string, data []byte) error 
 	return f.Backend.Write(ctx, key, data)
 }
 
+func (f failKeyWrite) CompareAndSwap(
+	ctx context.Context, key string, expected backend.Version, data []byte,
+) (backend.Version, bool, error) {
+	if strings.HasSuffix(key, f.suffix) {
+		return backend.VersionAbsent, false, assert.AnError
+	}
+
+	return f.Backend.CompareAndSwap(ctx, key, expected, data)
+}
+
 func TestFlushIndexWriteErrorsPropagate(t *testing.T) {
 	t.Parallel()
 
