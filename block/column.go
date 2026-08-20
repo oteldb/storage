@@ -2,6 +2,8 @@ package block
 
 import (
 	"bytes"
+	"encoding/binary"
+	"hash/crc32"
 	"math"
 
 	"github.com/go-faster/errors"
@@ -207,7 +209,7 @@ func buildColumn(c Column, comp *compress.Compressor, blockRows, compressBytes i
 		}
 	}
 
-	desc := ColumnDesc{Name: c.Name, Kind: c.Kind, Codec: codec, Compress: comp.Algorithm()}
+	desc := ColumnDesc{Name: c.Name, Kind: c.Kind, Codec: codec, Compress: comp.Algorithm(), Checked: true}
 	if desc.Compress != compress.AlgorithmNone {
 		desc.Level = comp.Level()
 	}
@@ -251,7 +253,7 @@ func buildColumn(c Column, comp *compress.Compressor, blockRows, compressBytes i
 		desc.FloatPrecisionBits = budget
 
 		if !c.Block {
-			return desc, comp.Compress(nil, stream), nil
+			return desc, sealStream(comp, stream), nil
 		}
 	}
 
@@ -264,7 +266,42 @@ func buildColumn(c Column, comp *compress.Compressor, blockRows, compressBytes i
 		return ColumnDesc{}, nil, err
 	}
 
-	return desc, comp.Compress(nil, stream), nil
+	return desc, sealStream(comp, stream), nil
+}
+
+// objectCRCBytes is the fixed little-endian CRC32C closing an unblocked column object. A column
+// written as one compressed stream has no directory to hang a per-frame checksum off and is only
+// ever read whole, so the checksum covers the object and sits at its end.
+const objectCRCBytes = 4
+
+// sealStream compresses a column's codec stream into its object and closes it with the checksum the
+// read path verifies ([ColumnDesc.Checked]).
+func sealStream(comp *compress.Compressor, stream []byte) []byte {
+	obj := comp.Compress(nil, stream)
+
+	return binary.LittleEndian.AppendUint32(obj, crc32.Checksum(obj, castagnoli))
+}
+
+// verifyStream strips and checks an unblocked column object's trailing checksum, returning the
+// compressed bytes it covers. A column from a part written before the checksums existed carries
+// none and is returned as-is.
+func verifyStream(object []byte, desc ColumnDesc) ([]byte, error) {
+	if !desc.Checked {
+		return object, nil
+	}
+
+	if len(object) < objectCRCBytes {
+		return nil, errors.Wrapf(ErrCorrupt, "column %q: object too short for its checksum", desc.Name)
+	}
+
+	body := object[:len(object)-objectCRCBytes]
+
+	want := binary.LittleEndian.Uint32(object[len(object)-objectCRCBytes:])
+	if got := crc32.Checksum(body, castagnoli); got != want {
+		return nil, errors.Wrapf(ErrCorrupt, "column %q: checksum %08x, want %08x", desc.Name, got, want)
+	}
+
+	return body, nil
 }
 
 // chooseFloatCodec picks the denser float encoding for vals, returning the winning codec and its
@@ -992,7 +1029,7 @@ func (r *ColumnReader) blockDir() (blockDir, error) {
 		object = r.sharedRest
 	}
 
-	return parseBlockDir(object, r.desc.Framed, r.desc.Footer)
+	return parseBlockDir(object, r.desc)
 }
 
 // sharedEntries returns the column's shared dictionary, nil for a column without one. The header is
@@ -1007,7 +1044,7 @@ func (r *ColumnReader) sharedEntries() ([][]byte, error) {
 		return r.sharedEnt, nil
 	}
 
-	entries, rest, err := parseSharedDict(r.object, r.comp)
+	entries, rest, err := parseSharedDict(r.object, r.comp, r.desc.Checked)
 	if err != nil {
 		return nil, errors.Wrapf(err, "column %q", r.desc.Name)
 	}
@@ -1019,7 +1056,12 @@ func (r *ColumnReader) sharedEntries() ([][]byte, error) {
 
 // stream decompresses the column's block frame into its raw codec stream.
 func (r *ColumnReader) stream() ([]byte, error) {
-	out, err := r.comp.Decompress(nil, r.object)
+	body, err := verifyStream(r.object, r.desc)
+	if err != nil {
+		return nil, err
+	}
+
+	out, err := r.comp.Decompress(nil, body)
 	if err != nil {
 		return nil, errors.Wrapf(err, "decompress column %q", r.desc.Name)
 	}
@@ -1063,7 +1105,7 @@ func buildFramedColumn(
 			return ColumnDesc{}, nil, err
 		}
 
-		return desc, comp.Compress(nil, stream), nil
+		return desc, sealStream(comp, stream), nil
 	}
 
 	desc.Blocked, desc.Framed = true, true

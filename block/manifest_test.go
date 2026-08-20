@@ -52,13 +52,23 @@ func sampleManifest() Manifest {
 	}
 }
 
+// checkedColumns marks every column as carrying its data checksums, which is what a manifest at
+// [manifestVersion] decodes to — the flag follows from the version rather than from the bytes.
+func checkedColumns(m Manifest) Manifest {
+	for i := range m.Columns {
+		m.Columns[i].Checked = true
+	}
+
+	return m
+}
+
 func TestManifestRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	m := sampleManifest()
 	got, err := DecodeManifest(m.Encode(nil))
 	require.NoError(t, err)
-	assert.Equal(t, m, got)
+	assert.Equal(t, checkedColumns(sampleManifest()), got)
 }
 
 func TestManifestEncodeAppends(t *testing.T) {
@@ -72,7 +82,7 @@ func TestManifestEncodeAppends(t *testing.T) {
 	// The manifest portion (after the prefix) decodes on its own.
 	got, err := DecodeManifest(out[len(prefix):])
 	require.NoError(t, err)
-	assert.Equal(t, m, got)
+	assert.Equal(t, checkedColumns(sampleManifest()), got)
 }
 
 func TestManifestEmpty(t *testing.T) {
@@ -154,7 +164,7 @@ func TestManifestTruncationSweep(t *testing.T) {
 			// DiskBytes and RawBytes are trailing optional fields, so the prefixes that drop
 			// exactly them are valid manifests in the older layouts — that is what makes the fields
 			// readable both ways. Every other prefix must be rejected.
-			want := sampleManifest()
+			want := checkedColumns(sampleManifest())
 			want.DiskBytes, want.RawBytes = 0, 0
 			require.Equalf(t, want, got, "prefix len %d decoded, so it must be an older-layout manifest", n)
 

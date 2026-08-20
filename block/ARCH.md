@@ -6,8 +6,9 @@ reads).
 
 ```
 {prefix}/manifest   schema + stats, CRC32C-checked, WRITTEN LAST = the commit point
-{prefix}/marks      sparse granule index (sort-key min/max per granule)
-{prefix}/c/{i}      column i's stream (absent for a constant-collapsed column)
+{prefix}/marks      sparse granule index (sort-key min/max per granule), CRC32C-checked
+{prefix}/c/{i}      column i's stream, CRC32C-checked per compression frame
+                    (absent for a constant-collapsed column)
 ```
 
 An incompletely written part (no manifest) is not openable — that is the commit discipline every
@@ -234,10 +235,56 @@ missing piece was purely the ability to fetch a byte range.
 - The **compression frame is the floor**: it is the smallest unit a ranged read can fetch, so a
   single-series fetch pays one frame per column however few rows it wants.
 
+## At-rest checksums
+
+Every byte a part stores is covered by a CRC32C, so a column that comes back from the store altered
+fails the read instead of decoding into plausible values. Corruption presenting as *absence* — a
+damaged column that yields no rows and no error — is worse than a failed query, because a caller
+cannot tell it from "there was no data in that range".
+
+The unit is the unit the reader already fetches, which is what keeps verification free of extra I/O
+and keeps sub-part seek intact:
+
+| what | checksum |
+|---|---|
+| manifest, marks | one CRC32C over the object |
+| framed column: directory | one CRC32C over the directory fields, immediately after them |
+| framed column: each compression frame | one CRC32C in the directory, over the frame's compressed bytes |
+| shared bytes dictionary | one CRC32C after the compressed dictionary blob |
+| unblocked column (single stream) | one CRC32C trailing the object |
+
+A single checksum over a column object would be the wrong unit: a ranged read decodes only the
+granules its row range touches, so verifying one would mean reading the whole object — exactly the
+cost the framing exists to avoid. The frame is the floor anyway (nothing below it is separable), and
+the directory already lists a `compressedLen` per frame and is already fetched on the ranged path,
+so a 4-byte checksum per frame rides along at no extra round trip.
+
+The directory carries its own checksum rather than relying on the frames'. Its frame lengths *are*
+covered indirectly — wrong spans slice wrong bytes, whose frame checksums then fail — but its
+granule lengths and `blockRows` are never compared against frame bytes, so a flipped bit there would
+place decoded rows at wrong offsets with every frame checksum still passing.
+
+It is not a per-column flag: all eight descriptor flag bits are spent, and a checksum is not a
+per-column choice. The **manifest version** carries it. Version 2 is what the writer emits and means
+"every column object is checked"; version 1 parts carry no column checksums and are read unverified,
+so no migration is forced. The reader accepts the range 1..2 and rejects anything outside it, so an
+older binary — which accepts version 1 only — refuses a version-2 part outright with
+`unsupported version 2` wrapping `ErrCorrupt`, rather than misreading it.
+
+Cost: 4 bytes per compression frame (0.006% of a 64 KiB frame), 4 per column directory, 4 per
+unblocked object. The hashing itself is hardware CRC32C on both paths and did not move any `block/`
+encode or decode benchmark out of the noise.
+
+Detection is only half of #389. Failing *over* to a replica holding a good copy — turning an
+`ErrCorrupt` into `cluster.ErrShardAbsent` the way `cluster_completeness.go` already does for a node
+that cannot answer a window — is not wired up here.
+
 ## Manifest & marks
 
 - **Manifest** — versioned binary record (magic `OTPM`, row count, time range, granule size,
-  per-column descriptors, then the two sizes) + trailing CRC32C. `DiskBytes` is the encoded size of
+  per-column descriptors, then the two sizes) + trailing CRC32C. The version is the one thing that
+  is *not* additive: it gates whether column objects carry checksums (above), and the reader accepts
+  a range of versions rather than one. `DiskBytes` is the encoded size of
   the part's column and marks objects; `RawBytes` is its **decoded** footprint, the bytes its values
   occupy in memory. Both exist because a merge is bounded by both and the ratio between them is the
   compression ratio, which varies per column and per dataset: the metric merge seals on bytes it

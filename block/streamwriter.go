@@ -3,6 +3,7 @@ package block
 import (
 	"context"
 	"encoding/binary"
+	"hash/crc32"
 	"math"
 
 	"github.com/go-faster/errors"
@@ -703,7 +704,7 @@ func (c *streamColumn) decimalGranuleRoundTrips(vals []float64) bool {
 // the object's byte size. A streamed column commits its object to the backend here and returns a nil
 // one — the size is what the caller needs, since the bytes are already gone.
 func (c *streamColumn) finish(ctx context.Context, granuleSize int) (ColumnDesc, []byte, int64, error) {
-	desc := ColumnDesc{Name: c.name, Kind: c.kind, Codec: c.codec, Compress: c.comp.Algorithm()}
+	desc := ColumnDesc{Name: c.name, Kind: c.kind, Codec: c.codec, Compress: c.comp.Algorithm(), Checked: true}
 	if desc.Compress != compress.AlgorithmNone {
 		desc.Level = c.comp.Level()
 	}
@@ -711,7 +712,7 @@ func (c *streamColumn) finish(ctx context.Context, granuleSize int) (ColumnDesc,
 	if c.kind == KindInt128 {
 		// No stats and never constant-collapsed: the RLE codec already shrinks a single-id column
 		// to a handful of bytes.
-		obj := c.comp.Compress(nil, chunk.EncodeU128Runs(nil, c.runs))
+		obj := sealStream(c.comp, chunk.EncodeU128Runs(nil, c.runs))
 
 		return desc, obj, int64(len(obj)), nil
 	}
@@ -846,7 +847,8 @@ type blockAccum struct {
 	// because a streamed frame is gone by the time the directory is written.
 	frameGranules []int
 	frameBytes    []int
-	gLens         []int // per-granule stream length within its frame
+	frameCRC      []uint32 // per sealed frame: CRC32C over its compressed bytes
+	gLens         []int    // per-granule stream length within its frame
 	pending       []byte
 	inFrame       int
 	bytes         int // compressed bytes sealed so far, the size the codec choice compares on
@@ -874,7 +876,7 @@ func (a *blockAccum) residentBytes() int64 {
 	}
 
 	// Two ints per frame and one per granule, all in slices that grow amortized.
-	dir := int64(cap(a.frameGranules)+cap(a.frameBytes)+cap(a.gLens)) * 8
+	dir := int64(cap(a.frameGranules)+cap(a.frameBytes)+cap(a.gLens))*8 + int64(cap(a.frameCRC))*4
 
 	resident := int64(cap(a.pending)) + dir + int64(cap(a.frames))*8
 	if a.sink == nil {
@@ -952,6 +954,7 @@ func (a *blockAccum) seal() error {
 
 	a.frameGranules = append(a.frameGranules, a.inFrame)
 	a.frameBytes = append(a.frameBytes, len(f))
+	a.frameCRC = append(a.frameCRC, crc32.Checksum(f, castagnoli))
 	a.bytes += len(f)
 	a.pending, a.inFrame = a.pending[:0], 0
 
@@ -1037,11 +1040,12 @@ func (a *blockAccum) encodeDir(blockRows int) []byte {
 	for i, n := range a.frameGranules {
 		dir = binary.AppendUvarint(dir, uint64(n))
 		dir = binary.AppendUvarint(dir, uint64(a.frameBytes[i]))
+		dir = binary.LittleEndian.AppendUint32(dir, a.frameCRC[i])
 	}
 
 	for _, l := range a.gLens {
 		dir = binary.AppendUvarint(dir, uint64(l))
 	}
 
-	return dir
+	return binary.LittleEndian.AppendUint32(dir, crc32.Checksum(dir, castagnoli))
 }

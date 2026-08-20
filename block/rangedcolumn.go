@@ -97,15 +97,16 @@ func readBlockDir(
 	)
 
 	if desc.Footer {
-		d, err = readFooterDir(ctx, b, key, size)
+		d, err = readFooterDir(ctx, b, key, size, desc.Checked)
 	} else {
-		d, err = readLeadingDir(ctx, b, key, size)
+		d, err = readLeadingDir(ctx, b, key, size, desc.Checked)
 	}
 
 	if err != nil {
 		return blockDir{}, err
 	}
 
+	d.col = desc.Name
 	d.src = &frameSource{ctx: ctx, b: b, key: key, base: d.dataOff}
 
 	return d, nil
@@ -114,7 +115,9 @@ func readBlockDir(
 // readFooterDir reads the directory of a column that carries it after its frames. The trailing
 // length is at a known offset from the end, so one read of the tail usually lands the whole
 // directory and the second read is needed only for a directory larger than the probe.
-func readFooterDir(ctx context.Context, b backend.Backend, key string, size int64) (blockDir, error) {
+func readFooterDir(
+	ctx context.Context, b backend.Backend, key string, size int64, checked bool,
+) (blockDir, error) {
 	probe := min(size, dirProbeBytes)
 
 	tail, err := backend.ReadAt(ctx, b, key, size-probe, probe)
@@ -146,9 +149,17 @@ func readFooterDir(ctx context.Context, b backend.Backend, key string, size int6
 
 	raw = raw[int64(len(raw))-dirLen:]
 
-	d, pos, total, err := parseFramedDirFields(raw, int(dataOff))
+	d, pos, total, err := parseFramedDirFields(raw, int(dataOff), checked)
 	if err != nil {
 		return blockDir{}, err
+	}
+
+	if checked {
+		if err := verifyDirCRC(raw, pos); err != nil {
+			return blockDir{}, err
+		}
+
+		pos += dirCRCBytes
 	}
 
 	if int64(pos) != dirLen {
@@ -170,7 +181,9 @@ func readFooterDir(ctx context.Context, b backend.Backend, key string, size int6
 // most a granule-count varint plus a length varint, and every granule at most a length varint. That
 // bound is tight enough to read in one further request — ~1.4 MB for a directory over an 833 MB
 // column, against the 15 MB a worst-case-varint bound would ask for.
-func readLeadingDir(ctx context.Context, b backend.Backend, key string, size int64) (blockDir, error) {
+func readLeadingDir(
+	ctx context.Context, b backend.Backend, key string, size int64, checked bool,
+) (blockDir, error) {
 	raw, err := backend.ReadAt(ctx, b, key, 0, min(size, dirProbeBytes))
 	if err != nil {
 		return blockDir{}, err
@@ -181,16 +194,24 @@ func readLeadingDir(ctx context.Context, b backend.Backend, key string, size int
 		return blockDir{}, err
 	}
 
-	bound := dirBound(nGranules, nFrames, size)
+	bound := dirBound(nGranules, nFrames, size, checked)
 	if bound > int64(len(raw)) {
 		if raw, err = backend.ReadAt(ctx, b, key, 0, min(bound, size)); err != nil {
 			return blockDir{}, err
 		}
 	}
 
-	d, pos, total, err := parseFramedDirFields(raw, int(size))
+	d, pos, total, err := parseFramedDirFields(raw, int(size), checked)
 	if err != nil {
 		return blockDir{}, err
+	}
+
+	if checked {
+		if err := verifyDirCRC(raw, pos); err != nil {
+			return blockDir{}, err
+		}
+
+		pos += dirCRCBytes
 	}
 
 	if int64(pos)+int64(total) != size {
@@ -229,8 +250,11 @@ func peekDirCounts(raw []byte) (int64, int64, error) {
 // which is larger than the compressed bytes on disk by the compression ratio, so it gets the
 // unconditional uvarint bound instead. Loose by a few bytes per granule — megabytes against a
 // column of hundreds of them — and, unlike a tighter guess, never short.
-func dirBound(nGranules, nFrames, size int64) int64 {
+func dirBound(nGranules, nFrames, size int64, checked bool) int64 {
 	frameBytes := int64(varintLen(uint64(nGranules))) + int64(varintLen(uint64(size)))
+	if checked {
+		frameBytes += objectCRCBytes
+	}
 
 	return dirProbeBytes + nFrames*frameBytes + nGranules*binary.MaxVarintLen64
 }

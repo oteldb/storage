@@ -363,7 +363,7 @@ func TestParseFooterDirRejectsCorrupt(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, object)
 
-	_, err = parseBlockDir(object, true, true)
+	_, err = parseBlockDir(object, footerDesc)
 	require.NoError(t, err, "the unmodified object must parse")
 
 	dirLen := binary.LittleEndian.Uint32(object[len(object)-footerLenBytes:])
@@ -394,7 +394,7 @@ func TestParseFooterDirRejectsCorrupt(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			d, err := parseBlockDir(tc.mutate(append([]byte(nil), object...)), true, true)
+			d, err := parseBlockDir(tc.mutate(append([]byte(nil), object...)), footerDesc)
 			if err == nil {
 				// A mutation the directory happens to still describe must at least stay in bounds.
 				_ = d.nBlocks()
@@ -406,6 +406,10 @@ func TestParseFooterDirRejectsCorrupt(t *testing.T) {
 		})
 	}
 }
+
+// footerDesc describes a column laid out the way the streaming writer lays one out: block-framed,
+// directory as a footer, checksummed.
+var footerDesc = ColumnDesc{Name: "v", Kind: KindFloat64, Blocked: true, Framed: true, Footer: true, Checked: true}
 
 // FuzzParseFooterDir checks that no byte string parses into a directory that reads out of bounds —
 // the footer layout takes its offsets from the object's tail, so a corrupt length is the first thing
@@ -427,7 +431,7 @@ func FuzzParseFooterDir(f *testing.F) {
 	f.Add([]byte{0, 0, 0, 0})
 
 	f.Fuzz(func(_ *testing.T, object []byte) {
-		d, err := parseBlockDir(object, true, true)
+		d, err := parseBlockDir(object, footerDesc)
 		if err != nil {
 			return
 		}

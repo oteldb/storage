@@ -39,7 +39,7 @@ engines over the fetch seam (`query/fetch`).
 |---|---|
 | [`encoding/ARCH.md`](encoding/ARCH.md) | bitstream, column codecs, compression, `pool` |
 | [`backend/ARCH.md`](backend/ARCH.md) | the L1 seam, memory/file/s3, read cache, bucket index, stateless read path |
-| [`block/ARCH.md`](block/ARCH.md) | the immutable part format: columns, marks, manifest |
+| [`block/ARCH.md`](block/ARCH.md) | the immutable part format: columns, marks, manifest, at-rest checksums |
 | [`index/ARCH.md`](index/ARCH.md) | identity (`signal.Series`/`SeriesID`), symbols, series, postings, blooms |
 | [`wal/ARCH.md`](wal/ARCH.md) | segmented CRC-framed WAL, epochs, exactly-once recovery |
 | [`signal/ARCH.md`](signal/ARCH.md) | per-signal ingest models + projection, `otlp/pdataconv` |

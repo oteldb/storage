@@ -2,6 +2,7 @@ package block
 
 import (
 	"encoding/binary"
+	"hash/crc32"
 	"math"
 
 	"github.com/go-faster/errors"
@@ -31,9 +32,22 @@ var errCursorEOF = errors.New("block: blocked cursor exhausted")
 // Object layout:
 //
 //	[uvarint nGranules][uvarint blockRows][uvarint nFrames]
-//	  per frame:   [uvarint granulesInFrame][uvarint compressedLen]
+//	  per frame:   [uvarint granulesInFrame][uvarint compressedLen][u32le CRC32C]
 //	  per granule: [uvarint streamLen]                 (length within the decompressed frame)
+//	[u32le CRC32C over the directory fields above]
 //	[frame0][frame1]…
+//
+// Both checksums are present only in a column whose manifest says so ([ColumnDesc.Checked], i.e.
+// manifest version ≥ 2). The per-frame CRC32C is over the frame's compressed bytes as stored, and
+// the compression frame is the checksum unit because it is already the read unit: a ranged read
+// fetches whole frames, so verifying one costs nothing beyond hashing bytes the reader holds
+// anyway, and a single checksum over the object would force reading the whole object to verify it —
+// destroying the sub-part seek the framing exists for.
+//
+// The directory gets its own checksum rather than relying on the frames': its granule lengths and
+// blockRows are never compared against the frame bytes, so a flipped bit there would place decoded
+// rows at the wrong offsets with every frame checksum still passing. It is read up front in one
+// piece either way, so checking it costs one hash of a few kilobytes per column.
 //
 // blockRows is the nominal rows per granule (the last granule may hold fewer); row r lives in
 // granule r/blockRows. Each frame is comp.Compress(concatenated streams of its granules). The
@@ -122,11 +136,14 @@ func encodeBlockedWith(
 	for i, f := range frames {
 		dst = binary.AppendUvarint(dst, uint64(frameLens[i]))
 		dst = binary.AppendUvarint(dst, uint64(len(f)))
+		dst = binary.LittleEndian.AppendUint32(dst, crc32.Checksum(f, castagnoli))
 	}
 
 	for _, l := range gLens {
 		dst = binary.AppendUvarint(dst, uint64(l))
 	}
+
+	dst = binary.LittleEndian.AppendUint32(dst, crc32.Checksum(dst, castagnoli))
 
 	for _, f := range frames {
 		dst = append(dst, f...)
@@ -186,10 +203,15 @@ func decimalPrecision(budget uint8) uint8 {
 type blockDir struct {
 	blockRows int
 	granules  int
-	frameOff  []int32 // cumulative byte offsets into data; len == nFrames+1
-	gFrame    []int32 // per granule: owning frame; nil in the legacy layout
-	gOff      []int32 // per granule: byte offset within the decompressed frame
-	gLen      []int32 // per granule: byte length within the decompressed frame
+	frameOff  []int32  // cumulative byte offsets into data; len == nFrames+1
+	frameCRC  []uint32 // per frame: CRC32C over its compressed bytes; nil when unchecked
+	gFrame    []int32  // per granule: owning frame; nil in the legacy layout
+	gOff      []int32  // per granule: byte offset within the decompressed frame
+	gLen      []int32  // per granule: byte length within the decompressed frame
+
+	// col names the column in checksum errors, which otherwise report a frame index against no
+	// column at all.
+	col string
 
 	// The frames themselves, either resident (data) or fetched per frame from the backend (src).
 	// Exactly one is set; dataOff is the data region's offset within the object, meaningful to src.
@@ -205,11 +227,28 @@ func (d blockDir) nBlocks() int { return d.granules }
 // ranged read of just that frame.
 func (d blockDir) frame(f int) ([]byte, error) {
 	lo, hi := d.frameOff[f], d.frameOff[f+1]
+
+	var (
+		raw []byte
+		err error
+	)
+
 	if d.src == nil {
-		return d.data[lo:hi], nil
+		raw = d.data[lo:hi]
+	} else if raw, err = d.src.frame(int64(lo), int64(hi-lo)); err != nil {
+		return nil, err
 	}
 
-	return d.src.frame(int64(lo), int64(hi-lo))
+	if d.frameCRC == nil {
+		return raw, nil
+	}
+
+	if got := crc32.Checksum(raw, castagnoli); got != d.frameCRC[f] {
+		return nil, errors.Wrapf(ErrCorrupt, "column %q frame %d: checksum %08x, want %08x",
+			d.col, f, got, d.frameCRC[f])
+	}
+
+	return raw, nil
 }
 
 // frameOf returns the frame holding granule g.
@@ -243,24 +282,40 @@ const footerLenBytes = 4
 // layout: the frame-packed directory leading the frames, the same directory trailing them, or the
 // legacy one-compressed-block-per-granule form. It bounds-checks every field against the object
 // length so a corrupt object errors rather than panics.
-func parseBlockDir(object []byte, framed, footer bool) (blockDir, error) {
+func parseBlockDir(object []byte, desc ColumnDesc) (blockDir, error) {
+	var (
+		d   blockDir
+		err error
+	)
+
 	switch {
-	case footer:
-		return parseFooterDir(object)
-	case framed:
-		return parseFramedDir(object)
+	case desc.Footer:
+		d, err = parseFooterDir(object, desc.Checked)
+	case desc.Framed:
+		d, err = parseFramedDir(object, desc.Checked)
 	default:
-		return parseLegacyDir(object)
+		// The legacy one-compressed-block-per-granule layout predates the checksums and no writer
+		// emits it, so a directory in that form never carries them.
+		d, err = parseLegacyDir(object)
 	}
+
+	if err != nil {
+		return blockDir{}, err
+	}
+
+	d.col = desc.Name
+
+	return d, nil
 }
 
 // parseFooterDir parses a column whose frames lead and whose directory trails:
 //
 //	[frame0][frame1]…[directory][uint32 dirLen]
 //
-// The directory bytes are the frame-packed ones [parseFramedDir] reads, so the two layouts differ
-// only in where the reader finds them and where each frame's offset is measured from.
-func parseFooterDir(object []byte) (blockDir, error) {
+// The directory bytes are the frame-packed ones [parseFramedDir] reads — including their trailing
+// checksum, which dirLen counts — so the two layouts differ only in where the reader finds them and
+// where each frame's offset is measured from.
+func parseFooterDir(object []byte, checked bool) (blockDir, error) {
 	if len(object) < footerLenBytes {
 		return blockDir{}, errors.Wrap(ErrCorrupt, "block dir footer truncated")
 	}
@@ -274,7 +329,7 @@ func parseFooterDir(object []byte) (blockDir, error) {
 
 	dataEnd := end - dirLen
 
-	d, err := parseFramedDirAt(object[dataEnd:end], object[:dataEnd])
+	d, err := parseFramedDirAt(object[dataEnd:end], object[:dataEnd], checked)
 	if err != nil {
 		return blockDir{}, err
 	}
@@ -292,6 +347,18 @@ type dirCursor struct {
 	dataMax int
 }
 
+// u32 reads a fixed little-endian uint32 (a frame checksum).
+func (c *dirCursor) u32(what string) (uint32, error) {
+	if c.pos+dirCRCBytes > len(c.object) {
+		return 0, errors.Wrapf(ErrCorrupt, "block dir %s", what)
+	}
+
+	v := binary.LittleEndian.Uint32(c.object[c.pos:])
+	c.pos += dirCRCBytes
+
+	return v, nil
+}
+
 func (c *dirCursor) uvarint(what string) (uint64, error) {
 	v, n := binary.Uvarint(c.object[c.pos:])
 	if n <= 0 {
@@ -305,10 +372,18 @@ func (c *dirCursor) uvarint(what string) (uint64, error) {
 
 // parseFramedDir parses the frame-packed directory leading the frames it describes (see the layout
 // comment above).
-func parseFramedDir(object []byte) (blockDir, error) {
-	d, pos, total, err := parseFramedDirFields(object, len(object))
+func parseFramedDir(object []byte, checked bool) (blockDir, error) {
+	d, pos, total, err := parseFramedDirFields(object, len(object), checked)
 	if err != nil {
 		return blockDir{}, err
+	}
+
+	if checked {
+		if err := verifyDirCRC(object, pos); err != nil {
+			return blockDir{}, err
+		}
+
+		pos += dirCRCBytes
 	}
 
 	if pos+total > len(object) {
@@ -320,14 +395,39 @@ func parseFramedDir(object []byte) (blockDir, error) {
 	return d, nil
 }
 
+// dirCRCBytes is the fixed little-endian CRC32C closing a checked column's directory fields.
+const dirCRCBytes = 4
+
+// verifyDirCRC checks the directory checksum sitting immediately after the fields at dir[:pos].
+func verifyDirCRC(dir []byte, pos int) error {
+	if pos+dirCRCBytes > len(dir) {
+		return errors.Wrap(ErrCorrupt, "block dir truncated before its checksum")
+	}
+
+	want := binary.LittleEndian.Uint32(dir[pos:])
+	if got := crc32.Checksum(dir[:pos], castagnoli); got != want {
+		return errors.Wrapf(ErrCorrupt, "block dir checksum %08x, want %08x", got, want)
+	}
+
+	return nil
+}
+
 // parseFramedDirAt parses the same directory read out of a separate region — the footer layout,
 // where dir trails the frames in data rather than leading them. The frames' lengths must account for
 // data exactly: a directory describing fewer bytes than the object holds is as corrupt as one
 // describing more.
-func parseFramedDirAt(dir, data []byte) (blockDir, error) {
-	d, pos, total, err := parseFramedDirFields(dir, len(data))
+func parseFramedDirAt(dir, data []byte, checked bool) (blockDir, error) {
+	d, pos, total, err := parseFramedDirFields(dir, len(data), checked)
 	if err != nil {
 		return blockDir{}, err
+	}
+
+	if checked {
+		if err := verifyDirCRC(dir, pos); err != nil {
+			return blockDir{}, err
+		}
+
+		pos += dirCRCBytes
 	}
 
 	if pos != len(dir) {
@@ -347,7 +447,7 @@ func parseFramedDirAt(dir, data []byte) (blockDir, error) {
 // directory (without its data), the byte position just past the fields, and the frames' total
 // compressed length. dataMax bounds that total — the byte count available to the frames, which is
 // the object itself in the leading layout and the region before the directory in the footer one.
-func parseFramedDirFields(dir []byte, dataMax int) (blockDir, int, int, error) {
+func parseFramedDirFields(dir []byte, dataMax int, checked bool) (blockDir, int, int, error) {
 	c := dirCursor{object: dir, dataMax: dataMax}
 
 	nGranules64, err := c.uvarint("nGranules")
@@ -388,6 +488,10 @@ func parseFramedDirFields(dir []byte, dataMax int) (blockDir, int, int, error) {
 		gLen:      buf[nFrames+1+2*nGranules:],
 	}
 
+	if checked {
+		d.frameCRC = make([]uint32, nFrames)
+	}
+
 	total, err := readFrameTable(&c, &d, nFrames)
 	if err != nil {
 		return blockDir{}, 0, 0, err
@@ -414,6 +518,15 @@ func readFrameTable(c *dirCursor, d *blockDir, nFrames int) (int, error) {
 		clen, err := c.uvarint("frame len")
 		if err != nil {
 			return 0, err
+		}
+
+		if d.frameCRC != nil {
+			sum, err := c.u32("frame crc")
+			if err != nil {
+				return 0, err
+			}
+
+			d.frameCRC[f] = sum
 		}
 
 		if count > uint64(d.granules) || g+int(count) > d.granules {

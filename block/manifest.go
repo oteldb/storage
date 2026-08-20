@@ -50,8 +50,18 @@ func (k Kind) valid() bool { return k <= KindInt128 }
 // manifest framing constants. The manifest is the last object written for a part
 // (the commit point) and is the entry point a reader parses first.
 const (
-	manifestMagic   uint32 = 0x4F54504D // "OTPM" (OTel Part Manifest)
-	manifestVersion uint32 = 1
+	manifestMagic uint32 = 0x4F54504D // "OTPM" (OTel Part Manifest)
+	// manifestVersion is what the writer emits. Version 2 added the at-rest checksums over column
+	// data ([ColumnDesc.Checked]); version 1 parts carry none and are still read, unverified.
+	//
+	// The version, rather than a per-column flag, carries it because all eight flag bits are spent
+	// and because a checksum is not a per-column choice: within one part either every column object
+	// is checked or none is.
+	manifestVersion uint32 = 2
+	// manifestVersionMin is the oldest version this reader accepts.
+	manifestVersionMin uint32 = 1
+	// manifestVersionChecked is the first version whose column objects carry checksums.
+	manifestVersionChecked uint32 = 2
 
 	// flagConst marks a constant-collapsed column (single value, no data object).
 	flagConst byte = 1 << 0
@@ -149,6 +159,12 @@ type ColumnDesc struct {
 	// object, and a part written before [flagBytes] existed did not record one). Persisted only when
 	// non-zero. It exists so opening a column for ranged reads costs no round trip of its own.
 	Bytes int64
+
+	// Checked reports that the column's object carries CRC32C checksums over its data — per
+	// compression frame for a framed column, a trailing one over the whole object otherwise — which
+	// the read path verifies. It is not a persisted field of its own: it follows from the enclosing
+	// manifest's version, and the writer sets it on every column it produces.
+	Checked bool
 
 	// Level is the compression level the column's data was written at (0 ⇒ the algorithm default, or
 	// no compression). Persisted only when non-zero, via [flagLevel]. Decode ignores it; the merge
@@ -318,8 +334,9 @@ func DecodeManifest(src []byte) (Manifest, error) {
 	}
 
 	m.Version = uint32(version)
-	if m.Version != manifestVersion {
-		return Manifest{}, errors.Wrapf(ErrCorrupt, "unsupported version %d", m.Version)
+	if m.Version < manifestVersionMin || m.Version > manifestVersion {
+		return Manifest{}, errors.Wrapf(ErrCorrupt,
+			"unsupported version %d, want %d..%d", m.Version, manifestVersionMin, manifestVersion)
 	}
 
 	rowCount, err := r.ReadUvarint()
@@ -356,7 +373,7 @@ func DecodeManifest(src []byte) (Manifest, error) {
 
 	m.Columns = make([]ColumnDesc, 0, colCount)
 	for i := range colCount {
-		c, err := decodeColumnDesc(r)
+		c, err := decodeColumnDesc(r, m.Version)
 		if err != nil {
 			return Manifest{}, errors.Wrapf(err, "column %d", i)
 		}
@@ -376,8 +393,8 @@ func DecodeManifest(src []byte) (Manifest, error) {
 	return m, nil
 }
 
-func decodeColumnDesc(r *bitstream.Reader) (ColumnDesc, error) {
-	var c ColumnDesc
+func decodeColumnDesc(r *bitstream.Reader, version uint32) (ColumnDesc, error) {
+	c := ColumnDesc{Checked: version >= manifestVersionChecked}
 
 	nameLen, err := r.ReadUvarint()
 	if err != nil {
