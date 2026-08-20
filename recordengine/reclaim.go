@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/partid"
 )
 
 // The engine's `parts` slice is the only mutable handle onto its immutable parts; flush/merge replace
@@ -69,25 +70,20 @@ func (e *Engine) retireLocked(parts []*part) {
 
 // sweepOrphansLocked deletes every object under the engine's prefix that belongs to a part the loaded
 // bucket index does not name: the residue of a flush or merge that wrote a part's objects and then
-// failed before committing it, or of a reclaim whose delete failed. It returns the sequence to resume
-// at — one past the highest sequence seen on the backend, not just in the index — so a part never
-// lands on leftovers even when a delete fails or the process restarted mid-attempt. Deletes are
-// best-effort (a failure leaves the object for a later open); a failed List is fatal, since silently
-// skipping the sweep would also skip the sequence seed. Caller holds e.mu.
-func (e *Engine) sweepOrphansLocked(ctx context.Context, maxSeq int) (int, error) {
+// failed before committing it, or of a reclaim whose delete failed. Deletes are best-effort (a failure
+// leaves the object for a later open); a failed List is fatal. Caller holds e.mu.
+func (e *Engine) sweepOrphansLocked(ctx context.Context) error {
 	root := e.cfg.Prefix + "/"
 
 	keys, err := e.cfg.Backend.List(ctx, root)
 	if err != nil {
-		return 0, errors.Wrap(err, "list objects")
+		return errors.Wrap(err, "list objects")
 	}
 
 	live := make(map[string]struct{}, len(e.parts))
 	for _, p := range e.parts {
 		live[p.prefix] = struct{}{}
 	}
-
-	next := maxSeq + 1
 
 	var orphans []string
 
@@ -97,8 +93,7 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context, maxSeq int) (int, error
 			continue // an engine-level object (bucket index, stream index), not part of a part
 		}
 
-		seq := seqOfPrefix(dir)
-		if seq < 0 {
+		if !partid.Valid(dir) {
 			continue
 		}
 
@@ -106,15 +101,11 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context, maxSeq int) (int, error
 			continue
 		}
 
-		if seq >= next {
-			next = seq + 1
-		}
-
 		orphans = append(orphans, k)
 	}
 
 	if len(orphans) == 0 {
-		return next, nil
+		return nil
 	}
 
 	var failed int
@@ -127,9 +118,9 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context, maxSeq int) (int, error
 
 	zctx.From(ctx).Debug("swept orphan part objects",
 		zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
-		zap.Int("objects", len(orphans)), zap.Int("failed", failed), zap.Int("next_seq", next))
+		zap.Int("objects", len(orphans)), zap.Int("failed", failed))
 
-	return next, nil
+	return nil
 }
 
 // reclaimRetired deletes the backend objects of retired parts whose readers have all drained, doing the

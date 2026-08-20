@@ -44,7 +44,7 @@ known, so no `signal.Series` is built or hashed. WAL frames group by series, one
 Drains the head into one flat part, one row per sample:
 
 ```
-{tenant}/metrics/{seq}/
+{tenant}/metrics/{partid}/
   columns    [series:int128, ts:int64, value:float64]   sorted by (series, ts)
   sidx       series index sidecar
   stats      aggregate stats sidecar        (optional, Config.AggregateStats)
@@ -127,25 +127,38 @@ a series starts a buffer, its live records name only series it describes. The pr
 durable. `recordengine/prune.go` is the same prune over resident `part.ranges`; **known gap there:**
 merged symbol sidecars stay unbounded.
 
-## Lifecycle and part sequences
+## Lifecycle and part identity
 
 Driven by the facade's single maintenance loop, plus a head-bytes trigger flushing only the
 over-threshold engines. `Engine` is exported and `Close`/`Reset` callable from anywhere, so
 concurrency is enforced, not assumed: flush and merge hold one `flushMu` across their whole body.
-`Reset` takes it too, draining an in-flight flush/merge that would otherwise publish its part — and a
-stale sequence — into the emptied engine, dropping detached buffers with the head, and **retiring**
-live parts rather than deleting their objects, so a fetch holding one is not read out from under it.
+`Reset` takes it too, draining an in-flight flush/merge that would otherwise publish its part into the
+emptied engine, dropping detached buffers with the head, and **retiring** live parts rather than
+deleting their objects, so a fetch holding one is not read out from under it.
 
-**Invariant: part sequences are append-only.** Flush and merge reserve `{seq}` as they write and
-advance immediately, so a failed attempt burns its sequence rather than handing it to the retry: a
-rewrite replaces only the objects it produces, so a part reusing the sequence inherits leftovers it
-never wrote.
+**Invariant: a part id is globally unique, and names one part's content forever.** `{partid}`
+(`internal/partid`) is a ULID-shaped 128-bit id — 48-bit unix-millisecond timestamp, 80 random bits,
+Crockford base32 — minted per part, never derived from what the node holds. A counter would be unique
+only under a single-writer-per-prefix discipline that nothing enforces: over a shared object store
+(`cluster.Config.PrivateBackend` false) every replica of a shard writes one bucket under one prefix,
+so an ownership handoff, a restore from a stale index, or a rejoin after a lease loss would have two
+writers minting the same key for different content — a silent overwrite there, and a permanently
+diverged part under `cluster/partsync`, which treats the key as the part's identity.
+
+The id's textual form sorts in creation order (the timestamp leads, and the entropy is incremented
+rather than redrawn within a millisecond), so part prefixes still order lexicographically the way the
+old zero-padded counter did — `cluster/partsync` ranks pre-generation indexes by their highest part
+prefix on that basis.
+
+Uniqueness also makes part prefixes append-only for free: a failed attempt burns its id rather than
+handing it to the retry, which matters because a rewrite replaces only the objects it produces, so a
+part reusing a prefix would inherit leftovers it never wrote.
 
 `LoadParts` sweeps that residue — a failed attempt's objects, or a retired part whose reclaim delete
-failed. It lists the prefix, deletes every object under a part directory the bucket index does not
-name, and resumes past the highest sequence seen *on the backend*, which is what makes the guarantee
-survive a restart. The sweep assumes this node **owns** the prefix, so a replica's `RefreshReplica`
-skips it: the owner's in-flight part is not in the index yet.
+failed. It lists the prefix and deletes every object under a part directory the bucket index does not
+name; a directory is a part's when its name parses as a part id. The sweep assumes this node **owns**
+the prefix, so a replica's `RefreshReplica` skips it: the owner's in-flight part is not in the index
+yet.
 
 ## Flush and merge are bounded separately
 

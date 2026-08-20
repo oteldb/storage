@@ -87,8 +87,8 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
 
-	// Plan (under lock): snapshot the source parts (immutable backing). Output part sequences are
-	// reserved one at a time, as the parts are written.
+	// Plan (under lock): snapshot the source parts (immutable backing). Output part ids are minted one
+	// at a time, as the parts are written.
 	e.mu.Lock()
 	src := e.parts
 	e.mu.Unlock()
@@ -309,7 +309,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 			return nil
 		}
 
-		p, err := e.writeMergedPart(ctx, src, buf, e.reserveSeq())
+		p, err := e.writeMergedPart(ctx, src, buf)
 		if err != nil {
 			return err
 		}
@@ -377,10 +377,10 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 	return newParts, nil
 }
 
-// writeMergedPart writes f as the seq-th output part, reads it back, stamps its time bounds, and — when
-// the engine has a side store — writes the union of the source parts' sidecars under it.
-func (e *Engine) writeMergedPart(ctx context.Context, src []*part, f *flushColumns, seq int) (*part, error) {
-	prefix := e.partPrefix(seq)
+// writeMergedPart writes f as an output part, reads it back, stamps its time bounds, and — when the
+// engine has a side store — writes the union of the source parts' sidecars under it.
+func (e *Engine) writeMergedPart(ctx context.Context, src []*part, f *flushColumns) (*part, error) {
+	prefix := e.newPartPrefix()
 	// Compacted parts are the cold, long-lived data — block-compress them (typically ZSTD) so the
 	// dict/DoD-coded columns are also entropy-coded. Defaults to AlgorithmNone (legacy, uncompressed).
 	// The merged part's identities come from the resident index, which spans every live stream —

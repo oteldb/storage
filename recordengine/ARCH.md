@@ -195,12 +195,12 @@ loaded.
 **Merge** is identical to the metric engine: sources are retired only after the bucket index naming
 their replacement is committed. See [`../engine/ARCH.md`](../engine/ARCH.md), "Publish ordering".
 
-## Part sequences & orphans
+## Part identity & orphans
 
-Part prefixes (`<prefix>/%010d`) are **append-only**, and `LoadParts` sweeps orphans at open, exactly
-as in the metric engine ([`../engine/ARCH.md`](../engine/ARCH.md), "Lifecycle and part sequences") —
-including the replica exception, `RefreshReplica` skipping the sweep because the owner's in-flight part
-is not in the index yet.
+Part prefixes are `<prefix>/{partid}`, a minted globally unique id, and `LoadParts` sweeps orphans at
+open — exactly as in the metric engine ([`../engine/ARCH.md`](../engine/ARCH.md), "Lifecycle and part
+identity"), including the replica exception, `RefreshReplica` skipping the sweep because the owner's
+in-flight part is not in the index yet.
 
 Reuse would be unsound here for one extra reason: two of a part's objects are conditional — `keys.bin`
 is skipped when the rows carry no record attributes, the `sym-*.bin` sidecars when there is no side

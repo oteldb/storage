@@ -3,9 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/binary"
-	"path"
 	"slices"
-	"strconv"
 
 	"github.com/go-faster/errors"
 
@@ -76,8 +74,7 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 // once after [New] during recovery. WAL [Engine.Replay] is complementary — it restores the
 // unflushed head samples — but is not required to query flushed data.
 //
-// It replaces any current parts and advances the part sequence past the highest existing
-// part. A head-only engine (no backend) is a no-op. It assumes this node owns the prefix — it
+// It replaces any current parts. A head-only engine (no backend) is a no-op. It assumes this node owns the prefix — it
 // sweeps the part objects the index does not name (see [Engine.sweepOrphansLocked]).
 func (e *Engine) LoadParts(ctx context.Context) error {
 	e.mu.Lock()
@@ -100,7 +97,6 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 	}
 
 	parts := make([]*part, 0, len(ix.Entries))
-	maxSeq := -1
 
 	for _, ent := range ix.Entries {
 		p, err := openPart(ctx, e.cfg.Backend, ent.Prefix)
@@ -110,10 +106,6 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 
 		p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
 		parts = append(parts, p)
-
-		if s := seqOfPrefix(ent.Prefix); s > maxSeq {
-			maxSeq = s
-		}
 	}
 
 	// A part disappearing means identities may have died with it, which is what arms the identity
@@ -127,7 +119,6 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 	}
 
 	e.parts = parts
-	e.nextSeq = maxSeq + 1
 	e.flushedEpoch = ix.FlushedEpoch
 	e.generation = ix.Generation
 	e.removals = ix.Removed
@@ -144,12 +135,9 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 	}
 
 	if sweep {
-		next, err := e.sweepOrphansLocked(ctx, maxSeq)
-		if err != nil {
+		if err := e.sweepOrphansLocked(ctx); err != nil {
 			return err
 		}
-
-		e.nextSeq = next
 	}
 
 	complete, err := e.loadIdentitiesLocked(ctx, parts)
@@ -257,17 +245,6 @@ func decodeSeriesSet(data []byte, fn func(signal.Series)) error {
 	}
 
 	return nil
-}
-
-// seqOfPrefix parses the trailing sequence number of a part prefix
-// ("{enginePrefix}/{seq}"), or -1 if it is not numeric.
-func seqOfPrefix(prefix string) int {
-	n, err := strconv.Atoi(path.Base(prefix))
-	if err != nil {
-		return -1
-	}
-
-	return n
 }
 
 // colsTimeRange returns the inclusive min/max timestamp across cols (which has ≥ 1 sample

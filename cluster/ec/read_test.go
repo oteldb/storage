@@ -13,7 +13,7 @@ import (
 	"github.com/oteldb/storage/cluster/ec"
 )
 
-const partPrefix = "default/metrics/0000000007"
+const partPrefix = "default/metrics/01M00000000000000000000007"
 
 // buildECPart encodes objects into an EC part spread over scheme.Shards() per-node memory
 // backends (shard slot i on node i) with the sidecar on every node, returning the nodes and
@@ -154,7 +154,7 @@ func TestReaderPassthroughAndNotExist(t *testing.T) {
 
 	local := backend.Memory()
 	require.NoError(t, local.Write(ctx, "default/metrics/bucket-index.bin", []byte("ix")))
-	require.NoError(t, local.Write(ctx, "default/metrics/0000000001/manifest", []byte("full-copy")))
+	require.NoError(t, local.Write(ctx, "default/metrics/01M0000000000000000000000A/manifest", []byte("full-copy")))
 
 	r := &ec.Reader{Local: local, Slot: -1}
 
@@ -163,14 +163,14 @@ func TestReaderPassthroughAndNotExist(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("ix"), got)
 
-	got, err = r.Read(ctx, "default/metrics/0000000001/manifest")
+	got, err = r.Read(ctx, "default/metrics/01M0000000000000000000000A/manifest")
 	require.NoError(t, err)
 	assert.Equal(t, []byte("full-copy"), got)
 
 	// Absent everywhere: ErrNotExist, both for non-part keys and part keys without a sidecar.
 	_, err = r.Read(ctx, "default/metrics/streams.bin")
 	require.ErrorIs(t, err, backend.ErrNotExist)
-	_, err = r.Read(ctx, "default/metrics/0000000002/c/0")
+	_, err = r.Read(ctx, "default/metrics/01M0000000000000000000000B/c/0")
 	require.ErrorIs(t, err, backend.ErrNotExist)
 }
 
@@ -178,9 +178,9 @@ func TestSplitKey(t *testing.T) {
 	t.Parallel()
 
 	for key, want := range map[string][2]string{
-		"default/metrics/0000000007/c/0":      {"default/metrics/0000000007", "c/0"},
-		"default/metrics/0000000007/manifest": {"default/metrics/0000000007", "manifest"},
-		"acme/_s3/logs/0000000001/bloom-x":    {"acme/_s3/logs/0000000001", "bloom-x"},
+		"default/metrics/01M00000000000000000000007/c/0":      {"default/metrics/01M00000000000000000000007", "c/0"},
+		"default/metrics/01M00000000000000000000007/manifest": {"default/metrics/01M00000000000000000000007", "manifest"},
+		"acme/_s3/logs/01M0000000000000000000000A/bloom-x":    {"acme/_s3/logs/01M0000000000000000000000A", "bloom-x"},
 	} {
 		prefix, object, ok := ec.SplitKey(key)
 		require.Truef(t, ok, "key %q splits", key)
@@ -191,8 +191,8 @@ func TestSplitKey(t *testing.T) {
 	for _, key := range []string{
 		"default/metrics/bucket-index.bin", // no part segment
 		"default/metrics/series.bin",
-		"default/metrics/0000000007", // a part prefix with no object
-		"123456789/x",                // nine digits, not a seq segment
+		"default/metrics/01M00000000000000000000007", // a part prefix with no object
+		"01M0000000000000000000000/x",                // 25 characters, not a part id
 	} {
 		_, _, ok := ec.SplitKey(key)
 		assert.Falsef(t, ok, "key %q rejected", key)
@@ -203,9 +203,9 @@ func TestShardSlotOf(t *testing.T) {
 	t.Parallel()
 
 	for key, want := range map[string]int{
-		"default/metrics/0000000007/ecshard/0/c/0":      0,
-		"default/metrics/0000000007/ecshard/3/manifest": 3,
-		"t/logs/0000000001/ecshard/11/bloom-x.bin":      11,
+		"default/metrics/01M00000000000000000000007/ecshard/0/c/0":      0,
+		"default/metrics/01M00000000000000000000007/ecshard/3/manifest": 3,
+		"t/logs/01M0000000000000000000000A/ecshard/11/bloom-x.bin":      11,
 	} {
 		slot, ok := ec.ShardSlotOf(key)
 		require.Truef(t, ok, "key %q is a shard", key)
@@ -214,12 +214,12 @@ func TestShardSlotOf(t *testing.T) {
 
 	// Non-shard keys (full copies, sidecar, index) are not shards.
 	for _, key := range []string{
-		"default/metrics/0000000007/c/0",
-		"default/metrics/0000000007/manifest",
-		"default/metrics/0000000007/ecmeta",
+		"default/metrics/01M00000000000000000000007/c/0",
+		"default/metrics/01M00000000000000000000007/manifest",
+		"default/metrics/01M00000000000000000000007/ecmeta",
 		"default/metrics/bucket-index.bin",
-		"default/metrics/0000000007/ecshard/x/c/0", // non-numeric slot
-		"default/metrics/0000000007/ecshard/",      // no slot/object
+		"default/metrics/01M00000000000000000000007/ecshard/x/c/0", // non-numeric slot
+		"default/metrics/01M00000000000000000000007/ecshard/",      // no slot/object
 	} {
 		_, ok := ec.ShardSlotOf(key)
 		assert.Falsef(t, ok, "key %q is not a shard slot", key)

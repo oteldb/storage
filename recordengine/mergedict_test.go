@@ -1,8 +1,11 @@
 package recordengine_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"maps"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,6 +16,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/internal/partid"
 	"github.com/oteldb/storage/recordengine"
 )
 
@@ -26,7 +30,9 @@ var mergeRawIDSchema = recordengine.NewSchema(
 	recordengine.Column{Name: "attrs", Kind: recordengine.KindBytes, Codec: chunk.CodecDict, Bloom: recordengine.BloomAttrs},
 )
 
-// dumpBackend reads every object the backend holds, so two runs can be compared byte for byte.
+// dumpBackend reads every object the backend holds, so two runs can be compared byte for byte. Part
+// ids are minted per run, so they are canonicalized away (see [canonicalizePartIDs]) — what the
+// comparison is about is the part *contents*, which the ids would otherwise mask.
 func dumpBackend(t *testing.T, b backend.Backend) map[string][]byte {
 	t.Helper()
 
@@ -40,6 +46,50 @@ func dumpBackend(t *testing.T, b backend.Backend) map[string][]byte {
 	for _, k := range keys {
 		v, err := b.Read(ctx, k)
 		require.NoError(t, err)
+		out[k] = v
+	}
+
+	return canonicalizePartIDs(out)
+}
+
+// partIDPattern matches a part id that follows a path separator, the only shape one takes in a key
+// or in the length-prefixed prefixes an object body embeds.
+var partIDPattern = regexp.MustCompile(`/([0-9A-HJKMNP-TV-Z]{26})`)
+
+// canonicalizePartIDs rewrites every part id in a backend dump — in keys and in object bodies, which
+// embed their own prefix — to its rank in creation order. The stand-in is the same length as an id,
+// so length-prefixed framing inside an object stays byte-identical.
+func canonicalizePartIDs(objs map[string][]byte) map[string][]byte {
+	ids := make(map[string]struct{})
+
+	collect := func(b []byte) {
+		for _, m := range partIDPattern.FindAllSubmatch(b, -1) {
+			if id := string(m[1]); partid.Valid(id) {
+				ids[id] = struct{}{}
+			}
+		}
+	}
+
+	for k, v := range objs {
+		collect([]byte(k))
+		// Bodies name parts too — the bucket index lists the merge's removed prefixes, which are
+		// gone from the backend and so appear in no key.
+		collect(v)
+	}
+
+	rename := make(map[string]string, len(ids))
+	for i, id := range slices.Sorted(maps.Keys(ids)) {
+		rename[id] = fmt.Sprintf("PART%022d", i)
+	}
+
+	out := make(map[string][]byte, len(objs))
+
+	for k, v := range objs {
+		for id, name := range rename {
+			k = strings.ReplaceAll(k, id, name)
+			v = bytes.ReplaceAll(v, []byte(id), []byte(name))
+		}
+
 		out[k] = v
 	}
 

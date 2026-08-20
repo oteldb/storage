@@ -198,7 +198,7 @@ func TestSyncPrunesAfterTwoMisses(t *testing.T) {
 	_, err = replica.Read(ctx, "t/metrics/0000000001/manifest")
 	require.NoError(t, err, "stale part objects still present after one miss")
 
-	// The index changed again (epoch-less same-generation edge is fine: same maxSeq but the
+	// The index changed again (epoch-less same-generation edge is fine: same max part prefix but the
 	// owner rewrote nothing — force a differing index by another flush).
 	fix := &bucketindex.Index{}
 	fix.Add(bucketindex.Entry{Prefix: "t/metrics/0000000003", MinTime: 100, MaxTime: 400})

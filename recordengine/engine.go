@@ -81,15 +81,14 @@ type Config struct {
 type Engine struct {
 	cfg Config
 	mu  sync.RWMutex
-	// flushMu serializes the *whole* body of a flush or merge (both mutate parts and reserve part
-	// sequences, and a flush reuses e.flushBuf off e.mu). The facade drives them from one maintenance
+	// flushMu serializes the *whole* body of a flush or merge (both mutate parts, and a flush reuses
+	// e.flushBuf off e.mu). The facade drives them from one maintenance
 	// goroutine, but the type is exported and Close/Reset are callable from anywhere, so the
 	// single-mutator invariant is enforced here rather than assumed. Always taken before e.mu, never
 	// while holding it.
 	flushMu sync.Mutex
 	head    *head
 	parts   []*part
-	nextSeq int
 	// mergeRunning is true while a [Engine.Merge] is executing (introspection liveness; see
 	// [Engine.MergeRunning]). Set/cleared around the merge, not held during it.
 	mergeRunning atomic.Bool
@@ -692,7 +691,6 @@ func (e *Engine) Reset(ctx context.Context) error {
 	e.mu.Lock()
 	e.head = newHead(e.cfg.Schema)
 	e.flushing = nil // discarded with the head: Reset drops the records, it does not flush them
-	e.nextSeq = 0
 
 	if e.cfg.Backend == nil {
 		e.parts, e.retiring = nil, nil
@@ -1154,8 +1152,8 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 
 	// Plan (under lock): detach the head's record buffers (keeping them readable via e.flushing so a
 	// concurrent fetch never loses them), snapshot the side-store delta atomically with the detach (so
-	// a concurrent append's symbols aren't lost by the Reset). Part sequences are reserved per part
-	// below, as the parts are written.
+	// a concurrent append's symbols aren't lost by the Reset). Part ids are minted per part below, as
+	// the parts are written.
 	e.mu.Lock()
 	detached, detachedBytes := e.head.detach()
 	if detached == nil {
@@ -1200,7 +1198,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 			sub = f.slice(rg[0], rg[1])
 		}
 
-		prefix := e.partPrefix(e.reserveSeq())
+		prefix := e.newPartPrefix()
 
 		// Flush writes columns codec-only (no block compression) to keep ingest cheap; the cold merge
 		// recompresses. See [Config.MergeCompression].

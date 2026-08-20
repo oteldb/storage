@@ -1,9 +1,10 @@
 package ec
 
 import (
-	"path"
 	"strconv"
 	"strings"
+
+	"github.com/oteldb/storage/internal/partid"
 )
 
 // The on-backend layout of an erasure-coded part. A full-copy part stores each object at
@@ -62,37 +63,16 @@ func ShardSlotOf(key string) (slot int, ok bool) {
 	return n, true
 }
 
-// SplitKey splits a backend key into its part prefix and part-relative object name, keyed off
-// the engine's fixed-width numeric part-sequence segment ("{enginePrefix}/{seq:010d}/{object}").
-// It reports ok=false for keys not under a part (e.g. the engine's bucket index or identity
-// objects).
+// SplitKey splits a backend key into its part prefix and part-relative object name, keyed off the
+// part id segment the flush path mints ("{enginePrefix}/{partid}/{object}"). It reports ok=false for
+// keys not under a part (e.g. the engine's bucket index or identity objects).
 func SplitKey(key string) (partPrefix, object string, ok bool) {
 	segs := strings.Split(key, "/")
 	for i, s := range segs[:max(len(segs)-1, 0)] {
-		if isSeqSegment(s) {
+		if partid.Valid(s) {
 			return strings.Join(segs[:i+1], "/"), strings.Join(segs[i+1:], "/"), true
 		}
 	}
 
 	return "", "", false
-}
-
-// isSeqSegment reports whether s is a part-sequence path segment: exactly ten digits (the
-// flush path's %010d formatting).
-func isSeqSegment(s string) bool {
-	if len(s) != 10 {
-		return false
-	}
-
-	if _, err := strconv.Atoi(s); err != nil || path.Clean(s) != s {
-		return false
-	}
-
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-
-	return true
 }

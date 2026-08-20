@@ -136,6 +136,11 @@ degrades into a silently partial result.
   first — its column objects and, in `engine`, the part's own identity object naming its series.
   Publish order is chosen to leave recoverable slack on a crash — unreferenced objects, an orphan
   part swept at the next open — never rows that are committed but unresolvable.
+- **A part id is globally unique** (both engines). A part's backend key is `{enginePrefix}/{partid}`,
+  where `partid` is a minted ULID-shaped id (`internal/partid`), not a per-node counter: replicas of a
+  shard can share one object store under one prefix, so only an id no local state participates in
+  keeps two writers from naming different content with the same key. It sorts in creation order, so
+  part prefixes still order lexicographically.
 - **Identity is scoped to the part that holds it** (both engines). Each part carries the identities of its own series, so retention is self-cleaning
   (dropping a part drops them), a flush persists what it wrote rather than the whole set, and every
   node — owner or replica — derives its live identity set from its own parts. The resident index is
@@ -178,6 +183,6 @@ engine/               metrics vertical
 recordengine/         shared record engine (logs/traces/profiles)
 query/{fetch,scale,profile,promql}           read seam · scale-out decorators · EXPLAIN ANALYZE · Prom adapter
 cluster/{,ring,etcd,replica,rebalance,partsync,ec}   L0 distribution
-internal/{obs,retry,simd,parallel,cmd/gensimd}       injected observability · reliability · AVX2 kernels · fan-out
+internal/{obs,retry,simd,parallel,partid,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids
 reliability/          public RetryConfig presets
 ```

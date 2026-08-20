@@ -18,9 +18,9 @@ import (
 
 // The shared-store deployment (cluster.Config.PrivateBackend false) runs every replica of a shard
 // over one object store under one prefix, so two engines flush into the same namespace and commit
-// through the same index object. These are the reproducers for what that costs today; see #392
-// (the index is overwritten without compare-and-swap) and #383 (part sequences are minted from
-// per-engine counters into a shared namespace).
+// through the same index object. These are the reproducers for what that costs today; the part
+// namespace is safe (#383: part ids are minted, so two engines cannot name the same key), but the
+// index is still overwritten without compare-and-swap (#392).
 
 const sharedPrefix = "default/metrics"
 
@@ -57,9 +57,9 @@ func queryable(t *testing.T, be backend.Backend, jobs ...string) []string {
 }
 
 // TestSharedBackendFlushKeepsPeerPart is the sequential form: two engines over one backend flush
-// one series each, both succeed, and only one of the two is afterwards queryable. The second
-// flush mints the sequence the first already used, so it overwrites the first engine's part
-// objects and then commits an index that does not name them.
+// one series each, both succeed, and only one of the two is afterwards queryable. Both parts are on
+// the store under their own ids ([TestSharedBackendFlushKeepsPeerPartObjects]); the second commit
+// writes an index that does not name the first.
 func TestSharedBackendFlushKeepsPeerPart(t *testing.T) {
 	reproduce.Unfixed(t, 392, "engines over a shared store commit the index without compare-and-swap")
 	t.Parallel()
@@ -78,6 +78,67 @@ func TestSharedBackendFlushKeepsPeerPart(t *testing.T) {
 
 	require.ElementsMatch(t, []string{"a", "b"}, queryable(t, be, "a", "b"),
 		"a flush that reported success must not drop another engine's committed part")
+}
+
+// TestSharedBackendFlushKeepsPeerPartObjects covers the identity half of the shared-store loss (#383)
+// on its own: two engines over one backend flush a part each, and neither writes over the other's
+// objects, because a part id is minted rather than derived from a per-engine counter. The index
+// still names only one of the two until the commit takes compare-and-swap (#392) — this is about
+// the objects being intact on the store for that fix to name.
+func TestSharedBackendFlushKeepsPeerPartObjects(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := backend.Memory()
+
+	a := newSharedEngine(t, be)
+	b := newSharedEngine(t, be)
+
+	mustAppend(t, a, mkSeries("job", "a"), 100, 1.0)
+	require.NoError(t, a.Flush(ctx))
+
+	first := partDirs(t, be, sharedPrefix)
+	require.Len(t, first, 1)
+
+	// b has never seen a's part: it mints from its own state, exactly the split-brain case.
+	written := objectBytes(t, be, sharedPrefix+"/"+first[0]+"/")
+	require.NotEmpty(t, written)
+
+	mustAppend(t, b, mkSeries("job", "b"), 200, 2.0)
+	require.NoError(t, b.Flush(ctx))
+
+	both := partDirs(t, be, sharedPrefix)
+	require.Len(t, both, 2, "the two engines must mint distinct part ids")
+	require.Contains(t, both, first[0])
+
+	require.Equal(t, written, objectBytes(t, be, sharedPrefix+"/"+first[0]+"/"),
+		"the second engine's flush must not write over the first engine's part objects")
+
+	other := both[0]
+	if other == first[0] {
+		other = both[1]
+	}
+
+	require.NotEmpty(t, objectBytes(t, be, sharedPrefix+"/"+other+"/"),
+		"the second engine's own part must be on the store too")
+}
+
+// objectBytes reads every object under prefix, so a later write over any of them is detectable.
+func objectBytes(t *testing.T, be backend.Backend, prefix string) map[string][]byte {
+	t.Helper()
+
+	keys, err := be.List(context.Background(), prefix)
+	require.NoError(t, err)
+
+	out := make(map[string][]byte, len(keys))
+
+	for _, k := range keys {
+		v, err := be.Read(context.Background(), k)
+		require.NoError(t, err)
+		out[k] = v
+	}
+
+	return out
 }
 
 // TestSharedBackendConcurrentFlushKeepsPeerPart is the concurrent form, so the loss cannot be

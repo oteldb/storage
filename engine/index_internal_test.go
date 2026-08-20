@@ -10,14 +10,6 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-func TestSeqOfPrefix(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, 7, seqOfPrefix("default/metrics/0000000007"))
-	assert.Equal(t, 0, seqOfPrefix("p/0000000000"))
-	assert.Equal(t, -1, seqOfPrefix("default/metrics/not-a-number"))
-}
-
 // legacySeriesSet writes the whole-set identity object exactly as builds before part-scoped
 // identity did: a count followed by length-delimited hash-input records. Nothing in the engine
 // writes this any more — the fixture stands in for an older writer so the migration path stays
