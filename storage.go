@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"fmt"
 	"io/fs"
 	"maps"
 	"os"
@@ -154,18 +153,12 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	// Join the cluster (membership + replica server + routed writes) when configured.
 	if o.Cluster != nil {
 		if o.nodeLocalBackendUnshared() {
-			const (
-				effect = "flushed parts are not replicated between nodes; after a rebalance handoff or a " +
-					"replica restart this node answers reads without them, and the caller cannot tell that " +
-					"from real absence"
-				action = "set cluster.Config.PrivateBackend if the backend is local to this node; ignore " +
-					"this if it is a shared store every node reads (a network mount, an object store)"
-			)
-
-			s.obs.Logger(ctx).Warn("cluster backend looks node-private but PrivateBackend is false",
-				zap.String("backend", fmt.Sprintf("%T", o.Backend)),
-				zap.String("effect", effect),
-				zap.String("action", action))
+			return nil, errors.Errorf(
+				"cluster backend %T is node-private but cluster.Config.PrivateBackend is false: "+
+					"flushed parts would not be replicated between nodes, so after a rebalance handoff or a "+
+					"replica restart this node answers reads without them and the caller cannot tell that "+
+					"from real absence; set PrivateBackend, or use an object store",
+				o.Backend)
 		}
 
 		// Recovery restores flushed parts and the WAL's head; whatever the shard held unflushed and

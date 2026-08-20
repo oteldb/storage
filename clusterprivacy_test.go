@@ -47,30 +47,27 @@ func TestNodeLocalBackendUnshared(t *testing.T) {
 	}
 }
 
-// TestClusterWarnsNodeLocalBackendUnshared covers issue #369: a cluster node whose backend is
-// private to it while cluster.Config.PrivateBackend is unset replicates no flushed part, and the
-// resulting hole reads as genuine absence. Open says so, and Inspect keeps saying so.
+// TestClusterRefusesNodeLocalBackendUnshared covers issue #369, as narrowed by #408: a cluster node
+// whose backend is private to it while cluster.Config.PrivateBackend is unset replicates no flushed
+// part, and the resulting hole reads as genuine absence. It used to open with a warning, on the
+// premise that a file backend over a shared mount was a legitimate shared store landing in the same
+// check. It is not one — CompareAndSwap is process-local over a directory tree, so two nodes lose
+// index commits to each other in silence — which leaves the configuration with no valid reading.
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
-func TestClusterWarnsNodeLocalBackendUnshared(t *testing.T) {
+func TestClusterRefusesNodeLocalBackendUnshared(t *testing.T) {
 	endpoint := startEtcd(t)
 
-	core, logs := observer.New(zap.WarnLevel)
+	_, err := Open(context.Background(), Options{}, WithBackend(backend.Memory()),
+		WithCluster(&cluster.Config{
+			Etcd: []string{endpoint},
+			Self: etcd.Member{ID: "node-a", Addr: "127.0.0.1:0"},
+			RF:   1,
+		}))
 
-	s := openClusterNodeWith(t, endpoint, "node-a", backend.Memory(), WithLogger(zap.New(core)))
-
-	warnings := logs.FilterMessage("cluster backend looks node-private but PrivateBackend is false").All()
-	require.Len(t, warnings, 1)
-
-	fields := warnings[0].ContextMap()
-	assert.Contains(t, fields, "backend")
-	assert.Contains(t, fields["action"], "cluster.Config.PrivateBackend", "the warning names the field that fixes it")
-	assert.Contains(t, fields["effect"], "not replicated", "the warning names what silently does not happen")
-
-	cs := s.Inspect().Cluster
-	require.NotNil(t, cs)
-	assert.False(t, cs.PrivateBackend)
-	assert.True(t, cs.NodeLocalBackendUnshared)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "PrivateBackend", "the error names the field that fixes it")
+	assert.Contains(t, err.Error(), "not be replicated", "the error names what silently does not happen")
 }
 
 // TestClusterQuietWhenPrivateBackendDeclared is the other half: a node that declares its backend
@@ -104,5 +101,4 @@ func TestClusterQuietWhenPrivateBackendDeclared(t *testing.T) {
 	cs := s.Inspect().Cluster
 	require.NotNil(t, cs)
 	assert.True(t, cs.PrivateBackend)
-	assert.False(t, cs.NodeLocalBackendUnshared)
 }

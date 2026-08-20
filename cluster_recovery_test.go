@@ -68,9 +68,10 @@ func TestClusterRestartServesUnflushedHead(t *testing.T) {
 		// the WAL is the only copy the restart can recover from.
 		s, err := Open(ctx, Options{}, WithBackend(be), WithWALDir(walDir), WithFlushInterval(-1),
 			WithCluster(&cluster.Config{
-				Etcd: []string{endpoint},
-				Self: etcd.Member{ID: "node-a", Addr: "127.0.0.1:0"},
-				RF:   1,
+				Etcd:           []string{endpoint},
+				Self:           etcd.Member{ID: "node-a", Addr: "127.0.0.1:0"},
+				RF:             1,
+				PrivateBackend: true, // a file backend is private to its node; Open refuses otherwise (#408)
 			}))
 		require.NoError(t, err)
 
@@ -117,7 +118,12 @@ func TestClusterRestartedReplicaFailsOverInsteadOfServingAHole(t *testing.T) {
 		be, err := file.New(dataDir)
 		require.NoError(t, err)
 
-		s, err := Open(ctx, Options{}, WithBackend(be), WithWALDir(walDirs[id]), WithFlushInterval(-1),
+		// Declared shared, which is what an object store reports and what this directory is *here*:
+		// both nodes are one process, so the file backend's process-local CompareAndSwap really is
+		// atomic between them. Across processes it would not be, which is why a shared mount is not
+		// a supported deployment (#408) and Open refuses the undeclared form.
+		s, err := Open(ctx, Options{}, WithBackend(&sharedStore{be}), WithWALDir(walDirs[id]),
+			WithFlushInterval(-1),
 			WithCluster(&cluster.Config{
 				Etcd: []string{endpoint},
 				Self: etcd.Member{ID: id, Addr: "127.0.0.1:0"},
