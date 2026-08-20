@@ -36,6 +36,10 @@ type Ownership struct {
 	// after losing its lease ([Membership.OnRejoin]), so it is read atomically.
 	leaseID atomic.Int64
 
+	// fenced reports that the lease every claim hangs off can no longer be proven live
+	// ([Membership.Fenced]), so nothing in held may be acted on. Unset ⇒ never fenced.
+	fenced atomic.Pointer[func() bool]
+
 	mu sync.Mutex
 	// held maps each shard this node holds a claim on to that claim's term — the etcd revision
 	// the claim was created at. See [Ownership.Term].
@@ -70,6 +74,22 @@ func (o *Ownership) SetLease(id clientv3.LeaseID) {
 
 	o.leaseID.Store(int64(id))
 	o.held = make(map[string]uint64)
+}
+
+// SetFence installs the predicate that reports this node's claims unprovable — wire it to
+// [Membership.Fenced]. While it reports true this node holds nothing as far as every caller is
+// concerned: [Ownership.Term] disclaims, [Ownership.Owned] is empty, and [Ownership.Reconcile]
+// is a no-op, so the node neither flushes nor stamps an index for a shard whose tenure it can
+// no longer prove. The held set itself is kept, so a lease confirmed again — the same lease,
+// without a rejoin — resumes the claims rather than re-acquiring them. nil clears the fence.
+func (o *Ownership) SetFence(fenced func() bool) {
+	if fenced == nil {
+		o.fenced.Store(nil)
+
+		return
+	}
+
+	o.fenced.Store(&fenced)
 }
 
 // Claims returns every currently-claimed shard across the cluster (sorted), from one etcd
@@ -138,6 +158,10 @@ func (o *Ownership) Acquire(ctx context.Context, shard string) (term uint64, ok 
 // and whether the shard is held at all. It is what a writer stamps into the indexes it writes
 // for that shard, so a shrunk index can be told from a damaged one.
 func (o *Ownership) Term(shard string) (uint64, bool) {
+	if o.isFenced() {
+		return 0, false
+	}
+
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -173,6 +197,12 @@ func (o *Ownership) Release(ctx context.Context, shard string) error {
 // unchanged ring), and a held shard no longer wanted is released. Steady state issues no etcd
 // writes. On a ring change the enacted primary handoffs are recorded in [Ownership.LastPlan].
 func (o *Ownership) Reconcile(ctx context.Context, r *ring.Ring, shards []string) ([]string, error) {
+	if o.isFenced() {
+		// Past the lease deadline every claim is another node's to take, and the etcd writes
+		// this pass would issue cannot reach etcd anyway. Hold the set and own nothing.
+		return nil, nil
+	}
+
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -238,6 +268,10 @@ func (o *Ownership) Reconcile(ctx context.Context, r *ring.Ring, shards []string
 
 // Owned returns a sorted snapshot of the shards this node currently holds a compaction claim on.
 func (o *Ownership) Owned() []string {
+	if o.isFenced() {
+		return nil
+	}
+
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -266,6 +300,13 @@ func (o *Ownership) LastPlan() []rebalance.Reassignment {
 	copy(out, o.lastPlan)
 
 	return out
+}
+
+// isFenced reports whether the claim-backing lease is currently unprovable.
+func (o *Ownership) isFenced() bool {
+	fn := o.fenced.Load()
+
+	return fn != nil && (*fn)()
 }
 
 // ownedLocked returns a sorted snapshot of held; the caller must hold o.mu.

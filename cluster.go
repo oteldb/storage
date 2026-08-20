@@ -361,6 +361,12 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	// claims have to follow the node's new lease when it re-registers.
 	mship.OnRejoin(own.SetLease)
 
+	// A rejoin is not the only way a claim dies: a node that simply stops renewing keeps its
+	// held set and would go on flushing and stamping indexes for shards etcd has reassigned.
+	// The lease deadline expires the claims locally, without waiting for a rejoin that may
+	// never come.
+	own.SetFence(mship.Fenced)
+
 	s.cluster = &clusterNode{
 		client:     client,
 		membership: mship,
@@ -1353,6 +1359,13 @@ func (s *Storage) routeToPrimary(ctx context.Context, sig signal.Signal, tenant 
 // durable copy, so it needs RF/2 secondary acks). It returns the per-reason rejection breakdown.
 // The applying engine is selected by sig (metrics vs the record signals).
 func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant string, walBytes []byte) (cluster.Reject, error) {
+	// A write is only acknowledged by a node that can still prove the shard is its own; see
+	// cluster_fence.go. Checked before the engine is touched, so a fenced node neither applies
+	// nor materializes anything for a shard that has moved on.
+	if err := s.checkPrimaryClaim(ctx, sig, tenant); err != nil {
+		return cluster.Reject{}, err
+	}
+
 	// Policy is per real tenant; in sharded-metric mode tenant is a shard key ({tenant}/_s{idx}).
 	limits := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(signal.TenantID(tenant)))).Limits
 
