@@ -9,6 +9,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 )
 
@@ -34,7 +35,7 @@ func rivals(t *testing.T, be backend.Backend) (a, b *engine.Engine) {
 // every fix in #397 (per-writer slots keep each writer's own; a globally comparable epoch is
 // monotone), while the value itself depends on which is chosen.
 func TestRebaseDoesNotLowerTheFlushWatermark(t *testing.T) {
-	t.Skip("reproducer for #397: a rebased commit stamps its own per-node WAL epoch")
+	reproduce.Unfixed(t, 397, "a rebased commit stamps its own per-node WAL epoch")
 	t.Parallel()
 
 	ctx := context.Background()
@@ -68,7 +69,7 @@ func TestRebaseDoesNotLowerTheFlushWatermark(t *testing.T) {
 // check that trusts the local index — the rival's rows are missing while the index says they are
 // there.
 func TestRebaseServesTheAdoptedParts(t *testing.T) {
-	t.Skip("reproducer for #398: adopted entries are committed but not opened")
+	reproduce.Unfixed(t, 398, "adopted entries are committed but not opened")
 	t.Parallel()
 
 	ctx := context.Background()
