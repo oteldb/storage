@@ -74,9 +74,40 @@ func TestRoundTrip(t *testing.T) {
 func TestGoldenEncoding(t *testing.T) {
 	t.Parallel()
 
-	ix := &bucketindex.Index{Entries: []bucketindex.Entry{{Prefix: "a", MinTime: 1, MaxTime: 2}}, FlushedEpoch: 3}
-	// magic 'B','I', version 2, count 1, len 1, 'a', zigzag(1)=2, zigzag(2)=4, flushedEpoch 3.
-	assert.Equal(t, []byte{'B', 'I', 2, 1, 1, 'a', 2, 4, 3}, ix.AppendBinary(nil))
+	ix := &bucketindex.Index{
+		Entries:      []bucketindex.Entry{{Prefix: "a", MinTime: 1, MaxTime: 2}},
+		FlushedEpoch: 3,
+		Generation:   bucketindex.Generation{Term: 4, Counter: 5},
+	}
+	// magic 'B','I', version 3, count 1, len 1, 'a', zigzag(1)=2, zigzag(2)=4, flushedEpoch 3,
+	// generation term 4, generation counter 5.
+	assert.Equal(t, []byte{'B', 'I', 3, 1, 1, 'a', 2, 4, 3, 4, 5}, ix.AppendBinary(nil))
+}
+
+// TestDecodeV2Compat verifies a v2 index (epoch, no generation) decodes with a zero generation,
+// which orders below every generation a writer produces.
+func TestDecodeV2Compat(t *testing.T) {
+	t.Parallel()
+
+	got, err := bucketindex.Decode([]byte{'B', 'I', 2, 1, 1, 'a', 2, 4, 3})
+	require.NoError(t, err)
+	require.Len(t, got.Entries, 1)
+	assert.EqualValues(t, 3, got.FlushedEpoch)
+	assert.True(t, got.Generation.Zero())
+}
+
+// TestGenerationRoundTrip verifies the generation survives encode∘decode.
+func TestGenerationRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	in := &bucketindex.Index{
+		Entries:    []bucketindex.Entry{{Prefix: "p", MinTime: 1, MaxTime: 2}},
+		Generation: bucketindex.Generation{Term: 1 << 40, Counter: 1 << 33},
+	}
+
+	out, err := bucketindex.Decode(in.AppendBinary(nil))
+	require.NoError(t, err)
+	assert.Equal(t, in.Generation, out.Generation)
 }
 
 // TestDecodeV1Compat verifies a v1 index (no flush epoch) decodes with FlushedEpoch 0.

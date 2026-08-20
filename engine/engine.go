@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/pool"
 	"github.com/oteldb/storage/query/fetch"
@@ -37,6 +38,12 @@ type Config struct {
 	// Prefix is the backend key prefix under which this engine's parts are written
 	// (typically "{tenant}/metrics").
 	Prefix string
+	// Term reports this writer's current ownership term for Prefix — which tenure of the shard
+	// this engine is writing as. It is stamped into every bucket index written, so a reader can
+	// order two indexes of the same prefix even when neither the part names nor FlushedEpoch
+	// moved; see [github.com/oteldb/storage/backend/bucketindex.Generation]. nil is a writer with
+	// no cluster, whose generation is then a plain local counter.
+	Term func() uint64
 	// Obs is the observability handle (spans + metrics). nil ⇒ a no-op handle, so an engine
 	// constructed without one logs/spans/counts nothing.
 	Obs *obs.Obs
@@ -149,6 +156,10 @@ type Engine struct {
 	// the segments outlive their checkpoint (a node that stops being the shard's compaction owner
 	// stops checkpointing, but its parts still arrive from the owner).
 	flushedEpoch uint64
+	// generation is the commit generation of the last bucket index this engine wrote, advanced on
+	// every write. It is deliberately *not* reset by Reset: dropping the data does not entitle the
+	// engine to write an index a replica would refuse as stale.
+	generation bucketindex.Generation
 	// blockCache memoizes decoded column blocks across fetches (LRU, keyed by part/column/block); nil
 	// ⇒ decode every fetch. A fetch caches only the blocks its matched series touch, so the resident
 	// set is the useful blocks across live parts rather than every whole part touched.
@@ -1683,3 +1694,12 @@ func (e *Engine) putI64(s []int64) { e.i64Res.put(s) }
 
 // putF64 is [Engine.putI64] for float64 value buffers.
 func (e *Engine) putF64(s []float64) { e.f64Res.put(s) }
+
+// term is this writer's ownership term, or 0 with no cluster to ask.
+func (e *Engine) term() uint64 {
+	if e.cfg.Term == nil {
+		return 0
+	}
+
+	return e.cfg.Term()
+}

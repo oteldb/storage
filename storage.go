@@ -1110,6 +1110,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		OOOWindow:        s.opts.OOOWindow,
 		Backend:          s.backendFor(tid),
 		Prefix:           prefix,
+		Term:             s.termFor(tid),
 		WAL:              w,
 		Obs:              s.obs,
 		DecodeCacheBytes: s.opts.DecodeCacheBytes,

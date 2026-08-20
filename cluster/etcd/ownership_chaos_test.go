@@ -117,7 +117,7 @@ func TestOwnershipConcurrentClaimSingleWinner(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			ok, err := owners[i].Acquire(ctx, "hot") // distinct index per goroutine ⇒ race-free
+			_, ok, err := owners[i].Acquire(ctx, "hot") // distinct index per goroutine ⇒ race-free
 			results[i] = result{ok, err}
 		}(i)
 	}

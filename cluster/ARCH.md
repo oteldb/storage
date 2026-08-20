@@ -175,6 +175,23 @@ objects, bucket index after everything**, so the local index only ever reference
 parts (the same commit-point discipline as flush; a crashed sync leaves an orphan retried next
 pass).
 
+**Absence is not an instruction.** Mirroring a peer and obeying its deletions are separate claims,
+and only an index that *supersedes* the local one may do the second. Ordering comes from the bucket
+index's commit generation — a `(term, counter)` pair the writing engine stamps on every index write,
+where the term is the etcd revision the writer's compaction claim was created at
+(`Ownership.Acquire`). Neither the part names nor `FlushedEpoch` can play that role: both are
+high-water marks of *creation*, so a rewrite that only removes parts moves neither, and a shrink is
+indistinguishable from a silent loss — an owner with bit rot, a partial `rm`, or an index rolled
+back by a snapshot still holds the newest part. A peer that does not supersede is still copied from
+(additive, always safe) but its index is not installed and its absences prune nothing; the
+protection set is then the union of both indexes, and because the local index is kept, the part goes
+on being protected on every later pass rather than only the one that noticed. The term is what keeps
+this live as well as safe: a purely local counter would leave a node restored from an old snapshot
+permanently unable to supersede its own replicas, where reacquiring the shard raises its term above
+the tenure that intervened. An index predating format v3 carries no generation, sorts below every
+one that does, and falls back to the old `maxSeq`/`FlushedEpoch` ranking only when neither side has
+one.
+
 The engine layer is untouched: partsync moves objects, then the ordinary `RefreshReplica`/
 `LoadParts` path loads them. Because the head is trimmed only below parts the engine actually
 loaded, pull-before-trim can never drop an unflushed sample. A replica mirrors before each refresh;

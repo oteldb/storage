@@ -74,6 +74,7 @@ func (s *Storage) recordEngineCached(
 		OOOWindow: s.opts.OOOWindow,
 		Backend:   s.backendFor(tid),
 		Prefix:    prefix,
+		Term:      s.termFor(tid),
 		SideStore: side,
 		WAL:       w,
 		Obs:       s.obs,
