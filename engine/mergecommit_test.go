@@ -31,6 +31,18 @@ func (r *rejectIndexWrites) Write(ctx context.Context, key string, data []byte) 
 	return r.Backend.Write(ctx, key, data)
 }
 
+// CompareAndSwap is the path the index commit actually takes; failing only Write would leave the
+// commit untouched.
+func (r *rejectIndexWrites) CompareAndSwap(
+	ctx context.Context, key string, expected backend.Version, data []byte,
+) (backend.Version, bool, error) {
+	if r.armed.Load() && strings.HasSuffix(key, "/"+bucketindex.Object) {
+		return backend.VersionAbsent, false, errors.New("injected write failure")
+	}
+
+	return r.Backend.CompareAndSwap(ctx, key, expected, data)
+}
+
 // seriesSamples returns the timestamps and values the engine holds for the "api" series.
 func seriesSamples(t *testing.T, e *engine.Engine) ([]int64, []float64) {
 	t.Helper()

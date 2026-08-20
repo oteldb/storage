@@ -196,6 +196,21 @@ func (e *ecBackend) PutIfAbsent(ctx context.Context, key string, data []byte) (b
 	return e.inner.PutIfAbsent(ctx, key, data)
 }
 
+// CompareAndSwap and ReadVersioned pass straight through to the raw backend, deliberately with
+// no reconstruction fallback: the objects committed conditionally (the bucket index, manifests)
+// are small full copies that the converter never erasure-codes, so a version read here is the
+// version the store holds. Reconstructing one would produce bytes with no version the store would
+// match, and a commit conditioned on that could never land.
+func (e *ecBackend) CompareAndSwap(
+	ctx context.Context, key string, expected backend.Version, data []byte,
+) (backend.Version, bool, error) {
+	return e.inner.CompareAndSwap(ctx, key, expected, data)
+}
+
+func (e *ecBackend) ReadVersioned(ctx context.Context, key string) ([]byte, backend.Version, error) {
+	return e.inner.ReadVersioned(ctx, key)
+}
+
 func (e *ecBackend) IsEphemeral() bool { return e.inner.IsEphemeral() }
 
 // IsNodeLocal forwards the [backend.NodeLocal] capability.

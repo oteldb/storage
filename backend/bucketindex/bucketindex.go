@@ -270,9 +270,13 @@ func readVarint(buf []byte) (int64, []byte, bool) {
 }
 
 // Load reads the index stored under key from b. A missing object is reported as an empty
-// index (the read path starts before any flush has written one).
+// index (the read path starts before any flush has written one). Use [LoadVersioned] when the
+// index will be written back: a commit needs the version it was read at.
 func Load(ctx context.Context, b backend.Backend, key string) (*Index, error) {
-	data, err := b.Read(ctx, key)
+	// Uncached, like [LoadVersioned]: the index is rewritten as parts come and go, and over a
+	// shared store by writers this process cannot see. A resident copy proves only what this
+	// process last read, and serving one here would hide a peer's commit behind a stale part set.
+	data, err := backend.ReadUncached(ctx, b, key)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotExist) {
 			return &Index{}, nil
@@ -289,12 +293,54 @@ func Load(ctx context.Context, b backend.Backend, key string) (*Index, error) {
 	return ix, nil
 }
 
-// Save writes the index under key in b (overwriting the previous version atomically per the
-// backend's per-object write atomicity).
-func (ix *Index) Save(ctx context.Context, b backend.Backend, key string) error {
-	if err := b.Write(ctx, key, ix.AppendBinary(nil)); err != nil {
-		return errors.Wrapf(err, "write index %q", key)
+// LoadVersioned reads the index and the backend version it was read at — the token
+// [Index.Save] commits against. A missing object yields an empty index at
+// [backend.VersionAbsent], which is the version a first commit expects.
+func LoadVersioned(ctx context.Context, b backend.Backend, key string) (*Index, backend.Version, error) {
+	data, version, err := b.ReadVersioned(ctx, key)
+	if err != nil {
+		return nil, backend.VersionAbsent, errors.Wrapf(err, "read index %q", key)
 	}
 
-	return nil
+	if version == backend.VersionAbsent {
+		return &Index{}, backend.VersionAbsent, nil
+	}
+
+	ix, err := Decode(data)
+	if err != nil {
+		return nil, backend.VersionAbsent, errors.Wrapf(err, "decode index %q", key)
+	}
+
+	return ix, version, nil
+}
+
+// ErrConflict is returned (wrapped) by [Index.Save] when the stored index is no longer the one
+// the committer read: another writer committed in between, and this commit did not land.
+//
+// It is an error *here*, unlike at the backend seam where a lost race is a plain false, because
+// the caller of a commit has a part in the store that nothing yet references. Anything short of
+// an error would let a flush report success while its entry was dropped — the failure #392 is
+// about. The caller reloads and retries; only exhausting its retries is a real failure.
+var ErrConflict = errors.New("bucketindex: index changed since it was loaded")
+
+// Save commits the index under key, replacing the version the caller loaded and nothing else.
+// It returns the version the committed index now has, which the committer holds for its next
+// commit without re-reading the object. Pass [backend.VersionAbsent] as expected to commit an
+// index into a prefix that has none yet.
+//
+// A commit that loses the race wraps [ErrConflict] and has written nothing: reload with
+// [LoadVersioned], rebuild on top of what is there, and try again.
+func (ix *Index) Save(
+	ctx context.Context, b backend.Backend, key string, expected backend.Version,
+) (backend.Version, error) {
+	version, ok, err := b.CompareAndSwap(ctx, key, expected, ix.AppendBinary(nil))
+	if err != nil {
+		return backend.VersionAbsent, errors.Wrapf(err, "commit index %q", key)
+	}
+
+	if !ok {
+		return backend.VersionAbsent, errors.Wrapf(ErrConflict, "commit index %q", key)
+	}
+
+	return version, nil
 }

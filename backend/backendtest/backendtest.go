@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -241,8 +242,192 @@ func Run(t *testing.T, factory func(t *testing.T) backend.Backend) {
 		assert.Equal(t, int64(1), wins.Load(), "exactly one writer claims the key")
 	})
 
+	runCompareAndSwap(t, ctx, factory)
 	runObjectWriter(t, ctx, factory)
 	runReadAt(t, ctx, factory)
+}
+
+// runCompareAndSwap covers the conditional-replace seam ([backend.Backend.CompareAndSwap] and
+// [backend.Backend.ReadVersioned]), the primitive the bucket-index commit builds on. It is the
+// one operation whose whole value is what it does under contention, so the suite states that
+// directly: writers that all hold one version resolve to a single winner, and writers that
+// reload after losing all land, none of them overwriting another.
+func runCompareAndSwap(t *testing.T, ctx context.Context, factory func(t *testing.T) backend.Backend) {
+	t.Helper()
+
+	t.Run("ReadVersionedAbsent", func(t *testing.T) {
+		b := factory(t)
+
+		data, v, err := b.ReadVersioned(ctx, "cas/absent")
+		require.NoError(t, err, "absence is a version, not a failure")
+		assert.Empty(t, data)
+		assert.Equal(t, backend.VersionAbsent, v)
+	})
+
+	t.Run("CompareAndSwapCreates", func(t *testing.T) {
+		b := factory(t)
+
+		v, ok, err := b.CompareAndSwap(ctx, "cas/new", backend.VersionAbsent, []byte("first"))
+		require.NoError(t, err)
+		require.True(t, ok, "an absent key accepts a commit expecting absence")
+		assert.NotEqual(t, backend.VersionAbsent, v, "a stored object has a version")
+
+		got, err := b.Read(ctx, "cas/new")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("first"), got)
+
+		_, ok, err = b.CompareAndSwap(ctx, "cas/new", backend.VersionAbsent, []byte("second"))
+		require.NoError(t, err, "losing to an existing object is not an error")
+		assert.False(t, ok)
+
+		got, err = b.Read(ctx, "cas/new")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("first"), got, "a refused commit changes nothing")
+	})
+
+	t.Run("CompareAndSwapReplaces", func(t *testing.T) {
+		b := factory(t)
+		require.NoError(t, b.Write(ctx, "cas/k", []byte("one")))
+
+		data, v, err := b.ReadVersioned(ctx, "cas/k")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("one"), data)
+
+		next, ok, err := b.CompareAndSwap(ctx, "cas/k", v, []byte("two"))
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		got, err := b.Read(ctx, "cas/k")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("two"), got)
+
+		// The version handed back must be usable directly, or every committer pays a read per commit.
+		_, ok, err = b.CompareAndSwap(ctx, "cas/k", next, []byte("three"))
+		require.NoError(t, err)
+		assert.True(t, ok, "the version returned by a commit is the one the next commit expects")
+	})
+
+	t.Run("CompareAndSwapRejectsStaleVersion", func(t *testing.T) {
+		b := factory(t)
+		require.NoError(t, b.Write(ctx, "cas/k", []byte("one")))
+
+		_, stale, err := b.ReadVersioned(ctx, "cas/k")
+		require.NoError(t, err)
+
+		require.NoError(t, b.Write(ctx, "cas/k", []byte("two")))
+
+		_, ok, err := b.CompareAndSwap(ctx, "cas/k", stale, []byte("three"))
+		require.NoError(t, err)
+		assert.False(t, ok, "a version superseded by another write no longer commits")
+
+		got, err := b.Read(ctx, "cas/k")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("two"), got)
+	})
+
+	t.Run("CompareAndSwapOnDeletedKey", func(t *testing.T) {
+		b := factory(t)
+		require.NoError(t, b.Write(ctx, "cas/gone", []byte("one")))
+
+		_, v, err := b.ReadVersioned(ctx, "cas/gone")
+		require.NoError(t, err)
+		require.NoError(t, b.Delete(ctx, "cas/gone"))
+
+		_, ok, err := b.CompareAndSwap(ctx, "cas/gone", v, []byte("two"))
+		require.NoError(t, err, "a key deleted underneath a committer is a lost race, not a failure")
+		assert.False(t, ok)
+
+		_, err = b.Read(ctx, "cas/gone")
+		assert.ErrorIs(t, err, backend.ErrNotExist, "a refused commit must not resurrect the key")
+	})
+
+	t.Run("CompareAndSwapEmptyValue", func(t *testing.T) {
+		b := factory(t)
+
+		v, ok, err := b.CompareAndSwap(ctx, "cas/empty", backend.VersionAbsent, []byte{})
+		require.NoError(t, err)
+		require.True(t, ok)
+		assert.NotEqual(t, backend.VersionAbsent, v, "a stored empty object is present, not absent")
+
+		_, read, err := b.ReadVersioned(ctx, "cas/empty")
+		require.NoError(t, err)
+		assert.Equal(t, v, read)
+	})
+
+	t.Run("CompareAndSwapConcurrentSingleWinner", func(t *testing.T) {
+		b := factory(t)
+		require.NoError(t, b.Write(ctx, "cas/race", []byte("base")))
+
+		_, base, err := b.ReadVersioned(ctx, "cas/race")
+		require.NoError(t, err)
+
+		const n = 32
+
+		var (
+			wg   sync.WaitGroup
+			wins atomic.Int64
+		)
+
+		wg.Add(n)
+		for i := range n {
+			go func(i int) {
+				defer wg.Done()
+
+				_, ok, err := b.CompareAndSwap(ctx, "cas/race", base, fmt.Appendf(nil, "w-%d", i))
+				assert.NoError(t, err)
+				if ok {
+					wins.Add(1)
+				}
+			}(i)
+		}
+
+		wg.Wait()
+		assert.Equal(t, int64(1), wins.Load(), "exactly one writer commits over a given version")
+	})
+
+	// The loop every real committer runs: lose, reload, rebuild, retry. No update may be lost —
+	// that is the whole reason the primitive exists.
+	t.Run("CompareAndSwapConcurrentNoLostUpdate", func(t *testing.T) {
+		b := factory(t)
+
+		const (
+			n           = 16
+			maxAttempts = 1000
+		)
+
+		var wg sync.WaitGroup
+
+		wg.Add(n)
+		for range n {
+			go func() {
+				defer wg.Done()
+
+				for range maxAttempts {
+					data, v, err := b.ReadVersioned(ctx, "cas/append")
+					if !assert.NoError(t, err) {
+						return
+					}
+
+					_, ok, err := b.CompareAndSwap(ctx, "cas/append", v, append(slices.Clone(data), 'x'))
+					if !assert.NoError(t, err) {
+						return
+					}
+
+					if ok {
+						return
+					}
+				}
+
+				assert.Fail(t, "a committer never landed within its retry budget")
+			}()
+		}
+
+		wg.Wait()
+
+		got, err := b.Read(ctx, "cas/append")
+		require.NoError(t, err)
+		assert.Len(t, got, n, "every committer's update survives")
+	})
 }
 
 // runReadAt covers the ranged-read seam ([backend.ReadAt]). Like the writer suite it runs over every
@@ -490,7 +675,7 @@ func runObjectWriter(t *testing.T, ctx context.Context, factory func(t *testing.
 }
 
 // AtomicConditionalPut wraps an S3-compatible test server's handler, serializing every request
-// that carries an If-None-Match precondition. Real S3 evaluates a conditional PUT atomically;
+// that carries an If-None-Match or If-Match precondition. Real S3 evaluates a conditional PUT atomically;
 // the embeddable go-faster/fs server (as of v0.3.0) checks the precondition and performs the
 // write as two separate steps, so two concurrent "If-None-Match: *" PUTs can both observe the
 // key absent and both succeed — a TOCTOU race the conformance suite's single-winner CAS test
@@ -500,7 +685,8 @@ func AtomicConditionalPut(h http.Handler) http.Handler {
 	var mu sync.Mutex
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut && r.Header.Get("If-None-Match") != "" {
+		if r.Method == http.MethodPut &&
+			(r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Match") != "") {
 			mu.Lock()
 			defer mu.Unlock()
 		}

@@ -29,6 +29,18 @@ func (r *rejectIndexWrites) Write(ctx context.Context, key string, data []byte) 
 	return r.Backend.Write(ctx, key, data)
 }
 
+// CompareAndSwap is the path the index commit actually takes; failing only Write would leave the
+// commit untouched.
+func (r *rejectIndexWrites) CompareAndSwap(
+	ctx context.Context, key string, expected backend.Version, data []byte,
+) (backend.Version, bool, error) {
+	if r.armed.Load() && strings.HasSuffix(key, "/"+bucketindex.Object) {
+		return backend.VersionAbsent, false, errors.New("injected write failure")
+	}
+
+	return r.Backend.CompareAndSwap(ctx, key, expected, data)
+}
+
 // TestMergeIndexCommitFailureKeepsSources verifies a merge whose index commit fails does not retire
 // its source parts: the persisted index still names them, so reclaim must not delete their objects —
 // otherwise a restart's LoadParts hard-fails on a part the index says exists.

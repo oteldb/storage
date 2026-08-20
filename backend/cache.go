@@ -226,6 +226,47 @@ func (c *cachedBackend) PutIfAbsent(ctx context.Context, key string, data []byte
 	return ok, nil
 }
 
+// CompareAndSwap forwards the conditional replace and refreshes the entry on a win, so a reader
+// through this cache sees the value the commit just published. Implements [Backend].
+func (c *cachedBackend) CompareAndSwap(
+	ctx context.Context, key string, expected Version, data []byte,
+) (Version, bool, error) {
+	v, ok, err := c.inner.CompareAndSwap(ctx, key, expected, data)
+	if err != nil {
+		return VersionAbsent, false, err
+	}
+
+	// Dropped, never stored: see [cachedBackend.ReadVersioned]. Invalidating on a *lost* swap too
+	// is deliberate — losing proves the object moved under this process, so whatever is resident
+	// is stale by definition.
+	c.values.Invalidate(key)
+
+	return v, ok, nil
+}
+
+// ReadVersioned bypasses the cache entirely. The version it hands back is the one a commit will
+// condition on, and a cached copy only proves what *this* process last saw — the objects
+// committed this way (bucket index, manifests) are exactly the mutable ones another writer over
+// the same store rewrites. Serving a resident copy here would hand back a version already
+// superseded, and the commit built on it would fail forever rather than converge.
+//
+// It drops the entry rather than refreshing it, and [cachedBackend.CompareAndSwap] does the same,
+// so **a versioned key is never resident**. Refreshing looks like a free cache fill but is not
+// safe: this read and a rival's winning swap race to store, and a read that observed the older
+// value can land last, leaving the cache serving a superseded object to every plain
+// [Backend.Read]. There is no ordering between them to exploit — the value is mutable, which is
+// the whole reason it is committed conditionally. Implements [Backend].
+func (c *cachedBackend) ReadVersioned(ctx context.Context, key string) ([]byte, Version, error) {
+	data, v, err := c.inner.ReadVersioned(ctx, key)
+	if err != nil {
+		return nil, VersionAbsent, err
+	}
+
+	c.values.Invalidate(key)
+
+	return data, v, nil
+}
+
 func (c *cachedBackend) Delete(ctx context.Context, key string) error {
 	err := c.inner.Delete(ctx, key)
 	c.values.Invalidate(key) // drop the entry whether or not the object existed

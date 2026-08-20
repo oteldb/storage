@@ -22,6 +22,8 @@ const (
 	Read Kind = iota
 	Write
 	PutIfAbsent
+	CompareAndSwap
+	ReadVersioned
 	List
 	Delete
 )
@@ -35,6 +37,10 @@ func (k Kind) String() string {
 		return "write"
 	case PutIfAbsent:
 		return "put-if-absent"
+	case CompareAndSwap:
+		return "compare-and-swap"
+	case ReadVersioned:
+		return "read-versioned"
 	case List:
 		return "list"
 	case Delete:
@@ -158,6 +164,28 @@ func (b *Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (boo
 	}
 
 	return b.Backend.PutIfAbsent(ctx, key, data)
+}
+
+// CompareAndSwap implements [backend.Backend]. Gating it is how a test states the interleaving
+// the commit protocol turns on: one writer suspended inside its conditional write while another
+// commits over it.
+func (b *Backend) CompareAndSwap(
+	ctx context.Context, key string, expected backend.Version, data []byte,
+) (backend.Version, bool, error) {
+	if r := b.intercept(Op{Kind: CompareAndSwap, Key: key}); r != nil && r.Err != nil {
+		return backend.VersionAbsent, false, r.Err
+	}
+
+	return b.Backend.CompareAndSwap(ctx, key, expected, data)
+}
+
+// ReadVersioned implements [backend.Backend].
+func (b *Backend) ReadVersioned(ctx context.Context, key string) ([]byte, backend.Version, error) {
+	if r := b.intercept(Op{Kind: ReadVersioned, Key: key}); r != nil && r.Err != nil {
+		return nil, backend.VersionAbsent, r.Err
+	}
+
+	return b.Backend.ReadVersioned(ctx, key)
 }
 
 // List implements [backend.Backend].

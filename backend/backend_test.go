@@ -48,6 +48,16 @@ func (b withoutCapabilities) PutIfAbsent(ctx context.Context, key string, data [
 	return b.inner.PutIfAbsent(ctx, key, data)
 }
 
+func (b withoutCapabilities) CompareAndSwap(
+	ctx context.Context, key string, expected backend.Version, data []byte,
+) (backend.Version, bool, error) {
+	return b.inner.CompareAndSwap(ctx, key, expected, data)
+}
+
+func (b withoutCapabilities) ReadVersioned(ctx context.Context, key string) ([]byte, backend.Version, error) {
+	return b.inner.ReadVersioned(ctx, key)
+}
+
 func (b withoutCapabilities) Write(ctx context.Context, key string, data []byte) error {
 	return b.inner.Write(ctx, key, data)
 }

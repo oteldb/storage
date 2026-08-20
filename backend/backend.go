@@ -24,10 +24,12 @@ import (
 // referenced column objects), and [ReaderAt] gives the pushdown *within* a column that keeps a
 // query touching a few granules from paying for the whole thing.
 //
-// [Backend.PutIfAbsent] is the conditional-write primitive (added in M5) on which atomic
-// manifest / block-list commits build: a versioned manifest key is written only if no
-// writer has claimed that version, so single-writer-wins coordination needs no Raft (it
-// maps to S3 If-None-Match, a filesystem exclusive create, and a guarded map insert).
+// [Backend.PutIfAbsent] and [Backend.CompareAndSwap] are the conditional-write primitives on
+// which atomic manifest / block-list / bucket-index commits build, so multi-writer
+// coordination over one prefix needs no Raft. PutIfAbsent claims an *absent* key
+// (S3 If-None-Match, a filesystem exclusive create, a guarded map insert); CompareAndSwap
+// replaces an *existing* one only if it still holds the version the committer read
+// (S3 If-Match, a digest checked under the store's own lock).
 type Backend interface {
 	// IsEphemeral reports whether the backend stores data only in RAM (dropped on
 	// process exit). [Memory] is ephemeral; file and s3 are not.
@@ -38,6 +40,27 @@ type Backend interface {
 	// change). Like [Backend.Write] it is atomic per object. It is the compare-and-swap
 	// primitive for manifest commits.
 	PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error)
+
+	// CompareAndSwap stores data under key only if the key's current version is expected,
+	// atomically. Pass [VersionAbsent] to demand that the key not exist yet, so a first commit
+	// and every later one are the same call. It returns the version the stored data now has,
+	// which the committer holds for its next commit without re-reading the object.
+	//
+	// A lost race is (false, nil), not an error: nothing failed and nothing is broken, the
+	// caller simply holds a stale version and must reload and retry. Reporting it as an error
+	// would put it on the path every caller already funnels into "the backend is unhealthy",
+	// which is how a contended commit becomes an outage. A returned error means the operation
+	// could not be evaluated at all, and says nothing about whether the write landed.
+	//
+	// Both failing cases are conditional, never destructive: an absent key with a version
+	// expected, and a present key with [VersionAbsent] expected, both report (false, nil).
+	CompareAndSwap(ctx context.Context, key string, expected Version, data []byte) (Version, bool, error)
+
+	// ReadVersioned returns the value stored under key together with the [Version] identifying
+	// it — the token a later [Backend.CompareAndSwap] conditions on. An absent key is
+	// ([]byte(nil), [VersionAbsent], nil): absence is a version, and the value a first
+	// committer conditions on. Errors are reserved for a backend that could not answer.
+	ReadVersioned(ctx context.Context, key string) ([]byte, Version, error)
 
 	// Write stores data under key, overwriting any existing value. The write is
 	// atomic per object: a reader never observes a partially written value. The
@@ -166,6 +189,47 @@ func (m *memoryBackend) PutIfAbsent(_ context.Context, key string, data []byte) 
 	m.objects[key] = cp
 
 	return true, nil
+}
+
+// CompareAndSwap replaces the value under key while holding the same lock the version was read
+// under, so no writer can slip in between the comparison and the store. The version is a digest
+// of the stored bytes rather than a counter: it needs no second map, and it survives the map
+// entry being replaced by an identical value.
+func (m *memoryBackend) CompareAndSwap(
+	_ context.Context, key string, expected Version, data []byte,
+) (Version, bool, error) {
+	cp := slices.Clone(data)
+	if cp == nil {
+		cp = []byte{}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	current := VersionAbsent
+	if cur, ok := m.objects[key]; ok {
+		current = ContentVersion(cur)
+	}
+
+	if current != expected {
+		return VersionAbsent, false, nil
+	}
+
+	m.objects[key] = cp
+
+	return ContentVersion(cp), true, nil
+}
+
+func (m *memoryBackend) ReadVersioned(_ context.Context, key string) ([]byte, Version, error) {
+	m.mu.RLock()
+	v, ok := m.objects[key]
+	m.mu.RUnlock()
+
+	if !ok {
+		return nil, VersionAbsent, nil
+	}
+
+	return slices.Clone(v), ContentVersion(v), nil
 }
 
 func (m *memoryBackend) Read(_ context.Context, key string) ([]byte, error) {

@@ -92,6 +92,38 @@ func (s *retryStore) PutObjectIfAbsent(ctx context.Context, key string, data []b
 	})
 }
 
+func (s *retryStore) PutObjectIfVersion(
+	ctx context.Context, key string, data []byte, etag string,
+) (string, bool, error) {
+	type result struct {
+		etag string
+		ok   bool
+	}
+
+	r, err := retry.Do(ctx, s.cas, func(ctx context.Context) (result, error) {
+		e, ok, err := s.inner.PutObjectIfVersion(ctx, key, data, etag)
+
+		return result{etag: e, ok: ok}, err
+	})
+
+	return r.etag, r.ok, err
+}
+
+func (s *retryStore) GetObjectVersion(ctx context.Context, key string) ([]byte, string, error) {
+	type result struct {
+		data []byte
+		etag string
+	}
+
+	r, err := retry.Do(ctx, s.read, func(ctx context.Context) (result, error) {
+		data, etag, err := s.inner.GetObjectVersion(ctx, key)
+
+		return result{data: data, etag: etag}, err
+	})
+
+	return r.data, r.etag, err
+}
+
 func (s *retryStore) DeleteObject(ctx context.Context, key string) error {
 	_, err := retry.Do(ctx, s.write, func(ctx context.Context) (struct{}, error) {
 		return struct{}{}, s.inner.DeleteObject(ctx, key)
