@@ -269,7 +269,7 @@ func TestECSchemeForGating(t *testing.T) {
 	endpoint := startEtcd(t)
 
 	// EC policy but shared backend (PrivateBackend false) ⇒ EC does not apply.
-	shared := openClusterNodeWith(t, endpoint, "node-a", backend.Memory(),
+	shared := openClusterNodeShared(t, endpoint, "node-a",
 		WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
 			return tenant.Policy{Durability: tenant.Durability{EC: &tenant.ECScheme{Data: 2, Parity: 1}}}
 		})))

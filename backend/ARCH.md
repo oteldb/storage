@@ -134,8 +134,9 @@ a demonstration.
   that lacks it: `Cached` returns a second type that carries `CreateObject` only in that case,
   rather than a method that would always answer yes.
 - **`backend.NodeLocal`** — optional `IsNodeLocal()`, implemented by `Memory` (a process heap) and
-  `file` (a directory tree), not by object stores. It reports the *medium*, and is exact only in the
-  false direction: a `file` root on a network mount is a shared store and still answers true. Its
+  `file` (a directory tree), not by object stores. It reports the *medium*, and a `file` root on a
+  network mount answers true as well — which is correct rather than imprecise, since a shared mount
+  is not a supported shared store (`CompareAndSwap` is process-local there; see `file/cas.go`). Its
   one consumer is the `Open` diagnostic for a cluster node whose backend looks private while
   `cluster.Config.PrivateBackend` is unset — the configuration in which no flushed part ever
   replicates and the gap reads as real absence. Being a heuristic is why that is a warning and not a

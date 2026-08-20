@@ -119,13 +119,37 @@ func openClusterNode(t *testing.T, endpoint, id string) *Storage {
 	return openClusterNodeWith(t, endpoint, id, backend.Memory())
 }
 
-func openClusterNodeWith(t *testing.T, endpoint, id string, be backend.Backend, opts ...Option) *Storage {
+// openClusterNodeShared opens a clustered node over a backend that *declares itself shared* — every
+// node reads it, so flushed parts are exchanged through the store rather than mirrored node to node.
+// It is the counterpart of [openClusterNodePrivate], and the only way to reach the
+// PrivateBackend-false path now that a node-private backend with the flag unset fails Open (#408).
+func openClusterNodeShared(t *testing.T, endpoint, id string, opts ...Option) *Storage {
 	t.Helper()
 
-	all := append([]Option{WithBackend(be), WithCluster(&cluster.Config{
+	all := append([]Option{WithBackend(&sharedStore{backend.Memory()}), WithCluster(&cluster.Config{
 		Etcd: []string{endpoint},
 		Self: etcd.Member{ID: id, Addr: "127.0.0.1:0"},
 		RF:   2,
+	})}, opts...)
+
+	s, err := Open(context.Background(), Options{}, all...)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	return s
+}
+
+func openClusterNodeWith(t *testing.T, endpoint, id string, be backend.Backend, opts ...Option) *Storage {
+	t.Helper()
+
+	// Each node gets its own backend, so the cluster is shared-nothing and must say so: Open
+	// refuses a node-private backend with PrivateBackend unset (#408), and flushed parts replicate
+	// over the partsync endpoints rather than through a store every node can read.
+	all := append([]Option{WithBackend(be), WithCluster(&cluster.Config{
+		Etcd:           []string{endpoint},
+		Self:           etcd.Member{ID: id, Addr: "127.0.0.1:0"},
+		RF:             2,
+		PrivateBackend: true,
 	})}, opts...)
 
 	// A clustered node on a durable backend must be able to recover its unflushed head, so Open
@@ -150,6 +174,7 @@ func openClusterNodeSharded(t *testing.T, endpoint, id string, shards int) *Stor
 		Self:            etcd.Member{ID: id, Addr: "127.0.0.1:0"},
 		RF:              2,
 		ShardsPerTenant: shards,
+		PrivateBackend:  true,
 	}))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close(context.Background()) })
@@ -417,9 +442,12 @@ func TestClusterOnlyPrimaryCompacts(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, 1, pe.PartCount(), "the primary flushed the tenant's part")
 
-	re, ok := replica.lookupEngine("default")
-	require.True(t, ok)
-	assert.Equal(t, 0, re.PartCount(), "the replica did not compact (it holds no claim)")
+	// The replica's part count no longer answers this: over a private backend its maintenance tick
+	// mirrors the primary's flushed part into its own store. What the claim gates is who *compacts*,
+	// so ask ownership directly.
+	cs := replica.Inspect().Cluster
+	require.NotNil(t, cs)
+	assert.NotContains(t, cs.Owned, "default", "the replica holds no claim, so it compacts nothing")
 }
 
 // TestClusterReplicaTrimsHeadAfterOwnerFlush closes the replica-memory parity gap: over a
@@ -819,7 +847,7 @@ func TestInspectClusterSection(t *testing.T) {
 	endpoint := startEtcd(t)
 	ctx := context.Background()
 
-	s := openClusterNodeWith(t, endpoint, "node-a", backend.Memory())
+	s := openClusterNodeShared(t, endpoint, "node-a")
 
 	require.Eventually(t, func() bool {
 		return ringSize(s) == 1

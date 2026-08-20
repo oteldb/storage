@@ -110,12 +110,6 @@ type ClusterStats struct {
 	// flushed parts to and from its peers (see PartSync); unset, parts are exchanged through a
 	// backend every node can read.
 	PrivateBackend bool
-	// NodeLocalBackendUnshared is the standing form of the diagnostic [Open] logs once: the backend
-	// looks node-private (see [backend.NodeLocal]) while PrivateBackend is unset, so nothing
-	// replicates flushed parts and a node that gained a shard — or restarted as a replica — serves
-	// reads missing whatever only its peers hold. A shared mount answers true here as well, so read
-	// it as "confirm the backend really is shared", not as a fault.
-	NodeLocalBackendUnshared bool
 	// SelfAbsent reports that this node is missing from the cluster member set while still
 	// running: its etcd lease was lost (or its member key deleted) and re-registration has not
 	// yet succeeded. While it holds, no peer routes anything here and this node owns no shards
@@ -273,12 +267,11 @@ func (s *Storage) clusterStats() *ClusterStats {
 	}
 
 	cs := &ClusterStats{
-		Self:                     s.cluster.self,
-		Owned:                    s.cluster.ownership.Owned(),
-		PrivateBackend:           s.cluster.private,
-		NodeLocalBackendUnshared: s.opts.nodeLocalBackendUnshared(),
-		SelfAbsent:               s.cluster.membership.SelfAbsent(),
-		Rejoins:                  s.cluster.membership.Rejoins(),
+		Self:           s.cluster.self,
+		Owned:          s.cluster.ownership.Owned(),
+		PrivateBackend: s.cluster.private,
+		SelfAbsent:     s.cluster.membership.SelfAbsent(),
+		Rejoins:        s.cluster.membership.Rejoins(),
 	}
 
 	for _, m := range s.cluster.membership.Members() {
