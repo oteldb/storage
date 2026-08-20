@@ -391,7 +391,11 @@ func FuzzBlockedDecodeNoPanic(f *testing.F) {
 	f.Add([]byte{2, 4, 1, 1, 0xff})
 
 	f.Fuzz(func(_ *testing.T, object []byte) {
-		desc := ColumnDesc{Name: "c", Kind: KindInt64, Codec: chunk.CodecDoD, Blocked: true, Framed: true}
+		desc := ColumnDesc{
+			Name: "c", Kind: KindInt64, Codec: chunk.CodecDoD, Blocked: true, Framed: true, Checked: true,
+		}
+		unchecked := desc
+		unchecked.Checked = false
 		legacy := ColumnDesc{Name: "c", Kind: KindInt64, Codec: chunk.CodecDoD, Blocked: true}
 		// Must not panic regardless of the (arbitrary) declared row count. Exercise every decode
 		// path that parses the directory: whole-column, range, block-set, and the streaming cursor.
@@ -403,7 +407,9 @@ func FuzzBlockedDecodeNoPanic(f *testing.F) {
 		_, _ = newColumnReader(legacy, object, noneComp(), 32).RangeInt64(nil, 0, 8)
 		_, _ = newColumnReader(legacy, object, noneComp(), 32).DecodeBlocksInt64(nil, []int{0, 1, 5})
 
-		for _, d := range []ColumnDesc{desc, legacy} {
+		_, _ = newColumnReader(unchecked, object, noneComp(), 32).Int64(nil)
+
+		for _, d := range []ColumnDesc{desc, unchecked, legacy} {
 			cur, err := newColumnReader(d, object, noneComp(), 32).TsCursor()
 			if err != nil {
 				continue
@@ -416,8 +422,8 @@ func FuzzBlockedDecodeNoPanic(f *testing.F) {
 			}
 		}
 
-		for _, framed := range []bool{false, true} {
-			if dir, err := parseBlockDir(object, framed, false); err == nil {
+		for _, d := range []ColumnDesc{desc, unchecked, legacy} {
+			if dir, err := parseBlockDir(object, d); err == nil {
 				_ = dir.nBlocks()
 			}
 		}

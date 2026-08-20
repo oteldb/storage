@@ -3,6 +3,7 @@ package block
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 
 	"github.com/go-faster/errors"
 
@@ -26,8 +27,12 @@ import (
 //
 // Object layout, ahead of the ordinary block-framed container:
 //
-//	[uvarint entryCount][uvarint compressedDictLen][compressed dictionary]
+//	[uvarint entryCount][uvarint compressedDictLen][compressed dictionary][u32le CRC32C]
 //	[ block-framed container of granule streams ]
+//
+// The checksum covers the compressed dictionary and is present only when the manifest says the
+// column is checked ([ColumnDesc.Checked]); the granule streams are covered by the per-frame
+// checksums in the block-framed container's directory.
 //
 // The dictionary blob is [uvarint len][bytes] per entry. Each granule stream is prefixed with a mode
 // byte: [modeShared] then idWidth-byte big-endian ids, or [modeSelf] then an ordinary chunk bytes
@@ -281,6 +286,7 @@ func encodeSharedDictBytes(
 	obj = binary.AppendUvarint(nil, uint64(len(entries)))
 	obj = binary.AppendUvarint(obj, uint64(len(packed)))
 	obj = append(obj, packed...)
+	obj = binary.LittleEndian.AppendUint32(obj, crc32.Checksum(packed, castagnoli))
 
 	return append(obj, body...), true, nil
 }
@@ -296,7 +302,9 @@ var maxSharedEntries = 1 << 16
 
 // parseSharedDict peels the dictionary header off a shared-dictionary column object, returning the
 // decoded entries and the ordinary block-framed container that follows.
-func parseSharedDict(object []byte, comp *compress.Compressor) (entries [][]byte, rest []byte, err error) {
+func parseSharedDict(
+	object []byte, comp *compress.Compressor, checked bool,
+) (entries [][]byte, rest []byte, err error) {
 	count, n := binary.Uvarint(object)
 	if n <= 0 {
 		return nil, nil, errors.Wrap(ErrCorrupt, "shared dict: bad entry count")
@@ -315,7 +323,24 @@ func parseSharedDict(object []byte, comp *compress.Compressor) (entries [][]byte
 		return nil, nil, errors.Wrapf(ErrCorrupt, "shared dict: length %d past object %d", packedLen, len(object))
 	}
 
-	dict, err := comp.Decompress(nil, object[:packedLen])
+	packed := object[:packedLen]
+	rest = object[packedLen:]
+
+	if checked {
+		if len(rest) < objectCRCBytes {
+			return nil, nil, errors.Wrap(ErrCorrupt, "shared dict: truncated before its checksum")
+		}
+
+		want := binary.LittleEndian.Uint32(rest)
+		if got := crc32.Checksum(packed, castagnoli); got != want {
+			return nil, nil, errors.Wrapf(ErrCorrupt,
+				"shared dict: checksum %08x, want %08x", got, want)
+		}
+
+		rest = rest[objectCRCBytes:]
+	}
+
+	dict, err := comp.Decompress(nil, packed)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "decompress shared dictionary")
 	}
@@ -342,7 +367,7 @@ func parseSharedDict(object []byte, comp *compress.Compressor) (entries [][]byte
 		dict = dict[l:]
 	}
 
-	return entries, object[packedLen:], nil
+	return entries, rest, nil
 }
 
 // sharedIDWidth is the bytes per row a granule spends on ids into a dictionary of the given size.

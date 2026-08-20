@@ -9,22 +9,20 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/faultbackend"
+	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 )
 
-// TestCorruptColumnIsNotSilentlyEmpty is the reproducer for #389: a part's column objects carry no
-// at-rest checksum (the manifest and marks do), so a column that comes back from the store altered
-// is decoded as if it were sound.
+// TestCorruptColumnIsNotSilentlyEmpty covers the reason column objects carry checksums: a column
+// that comes back from the store altered must not decode as if it were sound.
 //
 // The store is made to return one flipped byte in the value column — a bit rot, a truncated write
-// that reported success, a misdirected read. The read path reports no error and yields no rows: two
-// hundred samples become an empty result, and the caller is told nothing. A hole a query cannot
-// distinguish from "there was no data" is worse than a failed query, which is why the assertion
-// here is that the read must *fail*, not that it must succeed.
+// that reported success, a misdirected read. Before the checksums the read path reported no error
+// and yielded no rows: two hundred samples became an empty result and the caller was told nothing,
+// a hole no query can distinguish from "there was no data". So the assertion is that the read must
+// *fail*, and fail as [block.ErrCorrupt].
 func TestCorruptColumnIsNotSilentlyEmpty(t *testing.T) {
-	reproduce.Unfixed(t, 389, "column objects are unchecksummed, so corruption reads as absence")
 	t.Parallel()
 
 	ctx := context.Background()
@@ -65,14 +63,12 @@ func TestCorruptColumnIsNotSilentlyEmpty(t *testing.T) {
 
 	it, err := r.Fetch(ctx, req)
 	if err != nil {
-		return // Detected at plan time, which is all this asks for.
+		require.ErrorIs(t, err, block.ErrCorrupt) // Detected at plan time.
+
+		return
 	}
 
-	got, err := fetch.Drain(ctx, it)
-	if err != nil {
-		return // Detected during decode.
-	}
-
-	require.Len(t, got, 1, "a corrupt column must be reported, not read as an absence of rows")
-	require.Len(t, got[0].Values, 200)
+	_, err = fetch.Drain(ctx, it)
+	require.Error(t, err, "a corrupt column must be reported, not read as an absence of rows")
+	require.ErrorIs(t, err, block.ErrCorrupt)
 }

@@ -27,7 +27,7 @@ func bytesColumn(t *testing.T, vals [][]byte, codec chunk.Codec, granule int) *C
 	c := Column{Name: "c", Kind: KindBytes, Codec: codec, Bytes: vals, Block: true}
 	desc := ColumnDesc{
 		Name: "c", Kind: KindBytes, Codec: codec,
-		Compress: noneComp().Algorithm(), Blocked: true, Framed: true,
+		Compress: noneComp().Algorithm(), Blocked: true, Framed: true, Checked: true,
 	}
 
 	obj, ok, err := trySharedDict(c, codec, noneComp(), granule, defaultCompressBlockBytes)

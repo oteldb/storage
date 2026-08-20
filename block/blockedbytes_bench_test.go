@@ -59,6 +59,7 @@ func benchColumn(b *testing.B, vals [][]byte, blocked bool, granule int) *Column
 	desc := ColumnDesc{
 		Name: "c", Kind: KindBytes, Codec: chunk.CodecDict,
 		Compress: zstdComp().Algorithm(), Level: zstdComp().Level(), Blocked: true, Framed: true,
+		Checked: true,
 	}
 
 	obj, ok, err := trySharedDict(c, chunk.CodecDict, zstdComp(), granule, defaultCompressBlockBytes)
