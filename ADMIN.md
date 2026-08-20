@@ -93,8 +93,11 @@ engines still bucket by tier and wait for `MinTierParts` of them.
 
 ### Drill-down per `(tenant, signal)` (`introspect.go`)
 
-- **`Parts(tenant, signal) []PartInfo`** — one entry per flushed part: `ID` (key prefix), time
-  bounds, `Series`, `Rows`. In-memory, no backend I/O — safe to poll. (Each engine's own `PartStat`
+- **`Parts(tenant, signal) []PartInfo`** — one entry per flushed part the engine can **serve**: its
+  own, plus the ones it adopted from a rival writer's index over a shared store (`engine/ARCH.md`,
+  "Adopted parts"). `ID` (key prefix), time bounds, `Series`, `Rows`. In-memory, no backend I/O —
+  safe to poll. The engines' `StoreStats.Parts` counter is the narrower quantity — parts this writer
+  owns, the ones its merge can act on — so the two differ by the adopted set on a shared store. (Each engine's own `PartStat`
   additionally carries `SizeBytes`, the figure that engine's merge cap compares against, and so the
   one that explains why a part is or is not sealed. It is deliberately **not** on the cross-signal
   `PartInfo`: the two are different quantities under one name — `engine.PartStat.SizeBytes` is the
