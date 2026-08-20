@@ -136,6 +136,11 @@ type Membership struct {
 	selfAbsent atomic.Bool
 	rejoins    atomic.Int64
 
+	// lastKeepAlive is when etcd last confirmed the lease (unix nanos), the basis of the
+	// fence deadline. Written by the maintainer, read by any caller. See fence.go.
+	lastKeepAlive atomic.Int64
+	clock         atomic.Pointer[func() time.Time] // fence clock; unset ⇒ time.Now
+
 	onRejoin atomic.Pointer[func(clientv3.LeaseID)]
 
 	current atomic.Pointer[ring.Ring]
@@ -300,6 +305,8 @@ func (m *Membership) register(ctx context.Context) (clientv3.LeaseID, error) {
 		return clientv3.NoLease, errors.Wrap(err, "register member")
 	}
 
+	m.noteKeepAlive() // etcd just granted the lease: the fence window starts here.
+
 	return lease.ID, nil
 }
 
@@ -361,6 +368,8 @@ func (m *Membership) follow(ctx context.Context) bool {
 			if !ok {
 				return ctx.Err() == nil
 			}
+
+			m.noteKeepAlive() // etcd answered: the lease is good for another TTL.
 		}
 	}
 }

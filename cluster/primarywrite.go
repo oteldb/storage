@@ -14,6 +14,12 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
+// ErrNotPrimary is a node's refusal to apply a write as a shard's primary: it can no longer prove
+// it holds the shard, so another node may already own it and anything applied here would be
+// acknowledged and then withheld. It is the write side of [ErrShardAbsent] — a routing answer, not
+// a server fault — so the origin should re-resolve the shard's primary rather than retry here.
+var ErrNotPrimary = errors.New("cluster: shard no longer held by this node")
+
 // PrimaryWritePath is the endpoint a shard's ring primary serves: the single authority for the
 // shard, so every write for it lands here and the admission decision is made once.
 const PrimaryWritePath = "/internal/primary-write"
@@ -62,7 +68,14 @@ func PrimaryWriteHandler(fn PrimaryWriteFunc) http.Handler {
 
 		rej, err := fn(ctx, sig, shardKey, walBytes)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			// A disclaimed shard is 409, like a read's ErrShardAbsent: the origin must be able
+			// to tell "ask someone else" from "this node is broken".
+			code := http.StatusInternalServerError
+			if errors.Is(err, ErrNotPrimary) {
+				code = absentStatus
+			}
+
+			http.Error(w, err.Error(), code)
 
 			return
 		}
@@ -100,6 +113,10 @@ func SendPrimaryWrite(ctx context.Context, client *http.Client, addr string, pay
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return Reject{}, errors.Wrap(err, "read primary-write response")
+	}
+
+	if resp.StatusCode == absentStatus {
+		return Reject{}, errors.Wrapf(ErrNotPrimary, "primary %q", addr)
 	}
 
 	if resp.StatusCode != http.StatusOK {

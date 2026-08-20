@@ -130,6 +130,12 @@ degrades into a silently partial result.
   iterators) until `Close`, which every caller owes it; `fetch.Drain` closes what it drains.
 - **Coordination is external/minimal.** etcd for membership/claims, backend CAS for commits. No
   homegrown Raft; single-node works with the cluster layer absent.
+- **A write is acked only by a node that can prove it owns the shard.** Compaction claims hang off
+  the membership lease, so a node past `last keep-alive + TTL − margin` disclaims everything it
+  held: it stops acting as any shard's primary (`cluster.ErrNotPrimary`), stops flushing and stops
+  stamping ownership terms, while still serving reads and still applying replicated writes. Gating
+  on the lease deadline rather than on etcd reachability is what keeps a blip free and a partition
+  safe (`cluster/ARCH.md`, *Lease fencing*).
 - **The bucket index commits last, conditionally.** It is what makes a part durably visible — and in
   `recordengine` it also carries the flush watermark (the WAL replay floor) — so its write is the
   commit point in both engines: everything a committed part needs to stay readable must be durable

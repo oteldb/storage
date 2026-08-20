@@ -47,9 +47,9 @@ snapshot doubles as a second eviction check, since a key deleted while nothing w
 produces no `DELETE` for anyone to see. This applies equally to `Watch` observers, whose only
 membership input is that stream.
 
-An absent node **keeps serving**: it still holds its shards, and a secondary's head is memory-only,
-so restarting it would trade a routing problem for lost writes and a read gap on every node at
-once. The state is reported instead — `ClusterStats.SelfAbsent`/`Rejoins`, the
+An absent node **keeps serving reads**: it still holds its shards, and a secondary's head is
+memory-only, so restarting it would trade a routing problem for lost writes and a read gap on every
+node at once. The state is reported instead — `ClusterStats.SelfAbsent`/`Rejoins`, the
 `storage.cluster.self_absent` gauge, and a warning log — while the routing tier's readiness gate
 reports the routing side.
 
@@ -60,6 +60,48 @@ retrying the wanted-unheld acquires each pass is what converges a handoff. It re
 plan (`LastPlan`) for operator preview. In cluster mode the maintenance loop flushes/merges **only
 owned shards**, so a shard's parts are written by exactly one node even during ring-disagreement
 windows — the claim arbitrates.
+
+### Lease fencing — the boundary on acting as primary
+
+A node that stops renewing its lease keeps a ring frozen at its last etcd view, so it goes on
+resolving itself as the primary of shards etcd has already handed elsewhere. Its `held` set is
+local and only cleared on rejoin, so the belief outlives the fact by exactly the window that
+matters. Ordering survives this — a takeover acquires at a higher etcd revision, so a displaced
+writer's indexes never supersede — but an acknowledged write does not: it is replicated to owners
+that are no longer in the real ring, and read by nobody.
+
+So a claim expires **locally, on a deadline the node computes for itself**:
+`Membership.FenceDeadline()` is the last keep-alive etcd answered plus the TTL, less `FenceMargin`
+(clock error plus the delay in noticing; 5s against the 30s `DefaultTTL`, clamped to `ttl/3` so a
+short-TTL cluster is not fenced permanently). Past it `Membership.Fenced()` is true and
+`Ownership` disclaims everything: `Term` reports not-held, `Owned` is empty, `Reconcile` is a
+no-op. The `held` set itself is kept, so a lease confirmed again — the same lease, no rejoin —
+resumes the claims in place.
+
+The gate is deliberately **not "can I reach etcd"**. A node that cannot reach etcd but is still
+inside a live lease is not wrong to serve as primary; a node whose lease has lapsed is wrong
+whether or not etcd is reachable. The cost is stated plainly: an etcd outage longer than the TTL
+does stop ingest cluster-wide, because no node can distinguish "etcd is down for everyone" from
+"I am the one partitioned" — and in the second case someone has already taken over. A blip shorter
+than the TTL costs nothing.
+
+Fencing suppresses the **primary role only**:
+
+- **Writes** — `primaryWrite` refuses with `cluster.ErrNotPrimary` (HTTP 409, like a read's
+  `ErrShardAbsent`, so the origin can tell "ask someone else" from "this node is broken"). The
+  write fails at its origin instead of being acknowledged and then withheld.
+- **Replicated writes** are still applied: they come from a primary that *can* prove its claim,
+  and that primary is the authority.
+- **Reads** stay served — they have their own disclaim path (`canAnswer`), and a stale read is a
+  lesser fault than a lost write.
+- **The unflushed head is kept**, neither dropped nor flushed. Dropping loses writes that were
+  properly replicated when they were acked; flushing writes parts under a tenure that has ended,
+  which the shard's new owner never tombstones. It flushes when the node can prove the shard is
+  its own again — which follows from `Reconcile` being a no-op while fenced, since the maintenance
+  loop only flushes owned shards.
+
+The residual is bounded and named: writes acked between the instant the lease was actually lost and
+the deadline. That is a parameter (`FenceMargin`), not "until someone notices".
 
 ## `replica` — quorum replication
 
@@ -72,7 +114,9 @@ owners→addresses — so routing and quorum logic test against a fake transport
 ## Write path — primary-authoritative
 
 A write is framed with its tenant + signal byte and routed to the shard's **ring-primary**, the
-single authority. The primary applies it via `ApplyPrimary` (the *only* OOO and admission decision
+single authority. The primary first checks it can still prove the shard is its own (see *Lease
+fencing*) and otherwise refuses with `ErrNotPrimary`; a write it cannot place must fail, not
+succeed and vanish. It then applies it via `ApplyPrimary` (the *only* OOO and admission decision
 for the shard), re-frames the **accepted** set, and replicates that verbatim to secondaries
 (`ApplyReplicated`, no re-check — the way WAL replay trusts the log). Every replica therefore
 receives the same accepted set from one authority: replicas converge even under concurrent writers
