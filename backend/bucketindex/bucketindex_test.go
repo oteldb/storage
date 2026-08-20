@@ -80,8 +80,8 @@ func TestGoldenEncoding(t *testing.T) {
 		Generation:   bucketindex.Generation{Term: 4, Counter: 5},
 	}
 	// magic 'B','I', version 3, count 1, len 1, 'a', zigzag(1)=2, zigzag(2)=4, flushedEpoch 3,
-	// generation term 4, generation counter 5.
-	assert.Equal(t, []byte{'B', 'I', 3, 1, 1, 'a', 2, 4, 3, 4, 5}, ix.AppendBinary(nil))
+	// generation term 4, generation counter 5, removal count 0.
+	assert.Equal(t, []byte{'B', 'I', 3, 1, 1, 'a', 2, 4, 3, 4, 5, 0}, ix.AppendBinary(nil))
 }
 
 // TestDecodeV2Compat verifies a v2 index (epoch, no generation) decodes with a zero generation,

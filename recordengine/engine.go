@@ -123,6 +123,12 @@ type Engine struct {
 	// every write. It is deliberately *not* reset by Reset: dropping the data does not entitle the
 	// engine to write an index a replica would refuse as stale.
 	generation bucketindex.Generation
+	// indexed is the part set of the last bucket index this engine wrote, and removals the
+	// tombstones it carried. Together they turn the next write's diff into a statement: a part
+	// that was indexed and is not any more was removed *by this writer*, which is what lets a
+	// replica tell a compaction from a loss.
+	indexed  map[string]struct{}
+	removals []bucketindex.Removal
 
 	// recPool recycles per-stream fetch accumulators (*recordCols) when a caller opts into batch
 	// reuse via fetch.Request.Recycle and releases each batch. The accumulator's columns back the

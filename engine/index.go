@@ -42,9 +42,25 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 	e.generation = e.generation.Next(e.term())
 
 	ix := &bucketindex.Index{FlushedEpoch: e.flushedEpoch, Generation: e.generation}
+
+	live := make(map[string]struct{}, len(e.parts))
 	for _, p := range e.parts {
 		ix.Add(bucketindex.Entry{Prefix: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime})
+		live[p.prefix] = struct{}{}
 	}
+
+	// A part the last index named and this one does not was removed here, and says so. Absence
+	// on its own is not evidence — a part missing from an index is either one a merge consumed
+	// or one the node lost, and a reader cannot tell those apart without being told.
+	for prefix := range e.indexed {
+		if _, ok := live[prefix]; !ok {
+			e.removals = append(e.removals, bucketindex.Removal{Prefix: prefix, Generation: e.generation})
+		}
+	}
+
+	e.removals = bucketindex.TrimRemovals(e.removals, live, bucketindex.MaxRemovals)
+	ix.Removed = e.removals
+	e.indexed = live
 
 	if err := ix.Save(ctx, e.cfg.Backend, e.indexKey()); err != nil {
 		return errors.Wrap(err, "save bucket index")
@@ -114,6 +130,12 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 	e.nextSeq = maxSeq + 1
 	e.flushedEpoch = ix.FlushedEpoch
 	e.generation = ix.Generation
+	e.removals = ix.Removed
+	e.indexed = make(map[string]struct{}, len(ix.Entries))
+
+	for _, entry := range ix.Entries {
+		e.indexed[entry.Prefix] = struct{}{}
+	}
 
 	// New head records belong to the generation past the recovered watermark; replay (which the
 	// facade runs next) then skips everything the loaded parts already hold.
