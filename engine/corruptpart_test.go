@@ -10,6 +10,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 )
 
@@ -23,7 +24,7 @@ import (
 // distinguish from "there was no data" is worse than a failed query, which is why the assertion
 // here is that the read must *fail*, not that it must succeed.
 func TestCorruptColumnIsNotSilentlyEmpty(t *testing.T) {
-	t.Skip("reproducer for #389: column objects are unchecksummed, so corruption reads as absence")
+	reproduce.Unfixed(t, 389, "column objects are unchecksummed, so corruption reads as absence")
 	t.Parallel()
 
 	ctx := context.Background()

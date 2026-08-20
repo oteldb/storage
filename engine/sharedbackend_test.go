@@ -12,6 +12,7 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 )
 
@@ -60,7 +61,7 @@ func queryable(t *testing.T, be backend.Backend, jobs ...string) []string {
 // flush mints the sequence the first already used, so it overwrites the first engine's part
 // objects and then commits an index that does not name them.
 func TestSharedBackendFlushKeepsPeerPart(t *testing.T) {
-	t.Skip("reproducer for #383/#392: engines over a shared store mint colliding part sequences and commit without CAS")
+	reproduce.Unfixed(t, 392, "engines over a shared store commit the index without compare-and-swap")
 	t.Parallel()
 
 	ctx := context.Background()
@@ -84,7 +85,7 @@ func TestSharedBackendFlushKeepsPeerPart(t *testing.T) {
 // index commit while the other completes a whole flush; the suspended commit then lands on top,
 // writing an index that names only its own parts.
 func TestSharedBackendConcurrentFlushKeepsPeerPart(t *testing.T) {
-	t.Skip("reproducer for #392: the bucket index is committed without compare-and-swap")
+	reproduce.Unfixed(t, 392, "the bucket index is committed without compare-and-swap")
 	t.Parallel()
 
 	ctx := context.Background()
@@ -122,7 +123,7 @@ func TestSharedBackendConcurrentFlushKeepsPeerPart(t *testing.T) {
 // oversight: the part objects the winning index does not name are deleted as orphans by the next
 // engine to open the prefix, so the data is gone from the store as well as from the index.
 func TestSharedBackendFlushSweepsPeerPart(t *testing.T) {
-	t.Skip("reproducer for #392: the orphan sweep deletes parts the lost index update named")
+	reproduce.Unfixed(t, 392, "the orphan sweep deletes parts the lost index update named")
 	t.Parallel()
 
 	ctx := context.Background()

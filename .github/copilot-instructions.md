@@ -117,6 +117,11 @@ One rule, by destination: the *why* goes in `ARCH.md`; code comments only what t
   postings set-ops vs a naive reference, fetch returns a superset of a brute-force scan,
   lossless exp-histogram downsampling.
 - **Golden tests** for on-disk formats (parts, WAL) to catch accidental format breaks.
+- **Reproducers for unfixed defects** are committed, not deferred: write the test that demonstrates
+  the bug, assert the *correct* behavior, and gate it with `reproduce.Unfixed(t, <issue>, "what the
+  tree does today")` (`internal/reproduce`). It skips by default, so CI stays green; run the suite
+  with `OTELDB_STORAGE_REPRODUCE=1` to execute them. Delete the call with the fix — a reproducer
+  that passes unskipped is the fix's acceptance criterion.
 - **Benchmarks on hot paths** (bit-stream, merge, postings intersection, fetch); use benchmarks +
   pprof as the performance feedback loop — measure before and after hot-path changes. **Both encode
   and decode benchmarks must report throughput** via `b.SetBytes` (plus `b.ReportAllocs()`). Size it

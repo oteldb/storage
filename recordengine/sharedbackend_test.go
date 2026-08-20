@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/reproduce"
 )
 
 // TestSharedBackendFlushKeepsPeerPart is the record engine's copy of the metric engine's
@@ -15,7 +16,7 @@ import (
 // report success and only one survives — the second mints a sequence the first already used and
 // then commits an index naming only its own parts. See #392 and #383.
 func TestSharedBackendFlushKeepsPeerPart(t *testing.T) {
-	t.Skip("reproducer for #383/#392: engines over a shared store mint colliding part sequences and commit without CAS")
+	reproduce.Unfixed(t, 392, "engines over a shared store commit the index without compare-and-swap")
 	t.Parallel()
 
 	ctx := context.Background()

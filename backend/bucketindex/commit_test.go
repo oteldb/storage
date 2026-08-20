@@ -8,6 +8,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/internal/reproduce"
 )
 
 // TestSaveDoesNotDropAConcurrentWritersPart isolates the commit itself from the engines above it.
@@ -19,7 +20,7 @@ import (
 // The assertion is deliberately loose about the mechanism — a conditional write and a
 // generation-named object both satisfy it.
 func TestSaveDoesNotDropAConcurrentWritersPart(t *testing.T) {
-	t.Skip("reproducer for #392: the bucket index is committed without compare-and-swap")
+	reproduce.Unfixed(t, 392, "the bucket index is committed without compare-and-swap")
 	t.Parallel()
 
 	ctx := context.Background()
