@@ -3,6 +3,7 @@ package recordengine_test
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -10,6 +11,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/backend/faultbackend"
+	"github.com/oteldb/storage/query/fetch"
 )
 
 // TestFlushRebasesOnARivalIndexCommit is the shared-store case of #392, with the interleaving
@@ -60,4 +62,54 @@ func TestFlushRebasesOnARivalIndexCommit(t *testing.T) {
 
 	require.Contains(t, prefixes, rival, "the rival's part must survive this engine's commit")
 	require.Len(t, prefixes, 2, "and this engine's own flushed part is committed alongside it")
+}
+
+// TestRebasedFlushServesTheAdoptedPart is #398 for the record engine: the entries a rebase carries
+// forward go into the committed index, so they must go into the part set this engine reads too —
+// an index naming a part the engine will not serve is a query that silently misses rows until the
+// next LoadParts.
+func TestRebasedFlushServesTheAdoptedPart(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const prefix = "t/recs"
+
+	be := faultbackend.Wrap(backend.Memory())
+	a := newEngine(t, be)
+	b := newEngine(t, be)
+
+	ingest(t, a, mkBatch("api", rrec{ts: 100, body: "a"}))
+	ingest(t, b, mkBatch("web", rrec{ts: 200, body: "b"}))
+
+	gate := faultbackend.NewGate()
+	be.Add(gate.Rule(faultbackend.CompareAndSwap, func(op faultbackend.Op) bool {
+		return strings.HasSuffix(op.Key, "/"+bucketindex.Object)
+	}))
+
+	var (
+		flushErr error
+		wg       sync.WaitGroup
+	)
+
+	wg.Go(func() { flushErr = a.Flush(ctx) })
+
+	gate.Await(t)
+	be.Reset()
+
+	require.NoError(t, b.Flush(ctx))
+
+	gate.Release()
+	wg.Wait()
+	require.NoError(t, flushErr)
+
+	ix, err := bucketindex.Load(ctx, be, prefix+"/"+bucketindex.Object)
+	require.NoError(t, err)
+	require.Len(t, ix.Entries, 2, "the rebased commit names both writers' parts")
+
+	got := fetchAll(t, a, fetch.Request{Start: 0, End: 10000, Matchers: []fetch.Matcher{svcMatcher("web")}})
+	require.Len(t, got, 1, "the rebasing engine serves the part it adopted")
+	require.Equal(t, []int64{200}, got[0].Timestamps)
+
+	require.Equal(t, 1, a.PartCount(), "which is still not a part it owns")
+	require.Len(t, a.Parts(), 2, "though it is one it serves")
 }

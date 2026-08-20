@@ -196,6 +196,10 @@ loaded.
 **Merge** is identical to the metric engine: sources are retired only after the bucket index naming
 their replacement is committed. See [`../engine/ARCH.md`](../engine/ARCH.md), "Publish ordering".
 
+**A rebased commit opens what it adopts**, so the index this engine publishes and the parts it
+serves stay the same set; the adopted parts are readable but not owned. See
+[`../engine/ARCH.md`](../engine/ARCH.md), "Adopted parts".
+
 ## Part identity & orphans
 
 Part prefixes are `<prefix>/{partid}`, a minted globally unique id, and `LoadParts` sweeps orphans at

@@ -192,6 +192,11 @@ type Engine struct {
 	// knows nothing about those parts but must not drop them, because the entry is all that keeps
 	// the part reachable. Empty for the single-writer case, which never reloads.
 	foreign []bucketindex.Entry
+	// foreignParts are the adopted entries' parts, opened so a query can read what the committed
+	// index names. Keyed by prefix, they are deliberately *not* in e.parts: this engine does not
+	// own them — it never merges, removes or deletes them — and treating them as its own would let
+	// its next commit resurrect a part their writer had removed.
+	foreignParts map[string]*part
 	// blockCache memoizes decoded column blocks across fetches (LRU, keyed by part/column/block); nil
 	// ⇒ decode every fetch. A fetch caches only the blocks its matched series touch, so the resident
 	// set is the useful blocks across live parts rather than every whole part touched.
@@ -1152,6 +1157,9 @@ func (e *Engine) Reset(ctx context.Context) error {
 
 	e.retireLocked(e.parts)
 	e.parts = nil
+	// Adopted parts are dropped, not retired: this engine does not own their objects. Reset wipes
+	// the whole prefix below, which is what makes it destructive.
+	e.foreign, e.foreignParts = nil, nil
 	e.mu.Unlock()
 
 	// Delete the drained parts' objects (and re-queue the ones a fetch still holds), then sweep
@@ -1554,14 +1562,16 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 // views (edge parts decode timestamps through the plan decode cache), so the per-part readers and
 // the freelist concurrency registration would be dead weight. Caller holds e.mu.
 func (e *Engine) acquireWindowParts(p *enginePlan, start, end int64, withReaders bool) {
+	readable := e.readablePartsLocked()
+
 	if withReaders && e.blockCache != nil {
-		p.blockReaders = make(map[*part]*seriesBlockReader, len(e.parts))
+		p.blockReaders = make(map[*part]*seriesBlockReader, len(readable))
 		// Registered until releaseParts (which keys off p.blockReaders != nil), scaling the decode
 		// freelists with fetch concurrency.
 		e.blockCache.fetchStart()
 	}
 
-	for _, pt := range e.parts {
+	for _, pt := range readable {
 		if pt.maxTime < start || pt.minTime > end { // time-prune
 			continue
 		}

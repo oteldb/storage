@@ -9,13 +9,12 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 )
 
 // These cover what a *rebase* leaves behind. A commit that loses the conditional write reloads the
-// winner's index and retries on top of it, which keeps the winner's entries — and that is where
-// both of these stop. See #397 and #398.
+// winner's index and retries on top of it: it must keep the winner's entries without stamping its
+// own WAL watermark over the winner's (#397), and must serve the parts it thereby names (#398).
 
 // rivals returns two engines over one shared backend, each with its own node identity and each
 // holding the state the other's commits will move under it.
@@ -80,7 +79,6 @@ func TestRebaseDoesNotLowerTheFlushWatermark(t *testing.T) {
 // check that trusts the local index — the rival's rows are missing while the index says they are
 // there.
 func TestRebaseServesTheAdoptedParts(t *testing.T) {
-	reproduce.Unfixed(t, 398, "adopted entries are committed but not opened")
 	t.Parallel()
 
 	ctx := context.Background()

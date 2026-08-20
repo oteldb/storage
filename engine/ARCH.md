@@ -100,6 +100,25 @@ rival's index carries the rival's slots through untouched and stamps only its ow
 number over another node's is data loss in one direction and duplicate replay in the other
 (`wal/ARCH.md`, "Epochs").
 
+### Adopted parts
+
+**Invariant: the index an engine commits and the part set it serves are the same set.** A commit
+that loses the conditional write rebases — it carries the winner's entries forward so its retry
+does not drop them — and it opens them, identities included, in the same step. Publishing an index
+that names a part this engine will not answer for is a query silently missing rows until the next
+`LoadParts` (#398).
+
+They are held apart from `parts`, in `foreignParts`, because the two sets differ in *ownership*, not
+in readability: an adopted part is not this engine's to merge, remove or delete, and counting it as
+its own would let the next commit's diff read the rival's later removal as a part this engine lost —
+or resurrect one it had removed. So `parts` is what flush/merge/retention operate on, `foreignParts`
+is added to it for reads (`Parts`, fetch, the identity prune's live set), and `LoadParts` collapses
+the two: everything the index names is opened as this engine's view of the prefix.
+
+The opens sit on the commit path, which is where the cost is. It is bounded: handles are reused
+across the retry loop, and an entry that cannot be opened — a rival merged it away in between — is
+left out of the readable set but kept in the index, since only its writer knows whether it is live.
+
 ## Identity prune
 
 `PruneIdentities` drops the identities retention leaves behind, which otherwise accumulate for the

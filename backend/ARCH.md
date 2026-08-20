@@ -109,8 +109,8 @@ a demonstration.
   commits against that version, and a loser wraps `ErrConflict`. The engines
   (`engine`/`recordengine`, `updateIndexLocked`) run the loop: on a conflict they reload, raise
   their generation above the winner's, record the winner's entries as *foreign* — entries they
-  neither wrote nor removed, carried into every later commit so they are never dropped — and retry,
-  bounded at 8 attempts. Exhausting the bound fails the flush or merge that asked for the commit,
+  neither wrote nor removed, carried into every later commit so they are never dropped — **open**
+  them, and retry, bounded at 8 attempts. Exhausting the bound fails the flush or merge that asked for the commit,
   because a part whose entry never landed is unreachable.
 - **`backend.ReaderAt`** — optional `ReadAt(ctx,key,off,n)`, the read counterpart of
   `ObjectCreator` and the reason a query touching a few granules no longer pays for the whole

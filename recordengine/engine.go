@@ -155,6 +155,11 @@ type Engine struct {
 	// knows nothing about those parts but must not drop them, because the entry is all that keeps
 	// the part reachable. Empty for the single-writer case, which never reloads.
 	foreign []bucketindex.Entry
+	// foreignParts are the adopted entries' parts, opened so a query can read what the committed
+	// index names. Keyed by prefix, they are deliberately *not* in e.parts: this engine does not
+	// own them — it never merges, removes or deletes them — and treating them as its own would let
+	// its next commit resurrect a part their writer had removed.
+	foreignParts map[string]*part
 
 	// recPool recycles per-stream fetch accumulators (*recordCols) when a caller opts into batch
 	// reuse via fetch.Request.Recycle and releases each batch. The accumulator's columns back the
@@ -728,6 +733,9 @@ func (e *Engine) Reset(ctx context.Context) error {
 
 	e.retireLocked(e.parts)
 	e.parts = nil
+	// Adopted parts are dropped, not retired: this engine does not own their objects. Reset wipes
+	// the whole prefix below, which is what makes it destructive.
+	e.foreign, e.foreignParts = nil, nil
 	e.mu.Unlock()
 
 	// Delete the drained parts' objects (and re-queue the ones still being read), then sweep whatever
@@ -782,10 +790,12 @@ func (e *Engine) SideSnapshot(ctx context.Context) (map[string][]byte, error) {
 		return map[string][]byte{}, nil
 	}
 
-	parts := make([]map[string][]byte, 0, len(e.parts)+1)
+	readable := e.readablePartsLocked()
+
+	parts := make([]map[string][]byte, 0, len(readable)+1)
 	parts = append(parts, e.cfg.SideStore.Encode()) // unflushed head symbols
 
-	for _, p := range e.parts {
+	for _, p := range readable {
 		m, err := loadSidecars(ctx, e.cfg.Backend, p.prefix, e.cfg.SideStore.Names())
 		if err != nil {
 			return nil, err
@@ -882,7 +892,7 @@ func (e *Engine) streamInRangeLocked(id signal.SeriesID, start, end int64) bool 
 		return true
 	}
 
-	for _, p := range e.parts {
+	for _, p := range e.readablePartsLocked() {
 		if rng, ok := p.lookup(id); ok && rng.start < rng.end && p.maxTime >= start && p.minTime <= end {
 			return true
 		}
@@ -996,7 +1006,8 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) (*fetchPlan, 
 		p.limit, p.reverse = r.Limit, r.Reverse
 	}
 
-	p.partsTotal = len(e.parts)
+	readable := e.readablePartsLocked()
+	p.partsTotal = len(readable)
 
 	// Resolving the query's streams against a part is the whole cost of planning a fetch on a
 	// fragmented store (parts × streams). Sorting the ids once turns each part's resolution into a
@@ -1007,7 +1018,7 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) (*fetchPlan, 
 
 	partRows := make([]int, len(p.sortedIDs))
 
-	for _, part := range e.parts {
+	for _, part := range readable {
 		rows := int64(part.reader.RowCount()) // cached from the manifest at part-open; no extra I/O
 		p.rowsTotal += rows
 

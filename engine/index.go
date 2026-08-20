@@ -6,6 +6,8 @@ import (
 	"slices"
 
 	"github.com/go-faster/errors"
+	"github.com/go-faster/sdk/zctx"
+	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
@@ -87,8 +89,74 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 	e.epochs, e.anonEpoch = ix.Epochs, ix.FlushedEpoch
 
 	e.foreign = foreignEntries(ix.Entries, e.indexed, e.removals)
+	e.openForeignLocked(ctx)
 
 	return nil
+}
+
+// openForeignLocked opens the parts of the entries this engine adopted, so the part set it can
+// serve matches the index it is about to commit — the index names them, and until they are open
+// only [Engine.LoadParts] would make them readable (#398).
+//
+// Already-open handles are reused, so a commit retrying under contention re-reads nothing, and one
+// that cannot be opened (a rival that merged it away between the two commits) is left out of the
+// readable set but kept in the index: the entry is what keeps the part reachable, and only its
+// writer knows whether it is still live. Caller holds e.mu.
+func (e *Engine) openForeignLocked(ctx context.Context) {
+	if len(e.foreign) == 0 {
+		e.foreignParts = nil
+
+		return
+	}
+
+	open := make(map[string]*part, len(e.foreign))
+
+	for _, ent := range e.foreign {
+		if p, ok := e.foreignParts[ent.Prefix]; ok {
+			open[ent.Prefix] = p
+
+			continue
+		}
+
+		p, err := openPart(ctx, e.cfg.Backend, ent.Prefix)
+		if err != nil {
+			zctx.From(ctx).Debug("adopted part is not readable here",
+				zap.String("prefix", ent.Prefix), zap.Error(err))
+
+			continue
+		}
+
+		p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
+		open[ent.Prefix] = p
+
+		// Without its identities the part is open but unresolvable: matchers resolve through the
+		// head's identity index, so the rows would be there and nothing would name them.
+		if _, err := e.registerPartIdentitiesLocked(ctx, ent.Prefix); err != nil {
+			zctx.From(ctx).Debug("adopted part identities are not readable here",
+				zap.String("prefix", ent.Prefix), zap.Error(err))
+		}
+	}
+
+	e.foreignParts = open
+}
+
+// readablePartsLocked is the part set a query may read: this engine's own, plus the ones it
+// adopted from a rival writer's index. The two are kept apart because only the first are this
+// engine's to merge, remove or delete — but both are named by the index it committed, so both must
+// answer a read. Caller holds e.mu.
+func (e *Engine) readablePartsLocked() []*part {
+	if len(e.foreignParts) == 0 {
+		return e.parts
+	}
+
+	out := make([]*part, 0, len(e.parts)+len(e.foreignParts))
+	out = append(out, e.parts...)
+
+	for _, p := range e.foreignParts {
+		out = append(out, p)
+	}
+
+	return out
 }
 
 // nextIndexLocked builds the index state this engine wants committed and advances the
@@ -195,6 +263,9 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 	// for every entry the index names, so nothing is foreign any more.
 	e.indexVersion = version
 	e.foreign = nil
+	// Everything the index names is opened below, so the adopted handles have no separate life
+	// left. Their objects belong to their writer and are not deleted here.
+	e.foreignParts = nil
 
 	parts := make([]*part, 0, len(ix.Entries))
 

@@ -80,7 +80,9 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 	defer e.flushMu.Unlock()
 
 	e.mu.RLock()
-	dirty, parts, total := e.identityDirty, e.parts, e.head.series.Len()
+	// readablePartsLocked, not e.parts: the identities of an adopted part back rows this engine
+	// serves, and pruning them would leave the part open and unresolvable.
+	dirty, parts, total := e.identityDirty, e.readablePartsLocked(), e.head.series.Len()
 	e.mu.RUnlock()
 
 	// Identities die only when retention drops rows or parts, so an engine that has merged nothing
