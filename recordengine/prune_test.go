@@ -2,6 +2,7 @@ package recordengine_test
 
 import (
 	"context"
+	"runtime"
 	"strconv"
 	"testing"
 
@@ -41,9 +42,25 @@ func pruneEngine(t *testing.T, total, keep int) *recordengine.Engine {
 	return e
 }
 
-func TestPruneIdentitiesDropsDeadStreams(t *testing.T) {
-	t.Parallel()
+// drainMapPool empties the [pool.ByteIntMap] pool, so the next map drawn from it starts at the
+// initial capacity and grows to fit its data alone.
+//
+// [Stats.IdentityBytes] measures the *capacity* of the interning tables, and a pooled table keeps
+// whatever capacity its previous user grew it to. Without this, the number depends on what else ran
+// in this process and when the GC last ran — which is how the memory assertions below came to fail
+// only under load. sync.Pool drops its victim cache on every GC and its primary cache to the victim
+// cache, so two collections empty it.
+func drainMapPool() {
+	runtime.GC()
+	runtime.GC()
+}
 
+// Deliberately not parallel: it measures pooled capacity, and a concurrently running test returning
+// a grown map to the pool is exactly the interference drainMapPool exists to remove. A test in this
+// package that runs alongside it would put the flake straight back.
+//
+//nolint:paralleltest // measures pooled capacity; a concurrent test would repopulate the pool
+func TestPruneIdentitiesDropsDeadStreams(t *testing.T) {
 	const (
 		total = pruneMinIdentitiesTest
 		keep  = total / 8
@@ -57,16 +74,17 @@ func TestPruneIdentitiesDropsDeadStreams(t *testing.T) {
 
 	require.NoError(t, e.Merge(ctx, 500)) // retention drops the first flush's records
 
+	drainMapPool() // the prune rebuilds the interning tables from the pool; size them by the data
 	removed, err := e.PruneIdentities(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, total-keep, removed)
 	assert.EqualValues(t, keep, e.Stats().Streams, "only streams with surviving records remain")
-	// Compared against an engine that only ever held the survivors, not against a fraction of `before`.
-	// IdentityBytes counts the *capacity* of the interning maps, and those come from a pool — so a
-	// pruned engine's floor depends on how large a map the pool happened to hand its rebuilt table,
-	// which depends on what else ran in this process. Both sides here draw from the same pool, so the
-	// comparison is like-for-like; a fraction of `before` is not (it failed CI at 31.6% of before,
-	// where the same code measures 13.0% in a quiet process).
+	// Compared against an engine that only ever held the survivors, not against a fraction of
+	// `before`: a fraction of `before` is not like-for-like (it failed CI at 31.6% of before, where
+	// the same code measures 13.0% in a quiet process). Both sides are drained first, so each sizes
+	// its tables from its own data rather than from a map the pool happened to hand it.
+	drainMapPool()
+
 	fresh := pruneEngine(t, keep, keep).Stats().IdentityBytes
 
 	assert.Less(t, e.Stats().IdentityBytes, before/2, "the reclaimed memory is reported")
