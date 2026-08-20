@@ -148,6 +148,19 @@ whatever arrived meanwhile), restores the side-store snapshot via `SideStore.Res
 only runs on a successful publish, so without the fold-back the rows would be lost the moment the next
 flush overwrote the in-flight buffer.
 
+### Out of space is not a retryable flush failure
+
+The fold-back above is what makes a *transient* failure survivable; it does nothing for a disk that
+is full, where the next flush fails identically and the head grows without bound. The shared
+`internal/diskguard` (design and rationale in [`../engine/ARCH.md`](../engine/ARCH.md)) checks free
+bytes and free inodes before the detach and latches either verdict, so `AppendBatch`/`ApplyPrimary`
+reject with `backend.ErrNoSpace` instead of buffering records that cannot be stored. The abort path
+also latches an ENOSPC the write itself returned.
+
+The inode axis is sized from the **schema**: a record part is one object per column plus its blooms,
+footer, identities and sidecars, and a record schema is an order of magnitude wider than a metric
+one — width is exactly what the inode axis spends.
+
 ## Stream identity is part-scoped
 
 Each part carries the identities of the streams it holds (`{part}/identity`, format in

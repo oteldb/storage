@@ -44,6 +44,7 @@ type Obs struct {
 	WAL       *WAL
 	RPC       *RPC
 	Cluster   *Cluster
+	Disk      *Disk
 }
 
 // New builds the observability handle, defaulting each unset pillar to its no-op implementation.
@@ -101,6 +102,11 @@ func New(cfg Config) (*Obs, error) {
 		return nil, err
 	}
 
+	disk, err := newDisk(meter)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Obs{
 		Log:       log,
 		Tracer:    tp.Tracer(scope),
@@ -113,6 +119,7 @@ func New(cfg Config) (*Obs, error) {
 		WAL:       wal,
 		RPC:       rpc,
 		Cluster:   cl,
+		Disk:      disk,
 	}, nil
 }
 

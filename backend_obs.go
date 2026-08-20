@@ -94,6 +94,12 @@ func (b *instrumentedBackend) FreeSpace(ctx context.Context) (int64, error) {
 	return backend.FreeSpace(ctx, b.inner)
 }
 
+// FreeInodes forwards the [backend.InodeReporter] capability, unmetered, for the same reason as
+// FreeSpace.
+func (b *instrumentedBackend) FreeInodes(ctx context.Context) (int64, error) {
+	return backend.FreeInodes(ctx, b.inner)
+}
+
 func (b *instrumentedBackend) Read(ctx context.Context, key string) ([]byte, error) {
 	start := time.Now()
 	v, err := b.inner.Read(ctx, key)

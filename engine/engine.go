@@ -17,6 +17,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/internal/diskguard"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/pool"
 	"github.com/oteldb/storage/query/fetch"
@@ -99,6 +100,17 @@ type Config struct {
 	// (one engine per tenant) so the cap bounds the process-wide in-flight decoded bytes rather
 	// than multiplying per tenant. Takes precedence over DecodeMemoryBytes.
 	DecodeBudget *DecodeBudget
+	// MinFreeBytes is the headroom the engine leaves unused on a backend that reports its free
+	// space: a flush is refused, and the ingest path starts rejecting, once the medium holds less
+	// than the pending part plus this. It leaves a merge room for its output — a merge must write
+	// before it can retire the inputs it frees, so a disk at 100% cannot compact its way out. 0 ⇒
+	// [diskguard.DefaultReserveBytes]; negative ⇒ the byte axis is not checked.
+	MinFreeBytes int64
+	// MinFreeInodes is the same headroom on the object-count axis, for a backend that reports free
+	// inodes. It is checked separately because a part is many small objects: an inode table can
+	// exhaust with the disk half empty, and byte accounting cannot see it. 0 ⇒
+	// [diskguard.DefaultReserveInodes]; negative ⇒ the inode axis is not checked.
+	MinFreeInodes int64
 	// MetricBlockRows sets the row block size for metric part columns (ts/value/sf): the columns are
 	// split into independently decodable blocks of this many rows, so a query can decode only the
 	// blocks its matched series' row ranges touch (sub-part seek) instead of the whole column, and
@@ -205,6 +217,10 @@ type Engine struct {
 	// identity prune ([Engine.PruneIdentities]) has something to look for. Identities die no other
 	// way, so an engine whose data has only grown skips even the live-set walk.
 	identityDirty bool
+	// space latches disk pressure: a flush that finds the backend short of bytes or inodes (or one
+	// that gets ENOSPC anyway) closes the ingest path until a later flush finds room. Without it a
+	// full disk is invisible — the write is acked, the flush fails, and the head grows behind it.
+	space *diskguard.Guard
 	// planMaps recycles the per-fetch plan maps (series identity + head/flush/recent snapshots) so a
 	// fetch reuses cleared maps instead of allocating and growing fresh ones each call.
 	planMaps planMapPools
@@ -219,6 +235,7 @@ func New(cfg Config) *Engine {
 	}
 
 	e := &Engine{cfg: cfg, head: newHead()}
+	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
 	// The decode free list covers the peak in-flight decoded parts: prefetch can decode
 	// prefetchConcurrency parts concurrently per fetch, and several fetches overlap, so a
 	// small multiple of GOMAXPROCS bounds the live set without over-retaining. Buffers
@@ -260,6 +277,10 @@ const metricSignal = "metric"
 // Append ingests one sample for series s, logging to the WAL when durable. It returns
 // whether the sample was accepted (false ⇒ rejected as out-of-order beyond the window).
 func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) {
+	if err := e.refuseWrite(); err != nil {
+		return false, err
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -295,6 +316,10 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 func (e *Engine) AppendBatch(
 	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(i int) signal.Series, limits AppendLimits,
 ) (AppendResult, error) {
+	if err := e.refuseWrite(); err != nil {
+		return AppendResult{}, err
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -387,6 +412,9 @@ type Stats struct {
 	Parts         int   // flushed immutable parts
 	MinTime       int64 // oldest flushed sample time (unix ns); 0 when no parts
 	MaxTime       int64 // newest sample time across parts and the head (unix ns); 0 when empty
+	// OutOfSpace is set while the engine refuses writes because its backend is out of bytes or
+	// inodes. Reads still answer from what is on disk; it clears when a flush finds room again.
+	OutOfSpace bool
 }
 
 // Stats returns an in-memory snapshot of the engine's state under a single read lock. It does no
@@ -398,6 +426,7 @@ func (e *Engine) Stats() Stats {
 
 	s := Stats{
 		Series:        int64(e.head.series.Len()),
+		OutOfSpace:    e.space.Exhausted(),
 		HeadBytes:     e.head.bytes,
 		IdentityBytes: e.head.identityBytes(),
 		Parts:         len(e.parts),
@@ -1195,6 +1224,10 @@ func (e *Engine) Replay(dir string) error {
 // admission-checks and it dictates the accepted set, every replica converges on the same data
 // regardless of concurrent writers. Safe for concurrent use.
 func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte, res AppendResult, err error) {
+	if err := e.refuseWrite(); err != nil {
+		return nil, AppendResult{}, err
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -1308,6 +1341,10 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
 
+	if err := e.admitFlush(ctx); err != nil {
+		return 0, err
+	}
+
 	// Plan (under lock): detach the head's sample buffers, keeping them readable via e.flushing so a
 	// concurrent fetch never loses them.
 	e.mu.Lock()
@@ -1349,11 +1386,15 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 
 		if err := writePart(ctx, e.cfg.Backend, prefix, sub, idents,
 			compressProfile{}, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
+			e.space.Observe(err)
+
 			return 0, err
 		}
 
 		p, err := openPart(ctx, e.cfg.Backend, prefix)
 		if err != nil {
+			e.space.Observe(err)
+
 			return 0, err
 		}
 

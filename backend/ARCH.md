@@ -148,6 +148,17 @@ a demonstration.
   and object stores, where local free space has no meaning — and the caller then falls back to its
   configured ceiling. **A wrapper must forward it**: `cachedBackend` does, or every cached backend
   would silently lose the capability.
+- **`backend.InodeReporter`** — optional `FreeInodes(ctx)`, implemented by `file` (the same statfs).
+  It is a **separate axis, not a refinement** of `SpaceReporter`: a part is many small objects, so an
+  inode table can exhaust with the disk half empty, and the failure is byte-indistinguishable from a
+  healthy volume. A filesystem that allocates inodes dynamically (btrfs, some tmpfs) reports a zero
+  total and so returns `ErrSpaceUnknown` — no ceiling to report is not "none left". Windows has no
+  inode table, so only the byte axis binds there. Same wrapper rule.
+- **`backend.ErrNoSpace`** is the sentinel every out-of-room failure carries: a capacity check that
+  refused, and the ENOSPC a write returned. The engines' disk guard
+  (`internal/diskguard`, see [`../engine/ARCH.md`](../engine/ARCH.md)) latches on it and the ingest
+  path rejects with it, so an embedder tells an exhausted node from a transient backend fault with
+  one `errors.Is`.
 
 ## Stateless read path
 

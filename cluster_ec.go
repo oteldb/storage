@@ -216,6 +216,16 @@ func (e *ecBackend) IsEphemeral() bool { return e.inner.IsEphemeral() }
 // IsNodeLocal forwards the [backend.NodeLocal] capability.
 func (e *ecBackend) IsNodeLocal() bool { return backend.IsNodeLocal(e.inner) }
 
+// FreeSpace and FreeInodes forward the capacity capabilities. Without them an EC tenant's engine
+// would see an unbounded medium and neither the merge cap nor the disk-pressure guard would bind.
+func (e *ecBackend) FreeSpace(ctx context.Context) (int64, error) {
+	return backend.FreeSpace(ctx, e.inner)
+}
+
+func (e *ecBackend) FreeInodes(ctx context.Context) (int64, error) {
+	return backend.FreeInodes(ctx, e.inner)
+}
+
 // reconstruct is the counted reader fallback: an object with no local full copy is reassembled
 // from shards, and the outcome lands in the EC operator stats (a missing object is not an
 // error of the reconstruction machinery and is not counted as one).

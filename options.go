@@ -100,6 +100,21 @@ type Options struct {
 	// embedder that bounds merge memory itself.
 	MergeMemoryBytes int64
 
+	// MinFreeBytes is the headroom each engine leaves unused on a backend that reports free space.
+	// Once the medium holds less than a pending flush plus this, the engine refuses to flush and
+	// starts rejecting writes with an error wrapping [backend.ErrNoSpace] rather than accepting data
+	// it cannot store — reads keep answering from what is on disk, and the state clears on its own
+	// when a later flush finds room. The headroom is what leaves compaction a way out: a merge must
+	// write its output before it can retire the inputs that would free the space. Zero ⇒
+	// a small default; negative ⇒ the byte axis is not checked.
+	MinFreeBytes int64
+
+	// MinFreeInodes is the same headroom on the object-count axis, for a backend that reports free
+	// inodes (a unix filesystem with a fixed inode table). It is a separate axis because a part is
+	// many small objects: a volume with terabytes free can still fail every create. Zero ⇒ a small
+	// default; negative ⇒ the inode axis is not checked.
+	MinFreeInodes int64
+
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each metric
 	// part, so [Storage.AggregateMetrics] answers a range-covering aggregate without decoding the
 	// value column — returning one number per series instead of every sample. It costs a little
@@ -304,6 +319,15 @@ func WithDecodeMemory(maxBytes int64) Option {
 // [Options.MergeMemoryBytes].
 func WithMergeMemory(maxBytes int64) Option {
 	return func(o *Options) { o.MergeMemoryBytes = maxBytes }
+}
+
+// WithDiskReserve sets the free bytes and free inodes each engine keeps in hand before it refuses
+// to flush and starts rejecting writes. Zero takes the defaults, negative disables that axis. See
+// [Options.MinFreeBytes] and [Options.MinFreeInodes].
+func WithDiskReserve(minFreeBytes, minFreeInodes int64) Option {
+	return func(o *Options) {
+		o.MinFreeBytes, o.MinFreeInodes = minFreeBytes, minFreeInodes
+	}
 }
 
 // WithAggregateStats writes the per-series aggregate sidecar that lets [Storage.AggregateMetrics]

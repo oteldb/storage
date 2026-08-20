@@ -339,3 +339,43 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 
 	return flush, merge, fetch, b.err
 }
+
+// Disk instruments the medium's ability to take what the node accepts. A full disk or an exhausted
+// inode table is not a transient backend fault: the node keeps acking writes it cannot store, so
+// the two states need separate signals — a gauge that stands while the engine refuses writes, and
+// a counter of the writes it refused.
+type Disk struct {
+	outOfSpace metric.Int64Gauge
+	rejected   metric.Int64Counter
+}
+
+// Record publishes a signal's disk-pressure state: whether its engine is currently refusing writes
+// for want of room, and how many writes it refused since the previous call. Both are published
+// together, from the flush that decides the state — the ingest path that counts a rejection carries
+// no context of its own, and a counter is as useful at flush cadence as per write.
+func (d *Disk) Record(ctx context.Context, sig string, outOfSpace bool, rejected int64) {
+	a := sigAttr(sig)
+
+	var v int64
+	if outOfSpace {
+		v = 1
+	}
+
+	d.outOfSpace.Record(ctx, v, a)
+
+	if rejected > 0 {
+		d.rejected.Add(ctx, rejected, a)
+	}
+}
+
+func newDisk(m metric.Meter) (*Disk, error) {
+	b := &imb{m: m}
+	d := &Disk{
+		outOfSpace: b.gauge("storage.disk.out_of_space",
+			"1 while an engine refuses writes because the medium is out of bytes or inodes", "{engine}"),
+		rejected: b.counter("storage.disk.rejected_writes",
+			"writes refused because the medium cannot store them", "{write}"),
+	}
+
+	return d, b.err
+}

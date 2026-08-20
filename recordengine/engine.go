@@ -17,6 +17,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/encoding/compress"
+	"github.com/oteldb/storage/internal/diskguard"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/profile"
@@ -75,6 +76,17 @@ type Config struct {
 	MergeCompression compress.Algorithm
 	// MergeCompressionLevel is the level for MergeCompression (ZSTD only). 0 ⇒ the algorithm default.
 	MergeCompressionLevel compress.Level
+	// MinFreeBytes is the headroom the engine leaves unused on a backend that reports its free
+	// space: a flush is refused, and the ingest path starts rejecting, once the medium holds less
+	// than the pending part plus this. It leaves a merge room for its output — a merge must write
+	// before it can retire the inputs it frees. 0 ⇒ [diskguard.DefaultReserveBytes]; negative ⇒ the
+	// byte axis is not checked.
+	MinFreeBytes int64
+	// MinFreeInodes is the same headroom on the object-count axis, for a backend that reports free
+	// inodes. It is checked separately because a part is many small objects: an inode table can
+	// exhaust with the disk half empty, and byte accounting cannot see it. 0 ⇒
+	// [diskguard.DefaultReserveInodes]; negative ⇒ the inode axis is not checked.
+	MinFreeInodes int64
 }
 
 // Engine is one tenant's record store for a signal. Safe for concurrent use.
@@ -100,6 +112,10 @@ type Engine struct {
 	// closes the visibility gap a flush would otherwise open between draining the head and the part
 	// becoming live. nil when no flush is in flight.
 	flushing map[signal.SeriesID]*recordCols
+	// space latches disk pressure: a flush that finds the backend short of bytes or inodes (or one
+	// that gets ENOSPC anyway) closes the ingest path until a later flush finds room. Without it a
+	// full disk is invisible — the write is acked, the flush fails, and the head grows behind it.
+	space *diskguard.Guard
 	// identityDirty is set when a merge dropped rows or parts, or when a refresh adopted a part set
 	// that lost one, so identities may now be dead and an identity prune
 	// ([Engine.PruneIdentities]) has something to look for. Identities die no other way, so an
@@ -167,6 +183,7 @@ func New(cfg Config) *Engine {
 	}
 
 	e := &Engine{cfg: cfg, head: newHead(cfg.Schema)}
+	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
 	e.recycle = func(b *fetch.Batch) {
 		if c, ok := b.ReleaseState().(*recordCols); ok {
 			e.recPool.Put(c)
@@ -220,6 +237,10 @@ func (b *Batch) ByteSize() int64 {
 // records to the WAL. It returns an [AppendResult] breaking accepted/rejected down by reason, so the
 // caller can report an exact OTLP partial-success. Safe for concurrent use.
 func (e *Engine) AppendBatch(b *Batch, limits AppendLimits) (AppendResult, error) {
+	if err := e.refuseWrite(); err != nil {
+		return AppendResult{}, err
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -336,6 +357,9 @@ type Stats struct {
 	Parts         int   // flushed immutable parts
 	MinTime       int64 // oldest flushed record time (unix ns); 0 when no parts
 	MaxTime       int64 // newest record time across parts and the head (unix ns); 0 when empty
+	// OutOfSpace is set while the engine refuses writes because its backend is out of bytes or
+	// inodes. Reads still answer from what is on disk; it clears when a flush finds room again.
+	OutOfSpace bool
 }
 
 // Stats returns an in-memory snapshot of the engine's state under a single read lock (no backend
@@ -346,6 +370,7 @@ func (e *Engine) Stats() Stats {
 
 	s := Stats{
 		Streams:       int64(e.head.series.Len()),
+		OutOfSpace:    e.space.Exhausted(),
 		HeadBytes:     e.head.inFlightBytes(),
 		IdentityBytes: e.head.identityBytes(),
 		Parts:         len(e.parts),
@@ -1159,6 +1184,10 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
 
+	if err := e.admitFlush(ctx); err != nil {
+		return 0, err
+	}
+
 	// Plan (under lock): detach the head's record buffers (keeping them readable via e.flushing so a
 	// concurrent fetch never loses them), snapshot the side-store delta atomically with the detach (so
 	// a concurrent append's symbols aren't lost by the Reset). Part ids are minted per part below, as
@@ -1271,6 +1300,8 @@ func (e *Engine) abortFlush(
 	side map[string][]byte,
 	cause error,
 ) error {
+	e.space.Observe(cause)
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 

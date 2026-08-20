@@ -93,6 +93,11 @@ type SignalStats struct {
 	// everything after it is missing here. math.MinInt64 when the shard had no parts at all — nothing
 	// here is known to be complete. Meaningful only while HasReadGap.
 	ReadGapAfterUnixNano int64
+	// OutOfSpace is true while this engine refuses writes because its backend is out of bytes or
+	// out of inodes: a flush found the medium short of room (or got ENOSPC writing a part), so
+	// ingest is rejected with an error wrapping backend.ErrNoSpace rather than accepted and lost.
+	// Reads keep answering from what is on disk, and it clears when a later flush finds room.
+	OutOfSpace bool
 }
 
 // ClusterStats is the cluster-mode view of this node.
@@ -207,8 +212,8 @@ func (s *Storage) Inspect() StoreStats {
 			IdentityBytes: es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
 			MergeRunning: eng.MergeRunning(),
 			SealedParts:  sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
-			MergeCapBytes: sh.CapBytes,
-			WAL:           hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
+			MergeCapBytes: sh.CapBytes, OutOfSpace: es.OutOfSpace,
+			WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 		})
 		s.attachReadGap(&ts.Signals[len(ts.Signals)-1], signal.Metric, tid)
 
@@ -232,8 +237,8 @@ func (s *Storage) Inspect() StoreStats {
 				IdentityBytes: es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
 				MergeRunning: eng.MergeRunning(),
 				SealedParts:  sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
-				MergeCapBytes: sh.CapBytes,
-				WAL:           hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
+				MergeCapBytes: sh.CapBytes, OutOfSpace: es.OutOfSpace,
+				WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 			})
 			s.attachReadGap(&ts.Signals[len(ts.Signals)-1], sig, tid)
 		}
