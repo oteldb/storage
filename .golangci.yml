@@ -5,6 +5,7 @@ linters:
     # Superseded / not applicable.
     - wsl # superseded by wsl_v5 (also disabled below)
     - gomodguard # superseded by gomodguard_v2
+    - exhaustruct_v5 # superseded name for exhaustruct (also disabled below)
     - depguard # no import allowlist maintained for this library
     # Style linters that fight this codebase's deliberate conventions.
     - wsl_v5 # pedantic cuddle/whitespace rules; not the house style

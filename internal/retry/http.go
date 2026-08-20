@@ -31,8 +31,7 @@ func Transient(err error) bool {
 		return true
 	}
 
-	var ne net.Error
-	if errors.As(err, &ne) {
+	if _, ok := errors.AsType[net.Error](err); ok {
 		return true
 	}
 
