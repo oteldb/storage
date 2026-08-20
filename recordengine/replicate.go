@@ -15,6 +15,10 @@ import (
 // partial-success exactly like the single-node path. Every replica converges on the same data.
 // Safe for concurrent use.
 func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte, res AppendResult, err error) {
+	if err := e.refuseWrite(); err != nil {
+		return nil, AppendResult{}, err
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 

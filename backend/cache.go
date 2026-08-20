@@ -146,6 +146,11 @@ func (c *cachedBackend) FreeSpace(ctx context.Context) (int64, error) {
 	return FreeSpace(ctx, c.inner)
 }
 
+// FreeInodes forwards the [InodeReporter] capability, for the same reason as FreeSpace.
+func (c *cachedBackend) FreeInodes(ctx context.Context) (int64, error) {
+	return FreeInodes(ctx, c.inner)
+}
+
 func (c *cachedBackend) Read(ctx context.Context, key string) ([]byte, error) {
 	v, err := c.ReadView(ctx, key)
 	if err != nil {

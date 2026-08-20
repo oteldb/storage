@@ -87,6 +87,8 @@ func (s *Storage) recordEngineCached(
 		// part size, which says nothing about the memory this process has.
 		MergeMemoryBytes: s.opts.MergeMemoryBytes,
 		MergeConcurrency: s.mergeConcurrency,
+		MinFreeBytes:     s.opts.MinFreeBytes,
+		MinFreeInodes:    s.opts.MinFreeInodes,
 		// ZSTD-compress compacted parts: record byte columns are dict-coded but not entropy-coded, so
 		// the cold, long-lived data is otherwise stored far larger than necessary (≈10× on logs).
 		// Flushes stay codec-only, so ingest is unaffected.

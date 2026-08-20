@@ -88,6 +88,12 @@ metrics only, a soft cardinality budget that remaps new series into a synthetic
 tags it with a per-sample scale factor (`sf` column) so counts/sums stay unbiased.
 In cluster mode the rate valve runs at the origin, cardinality/in-flight on the shard primary.
 
+A fourth valve sits below them, on a different axis: `internal/diskguard` refuses a flush the medium
+has no room for — bytes **and** inodes, checked separately — and latches, so ingest rejects with
+`backend.ErrNoSpace` instead of accepting data the node cannot store. Unlike the limits above it is
+not a policy but a fact about the disk, so it is enforced in the engines rather than at the facade,
+and it clears itself when a later flush finds room (`engine/ARCH.md`, "Disk pressure").
+
 ### Observability (`internal/obs`, `query/profile`)
 
 **Injected, never owned.** `Options.{Logger, TracerProvider, MeterProvider}` (OTel **API**
@@ -120,7 +126,12 @@ degrades into a silently partial result.
 - **Immutable parts + one merge engine.** Compaction, retention, downsampling, recompression,
   precision and EC conversion are all one background merge pass. No parallel subsystem.
 - **Backends are interchangeable**; the in-memory/ephemeral path is first-class and every layer
-  must work with no disk or object store.
+  must work with no disk or object store. Optional capabilities (`Viewer`, `Sizer`, `ReaderAt`,
+  `NodeLocal`, `SpaceReporter`, `InodeReporter`) are type assertions with mandatory fallbacks, so a
+  wrapper that does not forward one silently disables the behavior it feeds.
+- **A node never accepts what it cannot store.** Out of bytes or out of inodes is a distinct,
+  latched, observable state that rejects writes with `backend.ErrNoSpace` and keeps serving reads —
+  not a stream of failed flushes behind an unbounded head.
 - **Engine locks are never held across object-store I/O.** Plan under lock → read/write off lock →
   publish under lock; parts are copy-on-write and refcounted with deferred reclamation.
 - **Reads stream; the consumer must `Close`.** A `fetch.Iterator` produces a batch per `Next` —
@@ -185,6 +196,6 @@ engine/               metrics vertical
 recordengine/         shared record engine (logs/traces/profiles)
 query/{fetch,scale,profile,promql}           read seam · scale-out decorators · EXPLAIN ANALYZE · Prom adapter
 cluster/{,ring,etcd,replica,rebalance,partsync,ec}   L0 distribution
-internal/{obs,retry,simd,parallel,partid,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids
+internal/{obs,retry,simd,parallel,partid,diskguard,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids · disk-pressure guard
 reliability/          public RetryConfig presets
 ```

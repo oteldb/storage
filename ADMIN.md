@@ -68,6 +68,7 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 | `WAL` | the engine has a write-ahead log (false for the ephemeral in-memory engine) |
 | `WALSegments` / `WALBytes` | WAL segment sequence number and open-segment byte size |
 | `WALEpoch` | WAL active flush generation (not the recovery watermark) |
+| `OutOfSpace` | this engine is refusing writes because its backend is out of **bytes or inodes**. A flush found the medium short of room (or got `ENOSPC` writing a part), so ingest is rejected with an error wrapping `backend.ErrNoSpace` rather than accepted and lost; reads keep answering from what is on disk. It clears by itself on the next flush that finds room. See "Disk pressure" below |
 | `HasReadGap` / `ReadGapAfterUnixNano` | this node holds the shard but came back without its unflushed head (a restart, or a rebalance handing it over), so it disclaims reads at or past that timestamp and lets another owner answer. Clears when a flush by the shard's compaction owner puts newer data in this node's parts. `math.MinInt64` means the shard had no parts at all — nothing here is known to be complete |
 
 Part *byte* sizes are intentionally omitted from `Inspect` (they would need backend stat calls) — use
@@ -191,12 +192,38 @@ Metric instruments (all prefixed `storage.`):
 | `rpc.attempts` / `rpc.retries` / `rpc.hedges` | `op` | cluster RPCs |
 | `rpc.shard_absent` | `op` | shard reads that failed over because an owner holds no data for the shard (a rebalance backfill that has not caught up, or a lagging membership view); a sustained rate means the ring and the data disagree |
 | `rpc.shard_incomplete` | `op` | shard reads that failed over because this node holds the shard but is missing the head it held unflushed (see `HasReadGap` above). Expected briefly after a restart or a rebalance; sustained means no owner is flushing the shard |
+| `disk.out_of_space` | `signal` | gauge: 1 while an engine refuses writes for want of bytes or inodes. Alertable on its own — the node looks healthy while it is happening, and nothing else distinguishes it from a slow backend |
+| `disk.rejected_writes` | `signal` | writes refused because the medium cannot store them, published with the gauge on each flush attempt (the ingest path that counts them carries no context of its own). Rises only while the gauge stands |
 | `wal.appends` / `wal.fsyncs` / `wal.rotations` | — | WAL activity |
 | `parts.total` / `parts.sealed` / `parts.merge_backlog` / `parts.merge_candidates` / `merge.cap_bytes` | `signal` | gauges: the merge selector's view of the parts, published once per maintenance cycle, summed over this node's tenants (`cap_bytes` is the largest threshold in effect, not a sum — it is a threshold, not a quantity). `merge_backlog` flat with `merge_candidates` pinned at 0 is the stuck engine above. Per-tenant detail is `Inspect`, which needs no meter |
 
 Tracing emits coarse spans (`engine.flush`, `engine.merge`, `engine.fetch`, backend ops, cluster
 RPCs) with W3C trace-context propagation across the cluster transport. Logs are context-plumbed via
 `go-faster/sdk/zctx` (trace-correlated); admission shed events log at Warn only when rejections occur.
+
+**Disk pressure (a full disk or an exhausted inode table).** Before each flush an engine asks its
+backend for free bytes *and* free inodes and compares them against the pending part plus
+`Options.MinFreeBytes` / `Options.MinFreeInodes` (`WithDiskReserve`). A flush that cannot fit never
+starts — the samples stay in the head, no part sequence is burned — and the verdict latches: ingest
+rejects with an error wrapping `backend.ErrNoSpace`, `SignalStats.OutOfSpace` and
+`storage.disk.out_of_space` go up, and reads keep serving. It clears on the next flush that finds
+room, so a node that was freed up recovers without operator action, and process readiness is
+deliberately untouched (a restart would trade a storage problem for the loss of every unflushed
+sample).
+
+Three things an operator should know:
+
+- **Inodes are their own axis.** A volume with terabytes free still fails every create once its
+  inode table is exhausted, and a part is many small objects. Only a unix `statfs` reports it: on
+  Windows, and on a filesystem that allocates inodes dynamically (btrfs), the count is unknown and
+  only the byte axis binds.
+- **The reserve exists so compaction can still run.** A merge must write its output before it can
+  retire the inputs that would free the space, so a disk at 100% cannot compact its way out. The
+  default is small; a negative value waives that axis entirely.
+- **A backend wrapper that hides `backend.SpaceReporter` / `backend.InodeReporter` disables all of
+  this**, exactly as it disables the merge cap — the capability is a type assertion, and an
+  unforwarded one reads as an unbounded disk. The in-tree wrappers (read cache, metering, the EC
+  read wrapper) forward both.
 
 **Decode-budget forced admissions.** `Options.DecodeMemoryBytes` caps in-flight decoded bytes; a
 query reserves its estimate before reading parts and blocks while it does not fit. That wait is

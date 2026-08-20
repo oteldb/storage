@@ -1120,6 +1120,8 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		MergeCeilingBytes: limits.MaxMergePartSize,
 		MergeConcurrency:  s.mergeConcurrency,
 		MergeMemoryBytes:  s.opts.MergeMemoryBytes,
+		MinFreeBytes:      s.opts.MinFreeBytes,
+		MinFreeInodes:     s.opts.MinFreeInodes,
 	})
 	s.tenants[tid] = e
 

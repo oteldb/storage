@@ -160,6 +160,45 @@ name; a directory is a part's when its name parses as a part id. The sweep assum
 the prefix, so a replica's `RefreshReplica` skips it: the owner's in-flight part is not in the index
 yet.
 
+## Disk pressure closes the ingest path
+
+A flush that cannot fit is not a retryable failure. It detaches the head, fails part-way, burns a
+part sequence, and leaves the head to grow behind it — so a node with a full disk manufactures its
+own damage continuously while still acking every write, until it OOMs with everything unflushed in
+it. `internal/diskguard` (shared with `recordengine`) closes the loop:
+
+- **Before** the head is detached, a flush asks the backend for free bytes and free inodes and
+  compares them against the pending part plus `Config.MinFreeBytes` / `Config.MinFreeInodes`. A
+  flush that cannot land never starts, so the samples stay where a later flush can still write them.
+- Either verdict **latches**. While it stands, `Append`/`AppendBatch`/`ApplyPrimary` reject with an
+  error wrapping `backend.ErrNoSpace`, reads keep answering from what is on disk, and
+  `Stats.OutOfSpace` (surfaced as `SignalStats.OutOfSpace` and the `storage.disk.out_of_space`
+  gauge) says so.
+- An ENOSPC from the write itself latches the same way — the disk can fill between the check and
+  the write — while any other backend error does not: a transient fault must not make a node
+  read-only.
+- The latch clears on the next flush that finds room, which the maintenance loop runs on its own
+  cadence. Recovery needs no operator action. On a backend that reports **neither** axis (an object
+  store), a latch set by an ENOSPC clears at the next flush attempt and re-latches if that write
+  fails too: nothing can say when such a medium has room again except writing to it, so the flush
+  cadence is the retry.
+
+**Reject, not block.** A full disk is not a queue that drains: a writer parked waiting for one would
+only convert an unbounded head into unbounded blocked callers, and still lose the data. The error is
+retryable, so an embedder can shed or throttle at the protocol edge, where it has a client to tell.
+The opt-in *blocking* backpressure for a head that cannot drain fast enough is a different valve for
+a different, transient condition; it must treat `ErrNoSpace` as a reason to stop waiting, not to
+wait longer.
+
+**The reserve is for compaction.** A merge writes its output before it can retire the inputs that
+would free the space, so a disk at 100% cannot compact its way out. The headroom is deliberately
+small — the guard catches a medium that is actually out, and is not a capacity policy — and both
+axes can be waived with a negative value.
+
+**The wrapper hazard is the whole guard's weak point.** `FreeSpace`/`FreeInodes` are type
+assertions, so a `Backend` decorator that does not forward them silently turns a bounded disk into
+"unbounded" and the guard never fires.
+
 ## Flush and merge are bounded separately
 
 | phase | splits at | measured in | why |
