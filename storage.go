@@ -1111,6 +1111,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		Backend:          s.backendFor(tid),
 		Prefix:           prefix,
 		Term:             s.termFor(tid),
+		WriterID:         s.writerID(),
 		WAL:              w,
 		Obs:              s.obs,
 		DecodeCacheBytes: s.opts.DecodeCacheBytes,

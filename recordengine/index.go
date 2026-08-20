@@ -75,6 +75,10 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 		e.generation = ix.Generation
 	}
 
+	// The rival's slots, not this engine's watermark: e.flushedEpoch counts this node's own
+	// flushes and nothing another writer committed can say anything about it.
+	e.epochs, e.anonEpoch = ix.Epochs, ix.FlushedEpoch
+
 	e.foreign = foreignEntries(ix.Entries, e.indexed, e.removals)
 
 	return nil
@@ -87,7 +91,18 @@ func (e *Engine) nextIndexLocked() *bucketindex.Index {
 	// the whole point of it, since that is exactly the rewrite the part names cannot express.
 	e.generation = e.generation.Next(e.term())
 
-	ix := &bucketindex.Index{FlushedEpoch: e.flushedEpoch, Generation: e.generation}
+	ix := &bucketindex.Index{
+		// The watermark goes into this writer's own slot, and every other writer's is carried
+		// through untouched: they count flushes of WALs this engine has never seen, and a commit
+		// that stamped its own number over one of them would make that node replay records its
+		// parts already hold, or skip records it still holds only in memory (#397).
+		FlushedEpoch: e.anonEpoch,
+		Epochs:       slices.Clone(e.epochs),
+		Generation:   e.generation,
+	}
+	ix.SetWriterEpoch(e.cfg.WriterID, e.flushedEpoch, e.generation)
+	ix.Epochs = bucketindex.TrimWriters(ix.Epochs, e.cfg.WriterID, bucketindex.MaxWriters)
+	e.epochs, e.anonEpoch = ix.Epochs, ix.FlushedEpoch
 
 	// A rival writer's entries go in first, so this engine's own parts win any prefix collision.
 	for _, ent := range e.foreign {
@@ -192,7 +207,8 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 	}
 
 	e.parts = parts
-	e.flushedEpoch = ix.FlushedEpoch
+	e.flushedEpoch = ix.WriterEpoch(e.cfg.WriterID)
+	e.epochs, e.anonEpoch = ix.Epochs, ix.FlushedEpoch
 	e.generation = ix.Generation
 	e.removals = ix.Removed
 	e.indexed = make(map[string]struct{}, len(ix.Entries))

@@ -43,6 +43,17 @@ type Config struct {
 	// moved; see [github.com/oteldb/storage/backend/bucketindex.Generation]. nil is a writer with
 	// no cluster, whose generation is then a plain local counter.
 	Term func() uint64
+	// WriterID is this writer's stable identity — the cluster node id — under which its WAL flush
+	// watermark is kept in the bucket index. It matters because that index is *shared*: over a
+	// shared object store every replica of a shard commits one index object under one prefix, and
+	// the watermark is a per-node count of that node's own flushes, so one scalar in a shared
+	// object is meaningless to whichever node did not write it (see
+	// [github.com/oteldb/storage/backend/bucketindex.WriterEpoch]).
+	//
+	// Empty is the anonymous writer: a single-writer engine, which keeps the sole pre-v4 slot.
+	// Leaving it empty where two engines do share a prefix makes them share one slot, which is
+	// the defect the slots exist to prevent.
+	WriterID string
 	// SideStore, when non-nil, is a signal-supplied content-addressed auxiliary store (e.g. the
 	// profiles symbol store) that the engine persists as part sidecars on flush and unions on merge.
 	// nil ⇒ no side data (logs, traces).
@@ -115,9 +126,16 @@ type Engine struct {
 	// single-writer argument as flushBuf applies — see [Engine.blooms].
 	bloomBuf *bloomBuilder
 	// flushedEpoch is the WAL flush watermark: the generation of the most recently flushed head
-	// (persisted in the bucket index). Current head records are written to the WAL at flushedEpoch+1,
+	// (persisted in the bucket index, under this writer's [Config.WriterID] slot). Current head
+	// records are written to the WAL at flushedEpoch+1,
 	// so on recovery the engine replays only WAL segments past flushedEpoch — exactly-once.
 	flushedEpoch uint64
+	// epochs are the named writers' WAL flush watermarks as of the index this engine last read or
+	// committed, carried across its own commits so a peer's slot is never dropped by a rewrite
+	// this engine makes. anonEpoch is the same for the anonymous slot, which this engine owns only
+	// when [Config.WriterID] is empty.
+	epochs    []bucketindex.WriterEpoch
+	anonEpoch uint64
 	// generation is the commit generation of the last bucket index this engine wrote, advanced on
 	// every write. It is deliberately *not* reset by Reset: dropping the data does not entitle the
 	// engine to write an index a replica would refuse as stale.

@@ -75,6 +75,7 @@ func (s *Storage) recordEngineCached(
 		Backend:   s.backendFor(tid),
 		Prefix:    prefix,
 		Term:      s.termFor(tid),
+		WriterID:  s.writerID(),
 		SideStore: side,
 		WAL:       w,
 		Obs:       s.obs,

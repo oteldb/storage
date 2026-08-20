@@ -36,10 +36,10 @@ type Entry struct {
 // a valid empty index.
 type Index struct {
 	Entries []Entry
-	// FlushedEpoch is the highest WAL flush generation durably persisted in these parts (0 if
-	// unused). It is the watermark a record engine reads on recovery to skip WAL records a part
-	// already holds — advanced atomically with the part list, so exactly-once replay survives a
-	// crash between a flush committing and its WAL being truncated. Added in format v2.
+	// FlushedEpoch is the *anonymous* writer's WAL flush watermark: the highest flush generation
+	// it has durably persisted into these parts (0 if unused). Read and written through
+	// [Index.WriterEpoch] / [Index.SetWriterEpoch] with an empty writer id — a single-writer
+	// engine, and every writer of a pre-v4 index, which had no other slot. Added in format v2.
 	FlushedEpoch uint64
 	// Generation orders index states — see [Generation], which is the whole of why it exists.
 	// Zero in an index written before format v3, which is below every generation a writer
@@ -48,6 +48,10 @@ type Index struct {
 	// Removed are the parts this writer deliberately took out, newest-bounded — see [Removal].
 	// Kept sorted by prefix. Added in format v3.
 	Removed []Removal
+	// Epochs are the named writers' WAL flush watermarks, one slot each — see [WriterEpoch], which
+	// is the whole of why the watermark cannot be a single number. Kept sorted by writer id.
+	// Added in format v4.
+	Epochs []WriterEpoch
 }
 
 // Add inserts e, replacing any existing entry with the same prefix, keeping the index sorted.
@@ -94,8 +98,9 @@ func (ix *Index) Overlapping(start, end int64) []Entry {
 const (
 	magic0, magic1 = 'B', 'I'
 
-	// v3 appends Generation and Removed; v2 (epoch only) and v1 (neither) still decode.
-	version = 3
+	// v4 appends the per-writer flush watermarks; v3 (Generation + Removed), v2 (the anonymous
+	// epoch only) and v1 (neither) still decode.
+	version = 4
 )
 
 // AppendBinary appends the versioned binary encoding of the index to dst (append-style for
@@ -122,6 +127,16 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 		dst = append(dst, r.Prefix...)
 		dst = binary.AppendUvarint(dst, r.Generation.Term)
 		dst = binary.AppendUvarint(dst, r.Generation.Counter)
+	}
+
+	dst = binary.AppendUvarint(dst, uint64(len(ix.Epochs)))
+	for i := range ix.Epochs {
+		w := &ix.Epochs[i]
+		dst = binary.AppendUvarint(dst, uint64(len(w.Writer)))
+		dst = append(dst, w.Writer...)
+		dst = binary.AppendUvarint(dst, w.Epoch)
+		dst = binary.AppendUvarint(dst, w.Generation.Term)
+		dst = binary.AppendUvarint(dst, w.Generation.Counter)
 	}
 
 	return dst
@@ -208,28 +223,89 @@ func Decode(data []byte) (*Index, error) {
 
 		ix.Generation = Generation{Term: term, Counter: counter}
 
-		removed, err := decodeRemovals(buf)
+		removed, rest, err := decodeRemovals(buf)
 		if err != nil {
 			return nil, err
 		}
 
 		ix.Removed = removed
+		buf = rest
+	}
+
+	// v4+ appends the named writers' watermarks; earlier versions carry only the anonymous slot.
+	if ver >= 4 {
+		epochs, err := decodeWriterEpochs(buf)
+		if err != nil {
+			return nil, err
+		}
+
+		ix.Epochs = epochs
 	}
 
 	return ix, nil
 }
 
-// decodeRemovals parses the tombstone list, defensively: the count is bounded by what the buffer
-// could hold, as the entry count is.
-func decodeRemovals(buf []byte) ([]Removal, error) {
+// decodeWriterEpochs parses the per-writer watermark slots, bounding the count by what the buffer
+// could hold as the entry and removal counts are.
+func decodeWriterEpochs(buf []byte) ([]WriterEpoch, error) {
 	n, m := binary.Uvarint(buf)
 	if m <= 0 {
-		return nil, errors.Wrap(ErrCorrupt, "bad removal count")
+		return nil, errors.Wrap(ErrCorrupt, "bad writer count")
 	}
 	buf = buf[m:]
 
 	if n > uint64(len(buf)) {
-		return nil, errors.Wrap(ErrCorrupt, "removal count exceeds input")
+		return nil, errors.Wrap(ErrCorrupt, "writer count exceeds input")
+	}
+
+	if n == 0 {
+		return nil, nil // nil, not an empty slice, so encode∘decode is the identity
+	}
+
+	out := make([]WriterEpoch, 0, n)
+	for range n {
+		var w WriterEpoch
+
+		l, m := binary.Uvarint(buf)
+		if m <= 0 || l > uint64(len(buf)-m) {
+			return nil, errors.Wrap(ErrCorrupt, "bad writer length")
+		}
+		buf = buf[m:]
+		w.Writer = string(buf[:l])
+		buf = buf[l:]
+
+		if w.Epoch, m = binary.Uvarint(buf); m <= 0 {
+			return nil, errors.Wrap(ErrCorrupt, "bad writer epoch")
+		}
+		buf = buf[m:]
+
+		if w.Generation.Term, m = binary.Uvarint(buf); m <= 0 {
+			return nil, errors.Wrap(ErrCorrupt, "bad writer term")
+		}
+		buf = buf[m:]
+
+		if w.Generation.Counter, m = binary.Uvarint(buf); m <= 0 {
+			return nil, errors.Wrap(ErrCorrupt, "bad writer counter")
+		}
+		buf = buf[m:]
+
+		out = append(out, w)
+	}
+
+	return out, nil
+}
+
+// decodeRemovals parses the tombstone list, defensively: the count is bounded by what the buffer
+// could hold, as the entry count is.
+func decodeRemovals(buf []byte) ([]Removal, []byte, error) {
+	n, m := binary.Uvarint(buf)
+	if m <= 0 {
+		return nil, nil, errors.Wrap(ErrCorrupt, "bad removal count")
+	}
+	buf = buf[m:]
+
+	if n > uint64(len(buf)) {
+		return nil, nil, errors.Wrap(ErrCorrupt, "removal count exceeds input")
 	}
 
 	out := make([]Removal, 0, n)
@@ -238,26 +314,26 @@ func decodeRemovals(buf []byte) ([]Removal, error) {
 
 		l, m := binary.Uvarint(buf)
 		if m <= 0 || l > uint64(len(buf)-m) {
-			return nil, errors.Wrap(ErrCorrupt, "bad removal prefix length")
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad removal prefix length")
 		}
 		buf = buf[m:]
 		r.Prefix = string(buf[:l])
 		buf = buf[l:]
 
 		if r.Generation.Term, m = binary.Uvarint(buf); m <= 0 {
-			return nil, errors.Wrap(ErrCorrupt, "bad removal term")
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad removal term")
 		}
 		buf = buf[m:]
 
 		if r.Generation.Counter, m = binary.Uvarint(buf); m <= 0 {
-			return nil, errors.Wrap(ErrCorrupt, "bad removal counter")
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad removal counter")
 		}
 		buf = buf[m:]
 
 		out = append(out, r)
 	}
 
-	return out, nil
+	return out, buf, nil
 }
 
 func readVarint(buf []byte) (int64, []byte, bool) {

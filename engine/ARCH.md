@@ -88,10 +88,17 @@ always carries the identities its rows resolve through. A crash in between leave
 and identity together — swept at the next open, stranding nothing.
 
 `Checkpoint` runs last and is the WAL's commit point, so replay recovers a part that failed to
-publish. The index also carries a `FlushedEpoch` watermark (as `recordengine` does) and replay skips
-segments at or below it: a checkpoint only reaches segments this node wrote, and in a cluster the
-shard's compaction owner can flush records another owner logged — those segments are never
-checkpointed away, so the watermark is what keeps recovery exactly-once.
+publish. The index also carries the flush watermark (as `recordengine` does) and replay skips
+segments at or below it: a checkpoint only reaches segments this node wrote, and it can miss them —
+a node that stops being the shard's compaction owner stops checkpointing while its parts keep
+arriving — so the watermark is what keeps recovery exactly-once.
+
+**The watermark is per writer.** It counts *this* node's flushes and indexes *this* node's WAL
+segments, while the index holding it is shared by every replica of the shard, so it is stored in a
+slot keyed by `Config.WriterID` and each node recovers only its own. A commit that rebases onto a
+rival's index carries the rival's slots through untouched and stamps only its own; stamping one
+number over another node's is data loss in one direction and duplicate replay in the other
+(`wal/ARCH.md`, "Epochs").
 
 ## Identity prune
 

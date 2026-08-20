@@ -2,8 +2,10 @@ package engine_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -23,13 +25,28 @@ import (
 
 const sharedPrefix = "default/metrics"
 
+// sharedWriter mints the distinct node identities the engines of these tests stand in for: over a
+// shared store the WAL flush watermark is kept per writer, so two engines sharing one id would
+// share one slot — the very thing #397 is about.
+var sharedWriter atomic.Int64
+
 func newSharedEngine(t *testing.T, be backend.Backend) *engine.Engine {
 	t.Helper()
 
-	e := engine.New(engine.Config{Backend: be, Prefix: sharedPrefix})
-	require.NoError(t, e.LoadParts(context.Background()))
+	e, _ := newSharedWriter(t, be)
 
 	return e
+}
+
+// newSharedWriter returns an engine over the shared prefix and the node identity it writes as.
+func newSharedWriter(t *testing.T, be backend.Backend) (*engine.Engine, string) {
+	t.Helper()
+
+	id := fmt.Sprintf("node-%d", sharedWriter.Add(1))
+	e := engine.New(engine.Config{Backend: be, Prefix: sharedPrefix, WriterID: id})
+	require.NoError(t, e.LoadParts(context.Background()))
+
+	return e, id
 }
 
 // queryable reports which of the given series a fresh reader over be can see, by the value of
