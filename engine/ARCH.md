@@ -88,10 +88,36 @@ always carries the identities its rows resolve through. A crash in between leave
 and identity together — swept at the next open, stranding nothing.
 
 `Checkpoint` runs last and is the WAL's commit point, so replay recovers a part that failed to
-publish. The index also carries a `FlushedEpoch` watermark (as `recordengine` does) and replay skips
-segments at or below it: a checkpoint only reaches segments this node wrote, and in a cluster the
-shard's compaction owner can flush records another owner logged — those segments are never
-checkpointed away, so the watermark is what keeps recovery exactly-once.
+publish. The index also carries the flush watermark (as `recordengine` does) and replay skips
+segments at or below it: a checkpoint only reaches segments this node wrote, and it can miss them —
+a node that stops being the shard's compaction owner stops checkpointing while its parts keep
+arriving — so the watermark is what keeps recovery exactly-once.
+
+**The watermark is per writer.** It counts *this* node's flushes and indexes *this* node's WAL
+segments, while the index holding it is shared by every replica of the shard, so it is stored in a
+slot keyed by `Config.WriterID` and each node recovers only its own. A commit that rebases onto a
+rival's index carries the rival's slots through untouched and stamps only its own; stamping one
+number over another node's is data loss in one direction and duplicate replay in the other
+(`wal/ARCH.md`, "Epochs").
+
+### Adopted parts
+
+**Invariant: the index an engine commits and the part set it serves are the same set.** A commit
+that loses the conditional write rebases — it carries the winner's entries forward so its retry
+does not drop them — and it opens them, identities included, in the same step. Publishing an index
+that names a part this engine will not answer for is a query silently missing rows until the next
+`LoadParts` (#398).
+
+They are held apart from `parts`, in `foreignParts`, because the two sets differ in *ownership*, not
+in readability: an adopted part is not this engine's to merge, remove or delete, and counting it as
+its own would let the next commit's diff read the rival's later removal as a part this engine lost —
+or resurrect one it had removed. So `parts` is what flush/merge/retention operate on, `foreignParts`
+is added to it for reads (`Parts`, fetch, the identity prune's live set), and `LoadParts` collapses
+the two: everything the index names is opened as this engine's view of the prefix.
+
+The opens sit on the commit path, which is where the cost is. It is bounded: handles are reused
+across the retry loop, and an entry that cannot be opened — a rival merged it away in between — is
+left out of the readable set but kept in the index, since only its writer knows whether it is live.
 
 ## Identity prune
 

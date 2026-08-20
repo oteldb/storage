@@ -113,7 +113,9 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 func (e *Engine) liveIdentitiesLocked() map[signal.SeriesID]struct{} {
 	live := make(map[signal.SeriesID]struct{})
 
-	for _, p := range e.parts {
+	// readablePartsLocked, not e.parts: the identities of an adopted part back rows this engine
+	// serves, and pruning them would leave the part open and unresolvable.
+	for _, p := range e.readablePartsLocked() {
 		for _, sr := range p.ranges {
 			live[sr.id] = struct{}{}
 		}

@@ -45,6 +45,17 @@ type Config struct {
 	// moved; see [github.com/oteldb/storage/backend/bucketindex.Generation]. nil is a writer with
 	// no cluster, whose generation is then a plain local counter.
 	Term func() uint64
+	// WriterID is this writer's stable identity — the cluster node id — under which its WAL flush
+	// watermark is kept in the bucket index. It matters because that index is *shared*: over a
+	// shared object store every replica of a shard commits one index object under one prefix, and
+	// the watermark is a per-node count of that node's own flushes, so one scalar in a shared
+	// object is meaningless to whichever node did not write it (see
+	// [github.com/oteldb/storage/backend/bucketindex.WriterEpoch]).
+	//
+	// Empty is the anonymous writer: a single-writer engine, which keeps the sole pre-v4 slot.
+	// Leaving it empty where two engines do share a prefix makes them share one slot, which is
+	// the defect the slots exist to prevent.
+	WriterID string
 	// Obs is the observability handle (spans + metrics). nil ⇒ a no-op handle, so an engine
 	// constructed without one logs/spans/counts nothing.
 	Obs *obs.Obs
@@ -162,11 +173,18 @@ type Engine struct {
 	// walB groups a durable AppendBatch's WAL frames by series (reused under e.mu); nil head-only.
 	walB *walBatch
 	// flushedEpoch is the WAL flush watermark: the generation of the most recently flushed head
-	// (persisted in the bucket index). Current head records are written to the WAL at flushedEpoch+1,
+	// (persisted in the bucket index, under this writer's [Config.WriterID] slot). Current head
+	// records are written to the WAL at flushedEpoch+1,
 	// so on recovery the engine replays only WAL segments past flushedEpoch — exactly-once even when
 	// the segments outlive their checkpoint (a node that stops being the shard's compaction owner
 	// stops checkpointing, but its parts still arrive from the owner).
 	flushedEpoch uint64
+	// epochs are the named writers' WAL flush watermarks as of the index this engine last read or
+	// committed, carried across its own commits so a peer's slot is never dropped by a rewrite
+	// this engine makes. anonEpoch is the same for the anonymous slot, which this engine owns only
+	// when [Config.WriterID] is empty.
+	epochs    []bucketindex.WriterEpoch
+	anonEpoch uint64
 	// generation is the commit generation of the last bucket index this engine wrote, advanced on
 	// every write. It is deliberately *not* reset by Reset: dropping the data does not entitle the
 	// engine to write an index a replica would refuse as stale.
@@ -186,6 +204,11 @@ type Engine struct {
 	// knows nothing about those parts but must not drop them, because the entry is all that keeps
 	// the part reachable. Empty for the single-writer case, which never reloads.
 	foreign []bucketindex.Entry
+	// foreignParts are the adopted entries' parts, opened so a query can read what the committed
+	// index names. Keyed by prefix, they are deliberately *not* in e.parts: this engine does not
+	// own them — it never merges, removes or deletes them — and treating them as its own would let
+	// its next commit resurrect a part their writer had removed.
+	foreignParts map[string]*part
 	// blockCache memoizes decoded column blocks across fetches (LRU, keyed by part/column/block); nil
 	// ⇒ decode every fetch. A fetch caches only the blocks its matched series touch, so the resident
 	// set is the useful blocks across live parts rather than every whole part touched.
@@ -1163,6 +1186,9 @@ func (e *Engine) Reset(ctx context.Context) error {
 
 	e.retireLocked(e.parts)
 	e.parts = nil
+	// Adopted parts are dropped, not retired: this engine does not own their objects. Reset wipes
+	// the whole prefix below, which is what makes it destructive.
+	e.foreign, e.foreignParts = nil, nil
 	e.mu.Unlock()
 
 	// Delete the drained parts' objects (and re-queue the ones a fetch still holds), then sweep
@@ -1577,14 +1603,16 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 // views (edge parts decode timestamps through the plan decode cache), so the per-part readers and
 // the freelist concurrency registration would be dead weight. Caller holds e.mu.
 func (e *Engine) acquireWindowParts(p *enginePlan, start, end int64, withReaders bool) {
+	readable := e.readablePartsLocked()
+
 	if withReaders && e.blockCache != nil {
-		p.blockReaders = make(map[*part]*seriesBlockReader, len(e.parts))
+		p.blockReaders = make(map[*part]*seriesBlockReader, len(readable))
 		// Registered until releaseParts (which keys off p.blockReaders != nil), scaling the decode
 		// freelists with fetch concurrency.
 		e.blockCache.fetchStart()
 	}
 
-	for _, pt := range e.parts {
+	for _, pt := range readable {
 		if pt.maxTime < start || pt.minTime > end { // time-prune
 			continue
 		}

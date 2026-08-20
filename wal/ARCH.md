@@ -27,6 +27,21 @@ the **bucket index**, so it advances *atomically with part discoverability* — 
 window between a part committing and its WAL being deleted re-applies nothing.
 (Metrics don't track the epoch — their merge dedup makes that window self-healing.)
 
+**The epoch is a per-node counter, and the index it lives in is shared.** Over a shared object store
+every replica of a shard commits one index object under one prefix, and each of them counts its own
+flushes over its own WAL directory: two writers' epochs are unrelated integers naming different
+sequences of records. The index therefore keeps **one slot per writer**, keyed by
+`engine.Config.WriterID` (the cluster node id, empty for a single writer — see
+[`../backend/ARCH.md`](../backend/ARCH.md)), and a node recovers only its own. There is no
+correct scalar: a foreign number below this node's replays records its parts already hold, and one
+above skips records it never persisted, so max-merging on rebase trades duplicates for silent loss.
+
+What that gives up: a node's WAL records are superseded **only by its own flushes**. A record
+flushed into a part by a *different* node — the shard's compaction owner — is replayed by the node
+that logged it, because nothing relates the two counters. That direction is duplicates, not loss:
+the metric merge dedups, and a replica's `RefreshReplica` trims the head below what its parts
+cover.
+
 Lifecycle: `Create` **resumes** an existing directory (opens lazily beyond the prior run's
 segments, never truncating them), `SetEpoch` stamps new segments, `Checkpoint` deletes the segments
 a flush made durable (truncate-on-flush), so replay stays bounded.

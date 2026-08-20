@@ -79,9 +79,9 @@ func TestGoldenEncoding(t *testing.T) {
 		FlushedEpoch: 3,
 		Generation:   bucketindex.Generation{Term: 4, Counter: 5},
 	}
-	// magic 'B','I', version 3, count 1, len 1, 'a', zigzag(1)=2, zigzag(2)=4, flushedEpoch 3,
-	// generation term 4, generation counter 5, removal count 0.
-	assert.Equal(t, []byte{'B', 'I', 3, 1, 1, 'a', 2, 4, 3, 4, 5, 0}, ix.AppendBinary(nil))
+	// magic 'B','I', version 4, count 1, len 1, 'a', zigzag(1)=2, zigzag(2)=4, flushedEpoch 3,
+	// generation term 4, generation counter 5, removal count 0, writer-epoch count 0.
+	assert.Equal(t, []byte{'B', 'I', 4, 1, 1, 'a', 2, 4, 3, 4, 5, 0, 0}, ix.AppendBinary(nil))
 }
 
 // TestDecodeV2Compat verifies a v2 index (epoch, no generation) decodes with a zero generation,
@@ -206,6 +206,12 @@ func FuzzDecode(f *testing.F) {
 	f.Add([]byte{'B', 'I', 1, 0})
 	f.Add([]byte{'B', 'I', 1, 1, 1, 'a', 2, 4})
 	f.Add((&bucketindex.Index{Entries: []bucketindex.Entry{{Prefix: "x", MinTime: -1, MaxTime: 1}}}).AppendBinary(nil))
+	f.Add((&bucketindex.Index{
+		Entries: []bucketindex.Entry{{Prefix: "x", MinTime: -1, MaxTime: 1}},
+		Epochs: []bucketindex.WriterEpoch{
+			{Writer: "node-a", Epoch: 3, Generation: bucketindex.Generation{Term: 1, Counter: 2}},
+		},
+	}).AppendBinary(nil))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		ix, err := bucketindex.Decode(data)
@@ -217,5 +223,6 @@ func FuzzDecode(f *testing.F) {
 		again, err := bucketindex.Decode(ix.AppendBinary(nil))
 		require.NoError(t, err)
 		assert.Equal(t, ix.Entries, again.Entries)
+		assert.Equal(t, ix.Epochs, again.Epochs)
 	})
 }

@@ -95,14 +95,22 @@ a demonstration.
   removes the clone-per-hit that dominated the query-path allocation profile; `backend.ReadView`
   falls back to `Read` on backends without it, and `block.PartReader` reads through it.
 - **`backend/bucketindex`** — compact versioned index (part list + per-part time bounds + the WAL
-  flushed-epoch watermark) in one object, so a stateless reader enumerates and time-prunes a
-  tenant's parts without a full `List`. Fuzzed + golden-tested. **It is committed through
+  flush watermarks) in one object, so a stateless reader enumerates and time-prunes a
+  tenant's parts without a full `List`. **The watermark is one slot per writer**
+  (`WriterEpoch`, format v4), because it is a per-node count of that node's own flushes while the
+  index is shared by every replica of the shard: a single scalar means nothing to whichever node did
+  not write it, and there is no arithmetic that fixes it — a foreign number below this node's
+  replays records its parts hold, above it skips records only this node has. Slots are keyed by
+  `engine.Config.WriterID` (the cluster node id; empty is the anonymous single-writer slot, which is
+  the pre-v4 scalar) and bounded at `MaxWriters`, evicting by commit generation. A writer with no
+  slot — a new node, or one whose slot aged out — recovers 0 and replays what its last checkpoint
+  left on disk, never a number that is not its own. Fuzzed + golden-tested. **It is committed through
   `CompareAndSwap`**: `LoadVersioned` returns the index with the version it was read at, `Save`
   commits against that version, and a loser wraps `ErrConflict`. The engines
   (`engine`/`recordengine`, `updateIndexLocked`) run the loop: on a conflict they reload, raise
   their generation above the winner's, record the winner's entries as *foreign* — entries they
-  neither wrote nor removed, carried into every later commit so they are never dropped — and retry,
-  bounded at 8 attempts. Exhausting the bound fails the flush or merge that asked for the commit,
+  neither wrote nor removed, carried into every later commit so they are never dropped — **open**
+  them, and retry, bounded at 8 attempts. Exhausting the bound fails the flush or merge that asked for the commit,
   because a part whose entry never landed is unreachable.
 - **`backend.ReaderAt`** — optional `ReadAt(ctx,key,off,n)`, the read counterpart of
   `ObjectCreator` and the reason a query touching a few granules no longer pays for the whole

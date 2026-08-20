@@ -44,6 +44,17 @@ type Config struct {
 	// moved; see [github.com/oteldb/storage/backend/bucketindex.Generation]. nil is a writer with
 	// no cluster, whose generation is then a plain local counter.
 	Term func() uint64
+	// WriterID is this writer's stable identity — the cluster node id — under which its WAL flush
+	// watermark is kept in the bucket index. It matters because that index is *shared*: over a
+	// shared object store every replica of a shard commits one index object under one prefix, and
+	// the watermark is a per-node count of that node's own flushes, so one scalar in a shared
+	// object is meaningless to whichever node did not write it (see
+	// [github.com/oteldb/storage/backend/bucketindex.WriterEpoch]).
+	//
+	// Empty is the anonymous writer: a single-writer engine, which keeps the sole pre-v4 slot.
+	// Leaving it empty where two engines do share a prefix makes them share one slot, which is
+	// the defect the slots exist to prevent.
+	WriterID string
 	// SideStore, when non-nil, is a signal-supplied content-addressed auxiliary store (e.g. the
 	// profiles symbol store) that the engine persists as part sidecars on flush and unions on merge.
 	// nil ⇒ no side data (logs, traces).
@@ -131,9 +142,16 @@ type Engine struct {
 	// single-writer argument as flushBuf applies — see [Engine.blooms].
 	bloomBuf *bloomBuilder
 	// flushedEpoch is the WAL flush watermark: the generation of the most recently flushed head
-	// (persisted in the bucket index). Current head records are written to the WAL at flushedEpoch+1,
+	// (persisted in the bucket index, under this writer's [Config.WriterID] slot). Current head
+	// records are written to the WAL at flushedEpoch+1,
 	// so on recovery the engine replays only WAL segments past flushedEpoch — exactly-once.
 	flushedEpoch uint64
+	// epochs are the named writers' WAL flush watermarks as of the index this engine last read or
+	// committed, carried across its own commits so a peer's slot is never dropped by a rewrite
+	// this engine makes. anonEpoch is the same for the anonymous slot, which this engine owns only
+	// when [Config.WriterID] is empty.
+	epochs    []bucketindex.WriterEpoch
+	anonEpoch uint64
 	// generation is the commit generation of the last bucket index this engine wrote, advanced on
 	// every write. It is deliberately *not* reset by Reset: dropping the data does not entitle the
 	// engine to write an index a replica would refuse as stale.
@@ -153,6 +171,11 @@ type Engine struct {
 	// knows nothing about those parts but must not drop them, because the entry is all that keeps
 	// the part reachable. Empty for the single-writer case, which never reloads.
 	foreign []bucketindex.Entry
+	// foreignParts are the adopted entries' parts, opened so a query can read what the committed
+	// index names. Keyed by prefix, they are deliberately *not* in e.parts: this engine does not
+	// own them — it never merges, removes or deletes them — and treating them as its own would let
+	// its next commit resurrect a part their writer had removed.
+	foreignParts map[string]*part
 
 	// recPool recycles per-stream fetch accumulators (*recordCols) when a caller opts into batch
 	// reuse via fetch.Request.Recycle and releases each batch. The accumulator's columns back the
@@ -735,6 +758,9 @@ func (e *Engine) Reset(ctx context.Context) error {
 
 	e.retireLocked(e.parts)
 	e.parts = nil
+	// Adopted parts are dropped, not retired: this engine does not own their objects. Reset wipes
+	// the whole prefix below, which is what makes it destructive.
+	e.foreign, e.foreignParts = nil, nil
 	e.mu.Unlock()
 
 	// Delete the drained parts' objects (and re-queue the ones still being read), then sweep whatever
@@ -789,10 +815,12 @@ func (e *Engine) SideSnapshot(ctx context.Context) (map[string][]byte, error) {
 		return map[string][]byte{}, nil
 	}
 
-	parts := make([]map[string][]byte, 0, len(e.parts)+1)
+	readable := e.readablePartsLocked()
+
+	parts := make([]map[string][]byte, 0, len(readable)+1)
 	parts = append(parts, e.cfg.SideStore.Encode()) // unflushed head symbols
 
-	for _, p := range e.parts {
+	for _, p := range readable {
 		m, err := loadSidecars(ctx, e.cfg.Backend, p.prefix, e.cfg.SideStore.Names())
 		if err != nil {
 			return nil, err
@@ -889,7 +917,7 @@ func (e *Engine) streamInRangeLocked(id signal.SeriesID, start, end int64) bool 
 		return true
 	}
 
-	for _, p := range e.parts {
+	for _, p := range e.readablePartsLocked() {
 		if rng, ok := p.lookup(id); ok && rng.start < rng.end && p.maxTime >= start && p.minTime <= end {
 			return true
 		}
@@ -1003,7 +1031,8 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) (*fetchPlan, 
 		p.limit, p.reverse = r.Limit, r.Reverse
 	}
 
-	p.partsTotal = len(e.parts)
+	readable := e.readablePartsLocked()
+	p.partsTotal = len(readable)
 
 	// Resolving the query's streams against a part is the whole cost of planning a fetch on a
 	// fragmented store (parts × streams). Sorting the ids once turns each part's resolution into a
@@ -1014,7 +1043,7 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) (*fetchPlan, 
 
 	partRows := make([]int, len(p.sortedIDs))
 
-	for _, part := range e.parts {
+	for _, part := range readable {
 		rows := int64(part.reader.RowCount()) // cached from the manifest at part-open; no extra I/O
 		p.rowsTotal += rows
 

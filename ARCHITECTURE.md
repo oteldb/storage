@@ -148,7 +148,8 @@ degrades into a silently partial result.
   on the lease deadline rather than on etcd reachability is what keeps a blip free and a partition
   safe (`cluster/ARCH.md`, *Lease fencing*).
 - **The bucket index commits last, conditionally.** It is what makes a part durably visible — and in
-  `recordengine` it also carries the flush watermark (the WAL replay floor) — so its write is the
+  `recordengine` it also carries the flush watermark (the WAL replay floor, one slot per writer since
+  the watermark is per node and the index is shared) — so its write is the
   commit point in both engines: everything a committed part needs to stay readable must be durable
   first — its column objects and, in `engine`, the part's own identity object naming its series.
   Publish order is chosen to leave recoverable slack on a crash — unreferenced objects, an orphan

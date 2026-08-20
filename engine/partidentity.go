@@ -121,32 +121,45 @@ func (e *Engine) loadIdentitiesLocked(ctx context.Context, parts []*part) (bool,
 	complete := true
 
 	for _, p := range parts {
-		data, err := backend.ReadUncached(ctx, e.cfg.Backend, identityKey(p.prefix))
+		ok, err := e.registerPartIdentitiesLocked(ctx, p.prefix)
 		if err != nil {
-			if errors.Is(err, backend.ErrNotExist) {
-				complete = false // pre-part-scoped part: its identities come from the legacy object
-
-				continue
-			}
-
-			return false, errors.Wrapf(err, "read identity object %q", p.prefix)
+			return false, err
 		}
 
-		if err := identity.Decode(data, func(_ signal.SeriesID, s signal.Series) error {
-			// registerSeries interns the identity, so the aliased decode buffer is not retained.
-			e.head.registerSeries(s)
-
-			return nil
-		}); err != nil {
-			// A corrupt identity object is not fatal: the part's rows stay unresolvable until it is
-			// rewritten by a merge, exactly as a missing one would be, and the rest of the engine
-			// still opens.
-			zctx.From(ctx).Error("corrupt part identity object",
-				zap.String("part", p.prefix), zap.Error(err))
-
+		if !ok {
 			complete = false
 		}
 	}
 
 	return complete, nil
+}
+
+// registerPartIdentitiesLocked registers the series of the part at prefix into the head's identity
+// index, so a matcher can resolve the rows it holds. It reports whether the part carried its own
+// identity object: a missing one is a part written before identity was part-scoped (its identities
+// come from the legacy whole-set object), a corrupt one leaves its rows unresolvable until a merge
+// rewrites the part — neither is fatal. Caller holds e.mu.
+func (e *Engine) registerPartIdentitiesLocked(ctx context.Context, prefix string) (bool, error) {
+	data, err := backend.ReadUncached(ctx, e.cfg.Backend, identityKey(prefix))
+	if err != nil {
+		if errors.Is(err, backend.ErrNotExist) {
+			return false, nil
+		}
+
+		return false, errors.Wrapf(err, "read identity object %q", prefix)
+	}
+
+	if err := identity.Decode(data, func(_ signal.SeriesID, s signal.Series) error {
+		// registerSeries interns the identity, so the aliased decode buffer is not retained.
+		e.head.registerSeries(s)
+
+		return nil
+	}); err != nil {
+		zctx.From(ctx).Error("corrupt part identity object",
+			zap.String("part", prefix), zap.Error(err))
+
+		return false, nil
+	}
+
+	return true, nil
 }

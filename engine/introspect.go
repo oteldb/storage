@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"slices"
 	"sort"
 
 	"github.com/oteldb/storage/backend"
@@ -59,14 +60,19 @@ type LabelCard struct {
 	DistinctValues int
 }
 
-// Parts returns an in-memory snapshot of the engine's flushed parts under a read lock — no backend
-// I/O and no decode, safe to poll. For byte sizes, codecs, and chunk counts, use [Engine.PartsDetailed].
+// Parts returns an in-memory snapshot of the parts the engine can serve — its own, plus the ones it
+// adopted from a rival writer's index — under a read lock, with no backend I/O and no decode, so it
+// is safe to poll. It is the servable set rather than this writer's own, because that is what a
+// read answers from and what the completeness accounting has to measure. For byte sizes, codecs, and
+// chunk counts, use [Engine.PartsDetailed].
 func (e *Engine) Parts() []PartStat {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	out := make([]PartStat, 0, len(e.parts))
-	for _, p := range e.parts {
+	readable := e.readablePartsLocked()
+
+	out := make([]PartStat, 0, len(readable))
+	for _, p := range readable {
 		out = append(out, PartStat{
 			ID: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
 			Series: p.index.seriesCount(), Rows: int64(p.rows()),
@@ -83,8 +89,7 @@ func (e *Engine) Parts() []PartStat {
 // for the duration so a concurrent merge cannot reclaim its objects mid-read.
 func (e *Engine) PartsDetailed(ctx context.Context) ([]PartDetailStat, error) {
 	e.mu.RLock()
-	parts := make([]*part, len(e.parts))
-	copy(parts, e.parts)
+	parts := slices.Clone(e.readablePartsLocked())
 
 	for _, p := range parts {
 		p.acquire()

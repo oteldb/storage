@@ -1465,6 +1465,22 @@ func (s *Storage) sendPrimaryWrite(ctx context.Context, addr string, payload []b
 //
 // nil in single-node mode, where the engine's generation is a plain local counter — there is no
 // second writer for a term to order it against.
+// writerID returns the identity this node's engines keep their WAL flush watermark under in the
+// bucket index — the configured cluster node id, which is stable across restarts and distinct from
+// every peer sharing the prefix.
+//
+// Empty in single-node mode: there is no second writer, so the engine keeps the anonymous slot the
+// index has always had. It is read from the *configuration* rather than from the joined cluster so
+// that an engine created before (or without) a successful join still writes under this node's own
+// slot instead of silently sharing the anonymous one.
+func (s *Storage) writerID() string {
+	if s.opts.Cluster == nil {
+		return ""
+	}
+
+	return s.opts.Cluster.Self.ID
+}
+
 func (s *Storage) termFor(tid signal.TenantID) func() uint64 {
 	if s.cluster == nil {
 		return nil

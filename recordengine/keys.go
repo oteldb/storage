@@ -75,7 +75,7 @@ func (e *Engine) Keys(start, end int64) []KeyInfo {
 	collectRecordKeys(e.cfg.Schema, e.head.records, start, end, emitRecord)
 	collectRecordKeys(e.cfg.Schema, e.flushing, start, end, emitRecord)
 
-	for _, p := range e.parts {
+	for _, p := range e.readablePartsLocked() {
 		if !partInWindow(p, start, end) {
 			continue
 		}
