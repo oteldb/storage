@@ -78,14 +78,18 @@ a demonstration.
   larger than the whole budget is never retained.
 - **`backend.WriteUncached` / `backend.ReadUncached`** — the escape hatch from that cache for the
   few *mutable* objects rewritten far more often than they are read: the engines' identity sets,
-  written when identity changes and read only on recovery. `ReadVersioned` bypasses the cache for
-  the same reason and always: the version it returns is what a commit conditions on, and a resident
-  copy only proves what *this* process last saw — the objects committed conditionally are exactly
-  the mutable ones another writer rewrites. It refreshes the entry with what it read, so the
-  pass-through costs one read, not two. Caching one is pure eviction pressure (at
+  written when identity changes and read only on recovery. Caching one is pure eviction pressure (at
   real cardinality a single identity object is a large fraction of the budget), and it is the one
   object class where the write-once-immutable premise above does not hold. `WriteUncached` still
   invalidates the key, so a reader never sees a superseded value.
+- **A versioned key is never resident.** `ReadVersioned` and `CompareAndSwap` both *invalidate*;
+  neither stores. Refreshing the entry with what was just read looks like a free cache fill, and is
+  not safe: a read that observed the older value races a rival's winning swap to store, and can land
+  last, leaving every plain `Read` served a superseded object. There is no ordering to exploit —
+  the value is mutable, which is why it is committed conditionally at all. `CompareAndSwap`
+  invalidates on a *lost* swap too: losing proves the object moved under this process, so whatever
+  is resident is stale by definition. `bucketindex.Load` reads through `ReadUncached` for the same
+  reason, so a plain read cannot repopulate the entry behind the versioned path's back.
 - **`backend.Viewer`** — opt-in `ReadView(ctx,key)` returning a **read-only view** instead of a
   copy (a stored value is never mutated in place, so a view survives overwrite/eviction). This
   removes the clone-per-hit that dominated the query-path allocation profile; `backend.ReadView`

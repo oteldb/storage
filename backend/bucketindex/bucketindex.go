@@ -273,7 +273,10 @@ func readVarint(buf []byte) (int64, []byte, bool) {
 // index (the read path starts before any flush has written one). Use [LoadVersioned] when the
 // index will be written back: a commit needs the version it was read at.
 func Load(ctx context.Context, b backend.Backend, key string) (*Index, error) {
-	data, err := b.Read(ctx, key)
+	// Uncached, like [LoadVersioned]: the index is rewritten as parts come and go, and over a
+	// shared store by writers this process cannot see. A resident copy proves only what this
+	// process last read, and serving one here would hide a peer's commit behind a stale part set.
+	data, err := backend.ReadUncached(ctx, b, key)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotExist) {
 			return &Index{}, nil

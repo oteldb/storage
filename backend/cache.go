@@ -236,9 +236,10 @@ func (c *cachedBackend) CompareAndSwap(
 		return VersionAbsent, false, err
 	}
 
-	if ok {
-		c.store(key, data)
-	}
+	// Dropped, never stored: see [cachedBackend.ReadVersioned]. Invalidating on a *lost* swap too
+	// is deliberate — losing proves the object moved under this process, so whatever is resident
+	// is stale by definition.
+	c.values.Invalidate(key)
 
 	return v, ok, nil
 }
@@ -247,21 +248,21 @@ func (c *cachedBackend) CompareAndSwap(
 // condition on, and a cached copy only proves what *this* process last saw — the objects
 // committed this way (bucket index, manifests) are exactly the mutable ones another writer over
 // the same store rewrites. Serving a resident copy here would hand back a version already
-// superseded, and the commit built on it would fail forever rather than converge. The fresh value
-// refreshes the entry, so the pass-through costs one read, not two. Implements [Backend].
+// superseded, and the commit built on it would fail forever rather than converge.
+//
+// It drops the entry rather than refreshing it, and [cachedBackend.CompareAndSwap] does the same,
+// so **a versioned key is never resident**. Refreshing looks like a free cache fill but is not
+// safe: this read and a rival's winning swap race to store, and a read that observed the older
+// value can land last, leaving the cache serving a superseded object to every plain
+// [Backend.Read]. There is no ordering between them to exploit — the value is mutable, which is
+// the whole reason it is committed conditionally. Implements [Backend].
 func (c *cachedBackend) ReadVersioned(ctx context.Context, key string) ([]byte, Version, error) {
 	data, v, err := c.inner.ReadVersioned(ctx, key)
 	if err != nil {
 		return nil, VersionAbsent, err
 	}
 
-	if v == VersionAbsent {
-		c.values.Invalidate(key)
-
-		return data, v, nil
-	}
-
-	c.store(key, data)
+	c.values.Invalidate(key)
 
 	return data, v, nil
 }
