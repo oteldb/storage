@@ -12,7 +12,6 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 )
 
@@ -61,7 +60,6 @@ func queryable(t *testing.T, be backend.Backend, jobs ...string) []string {
 // the store under their own ids ([TestSharedBackendFlushKeepsPeerPartObjects]); the second commit
 // writes an index that does not name the first.
 func TestSharedBackendFlushKeepsPeerPart(t *testing.T) {
-	reproduce.Unfixed(t, 392, "engines over a shared store commit the index without compare-and-swap")
 	t.Parallel()
 
 	ctx := context.Background()
@@ -141,12 +139,11 @@ func objectBytes(t *testing.T, be backend.Backend, prefix string) map[string][]b
 	return out
 }
 
-// TestSharedBackendConcurrentFlushKeepsPeerPart is the concurrent form, so the loss cannot be
+// TestSharedBackendConcurrentFlushKeepsPeerPart is the concurrent form, so the outcome cannot be
 // dismissed as an artifact of the sequential test's ordering. One engine is suspended inside its
-// index commit while the other completes a whole flush; the suspended commit then lands on top,
-// writing an index that names only its own parts.
+// index commit while the other completes a whole flush; the suspended commit then lands on a
+// version that has moved under it, and must rebase onto the peer's rather than replace it.
 func TestSharedBackendConcurrentFlushKeepsPeerPart(t *testing.T) {
-	reproduce.Unfixed(t, 392, "the bucket index is committed without compare-and-swap")
 	t.Parallel()
 
 	ctx := context.Background()
@@ -159,7 +156,7 @@ func TestSharedBackendConcurrentFlushKeepsPeerPart(t *testing.T) {
 	mustAppend(t, b, mkSeries("job", "b"), 200, 2.0)
 
 	gate := faultbackend.NewGate()
-	be.Add(gate.Rule(faultbackend.Write, func(op faultbackend.Op) bool {
+	be.Add(gate.Rule(faultbackend.CompareAndSwap, func(op faultbackend.Op) bool {
 		return strings.HasSuffix(op.Key, bucketindex.Object)
 	}))
 
@@ -184,7 +181,6 @@ func TestSharedBackendConcurrentFlushKeepsPeerPart(t *testing.T) {
 // oversight: the part objects the winning index does not name are deleted as orphans by the next
 // engine to open the prefix, so the data is gone from the store as well as from the index.
 func TestSharedBackendFlushSweepsPeerPart(t *testing.T) {
-	reproduce.Unfixed(t, 392, "the orphan sweep deletes parts the lost index update named")
 	t.Parallel()
 
 	ctx := context.Background()
