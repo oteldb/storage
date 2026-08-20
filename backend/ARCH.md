@@ -10,7 +10,9 @@ Implementations are **interchangeable** — `backend/backendtest.Run(t, factory)
 conformance suite all of them pass under `-race`.
 
 **`backend/faultbackend`** is the fault-injection wrapper for tests: rules match an operation by
-kind and key and either fail it or run a hook before it. The hook is the point of the package — a
+kind and key and either fail it, rewrite the bytes a read returns, or run a hook before it. The
+rewrite models the failure an error cannot — a store handing back data that is not what was written,
+and saying nothing. The hook is the point of the package — a
 `Gate` suspends the matching operation *inside* the backend until the test releases it, so a test
 states a distributed interleaving instead of racing for one with sleeps, and the code under test
 needs no seams of its own. It forwards none of the optional capabilities below: each has a

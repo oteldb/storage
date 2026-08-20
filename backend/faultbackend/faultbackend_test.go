@@ -180,3 +180,46 @@ func TestKindString(t *testing.T) {
 	assert.Equal(t, "put-if-absent", faultbackend.PutIfAbsent.String())
 	assert.Equal(t, "unknown", faultbackend.Kind(99).String())
 }
+
+// TestReplaceRewritesReadBytes covers the corruption seam: a store that hands back bytes other
+// than those written, without reporting an error.
+func TestReplaceRewritesReadBytes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+	be.Add(faultbackend.Rule{
+		Kind:    faultbackend.Read,
+		Match:   func(op faultbackend.Op) bool { return op.Key == "rotten" },
+		Replace: func(_ faultbackend.Op, data []byte) []byte { return append(data, '!') },
+	})
+
+	require.NoError(t, be.Write(ctx, "rotten", []byte("v")))
+	require.NoError(t, be.Write(ctx, "sound", []byte("v")))
+
+	got, err := be.Read(ctx, "rotten")
+	require.NoError(t, err, "corruption is silent: the read still succeeds")
+	assert.Equal(t, []byte("v!"), got)
+
+	got, err = be.Read(ctx, "sound")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v"), got)
+}
+
+// TestReplaceLeavesAFailedReadAlone guards the ordering: a rule carrying both an error and a
+// replacement must report the error, not a rewritten value of nothing.
+func TestReplaceLeavesAFailedReadAlone(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+	require.NoError(t, be.Write(ctx, "k", []byte("v")))
+	be.Add(faultbackend.Rule{
+		Kind:    faultbackend.Read,
+		Err:     errInjected,
+		Replace: func(_ faultbackend.Op, data []byte) []byte { return append(data, '!') },
+	})
+
+	_, err := be.Read(ctx, "k")
+	require.ErrorIs(t, err, errInjected)
+}

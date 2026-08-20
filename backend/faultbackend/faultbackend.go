@@ -60,6 +60,11 @@ type Rule struct {
 	// Before, when non-nil, runs before the operation. It may block, which is what suspends the
 	// calling goroutine inside the backend (see [Gate]).
 	Before func(Op)
+	// Replace, when non-nil, rewrites the bytes a read returns. It models the failure a returned
+	// error cannot: a store that hands back data which is not what was written, and says nothing.
+	// It applies to [Read] alone; the wrapper implements no [backend.Viewer], so every read of an
+	// object's bytes — including one made through [backend.ReadView] — passes through it.
+	Replace func(Op, []byte) []byte
 	// Times limits how many operations the rule applies to. Zero ⇒ unlimited.
 	Times int
 
@@ -122,11 +127,19 @@ func (b *Backend) Count(match func(Op) bool) int {
 
 // Read implements [backend.Backend].
 func (b *Backend) Read(ctx context.Context, key string) ([]byte, error) {
-	if r := b.intercept(Op{Kind: Read, Key: key}); r != nil && r.Err != nil {
+	op := Op{Kind: Read, Key: key}
+
+	r := b.intercept(op)
+	if r != nil && r.Err != nil {
 		return nil, r.Err
 	}
 
-	return b.Backend.Read(ctx, key)
+	data, err := b.Backend.Read(ctx, key)
+	if err != nil || r == nil || r.Replace == nil {
+		return data, err
+	}
+
+	return r.Replace(op, data), nil
 }
 
 // Write implements [backend.Backend].
