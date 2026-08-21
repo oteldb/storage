@@ -23,23 +23,34 @@ const objectWriteBufferBytes = 64 << 10
 // then, so the atomicity contract is the same one; the difference is only that the bytes reach the
 // filesystem as they are produced rather than all at once. Implements [backend.ObjectCreator].
 func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter, error) {
-	p, err := f.path(key)
+	p, err := f.rel(key)
 	if err != nil {
 		return nil, err
 	}
 
-	tmp, err := createTemp(filepath.Dir(p))
+	tmp, name, err := f.createTemp(filepath.Dir(p))
 	if err != nil {
 		return nil, err
 	}
 
-	return &objectWriter{path: p, tmp: tmp, buf: bufio.NewWriterSize(tmp, objectWriteBufferBytes)}, nil
+	return &objectWriter{
+		root: f.root,
+		key:  key,
+		path: p,
+		tmp:  tmp,
+		name: name,
+		buf:  bufio.NewWriterSize(tmp, objectWriteBufferBytes),
+	}, nil
 }
 
-// objectWriter streams one object into a temp file, publishing it with a rename.
+// objectWriter streams one object into a temp file, publishing it with a rename. Both names are
+// relative to root, which resolves them the same way every other path in this package is resolved.
 type objectWriter struct {
+	root *os.Root
+	key  string
 	path string
 	tmp  *os.File
+	name string
 	buf  *bufio.Writer
 }
 
@@ -62,33 +73,33 @@ func (w *objectWriter) Commit(_ context.Context) error {
 	}
 
 	// Past this point the temp file is either renamed or removed; either way the handle is done.
-	tmp, name := w.tmp, w.tmp.Name()
+	tmp, name := w.tmp, w.name
 	w.tmp = nil
 
 	if err := w.buf.Flush(); err != nil {
 		_ = tmp.Close()
-		_ = os.Remove(name)
+		_ = w.root.Remove(name)
 
 		return errors.Wrap(err, "flush temp")
 	}
 
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		_ = os.Remove(name)
+		_ = w.root.Remove(name)
 
 		return errors.Wrap(err, "sync temp")
 	}
 
 	if err := tmp.Close(); err != nil {
-		_ = os.Remove(name)
+		_ = w.root.Remove(name)
 
 		return errors.Wrap(err, "close temp")
 	}
 
-	if err := os.Rename(name, w.path); err != nil {
-		_ = os.Remove(name)
+	if err := w.root.Rename(name, w.path); err != nil {
+		_ = w.root.Remove(name)
 
-		return errors.Wrapf(err, "rename into %q", w.path)
+		return errors.Wrapf(err, "rename into %q", w.key)
 	}
 
 	return nil
@@ -99,10 +110,10 @@ func (w *objectWriter) Abort() {
 		return
 	}
 
-	name := w.tmp.Name()
+	name := w.name
 
 	_ = w.tmp.Close()
-	_ = os.Remove(name)
+	_ = w.root.Remove(name)
 
 	w.tmp, w.buf = nil, nil
 }
