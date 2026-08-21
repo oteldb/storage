@@ -24,17 +24,21 @@ import (
 // paths under root. Safe for concurrent use (the filesystem serializes renames; reads
 // and writes touch distinct temp files).
 //
-// Every path operation goes through [os.Root], which resolves names inside the root in the
-// kernel. That buys two things over joining strings onto a root path. Containment stops being
-// a check this package has to get right — a symlink inside the tree pointing out of it is
-// refused, not merely a "..". And on Windows the handles it opens carry FILE_SHARE_DELETE,
-// without which a concurrent reader blocks the rename that publishes an object: plain
-// [os.Open] there asks for FILE_SHARE_READ|FILE_SHARE_WRITE only, and MoveFileEx over a
-// destination someone holds open fails with ERROR_ACCESS_DENIED. Rename-over-an-open-file is
-// a POSIX guarantee the write path depends on; os.Root is what extends it to Windows.
+// Every path operation goes through an [os.Root] opened for that operation alone. That buys two
+// things over joining strings onto a root path. Containment stops being a check this package has
+// to get right — a symlink inside the tree pointing out of it is refused, not merely a "..". And
+// on Windows the file handles it opens carry FILE_SHARE_DELETE, without which a concurrent reader
+// blocks the rename that publishes an object: plain [os.Open] there asks for
+// FILE_SHARE_READ|FILE_SHARE_WRITE only, and MoveFileEx over a destination someone holds open
+// fails with ERROR_ACCESS_DENIED. Rename-over-an-open-file is a POSIX guarantee the write path
+// depends on; os.Root is what extends it to Windows.
+//
+// The handle is per-operation rather than held on the File because [os.OpenRoot] opens its own
+// directory handle through the same [syscall.Open] that omits FILE_SHARE_DELETE
+// (os/root_windows.go). A root kept for the backend's lifetime would therefore pin its data
+// directory against removal on Windows, and [backend.Backend] has no Close with which to release
+// it. The cost is one extra open and close per operation.
 type File struct {
-	root *os.Root
-	// dir is root's path, kept for statfs and for naming the tree in errors.
 	dir string
 }
 
@@ -51,17 +55,19 @@ func New(dir string) (*File, error) {
 		return nil, errors.Wrapf(err, "create root %q", abs)
 	}
 
-	root, err := os.OpenRoot(abs)
-	if err != nil {
-		return nil, errors.Wrapf(err, "open root %q", abs)
-	}
+	f := &File{dir: abs}
 
-	f := &File{root: root, dir: abs}
+	// Fail at construction rather than at the first operation if the tree cannot be opened.
+	root, err := f.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
 
 	// Directories left behind by a version without Delete-time pruning (or by a crash between
 	// an object delete and its rmdir) make every List traverse dead subtrees forever. Sweep
 	// them once at open; best-effort, an unreadable subtree is not a reason to fail.
-	f.pruneEmpty(".")
+	f.pruneEmpty(root, ".")
 
 	return f, nil
 }
@@ -81,7 +87,13 @@ func (f *File) Write(_ context.Context, key string, data []byte) (rerr error) {
 		return err
 	}
 
-	tmp, tmpName, err := f.createTemp(filepath.Dir(p))
+	root, err := f.openRoot()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+
+	tmp, tmpName, err := createTemp(root, filepath.Dir(p))
 	if err != nil {
 		return err
 	}
@@ -89,7 +101,7 @@ func (f *File) Write(_ context.Context, key string, data []byte) (rerr error) {
 	// On any failure past this point, remove the temp file.
 	defer func() {
 		if rerr != nil {
-			_ = f.root.Remove(tmpName)
+			_ = root.Remove(tmpName)
 		}
 	}()
 
@@ -109,7 +121,7 @@ func (f *File) Write(_ context.Context, key string, data []byte) (rerr error) {
 		return errors.Wrap(err, "close temp")
 	}
 
-	if err := f.root.Rename(tmpName, p); err != nil {
+	if err := root.Rename(tmpName, p); err != nil {
 		return errors.Wrapf(err, "rename into %q", key)
 	}
 
@@ -127,12 +139,18 @@ func (f *File) PutIfAbsent(_ context.Context, key string, data []byte) (written 
 		return false, err
 	}
 
-	tmp, tmpName, err := f.createTemp(filepath.Dir(p))
+	root, err := f.openRoot()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = root.Close() }()
+
+	tmp, tmpName, err := createTemp(root, filepath.Dir(p))
 	if err != nil {
 		return false, err
 	}
 
-	defer func() { _ = f.root.Remove(tmpName) }() // the link, if made, is the durable copy
+	defer func() { _ = root.Remove(tmpName) }() // the link, if made, is the durable copy
 
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
@@ -150,7 +168,7 @@ func (f *File) PutIfAbsent(_ context.Context, key string, data []byte) (written 
 		return false, errors.Wrap(err, "close temp")
 	}
 
-	if err := f.root.Link(tmpName, p); err != nil {
+	if err := root.Link(tmpName, p); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return false, nil // key already present
 		}
@@ -168,7 +186,13 @@ func (f *File) Read(_ context.Context, key string) ([]byte, error) {
 		return nil, err
 	}
 
-	data, err := f.root.ReadFile(p)
+	root, err := f.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+
+	data, err := root.ReadFile(p)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, errors.Wrapf(backend.ErrNotExist, "read %q", key)
@@ -189,7 +213,13 @@ func (f *File) ReadAt(_ context.Context, key string, off, n int64) ([]byte, erro
 		return nil, err
 	}
 
-	file, err := f.root.Open(p)
+	root, err := f.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+
+	file, err := root.Open(p)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, errors.Wrapf(backend.ErrNotExist, "read %q", key)
@@ -228,7 +258,13 @@ func (f *File) Size(_ context.Context, key string) (int64, error) {
 		return 0, err
 	}
 
-	fi, err := f.root.Stat(p)
+	root, err := f.openRoot()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = root.Close() }()
+
+	fi, err := root.Stat(p)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return 0, errors.Wrapf(backend.ErrNotExist, "size %q", key)
@@ -255,11 +291,17 @@ func (f *File) List(_ context.Context, prefix string) ([]string, error) {
 
 	// [os.Root.FS] walks in slash paths relative to the root, so an entry's own path is already
 	// the key — no relativizing against an absolute root.
+	root, err := f.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+
 	base := filepath.ToSlash(rel)
 
 	var keys []string
 
-	err = fs.WalkDir(f.root.FS(), base, func(p string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(root.FS(), base, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// A prefix whose directory does not exist lists empty, as on an object store.
 			if p == base && errors.Is(err, fs.ErrNotExist) {
@@ -304,7 +346,13 @@ func (f *File) Delete(_ context.Context, key string) error {
 		return err
 	}
 
-	if err := f.root.Remove(p); err != nil {
+	root, err := f.openRoot()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+
+	if err := root.Remove(p); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return errors.Wrapf(backend.ErrNotExist, "delete %q", key)
 		}
@@ -312,18 +360,28 @@ func (f *File) Delete(_ context.Context, key string) error {
 		return errors.Wrapf(err, "delete %q", key)
 	}
 
-	f.pruneParents(p)
+	pruneParents(root, p)
 
 	return nil
+}
+
+// openRoot opens a root handle for one operation. The caller closes it.
+func (f *File) openRoot() (*os.Root, error) {
+	root, err := os.OpenRoot(f.dir)
+	if err != nil {
+		return nil, errors.Wrapf(err, "open root %q", f.dir)
+	}
+
+	return root, nil
 }
 
 // pruneParents removes the directories left empty by deleting p, up to (but never including)
 // the root. Without it a deleted part leaves its directories behind forever, and every List
 // keeps paying for them: the traversal cost grows with parts ever created, not parts retained.
-func (f *File) pruneParents(p string) {
+func pruneParents(root *os.Root, p string) {
 	for dir := path.Dir(filepath.ToSlash(p)); dir != "." && dir != "/"; dir = path.Dir(dir) {
 		// Fails with ENOTEMPTY as soon as a directory still holds objects.
-		if err := f.root.Remove(filepath.FromSlash(dir)); err != nil {
+		if err := root.Remove(filepath.FromSlash(dir)); err != nil {
 			return
 		}
 	}
@@ -331,8 +389,8 @@ func (f *File) pruneParents(p string) {
 
 // pruneEmpty removes every empty directory under dir (not dir itself), reporting whether dir
 // is empty afterwards. Errors are ignored: it is an optimization, not a correctness step.
-func (f *File) pruneEmpty(dir string) bool {
-	entries, err := fs.ReadDir(f.root.FS(), dir)
+func (f *File) pruneEmpty(root *os.Root, dir string) bool {
+	entries, err := fs.ReadDir(root.FS(), dir)
 	if err != nil {
 		return false
 	}
@@ -347,7 +405,7 @@ func (f *File) pruneEmpty(dir string) bool {
 		}
 
 		sub := path.Join(dir, e.Name())
-		if f.pruneEmpty(sub) && f.root.Remove(filepath.FromSlash(sub)) == nil {
+		if f.pruneEmpty(root, sub) && root.Remove(filepath.FromSlash(sub)) == nil {
 			continue
 		}
 
@@ -363,16 +421,16 @@ func (f *File) pruneEmpty(dir string) bool {
 //
 // [os.Root] has no CreateTemp, so the exclusive-create loop is here: O_EXCL makes the name
 // claim atomic, and a collision just draws another.
-func (f *File) createTemp(dir string) (*os.File, string, error) {
+func createTemp(root *os.Root, dir string) (*os.File, string, error) {
 	for attempt := 0; ; attempt++ {
-		if err := f.root.MkdirAll(dir, 0o750); err != nil {
+		if err := root.MkdirAll(dir, 0o750); err != nil {
 			return nil, "", errors.Wrapf(err, "mkdir %q", dir)
 		}
 
 		for range 10 {
 			name := filepath.Join(dir, ".tmp-"+strconv.FormatUint(rand.Uint64(), 36)) //nolint:gosec // temp file names need no unpredictability
 
-			tmp, err := f.root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+			tmp, err := root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 			if err == nil {
 				return tmp, name, nil
 			}

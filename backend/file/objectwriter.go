@@ -28,13 +28,20 @@ func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter
 		return nil, err
 	}
 
-	tmp, name, err := f.createTemp(filepath.Dir(p))
+	root, err := f.openRoot()
 	if err != nil {
 		return nil, err
 	}
 
+	tmp, name, err := createTemp(root, filepath.Dir(p))
+	if err != nil {
+		_ = root.Close()
+
+		return nil, err
+	}
+
 	return &objectWriter{
-		root: f.root,
+		root: root,
 		key:  key,
 		path: p,
 		tmp:  tmp,
@@ -45,6 +52,8 @@ func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter
 
 // objectWriter streams one object into a temp file, publishing it with a rename. Both names are
 // relative to root, which resolves them the same way every other path in this package is resolved.
+// The root handle stays open for the writer's lifetime — the temp file it holds is only published
+// at commit — and is released by [objectWriter.Commit] or [objectWriter.Abort].
 type objectWriter struct {
 	root *os.Root
 	key  string
@@ -79,6 +88,7 @@ func (w *objectWriter) Commit(_ context.Context) error {
 	if err := w.buf.Flush(); err != nil {
 		_ = tmp.Close()
 		_ = w.root.Remove(name)
+		_ = w.root.Close()
 
 		return errors.Wrap(err, "flush temp")
 	}
@@ -86,20 +96,27 @@ func (w *objectWriter) Commit(_ context.Context) error {
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		_ = w.root.Remove(name)
+		_ = w.root.Close()
 
 		return errors.Wrap(err, "sync temp")
 	}
 
 	if err := tmp.Close(); err != nil {
 		_ = w.root.Remove(name)
+		_ = w.root.Close()
 
 		return errors.Wrap(err, "close temp")
 	}
 
 	if err := w.root.Rename(name, w.path); err != nil {
 		_ = w.root.Remove(name)
+		_ = w.root.Close()
 
 		return errors.Wrapf(err, "rename into %q", w.key)
+	}
+
+	if err := w.root.Close(); err != nil {
+		return errors.Wrap(err, "close root")
 	}
 
 	return nil
@@ -114,6 +131,7 @@ func (w *objectWriter) Abort() {
 
 	_ = w.tmp.Close()
 	_ = w.root.Remove(name)
+	_ = w.root.Close()
 
 	w.tmp, w.buf = nil, nil
 }

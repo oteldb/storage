@@ -81,7 +81,13 @@ func (f *File) versionOf(key string) (backend.Version, error) {
 		return backend.VersionAbsent, err
 	}
 
-	data, err := f.root.ReadFile(p)
+	root, err := f.openRoot()
+	if err != nil {
+		return backend.VersionAbsent, err
+	}
+	defer func() { _ = root.Close() }()
+
+	data, err := root.ReadFile(p)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return backend.VersionAbsent, nil

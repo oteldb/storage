@@ -373,8 +373,14 @@ func TestFilePublishesOverOpenReader(t *testing.T) {
 
 	require.NoError(t, b.Write(ctx, "held/object", []byte("first")))
 
-	// A reader holding the object open across the rename, as a concurrent Read or ReadAt does.
-	held, err := os.Open(filepath.Join(root, "held", "object"))
+	// A reader holding the object open across the rename, opened the way the backend's own Read
+	// and ReadAt open it. The share mode is the whole point: a plain os.Open here would still
+	// block the rename on Windows, because that is the defect rather than the test's premise.
+	r, err := os.OpenRoot(root)
+	require.NoError(t, err)
+	defer func() { _ = r.Close() }()
+
+	held, err := r.Open("held/object")
 	require.NoError(t, err)
 	defer func() { _ = held.Close() }()
 
