@@ -4,7 +4,6 @@ import (
 	"context"
 	"hash/maphash"
 	"io/fs"
-	"os"
 	"sync"
 
 	"github.com/go-faster/errors"
@@ -77,12 +76,18 @@ func (f *File) ReadVersioned(ctx context.Context, key string) ([]byte, backend.V
 // versionOf returns the digest of key's stored contents, or [backend.VersionAbsent] if there is
 // no file there.
 func (f *File) versionOf(key string) (backend.Version, error) {
-	p, err := f.path(key)
+	p, err := f.rel(key)
 	if err != nil {
 		return backend.VersionAbsent, err
 	}
 
-	data, err := os.ReadFile(p) //nolint:gosec // p is validated by f.path to stay within root
+	root, err := f.openRoot()
+	if err != nil {
+		return backend.VersionAbsent, err
+	}
+	defer func() { _ = root.Close() }()
+
+	data, err := root.ReadFile(p)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return backend.VersionAbsent, nil

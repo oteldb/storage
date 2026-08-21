@@ -357,3 +357,37 @@ func TestFileAtomicWriteLeavesNoTemp(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"x"}, keys)
 }
+
+// TestFilePublishesOverOpenReader pins the property the whole write path rests on: a rename
+// publishes an object even while a reader holds the old one open. POSIX gives that for free, so
+// this test can only ever fail on Windows — which is the point. There, a handle opened without
+// FILE_SHARE_DELETE makes MoveFileEx over the destination fail with ERROR_ACCESS_DENIED, and the
+// commit is lost rather than merely delayed. It surfaced as a flake in the concurrent
+// compare-and-swap conformance case, where 16 committers read the same key in a loop.
+func TestFilePublishesOverOpenReader(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	b, err := file.New(root)
+	require.NoError(t, err)
+
+	require.NoError(t, b.Write(ctx, "held/object", []byte("first")))
+
+	// A reader holding the object open across the rename, opened the way the backend's own Read
+	// and ReadAt open it. The share mode is the whole point: a plain os.Open here would still
+	// block the rename on Windows, because that is the defect rather than the test's premise.
+	r, err := os.OpenRoot(root)
+	require.NoError(t, err)
+	defer func() { _ = r.Close() }()
+
+	held, err := r.Open("held/object")
+	require.NoError(t, err)
+	defer func() { _ = held.Close() }()
+
+	require.NoError(t, b.Write(ctx, "held/object", []byte("second")),
+		"publishing over an object a reader holds open must succeed")
+
+	got, err := b.Read(ctx, "held/object")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("second"), got)
+}

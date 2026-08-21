@@ -41,7 +41,7 @@ func (f *File) FreeInodes(context.Context) (int64, error) {
 	}
 
 	if int64(st.Files) <= 0 {
-		return 0, errors.Wrapf(backend.ErrSpaceUnknown, "inodes on %q are not accounted", f.root)
+		return 0, errors.Wrapf(backend.ErrSpaceUnknown, "inodes on %q are not accounted", f.dir)
 	}
 
 	return int64(st.Ffree), nil
@@ -49,8 +49,8 @@ func (f *File) FreeInodes(context.Context) (int64, error) {
 
 func (f *File) statfs() (syscall.Statfs_t, error) {
 	var st syscall.Statfs_t
-	if err := syscall.Statfs(f.root, &st); err != nil {
-		return st, errors.Wrapf(err, "statfs %q", f.root)
+	if err := syscall.Statfs(f.dir, &st); err != nil {
+		return st, errors.Wrapf(err, "statfs %q", f.dir)
 	}
 
 	return st, nil
