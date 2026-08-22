@@ -183,9 +183,13 @@ func (a Admin) Rebalance(ctx context.Context) error {
 
 	shards := a.s.allEngineKeys()
 
-	_, err := a.s.cluster.ownership.Reconcile(ctx, a.s.cluster.membership.Ring(), shards)
+	// errors.Wrap returns a non-nil error even for a nil one, so a successful reconcile has to
+	// return early. Wrapping unconditionally made every rebalance report failure.
+	if _, err := a.s.cluster.ownership.Reconcile(ctx, a.s.cluster.membership.Ring(), shards); err != nil {
+		return errors.Wrap(err, "reconcile ownership")
+	}
 
-	return errors.Wrap(err, "reconcile ownership")
+	return nil
 }
 
 // MaintainNow runs one full maintenance cycle immediately — flush + merge + retention across every

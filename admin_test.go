@@ -127,6 +127,21 @@ func TestAdminRebalanceSingleNodeNoOp(t *testing.T) {
 	require.NoError(t, s.Admin().Rebalance(ctx), "rebalance is a no-op without a cluster")
 }
 
+// TestAdminRebalanceClusteredReportsSuccess covers the path TestAdminRebalanceSingleNodeNoOp cannot:
+// with a cluster, Rebalance runs the reconcile and wraps its error. errors.Wrap builds a non-nil
+// error from a nil one, so wrapping unconditionally made a successful rebalance indistinguishable
+// from a failed one — an operator had no way to tell whether the ring had been applied.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestAdminRebalanceClusteredReportsSuccess(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	s := openClusterNodeShared(t, endpoint, "node-a")
+
+	require.NoError(t, s.Admin().Rebalance(ctx), "a reconcile that succeeds reports success")
+}
+
 func TestAdminRejectsAfterClose(t *testing.T) {
 	t.Parallel()
 
