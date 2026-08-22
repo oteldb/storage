@@ -76,6 +76,26 @@ func joinNode(t *testing.T, endpoint, root, id, addr string) {
 	t.Cleanup(func() { _ = m.Close(context.WithoutCancel(t.Context())) })
 }
 
+// TestRouterCloseReportsSuccess pins that a clean close reports success. errors.Wrap builds a
+// non-nil error from a nil one, so Close could never return nil: every caller's shutdown path took
+// the error branch and a normal exit looked like a failure. Every other test here discards Close's
+// error, which is why it went unnoticed.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestRouterCloseReportsSuccess(t *testing.T) {
+	const root = "/test"
+
+	endpoint := startEtcd(t)
+	joinNode(t, endpoint, root, "node-a", "10.0.0.1:9000")
+
+	r, err := router.Open(t.Context(), router.Config{
+		Etcd: []string{endpoint}, Root: root, RF: 1, ShardsPerTenant: 1,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, r.Close(context.WithoutCancel(t.Context())), "a clean close reports success")
+}
+
 func TestRouterResolvesPlacement(t *testing.T) {
 	t.Parallel()
 

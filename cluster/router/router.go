@@ -152,7 +152,13 @@ func (r *Router) Close(ctx context.Context) error {
 		err = cerr
 	}
 
-	return errors.Wrap(err, "close router")
+	// errors.Wrap returns a non-nil error even for a nil one, so a clean close has to return early.
+	// Wrapping unconditionally made every caller's shutdown look like a failure.
+	if err != nil {
+		return errors.Wrap(err, "close router")
+	}
+
+	return nil
 }
 
 // Members returns the cluster's current members, sorted by ID.
