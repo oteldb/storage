@@ -558,6 +558,7 @@ const pruneRounds = 4
 // TestClientPeerErrorBody proves a peer's 5xx body reaches the caller's error: without it a
 // peer-side backend failure is invisible on both nodes (issue #431).
 func TestClientPeerErrorBody(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	const reason = "list: open bucket index: permission denied"
@@ -588,6 +589,7 @@ func TestClientPeerErrorBody(t *testing.T) {
 // TestClientPeerErrorBodyBounded checks the body prefix in the error is capped, so a peer
 // answering with a huge body cannot blow up the caller's log line.
 func TestClientPeerErrorBodyBounded(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	body := strings.Repeat("x", 1<<20)
@@ -607,6 +609,7 @@ func TestClientPeerErrorBodyBounded(t *testing.T) {
 // TestListHandlerLogsFailure checks the serving node records its own backend failure instead of
 // leaving the caller as the only witness (issue #431).
 func TestListHandlerLogsFailure(t *testing.T) {
+	t.Parallel()
 	core, logs := observer.New(zap.ErrorLevel)
 	ctx := zctx.Base(context.Background(), zap.New(core))
 
