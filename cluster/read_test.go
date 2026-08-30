@@ -122,7 +122,7 @@ func TestRemoteFetcherOverHTTP(t *testing.T) {
 		return want, nil
 	}
 	noFn := func(context.Context, string, int64, int64, []fetch.Matcher) ([]*fetch.Batch, error) { return nil, nil }
-	handler := cluster.ReadHandler(metricFn, noFn, noFn, noFn)
+	handler := cluster.ReadHandler(metricFn, noFn, noFn, noFn, nil)
 
 	mux := http.NewServeMux()
 	mux.Handle(cluster.ReadPath, handler)
@@ -130,7 +130,7 @@ func TestRemoteFetcherOverHTTP(t *testing.T) {
 	t.Cleanup(srv.Close)
 	addr := strings.TrimPrefix(srv.URL, "http://")
 
-	rf := cluster.NewRemoteFetcher(signal.Metric, addr, nil)
+	rf := cluster.NewRemoteFetcher(signal.Metric, addr, nil, nil)
 	it, err := rf.Fetch(context.Background(), fetch.Request{
 		Tenant: "acme", Start: 10, End: 20,
 		Matchers: []fetch.Matcher{{Name: []byte("job"), Spec: &fetch.EqualMatcher{Name: "job", Value: "api"}}},
@@ -166,10 +166,10 @@ func TestShardAbsentOverHTTP(t *testing.T) {
 	t.Cleanup(srv.Close)
 	addr := strings.TrimPrefix(srv.URL, "http://")
 
-	_, err := cluster.NewRemoteFetcher(signal.Metric, addr, nil).Fetch(context.Background(), fetch.Request{Tenant: "acme"})
+	_, err := cluster.NewRemoteFetcher(signal.Metric, addr, nil, nil).Fetch(context.Background(), fetch.Request{Tenant: "acme"})
 	require.ErrorIs(t, err, cluster.ErrShardAbsent)
 
-	_, err = cluster.NewRemoteFetcher(signal.Log, addr, nil).Fetch(context.Background(), fetch.Request{Tenant: "acme"})
+	_, err = cluster.NewRemoteFetcher(signal.Log, addr, nil, nil).Fetch(context.Background(), fetch.Request{Tenant: "acme"})
 	require.Error(t, err)
 	require.NotErrorIs(t, err, cluster.ErrShardAbsent, "a real failure is not an absent shard")
 }
@@ -196,12 +196,12 @@ func TestEnumShardAbsentOverHTTP(t *testing.T) {
 	addr := strings.TrimPrefix(srv.URL, "http://")
 	ctx := context.Background()
 
-	_, err := cluster.FetchSeries(ctx, nil, addr, signal.Log, "acme", 0, 0, nil)
+	_, err := cluster.FetchSeries(ctx, nil, addr, signal.Log, "acme", 0, 0, nil, nil)
 	require.ErrorIs(t, err, cluster.ErrShardAbsent)
 
-	_, err = cluster.FetchKeys(ctx, nil, addr, signal.Log, "acme", 0, 0)
+	_, err = cluster.FetchKeys(ctx, nil, addr, signal.Log, "acme", 0, 0, nil)
 	require.ErrorIs(t, err, cluster.ErrShardAbsent)
 
-	_, err = cluster.FetchSide(ctx, nil, addr, signal.Profile, "acme")
+	_, err = cluster.FetchSide(ctx, nil, addr, signal.Profile, "acme", nil)
 	require.ErrorIs(t, err, cluster.ErrShardAbsent)
 }

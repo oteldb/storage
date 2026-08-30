@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/go-faster/errors"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/obs"
@@ -127,7 +128,9 @@ func DecodeWindowAggregates(data []byte) ([]engine.NamedWindowAgg, error) {
 // the shared halves (body read, matcher rebuild) are already factored out.
 //
 //nolint:dupl // same shape as the sibling handler, but the decoded request types differ;
-func AggregateWindowHandler(fn AggregateWindowFunc) http.Handler {
+func AggregateWindowHandler(fn AggregateWindowFunc, opts ...Option) http.Handler {
+	o := resolveOpts(opts)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		body, ok := aggregateRequestBody(w, req)
 		if !ok {
@@ -141,14 +144,18 @@ func AggregateWindowHandler(fn AggregateWindowFunc) http.Handler {
 			return
 		}
 
-		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace
+		ctx, span := o.Tracer.Start(obs.ExtractHTTP(req.Context(), req.Header), "cluster.serve.aggregate_window") // join the caller's trace
+		defer func() { endSpan(span, err) }()
 
-		aggs, err := fn(ctx, tenant, start, end, spec, matchersFromEq(eq))
+		var aggs []engine.NamedWindowAgg
+		aggs, err = fn(ctx, tenant, start, end, spec, matchersFromEq(eq))
 		if err != nil {
 			writeRPCError(w, err)
 
 			return
 		}
+
+		span.SetAttributes(attribute.Int("storage.rows", len(aggs)))
 
 		_, _ = w.Write(EncodeWindowAggregates(aggs))
 	})
@@ -158,7 +165,10 @@ func AggregateWindowHandler(fn AggregateWindowFunc) http.Handler {
 // returns its per-series evaluation windows.
 func (a *RemoteAggregator) AggregateWindow(
 	ctx context.Context, tenant string, start, end int64, spec engine.WindowSpec, eq []fetch.EqualMatcher,
-) ([]engine.NamedWindowAgg, error) {
+) (_ []engine.NamedWindowAgg, err error) {
+	ctx, span := a.clientSpan(ctx, "cluster.aggregate_window")
+	defer func() { endSpan(span, err) }()
+
 	payload := EncodeAggregateWindowRequest(tenant, start, end, spec, eq)
 
 	body, err := a.post(ctx, AggregateWindowPath, payload, "window aggregate")
@@ -166,5 +176,12 @@ func (a *RemoteAggregator) AggregateWindow(
 		return nil, err
 	}
 
-	return DecodeWindowAggregates(body)
+	aggs, err := DecodeWindowAggregates(body)
+	if err != nil {
+		return nil, err
+	}
+
+	span.SetAttributes(attribute.Int("storage.rows", len(aggs)))
+
+	return aggs, nil
 }

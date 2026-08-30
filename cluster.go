@@ -326,13 +326,16 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	mux.Handle(cluster.PrimaryWritePath, s.primaryWriteHandler()) // primary: OOO apply + replicate
 	// read fan-out across metric/log/trace/profile signals.
 	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch,
-		s.recordFetchFunc(signal.Log), s.recordFetchFunc(signal.Trace), s.recordFetchFunc(signal.Profile)))
+		s.recordFetchFunc(signal.Log), s.recordFetchFunc(signal.Trace), s.recordFetchFunc(signal.Profile), s.clusterOpts...))
 	// Metric aggregate pushdown: disjoint step buckets, and the overlapping-window variant.
-	mux.Handle(cluster.AggregatePath, cluster.AggregateHandler(s.localAggregate))
-	mux.Handle(cluster.AggregateWindowPath, cluster.AggregateWindowHandler(s.localAggregateWindow))
-	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(s.localSeries))     // record-signal series enumeration (log/trace/profile)
-	mux.Handle(cluster.KeysPath, cluster.KeysHandler(s.localKeys))           // record-signal attribute-key enumeration
-	mux.Handle(cluster.SidePath, cluster.SideHandler(s.localProfileSymbols)) // profile symbol store
+	mux.Handle(cluster.AggregatePath, cluster.AggregateHandler(s.localAggregate, s.clusterOpts...))
+	mux.Handle(cluster.AggregateWindowPath, cluster.AggregateWindowHandler(s.localAggregateWindow, s.clusterOpts...))
+	// record-signal series enumeration (log/trace/profile)
+	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(s.localSeries, s.clusterOpts...))
+	// record-signal attribute-key enumeration
+	mux.Handle(cluster.KeysPath, cluster.KeysHandler(s.localKeys, s.clusterOpts...))
+	// profile symbol store
+	mux.Handle(cluster.SidePath, cluster.SideHandler(s.localProfileSymbols, s.clusterOpts...))
 	// Part mirroring for per-node private backends: peers list and fetch this node's backend
 	// objects. Mounted unconditionally (read-only; useful for operator inspection), used by the
 	// maintenance loop only when Config.PrivateBackend is set.
@@ -497,7 +500,7 @@ func (s *Storage) shardReadTargets(
 				absent = true
 			}
 		case addr != "":
-			remotes = append(remotes, cluster.NewRemoteFetcher(sig, addr, cn.httpc))
+			remotes = append(remotes, cluster.NewRemoteFetcher(sig, addr, cn.httpc, s.clusterOpts...))
 		}
 	}
 
@@ -696,7 +699,7 @@ func (s *Storage) shardAggregate(
 			}, step)
 		},
 		func(addr string) ([]engine.NamedAgg, error) {
-			return cluster.NewRemoteAggregator(addr, s.cluster.httpc).
+			return cluster.NewRemoteAggregator(addr, s.cluster.httpc, s.clusterOpts...).
 				Aggregate(ctx, string(shardKey), r.Start, r.End, step, eq)
 		})
 }
@@ -714,7 +717,7 @@ func (s *Storage) shardAggregateWindow(
 			}, spec)
 		},
 		func(addr string) ([]engine.NamedWindowAgg, error) {
-			return cluster.NewRemoteAggregator(addr, s.cluster.httpc).
+			return cluster.NewRemoteAggregator(addr, s.cluster.httpc, s.clusterOpts...).
 				AggregateWindow(ctx, string(shardKey), r.Start, r.End, spec, eq)
 		})
 }
@@ -1025,7 +1028,7 @@ func (s *Storage) shardSeries(
 	}
 
 	return hedgeOwners(ctx, s, rpcOpSeries, remotes, func(ctx context.Context, addr string) ([]signal.Series, error) {
-		series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end, eq)
+		series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end, eq, s.clusterOpts...)
 		if err != nil {
 			return nil, err
 		}
@@ -1092,7 +1095,7 @@ func (s *Storage) shardKeys(
 	}
 
 	return hedgeOwners(ctx, s, rpcOpKeys, remotes, func(ctx context.Context, addr string) ([]cluster.KeyInfo, error) {
-		return cluster.FetchKeys(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end)
+		return cluster.FetchKeys(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end, s.clusterOpts...)
 	})
 }
 
@@ -1130,7 +1133,7 @@ func (s *Storage) shardSymbols(ctx context.Context, shardKey signal.TenantID) (m
 	}
 
 	return hedgeOwners(ctx, s, rpcOpSide, remotes, func(ctx context.Context, addr string) (map[string][]byte, error) {
-		return cluster.FetchSide(ctx, s.cluster.httpc, addr, signal.Profile, string(shardKey))
+		return cluster.FetchSide(ctx, s.cluster.httpc, addr, signal.Profile, string(shardKey), s.clusterOpts...)
 	})
 }
 

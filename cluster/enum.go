@@ -10,6 +10,8 @@ import (
 	"slices"
 
 	"github.com/go-faster/errors"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
@@ -186,7 +188,9 @@ func DecodeSideTables(data []byte) (map[string][]byte, error) {
 
 // SeriesHandler serves [SeriesPath]: it reconstructs the pushed-down equality matchers and lists the
 // matching stream identities via fn, dispatched to the right engine by the request's signal.
-func SeriesHandler(fn SeriesFunc) http.Handler {
+func SeriesHandler(fn SeriesFunc, opts ...Option) http.Handler {
+	o := resolveOpts(opts)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		r, err := decodeEnumRequest(req)
 		if err != nil {
@@ -195,12 +199,19 @@ func SeriesHandler(fn SeriesFunc) http.Handler {
 			return
 		}
 
-		series, err := fn(obs.ExtractHTTP(req.Context(), req.Header), r.sig, r.tenant, r.start, r.end, r.matchers)
+		ctx, span := o.Tracer.Start(obs.ExtractHTTP(req.Context(), req.Header), "cluster.serve.series",
+			trace.WithAttributes(attribute.String("storage.signal", r.sig.String())))
+		defer func() { endSpan(span, err) }()
+
+		var series []signal.Series
+		series, err = fn(ctx, r.sig, r.tenant, r.start, r.end, r.matchers)
 		if err != nil {
 			writeRPCError(w, err)
 
 			return
 		}
+
+		span.SetAttributes(attribute.Int("storage.rows", len(series)))
 
 		_, _ = w.Write(EncodeSeriesList(series))
 	})
@@ -208,7 +219,9 @@ func SeriesHandler(fn SeriesFunc) http.Handler {
 
 // KeysHandler serves [KeysPath]: it enumerates the distinct record-attribute keys for the request's
 // signal+tenant+window via fn (matchers are not used — keys are window-scoped, not matcher-scoped).
-func KeysHandler(fn KeysFunc) http.Handler {
+func KeysHandler(fn KeysFunc, opts ...Option) http.Handler {
+	o := resolveOpts(opts)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		r, err := decodeEnumRequest(req)
 		if err != nil {
@@ -217,19 +230,28 @@ func KeysHandler(fn KeysFunc) http.Handler {
 			return
 		}
 
-		keys, err := fn(obs.ExtractHTTP(req.Context(), req.Header), r.sig, r.tenant, r.start, r.end)
+		ctx, span := o.Tracer.Start(obs.ExtractHTTP(req.Context(), req.Header), "cluster.serve.keys",
+			trace.WithAttributes(attribute.String("storage.signal", r.sig.String())))
+		defer func() { endSpan(span, err) }()
+
+		var keys []KeyInfo
+		keys, err = fn(ctx, r.sig, r.tenant, r.start, r.end)
 		if err != nil {
 			writeRPCError(w, err)
 
 			return
 		}
+
+		span.SetAttributes(attribute.Int("storage.rows", len(keys)))
 
 		_, _ = w.Write(EncodeKeyList(keys))
 	})
 }
 
 // SideHandler serves [SidePath]: it returns the tenant's side-store tables via fn.
-func SideHandler(fn SideFunc) http.Handler {
+func SideHandler(fn SideFunc, opts ...Option) http.Handler {
+	o := resolveOpts(opts)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		r, err := decodeEnumRequest(req)
 		if err != nil {
@@ -238,12 +260,19 @@ func SideHandler(fn SideFunc) http.Handler {
 			return
 		}
 
-		tables, err := fn(obs.ExtractHTTP(req.Context(), req.Header), r.tenant)
+		ctx, span := o.Tracer.Start(obs.ExtractHTTP(req.Context(), req.Header), "cluster.serve.side",
+			trace.WithAttributes(attribute.String("storage.signal", r.sig.String())))
+		defer func() { endSpan(span, err) }()
+
+		var tables map[string][]byte
+		tables, err = fn(ctx, r.tenant)
 		if err != nil {
 			writeRPCError(w, err)
 
 			return
 		}
+
+		span.SetAttributes(attribute.Int("storage.rows", len(tables)))
 
 		_, _ = w.Write(EncodeSideTables(tables))
 	})
@@ -284,39 +313,89 @@ func decodeEnumRequest(req *http.Request) (enumReq, error) {
 }
 
 // FetchSeries lists a peer's stream identities for the signal+tenant+window, pushing down the
-// serializable (equality) matchers; the caller re-applies any non-equality matchers.
+// serializable (equality) matchers; the caller re-applies any non-equality matchers. Without
+// [WithTracerProvider] its spans report through a no-op tracer.
 func FetchSeries(
 	ctx context.Context, client *http.Client, addr string, sig signal.Signal,
-	tenant string, start, end int64, eq []fetch.EqualMatcher,
-) ([]signal.Series, error) {
+	tenant string, start, end int64, eq []fetch.EqualMatcher, opts ...Option,
+) (_ []signal.Series, err error) {
+	ctx, span := enumClientSpan(ctx, resolveOpts(opts), "cluster.series", addr, sig)
+	defer func() { endSpan(span, err) }()
+
 	body, err := postEnum(ctx, client, addr, SeriesPath, EncodeFetchRequest(sig, tenant, start, end, eq))
 	if err != nil {
 		return nil, err
 	}
 
-	return DecodeSeriesList(body)
+	series, err := DecodeSeriesList(body)
+	if err != nil {
+		return nil, err
+	}
+
+	span.SetAttributes(attribute.Int("storage.rows", len(series)))
+
+	return series, nil
 }
 
-// FetchKeys returns a peer's distinct record-attribute keys for the signal+tenant+window.
+// FetchKeys returns a peer's distinct record-attribute keys for the signal+tenant+window. Without
+// [WithTracerProvider] its spans report through a no-op tracer.
 func FetchKeys(
 	ctx context.Context, client *http.Client, addr string, sig signal.Signal, tenant string, start, end int64,
-) ([]KeyInfo, error) {
+	opts ...Option,
+) (_ []KeyInfo, err error) {
+	ctx, span := enumClientSpan(ctx, resolveOpts(opts), "cluster.keys", addr, sig)
+	defer func() { endSpan(span, err) }()
+
 	body, err := postEnum(ctx, client, addr, KeysPath, EncodeFetchRequest(sig, tenant, start, end, nil))
 	if err != nil {
 		return nil, err
 	}
 
-	return DecodeKeyList(body)
+	keys, err := DecodeKeyList(body)
+	if err != nil {
+		return nil, err
+	}
+
+	span.SetAttributes(attribute.Int("storage.rows", len(keys)))
+
+	return keys, nil
 }
 
-// FetchSide returns a peer's side-store tables for the signal+tenant.
-func FetchSide(ctx context.Context, client *http.Client, addr string, sig signal.Signal, tenant string) (map[string][]byte, error) {
+// FetchSide returns a peer's side-store tables for the signal+tenant. Without [WithTracerProvider]
+// its spans report through a no-op tracer.
+func FetchSide(
+	ctx context.Context, client *http.Client, addr string, sig signal.Signal, tenant string, opts ...Option,
+) (_ map[string][]byte, err error) {
+	ctx, span := enumClientSpan(ctx, resolveOpts(opts), "cluster.side", addr, sig)
+	defer func() { endSpan(span, err) }()
+
 	body, err := postEnum(ctx, client, addr, SidePath, EncodeFetchRequest(sig, tenant, 0, 0, nil))
 	if err != nil {
 		return nil, err
 	}
 
-	return DecodeSideTables(body)
+	tables, err := DecodeSideTables(body)
+	if err != nil {
+		return nil, err
+	}
+
+	span.SetAttributes(attribute.Int("storage.rows", len(tables)))
+
+	return tables, nil
+}
+
+// enumClientSpan opens the client-side span for one enumeration/resolution RPC to a peer. A nil o
+// uses a no-op observability handle, so an unconfigured caller pays nothing.
+func enumClientSpan(ctx context.Context, o *obs.Obs, name, addr string, sig signal.Signal) (context.Context, trace.Span) {
+	if o == nil {
+		o = obs.NewNop()
+	}
+
+	//nolint:spancheck // the caller ends the returned span via endSpan.
+	return o.Tracer.Start(ctx, name, trace.WithAttributes(
+		attribute.String("storage.rpc.peer", addr),
+		attribute.String("storage.signal", sig.String()),
+	))
 }
 
 func postEnum(ctx context.Context, client *http.Client, addr, path string, payload []byte) ([]byte, error) {

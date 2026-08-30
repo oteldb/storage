@@ -22,11 +22,13 @@ import (
 
 	"github.com/go-faster/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
 	"github.com/oteldb/storage/cluster/ring"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/reliability"
 	"github.com/oteldb/storage/signal"
 )
@@ -67,6 +69,11 @@ type Config struct {
 	Logger *zap.Logger
 	// DialTimeout bounds the initial etcd connection. Zero ⇒ 5s.
 	DialTimeout time.Duration
+	// TracerProvider is the OTel tracer provider the routed RPCs report their spans through. Nil ⇒
+	// the noop provider, so a Router built without one spans and costs nothing. This is the public
+	// type an embedder already has; the Router resolves it into the library's internal
+	// observability handle itself.
+	TracerProvider trace.TracerProvider
 }
 
 // Router resolves shard placement from a live ring view and carries the routed RPCs.
@@ -75,11 +82,13 @@ type Router struct {
 	membership *etcd.Membership
 	httpc      *http.Client
 
-	rf        int
-	shards    int
-	placement func(signal.TenantID) Placement
-	retry     reliability.RetryConfig
-	lg        *zap.Logger
+	rf          int
+	shards      int
+	placement   func(signal.TenantID) Placement
+	retry       reliability.RetryConfig
+	lg          *zap.Logger
+	obs         *obs.Obs         // this package's own hedge/failover spans
+	clusterOpts []cluster.Option // reused on every cluster.* client call, resolved once here
 }
 
 // Open connects to etcd and starts following the cluster's membership. The Router registers
@@ -133,15 +142,22 @@ func Open(ctx context.Context, cfg Config) (*Router, error) {
 		lg = zap.NewNop()
 	}
 
+	o, err := obs.New(obs.Config{TracerProvider: cfg.TracerProvider})
+	if err != nil { // a TracerProvider-only Config never errors; guard rather than propagate a panic
+		o = obs.NewNop()
+	}
+
 	return &Router{
-		client:     client,
-		membership: mship,
-		httpc:      httpc,
-		rf:         rf,
-		shards:     cluster.ShardCount(cfg.ShardsPerTenant),
-		placement:  cfg.Placement,
-		retry:      rc,
-		lg:         lg,
+		client:      client,
+		membership:  mship,
+		httpc:       httpc,
+		rf:          rf,
+		shards:      cluster.ShardCount(cfg.ShardsPerTenant),
+		placement:   cfg.Placement,
+		retry:       rc,
+		lg:          lg,
+		obs:         o,
+		clusterOpts: []cluster.Option{cluster.WithTracerProvider(cfg.TracerProvider)},
 	}, nil
 }
 

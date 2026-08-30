@@ -3,6 +3,8 @@ package router
 import (
 	"context"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -20,14 +22,15 @@ func (r *Router) Series(
 ) ([]signal.Series, error) {
 	eq := fetch.EqualitySpecs(matchers)
 
-	return hedgeOwners(ctx, r, shardKey, func(ctx context.Context, addr string) ([]signal.Series, error) {
-		series, err := cluster.FetchSeries(ctx, r.httpc, addr, sig, string(shardKey), start, end, eq)
-		if err != nil {
-			return nil, err
-		}
+	return hedgeOwners(ctx, r, "cluster.series.hedge", shardKey,
+		func(ctx context.Context, addr string) ([]signal.Series, error) {
+			series, err := cluster.FetchSeries(ctx, r.httpc, addr, sig, string(shardKey), start, end, eq, r.clusterOpts...)
+			if err != nil {
+				return nil, err
+			}
 
-		return fetch.FilterSeries(series, matchers), nil
-	})
+			return fetch.FilterSeries(series, matchers), nil
+		}, attribute.String("storage.signal", sig.String()))
 }
 
 // Keys lists one shard's distinct record-attribute keys within the window, with the scope(s) each
@@ -36,9 +39,10 @@ func (r *Router) Series(
 func (r *Router) Keys(
 	ctx context.Context, sig signal.Signal, shardKey signal.TenantID, start, end int64,
 ) ([]cluster.KeyInfo, error) {
-	return hedgeOwners(ctx, r, shardKey, func(ctx context.Context, addr string) ([]cluster.KeyInfo, error) {
-		return cluster.FetchKeys(ctx, r.httpc, addr, sig, string(shardKey), start, end)
-	})
+	return hedgeOwners(ctx, r, "cluster.keys.hedge", shardKey,
+		func(ctx context.Context, addr string) ([]cluster.KeyInfo, error) {
+			return cluster.FetchKeys(ctx, r.httpc, addr, sig, string(shardKey), start, end, r.clusterOpts...)
+		}, attribute.String("storage.signal", sig.String()))
 }
 
 // Side returns one shard's side-store tables (the profile symbol store, for stack resolution),
@@ -46,7 +50,8 @@ func (r *Router) Keys(
 func (r *Router) Side(
 	ctx context.Context, sig signal.Signal, shardKey signal.TenantID,
 ) (map[string][]byte, error) {
-	return hedgeOwners(ctx, r, shardKey, func(ctx context.Context, addr string) (map[string][]byte, error) {
-		return cluster.FetchSide(ctx, r.httpc, addr, sig, string(shardKey))
-	})
+	return hedgeOwners(ctx, r, "cluster.side.hedge", shardKey,
+		func(ctx context.Context, addr string) (map[string][]byte, error) {
+			return cluster.FetchSide(ctx, r.httpc, addr, sig, string(shardKey), r.clusterOpts...)
+		}, attribute.String("storage.signal", sig.String()))
 }

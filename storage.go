@@ -17,6 +17,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/obs"
@@ -75,6 +76,11 @@ type Storage struct {
 
 	obs *obs.Obs // injected logging/tracing/metrics (no-op by default); never nil after Open
 
+	// clusterOpts wraps opts.TracerProvider into cluster.Option once, so every cluster.* RPC call
+	// (client and handler mounts) reuses one resolved observability handle instead of re-resolving
+	// a tracer per call. cluster's exported functions cannot take *obs.Obs directly — it is internal.
+	clusterOpts []cluster.Option
+
 	stopCh chan struct{}  // closed by Close to stop the maintenance loop
 	wg     sync.WaitGroup // tracks the maintenance goroutine
 
@@ -129,6 +135,7 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	}
 
 	s.obs = observer
+	s.clusterOpts = []cluster.Option{cluster.WithTracerProvider(o.TracerProvider)}
 
 	// Meter the backend only when a meter is configured, so the default path is the bare backend.
 	if o.MeterProvider != nil {
