@@ -57,13 +57,15 @@ func (h *head) grow(n int64) {
 	h.bytes += n
 }
 
-// age is how long the head has been accumulating since its last flush (0 when empty).
+// age is how long the head has been accumulating since its last flush. 0 is reserved for an empty
+// head, so a live one floors at a tick: a coarse clock (Windows moves in ~15ms steps) otherwise
+// reports a head that has just taken its first bytes as having none.
 func (h *head) age() time.Duration {
 	if h.bytes == 0 || h.since.IsZero() {
 		return 0
 	}
 
-	return time.Since(h.since)
+	return max(time.Since(h.since), time.Nanosecond)
 }
 
 func newHead(schema *Schema) *head {
