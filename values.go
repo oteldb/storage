@@ -31,7 +31,7 @@ type ValuesRequest struct {
 // overlap the window contributes its whole dictionary, so a value occurring only outside the window
 // may be returned (consistent with the fetch contract, and harmless for autocomplete). Empty values
 // are omitted; Limit truncates the sorted union to its lexicographically smallest values without
-// signalling that it did. Numeric columns are not enumerable — a signal's numeric enums (span kind,
+// signaling that it did. Numeric columns are not enumerable — a signal's numeric enums (span kind,
 // status code) are a static set the caller already knows.
 //
 // In cluster mode it serves each shard locally when this node owns it, else from an owner (hedged),

@@ -73,7 +73,10 @@ func TestValuesHandlerRejectsGET(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	resp, err := srv.Client().Get(srv.URL + cluster.ValuesPath)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+cluster.ValuesPath, http.NoBody)
+	require.NoError(t, err)
+
+	resp, err := srv.Client().Do(req)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)

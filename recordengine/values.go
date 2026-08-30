@@ -34,7 +34,7 @@ type ValuesRequest struct {
 // a part whose bounds overlap the window contributes its whole dictionary, so a value that occurs
 // only outside the window may be returned. That matches the fetch contract and is what tag/label
 // autocomplete wants. Empty values are omitted. Limit truncates the sorted union, so the result is
-// the lexicographically smallest Limit values — truncation is not otherwise signalled.
+// the lexicographically smallest Limit values — truncation is not otherwise signaled.
 //
 // Attribute values are the canonical text projection ([signal.Value.AppendText]), the same form the
 // matching layer compares against. Safe for concurrent use.
