@@ -2,6 +2,7 @@ package recordengine
 
 import (
 	"math"
+	"time"
 
 	"github.com/oteldb/storage/index/postings"
 	"github.com/oteldb/storage/index/series"
@@ -40,6 +41,31 @@ type head struct {
 	// stay fully resident (and the flush builds a second copy from them) until the part is published,
 	// so they belong to the in-flight measure — see [head.inFlightBytes].
 	detachedBytes int64
+	// since is when the head took its first bytes after the last flush (zero while empty). It is the
+	// only wall-clock the head keeps: record timestamps are data time, which backfill makes unusable
+	// as a measure of how long data has been sitting unflushed.
+	since time.Time
+}
+
+// grow accounts n newly buffered bytes, stamping the head's start when it takes its first bytes
+// since the last flush.
+func (h *head) grow(n int64) {
+	if h.bytes == 0 {
+		h.since = time.Now()
+	}
+
+	h.bytes += n
+}
+
+// age is how long the head has been accumulating since its last flush. 0 is reserved for an empty
+// head, so a live one floors at a tick: a coarse clock (Windows moves in ~15ms steps) otherwise
+// reports a head that has just taken its first bytes as having none.
+func (h *head) age() time.Duration {
+	if h.bytes == 0 || h.since.IsZero() {
+		return 0
+	}
+
+	return max(time.Since(h.since), time.Nanosecond)
 }
 
 func newHead(schema *Schema) *head {
@@ -194,7 +220,7 @@ func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow, maxBytes int64
 	}
 
 	buf.appendClone(r)
-	h.bytes += recByteSize(r)
+	h.grow(recByteSize(r))
 
 	if !seen || r.ts > streamNewest {
 		h.streamNewest[id] = r.ts
@@ -450,4 +476,7 @@ func (h *head) recountBytes() {
 	}
 
 	h.bytes = n
+	if h.bytes == 0 {
+		h.since = time.Time{}
+	}
 }

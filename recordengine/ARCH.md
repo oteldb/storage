@@ -63,7 +63,8 @@ enter; the flush cap and the tiering target bound the disk.
 ### Merge shape and forcing (`mergeshape.go`)
 
 `Engine.MergeShape` reports the selector's inputs (fields in `ADMIN.md`), because a no-op merge is
-otherwise indistinguishable from an idle engine. This engine has **no idle waiver**: two parts in
+otherwise indistinguishable from an idle engine. `MergeShape.Bytes` sums the parts' manifest sizes
+(no backend stat calls), so the same snapshot separates parts that grew from a merge that stopped. This engine has **no idle waiver**: two parts in
 different tiers of one bucket are a *permanent* fixed point, and `MergeOptions.Force` is the only way
 out. It takes a bucket's unsealed parts smallest-first whatever their tiers, still truncated at the
 cumulative-bytes cap and still confined to one bucket — the tier rule is waived, the memory bound is
@@ -256,6 +257,10 @@ columns built from them — live until the part is published, so their size is p
 cleared at the publish or handed back by `head.reattach` on a failed flush, never both. Otherwise the
 measure would read zero for the whole duration of a slow flush and `MaxInFlightBytes` would admit a
 second full head on top of the one still being written out.
+
+**How long it has been waiting** is `head.since`, stamped when the head takes its first bytes after a
+flush and cleared by `head.detach` (`Stats.HeadAge`). Wall time, not record timestamps: backfill puts
+arbitrarily old records in a brand-new head, so data time cannot say how long a flush has stalled.
 
 **Stream identity sits outside that measure:** `Stats.IdentityBytes` reports the symbol table, stream
 index, postings and per-stream watermarks on their own, since a flush drains records but not identities

@@ -50,7 +50,7 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 		zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
 		zap.Int64("retain_from", retainFrom), zap.Bool("force", opts.Force))
 
-	compacted, err := e.merge(ctx, opts)
+	res, err := e.merge(ctx, opts)
 	if err != nil {
 		span.RecordError(err)
 		log.Error("merge failed",
@@ -59,12 +59,14 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 		return err
 	}
 
-	if compacted > 0 {
-		span.SetAttributes(attribute.Int("storage.merge.parts_in", compacted))
-		e.cfg.Obs.Merge.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(compacted))
+	if res.parts > 0 {
+		span.SetAttributes(attribute.Int("storage.merge.parts_in", res.parts),
+			attribute.Int64("storage.merge.bytes_out", res.bytesOut))
+		e.cfg.Obs.Merge.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(res.parts), res.bytesIn, res.bytesOut)
 		log.Debug("merged parts",
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
-			zap.Int("parts_in", compacted), zap.Duration("took", time.Since(startNs)))
+			zap.Int("parts_in", res.parts), zap.Int64("bytes_in", res.bytesIn),
+			zap.Int64("bytes_out", res.bytesOut), zap.Duration("took", time.Since(startNs)))
 	} else {
 		log.Debug("merge no-op (nothing to compact)",
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix))
@@ -81,7 +83,7 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 // small metadata publish runs under it. The old parts are retired (not deleted inline) and reclaimed
 // once their in-flight readers drain. Only the background maintenance task calls merge, so the parts
 // mutation has a single writer.
-func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
+func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, error) {
 	retainFrom := opts.RetainFrom
 
 	e.flushMu.Lock()
@@ -99,7 +101,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	// cutoff is dropped whole rather than rewritten into nothing.
 	src, dropped, err := e.dropExpired(ctx, src, retainFrom)
 	if err != nil {
-		return 0, err
+		return mergeResult{}, err
 	}
 
 	selected := selectMergeParts(src, retainFrom, capBytes, opts.Force)
@@ -117,7 +119,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 
 		e.reclaimRetired(ctx) // nothing to compact, but still sweep pending deletions
 
-		return dropped, nil
+		return mergeResult{parts: dropped}, nil
 	}
 
 	start := minInt64
@@ -128,9 +130,11 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 	// Build (lock-free): compact the selected parts into bounded output part(s), reading them back and
 	// unioning the side-store sidecars. The selected parts stay live (not retired) until publish, so
 	// they cannot be reclaimed underneath this read.
+	bytesIn := partsBytes(selected)
+
 	newParts, err := e.compactParts(ctx, selected, start, capBytes)
 	if err != nil {
-		return dropped, err
+		return mergeResult{parts: dropped}, err
 	}
 
 	// Publish (under lock): swap the selected parts for the merged one(s) copy-on-write (keeping every
@@ -153,7 +157,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 		e.parts = committed
 		e.mu.Unlock()
 
-		return dropped + len(selected), err
+		return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, err
 	}
 
 	e.retireLocked(selected)
@@ -168,7 +172,25 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (int, error) {
 
 	e.reclaimRetired(ctx)
 
-	return dropped + len(selected), nil
+	return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, nil
+}
+
+// mergeResult is what one merge moved: the source parts it compacted (including those retention
+// dropped whole) and the bytes it read and wrote. bytesOut over bytesIn is the merge's write
+// amplification, which no part count shows.
+type mergeResult struct {
+	parts             int
+	bytesIn, bytesOut int64
+}
+
+// partsBytes sums the on-disk size of ps.
+func partsBytes(ps []*part) int64 {
+	var n int64
+	for _, p := range ps {
+		n += p.sizeBytes()
+	}
+
+	return n
 }
 
 // dropExpired retires every part retention has emptied — one whose newest record is already older
@@ -410,7 +432,7 @@ func (e *Engine) writeMergedPart(ctx context.Context, src []*part, f *flushColum
 // Close flushes any buffered records to a part and closes the WAL. It does not stop a background
 // loop — the owner ([storage.Storage]) does that before calling Close.
 func (e *Engine) Close(ctx context.Context) error {
-	if _, err := e.flush(ctx); err != nil {
+	if _, _, err := e.flush(ctx); err != nil {
 		return err
 	}
 

@@ -10,6 +10,9 @@ type MergeShape struct {
 	Parts   int
 	Sealed  int
 	Backlog int
+	// Bytes is what the flushed parts occupy on disk. Divided by Parts it is the average part size,
+	// which is what says whether a rising part count is a merge that stopped or an ingest that grew.
+	Bytes int64
 	// Candidates is how many parts the next size-driven merge would select right now. 0 with a
 	// non-zero Backlog is the stuck state: parts remain mergeable but no run of them qualifies.
 	Candidates int
@@ -38,8 +41,14 @@ func (e *Engine) MergeShape() MergeShape {
 	idle := int(e.idleMerges.Load())
 	sealedN, backlog, bestM := mergeShape(src, capBytes)
 
+	var bytes int64
+	for _, p := range src {
+		bytes += p.sizeBytes()
+	}
+
 	return MergeShape{
 		Parts:          len(src),
+		Bytes:          bytes,
 		Sealed:         sealedN,
 		Backlog:        backlog,
 		Candidates:     len(pickMergeRun(src, capBytes, idle)),

@@ -49,9 +49,12 @@ type Policy struct {
 	Rand func() float64
 
 	// Observability hooks (all optional). attempt is 0-based; attempt 0 is the first try.
-	OnAttempt func(attempt int)                                // every launch (incl. the first)
-	OnRetry   func(attempt int, err error, wait time.Duration) // before a sequential retry waits
-	OnHedge   func(attempt int)                                // when a hedged attempt is launched (attempt ≥ 1)
+	OnRetry func(attempt int, err error, wait time.Duration) // before a sequential retry waits
+	OnHedge func(attempt int)                                // when a hedged attempt is launched (attempt ≥ 1)
+	// OnResult fires once per attempt, when it finishes, with the error it returned (nil ⇒ it
+	// succeeded). A launch hook cannot say how the attempt ended, which is the only thing an error
+	// rate can be computed from; a hedged loser reports the cancellation that stopped it.
+	OnResult func(attempt int, err error)
 }
 
 func (p Policy) attempts() int {
@@ -131,11 +134,11 @@ func Do[T any](ctx context.Context, p Policy, fn func(context.Context) (T, error
 			}
 		}
 
-		if p.OnAttempt != nil {
-			p.OnAttempt(i)
+		v, err := runOne(ctx, p.PerTryTimeout, fn)
+		if p.OnResult != nil {
+			p.OnResult(i, err)
 		}
 
-		v, err := runOne(ctx, p.PerTryTimeout, fn)
 		if err == nil {
 			return v, nil
 		}
@@ -191,12 +194,12 @@ func Hedge[T any](ctx context.Context, p Policy, thunks []func(context.Context) 
 			p.OnHedge(i)
 		}
 
-		if p.OnAttempt != nil {
-			p.OnAttempt(i)
-		}
-
 		go func() {
 			v, err := runOne(ctx, p.PerTryTimeout, thunks[i])
+			if p.OnResult != nil {
+				p.OnResult(i, err)
+			}
+
 			done <- res{v, err}
 		}()
 	}

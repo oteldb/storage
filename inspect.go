@@ -2,6 +2,7 @@ package storage
 
 import (
 	"sort"
+	"time"
 
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/recordengine"
@@ -44,6 +45,10 @@ type SignalStats struct {
 	HeadItems int64
 	// HeadBytes is the head's buffered bytes — the in-flight memory measure a flush drains.
 	HeadBytes int64
+	// HeadAge is how long the head has been accumulating since its last flush (0 when empty) — the
+	// flush lag. It is wall clock, not data time: a backfilled timestamp says nothing about how
+	// long the head has held the data.
+	HeadAge time.Duration
 	// IdentityBytes is the resident bytes of this engine's identity state: the symbol table, the
 	// series/stream index, the postings lists and the per-series out-of-order watermarks. A flush
 	// does **not** drain it — identities outlive their data — so it is reported separately from
@@ -203,6 +208,7 @@ func (s *Storage) Inspect() StoreStats {
 		ts := tenantStats(tid)
 		ts.Signals = append(ts.Signals, SignalStats{
 			Signal: signal.Metric, Series: es.Series, HeadItems: es.HeadSamples, HeadBytes: es.HeadBytes,
+			HeadAge:       es.HeadAge,
 			IdentityBytes: es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
 			MergeRunning: eng.MergeRunning(),
 			SealedParts:  sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
@@ -228,6 +234,7 @@ func (s *Storage) Inspect() StoreStats {
 			ts := tenantStats(tid)
 			ts.Signals = append(ts.Signals, SignalStats{
 				Signal: sig, Series: es.Streams, HeadItems: es.HeadRecords, HeadBytes: es.HeadBytes,
+				HeadAge:       es.HeadAge,
 				IdentityBytes: es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
 				MergeRunning: eng.MergeRunning(),
 				SealedParts:  sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,

@@ -88,7 +88,7 @@ func (s *Storage) writePolicy(ctx context.Context, op string) retry.Policy {
 
 // bindPolicyObs attaches the trace-correlated log + metric hooks to a policy for the given op.
 func (s *Storage) bindPolicyObs(ctx context.Context, op string, p *retry.Policy) {
-	p.OnAttempt = func(int) { s.obs.RPC.Attempt(ctx, op) }
+	p.OnResult = func(_ int, err error) { s.obs.RPC.Attempt(ctx, op, rpcResult(err)) }
 	p.OnRetry = func(attempt int, err error, wait time.Duration) {
 		s.obs.RPC.Retry(ctx, op)
 		s.obs.Logger(ctx).Debug("rpc retry",
@@ -97,6 +97,23 @@ func (s *Storage) bindPolicyObs(ctx context.Context, op string, p *retry.Policy)
 	p.OnHedge = func(attempt int) {
 		s.obs.RPC.Hedge(ctx, op)
 		s.obs.Logger(ctx).Debug("rpc hedge", zap.String("op", op), zap.Int("attempt", attempt))
+	}
+}
+
+// rpcResult labels how one transport attempt ended, mirroring the result vocabulary of
+// storage.backend.ops. A per-attempt deadline and a caller that went away are separated from a
+// plain failure because they say different things: the first is the peer being slow, the second is
+// the query above losing interest, and neither is the link being broken.
+func rpcResult(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	default:
+		return "error"
 	}
 }
 

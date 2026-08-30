@@ -36,6 +36,7 @@ type Obs struct {
 	Log       *zap.Logger
 	Tracer    trace.Tracer
 	Admission *Admission
+	Head      *Head
 	Flush     *Flush
 	Merge     *Merge
 	Parts     *Parts
@@ -77,6 +78,11 @@ func New(cfg Config) (*Obs, error) {
 		return nil, err
 	}
 
+	head, err := newHead(meter)
+	if err != nil {
+		return nil, err
+	}
+
 	backend, err := newBackend(meter)
 	if err != nil {
 		return nil, err
@@ -111,6 +117,7 @@ func New(cfg Config) (*Obs, error) {
 		Log:       log,
 		Tracer:    tp.Tracer(scope),
 		Admission: adm,
+		Head:      head,
 		Flush:     flush,
 		Merge:     merge,
 		Parts:     parts,

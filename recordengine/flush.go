@@ -3,6 +3,7 @@ package recordengine
 import (
 	"context"
 	"slices"
+	"time"
 
 	"github.com/go-faster/errors"
 
@@ -160,6 +161,7 @@ func (h *head) detach() (map[signal.SeriesID]*recordCols, int64) {
 	detached, bytes := h.records, h.bytes
 	h.records = make(map[signal.SeriesID]*recordCols)
 	h.bytes = 0
+	h.since = time.Time{}
 	// The detached buffers are still resident: keep their bytes in the in-flight measure until the
 	// part is published ([head.releaseDetached]) or they are folded back in ([head.reattach]).
 	h.detachedBytes = bytes
@@ -191,7 +193,7 @@ func (h *head) reattach(detached map[signal.SeriesID]*recordCols, bytes int64) {
 
 	// The bytes move back from the detached side of the measure to the live one; counting them in
 	// both would permanently inflate the in-flight total.
-	h.bytes += bytes
+	h.grow(bytes)
 	h.detachedBytes = 0
 }
 

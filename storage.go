@@ -1341,6 +1341,11 @@ func (s *Storage) maintain(ctx context.Context) {
 		zap.Int("metric_tenants", len(metricEngines)), zap.Int("log_tenants", len(logEngines)),
 		zap.Int("trace_tenants", len(traceEngines)), zap.Int("profile_tenants", len(profileEngines)))
 
+	// Before the flushes, not after: this is the cycle's high-water mark for everything the heads
+	// hold. Published after the drain, the gauges would report a head that is empty by construction
+	// on a healthy node and say nothing about how full it got between cycles.
+	s.recordHeadShape(ctx)
+
 	// Compaction ownership is per-tenant and shared across signals, so reconcile it once over the
 	// union of all signals' tenants (reconciling per-signal would have each release the others'
 	// claims). nil ⇒ single-node: own everything.
@@ -1543,11 +1548,11 @@ func (s *Storage) maintain(ctx context.Context) {
 // this cadence shows. Summed over tenants, tagged by signal (tenant ids are unbounded; per-tenant
 // detail is [Storage.Inspect]).
 func (s *Storage) recordPartShape(ctx context.Context) {
-	type shape struct{ total, sealed, backlog, candidates, capBytes int64 }
+	type shape struct{ total, sealed, backlog, candidates, capBytes, bytes int64 }
 
 	shapes := make(map[signal.Signal]*shape, 4)
 
-	add := func(sig signal.Signal, total, sealed, backlog, candidates, capBytes int64) {
+	add := func(sig signal.Signal, total, sealed, backlog, candidates, capBytes, bytes int64) {
 		sh, ok := shapes[sig]
 		if !ok {
 			sh = &shape{}
@@ -1558,6 +1563,7 @@ func (s *Storage) recordPartShape(ctx context.Context) {
 		sh.sealed += sealed
 		sh.backlog += backlog
 		sh.candidates += candidates
+		sh.bytes += bytes
 		// The cap is a per-engine threshold, not a quantity: the largest in effect is the one that
 		// explains the sealed counts, and summing it would be meaningless.
 		sh.capBytes = max(sh.capBytes, capBytes)
@@ -1565,22 +1571,87 @@ func (s *Storage) recordPartShape(ctx context.Context) {
 
 	for _, eng := range s.engineSnapshotByTenant() {
 		m := eng.MergeShape()
-		add(signal.Metric, int64(m.Parts), int64(m.Sealed), int64(m.Backlog), int64(m.Candidates), m.CapBytes)
+		add(signal.Metric, int64(m.Parts), int64(m.Sealed), int64(m.Backlog), int64(m.Candidates), m.CapBytes, m.Bytes)
 	}
 
-	for sig, engines := range map[signal.Signal]map[signal.TenantID]*recordengine.Engine{
-		signal.Log:     s.logEngineSnapshotByTenant(),
-		signal.Trace:   s.traceEngineSnapshotByTenant(),
-		signal.Profile: s.profileEngineSnapshotByTenant(),
-	} {
+	for sig, engines := range s.recordEnginesBySignal() {
 		for _, eng := range engines {
 			m := eng.MergeShape()
-			add(sig, int64(m.Parts), int64(m.Sealed), int64(m.Backlog), int64(m.Candidates), m.CapBytes)
+			add(sig, int64(m.Parts), int64(m.Sealed), int64(m.Backlog), int64(m.Candidates), m.CapBytes, m.Bytes)
 		}
 	}
 
 	for sig, sh := range shapes {
-		s.obs.Parts.Record(ctx, sig.String(), sh.total, sh.sealed, sh.backlog, sh.candidates, sh.capBytes)
+		s.obs.Parts.Record(ctx, sig.String(), sh.total, sh.sealed, sh.backlog, sh.candidates, sh.capBytes, sh.bytes)
+	}
+}
+
+// recordHeadShape publishes the unflushed side that recordPartShape does not reach: what each
+// signal's heads hold and how long they have held it, plus the WAL segments still backing them.
+// Nothing else exposes it — a head that stops draining is invisible in the part gauges until a part
+// finally appears, which is exactly the case where one never does.
+func (s *Storage) recordHeadShape(ctx context.Context) {
+	type shape struct {
+		bytes, items, series, identity int64
+		age                            time.Duration
+		walSegments, walBytes          int64
+	}
+
+	shapes := make(map[signal.Signal]*shape, 4)
+
+	add := func(sig signal.Signal, bytes, items, series, identity int64, age time.Duration) *shape {
+		sh, ok := shapes[sig]
+		if !ok {
+			sh = &shape{}
+			shapes[sig] = sh
+		}
+
+		sh.bytes += bytes
+		sh.items += items
+		sh.series += series
+		sh.identity += identity
+		// The oldest head is the flush lag: averaging it would let a freshly drained tenant hide
+		// the one that is stuck.
+		sh.age = max(sh.age, age)
+
+		return sh
+	}
+
+	for _, eng := range s.engineSnapshotByTenant() {
+		st := eng.Stats()
+		sh := add(signal.Metric, st.HeadBytes, st.HeadSamples, st.Series, st.IdentityBytes, st.HeadAge)
+
+		if segments, bytes, _, ok := eng.WALState(); ok {
+			sh.walSegments += int64(segments)
+			sh.walBytes += bytes
+		}
+	}
+
+	for sig, engines := range s.recordEnginesBySignal() {
+		for _, eng := range engines {
+			st := eng.Stats()
+			sh := add(sig, st.HeadBytes, st.HeadRecords, st.Streams, st.IdentityBytes, st.HeadAge)
+
+			if segments, bytes, _, ok := eng.WALState(); ok {
+				sh.walSegments += int64(segments)
+				sh.walBytes += bytes
+			}
+		}
+	}
+
+	for sig, sh := range shapes {
+		name := sig.String()
+		s.obs.Head.Record(ctx, name, sh.bytes, sh.items, sh.series, sh.identity, sh.age)
+		s.obs.WAL.Record(ctx, name, sh.walSegments, sh.walBytes)
+	}
+}
+
+// recordEnginesBySignal snapshots every record engine this node holds, keyed by signal.
+func (s *Storage) recordEnginesBySignal() map[signal.Signal]map[signal.TenantID]*recordengine.Engine {
+	return map[signal.Signal]map[signal.TenantID]*recordengine.Engine{
+		signal.Log:     s.logEngineSnapshotByTenant(),
+		signal.Trace:   s.traceEngineSnapshotByTenant(),
+		signal.Profile: s.profileEngineSnapshotByTenant(),
 	}
 }
 

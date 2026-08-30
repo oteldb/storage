@@ -59,16 +59,23 @@ type Flush struct {
 	total    metric.Int64Counter
 	duration metric.Float64Histogram
 	rows     metric.Int64Histogram
+	bytes    metric.Int64Counter
 }
 
-// Record accounts one flush: the row count written and the wall time dur, for the given signal.
-func (f *Flush) Record(ctx context.Context, sig string, dur time.Duration, rows int64) {
+// Record accounts one flush: the row count and part bytes written, and the wall time dur, for the
+// given signal. bytes is the ingest side of write amplification — what merges rewrite is measured
+// against it.
+func (f *Flush) Record(ctx context.Context, sig string, dur time.Duration, rows, bytes int64) {
 	a := sigAttr(sig)
 	f.total.Add(ctx, 1, a)
 	f.duration.Record(ctx, dur.Seconds(), a)
 
 	if rows > 0 {
 		f.rows.Record(ctx, rows, a)
+	}
+
+	if bytes > 0 {
+		f.bytes.Add(ctx, bytes, a)
 	}
 }
 
@@ -77,16 +84,29 @@ type Merge struct {
 	total    metric.Int64Counter
 	duration metric.Float64Histogram
 	parts    metric.Int64Histogram
+	bytesIn  metric.Int64Counter
+	bytesOut metric.Int64Counter
 }
 
-// Record accounts one merge that compacted partsIn source parts in dur, for the given signal.
-func (m *Merge) Record(ctx context.Context, sig string, dur time.Duration, partsIn int64) {
+// Record accounts one merge that compacted partsIn source parts of bytesIn bytes into bytesOut
+// bytes in dur, for the given signal. The byte pair is what makes write amplification visible:
+// bytesOut against storage.flush.bytes is how many times the engine rewrites what it ingests, and
+// bytesOut/bytesIn is what one merge cycle gains.
+func (m *Merge) Record(ctx context.Context, sig string, dur time.Duration, partsIn, bytesIn, bytesOut int64) {
 	a := sigAttr(sig)
 	m.total.Add(ctx, 1, a)
 	m.duration.Record(ctx, dur.Seconds(), a)
 
 	if partsIn > 0 {
 		m.parts.Record(ctx, partsIn, a)
+	}
+
+	if bytesIn > 0 {
+		m.bytesIn.Add(ctx, bytesIn, a)
+	}
+
+	if bytesOut > 0 {
+		m.bytesOut.Add(ctx, bytesOut, a)
 	}
 }
 
@@ -101,18 +121,20 @@ type Parts struct {
 	backlog    metric.Int64Gauge
 	candidates metric.Int64Gauge
 	capBytes   metric.Int64Gauge
+	bytes      metric.Int64Gauge
 }
 
 // Record publishes one signal's part shape, summed over the tenants this node holds. The values are
 // tagged by signal only: tenant ids are unbounded, and [storage.Storage.Inspect] is the per-tenant
 // surface.
-func (p *Parts) Record(ctx context.Context, sig string, total, sealed, backlog, candidates, capBytes int64) {
+func (p *Parts) Record(ctx context.Context, sig string, total, sealed, backlog, candidates, capBytes, bytes int64) {
 	a := sigAttr(sig)
 	p.total.Record(ctx, total, a)
 	p.sealed.Record(ctx, sealed, a)
 	p.backlog.Record(ctx, backlog, a)
 	p.candidates.Record(ctx, candidates, a)
 	p.capBytes.Record(ctx, capBytes, a)
+	p.bytes.Record(ctx, bytes, a)
 }
 
 // Fetch instruments a fetch over the head ∪ parts.
@@ -181,8 +203,15 @@ func opAttr(op string) metric.MeasurementOption {
 	return metric.WithAttributes(attribute.String("op", op))
 }
 
-// Attempt accounts one transport attempt (including the first) for op.
-func (r *RPC) Attempt(ctx context.Context, op string) { r.attempts.Add(ctx, 1, opAttr(op)) }
+// Attempt accounts one completed transport attempt (including the first) for op, tagged with how it
+// ended: "ok", "timeout" (the per-attempt deadline fired), "canceled" (the caller went away) or
+// "error". It is recorded on completion rather than on launch precisely so the result is known —
+// without it the retry and hedge counters describe reactions to failures the attempt counter never
+// admits to, and no error rate can be computed.
+func (r *RPC) Attempt(ctx context.Context, op, result string) {
+	r.attempts.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("op", op), attribute.String("result", result)))
+}
 
 // Retry accounts one sequential retry for op.
 func (r *RPC) Retry(ctx context.Context, op string) { r.retries.Add(ctx, 1, opAttr(op)) }
@@ -204,7 +233,7 @@ func (r *RPC) Hedge(ctx context.Context, op string) { r.hedges.Add(ctx, 1, opAtt
 func newRPC(m metric.Meter) (*RPC, error) {
 	b := &imb{m: m}
 	r := &RPC{
-		attempts: b.counter("storage.rpc.attempts", "cluster RPC attempts (incl. first)", "{attempt}"),
+		attempts: b.counter("storage.rpc.attempts", "cluster RPC attempts (incl. first), by result", "{attempt}"),
 		retries:  b.counter("storage.rpc.retries", "cluster RPC sequential retries", "{retry}"),
 		hedges:   b.counter("storage.rpc.hedges", "cluster RPC hedged (concurrent) attempts", "{hedge}"),
 		absent:   b.counter("storage.rpc.shard_absent", "shard reads failed over because the owner holds no data", "{read}"),
@@ -232,6 +261,8 @@ type WAL struct {
 	appends   metric.Int64Counter
 	fsyncs    metric.Int64Counter
 	rotations metric.Int64Counter
+	segments  metric.Int64Gauge
+	bytes     metric.Int64Gauge
 }
 
 // Append accounts one WAL record-batch append.
@@ -249,6 +280,8 @@ func newWAL(m metric.Meter) (*WAL, error) {
 		appends:   b.counter("storage.wal.appends", "WAL record-batch appends", "{append}"),
 		fsyncs:    b.counter("storage.wal.fsyncs", "WAL fsyncs", "{fsync}"),
 		rotations: b.counter("storage.wal.rotations", "WAL segment rotations", "{rotation}"),
+		segments:  b.gauge("storage.wal.segments", "WAL segments on disk", "{segment}"),
+		bytes:     b.gauge("storage.wal.bytes", "bytes the WAL segments hold", "By"),
 	}
 
 	return w, b.err
@@ -290,6 +323,17 @@ func newCluster(m metric.Meter) (*Cluster, error) {
 	return c, b.err
 }
 
+func (b *imb) f64gauge(name, desc, unit string) metric.Float64Gauge {
+	if b.err != nil {
+		return nil
+	}
+
+	g, err := b.m.Float64Gauge(name, metric.WithDescription(desc), metric.WithUnit(unit))
+	b.err = err
+
+	return g
+}
+
 func (b *imb) gauge(name, desc, unit string) metric.Int64Gauge {
 	if b.err != nil {
 		return nil
@@ -309,6 +353,7 @@ func newParts(m metric.Meter) (*Parts, error) {
 		backlog:    b.gauge("storage.parts.merge_backlog", "unsealed parts a merge may still take", "{part}"),
 		candidates: b.gauge("storage.parts.merge_candidates", "parts the next merge would select", "{part}"),
 		capBytes:   b.gauge("storage.merge.cap_bytes", "seal threshold in effect for a merged part", "By"),
+		bytes:      b.gauge("storage.parts.bytes", "bytes the flushed parts occupy on disk", "By"),
 	}
 
 	return p, b.err
@@ -321,11 +366,14 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 		total:    b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
 		duration: b.f64hist("storage.flush.duration", "flush wall time"),
 		rows:     b.i64hist("storage.flush.rows", "rows written per flush", "{row}"),
+		bytes:    b.counter("storage.flush.bytes", "part bytes written by flushes", "By"),
 	}
 	merge := &Merge{
 		total:    b.counter("storage.merge.total", "background merges", "{merge}"),
 		duration: b.f64hist("storage.merge.duration", "merge wall time"),
 		parts:    b.i64hist("storage.merge.parts_in", "source parts compacted per merge", "{part}"),
+		bytesIn:  b.counter("storage.merge.bytes_in", "part bytes read by merges", "By"),
+		bytesOut: b.counter("storage.merge.bytes_out", "part bytes written by merges", "By"),
 	}
 	fetch := &Fetch{
 		total:        b.counter("storage.fetch.total", "fetch requests served", "{fetch}"),
@@ -338,6 +386,54 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 	}
 
 	return flush, merge, fetch, b.err
+}
+
+// Head is the unflushed side of the engine, which no storage.parts.* gauge covers: the rows, bytes
+// and streams a flush has yet to make durable, and how long they have been waiting. It is the state
+// flush backpressure and the process' resident memory both live in — a head that stops draining
+// shows here first, and nowhere else until a part finally appears.
+type Head struct {
+	bytes         metric.Int64Gauge
+	items         metric.Int64Gauge
+	series        metric.Int64Gauge
+	identityBytes metric.Int64Gauge
+	age           metric.Float64Gauge
+}
+
+// Record publishes one signal's head, summed over the tenants this node holds (age is the oldest of
+// them — the worst flush lag, not an average that a fresh head would hide). series and
+// identityBytes span the head's all-time identity set, which a flush does not drain: they are the
+// memory that only [storage.Storage] restart or an identity prune returns.
+func (h *Head) Record(ctx context.Context, sig string, bytes, items, series, identityBytes int64, age time.Duration) {
+	a := sigAttr(sig)
+	h.bytes.Record(ctx, bytes, a)
+	h.items.Record(ctx, items, a)
+	h.series.Record(ctx, series, a)
+	h.identityBytes.Record(ctx, identityBytes, a)
+	h.age.Record(ctx, age.Seconds(), a)
+}
+
+func newHead(m metric.Meter) (*Head, error) {
+	b := &imb{m: m}
+	h := &Head{
+		bytes:  b.gauge("storage.head.bytes", "buffered bytes a flush has yet to make durable", "By"),
+		items:  b.gauge("storage.head.items", "samples or records buffered in the head", "{item}"),
+		series: b.gauge("storage.head.series", "distinct series or streams the identity index holds", "{series}"),
+		identityBytes: b.gauge("storage.head.identity_bytes",
+			"resident identity state (symbols, index, postings) — memory a flush does not drain", "By"),
+		age: b.f64gauge("storage.head.age", "how long the head has been accumulating since its last flush", "s"),
+	}
+
+	return h, b.err
+}
+
+// Record publishes a signal's WAL footprint: the segments on disk and the bytes they hold. It is
+// the durability backlog — segments accumulate exactly while flushes are not retiring them, so a
+// rising count is the same stall storage.head.age shows, seen from the disk.
+func (w *WAL) Record(ctx context.Context, sig string, segments, bytes int64) {
+	a := sigAttr(sig)
+	w.segments.Record(ctx, segments, a)
+	w.bytes.Record(ctx, bytes, a)
 }
 
 // Disk instruments the medium's ability to take what the node accepts. A full disk or an exhausted
