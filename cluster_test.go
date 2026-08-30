@@ -29,6 +29,7 @@ import (
 	"github.com/oteldb/storage/query/fetch"
 	qprofile "github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/signal/log"
 	"github.com/oteldb/storage/signal/profile"
 	"github.com/oteldb/storage/tenant"
 )
@@ -784,8 +785,8 @@ func TestClusteredReadFansOutToOwners(t *testing.T) {
 	assert.Len(t, listed, 1)
 }
 
-// TestClusteredLogEnumerationFansOut covers the LogSeries/LogKeys cluster fan-out: a non-owner,
-// holding none of a tenant's log data, serves both enumerations from an owner over HTTP.
+// TestClusteredLogEnumerationFansOut covers the LogSeries/LogKeys/ColumnValues cluster fan-out: a
+// non-owner, holding none of a tenant's log data, serves every enumeration from an owner over HTTP.
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredLogEnumerationFansOut(t *testing.T) {
@@ -837,6 +838,13 @@ func TestClusteredLogEnumerationFansOut(t *testing.T) {
 	assert.Equal(t, KeyScopeResource, got["service.name"], "resource attribute (a stream label)")
 	assert.Equal(t, KeyScopeRecord, got["http.method"], "record attribute served via fan-out")
 	assert.Equal(t, KeyScopeRecord, got["http.status_code"])
+
+	// ColumnValues fans out for both shapes: a fixed column's dictionary and one attribute key's
+	// values, unioned across the tenant's shards.
+	assert.Equal(t, []string{"first", "second"},
+		columnValues(t, nonOwner, ValuesRequest{Signal: signal.Log, Column: log.ColBody}))
+	assert.Equal(t, []string{"v"},
+		columnValues(t, nonOwner, ValuesRequest{Signal: signal.Log, AttrKey: []byte("http.method")}))
 }
 
 // TestInspectClusterSection verifies Inspect populates the cluster view: this node's address, the

@@ -288,13 +288,18 @@ type enumReq struct {
 	matchers []fetch.Matcher
 }
 
-// decodeEnumRequest reads an [EncodeFetchRequest] body and reconstructs the enumeration request.
-func decodeEnumRequest(req *http.Request) (enumReq, error) {
+// readEnumBody reads a POSTed enumeration request body, rejecting any other method.
+func readEnumBody(req *http.Request) ([]byte, error) {
 	if req.Method != http.MethodPost {
-		return enumReq{}, errors.New("method not allowed")
+		return nil, errors.New("method not allowed")
 	}
 
-	body, err := io.ReadAll(req.Body)
+	return io.ReadAll(req.Body)
+}
+
+// decodeEnumRequest reads an [EncodeFetchRequest] body and reconstructs the enumeration request.
+func decodeEnumRequest(req *http.Request) (enumReq, error) {
+	body, err := readEnumBody(req)
 	if err != nil {
 		return enumReq{}, err
 	}

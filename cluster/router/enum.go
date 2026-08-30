@@ -55,3 +55,17 @@ func (r *Router) Side(
 			return cluster.FetchSide(ctx, r.httpc, addr, sig, string(shardKey), r.clusterOpts...)
 		}, attribute.String("storage.signal", sig.String()))
 }
+
+// Values enumerates one shard's distinct values of a byte column — or of one per-record attribute
+// key — within the window, hedged across the shard's owners. r.Tenant is ignored: shardKey names
+// the shard to ask.
+func (r *Router) Values(
+	ctx context.Context, req cluster.ValuesRequest, shardKey signal.TenantID,
+) ([][]byte, error) {
+	req.Tenant = string(shardKey)
+
+	return hedgeOwners(ctx, r, "cluster.values.hedge", shardKey,
+		func(ctx context.Context, addr string) ([][]byte, error) {
+			return cluster.FetchValues(ctx, r.httpc, addr, req, r.clusterOpts...)
+		}, attribute.String("storage.signal", req.Signal.String()))
+}
