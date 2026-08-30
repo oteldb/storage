@@ -77,6 +77,16 @@ func absentOf(absent bool, sig signal.Signal, shardKey signal.TenantID) *absentS
 	return &absentShard{sig: sig, shard: shardKey}
 }
 
+// disclaimedLocally reports whether a local enumeration read gave up the shard. [Storage.shardPlacement]
+// only checks that this node has an engine for the shard, while the local read additionally requires
+// that engine to cover the request's window — a spare that backfilled sealed parts but not the
+// unflushed tail holds the shard and still cannot answer. So the local path can disclaim after
+// placement chose it, and that disclaim is a failover to the other owners exactly like a peer's:
+// never the caller's error.
+func disclaimedLocally(err error) bool {
+	return errors.Is(err, cluster.ErrShardAbsent)
+}
+
 // hedgeOwners races an RPC across a shard's remote owners under the hedged read policy, treating an
 // owner's [cluster.ErrShardAbsent] as no answer rather than as an empty result: the call fails over
 // to the next owner, and returns the zero value only when every owner disclaims the shard (it has no
