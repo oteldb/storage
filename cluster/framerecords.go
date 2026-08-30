@@ -23,6 +23,9 @@ type RecordFrames struct {
 	Emitted int
 	// Shed is how many records the admit valve dropped before framing.
 	Shed int
+	// Counts is how many records each shard's payload carries, so a caller that routes them can
+	// attribute a per-shard outcome to the right number of records.
+	Counts map[signal.TenantID]int
 }
 
 // FrameRecords groups a record signal's streams by shard key and frames each shard's records as a
@@ -34,6 +37,7 @@ type RecordFrames struct {
 func FrameRecords(project RecordProjector, shards int, tenantOf TenantFunc, admit RecordAdmitFunc) RecordFrames {
 	n := ShardCount(shards)
 	byShard := make(map[signal.TenantID][]byte)
+	counts := make(map[signal.TenantID]int)
 
 	var shed int
 
@@ -55,7 +59,8 @@ func FrameRecords(project RecordProjector, shards int, tenantOf TenantFunc, admi
 
 		sk := ShardKeyOf(tid, ShardOf(b.Stream, n), n)
 		byShard[sk] = append(byShard[sk], recordengine.EncodeWAL(b)...)
+		counts[sk] += b.Len()
 	})
 
-	return RecordFrames{Shards: byShard, Emitted: emitted, Shed: shed}
+	return RecordFrames{Shards: byShard, Emitted: emitted, Shed: shed, Counts: counts}
 }

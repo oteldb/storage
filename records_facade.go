@@ -243,6 +243,15 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 		rej.inflight += int64(r.InFlight)
 	}
 
+	keys := make([]signal.TenantID, len(routes))
+	for i, r := range routes {
+		keys[i] = r.key
+	}
+
+	primaryRejected := rej.ooo + rej.cardinality + rej.inflight
+	failed := routeFailures(frames.Counts, keys, errs)
+	s.emitRouted(ctx, sig, int64(emitted-frames.Shed)-primaryRejected-failed, primaryRejected, failed)
+
 	for _, err := range errs { // surface the first error deterministically (by route index)
 		if err != nil {
 			return Accepted{Accepted: int64(emitted) - rej.total(), Rejected: rej.total()}, err

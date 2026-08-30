@@ -294,6 +294,24 @@ func newWAL(m metric.Meter) (*WAL, error) {
 type Cluster struct {
 	selfAbsent metric.Int64Gauge
 	rejoins    metric.Int64Counter
+	routed     metric.Int64Counter
+}
+
+// Routed accounts n points or records this node routed to a shard primary, tagged with the signal
+// and how the routing ended: "accepted" (a primary took them), "rejected" (a primary's admission
+// refused them) or "failed" (the route errored, so nothing was stored).
+//
+// It is recorded on the routing node, not the storing one. storage.ingest.accepted is per storing
+// engine and storage.flush.* per flushing engine, so on a cluster the node that takes a write in,
+// the node that flushes it and the node that ends up holding it are three different nodes, and
+// none of those counters describes what a coordinator routed. A zero n is ignored.
+func (c *Cluster) Routed(ctx context.Context, n int64, sig, result string) {
+	if n <= 0 {
+		return
+	}
+
+	c.routed.Add(ctx, n, metric.WithAttributes(
+		attribute.String("signal", sig), attribute.String("result", result)))
 }
 
 // Record publishes this node's membership standing: absent is whether it is currently missing
@@ -318,6 +336,8 @@ func newCluster(m metric.Meter) (*Cluster, error) {
 			"1 while this node is running but missing from the cluster member set", "{node}"),
 		rejoins: b.counter("storage.cluster.rejoins",
 			"times this node re-registered after losing its membership lease", "{rejoin}"),
+		routed: b.counter("storage.cluster.routed_points",
+			"points and records routed to shard primaries by this node, by result", "{point}"),
 	}
 
 	return c, b.err
