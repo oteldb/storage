@@ -7,8 +7,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-faster/errors"
+	"github.com/go-faster/sdk/zctx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
@@ -550,3 +554,80 @@ func TestSyncProtectsOwnSlotShard(t *testing.T) {
 }
 
 const pruneRounds = 4
+
+// TestClientPeerErrorBody proves a peer's 5xx body reaches the caller's error: without it a
+// peer-side backend failure is invisible on both nodes (issue #431).
+func TestClientPeerErrorBody(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	const reason = "list: open bucket index: permission denied"
+
+	mux := http.NewServeMux()
+	for _, p := range []string{partsync.ListPath, partsync.ObjectPath, partsync.NotifyPath} {
+		mux.HandleFunc(p, func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, reason, http.StatusInternalServerError)
+		})
+	}
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	var c partsync.Client
+
+	_, err := c.List(ctx, addr, "t/logs")
+	require.ErrorContains(t, err, reason)
+	require.ErrorContains(t, err, "500")
+
+	_, err = c.Fetch(ctx, addr, "t/logs/0000000001/manifest")
+	require.ErrorContains(t, err, reason)
+
+	require.ErrorContains(t, c.Notify(ctx, addr, "t/logs"), reason)
+}
+
+// TestClientPeerErrorBodyBounded checks the body prefix in the error is capped, so a peer
+// answering with a huge body cannot blow up the caller's log line.
+func TestClientPeerErrorBodyBounded(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	body := strings.Repeat("x", 1<<20)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, body, http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	var c partsync.Client
+
+	_, err := c.List(ctx, strings.TrimPrefix(srv.URL, "http://"), "t/logs")
+	require.Error(t, err)
+	assert.Less(t, len(err.Error()), 1<<13, "the error must carry a bounded prefix of the body")
+}
+
+// TestListHandlerLogsFailure checks the serving node records its own backend failure instead of
+// leaving the caller as the only witness (issue #431).
+func TestListHandlerLogsFailure(t *testing.T) {
+	t.Parallel()
+	core, logs := observer.New(zap.ErrorLevel)
+	ctx := zctx.Base(context.Background(), zap.New(core))
+
+	be := &listErrBackend{Backend: backend.Memory()}
+
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, partsync.ListPath+"?prefix=t/logs", http.NoBody)
+	rec := httptest.NewRecorder()
+	partsync.ListHandler(be).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.Equal(t, 1, logs.Len())
+	require.Contains(t, logs.All()[0].ContextMap()["error"], "disk on fire")
+}
+
+type listErrBackend struct {
+	backend.Backend
+}
+
+func (*listErrBackend) List(context.Context, string) ([]string, error) {
+	return nil, errors.New("disk on fire")
+}
