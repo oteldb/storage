@@ -32,6 +32,9 @@ type MetricFrames struct {
 	Emitted int
 	// Shed is how many points the admit valve dropped before framing.
 	Shed int
+	// Counts is how many points each shard's payload carries, so a caller that routes them can
+	// attribute a per-shard outcome to the right number of points.
+	Counts map[signal.TenantID]int
 }
 
 // FrameMetrics projects md and groups every point by the shard key it routes to, framing each
@@ -53,6 +56,7 @@ func FrameMetrics(md metric.Metrics, shards int, tenantOf TenantFunc, admit Admi
 
 	n := ShardCount(shards)
 	byShard := make(map[signal.TenantID]*shardWAL)
+	counts := make(map[signal.TenantID]int)
 
 	var shed int
 
@@ -87,6 +91,7 @@ func FrameMetrics(md metric.Metrics, shards int, tenantOf TenantFunc, admit Admi
 			}
 
 			_ = sw.w.WriteSamples(id, b.Ts[i:i+1], b.Values[i:i+1])
+			counts[sk]++
 		}
 	})
 
@@ -95,5 +100,5 @@ func FrameMetrics(md metric.Metrics, shards int, tenantOf TenantFunc, admit Admi
 		frames[sk] = sw.buf.Bytes()
 	}
 
-	return MetricFrames{Shards: frames, Emitted: emitted, Shed: shed}
+	return MetricFrames{Shards: frames, Emitted: emitted, Shed: shed, Counts: counts}
 }

@@ -1416,6 +1416,16 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 		rej.inflight += int64(r.InFlight)
 	}
 
+	keys := make([]signal.TenantID, len(routes))
+	for i, r := range routes {
+		keys[i] = r.key
+	}
+
+	primaryRejected := rej.ooo + rej.cardinality + rej.inflight
+	failed := routeFailures(frames.Counts, keys, errs)
+	s.emitRouted(ctx, signal.Metric,
+		int64(emitted-frames.Shed)-primaryRejected-failed, primaryRejected, failed)
+
 	for _, err := range errs { // surface the first error deterministically (by route index)
 		if err != nil {
 			return Accepted{Accepted: int64(emitted) - rej.total(), Rejected: rej.total()}, err
@@ -1594,4 +1604,38 @@ func (s *Storage) termFor(tid signal.TenantID) func() uint64 {
 		// as any tenure of the shard, and must not be able to supersede one that is.
 		return term
 	}
+}
+
+// Routing outcomes reported by [Storage.emitRouted] on the coordinator side of a clustered write.
+const (
+	routedAccepted = "accepted"
+	routedRejected = "rejected"
+	routedFailed   = "failed"
+)
+
+// emitRouted records what a clustered write routed to shard primaries, split by outcome, on the
+// routing node. It counts only what was actually framed and sent: the origin rate valve sheds
+// before routing and is already covered by storage.ingest.rejected on this same node.
+//
+// It is called once per write (bulk), so it never touches the per-point hot path.
+func (s *Storage) emitRouted(ctx context.Context, sig signal.Signal, accepted, rejected, failed int64) {
+	name := sig.String()
+	c := s.obs.Cluster
+	c.Routed(ctx, accepted, name, routedAccepted)
+	c.Routed(ctx, rejected, name, routedRejected)
+	c.Routed(ctx, failed, name, routedFailed)
+}
+
+// routeFailures sums the points the errored routes carried, so a failed route is attributed the
+// number of points it actually took rather than being counted as accepted.
+func routeFailures(counts map[signal.TenantID]int, keys []signal.TenantID, errs []error) int64 {
+	var failed int64
+
+	for i, err := range errs {
+		if err != nil {
+			failed += int64(counts[keys[i]])
+		}
+	}
+
+	return failed
 }
