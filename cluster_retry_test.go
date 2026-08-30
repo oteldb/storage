@@ -323,3 +323,27 @@ func TestHedgedFetcherSingleAbsentOwnerNotRetried(t *testing.T) {
 	assert.Empty(t, batches)
 	assert.Equal(t, int32(1), absent.calls.Load(), "an absent owner is asked once")
 }
+
+// TestRPCResultLabels pins the vocabulary the attempt counter is tagged with: a per-attempt
+// deadline and a caller that walked away are separated from a broken link, because a dashboard
+// reading storage.rpc.attempts as an error rate must not count either as a failure of the peer.
+func TestRPCResultLabels(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"success", nil, "ok"},
+		{"per-try deadline", context.DeadlineExceeded, "timeout"},
+		{"wrapped deadline", errors.Wrap(context.DeadlineExceeded, "fetch"), "timeout"},
+		{"caller canceled", context.Canceled, "canceled"},
+		{"transport failure", errors.New("connection refused"), "error"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, rpcResult(tt.err))
+		})
+	}
+}

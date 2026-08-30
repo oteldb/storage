@@ -81,6 +81,11 @@ now lives in parts retention can drop at any time.
 `Stats.IdentityBytes`, not `HeadBytes`: a flush drains samples, not identities, so folding them would
 have the size-triggered flush chase a number it cannot lower.
 
+**One wall clock.** `head.since` is stamped when the head takes its first bytes after a flush and
+cleared by `head.detach`, giving `Stats.HeadAge` — how long the buffered data has been waiting. It
+is wall time and not the timestamps in the buffers: backfill puts arbitrarily old data in a
+brand-new head, so data time cannot say how long a flush has been stalled.
+
 ### Publish order: the part's objects first, the bucket index last
 
 The bucket index makes a part durably visible, so writing it is the commit point and a readable part
@@ -382,6 +387,8 @@ oldest → newest and a later part's value wins a duplicate timestamp.
 merge is otherwise indistinguishable from an idle engine, and a store can sit at a part count it will
 never reduce for thousands of cycles with nothing saying so. The cap comes from the last merge rather
 than being derived on demand: deriving it reads free space, and introspection does no I/O.
+`MergeShape.Bytes` sums the parts' manifest sizes (no backend stat calls), so the same snapshot says
+whether a rising part count is parts that grew or a merge that stopped taking them.
 
 ### Streaming both ways (`compactStream`)
 

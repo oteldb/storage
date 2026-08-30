@@ -374,6 +374,10 @@ type Stats struct {
 	Streams     int64 // distinct streams ever seen (index span: head ∪ flushed)
 	HeadRecords int64 // records currently buffered in the head (unflushed)
 	HeadBytes   int64 // buffered record bytes, head + in-flight flush (the in-flight memory measure)
+	// HeadAge is how long the head has been accumulating since its last flush (0 when empty) —
+	// the flush lag, which no data-time field here reports (backfill makes record timestamps
+	// useless as a measure of it).
+	HeadAge time.Duration
 	// IdentityBytes is the resident identity state (symbols + stream index + postings + OOO
 	// watermarks) — memory a flush does not drain, and which no other counter here reports.
 	IdentityBytes int64
@@ -395,6 +399,7 @@ func (e *Engine) Stats() Stats {
 		Streams:       int64(e.head.series.Len()),
 		OutOfSpace:    e.space.Exhausted(),
 		HeadBytes:     e.head.inFlightBytes(),
+		HeadAge:       e.head.age(),
 		IdentityBytes: e.head.identityBytes(),
 		Parts:         len(e.parts),
 		MaxTime:       e.head.newest,
@@ -712,7 +717,7 @@ func (e *Engine) Flush(ctx context.Context) error {
 	log := zctx.From(ctx)
 	log.Debug("flush requested", zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix))
 
-	rows, err := e.flush(ctx)
+	rows, bytes, err := e.flush(ctx)
 	if err != nil {
 		span.RecordError(err)
 		log.Error("flush failed",
@@ -722,11 +727,12 @@ func (e *Engine) Flush(ctx context.Context) error {
 	}
 
 	if rows > 0 {
-		span.SetAttributes(attribute.Int("storage.rows", rows))
-		e.cfg.Obs.Flush.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(rows))
+		span.SetAttributes(attribute.Int("storage.rows", rows), attribute.Int64("storage.flush.bytes", bytes))
+		e.cfg.Obs.Flush.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(rows), bytes)
 		log.Debug("flushed head to part",
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
-			zap.Int("rows", rows), zap.Duration("took", time.Since(startNs)))
+			zap.Int("rows", rows), zap.Int64("bytes", bytes),
+			zap.Duration("took", time.Since(startNs)))
 	} else {
 		log.Debug("flush no-op (empty head)",
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix))
@@ -1209,12 +1215,12 @@ func (p *fetchPlan) releaseParts() {
 // — appends and fetches proceed concurrently — while the head drain, the side-store snapshot, and the
 // metadata publish run under it. Only the background maintenance task (or Close) calls flush, so the
 // parts mutation has a single writer.
-func (e *Engine) flush(ctx context.Context) (int, error) {
+func (e *Engine) flush(ctx context.Context) (rows int, bytes int64, err error) {
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
 
 	if err := e.admitFlush(ctx); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	// Plan (under lock): detach the head's record buffers (keeping them readable via e.flushing so a
@@ -1227,7 +1233,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		e.mu.Unlock()
 		e.reclaimRetired(ctx) // nothing to flush, but still sweep pending deletions
 
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	e.flushing = detached
@@ -1249,7 +1255,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	// read-only here: a concurrent fetch still reads them through e.flushing until the part publishes.
 	f := buildFlushColumns(e.cfg.Schema, detached, e.flushBuf)
 	e.flushBuf = f // reused by the next flush; only this single flusher touches it
-	rows := f.len()
+	rows = f.len()
 
 	// Split the flushed rows into parts of at most MaxPartBytes (a single part when unlimited), so a
 	// long flush interval or a large head cannot produce one oversized part — which would distort the
@@ -1271,12 +1277,12 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		// recompresses. See [Config.MergeCompression].
 		if err := writePart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, sub, idents,
 			compress.AlgorithmNone, 0, e.blooms()); err != nil {
-			return 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
+			return 0, 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
 		}
 
 		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix)
 		if err != nil {
-			return 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
+			return 0, 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
 		}
 
 		p.minTime, p.maxTime = colsTimeRange(sub)
@@ -1285,7 +1291,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		// by id, so every part a split produces must resolve them on its own.
 		if side != nil {
 			if err := writeSidecars(ctx, e.cfg.Backend, prefix, side); err != nil {
-				return 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
+				return 0, 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
 			}
 		}
 
@@ -1306,16 +1312,18 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	e.flushing = nil
 	e.head.releaseDetached() // the buffers are gone with e.flushing: drop them from the in-flight measure
 	e.flushedEpoch++
-	err := e.publishLocked(ctx)
+	err = e.publishLocked(ctx)
 	e.mu.Unlock()
 
+	bytes = partsBytes(newParts)
+
 	if err != nil {
-		return rows, err
+		return rows, bytes, err
 	}
 
 	e.reclaimRetired(ctx)
 
-	return rows, nil
+	return rows, bytes, nil
 }
 
 // abortFlush undoes the plan phase of a flush that failed before publishing a part: the detached

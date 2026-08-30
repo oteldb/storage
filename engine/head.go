@@ -3,6 +3,7 @@ package engine
 import (
 	"cmp"
 	"slices"
+	"time"
 
 	"github.com/oteldb/storage/index/postings"
 	"github.com/oteldb/storage/index/series"
@@ -39,6 +40,29 @@ type head struct {
 	seriesNewest map[signal.SeriesID]int64
 
 	bytes int64 // buffered sample bytes (SampleBytes each); the in-flight memory measure
+	// since is when the head took its first bytes after the last flush (zero while empty). It is
+	// the only wall-clock the head keeps: sample timestamps are data time, which backfill makes
+	// unusable as a measure of how long data has been sitting unflushed.
+	since time.Time
+}
+
+// grow accounts n newly buffered bytes, stamping the head's start when it takes its first bytes
+// since the last flush.
+func (h *head) grow(n int64) {
+	if h.bytes == 0 {
+		h.since = time.Now()
+	}
+
+	h.bytes += n
+}
+
+// age is how long the head has been accumulating since its last flush (0 when empty).
+func (h *head) age() time.Duration {
+	if h.bytes == 0 || h.since.IsZero() {
+		return 0
+	}
+
+	return time.Since(h.since)
 }
 
 type sampleBuf struct {
@@ -204,7 +228,7 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 
 	buf := h.bufFor(id)
 	buf.appendSample(ts, value, 1)
-	h.bytes += SampleBytes
+	h.grow(SampleBytes)
 	h.noteTS(id, ts)
 
 	return id, true, logSeries
@@ -271,7 +295,7 @@ func (h *head) appendByID(
 	}
 
 	buf.appendSample(ts, value, sf)
-	h.bytes += SampleBytes
+	h.grow(SampleBytes)
 	h.noteTS(id, ts)
 
 	return admitted, id, logSeries, s
@@ -330,7 +354,7 @@ func (h *head) appendOverflow(ov signal.Series, ts int64, value, sf float64) (ad
 	}
 
 	buf.appendSample(ts, value, sf)
-	h.bytes += SampleBytes
+	h.grow(SampleBytes)
 	// The sample lands under the overflow identity, so that is the series whose lateness bound it
 	// advances — the shed series never gets one.
 	h.noteTS(oid, ts)
@@ -377,6 +401,9 @@ func (h *head) recountBytes() {
 	}
 
 	h.bytes = n * SampleBytes
+	if h.bytes == 0 {
+		h.since = time.Time{}
+	}
 }
 
 // bufFor returns the (created-on-demand) sample buffer for an already-registered series.
@@ -418,7 +445,7 @@ func (h *head) replaySamples(id signal.SeriesID, ts []int64, values []float64) {
 		}
 	}
 
-	h.bytes += int64(len(ts)) * SampleBytes
+	h.grow(int64(len(ts)) * SampleBytes)
 
 	for _, t := range ts {
 		h.noteTS(id, t)
@@ -440,7 +467,7 @@ func (h *head) replaySamplesSF(id signal.SeriesID, ts []int64, values, sf []floa
 		h.noteTS(id, ts[i])
 	}
 
-	h.bytes += int64(len(ts)) * SampleBytes
+	h.grow(int64(len(ts)) * SampleBytes)
 }
 
 // indexLabels interns and registers every queryable label of the series — resource and
@@ -611,6 +638,7 @@ func (h *head) detach() map[signal.SeriesID]*sampleBuf {
 	detached := h.samples
 	h.samples = make(map[signal.SeriesID]*sampleBuf)
 	h.bytes = 0
+	h.since = time.Time{}
 
 	return detached
 }

@@ -429,6 +429,10 @@ type Stats struct {
 	Series      int64 // distinct series ever seen (index span: head ∪ flushed)
 	HeadSamples int64 // samples currently buffered in the head (unflushed)
 	HeadBytes   int64 // head's buffered sample bytes (the in-flight memory measure)
+	// HeadAge is how long the head has been accumulating since its last flush (0 when empty) —
+	// the flush lag, which no data-time field here reports (backfill makes sample timestamps
+	// useless as a measure of it).
+	HeadAge time.Duration
 	// IdentityBytes is the resident identity state (symbols + series index + postings + OOO
 	// watermarks) — memory a flush does not drain, and which no other counter here reports.
 	IdentityBytes int64
@@ -451,6 +455,7 @@ func (e *Engine) Stats() Stats {
 		Series:        int64(e.head.series.Len()),
 		OutOfSpace:    e.space.Exhausted(),
 		HeadBytes:     e.head.bytes,
+		HeadAge:       e.head.age(),
 		IdentityBytes: e.head.identityBytes(),
 		Parts:         len(e.parts),
 		MaxTime:       e.head.newest,
@@ -1138,7 +1143,7 @@ func (e *Engine) Flush(ctx context.Context) error {
 	log := zctx.From(ctx)
 	log.Debug("flush requested", zap.String("prefix", e.cfg.Prefix))
 
-	rows, err := e.flush(ctx)
+	rows, bytes, err := e.flush(ctx)
 	if err != nil {
 		span.RecordError(err)
 		log.Error("flush failed", zap.String("prefix", e.cfg.Prefix), zap.Error(err))
@@ -1147,10 +1152,10 @@ func (e *Engine) Flush(ctx context.Context) error {
 	}
 
 	if rows > 0 {
-		span.SetAttributes(attribute.Int("storage.rows", rows))
-		e.cfg.Obs.Flush.Record(ctx, metricSignal, time.Since(startNs), int64(rows))
+		span.SetAttributes(attribute.Int("storage.rows", rows), attribute.Int64("storage.flush.bytes", bytes))
+		e.cfg.Obs.Flush.Record(ctx, metricSignal, time.Since(startNs), int64(rows), bytes)
 		log.Debug("flushed head to part",
-			zap.String("prefix", e.cfg.Prefix), zap.Int("rows", rows),
+			zap.String("prefix", e.cfg.Prefix), zap.Int("rows", rows), zap.Int64("bytes", bytes),
 			zap.Duration("took", time.Since(startNs)))
 	} else {
 		log.Debug("flush no-op (empty head)", zap.String("prefix", e.cfg.Prefix))
@@ -1363,12 +1368,12 @@ func (e *Engine) SeriesCount() int {
 // so the part write and read-back happen off the engine lock (appends and fetches proceed), while the
 // head detach and the metadata publish run under it. Only the background maintenance task (or Close)
 // calls flush, so the parts mutation has a single writer.
-func (e *Engine) flush(ctx context.Context) (int, error) {
+func (e *Engine) flush(ctx context.Context) (rows int, bytes int64, err error) {
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
 
 	if err := e.admitFlush(ctx); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	// Plan (under lock): detach the head's sample buffers, keeping them readable via e.flushing so a
@@ -1379,7 +1384,7 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		e.mu.Unlock()
 		e.reclaimRetired(ctx) // nothing to flush, but still sweep pending deletions
 
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	e.flushing = detached
@@ -1396,10 +1401,10 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 		e.flushing = nil
 		e.mu.Unlock()
 
-		return 0, nil
+		return 0, 0, nil
 	}
 
-	rows := len(cols.ts)
+	rows = len(cols.ts)
 
 	// Split the flushed columns into one or more parts, each kept under MaxPartBytes (a single part
 	// when unlimited). Flush writes freshly-ingested data with codec-only framing (no recompression).
@@ -1414,14 +1419,14 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 			compressProfile{}, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
 			e.space.Observe(err)
 
-			return 0, err
+			return 0, 0, err
 		}
 
 		p, err := openPart(ctx, e.cfg.Backend, prefix)
 		if err != nil {
 			e.space.Observe(err)
 
-			return 0, err
+			return 0, 0, err
 		}
 
 		p.minTime, p.maxTime = colsTimeRange(sub)
@@ -1443,16 +1448,18 @@ func (e *Engine) flush(ctx context.Context) (int, error) {
 	// The parts about to be committed supersede every WAL record logged so far, so the watermark
 	// they carry retires that generation and the next head records open a new one.
 	e.flushedEpoch++
-	err := e.publishLocked(ctx)
+	err = e.publishLocked(ctx)
 	e.mu.Unlock()
 
+	bytes = partsBytes(newParts)
+
 	if err != nil {
-		return rows, err
+		return rows, bytes, err
 	}
 
 	e.reclaimRetired(ctx)
 
-	return rows, nil
+	return rows, bytes, nil
 }
 
 // publishLocked persists the engine's part set (the bucket index) and checkpoints the WAL — the
