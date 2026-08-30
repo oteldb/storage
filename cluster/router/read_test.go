@@ -28,6 +28,10 @@ type peer struct {
 	side   map[string][]byte
 	aggs   []engine.NamedAgg
 
+	// records is the record-signal (log/trace) answer, carrying per-record columns. A peer never
+	// receives a request's columnar conditions, so this is deliberately the unfiltered window.
+	records []*fetch.Batch
+
 	// absent makes every endpoint disclaim the shard, the way an owner that holds no data for it
 	// answers.
 	absent bool
@@ -46,14 +50,18 @@ func (p *peer) serve(t *testing.T) string {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle(cluster.ReadPath, cluster.ReadHandler(
-		func(context.Context, string, int64, int64, []fetch.Matcher) ([]*fetch.Batch, error) {
+	fetchFn := func(answer []*fetch.Batch) cluster.FetchFunc {
+		return func(context.Context, string, int64, int64, []fetch.Matcher) ([]*fetch.Batch, error) {
 			if p.absent {
 				return nil, cluster.ErrShardAbsent
 			}
 
-			return batches, nil
-		}, nil, nil, nil))
+			return answer, nil
+		}
+	}
+
+	mux.Handle(cluster.ReadPath, cluster.ReadHandler(
+		fetchFn(batches), fetchFn(p.records), fetchFn(p.records), nil))
 	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(
 		func(context.Context, signal.Signal, string, int64, int64, []fetch.Matcher) ([]signal.Series, error) {
 			if p.absent {
@@ -264,4 +272,39 @@ func TestReadsEmptyOnEmptyRing(t *testing.T) {
 	aggs, err := r.Aggregate(t.Context(), "acme", 0, 10, 0, nil)
 	require.NoError(t, err)
 	assert.Empty(t, aggs)
+}
+
+// TestFetcherAppliesConditions pins trace-by-id over the cluster. Its whole predicate is a columnar
+// condition on the trace id — there are no matchers — and conditions never cross the wire, so a peer
+// answers with every span it holds. Narrowing only by matchers returned that entire window as if it
+// were one trace.
+func TestFetcherAppliesConditions(t *testing.T) {
+	t.Parallel()
+
+	series := svcSeries("api")
+	r := openRouter(t, &peer{records: []*fetch.Batch{{
+		ID:         series.Hash(),
+		Series:     series,
+		Timestamps: []int64{1, 2, 3},
+		Columns: []fetch.NamedColumn{
+			{Name: "trace_id", Bytes: [][]byte{[]byte("aaa"), []byte("bbb"), []byte("aaa")}},
+		},
+	}}})
+
+	want := "aaa"
+	it, err := r.Fetcher(signal.Trace, "acme").Fetch(t.Context(), fetch.Request{
+		Tenant: "acme", Start: 0, End: 10,
+		AllConditions: true,
+		Conditions: []fetch.Condition{{
+			Column: "trace_id",
+			Match:  func(v signal.Value) bool { return string(v.Str()) == want },
+			Equal:  &fetch.EqualMatcher{Name: "trace_id", Value: want},
+		}},
+	})
+	require.NoError(t, err)
+
+	batches, err := fetch.Drain(t.Context(), it)
+	require.NoError(t, err)
+	require.Len(t, batches, 1)
+	assert.Equal(t, []int64{1, 3}, batches[0].Timestamps, "the other trace's span is dropped, not returned")
 }

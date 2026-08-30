@@ -125,3 +125,107 @@ func drainReq(t *testing.T, f fetch.Fetcher, r fetch.Request) []*fetch.Batch {
 
 	return out
 }
+
+// traceIDCondition is the shape [Storage.Trace] and the cluster fan-out build: the whole predicate
+// lives in a column condition, with no matchers at all.
+func traceIDCondition(column, want string) fetch.Condition {
+	return fetch.Condition{
+		Column: column,
+		Match:  func(v signal.Value) bool { return string(v.Str()) == want },
+		Equal:  &fetch.EqualMatcher{Name: column, Value: want},
+	}
+}
+
+func TestFilterAppliesConditions(t *testing.T) {
+	t.Parallel()
+
+	series := signal.Series{Resource: signal.Resource{Attributes: attrs(kv("service.name", "api"))}}
+
+	// A producer that ignored the conditions: three rows of two different traces.
+	superset := func() []*fetch.Batch {
+		return []*fetch.Batch{{
+			ID:         series.Hash(),
+			Series:     series,
+			Timestamps: []int64{1, 2, 3},
+			Columns: []fetch.NamedColumn{
+				{Name: "trace_id", Bytes: [][]byte{[]byte("aaa"), []byte("bbb"), []byte("aaa")}},
+				{Name: "name", Bytes: [][]byte{[]byte("root"), []byte("other"), []byte("child")}},
+			},
+		}}
+	}
+
+	f := fetch.Filter(fetcherFunc(func(context.Context, fetch.Request) (fetch.Iterator, error) {
+		return fetch.NewSliceIterator(superset()), nil
+	}))
+
+	t.Run("keeps only matching rows", func(t *testing.T) {
+		t.Parallel()
+
+		batches := drainReq(t, f, fetch.Request{
+			Conditions:    []fetch.Condition{traceIDCondition("trace_id", "aaa")},
+			AllConditions: true,
+		})
+		require.Len(t, batches, 1)
+
+		b := batches[0]
+		assert.Equal(t, []int64{1, 3}, b.Timestamps)
+
+		names, ok := b.Column("name")
+		require.True(t, ok)
+		assert.Equal(t, [][]byte{[]byte("root"), []byte("child")}, names.Bytes)
+	})
+
+	t.Run("drops a batch no row survives", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Empty(t, drainReq(t, f, fetch.Request{
+			Conditions:    []fetch.Condition{traceIDCondition("trace_id", "zzz")},
+			AllConditions: true,
+		}))
+	})
+}
+
+func TestFilterConditionOnAttribute(t *testing.T) {
+	t.Parallel()
+
+	blob := func(k, v string) []byte {
+		return signal.NewAttributes(kv(k, v)).AppendHashInput(nil)
+	}
+
+	series := signal.Series{Resource: signal.Resource{Attributes: attrs(kv("service.name", "api"))}}
+	f := fetch.Filter(fetcherFunc(func(context.Context, fetch.Request) (fetch.Iterator, error) {
+		return fetch.NewSliceIterator([]*fetch.Batch{{
+			ID:         series.Hash(),
+			Series:     series,
+			Timestamps: []int64{1, 2},
+			Columns: []fetch.NamedColumn{
+				{Name: fetch.AttrsColumn, Bytes: [][]byte{blob("http.method", "GET"), blob("http.method", "POST")}},
+			},
+		}}), nil
+	}))
+
+	batches := drainReq(t, f, fetch.Request{
+		Conditions:    []fetch.Condition{traceIDCondition("http.method", "GET")},
+		AllConditions: true,
+	})
+	require.Len(t, batches, 1)
+	assert.Equal(t, []int64{1}, batches[0].Timestamps)
+}
+
+func TestFilterSecondPass(t *testing.T) {
+	t.Parallel()
+
+	series := signal.Series{Resource: signal.Resource{Attributes: attrs(kv("service.name", "api"))}}
+	f := fetch.Filter(fetcherFunc(func(context.Context, fetch.Request) (fetch.Iterator, error) {
+		return fetch.NewSliceIterator([]*fetch.Batch{
+			{ID: signal.SeriesID{Lo: 1}, Series: series, Timestamps: []int64{1}},
+			{ID: signal.SeriesID{Lo: 2}, Series: series, Timestamps: []int64{2}},
+		}), nil
+	}))
+
+	batches := drainReq(t, f, fetch.Request{
+		SecondPass: func(b *fetch.Batch) bool { return b.ID == signal.SeriesID{Lo: 2} },
+	})
+	require.Len(t, batches, 1)
+	assert.Equal(t, signal.SeriesID{Lo: 2}, batches[0].ID)
+}
