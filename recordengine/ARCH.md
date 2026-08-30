@@ -383,6 +383,21 @@ relies on `Condition.Equal` being byte-identical to `Match` for that column — 
 (resource/scope/record), so an embedder can list and push down record-attribute labels that
 `Series`-based resolution cannot see. It is the enumeration twin of `Engine.Series`.
 
+**Values** need no sidecar: `Engine.ColumnValues` (`values.go`) unions each in-window part's
+**column dictionary** — already the part's distinct value set — with a scan of the unflushed head,
+so tag/label autocomplete costs O(distinct values) instead of decoding every record. The flat
+fallback (`IDWidth == 0`, one entry per row) reads the same way because the accumulator dedups. With
+`ValuesRequest.AttrKey` set the cells are serialized attribute blobs and only that key's value is
+kept: each *distinct blob* is decoded once, which is still far below per-row. Values project through
+`signal.Value.AppendText`, the form the matching layer compares against.
+
+Three contract points the callers depend on: the result is a **superset** for the window (an
+overlapping part contributes its whole dictionary, matching the fetch contract); `Limit` truncates
+the sorted union to its lexicographically smallest values and does not signal that it did; and
+numeric columns are not enumerable — a signal's numeric enums are a static set the caller knows.
+Backend reads happen off the engine lock: the head is drained and the in-window parts acquired under
+it, then released after their dictionaries are read.
+
 The side store is a content-addressed auxiliary store a signal attaches per batch (`Batch.Side`),
 riding the part lifecycle: absorbed into a live accumulator, written as sidecars on flush, **unioned**
 on merge (content addressing makes the union a plain dedup with no id remap), and **restored** into the

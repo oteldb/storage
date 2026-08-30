@@ -25,6 +25,7 @@ type peer struct {
 
 	series []signal.Series
 	keys   []cluster.KeyInfo
+	values [][]byte
 	side   map[string][]byte
 	aggs   []engine.NamedAgg
 
@@ -77,6 +78,14 @@ func (p *peer) serve(t *testing.T) string {
 			}
 
 			return p.keys, nil
+		}))
+	mux.Handle(cluster.ValuesPath, cluster.ValuesHandler(
+		func(context.Context, cluster.ValuesRequest) ([][]byte, error) {
+			if p.absent {
+				return nil, cluster.ErrShardAbsent
+			}
+
+			return p.values, nil
 		}))
 	mux.Handle(cluster.SidePath, cluster.SideHandler(func(context.Context, string) (map[string][]byte, error) {
 		if p.absent {
@@ -183,14 +192,15 @@ func TestSeriesNarrowsAndFailsOver(t *testing.T) {
 	assert.Equal(t, svcSeries("web").Hash(), got[0].Hash())
 }
 
-func TestKeysAndSideFailOver(t *testing.T) {
+func TestEnumerationFailOver(t *testing.T) {
 	t.Parallel()
 
 	r := openRouter(t,
 		&peer{absent: true},
 		&peer{
-			keys: []cluster.KeyInfo{{Key: []byte("http.method"), Scope: 0b101}},
-			side: map[string][]byte{"stacks": []byte("abc")},
+			keys:   []cluster.KeyInfo{{Key: []byte("http.method"), Scope: 0b101}},
+			values: [][]byte{[]byte("GET")},
+			side:   map[string][]byte{"stacks": []byte("abc")},
 		},
 	)
 
@@ -199,6 +209,11 @@ func TestKeysAndSideFailOver(t *testing.T) {
 	require.Len(t, keys, 1)
 	assert.Equal(t, []byte("http.method"), keys[0].Key)
 	assert.Equal(t, uint8(0b101), keys[0].Scope)
+
+	values, err := r.Values(t.Context(),
+		cluster.ValuesRequest{Signal: signal.Log, AttrKey: []byte("http.method")}, "acme")
+	require.NoError(t, err)
+	assert.Equal(t, [][]byte{[]byte("GET")}, values)
 
 	side, err := r.Side(t.Context(), signal.Profile, "acme")
 	require.NoError(t, err)
@@ -237,6 +252,10 @@ func TestReadsEmptyWhenEveryOwnerDisclaims(t *testing.T) {
 	keys, err := r.Keys(t.Context(), signal.Log, "acme", 0, 10)
 	require.NoError(t, err)
 	assert.Empty(t, keys)
+
+	values, err := r.Values(t.Context(), cluster.ValuesRequest{Signal: signal.Log, Column: "body"}, "acme")
+	require.NoError(t, err)
+	assert.Empty(t, values)
 
 	side, err := r.Side(t.Context(), signal.Profile, "acme")
 	require.NoError(t, err)

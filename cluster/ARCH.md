@@ -165,8 +165,9 @@ permits). Re-applying is `fetch.Filter` / `fetch.MatchesSeries` — one implemen
 shared by the node's fan-out and by `router`, since a superset every consumer must narrow the same
 way is a shared obligation, not a per-consumer one. **Equality is the exception**: `fetch.Matcher` may carry a serializable `EqualMatcher`
 spec, forwarded and pushed down on the peer, so a non-owner read narrows by `__name__` instead of
-pulling the whole window. Enumeration RPCs (series, keys, side store, aggregate) fan out the same
-hedged way. The series RPC is **signal-dispatched**: one endpoint enumerates stream identities for
+pulling the whole window. Enumeration RPCs (series, keys, values, side store, aggregate) fan out the same
+hedged way. The **values** RPC (`/internal/values`) is the one enumeration with its own request
+shape rather than `EncodeFetchRequest`: it carries a column name (or an attribute key) and a limit. The series RPC is **signal-dispatched**: one endpoint enumerates stream identities for
 logs/traces/profiles and metric series alike, so the metrics label endpoints answer from identities
 in cluster mode too, and the read seam re-exposes that gather as the `fetch.SeriesLister` capability
 the shard merge underneath it cannot provide.
@@ -191,8 +192,8 @@ shard; reads gather across all N and merge. Policy (retention, RF, downsampling)
 **real** tenant via `tenantOfShard`.
 
 Cross-shard reassembly is explicit: trace-by-id runs across every shard (a trace's spans scatter
-across service streams), series listings concatenate, key listings union, and the profile symbol
-store is unioned (content-addressed ⇒ a plain dedup).
+across service streams), series listings concatenate, key and value listings union (values re-truncated
+to the limit after the union), and the profile symbol store is unioned (content-addressed ⇒ a plain dedup).
 
 ## `rebalance`
 

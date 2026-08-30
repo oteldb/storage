@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"math"
@@ -334,6 +335,8 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(s.localSeries, s.clusterOpts...))
 	// record-signal attribute-key enumeration
 	mux.Handle(cluster.KeysPath, cluster.KeysHandler(s.localKeys, s.clusterOpts...))
+	// record-signal distinct column-value enumeration
+	mux.Handle(cluster.ValuesPath, cluster.ValuesHandler(s.localValues, s.clusterOpts...))
 	// profile symbol store
 	mux.Handle(cluster.SidePath, cluster.SideHandler(s.localProfileSymbols, s.clusterOpts...))
 	// Part mirroring for per-node private backends: peers list and fetch this node's backend
@@ -980,6 +983,25 @@ func (s *Storage) localKeys(
 	return out, nil
 }
 
+// localValues serves a peer's distinct column-value enumeration for a record signal from the local
+// engine (the enumeration twin of localKeys, backing ColumnValues' cluster fan-out).
+func (s *Storage) localValues(ctx context.Context, r cluster.ValuesRequest) ([][]byte, error) {
+	tid := s.normalizeTenant(signal.TenantID(r.Tenant))
+
+	eng, ok := s.lookupRecordEngine(r.Signal, tid)
+	if !ok || !s.canAnswer(ctx, rpcOpValues, r.Signal, tid, r.Start, r.End) {
+		return nil, cluster.ErrShardAbsent
+	}
+
+	return eng.ColumnValues(ctx, recordengine.ValuesRequest{
+		Column:  r.Column,
+		AttrKey: r.AttrKey,
+		Start:   r.Start,
+		End:     r.End,
+		Limit:   r.Limit,
+	})
+}
+
 // localProfileSymbols serves a peer's profile symbol store from the local engine.
 func (s *Storage) localProfileSymbols(ctx context.Context, tenant string) (map[string][]byte, error) {
 	eng, ok := s.lookupProfileEngine(s.normalizeTenant(signal.TenantID(tenant)))
@@ -1096,6 +1118,62 @@ func (s *Storage) shardKeys(
 
 	return hedgeOwners(ctx, s, rpcOpKeys, remotes, func(ctx context.Context, addr string) ([]cluster.KeyInfo, error) {
 		return cluster.FetchKeys(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end, s.clusterOpts...)
+	})
+}
+
+// clusterValues enumerates a record signal's distinct column values for a tenant in cluster mode:
+// locally if this node owns the shard, else from an owner (hedged failover). A value can occur on
+// streams in more than one shard, so the shards' results are unioned and re-truncated to the limit.
+func (s *Storage) clusterValues(ctx context.Context, r cluster.ValuesRequest) ([][]byte, error) {
+	tenant := s.normalizeTenant(signal.TenantID(r.Tenant))
+	n := s.cluster.shardCount()
+
+	seen := make(map[string]struct{})
+
+	for idx := range n {
+		shard := r
+		shard.Tenant = string(shardKeyOf(tenant, idx, n))
+
+		vs, err := s.shardValues(ctx, shard)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, v := range vs {
+			seen[string(v)] = struct{}{}
+		}
+	}
+
+	if len(seen) == 0 {
+		return nil, nil
+	}
+
+	out := make([][]byte, 0, len(seen))
+	for v := range seen {
+		out = append(out, []byte(v))
+	}
+
+	slices.SortFunc(out, bytes.Compare)
+
+	if r.Limit > 0 && len(out) > r.Limit {
+		out = out[:r.Limit]
+	}
+
+	return out, nil
+}
+
+// shardValues enumerates one shard's distinct column values: locally if owned, else hedged across
+// its remote owners (each a complete replica).
+func (s *Storage) shardValues(ctx context.Context, r cluster.ValuesRequest) ([][]byte, error) {
+	shardKey := signal.TenantID(r.Tenant)
+
+	local, remotes := s.shardPlacement(ctx, rpcOpValues, r.Signal, shardKey)
+	if local {
+		return s.localValues(ctx, r)
+	}
+
+	return hedgeOwners(ctx, s, rpcOpValues, remotes, func(ctx context.Context, addr string) ([][]byte, error) {
+		return cluster.FetchValues(ctx, s.cluster.httpc, addr, r, s.clusterOpts...)
 	})
 }
 

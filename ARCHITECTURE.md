@@ -63,6 +63,8 @@ engines over the fetch seam (`query/fetch`).
 - **Read** — `Fetcher(tenants...)` and the per-signal variants return a `fetch.Fetcher` over
   head ∪ parts; no tenants ⇒ all (cross-tenant fan-out, merged by series id). Plus the
   convenience/enumeration primitives: `Trace`, `LogsForTrace`, `LogSeries`, `LogKeys`,
+  `ColumnValues` (a record column's — or one attribute key's — distinct values, answered from the
+  part dictionaries, so tag/label autocomplete never scans rows),
   `MetricSeries`, `ProfileSeries`, `ProfileResolver`,
   `AggregateMetrics{,Named,StepNamed,WindowNamed}` — the last
   two are series-major (every step bucket, or every evaluation window, for every series in one
