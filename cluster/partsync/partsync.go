@@ -35,7 +35,9 @@ import (
 	"time"
 
 	"github.com/go-faster/errors"
+	"github.com/go-faster/sdk/zctx"
 	"github.com/zeebo/xxh3"
+	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
@@ -60,6 +62,10 @@ const (
 	// pruneAfterMisses is how many consecutive sync passes a local object must be absent from
 	// the peer before it is deleted.
 	pruneAfterMisses = 2
+
+	// errBodyLimit bounds how much of a peer's error response is read into an error message, so
+	// a peer answering with a large body cannot blow up the caller's log line.
+	errBodyLimit = 4 << 10
 )
 
 // ValidKey reports whether a remotely-supplied key or prefix is safe to hand to a backend:
@@ -85,6 +91,8 @@ func ListHandler(be backend.Backend) http.Handler {
 
 		keys, err := be.List(req.Context(), prefix)
 		if err != nil {
+			zctx.From(req.Context()).Error("partsync list failed",
+				zap.String("prefix", prefix), zap.Error(err))
 			http.Error(w, "list: "+err.Error(), http.StatusInternalServerError)
 
 			return
@@ -120,6 +128,8 @@ func ObjectHandler(be backend.Backend) http.Handler {
 				return
 			}
 
+			zctx.From(req.Context()).Error("partsync object read failed",
+				zap.String("key", key), zap.Error(err))
 			http.Error(w, "read: "+err.Error(), http.StatusInternalServerError)
 
 			return
@@ -150,7 +160,7 @@ func (c *Client) List(ctx context.Context, addr, prefix string) ([]string, error
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.Errorf("list: %q returned %d", addr, resp.StatusCode)
+		return nil, peerError(addr, "list", resp)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -180,7 +190,7 @@ func (c *Client) Fetch(ctx context.Context, addr, key string) ([]byte, error) {
 	case http.StatusNotFound:
 		return nil, errors.Wrapf(ErrNotExist, "%q on %q", key, addr)
 	default:
-		return nil, errors.Errorf("fetch %q: %q returned %d", key, addr, resp.StatusCode)
+		return nil, peerError(addr, "fetch "+strconv.Quote(key), resp)
 	}
 
 	data, err := io.ReadAll(resp.Body)
@@ -218,10 +228,22 @@ func (c *Client) Notify(ctx context.Context, addr, enginePrefix string) error {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return errors.Errorf("notify: %q returned %d", addr, resp.StatusCode)
+		return peerError(addr, "notify", resp)
 	}
 
 	return nil
+}
+
+// peerError turns a peer's non-2xx response into an error carrying a bounded prefix of the
+// response body, which is where the peer's handler put its own failure reason.
+func peerError(addr, what string, resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyLimit))
+
+	if body = bytes.TrimSpace(body); len(body) == 0 {
+		return errors.Errorf("%s: %q returned %d", what, addr, resp.StatusCode)
+	}
+
+	return errors.Errorf("%s: %q returned %d: %s", what, addr, resp.StatusCode, body)
 }
 
 func (c *Client) http() *http.Client {

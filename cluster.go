@@ -345,7 +345,12 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	mux.Handle(partsync.ListPath, partsync.ListHandler(s.backend))
 	mux.Handle(partsync.ObjectPath, partsync.ObjectHandler(s.backend))
 	mux.Handle(partsync.NotifyPath, s.partsNotifyHandler())
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		// Seed the zctx base so internal handlers can log their own faults.
+		BaseContext: func(net.Listener) context.Context { return s.obs.Base(context.Background()) },
+	}
 
 	go func() { _ = srv.Serve(ln) }()
 
