@@ -42,9 +42,9 @@ func TestDoOnResultReportsEveryAttempt(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Len(t, errs, 3)
-	assert.ErrorIs(t, errs[0], errTransient)
-	assert.ErrorIs(t, errs[1], errTransient)
-	assert.NoError(t, errs[2])
+	require.ErrorIs(t, errs[0], errTransient)
+	require.ErrorIs(t, errs[1], errTransient)
+	require.NoError(t, errs[2])
 }
 
 // TestDoOnResultReportsPerTryTimeout confirms an attempt the per-try deadline killed is reported as
@@ -74,7 +74,7 @@ func TestDoOnResultReportsPerTryTimeout(t *testing.T) {
 
 	require.Error(t, err)
 	require.Len(t, errs, 1)
-	assert.ErrorIs(t, errs[0], context.DeadlineExceeded)
+	require.ErrorIs(t, errs[0], context.DeadlineExceeded)
 }
 
 // TestHedgeOnResultReportsLosers confirms the hedged attempts report too — including the loser the

@@ -717,7 +717,7 @@ func (e *Engine) Flush(ctx context.Context) error {
 	log := zctx.From(ctx)
 	log.Debug("flush requested", zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix))
 
-	rows, bytes, err := e.flush(ctx)
+	rows, written, err := e.flush(ctx)
 	if err != nil {
 		span.RecordError(err)
 		log.Error("flush failed",
@@ -727,11 +727,11 @@ func (e *Engine) Flush(ctx context.Context) error {
 	}
 
 	if rows > 0 {
-		span.SetAttributes(attribute.Int("storage.rows", rows), attribute.Int64("storage.flush.bytes", bytes))
-		e.cfg.Obs.Flush.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(rows), bytes)
+		span.SetAttributes(attribute.Int("storage.rows", rows), attribute.Int64("storage.flush.bytes", written))
+		e.cfg.Obs.Flush.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(rows), written)
 		log.Debug("flushed head to part",
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
-			zap.Int("rows", rows), zap.Int64("bytes", bytes),
+			zap.Int("rows", rows), zap.Int64("bytes", written),
 			zap.Duration("took", time.Since(startNs)))
 	} else {
 		log.Debug("flush no-op (empty head)",
@@ -1215,7 +1215,7 @@ func (p *fetchPlan) releaseParts() {
 // — appends and fetches proceed concurrently — while the head drain, the side-store snapshot, and the
 // metadata publish run under it. Only the background maintenance task (or Close) calls flush, so the
 // parts mutation has a single writer.
-func (e *Engine) flush(ctx context.Context) (rows int, bytes int64, err error) {
+func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error) {
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
 
@@ -1315,15 +1315,15 @@ func (e *Engine) flush(ctx context.Context) (rows int, bytes int64, err error) {
 	err = e.publishLocked(ctx)
 	e.mu.Unlock()
 
-	bytes = partsBytes(newParts)
+	written = partsBytes(newParts)
 
 	if err != nil {
-		return rows, bytes, err
+		return rows, written, err
 	}
 
 	e.reclaimRetired(ctx)
 
-	return rows, bytes, nil
+	return rows, written, nil
 }
 
 // abortFlush undoes the plan phase of a flush that failed before publishing a part: the detached
