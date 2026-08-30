@@ -10,6 +10,8 @@ import (
 	"net/url"
 
 	"github.com/go-faster/errors"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
@@ -373,7 +375,9 @@ type FetchFunc func(ctx context.Context, tenant string, start, end int64, matche
 // the pushed-down equality matchers and dispatching to the metric, log, trace, or profile fetch by
 // the request's signal (encoding the result with the matching batch codec — samples for metrics,
 // columns for the record signals). Mount it at [ReadPath].
-func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc) http.Handler {
+func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc, opts ...Option) http.Handler {
+	o := resolveOpts(opts)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -411,6 +415,9 @@ func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc) http.Handler {
 		}
 
 		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace (peer fetch spans nest)
+		ctx, span := o.Tracer.Start(ctx, "cluster.serve.fetch",
+			trace.WithAttributes(attribute.String("storage.signal", sig.String())))
+		defer func() { endSpan(span, err) }()
 
 		// When the caller is collecting EXPLAIN ANALYZE, run the fetch under a profile collector and
 		// return the peer's subtree ahead of the batches so the requester can graft it.
@@ -419,12 +426,15 @@ func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc) http.Handler {
 			ctx, coll = profile.WithCollector(ctx)
 		}
 
-		batches, err := fn(ctx, tenant, start, end, matchers)
+		var batches []*fetch.Batch
+		batches, err = fn(ctx, tenant, start, end, matchers)
 		if err != nil {
 			writeRPCError(w, err)
 
 			return
 		}
+
+		span.SetAttributes(attribute.Int("storage.rows", len(batches)))
 
 		out := encode(batches)
 
@@ -456,22 +466,30 @@ type RemoteFetcher struct {
 	sig    signal.Signal
 	addr   string
 	client *http.Client
+	obs    *obs.Obs
 }
 
 // NewRemoteFetcher returns a fetcher that reads the given signal from the peer at addr. A nil
-// client uses [http.DefaultClient]. The zero signal value reads metrics.
-func NewRemoteFetcher(sig signal.Signal, addr string, client *http.Client) *RemoteFetcher {
+// client uses [http.DefaultClient]. The zero signal value reads metrics. Without [WithTracerProvider]
+// its spans report through a no-op tracer.
+func NewRemoteFetcher(sig signal.Signal, addr string, client *http.Client, opts ...Option) *RemoteFetcher {
 	if client == nil {
 		client = http.DefaultClient
 	}
 
-	return &RemoteFetcher{sig: sig, addr: addr, client: client}
+	return &RemoteFetcher{sig: sig, addr: addr, client: client, obs: resolveOpts(opts)}
 }
 
 // Fetch forwards r's tenant, window, and serializable (equality) matchers to the peer and
 // returns the decoded batches. Non-equality matchers (and columnar conditions) are not forwarded —
 // the requester re-applies them to the (possibly superset) result.
-func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
+func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, err error) {
+	ctx, span := f.obs.Tracer.Start(ctx, "cluster.fetch", trace.WithAttributes(
+		attribute.String("storage.rpc.peer", f.addr),
+		attribute.String("storage.signal", f.sig.String()),
+	))
+	defer func() { endSpan(span, err) }()
+
 	var eq []fetch.EqualMatcher
 	for i := range r.Matchers {
 		if r.Matchers[i].Spec != nil {
@@ -525,6 +543,8 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Itera
 	if err != nil {
 		return nil, err
 	}
+
+	span.SetAttributes(attribute.Int("storage.rows", len(batches)))
 
 	return fetch.NewSliceIterator(batches), nil
 }

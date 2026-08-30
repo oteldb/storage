@@ -89,7 +89,7 @@ func TestRemoteAggregatorOverHTTP(t *testing.T) {
 	t.Cleanup(srv.Close)
 	addr := strings.TrimPrefix(srv.URL, "http://")
 
-	got, err := cluster.NewRemoteAggregator(addr, nil).Aggregate(
+	got, err := cluster.NewRemoteAggregator(addr, nil, nil).Aggregate(
 		context.Background(), "acme", 10, 20, 60, []fetch.EqualMatcher{{Name: "job", Value: "api"}})
 	require.NoError(t, err)
 

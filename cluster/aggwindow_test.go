@@ -111,7 +111,7 @@ func TestRemoteAggregatorWindowOverHTTP(t *testing.T) {
 
 	spec := engine.WindowSpec{Step: 20, Window: 60, Anchor: 7}
 
-	got, err := cluster.NewRemoteAggregator(addr, nil).AggregateWindow(
+	got, err := cluster.NewRemoteAggregator(addr, nil, nil).AggregateWindow(
 		context.Background(), "acme", 10, 200, spec, []fetch.EqualMatcher{{Name: "job", Value: "api"}})
 	require.NoError(t, err)
 
@@ -139,7 +139,7 @@ func TestRemoteAggregatorWindowFailsOnBucketOnlyPeer(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	_, err := cluster.NewRemoteAggregator(strings.TrimPrefix(srv.URL, "http://"), nil).
+	_, err := cluster.NewRemoteAggregator(strings.TrimPrefix(srv.URL, "http://"), nil, nil).
 		AggregateWindow(context.Background(), "acme", 0, 100, engine.WindowSpec{Step: 10, Window: 50}, nil)
 	require.Error(t, err)
 }

@@ -20,9 +20,10 @@ func (r *Router) Aggregate(
 ) ([]engine.NamedAgg, error) {
 	eq := fetch.EqualitySpecs(matchers)
 
-	aggs, err := hedgeOwners(ctx, r, shardKey, func(ctx context.Context, addr string) ([]engine.NamedAgg, error) {
-		return cluster.NewRemoteAggregator(addr, r.httpc).Aggregate(ctx, string(shardKey), start, end, step, eq)
-	})
+	aggs, err := hedgeOwners(ctx, r, "cluster.aggregate.hedge", shardKey,
+		func(ctx context.Context, addr string) ([]engine.NamedAgg, error) {
+			return cluster.NewRemoteAggregator(addr, r.httpc, r.clusterOpts...).Aggregate(ctx, string(shardKey), start, end, step, eq)
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -42,9 +43,11 @@ func (r *Router) AggregateWindow(
 ) ([]engine.NamedWindowAgg, error) {
 	eq := fetch.EqualitySpecs(matchers)
 
-	aggs, err := hedgeOwners(ctx, r, shardKey, func(ctx context.Context, addr string) ([]engine.NamedWindowAgg, error) {
-		return cluster.NewRemoteAggregator(addr, r.httpc).AggregateWindow(ctx, string(shardKey), start, end, spec, eq)
-	})
+	aggs, err := hedgeOwners(ctx, r, "cluster.aggregate_window.hedge", shardKey,
+		func(ctx context.Context, addr string) ([]engine.NamedWindowAgg, error) {
+			return cluster.NewRemoteAggregator(addr, r.httpc, r.clusterOpts...).
+				AggregateWindow(ctx, string(shardKey), start, end, spec, eq)
+		})
 	if err != nil {
 		return nil, err
 	}

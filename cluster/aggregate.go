@@ -10,6 +10,8 @@ import (
 	"net/url"
 
 	"github.com/go-faster/errors"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/obs"
@@ -267,7 +269,9 @@ func matchersFromEq(eq []fetch.EqualMatcher) []fetch.Matcher {
 // the shared halves (body read, matcher rebuild) are already factored out.
 //
 //nolint:dupl // same shape as the sibling handler, but the decoded request types differ;
-func AggregateHandler(fn AggregateFunc) http.Handler {
+func AggregateHandler(fn AggregateFunc, opts ...Option) http.Handler {
+	o := resolveOpts(opts)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		body, ok := aggregateRequestBody(w, req)
 		if !ok {
@@ -281,14 +285,18 @@ func AggregateHandler(fn AggregateFunc) http.Handler {
 			return
 		}
 
-		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace
+		ctx, span := o.Tracer.Start(obs.ExtractHTTP(req.Context(), req.Header), "cluster.serve.aggregate") // join the caller's trace
+		defer func() { endSpan(span, err) }()
 
-		aggs, err := fn(ctx, tenant, start, end, step, matchersFromEq(eq))
+		var aggs []engine.NamedAgg
+		aggs, err = fn(ctx, tenant, start, end, step, matchersFromEq(eq))
 		if err != nil {
 			writeRPCError(w, err)
 
 			return
 		}
+
+		span.SetAttributes(attribute.Int("storage.rows", len(aggs)))
 
 		_, _ = w.Write(EncodeAggregates(aggs))
 	})
@@ -298,29 +306,46 @@ func AggregateHandler(fn AggregateFunc) http.Handler {
 type RemoteAggregator struct {
 	addr   string
 	client *http.Client
+	obs    *obs.Obs
 }
 
 // NewRemoteAggregator returns an aggregator over the peer at addr. A nil client uses
-// [http.DefaultClient].
-func NewRemoteAggregator(addr string, client *http.Client) *RemoteAggregator {
+// [http.DefaultClient]. Without [WithTracerProvider] its spans report through a no-op tracer.
+func NewRemoteAggregator(addr string, client *http.Client, opts ...Option) *RemoteAggregator {
 	if client == nil {
 		client = http.DefaultClient
 	}
 
-	return &RemoteAggregator{addr: addr, client: client}
+	return &RemoteAggregator{addr: addr, client: client, obs: resolveOpts(opts)}
 }
 
 // Aggregate pushes the tenant, window, step, and equality matchers to the peer and returns its
 // per-series aggregates.
 func (a *RemoteAggregator) Aggregate(
 	ctx context.Context, tenant string, start, end, step int64, eq []fetch.EqualMatcher,
-) ([]engine.NamedAgg, error) {
+) (_ []engine.NamedAgg, err error) {
+	ctx, span := a.clientSpan(ctx, "cluster.aggregate")
+	defer func() { endSpan(span, err) }()
+
 	body, err := a.post(ctx, AggregatePath, EncodeAggregateRequest(tenant, start, end, step, eq), "aggregate")
 	if err != nil {
 		return nil, err
 	}
 
-	return DecodeAggregates(body)
+	aggs, err := DecodeAggregates(body)
+	if err != nil {
+		return nil, err
+	}
+
+	span.SetAttributes(attribute.Int("storage.rows", len(aggs)))
+
+	return aggs, nil
+}
+
+// clientSpan opens the client-side span for one aggregate RPC to the peer.
+func (a *RemoteAggregator) clientSpan(ctx context.Context, name string) (context.Context, trace.Span) {
+	//nolint:spancheck // the caller ends the returned span via endSpan.
+	return a.obs.Tracer.Start(ctx, name, trace.WithAttributes(attribute.String("storage.rpc.peer", a.addr)))
 }
 
 // post sends payload to the peer's path, joining the caller's trace, and returns the response body.
