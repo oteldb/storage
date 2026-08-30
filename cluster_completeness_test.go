@@ -62,3 +62,43 @@ func TestCanAnswerWidensZeroWindow(t *testing.T) {
 	assert.False(t, s.canAnswer(context.Background(), rpcOpSeries, signal.Metric, "default", 0, 0),
 		"an unbounded listing certainly reaches into the gap")
 }
+
+// TestEnumerationFailsOverWhenLocalShardIsIncomplete pins the failover the incomplete-shard warning
+// already promises ("held shard is missing its unflushed head, failing over"). The enumeration RPCs
+// served the local engine directly, so a node holding the shard but missing its head answered the
+// caller with [cluster.ErrShardAbsent] instead of asking an owner that can answer — surfacing
+// absence, which is failover control flow, as a query error.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestEnumerationFailsOverWhenLocalShardIsIncomplete(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNode(t, endpoint, "node-a"),
+		"node-b": openClusterNode(t, endpoint, "node-b"),
+		"node-c": openClusterNode(t, endpoint, "node-c"),
+	}
+	a := nodes["node-a"]
+
+	awaitMembership(t, nodes)
+
+	_, err := a.WriteLogs(ctx, logBatch("api", [3]any{100, 9, "first"}, [3]any{200, 17, "second"}))
+	require.NoError(t, err)
+
+	series, err := a.LogSeries(ctx, "default", nil, 0, 0)
+	require.NoError(t, err)
+	require.NotEmpty(t, series, "the streams are enumerable before the gap")
+
+	// node-a keeps its engine, but loses the window: exactly a restarted owner whose head did not
+	// survive, which is what canAnswer disclaims on.
+	a.noteReadGap(signal.Log, shardKeyOf("default", 0, a.cluster.shardCount()), math.MinInt64)
+
+	got, err := a.LogSeries(ctx, "default", nil, 0, 0)
+	require.NoError(t, err, "the incomplete local shard must fail over to an owner, not error")
+	assert.Len(t, got, len(series), "the owner answers what the incomplete local shard cannot")
+
+	keys, err := a.LogKeys(ctx, "default", 0, 0)
+	require.NoError(t, err)
+	assert.NotEmpty(t, keys, "key enumeration fails over too")
+}

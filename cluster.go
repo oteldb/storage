@@ -1051,7 +1051,10 @@ func (s *Storage) shardSeries(
 ) ([]signal.Series, error) {
 	local, remotes := s.shardPlacement(ctx, rpcOpSeries, sig, shardKey)
 	if local {
-		return s.localSeries(ctx, sig, string(shardKey), start, end, matchers)
+		ser, err := s.localSeries(ctx, sig, string(shardKey), start, end, matchers)
+		if !disclaimedLocally(err) {
+			return ser, err
+		}
 	}
 
 	return hedgeOwners(ctx, s, rpcOpSeries, remotes, func(ctx context.Context, addr string) ([]signal.Series, error) {
@@ -1118,7 +1121,10 @@ func (s *Storage) shardKeys(
 ) ([]cluster.KeyInfo, error) {
 	local, remotes := s.shardPlacement(ctx, rpcOpKeys, sig, shardKey)
 	if local {
-		return s.localKeys(ctx, sig, string(shardKey), start, end)
+		keys, err := s.localKeys(ctx, sig, string(shardKey), start, end)
+		if !disclaimedLocally(err) {
+			return keys, err
+		}
 	}
 
 	return hedgeOwners(ctx, s, rpcOpKeys, remotes, func(ctx context.Context, addr string) ([]cluster.KeyInfo, error) {
@@ -1174,7 +1180,10 @@ func (s *Storage) shardValues(ctx context.Context, r cluster.ValuesRequest) ([][
 
 	local, remotes := s.shardPlacement(ctx, rpcOpValues, r.Signal, shardKey)
 	if local {
-		return s.localValues(ctx, r)
+		values, err := s.localValues(ctx, r)
+		if !disclaimedLocally(err) {
+			return values, err
+		}
 	}
 
 	return hedgeOwners(ctx, s, rpcOpValues, remotes, func(ctx context.Context, addr string) ([][]byte, error) {
@@ -1212,7 +1221,10 @@ func (s *Storage) clusterProfileSymbols(ctx context.Context, tid signal.TenantID
 func (s *Storage) shardSymbols(ctx context.Context, shardKey signal.TenantID) (map[string][]byte, error) {
 	local, remotes := s.shardPlacement(ctx, rpcOpSide, signal.Profile, shardKey)
 	if local {
-		return s.localProfileSymbols(ctx, string(shardKey))
+		tables, err := s.localProfileSymbols(ctx, string(shardKey))
+		if !disclaimedLocally(err) {
+			return tables, err
+		}
 	}
 
 	return hedgeOwners(ctx, s, rpcOpSide, remotes, func(ctx context.Context, addr string) (map[string][]byte, error) {
