@@ -89,6 +89,21 @@ type Options struct {
 	// whole budget is admitted alone (it cannot be bounded below its own footprint).
 	DecodeMemoryBytes int64
 
+	// MaxQueryBytes caps how many bytes one query may read before it is refused with an error
+	// wrapping [fetch.ErrTooLarge]. It bounds a *single* query against the process, which is the gap
+	// DecodeMemoryBytes leaves: that budget queues concurrent queries behind a shared ceiling but
+	// admits an over-budget query alone rather than refusing it, and it covers only the metric
+	// engine — the record engines (logs, traces, profiles) have no decode admission at all. So an
+	// unselective read — every span in a wide window to answer one tag lookup — had nothing standing
+	// between it and the process memory.
+	//
+	// The bound counts bytes read, not bytes retained: a caller that streams and releases is charged
+	// for what it passed through. That is intended — the usual consumers accumulate, and a query
+	// reading tens of gigabytes is worth refusing either way. Zero ⇒ a share of the detected process
+	// budget (GOMEMLIMIT, else the cgroup limit, else host memory); negative ⇒ unbounded, for an
+	// embedder that bounds reads itself.
+	MaxQueryBytes int64
+
 	// MergeMemoryBytes caps how much memory all concurrent merges together may hold. What that
 	// bounds depends on the backend: one that takes objects whole makes a merge buffer its output
 	// part *encoded* in RAM until it is sealed, so part size and merge memory are the same number and

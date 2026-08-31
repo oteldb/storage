@@ -57,6 +57,16 @@ and releases stays O(1) in matched series. The flip side is that the producer's 
 whole iteration — so **every caller must Close** (`Drain` does it for you, at the cost of
 materializing the result set it was meant to avoid).
 
+`LimitBytes(inner, maxBytes)` bounds one query's cumulative `Batch.Size` and fails it with
+`ErrTooLarge` past the budget. It is **rejection**, the complement of the metric engine's decode
+budget: that one queues concurrent queries behind a shared ceiling but admits an over-budget query
+*alone*, and it covers only the metric engine — so before this, nothing bounded a single unselective
+read, and the record engines had no decode admission at all. The bound counts bytes **read**, not
+retained: a streaming caller is charged for what it passed through, which is the stricter reading and
+the intended one, since the usual consumers accumulate (`Drain`). The facade installs it inside the
+same seam that adds observability, so every vertical and both the local and cluster paths are bounded
+by construction; it forwards `Unwrap`, so optional capabilities still resolve through it.
+
 `Merge(fetchers...)` is the fan-out combinator (union by series id, timestamp-ordered, later child
 wins a duplicate) backing multi-tenant and cluster reads; `MergeBatches` is its batch-level form (a
 materializing merge over already-drained groups, used by `SplitFetcher`). Children are opened

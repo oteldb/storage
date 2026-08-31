@@ -279,8 +279,10 @@ func (s *Storage) recordFetcher(
 		return fetch.Merge()
 	}
 
+	// The per-query read bound goes inside the seed, so every return path below — cluster fan-out,
+	// named tenants, cross-tenant snapshot — is bounded by construction rather than at each site.
 	seed := func(f fetch.Fetcher) fetch.Fetcher {
-		return seedFetcher{inner: f, obs: s.obs, signal: sig.String()}
+		return seedFetcher{inner: fetch.LimitBytes(f, s.maxQueryBytes), obs: s.obs, signal: sig.String()}
 	}
 
 	if s.cluster != nil && len(tenants) > 0 {

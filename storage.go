@@ -20,6 +20,7 @@ import (
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/fetch"
@@ -69,6 +70,10 @@ type Storage struct {
 	// shared by every tenant engine so concurrent queries cannot multiply resident decoded bytes
 	// past the cap. nil ⇒ unlimited.
 	decodeBudget *engine.DecodeBudget
+
+	// maxQueryBytes is the per-query read bound ([Options.MaxQueryBytes]) resolved once against the
+	// process memory budget. 0 ⇒ no limiter is installed at all.
+	maxQueryBytes int64
 
 	admitMu sync.Mutex                           // guards admit
 	admit   map[signal.TenantID]*tenantAdmission // per-tenant admission state (rate valve + counters)
@@ -128,6 +133,8 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	if o.DecodeMemoryBytes > 0 {
 		s.decodeBudget = engine.NewDecodeBudget(o.DecodeMemoryBytes)
 	}
+
+	s.maxQueryBytes = memlimit.QueryShare(o.MaxQueryBytes)
 
 	observer, err := obs.New(obs.Config{Logger: o.Logger, TracerProvider: o.TracerProvider, MeterProvider: o.MeterProvider})
 	if err != nil {
@@ -584,7 +591,9 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 		return fetch.Merge() // empty
 	}
 
-	return seedFetcher{inner: s.scaleWrap(s.baseFetcher(tenants), tenants), obs: s.obs, signal: signal.Metric.String()}
+	inner := fetch.LimitBytes(s.scaleWrap(s.baseFetcher(tenants), tenants), s.maxQueryBytes)
+
+	return seedFetcher{inner: inner, obs: s.obs, signal: signal.Metric.String()}
 }
 
 // MetricSeries returns the identities of a tenant's metric series matching the label matchers with

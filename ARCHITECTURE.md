@@ -96,6 +96,14 @@ has no room for — bytes **and** inodes, checked separately — and latches, so
 not a policy but a fact about the disk, so it is enforced in the engines rather than at the facade,
 and it clears itself when a later flush finds room (`engine/ARCH.md`, "Disk pressure").
 
+The read path has its own bound, on the same principle. `Options.MaxQueryBytes` caps how many bytes
+one query may materialize, refusing it with `fetch.ErrTooLarge` rather than letting an unselective
+read — every span in a wide window to answer one tag lookup — take the process down. It is installed
+at the fetch seam, so it covers metrics, logs, traces and profiles, local and cluster alike. This is
+distinct from `DecodeMemoryBytes`, which is *admission*: that budget makes concurrent metric queries
+queue behind a shared ceiling, but it admits an over-budget query alone and never rejects, so it
+bounds queries against each other rather than any one of them against the process.
+
 ### Observability (`internal/obs`, `query/profile`)
 
 **Injected, never owned.** `Options.{Logger, TracerProvider, MeterProvider}` (OTel **API**
