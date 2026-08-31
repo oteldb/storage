@@ -12,66 +12,53 @@ import (
 // footprint from part metadata *before* reading, reserve it, and release when the caller closes the
 // iterator.
 //
-// The charge has to happen here rather than in a decorator around the fetcher. [Engine.Fetch] reads
-// every part, accumulates every survivor and materializes every output batch before it returns an
-// iterator at all, so anything wrapping that iterator only sees batches that are already resident —
-// it would reject a query after the allocation it was meant to prevent.
+// The charge has to happen inside planning, not in a decorator around the fetcher and not merely
+// before the parts are read. [Engine.Fetch] reads every part, accumulates every survivor and
+// materializes every output batch before it returns an iterator at all, so anything wrapping that
+// iterator only sees bytes that are already resident. And [Engine.planFetch] pre-sizes each stream's
+// accumulator to the rows it will hold, so the largest allocation of the fetch happens during
+// planning — earlier still than the first backend read.
 
-// estimateBytes estimates the decoded bytes this plan will hold once it has read its parts.
+// bytesPerRow is the average decoded bytes one accumulated row costs, taken over the parts this
+// plan will read.
 //
-// It is the record twin of the metric engine's decode estimate, and it is honest for the same
-// reason: [part.sizeBytes] is the part's *decoded* footprint as recorded in its manifest, not its
-// compressed size, so scaling it by the share of rows this request touches needs no guessed
-// expansion factor. Records are variable-width, so the per-part average is the best the metadata
-// supports — a part whose matched rows are unusually wide is under-counted and one whose rows are
-// narrow is over-counted.
-//
-// It counts whole stream ranges rather than the window's slice of them, so it over-estimates a
-// request that touches part of a stream's run. That is the safe direction for admission, and the
-// alternative — resolving granules per stream — costs the backend reads the estimate exists to
-// avoid.
-func (p *fetchPlan) estimateBytes() int64 {
-	var (
-		total   int64
-		matched []streamRange
-	)
+// [part.sizeBytes] is the part's *decoded* footprint as recorded in its manifest, not its compressed
+// size, so this needs no guessed expansion factor. Records are variable-width, so it is an average:
+// a request whose matched rows are unusually wide is under-counted and one whose rows are narrow is
+// over-counted. With no live parts (a head-only read) it falls back to the same per-row constant the
+// manifest fallback uses.
+func (p *fetchPlan) bytesPerRow() int64 {
+	var bytes, rows int64
 
 	for _, part := range p.liveParts {
-		rows := part.rows()
-		if rows <= 0 {
-			continue
-		}
-
-		matched = part.heldStreams(matched[:0], p.sortedIDs)
-
-		var n int64
-		for _, sr := range matched {
-			n += int64(sr.end - sr.start)
-		}
-
-		if n <= 0 {
-			continue
-		}
-
-		total += n * part.sizeBytes() / rows
+		bytes += part.sizeBytes()
+		rows += part.rows()
 	}
 
-	return total
+	if rows <= 0 {
+		return recordRowBytes
+	}
+
+	return max(bytes/rows, 1)
 }
 
-// admit reserves the plan's estimated footprint against the query's budget, returning the release to
-// run when the caller is done with the result. It reports an error wrapping
-// [readbudget.ErrExceeded] when the read would hold more than the query is allowed, before any part
-// is read.
+// admit reserves the footprint of the rows this plan is about to accumulate, returning the release to
+// run when the caller is done with the result. It reports an error wrapping [readbudget.ErrExceeded]
+// when the read would hold more than the query is allowed.
+//
+// It must be called before the per-stream accumulators are allocated, not merely before the parts
+// are read: [Engine.planFetch] pre-sizes each accumulator to the rows it will hold, so by the time
+// planning returns, the largest allocation of the whole fetch has already happened. Admitting after
+// that would refuse the query having already committed the memory it was refusing it to save.
 //
 // A read with no budget on its context is unbounded, and the release is a no-op.
-func (p *fetchPlan) admit(ctx context.Context) (release func(), _ error) {
+func (p *fetchPlan) admit(ctx context.Context, rows int64) (release func(), _ error) {
 	budget := readbudget.From(ctx)
 	if budget == nil {
 		return func() {}, nil
 	}
 
-	n := p.estimateBytes()
+	n := rows * p.bytesPerRow()
 	if err := budget.Reserve(n); err != nil {
 		return nil, err
 	}

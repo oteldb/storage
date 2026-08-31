@@ -204,7 +204,7 @@ func TestPlanFetchResolvesEveryRow(t *testing.T) {
 		t.Helper()
 
 		e.mu.RLock()
-		plan, err := e.planFetch(ask, fetch.Request{Signal: signal.Log, Start: 0, End: maxInt64})
+		plan, err := e.planFetch(ctx, ask, fetch.Request{Signal: signal.Log, Start: 0, End: maxInt64})
 		e.mu.RUnlock()
 
 		defer plan.releaseParts()
@@ -260,7 +260,7 @@ func TestPlanFetchResolvesEveryRow(t *testing.T) {
 		t.Parallel()
 
 		e.mu.RLock()
-		plan, err := e.planFetch(nil, fetch.Request{Signal: signal.Log, Start: 0, End: maxInt64})
+		plan, err := e.planFetch(ctx, nil, fetch.Request{Signal: signal.Log, Start: 0, End: maxInt64})
 		e.mu.RUnlock()
 
 		defer plan.releaseParts()

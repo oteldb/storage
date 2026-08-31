@@ -511,7 +511,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, 
 	// live parts to read, and capture stream identities. Releasing the lock before the backend reads
 	// lets appends and flush/merge proceed concurrently — the acquired parts can't be reclaimed until
 	// we release them, so the lock-free reads never race a delete.
-	plan, planErr := e.planFetch(ids, r)
+	plan, planErr := e.planFetch(ctx, ids, r)
 	e.mu.RUnlock()
 
 	defer plan.releaseParts()
@@ -522,20 +522,11 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, 
 		return nil, planErr
 	}
 
-	// Admission before the first backend read: past this point the plan materializes its whole
-	// result set, so a refusal after it would come too late to be worth anything.
-	releaseBudget, err := plan.admit(ctx)
-	if err != nil {
-		span.RecordError(err)
-
-		return nil, err
-	}
-
 	defer func() {
 		// Every path that does not hand the caller an iterator must give the reservation back; the
 		// successful one transfers it to the iterator's Close.
 		if rerr != nil || !admitted {
-			releaseBudget()
+			plan.releaseBudget()
 		}
 	}()
 
@@ -604,7 +595,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, 
 
 	admitted = true
 
-	return &budgetedIterator{Iterator: fetch.NewSliceIterator(batches), release: releaseBudget}, nil
+	return &budgetedIterator{Iterator: fetch.NewSliceIterator(batches), release: plan.releaseBudget}, nil
 }
 
 // matchedStream pairs a matched stream's id with its accumulated, ts-sorted records during a fetch.
@@ -958,6 +949,10 @@ func (e *Engine) streamInRangeLocked(id signal.SeriesID, start, end int64) bool 
 // accumulators already seeded from the head, the acquired (ref-held) live parts still to read, and the
 // captured stream identities. Its [fetchPlan.readParts] does the backend I/O off the lock.
 type fetchPlan struct {
+	// releaseBudget returns the plan's memory reservation. Always non-nil after planFetch, including
+	// on an unbudgeted read, so no caller needs a nil check on an error path.
+	releaseBudget func()
+
 	e          *Engine
 	sel        colSel
 	ids        []signal.SeriesID
@@ -1035,8 +1030,11 @@ func (e *Engine) getRecordCols(n int, sel colSel) *recordCols {
 	return newRecordCols(e.cfg.Schema, n, sel)
 }
 
-func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) (*fetchPlan, error) {
+func (e *Engine) planFetch(ctx context.Context, ids []signal.SeriesID, r fetch.Request) (*fetchPlan, error) {
+	noopRelease := func() {}
 	p := &fetchPlan{
+		releaseBudget: noopRelease,
+
 		e:      e,
 		sel:    selectColumns(e.cfg.Schema, r),
 		ids:    ids,
@@ -1086,6 +1084,29 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) (*fetchPlan, 
 			p.rowsLive += rows
 		}
 	}
+
+	// Admission goes here, between selecting the parts and sizing the accumulators: the loop below
+	// pre-allocates each stream's buffers to the rows it will hold, which is the fetch's largest
+	// allocation and happens before any part is read.
+	var accRows int64
+
+	for k, id := range p.sortedIDs {
+		n := partRows[k] + e.head.recordCount(id)
+		if buf := e.flushing[id]; buf != nil {
+			n += buf.len()
+		}
+
+		accRows += int64(n)
+	}
+
+	release, err := p.admit(ctx, accRows)
+	if err != nil {
+		// Return the plan, not nil: it already holds acquired parts, and [Engine.Fetch] releases them
+		// through its deferred releaseParts even on a planning error.
+		return p, err
+	}
+
+	p.releaseBudget = release
 
 	for k, id := range p.sortedIDs {
 		n := partRows[k] + e.head.recordCount(id)

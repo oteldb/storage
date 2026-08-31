@@ -596,6 +596,24 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 	return seedFetcher{inner: inner, obs: s.obs, maxQueryBytes: s.maxQueryBytes, signal: signal.Metric.String()}
 }
 
+// withReadBudget installs a read budget of limit bytes unless the caller already installed one.
+//
+// A cluster caller may declare how much room it still has ([readbudget.WithLimitHint]); that can only
+// tighten this node's own limit, never loosen it. The declared value arrives over the network, so a
+// node that adopted it outright would let anyone able to reach the read endpoint grant itself an
+// unbounded query.
+func withReadBudget(ctx context.Context, limit int64) context.Context {
+	if readbudget.From(ctx) != nil {
+		return ctx
+	}
+
+	if hint := readbudget.LimitHint(ctx); hint > 0 && (limit <= 0 || hint < limit) {
+		limit = hint
+	}
+
+	return readbudget.With(ctx, readbudget.New(limit))
+}
+
 // WithQueryBudget returns ctx carrying a fresh read budget at this store's configured limit
 // ([Options.MaxQueryBytes]), so every read the query makes — across several fetches, and at every
 // layer that materializes bytes — is charged against one allowance.
@@ -815,17 +833,7 @@ type seedFetcher struct {
 }
 
 func (f seedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
-	ctx = f.obs.Base(ctx)
-	if readbudget.From(ctx) == nil {
-		// A cluster caller may declare how much room it still has, which can only tighten this node's
-		// own limit — never loosen it. See [readbudget.WithLimitHint].
-		limit := f.maxQueryBytes
-		if hint := readbudget.LimitHint(ctx); hint > 0 && (limit <= 0 || hint < limit) {
-			limit = hint
-		}
-
-		ctx = readbudget.With(ctx, readbudget.New(limit))
-	}
+	ctx = withReadBudget(f.obs.Base(ctx), f.maxQueryBytes)
 	f.obs.Logger(ctx).Debug("query fetch",
 		zap.String("signal", f.signal), zap.Int("matchers", len(r.Matchers)),
 		zap.Int64("start", r.Start), zap.Int64("end", r.End))

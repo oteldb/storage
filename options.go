@@ -105,6 +105,11 @@ type Options struct {
 	// In cluster mode the aggregator sends its remaining allowance with the request; a receiver may
 	// only use it to tighten its own limit, never to raise it.
 	//
+	// It covers record *fetches*. The enumeration reads — [Storage.ColumnValues], the per-signal
+	// Series and Keys lookups — are not admitted: they build a distinct set whose size is not
+	// predictable from part metadata, so they need incremental accounting rather than an up-front
+	// estimate. A high-cardinality enumeration is still unbounded.
+	//
 	// Zero ⇒ a share of the detected process budget (GOMEMLIMIT, else the cgroup limit, else host
 	// memory); negative ⇒ unbounded, for an embedder that bounds reads itself.
 	MaxQueryBytes int64

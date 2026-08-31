@@ -116,10 +116,12 @@ allowance in `X-Oteldb-Read-Budget`; a receiver treats that as a **hint that may
 configured limit, never raise it — the value arrives over the network, so adopting it verbatim would
 let anyone reaching the read endpoint grant themselves an unbounded query.
 
-This is distinct from `DecodeMemoryBytes`, which is *admission*: it makes concurrent metric queries
-queue behind a shared ceiling, but admits an over-budget query alone and never rejects. The metric
-read path is still covered only by that budget; the rejecting bound is on the record engines, which
-had no admission control at all.
+The bound covers record *fetches*, on both the local and the served-to-a-peer path. Two things it
+does not cover: metric reads, still bounded only by `DecodeMemoryBytes`, which is *admission* — it
+makes concurrent queries queue behind a shared ceiling but admits an over-budget query alone and
+never rejects; and the enumeration reads (`ColumnValues`, Series, Keys), whose distinct-set size is
+not predictable from part metadata and so needs incremental accounting rather than an up-front
+estimate.
 
 ### Observability (`internal/obs`, `query/profile`)
 

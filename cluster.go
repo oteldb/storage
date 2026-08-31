@@ -852,6 +852,11 @@ func (s *Storage) localRecordFetch(
 ) ([]*fetch.Batch, error) {
 	tid := s.normalizeTenant(signal.TenantID(tenant))
 
+	// This path reaches the engine directly rather than through [Storage.recordFetcher], so it must
+	// install the read budget itself — otherwise a peer serving a fan-out admits nothing and
+	// materializes the whole result the caller has already said it has no room for.
+	ctx = withReadBudget(ctx, s.maxQueryBytes)
+
 	eng, ok := s.lookupRecordEngine(sig, tid)
 	if !ok || !s.canAnswer(ctx, rpcOpRead, sig, tid, start, end) {
 		return nil, cluster.ErrShardAbsent
