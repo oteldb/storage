@@ -20,7 +20,6 @@ import (
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/fetch"
@@ -135,7 +134,7 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 		s.decodeBudget = engine.NewDecodeBudget(o.DecodeMemoryBytes)
 	}
 
-	s.maxQueryBytes = memlimit.QueryShare(o.MaxQueryBytes)
+	s.maxQueryBytes = readbudget.ProcessShare(o.MaxQueryBytes)
 
 	observer, err := obs.New(obs.Config{Logger: o.Logger, TracerProvider: o.TracerProvider, MeterProvider: o.MeterProvider})
 	if err != nil {

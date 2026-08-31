@@ -16,6 +16,8 @@ import (
 	"sync"
 
 	"github.com/go-faster/errors"
+
+	"github.com/oteldb/storage/internal/memlimit"
 )
 
 // ErrExceeded is returned by [Budget.Reserve] when a query has asked for more memory than it is
@@ -129,3 +131,14 @@ func From(ctx context.Context) *Budget {
 
 	return b
 }
+
+// ProcessShare resolves a configured limit against the memory the process actually has, so a
+// deployment that sets nothing still gets a bound that tracks the container it runs in rather than a
+// constant that is right at exactly one deployment size.
+//
+// It is exported because a query-only node has no [Storage] to derive it from and must size its own
+// budget the same way an embedded one does — one sizing rule, not two that drift.
+//
+// configured: 0 takes a share of the detected process budget, positive is taken as given, and
+// negative opts out (0, meaning install no limiter).
+func ProcessShare(configured int64) int64 { return memlimit.QueryShare(configured) }
