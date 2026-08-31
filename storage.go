@@ -23,9 +23,9 @@ import (
 	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/parallel"
-	"github.com/oteldb/storage/internal/readbudget"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/scale"
+	"github.com/oteldb/storage/readbudget"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
@@ -145,8 +145,11 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	s.obs = observer
 	s.clusterOpts = []cluster.Option{cluster.WithTracerProvider(o.TracerProvider)}
 
-	// Meter the backend only when a meter is configured, so the default path is the bare backend.
-	if o.MeterProvider != nil {
+	// The wrapper carries two concerns — metering and the per-query read budget — so it is applied
+	// when either is wanted. The budget defaults to a share of process memory, so in practice this is
+	// always on; an embedder that wants the bare backend opts out of the bound with a negative
+	// MaxQueryBytes, which is also the only way to get an unmetered, uncharged read path.
+	if o.MeterProvider != nil || s.maxQueryBytes > 0 {
 		s.backend = instrumentBackend(s.backend, s.obs.Backend)
 	}
 
@@ -595,6 +598,27 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 	inner := fetch.Budgeted(s.scaleWrap(s.baseFetcher(tenants), tenants))
 
 	return seedFetcher{inner: inner, obs: s.obs, maxQueryBytes: s.maxQueryBytes, signal: signal.Metric.String()}
+}
+
+// WithQueryBudget returns ctx carrying a fresh read budget at this store's configured limit
+// ([Options.MaxQueryBytes]), so every read the query makes — across several fetches, and at every
+// layer that materializes bytes — is charged against one allowance.
+//
+// Install it at the request boundary. Without it each fetch gets its own budget, which still bounds
+// each fetch but lets a request that opens several (a TraceQL search runs one fetch per filter
+// group; a LogQL evaluation resolves stream labels before fetching records) hold a multiple of the
+// limit. It is the read-side twin of [fetch.WithScope], and belongs at the same boundary.
+//
+// A budget that outlives its query keeps its reservations forever, and the bound then holds nothing
+// back — so scope it to the request, never to the process.
+func (s *Storage) WithQueryBudget(ctx context.Context) context.Context {
+	// Idempotent, like [fetch.WithScope]: a nested install would hand the inner call a fresh
+	// allowance and silently uncap the query it was meant to bound.
+	if readbudget.From(ctx) != nil {
+		return ctx
+	}
+
+	return readbudget.With(ctx, readbudget.New(s.maxQueryBytes))
 }
 
 // MetricSeries returns the identities of a tenant's metric series matching the label matchers with

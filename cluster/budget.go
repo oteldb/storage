@@ -8,7 +8,7 @@ import (
 
 	"github.com/go-faster/errors"
 
-	"github.com/oteldb/storage/internal/readbudget"
+	"github.com/oteldb/storage/readbudget"
 )
 
 // budgetHeader carries the caller's remaining memory allowance to a peer, so the peer stops early

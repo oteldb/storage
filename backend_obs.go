@@ -21,8 +21,10 @@ type instrumentedBackend struct {
 	m     *obs.Backend
 }
 
-// instrumentBackend wraps b so its operations are metered. It is applied only when a meter is
-// configured, so the default path is the bare backend.
+// instrumentBackend wraps b so its operations are metered and its reads are charged to the query's
+// memory budget. The two ride one decorator on purpose: it already forwards every optional backend
+// capability, and a second wrapper that forgot one would silently turn a ranged column read back
+// into a whole-object read (see [backend.ReaderAt]). It is applied when either concern is live.
 func instrumentBackend(b backend.Backend, m *obs.Backend) backend.Backend {
 	i := &instrumentedBackend{inner: b, m: m}
 

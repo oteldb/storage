@@ -6,7 +6,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
-	"github.com/oteldb/storage/internal/readbudget"
+	"github.com/oteldb/storage/readbudget"
 )
 
 // The backend charge point: what a query pulls off disk or out of an object store, denominated in

@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/oteldb/storage/internal/readbudget"
+	"github.com/oteldb/storage/readbudget"
 )
 
 // ErrTooLarge is returned once a query has asked to hold more memory than its budget allows. It is
