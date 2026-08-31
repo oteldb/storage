@@ -23,6 +23,7 @@ import (
 	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/parallel"
+	"github.com/oteldb/storage/internal/readbudget"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/scale"
 	"github.com/oteldb/storage/recordengine"
@@ -591,9 +592,9 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 		return fetch.Merge() // empty
 	}
 
-	inner := fetch.LimitBytes(s.scaleWrap(s.baseFetcher(tenants), tenants), s.maxQueryBytes)
+	inner := fetch.Budgeted(s.scaleWrap(s.baseFetcher(tenants), tenants))
 
-	return seedFetcher{inner: inner, obs: s.obs, signal: signal.Metric.String()}
+	return seedFetcher{inner: inner, obs: s.obs, maxQueryBytes: s.maxQueryBytes, signal: signal.Metric.String()}
 }
 
 // MetricSeries returns the identities of a tenant's metric series matching the label matchers with
@@ -784,13 +785,20 @@ func (s *Storage) AggregateMetricsWindowNamed(
 // every downstream fetcher (fan-out, remote, engine) can log a trace-correlated line, and emits one
 // Debug at the query boundary. It does not touch the request.
 type seedFetcher struct {
-	inner  fetch.Fetcher
-	obs    *obs.Obs
-	signal string
+	inner fetch.Fetcher
+	obs   *obs.Obs
+	// maxQueryBytes seeds a per-fetch budget when the caller installed none. An embedder that wants
+	// one budget across a whole query — a PromQL request and every selector under it — installs it
+	// at the request boundary with [readbudget.With] and that one wins.
+	maxQueryBytes int64
+	signal        string
 }
 
 func (f seedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
 	ctx = f.obs.Base(ctx)
+	if readbudget.From(ctx) == nil {
+		ctx = readbudget.With(ctx, readbudget.New(f.maxQueryBytes))
+	}
 	f.obs.Logger(ctx).Debug("query fetch",
 		zap.String("signal", f.signal), zap.Int("matchers", len(r.Matchers)),
 		zap.Int64("start", r.Start), zap.Int64("end", r.End))

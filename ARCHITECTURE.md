@@ -96,13 +96,27 @@ has no room for — bytes **and** inodes, checked separately — and latches, so
 not a policy but a fact about the disk, so it is enforced in the engines rather than at the facade,
 and it clears itself when a later flush finds room (`engine/ARCH.md`, "Disk pressure").
 
-The read path has its own bound, on the same principle. `Options.MaxQueryBytes` caps how many bytes
-one query may materialize, refusing it with `fetch.ErrTooLarge` rather than letting an unselective
-read — every span in a wide window to answer one tag lookup — take the process down. It is installed
-at the fetch seam, so it covers metrics, logs, traces and profiles, local and cluster alike. This is
-distinct from `DecodeMemoryBytes`, which is *admission*: that budget makes concurrent metric queries
-queue behind a shared ceiling, but it admits an over-budget query alone and never rejects, so it
-bounds queries against each other rather than any one of them against the process.
+The read path has its own bound, on the same principle. `Options.MaxQueryBytes` caps what one query
+may hold, refusing it with `fetch.ErrTooLarge` rather than letting an unselective read — every span
+in a wide window to answer one tag lookup — take the process down.
+
+It is a single budget (`internal/readbudget`) in peak resident bytes, carried on the query context
+and charged at all three places a query materializes memory: a backend read (`backend_budget.go`,
+riding the metering decorator so every optional capability stays forwarded), a fan-out response body
+(`cluster/budget.go`), and a decoded batch (`query/fetch`, `Budgeted`). Each charges what it itself
+allocates and releases when it frees, so no amplification factor is needed between layers and the
+sum is the query's real peak. The first two can refuse before the memory is committed; the last
+measures what actually exhausts the heap. Aliased reads — a memory-backend or read-cache view — are
+not charged, since those bytes are resident regardless of the query and bounded by that cache.
+
+In cluster mode the aggregator sends its remaining allowance to each peer (`X-Oteldb-Read-Budget`),
+so it is one budget enforced at several points rather than independent limits. The same number
+applies at both ends, never multiplied by peer count: the allowance belongs to the query's answer,
+not the cluster's shape.
+
+This is distinct from `DecodeMemoryBytes`, which is *admission*: that budget makes concurrent metric
+queries queue behind a shared ceiling, but it admits an over-budget query alone and never rejects,
+so it bounds queries against each other rather than any one of them against the process.
 
 ### Observability (`internal/obs`, `query/profile`)
 

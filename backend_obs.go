@@ -103,6 +103,7 @@ func (b *instrumentedBackend) FreeInodes(ctx context.Context) (int64, error) {
 func (b *instrumentedBackend) Read(ctx context.Context, key string) ([]byte, error) {
 	start := time.Now()
 	v, err := b.inner.Read(ctx, key)
+	v, err = chargeRead(ctx, v, err)
 	b.m.Record(ctx, "read", result(err), time.Since(start), int64(len(v)))
 	zctx.From(ctx).Debug("backend read",
 		zap.String("key", key), zap.Int("bytes", len(v)),
@@ -115,7 +116,11 @@ func (b *instrumentedBackend) Read(ctx context.Context, key string) ([]byte, err
 // in metering does not silently reintroduce the defensive copy. Implements [backend.Viewer].
 func (b *instrumentedBackend) ReadView(ctx context.Context, key string) ([]byte, error) {
 	start := time.Now()
+
 	v, err := backend.ReadView(ctx, b.inner, key)
+	if !aliases(b.inner, false) {
+		v, err = chargeRead(ctx, v, err)
+	}
 	b.m.Record(ctx, "read", result(err), time.Since(start), int64(len(v)))
 	zctx.From(ctx).Debug("backend read",
 		zap.String("key", key), zap.Int("bytes", len(v)),
@@ -128,8 +133,14 @@ func (b *instrumentedBackend) ReadView(ctx context.Context, key string) ([]byte,
 // Without it a metered backend would hide the capability and every column read would pull the whole
 // object. Implements [backend.ReaderAt].
 func (b *instrumentedBackend) ReadAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	if err := preflightRead(ctx, key, n); err != nil {
+		return nil, err
+	}
+
 	start := time.Now()
+
 	v, err := backend.ReadAt(ctx, b.inner, key, off, n)
+	v, err = chargeRead(ctx, v, err)
 	b.m.Record(ctx, "read", result(err), time.Since(start), int64(len(v)))
 	zctx.From(ctx).Debug("backend read",
 		zap.String("key", key), zap.Int("bytes", len(v)),
@@ -142,8 +153,19 @@ func (b *instrumentedBackend) ReadAt(ctx context.Context, key string, off, n int
 // ReadViewAt forwards the no-copy ranged read, so metering does not reintroduce a copy per frame on
 // the query path. Implements [backend.ViewerAt].
 func (b *instrumentedBackend) ReadViewAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	ranged := aliases(b.inner, true)
+	if !ranged {
+		if err := preflightRead(ctx, key, n); err != nil {
+			return nil, err
+		}
+	}
+
 	start := time.Now()
+
 	v, err := backend.ReadViewAt(ctx, b.inner, key, off, n)
+	if !ranged {
+		v, err = chargeRead(ctx, v, err)
+	}
 	b.m.Record(ctx, "read", result(err), time.Since(start), int64(len(v)))
 
 	return v, err

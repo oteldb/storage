@@ -97,11 +97,20 @@ type Options struct {
 	// unselective read — every span in a wide window to answer one tag lookup — had nothing standing
 	// between it and the process memory.
 	//
-	// The bound counts bytes read, not bytes retained: a caller that streams and releases is charged
-	// for what it passed through. That is intended — the usual consumers accumulate, and a query
-	// reading tens of gigabytes is worth refusing either way. Zero ⇒ a share of the detected process
-	// budget (GOMEMLIMIT, else the cgroup limit, else host memory); negative ⇒ unbounded, for an
-	// embedder that bounds reads itself.
+	// It is denominated in peak resident bytes and charged wherever a query materializes memory — a
+	// part read off the backend, a fan-out response body, a decoded batch — each releasing when it
+	// frees. So the bound is on what a query holds at once: a consumer that streams and releases is
+	// charged only for what is in flight, and one that accumulates is charged for all of it, without
+	// either having to say which it is.
+	//
+	// In cluster mode the same number applies at the aggregator and at each peer, and the aggregator
+	// sends its *remaining* allowance along with the request so a peer stops early. It is deliberately
+	// not multiplied by the peer count: the allowance belongs to the query's answer, not to the
+	// cluster's shape, and scaling it per peer would mean adding nodes raises the peak heap one
+	// process can be driven to by a single query.
+	//
+	// Zero ⇒ a share of the detected process budget (GOMEMLIMIT, else the cgroup limit, else host
+	// memory); negative ⇒ unbounded, for an embedder that bounds reads itself.
 	MaxQueryBytes int64
 
 	// MergeMemoryBytes caps how much memory all concurrent merges together may hold. What that
