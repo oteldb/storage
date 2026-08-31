@@ -57,24 +57,6 @@ and releases stays O(1) in matched series. The flip side is that the producer's 
 whole iteration — so **every caller must Close** (`Drain` does it for you, at the cost of
 materializing the result set it was meant to avoid).
 
-`Budgeted(inner)` charges every batch a fetch materializes against the query's memory budget
-(`internal/readbudget`, carried on the context) and fails it with `ErrTooLarge` past the allowance.
-It is **rejection**, the complement of the metric engine's decode budget: that one queues concurrent
-queries behind a shared ceiling but admits an over-budget query *alone*, and it covers only the
-metric engine — the record engines have no decode admission at all.
-
-The reservation is released when the batch is, so the bound is on what the query holds **at once**.
-A consumer that streams and releases is charged only for what is in flight; one that accumulates
-(`Drain`) is charged for everything. Neither has to declare which it is. The wrapper preserves the
-producer's own release hook rather than replacing it, and returns any still-outstanding reservation
-at `Close`.
-
-This is the last of three charge points on one budget — a backend read, a fan-out response body, and
-a materialized batch. Because each charges what it itself allocates, in the same unit, no
-layer-to-layer amplification factor is needed anywhere: the sum is the query's real peak. The
-earlier two can refuse *before* the memory is committed but only estimate what the bytes expand to;
-this one measures the thing that actually exhausts the heap, just later.
-
 `Merge(fetchers...)` is the fan-out combinator (union by series id, timestamp-ordered, later child
 wins a duplicate) backing multi-tenant and cluster reads; `MergeBatches` is its batch-level form (a
 materializing merge over already-drained groups, used by `SplitFetcher`). Children are opened

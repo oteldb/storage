@@ -1,14 +1,16 @@
-// Package readbudget bounds how much memory one query may hold at once.
+// Package readbudget bounds how much memory one query may hold at once, so an unselective read
+// fails loudly instead of taking the process down.
 //
-// It is denominated in **peak resident bytes**, and that is the whole point of having one package
-// rather than a limit per layer. A query's bytes enter at several places — a part column read off
-// disk, a fan-out response body off the network, a materialized batch — and each of those measures
-// something different: compressed on-disk bytes, wire bytes, Go structs. Left as separate limits
-// they would be three knobs where whichever is tightest binds and the other two are dead.
+// The bound is charged where a read can still be refused — before the memory is committed — which in
+// practice means at the producer, not around it. The record engine reads every part, accumulates
+// every survivor and materializes every output batch before it returns an iterator at all, so
+// anything wrapping that iterator sees only bytes that are already resident. It therefore admits
+// against an estimate of its decoded footprint taken from part metadata, mirroring what the metric
+// engine's decode budget does with [engine.DecodeBudget].
 //
-// So every charge point converts into the same unit before charging. Where part metadata gives a
-// real estimate of the decoded footprint, that estimate is charged rather than the compressed size;
-// only the network body, where the wire size is all that is known, has to approximate.
+// Unlike that budget, this one *rejects*. Decode admission queues concurrent queries behind a shared
+// ceiling but admits an over-budget query alone rather than refusing it, so it bounds queries against
+// each other and never any one of them against the process.
 package readbudget
 
 import (
@@ -142,3 +144,28 @@ func From(ctx context.Context) *Budget {
 // configured: 0 takes a share of the detected process budget, positive is taken as given, and
 // negative opts out (0, meaning install no limiter).
 func ProcessShare(configured int64) int64 { return memlimit.QueryShare(configured) }
+
+type hintKey struct{}
+
+// WithLimitHint returns ctx carrying an upper bound a *caller* has declared — the remaining
+// allowance a cluster aggregator sent with its request.
+//
+// It is deliberately a hint and not a budget. A declared limit may only ever *lower* what this node
+// grants a query (see [LimitHint] callers), never raise it: the value arrives over the network, so
+// treating it as authoritative would let anyone able to reach the read endpoint hand themselves an
+// unbounded query by declaring a huge allowance.
+func WithLimitHint(ctx context.Context, n int64) context.Context {
+	if n <= 0 {
+		return ctx
+	}
+
+	return context.WithValue(ctx, hintKey{}, n)
+}
+
+// LimitHint returns the caller-declared upper bound, or 0 when none was declared. Callers must
+// combine it with their own configured limit by taking the smaller of the two.
+func LimitHint(ctx context.Context) int64 {
+	n, _ := ctx.Value(hintKey{}).(int64)
+
+	return n
+}

@@ -23,9 +23,8 @@ func TestBudgetHeaderRoundTrip(t *testing.T) {
 	sendBudget(readbudget.With(context.Background(), b), h)
 	assert.Equal(t, "600", h.Get(budgetHeader), "a peer is told what is left, not the original limit")
 
-	got := readbudget.From(recvBudget(context.Background(), h))
-	require.NotNil(t, got)
-	assert.Equal(t, int64(600), got.Remaining())
+	assert.Equal(t, int64(600), readbudget.LimitHint(recvBudget(context.Background(), h)),
+		"the declared value arrives as a hint the receiver may only tighten with, never adopt")
 }
 
 // Both ends run the same number on purpose. Giving each of N peers a full allowance would make the
@@ -55,12 +54,13 @@ func TestBudgetHeaderAbsentOrMalformed(t *testing.T) {
 	h := http.Header{}
 	sendBudget(ctx, h)
 	assert.Empty(t, h.Get(budgetHeader))
-	assert.Nil(t, readbudget.From(recvBudget(ctx, h)))
+	assert.Zero(t, readbudget.LimitHint(recvBudget(ctx, h)))
 
 	for _, raw := range []string{"", "abc", "-1", "0"} {
 		h := http.Header{}
 		h.Set(budgetHeader, raw)
-		assert.Nil(t, readbudget.From(recvBudget(ctx, h)), "malformed %q is treated as unbounded", raw)
+		assert.Zero(t, readbudget.LimitHint(recvBudget(ctx, h)),
+			"malformed %q declares nothing, so the node keeps its own limit", raw)
 	}
 }
 

@@ -29,9 +29,16 @@ func sendBudget(ctx context.Context, h http.Header) {
 	}
 }
 
-// recvBudget returns ctx carrying the allowance the caller declared, so the peer's own read is
-// bounded by what the caller can still hold. A missing, malformed, or non-positive header leaves ctx
-// untouched: a peer must not invent a bound the caller did not ask for.
+// recvBudget returns ctx carrying the allowance the caller declared, so this node's own read is
+// bounded by what the caller can still hold.
+//
+// It records the value as a *hint*, never as the budget itself. The header arrives over the network,
+// so a node that adopted it verbatim would let anyone able to reach the read endpoint grant itself an
+// unbounded query by declaring a huge allowance — the local limit would then be skipped, because a
+// budget was already installed. As a hint it can only lower what this node grants, never raise it.
+//
+// A missing, malformed, or non-positive header leaves ctx untouched, and the node falls back to its
+// own configured limit.
 func recvBudget(ctx context.Context, h http.Header) context.Context {
 	raw := h.Get(budgetHeader)
 	if raw == "" {
@@ -43,7 +50,7 @@ func recvBudget(ctx context.Context, h http.Header) context.Context {
 		return ctx
 	}
 
-	return readbudget.With(ctx, readbudget.New(n))
+	return readbudget.WithLimitHint(ctx, n)
 }
 
 // readBudgetedBody reads a fan-out response body under the query's memory budget.

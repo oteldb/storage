@@ -425,7 +425,10 @@ func (e *Engine) Stats() Stats {
 // Fetch implements [fetch.Fetcher] over head ∪ flushed parts: it resolves matchers to streams,
 // gathers each stream's in-window records (decoding only the referenced columns), applies the
 // column conditions and projection, and returns one batch per stream sorted by timestamp.
-func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
+func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, rerr error) {
+	// admitted flips once the reservation is handed to the returned iterator; until then every exit
+	// path returns it.
+	var admitted bool
 	ctx = e.cfg.Obs.Base(ctx)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "recordengine.fetch",
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
@@ -519,6 +522,23 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 		return nil, planErr
 	}
 
+	// Admission before the first backend read: past this point the plan materializes its whole
+	// result set, so a refusal after it would come too late to be worth anything.
+	releaseBudget, err := plan.admit(ctx)
+	if err != nil {
+		span.RecordError(err)
+
+		return nil, err
+	}
+
+	defer func() {
+		// Every path that does not hand the caller an iterator must give the reservation back; the
+		// successful one transfers it to the iterator's Close.
+		if rerr != nil || !admitted {
+			releaseBudget()
+		}
+	}()
+
 	if err := plan.readParts(ctx); err != nil {
 		span.RecordError(err)
 
@@ -582,7 +602,9 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 	record(rows)
 
-	return fetch.NewSliceIterator(batches), nil
+	admitted = true
+
+	return &budgetedIterator{Iterator: fetch.NewSliceIterator(batches), release: releaseBudget}, nil
 }
 
 // matchedStream pairs a matched stream's id with its accumulated, ts-sorted records during a fetch.

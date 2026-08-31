@@ -8,7 +8,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
-	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/readbudget"
 	"github.com/oteldb/storage/signal"
@@ -29,67 +28,57 @@ func openLimited(t *testing.T, maxQueryBytes int64) *Storage {
 	return s
 }
 
-// The record seam (traces/logs/profiles), which has no decode admission control of its own: a wide
-// unselective read is exactly the shape that used to run until the process died.
-func TestFacadeTraceFetchRefusesOverBudget(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	s := openLimited(t, 1) // one byte: any batch at all overruns it
+func writeTwoTraceStreams(t *testing.T, ctx context.Context, s *Storage) {
+	t.Helper()
 
 	_, err := s.WriteTraces(ctx, traceBatch("api",
 		spanSpec{traceID: "t1", spanID: "s1", name: "GET /users", start: 100, end: 150},
 		spanSpec{traceID: "t1", spanID: "s2", parent: "s1", name: "db.query", start: 110, end: 120},
 	))
 	require.NoError(t, err)
-
-	it, err := s.TraceFetcher("default").Fetch(ctx, fetch.Request{
-		Tenant: "default",
-		Signal: signal.Trace,
-		Start:  0,
-		End:    1_000,
-	})
-	require.NoError(t, err, "the budget is enforced while reading, not at plan time")
-
-	_, err = fetch.Drain(ctx, it)
-	assert.ErrorIs(t, err, fetch.ErrTooLarge)
 }
 
-// The metric seam. The decode budget already queues concurrent metric queries, but it admits an
-// over-budget query alone rather than refusing it, so this bound is what makes one query fail.
-func TestFacadeMetricFetchRefusesOverBudget(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	s := openLimited(t, 1)
-
-	_, err := s.WriteMetrics(ctx, gaugeBatch("api", "m1", []int64{1, 2, 3}, []float64{1, 2, 3}))
-	require.NoError(t, err)
-
-	it, err := s.Fetcher("default").Fetch(ctx, fetch.Request{
-		Tenant: "default",
-		Start:  0,
-		End:    1_000_000_000,
-	})
-	require.NoError(t, err)
-
-	_, err = fetch.Drain(ctx, it)
-	assert.ErrorIs(t, err, fetch.ErrTooLarge)
-}
-
-// A generous budget must be invisible: the bound is a backstop, not a behavior change.
-func TestFacadeFetchUnderBudgetIsUnchanged(t *testing.T) {
+// The record engine refuses before it reads, which is the only point at which refusing is worth
+// anything: past it, Fetch materializes the whole result set before returning an iterator.
+func TestRecordFetchRefusesBeforeReading(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	s := openLimited(t, 1<<30)
 
-	_, err := s.WriteTraces(ctx, traceBatch("api",
-		spanSpec{traceID: "t1", spanID: "s1", name: "GET /users", start: 100, end: 150},
-	))
-	require.NoError(t, err)
+	writeTwoTraceStreams(t, ctx, s)
+	require.NoError(t, s.Admin().Flush(ctx, "default", signal.Trace))
 
-	it, err := s.TraceFetcher("default").Fetch(ctx, fetch.Request{
+	// One byte of allowance: the estimate for any flushed part overruns it.
+	budget := readbudget.New(1)
+	bctx := readbudget.With(ctx, budget)
+
+	_, err := s.TraceFetcher("default").Fetch(bctx, fetch.Request{
+		Tenant: "default",
+		Signal: signal.Trace,
+		Start:  0,
+		End:    1_000,
+	})
+	require.ErrorIs(t, err, readbudget.ErrExceeded,
+		"the refusal comes from Fetch itself, not from draining an iterator")
+	assert.Equal(t, int64(1), budget.Remaining(), "a refused read reserves nothing")
+}
+
+// A generous budget must be invisible, and the reservation must come back when the caller closes —
+// otherwise one query permanently shrinks the next.
+func TestRecordFetchReleasesOnClose(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := openLimited(t, 1<<30)
+
+	writeTwoTraceStreams(t, ctx, s)
+	require.NoError(t, s.Admin().Flush(ctx, "default", signal.Trace))
+
+	budget := readbudget.New(1 << 30)
+	bctx := readbudget.With(ctx, budget)
+
+	it, err := s.TraceFetcher("default").Fetch(bctx, fetch.Request{
 		Tenant: "default",
 		Signal: signal.Trace,
 		Start:  0,
@@ -97,55 +86,46 @@ func TestFacadeFetchUnderBudgetIsUnchanged(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	got, err := fetch.Drain(ctx, it)
+	got, err := fetch.Drain(bctx, it)
 	require.NoError(t, err)
 	assert.NotEmpty(t, got, "a query well inside its budget reads normally")
+
+	// Drain closes the iterator, which is what hands the reservation back.
+	assert.Equal(t, int64(1<<30), budget.Remaining(), "Close returns the whole reservation")
 }
 
-// Opting out must install no limiter, so an embedder that bounds reads itself pays nothing.
+// Closing twice must not credit the budget twice, or a later query overdraws.
+func TestRecordFetchDoubleCloseDoesNotDoubleCredit(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := openLimited(t, 1<<30)
+
+	writeTwoTraceStreams(t, ctx, s)
+	require.NoError(t, s.Admin().Flush(ctx, "default", signal.Trace))
+
+	budget := readbudget.New(1 << 30)
+	bctx := readbudget.With(ctx, budget)
+
+	it, err := s.TraceFetcher("default").Fetch(bctx, fetch.Request{
+		Tenant: "default",
+		Signal: signal.Trace,
+		Start:  0,
+		End:    1_000,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, it.Close())
+	require.NoError(t, it.Close())
+
+	assert.Equal(t, int64(1<<30), budget.Remaining(), "the reservation is returned exactly once")
+}
+
 func TestFacadeFetchUnboundedOptOut(t *testing.T) {
 	t.Parallel()
 
 	s := openLimited(t, -1)
 	assert.Zero(t, s.maxQueryBytes, "a negative cap resolves to no limiter at all")
-}
-
-// The backend charge point, on a backend that really copies. It runs with no MeterProvider on
-// purpose: the budget must not depend on whether metrics happen to be configured.
-func TestFacadeBackendReadIsCharged(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-
-	be, err := file.New(t.TempDir())
-	require.NoError(t, err)
-
-	s, err := Open(ctx, Options{MaxQueryBytes: 1 << 20},
-		WithBackend(be),
-	)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close(ctx) })
-
-	_, err = s.WriteTraces(ctx, traceBatch("api",
-		spanSpec{traceID: "t1", spanID: "s1", name: "GET /users", start: 100, end: 150},
-	))
-	require.NoError(t, err)
-	require.NoError(t, s.Admin().Flush(ctx, "default", signal.Trace))
-
-	// One byte of allowance: the first part read the query makes must be refused, and the refusal
-	// has to come from the backend rather than from a batch that was already materialized.
-	budget := readbudget.New(1)
-
-	it, err := s.TraceFetcher("default").Fetch(readbudget.With(ctx, budget), fetch.Request{
-		Tenant: "default",
-		Signal: signal.Trace,
-		Start:  0,
-		End:    1_000,
-	})
-	require.NoError(t, err)
-
-	_, err = fetch.Drain(readbudget.With(ctx, budget), it)
-	require.ErrorIs(t, err, fetch.ErrTooLarge)
 }
 
 // WithQueryBudget is the seam an embedder installs at its request boundary so several fetches share
@@ -164,4 +144,51 @@ func TestFacadeWithQueryBudget(t *testing.T) {
 
 	assert.Same(t, b, readbudget.From(s.WithQueryBudget(qctx)),
 		"an already-budgeted context is not re-budgeted out from under the query")
+}
+
+// A caller-declared allowance may tighten this node's limit but never loosen it: the value arrives
+// over the network.
+func TestSeedBudgetHintOnlyLowers(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := openLimited(t, 4096)
+
+	f := seedFetcher{inner: nopFetcher{}, obs: s.obs, maxQueryBytes: s.maxQueryBytes, signal: "trace"}
+
+	for _, tc := range []struct {
+		name string
+		hint int64
+		want int64
+	}{
+		{"lower wins", 1024, 1024},
+		{"higher is ignored", 1 << 40, 4096},
+		{"absent falls back", 0, 4096},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			hctx := readbudget.WithLimitHint(ctx, tc.hint)
+
+			it, err := f.Fetch(hctx, fetch.Request{})
+			require.NoError(t, err)
+
+			got := it.(*capturedIterator).budget
+			require.NotNil(t, got)
+			assert.Equal(t, tc.want, got.Remaining())
+		})
+	}
+}
+
+// nopFetcher captures the budget the seed installed on the context.
+type nopFetcher struct{}
+
+func (nopFetcher) Fetch(ctx context.Context, _ fetch.Request) (fetch.Iterator, error) {
+	return &capturedIterator{budget: readbudget.From(ctx)}, nil
+}
+
+type capturedIterator struct {
+	fetch.Iterator
+
+	budget *readbudget.Budget
 }

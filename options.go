@@ -89,25 +89,21 @@ type Options struct {
 	// whole budget is admitted alone (it cannot be bounded below its own footprint).
 	DecodeMemoryBytes int64
 
-	// MaxQueryBytes caps how many bytes one query may read before it is refused with an error
-	// wrapping [fetch.ErrTooLarge]. It bounds a *single* query against the process, which is the gap
+	// MaxQueryBytes caps what one query may hold before it is refused with an error wrapping
+	// [readbudget.ErrExceeded]. It bounds a *single* query against the process, which is the gap
 	// DecodeMemoryBytes leaves: that budget queues concurrent queries behind a shared ceiling but
-	// admits an over-budget query alone rather than refusing it, and it covers only the metric
-	// engine — the record engines (logs, traces, profiles) have no decode admission at all. So an
-	// unselective read — every span in a wide window to answer one tag lookup — had nothing standing
-	// between it and the process memory.
+	// admits an over-budget query alone rather than refusing it, and it covers only the metric engine
+	// — the record engines (logs, traces, profiles) had no admission control at all. So an unselective
+	// read — every span in a wide window to answer one tag lookup — had nothing between it and the
+	// process memory.
 	//
-	// It is denominated in peak resident bytes and charged wherever a query materializes memory — a
-	// part read off the backend, a fan-out response body, a decoded batch — each releasing when it
-	// frees. So the bound is on what a query holds at once: a consumer that streams and releases is
-	// charged only for what is in flight, and one that accumulates is charged for all of it, without
-	// either having to say which it is.
+	// The record engines reserve their estimated decoded footprint from part metadata before reading,
+	// and release it when the caller closes the iterator. The estimate is a per-part average over
+	// variable-width records, so it is approximate — deliberately in the over-counting direction,
+	// since it counts whole stream ranges rather than the window's slice of them.
 	//
-	// In cluster mode the same number applies at the aggregator and at each peer, and the aggregator
-	// sends its *remaining* allowance along with the request so a peer stops early. It is deliberately
-	// not multiplied by the peer count: the allowance belongs to the query's answer, not to the
-	// cluster's shape, and scaling it per peer would mean adding nodes raises the peak heap one
-	// process can be driven to by a single query.
+	// In cluster mode the aggregator sends its remaining allowance with the request; a receiver may
+	// only use it to tighten its own limit, never to raise it.
 	//
 	// Zero ⇒ a share of the detected process budget (GOMEMLIMIT, else the cgroup limit, else host
 	// memory); negative ⇒ unbounded, for an embedder that bounds reads itself.

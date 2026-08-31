@@ -144,11 +144,8 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	s.obs = observer
 	s.clusterOpts = []cluster.Option{cluster.WithTracerProvider(o.TracerProvider)}
 
-	// The wrapper carries two concerns — metering and the per-query read budget — so it is applied
-	// when either is wanted. The budget defaults to a share of process memory, so in practice this is
-	// always on; an embedder that wants the bare backend opts out of the bound with a negative
-	// MaxQueryBytes, which is also the only way to get an unmetered, uncharged read path.
-	if o.MeterProvider != nil || s.maxQueryBytes > 0 {
+	// Meter the backend only when a meter is configured, so the default path is the bare backend.
+	if o.MeterProvider != nil {
 		s.backend = instrumentBackend(s.backend, s.obs.Backend)
 	}
 
@@ -594,7 +591,7 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 		return fetch.Merge() // empty
 	}
 
-	inner := fetch.Budgeted(s.scaleWrap(s.baseFetcher(tenants), tenants))
+	inner := s.scaleWrap(s.baseFetcher(tenants), tenants)
 
 	return seedFetcher{inner: inner, obs: s.obs, maxQueryBytes: s.maxQueryBytes, signal: signal.Metric.String()}
 }
@@ -820,7 +817,14 @@ type seedFetcher struct {
 func (f seedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
 	ctx = f.obs.Base(ctx)
 	if readbudget.From(ctx) == nil {
-		ctx = readbudget.With(ctx, readbudget.New(f.maxQueryBytes))
+		// A cluster caller may declare how much room it still has, which can only tighten this node's
+		// own limit — never loosen it. See [readbudget.WithLimitHint].
+		limit := f.maxQueryBytes
+		if hint := readbudget.LimitHint(ctx); hint > 0 && (limit <= 0 || hint < limit) {
+			limit = hint
+		}
+
+		ctx = readbudget.With(ctx, readbudget.New(limit))
 	}
 	f.obs.Logger(ctx).Debug("query fetch",
 		zap.String("signal", f.signal), zap.Int("matchers", len(r.Matchers)),

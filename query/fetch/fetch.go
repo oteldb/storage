@@ -208,12 +208,6 @@ func (b *Batch) ScaleFactor(i int) float64 {
 	return b.ScaleFactors[i]
 }
 
-const (
-	sizeofInt64       = 8
-	sizeofFloat64     = 8
-	sizeofSliceHeader = 24 // ptr + len + cap on every 64-bit platform Go targets.
-)
-
 // NamedColumn is one materialized column of a log [Batch]: its name and exactly one populated
 // typed slice (Int64/Float64/Bytes), matching the physical column kind. Row i of the batch is
 // Int64[i] / Float64[i] / Bytes[i] for that column.
@@ -222,42 +216,6 @@ type NamedColumn struct {
 	Int64   []int64
 	Float64 []float64
 	Bytes   [][]byte
-}
-
-// Size estimates the batch's heap footprint in bytes: the sample arrays plus every materialized
-// column. A byte value is charged its payload and its slice header, because a column of many small
-// values costs far more than the sum of its lengths — that gap is exactly what makes a wide scan
-// exhaust memory sooner than a naive byte count predicts.
-//
-// It is the quantity [LimitBytes] charges against, so it stays O(rows) with no allocation: every
-// term is a length except the byte columns, whose element lengths must be summed.
-func (b *Batch) Size() int64 {
-	if b == nil {
-		return 0
-	}
-
-	n := int64(len(b.Timestamps))*sizeofInt64 +
-		int64(len(b.Values))*sizeofFloat64 +
-		int64(len(b.ScaleFactors))*sizeofFloat64
-
-	for i := range b.Columns {
-		n += b.Columns[i].size()
-	}
-
-	return n
-}
-
-// size estimates the column's heap footprint. See [Batch.Size].
-func (c NamedColumn) size() int64 {
-	n := int64(len(c.Name)) +
-		int64(len(c.Int64))*sizeofInt64 +
-		int64(len(c.Float64))*sizeofFloat64
-
-	for _, v := range c.Bytes {
-		n += int64(len(v)) + sizeofSliceHeader
-	}
-
-	return n
 }
 
 // Column returns the named column of the batch and whether it is present.

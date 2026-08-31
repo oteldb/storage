@@ -97,26 +97,29 @@ not a policy but a fact about the disk, so it is enforced in the engines rather 
 and it clears itself when a later flush finds room (`engine/ARCH.md`, "Disk pressure").
 
 The read path has its own bound, on the same principle. `Options.MaxQueryBytes` caps what one query
-may hold, refusing it with `fetch.ErrTooLarge` rather than letting an unselective read — every span
-in a wide window to answer one tag lookup — take the process down.
+may hold, refusing it with `readbudget.ErrExceeded` rather than letting an unselective read — every
+span in a wide window to answer one tag lookup — take the process down.
 
-It is a single budget (`internal/readbudget`) in peak resident bytes, carried on the query context
-and charged at all three places a query materializes memory: a backend read (`backend_budget.go`,
-riding the metering decorator so every optional capability stays forwarded), a fan-out response body
-(`cluster/budget.go`), and a decoded batch (`query/fetch`, `Budgeted`). Each charges what it itself
-allocates and releases when it frees, so no amplification factor is needed between layers and the
-sum is the query's real peak. The first two can refuse before the memory is committed; the last
-measures what actually exhausts the heap. Aliased reads — a memory-backend or read-cache view — are
-not charged, since those bytes are resident regardless of the query and bounded by that cache.
+It is a single budget (`readbudget`) carried on the query context, charged where a refusal is still
+worth something: **before** the memory is committed. That rules out wrapping the fetcher, because
+`recordengine.Fetch` reads every part, accumulates every survivor and materializes every batch before
+it returns an iterator — anything around that iterator would reject after the allocation it was meant
+to prevent. So the record engine admits against an estimate of its decoded footprint taken from part
+metadata (`recordengine/budget.go`), the way the metric engine's decode budget does, and releases the
+reservation when the caller closes. The estimate needs no guessed expansion factor: a part's manifest
+records its *decoded* size, so scaling it by the share of rows a request touches is honest, modulo a
+per-part average over variable-width records.
 
-In cluster mode the aggregator sends its remaining allowance to each peer (`X-Oteldb-Read-Budget`),
-so it is one budget enforced at several points rather than independent limits. The same number
-applies at both ends, never multiplied by peer count: the allowance belongs to the query's answer,
-not the cluster's shape.
+The cluster fan-out body is bounded separately (`cluster/budget.go`), since `io.ReadAll` on a peer
+response is an unbounded remote input nothing else covers. The aggregator sends its remaining
+allowance in `X-Oteldb-Read-Budget`; a receiver treats that as a **hint that may only lower** its own
+configured limit, never raise it — the value arrives over the network, so adopting it verbatim would
+let anyone reaching the read endpoint grant themselves an unbounded query.
 
-This is distinct from `DecodeMemoryBytes`, which is *admission*: that budget makes concurrent metric
-queries queue behind a shared ceiling, but it admits an over-budget query alone and never rejects,
-so it bounds queries against each other rather than any one of them against the process.
+This is distinct from `DecodeMemoryBytes`, which is *admission*: it makes concurrent metric queries
+queue behind a shared ceiling, but admits an over-budget query alone and never rejects. The metric
+read path is still covered only by that budget; the rejecting bound is on the record engines, which
+had no admission control at all.
 
 ### Observability (`internal/obs`, `query/profile`)
 
