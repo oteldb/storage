@@ -25,6 +25,18 @@ type PartStat struct {
 	SizeBytes int64
 }
 
+// LogicalBytes is the part's uncompressed size for a compression ratio: [PartStat.SizeBytes] when
+// the manifest recorded it, and otherwise the same per-row estimate the engine falls back to
+// internally, so a store still holding pre-manifest parts reports an approximate ratio rather than
+// none at all.
+func (p PartStat) LogicalBytes() int64 {
+	if p.SizeBytes > 0 {
+		return p.SizeBytes
+	}
+
+	return p.Rows * recordRowBytes
+}
+
 // PartDetailStat augments [PartStat] with fields that need a backend read: the on-backend byte size
 // (summed over the part's objects) and the column/codec layout and chunk count from the manifest
 // (cached on the open part, so only Bytes incurs additional I/O).

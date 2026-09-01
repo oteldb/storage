@@ -211,3 +211,25 @@ func TestMergeCapBytes(t *testing.T) {
 		})
 	}
 }
+
+// TestPartStatLogicalBytes pins the legacy fallback: a part whose manifest predates the recorded
+// decoded size must still report an approximate logical size, so a store holding such parts shows
+// an estimated compression ratio rather than none.
+func TestPartStatLogicalBytes(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		stat PartStat
+		want int64
+	}{
+		{"recorded", PartStat{Rows: 10, SizeBytes: 4096}, 4096},
+		{"legacy", PartStat{Rows: 10}, 10 * recordRowBytes},
+		{"legacy empty", PartStat{}, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, tt.stat.LogicalBytes())
+		})
+	}
+}
