@@ -128,9 +128,13 @@ func (s *Storage) LogKeys(ctx context.Context, tenant signal.TenantID, start, en
 		return nil, nil
 	}
 
-	raw := eng.Keys(start, end)
+	return keyInfosFromEngine(eng.Keys(start, end)), nil
+}
+
+// keyInfosFromEngine converts the record engine's key list into the facade's [KeyInfo] type.
+func keyInfosFromEngine(raw []recordengine.KeyInfo) []KeyInfo {
 	if len(raw) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	out := make([]KeyInfo, len(raw))
@@ -138,7 +142,7 @@ func (s *Storage) LogKeys(ctx context.Context, tenant signal.TenantID, start, en
 		out[i] = KeyInfo{Key: raw[i].Key, Scope: KeyScope(raw[i].Scope)}
 	}
 
-	return out, nil
+	return out
 }
 
 // keyInfosFromCluster converts the cluster RPC's key list into the facade's [KeyInfo] type.

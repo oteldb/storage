@@ -66,6 +66,36 @@ func (s *Storage) TraceSeries(
 	return eng.Series(matchers, start, end), nil
 }
 
+// TraceKeys returns the distinct attribute keys present in a tenant's spans within [start, end],
+// each tagged with the scope(s) it appears in (resource, scope, span). A zero start AND end disables
+// the time filter. It is to [Storage.TraceSeries] what [Storage.LogKeys] is to [Storage.LogSeries]:
+// the [KeyScopeRecord] keys are the per-span attribute names that stream enumeration cannot see, so
+// an embedder can answer a TraceQL tag-name request without materializing spans, and the scope
+// bitset distinguishes a stream label from a span attribute (or both). Keys are low-cardinality
+// metadata. In cluster mode it serves locally when this node owns the tenant, else it fans out to an
+// owner (hedged); each owner is a complete replica, so one response is authoritative.
+func (s *Storage) TraceKeys(ctx context.Context, tenant signal.TenantID, start, end int64) ([]KeyInfo, error) {
+	if s.closed.Load() {
+		return nil, errors.Wrap(ErrClosed, "trace keys")
+	}
+
+	if s.cluster != nil {
+		raw, err := s.clusterKeys(ctx, signal.Trace, s.normalizeTenant(tenant), start, end)
+		if err != nil {
+			return nil, err
+		}
+
+		return keyInfosFromCluster(raw), nil
+	}
+
+	eng, ok := s.lookupTraceEngine(s.normalizeTenant(tenant))
+	if !ok {
+		return nil, nil
+	}
+
+	return keyInfosFromEngine(eng.Keys(start, end)), nil
+}
+
 // Trace fetches every span of one trace from a tenant by trace id: an equality condition on the
 // trace_id column, pruned by its per-part equality bloom (trace-by-id). It returns one batch per
 // stream (service) carrying the trace's spans — including the nested-set columns the embedder's
