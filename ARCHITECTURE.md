@@ -62,7 +62,7 @@ engines over the fetch seam (`query/fetch`).
   Returns `Accepted{Accepted, Rejected, RejectedReason}` (OTLP partial success).
 - **Read** — `Fetcher(tenants...)` and the per-signal variants return a `fetch.Fetcher` over
   head ∪ parts; no tenants ⇒ all (cross-tenant fan-out, merged by series id). Plus the
-  convenience/enumeration primitives: `Trace`, `LogsForTrace`, `LogSeries`, `LogKeys`,
+  convenience/enumeration primitives: `Trace`, `LogsForTrace`, `LogSeries`, `LogKeys`, `TraceSeries`, `TraceKeys`,
   `ColumnValues` (a record column's — or one attribute key's — distinct values, answered from the
   part dictionaries, so tag/label autocomplete never scans rows),
   `MetricSeries`, `ProfileSeries`, `ProfileResolver`,
