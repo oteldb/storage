@@ -1298,7 +1298,8 @@ func (s *Storage) recordEngineFor(sig signal.Signal, tenant string) (*recordengi
 
 // applyReplicated is the secondary receive path: it decodes a primary's accepted write and applies
 // it verbatim to the local tenant engine for the addressed signal — no OOO re-check, the primary
-// already decided.
+// already decided. It deliberately does not tally admission: the primary already did, and a second
+// tally per replica would multiply the cluster-wide total by RF (see primaryWrite).
 func (s *Storage) applyReplicated(_ context.Context, payload []byte) error {
 	sig, tenant, walBytes, err := cluster.DecodeWrite(payload)
 	if err != nil {
@@ -1479,12 +1480,15 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 	}
 
 	// Policy is per real tenant; in sharded-metric mode tenant is a shard key ({tenant}/_s{idx}).
-	limits := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(signal.TenantID(tenant)))).Limits
+	tid := s.normalizeTenant(tenantOfShard(signal.TenantID(tenant)))
+	limits := s.tenant.Resolve(tid).Limits
 
 	var (
-		accepted []byte
-		rej      cluster.Reject
-		err      error
+		accepted   []byte
+		rej        cluster.Reject
+		admitted   int64
+		overflowed int64
+		err        error
 	)
 
 	if sig == signal.Metric {
@@ -1495,6 +1499,7 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 				MaxSeries: limits.MaxSeries, MaxInFlightBytes: limits.MaxInFlightBytes,
 			})
 			rej = cluster.Reject{OOO: res.RejectedOOO, Cardinality: res.RejectedCardinality, InFlight: res.RejectedBytes}
+			admitted, overflowed = int64(res.Accepted), int64(res.Overflowed)
 			s.pokeFlush(eng)
 		}
 	} else {
@@ -1505,12 +1510,27 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 				MaxSeries: limits.MaxSeries, MaxInFlightBytes: limits.MaxInFlightBytes,
 			})
 			rej = cluster.Reject{OOO: res.RejectedOOO, Cardinality: res.RejectedCardinality, InFlight: res.RejectedBytes}
+			admitted = int64(res.Accepted)
 			s.pokeFlush(eng)
 		}
 	}
 
 	if err != nil {
 		return cluster.Reject{}, errors.Wrapf(err, "primary apply for tenant %q", tenant)
+	}
+
+	// The clustered write is tallied here and nowhere else. The origin cannot: only the primary
+	// runs the OOO/cardinality/in-flight valves, and it discards the breakdown after answering the
+	// write (issue #451). The secondaries must not: applyReplicated replays the *already admitted*
+	// set verbatim, so counting there would inflate the cluster-wide total by RF and make the
+	// rejection reasons — always zero on a replica — read as a lower shed rate than really happened.
+	// The origin still owns the rate valve, which the primary never sees, so the cluster-wide sum
+	// stays one tally per point.
+	admit := s.admissionFor(tid)
+	admit.record(admitted, int64(rej.OOO), int64(rej.Cardinality), int64(rej.InFlight))
+
+	if overflowed > 0 {
+		admit.recordOverflowed(overflowed)
 	}
 
 	rf := s.rfFor(signal.TenantID(tenant))
