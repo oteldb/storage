@@ -107,13 +107,20 @@ func (s *Storage) rfFor(shardKey signal.TenantID) int {
 // owner's own newer index). A no-op in single-node mode, with a shared backend, or when the
 // shard has no reachable peers; errors are swallowed like the rest of the maintenance loop
 // (the next pass retries).
+//
+// A node that is not one of the shard's ring owners mirrors nothing. Without that check the mirror
+// is bounded only by who has peers, so every member that happens to hold an engine for the prefix
+// pulls the whole shard and the on-disk footprint becomes the membership size rather than RF — and
+// it is self-sustaining, since startup recovery rebuilds an engine from whatever the last pass
+// copied. The maintenance caller cannot make this decision for us: it branches on *compaction*
+// ownership, which a non-owner also fails, so it reaches the replica path too.
 func (s *Storage) syncParts(ctx context.Context, tid signal.TenantID, signalPrefix string, strict bool) bool {
 	if s.cluster == nil || !s.cluster.private {
 		return false
 	}
 
-	_, remotes := s.shardOwners(tid)
-	if len(remotes) == 0 {
+	local, remotes := s.shardOwners(tid)
+	if !local || len(remotes) == 0 {
 		return false
 	}
 
