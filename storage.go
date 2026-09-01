@@ -24,6 +24,7 @@ import (
 	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/scale"
+	"github.com/oteldb/storage/readbudget"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
@@ -69,6 +70,10 @@ type Storage struct {
 	// shared by every tenant engine so concurrent queries cannot multiply resident decoded bytes
 	// past the cap. nil ⇒ unlimited.
 	decodeBudget *engine.DecodeBudget
+
+	// maxQueryBytes is the per-query read bound ([Options.MaxQueryBytes]) resolved once against the
+	// process memory budget. 0 ⇒ no limiter is installed at all.
+	maxQueryBytes int64
 
 	admitMu sync.Mutex                           // guards admit
 	admit   map[signal.TenantID]*tenantAdmission // per-tenant admission state (rate valve + counters)
@@ -128,6 +133,8 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	if o.DecodeMemoryBytes > 0 {
 		s.decodeBudget = engine.NewDecodeBudget(o.DecodeMemoryBytes)
 	}
+
+	s.maxQueryBytes = readbudget.ProcessShare(o.MaxQueryBytes)
 
 	observer, err := obs.New(obs.Config{Logger: o.Logger, TracerProvider: o.TracerProvider, MeterProvider: o.MeterProvider})
 	if err != nil {
@@ -584,7 +591,48 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 		return fetch.Merge() // empty
 	}
 
-	return seedFetcher{inner: s.scaleWrap(s.baseFetcher(tenants), tenants), obs: s.obs, signal: signal.Metric.String()}
+	inner := s.scaleWrap(s.baseFetcher(tenants), tenants)
+
+	return seedFetcher{inner: inner, obs: s.obs, maxQueryBytes: s.maxQueryBytes, signal: signal.Metric.String()}
+}
+
+// withReadBudget installs a read budget of limit bytes unless the caller already installed one.
+//
+// A cluster caller may declare how much room it still has ([readbudget.WithLimitHint]); that can only
+// tighten this node's own limit, never loosen it. The declared value arrives over the network, so a
+// node that adopted it outright would let anyone able to reach the read endpoint grant itself an
+// unbounded query.
+func withReadBudget(ctx context.Context, limit int64) context.Context {
+	if readbudget.From(ctx) != nil {
+		return ctx
+	}
+
+	if hint := readbudget.LimitHint(ctx); hint > 0 && (limit <= 0 || hint < limit) {
+		limit = hint
+	}
+
+	return readbudget.With(ctx, readbudget.New(limit))
+}
+
+// WithQueryBudget returns ctx carrying a fresh read budget at this store's configured limit
+// ([Options.MaxQueryBytes]), so every read the query makes — across several fetches, and at every
+// layer that materializes bytes — is charged against one allowance.
+//
+// Install it at the request boundary. Without it each fetch gets its own budget, which still bounds
+// each fetch but lets a request that opens several (a TraceQL search runs one fetch per filter
+// group; a LogQL evaluation resolves stream labels before fetching records) hold a multiple of the
+// limit. It is the read-side twin of [fetch.WithScope], and belongs at the same boundary.
+//
+// A budget that outlives its query keeps its reservations forever, and the bound then holds nothing
+// back — so scope it to the request, never to the process.
+func (s *Storage) WithQueryBudget(ctx context.Context) context.Context {
+	// Idempotent, like [fetch.WithScope]: a nested install would hand the inner call a fresh
+	// allowance and silently uncap the query it was meant to bound.
+	if readbudget.From(ctx) != nil {
+		return ctx
+	}
+
+	return readbudget.With(ctx, readbudget.New(s.maxQueryBytes))
 }
 
 // MetricSeries returns the identities of a tenant's metric series matching the label matchers with
@@ -775,13 +823,17 @@ func (s *Storage) AggregateMetricsWindowNamed(
 // every downstream fetcher (fan-out, remote, engine) can log a trace-correlated line, and emits one
 // Debug at the query boundary. It does not touch the request.
 type seedFetcher struct {
-	inner  fetch.Fetcher
-	obs    *obs.Obs
-	signal string
+	inner fetch.Fetcher
+	obs   *obs.Obs
+	// maxQueryBytes seeds a per-fetch budget when the caller installed none. An embedder that wants
+	// one budget across a whole query — a PromQL request and every selector under it — installs it
+	// at the request boundary with [readbudget.With] and that one wins.
+	maxQueryBytes int64
+	signal        string
 }
 
 func (f seedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
-	ctx = f.obs.Base(ctx)
+	ctx = withReadBudget(f.obs.Base(ctx), f.maxQueryBytes)
 	f.obs.Logger(ctx).Debug("query fetch",
 		zap.String("signal", f.signal), zap.Int("matchers", len(r.Matchers)),
 		zap.Int64("start", r.Start), zap.Int64("end", r.End))

@@ -425,7 +425,10 @@ func (e *Engine) Stats() Stats {
 // Fetch implements [fetch.Fetcher] over head ∪ flushed parts: it resolves matchers to streams,
 // gathers each stream's in-window records (decoding only the referenced columns), applies the
 // column conditions and projection, and returns one batch per stream sorted by timestamp.
-func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
+func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, rerr error) {
+	// admitted flips once the reservation is handed to the returned iterator; until then every exit
+	// path returns it.
+	var admitted bool
 	ctx = e.cfg.Obs.Base(ctx)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "recordengine.fetch",
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
@@ -508,7 +511,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	// live parts to read, and capture stream identities. Releasing the lock before the backend reads
 	// lets appends and flush/merge proceed concurrently — the acquired parts can't be reclaimed until
 	// we release them, so the lock-free reads never race a delete.
-	plan, planErr := e.planFetch(ids, r)
+	plan, planErr := e.planFetch(ctx, ids, r)
 	e.mu.RUnlock()
 
 	defer plan.releaseParts()
@@ -518,6 +521,14 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 		return nil, planErr
 	}
+
+	defer func() {
+		// Every path that does not hand the caller an iterator must give the reservation back; the
+		// successful one transfers it to the iterator's Close.
+		if rerr != nil || !admitted {
+			plan.releaseBudget()
+		}
+	}()
 
 	if err := plan.readParts(ctx); err != nil {
 		span.RecordError(err)
@@ -582,7 +593,9 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 
 	record(rows)
 
-	return fetch.NewSliceIterator(batches), nil
+	admitted = true
+
+	return &budgetedIterator{Iterator: fetch.NewSliceIterator(batches), release: plan.releaseBudget}, nil
 }
 
 // matchedStream pairs a matched stream's id with its accumulated, ts-sorted records during a fetch.
@@ -936,6 +949,10 @@ func (e *Engine) streamInRangeLocked(id signal.SeriesID, start, end int64) bool 
 // accumulators already seeded from the head, the acquired (ref-held) live parts still to read, and the
 // captured stream identities. Its [fetchPlan.readParts] does the backend I/O off the lock.
 type fetchPlan struct {
+	// releaseBudget returns the plan's memory reservation. Always non-nil after planFetch, including
+	// on an unbudgeted read, so no caller needs a nil check on an error path.
+	releaseBudget func()
+
 	e          *Engine
 	sel        colSel
 	ids        []signal.SeriesID
@@ -1013,8 +1030,11 @@ func (e *Engine) getRecordCols(n int, sel colSel) *recordCols {
 	return newRecordCols(e.cfg.Schema, n, sel)
 }
 
-func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) (*fetchPlan, error) {
+func (e *Engine) planFetch(ctx context.Context, ids []signal.SeriesID, r fetch.Request) (*fetchPlan, error) {
+	noopRelease := func() {}
 	p := &fetchPlan{
+		releaseBudget: noopRelease,
+
 		e:      e,
 		sel:    selectColumns(e.cfg.Schema, r),
 		ids:    ids,
@@ -1064,6 +1084,29 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) (*fetchPlan, 
 			p.rowsLive += rows
 		}
 	}
+
+	// Admission goes here, between selecting the parts and sizing the accumulators: the loop below
+	// pre-allocates each stream's buffers to the rows it will hold, which is the fetch's largest
+	// allocation and happens before any part is read.
+	var accRows int64
+
+	for k, id := range p.sortedIDs {
+		n := partRows[k] + e.head.recordCount(id)
+		if buf := e.flushing[id]; buf != nil {
+			n += buf.len()
+		}
+
+		accRows += int64(n)
+	}
+
+	release, err := p.admit(ctx, accRows)
+	if err != nil {
+		// Return the plan, not nil: it already holds acquired parts, and [Engine.Fetch] releases them
+		// through its deferred releaseParts even on a planning error.
+		return p, err
+	}
+
+	p.releaseBudget = release
 
 	for k, id := range p.sortedIDs {
 		n := partRows[k] + e.head.recordCount(id)

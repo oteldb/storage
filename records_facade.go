@@ -280,7 +280,9 @@ func (s *Storage) recordFetcher(
 	}
 
 	seed := func(f fetch.Fetcher) fetch.Fetcher {
-		return seedFetcher{inner: f, obs: s.obs, signal: sig.String()}
+		return seedFetcher{
+			inner: f, obs: s.obs, maxQueryBytes: s.maxQueryBytes, signal: sig.String(),
+		}
 	}
 
 	if s.cluster != nil && len(tenants) > 0 {

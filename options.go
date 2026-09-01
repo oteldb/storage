@@ -89,6 +89,31 @@ type Options struct {
 	// whole budget is admitted alone (it cannot be bounded below its own footprint).
 	DecodeMemoryBytes int64
 
+	// MaxQueryBytes caps what one query may hold before it is refused with an error wrapping
+	// [readbudget.ErrExceeded]. It bounds a *single* query against the process, which is the gap
+	// DecodeMemoryBytes leaves: that budget queues concurrent queries behind a shared ceiling but
+	// admits an over-budget query alone rather than refusing it, and it covers only the metric engine
+	// — the record engines (logs, traces, profiles) had no admission control at all. So an unselective
+	// read — every span in a wide window to answer one tag lookup — had nothing between it and the
+	// process memory.
+	//
+	// The record engines reserve their estimated decoded footprint from part metadata before reading,
+	// and release it when the caller closes the iterator. The estimate is a per-part average over
+	// variable-width records, so it is approximate — deliberately in the over-counting direction,
+	// since it counts whole stream ranges rather than the window's slice of them.
+	//
+	// In cluster mode the aggregator sends its remaining allowance with the request; a receiver may
+	// only use it to tighten its own limit, never to raise it.
+	//
+	// It covers record *fetches*. The enumeration reads — [Storage.ColumnValues], the per-signal
+	// Series and Keys lookups — are not admitted: they build a distinct set whose size is not
+	// predictable from part metadata, so they need incremental accounting rather than an up-front
+	// estimate. A high-cardinality enumeration is still unbounded.
+	//
+	// Zero ⇒ a share of the detected process budget (GOMEMLIMIT, else the cgroup limit, else host
+	// memory); negative ⇒ unbounded, for an embedder that bounds reads itself.
+	MaxQueryBytes int64
+
 	// MergeMemoryBytes caps how much memory all concurrent merges together may hold. What that
 	// bounds depends on the backend: one that takes objects whole makes a merge buffer its output
 	// part *encoded* in RAM until it is sealed, so part size and merge memory are the same number and

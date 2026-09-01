@@ -415,6 +415,9 @@ func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc, opts ...Option) 
 		}
 
 		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace (peer fetch spans nest)
+		// Serve under the caller's remaining allowance, so this node stops rather than materializing a
+		// response the caller has already run out of room for.
+		ctx = recvBudget(ctx, req.Header)
 		ctx, span := o.Tracer.Start(ctx, "cluster.serve.fetch",
 			trace.WithAttributes(attribute.String("storage.signal", sig.String())))
 		defer func() { endSpan(span, err) }()
@@ -506,6 +509,7 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Ite
 	}
 
 	obs.InjectHTTP(ctx, req.Header) // carry the trace into the read fan-out
+	sendBudget(ctx, req.Header)     // and what the caller still has room to accept
 
 	wantProfile := profile.Active(ctx)
 	if wantProfile {
@@ -518,10 +522,13 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Ite
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	body, releaseBody, err := readBudgetedBody(ctx, resp.Body, resp.ContentLength)
 	if err != nil {
-		return nil, errors.Wrap(err, "read response")
+		return nil, err
 	}
+	// The wire bytes are transient: past the decode below the batches carry the memory and are
+	// charged in their own right.
+	defer releaseBody()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, statusError(f.addr, "fetch", resp.StatusCode, body)
