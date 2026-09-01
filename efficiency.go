@@ -26,12 +26,20 @@ type SignalEfficiency struct {
 	// BytesPerPoint is StoredBytes / Points (0 when empty) — the per-sample storage cost, the
 	// single most useful capacity-planning number.
 	BytesPerPoint float64
-	// LogicalBytes is the uncompressed logical size of the stored points. Exact for metrics
-	// (Points × 16: an int64 timestamp + a float64 value); 0 for the record signals, whose
-	// per-record logical size varies and is not recorded per part.
+	// LogicalBytes is the uncompressed size of what the parts hold, but the two signal families
+	// measure it differently and the difference is worth knowing before comparing their ratios.
+	// For metrics it is the wire-shaped size, Points × [engine.SampleBytes] (an int64 timestamp
+	// plus a float64 value). Records are variable-width, so there is no such constant: theirs is
+	// the sum of the parts' *decoded column footprints* as recorded in their manifests — the same
+	// figure the merge cap and the size tiers are denominated in, so it needs no decode and no
+	// guessed expansion factor.
+	//
+	// A record part written before the manifest carried that figure falls back to
+	// [recordengine.PartStat.LogicalBytes]' per-row estimate, so a store holding legacy parts
+	// reports an approximate ratio rather than a wrong one.
 	LogicalBytes int64
 	// CompressionRatio is LogicalBytes / StoredBytes (e.g. 8.0 = stored at 1/8th of logical);
-	// 0 when LogicalBytes is unknown (record signals) or nothing is stored.
+	// 0 when nothing is stored.
 	CompressionRatio float64
 }
 
@@ -86,9 +94,10 @@ func (s *Storage) EfficiencyStats(ctx context.Context) ([]TenantEfficiency, erro
 			for _, p := range parts {
 				se.Points += p.Rows
 				se.StoredBytes += p.Bytes
+				se.LogicalBytes += p.LogicalBytes()
 			}
 
-			finishEfficiency(&se) // LogicalBytes stays 0: record logical size is not recorded
+			finishEfficiency(&se)
 			tenantOf(tid).Signals = append(tenantOf(tid).Signals, se)
 		}
 

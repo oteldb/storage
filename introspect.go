@@ -26,9 +26,14 @@ type PartInfo struct {
 type PartDetail struct {
 	PartInfo
 
-	Bytes   int64        // sum of the part's backend object sizes
-	Chunks  int          // sparse-index granules
-	Columns []ColumnInfo // per-column physical layout
+	Bytes int64 // sum of the part's backend object sizes
+	// LogicalBytes is the part's uncompressed size, so that Bytes / LogicalBytes gives its
+	// compression ratio without a second call. It is measured per signal family exactly as
+	// [SignalEfficiency.LogicalBytes] describes: Rows × [engine.SampleBytes] for metrics, the
+	// manifest's decoded column footprint (or the per-row estimate, for a legacy part) for records.
+	LogicalBytes int64
+	Chunks       int          // sparse-index granules
+	Columns      []ColumnInfo // per-column physical layout
 }
 
 // ColumnInfo is one part column's physical description.
@@ -280,7 +285,8 @@ func metricPartDetails(ds []engine.PartDetailStat) []PartDetail {
 	for i, d := range ds {
 		out[i] = PartDetail{
 			PartInfo: PartInfo{ID: d.ID, MinTime: d.MinTime, MaxTime: d.MaxTime, Series: d.Series, Rows: d.Rows},
-			Bytes:    d.Bytes, Chunks: d.Chunks, Columns: metricColumns(d.Columns),
+			Bytes:    d.Bytes, LogicalBytes: d.Rows * engine.SampleBytes,
+			Chunks: d.Chunks, Columns: metricColumns(d.Columns),
 		}
 	}
 
@@ -292,7 +298,8 @@ func recordPartDetails(ds []recordengine.PartDetailStat) []PartDetail {
 	for i, d := range ds {
 		out[i] = PartDetail{
 			PartInfo: PartInfo{ID: d.ID, MinTime: d.MinTime, MaxTime: d.MaxTime, Series: d.Series, Rows: d.Rows},
-			Bytes:    d.Bytes, Chunks: d.Chunks, Columns: recordColumns(d.Columns),
+			Bytes:    d.Bytes, LogicalBytes: d.LogicalBytes(),
+			Chunks: d.Chunks, Columns: recordColumns(d.Columns),
 		}
 	}
 
