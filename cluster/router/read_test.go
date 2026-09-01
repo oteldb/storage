@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,9 +30,12 @@ type peer struct {
 	side   map[string][]byte
 	aggs   []engine.NamedAgg
 
-	// records is the record-signal (log/trace) answer, carrying per-record columns. A peer never
-	// receives a request's columnar conditions, so this is deliberately the unfiltered window.
+	// records is the record-signal (log/trace) answer, carrying per-record columns. A peer answers
+	// with the unfiltered window here (a superset the router must narrow), whatever it was asked.
 	records []*fetch.Batch
+
+	mu        sync.Mutex
+	lastFetch fetch.Request
 
 	// absent makes every endpoint disclaim the shard, the way an owner that holds no data for it
 	// answers.
@@ -51,18 +55,21 @@ func (p *peer) serve(t *testing.T) string {
 	}
 
 	mux := http.NewServeMux()
-	fetchFn := func(answer []*fetch.Batch) cluster.FetchFunc {
-		return func(context.Context, string, int64, int64, []fetch.Matcher) ([]*fetch.Batch, error) {
-			if p.absent {
-				return nil, cluster.ErrShardAbsent
-			}
+	mux.Handle(cluster.ReadPath, cluster.NewReadHandler(func(_ context.Context, r fetch.Request) ([]*fetch.Batch, error) {
+		p.mu.Lock()
+		p.lastFetch = r
+		p.mu.Unlock()
 
-			return answer, nil
+		if p.absent {
+			return nil, cluster.ErrShardAbsent
 		}
-	}
 
-	mux.Handle(cluster.ReadPath, cluster.ReadHandler(
-		fetchFn(batches), fetchFn(p.records), fetchFn(p.records), nil))
+		if r.Signal == signal.Metric {
+			return batches, nil
+		}
+
+		return p.records, nil
+	}))
 	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(
 		func(context.Context, signal.Signal, string, int64, int64, []fetch.Matcher) ([]signal.Series, error) {
 			if p.absent {
@@ -294,21 +301,22 @@ func TestReadsEmptyOnEmptyRing(t *testing.T) {
 }
 
 // TestFetcherAppliesConditions pins trace-by-id over the cluster. Its whole predicate is a columnar
-// condition on the trace id — there are no matchers — and conditions never cross the wire, so a peer
-// answers with every span it holds. Narrowing only by matchers returned that entire window as if it
-// were one trace.
+// condition on the trace id — there are no matchers — so the peer is asked for the id's equality
+// hint (which prunes its parts) and its Match closure, which cannot cross the wire, is re-applied
+// here. Narrowing only by matchers returned the peer's entire window as if it were one trace.
 func TestFetcherAppliesConditions(t *testing.T) {
 	t.Parallel()
 
 	series := svcSeries("api")
-	r := openRouter(t, &peer{records: []*fetch.Batch{{
+	p := &peer{records: []*fetch.Batch{{
 		ID:         series.Hash(),
 		Series:     series,
 		Timestamps: []int64{1, 2, 3},
 		Columns: []fetch.NamedColumn{
 			{Name: "trace_id", Bytes: [][]byte{[]byte("aaa"), []byte("bbb"), []byte("aaa")}},
 		},
-	}}})
+	}}}
+	r := openRouter(t, p)
 
 	want := "aaa"
 	it, err := r.Fetcher(signal.Trace, "acme").Fetch(t.Context(), fetch.Request{
@@ -326,4 +334,13 @@ func TestFetcherAppliesConditions(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, batches, 1)
 	assert.Equal(t, []int64{1, 3}, batches[0].Timestamps, "the other trace's span is dropped, not returned")
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	require.Len(t, p.lastFetch.Conditions, 1, "the peer was told which trace to prune to")
+	require.NotNil(t, p.lastFetch.Conditions[0].Equal)
+	assert.Equal(t, want, p.lastFetch.Conditions[0].Equal.Value)
+	assert.Equal(t, "trace_id", p.lastFetch.Conditions[0].Column)
+	assert.Empty(t, p.lastFetch.Matchers, "a column equality is not pushed as a series-identity matcher")
 }

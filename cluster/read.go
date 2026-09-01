@@ -25,74 +25,29 @@ const (
 	httpScheme = "http"
 )
 
-// The cluster read RPC carries only a tenant and a time window — not the fetch matchers, which
-// are opaque Go predicates (not serializable). A peer returns every series in the window (a
-// superset, which the fetch contract permits); the requesting node re-applies its matchers.
+// The cluster read RPC carries a tenant, a time window, and the serializable *hints* of the
+// request's predicate — an equality matcher's spec, an equality condition's column and value. The
+// predicates themselves are opaque Go closures, so a peer answers with a superset (which the fetch
+// contract permits) and the requesting node re-applies them.
 
 // EncodeFetchRequest frames a fetch request: the signal, tenant, window, and any serializable
 // equality matchers to push down to the peer (other predicates are re-checked by the requester).
+// It carries no condition hints; [FetchRequest.Encode] does.
 func EncodeFetchRequest(sig signal.Signal, tenant string, start, end int64, eq []fetch.EqualMatcher) []byte {
-	buf := []byte{byte(sig)}
-	buf = appendString(buf, tenant)
-	buf = binary.AppendVarint(buf, start)
-	buf = binary.AppendVarint(buf, end)
-	buf = binary.AppendUvarint(buf, uint64(len(eq)))
-	for _, m := range eq {
-		buf = appendString(buf, m.Name)
-		buf = appendString(buf, m.Value)
-	}
-
-	return buf
+	return FetchRequest{Signal: sig, Tenant: tenant, Start: start, End: end, Equal: eq}.Encode()
 }
 
-// DecodeFetchRequest parses a request made by [EncodeFetchRequest].
+// DecodeFetchRequest parses a request made by [EncodeFetchRequest], dropping any condition hints.
+// [ParseFetchRequest] keeps them.
 //
 //nolint:gocritic // the wire shape is signal+tenant+window+matchers+err; a struct would obscure it
 func DecodeFetchRequest(data []byte) (sig signal.Signal, tenant string, start, end int64, eq []fetch.EqualMatcher, err error) {
-	if len(data) < 1 {
-		return 0, "", 0, 0, nil, errors.New("cluster: empty fetch request")
-	}
-
-	sig = signal.Signal(data[0])
-	data = data[1:]
-
-	tenant, data, err = takeString(data)
+	r, err := ParseFetchRequest(data)
 	if err != nil {
-		return 0, "", 0, 0, nil, errors.Wrap(err, "tenant")
+		return 0, "", 0, 0, nil, err
 	}
 
-	var m int
-	if start, m = binary.Varint(data); m <= 0 {
-		return 0, "", 0, 0, nil, errors.New("cluster: malformed fetch request start")
-	}
-	data = data[m:]
-
-	if end, m = binary.Varint(data); m <= 0 {
-		return 0, "", 0, 0, nil, errors.New("cluster: malformed fetch request end")
-	}
-	data = data[m:]
-
-	count, m := binary.Uvarint(data)
-	if m <= 0 {
-		return 0, "", 0, 0, nil, errors.New("cluster: malformed matcher count")
-	}
-	data = data[m:]
-
-	eq = make([]fetch.EqualMatcher, 0, count)
-	for range count {
-		var name, value string
-		if name, data, err = takeString(data); err != nil {
-			return 0, "", 0, 0, nil, errors.Wrap(err, "matcher name")
-		}
-
-		if value, data, err = takeString(data); err != nil {
-			return 0, "", 0, 0, nil, errors.Wrap(err, "matcher value")
-		}
-
-		eq = append(eq, fetch.EqualMatcher{Name: name, Value: value})
-	}
-
-	return sig, tenant, start, end, eq, nil
+	return r.Signal, r.Tenant, r.Start, r.End, r.Equal, nil
 }
 
 func appendString(dst []byte, s string) []byte {
@@ -371,11 +326,37 @@ func decodeColumn(data []byte) (fetch.NamedColumn, []byte, error) {
 // pushed-down matchers. It is what [ReadHandler] serves.
 type FetchFunc func(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error)
 
+// RequestFetchFunc serves one decoded read RPC from the local store. Unlike [FetchFunc] it sees
+// the whole [fetch.Request] — its signal, and the columnar conditions the requester pushed down —
+// so a peer prunes by them instead of scanning its whole window.
+type RequestFetchFunc func(ctx context.Context, r fetch.Request) ([]*fetch.Batch, error)
+
 // ReadHandler returns the HTTP handler that serves fetches from the local store, reconstructing
 // the pushed-down equality matchers and dispatching to the metric, log, trace, or profile fetch by
-// the request's signal (encoding the result with the matching batch codec — samples for metrics,
-// columns for the record signals). Mount it at [ReadPath].
+// the request's signal. Column conditions cannot reach a [FetchFunc], so a peer served this way
+// answers with its whole window for a condition-only request (trace-by-id); [NewReadHandler]
+// pushes them down. Mount it at [ReadPath].
 func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc, opts ...Option) http.Handler {
+	return NewReadHandler(func(ctx context.Context, r fetch.Request) ([]*fetch.Batch, error) {
+		fn := metricFn
+
+		switch r.Signal { //nolint:exhaustive // metric is the default
+		case signal.Log:
+			fn = logFn
+		case signal.Trace:
+			fn = traceFn
+		case signal.Profile:
+			fn = profileFn
+		}
+
+		return fn(ctx, string(r.Tenant), r.Start, r.End, r.Matchers)
+	}, opts...)
+}
+
+// NewReadHandler returns the HTTP handler that serves fetches from the local store, reconstructing
+// the request's pushed-down matchers and column conditions and encoding the result with the codec
+// matching its signal (samples for metrics, columns for the record signals). Mount it at [ReadPath].
+func NewReadHandler(fetchFn RequestFetchFunc, opts ...Option) http.Handler {
 	o := resolveOpts(opts)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -392,26 +373,19 @@ func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc, opts ...Option) 
 			return
 		}
 
-		sig, tenant, start, end, eq, err := DecodeFetchRequest(body)
+		decoded, err := ParseFetchRequest(body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 
 			return
 		}
 
-		matchers := make([]fetch.Matcher, len(eq))
-		for i := range eq {
-			matchers[i] = fetch.Matcher{Name: []byte(eq[i].Name), Match: eq[i].Predicate(), Spec: &eq[i]}
-		}
+		sig := decoded.Signal
+		fetchReq := decoded.Request()
 
-		fn, encode := metricFn, EncodeBatches
-		switch sig { //nolint:exhaustive // metric is the default
-		case signal.Log:
-			fn, encode = logFn, EncodeLogBatches
-		case signal.Trace:
-			fn, encode = traceFn, EncodeLogBatches // record signals share the column codec
-		case signal.Profile:
-			fn, encode = profileFn, EncodeLogBatches
+		encode := EncodeBatches
+		if sig != signal.Metric { // log, trace and profile share the column codec
+			encode = EncodeLogBatches
 		}
 
 		ctx := obs.ExtractHTTP(req.Context(), req.Header) // join the caller's trace (peer fetch spans nest)
@@ -430,7 +404,7 @@ func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc, opts ...Option) 
 		}
 
 		var batches []*fetch.Batch
-		batches, err = fn(ctx, tenant, start, end, matchers)
+		batches, err = fetchFn(ctx, fetchReq)
 		if err != nil {
 			writeRPCError(w, err)
 
@@ -462,9 +436,9 @@ func ReadHandler(metricFn, logFn, traceFn, profileFn FetchFunc, opts ...Option) 
 // the batches): [uvarint len][profile bytes][batches]. Absent ⇒ the plain batches response.
 const profileHeader = "X-Oteldb-Profile"
 
-// RemoteFetcher is a [fetch.Fetcher] over a peer node's [ReadHandler]. It forwards only the
-// request's tenant and window (matchers are re-applied by the caller), so it returns the
-// peer's full window — a superset the fetch contract permits.
+// RemoteFetcher is a [fetch.Fetcher] over a peer node's read handler. It forwards the request's
+// tenant, window and serializable predicates (matchers are re-applied by the caller), so it
+// returns a superset the fetch contract permits.
 type RemoteFetcher struct {
 	sig    signal.Signal
 	addr   string
@@ -483,9 +457,10 @@ func NewRemoteFetcher(sig signal.Signal, addr string, client *http.Client, opts 
 	return &RemoteFetcher{sig: sig, addr: addr, client: client, obs: resolveOpts(opts)}
 }
 
-// Fetch forwards r's tenant, window, and serializable (equality) matchers to the peer and
-// returns the decoded batches. Non-equality matchers (and columnar conditions) are not forwarded —
-// the requester re-applies them to the (possibly superset) result.
+// Fetch forwards r's tenant, window, and serializable (equality) predicates — both identity
+// matchers and the columnar condition hints — to the peer and returns the decoded batches. The
+// non-serializable predicates (a regex matcher, a condition's Match closure) stay behind, so the
+// answer is a superset the requester re-applies them to.
 func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, err error) {
 	ctx, span := f.obs.Tracer.Start(ctx, "cluster.fetch", trace.WithAttributes(
 		attribute.String("storage.rpc.peer", f.addr),
@@ -500,7 +475,11 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Ite
 		}
 	}
 
-	payload := EncodeFetchRequest(f.sig, string(r.Tenant), r.Start, r.End, eq)
+	payload := FetchRequest{
+		Signal: f.sig, Tenant: string(r.Tenant), Start: r.Start, End: r.End,
+		Equal:      eq,
+		Conditions: ConditionHints(r.Conditions, r.AllConditions),
+	}.Encode()
 
 	u := (&url.URL{Scheme: httpScheme, Host: f.addr}).JoinPath(ReadPath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
