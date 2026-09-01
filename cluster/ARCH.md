@@ -165,7 +165,16 @@ permits). Re-applying is `fetch.Filter` / `fetch.MatchesSeries` — one implemen
 shared by the node's fan-out and by `router`, since a superset every consumer must narrow the same
 way is a shared obligation, not a per-consumer one. **Equality is the exception**: `fetch.Matcher` may carry a serializable `EqualMatcher`
 spec, forwarded and pushed down on the peer, so a non-owner read narrows by `__name__` instead of
-pulling the whole window. Enumeration RPCs (series, keys, values, side store, aggregate) fan out the same
+pulling the whole window. A `fetch.Condition`'s `Equal` hint rides along the same way, in its **own**
+request field: it names a record column, so reconstructing it as an identity matcher would resolve it
+against the postings index and match no stream at all. The peer prunes parts by that column's
+equality bloom and drops the rows that fail it — sound because a hinted condition matches no row
+lacking the value, which is what already makes the local bloom prune sound. Without it a predicate
+carried entirely by conditions pushes nothing: trace-by-id is an equality on `trace_id` over an
+unbounded window, so every owner streamed its whole span history and the requester kept one trace.
+Hints ride only under `AllConditions` (without it a producer may ignore conditions, so ANDing them
+could drop rows), and are an **append-only tail** of the request encoding — a peer that predates them
+stops after the matchers and answers with the superset it always did. Enumeration RPCs (series, keys, values, side store, aggregate) fan out the same
 hedged way. The **values** RPC (`/internal/values`) is the one enumeration with its own request
 shape rather than `EncodeFetchRequest`: it carries a column name (or an attribute key) and a limit. The series RPC is **signal-dispatched**: one endpoint enumerates stream identities for
 logs/traces/profiles and metric series alike, so the metrics label endpoints answer from identities

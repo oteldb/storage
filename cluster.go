@@ -326,8 +326,7 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	mux.Handle(replica.ReplicatePath, rp.Handler())               // secondary: trusting apply
 	mux.Handle(cluster.PrimaryWritePath, s.primaryWriteHandler()) // primary: OOO apply + replicate
 	// read fan-out across metric/log/trace/profile signals.
-	mux.Handle(cluster.ReadPath, cluster.ReadHandler(s.localFetch,
-		s.recordFetchFunc(signal.Log), s.recordFetchFunc(signal.Trace), s.recordFetchFunc(signal.Profile), s.clusterOpts...))
+	mux.Handle(cluster.ReadPath, cluster.NewReadHandler(s.serveFetch, s.clusterOpts...))
 	// Metric aggregate pushdown: disjoint step buckets, and the overlapping-window variant.
 	mux.Handle(cluster.AggregatePath, cluster.AggregateHandler(s.localAggregate, s.clusterOpts...))
 	mux.Handle(cluster.AggregateWindowPath, cluster.AggregateWindowHandler(s.localAggregateWindow, s.clusterOpts...))
@@ -844,12 +843,22 @@ func mergeBucketLists(a, b []engine.BucketAgg) []engine.BucketAgg {
 	return out
 }
 
+// serveFetch serves a peer's read RPC from the local store, dispatching on the request's signal —
+// the receiving side of [cluster.NewReadHandler].
+func (s *Storage) serveFetch(ctx context.Context, r fetch.Request) ([]*fetch.Batch, error) {
+	if r.Signal == signal.Metric {
+		return s.localFetch(ctx, string(r.Tenant), r.Start, r.End, r.Matchers)
+	}
+
+	return s.localRecordFetch(ctx, r)
+}
+
 // localRecordFetch serves a peer's fetch for one record signal (logs, traces, or profiles) from the
-// local engine, pushing down the (equality) stream matchers it forwarded — the receiving side of
-// [cluster.ReadHandler] for everything but metrics.
-func (s *Storage) localRecordFetch(
-	ctx context.Context, sig signal.Signal, tenant string, start, end int64, matchers []fetch.Matcher,
-) ([]*fetch.Batch, error) {
+// local engine, pushing down the equality predicates it forwarded: the stream matchers, and the
+// column conditions that prune parts by bloom (without which a condition-only request — trace-by-id
+// — would scan the whole window).
+func (s *Storage) localRecordFetch(ctx context.Context, r fetch.Request) ([]*fetch.Batch, error) {
+	sig, tenant := r.Signal, string(r.Tenant)
 	tid := s.normalizeTenant(signal.TenantID(tenant))
 
 	// This path reaches the engine directly rather than through [Storage.recordFetcher], so it must
@@ -858,26 +867,16 @@ func (s *Storage) localRecordFetch(
 	ctx = withReadBudget(ctx, s.maxQueryBytes)
 
 	eng, ok := s.lookupRecordEngine(sig, tid)
-	if !ok || !s.canAnswer(ctx, rpcOpRead, sig, tid, start, end) {
+	if !ok || !s.canAnswer(ctx, rpcOpRead, sig, tid, r.Start, r.End) {
 		return nil, cluster.ErrShardAbsent
 	}
 
-	it, err := eng.Fetch(ctx, fetch.Request{
-		Signal: sig, Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers,
-	})
+	it, err := eng.Fetch(ctx, r)
 	if err != nil {
 		return nil, err
 	}
 
 	return fetch.Drain(ctx, it)
-}
-
-// recordFetchFunc binds [Storage.localRecordFetch] to one signal, for the read handler's per-signal
-// arguments.
-func (s *Storage) recordFetchFunc(sig signal.Signal) cluster.FetchFunc {
-	return func(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
-		return s.localRecordFetch(ctx, sig, tenant, start, end, matchers)
-	}
 }
 
 // clusterLogFetcherFor returns the log read seam for one tenant in cluster mode: local if this
