@@ -563,11 +563,11 @@ func (c *recordCols) projectColumns(projection []string) []fetch.NamedColumn {
 	if len(projection) == 0 {
 		out := make([]fetch.NamedColumn, 0, c.schema.numInts()+c.schema.numBytes())
 		for k := range c.ints {
-			out = append(out, fetch.NamedColumn{Name: c.schema.intColumn(k).Name, Int64: c.ints[k]})
+			out = append(out, fetch.Int64Column(c.schema.intColumn(k).Name, c.ints[k]))
 		}
 
 		for k := range c.bytes {
-			out = append(out, fetch.NamedColumn{Name: c.schema.byteColumn(k).Name, Bytes: c.byteViews(k)})
+			out = append(out, fetch.BytesColumn(c.schema.byteColumn(k).Name, c.byteViews(k)))
 		}
 
 		return out
@@ -581,9 +581,9 @@ func (c *recordCols) projectColumns(projection []string) []fetch.NamedColumn {
 		}
 
 		if ref.kind == KindInt64 {
-			out = append(out, fetch.NamedColumn{Name: name, Int64: c.ints[ref.idx]})
+			out = append(out, fetch.Int64Column(name, c.ints[ref.idx]))
 		} else {
-			out = append(out, fetch.NamedColumn{Name: name, Bytes: c.byteViews(ref.idx)})
+			out = append(out, fetch.BytesColumn(name, c.byteViews(ref.idx)))
 		}
 	}
 

@@ -139,9 +139,11 @@ const (
 )
 
 // EncodeLogBatches serializes log fetch batches: each stream's identity, its record timestamps,
-// and its named per-record columns (each tagged by physical kind). The id is recomputed from the
-// identity on decode, so it is not sent.
-func EncodeLogBatches(batches []*fetch.Batch) []byte {
+// and its named per-record columns (each tagged by its [fetch.ColumnKind]). The id is recomputed
+// from the identity on decode, so it is not sent. A column carrying no kind is an error rather
+// than an untagged int64 column: an empty column of any kind would otherwise arrive as an empty
+// int64 one.
+func EncodeLogBatches(batches []*fetch.Batch) ([]byte, error) {
 	buf := binary.AppendUvarint(nil, uint64(len(batches)))
 	for _, b := range batches {
 		enc := b.Series.AppendHashInput(nil)
@@ -154,39 +156,50 @@ func EncodeLogBatches(batches []*fetch.Batch) []byte {
 		}
 
 		buf = binary.AppendUvarint(buf, uint64(len(b.Columns)))
+
 		for i := range b.Columns {
-			buf = appendColumn(buf, &b.Columns[i])
+			var err error
+			if buf, err = appendColumn(buf, &b.Columns[i]); err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	return buf
+	return buf, nil
 }
 
-func appendColumn(buf []byte, c *fetch.NamedColumn) []byte {
+func appendColumn(buf []byte, c *fetch.NamedColumn) ([]byte, error) {
 	buf = appendString(buf, c.Name)
 
-	switch {
-	case c.Bytes != nil:
+	switch c.Kind {
+	case fetch.KindBytes:
 		buf = append(buf, colKindBytes)
 		buf = binary.AppendUvarint(buf, uint64(len(c.Bytes)))
+
 		for _, v := range c.Bytes {
 			buf = appendString(buf, string(v))
 		}
-	case c.Float64 != nil:
+	case fetch.KindFloat64:
 		buf = append(buf, colKindFloat)
 		buf = binary.AppendUvarint(buf, uint64(len(c.Float64)))
+
 		for _, v := range c.Float64 {
 			buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(v))
 		}
-	default:
+	case fetch.KindInt64:
 		buf = append(buf, colKindInt64)
 		buf = binary.AppendUvarint(buf, uint64(len(c.Int64)))
+
 		for _, v := range c.Int64 {
 			buf = binary.AppendVarint(buf, v)
 		}
+	case fetch.KindUnknown:
+		return nil, errors.Errorf("cluster: column %q has no kind", c.Name)
+	default:
+		return nil, errors.Errorf("cluster: column %q has unsupported kind %d", c.Name, c.Kind)
 	}
 
-	return buf
+	return buf, nil
 }
 
 // DecodeLogBatches parses [EncodeLogBatches] output, recomputing each batch's id from its identity.
@@ -287,7 +300,9 @@ func decodeColumn(data []byte) (fetch.NamedColumn, []byte, error) {
 
 	switch kind {
 	case colKindBytes:
+		col.Kind = fetch.KindBytes
 		col.Bytes = make([][]byte, 0, n)
+
 		for range n {
 			var v string
 			if v, data, err = takeString(data); err != nil {
@@ -297,7 +312,9 @@ func decodeColumn(data []byte) (fetch.NamedColumn, []byte, error) {
 			col.Bytes = append(col.Bytes, []byte(v))
 		}
 	case colKindFloat:
+		col.Kind = fetch.KindFloat64
 		col.Float64 = make([]float64, 0, n)
+
 		for range n {
 			if len(data) < 8 {
 				return fetch.NamedColumn{}, nil, errors.New("cluster: malformed float column")
@@ -306,8 +323,10 @@ func decodeColumn(data []byte) (fetch.NamedColumn, []byte, error) {
 			col.Float64 = append(col.Float64, math.Float64frombits(binary.BigEndian.Uint64(data)))
 			data = data[8:]
 		}
-	default:
+	case colKindInt64:
+		col.Kind = fetch.KindInt64
 		col.Int64 = make([]int64, 0, n)
+
 		for range n {
 			v, m := binary.Varint(data)
 			if m <= 0 {
@@ -317,6 +336,8 @@ func decodeColumn(data []byte) (fetch.NamedColumn, []byte, error) {
 			data = data[m:]
 			col.Int64 = append(col.Int64, v)
 		}
+	default:
+		return fetch.NamedColumn{}, nil, errors.Errorf("cluster: column %q has unknown kind tag %d", name, kind)
 	}
 
 	return col, data, nil
@@ -383,7 +404,7 @@ func NewReadHandler(fetchFn RequestFetchFunc, opts ...Option) http.Handler {
 		sig := decoded.Signal
 		fetchReq := decoded.Request()
 
-		encode := EncodeBatches
+		encode := func(b []*fetch.Batch) ([]byte, error) { return EncodeBatches(b), nil }
 		if sig != signal.Metric { // log, trace and profile share the column codec
 			encode = EncodeLogBatches
 		}
@@ -413,12 +434,19 @@ func NewReadHandler(fetchFn RequestFetchFunc, opts ...Option) http.Handler {
 
 		span.SetAttributes(attribute.Int("storage.rows", len(batches)))
 
-		out := encode(batches)
+		var out []byte
+		out, err = encode(batches)
 
 		// The batches are now serialized into out and no longer needed — release them so a producing
 		// engine recycles their buffers (a no-op for batches without a release hook).
 		for _, b := range batches {
 			b.Release()
+		}
+
+		if err != nil {
+			writeRPCError(w, err)
+
+			return
 		}
 
 		if coll != nil {

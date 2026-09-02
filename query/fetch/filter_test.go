@@ -148,8 +148,8 @@ func TestFilterAppliesConditions(t *testing.T) {
 			Series:     series,
 			Timestamps: []int64{1, 2, 3},
 			Columns: []fetch.NamedColumn{
-				{Name: "trace_id", Bytes: [][]byte{[]byte("aaa"), []byte("bbb"), []byte("aaa")}},
-				{Name: "name", Bytes: [][]byte{[]byte("root"), []byte("other"), []byte("child")}},
+				fetch.BytesColumn("trace_id", [][]byte{[]byte("aaa"), []byte("bbb"), []byte("aaa")}),
+				fetch.BytesColumn("name", [][]byte{[]byte("root"), []byte("other"), []byte("child")}),
 			},
 		}}
 	}
@@ -199,7 +199,7 @@ func TestFilterConditionOnAttribute(t *testing.T) {
 			Series:     series,
 			Timestamps: []int64{1, 2},
 			Columns: []fetch.NamedColumn{
-				{Name: fetch.AttrsColumn, Bytes: [][]byte{blob("http.method", "GET"), blob("http.method", "POST")}},
+				fetch.BytesColumn(fetch.AttrsColumn, [][]byte{blob("http.method", "GET"), blob("http.method", "POST")}),
 			},
 		}}), nil
 	}))

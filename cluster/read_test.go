@@ -45,8 +45,8 @@ func TestLogBatchesCodec(t *testing.T) {
 		}
 
 		return &fetch.Batch{ID: s.Hash(), Series: s, Timestamps: ts, Columns: []fetch.NamedColumn{
-			{Name: "body", Bytes: body},
-			{Name: "severity", Int64: sev},
+			fetch.BytesColumn("body", body),
+			fetch.Int64Column("severity", sev),
 		}}
 	}
 
@@ -55,7 +55,10 @@ func TestLogBatchesCodec(t *testing.T) {
 		mk("web", []int64{150}, []string{"web"}, []int64{9}),
 	}
 
-	out, err := cluster.DecodeLogBatches(cluster.EncodeLogBatches(in))
+	enc, err := cluster.EncodeLogBatches(in)
+	require.NoError(t, err)
+
+	out, err := cluster.DecodeLogBatches(enc)
 	require.NoError(t, err)
 	require.Len(t, out, 2)
 

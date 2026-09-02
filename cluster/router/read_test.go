@@ -313,7 +313,7 @@ func TestFetcherAppliesConditions(t *testing.T) {
 		Series:     series,
 		Timestamps: []int64{1, 2, 3},
 		Columns: []fetch.NamedColumn{
-			{Name: "trace_id", Bytes: [][]byte{[]byte("aaa"), []byte("bbb"), []byte("aaa")}},
+			fetch.BytesColumn("trace_id", [][]byte{[]byte("aaa"), []byte("bbb"), []byte("aaa")}),
 		},
 	}}}
 	r := openRouter(t, p)
