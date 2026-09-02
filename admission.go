@@ -144,6 +144,35 @@ func (a *tenantAdmission) sample(budgetPerSec, nowNs int64, ids []signal.SeriesI
 	return weights, true
 }
 
+// sampleBatch runs the tenant's budgeted sampler over a batch and accounts what it dropped. It
+// returns the per-point weights — nil when the tenant is under budget this window, meaning keep
+// every point with no scale factor at all — and how many points the sampler dropped. Both the
+// single-node and the clustered ingest paths call it, so the two cannot disagree about the
+// sampling decision or about how a dropped point is reported.
+//
+// The budget is deliberately **per-node**: each node samples against the ingest rate it observes
+// itself, matching the per-node ingest-rate valve. N nodes each under a per-node view of the same
+// budget can therefore exceed it in aggregate. That is an accepted limitation — a cluster-wide
+// budget needs shared state across the ring and is a separate change.
+func (a *tenantAdmission) sampleBatch(
+	budgetPerSec, nowNs int64, ids []signal.SeriesID, ts []int64,
+) (weights []float64, dropped int64) {
+	w, active := a.sample(budgetPerSec, nowNs, ids, ts)
+	if !active {
+		return nil, 0
+	}
+
+	for _, x := range w {
+		if x == 0 {
+			dropped++
+		}
+	}
+
+	a.recordSampledDropped(dropped)
+
+	return w, dropped
+}
+
 // sampleHash is a deterministic mix of a series id and timestamp, so a given (series, ts) is
 // consistently kept or dropped across batches and nodes.
 func sampleHash(id signal.SeriesID, ts int64) uint64 {

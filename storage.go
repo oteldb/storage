@@ -400,19 +400,15 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 		ids, tss, vals, sf := b.IDs, b.Ts, b.Values, []float64(nil)
 		mat := b.Series
 
-		if weights, active := lastAdmit.sample(lastSampling, s.now(), b.IDs, b.Ts); active {
+		if weights, dropped := lastAdmit.sampleBatch(lastSampling, s.now(), b.IDs, b.Ts); weights != nil {
 			fids := make([]signal.SeriesID, 0, len(weights))
 			fts := make([]int64, 0, len(weights))
 			fvals := make([]float64, 0, len(weights))
 			fsf := make([]float64, 0, len(weights))
 			kept := make([]int, 0, len(weights))
 
-			var dropped int64
-
 			for i, w := range weights {
 				if w == 0 {
-					dropped++
-
 					continue
 				}
 
@@ -425,7 +421,6 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 
 			ids, tss, vals, sf = fids, fts, fvals, fsf
 			mat = func(j int) signal.Series { return b.Series(kept[j]) }
-			lastAdmit.recordSampledDropped(dropped)
 			sampledDropped += dropped
 		}
 

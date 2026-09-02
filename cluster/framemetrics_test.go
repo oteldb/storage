@@ -123,8 +123,8 @@ func TestFrameMetricsTenantFunc(t *testing.T) {
 func TestFrameMetricsAdmitShedsWholeBatch(t *testing.T) {
 	t.Parallel()
 
-	f := FrameMetrics(buildMetrics("a", "b"), 1, nil, func(signal.TenantID, *metric.Batch) bool {
-		return false
+	f := FrameMetrics(buildMetrics("a", "b"), 1, nil, func(signal.TenantID, *metric.Batch) ([]float64, bool) {
+		return nil, false
 	})
 
 	assert.Equal(t, 2, f.Emitted, "projection still saw them")
@@ -140,4 +140,54 @@ func TestFrameMetricsEmpty(t *testing.T) {
 	assert.Zero(t, f.Emitted)
 	assert.Zero(t, f.Shed)
 	assert.Empty(t, f.Shards)
+}
+
+// TestFrameMetricsAdmitWeightsAreFramed pins that the sampler's verdict reaches the shard primary:
+// a zero weight drops the point before framing, and a kept one is written as a scale-factor record
+// (wal.WriteSamplesSF) rather than a plain one, because the primary is handed the encoded payload
+// and cannot recover a weight that was never written.
+func TestFrameMetricsAdmitWeightsAreFramed(t *testing.T) {
+	t.Parallel()
+
+	// Projection emits one single-point batch per metric, so the sampler is asked once per point:
+	// keep the first and the last, drop the two in between.
+	verdicts := [][]float64{{4}, {0}, {0}, {4}}
+	call := 0
+
+	f := FrameMetrics(buildMetrics("a", "b", "c", "d"), 1, nil,
+		func(signal.TenantID, *metric.Batch) ([]float64, bool) {
+			w := verdicts[call]
+			call++
+
+			return w, true
+		})
+
+	assert.Equal(t, 4, f.Emitted, "projection still saw them all")
+	assert.Zero(t, f.Shed, "sampled out is not shed: the batch was admitted")
+	assert.Equal(t, 2, f.Counts[DefaultTenant], "only the kept points are framed")
+
+	var (
+		sf   []float64
+		ts   []int64
+		sfID int
+	)
+
+	require.NoError(t, wal.Replay(f.Shards[DefaultTenant], wal.Handlers{
+		OnSamples: func(signal.SeriesID, []int64, []float64) error {
+			t.Fatal("a weighted point must not be framed as a plain samples record")
+
+			return nil
+		},
+		OnSamplesSF: func(_ signal.SeriesID, rts []int64, _, rsf []float64) error {
+			sfID++
+			ts = append(ts, rts...)
+			sf = append(sf, rsf...)
+
+			return nil
+		},
+	}))
+
+	assert.Equal(t, 2, sfID, "one record per kept point")
+	assert.Len(t, ts, 2)
+	assert.Equal(t, []float64{4, 4}, sf)
 }

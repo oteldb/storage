@@ -1399,32 +1399,45 @@ func (n *clusterNode) close(ctx context.Context) error {
 // rejected count back here, and replicates the accepted set to the secondary owners — so the
 // returned [Accepted] accounting matches the single-node path and every replica converges.
 func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) (Accepted, error) {
-	// The ingest-rate valve is applied at the origin (per real tenant, like the single-node path):
-	// each node rate-limits its own ingest. The cardinality and in-flight-memory valves are
-	// head-enforced, so they are applied by the shard primary in primaryWrite. Batches arrive in
-	// projection order, so the last tenant's admission state is cached across a contiguous run.
+	// The ingest-rate valve and the budgeted sampler are both applied at the origin (per real
+	// tenant, like the single-node path): each node rate-limits and samples its own ingest. The
+	// cardinality and in-flight-memory valves are head-enforced, so they are applied by the shard
+	// primary in primaryWrite. Batches arrive in projection order, so the last tenant's admission
+	// state is cached across a contiguous run.
 	var (
-		lastTenant signal.TenantID
-		lastAdmit  *tenantAdmission
-		lastLimits tenantpkg.Limits
-		haveTenant bool
+		lastTenant   signal.TenantID
+		lastAdmit    *tenantAdmission
+		lastLimits   tenantpkg.Limits
+		lastSampling int64
+		haveTenant   bool
+
+		sampledDropped int64
 	)
 
 	frames := cluster.FrameMetrics(md, s.cluster.shardCount(), s.opts.Tenant,
-		func(tid signal.TenantID, b *metric.Batch) bool {
+		func(tid signal.TenantID, b *metric.Batch) ([]float64, bool) {
 			if !haveTenant || tid != lastTenant {
 				lastTenant, haveTenant = tid, true
 				lastAdmit = s.admissionFor(tid)
-				lastLimits = s.tenant.Resolve(tid).Limits
+
+				pol := s.tenant.Resolve(tid)
+				lastLimits, lastSampling = pol.Limits, pol.Sampling.MaxRowsPerSecond
 			}
 
-			if lastAdmit.allowRate(lastLimits, int64(b.Len())*engine.SampleBytes, s.now()) {
-				return true
+			if !lastAdmit.allowRate(lastLimits, int64(b.Len())*engine.SampleBytes, s.now()) {
+				lastAdmit.addRate(int64(b.Len()))
+
+				return nil, false // whole over-budget batch shed before framing
 			}
 
-			lastAdmit.addRate(int64(b.Len()))
+			// Budgeted (lossy) sampling, per-node — see [tenantAdmission.sampleBatch]. It must run
+			// here rather than on the primary: the primary is handed an already-framed payload, so
+			// which samples to keep is no longer its to decide. The weights ride to the primary in
+			// the frame itself (wal.WriteSamplesSF).
+			weights, dropped := lastAdmit.sampleBatch(lastSampling, s.now(), b.IDs, b.Ts)
+			sampledDropped += dropped
 
-			return false // whole over-budget batch shed before framing
+			return weights, true
 		})
 
 	byShard, emitted, rateRejected := frames.Shards, frames.Emitted, int64(frames.Shed)
@@ -1471,7 +1484,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 	primaryRejected := rej.ooo + rej.cardinality + rej.inflight
 	failed := routeFailures(frames.Counts, keys, errs)
 	s.emitRouted(ctx, signal.Metric,
-		int64(emitted-frames.Shed)-primaryRejected-failed, primaryRejected, failed)
+		int64(emitted-frames.Shed)-sampledDropped-primaryRejected-failed, primaryRejected, failed)
 
 	for _, err := range errs { // surface the first error deterministically (by route index)
 		if err != nil {
@@ -1481,7 +1494,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 
 	total := rej.total()
 	accepted := int64(emitted) - total
-	s.emitAdmission(ctx, signal.Metric, accepted, rej, 0, 0)
+	s.emitAdmission(ctx, signal.Metric, accepted, rej, sampledDropped, 0)
 
 	return Accepted{Accepted: accepted, Rejected: total, RejectedReason: rej.reason()}, nil
 }
