@@ -120,17 +120,41 @@ type Request struct {
 // rows. A predicate that only accepts a concrete value must therefore reject [signal.KindEmpty] —
 // which also keeps the hints below sound, since a pruning hint asserts a value is present.
 //
-// Two optional, serializable hints let a fetcher prune whole parts before scanning (the engine
+// Three optional, serializable hints let a fetcher prune whole parts before scanning (the engine
 // always re-checks Match per row, so a hint only ever skips work, never changes results):
 //   - Tokens: the full-text tokens the column value must contain (lowered) — consulted against a
 //     per-part token bloom for a `contains` condition (an empty Tokens ⇒ not full-text).
 //   - Equal: an exact column=value equality — consulted against a per-part value bloom. For a
 //     per-record attribute condition, Column is the attribute key and Equal carries key=value.
+//   - AnyEqual: the same equality widened to a set of values (see below).
 type Condition struct {
 	Column string
 	Match  func(value signal.Value) bool
 	Tokens [][]byte
 	Equal  *EqualMatcher
+
+	// AnyEqual is the set-membership hint: the column's value must equal one of these members. It
+	// exists because an N-value equality is otherwise expressible only as a Match closure, which
+	// reaches neither the per-part equality bloom nor a dictionary-level test — see
+	// [AnyEqualSet] and the file comment in anyequal.go.
+	//
+	// It is a **disjunction inside one condition**: a part survives when *any* member may be
+	// present, where several conditions AND. So it cannot be expressed by passing N conditions.
+	//
+	// Like Equal it is a superset hint, not a replacement for Match: a row Match accepts must have
+	// its column value in the set, which lets a fetcher reject a non-member outright while a member
+	// is still verified through Match. Members are compared against the value's canonical text
+	// projection (for a byte column, the cell's raw bytes), the same comparison
+	// [EqualMatcher.Predicate] makes; for a per-record attribute condition, Column is the attribute
+	// key and the members are its candidate values.
+	//
+	// The set must be sorted ascending and deduplicated — build it with [AnyEqualSet]. **A nil and
+	// an empty set mean the same thing: no hint.** They are not distinguished, because a caller
+	// that builds the set by appending over an empty candidate list gets one or the other depending
+	// on how it was written, and that must not silently change the semantics. A genuinely empty
+	// membership predicate still matches nothing, because Match decides — its closure rejects every
+	// row.
+	AnyEqual [][]byte
 }
 
 // Batch is one matching identity (a metric series, or a log stream) and its rows within the

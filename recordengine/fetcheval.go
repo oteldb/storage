@@ -46,6 +46,12 @@ const (
 	// Placed after evalDict because a byte column is usually the more selective of the two (an id or
 	// a body match) and costs a byte per row to probe rather than eight.
 	evalIntMemo
+	// evalSetScan tests a row's cell against the condition's sorted [fetch.Condition.AnyEqual] set:
+	// a binary search per row, with the predicate called only for the members that pass. It serves
+	// the byte-column forms that have no dictionary to memoize — the flat decode form and a
+	// fast-pathed column's raw blob — which is where an id column (trace_id) lands and which
+	// otherwise falls all the way through to [evalGeneric], one predicate call per row.
+	evalSetScan
 	// evalRow calls the predicate per row over a directly indexable int vector — the timestamp,
 	// whose values never fall in the memo's domain.
 	evalRow
@@ -85,6 +91,9 @@ type condEval struct {
 	memo []uint8           // evalDict/evalIntMemo: per-entry tri-state, filled lazily
 	attr string            // evalDict: when set, the entry is an attrs blob and this key is looked up in it
 	ints []int64           // evalIntMemo/evalRow: the column's values
+	raw  rawBytesCol       // evalSetScan: the column's raw fixed-width blob, when it has one
+	flat [][]byte          // evalSetScan: the flat decode form's per-row values, when it has no blob
+	text []byte            // evalDict: reused rendering of an attribute value for the set test
 }
 
 // match reports whether row i satisfies this condition.
@@ -102,6 +111,15 @@ func (ce *condEval) match(lz *lazyCols, i int) bool {
 		}
 
 		return ce.remember(id, ce.matchEntry(ce.dict.Entries[id]))
+	case evalSetScan:
+		v := ce.flat
+		if v == nil {
+			cell, _ := ce.raw.at(i)
+
+			return ce.setMatches(cell)
+		}
+
+		return ce.setMatches(v[i])
 	case evalIntMemo:
 		v := ce.ints[i]
 		if uint64(v) >= maxIntMemo { // negative or out of the memoized domain
@@ -128,6 +146,17 @@ func (ce *condEval) match(lz *lazyCols, i int) bool {
 	}
 }
 
+// setMatches is the [evalSetScan] body: reject a cell outside the set without touching the
+// predicate, verify a member through it. The set is a superset hint, not a replacement — see
+// [fetch.Condition.AnyEqual] — so a member still goes through Match.
+func (ce *condEval) setMatches(cell []byte) bool {
+	if !fetch.InAnyEqual(ce.cond.AnyEqual, cell) {
+		return false
+	}
+
+	return ce.cond.Match(signal.StringValue(cell))
+}
+
 // remember records a freshly evaluated memo slot and returns the verdict.
 func (ce *condEval) remember(slot int, matched bool) bool {
 	if matched {
@@ -144,13 +173,26 @@ func (ce *condEval) remember(slot int, matched bool) bool {
 // offered as [signal.EmptyValue], exactly as [recordCols.rowMatches] does — only the language knows
 // whether a missing value satisfies its predicate.
 func (ce *condEval) matchEntry(entry []byte) bool {
+	set := ce.cond.AnyEqual
+
 	if ce.attr == "" {
+		if len(set) > 0 && !fetch.InAnyEqual(set, entry) {
+			return false
+		}
+
 		return ce.cond.Match(signal.StringValue(entry))
 	}
 
 	v, found, err := signal.LookupAttribute(entry, ce.attr)
 	if err != nil || !found {
 		v = signal.EmptyValue()
+	}
+
+	if len(set) > 0 {
+		ce.text = v.AppendText(ce.text[:0])
+		if !fetch.InAnyEqual(set, ce.text) {
+			return false
+		}
 	}
 
 	return ce.cond.Match(v)
@@ -205,8 +247,22 @@ func (p *fetchPlan) compileCond(lz *lazyCols, j int) condEval {
 			return ce
 		}
 
-		if dc := lz.bytes[ref.idx]; dc != nil && dc.IDWidth != 0 {
+		dc := lz.bytes[ref.idx]
+		if dc != nil && dc.IDWidth != 0 {
 			ce.kind, ce.dict, ce.memo = evalDict, dc, p.memo(j, len(dc.Entries))
+
+			return ce
+		}
+
+		// No dictionary to memoize: a set membership still beats a per-row predicate call, over the
+		// raw blob when the column has one and over the flat form's per-row values otherwise.
+		if len(cond.AnyEqual) > 0 {
+			switch rb := lz.rawBlob[ref.idx]; {
+			case rb.blob != nil:
+				ce.kind, ce.raw = evalSetScan, rb
+			case dc != nil:
+				ce.kind, ce.flat = evalSetScan, dc.Entries
+			}
 		}
 
 		return ce

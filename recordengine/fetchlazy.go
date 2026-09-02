@@ -127,7 +127,7 @@ func eqFastPathCols(schema *Schema, conds []fetch.Condition) map[int]int {
 	fast := make(map[int]int)
 	for j := range conds {
 		cond := &conds[j]
-		if cond.Equal == nil || len(cond.Equal.Value) != simd.EqualFixed16Width {
+		if !rawScanCond(cond) {
 			continue
 		}
 
@@ -148,6 +148,13 @@ func eqFastPathCols(schema *Schema, conds []fetch.Condition) map[int]int {
 	}
 
 	return fast
+}
+
+// rawScanCond reports whether a condition is one a flat-blob decode can serve instead of a
+// dictionary: an exact equality of the kernel's fixed width (scanned into [lazyCols.eqMask]), or a
+// set membership ([fetch.Condition.AnyEqual]) tested per row against the blob ([evalRawSet]).
+func rawScanCond(c *fetch.Condition) bool {
+	return (c.Equal != nil && len(c.Equal.Value) == simd.EqualFixed16Width) || len(c.AnyEqual) > 0
 }
 
 // rawBytesBlob decodes column name's flat [chunk.CodecBytesRaw] blob. ok is false (blob, err both
@@ -211,7 +218,7 @@ func (p *part) readLazyConds(
 		}
 
 		if j, isFast := fast[k]; isFast {
-			needle := []byte(conds[j].Equal.Value)
+			cond := &conds[j]
 
 			blob, width, ok, err := p.rawBytesBlob(ctx, p.schema.byteColumn(k).Name)
 			if err != nil {
@@ -219,14 +226,24 @@ func (p *part) readLazyConds(
 			}
 
 			// width must be exactly simd.EqualFixed16Width — the kernel's real, hardcoded
-			// precondition — not merely equal to needle's length (eqFastPathCols already fixes
+			// precondition — not merely equal to the needle's length (eqFastPathCols already fixes
 			// that at 16 separately; comparing against len(needle) here would assert the wrong
 			// thing if that ever changed).
-			if ok && width == simd.EqualFixed16Width {
+			if ok && cond.Equal != nil && len(cond.Equal.Value) == simd.EqualFixed16Width &&
+				width == simd.EqualFixed16Width {
 				mask := make([]byte, len(blob)/width)
-				simd.EqualFixed16(blob, needle, mask)
+				simd.EqualFixed16(blob, []byte(cond.Equal.Value), mask)
 
 				lz.eqMask[j] = mask
+				lz.rawBlob[k] = rawBytesCol{blob: blob, width: width}
+
+				continue
+			}
+
+			// A set membership needs no kernel and no fixed width: [evalRawSet] tests each row's
+			// cell against the sorted set straight out of the blob, so the dictionary decode this
+			// column would otherwise pay is skipped entirely.
+			if ok && len(cond.AnyEqual) > 0 {
 				lz.rawBlob[k] = rawBytesCol{blob: blob, width: width}
 
 				continue
