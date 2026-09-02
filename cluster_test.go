@@ -167,16 +167,18 @@ func openClusterNodeWith(t *testing.T, endpoint, id string, be backend.Backend, 
 }
 
 // openClusterNodeSharded opens a clustered node with ShardsPerTenant set, for per-series sharding.
-func openClusterNodeSharded(t *testing.T, endpoint, id string, shards int) *Storage {
+func openClusterNodeSharded(t *testing.T, endpoint, id string, shards int, opts ...Option) *Storage {
 	t.Helper()
 
-	s, err := Open(context.Background(), Options{}, WithBackend(backend.Memory()), WithCluster(&cluster.Config{
+	all := append([]Option{WithBackend(backend.Memory()), WithCluster(&cluster.Config{
 		Etcd:            []string{endpoint},
 		Self:            etcd.Member{ID: id, Addr: "127.0.0.1:0"},
 		RF:              2,
 		ShardsPerTenant: shards,
 		PrivateBackend:  true,
-	}))
+	})}, opts...)
+
+	s, err := Open(context.Background(), Options{}, all...)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close(context.Background()) })
 

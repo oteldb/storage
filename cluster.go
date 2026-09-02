@@ -59,6 +59,41 @@ type clusterNode struct {
 
 	// reportedRejoins is the re-registration total already published as a counter delta.
 	reportedRejoins atomic.Int64
+	// warnedSingleShard guards the single-shard advisory so it is said once, not every cycle.
+	warnedSingleShard sync.Once
+}
+
+// warnSingleShard says once that this tenant-per-shard cluster cannot spread its writes.
+//
+// A single shard has exactly one primary, and every write for a shard is admitted there, so a
+// multi-node cluster left at the default ingests through one node no matter what RF is set to —
+// the ring looks healthy and the load is not distributed. That is silent otherwise: nothing else
+// reports it, and the two settings that look like they should govern it (RF, and the node count)
+// do not.
+//
+// It waits for the ring rather than firing at join, because a node that has not yet seen its peers
+// cannot tell a deliberate single-node deployment from a cluster mid-formation, and warning about
+// the former would be noise.
+//
+// Said once per process: the condition cannot resolve on its own. Fixing it means re-keying every
+// shard, which strands the data written under the old keys, so repeating the advisory every cycle
+// would only be nagging about something the operator cannot safely change in place.
+func (s *Storage) warnSingleShard(ctx context.Context) {
+	cn := s.cluster
+	if cn == nil || cn.shardCount() > 1 || cn.membership.Ring().Len() < 2 {
+		return
+	}
+
+	cn.warnedSingleShard.Do(func() {
+		s.obs.Logger(ctx).Warn("cluster is running one shard per tenant: writes cannot spread",
+			zap.Int("nodes", cn.membership.Ring().Len()),
+			zap.Int("shards_per_tenant", cn.shards),
+			zap.Int("rf", cn.rf),
+			zap.String("effect", "every write for a tenant is admitted by that tenant's single primary"),
+			zap.String("fix", "set ShardsPerTenant > 1 identically on every tier that routes"),
+			zap.String("caveat", "changing it re-keys every shard and strands existing data, "+
+				"so size it for the largest cluster this tenant will run on"))
+	})
 }
 
 // recordMembershipHealth publishes this node's standing in the cluster member set once per

@@ -18,11 +18,22 @@ type Config struct {
 	Self etcd.Member
 	// RF is the replication factor (replicas per write). Zero ⇒ 3.
 	RF int
-	// ShardsPerTenant splits each tenant's metric series into this many independently-placed
-	// shards (series → shard = hash(seriesID) % N), so a single large tenant spreads its ingest,
-	// storage, and compaction across up to N nodes instead of being pinned to one owner set. Zero
-	// or one ⇒ a single shard (the tenant is the shard; on-disk layout and placement are identical
-	// to the unsharded path). Applies to metrics only; the record signals are a single shard.
+	// ShardsPerTenant splits each tenant into this many independently-placed shards, so a single
+	// large tenant spreads its ingest, storage, and compaction across up to N nodes instead of
+	// being pinned to one owner set. Metrics shard by series (hash(seriesID) % N); the record
+	// signals shard by stream, so a stream's records stay together on one primary (see
+	// [FrameMetrics] and [FrameRecords]). Zero or one ⇒ a single shard: the tenant is the shard,
+	// and on-disk layout and placement are identical to the unsharded path.
+	//
+	// This is not the replication knob, and RF does not substitute for it. Every write for a
+	// shard is admitted by that shard's one primary, so a single-shard tenant concentrates all of
+	// its ingest and compaction on one node however many replicas RF asks for and however many
+	// nodes the ring has.
+	//
+	// Choose it for the largest cluster this tenant will ever run on, not the current one: the
+	// shard key is the routing key *and* the on-disk prefix, so changing N re-keys every shard and
+	// strands the data written under the old keys. One is the only value that cannot be grown out
+	// of, which is why a multi-node cluster is warned about it at maintenance time.
 	ShardsPerTenant int
 	// Root is the etcd key prefix for this cluster's state. Empty ⇒ "/oteldb".
 	Root string
