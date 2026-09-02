@@ -1045,6 +1045,9 @@ func (e *Engine) planFetch(ctx context.Context, ids []signal.SeriesID, r fetch.R
 	}
 
 	if r.AllConditions && len(r.Conditions) > 0 {
+		// Normalized once per fetch, before the bloom prune below and the per-part scan both read
+		// the sets: an embedder that hands over an unsorted set then pays a sort, not wrong rows.
+		r.Conditions = fetch.NormalizeConditions(r.Conditions)
 		p.conds = r.Conditions
 		p.condSel = conditionSel(e.cfg.Schema, r.Conditions)
 		p.headRows = make(map[signal.SeriesID]int, len(ids))

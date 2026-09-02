@@ -542,30 +542,8 @@ func (p *part) mayContain(conds []fetch.Condition) bool {
 }
 
 func (p *part) conditionMayMatch(c *fetch.Condition) bool {
-	// Attribute condition (column is not a fixed schema column): consult the Attrs-column bloom
-	// with key-scoped tokens.
 	if _, ok := p.schema.ref(c.Column); !ok {
-		k, has := p.schema.attrsByteCol()
-		if !has {
-			return true
-		}
-
-		f := p.blooms[p.schema.byteColumn(k).Name]
-		if f == nil {
-			return true
-		}
-
-		if c.Equal != nil && !f.Test(attrToken([]byte(c.Equal.Name), []byte(c.Equal.Value))) {
-			return false
-		}
-
-		for _, tok := range c.Tokens {
-			if !f.Test(attrToken([]byte(c.Column), tok)) {
-				return false
-			}
-		}
-
-		return true
+		return p.attrConditionMayMatch(c)
 	}
 
 	// Fixed-column condition: consult that column's bloom (FullText tokens or Equality value).
@@ -586,10 +564,74 @@ func (p *part) conditionMayMatch(c *fetch.Condition) bool {
 	// The empty value is skipped by the Equality build (see eachEquality), so it is never provably
 	// absent either.
 	ref, _ := p.schema.ref(c.Column) // present: the no-such-column case returned above
-	if c.Equal != nil && c.Equal.Value != "" && p.schema.byteColumn(ref.idx).Bloom == BloomEquality &&
-		!f.Test([]byte(c.Equal.Value)) {
+	if p.schema.byteColumn(ref.idx).Bloom != BloomEquality {
+		return true
+	}
+
+	if c.Equal != nil && c.Equal.Value != "" && !f.Test([]byte(c.Equal.Value)) {
 		return false
 	}
 
+	return anyTokenPresent(f, c.AnyEqual, nil)
+}
+
+// attrConditionMayMatch is [part.conditionMayMatch] for a column the schema does not carry: a
+// per-record attribute, consulted against the Attrs-column bloom with key-scoped tokens.
+func (p *part) attrConditionMayMatch(c *fetch.Condition) bool {
+	k, has := p.schema.attrsByteCol()
+	if !has {
+		return true
+	}
+
+	f := p.blooms[p.schema.byteColumn(k).Name]
+	if f == nil {
+		return true
+	}
+
+	if c.Equal != nil && !f.Test(attrToken([]byte(c.Equal.Name), []byte(c.Equal.Value))) {
+		return false
+	}
+
+	key := []byte(c.Column)
+	if !anyTokenPresent(f, c.AnyEqual, func(v []byte) []byte { return attrToken(key, v) }) {
+		return false
+	}
+
+	for _, tok := range c.Tokens {
+		if !f.Test(attrToken(key, tok)) {
+			return false
+		}
+	}
+
 	return true
+}
+
+// anyTokenPresent is the set-membership prune test for [fetch.Condition.AnyEqual]: the part
+// survives when *any* member may be present, and is pruned only when the filter proves every one
+// absent. That disjunction is why the set cannot be passed as N separate conditions —
+// [part.mayContain] ANDs across conditions.
+//
+// token maps a member to the bloom token to test (nil ⇒ the member verbatim, for a fixed equality
+// column). An empty member is never provably absent: the equality build skips empty values
+// ([eachEquality]), so it always keeps the part.
+func anyTokenPresent(f *bloom.Filter, set [][]byte, token func([]byte) []byte) bool {
+	if len(set) == 0 {
+		return true // no hint
+	}
+
+	for _, v := range set {
+		if len(v) == 0 {
+			return true
+		}
+
+		if token != nil {
+			v = token(v)
+		}
+
+		if f.Test(v) {
+			return true
+		}
+	}
+
+	return false
 }
