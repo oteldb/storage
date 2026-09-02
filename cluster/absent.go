@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/readbudget"
 )
 
@@ -36,6 +37,12 @@ const absentStatus = http.StatusConflict
 // refuse the same query, so retrying elsewhere only spends the budget again.
 const budgetStatus = http.StatusUnprocessableEntity
 
+// unsupportedStatus is how [fetch.ErrLabelsUnsupported] crosses the wire: the peer holds the shard
+// but the requested signal has no label index to answer from. It is not an absence — failing over to
+// another owner would meet the same answer — and not a fault either: the caller stays on the path it
+// was already taking.
+const unsupportedStatus = http.StatusNotImplemented
+
 // writeRPCError replies to a read/enumeration RPC, mapping [ErrShardAbsent] to [absentStatus] so
 // the caller fails over to another owner instead of accepting an empty answer.
 func writeRPCError(w http.ResponseWriter, err error) {
@@ -46,6 +53,8 @@ func writeRPCError(w http.ResponseWriter, err error) {
 		code = absentStatus
 	case errors.Is(err, readbudget.ErrExceeded):
 		code = budgetStatus
+	case errors.Is(err, fetch.ErrLabelsUnsupported):
+		code = unsupportedStatus
 	}
 
 	http.Error(w, err.Error(), code)
@@ -55,11 +64,16 @@ func writeRPCError(w http.ResponseWriter, err error) {
 // branches on: absence, so it fails over, and budget exhaustion, so it reports a client error
 // rather than a server fault.
 func statusError(addr, what string, code int, body []byte) error {
-	switch code {
-	case absentStatus:
+	switch {
+	case code == absentStatus:
 		return errors.Wrapf(ErrShardAbsent, "%q %s", addr, what)
-	case budgetStatus:
+	case code == budgetStatus:
 		return errors.Wrapf(readbudget.ErrExceeded, "%q %s: %s", addr, what, bytes.TrimSpace(body))
+	// A peer too old to know the label endpoint answers 404 from its mux. That is the same
+	// situation as an explicit "no label index here", and must fall back rather than fail the
+	// user's query, so it decodes to the same sentinel.
+	case code == unsupportedStatus, code == http.StatusNotFound && what == LabelsPath:
+		return errors.Wrapf(fetch.ErrLabelsUnsupported, "%q %s", addr, what)
 	}
 
 	return errors.Errorf("cluster: %q %s returned %d: %s", addr, what, code, bytes.TrimSpace(body))

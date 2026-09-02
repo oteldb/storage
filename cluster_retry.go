@@ -24,6 +24,7 @@ const (
 	rpcOpSide   = "side"   // profile symbol-store fetch
 	rpcOpKeys   = "keys"   // record-signal attribute-key enumeration
 	rpcOpValues = "values" // record-signal distinct column-value enumeration
+	rpcOpLabels = "labels" // metric label-metadata enumeration
 )
 
 // newClusterHTTPClient builds the node-to-node HTTP client. It sets connection-level timeouts so a
