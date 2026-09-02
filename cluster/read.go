@@ -68,6 +68,9 @@ func takeString(data []byte) (string, []byte, error) {
 // EncodeBatches serializes fetch batches: each series' identity (reversible hash pre-image)
 // followed by its (timestamp, value) samples. The id is recomputed from the identity on
 // decode, so it is not sent.
+//
+// Lossy-sampling weights follow as an append-only trailer, written only when some batch carries
+// them; see [appendScaleFactors] for the shape and its mixed-version behavior.
 func EncodeBatches(batches []*fetch.Batch) []byte {
 	buf := binary.AppendUvarint(nil, uint64(len(batches)))
 	for _, b := range batches {
@@ -82,7 +85,7 @@ func EncodeBatches(batches []*fetch.Batch) []byte {
 		}
 	}
 
-	return buf
+	return appendScaleFactors(buf, batches)
 }
 
 // DecodeBatches parses [EncodeBatches] output, recomputing each batch's id from its identity.
@@ -126,6 +129,10 @@ func DecodeBatches(data []byte) ([]*fetch.Batch, error) {
 		}
 
 		out = append(out, b)
+	}
+
+	if err := decodeScaleFactors(data, out); err != nil {
+		return nil, err
 	}
 
 	return out, nil

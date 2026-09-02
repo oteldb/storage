@@ -30,6 +30,7 @@ import (
 	qprofile "github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/log"
+	"github.com/oteldb/storage/signal/metric"
 	"github.com/oteldb/storage/signal/profile"
 	"github.com/oteldb/storage/tenant"
 )
@@ -1539,4 +1540,72 @@ func TestClusterSharedNothingPushNotify(t *testing.T) {
 	got := queryEngine(t, re, nameMatcher("http.requests"))
 	require.Len(t, got, 1)
 	assert.Equal(t, []int64{100, 200}, got[0].Timestamps, "replica serves the pushed part")
+}
+
+// TestClusteredReadFanOutKeepsScaleFactors is the read-fan-out capstone for lossy sampling: a
+// sampled series held by the tenant's owners must reach a non-owner over the wire with its weights
+// intact. Dropping them on the cluster hop makes the very same query correct on one node and
+// biased low on another (#460), which no single-node test can catch.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusteredReadFanOutKeepsScaleFactors(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNode(t, endpoint, "node-a"),
+		"node-b": openClusterNode(t, endpoint, "node-b"),
+		"node-c": openClusterNode(t, endpoint, "node-c"),
+	}
+	a := nodes["node-a"]
+
+	awaitMembership(t, nodes)
+
+	owners := a.cluster.membership.Ring().Lookup([]byte("default"), 2)
+	require.Len(t, owners, 2)
+	ownerID := map[string]bool{owners[0].ID: true, owners[1].ID: true}
+
+	// The clustered write path does not sample, so seed each owner's engine directly with the
+	// weighted samples an admission-sampled ingest would have stored.
+	series := signal.Series{Attributes: signal.NewAttributes(signal.KeyValue{
+		Key: metric.LabelName, Value: signal.StringValue([]byte("sampled.metric")),
+	})}
+	id := series.Hash()
+	ids := []signal.SeriesID{id, id}
+	sf := []float64{8, 4}
+
+	for name, s := range nodes {
+		if !ownerID[name] {
+			continue
+		}
+
+		eng := mustEngine(s.engineFor("default"))
+		_, err := eng.AppendBatch(ids, []int64{100, 200}, []float64{1, 2}, sf,
+			func(int) signal.Series { return series }, engine.AppendLimits{})
+		require.NoError(t, err)
+	}
+
+	var nonOwner *Storage
+	var nonOwnerName string
+
+	for name, s := range nodes {
+		if !ownerID[name] {
+			nonOwner, nonOwnerName = s, name
+		}
+	}
+
+	require.NotNil(t, nonOwner, "one node is not an owner")
+
+	it, err := nonOwner.Fetcher("default").Fetch(ctx, fetch.Request{
+		Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{nameMatcher("sampled.metric")},
+	})
+	require.NoError(t, err)
+	got, err := fetch.Drain(ctx, it)
+	require.NoError(t, err)
+	require.Lenf(t, got, 1, "%s served the sampled series via read fan-out", nonOwnerName)
+	assert.Equal(t, []int64{100, 200}, got[0].Timestamps)
+	assert.Equal(t, []float64{1, 2}, got[0].Values)
+	assert.Equal(t, []float64{8, 4}, got[0].ScaleFactors, "the weights survive the cluster hop")
+	assert.InDelta(t, 8.0, got[0].ScaleFactor(0), 0)
+	assert.InDelta(t, 4.0, got[0].ScaleFactor(1), 0)
 }
