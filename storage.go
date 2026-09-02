@@ -1591,6 +1591,7 @@ func (s *Storage) maintain(ctx context.Context) {
 
 	s.recordPartShape(ctx)
 	s.recordMembershipHealth(ctx)
+	s.warnSingleShard(ctx)
 }
 
 // recordPartShape publishes the merge selector's view of every engine's parts as gauges, once per
