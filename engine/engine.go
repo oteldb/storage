@@ -1269,6 +1269,68 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 		written = make(map[signal.SeriesID]struct{})
 	)
 
+	// apply admits one series' run of samples and re-frames the accepted subset. sf is the run's
+	// per-sample lossy-sampling weights, or nil for an unsampled run; it is carried through to the
+	// head and back out into the replicated frame, so a weight survives origin → primary →
+	// secondary rather than being silently reset to 1.
+	apply := func(id signal.SeriesID, ts []int64, values, sf []float64) error {
+		s := byID[id] // the series record precedes its samples in the frame
+
+		var accTs []int64
+
+		var accVals, accSF []float64
+
+		for i := range ts {
+			w := 1.0
+			if sf != nil {
+				w = sf[i]
+			}
+
+			// The primary is the shard's single authority, so it makes the admission decision
+			// here (OOO window + cardinality + in-flight memory); secondaries apply the accepted
+			// set verbatim via ApplyReplicated.
+			// The cluster primary path does not set limits.Overflow, so a new series past the cap
+			// is hard-rejected here (overflow routing is single-node metrics today); effID == id.
+			out, _, _, _ := e.head.appendByID(id, ts[i], values[i], w, e.cfg.OOOWindow,
+				limits, func() signal.Series { return s })
+
+			switch out {
+			case admitted, admittedOverflow: // primary path sets no Overflow, so only `admitted` occurs
+				accTs = append(accTs, ts[i])
+				accVals = append(accVals, values[i])
+
+				if sf != nil {
+					accSF = append(accSF, w)
+				}
+
+				res.Accepted++
+			case rejectOOO:
+				res.RejectedOOO++
+			case rejectCardinality:
+				res.RejectedCardinality++
+			case rejectBytes:
+				res.RejectedBytes++
+			}
+		}
+
+		if len(accTs) == 0 {
+			return nil
+		}
+
+		if _, ok := written[id]; !ok {
+			written[id] = struct{}{}
+			if err := w.WriteSeries(id, s); err != nil {
+				return err
+			}
+		}
+
+		if accSF != nil {
+			return w.WriteSamplesSF(id, accTs, accVals, accSF)
+		}
+
+		return w.WriteSamples(id, accTs, accVals)
+	}
+
 	err = wal.Replay(data, wal.Handlers{
 		OnSeries: func(id signal.SeriesID, s signal.Series) error {
 			byID[id] = s
@@ -1276,47 +1338,10 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 			return nil
 		},
 		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
-			s := byID[id] // the series record precedes its samples in the frame
-
-			var accTs []int64
-
-			var accVals []float64
-
-			for i := range ts {
-				// The primary is the shard's single authority, so it makes the admission decision
-				// here (OOO window + cardinality + in-flight memory); secondaries apply the accepted
-				// set verbatim via ApplyReplicated.
-				// The cluster primary path does not set limits.Overflow, so a new series past the cap
-				// is hard-rejected here (overflow routing is single-node metrics today); effID == id.
-				out, _, _, _ := e.head.appendByID(id, ts[i], values[i], 1, e.cfg.OOOWindow,
-					limits, func() signal.Series { return s })
-
-				switch out {
-				case admitted, admittedOverflow: // primary path sets no Overflow, so only `admitted` occurs
-					accTs = append(accTs, ts[i])
-					accVals = append(accVals, values[i])
-					res.Accepted++
-				case rejectOOO:
-					res.RejectedOOO++
-				case rejectCardinality:
-					res.RejectedCardinality++
-				case rejectBytes:
-					res.RejectedBytes++
-				}
-			}
-
-			if len(accTs) == 0 {
-				return nil
-			}
-
-			if _, ok := written[id]; !ok {
-				written[id] = struct{}{}
-				if err := w.WriteSeries(id, s); err != nil {
-					return err
-				}
-			}
-
-			return w.WriteSamples(id, accTs, accVals)
+			return apply(id, ts, values, nil)
+		},
+		OnSamplesSF: func(id signal.SeriesID, ts []int64, values, sf []float64) error {
+			return apply(id, ts, values, sf)
 		},
 	})
 

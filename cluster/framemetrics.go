@@ -16,12 +16,21 @@ const DefaultTenant signal.TenantID = "default"
 // to many tenants. A nil func, or one returning "", routes everything to [DefaultTenant].
 type TenantFunc func(signal.Resource, signal.Scope) signal.TenantID
 
-// AdmitFunc is the origin-side ingest valve: it reports whether a projected batch is admitted, and
-// a false sheds the whole batch before it is framed. Nil admits everything.
+// AdmitFunc is the origin-side admission valve: it decides a projected batch's fate before the
+// batch is framed. Nil admits everything unsampled.
+//
+// admit=false sheds the whole batch (the ingest-rate valve). weights, when non-nil, is the
+// budgeted sampler's per-point verdict, one entry per point in b: a zero drops the point, and a
+// positive value keeps it and is framed as that point's scale factor so an embedder's count/sum
+// stays unbiased. A nil weights keeps every point with no scale factor at all, which is what
+// "sampling is off" means downstream — it is not the same as a run of 1s.
+//
+// Sampling has to happen here, at the origin: the shard primary receives an already-encoded
+// payload, so by then which samples to keep is no longer a decision it can make.
 //
 // It is called once per projected batch in projection order, so an implementation may cache the
 // state it resolves per tenant across a tenant-contiguous run.
-type AdmitFunc func(tenant signal.TenantID, b *metric.Batch) bool
+type AdmitFunc func(tenant signal.TenantID, b *metric.Batch) (weights []float64, admit bool)
 
 // MetricFrames is what [FrameMetrics] produced: one WAL-encoded payload per shard key, ready to be
 // routed to that shard's primary, plus what projection saw.
@@ -68,13 +77,26 @@ func FrameMetrics(md metric.Metrics, shards int, tenantOf TenantFunc, admit Admi
 			}
 		}
 
-		if admit != nil && !admit(tid, b) {
-			shed += b.Len()
+		var weights []float64
 
-			return
+		if admit != nil {
+			w, ok := admit(tid, b)
+			if !ok {
+				shed += b.Len()
+
+				return
+			}
+
+			weights = w
 		}
 
+		sampled := len(weights) > 0 // a sampled batch weights every one of its points
+
 		for i := range b.Len() {
+			if sampled && weights[i] == 0 {
+				continue // sampled out: a kept peer's scale factor represents it
+			}
+
 			id := b.IDs[i]
 			sk := ShardKeyOf(tid, ShardOf(id, n), n)
 
@@ -90,7 +112,12 @@ func FrameMetrics(md metric.Metrics, shards int, tenantOf TenantFunc, admit Admi
 				_ = sw.w.WriteSeries(id, b.Series(i))
 			}
 
-			_ = sw.w.WriteSamples(id, b.Ts[i:i+1], b.Values[i:i+1])
+			if sampled {
+				_ = sw.w.WriteSamplesSF(id, b.Ts[i:i+1], b.Values[i:i+1], weights[i:i+1])
+			} else {
+				_ = sw.w.WriteSamples(id, b.Ts[i:i+1], b.Values[i:i+1])
+			}
+
 			counts[sk]++
 		}
 	})
