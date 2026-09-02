@@ -247,6 +247,7 @@ func cloneColumns(cols []fetch.NamedColumn) []fetch.NamedColumn {
 	for i, c := range cols {
 		out[i] = fetch.NamedColumn{
 			Name:    c.Name,
+			Kind:    c.Kind,
 			Int64:   slices.Clone(c.Int64),
 			Float64: slices.Clone(c.Float64),
 		}

@@ -208,14 +208,90 @@ func (b *Batch) ScaleFactor(i int) float64 {
 	return b.ScaleFactors[i]
 }
 
-// NamedColumn is one materialized column of a log [Batch]: its name and exactly one populated
-// typed slice (Int64/Float64/Bytes), matching the physical column kind. Row i of the batch is
+// ColumnKind is the physical kind of a [NamedColumn]: which typed slice is the live one. It
+// mirrors the persisted block.Kind of the column a batch materializes, but is a separate type so
+// the query layer does not depend on the storage layer and so the zero value is invalid rather
+// than a valid kind — a column built without a kind is a bug, and every switch on ColumnKind must
+// reject it explicitly instead of guessing.
+type ColumnKind uint8
+
+const (
+	// KindUnknown is the invalid zero value: a column whose kind was never set.
+	KindUnknown ColumnKind = iota
+	// KindInt64 marks Int64 as the live slice.
+	KindInt64
+	// KindFloat64 marks Float64 as the live slice.
+	KindFloat64
+	// KindBytes marks Bytes as the live slice.
+	KindBytes
+)
+
+func (k ColumnKind) String() string {
+	switch k {
+	case KindInt64:
+		return "int64"
+	case KindFloat64:
+		return "float64"
+	case KindBytes:
+		return "bytes"
+	case KindUnknown:
+		return "unknown"
+	default:
+		return "invalid"
+	}
+}
+
+// Valid reports whether k names a kind [NamedColumn] can carry.
+func (k ColumnKind) Valid() bool { return k >= KindInt64 && k <= KindBytes }
+
+// NamedColumn is one materialized column of a log [Batch]: its name, its physical [ColumnKind],
+// and the one typed slice that kind selects (Int64/Float64/Bytes). Row i of the batch is
 // Int64[i] / Float64[i] / Bytes[i] for that column.
+//
+// Kind is authoritative: a consumer must switch on it rather than test which slice is non-nil,
+// since an *empty* column of any kind has a nil (or zero-length) slice and is otherwise
+// indistinguishable from an empty column of every other kind. A column absent from
+// [Batch.Columns] is absent; an empty column present in it keeps its kind. The zero Kind
+// ([KindUnknown]) is never valid, so a column built by code that does not set one is rejected
+// instead of silently taken for an int64 column.
 type NamedColumn struct {
 	Name    string
+	Kind    ColumnKind
 	Int64   []int64
 	Float64 []float64
 	Bytes   [][]byte
+}
+
+// Int64Column builds an int64 [NamedColumn].
+func Int64Column(name string, vals []int64) NamedColumn {
+	return NamedColumn{Name: name, Kind: KindInt64, Int64: vals}
+}
+
+// Float64Column builds a float64 [NamedColumn].
+func Float64Column(name string, vals []float64) NamedColumn {
+	return NamedColumn{Name: name, Kind: KindFloat64, Float64: vals}
+}
+
+// BytesColumn builds a byte-string [NamedColumn].
+func BytesColumn(name string, vals [][]byte) NamedColumn {
+	return NamedColumn{Name: name, Kind: KindBytes, Bytes: vals}
+}
+
+// Len returns the column's row count, taken from the slice its [ColumnKind] selects (0 for an
+// unknown kind).
+func (c NamedColumn) Len() int {
+	switch c.Kind {
+	case KindInt64:
+		return len(c.Int64)
+	case KindFloat64:
+		return len(c.Float64)
+	case KindBytes:
+		return len(c.Bytes)
+	case KindUnknown:
+		return 0
+	default:
+		return 0
+	}
 }
 
 // Column returns the named column of the batch and whether it is present.

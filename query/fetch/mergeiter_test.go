@@ -144,7 +144,7 @@ func TestMergePassesSingleSourceBatchThrough(t *testing.T) {
 	t.Parallel()
 
 	unique := batch(3, [2]int64{10, 1})
-	unique.Columns = []fetch.NamedColumn{{Name: "body", Bytes: [][]byte{[]byte("hello")}}}
+	unique.Columns = []fetch.NamedColumn{fetch.BytesColumn("body", [][]byte{[]byte("hello")})}
 
 	released := 0
 	unique.SetRelease(func(*fetch.Batch) { released++ })

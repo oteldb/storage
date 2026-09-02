@@ -166,9 +166,9 @@ func recordBatch() *fetch.Batch {
 		ID:         signal.SeriesID{Lo: 7},
 		Timestamps: []int64{10, 20},
 		Columns: []fetch.NamedColumn{
-			{Name: "severity", Bytes: [][]byte{[]byte("ERROR"), nil}},
-			{Name: "body", Bytes: [][]byte{[]byte("boom"), []byte("ok")}},
-			{Name: "code", Int64: []int64{500, 200}},
+			fetch.BytesColumn("severity", [][]byte{[]byte("ERROR"), nil}),
+			fetch.BytesColumn("body", [][]byte{[]byte("boom"), []byte("ok")}),
+			fetch.Int64Column("code", []int64{500, 200}),
 		},
 	}
 }

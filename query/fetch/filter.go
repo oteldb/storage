@@ -169,18 +169,19 @@ func RowValue(b *Batch, i int, name string) (signal.Value, bool) {
 	}
 
 	if col, ok := b.Column(name); ok {
-		switch {
-		case col.Int64 != nil:
+		switch col.Kind {
+		case KindInt64:
 			return signal.IntValue(col.Int64[i]), true
-		case col.Float64 != nil:
+		case KindFloat64:
 			return signal.DoubleValue(col.Float64[i]), true
-		case col.Bytes != nil:
+		case KindBytes:
 			return signal.StringValue(col.Bytes[i]), true
+		case KindUnknown:
 		}
 	}
 
 	attrs, ok := b.Column(AttrsColumn)
-	if !ok || attrs.Bytes == nil {
+	if !ok || attrs.Kind != KindBytes {
 		return signal.Value{}, false
 	}
 
