@@ -378,6 +378,8 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 	mux.Handle(cluster.KeysPath, cluster.KeysHandler(s.localKeys, s.clusterOpts...))
 	// record-signal distinct column-value enumeration
 	mux.Handle(cluster.ValuesPath, cluster.ValuesHandler(s.localValues, s.clusterOpts...))
+	// metric label-metadata enumeration (index-only label names/values)
+	mux.Handle(cluster.LabelsPath, cluster.LabelsHandler(s.localLabels, s.clusterOpts...))
 	// profile symbol store
 	mux.Handle(cluster.SidePath, cluster.SideHandler(s.localProfileSymbols, s.clusterOpts...))
 	// Part mirroring for per-node private backends: peers list and fetch this node's backend
@@ -485,12 +487,13 @@ func (s *Storage) clusterFetcherFor(tid signal.TenantID) fetch.Fetcher {
 	return clusterSeriesFetcher{Fetcher: fetch.Merge(shardFetchers...), store: s, tenant: tenant}
 }
 
-// clusterSeriesFetcher adds the [fetch.SeriesLister] capability to a tenant's cluster read seam.
-// The shard fan-out under it is a multi-child merge, which opts out of the fetcher capabilities
-// (their per-child semantics do not compose), so without this layer the label endpoints would fall
-// back to draining every sample of every matching series. Series enumeration *does* compose: shards
-// partition a tenant's series, so the gather is a concatenation — exactly what
-// [Storage.clusterSeries] already does for the record signals.
+// clusterSeriesFetcher adds the [fetch.SeriesLister] and [fetch.LabelLister] capabilities to a
+// tenant's cluster read seam. The shard fan-out under it is a multi-child merge, which opts out of
+// the fetcher capabilities (their per-child semantics do not compose), so without this layer the
+// label endpoints would fall back to draining every sample of every matching series. Both
+// enumerations *do* compose across shards, which partition a tenant's series: identities
+// concatenate ([Storage.clusterSeries], as for the record signals) and label metadata unions
+// ([Storage.clusterLabels]).
 type clusterSeriesFetcher struct {
 	fetch.Fetcher
 

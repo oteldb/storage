@@ -181,6 +181,16 @@ logs/traces/profiles and metric series alike, so the metrics label endpoints ans
 in cluster mode too, and the read seam re-exposes that gather as the `fetch.SeriesLister` capability
 the shard merge underneath it cannot provide.
 
+The **labels** RPC (`/internal/labels`) is the index-only twin of the series one: it answers a
+tenant's distinct label names, or one name's values, from the metrics engine's inverted index, so a
+label query costs O(distinct values) instead of shipping every matching identity. It reuses
+`EncodeFetchRequest` behind a name discriminator (empty ⇒ names) and replies with a sorted string
+list. Every shard must answer — label metadata unions across shards, and a shard silently skipped
+would drop labels only it has — while an owner's replicas fail over as everywhere else. A signal
+with no label index (logs/traces/profiles) answers `fetch.ErrLabelsUnsupported`, as does a peer too
+old to know the endpoint (404), which leaves the caller on the identity path it was already taking
+rather than failing the query.
+
 The metric **aggregate pushdown** has two endpoints: `/internal/aggregate` returns disjoint step
 buckets, `/internal/aggregate/window` the overlapping evaluation windows of a range vector. Both
 ship one compact entry per series — identity + aggregates, never raw samples — which the coordinator
