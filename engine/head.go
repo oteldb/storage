@@ -620,10 +620,12 @@ func winBuffers(e *Engine, n int) ([]int64, []float64) {
 }
 
 // detach moves the head's sample buffers aside for a flush and installs fresh empty buffers, so new
-// appends are unaffected, returning the detached buffers (nil if no series holds a sample). The series
-// index is retained — identities outlive a flush. The caller keeps the detached buffers readable until
-// the flushed part is published, so a concurrent fetch never loses sight of the samples mid-flush.
-func (h *head) detach() map[signal.SeriesID]*sampleBuf {
+// appends are unaffected, returning the detached buffers (nil if no series holds a sample) together
+// with the byte count and accumulation start they carried away. The series index is retained —
+// identities outlive a flush. The caller keeps the detached buffers readable until the flushed part
+// is published, so a concurrent fetch never loses sight of the samples mid-flush, and hands the two
+// bookkeeping values back to [head.reattach] if the flush fails before publishing.
+func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
 	hasRows := false
 	for _, buf := range h.samples {
 		if len(buf.ts) > 0 {
@@ -634,15 +636,43 @@ func (h *head) detach() map[signal.SeriesID]*sampleBuf {
 	}
 
 	if !hasRows {
-		return nil
+		return nil, 0, time.Time{}
 	}
 
-	detached := h.samples
+	detached, bytes, since := h.samples, h.bytes, h.since
 	h.samples = make(map[signal.SeriesID]*sampleBuf)
 	h.bytes = 0
 	h.since = time.Time{}
 
-	return detached
+	return detached, bytes, since
+}
+
+// reattach folds the buffers of a flush that failed before publishing back into the head, undoing
+// what [head.detach] took away. The detached samples precede everything appended since, so the live
+// buffers are appended onto the detached ones rather than the reverse, and the merged buffer
+// replaces the live one.
+func (h *head) reattach(detached map[signal.SeriesID]*sampleBuf, bytes int64, since time.Time) {
+	for id, buf := range detached {
+		if len(buf.ts) == 0 {
+			continue
+		}
+
+		if live := h.samples[id]; live != nil {
+			for i := range live.ts {
+				buf.appendSample(live.ts[i], live.values[i], bufSF(live, i))
+			}
+		}
+
+		h.samples[id] = buf
+	}
+
+	h.grow(bytes)
+
+	// grow stamps since at now for a head that was empty; the samples coming back are older than
+	// that, so the earlier start wins and the flush interval keeps measuring from it.
+	if !since.IsZero() && (h.since.IsZero() || since.Before(h.since)) {
+		h.since = since
+	}
 }
 
 type tsv struct {

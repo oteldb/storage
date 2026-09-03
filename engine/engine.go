@@ -1404,7 +1404,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	// Plan (under lock): detach the head's sample buffers, keeping them readable via e.flushing so a
 	// concurrent fetch never loses them.
 	e.mu.Lock()
-	detached := e.head.detach()
+	detached, detachedBytes, detachedSince := e.head.detach()
 	if detached == nil {
 		e.mu.Unlock()
 		e.reclaimRetired(ctx) // nothing to flush, but still sweep pending deletions
@@ -1425,12 +1425,9 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	if e.cfg.WAL != nil {
 		seq, serr := e.cfg.WAL.Seal(e.flushedEpoch + 2)
 		if serr != nil {
-			// The detached buffers stay readable through e.flushing and their records stay in the
-			// (uncheckpointed) log, as on any other failure before publish.
 			e.mu.Unlock()
-			e.space.Observe(serr)
 
-			return 0, 0, errors.Wrap(serr, "seal wal")
+			return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, errors.Wrap(serr, "seal wal"))
 		}
 
 		checkpointSeq = seq
@@ -1442,11 +1439,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	// (warm) data with the default codec-only framing; recompression of cold data happens at merge.
 	cols := buildFlushColumns(detached)
 	if cols == nil { // every detached buffer was empty (defensive — detach guarantees ≥1 row)
-		e.mu.Lock()
-		e.flushing = nil
-		e.mu.Unlock()
-
-		return 0, 0, nil
+		return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, nil)
 	}
 
 	rows = len(cols.ts)
@@ -1462,16 +1455,12 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 
 		if err := writePart(ctx, e.cfg.Backend, prefix, sub, idents,
 			compressProfile{}, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
-			e.space.Observe(err)
-
-			return 0, 0, err
+			return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
 		}
 
 		p, err := openPart(ctx, e.cfg.Backend, prefix)
 		if err != nil {
-			e.space.Observe(err)
-
-			return 0, 0, err
+			return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
 		}
 
 		p.minTime, p.maxTime = colsTimeRange(sub)
@@ -1505,6 +1494,27 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	e.reclaimRetired(ctx)
 
 	return rows, written, nil
+}
+
+// abortFlush undoes the plan phase of a flush that failed before publishing a part: the detached
+// buffers are folded back into the head, so the samples stay live and queryable and the WAL segments
+// holding them stay in scope for the next flush's checkpoint instead of being stranded in e.flushing
+// (which the next flush overwrites). It returns cause, so callers can `return e.abortFlush(…, err)`.
+func (e *Engine) abortFlush(
+	detached map[signal.SeriesID]*sampleBuf,
+	detachedBytes int64,
+	detachedSince time.Time,
+	cause error,
+) error {
+	e.space.Observe(cause)
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.head.reattach(detached, detachedBytes, detachedSince)
+	e.flushing = nil
+
+	return cause
 }
 
 // publishLocked persists the engine's part set (the bucket index) and checkpoints the WAL through

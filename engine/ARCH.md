@@ -24,6 +24,15 @@ crash consistency.
 **Invariant:** a record is visible in exactly one of head / `flushing` / part. Never neither
 (visibility gap), never both (double count).
 
+**A flush that fails before publishing unwinds** (`abortFlush`): every pre-publish error path — the
+WAL seal, the part write, the read-back — folds the detached buffers back into the head and clears
+`flushing` in one critical section. Leaving them in `flushing` would strand them: the next flush
+overwrites it, and its checkpoint then discards the WAL segments that were the samples' last copy.
+The fold merges — appends kept landing in the fresh buffers during the flush, and the detached
+samples precede them — and restores the byte measure and `head.since`, so the retry is scheduled
+from when the data actually started waiting. Past the publish there is nothing to unwind: the parts
+are already in the live set and the samples are durable.
+
 ## Head
 
 The index (`symbols`+`series`+`postings`) plus per-series `(ts, value)` buffers.
