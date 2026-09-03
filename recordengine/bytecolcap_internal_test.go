@@ -5,6 +5,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/signal"
 )
 
 // withByteColCap lowers the int32 blob bound for the duration of a test, so the overflow guards can
@@ -89,4 +92,55 @@ func TestAppendWindowRowsRefusesOverflow(t *testing.T) {
 	require.ErrorContains(t, err, "fetch result too large")
 
 	require.NoError(t, appendWindowRows(capTestCols(t), src, rowRange{start: 0, end: 1}, 0, 1<<60))
+}
+
+// lazyCapCols builds a one-row lazy part view whose body cell is body, taking the raw-blob route
+// (the dictionary route resolves the same cell through [lazyCols.cell]).
+func lazyCapCols(body string) *lazyCols {
+	s := headTestSchema
+
+	return &lazyCols{
+		schema:  s,
+		ts:      []int64{100},
+		ints:    [][]int64{{1}},
+		bytes:   make([]*chunk.DictColumn, s.numBytes()),
+		rawBlob: []rawBytesCol{{blob: []byte(body), width: len(body)}},
+	}
+}
+
+// The two-phase filtered fetch appends row by row out of a lazily decoded part, so it accumulates
+// past the bound the same way the window paths do — an unbudgeted read with a weak AllConditions
+// condition is enough. It must reject rather than truncate an int32 offset to a negative value.
+//
+//nolint:paralleltest // mutates the package-level byteColCap
+func TestGatherHitsRefusesOverflow(t *testing.T) {
+	withByteColCap(t, 48)
+
+	big := string(bytes.Repeat([]byte("x"), 40))
+	lz := lazyCapCols(big)
+	id := signal.SeriesID{Hi: 1}
+
+	plan := func(acc *recordCols) *fetchPlan {
+		return &fetchPlan{
+			accs:    map[signal.SeriesID]*recordCols{id: acc},
+			hits:    []int{0},
+			hitRuns: []hitRun{{id: id, lo: 0, hi: 1}},
+		}
+	}
+
+	t.Run("rejects", func(t *testing.T) {
+		acc := capTestCols(t, big)
+
+		err := plan(acc).gatherHits(lz)
+		require.ErrorContains(t, err, "fetch result too large")
+		require.ErrorContains(t, err, "body", "names the offending column")
+	})
+
+	t.Run("fits", func(t *testing.T) {
+		acc := capTestCols(t)
+
+		require.NoError(t, plan(acc).gatherHits(lz))
+		require.Equal(t, 1, acc.len())
+		require.Equal(t, big, string(acc.bytes[0].at(0)))
+	})
 }

@@ -346,7 +346,7 @@ func (lz *lazyCols) colValue(i int, name string) (signal.Value, bool) {
 // appendLazyRow appends row i of lz's selected columns (ts always) to c, copying byte cells (via
 // [chunk.DictColumn.At], or the flat blob directly for an [eqFastPathCols] column) into c's blob
 // so they no longer alias the part.
-func (c *recordCols) appendLazyRow(lz *lazyCols, i int) {
+func (c *recordCols) appendLazyRow(lz *lazyCols, i int) error {
 	c.ts = append(c.ts, lz.ts[i])
 	c.noteTS(lz.ts[i])
 
@@ -361,13 +361,29 @@ func (c *recordCols) appendLazyRow(lz *lazyCols, i int) {
 			continue
 		}
 
-		if v, ok := lz.rawBlob[k].at(i); ok {
-			c.bytes[k].appendCell(v)
-			continue
+		// The cap is checked against the cell already in hand rather than in a pre-pass like the
+		// window paths' [recordCols.appendRangeOverflows]: resolving a lazy cell twice per row costs
+		// ~10% of a full filtered scan. A rejection therefore leaves a torn row behind, which is
+		// harmless — the error aborts the whole fetch and the accumulators are discarded unread.
+		v := lz.cell(k, i)
+		if int64(len(c.bytes[k].data))+int64(len(v)) > byteColCap {
+			return errColumnTooLarge(c.schema.byteColumn(k).Name)
 		}
 
-		c.bytes[k].appendCell(lz.bytes[k].At(i))
+		c.bytes[k].appendCell(v)
 	}
+
+	return nil
+}
+
+// cell returns row i of byte column k, from the flat [chunk.CodecBytesRaw] blob when the column took
+// the [eqFastPathCols] route and from its dictionary otherwise.
+func (lz *lazyCols) cell(k, i int) []byte {
+	if v, ok := lz.rawBlob[k].at(i); ok {
+		return v
+	}
+
+	return lz.bytes[k].At(i)
 }
 
 // readPartsLazy is the two-phase filtered part scan (see file doc). It appends only matching,
@@ -391,7 +407,9 @@ func (p *fetchPlan) readPartsLazy(ctx context.Context) error {
 				return err
 			}
 
-			p.gatherHits(lz)
+			if err := p.gatherHits(lz); err != nil {
+				return err
+			}
 		}
 
 		p.e.recycleLazyInts(lz)
@@ -459,13 +477,17 @@ func (p *fetchPlan) scanMatches(part *part, lz *lazyCols) bool {
 
 // gatherHits is phase 2: it appends the rows [fetchPlan.scanMatches] recorded to their streams'
 // accumulators, now that the projected columns are decoded.
-func (p *fetchPlan) gatherHits(lz *lazyCols) {
+func (p *fetchPlan) gatherHits(lz *lazyCols) error {
 	for _, run := range p.hitRuns {
 		acc := p.accs[run.id]
 		for _, i := range p.hits[run.lo:run.hi] {
-			acc.appendLazyRow(lz, i)
+			if err := acc.appendLazyRow(lz, i); err != nil {
+				return err
+			}
 		}
 	}
+
+	return nil
 }
 
 // recycleLazyInts returns a lazy part's decoded int columns (timestamp + int values) to the pool;
