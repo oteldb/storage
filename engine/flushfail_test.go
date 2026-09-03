@@ -2,12 +2,17 @@ package engine_test
 
 import (
 	"context"
+	"strings"
+	"sync"
 	"testing"
+
+	"github.com/go-faster/errors"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/wal"
@@ -92,4 +97,46 @@ func TestFlushFailureKeepsSamplesAcrossRestart(t *testing.T) {
 
 	assert.Equal(t, []int64{100, 200}, apiSamples(t, restored),
 		"samples logged to the WAL must survive a restart after a failed flush")
+}
+
+// TestFlushFailureMergesConcurrentAppends covers the fold-back's merge arm: a sample appended while
+// the flush was writing its part lands in the fresh buffer, so the failed flush must merge the
+// detached samples with it rather than replace either side. The interleaving is stated with a gate.
+func TestFlushFailureMergesConcurrentAppends(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+	e := engine.New(engine.Config{Backend: be, Prefix: "t/metrics"})
+	api := mkSeries("job", "api")
+
+	mustAppend(t, e, api, 100, 1.0)
+
+	gate := faultbackend.NewGate()
+	rule := gate.Rule(faultbackend.Write, func(op faultbackend.Op) bool {
+		return strings.HasPrefix(op.Key, "t/metrics/")
+	})
+	rule.Err = errors.New("injected write failure")
+	be.Add(rule)
+
+	var (
+		wg       sync.WaitGroup
+		flushErr error
+	)
+
+	wg.Go(func() { flushErr = e.Flush(ctx) })
+
+	gate.Await(t) // the head is detached and the part write is about to fail
+	mustAppend(t, e, api, 200, 2.0)
+
+	gate.Release()
+	wg.Wait()
+	require.Error(t, flushErr)
+	be.Reset()
+
+	assert.Equal(t, []int64{100, 200}, apiSamples(t, e),
+		"the detached sample and the one appended during the flush are both live")
+
+	require.NoError(t, e.Flush(ctx))
+	assert.Equal(t, []int64{100, 200}, apiSamples(t, e), "and both reach the retried part")
 }
