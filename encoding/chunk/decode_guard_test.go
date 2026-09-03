@@ -45,6 +45,8 @@ func TestDecodeRejectsCorruptRowCount(t *testing.T) {
 		{"t64/nonconstant-huge", t64Header(huge, false), func(s []byte) error { _, _, e := DecodeIntsT64(nil, s); return e }},
 		{"t64/constant-huge", t64Header(huge, true), func(s []byte) error { _, _, e := DecodeIntsT64(nil, s); return e }},
 		{"t64/overflow", t64Header(math.MaxUint64, true), func(s []byte) error { _, _, e := DecodeIntsT64(nil, s); return e }},
+		{"decimal/huge", uvarint(huge), func(s []byte) error { _, _, e := DecodeFloatsDecimal(nil, s); return e }},
+		{"decimal/overflow", uvarint(math.MaxUint64), func(s []byte) error { _, _, e := DecodeFloatsDecimal(nil, s); return e }},
 		{"u128/huge", uvarint(huge), func(s []byte) error { _, _, e := DecodeU128(nil, s); return e }},
 		{"u128/overflow", uvarint(math.MaxUint64), func(s []byte) error { _, _, e := DecodeU128(nil, s); return e }},
 		{"bytes/huge", uvarint(huge), func(s []byte) error { _, _, e := DecodeBytes(nil, s); return e }},
