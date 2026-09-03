@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"hash/crc32"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -159,5 +160,72 @@ func FuzzDecode(f *testing.F) {
 		again, err := Decode(got.Encode(nil))
 		require.NoError(t, err)
 		assert.Equal(t, got.Len(), again.Len())
+	})
+}
+
+// symbolsBody builds a serialized symbol table body (pre-CRC) with a chosen symbol count and a
+// chosen length prefix for its first symbol.
+func symbolsBody(count, firstLen uint64) []byte {
+	b := binary.BigEndian.AppendUint32(nil, symbolsMagic)
+	b = binary.AppendUvarint(b, uint64(symbolsVersion))
+	b = binary.AppendUvarint(b, count)
+
+	return binary.AppendUvarint(b, firstLen)
+}
+
+// withSymbolsCRC appends the checksum [Decode] verifies, so a hand-built body reaches the inner
+// field parsing instead of being rejected at the CRC.
+func withSymbolsCRC(body []byte) []byte {
+	return binary.BigEndian.AppendUint32(body, crc32.Checksum(body, castagnoli))
+}
+
+// TestDecodeRejectsHugeSymbolLength checks that a per-symbol length larger than the body errors
+// rather than panicking: an int-overflowing length reached bitstream's negative-length panic, which
+// crashed the identity-recovery path that otherwise tolerates a corrupt object.
+func TestDecodeRejectsHugeSymbolLength(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		ln   uint64
+	}{
+		{"overflow", math.MaxUint64},
+		{"huge", 1 << 40},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := Decode(withSymbolsCRC(symbolsBody(1, tc.ln)))
+			require.ErrorIs(t, err, ErrCorrupt)
+		})
+	}
+}
+
+// FuzzDecodeBody fuzzes the body with a repaired CRC, so mutations reach the field parsing that
+// [FuzzDecode] can only hit by accidentally producing a matching checksum.
+func FuzzDecodeBody(f *testing.F) {
+	tbl := New()
+	tbl.Intern([]byte("job"))
+	tbl.Intern([]byte("instance"))
+
+	enc := tbl.Encode(nil)
+	f.Add(enc[:len(enc)-4])
+	f.Add(symbolsBody(1, math.MaxUint64))
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, body []byte) {
+		got, err := Decode(withSymbolsCRC(body))
+		if err != nil {
+			return
+		}
+
+		again, err := Decode(got.Encode(nil))
+		if err != nil {
+			t.Fatalf("re-decode: %v", err)
+		}
+
+		if again.Len() != got.Len() {
+			t.Fatalf("len = %d, want %d", again.Len(), got.Len())
+		}
 	})
 }
