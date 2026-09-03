@@ -1416,6 +1416,26 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	// Snapshot the flushed series' identities while still under the lock: the part write runs
 	// off-lock, and the resident index keeps being mutated by ingest.
 	idents := e.head.identitiesOf(detached)
+
+	// Seal the WAL at the detach point, atomically with it: the part about to be written holds
+	// exactly the samples logged so far, so the checkpoint that publishes it must discard only those
+	// segments. A sample appended during the off-lock part write logs into a later segment at the
+	// next generation, which this flush neither deletes nor makes replay skip.
+	checkpointSeq := -1
+	if e.cfg.WAL != nil {
+		seq, serr := e.cfg.WAL.Seal(e.flushedEpoch + 2)
+		if serr != nil {
+			// The detached buffers stay readable through e.flushing and their records stay in the
+			// (uncheckpointed) log, as on any other failure before publish.
+			e.mu.Unlock()
+			e.space.Observe(serr)
+
+			return 0, 0, errors.Wrap(serr, "seal wal")
+		}
+
+		checkpointSeq = seq
+	}
+
 	e.mu.Unlock()
 
 	// Build (lock-free): lay out the detached buffers and write the part. Flush writes freshly-ingested
@@ -1473,7 +1493,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	// The parts about to be committed supersede every WAL record logged so far, so the watermark
 	// they carry retires that generation and the next head records open a new one.
 	e.flushedEpoch++
-	err = e.publishLocked(ctx)
+	err = e.publishLocked(ctx, checkpointSeq)
 	e.mu.Unlock()
 
 	written = partsBytes(newParts)
@@ -1487,9 +1507,10 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	return rows, written, nil
 }
 
-// publishLocked persists the engine's part set (the bucket index) and checkpoints the WAL — the
-// now-durable part makes its WAL records obsolete. Caller holds e.mu.
-func (e *Engine) publishLocked(ctx context.Context) error {
+// publishLocked persists the engine's part set (the bucket index) and checkpoints the WAL through
+// checkpointSeq — the sequence the flush sealed at detach, past which the now-durable part
+// supersedes nothing (negative ⇒ no WAL). Caller holds e.mu.
+func (e *Engine) publishLocked(ctx context.Context, checkpointSeq int) error {
 	// Ordering is a durability invariant: a part's own objects — including the identity object
 	// naming its series — are all written before the bucket index, which is what makes the part
 	// durably visible, so a readable part always has the identities its rows resolve through. The
@@ -1499,10 +1520,8 @@ func (e *Engine) publishLocked(ctx context.Context) error {
 		return err
 	}
 
-	if e.cfg.WAL != nil {
-		e.cfg.WAL.SetEpoch(e.flushedEpoch + 1)
-
-		return e.cfg.WAL.Checkpoint()
+	if e.cfg.WAL != nil && checkpointSeq >= 0 {
+		return e.cfg.WAL.CheckpointThrough(checkpointSeq)
 	}
 
 	return nil

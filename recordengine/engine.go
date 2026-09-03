@@ -1287,6 +1287,22 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	// off-lock, and the resident index keeps being mutated by ingest.
 	idents := e.head.identitiesOf(detached)
 
+	// Seal the WAL at the detach point, atomically with it: the part about to be written holds
+	// exactly the records logged so far, so the checkpoint that publishes it must discard only those
+	// segments. An append landing during the off-lock part write logs into a later segment at the
+	// next generation, which this flush neither deletes nor makes replay skip.
+	checkpointSeq := -1
+	if e.cfg.WAL != nil {
+		seq, serr := e.cfg.WAL.Seal(e.flushedEpoch + 2)
+		if serr != nil {
+			e.mu.Unlock()
+
+			return 0, 0, e.abortFlush(ctx, detached, detachedBytes, nil, errors.Wrap(serr, "seal wal"))
+		}
+
+		checkpointSeq = seq
+	}
+
 	var side map[string][]byte
 	if e.cfg.SideStore != nil {
 		side = e.cfg.SideStore.Encode()
@@ -1358,7 +1374,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	e.flushing = nil
 	e.head.releaseDetached() // the buffers are gone with e.flushing: drop them from the in-flight measure
 	e.flushedEpoch++
-	err = e.publishLocked(ctx)
+	err = e.publishLocked(ctx, checkpointSeq)
 	e.mu.Unlock()
 
 	written = partsBytes(newParts)
@@ -1406,8 +1422,9 @@ func (e *Engine) abortFlush(
 }
 
 // publishLocked persists the engine's part set (the bucket index) and, for a flush, checkpoints the
-// WAL to the advanced watermark. Caller holds e.mu.
-func (e *Engine) publishLocked(ctx context.Context) error {
+// WAL through checkpointSeq — the sequence the flush sealed at detach (negative ⇒ no WAL). Caller
+// holds e.mu.
+func (e *Engine) publishLocked(ctx context.Context, checkpointSeq int) error {
 	// Ordering is a durability invariant: a part's own objects — including the identity object
 	// naming its streams — are all written before the bucket index, which carries the flush
 	// watermark (the WAL replay floor) and is therefore the commit point. A committed part whose
@@ -1420,10 +1437,8 @@ func (e *Engine) publishLocked(ctx context.Context) error {
 		return err
 	}
 
-	if e.cfg.WAL != nil {
-		e.cfg.WAL.SetEpoch(e.flushedEpoch + 1)
-
-		return e.cfg.WAL.Checkpoint()
+	if e.cfg.WAL != nil && checkpointSeq >= 0 {
+		return e.cfg.WAL.CheckpointThrough(checkpointSeq)
 	}
 
 	return nil

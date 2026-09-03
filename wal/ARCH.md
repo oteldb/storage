@@ -43,8 +43,17 @@ the metric merge dedups, and a replica's `RefreshReplica` trims the head below w
 cover.
 
 Lifecycle: `Create` **resumes** an existing directory (opens lazily beyond the prior run's
-segments, never truncating them), `SetEpoch` stamps new segments, `Checkpoint` deletes the segments
-a flush made durable (truncate-on-flush), so replay stays bounded.
+segments, never truncating them), `SetEpoch` stamps new segments, `Seal` closes the current segment
+and stamps the next generation, and `CheckpointThrough` deletes the segments a flush made durable
+(truncate-on-flush), so replay stays bounded.
+
+**A flush seals at detach, not at publish.** The part holds exactly the records logged when the head
+was detached, and the part write then runs off the engine lock while ingest continues. Sealing there
+— atomically with the detach — puts every later record in a segment beyond the sealed sequence, at
+the generation past the watermark the flush is about to commit, so `CheckpointThrough` cannot delete
+it and `ReplayDirFrom` cannot skip it. Checkpointing through the *current* sequence instead deletes
+the segments holding acknowledged records that no part contains: silent loss under ordinary
+concurrent ingest.
 
 ## Durability policy
 
