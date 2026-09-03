@@ -68,7 +68,7 @@ func DecodeAggregateRequest(data []byte) (tenant string, start, end, step int64,
 	}
 
 	count, m := binary.Uvarint(data)
-	if m <= 0 {
+	if m <= 0 || count > uint64(len(data)) { // each matcher needs ≥1 downstream byte
 		return "", 0, 0, 0, nil, errors.New("cluster: malformed matcher count")
 	}
 	data = data[m:]
