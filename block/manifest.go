@@ -63,6 +63,10 @@ const (
 	// manifestVersionChecked is the first version whose column objects carry checksums.
 	manifestVersionChecked uint32 = 2
 
+	// maxPartRows is the defensive ceiling on a decoded row count, mirroring the chunk decoders'
+	// own: no writer emits a part this large, and a count above it is a corrupt manifest.
+	maxPartRows uint64 = 1 << 31
+
 	// flagConst marks a constant-collapsed column (single value, no data object).
 	flagConst byte = 1 << 0
 	// flagLossy marks a float column carrying a non-zero lossy precision budget; when set, one
@@ -342,6 +346,13 @@ func DecodeManifest(src []byte) (Manifest, error) {
 	rowCount, err := r.ReadUvarint()
 	if err != nil {
 		return Manifest{}, errors.Wrap(ErrCorrupt, "rowCount")
+	}
+
+	// Unlike colCount, a part's row count is not bounded by the manifest's own length, so it is
+	// bounded defensively instead: past maxPartRows the int conversion is either negative (a part
+	// then opens and panics on the first column read) or a row count no writer can produce.
+	if rowCount > maxPartRows {
+		return Manifest{}, errors.Wrapf(ErrCorrupt, "rowCount %d exceeds %d", rowCount, maxPartRows)
 	}
 
 	m.RowCount = int(rowCount)

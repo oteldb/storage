@@ -384,6 +384,49 @@ func FuzzBlockedRoundTrip(f *testing.F) {
 	})
 }
 
+// TestBlockedShortGranule checks that a granule holding fewer rows than the directory places there
+// is rejected rather than decoded. Silently packing the surviving rows together shifts every later
+// row earlier, so a column read against an intact one mispairs values with timestamps — a wrong
+// answer with no error anywhere.
+func TestBlockedShortGranule(t *testing.T) {
+	t.Parallel()
+
+	const blockRows, n = 4, 16
+
+	vals := make([]int64, n)
+	for i := range vals {
+		vals[i] = int64(1000 + i*15)
+	}
+
+	for _, short := range []int{0, 1, n/blockRows - 1} {
+		t.Run("granule="+itoaT(short), func(t *testing.T) {
+			t.Parallel()
+
+			object, err := encodeBlockedWith(n, noneComp(), blockRows, defaultCompressBlockBytes,
+				func(dst []byte, lo, hi int) ([]byte, error) {
+					if lo/blockRows == short {
+						hi = lo + 1 // one row where the directory places blockRows
+					}
+
+					return chunk.EncodeTimestamps(dst, vals[lo:hi]), nil
+				})
+			require.NoError(t, err)
+
+			desc := ColumnDesc{
+				Name: "ts", Kind: KindInt64, Codec: chunk.CodecDoD,
+				Blocked: true, Framed: true, Checked: true,
+			}
+
+			got, err := newColumnReader(desc, object, noneComp(), n).Int64(nil)
+			if err != nil {
+				return // rejected, as it must be
+			}
+
+			assert.Equal(t, vals, got, "accepted a short granule and shifted the rows after it")
+		})
+	}
+}
+
 // FuzzBlockedDecodeNoPanic feeds arbitrary bytes to the blocked decode path: a corrupt object must
 // error, never panic, and never read out of bounds.
 func FuzzBlockedDecodeNoPanic(f *testing.F) {

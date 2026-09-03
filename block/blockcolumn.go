@@ -838,10 +838,8 @@ func (w *bytesWalk) appendShared(ids []byte, rows, lo int) error {
 
 	// Bounds-checked here rather than left to the merge's remap lookup: a corrupt id would otherwise
 	// panic inside the merger with nothing naming the granule it came from.
-	for r := range rows {
-		if id := sharedIDAt(ids, idWidth, r); id >= len(w.shared) {
-			return errors.Wrapf(ErrCorrupt, "shared dict: id %d past %d entries", id, len(w.shared))
-		}
+	if err := boundSharedIDs(ids, idWidth, rows, w.shared); err != nil {
+		return err
 	}
 
 	w.merger.SeedShared(w.shared)
@@ -931,6 +929,10 @@ func decodeBlockedColumn[T any](
 			return nil, err
 		}
 
+		if base >= rows {
+			return nil, errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", i, base, rows)
+		}
+
 		// cap(out[base:]) == rows-base ≥ this block's row count (blocks partition [0,rows)), so the
 		// decoder fills out[base:base+blkRows] in place without reallocating.
 		sub, _, err := dec(out[base:base], stream)
@@ -938,10 +940,13 @@ func decodeBlockedColumn[T any](
 			return nil, errors.Wrapf(err, "decode block %d", i)
 		}
 
-		base += len(sub)
-		if base > rows {
-			return nil, errors.Wrapf(ErrCorrupt, "block %d overran row count %d", i, rows)
+		// A granule shorter than the directory places there would otherwise pack the surviving rows
+		// together, shifting every later row earlier — a wrong answer with no error.
+		if want := min(base+dir.blockRows, rows) - base; len(sub) != want {
+			return nil, errors.Wrapf(ErrCorrupt, "block %d decoded %d rows, want %d", i, len(sub), want)
 		}
+
+		base += len(sub)
 	}
 
 	return out[:base], nil

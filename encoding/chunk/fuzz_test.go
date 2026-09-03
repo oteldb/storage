@@ -255,6 +255,23 @@ func FuzzDecodeBytesArbitrary(f *testing.F) {
 	})
 }
 
+// FuzzDecodeNumericArbitrary feeds arbitrary bytes to every numeric column decoder: a corrupt
+// header must yield an error, never a panic or a row count large enough to exhaust memory.
+func FuzzDecodeNumericArbitrary(f *testing.F) {
+	f.Add(uvarint(1 << 40))
+	f.Add(uvarint(math.MaxUint64))
+	f.Add(EncodeFloatsDecimal(nil, []float64{1, 2.5, 3}, 64))
+	f.Add(EncodeTimestamps(nil, []int64{1, 2, 3}))
+
+	f.Fuzz(func(_ *testing.T, src []byte) {
+		_, _, _ = DecodeTimestamps(nil, src)
+		_, _, _ = DecodeFloats(nil, src)
+		_, _, _ = DecodeFloatsDecimal(nil, src)
+		_, _, _ = DecodeIntsT64(nil, src)
+		_, _, _ = DecodeU128(nil, src)
+	})
+}
+
 // decodeSeedToInt64s reads a sequence of zigzag varints from the seed.
 func decodeSeedToInt64s(seed []byte, maxVals int) []int64 {
 	var vals []int64

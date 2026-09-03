@@ -3,6 +3,7 @@ package identity
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"math"
 
 	"github.com/go-faster/errors"
 
@@ -254,6 +255,12 @@ func (d *decoder) sym() ([]byte, error) {
 	}
 
 	d.rest = d.rest[n:]
+
+	// Checked before the narrowing conversion: symbols.ID is 32-bit, so a ref of 2^32+k would
+	// otherwise decode as symbol k — a different identity, with no error.
+	if v > math.MaxUint32 {
+		return nil, errors.Wrapf(ErrCorrupt, "symbol %d out of range", v)
+	}
 
 	b, ok := d.tab.Get(symbols.ID(v))
 	if !ok {

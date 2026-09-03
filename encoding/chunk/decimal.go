@@ -77,6 +77,12 @@ func DecodeFloatsDecimal(dst []float64, src []byte) ([]float64, int, error) {
 		return dst, consumed, nil
 	}
 
+	// Every row past the first is a varint of at least one byte, so a count above the remaining
+	// bytes is a corrupt header.
+	if err := boundRows(rows, len(src)-consumed); err != nil {
+		return dst, 0, err
+	}
+
 	if cap(dst) < rows {
 		dst = resize(dst, rows)
 	}

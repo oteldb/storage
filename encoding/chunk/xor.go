@@ -158,6 +158,50 @@ func xorReadControl(r *bitstream.Reader) (changed, newLT bool, err error) {
 	return true, newLT, err
 }
 
+// xorReadWindow resolves one sample's significant-bit window: either the previous sample's, or a
+// new leading/significant pair read from the stream (which it stores as the carried state).
+//
+// Both forms are bounds-checked because the widths are uint8 subtractions: the encoder never emits
+// a window wider than the value, but a corrupt stream that does would underflow them into a
+// ReadBits count outside [0,64], which panics.
+func xorReadWindow(r *bitstream.Reader, ctrl1 bool, leading, trailing *uint8) (newTrailing, sigbits uint8, err error) {
+	if !ctrl1 {
+		// Reusing the previous sample's window — including, on a corrupt stream, the initial
+		// "no previous sample" sentinel (leading 0xff).
+		if int(*leading)+int(*trailing) > 64 {
+			return 0, 0, errUnexpectedEOF
+		}
+
+		return *trailing, 64 - *leading - *trailing, nil
+	}
+
+	lbits, err := r.ReadBits(5)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	sbits, err := r.ReadBits(6)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	newLeading := uint8(lbits)
+
+	sigbits = uint8(sbits)
+	if sigbits == 0 {
+		sigbits = 64 // sentinel
+	}
+
+	if int(newLeading)+int(sigbits) > 64 {
+		return 0, 0, errUnexpectedEOF
+	}
+
+	newTrailing = 64 - newLeading - sigbits
+	*leading, *trailing = newLeading, newTrailing
+
+	return newTrailing, sigbits, nil
+}
+
 // xorRead reads a single XOR delta and updates the value. State (leading, trailing)
 // is carried between samples.
 func xorRead(r *bitstream.Reader, val *float64, leading, trailing *uint8) error {
@@ -166,32 +210,9 @@ func xorRead(r *bitstream.Reader, val *float64, leading, trailing *uint8) error 
 		return err // err, or value unchanged (err == nil)
 	}
 
-	var newLeading, newTrailing, sigbits uint8
-	if !ctrl1 {
-		// Reuse previous leading/trailing.
-		newLeading, newTrailing = *leading, *trailing
-		sigbits = 64 - newLeading - newTrailing
-	} else {
-		// New leading/trailing.
-		lbits, err := r.ReadBits(5)
-		if err != nil {
-			return err
-		}
-
-		newLeading = uint8(lbits)
-
-		sbits, err := r.ReadBits(6)
-		if err != nil {
-			return err
-		}
-
-		sigbits = uint8(sbits)
-		if sigbits == 0 {
-			sigbits = 64 // sentinel
-		}
-
-		newTrailing = 64 - newLeading - sigbits
-		*leading, *trailing = newLeading, newTrailing
+	newTrailing, sigbits, err := xorReadWindow(r, ctrl1, leading, trailing)
+	if err != nil {
+		return err
 	}
 
 	mbits, err := r.ReadBits(sigbits)

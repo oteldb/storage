@@ -172,6 +172,10 @@ func Decode(src []byte) (*Table, error) {
 			return nil, errors.Wrapf(ErrCorrupt, "symbol %d length", i)
 		}
 
+		if ln > uint64(len(body)) {
+			return nil, errors.Wrapf(ErrCorrupt, "symbol %d length %d exceeds body", i, ln)
+		}
+
 		view, err := r.ReadBytesView(int(ln))
 		if err != nil {
 			return nil, errors.Wrapf(ErrCorrupt, "symbol %d bytes", i)
