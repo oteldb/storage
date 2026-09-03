@@ -103,17 +103,40 @@ func (sw *SegmentWriter) SetSync(on bool) { sw.sync = on }
 // [ReplayDirFrom] can skip whole segments already superseded by a flushed part.
 func (sw *SegmentWriter) SetEpoch(epoch uint64) { sw.epoch = epoch }
 
-// Checkpoint discards every segment written so far. Call it after a full head flush, whose part
-// durably supersedes those records. It closes the current segment and best-effort deletes all
-// segments (the next write lazily opens a fresh one carrying the current epoch). The flush advances
-// the epoch and persists it as the bucket-index watermark *before* this call, so even a crash between
-// the part committing and this deletion replays nothing already flushed (exactly-once — the watermark
-// and the part list advance atomically; see [ReplayDirFrom]).
-func (sw *SegmentWriter) Checkpoint() error {
-	obsolete := sw.seq
+// Seal closes the current segment and stamps subsequent ones with epoch, returning the sequence
+// number it sealed through — the argument [SegmentWriter.CheckpointThrough] takes once the flush of
+// those records commits.
+//
+// A flush seals at the instant it detaches the head, not when it publishes: the part it goes on to
+// write off-lock holds exactly the records logged before that instant. A record appended during the
+// part write then lands in a segment beyond the sealed number, carrying the generation past the
+// watermark the flush is about to commit — so the checkpoint does not delete it and replay does not
+// skip it.
+func (sw *SegmentWriter) Seal(epoch uint64) (int, error) {
+	if err := sw.Close(); err != nil { // the next write lazily opens a segment carrying epoch
+		return 0, err
+	}
 
-	if err := sw.Close(); err != nil { // close the current segment; next write reopens lazily
-		return err
+	sw.epoch = epoch
+
+	return sw.seq, nil
+}
+
+// Checkpoint discards every segment written so far. Call it only when a durable part supersedes
+// every record logged up to now — a flush that ran concurrently with ingest must use
+// [SegmentWriter.CheckpointThrough] with the sequence its [SegmentWriter.Seal] returned instead.
+func (sw *SegmentWriter) Checkpoint() error { return sw.CheckpointThrough(sw.seq) }
+
+// CheckpointThrough discards the segments up to and including through, whose records a flushed part
+// durably supersedes; later segments (holding records appended while that part was being written)
+// are kept. The flush advances the epoch and persists it as the bucket-index watermark *before* this
+// call, so even a crash between the part committing and this deletion replays nothing already
+// flushed (exactly-once — the watermark and the part list advance atomically; see [ReplayDirFrom]).
+func (sw *SegmentWriter) CheckpointThrough(obsolete int) error {
+	if obsolete >= sw.seq {
+		if err := sw.Close(); err != nil { // close the current segment; next write reopens lazily
+			return err
+		}
 	}
 
 	entries, err := os.ReadDir(sw.dir)

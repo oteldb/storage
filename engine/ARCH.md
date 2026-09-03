@@ -92,8 +92,9 @@ The bucket index makes a part durably visible, so writing it is the commit point
 always carries the identities its rows resolve through. A crash in between leaves an orphan — objects
 and identity together — swept at the next open, stranding nothing.
 
-`Checkpoint` runs last and is the WAL's commit point, so replay recovers a part that failed to
-publish. The index also carries the flush watermark (as `recordengine` does) and replay skips
+`CheckpointThrough` runs last and is the WAL's commit point, so replay recovers a part that failed
+to publish. It discards only through the sequence the flush sealed at detach, leaving the segments
+that hold samples appended during the part write (`wal/ARCH.md`, "Epochs"). The index also carries the flush watermark (as `recordengine` does) and replay skips
 segments at or below it: a checkpoint only reaches segments this node wrote, and it can miss them —
 a node that stops being the shard's compaction owner stops checkpointing while its parts keep
 arriving — so the watermark is what keeps recovery exactly-once.

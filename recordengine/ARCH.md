@@ -198,8 +198,9 @@ dead-fraction thresholds.
 
 ## Publish ordering
 
-**Flush** writes the part's objects — identity included — first, the bucket index last, then
-checkpoints the WAL. The bucket index carries the flush watermark replay starts from — one slot per
+**Flush** seals the WAL as it detaches the head, writes the part's objects — identity included —
+first, the bucket index last, then checkpoints the WAL through the sealed sequence, keeping the
+segments that hold records appended during the part write (`wal/ARCH.md`, "Epochs"). The bucket index carries the flush watermark replay starts from — one slot per
 writer, since the index is shared and the watermark is not (`wal/ARCH.md`, "Epochs") — so
 writing it is the commit point and only what is already durable may be committed. A committed part
 whose identities were missing would be **unrecoverable**: it holds rows no matcher can name, while the
