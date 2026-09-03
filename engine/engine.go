@@ -1540,11 +1540,18 @@ func (e *Engine) decodeOf(ctx context.Context, p *part, need colNeed, ranges []r
 	}
 
 	var err error
-	if e.blockCache != nil {
+
+	switch {
+	case ranges == nil:
+		// The whole-part convention is resolved here, above both decode implementations: neither is
+		// then free to interpret nil, and a block-selecting implementation cannot silently return
+		// buffers it never filled.
+		dp, err = p.decodeInto(ctx, dp, need)
+	case e.blockCache != nil:
 		// Cross-fetch block cache: assemble the matched blocks from the cache (decoding+caching the
 		// misses), so a column is decoded once across fetches and only for the blocks it touches.
 		err = e.assembleFromBlocks(ctx, dp, p, need, ranges)
-	} else {
+	default:
 		// No cache: decode the matched blocks fresh into the pooled buffers each fetch.
 		dp, err = p.decodeRangesInto(ctx, dp, need, ranges)
 	}

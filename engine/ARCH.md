@@ -452,6 +452,14 @@ without enlarging the resident set. Cache-off, or constant/unblocked columns, de
 series-skipped to the blocks the matched row ranges touch. With the cache on a fetch also prefetches
 the parts it will touch.
 
+Every part decode enters through one seam (`Engine.decodeOf`), which owns the whole-part convention:
+`nil` row ranges mean *decode the whole part* and resolve to a whole-column decode there, above both
+the cached and uncached implementations. A block-selecting implementation must never see `nil` — it
+returns part-sized buffers with only the selected blocks written, so an empty block set yields buffers
+the caller reads as data (a pooled buffer then surfaces its previous occupant's rows). Non-nil ranges
+carry the same contract in the other direction: rows outside the selected blocks are undefined, and a
+caller reads only its matched series' rows.
+
 **Granule time pruning** — block boundaries align with the part's marks granules, so the marks index
 already carries each block's `[MinKey, MaxKey]` sample times (`block/ARCH.md`). A block-sliced fetch
 drops blocks that cannot intersect the window before reading them, and sizes the decode reservation

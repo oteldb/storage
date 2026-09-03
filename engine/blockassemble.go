@@ -10,12 +10,12 @@ import (
 // cache, decoding (and caching) only the blocks not already resident. dp's arrays are sized to the
 // part's full row count, with the touched blocks' row spans populated; the caller reads only the
 // matched series' rows, which lie in those blocks. A legacy unblocked part (no granule-aligned blocks)
-// falls back to a whole-column decode.
+// falls back to a whole-column decode, as does a nil ranges (the whole-part convention).
 func (e *Engine) assembleFromBlocks(ctx context.Context, dp *decodedPart, p *part, need colNeed, ranges []rowRange) error {
 	blockRows := p.reader.Manifest().GranuleSize
 
 	tsDesc, ok := p.reader.ColumnDescByName(colTs)
-	if !ok || blockRows <= 0 || !tsDesc.Blocked {
+	if ranges == nil || !ok || blockRows <= 0 || !tsDesc.Blocked {
 		_, err := p.decodeRangesInto(ctx, dp, need, ranges)
 
 		return err
