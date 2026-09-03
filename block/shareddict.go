@@ -388,6 +388,19 @@ func sharedIDAt(ids []byte, idWidth, r int) int {
 	return int(uint16(ids[r*2])<<8 | uint16(ids[r*2+1]))
 }
 
+// boundSharedIDs rejects a granule whose packed ids do not all index entries. Every path that
+// accepts shared-dictionary ids runs it: the ids outlive the decode inside the returned column, so
+// an unchecked one surfaces as a panic at [chunk.DictColumn.At] rather than a decode error.
+func boundSharedIDs(ids []byte, idWidth, rows int, entries [][]byte) error {
+	for r := range rows {
+		if id := sharedIDAt(ids, idWidth, r); id >= len(entries) {
+			return errors.Wrapf(ErrCorrupt, "shared dict: id %d past %d entries", id, len(entries))
+		}
+	}
+
+	return nil
+}
+
 // splitSharedGranule peels a granule stream's leading mode byte, rejecting a mode this reader does
 // not know rather than treating its payload as one of the two it does.
 func splitSharedGranule(stream []byte) (mode byte, payload []byte, err error) {
@@ -470,6 +483,13 @@ func decodeSharedIDs(
 		if len(stream[1:]) != n*idWidth {
 			return nil, false, errors.Wrapf(ErrCorrupt,
 				"shared dict: %d id bytes for %d rows at width %d", len(stream[1:]), n, idWidth)
+		}
+
+		// Bounds-checked here as the merge path does in appendShared: an unchecked id survives into
+		// the returned column and panics later at chunk.DictColumn.At, inside the caller's row loop
+		// with nothing naming the granule it came from.
+		if err := boundSharedIDs(stream[1:], idWidth, n, entries); err != nil {
+			return nil, false, err
 		}
 
 		at := pos

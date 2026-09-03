@@ -263,6 +263,31 @@ func TestKindString(t *testing.T) {
 	assert.Equal(t, "unknown", Kind(99).String())
 }
 
+// TestDecodeManifestRejectsCorruptRowCount checks that an implausible row count errors at decode.
+// Accepted unchecked it wraps negative, and the part then opens successfully only to panic on the
+// first column read.
+func TestDecodeManifestRejectsCorruptRowCount(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		rows int
+	}{
+		{"negative", -1},
+		{"huge", 1 << 40},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := sampleManifest()
+			m.RowCount = tc.rows
+
+			_, err := DecodeManifest(m.Encode(nil))
+			require.ErrorIs(t, err, ErrCorrupt)
+		})
+	}
+}
+
 // FuzzManifestDecode asserts DecodeManifest never panics on arbitrary input, and that
 // any manifest it accepts re-encodes to bytes it accepts again (decode∘encode stable).
 func FuzzManifestDecode(f *testing.F) {
@@ -276,6 +301,27 @@ func FuzzManifestDecode(f *testing.F) {
 			return
 		}
 		// Accepted ⇒ re-encode must round-trip.
+		got, err := DecodeManifest(m.Encode(nil))
+		require.NoError(t, err)
+		assert.Equal(t, m, got)
+	})
+}
+
+// FuzzManifestDecodeBody fuzzes the body with a repaired CRC, so mutations reach the field parsing
+// that [FuzzManifestDecode] can only hit by accidentally producing a matching checksum.
+func FuzzManifestDecodeBody(f *testing.F) {
+	enc := sampleManifest().Encode(nil)
+	f.Add(enc[:len(enc)-4])
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, body []byte) {
+		src := binary.BigEndian.AppendUint32(append([]byte(nil), body...), crc32.Checksum(body, castagnoli))
+
+		m, err := DecodeManifest(src)
+		if err != nil {
+			return
+		}
+
 		got, err := DecodeManifest(m.Encode(nil))
 		require.NoError(t, err)
 		assert.Equal(t, m, got)
