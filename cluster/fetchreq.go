@@ -238,7 +238,7 @@ func ParseFetchRequest(data []byte) (FetchRequest, error) {
 	data = data[m:]
 
 	count, m := binary.Uvarint(data)
-	if m <= 0 {
+	if m <= 0 || count > uint64(len(data)) { // each matcher needs ≥1 downstream byte
 		return FetchRequest{}, errors.New("cluster: malformed matcher count")
 	}
 	data = data[m:]
@@ -263,7 +263,7 @@ func ParseFetchRequest(data []byte) (FetchRequest, error) {
 	}
 
 	count, m = binary.Uvarint(data)
-	if m <= 0 {
+	if m <= 0 || count > uint64(len(data)) { // each condition needs ≥1 downstream byte
 		return FetchRequest{}, errors.New("cluster: malformed condition count")
 	}
 	data = data[m:]

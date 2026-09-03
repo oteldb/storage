@@ -200,6 +200,13 @@ are deliberately **separate paths** rather than one widened request: a peer that
 answers 404, which fails over, instead of silently returning disjoint buckets for an overlapping
 question.
 
+**Every RPC decoder rejects a length prefix larger than the bytes that could back it**, on both
+sides of the wire: a request decoder runs on the node being asked, a response decoder on the node
+that asked, so an unclamped `make` from a peer's count is a remote process kill in either direction.
+The RPCs carry no checksum, so this is the only thing standing between a corrupted frame and a
+crash. The bound is the remaining input, since every element costs at least one byte; the decoders
+are fuzzed against it.
+
 ## Sharding
 
 `Config.ShardsPerTenant` splits a tenant into N shards; a series/stream maps to

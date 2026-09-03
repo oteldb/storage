@@ -91,7 +91,7 @@ func EncodeBatches(batches []*fetch.Batch) []byte {
 // DecodeBatches parses [EncodeBatches] output, recomputing each batch's id from its identity.
 func DecodeBatches(data []byte) ([]*fetch.Batch, error) {
 	count, m := binary.Uvarint(data)
-	if m <= 0 {
+	if m <= 0 || count > uint64(len(data)) { // each batch needs ≥1 downstream byte
 		return nil, errors.New("cluster: malformed batches")
 	}
 	data = data[m:]
@@ -111,7 +111,7 @@ func DecodeBatches(data []byte) ([]*fetch.Batch, error) {
 		data = data[sl:]
 
 		ns, m := binary.Uvarint(data)
-		if m <= 0 {
+		if m <= 0 || ns > uint64(len(data)-m)/9 { // each sample is a varint plus 8 value bytes
 			return nil, errors.New("cluster: malformed sample count")
 		}
 		data = data[m:]
@@ -212,7 +212,7 @@ func appendColumn(buf []byte, c *fetch.NamedColumn) ([]byte, error) {
 // DecodeLogBatches parses [EncodeLogBatches] output, recomputing each batch's id from its identity.
 func DecodeLogBatches(data []byte) ([]*fetch.Batch, error) {
 	count, m := binary.Uvarint(data)
-	if m <= 0 {
+	if m <= 0 || count > uint64(len(data)) { // each batch needs ≥1 downstream byte
 		return nil, errors.New("cluster: malformed log batches")
 	}
 
@@ -241,7 +241,7 @@ func DecodeLogBatches(data []byte) ([]*fetch.Batch, error) {
 		}
 
 		nc, m := binary.Uvarint(data)
-		if m <= 0 {
+		if m <= 0 || nc > uint64(len(data)-m) { // each column needs ≥1 downstream byte
 			return nil, errors.New("cluster: malformed column count")
 		}
 
@@ -264,7 +264,7 @@ func DecodeLogBatches(data []byte) ([]*fetch.Batch, error) {
 
 func decodeTimestamps(data []byte) ([]int64, []byte, error) {
 	n, m := binary.Uvarint(data)
-	if m <= 0 {
+	if m <= 0 || n > uint64(len(data)-m) { // each timestamp is ≥1 varint byte
 		return nil, nil, errors.New("cluster: malformed timestamp count")
 	}
 
@@ -298,7 +298,7 @@ func decodeColumn(data []byte) (fetch.NamedColumn, []byte, error) {
 	data = data[1:]
 
 	n, m := binary.Uvarint(data)
-	if m <= 0 {
+	if m <= 0 || n > uint64(len(data)-m) { // every kind spends ≥1 byte per element
 		return fetch.NamedColumn{}, nil, errors.New("cluster: malformed column length")
 	}
 
