@@ -60,6 +60,34 @@ func TestAggregateWholePartDecodeWithBlockCache(t *testing.T) {
 		}
 	})
 
+	// A ranged fetch first, so the block cache holds this part's blocks when the whole-part fold
+	// runs: the two decode shapes share a part and must not be answered from each other's selection.
+	t.Run("AfterRangedFetch", func(t *testing.T) {
+		t.Parallel()
+
+		e := engine.New(engine.Config{
+			Backend: backend.Memory(), Prefix: "default/metrics",
+			DecodeCacheBytes: 1 << 20, AggregateStats: true,
+		})
+		seedAggPart(ctx, t, e)
+
+		it, err := e.Fetch(ctx, req)
+		require.NoError(t, err)
+
+		got, err := fetch.Drain(ctx, it)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		require.Len(t, got[0].Timestamps, 5)
+
+		steps, err := e.AggregateStep(ctx, req, 100)
+		require.NoError(t, err)
+		require.Len(t, steps, 1)
+
+		for _, buckets := range steps {
+			assert.Len(t, buckets, 5, "one bucket per sample")
+		}
+	})
+
 	// aggViaStats falls back to a whole-part decode for a part with no sidecar.
 	t.Run("SidecarlessRangeFold", func(t *testing.T) {
 		t.Parallel()
