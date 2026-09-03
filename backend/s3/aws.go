@@ -105,13 +105,13 @@ func (s *awsStore) PutObject(ctx context.Context, key string, data []byte) error
 }
 
 func (s *awsStore) PutObjectIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
-	// If-None-Match: * makes the PUT succeed only if no object exists at the key; a 412
-	// PreconditionFailed means another writer won the race.
+	// If-None-Match: * makes the PUT succeed only if no object exists at the key; a lost
+	// condition (412, or 409 against a concurrent writer) means another writer won the race.
 	_, err := s.api.PutObject(ctx, &awss3.PutObjectInput{
 		Bucket: &s.bucket, Key: &key, Body: bytes.NewReader(data), IfNoneMatch: aws.String("*"),
 	})
 	if err != nil {
-		if isPreconditionFailed(err) {
+		if isConditionLost(err) {
 			return false, nil
 		}
 
@@ -145,8 +145,8 @@ func (s *awsStore) GetObjectVersion(ctx context.Context, key string) ([]byte, st
 // PutObjectIfVersion is the conditional replace: If-Match on the ETag the committer read, or
 // If-None-Match: * when it expects no object at all. S3 evaluates the precondition atomically
 // with the write, so concurrent committers resolve to one winner; the losers get 412
-// PreconditionFailed, or 404 NoSuchKey when they matched an ETag on a key that has since been
-// deleted.
+// PreconditionFailed, 409 ConditionalRequestConflict when they raced a concurrent write to the
+// key, or 404 NoSuchKey when they matched an ETag on a key that has since been deleted.
 func (s *awsStore) PutObjectIfVersion(
 	ctx context.Context, key string, data []byte, etag string,
 ) (string, bool, error) {
@@ -159,7 +159,7 @@ func (s *awsStore) PutObjectIfVersion(
 
 	out, err := s.api.PutObject(ctx, in)
 	if err != nil {
-		if isPreconditionFailed(err) || isNotFound(err) {
+		if isConditionLost(err) || isNotFound(err) {
 			return "", false, nil
 		}
 
@@ -254,11 +254,22 @@ func isRangeNotSatisfiable(err error) bool {
 	return false
 }
 
-// isPreconditionFailed reports whether err is a 412 from a conditional (If-None-Match) PUT.
-func isPreconditionFailed(err error) bool {
+// isConditionLost reports whether err says a conditional PUT's precondition did not hold. S3 has
+// two answers for that: 412 PreconditionFailed when the condition was evaluated and failed, and
+// 409 ConditionalRequestConflict when a concurrent write to the same key raced this one. Both mean
+// this writer did not win and must re-read; only the 412 is reachable when nothing else is
+// writing, which is why the 409 is easy to miss until a second writer appears.
+//
+// 409 OperationAborted is deliberately not here: it reports a conflicting operation still in
+// progress rather than a lost precondition, so the remedy is to retry the same request, not to
+// tell the caller another writer owns the key.
+func isConditionLost(err error) bool {
 	var ae smithy.APIError
 	if errors.As(err, &ae) {
-		return ae.ErrorCode() == "PreconditionFailed"
+		switch ae.ErrorCode() {
+		case "PreconditionFailed", "ConditionalRequestConflict":
+			return true
+		}
 	}
 
 	return false

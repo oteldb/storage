@@ -62,8 +62,12 @@ a demonstration.
   contract logic (root prefixing, sorted listing, 404→`ErrNotExist`, conditional put, idempotent
   delete) is testable over a fake. `CompareAndSwap` is `If-Match` on the object's ETag (and
   `If-None-Match: *` for the create), evaluated by the store itself — a genuine CAS across
-  processes, not a read-then-write. S3 answers a failed precondition with 412 and an `If-Match`
-  against an absent key with 404; both are a lost race, not an error. A store that reports no ETag
+  processes, not a read-then-write. S3 answers a failed precondition with 412, a conditional put
+  that raced a concurrent write to the same key with 409 `ConditionalRequestConflict`, and an
+  `If-Match` against an absent key with 404; all three are a lost race, not an error. The 409 is
+  unreachable with a single writer, so it only appears once replicas contend over one key — the
+  case CAS exists for. 409 `OperationAborted` is not in that set: it means a conflicting operation
+  is still in progress, whose remedy is to retry the request rather than to cede the key. A store that reports no ETag
   on a successful conditional put is rejected outright, since an empty token is indistinguishable
   from `VersionAbsent` and would wedge the committer's next write forever. `NewAWS` adapts aws-sdk-go-v2 — **the only package importing
   the AWS SDK**. An always-on integration test runs the suite over a real S3 protocol server
