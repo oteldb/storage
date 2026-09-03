@@ -83,3 +83,8 @@ repetition factor): a filter that would be small anyway keeps the cheap occurren
 one is sized from a constant-space HyperLogLog estimate. FP targets differ per mode (`1e-6`
 equality, `1e-2` full-text/attrs). The sidecar is self-describing (`k`, `m` encoded), so parts
 written under any sizing stay readable.
+
+`Decode` bounds `k` to `[1, 64]` and `New` clamps to the same range, so the two agree for every
+rate the engine uses (`k = log2(1/p)`). Both ends of an unbounded `k` are silent: `0` — or a value
+that truncates to a negative `int` — is a filter that probes nothing and tests present for
+everything, and a large one is per-probe CPU spent on every condition of every part.

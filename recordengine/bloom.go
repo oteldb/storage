@@ -4,8 +4,10 @@ import (
 	"context"
 
 	"github.com/go-faster/errors"
+	"github.com/go-faster/sdk/zctx"
 
 	"github.com/zeebo/xxh3"
+	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
 
@@ -493,8 +495,11 @@ func (e *Engine) blooms() *bloomBuilder {
 	return e.bloomBuf
 }
 
-// loadBlooms reads the bloom sidecar of each bloom-bearing column. A missing sidecar is skipped
-// (that column simply is not prunable — the part is always scanned for it).
+// loadBlooms reads the bloom sidecar of each bloom-bearing column. A missing *or corrupt* sidecar
+// is skipped (that column simply is not prunable — the part is always scanned for it). The bloom
+// only ever removes parts a per-row re-check would have removed anyway, so dropping one widens the
+// scan and never the result; a corrupt one is logged, not fatal, since it must not take the whole
+// prefix offline.
 func loadBlooms(ctx context.Context, b backend.Backend, schema *Schema, prefix string) (map[string]*bloom.Filter, error) {
 	var out map[string]*bloom.Filter
 
@@ -515,7 +520,10 @@ func loadBlooms(ctx context.Context, b backend.Backend, schema *Schema, prefix s
 
 		f, _, err := bloom.Decode(data)
 		if err != nil {
-			return nil, errors.Wrapf(err, "decode bloom %q", col.Name)
+			zctx.From(ctx).Error("corrupt bloom sidecar, part is not prunable by this column",
+				zap.String("part", prefix), zap.String("column", col.Name), zap.Error(err))
+
+			continue
 		}
 
 		if out == nil {
