@@ -19,6 +19,12 @@ func OpenRoot(dir string, perm fs.FileMode) (FS, error) {
 		return nil, errors.Wrapf(err, "create dir %q", dir)
 	}
 
+	return Open(dir)
+}
+
+// Open opens an existing dir as a rooted [FS]. Unlike [OpenRoot] it creates nothing, so a caller
+// that opens one handle per operation does not pay a mkdir syscall on every one of them.
+func Open(dir string) (FS, error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, errors.Wrapf(err, "open root %q", dir)

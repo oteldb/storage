@@ -54,10 +54,33 @@ a demonstration.
 - **`backend.Memory()`** — ephemeral reference backend; copies on both read and write so stored
   objects never alias a caller's buffer. The default in tests.
 - **`backend/file`** — directory tree with a `..` traversal guard; atomic write via temp+fsync+
-  rename, `PutIfAbsent` via temp + `os.Link`. **The key prefix bounds the traversal, not just the
+  rename, `PutIfAbsent` via temp + link. **The key prefix bounds the traversal, not just the
   result**: `List` walks only the prefix's subtree, and `Delete` rmdirs the directories its object
   leaves empty (`New` sweeps pre-existing ones once). Otherwise a listing costs a full-tree walk
   whose size grows with parts *ever created* — maintenance lists per tenant/signal every tick.
+
+  **Durability against power loss, not only against a process crash.** Syncing the temp file
+  commits its *bytes*; the directory entry that names them is a separate promise, and a rename is
+  the classic case a journalling filesystem does not make for free. Every publish therefore ends by
+  syncing the destination directory — after the rename in `Write` and `ObjectWriter.Commit`, after
+  the link in `PutIfAbsent`, after the unlink and each rmdir in `Delete` — and, when the write had
+  to create a directory chain, by syncing that chain from the outermost in, since a child's entry
+  only means something once its parent's entry is on the disk. Without that last barrier the
+  bucket-index CAS (the commit point, and the only `CompareAndSwap` call site) can revert under a
+  power cut while the WAL checkpoint that follows it has already deleted the segments replay would
+  need: silent loss of acknowledged records. It costs one directory fsync per published object —
+  measured at +86% on a 4 KiB `Write` on btrfs/NVMe (1.41 → 2.63 ms/op), where the file fsync
+  already dominates. A per-flush barrier that syncs a part's directory once instead of once per
+  column would recover most of that; it needs an optional interface on `backend.Backend`, and
+  correctness comes first. Off unix the directory sync is a no-op: there is no directory handle to
+  fsync, and the atomic-replace primitive carries the ordering instead.
+
+  Filesystem access goes through `internal/vfs` (a rooted `FS`/`File` interface over `os.Root`)
+  rather than `os.Root` directly. The seam exists for the durability claim above: only a fake
+  filesystem can present the state a power cut leaves behind, and `internal/vfs/faultfs` does —
+  `Crash()` keeps only what a directory sync committed, `Kill()` (process death) keeps everything,
+  and a `Gate` on `SyncDir` puts the crash *between* a rename and its sync. The handle stays
+  per-operation, as it was with `os.Root`, for the Windows reason recorded in `file.go`.
 - **`backend/s3`** — store-specific calls sit behind a small `ObjectStore` interface so the
   contract logic (root prefixing, sorted listing, 404→`ErrNotExist`, conditional put, idempotent
   delete) is testable over a fake. `CompareAndSwap` is `If-Match` on the object's ETag (and
@@ -135,8 +158,8 @@ a demonstration.
 - **`backend.ObjectCreator`** — optional `CreateObject(ctx,key) → ObjectWriter`, an object built
   incrementally: `Write` appends, `Commit` publishes atomically (nothing is visible under the key
   before it), `Abort` discards and is a no-op after a commit. `file` implements it with the same
-  temp+fsync+rename it writes whole objects with, so the bytes reach the filesystem as they are
-  produced; `Memory` and `s3` do not, and `backend.CreateObject` buffers into a single `Write` for
+  temp+fsync+rename+dirsync it writes whole objects with, so the bytes reach the filesystem as they
+  are produced; `Memory` and `s3` do not, and `backend.CreateObject` buffers into a single `Write` for
   them, so callers stream unconditionally. Several writers may target one key — that is how a
   part's rival codecs race, only the winner committing. It exists for the one object class far
   larger than the writer wants resident: a merged part's column (`block/ARCH.md`, "Two writers").
