@@ -759,10 +759,8 @@ func (s *Storage) shardAggregate(
 	eq := equalityMatchers(r.Matchers)
 
 	return shardAggregateWith(ctx, s, shardKey,
-		func(eng *engine.Engine) ([]engine.NamedAgg, error) {
-			return eng.AggregateStepNamed(ctx, fetch.Request{
-				Tenant: shardKey, Start: r.Start, End: r.End, Matchers: r.Matchers,
-			}, step)
+		func() ([]engine.NamedAgg, error) {
+			return s.localAggregate(ctx, string(shardKey), r.Start, r.End, step, r.Matchers)
 		},
 		func(addr string) ([]engine.NamedAgg, error) {
 			return cluster.NewRemoteAggregator(addr, s.cluster.httpc, s.clusterOpts...).
@@ -777,10 +775,8 @@ func (s *Storage) shardAggregateWindow(
 	eq := equalityMatchers(r.Matchers)
 
 	return shardAggregateWith(ctx, s, shardKey,
-		func(eng *engine.Engine) ([]engine.NamedWindowAgg, error) {
-			return eng.AggregateWindowNamed(ctx, fetch.Request{
-				Tenant: shardKey, Start: r.Start, End: r.End, Matchers: r.Matchers,
-			}, spec)
+		func() ([]engine.NamedWindowAgg, error) {
+			return s.localAggregateWindow(ctx, string(shardKey), r.Start, r.End, spec, r.Matchers)
 		},
 		func(addr string) ([]engine.NamedWindowAgg, error) {
 			return cluster.NewRemoteAggregator(addr, s.cluster.httpc, s.clusterOpts...).
@@ -791,19 +787,21 @@ func (s *Storage) shardAggregateWindow(
 // shardAggregateWith serves one shard's aggregates: locally (full matcher pushdown) if this node
 // holds the shard, else from another owner with sequential failover (equality matchers pushed; the
 // coordinator re-checks the full set on the returned identities).
+//
+// local is the same function that serves a peer's aggregate RPC, so the completeness guard it
+// applies cannot be skipped by a node coordinating a query against its own shards; a local disclaim
+// fails over to the other owners exactly as a peer's does.
 func shardAggregateWith[T any](
 	ctx context.Context, s *Storage, shardKey signal.TenantID,
-	local func(*engine.Engine) ([]T, error),
+	local func() ([]T, error),
 	remote func(addr string) ([]T, error),
 ) ([]T, error) {
 	isLocal, remotes := s.shardPlacement(ctx, rpcOpRead, signal.Metric, shardKey)
 	if isLocal {
-		eng, ok := s.lookupEngine(shardKey)
-		if !ok {
-			return nil, nil
+		got, err := local()
+		if !disclaimedLocally(err) {
+			return got, err
 		}
-
-		return local(eng)
 	}
 
 	var (
@@ -1070,10 +1068,14 @@ func (s *Storage) localValues(ctx context.Context, r cluster.ValuesRequest) ([][
 	})
 }
 
-// localProfileSymbols serves a peer's profile symbol store from the local engine.
+// localProfileSymbols serves a peer's profile symbol store from the local engine. The store has no
+// time domain, so an open Profile read gap disclaims it outright: symbols are interned as samples
+// are ingested, and a node that lost its unflushed head lost the symbols that came with it.
 func (s *Storage) localProfileSymbols(ctx context.Context, tenant string) (map[string][]byte, error) {
-	eng, ok := s.lookupProfileEngine(s.normalizeTenant(signal.TenantID(tenant)))
-	if !ok {
+	tid := s.normalizeTenant(signal.TenantID(tenant))
+
+	eng, ok := s.lookupProfileEngine(tid)
+	if !ok || !s.canAnswer(ctx, rpcOpSide, signal.Profile, tid, 0, 0) {
 		return nil, cluster.ErrShardAbsent
 	}
 
