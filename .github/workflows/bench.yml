@@ -14,13 +14,30 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # Set to true while the self-hosted benchmark runner is down. The gate job below reads it
+  # and the measurement job is skipped, so PRs do not queue a run that never starts.
+  # Flip to false to restore the gate.
+  BENCH_BROKEN: true
   # The definitive golden set (golden_bench_test.go) and the run flags. -count gives benchstat
   # several samples per benchmark so it can judge significance; -benchtime bounds wall time.
   BENCH: '^BenchmarkGolden$'
   FLAGS: '-run=^$ -benchmem -benchtime=300ms -count=6 -timeout=30m'
 
 jobs:
+  # The flag has to be read on a hosted runner: a job is assigned its runner before any
+  # step-level `if` is evaluated, so guarding the steps would still queue against the
+  # runner that is down. Job-level `if` cannot read `env`, hence the output.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      broken: ${{ steps.flag.outputs.broken }}
+    steps:
+      - id: flag
+        run: echo "broken=$BENCH_BROKEN" >> "$GITHUB_OUTPUT"
+
   golden:
+    needs: gate
+    if: ${{ needs.gate.outputs.broken != 'true' }}
     runs-on: [Linux]
     # Serialize against every other benchmark job in the repo (including query-bench, which shares
     # this group): they share one self-hosted runner, and a concurrent run makes the numbers noise.
