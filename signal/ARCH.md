@@ -71,3 +71,10 @@ summaries). An exponential histogram is first converted to explicit `le` bounds 
 So all three reuse the engine, merge, downsample and fetch paths with **no histogram-specific
 storage code**. Conversion necessarily allocates (pdata holds Go strings), which is why it sits
 off the hot path — embedders owning their OTLP decoder build the internal batch directly.
+
+**A log record's event time falls back to its observed time.** `time_unix_nano` is optional in OTLP
+— a receiver tailing files or journald with no timestamp parser leaves it unset — and the record's
+timestamp is the part sort key, so without the fallback such a record sorts at the unix epoch, where
+no query window reaches it and retention drops the part as ancient. A record with neither time is
+refused and counted in `dropped`, so the embedder reports it as an OTLP partial success rather than
+storing something nothing can retrieve.
