@@ -58,5 +58,24 @@ concurrent ingest.
 ## Durability policy
 
 `Options.WALDir` attaches one writer per (tenant, signal) engine. `Options.WALSync` picks the fsync
-policy: `None` (default — page cache, process-crash safe), `Always` (per record, power-loss safe),
-`Interval` (background timer).
+policy: `None` (default — page cache), `Always` (per record), `Interval` (background timer).
+
+Segments go through `internal/vfs`, the rooted filesystem seam, so the crash model is testable
+rather than argued: `faultfs` keeps only what was synced *through a synced directory*, and
+distinguishes `Crash()` (power loss) from `Kill()` (process death).
+
+What each policy guarantees, precisely:
+
+| policy | process death (`Kill`) | power loss (`Crash`) |
+|---|---|---|
+| `None` | every acknowledged record | nothing not already synced by a rotation |
+| `Always` | every acknowledged record | every acknowledged record |
+
+`Always` earns the second column only because **the directory is synced too**. An fsync commits a
+segment's bytes and says nothing about the entry naming them, so a directory sync is required once
+per segment (in `openNext`, before any record lands in it) and once per `CheckpointThrough` (so a
+power cut cannot resurrect segments a flush already superseded and have replay re-apply them). Not
+per record: the name a record needs is already durable by the time it is written.
+
+The claim stops at the filesystem. A drive that lies about its write cache is outside what any
+placement of fsync can cover.
