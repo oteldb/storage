@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/go-faster/errors"
+
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
@@ -134,6 +136,28 @@ func (idx partIndex) forEachID(ctx context.Context, fn func(signal.SeriesID)) er
 
 	for _, id := range idx.ids {
 		fn(id)
+	}
+
+	return nil
+}
+
+// forEachRange calls fn for every series in the part with its row range, ascending by id.
+func (idx partIndex) forEachRange(ctx context.Context, fn func(signal.SeriesID, rowRange)) error {
+	if p := idx.paged; p != nil {
+		ents, err := p.entries(ctx)
+		if err != nil {
+			return err
+		}
+
+		for k := range p.n {
+			fn(sidxEntryID(ents, k), p.rangeAt(ents, k))
+		}
+
+		return nil
+	}
+
+	for i, id := range idx.ids {
+		fn(id, rowRange{start: int(idx.starts[i]), end: int(idx.starts[i+1])})
 	}
 
 	return nil
@@ -276,6 +300,12 @@ type part struct {
 	// part is not deleted from the backend until its refs reach zero, so a lock-free read never races a
 	// delete.
 	refs atomic.Int32
+
+	// seriesMaxMu guards seriesMax, the per-series newest timestamps of [part.forEachSeriesMaxTime].
+	// A mutex rather than a sync.Once so a failed decode (a transient backend error) is retried
+	// instead of being cached as "this part has no times".
+	seriesMaxMu sync.Mutex
+	seriesMax   []int64
 }
 
 func (p *part) acquire() { p.refs.Add(1) }
@@ -437,6 +467,63 @@ type decodeFunc func(context.Context, *part) (*decodedPart, error)
 // are about to be retired and so must not populate the decode cache.
 func decodePart(ctx context.Context, p *part) (*decodedPart, error) {
 	return p.decode(ctx, colNeed{values: true})
+}
+
+// seriesMaxTimes returns, in the index's ascending id order, the newest timestamp each series has in
+// this part: the per-series durability watermark the replica refresh trims against. Decoded from the
+// timestamp column once per part (parts are immutable) and kept as one int64 per series, since the
+// alternative — re-decoding on every refresh — repeats a whole-column read per part per tick.
+func (p *part) seriesMaxTimes(ctx context.Context) ([]int64, error) {
+	p.seriesMaxMu.Lock()
+	defer p.seriesMaxMu.Unlock()
+
+	if p.seriesMax != nil {
+		return p.seriesMax, nil
+	}
+
+	dec, err := p.decode(ctx, colNeed{})
+	if err != nil {
+		return nil, errors.Wrapf(err, "decode timestamps of part %q", p.prefix)
+	}
+
+	out := make([]int64, 0, p.index.seriesCount())
+
+	// Scanning each run rather than reading its last row: rows are (series, ts)-ordered as written,
+	// but the watermark decides what a replica may delete, so it does not rest on an ordering the
+	// part itself does not enforce.
+	err = p.index.forEachRange(ctx, func(_ signal.SeriesID, r rowRange) {
+		newest := minInt64
+		for _, t := range dec.ts[min(r.start, len(dec.ts)):min(r.end, len(dec.ts))] {
+			newest = max(newest, t)
+		}
+
+		out = append(out, newest)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	p.seriesMax = out
+
+	return out, nil
+}
+
+// forEachSeriesMaxTime calls fn for every series in the part with its newest timestamp there.
+func (p *part) forEachSeriesMaxTime(ctx context.Context, fn func(signal.SeriesID, int64)) error {
+	maxTS, err := p.seriesMaxTimes(ctx)
+	if err != nil {
+		return err
+	}
+
+	k := 0
+
+	return p.index.forEachRange(ctx, func(id signal.SeriesID, _ rowRange) {
+		if k < len(maxTS) {
+			fn(id, maxTS[k])
+		}
+
+		k++
+	})
 }
 
 // decode reads and decodes the part's timestamp column (and, when need.values, the value/sf columns)

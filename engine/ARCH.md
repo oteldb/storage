@@ -612,11 +612,22 @@ accumulated durations on one span plus a planning child span, not sub-spans (`AD
 |---|---|
 | `ApplyPrimary(walBytes)` | the shard's single authoritative accept/reject decision, logged to the WAL |
 | `ApplyReplicated` | applies a payload verbatim, like WAL replay |
-| `RefreshReplica` | reloads parts from the store and trims the head, series-scoped |
+| `RefreshReplica` | reloads parts from the store and trims the head against each series' own flushed watermark |
 
 `ApplyPrimary` OOO-checks and admission-checks each sample, returning the accepted set re-framed plus a
-per-reason reject breakdown. `RefreshReplica` trims only series actually present in the flushed parts;
-a global trim would leave the primary the sole holder of quorum-acked backfill.
+per-reason reject breakdown.
+
+**The replica trim watermark is per series, never one figure across the head.** A series absent from
+every part keeps its whole head, and a series present keeps every sample past *its own* newest flushed
+timestamp — the part set's newest time belongs to whichever series flushed last and says nothing about
+the durability of any other. Trimming against it deletes late samples that are legal under their own
+out-of-order bound and durable nowhere yet: invisible on replica reads until the owner's next flush,
+and lost outright if the replica is promoted first.
+
+Those watermarks come from the parts, since nothing per series is recorded in the bucket index: a part
+decodes its timestamp column once (parts are immutable) and keeps one `int64` per series, ~8 bytes per
+series per part on top of the 20 the resident index already costs. Re-deriving them per refresh would
+instead repeat a whole-column read per part on every maintenance tick.
 
 **The primary logs the accepted set** — the frames it already built to replicate, written to the WAL
 verbatim (`wal.WriteFrames`). That is what makes the quorum's "one durable copy at the primary" true:

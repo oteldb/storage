@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/go-faster/errors"
+
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
@@ -62,6 +64,12 @@ type part struct {
 	// the backend objects between. A retired part (removed from the live set by flush/merge) is not
 	// deleted from the backend until its refs reach zero, so a lock-free reader never races a delete.
 	refs atomic.Int32
+
+	// streamMaxMu guards streamMax, the per-stream newest timestamps of [part.streamMaxTimes]. A
+	// mutex rather than a sync.Once so a failed decode (a transient backend error) is retried
+	// instead of being cached as "this part has no times".
+	streamMaxMu sync.Mutex
+	streamMax   []int64
 }
 
 func (p *part) acquire() { p.refs.Add(1) }
@@ -116,6 +124,43 @@ func openPart(ctx context.Context, b backend.Backend, schema *Schema, prefix str
 		schema: schema, reader: r, prefix: prefix, ranges: ranges,
 		blooms: blooms, recordKeys: recordKeys, rawBytes: r.Manifest().RawBytes,
 	}, nil
+}
+
+// streamMaxTimes returns, aligned with p.ranges, the newest timestamp each stream has in this part:
+// the per-stream durability watermark the replica refresh trims against. Decoded from the timestamp
+// column once per part (parts are immutable) and kept as one int64 per stream, since the alternative
+// — re-decoding on every refresh — repeats a whole-column read per part per tick.
+func (p *part) streamMaxTimes(ctx context.Context) ([]int64, error) {
+	p.streamMaxMu.Lock()
+	defer p.streamMaxMu.Unlock()
+
+	if p.streamMax != nil {
+		return p.streamMax, nil
+	}
+
+	ts, err := p.readInt64(ctx, colTs, nil, nil)
+	if err != nil {
+		return nil, errors.Wrapf(err, "read timestamps of part %q", p.prefix)
+	}
+
+	out := make([]int64, len(p.ranges))
+
+	for i, sr := range p.ranges {
+		newest := minInt64
+
+		// Scanning the run rather than reading its last row: rows are (stream, ts)-ordered as
+		// written, but the watermark decides what a replica may delete, so it does not rest on
+		// an ordering the part itself does not enforce.
+		for _, t := range ts[min(sr.start, len(ts)):min(sr.end, len(ts))] {
+			newest = max(newest, t)
+		}
+
+		out[i] = newest
+	}
+
+	p.streamMax = out
+
+	return out, nil
 }
 
 // buildRanges turns a part's stream column into the sorted stream → row-span index. A part written

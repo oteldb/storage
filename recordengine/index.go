@@ -319,8 +319,8 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 }
 
 // RefreshReplica brings a replica node's view up to date with the shared object store: it
-// reconstructs the flushed parts and trims its head to the still-unflushed window. With no shared
-// store, a safe no-op.
+// reconstructs the flushed parts and trims its head to the still-unflushed window, stream by stream
+// (see [head.trimBelowCovered]). With no shared store, a safe no-op.
 func (e *Engine) RefreshReplica(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -333,22 +333,26 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 		return nil
 	}
 
-	maxT := minInt64
-	covered := make(map[signal.SeriesID]struct{})
+	covered := make(map[signal.SeriesID]int64)
 
+	// Each stream is trimmed against its own newest flushed timestamp, not the newest in the part
+	// set: a stream absent from every part keeps its whole head (the primary would otherwise be the
+	// sole holder of quorum-acked records), and one present keeps everything past what is durable
+	// *for it*.
 	for _, p := range e.parts {
-		if p.maxTime > maxT {
-			maxT = p.maxTime
+		maxTS, err := p.streamMaxTimes(ctx)
+		if err != nil {
+			return err
 		}
 
-		// Trim only streams the parts hold (in-memory ranges — no I/O); an unflushed stream's
-		// head must survive the refresh, or the primary becomes its sole holder.
-		for _, sr := range p.ranges {
-			covered[sr.id] = struct{}{}
+		for i, sr := range p.ranges {
+			if t, ok := covered[sr.id]; !ok || maxTS[i] > t {
+				covered[sr.id] = maxTS[i]
+			}
 		}
 	}
 
-	e.head.trimBelowCovered(maxT, covered)
+	e.head.trimBelowCovered(covered)
 
 	return nil
 }
