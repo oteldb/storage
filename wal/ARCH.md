@@ -15,8 +15,28 @@ Record types (additive — an old reader **skips** an unknown type):
 | records | opaque record-engine payload (logs/traces/profiles) |
 | side | opaque content-addressed side-store delta (the profile symbol store) |
 
-Replay tolerates a **torn final record** (crash recovery), surfaces a bad-CRC *complete* record as
-corruption, and stitches segments in order.
+Replay surfaces a bad-CRC *complete* record as corruption and stitches segments in order.
+
+## Where a torn record is tolerated, and where it is not
+
+Exactly one place may end mid-record: the **last segment of a WAL directory**, which is the one a
+crash was appending to. `ReplayDirFrom` tolerates it there and nowhere else — a short stop in an
+earlier segment means the rest of that segment, and the hole it leaves in history, would be skipped
+while the segments after it papered over the gap. That is silent loss bounded only by the segment
+size, so it is an `ErrCorrupt` naming the segment and the offset.
+
+`Replay` itself is therefore **strict**: it is handed a complete log — a whole segment, or a
+replication payload from `ApplyPrimary` — so a record that does not fit inside the buffer is
+truncation, not an end of stream. A truncated replication payload used to decode as a short batch
+and let a replica diverge from its primary in silence; it is now an error. The records applied
+before the stopping point are kept either way.
+
+Making the tolerance last-segment-only is only safe because `Create` **repairs on resume**: it
+truncates the highest-numbered segment to its last complete frame before opening the next one
+(Prometheus `wal.Repair` semantics). Without that, one ordinary crash leaves a torn tail that the
+next run turns into a permanent *middle* segment, and every later replay fails. The discarded bytes
+are an incomplete frame, unreadable by construction. A *complete* frame that fails its CRC is left
+alone — that is corruption rather than a torn append, and replay is the one place that reports it.
 
 ## Epochs — exactly-once recovery (record signals)
 
@@ -42,8 +62,8 @@ that logged it, because nothing relates the two counters. That direction is dupl
 the metric merge dedups, and a replica's `RefreshReplica` trims the head below what its parts
 cover.
 
-Lifecycle: `Create` **resumes** an existing directory (opens lazily beyond the prior run's
-segments, never truncating them), `SetEpoch` stamps new segments, `Seal` closes the current segment
+Lifecycle: `Create` **resumes** an existing directory (repairs the highest-numbered segment's torn
+tail, then opens lazily beyond the prior run's segments), `SetEpoch` stamps new segments, `Seal` closes the current segment
 and stamps the next generation, and `CheckpointThrough` deletes the segments a flush made durable
 (truncate-on-flush), so replay stays bounded.
 
