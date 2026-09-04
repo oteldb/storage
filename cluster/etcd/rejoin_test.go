@@ -46,34 +46,45 @@ type etcdServer struct {
 	e      *embed.Etcd
 }
 
+// startEtcdServer boots the server on ports chosen here, re-picking if one is
+// lost to another process before etcd binds it.
+//
+// The re-pick belongs to this first boot only. Every restart afterwards must
+// come back on the same address — a client that keeps running across the
+// rollout is the whole point of this fixture — so `start` cannot choose new
+// ports, and does not try to.
 func startEtcdServer(t *testing.T) *etcdServer {
 	t.Helper()
 
+	// The directory comes back from the boot rather than being made here: a
+	// restart has to reopen the state the first boot wrote, and a second
+	// t.TempDir() would silently hand it an empty one.
+	e, client, peer, dir := startEtcdOnFreshPorts(t)
 	s := &etcdServer{
 		t:      t,
-		client: url.URL{Scheme: httpScheme, Host: freeAddr(t)},
-		peer:   url.URL{Scheme: httpScheme, Host: freeAddr(t)},
-		dir:    t.TempDir(),
+		client: client,
+		peer:   peer,
+		dir:    dir,
+		e:      e,
 	}
-	s.start()
+	awaitReady(t, e)
 	t.Cleanup(s.stop)
 
 	return s
 }
 
+// start brings the server back up on the address it already had.
 func (s *etcdServer) start() {
 	s.t.Helper()
 
-	cfg := embed.NewConfig()
-	cfg.Dir = s.dir
-	cfg.LogLevel = "error"
-	cfg.ListenClientUrls = []url.URL{s.client}
-	cfg.AdvertiseClientUrls = []url.URL{s.client}
-	cfg.ListenPeerUrls = []url.URL{s.peer}
-	cfg.AdvertisePeerUrls = []url.URL{s.peer}
-	cfg.InitialCluster = cfg.Name + "=" + s.peer.String()
-
-	e, err := embed.StartEtcd(cfg)
+	e, err := bootEtcd(s.dir, s.client, s.peer)
+	// Not retried and not re-addressed: the address is this fixture's contract
+	// with a client that is still holding it. A loss here is worth seeing named
+	// rather than absorbed, because it means something outside the test took an
+	// address we were using rather than one we had merely reserved.
+	if isAddrInUse(err) {
+		s.t.Fatalf("etcd could not restart on %s: %v", s.client.Host, err)
+	}
 	require.NoError(s.t, err)
 
 	select {
@@ -270,7 +281,25 @@ func TestMembershipRejoinsAfterExternalKeyDelete(t *testing.T) {
 
 	requireConverged(t, client, nodes, "node-a", "node-b")
 	assert.NotEqual(t, held, b.LeaseID(), "the stale lease is not reused")
-	assert.Zero(t, a.Rejoins(), "the undisturbed node did not re-register")
+
+	// There is deliberately no `assert.Zero(t, a.Rejoins())` here (issue #509).
+	//
+	// It asserted a negative about a background watcher that the design permits
+	// to fire. `follow` ends on either of two things, and only one of them is
+	// node-b's deletion: the other is the keep-alive channel closing, which a
+	// loaded runner can produce on any node at any time. `maintain` documents
+	// the response as ordinary — "Losing it is therefore an ordinary event,
+	// answered with a new lease and a new key rather than with an exit" — so a
+	// rejoin by node-a is correct behaviour, not evidence of a defect, and the
+	// assertion read it as one. It failed on windows CI for exactly that reason.
+	//
+	// What actually matters is asserted above and below: deleting node-b's key
+	// must not evict node-a from the member set, and must not leave it holding a
+	// registration the cluster cannot see. Whether node-a got there on its
+	// original lease or a replacement one is not this test's business.
+	assert.False(t, a.SelfAbsent(), "node-a still holds a registration the cluster can see")
+	assert.Contains(t, memberKeys(client), testPrefix+"node-a",
+		"deleting one node's key does not evict another")
 }
 
 // TestMembershipRejoinIsIdempotent hits the same node repeatedly. Each loss must produce
