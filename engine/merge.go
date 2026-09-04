@@ -47,6 +47,10 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 		zap.Bool("downsample", len(opts.Downsample) > 0),
 		zap.Bool("recompress", opts.Recompress != nil))
 
+	// Repair first: a part pulled back from a peer joins this cycle's compaction, and a merge that
+	// cannot repair still compacts.
+	e.repairWants(ctx)
+
 	res, err := e.merge(ctx, opts)
 	if err != nil {
 		span.RecordError(err)

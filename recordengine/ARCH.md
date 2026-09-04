@@ -215,6 +215,10 @@ their replacement is committed. See [`../engine/ARCH.md`](../engine/ARCH.md), "P
 serves stay the same set; the adopted parts are readable but not owned. See
 [`../engine/ARCH.md`](../engine/ARCH.md), "Adopted parts".
 
+**Repair** is identical to the metric engine, down to `Config.Repair` and the satisfaction rule
+(the exact part, or the largest containing part at a higher level). See
+[`../engine/ARCH.md`](../engine/ARCH.md), "Repair — a want is discharged by committing a part".
+
 ## Part identity & orphans
 
 Part prefixes are `<prefix>/{partid}`, a minted globally unique id, and `LoadParts` sweeps orphans at

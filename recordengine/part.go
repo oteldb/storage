@@ -9,6 +9,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/index/bloom"
@@ -54,6 +55,12 @@ type part struct {
 	// minTime, maxTime are the inclusive unix-ns record bounds of the part (from the columns when
 	// written, from the bucket index when reconstructed), for time pruning.
 	minTime, maxTime int64
+
+	// blocks and level are the part's identity in block-number space, carried through the bucket
+	// index. They are unset for a part written before that identity existed, which makes it neither
+	// contain nor be contained by anything — see [bucketindex.Interval].
+	blocks bucketindex.Interval
+	level  uint32
 
 	// rawBytes is the part's decoded footprint per its manifest, 0 for a part written before the
 	// manifest carried one. See [part.sizeBytes].

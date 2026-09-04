@@ -49,9 +49,15 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 	}
 
 	for range indexCommitAttempts {
-		version, err := e.nextIndexLocked(ctx).Save(ctx, e.cfg.Backend, e.indexKey(), e.indexVersion)
+		ix := e.nextIndexLocked(ctx)
+
+		version, err := ix.Save(ctx, e.cfg.Backend, e.indexKey(), e.indexVersion)
 		if err == nil {
 			e.indexVersion = version
+			// Only a commit that landed discharges a want: the obligation is dropped from the
+			// engine's own list here, never while building an index that may not be written.
+			e.wants = ix.Wanted
+			e.pendingWants = nil
 
 			return nil
 		}
@@ -87,6 +93,17 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 	// The rival's slots, not this engine's watermark: e.flushedEpoch counts this node's own
 	// flushes and nothing another writer committed can say anything about it.
 	e.epochs, e.anonEpoch = ix.Epochs, ix.FlushedEpoch
+
+	// The rival's wants are obligations over the same prefix, and this engine's commit is about to
+	// rewrite the object holding them. They are unioned with this engine's rather than replacing
+	// them: the losing commit never landed, so whatever it was going to record is still owed. A
+	// want either side has already met is dropped again by the trim in [Engine.nextIndexLocked].
+	merged := bucketindex.Index{Wanted: e.wants}
+	for _, w := range ix.Wanted {
+		merged.RecordWant(w)
+	}
+
+	e.wants = merged.Wanted
 
 	e.foreign = foreignEntries(ix.Entries, e.indexed, e.removals, e.wants)
 	e.openForeignLocked(ctx)
@@ -186,7 +203,10 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 
 	live := make(map[string]struct{}, len(e.parts))
 	for _, p := range e.parts {
-		ix.Add(bucketindex.Entry{Prefix: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime})
+		ix.Add(bucketindex.Entry{
+			Prefix: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
+			Blocks: p.blocks, Level: p.level,
+		})
 		live[p.prefix] = struct{}{}
 	}
 
@@ -204,8 +224,8 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 	e.indexed = live
 
 	// The same commit that drops an unreadable part from Entries states the obligation to get it
-	// back: a part leaves Entries only into Removed or into Wanted, and one CAS commit carries
-	// both halves, so no crash can land the drop without the want.
+	// back: a part leaves Entries only into Removed or into Wanted, and one CAS commit carries both
+	// halves, so no crash can land the drop without the want.
 	ix.Wanted = slices.Clone(e.wants)
 
 	for _, w := range e.pendingWants {
@@ -213,16 +233,19 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 		ix.RecordWant(w)
 	}
 
-	e.pendingWants = nil
-
+	// Committing a part is what discharges a want, so the trim runs against the entries this
+	// commit publishes: a want naming a part the index holds again, or one a live part contains,
+	// is repaired by the act of writing this index.
 	kept, dropped := bucketindex.TrimWants(ix.Wanted, ix.Entries, bucketindex.MaxWants)
 	if len(dropped) > 0 {
+		// Past the bound a node can no longer repair part by part and needs a wholesale reseed,
+		// which does not exist yet; losing the obligation quietly is what must not happen.
 		zctx.From(ctx).Warn("outstanding repairs exceed the index bound",
 			zap.String("prefix", e.cfg.Prefix), zap.Int("dropped", len(dropped)),
 			zap.Int("kept", len(kept)))
 	}
 
-	ix.Wanted, e.wants = kept, kept
+	ix.Wanted = kept
 
 	return ix
 }

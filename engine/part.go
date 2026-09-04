@@ -9,6 +9,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
@@ -294,6 +295,12 @@ type part struct {
 	// bucket index for time pruning. Set from the flush/merge columns when written and from
 	// the index entry when reconstructed (see engine/index.go).
 	minTime, maxTime int64
+
+	// blocks and level are the part's identity in block-number space, carried through the bucket
+	// index. They are unset for a part written before that identity existed, which makes it neither
+	// contain nor be contained by anything — see [bucketindex.Interval].
+	blocks bucketindex.Interval
+	level  uint32
 
 	// refs counts in-flight fetches reading this part lock-free. A fetch acquires (under the engine
 	// lock, while the part is still live) the parts it will read and releases them when done; a retired
