@@ -186,6 +186,11 @@ degrades into a silently partial result.
   part swept at the next open — never rows that are committed but unresolvable. The commit is a
   `backend.CompareAndSwap` against the version the writer read, so two writers over one prefix (a
   shared store) cannot overwrite each other's entries; the loser reloads and retries.
+- **A part leaves the index's `Entries` only into `Removed` or into `Wanted`** — a tombstone (a
+  deliberate deletion) or a repair obligation, never silently. An owner that cannot open a part
+  drops it and records the want in the *same* commit, so the two halves cannot come apart; and only
+  a definitive `backend.ErrNotExist` qualifies, because a backend that merely failed to answer says
+  nothing about whether the data is there (`backend/ARCH.md`, `engine/ARCH.md`).
 - **A part id is globally unique** (both engines). A part's backend key is `{enginePrefix}/{partid}`,
   where `partid` is a minted ULID-shaped id (`internal/partid`), not a per-node counter: replicas of a
   shard can share one object store under one prefix, so only an id no local state participates in

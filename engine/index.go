@@ -49,7 +49,7 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 	}
 
 	for range indexCommitAttempts {
-		version, err := e.nextIndexLocked().Save(ctx, e.cfg.Backend, e.indexKey(), e.indexVersion)
+		version, err := e.nextIndexLocked(ctx).Save(ctx, e.cfg.Backend, e.indexKey(), e.indexVersion)
 		if err == nil {
 			e.indexVersion = version
 
@@ -88,7 +88,7 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 	// flushes and nothing another writer committed can say anything about it.
 	e.epochs, e.anonEpoch = ix.Epochs, ix.FlushedEpoch
 
-	e.foreign = foreignEntries(ix.Entries, e.indexed, e.removals)
+	e.foreign = foreignEntries(ix.Entries, e.indexed, e.removals, e.wants)
 	e.openForeignLocked(ctx)
 
 	return nil
@@ -161,7 +161,7 @@ func (e *Engine) readablePartsLocked() []*part {
 
 // nextIndexLocked builds the index state this engine wants committed and advances the
 // bookkeeping the next one is diffed against. Caller holds e.mu.
-func (e *Engine) nextIndexLocked() *bucketindex.Index {
+func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 	// The generation advances on every write, including one that only removes parts — which is
 	// the whole point of it, since that is exactly the rewrite the part names cannot express.
 	e.generation = e.generation.Next(e.term())
@@ -203,6 +203,27 @@ func (e *Engine) nextIndexLocked() *bucketindex.Index {
 	ix.Removed = e.removals
 	e.indexed = live
 
+	// The same commit that drops an unreadable part from Entries states the obligation to get it
+	// back: a part leaves Entries only into Removed or into Wanted, and one CAS commit carries
+	// both halves, so no crash can land the drop without the want.
+	ix.Wanted = slices.Clone(e.wants)
+
+	for _, w := range e.pendingWants {
+		w.Generation = e.generation
+		ix.RecordWant(w)
+	}
+
+	e.pendingWants = nil
+
+	kept, dropped := bucketindex.TrimWants(ix.Wanted, ix.Entries, bucketindex.MaxWants)
+	if len(dropped) > 0 {
+		zctx.From(ctx).Warn("outstanding repairs exceed the index bound",
+			zap.String("prefix", e.cfg.Prefix), zap.Int("dropped", len(dropped)),
+			zap.Int("kept", len(kept)))
+	}
+
+	ix.Wanted, e.wants = kept, kept
+
 	return ix
 }
 
@@ -211,7 +232,8 @@ func (e *Engine) nextIndexLocked() *bucketindex.Index {
 // still live, so this engine's job is to carry them across its own commits — an entry dropped
 // here leaves durable part objects unreferenced, and the next open-time orphan sweep deletes them.
 func foreignEntries(
-	entries []bucketindex.Entry, indexed map[string]struct{}, removals []bucketindex.Removal,
+	entries []bucketindex.Entry, indexed map[string]struct{},
+	removals []bucketindex.Removal, wants []bucketindex.Want,
 ) []bucketindex.Entry {
 	var out []bucketindex.Entry
 
@@ -221,6 +243,13 @@ func foreignEntries(
 		}
 
 		if slices.ContainsFunc(removals, func(r bucketindex.Removal) bool { return r.Prefix == e.Prefix }) {
+			continue
+		}
+
+		// A part this engine already found unreadable is not adopted back: carrying its entry
+		// forward would put it in Entries again and discharge the want that names it, leaving the
+		// index pointing at bytes no one has.
+		if slices.ContainsFunc(wants, func(w bucketindex.Want) bool { return w.Prefix == e.Prefix }) {
 			continue
 		}
 
@@ -269,10 +298,21 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 
 	parts := make([]*part, 0, len(ix.Entries))
 
+	var lost []bucketindex.Want
+
 	for _, ent := range ix.Entries {
 		p, err := openPart(ctx, e.cfg.Backend, ent.Prefix)
 		if err != nil {
-			return errors.Wrapf(err, "open part %q", ent.Prefix)
+			if !sweep || !partGone(err) {
+				return errors.Wrapf(err, "open part %q", ent.Prefix)
+			}
+
+			zctx.From(ctx).Error("part named by the index is gone; recording a repair",
+				zap.String("prefix", ent.Prefix), zap.Error(err))
+
+			lost = append(lost, bucketindex.Want{Prefix: ent.Prefix, Blocks: ent.Blocks})
+
+			continue
 		}
 
 		p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
@@ -294,10 +334,13 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 	e.epochs, e.anonEpoch = ix.Epochs, ix.FlushedEpoch
 	e.generation = ix.Generation
 	e.removals = ix.Removed
-	e.indexed = make(map[string]struct{}, len(ix.Entries))
+	e.wants, e.pendingWants = ix.Wanted, lost
+	e.indexed = make(map[string]struct{}, len(parts))
 
-	for _, entry := range ix.Entries {
-		e.indexed[entry.Prefix] = struct{}{}
+	// Only the parts that opened: a lost one left out of e.indexed is what keeps the commit below
+	// from also calling it a removal, which would restate a loss as a deliberate deletion.
+	for _, p := range parts {
+		e.indexed[p.prefix] = struct{}{}
 	}
 
 	// New head records belong to the generation past the recovered watermark; replay (which the
@@ -309,6 +352,14 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 	if sweep {
 		if err := e.sweepOrphansLocked(ctx); err != nil {
 			return err
+		}
+	}
+
+	// One commit drops the gone parts from Entries and states the wants that replace them. It runs
+	// before the rest of the load so the obligation is durable even if identity recovery fails.
+	if len(lost) > 0 {
+		if err := e.updateIndexLocked(ctx); err != nil {
+			return errors.Wrap(err, "record repair wants")
 		}
 	}
 

@@ -168,6 +168,12 @@ type Engine struct {
 	// replica tell a compaction from a loss.
 	indexed  map[string]struct{}
 	removals []bucketindex.Removal
+	// wants are the repair obligations the last bucket index this engine wrote carried, and
+	// pendingWants the ones a load discovered and the next commit must add — see [bucketindex.Want].
+	// Keeping the discovery pending rather than committing it on the spot is what makes dropping
+	// the entry and recording the want one CAS commit instead of two.
+	wants        []bucketindex.Want
+	pendingWants []bucketindex.Want
 	// indexVersion is the backend version of the bucket index this engine last read or committed —
 	// the token its next commit conditions on, so a rewrite that another writer got in front of is
 	// refused rather than silently overwriting it (#392).
