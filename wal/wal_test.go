@@ -3,6 +3,7 @@ package wal
 import (
 	"bytes"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -160,7 +161,9 @@ func TestParseSamplesSFErrors(t *testing.T) {
 	require.Error(t, Replay(appendFrame(nil, recordSamplesSF, truncated), noop))
 }
 
-func TestTornTailRecoversPrefix(t *testing.T) {
+// TestTornTailIsTruncation: a buffer ending mid-frame is truncation, not a clean end — Replay
+// reports it, and the records before the tear are still applied.
+func TestTornTailIsTruncation(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
@@ -171,7 +174,15 @@ func TestTornTailRecoversPrefix(t *testing.T) {
 	require.NoError(t, w.WriteSeries(s2.Hash(), s2))
 
 	torn := buf.Bytes()[:full+2] // cut the second record mid-frame
-	got := collect(t, torn)
+
+	var got []captured
+
+	err := Replay(torn, Handlers{OnSeries: func(id signal.SeriesID, s signal.Series) error {
+		got = append(got, captured{id, s.Clone()})
+
+		return nil
+	}})
+	require.ErrorIs(t, err, ErrCorrupt)
 	require.Len(t, got, 1)
 	assert.Equal(t, s1.Hash(), got[0].id)
 }
@@ -272,6 +283,11 @@ func FuzzReplay(f *testing.F) {
 	_ = w.WriteSamplesSF(s.Hash(), []int64{3, 4}, []float64{3, 4}, []float64{2, 2})
 	f.Add(buf.Bytes())
 	f.Add([]byte{})
+	f.Add(buf.Bytes()[:len(buf.Bytes())-3]) // a torn final frame
+
+	inflated := slices.Clone(buf.Bytes())
+	inflated[0] |= 0x80 // a length varint claiming a body past the end of the log
+	f.Add(inflated)
 
 	f.Fuzz(func(_ *testing.T, data []byte) {
 		// Must never panic; corrupt input returns an error or stops cleanly. Exercise every

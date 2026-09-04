@@ -22,8 +22,9 @@ func OpenRoot(dir string, perm fs.FileMode) (FS, error) {
 	return Open(dir)
 }
 
-// Open opens an existing dir as a rooted [FS]. Unlike [OpenRoot] it creates nothing, so a caller
-// that opens one handle per operation does not pay a mkdir syscall on every one of them.
+// Open opens an existing dir as a rooted [FS], failing when it is missing — the read side, where
+// creating the directory would turn "no log here" into "an empty log". Unlike [OpenRoot] it creates
+// nothing, so a caller opening one handle per operation pays no mkdir syscall.
 func Open(dir string) (FS, error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {

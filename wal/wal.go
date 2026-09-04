@@ -127,29 +127,71 @@ func appendSamplesSF(dst []byte, ts []int64, values, sf []float64) []byte {
 	return dst
 }
 
-// Replay reads every complete record from data and dispatches it to h. It stops cleanly
-// at end-of-log or a torn final record (returning nil), and returns an
-// [ErrCorrupt]-wrapping error on a complete record whose CRC fails. Records already
-// applied before the stopping point are kept.
+// Replay reads every record from data and dispatches it to h. data must be a *complete* log — a
+// replication payload, or a segment read whole — so a record that does not fit inside it is
+// truncation, and Replay returns an [ErrCorrupt]-wrapping error rather than a short read. A complete
+// record whose CRC fails is the same error. Records already applied before the stopping point are
+// kept.
+//
+// Only the last segment of a WAL directory may legitimately end mid-record (a crash was appending to
+// it); [ReplayDirFrom] is the one caller that tolerates it, and only there.
 func Replay(data []byte, h Handlers) error {
-	for off := 0; off < len(data); {
+	n, err := replay(data, h)
+	if err != nil {
+		return err
+	}
+
+	if n < len(data) {
+		return errors.Wrapf(ErrCorrupt, "truncated record at offset %d of %d", n, len(data))
+	}
+
+	return nil
+}
+
+// replay dispatches records from data and returns the offset it stopped at: len(data) when the log
+// ended on a frame boundary, and the start of the incomplete frame when it did not. Telling those
+// apart is what lets the caller decide whether a torn record is expected.
+func replay(data []byte, h Handlers) (int, error) {
+	off := 0
+	for off < len(data) {
 		typ, payload, n, err := readFrame(data[off:])
 		if errors.Is(err, io.EOF) {
-			return nil // clean end or torn tail
+			return off, nil // torn frame: the log ends here
 		}
 
 		if err != nil {
-			return err
+			return off, err
 		}
 
 		off += n
 
 		if err := dispatch(typ, payload, h); err != nil {
-			return err
+			return off, err
 		}
 	}
 
-	return nil
+	return off, nil
+}
+
+// frameEnd returns the offset just past the last complete, CRC-valid frame in data — where a
+// truncation would leave only whole records. It walks the framing without decoding payloads, so a
+// record this reader does not understand still bounds the truncation correctly.
+func frameEnd(data []byte) (int, error) {
+	off := 0
+	for off < len(data) {
+		_, _, n, err := readFrame(data[off:])
+		if errors.Is(err, io.EOF) {
+			return off, nil
+		}
+
+		if err != nil {
+			return off, err
+		}
+
+		off += n
+	}
+
+	return off, nil
 }
 
 func dispatch(typ byte, payload []byte, h Handlers) error {
@@ -214,10 +256,12 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 	}
 }
 
-// appendFrame appends [uvarint bodyLen][type][payload][u32 CRC32C(body)] to dst.
+// appendFrame appends [uvarint bodyLen][type][payload][u32 CRC32C(len+body)] to dst. The length is
+// inside the checksum: readFrame trusts it to decide where the frame ends, so leaving it uncovered
+// leaves the one field that steers the reader unprotected.
 func appendFrame(dst []byte, typ byte, payload []byte) []byte {
-	dst = binary.AppendUvarint(dst, uint64(1+len(payload)))
 	start := len(dst)
+	dst = binary.AppendUvarint(dst, uint64(1+len(payload)))
 	dst = append(dst, typ)
 	dst = append(dst, payload...)
 	crc := crc32.Checksum(dst[start:], castagnoli)
@@ -234,8 +278,11 @@ func readFrame(src []byte) (typ byte, payload []byte, consumed int, err error) {
 		return 0, nil, 0, io.EOF
 	}
 
-	// Bound bodyLen against the bytes available (in uint64, to avoid int overflow)
-	// before computing any offset: a complete frame needs body + a 4-byte CRC.
+	// Bound bodyLen against the bytes available (in uint64, to avoid int overflow) before computing
+	// any offset: a complete frame needs body + a 4-byte CRC. This runs before the checksum because
+	// the checksum's span depends on it — which is why a length inflated past the end of the buffer
+	// is indistinguishable from a torn tail here, and why only the caller, knowing whether more log
+	// was supposed to follow, can classify it.
 	avail := len(src) - n
 	if avail < 4 || bodyLen > uint64(avail-4) {
 		return 0, nil, 0, io.EOF // torn tail
@@ -244,7 +291,7 @@ func readFrame(src []byte) (typ byte, payload []byte, consumed int, err error) {
 	bodyEnd := n + int(bodyLen)
 	crcEnd := bodyEnd + 4
 	body := src[n:bodyEnd]
-	if crc32.Checksum(body, castagnoli) != binary.BigEndian.Uint32(src[bodyEnd:crcEnd]) {
+	if crc32.Checksum(src[:bodyEnd], castagnoli) != binary.BigEndian.Uint32(src[bodyEnd:crcEnd]) {
 		return 0, nil, 0, errors.Wrap(ErrCorrupt, "CRC mismatch")
 	}
 
@@ -356,4 +403,44 @@ func parseSamplesSF(payload []byte) (signal.SeriesID, []int64, []float64, []floa
 	}
 
 	return id, ts, values, sf, nil
+}
+
+// scanCRCBudget bounds the bytes checksummed by one [frameAfter] scan. The scan is byte-aligned, so
+// its worst case is quadratic in the region it walks; the budget turns that into a fixed ~0.3s of
+// CRC work. Exhausting it means the region is neither a zero-fill (rejected without a checksum) nor
+// ordinary payload (whose random lengths mostly fail the bounds check), and the scan gives up
+// undecided — reported as a torn tail, the behavior it is refining.
+const scanCRCBudget = 1 << 30
+
+// frameAfter reports whether a complete, CRC-valid frame starts at any offset in data. It is the
+// evidence that a stopping point is a hole rather than the end of the log: the bytes after a torn
+// append are one record's truncated prefix and hold no whole frame, while a zero-filled gap left by
+// per-block writeback is followed by the frames that did reach the platter.
+//
+// The scan is byte-aligned because a hole destroys frame alignment — the resume point can be any
+// offset. A chance CRC32C match costs 2^-32 per candidate, so even a 32 MiB region false-positives
+// with probability ~0.8%; payloads carry no nested framing to bias that.
+func frameAfter(data []byte) bool {
+	budget := scanCRCBudget
+	for off := range data {
+		bodyLen, n := binary.Uvarint(data[off:])
+		if n <= 0 || bodyLen == 0 {
+			continue
+		}
+
+		avail := len(data) - off - n
+		if avail < 4 || bodyLen > uint64(avail-4) {
+			continue
+		}
+
+		if budget -= n + int(bodyLen); budget < 0 {
+			return false
+		}
+
+		if _, _, _, err := readFrame(data[off:]); err == nil {
+			return true
+		}
+	}
+
+	return false
 }

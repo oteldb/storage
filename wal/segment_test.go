@@ -232,3 +232,20 @@ func TestReplayDirCorruptSegment(t *testing.T) {
 	err := ReplayDir(dir, Handlers{OnSeries: func(signal.SeriesID, signal.Series) error { return nil }})
 	require.ErrorIs(t, err, ErrCorrupt)
 }
+
+func TestCloseReleasesDirectoryHandle(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	sw, err := Create(dir, 0)
+	require.NoError(t, err)
+	require.NoError(t, sw.WriteSeries(signal.SeriesID{}, signal.Series{}))
+	require.NoError(t, sw.Close())
+	require.NoError(t, sw.Close(), "double close is a no-op")
+
+	// The released root is observable only through its effect: rotation can no longer open a
+	// segment. (The leak it guards against is invisible on unix, where an open fd does not block
+	// removal, but on Windows a held directory handle fails the crash tests' RemoveAll.)
+	require.Error(t, sw.WriteSeries(signal.SeriesID{}, signal.Series{}))
+	require.NoError(t, os.RemoveAll(dir))
+}

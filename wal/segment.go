@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/internal/obs"
+	"github.com/oteldb/storage/internal/vfs"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -28,11 +28,13 @@ const (
 // directory in order ([ReplayDir]) reconstructs the logged state. Not safe for
 // concurrent use.
 type SegmentWriter struct {
-	dir      string
+	fsys     vfs.FS // rooted at the segment directory; held for the writer's lifetime
+	dir      string // the rooted directory's name, for log lines only
+	closed   bool   // the directory handle is released; no further segment can be opened
 	maxBytes int
 	seq      int
 	epoch    uint64 // flush generation stamped into new segment names; see [SegmentWriter.SetEpoch]
-	f        *os.File
+	f        vfs.File
 	size     int
 	w        *Writer
 	sync     bool        // fsync after every framed write (durability vs throughput)
@@ -53,20 +55,40 @@ func (sw *SegmentWriter) SetLogger(l *zap.Logger) {
 
 // Create opens (creating the directory if needed) a segmented WAL writer. A non-positive maxBytes
 // uses [DefaultMaxSegmentBytes]. If the directory already holds segments from a prior run, Create
-// **resumes**: it opens a fresh segment numbered beyond the existing ones (never truncating them), so
-// [ReplayDir] can still recover the prior segments before the next [SegmentWriter.Checkpoint] discards
-// them.
+// **resumes**: it repairs the last segment's torn tail (see [repair]) and opens a fresh segment
+// numbered beyond the existing ones, so [ReplayDir] can still recover the prior segments before the
+// next [SegmentWriter.Checkpoint] discards them.
 func Create(dir string, maxBytes int) (*SegmentWriter, error) {
+	fsys, err := vfs.OpenRoot(dir, 0o750)
+	if err != nil {
+		return nil, errors.Wrapf(err, "create wal dir %q", dir)
+	}
+
+	sw, err := createFS(fsys, maxBytes)
+	if err != nil {
+		_ = fsys.Close()
+
+		return nil, err
+	}
+
+	sw.dir = dir
+
+	return sw, nil
+}
+
+// createFS is [Create] over an already-rooted filesystem — the seam the durability tests inject a
+// crash model through. The writer keeps fsys open for its lifetime.
+func createFS(fsys vfs.FS, maxBytes int) (*SegmentWriter, error) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxSegmentBytes
 	}
 
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return nil, errors.Wrapf(err, "create wal dir %q", dir)
+	last, err := lastSegmentSeq(fsys)
+	if err != nil {
+		return nil, err
 	}
 
-	last, err := lastSegmentSeq(dir)
-	if err != nil {
+	if err := repair(fsys, last); err != nil {
 		return nil, err
 	}
 
@@ -74,7 +96,7 @@ func Create(dir string, maxBytes int) (*SegmentWriter, error) {
 	// then (and a resumed dir's prior segments are left intact for replay). Epoch starts at 1 (the
 	// first generation; the recovery watermark is 0), so a writer that never calls SetEpoch — the
 	// metric engine — still has all its segments replayed by ReplayDir's epoch>0 filter.
-	sw := &SegmentWriter{dir: dir, maxBytes: maxBytes, seq: last, epoch: 1}
+	sw := &SegmentWriter{fsys: fsys, maxBytes: maxBytes, seq: last, epoch: 1}
 	sw.w = NewWriter(sw) // the inner Writer frames records and writes them through sw
 
 	return sw, nil
@@ -113,7 +135,7 @@ func (sw *SegmentWriter) SetEpoch(epoch uint64) { sw.epoch = epoch }
 // watermark the flush is about to commit — so the checkpoint does not delete it and replay does not
 // skip it.
 func (sw *SegmentWriter) Seal(epoch uint64) (int, error) {
-	if err := sw.Close(); err != nil { // the next write lazily opens a segment carrying epoch
+	if err := sw.closeSegment(); err != nil { // the next write lazily opens a segment carrying epoch
 		return 0, err
 	}
 
@@ -134,12 +156,12 @@ func (sw *SegmentWriter) Checkpoint() error { return sw.CheckpointThrough(sw.seq
 // flushed (exactly-once — the watermark and the part list advance atomically; see [ReplayDirFrom]).
 func (sw *SegmentWriter) CheckpointThrough(obsolete int) error {
 	if obsolete >= sw.seq {
-		if err := sw.Close(); err != nil { // close the current segment; next write reopens lazily
+		if err := sw.closeSegment(); err != nil { // close the current segment; next write reopens lazily
 			return err
 		}
 	}
 
-	entries, err := os.ReadDir(sw.dir)
+	entries, err := sw.fsys.ReadDir(".")
 	if err != nil {
 		return errors.Wrapf(err, "read wal dir %q", sw.dir)
 	}
@@ -147,10 +169,16 @@ func (sw *SegmentWriter) CheckpointThrough(obsolete int) error {
 	for _, e := range entries {
 		seq, _, ok := parseSegment(e.Name())
 		if ok && seq <= obsolete {
-			if rerr := os.Remove(filepath.Join(sw.dir, e.Name())); rerr != nil && !os.IsNotExist(rerr) {
+			if rerr := sw.fsys.Remove(e.Name()); rerr != nil && !os.IsNotExist(rerr) {
 				return errors.Wrapf(rerr, "remove obsolete segment %q", e.Name())
 			}
 		}
+	}
+
+	// The removals are only durable once the directory is: without this a power cut can bring back
+	// segments a flush already superseded, and replay re-applies records the parts hold.
+	if err := sw.fsys.SyncDir("."); err != nil {
+		return errors.Wrapf(err, "sync wal dir %q", sw.dir)
 	}
 
 	sw.logger().Debug("wal checkpoint (obsolete segments discarded)",
@@ -159,11 +187,11 @@ func (sw *SegmentWriter) CheckpointThrough(obsolete int) error {
 	return nil
 }
 
-// lastSegmentSeq returns the highest segment number present in dir, or 0 if none.
-func lastSegmentSeq(dir string) (int, error) {
-	entries, err := os.ReadDir(dir)
+// lastSegmentSeq returns the highest segment number present in fsys, or 0 if none.
+func lastSegmentSeq(fsys vfs.FS) (int, error) {
+	entries, err := fsys.ReadDir(".")
 	if err != nil {
-		return 0, errors.Wrapf(err, "read wal dir %q", dir)
+		return 0, errors.Wrap(err, "read wal dir")
 	}
 
 	last := 0
@@ -285,8 +313,24 @@ func (sw *SegmentWriter) Sync() error {
 	return sw.f.Sync()
 }
 
-// Close syncs and closes the current segment.
+// Close syncs and closes the current segment and releases the writer's handle on the segment
+// directory. The writer is spent: a later append cannot open a segment. Idempotent.
 func (sw *SegmentWriter) Close() error {
+	err := sw.closeSegment()
+
+	if !sw.closed {
+		sw.closed = true
+		if cerr := sw.fsys.Close(); err == nil {
+			err = cerr
+		}
+	}
+
+	return err
+}
+
+// closeSegment syncs and closes the current segment, leaving the directory handle open so the next
+// append can lazily open the following segment. Rotation, sealing, and checkpointing use it.
+func (sw *SegmentWriter) closeSegment() error {
 	if sw.f == nil {
 		return nil
 	}
@@ -343,7 +387,7 @@ func (sw *SegmentWriter) logger() *zap.Logger {
 }
 
 func (sw *SegmentWriter) rotate() error {
-	if err := sw.Close(); err != nil {
+	if err := sw.closeSegment(); err != nil {
 		return err
 	}
 
@@ -358,11 +402,20 @@ func (sw *SegmentWriter) rotate() error {
 
 func (sw *SegmentWriter) openNext() error {
 	sw.seq++
-	name := filepath.Join(sw.dir, segmentName(sw.seq, sw.epoch))
+	name := segmentName(sw.seq, sw.epoch)
 
-	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // name is a segment file under the WAL dir
+	f, err := sw.fsys.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return errors.Wrapf(err, "open segment %q", name)
+	}
+
+	// Syncing the segment commits its bytes; the entry naming them reaches the disk only when the
+	// directory does. Without this, a power cut after a synced append can leave records on the
+	// platter that no name reaches.
+	if err := sw.fsys.SyncDir("."); err != nil {
+		_ = f.Close()
+
+		return errors.Wrapf(err, "sync wal dir %q", sw.dir)
 	}
 
 	sw.f, sw.size = f, 0
@@ -383,16 +436,72 @@ func ReplayDir(dir string, h Handlers) error { return ReplayDirFrom(dir, 0, h) }
 // ReplayDirFrom replays the segments in dir whose epoch is greater than minEpoch, in ascending
 // segment order, dispatching each record to h. Segments at or below minEpoch are skipped — their
 // records are already durable in a flushed part (the watermark), so skipping them makes recovery
-// exactly-once. A torn final record in the last replayed segment ends replay cleanly.
+// exactly-once. A torn final record in the **last** replayed segment ends replay cleanly, but only
+// once nothing whole is found after it; a torn record anywhere earlier, or one followed by a
+// CRC-valid frame, is a hole in the middle of history and returns an [ErrCorrupt]-wrapping error.
 func ReplayDirFrom(dir string, minEpoch uint64, h Handlers) error {
-	entries, err := os.ReadDir(dir)
+	fsys, err := vfs.Open(dir)
 	if err != nil {
 		return errors.Wrapf(err, "read wal dir %q", dir)
 	}
+	defer func() { _ = fsys.Close() }()
 
-	type seg struct {
-		seq  int
-		name string
+	if err := replayDirFrom(fsys, minEpoch, h); err != nil {
+		return errors.Wrapf(err, "wal dir %q", dir)
+	}
+
+	return nil
+}
+
+// replayDirFrom is [ReplayDirFrom] over an already-rooted filesystem.
+func replayDirFrom(fsys vfs.FS, minEpoch uint64, h Handlers) error {
+	segs, err := segments(fsys, minEpoch)
+	if err != nil {
+		return err
+	}
+
+	for i, s := range segs {
+		data, err := fsys.ReadFile(s.name)
+		if err != nil {
+			return errors.Wrapf(err, "read segment %q", s.name)
+		}
+
+		n, err := replay(data, h)
+		if err != nil {
+			return errors.Wrapf(err, "replay segment %q", s.name)
+		}
+
+		if n == len(data) {
+			continue
+		}
+
+		// Only the segment a crash was appending to may end mid-frame. Stopping short of any earlier
+		// one means the rest of that segment is skipped — a hole in the middle of history that the
+		// segments after it would paper over.
+		if i != len(segs)-1 {
+			return errors.Wrapf(ErrCorrupt, "torn record in non-final segment %q at offset %d", s.name, n)
+		}
+
+		// Even in the final segment, "ends mid-frame" is only a torn append if nothing whole follows.
+		if frameAfter(data[n:]) {
+			return errors.Wrapf(ErrCorrupt, "hole in final segment %q at offset %d of %d", s.name, n, len(data))
+		}
+	}
+
+	return nil
+}
+
+// seg is a replayable segment: its sequence (the replay order) and its file name.
+type seg struct {
+	seq  int
+	name string
+}
+
+// segments lists the segments in fsys whose epoch is above minEpoch, in ascending sequence order.
+func segments(fsys vfs.FS, minEpoch uint64) ([]seg, error) {
+	entries, err := fsys.ReadDir(".")
+	if err != nil {
+		return nil, errors.Wrap(err, "read wal dir")
 	}
 
 	var segs []seg
@@ -404,15 +513,75 @@ func ReplayDirFrom(dir string, minEpoch uint64, h Handlers) error {
 
 	slices.SortFunc(segs, func(a, b seg) int { return a.seq - b.seq })
 
-	for _, s := range segs {
-		data, err := os.ReadFile(filepath.Join(dir, s.name)) //nolint:gosec // name is a *.wal entry under dir
-		if err != nil {
-			return errors.Wrapf(err, "read segment %q", s.name)
-		}
+	return segs, nil
+}
 
-		if err := Replay(data, h); err != nil {
-			return errors.Wrapf(err, "replay segment %q", s.name)
-		}
+// repair truncates the segment numbered last to its final complete frame — the shape a crash
+// mid-append leaves it in. It is what keeps a resumed directory replayable: [Create] opens a *new*
+// segment beyond the existing ones, so a torn tail left behind becomes a permanent middle segment
+// and fails every later replay. The discarded bytes are an incomplete frame, unreadable by
+// construction, and repairing an intact segment is a no-op.
+//
+// A complete frame that fails its CRC is left alone: that is corruption rather than a torn append,
+// and replay is the one place that reports it. So is a segment whose tail turns out to be a hole —
+// a CRC-valid frame follows the stopping point — which is [ErrCorrupt] here rather than a
+// truncation, because [Create] runs before replay and truncating would erase what proves it.
+func repair(fsys vfs.FS, last int) error {
+	if last == 0 {
+		return nil
+	}
+
+	segs, err := segments(fsys, 0)
+	if err != nil {
+		return err
+	}
+
+	i := slices.IndexFunc(segs, func(s seg) bool { return s.seq == last })
+	if i < 0 {
+		return nil
+	}
+
+	name := segs[i].name
+
+	data, err := fsys.ReadFile(name)
+	if err != nil {
+		return errors.Wrapf(err, "read segment %q", name)
+	}
+
+	n, err := frameEnd(data)
+	if err != nil || n == len(data) {
+		return nil //nolint:nilerr // a failing CRC is replay's to report; an intact tail needs nothing
+	}
+
+	// Truncating a hole would discard the whole records past it *and* the evidence that they existed,
+	// leaving replay a clean-looking prefix. Create runs before replay, so this is the first reader
+	// that can see it.
+	if frameAfter(data[n:]) {
+		return errors.Wrapf(ErrCorrupt, "hole in segment %q at offset %d of %d", name, n, len(data))
+	}
+
+	return writeSegment(fsys, name, data[:n])
+}
+
+// writeSegment replaces name's contents with data and commits them. The name is unchanged, so the
+// directory entry already reaching these bytes needs no sync of its own.
+func writeSegment(fsys vfs.FS, name string, data []byte) error {
+	f, err := fsys.OpenFile(name, os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return errors.Wrapf(err, "open segment %q", name)
+	}
+
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+
+	if err != nil {
+		return errors.Wrapf(err, "rewrite segment %q", name)
 	}
 
 	return nil
