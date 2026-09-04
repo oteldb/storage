@@ -246,6 +246,15 @@ objects, bucket index after everything**, so the local index only ever reference
 parts (the same commit-point discipline as flush; a crashed sync leaves an orphan retried next
 pass).
 
+The pass reads the peer twice — its index, then its key listing — and an owner merge landing between
+the two skews them: the index names a part whose objects the listing no longer offers, and no copy
+can bring it over. So the pass installs an index only when it can **back every entry**: a part the
+peer's listing does not name, or whose fetch 404s (the merge landing later still), disqualifies the
+whole index for this pass, which then keeps the local one and takes the non-superseding path for
+pruning. Copying stays unconditional, and the next pass reads a fresh index and converges. Re-reading
+the index after the listing would only move the skew to the other side of the pair; the entry-backing
+check is on state the pass has already observed, so it leaves no window.
+
 **Absence is not an instruction.** Mirroring a peer, obeying its deletions, and deleting a
 particular part are three separate claims. Only an index that *supersedes* the local one may do the
 second, and only a part the peer says it **removed** may be deleted at all. Ordering comes from the bucket
