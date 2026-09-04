@@ -482,8 +482,22 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 
 	st := Stats{}
 
-	if err := s.copyMissing(ctx, &st, addr, enginePrefix, indexKey, keep); err != nil {
+	unbacked, err := s.copyMissing(ctx, &st, addr, enginePrefix, indexKey, keep, peerIndex.Entries)
+	if err != nil {
 		return st, err
+	}
+
+	// The index was read before the peer's key listing, so an owner merge landing in between hands
+	// us an index naming a part whose objects the peer has already dropped — a part the copy loop
+	// then cannot have copied, either because the listing no longer names it or because its fetch
+	// 404ed. Installing it would publish an entry resolving to objects that are not here. Racing a
+	// merge stays tolerated; adopting an index the pass could not back is what does not.
+	if len(unbacked) > 0 {
+		zctx.From(ctx).Debug("partsync: peer index outran its objects, deferring install",
+			zap.String("prefix", enginePrefix), zap.String("peer", addr),
+			zap.Int("parts", len(unbacked)))
+
+		supersedes = false
 	}
 
 	// Adopting the peer's index is what makes its absences ours, so it is gated on the same
@@ -633,11 +647,19 @@ func (s *Syncer) newestPeer(ctx context.Context, indexKey string, peers []string
 // copyMissing fetches from addr every object under enginePrefix the local backend lacks,
 // ordering manifests after their part's other objects and re-fetching the mutable identity
 // objects; the bucket index itself is excluded (installed by the caller, last).
-func (s *Syncer) copyMissing(ctx context.Context, st *Stats, addr, enginePrefix, indexKey string, keep KeepFunc) error {
+func (s *Syncer) copyMissing(
+	ctx context.Context, st *Stats, addr, enginePrefix, indexKey string, keep KeepFunc,
+	indexed []bucketindex.Entry,
+) (map[string]struct{}, error) {
 	listed, err := s.client.List(ctx, addr, enginePrefix)
 	if err != nil {
-		return errors.Wrap(err, "list peer")
+		return nil, errors.Wrap(err, "list peer")
 	}
+
+	// Measured against the unfiltered listing: an object filter narrows what this node stores, not
+	// what the peer holds, so filtering here would report a part as lost the moment its objects
+	// became someone else's shards.
+	unbacked := unbackedParts(indexed, listed, enginePrefix)
 
 	// Apply the caller's object filter (EC slot filtering) up front, so both the copy set and
 	// the prune bookkeeping (remote set below) see only the objects this node should hold — a
@@ -651,7 +673,7 @@ func (s *Syncer) copyMissing(ctx context.Context, st *Stats, addr, enginePrefix,
 
 	local, err := s.local.List(ctx, enginePrefix)
 	if err != nil {
-		return errors.Wrap(err, "list local")
+		return nil, errors.Wrap(err, "list local")
 	}
 
 	have := make(map[string]struct{}, len(local))
@@ -666,14 +688,20 @@ func (s *Syncer) copyMissing(ctx context.Context, st *Stats, addr, enginePrefix,
 			data, err := s.client.Fetch(ctx, addr, k)
 			if err != nil {
 				if errors.Is(err, ErrNotExist) {
-					continue // raced a merge on the peer: the object went away with its part
+					// Raced a merge on the peer: the object went away with its part. Tolerated,
+					// but the part is no longer one this pass can vouch for.
+					if part := partOf(k, enginePrefix); part != "" {
+						unbacked[part] = struct{}{}
+					}
+
+					continue
 				}
 
-				return err
+				return nil, err
 			}
 
 			if err := s.local.Write(ctx, k, data); err != nil {
-				return errors.Wrapf(err, "write %q", k)
+				return nil, errors.Wrapf(err, "write %q", k)
 			}
 
 			st.Copied++
@@ -686,7 +714,29 @@ func (s *Syncer) copyMissing(ctx context.Context, st *Stats, addr, enginePrefix,
 	s.stateFor(enginePrefix).remote = keySet(remote)
 	s.mu.Unlock()
 
-	return nil
+	return unbacked, nil
+}
+
+// unbackedParts is the set of index entries the peer's own listing no longer backs with any
+// object: parts an owner merge dropped after the index was read, which no copy can bring over.
+func unbackedParts(indexed []bucketindex.Entry, listed []string, enginePrefix string) map[string]struct{} {
+	backed := make(map[string]struct{}, len(listed))
+
+	for _, k := range listed {
+		if part := partOf(k, enginePrefix); part != "" {
+			backed[part] = struct{}{}
+		}
+	}
+
+	unbacked := make(map[string]struct{})
+
+	for i := range indexed {
+		if _, ok := backed[indexed[i].Prefix]; !ok {
+			unbacked[indexed[i].Prefix] = struct{}{}
+		}
+	}
+
+	return unbacked
 }
 
 // classifyFetch splits a peer's (already slot-filtered) key listing into the objects to fetch,
