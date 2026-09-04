@@ -1,0 +1,55 @@
+name: crash model
+
+# Validates the crash model against a real kernel: ext4 on a dm-flakey device that drops writes.
+#
+# internal/vfs/faultfs decides what a power cut takes, and every durability test in the tree trusts
+# that decision. This job checks it against an actual filesystem losing actual writes. It needs
+# root, device-mapper and loopback devices, so it is opt-in rather than part of the pull-request
+# suite; the model half of the same scenario table runs there as TestModel.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly is enough: the model changes rarely, and a regression here is caught by TestModel first.
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  crashmodel:
+    name: dm-flakey conformance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Get Go environment
+        shell: bash
+        run: |
+          echo "cache=$(go env GOCACHE)" >> $GITHUB_ENV
+          echo "modcache=$(go env GOMODCACHE)" >> $GITHUB_ENV
+
+      - name: Set up cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.cache }}
+            ${{ env.modcache }}
+          key: ${{ runner.os }}-${{ runner.arch }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-
+
+      - name: Install device-mapper tooling
+        run: sudo apt-get update && sudo apt-get install -y dmsetup e2fsprogs
+
+      - name: Run crash-model conformance
+        run: ./scripts/crashmodel-test.sh
