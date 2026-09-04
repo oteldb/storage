@@ -47,6 +47,7 @@ engines over the fetch seam (`query/fetch`).
 | [`recordengine/ARCH.md`](recordengine/ARCH.md) | the shared record engine for logs/traces/profiles |
 | [`query/ARCH.md`](query/ARCH.md) | fetch contract, scale decorators, PromQL adapter, EXPLAIN ANALYZE |
 | [`cluster/ARCH.md`](cluster/ARCH.md) | ring, membership, replication, rebalance, sharding, partsync, erasure coding |
+| [`internal/vfs/ARCH.md`](internal/vfs/ARCH.md) | the filesystem seam, `SyncDir`, and what each crash mode of the fake does and does not model |
 | [`ADMIN.md`](ADMIN.md) | operator surface: `Inspect`, `Admin`, drill-downs, metrics catalog |
 
 ---
