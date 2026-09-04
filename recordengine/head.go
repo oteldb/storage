@@ -188,10 +188,10 @@ func (h *head) ensureStream(id signal.SeriesID, materialize func() signal.Series
 	return true
 }
 
-// headByteCap is the hard ceiling on a head's buffered record bytes, enforced regardless of
-// [AppendLimits.MaxInFlightBytes] (which may be unset). A flush concatenates every stream's cells
+// headByteCap is the hard ceiling on the head's record bytes, live plus detached, enforced regardless
+// of [AppendLimits.MaxInFlightBytes] (which may be unset). A flush concatenates every stream's cells
 // into one blob per byte column, indexed by the int32 offsets of [byteCol] — so a column blob cannot
-// exceed 2 GiB, and h.bytes (which counts every column's bytes) bounds any single one of them.
+// exceed 2 GiB, and the byte count (which counts every column's bytes) bounds any single one of them.
 // Overflowing would be silent corruption: negative offsets written into a part. Reaching it takes a
 // raised or disabled FlushThresholdBytes; past it records are rejected as [rejectBytes], the same
 // memory-backpressure reason the configurable cap uses.
@@ -207,9 +207,11 @@ func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow, maxBytes int64
 		return rejectOOO
 	}
 
-	// headByteCap is a format bound on the *next* part's column blobs, so it applies to the live
-	// buffers only; MaxInFlightBytes is memory backpressure, so it applies to everything resident.
-	if h.bytes >= headByteCap || (maxBytes > 0 && h.inFlightBytes() >= maxBytes) {
+	// headByteCap is a format bound on the *next* part's column blobs, and a failed flush folds the
+	// detached buffers back into the live ones ([head.reattach]) — so the bound covers both sides of
+	// the in-flight measure, not just the live half, which would let a reattach restore ~2× the cap.
+	// MaxInFlightBytes is memory backpressure, and covers everything resident for its own reason.
+	if h.inFlightBytes() >= headByteCap || (maxBytes > 0 && h.inFlightBytes() >= maxBytes) {
 		return rejectBytes
 	}
 
