@@ -1,7 +1,8 @@
 name: bench
 
 on:
-  pull_request:
+  # pull_request: disabled — the self-hosted benchmark runner is down, so every PR queued a
+  # job that never got picked up. Restore this line once the runner is back.
   workflow_dispatch:
 
 permissions:

@@ -384,6 +384,13 @@ relies on `Condition.Equal` being byte-identical to `Match` for that column — 
 | `keys.bin` (`OTKY`, magic+version+CRC32C) | the part's distinct per-record **attribute keys** |
 | `sym-{name}.bin` (`OTSP`) | the optional **side store** |
 
+The blooms are **advisory**: they only ever remove parts the per-row re-check would have removed
+anyway, so a sidecar that is absent *or fails to decode* degrades to "this column does not prune
+this part" — the part is scanned and the exact predicate decides. Opening the part logs the
+corruption and continues; failing recovery instead would take a whole prefix offline over a
+structure that changes no result, and a merge rewrites the sidecar. This matches the metric
+engine's derived sidecars (`../engine/ARCH.md`), which fall back on absent or corrupt alike.
+
 `keys.bin` holds keys, not values: the schema does not bound values, while keys are tiny.
 `Engine.Keys` enumerates them across head ∪ in-window parts tagged with a `KeyScope` bitset
 (resource/scope/record), so an embedder can list and push down record-attribute labels that

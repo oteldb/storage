@@ -11,7 +11,8 @@ name: query-bench
 # Complements bench.yml (BenchmarkGolden, in-repo, includes PromQL via the public Prometheus engine).
 
 on:
-  pull_request:
+  # pull_request: disabled — the self-hosted benchmark runner is down, so every PR queued a
+  # job that never got picked up. Restore this line once the runner is back.
   workflow_dispatch:
 
 permissions:

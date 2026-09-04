@@ -3,12 +3,12 @@ package file
 import (
 	"bufio"
 	"context"
-	"os"
-	"path/filepath"
+	"path"
 
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/vfs"
 )
 
 var _ backend.ObjectCreator = (*File)(nil)
@@ -33,7 +33,7 @@ func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter
 		return nil, err
 	}
 
-	tmp, name, err := createTemp(root, filepath.Dir(p))
+	tmp, name, created, err := createTemp(root, path.Dir(p))
 	if err != nil {
 		_ = root.Close()
 
@@ -41,12 +41,13 @@ func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter
 	}
 
 	return &objectWriter{
-		root: root,
-		key:  key,
-		path: p,
-		tmp:  tmp,
-		name: name,
-		buf:  bufio.NewWriterSize(tmp, objectWriteBufferBytes),
+		root:    root,
+		key:     key,
+		path:    p,
+		tmp:     tmp,
+		name:    name,
+		created: created,
+		buf:     bufio.NewWriterSize(tmp, objectWriteBufferBytes),
 	}, nil
 }
 
@@ -55,12 +56,13 @@ func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter
 // The root handle stays open for the writer's lifetime — the temp file it holds is only published
 // at commit — and is released by [objectWriter.Commit] or [objectWriter.Abort].
 type objectWriter struct {
-	root *os.Root
-	key  string
-	path string
-	tmp  *os.File
-	name string
-	buf  *bufio.Writer
+	root    vfs.FS
+	key     string
+	path    string
+	tmp     vfs.File
+	name    string
+	created []string
+	buf     *bufio.Writer
 }
 
 func (w *objectWriter) Write(p []byte) (int, error) {
@@ -113,6 +115,12 @@ func (w *objectWriter) Commit(_ context.Context) error {
 		_ = w.root.Close()
 
 		return errors.Wrapf(err, "rename into %q", w.key)
+	}
+
+	if err := publish(w.root, w.created, path.Dir(w.path)); err != nil {
+		_ = w.root.Close()
+
+		return errors.Wrapf(err, "publish %q", w.key)
 	}
 
 	if err := w.root.Close(); err != nil {

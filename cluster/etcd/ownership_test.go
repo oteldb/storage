@@ -118,16 +118,25 @@ func TestOwnershipReconcileMinimalMoveAndHandoffPlan(t *testing.T) {
 	// as the maintenance loop reconciles every tick.
 	r2 := r1.Without("node-b")
 
+	// Polled on the test goroutine rather than through require.Eventually, which runs its condition
+	// on its own: require's FailNow is invalid there, so a failing reconcile surfaced as the timeout
+	// instead of its own error, and the condition's writes raced the read of its result.
 	var ownedA2 []string
 
-	require.Eventually(t, func() bool {
+	for deadline := time.Now().Add(2 * time.Second); ; {
 		_, err := b.Reconcile(ctx, r2, shards) // releases the shards it no longer owns
 		require.NoError(t, err)
+
 		ownedA2, err = a.Reconcile(ctx, r2, shards) // acquires the freed shards
 		require.NoError(t, err)
 
-		return len(ownedA2) == len(shards)
-	}, 2*time.Second, 20*time.Millisecond, "node-a takes over every shard")
+		if len(ownedA2) == len(shards) {
+			break
+		}
+
+		require.False(t, time.Now().After(deadline), "node-a takes over every shard")
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	assert.ElementsMatch(t, shards, ownedA2)
 	assert.Empty(t, b.Owned(), "node-b (gone from the ring) releases everything")

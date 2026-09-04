@@ -9,11 +9,9 @@ import (
 )
 
 // AppendLogs converts an OTLP logs batch into dst, reusing dst's retained capacity (call
-// [log.Logs.Reset] or use [log.GetLogs] for a recycled batch). Every record is representable, so
-// dropped is always 0; it is returned for symmetry with [AppendMetrics]. Non-string record bodies
-// are rendered to their textual form, since the internal model stores a body as text bytes.
-//
-//nolint:dupl // per-signal OTLP converter; identical resource/scope walk, types differ
+// [log.Logs.Reset] or use [log.GetLogs] for a recycled batch). dropped counts the records carrying
+// no usable time at all (see [appendRecord]). Non-string record bodies are rendered to their textual
+// form, since the internal model stores a body as text bytes.
 func AppendLogs(dst *log.Logs, ld plog.Logs) (dropped int) {
 	rls := ld.ResourceLogs()
 	for i := range rls.Len() {
@@ -39,7 +37,9 @@ func AppendLogs(dst *log.Logs, ld plog.Logs) (dropped int) {
 
 			records := ssl.LogRecords()
 			for k := range records.Len() {
-				appendRecord(sl, records.At(k))
+				if !appendRecord(sl, records.At(k)) {
+					dropped++
+				}
 			}
 		}
 	}
@@ -47,10 +47,25 @@ func AppendLogs(dst *log.Logs, ld plog.Logs) (dropped int) {
 	return dropped
 }
 
-func appendRecord(sl *log.ScopeLogs, r plog.LogRecord) {
+// appendRecord converts one OTLP record, reporting whether it was representable. time_unix_nano is
+// optional in OTLP — a receiver tailing files or journald with no timestamp parser leaves it unset —
+// so an unset event time falls back to the observed time, as the spec prescribes. Without the
+// fallback such a record sorts at the unix epoch, which no query window covers and which retention
+// then drops as ancient: silent loss of a whole class of ordinary logs. A record with neither time
+// has nothing to sort or query by and is refused here, where the caller can still report it.
+func appendRecord(sl *log.ScopeLogs, r plog.LogRecord) bool {
+	ts, observed := int64(r.Timestamp()), int64(r.ObservedTimestamp())
+	if ts == 0 {
+		ts = observed
+	}
+
+	if ts == 0 {
+		return false
+	}
+
 	rec := sl.AddRecord()
-	rec.Timestamp = int64(r.Timestamp())
-	rec.ObservedTimestamp = int64(r.ObservedTimestamp())
+	rec.Timestamp = ts
+	rec.ObservedTimestamp = observed
 	rec.SeverityNumber = int32(r.SeverityNumber())
 	rec.SeverityText = []byte(r.SeverityText())
 	rec.Body = bodyBytes(r.Body())
@@ -59,6 +74,8 @@ func appendRecord(sl *log.ScopeLogs, r plog.LogRecord) {
 	rec.Flags = uint32(r.Flags())
 	rec.Dropped = r.DroppedAttributesCount()
 	rec.Attributes = convertMap(r.Attributes())
+
+	return true
 }
 
 // bodyBytes renders a log record body to text bytes: a string body is copied verbatim, any other
