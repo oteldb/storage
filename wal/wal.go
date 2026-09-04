@@ -404,3 +404,43 @@ func parseSamplesSF(payload []byte) (signal.SeriesID, []int64, []float64, []floa
 
 	return id, ts, values, sf, nil
 }
+
+// scanCRCBudget bounds the bytes checksummed by one [frameAfter] scan. The scan is byte-aligned, so
+// its worst case is quadratic in the region it walks; the budget turns that into a fixed ~0.3s of
+// CRC work. Exhausting it means the region is neither a zero-fill (rejected without a checksum) nor
+// ordinary payload (whose random lengths mostly fail the bounds check), and the scan gives up
+// undecided — reported as a torn tail, the behavior it is refining.
+const scanCRCBudget = 1 << 30
+
+// frameAfter reports whether a complete, CRC-valid frame starts at any offset in data. It is the
+// evidence that a stopping point is a hole rather than the end of the log: the bytes after a torn
+// append are one record's truncated prefix and hold no whole frame, while a zero-filled gap left by
+// per-block writeback is followed by the frames that did reach the platter.
+//
+// The scan is byte-aligned because a hole destroys frame alignment — the resume point can be any
+// offset. A chance CRC32C match costs 2^-32 per candidate, so even a 32 MiB region false-positives
+// with probability ~0.8%; payloads carry no nested framing to bias that.
+func frameAfter(data []byte) bool {
+	budget := scanCRCBudget
+	for off := range data {
+		bodyLen, n := binary.Uvarint(data[off:])
+		if n <= 0 || bodyLen == 0 {
+			continue
+		}
+
+		avail := len(data) - off - n
+		if avail < 4 || bodyLen > uint64(avail-4) {
+			continue
+		}
+
+		if budget -= n + int(bodyLen); budget < 0 {
+			return false
+		}
+
+		if _, _, _, err := readFrame(data[off:]); err == nil {
+			return true
+		}
+	}
+
+	return false
+}

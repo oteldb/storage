@@ -56,6 +56,34 @@ next run turns into a permanent *middle* segment, and every later replay fails. 
 are an incomplete frame, unreadable by construction. A *complete* frame that fails its CRC is left
 alone — that is corruption rather than a torn append, and replay is the one place that reports it.
 
+### Proving a tail is a tail
+
+Ending mid-record is not by itself evidence of a torn append. A crash does not always truncate to a
+clean prefix: per-block writeback can land a later block while an earlier one is lost, and the
+filesystem zero-fills the gap; a preallocated tail reads back as zeros for the same reason. The
+result is a **hole** — a zero region followed by frames that did reach the platter — and the reader
+stops at the zeros, mistaking committed records for the end of the log.
+
+So both places that accept a torn tail (`ReplayDirFrom` on the last segment, `repair` before it
+truncates) first scan forward from the stopping point for a complete, CRC-valid frame. One found
+means whole records survive past the gap: the segment is `ErrCorrupt`, and `repair` refuses to
+truncate rather than destroying both the records and the evidence. None found means an ordinary torn
+append, accepted as before.
+
+The scan is byte-aligned, since a hole destroys frame alignment and the resume point can be any
+offset. Cost is bounded two ways: candidates whose length varint is zero or overruns the buffer are
+rejected without a checksum (a zero-fill is one pass over the gap), and the checksummed bytes carry a
+1 GiB budget — roughly 0.3 s — after which the scan gives up and reports a tail. False positives cost
+2^-32 per candidate offset, so even a maximal 32 MiB region misclassifies a healthy log with
+probability ~0.8%; payloads are engine blobs, never nested WAL frames, so nothing biases that.
+
+Pebble instead carries a durability watermark (`SyncOffset`) in every chunk header and proves
+corruption when a later chunk promises durability past the bad offset. That is exact, and costs a
+format major version and a second reader; a surviving CRC-valid frame is evidence enough here and
+needs no format change. The residual: a hole whose trailing region happens to hold no CRC-valid frame
+— a gap that swallowed every following record, or one whose survivors are themselves torn — is still
+indistinguishable from a tail and is accepted as one.
+
 ## Epochs — exactly-once recovery (record signals)
 
 Segments are named `{seq}-{epoch}.wal`: `seq` orders replay, `epoch` is the flush generation, so a

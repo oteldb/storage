@@ -436,9 +436,9 @@ func ReplayDir(dir string, h Handlers) error { return ReplayDirFrom(dir, 0, h) }
 // ReplayDirFrom replays the segments in dir whose epoch is greater than minEpoch, in ascending
 // segment order, dispatching each record to h. Segments at or below minEpoch are skipped — their
 // records are already durable in a flushed part (the watermark), so skipping them makes recovery
-// exactly-once. A torn final record in the **last** replayed segment ends replay cleanly; a torn
-// record anywhere earlier is a hole in the middle of history and returns an [ErrCorrupt]-wrapping
-// error.
+// exactly-once. A torn final record in the **last** replayed segment ends replay cleanly, but only
+// once nothing whole is found after it; a torn record anywhere earlier, or one followed by a
+// CRC-valid frame, is a hole in the middle of history and returns an [ErrCorrupt]-wrapping error.
 func ReplayDirFrom(dir string, minEpoch uint64, h Handlers) error {
 	fsys, err := vfs.Open(dir)
 	if err != nil {
@@ -471,11 +471,20 @@ func replayDirFrom(fsys vfs.FS, minEpoch uint64, h Handlers) error {
 			return errors.Wrapf(err, "replay segment %q", s.name)
 		}
 
+		if n == len(data) {
+			continue
+		}
+
 		// Only the segment a crash was appending to may end mid-frame. Stopping short of any earlier
 		// one means the rest of that segment is skipped — a hole in the middle of history that the
 		// segments after it would paper over.
-		if n < len(data) && i != len(segs)-1 {
+		if i != len(segs)-1 {
 			return errors.Wrapf(ErrCorrupt, "torn record in non-final segment %q at offset %d", s.name, n)
+		}
+
+		// Even in the final segment, "ends mid-frame" is only a torn append if nothing whole follows.
+		if frameAfter(data[n:]) {
+			return errors.Wrapf(ErrCorrupt, "hole in final segment %q at offset %d of %d", s.name, n, len(data))
 		}
 	}
 
@@ -514,7 +523,9 @@ func segments(fsys vfs.FS, minEpoch uint64) ([]seg, error) {
 // construction, and repairing an intact segment is a no-op.
 //
 // A complete frame that fails its CRC is left alone: that is corruption rather than a torn append,
-// and replay is the one place that reports it.
+// and replay is the one place that reports it. So is a segment whose tail turns out to be a hole —
+// a CRC-valid frame follows the stopping point — which is [ErrCorrupt] here rather than a
+// truncation, because [Create] runs before replay and truncating would erase what proves it.
 func repair(fsys vfs.FS, last int) error {
 	if last == 0 {
 		return nil
@@ -540,6 +551,13 @@ func repair(fsys vfs.FS, last int) error {
 	n, err := frameEnd(data)
 	if err != nil || n == len(data) {
 		return nil //nolint:nilerr // a failing CRC is replay's to report; an intact tail needs nothing
+	}
+
+	// Truncating a hole would discard the whole records past it *and* the evidence that they existed,
+	// leaving replay a clean-looking prefix. Create runs before replay, so this is the first reader
+	// that can see it.
+	if frameAfter(data[n:]) {
+		return errors.Wrapf(ErrCorrupt, "hole in segment %q at offset %d of %d", name, n, len(data))
 	}
 
 	return writeSegment(fsys, name, data[:n])
