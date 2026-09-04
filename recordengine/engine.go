@@ -187,10 +187,14 @@ type Engine struct {
 	// replica tell a compaction from a loss.
 	indexed  map[string]struct{}
 	removals []bucketindex.Removal
-	// wants are the repair obligations carried in this engine's index: parts it holds an entry for
-	// but cannot read. They are carried across every commit like removals, and discharged only by
-	// committing a part that satisfies them (see repair.go).
+	// wants are the repair obligations the last bucket index this engine wrote carried: parts it
+	// holds an entry for but cannot read. They ride every commit like removals, and are discharged
+	// only by committing a part that satisfies them (see repair.go).
 	wants []bucketindex.Want
+	// pendingWants are the ones a load discovered and the next commit must add. Keeping the
+	// discovery pending rather than committing it on the spot is what makes dropping the entry and
+	// recording the want one CAS commit instead of two.
+	pendingWants []bucketindex.Want
 	// repaired counts what repair did, for the operator surface and for tests: a want cannot be
 	// left silently outstanding.
 	repaired RepairStats

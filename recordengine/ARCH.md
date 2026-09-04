@@ -230,6 +230,12 @@ Reuse would be unsound here for one extra reason: two of a part's objects are co
 is skipped when the rows carry no record attributes, the `sym-*.bin` sidecars when there is no side
 data — so a new part would silently adopt a failed attempt's.
 
+A part the owner cannot open is handled identically: only `backend.ErrNotExist` drops it from
+`Entries` and records a `bucketindex.Want` in the same compare-and-swap, every other error still
+fails the load, and the sweep spares a wanted part's remaining objects
+([`../engine/ARCH.md`](../engine/ARCH.md), "A part the owner cannot read becomes a want, not a
+removal").
+
 ## Lifecycle guards
 
 Flush and merge run under one `flushMu`, and `Reset` takes it too, with the same rationale and the same

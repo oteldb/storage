@@ -201,6 +201,41 @@ name; a directory is a part's when its name parses as a part id. The sweep assum
 the prefix, so a replica's `RefreshReplica` skips it: the owner's in-flight part is not in the index
 yet.
 
+
+## A part the owner cannot read becomes a want, not a removal
+
+`LoadParts` used to fail the whole engine on the first part it could not open, which turns one lost
+part into a node that will not start. It now drops that part from `Entries` and records a
+`bucketindex.Want` naming it (`backend/ARCH.md`, "`Entries → Removed | Wanted`"), in **one**
+compare-and-swap: the drop and the obligation are the same commit, so no crash can land the drop
+without the want and a lost race leaves neither — the retry re-reads and re-derives both from the
+same evidence. Nothing consumes wants yet; they are recorded and durable.
+
+**Only `backend.ErrNotExist` may become a want.** Every other failure — a timeout, a canceled
+context, a full disk, a denied request, a throttled bucket — leaves the part's existence unknown,
+and a want is a statement that it is gone. Recording one on an unknown would drop a live part from
+the index and start a repair for data that was never missing; over a shared backend a single
+transient fault touches every part at once, so the index would be stripped wholesale. So a
+non-absence error fails the load exactly as it did before (`partGone`, the counterpart of
+ClickHouse's `isRetryableException` rethrow in `checkDataPart`).
+
+The trigger stays narrow in the other direction too: a part whose objects are **present but
+unreadable** — a corrupt manifest, a truncated column — is not a want. It is a different failure
+with a different remedy, and widening the trigger is how a repair path turns into a
+data-destruction path. It still fails the load.
+
+Two consequences fall out of the entry no longer being there:
+
+- The gone part is absent from `indexed`, so the next commit's diff does not also call it a
+  *removal*. A loss restated as a deliberate deletion is exactly the ambiguity wants exist to
+  remove.
+- `foreignEntries` refuses to adopt it back from a rival's index, and the orphan sweep spares its
+  surviving objects. They are the remains of a part repair is owed, not the residue of a failed
+  flush, and deleting them destroys the evidence before repair can see it.
+
+Only an owner does this — the replica path (`RefreshReplica`, no sweep) still fails, because
+recording a want is committing an index, which is the owner's to write.
+
 ## Disk pressure closes the ingest path
 
 A flush that cannot fit is not a retryable failure. It detaches the head, fails part-way, burns a
