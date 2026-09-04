@@ -23,15 +23,69 @@ type partRepairer struct {
 }
 
 // FetchWant implements the engines' PartFetcher.
+//
+// Finding nothing is reported as definitive absence only when this node could ask *every* owner
+// the shard is expected to have: the ring named the full replication factor, every one of those
+// nodes resolved to an address, and this node is among them. Anything less is
+// [bucketindex.WantIncomplete] — during a rolling restart the deregistered node drops out of the
+// ring, so the peers that answer are a strict subset of the owners and their not having the part
+// says nothing about the one that does.
+//
+// The bar is deliberately the *configured* replication factor rather than whatever the ring
+// currently returns. A cluster permanently running fewer nodes than its RF therefore never
+// acknowledges a loss, which is the safe direction: an outstanding want is visible and
+// recoverable, a hole over live data is neither.
 func (r *partRepairer) FetchWant(
 	ctx context.Context, w bucketindex.Want,
-) (bucketindex.Entry, bool, error) {
-	_, remotes := r.s.shardOwners(r.tid)
-	if len(remotes) == 0 {
-		return bucketindex.Entry{}, false, nil
+) (bucketindex.Entry, bucketindex.WantOutcome, error) {
+	complete, remotes := r.s.completeOwners(r.tid)
+
+	absent := bucketindex.WantIncomplete
+	if complete {
+		absent = bucketindex.WantAbsent
 	}
 
-	return r.s.cluster.psync.FetchWant(ctx, r.prefix, remotes, w)
+	if len(remotes) == 0 {
+		return bucketindex.Entry{}, absent, nil
+	}
+
+	ent, ok, err := r.s.cluster.psync.FetchWant(ctx, r.prefix, remotes, w)
+
+	switch {
+	case err != nil:
+		return bucketindex.Entry{}, bucketindex.WantIncomplete, err
+	case ok:
+		return ent, bucketindex.WantSatisfied, nil
+	default:
+		return bucketindex.Entry{}, absent, nil
+	}
+}
+
+// completeOwners reports the shard's remote owners and whether they are the whole expected owner
+// set — the ring named as many owners as the replication factor asks for, every one of them
+// resolved to an address, and this node is one of them.
+func (s *Storage) completeOwners(shardKey signal.TenantID) (complete bool, remotes []string) {
+	cn := s.cluster
+
+	var local, unresolved int
+
+	owners := s.ownerLookup(shardKey)
+	for _, o := range owners {
+		addr := cn.membership.AddrOf(o.ID)
+
+		switch {
+		case addr == cn.self:
+			local++
+		case addr != "":
+			remotes = append(remotes, addr)
+		default:
+			unresolved++
+		}
+	}
+
+	complete = local > 0 && unresolved == 0 && len(owners) >= s.rfFor(shardKey)
+
+	return complete, remotes
 }
 
 // repairerFor returns the repair seam for one engine, or nil where there is nothing to repair

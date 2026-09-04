@@ -46,6 +46,7 @@ type Obs struct {
 	RPC       *RPC
 	Cluster   *Cluster
 	Disk      *Disk
+	Repair    *Repair
 }
 
 // New builds the observability handle, defaulting each unset pillar to its no-op implementation.
@@ -113,6 +114,11 @@ func New(cfg Config) (*Obs, error) {
 		return nil, err
 	}
 
+	repair, err := newRepair(meter)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Obs{
 		Log:       log,
 		Tracer:    tp.Tracer(scope),
@@ -127,6 +133,7 @@ func New(cfg Config) (*Obs, error) {
 		RPC:       rpc,
 		Cluster:   cl,
 		Disk:      disk,
+		Repair:    repair,
 	}, nil
 }
 

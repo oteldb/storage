@@ -191,6 +191,14 @@ degrades into a silently partial result.
   drops it and records the want in the *same* commit, so the two halves cannot come apart; and only
   a definitive `backend.ErrNotExist` qualifies, because a backend that merely failed to answer says
   nothing about whether the data is there (`backend/ARCH.md`, `engine/ARCH.md`).
+- **An acknowledged loss is an entry, and it is monotone.** A want no owner of the shard can satisfy
+  becomes a *hole* — an `Entry` flagged as loss at the missing part's identity — which discharges
+  the want so reads resume, and raises the index's monotone `LostParts`. The flag rides on the entry
+  every reader already carries, so a hole can never be mistaken for an empty part. Two guards stand
+  between a want and a hole, both because a hole over live data is unrecoverable while an
+  outstanding want is not: the peer set must be the shard's *complete expected* owner set, and the
+  conclusion must repeat over consecutive repair passes. A hole is revoked by the part turning up on
+  any owner; the loss count never falls (`engine/ARCH.md`, `cluster/ARCH.md`).
 - **A part id is globally unique** (both engines). A part's backend key is `{enginePrefix}/{partid}`,
   where `partid` is a minted ULID-shaped id (`internal/partid`), not a per-node counter: replicas of a
   shard can share one object store under one prefix, so only an id no local state participates in

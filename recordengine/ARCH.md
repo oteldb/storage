@@ -215,9 +215,11 @@ their replacement is committed. See [`../engine/ARCH.md`](../engine/ARCH.md), "P
 serves stay the same set; the adopted parts are readable but not owned. See
 [`../engine/ARCH.md`](../engine/ARCH.md), "Adopted parts".
 
-**Repair** is identical to the metric engine, down to `Config.Repair` and the satisfaction rule
-(the exact part, or the largest containing part at a higher level). See
-[`../engine/ARCH.md`](../engine/ARCH.md), "Repair — a want is discharged by committing a part".
+**Repair** is identical to the metric engine, down to `Config.Repair`, the satisfaction rule (the
+exact part, or the largest containing part at a higher level), and the two gates a want must clear
+before its loss is acknowledged as a revocable hole. See [`../engine/ARCH.md`](../engine/ARCH.md),
+"Repair — a want is discharged by committing a part" and "An unrepairable want becomes a revocable
+hole".
 
 ## Part identity & orphans
 

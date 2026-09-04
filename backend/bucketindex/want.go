@@ -17,7 +17,9 @@ import "slices"
 const MaxWants = MaxRemovals
 
 // Want is a part this writer holds in its index but cannot read, and the generation at which it
-// discovered that.
+// discovered that. It carries the whole of the lost entry's identity, because repair has to hand
+// that identity back: either as the part fetched from a peer, or — when no owner has it — as the
+// hole committed in its place (see [Index.RecordHole]).
 //
 // Blocks is the interval the missing part covered: any part containing it at a higher level
 // satisfies the want, because the data is inside that successor (see [Index.Satisfying]). It is
@@ -27,9 +29,27 @@ const MaxWants = MaxRemovals
 // A want is an obligation with a completion condition, which is why it is not a [Removal]: a
 // removal is terminal, and conflating them would make "am I repaired?" unanswerable.
 type Want struct {
-	Prefix     string
-	Blocks     Interval
-	Generation Generation
+	Prefix           string
+	Blocks           Interval
+	Level            uint32
+	MinTime, MaxTime int64
+	Generation       Generation
+}
+
+// WantOf is the repair obligation a lost entry owes, discovered at generation g.
+func WantOf(e Entry, g Generation) Want {
+	return Want{
+		Prefix: e.Prefix, Blocks: e.Blocks, Level: e.Level,
+		MinTime: e.MinTime, MaxTime: e.MaxTime, Generation: g,
+	}
+}
+
+// Entry is the index entry the want owes: the identity of the part that went missing.
+func (w Want) Entry() Entry {
+	return Entry{
+		Prefix: w.Prefix, MinTime: w.MinTime, MaxTime: w.MaxTime,
+		Blocks: w.Blocks, Level: w.Level,
+	}
 }
 
 // RecordWant records that prefix is missing and must be repaired, replacing any earlier want for
@@ -82,7 +102,7 @@ func TrimWants(wants []Want, live []Entry, keep int) (kept, dropped []Want) {
 
 	out := wants[:0]
 	for _, w := range wants {
-		if _, ok := ix.Satisfying(w); ok {
+		if _, ok := ix.Discharging(w); ok {
 			continue
 		}
 

@@ -139,14 +139,15 @@ type Config struct {
 // and commit it back into the index. It is the engine's whole view of the cluster during repair:
 // a part identity in, the entry of the part that was actually copied out.
 //
-// Returning ok=false with a nil error means no peer holds a part satisfying the want — definitive
-// absence, which leaves the want outstanding. Any error is transient (a peer that could not be
-// reached says nothing about whether the data exists), and the want is retried on the next merge.
+// The outcome qualifies a fetch that brought nothing back, and the qualification is what decides
+// whether the owner may ever conclude the data is gone — see [bucketindex.WantOutcome]. Any error is transient
+// (a peer that could not be reached says nothing about whether the data exists), and the want is
+// retried on the next merge.
 //
 // The entry need not name the wanted prefix: a peer that has merged the part away answers with the
 // successor containing it, which is what makes repair terminate.
 type PartFetcher interface {
-	FetchWant(ctx context.Context, w bucketindex.Want) (bucketindex.Entry, bool, error)
+	FetchWant(ctx context.Context, w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error)
 }
 
 // DefaultMetricBlockRows is the metric part block size used when [Config.MetricBlockRows] is 0. It
@@ -218,6 +219,23 @@ type Engine struct {
 	// holds an entry for but cannot read. They ride every commit like removals, and are discharged
 	// only by committing a part that satisfies them (see repair.go).
 	wants []bucketindex.Want
+	// holes are the acknowledged losses carried in this engine's index: wants no owner could
+	// supply, committed as entries with [bucketindex.Entry.Hole] set so a read, an operator and
+	// the next repair pass all see them. They are kept out of e.parts — a hole names no objects
+	// and there is nothing to open.
+	holes []bucketindex.Entry
+	// holeEvidence counts, per want prefix, the consecutive repair attempts that concluded
+	// definitive absence over the shard's complete owner set; any other outcome resets it. It is
+	// deliberately in memory: a restart forgets the evidence and repair has to earn it again,
+	// which errs toward leaving a want outstanding rather than toward inventing a hole.
+	holeEvidence map[string]int
+	// lostParts is the index's monotone data-loss counter, carried across commits and raised to a
+	// rival's on rebase, so it is a cluster-visible fact and not a level a restart clears.
+	lostParts uint64
+	// pendingHoles are the losses the next commit must acknowledge. Like pendingWants they are
+	// held rather than applied on the spot, so a commit that never lands leaves the want
+	// outstanding instead of half-discharged.
+	pendingHoles []bucketindex.Want
 	// pendingWants are the ones a load discovered and the next commit must add. Keeping the
 	// discovery pending rather than committing it on the spot is what makes dropping the entry and
 	// recording the want one CAS commit instead of two.
@@ -472,6 +490,17 @@ type Stats struct {
 	// OutOfSpace is set while the engine refuses writes because its backend is out of bytes or
 	// inodes. Reads still answer from what is on disk; it clears when a flush finds room again.
 	OutOfSpace bool
+	// WantedParts is the repair obligations outstanding right now: parts the index names that this
+	// node cannot read and has not yet got back. Non-zero means the shard is not fully repaired.
+	WantedParts int
+	// Holes is the index entries that stand for an acknowledged loss rather than a part (see
+	// [bucketindex.Entry.Hole]). A read overlapping one is short by whatever that part held, so a
+	// hole is reported apart from Parts and never counted among them.
+	Holes int
+	// LostParts is the shard's monotone data-loss count as its index records it: the holes its
+	// writers have ever committed, including ones since revoked. It never decreases, and every
+	// owner of the shard reads the same number.
+	LostParts uint64
 }
 
 // Stats returns an in-memory snapshot of the engine's state under a single read lock. It does no
@@ -488,6 +517,9 @@ func (e *Engine) Stats() Stats {
 		HeadAge:       e.head.age(),
 		IdentityBytes: e.head.identityBytes(),
 		Parts:         len(e.parts),
+		WantedParts:   len(e.wants) + len(e.pendingWants),
+		Holes:         len(e.holes),
+		LostParts:     e.lostParts,
 		MaxTime:       e.head.newest,
 	}
 

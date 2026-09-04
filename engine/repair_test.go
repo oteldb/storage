@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/go-faster/errors"
@@ -18,18 +19,31 @@ import (
 // and answers with whatever the test staged, so the engine half of the seam is exercised without a
 // peer, a transport or a syncer.
 type fakeFetcher struct {
+	// mu guards asked: repair runs up to repairFetchConcurrency fetches at once.
+	mu     sync.Mutex
 	asked  []string
-	answer func(w bucketindex.Want) (bucketindex.Entry, bool, error)
+	answer func(w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error)
 }
 
-func (f *fakeFetcher) FetchWant(_ context.Context, w bucketindex.Want) (bucketindex.Entry, bool, error) {
+func (f *fakeFetcher) FetchWant(_ context.Context, w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
+	f.mu.Lock()
 	f.asked = append(f.asked, w.Prefix)
+	answer := f.answer
+	f.mu.Unlock()
 
-	if f.answer == nil {
-		return bucketindex.Entry{}, false, nil
+	if answer == nil {
+		return bucketindex.Entry{}, bucketindex.WantAbsent, nil
 	}
 
-	return f.answer(w)
+	return answer(w)
+}
+
+// asks reports what repair has asked for, in call order.
+func (f *fakeFetcher) asks() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return slices.Clone(f.asked)
 }
 
 func newRepairEngine(t *testing.T, be backend.Backend, r engine.PartFetcher) *engine.Engine {
@@ -114,15 +128,15 @@ func TestRepairFetchesWantedPartFromPeer(t *testing.T) {
 	dropObjects(t, be, lost)
 	e.LosePart(lost, bucketindex.Interval{Min: 1, Max: 1})
 
-	f.answer = func(w bucketindex.Want) (bucketindex.Entry, bool, error) {
+	f.answer = func(w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
 		copyObjects(t, peer, be, w.Prefix)
 
-		return bucketindex.Entry{Prefix: w.Prefix, MinTime: 100, MaxTime: 100, Blocks: w.Blocks}, true, nil
+		return bucketindex.Entry{Prefix: w.Prefix, MinTime: 100, MaxTime: 100, Blocks: w.Blocks}, bucketindex.WantSatisfied, nil
 	}
 
 	require.NoError(t, e.Merge(ctx, 0))
 
-	assert.Equal(t, []string{lost}, f.asked)
+	assert.Equal(t, []string{lost}, f.asks())
 	assert.Empty(t, e.WantPrefixes(), "committing the part is what discharges the want")
 	assert.Equal(t, int64(1), e.RepairStats().Fetched)
 
@@ -164,18 +178,18 @@ func TestRepairDischargedByContainingSuccessor(t *testing.T) {
 	require.Len(t, peerParts, 1)
 	successor := peerParts[0]
 
-	f.answer = func(bucketindex.Want) (bucketindex.Entry, bool, error) {
+	f.answer = func(bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
 		copyObjects(t, peerBE, be, successor)
 
 		return bucketindex.Entry{
 			Prefix: successor, MinTime: 100, MaxTime: 200,
 			Blocks: bucketindex.Interval{Min: 1, Max: 2}, Level: 1,
-		}, true, nil
+		}, bucketindex.WantSatisfied, nil
 	}
 
 	require.NoError(t, e.Merge(ctx, 0))
 
-	assert.Equal(t, []string{lost}, f.asked, "repair asks for the want it holds")
+	assert.Equal(t, []string{lost}, f.asks(), "repair asks for the want it holds")
 	assert.Empty(t, e.WantPrefixes(), "a containing successor discharges the want")
 
 	local, err := be.List(ctx, lost)
@@ -209,7 +223,7 @@ func TestRepairDischargedByLocalPart(t *testing.T) {
 
 	require.NoError(t, e.Merge(ctx, 0))
 
-	assert.Empty(t, f.asked, "no network call for a want the local index covers")
+	assert.Empty(t, f.asks(), "no network call for a want the local index covers")
 	assert.Empty(t, e.WantPrefixes())
 	assert.Equal(t, int64(1), e.RepairStats().Local)
 }
@@ -222,8 +236,8 @@ func TestRepairNoPeerLeavesWant(t *testing.T) {
 	ctx := context.Background()
 	be := backend.Memory()
 
-	f := &fakeFetcher{answer: func(bucketindex.Want) (bucketindex.Entry, bool, error) {
-		return bucketindex.Entry{}, false, nil
+	f := &fakeFetcher{answer: func(bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
+		return bucketindex.Entry{}, bucketindex.WantAbsent, nil
 	}}
 	e := newRepairEngine(t, be, f)
 
@@ -248,8 +262,8 @@ func TestRepairTransientFailureKeepsWant(t *testing.T) {
 	ctx := context.Background()
 	be := backend.Memory()
 
-	f := &fakeFetcher{answer: func(bucketindex.Want) (bucketindex.Entry, bool, error) {
-		return bucketindex.Entry{}, false, errors.New("peer unreachable")
+	f := &fakeFetcher{answer: func(bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
+		return bucketindex.Entry{}, bucketindex.WantIncomplete, errors.New("peer unreachable")
 	}}
 	e := newRepairEngine(t, be, f)
 

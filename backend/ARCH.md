@@ -166,6 +166,29 @@ a demonstration.
   boundaries. Because a forgotten want is a repair that never happens, `TrimWants` **returns** what
   the bound forced out instead of dropping it silently: overflow escalates to a reseed, it does not
   lose the obligation.
+- **A hole is an entry, not a side list.** When no owner can supply a wanted part, the owner commits
+  `Entry{Hole: true}` at that part's identity (`RecordHole`): the hole enters `Entries`, the want
+  leaves `Wanted`, and the monotone `Index.LostParts` rises — one mutation, so one CAS commit
+  carries all three or none of them. The flag lives on the entry because every reader already
+  carries the entry: a read path that forgot to join a side list would see an ordinary empty part
+  and answer short, which is exactly the silent loss the acknowledgement exists to prevent.
+  `Entry.Data()` is the one-word test, and `Index.Holes()` the enumeration.
+- **A hole discharges a want; it never satisfies one.** `Index.Satisfying` admits only data-bearing
+  entries — it is the question a peer is asked, and answering it with a hole would spread an
+  acknowledged loss from one owner to the next. `Index.Discharging` is the weaker question, "is this
+  obligation over", and is what `TrimWants` uses so reads resume once the loss is acknowledged.
+- **A hole is revocable.** The commit is not cross-replica atomic (unlike ClickHouse's
+  `createEmptyPartInsteadOfLost`, which checks non-existence on every replica in one transaction),
+  so an owner may acknowledge a loss while a peer still holds the data. `Revokes` therefore replaces
+  a hole with any data-bearing entry at the same prefix or any successor containing its blocks, and
+  `TrimHoles` runs on every commit — so a repair fetch, a rival's adopted entry and a merge all
+  revoke it as a side effect. `NextBlock` counts a hole's interval, because the part it stands for
+  may yet come back and two parts must never claim one identity.
+- **`LostParts` is monotone and cluster-visible.** It is carried forward across commits and raised
+  to the maximum on rebase, never lowered — a revoked hole leaves the count where it was. Data loss
+  is a fact, not a level: a per-node gauge that a restart or a successful repair clears erases the
+  only record that a range of a shard was ever acknowledged as gone. It follows ClickHouse's
+  `/lost_part_count`.
 - **Format v5 is a hard read break.** `Decode` rejects any version above the one it knows, so
   reading is backward compatible (v1–v4 still decode, unset fields ordering below everything a
   writer produces) but **writing is not**: a node on pre-v5 code fails on the first v5 index it

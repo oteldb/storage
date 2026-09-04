@@ -32,11 +32,18 @@ func (e *Engine) LosePart(prefix string, blocks bucketindex.Interval) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	ent := bucketindex.Entry{Prefix: prefix, Blocks: blocks}
+	for _, p := range e.parts {
+		if p.prefix == prefix {
+			ent.MinTime, ent.MaxTime, ent.Level = p.minTime, p.maxTime, p.level
+		}
+	}
+
 	e.parts = replaceParts(e.parts, map[string]struct{}{prefix: {}})
 	delete(e.indexed, prefix)
 
 	ix := bucketindex.Index{Wanted: e.wants}
-	ix.RecordWant(bucketindex.Want{Prefix: prefix, Blocks: blocks, Generation: e.generation})
+	ix.RecordWant(bucketindex.WantOf(ent, e.generation))
 	e.wants = ix.Wanted
 }
 
