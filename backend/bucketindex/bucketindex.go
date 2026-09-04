@@ -11,6 +11,7 @@ package bucketindex
 import (
 	"context"
 	"encoding/binary"
+	"math"
 	"slices"
 	"strings"
 
@@ -30,6 +31,12 @@ type Entry struct {
 	Prefix  string
 	MinTime int64
 	MaxTime int64
+	// Blocks is the interval of block numbers this part covers and Level its merge depth: a flush
+	// writes [n, n] at level 0, a merge over parts spanning [a … b] writes [a, b] above it. The two
+	// together make supersession decidable from identity alone — see [Entry.Supersedes]. Both are
+	// unset in a part written before format v5, which carries neither. Added in format v5.
+	Blocks Interval
+	Level  uint32
 }
 
 // Index is the set of parts under a prefix, kept sorted by [Entry.Prefix]. The zero value is
@@ -52,6 +59,10 @@ type Index struct {
 	// is the whole of why the watermark cannot be a single number. Kept sorted by writer id.
 	// Added in format v4.
 	Epochs []WriterEpoch
+	// Wanted are the parts this writer holds no readable copy of and owes a repair for — see
+	// [Want]. Kept sorted by prefix. A part leaves [Index.Entries] only into [Index.Removed] or
+	// into here. Added in format v5.
+	Wanted []Want
 }
 
 // Add inserts e, replacing any existing entry with the same prefix, keeping the index sorted.
@@ -98,9 +109,14 @@ func (ix *Index) Overlapping(start, end int64) []Entry {
 const (
 	magic0, magic1 = 'B', 'I'
 
-	// v4 appends the per-writer flush watermarks; v3 (Generation + Removed), v2 (the anonymous
-	// epoch only) and v1 (neither) still decode.
-	version = 4
+	// v5 carries the block interval and level on each entry and appends the wanted list; v4 (the
+	// per-writer flush watermarks), v3 (Generation + Removed), v2 (the anonymous epoch only) and
+	// v1 (neither) still decode.
+	//
+	// Reading is backward compatible; writing is not. [Decode] rejects any version above this one,
+	// so a node on pre-v5 code cannot read an index this one writes: every node that reads a given
+	// index must be upgraded together. See backend/ARCH.md for the blast radius per deployment.
+	version = 5
 )
 
 // AppendBinary appends the versioned binary encoding of the index to dst (append-style for
@@ -114,6 +130,9 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 		dst = append(dst, e.Prefix...)
 		dst = binary.AppendVarint(dst, e.MinTime)
 		dst = binary.AppendVarint(dst, e.MaxTime)
+		dst = binary.AppendUvarint(dst, e.Blocks.Min)
+		dst = binary.AppendUvarint(dst, e.Blocks.Max)
+		dst = binary.AppendUvarint(dst, uint64(e.Level))
 	}
 
 	dst = binary.AppendUvarint(dst, ix.FlushedEpoch)
@@ -139,6 +158,17 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 		dst = binary.AppendUvarint(dst, w.Generation.Counter)
 	}
 
+	dst = binary.AppendUvarint(dst, uint64(len(ix.Wanted)))
+	for i := range ix.Wanted {
+		w := &ix.Wanted[i]
+		dst = binary.AppendUvarint(dst, uint64(len(w.Prefix)))
+		dst = append(dst, w.Prefix...)
+		dst = binary.AppendUvarint(dst, w.Blocks.Min)
+		dst = binary.AppendUvarint(dst, w.Blocks.Max)
+		dst = binary.AppendUvarint(dst, w.Generation.Term)
+		dst = binary.AppendUvarint(dst, w.Generation.Counter)
+	}
+
 	return dst
 }
 
@@ -157,42 +187,12 @@ func Decode(data []byte) (*Index, error) {
 		return nil, errors.Wrapf(ErrCorrupt, "unsupported version %d", ver)
 	}
 
-	buf := data[3:]
-
-	n, m := binary.Uvarint(buf)
-	if m <= 0 {
-		return nil, errors.Wrap(ErrCorrupt, "bad count")
-	}
-	buf = buf[m:]
-
-	// Guard against a bogus count claiming more entries than the buffer could hold (each
-	// entry is ≥ 3 bytes: a length, and two varint times).
-	if n > uint64(len(buf)) {
-		return nil, errors.Wrap(ErrCorrupt, "count exceeds input")
+	entries, buf, err := decodeEntries(data[3:], ver)
+	if err != nil {
+		return nil, err
 	}
 
-	ix := &Index{Entries: make([]Entry, 0, n)}
-	for range n {
-		var e Entry
-
-		l, m := binary.Uvarint(buf)
-		if m <= 0 || l > uint64(len(buf)-m) {
-			return nil, errors.Wrap(ErrCorrupt, "bad prefix length")
-		}
-		buf = buf[m:]
-		e.Prefix = string(buf[:l])
-		buf = buf[l:]
-
-		var ok bool
-		if e.MinTime, buf, ok = readVarint(buf); !ok {
-			return nil, errors.Wrap(ErrCorrupt, "bad min time")
-		}
-		if e.MaxTime, buf, ok = readVarint(buf); !ok {
-			return nil, errors.Wrap(ErrCorrupt, "bad max time")
-		}
-
-		ix.Entries = append(ix.Entries, e)
-	}
+	ix := &Index{Entries: entries}
 
 	// v2+ appends the flush-epoch watermark; v1 has none (it stays 0).
 	if ver >= 2 {
@@ -234,32 +234,168 @@ func Decode(data []byte) (*Index, error) {
 
 	// v4+ appends the named writers' watermarks; earlier versions carry only the anonymous slot.
 	if ver >= 4 {
-		epochs, err := decodeWriterEpochs(buf)
+		epochs, rest, err := decodeWriterEpochs(buf)
 		if err != nil {
 			return nil, err
 		}
 
 		ix.Epochs = epochs
+		buf = rest
+	}
+
+	// v5+ appends the outstanding repair obligations; earlier versions could not express one.
+	if ver >= 5 {
+		wanted, err := decodeWants(buf)
+		if err != nil {
+			return nil, err
+		}
+
+		ix.Wanted = wanted
 	}
 
 	return ix, nil
 }
 
-// decodeWriterEpochs parses the per-writer watermark slots, bounding the count by what the buffer
-// could hold as the entry and removal counts are.
-func decodeWriterEpochs(buf []byte) ([]WriterEpoch, error) {
+// decodeEntries parses the part list, bounding the count by what the buffer could hold as the
+// removal and writer counts are.
+func decodeEntries(buf []byte, ver uint8) ([]Entry, []byte, error) {
 	n, m := binary.Uvarint(buf)
 	if m <= 0 {
-		return nil, errors.Wrap(ErrCorrupt, "bad writer count")
+		return nil, nil, errors.Wrap(ErrCorrupt, "bad count")
+	}
+	buf = buf[m:]
+
+	// Guard against a bogus count claiming more entries than the buffer could hold (each
+	// entry is ≥ 3 bytes: a length, and two varint times).
+	if n > uint64(len(buf)) {
+		return nil, nil, errors.Wrap(ErrCorrupt, "count exceeds input")
+	}
+
+	if n == 0 {
+		return nil, buf, nil // nil, not an empty slice, so encode∘decode is the identity
+	}
+
+	out := make([]Entry, 0, n)
+	for range n {
+		var (
+			e  Entry
+			ok bool
+		)
+
+		l, m := binary.Uvarint(buf)
+		if m <= 0 || l > uint64(len(buf)-m) {
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad prefix length")
+		}
+		buf = buf[m:]
+		e.Prefix = string(buf[:l])
+		buf = buf[l:]
+
+		if e.MinTime, buf, ok = readVarint(buf); !ok {
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad min time")
+		}
+		if e.MaxTime, buf, ok = readVarint(buf); !ok {
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad max time")
+		}
+
+		// v5+ carries the block identity inline; earlier entries leave it unset, which takes part
+		// in no containment (see [Interval.Valid]).
+		if ver >= 5 {
+			if buf, ok = decodeBlockIdentity(buf, &e); !ok {
+				return nil, nil, errors.Wrap(ErrCorrupt, "bad block identity")
+			}
+		}
+
+		out = append(out, e)
+	}
+
+	return out, buf, nil
+}
+
+func decodeBlockIdentity(buf []byte, e *Entry) ([]byte, bool) {
+	var ok bool
+	if e.Blocks.Min, buf, ok = readUvarint(buf); !ok {
+		return nil, false
+	}
+	if e.Blocks.Max, buf, ok = readUvarint(buf); !ok {
+		return nil, false
+	}
+
+	level, buf, ok := readUvarint(buf)
+	if !ok || level > math.MaxUint32 {
+		return nil, false
+	}
+
+	e.Level = uint32(level)
+
+	return buf, true
+}
+
+// decodeWants parses the wanted list, bounding the count by what the buffer could hold as the
+// entry and removal counts are.
+func decodeWants(buf []byte) ([]Want, error) {
+	n, m := binary.Uvarint(buf)
+	if m <= 0 {
+		return nil, errors.Wrap(ErrCorrupt, "bad want count")
 	}
 	buf = buf[m:]
 
 	if n > uint64(len(buf)) {
-		return nil, errors.Wrap(ErrCorrupt, "writer count exceeds input")
+		return nil, errors.Wrap(ErrCorrupt, "want count exceeds input")
 	}
 
 	if n == 0 {
 		return nil, nil // nil, not an empty slice, so encode∘decode is the identity
+	}
+
+	out := make([]Want, 0, n)
+	for range n {
+		var (
+			w  Want
+			ok bool
+		)
+
+		l, m := binary.Uvarint(buf)
+		if m <= 0 || l > uint64(len(buf)-m) {
+			return nil, errors.Wrap(ErrCorrupt, "bad want prefix length")
+		}
+		buf = buf[m:]
+		w.Prefix = string(buf[:l])
+		buf = buf[l:]
+
+		if w.Blocks.Min, buf, ok = readUvarint(buf); !ok {
+			return nil, errors.Wrap(ErrCorrupt, "bad want block min")
+		}
+		if w.Blocks.Max, buf, ok = readUvarint(buf); !ok {
+			return nil, errors.Wrap(ErrCorrupt, "bad want block max")
+		}
+		if w.Generation.Term, buf, ok = readUvarint(buf); !ok {
+			return nil, errors.Wrap(ErrCorrupt, "bad want term")
+		}
+		if w.Generation.Counter, buf, ok = readUvarint(buf); !ok {
+			return nil, errors.Wrap(ErrCorrupt, "bad want counter")
+		}
+
+		out = append(out, w)
+	}
+
+	return out, nil
+}
+
+// decodeWriterEpochs parses the per-writer watermark slots, bounding the count by what the buffer
+// could hold as the entry and removal counts are.
+func decodeWriterEpochs(buf []byte) ([]WriterEpoch, []byte, error) {
+	n, m := binary.Uvarint(buf)
+	if m <= 0 {
+		return nil, nil, errors.Wrap(ErrCorrupt, "bad writer count")
+	}
+	buf = buf[m:]
+
+	if n > uint64(len(buf)) {
+		return nil, nil, errors.Wrap(ErrCorrupt, "writer count exceeds input")
+	}
+
+	if n == 0 {
+		return nil, buf, nil // nil, not an empty slice, so encode∘decode is the identity
 	}
 
 	out := make([]WriterEpoch, 0, n)
@@ -268,31 +404,31 @@ func decodeWriterEpochs(buf []byte) ([]WriterEpoch, error) {
 
 		l, m := binary.Uvarint(buf)
 		if m <= 0 || l > uint64(len(buf)-m) {
-			return nil, errors.Wrap(ErrCorrupt, "bad writer length")
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad writer length")
 		}
 		buf = buf[m:]
 		w.Writer = string(buf[:l])
 		buf = buf[l:]
 
 		if w.Epoch, m = binary.Uvarint(buf); m <= 0 {
-			return nil, errors.Wrap(ErrCorrupt, "bad writer epoch")
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad writer epoch")
 		}
 		buf = buf[m:]
 
 		if w.Generation.Term, m = binary.Uvarint(buf); m <= 0 {
-			return nil, errors.Wrap(ErrCorrupt, "bad writer term")
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad writer term")
 		}
 		buf = buf[m:]
 
 		if w.Generation.Counter, m = binary.Uvarint(buf); m <= 0 {
-			return nil, errors.Wrap(ErrCorrupt, "bad writer counter")
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad writer counter")
 		}
 		buf = buf[m:]
 
 		out = append(out, w)
 	}
 
-	return out, nil
+	return out, buf, nil
 }
 
 // decodeRemovals parses the tombstone list, defensively: the count is bounded by what the buffer
@@ -306,6 +442,10 @@ func decodeRemovals(buf []byte) ([]Removal, []byte, error) {
 
 	if n > uint64(len(buf)) {
 		return nil, nil, errors.Wrap(ErrCorrupt, "removal count exceeds input")
+	}
+
+	if n == 0 {
+		return nil, buf, nil // nil, not an empty slice, so encode∘decode is the identity
 	}
 
 	out := make([]Removal, 0, n)
@@ -334,6 +474,15 @@ func decodeRemovals(buf []byte) ([]Removal, []byte, error) {
 	}
 
 	return out, buf, nil
+}
+
+func readUvarint(buf []byte) (uint64, []byte, bool) {
+	v, m := binary.Uvarint(buf)
+	if m <= 0 {
+		return 0, buf, false
+	}
+
+	return v, buf[m:], true
 }
 
 func readVarint(buf []byte) (int64, []byte, bool) {
