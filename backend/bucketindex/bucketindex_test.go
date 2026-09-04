@@ -79,9 +79,10 @@ func TestGoldenEncoding(t *testing.T) {
 		FlushedEpoch: 3,
 		Generation:   bucketindex.Generation{Term: 4, Counter: 5},
 	}
-	// magic 'B','I', version 4, count 1, len 1, 'a', zigzag(1)=2, zigzag(2)=4, flushedEpoch 3,
-	// generation term 4, generation counter 5, removal count 0, writer-epoch count 0.
-	assert.Equal(t, []byte{'B', 'I', 4, 1, 1, 'a', 2, 4, 3, 4, 5, 0, 0}, ix.AppendBinary(nil))
+	// magic 'B','I', version 5, count 1, len 1, 'a', zigzag(1)=2, zigzag(2)=4, block min 0,
+	// block max 0, level 0, flushedEpoch 3, generation term 4, generation counter 5,
+	// removal count 0, writer-epoch count 0, want count 0.
+	assert.Equal(t, []byte{'B', 'I', 5, 1, 1, 'a', 2, 4, 0, 0, 0, 3, 4, 5, 0, 0, 0}, ix.AppendBinary(nil))
 }
 
 // TestDecodeV2Compat verifies a v2 index (epoch, no generation) decodes with a zero generation,
@@ -224,5 +225,6 @@ func FuzzDecode(f *testing.F) {
 		require.NoError(t, err)
 		assert.Equal(t, ix.Entries, again.Entries)
 		assert.Equal(t, ix.Epochs, again.Epochs)
+		assert.Equal(t, ix.Wanted, again.Wanted)
 	})
 }
