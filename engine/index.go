@@ -58,6 +58,8 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 			// engine's own list here, never while building an index that may not be written.
 			e.wants = ix.Wanted
 			e.pendingWants = nil
+			e.holes, e.lostParts = ix.Holes(), ix.LostParts
+			e.pendingHoles = nil
 
 			return nil
 		}
@@ -105,10 +107,25 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 
 	e.wants = merged.Wanted
 
+	// A rival's holes are this shard's losses too, and its loss count is a fact this commit must
+	// not walk back: the counter only ever rises.
+	e.holes = mergeHoles(e.holes, ix.Holes())
+	e.lostParts = max(e.lostParts, ix.LostParts)
+
 	e.foreign = foreignEntries(ix.Entries, e.indexed, e.removals, e.wants)
 	e.openForeignLocked(ctx)
 
 	return nil
+}
+
+// mergeHoles unions the holes a rival writer committed into this engine's, keyed by prefix.
+func mergeHoles(cur, other []bucketindex.Entry) []bucketindex.Entry {
+	ix := bucketindex.Index{Entries: slices.Clone(cur)}
+	for _, h := range other {
+		ix.Add(h)
+	}
+
+	return ix.Entries
 }
 
 // openForeignLocked opens the parts of the entries this engine adopted, so the part set it can
@@ -219,6 +236,24 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 		}
 	}
 
+	// A hole is revoked by the part turning up, so the trim runs against the entries this commit
+	// publishes: every path that commits the data back — a repair fetch, a rival's entry adopted
+	// under CAS, a merge — replaces the hole as a side effect of the commit. What survives counts
+	// as indexed, or the next commit would read it as a removal.
+	ix.LostParts = e.lostParts
+
+	for _, h := range bucketindex.TrimHoles(slices.Clone(e.holes), ix.Entries) {
+		ix.Add(h)
+		live[h.Prefix] = struct{}{}
+	}
+
+	// Acknowledging a loss is one index mutation, so the hole, the want it discharges and the
+	// data-loss counter all land in the same CAS commit — or none of them do.
+	for _, w := range e.pendingHoles {
+		live[w.Prefix] = struct{}{}
+		ix.RecordHole(w)
+	}
+
 	e.removals = bucketindex.TrimRemovals(e.removals, live, bucketindex.MaxRemovals)
 	ix.Removed = e.removals
 	e.indexed = live
@@ -261,6 +296,12 @@ func foreignEntries(
 	var out []bucketindex.Entry
 
 	for _, e := range entries {
+		// A hole is carried through [Engine.holes], which is also what re-attempts and revokes it;
+		// letting one in here would commit it twice and try to open objects that do not exist.
+		if e.Hole {
+			continue
+		}
+
 		if _, ours := indexed[e.Prefix]; ours {
 			continue
 		}
@@ -321,9 +362,20 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 
 	parts := make([]*part, 0, len(ix.Entries))
 
-	var lost []bucketindex.Want
+	var (
+		holes []bucketindex.Entry
+		lost  []bucketindex.Want
+	)
 
 	for _, ent := range ix.Entries {
+		// A hole names no objects, so there is nothing to open: it is carried as what it is, an
+		// acknowledged loss the next repair pass re-attempts.
+		if ent.Hole {
+			holes = append(holes, ent)
+
+			continue
+		}
+
 		p, err := openPart(ctx, e.cfg.Backend, ent.Prefix)
 		if err != nil {
 			if !sweep || !partGone(err) {
@@ -333,14 +385,17 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 			zctx.From(ctx).Error("part named by the index is gone; recording a repair",
 				zap.String("prefix", ent.Prefix), zap.Error(err))
 
-			lost = append(lost, bucketindex.Want{Prefix: ent.Prefix, Blocks: ent.Blocks})
+			lost = append(lost, bucketindex.WantOf(ent, e.generation))
 
 			continue
 		}
 
 		p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
+		p.blocks, p.level = ent.Blocks, ent.Level
 		parts = append(parts, p)
 	}
+
+	e.holes, e.lostParts = holes, ix.LostParts
 
 	// A part disappearing means identities may have died with it, which is what arms the identity
 	// prune on a node that never merges (a replica adopting the owner's part set).

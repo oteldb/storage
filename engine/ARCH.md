@@ -501,6 +501,43 @@ would spend the maintenance cycle in the network and never compact; a shard need
 handful of parts back is past what part-by-part repair is for. The *serving* side is where the real
 budget belongs (see `cluster/ARCH.md`), and is not built yet.
 
+### An unrepairable want becomes a revocable hole
+
+A want no owner can satisfy would otherwise stay outstanding forever, and the shard would be
+permanently "not repaired" with no in-band way for an operator to accept the loss. So repair
+acknowledges it: it commits `Entry{Hole: true}` at the lost part's identity, which discharges the
+want and raises the index's monotone `LostParts` (`backend/ARCH.md`). Converting the want into a
+*removal* instead would terminate just as cleanly and destroy the evidence — the part would become
+indistinguishable from a deliberate deletion, which is the ambiguity wants exist to remove.
+
+**Two independent conditions gate the acknowledgement, because a hole over live data is worse than
+an outstanding want in every way that matters.** An outstanding want is visible and recoverable; a
+hole over data that was never lost is neither.
+
+1. **The peer set must be the shard's complete expected owner set.** `PartFetcher` answers with a
+   `bucketindex.WantOutcome`, and only `WantAbsent` — every expected owner answered, none had it —
+   is evidence. `WantIncomplete` means the peers asked were a strict subset: during a rolling
+   restart the deregistered owner drops out of the ring, and the two reachable peers lacking the
+   part says nothing about the third that holds it. The cluster layer decides this against the
+   *configured* replication factor, not against whatever the ring currently returns, so a cluster
+   permanently short of nodes never acknowledges a loss (`cluster/ARCH.md`).
+2. **The conclusion must repeat over `holeConfirmations` (3) consecutive attempts.** One pass is a
+   snapshot: a peer that is up, in the ring and has not finished loading its bucket index answers
+   "no such part" truthfully and prematurely. Any other outcome — a fetch, an error, an incomplete
+   owner set — resets the count. The evidence lives only in memory, so a restart forgets it and
+   repair earns it again; the bias is deliberately toward leaving the want outstanding.
+
+An error is never evidence at either gate: a peer that could not be reached says nothing about
+whether the data exists.
+
+**The hole is revocable and re-attempted.** Because the commit is not cross-replica atomic, an owner
+can acknowledge a loss while a peer still holds the part. So every repair pass targets the holes as
+well as the wants, and a hole is replaced by the part turning up — at its exact prefix, or inside a
+containing successor. Holes are held apart from `parts` (there is nothing to open) and re-read from
+the index on load, so an acknowledgement survives a restart. `LostParts` does not fall when a hole
+is revoked.
+
+
 ## Read path
 
 `Fetch` resolves matchers over the index, then merges each series' head buffer ∪ every part by

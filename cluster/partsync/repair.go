@@ -14,10 +14,17 @@ import (
 // every block it covered at a higher level — by pulling its objects from whichever peer holds it,
 // and returns that part's index entry.
 //
-// ok is false with a nil error only when every peer answered and none of them named a satisfying
-// part: definitive absence, which leaves the want outstanding rather than repaired. A peer that
-// could not be reached is a transient failure and is reported as an error, because the difference
-// decides whether the owner may ever conclude the data is gone.
+// ok is false with a nil error only when every peer *given to it* answered and none of them named
+// a satisfying part. A peer that could not be reached is a transient failure and is reported as an
+// error, because the difference decides whether the owner may ever conclude the data is gone.
+//
+// That is absence over the peers asked, not over the shard's owners, and the two coincide only
+// when the caller says so: only the caller knows the expected owner set (see
+// [bucketindex.WantIncomplete]). Acknowledging a loss on this answer alone would fabricate a hole
+// over an owner that is merely restarting.
+//
+// A peer's own hole never counts as a satisfying part — [bucketindex.Index.Satisfying] admits only
+// data-bearing entries — so an acknowledged loss cannot propagate from one owner to the next.
 //
 // The index is deliberately not installed: the caller commits the entry through its own index
 // commit, which is what discharges the want.

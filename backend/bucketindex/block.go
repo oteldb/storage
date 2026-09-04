@@ -72,13 +72,25 @@ func (ix *Index) NextBlock() uint64 {
 	return maxBlock + 1
 }
 
-// Satisfying returns the entry in this index that discharges w, if any: the part itself if the
-// index still holds it, otherwise the largest part containing every block w covers. Repair asks
-// this to decide whether a want is already met, and which part to fetch when it is not.
+// Satisfying returns the part in this index that holds w's data, if any: the part itself if the
+// index still has it, otherwise the largest part containing every block w covers. Repair asks this
+// to decide whether a want is already met by real data, and which part to fetch when it is not.
+//
+// A hole never satisfies: it is an acknowledgement that the data is gone, so answering a want with
+// one — or offering one to a peer repairing the same part — would spread the loss instead of
+// repairing it. Use [Index.Discharging] for the weaker question of whether the obligation is over.
 //
 // "Largest" is widest interval first, then highest level, then prefix, so the answer does not
 // depend on index order and a caller fetches the fewest objects for the most data.
-func (ix *Index) Satisfying(w Want) (Entry, bool) {
+func (ix *Index) Satisfying(w Want) (Entry, bool) { return ix.satisfying(w, Entry.Data) }
+
+// Discharging returns the entry that ends w as an obligation: a part satisfying it, or the hole
+// committed in its place. It is what decides a want is no longer outstanding.
+func (ix *Index) Discharging(w Want) (Entry, bool) {
+	return ix.satisfying(w, func(Entry) bool { return true })
+}
+
+func (ix *Index) satisfying(w Want, admit func(Entry) bool) (Entry, bool) {
 	var (
 		best  Entry
 		found bool
@@ -86,6 +98,10 @@ func (ix *Index) Satisfying(w Want) (Entry, bool) {
 
 	for i := range ix.Entries {
 		e := ix.Entries[i]
+		if !admit(e) {
+			continue
+		}
+
 		if e.Prefix == w.Prefix {
 			return e, true
 		}

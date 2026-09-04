@@ -324,6 +324,26 @@ publish an index entry naming that part, and a part it could not fully copy must
 The pull direction means the **serving** side is what a real budget has to cap — N recovering nodes
 converge on whichever peers hold the data — which is not built yet.
 
+A peer's own hole is never offered: `Index.Satisfying` admits only data-bearing entries, so one
+owner's acknowledged loss cannot become another's.
+
+### Absence over the owners, not over whoever answered
+
+`Syncer.FetchWant` reports absence over the peers it was *given*. Whether those peers are the
+shard's owners is `partRepairer`'s to establish (`cluster_repair.go`), and it is what decides
+whether the engine may ever acknowledge a loss (`engine/ARCH.md`, "An unrepairable want becomes a
+revocable hole"). `completeOwners` requires all three of: the ring named at least as many owners as
+the tenant's replication factor, every one of them resolved to an address, and this node is among
+them. Anything less is `bucketindex.WantIncomplete`.
+
+The bar is the **configured** replication factor rather than the ring's current answer, and the
+asymmetry is deliberate. A rolling restart deregisters the restarting owner, so the ring shrinks and
+the peers that answer are a strict subset of the owners — exactly when a naive reading would
+fabricate a hole over live data. The cost is that a cluster permanently running fewer nodes than its
+RF never acknowledges a loss at all; that is the safe direction, because an outstanding want is a
+visible, recoverable state and a hole over live data is neither. ClickHouse's
+`searchForMissingPartOnOtherReplicas` scans every replica, live *and* dead, for the same reason.
+
 ## `ec` — erasure coding
 
 Per-tenant policy (`tenant.Durability.EC`, an age tier like recompression, so recent data stays

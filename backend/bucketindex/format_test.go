@@ -27,9 +27,13 @@ func fullV5Index() *bucketindex.Index {
 			{
 				Prefix:     "x",
 				Blocks:     bucketindex.Interval{Min: 5, Max: 5},
+				Level:      1,
+				MinTime:    13,
+				MaxTime:    14,
 				Generation: bucketindex.Generation{Term: 11, Counter: 12},
 			},
 		},
+		LostParts: 15,
 	}
 }
 
@@ -40,12 +44,13 @@ func TestGoldenV5(t *testing.T) {
 
 	want := []byte{
 		'B', 'I', 5,
-		1, 1, 'a', 2, 4, 1, 4, 2, // one entry: prefix, zigzag times, blocks [1,4], level 2
+		1, 1, 'a', 2, 4, 1, 4, 2, 0, // one entry: prefix, zigzag times, blocks [1,4], level 2, flags
 		3,    // flushed epoch
 		4, 5, // generation
 		1, 1, 'r', 6, 7, // one removal
 		1, 1, 'w', 8, 9, 10, // one writer epoch
-		1, 1, 'x', 5, 5, 11, 12, // one want: prefix, blocks [5,5], generation
+		1, 1, 'x', 5, 5, 1, 26, 28, 11, 12, // one want: prefix, blocks, level, zigzag times, gen
+		15, // lost parts
 	}
 	assert.Equal(t, want, fullV5Index().AppendBinary(nil))
 }
@@ -92,7 +97,7 @@ func TestDecodeAllVersions(t *testing.T) {
 		2: {'B', 'I', 2, 1, 1, 'a', 2, 4, 3},
 		3: {'B', 'I', 3, 1, 1, 'a', 2, 4, 3, 4, 5, 0},
 		4: {'B', 'I', 4, 1, 1, 'a', 2, 4, 3, 4, 5, 0, 0},
-		5: {'B', 'I', 5, 1, 1, 'a', 2, 4, 0, 0, 0, 3, 4, 5, 0, 0, 0},
+		5: {'B', 'I', 5, 1, 1, 'a', 2, 4, 0, 0, 0, 0, 3, 4, 5, 0, 0, 0, 0},
 	}
 	for ver, data := range cases {
 		t.Run(fmt.Sprintf("v%d", ver), func(t *testing.T) {

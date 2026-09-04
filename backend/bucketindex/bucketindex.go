@@ -37,7 +37,19 @@ type Entry struct {
 	// unset in a part written before format v5, which carries neither. Added in format v5.
 	Blocks Interval
 	Level  uint32
+	// Hole marks this entry as an acknowledged loss rather than a part: the writer owed a repair
+	// for these blocks, no owner could supply them, and it committed this in their place so the
+	// obligation stops blocking reads. It names no objects and holds no rows.
+	//
+	// The flag lives on the entry, not in a side list, because every reader already carries the
+	// entry: a hole a read path forgot to join against would be indistinguishable from an empty
+	// part, which turns acknowledged loss back into silent loss. Added in format v5.
+	Hole bool
 }
+
+// Data reports whether the entry names a real part — anything a read may open, a merge may
+// consume, a peer may copy. A hole is the one entry that does not.
+func (e Entry) Data() bool { return !e.Hole }
 
 // Index is the set of parts under a prefix, kept sorted by [Entry.Prefix]. The zero value is
 // a valid empty index.
@@ -63,6 +75,11 @@ type Index struct {
 	// [Want]. Kept sorted by prefix. A part leaves [Index.Entries] only into [Index.Removed] or
 	// into here. Added in format v5.
 	Wanted []Want
+	// LostParts counts the holes this shard's writers have ever committed — parts no owner could
+	// supply, acknowledged as lost (see [Entry.Hole]). It only ever rises: a writer carries the
+	// value it read forward and takes the maximum when it rebases on a rival's commit, so it is a
+	// cluster-visible fact rather than a per-node level a restart resets. Added in format v5.
+	LostParts uint64
 }
 
 // Add inserts e, replacing any existing entry with the same prefix, keeping the index sorted.
@@ -133,6 +150,7 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 		dst = binary.AppendUvarint(dst, e.Blocks.Min)
 		dst = binary.AppendUvarint(dst, e.Blocks.Max)
 		dst = binary.AppendUvarint(dst, uint64(e.Level))
+		dst = binary.AppendUvarint(dst, entryFlags(*e))
 	}
 
 	dst = binary.AppendUvarint(dst, ix.FlushedEpoch)
@@ -165,9 +183,14 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 		dst = append(dst, w.Prefix...)
 		dst = binary.AppendUvarint(dst, w.Blocks.Min)
 		dst = binary.AppendUvarint(dst, w.Blocks.Max)
+		dst = binary.AppendUvarint(dst, uint64(w.Level))
+		dst = binary.AppendVarint(dst, w.MinTime)
+		dst = binary.AppendVarint(dst, w.MaxTime)
 		dst = binary.AppendUvarint(dst, w.Generation.Term)
 		dst = binary.AppendUvarint(dst, w.Generation.Counter)
 	}
+
+	dst = binary.AppendUvarint(dst, ix.LostParts)
 
 	return dst
 }
@@ -245,12 +268,19 @@ func Decode(data []byte) (*Index, error) {
 
 	// v5+ appends the outstanding repair obligations; earlier versions could not express one.
 	if ver >= 5 {
-		wanted, err := decodeWants(buf)
+		wanted, rest, err := decodeWants(buf)
 		if err != nil {
 			return nil, err
 		}
 
 		ix.Wanted = wanted
+
+		lost, m := binary.Uvarint(rest)
+		if m <= 0 {
+			return nil, errors.Wrap(ErrCorrupt, "bad lost part count")
+		}
+
+		ix.LostParts = lost
 	}
 
 	return ix, nil
@@ -311,6 +341,18 @@ func decodeEntries(buf []byte, ver uint8) ([]Entry, []byte, error) {
 	return out, buf, nil
 }
 
+// entryFlagHole is bit 0 of an entry's flag word, [Entry.Hole]. Every other bit is reserved, and
+// [decodeBlockIdentity] rejects them: an unknown bit must never read as a data-bearing part.
+const entryFlagHole = 1
+
+func entryFlags(e Entry) uint64 {
+	if e.Hole {
+		return entryFlagHole
+	}
+
+	return 0
+}
+
 func decodeBlockIdentity(buf []byte, e *Entry) ([]byte, bool) {
 	var ok bool
 	if e.Blocks.Min, buf, ok = readUvarint(buf); !ok {
@@ -327,24 +369,31 @@ func decodeBlockIdentity(buf []byte, e *Entry) ([]byte, bool) {
 
 	e.Level = uint32(level)
 
+	flags, buf, ok := readUvarint(buf)
+	if !ok || flags & ^uint64(entryFlagHole) != 0 {
+		return nil, false
+	}
+
+	e.Hole = flags&entryFlagHole != 0
+
 	return buf, true
 }
 
 // decodeWants parses the wanted list, bounding the count by what the buffer could hold as the
 // entry and removal counts are.
-func decodeWants(buf []byte) ([]Want, error) {
+func decodeWants(buf []byte) ([]Want, []byte, error) {
 	n, m := binary.Uvarint(buf)
 	if m <= 0 {
-		return nil, errors.Wrap(ErrCorrupt, "bad want count")
+		return nil, nil, errors.Wrap(ErrCorrupt, "bad want count")
 	}
 	buf = buf[m:]
 
 	if n > uint64(len(buf)) {
-		return nil, errors.Wrap(ErrCorrupt, "want count exceeds input")
+		return nil, nil, errors.Wrap(ErrCorrupt, "want count exceeds input")
 	}
 
 	if n == 0 {
-		return nil, nil // nil, not an empty slice, so encode∘decode is the identity
+		return nil, buf, nil // nil, not an empty slice, so encode∘decode is the identity
 	}
 
 	out := make([]Want, 0, n)
@@ -356,29 +405,43 @@ func decodeWants(buf []byte) ([]Want, error) {
 
 		l, m := binary.Uvarint(buf)
 		if m <= 0 || l > uint64(len(buf)-m) {
-			return nil, errors.Wrap(ErrCorrupt, "bad want prefix length")
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad want prefix length")
 		}
 		buf = buf[m:]
 		w.Prefix = string(buf[:l])
 		buf = buf[l:]
 
 		if w.Blocks.Min, buf, ok = readUvarint(buf); !ok {
-			return nil, errors.Wrap(ErrCorrupt, "bad want block min")
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad want block min")
 		}
 		if w.Blocks.Max, buf, ok = readUvarint(buf); !ok {
-			return nil, errors.Wrap(ErrCorrupt, "bad want block max")
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad want block max")
+		}
+
+		level, rest, lok := readUvarint(buf)
+		if !lok || level > math.MaxUint32 {
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad want level")
+		}
+
+		w.Level, buf = uint32(level), rest
+
+		if w.MinTime, buf, ok = readVarint(buf); !ok {
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad want min time")
+		}
+		if w.MaxTime, buf, ok = readVarint(buf); !ok {
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad want max time")
 		}
 		if w.Generation.Term, buf, ok = readUvarint(buf); !ok {
-			return nil, errors.Wrap(ErrCorrupt, "bad want term")
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad want term")
 		}
 		if w.Generation.Counter, buf, ok = readUvarint(buf); !ok {
-			return nil, errors.Wrap(ErrCorrupt, "bad want counter")
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad want counter")
 		}
 
 		out = append(out, w)
 	}
 
-	return out, nil
+	return out, buf, nil
 }
 
 // decodeWriterEpochs parses the per-writer watermark slots, bounding the count by what the buffer
