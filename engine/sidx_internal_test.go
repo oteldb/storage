@@ -81,6 +81,22 @@ func TestSeriesIndexRoundTrip(t *testing.T) {
 		require.NoError(t, pagedIdx.forEachID(ctx, func(id signal.SeriesID) { pagedIDs = append(pagedIDs, id) }))
 		assert.Equal(t, resident.ids, pagedIDs)
 
+		type idRange struct {
+			id signal.SeriesID
+			r  rowRange
+		}
+
+		collect := func(idx partIndex) []idRange {
+			var out []idRange
+			require.NoError(t, idx.forEachRange(ctx, func(id signal.SeriesID, r rowRange) {
+				out = append(out, idRange{id: id, r: r})
+			}))
+
+			return out
+		}
+
+		assert.Equal(t, collect(resident), collect(pagedIdx), "paged ranges must match resident")
+
 		if len(resident.ids) > 0 {
 			probe := append([]signal.SeriesID{}, resident.ids...)
 			probe = append(probe, absent) // absent sorts last (max id)

@@ -455,7 +455,12 @@ and bounded by `MaxSketchGroups`, so the sketch state is a budget rather than gr
 The WAL frame is signal-agnostic — an opaque engine-encoded payload plus an optional side frame.
 `recordengine` owns the codec and `EncodeWAL`, the cluster write form, which appends the side frame so
 the profile symbol store replicates. `ApplyPrimary`/`ApplyReplicated` mirror the metric engine's
-primary-authoritative contract.
+primary-authoritative contract, and so does `RefreshReplica`'s **per-stream** trim watermark
+([`../engine/ARCH.md`](../engine/ARCH.md), "Cluster surface"): a stream absent from every part keeps
+its whole head, one present keeps every record past *its own* newest flushed timestamp. Each part
+decodes its timestamp column once to derive those (one `int64` per stream, kept for the part's life),
+because the bucket index records time bounds per part only — and a part-wide figure is another
+stream's flush, which says nothing about this one's durability.
 
 **A stream's identity frame is logged when the head registers the stream**, not when it first has an
 accepted record. A stream is new exactly once, and replay drops records it cannot attribute to a

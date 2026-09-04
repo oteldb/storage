@@ -364,18 +364,20 @@ func (h *head) appendOverflow(ov signal.Series, ts int64, value, sf float64) (ad
 	return admittedOverflow, oid, logSeries, ov
 }
 
-// trimBelowCovered drops every buffered sample with timestamp ≤ t (now durable in a flushed
-// part) for the series in covered (nil ⇒ every series), bounding a replica's head to the
-// still-unflushed window; each buffer is compacted in place. The replica refresh passes the
-// series actually present in the flushed parts: a series whose samples are not flushed
-// anywhere must keep its head — trimming it would leave the primary as the sole holder of
-// quorum-acked data until the next flush.
-func (h *head) trimBelowCovered(t int64, covered map[signal.SeriesID]struct{}) {
+// trimBelowCovered drops every buffered sample at or below its own series' watermark — the newest
+// timestamp that series has in a flushed part — bounding a replica's head to the still-unflushed
+// window; each buffer is compacted in place. A series absent from covered keeps its whole head:
+// trimming it would leave the primary as the sole holder of quorum-acked data until the next flush.
+//
+// The watermark is per series, never one figure across the head: a high-rate series flushed up to
+// t=100 says nothing about a low-rate one, and trimming the latter at 100 deletes a late sample that
+// is legal under its own out-of-order bound and durable nowhere yet — invisible until the owner's
+// next flush, and lost outright if this replica is promoted first.
+func (h *head) trimBelowCovered(covered map[signal.SeriesID]int64) {
 	for id, buf := range h.samples {
-		if covered != nil {
-			if _, ok := covered[id]; !ok {
-				continue
-			}
+		t, ok := covered[id]
+		if !ok {
+			continue
 		}
 
 		ts := buf.ts[:0]
