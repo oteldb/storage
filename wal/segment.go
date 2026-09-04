@@ -30,6 +30,7 @@ const (
 type SegmentWriter struct {
 	fsys     vfs.FS // rooted at the segment directory; held for the writer's lifetime
 	dir      string // the rooted directory's name, for log lines only
+	closed   bool   // the directory handle is released; no further segment can be opened
 	maxBytes int
 	seq      int
 	epoch    uint64 // flush generation stamped into new segment names; see [SegmentWriter.SetEpoch]
@@ -134,7 +135,7 @@ func (sw *SegmentWriter) SetEpoch(epoch uint64) { sw.epoch = epoch }
 // watermark the flush is about to commit — so the checkpoint does not delete it and replay does not
 // skip it.
 func (sw *SegmentWriter) Seal(epoch uint64) (int, error) {
-	if err := sw.Close(); err != nil { // the next write lazily opens a segment carrying epoch
+	if err := sw.closeSegment(); err != nil { // the next write lazily opens a segment carrying epoch
 		return 0, err
 	}
 
@@ -155,7 +156,7 @@ func (sw *SegmentWriter) Checkpoint() error { return sw.CheckpointThrough(sw.seq
 // flushed (exactly-once — the watermark and the part list advance atomically; see [ReplayDirFrom]).
 func (sw *SegmentWriter) CheckpointThrough(obsolete int) error {
 	if obsolete >= sw.seq {
-		if err := sw.Close(); err != nil { // close the current segment; next write reopens lazily
+		if err := sw.closeSegment(); err != nil { // close the current segment; next write reopens lazily
 			return err
 		}
 	}
@@ -312,8 +313,24 @@ func (sw *SegmentWriter) Sync() error {
 	return sw.f.Sync()
 }
 
-// Close syncs and closes the current segment.
+// Close syncs and closes the current segment and releases the writer's handle on the segment
+// directory. The writer is spent: a later append cannot open a segment. Idempotent.
 func (sw *SegmentWriter) Close() error {
+	err := sw.closeSegment()
+
+	if !sw.closed {
+		sw.closed = true
+		if cerr := sw.fsys.Close(); err == nil {
+			err = cerr
+		}
+	}
+
+	return err
+}
+
+// closeSegment syncs and closes the current segment, leaving the directory handle open so the next
+// append can lazily open the following segment. Rotation, sealing, and checkpointing use it.
+func (sw *SegmentWriter) closeSegment() error {
 	if sw.f == nil {
 		return nil
 	}
@@ -370,7 +387,7 @@ func (sw *SegmentWriter) logger() *zap.Logger {
 }
 
 func (sw *SegmentWriter) rotate() error {
-	if err := sw.Close(); err != nil {
+	if err := sw.closeSegment(); err != nil {
 		return err
 	}
 

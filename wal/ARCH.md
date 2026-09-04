@@ -102,6 +102,12 @@ Segments go through `internal/vfs`, the rooted filesystem seam, so the crash mod
 rather than argued: `faultfs` keeps only what was synced *through a synced directory*, and
 distinguishes `Crash()` (power loss) from `Kill()` (process death).
 
+The writer holds that rooted directory open for its lifetime, since every rotation and checkpoint
+syncs it. `Close` is therefore terminal — it releases the directory as well as the current segment,
+and a closed writer cannot open another. Rotation, sealing, and checkpointing use the internal
+segment-only close instead. A leaked directory handle would be invisible on unix and fail the
+crash-recovery tests on Windows, which cannot remove a directory a live process still holds.
+
 What each policy guarantees, precisely:
 
 | policy | process death (`Kill`) | power loss (`Crash`) |
