@@ -159,6 +159,15 @@ does — a merge preserves its inputs' time range and so cannot close it by acci
 conservative in one direction only: a node whose head was genuinely empty still fails over for
 recent windows until the next flush.
 
+The guard has one implementation per RPC and both callers reach it through the same function: the
+node coordinating a query against its own shards calls the very code that serves a peer's request,
+so a coordinator cannot serve an engine the peer path would have disclaimed. The alternative — a
+placement check followed by a direct engine call — is what makes the answer depend on which node was
+asked, silently and without an error, and it is unreachable by construction only if the local seam
+has no route to the engine that skips the guard. Profile symbols take the same guard with no window:
+the store has no time domain, symbols are interned as samples arrive, so any open Profile gap
+disclaims the whole store rather than serving a snapshot missing whatever the lost head held.
+
 Matchers are opaque Go closures and **not serializable**, so the RPC carries the tenant
 + window and the requester **re-applies the matchers** to the returned superset (which the contract
 permits). Re-applying is `fetch.Filter` / `fetch.MatchesSeries` — one implementation on the seam,
