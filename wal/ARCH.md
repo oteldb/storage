@@ -1,7 +1,7 @@
 # `wal/` — write-ahead log
 
-CRC-framed records (`[uvarint len][type][payload][CRC32C]`) appended to numbered segment files,
-rotating at a size limit. Replaying a log rebuilds the symbols+series+postings index and the head —
+CRC-framed records (`[uvarint len][type][payload][CRC32C(len+type+payload)]`) appended to numbered
+segment files, rotating at a size limit. Replaying a log rebuilds the symbols+series+postings index and the head —
 the unflushed state a crash would otherwise lose. Flushed data comes from the backend instead
 (see [`../backend/ARCH.md`](../backend/ARCH.md)).
 
@@ -16,6 +16,24 @@ Record types (additive — an old reader **skips** an unknown type):
 | side | opaque content-addressed side-store delta (the profile symbol store) |
 
 Replay surfaces a bad-CRC *complete* record as corruption and stitches segments in order.
+
+**The checksum covers the length varint**, not just the body. `readFrame` trusts the length to
+decide where the frame ends, so leaving it uncovered leaves the one field that steers the reader
+unprotected: a payload can hold the checksum of a prefix of itself, and a corrupted length then
+carves a shorter, checksum-valid record out of a longer one — a record the writer never wrote,
+dispatched without complaint, with the reader parsing from the wrong offset afterwards.
+
+What length coverage does *not* buy: a length inflated past the end of the buffer. The completeness
+bound has to run before the checksum (the checksum's span depends on the length), so such a frame is
+byte-indistinguishable from a torn tail no matter what the CRC covers. Refusing a short read outside
+the last segment is what closes that one, not the checksum.
+
+**This framing is also the node-to-node replication payload** (`ApplyPrimary` → `cluster/replica` →
+`Replay`), so widening the checksum input is a wire break as well as a disk break. The break is
+loud in both directions — an older directory fails `ErrCorrupt` on its first frame at startup, a
+mismatched replication payload is rejected rather than half-applied — and both halves need a
+coordinated rollout. Carrying a discriminator in the segment name would version only the disk half
+and leave the wire half broken anyway, which is why the format is not versioned here.
 
 ## Where a torn record is tolerated, and where it is not
 

@@ -256,10 +256,12 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 	}
 }
 
-// appendFrame appends [uvarint bodyLen][type][payload][u32 CRC32C(body)] to dst.
+// appendFrame appends [uvarint bodyLen][type][payload][u32 CRC32C(len+body)] to dst. The length is
+// inside the checksum: readFrame trusts it to decide where the frame ends, so leaving it uncovered
+// leaves the one field that steers the reader unprotected.
 func appendFrame(dst []byte, typ byte, payload []byte) []byte {
-	dst = binary.AppendUvarint(dst, uint64(1+len(payload)))
 	start := len(dst)
+	dst = binary.AppendUvarint(dst, uint64(1+len(payload)))
 	dst = append(dst, typ)
 	dst = append(dst, payload...)
 	crc := crc32.Checksum(dst[start:], castagnoli)
@@ -276,8 +278,11 @@ func readFrame(src []byte) (typ byte, payload []byte, consumed int, err error) {
 		return 0, nil, 0, io.EOF
 	}
 
-	// Bound bodyLen against the bytes available (in uint64, to avoid int overflow)
-	// before computing any offset: a complete frame needs body + a 4-byte CRC.
+	// Bound bodyLen against the bytes available (in uint64, to avoid int overflow) before computing
+	// any offset: a complete frame needs body + a 4-byte CRC. This runs before the checksum because
+	// the checksum's span depends on it — which is why a length inflated past the end of the buffer
+	// is indistinguishable from a torn tail here, and why only the caller, knowing whether more log
+	// was supposed to follow, can classify it.
 	avail := len(src) - n
 	if avail < 4 || bodyLen > uint64(avail-4) {
 		return 0, nil, 0, io.EOF // torn tail
@@ -286,7 +291,7 @@ func readFrame(src []byte) (typ byte, payload []byte, consumed int, err error) {
 	bodyEnd := n + int(bodyLen)
 	crcEnd := bodyEnd + 4
 	body := src[n:bodyEnd]
-	if crc32.Checksum(body, castagnoli) != binary.BigEndian.Uint32(src[bodyEnd:crcEnd]) {
+	if crc32.Checksum(src[:bodyEnd], castagnoli) != binary.BigEndian.Uint32(src[bodyEnd:crcEnd]) {
 		return 0, nil, 0, errors.Wrap(ErrCorrupt, "CRC mismatch")
 	}
 

@@ -3,6 +3,7 @@ package wal
 import (
 	"bytes"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -282,6 +283,11 @@ func FuzzReplay(f *testing.F) {
 	_ = w.WriteSamplesSF(s.Hash(), []int64{3, 4}, []float64{3, 4}, []float64{2, 2})
 	f.Add(buf.Bytes())
 	f.Add([]byte{})
+	f.Add(buf.Bytes()[:len(buf.Bytes())-3]) // a torn final frame
+
+	inflated := slices.Clone(buf.Bytes())
+	inflated[0] |= 0x80 // a length varint claiming a body past the end of the log
+	f.Add(inflated)
 
 	f.Fuzz(func(_ *testing.T, data []byte) {
 		// Must never panic; corrupt input returns an error or stops cleanly. Exercise every
