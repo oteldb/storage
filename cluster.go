@@ -57,6 +57,9 @@ type clusterNode struct {
 	notifyMu   sync.Mutex          // guards notifyBusy
 	notifyBusy map[string]struct{} // engine prefixes with a notify-triggered sync in flight
 
+	bootMu sync.Mutex                   // guards booted
+	booted map[signal.TenantID]struct{} // shards whose per-signal bootstrap pass completed
+
 	// reportedRejoins is the re-registration total already published as a counter delta.
 	reportedRejoins atomic.Int64
 	// warnedSingleShard guards the single-shard advisory so it is said once, not every cycle.
@@ -150,13 +153,23 @@ func (s *Storage) rfFor(shardKey signal.TenantID) int {
 // copied. The maintenance caller cannot make this decision for us: it branches on *compaction*
 // ownership, which a non-owner also fails, so it reaches the replica path too.
 func (s *Storage) syncParts(ctx context.Context, tid signal.TenantID, signalPrefix string, strict bool) bool {
+	synced, _ := s.syncPartsStatus(ctx, tid, signalPrefix, strict)
+
+	return synced
+}
+
+// syncPartsStatus is [Storage.syncParts] with the mirroring error surfaced, for the one caller
+// that must tell "the peers have nothing under this prefix" from "the peers could not be read".
+func (s *Storage) syncPartsStatus(
+	ctx context.Context, tid signal.TenantID, signalPrefix string, strict bool,
+) (bool, error) {
 	if s.cluster == nil || !s.cluster.private {
-		return false
+		return false, nil
 	}
 
 	local, remotes := s.shardOwners(tid)
 	if !local || len(remotes) == 0 {
-		return false
+		return false, nil
 	}
 
 	enginePrefix := string(s.normalizeTenant(tid)) + signalPrefix
@@ -166,7 +179,7 @@ func (s *Storage) syncParts(ctx context.Context, tid signal.TenantID, signalPref
 		s.obs.Logger(ctx).Warn("part sync failed",
 			zap.String("prefix", enginePrefix), zap.Bool("strict", strict), zap.Error(err))
 
-		return false
+		return false, err
 	}
 
 	if st.Synced && st.Copied > 0 {
@@ -175,7 +188,7 @@ func (s *Storage) syncParts(ctx context.Context, tid signal.TenantID, signalPref
 			zap.Int("copied", st.Copied), zap.Int64("bytes", st.CopiedBytes), zap.Int("pruned", st.Pruned))
 	}
 
-	return st.Synced
+	return st.Synced, nil
 }
 
 // splitEnginePrefix parses an engine prefix ("{tenant}{signalPrefix}", e.g. "default/metrics")
@@ -436,6 +449,7 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 		private:    cfg.PrivateBackend,
 		psync:      partsync.New(s.backend, &partsync.Client{HTTP: httpc}),
 		notifyBusy: make(map[string]struct{}),
+		booted:     make(map[signal.TenantID]struct{}),
 	}
 
 	// Record rebalance plans at each shard's own (per-tenant) replication factor, so

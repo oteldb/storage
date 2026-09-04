@@ -324,3 +324,15 @@ rack/server/disk hierarchy; a scheme is rack-safe with at least `ceil(Shards/Par
   claiming owner), mirrors from peers, then creates the engine by the same backend-driven prefix
   discovery startup recovery uses. A shard whose every owner died has no claim and is not
   discoverable.
+  - **Per signal, not per shard.** The mirror-and-probe is gated on each signal's own engine. A
+    shard-wide "holds any engine" gate loses data: the write path creates engines lazily per
+    signal, so under live ingest the first replicated write of one signal beats the first
+    maintenance tick and disclaims the shard's *other* signals on every owner — reads fail over
+    until the owner set has turned over, after which every owner disclaims and the fetch returns an
+    empty merge **with no error**.
+  - **Memoized per shard.** A shard whose pass resolved every signal without error is skipped
+    thereafter, so the steady state costs one map lookup per owned shard per cycle rather than a
+    peer list plus a backend HEAD per absent signal. Only an error-free pass is memoized — an
+    unreachable peer cannot prove a signal is absent, so it retries — and entries for shards this
+    node no longer owns are dropped, so a lost-and-regained shard bootstraps again. A signal that
+    gains data later needs no re-probe: its write reaches every owner and creates the engine there.
