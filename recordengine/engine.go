@@ -123,6 +123,12 @@ type Engine struct {
 	// closes the visibility gap a flush would otherwise open between draining the head and the part
 	// becoming live. nil when no flush is in flight.
 	flushing map[signal.SeriesID]*recordCols
+	// flushingSide holds the side-store snapshot an in-progress flush took at detach, kept visible to
+	// [Engine.SideSnapshot] until the part's sidecars are published (then cleared, atomically with
+	// adding the part) or the flush aborts and restores it into the live accumulator. It closes the
+	// symbol-visibility gap that mirrors the record gap [Engine.flushing] closes. nil when no flush is
+	// in flight or the engine has no side store.
+	flushingSide map[string][]byte
 	// space latches disk pressure: a flush that finds the backend short of bytes or inodes (or one
 	// that gets ENOSPC anyway) closes the ingest path until a later flush finds room. Without it a
 	// full disk is invisible — the write is acked, the flush fails, and the head grows behind it.
@@ -767,6 +773,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 	e.mu.Lock()
 	e.head = newHead(e.cfg.Schema)
 	e.flushing = nil // discarded with the head: Reset drops the records, it does not flush them
+	e.flushingSide = nil
 
 	if e.cfg.Backend == nil {
 		e.parts, e.retiring = nil, nil
@@ -838,6 +845,10 @@ func (e *Engine) SideSnapshot(ctx context.Context) (map[string][]byte, error) {
 
 	parts := make([]map[string][]byte, 0, len(readable)+1)
 	parts = append(parts, e.cfg.SideStore.Encode()) // unflushed head symbols
+
+	if e.flushingSide != nil {
+		parts = append(parts, e.flushingSide) // symbols of the records an in-flight flush detached
+	}
 
 	for _, p := range readable {
 		m, err := loadSidecars(ctx, e.cfg.Backend, p.prefix, e.cfg.SideStore.Names())
@@ -1307,6 +1318,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	if e.cfg.SideStore != nil {
 		side = e.cfg.SideStore.Encode()
 		e.cfg.SideStore.Reset()
+		e.flushingSide = side
 	}
 
 	e.mu.Unlock()
@@ -1372,6 +1384,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		e.parts = appendPart(e.parts, p)
 	}
 	e.flushing = nil
+	e.flushingSide = nil
 	e.head.releaseDetached() // the buffers are gone with e.flushing: drop them from the in-flight measure
 	e.flushedEpoch++
 	err = e.publishLocked(ctx, checkpointSeq)
@@ -1406,6 +1419,7 @@ func (e *Engine) abortFlush(
 
 	e.head.reattach(detached, bytes)
 	e.flushing = nil
+	e.flushingSide = nil
 
 	if side != nil && e.cfg.SideStore != nil {
 		if err := e.cfg.SideStore.Restore(side); err != nil {
