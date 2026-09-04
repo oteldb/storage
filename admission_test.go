@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -35,6 +36,52 @@ func TestTokenBucket(t *testing.T) {
 
 	// Unlimited always admits regardless of tokens.
 	assert.True(t, b.allow(1e9, t0, true))
+}
+
+// TestTokenBucketConcurrentWrites drives concurrent rate-limited writes for one tenant, so the
+// per-tenant token bucket is reconfigured and consumed from several goroutines at once. It exists
+// to be run under -race: the bucket's fields must never be written outside its mutex.
+func TestTokenBucketConcurrentWrites(t *testing.T) {
+	t.Parallel()
+
+	s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+		return tenant.Policy{Limits: tenant.Limits{IngestBytesPerSecond: 1 << 30}}
+	})))
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	const (
+		writers = 8
+		rounds  = 200
+	)
+
+	var start, done sync.WaitGroup
+
+	start.Add(1)
+	done.Add(writers)
+
+	for w := range writers {
+		go func() {
+			defer done.Done()
+
+			start.Wait()
+
+			for i := range rounds {
+				ts := int64(w*rounds+i) + 1
+				if _, err := s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{ts}, []float64{1})); err != nil {
+					t.Error(err)
+
+					return
+				}
+			}
+		}()
+	}
+
+	start.Done()
+	done.Wait()
+
+	require.NoError(t, s.Close(ctx))
 }
 
 func TestWriteMetricsRateLimit(t *testing.T) {

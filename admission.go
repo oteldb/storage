@@ -51,6 +51,9 @@ type tokenBucket struct {
 // reconfigure updates the rate/burst from the current policy (hot-reload) without discarding the
 // accrued tokens, and lazily seeds the clock on first use.
 func (b *tokenBucket) reconfigure(ratePerSec, burst float64, nowNs int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	if b.last == 0 {
 		b.last = nowNs
 		b.tokens = burst
