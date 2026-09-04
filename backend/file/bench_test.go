@@ -55,3 +55,63 @@ func BenchmarkListPrefix(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkWrite publishes a 4 KiB object into a directory that already exists — the shape a part's
+// column objects take, and where the fsync durability costs shows up as write latency.
+func BenchmarkWrite(b *testing.B) {
+	ctx := context.Background()
+
+	bk, err := file.New(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	data := make([]byte, 4<<10)
+
+	if err := bk.Write(ctx, "t0/metrics/0000/c/warm", data); err != nil {
+		b.Fatal(err)
+	}
+
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+
+	i := 0
+
+	for b.Loop() {
+		if err := bk.Write(ctx, fmt.Sprintf("t0/metrics/0000/c/col%d", i), data); err != nil {
+			b.Fatal(err)
+		}
+
+		i++
+	}
+}
+
+// BenchmarkPutIfAbsent measures the link publish path, whose directory sync is the same one
+// [BenchmarkWrite] pays for the rename.
+func BenchmarkPutIfAbsent(b *testing.B) {
+	ctx := context.Background()
+
+	bk, err := file.New(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	data := make([]byte, 4<<10)
+
+	if err := bk.Write(ctx, "t0/metrics/0000/c/warm", data); err != nil {
+		b.Fatal(err)
+	}
+
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+
+	i := 0
+
+	for b.Loop() {
+		if _, err := bk.PutIfAbsent(ctx, fmt.Sprintf("t0/metrics/0000/c/obj%d", i), data); err != nil {
+			b.Fatal(err)
+		}
+
+		i++
+	}
+}

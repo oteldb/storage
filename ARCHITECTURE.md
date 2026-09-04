@@ -232,6 +232,6 @@ engine/               metrics vertical
 recordengine/         shared record engine (logs/traces/profiles)
 query/{fetch,scale,profile,promql}           read seam · scale-out decorators · EXPLAIN ANALYZE · Prom adapter
 cluster/{,ring,etcd,replica,rebalance,partsync,ec}   L0 distribution
-internal/{obs,retry,simd,parallel,partid,diskguard,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids · disk-pressure guard
+internal/{obs,retry,simd,parallel,partid,diskguard,vfs,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids · disk-pressure guard · filesystem seam + crash model
 reliability/          public RetryConfig presets
 ```
