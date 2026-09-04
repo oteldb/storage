@@ -26,6 +26,10 @@ type Filter struct {
 // encodeVersion is the on-disk format tag of an encoded filter.
 const encodeVersion byte = 1
 
+// maxProbes bounds k on both build and decode: k = log2(1/p) for a filter sized by [New], so the
+// cap only bites for absurdly small p, while decode gains a bound on per-condition probe CPU.
+const maxProbes = 64
+
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 // New returns a filter sized for n expected items at false-positive rate p (0 < p < 1), using the
@@ -35,7 +39,7 @@ func New(n int, p float64) *Filter {
 	m := Bits(n, p)
 	n = max(n, 1)
 
-	k := max(int(math.Round(float64(m)/float64(n)*math.Ln2)), 1)
+	k := min(max(int(math.Round(float64(m)/float64(n)*math.Ln2)), 1), maxProbes)
 
 	return &Filter{bits: make([]uint64, m/64), m: m, k: k}
 }
@@ -124,7 +128,7 @@ func Decode(src []byte) (*Filter, int, error) {
 	off := 1
 
 	k64, n := binary.Uvarint(src[off:])
-	if n <= 0 {
+	if n <= 0 || k64 == 0 || k64 > maxProbes {
 		return nil, 0, errors.New("bloom: bad k")
 	}
 
