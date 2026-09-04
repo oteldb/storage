@@ -306,6 +306,24 @@ sidecar replicates identically. Convergence is push-accelerated by a best-effort
 flush/merge; the periodic pull stays the anti-entropy source of truth, and passes are serialized
 per prefix so a notify can never install an older index over a newer one.
 
+### Repairing a want
+
+`Syncer.FetchWant` is the serving half of the engines' repair seam (`engine/ARCH.md`,
+"Repair"). Given a `bucketindex.Want` it asks every peer for its bucket index, runs
+`Index.Satisfying` over each, and copies the objects of the best answer — widest block interval,
+then deepest level, so one fetch recovers the most data. It installs no index: committing the entry
+is the owner's own commit, which is what discharges the want.
+
+The distinction the call exists to preserve is **definitive absence versus an unanswered peer**.
+`ok=false` with a nil error means every peer replied and none named a satisfying part; a peer that
+could not be reached is an error, and the want survives untouched. Collapsing the two would let an
+unreachable peer be read as proof the data is gone.
+
+Unlike a whole-prefix sync, a missing object mid-copy is fatal to the call: the caller is about to
+publish an index entry naming that part, and a part it could not fully copy must never become one.
+The pull direction means the **serving** side is what a real budget has to cap — N recovering nodes
+converge on whichever peers hold the data — which is not built yet.
+
 ## `ec` — erasure coding
 
 Per-tenant policy (`tenant.Durability.EC`, an age tier like recompression, so recent data stays

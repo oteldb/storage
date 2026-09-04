@@ -433,6 +433,39 @@ retiring first would let the next reclaim delete referenced objects, and `LoadPa
 engine on a missing part. A failed commit rolls the in-memory swap back, so the uncommitted output is
 never observable as published; its objects are orphans, swept at the next open.
 
+### Repair — a want is discharged by committing a part
+
+A part this engine's index names but cannot read is recorded as a `bucketindex.Want`, carried
+across every commit alongside the removals. Repair runs at the head of each merge cycle
+(`repair.go`), so a part pulled back joins the same compaction, and it **never fails the merge**: a
+shard that cannot be repaired must still compact.
+
+Satisfaction follows `Index.Satisfying` — the exact part, **or the largest live part whose block
+interval contains the want's at a higher level**. That is what makes repair terminate: by the time
+a want is serviced the data may exist only inside a merged successor, and chasing a prefix that no
+longer exists anywhere would never converge. The local index is asked first, so a want this
+engine's own merges already covered costs no network call at all.
+
+`Config.Repair` (`PartFetcher`) is the whole seam to the cluster: a part identity in, the entry of
+whatever part was actually copied out. The engine never learns about peers, addresses or transport —
+`cluster/partsync` supplies the implementation, and nil (single node, or a shared backend where
+every replica reads the same objects) makes repair a no-op. `ok=false` with a nil error is
+definitive absence and leaves the want outstanding, counted in `RepairStats.Unsatisfiable`; an
+error is transient and retried next cycle. The two are never merged: an unreachable peer is not
+evidence that data is gone.
+
+Publishing a repaired part is the same swap a merge publishes — it is committed into `Entries`, and
+the commit's want trim discharges every want it satisfies. A fetched **successor** also retires the
+local parts it supersedes, because their rows are inside it and keeping both would count them
+twice. A part whose objects arrived but will not open is rolled back to a failure, so the want
+stays.
+
+One cycle attempts at most `repairFetchesPerCycle` (4) wants with `repairFetchConcurrency` (2)
+copies in flight. A repair fetch copies a whole part, so an unbounded pass on a badly damaged node
+would spend the maintenance cycle in the network and never compact; a shard needing more than a
+handful of parts back is past what part-by-part repair is for. The *serving* side is where the real
+budget belongs (see `cluster/ARCH.md`), and is not built yet.
+
 ## Read path
 
 `Fetch` resolves matchers over the index, then merges each series' head buffer ∪ every part by

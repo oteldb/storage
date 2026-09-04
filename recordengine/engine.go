@@ -98,6 +98,25 @@ type Config struct {
 	// exhaust with the disk half empty, and byte accounting cannot see it. 0 ⇒
 	// [diskguard.DefaultReserveInodes]; negative ⇒ the inode axis is not checked.
 	MinFreeInodes int64
+	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
+	// still has it. It is supplied by the cluster layer, which owns peer discovery and the
+	// node-to-node transport; nil is single-node mode, where an outstanding want stays outstanding
+	// because there is nowhere to fetch it from. See [PartFetcher].
+	Repair PartFetcher
+}
+
+// PartFetcher makes the objects of a part that discharges a want local, so the engine can open it
+// and commit it back into the index. It is the engine's whole view of the cluster during repair:
+// a part identity in, the entry of the part that was actually copied out.
+//
+// Returning ok=false with a nil error means no peer holds a part satisfying the want — definitive
+// absence, which leaves the want outstanding. Any error is transient (a peer that could not be
+// reached says nothing about whether the data exists), and the want is retried on the next merge.
+//
+// The entry need not name the wanted prefix: a peer that has merged the part away answers with the
+// successor containing it, which is what makes repair terminate.
+type PartFetcher interface {
+	FetchWant(ctx context.Context, w bucketindex.Want) (bucketindex.Entry, bool, error)
 }
 
 // Engine is one tenant's record store for a signal. Safe for concurrent use.
@@ -168,6 +187,13 @@ type Engine struct {
 	// replica tell a compaction from a loss.
 	indexed  map[string]struct{}
 	removals []bucketindex.Removal
+	// wants are the repair obligations carried in this engine's index: parts it holds an entry for
+	// but cannot read. They are carried across every commit like removals, and discharged only by
+	// committing a part that satisfies them (see repair.go).
+	wants []bucketindex.Want
+	// repaired counts what repair did, for the operator surface and for tests: a want cannot be
+	// left silently outstanding.
+	repaired RepairStats
 	// indexVersion is the backend version of the bucket index this engine last read or committed —
 	// the token its next commit conditions on, so a rewrite that another writer got in front of is
 	// refused rather than silently overwriting it (#392).
