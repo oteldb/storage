@@ -421,6 +421,14 @@ riding the part lifecycle: absorbed into a live accumulator, written as sidecars
 on merge (content addressing makes the union a plain dedup with no id remap), and **restored** into the
 accumulator when a flush fails. Profiles' symbol store is the first user; nil for logs/traces.
 
+**Symbols follow their records' visibility.** A record is in exactly one of head / `e.flushing` / a
+published part, and `Engine.SideSnapshot` must union the side data of all three the same way a fetch
+reads all three. The flush's `Encode`+`Reset` at detach hands the accumulator's snapshot to
+`e.flushingSide`, cleared under the same lock that publishes the part (whose sidecars now carry it) or
+that restores it into the accumulator on abort. Without that hop the snapshot lives only in a
+flush-local variable, and for the length of an object-store flush the detached records resolve their
+symbols against an empty set — wrong answers, not an error.
+
 ## Cost attribution
 
 `Engine.StreamCost` (`streamcost.go`) attributes the live parts to streams — or to a label's values
