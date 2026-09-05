@@ -2,6 +2,8 @@ package bucketindex_test
 
 import (
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -63,34 +65,32 @@ func TestTrimWantsDropsDischarged(t *testing.T) {
 		{Prefix: "successor", Blocks: bucketindex.Interval{Min: 2, Max: 5}, Level: 1},
 	}
 
-	kept, dropped := bucketindex.TrimWants(wants, live, bucketindex.MaxWants)
+	kept := bucketindex.TrimWants(wants, live)
 	require.Len(t, kept, 1)
 	assert.Equal(t, "still-gone", kept[0].Prefix)
-	assert.Empty(t, dropped, "discharged wants are not losses")
 }
 
-// TestTrimWantsBoundReports pins the reason the bound is safe: what it forces out is handed back,
-// so exceeding it escalates rather than silently forgetting a repair.
-func TestTrimWantsBoundReports(t *testing.T) {
+// TestTrimWantsKeepsEveryOutstandingWant pins that no count trims an outstanding want, MaxWants
+// included: a want is the only record that its part is owed, and past the horizon the record is what
+// a reseed will need.
+func TestTrimWantsKeepsEveryOutstandingWant(t *testing.T) {
 	t.Parallel()
 
-	wants := make([]bucketindex.Want, 0, 10)
-	for i := range 10 {
+	n := bucketindex.MaxWants + 7
+	wants := make([]bucketindex.Want, 0, n)
+
+	for i := range n {
 		wants = append(wants, bucketindex.Want{
-			Prefix:     fmt.Sprintf("p%02d", i),
+			Prefix:     fmt.Sprintf("p%05d", n-i),
 			Generation: bucketindex.Generation{Term: 1, Counter: uint64(i + 1)},
 		})
 	}
 
-	kept, dropped := bucketindex.TrimWants(wants, nil, 4)
-	require.Len(t, kept, 4)
-	require.Len(t, dropped, 6)
-
-	assert.Equal(t, []string{"p00", "p01", "p02", "p03"},
-		[]string{kept[0].Prefix, kept[1].Prefix, kept[2].Prefix, kept[3].Prefix},
-		"the oldest obligations survive")
-	assert.Equal(t, "p04", dropped[0].Prefix)
-	assert.Equal(t, len(wants), len(kept)+len(dropped), "nothing vanishes")
+	kept := bucketindex.TrimWants(wants, nil)
+	require.Len(t, kept, n, "nothing vanishes")
+	assert.True(t, slices.IsSortedFunc(kept, func(a, b bucketindex.Want) int {
+		return strings.Compare(a.Prefix, b.Prefix)
+	}), "prefix order keeps the encoding deterministic")
 }
 
 func TestMaxWantsMatchesMaxRemovals(t *testing.T) {

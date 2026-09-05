@@ -291,16 +291,15 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 	// Committing a part is what discharges a want, so the trim runs against the entries this
 	// commit publishes: a want naming a part the index holds again, or one a live part contains,
 	// is repaired by the act of writing this index.
-	kept, dropped := bucketindex.TrimWants(ix.Wanted, ix.Entries, bucketindex.MaxWants)
-	if len(dropped) > 0 {
-		// Past the bound a node can no longer repair part by part and needs a wholesale reseed,
-		// which does not exist yet; losing the obligation quietly is what must not happen.
-		zctx.From(ctx).Warn("outstanding repairs exceed the index bound",
-			zap.String("prefix", e.cfg.Prefix), zap.Int("dropped", len(dropped)),
-			zap.Int("kept", len(kept)))
-	}
+	ix.Wanted = bucketindex.TrimWants(ix.Wanted, ix.Entries)
 
-	ix.Wanted = kept
+	// Past the horizon the node needs a wholesale reseed, which does not exist yet. The wants stay:
+	// each is the only record that its part is owed, and the read policy disclaims over them.
+	if len(ix.Wanted) > bucketindex.MaxWants {
+		zctx.From(ctx).Warn("outstanding repairs exceed the part-by-part repair horizon",
+			zap.String("prefix", e.cfg.Prefix), zap.Int("wanted", len(ix.Wanted)),
+			zap.Int("horizon", bucketindex.MaxWants))
+	}
 
 	return ix
 }

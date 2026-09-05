@@ -2,18 +2,17 @@ package bucketindex
 
 import "slices"
 
-// MaxWants bounds how many outstanding repair obligations an index carries, for the same reason
-// [MaxRemovals] bounds tombstones: the index is a small object rewritten on every commit, and an
-// unbounded list on a badly damaged node would grow it without limit.
+// MaxWants is the horizon past which part-by-part repair is no longer the tool: a node owing more
+// than this many parts has to adopt a peer's current index wholesale. It is deliberately
+// [MaxRemovals], because past that many tombstones a node can no longer tell a removed part from a
+// lost one, which is the same regime; one constant governs both boundaries.
 //
-// It is deliberately the same number. Past [MaxRemovals] a node can no longer tell a removed part
-// from a lost one and has to adopt a peer's current index wholesale rather than repair part by
-// part; a node with that many outstanding wants is in the same regime, so one constant governs
-// both boundaries.
-//
-// Unlike a trimmed tombstone, a forgotten want is a repair that will never happen. [TrimWants]
-// therefore hands back what it dropped instead of discarding it silently: exceeding the bound is
-// the signal to escalate to a wholesale reseed, not a license to lose the obligation.
+// Unlike [MaxRemovals] it bounds nothing. A tombstone is a fact about the past that accumulates for
+// as long as the shard lives, so the list has to be cut; a want is the only record that a part is
+// owed, and dropping one is dropping the repair. Nor does cutting the list buy the index anything:
+// a want costs the bytes the entry it replaced did, so [Index.Wanted] is bounded by the parts the
+// node has held, not by how long it has run. Exceeding the horizon is a signal to escalate, and
+// the wants stay in the index until the escalation exists.
 const MaxWants = MaxRemovals
 
 // Want is a part this writer holds in its index but cannot read, and the generation at which it
@@ -90,14 +89,10 @@ func (ix *Index) Wants() map[string]Want {
 	return out
 }
 
-// TrimWants drops wants already discharged — those naming a part the index holds again, or one a
-// live part supersedes — and bounds what remains to keep entries, returning the kept wants and the
-// ones the bound forced out.
-//
-// Oldest wants are kept: the longest-outstanding obligation is the one repair has had the most
-// chances to discharge, so its survival is what tells an operator repair is stuck. Dropped wants
-// are returned rather than discarded, because losing one silently is losing a repair.
-func TrimWants(wants []Want, live []Entry, keep int) (kept, dropped []Want) {
+// TrimWants drops the wants already discharged — those naming a part the index holds again, or one
+// a live part supersedes — and nothing else: an outstanding want is the only record that a part is
+// owed, so no count trims it (see [MaxWants]).
+func TrimWants(wants []Want, live []Entry) []Want {
 	ix := Index{Entries: live}
 
 	out := wants[:0]
@@ -109,17 +104,9 @@ func TrimWants(wants []Want, live []Entry, keep int) (kept, dropped []Want) {
 		out = append(out, w)
 	}
 
-	if len(out) > keep {
-		// Oldest first, take keep, then restore prefix order so the encoding stays deterministic.
-		slices.SortFunc(out, func(a, b Want) int { return a.Generation.Compare(b.Generation) })
-		dropped = slices.Clone(out[keep:])
-		out = out[:keep]
-	}
-
 	slices.SortFunc(out, compareWantPrefix)
-	slices.SortFunc(dropped, compareWantPrefix)
 
-	return out, dropped
+	return out
 }
 
 func compareWantPrefix(a, b Want) int {

@@ -544,6 +544,15 @@ local parts it supersedes, because their rows are inside it and keeping both wou
 twice. A part whose objects arrived but will not open is rolled back to a failure, so the want
 stays.
 
+**No count trims an outstanding want.** `bucketindex.MaxWants` (4096) is the horizon past which a
+node owes more than part-by-part repair can converge on and needs a wholesale reseed, which does not
+exist yet; the commit logs past it and keeps every want. Truncating the list would break the one
+invariant the read policy stands on — a part leaves `Entries` only into `Removed` or into `Wanted` —
+and a want dropped that way is neither a hole nor a `LostParts` increment: the window it covered is
+served short with nothing to say so. Refusing the commit instead would keep the invariant trivially
+(the entries stay) but wedge the node — flush, merge and the repair commit that discharges wants all
+go through the same commit — for the same index bytes, since a want costs what its entry did.
+
 One cycle attempts at most `repairFetchesPerCycle` (4) wants with `repairFetchConcurrency` (2)
 copies in flight. A repair fetch copies a whole part, so an unbounded pass on a badly damaged node
 would spend the maintenance cycle in the network and never compact; a shard needing more than a
