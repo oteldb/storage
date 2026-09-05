@@ -142,11 +142,19 @@ merged part covers the blocks its inputs covered, and that is what makes `Entry.
 a repair that terminates on a successor — decidable from identity alone (`backend/ARCH.md`, "Part
 identity is a block interval plus a level").
 
-Two merges allocate instead, and both leave their output superseding nothing until a later merge
-rewrites it. Inputs that all predate format v5 carry no interval to inherit; a fresh `[n, n]` is how
-such a part migrates, a merge being the only thing that rewrites it. And a merge whose output is
-split across several parts cannot hand any one of them the union — none holds all of that data, so a
-successor claim would answer a want with a fraction of the part. A **mixed** merge inherits the
+Two merges allocate instead, and both leave their output superseding nothing. Inputs that all
+predate format v5 carry no interval to inherit; a fresh `[n, n]` is how such a part migrates, a merge
+being the only thing that rewrites it. And a merge whose output is split across several parts cannot
+hand any one of them the union — none holds all of that data, so a successor claim would answer a
+want with a fraction of the part. **The severed lineage is permanent**: the inputs' intervals leave
+the index with them, every later merge over the outputs inherits the fresh numbers, and a want naming
+a retired input is satisfiable only by its exact prefix — so a replica that lost that part before a
+peer split it cannot be repaired from the fragments, and repair acknowledges a hole for data the
+fragments hold (#548). Two further costs of the interval algebra sit beside it: `Interval.Union` is a
+hull, so a merge over the neighbors of a lost part claims its block and discharges the want without
+its rows; and `NextBlock` counts only what the index still names, so fragments published by the
+commit that retires the top-numbered inputs take those inputs' numbers again, each one an input's
+interval one level up. The reproducers are gated in `splitlineage_test.go`. A **mixed** merge inherits the
 union of the inputs that do carry an interval and allocates nothing on top: a want naming a pre-v5
 part records that part's unset interval, so no claim the output could make would contain it, and a
 fresh block would name blocks the output does not cover.

@@ -42,8 +42,11 @@ func planFlushBlocks(p *part) { p.pending = &blockPlan{} }
 // inherit; a fresh one is how such a part migrates, a merge being the only thing that rewrites it.
 // And a merge that splits its output over several parts cannot hand any of them the union: none
 // holds all of that data, so a successor claim would answer a want with a fraction of the part.
-// Both leave the outputs superseding nothing, which costs a repair the fallback to exact-prefix
-// matching and is corrected by the next merge.
+// Both leave the outputs superseding nothing, and nothing later restores what was severed: the
+// inputs' intervals leave the index with them, and every part merged from the outputs inherits the
+// fresh numbers, so a want naming an input is satisfiable only by its exact prefix — which the same
+// commit retired. See engine/ARCH.md, "Block identity is allocated by the commit that publishes the
+// part".
 //
 // A mixed merge — some inputs carrying an interval, some not — inherits the union of the ones that
 // do. It cannot do better: a want naming a pre-v5 part records that part's unset interval, so no
