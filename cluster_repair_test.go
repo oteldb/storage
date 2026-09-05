@@ -54,7 +54,7 @@ func TestRepairCompleteOwnerSetIsAbsence(t *testing.T) {
 	r := a.repairerFor(tid, "acme/metrics")
 	require.NotNil(t, r)
 
-	_, outcome, err := r.FetchWant(ctx, bucketindex.Want{Prefix: "acme/metrics/0000000001"})
+	outcome, err := fetchOne(ctx, r, bucketindex.Want{Prefix: "acme/metrics/0000000001"})
 	require.NoError(t, err)
 	assert.Equal(t, bucketindex.WantAbsent, outcome, "no owner holds it, and every owner answered")
 }
@@ -81,7 +81,7 @@ func TestRepairShortOwnerSetIsIncomplete(t *testing.T) {
 	r := a.repairerFor(tid, "acme/metrics")
 	require.NotNil(t, r)
 
-	_, outcome, err := r.FetchWant(ctx, bucketindex.Want{Prefix: "acme/metrics/0000000001"})
+	outcome, err := fetchOne(ctx, r, bucketindex.Want{Prefix: "acme/metrics/0000000001"})
 	require.NoError(t, err)
 	assert.Equal(t, bucketindex.WantIncomplete, outcome,
 		"absence over a subset of the owners must never read as absence")
@@ -107,7 +107,7 @@ func TestRepairSingleOwnerShardIsComplete(t *testing.T) {
 	r := a.repairerFor(tid, "acme/metrics")
 	require.NotNil(t, r)
 
-	_, outcome, err := r.FetchWant(ctx, bucketindex.Want{Prefix: "acme/metrics/0000000001"})
+	outcome, err := fetchOne(ctx, r, bucketindex.Want{Prefix: "acme/metrics/0000000001"})
 	require.NoError(t, err)
 	assert.Equal(t, bucketindex.WantAbsent, outcome)
 }
@@ -121,4 +121,13 @@ func TestRepairerAbsentWithoutPrivateBackend(t *testing.T) {
 	assert.Nil(t, s.repairerFor(signal.TenantID("acme"), "acme/metrics"))
 	assert.Nil(t, s.metricRepairerFor(signal.TenantID("acme"), "acme/metrics"))
 	assert.Nil(t, s.recordRepairerFor(signal.TenantID("acme"), "acme/metrics"))
+}
+
+// fetchOne drives the batch repair seam with a single want.
+func fetchOne(
+	ctx context.Context, r *partRepairer, w bucketindex.Want,
+) (bucketindex.WantOutcome, error) {
+	res := r.FetchWants(ctx, []bucketindex.Want{w})
+
+	return res[0].Outcome, res[0].Err
 }

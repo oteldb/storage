@@ -5,7 +5,8 @@ import (
 	"maps"
 	"slices"
 	"strings"
-	"sync"
+
+	"github.com/go-faster/errors"
 
 	"github.com/go-faster/sdk/zctx"
 	"go.uber.org/zap"
@@ -13,21 +14,18 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 )
 
-// repairFetchesPerCycle bounds how many wants one merge cycle tries to repair, and
-// repairFetchConcurrency how many of those fetches are in flight at once.
+// repairFetchesPerCycle bounds how many wants one merge cycle tries to repair. The
+// [PartFetcher] bounds how many part copies that cycle runs concurrently.
 //
 // A repair fetch copies a whole part — up to Config.MaxPartBytes — from a peer, so an unbounded
 // pass on a badly damaged node would spend the entire maintenance cycle in the network and never
-// compact. Both numbers are small on purpose: repair is anti-entropy, it runs every cycle, and a
+// compact. The number is small on purpose: repair is anti-entropy, it runs every cycle, and a
 // shard that needs more than a handful of parts back is past what part-by-part repair is for.
 //
 // The fetching side is not the side that needs the real budget. Under pull, every recovering node
 // converges on whichever peers hold the data, so it is the *serving* side that turns one node's
 // disk failure into a shard-wide degradation; capping it is future work.
-const (
-	repairFetchesPerCycle  = 4
-	repairFetchConcurrency = 2
-)
+const repairFetchesPerCycle = 4
 
 // holeConfirmations is how many consecutive repair attempts must reach the same definitive-absence
 // conclusion before the loss is acknowledged with a hole.
@@ -251,8 +249,9 @@ func (e *Engine) entriesLocked() []bucketindex.Entry {
 	return append(out, e.foreign...)
 }
 
-// fetchWants pulls up to [repairFetchesPerCycle] targets' parts from peers, bounded to
-// [repairFetchConcurrency] concurrent copies, and returns what each attempt concluded.
+// fetchWants pulls up to [repairFetchesPerCycle] targets' parts from peers in one call — the
+// fetcher answers the whole cycle at once so it can read each peer's index once and copy a part
+// discharging several wants once — and returns what each attempt concluded.
 func (e *Engine) fetchWants(ctx context.Context, pending []repairTarget) ([]repairResult, RepairStats) {
 	var stats RepairStats
 
@@ -262,59 +261,53 @@ func (e *Engine) fetchWants(ctx context.Context, pending []repairTarget) ([]repa
 
 	pending = pending[:min(len(pending), repairFetchesPerCycle)]
 
-	var (
-		mu  sync.Mutex
-		out []repairResult
-		wg  sync.WaitGroup
-	)
-
-	sem := make(chan struct{}, repairFetchConcurrency)
-
-	for _, t := range pending {
-		wg.Add(1)
-		sem <- struct{}{}
-
-		go func() {
-			defer func() { <-sem; wg.Done() }()
-
-			ent, outcome, err := e.cfg.Repair.FetchWant(ctx, t.want)
-
-			mu.Lock()
-			defer mu.Unlock()
-
-			if err != nil {
-				stats.Failed++
-
-				zctx.From(ctx).Warn("repair fetch failed",
-					zap.String("prefix", e.cfg.Prefix), zap.String("want", t.want.Prefix), zap.Error(err))
-
-				return
-			}
-
-			switch outcome {
-			case bucketindex.WantSatisfied:
-				if t.hole {
-					stats.Revoked++
-				} else {
-					stats.Fetched++
-				}
-			case bucketindex.WantAbsent:
-				stats.Unsatisfiable++
-
-				zctx.From(ctx).Warn("no owner holds a part satisfying the want",
-					zap.String("prefix", e.cfg.Prefix), zap.String("want", t.want.Prefix))
-			case bucketindex.WantIncomplete:
-				stats.Incomplete++
-
-				zctx.From(ctx).Warn("repair could not reach every owner of the shard",
-					zap.String("prefix", e.cfg.Prefix), zap.String("want", t.want.Prefix))
-			}
-
-			out = append(out, repairResult{repairTarget: t, entry: ent, outcome: outcome})
-		}()
+	wants := make([]bucketindex.Want, len(pending))
+	for i, t := range pending {
+		wants[i] = t.want
 	}
 
-	wg.Wait()
+	results := e.cfg.Repair.FetchWants(ctx, wants)
+
+	out := make([]repairResult, 0, len(pending))
+
+	for i, t := range pending {
+		// A short answer is a broken fetcher, not evidence: count it as a transient failure so the
+		// want stays outstanding.
+		r := FetchResult{Err: errors.Errorf("repair fetcher returned %d results for %d wants", len(results), len(pending))}
+		if i < len(results) {
+			r = results[i]
+		}
+
+		if r.Err != nil {
+			stats.Failed++
+
+			zctx.From(ctx).Warn("repair fetch failed",
+				zap.String("prefix", e.cfg.Prefix), zap.String("want", t.want.Prefix), zap.Error(r.Err))
+
+			continue
+		}
+
+		switch r.Outcome {
+		case bucketindex.WantSatisfied:
+			if t.hole {
+				stats.Revoked++
+			} else {
+				stats.Fetched++
+			}
+		case bucketindex.WantAbsent:
+			stats.Unsatisfiable++
+
+			zctx.From(ctx).Warn("no owner holds a part satisfying the want",
+				zap.String("prefix", e.cfg.Prefix), zap.String("want", t.want.Prefix))
+		case bucketindex.WantIncomplete:
+			stats.Incomplete++
+
+			zctx.From(ctx).Warn("repair could not reach every owner of the shard",
+				zap.String("prefix", e.cfg.Prefix), zap.String("want", t.want.Prefix))
+		}
+
+		out = append(out, repairResult{repairTarget: t, entry: r.Entry, outcome: r.Outcome})
+	}
 
 	// Deterministic order so the parts are opened, and any supersession applied, the same way on
 	// every node.

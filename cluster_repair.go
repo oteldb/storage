@@ -22,7 +22,10 @@ type partRepairer struct {
 	prefix string
 }
 
-// FetchWant implements the engines' PartFetcher.
+// FetchWants implements the engines' PartFetcher.
+//
+// The owner set is resolved once for the cycle, so every want in it is judged against the same
+// view of who holds the shard.
 //
 // Finding nothing is reported as definitive absence only when this node could ask *every* owner
 // the shard is expected to have: the ring named the full replication factor, every one of those
@@ -35,9 +38,7 @@ type partRepairer struct {
 // currently returns. A cluster permanently running fewer nodes than its RF therefore never
 // acknowledges a loss, which is the safe direction: an outstanding want is visible and
 // recoverable, a hole over live data is neither.
-func (r *partRepairer) FetchWant(
-	ctx context.Context, w bucketindex.Want,
-) (bucketindex.Entry, bucketindex.WantOutcome, error) {
+func (r *partRepairer) FetchWants(ctx context.Context, wants []bucketindex.Want) []engine.FetchResult {
 	complete, remotes := r.s.completeOwners(r.tid)
 
 	absent := bucketindex.WantIncomplete
@@ -45,20 +46,46 @@ func (r *partRepairer) FetchWant(
 		absent = bucketindex.WantAbsent
 	}
 
+	out := make([]engine.FetchResult, len(wants))
+
 	if len(remotes) == 0 {
-		return bucketindex.Entry{}, absent, nil
+		for i := range out {
+			out[i].Outcome = absent
+		}
+
+		return out
 	}
 
-	ent, ok, err := r.s.cluster.psync.FetchWant(ctx, r.prefix, remotes, w)
-
-	switch {
-	case err != nil:
-		return bucketindex.Entry{}, bucketindex.WantIncomplete, err
-	case ok:
-		return ent, bucketindex.WantSatisfied, nil
-	default:
-		return bucketindex.Entry{}, absent, nil
+	for i, res := range r.s.cluster.psync.FetchWants(ctx, r.prefix, remotes, wants) {
+		switch {
+		case res.Err != nil:
+			out[i] = engine.FetchResult{Outcome: bucketindex.WantIncomplete, Err: res.Err}
+		case res.OK:
+			out[i] = engine.FetchResult{Entry: res.Entry, Outcome: bucketindex.WantSatisfied}
+		default:
+			out[i] = engine.FetchResult{Outcome: absent}
+		}
 	}
+
+	return out
+}
+
+// recordPartRepairer adapts [partRepairer] to the record engines' identical seam; the two engines
+// declare their own result type, so the wrapper only re-labels the fields.
+type recordPartRepairer struct{ *partRepairer }
+
+// FetchWants implements recordengine.PartFetcher.
+func (r recordPartRepairer) FetchWants(
+	ctx context.Context, wants []bucketindex.Want,
+) []recordengine.FetchResult {
+	src := r.partRepairer.FetchWants(ctx, wants)
+
+	out := make([]recordengine.FetchResult, len(src))
+	for i, s := range src {
+		out[i] = recordengine.FetchResult{Entry: s.Entry, Outcome: s.Outcome, Err: s.Err}
+	}
+
+	return out
 }
 
 // completeOwners reports the shard's remote owners and whether they are the whole expected owner
@@ -106,7 +133,7 @@ func (s *Storage) recordRepairerFor(tid signal.TenantID, prefix string) recorden
 		return nil
 	}
 
-	return r
+	return recordPartRepairer{r}
 }
 
 func (s *Storage) metricRepairerFor(tid signal.TenantID, prefix string) engine.PartFetcher {

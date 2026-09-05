@@ -481,13 +481,19 @@ a want is serviced the data may exist only inside a merged successor, and chasin
 longer exists anywhere would never converge. The local index is asked first, so a want this
 engine's own merges already covered costs no network call at all.
 
-`Config.Repair` (`PartFetcher`) is the whole seam to the cluster: a part identity in, the entry of
-whatever part was actually copied out. The engine never learns about peers, addresses or transport —
+`Config.Repair` (`PartFetcher`) is the whole seam to the cluster: part identities in, the entries of
+whatever parts were actually copied out. The engine never learns about peers, addresses or transport —
 `cluster/partsync` supplies the implementation, and nil (single node, or a shared backend where
-every replica reads the same objects) makes repair a no-op. `ok=false` with a nil error is
-definitive absence and leaves the want outstanding, counted in `RepairStats.Unsatisfiable`; an
+every replica reads the same objects) makes repair a no-op. A `WantAbsent` outcome with a nil error
+is definitive absence and leaves the want outstanding, counted in `RepairStats.Unsatisfiable`; an
 error is transient and retried next cycle. The two are never merged: an unreachable peer is not
 evidence that data is gone.
+
+The seam takes the **whole cycle's wants in one call**, capped at `repairFetchesPerCycle`, and gets
+one result per want back. The cluster-side cost is per cycle, not per want — one read of each peer's
+bucket index answers every want, and one copy of a merged successor discharges every want inside it
+— so splitting the cycle into per-want calls would multiply both by the want count. Fetch
+concurrency therefore belongs to the implementation, not to the engine.
 
 Publishing a repaired part is the same swap a merge publishes — it is committed into `Entries`, and
 the commit's want trim discharges every want it satisfies. A fetched **successor** also retires the

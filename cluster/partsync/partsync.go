@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"path"
@@ -361,6 +362,21 @@ type Syncer struct {
 	state map[string]*prefixState
 	// totals is the cumulative activity across every prefix and pass.
 	totals Totals
+
+	// rnd shuffles the peer order a repair selects over; rndMu guards it because *rand.Rand is
+	// not safe for concurrent use and repair batches run per engine.
+	rndMu sync.Mutex
+	rnd   *rand.Rand
+}
+
+// Option configures a [Syncer].
+type Option func(*Syncer)
+
+// WithRandSeed fixes the source a repair shuffles peers with, making peer selection reproducible.
+// For tests; production leaves it unset and gets a per-process random source.
+func WithRandSeed(seed uint64) Option {
+	//nolint:gosec // G404: spreading repair load across equal peers, not a security decision
+	return func(s *Syncer) { s.rnd = rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)) }
 }
 
 // Totals returns a snapshot of the Syncer's cumulative activity.
@@ -382,8 +398,20 @@ type prefixState struct {
 }
 
 // New returns a Syncer mirroring into local via client.
-func New(local backend.Backend, client *Client) *Syncer {
-	return &Syncer{local: local, client: client, state: make(map[string]*prefixState)}
+func New(local backend.Backend, client *Client, opts ...Option) *Syncer {
+	s := &Syncer{
+		local:  local,
+		client: client,
+		state:  make(map[string]*prefixState),
+		//nolint:gosec // G404: spreading repair load across equal peers, not a security decision
+		rnd: rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
+	}
+
+	for _, o := range opts {
+		o(s)
+	}
+
+	return s
 }
 
 // Sync mirrors one engine prefix (e.g. "default/metrics") from the newest of peers into the

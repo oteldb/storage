@@ -308,16 +308,36 @@ per prefix so a notify can never install an older index over a newer one.
 
 ### Repairing a want
 
-`Syncer.FetchWant` is the serving half of the engines' repair seam (`engine/ARCH.md`,
-"Repair"). Given a `bucketindex.Want` it asks every peer for its bucket index, runs
-`Index.Satisfying` over each, and copies the objects of the best answer — widest block interval,
-then deepest level, so one fetch recovers the most data. It installs no index: committing the entry
-is the owner's own commit, which is what discharges the want.
+`Syncer.FetchWants` is the serving half of the engines' repair seam (`engine/ARCH.md`,
+"Repair"). It takes a whole repair cycle's `bucketindex.Want`s, asks every peer for its bucket
+index, runs `Index.Satisfying` over each, and copies the objects of the best answer per want —
+widest block interval, then deepest level, so one fetch recovers the most data. It installs no
+index: committing the entries is the owner's own commit, which is what discharges the wants.
+
+**The batch is the unit because the cost is per cycle, not per want.** Each peer's index is read
+once for the batch (O(peers), not O(peers × wants)), and a merged successor discharging several
+wants is copied once. Nothing outlives the call: a peer index cached across cycles would let repair
+act on a stale view of what peers hold, and staleness is precisely what anti-entropy is for.
+
+Peer indexes are read **concurrently, but selected by shuffled peer index rather than by arrival**.
+Results land in a slice aligned to the peer order and selection runs after every fetch returns, so
+the winner is a function of the entries, not of the network — taking the first good answer would
+silently retire "prefer the most satisfying part". Nothing cancels a sibling fetch either: a
+cancelled fetch would surface as a failure this node never actually suffered.
+
+The peer order is **shuffled per batch**, from a source `partsync.WithRandSeed` makes injectable.
+`betterCandidate` is a strict order and returns false for two identical entries, so without the
+shuffle every recovering node would pick whichever peer sorts first for the same want — the fan-in
+the pull direction cannot afford. Owner preference is deliberately *not* a tiebreak: it would aim
+the repair load at the busiest node. ClickHouse shuffles replicas in
+`findReplicaHavingCoveringPart` for the same reason.
 
 The distinction the call exists to preserve is **definitive absence versus an unanswered peer**.
-`ok=false` with a nil error means every peer replied and none named a satisfying part; a peer that
+`OK=false` with a nil error means every peer replied and none named a satisfying part; a peer that
 could not be reached is an error, and the want survives untouched. Collapsing the two would let an
-unreachable peer be read as proof the data is gone.
+unreachable peer be read as proof the data is gone — which is why every peer's failure is folded
+into the batch's result even when other peers answered cleanly, and why the concurrency above
+neither drops nor manufactures one.
 
 Unlike a whole-prefix sync, a missing object mid-copy is fatal to the call: the caller is about to
 publish an index entry naming that part, and a part it could not fully copy must never become one.
@@ -329,7 +349,7 @@ owner's acknowledged loss cannot become another's.
 
 ### Absence over the owners, not over whoever answered
 
-`Syncer.FetchWant` reports absence over the peers it was *given*. Whether those peers are the
+`Syncer.FetchWants` reports absence over the peers it was *given*. Whether those peers are the
 shard's owners is `partRepairer`'s to establish (`cluster_repair.go`), and it is what decides
 whether the engine may ever acknowledge a loss (`engine/ARCH.md`, "An unrepairable want becomes a
 revocable hole"). `completeOwners` requires all three of: the ring named at least as many owners as
