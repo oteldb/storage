@@ -168,6 +168,12 @@ type PartSyncStats struct {
 	CopiedBytes int64
 	// Pruned is the stale local objects deleted after the quarantine delay.
 	Pruned int64
+	// Withheld is the local objects a prune declined to delete because no peer said it removed
+	// their part, and Retained the parts kept in an installed index because the peer's index did
+	// not account for them at all. Both name a peer missing data it should hold: steady state is
+	// zero, and a value that keeps climbing names a damaged owner.
+	Withheld int64
+	Retained int64
 	// Errors is the passes that failed part-way (retried next maintenance tick).
 	Errors int64
 	// LastSyncUnixNano is when the last mirroring pass completed (zero until one has) — the
@@ -318,7 +324,8 @@ func (s *Storage) clusterStats() *ClusterStats {
 		cs.PartSync = &PartSyncStats{
 			Passes: t.Passes, Mirrored: t.Mirrored,
 			Copied: t.Copied, CopiedBytes: t.CopiedBytes,
-			Pruned: t.Pruned, Errors: t.Errors,
+			Pruned: t.Pruned, Withheld: t.Withheld, Retained: t.Retained,
+			Errors:           t.Errors,
 			LastSyncUnixNano: t.LastSyncUnixNano,
 		}
 		cs.EC = &ECStats{

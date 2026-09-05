@@ -35,8 +35,12 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
   part-mirroring activity (nil otherwise): cumulative `Passes` (every sync attempt — the
   "is the sync loop running?" probe), `Mirrored` (passes that installed a newer peer copy),
   `Copied`/`CopiedBytes` (objects fetched from peers), `Pruned` (stale local objects deleted after
-  the quarantine delay), `Errors` (failed passes, retried next tick), and `LastSyncUnixNano` (when
-  the last mirroring pass completed — the replication-staleness probe). `Cluster.EC` (same
+  the quarantine delay), `Withheld`/`Retained` (the two halves of "a peer is missing data it should
+  hold" — objects a prune declined to delete because no peer said it removed their part, and parts
+  kept in an installed index because the peer's index neither named nor accounted for them; both are
+  zero in steady state, and a climbing value names a damaged owner), `Errors` (failed passes, retried
+  next tick), and `LastSyncUnixNano` (when the last mirroring pass completed — the
+  replication-staleness probe). `Cluster.EC` (same
   gating) reports the erasure-coding activity, cumulative: `Converted`/`ConvertErrors` (cold parts
   coded by this node as compaction owner), `RepairedSlots`/`RepairErrors` (shard slots rebuilt
   after a loss), `PrunedStagedParts` (staged shards dropped after distribution — each one converges

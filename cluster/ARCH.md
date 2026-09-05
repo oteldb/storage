@@ -313,14 +313,26 @@ acknowledged a loss on the last index before the hole.
 is a copy of whichever owner's index last superseded it, so a want or a hole in it says only that
 *that owner* could not read the part — nothing about the peer's disk, and nothing about this one.
 Two rules follow. Installing a superseding index never moves a part this node holds out of
-`Entries`: an entry the local index names whose manifest is on disk (the manifest lands last, so its
-presence is a complete copy) stays, and the peer's claim of loss rides beside it as a want — kept
-rather than dropped, because that want is what the owner's repair pass discharges with a commit,
-and that commit is what republishes the part at a generation the peers adopt; a hole becomes the
-want it discharged, since an entry and a hole cannot share a prefix, and `LostParts` stays where it
-was, as on any revocation. Dropping the want instead would leave the owner nothing to commit, and a
-replica's damaged, higher-generation index would stand until the next flush. And repair asks the
-disks: `FetchWants` falls back to each peer's listing for a want no index names (below).
+`Entries` unless the peer's index **accounts for** it: an entry the local index names whose manifest
+is on disk (the manifest lands last, so its presence is a complete copy) stays unless the peer names
+the part itself, states a tombstone for it, or holds a live entry whose identity subsumes it
+(`Entry.Supersedes` — a merge output covers its inputs' blocks at a higher level, so the rows are
+inside it). An omission is not an account: a part the peer neither names nor explains is one this
+node holds the only copy of, and installing that index verbatim would leave the rows unreachable
+while the deletion rule below withholds the bytes — unreclaimable at the same time. Containment is
+what keeps this from resurrecting compacted parts forever; it is the same evidence a repair accepts
+for a want (`Index.Satisfying`), and it does not depend on tombstones, which are bounded and age out.
+
+What rides beside a kept entry depends on what the peer said. A **claim** of loss — a want or a hole
+— is carried back as a want, kept rather than dropped, because that want is what the owner's repair
+pass discharges with a commit, and that commit is what republishes the part at a generation the peers
+adopt; a hole becomes the want it discharged, since an entry and a hole cannot share a prefix, and
+`LostParts` stays where it was, as on any revocation. Dropping the want instead would leave the owner
+nothing to commit, and a replica's damaged, higher-generation index would stand until the next flush.
+An **omission** carries nothing: the peer stated no obligation, this node reads the part fine, and
+inventing a want would point the loss counters at the healthy node. The signal is `Stats.Retained`
+instead — the `Withheld` of the object half, for a peer that omits rather than claims. And repair asks
+the disks: `FetchWants` falls back to each peer's listing for a want no index names (below).
 
 **Nor is this node's own index evidence of its own disk.** A pass is index-driven — nothing newer at
 the peer, nothing to do — so a replica that loses objects while the owner's index stands still would
@@ -361,7 +373,8 @@ the part it lost. So the index also carries **tombstones** — each removed part
 that removed it — recorded by the engine from the diff against the index it last wrote. Pruning
 requires one: a part absent from a peer's index that the peer never claimed to have removed is a
 peer missing data, and its objects are withheld and counted (`Stats.Withheld`, a repair signal that
-is zero in steady state) rather than deleted. This is the shape Mimir gets from `deletion-mark.json`
+is zero in steady state) rather than deleted — while the entry itself stays in the installed index
+(above), so the withheld objects are a live part rather than orphaned bytes. This is the shape Mimir gets from `deletion-mark.json`
 and ClickHouse from an explicit `DROP_RANGE`; with no shared bucket to hold it, the statement rides
 in the index. Tombstones are bounded (`bucketindex.MaxRemovals`, newest kept), so a replica further
 behind than that keeps garbage instead of guessing, and a legacy index states no removals at all,
