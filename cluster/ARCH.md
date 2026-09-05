@@ -316,12 +316,20 @@ Two rules follow. Installing a superseding index never moves a part this node ho
 `Entries` unless the peer's index **accounts for** it: an entry the local index names whose manifest
 is on disk (the manifest lands last, so its presence is a complete copy) stays unless the peer names
 the part itself, states a tombstone for it, or holds a live entry whose identity subsumes it
-(`Entry.Supersedes` — a merge output covers its inputs' blocks at a higher level, so the rows are
-inside it). An omission is not an account: a part the peer neither names nor explains is one this
+(`Entry.Supersedes` — a merge output covers the union of the blocks its inputs covered and nothing
+else, at a higher level, so containment is a statement about which parts were consumed and the rows
+are inside it). An omission is not an account: a part the peer neither names nor explains is one this
 node holds the only copy of, and installing that index verbatim would leave the rows unreachable
 while the deletion rule below withholds the bytes — unreclaimable at the same time. Containment is
 what keeps this from resurrecting compacted parts forever; it is the same evidence a repair accepts
 for a want (`Index.Satisfying`), and it does not depend on tombstones, which are bounded and age out.
+
+`accountsFor` deliberately stops short of `Satisfying`'s **split-group** case: a peer that holds a
+part's rows only jointly, spread across the fragments of a split, does not account for it and the
+local copy is kept. Dropping a part on a joint claim would mean trusting that every member of the
+group is on that one peer and stays there, which is a stronger bet than an omission is worth; the
+cost of the conservative answer is a part kept a little longer, and a merge that rejoins the group
+folds the claim into an ordinary interval and settles it.
 
 What rides beside a kept entry depends on what the peer said. A **claim** of loss — a want or a hole
 — is carried back as a want, kept rather than dropped, because that want is what the owner's repair
@@ -397,7 +405,9 @@ per prefix so a notify can never install an older index over a newer one.
 `Syncer.FetchWants` is the serving half of the engines' repair seam (`engine/ARCH.md`,
 "Repair"). It takes a whole repair cycle's `bucketindex.Want`s, asks every peer for its bucket
 index, runs `Index.Satisfying` over each, and copies the objects of the best answer per want —
-widest block interval, then deepest level, so one fetch recovers the most data. It installs no
+widest block set, then deepest level, so one fetch recovers the most data. A want naming blocks
+rather than a prefix — one member of a split group the asking engine still needs — is answered from
+the peers' indexes only: the empty prefix matches no listing, so the disk fallback below skips it. It installs no
 index: committing the entries is the owner's own commit, which is what discharges the wants.
 
 **The batch is the unit because the cost is per cycle, not per want.** Each peer's index is read
