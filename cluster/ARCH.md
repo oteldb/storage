@@ -187,8 +187,11 @@ survives) is user-visible unavailability.
 
 A node coordinating against its own shards folds its **own** disclaim into that tally, so a fan-out
 where the one remote owner holds nothing does not read as "nothing holds this shard". With no peer at
-all — a single-node cluster — the read fails here, which is the same policy with the failover
-removed; serving the local engine there would answer the query short with no error.
+all — a single-node cluster, or every peer filtered out of the owner set — the read fails here, which
+is the same policy with the failover removed; serving the local engine there would answer the query
+short with no error. This holds for every fan-out alike: the fetch (`gapFetcher` → `hedgedFetcher`),
+the aggregates (`shardAggregateWith`) and the enumeration RPCs (`hedgeOwners`, whose denominator is
+remotes plus self), because an empty listing is the same short answer as an empty fetch.
 
 The guard has one implementation per RPC and both callers reach it through the same function: the
 node coordinating a query against its own shards calls the very code that serves a peer's request,

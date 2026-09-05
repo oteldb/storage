@@ -199,6 +199,8 @@ func (h hedgedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterat
 
 	if err != nil && disclaims.Failed(owners) {
 		h.store.obs.RPC.ReadIncomplete(ctx, h.op)
+
+		return nil, failedReadError(err)
 	}
 
 	return it, err

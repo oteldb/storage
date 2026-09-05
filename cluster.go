@@ -834,6 +834,8 @@ func shardAggregateWith[T any](
 
 	if disclaims.Failed(owners) {
 		s.obs.RPC.ReadIncomplete(ctx, rpcOpRead)
+
+		return nil, failedReadError(lastErr)
 	}
 
 	return nil, lastErr // nil when there were no reachable owners (treated as no data)
@@ -1125,14 +1127,19 @@ func (s *Storage) shardSeries(
 	eq []fetch.EqualMatcher, start, end int64,
 ) ([]signal.Series, error) {
 	local, remotes := s.shardPlacement(ctx, rpcOpSeries, sig, shardKey)
+
+	var selfDisclaim error
+
 	if local {
 		ser, err := s.localSeries(ctx, sig, string(shardKey), start, end, matchers)
 		if !disclaimedLocally(err) {
 			return ser, err
 		}
+
+		selfDisclaim = err
 	}
 
-	return hedgeOwners(ctx, s, rpcOpSeries, remotes, func(ctx context.Context, addr string) ([]signal.Series, error) {
+	return hedgeOwners(ctx, s, rpcOpSeries, remotes, selfDisclaim, func(ctx context.Context, addr string) ([]signal.Series, error) {
 		series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end, eq, s.clusterOpts...)
 		if err != nil {
 			return nil, err
@@ -1195,14 +1202,19 @@ func (s *Storage) shardKeys(
 	ctx context.Context, sig signal.Signal, shardKey signal.TenantID, start, end int64,
 ) ([]cluster.KeyInfo, error) {
 	local, remotes := s.shardPlacement(ctx, rpcOpKeys, sig, shardKey)
+
+	var selfDisclaim error
+
 	if local {
 		keys, err := s.localKeys(ctx, sig, string(shardKey), start, end)
 		if !disclaimedLocally(err) {
 			return keys, err
 		}
+
+		selfDisclaim = err
 	}
 
-	return hedgeOwners(ctx, s, rpcOpKeys, remotes, func(ctx context.Context, addr string) ([]cluster.KeyInfo, error) {
+	return hedgeOwners(ctx, s, rpcOpKeys, remotes, selfDisclaim, func(ctx context.Context, addr string) ([]cluster.KeyInfo, error) {
 		return cluster.FetchKeys(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end, s.clusterOpts...)
 	})
 }
@@ -1254,14 +1266,19 @@ func (s *Storage) shardValues(ctx context.Context, r cluster.ValuesRequest) ([][
 	shardKey := signal.TenantID(r.Tenant)
 
 	local, remotes := s.shardPlacement(ctx, rpcOpValues, r.Signal, shardKey)
+
+	var selfDisclaim error
+
 	if local {
 		values, err := s.localValues(ctx, r)
 		if !disclaimedLocally(err) {
 			return values, err
 		}
+
+		selfDisclaim = err
 	}
 
-	return hedgeOwners(ctx, s, rpcOpValues, remotes, func(ctx context.Context, addr string) ([][]byte, error) {
+	return hedgeOwners(ctx, s, rpcOpValues, remotes, selfDisclaim, func(ctx context.Context, addr string) ([][]byte, error) {
 		return cluster.FetchValues(ctx, s.cluster.httpc, addr, r, s.clusterOpts...)
 	})
 }
@@ -1295,14 +1312,19 @@ func (s *Storage) clusterProfileSymbols(ctx context.Context, tid signal.TenantID
 // across its remote owners (each a complete replica — symbols ride the write path).
 func (s *Storage) shardSymbols(ctx context.Context, shardKey signal.TenantID) (map[string][]byte, error) {
 	local, remotes := s.shardPlacement(ctx, rpcOpSide, signal.Profile, shardKey)
+
+	var selfDisclaim error
+
 	if local {
 		tables, err := s.localProfileSymbols(ctx, string(shardKey))
 		if !disclaimedLocally(err) {
 			return tables, err
 		}
+
+		selfDisclaim = err
 	}
 
-	return hedgeOwners(ctx, s, rpcOpSide, remotes, func(ctx context.Context, addr string) (map[string][]byte, error) {
+	return hedgeOwners(ctx, s, rpcOpSide, remotes, selfDisclaim, func(ctx context.Context, addr string) (map[string][]byte, error) {
 		return cluster.FetchSide(ctx, s.cluster.httpc, addr, signal.Profile, string(shardKey), s.clusterOpts...)
 	})
 }

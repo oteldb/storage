@@ -296,3 +296,90 @@ func TestSingleNodeReadFailsWithNothingToFailOverTo(t *testing.T) {
 	_, err = fetchLogs(ctx, s, 0, 1<<62)
 	require.ErrorIs(t, err, cluster.ErrShardIncomplete, "with no owner to ask, the read fails here")
 }
+
+// loseOldestLogPart is [readPolicyCluster.loseOldestPart] for a node opened on its own, outside the
+// three-node harness.
+func loseOldestLogPart(t *testing.T, s *Storage, shard signal.TenantID) {
+	t.Helper()
+	ctx := context.Background()
+
+	eng, ok := s.lookupRecordEngine(signal.Log, shard)
+	require.True(t, ok)
+
+	parts := eng.Parts()
+	require.NotEmpty(t, parts)
+
+	keys, err := s.backend.List(ctx, parts[0].ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, keys)
+
+	for _, k := range keys {
+		require.NoError(t, s.backend.Delete(ctx, k))
+	}
+
+	require.NoError(t, eng.LoadParts(ctx))
+	require.Positive(t, eng.Stats().WantedParts)
+}
+
+// TestEnumerationSoleOwnerIncompleteFails is [TestSingleNodeReadFailsWithNothingToFailOverTo] for
+// the enumeration seams: the one node holding the shard cannot answer the window and has no peer to
+// ask. An empty listing here is the same short answer as an empty fetch, and must fail the same way.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestEnumerationSoleOwnerIncompleteFails(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	s := openClusterNodePrivate(t, endpoint, "solo", 1)
+
+	_, err := s.WriteLogs(ctx, logBatch("api", [3]any{100, 9, "first"}, [3]any{200, 17, "second"}))
+	require.NoError(t, err)
+	require.NoError(t, s.Admin().MaintainNow(ctx))
+
+	shard := shardKeyOf("default", 0, s.cluster.shardCount())
+	loseOldestLogPart(t, s, shard)
+
+	_, err = s.LogSeries(ctx, "default", nil, 0, 1<<62)
+	require.ErrorIs(t, err, cluster.ErrShardIncomplete, "series: with no owner to ask, the listing fails here")
+
+	_, err = s.LogKeys(ctx, "default", 0, 1<<62)
+	require.ErrorIs(t, err, cluster.ErrShardIncomplete, "keys: with no owner to ask, the listing fails here")
+}
+
+// TestEnumerationLocalIncompleteDeniesRemoteAbsence: this node holds the shard and knows it is short,
+// and the only other owner does not hold it at all (it joined after the write and has not backfilled).
+// Nobody can answer, and one of the disclaims is an incompleteness — so the listing must fail rather
+// than collapse to empty on the strength of the peer's absence alone.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestEnumerationLocalIncompleteDeniesRemoteAbsence(t *testing.T) {
+	endpoint := startEtcd(t)
+	ctx := context.Background()
+
+	a := openClusterNodePrivate(t, endpoint, "node-a", 2)
+
+	_, err := a.WriteLogs(ctx, logBatch("api", [3]any{100, 9, "first"}, [3]any{200, 17, "second"}))
+	require.NoError(t, err)
+	require.NoError(t, a.Admin().MaintainNow(ctx))
+
+	b := openClusterNodePrivate(t, endpoint, "node-b", 2)
+	awaitMembership(t, map[string]*Storage{"node-a": a, "node-b": b})
+
+	shard := shardKeyOf("default", 0, a.cluster.shardCount())
+
+	local, remotes := a.shardOwners(shard)
+	require.True(t, local)
+	require.Len(t, remotes, 1, "RF 2 puts the late joiner in the owner set")
+	require.False(t, b.holdsShard(signal.Log, shard), "the late joiner has not backfilled the shard")
+
+	loseOldestLogPart(t, a, shard)
+
+	_, err = a.LogSeries(ctx, "default", nil, 0, 1<<62)
+	require.ErrorIs(t, err, cluster.ErrShardIncomplete, "series: an absent peer cannot vouch for an empty listing")
+
+	_, err = a.LogKeys(ctx, "default", 0, 1<<62)
+	require.ErrorIs(t, err, cluster.ErrShardIncomplete, "keys: an absent peer cannot vouch for an empty listing")
+
+	_, err = fetchLogs(ctx, a, 0, 1<<62)
+	require.ErrorIs(t, err, cluster.ErrShardIncomplete, "fetch: the same tally ends on the same sentinel")
+}
