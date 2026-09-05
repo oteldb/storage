@@ -19,23 +19,37 @@ import (
 // and answers with whatever the test staged, so the engine half of the seam is exercised without a
 // peer, a transport or a syncer.
 type fakeFetcher struct {
-	// mu guards asked: repair runs up to repairFetchConcurrency fetches at once.
 	mu     sync.Mutex
 	asked  []string
+	calls  int
 	answer func(w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error)
 }
 
-func (f *fakeFetcher) FetchWant(_ context.Context, w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
+func (f *fakeFetcher) FetchWants(_ context.Context, wants []bucketindex.Want) []engine.FetchResult {
 	f.mu.Lock()
-	f.asked = append(f.asked, w.Prefix)
+	f.calls++
+
+	for _, w := range wants {
+		f.asked = append(f.asked, w.Prefix)
+	}
+
 	answer := f.answer
 	f.mu.Unlock()
 
-	if answer == nil {
-		return bucketindex.Entry{}, bucketindex.WantAbsent, nil
+	out := make([]engine.FetchResult, len(wants))
+
+	for i, w := range wants {
+		if answer == nil {
+			out[i].Outcome = bucketindex.WantAbsent
+
+			continue
+		}
+
+		ent, outcome, err := answer(w)
+		out[i] = engine.FetchResult{Entry: ent, Outcome: outcome, Err: err}
 	}
 
-	return answer(w)
+	return out
 }
 
 // asks reports what repair has asked for, in call order.
@@ -44,6 +58,14 @@ func (f *fakeFetcher) asks() []string {
 	defer f.mu.Unlock()
 
 	return slices.Clone(f.asked)
+}
+
+// fetchCalls reports how many batches repair issued — one per cycle, whatever the want count.
+func (f *fakeFetcher) fetchCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.calls
 }
 
 func newRepairEngine(t *testing.T, be backend.Backend, r engine.PartFetcher) *engine.Engine {
@@ -314,4 +336,30 @@ func loseOneOfThree(t *testing.T, e *engine.Engine, be backend.Backend) string {
 	require.True(t, slices.Contains(e.WantPrefixes(), lost))
 
 	return lost
+}
+
+// TestRepairAsksTheFetcherOncePerCycle pins the batch seam: a cycle's wants go over in one call,
+// which is what lets the cluster side read each peer's index once instead of once per want.
+func TestRepairAsksTheFetcherOncePerCycle(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := backend.Memory()
+
+	f := &fakeFetcher{answer: func(bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
+		return bucketindex.Entry{}, bucketindex.WantAbsent, nil
+	}}
+	e := newRepairEngine(t, be, f)
+
+	parts := flushSamples(t, e, 3)
+	for i, p := range parts {
+		dropObjects(t, be, p)
+		e.LosePart(p, bucketindex.Interval{Min: uint64(i + 1), Max: uint64(i + 1)})
+	}
+
+	require.Len(t, e.WantPrefixes(), len(parts))
+	require.NoError(t, e.Merge(ctx, 0))
+
+	assert.Equal(t, 1, f.fetchCalls(), "one batch per cycle, whatever the want count")
+	assert.Len(t, f.asks(), len(parts), "every want is still asked for")
 }
