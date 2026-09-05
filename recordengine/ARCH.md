@@ -215,6 +215,11 @@ their replacement is committed. See [`../engine/ARCH.md`](../engine/ARCH.md), "P
 serves stay the same set; the adopted parts are readable but not owned. See
 [`../engine/ARCH.md`](../engine/ARCH.md), "Adopted parts".
 
+**Block identity** is allocated the same way: a flush output takes a fresh `[n, n]` at level 0, a
+merge output the union of its inputs at one level above them, assigned per CAS attempt and written
+onto the part only once the commit lands. See [`../engine/ARCH.md`](../engine/ARCH.md), "Block
+identity is allocated by the commit that publishes the part".
+
 **Repair** is identical to the metric engine, down to `Config.Repair`, the satisfaction rule (the
 exact part, or the largest containing part at a higher level), and the two gates a want must clear
 before its loss is acknowledged as a revocable hole. See [`../engine/ARCH.md`](../engine/ARCH.md),

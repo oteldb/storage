@@ -149,9 +149,12 @@ a demonstration.
   containment in either direction, and is matched by exact prefix until a merge rewrites it. Any
   inverted or zero-touching interval a corrupt encoding could produce is unset by the same rule, so
   the predicate is total.
+  `Interval.Union` is what a merge output claims — the blocks its inputs covered.
   **Allocation is the shard owner's alone**: `Index.NextBlock` is `max(block) + 1` over its own
   entries *and* its outstanding wants (a wanted part's blocks stay claimed — it may be repaired
-  back in), claimed by the same `CompareAndSwap` that adds the part. No etcd, no round trip on the
+  back in), claimed by the same `CompareAndSwap` that adds the part. A writer rebasing on a rival's
+  index counts the adopted entries too — see `engine/ARCH.md`, "Block identity is allocated by the
+  commit that publishes the part". No etcd, no round trip on the
   flush path, and it works with the cluster layer absent. Two owners racing a handoff resolve
   through that CAS: one commit lands, the loser wraps `ErrConflict`, re-reads, and re-allocates
   above the winner.

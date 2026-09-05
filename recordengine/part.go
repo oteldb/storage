@@ -62,6 +62,11 @@ type part struct {
 	blocks bucketindex.Interval
 	level  uint32
 
+	// pending is the identity a part this engine just wrote is waiting to be assigned; nil for one
+	// opened from an index, whose identity is whatever that index recorded — including the unset
+	// one of a part written before format v5. See blockid.go.
+	pending *blockPlan
+
 	// rawBytes is the part's decoded footprint per its manifest, 0 for a part written before the
 	// manifest carried one. See [part.sizeBytes].
 	rawBytes int64

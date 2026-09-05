@@ -51,6 +51,13 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 			// engine's own list here, never while building an index that may not be written.
 			e.wants = ix.Wanted
 			e.pendingWants = nil
+			// Same rule for the blocks this attempt allocated: a part numbered before its CAS
+			// landed would hold a block the winner took, and the retry would not re-allocate.
+			for _, a := range e.pendingBlocks {
+				a.part.blocks, a.part.level, a.part.pending = a.blocks, a.level, nil
+			}
+
+			e.pendingBlocks = nil
 			e.holes, e.lostParts = ix.Holes(), ix.LostParts
 			e.pendingHoles = nil
 
@@ -211,14 +218,34 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 		ix.Add(ent)
 	}
 
+	// Block numbers are allocated here, per attempt, because a rival's entries are only known
+	// after a rebase: allocating once and reusing it across retries would hand a part a block the
+	// winner already claimed. The assignments are held, not applied — see [Engine.updateIndexLocked].
+	next := e.nextBlockLocked(ix)
+
+	var assigned []blockAssignment
+
 	live := make(map[string]struct{}, len(e.parts))
 	for _, p := range e.parts {
+		blocks, level := p.blocks, p.level
+		if id := p.pending; id != nil {
+			blocks, level = id.blocks, id.level
+			if !blocks.Valid() {
+				blocks = bucketindex.Interval{Min: next, Max: next}
+				next++
+			}
+
+			assigned = append(assigned, blockAssignment{part: p, blocks: blocks, level: level})
+		}
+
 		ix.Add(bucketindex.Entry{
 			Prefix: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
-			Blocks: p.blocks, Level: p.level,
+			Blocks: blocks, Level: level,
 		})
 		live[p.prefix] = struct{}{}
 	}
+
+	e.pendingBlocks = assigned
 
 	// A part the last index named and this one does not was removed here, and says so. Absence
 	// on its own is not evidence — a part missing from an index is either one a merge consumed

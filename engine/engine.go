@@ -255,6 +255,9 @@ type Engine struct {
 	// discovery pending rather than committing it on the spot is what makes dropping the entry and
 	// recording the want one CAS commit instead of two.
 	pendingWants []bucketindex.Want
+	// pendingBlocks are the block identities the index under construction chose for the parts that
+	// do not have one yet. Applied only by the commit that lands — see [blockAssignment].
+	pendingBlocks []blockAssignment
 	// repaired counts what repair did, for the operator surface and for tests: a want cannot be
 	// left silently outstanding.
 	repaired RepairStats
@@ -1541,6 +1544,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		}
 
 		p.minTime, p.maxTime = colsTimeRange(sub)
+		planFlushBlocks(p)
 		newParts = append(newParts, p)
 	}
 
