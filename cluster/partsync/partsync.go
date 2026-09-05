@@ -324,6 +324,11 @@ type Stats struct {
 	// removed one. That is a peer missing data it should hold, so a non-zero value is a repair
 	// signal, not a tuning knob.
 	Withheld int
+	// Retained is the number of parts this node kept in the installed index because the peer's
+	// index neither names nor accounts for them — no want, no hole, no tombstone, no successor
+	// containing their blocks. Like Withheld it names a peer missing data, and it is the half that
+	// covers a peer that made no claim at all.
+	Retained int
 }
 
 // Totals is a Syncer's cumulative activity across every prefix and pass, for the operator
@@ -343,6 +348,9 @@ type Totals struct {
 	// removed their part — a peer missing data it should hold. It is a repair signal: steady
 	// state is zero, and a value that keeps climbing names a damaged owner.
 	Withheld int64
+	// Retained is the parts kept in an installed index because the peer's index did not account
+	// for them. The same repair signal as Withheld, for a peer that omits rather than claims.
+	Retained int64
 	// Errors is the passes that failed part-way (retried by the next maintenance tick).
 	Errors int64
 	// LastSyncUnixNano is the wall-clock completion time of the most recent mirroring pass
@@ -449,6 +457,7 @@ func (s *Syncer) account(st Stats, err error) {
 	s.totals.CopiedBytes += st.CopiedBytes
 	s.totals.Pruned += int64(st.Pruned)
 	s.totals.Withheld += int64(st.Withheld)
+	s.totals.Retained += int64(st.Retained)
 
 	switch {
 	case err != nil:
@@ -490,21 +499,26 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 	}
 
 	cmp := compareIndexes(peerIndex, localIndex)
+	acct := accountOf(peerIndex)
 
 	installed, installedRaw := peerIndex, peerIndexRaw
 
+	var retained int
+
 	if cmp >= 0 {
-		held, err := s.heldEntries(ctx, localIndex, peerIndex)
+		h, err := s.heldEntries(ctx, localIndex, acct)
 		if err != nil {
 			return Stats{}, errors.Wrap(err, "check held parts")
 		}
 
-		if len(held) > 0 {
-			installed = retainHeld(peerIndex, held)
+		if h.len() > 0 {
+			installed = retainHeld(peerIndex, h)
 			installedRaw = installed.AppendBinary(nil)
+			retained = len(h.omitted)
 
-			zctx.From(ctx).Info("partsync: keeping parts the peer's index reports lost",
-				zap.String("prefix", enginePrefix), zap.String("peer", addr), zap.Int("parts", len(held)))
+			zctx.From(ctx).Info("partsync: keeping parts the peer's index does not account for",
+				zap.String("prefix", enginePrefix), zap.String("peer", addr),
+				zap.Int("claimed", len(h.claimed)), zap.Int("omitted", len(h.omitted)))
 		}
 	}
 
@@ -525,11 +539,11 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 	if !newer && !forced {
 		reconcile, err := s.reconcileConverged(ctx, enginePrefix, addr, strict, cmp)
 		if err != nil || !reconcile {
-			return Stats{}, err
+			return Stats{Retained: retained}, err
 		}
 	}
 
-	st := Stats{}
+	st := Stats{Retained: retained}
 
 	unbacked, err := s.copyMissing(ctx, &st, addr, enginePrefix, indexKey, keep, peerIndex.Entries)
 	if err != nil {
@@ -566,8 +580,8 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 
 	del := deletion{
 		live:    livePartSet(installed, localIndex, supersedes),
-		removed: peerIndex.Removals(),
-		stated:  peerIndex.RecordsRemovals(),
+		removed: acct.removed,
+		stated:  acct.stated,
 	}
 	if err := s.prune(ctx, &st, enginePrefix, keep, del); err != nil {
 		return st, err

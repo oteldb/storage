@@ -158,7 +158,7 @@ func TestSyncIgnoresAStaleSnapshotPeer(t *testing.T) {
 // left and goes on flushing, so its later writes legitimately supersede and legitimately do not
 // name the lost part. Nothing in the ordering can tell that from a compaction — only the absence
 // of a tombstone can.
-func TestSyncWithholdsWhenASupersedingPeerStatesNoRemoval(t *testing.T) {
+func TestSyncRetainsWhenASupersedingPeerStatesNoRemoval(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -174,7 +174,7 @@ func TestSyncWithholdsWhenASupersedingPeerStatesNoRemoval(t *testing.T) {
 	// supersedes.
 	ix = dropPart(t, owner, "t/metrics", ix, 1, gen(1, 6), false)
 
-	var withheld int
+	var retained int
 	for seq := 3; seq <= 6; seq++ {
 		writePart(t, owner, ix, "t/metrics", seq, int64(seq)*1000, int64(seq)*1000+100)
 		ix.Generation = ix.Generation.Next(1)
@@ -183,14 +183,20 @@ func TestSyncWithholdsWhenASupersedingPeerStatesNoRemoval(t *testing.T) {
 		for range 2 {
 			st, err := s.Sync(ctx, "t/metrics", []string{addr}, false, nil)
 			require.NoError(t, err)
-			withheld += st.Withheld
+			retained += st.Retained
 		}
 
 		_, err = replica.Read(ctx, "t/metrics/0000000001/manifest")
 		require.NoErrorf(t, err, "the replica's good copy was deleted after flush %d", seq)
 	}
 
-	assert.Positive(t, withheld, "a peer missing data it should hold is reported, not obeyed")
+	// The copy is kept *and* named by the installed index, so the objects are a live part rather
+	// than withheld garbage: the repair signal is Retained, not Withheld.
+	assert.Positive(t, retained, "a peer missing data it should hold is reported, not obeyed")
+
+	got, err := bucketindex.Load(ctx, replica, "t/metrics/"+bucketindex.Object)
+	require.NoError(t, err)
+	assert.Contains(t, partPrefixes(got), "t/metrics/0000000001", "and the rows stay reachable")
 
 	// The parts the owner did write are still mirrored: withholding a deletion does not stop
 	// replication.
