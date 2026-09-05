@@ -86,9 +86,7 @@ func TestTrimWantsDischargedByHole(t *testing.T) {
 	hole := w.Entry()
 	hole.Hole = true
 
-	kept, dropped := bucketindex.TrimWants([]bucketindex.Want{w}, []bucketindex.Entry{hole}, 10)
-	assert.Empty(t, kept)
-	assert.Empty(t, dropped)
+	assert.Empty(t, bucketindex.TrimWants([]bucketindex.Want{w}, []bucketindex.Entry{hole}))
 }
 
 func TestRevokes(t *testing.T) {

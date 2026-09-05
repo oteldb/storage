@@ -163,12 +163,15 @@ a demonstration.
   obligation to fetch it back). Conflating the two would make "am I repaired?" unanswerable, which
   is the property the whole repair design turns on; an absence that is *neither* is a consistency
   alarm rather than a repair trigger. `RecordWant`/`SatisfyWant`/`Wants` mirror
-  `Tombstone`/`Removals`. `MaxWants` bounds the list at `MaxRemovals`, deliberately the same
-  number — past it a node cannot tell a removed part from a lost one and must adopt a peer's
-  current index wholesale rather than repair part by part, so one constant governs both
-  boundaries. Because a forgotten want is a repair that never happens, `TrimWants` **returns** what
-  the bound forced out instead of dropping it silently: overflow escalates to a reseed, it does not
-  lose the obligation. A want carries the lost part's own time bounds, so `Want.Overlaps` answers the
+  `Tombstone`/`Removals`. `MaxWants` is `MaxRemovals`, deliberately the same number — past it a
+  node cannot tell a removed part from a lost one and must adopt a peer's current index wholesale
+  rather than repair part by part, so one constant governs both boundaries — but unlike
+  `MaxRemovals` it **bounds nothing**: a tombstone accumulates for as long as the shard lives and has
+  to be cut, while a want is the only record that a part is owed, and it costs the index the bytes
+  its entry did, so `Wanted` is bounded by the parts the node has held rather than by uptime.
+  `TrimWants` drops only what a live entry discharges; the engines log past the horizon and keep
+  every want, because a forgotten want is a repair that never happens and a read that is silently
+  short. A want carries the lost part's own time bounds, so `Want.Overlaps` answers the
   read path's question — is *this* window short? — and an unrepaired shard stays readable outside the
   range it actually lost. A want with no bounds at all names a part of unknown extent and therefore
   covers everything: a want is a claim of ignorance and errs wide.
