@@ -97,8 +97,17 @@ Fencing suppresses the **primary role only**:
 - **The unflushed head is kept**, neither dropped nor flushed. Dropping loses writes that were
   properly replicated when they were acked; flushing writes parts under a tenure that has ended,
   which the shard's new owner never tombstones. It flushes when the node can prove the shard is
-  its own again — which follows from `Reconcile` being a no-op while fenced, since the maintenance
-  loop only flushes owned shards.
+  its own again.
+
+Every path that can write a shard's parts asks the same question — *does this node hold the
+shard's claim?* (`Storage.claimsShard`, which `Ownership.Term` answers as not-held both for a
+shard claimed elsewhere and for anything while fenced). The maintenance cycle's reconcile, the
+size-triggered pressure sweep (`flushPressured`) and the operator's `Admin.Flush`/`Compact` all
+gate on it. The claim, not ring primacy: the ring is a node's own membership view and freezes
+when it loses etcd, so a displaced node still resolves itself as primary. A pressure sweep never
+reconciles — it reads the claim it already holds, so a size trigger costs no etcd round trip and a
+node that has not reconciled yet simply keeps its head until the next cycle; the admin path, which
+an operator can call on a node opened moments ago, reconciles once before refusing.
 
 The residual is bounded and named: writes acked between the instant the lease was actually lost and
 the deadline. That is a parameter (`FenceMargin`), not "until someone notices".

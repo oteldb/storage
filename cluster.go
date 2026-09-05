@@ -1697,6 +1697,27 @@ func (s *Storage) writerID() string {
 	return s.opts.Cluster.Self.ID
 }
 
+// claimsShard reports whether this node currently holds tid's compaction claim, and so may write the
+// shard's parts. Always true in single-node mode, where there is no second writer.
+//
+// It is the etcd claim rather than ring primacy because the ring is this node's own membership view
+// and freezes when it loses etcd: a displaced node goes on resolving itself as primary of shards
+// that have moved on. The claim also folds in lease fencing — [etcd.Ownership] reports nothing held
+// once the lease backing every claim is past its fence deadline (see cluster_fence.go).
+//
+// A node that has never reconciled — before the first maintenance tick, or while etcd is
+// unreachable — holds nothing and so writes nothing, which is the honest answer: it cannot prove
+// the shard is its own.
+func (s *Storage) claimsShard(tid signal.TenantID) bool {
+	if s.cluster == nil {
+		return true
+	}
+
+	_, held := s.cluster.ownership.Term(string(s.normalizeTenant(tid)))
+
+	return held
+}
+
 func (s *Storage) termFor(tid signal.TenantID) func() uint64 {
 	if s.cluster == nil {
 		return nil

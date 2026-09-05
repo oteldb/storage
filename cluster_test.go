@@ -879,9 +879,9 @@ func TestInspectClusterSection(t *testing.T) {
 	assert.Nil(t, ss.Cluster.PartSync, "shared backend ⇒ no part-sync section")
 }
 
-// TestAdminCompactOwnershipGate verifies the Admin flush/compact ownership gate: a node that is not
-// the ring-primary of a tenant returns ErrNotOwner (so a shard's parts stay single-writer), while
-// the owner succeeds.
+// TestAdminCompactOwnershipGate verifies the Admin flush/compact ownership gate: a node that cannot
+// claim a tenant's shard returns ErrNotOwner (so a shard's parts stay single-writer), while the
+// ring-primary — which the gate's reconcile lets claim it on the spot — succeeds.
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestAdminCompactOwnershipGate(t *testing.T) {

@@ -325,9 +325,12 @@ when a flush, merge, or drop changes the part set (or the budget itself moves), 
 follows an idle one does no part enumeration at all. Erasure-coding a part rewrites its stored bytes
 under the same identity, so the converter drops the tenant's memo.
 
-In **cluster mode**, `Flush`/`Compact`/`CompactNow` act only on shards this node is the ring-primary of, returning
-`ErrNotOwner` otherwise — so a shard's parts are still written by exactly one node, the invariant the
-maintenance loop preserves. Single-node owns everything.
+In **cluster mode**, `Flush`/`Compact`/`CompactNow`/`PruneIdentities` act only on shards this node holds the etcd
+compaction claim on, returning `ErrNotOwner` otherwise — so a shard's parts are still written by exactly one node,
+the invariant the maintenance loop preserves. The claim rather than ring primacy: a node whose lease has lapsed is
+fenced and holds nothing, and a node whose ring view is stale still resolves itself as primary. A node that has not
+reconciled yet (opened moments ago) reconciles once before refusing, so an operator never waits out a maintenance
+interval for a shard that is plainly its own. Single-node owns everything.
 
 ## Ranged column reads (`backend.ReaderAt`)
 
