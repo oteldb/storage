@@ -98,6 +98,41 @@ type Config struct {
 	// exhaust with the disk half empty, and byte accounting cannot see it. 0 ⇒
 	// [diskguard.DefaultReserveInodes]; negative ⇒ the inode axis is not checked.
 	MinFreeInodes int64
+	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
+	// still has it. It is supplied by the cluster layer, which owns peer discovery and the
+	// node-to-node transport; nil is single-node mode, where an outstanding want stays outstanding
+	// because there is nowhere to fetch it from. See [PartFetcher].
+	Repair PartFetcher
+}
+
+// PartFetcher makes the objects of the parts discharging a repair cycle's wants local, so the
+// engine can open them and commit them back into the index. It is the engine's whole view of the
+// cluster during repair: part identities in, the entries of the parts actually copied out.
+//
+// A whole cycle goes in one call because the cluster-side cost is per cycle, not per want: one
+// read of each peer's bucket index answers every want, and one copy of a part discharges every
+// want it contains. Splitting the cycle multiplies both by the number of wants.
+//
+// The outcome qualifies a fetch that brought nothing back, and the qualification is what decides
+// whether the owner may ever conclude the data is gone — see [bucketindex.WantOutcome]. Any error is transient
+// (a peer that could not be reached says nothing about whether the data exists), and the want is
+// retried on the next merge.
+//
+// The entry need not name the wanted prefix: a peer that has merged the part away answers with the
+// successor containing it, which is what makes repair terminate.
+type PartFetcher interface {
+	// FetchWants answers every want, returning one result per want in the same order.
+	FetchWants(ctx context.Context, wants []bucketindex.Want) []FetchResult
+}
+
+// FetchResult is one want's outcome from a [PartFetcher].
+type FetchResult struct {
+	// Entry names the part that came across, valid only when Outcome is [bucketindex.WantSatisfied].
+	Entry bucketindex.Entry
+	// Outcome qualifies a fetch that brought nothing back.
+	Outcome bucketindex.WantOutcome
+	// Err is a transient failure; the want is retried on the next merge.
+	Err error
 }
 
 // Engine is one tenant's record store for a signal. Safe for concurrent use.
@@ -168,6 +203,37 @@ type Engine struct {
 	// replica tell a compaction from a loss.
 	indexed  map[string]struct{}
 	removals []bucketindex.Removal
+	// wants are the repair obligations the last bucket index this engine wrote carried: parts it
+	// holds an entry for but cannot read. They ride every commit like removals, and are discharged
+	// only by committing a part that satisfies them (see repair.go).
+	wants []bucketindex.Want
+	// holes are the acknowledged losses carried in this engine's index: wants no owner could
+	// supply, committed as entries with [bucketindex.Entry.Hole] set so a read, an operator and
+	// the next repair pass all see them. They are kept out of e.parts — a hole names no objects
+	// and there is nothing to open.
+	holes []bucketindex.Entry
+	// holeEvidence counts, per want prefix, the consecutive repair attempts that concluded
+	// definitive absence over the shard's complete owner set; any other outcome resets it. It is
+	// deliberately in memory: a restart forgets the evidence and repair has to earn it again,
+	// which errs toward leaving a want outstanding rather than toward inventing a hole.
+	holeEvidence map[string]int
+	// lostParts is the index's monotone data-loss counter, carried across commits and raised to a
+	// rival's on rebase, so it is a cluster-visible fact and not a level a restart clears.
+	lostParts uint64
+	// pendingHoles are the losses the next commit must acknowledge. Like pendingWants they are
+	// held rather than applied on the spot, so a commit that never lands leaves the want
+	// outstanding instead of half-discharged.
+	pendingHoles []bucketindex.Want
+	// pendingWants are the ones a load discovered and the next commit must add. Keeping the
+	// discovery pending rather than committing it on the spot is what makes dropping the entry and
+	// recording the want one CAS commit instead of two.
+	pendingWants []bucketindex.Want
+	// pendingBlocks are the block identities the index under construction chose for the parts that
+	// do not have one yet. Applied only by the commit that lands — see [blockAssignment].
+	pendingBlocks []blockAssignment
+	// repaired counts what repair did, for the operator surface and for tests: a want cannot be
+	// left silently outstanding.
+	repaired RepairStats
 	// indexVersion is the backend version of the bucket index this engine last read or committed —
 	// the token its next commit conditions on, so a rewrite that another writer got in front of is
 	// refused rather than silently overwriting it (#392).
@@ -393,6 +459,17 @@ type Stats struct {
 	// OutOfSpace is set while the engine refuses writes because its backend is out of bytes or
 	// inodes. Reads still answer from what is on disk; it clears when a flush finds room again.
 	OutOfSpace bool
+	// WantedParts is the repair obligations outstanding right now: parts the index names that this
+	// node cannot read and has not yet got back. Non-zero means the shard is not fully repaired.
+	WantedParts int
+	// Holes is the index entries that stand for an acknowledged loss rather than a part (see
+	// [bucketindex.Entry.Hole]). A read overlapping one is short by whatever that part held, so a
+	// hole is reported apart from Parts and never counted among them.
+	Holes int
+	// LostParts is the shard's monotone data-loss count as its index records it: the holes its
+	// writers have ever committed, including ones since revoked. It never decreases, and every
+	// owner of the shard reads the same number.
+	LostParts uint64
 }
 
 // Stats returns an in-memory snapshot of the engine's state under a single read lock (no backend
@@ -408,6 +485,9 @@ func (e *Engine) Stats() Stats {
 		HeadAge:       e.head.age(),
 		IdentityBytes: e.head.identityBytes(),
 		Parts:         len(e.parts),
+		WantedParts:   len(e.wants) + len(e.pendingWants),
+		Holes:         len(e.holes),
+		LostParts:     e.lostParts,
 		MaxTime:       e.head.newest,
 	}
 
@@ -1360,6 +1440,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		}
 
 		p.minTime, p.maxTime = colsTimeRange(sub)
+		planFlushBlocks(p)
 
 		// Each part carries its own copy of the side-store delta: a part's columns reference symbols
 		// by id, so every part a split produces must resolve them on its own.

@@ -141,7 +141,11 @@ jittered backoff; **idempotent reads hedge** across replicas, **writes stay at-m
 `reliability.RetryConfig` is the public knob (`Default`, `LossyEnvironment`). A shard read is
 routed to a **holder**, not to a ring owner: an owner that has no data for the shard answers
 `cluster.ErrShardAbsent`, which fails over to an owner that does, so a ring/data disagreement never
-degrades into a silently partial result.
+degrades into a silently partial result. An owner that *holds* the shard and knows it is missing data
+for the window — a head lost at restart, or a part its index names but it cannot read — answers
+`cluster.ErrShardIncomplete`, which fails over the same way but never collapses to an empty success:
+when every owner disclaims, "no owner holds it" reads as empty and "an owner holds it and is short"
+fails the read (`cluster.Disclaims`).
 
 ---
 
@@ -186,6 +190,19 @@ degrades into a silently partial result.
   part swept at the next open — never rows that are committed but unresolvable. The commit is a
   `backend.CompareAndSwap` against the version the writer read, so two writers over one prefix (a
   shared store) cannot overwrite each other's entries; the loser reloads and retries.
+- **A part leaves the index's `Entries` only into `Removed` or into `Wanted`** — a tombstone (a
+  deliberate deletion) or a repair obligation, never silently. An owner that cannot open a part
+  drops it and records the want in the *same* commit, so the two halves cannot come apart; and only
+  a definitive `backend.ErrNotExist` qualifies, because a backend that merely failed to answer says
+  nothing about whether the data is there (`backend/ARCH.md`, `engine/ARCH.md`).
+- **An acknowledged loss is an entry, and it is monotone.** A want no owner of the shard can satisfy
+  becomes a *hole* — an `Entry` flagged as loss at the missing part's identity — which discharges
+  the want so reads resume, and raises the index's monotone `LostParts`. The flag rides on the entry
+  every reader already carries, so a hole can never be mistaken for an empty part. Two guards stand
+  between a want and a hole, both because a hole over live data is unrecoverable while an
+  outstanding want is not: the peer set must be the shard's *complete expected* owner set, and the
+  conclusion must repeat over consecutive repair passes. A hole is revoked by the part turning up on
+  any owner; the loss count never falls (`engine/ARCH.md`, `cluster/ARCH.md`).
 - **A part id is globally unique** (both engines). A part's backend key is `{enginePrefix}/{partid}`,
   where `partid` is a minted ULID-shaped id (`internal/partid`), not a per-node counter: replicas of a
   shard can share one object store under one prefix, so only an id no local state participates in

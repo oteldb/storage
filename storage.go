@@ -980,10 +980,16 @@ func (s *Storage) recover(ctx context.Context) error {
 		return errors.Wrap(err, "list backend for recovery")
 	}
 
-	// load creates an engine (propagating a creation error) and loads its flushed parts.
+	// load creates an engine (propagating a creation error) and loads its flushed parts. A cluster
+	// node holds no compaction claim yet, so a part it cannot read is not committed as a want here:
+	// only an owner writes one, and the first owned commit carries it ([engine.Engine.LoadPartsUnclaimed]).
 	load := func(e partLoader, err error) error {
 		if err != nil {
 			return err
+		}
+
+		if s.opts.Cluster != nil {
+			return e.LoadPartsUnclaimed(ctx)
 		}
 
 		return e.LoadParts(ctx)
@@ -1028,6 +1034,7 @@ func (s *Storage) recover(ctx context.Context) error {
 // created engine's flushed parts uniformly.
 type partLoader interface {
 	LoadParts(ctx context.Context) error
+	LoadPartsUnclaimed(ctx context.Context) error
 }
 
 // recoverWAL replays each per-tenant WAL directory under [Options.WALDir] into its engine, restoring
@@ -1177,6 +1184,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		MergeMemoryBytes:  s.opts.MergeMemoryBytes,
 		MinFreeBytes:      s.opts.MinFreeBytes,
 		MinFreeInodes:     s.opts.MinFreeInodes,
+		Repair:            s.metricRepairerFor(tid, prefix),
 	})
 	s.tenants[tid] = e
 

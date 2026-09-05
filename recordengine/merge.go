@@ -50,6 +50,10 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 		zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
 		zap.Int64("retain_from", retainFrom), zap.Bool("force", opts.Force))
 
+	// Repair first: a part pulled back from a peer joins this cycle's compaction, and a merge that
+	// cannot repair still compacts.
+	e.repairWants(ctx)
+
 	res, err := e.merge(ctx, opts)
 	if err != nil {
 		span.RecordError(err)
@@ -136,6 +140,8 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	if err != nil {
 		return mergeResult{parts: dropped}, err
 	}
+
+	planMergeBlocks(selected, newParts)
 
 	// Publish (under lock): swap the selected parts for the merged one(s) copy-on-write (keeping every
 	// unselected part, including any a concurrent flush may have added) and persist the index. The

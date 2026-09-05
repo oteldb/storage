@@ -2,7 +2,6 @@ package router
 
 import (
 	"context"
-	"sync/atomic"
 
 	"github.com/go-faster/errors"
 	"go.opentelemetry.io/otel/attribute"
@@ -76,16 +75,14 @@ func hedgeOwners[T any](
 		return zero, nil
 	}
 
-	var absent atomic.Int64
+	var disclaims cluster.Disclaims
 
 	thunks := make([]func(context.Context) (T, error), len(addrs))
 	for i := range addrs {
 		addr := addrs[i]
 		thunks[i] = func(ctx context.Context) (T, error) {
 			v, err := call(ctx, addr)
-			if errors.Is(err, cluster.ErrShardAbsent) {
-				absent.Add(1)
-			}
+			disclaims.Note(err)
 
 			return v, err
 		}
@@ -93,9 +90,11 @@ func hedgeOwners[T any](
 
 	v, err := retry.Hedge(ctx, r.readPolicy(), thunks)
 
-	span.SetAttributes(attribute.Int64("storage.rpc.owners_absent", absent.Load()))
+	span.SetAttributes(
+		attribute.Int64("storage.rpc.owners_absent", disclaims.Absent()),
+		attribute.Int64("storage.rpc.owners_incomplete", disclaims.Incomplete()))
 
-	if err != nil && int(absent.Load()) >= len(addrs) {
+	if err != nil && disclaims.Empty(len(addrs)) {
 		err = nil
 
 		return zero, nil
@@ -127,16 +126,14 @@ func (h hedgedFetcher) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iter
 		return nil, errors.New("router: no reachable owners for shard") //nolint:spancheck // ended by the deferred endSpan above
 	}
 
-	var absent atomic.Int64
+	var disclaims cluster.Disclaims
 
 	thunks := make([]func(context.Context) (fetch.Iterator, error), len(h.remotes))
 	for i := range h.remotes {
 		f := h.remotes[i]
 		thunks[i] = func(ctx context.Context) (fetch.Iterator, error) {
 			it, err := f.Fetch(ctx, r)
-			if errors.Is(err, cluster.ErrShardAbsent) {
-				absent.Add(1)
-			}
+			disclaims.Note(err)
 
 			return it, err
 		}
@@ -152,9 +149,11 @@ func (h hedgedFetcher) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iter
 
 	it, err := retry.Hedge(ctx, policy, thunks)
 
-	span.SetAttributes(attribute.Int64("storage.rpc.owners_absent", absent.Load()))
+	span.SetAttributes(
+		attribute.Int64("storage.rpc.owners_absent", disclaims.Absent()),
+		attribute.Int64("storage.rpc.owners_incomplete", disclaims.Incomplete()))
 
-	if err != nil && int(absent.Load()) >= len(h.remotes) {
+	if err != nil && disclaims.Empty(len(h.remotes)) {
 		err = nil
 
 		return fetch.NewSliceIterator(nil), nil

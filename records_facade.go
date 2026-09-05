@@ -95,6 +95,7 @@ func (s *Storage) recordEngineCached(
 		// Flushes stay codec-only, so ingest is unaffected.
 		MergeCompression:      compress.AlgorithmZSTD,
 		MergeCompressionLevel: compress.LevelBest,
+		Repair:                s.recordRepairerFor(tid, prefix),
 	})
 	m[tid] = e
 

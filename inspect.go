@@ -103,6 +103,21 @@ type SignalStats struct {
 	// ingest is rejected with an error wrapping backend.ErrNoSpace rather than accepted and lost.
 	// Reads keep answering from what is on disk, and it clears when a later flush finds room.
 	OutOfSpace bool
+	// WantedParts is the repair obligations outstanding right now: parts this engine's index names
+	// but cannot read, awaiting a copy from a peer. Non-zero means the shard is not fully repaired;
+	// it clears when the parts come back or the losses are acknowledged.
+	WantedParts int
+	// Holes is the index entries standing for an acknowledged loss rather than a part: no owner of
+	// the shard had the part or any successor of it, so a zero-row marker was committed at its
+	// identity to stop the obligation blocking. They are **not** counted in Parts — a query over a
+	// hole's range is short by whatever the lost part held. A hole is revocable: if the part turns
+	// up on any owner it replaces the hole and this drops back to zero.
+	Holes int
+	// LostParts is the shard's monotone data-loss count as its bucket index records it: every hole
+	// its writers have ever committed, including ones since revoked. It never decreases and every
+	// owner reads the same number, so it is the durable answer to "did this shard ever lose data?"
+	// — unlike Holes, which is the current state.
+	LostParts uint64
 }
 
 // ClusterStats is the cluster-mode view of this node.
@@ -214,6 +229,7 @@ func (s *Storage) Inspect() StoreStats {
 			SealedParts:  sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
 			MergeCapBytes: sh.CapBytes, OutOfSpace: es.OutOfSpace,
 			WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
+			WantedParts: es.WantedParts, Holes: es.Holes, LostParts: es.LostParts,
 		})
 		s.attachReadGap(&ts.Signals[len(ts.Signals)-1], signal.Metric, tid)
 
@@ -240,6 +256,7 @@ func (s *Storage) Inspect() StoreStats {
 				SealedParts:  sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
 				MergeCapBytes: sh.CapBytes, OutOfSpace: es.OutOfSpace,
 				WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
+				WantedParts: es.WantedParts, Holes: es.Holes, LostParts: es.LostParts,
 			})
 			s.attachReadGap(&ts.Signals[len(ts.Signals)-1], sig, tid)
 		}

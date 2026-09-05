@@ -86,6 +86,17 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context) error {
 		live[p.prefix] = struct{}{}
 	}
 
+	// A wanted part's objects are not orphans, they are what is left of it. Deleting the readable
+	// remainder of a part repair is about to fetch destroys evidence and buys nothing: the want
+	// bounds how long it is kept, and a discharged want puts the prefix back in the live set.
+	for _, w := range e.wants {
+		live[w.Prefix] = struct{}{}
+	}
+
+	for _, w := range e.pendingWants {
+		live[w.Prefix] = struct{}{}
+	}
+
 	var orphans []string
 
 	for _, k := range keys {

@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"path"
@@ -361,6 +362,21 @@ type Syncer struct {
 	state map[string]*prefixState
 	// totals is the cumulative activity across every prefix and pass.
 	totals Totals
+
+	// rnd shuffles the peer order a repair selects over; rndMu guards it because *rand.Rand is
+	// not safe for concurrent use and repair batches run per engine.
+	rndMu sync.Mutex
+	rnd   *rand.Rand
+}
+
+// Option configures a [Syncer].
+type Option func(*Syncer)
+
+// WithRandSeed fixes the source a repair shuffles peers with, making peer selection reproducible.
+// For tests; production leaves it unset and gets a per-process random source.
+func WithRandSeed(seed uint64) Option {
+	//nolint:gosec // G404: spreading repair load across equal peers, not a security decision
+	return func(s *Syncer) { s.rnd = rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)) }
 }
 
 // Totals returns a snapshot of the Syncer's cumulative activity.
@@ -382,8 +398,20 @@ type prefixState struct {
 }
 
 // New returns a Syncer mirroring into local via client.
-func New(local backend.Backend, client *Client) *Syncer {
-	return &Syncer{local: local, client: client, state: make(map[string]*prefixState)}
+func New(local backend.Backend, client *Client, opts ...Option) *Syncer {
+	s := &Syncer{
+		local:  local,
+		client: client,
+		state:  make(map[string]*prefixState),
+		//nolint:gosec // G404: spreading repair load across equal peers, not a security decision
+		rnd: rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
+	}
+
+	for _, o := range opts {
+		o(s)
+	}
+
+	return s
 }
 
 // Sync mirrors one engine prefix (e.g. "default/metrics") from the newest of peers into the
@@ -462,7 +490,25 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 	}
 
 	cmp := compareIndexes(peerIndex, localIndex)
-	newer := cmp > 0 || (cmp == 0 && !strict && !bytes.Equal(peerIndexRaw, localRaw))
+
+	installed, installedRaw := peerIndex, peerIndexRaw
+
+	if cmp >= 0 {
+		held, err := s.heldEntries(ctx, localIndex, peerIndex)
+		if err != nil {
+			return Stats{}, errors.Wrap(err, "check held parts")
+		}
+
+		if len(held) > 0 {
+			installed = retainHeld(peerIndex, held)
+			installedRaw = installed.AppendBinary(nil)
+
+			zctx.From(ctx).Info("partsync: keeping parts the peer's index reports lost",
+				zap.String("prefix", enginePrefix), zap.String("peer", addr), zap.Int("parts", len(held)))
+		}
+	}
+
+	newer := cmp > 0 || (cmp == 0 && !strict && !bytes.Equal(installedRaw, localRaw))
 
 	// Whether the peer's index may *authorize a deletion*, which is a stronger claim than whether
 	// it is worth mirroring. Only a peer that provably supersedes may. An index that merely
@@ -504,19 +550,19 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 	// claim pruning is: a non-superseding index is not installed, and the local one goes on
 	// naming what this node holds. Copying stays unconditional — it is additive, and a peer that
 	// has an object we lack is worth taking whichever way the indexes order.
-	if supersedes && !bytes.Equal(peerIndexRaw, localRaw) {
+	if supersedes && !bytes.Equal(installedRaw, localRaw) {
 		// Installed last (the commit point) — it only ever references parts whose objects are
 		// already local.
-		if err := s.local.Write(ctx, indexKey, peerIndexRaw); err != nil {
+		if err := s.local.Write(ctx, indexKey, installedRaw); err != nil {
 			return st, errors.Wrap(err, "install index")
 		}
 
 		st.Copied++
-		st.CopiedBytes += int64(len(peerIndexRaw))
+		st.CopiedBytes += int64(len(installedRaw))
 	}
 
 	del := deletion{
-		live:    livePartSet(peerIndex, localIndex, supersedes),
+		live:    livePartSet(installed, localIndex, supersedes),
 		removed: peerIndex.Removals(),
 		stated:  peerIndex.RecordsRemovals(),
 	}
@@ -718,7 +764,8 @@ func (s *Syncer) copyMissing(
 }
 
 // unbackedParts is the set of index entries the peer's own listing no longer backs with any
-// object: parts an owner merge dropped after the index was read, which no copy can bring over.
+// object: parts an owner merge dropped after the index was read, which no copy can bring over. A
+// hole names no objects, so it is never one of them.
 func unbackedParts(indexed []bucketindex.Entry, listed []string, enginePrefix string) map[string]struct{} {
 	backed := make(map[string]struct{}, len(listed))
 
@@ -731,6 +778,10 @@ func unbackedParts(indexed []bucketindex.Entry, listed []string, enginePrefix st
 	unbacked := make(map[string]struct{})
 
 	for i := range indexed {
+		if indexed[i].Hole {
+			continue
+		}
+
 		if _, ok := backed[indexed[i].Prefix]; !ok {
 			unbacked[indexed[i].Prefix] = struct{}{}
 		}

@@ -139,6 +139,68 @@ a demonstration.
   neither wrote nor removed, carried into every later commit so they are never dropped — **open**
   them, and retry, bounded at 8 attempts. Exhausting the bound fails the flush or merge that asked for the commit,
   because a part whose entry never landed is unreachable.
+- **Part identity is a block interval plus a level** (`bucketindex.Interval`, `Entry.Level`,
+  format v5). A flush writes `[n, n]` at level 0; a merge over parts spanning `[a … b]` writes
+  `[a, b]` above it. `Entry.Supersedes` is then decidable from identity alone — no index diff, no
+  bookkeeping — which is what lets a repair terminate: by the time a want is serviced the data may
+  exist only inside a merged successor, and `Index.Satisfying` accepts that successor (largest
+  containing part) as discharging the want. Blocks are numbered from 1, so **the zero interval is
+  unset, not a range covering block 0**: an entry written before v5 carries none, takes part in no
+  containment in either direction, and is matched by exact prefix until a merge rewrites it. Any
+  inverted or zero-touching interval a corrupt encoding could produce is unset by the same rule, so
+  the predicate is total.
+  `Interval.Union` is what a merge output claims — the blocks its inputs covered.
+  **Allocation is the shard owner's alone**: `Index.NextBlock` is `max(block) + 1` over its own
+  entries *and* its outstanding wants (a wanted part's blocks stay claimed — it may be repaired
+  back in), claimed by the same `CompareAndSwap` that adds the part. A writer rebasing on a rival's
+  index counts the adopted entries too — see `engine/ARCH.md`, "Block identity is allocated by the
+  commit that publishes the part". No etcd, no round trip on the
+  flush path, and it works with the cluster layer absent. Two owners racing a handoff resolve
+  through that CAS: one commit lands, the loser wraps `ErrConflict`, re-reads, and re-allocates
+  above the winner.
+- **`Entries → Removed | Wanted`** is the invariant the repair path enforces: a part leaves
+  `Entries` only into a tombstone (`Removal`, a deliberate deletion) or into a `Want` (an
+  obligation to fetch it back). Conflating the two would make "am I repaired?" unanswerable, which
+  is the property the whole repair design turns on; an absence that is *neither* is a consistency
+  alarm rather than a repair trigger. `RecordWant`/`SatisfyWant`/`Wants` mirror
+  `Tombstone`/`Removals`. `MaxWants` bounds the list at `MaxRemovals`, deliberately the same
+  number — past it a node cannot tell a removed part from a lost one and must adopt a peer's
+  current index wholesale rather than repair part by part, so one constant governs both
+  boundaries. Because a forgotten want is a repair that never happens, `TrimWants` **returns** what
+  the bound forced out instead of dropping it silently: overflow escalates to a reseed, it does not
+  lose the obligation. A want carries the lost part's own time bounds, so `Want.Overlaps` answers the
+  read path's question — is *this* window short? — and an unrepaired shard stays readable outside the
+  range it actually lost. A want with no bounds at all names a part of unknown extent and therefore
+  covers everything: a want is a claim of ignorance and errs wide.
+- **A hole is an entry, not a side list.** When no owner can supply a wanted part, the owner commits
+  `Entry{Hole: true}` at that part's identity (`RecordHole`): the hole enters `Entries`, the want
+  leaves `Wanted`, and the monotone `Index.LostParts` rises — one mutation, so one CAS commit
+  carries all three or none of them. The flag lives on the entry because every reader already
+  carries the entry: a read path that forgot to join a side list would see an ordinary empty part
+  and answer short, which is exactly the silent loss the acknowledgement exists to prevent.
+  `Entry.Data()` is the one-word test, and `Index.Holes()` the enumeration.
+- **A hole discharges a want; it never satisfies one.** `Index.Satisfying` admits only data-bearing
+  entries — it is the question a peer is asked, and answering it with a hole would spread an
+  acknowledged loss from one owner to the next. `Index.Discharging` is the weaker question, "is this
+  obligation over", and is what `TrimWants` uses so reads resume once the loss is acknowledged.
+- **A hole is revocable.** The commit is not cross-replica atomic (unlike ClickHouse's
+  `createEmptyPartInsteadOfLost`, which checks non-existence on every replica in one transaction),
+  so an owner may acknowledge a loss while a peer still holds the data. `Revokes` therefore replaces
+  a hole with any data-bearing entry at the same prefix or any successor containing its blocks, and
+  `TrimHoles` runs on every commit — so a repair fetch, a rival's adopted entry and a merge all
+  revoke it as a side effect. `NextBlock` counts a hole's interval, because the part it stands for
+  may yet come back and two parts must never claim one identity.
+- **`LostParts` is monotone and cluster-visible.** It is carried forward across commits and raised
+  to the maximum on rebase, never lowered — a revoked hole leaves the count where it was. Data loss
+  is a fact, not a level: a per-node gauge that a restart or a successful repair clears erases the
+  only record that a range of a shard was ever acknowledged as gone. It follows ClickHouse's
+  `/lost_part_count`.
+- **Format v5 is a hard read break.** `Decode` rejects any version above the one it knows, so
+  reading is backward compatible (v1–v4 still decode, unset fields ordering below everything a
+  writer produces) but **writing is not**: a node on pre-v5 code fails on the first v5 index it
+  reads. Every node that reads a given index must be upgraded together. The path differs by
+  deployment and both matter — on a shared backend every node reads the same index object, and in
+  `PrivateBackend` mode `cluster/partsync` reads its peers' indexes.
 - **`backend.ReaderAt`** — optional `ReadAt(ctx,key,off,n)`, the read counterpart of
   `ObjectCreator` and the reason a query touching a few granules no longer pays for the whole
   column (`block/ARCH.md`, "Reading a column by range"). The range is **clamped to the object's

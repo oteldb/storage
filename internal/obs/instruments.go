@@ -197,6 +197,7 @@ type RPC struct {
 	hedges     metric.Int64Counter
 	absent     metric.Int64Counter
 	incomplete metric.Int64Counter
+	unanswered metric.Int64Counter
 }
 
 func opAttr(op string) metric.MeasurementOption {
@@ -221,11 +222,18 @@ func (r *RPC) Retry(ctx context.Context, op string) { r.retries.Add(ctx, 1, opAt
 // and the data disagree — a rebalance whose backfill has not caught up, or a lagging membership view.
 func (r *RPC) ShardAbsent(ctx context.Context, op string) { r.absent.Add(ctx, 1, opAttr(op)) }
 
-// ShardIncomplete accounts one read of a shard this node holds but cannot fully answer for: it came
-// back from a restart (or a rebalance) without the head the shard held unflushed, so the query
-// window overlaps data only another owner has, and the read failed over. It clears once the shard's
-// parts cover that window; a sustained rate means no owner is flushing.
+// ShardIncomplete accounts one read of a shard this node holds but cannot fully answer for, so the
+// read failed over to another owner. Two facts raise it: a head the shard held unflushed and this
+// node came back without, and a part its index names that it cannot read and repair has not got
+// back. The first clears when the shard's parts cover the window, the second when repair succeeds or
+// the loss is acknowledged as a hole.
 func (r *RPC) ShardIncomplete(ctx context.Context, op string) { r.incomplete.Add(ctx, 1, opAttr(op)) }
+
+// ReadIncomplete accounts one read that failed because no owner could answer it completely: every
+// owner disclaimed and at least one of them held the shard and knew it was short. Unlike
+// [RPC.ShardIncomplete] — a failover, which the query survives — this is the query's error, so any
+// non-zero rate is user-visible unavailability and the direct measure of what repair owes.
+func (r *RPC) ReadIncomplete(ctx context.Context, op string) { r.unanswered.Add(ctx, 1, opAttr(op)) }
 
 // Hedge accounts one hedged (opportunistic concurrent) attempt for op.
 func (r *RPC) Hedge(ctx context.Context, op string) { r.hedges.Add(ctx, 1, opAttr(op)) }
@@ -238,7 +246,9 @@ func newRPC(m metric.Meter) (*RPC, error) {
 		hedges:   b.counter("storage.rpc.hedges", "cluster RPC hedged (concurrent) attempts", "{hedge}"),
 		absent:   b.counter("storage.rpc.shard_absent", "shard reads failed over because the owner holds no data", "{read}"),
 		incomplete: b.counter("storage.rpc.shard_incomplete",
-			"shard reads failed over because the owner's copy is missing its unflushed head", "{read}"),
+			"shard reads failed over because the owner's copy is missing data", "{read}"),
+		unanswered: b.counter("storage.rpc.read_incomplete",
+			"reads failed because no owner could answer the window completely", "{read}"),
 	}
 
 	return r, b.err

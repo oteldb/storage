@@ -159,6 +159,37 @@ does — a merge preserves its inputs' time range and so cannot close it by acci
 conservative in one direction only: a node whose head was genuinely empty still fails over for
 recent windows until the next flush.
 
+A **want** — a part the shard's index names that this node cannot read and repair has not got back
+(`backend/ARCH.md`) — is the same statement about a different range and takes the same route. It
+carries the lost part's own time bounds, so only a query reaching into that range disclaims; the rest
+of the shard is served here as usual. It ends when repair fetches the part back, or when the loss is
+acknowledged as a hole — which discharges the want — so failing reads is bounded by repair or by an
+operator accepting the loss, never open-ended.
+
+**The two disclaims are not the same fact, and they end differently.** Both fail over, and in a
+cluster that is usually the end of it: a complete owner answers and the query succeeds. The
+difference bites only when *every* owner disclaims. "No owner holds the shard" means it has no data
+anywhere, and an empty result is the truth. "An owner holds it and knows it is short" has no complete
+answer anywhere, and the read **fails** — Mimir's stance, and the alternative is Loki's, where a
+chunk the index names but storage lacks yields a short result with no error and nothing downstream
+can tell. Serving with a partial flag was rejected for the same reason: the flag has to survive the
+whole query path, and any consumer ignoring it gets a wrong number.
+
+`cluster.ErrShardIncomplete` is what carries that. It unwraps to `ErrShardAbsent`, so every failover
+site branching on that sentinel keeps working unchanged and no new call site has to remember a second
+condition; it crosses the wire as its own status (HTTP 410) so the origin can still tell them apart.
+`cluster.Disclaims` is the one place they are told apart — a fan-out tallies each owner's answer
+through it and asks `Empty` (may answer empty) or `Failed` (must fail the read), rather than
+re-deriving the rule per site. A peer too old to send 410 falls back to 409 and the read collapses to
+empty as it did before, so a mixed-version cluster degrades rather than breaks. The failed read is
+metered as `storage.rpc.read_incomplete`, which unlike `shard_incomplete` (a failover the query
+survives) is user-visible unavailability.
+
+A node coordinating against its own shards folds its **own** disclaim into that tally, so a fan-out
+where the one remote owner holds nothing does not read as "nothing holds this shard". With no peer at
+all — a single-node cluster — the read fails here, which is the same policy with the failover
+removed; serving the local engine there would answer the query short with no error.
+
 The guard has one implementation per RPC and both callers reach it through the same function: the
 node coordinating a query against its own shards calls the very code that serves a peer's request,
 so a coordinator cannot serve an engine the peer path would have disclaimed. The alternative — a
@@ -262,7 +293,22 @@ peer's listing does not name, or whose fetch 404s (the merge landing later still
 whole index for this pass, which then keeps the local one and takes the non-superseding path for
 pruning. Copying stays unconditional, and the next pass reads a fresh index and converges. Re-reading
 the index after the listing would only move the skew to the other side of the pair; the entry-backing
-check is on state the pass has already observed, so it leaves no window.
+check is on state the pass has already observed, so it leaves no window. A hole is not an unbacked
+entry: it names no objects by definition, and counting it would freeze every replica of a shard that
+acknowledged a loss on the last index before the hole.
+
+**A peer's index is not evidence of what any disk holds.** Under a private backend the mirrored index
+is a copy of whichever owner's index last superseded it, so a want or a hole in it says only that
+*that owner* could not read the part — nothing about the peer's disk, and nothing about this one.
+Two rules follow. Installing a superseding index never moves a part this node holds out of
+`Entries`: an entry the local index names whose manifest is on disk (the manifest lands last, so its
+presence is a complete copy) stays, and the peer's claim of loss rides beside it as a want — kept
+rather than dropped, because that want is what the owner's repair pass discharges with a commit,
+and that commit is what republishes the part at a generation the peers adopt; a hole becomes the
+want it discharged, since an entry and a hole cannot share a prefix, and `LostParts` stays where it
+was, as on any revocation. Dropping the want instead would leave the owner nothing to commit, and a
+replica's damaged, higher-generation index would stand until the next flush. And repair asks the
+disks: `FetchWants` falls back to each peer's listing for a want no index names (below).
 
 **Absence is not an instruction.** Mirroring a peer, obeying its deletions, and deleting a
 particular part are three separate claims. Only an index that *supersedes* the local one may do the
@@ -305,6 +351,73 @@ exempt. Sync is **signal-agnostic** (it mirrors whatever lives under `{tenant}/{
 sidecar replicates identically. Convergence is push-accelerated by a best-effort notify after a
 flush/merge; the periodic pull stays the anti-entropy source of truth, and passes are serialized
 per prefix so a notify can never install an older index over a newer one.
+
+### Repairing a want
+
+`Syncer.FetchWants` is the serving half of the engines' repair seam (`engine/ARCH.md`,
+"Repair"). It takes a whole repair cycle's `bucketindex.Want`s, asks every peer for its bucket
+index, runs `Index.Satisfying` over each, and copies the objects of the best answer per want —
+widest block interval, then deepest level, so one fetch recovers the most data. It installs no
+index: committing the entries is the owner's own commit, which is what discharges the wants.
+
+**The batch is the unit because the cost is per cycle, not per want.** Each peer's index is read
+once for the batch (O(peers), not O(peers × wants)), and a merged successor discharging several
+wants is copied once. Nothing outlives the call: a peer index cached across cycles would let repair
+act on a stale view of what peers hold, and staleness is precisely what anti-entropy is for.
+
+**A want no index names is asked of the disks.** The indexes are copies of one another and not
+evidence of what a peer holds (above), so the batch then lists each peer's engine prefix — once per
+peer, the same per-cycle shape as the index reads, and only when some want went unnamed — and takes
+the want's exact prefix from any peer whose listing shows the manifest. Surviving objects without a
+manifest are remnants, not a part, and count as nothing; a listing that could not be read is a
+transient failure, exactly as an unreadable index is. Measured with three peers and four wants: the
+indexes answering costs 3 index reads and 1 listing (the copy's); the indexes silent costs 3 index
+reads and 3 prefix listings plus one part listing per copy. Per-want listings would be 12.
+
+Peer indexes are read **concurrently, but selected by shuffled peer index rather than by arrival**.
+Results land in a slice aligned to the peer order and selection runs after every fetch returns, so
+the winner is a function of the entries, not of the network — taking the first good answer would
+silently retire "prefer the most satisfying part". Nothing cancels a sibling fetch either: a
+cancelled fetch would surface as a failure this node never actually suffered.
+
+The peer order is **shuffled per batch**, from a source `partsync.WithRandSeed` makes injectable.
+`betterCandidate` is a strict order and returns false for two identical entries, so without the
+shuffle every recovering node would pick whichever peer sorts first for the same want — the fan-in
+the pull direction cannot afford. Owner preference is deliberately *not* a tiebreak: it would aim
+the repair load at the busiest node. ClickHouse shuffles replicas in
+`findReplicaHavingCoveringPart` for the same reason.
+
+The distinction the call exists to preserve is **definitive absence versus an unanswered peer**.
+`OK=false` with a nil error means every peer replied and none named a satisfying part; a peer that
+could not be reached is an error, and the want survives untouched. Collapsing the two would let an
+unreachable peer be read as proof the data is gone — which is why every peer's failure is folded
+into the batch's result even when other peers answered cleanly, and why the concurrency above
+neither drops nor manufactures one.
+
+Unlike a whole-prefix sync, a missing object mid-copy is fatal to the call: the caller is about to
+publish an index entry naming that part, and a part it could not fully copy must never become one.
+The pull direction means the **serving** side is what a real budget has to cap — N recovering nodes
+converge on whichever peers hold the data — which is not built yet.
+
+A peer's own hole is never offered: `Index.Satisfying` admits only data-bearing entries, so one
+owner's acknowledged loss cannot become another's.
+
+### Absence over the owners, not over whoever answered
+
+`Syncer.FetchWants` reports absence over the peers it was *given*. Whether those peers are the
+shard's owners is `partRepairer`'s to establish (`cluster_repair.go`), and it is what decides
+whether the engine may ever acknowledge a loss (`engine/ARCH.md`, "An unrepairable want becomes a
+revocable hole"). `completeOwners` requires all three of: the ring named at least as many owners as
+the tenant's replication factor, every one of them resolved to an address, and this node is among
+them. Anything less is `bucketindex.WantIncomplete`.
+
+The bar is the **configured** replication factor rather than the ring's current answer, and the
+asymmetry is deliberate. A rolling restart deregisters the restarting owner, so the ring shrinks and
+the peers that answer are a strict subset of the owners — exactly when a naive reading would
+fabricate a hole over live data. The cost is that a cluster permanently running fewer nodes than its
+RF never acknowledges a loss at all; that is the safe direction, because an outstanding want is a
+visible, recoverable state and a hole over live data is neither. ClickHouse's
+`searchForMissingPartOnOtherReplicas` scans every replica, live *and* dead, for the same reason.
 
 ## `ec` — erasure coding
 

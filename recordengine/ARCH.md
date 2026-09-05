@@ -215,6 +215,17 @@ their replacement is committed. See [`../engine/ARCH.md`](../engine/ARCH.md), "P
 serves stay the same set; the adopted parts are readable but not owned. See
 [`../engine/ARCH.md`](../engine/ARCH.md), "Adopted parts".
 
+**Block identity** is allocated the same way: a flush output takes a fresh `[n, n]` at level 0, a
+merge output the union of its inputs at one level above them, assigned per CAS attempt and written
+onto the part only once the commit lands. See [`../engine/ARCH.md`](../engine/ARCH.md), "Block
+identity is allocated by the commit that publishes the part".
+
+**Repair** is identical to the metric engine, down to `Config.Repair`, the satisfaction rule (the
+exact part, or the largest containing part at a higher level), and the two gates a want must clear
+before its loss is acknowledged as a revocable hole. See [`../engine/ARCH.md`](../engine/ARCH.md),
+"Repair — a want is discharged by committing a part" and "An unrepairable want becomes a revocable
+hole".
+
 ## Part identity & orphans
 
 Part prefixes are `<prefix>/{partid}`, a minted globally unique id, and `LoadParts` sweeps orphans at
@@ -225,6 +236,12 @@ in-flight part is not in the index yet.
 Reuse would be unsound here for one extra reason: two of a part's objects are conditional — `keys.bin`
 is skipped when the rows carry no record attributes, the `sym-*.bin` sidecars when there is no side
 data — so a new part would silently adopt a failed attempt's.
+
+A part the owner cannot open is handled identically: only `backend.ErrNotExist` drops it from
+`Entries` and records a `bucketindex.Want` in the same compare-and-swap, every other error still
+fails the load, and the sweep spares a wanted part's remaining objects
+([`../engine/ARCH.md`](../engine/ARCH.md), "A part the owner cannot read becomes a want, not a
+removal").
 
 ## Lifecycle guards
 

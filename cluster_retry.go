@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"net/http"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -124,8 +123,10 @@ func rpcResult(err error) string {
 // success is authoritative. It subsumes a plain sequential failover (HedgeDelay 0).
 //
 // An owner answering [cluster.ErrShardAbsent] (the ring points at it, but it holds no data for the
-// shard) is a failover, not a result: only when every owner disclaims the shard does the fetch yield
-// an empty iterator.
+// shard) is a failover, not a result: only when every owner disclaims the shard *and* every disclaim
+// was an absence does the fetch yield an empty iterator. An owner that holds the shard and knows it
+// is missing data ([cluster.ErrShardIncomplete]) denies that collapse and the fetch fails — see
+// [cluster.Disclaims].
 type hedgedFetcher struct {
 	store   *Storage
 	op      string
@@ -134,6 +135,11 @@ type hedgedFetcher struct {
 	// absentShard, when set, is the shard this node owns per the ring but holds no data for — the
 	// reason the fan-out exists at all. Reported here, where a request context finally exists.
 	absentShard *absentShard
+
+	// selfDisclaim, when set, is this node's own refusal to answer the shard, carried in from
+	// [gapFetcher]. It counts as one more disclaiming owner: the local engine holds the shard, so
+	// the fan-out must not read "every owner disclaims" as "nothing holds this shard".
+	selfDisclaim error
 }
 
 func (h hedgedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
@@ -145,14 +151,19 @@ func (h hedgedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterat
 		h.store.reportAbsentShard(ctx, h.op, a.sig, a.shard, len(h.remotes))
 	}
 
-	var absent atomic.Int64
+	var disclaims cluster.Disclaims
+
+	owners := len(h.remotes)
+	if h.selfDisclaim != nil {
+		disclaims.Note(h.selfDisclaim)
+
+		owners++
+	}
 
 	attempt := func(f fetch.Fetcher) func(context.Context) (fetch.Iterator, error) {
 		return func(c context.Context) (fetch.Iterator, error) {
 			it, err := f.Fetch(c, r)
-			if errors.Is(err, cluster.ErrShardAbsent) {
-				absent.Add(1)
-			}
+			disclaims.Note(err)
 
 			return it, err
 		}
@@ -180,10 +191,14 @@ func (h hedgedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterat
 		it, err = retry.Hedge(ctx, h.store.readPolicy(ctx, h.op), thunks)
 	}
 
-	if err != nil && int(absent.Load()) >= len(h.remotes) {
+	if err != nil && disclaims.Empty(owners) {
 		h.store.obs.RPC.ShardAbsent(ctx, h.op)
 
 		return fetch.NewSliceIterator(nil), nil
+	}
+
+	if err != nil && disclaims.Failed(owners) {
+		h.store.obs.RPC.ReadIncomplete(ctx, h.op)
 	}
 
 	return it, err

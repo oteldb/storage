@@ -134,6 +134,32 @@ The opens sit on the commit path, which is where the cost is. It is bounded: han
 across the retry loop, and an entry that cannot be opened — a rival merged it away in between — is
 left out of the readable set but kept in the index, since only its writer knows whether it is live.
 
+### Block identity is allocated by the commit that publishes the part
+
+A flush output commits `[n, n]` at level 0, `n` from `bucketindex.Index.NextBlock`. A merge output
+commits the **union of its inputs' intervals** at `max(input level) + 1` and allocates nothing: the
+merged part covers the blocks its inputs covered, and that is what makes `Entry.Supersedes` — and so
+a repair that terminates on a successor — decidable from identity alone (`backend/ARCH.md`, "Part
+identity is a block interval plus a level").
+
+Two merges allocate instead, and both leave their output superseding nothing until a later merge
+rewrites it. Inputs that all predate format v5 carry no interval to inherit; a fresh `[n, n]` is how
+such a part migrates, a merge being the only thing that rewrites it. And a merge whose output is
+split across several parts cannot hand any one of them the union — none holds all of that data, so a
+successor claim would answer a want with a fraction of the part. A **mixed** merge inherits the
+union of the inputs that do carry an interval and allocates nothing on top: a want naming a pre-v5
+part records that part's unset interval, so no claim the output could make would contain it, and a
+fresh block would name blocks the output does not cover.
+
+**Allocation runs once per CAS attempt, inside `nextIndexLocked`, and is applied only after the
+commit lands.** `NextBlock` is taken over the state that attempt publishes — the entries a rebase
+adopted from a rival writer included, since its blocks are real claims — plus this engine's own
+parts, its holes, and every want outstanding or pending, whose part may yet be repaired back in. A
+number written onto the part before its CAS succeeds survives the rebase, so the retry would keep a
+block the winner just took and never re-allocate; the assignments are therefore held in
+`pendingBlocks` and written through in the `err == nil` branch, the same discipline `pendingWants`
+and `pendingHoles` follow, and for the same reason.
+
 ## Identity prune
 
 `PruneIdentities` drops the identities retention leaves behind, which otherwise accumulate for the
@@ -200,6 +226,53 @@ failed. It lists the prefix and deletes every object under a part directory the 
 name; a directory is a part's when its name parses as a part id. The sweep assumes this node **owns**
 the prefix, so a replica's `RefreshReplica` skips it: the owner's in-flight part is not in the index
 yet.
+
+
+## A part the owner cannot read becomes a want, not a removal
+
+`LoadParts` used to fail the whole engine on the first part it could not open, which turns one lost
+part into a node that will not start. It now drops that part from `Entries` and records a
+`bucketindex.Want` naming it (`backend/ARCH.md`, "`Entries → Removed | Wanted`"), in **one**
+compare-and-swap: the drop and the obligation are the same commit, so no crash can land the drop
+without the want and a lost race leaves neither — the retry re-reads and re-derives both from the
+same evidence.
+
+Two things consume them. Repair fetches the missing part back (or acknowledges the loss as a hole),
+and the **read policy** refuses to answer over one: `WantOverlaps` reports whether an outstanding
+want covers a query window, which is what the cluster read seam disclaims on (`cluster/ARCH.md`).
+Pending wants count — a want a load discovered but no commit has published yet still names data that
+is already unreadable — while a hole does not, since acknowledging a loss discharges its want and
+lets reads resume.
+
+**Only `backend.ErrNotExist` may become a want.** Every other failure — a timeout, a canceled
+context, a full disk, a denied request, a throttled bucket — leaves the part's existence unknown,
+and a want is a statement that it is gone. Recording one on an unknown would drop a live part from
+the index and start a repair for data that was never missing; over a shared backend a single
+transient fault touches every part at once, so the index would be stripped wholesale. So a
+non-absence error fails the load exactly as it did before (`partGone`, the counterpart of
+ClickHouse's `isRetryableException` rethrow in `checkDataPart`).
+
+The trigger stays narrow in the other direction too: a part whose objects are **present but
+unreadable** — a corrupt manifest, a truncated column — is not a want. It is a different failure
+with a different remedy, and widening the trigger is how a repair path turns into a
+data-destruction path. It still fails the load.
+
+Two consequences fall out of the entry no longer being there:
+
+- The gone part is absent from `indexed`, so the next commit's diff does not also call it a
+  *removal*. A loss restated as a deliberate deletion is exactly the ambiguity wants exist to
+  remove.
+- `foreignEntries` refuses to adopt it back from a rival's index, and the orphan sweep spares its
+  surviving objects. They are the remains of a part repair is owed, not the residue of a failed
+  flush, and deleting them destroys the evidence before repair can see it.
+
+Only an owner does this — the replica path (`RefreshReplica`, no sweep) still fails, because
+recording a want is committing an index, which is the owner's to write. A cluster node recovering
+holds no claim yet, so it loads through `LoadPartsUnclaimed`: the sweep runs, but a gone part is a
+*pending* want — counted, disclaimed over, protected from the sweep — that the engine's first commit
+as a writer records, which only an owner ever makes. Committing it at recovery would let a replica
+publish a want at a generation above the owner's; a strict backfill then installs that index on the
+owner and a part the owner holds intact reads as lost.
 
 ## Disk pressure closes the ingest path
 
@@ -432,6 +505,87 @@ index is what a restart and every replica read, so a part it still names must ne
 retiring first would let the next reclaim delete referenced objects, and `LoadParts` hard-fails the
 engine on a missing part. A failed commit rolls the in-memory swap back, so the uncommitted output is
 never observable as published; its objects are orphans, swept at the next open.
+
+### Repair — a want is discharged by committing a part
+
+A part this engine's index names but cannot read is recorded as a `bucketindex.Want`, carried
+across every commit alongside the removals. Repair runs at the head of each merge cycle
+(`repair.go`), so a part pulled back joins the same compaction, and it **never fails the merge**: a
+shard that cannot be repaired must still compact.
+
+Satisfaction follows `Index.Satisfying` — the exact part, **or the largest live part whose block
+interval contains the want's at a higher level**. That is what makes repair terminate: by the time
+a want is serviced the data may exist only inside a merged successor, and chasing a prefix that no
+longer exists anywhere would never converge. The local index is asked first, so a want this
+engine's own merges already covered costs no network call at all — and then the local **disk**: a
+want whose part still opens from this node's own backend is discharged without a peer
+(`RepairStats.Local`). The index that recorded the want may be a peer's copy installed by a
+backfill, which knows nothing of this disk; and holding is proven by opening the part, because
+surviving objects under a prefix are not a readable part. Pending wants — those a load could not
+commit — are serviced alongside the committed ones, since the repair commit is a commit.
+
+`Config.Repair` (`PartFetcher`) is the whole seam to the cluster: part identities in, the entries of
+whatever parts were actually copied out. The engine never learns about peers, addresses or transport —
+`cluster/partsync` supplies the implementation, and nil (single node, or a shared backend where
+every replica reads the same objects) makes repair a no-op. A `WantAbsent` outcome with a nil error
+is definitive absence and leaves the want outstanding, counted in `RepairStats.Unsatisfiable`; an
+error is transient and retried next cycle. The two are never merged: an unreachable peer is not
+evidence that data is gone.
+
+The seam takes the **whole cycle's wants in one call**, capped at `repairFetchesPerCycle`, and gets
+one result per want back. The cluster-side cost is per cycle, not per want — one read of each peer's
+bucket index answers every want, and one copy of a merged successor discharges every want inside it
+— so splitting the cycle into per-want calls would multiply both by the want count. Fetch
+concurrency therefore belongs to the implementation, not to the engine.
+
+Publishing a repaired part is the same swap a merge publishes — it is committed into `Entries`, and
+the commit's want trim discharges every want it satisfies. A fetched **successor** also retires the
+local parts it supersedes, because their rows are inside it and keeping both would count them
+twice. A part whose objects arrived but will not open is rolled back to a failure, so the want
+stays.
+
+One cycle attempts at most `repairFetchesPerCycle` (4) wants with `repairFetchConcurrency` (2)
+copies in flight. A repair fetch copies a whole part, so an unbounded pass on a badly damaged node
+would spend the maintenance cycle in the network and never compact; a shard needing more than a
+handful of parts back is past what part-by-part repair is for. The *serving* side is where the real
+budget belongs (see `cluster/ARCH.md`), and is not built yet.
+
+### An unrepairable want becomes a revocable hole
+
+A want no owner can satisfy would otherwise stay outstanding forever, and the shard would be
+permanently "not repaired" with no in-band way for an operator to accept the loss. So repair
+acknowledges it: it commits `Entry{Hole: true}` at the lost part's identity, which discharges the
+want and raises the index's monotone `LostParts` (`backend/ARCH.md`). Converting the want into a
+*removal* instead would terminate just as cleanly and destroy the evidence — the part would become
+indistinguishable from a deliberate deletion, which is the ambiguity wants exist to remove.
+
+**Two independent conditions gate the acknowledgement, because a hole over live data is worse than
+an outstanding want in every way that matters.** An outstanding want is visible and recoverable; a
+hole over data that was never lost is neither.
+
+1. **The peer set must be the shard's complete expected owner set.** `PartFetcher` answers with a
+   `bucketindex.WantOutcome`, and only `WantAbsent` — every expected owner answered, none had it —
+   is evidence. `WantIncomplete` means the peers asked were a strict subset: during a rolling
+   restart the deregistered owner drops out of the ring, and the two reachable peers lacking the
+   part says nothing about the third that holds it. The cluster layer decides this against the
+   *configured* replication factor, not against whatever the ring currently returns, so a cluster
+   permanently short of nodes never acknowledges a loss (`cluster/ARCH.md`).
+2. **The conclusion must repeat over `holeConfirmations` (3) consecutive attempts.** One pass is a
+   snapshot: a peer that is up, in the ring and has not finished loading its bucket index answers
+   "no such part" truthfully and prematurely. Any other outcome — a fetch, an error, an incomplete
+   owner set — resets the count. The evidence lives only in memory, so a restart forgets it and
+   repair earns it again; the bias is deliberately toward leaving the want outstanding.
+
+An error is never evidence at either gate: a peer that could not be reached says nothing about
+whether the data exists.
+
+**The hole is revocable and re-attempted.** Because the commit is not cross-replica atomic, an owner
+can acknowledge a loss while a peer still holds the part. So every repair pass targets the holes as
+well as the wants, and a hole is replaced by the part turning up — at its exact prefix, or inside a
+containing successor. Holes are held apart from `parts` (there is nothing to open) and re-read from
+the index on load, so an acknowledgement survives a restart. `LostParts` does not fall when a hole
+is revoked.
+
 
 ## Read path
 
