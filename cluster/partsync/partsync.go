@@ -523,7 +523,10 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 	supersedes := cmp > 0
 
 	if !newer && !forced {
-		return Stats{}, nil // peer is older, or not newer enough, and no object-level reconcile
+		reconcile, err := s.reconcileConverged(ctx, enginePrefix, addr, strict, cmp)
+		if err != nil || !reconcile {
+			return Stats{}, err
+		}
 	}
 
 	st := Stats{}
@@ -573,6 +576,63 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 	st.Synced = newer || st.Copied > 0 || st.Pruned > 0
 
 	return st, nil
+}
+
+// reconcileConverged decides whether a pass with nothing newer at the peer still runs the object-level
+// mirror. A converged index says nothing about this disk: a replica that lost objects under it would
+// otherwise wait for the owner's next commit to notice. The check is local — one listing against the
+// peer's key set from the last pass — and the peer is reached only when something is actually gone,
+// or on the first pass of a process, which has no last pass to trust. Strict (owner) passes never
+// reconcile: an owner's losses are the engine's want path, and mirroring a replica's objects onto an
+// owner would resurrect every part the owner just merged away.
+func (s *Syncer) reconcileConverged(ctx context.Context, enginePrefix, addr string, strict bool, cmp int) (bool, error) {
+	if strict || cmp != 0 {
+		return false, nil
+	}
+
+	missing, verified, err := s.missingSinceLastPass(ctx, enginePrefix)
+	if err != nil {
+		return false, err
+	}
+
+	if verified && missing == 0 {
+		return false, nil
+	}
+
+	if missing > 0 {
+		zctx.From(ctx).Warn("partsync: local objects gone under an unchanged index, reconciling",
+			zap.String("prefix", enginePrefix), zap.String("peer", addr), zap.Int("objects", missing))
+	}
+
+	return true, nil
+}
+
+// missingSinceLastPass counts the objects the peer listed on the last pass that the local backend no
+// longer holds. A prefix no pass of this process has listed is unverified: nothing is known about
+// its disk, so the caller reconciles once rather than trusting the index it loaded.
+func (s *Syncer) missingSinceLastPass(ctx context.Context, enginePrefix string) (missing int, verified bool, err error) {
+	s.mu.Lock()
+	remote := s.stateFor(enginePrefix).remote
+	s.mu.Unlock()
+
+	if remote == nil {
+		return 0, false, nil
+	}
+
+	local, err := s.local.List(ctx, enginePrefix)
+	if err != nil {
+		return 0, false, errors.Wrap(err, "list local")
+	}
+
+	have := keySet(local)
+
+	for k := range remote {
+		if _, ok := have[k]; !ok {
+			missing++
+		}
+	}
+
+	return missing, true, nil
 }
 
 // deletion is what a pass is allowed to delete, which is a narrower question than what it is
