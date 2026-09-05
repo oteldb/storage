@@ -158,6 +158,8 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{parts: dropped}, err
 	}
 
+	planMergeBlocks(selected, newParts)
+
 	// Publish (under lock): swap the selected parts for the merged one(s) copy-on-write (keeping every
 	// part not selected — including any a concurrent flush may have added) and commit the index. The
 	// sources are retired — queued for backend deletion — only once that commit succeeds: the persisted

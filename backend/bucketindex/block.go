@@ -23,6 +23,19 @@ func (iv Interval) Contains(o Interval) bool {
 	return iv.Valid() && o.Valid() && iv.Min <= o.Min && iv.Max >= o.Max
 }
 
+// Union is the smallest interval covering both, ignoring an unset operand. It is what a merge
+// output claims: the blocks its inputs covered, which is what makes it supersede them.
+func (iv Interval) Union(o Interval) Interval {
+	switch {
+	case !o.Valid():
+		return iv
+	case !iv.Valid():
+		return o
+	default:
+		return Interval{Min: min(iv.Min, o.Min), Max: max(iv.Max, o.Max)}
+	}
+}
+
 // Len reports how many blocks the interval covers, 0 if unset. It orders candidate successors
 // by how much of the shard they subsume.
 func (iv Interval) Len() uint64 {

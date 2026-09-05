@@ -134,6 +134,32 @@ The opens sit on the commit path, which is where the cost is. It is bounded: han
 across the retry loop, and an entry that cannot be opened — a rival merged it away in between — is
 left out of the readable set but kept in the index, since only its writer knows whether it is live.
 
+### Block identity is allocated by the commit that publishes the part
+
+A flush output commits `[n, n]` at level 0, `n` from `bucketindex.Index.NextBlock`. A merge output
+commits the **union of its inputs' intervals** at `max(input level) + 1` and allocates nothing: the
+merged part covers the blocks its inputs covered, and that is what makes `Entry.Supersedes` — and so
+a repair that terminates on a successor — decidable from identity alone (`backend/ARCH.md`, "Part
+identity is a block interval plus a level").
+
+Two merges allocate instead, and both leave their output superseding nothing until a later merge
+rewrites it. Inputs that all predate format v5 carry no interval to inherit; a fresh `[n, n]` is how
+such a part migrates, a merge being the only thing that rewrites it. And a merge whose output is
+split across several parts cannot hand any one of them the union — none holds all of that data, so a
+successor claim would answer a want with a fraction of the part. A **mixed** merge inherits the
+union of the inputs that do carry an interval and allocates nothing on top: a want naming a pre-v5
+part records that part's unset interval, so no claim the output could make would contain it, and a
+fresh block would name blocks the output does not cover.
+
+**Allocation runs once per CAS attempt, inside `nextIndexLocked`, and is applied only after the
+commit lands.** `NextBlock` is taken over the state that attempt publishes — the entries a rebase
+adopted from a rival writer included, since its blocks are real claims — plus this engine's own
+parts, its holes, and every want outstanding or pending, whose part may yet be repaired back in. A
+number written onto the part before its CAS succeeds survives the rebase, so the retry would keep a
+block the winner just took and never re-allocate; the assignments are therefore held in
+`pendingBlocks` and written through in the `err == nil` branch, the same discipline `pendingWants`
+and `pendingHoles` follow, and for the same reason.
+
 ## Identity prune
 
 `PruneIdentities` drops the identities retention leaves behind, which otherwise accumulate for the

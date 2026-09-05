@@ -302,6 +302,11 @@ type part struct {
 	blocks bucketindex.Interval
 	level  uint32
 
+	// pending is the identity a part this engine just wrote is waiting to be assigned; nil for one
+	// opened from an index, whose identity is whatever that index recorded — including the unset
+	// one of a part written before format v5. See blockid.go.
+	pending *blockPlan
+
 	// refs counts in-flight fetches reading this part lock-free. A fetch acquires (under the engine
 	// lock, while the part is still live) the parts it will read and releases them when done; a retired
 	// part is not deleted from the backend until its refs reach zero, so a lock-free read never races a

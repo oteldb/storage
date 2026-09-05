@@ -71,6 +71,29 @@ func TestIntervalContains(t *testing.T) {
 	}
 }
 
+func TestIntervalUnion(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		a, b, ab bucketindex.Interval
+	}{
+		{"adjacent", bucketindex.Interval{Min: 1, Max: 1}, bucketindex.Interval{Min: 2, Max: 2}, bucketindex.Interval{Min: 1, Max: 2}},
+		{"gapped", bucketindex.Interval{Min: 1, Max: 1}, bucketindex.Interval{Min: 5, Max: 7}, bucketindex.Interval{Min: 1, Max: 7}},
+		{"nested", bucketindex.Interval{Min: 1, Max: 9}, bucketindex.Interval{Min: 4, Max: 5}, bucketindex.Interval{Min: 1, Max: 9}},
+		{"unset right", bucketindex.Interval{Min: 2, Max: 3}, bucketindex.Interval{}, bucketindex.Interval{Min: 2, Max: 3}},
+		{"unset left", bucketindex.Interval{}, bucketindex.Interval{Min: 2, Max: 3}, bucketindex.Interval{Min: 2, Max: 3}},
+		{"both unset", bucketindex.Interval{}, bucketindex.Interval{}, bucketindex.Interval{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.ab, tc.a.Union(tc.b))
+			assert.Equal(t, tc.ab, tc.b.Union(tc.a), "union is symmetric")
+		})
+	}
+}
+
 func TestIntervalBlocks(t *testing.T) {
 	t.Parallel()
 
