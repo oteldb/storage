@@ -168,7 +168,10 @@ a demonstration.
   current index wholesale rather than repair part by part, so one constant governs both
   boundaries. Because a forgotten want is a repair that never happens, `TrimWants` **returns** what
   the bound forced out instead of dropping it silently: overflow escalates to a reseed, it does not
-  lose the obligation.
+  lose the obligation. A want carries the lost part's own time bounds, so `Want.Overlaps` answers the
+  read path's question — is *this* window short? — and an unrepaired shard stays readable outside the
+  range it actually lost. A want with no bounds at all names a part of unknown extent and therefore
+  covers everything: a want is a claim of ignorance and errs wide.
 - **A hole is an entry, not a side list.** When no owner can supply a wanted part, the owner commits
   `Entry{Hole: true}` at that part's identity (`RecordHole`): the hole enters `Entries`, the want
   leaves `Wanted`, and the monotone `Index.LostParts` rises — one mutation, so one CAS commit

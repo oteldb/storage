@@ -159,6 +159,37 @@ does — a merge preserves its inputs' time range and so cannot close it by acci
 conservative in one direction only: a node whose head was genuinely empty still fails over for
 recent windows until the next flush.
 
+A **want** — a part the shard's index names that this node cannot read and repair has not got back
+(`backend/ARCH.md`) — is the same statement about a different range and takes the same route. It
+carries the lost part's own time bounds, so only a query reaching into that range disclaims; the rest
+of the shard is served here as usual. It ends when repair fetches the part back, or when the loss is
+acknowledged as a hole — which discharges the want — so failing reads is bounded by repair or by an
+operator accepting the loss, never open-ended.
+
+**The two disclaims are not the same fact, and they end differently.** Both fail over, and in a
+cluster that is usually the end of it: a complete owner answers and the query succeeds. The
+difference bites only when *every* owner disclaims. "No owner holds the shard" means it has no data
+anywhere, and an empty result is the truth. "An owner holds it and knows it is short" has no complete
+answer anywhere, and the read **fails** — Mimir's stance, and the alternative is Loki's, where a
+chunk the index names but storage lacks yields a short result with no error and nothing downstream
+can tell. Serving with a partial flag was rejected for the same reason: the flag has to survive the
+whole query path, and any consumer ignoring it gets a wrong number.
+
+`cluster.ErrShardIncomplete` is what carries that. It unwraps to `ErrShardAbsent`, so every failover
+site branching on that sentinel keeps working unchanged and no new call site has to remember a second
+condition; it crosses the wire as its own status (HTTP 410) so the origin can still tell them apart.
+`cluster.Disclaims` is the one place they are told apart — a fan-out tallies each owner's answer
+through it and asks `Empty` (may answer empty) or `Failed` (must fail the read), rather than
+re-deriving the rule per site. A peer too old to send 410 falls back to 409 and the read collapses to
+empty as it did before, so a mixed-version cluster degrades rather than breaks. The failed read is
+metered as `storage.rpc.read_incomplete`, which unlike `shard_incomplete` (a failover the query
+survives) is user-visible unavailability.
+
+A node coordinating against its own shards folds its **own** disclaim into that tally, so a fan-out
+where the one remote owner holds nothing does not read as "nothing holds this shard". With no peer at
+all — a single-node cluster — the read fails here, which is the same policy with the failover
+removed; serving the local engine there would answer the query short with no error.
+
 The guard has one implementation per RPC and both callers reach it through the same function: the
 node coordinating a query against its own shards calls the very code that serves a peer's request,
 so a coordinator cannot serve an engine the peer path would have disclaimed. The alternative — a

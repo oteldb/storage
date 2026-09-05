@@ -235,7 +235,14 @@ part into a node that will not start. It now drops that part from `Entries` and 
 `bucketindex.Want` naming it (`backend/ARCH.md`, "`Entries → Removed | Wanted`"), in **one**
 compare-and-swap: the drop and the obligation are the same commit, so no crash can land the drop
 without the want and a lost race leaves neither — the retry re-reads and re-derives both from the
-same evidence. Nothing consumes wants yet; they are recorded and durable.
+same evidence.
+
+Two things consume them. Repair fetches the missing part back (or acknowledges the loss as a hole),
+and the **read policy** refuses to answer over one: `WantOverlaps` reports whether an outstanding
+want covers a query window, which is what the cluster read seam disclaims on (`cluster/ARCH.md`).
+Pending wants count — a want a load discovered but no commit has published yet still names data that
+is already unreadable — while a hole does not, since acknowledging a loss discharges its want and
+lets reads resume.
 
 **Only `backend.ErrNotExist` may become a want.** Every other failure — a timeout, a canceled
 context, a full disk, a denied request, a throttled bucket — leaves the part's existence unknown,

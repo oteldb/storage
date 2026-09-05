@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -59,8 +60,32 @@ func TestCanAnswerWidensZeroWindow(t *testing.T) {
 
 	s.noteReadGap(signal.Metric, "default", math.MinInt64)
 
-	assert.False(t, s.canAnswer(context.Background(), rpcOpSeries, signal.Metric, "default", 0, 0),
-		"an unbounded listing certainly reaches into the gap")
+	require.ErrorIs(t, s.canAnswer(context.Background(), rpcOpSeries, signal.Metric, "default", true, 0, 0),
+		cluster.ErrShardIncomplete, "an unbounded listing certainly reaches into the gap")
+}
+
+// TestCanAnswerSeparatesAbsenceFromIncompleteness: the two disclaims travel the same failover path
+// and end differently — one may read as empty, the other must fail the query — so the chokepoint has
+// to state which it is rather than leave both spelled as absence.
+func TestCanAnswerSeparatesAbsenceFromIncompleteness(t *testing.T) {
+	t.Parallel()
+
+	s, err := InMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	ctx := context.Background()
+
+	notHeld := s.canAnswer(ctx, rpcOpRead, signal.Metric, "default", false, 0, 100)
+	require.ErrorIs(t, notHeld, cluster.ErrShardAbsent)
+	require.NotErrorIs(t, notHeld, cluster.ErrShardIncomplete, "holding nothing is not holding something short")
+
+	s.noteReadGap(signal.Metric, "default", 100)
+
+	require.NoError(t, s.canAnswer(ctx, rpcOpRead, signal.Metric, "default", true, 0, 99),
+		"a window the parts cover is answered here")
+	require.ErrorIs(t, s.canAnswer(ctx, rpcOpRead, signal.Metric, "default", true, 0, 500),
+		cluster.ErrShardIncomplete)
 }
 
 // TestEnumerationFailsOverWhenLocalShardIsIncomplete pins the failover the incomplete-shard warning
