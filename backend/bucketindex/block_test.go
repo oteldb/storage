@@ -79,7 +79,13 @@ func TestIntervalUnion(t *testing.T) {
 		a, b, ab bucketindex.Interval
 	}{
 		{"adjacent", bucketindex.Interval{Min: 1, Max: 1}, bucketindex.Interval{Min: 2, Max: 2}, bucketindex.Interval{Min: 1, Max: 2}},
-		{"gapped", bucketindex.Interval{Min: 1, Max: 1}, bucketindex.Interval{Min: 5, Max: 7}, bucketindex.Interval{Min: 1, Max: 7}},
+		// The union is a set, not a hull: blocks 2 to 4 belong to neither side and the result must
+		// not claim them, or a merge of a lost part's neighbors would discharge the want for it.
+		{
+			"gapped",
+			bucketindex.Interval{Min: 1, Max: 1}, bucketindex.Interval{Min: 5, Max: 7},
+			bucketindex.Interval{Min: 1, Max: 7, Gaps: []bucketindex.Gap{{Min: 2, Max: 4}}},
+		},
 		{"nested", bucketindex.Interval{Min: 1, Max: 9}, bucketindex.Interval{Min: 4, Max: 5}, bucketindex.Interval{Min: 1, Max: 9}},
 		{"unset right", bucketindex.Interval{Min: 2, Max: 3}, bucketindex.Interval{}, bucketindex.Interval{Min: 2, Max: 3}},
 		{"unset left", bucketindex.Interval{}, bucketindex.Interval{Min: 2, Max: 3}, bucketindex.Interval{Min: 2, Max: 3}},

@@ -31,12 +31,17 @@ type Entry struct {
 	Prefix  string
 	MinTime int64
 	MaxTime int64
-	// Blocks is the interval of block numbers this part covers and Level its merge depth: a flush
-	// writes [n, n] at level 0, a merge over parts spanning [a … b] writes [a, b] above it. The two
-	// together make supersession decidable from identity alone — see [Entry.Supersedes]. Both are
-	// unset in a part written before format v5, which carries neither. Added in format v5.
+	// Blocks is the exact set of block numbers this part covers and Level its merge depth: a flush
+	// writes {n} at level 0, a merge writes the union of what its inputs covered, above them. The
+	// two together make supersession decidable from identity alone — see [Entry.Supersedes]. Both
+	// are unset in a part written before format v5, which carries neither. Added in format v5; the
+	// set (rather than a hull) and the gap list in format v6.
 	Blocks Interval
 	Level  uint32
+	// Claim is the ancestry this part holds only jointly with the rest of its split group — unset
+	// for every part a merge wrote whole, which is nearly all of them. See [Claim]. Added in
+	// format v6.
+	Claim Claim
 	// Hole marks this entry as an acknowledged loss rather than a part: the writer owed a repair
 	// for these blocks, no owner could supply them, and it committed this in their place so the
 	// obligation stops blocking reads. It names no objects and holds no rows.
@@ -80,6 +85,11 @@ type Index struct {
 	// value it read forward and takes the maximum when it rebases on a rival's commit, so it is a
 	// cluster-visible fact rather than a per-node level a restart resets. Added in format v5.
 	LostParts uint64
+	// AllocatedBlocks is the highest block number ever handed out under this prefix — the
+	// allocation high-water mark [Index.NextBlock] runs above. It is a separate number from
+	// anything the live set says, because the live set shrinks and identity must not: see
+	// [Index.NextBlock]. Added in format v6.
+	AllocatedBlocks uint64
 }
 
 // Add inserts e, replacing any existing entry with the same prefix, keeping the index sorted.
@@ -114,9 +124,9 @@ func (ix *Index) Remove(prefix string) bool {
 // window [start, end]. It is the read-path prune: only these parts need to be opened.
 func (ix *Index) Overlapping(start, end int64) []Entry {
 	var out []Entry
-	for _, e := range ix.Entries {
-		if e.MinTime <= end && e.MaxTime >= start {
-			out = append(out, e)
+	for i := range ix.Entries {
+		if e := &ix.Entries[i]; e.MinTime <= end && e.MaxTime >= start {
+			out = append(out, *e)
 		}
 	}
 
@@ -126,14 +136,21 @@ func (ix *Index) Overlapping(start, end int64) []Entry {
 const (
 	magic0, magic1 = 'B', 'I'
 
-	// v5 carries the block interval and level on each entry and appends the wanted list; v4 (the
-	// per-writer flush watermarks), v3 (Generation + Removed), v2 (the anonymous epoch only) and
-	// v1 (neither) still decode.
+	// v6 turns the block interval into an exact set (bounds plus gaps), adds the split-group claim
+	// to entries and wants, and appends the allocation high-water mark. v5 (the block interval,
+	// level and the wanted list), v4 (the per-writer flush watermarks), v3 (Generation + Removed),
+	// v2 (the anonymous epoch only) and v1 (neither) still decode.
+	//
+	// A v5 interval is a hull, and what it covered is unknowable once decoded, so it is read as the
+	// contiguous set of its bounds — the meaning it had when it was written. Such an entry can
+	// still claim a block no part held; a merge rewriting it produces an exact set. A v5 index also
+	// carries no high-water mark, so the first v6 commit seeds one from what that index still
+	// names: a shard already emptied under v5 restarts its numbering once, and never again.
 	//
 	// Reading is backward compatible; writing is not. [Decode] rejects any version above this one,
 	// so a node on pre-v5 code cannot read an index this one writes: every node that reads a given
 	// index must be upgraded together. See backend/ARCH.md for the blast radius per deployment.
-	version = 5
+	version = 6
 )
 
 // AppendBinary appends the versioned binary encoding of the index to dst (append-style for
@@ -147,10 +164,10 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 		dst = append(dst, e.Prefix...)
 		dst = binary.AppendVarint(dst, e.MinTime)
 		dst = binary.AppendVarint(dst, e.MaxTime)
-		dst = binary.AppendUvarint(dst, e.Blocks.Min)
-		dst = binary.AppendUvarint(dst, e.Blocks.Max)
+		dst = appendInterval(dst, e.Blocks)
 		dst = binary.AppendUvarint(dst, uint64(e.Level))
 		dst = binary.AppendUvarint(dst, entryFlags(*e))
+		dst = appendClaim(dst, e.Claim)
 	}
 
 	dst = binary.AppendUvarint(dst, ix.FlushedEpoch)
@@ -181,16 +198,17 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 		w := &ix.Wanted[i]
 		dst = binary.AppendUvarint(dst, uint64(len(w.Prefix)))
 		dst = append(dst, w.Prefix...)
-		dst = binary.AppendUvarint(dst, w.Blocks.Min)
-		dst = binary.AppendUvarint(dst, w.Blocks.Max)
+		dst = appendInterval(dst, w.Blocks)
 		dst = binary.AppendUvarint(dst, uint64(w.Level))
 		dst = binary.AppendVarint(dst, w.MinTime)
 		dst = binary.AppendVarint(dst, w.MaxTime)
 		dst = binary.AppendUvarint(dst, w.Generation.Term)
 		dst = binary.AppendUvarint(dst, w.Generation.Counter)
+		dst = appendClaim(dst, w.Claim)
 	}
 
 	dst = binary.AppendUvarint(dst, ix.LostParts)
+	dst = binary.AppendUvarint(dst, ix.AllocatedBlocks)
 
 	return dst
 }
@@ -268,22 +286,42 @@ func Decode(data []byte) (*Index, error) {
 
 	// v5+ appends the outstanding repair obligations; earlier versions could not express one.
 	if ver >= 5 {
-		wanted, rest, err := decodeWants(buf)
-		if err != nil {
+		if err := decodeTail(ix, buf, ver); err != nil {
 			return nil, err
 		}
-
-		ix.Wanted = wanted
-
-		lost, m := binary.Uvarint(rest)
-		if m <= 0 {
-			return nil, errors.Wrap(ErrCorrupt, "bad lost part count")
-		}
-
-		ix.LostParts = lost
 	}
 
 	return ix, nil
+}
+
+// decodeTail parses the v5+ tail: the outstanding wants, the loss counter, and the v6+ allocation
+// high-water mark.
+func decodeTail(ix *Index, buf []byte, ver uint8) error {
+	wanted, rest, err := decodeWants(buf, ver)
+	if err != nil {
+		return err
+	}
+
+	ix.Wanted = wanted
+
+	lost, rest, ok := readUvarint(rest)
+	if !ok {
+		return errors.Wrap(ErrCorrupt, "bad lost part count")
+	}
+
+	ix.LostParts = lost
+
+	// v6+ appends the allocation high-water mark; a v5 index has none, and [Index.NextBlock]
+	// falls back to the live set exactly as v5 did until the first v6 commit seeds it.
+	if ver < 6 {
+		return nil
+	}
+
+	if ix.AllocatedBlocks, _, ok = readUvarint(rest); !ok {
+		return errors.Wrap(ErrCorrupt, "bad allocated blocks")
+	}
+
+	return nil
 }
 
 // decodeEntries parses the part list, bounding the count by what the buffer could hold as the
@@ -330,7 +368,7 @@ func decodeEntries(buf []byte, ver uint8) ([]Entry, []byte, error) {
 		// v5+ carries the block identity inline; earlier entries leave it unset, which takes part
 		// in no containment (see [Interval.Valid]).
 		if ver >= 5 {
-			if buf, ok = decodeBlockIdentity(buf, &e); !ok {
+			if buf, ok = decodeBlockIdentity(buf, ver, &e); !ok {
 				return nil, nil, errors.Wrap(ErrCorrupt, "bad block identity")
 			}
 		}
@@ -353,12 +391,9 @@ func entryFlags(e Entry) uint64 {
 	return 0
 }
 
-func decodeBlockIdentity(buf []byte, e *Entry) ([]byte, bool) {
+func decodeBlockIdentity(buf []byte, ver uint8, e *Entry) ([]byte, bool) {
 	var ok bool
-	if e.Blocks.Min, buf, ok = readUvarint(buf); !ok {
-		return nil, false
-	}
-	if e.Blocks.Max, buf, ok = readUvarint(buf); !ok {
+	if e.Blocks, buf, ok = readInterval(buf, ver); !ok {
 		return nil, false
 	}
 
@@ -376,12 +411,136 @@ func decodeBlockIdentity(buf []byte, e *Entry) ([]byte, bool) {
 
 	e.Hole = flags&entryFlagHole != 0
 
+	if ver >= 6 {
+		if e.Claim, buf, ok = readClaim(buf); !ok {
+			return nil, false
+		}
+	}
+
 	return buf, true
+}
+
+// appendInterval writes a block set. An unset one costs a single zero byte, and the gap list is
+// written only for a set that has one, so the ordinary contiguous part pays three bytes.
+func appendInterval(dst []byte, iv Interval) []byte {
+	if !iv.Valid() {
+		return binary.AppendUvarint(dst, 0)
+	}
+
+	dst = binary.AppendUvarint(dst, iv.Min)
+	dst = binary.AppendUvarint(dst, iv.Max)
+	dst = binary.AppendUvarint(dst, uint64(len(iv.Gaps)))
+
+	for _, g := range iv.Gaps {
+		dst = binary.AppendUvarint(dst, g.Min)
+		dst = binary.AppendUvarint(dst, g.Max)
+	}
+
+	return dst
+}
+
+// readInterval parses a block set. A v5 encoding carries bounds only and is read as the contiguous
+// set they describe — the meaning a hull had when it was written.
+//
+// A set that does not round-trip to its canonical form is rejected rather than normalized: two
+// encodings of one set would break both equality and the encode∘decode identity, and a
+// denormalized one is not something this package ever writes.
+func readInterval(buf []byte, ver uint8) (Interval, []byte, bool) {
+	var (
+		iv Interval
+		ok bool
+	)
+
+	if iv.Min, buf, ok = readUvarint(buf); !ok {
+		return Interval{}, nil, false
+	}
+
+	if ver < 6 {
+		if iv.Max, buf, ok = readUvarint(buf); !ok {
+			return Interval{}, nil, false
+		}
+
+		return iv, buf, true
+	}
+
+	if iv.Min == 0 {
+		return Interval{}, buf, true
+	}
+
+	if iv.Max, buf, ok = readUvarint(buf); !ok {
+		return Interval{}, nil, false
+	}
+
+	n, buf, ok := readUvarint(buf)
+	if !ok || n > uint64(len(buf)) {
+		return Interval{}, nil, false
+	}
+
+	if n > 0 {
+		iv.Gaps = make([]Gap, 0, n)
+		for range n {
+			var g Gap
+
+			if g.Min, buf, ok = readUvarint(buf); !ok {
+				return Interval{}, nil, false
+			}
+
+			if g.Max, buf, ok = readUvarint(buf); !ok {
+				return Interval{}, nil, false
+			}
+
+			iv.Gaps = append(iv.Gaps, g)
+		}
+	}
+
+	if !iv.Valid() {
+		return Interval{}, nil, false
+	}
+
+	return iv, buf, true
+}
+
+func appendClaim(dst []byte, c Claim) []byte {
+	if !c.Valid() {
+		return binary.AppendUvarint(dst, 0)
+	}
+
+	dst = binary.AppendUvarint(dst, 1)
+	dst = appendInterval(dst, c.Blocks)
+
+	return appendInterval(dst, c.Group)
+}
+
+func readClaim(buf []byte) (Claim, []byte, bool) {
+	present, buf, ok := readUvarint(buf)
+	if !ok || present > 1 {
+		return Claim{}, nil, false
+	}
+
+	if present == 0 {
+		return Claim{}, buf, true
+	}
+
+	var c Claim
+
+	if c.Blocks, buf, ok = readInterval(buf, version); !ok {
+		return Claim{}, nil, false
+	}
+
+	if c.Group, buf, ok = readInterval(buf, version); !ok {
+		return Claim{}, nil, false
+	}
+
+	if !c.Valid() {
+		return Claim{}, nil, false
+	}
+
+	return c, buf, true
 }
 
 // decodeWants parses the wanted list, bounding the count by what the buffer could hold as the
 // entry and removal counts are.
-func decodeWants(buf []byte) ([]Want, []byte, error) {
+func decodeWants(buf []byte, ver uint8) ([]Want, []byte, error) {
 	n, m := binary.Uvarint(buf)
 	if m <= 0 {
 		return nil, nil, errors.Wrap(ErrCorrupt, "bad want count")
@@ -411,11 +570,8 @@ func decodeWants(buf []byte) ([]Want, []byte, error) {
 		w.Prefix = string(buf[:l])
 		buf = buf[l:]
 
-		if w.Blocks.Min, buf, ok = readUvarint(buf); !ok {
-			return nil, nil, errors.Wrap(ErrCorrupt, "bad want block min")
-		}
-		if w.Blocks.Max, buf, ok = readUvarint(buf); !ok {
-			return nil, nil, errors.Wrap(ErrCorrupt, "bad want block max")
+		if w.Blocks, buf, ok = readInterval(buf, ver); !ok {
+			return nil, nil, errors.Wrap(ErrCorrupt, "bad want blocks")
 		}
 
 		level, rest, lok := readUvarint(buf)
@@ -436,6 +592,12 @@ func decodeWants(buf []byte) ([]Want, []byte, error) {
 		}
 		if w.Generation.Counter, buf, ok = readUvarint(buf); !ok {
 			return nil, nil, errors.Wrap(ErrCorrupt, "bad want counter")
+		}
+
+		if ver >= 6 {
+			if w.Claim, buf, ok = readClaim(buf); !ok {
+				return nil, nil, errors.Wrap(ErrCorrupt, "bad want claim")
+			}
 		}
 
 		out = append(out, w)

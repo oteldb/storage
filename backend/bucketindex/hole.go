@@ -43,9 +43,9 @@ func (ix *Index) RecordHole(w Want) Entry {
 func (ix *Index) Holes() []Entry {
 	var out []Entry
 
-	for _, e := range ix.Entries {
-		if e.Hole {
-			out = append(out, e)
+	for i := range ix.Entries {
+		if e := &ix.Entries[i]; e.Hole {
+			out = append(out, *e)
 		}
 	}
 
@@ -73,11 +73,12 @@ func Revokes(e, h Entry) bool {
 func TrimHoles(holes, live []Entry) []Entry {
 	out := holes[:0]
 
-	for _, h := range holes {
+	for j := range holes {
+		h := &holes[j]
 		revoked := false
 
 		for i := range live {
-			if Revokes(live[i], h) {
+			if Revokes(live[i], *h) {
 				revoked = true
 
 				break
@@ -85,7 +86,7 @@ func TrimHoles(holes, live []Entry) []Entry {
 		}
 
 		if !revoked {
-			out = append(out, h)
+			out = append(out, *h)
 		}
 	}
 
