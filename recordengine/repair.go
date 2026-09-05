@@ -101,6 +101,22 @@ type repairResult struct {
 
 	entry   bucketindex.Entry
 	outcome bucketindex.WantOutcome
+	// opened is the part when this node's own backend held it; nil for one a peer supplied.
+	opened *part
+}
+
+// uncount reverses what a satisfied target added to the stats when its part will not open.
+func (r *repairResult) uncount(s *RepairStats) {
+	switch {
+	case r.hole:
+		s.Revoked--
+	case r.opened != nil:
+		s.Local--
+	default:
+		s.Fetched--
+	}
+
+	s.Failed++
 }
 
 // repairWants discharges what it can of this engine's outstanding repair obligations before the
@@ -116,7 +132,9 @@ func (e *Engine) repairWants(ctx context.Context) {
 	}
 
 	e.mu.Lock()
-	wants := slices.Clone(e.wants)
+	// Pending wants are obligations too: a load that could not commit them left them for the first
+	// commit this engine makes, and the repair commit is one.
+	wants := slices.Concat(e.wants, e.pendingWants)
 	holes := slices.Clone(e.holes)
 	entries := e.entriesLocked()
 	e.mu.Unlock()
@@ -154,8 +172,16 @@ func (e *Engine) repairWants(ctx context.Context) {
 		pending = append(pending, repairTarget{want: w, hole: true})
 	}
 
-	results, fetchStats := e.fetchWants(ctx, pending)
+	held, remote := e.openHeld(ctx, pending, &stats)
+
+	results, fetchStats := e.fetchWants(ctx, remote)
 	stats.add(fetchStats)
+
+	results = append(results, held...)
+
+	// Deterministic order so the parts are opened, and any supersession applied, the same way on
+	// every node.
+	slices.SortFunc(results, func(a, b repairResult) int { return strings.Compare(a.want.Prefix, b.want.Prefix) })
 
 	lost := e.confirmLost(wants, results)
 	stats.Lost = int64(len(lost))
@@ -249,6 +275,35 @@ func (e *Engine) entriesLocked() []bucketindex.Entry {
 	return append(out, e.foreign...)
 }
 
+// openHeld splits the targets into those whose part this node's own backend still holds and those
+// to ask peers for. The index said the part was gone, so the disk is asked before any peer: the
+// index this engine loaded may be a peer's copy that knows nothing of this disk. Holding is proven
+// by opening the part — surviving objects under the prefix are not a readable part.
+func (e *Engine) openHeld(
+	ctx context.Context, pending []repairTarget, stats *RepairStats,
+) (held []repairResult, remote []repairTarget) {
+	for _, t := range pending {
+		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, t.want.Prefix)
+		if err != nil {
+			remote = append(remote, t)
+
+			continue
+		}
+
+		if t.hole {
+			stats.Revoked++
+		} else {
+			stats.Local++
+		}
+
+		held = append(held, repairResult{
+			repairTarget: t, entry: t.want.Entry(), outcome: bucketindex.WantSatisfied, opened: p,
+		})
+	}
+
+	return held, remote
+}
+
 // fetchWants pulls up to [repairFetchesPerCycle] targets' parts from peers in one call — the
 // fetcher answers the whole cycle at once so it can read each peer's index once and copy a part
 // discharging several wants once — and returns what each attempt concluded.
@@ -309,10 +364,6 @@ func (e *Engine) fetchWants(ctx context.Context, pending []repairTarget) ([]repa
 		out = append(out, repairResult{repairTarget: t, entry: r.Entry, outcome: r.Outcome})
 	}
 
-	// Deterministic order so the parts are opened, and any supersession applied, the same way on
-	// every node.
-	slices.SortFunc(out, func(a, b repairResult) int { return strings.Compare(a.want.Prefix, b.want.Prefix) })
-
 	return out, stats
 }
 
@@ -326,15 +377,15 @@ func (e *Engine) fetchWants(ctx context.Context, pending []repairTarget) ([]repa
 func (e *Engine) publishRepaired(
 	ctx context.Context, results []repairResult, lost []bucketindex.Want, stats RepairStats,
 ) {
-	fetched := make([]bucketindex.Entry, 0, len(results))
+	satisfied := make([]*repairResult, 0, len(results))
 
 	for i := range results {
 		if results[i].outcome == bucketindex.WantSatisfied {
-			fetched = append(fetched, results[i].entry)
+			satisfied = append(satisfied, &results[i])
 		}
 	}
 
-	if len(fetched) == 0 && len(lost) == 0 && stats.Local == 0 && stats.Revoked == 0 {
+	if len(satisfied) == 0 && len(lost) == 0 && stats.Local == 0 && stats.Revoked == 0 {
 		// Nothing changed, so there is nothing to commit; a want nobody could satisfy is left in
 		// the index exactly as it was, and only the counters move.
 		e.mu.Lock()
@@ -349,8 +400,8 @@ func (e *Engine) publishRepaired(
 
 	e.mu.Lock()
 
-	added := make([]*part, 0, len(fetched))
-	opened := make([]bucketindex.Entry, 0, len(fetched))
+	added := make([]*part, 0, len(satisfied))
+	opened := make([]bucketindex.Entry, 0, len(satisfied))
 
 	// Two wants are routinely answered by one merged successor, and a part opened twice would be
 	// committed twice and have its rows counted twice.
@@ -359,23 +410,28 @@ func (e *Engine) publishRepaired(
 		have[p.prefix] = struct{}{}
 	}
 
-	for _, ent := range fetched {
+	for _, r := range satisfied {
+		ent := r.entry
 		if _, dup := have[ent.Prefix]; dup {
 			continue
 		}
 
 		have[ent.Prefix] = struct{}{}
 
-		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, ent.Prefix)
-		if err != nil {
-			// The objects are here but unreadable: the want stays, and the next cycle re-copies.
-			zctx.From(ctx).Warn("repaired part is not readable",
-				zap.String("prefix", ent.Prefix), zap.Error(err))
+		p := r.opened
+		if p == nil {
+			var err error
 
-			stats.Fetched--
-			stats.Failed++
+			p, err = openPart(ctx, e.cfg.Backend, e.cfg.Schema, ent.Prefix)
+			if err != nil {
+				// The objects are here but unreadable: the want stays, and the next cycle re-copies.
+				zctx.From(ctx).Warn("repaired part is not readable",
+					zap.String("prefix", ent.Prefix), zap.Error(err))
 
-			continue
+				r.uncount(&stats)
+
+				continue
+			}
 		}
 
 		p.minTime, p.maxTime = ent.MinTime, ent.MaxTime

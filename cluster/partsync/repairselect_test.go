@@ -33,6 +33,8 @@ type probeOpts struct {
 	// failIndex makes the bucket index answer 500: a peer we could not ask, not one that answered
 	// it has nothing.
 	failIndex bool
+	// failList makes the key listing answer 500, the same shape for the disk.
+	failList bool
 }
 
 func servePeer(t *testing.T, be backend.Backend, prefix string, opts probeOpts) *probePeer {
@@ -48,6 +50,12 @@ func servePeer(t *testing.T, be backend.Backend, prefix string, opts probeOpts) 
 		p.mu.Lock()
 		p.lists++
 		p.mu.Unlock()
+
+		if opts.failList {
+			http.Error(w, "listing unavailable", http.StatusInternalServerError)
+
+			return
+		}
 
 		list.ServeHTTP(w, req)
 	})
@@ -140,15 +148,17 @@ func TestFetchWantsReadsEachIndexOncePerCycle(t *testing.T) {
 		require.True(t, r.OK)
 	}
 
-	total := 0
+	total, lists := 0, 0
 	for _, p := range peers {
 		n := p.indexFetches(prefix)
 		assert.LessOrEqual(t, n, 1, "a peer's index is read at most once for the whole cycle")
 
 		total += n
+		lists += p.listCalls()
 	}
 
 	assert.Equal(t, len(peers), total, "one index read per peer, not one per peer per want")
+	assert.Equal(t, 1, lists, "the indexes answered every want, so no disk was listed; the one call is the copy's")
 }
 
 // TestFetchWantsCopiesASharedSuccessorOnce pins the fetch-side dedupe: two wants answered by the

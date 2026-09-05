@@ -267,7 +267,12 @@ Two consequences fall out of the entry no longer being there:
   flush, and deleting them destroys the evidence before repair can see it.
 
 Only an owner does this — the replica path (`RefreshReplica`, no sweep) still fails, because
-recording a want is committing an index, which is the owner's to write.
+recording a want is committing an index, which is the owner's to write. A cluster node recovering
+holds no claim yet, so it loads through `LoadPartsUnclaimed`: the sweep runs, but a gone part is a
+*pending* want — counted, disclaimed over, protected from the sweep — that the engine's first commit
+as a writer records, which only an owner ever makes. Committing it at recovery would let a replica
+publish a want at a generation above the owner's; a strict backfill then installs that index on the
+owner and a part the owner holds intact reads as lost.
 
 ## Disk pressure closes the ingest path
 
@@ -512,7 +517,12 @@ Satisfaction follows `Index.Satisfying` — the exact part, **or the largest liv
 interval contains the want's at a higher level**. That is what makes repair terminate: by the time
 a want is serviced the data may exist only inside a merged successor, and chasing a prefix that no
 longer exists anywhere would never converge. The local index is asked first, so a want this
-engine's own merges already covered costs no network call at all.
+engine's own merges already covered costs no network call at all — and then the local **disk**: a
+want whose part still opens from this node's own backend is discharged without a peer
+(`RepairStats.Local`). The index that recorded the want may be a peer's copy installed by a
+backfill, which knows nothing of this disk; and holding is proven by opening the part, because
+surviving objects under a prefix are not a readable part. Pending wants — those a load could not
+commit — are serviced alongside the committed ones, since the repair commit is a commit.
 
 `Config.Repair` (`PartFetcher`) is the whole seam to the cluster: part identities in, the entries of
 whatever parts were actually copied out. The engine never learns about peers, addresses or transport —

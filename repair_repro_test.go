@@ -7,7 +7,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -46,7 +45,6 @@ func (c *readPolicyCluster) logStats(id string) (parts int, wanted int, holes in
 
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestRepro387ReplicaInstallsDamagedIndexThenOwnerHoles(t *testing.T) {
-	reproduce.Unfixed(t, 540, "repair reads a peer's index instead of its disk, so an owner holes a part a replica still holds")
 	endpoint := startEtcd(t)
 	ctx := context.Background()
 
@@ -83,7 +81,7 @@ func TestRepro387ReplicaInstallsDamagedIndexThenOwnerHoles(t *testing.T) {
 	for i := range 5 {
 		require.NoError(t, c.nodes[owner].Admin().MaintainNow(ctx))
 
-		_, _, h, l = c.logStats(owner)
+		p, w, h, l = c.logStats(owner)
 		rs := ownerEng.RepairStats()
 		t.Logf("owner pass %d: parts=%d wanted=%d holes=%d lost=%d repair=%+v", i+1, p, w, h, l, rs)
 	}
@@ -92,15 +90,21 @@ func TestRepro387ReplicaInstallsDamagedIndexThenOwnerHoles(t *testing.T) {
 	require.NoError(t, err)
 	t.Logf("replica STILL holds %d objects of the lost part on disk", len(keys))
 
-	p, _, h, l = c.logStats(owner)
+	p, w, h, l = c.logStats(owner)
 	require.Zero(t, h, "DESIGN EXPECTATION: the part is on the replica's disk, so no hole should be committed")
 	require.Zero(t, l, "DESIGN EXPECTATION: no data was lost cluster-wide")
-	require.Equal(t, 2, p, "DESIGN EXPECTATION: the part is repaired back")
+	require.Equal(t, 1, p, "DESIGN EXPECTATION: the part is repaired back")
+	require.Zero(t, w, "DESIGN EXPECTATION: the repair discharges the want")
+
+	require.NoError(t, c.nodes[replica].Admin().MaintainNow(ctx))
+
+	rp, rw, rh, _ := c.logStats(replica)
+	require.Equal(t, 1, rp, "DESIGN EXPECTATION: the replica goes on serving the part")
+	require.Zero(t, rw+rh, "DESIGN EXPECTATION: and adopts the owner's repaired index")
 }
 
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestRepro387HoleFreezesReplicaIndexInstall(t *testing.T) {
-	reproduce.Unfixed(t, 541, "a hole counts as unbacked, so replicas stop installing the owner's index")
 	endpoint := startEtcd(t)
 	ctx := context.Background()
 
@@ -155,7 +159,6 @@ func TestRepro387HoleFreezesReplicaIndexInstall(t *testing.T) {
 
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestRepro387ReplicaLossPropagatesToOwner(t *testing.T) {
-	reproduce.Unfixed(t, 540, "a replica's want-carrying index supersedes the owner's, dropping the owner's intact copy")
 	endpoint := startEtcd(t)
 	ctx := context.Background()
 

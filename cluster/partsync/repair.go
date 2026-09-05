@@ -42,9 +42,15 @@ type WantResult struct {
 // Peers are consulted in a shuffled order, so equal candidates spread the repair load instead of
 // every recovering node converging on whichever peer sorts first.
 //
-// OK is false with a nil error only when every peer *given to it* answered and none of them named
-// a satisfying part. A peer that could not be reached is a transient failure and is reported as an
-// error, because the difference decides whether the owner may ever conclude the data is gone.
+// A want no peer's index names is then asked of the peers' disks — one listing per peer, again once
+// for the batch — and answered by the exact prefix from any peer holding a complete copy of it. An
+// index is a copy of whichever owner's index last superseded it and is not evidence of what that
+// peer holds.
+//
+// OK is false with a nil error only when every peer *given to it* answered, both its index and its
+// listing, and none of them named or held a satisfying part. A peer that could not be reached is a
+// transient failure and is reported as an error, because the difference decides whether the owner
+// may ever conclude the data is gone.
 //
 // That is absence over the peers asked, not over the shard's owners, and the two coincide only
 // when the caller says so: only the caller knows the expected owner set (see
@@ -74,18 +80,11 @@ func (s *Syncer) FetchWants(
 		return out
 	}
 
-	views, indexErr := s.peerIndexes(ctx, enginePrefix, peers)
+	views, firstErr := s.peerIndexes(ctx, enginePrefix, peers)
 
 	tasks := make(map[string]*copyTask)
 
-	for i := range wants {
-		addr, ent, ok := selectSatisfying(views, wants[i])
-		if !ok {
-			out[i].Err = indexErr
-
-			continue
-		}
-
+	enqueue := func(i int, addr string, ent bucketindex.Entry) {
 		t, seen := tasks[ent.Prefix]
 		if !seen {
 			t = &copyTask{addr: addr, entry: ent}
@@ -93,6 +92,34 @@ func (s *Syncer) FetchWants(
 		}
 
 		t.wants = append(t.wants, i)
+	}
+
+	var silent []int
+
+	for i := range wants {
+		if addr, ent, ok := selectSatisfying(views, wants[i]); ok {
+			enqueue(i, addr, ent)
+		} else {
+			silent = append(silent, i)
+		}
+	}
+
+	// A peer's index is a copy of whichever owner's index last superseded it and says nothing about
+	// that peer's disk, so a want no index names is asked of the disks: one listing per peer for the
+	// batch, and the want's own prefix is taken from any peer holding a complete copy.
+	if len(silent) > 0 {
+		holdings, listErr := s.peerHoldings(ctx, enginePrefix, peers)
+		if firstErr == nil {
+			firstErr = listErr
+		}
+
+		for _, i := range silent {
+			if addr, ok := selectHeld(holdings, wants[i].Prefix); ok {
+				enqueue(i, addr, wants[i].Entry())
+			} else {
+				out[i].Err = firstErr
+			}
+		}
 	}
 
 	s.runCopies(ctx, enginePrefix, tasks)
@@ -194,8 +221,9 @@ func (s *Syncer) peerIndexes(
 		wg.Go(func() {
 			data, err := s.client.Fetch(ctx, p, indexKey)
 			if err != nil {
-				// A peer with no index at all holds nothing; anything else is a peer we could not
-				// ask, which is not evidence of absence.
+				// A peer with no index at all names nothing (its disk is still asked, see
+				// peerHoldings); anything else is a peer we could not ask, which is not evidence of
+				// absence.
 				if !errors.Is(err, ErrNotExist) {
 					results[i].err = err
 				}
@@ -229,6 +257,70 @@ func (s *Syncer) peerIndexes(
 	}
 
 	return views, firstErr
+}
+
+// peerHolding is the parts one peer's disk holds a complete copy of, whatever its index says.
+type peerHolding struct {
+	addr  string
+	parts map[string]struct{}
+}
+
+// peerHoldings lists every peer's engine prefix concurrently, once for the batch, and returns the
+// readable listings in shuffled peer order with the first failure among the rest. A listing that
+// could not be read is transient, exactly as an unreadable index is.
+func (s *Syncer) peerHoldings(
+	ctx context.Context, enginePrefix string, peers []string,
+) (holdings []peerHolding, firstErr error) {
+	order := s.shuffled(peers)
+
+	type result struct {
+		parts map[string]struct{}
+		err   error
+	}
+
+	results := make([]result, len(order))
+
+	var wg sync.WaitGroup
+
+	for i, p := range order {
+		wg.Go(func() {
+			listed, err := s.client.List(ctx, p, enginePrefix)
+			if err != nil {
+				results[i].err = err
+
+				return
+			}
+
+			results[i].parts = manifestParts(listed, enginePrefix)
+		})
+	}
+
+	wg.Wait()
+
+	holdings = make([]peerHolding, 0, len(order))
+
+	for i, r := range results {
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+
+		if r.parts != nil {
+			holdings = append(holdings, peerHolding{addr: order[i], parts: r.parts})
+		}
+	}
+
+	return holdings, firstErr
+}
+
+// selectHeld picks the first peer, in shuffled order, whose disk holds a complete copy of prefix.
+func selectHeld(holdings []peerHolding, prefix string) (addr string, ok bool) {
+	for _, h := range holdings {
+		if _, found := h.parts[prefix]; found {
+			return h.addr, true
+		}
+	}
+
+	return "", false
 }
 
 // shuffled returns peers in a random order, so two nodes repairing the same want from the same set

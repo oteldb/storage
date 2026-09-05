@@ -293,7 +293,22 @@ peer's listing does not name, or whose fetch 404s (the merge landing later still
 whole index for this pass, which then keeps the local one and takes the non-superseding path for
 pruning. Copying stays unconditional, and the next pass reads a fresh index and converges. Re-reading
 the index after the listing would only move the skew to the other side of the pair; the entry-backing
-check is on state the pass has already observed, so it leaves no window.
+check is on state the pass has already observed, so it leaves no window. A hole is not an unbacked
+entry: it names no objects by definition, and counting it would freeze every replica of a shard that
+acknowledged a loss on the last index before the hole.
+
+**A peer's index is not evidence of what any disk holds.** Under a private backend the mirrored index
+is a copy of whichever owner's index last superseded it, so a want or a hole in it says only that
+*that owner* could not read the part — nothing about the peer's disk, and nothing about this one.
+Two rules follow. Installing a superseding index never moves a part this node holds out of
+`Entries`: an entry the local index names whose manifest is on disk (the manifest lands last, so its
+presence is a complete copy) stays, and the peer's claim of loss rides beside it as a want — kept
+rather than dropped, because that want is what the owner's repair pass discharges with a commit,
+and that commit is what republishes the part at a generation the peers adopt; a hole becomes the
+want it discharged, since an entry and a hole cannot share a prefix, and `LostParts` stays where it
+was, as on any revocation. Dropping the want instead would leave the owner nothing to commit, and a
+replica's damaged, higher-generation index would stand until the next flush. And repair asks the
+disks: `FetchWants` falls back to each peer's listing for a want no index names (below).
 
 **Absence is not an instruction.** Mirroring a peer, obeying its deletions, and deleting a
 particular part are three separate claims. Only an index that *supersedes* the local one may do the
@@ -349,6 +364,15 @@ index: committing the entries is the owner's own commit, which is what discharge
 once for the batch (O(peers), not O(peers × wants)), and a merged successor discharging several
 wants is copied once. Nothing outlives the call: a peer index cached across cycles would let repair
 act on a stale view of what peers hold, and staleness is precisely what anti-entropy is for.
+
+**A want no index names is asked of the disks.** The indexes are copies of one another and not
+evidence of what a peer holds (above), so the batch then lists each peer's engine prefix — once per
+peer, the same per-cycle shape as the index reads, and only when some want went unnamed — and takes
+the want's exact prefix from any peer whose listing shows the manifest. Surviving objects without a
+manifest are remnants, not a part, and count as nothing; a listing that could not be read is a
+transient failure, exactly as an unreadable index is. Measured with three peers and four wants: the
+indexes answering costs 3 index reads and 1 listing (the copy's); the indexes silent costs 3 index
+reads and 3 prefix listings plus one part listing per copy. Per-want listings would be 12.
 
 Peer indexes are read **concurrently, but selected by shuffled peer index rather than by arrival**.
 Results land in a slice aligned to the peer order and selection runs after every fetch returns, so

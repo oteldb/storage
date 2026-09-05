@@ -358,18 +358,46 @@ func foreignEntries(
 // unflushed head samples — but is not required to query flushed data.
 //
 // It replaces any current parts. A head-only engine (no backend) is a no-op. It assumes this node owns the prefix — it
-// sweeps the part objects the index does not name (see [Engine.sweepOrphansLocked]).
+// sweeps the part objects the index does not name (see [Engine.sweepOrphansLocked]) and commits a
+// want for each part the index names that is not there.
 func (e *Engine) LoadParts(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return e.loadPartsLocked(ctx, true)
+	return e.loadPartsLocked(ctx, loadOwner)
 }
 
-// loadPartsLocked is [Engine.LoadParts] with the orphan sweep made optional: a replica shares the
-// prefix with the owner, whose in-flight (not yet committed) part must not be deleted underneath it.
-// Caller holds e.mu.
-func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
+// LoadPartsUnclaimed is [Engine.LoadParts] for a node whose authority over the prefix is not yet
+// established (a cluster node recovering before it holds any claim): a part the index names but the
+// backend lacks becomes a pending want, committed by the first commit this engine makes as a writer
+// rather than now. Reads over it disclaim meanwhile ([Engine.WantOverlaps]).
+func (e *Engine) LoadPartsUnclaimed(ctx context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.loadPartsLocked(ctx, loadUnclaimed)
+}
+
+// loadMode is what a load may do about a part the index names but the backend does not hold.
+type loadMode uint8
+
+const (
+	// loadReplica fails on such a part: a replica reconciles through the owner's copy and records
+	// nothing of its own.
+	loadReplica loadMode = iota
+	// loadUnclaimed sweeps orphans and keeps the part as a pending want for the engine's first
+	// commit, which only an owner makes.
+	loadUnclaimed
+	// loadOwner sweeps orphans and commits the want at once.
+	loadOwner
+)
+
+// loadPartsLocked is [Engine.LoadParts] under a [loadMode]. Only an owner sweeps: a replica shares
+// the prefix with the owner, whose in-flight (not yet committed) part must not be deleted underneath
+// it. Caller holds e.mu.
+func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
+	sweep := mode != loadReplica
+
 	if e.cfg.Backend == nil {
 		return nil
 	}
@@ -462,7 +490,7 @@ func (e *Engine) loadPartsLocked(ctx context.Context, sweep bool) error {
 
 	// One commit drops the gone parts from Entries and states the wants that replace them. It runs
 	// before the rest of the load so the obligation is durable even if identity recovery fails.
-	if len(lost) > 0 {
+	if len(lost) > 0 && mode == loadOwner {
 		if err := e.updateIndexLocked(ctx); err != nil {
 			return errors.Wrap(err, "record repair wants")
 		}
@@ -495,7 +523,7 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := e.loadPartsLocked(ctx, false); err != nil {
+	if err := e.loadPartsLocked(ctx, loadReplica); err != nil {
 		return err
 	}
 
