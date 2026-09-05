@@ -7,8 +7,19 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
+
+// requireBothRecords reads the shard back through a node and asserts the two records c.write
+// ingested are there: consistent bookkeeping with an empty part would pass every count check.
+func (c *readPolicyCluster) requireBothRecords(t *testing.T, id string) {
+	t.Helper()
+
+	got := logBodies(t, c.nodes[id].LogFetcher("default"),
+		fetch.Request{Signal: signal.Log, Start: 0, End: 1 << 62})
+	require.ElementsMatch(t, []string{"first", "second"}, got, "%s serves the repaired rows", id)
+}
 
 // compactionOwnerOf returns the shard's compaction owner and the other ring owner.
 func (c *readPolicyCluster) compactionOwnerOf(t *testing.T) (owner, replica string) {
@@ -101,6 +112,9 @@ func TestRepro387ReplicaInstallsDamagedIndexThenOwnerHoles(t *testing.T) {
 	rp, rw, rh, _ := c.logStats(replica)
 	require.Equal(t, 1, rp, "DESIGN EXPECTATION: the replica goes on serving the part")
 	require.Zero(t, rw+rh, "DESIGN EXPECTATION: and adopts the owner's repaired index")
+
+	c.requireBothRecords(t, owner)
+	c.requireBothRecords(t, replica)
 }
 
 //nolint:paralleltest // owns an embedded etcd; runs serially
@@ -199,4 +213,7 @@ func TestRepro387ReplicaLossPropagatesToOwner(t *testing.T) {
 	rp, _, rh, _ := c.logStats(replica)
 	require.Equal(t, 1, rp, "DESIGN EXPECTATION: replica re-mirrors the part from the owner")
 	require.Zero(t, rh, "DESIGN EXPECTATION: and adopts no hole for a part that exists")
+
+	c.requireBothRecords(t, owner)
+	c.requireBothRecords(t, replica)
 }
