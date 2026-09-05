@@ -105,6 +105,15 @@ func (p *probePeer) indexFetches(prefix string) int {
 	return p.count(prefix + "/" + bucketindex.Object)
 }
 
+// reset zeroes the counters so a test can price one pass in isolation.
+func (p *probePeer) reset() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.fetches = make(map[string]int)
+	p.lists = 0
+}
+
 // wantAt is a want for one block, which a wider part containing that block satisfies.
 func wantAt(prefix string, block uint64) bucketindex.Want {
 	return bucketindex.Want{

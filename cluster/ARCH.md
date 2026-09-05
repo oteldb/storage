@@ -310,6 +310,21 @@ was, as on any revocation. Dropping the want instead would leave the owner nothi
 replica's damaged, higher-generation index would stand until the next flush. And repair asks the
 disks: `FetchWants` falls back to each peer's listing for a want no index names (below).
 
+**Nor is this node's own index evidence of its own disk.** A pass is index-driven — nothing newer at
+the peer, nothing to do — so a replica that loses objects while the owner's index stands still would
+otherwise serve an index naming parts it does not hold until the owner happens to commit something
+else. A converged pass (equal generation, identical bytes, replica mode) therefore verifies the disk
+before it returns: one listing of the *local* prefix against the peer's key set remembered from the
+last pass, and only when an object is gone does the pass go on to the ordinary mirror — one peer
+listing plus the missing objects — and log the loss. The first pass of a process has no last pass to
+compare with and runs the mirror once, so a restart that finds objects gone recovers them before
+`RefreshReplica` opens the parts (which, in replica mode, fails rather than records a want for a part
+it cannot open). Steady state stays index-only: one index read per peer per pass and no listing. The
+owner's strict pass is exempt — its losses are the engine's want path, and mirroring a replica's
+objects onto an owner would resurrect every part the owner had just merged away. The reconcile
+changes when a pass runs, not what it may delete: it takes the non-superseding path, so the
+deletion rules below hold unchanged.
+
 **Absence is not an instruction.** Mirroring a peer, obeying its deletions, and deleting a
 particular part are three separate claims. Only an index that *supersedes* the local one may do the
 second, and only a part the peer says it **removed** may be deleted at all. Ordering comes from the bucket
