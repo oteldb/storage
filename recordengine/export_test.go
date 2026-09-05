@@ -66,8 +66,8 @@ func (e *Engine) WantPrefixes() []string {
 	defer e.mu.Unlock()
 
 	out := make([]string, 0, len(e.wants))
-	for _, w := range e.wants {
-		out = append(out, w.Prefix)
+	for i := range e.wants {
+		out = append(out, e.wants[i].Prefix)
 	}
 
 	return out

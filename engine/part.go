@@ -301,6 +301,9 @@ type part struct {
 	// contain nor be contained by anything — see [bucketindex.Interval].
 	blocks bucketindex.Interval
 	level  uint32
+	// claim is the ancestry this part holds only jointly with the rest of its split group; unset
+	// for every part a merge wrote whole — see [bucketindex.Claim].
+	claim bucketindex.Claim
 
 	// pending is the identity a part this engine just wrote is waiting to be assigned; nil for one
 	// opened from an index, whose identity is whatever that index recorded — including the unset

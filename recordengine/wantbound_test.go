@@ -48,12 +48,13 @@ func seedGoneParts(t *testing.T, be backend.Backend, n int) []string {
 // acknowledged holes. A part in neither has left Entries into nothing, which is silent loss.
 func owedParts(ix *bucketindex.Index) map[string]struct{} {
 	owed := make(map[string]struct{}, len(ix.Wanted))
-	for _, w := range ix.Wanted {
-		owed[w.Prefix] = struct{}{}
+	for i := range ix.Wanted {
+		owed[ix.Wanted[i].Prefix] = struct{}{}
 	}
 
-	for _, h := range ix.Holes() {
-		owed[h.Prefix] = struct{}{}
+	holes := ix.Holes()
+	for i := range holes {
+		owed[holes[i].Prefix] = struct{}{}
 	}
 
 	return owed

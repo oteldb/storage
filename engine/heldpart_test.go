@@ -116,8 +116,8 @@ func TestLoadPartsUnclaimedWantIsRepaired(t *testing.T) {
 
 func partPrefixesOf(ix *bucketindex.Index) []string {
 	out := make([]string, 0, len(ix.Entries))
-	for _, e := range ix.Entries {
-		out = append(out, e.Prefix)
+	for i := range ix.Entries {
+		out = append(out, ix.Entries[i].Prefix)
 	}
 
 	return out

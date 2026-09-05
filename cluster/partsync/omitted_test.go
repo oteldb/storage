@@ -43,9 +43,9 @@ func mirrorOmitParts(t *testing.T, owner, replica backend.Backend) (*bucketindex
 // stale-snapshot restore or a partial rm leaves behind on a writer that goes on committing.
 func omitIndex(ix *bucketindex.Index, seq int, g bucketindex.Generation) *bucketindex.Index {
 	out := &bucketindex.Index{Generation: g, Removed: ix.Removed}
-	for _, e := range ix.Entries {
-		if e.Prefix != omitPart(seq) {
-			out.Add(e)
+	for i := range ix.Entries {
+		if ix.Entries[i].Prefix != omitPart(seq) {
+			out.Add(ix.Entries[i])
 		}
 	}
 

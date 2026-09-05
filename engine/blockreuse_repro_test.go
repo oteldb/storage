@@ -8,13 +8,11 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
-	"github.com/oteldb/storage/internal/reproduce"
 )
 
 func TestReproBlockNumbersReusedAfterRetentionEmptiesShard(t *testing.T) {
 	t.Parallel()
 
-	reproduce.Unfixed(t, 542, "NextBlock is max over live entries, so a shard that empties rewinds the counter")
 	ctx := context.Background()
 	be := backend.Memory()
 	e := newLostEngine(be)

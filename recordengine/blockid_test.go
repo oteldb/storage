@@ -17,8 +17,8 @@ import (
 // blocksByPrefix maps each entry's prefix to the block interval and level it carries.
 func blocksByPrefix(ix *bucketindex.Index) map[string]bucketindex.Entry {
 	out := make(map[string]bucketindex.Entry, len(ix.Entries))
-	for _, e := range ix.Entries {
-		out[e.Prefix] = e
+	for i := range ix.Entries {
+		out[ix.Entries[i].Prefix] = ix.Entries[i]
 	}
 
 	return out
@@ -55,6 +55,10 @@ func stripBlocks(ctx context.Context, t *testing.T, be backend.Backend, ids ...s
 			}
 		}
 	}
+
+	// An index that predates block identity predates the allocation high-water mark too, so the
+	// simulation has to drop it as well or the migrated part numbers above a mark v5 never wrote.
+	ix.AllocatedBlocks = 0
 
 	_, err = ix.Save(ctx, be, indexKey(), version)
 	require.NoError(t, err)
@@ -105,11 +109,18 @@ func TestMergeUnionsItsInputs(t *testing.T) {
 	}
 }
 
-// TestWantDischargedByAMergedSuccessor is the acceptance test for block allocation: no entry in it
-// is built by hand. Three parts are flushed and take real intervals, one is lost so the index owes
-// a repair for it, and the surviving two are merged into a part whose interval contains the lost
-// one's. That containment — and nothing else — is what ends the obligation.
-func TestWantDischargedByAMergedSuccessor(t *testing.T) {
+// TestMergedNeighboursDoNotDischargeAWant is the acceptance test for block allocation: no entry in
+// it is built by hand. Three parts are flushed and take real intervals, the middle one is lost so
+// the index owes a repair for it, and the surviving two are merged.
+//
+// The merge holds not one row of the lost part, so it must not end the obligation. Its identity is
+// the union of what it consumed — {1} and {3} — and that set does not contain {2}. This is the case
+// a hull got wrong: [1,3] contained the lost block, the want was discharged by a part built from
+// neither, and the loss became invisible with no hole and no counter moving.
+//
+// The obligation ends only two ways from here, and both are visible: a repair brings the part back,
+// or a hole is committed for it.
+func TestMergedNeighboursDoNotDischargeAWant(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -132,17 +143,19 @@ func TestWantDischargedByAMergedSuccessor(t *testing.T) {
 	require.NoError(t, r.MergeWith(ctx, recordengine.MergeOptions{Force: true}))
 
 	ix = loadIndex(t, be)
-	require.Empty(t, ix.Wanted, "a successor containing the lost blocks discharges the want")
 	require.Len(t, ix.Entries, 1)
 
-	succ := ix.Entries[0]
-	assert.True(t, succ.Data(), "the want is repaired, not acknowledged as a hole")
-	assert.True(t, succ.Supersedes(lost.Entry()))
+	merged := ix.Entries[0]
+	assert.Equal(t, []string{enginePrefix + "/" + ids[1]}, wantPrefixes(ix.Wanted),
+		"the merged part %+v holds none of the lost rows, so the want must stand", merged)
+	assert.False(t, merged.Supersedes(lost.Entry()),
+		"and it claims none of the lost part's blocks")
+	assert.Empty(t, ix.Holes(), "the loss is not acknowledged either: the want is still repairable")
 	assert.Zero(t, ix.LostParts)
 	assert.Zero(t, r.RepairStats().Unsatisfiable, "the want never had to reach a peer")
 
 	_, ok := ix.Satisfying(lost)
-	assert.True(t, ok, "and the successor is what Satisfying picks for it")
+	assert.False(t, ok, "and nothing in the index answers for it")
 }
 
 // TestBlocksSurviveRestart pins that identity is durable: it is read back from the committed index

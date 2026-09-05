@@ -220,6 +220,10 @@ type Engine struct {
 	// lostParts is the index's monotone data-loss counter, carried across commits and raised to a
 	// rival's on rebase, so it is a cluster-visible fact and not a level a restart clears.
 	lostParts uint64
+	// allocated is the block-number high-water mark this engine last committed, carried across
+	// commits and raised to a rival's on rebase for the same reason: identity must stay unique over
+	// the shard's whole life, and the live set it could otherwise be derived from shrinks.
+	allocated uint64
 	// pendingHoles are the losses the next commit must acknowledge. Like pendingWants they are
 	// held rather than applied on the spot, so a commit that never lands leaves the want
 	// outstanding instead of half-discharged.

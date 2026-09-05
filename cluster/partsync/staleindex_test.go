@@ -31,7 +31,8 @@ func requireIndexResolves(t *testing.T, local backend.Backend, prefix string) *b
 	ix, err := bucketindex.Decode(raw)
 	require.NoError(t, err)
 
-	for _, e := range ix.Entries {
+	for i := range ix.Entries {
+		e := &ix.Entries[i]
 		for _, suffix := range []string{"/c/0", "/marks", "/manifest"} {
 			_, err := backend.ReadView(ctx, local, e.Prefix+suffix)
 			require.NoErrorf(t, err, "index entry %q resolves to %q", e.Prefix, e.Prefix+suffix)
@@ -44,8 +45,8 @@ func requireIndexResolves(t *testing.T, local backend.Backend, prefix string) *b
 // partPrefixes is the parts an index names, for readable assertions.
 func partPrefixes(ix *bucketindex.Index) []string {
 	out := make([]string, 0, len(ix.Entries))
-	for _, e := range ix.Entries {
-		out = append(out, e.Prefix)
+	for i := range ix.Entries {
+		out = append(out, ix.Entries[i].Prefix)
 	}
 
 	return out

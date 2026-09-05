@@ -12,7 +12,6 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
@@ -119,7 +118,8 @@ func splitMerge(ctx context.Context, t *testing.T, be backend.Backend, before []
 
 	fragments := 0
 
-	for _, ent := range ix.Entries {
+	for i := range ix.Entries {
+		ent := &ix.Entries[i]
 		if !slices.ContainsFunc(before, func(in bucketindex.Entry) bool { return in.Prefix == ent.Prefix }) {
 			fragments++
 		}
@@ -138,7 +138,6 @@ func splitMerge(ctx context.Context, t *testing.T, be backend.Backend, before []
 // peer's want for that input is answered with it.
 func TestSplitMergeAllocatesAboveItsInputs(t *testing.T) {
 	t.Parallel()
-	reproduce.Unfixed(t, 548, "split fragments reuse the block numbers of the inputs the same commit retires")
 
 	ctx := context.Background()
 	be := backend.Memory()
@@ -161,7 +160,6 @@ func TestSplitMergeAllocatesAboveItsInputs(t *testing.T) {
 // many merges follow and even when every row of it is inside one.
 func TestSplitMergeSeversLineage(t *testing.T) {
 	t.Parallel()
-	reproduce.Unfixed(t, 548, "a split merge's fragments and every part merged from them claim fresh blocks, so no successor ever contains a pre-split part's interval")
 
 	ctx := context.Background()
 	be := backend.Memory()
@@ -174,8 +172,12 @@ func TestSplitMergeSeversLineage(t *testing.T) {
 		require.False(t, f.Supersedes(lost), "a fragment holds a fraction of the input and must not claim it: %+v", f)
 	}
 
-	_, ok := ix.Satisfying(want)
-	require.False(t, ok, "no fragment satisfies the want, as documented")
+	// No *single* fragment answers the want, but the group does: every one of its members is here,
+	// so the rows are too. That is what TestSplitLineageWantBecomesHole needs a peer to say, and it
+	// is the opposite of what this line asserted while the split severed the lineage outright.
+	got, ok := ix.Satisfying(want)
+	require.True(t, ok, "the whole group is present, so the want is answerable")
+	require.False(t, got.Supersedes(lost), "and it is answered by a member, not by a part containing it")
 
 	// "corrected by the next merge": rejoin the fragments, and keep merging until the part set is a
 	// fixed point, then fold in one more part.
@@ -210,7 +212,6 @@ func TestSplitMergeSeversLineage(t *testing.T) {
 // is acknowledged as a hole — for data that is entirely on the peer's disk.
 func TestSplitLineageWantBecomesHole(t *testing.T) {
 	t.Parallel()
-	reproduce.Unfixed(t, 548, "repair commits a hole for a part whose rows are all inside a peer's split merge output")
 
 	ctx := context.Background()
 	be, peer := backend.Memory(), backend.Memory()
@@ -259,7 +260,6 @@ func TestSplitLineageWantBecomesHole(t *testing.T) {
 // hole, no want, and a read short by the whole part.
 func TestMergeAroundALostPartKeepsItsWant(t *testing.T) {
 	t.Parallel()
-	reproduce.Unfixed(t, 548, "the hull of a lost part's neighbors discharges the want for it while its rows are absent")
 
 	ctx := context.Background()
 	be := backend.Memory()
