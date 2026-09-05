@@ -91,14 +91,19 @@ func (s *Storage) shardLabels(ctx context.Context, r cluster.LabelsRequest) ([]s
 	shardKey := signal.TenantID(r.Tenant)
 
 	local, remotes := s.shardPlacement(ctx, rpcOpLabels, r.Signal, shardKey)
+
+	var selfDisclaim error
+
 	if local {
 		vs, err := s.localLabels(ctx, r)
 		if !disclaimedLocally(err) {
 			return vs, err
 		}
+
+		selfDisclaim = err
 	}
 
-	return hedgeOwners(ctx, s, rpcOpLabels, remotes, func(ctx context.Context, addr string) ([]string, error) {
+	return hedgeOwners(ctx, s, rpcOpLabels, remotes, selfDisclaim, func(ctx context.Context, addr string) ([]string, error) {
 		return cluster.FetchLabels(ctx, s.cluster.httpc, addr, r, s.clusterOpts...)
 	})
 }

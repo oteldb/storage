@@ -91,38 +91,70 @@ func disclaimedLocally(err error) bool {
 // to the next owner, and returns the zero value only when every owner disclaims the shard (it has no
 // data anywhere) or there are no owners to ask. An owner disclaiming because it holds the shard and
 // is missing data denies the empty answer and the call fails ([cluster.Disclaims]).
+//
+// selfDisclaim is this node's own refusal to serve the shard locally ([disclaimedLocally]), nil when
+// the local read was not attempted. It is one more disclaiming owner in the tally: this node holds
+// the shard, so neither an empty remote list nor every remote answering absent may read as "nothing
+// holds this shard" — with no remote to ask the read fails here on that disclaim.
 func hedgeOwners[T any](
-	ctx context.Context, s *Storage, op string, remotes []string, call func(context.Context, string) (T, error),
+	ctx context.Context, s *Storage, op string, remotes []string, selfDisclaim error,
+	call func(context.Context, string) (T, error),
 ) (T, error) {
-	var zero T
+	var (
+		zero      T
+		disclaims cluster.Disclaims
+	)
 
-	if len(remotes) == 0 {
+	owners := len(remotes)
+	if selfDisclaim != nil {
+		disclaims.Note(selfDisclaim)
+
+		owners++
+	}
+
+	if owners == 0 {
 		return zero, nil
 	}
 
-	var disclaims cluster.Disclaims
+	v, err := zero, selfDisclaim
 
-	thunks := make([]func(context.Context) (T, error), len(remotes))
-	for i := range remotes {
-		addr := remotes[i]
-		thunks[i] = func(ctx context.Context) (T, error) {
-			v, err := call(ctx, addr)
-			disclaims.Note(err)
+	if len(remotes) > 0 {
+		thunks := make([]func(context.Context) (T, error), len(remotes))
+		for i := range remotes {
+			addr := remotes[i]
+			thunks[i] = func(ctx context.Context) (T, error) {
+				v, err := call(ctx, addr)
+				disclaims.Note(err)
 
-			return v, err
+				return v, err
+			}
 		}
+
+		v, err = retry.Hedge(ctx, s.readPolicy(ctx, op), thunks)
 	}
 
-	v, err := retry.Hedge(ctx, s.readPolicy(ctx, op), thunks)
-	if err != nil && disclaims.Empty(len(remotes)) {
+	if err != nil && disclaims.Empty(owners) {
 		s.obs.RPC.ShardAbsent(ctx, op)
 
 		return zero, nil
 	}
 
-	if err != nil && disclaims.Failed(len(remotes)) {
+	if err != nil && disclaims.Failed(owners) {
 		s.obs.RPC.ReadIncomplete(ctx, op)
+
+		return zero, failedReadError(err)
 	}
 
 	return v, err
+}
+
+// failedReadError is the error a fan-out [cluster.Disclaims] judged Failed ends on. The tally failed
+// the read because an owner holds the shard and is short, and the caller branches on that sentinel;
+// the last answer to arrive may have been another owner's absence, which must not mask it.
+func failedReadError(err error) error {
+	if errors.Is(err, cluster.ErrShardIncomplete) {
+		return err
+	}
+
+	return errors.Wrapf(cluster.ErrShardIncomplete, "%v", err)
 }
