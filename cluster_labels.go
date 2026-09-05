@@ -25,8 +25,8 @@ func (s *Storage) localLabels(ctx context.Context, r cluster.LabelsRequest) ([]s
 	tid := s.normalizeTenant(signal.TenantID(r.Tenant))
 
 	eng, ok := s.lookupEngine(tid)
-	if !ok || !s.canAnswer(ctx, rpcOpLabels, signal.Metric, tid, r.Start, r.End) {
-		return nil, cluster.ErrShardAbsent
+	if err := s.canAnswer(ctx, rpcOpLabels, signal.Metric, tid, ok, r.Start, r.End); err != nil {
+		return nil, err
 	}
 
 	req := metricSeriesRequest(tid, r.Matchers(), r.Start, r.End)

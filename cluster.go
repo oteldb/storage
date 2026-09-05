@@ -467,8 +467,8 @@ func (s *Storage) localFetch(ctx context.Context, tenant string, start, end int6
 	tid := s.normalizeTenant(signal.TenantID(tenant))
 
 	eng, ok := s.lookupEngine(tid)
-	if !ok || !s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, start, end) {
-		return nil, cluster.ErrShardAbsent
+	if err := s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, ok, start, end); err != nil {
+		return nil, err
 	}
 
 	// Recycle: the read handler serializes the batches and discards them, so it releases them right
@@ -581,8 +581,8 @@ func (s *Storage) localAggregate(
 	tid := s.normalizeTenant(signal.TenantID(tenant))
 
 	eng, ok := s.lookupEngine(tid)
-	if !ok || !s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, start, end) {
-		return nil, cluster.ErrShardAbsent
+	if err := s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, ok, start, end); err != nil {
+		return nil, err
 	}
 
 	return eng.AggregateStepNamed(ctx, fetch.Request{
@@ -598,8 +598,8 @@ func (s *Storage) localAggregateWindow(
 	tid := s.normalizeTenant(signal.TenantID(tenant))
 
 	eng, ok := s.lookupEngine(tid)
-	if !ok || !s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, start, end) {
-		return nil, cluster.ErrShardAbsent
+	if err := s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, ok, start, end); err != nil {
+		return nil, err
 	}
 
 	return eng.AggregateWindowNamed(ctx, fetch.Request{
@@ -797,17 +797,25 @@ func shardAggregateWith[T any](
 	remote func(addr string) ([]T, error),
 ) ([]T, error) {
 	isLocal, remotes := s.shardPlacement(ctx, rpcOpRead, signal.Metric, shardKey)
+
+	var (
+		lastErr   error
+		disclaims cluster.Disclaims
+		owners    = len(remotes)
+	)
+
 	if isLocal {
+		// The local disclaim counts as an owner's: this node holds the shard, so a fan-out where
+		// every remote also disclaims must not read as "nothing holds this shard".
 		got, err := local()
 		if !disclaimedLocally(err) {
 			return got, err
 		}
-	}
 
-	var (
-		lastErr error
-		absent  int
-	)
+		disclaims.Note(err)
+
+		lastErr, owners = err, owners+1
+	}
 
 	for _, addr := range remotes {
 		got, err := remote(addr)
@@ -815,15 +823,17 @@ func shardAggregateWith[T any](
 			return got, nil
 		}
 
-		if errors.Is(err, cluster.ErrShardAbsent) {
-			absent++ // an owner that holds nothing is no answer at all, not an empty one
-		}
+		disclaims.Note(err)
 
 		lastErr = err
 	}
 
-	if absent == len(remotes) { // every owner disclaims the shard: it has no data anywhere
+	if disclaims.Empty(owners) { // every owner disclaims the shard: it has no data anywhere
 		return nil, nil
+	}
+
+	if disclaims.Failed(owners) {
+		s.obs.RPC.ReadIncomplete(ctx, rpcOpRead)
 	}
 
 	return nil, lastErr // nil when there were no reachable owners (treated as no data)
@@ -924,8 +934,8 @@ func (s *Storage) localRecordFetch(ctx context.Context, r fetch.Request) ([]*fet
 	ctx = withReadBudget(ctx, s.maxQueryBytes)
 
 	eng, ok := s.lookupRecordEngine(sig, tid)
-	if !ok || !s.canAnswer(ctx, rpcOpRead, sig, tid, r.Start, r.End) {
-		return nil, cluster.ErrShardAbsent
+	if err := s.canAnswer(ctx, rpcOpRead, sig, tid, ok, r.Start, r.End); err != nil {
+		return nil, err
 	}
 
 	it, err := eng.Fetch(ctx, r)
@@ -996,16 +1006,16 @@ func (s *Storage) localSeries(
 
 	if sig == signal.Metric {
 		eng, ok := s.lookupEngine(tid)
-		if !ok || !s.canAnswer(ctx, rpcOpSeries, sig, tid, start, end) {
-			return nil, cluster.ErrShardAbsent
+		if err := s.canAnswer(ctx, rpcOpSeries, sig, tid, ok, start, end); err != nil {
+			return nil, err
 		}
 
 		return eng.Series(ctx, metricSeriesRequest(tid, matchers, start, end))
 	}
 
 	eng, ok := s.lookupRecordEngine(sig, tid)
-	if !ok || !s.canAnswer(ctx, rpcOpSeries, sig, tid, start, end) {
-		return nil, cluster.ErrShardAbsent
+	if err := s.canAnswer(ctx, rpcOpSeries, sig, tid, ok, start, end); err != nil {
+		return nil, err
 	}
 
 	return eng.Series(matchers, start, end), nil
@@ -1035,8 +1045,8 @@ func (s *Storage) localKeys(
 	tid := s.normalizeTenant(signal.TenantID(tenant))
 
 	eng, ok := s.lookupRecordEngine(sig, tid)
-	if !ok || !s.canAnswer(ctx, rpcOpSeries, sig, tid, start, end) {
-		return nil, cluster.ErrShardAbsent
+	if err := s.canAnswer(ctx, rpcOpSeries, sig, tid, ok, start, end); err != nil {
+		return nil, err
 	}
 
 	raw := eng.Keys(start, end)
@@ -1055,8 +1065,8 @@ func (s *Storage) localValues(ctx context.Context, r cluster.ValuesRequest) ([][
 	tid := s.normalizeTenant(signal.TenantID(r.Tenant))
 
 	eng, ok := s.lookupRecordEngine(r.Signal, tid)
-	if !ok || !s.canAnswer(ctx, rpcOpValues, r.Signal, tid, r.Start, r.End) {
-		return nil, cluster.ErrShardAbsent
+	if err := s.canAnswer(ctx, rpcOpValues, r.Signal, tid, ok, r.Start, r.End); err != nil {
+		return nil, err
 	}
 
 	return eng.ColumnValues(ctx, recordengine.ValuesRequest{
@@ -1075,8 +1085,8 @@ func (s *Storage) localProfileSymbols(ctx context.Context, tenant string) (map[s
 	tid := s.normalizeTenant(signal.TenantID(tenant))
 
 	eng, ok := s.lookupProfileEngine(tid)
-	if !ok || !s.canAnswer(ctx, rpcOpSide, signal.Profile, tid, 0, 0) {
-		return nil, cluster.ErrShardAbsent
+	if err := s.canAnswer(ctx, rpcOpSide, signal.Profile, tid, ok, 0, 0); err != nil {
+		return nil, err
 	}
 
 	return eng.SideSnapshot(ctx)

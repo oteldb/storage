@@ -141,7 +141,11 @@ jittered backoff; **idempotent reads hedge** across replicas, **writes stay at-m
 `reliability.RetryConfig` is the public knob (`Default`, `LossyEnvironment`). A shard read is
 routed to a **holder**, not to a ring owner: an owner that has no data for the shard answers
 `cluster.ErrShardAbsent`, which fails over to an owner that does, so a ring/data disagreement never
-degrades into a silently partial result.
+degrades into a silently partial result. An owner that *holds* the shard and knows it is missing data
+for the window — a head lost at restart, or a part its index names but it cannot read — answers
+`cluster.ErrShardIncomplete`, which fails over the same way but never collapses to an empty success:
+when every owner disclaims, "no owner holds it" reads as empty and "an owner holds it and is short"
+fails the read (`cluster.Disclaims`).
 
 ---
 

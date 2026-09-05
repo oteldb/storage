@@ -132,3 +132,27 @@ func compareWantPrefix(a, b Want) int {
 		return 0
 	}
 }
+
+// Overlaps reports whether the want's lost part covers any of [start, end] — the read-side question,
+// since a query outside a want's range is answerable in full despite it.
+//
+// A want whose time range is entirely unset names a part of unknown extent, so it covers everything:
+// a want is a claim of ignorance and errs wide.
+func (w Want) Overlaps(start, end int64) bool {
+	if w.MinTime == 0 && w.MaxTime == 0 {
+		return true
+	}
+
+	return w.MinTime <= end && start <= w.MaxTime
+}
+
+// WantsOverlap reports whether any of wants covers [start, end].
+func WantsOverlap(wants []Want, start, end int64) bool {
+	for _, w := range wants {
+		if w.Overlaps(start, end) {
+			return true
+		}
+	}
+
+	return false
+}

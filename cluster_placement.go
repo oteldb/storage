@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"sync/atomic"
 
 	"github.com/go-faster/errors"
 	"go.uber.org/zap"
@@ -90,7 +89,8 @@ func disclaimedLocally(err error) bool {
 // hedgeOwners races an RPC across a shard's remote owners under the hedged read policy, treating an
 // owner's [cluster.ErrShardAbsent] as no answer rather than as an empty result: the call fails over
 // to the next owner, and returns the zero value only when every owner disclaims the shard (it has no
-// data anywhere) or there are no owners to ask.
+// data anywhere) or there are no owners to ask. An owner disclaiming because it holds the shard and
+// is missing data denies the empty answer and the call fails ([cluster.Disclaims]).
 func hedgeOwners[T any](
 	ctx context.Context, s *Storage, op string, remotes []string, call func(context.Context, string) (T, error),
 ) (T, error) {
@@ -100,26 +100,28 @@ func hedgeOwners[T any](
 		return zero, nil
 	}
 
-	var absent atomic.Int64
+	var disclaims cluster.Disclaims
 
 	thunks := make([]func(context.Context) (T, error), len(remotes))
 	for i := range remotes {
 		addr := remotes[i]
 		thunks[i] = func(ctx context.Context) (T, error) {
 			v, err := call(ctx, addr)
-			if errors.Is(err, cluster.ErrShardAbsent) {
-				absent.Add(1)
-			}
+			disclaims.Note(err)
 
 			return v, err
 		}
 	}
 
 	v, err := retry.Hedge(ctx, s.readPolicy(ctx, op), thunks)
-	if err != nil && int(absent.Load()) == len(remotes) {
+	if err != nil && disclaims.Empty(len(remotes)) {
 		s.obs.RPC.ShardAbsent(ctx, op)
 
 		return zero, nil
+	}
+
+	if err != nil && disclaims.Failed(len(remotes)) {
+		s.obs.RPC.ReadIncomplete(ctx, op)
 	}
 
 	return v, err
