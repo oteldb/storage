@@ -1267,25 +1267,38 @@ func (s *Storage) pokeFlush(eng headSized) {
 	}
 }
 
-// flushPressured flushes every engine whose head has reached [Options.FlushThresholdBytes], and
-// nothing else. Engines are independent shards, so the flushes fan out under the same bound as the
-// maintenance cycle. A replica (non-owning node) is skipped: its head is trimmed by the refresh
-// path, and flushing there would fork the shard's part sequence.
+// flushPressured flushes every engine whose head has reached [Options.FlushThresholdBytes] and
+// whose shard this node holds the compaction claim on, and nothing else. Engines are independent
+// shards, so the flushes fan out under the same bound as the maintenance cycle.
+//
+// Memory relief never overrides ownership: a replica's head is trimmed by the refresh path, and a
+// fenced node holds its head until it can prove the shard is its own again ([Storage.claimsShard]).
+// Flushing either forks the shard's part sequence.
 func (s *Storage) flushPressured(ctx context.Context) {
 	ctx = s.obs.Base(ctx)
 	threshold := s.opts.flushThresholdBytes()
 
 	var flushes []func()
 
-	for _, eng := range s.engineSnapshot() {
-		if eng.HeadBytes() >= threshold {
-			flushes = append(flushes, func() { _ = eng.Flush(ctx) })
+	collect := func(tid signal.TenantID, head int64, flush func(context.Context) error) {
+		if head < threshold || !s.claimsShard(tid) {
+			return
 		}
+
+		flushes = append(flushes, func() { _ = flush(ctx) })
 	}
 
-	for _, eng := range s.recordEngineSnapshot() {
-		if eng.HeadBytes() >= threshold {
-			flushes = append(flushes, func() { _ = eng.Flush(ctx) })
+	for tid, eng := range s.engineSnapshotByTenant() {
+		collect(tid, eng.HeadBytes(), eng.Flush)
+	}
+
+	for _, engines := range []map[signal.TenantID]*recordengine.Engine{
+		s.logEngineSnapshotByTenant(),
+		s.traceEngineSnapshotByTenant(),
+		s.profileEngineSnapshotByTenant(),
+	} {
+		for tid, eng := range engines {
+			collect(tid, eng.HeadBytes(), eng.Flush)
 		}
 	}
 
@@ -1295,19 +1308,6 @@ func (s *Storage) flushPressured(ctx context.Context) {
 
 	s.maintStats.pressureFlushes.Add(int64(len(flushes)))
 	parallel.ForEach(len(flushes), s.maintenanceConcurrency(), func(i int) { flushes[i]() })
-}
-
-// recordEngineSnapshot is every record engine (logs, traces, profiles) across tenants.
-func (s *Storage) recordEngineSnapshot() []*recordengine.Engine {
-	logs := s.logEngineSnapshot()
-	traces := s.traceEngineSnapshot()
-	profiles := s.profileEngineSnapshot()
-
-	out := make([]*recordengine.Engine, 0, len(logs)+len(traces)+len(profiles))
-	out = append(out, logs...)
-	out = append(out, traces...)
-
-	return append(out, profiles...)
 }
 
 // runWALSync periodically fsyncs every engine's WAL until Close stops it ([WALSyncInterval] mode).

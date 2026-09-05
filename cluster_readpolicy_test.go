@@ -28,7 +28,7 @@ type readPolicyCluster struct {
 	shard    signal.TenantID
 }
 
-func newReadPolicyCluster(t *testing.T, endpoint string) *readPolicyCluster {
+func newReadPolicyCluster(t *testing.T, endpoint string, opts ...Option) *readPolicyCluster {
 	t.Helper()
 
 	c := &readPolicyCluster{
@@ -39,7 +39,7 @@ func newReadPolicyCluster(t *testing.T, endpoint string) *readPolicyCluster {
 	for _, id := range []string{"node-a", "node-b", "node-c"} {
 		be := backend.Memory()
 		c.backends[id] = be
-		c.nodes[id] = openClusterNodeWith(t, endpoint, id, be)
+		c.nodes[id] = openClusterNodeWith(t, endpoint, id, be, opts...)
 	}
 
 	awaitMembership(t, c.nodes)

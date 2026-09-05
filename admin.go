@@ -11,7 +11,7 @@ import (
 )
 
 // ErrNotOwner is returned by an [Admin] flush/compact when this node is not the cluster
-// compaction-owner (ring primary) of the tenant/shard, so it must not write that shard's parts.
+// compaction-owner of the tenant/shard, so it must not write that shard's parts.
 var ErrNotOwner = errors.New("storage: this node is not the compaction owner of the tenant/shard")
 
 // Admin is the imperative operator-control surface, complementing the background maintenance loop:
@@ -20,8 +20,8 @@ var ErrNotOwner = errors.New("storage: this node is not the compaction owner of 
 //
 // The key argument is the engine key — the tenant id in the default layout, or a metric shard key
 // ({tenant}/_s{idx}) when [Options.Cluster] sets ShardsPerTenant > 1. In cluster mode flush/compact
-// act only on shards this node is the ring-primary of (else [ErrNotOwner]), so a shard's parts are
-// still written by exactly one node — the same invariant the maintenance loop preserves.
+// act only on shards this node holds the compaction claim on (else [ErrNotOwner]), so a shard's
+// parts are still written by exactly one node — the same invariant the maintenance loop preserves.
 type Admin struct{ s *Storage }
 
 // Admin returns the operator-control surface for on-demand maintenance.
@@ -29,13 +29,13 @@ func (s *Storage) Admin() Admin { return Admin{s} }
 
 // Flush drains a tenant/shard's in-memory head for one signal to an immutable part now. It is a
 // no-op (nil) when nothing has been ingested for that key+signal. In cluster mode it returns
-// [ErrNotOwner] unless this node is the shard's ring-primary.
+// [ErrNotOwner] unless this node holds the shard's compaction claim.
 func (a Admin) Flush(ctx context.Context, key signal.TenantID, sig signal.Signal) error {
 	if a.s.closed.Load() {
 		return errors.Wrap(ErrClosed, "admin flush")
 	}
 
-	if err := a.s.adminOwns(key); err != nil {
+	if err := a.s.adminOwns(ctx, key); err != nil {
 		return err
 	}
 
@@ -50,13 +50,13 @@ func (a Admin) Flush(ctx context.Context, key signal.TenantID, sig signal.Signal
 // Compact merges a tenant/shard's parts for one signal now, applying the tenant's policy
 // (retention cutoff, plus downsampling/recompression/precision for metrics) — the same merge the
 // background loop runs, so there is no parallel code path. No-op when nothing is ingested; returns
-// [ErrNotOwner] in cluster mode unless this node is the shard's ring-primary.
+// [ErrNotOwner] in cluster mode unless this node holds the shard's compaction claim.
 func (a Admin) Compact(ctx context.Context, key signal.TenantID, sig signal.Signal) error {
 	if a.s.closed.Load() {
 		return errors.Wrap(ErrClosed, "admin compact")
 	}
 
-	if err := a.s.adminOwns(key); err != nil {
+	if err := a.s.adminOwns(ctx, key); err != nil {
 		return err
 	}
 
@@ -77,13 +77,13 @@ func (a Admin) Compact(ctx context.Context, key signal.TenantID, sig signal.Sign
 // threshold, the cumulative-bytes cap and the merge memory bound still apply, so a forced compaction
 // reads, writes and holds no more than a background one. One call compacts one group; call it again
 // to make further progress. No-op when nothing is ingested for the key+signal; [ErrNotOwner] in
-// cluster mode unless this node is the shard's ring-primary.
+// cluster mode unless this node holds the shard's compaction claim.
 func (a Admin) CompactNow(ctx context.Context, key signal.TenantID, sig signal.Signal) error {
 	if a.s.closed.Load() {
 		return errors.Wrap(ErrClosed, "admin compact now")
 	}
 
-	if err := a.s.adminOwns(key); err != nil {
+	if err := a.s.adminOwns(ctx, key); err != nil {
 		return err
 	}
 
@@ -136,7 +136,7 @@ func (a Admin) PruneIdentities(ctx context.Context, key signal.TenantID) (int, e
 		return 0, errors.Wrap(ErrClosed, "admin prune identities")
 	}
 
-	if err := a.s.adminOwns(key); err != nil {
+	if err := a.s.adminOwns(ctx, key); err != nil {
 		return 0, err
 	}
 
@@ -248,21 +248,30 @@ func (a Admin) compactFn(ctx context.Context, sig signal.Signal, key signal.Tena
 	return func(ctx context.Context) error { return eng.Merge(ctx, cutoff) }, true
 }
 
-// adminOwns gates a flush/compact in cluster mode: it succeeds only when this node is the ring
-// primary of the key's shard (so exactly one node writes its parts). Single-node always owns.
-func (s *Storage) adminOwns(key signal.TenantID) error {
-	if s.cluster == nil {
+// adminOwns gates a flush/compact in cluster mode: it succeeds only when this node holds the key's
+// compaction claim (so exactly one node writes its parts). Single-node always owns.
+//
+// The claim, not ring primacy ([Storage.claimsShard]): an operator flush is the same write as the
+// background one, so it answers to the same authority — a displaced node's frozen ring, or a node
+// past its lease fence, must not be able to write a shard's parts on request either.
+func (s *Storage) adminOwns(ctx context.Context, key signal.TenantID) error {
+	if s.claimsShard(key) {
 		return nil
 	}
 
-	norm := string(s.normalizeTenant(key))
+	if s.cluster != nil {
+		// Claims are established by the maintenance loop's reconcile, which a node opened moments
+		// ago has not run yet — refusing there would make an operator wait out a flush interval for
+		// a shard that is plainly its own. Reconcile over the full engine set, exactly as
+		// [Admin.Rebalance] does: a subset pass would release every claim it left out.
+		_, _ = s.cluster.ownership.Reconcile(ctx, s.cluster.membership.Ring(), s.allEngineKeys())
 
-	primary, ok := s.cluster.membership.Ring().Primary([]byte(norm))
-	if ok && s.cluster.membership.AddrOf(primary.ID) == s.cluster.self {
-		return nil
+		if s.claimsShard(key) {
+			return nil
+		}
 	}
 
-	return errors.Wrapf(ErrNotOwner, "tenant/shard %q", norm)
+	return errors.Wrapf(ErrNotOwner, "tenant/shard %q", string(s.normalizeTenant(key)))
 }
 
 // allEngineKeys returns the union of every engine's key across all signals (normalized), for an
