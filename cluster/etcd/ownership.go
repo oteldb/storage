@@ -128,30 +128,26 @@ func (o *Ownership) Claims(ctx context.Context) ([]string, error) {
 // old snapshot:
 // reacquiring the shard puts its writes above everything its replicas hold, and a node that lost
 // the shard keeps the lower term of a tenure that has ended.
+//
+// Identity is the pair (id, lease), not the id alone. A crashed node's lease outlives its process
+// by up to the TTL, so a node restarting under the same ring id finds a claim carrying its own id
+// but bound to the dead incarnation's lease. Adopting that key would hand this node a claim etcd
+// deletes at the old lease's expiry — leaving the shard unclaimed and undiscoverable while this
+// node went on flushing it. Such a claim is dropped and recreated under the live lease instead,
+// which is also what makes the restart a new tenure with a term above the dead one's.
 func (o *Ownership) Acquire(ctx context.Context, shard string) (term uint64, ok bool, err error) {
-	key := o.prefix + shard
-
-	resp, err := o.client.Txn(ctx).
-		If(clientv3.Compare(clientv3.CreateRevision(key), "=", 0)).
-		Then(clientv3.OpPut(key, o.id, clientv3.WithLease(clientv3.LeaseID(o.leaseID.Load())))).
-		Else(clientv3.OpGet(key)).
-		Commit()
-	if err != nil {
-		return 0, false, errors.Wrapf(err, "acquire %q", shard)
+	term, ok, stale, err := o.tryAcquire(ctx, shard)
+	if err != nil || ok || !stale {
+		return term, ok, err
 	}
 
-	if resp.Succeeded {
-		// We created the claim, so the transaction's revision is the one it was created at.
-		return uint64(resp.Header.GetRevision()), true, nil
+	if err := o.dropStale(ctx, shard); err != nil {
+		return 0, false, err
 	}
 
-	// The key already exists: the claim is ours only if we wrote it.
-	kvs := resp.Responses[0].GetResponseRange().GetKvs()
-	if len(kvs) != 1 || string(kvs[0].GetValue()) != o.id {
-		return 0, false, nil
-	}
+	term, ok, _, err = o.tryAcquire(ctx, shard)
 
-	return uint64(kvs[0].GetCreateRevision()), true, nil
+	return term, ok, err
 }
 
 // Term returns the term of this node's claim on shard — the etcd revision it was created at —
@@ -300,6 +296,61 @@ func (o *Ownership) LastPlan() []rebalance.Reassignment {
 	copy(out, o.lastPlan)
 
 	return out
+}
+
+// tryAcquire is one create-if-absent CAS pass. stale reports that the existing claim carries this
+// node's id under a lease that is not the current one — a dead incarnation's key, which the caller
+// must rebind rather than adopt.
+func (o *Ownership) tryAcquire(ctx context.Context, shard string) (term uint64, ok, stale bool, err error) {
+	key := o.prefix + shard
+	lease := clientv3.LeaseID(o.leaseID.Load())
+
+	resp, err := o.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.CreateRevision(key), "=", 0)).
+		Then(clientv3.OpPut(key, o.id, clientv3.WithLease(lease))).
+		Else(clientv3.OpGet(key)).
+		Commit()
+	if err != nil {
+		return 0, false, false, errors.Wrapf(err, "acquire %q", shard)
+	}
+
+	if resp.Succeeded {
+		// We created the claim, so the transaction's revision is the one it was created at.
+		return uint64(resp.Header.GetRevision()), true, false, nil
+	}
+
+	// The key already exists: the claim is ours only if we wrote it under the lease we hold now.
+	kvs := resp.Responses[0].GetResponseRange().GetKvs()
+	if len(kvs) != 1 || string(kvs[0].GetValue()) != o.id {
+		return 0, false, false, nil
+	}
+
+	if clientv3.LeaseID(kvs[0].GetLease()) != lease {
+		return 0, false, true, nil
+	}
+
+	return uint64(kvs[0].GetCreateRevision()), true, false, nil
+}
+
+// dropStale deletes a claim carrying this node's id under any lease but the live one, so the next
+// pass can recreate it. The delete and the recreate cannot share a transaction (etcd rejects two
+// ops on one key), so a peer may win the gap — which is the correct outcome: until the claim is
+// rebound this node cannot prove the shard is its own.
+func (o *Ownership) dropStale(ctx context.Context, shard string) error {
+	key := o.prefix + shard
+
+	_, err := o.client.Txn(ctx).
+		If(
+			clientv3.Compare(clientv3.Value(key), "=", o.id),
+			clientv3.Compare(clientv3.LeaseValue(key), "!=", clientv3.LeaseID(o.leaseID.Load())),
+		).
+		Then(clientv3.OpDelete(key)).
+		Commit()
+	if err != nil {
+		return errors.Wrapf(err, "drop stale claim %q", shard)
+	}
+
+	return nil
 }
 
 // isFenced reports whether the claim-backing lease is currently unprovable.
