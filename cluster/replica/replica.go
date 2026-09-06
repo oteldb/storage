@@ -34,9 +34,9 @@ type Target struct {
 // transport runs for a remote write.
 type ApplyFunc func(ctx context.Context, payload []byte) error
 
-// sendTimeout bounds one send once it is detached from the caller's context, so a peer that
-// hangs does not hold a goroutine until [Replicator.Close].
-const sendTimeout = 10 * time.Second
+// DefaultSendTimeout bounds one send once it is detached from the caller's context, so a peer
+// that hangs does not hold a goroutine until [Replicator.Close]. Override with [WithSendTimeout].
+const DefaultSendTimeout = 10 * time.Second
 
 // Replicator fans writes out to replica targets and enforces write quorum.
 type Replicator struct {
@@ -44,17 +44,46 @@ type Replicator struct {
 	transport Transport
 	apply     ApplyFunc
 
+	sendTimeout time.Duration
+
 	lifetime context.Context //nolint:containedctx // the replicator's own lifetime, ended by Close; sends outlive their callers
 	stop     context.CancelFunc
 	inflight sync.WaitGroup
 }
 
+// Option configures a [Replicator].
+type Option func(*Replicator)
+
+// WithSendTimeout bounds how long one detached send may run. Since a send no longer ends with
+// the caller's context, this — not the write deadline — is what caps a quorum wait against a
+// slow peer, so it must exceed the slowest acceptable peer round-trip. Zero or negative ⇒
+// [DefaultSendTimeout].
+func WithSendTimeout(d time.Duration) Option {
+	return func(r *Replicator) {
+		if d > 0 {
+			r.sendTimeout = d
+		}
+	}
+}
+
 // New returns a replicator for the local node at self, using transport for remote sends and
 // apply for local (and, on the receiving side, remote) application.
-func New(self string, transport Transport, apply ApplyFunc) *Replicator {
+func New(self string, transport Transport, apply ApplyFunc, opts ...Option) *Replicator {
 	lifetime, stop := context.WithCancel(context.Background())
 
-	return &Replicator{self: self, transport: transport, apply: apply, lifetime: lifetime, stop: stop}
+	r := &Replicator{
+		self:        self,
+		transport:   transport,
+		apply:       apply,
+		sendTimeout: DefaultSendTimeout,
+		lifetime:    lifetime,
+		stop:        stop,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
 }
 
 // Close cancels every in-flight send and waits for them to return. Replicate must not be called
@@ -163,7 +192,7 @@ func (r *Replicator) fanOut(ctx context.Context, targets []Target, payload []byt
 }
 
 func (r *Replicator) sendContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.sendTimeout)
 	stop := context.AfterFunc(r.lifetime, cancel)
 
 	return sctx, func() {

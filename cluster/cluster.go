@@ -52,6 +52,11 @@ type Config struct {
 	// shared-store model: flushed parts are exchanged through the backend, never over the
 	// cluster transport.
 	PrivateBackend bool
+	// ReplicaSendTimeout bounds one replicated write's delivery to one peer. A send is detached
+	// from the writing request's context — a straggler must still land after the caller has
+	// answered its client — so this, not the write deadline, is what a quorum wait fails on when
+	// a peer is slow. Zero ⇒ the replica layer default (10s).
+	ReplicaSendTimeout time.Duration
 }
 
 // DefaultRF is the replication factor used when [Config.RF] is unset.

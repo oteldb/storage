@@ -247,3 +247,35 @@ func TestReplicateCallerCancelBoundsOnlyTheWait(t *testing.T) {
 	require.NoError(t, <-tr.sendErr, "the send itself is not cut by the caller's cancellation")
 	assert.True(t, tr.got("slow"))
 }
+
+func TestSendTimeoutBoundsTheDetachedSend(t *testing.T) {
+	t.Parallel()
+
+	tr := newGatedTransport("slow")
+	rp := replica.New("self", tr, (&localApplier{}).apply, replica.WithSendTimeout(time.Millisecond))
+	t.Cleanup(rp.Close)
+
+	// Never released: with the send detached from the caller, this timeout is the only thing that
+	// ends it — and, since it also bounds the quorum sends, what the quorum wait fails on.
+	start := time.Now()
+	err := rp.ReplicateQuorum(t.Context(), targets("slow"), []byte("w"), 1)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorIs(t, <-tr.sendErr, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), time.Second, "the configured timeout, not %v, bounds the wait", replica.DefaultSendTimeout)
+	assert.False(t, tr.got("slow"))
+}
+
+func TestSendTimeoutDefaultsWhenUnset(t *testing.T) {
+	t.Parallel()
+
+	for _, d := range []time.Duration{0, -time.Second} {
+		tr := newGatedTransport("slow")
+		rp := replica.New("self", tr, (&localApplier{}).apply, replica.WithSendTimeout(d))
+		t.Cleanup(rp.Close)
+
+		require.NoError(t, rp.ReplicateQuorum(t.Context(), targets("self", "slow"), []byte("w"), 1))
+
+		close(tr.release)
+		require.NoError(t, <-tr.sendErr, "a non-positive timeout leaves %v in force", replica.DefaultSendTimeout)
+	}
+}

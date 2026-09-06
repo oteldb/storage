@@ -132,13 +132,18 @@ copy, so it needs `RF/2` more). The replicator is **decoupled from the ring** �
 owners→addresses — so routing and quorum logic test against a fake transport.
 
 The caller's context bounds only the **wait**. Each send runs on a context that keeps the caller's
-values (trace, logger) but not its cancellation, ended by a 10 s send timeout or by the
-replicator's `Close` (called after the node's server has shut down, so no handler is still starting
-sends). On the routed path the caller's context is the HTTP request's, canceled the moment the
+values (trace, logger) but not its cancellation, ended by the send timeout
+(`Config.ReplicaSendTimeout`, default 10 s) or by the replicator's `Close` (called after the
+node's server has shut down, so no handler is still starting sends). On the routed path the caller's context is the HTTP request's, canceled the moment the
 primary answers; a send that rode it would be cut for every secondary slower than the quorum, so a
 merely slow replica would miss nearly every acknowledged write and serve short hedged reads until
 the next flush mirrored the parts. An acknowledged write therefore guarantees quorum durability
 *and* an in-flight, timeout-bounded delivery attempt to every other owner.
+
+Two consequences follow from detaching the send. The send timeout bounds the **quorum** sends too,
+so it — not the caller's write deadline — is what a quorum wait against a slow peer fails on; it is
+configurable for that reason. And a write that returned an *error* can still land on a peer within
+that window, so a client retry re-appends rows the store does not deduplicate (#572).
 
 ## Write path — primary-authoritative
 

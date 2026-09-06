@@ -393,7 +393,8 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 
 	// The replicator applies an inbound (or local) write to the addressed tenant's engine. Its
 	// transport shares the tuned client (connection timeouts) so replication tolerates a slow peer.
-	rp := replica.New(self.Addr, replica.NewHTTPTransport(httpc), s.applyReplicated)
+	rp := replica.New(self.Addr, replica.NewHTTPTransport(httpc), s.applyReplicated,
+		replica.WithSendTimeout(cfg.ReplicaSendTimeout))
 
 	mux := http.NewServeMux()
 	mux.Handle(replica.ReplicatePath, rp.Handler())               // secondary: trusting apply
