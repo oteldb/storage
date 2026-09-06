@@ -390,6 +390,15 @@ in the index. Tombstones are bounded (`bucketindex.MaxRemovals`, newest kept), s
 behind than that keeps garbage instead of guessing, and a legacy index states no removals at all,
 where absence is all there is and the pre-tombstone behavior stands.
 
+That bound is short in ingest — about one removal per 41.75 KiB of logical ingest, so 4096 of them
+is ~167 GiB per shard at the 64 MiB `MaxPartBytes` default — and harmless because a tombstone is not
+the only evidence `accountsFor` has. `Entry.Supersedes` never expires and explains every removal a
+steady-state flush/merge cycle produces; the tombstone carries only what supersession cannot, a part
+whose successors are themselves retention-dropped (1306 of 1394 removals under a retention window).
+Aging out therefore costs withheld bytes and nothing else: outside this deletion authorization a
+tombstone is read only by the commit deciding which foreign entries to carry forward, never by the
+repair or want path, so an expired one cannot mint a want or a hole.
+
 The engine layer is untouched: partsync moves objects, then the ordinary `RefreshReplica`/
 `LoadParts` path loads them. Because the head is trimmed only below parts the engine actually
 loaded, pull-before-trim can never drop an unflushed sample. A replica mirrors before each refresh;

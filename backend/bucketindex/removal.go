@@ -7,8 +7,20 @@ import "slices"
 // bounded number of removals instead.
 //
 // A replica further behind than this keeps the objects of parts whose tombstones have aged out —
-// bounded garbage, reported as [Stats.Withheld] rather than deleted on a guess. Compaction removes
-// parts in the low tens per merge, so this is a long window in practice.
+// bounded garbage, reported as [Stats.Withheld] rather than deleted on a guess.
+//
+// The window is short in ingest, not long: essentially every part created is eventually removed, at
+// roughly one removal per 41.75 KiB of logical ingest for a 64 KiB MaxPartBytes — so 4096 removals
+// is about 167 GiB of logical ingest per shard at the 64 MiB default, order of a day at a busy
+// shard's rate. Aging out costs only those withheld bytes: outside the cluster prune's deletion
+// authorization a tombstone is read only by the commit deciding which foreign entries to carry
+// forward, never by the repair or want path, so an expired one cannot mint a want or a hole.
+//
+// What keeps the short window harmless is that a tombstone is not the only evidence. The prune's
+// account of a peer also tests [Entry.Supersedes], which never expires, and that alone explains
+// every removal a steady-state flush/merge cycle produces. The tombstone is load-bearing only where
+// supersession runs out — once a part's successors are themselves retention-dropped, nothing live
+// contains it: under a retention window 1306 of 1394 removals are explained by the tombstone alone.
 const MaxRemovals = 4096
 
 // Removal is a part a writer deliberately took out of the index, and the generation at which it

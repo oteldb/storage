@@ -187,7 +187,10 @@ a demonstration.
   alarm rather than a repair trigger. `RecordWant`/`SatisfyWant`/`Wants` mirror
   `Tombstone`/`Removals`. `MaxWants` is `MaxRemovals`, deliberately the same number — past it a
   node cannot tell a removed part from a lost one and must adopt a peer's current index wholesale
-  rather than repair part by part, so one constant governs both boundaries — but unlike
+  rather than repair part by part, so one constant governs both boundaries. `cluster/partsync` is
+  that wholesale adoption, and it runs below the want path, so the horizon is reached only by local
+  loss of more than 4096 live parts, which the live part count (one per ~1.67 MiB of logical ingest,
+  growing sub-linearly) puts tens of TiB away. Unlike
   `MaxRemovals` it **bounds nothing**: a tombstone accumulates for as long as the shard lives and has
   to be cut, while a want is the only record that a part is owed, and it costs the index the bytes
   its entry did, so `Wanted` is bounded by the parts the node has held rather than by uptime.
