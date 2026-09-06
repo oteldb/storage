@@ -7,6 +7,16 @@ import "slices"
 // [MaxRemovals], because past that many tombstones a node can no longer tell a removed part from a
 // lost one, which is the same regime; one constant governs both boundaries.
 //
+// It measures how many parts are gone from this node's disk, not how long it was away. A want is
+// minted per index entry whose objects will not open, so [Index.Wanted] is bounded by the shard's
+// live part count — which compaction holds low and roughly logarithmic in volume: 35 live parts at
+// 58 MiB of logical ingest and 85 at 234 MiB, one per ~1.67 MiB, four times the data giving 2.4
+// times the parts. Reaching 4096 takes a shard of tens of TiB or years of retention. A node that
+// was merely absent does not approach it from the other direction either: cluster/partsync copies
+// the objects a superseding peer's index names and installs that index, so a returning node's wants
+// are what that mirror has not restored yet — bounded by the same live part set and cleared by the
+// next refresh, not growing with the length of the absence.
+//
 // Unlike [MaxRemovals] it bounds nothing. A tombstone is a fact about the past that accumulates for
 // as long as the shard lives, so the list has to be cut; a want is the only record that a part is
 // owed, and dropping one is dropping the repair. Nor does cutting the list buy the index anything:

@@ -578,8 +578,16 @@ twice. A part whose objects arrived but will not open is rolled back to a failur
 stays.
 
 **No count trims an outstanding want.** `bucketindex.MaxWants` (4096) is the horizon past which a
-node owes more than part-by-part repair can converge on and needs a wholesale reseed, which does not
-exist yet; the commit logs past it and keeps every want. Truncating the list would break the one
+node owes more than part-by-part repair can converge on; the commit logs past it and keeps every
+want. The horizon counts *parts gone from this node's disk*, not time away, and compaction holds the
+live part set far below it: 35 live parts at 58 MiB of logical ingest, 85 at 234 MiB — one per
+~1.67 MiB, four times the data giving 2.4 times the parts, since the ladder's top level is a day
+bucket. 4096 wants therefore needs a shard of tens of TiB or years of retention. Absence does not
+reach it from the other direction either. The wholesale adoption is `cluster/partsync`, which copies
+the objects a superseding peer's current index names and installs that index; a returning node's
+wants are what the mirror has not restored *yet*, bounded by that same live part set and cleared by
+the next refresh, rather than a count that grows with how long it was away. Truncating the list
+would break the one
 invariant the read policy stands on — a part leaves `Entries` only into `Removed` or into `Wanted` —
 and a want dropped that way is neither a hole nor a `LostParts` increment: the window it covered is
 served short with nothing to say so. Refusing the commit instead would keep the invariant trivially

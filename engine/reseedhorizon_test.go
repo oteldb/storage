@@ -125,6 +125,12 @@ func TestReseedHorizonRate(t *testing.T) {
 		}
 	}
 
+	// The two claims the horizon documentation rests on, with orders of magnitude of margin: a
+	// merged-away part is accounted for by its successor without any tombstone, and the live part
+	// set — which is what bounds a node's wants — stays far below the reseed horizon.
+	require.Zero(t, unexplained, "a merge-consumed part must stay accounted for by its successor")
+	require.Less(t, len(ixFinal.Entries), bucketindex.MaxWants)
+
 	logical := int64(rows) * rowBytes
 	perRemoval := logical / int64(max(len(removed), 1))
 	span := time.Duration(ts - int64(1_700_000_000)*int64(time.Second))
