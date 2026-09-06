@@ -136,37 +136,42 @@ left out of the readable set but kept in the index, since only its writer knows 
 
 ### Block identity is allocated by the commit that publishes the part
 
-A flush output commits `[n, n]` at level 0, `n` from `bucketindex.Index.NextBlock`. A merge output
-commits the **union of its inputs' intervals** at `max(input level) + 1` and allocates nothing: the
-merged part covers the blocks its inputs covered, and that is what makes `Entry.Supersedes` — and so
-a repair that terminates on a successor — decidable from identity alone (`backend/ARCH.md`, "Part
-identity is a block interval plus a level").
+A flush output commits `{n}` at level 0, `n` from `bucketindex.Index.NextBlock`. A merge that writes
+**one** part commits the union of the block sets its inputs covered, at `max(input level) + 1`, and
+allocates nothing: the merged part covers exactly the blocks its inputs covered — a set, so a run
+that straddles a gap claims no block inside it — and that is what makes `Entry.Supersedes`, and so a
+repair that terminates on a successor, decidable from identity alone (`backend/ARCH.md`, "Part
+identity is a block *set* plus a level").
 
-Two merges allocate instead, and both leave their output superseding nothing. Inputs that all
-predate format v5 carry no interval to inherit; a fresh `[n, n]` is how such a part migrates, a merge
-being the only thing that rewrites it. And a merge whose output is split across several parts cannot
-hand any one of them the union — none holds all of that data, so a successor claim would answer a
-want with a fraction of the part. **The severed lineage is permanent**: the inputs' intervals leave
-the index with them, every later merge over the outputs inherits the fresh numbers, and a want naming
-a retired input is satisfiable only by its exact prefix — so a replica that lost that part before a
-peer split it cannot be repaired from the fragments, and repair acknowledges a hole for data the
-fragments hold (#548). Two further costs of the interval algebra sit beside it: `Interval.Union` is a
-hull, so a merge over the neighbors of a lost part claims its block and discharges the want without
-its rows; and `NextBlock` counts only what the index still names, so fragments published by the
-commit that retires the top-numbered inputs take those inputs' numbers again, each one an input's
-interval one level up. The reproducers are gated in `splitlineage_test.go`. A **mixed** merge inherits the
-union of the inputs that do carry an interval and allocates nothing on top: a want naming a pre-v5
-part records that part's unset interval, so no claim the output could make would contain it, and a
-fresh block would name blocks the output does not cover.
+A merge that **splits** its output allocates a fresh contiguous run instead, one block per fragment,
+and hands every fragment the same `bucketindex.Claim`: the consumed set as `Blocks`, the run as
+`Group`. No fragment supersedes an input on its own — it holds a fraction of one — but the group
+jointly covers what the inputs did, and a later merge that consumes the whole group folds the claim
+back into an ordinary interval, which every merge after that inherits. Nothing is severed. The run is
+allocated **as a whole, before any fragment is numbered**, so each fragment can name its siblings;
+that is what lets a repair fetch a group member by member.
+
+One limit is deliberate: an output carries **at most one unrealized claim**, the widest. A merge
+consuming fragments of two groups without completing either keeps the lineage of one, and the other
+falls back to exact-prefix matching — where every split left it before claims existed, so never
+worse than the status quo, and rare enough not to justify a list per entry.
+
+Inputs that all predate format v5 carry no interval to inherit; a fresh `{n}` is how such a part
+migrates, a merge being the only thing that rewrites it, and that output supersedes nothing. A
+**mixed** merge inherits the union of the inputs that do carry an interval and allocates nothing on
+top: a want naming a pre-v5 part records that part's unset interval, so no claim the output could
+make would contain it, and a fresh block would name blocks the output does not cover.
 
 **Allocation runs once per CAS attempt, inside `nextIndexLocked`, and is applied only after the
-commit lands.** `NextBlock` is taken over the state that attempt publishes — the entries a rebase
-adopted from a rival writer included, since its blocks are real claims — plus this engine's own
-parts, its holes, and every want outstanding or pending, whose part may yet be repaired back in. A
-number written onto the part before its CAS succeeds survives the rebase, so the retry would keep a
-block the winner just took and never re-allocate; the assignments are therefore held in
-`pendingBlocks` and written through in the `err == nil` branch, the same discipline `pendingWants`
-and `pendingHoles` follow, and for the same reason.
+commit lands.** `NextBlock` is taken over the state that attempt publishes — the persisted
+high-water mark, the entries a rebase adopted from a rival writer included (its blocks are real
+claims), this engine's own parts, its holes, and every want outstanding or pending, whose part may
+yet be repaired back in. The attempt's own allocations raise the mark it commits, so the mark only
+ever rises and the commit that retires the top-numbered parts cannot renumber over them. A number
+written onto the part before its CAS succeeds survives the rebase, so the retry would keep a block
+the winner just took and never re-allocate; the assignments are therefore held in `pendingBlocks`
+and written through in the `err == nil` branch, the same discipline `pendingWants` and
+`pendingHoles` follow, and for the same reason.
 
 ## Identity prune
 
@@ -522,7 +527,23 @@ across every commit alongside the removals. Repair runs at the head of each merg
 shard that cannot be repaired must still compact.
 
 Satisfaction follows `Index.Satisfying` — the exact part, **or the largest live part whose block
-interval contains the want's at a higher level**. That is what makes repair terminate: by the time
+set contains the want's at a higher level**, or, when no single part does, **a split group whose
+members are all present and whose joint claim covers it**. A group is answered one member at a time,
+so repair runs a second fetch round in the same cycle: the first round's answer names the group, and
+`Index.Missing` names the members still to fetch, by block rather than by prefix (no prefix is known
+for them). The whole group therefore lands in **one commit**, which matters — a fragment committed
+beside the ancestors it partly duplicates, with nothing yet able to retire them, would have those
+rows read twice. A round that cannot complete a group inside the per-cycle fetch budget commits none
+of it (`dropIncompleteGroups`) and the next cycle asks again. Completing a group retires the parts
+its claim covers, through `bucketindex.Subsumed`, the same swap a merge publishes.
+
+A group with a member no peer can supply therefore **stays outstanding rather than becoming a hole**:
+each cycle answers the want with a member it already has, which resets the absence evidence, so the
+two gates a hole needs are never both cleared. That is the safe direction — an outstanding want is
+visible and recoverable, a hole over live data is neither — but it is a stuck state, and the signal
+for it is `RepairStats.Fetched` climbing while the wanted count does not fall.
+These targets are **never wants**: nothing about them reaches the index, so the obligation stays the
+original want's and `Entries → Removed | Wanted` is untouched. That is what makes repair terminate: by the time
 a want is serviced the data may exist only inside a merged successor, and chasing a prefix that no
 longer exists anywhere would never converge. The local index is asked first, so a want this
 engine's own merges already covered costs no network call at all — and then the local **disk**: a

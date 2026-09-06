@@ -14,7 +14,6 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 )
 
@@ -112,7 +111,8 @@ func splitMerge(ctx context.Context, t *testing.T, be backend.Backend, before []
 
 	fragments := 0
 
-	for _, ent := range ix.Entries {
+	for i := range ix.Entries {
+		ent := &ix.Entries[i]
 		if !slices.ContainsFunc(before, func(in bucketindex.Entry) bool { return in.Prefix == ent.Prefix }) {
 			fragments++
 		}
@@ -124,14 +124,12 @@ func splitMerge(ctx context.Context, t *testing.T, be backend.Backend, before []
 }
 
 // TestSplitMergeAllocatesAboveItsInputs pins that a split output never takes a block number one of
-// its inputs held. NextBlock is one above the highest block the index still names, and the commit
-// that publishes the fragments is the one that retires the inputs — so with the inputs holding the
-// top blocks, the fragments are numbered from the bottom again, each one the same interval as an
-// input one level up. A fragment holding a third of the rows then supersedes a whole input, and a
-// peer's want for that input is answered with it.
+// its inputs held, even though the commit that publishes the fragments is the one that retires
+// those inputs. Numbering runs above the persisted high-water mark rather than above the live set,
+// so nothing rewinds into the identity of a part the same commit removed — a fragment holding a
+// third of the rows would otherwise supersede a whole input, and answer a peer's want with it.
 func TestSplitMergeAllocatesAboveItsInputs(t *testing.T) {
 	t.Parallel()
-	reproduce.Unfixed(t, 548, "split fragments reuse the block numbers of the inputs the same commit retires")
 
 	ctx := context.Background()
 	be := backend.Memory()
@@ -147,14 +145,13 @@ func TestSplitMergeAllocatesAboveItsInputs(t *testing.T) {
 	}
 }
 
-// TestSplitMergeSeversLineage is the reproducer for #548. A merge that splits its output hands the
-// fragments fresh intervals, so none of them supersedes an input; the doc on planMergeBlocks says the
-// next merge corrects that. It does not: the fragments' successor inherits the fresh intervals and
-// never the ancestors', so a want naming a pre-split part is not satisfied by any later part, however
-// many merges follow and even when every row of it is inside one.
+// TestSplitMergeSeversLineage pins that a split does not sever the lineage. The fragments take fresh
+// blocks and none of them supersedes an input on its own, but they carry the inputs' blocks as a
+// joint claim, so the group answers a want for a pre-split part while it is spread across them and a
+// merge that consumes the whole group folds the claim back into one ordinary interval — which every
+// later merge then inherits.
 func TestSplitMergeSeversLineage(t *testing.T) {
 	t.Parallel()
-	reproduce.Unfixed(t, 548, "a split merge's fragments and every part merged from them claim fresh blocks, so no successor ever contains a pre-split part's interval")
 
 	ctx := context.Background()
 	be := backend.Memory()
@@ -167,8 +164,12 @@ func TestSplitMergeSeversLineage(t *testing.T) {
 		require.False(t, f.Supersedes(lost), "a fragment holds a fraction of the input and must not claim it: %+v", f)
 	}
 
-	_, ok := ix.Satisfying(want)
-	require.False(t, ok, "no fragment satisfies the want, as documented")
+	// No *single* fragment answers the want, but the group does: every one of its members is here,
+	// so the rows are too. That is what TestSplitLineageWantBecomesHole needs a peer to say, and it
+	// is the opposite of what this line asserted while the split severed the lineage outright.
+	got, ok := ix.Satisfying(want)
+	require.True(t, ok, "the whole group is present, so the want is answerable")
+	require.False(t, got.Supersedes(lost), "and it is answered by a member, not by a part containing it")
 
 	// "corrected by the next merge": rejoin the fragments, and keep merging until the part set is a
 	// fixed point, then fold in one more part.
@@ -197,13 +198,12 @@ func TestSplitMergeSeversLineage(t *testing.T) {
 	assert.True(t, ok, "a want naming the pre-split part is never satisfied: after further merges the index holds %+v", ix.Entries[0])
 }
 
-// TestSplitLineageWantBecomesHole is the loss #548 leads to. One replica loses a part; the other
-// has merged it into split fragments that hold every one of its rows. Repair asks the peer's index
-// for a part satisfying the want, none claims the interval, and after enough confirmations the want
-// is acknowledged as a hole — for data that is entirely on the peer's disk.
+// TestSplitLineageWantBecomesHole pins the loss #548 led to. One replica loses a part; the other has
+// merged it into split fragments that hold every one of its rows. The peer's index must answer that
+// the want is satisfiable, repair must pull the whole group rather than the one member the peer
+// names, and no hole may be acknowledged for data that is entirely on the peer's disk.
 func TestSplitLineageWantBecomesHole(t *testing.T) {
 	t.Parallel()
-	reproduce.Unfixed(t, 548, "repair commits a hole for a part whose rows are all inside a peer's split merge output")
 
 	ctx := context.Background()
 	be, peer := backend.Memory(), backend.Memory()
@@ -246,13 +246,12 @@ func TestSplitLineageWantBecomesHole(t *testing.T) {
 	assert.Equal(t, 4*seriesPerPart, countSeries(t, r), "repair brings the lost rows back from the peer")
 }
 
-// TestMergeAroundALostPartKeepsItsWant is a defect the algebra behind #548 shares its root with,
-// though not the one the issue names. Interval.Union is a hull: merging the neighbors of a lost part
-// yields an interval covering its block, so the want is discharged with the data still gone — no
-// hole, no want, and a read short by the whole part.
+// TestMergeAroundALostPartKeepsItsWant pins that a merge of a lost part's neighbors claims none of
+// its blocks. The union of block sets is a set and not a hull, so merging {1} and {3} yields {1,3}
+// and cannot discharge a want for block 2 — which a hull did, leaving no hole, no want, and a read
+// short by the whole part.
 func TestMergeAroundALostPartKeepsItsWant(t *testing.T) {
 	t.Parallel()
-	reproduce.Unfixed(t, 548, "the hull of a lost part's neighbors discharges the want for it while its rows are absent")
 
 	ctx := context.Background()
 	be := backend.Memory()

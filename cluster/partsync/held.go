@@ -37,13 +37,14 @@ func (s *Syncer) heldEntries(
 ) (held, error) {
 	var out held
 
-	for _, e := range localIndex.Entries {
+	for i := range localIndex.Entries {
+		e := &localIndex.Entries[i]
 		if e.Hole {
 			continue
 		}
 
 		_, claimed := acct.claimed[e.Prefix]
-		if !claimed && acct.accountsFor(e) {
+		if !claimed && acct.accountsFor(*e) {
 			continue
 		}
 
@@ -57,9 +58,9 @@ func (s *Syncer) heldEntries(
 		}
 
 		if claimed {
-			out.claimed = append(out.claimed, e)
+			out.claimed = append(out.claimed, *e)
 		} else {
-			out.omitted = append(out.omitted, e)
+			out.omitted = append(out.omitted, *e)
 		}
 	}
 
@@ -89,7 +90,8 @@ func accountOf(ix *bucketindex.Index) peerAccount {
 		stated:  ix.RecordsRemovals(),
 	}
 
-	for _, e := range ix.Entries {
+	for i := range ix.Entries {
+		e := &ix.Entries[i]
 		a.present[e.Prefix] = struct{}{}
 
 		if e.Hole {
@@ -98,11 +100,11 @@ func accountOf(ix *bucketindex.Index) peerAccount {
 			continue
 		}
 
-		a.live = append(a.live, e)
+		a.live = append(a.live, *e)
 	}
 
-	for _, w := range ix.Wanted {
-		a.claimed[w.Prefix] = struct{}{}
+	for i := range ix.Wanted {
+		a.claimed[ix.Wanted[i].Prefix] = struct{}{}
 	}
 
 	return a
@@ -113,9 +115,13 @@ func accountOf(ix *bucketindex.Index) peerAccount {
 //
 // The successor test is the one an omission needs and a tombstone cannot always give: tombstones
 // are bounded ([bucketindex.MaxRemovals]) and age out, while [bucketindex.Entry.Supersedes] is
-// decidable from identity alone — block intervals are allocated once per shard, so a live entry
-// covering e's blocks at a higher merge level was built from e and holds its rows. It is the same
-// evidence a repair accepts for a want ([bucketindex.Index.Satisfying]).
+// decidable from identity alone and never expires. A live entry covering e's blocks at a higher
+// merge level was built from e and holds its rows: block numbers are allocated once per shard and
+// never reused, and a merge output covers the union of the blocks its inputs covered and nothing
+// else — so containment is a statement about which parts were consumed, not a guess from a range.
+// It is the same evidence a repair accepts for a want ([bucketindex.Index.Satisfying]), minus that
+// one's split-group case: a peer holding a want's rows only jointly, across the fragments of a
+// split, does not account for e here, and the part is kept.
 func (a peerAccount) accountsFor(e bucketindex.Entry) bool {
 	if _, ok := a.present[e.Prefix]; ok {
 		return true
@@ -173,16 +179,17 @@ func retainHeld(peer *bucketindex.Index, h held) *bucketindex.Index {
 
 	wanted := peer.Wants()
 
-	for _, e := range h.claimed {
-		ix.Add(e)
+	for i := range h.claimed {
+		e := &h.claimed[i]
+		ix.Add(*e)
 
 		if _, ok := wanted[e.Prefix]; !ok {
-			ix.RecordWant(bucketindex.WantOf(e, peer.Generation))
+			ix.RecordWant(bucketindex.WantOf(*e, peer.Generation))
 		}
 	}
 
-	for _, e := range h.omitted {
-		ix.Add(e)
+	for i := range h.omitted {
+		ix.Add(h.omitted[i])
 	}
 
 	return &ix

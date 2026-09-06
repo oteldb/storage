@@ -29,8 +29,8 @@ func (f *fakeFetcher) FetchWants(_ context.Context, wants []bucketindex.Want) []
 	f.mu.Lock()
 	f.calls++
 
-	for _, w := range wants {
-		f.asked = append(f.asked, w.Prefix)
+	for i := range wants {
+		f.asked = append(f.asked, wants[i].Prefix)
 	}
 
 	answer := f.answer
@@ -38,14 +38,15 @@ func (f *fakeFetcher) FetchWants(_ context.Context, wants []bucketindex.Want) []
 
 	out := make([]recordengine.FetchResult, len(wants))
 
-	for i, w := range wants {
+	for i := range wants {
+		w := &wants[i]
 		if answer == nil {
 			out[i].Outcome = bucketindex.WantAbsent
 
 			continue
 		}
 
-		ent, outcome, err := answer(w)
+		ent, outcome, err := answer(*w)
 		out[i] = recordengine.FetchResult{Entry: ent, Outcome: outcome, Err: err}
 	}
 

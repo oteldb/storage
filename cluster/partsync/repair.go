@@ -314,6 +314,12 @@ func (s *Syncer) peerHoldings(
 
 // selectHeld picks the first peer, in shuffled order, whose disk holds a complete copy of prefix.
 func selectHeld(holdings []peerHolding, prefix string) (addr string, ok bool) {
+	// A want naming blocks rather than a part — one member of a split group a repair still needs —
+	// has no prefix to look for, and the empty one must never match a listing.
+	if prefix == "" {
+		return "", false
+	}
+
 	for _, h := range holdings {
 		if _, found := h.parts[prefix]; found {
 			return h.addr, true

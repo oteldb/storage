@@ -56,7 +56,10 @@ func (r *partRepairer) FetchWants(ctx context.Context, wants []bucketindex.Want)
 		return out
 	}
 
-	for i, res := range r.s.cluster.psync.FetchWants(ctx, r.prefix, remotes, wants) {
+	fetched := r.s.cluster.psync.FetchWants(ctx, r.prefix, remotes, wants)
+	for i := range fetched {
+		res := &fetched[i]
+
 		switch {
 		case res.Err != nil:
 			out[i] = engine.FetchResult{Outcome: bucketindex.WantIncomplete, Err: res.Err}
@@ -81,7 +84,8 @@ func (r recordPartRepairer) FetchWants(
 	src := r.partRepairer.FetchWants(ctx, wants)
 
 	out := make([]recordengine.FetchResult, len(src))
-	for i, s := range src {
+	for i := range src {
+		s := &src[i]
 		out[i] = recordengine.FetchResult{Entry: s.Entry, Outcome: s.Outcome, Err: s.Err}
 	}
 

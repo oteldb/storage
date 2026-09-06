@@ -43,9 +43,9 @@ func dropPart(t *testing.T, be backend.Backend, prefix string, ix *bucketindex.I
 	}
 
 	out := &bucketindex.Index{Generation: g, Removed: ix.Removed}
-	for _, e := range ix.Entries {
-		if e.Prefix != part {
-			out.Add(e)
+	for i := range ix.Entries {
+		if ix.Entries[i].Prefix != part {
+			out.Add(ix.Entries[i])
 		}
 	}
 

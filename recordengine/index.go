@@ -53,12 +53,14 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 			e.pendingWants = nil
 			// Same rule for the blocks this attempt allocated: a part numbered before its CAS
 			// landed would hold a block the winner took, and the retry would not re-allocate.
-			for _, a := range e.pendingBlocks {
-				a.part.blocks, a.part.level, a.part.pending = a.blocks, a.level, nil
+			for i := range e.pendingBlocks {
+				a := &e.pendingBlocks[i]
+				a.part.blocks, a.part.claim, a.part.level, a.part.pending = a.blocks, a.claim, a.level, nil
 			}
 
 			e.pendingBlocks = nil
 			e.holes, e.lostParts = ix.Holes(), ix.LostParts
+			e.allocated = ix.AllocatedBlocks
 			e.pendingHoles = nil
 
 			return nil
@@ -101,8 +103,8 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 	// them: the losing commit never landed, so whatever it was going to record is still owed. A
 	// want either side has already met is dropped again by the trim in [Engine.nextIndexLocked].
 	merged := bucketindex.Index{Wanted: e.wants}
-	for _, w := range ix.Wanted {
-		merged.RecordWant(w)
+	for i := range ix.Wanted {
+		merged.RecordWant(ix.Wanted[i])
 	}
 
 	e.wants = merged.Wanted
@@ -111,6 +113,7 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 	// not walk back: the counter only ever rises.
 	e.holes = mergeHoles(e.holes, ix.Holes())
 	e.lostParts = max(e.lostParts, ix.LostParts)
+	e.allocated = max(e.allocated, ix.AllocatedBlocks)
 
 	e.foreign = foreignEntries(ix.Entries, e.indexed, e.removals, e.wants)
 	e.openForeignLocked(ctx)
@@ -121,8 +124,8 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 // mergeHoles unions the holes a rival writer committed into this engine's, keyed by prefix.
 func mergeHoles(cur, other []bucketindex.Entry) []bucketindex.Entry {
 	ix := bucketindex.Index{Entries: slices.Clone(cur)}
-	for _, h := range other {
-		ix.Add(h)
+	for i := range other {
+		ix.Add(other[i])
 	}
 
 	return ix.Entries
@@ -145,7 +148,8 @@ func (e *Engine) openForeignLocked(ctx context.Context) {
 
 	open := make(map[string]*part, len(e.foreign))
 
-	for _, ent := range e.foreign {
+	for i := range e.foreign {
+		ent := &e.foreign[i]
 		if p, ok := e.foreignParts[ent.Prefix]; ok {
 			open[ent.Prefix] = p
 
@@ -214,36 +218,39 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 	e.epochs, e.anonEpoch = ix.Epochs, ix.FlushedEpoch
 
 	// A rival writer's entries go in first, so this engine's own parts win any prefix collision.
-	for _, ent := range e.foreign {
-		ix.Add(ent)
+	for i := range e.foreign {
+		ix.Add(e.foreign[i])
 	}
 
 	// Block numbers are allocated here, per attempt, because a rival's entries are only known
 	// after a rebase: allocating once and reusing it across retries would hand a part a block the
 	// winner already claimed. The assignments are held, not applied — see [Engine.updateIndexLocked].
 	next := e.nextBlockLocked(ix)
+	groups := make(map[*splitGroup]*groupRun)
 
 	var assigned []blockAssignment
 
 	live := make(map[string]struct{}, len(e.parts))
 	for _, p := range e.parts {
-		blocks, level := p.blocks, p.level
+		blocks, claim, level := p.blocks, p.claim, p.level
 		if id := p.pending; id != nil {
-			blocks, level = id.blocks, id.level
-			if !blocks.Valid() {
-				blocks = bucketindex.Interval{Min: next, Max: next}
-				next++
-			}
+			blocks, claim = allocateBlocks(id, &next, groups)
+			level = id.level
 
-			assigned = append(assigned, blockAssignment{part: p, blocks: blocks, level: level})
+			assigned = append(assigned, blockAssignment{part: p, blocks: blocks, claim: claim, level: level})
 		}
 
 		ix.Add(bucketindex.Entry{
 			Prefix: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
-			Blocks: blocks, Level: level,
+			Blocks: blocks, Claim: claim, Level: level,
 		})
 		live[p.prefix] = struct{}{}
 	}
+
+	// One above the last block handed out, over every source this attempt considered — so the mark
+	// only ever rises, and a shard whose live set has since emptied never renumbers over a part it
+	// once held.
+	ix.AllocatedBlocks = next - 1
 
 	e.pendingBlocks = assigned
 
@@ -262,16 +269,18 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 	// as indexed, or the next commit would read it as a removal.
 	ix.LostParts = e.lostParts
 
-	for _, h := range bucketindex.TrimHoles(slices.Clone(e.holes), ix.Entries) {
-		ix.Add(h)
-		live[h.Prefix] = struct{}{}
+	trimmed := bucketindex.TrimHoles(slices.Clone(e.holes), ix.Entries)
+	for i := range trimmed {
+		ix.Add(trimmed[i])
+		live[trimmed[i].Prefix] = struct{}{}
 	}
 
 	// Acknowledging a loss is one index mutation, so the hole, the want it discharges and the
 	// data-loss counter all land in the same CAS commit — or none of them do.
-	for _, w := range e.pendingHoles {
+	for i := range e.pendingHoles {
+		w := &e.pendingHoles[i]
 		live[w.Prefix] = struct{}{}
-		ix.RecordHole(w)
+		ix.RecordHole(*w)
 	}
 
 	e.removals = bucketindex.TrimRemovals(e.removals, live, bucketindex.MaxRemovals)
@@ -283,7 +292,8 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 	// halves, so no crash can land the drop without the want.
 	ix.Wanted = slices.Clone(e.wants)
 
-	for _, w := range e.pendingWants {
+	for i := range e.pendingWants {
+		w := e.pendingWants[i]
 		w.Generation = e.generation
 		ix.RecordWant(w)
 	}
@@ -314,7 +324,9 @@ func foreignEntries(
 ) []bucketindex.Entry {
 	var out []bucketindex.Entry
 
-	for _, e := range entries {
+	for i := range entries {
+		e := &entries[i]
+
 		// A hole is carried through [Engine.holes], which is also what re-attempts and revokes it;
 		// letting one in here would commit it twice and try to open objects that do not exist.
 		if e.Hole {
@@ -336,7 +348,7 @@ func foreignEntries(
 			continue
 		}
 
-		out = append(out, e)
+		out = append(out, *e)
 	}
 
 	return out
@@ -409,11 +421,13 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 		lost  []bucketindex.Want
 	)
 
-	for _, ent := range ix.Entries {
+	for i := range ix.Entries {
+		ent := &ix.Entries[i]
+
 		// A hole names no objects, so there is nothing to open: it is carried as what it is, an
 		// acknowledged loss the next repair pass re-attempts.
 		if ent.Hole {
-			holes = append(holes, ent)
+			holes = append(holes, *ent)
 
 			continue
 		}
@@ -427,17 +441,17 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 			zctx.From(ctx).Error("part named by the index is gone; recording a repair",
 				zap.String("prefix", ent.Prefix), zap.Error(err))
 
-			lost = append(lost, bucketindex.WantOf(ent, e.generation))
+			lost = append(lost, bucketindex.WantOf(*ent, e.generation))
 
 			continue
 		}
 
 		p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
-		p.blocks, p.level = ent.Blocks, ent.Level
+		p.blocks, p.claim, p.level = ent.Blocks, ent.Claim, ent.Level
 		parts = append(parts, p)
 	}
 
-	e.holes, e.lostParts = holes, ix.LostParts
+	e.holes, e.lostParts, e.allocated = holes, ix.LostParts, ix.AllocatedBlocks
 
 	// A part disappearing means identities may have died with it, which is what arms the identity
 	// prune on a node that never merges (a replica adopting the owner's part set).

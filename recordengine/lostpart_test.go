@@ -35,8 +35,8 @@ func loadIndex(t *testing.T, be backend.Backend) *bucketindex.Index {
 
 func prefixes(entries []bucketindex.Entry) []string {
 	out := make([]string, len(entries))
-	for i, e := range entries {
-		out[i] = e.Prefix
+	for i := range entries {
+		out[i] = entries[i].Prefix
 	}
 
 	return out
@@ -44,8 +44,8 @@ func prefixes(entries []bucketindex.Entry) []string {
 
 func wantPrefixes(wants []bucketindex.Want) []string {
 	out := make([]string, len(wants))
-	for i, w := range wants {
-		out[i] = w.Prefix
+	for i := range wants {
+		out[i] = wants[i].Prefix
 	}
 
 	return out

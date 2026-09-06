@@ -716,16 +716,16 @@ func partOf(key, enginePrefix string) string {
 // Where the two indexes agree, which is every ordinary pass, the union is the peer's set.
 func livePartSet(peerIndex, localIndex *bucketindex.Index, supersedes bool) map[string]struct{} {
 	live := make(map[string]struct{}, len(peerIndex.Entries))
-	for _, e := range peerIndex.Entries {
-		live[e.Prefix] = struct{}{}
+	for i := range peerIndex.Entries {
+		live[peerIndex.Entries[i].Prefix] = struct{}{}
 	}
 
 	if supersedes {
 		return live
 	}
 
-	for _, e := range localIndex.Entries {
-		live[e.Prefix] = struct{}{}
+	for i := range localIndex.Entries {
+		live[localIndex.Entries[i].Prefix] = struct{}{}
 	}
 
 	return live
@@ -1046,8 +1046,8 @@ func compareIndexes(a, b *bucketindex.Index) int {
 func maxPartPrefix(ix *bucketindex.Index) string {
 	var m string
 
-	for _, e := range ix.Entries {
-		if n := path.Base(e.Prefix); n > m {
+	for i := range ix.Entries {
+		if n := path.Base(ix.Entries[i].Prefix); n > m {
 			m = n
 		}
 	}

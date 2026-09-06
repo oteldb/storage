@@ -51,14 +51,15 @@ func loseOnOwner(t *testing.T, owner backend.Backend, ix *bucketindex.Index, hol
 	var lost bucketindex.Entry
 
 	damaged := &bucketindex.Index{Generation: gen(1, 6)}
-	for _, e := range ix.Entries {
+	for i := range ix.Entries {
+		e := &ix.Entries[i]
 		if e.Prefix == part {
-			lost = e
+			lost = *e
 
 			continue
 		}
 
-		damaged.Add(e)
+		damaged.Add(*e)
 	}
 
 	w := bucketindex.WantOf(lost, damaged.Generation)

@@ -20,16 +20,17 @@ const MaxWants = MaxRemovals
 // that identity back: either as the part fetched from a peer, or — when no owner has it — as the
 // hole committed in its place (see [Index.RecordHole]).
 //
-// Blocks is the interval the missing part covered: any part containing it at a higher level
-// satisfies the want, because the data is inside that successor (see [Index.Satisfying]). It is
-// unset for a part written before format v5, which carries no interval; such a want is satisfiable
-// only by the exact prefix.
+// Blocks is the set of blocks the missing part covered: any part containing it at a higher level
+// satisfies the want, because the data is inside that successor, and so does a complete split
+// group whose claim covers it (see [Index.Satisfying]). It is unset for a part written before
+// format v5, which carries no interval; such a want is satisfiable only by the exact prefix.
 //
 // A want is an obligation with a completion condition, which is why it is not a [Removal]: a
 // removal is terminal, and conflating them would make "am I repaired?" unanswerable.
 type Want struct {
 	Prefix           string
 	Blocks           Interval
+	Claim            Claim
 	Level            uint32
 	MinTime, MaxTime int64
 	Generation       Generation
@@ -38,7 +39,7 @@ type Want struct {
 // WantOf is the repair obligation a lost entry owes, discovered at generation g.
 func WantOf(e Entry, g Generation) Want {
 	return Want{
-		Prefix: e.Prefix, Blocks: e.Blocks, Level: e.Level,
+		Prefix: e.Prefix, Blocks: e.Blocks, Claim: e.Claim, Level: e.Level,
 		MinTime: e.MinTime, MaxTime: e.MaxTime, Generation: g,
 	}
 }
@@ -47,7 +48,7 @@ func WantOf(e Entry, g Generation) Want {
 func (w Want) Entry() Entry {
 	return Entry{
 		Prefix: w.Prefix, MinTime: w.MinTime, MaxTime: w.MaxTime,
-		Blocks: w.Blocks, Level: w.Level,
+		Blocks: w.Blocks, Claim: w.Claim, Level: w.Level,
 	}
 }
 
@@ -82,8 +83,8 @@ func (ix *Index) SatisfyWant(prefix string) bool {
 // carries the whole want: repair needs the block interval to accept a merged successor.
 func (ix *Index) Wants() map[string]Want {
 	out := make(map[string]Want, len(ix.Wanted))
-	for _, w := range ix.Wanted {
-		out[w.Prefix] = w
+	for i := range ix.Wanted {
+		out[ix.Wanted[i].Prefix] = ix.Wanted[i]
 	}
 
 	return out
@@ -96,12 +97,13 @@ func TrimWants(wants []Want, live []Entry) []Want {
 	ix := Index{Entries: live}
 
 	out := wants[:0]
-	for _, w := range wants {
-		if _, ok := ix.Discharging(w); ok {
+	for i := range wants {
+		w := &wants[i]
+		if _, ok := ix.Discharging(*w); ok {
 			continue
 		}
 
-		out = append(out, w)
+		out = append(out, *w)
 	}
 
 	slices.SortFunc(out, compareWantPrefix)
@@ -135,8 +137,8 @@ func (w Want) Overlaps(start, end int64) bool {
 
 // WantsOverlap reports whether any of wants covers [start, end].
 func WantsOverlap(wants []Want, start, end int64) bool {
-	for _, w := range wants {
-		if w.Overlaps(start, end) {
+	for i := range wants {
+		if w := &wants[i]; w.Overlaps(start, end) {
 			return true
 		}
 	}

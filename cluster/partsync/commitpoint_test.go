@@ -122,8 +122,8 @@ func requireCommitPoint(t *testing.T, local backend.Backend, prefix string) {
 	ix, err := bucketindex.Decode(raw)
 	require.NoError(t, err)
 
-	for _, e := range ix.Entries {
-		requirePartComplete(e.Prefix)
+	for i := range ix.Entries {
+		requirePartComplete(ix.Entries[i].Prefix)
 	}
 }
 

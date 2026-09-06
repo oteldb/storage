@@ -139,25 +139,47 @@ a demonstration.
   neither wrote nor removed, carried into every later commit so they are never dropped — **open**
   them, and retry, bounded at 8 attempts. Exhausting the bound fails the flush or merge that asked for the commit,
   because a part whose entry never landed is unreachable.
-- **Part identity is a block interval plus a level** (`bucketindex.Interval`, `Entry.Level`,
-  format v5). A flush writes `[n, n]` at level 0; a merge over parts spanning `[a … b]` writes
-  `[a, b]` above it. `Entry.Supersedes` is then decidable from identity alone — no index diff, no
-  bookkeeping — which is what lets a repair terminate: by the time a want is serviced the data may
-  exist only inside a merged successor, and `Index.Satisfying` accepts that successor (largest
-  containing part) as discharging the want. Blocks are numbered from 1, so **the zero interval is
-  unset, not a range covering block 0**: an entry written before v5 carries none, takes part in no
-  containment in either direction, and is matched by exact prefix until a merge rewrites it. Any
-  inverted or zero-touching interval a corrupt encoding could produce is unset by the same rule, so
-  the predicate is total.
-  `Interval.Union` is what a merge output claims — the blocks its inputs covered.
-  **Allocation is the shard owner's alone**: `Index.NextBlock` is `max(block) + 1` over its own
-  entries *and* its outstanding wants (a wanted part's blocks stay claimed — it may be repaired
-  back in), claimed by the same `CompareAndSwap` that adds the part. A writer rebasing on a rival's
-  index counts the adopted entries too — see `engine/ARCH.md`, "Block identity is allocated by the
-  commit that publishes the part". No etcd, no round trip on the
-  flush path, and it works with the cluster layer absent. Two owners racing a handoff resolve
-  through that CAS: one commit lands, the loser wraps `ErrConflict`, re-reads, and re-allocates
-  above the winner.
+- **Part identity is a block *set* plus a level** (`bucketindex.Interval`, `Entry.Level`, format
+  v6). A flush writes `{n}` at level 0; a merge writes the union of what its inputs covered, above
+  them. `Entry.Supersedes` is then decidable from identity alone — no index diff, no bookkeeping,
+  no data read — which is what lets a repair terminate: by the time a want is serviced the data may
+  exist only inside a merged successor, and `Index.Satisfying` accepts that successor as discharging
+  the want.
+  **The set is the statement of what a merge consumed**, and that is why it is not a hull. A merge
+  of the parts on either side of a lost one covers `{1,3}`; a hull `[1,3]` would additionally claim
+  block 2, and supersession would then discharge the want for a part whose rows it holds none of —
+  silently, with no hole and no counter moving (#559). `Interval` is stored as its bounds plus the
+  runs it skips (`Gaps`), so the ordinary contiguous part costs the same three bytes it always did
+  and the gap list is the exception. Only the canonical form is valid: a denormalized gap list is
+  rejected by `Decode` rather than normalized, since two encodings of one set would break both
+  equality and the encode∘decode identity.
+  Blocks are numbered from 1, so **the zero interval is unset, not a range covering block 0**: an
+  entry written before v5 carries none, takes part in no containment in either direction, and is
+  matched by exact prefix until a merge rewrites it. Any inverted, zero-touching or denormalized
+  interval is unset by the same rule, so the predicate is total, and such an interval is *written*
+  as unset — the safe direction, since an unset one can neither claim rows nor be claimed.
+- **A split merge states its lineage jointly** (`bucketindex.Claim`). A merge that writes several
+  parts can hand none of them the blocks it consumed: no fragment holds all that data, so a
+  single-part successor claim would answer a want with a fraction of the part. The fragments take a
+  fresh contiguous run of blocks and carry the consumed set as a `Claim{Blocks, Group}` over that
+  run. The claim is **realized only where every member of `Group` is present**, at which point those
+  blocks count as covered as if one part held them — `Index.Covered`, which `Satisfying`,
+  `Discharging` and `Subsumed` all consult. A merge that consumes a whole group folds the claim back
+  into an ordinary interval, so the lineage rejoins rather than staying severed forever (#548).
+  A group answer is deliberately *partial*: `Satisfying` names one member, and `Index.Missing`
+  names the members a repair still has to fetch, by block.
+  **Allocation is the shard owner's alone**: `Index.NextBlock` is one above `AllocatedBlocks`, the
+  persisted high-water mark, and above every block the live entries, wants and group runs still
+  name. The mark is what keeps identity unique over a shard's *whole life* rather than over its
+  current contents: the live set shrinks — retention can empty a shard outright, leaving tombstones
+  that carry no blocks — and numbering derived from it would rewind and hand a new part the identity
+  an expired one held, at which point a stale peer's old part satisfies a want for the new one and
+  expired data is committed as a repair (#542). Numbers are claimed by the same `CompareAndSwap`
+  that adds the part; a writer rebasing on a rival's index takes the maximum of the two marks — see
+  `engine/ARCH.md`, "Block identity is allocated by the commit that publishes the part". No etcd, no
+  round trip on the flush path, and it works with the cluster layer absent. Two owners racing a
+  handoff resolve through that CAS: one commit lands, the loser wraps `ErrConflict`, re-reads, and
+  re-allocates above the winner.
 - **`Entries → Removed | Wanted`** is the invariant the repair path enforces: a part leaves
   `Entries` only into a tombstone (`Removal`, a deliberate deletion) or into a `Want` (an
   obligation to fetch it back). Conflating the two would make "am I repaired?" unanswerable, which
@@ -198,12 +220,22 @@ a demonstration.
   is a fact, not a level: a per-node gauge that a restart or a successful repair clears erases the
   only record that a range of a shard was ever acknowledged as gone. It follows ClickHouse's
   `/lost_part_count`.
-- **Format v5 is a hard read break.** `Decode` rejects any version above the one it knows, so
-  reading is backward compatible (v1–v4 still decode, unset fields ordering below everything a
-  writer produces) but **writing is not**: a node on pre-v5 code fails on the first v5 index it
+- **Format v6 is a hard read break.** `Decode` rejects any version above the one it knows, so
+  reading is backward compatible (v1–v5 still decode, unset fields ordering below everything a
+  writer produces) but **writing is not**: a node on pre-v6 code fails on the first v6 index it
   reads. Every node that reads a given index must be upgraded together. The path differs by
   deployment and both matter — on a shared backend every node reads the same index object, and in
   `PrivateBackend` mode `cluster/partsync` reads its peers' indexes.
+  Two things migrate. A **v5 interval is a hull**, and what it actually covered is unknowable once
+  decoded, so it is read as the contiguous set of its bounds — the meaning it had when it was
+  written. Such an entry can still claim a block no part held, exactly as it did under v5; a merge
+  rewriting it produces an exact set, so the defect drains as the shard compacts rather than being
+  retro-fixed. A **v5 index carries no high-water mark**, so `NextBlock` falls back to the live set
+  and behaves exactly as v5 did until the first v6 commit seeds the mark from what that index still
+  names. A shard already emptied under v5 therefore restarts its numbering once, and never again —
+  the tombstones a v5 index left carry no blocks, so there is nothing better to seed from.
+  **Pre-v5 entries are untouched**: no interval, no claim, exact-prefix matching, and
+  `planMergeBlocks`' mixed path still inherits the union of whichever inputs do carry one.
 - **`backend.ReaderAt`** — optional `ReadAt(ctx,key,off,n)`, the read counterpart of
   `ObjectCreator` and the reason a query touching a few granules no longer pays for the whole
   column (`block/ARCH.md`, "Reading a column by range"). The range is **clamped to the object's

@@ -98,9 +98,9 @@ func forgetPart(t *testing.T, be backend.Backend, indexKey, partPrefix string) {
 		LostParts:    ix.LostParts,
 	}
 
-	for _, e := range ix.Entries {
-		if e.Prefix != partPrefix {
-			out.Add(e)
+	for i := range ix.Entries {
+		if ix.Entries[i].Prefix != partPrefix {
+			out.Add(ix.Entries[i])
 		}
 	}
 
@@ -112,8 +112,8 @@ func forgetPart(t *testing.T, be backend.Backend, indexKey, partPrefix string) {
 
 func partPrefixesOf(ix *bucketindex.Index) []string {
 	out := make([]string, 0, len(ix.Entries))
-	for _, e := range ix.Entries {
-		out = append(out, e.Prefix)
+	for i := range ix.Entries {
+		out = append(out, ix.Entries[i].Prefix)
 	}
 
 	return out
