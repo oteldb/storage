@@ -1448,7 +1448,7 @@ func (s *Storage) maintain(ctx context.Context) {
 				// A replica, not the compaction owner: pull the owner's flushed parts and trim the
 				// head to the unflushed window, bounding memory.
 				s.syncParts(ctx, tid, signalPrefix, false)
-				_ = refresh()
+				s.refreshOrLog(ctx, "replica refresh failed", string(s.normalizeTenant(tid))+signalPrefix, refresh)
 				// Rebuild this node's erasure-coded shard slot if a membership change left it
 				// missing (a no-op when not an EC owner or the shard is already present).
 				s.repairEcShards(ctx, tid, ecParts())
@@ -1460,7 +1460,7 @@ func (s *Storage) maintain(ctx context.Context) {
 		if s.syncParts(ctx, tid, signalPrefix, true) {
 			// Backfilled parts from a peer (this node just gained the shard): reload them before
 			// flushing so the part sequence advances past the synced parts.
-			_ = refresh()
+			s.refreshOrLog(ctx, "backfill refresh failed", string(s.normalizeTenant(tid))+signalPrefix, refresh)
 		}
 
 		_ = flush()

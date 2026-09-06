@@ -272,17 +272,35 @@ func (s *Storage) partsNotifyHandler() http.Handler {
 			}
 
 			// Mirrored something: load it and trim the head, like the maintenance refresh.
-			if sig == signal.Metric {
-				if eng, ok := s.lookupEngine(tid); ok {
-					_ = eng.RefreshReplica(ctx)
-				}
-			} else if eng, ok := s.lookupRecordEngine(sig, tid); ok {
-				_ = eng.RefreshReplica(ctx)
-			}
+			s.refreshOrLog(ctx, "replica refresh after notify failed", prefix,
+				func() error {
+					if sig == signal.Metric {
+						if eng, ok := s.lookupEngine(tid); ok {
+							return eng.RefreshReplica(ctx)
+						}
+
+						return nil
+					}
+
+					if eng, ok := s.lookupRecordEngine(sig, tid); ok {
+						return eng.RefreshReplica(ctx)
+					}
+
+					return nil
+				})
 		}()
 
 		w.WriteHeader(http.StatusAccepted)
 	})
+}
+
+// refreshOrLog runs a replica refresh whose failure the caller cannot act on: a part that stays gone
+// is already a want the engine counts ([engine.Stats.WantedParts]), so the log is the only trace a
+// failure of any other kind leaves.
+func (s *Storage) refreshOrLog(ctx context.Context, msg, enginePrefix string, refresh func() error) {
+	if err := refresh(); err != nil {
+		s.obs.Logger(ctx).Error(msg, zap.String("prefix", enginePrefix), zap.Error(err))
+	}
 }
 
 // notifyPeers tells the shard's secondary owners that this node just flushed/merged the engine

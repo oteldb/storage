@@ -350,8 +350,10 @@ before it returns: one listing of the *local* prefix against the peer's key set 
 last pass, and only when an object is gone does the pass go on to the ordinary mirror — one peer
 listing plus the missing objects — and log the loss. The first pass of a process has no last pass to
 compare with and runs the mirror once, so a restart that finds objects gone recovers them before
-`RefreshReplica` opens the parts (which, in replica mode, fails rather than records a want for a part
-it cannot open). Steady state stays index-only: one index read per peer per pass and no listing. The
+`RefreshReplica` opens the parts. A part the mirror could not bring back — no owner holds it either —
+leaves the replica's part set as a pending want (`engine/ARCH.md`), so reads over it disclaim
+instead of the engine going on serving a handle to objects that are not there. Steady state stays
+index-only: one index read per peer per pass and no listing. The
 owner's strict pass is exempt — its losses are the engine's want path, and mirroring a replica's
 objects onto an owner would resurrect every part the owner had just merged away. The reconcile
 changes when a pass runs, not what it may delete: it takes the non-superseding path, so the

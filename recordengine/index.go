@@ -381,8 +381,9 @@ func (e *Engine) LoadPartsUnclaimed(ctx context.Context) error {
 type loadMode uint8
 
 const (
-	// loadReplica fails on such a part: a replica reconciles through the owner's copy and records
-	// nothing of its own.
+	// loadReplica keeps the part as a pending want and sweeps nothing: a replica shares the prefix
+	// with the owner, whose in-flight (not yet committed) part must not be deleted underneath it.
+	// The want reaches an index only through the first commit this engine makes as a writer.
 	loadReplica loadMode = iota
 	// loadUnclaimed sweeps orphans and keeps the part as a pending want for the engine's first
 	// commit, which only an owner makes.
@@ -391,9 +392,7 @@ const (
 	loadOwner
 )
 
-// loadPartsLocked is [Engine.LoadParts] under a [loadMode]. Only an owner sweeps: a replica shares
-// the prefix with the owner, whose in-flight (not yet committed) part must not be deleted underneath
-// it. Caller holds e.mu.
+// loadPartsLocked is [Engine.LoadParts] under a [loadMode]. Caller holds e.mu.
 func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 	sweep := mode != loadReplica
 
@@ -434,7 +433,7 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 
 		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, ent.Prefix)
 		if err != nil {
-			if !sweep || !partGone(err) {
+			if !partGone(err) {
 				return errors.Wrapf(err, "open part %q", ent.Prefix)
 			}
 
@@ -517,7 +516,10 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 
 // RefreshReplica brings a replica node's view up to date with the shared object store: it
 // reconstructs the flushed parts and trims its head to the still-unflushed window, stream by stream
-// (see [head.trimBelowCovered]). With no shared store, a safe no-op.
+// (see [head.trimBelowCovered]). With no shared store, a safe no-op. A part the index names but the
+// store lacks is not an error: it leaves the part set and is counted as a pending want
+// ([Stats.WantedParts], [Engine.WantOverlaps]) until a refresh finds it again or this node commits
+// as an owner.
 func (e *Engine) RefreshReplica(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()

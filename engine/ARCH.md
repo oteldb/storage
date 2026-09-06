@@ -279,13 +279,17 @@ Two consequences fall out of the entry no longer being there:
   surviving objects. They are the remains of a part repair is owed, not the residue of a failed
   flush, and deleting them destroys the evidence before repair can see it.
 
-Only an owner does this — the replica path (`RefreshReplica`, no sweep) still fails, because
-recording a want is committing an index, which is the owner's to write. A cluster node recovering
-holds no claim yet, so it loads through `LoadPartsUnclaimed`: the sweep runs, but a gone part is a
-*pending* want — counted, disclaimed over, protected from the sweep — that the engine's first commit
-as a writer records, which only an owner ever makes. Committing it at recovery would let a replica
-publish a want at a generation above the owner's; a strict backfill then installs that index on the
-owner and a part the owner holds intact reads as lost.
+Only an owner commits it, because recording a want is committing an index, which is the owner's to
+write. Every other load still drops the gone part and keeps it as a *pending* want — counted,
+disclaimed over, protected from the sweep — that the engine's first commit as a writer records, which
+only an owner ever makes. A cluster node recovering holds no claim yet, so it loads through
+`LoadPartsUnclaimed`: the sweep runs, the want stays pending. A replica's `RefreshReplica` does the
+same without the sweep; failing the refresh instead would leave the engine serving the handles of the
+previous load, a part set that says a part is present while nothing under its prefix can be read, and
+the object-level mirror (`cluster/ARCH.md`) is what brings the objects back so the next refresh
+clears the want. Committing at recovery or on a replica would let a non-owner publish a want at a
+generation above the owner's; a strict backfill then installs that index on the owner and a part the
+owner holds intact reads as lost.
 
 ## Disk pressure closes the ingest path
 
