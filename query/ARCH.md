@@ -107,6 +107,21 @@ The library implements **no** query language. This package bridges the fetch sea
   the content-addressed id, so a `Queryable` memoizes it per id.
 - **Zero-copy samples.** Series iterators read the batch's slices directly (ns→ms on the fly), no
   per-sample copy or interface boxing; Select sets `Recycle` and `querier.Close` releases.
+- **Sampling weights are carried and announced, never applied.** A `chunkenc.Iterator` is a plain
+  sample stream with no weight channel, and `ScaleFactors` is a *row* weight whose meaning depends
+  on the operator: `count_over_time`, `sum_over_time` and anything treating a point as an event
+  want it; an instant read, `min`/`max`, and `rate`/`increase` over a cumulative counter (first/last
+  point — sampling costs resolution, not mass) are exact without it. Folding the weight into the
+  value would scale gauges and cumulative counters (a `rate` N× too high); emitting a kept sample N
+  times fabricates points at a duplicate timestamp and breaks `changes`/`resets`/`deriv`; refusing
+  sampled series turns an overload-degradation mechanism into a query outage for the majority of
+  queries that are unbiased. So the adapter serves rows as stored, attaches **`SampledWarning`**
+  (a `PromQLWarning` the engine propagates to the result's warnings) when any returned series has a
+  weight above 1 — weights are `ceil(observed/budget) ≥ 1`, so a 0 or 1 carries no information and
+  is never multiplied in — and exposes the weights on every series via **`WeightedSeries`**, in
+  iterator order, for an embedder's weight-aware operator. Unbiased per-sample counts/sums over a
+  sampled tenant belong to a consumer that reads the weight — this adapter or the fetch seam
+  directly — not to the Prometheus engine.
 - `PushableMatchers`/`MatchesAll`/`PromLabels` are exported as the single source of truth for the
   Prom↔storage projection, so an embedder building its own pushdown reuses them.
 

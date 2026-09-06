@@ -185,6 +185,8 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.Select
 	slab := make([]batchSeries, len(batches))
 	series := make([]storage.Series, 0, len(batches))
 
+	var warnings annotations.Annotations
+
 	for _, b := range batches {
 		lset, ok := q.labels.get(b.ID)
 		if !ok {
@@ -200,15 +202,19 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.Select
 
 		q.held = append(q.held, b) // keep alive until Close; the series aliases its buffers
 		bs := &slab[len(series)]
-		*bs = batchSeries{labels: lset, ts: b.Timestamps, vs: b.Values}
+		*bs = batchSeries{labels: lset, ts: b.Timestamps, vs: b.Values, sf: b.ScaleFactors}
 		series = append(series, bs)
+
+		if warnings == nil && sampled(b.ScaleFactors) {
+			warnings = annotations.New().Add(SampledWarning)
+		}
 	}
 
 	if sortSeries {
 		sort.Slice(series, func(i, j int) bool { return labels.Compare(series[i].Labels(), series[j].Labels()) < 0 })
 	}
 
-	return newSliceSeriesSet(series)
+	return newSliceSeriesSet(series, warnings)
 }
 
 // CountSeries returns the number of series matching matchers with at least one sample in
@@ -683,9 +689,11 @@ type batchSeries struct {
 	labels labels.Labels
 	ts     []int64
 	vs     []float64
+	sf     []float64
 }
 
-func (s *batchSeries) Labels() labels.Labels { return s.labels }
+func (s *batchSeries) Labels() labels.Labels   { return s.labels }
+func (s *batchSeries) ScaleFactors() []float64 { return s.sf }
 
 func (s *batchSeries) Iterator(it chunkenc.Iterator) chunkenc.Iterator {
 	if r, ok := it.(*batchSeriesIterator); ok { // reuse the engine's recycled iterator
@@ -754,12 +762,13 @@ func (it *batchSeriesIterator) reset(ts []int64, vs []float64) {
 
 // sliceSeriesSet is a storage.SeriesSet over a fixed slice of series.
 type sliceSeriesSet struct {
-	series []storage.Series
-	i      int
+	series   []storage.Series
+	warnings annotations.Annotations
+	i        int
 }
 
-func newSliceSeriesSet(series []storage.Series) *sliceSeriesSet {
-	return &sliceSeriesSet{series: series, i: -1}
+func newSliceSeriesSet(series []storage.Series, warnings annotations.Annotations) *sliceSeriesSet {
+	return &sliceSeriesSet{series: series, warnings: warnings, i: -1}
 }
 
 func (s *sliceSeriesSet) Next() bool {
@@ -770,4 +779,4 @@ func (s *sliceSeriesSet) Next() bool {
 
 func (s *sliceSeriesSet) At() storage.Series                { return s.series[s.i] }
 func (s *sliceSeriesSet) Err() error                        { return nil }
-func (s *sliceSeriesSet) Warnings() annotations.Annotations { return nil }
+func (s *sliceSeriesSet) Warnings() annotations.Annotations { return s.warnings }
