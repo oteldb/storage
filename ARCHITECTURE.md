@@ -6,7 +6,7 @@
 > package/layer, new public type, new or changed on-disk/wire format, a moved layer
 > boundary, a new cross-cutting invariant) updates this file *or* the relevant `ARCH.md` in
 > the same change. Keep it brief — anything derivable from the source belongs in the source,
-> not here. Roadmap and speculation live in `DESIGN.md`/`PROMPT.md`, not here.
+> not here — and neither does roadmap or speculation: this file describes the system as built.
 
 `github.com/oteldb/storage` is a low-level, OpenTelemetry-centric columnar storage
 **library** (Go 1.26). No `main`, server, or CLI: an embedder (primarily `go-faster/oteldb`)
@@ -215,7 +215,10 @@ fails the read (`cluster.Disclaims`).
 - **Injected, no-op-default observability** (above).
 - **Stable formats.** Golden-tested and version-guarded: the `Codec` enum and per-codec framing,
   part manifest (`OTPM`) / marks (`OTMK`) / column object framing and key layout, the attribute
-  hash+binary encoding (the SeriesID pre-image), symbol table (`OTSY`), WAL record framing
+  hash+binary encoding (the SeriesID pre-image), symbol table (`OTSY`), the bucket index (format
+  v6: entries with their block sets and split claims, tombstones, wants, per-writer flush
+  watermarks and the block high-water mark — readable back to v1, not writable by older
+  nodes), WAL record framing
   (additive record types), record-key footer (`OTKY`), the metric part column layout
   (`[series:int128, ts:int64, value:float64]` + optional `sf:float64`), and the profile
   symbol-store sidecar (`OTSP`). Changing one is an architectural change.
@@ -249,7 +252,7 @@ wal/                  segmented CRC-framed WAL
 engine/               metrics vertical
 recordengine/         shared record engine (logs/traces/profiles)
 query/{fetch,scale,profile,promql}           read seam · scale-out decorators · EXPLAIN ANALYZE · Prom adapter
-cluster/{,ring,etcd,replica,rebalance,partsync,ec}   L0 distribution
-internal/{obs,retry,simd,parallel,partid,diskguard,vfs,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids · disk-pressure guard · filesystem seam + crash model (validated against ext4 on dm-flakey by `internal/vfs/crashmodel`, `-tags crashmodel`)
+cluster/{,ring,etcd,replica,rebalance,partsync,ec,router}   L0 distribution
+internal/{obs,retry,simd,parallel,partid,diskguard,vfs,memlimit,memsize,reproduce,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids · disk-pressure guard · heap accounting · gated defect reproducers · filesystem seam + crash model (validated against ext4 on dm-flakey by `internal/vfs/crashmodel`, `-tags crashmodel`)
 reliability/          public RetryConfig presets
 ```

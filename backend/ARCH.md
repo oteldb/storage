@@ -10,8 +10,7 @@ insert (memory), exclusive `os.Link` (file), `If-None-Match: *` (s3). `CompareAn
 *existing* one only if it still holds the `backend.Version` the committer read, which is the case
 an absent-key claim cannot express: a shared store where every replica of a shard rewrites one
 index object under one prefix, and an unconditional `Write` silently drops whichever entry lost
-(#392 — the part objects stay durable, unreferenced, and the next open-time orphan sweep deletes
-them).
+(the part objects stay durable, unreferenced, and the next open-time orphan sweep deletes them).
 
 ### The version token
 
@@ -148,7 +147,7 @@ a demonstration.
   **The set is the statement of what a merge consumed**, and that is why it is not a hull. A merge
   of the parts on either side of a lost one covers `{1,3}`; a hull `[1,3]` would additionally claim
   block 2, and supersession would then discharge the want for a part whose rows it holds none of —
-  silently, with no hole and no counter moving (#559). `Interval` is stored as its bounds plus the
+  silently, with no hole and no counter moving. `Interval` is stored as its bounds plus the
   runs it skips (`Gaps`), so the ordinary contiguous part costs the same three bytes it always did
   and the gap list is the exception. Only the canonical form is valid: a denormalized gap list is
   rejected by `Decode` rather than normalized, since two encodings of one set would break both
@@ -165,7 +164,7 @@ a demonstration.
   run. The claim is **realized only where every member of `Group` is present**, at which point those
   blocks count as covered as if one part held them — `Index.Covered`, which `Satisfying`,
   `Discharging` and `Subsumed` all consult. A merge that consumes a whole group folds the claim back
-  into an ordinary interval, so the lineage rejoins rather than staying severed forever (#548).
+  into an ordinary interval, so the lineage rejoins rather than staying severed forever.
   A group answer is deliberately *partial*: `Satisfying` names one member, and `Index.Missing`
   names the members a repair still has to fetch, by block.
   **Allocation is the shard owner's alone**: `Index.NextBlock` is one above `AllocatedBlocks`, the
@@ -174,7 +173,7 @@ a demonstration.
   current contents: the live set shrinks — retention can empty a shard outright, leaving tombstones
   that carry no blocks — and numbering derived from it would rewind and hand a new part the identity
   an expired one held, at which point a stale peer's old part satisfies a want for the new one and
-  expired data is committed as a repair (#542). Numbers are claimed by the same `CompareAndSwap`
+  expired data is committed as a repair. Numbers are claimed by the same `CompareAndSwap`
   that adds the part; a writer rebasing on a rival's index takes the maximum of the two marks — see
   `engine/ARCH.md`, "Block identity is allocated by the commit that publishes the part". No etcd, no
   round trip on the flush path, and it works with the cluster layer absent. Two owners racing a

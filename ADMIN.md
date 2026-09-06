@@ -26,11 +26,11 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
   owned shards, and the last enacted rebalance plan (`LastRebalance`: each changed shard's full
   owner-set diff at its per-tenant replication factor — the replicas that must backfill, not just
   the compaction-primary move). `PrivateBackend` echoes the configured
-  `cluster.Config.PrivateBackend`. There is no standing diagnostic for the mismatch it used to
-  carry: a node-private backend (`backend.NodeLocal`) with `PrivateBackend` unset now fails `Open`
-  outright, since no flushed part would replicate and a shard gained in a rebalance — or a restarted
-  replica — would answer reads missing whatever only its peers hold, indistinguishable from real
-  absence. With a private (per-node) backend
+  `cluster.Config.PrivateBackend`. The mismatch needs no diagnostic: a node-private backend
+  (`backend.NodeLocal`) with `PrivateBackend` unset fails `Open` outright, since no flushed part
+  would replicate and a shard gained in a rebalance — or a restarted replica — would answer reads
+  missing whatever only its peers hold, indistinguishable from real absence. With a private
+  (per-node) backend
   (`cluster.Config.PrivateBackend`), `Cluster.PartSync` additionally reports the shared-nothing
   part-mirroring activity (nil otherwise): cumulative `Passes` (every sync attempt — the
   "is the sync loop running?" probe), `Mirrored` (passes that installed a newer peer copy),
@@ -339,8 +339,8 @@ interval for a shard that is plainly its own. Single-node owns everything.
 ## Ranged column reads (`backend.ReaderAt`)
 
 A part stores one object per column. Without ranged reads, touching any block of a column transfers
-the whole column, so **read cost was independent of selectivity** and part size bounded process
-memory rather than disk: a selector matching 16 of 210k series still paid for all 210k.
+the whole column, so **read cost is independent of selectivity** and part size bounds process memory
+rather than disk: a selector matching 16 of 210k series pays for all 210k.
 
 `file` and `s3` read ranges natively (`pread`, the `Range` header); `Memory` copies the range. The
 block-sliced query path opens a column with `PartReader.ColumnBlocks`, which reads the column's
@@ -362,5 +362,4 @@ Two things an operator should know:
 optional `Sizer` capability (`Size(ctx, key) (int64, error)`) does. Use `backend.SizeOf(ctx, b, key)`:
 it takes the `Sizer` fast path when available and falls back to a full `Read` otherwise. Memory and
 file backends implement `Size` cheaply (in-RAM length / `os.Stat`); the cache and instrumentation
-wrappers delegate; s3 currently uses the Read fallback (a future optimization can add a `HeadObject`
-size path).
+wrappers delegate; s3 uses the `Read` fallback.

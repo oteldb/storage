@@ -121,7 +121,7 @@ number over another node's is data loss in one direction and duplicate replay in
 that loses the conditional write rebases — it carries the winner's entries forward so its retry
 does not drop them — and it opens them, identities included, in the same step. Publishing an index
 that names a part this engine will not answer for is a query silently missing rows until the next
-`LoadParts` (#398).
+`LoadParts`.
 
 They are held apart from `parts`, in `foreignParts`, because the two sets differ in *ownership*, not
 in readability: an adopted part is not this engine's to merge, remove or delete, and counting it as
@@ -243,8 +243,8 @@ yet.
 
 ## A part the owner cannot read becomes a want, not a removal
 
-`LoadParts` used to fail the whole engine on the first part it could not open, which turns one lost
-part into a node that will not start. It now drops that part from `Entries` and records a
+A part `LoadParts` cannot open must not fail the whole engine — that turns one lost part into a node
+that will not start. It drops the part from `Entries` and records a
 `bucketindex.Want` naming it (`backend/ARCH.md`, "`Entries → Removed | Wanted`"), in **one**
 compare-and-swap: the drop and the obligation are the same commit, so no crash can land the drop
 without the want and a lost race leaves neither — the retry re-reads and re-derives both from the
@@ -519,8 +519,8 @@ the routine compaction tick.
 
 A merge retires its sources only after the bucket index naming their replacement is committed. The
 index is what a restart and every replica read, so a part it still names must never become reclaimable:
-retiring first would let the next reclaim delete referenced objects, and `LoadParts` hard-fails the
-engine on a missing part. A failed commit rolls the in-memory swap back, so the uncommitted output is
+retiring first would let the next reclaim delete referenced objects, and every later load would drop
+the part into a want repair can never satisfy. A failed commit rolls the in-memory swap back, so the uncommitted output is
 never observable as published; its objects are orphans, swept at the next open.
 
 ### Repair — a want is discharged by committing a part
@@ -597,8 +597,8 @@ go through the same commit — for the same index bytes, since a want costs what
 One cycle attempts at most `repairFetchesPerCycle` (4) wants with `repairFetchConcurrency` (2)
 copies in flight. A repair fetch copies a whole part, so an unbounded pass on a badly damaged node
 would spend the maintenance cycle in the network and never compact; a shard needing more than a
-handful of parts back is past what part-by-part repair is for. The *serving* side is where the real
-budget belongs (see `cluster/ARCH.md`), and is not built yet.
+handful of parts back is past what part-by-part repair is for. The *serving* side, where the real
+budget belongs (see `cluster/ARCH.md`), is uncapped.
 
 ### An unrepairable want becomes a revocable hole
 

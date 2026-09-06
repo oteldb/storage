@@ -11,8 +11,9 @@ series differing only in resource or scope stay distinct.
 
 `SeriesID` is a **128-bit** xxh3 over a canonical, type-tagged, length-delimited pre-image (maps
 hash order-independently, arrays keep order, `int 5`/`"5"`/`5.0`/empty are distinct). 128 bits
-because content addressing has no allocator to resolve a collision. `AppendValue`/`DecodeSeries`
-are the reversible binary codec (WAL + interning). Signal-specific identity (metric name/unit/
+because content addressing has no allocator to resolve a collision.
+`Series.AppendHashInput`/`DecodeSeries` — and `AppendValue`/`DecodeValue` for a single value — are
+the reversible binary codec (WAL + interning). Signal-specific identity (metric name/unit/
 temporality, profile type) folds into the pre-image as reserved labels at the signal layer.
 
 ## `symbols`
@@ -50,8 +51,9 @@ it is zero-alloc and **type-preserving** (the value id comes from the value's ty
 
 The **on-disk** form of a part's identity set — the `{part}/identity` object — encoded against a
 symbol table private to the object (measured ~3.8× smaller than repeating the label bytes per
-series; ~40 B/series on a churn-shaped set). Sections are addressed by a trailing TOC whose own
-offset is the last fixed-width field, so a section can be fetched by byte range without reading the
+series; ~40 B/series on a churn-shaped set). Sections are addressed by a trailing TOC located from a
+fixed 8-byte trailer — its offset plus the TOC's own CRC32C — so a section can be fetched by byte
+range without reading the
 object and a new section kind (the postings and offset tables a per-part *index* would need) can be
 added without breaking a reader. Deliberately uncompressed: interning already removes the repetition
 a compressor would find, and a compressed body would defeat that range-addressability.
@@ -74,9 +76,9 @@ map-slot padding — measured ~10 % under the heap delta at 200k series.
 ## `bloom`
 
 Token bloom filter (bit array, k xxh3-128 double-hash probes, versioned + CRC'd, **no false
-negatives**), one per bloom-bearing record column. Modes: `FullText` (tokenized value),
-`Attrs` (key-scoped `key‖value` and `key‖word` tokens), `Equality` (verbatim values — the
-trace-by-id path).
+negatives**), one per bloom-bearing record column. The mode comes from the record schema
+(`recordengine.BloomFullText`, tokenized value; `BloomAttrs`, key-scoped `key‖value` and `key‖word`
+tokens; `BloomEquality`, verbatim values — the trace-by-id path).
 
 Sizing is by **distinct** tokens, not occurrences (occurrences inflate the filter by the column's
 repetition factor): a filter that would be small anyway keeps the cheap occurrence count, a larger
