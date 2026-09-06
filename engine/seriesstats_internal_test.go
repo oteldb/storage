@@ -26,8 +26,8 @@ func TestComputeAndRoundTripSeriesStats(t *testing.T) {
 	got, err := decodeSeriesStats(enc)
 	require.NoError(t, err)
 
-	assert.Equal(t, SeriesAgg{Count: 3, Sum: 36, Min: 6, Max: 20}, got[signal.SeriesID{Lo: 1}])
-	assert.Equal(t, SeriesAgg{Count: 1, Sum: 5, Min: 5, Max: 5}, got[signal.SeriesID{Lo: 2}])
+	assert.Equal(t, SeriesAgg{Count: 3, Rows: 3, Sum: 36, Min: 6, Max: 20}, got[signal.SeriesID{Lo: 1}])
+	assert.Equal(t, SeriesAgg{Count: 1, Rows: 1, Sum: 5, Min: 5, Max: 5}, got[signal.SeriesID{Lo: 2}])
 }
 
 func TestDecodeSeriesStatsRejectsCorruption(t *testing.T) {
@@ -45,10 +45,11 @@ func TestDecodeSeriesStatsRejectsCorruption(t *testing.T) {
 func TestSeriesAggMerge(t *testing.T) {
 	t.Parallel()
 
-	a := SeriesAgg{Count: 2, Sum: 30, Min: 10, Max: 20}
-	a.merge(SeriesAgg{Count: 1, Sum: 5, Min: 5, Max: 5})
-	assert.Equal(t, SeriesAgg{Count: 3, Sum: 35, Min: 5, Max: 20}, a)
+	a := SeriesAgg{Count: 2, Rows: 2, Sum: 30, Min: 10, Max: 20}
+	a.merge(SeriesAgg{Count: 1, Rows: 1, Sum: 5, Min: 5, Max: 5})
+	assert.Equal(t, SeriesAgg{Count: 3, Rows: 3, Sum: 35, Min: 5, Max: 20}, a)
 
 	a.merge(SeriesAgg{}) // empty is a no-op
-	assert.Equal(t, int64(3), a.Count)
+	assert.InDelta(t, 3, a.Count, 0)
+	assert.Equal(t, int64(3), a.Rows)
 }

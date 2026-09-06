@@ -277,6 +277,12 @@ are deliberately **separate paths** rather than one widened request: a peer that
 answers 404, which fails over, instead of silently returning disjoint buckets for an overlapping
 question.
 
+An aggregate's count crosses the wire as a **float**, with the unweighted row count beside it as a
+varint: a shard's aggregate is weighted by lossy sampling (see `engine/ARCH.md`), so shipping the
+count as an integer would round a sampled tenant's answer on every hop. The aggregate RPCs carry no
+version, so peers must run the same build — a mixed-version fan-out reads the fields at the wrong
+offsets and fails the frame's length checks rather than answering.
+
 **Every RPC decoder rejects a length prefix larger than the bytes that could back it**, on both
 sides of the wire: a request decoder runs on the node being asked, a response decoder on the node
 that asked, so an unclamped `make` from a peer's count is a remote process kill in either direction.

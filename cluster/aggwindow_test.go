@@ -55,11 +55,11 @@ func TestWindowAggregatesCodec(t *testing.T) {
 
 	in := []engine.NamedWindowAgg{
 		{Series: aggSeries("api"), Windows: []engine.WindowAgg{
-			{End: 60, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 5, Min: 1, Max: 4}},
-			{End: 120, SeriesAgg: engine.SeriesAgg{Count: 3, Sum: 14, Min: 1, Max: 9}},
+			{End: 60, SeriesAgg: engine.SeriesAgg{Count: 2, Rows: 2, Sum: 5, Min: 1, Max: 4}},
+			{End: 120, SeriesAgg: engine.SeriesAgg{Count: 3, Rows: 3, Sum: 14, Min: 1, Max: 9}},
 		}},
 		{Series: aggSeries("web"), Windows: []engine.WindowAgg{
-			{End: 60, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 3, Min: 3, Max: 3}},
+			{End: 60, SeriesAgg: engine.SeriesAgg{Count: 1, Rows: 1, Sum: 3, Min: 3, Max: 3}},
 		}},
 	}
 
@@ -85,7 +85,7 @@ func TestRemoteAggregatorWindowOverHTTP(t *testing.T) {
 	t.Parallel()
 
 	want := []engine.NamedWindowAgg{{Series: aggSeries("api"), Windows: []engine.WindowAgg{
-		{End: 60, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 5, Min: 1, Max: 4}},
+		{End: 60, SeriesAgg: engine.SeriesAgg{Count: 2, Rows: 2, Sum: 5, Min: 1, Max: 4}},
 	}}}
 
 	var (

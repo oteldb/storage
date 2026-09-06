@@ -725,7 +725,7 @@ func (s *Storage) AggregateMetricsNamed(ctx context.Context, t signal.TenantID, 
 	out := make([]SeriesAggregate, 0, len(named))
 	for i := range named {
 		na := &named[i]
-		if len(na.Buckets) == 0 { // SeriesAgg.Count == 0; omitted upstream, defended anyway.
+		if len(na.Buckets) == 0 { // SeriesAgg.Rows == 0; omitted upstream, defended anyway.
 			continue
 		}
 

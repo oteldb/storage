@@ -57,7 +57,7 @@ func TestRecentTierAggregateRange(t *testing.T) {
 	require.Len(t, got, 1, "the matched series must aggregate")
 
 	for _, agg := range got {
-		assert.Equal(t, int64(5), agg.Count)
+		assert.InDelta(t, 5, agg.Count, 0)
 		assert.InDelta(t, 1500.0, agg.Sum, 1e-9)
 		assert.InDelta(t, 100.0, agg.Min, 1e-9)
 		assert.InDelta(t, 500.0, agg.Max, 1e-9)
@@ -83,7 +83,7 @@ func TestRecentTierAggregateStep(t *testing.T) {
 
 	for _, buckets := range got {
 		var (
-			count int64
+			count float64
 			sum   float64
 		)
 
@@ -92,7 +92,7 @@ func TestRecentTierAggregateStep(t *testing.T) {
 			sum += b.Sum
 		}
 
-		assert.Equal(t, int64(5), count)
+		assert.InDelta(t, 5, count, 1e-9)
 		assert.InDelta(t, 1500.0, sum, 1e-9)
 	}
 }
@@ -115,14 +115,14 @@ func TestRecentTierAggregateWindow(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 1, "the matched series must produce windows")
 
-	var count int64
+	var count float64
 	for _, windows := range got {
 		for _, w := range windows {
 			count += w.Count
 		}
 	}
 
-	assert.Equal(t, int64(5), count)
+	assert.InDelta(t, 5, count, 1e-9)
 }
 
 // TestRecentTierAggregateMatchesFetch is the invariant behind (a): whatever a raw fetch returns for
@@ -147,14 +147,16 @@ func TestRecentTierAggregateMatchesFetch(t *testing.T) {
 		batches := fetchAll(t, e, r)
 
 		var (
-			wantCount int64
+			wantCount float64
 			wantSum   float64
 		)
 
+		// The weighted fold of what a raw fetch returns — what the aggregate paths must reproduce.
 		for _, b := range batches {
-			for _, v := range b.Values {
-				wantCount++
-				wantSum += v
+			for i, v := range b.Values {
+				w := b.ScaleFactor(i)
+				wantCount += w
+				wantSum += w * v
 			}
 		}
 
@@ -162,7 +164,7 @@ func TestRecentTierAggregateMatchesFetch(t *testing.T) {
 		require.NoError(t, err)
 
 		var (
-			gotCount int64
+			gotCount float64
 			gotSum   float64
 		)
 
@@ -171,14 +173,14 @@ func TestRecentTierAggregateMatchesFetch(t *testing.T) {
 			gotSum += a.Sum
 		}
 
-		assert.Equal(t, wantCount, gotCount, "AggregateRange count matches fetch at start=%d", start)
+		assert.InDelta(t, wantCount, gotCount, 1e-9, "AggregateRange count matches fetch at start=%d", start)
 		assert.InDelta(t, wantSum, gotSum, 1e-9, "AggregateRange sum matches fetch at start=%d", start)
 
 		step, err := e.AggregateStep(ctx, r, 150)
 		require.NoError(t, err)
 
 		var (
-			stepCount int64
+			stepCount float64
 			stepSum   float64
 		)
 
@@ -189,7 +191,7 @@ func TestRecentTierAggregateMatchesFetch(t *testing.T) {
 			}
 		}
 
-		assert.Equal(t, wantCount, stepCount, "AggregateStep count matches fetch at start=%d", start)
+		assert.InDelta(t, wantCount, stepCount, 1e-9, "AggregateStep count matches fetch at start=%d", start)
 		assert.InDelta(t, wantSum, stepSum, 1e-9, "AggregateStep sum matches fetch at start=%d", start)
 	}
 }
@@ -220,7 +222,7 @@ func TestRecentTierDuplicateTimestampNotDoubleCounted(t *testing.T) {
 	require.Len(t, agg, 1)
 
 	for _, a := range agg {
-		assert.Equal(t, int64(1), a.Count)
+		assert.InDelta(t, 1, a.Count, 0)
 		assert.InDelta(t, 5.0, a.Sum, 1e-9)
 	}
 }
@@ -297,6 +299,6 @@ func TestRecentTierResetClearsTier(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, a := range agg {
-		assert.Equal(t, int64(1), a.Count, "aggregate sees only post-Reset samples")
+		assert.InDelta(t, 1, a.Count, 0, "aggregate sees only post-Reset samples")
 	}
 }

@@ -336,11 +336,13 @@ func (w *windower) series(ctx context.Context, e *Engine, plan *enginePlan, id s
 			return nil, err
 		}
 
-		w.ts, w.vals, _ = m.collect(w.ts[:0], w.vals[:0])
+		var sf []float64
+
+		w.ts, w.vals, sf = m.collect(w.ts[:0], w.vals[:0])
 		plan.releaseSeriesPins() // samples copied out; recirculate this series' block pins
 		plan.samplesDecoded += len(w.ts)
 
-		w.ents = sampleEntries(w.ents[:0], w.ts, w.vals)
+		w.ents = sampleEntries(w.ents[:0], w.ts, w.vals, sf)
 	}
 
 	decoded := w.add(&w.decodeDur, started)
@@ -356,7 +358,9 @@ func (w *windower) series(ctx context.Context, e *Engine, plan *enginePlan, id s
 func bucketEntries(dst []windowEnt, fine []BucketAgg, step int64) []windowEnt {
 	for i := range fine {
 		b := &fine[i]
-		dst = append(dst, windowEnt{end: b.Start + step, count: b.Count, sum: b.Sum, min: b.Min, max: b.Max})
+		dst = append(dst, windowEnt{
+			end: b.Start + step, rows: b.Rows, count: b.Count, sum: b.Sum, min: b.Min, max: b.Max,
+		})
 	}
 
 	return dst
@@ -365,10 +369,10 @@ func bucketEntries(dst []windowEnt, fine []BucketAgg, step int64) []windowEnt {
 // sampleEntries rewrites merged raw samples — ascending by timestamp — as accumulator entries, one
 // each. The misaligned fallback: with a window edge free to fall inside a step, only per-sample
 // membership is exact.
-func sampleEntries(dst []windowEnt, ts []int64, vals []float64) []windowEnt {
+func sampleEntries(dst []windowEnt, ts []int64, vals, sf []float64) []windowEnt {
 	for i, t := range ts {
-		v := vals[i]
-		dst = append(dst, windowEnt{end: t, count: 1, sum: v, min: v, max: v})
+		v, w := vals[i], weightAt(sf, i)
+		dst = append(dst, windowEnt{end: t, rows: 1, count: w, sum: w * v, min: v, max: v})
 	}
 
 	return dst

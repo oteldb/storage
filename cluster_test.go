@@ -328,10 +328,10 @@ func TestClusterAggregateWindowGathersAcrossShards(t *testing.T) {
 
 		// Windows at 100..400 over (t-400, t]: the samples accumulate, none has expired by 400.
 		want := []engine.WindowAgg{
-			{End: 100, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 1, Min: 1, Max: 1}},
-			{End: 200, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 3, Min: 1, Max: 2}},
-			{End: 300, SeriesAgg: engine.SeriesAgg{Count: 3, Sum: 6, Min: 1, Max: 3}},
-			{End: 400, SeriesAgg: engine.SeriesAgg{Count: 4, Sum: 10, Min: 1, Max: 4}},
+			{End: 100, SeriesAgg: engine.SeriesAgg{Count: 1, Rows: 1, Sum: 1, Min: 1, Max: 1}},
+			{End: 200, SeriesAgg: engine.SeriesAgg{Count: 2, Rows: 2, Sum: 3, Min: 1, Max: 2}},
+			{End: 300, SeriesAgg: engine.SeriesAgg{Count: 3, Rows: 3, Sum: 6, Min: 1, Max: 3}},
+			{End: 400, SeriesAgg: engine.SeriesAgg{Count: 4, Rows: 4, Sum: 10, Min: 1, Max: 4}},
 		}
 		assert.Equalf(t, want, got[0].Windows, "%s", name)
 	}
