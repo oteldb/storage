@@ -61,6 +61,17 @@ plan (`LastPlan`) for operator preview. In cluster mode the maintenance loop flu
 owned shards**, so a shard's parts are written by exactly one node even during ring-disagreement
 windows — the claim arbitrates.
 
+A claim's identity is the pair **(node id, lease)**, not the id alone. A crashed node's lease
+outlives its process by up to the TTL, so a node restarting under the same ring id — or rejoining
+under a fresh lease before the old one lapses — finds a claim carrying its own id bound to a lease
+that is about to be revoked. Adopting it on the id alone would hand the node a claim etcd deletes
+at that expiry: the shard then has no claim (invisible to the claims-based discovery
+`bootstrapGainedTenants` uses, and free for any peer to acquire) while the node's local `held` set
+still says it owns it, and `Reconcile` never rewrites a shard it believes it holds. `Acquire`
+therefore drops such a key under a value+lease guard and recreates it under the live lease. That
+also makes the restart a real new tenure: the recreated claim takes a higher term, so the
+incarnation's writes outrank the dead one's.
+
 ### Lease fencing — the boundary on acting as primary
 
 A node that stops renewing its lease keeps a ring frozen at its last etcd view, so it goes on
