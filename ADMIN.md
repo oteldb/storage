@@ -286,9 +286,11 @@ column rather than folding the parts' precomputed stats:
   the trade-off note in `engine/ARCH.md` ("Aggregate pushdown"): fewer, larger parts are less likely
   to be contained in a dashboard's window, so a store compacted from 71 parts to 3 can lose pushdown
   eligibility entirely for a 6h query.
-- `overlapping_parts` — `storage.stats_pushdown_parts` sources overlap a predecessor in time (the
-  head/mid-flush samples count as one such source), so a timestamp could be double-counted. A layout
-  property, not a query one; backfill and out-of-order ingest produce it.
+- `overlapping_parts` — `storage.stats_pushdown_parts` sources overlap a predecessor in time, so a
+  timestamp could be double-counted. Each in-memory tier — recent tier, mid-flush buffers, head — is
+  one such source alongside the parts. A layout property, not a query one; backfill and out-of-order
+  ingest produce it, and `Config.RecentWindow` does whenever a query reaches back past the tier
+  (the tier mirrors samples that also live in a part).
 
 **EXPLAIN ANALYZE** (`query/profile`): `profile.WithCollector(ctx)` opts a single query into a
 per-operator timing tree; distributed reads graft each peer's subtree under a `remote {addr}` node.

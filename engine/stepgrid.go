@@ -221,7 +221,7 @@ func planDataSpan(plan *enginePlan) (lo, hi int64, ok bool) {
 		lo, hi = min(lo, p.minTime), max(hi, p.maxTime)
 	}
 
-	if hlo, hhi, has := planHeadSpan(plan); has {
+	if hlo, hhi, has := planMemSpan(plan); has {
 		if !ok {
 			lo, hi, ok = hlo, hhi, true
 		} else {

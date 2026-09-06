@@ -777,19 +777,42 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 		d.mergeSeriesInto(rng, &m, p.start, p.end)
 	}
 
-	if fb := p.flushB[id]; fb != nil {
-		m.add(fb.Timestamps, fb.Values, fb.ScaleFactors, p.start, p.end)
-	}
+	for _, b := range p.memBatches(id) {
+		if b == nil {
+			continue
+		}
 
-	if rb := p.recentB[id]; rb != nil {
-		m.add(rb.Timestamps, rb.Values, rb.ScaleFactors, p.start, p.end)
-	}
-
-	if hb := p.headB[id]; hb != nil {
-		m.add(hb.Timestamps, hb.Values, hb.ScaleFactors, p.start, p.end)
+		m.add(b.Timestamps, b.Values, b.ScaleFactors, p.start, p.end)
 	}
 
 	return m, nil
+}
+
+// memSources are the plan's in-memory sample maps, oldest source first: the recent tier (already
+// flushed), the mid-flush detached buffers, then the head. Every path that reads the in-memory
+// tiers — the merge, the aggregate folds, the pushdown-safety and grid-sizing spans — enumerates
+// them through this one accessor, so a new tier cannot be visible to some read paths and not
+// others (the recent tier was invisible to every aggregate path, issue #471).
+//
+// The tier and the mid-flush buffers hold disjoint samples: a flush populates the tier from its
+// detached buffers and clears e.flushing in the same critical section, so no sample is ever in
+// both. The tier does duplicate samples that also live in a part; the merge dedups by timestamp,
+// and [aggPushdownCheck] sees the resulting source overlap and takes the merging path.
+func (p *enginePlan) memSources() [3]map[signal.SeriesID]*fetch.Batch {
+	return [3]map[signal.SeriesID]*fetch.Batch{p.recentB, p.flushB, p.headB}
+}
+
+// memBatches returns id's in-memory batches in [enginePlan.memSources] order; an entry is nil when
+// that source holds no in-window sample for id. It returns an array, not a slice, to stay
+// allocation-free on the per-series merge path.
+func (p *enginePlan) memBatches(id signal.SeriesID) [3]*fetch.Batch {
+	var out [3]*fetch.Batch
+
+	for i, m := range p.memSources() {
+		out[i] = m[id]
+	}
+
+	return out
 }
 
 // releaseParts releases the fetch's hold on its acquired parts, letting a retired part be reclaimed.
@@ -946,17 +969,14 @@ func (p *enginePlan) releaseParts() {
 		part.release()
 	}
 
-	// Recycle the per-series head/flush window buffers drawn by winBuffers. The merge has likewise
+	// Recycle the per-series in-memory window buffers drawn by winBuffers. The merge has likewise
 	// copied their samples out, so the backing ts/value slices are dead — returning them to the
-	// engine pool is what stops the head fetch path re-allocating a pair per series each fetch.
-	for _, b := range p.headB {
-		p.engine.putI64(b.Timestamps)
-		p.engine.putF64(b.Values)
-	}
-
-	for _, b := range p.flushB {
-		p.engine.putI64(b.Timestamps)
-		p.engine.putF64(b.Values)
+	// engine pool is what stops the in-memory fetch path re-allocating a pair per series each fetch.
+	for _, m := range p.memSources() {
+		for _, b := range m {
+			p.engine.putI64(b.Timestamps)
+			p.engine.putF64(b.Values)
+		}
 	}
 
 	// The plan maps are dead now: the returned batches copied out their identity and samples. Clear
@@ -1265,6 +1285,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 	e.head = newHead()
 	e.flushing = nil        // discarded with the head: Reset drops the samples, it does not flush them
 	e.identityDirty = false // nothing is left to prune
+	e.clearRecent()         // else pre-Reset samples resurface on the next read
 
 	if e.cfg.Backend == nil {
 		e.parts, e.retiring = nil, nil

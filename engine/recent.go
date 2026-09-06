@@ -43,12 +43,7 @@ func (e *Engine) populateRecent(detached map[signal.SeriesID]*sampleBuf) {
 				continue
 			}
 
-			var sf float64
-			if buf.sf != nil {
-				sf = buf.sf[i]
-			}
-
-			rbuf.appendSample(buf.ts[i], buf.values[i], sf)
+			rbuf.appendSample(buf.ts[i], buf.values[i], bufSF(buf, i))
 		}
 	}
 
@@ -120,3 +115,14 @@ func trimBufBelow(rbuf *sampleBuf, cutoff int64) (ts []int64, vals, sf []float64
 
 // recentEnabled reports whether the recent tier is configured on.
 func (e *Engine) recentEnabled() bool { return e.recent != nil }
+
+// clearRecent empties the tier without disabling it. Caller holds e.mu.
+func (e *Engine) clearRecent() {
+	if !e.recentEnabled() {
+		return
+	}
+
+	clear(e.recent)
+
+	e.recentMin = maxInt64
+}
