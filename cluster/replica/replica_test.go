@@ -152,3 +152,98 @@ func TestApplyAppliesLocally(t *testing.T) {
 	require.NoError(t, rp.Apply(context.Background(), []byte("x")))
 	assert.Equal(t, 1, local.count())
 }
+
+// gatedTransport holds the send to gate open until released, the way an in-flight request to a
+// slow peer is still on the wire when the caller has already moved on.
+type gatedTransport struct {
+	*fakeTransport
+
+	gate    string
+	release chan struct{}
+	sendErr chan error
+}
+
+func newGatedTransport(gate string) *gatedTransport {
+	return &gatedTransport{
+		fakeTransport: newFakeTransport(),
+		gate:          gate,
+		release:       make(chan struct{}),
+		sendErr:       make(chan error, 1),
+	}
+}
+
+func (g *gatedTransport) Send(ctx context.Context, addr string, payload []byte) error {
+	if addr != g.gate {
+		return g.fakeTransport.Send(ctx, addr, payload)
+	}
+
+	select {
+	case <-ctx.Done():
+		g.sendErr <- ctx.Err()
+
+		return ctx.Err()
+	case <-g.release:
+	}
+
+	if err := ctx.Err(); err != nil {
+		g.sendErr <- err
+
+		return err
+	}
+
+	err := g.fakeTransport.Send(ctx, addr, payload)
+	g.sendErr <- err
+
+	return err
+}
+
+func TestReplicateStragglerSurvivesRequestCancel(t *testing.T) {
+	t.Parallel()
+
+	tr := newGatedTransport("slow")
+	rp := replica.New("self", tr, (&localApplier{}).apply)
+
+	// The request-scoped context: canceled the moment the primary answers, as an HTTP handler's is.
+	reqCtx, cancel := context.WithCancel(t.Context())
+	require.NoError(t, rp.ReplicateQuorum(reqCtx, targets("fast", "slow"), []byte("w"), 1))
+	cancel()
+
+	close(tr.release)
+
+	require.NoError(t, <-tr.sendErr, "the straggler send must outlive the request context")
+	assert.True(t, tr.got("slow"), "the slow secondary must still receive the acknowledged write")
+}
+
+func TestCloseCancelsStragglers(t *testing.T) {
+	t.Parallel()
+
+	tr := newGatedTransport("slow")
+	rp := replica.New("self", tr, (&localApplier{}).apply)
+
+	reqCtx, cancel := context.WithCancel(t.Context())
+	require.NoError(t, rp.ReplicateQuorum(reqCtx, targets("fast", "slow"), []byte("w"), 1))
+	cancel()
+
+	rp.Close()
+
+	require.ErrorIs(t, <-tr.sendErr, context.Canceled, "Close ends the straggler send")
+	assert.False(t, tr.got("slow"))
+}
+
+func TestReplicateCallerCancelBoundsOnlyTheWait(t *testing.T) {
+	t.Parallel()
+
+	tr := newGatedTransport("slow")
+	rp := replica.New("self", tr, (&localApplier{}).apply)
+
+	reqCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := rp.ReplicateQuorum(reqCtx, targets("slow"), []byte("w"), 1)
+	require.ErrorIs(t, err, context.Canceled)
+
+	close(tr.release)
+
+	require.NoError(t, <-tr.sendErr, "the send itself is not cut by the caller's cancellation")
+	assert.True(t, tr.got("slow"))
+}

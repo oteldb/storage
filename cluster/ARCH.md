@@ -131,6 +131,15 @@ converge. `ReplicateQuorum` takes an explicit ack count (the primary already hol
 copy, so it needs `RF/2` more). The replicator is **decoupled from the ring** — the caller maps
 owners→addresses — so routing and quorum logic test against a fake transport.
 
+The caller's context bounds only the **wait**. Each send runs on a context that keeps the caller's
+values (trace, logger) but not its cancellation, ended by a 10 s send timeout or by the
+replicator's `Close` (called after the node's server has shut down, so no handler is still starting
+sends). On the routed path the caller's context is the HTTP request's, canceled the moment the
+primary answers; a send that rode it would be cut for every secondary slower than the quorum, so a
+merely slow replica would miss nearly every acknowledged write and serve short hedged reads until
+the next flush mirrored the parts. An acknowledged write therefore guarantees quorum durability
+*and* an in-flight, timeout-bounded delivery attempt to every other owner.
+
 ## Write path — primary-authoritative
 
 A write is framed with its tenant + signal byte and routed to the shard's **ring-primary**, the

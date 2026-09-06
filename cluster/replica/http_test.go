@@ -102,3 +102,53 @@ func TestHTTPHandlerRejectsGet(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
 }
+
+// gatedRoundTripper holds requests to one host until released, then forwards them: a peer whose
+// network is slow, not down.
+type gatedRoundTripper struct {
+	next    http.RoundTripper
+	host    string
+	release chan struct{}
+	result  chan error
+}
+
+func (g *gatedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host != g.host {
+		return g.next.RoundTrip(req)
+	}
+
+	select {
+	case <-req.Context().Done():
+		g.result <- req.Context().Err()
+
+		return nil, req.Context().Err()
+	case <-g.release:
+	}
+
+	resp, err := g.next.RoundTrip(req)
+	g.result <- err
+
+	return resp, err
+}
+
+func TestHTTPStragglerSurvivesRequestCancel(t *testing.T) {
+	t.Parallel()
+
+	fast, slow := &node{}, &node{}
+	addrFast, addrSlow := serve(t, fast.apply), serve(t, slow.apply)
+
+	gate := &gatedRoundTripper{
+		next: http.DefaultTransport, host: addrSlow,
+		release: make(chan struct{}), result: make(chan error, 1),
+	}
+	rp := replica.New("local", replica.NewHTTPTransport(&http.Client{Transport: gate}), (&node{}).apply)
+
+	reqCtx, cancel := context.WithCancel(t.Context())
+	require.NoError(t, rp.ReplicateQuorum(reqCtx, targets(addrFast, addrSlow), []byte("p"), 1))
+	cancel()
+
+	close(gate.release)
+
+	require.NoError(t, <-gate.result, "the straggler send must outlive the request context")
+	assert.Equal(t, 1, slow.count(), "the slow secondary must still apply the acknowledged write")
+}
