@@ -684,6 +684,12 @@ absent, corrupt or mismatched marks prune nothing.
 **Recent tier** (`Config.RecentWindow`) — mirrors the most recent flush window in RAM across flushes,
 so a query inside the window acquires no part at all; overlap is deduped by the freshest-wins merge.
 
+The tier is one of three in-memory sample sources — recent tier, mid-flush detached buffers, head —
+and every read path enumerates them through `enginePlan.memSources`, never by naming the maps. That
+is an invariant, not a convenience: a plan inside the tier's window holds *no parts*, so a path that
+enumerates the tiers by hand does not merely miss the tier, it sees nothing at all. The aggregate
+folds, the pushdown-safety spans and the step-grid sizing all read the same accessor as the merge.
+
 **Buffer recycling** (`Request.Recycle` + `Batch.Release`) — default-off. Result buffers come from a
 GC-stable doubly-bounded freelist, not `sync.Pool`, which empties at every GC and lost the capacity
 under allocation-driven collections.
@@ -758,7 +764,10 @@ step-aligned grid. With `Config.AggregateStats` each part writes a small stats s
 (`{prefix}/stats`), and a range **fully covering** a part folds it without decoding the value column.
 
 Taken only when provably exact: in-window parts fully covered *and* pairwise time-disjoint, else it
-falls back to decode+merge, which dedups. Derived, so absent or corrupt means decode. In cluster mode
+falls back to decode+merge, which dedups. Each in-memory source is a span of its own in that
+disjointness test, not one merged span: the recent tier holds already-flushed samples that a
+re-append duplicates into the head, and merging the spans would hide that from the test while the raw
+fetch went on deduping it. Derived, so absent or corrupt means decode. In cluster mode
 it survives the network — each owner aggregates locally and ships per-series identity plus buckets, so
 only aggregates cross the wire.
 
@@ -776,9 +785,9 @@ the compaction wins for every other read. Reporting the reason instead lets an o
 
 **Buckets accumulate in a `stepGrid`,** allocated once per call and reused across every series in it: a
 dense array indexed by arithmetic on the timestamp, so filling costs no hashing and draining no sort of
-aggregate structs. It spans the plan's *data* — parts' ranges ∪ head span, clipped to the request — not
-the request, routinely unbounded on one side. A grid too wide to index densely, a fine step over a long
-span, falls back to a map sized by the samples.
+aggregate structs. It spans the plan's *data* — parts' ranges ∪ the in-memory sources' span, clipped
+to the request — not the request, routinely unbounded on one side. A grid too wide to index densely,
+a fine step over a long span, falls back to a map sized by the samples.
 
 ### Overlapping windows
 

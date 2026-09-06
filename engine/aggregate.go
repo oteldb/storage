@@ -47,8 +47,8 @@ const (
 )
 
 // pushdownDecision is [aggPushdownCheck]'s verdict together with how many sources tripped it: the
-// partially covered parts, or the sources that overlap their predecessor in time (the head/mid-flush
-// samples count as one such source). Zero for "ok" and for a grid that cannot be used at all.
+// partially covered parts, or the sources that overlap their predecessor in time (each in-memory
+// tier is one such source). Zero for "ok" and for a grid that cannot be used at all.
 type pushdownDecision struct {
 	reason pushdownReason
 	parts  int
@@ -266,7 +266,7 @@ func (e *Engine) bucketSeries(
 		}
 	}
 
-	for _, b := range []*fetch.Batch{plan.headB[id], plan.flushB[id]} {
+	for _, b := range plan.memBatches(id) {
 		if b == nil {
 			continue
 		}
@@ -336,19 +336,24 @@ func bucketStart(ts, step int64) int64 {
 	return ts - r
 }
 
+// tsSpan is one aggregate source's [lo, hi] timestamp extent.
+type tsSpan struct{ lo, hi int64 }
+
 // aggPushdownCheck reports whether the plan's parts can be aggregated from their stats sidecars
 // without risking a wrong count/sum: every in-window part must be fully inside [start, end] (else
-// its whole-part stats would include out-of-range samples) and the parts — plus any head/mid-flush
-// samples — must be pairwise time-disjoint (else a timestamp could appear in two sources and be
-// counted twice). When it is not safe, the caller decodes and merges, which dedups by timestamp.
+// its whole-part stats would include out-of-range samples) and every source — each part and each
+// in-memory tier — must be pairwise time-disjoint (else a timestamp could appear in two sources and
+// be counted twice). When it is not safe, the caller decodes and merges, which dedups by timestamp.
+//
+// The in-memory tiers are three separate sources, not one: the recent tier holds already-flushed
+// samples that a re-append can duplicate into the head, and a merged span would hide that from the
+// disjointness test while the raw fetch went on deduping it (issue #471).
 //
 // The two rejections are reported apart because they call for opposite operator responses: partial
 // coverage is a query-window/part-boundary mismatch that compaction into ever larger parts makes
 // *worse*, while overlap is a layout property of the store.
 func aggPushdownCheck(plan *enginePlan) pushdownDecision {
-	type span struct{ lo, hi int64 }
-
-	spans := make([]span, 0, len(plan.liveParts)+1)
+	spans := make([]tsSpan, 0, len(plan.liveParts)+len(plan.memSources()))
 	partial := 0
 
 	for _, p := range plan.liveParts {
@@ -358,19 +363,16 @@ func aggPushdownCheck(plan *enginePlan) pushdownDecision {
 			continue
 		}
 
-		spans = append(spans, span{p.minTime, p.maxTime})
+		spans = append(spans, tsSpan{p.minTime, p.maxTime})
 	}
 
 	if partial > 0 {
 		return pushdownDecision{reason: pushdownPartialCoverage, parts: partial}
 	}
 
-	// The head + mid-flush samples in window form one more span (they are newer, unflushed data).
-	if lo, hi, ok := planHeadSpan(plan); ok {
-		spans = append(spans, span{lo, hi})
-	}
+	spans = planMemSpans(plan, spans)
 
-	slices.SortFunc(spans, func(a, b span) int { return cmp.Compare(a.lo, b.lo) })
+	slices.SortFunc(spans, func(a, b tsSpan) int { return cmp.Compare(a.lo, b.lo) })
 
 	overlapping := 0
 
@@ -387,10 +389,45 @@ func aggPushdownCheck(plan *enginePlan) pushdownDecision {
 	return pushdownDecision{reason: pushdownOK}
 }
 
-// planHeadSpan returns the [min, max] timestamp of the plan's in-window head + mid-flush samples,
-// and whether there are any.
-func planHeadSpan(plan *enginePlan) (lo, hi int64, ok bool) {
-	consider := func(b *fetch.Batch) {
+// planMemSpans appends one span per non-empty in-memory source in [enginePlan.memSources] order.
+//
+// The recent tier duplicates samples that also live in a part, so giving it a span of its own is
+// what makes [aggPushdownCheck] reject a plan holding both: the spans overlap, the fold falls back
+// to the deduping merge, and no sample is counted twice.
+func planMemSpans(plan *enginePlan, dst []tsSpan) []tsSpan {
+	for _, m := range plan.memSources() {
+		if lo, hi, ok := batchMapSpan(m); ok {
+			dst = append(dst, tsSpan{lo, hi})
+		}
+	}
+
+	return dst
+}
+
+// planMemSpan is the union of [planMemSpans] — the whole in-memory contribution, for sizing the
+// step grid (which needs coverage, not disjointness).
+func planMemSpan(plan *enginePlan) (lo, hi int64, ok bool) {
+	for _, m := range plan.memSources() {
+		l, h, has := batchMapSpan(m)
+		if !has {
+			continue
+		}
+
+		if !ok {
+			lo, hi, ok = l, h, true
+
+			continue
+		}
+
+		lo, hi = min(lo, l), max(hi, h)
+	}
+
+	return lo, hi, ok
+}
+
+// batchMapSpan returns the [min, max] timestamp across one in-memory source's batches.
+func batchMapSpan(m map[signal.SeriesID]*fetch.Batch) (lo, hi int64, ok bool) {
+	for _, b := range m {
 		for _, ts := range b.Timestamps {
 			if !ok {
 				lo, hi, ok = ts, ts, true
@@ -398,29 +435,15 @@ func planHeadSpan(plan *enginePlan) (lo, hi int64, ok bool) {
 				continue
 			}
 
-			if ts < lo {
-				lo = ts
-			}
-
-			if ts > hi {
-				hi = ts
-			}
+			lo, hi = min(lo, ts), max(hi, ts)
 		}
-	}
-
-	for _, b := range plan.headB {
-		consider(b)
-	}
-
-	for _, b := range plan.flushB {
-		consider(b)
 	}
 
 	return lo, hi, ok
 }
 
 // aggViaStats folds id's aggregate from each covering part's stats sidecar (decoding only a part
-// whose sidecar is absent — old or sampled), plus the in-window head/mid-flush samples. Used only
+// whose sidecar is absent — old or sampled), plus the in-window in-memory samples. Used only
 // when [aggPushdownSafe] holds, so every contribution is range-exact and disjoint.
 func (e *Engine) aggViaStats(ctx context.Context, plan *enginePlan, id signal.SeriesID) (SeriesAgg, error) {
 	var agg SeriesAgg
@@ -451,12 +474,12 @@ func (e *Engine) aggViaStats(ctx context.Context, plan *enginePlan, id signal.Se
 		plan.samplesDecoded += foldRange(&agg, dp, rng, plan.start, plan.end)
 	}
 
-	if hb := plan.headB[id]; hb != nil {
-		foldBatch(&agg, hb, plan.start, plan.end)
-	}
+	for _, b := range plan.memBatches(id) {
+		if b == nil {
+			continue
+		}
 
-	if fb := plan.flushB[id]; fb != nil {
-		foldBatch(&agg, fb, plan.start, plan.end)
+		foldBatch(&agg, b, plan.start, plan.end)
 	}
 
 	return agg, nil
