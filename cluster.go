@@ -1455,6 +1455,9 @@ func (n *clusterNode) close(ctx context.Context) error {
 		firstErr = err
 	}
 
+	// After the server: no primary-write handler can start a send once Shutdown has returned.
+	n.replicator.Close()
+
 	if err := n.client.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}

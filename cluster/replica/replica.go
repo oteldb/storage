@@ -11,6 +11,8 @@ package replica
 
 import (
 	"context"
+	"sync"
+	"time"
 
 	"github.com/go-faster/errors"
 )
@@ -32,17 +34,34 @@ type Target struct {
 // transport runs for a remote write.
 type ApplyFunc func(ctx context.Context, payload []byte) error
 
+// sendTimeout bounds one send once it is detached from the caller's context, so a peer that
+// hangs does not hold a goroutine until [Replicator.Close].
+const sendTimeout = 10 * time.Second
+
 // Replicator fans writes out to replica targets and enforces write quorum.
 type Replicator struct {
 	self      string // this node's address; a target with this Addr is applied locally
 	transport Transport
 	apply     ApplyFunc
+
+	lifetime context.Context //nolint:containedctx // the replicator's own lifetime, ended by Close; sends outlive their callers
+	stop     context.CancelFunc
+	inflight sync.WaitGroup
 }
 
 // New returns a replicator for the local node at self, using transport for remote sends and
 // apply for local (and, on the receiving side, remote) application.
 func New(self string, transport Transport, apply ApplyFunc) *Replicator {
-	return &Replicator{self: self, transport: transport, apply: apply}
+	lifetime, stop := context.WithCancel(context.Background())
+
+	return &Replicator{self: self, transport: transport, apply: apply, lifetime: lifetime, stop: stop}
+}
+
+// Close cancels every in-flight send and waits for them to return. Replicate must not be called
+// after Close.
+func (r *Replicator) Close() {
+	r.stop()
+	r.inflight.Wait()
 }
 
 // Apply applies a payload locally — the entry point the transport's receiving side calls for
@@ -59,6 +78,10 @@ var ErrNoTargets = errors.New("replica: no targets")
 // returns early with an error once enough targets have failed that quorum is unreachable. The
 // non-quorum targets still receive the write (best-effort) so all replicas converge; only the
 // wait is quorum-bounded.
+//
+// ctx bounds the wait, not the sends: each send carries ctx's values (trace, logger) but not its
+// cancellation, and ends on its own timeout or at [Replicator.Close] — so a straggler is still
+// delivered after the caller has answered its client.
 func (r *Replicator) Replicate(ctx context.Context, targets []Target, payload []byte) error {
 	return r.ReplicateQuorum(ctx, targets, payload, len(targets)/2+1)
 }
@@ -69,18 +92,7 @@ func (r *Replicator) Replicate(ctx context.Context, targets []Target, payload []
 // caller's own copy suffices); a quorum exceeding len(targets) can never be met.
 func (r *Replicator) ReplicateQuorum(ctx context.Context, targets []Target, payload []byte, quorum int) error {
 	if quorum <= 0 {
-		// Fan out best-effort, wait for none (the caller already holds a durable copy).
-		for _, t := range targets {
-			go func(addr string) {
-				if addr == r.self {
-					_ = r.apply(ctx, payload)
-
-					return
-				}
-
-				_ = r.transport.Send(ctx, addr, payload)
-			}(t.Addr)
-		}
+		r.fanOut(ctx, targets, payload, nil)
 
 		return nil
 	}
@@ -90,25 +102,20 @@ func (r *Replicator) ReplicateQuorum(ctx context.Context, targets []Target, payl
 	}
 
 	results := make(chan error, len(targets)) // buffered so stragglers never block
-
-	for _, t := range targets {
-		go func(addr string) {
-			if addr == r.self {
-				results <- r.apply(ctx, payload)
-
-				return
-			}
-
-			results <- r.transport.Send(ctx, addr, payload)
-		}(t.Addr)
-	}
+	r.fanOut(ctx, targets, payload, results)
 
 	var acks, fails int
 
 	var lastErr error
 
 	for range targets {
-		err := <-results
+		var err error
+		select {
+		case err = <-results:
+		case <-ctx.Done():
+			return errors.Wrapf(ctx.Err(), "replica: quorum %d/%d not met (%d acked)", quorum, len(targets), acks)
+		}
+
 		if err == nil {
 			acks++
 			if acks >= quorum {
@@ -127,4 +134,40 @@ func (r *Replicator) ReplicateQuorum(ctx context.Context, targets []Target, payl
 	}
 
 	return errors.Wrapf(lastErr, "replica: quorum %d/%d not met", quorum, len(targets))
+}
+
+// fanOut starts one send per target on a context detached from ctx's cancellation; a nil
+// results channel discards the outcomes.
+func (r *Replicator) fanOut(ctx context.Context, targets []Target, payload []byte, results chan<- error) {
+	for _, t := range targets {
+		r.inflight.Add(1)
+
+		go func(addr string) {
+			defer r.inflight.Done()
+
+			sctx, cancel := r.sendContext(ctx)
+			defer cancel()
+
+			var err error
+			if addr == r.self {
+				err = r.apply(sctx, payload)
+			} else {
+				err = r.transport.Send(sctx, addr, payload)
+			}
+
+			if results != nil {
+				results <- err
+			}
+		}(t.Addr)
+	}
+}
+
+func (r *Replicator) sendContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
+	stop := context.AfterFunc(r.lifetime, cancel)
+
+	return sctx, func() {
+		stop()
+		cancel()
+	}
 }
