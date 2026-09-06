@@ -93,8 +93,9 @@ primitives the engines need:
   so the merge reads blocked parts unchanged.
 
 Block boundaries align with marks granules, so marks already carry each block's time bounds.
-Unblocked columns keep the prior single-stream layout byte-for-byte. Metric parts are blocked by
-default.
+Unblocked columns keep the single-stream layout byte-for-byte. Metric parts are block-framed
+throughout; record parts frame every per-record column too, leaving only the stream-id column
+unframed, which a fetch resolves through the part's row-range index rather than decoding.
 
 **The decode granule is not the compression unit.** A granule is ~1.6 KB of stream — far too little
 context for an entropy coder, which would restart its state every granule. Consecutive granules are
@@ -166,8 +167,8 @@ rather than its uncompressed rows. Output is byte-identical to `PartWriter`'s fr
 tested case-by-case and by fuzz.
 
 `NewStreamWriter` still holds **the whole encoded part**, and `build` then serializes each column's
-frames into one buffer, so its peak is about twice the part it is producing — which made part size a
-memory question rather than a disk one (`blockAccum.finish` therefore allocates at the exact final
+frames into one buffer, so its peak is about twice the part it is producing (`blockAccum.finish`
+therefore allocates at the exact final
 size and releases each frame as it copies it; a growing buffer would hold a second copy of a
 hundreds-of-MiB column).
 
@@ -182,10 +183,6 @@ describes. Two consequences worth stating:
   So a column buffers until the rows prove it non-constant — which is monotone (two differing values
   can never become one) and, for real data, the second row. Constant data is also where buffering
   costs least: a run of one value is what these codecs compress hardest.
-- **`AutoCodec` opens two writers over one key.** Both candidates stream; the denser commits and the
-  loser aborts, so the choice is still made over the whole column rather than a prefix. The backend
-  seam is what makes this affordable — the loser's bytes were never in RAM either.
-
 `StreamWriter.ResidentBytes()` reports the footprint directly, so a caller bounded by memory rather
 than by disk seals on the thing it is actually bounded by (`engine/ARCH.md`).
 
@@ -198,7 +195,9 @@ Two things the batch writer settles by looking at a finished column, a streaming
 
 - **`AutoCodec`** picks between Gorilla and scaled-decimal by trial-encoding. `StreamWriter` runs
   *both* candidates as it streams and keeps the denser at the end, so the choice is still made over
-  the whole column, not a prefix. It compares block-framed sizes where `PartWriter` compares
+  the whole column, not a prefix. The two run as two writers over one key — the denser commits, the
+  loser aborts — which the backend seam makes affordable, the loser's bytes never being in RAM
+  either. It compares block-framed sizes where `PartWriter` compares
   whole-column ones, so the two can pick differently in a marginal case — both lossless, so the part
   decodes the same either way. (It also drops one redundant encode pass the batch path does.)
 - **`OmitConstColumn`** covers a column the format leaves *absent* rather than constant — the
@@ -214,10 +213,10 @@ Two things the batch writer settles by looking at a finished column, a streaming
 Both are right for different callers: the whole-object form when a caller decodes the whole column,
 the ranged form on the query path, where the matched series' rows lie in a handful of granules.
 
-Whole-column reads made read cost independent of selectivity — a selector matching 16 of 210k series
-still transferred every column byte — so **part size bounded process memory rather than disk**. The
-engine already decoded only the granules it needed (`engine/ARCH.md`, the block-sliced fetch); the
-missing piece was purely the ability to fetch a byte range.
+A whole-column read makes cost independent of selectivity — a selector matching 16 of 210k series
+still transfers every column byte — so **part size bounds process memory rather than disk**. The
+engine decodes only the granules it needs (`engine/ARCH.md`, the block-sliced fetch); the ranged form
+is what lets it fetch only those bytes.
 
 - The **directory** is read up front and kept: two integers per frame and one per granule, ~1.4 MB
   for an 833 MB column. Everything else is derived from it.
@@ -275,9 +274,9 @@ Cost: 4 bytes per compression frame (0.006% of a 64 KiB frame), 4 per column dir
 unblocked object. The hashing itself is hardware CRC32C on both paths and did not move any `block/`
 encode or decode benchmark out of the noise.
 
-Detection is only half of #389. Failing *over* to a replica holding a good copy — turning an
-`ErrCorrupt` into `cluster.ErrShardAbsent` the way `cluster_completeness.go` already does for a node
-that cannot answer a window — is not wired up here.
+`block` reports corruption; choosing another copy is not its concern. Turning an `ErrCorrupt` into
+the `cluster.ErrShardAbsent` failover that `cluster_completeness.go` runs for a node which cannot
+answer a window belongs to the cluster layer.
 
 ## Manifest & marks
 
@@ -295,7 +294,7 @@ that cannot answer a window — is not wired up here.
   **only when `flagLevel` is set** (decode-irrelevant — it exists so the merge engine can tell a part
   already at its target level from one below it), then per-kind stats/const. The
   flag-gating is what keeps lossless and pre-existing parts byte-identical (no version bump, no
-  golden churn); `flagBlocked`/`flagFramed`/`flagFooter`/`flagBytes` are additive the same way.
+  golden churn); `flagBlocked`/`flagFramed`/`flagFooter`/`flagBytes`/`flagSharedDict` are additive the same way.
   `flagBytes` carries the column object's own byte size, so a ranged open needs no size round trip.
   Decode bounds-checks every field (fuzzed).
 - **Marks** — sparse granule index over the sort-key column (per-granule first row + min/max,

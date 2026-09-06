@@ -457,8 +457,8 @@ neither drops nor manufactures one.
 
 Unlike a whole-prefix sync, a missing object mid-copy is fatal to the call: the caller is about to
 publish an index entry naming that part, and a part it could not fully copy must never become one.
-The pull direction means the **serving** side is what a real budget has to cap — N recovering nodes
-converge on whichever peers hold the data — which is not built yet.
+The pull direction means the **serving** side is what a real budget has to cap, and it is uncapped:
+N recovering nodes converge on whichever peers hold the data.
 
 A peer's own hole is never offered: `Index.Satisfying` admits only data-bearing entries, so one
 owner's acknowledged loss cannot become another's.

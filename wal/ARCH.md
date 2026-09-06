@@ -45,9 +45,9 @@ size, so it is an `ErrCorrupt` naming the segment and the offset.
 
 `Replay` itself is therefore **strict**: it is handed a complete log — a whole segment, or a
 replication payload from `ApplyPrimary` — so a record that does not fit inside the buffer is
-truncation, not an end of stream. A truncated replication payload used to decode as a short batch
-and let a replica diverge from its primary in silence; it is now an error. The records applied
-before the stopping point are kept either way.
+truncation, not an end of stream, and an error: decoding it as a short batch instead would let a
+replica diverge from its primary in silence. The records applied before the stopping point are kept
+either way.
 
 Making the tolerance last-segment-only is only safe because `Create` **repairs on resume**: it
 truncates the highest-numbered segment to its last complete frame before opening the next one
@@ -141,6 +141,7 @@ What each policy guarantees, precisely:
 | policy | process death (`Kill`) | power loss (`Crash`) |
 |---|---|---|
 | `None` | every acknowledged record | nothing not already synced by a rotation |
+| `Interval` | every acknowledged record | every record synced by the last tick (200 ms window by default) |
 | `Always` | every acknowledged record | every acknowledged record |
 
 `Always` earns the second column only because **the directory is synced too**. An fsync commits a

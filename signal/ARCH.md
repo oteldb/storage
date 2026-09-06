@@ -63,8 +63,10 @@ rides the part lifecycle through the record engine's side-store hook.
 
 ## `otlp/pdataconv`
 
-**The only package importing `go.opentelemetry.io/collector/pdata`**, and optional. Converts
-`pmetric.Metrics` → `metric.Metrics`. Gauge/Sum convert directly; **Histogram,
+**The only package importing `go.opentelemetry.io/collector/pdata`**, and optional. It lives at the
+repository root, not under `signal/`. `AppendMetrics`/`AppendLogs`/`AppendTraces`/`AppendProfiles`
+convert each pdata type into its internal batch, each returning a `dropped` count for what it
+refuses. For metrics, Gauge/Sum convert directly; **Histogram,
 ExponentialHistogram and Summary are stored by classic decomposition** into ordinary float series
 (`_count`, `_sum`, cumulative `_bucket{le=…}` per the Prometheus convention; `{quantile=…}` for
 summaries). An exponential histogram is first converted to explicit `le` bounds from its scale.

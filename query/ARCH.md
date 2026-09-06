@@ -5,12 +5,15 @@ The library **stops at the fetch contract**. Query languages and planners are th
 ## `fetch` — the dual-shape contract
 
 `Request{Tenant, Signal, Start, End, Matchers, Conditions, AllConditions, Projection, SecondPass,
-Limit, Reverse, Recycle}` carries two **operator-free** predicate families:
+Limit, Reverse, Recycle, Scope}` carries two **operator-free** predicate families:
 
 - **Matchers** — `Matcher{Name, Match func(signal.Value) bool}` resolve **identity** over postings
   (a metric series, a log stream).
-- **Conditions** — `Condition{Column, Match, Tokens, Equal}` filter the **per-record columns**
-  within that identity.
+- **Conditions** — `Condition{Column, Match, Tokens, Equal, AnyEqual}` filter the **per-record
+  columns** within that identity. `Tokens`/`Equal`/`AnyEqual` are pruning hints checked against a
+  part's blooms, never a replacement for `Match`. `AnyEqual` is a disjunction *inside* one condition
+  — conditions AND, so an N-value equality cannot be spelled as N conditions; build it with
+  `AnyEqualSet`, which sorts and dedups. Nil and empty both mean "no hint".
 
 Neither is an operator enum, so equality/regex/negation and condition extraction live in the
 language layer and storage stays operator-free. `Fetch` returns an `Iterator` of

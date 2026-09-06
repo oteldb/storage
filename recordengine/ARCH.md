@@ -18,6 +18,7 @@ and the same lock discipline ([`../engine/ARCH.md`](../engine/ARCH.md)).
 | merge modes | append-only: retention only, no downsample/recompress/precision |
 | sizes | measured, not modeled — records are variable-width |
 | merge cap | decoded bytes, memory-derived; free space does not enter |
+| selection | size tiers (`sizeTier`, `minTierParts`), not the metric engine's scored runs |
 | forcing | no idle waiver; `Force` is the only escape from a fixed point |
 
 **Retention drops whole parts first** (`dropExpired`), as in the metric engine: a part past the cutoff
@@ -27,8 +28,10 @@ sidecars live under its own prefix, so `deletePart` reclaims them with it.
 **Merge selection is confined to an aligned time bucket** (`timebucket.go`) — the same `mergeLadder`
 (1h → 6h → 24h, nesting), walked narrowest-first, newest bucket skipped above the finest level, forced
 rewrites confined to one bucket and winning the cycle. [`../engine/ARCH.md`](../engine/ARCH.md),
-"Selection is confined to an aligned time bucket", has the mechanics and what each rule prevents; here
-`pickTierGroup` is the selector that runs unchanged inside one group.
+"Selection is confined to an aligned time bucket", has the mechanics of the **bucket** rules and what
+each prevents. The selector inside one bucket differs: `pickTierGroup` takes the fullest size tier once
+it holds `minTierParts`, where the metric engine scores runs — which is why there is no idle waiver
+here, there being no scoring heuristic to waive.
 
 It matters more here than for metrics: record queries are overwhelmingly narrow and recent, and a
 record row carries far more bytes than a sample, so opening an unneeded part costs more.
@@ -43,8 +46,9 @@ record row carries far more bytes than a sample, so opening an unneeded part cos
 | size tiers, seal threshold | compare those |
 
 A row count cannot stand in: the same count is ten 1 MiB records or ten thousand 1 KiB ones. Nor can an
-assumed average row size — a 256 B assumption against ~950 B real rows decodes ~4× the intended bytes
-per merge. `recordRowBytes` is the fallback for a part whose manifest does not carry the figure.
+assumed average row size, and the spread is what makes it unsafe: real structured-log rows average
+**~950 B**, so an assumption low by 4× decodes 4× the intended bytes per merge. `recordRowBytes`
+(1024 B, calibrated to that measurement) is only the fallback for a part whose manifest omits the figure.
 
 ### Merge cap
 
@@ -233,8 +237,10 @@ hole".
 
 Part prefixes are `<prefix>/{partid}`, a minted globally unique id, and `LoadParts` sweeps orphans at
 open — exactly as in the metric engine ([`../engine/ARCH.md`](../engine/ARCH.md), "Lifecycle and part
-identity"), including the replica exception, `RefreshReplica` skipping the sweep because the owner's
-in-flight part is not in the index yet.
+identity"), including the replica exception: `RefreshReplica` sweeps nothing, because the owner's
+in-flight part is not in the index yet, and a part the store lacks becomes a *pending* want rather than
+an error — counted and disclaimed over (`Stats.WantedParts`, `Engine.WantOverlaps`) until a refresh
+finds it or this node commits as an owner.
 
 Reuse would be unsound here for one extra reason: two of a part's objects are conditional — `keys.bin`
 is skipped when the rows carry no record attributes, the `sym-*.bin` sidecars when there is no side
@@ -359,7 +365,8 @@ A body search projecting body touches just `ts`+`body`. Distribution bulk-append
 filters in place, and skips the sort when already ts-ordered. Bloom pruning re-checks per row after the
 skip ([`../index/ARCH.md`](../index/ARCH.md)).
 
-Top-N (`Limit`+`Reverse`) stops once it holds `Limit` rows whose watermark is strictly past every
+Top-N (`Limit`, at whichever end `Reverse` selects — newest-first when set, oldest-first otherwise)
+stops once it holds `Limit` rows whose watermark is strictly past every
 unread part's bounds; strict comparison keeps boundary ties, so the result is a correct **superset**
 for the caller's own exact ordering. It is disabled with conditions, whose per-part survivor count is
 unknown until the filter runs. The watermark heap is fed only the rows each part appends, and
@@ -397,7 +404,11 @@ AND of pure predicates; `Match` stays an opaque callback.
 
 **Equality fast path.** An exact-match condition against a `CodecBytesRaw` column no other condition
 targets skips the dict decode: the flat blob is decoded once and scanned with
-`internal/simd.EqualFixed16` into a per-row match bitmap, which also serves phase 2's gather. This
+`internal/simd.EqualFixed16` into a per-row match bitmap, which also serves phase 2's gather. A set
+membership (`Condition.AnyEqual`) takes the same blob without the kernel, `evalRawSet` testing each
+row's cell out of it under no width constraint. The path needs an **unframed** column: a flush frames
+every byte column, and `ColumnReader.BytesRaw` refuses a framed one, so on parts this writer produces
+the column falls back to the dictionary path. This
 relies on `Condition.Equal` being byte-identical to `Match` for that column — a future caller using
 `Equal` as an approximate prune hint would break it, since the fast path never rechecks.
 

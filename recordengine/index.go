@@ -303,8 +303,9 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 	// is repaired by the act of writing this index.
 	ix.Wanted = bucketindex.TrimWants(ix.Wanted, ix.Entries)
 
-	// Past the horizon the node needs a wholesale reseed, which does not exist yet. The wants stay:
-	// each is the only record that its part is owed, and the read policy disclaims over them.
+	// Past the horizon the node needs the wholesale adoption cluster/partsync performs, not
+	// part-by-part repair. The wants stay either way: each is the only record that its part is
+	// owed, and the read policy disclaims over them.
 	if len(ix.Wanted) > bucketindex.MaxWants {
 		zctx.From(ctx).Warn("outstanding repairs exceed the part-by-part repair horizon",
 			zap.String("prefix", e.cfg.Prefix), zap.Int("wanted", len(ix.Wanted)),
