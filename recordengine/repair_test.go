@@ -458,3 +458,73 @@ func TestRepairAsksTheFetcherOncePerCycle(t *testing.T) {
 	assert.Equal(t, 1, f.fetchCalls(), "one batch per cycle, whatever the want count")
 	assert.Len(t, f.asks(), len(parts), "every want is still asked for")
 }
+
+// TestRepairCoveredWantIsNotAFailure is the record-signal twin of the metric engine's test for
+// issue #577: two wants answered by one merged successor arrive as two entries when the peer names
+// each separately, and the second names a copy nothing brought in. Opening it fails, but the want
+// it stands for is already discharged by the successor committed alongside it — nothing failed and
+// there is nothing to retry.
+func TestRepairCoveredWantIsNotAFailure(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be, peerBE := backend.Memory(), backend.Memory()
+
+	f := &fakeFetcher{}
+	e := newRepairEngine(t, be, f)
+
+	for i, body := range []string{"p1", "p2", "p3"} {
+		ingest(t, e, mkBatch("api", rrec{ts: int64(100 * (i + 1)), body: body}))
+		require.NoError(t, e.Flush(ctx))
+	}
+
+	parts := e.PartPrefixes()
+	require.Len(t, parts, 3)
+	first, second, kept := parts[0], parts[1], parts[2]
+
+	e.SetPartBlocks(first, bucketindex.Interval{Min: 1, Max: 1}, 0)
+	e.SetPartBlocks(second, bucketindex.Interval{Min: 2, Max: 2}, 0)
+	e.SetPartBlocks(kept, bucketindex.Interval{Min: 3, Max: 3}, 0)
+
+	dropObjects(t, be, first)
+	dropObjects(t, be, second)
+	e.LosePart(first, bucketindex.Interval{Min: 1, Max: 1})
+	e.LosePart(second, bucketindex.Interval{Min: 2, Max: 2})
+
+	peer := newRepairEngine(t, peerBE, nil)
+	ingest(t, peer, mkBatch("api", rrec{ts: 100, body: "p1"}))
+	ingest(t, peer, mkBatch("api", rrec{ts: 200, body: "p2"}))
+	require.NoError(t, peer.Flush(ctx))
+
+	peerParts := peer.PartPrefixes()
+	require.Len(t, peerParts, 1)
+	successor := peerParts[0]
+
+	const phantom = "t/recs/00000000000000000000000000"
+
+	f.answer = func(w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
+		if w.Prefix == first {
+			copyObjects(t, peerBE, be, successor)
+
+			return bucketindex.Entry{
+				Prefix: successor, MinTime: 100, MaxTime: 200,
+				Blocks: bucketindex.Interval{Min: 1, Max: 2}, Level: 1,
+			}, bucketindex.WantSatisfied, nil
+		}
+
+		return bucketindex.Entry{
+			Prefix: phantom, MinTime: 200, MaxTime: 200,
+			Blocks: bucketindex.Interval{Min: 2, Max: 2},
+		}, bucketindex.WantSatisfied, nil
+	}
+
+	require.NoError(t, e.Merge(ctx, 0))
+
+	assert.Zero(t, e.RepairStats().Failed,
+		"a want the same commit already covers is not a transient failure")
+	assert.Empty(t, e.WantPrefixes(), "the successor discharges both wants")
+	assert.NotContains(t, e.PartPrefixes(), phantom, "the unreadable copy is never committed")
+	assert.Empty(t, committedIndex(t, be).Wanted)
+	assert.ElementsMatch(t, []string{"p1", "p2", "p3"}, streamBodies(t, e),
+		"no records are lost or double-counted")
+}

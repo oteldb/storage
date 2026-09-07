@@ -434,6 +434,11 @@ func (e *Engine) publishRepaired(
 		have[p.prefix] = struct{}{}
 	}
 
+	// What this commit will hold, grown as parts open. `have` answers "this exact prefix is already
+	// in"; this answers the weaker and more useful question, "the want's blocks are already in" —
+	// which is what decides whether anything is still owed.
+	live := bucketindex.Index{Entries: e.entriesLocked()}
+
 	for _, r := range satisfied {
 		ent := r.entry
 		if _, dup := have[ent.Prefix]; dup {
@@ -448,6 +453,14 @@ func (e *Engine) publishRepaired(
 
 			p, err = openPart(ctx, e.cfg.Backend, e.cfg.Schema, ent.Prefix)
 			if err != nil {
+				if _, covered := live.Satisfying(r.want); covered {
+					// Nothing failed and nothing is owed: a part already in this commit contains
+					// the want's blocks, so the copy this entry names has nothing left to
+					// discharge and the next cycle has nothing to retry. Counting it as a
+					// transient failure would report repair as stuck at the moment it converged.
+					continue
+				}
+
 				// The objects are here but unreadable: the want stays, and the next cycle re-copies.
 				zctx.From(ctx).Warn("repaired part is not readable",
 					zap.String("prefix", ent.Prefix), zap.Error(err))
@@ -468,6 +481,7 @@ func (e *Engine) publishRepaired(
 
 		added = append(added, p)
 		opened = append(opened, ent)
+		live.Entries = append(live.Entries, ent)
 	}
 
 	superseded := supersededBy(e.parts, opened)
