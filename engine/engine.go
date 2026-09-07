@@ -190,6 +190,12 @@ type Engine struct {
 	// sealing is disabled). [Engine.MergeShape] reports and reasons against it because deriving the
 	// cap reads the backend's free space, which an introspection call must not do.
 	lastMergeCap atomic.Int64
+	// repairGate serializes this engine's repair passes: [Engine.MergeWith] is callable
+	// concurrently, and two passes over the same wants copy the same part from a peer twice and
+	// count both fetches though only one commit lands. A buffered channel rather than a mutex so a
+	// waiter honors ctx cancellation; repair's own gate rather than flushMu so a remote fetch
+	// never blocks a flush.
+	repairGate chan struct{}
 	// mergeRunning is true while a [Engine.MergeWith] is executing (introspection liveness; see
 	// [Engine.MergeRunning]). Set/cleared around the merge, not held during it.
 	mergeRunning atomic.Bool
@@ -328,6 +334,7 @@ func New(cfg Config) *Engine {
 	}
 
 	e := &Engine{cfg: cfg, head: newHead()}
+	e.repairGate = make(chan struct{}, 1)
 	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
 	// The decode free list covers the peak in-flight decoded parts: prefetch can decode
 	// prefetchConcurrency parts concurrently per fetch, and several fetches overlap, so a
