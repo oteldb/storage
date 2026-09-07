@@ -13,6 +13,7 @@ import (
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
+	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -316,11 +317,16 @@ type part struct {
 	// delete.
 	refs atomic.Int32
 
-	// seriesMaxMu guards seriesMax, the per-series newest timestamps of [part.forEachSeriesMaxTime].
-	// A mutex rather than a sync.Once so a failed decode (a transient backend error) is retried
-	// instead of being cached as "this part has no times".
+	// seriesMaxMu guards seriesMax, the per-series watermarks of [part.forEachSeriesMaxTime]. A
+	// mutex rather than a sync.Once so a failed load (a transient backend error) is retried instead
+	// of being cached as "this part has no times".
 	seriesMaxMu sync.Mutex
-	seriesMax   []int64
+	seriesMax   []watermark.Entry
+
+	// identityLoaded records that this part's identity object has already been registered into the
+	// head, and identityPresent whether it had one. A reloaded index reuses the handle, and the
+	// object is immutable, so the (uncached) read is not repeated per refresh.
+	identityLoaded, identityPresent bool
 }
 
 func (p *part) acquire() { p.refs.Add(1) }
@@ -484,11 +490,11 @@ func decodePart(ctx context.Context, p *part) (*decodedPart, error) {
 	return p.decode(ctx, colNeed{values: true})
 }
 
-// seriesMaxTimes returns, in the index's ascending id order, the newest timestamp each series has in
-// this part: the per-series durability watermark the replica refresh trims against. Decoded from the
-// timestamp column once per part (parts are immutable) and kept as one int64 per series, since the
-// alternative — re-decoding on every refresh — repeats a whole-column read per part per tick.
-func (p *part) seriesMaxTimes(ctx context.Context) ([]int64, error) {
+// seriesWatermarks returns, in the index's ascending id order, the newest timestamp each series has
+// in this part: the per-series durability watermark the replica refresh trims against. Resolved once
+// and held for the part's life — parts are immutable, and a reloaded index reuses the handle, so a
+// replica pays this per part rather than per refresh.
+func (p *part) seriesWatermarks(ctx context.Context) ([]watermark.Entry, error) {
 	p.seriesMaxMu.Lock()
 	defer p.seriesMaxMu.Unlock()
 
@@ -496,26 +502,12 @@ func (p *part) seriesMaxTimes(ctx context.Context) ([]int64, error) {
 		return p.seriesMax, nil
 	}
 
-	dec, err := p.decode(ctx, colNeed{})
-	if err != nil {
-		return nil, errors.Wrapf(err, "decode timestamps of part %q", p.prefix)
-	}
-
-	out := make([]int64, 0, p.index.seriesCount())
-
-	// Scanning each run rather than reading its last row: rows are (series, ts)-ordered as written,
-	// but the watermark decides what a replica may delete, so it does not rest on an ordering the
-	// part itself does not enforce.
-	err = p.index.forEachRange(ctx, func(_ signal.SeriesID, r rowRange) {
-		newest := minInt64
-		for _, t := range dec.ts[min(r.start, len(dec.ts)):min(r.end, len(dec.ts))] {
-			newest = max(newest, t)
+	out, ok := p.sidecarWatermarks(ctx)
+	if !ok {
+		var err error
+		if out, err = p.seriesMaxTimes(ctx); err != nil {
+			return nil, err
 		}
-
-		out = append(out, newest)
-	})
-	if err != nil {
-		return nil, err
 	}
 
 	p.seriesMax = out
@@ -523,22 +515,75 @@ func (p *part) seriesMaxTimes(ctx context.Context) ([]int64, error) {
 	return out, nil
 }
 
+// sidecarWatermarks reads the watermark sidecar written beside the part. ok is false when it is
+// absent (a part written by a build without it), corrupt, or does not cover the part's series — the
+// caller then decodes the timestamp column.
+func (p *part) sidecarWatermarks(ctx context.Context) ([]watermark.Entry, bool) {
+	if p.be == nil {
+		return nil, false
+	}
+
+	data, err := p.be.Read(ctx, watermark.Key(p.prefix))
+	if err != nil {
+		return nil, false
+	}
+
+	ents, err := watermark.Decode(data)
+	if err != nil || len(ents) != p.index.seriesCount() {
+		return nil, false
+	}
+
+	return ents, true
+}
+
+// seriesMaxTimes computes the watermarks from the part's timestamp column: the fallback for a part
+// written without the sidecar. It is a whole-column read and decode, which is why the result is
+// cached rather than recomputed per refresh.
+func (p *part) seriesMaxTimes(ctx context.Context) ([]watermark.Entry, error) {
+	dec, err := p.decode(ctx, colNeed{})
+	if err != nil {
+		return nil, errors.Wrapf(err, "decode timestamps of part %q", p.prefix)
+	}
+
+	out := make([]watermark.Entry, 0, p.index.seriesCount())
+
+	// Scanning each run rather than reading its last row: rows are (series, ts)-ordered as written,
+	// but the watermark decides what a replica may delete, so it does not rest on an ordering the
+	// part itself does not enforce.
+	err = p.index.forEachRange(ctx, func(id signal.SeriesID, r rowRange) {
+		newest := minInt64
+		for _, t := range dec.ts[min(r.start, len(dec.ts)):min(r.end, len(dec.ts))] {
+			newest = max(newest, t)
+		}
+
+		out = append(out, watermark.Entry{ID: id, Max: newest})
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// forEachRange pinned a paged index's entry view. No fetch is reading the part (a refresh holds
+	// the engine lock, under which fetches acquire), so hand the bytes back to the read cache rather
+	// than keeping them resident for the part's life.
+	if p.refs.Load() == 0 {
+		p.index.dropView()
+	}
+
+	return out, nil
+}
+
 // forEachSeriesMaxTime calls fn for every series in the part with its newest timestamp there.
 func (p *part) forEachSeriesMaxTime(ctx context.Context, fn func(signal.SeriesID, int64)) error {
-	maxTS, err := p.seriesMaxTimes(ctx)
+	ents, err := p.seriesWatermarks(ctx)
 	if err != nil {
 		return err
 	}
 
-	k := 0
+	for _, e := range ents {
+		fn(e.ID, e.Max)
+	}
 
-	return p.index.forEachRange(ctx, func(id signal.SeriesID, _ rowRange) {
-		if k < len(maxTS) {
-			fn(id, maxTS[k])
-		}
-
-		k++
-	})
+	return nil
 }
 
 // decode reads and decodes the part's timestamp column (and, when need.values, the value/sf columns)
@@ -754,7 +799,7 @@ func windowBlocks(
 	nBlocks := (totalRows + blockRows - 1) / blockRows
 
 	// The ranges come from the matched series in index order, and a part is (series, ts)-sorted, so
-	// they normally ascend and one watermark dedups the block list without sorting. A caller that
+	// they normally ascend and one high-water mark dedups the block list without sorting. A caller that
 	// passes them out of order still gets a correct answer, at the cost of a sort.
 	ordered := true
 
@@ -767,9 +812,9 @@ func windowBlocks(
 	}
 
 	var (
-		out       []int
-		rows      int64
-		watermark = -1
+		out     []int
+		rows    int64
+		emitted = -1
 	)
 
 	for _, rng := range ranges {
@@ -791,13 +836,13 @@ func windowBlocks(
 				rows += int64(hi - lo)
 			}
 
-			if !ordered || b > watermark {
+			if !ordered || b > emitted {
 				out = append(out, b)
 			}
 		}
 
-		if last > watermark {
-			watermark = last
+		if last > emitted {
+			emitted = last
 		}
 	}
 

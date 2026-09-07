@@ -253,6 +253,6 @@ engine/               metrics vertical
 recordengine/         shared record engine (logs/traces/profiles)
 query/{fetch,scale,profile,promql}           read seam · scale-out decorators · EXPLAIN ANALYZE · Prom adapter
 cluster/{,ring,etcd,replica,rebalance,partsync,ec,router}   L0 distribution
-internal/{obs,retry,simd,parallel,partid,diskguard,vfs,memlimit,memsize,reproduce,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids · disk-pressure guard · heap accounting · gated defect reproducers · filesystem seam + crash model (validated against ext4 on dm-flakey by `internal/vfs/crashmodel`, `-tags crashmodel`)
+internal/{obs,retry,simd,parallel,partid,diskguard,vfs,memlimit,memsize,watermark,reproduce,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids · disk-pressure guard · heap accounting · per-series watermark sidecar codec · gated defect reproducers · filesystem seam + crash model (validated against ext4 on dm-flakey by `internal/vfs/crashmodel`, `-tags crashmodel`)
 reliability/          public RetryConfig presets
 ```

@@ -266,6 +266,22 @@ type PartReader struct {
 	level   compress.Level
 }
 
+// PartPresent reports whether the part at prefix still exists, by probing its manifest — the object
+// [OpenPart] reads first and the commit point of a part write, so its absence is the part's absence.
+// It is the liveness check for an already-open part, which needs no reopening but must still be
+// noticed when its objects go away.
+func PartPresent(ctx context.Context, b backend.Backend, prefix string) (bool, error) {
+	if _, err := backend.SizeOf(ctx, b, manifestKey(prefix)); err != nil {
+		if errors.Is(err, backend.ErrNotExist) {
+			return false, nil
+		}
+
+		return false, errors.Wrap(err, "probe manifest")
+	}
+
+	return true, nil
+}
+
 // OpenPart reads a part's manifest from b under prefix and returns a reader. It returns
 // an error (wrapping [ErrCorrupt] or [backend.ErrNotExist]) if the manifest is absent or
 // malformed — an incompletely written part (no manifest) is therefore not readable.

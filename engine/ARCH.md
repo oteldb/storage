@@ -873,10 +873,27 @@ the durability of any other. Trimming against it deletes late samples that are l
 out-of-order bound and durable nowhere yet: invisible on replica reads until the owner's next flush,
 and lost outright if the replica is promoted first.
 
-Those watermarks come from the parts, since nothing per series is recorded in the bucket index: a part
-decodes its timestamp column once (parts are immutable) and keeps one `int64` per series, ~8 bytes per
-series per part on top of the 20 the resident index already costs. Re-deriving them per refresh would
-instead repeat a whole-column read per part on every maintenance tick.
+Those watermarks come from the parts, since nothing per series is recorded in the bucket index. Flush
+and merge both write them beside the part as the `{prefix}/smax` sidecar (`internal/watermark`: magic,
+uvarint count, then `(u128 id, i64 max)` big-endian per series, trailing CRC32C), so a cold replica —
+or one that has just mirrored a part with `cluster/partsync` — resolves them without touching the
+timestamp column at all. A part written before the sidecar existed, or one whose sidecar is corrupt or
+does not cover its series, falls back to decoding the column; absence is not an error. Either way the
+result is held on the part handle at ~24 bytes per series, on top of the 20 the resident index costs.
+
+**A reloaded index reuses the part handles the engine already holds** (`loadPartsLocked`). Parts are
+immutable and the prefix is their identity, so a handle for a prefix the new index still names is
+still valid; reopening it throws away the watermarks, the paged series index, the stats and granule
+sidecars and the registered identities, which a replica's maintenance tick would then rebuild every
+tick over the whole part set. A reused handle still takes its per-entry fields — time bounds, block
+identity, level — from the index entry, and keeps its in-flight readers. The part's identity object is
+registered once per handle for the same reason: it is immutable, and the identity prune only ever
+drops identities no live part holds. Over four parts of 50 series × 500 samples on the memory backend
+this is a refresh at 9.7 µs and 5.3 KB allocated instead of 653 µs and 943 KB.
+
+Reuse cannot skip noticing that a part's objects have gone away, which is what turns a lost part into
+a want. A reused handle is probed with `block.PartPresent` — the manifest, the commit point of a part
+write — so a refresh pays one small object per part instead of reopening it.
 
 **The primary logs the accepted set** — the frames it already built to replicate, written to the WAL
 verbatim (`wal.WriteFrames`). That is what makes the quorum's "one durable copy at the primary" true:

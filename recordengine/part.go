@@ -13,6 +13,7 @@ import (
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/index/bloom"
+	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -35,6 +36,7 @@ type streamRange struct {
 type part struct {
 	schema *Schema
 	reader *block.PartReader
+	be     backend.Backend // for lazily loading the per-stream watermark sidecar
 	prefix string
 
 	// ranges is the stream → row-span index, sorted by stream id, so a query resolves its streams by
@@ -80,11 +82,16 @@ type part struct {
 	// deleted from the backend until its refs reach zero, so a lock-free reader never races a delete.
 	refs atomic.Int32
 
-	// streamMaxMu guards streamMax, the per-stream newest timestamps of [part.streamMaxTimes]. A
-	// mutex rather than a sync.Once so a failed decode (a transient backend error) is retried
-	// instead of being cached as "this part has no times".
+	// streamMaxMu guards streamMax, the per-stream watermarks of [part.streamWatermarks]. A mutex
+	// rather than a sync.Once so a failed load (a transient backend error) is retried instead of
+	// being cached as "this part has no times".
 	streamMaxMu sync.Mutex
-	streamMax   []int64
+	streamMax   []watermark.Entry
+
+	// identityLoaded records that this part's identity object has already been registered into the
+	// head, and identityPresent whether it had one. A reloaded index reuses the handle, and the
+	// object is immutable, so the (uncached) read is not repeated per refresh.
+	identityLoaded, identityPresent bool
 }
 
 func (p *part) acquire() { p.refs.Add(1) }
@@ -136,16 +143,16 @@ func openPart(ctx context.Context, b backend.Backend, schema *Schema, prefix str
 	}
 
 	return &part{
-		schema: schema, reader: r, prefix: prefix, ranges: ranges,
+		schema: schema, reader: r, be: b, prefix: prefix, ranges: ranges,
 		blooms: blooms, recordKeys: recordKeys, rawBytes: r.Manifest().RawBytes,
 	}, nil
 }
 
-// streamMaxTimes returns, aligned with p.ranges, the newest timestamp each stream has in this part:
-// the per-stream durability watermark the replica refresh trims against. Decoded from the timestamp
-// column once per part (parts are immutable) and kept as one int64 per stream, since the alternative
-// — re-decoding on every refresh — repeats a whole-column read per part per tick.
-func (p *part) streamMaxTimes(ctx context.Context) ([]int64, error) {
+// streamWatermarks returns, aligned with p.ranges, the newest timestamp each stream has in this
+// part: the per-stream durability watermark the replica refresh trims against. Resolved once and
+// held for the part's life — parts are immutable, and a reloaded index reuses the handle, so a
+// replica pays this per part rather than per refresh.
+func (p *part) streamWatermarks(ctx context.Context) ([]watermark.Entry, error) {
 	p.streamMaxMu.Lock()
 	defer p.streamMaxMu.Unlock()
 
@@ -153,12 +160,59 @@ func (p *part) streamMaxTimes(ctx context.Context) ([]int64, error) {
 		return p.streamMax, nil
 	}
 
+	out, ok := p.sidecarWatermarks(ctx)
+	if !ok {
+		var err error
+		if out, err = p.streamMaxTimes(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	p.streamMax = out
+
+	return out, nil
+}
+
+// sidecarWatermarks reads the watermark sidecar written beside the part. ok is false when it is
+// absent (a part written by a build without it), corrupt, or does not cover the part's streams —
+// the caller then decodes the timestamp column.
+func (p *part) sidecarWatermarks(ctx context.Context) ([]watermark.Entry, bool) {
+	if p.be == nil {
+		return nil, false
+	}
+
+	data, err := p.be.Read(ctx, watermark.Key(p.prefix))
+	if err != nil {
+		return nil, false
+	}
+
+	ents, err := watermark.Decode(data)
+	if err != nil || len(ents) != len(p.ranges) {
+		return nil, false
+	}
+
+	// p.ranges is sorted by stream id and the sidecar is written in the same order, but a part
+	// whose stream column arrived unsorted had its ranges re-sorted at open — so the pairing is
+	// checked rather than assumed, and a mismatch falls back to the decode.
+	for i, sr := range p.ranges {
+		if ents[i].ID != sr.id {
+			return nil, false
+		}
+	}
+
+	return ents, true
+}
+
+// streamMaxTimes computes the watermarks from the part's timestamp column: the fallback for a part
+// written without the sidecar. It is a whole-column read and decode, which is why the result is
+// cached rather than recomputed per refresh.
+func (p *part) streamMaxTimes(ctx context.Context) ([]watermark.Entry, error) {
 	ts, err := p.readInt64(ctx, colTs, nil, nil)
 	if err != nil {
 		return nil, errors.Wrapf(err, "read timestamps of part %q", p.prefix)
 	}
 
-	out := make([]int64, len(p.ranges))
+	out := make([]watermark.Entry, len(p.ranges))
 
 	for i, sr := range p.ranges {
 		newest := minInt64
@@ -170,10 +224,8 @@ func (p *part) streamMaxTimes(ctx context.Context) ([]int64, error) {
 			newest = max(newest, t)
 		}
 
-		out[i] = newest
+		out[i] = watermark.Entry{ID: sr.id, Max: newest}
 	}
-
-	p.streamMax = out
 
 	return out, nil
 }

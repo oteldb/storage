@@ -11,6 +11,7 @@ import (
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/partid"
+	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -203,6 +204,12 @@ func writePart(
 		return err
 	}
 
+	// Watermark sidecar: the newest timestamp per series, so a replica refresh trims its head
+	// against this part without decoding the timestamp column (see part.seriesWatermarks).
+	if err := b.Write(ctx, watermark.Key(prefix), watermark.Encode(nil, computeWatermarks(cols))); err != nil {
+		return errors.Wrapf(err, "write watermark sidecar %q", prefix)
+	}
+
 	// Aggregate-pushdown sidecar: per-series count/sum/min/max over the value column, so a query
 	// whose range fully covers this part answers from it without decoding the column. Opt-in (it
 	// costs a little storage per series) and written only for an unsampled part (raw values); a
@@ -215,6 +222,26 @@ func writePart(
 	}
 
 	return nil
+}
+
+// computeWatermarks folds the (series, ts)-sorted flush columns into one newest timestamp per
+// series, in the order series first appear — which, given the sort, is each series' contiguous run
+// and so the ascending id order a part's series index enumerates.
+func computeWatermarks(cols *flushColumns) []watermark.Entry {
+	var out []watermark.Entry
+
+	for i := range cols.series {
+		if i == 0 || cols.series[i] != cols.series[i-1] {
+			out = append(out, watermark.Entry{ID: u128ToID(cols.series[i]), Max: cols.ts[i]})
+
+			continue
+		}
+
+		last := &out[len(out)-1]
+		last.Max = max(last.Max, cols.ts[i])
+	}
+
+	return out
 }
 
 // statsKey is the backend key of a part's aggregate-pushdown sidecar (deleted with the part, since

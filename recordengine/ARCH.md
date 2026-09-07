@@ -496,10 +496,18 @@ The WAL frame is signal-agnostic — an opaque engine-encoded payload plus an op
 the profile symbol store replicates. `ApplyPrimary`/`ApplyReplicated` mirror the metric engine's
 primary-authoritative contract, and so does `RefreshReplica`'s **per-stream** trim watermark
 ([`../engine/ARCH.md`](../engine/ARCH.md), "Cluster surface"): a stream absent from every part keeps
-its whole head, one present keeps every record past *its own* newest flushed timestamp. Each part
-decodes its timestamp column once to derive those (one `int64` per stream, kept for the part's life),
-because the bucket index records time bounds per part only — and a part-wide figure is another
-stream's flush, which says nothing about this one's durability.
+its whole head, one present keeps every record past *its own* newest flushed timestamp — the bucket
+index records time bounds per part only, and a part-wide figure is another stream's flush, which says
+nothing about this one's durability.
+
+`writePart` writes those watermarks beside the part as the `{prefix}/smax` sidecar
+(`internal/watermark`, framing in [`../engine/ARCH.md`](../engine/ARCH.md)), so a refresh resolves them
+without decoding the timestamp column. A part without the sidecar — or with one that does not pair
+with its stream ranges — falls back to that decode. The result is held on the part handle, and
+`loadPartsLocked` reuses handles by prefix across an index reload exactly as the metric engine does,
+so the blooms, record keys, stream ranges and identities a part carries are read once rather than per
+maintenance tick; a reused handle is probed with `block.PartPresent` so a part whose objects went away
+still becomes a want.
 
 **A stream's identity frame is logged when the head registers the stream**, not when it first has an
 accepted record. A stream is new exactly once, and replay drops records it cannot attribute to a
