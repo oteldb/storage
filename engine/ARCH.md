@@ -557,6 +557,16 @@ backfill, which knows nothing of this disk; and holding is proven by opening the
 surviving objects under a prefix are not a readable part. Pending wants — those a load could not
 commit — are serviced alongside the committed ones, since the repair commit is a commit.
 
+The local index is asked **again at commit time**, not only before the network. `Satisfying` is
+re-run over what the commit will hold — the live entries plus the parts opened earlier in the same
+loop — so a want the commit already covers is skipped rather than opened. That is what separates the
+two reasons an open can fail: objects that are present but unreadable are a transient failure and
+the want stays for the next cycle (`RepairStats.Failed`), while a want another entry in this very
+commit already contains is neither failed nor owed. Counting the second as a failure would report
+repair as stuck at the moment it converged, and `RepairStats` is the only view an operator has of
+that (`ADMIN.md`). Two wants answered by one merged successor produce exactly this shape whenever a
+peer names each want's own prefix rather than the successor twice.
+
 `Config.Repair` (`PartFetcher`) is the whole seam to the cluster: part identities in, the entries of
 whatever parts were actually copied out. The engine never learns about peers, addresses or transport —
 `cluster/partsync` supplies the implementation, and nil (single node, or a shared backend where
