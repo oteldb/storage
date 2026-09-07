@@ -610,6 +610,19 @@ would spend the maintenance cycle in the network and never compact; a shard need
 handful of parts back is past what part-by-part repair is for. The *serving* side, where the real
 budget belongs (see `cluster/ARCH.md`), is uncapped.
 
+A pass is single-flight, gated by `repairGate` — its own gate, not `flushMu`. `MergeWith` is
+callable concurrently (an operator's `Admin.MaintainNow` alongside the maintenance loop), and two
+passes snapshotting the same wants copy the same part from a peer twice into one object prefix.
+Only one of them commits — the winner's parts already carry the prefix — so the index stays right,
+but the loser has paid for a network copy, counted it in `RepairStats.Fetched`, and, once the
+winner's merge has retired the prefix it copied into, counts a `Failed` for a part that is fine.
+`RepairStats` is the operator's only view of whether repair is progressing, so a counter that
+inflates under concurrency misleads during exactly the incident it describes. The gate is repair's
+own rather than a widened `flushMu` because the pass it covers is remote I/O: holding the flush
+lock across a peer fetch would stall ingest for the length of a network copy. It is a buffered
+channel rather than a mutex so a waiter honors the merge's context — a shutdown does not wait out
+another pass's fetch. The second pass then observes the first pass's commit and finds nothing to do.
+
 ### An unrepairable want becomes a revocable hole
 
 A want no owner can satisfy would otherwise stay outstanding forever, and the shard would be

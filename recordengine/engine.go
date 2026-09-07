@@ -147,6 +147,12 @@ type Engine struct {
 	flushMu sync.Mutex
 	head    *head
 	parts   []*part
+	// repairGate serializes this engine's repair passes: [Engine.MergeWith] is callable
+	// concurrently, and two passes over the same wants copy the same part from a peer twice and
+	// count both fetches though only one commit lands. A buffered channel rather than a mutex so a
+	// waiter honors ctx cancellation; repair's own gate rather than flushMu so a remote fetch
+	// never blocks a flush.
+	repairGate chan struct{}
 	// mergeRunning is true while a [Engine.Merge] is executing (introspection liveness; see
 	// [Engine.MergeRunning]). Set/cleared around the merge, not held during it.
 	mergeRunning atomic.Bool
@@ -282,6 +288,7 @@ func New(cfg Config) *Engine {
 	}
 
 	e := &Engine{cfg: cfg, head: newHead(cfg.Schema)}
+	e.repairGate = make(chan struct{}, 1)
 	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
 	e.recycle = func(b *fetch.Batch) {
 		if c, ok := b.ReleaseState().(*recordCols); ok {

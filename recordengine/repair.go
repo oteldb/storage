@@ -134,6 +134,14 @@ func (e *Engine) repairWants(ctx context.Context) {
 		return
 	}
 
+	select {
+	case e.repairGate <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
+
+	defer func() { <-e.repairGate }()
+
 	e.mu.Lock()
 	// Pending wants are obligations too: a load that could not commit them left them for the first
 	// commit this engine makes, and the repair commit is one.
