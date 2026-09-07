@@ -12,7 +12,8 @@ reads).
 ```
 
 An incompletely written part (no manifest) is not openable — that is the commit discipline every
-writer (flush, merge, partsync mirroring) relies on.
+writer (flush, merge, partsync mirroring) relies on. `PartPresent` probes that same manifest, which is
+how a holder of an already-open part asks whether the part still exists without reopening it.
 
 ## Columns
 

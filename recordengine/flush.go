@@ -12,6 +12,7 @@ import (
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/partid"
+	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -336,7 +337,33 @@ func writePart(
 		return err
 	}
 
+	// Watermark sidecar: the newest timestamp per stream, so a replica refresh trims its head
+	// against this part without decoding the timestamp column (see part.streamWatermarks).
+	if err := b.Write(ctx, watermark.Key(prefix), watermark.Encode(nil, computeWatermarks(f))); err != nil {
+		return errors.Wrapf(err, "write watermark sidecar %q", prefix)
+	}
+
 	return writeRecordKeys(ctx, b, schema, prefix, f.cols)
+}
+
+// computeWatermarks folds the (stream, ts)-sorted flush columns into one newest timestamp per
+// stream, in the order streams first appear — which, given the sort, is each stream's contiguous run
+// and so the ascending id order [buildRanges] produces.
+func computeWatermarks(f *flushColumns) []watermark.Entry {
+	var out []watermark.Entry
+
+	for i := range f.stream {
+		if i == 0 || f.stream[i] != f.stream[i-1] {
+			out = append(out, watermark.Entry{ID: u128ToID(f.stream[i]), Max: f.cols.ts[i]})
+
+			continue
+		}
+
+		last := &out[len(out)-1]
+		last.Max = max(last.Max, f.cols.ts[i])
+	}
+
+	return out
 }
 
 // newPartPrefix mints the backend key prefix of a new part: the engine prefix plus a globally unique

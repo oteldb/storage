@@ -9,6 +9,7 @@ import (
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/index/series"
+	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -36,6 +37,9 @@ type partStreamWriter struct {
 
 	statsIDs []chunk.U128
 	stats    []SeriesAgg
+
+	// wmarks is the part's per-series durability watermark sidecar, accumulated with the runs.
+	wmarks []watermark.Entry
 
 	withSF    bool
 	withStats bool
@@ -131,6 +135,13 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 	p.runs = append(p.runs, chunk.U128Run{Value: id, Count: len(ts)})
 	p.rows += len(ts)
 
+	newest := ts[0]
+	for _, t := range ts[1:] {
+		newest = max(newest, t)
+	}
+
+	p.wmarks = append(p.wmarks, watermark.Entry{ID: u128ToID(id), Max: newest})
+
 	// Rows arrive series-major, so the part's bounds are the running extremes over every series
 	// rather than the first and last row.
 	lo, hi := ts[0], ts[len(ts)-1]
@@ -161,13 +172,15 @@ func (p *partStreamWriter) encodedBytes() int64 { return p.w.EncodedBytes() }
 // encoded byte than a merge of long ones, so they are the term worth sealing on.
 func (p *partStreamWriter) residentBytes() int64 {
 	const (
-		runBytes = 24 // chunk.U128Run
-		idBytes  = 16 // chunk.U128
-		aggBytes = 40 // SeriesAgg
+		runBytes   = 24 // chunk.U128Run
+		idBytes    = 16 // chunk.U128
+		aggBytes   = 40 // SeriesAgg
+		wmarkBytes = 24 // watermark.Entry
 	)
 
 	total := p.w.ResidentBytes() + int64(cap(p.runs))*runBytes
 	total += int64(cap(p.statsIDs))*idBytes + int64(cap(p.stats))*aggBytes
+	total += int64(cap(p.wmarks)) * wmarkBytes
 	total += int64(cap(p.ones)) * 8
 
 	return total
@@ -222,6 +235,10 @@ func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 
 	if err := writeIdentity(ctx, p.e.cfg.Backend, prefix, p.identityEntries()); err != nil {
 		return nil, err
+	}
+
+	if err := p.e.cfg.Backend.Write(ctx, watermark.Key(prefix), watermark.Encode(nil, p.wmarks)); err != nil {
+		return nil, errors.Wrapf(err, "write watermark sidecar %q", prefix)
 	}
 
 	if p.withStats && !p.sampled {

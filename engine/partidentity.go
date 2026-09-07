@@ -121,10 +121,21 @@ func (e *Engine) loadIdentitiesLocked(ctx context.Context, parts []*part) (bool,
 	complete := true
 
 	for _, p := range parts {
+		// A reused handle already registered its identities, and the object is immutable, so the
+		// uncached read is not repeated: the prune only ever drops identities no live part holds,
+		// so nothing it did can have unregistered these.
+		if p.identityLoaded {
+			complete = complete && p.identityPresent
+
+			continue
+		}
+
 		ok, err := e.registerPartIdentitiesLocked(ctx, p.prefix)
 		if err != nil {
 			return false, err
 		}
+
+		p.identityLoaded, p.identityPresent = true, ok
 
 		if !ok {
 			complete = false

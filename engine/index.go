@@ -11,6 +11,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -405,6 +406,37 @@ const (
 	loadOwner
 )
 
+// livePart resolves the handle for ent, taking it out of open (the previous load's part set) when
+// that handle is still good. Parts are immutable and the prefix is their identity, so an open handle
+// for a prefix the reloaded index still names is still valid — reusing it keeps the caches it built,
+// above all the per-series watermarks whose alternative is a whole timestamp column per part per
+// refresh. Reuse cannot skip noticing that the part's objects went away, though, so the handle is
+// probed first; a part that is gone is left in open (it counts as dropped) and reported through
+// [partGone], which the caller turns into a repair want.
+func (e *Engine) livePart(
+	ctx context.Context, ent *bucketindex.Entry, open map[string]*part,
+) (*part, error) {
+	if p := open[ent.Prefix]; p != nil {
+		live, err := block.PartPresent(ctx, e.cfg.Backend, ent.Prefix)
+		if err != nil {
+			return nil, errors.Wrapf(err, "probe part %q", ent.Prefix)
+		}
+
+		if live {
+			delete(open, ent.Prefix)
+
+			return p, nil
+		}
+	}
+
+	p, err := openPart(ctx, e.cfg.Backend, ent.Prefix)
+	if err != nil {
+		return nil, errors.Wrapf(err, "open part %q", ent.Prefix)
+	}
+
+	return p, nil
+}
+
 // loadPartsLocked is [Engine.LoadParts] under a [loadMode]. Caller holds e.mu.
 func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 	sweep := mode != loadReplica
@@ -433,6 +465,13 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 		lost  []bucketindex.Want
 	)
 
+	// The previous load's handles, which [Engine.livePart] reuses and takes out of the map; each is
+	// therefore claimed by at most one entry, and whatever is left over was dropped by this index.
+	open := make(map[string]*part, len(e.parts))
+	for _, p := range e.parts {
+		open[p.prefix] = p
+	}
+
 	for i := range ix.Entries {
 		ent := &ix.Entries[i]
 
@@ -444,10 +483,10 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 			continue
 		}
 
-		p, err := openPart(ctx, e.cfg.Backend, ent.Prefix)
+		p, err := e.livePart(ctx, ent, open)
 		if err != nil {
 			if !partGone(err) {
-				return errors.Wrapf(err, "open part %q", ent.Prefix)
+				return err
 			}
 
 			zctx.From(ctx).Error("part named by the index is gone; recording a repair",
@@ -460,6 +499,8 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 
 		p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
 		p.blocks, p.claim, p.level = ent.Blocks, ent.Claim, ent.Level
+		// The index names the part, so whatever identity it was waiting for has been committed.
+		p.pending = nil
 		parts = append(parts, p)
 	}
 
@@ -467,12 +508,8 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 
 	// A part disappearing means identities may have died with it, which is what arms the identity
 	// prune on a node that never merges (a replica adopting the owner's part set).
-	for _, p := range e.parts {
-		if !slices.ContainsFunc(parts, func(n *part) bool { return n.prefix == p.prefix }) {
-			e.identityDirty = true
-
-			break
-		}
+	if len(open) > 0 {
+		e.identityDirty = true
 	}
 
 	e.parts = parts
