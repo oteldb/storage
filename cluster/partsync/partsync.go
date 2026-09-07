@@ -329,10 +329,10 @@ type Stats struct {
 	// containing their blocks. Like Withheld it names a peer missing data, and it is the half that
 	// covers a peer that made no claim at all.
 	Retained int
-	// Owed are the repair obligations this pass discovered in the other direction: parts the peer
+	// Wants are the repair obligations this pass discovered in the other direction: parts the peer
 	// holds that the local index does not account for and cannot otherwise learn of. The caller
 	// hands them to the engine, whose repair pass fetches the objects and commits the entries.
-	Owed []bucketindex.Want
+	Wants []bucketindex.Want
 }
 
 // Totals is a Syncer's cumulative activity across every prefix and pass, for the operator
@@ -407,9 +407,9 @@ type prefixState struct {
 	pass   sync.Mutex // serializes Sync passes for this prefix
 	remote map[string]struct{}
 	miss   map[string]int
-	// owed counts consecutive passes in which a peer part went unaccounted for by the local
-	// index; see [owedAfterPasses].
-	owed map[string]int
+	// unaccounted counts consecutive passes in which a peer part went unaccounted for by the local
+	// index; see [wantAfterPasses].
+	unaccounted map[string]int
 }
 
 // New returns a Syncer mirroring into local via client.
@@ -511,13 +511,13 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 	// The obligations only the local side can state. A peer whose index this one supersedes still
 	// holds parts this one never indexed, and no claim path reaches them: the peer can only omit
 	// what it cannot explain, and this node cannot report losing what it never named.
-	var owed []bucketindex.Want
+	var wants []bucketindex.Want
 
 	if cmp < 0 {
-		if owed = s.owedWants(enginePrefix, peerIndex, localIndex); len(owed) > 0 {
+		if wants = s.confirmedWants(enginePrefix, peerIndex, localIndex); len(wants) > 0 {
 			zctx.From(ctx).Info("partsync: peer holds parts this index does not account for",
 				zap.String("prefix", enginePrefix), zap.String("peer", addr),
-				zap.Int("owed", len(owed)))
+				zap.Int("wants", len(wants)))
 		}
 	}
 
@@ -559,11 +559,11 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 	if !newer && !forced {
 		reconcile, err := s.reconcileConverged(ctx, enginePrefix, addr, strict, cmp)
 		if err != nil || !reconcile {
-			return Stats{Retained: retained, Owed: owed}, err
+			return Stats{Retained: retained, Wants: wants}, err
 		}
 	}
 
-	st := Stats{Retained: retained, Owed: owed}
+	st := Stats{Retained: retained, Wants: wants}
 
 	unbacked, err := s.copyMissing(ctx, &st, addr, enginePrefix, indexKey, keep, peerIndex.Entries)
 	if err != nil {
@@ -755,7 +755,7 @@ func livePartSet(peerIndex, localIndex *bucketindex.Index, supersedes bool) map[
 func (s *Syncer) stateFor(enginePrefix string) *prefixState {
 	st := s.state[enginePrefix]
 	if st == nil {
-		st = &prefixState{miss: make(map[string]int), owed: make(map[string]int)}
+		st = &prefixState{miss: make(map[string]int), unaccounted: make(map[string]int)}
 		s.state[enginePrefix] = st
 	}
 
@@ -916,20 +916,20 @@ func classifyFetch(remote []string, enginePrefix, indexKey string, have map[stri
 	return immutable, manifests, mutable
 }
 
-// owedAfterPasses is how many consecutive passes a peer part must go unaccounted for before it
+// wantAfterPasses is how many consecutive passes a peer part must go unaccounted for before it
 // becomes an obligation. A rebalance in flight briefly leaves two indexes disagreeing, and a want
 // raised then would fetch a part the next pass explains.
-const owedAfterPasses = 3
+const wantAfterPasses = 3
 
-// owedWants is the obligations this node owes for parts only the peer holds, confirmed across
-// [owedAfterPasses] passes. A part that becomes accounted for in between resets.
-func (s *Syncer) owedWants(enginePrefix string, peer, local *bucketindex.Index) []bucketindex.Want {
-	ents := owedEntries(peer, accountOf(local), retentionHorizon(local))
+// confirmedWants is the obligations this node owes for parts only the peer holds, confirmed across
+// [wantAfterPasses] passes. A part that becomes accounted for in between resets.
+func (s *Syncer) confirmedWants(enginePrefix string, peer, local *bucketindex.Index) []bucketindex.Want {
+	ents := unaccountedEntries(peer, accountOf(local), retentionHorizon(local))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	counts := s.stateFor(enginePrefix).owed
+	counts := s.stateFor(enginePrefix).unaccounted
 	seen := make(map[string]struct{}, len(ents))
 
 	var out []bucketindex.Want
@@ -939,7 +939,7 @@ func (s *Syncer) owedWants(enginePrefix string, peer, local *bucketindex.Index) 
 		seen[e.Prefix] = struct{}{}
 		counts[e.Prefix]++
 
-		if counts[e.Prefix] >= owedAfterPasses {
+		if counts[e.Prefix] >= wantAfterPasses {
 			out = append(out, bucketindex.WantOf(*e, local.Generation))
 		}
 	}

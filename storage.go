@@ -1245,7 +1245,7 @@ func (s *Storage) maintainOneEngine(
 		if _, ok := owned[tid]; !ok {
 			// A replica, not the compaction owner: pull the owner's flushed parts and trim the
 			// head to the unflushed window, bounding memory.
-			s.syncOwed(ctx, tid, signalPrefix, false, ops.adopt)
+			s.syncWants(ctx, tid, signalPrefix, false, ops.adopt)
 			s.refreshOrLog(ctx, "replica refresh failed", enginePrefix, ops.refresh)
 			// Rebuild this node's erasure-coded shard slot if a membership change left it
 			// missing (a no-op when not an EC owner or the shard is already present).
@@ -1255,7 +1255,7 @@ func (s *Storage) maintainOneEngine(
 		}
 	}
 
-	if s.syncOwed(ctx, tid, signalPrefix, true, ops.adopt) {
+	if s.syncWants(ctx, tid, signalPrefix, true, ops.adopt) {
 		// Backfilled parts from a peer (this node just gained the shard): reload them before
 		// flushing so the part sequence advances past the synced parts.
 		s.refreshOrLog(ctx, "backfill refresh failed", enginePrefix, ops.refresh)

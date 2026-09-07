@@ -159,16 +159,16 @@ func (s *Storage) syncParts(ctx context.Context, tid signal.TenantID, signalPref
 	return synced
 }
 
-// syncOwed is [Storage.syncParts] handing the pass's repair obligations to the engine: parts a peer
+// syncWants is [Storage.syncParts] handing the pass's repair obligations to the engine: parts a peer
 // holds that this node's index does not account for. Only the engine can state them, since only it
 // commits the index the repair pass reads.
-func (s *Storage) syncOwed(
+func (s *Storage) syncWants(
 	ctx context.Context, tid signal.TenantID, signalPrefix string, strict bool,
 	adopt func([]bucketindex.Want),
 ) bool {
 	synced, st, _ := s.syncPartsResult(ctx, tid, signalPrefix, strict)
-	if len(st.Owed) > 0 {
-		adopt(st.Owed)
+	if len(st.Wants) > 0 {
+		adopt(st.Wants)
 	}
 
 	return synced
