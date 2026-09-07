@@ -133,11 +133,16 @@ One rule, by destination: the *why* goes in `ARCH.md`; code comments only what t
   preconditions; `assert` for independent value checks). Prefer it for new and converted tests over
   hand-written `if got != want { t.Fatalf(...) }`. Fuzz/benchmark bodies stay testify-free where it
   would add overhead to the hot loop.
-- Run `go test ./...` and `go vet ./...`; keep the tree green and formatted (`gofmt`/`goimports`).
+- Run `go test ./...`; keep the tree green and formatted (`gofmt`/`goimports`).
 - **Lint before every push.** Run `golangci-lint run ./...` (config: `.golangci.yml`) and fix all
   issues in changed code before committing/pushing — CI (`.github/workflows/x.yml`) fails the PR
-  otherwise. It is stricter than `go vet` (e.g. `modernize`: prefer `slices.Sort` over `sort.Slice`;
-  `thelper`: test/bench helpers start with `t.Helper()`/`b.Helper()`).
+  otherwise. It runs `govet` among others, so it subsumes `go vet` and is stricter (`modernize`:
+  prefer `slices.Sort` over `sort.Slice`; `thelper`: test/bench helpers start with
+  `t.Helper()`/`b.Helper()`).
+- **Do not run bare `go vet ./...`.** It cannot pass: `query/promql` implements Prometheus'
+  `chunkenc.Iterator`, whose `Seek(int64) ValueType` trips `stdmethods`, and the `//nolint:govet`
+  that silences it is a golangci-lint directive bare vet does not read. A gate that always fails is
+  a gate that hides the finding it exists to catch — `golangci-lint run ./...` is the vet gate.
 
 ## Architecture invariants to preserve
 
