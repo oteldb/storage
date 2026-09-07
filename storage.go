@@ -1442,12 +1442,15 @@ func (s *Storage) maintain(ctx context.Context) {
 	// the replica first mirrors the owner's backend objects (partsync) and then refreshes from its
 	// own backend; the owner backfills strictly-newer peer parts before compacting, so a
 	// newly-gained owner never restarts a shard's part sequence from scratch.
-	maintainEngine := func(tid signal.TenantID, signalPrefix string, flush, merge, refresh func() error, ecParts func() []ecPartRef) {
+	maintainEngine := func(
+		tid signal.TenantID, signalPrefix string, flush, merge, refresh func() error,
+		adopt func([]bucketindex.Want), ecParts func() []ecPartRef,
+	) {
 		if owned != nil {
 			if _, ok := owned[tid]; !ok {
 				// A replica, not the compaction owner: pull the owner's flushed parts and trim the
 				// head to the unflushed window, bounding memory.
-				s.syncParts(ctx, tid, signalPrefix, false)
+				s.syncOwed(ctx, tid, signalPrefix, false, adopt)
 				s.refreshOrLog(ctx, "replica refresh failed", string(s.normalizeTenant(tid))+signalPrefix, refresh)
 				// Rebuild this node's erasure-coded shard slot if a membership change left it
 				// missing (a no-op when not an EC owner or the shard is already present).
@@ -1457,7 +1460,7 @@ func (s *Storage) maintain(ctx context.Context) {
 			}
 		}
 
-		if s.syncParts(ctx, tid, signalPrefix, true) {
+		if s.syncOwed(ctx, tid, signalPrefix, true, adopt) {
 			// Backfilled parts from a peer (this node just gained the shard): reload them before
 			// flushing so the part sequence advances past the synced parts.
 			s.refreshOrLog(ctx, "backfill refresh failed", string(s.normalizeTenant(tid))+signalPrefix, refresh)
@@ -1541,6 +1544,7 @@ func (s *Storage) maintain(ctx context.Context) {
 			maintainEngine(tid, metricsPrefix, func() error { return eng.Flush(ctx) },
 				func() error { return mergeMetrics(tid, eng) },
 				func() error { return refreshMetrics(eng) },
+				eng.AdoptWants,
 				func() []ecPartRef { return coldMetric(eng) })
 		}})
 	}
@@ -1574,6 +1578,7 @@ func (s *Storage) maintain(ctx context.Context) {
 				maintainEngine(tid, signalPrefix, func() error { return eng.Flush(ctx) },
 					func() error { return mergeRecords(tid, eng) },
 					func() error { return refreshRecords(eng) },
+					eng.AdoptWants,
 					func() []ecPartRef { return coldRecord(eng) })
 			}})
 		}

@@ -250,7 +250,8 @@ A part the owner cannot open is handled identically: only `backend.ErrNotExist` 
 `Entries` and records a `bucketindex.Want` in the same compare-and-swap, every other error still
 fails the load, and the sweep spares a wanted part's remaining objects
 ([`../engine/ARCH.md`](../engine/ARCH.md), "A part the owner cannot read becomes a want, not a
-removal").
+removal"). `AdoptWants` is shared with it too: obligations partsync discovers for parts a peer
+holds that this index never named, which survive a load because nothing in the index implies them.
 
 ## Lifecycle guards
 

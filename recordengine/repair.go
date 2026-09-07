@@ -145,7 +145,7 @@ func (e *Engine) repairWants(ctx context.Context) {
 	e.mu.Lock()
 	// Pending wants are obligations too: a load that could not commit them left them for the first
 	// commit this engine makes, and the repair commit is one.
-	wants := slices.Concat(e.wants, e.pendingWants)
+	wants := slices.Concat(e.wants, e.pendingWants, e.adoptedWants)
 	holes := slices.Clone(e.holes)
 	entries := e.entriesLocked()
 	e.mu.Unlock()

@@ -250,6 +250,13 @@ compare-and-swap: the drop and the obligation are the same commit, so no crash c
 without the want and a lost race leaves neither — the retry re-reads and re-derives both from the
 same evidence.
 
+**A want can also arrive from outside.** `AdoptWants` takes obligations the engine cannot derive
+from its own index — parts a peer holds that this index never named, which it therefore could never
+report losing (`cluster/ARCH.md`, partsync). They behave like a discovered want from there on, with
+one difference: they survive a load, since nothing in the index implies them and a reload would drop
+them before any commit could publish them. They are stated at this engine's generation, not the
+discovering peer's, and one naming a part already indexed is dropped.
+
 Two things consume them. Repair fetches the missing part back (or acknowledges the loss as a hole),
 and the **read policy** refuses to answer over one: `WantOverlaps` reports whether an outstanding
 want covers a query window, which is what the cluster read seam disclaims on (`cluster/ARCH.md`).

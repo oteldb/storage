@@ -18,6 +18,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/ec"
 	"github.com/oteldb/storage/cluster/etcd"
@@ -158,18 +159,43 @@ func (s *Storage) syncParts(ctx context.Context, tid signal.TenantID, signalPref
 	return synced
 }
 
+// syncOwed is [Storage.syncParts] handing the pass's repair obligations to the engine: parts a peer
+// holds that this node's index does not account for. Only the engine can state them, since only it
+// commits the index the repair pass reads.
+func (s *Storage) syncOwed(
+	ctx context.Context, tid signal.TenantID, signalPrefix string, strict bool,
+	adopt func([]bucketindex.Want),
+) bool {
+	synced, st, _ := s.syncPartsResult(ctx, tid, signalPrefix, strict)
+	if len(st.Owed) > 0 {
+		adopt(st.Owed)
+	}
+
+	return synced
+}
+
 // syncPartsStatus is [Storage.syncParts] with the mirroring error surfaced, for the one caller
 // that must tell "the peers have nothing under this prefix" from "the peers could not be read".
 func (s *Storage) syncPartsStatus(
 	ctx context.Context, tid signal.TenantID, signalPrefix string, strict bool,
 ) (bool, error) {
+	synced, _, err := s.syncPartsResult(ctx, tid, signalPrefix, strict)
+
+	return synced, err
+}
+
+// syncPartsResult is one mirroring pass with the whole outcome: whether it installed a newer copy,
+// what it found, and the error.
+func (s *Storage) syncPartsResult(
+	ctx context.Context, tid signal.TenantID, signalPrefix string, strict bool,
+) (bool, partsync.Stats, error) {
 	if s.cluster == nil || !s.cluster.private {
-		return false, nil
+		return false, partsync.Stats{}, nil
 	}
 
 	local, remotes := s.shardOwners(tid)
 	if !local || len(remotes) == 0 {
-		return false, nil
+		return false, partsync.Stats{}, nil
 	}
 
 	enginePrefix := string(s.normalizeTenant(tid)) + signalPrefix
@@ -179,7 +205,7 @@ func (s *Storage) syncPartsStatus(
 		s.obs.Logger(ctx).Warn("part sync failed",
 			zap.String("prefix", enginePrefix), zap.Bool("strict", strict), zap.Error(err))
 
-		return false, err
+		return false, partsync.Stats{}, err
 	}
 
 	if st.Synced && st.Copied > 0 {
@@ -188,7 +214,7 @@ func (s *Storage) syncPartsStatus(
 			zap.Int("copied", st.Copied), zap.Int64("bytes", st.CopiedBytes), zap.Int("pruned", st.Pruned))
 	}
 
-	return st.Synced, nil
+	return st.Synced, st, nil
 }
 
 // splitEnginePrefix parses an engine prefix ("{tenant}{signalPrefix}", e.g. "default/metrics")

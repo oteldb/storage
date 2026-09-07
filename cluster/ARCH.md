@@ -368,9 +368,25 @@ pass discharges with a commit, and that commit is what republishes the part at a
 adopt; a hole becomes the want it discharged, since an entry and a hole cannot share a prefix, and
 `LostParts` stays where it was, as on any revocation. Dropping the want instead would leave the owner
 nothing to commit, and a replica's damaged, higher-generation index would stand until the next flush.
-An **omission** carries nothing: the peer stated no obligation, this node reads the part fine, and
-inventing a want would point the loss counters at the healthy node. The signal is `Stats.Retained`
-instead — the `Withheld` of the object half, for a peer that omits rather than claims. And repair asks
+An **omission** carries nothing *for the node that holds the part*: the peer stated no obligation,
+this node reads the part fine, and inventing a want here would point the loss counters at the healthy
+node. The signal is `Stats.Retained` instead — the `Withheld` of the object half, for a peer that
+omits rather than claims.
+
+The obligation belongs to the other end, and only that end can state it. A part an index never named
+is one it can never report losing, so it can only ever be someone else's omission and the claim path
+above never reaches it — a part flushed by a node that then lost the shard stays on one disk forever,
+under-replicated, while the new owner's completeness check sees nothing missing and answers reads
+short. So a pass whose local index *supersedes* the peer's runs the dual of the held check
+(`owedEntries`): peer entries the local index does not account for become `Stats.Owed`, which
+`Storage.syncOwed` hands to the engine as wants for the ordinary repair pass to fetch and commit.
+
+Two things bound it, because silence is weaker evidence for acquiring a part than for keeping one.
+An index that predates tombstones states nothing to reason from. And below the oldest data the local
+index still names, a retention drop whose tombstone has aged out (`MaxRemovals`) is indistinguishable
+from a part that never arrived, so re-fetching would resurrect deleted rows. A confirmation count
+(`owedAfterPasses`) covers the third case, a rebalance in flight briefly leaving two indexes
+disagreeing. And repair asks
 the disks: `FetchWants` falls back to each peer's listing for a want no index names (below).
 
 **Nor is this node's own index evidence of its own disk.** A pass is index-driven — nothing newer at

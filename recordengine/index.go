@@ -51,7 +51,7 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 			// Only a commit that landed discharges a want: the obligation is dropped from the
 			// engine's own list here, never while building an index that may not be written.
 			e.wants = ix.Wanted
-			e.pendingWants = nil
+			e.pendingWants, e.adoptedWants = nil, nil
 			// Same rule for the blocks this attempt allocated: a part numbered before its CAS
 			// landed would hold a block the winner took, and the retry would not re-allocate.
 			for i := range e.pendingBlocks {
@@ -295,6 +295,15 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 
 	for i := range e.pendingWants {
 		w := e.pendingWants[i]
+		w.Generation = e.generation
+		ix.RecordWant(w)
+	}
+
+	// Adopted obligations are stated at this engine's own generation too: they name a part this
+	// index never held, so the discovering peer's generation says nothing about when this node
+	// came to owe it.
+	for i := range e.adoptedWants {
+		w := e.adoptedWants[i]
 		w.Generation = e.generation
 		ix.RecordWant(w)
 	}

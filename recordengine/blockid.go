@@ -143,7 +143,7 @@ func widestClaim(claims []bucketindex.Claim) bucketindex.Claim {
 func (e *Engine) nextBlockLocked(ix *bucketindex.Index) uint64 {
 	seed := bucketindex.Index{
 		Entries:         slices.Concat(ix.Entries, e.holes),
-		Wanted:          slices.Concat(e.wants, e.pendingWants, e.pendingHoles),
+		Wanted:          slices.Concat(e.wants, e.pendingWants, e.adoptedWants, e.pendingHoles),
 		AllocatedBlocks: e.allocated,
 	}
 
