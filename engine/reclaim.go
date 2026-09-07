@@ -97,6 +97,10 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context) error {
 		live[e.pendingWants[i].Prefix] = struct{}{}
 	}
 
+	for i := range e.adoptedWants {
+		live[e.adoptedWants[i].Prefix] = struct{}{}
+	}
+
 	var orphans []string
 
 	for _, k := range keys {

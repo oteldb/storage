@@ -265,6 +265,10 @@ type Engine struct {
 	// discovery pending rather than committing it on the spot is what makes dropping the entry and
 	// recording the want one CAS commit instead of two.
 	pendingWants []bucketindex.Want
+	// adoptedWants are obligations handed in from outside (cluster/partsync, for parts a peer holds
+	// that this index never named). Unlike pendingWants they survive a load: nothing in the index
+	// implies them, so a reload would drop them before any commit could publish them.
+	adoptedWants []bucketindex.Want
 	// pendingBlocks are the block identities the index under construction chose for the parts that
 	// do not have one yet. Applied only by the commit that lands — see [blockAssignment].
 	pendingBlocks []blockAssignment
@@ -546,7 +550,7 @@ func (e *Engine) Stats() Stats {
 		HeadAge:       e.head.age(),
 		IdentityBytes: e.head.identityBytes(),
 		Parts:         len(e.parts),
-		WantedParts:   len(e.wants) + len(e.pendingWants),
+		WantedParts:   len(e.wants) + len(e.pendingWants) + len(e.adoptedWants),
 		Holes:         len(e.holes),
 		LostParts:     e.lostParts,
 		MaxTime:       e.head.newest,

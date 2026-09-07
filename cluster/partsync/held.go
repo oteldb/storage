@@ -2,6 +2,7 @@ package partsync
 
 import (
 	"context"
+	"math"
 	"path"
 	"strings"
 
@@ -65,6 +66,49 @@ func (s *Syncer) heldEntries(
 	}
 
 	return out, nil
+}
+
+// owedEntries is [Syncer.heldEntries] with the roles swapped: the parts the *peer's* index names
+// live that the local index does not account for. It is the direction the claim path cannot reach —
+// a part the local node never indexed can only ever be another node's `omitted`, and an owner
+// cannot report losing something absent from its index, so nothing ever states the obligation.
+//
+// Silence is weaker evidence here than it is for a deletion, so two things bound it. An index that
+// predates tombstones states nothing to reason from. And below the oldest data the local index
+// still names, a retention drop whose tombstone has aged out ([bucketindex.MaxRemovals]) is
+// indistinguishable from a part that never arrived — re-fetching one would resurrect deleted data.
+func owedEntries(peer *bucketindex.Index, local peerAccount, horizon int64) []bucketindex.Entry {
+	if !local.stated {
+		return nil
+	}
+
+	var out []bucketindex.Entry
+
+	for i := range peer.Entries {
+		e := &peer.Entries[i]
+		if e.Hole || local.accountsFor(*e) || e.MaxTime < horizon {
+			continue
+		}
+
+		out = append(out, *e)
+	}
+
+	return out
+}
+
+// retentionHorizon is the oldest timestamp the index still names. An index naming nothing returns
+// [math.MaxInt64], which owes nothing: a node with no parts of its own adopts a peer's index
+// wholesale rather than repairing into it part by part.
+func retentionHorizon(ix *bucketindex.Index) int64 {
+	horizon := int64(math.MaxInt64)
+
+	for i := range ix.Entries {
+		if e := &ix.Entries[i]; !e.Hole && e.MinTime < horizon {
+			horizon = e.MinTime
+		}
+	}
+
+	return horizon
 }
 
 // peerAccount is what a peer's index states about the parts it does not hold.
