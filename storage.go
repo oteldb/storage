@@ -1220,6 +1220,63 @@ func (s *Storage) walFor(prefix string) (*wal.SegmentWriter, error) {
 	return w, nil
 }
 
+// engineOps is one engine's maintenance callbacks, bound by the caller that holds the engine.
+type engineOps struct {
+	flush, merge, refresh func() error
+	adopt                 func([]bucketindex.Want)
+	ecParts               func() []ecPartRef
+}
+
+// maintainOneEngine flushes then merges one engine, unless this node is a non-owning replica for
+// its shard (then it only syncs and refreshes). merge is signal-specific: metrics carry
+// downsampling (engine.MergeWith), the record signals carry retention only.
+//
+// With a private (per-node) backend, flushed parts are not visible through a shared store, so the
+// replica first mirrors the owner's backend objects (partsync) and then refreshes from its own
+// backend; the owner backfills strictly-newer peer parts before compacting, so a newly-gained owner
+// never restarts a shard's part sequence from scratch.
+func (s *Storage) maintainOneEngine(
+	ctx context.Context, tid signal.TenantID, signalPrefix string,
+	owned map[signal.TenantID]struct{}, ops engineOps,
+) {
+	enginePrefix := string(s.normalizeTenant(tid)) + signalPrefix
+
+	if owned != nil {
+		if _, ok := owned[tid]; !ok {
+			// A replica, not the compaction owner: pull the owner's flushed parts and trim the
+			// head to the unflushed window, bounding memory.
+			s.syncOwed(ctx, tid, signalPrefix, false, ops.adopt)
+			s.refreshOrLog(ctx, "replica refresh failed", enginePrefix, ops.refresh)
+			// Rebuild this node's erasure-coded shard slot if a membership change left it
+			// missing (a no-op when not an EC owner or the shard is already present).
+			s.repairEcShards(ctx, tid, ops.ecParts())
+
+			return
+		}
+	}
+
+	if s.syncOwed(ctx, tid, signalPrefix, true, ops.adopt) {
+		// Backfilled parts from a peer (this node just gained the shard): reload them before
+		// flushing so the part sequence advances past the synced parts.
+		s.refreshOrLog(ctx, "backfill refresh failed", enginePrefix, ops.refresh)
+	}
+
+	_ = ops.flush()
+	_ = ops.merge()
+
+	// Erasure-code the tenant's now-cold parts (shared-nothing + EC policy only; a no-op
+	// otherwise), replacing their full copies with shards, then prune the owner's staged shards
+	// once distributed and rebuild this node's slot if a membership change lost it.
+	cold := ops.ecParts()
+	s.convertColdParts(ctx, tid, cold)
+	s.repairEcShards(ctx, tid, cold)
+
+	// Shared-nothing: nudge the shard's secondaries to mirror the freshly flushed/merged parts
+	// now instead of on their next tick. Best-effort — pull remains the source of truth, so a lost
+	// notify only costs latency.
+	s.notifyPeers(ctx, tid, signalPrefix)
+}
+
 // runMaintenance periodically flushes and compacts every tenant engine until Close stops
 // it. It is the single background loop driving flush (age), merge+retention, and — poked by the
 // write path via flushWake — the head-size flush trigger ([Options.FlushThresholdBytes]). Both
@@ -1446,39 +1503,9 @@ func (s *Storage) maintain(ctx context.Context) {
 		tid signal.TenantID, signalPrefix string, flush, merge, refresh func() error,
 		adopt func([]bucketindex.Want), ecParts func() []ecPartRef,
 	) {
-		if owned != nil {
-			if _, ok := owned[tid]; !ok {
-				// A replica, not the compaction owner: pull the owner's flushed parts and trim the
-				// head to the unflushed window, bounding memory.
-				s.syncOwed(ctx, tid, signalPrefix, false, adopt)
-				s.refreshOrLog(ctx, "replica refresh failed", string(s.normalizeTenant(tid))+signalPrefix, refresh)
-				// Rebuild this node's erasure-coded shard slot if a membership change left it
-				// missing (a no-op when not an EC owner or the shard is already present).
-				s.repairEcShards(ctx, tid, ecParts())
-
-				return
-			}
-		}
-
-		if s.syncOwed(ctx, tid, signalPrefix, true, adopt) {
-			// Backfilled parts from a peer (this node just gained the shard): reload them before
-			// flushing so the part sequence advances past the synced parts.
-			s.refreshOrLog(ctx, "backfill refresh failed", string(s.normalizeTenant(tid))+signalPrefix, refresh)
-		}
-
-		_ = flush()
-		_ = merge()
-
-		// Erasure-code the tenant's now-cold parts (shared-nothing + EC policy only; a no-op
-		// otherwise), replacing their full copies with shards, then prune the owner's staged
-		// shards once distributed and rebuild this node's slot if a membership change lost it.
-		s.convertColdParts(ctx, tid, ecParts())
-		s.repairEcShards(ctx, tid, ecParts())
-
-		// Shared-nothing: nudge the shard's secondaries to mirror the freshly flushed/merged
-		// parts now instead of on their next tick. Best-effort — pull remains the source of
-		// truth, so a lost notify only costs latency.
-		s.notifyPeers(ctx, tid, signalPrefix)
+		s.maintainOneEngine(ctx, tid, signalPrefix, owned, engineOps{
+			flush: flush, merge: merge, refresh: refresh, adopt: adopt, ecParts: ecParts,
+		})
 	}
 
 	// coldParts snapshots an engine's parts as [ecPartRef]s (prefix + max time) for the converter.
