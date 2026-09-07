@@ -7,8 +7,13 @@ import "math"
 // A fine bucket (b, b+step] enters at b+step; a single sample enters at its own timestamp. Every
 // entry holds at least one sample, so an empty window is an empty span of entries.
 type windowEnt struct {
-	end   int64
-	count int64
+	end int64
+	// rows is the entry's unweighted sample count and count its weighted one (Σ scale factors).
+	// The slider adds and subtracts both, but tests membership on rows: an integer survives that
+	// arithmetic exactly, where a float count could leave an epsilon behind and report a window
+	// the data has already left.
+	rows  int64
+	count float64
 	sum   float64
 
 	min, max float64
@@ -71,6 +76,7 @@ func (s *windowSlider) slide(ents []windowEnt, step, window, phase, end int64) [
 		// An entry enters the window once t reaches its end, and stays until the lower bound does.
 		for head < len(ents) && ents[head].end <= t {
 			acc.Count += ents[head].count
+			acc.Rows += ents[head].rows
 			acc.Sum += ents[head].sum
 			s.push(ents, head)
 			head++
@@ -79,17 +85,19 @@ func (s *windowSlider) slide(ents []windowEnt, step, window, phase, end int64) [
 		// An entry whose end has fallen to the window's open lower bound has left it: (t-window, t].
 		for tail < head && ents[tail].end <= t-window {
 			acc.Count -= ents[tail].count
+			acc.Rows -= ents[tail].rows
 			acc.Sum -= ents[tail].sum
 			tail++
 		}
 
 		s.expire(tail)
 
-		if acc.Count > 0 {
+		if acc.Rows > 0 {
 			dst = append(dst, WindowAgg{
 				End: t,
 				SeriesAgg: SeriesAgg{
 					Count: acc.Count,
+					Rows:  acc.Rows,
 					Sum:   acc.Sum,
 					Min:   ents[s.mins[s.minLo]].min,
 					Max:   ents[s.maxs[s.maxLo]].max,
@@ -99,7 +107,8 @@ func (s *windowSlider) slide(ents []windowEnt, step, window, phase, end int64) [
 			continue
 		}
 
-		acc.Sum = 0 // the window emptied: drop whatever rounding the add/subtract pairs left behind
+		// The window emptied: drop whatever rounding the add/subtract pairs left behind.
+		acc.Count, acc.Sum = 0, 0
 
 		if head == len(ents) {
 			break // every entry has expired and none is left to enter

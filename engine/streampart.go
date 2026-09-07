@@ -143,7 +143,7 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 	if p.withStats {
 		agg := SeriesAgg{}
 		for _, v := range values {
-			agg.addSample(v)
+			agg.addSample(v, 1) // the sidecar is written only for an unsampled part; see encodeSeriesStats
 		}
 
 		p.statsIDs = append(p.statsIDs, id)
@@ -163,7 +163,7 @@ func (p *partStreamWriter) residentBytes() int64 {
 	const (
 		runBytes = 24 // chunk.U128Run
 		idBytes  = 16 // chunk.U128
-		aggBytes = 32 // SeriesAgg
+		aggBytes = 40 // SeriesAgg
 	)
 
 	total := p.w.ResidentBytes() + int64(cap(p.runs))*runBytes

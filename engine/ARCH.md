@@ -763,6 +763,19 @@ I/O-free under it.
 step-aligned grid. With `Config.AggregateStats` each part writes a small stats sidecar
 (`{prefix}/stats`), and a range **fully covering** a part folds it without decoding the value column.
 
+**Count and sum are weighted by the lossy-sampling scale factor**, so a sampled tenant's aggregate
+estimates the originals rather than the rows that survived; min/max are not, an extremum being
+independent of multiplicity. `SeriesAgg.Count` is therefore a float (Σw) and carries `Rows`, the
+unweighted row count, beside it — an operator asking how much data is behind a number wants Rows,
+a query asking how many events happened wants Count. Rows is also the aggregate's emptiness test:
+the sliding-window accumulator adds and subtracts entries as windows move, and only an integer
+survives that exactly, where a float count could leave an epsilon behind and report a window the
+data has already left.
+
+The stats sidecar stays integral and unversioned because **both writers gate it on the part having
+no weight column**: every weight in a sidecar is 1, so Count equals Rows there, and a sampled part
+has no sidecar and takes the weighted decode path.
+
 Taken only when provably exact: in-window parts fully covered *and* pairwise time-disjoint, else it
 falls back to decode+merge, which dedups. Each in-memory source is a span of its own in that
 disjointness test, not one merged span: the recent tier holds already-flushed samples that a

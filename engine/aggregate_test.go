@@ -27,15 +27,17 @@ func aggFromBatches(batches []*fetch.Batch) map[signal.SeriesID]engine.SeriesAgg
 	out := make(map[signal.SeriesID]engine.SeriesAgg, len(batches))
 	for _, b := range batches {
 		var a engine.SeriesAgg
-		for _, v := range b.Values {
-			if a.Count == 0 {
+		for i, v := range b.Values {
+			w := b.ScaleFactor(i)
+			if a.Rows == 0 {
 				a.Min, a.Max = v, v
 			} else {
 				a.Min = min(a.Min, v)
 				a.Max = max(a.Max, v)
 			}
-			a.Sum += v
-			a.Count++
+			a.Sum += w * v
+			a.Count += w
+			a.Rows++
 		}
 		out[b.ID] = a
 	}
@@ -72,7 +74,7 @@ func TestAggregateMatchesFetchSinglePart(t *testing.T) {
 
 	got := assertAggMatchesFetch(t, e, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
 	require.Len(t, got, 1)
-	assert.Equal(t, engine.SeriesAgg{Count: 40, Sum: 820, Min: 1, Max: 40}, got[api.Hash()])
+	assert.Equal(t, engine.SeriesAgg{Count: 40, Rows: 40, Sum: 820, Min: 1, Max: 40}, got[api.Hash()])
 }
 
 func TestAggregateMatchesFetchAcrossScenarios(t *testing.T) {
@@ -120,11 +122,11 @@ func TestAggregateDedupsOverlappingParts(t *testing.T) {
 
 	got := assertAggMatchesFetch(t, e, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
 	// ts 10→1, 20→9 (freshest), 30→4: count 3, sum 14, not 4 samples / sum 16.
-	assert.Equal(t, engine.SeriesAgg{Count: 3, Sum: 14, Min: 1, Max: 9}, got[s.Hash()])
+	assert.Equal(t, engine.SeriesAgg{Count: 3, Rows: 3, Sum: 14, Min: 1, Max: 9}, got[s.Hash()])
 }
 
 // stepBucket folds a value into a series' bucket map (the ground-truth bucketing).
-func stepBucket(m map[int64]engine.SeriesAgg, ts int64, v, step float64) {
+func stepBucket(m map[int64]engine.SeriesAgg, ts int64, v, w, step float64) {
 	bs := int64(0)
 	if step > 0 {
 		s := int64(step)
@@ -135,13 +137,14 @@ func stepBucket(m map[int64]engine.SeriesAgg, ts int64, v, step float64) {
 		bs = ts - r
 	}
 	a := m[bs]
-	if a.Count == 0 {
+	if a.Rows == 0 {
 		a.Min, a.Max = v, v
 	} else {
 		a.Min, a.Max = min(a.Min, v), max(a.Max, v)
 	}
-	a.Sum += v
-	a.Count++
+	a.Sum += w * v
+	a.Count += w
+	a.Rows++
 	m[bs] = a
 }
 
@@ -151,7 +154,7 @@ func stepFromBatches(batches []*fetch.Batch, step int64) map[signal.SeriesID][]e
 	for _, b := range batches {
 		m := map[int64]engine.SeriesAgg{}
 		for i, ts := range b.Timestamps {
-			stepBucket(m, ts, b.Values[i], float64(step))
+			stepBucket(m, ts, b.Values[i], b.ScaleFactor(i), float64(step))
 		}
 		list := make([]engine.BucketAgg, 0, len(m))
 		for start, a := range m {

@@ -108,7 +108,7 @@ func assertWindows(t *testing.T, want, got []engine.WindowAgg, msg string) {
 
 	for i := range want {
 		assert.Equalf(t, want[i].End, got[i].End, "%s: window %d end", msg, i)
-		assert.Equalf(t, want[i].Count, got[i].Count, "%s: window %d count", msg, i)
+		assert.InDeltaf(t, want[i].Count, got[i].Count, 1e-9, "%s: window %d count", msg, i)
 		assert.InDeltaf(t, want[i].Sum, got[i].Sum, 1e-9, "%s: window %d sum", msg, i)
 		assert.InDeltaf(t, want[i].Min, got[i].Min, 0, "%s: window %d min", msg, i)
 		assert.InDeltaf(t, want[i].Max, got[i].Max, 0, "%s: window %d max", msg, i)
@@ -317,10 +317,10 @@ func TestAggregateWindowHalfOpen(t *testing.T) {
 	require.NoError(t, err)
 
 	assertWindows(t, []engine.WindowAgg{
-		{End: 10, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 1, Min: 1, Max: 1}}, // (-10,10]: 10
-		{End: 20, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 3, Min: 1, Max: 2}}, // (0,20]: 10,20
-		{End: 30, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 5, Min: 2, Max: 3}}, // (10,30]: 20,30 — not 10
-		{End: 40, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 3, Min: 3, Max: 3}}, // (20,40]: 30
+		{End: 10, SeriesAgg: engine.SeriesAgg{Count: 1, Rows: 1, Sum: 1, Min: 1, Max: 1}}, // (-10,10]: 10
+		{End: 20, SeriesAgg: engine.SeriesAgg{Count: 2, Rows: 2, Sum: 3, Min: 1, Max: 2}}, // (0,20]: 10,20
+		{End: 30, SeriesAgg: engine.SeriesAgg{Count: 2, Rows: 2, Sum: 5, Min: 2, Max: 3}}, // (10,30]: 20,30 — not 10
+		{End: 40, SeriesAgg: engine.SeriesAgg{Count: 1, Rows: 1, Sum: 3, Min: 3, Max: 3}}, // (20,40]: 30
 	}, got[s.Hash()], "half-open window")
 }
 
@@ -355,7 +355,7 @@ func TestAggregateWindowMatchesStep(t *testing.T) {
 
 	for i := range want {
 		assert.Equal(t, want[i].Start+10, got[i].End, "window %d ends where the bucket does", i)
-		assert.Equal(t, want[i].Count, got[i].Count, "window %d count", i)
+		assert.InDelta(t, want[i].Count, got[i].Count, 1e-9, "window %d count", i)
 		assert.InDelta(t, want[i].Sum, got[i].Sum, 1e-9, "window %d sum", i)
 	}
 }

@@ -45,8 +45,8 @@ func TestUnionNamed(t *testing.T) {
 
 	// Shard 1 returns a superset (api + web); only api survives the full matcher set.
 	unionNamed(out, []engine.NamedAgg{
-		{Series: api, Buckets: []engine.BucketAgg{{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 5, Min: 1, Max: 4}}}},
-		{Series: web, Buckets: []engine.BucketAgg{{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 9, Min: 9, Max: 9}}}},
+		{Series: api, Buckets: []engine.BucketAgg{{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 2, Rows: 2, Sum: 5, Min: 1, Max: 4}}}},
+		{Series: web, Buckets: []engine.BucketAgg{{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 1, Rows: 1, Sum: 9, Min: 9, Max: 9}}}},
 	}, matchers)
 
 	require.Len(t, out, 1)
@@ -56,7 +56,7 @@ func TestUnionNamed(t *testing.T) {
 	// A second shard surfaces the same series in a different bucket ⇒ merge (defensive; series are
 	// normally shard-partitioned).
 	unionNamed(out, []engine.NamedAgg{
-		{Series: api, Buckets: []engine.BucketAgg{{Start: 60, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 3, Min: 3, Max: 3}}}},
+		{Series: api, Buckets: []engine.BucketAgg{{Start: 60, SeriesAgg: engine.SeriesAgg{Count: 1, Rows: 1, Sum: 3, Min: 3, Max: 3}}}},
 	}, matchers)
 
 	list := out[api.Hash()]
@@ -110,7 +110,8 @@ func TestAggregateMetricsEndToEnd(t *testing.T) {
 				mx = v
 			}
 		}
-		assert.Equal(t, int64(len(b.Values)), agg.Count)
+		assert.InDelta(t, len(b.Values), agg.Count, 0)
+		assert.Equal(t, int64(len(b.Values)), agg.Rows)
 		assert.InDelta(t, sum, agg.Sum, 0)
 		assert.InDelta(t, mn, agg.Min, 0)
 		assert.InDelta(t, mx, agg.Max, 0)
@@ -317,7 +318,7 @@ func TestAggregateMetricsWindowNamed(t *testing.T) {
 			want, ok := findAggregate(perWindow, na.Series.Hash())
 			require.Truef(t, ok, "series absent from the narrowed window ending at %d", w.End)
 			assert.InDeltaf(t, want.Sum, w.Sum, 1e-6, "window ending %d sum", w.End)
-			assert.Equalf(t, want.Count, w.Count, "window ending %d count", w.End)
+			assert.InDeltaf(t, want.Count, w.Count, 1e-9, "window ending %d count", w.End)
 			assert.InDeltaf(t, want.Min, w.Min, 0, "window ending %d min", w.End)
 			assert.InDeltaf(t, want.Max, w.Max, 0, "window ending %d max", w.End)
 		}
@@ -372,7 +373,7 @@ func TestAggregateMetricsWindowNamedDegenerate(t *testing.T) {
 		}
 
 		got := folded[na.Series.Hash()]
-		assert.Equal(t, a.Count, got.Count, "window == step partitions the samples exactly once")
+		assert.InDelta(t, a.Count, got.Count, 1e-9, "window == step partitions the samples exactly once")
 		assert.InDelta(t, a.Sum, got.Sum, 1e-6)
 		assert.InDelta(t, a.Min, got.Min, 0)
 		assert.InDelta(t, a.Max, got.Max, 0)
@@ -408,13 +409,14 @@ func findAggregate(list []SeriesAggregate, id signal.SeriesID) (engine.SeriesAgg
 // foldAgg merges one bucket's aggregate into a running total, mirroring what a caller summing the
 // stepped result back to a whole-range answer would do.
 func foldAgg(dst *engine.SeriesAgg, src engine.SeriesAgg) {
-	if dst.Count == 0 {
+	if dst.Rows == 0 {
 		*dst = src
 
 		return
 	}
 
 	dst.Count += src.Count
+	dst.Rows += src.Rows
 	dst.Sum += src.Sum
 	dst.Min = min(dst.Min, src.Min)
 	dst.Max = max(dst.Max, src.Max)

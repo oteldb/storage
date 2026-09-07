@@ -15,15 +15,28 @@ import (
 // and avg (Sum/Count) without the raw samples. It is the unit of the aggregate-pushdown fast path:
 // a part precomputes one per series at write time (the stats sidecar) so a query whose range fully
 // covers the part folds these instead of decoding its value column.
+//
+// Count and Sum are **weighted** by each sample's lossy-sampling factor (see
+// [fetch.Batch.ScaleFactors]): a kept sample standing for N originals contributes N to Count and
+// N·v to Sum, so a sampled tenant's count/sum/avg estimate the unsampled truth instead of the rows
+// that survived. Min and Max are unweighted — an extremum does not depend on multiplicity. For an
+// unsampled series every weight is 1 and Count equals Rows.
 type SeriesAgg struct {
-	Count    int64
+	Count float64
+	// Rows is how many stored samples were folded, unweighted. It answers "how much data is
+	// behind this" (an operator's question) where Count answers "how many events happened" (a
+	// query's), and it is the aggregate's emptiness test: an integer, so it stays exact under the
+	// add-then-subtract arithmetic a sliding window does to Count and Sum.
+	Rows     int64
 	Sum      float64
 	Min, Max float64
 }
 
-// addSample folds one value into the aggregate.
-func (a *SeriesAgg) addSample(v float64) {
-	if a.Count == 0 {
+// addSample folds one value carrying weight w into the aggregate. A weight is taken literally,
+// including zero: the producers all default an absent weight to 1 (see [fetch.Batch.ScaleFactor]),
+// so a zero here is real data, not a missing factor.
+func (a *SeriesAgg) addSample(v, w float64) {
+	if a.Rows == 0 {
 		a.Min, a.Max = v, v
 	} else {
 		if v < a.Min {
@@ -34,17 +47,18 @@ func (a *SeriesAgg) addSample(v float64) {
 		}
 	}
 
-	a.Sum += v
-	a.Count++
+	a.Sum += w * v
+	a.Count += w
+	a.Rows++
 }
 
 // merge folds another aggregate in (the two must cover disjoint samples, or counts/sums double).
 func (a *SeriesAgg) merge(b SeriesAgg) {
-	if b.Count == 0 {
+	if b.Rows == 0 {
 		return
 	}
 
-	if a.Count == 0 {
+	if a.Rows == 0 {
 		*a = b
 
 		return
@@ -52,6 +66,7 @@ func (a *SeriesAgg) merge(b SeriesAgg) {
 
 	a.Sum += b.Sum
 	a.Count += b.Count
+	a.Rows += b.Rows
 
 	if b.Min < a.Min {
 		a.Min = b.Min
@@ -78,7 +93,7 @@ func computeSeriesStats(cols *flushColumns) ([]chunk.U128, []SeriesAgg) {
 			stats = append(stats, SeriesAgg{})
 		}
 
-		stats[len(stats)-1].addSample(cols.value[i])
+		stats[len(stats)-1].addSample(cols.value[i], 1)
 	}
 
 	return ids, stats
@@ -93,6 +108,11 @@ var errStatsCorrupt = errors.New("engine: corrupt series-stats sidecar")
 
 // encodeSeriesStats serializes the per-series aggregates: [magic][uvarint n] then per series
 // [u128 id][varint count][f64 sum][f64 min][f64 max], with a trailing CRC32C.
+//
+// The count stays an integer varint, and Rows is not written, because the sidecar is only ever
+// produced for an **unsampled** part (both writers gate on the absence of a weight column): every
+// weight is 1 there, so Count is integral and equals Rows. A sampled part has no sidecar and takes
+// the weighted decode path, which is why weighting the aggregate needs no format change here.
 func encodeSeriesStats(ids []chunk.U128, stats []SeriesAgg) []byte {
 	buf := make([]byte, 0, 8+len(ids)*40)
 	buf = binary.BigEndian.AppendUint32(buf, statsMagic)
@@ -101,7 +121,7 @@ func encodeSeriesStats(ids []chunk.U128, stats []SeriesAgg) []byte {
 	for i := range ids {
 		buf = binary.BigEndian.AppendUint64(buf, ids[i].Hi)
 		buf = binary.BigEndian.AppendUint64(buf, ids[i].Lo)
-		buf = binary.AppendVarint(buf, stats[i].Count)
+		buf = binary.AppendVarint(buf, int64(stats[i].Count))
 		buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(stats[i].Sum))
 		buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(stats[i].Min))
 		buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(stats[i].Max))
@@ -152,7 +172,8 @@ func decodeSeriesStats(data []byte) (map[signal.SeriesID]SeriesAgg, error) {
 			return nil, errors.Wrap(errStatsCorrupt, "sum/min/max")
 		}
 		out[id] = SeriesAgg{
-			Count: count,
+			Count: float64(count),
+			Rows:  count,
 			Sum:   math.Float64frombits(binary.BigEndian.Uint64(rest[:8])),
 			Min:   math.Float64frombits(binary.BigEndian.Uint64(rest[8:16])),
 			Max:   math.Float64frombits(binary.BigEndian.Uint64(rest[16:24])),

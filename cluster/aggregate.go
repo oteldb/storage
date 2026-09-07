@@ -196,12 +196,19 @@ func takeSeriesEnvelope(data []byte) (s signal.Series, n uint64, rest []byte, er
 	return s, n, data[m:], nil
 }
 
-// appendPointAgg appends one keyed aggregate — [varint key][varint count][f64 sum][f64 min][f64 max].
-// The key is a bucket start ([engine.BucketAgg]) or an evaluation timestamp ([engine.WindowAgg]);
-// the two aggregate shapes share this body.
+// appendPointAgg appends one keyed aggregate —
+// [varint key][varint rows][f64 count][f64 sum][f64 min][f64 max]. The key is a bucket start
+// ([engine.BucketAgg]) or an evaluation timestamp ([engine.WindowAgg]); the two aggregate shapes
+// share this body.
+//
+// Count is a float because a shard's aggregate is weighted by lossy sampling (see
+// [engine.SeriesAgg]), so a fan-out that shipped it as an integer would round a sampled tenant's
+// count on every hop. Rows rides along unweighted, which is what makes an empty aggregate
+// distinguishable from one whose weights sum to zero.
 func appendPointAgg(buf []byte, key int64, a engine.SeriesAgg) []byte {
 	buf = binary.AppendVarint(buf, key)
-	buf = binary.AppendVarint(buf, a.Count)
+	buf = binary.AppendVarint(buf, a.Rows)
+	buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(a.Count))
 	buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(a.Sum))
 	buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(a.Min))
 
@@ -216,22 +223,23 @@ func takePointAgg(data []byte) (key int64, a engine.SeriesAgg, rest []byte, err 
 	}
 	data = data[m:]
 
-	count, m := binary.Varint(data)
+	rows, m := binary.Varint(data)
 	if m <= 0 {
-		return 0, a, nil, errors.New("cluster: malformed count")
+		return 0, a, nil, errors.New("cluster: malformed row count")
 	}
 	data = data[m:]
 
-	if len(data) < 24 {
+	if len(data) < 32 {
 		return 0, a, nil, errors.New("cluster: truncated aggregate")
 	}
 
 	return key, engine.SeriesAgg{
-		Count: count,
-		Sum:   math.Float64frombits(binary.BigEndian.Uint64(data[:8])),
-		Min:   math.Float64frombits(binary.BigEndian.Uint64(data[8:16])),
-		Max:   math.Float64frombits(binary.BigEndian.Uint64(data[16:24])),
-	}, data[24:], nil
+		Rows:  rows,
+		Count: math.Float64frombits(binary.BigEndian.Uint64(data[:8])),
+		Sum:   math.Float64frombits(binary.BigEndian.Uint64(data[8:16])),
+		Min:   math.Float64frombits(binary.BigEndian.Uint64(data[16:24])),
+		Max:   math.Float64frombits(binary.BigEndian.Uint64(data[24:32])),
+	}, data[32:], nil
 }
 
 // aggregateRequestBody reads a POST body for an aggregate endpoint, writing the error response

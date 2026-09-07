@@ -100,7 +100,7 @@ func (e *Engine) AggregateRange(ctx context.Context, r fetch.Request) (map[signa
 			return nil, err
 		}
 
-		if agg.Count > 0 {
+		if agg.Rows > 0 {
 			out[id] = agg
 		}
 	}
@@ -248,11 +248,11 @@ func (e *Engine) bucketSeries(
 			return err
 		}
 
-		ts, values, _ := m.collect(nil, nil)
+		ts, values, sf := m.collect(nil, nil)
 		plan.releaseSeriesPins() // samples copied out; recirculate this series' block pins
 
 		for i := range ts {
-			grid.addSample(ts[i], values[i])
+			grid.addSample(ts[i], values[i], weightAt(sf, i))
 		}
 
 		plan.samplesDecoded += len(ts)
@@ -273,7 +273,7 @@ func (e *Engine) bucketSeries(
 
 		for i, ts := range b.Timestamps {
 			if ts >= plan.start && ts <= plan.end {
-				grid.addSample(ts, b.Values[i])
+				grid.addSample(ts, b.Values[i], b.ScaleFactor(i))
 			}
 		}
 	}
@@ -311,7 +311,7 @@ func (e *Engine) bucketPart(ctx context.Context, plan *enginePlan, p *part, id s
 
 	for i := rng.start; i < rng.end; i++ {
 		if dp.ts[i] >= plan.start && dp.ts[i] <= plan.end {
-			grid.addSample(dp.ts[i], dp.vals[i])
+			grid.addSample(dp.ts[i], dp.vals[i], weightAt(dp.sf, i))
 			n++
 		}
 	}
@@ -493,12 +493,12 @@ func aggViaDecode(ctx context.Context, plan *enginePlan, id signal.SeriesID) (Se
 		return SeriesAgg{}, err
 	}
 
-	_, values, _ := m.collect(nil, nil)
+	_, values, sf := m.collect(nil, nil)
 	plan.releaseSeriesPins() // samples copied out; recirculate this series' block pins
 
 	var agg SeriesAgg
-	for _, v := range values {
-		agg.addSample(v)
+	for i, v := range values {
+		agg.addSample(v, weightAt(sf, i))
 	}
 
 	plan.samplesDecoded += len(values)
@@ -522,7 +522,7 @@ func foldRange(agg *SeriesAgg, dp *decodedPart, rng rowRange, start, end int64) 
 			continue
 		}
 
-		agg.addSample(dp.vals[i])
+		agg.addSample(dp.vals[i], weightAt(dp.sf, i))
 		n++
 	}
 
@@ -536,6 +536,16 @@ func foldBatch(agg *SeriesAgg, b *fetch.Batch, start, end int64) {
 			continue
 		}
 
-		agg.addSample(b.Values[i])
+		agg.addSample(b.Values[i], b.ScaleFactor(i))
 	}
+}
+
+// weightAt reads sample i's lossy-sampling weight from a scale-factor column, defaulting to 1 when
+// the column is absent (the unsampled case, where it is never materialized).
+func weightAt(sf []float64, i int) float64 {
+	if sf == nil {
+		return 1
+	}
+
+	return sf[i]
 }

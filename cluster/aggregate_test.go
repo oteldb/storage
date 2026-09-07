@@ -43,11 +43,11 @@ func TestAggregatesCodec(t *testing.T) {
 
 	in := []engine.NamedAgg{
 		{Series: aggSeries("api"), Buckets: []engine.BucketAgg{
-			{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 5, Min: 1, Max: 4}},
-			{Start: 60, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 9, Min: 9, Max: 9}},
+			{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 2, Rows: 2, Sum: 5, Min: 1, Max: 4}},
+			{Start: 60, SeriesAgg: engine.SeriesAgg{Count: 1, Rows: 1, Sum: 9, Min: 9, Max: 9}},
 		}},
 		{Series: aggSeries("web"), Buckets: []engine.BucketAgg{
-			{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 1, Sum: 3, Min: 3, Max: 3}},
+			{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 1, Rows: 1, Sum: 3, Min: 3, Max: 3}},
 		}},
 	}
 
@@ -68,7 +68,7 @@ func TestRemoteAggregatorOverHTTP(t *testing.T) {
 	t.Parallel()
 
 	want := []engine.NamedAgg{{Series: aggSeries("api"), Buckets: []engine.BucketAgg{
-		{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 5, Min: 1, Max: 4}},
+		{Start: 0, SeriesAgg: engine.SeriesAgg{Count: 2, Rows: 2, Sum: 5, Min: 1, Max: 4}},
 	}}}
 
 	var (

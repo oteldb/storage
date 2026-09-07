@@ -96,20 +96,20 @@ func (g *stepGrid) bucketOf(ts int64) int64 {
 	return g.phase + bucketStart(ts-g.phase, g.step)
 }
 
-// addSample folds one sample into its bucket.
-func (g *stepGrid) addSample(ts int64, v float64) {
+// addSample folds one sample, carrying lossy-sampling weight w, into its bucket.
+func (g *stepGrid) addSample(ts int64, v, w float64) {
 	if g.sparse != nil {
 		bs := g.bucketOf(ts)
 		a := g.sparse[bs]
-		a.addSample(v)
+		a.addSample(v, w)
 		g.sparse[bs] = a
 
 		return
 	}
 
 	if a, ok := g.slot(ts); ok {
-		empty := a.Count == 0
-		a.addSample(v)
+		empty := a.Rows == 0
+		a.addSample(v, w)
 
 		if empty {
 			g.touched = append(g.touched, g.indexOf(ts))
@@ -120,7 +120,7 @@ func (g *stepGrid) addSample(ts int64, v float64) {
 // mergeStat folds a whole part's precomputed aggregate into the bucket containing ts — the sidecar
 // pushdown, used when the part lies wholly inside that bucket.
 func (g *stepGrid) mergeStat(ts int64, st SeriesAgg) {
-	if st.Count == 0 {
+	if st.Rows == 0 {
 		return
 	}
 
@@ -134,7 +134,7 @@ func (g *stepGrid) mergeStat(ts int64, st SeriesAgg) {
 	}
 
 	if a, ok := g.slot(ts); ok {
-		empty := a.Count == 0
+		empty := a.Rows == 0
 		a.merge(st)
 
 		if empty {

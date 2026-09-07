@@ -54,7 +54,7 @@ func TestAggregateWholePartDecodeWithBlockCache(t *testing.T) {
 			for i, b := range buckets {
 				want := int64(100 + i*100)
 				assert.Equal(t, want, b.Start)
-				assert.Equal(t, int64(1), b.Count)
+				assert.InDelta(t, 1, b.Count, 0)
 				assert.InDelta(t, float64(want), b.Sum, 0)
 			}
 		}
@@ -103,7 +103,7 @@ func TestAggregateWholePartDecodeWithBlockCache(t *testing.T) {
 		require.Len(t, got, 1)
 
 		for _, agg := range got {
-			assert.Equal(t, int64(5), agg.Count)
+			assert.InDelta(t, 5, agg.Count, 0)
 			assert.InDelta(t, 1500.0, agg.Sum, 0)
 			assert.InDelta(t, 100.0, agg.Min, 0)
 			assert.InDelta(t, 500.0, agg.Max, 0)

@@ -26,16 +26,17 @@ func bruteSlide(ents []windowEnt, step, window, phase, end int64) []WindowAgg {
 				continue
 			}
 
-			if a.Count == 0 {
+			if a.Rows == 0 {
 				a.Min, a.Max = e.min, e.max
 			}
 
 			a.Count += e.count
+			a.Rows += e.rows
 			a.Sum += e.sum
 			a.Min, a.Max = min(a.Min, e.min), max(a.Max, e.max)
 		}
 
-		if a.Count > 0 {
+		if a.Rows > 0 {
 			out = append(out, WindowAgg{End: t, SeriesAgg: a})
 		}
 	}
@@ -69,7 +70,11 @@ func TestWindowSliderMatchesBrute(t *testing.T) {
 			}
 
 			v := float64(rnd.IntN(11) - 5) // a small alphabet, so ties are common
-			ents = append(ents, windowEnt{end: end, count: 1 + int64(rnd.IntN(3)), sum: v, min: v, max: v})
+			rows := 1 + int64(rnd.IntN(3))
+			// A fractional weight per row, so the slide is exercised on counts that cannot be
+			// represented exactly — the arithmetic the integer rows field is there to protect.
+			w := float64(rows) * (1 + float64(rnd.IntN(4))/3)
+			ents = append(ents, windowEnt{end: end, rows: rows, count: w, sum: w * v, min: v, max: v})
 		}
 
 		for _, mult := range []int64{1, 2, 3, 8, 25} {
@@ -84,7 +89,8 @@ func TestWindowSliderMatchesBrute(t *testing.T) {
 
 			for i := range want {
 				assert.Equalf(t, want[i].End, got[i].End, "step=%d window=%d window %d end", step, window, i)
-				assert.Equalf(t, want[i].Count, got[i].Count, "step=%d window=%d window %d count", step, window, i)
+				assert.Equalf(t, want[i].Rows, got[i].Rows, "step=%d window=%d window %d rows", step, window, i)
+				assert.InDeltaf(t, want[i].Count, got[i].Count, 1e-9, "step=%d window=%d window %d count", step, window, i)
 				assert.InDeltaf(t, want[i].Sum, got[i].Sum, 1e-9, "step=%d window=%d window %d sum", step, window, i)
 				assert.InDeltaf(t, want[i].Min, got[i].Min, 0, "step=%d window=%d window %d min", step, window, i)
 				assert.InDeltaf(t, want[i].Max, got[i].Max, 0, "step=%d window=%d window %d max", step, window, i)
@@ -98,7 +104,7 @@ func TestWindowSliderMatchesBrute(t *testing.T) {
 func TestWindowSliderClipsToEnd(t *testing.T) {
 	t.Parallel()
 
-	ents := []windowEnt{{end: 10, count: 1, sum: 1, min: 1, max: 1}}
+	ents := []windowEnt{{end: 10, rows: 1, count: 1, sum: 1, min: 1, max: 1}}
 
 	var s windowSlider
 

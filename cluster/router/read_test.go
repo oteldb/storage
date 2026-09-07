@@ -231,8 +231,8 @@ func TestAggregateNarrowsOwnerSuperset(t *testing.T) {
 	t.Parallel()
 
 	r := openRouter(t, &peer{aggs: []engine.NamedAgg{
-		{Series: svcSeries("api"), Buckets: []engine.BucketAgg{{SeriesAgg: engine.SeriesAgg{Count: 2, Sum: 3}}}},
-		{Series: svcSeries("web"), Buckets: []engine.BucketAgg{{SeriesAgg: engine.SeriesAgg{Count: 5, Sum: 7}}}},
+		{Series: svcSeries("api"), Buckets: []engine.BucketAgg{{SeriesAgg: engine.SeriesAgg{Count: 2, Rows: 2, Sum: 3}}}},
+		{Series: svcSeries("web"), Buckets: []engine.BucketAgg{{SeriesAgg: engine.SeriesAgg{Count: 5, Rows: 5, Sum: 7}}}},
 	}})
 
 	got, err := r.Aggregate(t.Context(), "acme", 0, 10, 0,
@@ -241,7 +241,7 @@ func TestAggregateNarrowsOwnerSuperset(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Equal(t, svcSeries("api").Hash(), got[0].Series.Hash())
 	require.Len(t, got[0].Buckets, 1)
-	assert.Equal(t, int64(2), got[0].Buckets[0].Count)
+	assert.InDelta(t, 2, got[0].Buckets[0].Count, 0)
 }
 
 // TestReadsEmptyWhenEveryOwnerDisclaims pins the contract that an all-absent shard reads as empty
