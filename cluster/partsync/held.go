@@ -68,7 +68,7 @@ func (s *Syncer) heldEntries(
 	return out, nil
 }
 
-// owedEntries is [Syncer.heldEntries] with the roles swapped: the parts the *peer's* index names
+// unaccountedEntries is [Syncer.heldEntries] with the roles swapped: the parts the *peer's* index names
 // live that the local index does not account for. It is the direction the claim path cannot reach —
 // a part the local node never indexed can only ever be another node's `omitted`, and an owner
 // cannot report losing something absent from its index, so nothing ever states the obligation.
@@ -77,7 +77,7 @@ func (s *Syncer) heldEntries(
 // predates tombstones states nothing to reason from. And below the oldest data the local index
 // still names, a retention drop whose tombstone has aged out ([bucketindex.MaxRemovals]) is
 // indistinguishable from a part that never arrived — re-fetching one would resurrect deleted data.
-func owedEntries(peer *bucketindex.Index, local peerAccount, horizon int64) []bucketindex.Entry {
+func unaccountedEntries(peer *bucketindex.Index, local peerAccount, horizon int64) []bucketindex.Entry {
 	if !local.stated {
 		return nil
 	}
