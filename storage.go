@@ -252,27 +252,31 @@ func (s *Storage) Close(ctx context.Context) error {
 		}
 	}
 
-	for _, eng := range s.engineSnapshot() {
-		if err := eng.Close(ctx); err != nil && firstErr == nil {
-			firstErr = err
+	// A read-only store has no head to drain and no WAL to close, and closing an engine flushes —
+	// so skipping the engine closes is what keeps [Options.ReadOnly]'s promise at the last step.
+	if !s.opts.ReadOnly {
+		for _, eng := range s.engineSnapshot() {
+			if err := eng.Close(ctx); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
-	}
 
-	for _, eng := range s.logEngineSnapshot() {
-		if err := eng.Close(ctx); err != nil && firstErr == nil {
-			firstErr = err
+		for _, eng := range s.logEngineSnapshot() {
+			if err := eng.Close(ctx); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
-	}
 
-	for _, eng := range s.traceEngineSnapshot() {
-		if err := eng.Close(ctx); err != nil && firstErr == nil {
-			firstErr = err
+		for _, eng := range s.traceEngineSnapshot() {
+			if err := eng.Close(ctx); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
-	}
 
-	for _, eng := range s.profileEngineSnapshot() {
-		if err := eng.Close(ctx); err != nil && firstErr == nil {
-			firstErr = err
+		for _, eng := range s.profileEngineSnapshot() {
+			if err := eng.Close(ctx); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 
@@ -294,6 +298,10 @@ func (s *Storage) Close(ctx context.Context) error {
 func (s *Storage) Reset(ctx context.Context) error {
 	if s.closed.Load() {
 		return errors.Wrap(ErrClosed, "reset")
+	}
+
+	if s.opts.ReadOnly {
+		return errors.Wrap(ErrReadOnly, "reset")
 	}
 
 	if !s.backend.IsEphemeral() {
@@ -338,6 +346,10 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 
 	if s.closed.Load() {
 		return Accepted{}, errors.Wrap(ErrClosed, "write metrics")
+	}
+
+	if s.opts.ReadOnly {
+		return Accepted{}, errors.Wrap(ErrReadOnly, "write metrics")
 	}
 
 	if s.cluster != nil {
@@ -983,16 +995,21 @@ func (s *Storage) recover(ctx context.Context) error {
 	// load creates an engine (propagating a creation error) and loads its flushed parts. A cluster
 	// node holds no compaction claim yet, so a part it cannot read is not committed as a want here:
 	// only an owner writes one, and the first owned commit carries it ([engine.Engine.LoadPartsUnclaimed]).
+	// A read-only store additionally sweeps nothing ([engine.Engine.LoadPartsReadOnly]) — the sweep
+	// is the one backend mutation that would otherwise happen before any caller could decline it.
 	load := func(e partLoader, err error) error {
 		if err != nil {
 			return err
 		}
 
-		if s.opts.Cluster != nil {
+		switch {
+		case s.opts.ReadOnly:
+			return e.LoadPartsReadOnly(ctx)
+		case s.opts.Cluster != nil:
 			return e.LoadPartsUnclaimed(ctx)
+		default:
+			return e.LoadParts(ctx)
 		}
-
-		return e.LoadParts(ctx)
 	}
 
 	metricSuffix := metricsPrefix + "/" + bucketindex.Object
@@ -1035,6 +1052,7 @@ func (s *Storage) recover(ctx context.Context) error {
 type partLoader interface {
 	LoadParts(ctx context.Context) error
 	LoadPartsUnclaimed(ctx context.Context) error
+	LoadPartsReadOnly(ctx context.Context) error
 }
 
 // recoverWAL replays each per-tenant WAL directory under [Options.WALDir] into its engine, restoring

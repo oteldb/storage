@@ -45,6 +45,27 @@ type Options struct {
 	// kept in RAM and dropped on [Storage.Close] (DESIGN.md §5).
 	Durability Durability
 
+	// ReadOnly opens a store that never mutates its backend, for the whole life of the handle:
+	// a backup, a verifier, an offline inspector. It is not merely a policy — it is what the
+	// default open cannot give, because recovery sweeps orphan objects (part objects the bucket
+	// index no longer names) before any caller-settable state exists, so a read-only consumer
+	// deleted from the directory it was only pointed at.
+	//
+	// It selects the sweep-nothing load: parts are reconstructed from the bucket index, an object
+	// the index names but the backend lacks becomes a pending want that reads disclaim rather than
+	// a repair commit, and nothing is deleted or written. On top of that the handle refuses every
+	// write for its lifetime — [Storage.WriteMetrics]/[Storage.WriteLogs]/[Storage.WriteTraces]/
+	// [Storage.WriteProfiles], [Storage.Reset], and every mutating [Admin] call return an error
+	// wrapping [ErrReadOnly] — no background maintenance loop runs (so no flush, merge, retention,
+	// or recompression), no WAL is opened or replayed, and [Storage.Close] drains nothing.
+	// Queries are unaffected.
+	//
+	// [Open] refuses combinations that cannot honour that guarantee: a [Cluster] (a member writes
+	// parts, replicates, and rebalances by definition), a [WALDir] (replay checkpoints and the
+	// recovered head could never be flushed), and an ephemeral backend (nothing is ever recovered
+	// from it, so the store would be permanently and silently empty).
+	ReadOnly bool
+
 	// WALDir is the WAL directory for the file backend with durability enabled.
 	// Ignored when [Durability] is [DurabilityEphemeral]; required in cluster mode
 	// ([Cluster]) on a durable backend, where a node that cannot restore its unflushed
@@ -263,6 +284,11 @@ func WithEncoding(p encoding.Profile) Option { return func(o *Options) { o.Encod
 // WithDurability sets the WAL + flush policy.
 func WithDurability(d Durability) Option { return func(o *Options) { o.Durability = d } }
 
+// WithReadOnly opens a store that never mutates its backend and refuses every write for the life
+// of the handle. See [Options.ReadOnly] for what it suppresses and which option combinations
+// [Open] refuses with it.
+func WithReadOnly() Option { return func(o *Options) { o.ReadOnly = true } }
+
 // WithWALDir sets the WAL directory (file backend + durability).
 func WithWALDir(dir string) Option { return func(o *Options) { o.WALDir = dir } }
 
@@ -420,6 +446,10 @@ var ErrClosed = errors.New("storage: closed")
 // all ingested data and is only permitted on an ephemeral (in-memory) store.
 var ErrNotEphemeral = errors.New("storage: reset requires an ephemeral backend")
 
+// ErrReadOnly is returned (wrapped) by every mutating [Storage] and [Admin] method when the store
+// was opened with [WithReadOnly].
+var ErrReadOnly = errors.New("storage: read-only")
+
 // errOptionInvalid is returned by [Open] for an invalid option combination.
 func errOptionInvalid(reason string) error {
 	return errors.Errorf("storage: invalid options: %s", reason)
@@ -431,6 +461,10 @@ func (o *Options) validate() error {
 		return errOptionInvalid("WALDir must be empty when Durability is Ephemeral")
 	}
 
+	if err := o.validateReadOnly(); err != nil {
+		return err
+	}
+
 	// A clustered node answers reads as a ring owner as soon as [Open] returns, and the read path
 	// treats one owner's answer as complete. On a durable backend without a WAL, recovery restores
 	// only the flushed parts: the node would serve everything written since its last flush as
@@ -439,6 +473,32 @@ func (o *Options) validate() error {
 	if o.Cluster != nil && o.WALDir == "" && o.Backend != nil && !o.Backend.IsEphemeral() {
 		return errOptionInvalid("WALDir is required in cluster mode on a durable backend: " +
 			"without it a restarted node serves reads with its unflushed head missing")
+	}
+
+	return nil
+}
+
+// validateReadOnly refuses the [Options.ReadOnly] combinations that cannot keep the never-mutate
+// guarantee, rather than half-supporting them. It runs before [Options.applyDefaults], so a nil
+// backend still stands for the ephemeral default.
+func (o *Options) validateReadOnly() error {
+	if !o.ReadOnly {
+		return nil
+	}
+
+	if o.Cluster != nil {
+		return errOptionInvalid("ReadOnly and Cluster are mutually exclusive: a cluster member " +
+			"writes parts, replicates, and rebalances, so it cannot promise not to mutate the backend")
+	}
+
+	if o.WALDir != "" {
+		return errOptionInvalid("WALDir must be empty when ReadOnly: replay writes checkpoints, and " +
+			"a recovered head could never be flushed")
+	}
+
+	if o.Backend == nil || o.Backend.IsEphemeral() {
+		return errOptionInvalid("ReadOnly requires a durable backend: an ephemeral one recovers " +
+			"nothing, so a read-only store over it is permanently empty")
 	}
 
 	return nil
@@ -474,6 +534,11 @@ func (o *Options) applyDefaults() {
 		// maintenance loop the head and WAL grow unbounded until OOM (issue 23); the previous behavior
 		// silently disabled all flushing at the zero value. A negative interval still opts out.
 		o.FlushInterval = int64(defaultFlushInterval)
+	}
+	if o.ReadOnly {
+		// The maintenance loop flushes, merges, applies retention and recompresses — every one of
+		// them a backend mutation. A read-only store must not run it whatever the interval says.
+		o.FlushInterval = -1
 	}
 }
 

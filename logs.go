@@ -27,6 +27,10 @@ func (s *Storage) WriteLogs(ctx context.Context, ld log.Logs) (acc Accepted, err
 		return Accepted{}, errors.Wrap(ErrClosed, "write logs")
 	}
 
+	if s.opts.ReadOnly {
+		return Accepted{}, errors.Wrap(ErrReadOnly, "write logs")
+	}
+
 	project := func(emit func(*recordengine.Batch)) int { return log.Project(ld, emit) }
 
 	if s.cluster != nil {

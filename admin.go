@@ -31,8 +31,8 @@ func (s *Storage) Admin() Admin { return Admin{s} }
 // no-op (nil) when nothing has been ingested for that key+signal. In cluster mode it returns
 // [ErrNotOwner] unless this node holds the shard's compaction claim.
 func (a Admin) Flush(ctx context.Context, key signal.TenantID, sig signal.Signal) error {
-	if a.s.closed.Load() {
-		return errors.Wrap(ErrClosed, "admin flush")
+	if err := a.mutable("admin flush"); err != nil {
+		return err
 	}
 
 	if err := a.s.adminOwns(ctx, key); err != nil {
@@ -52,8 +52,8 @@ func (a Admin) Flush(ctx context.Context, key signal.TenantID, sig signal.Signal
 // background loop runs, so there is no parallel code path. No-op when nothing is ingested; returns
 // [ErrNotOwner] in cluster mode unless this node holds the shard's compaction claim.
 func (a Admin) Compact(ctx context.Context, key signal.TenantID, sig signal.Signal) error {
-	if a.s.closed.Load() {
-		return errors.Wrap(ErrClosed, "admin compact")
+	if err := a.mutable("admin compact"); err != nil {
+		return err
 	}
 
 	if err := a.s.adminOwns(ctx, key); err != nil {
@@ -79,8 +79,8 @@ func (a Admin) Compact(ctx context.Context, key signal.TenantID, sig signal.Sign
 // to make further progress. No-op when nothing is ingested for the key+signal; [ErrNotOwner] in
 // cluster mode unless this node holds the shard's compaction claim.
 func (a Admin) CompactNow(ctx context.Context, key signal.TenantID, sig signal.Signal) error {
-	if a.s.closed.Load() {
-		return errors.Wrap(ErrClosed, "admin compact now")
+	if err := a.mutable("admin compact now"); err != nil {
+		return err
 	}
 
 	if err := a.s.adminOwns(ctx, key); err != nil {
@@ -132,8 +132,8 @@ func (a Admin) Retention(ctx context.Context, key signal.TenantID) error {
 //
 // Signals with no engine on this node contribute 0; ones it does not own are refused.
 func (a Admin) PruneIdentities(ctx context.Context, key signal.TenantID) (int, error) {
-	if a.s.closed.Load() {
-		return 0, errors.Wrap(ErrClosed, "admin prune identities")
+	if err := a.mutable("admin prune identities"); err != nil {
+		return 0, err
 	}
 
 	if err := a.s.adminOwns(ctx, key); err != nil {
@@ -173,8 +173,8 @@ func (a Admin) PruneIdentities(ctx context.Context, key signal.TenantID) (int, e
 // does it on its tick), so a freshly-changed ring takes effect without waiting. It is a no-op in
 // single-node mode.
 func (a Admin) Rebalance(ctx context.Context) error {
-	if a.s.closed.Load() {
-		return errors.Wrap(ErrClosed, "admin rebalance")
+	if err := a.mutable("admin rebalance"); err != nil {
+		return err
 	}
 
 	if a.s.cluster == nil {
@@ -196,11 +196,25 @@ func (a Admin) Rebalance(ctx context.Context) error {
 // owned tenant and signal (the background loop's body). Best-effort: per-engine errors are logged,
 // not returned, matching the loop.
 func (a Admin) MaintainNow(ctx context.Context) error {
-	if a.s.closed.Load() {
-		return errors.Wrap(ErrClosed, "admin maintain")
+	if err := a.mutable("admin maintain"); err != nil {
+		return err
 	}
 
 	a.s.maintain(ctx)
+
+	return nil
+}
+
+// mutable gates an on-demand maintenance call: it refuses after [Storage.Close], and on a
+// read-only store, which must not flush, merge, or reclaim.
+func (a Admin) mutable(op string) error {
+	if a.s.closed.Load() {
+		return errors.Wrap(ErrClosed, op)
+	}
+
+	if a.s.opts.ReadOnly {
+		return errors.Wrap(ErrReadOnly, op)
+	}
 
 	return nil
 }

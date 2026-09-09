@@ -388,6 +388,18 @@ func (e *Engine) LoadPartsUnclaimed(ctx context.Context) error {
 	return e.loadPartsLocked(ctx, loadUnclaimed)
 }
 
+// LoadPartsReadOnly is [Engine.LoadParts] for an engine that must never mutate its prefix: it
+// sweeps no orphan objects and commits no index, so opening over a data directory leaves every
+// object in it untouched. A part the index names but the backend lacks becomes a pending want that
+// reads disclaim ([Engine.WantOverlaps]), never a repair commit. It is what backs
+// storage.WithReadOnly (backup, verification, offline inspection).
+func (e *Engine) LoadPartsReadOnly(ctx context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.loadPartsLocked(ctx, loadReplica)
+}
+
 // loadMode is what a load may do about a part the index names but the backend does not hold.
 type loadMode uint8
 

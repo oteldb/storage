@@ -14,6 +14,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/internal/partid"
 	"github.com/oteldb/storage/recordengine"
 )
 
@@ -122,6 +123,39 @@ func TestLoadPartsUnclaimedWantIsRepaired(t *testing.T) {
 	committed := committedIndex(t, be)
 	assert.Empty(t, committed.Wanted)
 	assert.NotEmpty(t, committed.Entries)
+}
+
+// TestLoadPartsReadOnlySweepsNothing pins the mode storage.WithReadOnly selects: an orphan part
+// object survives the load and nothing is committed, where the owning load reclaims it.
+func TestLoadPartsReadOnlySweepsNothing(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	be := backend.Memory()
+	writer := newRepairEngine(t, be, nil)
+	parts := flushTwo(t, writer)
+	dropObjects(t, be, parts[0])
+
+	orphan := "t/recs/" + partid.New().String() + "/manifest"
+	require.NoError(t, be.Write(ctx, orphan, []byte("orphaned part object")))
+
+	before := committedIndex(t, be)
+
+	e := newRepairEngine(t, be, nil)
+	require.NoError(t, e.LoadPartsReadOnly(ctx))
+
+	assert.Equal(t, 1, e.Stats().WantedParts)
+	assert.True(t, e.WantOverlaps(0, 1<<62), "reads over the missing part disclaim")
+
+	_, err := be.Read(ctx, orphan)
+	assert.NoError(t, err, "a read-only load sweeps no orphan")
+	assert.Equal(t, before.Generation, committedIndex(t, be).Generation, "nothing was committed")
+
+	owner := newRepairEngine(t, be, nil)
+	require.NoError(t, owner.LoadParts(ctx))
+
+	_, err = be.Read(ctx, orphan)
+	assert.ErrorIs(t, err, backend.ErrNotExist, "the owning load reclaims it")
 }
 
 func partPrefixesOf(ix *bucketindex.Index) []string {

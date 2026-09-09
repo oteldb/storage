@@ -28,6 +28,10 @@ func (s *Storage) WriteProfiles(ctx context.Context, pd profile.Profiles) (acc A
 		return Accepted{}, errors.Wrap(ErrClosed, "write profiles")
 	}
 
+	if s.opts.ReadOnly {
+		return Accepted{}, errors.Wrap(ErrReadOnly, "write profiles")
+	}
+
 	project := func(emit func(*recordengine.Batch)) int { return profile.Project(&pd, emit) }
 
 	if s.cluster != nil {

@@ -26,6 +26,10 @@ func (s *Storage) WriteTraces(ctx context.Context, td trace.Traces) (acc Accepte
 		return Accepted{}, errors.Wrap(ErrClosed, "write traces")
 	}
 
+	if s.opts.ReadOnly {
+		return Accepted{}, errors.Wrap(ErrReadOnly, "write traces")
+	}
+
 	project := func(emit func(*recordengine.Batch)) int { return trace.Project(td, emit) }
 
 	if s.cluster != nil {

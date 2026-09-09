@@ -240,6 +240,12 @@ name; a directory is a part's when its name parses as a part id. The sweep assum
 the prefix, so a replica's `RefreshReplica` skips it: the owner's in-flight part is not in the index
 yet.
 
+`LoadPartsReadOnly` is that same sweep-nothing load reached deliberately rather than through the
+replica path. It exists because the sweep is the one backend mutation an open performs before the
+caller has any say, so without it a store could not be opened for reading only — a backup or a
+verifier reclaimed objects from the directory it was pointed at. It backs `storage.WithReadOnly`,
+which then keeps the guarantee at the facade for the life of the handle.
+
 
 ## A part the owner cannot read becomes a want, not a removal
 
