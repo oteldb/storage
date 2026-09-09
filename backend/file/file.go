@@ -345,6 +345,13 @@ func walk(root vfs.FS, dir string, depth int, leaf, prefix string, keys *[]strin
 
 	entries, err := root.ReadDir(dir)
 	if err != nil {
+		// Compaction or retention can remove a part's directory between the parent's ReadDir and
+		// this one. An object store lists whatever still exists rather than failing the listing,
+		// and callers (partsync's peer listing above all) depend on that.
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+
 		return err
 	}
 
