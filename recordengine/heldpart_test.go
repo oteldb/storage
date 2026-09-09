@@ -148,7 +148,7 @@ func TestLoadPartsReadOnlySweepsNothing(t *testing.T) {
 	assert.True(t, e.WantOverlaps(0, 1<<62), "reads over the missing part disclaim")
 
 	_, err := be.Read(ctx, orphan)
-	assert.NoError(t, err, "a read-only load sweeps no orphan")
+	require.NoError(t, err, "a read-only load sweeps no orphan")
 	assert.Equal(t, before.Generation, committedIndex(t, be).Generation, "nothing was committed")
 
 	owner := newRepairEngine(t, be, nil)

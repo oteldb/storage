@@ -22,21 +22,8 @@ func (s *Storage) WriteTraces(ctx context.Context, td trace.Traces) (acc Accepte
 	ctx, finish := s.writeSpan(ctx, "storage.write.traces")
 	defer finish(&acc, &err)
 
-	if s.closed.Load() {
-		return Accepted{}, errors.Wrap(ErrClosed, "write traces")
-	}
-
-	if s.opts.ReadOnly {
-		return Accepted{}, errors.Wrap(ErrReadOnly, "write traces")
-	}
-
-	project := func(emit func(*recordengine.Batch)) int { return trace.Project(td, emit) }
-
-	if s.cluster != nil {
-		return s.writeRecordsClustered(ctx, signal.Trace, project)
-	}
-
-	return s.writeRecordsLocal(ctx, signal.Trace, project, s.traceEngineFor)
+	return s.writeRecords(ctx, signal.Trace, "write traces",
+		func(emit func(*recordengine.Batch)) int { return trace.Project(td, emit) }, s.traceEngineFor)
 }
 
 // TraceFetcher returns the read seam for traces — a [fetch.Fetcher] over the named tenants' span

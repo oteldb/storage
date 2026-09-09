@@ -202,7 +202,7 @@ fails the read (`cluster.Disclaims`).
   disclaim) and then holds the guarantee for the life of the handle: writes, `Reset` and every
   mutating `Admin` call return `ErrReadOnly`, no maintenance loop runs, no WAL is opened or replayed,
   and `Close` drains no head. A partial read-only handle would be worse than none — one that still
-  flushed on a timer looks safe — so the combinations that cannot honour it (a cluster member, a WAL
+  flushed on a timer looks safe — so the combinations that cannot honor it (a cluster member, a WAL
   dir, an ephemeral backend that recovers nothing and so is permanently empty) are refused at `Open`
   rather than half-supported.
 - **A part leaves the index's `Entries` only into `Removed` or into `Wanted`** — a tombstone (a

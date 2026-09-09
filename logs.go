@@ -23,21 +23,8 @@ func (s *Storage) WriteLogs(ctx context.Context, ld log.Logs) (acc Accepted, err
 	ctx, finish := s.writeSpan(ctx, "storage.write.logs")
 	defer finish(&acc, &err)
 
-	if s.closed.Load() {
-		return Accepted{}, errors.Wrap(ErrClosed, "write logs")
-	}
-
-	if s.opts.ReadOnly {
-		return Accepted{}, errors.Wrap(ErrReadOnly, "write logs")
-	}
-
-	project := func(emit func(*recordengine.Batch)) int { return log.Project(ld, emit) }
-
-	if s.cluster != nil {
-		return s.writeRecordsClustered(ctx, signal.Log, project)
-	}
-
-	return s.writeRecordsLocal(ctx, signal.Log, project, s.logEngineFor)
+	return s.writeRecords(ctx, signal.Log, "write logs",
+		func(emit func(*recordengine.Batch)) int { return log.Project(ld, emit) }, s.logEngineFor)
 }
 
 // LogFetcher returns the read seam for logs — a [fetch.Fetcher] over the named tenants' log data

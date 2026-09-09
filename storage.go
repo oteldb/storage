@@ -255,28 +255,8 @@ func (s *Storage) Close(ctx context.Context) error {
 	// A read-only store has no head to drain and no WAL to close, and closing an engine flushes —
 	// so skipping the engine closes is what keeps [Options.ReadOnly]'s promise at the last step.
 	if !s.opts.ReadOnly {
-		for _, eng := range s.engineSnapshot() {
-			if err := eng.Close(ctx); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-
-		for _, eng := range s.logEngineSnapshot() {
-			if err := eng.Close(ctx); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-
-		for _, eng := range s.traceEngineSnapshot() {
-			if err := eng.Close(ctx); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-
-		for _, eng := range s.profileEngineSnapshot() {
-			if err := eng.Close(ctx); err != nil && firstErr == nil {
-				firstErr = err
-			}
+		if err := s.closeEngines(ctx); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 
@@ -851,6 +831,45 @@ func (f seedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator
 // Unwrap exposes the decorated fetcher so [fetch.CounterOf] can reach the engine's Count through
 // the seed layer (which only adds observability) for the count() pushdown.
 func (f seedFetcher) Unwrap() fetch.Fetcher { return f.inner }
+
+// engineCloser is the Close surface both engine types share, so [Storage.Close] drains them all
+// through one loop.
+type engineCloser interface {
+	Close(ctx context.Context) error
+}
+
+// closeEngines drains every tenant engine's head to a durable part and closes its WAL, returning
+// the first error while still closing the rest.
+func (s *Storage) closeEngines(ctx context.Context) error {
+	all := make([]engineCloser, 0,
+		len(s.engineSnapshot())+len(s.logEngineSnapshot())+len(s.traceEngineSnapshot())+len(s.profileEngineSnapshot()))
+
+	for _, eng := range s.engineSnapshot() {
+		all = append(all, eng)
+	}
+
+	for _, eng := range s.logEngineSnapshot() {
+		all = append(all, eng)
+	}
+
+	for _, eng := range s.traceEngineSnapshot() {
+		all = append(all, eng)
+	}
+
+	for _, eng := range s.profileEngineSnapshot() {
+		all = append(all, eng)
+	}
+
+	var firstErr error
+
+	for _, eng := range all {
+		if err := eng.Close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
+}
 
 // baseFetcher builds the unwrapped read seam for the tenant set: owner-aware per tenant in
 // cluster mode, otherwise the local engines (or a cross-tenant snapshot when none are named).

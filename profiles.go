@@ -24,21 +24,8 @@ func (s *Storage) WriteProfiles(ctx context.Context, pd profile.Profiles) (acc A
 	ctx, finish := s.writeSpan(ctx, "storage.write.profiles")
 	defer finish(&acc, &err)
 
-	if s.closed.Load() {
-		return Accepted{}, errors.Wrap(ErrClosed, "write profiles")
-	}
-
-	if s.opts.ReadOnly {
-		return Accepted{}, errors.Wrap(ErrReadOnly, "write profiles")
-	}
-
-	project := func(emit func(*recordengine.Batch)) int { return profile.Project(&pd, emit) }
-
-	if s.cluster != nil {
-		return s.writeRecordsClustered(ctx, signal.Profile, project)
-	}
-
-	return s.writeRecordsLocal(ctx, signal.Profile, project, s.profileEngineFor)
+	return s.writeRecords(ctx, signal.Profile, "write profiles",
+		func(emit func(*recordengine.Batch)) int { return profile.Project(&pd, emit) }, s.profileEngineFor)
 }
 
 // ProfileFetcher returns the read seam for profiles — a [fetch.Fetcher] over the named tenants'

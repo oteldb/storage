@@ -127,6 +127,8 @@ func TestReadOnlyRefusesWrites(t *testing.T) {
 	s := openReadOnly(t)
 
 	t.Run("Signals", func(t *testing.T) {
+		t.Parallel()
+
 		for name, write := range map[string]func() (Accepted, error){
 			"metrics": func() (Accepted, error) {
 				return s.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{300}, []float64{3}))
@@ -142,27 +144,31 @@ func TestReadOnlyRefusesWrites(t *testing.T) {
 			},
 		} {
 			acc, err := write()
-			assert.ErrorIs(t, err, ErrReadOnly, name)
+			require.ErrorIs(t, err, ErrReadOnly, name)
 			assert.Zero(t, acc.Accepted, name)
 		}
 	})
 
 	t.Run("Maintenance", func(t *testing.T) {
+		t.Parallel()
+
 		a := s.Admin()
 
-		assert.ErrorIs(t, s.Reset(ctx), ErrReadOnly)
-		assert.ErrorIs(t, a.Flush(ctx, "default", signal.Metric), ErrReadOnly)
-		assert.ErrorIs(t, a.Compact(ctx, "default", signal.Metric), ErrReadOnly)
-		assert.ErrorIs(t, a.CompactNow(ctx, "default", signal.Metric), ErrReadOnly)
-		assert.ErrorIs(t, a.Retention(ctx, "default"), ErrReadOnly)
-		assert.ErrorIs(t, a.Rebalance(ctx), ErrReadOnly)
-		assert.ErrorIs(t, a.MaintainNow(ctx), ErrReadOnly)
+		require.ErrorIs(t, s.Reset(ctx), ErrReadOnly)
+		require.ErrorIs(t, a.Flush(ctx, "default", signal.Metric), ErrReadOnly)
+		require.ErrorIs(t, a.Compact(ctx, "default", signal.Metric), ErrReadOnly)
+		require.ErrorIs(t, a.CompactNow(ctx, "default", signal.Metric), ErrReadOnly)
+		require.ErrorIs(t, a.Retention(ctx, "default"), ErrReadOnly)
+		require.ErrorIs(t, a.Rebalance(ctx), ErrReadOnly)
+		require.ErrorIs(t, a.MaintainNow(ctx), ErrReadOnly)
 
 		_, err := a.PruneIdentities(ctx, "default")
-		assert.ErrorIs(t, err, ErrReadOnly)
+		require.ErrorIs(t, err, ErrReadOnly)
 	})
 
 	t.Run("NoMaintenanceLoop", func(t *testing.T) {
+		t.Parallel()
+
 		// The loop is what would flush, merge and apply retention on a timer behind the caller's
 		// back; a read-only store must never start it, whatever the interval says.
 		assert.Nil(t, s.stopCh)
@@ -182,6 +188,6 @@ func TestReadOnlyOptionValidation(t *testing.T) {
 		"NoBackend": {WithReadOnly()},
 	} {
 		_, err := Open(context.Background(), Options{}, opts...)
-		assert.ErrorContains(t, err, "invalid options", name)
+		require.ErrorContains(t, err, "invalid options", name)
 	}
 }

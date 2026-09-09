@@ -60,7 +60,7 @@ type Options struct {
 	// or recompression), no WAL is opened or replayed, and [Storage.Close] drains nothing.
 	// Queries are unaffected.
 	//
-	// [Open] refuses combinations that cannot honour that guarantee: a [Cluster] (a member writes
+	// [Open] refuses combinations that cannot honor that guarantee: a [Cluster] (a member writes
 	// parts, replicates, and rebalances by definition), a [WALDir] (replay checkpoints and the
 	// recovered head could never be flushed), and an ephemeral backend (nothing is ever recovered
 	// from it, so the store would be permanently and silently empty).
