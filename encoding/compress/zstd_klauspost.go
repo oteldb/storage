@@ -67,6 +67,25 @@ func newZstdDecoder() zstdDecoder {
 	return kpDecoder{dec}
 }
 
+type kpStreamDecoder struct{ dec *zstd.Decoder }
+
+func (d kpStreamDecoder) Read(p []byte) (int, error) { return d.dec.Read(p) }
+func (d kpStreamDecoder) reset(r io.Reader) error    { return d.dec.Reset(r) }
+func (d kpStreamDecoder) release()                   { _ = d.dec.Reset(nil) }
+
+func newZstdStreamDecoder() zstdStreamDecoder {
+	// A nil reader is legal here: the decoder is driven entirely through Reset.
+	dec, err := zstd.NewReader(nil,
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderLowmem(true),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	return kpStreamDecoder{dec}
+}
+
 // nilReader is a zero-length reader for constructing a Decoder (DecodeAll doesn't use the reader, but
 // NewReader requires a non-nil one).
 type nilReader struct{}
