@@ -314,8 +314,13 @@ asymmetry is the same argument that rules out shipping raw part blocks — which
 decode onto the aggregator, make the storage format the wire format, and lose the owner-side
 condition filtering that keeps a selective query small in the first place.
 
+What it buys is **bandwidth**, and latency only where bandwidth is the constraint. On an idle 10 GbE
+link the 17.6 MB payload crosses in ~14 ms while compressing it costs ~48 ms, so a single
+unconcurrent query there is slower; the win is real once the link is shared by a fan-out's worth of
+concurrent queries, on a slower or cross-AZ link, or wherever egress is metered.
+
 Compressing the body changes what the read budget must charge. `Content-Length` is now the *wire*
-size, which understates the resident bytes by the compression ratio, so honouring it would quietly
+size, which understates the resident bytes by the compression ratio, so honoring it would quietly
 multiply every budget by ~4×. `readBudgetedBody` therefore inflates a compressed body as a **stream**
 and applies the cap to the inflated bytes, never to the declared length. Streaming is what makes the
 adversarial case safe: a peer sending a few hundred bytes that expand without bound is cut off
