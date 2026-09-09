@@ -1224,7 +1224,9 @@ func (s *Storage) walFor(prefix string) (*wal.SegmentWriter, error) {
 type engineOps struct {
 	flush, merge, refresh func() error
 	adopt                 func([]bucketindex.Want)
-	ecParts               func() []ecPartRef
+	// ecParts is passed unevaluated: the EC callees run it past their scheme guard, so a tenant
+	// without EC never pays for the parts snapshot.
+	ecParts func() []ecPartRef
 }
 
 // maintainOneEngine flushes then merges one engine, unless this node is a non-owning replica for
@@ -1249,7 +1251,7 @@ func (s *Storage) maintainOneEngine(
 			s.refreshOrLog(ctx, "replica refresh failed", enginePrefix, ops.refresh)
 			// Rebuild this node's erasure-coded shard slot if a membership change left it
 			// missing (a no-op when not an EC owner or the shard is already present).
-			s.repairEcShards(ctx, tid, ops.ecParts())
+			s.repairEcShards(ctx, tid, ops.ecParts)
 
 			return
 		}
@@ -1267,7 +1269,7 @@ func (s *Storage) maintainOneEngine(
 	// Erasure-code the tenant's now-cold parts (shared-nothing + EC policy only; a no-op
 	// otherwise), replacing their full copies with shards, then prune the owner's staged shards
 	// once distributed and rebuild this node's slot if a membership change lost it.
-	cold := ops.ecParts()
+	cold := sync.OnceValue(ops.ecParts)
 	s.convertColdParts(ctx, tid, cold)
 	s.repairEcShards(ctx, tid, cold)
 

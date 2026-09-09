@@ -26,7 +26,7 @@ import (
 // No data is destroyed: a node loss leaves ≥ Data shards on the surviving owners (a lost node is
 // never pushed *out* of the owner set, only removed), and repair only ever writes — the stale
 // foreign shards a renumber leaves behind are pruned by slot filtering / owner-prune.
-func (s *Storage) repairEcShards(ctx context.Context, shardKey signal.TenantID, parts []ecPartRef) {
+func (s *Storage) repairEcShards(ctx context.Context, shardKey signal.TenantID, parts func() []ecPartRef) {
 	scheme, ok := s.ecSchemeFor(shardKey)
 	if !ok {
 		return
@@ -42,7 +42,7 @@ func (s *Storage) repairEcShards(ctx context.Context, shardKey signal.TenantID, 
 	client := &partsync.Client{HTTP: s.cluster.httpc}
 	log := s.obs.Logger(ctx)
 
-	for _, p := range parts {
+	for _, p := range parts() {
 		meta, converted, err := ec.Converted(ctx, s.backend, p.prefix)
 		if err != nil || !converted {
 			continue
