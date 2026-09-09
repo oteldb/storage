@@ -53,16 +53,37 @@ func recvBudget(ctx context.Context, h http.Header) context.Context {
 	return readbudget.WithLimitHint(ctx, n)
 }
 
-// readBudgetedBody reads a fan-out response body under the query's memory budget.
+// readBudgetedBody reads a fan-out response body under the query's memory budget, inflating it
+// first when the peer answered with a zstd content coding.
 //
 // It refuses before allocating when the declared length already exceeds what the query may hold —
 // the point of charging here rather than downstream is that the bytes are never committed — and it
 // caps the read regardless, so an absent or dishonest Content-Length cannot get past it either.
 //
+// A compressed body is charged its *decompressed* length, never its Content-Length: the wire size
+// understates the resident bytes by the compression ratio, so honoring it would quietly multiply
+// every budget by ~4×. The cap is applied to the inflated stream, which also bounds a decompression
+// bomb — a few hundred wire bytes that expand without limit are cut off mid-inflation rather than
+// after the allocation.
+//
 // The returned release must be called once the body has been decoded. The wire bytes are transient:
 // they expand into batches that are charged in their own right, so holding both reservations past
 // the decode would charge one query twice for the same data.
-func readBudgetedBody(ctx context.Context, body io.Reader, length int64) (_ []byte, release func(), _ error) {
+func readBudgetedBody(ctx context.Context, body io.Reader, length int64, compressed bool) (_ []byte, release func(), _ error) {
+	if compressed {
+		zr, err := wireCompressor.Reader(body)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "zstd body")
+		}
+		defer func() { _ = zr.Close() }()
+
+		return readBudgeted(ctx, zr, -1)
+	}
+
+	return readBudgeted(ctx, body, length)
+}
+
+func readBudgeted(ctx context.Context, body io.Reader, length int64) (_ []byte, release func(), _ error) {
 	budget := readbudget.From(ctx)
 	if budget == nil {
 		data, err := io.ReadAll(body)

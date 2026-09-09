@@ -74,7 +74,7 @@ func TestReadBudgetedBodyRefusesOnContentLength(t *testing.T) {
 	var read bool
 	body := readerFunc(func([]byte) (int, error) { read = true; return 0, io.EOF })
 
-	_, _, err := readBudgetedBody(ctx, body, 500)
+	_, _, err := readBudgetedBody(ctx, body, 500, false)
 	require.ErrorIs(t, err, readbudget.ErrExceeded)
 	assert.False(t, read, "the body is never touched")
 }
@@ -85,7 +85,7 @@ func TestReadBudgetedBodyCapsUndeclaredLength(t *testing.T) {
 
 	ctx := readbudget.With(context.Background(), readbudget.New(100))
 
-	_, _, err := readBudgetedBody(ctx, bytes.NewReader(make([]byte, 500)), -1)
+	_, _, err := readBudgetedBody(ctx, bytes.NewReader(make([]byte, 500)), -1, false)
 	require.ErrorIs(t, err, readbudget.ErrExceeded)
 }
 
@@ -95,7 +95,7 @@ func TestReadBudgetedBodyChargesAndReleases(t *testing.T) {
 	b := readbudget.New(100)
 	ctx := readbudget.With(context.Background(), b)
 
-	data, release, err := readBudgetedBody(ctx, bytes.NewReader(make([]byte, 40)), 40)
+	data, release, err := readBudgetedBody(ctx, bytes.NewReader(make([]byte, 40)), 40, false)
 	require.NoError(t, err)
 	assert.Len(t, data, 40)
 	assert.Equal(t, int64(60), b.Remaining(), "the wire bytes are held while they are decoded")
@@ -108,7 +108,7 @@ func TestReadBudgetedBodyChargesAndReleases(t *testing.T) {
 func TestReadBudgetedBodyUnbounded(t *testing.T) {
 	t.Parallel()
 
-	data, release, err := readBudgetedBody(context.Background(), bytes.NewReader(make([]byte, 500)), 500)
+	data, release, err := readBudgetedBody(context.Background(), bytes.NewReader(make([]byte, 500)), 500, false)
 	require.NoError(t, err)
 	assert.Len(t, data, 500, "with no budget the read is unchanged")
 

@@ -290,6 +290,45 @@ The RPCs carry no checksum, so this is the only thing standing between a corrupt
 crash. The bound is the remaining input, since every element costs at least one byte; the decoders
 are fuzzed against it.
 
+### Response compression
+
+A fetch response body is compressed **whole** with zstd (`cluster/wire.go`), negotiated as ordinary
+HTTP content coding: the requester advertises `Accept-Encoding: zstd`, the peer answers
+`Content-Encoding: zstd` or plaintext. Nothing about *what* is on the wire changes — the batch
+encoding above is untouched — so the two sides need agree on nothing but the coding, and a
+mixed-version cluster is safe in both directions: a peer that predates this never advertises zstd
+and is answered in plaintext, and a peer that does advertise it still reads a plaintext answer. A
+payload that fails to shrink is sent plaintext, so a pathological body never costs bandwidth.
+
+The compression is worth it because the batch encoding is the *decompressed* form of what the part
+held: the owner inflates zstd-compressed columns and re-serializes them as raw varints and raw
+column bytes, so per row shipped the wire carried roughly the pre-compression size. Measured on a
+17.6 MB synthetic log fan-out payload the frame is **4.3×** smaller; metric samples range from 8.7×
+(integral counters) to 2.0× (full-entropy gauges), confirming that logs are where the bandwidth is.
+Level is `LevelFast`, not the default: on the same payload the two are within 1% on ratio while fast
+encodes ~20% quicker (365 vs 303 MB/s), and on integral samples fast is the denser of the two.
+
+The CPU lands the right way round. Encoding (~365 MB/s) is paid by the **owners**, which are the
+scale-out dimension; decoding (~1.3 GB/s, 3–4× cheaper) by the single aggregator, which is not. That
+asymmetry is the same argument that rules out shipping raw part blocks — which would move *all* the
+decode onto the aggregator, make the storage format the wire format, and lose the owner-side
+condition filtering that keeps a selective query small in the first place.
+
+What it buys is **bandwidth**, and latency only where bandwidth is the constraint. On an idle 10 GbE
+link the 17.6 MB payload crosses in ~14 ms while compressing it costs ~48 ms, so a single
+unconcurrent query there is slower; the win is real once the link is shared by a fan-out's worth of
+concurrent queries, on a slower or cross-AZ link, or wherever egress is metered.
+
+Compressing the body changes what the read budget must charge. `Content-Length` is now the *wire*
+size, which understates the resident bytes by the compression ratio, so honoring it would quietly
+multiply every budget by ~4×. `readBudgetedBody` therefore inflates a compressed body as a **stream**
+and applies the cap to the inflated bytes, never to the declared length. Streaming is what makes the
+adversarial case safe: a peer sending a few hundred bytes that expand without bound is cut off
+mid-inflation rather than after the allocation, which a whole-buffer decode cannot do — by the time
+it knows the size it has already allocated it. `compress.ZSTDFramer` exists for exactly this: bare
+zstd frames (no `Compressor` flag byte, so any zstd implementation reads them) plus a pooled
+streaming reader.
+
 ## Sharding
 
 `Config.ShardsPerTenant` splits a tenant into N shards; a series/stream maps to

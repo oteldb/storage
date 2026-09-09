@@ -115,7 +115,10 @@ The cluster fan-out body is bounded separately (`cluster/budget.go`), since `io.
 response is an unbounded remote input nothing else covers. The aggregator sends its remaining
 allowance in `X-Oteldb-Read-Budget`; a receiver treats that as a **hint that may only lower** its own
 configured limit, never raise it — the value arrives over the network, so adopting it verbatim would
-let anyone reaching the read endpoint grant themselves an unbounded query.
+let anyone reaching the read endpoint grant themselves an unbounded query. A fan-out body is
+zstd-compressed (`cluster/ARCH.md`), so the budget charges the body's **decompressed** length and
+caps the inflated stream, never `Content-Length` — the wire size understates the resident bytes by
+the compression ratio, and streaming is what stops a decompression bomb before the allocation.
 
 The bound covers record *fetches*, on both the local and the served-to-a-peer path. Two things it
 does not cover: metric reads, still bounded only by `DecodeMemoryBytes`, which is *admission* — it

@@ -2,7 +2,11 @@
 
 package compress
 
-import "github.com/valyala/gozstd"
+import (
+	"io"
+
+	"github.com/valyala/gozstd"
+)
 
 // The libzstd ZSTD backend (build -tags gozstd): github.com/valyala/gozstd, a cgo binding of the C
 // reference zstd. Higher ratio than pure-Go klauspost at high levels, full 1–22 range. The stateless
@@ -36,3 +40,17 @@ func newZstdEncoder(level Level) zstdEncoder {
 }
 
 func newZstdDecoder() zstdDecoder { return gzDecoder{} }
+
+type gzStreamDecoder struct{ r *gozstd.Reader }
+
+func (d gzStreamDecoder) Read(p []byte) (int, error) { return d.r.Read(p) }
+
+func (d gzStreamDecoder) reset(r io.Reader) error {
+	d.r.Reset(r, nil)
+
+	return nil
+}
+
+func (d gzStreamDecoder) release() { d.r.Reset(nil, nil) }
+
+func newZstdStreamDecoder() zstdStreamDecoder { return gzStreamDecoder{gozstd.NewReader(nil)} }

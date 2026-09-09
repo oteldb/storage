@@ -463,7 +463,7 @@ func NewReadHandler(fetchFn RequestFetchFunc, opts ...Option) http.Handler {
 			out = append(framed, out...)
 		}
 
-		_, _ = w.Write(out)
+		_, _ = w.Write(compressResponse(w, req.Header, out))
 	})
 }
 
@@ -524,6 +524,9 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Ite
 
 	obs.InjectHTTP(ctx, req.Header) // carry the trace into the read fan-out
 	sendBudget(ctx, req.Header)     // and what the caller still has room to accept
+	// Setting this also suppresses the transport's own transparent gzip, which would otherwise
+	// inflate the body before readBudgetedBody could charge it.
+	req.Header.Set(acceptEncodingHeader, encodingZSTD)
 
 	wantProfile := profile.Active(ctx)
 	if wantProfile {
@@ -536,7 +539,7 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Ite
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, releaseBody, err := readBudgetedBody(ctx, resp.Body, resp.ContentLength)
+	body, releaseBody, err := readBudgetedBody(ctx, resp.Body, resp.ContentLength, zstdEncoded(resp.Header))
 	if err != nil {
 		return nil, err
 	}
