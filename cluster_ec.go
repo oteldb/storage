@@ -291,7 +291,7 @@ type ecPartRef struct {
 // maintenance loop; a no-op when EC does not apply to the tenant. Already-converted parts are
 // skipped (cheap sidecar probe), and a conversion failure is logged and left for the next tick
 // — the part stays full-copy and readable meanwhile.
-func (s *Storage) convertColdParts(ctx context.Context, shardKey signal.TenantID, parts []ecPartRef) {
+func (s *Storage) convertColdParts(ctx context.Context, shardKey signal.TenantID, parts func() []ecPartRef) {
 	scheme, ok := s.ecSchemeFor(shardKey)
 	if !ok {
 		return
@@ -318,7 +318,7 @@ func (s *Storage) convertColdParts(ctx context.Context, shardKey signal.TenantID
 		}
 	}()
 
-	for _, p := range parts {
+	for _, p := range parts() {
 		meta, converted, err := ec.Converted(ctx, s.backend, p.prefix)
 		if err != nil {
 			log.Warn("ec: sidecar probe failed", zap.String("part", p.prefix), zap.Error(err))
