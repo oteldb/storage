@@ -202,3 +202,33 @@ func TestWriteReportsDirectorySyncFailure(t *testing.T) {
 	err := newFS(fsys).Write(context.Background(), "t1/obj", []byte("m"))
 	assert.ErrorIs(t, err, assert.AnError)
 }
+
+// A part directory can be removed by compaction or retention while a listing walks the tenant
+// above it, which is how a partsync peer listing met "openat …: no such file or directory".
+func TestListSkipsDirectoryRemovedMidWalk(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsys := faultfs.New()
+	b := newFS(fsys)
+
+	const doomed = "t1/traces/01M22YPD9JSHCNTBC1ABBM90G0"
+	require.NoError(t, b.Write(ctx, doomed+"/manifest", []byte("m")))
+	require.NoError(t, b.Write(ctx, "t1/traces/01M22YPD9JSHCNTBC1ABBM90G1/manifest", []byte("m")))
+
+	// Delete the part the moment the walk descends into it, so the ReadDir that follows finds
+	// nothing — the race, without a second goroutine to make it flaky.
+	fsys.Add(faultfs.Rule{
+		Op:    faultfs.OpReadDir,
+		Match: func(c faultfs.Call) bool { return c.Name == doomed },
+		Times: 1,
+		Before: func(faultfs.Call) {
+			require.NoError(t, fsys.Remove(doomed+"/manifest"))
+			require.NoError(t, fsys.Remove(doomed))
+		},
+	})
+
+	keys, err := b.List(ctx, "t1/traces/")
+	require.NoError(t, err)
+	require.Equal(t, []string{"t1/traces/01M22YPD9JSHCNTBC1ABBM90G1/manifest"}, keys)
+}
