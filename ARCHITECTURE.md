@@ -75,6 +75,10 @@ engines over the fetch seam (`query/fetch`).
 - **Maintenance** — one background loop flushes+merges every (tenant, signal) engine on
   `FlushInterval`, concurrently under a bound, ordered by head pressure. A head-bytes
   threshold pokes it early. A durable store always runs it (an unbounded head OOMs).
+- **Read-only** — `WithReadOnly()` opens a handle that never mutates the backend: the sweep-nothing
+  load, no maintenance loop, no WAL, no flush on `Close`, and every write and `Admin` mutation
+  refused with `ErrReadOnly`. `Open` refuses it alongside a cluster, a WAL dir, or an ephemeral
+  backend. See the invariant in §4.
 - **Operator surface** — `Inspect`, `Admin`, `Parts`/`PartsDetailed`/`Cardinality`/`StreamCosts`,
   `AdmissionStats`. See `ADMIN.md`.
 - **Policy** — `tenant.Policy` (limits, retention, downsample, sampling, recompress,
@@ -193,6 +197,17 @@ fails the read (`cluster.Disclaims`).
   part swept at the next open — never rows that are committed but unresolvable. The commit is a
   `backend.CompareAndSwap` against the version the writer read, so two writers over one prefix (a
   shared store) cannot overwrite each other's entries; the loser reloads and retries.
+- **Mutating the backend at open is opt-out, and opting out is total.** Recovery's orphan sweep is
+  the one write that happens before any caller-settable state exists, so a reader that only wanted to
+  look — a backup, a verifier, an offline inspector — reclaimed objects from the directory it was
+  pointed at. `Options.ReadOnly` selects the load mode that already exists for a replica (sweep
+  nothing, commit nothing, an index-named part the backend lacks becomes a pending want that reads
+  disclaim) and then holds the guarantee for the life of the handle: writes, `Reset` and every
+  mutating `Admin` call return `ErrReadOnly`, no maintenance loop runs, no WAL is opened or replayed,
+  and `Close` drains no head. A partial read-only handle would be worse than none — one that still
+  flushed on a timer looks safe — so the combinations that cannot honor it (a cluster member, a WAL
+  dir, an ephemeral backend that recovers nothing and so is permanently empty) are refused at `Open`
+  rather than half-supported.
 - **A part leaves the index's `Entries` only into `Removed` or into `Wanted`** — a tombstone (a
   deliberate deletion) or a repair obligation, never silently. An owner that cannot open a part
   drops it and records the want in the *same* commit, so the two halves cannot come apart; and only

@@ -240,7 +240,8 @@ open — exactly as in the metric engine ([`../engine/ARCH.md`](../engine/ARCH.m
 identity"), including the replica exception: `RefreshReplica` sweeps nothing, because the owner's
 in-flight part is not in the index yet, and a part the store lacks becomes a *pending* want rather than
 an error — counted and disclaimed over (`Stats.WantedParts`, `Engine.WantOverlaps`) until a refresh
-finds it or this node commits as an owner.
+finds it or this node commits as an owner. `LoadPartsReadOnly` reaches that same sweep-nothing load
+directly, for a handle that must not mutate the prefix at all (`storage.WithReadOnly`).
 
 Reuse would be unsound here for one extra reason: two of a part's objects are conditional — `keys.bin`
 is skipped when the rows carry no record attributes, the `sym-*.bin` sidecars when there is no side

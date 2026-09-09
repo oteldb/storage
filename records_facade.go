@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 
+	"github.com/go-faster/errors"
+
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/parallel"
@@ -100,6 +102,27 @@ func (s *Storage) recordEngineCached(
 	m[tid] = e
 
 	return e, nil
+}
+
+// writeRecords is the shared body of the record-signal ingest methods ([Storage.WriteLogs],
+// [Storage.WriteTraces], [Storage.WriteProfiles]): the handle-state gate, then the clustered or
+// local write path. op names the operation in a refusal.
+func (s *Storage) writeRecords(
+	ctx context.Context, sig signal.Signal, op string, project recordProjector, engineFor recordEngineFunc,
+) (Accepted, error) {
+	if s.closed.Load() {
+		return Accepted{}, errors.Wrap(ErrClosed, op)
+	}
+
+	if s.opts.ReadOnly {
+		return Accepted{}, errors.Wrap(ErrReadOnly, op)
+	}
+
+	if s.cluster != nil {
+		return s.writeRecordsClustered(ctx, sig, project)
+	}
+
+	return s.writeRecordsLocal(ctx, sig, project, engineFor)
 }
 
 // recordEngineFunc is the engine accessor passed to [Storage.writeRecordsLocal].

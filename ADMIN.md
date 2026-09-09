@@ -321,6 +321,11 @@ Imperative operator control, complementing the background maintenance loop (it h
 - `Rebalance(ctx)` — reconcile cluster ownership immediately (no-op single-node).
 - `MaintainNow(ctx)` — run one full maintenance cycle (flush + merge + retention across owned engines).
 
+Every one of these mutates the backend, so on a store opened with `WithReadOnly()` they all return an
+error wrapping `ErrReadOnly` (as do the `Write*` methods and `Reset`); the read side — `Inspect`,
+`Parts`/`PartsDetailed`/`Cardinality`/`StreamCosts`, `AdmissionStats` and the fetchers — is
+unaffected, which is what makes a read-only handle the right shape for an offline inspector.
+
 The retention cutoff both paths pass to the merge is `max(age cutoff, size cutoff)`. The size cutoff
 comes from `tenant.Retention.MaxBytes`: the tenant's parts across all signals/shards on this node are
 summed and dropped oldest-first until the total fits the budget (`retention.go`). Resolving it reads

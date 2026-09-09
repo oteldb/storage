@@ -252,26 +252,10 @@ func (s *Storage) Close(ctx context.Context) error {
 		}
 	}
 
-	for _, eng := range s.engineSnapshot() {
-		if err := eng.Close(ctx); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-
-	for _, eng := range s.logEngineSnapshot() {
-		if err := eng.Close(ctx); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-
-	for _, eng := range s.traceEngineSnapshot() {
-		if err := eng.Close(ctx); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-
-	for _, eng := range s.profileEngineSnapshot() {
-		if err := eng.Close(ctx); err != nil && firstErr == nil {
+	// A read-only store has no head to drain and no WAL to close, and closing an engine flushes —
+	// so skipping the engine closes is what keeps [Options.ReadOnly]'s promise at the last step.
+	if !s.opts.ReadOnly {
+		if err := s.closeEngines(ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -294,6 +278,10 @@ func (s *Storage) Close(ctx context.Context) error {
 func (s *Storage) Reset(ctx context.Context) error {
 	if s.closed.Load() {
 		return errors.Wrap(ErrClosed, "reset")
+	}
+
+	if s.opts.ReadOnly {
+		return errors.Wrap(ErrReadOnly, "reset")
 	}
 
 	if !s.backend.IsEphemeral() {
@@ -338,6 +326,10 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 
 	if s.closed.Load() {
 		return Accepted{}, errors.Wrap(ErrClosed, "write metrics")
+	}
+
+	if s.opts.ReadOnly {
+		return Accepted{}, errors.Wrap(ErrReadOnly, "write metrics")
 	}
 
 	if s.cluster != nil {
@@ -840,6 +832,45 @@ func (f seedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator
 // the seed layer (which only adds observability) for the count() pushdown.
 func (f seedFetcher) Unwrap() fetch.Fetcher { return f.inner }
 
+// engineCloser is the Close surface both engine types share, so [Storage.Close] drains them all
+// through one loop.
+type engineCloser interface {
+	Close(ctx context.Context) error
+}
+
+// closeEngines drains every tenant engine's head to a durable part and closes its WAL, returning
+// the first error while still closing the rest.
+func (s *Storage) closeEngines(ctx context.Context) error {
+	all := make([]engineCloser, 0,
+		len(s.engineSnapshot())+len(s.logEngineSnapshot())+len(s.traceEngineSnapshot())+len(s.profileEngineSnapshot()))
+
+	for _, eng := range s.engineSnapshot() {
+		all = append(all, eng)
+	}
+
+	for _, eng := range s.logEngineSnapshot() {
+		all = append(all, eng)
+	}
+
+	for _, eng := range s.traceEngineSnapshot() {
+		all = append(all, eng)
+	}
+
+	for _, eng := range s.profileEngineSnapshot() {
+		all = append(all, eng)
+	}
+
+	var firstErr error
+
+	for _, eng := range all {
+		if err := eng.Close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
+}
+
 // baseFetcher builds the unwrapped read seam for the tenant set: owner-aware per tenant in
 // cluster mode, otherwise the local engines (or a cross-tenant snapshot when none are named).
 func (s *Storage) baseFetcher(tenants []signal.TenantID) fetch.Fetcher {
@@ -983,16 +1014,21 @@ func (s *Storage) recover(ctx context.Context) error {
 	// load creates an engine (propagating a creation error) and loads its flushed parts. A cluster
 	// node holds no compaction claim yet, so a part it cannot read is not committed as a want here:
 	// only an owner writes one, and the first owned commit carries it ([engine.Engine.LoadPartsUnclaimed]).
+	// A read-only store additionally sweeps nothing ([engine.Engine.LoadPartsReadOnly]) — the sweep
+	// is the one backend mutation that would otherwise happen before any caller could decline it.
 	load := func(e partLoader, err error) error {
 		if err != nil {
 			return err
 		}
 
-		if s.opts.Cluster != nil {
+		switch {
+		case s.opts.ReadOnly:
+			return e.LoadPartsReadOnly(ctx)
+		case s.opts.Cluster != nil:
 			return e.LoadPartsUnclaimed(ctx)
+		default:
+			return e.LoadParts(ctx)
 		}
-
-		return e.LoadParts(ctx)
 	}
 
 	metricSuffix := metricsPrefix + "/" + bucketindex.Object
@@ -1035,6 +1071,7 @@ func (s *Storage) recover(ctx context.Context) error {
 type partLoader interface {
 	LoadParts(ctx context.Context) error
 	LoadPartsUnclaimed(ctx context.Context) error
+	LoadPartsReadOnly(ctx context.Context) error
 }
 
 // recoverWAL replays each per-tenant WAL directory under [Options.WALDir] into its engine, restoring
