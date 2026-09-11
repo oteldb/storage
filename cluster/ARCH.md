@@ -572,6 +572,17 @@ RF never acknowledges a loss at all; that is the safe direction, because an outs
 visible, recoverable state and a hole over live data is neither. ClickHouse's
 `searchForMissingPartOnOtherReplicas` scans every replica, live *and* dead, for the same reason.
 
+### Engine seams are fixed at creation, from the options
+
+An engine takes its repair seam and its term source once, at construction, and `Open` recovers every
+engine found on the backend *before* the cluster layer starts. So both are decided from `Options`
+(`Cluster`, `PrivateBackend`), never from whether `s.cluster` exists yet. A decision that reads the
+live cluster state instead leaves every recovered engine without the seam for the life of the
+process: wants — `AdoptWants` obligations included — are recorded and never fetched. Both seams
+still resolve peers and claims when they are called, and one called before the layer exists
+concludes nothing: `partRepairer` answers `WantIncomplete`, and the term is 0, the not-held
+answer.
+
 ## `ec` — erasure coding
 
 Per-tenant policy (`tenant.Durability.EC`, an age tier like recompression, so recent data stays

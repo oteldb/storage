@@ -39,14 +39,24 @@ type partRepairer struct {
 // acknowledges a loss, which is the safe direction: an outstanding want is visible and
 // recoverable, a hole over live data is neither.
 func (r *partRepairer) FetchWants(ctx context.Context, wants []bucketindex.Want) []engine.FetchResult {
+	out := make([]engine.FetchResult, len(wants))
+
+	// An engine recovery built is handed this seam before the cluster layer starts. There is no
+	// owner set to ask yet, so nothing may be concluded.
+	if r.s.cluster == nil {
+		for i := range out {
+			out[i].Outcome = bucketindex.WantIncomplete
+		}
+
+		return out
+	}
+
 	complete, remotes := r.s.completeOwners(r.tid)
 
 	absent := bucketindex.WantIncomplete
 	if complete {
 		absent = bucketindex.WantAbsent
 	}
-
-	out := make([]engine.FetchResult, len(wants))
 
 	if len(remotes) == 0 {
 		for i := range out {
@@ -122,8 +132,11 @@ func (s *Storage) completeOwners(shardKey signal.TenantID) (complete bool, remot
 // repairerFor returns the cluster repair seam for one engine, or nil where there is nothing to
 // repair from: a shared backend needs no cross-node copy (every replica reads the same objects), and
 // without a cluster layer there is no peer at all.
+//
+// It is decided from the options because the seam is fixed at engine creation, and recovery creates
+// every engine found on the backend before the cluster layer starts.
 func (s *Storage) repairerFor(tid signal.TenantID, prefix string) *partRepairer {
-	if s.cluster == nil || !s.cluster.private {
+	if s.opts.Cluster == nil || !s.opts.Cluster.PrivateBackend {
 		return nil
 	}
 
