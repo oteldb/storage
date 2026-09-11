@@ -285,6 +285,27 @@ func (s *Storage) gapGuarded(
 	return gapFetcher{store: s, sig: sig, shard: shard, local: local, remotes: remotes}
 }
 
+// wantHolder is the obligation check both engine types share.
+type wantHolder interface{ HasWants() bool }
+
+// answerLocally is the read policy for a store with no cluster layer, which has no owner to fail
+// over to: a read overlapping an unsatisfied want fails. The steady state costs one [wantHolder]
+// check — read gaps are recorded only on a cluster node.
+func (s *Storage) answerLocally(
+	ctx context.Context, op string, sig signal.Signal, tid signal.TenantID, eng wantHolder, start, end int64,
+) error {
+	if !eng.HasWants() {
+		return nil
+	}
+
+	err := s.canAnswer(ctx, op, sig, tid, true, start, end)
+	if err != nil {
+		s.obs.RPC.ReadIncomplete(ctx, op)
+	}
+
+	return err
+}
+
 // metricPartsMax returns the newest timestamp the engine's parts hold, or [math.MinInt64] when it
 // has none.
 func metricPartsMax(eng *engine.Engine) int64 {

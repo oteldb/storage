@@ -117,7 +117,7 @@ func TestRepairSingleOwnerShardIsComplete(t *testing.T) {
 func TestRepairerAbsentWithoutPrivateBackend(t *testing.T) {
 	t.Parallel()
 
-	s := &Storage{}
+	s := &Storage{opts: Options{Cluster: &cluster.Config{}}, cluster: &clusterNode{}}
 	assert.Nil(t, s.repairerFor(signal.TenantID("acme"), "acme/metrics"))
 	assert.Nil(t, s.metricRepairerFor(signal.TenantID("acme"), "acme/metrics"))
 	assert.Nil(t, s.recordRepairerFor(signal.TenantID("acme"), "acme/metrics"))

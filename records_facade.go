@@ -295,7 +295,7 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 func (s *Storage) recordFetcher(
 	sig signal.Signal,
 	tenants []signal.TenantID,
-	snapshot func() []*recordengine.Engine,
+	snapshot func() map[signal.TenantID]*recordengine.Engine,
 	lookup func(signal.TenantID) (*recordengine.Engine, bool),
 	clusterFor func(signal.TenantID) fetch.Fetcher,
 ) fetch.Fetcher {
@@ -321,13 +321,14 @@ func (s *Storage) recordFetcher(
 	var fetchers []fetch.Fetcher
 
 	if len(tenants) == 0 {
-		for _, eng := range snapshot() {
-			fetchers = append(fetchers, eng)
+		for tid, eng := range snapshot() {
+			fetchers = append(fetchers, s.gapGuarded(sig, tid, eng, nil))
 		}
 	} else {
 		for _, t := range tenants {
-			if e, ok := lookup(s.normalizeTenant(t)); ok {
-				fetchers = append(fetchers, e)
+			tid := s.normalizeTenant(t)
+			if e, ok := lookup(tid); ok {
+				fetchers = append(fetchers, s.gapGuarded(sig, tid, e, nil))
 			}
 		}
 	}
@@ -345,4 +346,65 @@ func oneOrConcat(fetchers []fetch.Fetcher) fetch.Fetcher {
 	default:
 		return concatFetcher(fetchers)
 	}
+}
+
+// recordSeries is the shared body of [Storage.LogSeries] and [Storage.TraceSeries]; op names the
+// call in a refusal.
+func (s *Storage) recordSeries(
+	ctx context.Context, sig signal.Signal, op string, lookup func(signal.TenantID) (*recordengine.Engine, bool),
+	t signal.TenantID, matchers []fetch.Matcher, start, end int64,
+) ([]signal.Series, error) {
+	if s.closed.Load() {
+		return nil, errors.Wrap(ErrClosed, op)
+	}
+
+	tid := s.normalizeTenant(t)
+
+	if s.cluster != nil {
+		return s.clusterSeries(ctx, sig, tid, matchers, start, end)
+	}
+
+	eng, ok := lookup(tid)
+	if !ok {
+		return nil, nil
+	}
+
+	if err := s.answerLocally(ctx, rpcOpSeries, sig, tid, eng, start, end); err != nil {
+		return nil, err
+	}
+
+	return eng.Series(matchers, start, end), nil
+}
+
+// recordKeys is the shared body of [Storage.LogKeys] and [Storage.TraceKeys]; op names the call in a
+// refusal.
+func (s *Storage) recordKeys(
+	ctx context.Context, sig signal.Signal, op string, lookup func(signal.TenantID) (*recordengine.Engine, bool),
+	t signal.TenantID, start, end int64,
+) ([]KeyInfo, error) {
+	if s.closed.Load() {
+		return nil, errors.Wrap(ErrClosed, op)
+	}
+
+	tid := s.normalizeTenant(t)
+
+	if s.cluster != nil {
+		raw, err := s.clusterKeys(ctx, sig, tid, start, end)
+		if err != nil {
+			return nil, err
+		}
+
+		return keyInfosFromCluster(raw), nil
+	}
+
+	eng, ok := lookup(tid)
+	if !ok {
+		return nil, nil
+	}
+
+	if err := s.answerLocally(ctx, rpcOpKeys, sig, tid, eng, start, end); err != nil {
+		return nil, err
+	}
+
+	return keyInfosFromEngine(eng.Keys(start, end)), nil
 }

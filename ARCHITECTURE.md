@@ -152,7 +152,8 @@ degrades into a silently partial result. An owner that *holds* the shard and kno
 for the window — a head lost at restart, or a part its index names but it cannot read — answers
 `cluster.ErrShardIncomplete`, which fails over the same way but never collapses to an empty success:
 when every owner disclaims, "no owner holds it" reads as empty and "an owner holds it and is short"
-fails the read (`cluster.Disclaims`).
+fails the read (`cluster.Disclaims`). A store without the cluster layer keeps the rule with nothing
+to fail over to: a read overlapping a want fails.
 
 ---
 
@@ -218,8 +219,9 @@ fails the read (`cluster.Disclaims`).
   the want so reads resume, and raises the index's monotone `LostParts`. The flag rides on the entry
   every reader already carries, so a hole can never be mistaken for an empty part. Two guards stand
   between a want and a hole, both because a hole over live data is unrecoverable while an
-  outstanding want is not: the peer set must be the shard's *complete expected* owner set, and the
-  conclusion must repeat over consecutive repair passes. A hole is revoked by the part turning up on
+  outstanding want is not: the peer set must be the shard's *complete expected* owner set — for a
+  store without the cluster layer, the node itself, whose backend holds the only copy — and the
+  conclusion must repeat over consecutive repair passes. A read-only store never commits one. A hole is revoked by the part turning up on
   any owner; the loss count never falls (`engine/ARCH.md`, `cluster/ARCH.md`).
 - **A part id is globally unique** (both engines). A part's backend key is `{enginePrefix}/{partid}`,
   where `partid` is a minted ULID-shaped id (`internal/partid`), not a per-node counter: replicas of a

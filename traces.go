@@ -30,7 +30,7 @@ func (s *Storage) WriteTraces(ctx context.Context, td trace.Traces) (acc Accepte
 // data. Label matchers resolve streams (services); column Conditions filter spans (name, kind,
 // status, duration, attributes). Same tenant scoping as [Storage.LogFetcher].
 func (s *Storage) TraceFetcher(tenants ...signal.TenantID) fetch.Fetcher {
-	return s.recordFetcher(signal.Trace, tenants, s.traceEngineSnapshot, s.lookupTraceEngine, s.clusterTraceFetcherFor)
+	return s.recordFetcher(signal.Trace, tenants, s.traceEngineSnapshotByTenant, s.lookupTraceEngine, s.clusterTraceFetcherFor)
 }
 
 // TraceSeries returns the identities of a tenant's span streams matching the label matchers within
@@ -41,20 +41,7 @@ func (s *Storage) TraceFetcher(tenants ...signal.TenantID) fetch.Fetcher {
 func (s *Storage) TraceSeries(
 	ctx context.Context, tenant signal.TenantID, matchers []fetch.Matcher, start, end int64,
 ) ([]signal.Series, error) {
-	if s.closed.Load() {
-		return nil, errors.Wrap(ErrClosed, "trace series")
-	}
-
-	if s.cluster != nil {
-		return s.clusterSeries(ctx, signal.Trace, s.normalizeTenant(tenant), matchers, start, end)
-	}
-
-	eng, ok := s.lookupTraceEngine(s.normalizeTenant(tenant))
-	if !ok {
-		return nil, nil
-	}
-
-	return eng.Series(matchers, start, end), nil
+	return s.recordSeries(ctx, signal.Trace, "trace series", s.lookupTraceEngine, tenant, matchers, start, end)
 }
 
 // TraceKeys returns the distinct attribute keys present in a tenant's spans within [start, end],
@@ -66,25 +53,7 @@ func (s *Storage) TraceSeries(
 // metadata. In cluster mode it serves locally when this node owns the tenant, else it fans out to an
 // owner (hedged); each owner is a complete replica, so one response is authoritative.
 func (s *Storage) TraceKeys(ctx context.Context, tenant signal.TenantID, start, end int64) ([]KeyInfo, error) {
-	if s.closed.Load() {
-		return nil, errors.Wrap(ErrClosed, "trace keys")
-	}
-
-	if s.cluster != nil {
-		raw, err := s.clusterKeys(ctx, signal.Trace, s.normalizeTenant(tenant), start, end)
-		if err != nil {
-			return nil, err
-		}
-
-		return keyInfosFromCluster(raw), nil
-	}
-
-	eng, ok := s.lookupTraceEngine(s.normalizeTenant(tenant))
-	if !ok {
-		return nil, nil
-	}
-
-	return keyInfosFromEngine(eng.Keys(start, end)), nil
+	return s.recordKeys(ctx, signal.Trace, "trace keys", s.lookupTraceEngine, tenant, start, end)
 }
 
 // Trace fetches every span of one trace from a tenant by trace id: an equality condition on the

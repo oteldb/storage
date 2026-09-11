@@ -32,7 +32,7 @@ func (s *Storage) WriteLogs(ctx context.Context, ld log.Logs) (acc Accepted, err
 // or none ⇒ all tenants with log data. Always usable: an empty fetcher when no tenant matches or
 // after [Close]. Label matchers resolve streams; column Conditions filter records.
 func (s *Storage) LogFetcher(tenants ...signal.TenantID) fetch.Fetcher {
-	return s.recordFetcher(signal.Log, tenants, s.logEngineSnapshot, s.lookupLogEngine, s.clusterLogFetcherFor)
+	return s.recordFetcher(signal.Log, tenants, s.logEngineSnapshotByTenant, s.lookupLogEngine, s.clusterLogFetcherFor)
 }
 
 // LogsForTrace fetches every log record correlated to a trace id from a tenant: an equality condition
@@ -55,20 +55,7 @@ func (s *Storage) LogsForTrace(ctx context.Context, tenant signal.TenantID, trac
 func (s *Storage) LogSeries(
 	ctx context.Context, tenant signal.TenantID, matchers []fetch.Matcher, start, end int64,
 ) ([]signal.Series, error) {
-	if s.closed.Load() {
-		return nil, errors.Wrap(ErrClosed, "log series")
-	}
-
-	if s.cluster != nil {
-		return s.clusterSeries(ctx, signal.Log, s.normalizeTenant(tenant), matchers, start, end)
-	}
-
-	eng, ok := s.lookupLogEngine(s.normalizeTenant(tenant))
-	if !ok {
-		return nil, nil
-	}
-
-	return eng.Series(matchers, start, end), nil
+	return s.recordSeries(ctx, signal.Log, "log series", s.lookupLogEngine, tenant, matchers, start, end)
 }
 
 // KeyScope is a bitset of the scopes an attribute key appears in. A key can appear in more than one
@@ -101,25 +88,7 @@ type KeyInfo struct {
 // it fans out to an owner (hedged); each owner is a complete replica, so one response is
 // authoritative.
 func (s *Storage) LogKeys(ctx context.Context, tenant signal.TenantID, start, end int64) ([]KeyInfo, error) {
-	if s.closed.Load() {
-		return nil, errors.Wrap(ErrClosed, "log keys")
-	}
-
-	if s.cluster != nil {
-		raw, err := s.clusterKeys(ctx, signal.Log, s.normalizeTenant(tenant), start, end)
-		if err != nil {
-			return nil, err
-		}
-
-		return keyInfosFromCluster(raw), nil
-	}
-
-	eng, ok := s.lookupLogEngine(s.normalizeTenant(tenant))
-	if !ok {
-		return nil, nil
-	}
-
-	return keyInfosFromEngine(eng.Keys(start, end)), nil
+	return s.recordKeys(ctx, signal.Log, "log keys", s.lookupLogEngine, tenant, start, end)
 }
 
 // keyInfosFromEngine converts the record engine's key list into the facade's [KeyInfo] type.

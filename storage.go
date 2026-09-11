@@ -650,6 +650,10 @@ func (s *Storage) MetricSeries(
 		return nil, nil
 	}
 
+	if err := s.answerLocally(ctx, rpcOpSeries, signal.Metric, tid, eng, start, end); err != nil {
+		return nil, err
+	}
+
 	return eng.Series(ctx, metricSeriesRequest(tid, matchers, start, end))
 }
 
@@ -684,9 +688,15 @@ func (s *Storage) AggregateMetrics(ctx context.Context, t signal.TenantID, r fet
 		return out, nil
 	}
 
-	eng, ok := s.lookupEngine(s.normalizeTenant(t))
+	tid := s.normalizeTenant(t)
+
+	eng, ok := s.lookupEngine(tid)
 	if !ok {
 		return map[signal.SeriesID]engine.SeriesAgg{}, nil
+	}
+
+	if err := s.answerLocally(ctx, rpcOpRead, signal.Metric, tid, eng, r.Start, r.End); err != nil {
+		return nil, err
 	}
 
 	return eng.AggregateRange(ctx, r)
@@ -758,9 +768,15 @@ func (s *Storage) AggregateMetricsStepNamed(
 		return s.clusterAggregateNamedFor(ctx, t, r, step)
 	}
 
-	eng, ok := s.lookupEngine(s.normalizeTenant(t))
+	tid := s.normalizeTenant(t)
+
+	eng, ok := s.lookupEngine(tid)
 	if !ok {
 		return nil, nil
+	}
+
+	if err := s.answerLocally(ctx, rpcOpRead, signal.Metric, tid, eng, r.Start, r.End); err != nil {
+		return nil, err
 	}
 
 	return eng.AggregateStepNamed(ctx, r, step)
@@ -798,9 +814,15 @@ func (s *Storage) AggregateMetricsWindowNamed(
 		return s.clusterAggregateWindowNamedFor(ctx, t, r, spec)
 	}
 
-	eng, ok := s.lookupEngine(s.normalizeTenant(t))
+	tid := s.normalizeTenant(t)
+
+	eng, ok := s.lookupEngine(tid)
 	if !ok {
 		return nil, nil
+	}
+
+	if err := s.answerLocally(ctx, rpcOpRead, signal.Metric, tid, eng, r.Start, r.End); err != nil {
+		return nil, err
 	}
 
 	return eng.AggregateWindowNamed(ctx, r, spec)
@@ -888,13 +910,14 @@ func (s *Storage) baseFetcher(tenants []signal.TenantID) fetch.Fetcher {
 	var fetchers []fetch.Fetcher
 
 	if len(tenants) == 0 {
-		for _, eng := range s.engineSnapshot() {
-			fetchers = append(fetchers, eng)
+		for tid, eng := range s.engineSnapshotByTenant() {
+			fetchers = append(fetchers, s.gapGuarded(signal.Metric, tid, eng, nil))
 		}
 	} else {
 		for _, t := range tenants {
-			if e, ok := s.lookupEngine(s.normalizeTenant(t)); ok {
-				fetchers = append(fetchers, e)
+			tid := s.normalizeTenant(t)
+			if e, ok := s.lookupEngine(tid); ok {
+				fetchers = append(fetchers, s.gapGuarded(signal.Metric, tid, e, nil))
 			}
 		}
 	}

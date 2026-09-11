@@ -230,8 +230,8 @@ written onto the part only once the commit lands. See [`../engine/ARCH.md`](../e
 exact part, the largest containing part at a higher level, or a split group whose members are all
 present), the second fetch round that completes such a group inside one commit, and the two gates a
 want must clear before its loss is acknowledged as a revocable hole. See [`../engine/ARCH.md`](../engine/ARCH.md),
-"Repair — a want is discharged by committing a part" and "An unrepairable want becomes a revocable
-hole".
+"Repair — a want is discharged by committing a part", "An unrepairable want becomes a revocable
+hole" and "A store without a cluster layer is its own complete owner set".
 
 ## Part identity & orphans
 
