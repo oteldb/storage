@@ -105,6 +105,12 @@ func (iv Interval) Union(o Interval) Interval {
 	}
 }
 
+// Equal reports whether iv and o have the same encoding, which for canonical intervals is set
+// equality.
+func (iv Interval) Equal(o Interval) bool {
+	return iv.Min == o.Min && iv.Max == o.Max && slices.Equal(iv.Gaps, o.Gaps)
+}
+
 // Len reports how many blocks the interval covers, 0 if unset. It orders candidate successors
 // by how much of the shard they subsume.
 func (iv Interval) Len() uint64 {
@@ -215,6 +221,9 @@ type Claim struct {
 // Valid reports whether the claim names a real group and a real set of ancestor blocks. An unset
 // claim realizes nothing.
 func (c Claim) Valid() bool { return c.Blocks.Valid() && c.Group.Valid() }
+
+// Equal reports whether c and o name the same ancestry and the same group.
+func (c Claim) Equal(o Claim) bool { return c.Blocks.Equal(o.Blocks) && c.Group.Equal(o.Group) }
 
 // Supersedes reports whether e's data wholly subsumes o's: e covers every block o covers, and sits
 // at a higher merge level. It is decidable from identity alone — no index comparison, no

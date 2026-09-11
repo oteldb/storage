@@ -509,7 +509,11 @@ with its stream ranges — falls back to that decode. The result is held on the 
 `loadPartsLocked` reuses handles by prefix across an index reload exactly as the metric engine does,
 so the blooms, record keys, stream ranges and identities a part carries are read once rather than per
 maintenance tick; a reused handle is probed with `block.PartPresent` so a part whose objects went away
-still becomes a want.
+still becomes a want. As there, a published part is never written. A handle is reused only while its
+entry is unchanged, and a changed entry gets a fresh handle. `MergeShape` (through the ladder
+selector's `fitsLevel`), `PartsDetailed` and the top-N scan (`orderPartsForLimit`, `beyondWatermark`)
+read part fields after releasing the engine lock. The commit's stamping of block identity relies on
+`flushMu` for the same reason given in the metric engine's ARCH.md.
 
 **A stream's identity frame is logged when the head registers the stream**, not when it first has an
 accepted record. A stream is new exactly once, and replay drops records it cannot attribute to a

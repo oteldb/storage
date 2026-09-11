@@ -32,6 +32,46 @@ func TestIntervalValid(t *testing.T) {
 	}
 }
 
+func TestIntervalEqual(t *testing.T) {
+	t.Parallel()
+
+	gapped := bucketindex.Blocks(1, 2, 5, 6)
+
+	cases := []struct {
+		name string
+		a, b bucketindex.Interval
+		want bool
+	}{
+		{"unset", bucketindex.Interval{}, bucketindex.Interval{}, true},
+		{"single", bucketindex.Blocks(3), bucketindex.Blocks(3), true},
+		{"gapped", gapped, bucketindex.Blocks(6, 5, 2, 1), true},
+		{"nil and empty gaps", bucketindex.Interval{Min: 1, Max: 2}, bucketindex.Interval{Min: 1, Max: 2, Gaps: []bucketindex.Gap{}}, true},
+		{"min", bucketindex.Blocks(3), bucketindex.Blocks(4), false},
+		{"max", bucketindex.Blocks(3, 4), bucketindex.Blocks(3, 4, 5), false},
+		{"gap", gapped, bucketindex.Blocks(1, 2, 3, 5, 6), false},
+		{"unset and set", bucketindex.Interval{}, bucketindex.Blocks(1), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, tc.a.Equal(tc.b))
+			assert.Equal(t, tc.want, tc.b.Equal(tc.a))
+		})
+	}
+}
+
+func TestClaimEqual(t *testing.T) {
+	t.Parallel()
+
+	claim := bucketindex.Claim{Blocks: bucketindex.Blocks(1, 2, 3), Group: bucketindex.Blocks(7, 8)}
+
+	assert.True(t, claim.Equal(bucketindex.Claim{Blocks: bucketindex.Blocks(1, 2, 3), Group: bucketindex.Blocks(7, 8)}))
+	assert.True(t, bucketindex.Claim{}.Equal(bucketindex.Claim{}))
+	assert.False(t, claim.Equal(bucketindex.Claim{Blocks: bucketindex.Blocks(1, 2), Group: bucketindex.Blocks(7, 8)}))
+	assert.False(t, claim.Equal(bucketindex.Claim{Blocks: bucketindex.Blocks(1, 2, 3), Group: bucketindex.Blocks(7, 9)}))
+	assert.False(t, claim.Equal(bucketindex.Claim{}))
+}
+
 // TestIntervalZeroContainsNothing pins the dangerous failure mode: a pre-v5 entry carries no
 // interval, and its zero value must neither contain nor be contained by anything.
 func TestIntervalZeroContainsNothing(t *testing.T) {

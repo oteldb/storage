@@ -416,16 +416,14 @@ const (
 )
 
 // livePart resolves the handle for ent, taking it out of open (the previous load's part set) when
-// that handle is still good. Parts are immutable and the prefix is their identity, so an open handle
-// for a prefix the reloaded index still names is still valid — reusing it keeps the caches it built,
-// above all the per-series watermarks whose alternative is a whole timestamp column per part per
-// refresh. Reuse cannot skip noticing that the part's objects went away, though, so the handle is
-// probed first; a part that is gone is left in open (it counts as dropped) and reported through
-// [partGone], which the caller turns into a repair want.
+// that handle can be reused: one whose objects are still present and that already carries everything
+// ent records ([part.matchesEntry]). A published handle is read off the lock, so it is never written;
+// any other prefix the index names gets a fresh handle. A part whose objects are gone is left in open
+// (it counts as dropped) and reported through [partGone], which the caller turns into a repair want.
 func (e *Engine) livePart(
 	ctx context.Context, ent *bucketindex.Entry, open map[string]*part,
 ) (*part, error) {
-	if p := open[ent.Prefix]; p != nil {
+	if p := open[ent.Prefix]; p != nil && p.matchesEntry(ent) {
 		live, err := block.PartPresent(ctx, e.cfg.Backend, ent.Prefix)
 		if err != nil {
 			return nil, errors.Wrapf(err, "probe part %q", ent.Prefix)
@@ -443,7 +441,20 @@ func (e *Engine) livePart(
 		return nil, errors.Wrapf(err, "open part %q", ent.Prefix)
 	}
 
+	// The handle this one replaces names a part that is still live, so it is not a dropped one.
+	delete(open, ent.Prefix)
+
+	p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
+	p.blocks, p.claim, p.level = ent.Blocks, ent.Claim, ent.Level
+
 	return p, nil
+}
+
+// matchesEntry reports whether p already carries every field ent records about it, with no identity
+// still pending, so reusing it needs no write.
+func (p *part) matchesEntry(ent *bucketindex.Entry) bool {
+	return p.pending == nil && p.minTime == ent.MinTime && p.maxTime == ent.MaxTime &&
+		p.level == ent.Level && p.blocks.Equal(ent.Blocks) && p.claim.Equal(ent.Claim)
 }
 
 // loadPartsLocked is [Engine.LoadParts] under a [loadMode]. Caller holds e.mu.
@@ -506,10 +517,6 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 			continue
 		}
 
-		p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
-		p.blocks, p.claim, p.level = ent.Blocks, ent.Claim, ent.Level
-		// The index names the part, so whatever identity it was waiting for has been committed.
-		p.pending = nil
 		parts = append(parts, p)
 	}
 
