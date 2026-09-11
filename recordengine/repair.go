@@ -186,7 +186,7 @@ func (e *Engine) repairWants(ctx context.Context) {
 
 	held, remote := e.openHeld(ctx, pending, &stats)
 
-	results, fetchStats := e.fetchWants(ctx, remote)
+	results, failed, fetchStats := e.fetchWants(ctx, remote)
 	stats.add(fetchStats)
 
 	results = append(results, held...)
@@ -196,7 +196,7 @@ func (e *Engine) repairWants(ctx context.Context) {
 	// with nothing yet able to retire them, would have those rows read twice. The group's other
 	// members are only knowable once one of them is in hand, which is why this is a second round.
 	if extra := siblingTargets(&ix, wants, results); len(extra) > 0 {
-		more, extraStats := e.fetchWants(ctx, extra)
+		more, _, extraStats := e.fetchWants(ctx, extra)
 		stats.add(extraStats)
 
 		results = append(results, dropIncompleteGroups(&ix, results, more)...)
@@ -206,7 +206,7 @@ func (e *Engine) repairWants(ctx context.Context) {
 	// every node.
 	slices.SortFunc(results, func(a, b repairResult) int { return strings.Compare(a.want.Prefix, b.want.Prefix) })
 
-	lost := e.confirmLost(wants, results)
+	lost := e.confirmLost(wants, results, failed)
 	stats.Lost = int64(len(lost))
 
 	e.publishRepaired(ctx, results, lost, stats)
@@ -236,10 +236,13 @@ func (e *Engine) observeRepair(ctx context.Context, s RepairStats) {
 // during a rolling restart that is a strict subset of the owners: two reachable peers lacking the
 // part says nothing about a third that holds it and is merely restarting.
 //
-// And the same conclusion must repeat over [holeConfirmations] attempts. Evidence lives only in
+// And the same conclusion must repeat over [holeConfirmations] consecutive attempts. A failed
+// attempt, named in failed, concludes nothing but still breaks the run. Evidence lives only in
 // memory, so a restart forgets it and repair has to earn it again — the bias is deliberately
 // toward leaving the want outstanding.
-func (e *Engine) confirmLost(wants []bucketindex.Want, results []repairResult) []bucketindex.Want {
+func (e *Engine) confirmLost(
+	wants []bucketindex.Want, results []repairResult, failed []string,
+) []bucketindex.Want {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -257,6 +260,10 @@ func (e *Engine) confirmLost(wants []bucketindex.Want, results []repairResult) [
 
 		return !ok
 	})
+
+	for _, prefix := range failed {
+		delete(e.holeEvidence, prefix)
+	}
 
 	var lost []bucketindex.Want
 
@@ -336,12 +343,15 @@ func (e *Engine) openHeld(
 
 // fetchWants pulls up to [repairFetchesPerCycle] targets' parts from peers in one call — the
 // fetcher answers the whole cycle at once so it can read each peer's index once and copy a part
-// discharging several wants once — and returns what each attempt concluded.
-func (e *Engine) fetchWants(ctx context.Context, pending []repairTarget) ([]repairResult, RepairStats) {
+// discharging several wants once — and returns what each attempt concluded. A failed attempt
+// concludes nothing, so it is never a result; failed names the wants it was made for.
+func (e *Engine) fetchWants(
+	ctx context.Context, pending []repairTarget,
+) ([]repairResult, []string, RepairStats) {
 	var stats RepairStats
 
 	if e.cfg.Repair == nil || len(pending) == 0 {
-		return nil, stats
+		return nil, nil, stats
 	}
 
 	pending = pending[:min(len(pending), repairFetchesPerCycle)]
@@ -355,6 +365,8 @@ func (e *Engine) fetchWants(ctx context.Context, pending []repairTarget) ([]repa
 
 	out := make([]repairResult, 0, len(pending))
 
+	var failed []string
+
 	for i := range pending {
 		t := &pending[i]
 
@@ -367,6 +379,10 @@ func (e *Engine) fetchWants(ctx context.Context, pending []repairTarget) ([]repa
 
 		if r.Err != nil {
 			stats.Failed++
+
+			if !t.hole && !t.sibling {
+				failed = append(failed, t.want.Prefix)
+			}
 
 			zctx.From(ctx).Warn("repair fetch failed",
 				zap.String("prefix", e.cfg.Prefix), zap.String("want", t.want.Prefix), zap.Error(r.Err))
@@ -396,7 +412,7 @@ func (e *Engine) fetchWants(ctx context.Context, pending []repairTarget) ([]repa
 		out = append(out, repairResult{repairTarget: *t, entry: r.Entry, outcome: r.Outcome})
 	}
 
-	return out, stats
+	return out, failed, stats
 }
 
 // publishRepaired commits the cycle's outcome in one index write: the parts that came back, and
