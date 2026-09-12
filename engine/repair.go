@@ -209,8 +209,7 @@ func (e *Engine) repairWants(ctx context.Context) {
 	lost := e.confirmLost(wants, results, failed)
 	stats.Lost = int64(len(lost))
 
-	e.publishRepaired(ctx, results, lost, stats)
-	e.observeRepair(ctx, stats)
+	e.observeRepair(ctx, e.publishRepaired(ctx, results, lost, stats))
 }
 
 // observeRepair publishes the pass to the injected metrics catalog. Lost is a monotone counter
@@ -422,9 +421,12 @@ func (e *Engine) fetchWants(
 //
 // Local parts a repaired one supersedes are retired in the same commit, because their rows are
 // inside it — the same swap a merge publishes.
+//
+// It returns stats as the commit's outcome corrected them, the only value [Engine.observeRepair]
+// may be given: a failed commit acknowledged no loss, and a part that would not open was not fetched.
 func (e *Engine) publishRepaired(
 	ctx context.Context, results []repairResult, lost []bucketindex.Want, stats RepairStats,
-) {
+) RepairStats {
 	satisfied := make([]*repairResult, 0, len(results))
 
 	for i := range results {
@@ -440,7 +442,7 @@ func (e *Engine) publishRepaired(
 		e.repaired.add(stats)
 		e.mu.Unlock()
 
-		return
+		return stats
 	}
 
 	e.flushMu.Lock()
@@ -543,10 +545,12 @@ func (e *Engine) publishRepaired(
 		zctx.From(ctx).Error("repair commit failed",
 			zap.String("prefix", e.cfg.Prefix), zap.Error(err))
 
-		return
+		return stats
 	}
 
 	e.reclaimRetired(ctx)
+
+	return stats
 }
 
 // supersededBy is the set of live parts whose rows are wholly inside the repaired entries: a peer
