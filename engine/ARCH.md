@@ -12,6 +12,7 @@ phase is `plan under lock → I/O off lock → publish under lock`.
 | element | rule |
 |---|---|
 | `parts` slice | copy-on-write; a snapshot stays valid after unlock |
+| published part | never written: a snapshot's parts are read lock-free (see "A published part is never written") |
 | fetch | plans under RLock (matchers, `acquire()`, head seed), then reads lock-free |
 | flush/merge | parts swap, index commit and WAL checkpoint publish atomically |
 | writers | only the maintenance loop mutates `parts` |
@@ -894,15 +895,29 @@ timestamp column at all. A part written before the sidecar existed, or one whose
 does not cover its series, falls back to decoding the column; absence is not an error. Either way the
 result is held on the part handle at ~24 bytes per series, on top of the 20 the resident index costs.
 
-**A reloaded index reuses the part handles the engine already holds** (`loadPartsLocked`). Parts are
-immutable and the prefix is their identity, so a handle for a prefix the new index still names is
-still valid; reopening it throws away the watermarks, the paged series index, the stats and granule
-sidecars and the registered identities, which a replica's maintenance tick would then rebuild every
-tick over the whole part set. A reused handle still takes its per-entry fields — time bounds, block
-identity, level — from the index entry, and keeps its in-flight readers. The part's identity object is
-registered once per handle for the same reason: it is immutable, and the identity prune only ever
-drops identities no live part holds. Over four parts of 50 series × 500 samples on the memory backend
-this is a refresh at 9.7 µs and 5.3 KB allocated instead of 653 µs and 943 KB.
+**A reloaded index reuses the part handles the engine already holds** (`loadPartsLocked`) when the
+handle already carries everything its entry records — time bounds, block identity, claim, level — and
+has no identity pending (`part.matchesEntry`). Reopening throws away the watermarks, the paged series
+index, the stats and granule sidecars and the registered identities, which a replica's maintenance
+tick would then rebuild every tick over the whole part set. A replica's entries do not change between
+ticks, so reuse is the steady state. The part's identity object is registered once per handle for the
+same reason: it is immutable, and the identity prune only ever drops identities no live part holds.
+Over four parts of 50 series × 500 samples on the memory backend this is a refresh at 9.7 µs and 5.3 KB
+allocated instead of 653 µs and 943 KB.
+
+**A published part is never written.** `PartsDetailed`, the merge selector and every fetch plan read
+a part's time bounds after releasing the engine lock: the merge selector from a copy-on-write
+snapshot, a fetch after `acquire()` (`Count`'s `activeFlags`, the aggregate pushdown's time-span
+checks). `MergeShape` reads the same kind of snapshot but only the part's immutable size. A reload whose entry disagrees with the handle therefore opens a fresh handle
+rather than updating the old one in place. A shallow copy is not an option, because the handle holds a
+`sync.Once` and atomics. The rare changed entry costs one open.
+
+The owner's commit is the one writer of a published part's block identity. `updateIndexLocked` stamps
+`blocks`/`claim`/`level` onto a part only once its CAS lands, and a flush whose commit failed leaves
+its part published with the identity still pending. That is safe because the one reader of those
+fields outside `e.mu`, `planMergeBlocks`, runs under `flushMu`. Every commit that can find a pending
+identity holds `flushMu` too: flush, merge, retention drop and repair. A reload clears none, because it
+publishes only handles with nothing pending.
 
 Reuse cannot skip noticing that a part's objects have gone away, which is what turns a lost part into
 a want. A reused handle is probed with `block.PartPresent` — the manifest, the commit point of a part
