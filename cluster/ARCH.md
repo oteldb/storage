@@ -227,6 +227,12 @@ short with no error. This holds for every fan-out alike: the fetch (`gapFetcher`
 the aggregates (`shardAggregateWith`) and the enumeration RPCs (`hedgeOwners`, whose denominator is
 remotes plus self), because an empty listing is the same short answer as an empty fetch.
 
+A store opened without this layer keeps the same rule with no failover at all. Its facade reads go
+through the same `canAnswer` — wrapping an engine's fetcher only while it has wants, as the seam
+builder here does — and a read overlapping a want fails. The want ends there too, because the store
+acknowledges its own losses (`engine/ARCH.md`, "A store without a cluster layer is its own complete
+owner set"); a read-only handle never does, and keeps failing.
+
 The guard has one implementation per RPC and both callers reach it through the same function: the
 node coordinating a query against its own shards calls the very code that serves a peer's request,
 so a coordinator cannot serve an engine the peer path would have disclaimed. The alternative — a
@@ -565,6 +571,17 @@ fabricate a hole over live data. The cost is that a cluster permanently running 
 RF never acknowledges a loss at all; that is the safe direction, because an outstanding want is a
 visible, recoverable state and a hole over live data is neither. ClickHouse's
 `searchForMissingPartOnOtherReplicas` scans every replica, live *and* dead, for the same reason.
+
+### Engine seams are fixed at creation, from the options
+
+An engine takes its repair seam and its term source once, at construction, and `Open` recovers every
+engine found on the backend *before* the cluster layer starts. So both are decided from `Options`
+(`Cluster`, `PrivateBackend`), never from whether `s.cluster` exists yet. A decision that reads the
+live cluster state instead leaves every recovered engine without the seam for the life of the
+process: wants — `AdoptWants` obligations included — are recorded and never fetched. Both seams
+still resolve peers and claims when they are called, and one called before the layer exists
+concludes nothing: `partRepairer` answers `WantIncomplete`, and the term is 0, the not-held
+answer.
 
 ## `ec` — erasure coding
 

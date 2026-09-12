@@ -39,14 +39,24 @@ type partRepairer struct {
 // acknowledges a loss, which is the safe direction: an outstanding want is visible and
 // recoverable, a hole over live data is neither.
 func (r *partRepairer) FetchWants(ctx context.Context, wants []bucketindex.Want) []engine.FetchResult {
+	out := make([]engine.FetchResult, len(wants))
+
+	// An engine recovery built is handed this seam before the cluster layer starts. There is no
+	// owner set to ask yet, so nothing may be concluded.
+	if r.s.cluster == nil {
+		for i := range out {
+			out[i].Outcome = bucketindex.WantIncomplete
+		}
+
+		return out
+	}
+
 	complete, remotes := r.s.completeOwners(r.tid)
 
 	absent := bucketindex.WantIncomplete
 	if complete {
 		absent = bucketindex.WantAbsent
 	}
-
-	out := make([]engine.FetchResult, len(wants))
 
 	if len(remotes) == 0 {
 		for i := range out {
@@ -73,15 +83,15 @@ func (r *partRepairer) FetchWants(ctx context.Context, wants []bucketindex.Want)
 	return out
 }
 
-// recordPartRepairer adapts [partRepairer] to the record engines' identical seam; the two engines
-// declare their own result type, so the wrapper only re-labels the fields.
-type recordPartRepairer struct{ *partRepairer }
+// recordPartRepairer adapts a metric repair seam to the record engines' identical one; the two
+// engines declare their own result type, so the wrapper only re-labels the fields.
+type recordPartRepairer struct{ engine.PartFetcher }
 
 // FetchWants implements recordengine.PartFetcher.
 func (r recordPartRepairer) FetchWants(
 	ctx context.Context, wants []bucketindex.Want,
 ) []recordengine.FetchResult {
-	src := r.partRepairer.FetchWants(ctx, wants)
+	src := r.PartFetcher.FetchWants(ctx, wants)
 
 	out := make([]recordengine.FetchResult, len(src))
 	for i := range src {
@@ -119,20 +129,40 @@ func (s *Storage) completeOwners(shardKey signal.TenantID) (complete bool, remot
 	return complete, remotes
 }
 
-// repairerFor returns the repair seam for one engine, or nil where there is nothing to repair
-// from: a shared backend needs no cross-node copy (every replica reads the same objects), and
-// single-node mode has no peer at all. A nil seam makes repair a no-op that still counts what it
-// could not satisfy.
+// repairerFor returns the cluster repair seam for one engine, or nil where there is nothing to
+// repair from: a shared backend needs no cross-node copy (every replica reads the same objects), and
+// without a cluster layer there is no peer at all.
+//
+// It is decided from the options because the seam is fixed at engine creation, and recovery creates
+// every engine found on the backend before the cluster layer starts.
 func (s *Storage) repairerFor(tid signal.TenantID, prefix string) *partRepairer {
-	if s.cluster == nil || !s.cluster.private {
+	if s.opts.Cluster == nil || !s.opts.Cluster.PrivateBackend {
 		return nil
 	}
 
 	return &partRepairer{s: s, tid: tid, prefix: prefix}
 }
 
+// repairSeamFor is the seam an engine is built with. A writable store without a cluster layer gets
+// [soleOwnerRepairer]; a read-only one gets nil, because it must never commit a hole. A nil seam
+// makes repair a no-op that still counts what it could not satisfy.
+//
+// The mode is read from the options, not from s.cluster: recovery creates engines before the
+// cluster layer starts, and a cluster node's engine must never take the single-node evidence rule.
+func (s *Storage) repairSeamFor(tid signal.TenantID, prefix string) engine.PartFetcher {
+	if s.opts.Cluster == nil && !s.opts.ReadOnly {
+		return soleOwnerRepairer{backend: s.backendFor(tid), prefix: prefix}
+	}
+
+	if r := s.repairerFor(tid, prefix); r != nil {
+		return r
+	}
+
+	return nil
+}
+
 func (s *Storage) recordRepairerFor(tid signal.TenantID, prefix string) recordengine.PartFetcher {
-	r := s.repairerFor(tid, prefix)
+	r := s.repairSeamFor(tid, prefix)
 	if r == nil {
 		return nil
 	}
@@ -141,10 +171,5 @@ func (s *Storage) recordRepairerFor(tid signal.TenantID, prefix string) recorden
 }
 
 func (s *Storage) metricRepairerFor(tid signal.TenantID, prefix string) engine.PartFetcher {
-	r := s.repairerFor(tid, prefix)
-	if r == nil {
-		return nil
-	}
-
-	return r
+	return s.repairSeamFor(tid, prefix)
 }

@@ -266,7 +266,8 @@ discovering peer's, and one naming a part already indexed is dropped.
 
 Two things consume them. Repair fetches the missing part back (or acknowledges the loss as a hole),
 and the **read policy** refuses to answer over one: `WantOverlaps` reports whether an outstanding
-want covers a query window, which is what the cluster read seam disclaims on (`cluster/ARCH.md`).
+want covers a query window, which is what the read seam disclaims on — a cluster node's and a
+single-node store's alike (`cluster/ARCH.md`).
 Pending wants count — a want a load discovered but no commit has published yet still names data that
 is already unreadable — while a hole does not, since acknowledging a loss discharges its want and
 lets reads resume.
@@ -583,8 +584,9 @@ peer names each want's own prefix rather than the successor twice.
 
 `Config.Repair` (`PartFetcher`) is the whole seam to the cluster: part identities in, the entries of
 whatever parts were actually copied out. The engine never learns about peers, addresses or transport —
-`cluster/partsync` supplies the implementation, and nil (single node, or a shared backend where
-every replica reads the same objects) makes repair a no-op. A `WantAbsent` outcome with a nil error
+`cluster/partsync` supplies the implementation; a store without a cluster layer supplies one that
+fetches nothing (see "A store without a cluster layer is its own complete owner set"); nil (a shared
+backend where every replica reads the same objects, or a read-only store) makes repair a no-op. A `WantAbsent` outcome with a nil error
 is definitive absence and leaves the want outstanding, counted in `RepairStats.Unsatisfiable`; an
 error is transient and retried next cycle. The two are never merged: an unreachable peer is not
 evidence that data is gone.
@@ -672,6 +674,35 @@ well as the wants, and a hole is replaced by the part turning up — at its exac
 containing successor. Holes are held apart from `parts` (there is nothing to open) and re-read from
 the index on load, so an acknowledgement survives a restart. `LostParts` does not fall when a hole
 is revoked.
+
+### A store without a cluster layer is its own complete owner set
+
+With no peer to fetch from, a single-node want can never be satisfied, and without a hole it never
+ends: every read reaching into it fails for the life of the shard (the read policy,
+`cluster/ARCH.md`). So the store acknowledges the loss itself. The facade hands the engine a
+`PartFetcher` (`soleOwnerRepairer`) that copies nothing and answers for an owner set of one. Both
+gates above stand unchanged — `WantAbsent` only, over `holeConfirmations` consecutive passes, each
+re-probing the backend — and so does the rule a want is minted by: absence is the backend saying the
+part's manifest does not exist. Any other error is a failed attempt, and a manifest that is present
+but will not open is a failure too, never absence.
+
+**Absence is definitive because the backend is the only copy.** The cluster gate exists because a
+peer may still hold the part; here nothing else can serve those bytes. What remains is whether
+another *writer* shares the prefix and removed the part on purpose — merged it into a successor or
+expired it — in a commit this engine has not rebased onto. In a supported deployment none does: a
+writable store's open sweeps every object its index does not name, which would delete a concurrent
+writer's in-flight part, so a non-clustered prefix has one writer by construction, and the one
+supported co-tenant, a read-only handle, never writes. The seam still re-reads the committed index
+on every pass and counts absence only while that index states the loss — a want or a hole at the
+prefix, not tombstoned, not contained in a committed part — so a rival's merge or expiry makes the
+pass inconclusive (`WantIncomplete`) rather than a loss. A rival committing between the last pass and
+the hole commit is not covered: the CAS retry lands the hole beside the rival's successor, the next
+commit revokes it, and `LostParts` over-counts by one — only in a deployment the open-time sweep
+already makes unsafe.
+
+**A read-only store never concludes.** Acknowledging a loss is an index commit, so its seam is nil.
+It keeps the pending want its load found and the read policy fails reads overlapping it: it neither
+answers short nor writes.
 
 
 ## Read path

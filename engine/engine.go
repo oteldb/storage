@@ -129,9 +129,10 @@ type Config struct {
 	// size skips more on sparse selectors at a small per-block header cost.
 	MetricBlockRows int
 	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
-	// still has it. It is supplied by the cluster layer, which owns peer discovery and the
-	// node-to-node transport; nil is single-node mode, where an outstanding want stays outstanding
-	// because there is nowhere to fetch it from. See [PartFetcher].
+	// still has it, and says whether the part is gone from every owner. The cluster layer supplies
+	// it over its transport; a single-node store supplies one that fetches nothing and answers for
+	// an owner set of one. nil concludes nothing, so an outstanding want stays outstanding. See
+	// [PartFetcher].
 	Repair PartFetcher
 }
 

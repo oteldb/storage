@@ -34,7 +34,7 @@ func (s *Storage) WriteProfiles(ctx context.Context, pd profile.Profiles) (acc A
 // Returned rows carry the global content-addressed `stack_id`; resolve it with
 // [Storage.ProfileResolver]. Same tenant scoping as [Storage.TraceFetcher].
 func (s *Storage) ProfileFetcher(tenants ...signal.TenantID) fetch.Fetcher {
-	return s.recordFetcher(signal.Profile, tenants, s.profileEngineSnapshot, s.lookupProfileEngine, s.clusterProfileFetcherFor)
+	return s.recordFetcher(signal.Profile, tenants, s.profileEngineSnapshotByTenant, s.lookupProfileEngine, s.clusterProfileFetcherFor)
 }
 
 // ProfileSeries returns the identities of a tenant's profile streams matching the label matchers
@@ -54,9 +54,15 @@ func (s *Storage) ProfileSeries(
 		return s.clusterProfileSeries(ctx, tenant, matchers, start, end)
 	}
 
-	eng, ok := s.lookupProfileEngine(s.normalizeTenant(tenant))
+	tid := s.normalizeTenant(tenant)
+
+	eng, ok := s.lookupProfileEngine(tid)
 	if !ok {
 		return nil, nil
+	}
+
+	if err := s.answerLocally(ctx, rpcOpSeries, signal.Profile, tid, eng, start, end); err != nil {
+		return nil, err
 	}
 
 	return eng.Series(matchers, start, end), nil
@@ -81,6 +87,10 @@ func (s *Storage) ProfileResolver(ctx context.Context, tenant signal.TenantID) (
 	if s.cluster != nil {
 		tables, err = s.clusterProfileSymbols(ctx, tenant)
 	} else if eng, ok := s.lookupProfileEngine(s.normalizeTenant(tenant)); ok {
+		if incomplete := s.answerLocally(ctx, rpcOpSide, signal.Profile, s.normalizeTenant(tenant), eng, 0, 0); incomplete != nil {
+			return nil, incomplete
+		}
+
 		tables, err = eng.SideSnapshot(ctx)
 	} else {
 		return profile.NewResolver(nil)

@@ -64,6 +64,10 @@ func (s *Storage) ColumnValues(ctx context.Context, tenant signal.TenantID, req 
 		return nil, nil
 	}
 
+	if err := s.answerLocally(ctx, rpcOpValues, req.Signal, tid, eng, req.Start, req.End); err != nil {
+		return nil, err
+	}
+
 	return eng.ColumnValues(ctx, recordengine.ValuesRequest{
 		Column:  req.Column,
 		AttrKey: req.AttrKey,

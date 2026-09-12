@@ -1789,13 +1789,19 @@ func (s *Storage) claimsShard(tid signal.TenantID) bool {
 }
 
 func (s *Storage) termFor(tid signal.TenantID) func() uint64 {
-	if s.cluster == nil {
+	// Decided from the options, not s.cluster: recovery creates engines before the cluster layer
+	// starts, and an engine keeps this for its whole life.
+	if s.opts.Cluster == nil {
 		return nil
 	}
 
 	shard := string(s.normalizeTenant(tid))
 
 	return func() uint64 {
+		if s.cluster == nil {
+			return 0
+		}
+
 		term, _ := s.cluster.ownership.Term(shard)
 
 		// A shard this node does not hold a claim on reports 0, which keeps the generation on the
