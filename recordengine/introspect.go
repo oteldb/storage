@@ -5,7 +5,7 @@ import (
 	"context"
 	"slices"
 
-	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/index/symbols"
 )
 
@@ -46,6 +46,9 @@ type PartDetailStat struct {
 	Bytes   int64        // sum of the part's backend object sizes
 	Chunks  int          // sparse-index granules: ceil(RowCount / GranuleSize)
 	Columns []ColumnStat // per-column physical layout
+	// OtherBytes is every non-column object's size, keyed by its name under the part prefix
+	// (manifest, marks, and the engine's own indexes). With the columns' Bytes it sums to Bytes.
+	OtherBytes map[string]int64
 }
 
 // ColumnStat is one part column's physical description (from the manifest).
@@ -55,6 +58,7 @@ type ColumnStat struct {
 	Codec    string // value codec
 	Compress string // block-compression algorithm
 	Level    int    // block-compression level (0 ⇒ algorithm default or uncompressed)
+	Bytes    int64  // size of the column's object; 0 for a constant-collapsed column, which has none
 }
 
 // CardinalityStat summarizes the engine's label cardinality (the head's index spans head ∪ flushed
@@ -143,17 +147,17 @@ func (e *Engine) PartsDetailed(ctx context.Context) ([]PartDetailStat, error) {
 	for _, p := range parts {
 		man := p.reader.Manifest()
 
-		cols := make([]ColumnStat, 0, len(man.Columns))
-		for _, c := range man.Columns {
-			cols = append(cols, ColumnStat{
-				Name: c.Name, Kind: c.Kind.String(), Codec: c.Codec.String(), Compress: c.Compress.String(),
-				Level: int(c.Level),
-			})
-		}
-
-		bytes, err := partBytes(ctx, be, p.prefix)
+		sizes, err := block.PartObjectSizes(ctx, be, p.prefix)
 		if err != nil {
 			return nil, err
+		}
+
+		cols := make([]ColumnStat, 0, len(man.Columns))
+		for i, c := range man.Columns {
+			cols = append(cols, ColumnStat{
+				Name: c.Name, Kind: c.Kind.String(), Codec: c.Codec.String(), Compress: c.Compress.String(),
+				Level: int(c.Level), Bytes: sizes.Columns[i],
+			})
 		}
 
 		out = append(out, PartDetailStat{
@@ -161,38 +165,14 @@ func (e *Engine) PartsDetailed(ctx context.Context) ([]PartDetailStat, error) {
 				ID: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
 				Series: len(p.ranges), Rows: p.rows(), SizeBytes: p.rawBytes,
 			},
-			Bytes:   bytes,
-			Chunks:  granuleCount(man.RowCount, man.GranuleSize),
-			Columns: cols,
+			Bytes:      sizes.Total,
+			Chunks:     granuleCount(man.RowCount, man.GranuleSize),
+			Columns:    cols,
+			OtherBytes: sizes.Other,
 		})
 	}
 
 	return out, nil
-}
-
-// partBytes sums the backend object sizes of the part at prefix (manifest, marks, and column
-// objects), using the [backend.Sizer] fast path when available.
-func partBytes(ctx context.Context, b backend.Backend, prefix string) (int64, error) {
-	if b == nil {
-		return 0, nil
-	}
-
-	keys, err := b.List(ctx, prefix)
-	if err != nil {
-		return 0, err
-	}
-
-	var total int64
-	for _, k := range keys {
-		n, err := backend.SizeOf(ctx, b, k)
-		if err != nil {
-			return 0, err
-		}
-
-		total += n
-	}
-
-	return total, nil
 }
 
 // granuleCount returns the number of sparse-index granules for a part of rowCount rows at

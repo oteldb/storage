@@ -34,6 +34,9 @@ type PartDetail struct {
 	LogicalBytes int64
 	Chunks       int          // sparse-index granules
 	Columns      []ColumnInfo // per-column physical layout
+	// OtherBytes is every non-column object's size, keyed by its name under the part prefix
+	// (manifest, marks, and the engine's own indexes). With the columns' Bytes it sums to Bytes.
+	OtherBytes map[string]int64
 }
 
 // ColumnInfo is one part column's physical description.
@@ -45,6 +48,8 @@ type ColumnInfo struct {
 	// Level is the block-compression level the column was written at (0 ⇒ the algorithm default, or
 	// uncompressed). Merged metric parts climb a size-graduated ladder, so it varies across parts.
 	Level int
+	// Bytes is the size of the column's object; 0 for a constant-collapsed column, which has none.
+	Bytes int64
 }
 
 // CardinalityStats summarizes a (tenant, signal) engine's label cardinality — the operator's first
@@ -286,7 +291,7 @@ func metricPartDetails(ds []engine.PartDetailStat) []PartDetail {
 		out[i] = PartDetail{
 			PartInfo: PartInfo{ID: d.ID, MinTime: d.MinTime, MaxTime: d.MaxTime, Series: d.Series, Rows: d.Rows},
 			Bytes:    d.Bytes, LogicalBytes: d.Rows * engine.SampleBytes,
-			Chunks: d.Chunks, Columns: metricColumns(d.Columns),
+			Chunks: d.Chunks, Columns: metricColumns(d.Columns), OtherBytes: d.OtherBytes,
 		}
 	}
 
@@ -299,7 +304,7 @@ func recordPartDetails(ds []recordengine.PartDetailStat) []PartDetail {
 		out[i] = PartDetail{
 			PartInfo: PartInfo{ID: d.ID, MinTime: d.MinTime, MaxTime: d.MaxTime, Series: d.Series, Rows: d.Rows},
 			Bytes:    d.Bytes, LogicalBytes: d.LogicalBytes(),
-			Chunks: d.Chunks, Columns: recordColumns(d.Columns),
+			Chunks: d.Chunks, Columns: recordColumns(d.Columns), OtherBytes: d.OtherBytes,
 		}
 	}
 
@@ -309,7 +314,7 @@ func recordPartDetails(ds []recordengine.PartDetailStat) []PartDetail {
 func metricColumns(cs []engine.ColumnStat) []ColumnInfo {
 	out := make([]ColumnInfo, len(cs))
 	for i, c := range cs {
-		out[i] = ColumnInfo{Name: c.Name, Kind: c.Kind, Codec: c.Codec, Compress: c.Compress, Level: c.Level}
+		out[i] = ColumnInfo{Name: c.Name, Kind: c.Kind, Codec: c.Codec, Compress: c.Compress, Level: c.Level, Bytes: c.Bytes}
 	}
 
 	return out
@@ -318,7 +323,7 @@ func metricColumns(cs []engine.ColumnStat) []ColumnInfo {
 func recordColumns(cs []recordengine.ColumnStat) []ColumnInfo {
 	out := make([]ColumnInfo, len(cs))
 	for i, c := range cs {
-		out[i] = ColumnInfo{Name: c.Name, Kind: c.Kind, Codec: c.Codec, Compress: c.Compress, Level: c.Level}
+		out[i] = ColumnInfo{Name: c.Name, Kind: c.Kind, Codec: c.Codec, Compress: c.Compress, Level: c.Level, Bytes: c.Bytes}
 	}
 
 	return out
