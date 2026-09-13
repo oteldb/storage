@@ -54,7 +54,7 @@ type Limits struct {
 type Retention struct {
 	// MaxAge is the maximum age of retained data. Zero ⇒ retain forever.
 	MaxAge time.Duration
-	// MaxBytes is the maximum total retained bytes. Zero ⇒ unlimited.
+	// MaxBytes is the maximum total retained bytes, pooled across every signal. Zero ⇒ unlimited.
 	//
 	// It bounds the stored (compressed, on-backend) bytes of the tenant's flushed parts across every
 	// signal and every shard the node holds — not its unflushed heads, which [Limits.MaxInFlightBytes]
@@ -65,7 +65,24 @@ type Retention struct {
 	//     part sizes at the start of the cycle, so the total can overshoot between cycles.
 	//   - The newest part is never dropped, so the effective floor is one part. Pair a byte budget with
 	//     [Limits.MaxPartSize] to make the granularity — and the overshoot — small enough to matter.
+	//
+	// Because the budget is pooled, one signal growing moves the cutoff for all of them: on a tenant
+	// whose metrics dwarf its logs, metric growth alone decides how much log history survives. Use
+	// MaxBytesPerSignal to give each signal its own budget.
 	MaxBytes int64
+	// MaxBytesPerSignal bounds each signal independently, in the same stored bytes MaxBytes counts.
+	// A signal with no entry is bounded only by MaxBytes; nil ⇒ no per-signal budgets.
+	//
+	// It exists because signals have different retention economics — a week of logs and a week of
+	// metrics are neither the same size nor the same value — which a pooled budget cannot express.
+	// Both budgets apply when both are set: a signal is trimmed to whichever of the two binds first,
+	// so MaxBytes remains the tenant-wide outer bound (useful when the sum of the per-signal budgets
+	// is more than the node should hold for one tenant).
+	//
+	// MaxBytes' per-node, eventual enforcement carries over per signal, and so does the floor: the
+	// newest part of *each* budgeted signal is never dropped, so the floor is one part per signal
+	// rather than one per tenant. Pair it with [Limits.MaxPartSize] for the same reason.
+	MaxBytesPerSignal map[signal.Signal]int64
 }
 
 // DownsampleTier rolls up samples once they reach a given age: every sample older than
