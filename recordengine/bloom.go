@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/obs"
 
 	"github.com/oteldb/storage/index/bloom"
 	"github.com/oteldb/storage/query/fetch"
@@ -500,7 +501,9 @@ func (e *Engine) blooms() *bloomBuilder {
 // only ever removes parts a per-row re-check would have removed anyway, so dropping one widens the
 // scan and never the result; a corrupt one is logged, not fatal, since it must not take the whole
 // prefix offline.
-func loadBlooms(ctx context.Context, b backend.Backend, schema *Schema, prefix string) (map[string]*bloom.Filter, error) {
+func loadBlooms(
+	ctx context.Context, b backend.Backend, schema *Schema, prefix string, corrupt *obs.Corruption,
+) (map[string]*bloom.Filter, error) {
 	var out map[string]*bloom.Filter
 
 	for k := range schema.byteCols {
@@ -522,6 +525,7 @@ func loadBlooms(ctx context.Context, b backend.Backend, schema *Schema, prefix s
 		if err != nil {
 			zctx.From(ctx).Error("corrupt bloom sidecar, part is not prunable by this column",
 				zap.String("part", prefix), zap.String("column", col.Name), zap.Error(err))
+			corrupt.Detected(ctx, "bloom", obs.CorruptTolerated)
 
 			continue
 		}

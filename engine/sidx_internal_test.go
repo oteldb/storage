@@ -10,6 +10,8 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/internal/obs"
+	"github.com/oteldb/storage/internal/obs/obstest"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -47,7 +49,7 @@ func TestSeriesIndexRoundTrip(t *testing.T) {
 		be := backend.Memory()
 		require.NoError(t, be.Write(ctx, sidxKey("p"), enc))
 
-		paged, ok := openPagedIndex(ctx, be, "p", total)
+		paged, ok := openPagedIndex(ctx, be, "p", total, obs.NewNop().Corruption)
 		require.True(t, ok)
 
 		pagedIdx := partIndex{paged: paged}
@@ -220,7 +222,7 @@ func TestPagedIndexDropAndReload(t *testing.T) {
 	be := backend.Memory()
 	require.NoError(t, be.Write(ctx, sidxKey("p"), encodeSeriesIndex(col)))
 
-	paged, ok := openPagedIndex(ctx, be, "p", len(col))
+	paged, ok := openPagedIndex(ctx, be, "p", len(col), obs.NewNop().Corruption)
 	require.True(t, ok)
 	require.False(t, paged.keep, "a Viewer backend allows dropping")
 	require.NotNil(t, paged.view.Load(), "open retains the validated view for the first fetch")
@@ -246,7 +248,7 @@ func TestPagedIndexDropAndReload(t *testing.T) {
 
 	// A backend without Viewer keeps the view (loads once, stays resident).
 	hidden := hiddenViewer{Backend: be}
-	kept, ok := openPagedIndex(ctx, hidden, "p", len(col))
+	kept, ok := openPagedIndex(ctx, hidden, "p", len(col), obs.NewNop().Corruption)
 	require.True(t, ok)
 	require.True(t, kept.keep)
 	kept.drop()
@@ -289,7 +291,7 @@ func TestOpenPartUsesSidecarAndFallsBack(t *testing.T) {
 	e.mu.RUnlock()
 
 	// Reopen the same part directly: paged again, and lookups resolve both series.
-	p, err := openPart(ctx, be, prefix)
+	p, err := openPart(ctx, be, prefix, obs.NewNop().Corruption)
 	require.NoError(t, err)
 	require.NotNil(t, p.index.paged)
 
@@ -300,10 +302,13 @@ func TestOpenPartUsesSidecarAndFallsBack(t *testing.T) {
 	// Sidecar deleted (a part written by an older version): resident fallback, same answers.
 	require.NoError(t, be.Delete(ctx, sidxKey(prefix)))
 
-	pOld, err := openPart(ctx, be, prefix)
+	oOld, mOld := obstest.New(t)
+
+	pOld, err := openPart(ctx, be, prefix, oOld.Corruption)
 	require.NoError(t, err)
 	require.Nil(t, pOld.index.paged, "no sidecar ⇒ resident index")
 	require.NotEmpty(t, pOld.index.ids)
+	assert.Zero(t, mOld.Counter("storage.corruption.detected"), "an absent sidecar is not corruption")
 
 	rngOld, ok, err := pOld.index.lookup(ctx, s1.Hash())
 	require.NoError(t, err)
@@ -315,9 +320,17 @@ func TestOpenPartUsesSidecarAndFallsBack(t *testing.T) {
 	// Corrupt sidecar: rejected at open, resident fallback again.
 	require.NoError(t, be.Write(ctx, sidxKey(prefix), []byte("OTSI junk")))
 
-	pBad, err := openPart(ctx, be, prefix)
+	o, m := obstest.New(t)
+
+	pBad, err := openPart(ctx, be, prefix, o.Corruption)
 	require.NoError(t, err)
 	assert.Nil(t, pBad.index.paged, "corrupt sidecar ⇒ resident fallback")
+	assert.Equal(t, int64(1),
+		m.Counter("storage.corruption.detected", "component", "series_index", "disposition", "tolerated"))
+
+	_, err = openPart(ctx, be, prefix, o.Corruption)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), m.Counter("storage.corruption.detected"), "every open that meets it counts")
 }
 
 // TestSeriesIndexRunsMatchesColumn pins the run-fed sidecar encoder — what the streaming merge

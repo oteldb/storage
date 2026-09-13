@@ -11,6 +11,7 @@ import (
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/index/identity"
 	"github.com/oteldb/storage/index/series"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -167,6 +168,7 @@ func (e *Engine) registerPartIdentitiesLocked(ctx context.Context, prefix string
 	}); err != nil {
 		zctx.From(ctx).Error("corrupt part identity object",
 			zap.String("part", prefix), zap.Error(err))
+		e.cfg.Obs.Corruption.Detected(ctx, "part_identity", obs.CorruptTolerated)
 
 		return false, nil
 	}

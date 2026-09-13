@@ -13,6 +13,7 @@ import (
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/index/bloom"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
@@ -114,7 +115,7 @@ func deletePart(ctx context.Context, b backend.Backend, prefix string) error {
 }
 
 // openPart opens the part at prefix and builds its StreamID → row-range index and bloom set.
-func openPart(ctx context.Context, b backend.Backend, schema *Schema, prefix string) (*part, error) {
+func openPart(ctx context.Context, b backend.Backend, schema *Schema, prefix string, corrupt *obs.Corruption) (*part, error) {
 	r, err := block.OpenPart(ctx, b, prefix)
 	if err != nil {
 		return nil, err
@@ -132,7 +133,7 @@ func openPart(ctx context.Context, b backend.Backend, schema *Schema, prefix str
 
 	ranges := buildRanges(ids)
 
-	blooms, err := loadBlooms(ctx, b, schema, prefix)
+	blooms, err := loadBlooms(ctx, b, schema, prefix, corrupt)
 	if err != nil {
 		return nil, err
 	}

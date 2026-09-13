@@ -247,7 +247,7 @@ func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 		}
 	}
 
-	part, err := openPart(ctx, p.e.cfg.Backend, prefix)
+	part, err := openPart(ctx, p.e.cfg.Backend, prefix, p.e.cfg.Obs.Corruption)
 	if err != nil {
 		return nil, err
 	}

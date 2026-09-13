@@ -134,6 +134,7 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context) error {
 	zctx.From(ctx).Debug("swept orphan part objects",
 		zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
 		zap.Int("objects", len(orphans)), zap.Int("failed", failed))
+	e.cfg.Obs.Parts.OrphansSwept(ctx, e.cfg.Signal, int64(len(orphans)-failed))
 
 	return nil
 }

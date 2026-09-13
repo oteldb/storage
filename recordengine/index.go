@@ -12,6 +12,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -87,6 +88,8 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 	ix, version, err := bucketindex.LoadVersioned(ctx, e.cfg.Backend, e.indexKey())
 	if err != nil {
+		e.countCorrupt(ctx, err, "bucket_index", obs.CorruptFatal)
+
 		return errors.Wrap(err, "reload bucket index")
 	}
 
@@ -157,10 +160,11 @@ func (e *Engine) openForeignLocked(ctx context.Context) {
 			continue
 		}
 
-		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, ent.Prefix)
+		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, ent.Prefix, e.cfg.Obs.Corruption)
 		if err != nil {
 			zctx.From(ctx).Debug("adopted part is not readable here",
 				zap.String("prefix", ent.Prefix), zap.Error(err))
+			e.countCorrupt(ctx, err, "part", obs.CorruptTolerated)
 
 			continue
 		}
@@ -436,7 +440,7 @@ func (e *Engine) livePart(
 		}
 	}
 
-	p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, ent.Prefix)
+	p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, ent.Prefix, e.cfg.Obs.Corruption)
 	if err != nil {
 		return nil, errors.Wrapf(err, "open part %q", ent.Prefix)
 	}
@@ -467,6 +471,8 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 
 	ix, version, err := bucketindex.LoadVersioned(ctx, e.cfg.Backend, e.indexKey())
 	if err != nil {
+		e.countCorrupt(ctx, err, "bucket_index", obs.CorruptFatal)
+
 		return errors.Wrap(err, "load bucket index")
 	}
 
@@ -506,6 +512,8 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 		p, err := e.livePart(ctx, ent, open)
 		if err != nil {
 			if !partGone(err) {
+				e.countCorrupt(ctx, err, "part", obs.CorruptFatal)
+
 				return err
 			}
 

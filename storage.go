@@ -107,6 +107,7 @@ type Storage struct {
 
 	ecStats    ecCounters    // cumulative erasure-coding activity (Inspect → ClusterStats.EC)
 	maintStats maintCounters // cumulative maintenance-loop activity (Inspect → StoreStats.Maintenance)
+	walSync    walSyncCounters
 }
 
 // Open constructs a [Storage] from [Options] (DESIGN.md §5). If [Options.Backend] is
@@ -210,7 +211,7 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 
 	if walSyncEvery > 0 {
 		s.wg.Add(1)
-		go s.runWALSync(walSyncEvery)
+		go s.runWALSync(walSyncEvery) //nolint:gosec,contextcheck // G118: loop-scoped context, see runWALSync
 	}
 
 	s.obs.Logger(ctx).Info("storage opened",
@@ -1169,7 +1170,17 @@ func (s *Storage) recoverWAL(ctx context.Context) error {
 			return err
 		}
 
-		return replay(ctx, signal.TenantID(filepath.ToSlash(rel)), path)
+		if err := replay(ctx, signal.TenantID(filepath.ToSlash(rel)), path); err != nil {
+			if errors.Is(err, wal.ErrCorrupt) {
+				s.obs.Corruption.Detected(ctx, "wal", obs.CorruptFatal)
+				s.obs.Logger(ctx).Error("corrupt WAL segment: the store cannot open until it is repaired or removed",
+					zap.String("dir", path), zap.Error(err))
+			}
+
+			return err
+		}
+
+		return nil
 	})
 }
 
@@ -1476,6 +1487,8 @@ func (s *Storage) flushPressured(ctx context.Context) {
 func (s *Storage) runWALSync(interval time.Duration) {
 	defer s.wg.Done()
 
+	ctx := s.obs.Base(context.Background())
+
 	t := time.NewTicker(interval)
 	defer t.Stop()
 
@@ -1484,14 +1497,14 @@ func (s *Storage) runWALSync(interval time.Duration) {
 		case <-s.stopCh:
 			return
 		case <-t.C:
-			s.syncWALs()
+			s.syncWALs(ctx)
 		}
 	}
 }
 
-// syncWALs fsyncs every tenant engine's WAL across all signals (background interval sync). Errors are
-// swallowed; the next tick retries.
-func (s *Storage) syncWALs() {
+// syncWALs fsyncs every tenant engine's WAL across all signals (background interval sync). A failed
+// sync is retried by the next tick and reported through [Storage.recordWALSync].
+func (s *Storage) syncWALs(ctx context.Context) {
 	// Each engine's WAL is an independent file; fsyncs across engines parallelize. Gather them as a
 	// single list and fan out under the same bound as maintenance.
 	metrics := s.engineSnapshot()
@@ -1521,7 +1534,40 @@ func (s *Storage) syncWALs() {
 		wals = append(wals, e)
 	}
 
-	parallel.ForEach(len(wals), s.maintenanceConcurrency(), func(i int) { _ = wals[i].SyncWAL() })
+	errs := make([]error, len(wals))
+	parallel.ForEach(len(wals), s.maintenanceConcurrency(), func(i int) { errs[i] = wals[i].SyncWAL() })
+	s.recordWALSync(ctx, errs)
+}
+
+// recordWALSync publishes one sync pass. The log is latched on the transition, not per failure: the
+// loop runs every few hundred milliseconds, and a disk that fails every fsync would otherwise bury
+// the one line that matters.
+func (s *Storage) recordWALSync(ctx context.Context, errs []error) {
+	var (
+		failed int64
+		first  error
+	)
+
+	for _, err := range errs {
+		if err != nil {
+			if first == nil {
+				first = err
+			}
+
+			failed++
+		}
+	}
+
+	s.walSync.failures.Add(failed)
+	s.obs.WAL.SyncFailed(ctx, failed, failed > 0)
+
+	switch {
+	case failed > 0 && !s.walSync.failing.Swap(true):
+		s.obs.Logger(ctx).Error("background WAL fsync failing: acknowledged writes are not power-loss durable until it recovers",
+			zap.Int64("failed", failed), zap.Int("wals", len(errs)), zap.Error(first))
+	case failed == 0 && s.walSync.failing.Swap(false):
+		s.obs.Logger(ctx).Info("background WAL fsync recovered")
+	}
 }
 
 // walSyncer is the subset of an engine the WAL-sync loop needs: both the metric engine and the

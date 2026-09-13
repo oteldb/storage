@@ -16,6 +16,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
+	"github.com/oteldb/storage/internal/obs/obstest"
 	"github.com/oteldb/storage/query/fetch"
 )
 
@@ -134,9 +135,12 @@ func TestClusterFencedPrimaryRejectsWrites(t *testing.T) {
 	ctx := context.Background()
 
 	proxies := map[string]*etcdProxy{"node-a": newEtcdProxy(t, endpoint), "node-b": newEtcdProxy(t, endpoint)}
+	mpA, metricsA := obstest.Provider(t)
+	mpB, metricsB := obstest.Provider(t)
+	metrics := map[string]*obstest.Metrics{"node-a": metricsA, "node-b": metricsB}
 	nodes := map[string]*Storage{
-		"node-a": openClusterNodeWith(t, proxies["node-a"].endpoint, "node-a", backend.Memory()),
-		"node-b": openClusterNodeWith(t, proxies["node-b"].endpoint, "node-b", backend.Memory()),
+		"node-a": openClusterNodeWith(t, proxies["node-a"].endpoint, "node-a", backend.Memory(), WithMeterProvider(mpA)),
+		"node-b": openClusterNodeWith(t, proxies["node-b"].endpoint, "node-b", backend.Memory(), WithMeterProvider(mpB)),
 	}
 
 	awaitMembership(t, nodes)
@@ -146,7 +150,7 @@ func TestClusterFencedPrimaryRejectsWrites(t *testing.T) {
 	primary, ok := nodes["node-a"].cluster.membership.Ring().Primary([]byte("default"))
 	require.True(t, ok)
 
-	victim, victimProxy := nodes[primary.ID], proxies[primary.ID]
+	victim, victimProxy, victimMetrics := nodes[primary.ID], proxies[primary.ID], metrics[primary.ID]
 
 	var survivor *Storage
 	for id, s := range nodes {
@@ -161,6 +165,8 @@ func TestClusterFencedPrimaryRejectsWrites(t *testing.T) {
 	_, err := victim.WriteMetrics(ctx, gaugeBatch("svc", "fenced_metric", []int64{100}, []float64{1}))
 	require.NoError(t, err)
 	assert.Equal(t, []float64{1}, readSamples(t, survivor, "fenced_metric"))
+	assert.False(t, victim.Inspect().Cluster.Fenced)
+	assert.Positive(t, victim.Inspect().Cluster.FenceDeadlineUnixNano, "a node holding a lease has a deadline")
 
 	lease := victim.cluster.membership.LeaseID()
 
@@ -189,12 +195,21 @@ func TestClusterFencedPrimaryRejectsWrites(t *testing.T) {
 	victim.cluster.membership.SetClock(func() time.Time { return time.Now().Add(2 * etcd.DefaultTTL) })
 
 	require.True(t, victim.cluster.membership.Fenced(), "past the lease deadline the node is fenced")
+
+	// The operator's view of the same fact: Inspect and the gauge say so, not only a per-write log.
+	assert.True(t, victim.Inspect().Cluster.Fenced, "Inspect reports the fence")
+	victim.recordMembershipHealth(ctx)
+	fenced, ok := victimMetrics.Gauge("storage.cluster.fenced")
+	require.True(t, ok)
+	assert.Equal(t, int64(1), fenced)
 	assert.Empty(t, victim.cluster.ownership.Owned(), "a fenced node owns nothing: it neither flushes nor stamps an index")
 
 	// The defect: this write is routed to the partitioned node as "primary" and must not be acked.
 	_, err = victim.WriteMetrics(ctx, gaugeBatch("svc", "fenced_metric", []int64{200}, []float64{2}))
 	require.Error(t, err, "a fenced node must not acknowledge a write the cluster will not serve")
 	require.ErrorIs(t, err, cluster.ErrNotPrimary)
+	assert.Equal(t, int64(1), victimMetrics.Counter("storage.cluster.primary_refusals", "signal", "metric"),
+		"the refusal is counted on the node that refused")
 
 	// And the reason it must not: the cluster cannot serve it.
 	assert.Equal(t, []float64{1}, readSamples(t, survivor, "fenced_metric"),
@@ -213,6 +228,7 @@ func TestClusterFencedPrimaryRejectsWrites(t *testing.T) {
 
 	_, err = victim.WriteMetrics(ctx, gaugeBatch("svc", "fenced_metric", []int64{300}, []float64{3}))
 	require.NoError(t, err, "a node that can prove its lease again accepts writes")
+	assert.False(t, victim.Inspect().Cluster.Fenced)
 }
 
 // readSamples drains one metric's values from s, sorted by the order the fetch returns them.

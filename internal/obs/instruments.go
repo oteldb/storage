@@ -122,6 +122,7 @@ type Parts struct {
 	candidates metric.Int64Gauge
 	capBytes   metric.Int64Gauge
 	bytes      metric.Int64Gauge
+	orphans    metric.Int64Counter
 }
 
 // Record publishes one signal's part shape, summed over the tenants this node holds. The values are
@@ -135,6 +136,14 @@ func (p *Parts) Record(ctx context.Context, sig string, total, sealed, backlog, 
 	p.candidates.Record(ctx, candidates, a)
 	p.capBytes.Record(ctx, capBytes, a)
 	p.bytes.Record(ctx, bytes, a)
+}
+
+// OrphansSwept accounts n part objects the open-time sweep deleted because no index entry names
+// them: what failed flushes and merges of an earlier process left behind. A zero n is ignored.
+func (p *Parts) OrphansSwept(ctx context.Context, sig string, n int64) {
+	if n > 0 {
+		p.orphans.Add(ctx, n, sigAttr(sig))
+	}
 }
 
 // Fetch instruments a fetch over the head ∪ parts.
@@ -273,6 +282,8 @@ type WAL struct {
 	rotations metric.Int64Counter
 	segments  metric.Int64Gauge
 	bytes     metric.Int64Gauge
+	syncFails metric.Int64Counter
+	failing   metric.Int64Gauge
 }
 
 // Append accounts one WAL record-batch append.
@@ -284,6 +295,16 @@ func (w *WAL) Fsync() { w.fsyncs.Add(context.Background(), 1) }
 // Rotate accounts one WAL segment rotation.
 func (w *WAL) Rotate() { w.rotations.Add(context.Background(), 1) }
 
+// SyncFailed accounts n failed background fsyncs and publishes whether the last sync pass failed.
+// A zero n with failing false is the recovery.
+func (w *WAL) SyncFailed(ctx context.Context, n int64, failing bool) {
+	if n > 0 {
+		w.syncFails.Add(ctx, n)
+	}
+
+	w.failing.Record(ctx, boolGauge(failing))
+}
+
 func newWAL(m metric.Meter) (*WAL, error) {
 	b := &imb{m: m}
 	w := &WAL{
@@ -292,6 +313,9 @@ func newWAL(m metric.Meter) (*WAL, error) {
 		rotations: b.counter("storage.wal.rotations", "WAL segment rotations", "{rotation}"),
 		segments:  b.gauge("storage.wal.segments", "WAL segments on disk", "{segment}"),
 		bytes:     b.gauge("storage.wal.bytes", "bytes the WAL segments hold", "By"),
+		syncFails: b.counter("storage.wal.sync_failures", "background WAL fsyncs that failed", "{fsync}"),
+		failing: b.gauge("storage.wal.sync_failing",
+			"1 while background WAL fsyncs are failing", "{node}"),
 	}
 
 	return w, b.err
@@ -303,8 +327,10 @@ func newWAL(m metric.Meter) (*WAL, error) {
 // other signal, because the node itself looks perfectly healthy while it is happening.
 type Cluster struct {
 	selfAbsent metric.Int64Gauge
+	fenced     metric.Int64Gauge
 	rejoins    metric.Int64Counter
 	routed     metric.Int64Counter
+	refused    metric.Int64Counter
 }
 
 // Routed accounts n points or records this node routed to a shard primary, tagged with the signal
@@ -325,18 +351,29 @@ func (c *Cluster) Routed(ctx context.Context, n int64, sig, result string) {
 }
 
 // Record publishes this node's membership standing: absent is whether it is currently missing
-// from the member set, rejoins the re-registrations since the previous call.
-func (c *Cluster) Record(ctx context.Context, absent bool, rejoins int64) {
-	var v int64
-	if absent {
-		v = 1
-	}
-
-	c.selfAbsent.Record(ctx, v)
+// from the member set, fenced whether it is past its lease's fence deadline, rejoins the
+// re-registrations since the previous call.
+func (c *Cluster) Record(ctx context.Context, absent, fenced bool, rejoins int64) {
+	c.selfAbsent.Record(ctx, boolGauge(absent))
+	c.fenced.Record(ctx, boolGauge(fenced))
 
 	if rejoins > 0 {
 		c.rejoins.Add(ctx, rejoins)
 	}
+}
+
+// PrimaryRefused accounts one write this node refused to apply as a shard's primary because it
+// could not prove it still held the shard.
+func (c *Cluster) PrimaryRefused(ctx context.Context, sig string) {
+	c.refused.Add(ctx, 1, sigAttr(sig))
+}
+
+func boolGauge(v bool) int64 {
+	if v {
+		return 1
+	}
+
+	return 0
 }
 
 func newCluster(m metric.Meter) (*Cluster, error) {
@@ -344,6 +381,10 @@ func newCluster(m metric.Meter) (*Cluster, error) {
 	c := &Cluster{
 		selfAbsent: b.gauge("storage.cluster.self_absent",
 			"1 while this node is running but missing from the cluster member set", "{node}"),
+		fenced: b.gauge("storage.cluster.fenced",
+			"1 while this node is past its membership lease's fence deadline", "{node}"),
+		refused: b.counter("storage.cluster.primary_refusals",
+			"writes refused as a shard primary because this node could not prove its claim", "{write}"),
 		rejoins: b.counter("storage.cluster.rejoins",
 			"times this node re-registered after losing its membership lease", "{rejoin}"),
 		routed: b.counter("storage.cluster.routed_points",
@@ -384,6 +425,8 @@ func newParts(m metric.Meter) (*Parts, error) {
 		candidates: b.gauge("storage.parts.merge_candidates", "parts the next merge would select", "{part}"),
 		capBytes:   b.gauge("storage.merge.cap_bytes", "seal threshold in effect for a merged part", "By"),
 		bytes:      b.gauge("storage.parts.bytes", "bytes the flushed parts occupy on disk", "By"),
+		orphans: b.counter("storage.parts.orphans_swept",
+			"part objects no index entry names, deleted by the sweep at open", "{object}"),
 	}
 
 	return p, b.err

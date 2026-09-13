@@ -10,6 +10,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -288,7 +289,9 @@ func validSidxEntries(entries []byte, n, total int) bool {
 // (absent or corrupt sidecar, or a row total disagreeing with the manifest) to send the caller to
 // the resident fallback. The validated view is retained — the part is being opened to be read, so
 // the first fetch starts warm; it drops at the part's first refs==0 release.
-func openPagedIndex(ctx context.Context, b backend.Backend, prefix string, manifestRows int) (*pagedIndex, bool) {
+func openPagedIndex(
+	ctx context.Context, b backend.Backend, prefix string, manifestRows int, corrupt *obs.Corruption,
+) (*pagedIndex, bool) {
 	data, err := backend.ReadView(ctx, b, sidxKey(prefix))
 	if err != nil {
 		return nil, false // absent (or unreadable) ⇒ resident fallback
@@ -296,6 +299,8 @@ func openPagedIndex(ctx context.Context, b backend.Backend, prefix string, manif
 
 	ents, n, total, err := parseSeriesIndex(data, true)
 	if err != nil || total != manifestRows || !validSidxEntries(ents, n, total) {
+		corrupt.Detected(ctx, "series_index", obs.CorruptTolerated)
+
 		return nil, false
 	}
 

@@ -319,7 +319,7 @@ func (e *Engine) openHeld(
 			continue
 		}
 
-		p, err := openPart(ctx, e.cfg.Backend, t.want.Prefix)
+		p, err := openPart(ctx, e.cfg.Backend, t.want.Prefix, e.cfg.Obs.Corruption)
 		if err != nil {
 			remote = append(remote, *t)
 
@@ -477,7 +477,7 @@ func (e *Engine) publishRepaired(
 		if p == nil {
 			var err error
 
-			p, err = openPart(ctx, e.cfg.Backend, ent.Prefix)
+			p, err = openPart(ctx, e.cfg.Backend, ent.Prefix, e.cfg.Obs.Corruption)
 			if err != nil {
 				if _, covered := live.Satisfying(r.want); covered {
 					// Nothing failed and nothing is owed: a part already in this commit contains

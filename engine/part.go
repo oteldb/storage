@@ -13,6 +13,7 @@ import (
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
@@ -274,9 +275,11 @@ func buildPartIndex(ids []chunk.U128) partIndex {
 type part struct {
 	reader *block.PartReader
 	be     backend.Backend // for lazily loading the aggregate-pushdown stats sidecar
-	prefix string
-	index  partIndex
-	hasSF  bool // the part carries a scale-factor column (sampling occurred); else every weight is 1
+	// corrupt accounts the lazily loaded sidecars that fail their checks.
+	corrupt *obs.Corruption
+	prefix  string
+	index   partIndex
+	hasSF   bool // the part carries a scale-factor column (sampling occurred); else every weight is 1
 
 	diskBytes int64 // from the manifest; 0 for a part predating the field, see sizeBytes
 
@@ -360,7 +363,7 @@ func deletePart(ctx context.Context, b backend.Backend, prefix string) error {
 // openPart opens the part at prefix and attaches its SeriesID → row-range index: the paged form
 // when the series-index sidecar is present and valid — skipping the series-column read and its
 // resident decode entirely — else the resident form built by scanning the series column.
-func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, error) {
+func openPart(ctx context.Context, b backend.Backend, prefix string, corrupt *obs.Corruption) (*part, error) {
 	r, err := block.OpenPart(ctx, b, prefix)
 	if err != nil {
 		return nil, err
@@ -368,7 +371,7 @@ func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, err
 
 	var idx partIndex
 
-	if paged, ok := openPagedIndex(ctx, b, prefix, r.RowCount()); ok {
+	if paged, ok := openPagedIndex(ctx, b, prefix, r.RowCount(), corrupt); ok {
 		idx = partIndex{paged: paged}
 	} else {
 		col, err := r.Column(ctx, colSeries)
@@ -387,6 +390,7 @@ func openPart(ctx context.Context, b backend.Backend, prefix string) (*part, err
 	return &part{
 		reader:    r,
 		be:        b,
+		corrupt:   corrupt,
 		prefix:    prefix,
 		index:     idx,
 		hasSF:     slices.Contains(r.ColumnNames(), colSF),
@@ -407,9 +411,14 @@ func (p *part) seriesStat(ctx context.Context, id signal.SeriesID) (SeriesAgg, b
 			return // absent ⇒ fall back to decode
 		}
 
-		if m, err := decodeSeriesStats(data); err == nil {
-			p.stats = m
+		m, err := decodeSeriesStats(data)
+		if err != nil {
+			p.corrupt.Detected(ctx, "series_stats", obs.CorruptTolerated)
+
+			return
 		}
+
+		p.stats = m
 	})
 
 	if p.stats == nil {
@@ -750,6 +759,10 @@ func (p *part) granuleTimes(ctx context.Context) []block.Granule {
 
 		m, err := p.reader.Marks(ctx)
 		if err != nil || m.GranuleSize != man.GranuleSize {
+			if errors.Is(err, block.ErrCorrupt) {
+				p.corrupt.Detected(ctx, "marks", obs.CorruptTolerated)
+			}
+
 			return // absent/corrupt ⇒ prune nothing
 		}
 
