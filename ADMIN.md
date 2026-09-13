@@ -327,14 +327,26 @@ error wrapping `ErrReadOnly` (as do the `Write*` methods and `Reset`); the read 
 unaffected, which is what makes a read-only handle the right shape for an offline inspector.
 
 The retention cutoff both paths pass to the merge is `max(age cutoff, size cutoff)`. The size cutoff
-comes from `tenant.Retention.MaxBytes`: the tenant's parts across all signals/shards on this node are
-summed and dropped oldest-first until the total fits the budget (`retention.go`). Resolving it reads
-per-part object sizes from the backend, like `PartsDetailed` — so a cycle only pays that I/O for
-tenants that actually set `MaxBytes`, and the cutoff is resolved once per tenant per cycle. It is
-also **memoized against the tenant's part set**: parts are immutable, so the cutoff can only change
-when a flush, merge, or drop changes the part set (or the budget itself moves), and a cycle that
-follows an idle one does no part enumeration at all. Erasure-coding a part rewrites its stored bytes
-under the same identity, so the converter drops the tenant's memo.
+comes from the tenant's byte budgets, and there are two, both enforced (`retention.go`):
+
+- `tenant.Retention.MaxBytes` is **pooled**: the tenant's parts across all signals/shards on this
+  node are summed and dropped oldest-first until the total fits. It is the tenant-wide outer bound.
+- `tenant.Retention.MaxBytesPerSignal` bounds **one signal at a time**, from that signal's parts
+  alone. It exists because a pooled budget has no isolation: on a tenant whose metrics dwarf its
+  logs, metric growth alone moves the shared cutoff and evicts log history that never grew.
+
+A signal's cutoff is the later of whichever budgets cover it, so setting both gives per-signal
+isolation under a total ceiling. Only the newest part of each budgeted *signal* is exempt from the
+drop, so the floor is one part per signal rather than one per tenant — pair a budget with
+`Limits.MaxPartSize` to make that granularity small.
+
+Resolving a budget reads per-part object sizes from the backend, like `PartsDetailed` — so a cycle
+only pays that I/O for tenants that set one, only for the signals a budget actually covers (a
+log-only budget never enumerates metric parts), and all of a tenant's signals resolve in one pass per
+cycle. It is also **memoized against the tenant's part set**: parts are immutable, so the cutoffs can
+only change when a flush, merge, or drop changes the part set (or a budget itself moves), and a cycle
+that follows an idle one does no part enumeration at all. Erasure-coding a part rewrites its stored
+bytes under the same identity, so the converter drops the tenant's memo.
 
 In **cluster mode**, `Flush`/`Compact`/`CompactNow`/`PruneIdentities` act only on shards this node holds the etcd
 compaction claim on, returning `ErrNotOwner` otherwise — so a shard's parts are still written by exactly one node,

@@ -258,12 +258,13 @@ func TestSizeRetentionMemoDropsUnheldTenants(t *testing.T) {
 
 	var c sizeRetentionCache
 
-	c.store("a", 1, 10)
-	c.store("b", 2, 20)
+	ca := bySignal{signal.Metric: 10, signal.Log: 11}
+	c.store("a", 1, ca)
+	c.store("b", 2, bySignal{signal.Metric: 20})
 
 	got, ok := c.lookup("a", 1)
 	require.True(t, ok)
-	assert.Equal(t, int64(10), got)
+	assert.Equal(t, ca, got, "every signal's cutoff comes back")
 
 	_, ok = c.lookup("a", 99)
 	assert.False(t, ok, "a different part set is a miss")
@@ -393,4 +394,337 @@ func TestMaintainNoSizeRetentionWithoutBudget(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, batches, 1)
 	assert.Equal(t, []int64{old, now}, batches[0].Timestamps, "everything is retained")
+}
+
+// mixedSignalStore builds a store holding both metrics and logs for one tenant, with the byte
+// budgets resolved live from budgets so a test can set them after measuring real parts. Log records
+// are strictly older than every metric sample, which is what makes a *pooled* budget's damage
+// unambiguous: the logs are always the oldest thing to drop.
+func mixedSignalStore(t *testing.T, budgets *atomic.Pointer[tenant.Retention]) *Storage {
+	t.Helper()
+
+	s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+		var r tenant.Retention
+		if p := budgets.Load(); p != nil {
+			r = *p
+		}
+
+		return tenant.Policy{Limits: tenant.Limits{MaxPartSize: 512}, Retention: r}
+	})))
+	require.NoError(t, err)
+
+	return s
+}
+
+const (
+	mixedLogBase    = 1
+	mixedMetricBase = 10_000
+	mixedRows       = 200
+)
+
+func writeMixedLogs(t *testing.T, s *Storage, from int) {
+	t.Helper()
+
+	recs := make([][3]any, 0, mixedRows)
+	for i := from; i < from+mixedRows; i++ {
+		recs = append(recs, [3]any{i, 9, "body-" + strconv.Itoa(i)})
+	}
+
+	_, err := s.WriteLogs(context.Background(), logBatch("api", recs...))
+	require.NoError(t, err)
+}
+
+func writeMixedMetrics(t *testing.T, s *Storage, from int64) {
+	t.Helper()
+
+	ts, vals := make([]int64, mixedRows), make([]float64, mixedRows)
+	for i := range ts {
+		ts[i] = from + int64(i)
+		vals[i] = float64(i)
+	}
+
+	_, err := s.WriteMetrics(context.Background(), gaugeBatch("api", "m", ts, vals))
+	require.NoError(t, err)
+}
+
+// storedBytes reads one signal's flushed footprint for the default tenant.
+func storedBytes(t *testing.T, s *Storage, sig signal.Signal) int64 {
+	t.Helper()
+
+	eff, err := s.EfficiencyStats(context.Background())
+	require.NoError(t, err)
+	require.Len(t, eff, 1)
+
+	for _, se := range eff[0].Signals {
+		if se.Signal == sig {
+			require.Positive(t, se.StoredBytes)
+
+			return se.StoredBytes
+		}
+	}
+
+	t.Fatalf("no %s parts", sig)
+
+	return 0
+}
+
+func mixedLogBodies(t *testing.T, s *Storage) []string {
+	t.Helper()
+
+	eng, ok := s.lookupRecordEngine(signal.Log, "default")
+	require.True(t, ok)
+
+	return logBodies(t, eng, fetch.Request{Start: 0, End: 1 << 40, Matchers: []fetch.Matcher{logSvcMatcher("api")}})
+}
+
+func mixedMetricTimestamps(t *testing.T, s *Storage) []int64 {
+	t.Helper()
+
+	eng := mustEngine(s.engineFor("default"))
+	it, err := eng.Fetch(context.Background(), fetch.Request{
+		Start: 0, End: 1 << 40, Matchers: []fetch.Matcher{nameMatcher("m")},
+	})
+	require.NoError(t, err)
+	batches, err := fetch.Drain(context.Background(), it)
+	require.NoError(t, err)
+	require.Len(t, batches, 1)
+
+	return batches[0].Timestamps
+}
+
+// TestSizeRetentionIsolatesSignals is the reason per-signal budgets exist: a tenant whose metrics
+// outgrow their budget must not lose log history to it. The same load under the pooled budget is
+// the contrast — there the logs, being the oldest data, are what the metric growth evicts.
+func TestSizeRetentionIsolatesSignals(t *testing.T) {
+	t.Parallel()
+
+	t.Run("per-signal", func(t *testing.T) {
+		t.Parallel()
+
+		var budgets atomic.Pointer[tenant.Retention]
+
+		s := mixedSignalStore(t, &budgets)
+		ctx := context.Background()
+
+		writeMixedLogs(t, s, mixedLogBase)
+		writeMixedMetrics(t, s, mixedMetricBase)
+		s.maintain(ctx)
+
+		// One batch of metrics is the metric budget, so the second batch below forces a drop; the
+		// logs get ten times what they occupy and must be untouched by it.
+		budgets.Store(&tenant.Retention{MaxBytesPerSignal: map[signal.Signal]int64{
+			signal.Metric: storedBytes(t, s, signal.Metric),
+			signal.Log:    10 * storedBytes(t, s, signal.Log),
+		}})
+
+		writeMixedMetrics(t, s, mixedMetricBase+10_000)
+		s.maintain(ctx) // flushes the new parts (the budget was met when the cycle started)
+		s.maintain(ctx) // over the metric budget now: drops oldest metric parts
+
+		ts := mixedMetricTimestamps(t, s)
+		require.NotEmpty(t, ts)
+		assert.Greater(t, ts[0], int64(mixedMetricBase), "the oldest metric samples were dropped")
+
+		bodies := mixedLogBodies(t, s)
+		assert.Len(t, bodies, mixedRows, "every log record survived the metric eviction")
+		assert.Contains(t, bodies, "body-"+strconv.Itoa(mixedLogBase), "the oldest log record is retained")
+	})
+
+	t.Run("pooled", func(t *testing.T) {
+		t.Parallel()
+
+		var budgets atomic.Pointer[tenant.Retention]
+
+		s := mixedSignalStore(t, &budgets)
+		ctx := context.Background()
+
+		writeMixedLogs(t, s, mixedLogBase)
+		writeMixedMetrics(t, s, mixedMetricBase)
+		s.maintain(ctx)
+		require.Len(t, mixedLogBodies(t, s), mixedRows, "the logs are there to lose")
+
+		// The pooled budget fits the metrics alone, so the logs — the oldest parts — are what pays
+		// for the metric growth even though their own volume never moved.
+		budgets.Store(&tenant.Retention{MaxBytes: 2 * storedBytes(t, s, signal.Metric)})
+
+		writeMixedMetrics(t, s, mixedMetricBase+10_000)
+		s.maintain(ctx)
+		s.maintain(ctx)
+
+		assert.Empty(t, mixedLogBodies(t, s), "a pooled budget lets metric growth evict the logs")
+	})
+}
+
+// TestSizeRetentionPooledBoundsPerSignalBudgets pins that the two budgets compose: per-signal
+// budgets no signal exceeds still answer to the tenant-wide bound when their sum does not fit.
+func TestSizeRetentionPooledBoundsPerSignalBudgets(t *testing.T) {
+	t.Parallel()
+
+	var budgets atomic.Pointer[tenant.Retention]
+
+	s := mixedSignalStore(t, &budgets)
+	ctx := context.Background()
+
+	writeMixedLogs(t, s, mixedLogBase)
+	writeMixedMetrics(t, s, mixedMetricBase)
+	s.maintain(ctx)
+
+	require.Len(t, mixedLogBodies(t, s), mixedRows, "the logs are there to lose")
+
+	metricBytes := storedBytes(t, s, signal.Metric)
+	budgets.Store(&tenant.Retention{
+		MaxBytes: 2 * metricBytes, // fits the metrics alone, as above
+		MaxBytesPerSignal: map[signal.Signal]int64{
+			signal.Metric: 1 << 30, // neither per-signal budget binds
+			signal.Log:    1 << 30,
+		},
+	})
+
+	writeMixedMetrics(t, s, mixedMetricBase+10_000)
+	s.maintain(ctx)
+	s.maintain(ctx)
+
+	assert.Empty(t, mixedLogBodies(t, s), "the pooled budget still bounds a signal its own budget does not")
+}
+
+// TestSizeCutoffsSkipsUnbudgetedSignals pins the enumeration scope: measuring a signal nothing
+// budgets is pure backend I/O for a number no engine reads.
+func TestSizeCutoffsSkipsUnbudgetedSignals(t *testing.T) {
+	t.Parallel()
+
+	be := &listCountingBackend{Backend: backend.Memory()}
+	s, err := Open(context.Background(), Options{},
+		WithBackend(be),
+		WithFlushInterval(-1), // no background loop: this test drives maintain itself
+		WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+			return tenant.Policy{Retention: tenant.Retention{
+				MaxBytesPerSignal: map[signal.Signal]int64{signal.Log: 1 << 30},
+			}}
+		})))
+	require.NoError(t, err)
+
+	t.Cleanup(func() { require.NoError(t, s.Close(context.Background())) })
+
+	ctx := context.Background()
+
+	writeMixedMetrics(t, s, mixedMetricBase)
+	s.maintain(ctx)
+
+	tids := map[signal.TenantID]struct{}{"default": {}}
+
+	be.lists.Store(0)
+	s.sizeCutoffs(ctx, tids)
+	assert.Zero(t, be.lists.Load(), "a metric-only store under a log-only budget enumerates nothing")
+
+	writeMixedLogs(t, s, mixedLogBase)
+	s.maintain(ctx)
+
+	be.lists.Store(0)
+	s.sizeCutoffs(ctx, tids)
+	assert.Positive(t, be.lists.Load(), "the budgeted signal is measured")
+}
+
+func TestBudgetsOf(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		retention tenant.Retention
+		want      sizeBudgets
+		empty     bool
+		covers    map[signal.Signal]bool
+	}{
+		{
+			name:   "unset",
+			empty:  true,
+			covers: map[signal.Signal]bool{signal.Metric: false, signal.Log: false},
+		},
+		{
+			name:      "pooled only covers every signal",
+			retention: tenant.Retention{MaxBytes: 100},
+			want:      sizeBudgets{pooled: 100},
+			covers:    map[signal.Signal]bool{signal.Metric: true, signal.Profile: true},
+		},
+		{
+			name:      "per-signal covers only its own",
+			retention: tenant.Retention{MaxBytesPerSignal: map[signal.Signal]int64{signal.Log: 100}},
+			want:      sizeBudgets{perSignal: bySignal{signal.Log: 100}},
+			covers:    map[signal.Signal]bool{signal.Log: true, signal.Metric: false},
+		},
+		{
+			name: "both",
+			retention: tenant.Retention{
+				MaxBytes:          100,
+				MaxBytesPerSignal: map[signal.Signal]int64{signal.Trace: 50},
+			},
+			want:   sizeBudgets{pooled: 100, perSignal: bySignal{signal.Trace: 50}},
+			covers: map[signal.Signal]bool{signal.Trace: true, signal.Metric: true},
+		},
+		{
+			name:      "unknown signal is ignored",
+			retention: tenant.Retention{MaxBytesPerSignal: map[signal.Signal]int64{signal.Signal(200): 100}},
+			empty:     true,
+			covers:    map[signal.Signal]bool{signal.Signal(200): false},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := budgetsOf(tt.retention)
+			assert.Equal(t, tt.want, got)
+			assert.Equal(t, tt.empty, got.empty())
+
+			for sig, want := range tt.covers {
+				assert.Equal(t, want, got.covers(sig), "covers(%s)", sig)
+			}
+		})
+	}
+}
+
+func TestBySignalAt(t *testing.T) {
+	t.Parallel()
+
+	v := bySignal{signal.Metric: 7}
+
+	assert.Equal(t, int64(7), v.at(signal.Metric))
+	assert.Zero(t, v.at(signal.Log))
+	assert.Zero(t, v.at(signal.Signal(200)), "a signal outside the known range reads as unbudgeted")
+	assert.True(t, v.any())
+	assert.False(t, bySignal{}.any())
+}
+
+// TestPartSetFingerprintFoldsBudgets pins the memo's other input: moving a budget — pooled or
+// per-signal — must invalidate the entry, or the cutoff would be memoized against the old one.
+func TestPartSetFingerprintFoldsBudgets(t *testing.T) {
+	t.Parallel()
+
+	var budgets atomic.Pointer[tenant.Retention]
+
+	s := mixedSignalStore(t, &budgets)
+	ctx := context.Background()
+
+	writeMixedLogs(t, s, mixedLogBase)
+	writeMixedMetrics(t, s, mixedMetricBase)
+	s.maintain(ctx)
+
+	base := sizeBudgets{pooled: 1 << 30, perSignal: bySignal{signal.Log: 1 << 20}}
+	fp := s.partSetFingerprint("default", base)
+
+	pooled := base
+	pooled.pooled++
+	assert.NotEqual(t, fp, s.partSetFingerprint("default", pooled), "the pooled budget is folded in")
+
+	perSignal := base
+	perSignal.perSignal[signal.Log]++
+	assert.NotEqual(t, fp, s.partSetFingerprint("default", perSignal), "a per-signal budget is folded in")
+
+	moved := base
+	moved.perSignal[signal.Trace] = base.perSignal[signal.Log]
+	moved.perSignal[signal.Log] = 0
+	assert.NotEqual(t, fp, s.partSetFingerprint("default", moved),
+		"the same budget on a different signal is a different fingerprint")
+
+	assert.Equal(t, fp, s.partSetFingerprint("default", base), "an unchanged input is an unchanged fingerprint")
 }

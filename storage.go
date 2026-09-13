@@ -1542,10 +1542,12 @@ func (s *Storage) maintain(ctx context.Context) {
 
 	owned := s.ownedTenants(ctx, tids)
 
-	// Size retention is resolved once per cycle, per tenant: the byte budget spans every signal, so
-	// it cannot be decided inside a single engine's merge. Empty (and free) unless a tenant sets
-	// Retention.MaxBytes — resolving it reads per-part object sizes from the backend, so it is scoped
-	// to the shards this node compacts (a replica applies no cutoff of its own).
+	// Size retention is resolved once per cycle, per tenant, for every signal at once: the cutoffs are
+	// read from the backend part sizes of all of a tenant's shards, and the pooled budget
+	// (Retention.MaxBytes) still spans signals, so neither can be decided inside a single engine's
+	// merge. Empty (and free) unless a tenant sets a byte budget — resolving it reads per-part object
+	// sizes from the backend, so it is scoped to the shards this node compacts (a replica applies no
+	// cutoff of its own).
 	budgeted := tids
 	if owned != nil {
 		budgeted = owned
@@ -1605,7 +1607,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	// identity, and because it runs on the owned path only — the live set is derived from this node's
 	// parts, so a replica mid-sync must not decide what is dead.
 	mergeMetrics := func(tid signal.TenantID, eng *engine.Engine) error {
-		if err := eng.MergeWith(ctx, s.metricMergeOptions(tid, sizeCutoffs[tid])); err != nil {
+		if err := eng.MergeWith(ctx, s.metricMergeOptions(tid, sizeCutoffs[tid].at(signal.Metric))); err != nil {
 			return err
 		}
 
@@ -1641,8 +1643,8 @@ func (s *Storage) maintain(ctx context.Context) {
 	// mergeRecords / refreshRecords mirror the metric pair: the prune follows whatever changed the
 	// part set, since that is the only thing that kills a stream identity. A replica reaches it
 	// only through the refresh — it never merges.
-	mergeRecords := func(tid signal.TenantID, eng *recordengine.Engine) error {
-		if err := eng.Merge(ctx, s.retainFrom(tid, sizeCutoffs[tid])); err != nil {
+	mergeRecords := func(tid signal.TenantID, eng *recordengine.Engine, sig signal.Signal) error {
+		if err := eng.Merge(ctx, s.retainFrom(tid, sizeCutoffs[tid].at(sig))); err != nil {
 			return err
 		}
 
@@ -1661,11 +1663,11 @@ func (s *Storage) maintain(ctx context.Context) {
 		return err
 	}
 
-	addRecord := func(engines map[signal.TenantID]*recordengine.Engine, signalPrefix string) {
+	addRecord := func(engines map[signal.TenantID]*recordengine.Engine, sig signal.Signal, signalPrefix string) {
 		for tid, eng := range engines {
 			tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
 				maintainEngine(tid, signalPrefix, func() error { return eng.Flush(ctx) },
-					func() error { return mergeRecords(tid, eng) },
+					func() error { return mergeRecords(tid, eng, sig) },
 					func() error { return refreshRecords(eng) },
 					eng.AdoptWants,
 					func() []ecPartRef { return coldRecord(eng) })
@@ -1673,9 +1675,9 @@ func (s *Storage) maintain(ctx context.Context) {
 		}
 	}
 
-	addRecord(logEngines, logsPrefix)
-	addRecord(traceEngines, tracesPrefix)
-	addRecord(profileEngines, profilesPrefix)
+	addRecord(logEngines, signal.Log, logsPrefix)
+	addRecord(traceEngines, signal.Trace, tracesPrefix)
+	addRecord(profileEngines, signal.Profile, profilesPrefix)
 
 	s.maintStats.lastTasks.Store(int64(len(tasks)))
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].pressure > tasks[j].pressure })
@@ -1796,13 +1798,34 @@ func (s *Storage) recordHeadShape(ctx context.Context) {
 	}
 }
 
+// recordSignals are the signals served by a record engine, in a form a loop can range over without
+// allocating (unlike [Storage.recordEnginesBySignal], which builds a map).
+var recordSignals = [...]signal.Signal{signal.Log, signal.Trace, signal.Profile}
+
+// recordEngineSnapshot snapshots the record engines this node holds for one signal; nil for a
+// signal no record engine serves. It lets a caller that walks only some signals pay for only those
+// snapshots.
+func (s *Storage) recordEngineSnapshot(sig signal.Signal) map[signal.TenantID]*recordengine.Engine {
+	switch sig {
+	case signal.Log:
+		return s.logEngineSnapshotByTenant()
+	case signal.Trace:
+		return s.traceEngineSnapshotByTenant()
+	case signal.Profile:
+		return s.profileEngineSnapshotByTenant()
+	default:
+		return nil
+	}
+}
+
 // recordEnginesBySignal snapshots every record engine this node holds, keyed by signal.
 func (s *Storage) recordEnginesBySignal() map[signal.Signal]map[signal.TenantID]*recordengine.Engine {
-	return map[signal.Signal]map[signal.TenantID]*recordengine.Engine{
-		signal.Log:     s.logEngineSnapshotByTenant(),
-		signal.Trace:   s.traceEngineSnapshotByTenant(),
-		signal.Profile: s.profileEngineSnapshotByTenant(),
+	out := make(map[signal.Signal]map[signal.TenantID]*recordengine.Engine, len(recordSignals))
+	for _, sig := range recordSignals {
+		out[sig] = s.recordEngineSnapshot(sig)
 	}
+
+	return out
 }
 
 // mergeConcurrency is how many merges may realistically run at once — the maintenance fan-out,
