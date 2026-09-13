@@ -907,11 +907,25 @@ func (w *bytesWalk) decode(g int) error {
 	return nil
 }
 
+// decodeFunc decodes one column stream, which must hold exactly rows values.
+type decodeFunc[T any] func(dst []T, src []byte, rows int) ([]T, int, error)
+
+// rowsUnchecked adapts a decoder whose stream bounds its own row count, so it has no use for the
+// expected one; the blocked paths check the decoded length against the directory regardless.
+func rowsUnchecked[T any](dec func([]T, []byte) ([]T, int, error)) decodeFunc[T] {
+	return func(dst []T, src []byte, _ int) ([]T, int, error) { return dec(dst, src) }
+}
+
+// blockRowsAt returns block blk's row count in a column of rows rows, or 0 for a block past the end.
+func blockRowsAt(dir blockDir, rows, blk int) int {
+	return max(min(dir.blockRows, rows-blk*dir.blockRows), 0)
+}
+
 // decodeBlockedColumn decodes every block of a blocked column into dst (sized to rows) in place: each
 // block decodes directly into its row span of dst, so the whole-column path adds no per-row copy over
 // the single-stream path. dec is the per-block typed decoder (DecodeTimestamps, DecodeFloats, …).
 func decodeBlockedColumn[T any](
-	dir blockDir, comp *compress.Compressor, rows int, dst []T, dec func([]T, []byte) ([]T, int, error),
+	dir blockDir, comp *compress.Compressor, rows int, dst []T, dec decodeFunc[T],
 ) ([]T, error) {
 	out := dst[:0]
 	if cap(out) < rows {
@@ -933,16 +947,18 @@ func decodeBlockedColumn[T any](
 			return nil, errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", i, base, rows)
 		}
 
+		want := min(base+dir.blockRows, rows) - base
+
 		// cap(out[base:]) == rows-base ≥ this block's row count (blocks partition [0,rows)), so the
 		// decoder fills out[base:base+blkRows] in place without reallocating.
-		sub, _, err := dec(out[base:base], stream)
+		sub, _, err := dec(out[base:base], stream, want)
 		if err != nil {
 			return nil, errors.Wrapf(err, "decode block %d", i)
 		}
 
 		// A granule shorter than the directory places there would otherwise pack the surviving rows
 		// together, shifting every later row earlier — a wrong answer with no error.
-		if want := min(base+dir.blockRows, rows) - base; len(sub) != want {
+		if len(sub) != want {
 			return nil, errors.Wrapf(ErrCorrupt, "block %d decoded %d rows, want %d", i, len(sub), want)
 		}
 
@@ -956,7 +972,7 @@ func decodeBlockedColumn[T any](
 // leaving rows outside those blocks untouched. It is the engine's series-skip primitive: decode only
 // the blocks a query's matched series touch.
 func decodeBlocksInto[T any](
-	dir blockDir, comp *compress.Compressor, rows int, out []T, blocks []int, dec func([]T, []byte) ([]T, int, error),
+	dir blockDir, comp *compress.Compressor, rows int, out []T, blocks []int, dec decodeFunc[T],
 ) error {
 	if dec == nil {
 		return errors.New("block: nil decoder")
@@ -984,7 +1000,7 @@ func decodeBlocksInto[T any](
 		}
 
 		// cap(out[lo:]) == rows-lo ≥ this block's row count, so the decoder fills out[lo:hi] in place.
-		sub, _, err := dec(out[lo:lo], stream)
+		sub, _, err := dec(out[lo:lo], stream, hi-lo)
 		if err != nil {
 			return errors.Wrapf(err, "decode block %d", b)
 		}
@@ -1001,7 +1017,7 @@ func decodeBlocksInto[T any](
 // the seek primitive: a query touching a fraction of a column decodes a fraction of its blocks. The
 // result is a view into a buffer reusing dst's capacity; lo/hi must satisfy 0 ≤ lo < hi ≤ rows.
 func decodeBlockedRange[T any](
-	dir blockDir, comp *compress.Compressor, lo, hi int, dst []T, dec func([]T, []byte) ([]T, int, error),
+	dir blockDir, comp *compress.Compressor, rows, lo, hi int, dst []T, dec decodeFunc[T],
 ) ([]T, error) {
 	if lo < 0 || hi <= lo {
 		return nil, errors.Errorf("block: bad range [%d,%d)", lo, hi)
@@ -1025,7 +1041,7 @@ func decodeBlockedRange[T any](
 			return nil, err
 		}
 
-		scratch, _, err = dec(scratch, stream)
+		scratch, _, err = dec(scratch, stream, blockRowsAt(dir, rows, i))
 		if err != nil {
 			return nil, errors.Wrapf(err, "decode block %d", i)
 		}
@@ -1049,8 +1065,8 @@ func decodeBlockedRange[T any](
 // block. Obtain one via [ColumnReader.Decoder]; it holds the column's already-read object.
 type Decoder struct {
 	rows int
-	i64  func([]int64, []byte) ([]int64, int, error)
-	f64  func([]float64, []byte) ([]float64, int, error)
+	i64  decodeFunc[int64]
+	f64  decodeFunc[float64]
 
 	// streams holds the decompressed compression frame, reused across this decoder's blocks. A
 	// decoder decodes its column's blocks serially (never concurrently), and each block's decoded
@@ -1074,31 +1090,31 @@ func (d *Decoder) BlockSpan(blk int) (lo, hi int) {
 
 // DecodeInt64 decodes block blk into a fresh slice (for an int64 column).
 func (d *Decoder) DecodeInt64(blk int) ([]int64, error) {
-	return decodeOneBlockInto(&d.streams, blk, nil, d.i64)
+	return decodeOneBlockInto(&d.streams, d.rows, blk, nil, d.i64)
 }
 
 // DecodeInt64Into decodes block blk into dst (for an int64 column), reusing dst's backing array when
 // it has room for the block's rows — so a caller drawing dst from a pool decodes without allocating
 // the output. Passing a nil dst is equivalent to [Decoder.DecodeInt64].
 func (d *Decoder) DecodeInt64Into(blk int, dst []int64) ([]int64, error) {
-	return decodeOneBlockInto(&d.streams, blk, dst, d.i64)
+	return decodeOneBlockInto(&d.streams, d.rows, blk, dst, d.i64)
 }
 
 // DecodeFloat64 decodes block blk into a fresh slice (for a float64 column).
 func (d *Decoder) DecodeFloat64(blk int) ([]float64, error) {
-	return decodeOneBlockInto(&d.streams, blk, nil, d.f64)
+	return decodeOneBlockInto(&d.streams, d.rows, blk, nil, d.f64)
 }
 
 // DecodeFloat64Into is the float64 analog of [Decoder.DecodeInt64Into].
 func (d *Decoder) DecodeFloat64Into(blk int, dst []float64) ([]float64, error) {
-	return decodeOneBlockInto(&d.streams, blk, dst, d.f64)
+	return decodeOneBlockInto(&d.streams, d.rows, blk, dst, d.f64)
 }
 
 // decodeOneBlockInto decompresses and decodes a single block into dst (reusing dst's backing array
 // when its capacity allows), taking its stream from s (whose frame buffer is retained across calls).
 // A nil dst decodes into a fresh slice.
 func decodeOneBlockInto[T any](
-	s *blockStreams, blk int, dst []T, dec func([]T, []byte) ([]T, int, error),
+	s *blockStreams, rows, blk int, dst []T, dec decodeFunc[T],
 ) ([]T, error) {
 	if dec == nil {
 		return nil, errors.New("block: nil decoder")
@@ -1113,7 +1129,7 @@ func decodeOneBlockInto[T any](
 		return nil, err
 	}
 
-	out, _, err := dec(dst[:0], stream)
+	out, _, err := dec(dst[:0], stream, blockRowsAt(s.dir, rows, blk))
 
 	return out, err
 }

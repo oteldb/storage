@@ -91,7 +91,7 @@ func FuzzT64RoundTrip(f *testing.F) {
 
 		enc := EncodeIntsT64(nil, vals)
 
-		got, _, err := DecodeIntsT64(nil, enc)
+		got, _, err := DecodeIntsT64(nil, enc, len(vals))
 		if err != nil {
 			t.Fatalf("Decode: %v", err)
 		}
@@ -267,10 +267,20 @@ func FuzzDecodeNumericArbitrary(f *testing.F) {
 		_, _, _ = DecodeTimestamps(nil, src)
 		_, _, _ = DecodeFloats(nil, src)
 		_, _, _ = DecodeFloatsDecimal(nil, src)
-		_, _, _ = DecodeIntsT64(nil, src)
-		_, _, _ = DecodeU128(nil, src)
+		// The caller-bounded decoders get what a part reader would pass: the header's count when it
+		// is plausible, which it never is past fuzzRows.
+		rows := fuzzRows
+		if n, k := binary.Uvarint(src); k > 0 && n < fuzzRows {
+			rows = int(n)
+		}
+
+		_, _, _ = DecodeIntsT64(nil, src, rows)
+		_, _, _ = DecodeU128(nil, src, rows)
 	})
 }
+
+// fuzzRows bounds the row count FuzzDecodeNumericArbitrary hands the caller-bounded decoders.
+const fuzzRows = 1 << 16
 
 // decodeSeedToInt64s reads a sequence of zigzag varints from the seed.
 func decodeSeedToInt64s(seed []byte, maxVals int) []int64 {

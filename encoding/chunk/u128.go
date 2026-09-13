@@ -85,17 +85,14 @@ func EncodeU128Runs(dst []byte, runs []U128Run) []byte {
 	return w.Bytes()
 }
 
-// DecodeU128 decodes a [U128] column into dst (reusing its capacity), returning the
-// result and bytes consumed.
-func DecodeU128(dst []U128, src []byte) ([]U128, int, error) {
-	r, rows, consumed, err := readHeader(src)
+// DecodeU128 decodes a [U128] column into dst (reusing its capacity), returning the result and bytes
+// consumed. It must hold exactly rows values: a stream whose header states another count is corrupt.
+//
+// rows comes from the caller because the stream cannot bound it: one 17-byte run encodes any row
+// count, so trusting the header would let a few corrupt bytes size the output.
+func DecodeU128(dst []U128, src []byte, rows int) ([]U128, int, error) {
+	r, rows, consumed, err := readHeaderRows(src, rows)
 	if err != nil {
-		return dst, 0, err
-	}
-
-	// RLE packs many rows into few bytes, so the stream length gives no bound on rows; cap defensively
-	// so a corrupt header can't drive a giant make. Each run is also bounded against rows below.
-	if err := boundRows(rows, maxColumnRows); err != nil {
 		return dst, 0, err
 	}
 

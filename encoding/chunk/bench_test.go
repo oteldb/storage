@@ -103,7 +103,7 @@ func BenchmarkT64Decode(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		_, _, _ = DecodeIntsT64(nil, enc)
+		_, _, _ = DecodeIntsT64(nil, enc, len(vals))
 	}
 }
 
@@ -229,7 +229,7 @@ func BenchmarkU128Decode(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		_, _, _ = DecodeU128(nil, enc)
+		_, _, _ = DecodeU128(nil, enc, len(vals))
 	}
 }
 
@@ -242,7 +242,7 @@ func BenchmarkU128DecodeReuseDst(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		dst, _, _ = DecodeU128(dst[:0], enc)
+		dst, _, _ = DecodeU128(dst[:0], enc, len(vals))
 	}
 }
 

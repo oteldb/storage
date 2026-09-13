@@ -19,7 +19,7 @@ func TestU128RoundTrip(t *testing.T) {
 		{{Lo: 0}, {Lo: 1}, {Lo: 2}, {Lo: 3}}, // all distinct (run length 1)
 	}
 	for _, vals := range cases {
-		got, n, err := DecodeU128(nil, EncodeU128(nil, vals))
+		got, n, err := DecodeU128(nil, EncodeU128(nil, vals), len(vals))
 		require.NoError(t, err)
 		assert.Equal(t, vals, orNilU128(got))
 		assert.Positive(t, n)
@@ -38,7 +38,7 @@ func TestU128RunCompression(t *testing.T) {
 	enc := EncodeU128(nil, vals)
 	assert.Less(t, len(enc), 40, "a single run compresses 10000 rows to a handful of bytes")
 
-	got, _, err := DecodeU128(nil, enc)
+	got, _, err := DecodeU128(nil, enc, len(vals))
 	require.NoError(t, err)
 	assert.Equal(t, vals, got)
 }
@@ -48,7 +48,7 @@ func TestU128DecodeTruncated(t *testing.T) {
 
 	enc := EncodeU128(nil, []U128{{Lo: 1}, {Lo: 1}, {Lo: 2}})
 	for n := range enc {
-		_, _, err := DecodeU128(nil, enc[:n])
+		_, _, err := DecodeU128(nil, enc[:n], 3)
 		require.Errorf(t, err, "prefix %d should error", n)
 	}
 }
@@ -73,7 +73,7 @@ func FuzzU128RoundTrip(f *testing.F) {
 			}
 		}
 
-		got, _, err := DecodeU128(nil, EncodeU128(nil, vals))
+		got, _, err := DecodeU128(nil, EncodeU128(nil, vals), len(vals))
 		require.NoError(t, err)
 		assert.Equal(t, orNilU128(vals), orNilU128(got))
 	})
