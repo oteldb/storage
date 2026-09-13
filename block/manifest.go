@@ -63,9 +63,10 @@ const (
 	// manifestVersionChecked is the first version whose column objects carry checksums.
 	manifestVersionChecked uint32 = 2
 
-	// maxPartRows is the defensive ceiling on a decoded row count, mirroring the chunk decoders'
-	// own: no writer emits a part this large, and a count above it is a corrupt manifest.
-	maxPartRows uint64 = 1 << 31
+	// maxPartRows is the defensive ceiling on a decoded row count; a count above it is a corrupt
+	// manifest. It is not 1<<31: merges write metric parts past that (3.3 B rows seen), which then
+	// failed to open. What it has to stop is the int conversion wrapping negative.
+	maxPartRows uint64 = 1 << 40
 
 	// flagConst marks a constant-collapsed column (single value, no data object).
 	flagConst byte = 1 << 0
