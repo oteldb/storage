@@ -153,7 +153,7 @@ func rawBytes(cols []Column) int64 {
 }
 
 // defaultCodec is the codec used when [Column.Codec] is unset (CodecNone). The
-// timestamp/sort column overrides this to [chunk.CodecDoD] via the part writer.
+// timestamp/sort column overrides this to [chunk.CodecDoD] or [chunk.CodecDoDScaled] via the part writer.
 func defaultCodec(k Kind) chunk.Codec {
 	switch k {
 	case KindInt64:
@@ -379,6 +379,8 @@ func encodeStream(c Column, codec chunk.Codec) ([]byte, error) {
 	switch {
 	case c.Kind == KindInt64 && codec == chunk.CodecDoD:
 		return chunk.EncodeTimestamps(nil, c.Int64), nil
+	case c.Kind == KindInt64 && codec == chunk.CodecDoDScaled:
+		return chunk.EncodeTimestampsScaled(nil, c.Int64), nil
 	case c.Kind == KindInt64 && codec == chunk.CodecT64:
 		return chunk.EncodeIntsT64(nil, c.Int64), nil
 	case c.Kind == KindFloat64 && codec == chunk.CodecGorilla:
@@ -837,7 +839,7 @@ func (r *ColumnReader) TsCursor() (chunk.TsCursor, error) {
 		return chunk.NewConstTsCursor(r.rows, r.desc.ConstInt64), nil
 	}
 
-	if r.desc.Codec != chunk.CodecDoD {
+	if r.desc.Codec != chunk.CodecDoD && r.desc.Codec != chunk.CodecDoDScaled {
 		return nil, errors.Errorf("block: codec %s not a streamable timestamp codec for %q", r.desc.Codec, r.desc.Name)
 	}
 
@@ -847,7 +849,7 @@ func (r *ColumnReader) TsCursor() (chunk.TsCursor, error) {
 			return nil, errors.Wrapf(err, "column %q", r.desc.Name)
 		}
 
-		return newBlockedTsCursor(dir, r.comp, r.rows), nil
+		return newBlockedTsCursor(dir, r.comp, r.desc.Codec, r.rows), nil
 	}
 
 	stream, err := r.stream()
@@ -855,7 +857,7 @@ func (r *ColumnReader) TsCursor() (chunk.TsCursor, error) {
 		return nil, err
 	}
 
-	return chunk.NewTsDecoder(stream)
+	return chunk.NewTsCursor(r.desc.Codec, stream)
 }
 
 // FloatCursor returns a forward cursor over a [KindFloat64] column (Gorilla or scaled-decimal). A
@@ -997,6 +999,8 @@ func (r *ColumnReader) int64Decoder() decodeFunc[int64] {
 	switch r.desc.Codec {
 	case chunk.CodecDoD:
 		return rowsUnchecked(chunk.DecodeTimestamps)
+	case chunk.CodecDoDScaled:
+		return rowsUnchecked(chunk.DecodeTimestampsScaled)
 	case chunk.CodecT64:
 		return chunk.DecodeIntsT64
 	default:

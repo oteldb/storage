@@ -24,6 +24,23 @@ import "github.com/oteldb/storage/encoding/bitstream"
 // Timestamps must be non-decreasing for optimal compression; decreasing timestamps
 // still round-trip but produce 68-bit escapes.
 func EncodeTimestamps(dst []byte, ts []int64) []byte {
+	return encodeTimestamps(dst, ts, false)
+}
+
+// EncodeTimestampsScaled appends a [CodecDoDScaled] timestamp column to dst: [EncodeTimestamps]
+// with the column's timestamp scale (see tsScale) factored out of every delta, written after row 0.
+//
+// Layout: [uvarint rows] [varint t0] [uvarint scale] [uvarint (t1-t0)/scale] [dod…]. A column of
+// fewer than two rows has no deltas and no scale, so it is byte-identical to [EncodeTimestamps].
+//
+// A timestamp stored at ns but produced at ms carries six decimal zeros in every delta, which DoD
+// spends ~20 bits a row on; dividing them out is lossless and costs nothing when the source really
+// is ns-entropic, since tsScale bails on the first delta that is not a multiple of 1000.
+func EncodeTimestampsScaled(dst []byte, ts []int64) []byte {
+	return encodeTimestamps(dst, ts, true)
+}
+
+func encodeTimestamps(dst []byte, ts []int64, scaled bool) []byte {
 	w, out := writeHeader(dst, len(ts))
 	if len(ts) == 0 {
 		return out
@@ -38,11 +55,30 @@ func EncodeTimestamps(dst []byte, ts []int64) []byte {
 		return w.Bytes()
 	}
 
-	// Row 1: first delta as an unsigned varint.
+	scale := int64(1)
+	if scaled {
+		scale = tsScale(ts)
+		w.WriteUvarint(uint64(scale))
+	}
+
+	// The unit scale keeps its own loop: a division per row would tax every ns-entropic column, and
+	// [CodecDoD] columns, for nothing.
+	if scale == 1 {
+		writeDeltas(w, ts)
+	} else {
+		writeScaledDeltas(w, ts, scale)
+	}
+
+	w.PadToByte()
+
+	return w.Bytes()
+}
+
+// writeDeltas writes row 1 as an unsigned varint delta and rows 2+ as delta-of-delta.
+func writeDeltas(w *bitstream.Writer, ts []int64) {
 	tDelta := ts[1] - ts[0]
 	w.WriteUvarint(uint64(tDelta))
 
-	// Row 2+: delta-of-delta.
 	prevDelta := tDelta
 	for i := 2; i < len(ts); i++ {
 		tDelta = ts[i] - ts[i-1]
@@ -51,15 +87,76 @@ func EncodeTimestamps(dst []byte, ts []int64) []byte {
 
 		writeDoD(w, dod)
 	}
+}
 
-	w.PadToByte()
+// writeScaledDeltas is [writeDeltas] over deltas divided by scale, which divides every one of them.
+func writeScaledDeltas(w *bitstream.Writer, ts []int64, scale int64) {
+	tDelta := (ts[1] - ts[0]) / scale
+	w.WriteUvarint(uint64(tDelta))
 
-	return w.Bytes()
+	prevDelta := tDelta
+	for i := 2; i < len(ts); i++ {
+		tDelta = (ts[i] - ts[i-1]) / scale
+		dod := tDelta - prevDelta
+		prevDelta = tDelta
+
+		writeDoD(w, dod)
+	}
+}
+
+// tsScale returns the largest of 10^9, 10^6, 10^3 and 1 that divides every first difference of ts.
+//
+// It is a fixed ladder rather than a gcd: the only scales worth finding are the units timestamps are
+// produced in, and testing three constants lets the compiler turn each modulo into a multiply. The
+// scale only ever steps down, so an ns-entropic column is settled by its first delta.
+//
+// Deltas are computed with int64 wraparound, exactly as the decoder recomputes them, so a delta that
+// overflows still round-trips: d%scale == 0 means d == (d/scale)*scale with no overflow.
+func tsScale(ts []int64) int64 {
+	scale := int64(1e9)
+	for i := 1; i < len(ts); i++ {
+		d := ts[i] - ts[i-1]
+		for !divides(scale, d) {
+			scale /= 1000
+		}
+
+		if scale == 1 {
+			return 1
+		}
+	}
+
+	return scale
+}
+
+func divides(scale, d int64) bool {
+	switch scale {
+	case 1e9:
+		return d%1e9 == 0
+	case 1e6:
+		return d%1e6 == 0
+	case 1e3:
+		return d%1e3 == 0
+	default:
+		return true
+	}
+}
+
+func validScale(scale uint64) bool {
+	return scale == 1 || scale == 1e3 || scale == 1e6 || scale == 1e9
 }
 
 // DecodeTimestamps decodes a DoD-encoded timestamp column from src into dst (growing
 // it as needed) and returns the result with the number of source bytes consumed.
 func DecodeTimestamps(dst []int64, src []byte) ([]int64, int, error) {
+	return decodeTimestamps(dst, src, false)
+}
+
+// DecodeTimestampsScaled decodes a [CodecDoDScaled] column written by [EncodeTimestampsScaled].
+func DecodeTimestampsScaled(dst []int64, src []byte) ([]int64, int, error) {
+	return decodeTimestamps(dst, src, true)
+}
+
+func decodeTimestamps(dst []int64, src []byte, scaled bool) ([]int64, int, error) {
 	r, rows, consumed, err := readHeader(src)
 	if err != nil {
 		return dst, 0, err
@@ -91,27 +188,77 @@ func DecodeTimestamps(dst []int64, src []byte) ([]int64, int, error) {
 		return dst, consumed + r.ConsumedBytes(), nil
 	}
 
-	// Row 1.
-	td64, err := r.ReadUvarint()
+	scale := int64(1)
+	if scaled {
+		s, err := r.ReadUvarint()
+		if err != nil {
+			return dst, 0, err
+		}
+
+		if !validScale(s) {
+			return dst, 0, errUnexpectedEOF
+		}
+
+		scale = int64(s)
+	}
+
+	if scale == 1 {
+		err = readDeltas(r, dst)
+	} else {
+		err = readScaledDeltas(r, dst, scale)
+	}
+
 	if err != nil {
 		return dst, 0, err
+	}
+
+	return dst, consumed + r.ConsumedBytes(), nil
+}
+
+// readDeltas fills dst[1:] from the row-1 delta and the rows-2+ delta-of-delta stream; dst[0] is set.
+func readDeltas(r *bitstream.Reader, dst []int64) error {
+	td64, err := r.ReadUvarint()
+	if err != nil {
+		return err
 	}
 
 	tDelta := int64(td64)
 	dst[1] = dst[0] + tDelta
 
-	// Row 2+.
-	for i := 2; i < rows; i++ {
+	for i := 2; i < len(dst); i++ {
 		dod, err := readDoD(r)
 		if err != nil {
-			return dst, 0, err
+			return err
 		}
 
 		tDelta += dod
 		dst[i] = dst[i-1] + tDelta
 	}
 
-	return dst, consumed + r.ConsumedBytes(), nil
+	return nil
+}
+
+// readScaledDeltas is [readDeltas] for deltas stored divided by scale.
+func readScaledDeltas(r *bitstream.Reader, dst []int64, scale int64) error {
+	td64, err := r.ReadUvarint()
+	if err != nil {
+		return err
+	}
+
+	tDelta := int64(td64)
+	dst[1] = dst[0] + tDelta*scale
+
+	for i := 2; i < len(dst); i++ {
+		dod, err := readDoD(r)
+		if err != nil {
+			return err
+		}
+
+		tDelta += dod
+		dst[i] = dst[i-1] + tDelta*scale
+	}
+
+	return nil
 }
 
 // writeDoD writes a delta-of-delta value using the 5-case prefix.

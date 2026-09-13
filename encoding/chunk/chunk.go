@@ -41,6 +41,12 @@ const (
 	// self-describing flag in the stream, so [DecodeBytes]/[DecodeBytesDict] handle it without
 	// consulting the codec.
 	CodecBytesRaw
+	// CodecDoDScaled is [CodecDoD] with each stream's timestamp scale (10^9, 10^6, 10^3 or 1)
+	// divided out of its deltas and stored in the stream, so ms- or s-aligned timestamps held at ns
+	// cost what they would at their own resolution. Lossless. The scale is per stream — per granule
+	// for a blocked column — never per part: a streaming writer seals granules before it could know
+	// a part-wide scale.
+	CodecDoDScaled
 )
 
 // String returns a stable lower-case codec name.
@@ -62,6 +68,8 @@ func (c Codec) String() string {
 		return "id128"
 	case CodecBytesRaw:
 		return "bytesraw"
+	case CodecDoDScaled:
+		return "dodscaled"
 	default:
 		return "unknown"
 	}

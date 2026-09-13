@@ -30,6 +30,16 @@ func blockCases() []blockCase {
 			}
 			return Column{Name: "ts", Kind: KindInt64, Codec: chunk.CodecDoD, Int64: v, Block: true}
 		}, true},
+		{"dodscaled", func(n int) Column {
+			v := make([]int64, n)
+			for i := range v {
+				v[i] = 1_700_000_000_000_000_000 + int64(i)*15_000_000 // ms-aligned
+			}
+			if n > 10 {
+				v[10] += 7 // one ns-entropic row, so granules settle on different scales
+			}
+			return Column{Name: "ts", Kind: KindInt64, Codec: chunk.CodecDoDScaled, Int64: v, Block: true}
+		}, true},
 		{"t64", func(n int) Column {
 			v := make([]int64, n)
 			for i := range v {
@@ -301,23 +311,37 @@ func TestBlockedCursor(t *testing.T) {
 		vals[i] = float64(i)*2.5 + 1
 	}
 
-	tsDesc, tsObj, err := buildColumn(Column{Name: "ts", Kind: KindInt64, Codec: chunk.CodecDoD, Int64: ts, Block: true}, noneComp(), blockRows, defaultCompressBlockBytes)
-	require.NoError(t, err)
-	require.True(t, tsDesc.Blocked)
-
-	cur, err := newColumnReader(tsDesc, tsObj, noneComp(), n).TsCursor()
-	require.NoError(t, err)
-	assert.Equal(t, n, cur.Len())
-
+	scaledTs := make([]int64, n)
 	for i := range n {
-		assert.Equal(t, i, cur.Pos())
-		got, err := cur.Next()
-		require.NoError(t, err)
-		assert.Equal(t, ts[i], got, "row %d", i)
+		scaledTs[i] = ts[i] * 1_000_000
 	}
+	scaledTs[9] += 3 // one ns-entropic block among ms-aligned ones
 
-	_, err = cur.Next()
-	require.Error(t, err, "cursor past the end errors")
+	for _, tc := range []struct {
+		codec chunk.Codec
+		ts    []int64
+	}{
+		{chunk.CodecDoD, ts},
+		{chunk.CodecDoDScaled, scaledTs},
+	} {
+		tsDesc, tsObj, err := buildColumn(Column{Name: "ts", Kind: KindInt64, Codec: tc.codec, Int64: tc.ts, Block: true}, noneComp(), blockRows, defaultCompressBlockBytes)
+		require.NoError(t, err)
+		require.True(t, tsDesc.Blocked)
+
+		cur, err := newColumnReader(tsDesc, tsObj, noneComp(), n).TsCursor()
+		require.NoError(t, err, "%s", tc.codec)
+		assert.Equal(t, n, cur.Len())
+
+		for i := range n {
+			assert.Equal(t, i, cur.Pos())
+			got, err := cur.Next()
+			require.NoError(t, err)
+			assert.Equal(t, tc.ts[i], got, "%s row %d", tc.codec, i)
+		}
+
+		_, err = cur.Next()
+		require.Error(t, err, "cursor past the end errors")
+	}
 
 	vDesc, vObj, err := buildColumn(Column{Name: "v", Kind: KindFloat64, Codec: chunk.CodecGorilla, Float64: vals, Block: true}, noneComp(), blockRows, defaultCompressBlockBytes)
 	require.NoError(t, err)

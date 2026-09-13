@@ -159,6 +159,8 @@ func appendBlockStream(dst []byte, c Column, codec chunk.Codec, budget uint8, lo
 	switch {
 	case c.Kind == KindInt64 && codec == chunk.CodecDoD:
 		return chunk.EncodeTimestamps(dst, c.Int64[lo:hi]), nil
+	case c.Kind == KindInt64 && codec == chunk.CodecDoDScaled:
+		return chunk.EncodeTimestampsScaled(dst, c.Int64[lo:hi]), nil
 	case c.Kind == KindInt64 && codec == chunk.CodecT64:
 		return chunk.EncodeIntsT64(dst, c.Int64[lo:hi]), nil
 	case c.Kind == KindFloat64 && codec == chunk.CodecGorilla:
@@ -1134,92 +1136,71 @@ func decodeOneBlockInto[T any](
 	return out, err
 }
 
-// blockedTsCursor is a forward [chunk.TsCursor] over a blocked int64 column: it decodes one block at
-// a time, opening the next block when the current is exhausted, so it spans block boundaries
-// transparently. Each block is an independent codec stream (its row 0 is absolute), so crossing a
-// boundary just starts a fresh per-block decoder — no cross-block state.
-type blockedTsCursor struct {
-	streams blockStreams
-	rows    int
-	pos     int
-	blk     int            // index of the open block; -1 before the first
-	cur     chunk.TsCursor // decoder for block blk; advanced past its end opens the next
+// rowCursor is the forward-cursor shape shared by [chunk.TsCursor] and [chunk.FloatDecoder].
+type rowCursor[T any] interface {
+	Len() int
+	Pos() int
+	Next() (T, error)
 }
 
-func newBlockedTsCursor(dir blockDir, comp *compress.Compressor, rows int) *blockedTsCursor {
-	return &blockedTsCursor{streams: newBlockStreams(dir, comp), rows: rows, blk: -1}
-}
-
-func (c *blockedTsCursor) Len() int { return c.rows }
-func (c *blockedTsCursor) Pos() int { return c.pos }
-
-func (c *blockedTsCursor) Next() (int64, error) {
-	for c.cur == nil || c.cur.Pos() >= c.cur.Len() {
-		c.blk++
-		if c.blk >= c.streams.dir.nBlocks() {
-			return 0, errCursorEOF
-		}
-
-		stream, err := c.streams.granule(c.blk)
-		if err != nil {
-			return 0, err
-		}
-
-		c.cur, err = chunk.NewTsDecoder(stream)
-		if err != nil {
-			return 0, errors.Wrapf(err, "block %d", c.blk)
-		}
-	}
-
-	v, err := c.cur.Next()
-	if err != nil {
-		return 0, err
-	}
-
-	c.pos++
-
-	return v, nil
-}
-
-// blockedFloatCursor is the float64 analog of [blockedTsCursor], over a blocked Gorilla/decimal
-// column.
-type blockedFloatCursor struct {
+// blockedCursor is a forward cursor over a blocked column: it decodes one block at a time, opening
+// the next block when the current is exhausted, so it spans block boundaries transparently. Each
+// block is an independent codec stream (its row 0 is absolute), so crossing a boundary just starts a
+// fresh per-block decoder — no cross-block state.
+type blockedCursor[T any, C rowCursor[T]] struct {
 	streams blockStreams
 	codec   chunk.Codec
+	open    func(chunk.Codec, []byte) (C, error)
 	rows    int
 	pos     int
-	blk     int
-	cur     chunk.FloatDecoder
+	blk     int  // index of the open block; -1 before the first
+	opened  bool // cur holds block blk's decoder
+	cur     C
+}
+
+type (
+	blockedTsCursor    = blockedCursor[int64, chunk.TsCursor]
+	blockedFloatCursor = blockedCursor[float64, chunk.FloatDecoder]
+)
+
+func newBlockedTsCursor(dir blockDir, comp *compress.Compressor, codec chunk.Codec, rows int) *blockedTsCursor {
+	return &blockedTsCursor{streams: newBlockStreams(dir, comp), codec: codec, open: chunk.NewTsCursor, rows: rows, blk: -1}
 }
 
 func newBlockedFloatCursor(dir blockDir, comp *compress.Compressor, codec chunk.Codec, rows int) *blockedFloatCursor {
-	return &blockedFloatCursor{streams: newBlockStreams(dir, comp), codec: codec, rows: rows, blk: -1}
+	return &blockedFloatCursor{streams: newBlockStreams(dir, comp), codec: codec, open: chunk.NewFloatDecoder, rows: rows, blk: -1}
 }
 
-func (c *blockedFloatCursor) Len() int { return c.rows }
-func (c *blockedFloatCursor) Pos() int { return c.pos }
+func (c *blockedCursor[T, C]) Len() int { return c.rows }
+func (c *blockedCursor[T, C]) Pos() int { return c.pos }
 
-func (c *blockedFloatCursor) Next() (float64, error) {
-	for c.cur == nil || c.cur.Pos() >= c.cur.Len() {
+func (c *blockedCursor[T, C]) Next() (T, error) {
+	var zero T
+
+	for !c.opened || c.cur.Pos() >= c.cur.Len() {
 		c.blk++
 		if c.blk >= c.streams.dir.nBlocks() {
-			return 0, errCursorEOF
+			return zero, errCursorEOF
 		}
 
 		stream, err := c.streams.granule(c.blk)
 		if err != nil {
-			return 0, err
+			return zero, err
 		}
 
-		c.cur, err = chunk.NewFloatDecoder(c.codec, stream)
+		c.cur, err = c.open(c.codec, stream)
 		if err != nil {
-			return 0, errors.Wrapf(err, "block %d", c.blk)
+			c.opened = false
+
+			return zero, errors.Wrapf(err, "block %d", c.blk)
 		}
+
+		c.opened = true
 	}
 
 	v, err := c.cur.Next()
 	if err != nil {
-		return 0, err
+		return zero, err
 	}
 
 	c.pos++
