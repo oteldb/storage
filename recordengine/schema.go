@@ -50,6 +50,17 @@ type Column struct {
 	Kind  Kind
 	Codec chunk.Codec
 	Bloom BloomMode
+
+	// Grams adds a second, independent per-part filter over the column's sparse n-grams, so an
+	// unanchored substring predicate prunes parts even when it holds no whole token to test
+	// ([fetch.Condition.Substrings]). It is orthogonal to Bloom — a column may carry both, and the
+	// two prune different queries: the token bloom is far cheaper and wins on values that tokenize
+	// cleanly, the gram index wins on identifiers, phrases and anything glued to its neighbors.
+	//
+	// It is not free: measured on real log bodies the gram filter is 4–5× the token bloom's bytes
+	// (3.4–5.9% of the part's on-disk size, resident while the part is live) and builds ~4.6×
+	// slower. Enable it per column, on columns whose substring queries matter. Bytes columns only.
+	Grams bool
 }
 
 // colRef locates a column within its kind's vector (recordCols.ints or recordCols.bytes).
@@ -98,6 +109,15 @@ func (s *Schema) ref(name string) (colRef, bool) {
 // intColumn / byteColumn return the Column metadata for the k-th column of that kind.
 func (s *Schema) intColumn(k int) Column  { return s.cols[s.intCols[k]] }
 func (s *Schema) byteColumn(k int) Column { return s.cols[s.byteCols[k]] }
+
+// hasGrams reports whether the named column carries a sparse-gram index ([Column.Grams]). A name
+// the schema does not know (a per-record attribute) never does — attribute conditions resolve
+// against the attrs blob, which the gram index does not key by attribute.
+func (s *Schema) hasGrams(name string) bool {
+	r, ok := s.byName[name]
+
+	return ok && r.kind == KindBytes && s.byteColumn(r.idx).Grams
+}
 
 // attrsByteCol returns the index (within the byte vector) of the column marked [BloomAttrs] — the
 // serialized per-record attributes — and whether the schema has one. Attribute conditions resolve

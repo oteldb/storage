@@ -368,6 +368,7 @@ decodes it.
 | lazy column decode | materialize only columns the conditions + projection reference |
 | one decode per part | rows distributed to per-stream accumulators, pre-sized from row-range counts |
 | bloom pruning | skip a part whose per-column bloom proves a required token or value absent |
+| gram pruning | skip a part whose opt-in sparse-gram filter proves a required substring absent (below) |
 | top-N pushdown (`limitscan.go`) | stop an *unfiltered* limited request once the watermark clears unread parts |
 | recycling | `Recycle` pools the per-stream accumulator via `Batch.SetReleaseState` |
 
@@ -386,6 +387,35 @@ stays linear in rows read.
 Beyond `Recycle`, part-decode int columns are **always** pooled: copied by value into accumulators,
 they are dead once a part is distributed. Conditions over a non-fixed column are per-record
 **attributes**, resolved by the zero-allocation `signal.LookupAttribute` over the `attrs` column.
+
+### Gram pruning (`gram.go`, `gramcache.go`)
+
+Opt-in per column via `Column.Grams`: a second filter over the column's **sparse n-grams**, probed by
+`Condition.Substrings`. It answers what the token bloom cannot: a substring literal holding no whole
+token (`trace[deadbeef…]`) yields no safe tokens, so the token bloom prunes nothing. Grams are chosen by
+a rule that reads only the bytes *inside* the gram, so a gram of the literal is a gram of every value
+containing it — no edge stripping, no anchoring. The two filters are independent and live in separate
+sidecars: a gram probe against a token bloom would report absent for a gram the column holds, pruning a
+matching part. Bounds (4–16 bytes) are format, stamped into the sidecar; a mismatch reads as absent,
+never misread. A literal shorter than the minimum prunes nothing (a scan, still correct). It is sized by
+distinct grams (the same `bloom.Sketch` estimate as the token blooms) and walks the same first-occurrence
+row set. Costly enough to be opt-in: measured on real log bodies, 4–5× the token bloom's bytes and ~4.6×
+slower to build.
+
+**Demand-loaded, unlike the blooms.** At 3.4–5.9% of a part's on-disk bytes, holding one per live part
+would make gram filters the largest resident term in the process. They are read per query through a
+weight-bounded loading cache (`Config.GramCacheBytes`, 64 MiB default) shared by all fetches, so memory
+tracks the queried working set, not the part count. The cache is `maypok86/otter`: the byte bound, the
+collapsing of concurrent misses into one backend read, and the caching of a negative verdict (this part
+has no sidecar — don't re-probe it) are all things a plain LRU would have to grow. Dedup is best-effort,
+which is sound because sidecars are immutable. Keys are part prefixes, which are minted and never reused,
+so an entry cannot be served for different content; `Reset` still invalidates the cache to free it.
+
+**The probe runs in the lock-free scan** (`readPartsLazy`), not in `planFetch` beside the bloom prune:
+it does backend I/O, and the plan phase holds the engine lock. It runs before granule selection, so a
+pruned part also skips its marks read. The hints are extracted once per request, not once per part. A
+pruned part is counted in `parts_pruned_gram`, separate from `parts_pruned_bloom` because it is a later,
+costlier prune (the part was acquired and its sidecar read); a sidecar read error degrades to a scan.
 
 ### Two-phase filtered fetch (`fetchlazy.go`)
 
@@ -427,6 +457,7 @@ relies on `Condition.Equal` being byte-identical to `Match` for that column — 
 | object | contents |
 |---|---|
 | `bloom-{col}.bin` | per-column token blooms |
+| `grams-{col}.bin` (version + gram bounds + `bloom.Filter`) | per-column **sparse-gram** filter, only for `Column.Grams` columns; a separate key from the token bloom because the two hold different sets |
 | `keys.bin` (`OTKY`, magic+version+CRC32C) | the part's distinct per-record **attribute keys** |
 | `sym-{name}.bin` (`OTSP`) | the optional **side store** |
 

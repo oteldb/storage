@@ -391,6 +391,16 @@ func (lz *lazyCols) cell(k, i int) []byte {
 // applies the conditions to the head-seeded prefix only (part rows already pass by construction).
 func (p *fetchPlan) readPartsLazy(ctx context.Context) error {
 	for _, part := range p.liveParts {
+		// Substring pruning happens here rather than in the plan phase because its filters are
+		// demand-loaded: reading a sidecar under the engine lock would block writers. A pruned part
+		// costs one sidecar read (usually a cache hit) and skips every column of the part.
+		if p.gramHints != nil &&
+			!part.gramsMayMatch(ctx, p.e.cfg.Backend, p.e.grams(), p.conds, p.gramHints) {
+			p.partsPrunedGram++
+
+			continue
+		}
+
 		// Granules the requested streams' rows occupy that the window can intersect; nil when
 		// nothing prunes, which keeps the whole-column decode on its simpler path.
 		blocks := part.windowGranules(ctx, p.sortedIDs, p.start, p.end)
