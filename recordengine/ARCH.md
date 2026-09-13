@@ -303,6 +303,14 @@ index, postings and per-stream watermarks on their own, since a flush drains rec
 sharing the head and a stream's first record is never late; the watermarks outlive a flush and are
 cleared only with the head.
 
+Every append is a *run* over one stream — a `Batch` is one stream, and so are WAL replay and the
+replica apply — so `head.appenderFor` resolves the record buffer and the watermark once per run
+(`streamAppender`) instead of per record, which costs two map reads and, on the common monotonic
+path, a map write for every record. The run carries its own watermark, so a record is still measured
+against the newest record ahead of it in the same run; `commit` publishes it. A run that admits
+nothing leaves the head untouched, which is what keeps `needsStreamRecord` true for a stream whose
+whole batch was rejected.
+
 ## Fetch
 
 Heavily tuned around decoding as little as possible.

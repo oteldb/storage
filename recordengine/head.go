@@ -197,15 +197,39 @@ func (h *head) ensureStream(id signal.SeriesID, materialize func() signal.Series
 // memory-backpressure reason the configurable cap uses.
 const headByteCap = math.MaxInt32
 
-// appendRecord appends r to stream id's buffer (already ensured, or created on demand for the
-// replica apply path), rejecting it as out-of-order when older than oooWindow behind *that stream's*
+// streamAppender appends a run of records to one stream. Every caller appends per stream — a
+// [Batch] is one stream, and so are WAL replay and the replica apply — so the stream's record buffer
+// and its out-of-order watermark are resolved once for the run instead of once per record, which is
+// two map reads and (on the common monotonic path) a map write that the per-record form pays every
+// time. [streamAppender.commit] writes the watermark back; the run's records are not visible to the
+// out-of-order check of a later run until it does.
+type streamAppender struct {
+	h     *head
+	id    signal.SeriesID
+	buf   *recordCols
+	ts    int64 // the stream's newest admitted timestamp, h.streamNewest[id] carried across the run
+	seen  bool
+	dirty bool
+}
+
+// appenderFor starts a run of appends to stream id. It does not create the stream's record buffer:
+// a run whose every record is rejected leaves the head exactly as it found it, so a stream that
+// [head.needsStreamRecord] would re-log stays that way.
+func (h *head) appenderFor(id signal.SeriesID) streamAppender {
+	ts, seen := h.streamNewest[id]
+
+	return streamAppender{h: h, id: id, buf: h.records[id], ts: ts, seen: seen}
+}
+
+// append appends r, rejecting it as out-of-order when older than oooWindow behind *that stream's*
 // newest admitted record (oooWindow > 0). A stream's first record is therefore never out of order,
 // however far behind its neighbors it is. It returns whether the record was accepted.
-func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow, maxBytes int64) admitOutcome {
-	streamNewest, seen := h.streamNewest[id]
-	if seen && oooWindow > 0 && r.ts < streamNewest-oooWindow {
+func (a *streamAppender) append(r rec, oooWindow, maxBytes int64) admitOutcome {
+	if a.seen && oooWindow > 0 && r.ts < a.ts-oooWindow {
 		return rejectOOO
 	}
+
+	h := a.h
 
 	// headByteCap is a format bound on the *next* part's column blobs, and a failed flush folds the
 	// detached buffers back into the live ones ([head.reattach]) — so the bound covers both sides of
@@ -215,17 +239,16 @@ func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow, maxBytes int64
 		return rejectBytes
 	}
 
-	buf := h.records[id]
-	if buf == nil {
-		buf = newRecordCols(h.schema, 0, fullSel(h.schema))
-		h.records[id] = buf
+	if a.buf == nil {
+		a.buf = newRecordCols(h.schema, 0, fullSel(h.schema))
+		h.records[a.id] = a.buf
 	}
 
-	buf.appendClone(r)
+	a.buf.appendClone(r)
 	h.grow(recByteSize(r))
 
-	if !seen || r.ts > streamNewest {
-		h.streamNewest[id] = r.ts
+	if !a.seen || r.ts > a.ts {
+		a.ts, a.seen, a.dirty = r.ts, true, true
 	}
 
 	if r.ts > h.newest {
@@ -233,6 +256,24 @@ func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow, maxBytes int64
 	}
 
 	return admitted
+}
+
+// commit publishes the run's out-of-order watermark. It must be called once the run is over, and
+// the appender is spent afterwards.
+func (a *streamAppender) commit() {
+	if a.dirty {
+		a.h.streamNewest[a.id] = a.ts
+	}
+}
+
+// appendRecord appends a single record to stream id's buffer, the one-record form of
+// [streamAppender].
+func (h *head) appendRecord(id signal.SeriesID, r rec, oooWindow, maxBytes int64) admitOutcome {
+	a := h.appenderFor(id)
+	out := a.append(r, oooWindow, maxBytes)
+	a.commit()
+
+	return out
 }
 
 // registerStream records and indexes a stream identity without records (WAL replay / load).
@@ -251,10 +292,13 @@ func (h *head) replayRecords(id signal.SeriesID, recs []rec) {
 		return // stream record missing; ignore (defensive)
 	}
 
+	a := h.appenderFor(id)
+	defer a.commit()
+
 	for i := range recs {
 		// Replay/replica records are authoritative: no admission limits. [headByteCap] still applies —
 		// it is a format bound, not a policy, and past it the head cannot be flushed at all.
-		h.appendRecord(id, recs[i], 0, 0)
+		a.append(recs[i], 0, 0)
 	}
 }
 

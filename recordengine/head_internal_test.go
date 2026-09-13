@@ -85,3 +85,45 @@ func TestHeadByteCapSurvivesReattach(t *testing.T) {
 	require.LessOrEqual(t, h.bytes, int64(headByteCap)+recByteSize(headTestRec(100)),
 		"reattach restores only what admission had already bounded")
 }
+
+// The out-of-order window is per stream, and a run of appends carries that stream's watermark in the
+// appender rather than in the map — so a record must still be measured against the newest record of
+// its own run, not only against what the head held when the run started.
+func TestStreamAppenderOOOWithinRun(t *testing.T) {
+	t.Parallel()
+
+	id := signal.SeriesID{Hi: 1}
+	h := newHead(headTestSchema)
+
+	a := h.appenderFor(id)
+	require.Equal(t, admitted, a.append(headTestRec(1000), 100, 0), "a stream's first record is never out of order")
+	require.Equal(t, admitted, a.append(headTestRec(2000), 100, 0))
+	require.Equal(t, rejectOOO, a.append(headTestRec(1500), 100, 0),
+		"measured against the run's own newest, not the watermark the run started with")
+	require.Equal(t, admitted, a.append(headTestRec(1950), 100, 0))
+	a.commit()
+
+	require.Equal(t, int64(2000), h.streamNewest[id], "commit publishes the run's newest")
+	require.Equal(t, rejectOOO, h.appendRecord(id, headTestRec(1500), 100, 0),
+		"a later run sees the committed watermark")
+}
+
+// A run that admits nothing must leave the head exactly as it found it: a stream whose buffer does
+// not exist stays without one, so [head.needsStreamRecord] still reports that its identity has to be
+// logged again before its records are.
+func TestStreamAppenderRejectedRunCreatesNothing(t *testing.T) {
+	t.Parallel()
+
+	id := signal.SeriesID{Hi: 1}
+	h := newHead(headTestSchema)
+	h.bytes = headByteCap
+
+	require.True(t, h.needsStreamRecord(id))
+
+	a := h.appenderFor(id)
+	require.Equal(t, rejectBytes, a.append(headTestRec(100), 0, 0))
+	a.commit()
+
+	require.True(t, h.needsStreamRecord(id), "a fully rejected run leaves no record buffer behind")
+	require.NotContains(t, h.streamNewest, id, "and no out-of-order watermark")
+}
