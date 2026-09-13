@@ -54,6 +54,10 @@ func crash(t *testing.T, s *Storage) {
 	for _, e := range s.profileEngineSnapshot() {
 		require.NoError(t, e.CloseWAL())
 	}
+
+	for _, e := range s.exemplarEngineSnapshot() {
+		require.NoError(t, e.CloseWAL())
+	}
 }
 
 // TestWALRecoversUnflushedMetrics writes metrics to a WAL-backed durable store, abandons it (no

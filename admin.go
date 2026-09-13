@@ -106,7 +106,7 @@ func (a Admin) CompactNow(ctx context.Context, key signal.TenantID, sig signal.S
 		return nil
 	}
 
-	cutoff := a.s.retainFrom(key, a.s.sizeCutoffFor(ctx, tenantOfShard(key)).at(sig))
+	cutoff := a.s.retainFrom(key, sig, a.s.sizeCutoffFor(ctx, tenantOfShard(key)).at(sig))
 
 	return eng.MergeWith(ctx, recordengine.MergeOptions{RetainFrom: cutoff, Force: true})
 }
@@ -114,7 +114,7 @@ func (a Admin) CompactNow(ctx context.Context, key signal.TenantID, sig signal.S
 // Retention forces a retention sweep across all of a tenant/shard's signals by compacting each
 // (a merge drops parts older than the policy's cutoff). Signals this node does not own are skipped.
 func (a Admin) Retention(ctx context.Context, key signal.TenantID) error {
-	for _, sig := range []signal.Signal{signal.Metric, signal.Log, signal.Trace, signal.Profile} {
+	for _, sig := range []signal.Signal{signal.Metric, signal.Log, signal.Trace, signal.Profile, signal.Exemplar} {
 		if err := a.Compact(ctx, key, sig); err != nil && !errors.Is(err, ErrNotOwner) {
 			return err
 		}
@@ -152,7 +152,7 @@ func (a Admin) PruneIdentities(ctx context.Context, key signal.TenantID) (int, e
 		total += n
 	}
 
-	for _, sig := range []signal.Signal{signal.Log, signal.Trace, signal.Profile} {
+	for _, sig := range recordSignals {
 		eng, ok := a.s.lookupRecordEngine(sig, norm)
 		if !ok {
 			continue
@@ -257,7 +257,7 @@ func (a Admin) compactFn(ctx context.Context, sig signal.Signal, key signal.Tena
 		return nil, false
 	}
 
-	cutoff := a.s.retainFrom(key, a.s.sizeCutoffFor(ctx, tenantOfShard(key)).at(sig))
+	cutoff := a.s.retainFrom(key, sig, a.s.sizeCutoffFor(ctx, tenantOfShard(key)).at(sig))
 
 	return func(ctx context.Context) error { return eng.Merge(ctx, cutoff) }, true
 }
@@ -306,6 +306,10 @@ func (s *Storage) allEngineKeys() []string {
 	}
 
 	for tid := range s.profileEngineSnapshotByTenant() {
+		seen[tid] = struct{}{}
+	}
+
+	for tid := range s.exemplarEngineSnapshotByTenant() {
 		seen[tid] = struct{}{}
 	}
 

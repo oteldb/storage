@@ -149,6 +149,7 @@ func (s *Storage) bootstrapShard(ctx context.Context, tid signal.TenantID) bool 
 		{logsPrefix, signal.Log},
 		{tracesPrefix, signal.Trace},
 		{profilesPrefix, signal.Profile},
+		{exemplarsPrefix, signal.Exemplar},
 	} {
 		if s.hasEngine(sp.sig, tid) {
 			continue

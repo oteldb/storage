@@ -15,14 +15,18 @@ const (
 	Trace
 	// Profile is the profiles signal (later vertical).
 	Profile
+	// Exemplar is the metric-exemplars signal: record-shaped rows keyed by the metric series
+	// identity they hang off (see signal/exemplar).
+	Exemplar
 )
 
 // Stable lower-case signal names (used by [Signal.String] and [ParseSignal]).
 const (
-	nameMetric  = "metric"
-	nameLog     = "log"
-	nameTrace   = "trace"
-	nameProfile = "profile"
+	nameMetric   = "metric"
+	nameLog      = "log"
+	nameTrace    = "trace"
+	nameProfile  = "profile"
+	nameExemplar = "exemplar"
 )
 
 // String returns a lower-case signal name. It is stable.
@@ -36,6 +40,8 @@ func (s Signal) String() string {
 		return nameTrace
 	case Profile:
 		return nameProfile
+	case Exemplar:
+		return nameExemplar
 	default:
 		return "unknown"
 	}
@@ -53,6 +59,8 @@ func ParseSignal(s string) (Signal, error) {
 		return Trace, nil
 	case nameProfile:
 		return Profile, nil
+	case nameExemplar:
+		return Exemplar, nil
 	default:
 		return 0, errors.Wrapf(ErrUnknownSignal, "unknown signal kind %q", s)
 	}

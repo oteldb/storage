@@ -1,15 +1,21 @@
-# `recordengine/` — the shared record engine (logs · traces · profiles)
+# `recordengine/` — the shared record engine (logs · traces · profiles · exemplars)
 
-A record-shaped signal is a **stream** — a Resource+Scope identity, indexed by postings exactly like a
+A record-shaped signal is a **stream** — a `signal.Series` identity, indexed by postings exactly like a
 metric series — of rows carrying a primary timestamp plus a fixed set of typed columns. A record's
 fields vary *within* the stream, unlike a metric's `(ts, float)` sample, so they are **columns filtered
 by predicate**, not identity. Hence the dual-shape contract: **Matchers resolve the stream, Conditions
 filter its records** (see [`../query/ARCH.md`](../query/ARCH.md)).
 
-All three signals share this engine; only the column schema, the projection and (profiles) a side
+All four signals share this engine; only the column schema, the projection and (profiles) a side
 store differ. It is the metrics engine's structural twin — head, flush, size-tiered merge with
 retention, durable bucket-index, part-scoped identity, stateless read path, `MaxPartBytes` splitting,
 and the same lock discipline ([`../engine/ARCH.md`](../engine/ARCH.md)).
+
+**All three of the identity's attribute sets are postings-indexed** — resource, scope, and the
+signal-level `Series.Attributes`. Logs, traces and profiles leave the last empty (their per-record
+attributes are a column, and profiles fold their type labels into the resource), so it costs them
+nothing. Exemplars carry the metric's data-point attributes and reserved labels (`__name__`, …)
+there, and a metric selector resolves exemplar streams only because those are matchable.
 
 ## Divergences from the metrics engine
 
@@ -439,7 +445,7 @@ engine's derived sidecars (`../engine/ARCH.md`), which fall back on absent or co
 
 `keys.bin` holds keys, not values: the schema does not bound values, while keys are tiny.
 `Engine.Keys` enumerates them across head ∪ in-window parts tagged with a `KeyScope` bitset
-(resource/scope/record), so an embedder can list and push down record-attribute labels that
+(resource/scope/series/record), so an embedder can list and push down record-attribute labels that
 `Series`-based resolution cannot see. It is the enumeration twin of `Engine.Series`.
 
 **Values** need no sidecar: `Engine.ColumnValues` (`values.go`) unions each in-window part's

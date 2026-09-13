@@ -81,7 +81,7 @@ func (s *Storage) ColumnValues(ctx context.Context, tenant signal.TenantID, req 
 // have no per-record columns to enumerate).
 func isRecordSignal(sig signal.Signal) bool {
 	switch sig {
-	case signal.Log, signal.Trace, signal.Profile:
+	case signal.Log, signal.Trace, signal.Profile, signal.Exemplar:
 		return true
 	default:
 		return false

@@ -77,9 +77,10 @@ func (s *Storage) noteRecoveryGaps() {
 	}
 
 	for sig, engines := range map[signal.Signal]map[signal.TenantID]*recordengine.Engine{
-		signal.Log:     s.logEngineSnapshotByTenant(),
-		signal.Trace:   s.traceEngineSnapshotByTenant(),
-		signal.Profile: s.profileEngineSnapshotByTenant(),
+		signal.Log:      s.logEngineSnapshotByTenant(),
+		signal.Trace:    s.traceEngineSnapshotByTenant(),
+		signal.Profile:  s.profileEngineSnapshotByTenant(),
+		signal.Exemplar: s.exemplarEngineSnapshotByTenant(),
 	} {
 		for tid, eng := range engines {
 			if eng.HeadRecordCount() == 0 {

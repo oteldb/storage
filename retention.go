@@ -11,19 +11,21 @@ import (
 	"github.com/oteldb/storage/tenant"
 )
 
-// retentionCutoff converts a retention window into an absolute cutoff at the given now (unix
-// nanoseconds); 0 means retain forever.
-func retentionCutoff(r tenant.Retention, now int64) int64 {
-	if r.MaxAge <= 0 {
+// retentionCutoff converts a signal's retention window into an absolute cutoff at the given now
+// (unix nanoseconds); 0 means retain forever. The window is per signal ([tenant.Retention.AgeFor]),
+// so exemplars can expire ahead of the samples they hang off.
+func retentionCutoff(r tenant.Retention, sig signal.Signal, now int64) int64 {
+	age := r.AgeFor(sig)
+	if age <= 0 {
 		return 0
 	}
 
-	return now - r.MaxAge.Nanoseconds()
+	return now - age.Nanoseconds()
 }
 
 // signalCount is one past the highest [signal.Signal] value, so a [signal.Signal] indexes a
 // bySignal array directly. Index 0 is unused (no signal has that value).
-const signalCount = int(signal.Profile) + 1
+const signalCount = int(signal.Exemplar) + 1
 
 // bySignal is one int64 per signal, indexed by [signal.Signal]. It carries both a tenant's
 // per-signal byte budgets and the cutoffs they resolve to, which is why it is a plain array: the
