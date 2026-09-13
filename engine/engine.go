@@ -1580,7 +1580,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 			return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
 		}
 
-		p, err := openPart(ctx, e.cfg.Backend, prefix)
+		p, err := openPart(ctx, e.cfg.Backend, prefix, e.cfg.Obs.Corruption)
 		if err != nil {
 			return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
 		}

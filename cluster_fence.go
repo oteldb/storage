@@ -45,6 +45,7 @@ func (s *Storage) checkPrimaryClaim(ctx context.Context, sig signal.Signal, shar
 
 	s.obs.Logger(ctx).Warn("refusing primary write: this node can no longer prove it holds the shard",
 		zap.Stringer("signal", sig), zap.String("shard", shardKey))
+	s.obs.Cluster.PrimaryRefused(ctx, sig.String())
 
 	return errors.Wrapf(cluster.ErrNotPrimary, "shard %q", shardKey)
 }

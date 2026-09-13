@@ -112,7 +112,7 @@ func (s *Storage) recordMembershipHealth(ctx context.Context) {
 	total := s.cluster.membership.Rejoins()
 	delta := total - s.cluster.reportedRejoins.Swap(total)
 
-	s.obs.Cluster.Record(ctx, s.cluster.membership.SelfAbsent(), delta)
+	s.obs.Cluster.Record(ctx, s.cluster.membership.SelfAbsent(), s.fenced(), delta)
 }
 
 // rfFor resolves the replication factor for one shard key: the tenant's

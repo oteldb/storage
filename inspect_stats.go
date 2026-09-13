@@ -64,3 +64,20 @@ type MaintenanceStats struct {
 	// count means ingestion is filling heads faster than the flush cadence drains them.
 	PressureFlushes int64
 }
+
+// walSyncCounters is the background WAL fsync outcome, snapshotted into [WALSyncStats] by Inspect.
+type walSyncCounters struct {
+	failures atomic.Int64
+	failing  atomic.Bool
+}
+
+// WALSyncStats is the background WAL fsync loop's health ([WALSyncInterval] mode; zero otherwise).
+type WALSyncStats struct {
+	// Failures is the background fsyncs that failed since process start, summed over every engine's
+	// WAL.
+	Failures int64
+	// Failing is true while the most recent sync pass had a failure. Writes acknowledged meanwhile
+	// are in the page cache but not on disk, so WALSyncInterval's power-loss bound does not hold
+	// until it clears.
+	Failing bool
+}

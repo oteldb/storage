@@ -122,10 +122,13 @@ func TestLoadPartsSweepsOrphanParts(t *testing.T) {
 	require.Len(t, orphans, 1)
 	require.NotEmpty(t, partObjects(t, be, orphans[0]))
 
+	objects := len(partObjects(t, be, orphans[0]))
+
 	// Restart: the index names no part, so the orphan is swept and its id is not reused.
-	r := newEngine(t, be)
+	r, m := newObservedEngine(t, be)
 	require.NoError(t, r.LoadParts(ctx))
 	require.Empty(t, partObjects(t, be, orphans[0]), "an orphan part's objects must be swept at open")
+	require.Equal(t, int64(objects), m.Counter("storage.parts.orphans_swept"))
 
 	ingest(t, r, mkBatch("api", rrec{ts: 200, body: "live"}))
 	require.NoError(t, r.Flush(ctx))

@@ -419,7 +419,7 @@ func (e *Engine) writeMergedPart(ctx context.Context, src []*part, f *flushColum
 		return nil, err
 	}
 
-	p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix)
+	p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, e.cfg.Obs.Corruption)
 	if err != nil {
 		return nil, err
 	}

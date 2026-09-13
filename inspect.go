@@ -24,6 +24,8 @@ type StoreStats struct {
 	Caches CacheStats
 	// Maintenance describes the background maintenance loop (cycles, recency, last-cycle size).
 	Maintenance MaintenanceStats
+	// WALSync is the background WAL fsync loop's health.
+	WALSync WALSyncStats
 }
 
 // TenantStats is one tenant's per-signal breakdown plus its (cross-signal) admission counters.
@@ -146,6 +148,14 @@ type ClusterStats struct {
 	// number that keeps climbing means the lease TTL (cluster.Config.MemberTTL) is too tight
 	// for this environment.
 	Rejoins int64
+	// Fenced reports that this node is past its membership lease's fence deadline: it cannot prove
+	// it owns any shard, so it refuses primary writes and stops flushing while still serving reads.
+	// It is derived from the last keep-alive etcd answered, not from the connection, so during an
+	// etcd partition it turns true on time while SelfAbsent still reads false.
+	Fenced bool
+	// FenceDeadlineUnixNano is the instant this node stops being able to prove its claims (last
+	// keep-alive + lease TTL − margin); zero when it holds no lease at all.
+	FenceDeadlineUnixNano int64
 	// PartSync is the shared-nothing part-mirroring activity (cluster/partsync), cumulative since
 	// process start; nil unless the cluster runs with a private (per-node) backend.
 	PartSync *PartSyncStats
@@ -292,6 +302,10 @@ func (s *Storage) Inspect() StoreStats {
 		LastCycleTasks:         s.maintStats.lastTasks.Load(),
 		PressureFlushes:        s.maintStats.pressureFlushes.Load(),
 	}
+	out.WALSync = WALSyncStats{
+		Failures: s.walSync.failures.Load(),
+		Failing:  s.walSync.failing.Load(),
+	}
 
 	return out
 }
@@ -308,6 +322,11 @@ func (s *Storage) clusterStats() *ClusterStats {
 		PrivateBackend: s.cluster.private,
 		SelfAbsent:     s.cluster.membership.SelfAbsent(),
 		Rejoins:        s.cluster.membership.Rejoins(),
+		Fenced:         s.cluster.membership.Fenced(),
+	}
+
+	if d := s.cluster.membership.FenceDeadline(); !d.IsZero() {
+		cs.FenceDeadlineUnixNano = d.UnixNano()
 	}
 
 	for _, m := range s.cluster.membership.Members() {

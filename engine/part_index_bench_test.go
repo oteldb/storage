@@ -9,6 +9,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -74,7 +75,7 @@ func BenchmarkPartIndexLookup(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		paged, ok := openPagedIndex(context.Background(), be, "p", len(col))
+		paged, ok := openPagedIndex(context.Background(), be, "p", len(col), obs.NewNop().Corruption)
 		if !ok {
 			b.Fatal("paged index did not open")
 		}

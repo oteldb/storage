@@ -33,20 +33,21 @@ type Config struct {
 // Obs is the observability handle passed to each subsystem. Log and Tracer are always non-nil
 // (no-op when unconfigured); Admission holds the ingest meta-metrics.
 type Obs struct {
-	Log       *zap.Logger
-	Tracer    trace.Tracer
-	Admission *Admission
-	Head      *Head
-	Flush     *Flush
-	Merge     *Merge
-	Parts     *Parts
-	Fetch     *Fetch
-	Backend   *Backend
-	WAL       *WAL
-	RPC       *RPC
-	Cluster   *Cluster
-	Disk      *Disk
-	Repair    *Repair
+	Log        *zap.Logger
+	Tracer     trace.Tracer
+	Admission  *Admission
+	Head       *Head
+	Flush      *Flush
+	Merge      *Merge
+	Parts      *Parts
+	Fetch      *Fetch
+	Backend    *Backend
+	WAL        *WAL
+	RPC        *RPC
+	Cluster    *Cluster
+	Disk       *Disk
+	Repair     *Repair
+	Corruption *Corruption
 }
 
 // New builds the observability handle, defaulting each unset pillar to its no-op implementation.
@@ -119,21 +120,27 @@ func New(cfg Config) (*Obs, error) {
 		return nil, err
 	}
 
+	corruption, err := newCorruption(meter)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Obs{
-		Log:       log,
-		Tracer:    tp.Tracer(scope),
-		Admission: adm,
-		Head:      head,
-		Flush:     flush,
-		Merge:     merge,
-		Parts:     parts,
-		Fetch:     fetch,
-		Backend:   backend,
-		WAL:       wal,
-		RPC:       rpc,
-		Cluster:   cl,
-		Disk:      disk,
-		Repair:    repair,
+		Log:        log,
+		Tracer:     tp.Tracer(scope),
+		Admission:  adm,
+		Head:       head,
+		Flush:      flush,
+		Merge:      merge,
+		Parts:      parts,
+		Fetch:      fetch,
+		Backend:    backend,
+		WAL:        wal,
+		RPC:        rpc,
+		Cluster:    cl,
+		Disk:       disk,
+		Repair:     repair,
+		Corruption: corruption,
 	}, nil
 }
 

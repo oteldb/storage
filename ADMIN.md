@@ -30,7 +30,13 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
   owned shards, and the last enacted rebalance plan (`LastRebalance`: each changed shard's full
   owner-set diff at its per-tenant replication factor — the replicas that must backfill, not just
   the compaction-primary move). `PrivateBackend` echoes the configured
-  `cluster.Config.PrivateBackend`. The mismatch needs no diagnostic: a node-private backend
+  `cluster.Config.PrivateBackend`. `Fenced` is true while the node is past its membership lease's
+  fence deadline (`FenceDeadlineUnixNano`: last keep-alive + TTL − margin, zero with no lease): it
+  refuses every primary write with `cluster.ErrNotPrimary` and stops flushing, while still serving
+  reads. It is not `SelfAbsent`, which flips only when the keep-alive stream closes: during an etcd
+  partition — the case fencing exists for — a node can be fenced for many seconds while `SelfAbsent`
+  still reads false, and `Owned` merely reads empty, which looks like owning nothing.
+  The mismatch needs no diagnostic: a node-private backend
   (`backend.NodeLocal`) with `PrivateBackend` unset fails `Open` outright, since no flushed part
   would replicate and a shard gained in a rebalance — or a restarted replica — would answer reads
   missing whatever only its peers hold, indistinguishable from real absence. With a private
@@ -58,6 +64,10 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
   recent cycle), and `PressureFlushes` (engines flushed by the head-size trigger
   `Options.FlushThresholdBytes` rather than by the interval — a rising count means ingestion is
   filling heads faster than the flush cadence drains them).
+- `StoreStats.WALSync` — the background fsync loop (`WALSyncInterval` mode): cumulative `Failures`,
+  and `Failing`, true while the latest sync pass had one. While it stands, acknowledged writes sit in
+  the page cache rather than on disk, so the interval's power-loss bound does not hold. The error is
+  logged once when a failing run starts, and a recovery line once it ends.
 
 `SignalStats` (one per `(tenant, signal)`):
 
@@ -219,6 +229,11 @@ Metric instruments (all prefixed `storage.`):
 | `disk.out_of_space` | `signal` | gauge: 1 while an engine refuses writes for want of bytes or inodes. Alertable on its own — the node looks healthy while it is happening, and nothing else distinguishes it from a slow backend |
 | `disk.rejected_writes` | `signal` | writes refused because the medium cannot store them, published with the gauge on each flush attempt (the ingest path that counts them carries no context of its own). Rises only while the gauge stands |
 | `wal.appends` / `wal.fsyncs` / `wal.rotations` | — | WAL activity |
+| `wal.sync_failures` / `wal.sync_failing` | — | background fsyncs that failed, and a gauge: 1 while the latest sync pass had a failure (`StoreStats.WALSync`). A non-zero gauge means `WALSyncInterval`'s power-loss bound is not holding; the sync retries every tick, so it clears on its own once the disk recovers |
+| `corruption.detected` | `component`, `disposition` | on-disk artifacts that failed an integrity check. `disposition=fatal` is an operation that failed on one: a corrupt WAL segment (`component=wal`) fails `Open`; a corrupt manifest or bucket index (`part`, `bucket_index`) fails the load. These count only errors carrying a corruption sentinel, never a backend that failed to answer. `disposition=tolerated` is corruption the engine fell back from and served on: a bloom sidecar (`bloom` — the part stops pruning on that column), a part's identity object (`part_identity` — its rows stay unresolvable until a merge rewrites the part), the paged series index or series-stats sidecar (`series_index`, `series_stats` — slower opens and aggregates), marks (`marks` — no granule pruning), an adopted part (`part` — left out of the read set). A tolerated artifact counts at every open or first read that meets it, so a steady rate is one damaged part read repeatedly, not new damage |
+| `parts.orphans_swept` | `signal` | part objects no index entry names, deleted by the sweep at open: what failed flushes and merges of the previous process left behind. It moves only at `Open` — a flush that fails at runtime leaves its objects until the next restart — so a flat line says nothing about orphans accumulating now |
+| `cluster.self_absent` / `cluster.fenced` | — | gauges, published once per maintenance cycle: 1 while this node is missing from the member set, and 1 while it is past its lease's fence deadline (`ClusterStats.Fenced`). Alert on `fenced` for a partition: it turns on at the deadline, while `self_absent` waits for the keep-alive stream to close. Sampled per cycle, it can miss a fence shorter than one |
+| `cluster.primary_refusals` | `signal` | writes this node refused as a shard primary because it could not prove its claim (`cluster.ErrNotPrimary`). Counted on the refusing node — the only one that knows why — on every refusal, so a fence shorter than a maintenance cycle still shows here |
 | `wal.segments` / `wal.bytes` | `signal` | gauges: the durability backlog on disk, published with the head gauges below. Segments accumulate exactly while flushes are not retiring them, so a rising count is `head.age` seen from the disk. Zero (not absent) for an engine with no WAL — the ephemeral in-memory one |
 | `head.bytes` / `head.items` / `head.series` / `head.identity_bytes` / `head.age` | `signal` | gauges: the unflushed side, which no `parts.*` gauge reaches. Published **before** the cycle's flushes, so they report the cycle's high-water mark rather than the empty head a healthy flush leaves behind. `age` is seconds since the head took its first bytes after the last flush (0 means an empty head, and only that — a live head is floored above 0, since a coarse clock would otherwise report a freshly filled one as empty) — the flush lag, and the oldest of this node's tenants rather than an average that a freshly drained one would hide. `series` / `identity_bytes` span the all-time identity set, which a flush does not drain (see `IdentityBytes` above) |
 | `parts.total` / `parts.sealed` / `parts.merge_backlog` / `parts.merge_candidates` / `parts.bytes` / `merge.cap_bytes` | `signal` | gauges: the merge selector's view of the parts, published once per maintenance cycle, summed over this node's tenants (`cap_bytes` is the largest threshold in effect, not a sum — it is a threshold, not a quantity). `merge_backlog` flat with `merge_candidates` pinned at 0 is the stuck engine above. `parts.bytes` over `parts.total` is the average part size, which says whether a rising count is parts that grew or a merge that stopped. Per-tenant detail is `Inspect`, which needs no meter |
