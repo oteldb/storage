@@ -186,19 +186,37 @@ func IsEOF(err error) bool {
 	return ok
 }
 
-// maxColumnRows is the defensive row-count ceiling for codecs whose row count is NOT bounded by the
-// stream length — a constant T64 column (only a 16-byte header) and a U128 RLE column (a run packs
-// many rows into a few bytes). It is a panic guard against a corrupt header requesting a giant make,
-// far above any real column; functional row counts are bounded by the embedder's flush thresholds,
-// and column streams come from CRC-validated parts.
+// readHeaderRows is [readHeader] for a codec whose stream cannot bound its own row count: the header
+// must state exactly want rows, the count the caller knows from the part, and anything else is
+// corrupt. It is checked before the caller sizes anything by it.
+func readHeaderRows(src []byte, want int) (r *bitstream.Reader, rows, consumed int, err error) {
+	if want < 0 {
+		return nil, 0, 0, errUnexpectedEOF
+	}
+
+	r, rows, consumed, err = readHeader(src)
+	if err != nil {
+		return r, 0, 0, err
+	}
+
+	if rows != want {
+		return r, 0, 0, errUnexpectedEOF
+	}
+
+	return r, rows, consumed, nil
+}
+
+// maxColumnRows is the row-count ceiling [NewDecimalDecoder] applies to its header. The cursor sizes
+// nothing by the count, so this only rejects an implausible one early. The decoders that do size an
+// allocation by a count the stream cannot bound — constant T64, U128 RLE — take it from the caller;
+// see [readHeaderRows].
 const maxColumnRows = 1 << 31
 
 // boundRows rejects, as a corrupt stream, a decoded row count that is negative — an int(uvarint)
 // that overflowed — or exceeds maxRows, the largest count the remaining stream could possibly
 // encode. Guarding before a decoder sizes its output slice keeps a corrupt header from triggering a
 // huge allocation. For bit-packed columns (DoD, Gorilla, T64 value blocks) every row consumes at
-// least one bit, so the caller passes maxRows = 8 × remaining bytes; for the unbounded-by-length
-// codecs the caller passes [maxColumnRows].
+// least one bit, so the caller passes maxRows = 8 × remaining bytes.
 func boundRows(rows, maxRows int) error {
 	if rows < 0 || rows > maxRows {
 		return errUnexpectedEOF

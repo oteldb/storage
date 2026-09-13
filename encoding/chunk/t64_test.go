@@ -36,7 +36,7 @@ func TestT64RoundTrip(t *testing.T) {
 
 			enc := EncodeIntsT64(nil, tc.vals)
 
-			got, _, err := DecodeIntsT64(nil, enc)
+			got, _, err := DecodeIntsT64(nil, enc, len(tc.vals))
 			require.NoError(t, err)
 			assert.Equal(t, tc.vals, got)
 		})

@@ -20,7 +20,7 @@ func TestDecodeCorrupt(t *testing.T) {
 	require.Error(t, err, "expected error from truncated floats")
 	// Truncated T64 stream.
 	enc = EncodeIntsT64(nil, []int64{1, 2, 3, 4, 5})
-	_, _, err = DecodeIntsT64(nil, enc[:3])
+	_, _, err = DecodeIntsT64(nil, enc[:3], 5)
 	require.Error(t, err, "expected error from truncated T64")
 	// Truncated decimal stream.
 	enc = EncodeFloatsDecimal(nil, []float64{1.0, 2.0, 3.0}, 64)

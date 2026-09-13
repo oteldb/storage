@@ -77,9 +77,13 @@ func EncodeIntsT64(dst []byte, vals []int64) []byte {
 	return w.Bytes()
 }
 
-// DecodeIntsT64 decodes a T64-encoded int64 column from src into dst.
-func DecodeIntsT64(dst []int64, src []byte) ([]int64, int, error) {
-	r, rows, consumed, err := readHeader(src)
+// DecodeIntsT64 decodes a T64-encoded int64 column from src into dst. It must hold exactly rows
+// values: a stream whose header states another count is corrupt.
+//
+// rows comes from the caller because the stream cannot bound it: a constant column is a 16-byte
+// header for any row count, so trusting the header would let a few corrupt bytes size the output.
+func DecodeIntsT64(dst []int64, src []byte, rows int) ([]int64, int, error) {
+	r, rows, consumed, err := readHeaderRows(src, rows)
 	if err != nil {
 		return dst, 0, err
 	}
@@ -120,13 +124,8 @@ func DecodeIntsT64(dst []int64, src []byte) ([]int64, int, error) {
 	numBits := valuableBits(umin, umax, minVal < 0 && maxVal >= 0)
 
 	if numBits == 0 {
-		// Constant column: only the 16-byte header, no per-row bytes — so the stream length gives no
-		// bound on rows. Cap defensively to keep a corrupt header from triggering a giant make; the
-		// ceiling is far above any real column and column streams come from CRC-validated parts.
-		if err := boundRows(rows, maxColumnRows); err != nil {
-			return dst, 0, err
-		}
-
+		// Constant column: only the 16-byte header, no per-row bytes. rows is the caller's, checked
+		// against the header above, so the allocation is what the caller asked for.
 		if cap(dst) < rows {
 			dst = resize(dst, rows)
 		}

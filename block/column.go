@@ -594,7 +594,7 @@ func (r *ColumnReader) ID128(dst []chunk.U128) ([]chunk.U128, error) {
 		return nil, err
 	}
 
-	out, _, err := chunk.DecodeU128(dst[:0], stream)
+	out, _, err := chunk.DecodeU128(dst[:0], stream, r.rows)
 
 	return out, err
 }
@@ -613,7 +613,7 @@ func fillConst[T any](dst []T, n int, v T) []T {
 // in turn (its object is a [blockDir] + per-block streams); an unblocked column decompresses its
 // single stream and decodes it. A nil decoder means the descriptor's codec does not match the
 // column's kind.
-func decodeColumn[T any](r *ColumnReader, dst []T, dec func([]T, []byte) ([]T, int, error)) ([]T, error) {
+func decodeColumn[T any](r *ColumnReader, dst []T, dec decodeFunc[T]) ([]T, error) {
 	if dec == nil {
 		return nil, errors.Errorf("block: codec %s invalid for column %q", r.desc.Codec, r.desc.Name)
 	}
@@ -632,7 +632,7 @@ func decodeColumn[T any](r *ColumnReader, dst []T, dec func([]T, []byte) ([]T, i
 		return nil, err
 	}
 
-	out, _, err := dec(dst[:0], stream)
+	out, _, err := dec(dst[:0], stream, r.rows)
 
 	return out, err
 }
@@ -660,7 +660,7 @@ func (r *ColumnReader) RangeFloat64(dst []float64, lo, hi int) ([]float64, error
 
 // decodeRange returns rows [lo,hi) of a column. A constant column repeats its value; a blocked column
 // decodes only the spanning blocks; an unblocked column decodes fully and slices.
-func decodeRange[T any](r *ColumnReader, dst []T, lo, hi int, constVal T, dec func([]T, []byte) ([]T, int, error)) ([]T, error) {
+func decodeRange[T any](r *ColumnReader, dst []T, lo, hi int, constVal T, dec decodeFunc[T]) ([]T, error) {
 	if lo < 0 || hi <= lo || hi > r.rows {
 		return nil, errors.Errorf("block: range [%d,%d) out of [0,%d) for column %q", lo, hi, r.rows, r.desc.Name)
 	}
@@ -679,7 +679,7 @@ func decodeRange[T any](r *ColumnReader, dst []T, lo, hi int, constVal T, dec fu
 			return nil, errors.Wrapf(err, "column %q", r.desc.Name)
 		}
 
-		return decodeBlockedRange(dir, r.comp, lo, hi, dst, dec)
+		return decodeBlockedRange(dir, r.comp, r.rows, lo, hi, dst, dec)
 	}
 
 	// Unblocked: decode the whole stream, then slice the requested rows.
@@ -688,7 +688,7 @@ func decodeRange[T any](r *ColumnReader, dst []T, lo, hi int, constVal T, dec fu
 		return nil, err
 	}
 
-	full, _, err := dec(dst[:0], stream)
+	full, _, err := dec(dst[:0], stream, r.rows)
 	if err != nil {
 		return nil, err
 	}
@@ -993,10 +993,10 @@ func (r *ColumnReader) blockedBytes() (blockDir, [][]byte, error) {
 
 // int64Decoder returns the per-block typed decoder for this column's codec, or nil for a codec that
 // is not an int64 codec (the caller reports the mismatch).
-func (r *ColumnReader) int64Decoder() func([]int64, []byte) ([]int64, int, error) {
+func (r *ColumnReader) int64Decoder() decodeFunc[int64] {
 	switch r.desc.Codec {
 	case chunk.CodecDoD:
-		return chunk.DecodeTimestamps
+		return rowsUnchecked(chunk.DecodeTimestamps)
 	case chunk.CodecT64:
 		return chunk.DecodeIntsT64
 	default:
@@ -1006,12 +1006,12 @@ func (r *ColumnReader) int64Decoder() func([]int64, []byte) ([]int64, int, error
 
 // float64Decoder returns the per-block typed decoder for this column's codec, or nil for a codec that
 // is not a float64 codec (the caller reports the mismatch).
-func (r *ColumnReader) float64Decoder() func([]float64, []byte) ([]float64, int, error) {
+func (r *ColumnReader) float64Decoder() decodeFunc[float64] {
 	switch r.desc.Codec {
 	case chunk.CodecGorilla:
-		return chunk.DecodeFloats
+		return rowsUnchecked(chunk.DecodeFloats)
 	case chunk.CodecDecimal:
-		return chunk.DecodeFloatsDecimal
+		return rowsUnchecked(chunk.DecodeFloatsDecimal)
 	default:
 		return nil
 	}

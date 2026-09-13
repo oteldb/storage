@@ -274,7 +274,7 @@ func TestDecodeManifestRejectsCorruptRowCount(t *testing.T) {
 		rows int
 	}{
 		{"negative", -1},
-		{"huge", 1 << 40},
+		{"huge", 1<<40 + 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -286,6 +286,18 @@ func TestDecodeManifestRejectsCorruptRowCount(t *testing.T) {
 			require.ErrorIs(t, err, ErrCorrupt)
 		})
 	}
+}
+
+// TestDecodeManifestAcceptsLargePart pins a real part's row count, past 1<<31, as decodable.
+func TestDecodeManifestAcceptsLargePart(t *testing.T) {
+	t.Parallel()
+
+	m := sampleManifest()
+	m.RowCount = 3_288_562_734
+
+	got, err := DecodeManifest(m.Encode(nil))
+	require.NoError(t, err)
+	require.Equal(t, m.RowCount, got.RowCount)
 }
 
 // FuzzManifestDecode asserts DecodeManifest never panics on arbitrary input, and that
