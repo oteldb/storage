@@ -318,7 +318,7 @@ func (e *Engine) writeMergedPart(ctx context.Context, cols *flushColumns, opts M
 
 	if err := writePart(ctx, e.cfg.Backend, prefix, cols, idents,
 		mergeProfile(opts.Recompress, maxT, len(cols.ts)), pickPrecision(opts.Precision, maxT),
-		e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
+		e.cfg.AggregateStats, e.cfg.MetricBlockRows, e.tsCodec); err != nil {
 		return nil, err
 	}
 

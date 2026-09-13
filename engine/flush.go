@@ -141,7 +141,7 @@ const (
 // lossless.
 func writePart(
 	ctx context.Context, b backend.Backend, prefix string, cols *flushColumns, idents identitySet,
-	comp compressProfile, precisionBits uint8, writeStats bool, blockRows int,
+	comp compressProfile, precisionBits uint8, writeStats bool, blockRows int, tsCodec chunk.Codec,
 ) error {
 	if blockRows <= 0 {
 		blockRows = DefaultMetricBlockRows
@@ -160,7 +160,7 @@ func writePart(
 		return err
 	}
 
-	if err := w.AddColumn(block.Column{Name: colTs, Kind: block.KindInt64, Codec: chunk.CodecDoD, Int64: cols.ts, Block: true}); err != nil {
+	if err := w.AddColumn(block.Column{Name: colTs, Kind: block.KindInt64, Codec: tsCodec, Int64: cols.ts, Block: true}); err != nil {
 		return err
 	}
 

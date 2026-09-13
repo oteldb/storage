@@ -84,7 +84,7 @@ func newPartStreamWriter(
 	}
 
 	if err := w.AddColumn(block.Column{
-		Name: colTs, Kind: block.KindInt64, Codec: chunk.CodecDoD, Block: true,
+		Name: colTs, Kind: block.KindInt64, Codec: e.tsCodec, Block: true,
 	}); err != nil {
 		return nil, err
 	}

@@ -17,6 +17,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/internal/diskguard"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/pool"
@@ -182,6 +183,10 @@ type Engine struct {
 	flushMu sync.Mutex
 	head    *head
 	parts   []*part
+	// tsCodec is the codec flushes and merges write the timestamp column with. It is a field, not a
+	// constant, only so a test can write the [chunk.CodecDoD] parts earlier builds wrote and check
+	// they merge.
+	tsCodec chunk.Codec
 	// idleMerges counts consecutive merges that selected nothing, so the selector can waive its
 	// write-amplification guard for parts that would otherwise never merge (see pickMergeRun).
 	// Written only under flushMu, which a merge holds across its whole body; atomic so
@@ -338,7 +343,7 @@ func New(cfg Config) *Engine {
 		cfg.Obs = obs.NewNop()
 	}
 
-	e := &Engine{cfg: cfg, head: newHead()}
+	e := &Engine{cfg: cfg, head: newHead(), tsCodec: chunk.CodecDoDScaled}
 	e.repairGate = make(chan struct{}, 1)
 	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
 	// The decode free list covers the peak in-flight decoded parts: prefetch can decode
@@ -1571,7 +1576,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		prefix := e.newPartPrefix()
 
 		if err := writePart(ctx, e.cfg.Backend, prefix, sub, idents,
-			compressProfile{}, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows); err != nil {
+			compressProfile{}, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows, e.tsCodec); err != nil {
 			return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
 		}
 
