@@ -50,6 +50,49 @@ func BenchmarkDoDEncodeJittered(b *testing.B) {
 	}
 }
 
+func BenchmarkDoDScaled(b *testing.B) {
+	inputs := []struct {
+		name string
+		ts   []int64
+	}{
+		{"ms-aligned", makeMsAligned(makeJittered(8192, 1_700_000_000_000, 15_000, 300))},
+		{"ns-jitter", makeJittered(8192, 1_700_000_000_000_000_000, 15_000_000_000, 300_001)},
+	}
+	for _, in := range inputs {
+		codecs := []struct {
+			name   string
+			encode func([]byte, []int64) []byte
+			decode func([]int64, []byte) ([]int64, int, error)
+		}{
+			{"dod", EncodeTimestamps, DecodeTimestamps},
+			{"dodscaled", EncodeTimestampsScaled, DecodeTimestampsScaled},
+		}
+		for _, c := range codecs {
+			enc := c.encode(nil, in.ts)
+
+			b.Run(in.name+"/"+c.name+"/encode", func(b *testing.B) {
+				b.SetBytes(int64(len(in.ts)) * 8)
+				b.ReportAllocs()
+				b.ReportMetric(float64(8*len(enc))/float64(len(in.ts)), "bits/point")
+
+				dst := make([]byte, 0, len(enc))
+				for range b.N {
+					dst = c.encode(dst[:0], in.ts)
+				}
+			})
+			b.Run(in.name+"/"+c.name+"/decode", func(b *testing.B) {
+				b.SetBytes(int64(len(in.ts)) * 8)
+				b.ReportAllocs()
+
+				dst := make([]int64, 0, len(in.ts))
+				for range b.N {
+					dst, _, _ = c.decode(dst[:0], enc)
+				}
+			})
+		}
+	}
+}
+
 func BenchmarkGorillaEncode(b *testing.B) {
 	vals := makeSlowFloats(1000, 42.0, 0.001)
 	b.SetBytes(int64(len(vals)) * 8) // raw input bytes encoded/sec

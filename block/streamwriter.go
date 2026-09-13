@@ -812,6 +812,8 @@ func appendInt64Granule(dst []byte, codec chunk.Codec, vals []int64) ([]byte, er
 	switch codec {
 	case chunk.CodecDoD:
 		return chunk.EncodeTimestamps(dst, vals), nil
+	case chunk.CodecDoDScaled:
+		return chunk.EncodeTimestampsScaled(dst, vals), nil
 	case chunk.CodecT64:
 		return chunk.EncodeIntsT64(dst, vals), nil
 	default:

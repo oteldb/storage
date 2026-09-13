@@ -82,6 +82,28 @@ func TestPartsDetailed(t *testing.T) {
 	for _, want := range []string{"series", "ts", "value"} {
 		assert.Contains(t, names, want, "part carries the %q column", want)
 	}
+
+	assert.Positive(t, names["ts"].Bytes, "the ts column is sized")
+	assert.Contains(t, d.OtherBytes, "manifest")
+	assert.Equal(t, d.Bytes, sumColumnBytes(d.Columns)+sumBytes(d.OtherBytes), "column and other bytes cover the part")
+}
+
+func sumColumnBytes(cs []engine.ColumnStat) int64 {
+	var n int64
+	for _, c := range cs {
+		n += c.Bytes
+	}
+
+	return n
+}
+
+func sumBytes(m map[string]int64) int64 {
+	var n int64
+	for _, v := range m {
+		n += v
+	}
+
+	return n
 }
 
 func TestCardinality(t *testing.T) {

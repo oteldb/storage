@@ -45,6 +45,59 @@ func FuzzDoDRoundTrip(f *testing.F) {
 	})
 }
 
+// FuzzDoDScaledRoundTrip fuzzes the scaled DoD round-trip through both the one-shot decoder and
+// the cursor. The seed's varints are deltas; a scale byte multiplies them so aligned inputs, where
+// the scale actually engages, are reached as often as ns-entropic ones.
+func FuzzDoDScaledRoundTrip(f *testing.F) {
+	f.Add(byte(0), []byte{0x02, 0xd0, 0x8f, 0xe0, 0x93, 0x4d, 0xe8, 0xb8, 0x03})
+	f.Add(byte(2), []byte{0x80, 0x80, 0x80, 0x01, 0x1e, 0x1e, 0x20, 0x1c})
+	f.Add(byte(3), []byte{0x02, 0x1e, 0x00, 0x1e, 0x01})
+	f.Add(byte(1), []byte{0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x02})
+
+	f.Fuzz(func(t *testing.T, unit byte, seed []byte) {
+		vals := decodeSeedToInt64s(seed, 256)
+		if len(vals) == 0 {
+			t.Skip("no values")
+		}
+
+		mul := [...]int64{1, 1e3, 1e6, 1e9}[unit%4]
+
+		ts := make([]int64, len(vals))
+
+		ts[0] = vals[0]
+		for i := 1; i < len(vals); i++ {
+			ts[i] = ts[i-1] + vals[i]*mul
+		}
+
+		enc := EncodeTimestampsScaled(nil, ts)
+
+		got, n, err := DecodeTimestampsScaled(nil, enc)
+		if err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+
+		if n != len(enc) {
+			t.Fatalf("consumed %d of %d", n, len(enc))
+		}
+
+		cur, err := NewTsCursor(CodecDoDScaled, enc)
+		if err != nil {
+			t.Fatalf("cursor: %v", err)
+		}
+
+		for i := range ts {
+			v, err := cur.Next()
+			if err != nil {
+				t.Fatalf("Next[%d]: %v", i, err)
+			}
+
+			if got[i] != ts[i] || v != ts[i] {
+				t.Fatalf("ts[%d]: one-shot %d, cursor %d, want %d", i, got[i], v, ts[i])
+			}
+		}
+	})
+}
+
 // FuzzGorillaRoundTrip fuzzes the Gorilla XOR float round-trip.
 func FuzzGorillaRoundTrip(f *testing.F) {
 	f.Add([]byte{0x02, 0x40, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x45, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00})
@@ -262,9 +315,11 @@ func FuzzDecodeNumericArbitrary(f *testing.F) {
 	f.Add(uvarint(math.MaxUint64))
 	f.Add(EncodeFloatsDecimal(nil, []float64{1, 2.5, 3}, 64))
 	f.Add(EncodeTimestamps(nil, []int64{1, 2, 3}))
+	f.Add(EncodeTimestampsScaled(nil, []int64{0, 1e6, 2e6}))
 
 	f.Fuzz(func(_ *testing.T, src []byte) {
 		_, _, _ = DecodeTimestamps(nil, src)
+		_, _, _ = DecodeTimestampsScaled(nil, src)
 		_, _, _ = DecodeFloats(nil, src)
 		_, _, _ = DecodeFloatsDecimal(nil, src)
 		// The caller-bounded decoders get what a part reader would pass: the header's count when it

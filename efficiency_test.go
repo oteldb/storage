@@ -88,6 +88,17 @@ func TestEfficiencyStats(t *testing.T) {
 		assert.Positive(t, d.LogicalBytes, "every part carries a decoded size")
 		logical += d.LogicalBytes
 		stored += d.Bytes
+
+		split := int64(0)
+		for _, c := range d.Columns {
+			split += c.Bytes
+		}
+
+		for _, n := range d.OtherBytes {
+			split += n
+		}
+
+		assert.Equal(t, d.Bytes, split, "per-column and other bytes reach the facade and cover the part")
 	}
 
 	assert.Equal(t, l.LogicalBytes, logical)

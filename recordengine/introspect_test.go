@@ -66,11 +66,22 @@ func TestPartsDetailed(t *testing.T) {
 	require.NotEmpty(t, d.Columns)
 
 	names := make(map[string]struct{}, len(d.Columns))
+
+	var columnBytes, otherBytes int64
+
 	for _, c := range d.Columns {
 		names[c.Name] = struct{}{}
+		columnBytes += c.Bytes
+	}
+
+	for _, n := range d.OtherBytes {
+		otherBytes += n
 	}
 
 	assert.Contains(t, names, "body", "schema column present")
+	assert.Positive(t, columnBytes)
+	assert.Contains(t, d.OtherBytes, "manifest")
+	assert.Equal(t, d.Bytes, columnBytes+otherBytes, "column and other bytes cover the part")
 }
 
 func TestCardinality(t *testing.T) {

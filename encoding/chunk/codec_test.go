@@ -21,6 +21,9 @@ func TestCodecString(t *testing.T) {
 		{CodecDict, "dict"},
 		{CodecT64, "t64"},
 		{CodecDecimal, "decimal"},
+		{CodecID128, "id128"},
+		{CodecBytesRaw, "bytesraw"},
+		{CodecDoDScaled, "dodscaled"},
 		{Codec(99), "unknown"},
 	}
 	for _, tc := range cases {

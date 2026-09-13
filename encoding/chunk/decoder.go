@@ -8,7 +8,10 @@ import (
 )
 
 // errUnsupportedCodec is returned by NewFloatDecoder for a non-float codec.
-var errUnsupportedCodec = errors.New("chunk: codec is not a float64 codec")
+var (
+	errUnsupportedCodec = errors.New("chunk: codec is not a float64 codec")
+	errNotTsCodec       = errors.New("chunk: codec is not a timestamp codec")
+)
 
 // This file provides forward decoders: stateful cursors that decode a column one row at a time from
 // its (sequential, bit-packed) codec stream. They decode exactly the same bytes as the one-shot
@@ -94,6 +97,45 @@ func (d *TsDecoder) Next() (int64, error) {
 	d.i++
 
 	return v, nil
+}
+
+// scaledTsDecoder is the forward cursor over a [CodecDoDScaled] column. It runs a [TsDecoder] over
+// the stream as if its deltas were unscaled — which yields t0 plus the running sum of scaled deltas —
+// and multiplies the offset from t0 back out. The arithmetic wraps exactly as the encoder's did, so
+// the result is exact. It is a wrapper rather than a mode of TsDecoder so that [CodecDoD] columns,
+// the merge's per-row hot path, pay nothing for it.
+type scaledTsDecoder struct {
+	TsDecoder
+
+	t0    int64
+	scale int64
+}
+
+// Next decodes and returns the next timestamp. It returns an [IsEOF] error after the last row.
+func (d *scaledTsDecoder) Next() (int64, error) {
+	if d.i == 1 && d.rows > 1 {
+		s, err := d.r.ReadUvarint()
+		if err != nil {
+			return 0, err
+		}
+
+		if !validScale(s) {
+			return 0, errUnexpectedEOF
+		}
+
+		d.scale = int64(s)
+	}
+
+	v, err := d.TsDecoder.Next()
+	if err != nil {
+		return 0, err
+	}
+
+	if d.i == 1 {
+		d.t0 = v
+	}
+
+	return d.t0 + (v-d.t0)*d.scale, nil
 }
 
 // GorillaDecoder is a forward cursor over a Gorilla XOR encoded float64 column ([EncodeFloats]).
@@ -238,11 +280,34 @@ type FloatDecoder interface {
 	Next() (float64, error)
 }
 
-// TsCursor is the forward-cursor interface over an int64 timestamp column ([CodecDoD]).
+// TsCursor is the forward-cursor interface over an int64 timestamp column ([CodecDoD], [CodecDoDScaled]).
 type TsCursor interface {
 	Len() int
 	Pos() int
 	Next() (int64, error)
+}
+
+// NewTsCursor returns the forward cursor for a timestamp column stream under codec, or
+// [errNotTsCodec] for a codec that is not a timestamp codec.
+func NewTsCursor(codec Codec, src []byte) (TsCursor, error) {
+	switch codec {
+	case CodecDoD:
+		d, err := NewTsDecoder(src)
+		if err != nil {
+			return nil, err
+		}
+
+		return d, nil
+	case CodecDoDScaled:
+		d, err := NewTsDecoder(src)
+		if err != nil {
+			return nil, err
+		}
+
+		return &scaledTsDecoder{TsDecoder: *d}, nil
+	default:
+		return nil, errNotTsCodec
+	}
 }
 
 // constFloatDecoder repeats one value for every row of a constant-collapsed float column.

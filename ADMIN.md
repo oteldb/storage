@@ -113,9 +113,13 @@ engines still bucket by tier and wait for `MinTierParts` of them.
   `recordengine.PartStat.SizeBytes` is its *decoded* footprint, since the record merge is bounded by
   what it holds.)
 - **`PartsDetailed(ctx, tenant, signal) ([]PartDetail, error)`** — augments each part with `Bytes`
-  (summed backend object sizes), `Chunks` (sparse-index granules), and `Columns` (`Name`, `Kind`,
+  (summed backend object sizes), `Chunks` (sparse-index granules), `Columns` (`Name`, `Kind`,
   `Codec`, `Compress`, `Level` — the compression level, which for merged metric parts climbs a
-  size-graduated ladder). Reads object sizes from the backend, so call it for a drill-down view, not a
+  size-graduated ladder — and `Bytes`, the column object's size, 0 for a constant-collapsed column),
+  and `OtherBytes` (every non-column object by name: `manifest`, `marks`, and the engine's indexes).
+  Column `Bytes` plus `OtherBytes` sum to the part's `Bytes`, so a single column's share of a store —
+  the metric timestamp column's, say — is measurable without shell access to a node. Reads object
+  sizes from the backend, so call it for a drill-down view, not a
   high-frequency poll; each part is ref-held for the read so a concurrent merge cannot reclaim it.
   Returns `nil` (no error) when the tenant has no engine for the signal.
 - **`Cardinality(tenant, signal, topN) CardinalityStats`** — the first stop for a
