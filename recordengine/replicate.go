@@ -55,10 +55,12 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 			}
 
 			acc := recs[:0]
+			app := e.head.appenderFor(id)
+
 			for i := range recs {
 				// OOO + in-flight memory are the remaining primary-applied valves; secondaries apply
 				// the accepted set verbatim via ApplyReplicated.
-				switch e.head.appendRecord(id, recs[i], e.cfg.OOOWindow, limits.MaxInFlightBytes) {
+				switch app.append(recs[i], e.cfg.OOOWindow, limits.MaxInFlightBytes) {
 				case admitted:
 					acc = append(acc, recs[i])
 					res.Accepted++
@@ -68,6 +70,8 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 					res.RejectedBytes++
 				}
 			}
+
+			app.commit()
 
 			if len(acc) == 0 {
 				return nil

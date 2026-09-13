@@ -391,6 +391,9 @@ func (e *Engine) AppendBatch(b *Batch, limits AppendLimits) (AppendResult, error
 		walRecs []rec
 	)
 
+	app := e.head.appenderFor(b.Stream)
+	defer app.commit()
+
 	for i := range b.Ts {
 		scratch.ts = b.Ts[i]
 		for k := range b.Ints {
@@ -401,7 +404,7 @@ func (e *Engine) AppendBatch(b *Batch, limits AppendLimits) (AppendResult, error
 			scratch.bytes[k] = b.Bytes[k][i]
 		}
 
-		switch e.head.appendRecord(b.Stream, scratch, e.cfg.OOOWindow, limits.MaxInFlightBytes) {
+		switch app.append(scratch, e.cfg.OOOWindow, limits.MaxInFlightBytes) {
 		case admitted:
 			res.Accepted++
 		case rejectOOO:
