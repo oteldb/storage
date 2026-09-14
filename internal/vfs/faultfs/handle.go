@@ -19,8 +19,14 @@ type handle struct {
 
 // Write implements [io.Writer].
 func (h *handle) Write(p []byte) (int, error) {
-	if err := h.fs.enter(Call{Op: OpWrite, Name: h.name}); err != nil {
-		return 0, err
+	if short, err := h.fs.enterShort(Call{Op: OpWrite, Name: h.name}); err != nil {
+		n := min(max(short, 0), len(p))
+
+		h.fs.mu.Lock()
+		h.node.data = append(h.node.data, p[:n]...)
+		h.fs.mu.Unlock()
+
+		return n, err
 	}
 
 	h.fs.mu.Lock()

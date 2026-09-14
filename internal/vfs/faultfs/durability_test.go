@@ -197,3 +197,28 @@ func TestGateSuspendsUntilReleased(t *testing.T) {
 	_, err = f.Crash().ReadFile("obj")
 	assert.NoError(t, err, "and completing the sync makes it durable")
 }
+
+// TestShortWriteLandsPrefix: a failing write with Short lands that many bytes and reports them, the
+// way a full disk's short write does.
+func TestShortWriteLandsPrefix(t *testing.T) {
+	t.Parallel()
+
+	f := faultfs.New()
+	errFull := errors.New("disk full")
+	f.Add(faultfs.Rule{Op: faultfs.OpWrite, Err: errFull, Short: 3, Times: 1})
+
+	w, err := f.OpenFile("obj", os.O_CREATE|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+
+	n, err := w.Write([]byte("written"))
+	require.ErrorIs(t, err, errFull)
+	assert.Equal(t, 3, n)
+
+	n, err = w.Write([]byte("!"))
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	got, err := f.ReadFile("obj")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("wri!"), got)
+}

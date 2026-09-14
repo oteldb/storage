@@ -90,6 +90,9 @@ type Rule struct {
 	Match func(Call) bool
 	// Err, when non-nil, is returned instead of performing the operation.
 	Err error
+	// Short, for a failing [OpWrite], is how many of the write's bytes land before Err is returned —
+	// the short write a full or failing disk produces. Zero writes nothing.
+	Short int
 	// Before, when non-nil, runs before the operation. It may block, which suspends the calling
 	// goroutine inside the filesystem (see [Gate]).
 	Before func(Call)
@@ -190,17 +193,24 @@ func (f *FS) intercept(c Call) *Rule {
 // enter applies the matching rule's Before hook and error. It releases f.mu across Before, so a
 // blocking hook suspends this operation without deadlocking the filesystem.
 func (f *FS) enter(c Call) error {
+	_, err := f.enterShort(c)
+
+	return err
+}
+
+// enterShort is [FS.enter] that also returns how many bytes a failing write lands first ([Rule.Short]).
+func (f *FS) enterShort(c Call) (int, error) {
 	f.mu.Lock()
 	r := f.intercept(c)
 	f.mu.Unlock()
 
 	if r == nil {
-		return nil
+		return 0, nil
 	}
 
 	if r.Before != nil {
 		r.Before(c)
 	}
 
-	return r.Err
+	return r.Short, r.Err
 }
