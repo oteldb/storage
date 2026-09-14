@@ -221,23 +221,53 @@ func (h *head) appenderFor(id signal.SeriesID) streamAppender {
 	return streamAppender{h: h, id: id, buf: h.records[id], ts: ts, seen: seen}
 }
 
-// append appends r, rejecting it as out-of-order when older than oooWindow behind *that stream's*
-// newest admitted record (oooWindow > 0). A stream's first record is therefore never out of order,
-// however far behind its neighbors it is. It returns whether the record was accepted.
+// append admits r and, when admitted, applies it — the single-pass form for callers whose records are
+// already durable (WAL replay, the replica apply) or that log nothing.
 func (a *streamAppender) append(r rec, oooWindow, maxBytes int64) admitOutcome {
+	var pending int64
+
+	out := a.admit(r, oooWindow, maxBytes, &pending)
+	if out == admitted {
+		a.apply(r)
+	}
+
+	return out
+}
+
+// admit decides whether r is accepted, without touching the head. It rejects r as out-of-order when
+// older than oooWindow behind *that stream's* newest admitted record (oooWindow > 0), so a stream's
+// first record is never out of order however far behind its neighbors it is.
+//
+// pending is the bytes admitted but not yet applied, shared by every appender of one write, so a
+// write can decide its whole accepted set, log it, and only then apply it: the byte check sees
+// exactly what it would have seen had each admitted record been applied as it was admitted. Every
+// admitted record must then be applied, in admission order, before [streamAppender.commit].
+func (a *streamAppender) admit(r rec, oooWindow, maxBytes int64, pending *int64) admitOutcome {
 	if a.seen && oooWindow > 0 && r.ts < a.ts-oooWindow {
 		return rejectOOO
 	}
-
-	h := a.h
 
 	// headByteCap is a format bound on the *next* part's column blobs, and a failed flush folds the
 	// detached buffers back into the live ones ([head.reattach]) — so the bound covers both sides of
 	// the in-flight measure, not just the live half, which would let a reattach restore ~2× the cap.
 	// MaxInFlightBytes is memory backpressure, and covers everything resident for its own reason.
-	if h.inFlightBytes() >= headByteCap || (maxBytes > 0 && h.inFlightBytes() >= maxBytes) {
+	inFlight := a.h.inFlightBytes() + *pending
+	if inFlight >= headByteCap || (maxBytes > 0 && inFlight >= maxBytes) {
 		return rejectBytes
 	}
+
+	*pending += recByteSize(r)
+
+	if !a.seen || r.ts > a.ts {
+		a.ts, a.seen, a.dirty = r.ts, true, true
+	}
+
+	return admitted
+}
+
+// apply appends a record [streamAppender.admit] accepted.
+func (a *streamAppender) apply(r rec) {
+	h := a.h
 
 	if a.buf == nil {
 		a.buf = newRecordCols(h.schema, 0, fullSel(h.schema))
@@ -247,15 +277,9 @@ func (a *streamAppender) append(r rec, oooWindow, maxBytes int64) admitOutcome {
 	a.buf.appendClone(r)
 	h.grow(recByteSize(r))
 
-	if !a.seen || r.ts > a.ts {
-		a.ts, a.seen, a.dirty = r.ts, true, true
-	}
-
 	if r.ts > h.newest {
 		h.newest = r.ts
 	}
-
-	return admitted
 }
 
 // commit publishes the run's out-of-order watermark. It must be called once the run is over, and

@@ -456,17 +456,6 @@ func (c *recordCols) appendClone(r rec) {
 	}
 }
 
-func cloneBytes(b []byte) []byte {
-	if len(b) == 0 {
-		return nil
-	}
-
-	out := make([]byte, len(b))
-	copy(out, b)
-
-	return out
-}
-
 // tsOrder returns c's rows in stable ascending-timestamp order, appended to dst (reusing its
 // capacity), or nil when c is already ordered — callers then read rows in their natural order.
 // Records arrive part-ordered and a part's rows are ts-sorted, so the accumulated window is very
