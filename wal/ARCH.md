@@ -56,6 +56,23 @@ next run turns into a permanent *middle* segment, and every later replay fails. 
 are an incomplete frame, unreadable by construction. A *complete* frame that fails its CRC is left
 alone — that is corruption rather than a torn append, and replay is the one place that reports it.
 
+### A failed write is healed before the next one
+
+The same tolerance would not survive a running writer that kept appending after a write failed
+part-way. A full or failing disk returns a short write, and a torn frame followed by later frames is
+exactly the corruption replay refuses, so one `ENOSPC` would make the store unopenable and take every
+acknowledged record behind it with it.
+
+So `SegmentWriter` never writes behind a partial frame. A failed write records the segment and its
+length before the write; before anything else is written, `heal` restores that segment to the length
+if the write left bytes past it, and the writer then moves to a fresh segment, since its open handle
+reaches the dropped bytes. The restore writes the kept prefix to a `.repair` file (not a segment name,
+so a stray one is never replayed), syncs it, renames it over the segment and syncs the directory — a
+rename rather than an in-place truncate, because a crash midway through rewriting the segment would
+lose the records already acknowledged from it, where a crash before the rename leaves the tear at the
+log's tail for `Create` to repair. Until the restore succeeds every write is refused, including the
+one that would open a new segment. A segment checkpointed away in the meantime needs no restore.
+
 ### Proving a tail is a tail
 
 Ending mid-record is not by itself evidence of a torn append. A crash does not always truncate to a
