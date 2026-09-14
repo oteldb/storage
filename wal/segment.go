@@ -38,6 +38,8 @@ type SegmentWriter struct {
 	f        vfs.File
 	name     string // the open segment's name: its epoch is the one current when it was opened
 	size     int
+	kept     []keptSegment // closed segments still on disk, ascending by seq
+	keptSize int64
 	w        *Writer
 	sync     bool        // fsync after every framed write (durability vs throughput)
 	metrics  *obs.WAL    // append/fsync/rotation counters; nil ⇒ not metered
@@ -113,7 +115,16 @@ func createFS(fsys vfs.FS, maxBytes int) (*SegmentWriter, error) {
 	// then (and a resumed dir's prior segments are left intact for replay). Epoch starts at 1 (the
 	// first generation; the recovery watermark is 0), so a writer that never calls SetEpoch — the
 	// metric engine — still has all its segments replayed by ReplayDir's epoch>0 filter.
+	kept, err := listKept(fsys)
+	if err != nil {
+		return nil, err
+	}
+
 	sw := &SegmentWriter{fsys: fsys, maxBytes: maxBytes, seq: last, epoch: 1}
+	for _, k := range kept {
+		sw.keep(k)
+	}
+
 	sw.w = NewWriter(sw) // the inner Writer frames records and writes them through sw
 
 	return sw, nil
@@ -126,6 +137,27 @@ func (sw *SegmentWriter) Seq() int { return sw.seq }
 // Size returns the byte size of the current open segment (0 when none is open). A cheap in-memory
 // read for introspection; not safe for concurrent use.
 func (sw *SegmentWriter) Size() int { return sw.size }
+
+// Segments returns the number of segment files on disk: the closed ones no checkpoint has discarded
+// yet, plus the open one. A cheap in-memory read for introspection; not safe for concurrent use.
+func (sw *SegmentWriter) Segments() int {
+	n := len(sw.kept)
+	if sw.f != nil {
+		n++
+	}
+
+	return n
+}
+
+// Bytes returns the bytes the on-disk segments hold (see [SegmentWriter.Segments]). A cheap
+// in-memory read for introspection; not safe for concurrent use.
+func (sw *SegmentWriter) Bytes() int64 {
+	if sw.f == nil {
+		return sw.keptSize
+	}
+
+	return sw.keptSize + int64(sw.size)
+}
 
 // Epoch returns the flush generation stamped into new segments (see [SegmentWriter.SetEpoch]). A
 // cheap in-memory read for introspection; not safe for concurrent use.
@@ -197,6 +229,8 @@ func (sw *SegmentWriter) CheckpointThrough(obsolete int) error {
 			if rerr := sw.fsys.Remove(e.Name()); rerr != nil && !os.IsNotExist(rerr) {
 				return errors.Wrapf(rerr, "remove obsolete segment %q", e.Name())
 			}
+
+			sw.forget(seq)
 		}
 	}
 
@@ -210,6 +244,37 @@ func (sw *SegmentWriter) CheckpointThrough(obsolete int) error {
 		zap.String("dir", sw.dir), zap.Int("through_seq", obsolete))
 
 	return nil
+}
+
+type keptSegment struct {
+	seq  int
+	size int64
+}
+
+// listKept returns the segments a prior run left in fsys, in ascending order.
+func listKept(fsys vfs.FS) ([]keptSegment, error) {
+	entries, err := fsys.ReadDir(".")
+	if err != nil {
+		return nil, errors.Wrap(err, "read wal dir")
+	}
+
+	var kept []keptSegment
+
+	for _, e := range entries {
+		seq, _, ok := parseSegment(e.Name())
+		if !ok {
+			continue
+		}
+
+		info, err := e.Info()
+		if err != nil {
+			return nil, errors.Wrapf(err, "stat segment %q", e.Name())
+		}
+
+		kept = append(kept, keptSegment{seq: seq, size: info.Size()})
+	}
+
+	return kept, nil
 }
 
 // lastSegmentSeq returns the highest segment number present in fsys, or 0 if none.
@@ -416,9 +481,25 @@ func (sw *SegmentWriter) closeSegment() error {
 		err = cerr
 	}
 
+	sw.keep(keptSegment{seq: sw.seq, size: int64(sw.size)})
 	sw.f = nil
 
 	return err
+}
+
+func (sw *SegmentWriter) keep(k keptSegment) {
+	sw.kept = append(sw.kept, k)
+	sw.keptSize += k.size
+}
+
+func (sw *SegmentWriter) forget(seq int) {
+	i := slices.IndexFunc(sw.kept, func(k keptSegment) bool { return k.seq == seq })
+	if i < 0 {
+		return
+	}
+
+	sw.keptSize -= sw.kept[i].size
+	sw.kept = slices.Delete(sw.kept, i, i+1)
 }
 
 // prepare ensures a current segment is open and not over the size limit before a write.
