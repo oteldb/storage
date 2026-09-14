@@ -97,4 +97,5 @@ func TestCorruptWALIsCountedAtOpen(t *testing.T) {
 	_, err = Open(ctx, Options{}, WithBackend(be), WithWALDir(walDir), WithFlushInterval(-1), WithMeterProvider(mp))
 	require.ErrorIs(t, err, wal.ErrCorrupt)
 	assert.Equal(t, int64(1), m.Counter("storage.corruption.detected", "component", "wal", "disposition", "fatal"))
+	require.NoError(t, os.RemoveAll(walDir), "a failed Open releases the WAL handles it opened")
 }
