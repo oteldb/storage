@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"time"
 
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
@@ -28,6 +29,10 @@ type walBatch struct {
 	// are what [head.appendByID] would have added to the head's in-flight bytes and series count.
 	samples    int
 	registered int
+
+	// first is when the write staged its first sample: the head's age starts there if the write is the
+	// first to fill it, as it would had the sample been applied on admission, not once the log returns.
+	first time.Time
 
 	frames bytes.Buffer
 	fw     *wal.Writer
@@ -143,6 +148,10 @@ func (b *walBatch) add(id signal.SeriesID, ts int64, value, sf float64, isNew, r
 		}
 	}
 
+	if b.samples == 0 {
+		b.first = time.Now()
+	}
+
 	a := &b.accs[k]
 	a.ts = append(a.ts, ts)
 	a.values = append(a.values, value)
@@ -161,14 +170,31 @@ func (b *walBatch) empty() bool { return len(b.order) == 0 }
 
 // flush logs the staged write — a series record per series starting a buffer, a samples frame per
 // series — as a single WAL write, so a write that fails logs none of it. It does not reset b.
-func (b *walBatch) flush(w *wal.SegmentWriter) error {
+func (b *walBatch) flush(h *head, w *wal.SegmentWriter) error {
+	if err := b.encode(h, false); err != nil {
+		return err
+	}
+
+	return w.WriteFrames(b.frames.Bytes())
+}
+
+// encode frames the staged write into b.frames, one samples frame per series, each preceded by its
+// series record when the series starts a buffer — or always, with everySeries, for frames read by a
+// replica whose head may not hold the identity the primary's does.
+func (b *walBatch) encode(h *head, everySeries bool) error {
 	b.frames.Reset()
 
 	for k, id := range b.order {
 		a := &b.accs[k]
 
-		if a.isNew {
+		switch {
+		case a.isNew:
 			if err := b.fw.WriteSeries(id, a.series); err != nil {
+				return err
+			}
+		case everySeries:
+			s, _ := h.series.Get(id) // a buffered series is registered
+			if err := b.fw.WriteSeries(id, s); err != nil {
 				return err
 			}
 		}
@@ -188,12 +214,14 @@ func (b *walBatch) flush(w *wal.SegmentWriter) error {
 		}
 	}
 
-	return w.WriteFrames(b.frames.Bytes())
+	return nil
 }
 
 // apply puts the staged samples into the head, leaving it exactly as applying each one through
 // [head.appendByID] in admission order would have.
 func (b *walBatch) apply(h *head) {
+	wasEmpty := h.bytes == 0
+
 	for k, id := range b.order {
 		a := &b.accs[k]
 
@@ -208,6 +236,10 @@ func (b *walBatch) apply(h *head) {
 
 		h.grow(int64(len(a.ts)) * SampleBytes)
 		h.noteTS(id, a.newest)
+	}
+
+	if wasEmpty && h.bytes > 0 {
+		h.since = b.first
 	}
 }
 

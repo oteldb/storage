@@ -408,7 +408,7 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 		return false, nil
 	}
 
-	if err := e.walB.flush(e.cfg.WAL); err != nil {
+	if err := e.walB.flush(e.head, e.cfg.WAL); err != nil {
 		return false, err
 	}
 
@@ -473,7 +473,7 @@ func (e *Engine) AppendBatch(
 		return res, nil
 	}
 
-	if err := e.walB.flush(e.cfg.WAL); err != nil {
+	if err := e.walB.flush(e.head, e.cfg.WAL); err != nil {
 		return AppendResult{}, err
 	}
 
@@ -1368,7 +1368,8 @@ func (e *Engine) Replay(dir string) error {
 // [AppendResult] breaking the disposition down by reason, so the clustered ingest path can
 // attribute OTLP partial-success exactly like the single-node path. Because only the primary
 // admission-checks and it dictates the accepted set, every replica converges on the same data
-// regardless of concurrent writers. Safe for concurrent use.
+// regardless of concurrent writers. A payload that fails to decode or to log applies nothing. Safe for
+// concurrent use.
 func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte, res AppendResult, err error) {
 	if err := e.refuseWrite(); err != nil {
 		return nil, AppendResult{}, err
@@ -1381,23 +1382,14 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 	// the head untouched (see [walBatch]).
 	defer e.walB.reset()
 
-	var (
-		buf     bytes.Buffer
-		w       = wal.NewWriter(&buf)
-		byID    = make(map[signal.SeriesID]signal.Series)
-		written = make(map[signal.SeriesID]struct{})
-	)
+	byID := make(map[signal.SeriesID]signal.Series)
 
-	// admit decides one series' run of samples and re-frames the accepted subset. sf is the run's
-	// per-sample lossy-sampling weights, or nil for an unsampled run; it is carried through to the
-	// head and back out into the replicated frame, so a weight survives origin → primary →
-	// secondary rather than being silently reset to 1.
-	admit := func(id signal.SeriesID, ts []int64, values, sf []float64) error {
+	// admit decides one series' run of samples. sf is the run's per-sample lossy-sampling weights, or
+	// nil for an unsampled run; it is carried through to the head and back out into the replicated
+	// frame, so a weight survives origin → primary → secondary rather than being silently reset to 1.
+	admit := func(id signal.SeriesID, ts []int64, values, sf []float64) {
 		s := byID[id] // the series record precedes its samples in the frame
-
-		var accTs []int64
-
-		var accVals, accSF []float64
+		materialize := func() signal.Series { return s }
 
 		for i := range ts {
 			w := 1.0
@@ -1405,41 +1397,10 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 				w = sf[i]
 			}
 
-			// The primary is the shard's single authority, so it makes the admission decision
-			// here (OOO window + cardinality + in-flight memory); secondaries apply the accepted
-			// set verbatim via ApplyReplicated.
-			// The cluster primary path does not set limits.Overflow, so a new series past the cap
-			// is hard-rejected here (overflow routing is single-node metrics today); the id is kept.
-			out := e.walB.admit(e.head, id, ts[i], values[i], w, e.cfg.OOOWindow,
-				limits, func() signal.Series { return s })
-			res = res.with(out)
-
-			if out == admitted || out == admittedOverflow {
-				accTs = append(accTs, ts[i])
-				accVals = append(accVals, values[i])
-
-				if sf != nil {
-					accSF = append(accSF, w)
-				}
-			}
+			// The primary is the shard's single authority, so it makes the admission decision here;
+			// secondaries apply the accepted set verbatim via ApplyReplicated.
+			res = res.with(e.walB.admit(e.head, id, ts[i], values[i], w, e.cfg.OOOWindow, limits, materialize))
 		}
-
-		if len(accTs) == 0 {
-			return nil
-		}
-
-		if _, ok := written[id]; !ok {
-			written[id] = struct{}{}
-			if err := w.WriteSeries(id, s); err != nil {
-				return err
-			}
-		}
-
-		if accSF != nil {
-			return w.WriteSamplesSF(id, accTs, accVals, accSF)
-		}
-
-		return w.WriteSamples(id, accTs, accVals)
 	}
 
 	if err := wal.Replay(data, wal.Handlers{
@@ -1449,27 +1410,38 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 			return nil
 		},
 		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
-			return admit(id, ts, values, nil)
+			admit(id, ts, values, nil)
+
+			return nil
 		},
 		OnSamplesSF: func(id signal.SeriesID, ts []int64, values, sf []float64) error {
-			return admit(id, ts, values, sf)
+			admit(id, ts, values, sf)
+
+			return nil
 		},
 	}); err != nil {
 		return nil, AppendResult{}, err
 	}
 
-	// The accepted frames are the primary's durable copy of the shard's unflushed head, the one the
-	// quorum ack counts on: a restart replays them, instead of serving a hole for everything written
-	// since the last flush. They are already framed for replication, so the log takes them verbatim.
+	// The accepted frames are framed from the staged batch, so a sample routed to an overflow series
+	// replicates under that series. Every series carries its identity: a secondary's head need not
+	// hold the series the primary's already buffers.
+	if err := e.walB.encode(e.head, true); err != nil {
+		return nil, AppendResult{}, err
+	}
+
+	// They are also the primary's durable copy of the shard's unflushed head, the one the quorum ack
+	// counts on: a restart replays them instead of serving a hole for everything written since the
+	// last flush.
 	if e.cfg.WAL != nil {
-		if err := e.cfg.WAL.WriteFrames(buf.Bytes()); err != nil {
+		if err := e.cfg.WAL.WriteFrames(e.walB.frames.Bytes()); err != nil {
 			return nil, AppendResult{}, err
 		}
 	}
 
 	e.walB.apply(e.head)
 
-	return buf.Bytes(), res, nil
+	return bytes.Clone(e.walB.frames.Bytes()), res, nil
 }
 
 // ApplyReplicated applies a replicated write from the shard's primary to this secondary's head:
