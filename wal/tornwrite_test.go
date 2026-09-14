@@ -308,3 +308,155 @@ func TestCreateRemovesRepairTemps(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"committed"}, got)
 }
+
+// failRepairWrites makes every write of a restore's temporary copy fail, the full disk that tore the
+// segment still refusing the space for its restore.
+func failRepairWrites(fsys *faultfs.FS) {
+	fsys.Add(faultfs.Rule{
+		Op:    faultfs.OpWrite,
+		Match: func(c faultfs.Call) bool { return strings.HasSuffix(c.Name, repairExt) },
+		Err:   errDiskFull,
+	})
+}
+
+// TestUnhealedTearFailsSyncAndClose: the records written before a failed write become durable only when
+// the torn segment is restored, so Sync and Close report failure until it is, rather than succeeding on
+// a writer whose segment handle the restore already let go of.
+func TestUnhealedTearFailsSyncAndClose(t *testing.T) {
+	t.Parallel()
+
+	fsys := faultfs.New()
+
+	w, err := createFS(fsys, 0)
+	require.NoError(t, err)
+	require.NoError(t, w.WriteSide([]byte("committed")))
+
+	failNextSegmentWrite(fsys, sideFrameLen("lost")/2)
+	failRepairWrites(fsys)
+	require.ErrorIs(t, w.WriteSide([]byte("lost")), errDiskFull)
+
+	require.ErrorIs(t, w.Sync(), errDiskFull)
+
+	fsys.Reset()
+	require.NoError(t, w.Sync())
+
+	got, err := sides(fsys.Crash())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"committed"}, got, "a Sync that succeeded made the records durable")
+
+	failNextSegmentWrite(fsys, sideFrameLen("lost")/2)
+	failRepairWrites(fsys)
+	require.ErrorIs(t, w.WriteSide([]byte("lost")), errDiskFull)
+	require.ErrorIs(t, w.Close(), errDiskFull)
+}
+
+// TestSyncFailsUntilRestoreIsDurable: a restore whose rename landed but whose directory sync keeps
+// failing is not durable, so Sync keeps failing until the directory sync succeeds.
+func TestSyncFailsUntilRestoreIsDurable(t *testing.T) {
+	t.Parallel()
+
+	fsys := faultfs.New()
+
+	w, err := createFS(fsys, 0)
+	require.NoError(t, err)
+	require.NoError(t, w.WriteSide([]byte("committed")))
+
+	errDirSync := errors.New("injected directory sync failure")
+	fsys.Add(faultfs.Rule{Op: faultfs.OpSyncDir, Err: errDirSync, Times: 2})
+
+	failNextSegmentWrite(fsys, sideFrameLen("lost")/2)
+	require.ErrorIs(t, w.WriteSide([]byte("lost")), errDiskFull)
+	require.ErrorIs(t, w.Sync(), errDirSync)
+	require.NoError(t, w.Sync())
+
+	got, err := sides(fsys.Crash())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"committed"}, got)
+}
+
+// tornDirectory returns a directory whose last segment holds synced records a and b followed by a torn
+// frame, as a process that died mid-append leaves it.
+func tornDirectory(t *testing.T) *faultfs.FS {
+	t.Helper()
+
+	fsys := faultfs.New()
+
+	w, err := createFS(fsys, 0)
+	require.NoError(t, err)
+	w.SetSync(true)
+	require.NoError(t, w.WriteSide([]byte("a")))
+	require.NoError(t, w.WriteSide([]byte("b")))
+
+	frame := appendFrame(nil, recordSide, []byte("torn"))
+	_, err = w.f.Write(frame[:len(frame)/2])
+	require.NoError(t, err)
+	require.NoError(t, w.f.Sync())
+
+	return fsys.Kill()
+}
+
+// TestCreateRepairFailureKeepsRecords is #617: a startup repair whose rewrite fails must leave the
+// segment's records in place for the next attempt.
+func TestCreateRepairFailureKeepsRecords(t *testing.T) {
+	t.Parallel()
+
+	for _, op := range []faultfs.Op{faultfs.OpWrite, faultfs.OpSync, faultfs.OpRename, faultfs.OpSyncDir} {
+		t.Run(op.String(), func(t *testing.T) {
+			t.Parallel()
+
+			fsys := tornDirectory(t)
+			fsys.Add(faultfs.Rule{Op: op, Err: errDiskFull, Times: 1})
+
+			_, err := createFS(fsys, 0)
+			require.ErrorIs(t, err, errDiskFull)
+
+			resumed, err := createFS(fsys, 0)
+			require.NoError(t, err)
+			require.NoError(t, resumed.Close())
+
+			got, err := sides(fsys)
+			require.NoError(t, err)
+			assert.Equal(t, []string{"a", "b"}, got)
+		})
+	}
+}
+
+// TestCrashDuringCreateRepairKeepsRecords: a power cut at any step of a startup repair keeps the
+// segment's synced records, and the next start repairs it again.
+func TestCrashDuringCreateRepairKeepsRecords(t *testing.T) {
+	t.Parallel()
+
+	for _, unsynced := range []int{0, 100} {
+		for _, op := range []faultfs.Op{faultfs.OpCreate, faultfs.OpWrite, faultfs.OpSync, faultfs.OpRename, faultfs.OpSyncDir} {
+			t.Run(fmt.Sprintf("%s/unsynced%d", op, unsynced), func(t *testing.T) {
+				t.Parallel()
+
+				fsys := tornDirectory(t)
+
+				var crashed *faultfs.FS
+
+				fsys.Add(faultfs.Rule{
+					Op: op,
+					Before: func(faultfs.Call) {
+						if crashed == nil {
+							crashed = fsys.CrashWith(faultfs.CrashConfig{UnsyncedPercent: unsynced})
+						}
+					},
+				})
+
+				resumed, err := createFS(fsys, 0)
+				require.NoError(t, err)
+				require.NoError(t, resumed.Close())
+				require.NotNil(t, crashed, "the crash point was never reached")
+
+				again, err := createFS(crashed, 0)
+				require.NoError(t, err)
+				require.NoError(t, again.Close())
+
+				got, err := sides(crashed)
+				require.NoError(t, err)
+				assert.Equal(t, []string{"a", "b"}, got)
+			})
+		}
+	}
+}

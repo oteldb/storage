@@ -49,9 +49,10 @@ truncation, not an end of stream, and an error: decoding it as a short batch ins
 replica diverge from its primary in silence. The records applied before the stopping point are kept
 either way.
 
-Making the tolerance last-segment-only is only safe because `Create` **repairs on resume**: it
-truncates the highest-numbered segment to its last complete frame before opening the next one
-(Prometheus `wal.Repair` semantics). Without that, one ordinary crash leaves a torn tail that the
+Making the tolerance last-segment-only is only safe because `Create` **repairs on resume**: it cuts
+the highest-numbered segment back to its last complete frame before opening the next one (Prometheus
+`wal.Repair` semantics), by the same copy-and-rename a running writer's restore uses (below), never by
+truncating the segment in place. Without that, one ordinary crash leaves a torn tail that the
 next run turns into a permanent *middle* segment, and every later replay fails. The discarded bytes
 are an incomplete frame, unreadable by construction. A *complete* frame that fails its CRC is left
 alone — that is corruption rather than a torn append, and replay is the one place that reports it.
@@ -68,14 +69,15 @@ length before the write; before anything else is written, `heal` restores that s
 if the write left bytes past it, and the writer then moves to a fresh segment, since its open handle
 reaches the dropped bytes. The restore writes the kept prefix to a `.repair` file (not a segment name,
 so a stray one is never replayed, and `Create` removes it), syncs it, closes the torn segment's handle
-without a sync, renames the copy over the segment and syncs the directory — a rename rather than an
+without a sync — the copy now holds its whole frames — renames the copy over the segment and syncs the directory — a rename rather than an
 in-place truncate, because a crash midway through rewriting the segment would lose the records already
 acknowledged from it, where a crash before the rename leaves the tear at the log's tail for `Create` to
 repair. The handle is closed before the rename because Windows refuses to rename over an open file, and
 on POSIX a handle kept open would write into the replaced file's orphaned bytes.
 
-Until the restore succeeds every write is refused, including the one that would open a new segment.
-Success includes the directory sync: a retry that finds the segment already at its kept length cannot
+Until the restore succeeds every write is refused, including the one that would open a new segment, and
+`Sync` and `Close` fail: the handle is already gone, so the records written before the failed write
+are durable only once the restore is. Success includes the directory sync: a retry that finds the segment already at its kept length cannot
 tell whether an earlier attempt's rename is durable, so it syncs the directory again before clearing
 the tear. A segment checkpointed away in the meantime needs no restore.
 
