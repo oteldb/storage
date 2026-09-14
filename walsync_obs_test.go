@@ -14,7 +14,7 @@ import (
 
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/internal/obs/obstest"
-	"github.com/oteldb/storage/wal"
+	"github.com/oteldb/storage/query/fetch"
 )
 
 // TestWALSyncFailuresAreReported: a background fsync that fails is counted every time, but logged
@@ -58,9 +58,10 @@ func TestWALSyncFailuresAreReported(t *testing.T) {
 	assert.Equal(t, 2, logs.FilterLevelExact(zap.ErrorLevel).Len(), "a new failing run logs again")
 }
 
-// TestCorruptWALIsCountedAtOpen: a corrupt segment fails Open, and the failure is reported as
-// corruption — the one corrupt artifact that keeps a node from starting at all.
-func TestCorruptWALIsCountedAtOpen(t *testing.T) {
+// TestDamagedWALOpensAndIsCounted: a damaged segment does not keep the store from opening. Replay skips
+// the damaged record, keeps every other one, counts the damage as tolerated corruption and keeps a copy
+// of the segment for inspection.
+func TestDamagedWALOpensAndIsCounted(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 	dataDir, walDir := t.TempDir(), t.TempDir()
@@ -86,7 +87,7 @@ func TestCorruptWALIsCountedAtOpen(t *testing.T) {
 
 	data, err := os.ReadFile(segments[0])
 	require.NoError(t, err)
-	data[len(data)/3] ^= 0xff
+	data[len(data)-5] ^= 0xff // inside the last sample's frame
 	require.NoError(t, os.WriteFile(segments[0], data, 0o600))
 
 	be, err := file.New(dataDir)
@@ -94,8 +95,21 @@ func TestCorruptWALIsCountedAtOpen(t *testing.T) {
 
 	mp, m := obstest.Provider(t)
 
-	_, err = Open(ctx, Options{}, WithBackend(be), WithWALDir(walDir), WithFlushInterval(-1), WithMeterProvider(mp))
-	require.ErrorIs(t, err, wal.ErrCorrupt)
-	assert.Equal(t, int64(1), m.Counter("storage.corruption.detected", "component", "wal", "disposition", "fatal"))
-	require.NoError(t, os.RemoveAll(walDir), "a failed Open releases the WAL handles it opened")
+	s2, err := Open(ctx, Options{}, WithBackend(be), WithWALDir(walDir), WithFlushInterval(-1), WithMeterProvider(mp))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s2.Close(ctx) })
+
+	assert.Equal(t, int64(1), m.Counter("storage.corruption.detected", "component", "wal", "disposition", "tolerated"))
+	assert.Zero(t, m.Counter("storage.corruption.detected", "component", "wal", "disposition", "fatal"))
+
+	batches, err := fetch.Drain(ctx, must(s2.Fetcher("default").Fetch(ctx, fetch.Request{
+		Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{nameMatcher("http.requests")},
+	})))
+	require.NoError(t, err)
+	require.Len(t, batches, 1)
+	assert.Equal(t, []int64{100, 101, 102, 103, 104, 105, 106}, batches[0].Timestamps)
+
+	kept, err := os.ReadFile(segments[0] + ".damaged")
+	require.NoError(t, err)
+	assert.Equal(t, data, kept)
 }

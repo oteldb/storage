@@ -63,7 +63,9 @@ func TestReplayDirHoleInFinalSegment(t *testing.T) {
 	assert.Zero(t, seen, "the records past the hole are not applied as if the log ended")
 }
 
-func TestCreateRefusesHole(t *testing.T) {
+// TestCreateLeavesHoleForReplay: Create cuts only a torn tail. A hole with whole frames past it stays
+// in place, byte for byte, for replay to report or salvage.
+func TestCreateLeavesHoleForReplay(t *testing.T) {
 	t.Parallel()
 
 	data := holedLog(t)
@@ -71,14 +73,15 @@ func TestCreateRefusesHole(t *testing.T) {
 	dir := t.TempDir()
 	writeSegmentFile(t, dir, data)
 
-	// Create repairs the last segment before anything replays it; truncating a hole would erase the
-	// records past it and leave replay a clean-looking prefix.
-	_, err := Create(dir, 0)
-	require.ErrorIs(t, err, ErrCorrupt)
+	w, err := Create(dir, 0)
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
 
 	after, rerr := os.ReadFile(filepath.Join(dir, segmentName(1, 1)))
 	require.NoError(t, rerr)
-	assert.Equal(t, data, after, "the segment is left intact for an operator to inspect")
+	assert.Equal(t, data, after)
+
+	require.ErrorIs(t, ReplayDir(dir, Handlers{}), ErrCorrupt, "a strict replay still refuses it")
 }
 
 func TestReplayDirTornTailStillAccepted(t *testing.T) {

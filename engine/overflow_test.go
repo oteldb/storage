@@ -99,7 +99,7 @@ func TestWALReplayRestoresOverflowSeries(t *testing.T) {
 	require.NoError(t, sw.Close())
 
 	restored := engine.New(engine.Config{})
-	require.NoError(t, restored.Replay(dir))
+	require.NoError(t, restored.Replay(t.Context(), dir))
 	require.NoError(t, err)
 
 	// The overflow series survives recovery with its redirected samples.

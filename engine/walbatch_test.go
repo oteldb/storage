@@ -39,7 +39,7 @@ func TestWALReplayAfterGroupedBatch(t *testing.T) {
 	require.NoError(t, sw.Close())
 
 	restored := engine.New(engine.Config{})
-	require.NoError(t, restored.Replay(dir))
+	require.NoError(t, restored.Replay(t.Context(), dir))
 	assert.Equal(t, 2, restored.SeriesCount())
 
 	got := fetchAll(t, restored, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
@@ -74,7 +74,7 @@ func TestWALReplayRestoresScaleFactors(t *testing.T) {
 	require.NoError(t, sw.Close())
 
 	restored := engine.New(engine.Config{})
-	require.NoError(t, restored.Replay(dir))
+	require.NoError(t, restored.Replay(t.Context(), dir))
 
 	got := fetchAll(t, restored, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
 	require.Len(t, got, 1)
@@ -100,7 +100,7 @@ func TestWALReplayUnsampledNoScaleFactors(t *testing.T) {
 	require.NoError(t, sw.Close())
 
 	restored := engine.New(engine.Config{})
-	require.NoError(t, restored.Replay(dir))
+	require.NoError(t, restored.Replay(t.Context(), dir))
 
 	got := fetchAll(t, restored, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
 	require.Len(t, got, 1)
@@ -128,7 +128,7 @@ func TestWALBatchReusedAcrossAppends(t *testing.T) {
 	require.NoError(t, sw.Close())
 
 	restored := engine.New(engine.Config{})
-	require.NoError(t, restored.Replay(dir))
+	require.NoError(t, restored.Replay(t.Context(), dir))
 
 	got := fetchAll(t, restored, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
 	require.Len(t, got, 1)

@@ -54,7 +54,7 @@ func TestApplyPrimaryLogsAcceptedToWAL(t *testing.T) {
 	require.NoError(t, sw.Close())
 
 	recovered := recordengine.New(recordengine.Config{Schema: testSchema})
-	require.NoError(t, recovered.Replay(dir))
+	require.NoError(t, recovered.Replay(t.Context(), dir))
 
 	got := fetchAll(t, recovered, req("api"))
 	require.Len(t, got, 1, "the primary's unflushed head is recovered from its WAL")

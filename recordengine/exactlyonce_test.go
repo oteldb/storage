@@ -70,8 +70,8 @@ func TestWALExactlyOnceRecovery(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w2.Close() })
 	e2 := recordengine.New(recordengine.Config{Schema: testSchema, Backend: be, Prefix: "t/recs", WAL: w2})
-	require.NoError(t, e2.LoadParts(ctx)) // recovers the watermark (1)
-	require.NoError(t, e2.Replay(walDir)) // skips generation ≤ 1, replays generation 2
+	require.NoError(t, e2.LoadParts(ctx))              // recovers the watermark (1)
+	require.NoError(t, e2.Replay(t.Context(), walDir)) // skips generation ≤ 1, replays generation 2
 
 	got := bodies(fetchAll(t, e2, req("api"))[0])
 	require.Equal(t, []string{"b1", "b2"}, got,

@@ -48,6 +48,11 @@ type SegmentWriter struct {
 	// heal. See [SegmentWriter.heal].
 	tornName string
 	tornGood int
+
+	// rotateSyncErr is the failed sync of a segment a rotation closed. The write that rotated reports
+	// its own failure, but the records already in that segment were acknowledged and may not survive a
+	// power cut, so the next Sync, Seal or Close reports it too: none may claim them durable.
+	rotateSyncErr error
 }
 
 // SetObs attaches the WAL metrics handle (append/fsync/rotation counters). nil disables metering.
@@ -139,7 +144,7 @@ func (sw *SegmentWriter) SetEpoch(epoch uint64) { sw.epoch = epoch }
 
 // Seal closes the current segment and stamps subsequent ones with epoch, returning the sequence
 // number it sealed through — the argument [SegmentWriter.CheckpointThrough] takes once the flush of
-// those records commits.
+// those records commits. Like [SegmentWriter.Sync], it fails while a torn segment cannot be restored.
 //
 // A flush seals at the instant it detaches the head, not when it publishes: the part it goes on to
 // write off-lock holds exactly the records logged before that instant. A record appended during the
@@ -147,7 +152,15 @@ func (sw *SegmentWriter) SetEpoch(epoch uint64) { sw.epoch = epoch }
 // watermark the flush is about to commit — so the checkpoint does not delete it and replay does not
 // skip it.
 func (sw *SegmentWriter) Seal(epoch uint64) (int, error) {
+	if err := sw.heal(); err != nil {
+		return 0, err
+	}
+
 	if err := sw.closeSegment(); err != nil { // the next write lazily opens a segment carrying epoch
+		return 0, err
+	}
+
+	if err := sw.takeRotateSyncErr(); err != nil {
 		return 0, err
 	}
 
@@ -335,9 +348,14 @@ func (sw *SegmentWriter) WriteSide(payload []byte) error {
 
 // Sync flushes the current segment to stable storage (no-op when no segment is open). It first finishes
 // restoring a segment a failed write tore, and fails while it cannot: the records before the failed
-// write are durable only once the restore is.
+// write are durable only once the restore is. It also fails, once, when a segment a rotation closed
+// failed to sync since the last call, so a nil return covers every record acknowledged since then.
 func (sw *SegmentWriter) Sync() error {
 	if err := sw.heal(); err != nil {
+		return err
+	}
+
+	if err := sw.takeRotateSyncErr(); err != nil {
 		return err
 	}
 
@@ -365,12 +383,23 @@ func (sw *SegmentWriter) Close() error {
 		err = cerr
 	}
 
+	if rerr := sw.takeRotateSyncErr(); err == nil {
+		err = rerr
+	}
+
 	if !sw.closed {
 		sw.closed = true
 		if cerr := sw.fsys.Close(); err == nil {
 			err = cerr
 		}
 	}
+
+	return err
+}
+
+func (sw *SegmentWriter) takeRotateSyncErr() error {
+	err := sw.rotateSyncErr
+	sw.rotateSyncErr = nil
 
 	return err
 }
@@ -441,6 +470,8 @@ func (sw *SegmentWriter) logger() *zap.Logger {
 
 func (sw *SegmentWriter) rotate() error {
 	if err := sw.closeSegment(); err != nil {
+		sw.rotateSyncErr = errors.Wrap(err, "a rotated segment failed to sync")
+
 		return err
 	}
 
@@ -519,6 +550,14 @@ func replayDirFrom(fsys vfs.FS, minEpoch uint64, h Handlers) error {
 			return errors.Wrapf(err, "read segment %q", s.name)
 		}
 
+		if h.OnDamage != nil {
+			if err := salvageSegment(fsys, s.name, data, i == len(segs)-1, &h); err != nil {
+				return errors.Wrapf(err, "replay segment %q", s.name)
+			}
+
+			continue
+		}
+
 		n, err := replay(data, h)
 		if err != nil {
 			return errors.Wrapf(err, "replay segment %q", s.name)
@@ -569,16 +608,15 @@ func segments(fsys vfs.FS, minEpoch uint64) ([]seg, error) {
 	return segs, nil
 }
 
-// repair truncates the segment numbered last to its final complete frame — the shape a crash
-// mid-append leaves it in. It is what keeps a resumed directory replayable: [Create] opens a *new*
-// segment beyond the existing ones, so a torn tail left behind becomes a permanent middle segment
-// and fails every later replay. The discarded bytes are an incomplete frame, unreadable by
-// construction, and repairing an intact segment is a no-op.
+// repair cuts the segment numbered last back to its readable log — the shape a crash mid-append
+// leaves it in. It is what keeps a resumed directory replayable: [Create] opens a *new* segment beyond
+// the existing ones, so a torn tail left behind becomes a permanent middle segment. The discarded bytes
+// are an incomplete frame no valid frame follows, unreadable by construction, and repairing an intact
+// segment is a no-op.
 //
-// A complete frame that fails its CRC is left alone: that is corruption rather than a torn append,
-// and replay is the one place that reports it. So is a segment whose tail turns out to be a hole —
-// a CRC-valid frame follows the stopping point — which is [ErrCorrupt] here rather than a
-// truncation, because [Create] runs before replay and truncating would erase what proves it.
+// Only the tail is cut. A frame that fails its CRC, or a hole with whole frames past it, is left in
+// place for replay: a strict replay reports it, a salvaging one skips it and keeps what follows, and
+// either way cutting it here would erase the records past it and the evidence of the damage.
 func repair(fsys vfs.FS, last int) error {
 	if last == 0 {
 		return nil
@@ -601,16 +639,9 @@ func repair(fsys vfs.FS, last int) error {
 		return errors.Wrapf(err, "read segment %q", name)
 	}
 
-	n, err := frameEnd(data)
-	if err != nil || n == len(data) {
-		return nil //nolint:nilerr // a failing CRC is replay's to report; an intact tail needs nothing
-	}
-
-	// Truncating a hole would discard the whole records past it *and* the evidence that they existed,
-	// leaving replay a clean-looking prefix. Create runs before replay, so this is the first reader
-	// that can see it.
-	if frameAfter(data[n:]) {
-		return errors.Wrapf(ErrCorrupt, "hole in segment %q at offset %d of %d", name, n, len(data))
+	n, _ := walk(data, nil, func(int, int, error) error { return nil })
+	if n == len(data) {
+		return nil
 	}
 
 	if err := replaceSegment(fsys, name, data[:n], nil); err != nil {

@@ -93,7 +93,7 @@ func TestFlushFailureKeepsSamplesAcrossRestart(t *testing.T) {
 	// Restart: recover the watermark from the bucket index, then replay whatever WAL is left.
 	restored := engine.New(engine.Config{Backend: be, Prefix: "t/metrics"})
 	require.NoError(t, restored.LoadParts(ctx))
-	require.NoError(t, restored.Replay(dir))
+	require.NoError(t, restored.Replay(t.Context(), dir))
 
 	assert.Equal(t, []int64{100, 200}, apiSamples(t, restored),
 		"samples logged to the WAL must survive a restart after a failed flush")

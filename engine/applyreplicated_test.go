@@ -76,7 +76,7 @@ func TestApplyPrimaryLogsAcceptedToWAL(t *testing.T) {
 	require.NoError(t, sw.Close())
 
 	recovered := engine.New(engine.Config{OOOWindow: 50})
-	require.NoError(t, recovered.Replay(dir))
+	require.NoError(t, recovered.Replay(t.Context(), dir))
 
 	got := fetchAll(t, recovered, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
 	require.Len(t, got, 1, "the primary's unflushed head is recovered from its WAL")

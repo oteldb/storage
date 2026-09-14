@@ -213,7 +213,7 @@ func TestSideStoreWALReplay(t *testing.T) {
 	// A fresh engine replays the WAL directory: head records and side store both come back.
 	fs := newFakeSide()
 	replayed := recordengine.New(recordengine.Config{Schema: testSchema, SideStore: fs})
-	require.NoError(t, replayed.Replay(dir))
+	require.NoError(t, replayed.Replay(t.Context(), dir))
 
 	require.Equal(t, 1, replayed.HeadRecordCount(), "record replayed")
 	require.Equal(t, []uint64{1, 2}, accIDs(fs), "side store replayed")

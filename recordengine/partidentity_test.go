@@ -209,7 +209,7 @@ func TestWALResolvesStreamAfterCheckpoint(t *testing.T) {
 
 	// Replay alone, with no parts at all — the log must be self-contained.
 	restored := recordengine.New(recordengine.Config{Schema: testSchema})
-	require.NoError(t, restored.Replay(dir))
+	require.NoError(t, restored.Replay(t.Context(), dir))
 
 	require.EqualValues(t, 1, restored.Stats().Streams, "the log re-registers the stream it references")
 	assert.Equal(t, []string{"unflushed"}, streamBodies(t, restored), "the post-checkpoint record survives")

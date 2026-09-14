@@ -40,6 +40,11 @@ type Handlers struct {
 	OnSamplesSF func(id signal.SeriesID, ts []int64, values, sf []float64) error
 	OnRecords   func(id signal.SeriesID, payload []byte) error
 	OnSide      func(payload []byte) error
+	// OnDamage, when set, makes directory replay ([ReplayDirFrom]) salvage a damaged log: each region
+	// it cannot read is reported here and skipped, and replay goes on with the next valid frame and
+	// every later segment. Returning an error stops replay with it. When nil, damage fails replay with
+	// an [ErrCorrupt]-wrapping error. [Replay] of a single payload is always strict.
+	OnDamage func(Damage) error
 }
 
 // Writer appends framed records to an [io.Writer] (typically a segment file). It reuses
@@ -151,48 +156,7 @@ func Replay(data []byte, h Handlers) error {
 // replay dispatches records from data and returns the offset it stopped at: len(data) when the log
 // ended on a frame boundary, and the start of the incomplete frame when it did not. Telling those
 // apart is what lets the caller decide whether a torn record is expected.
-func replay(data []byte, h Handlers) (int, error) {
-	off := 0
-	for off < len(data) {
-		typ, payload, n, err := readFrame(data[off:])
-		if errors.Is(err, io.EOF) {
-			return off, nil // torn frame: the log ends here
-		}
-
-		if err != nil {
-			return off, err
-		}
-
-		off += n
-
-		if err := dispatch(typ, payload, h); err != nil {
-			return off, err
-		}
-	}
-
-	return off, nil
-}
-
-// frameEnd returns the offset just past the last complete, CRC-valid frame in data — where a
-// truncation would leave only whole records. It walks the framing without decoding payloads, so a
-// record this reader does not understand still bounds the truncation correctly.
-func frameEnd(data []byte) (int, error) {
-	off := 0
-	for off < len(data) {
-		_, _, n, err := readFrame(data[off:])
-		if errors.Is(err, io.EOF) {
-			return off, nil
-		}
-
-		if err != nil {
-			return off, err
-		}
-
-		off += n
-	}
-
-	return off, nil
-}
+func replay(data []byte, h Handlers) (int, error) { return walk(data, &h, nil) }
 
 func dispatch(typ byte, payload []byte, h Handlers) error {
 	switch typ {
@@ -203,7 +167,7 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 
 		id, s, err := parseSeries(payload)
 		if err != nil {
-			return err
+			return decodeError{err}
 		}
 
 		return h.OnSeries(id, s)
@@ -214,14 +178,14 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 
 		id, ts, values, err := parseSamples(payload)
 		if err != nil {
-			return err
+			return decodeError{err}
 		}
 
 		return h.OnSamples(id, ts, values)
 	case recordSamplesSF:
 		id, ts, values, sf, err := parseSamplesSF(payload)
 		if err != nil {
-			return err
+			return decodeError{err}
 		}
 
 		// Prefer the sf-aware handler; fall back to the plain one (dropping the weights) so a
@@ -241,7 +205,7 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 
 		id, blob, err := parseRecords(payload)
 		if err != nil {
-			return err
+			return decodeError{err}
 		}
 
 		return h.OnRecords(id, blob)
