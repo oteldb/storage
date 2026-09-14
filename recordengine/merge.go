@@ -8,6 +8,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+
+	"github.com/oteldb/storage/internal/obs"
 )
 
 // Merge runs one size-tiered compaction cycle, dropping records older than retainFrom (retention;
@@ -306,6 +308,14 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 		d, err := p.readForMerge(ctx)
 		if err != nil {
 			return nil, err
+		}
+
+		if !d.tsSorted {
+			// Both writers sort a stream's rows by timestamp, and fetch trusts it. The merge scans such
+			// a part row by row, so it loses nothing, but the part's windowed reads are already wrong.
+			zctx.From(ctx).Warn("part rows are not timestamp-ordered within a stream; merging it without the windowed search",
+				zap.String("part", p.prefix))
+			e.cfg.Obs.Corruption.Detected(ctx, "stream_order", obs.CorruptTolerated)
 		}
 
 		decoded[i] = d

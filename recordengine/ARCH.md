@@ -150,6 +150,14 @@ requirement — the detached buffers stay fetchable through `e.flushing` while t
 the lock, so a concurrent fetch is reading them (§ Flush failure). An already-ordered stream, the
 common case, computes no permutation at all.
 
+**A merge searches a stream's window only in a part it has checked.** Both writers leave each stream's
+rows ts-ascending, and the retention merge binary-searches `[retainFrom, ∞)` on that order. Nothing
+checks it when a part opens, though, and on a part that broke it a search would skip in-window rows the
+merge then retires with the part. `readForMerge` already decodes the whole `ts` column, so it verifies
+the order per stream (`decodedPart.tsSorted`); a part that fails is merged row by row, logged, and
+counted as `corruption.detected{component="stream_order"}`, since its windowed fetches are already
+wrong.
+
 ## Flush failure
 
 A flush detaches the head, then writes the part off the lock, so **every step after the detach must be

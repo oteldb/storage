@@ -2,6 +2,7 @@ package recordengine
 
 import (
 	"context"
+	"slices"
 
 	"github.com/oteldb/storage/encoding/chunk"
 )
@@ -17,6 +18,10 @@ type decodedPart struct {
 	ts    []int64
 	ints  [][]int64
 	bytes []mergeByteCol
+	// tsSorted is whether every stream's rows are ts-ascending, as both part writers leave them. Only then
+	// may a merge binary-search a stream's window: on a part that breaks the order, a search would skip
+	// in-window rows, and the merge would retire the part that held them.
+	tsSorted bool
 }
 
 // mergeByteCol holds one source byte column of a merge, either dict-compressed or, for the dictionary's
@@ -125,6 +130,8 @@ func (p *part) readForMerge(ctx context.Context) (*decodedPart, error) {
 		return nil, err
 	}
 
+	d.tsSorted = streamsTSSorted(d.ts, p.ranges)
+
 	for k := range d.ints {
 		if d.ints[k], err = p.readInt64(ctx, p.schema.intColumn(k).Name, nil, nil); err != nil {
 			return nil, err
@@ -224,9 +231,28 @@ func (c *recordCols) appendMergeRow(d *decodedPart, part, i int) {
 // appendMergeWindow appends rows [rng.start, rng.end) of source part number part whose timestamp is
 // in [start, end] to acc.
 func appendMergeWindow(acc *recordCols, d *decodedPart, part int, rng rowRange, start, end int64) {
+	if d.tsSorted {
+		w := tsWindow(d.ts, rng, start, end)
+		for i := w.start; i < w.end; i++ {
+			acc.appendMergeRow(d, part, i)
+		}
+
+		return
+	}
+
 	for i := rng.start; i < rng.end; i++ {
 		if d.ts[i] >= start && d.ts[i] <= end {
 			acc.appendMergeRow(d, part, i)
 		}
 	}
+}
+
+func streamsTSSorted(ts []int64, ranges []streamRange) bool {
+	for _, r := range ranges {
+		if r.end > len(ts) || !slices.IsSorted(ts[r.start:r.end]) {
+			return false
+		}
+	}
+
+	return true
 }
