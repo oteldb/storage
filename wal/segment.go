@@ -589,3 +589,7 @@ func writeSegment(fsys vfs.FS, name string, data []byte) error {
 
 // ensure io.Writer is satisfied.
 var _ io.Writer = (*SegmentWriter)(nil)
+
+// CreateFS is [Create] over an already-rooted filesystem, for tests outside this package that inject
+// faults through a fake one.
+func CreateFS(fsys vfs.FS, maxBytes int) (*SegmentWriter, error) { return createFS(fsys, maxBytes) }
