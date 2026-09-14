@@ -2,15 +2,21 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/faultbackend"
 
 	"github.com/oteldb/storage/internal/vfs/faultfs"
 	"github.com/oteldb/storage/signal"
@@ -111,13 +117,19 @@ func TestStagedWriteAgesHeadFromAdmission(t *testing.T) {
 
 // FuzzApplyPrimaryReplicatesHead drives the primary path through the admission limits — overflow
 // routing included — with repeated and sampled runs of a series in one payload, with and without a
-// log. The primary must admit each run as appending it directly would, and its accepted frames must
-// rebuild its head on a replica that saw every write, and on a fresh one the write's own series.
+// log. detach flushes the heads before the payloads its bits select. The primary must admit each run as
+// appending it directly would, and its accepted frames must rebuild its head on a replica that saw every
+// write, and on a fresh one the write's own series.
 func FuzzApplyPrimaryReplicatesHead(f *testing.F) {
-	f.Add([]byte{1, 1, 10, 20, 5, 2, 0, 30, 31, 32, 1, 0, 3, 4, 50, 3, 1, 60, 1, 2}, uint8(20), uint8(3), uint8(2), uint8(30), true)
-	f.Add([]byte{0, 0, 0, 0, 0, 7, 1, 255, 7, 0}, uint8(0), uint8(0), uint8(0), uint8(0), false)
+	f.Add([]byte{1, 1, 10, 20, 5, 2, 0, 30, 31, 32, 1, 0, 3, 4, 50, 3, 1, 60, 1, 2}, uint8(20), uint8(3), uint8(2), uint8(30), true, uint16(0))
+	f.Add([]byte{0, 0, 0, 0, 0, 7, 1, 255, 7, 0}, uint8(0), uint8(0), uint8(0), uint8(0), false, uint16(0))
+	f.Add([]byte{1, 0, 1, 2, 3}, uint8(0), uint8(0), uint8(0), uint8(2), true, uint16(0))
+	f.Add([]byte{
+		1, 0, 10, 11, 12, 1, 0, 13, 14, 15, 1, 0, 16, 17, 18,
+		1, 0, 20, 21, 22, 2, 1, 23, 24, 25,
+	}, uint8(0), uint8(2), uint8(0), uint8(0), true, uint16(0b10))
 
-	f.Fuzz(func(t *testing.T, script []byte, ooo, maxSeries, softSeries, inFlight uint8, logged bool) {
+	f.Fuzz(func(t *testing.T, script []byte, ooo, maxSeries, softSeries, inFlight uint8, logged bool, detach uint16) {
 		limits := AppendLimits{
 			MaxSeries:        int64(maxSeries % 8),
 			MaxSeriesSoft:    int64(softSeries % 8),
@@ -135,8 +147,18 @@ func FuzzApplyPrimaryReplicatesHead(f *testing.F) {
 		direct := New(Config{OOOWindow: int64(ooo)})
 		replica := New(Config{})
 
+		k := 0
+
 		// Each run is 5 bytes: series, sampled, three timestamps; each payload is 3 runs.
 		for payloadRuns := range slices.Chunk(script, 15) {
+			if detach&(1<<(k%16)) != 0 {
+				primary.head.detach()
+				direct.head.detach()
+				replica.head.detach()
+			}
+
+			k++
+
 			var (
 				buf  bytes.Buffer
 				want AppendResult
@@ -192,8 +214,60 @@ func FuzzApplyPrimaryReplicatesHead(f *testing.F) {
 				"a fresh replica keeps every accepted sample")
 		}
 
-		if logged {
+		if logged && detach == 0 {
 			require.Equal(t, snapshotHead(primary.head), snapshotHead(replayedHead(t, fsys)))
 		}
+	})
+}
+
+// TestFailedFlushKeepsHeadAgeAcrossStagedAppend: a staged append that refills the head a flush has
+// detached starts a new age, and the flush failing must give the head back the older one.
+func TestFailedFlushKeepsHeadAgeAcrossStagedAppend(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		fsys := faultfs.New()
+
+		w, err := wal.CreateFS(fsys, 0)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = w.Close() })
+
+		be := faultbackend.Wrap(backend.Memory())
+		e := New(Config{WAL: w, Backend: be, Prefix: "t/m"})
+		s := stagedTestSeries("up")
+
+		_, err = e.Append(s, 100, 1)
+		require.NoError(t, err)
+
+		gate := faultbackend.NewGate()
+		be.Add(gate.Rule(faultbackend.Write, nil))
+
+		errFlush := errors.New("injected part write failure")
+		for _, kind := range []faultbackend.Kind{faultbackend.Write, faultbackend.PutIfAbsent, faultbackend.CompareAndSwap} {
+			be.Add(faultbackend.Rule{Kind: kind, Err: errFlush})
+		}
+
+		var (
+			wg       sync.WaitGroup
+			flushErr error
+		)
+
+		wg.Go(func() { flushErr = e.Flush(context.Background()) })
+
+		gate.Await(t)
+
+		const lag = time.Minute
+
+		time.Sleep(lag)
+
+		_, err = e.Append(s, 200, 2)
+		require.NoError(t, err)
+
+		gate.Release()
+		wg.Wait()
+		require.ErrorIs(t, flushErr, errFlush)
+
+		assert.EqualValues(t, 2, e.Stats().HeadSamples)
+		assert.GreaterOrEqual(t, e.head.age(), lag, "the head is as old as its first sample")
 	})
 }

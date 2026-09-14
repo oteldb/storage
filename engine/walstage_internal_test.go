@@ -210,13 +210,20 @@ func snapshotHead(h *head) headState {
 // [head.appendByID], which applies each sample as it admits it. Both engines take the same batches
 // through the same limits: the out-of-order window, the in-flight cap, the hard cardinality cap and
 // the soft budget's overflow routing, so a rejection followed by admitted samples, a series registered
-// mid-batch and an overflow series created mid-batch are all common. The head each leaves must match
+// mid-batch and an overflow series created mid-batch are all common. detach flushes both heads before
+// the batches its bits select, leaving series registered with no buffer. The head each leaves must match
 // field for field, and every batch must report the same result.
 func FuzzStagedAdmissionMatchesDirect(f *testing.F) {
-	f.Add([]byte{1, 10, 2, 20, 1, 5, 3, 30, 4, 1, 5, 2, 1, 40}, uint8(20), uint8(3), uint8(2), uint8(12))
-	f.Add([]byte{0, 0, 0, 0, 7, 255, 7, 0}, uint8(0), uint8(0), uint8(0), uint8(0))
+	f.Add([]byte{1, 10, 2, 20, 1, 5, 3, 30, 4, 1, 5, 2, 1, 40}, uint8(20), uint8(3), uint8(2), uint8(12), uint16(0))
+	f.Add([]byte{0, 0, 0, 0, 7, 255, 7, 0}, uint8(0), uint8(0), uint8(0), uint8(0), uint16(0))
+	// The in-flight cap trips on the batch's own third sample.
+	f.Add([]byte{0, 1, 1, 2, 2, 3}, uint8(0), uint8(0), uint8(0), uint8(2), uint16(0))
+	// s1 is registered and flushed; a new series next to it must count one identity, not two.
+	f.Add([]byte{1, 10, 1, 11, 1, 12, 1, 20, 2, 21, 2, 22}, uint8(0), uint8(2), uint8(0), uint8(0), uint16(0b10))
+	// The overflow series is registered and flushed before the budget routes more series into it.
+	f.Add([]byte{0, 10, 1, 11, 2, 12, 3, 20, 4, 21, 0, 22}, uint8(0), uint8(3), uint8(1), uint8(0), uint16(0b10))
 
-	f.Fuzz(func(t *testing.T, script []byte, ooo, maxSeries, softSeries, inFlight uint8) {
+	f.Fuzz(func(t *testing.T, script []byte, ooo, maxSeries, softSeries, inFlight uint8, detach uint16) {
 		limits := AppendLimits{
 			MaxSeries:        int64(maxSeries % 8),
 			MaxSeriesSoft:    int64(softSeries % 8),
@@ -227,7 +234,15 @@ func FuzzStagedAdmissionMatchesDirect(f *testing.F) {
 		staged, _ := newFaultWALEngine(t, int64(ooo))
 		direct := New(Config{OOOWindow: int64(ooo)})
 
+		k := 0
 		for batch := range slices.Chunk(script, 6) {
+			if detach&(1<<(k%16)) != 0 {
+				staged.head.detach()
+				direct.head.detach()
+			}
+
+			k++
+
 			var (
 				ids   []signal.SeriesID
 				ts    []int64
