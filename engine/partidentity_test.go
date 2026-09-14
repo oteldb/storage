@@ -227,7 +227,7 @@ func TestWALResolvesSeriesAfterCheckpoint(t *testing.T) {
 
 	// Replay alone, with no parts at all — the log must be self-contained.
 	restored := engine.New(engine.Config{})
-	require.NoError(t, restored.Replay(dir))
+	require.NoError(t, restored.Replay(t.Context(), dir))
 
 	require.Equal(t, 1, restored.SeriesCount(), "the log re-registers the series it still references")
 

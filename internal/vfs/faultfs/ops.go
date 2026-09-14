@@ -75,6 +75,8 @@ func (f *FS) OpenFile(name string, flag int, perm fs.FileMode) (vfs.File, error)
 		n.data = n.data[:0]
 	}
 
+	n.open++
+
 	return &handle{fs: f, name: c, node: n, write: flag&(os.O_WRONLY|os.O_RDWR) != 0}, nil
 }
 
@@ -216,6 +218,10 @@ func (f *FS) Rename(oldname, newname string) error {
 
 	if _, dirOK := f.dirs[path.Dir(to)]; !dirOK {
 		return notExist("rename", newname)
+	}
+
+	if dst, exists := f.live[to]; exists && f.lockOpen && dst.open > 0 {
+		return &os.LinkError{Op: "rename", Old: oldname, New: newname, Err: fs.ErrPermission}
 	}
 
 	delete(f.live, from)

@@ -10,17 +10,24 @@ import (
 // handle is an open file. Writes land in the node's live bytes and reach its synced bytes — the
 // ones a crash keeps — only on Sync.
 type handle struct {
-	fs    *FS
-	name  string
-	node  *node
-	write bool
-	off   int64
+	fs     *FS
+	name   string
+	node   *node
+	write  bool
+	off    int64
+	closed bool
 }
 
 // Write implements [io.Writer].
 func (h *handle) Write(p []byte) (int, error) {
-	if err := h.fs.enter(Call{Op: OpWrite, Name: h.name}); err != nil {
-		return 0, err
+	if short, err := h.fs.enterShort(Call{Op: OpWrite, Name: h.name}); err != nil {
+		n := min(max(short, 0), len(p))
+
+		h.fs.mu.Lock()
+		h.node.data = append(h.node.data, p[:n]...)
+		h.fs.mu.Unlock()
+
+		return n, err
 	}
 
 	h.fs.mu.Lock()
@@ -95,7 +102,17 @@ func (h *handle) Sync() error {
 
 // Close implements [io.Closer]. Closing does not commit anything: an unsynced write is still lost
 // by a crash, which is the mistake this fake exists to catch.
-func (h *handle) Close() error { return nil }
+func (h *handle) Close() error {
+	h.fs.mu.Lock()
+	defer h.fs.mu.Unlock()
+
+	if !h.closed {
+		h.closed = true
+		h.node.open--
+	}
+
+	return nil
+}
 
 // dirEntry satisfies [fs.DirEntry] and [fs.FileInfo] for the fake's listings.
 type dirEntry struct {

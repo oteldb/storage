@@ -119,7 +119,7 @@ func TestFlushFailureKeepsRowsAcrossRestart(t *testing.T) {
 
 	e2 := recordengine.New(recordengine.Config{Schema: testSchema, Backend: be, Prefix: "t/recs", WAL: w2})
 	require.NoError(t, e2.LoadParts(ctx))
-	require.NoError(t, e2.Replay(walDir))
+	require.NoError(t, e2.Replay(t.Context(), walDir))
 
 	require.Equal(t, []string{"buffered-1", "buffered-2", "later"}, streamBodies(t, e2),
 		"records logged to the WAL must survive a restart after a failed flush")

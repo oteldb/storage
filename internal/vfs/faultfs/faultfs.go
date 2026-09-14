@@ -90,6 +90,9 @@ type Rule struct {
 	Match func(Call) bool
 	// Err, when non-nil, is returned instead of performing the operation.
 	Err error
+	// Short, for a failing [OpWrite], is how many of the write's bytes land before Err is returned —
+	// the short write a full or failing disk produces. Zero writes nothing.
+	Short int
 	// Before, when non-nil, runs before the operation. It may block, which suspends the calling
 	// goroutine inside the filesystem (see [Gate]).
 	Before func(Call)
@@ -105,6 +108,7 @@ type node struct {
 	synced []byte
 	perm   fs.FileMode
 	mod    time.Time
+	open   int // handles not yet closed
 }
 
 // FS is an in-memory [vfs.FS] with a durability model and fault injection. The zero value is not
@@ -128,6 +132,8 @@ type FS struct {
 
 	rules []*Rule
 	log   []Call
+
+	lockOpen bool // see [FS.LockOpenFiles]
 }
 
 // New returns an empty filesystem.
@@ -140,6 +146,17 @@ func New() *FS {
 		links:       map[string][]string{},
 		unlinks:     map[string][]string{},
 	}
+}
+
+// LockOpenFiles makes a rename over a file some handle still holds open fail, as it does on Windows,
+// so code that must release a file before replacing it is tested on any platform. The setting carries
+// over to the filesystem [FS.Crash] and [FS.Kill] return; rules do not.
+func (f *FS) LockOpenFiles() *FS {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lockOpen = true
+
+	return f
 }
 
 // Add installs a rule. Rules are consulted in order; the first to match an operation decides it.
@@ -190,17 +207,24 @@ func (f *FS) intercept(c Call) *Rule {
 // enter applies the matching rule's Before hook and error. It releases f.mu across Before, so a
 // blocking hook suspends this operation without deadlocking the filesystem.
 func (f *FS) enter(c Call) error {
+	_, err := f.enterShort(c)
+
+	return err
+}
+
+// enterShort is [FS.enter] that also returns how many bytes a failing write lands first ([Rule.Short]).
+func (f *FS) enterShort(c Call) (int, error) {
 	f.mu.Lock()
 	r := f.intercept(c)
 	f.mu.Unlock()
 
 	if r == nil {
-		return nil
+		return 0, nil
 	}
 
 	if r.Before != nil {
 		r.Before(c)
 	}
 
-	return r.Err
+	return r.Short, r.Err
 }

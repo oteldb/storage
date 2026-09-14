@@ -1,7 +1,10 @@
 package recordengine_test
 
 import (
+	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -14,6 +17,7 @@ import (
 	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/internal/obs/obstest"
 	"github.com/oteldb/storage/recordengine"
+	"github.com/oteldb/storage/wal"
 )
 
 const corruptionDetected = "storage.corruption.detected"
@@ -99,4 +103,41 @@ func TestCorruptionIsCounted(t *testing.T) {
 
 		assert.Zero(t, m.Counter(corruptionDetected))
 	})
+}
+
+// TestDamagedWALIsSalvagedAndCounted: replaying a WAL directory with a damaged record keeps the
+// records around it and counts the damage, instead of failing.
+func TestDamagedWALIsSalvagedAndCounted(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	w, err := wal.Create(dir, 0)
+	require.NoError(t, err)
+
+	e := recordengine.New(recordengine.Config{Schema: testSchema, WAL: w})
+	for _, body := range []string{"first", "damaged", "third"} {
+		ingest(t, e, mkBatch("api", rrec{ts: 100, body: body}))
+	}
+
+	require.NoError(t, w.Close())
+
+	segments, err := filepath.Glob(filepath.Join(dir, "*.wal"))
+	require.NoError(t, err)
+	require.Len(t, segments, 1)
+
+	data, err := os.ReadFile(segments[0])
+	require.NoError(t, err)
+
+	at := bytes.Index(data, []byte("damaged"))
+	require.Positive(t, at)
+	data[at] ^= 0xff
+	require.NoError(t, os.WriteFile(segments[0], data, 0o600))
+
+	o, m := obstest.New(t)
+	restored := recordengine.New(recordengine.Config{Schema: testSchema, Obs: o})
+	require.NoError(t, restored.Replay(t.Context(), dir))
+
+	assert.Equal(t, []string{"first", "third"}, streamBodies(t, restored))
+	assert.Equal(t, int64(1), m.Counter(corruptionDetected, "component", "wal", "disposition", "tolerated"))
 }

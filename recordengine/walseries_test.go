@@ -43,7 +43,7 @@ func TestWALSeriesLoggedOnRegistration(t *testing.T) {
 	require.NoError(t, w.Sync())
 
 	e2 := recordengine.New(recordengine.Config{Schema: testSchema, Prefix: "t/recs"})
-	require.NoError(t, e2.Replay(walDir))
+	require.NoError(t, e2.Replay(t.Context(), walDir))
 
 	batches := fetchAll(t, e2, req("web"))
 

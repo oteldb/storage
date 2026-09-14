@@ -30,7 +30,7 @@ the last segment is what closes that one, not the checksum.
 
 **This framing is also the node-to-node replication payload** (`ApplyPrimary` → `cluster/replica` →
 `Replay`), so widening the checksum input is a wire break as well as a disk break. The break is
-loud in both directions — an older directory fails `ErrCorrupt` on its first frame at startup, a
+loud in both directions — an older directory salvages nothing, every frame reported as damage, and a
 mismatched replication payload is rejected rather than half-applied — and both halves need a
 coordinated rollout. Carrying a discriminator in the segment name would version only the disk half
 and leave the wire half broken anyway, which is why the format is not versioned here.
@@ -38,10 +38,11 @@ and leave the wire half broken anyway, which is why the format is not versioned 
 ## Where a torn record is tolerated, and where it is not
 
 Exactly one place may end mid-record: the **last segment of a WAL directory**, which is the one a
-crash was appending to. `ReplayDirFrom` tolerates it there and nowhere else — a short stop in an
+crash was appending to. `ReplayDirFrom` accepts a torn tail there and nowhere else — a short stop in an
 earlier segment means the rest of that segment, and the hole it leaves in history, would be skipped
-while the segments after it papered over the gap. That is silent loss bounded only by the segment
-size, so it is an `ErrCorrupt` naming the segment and the offset.
+while the segments after it papered over the gap. Skipping it silently is loss bounded only by the
+segment size, so it is damage: reported, never taken for the end of the log (see *A damaged log is
+salvaged*).
 
 `Replay` itself is therefore **strict**: it is handed a complete log — a whole segment, or a
 replication payload from `ApplyPrimary` — so a record that does not fit inside the buffer is
@@ -49,40 +50,108 @@ truncation, not an end of stream, and an error: decoding it as a short batch ins
 replica diverge from its primary in silence. The records applied before the stopping point are kept
 either way.
 
-Making the tolerance last-segment-only is only safe because `Create` **repairs on resume**: it
-truncates the highest-numbered segment to its last complete frame before opening the next one
-(Prometheus `wal.Repair` semantics). Without that, one ordinary crash leaves a torn tail that the
+Making the tolerance last-segment-only is only safe because `Create` **repairs on resume**: it cuts
+the highest-numbered segment back to its last complete frame before opening the next one (Prometheus
+`wal.Repair` semantics), by the same copy-and-rename a running writer's restore uses (below), never by
+truncating the segment in place. Without that, one ordinary crash leaves a torn tail that the
 next run turns into a permanent *middle* segment, and every later replay fails. The discarded bytes
-are an incomplete frame, unreadable by construction. A *complete* frame that fails its CRC is left
-alone — that is corruption rather than a torn append, and replay is the one place that reports it.
+are an incomplete frame no valid frame follows, unreadable by construction. Everything before them
+is left alone: a *complete* frame that fails its CRC, or a hole with whole frames past it, is damage
+rather than a torn append, and replay is the one place that reports it — cutting it here would erase
+the records past it and the evidence.
+
+### A failed write is healed before the next one
+
+The same tolerance would not survive a running writer that kept appending after a write failed
+part-way. A full or failing disk returns a short write, and a torn frame followed by later frames is
+exactly the corruption replay refuses, so one `ENOSPC` would make the store unopenable and take every
+acknowledged record behind it with it.
+
+So `SegmentWriter` never writes behind a partial frame. A failed write records the segment and its
+length before the write; before anything else is written, `heal` restores that segment to the length
+if the write left bytes past it, and the writer then moves to a fresh segment, since its open handle
+reaches the dropped bytes. The restore writes the kept prefix to a `.repair` file (not a segment name,
+so a stray one is never replayed, and `Create` removes it), syncs it, closes the torn segment's handle
+without a sync — the copy now holds its whole frames — renames the copy over the segment and syncs the directory — a rename rather than an
+in-place truncate, because a crash midway through rewriting the segment would lose the records already
+acknowledged from it, where a crash before the rename leaves the tear at the log's tail for `Create` to
+repair. The handle is closed before the rename because Windows refuses to rename over an open file, and
+on POSIX a handle kept open would write into the replaced file's orphaned bytes.
+
+Until the restore succeeds every write is refused, including the one that would open a new segment, and
+`Sync`, `Seal` and `Close` fail: the handle is already gone, so the records written before the failed write
+are durable only once the restore is. A failed sync of a segment a rotation closes gets the same
+treatment: the write that rotated reports it, and so does the next `Sync`, `Seal` or `Close`, since the
+records already in that segment were acknowledged and no later sync reaches them. Success includes the directory sync: a retry that finds the segment already at its kept length cannot
+tell whether an earlier attempt's rename is durable, so it syncs the directory again before clearing
+the tear. A segment checkpointed away in the meantime needs no restore.
 
 ### Proving a tail is a tail
 
 Ending mid-record is not by itself evidence of a torn append. A crash does not always truncate to a
 clean prefix: per-block writeback can land a later block while an earlier one is lost, and the
 filesystem zero-fills the gap; a preallocated tail reads back as zeros for the same reason. The
-result is a **hole** — a zero region followed by frames that did reach the platter — and the reader
-stops at the zeros, mistaking committed records for the end of the log.
+result is a **hole** — a zero region followed by frames that did reach the platter — and a reader
+stopping at the zeros would mistake committed records for the end of the log.
 
-So both places that accept a torn tail (`ReplayDirFrom` on the last segment, `repair` before it
-truncates) first scan forward from the stopping point for a complete, CRC-valid frame. One found
-means whole records survive past the gap: the segment is `ErrCorrupt`, and `repair` refuses to
-truncate rather than destroying both the records and the evidence. None found means an ordinary torn
-append, accepted as before.
+So a stopping point is a tail only when no frame replay can trust follows it. A trusted frame is
+CRC-valid and followed by another valid frame or by the end of the segment: a chance CRC32C match is
+2^-32 per candidate offset, two in a row is negligible, and payloads are engine blobs, never nested WAL
+frames, so nothing biases that. The cost is a lone frame between a hole and a torn tail, dropped with
+the tail. (A strict replay keeps the older single-frame test, which reports such a lone frame as a
+hole.)
 
 The scan is byte-aligned, since a hole destroys frame alignment and the resume point can be any
 offset. Cost is bounded two ways: candidates whose length varint is zero or overruns the buffer are
 rejected without a checksum (a zero-fill is one pass over the gap), and the checksummed bytes carry a
-1 GiB budget — roughly 0.3 s — after which the scan gives up and reports a tail. False positives cost
-2^-32 per candidate offset, so even a maximal 32 MiB region misclassifies a healthy log with
-probability ~0.8%; payloads are engine blobs, never nested WAL frames, so nothing biases that.
+1 GiB budget per segment — roughly 0.3 s — after which nothing more is trusted.
 
 Pebble instead carries a durability watermark (`SyncOffset`) in every chunk header and proves
 corruption when a later chunk promises durability past the bad offset. That is exact, and costs a
-format major version and a second reader; a surviving CRC-valid frame is evidence enough here and
-needs no format change. The residual: a hole whose trailing region happens to hold no CRC-valid frame
-— a gap that swallowed every following record, or one whose survivors are themselves torn — is still
-indistinguishable from a tail and is accepted as one.
+format major version and a second reader; salvage makes the distinction matter less, since a hole is
+skipped either way and only the report differs. The residual: a hole whose trailing region holds no
+trusted frame — a gap that swallowed every following record, or one whose survivors are themselves
+torn — is indistinguishable from a tail and is accepted as one.
+
+## A damaged log is salvaged
+
+A damaged segment does not keep a store from opening. For telemetry, losing the records in a damaged
+region is within the contract; refusing to start is not — and with the default `WALSyncNone` a power
+cut that lands a later block before an earlier one is an ordinary event, not a failing disk. So the
+engines replay their directories through `Handlers.OnDamage`: each region replay cannot read — a frame
+failing its CRC, a hole, a CRC-valid frame whose payload does not decode, a torn record in a non-final
+segment — is reported and skipped, and replay resumes at the next trusted frame and goes on through every
+later segment. The engines count it as `storage.corruption.detected{component="wal",
+disposition="tolerated"}` and log it with the segment, offset and bytes skipped (`ADMIN.md`).
+
+What salvage can lose: the records inside a damaged region; samples whose series record was inside it
+(replay drops samples of an unregistered series); and the tail of a batch a crash cut through — a batch
+is several frames, so its whole frames before the cut replay while the client, never acknowledged,
+retries it. Prometheus's `wlog.Repair` instead cuts the log at the damage and deletes every later
+segment, and Loki's replay stops at the first error; both lose everything past the damage to keep going.
+
+The first damage replay meets in a segment copies the segment aside as `{segment}.damaged`, a name
+replay never reads, so a flush checkpointing the segment away does not take the evidence with it. Only
+the newest four copies are kept, so a disk that keeps corrupting the log cannot fill itself with them.
+
+`Handlers.OnDamage` unset keeps replay strict — damage is an `ErrCorrupt` naming the segment and offset —
+and `Replay` of a single payload is always strict: a replica must reject a damaged replication payload
+rather than diverge from its primary.
+
+`FuzzCrashDurability` holds all of this to what the writer acknowledges. It drives a writer on `faultfs`
+through writes, batched writes, syncs, seals, checkpoints and clean restarts, and injects filesystem
+faults, process deaths and power cuts, including partway through a recovery. Every recovery must open
+and replay:
+- records in write order, intact, none duplicated or invented;
+- every record a successful sync covered;
+- every acknowledged record when no power cut intervened;
+- no failed write once a `Sync` healed it, and nothing a checkpoint or an earlier recovery removed;
+- damage only after a crash that kept part of the unsynced state.
+
+A sweep of 400 schedules runs with the tests. Each of eleven known durability regressions — a heal
+skipped in `prepare`, `Sync`, `Seal` or `Close`, a handle left open, the directory sync skipped on retry,
+an in-place repair, a swallowed rotation sync, a checkpoint or segment creation without a directory
+sync, and a `Create` that refuses damage — fails the sweep or the committed fuzz corpus.
 
 ## Epochs — exactly-once recovery (record signals)
 

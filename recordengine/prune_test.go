@@ -237,7 +237,7 @@ func TestPruneIdentitiesSurvivesRestart(t *testing.T) {
 
 	restored := recordengine.New(recordengine.Config{Schema: testSchema, Backend: be, Prefix: "t/recs"})
 	require.NoError(t, restored.LoadParts(ctx))
-	require.NoError(t, restored.Replay(dir))
+	require.NoError(t, restored.Replay(t.Context(), dir))
 
 	assert.EqualValues(t, keep, restored.Stats().Streams, "recovery rebuilds the pruned set, not the old one")
 

@@ -1190,17 +1190,8 @@ func (s *Storage) recoverWAL(ctx context.Context) error {
 			return err
 		}
 
-		if err := replay(ctx, signal.TenantID(filepath.ToSlash(rel)), path); err != nil {
-			if errors.Is(err, wal.ErrCorrupt) {
-				s.obs.Corruption.Detected(ctx, "wal", obs.CorruptFatal)
-				s.obs.Logger(ctx).Error("corrupt WAL segment: the store cannot open until it is repaired or removed",
-					zap.String("dir", path), zap.Error(err))
-			}
-
-			return err
-		}
-
-		return nil
+		// A damaged segment does not fail this: the engines salvage it, counting each skipped region.
+		return replay(ctx, signal.TenantID(filepath.ToSlash(rel)), path)
 	})
 }
 
@@ -1209,49 +1200,49 @@ func (s *Storage) recoverWAL(ctx context.Context) error {
 func (s *Storage) walReplayerFor(name string) (func(context.Context, signal.TenantID, string) error, bool) {
 	switch "/" + name {
 	case metricsPrefix:
-		return func(_ context.Context, tid signal.TenantID, dir string) error {
+		return func(ctx context.Context, tid signal.TenantID, dir string) error {
 			e, err := s.engineFor(tid)
 			if err != nil {
 				return err
 			}
 
-			return e.Replay(dir)
+			return e.Replay(ctx, dir)
 		}, true
 	case logsPrefix:
-		return func(_ context.Context, tid signal.TenantID, dir string) error {
+		return func(ctx context.Context, tid signal.TenantID, dir string) error {
 			e, err := s.logEngineFor(tid)
 			if err != nil {
 				return err
 			}
 
-			return e.Replay(dir)
+			return e.Replay(ctx, dir)
 		}, true
 	case tracesPrefix:
-		return func(_ context.Context, tid signal.TenantID, dir string) error {
+		return func(ctx context.Context, tid signal.TenantID, dir string) error {
 			e, err := s.traceEngineFor(tid)
 			if err != nil {
 				return err
 			}
 
-			return e.Replay(dir)
+			return e.Replay(ctx, dir)
 		}, true
 	case profilesPrefix:
-		return func(_ context.Context, tid signal.TenantID, dir string) error {
+		return func(ctx context.Context, tid signal.TenantID, dir string) error {
 			e, err := s.profileEngineFor(tid)
 			if err != nil {
 				return err
 			}
 
-			return e.Replay(dir)
+			return e.Replay(ctx, dir)
 		}, true
 	case exemplarsPrefix:
-		return func(_ context.Context, tid signal.TenantID, dir string) error {
+		return func(ctx context.Context, tid signal.TenantID, dir string) error {
 			e, err := s.exemplarEngineFor(tid)
 			if err != nil {
 				return err
 			}
 
-			return e.Replay(dir)
+			return e.Replay(ctx, dir)
 		}, true
 	default:
 		return nil, false

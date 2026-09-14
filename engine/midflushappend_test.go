@@ -63,7 +63,7 @@ func TestMidFlushAppendSurvivesCrash(t *testing.T) {
 
 	restored := engine.New(engine.Config{WAL: sw2, Backend: be, Prefix: "t/m"})
 	require.NoError(t, restored.LoadParts(ctx))
-	require.NoError(t, restored.Replay(walDir))
+	require.NoError(t, restored.Replay(t.Context(), walDir))
 
 	got := fetchAll(t, restored, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
 	require.Len(t, got, 1)

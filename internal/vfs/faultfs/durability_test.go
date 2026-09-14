@@ -197,3 +197,82 @@ func TestGateSuspendsUntilReleased(t *testing.T) {
 	_, err = f.Crash().ReadFile("obj")
 	assert.NoError(t, err, "and completing the sync makes it durable")
 }
+
+// TestShortWriteLandsPrefix: a failing write with Short lands that many bytes and reports them, the
+// way a full disk's short write does.
+func TestShortWriteLandsPrefix(t *testing.T) {
+	t.Parallel()
+
+	f := faultfs.New()
+	errFull := errors.New("disk full")
+	f.Add(faultfs.Rule{Op: faultfs.OpWrite, Err: errFull, Short: 3, Times: 1})
+
+	w, err := f.OpenFile("obj", os.O_CREATE|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+
+	n, err := w.Write([]byte("written"))
+	require.ErrorIs(t, err, errFull)
+	assert.Equal(t, 3, n)
+
+	n, err = w.Write([]byte("!"))
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	got, err := f.ReadFile("obj")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("wri!"), got)
+}
+
+// TestLockOpenFilesRefusesRenameOverOpenFile: with LockOpenFiles a rename over a file a handle holds
+// open fails, as on Windows, and succeeds once the handle is closed.
+func TestLockOpenFilesRefusesRenameOverOpenFile(t *testing.T) {
+	t.Parallel()
+
+	f := faultfs.New().LockOpenFiles()
+
+	held, err := f.OpenFile("obj", os.O_CREATE|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+
+	tmp, err := f.OpenFile("tmp", os.O_CREATE|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	require.NoError(t, tmp.Close())
+
+	require.ErrorIs(t, f.Rename("tmp", "obj"), fs.ErrPermission)
+
+	require.NoError(t, held.Close())
+	require.NoError(t, held.Close(), "closing twice releases the file once")
+	require.NoError(t, f.Rename("tmp", "obj"))
+}
+
+// TestLockOpenFilesSurvivesRestart: the filesystem a crash or a process death leaves behind is still
+// Windows-like, so a test restarting on it keeps checking that files are released before a rename.
+func TestLockOpenFilesSurvivesRestart(t *testing.T) {
+	t.Parallel()
+
+	for name, restart := range map[string]func(*faultfs.FS) *faultfs.FS{
+		"Crash": (*faultfs.FS).Crash,
+		"Kill":  (*faultfs.FS).Kill,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			f := faultfs.New().LockOpenFiles()
+			for _, n := range []string{"obj", "tmp"} {
+				w, err := f.OpenFile(n, os.O_CREATE|os.O_WRONLY, 0o600)
+				require.NoError(t, err)
+				require.NoError(t, w.Sync())
+				require.NoError(t, w.Close())
+			}
+
+			require.NoError(t, f.SyncDir("."))
+
+			after := restart(f)
+
+			held, err := after.OpenFile("obj", os.O_WRONLY, 0)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = held.Close() })
+
+			require.ErrorIs(t, after.Rename("tmp", "obj"), fs.ErrPermission)
+		})
+	}
+}

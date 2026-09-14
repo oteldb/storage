@@ -60,6 +60,7 @@ func (f *FS) CrashWith(cfg CrashConfig) *FS {
 	f.applyPending(rng, dirs, files)
 
 	out := New()
+	out.lockOpen = f.lockOpen
 
 	for d := range dirs {
 		out.dirs[d] = 0o750
@@ -167,6 +168,7 @@ func (f *FS) Kill() *FS {
 	defer f.mu.Unlock()
 
 	out := New()
+	out.lockOpen = f.lockOpen
 
 	for d, perm := range f.dirs {
 		out.dirs[d] = perm

@@ -58,7 +58,7 @@ func TestPruneIdentitiesSurvivesRestart(t *testing.T) {
 
 	restored := engine.New(engine.Config{Backend: be, Prefix: "t/prune-wal"})
 	require.NoError(t, restored.LoadParts(ctx))
-	require.NoError(t, restored.Replay(dir))
+	require.NoError(t, restored.Replay(t.Context(), dir))
 
 	assert.Equal(t, keep, restored.SeriesCount(), "recovery rebuilds the pruned set, not the old one")
 

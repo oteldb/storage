@@ -44,7 +44,7 @@ func TestReplaySkipsSegmentsBelowFlushWatermark(t *testing.T) {
 
 	restored := engine.New(engine.Config{Backend: be, Prefix: "t/epoch"})
 	require.NoError(t, restored.LoadParts(ctx))
-	require.NoError(t, restored.Replay(dir))
+	require.NoError(t, restored.Replay(t.Context(), dir))
 
 	assert.Zero(t, restored.HeadSampleCount(), "the superseded segment is skipped, not replayed into the head")
 

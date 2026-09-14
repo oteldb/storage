@@ -60,7 +60,7 @@ func TestMidFlushAppendSurvivesCrash(t *testing.T) {
 
 	e2 := recordengine.New(recordengine.Config{Schema: testSchema, Backend: be, Prefix: "t/recs", WAL: w2})
 	require.NoError(t, e2.LoadParts(ctx))
-	require.NoError(t, e2.Replay(walDir))
+	require.NoError(t, e2.Replay(t.Context(), walDir))
 
 	require.ElementsMatch(t, []string{"b1", "b2"}, streamBodies(t, e2),
 		"the flushed record comes from the part and the mid-flush one from the kept segment, each once")

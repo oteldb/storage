@@ -175,7 +175,7 @@ func TestWALReplayReconstructs(t *testing.T) {
 
 	// A fresh engine replays the WAL and answers the same query.
 	restored := engine.New(engine.Config{})
-	require.NoError(t, restored.Replay(dir))
+	require.NoError(t, restored.Replay(t.Context(), dir))
 	assert.Equal(t, 3, restored.SeriesCount())
 
 	got := fetchAll(t, restored, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "web")}})

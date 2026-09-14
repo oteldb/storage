@@ -43,7 +43,7 @@ func TestPublishWritesIdentityBeforeCommit(t *testing.T) {
 
 	r := recordengine.New(recordengine.Config{Schema: testSchema, Backend: be, Prefix: "t/recs", WAL: w2})
 	require.NoError(t, r.LoadParts(ctx))
-	require.NoError(t, r.Replay(walDir))
+	require.NoError(t, r.Replay(t.Context(), walDir))
 
 	require.Equal(t, []string{"stranded"}, streamBodies(t, r),
 		"rows must stay reachable after a crash between the identity object and the bucket index")

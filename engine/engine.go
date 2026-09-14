@@ -1354,11 +1354,12 @@ func (e *Engine) PartCount() int {
 // Replay rebuilds the head from the WAL segments in dir (durable restart). It skips segments at or
 // below the flush watermark recovered by [Engine.LoadParts] (call LoadParts first), so records
 // already in a flushed part are not re-applied — exactly-once recovery.
-func (e *Engine) Replay(dir string) error {
+// A damaged segment does not fail it: the unreadable regions are skipped, counted and logged.
+func (e *Engine) Replay(ctx context.Context, dir string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return wal.ReplayDirFrom(dir, e.flushedEpoch, e.replayHandlers())
+	return wal.ReplayDirFrom(dir, e.flushedEpoch, e.salvageHandlers(ctx, dir))
 }
 
 // ApplyPrimary applies a write as the shard's **primary**: it runs each sample through the
