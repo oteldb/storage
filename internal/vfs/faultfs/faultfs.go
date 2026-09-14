@@ -108,6 +108,7 @@ type node struct {
 	synced []byte
 	perm   fs.FileMode
 	mod    time.Time
+	open   int // handles not yet closed
 }
 
 // FS is an in-memory [vfs.FS] with a durability model and fault injection. The zero value is not
@@ -131,6 +132,8 @@ type FS struct {
 
 	rules []*Rule
 	log   []Call
+
+	lockOpen bool // see [FS.LockOpenFiles]
 }
 
 // New returns an empty filesystem.
@@ -143,6 +146,16 @@ func New() *FS {
 		links:       map[string][]string{},
 		unlinks:     map[string][]string{},
 	}
+}
+
+// LockOpenFiles makes a rename over a file some handle still holds open fail, as it does on Windows,
+// so code that must release a file before replacing it is tested on any platform.
+func (f *FS) LockOpenFiles() *FS {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lockOpen = true
+
+	return f
 }
 
 // Add installs a rule. Rules are consulted in order; the first to match an operation decides it.

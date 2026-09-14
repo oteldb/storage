@@ -87,4 +87,6 @@ Tests take a fixed seed so the suite never flakes, and log it on failure alongsi
 A `Rule` matches an `Op` (and optionally the `Call`), then fails it with `Err` or suspends it in
 `Before`. A failing write can land a prefix first (`Short`), the short write a full disk returns. `Gate` is the ready-made `Before` for holding an operation until a test releases it, so an
 interleaving is stated rather than raced for. `Calls()` returns the operation log for asserting that
-a `SyncDir` actually happened.
+a `SyncDir` actually happened. `LockOpenFiles` refuses a rename over a file a handle still holds open,
+as Windows does; without it the fake follows POSIX, where the open handle keeps writing to the replaced
+file's orphaned bytes.

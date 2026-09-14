@@ -222,3 +222,24 @@ func TestShortWriteLandsPrefix(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("wri!"), got)
 }
+
+// TestLockOpenFilesRefusesRenameOverOpenFile: with LockOpenFiles a rename over a file a handle holds
+// open fails, as on Windows, and succeeds once the handle is closed.
+func TestLockOpenFilesRefusesRenameOverOpenFile(t *testing.T) {
+	t.Parallel()
+
+	f := faultfs.New().LockOpenFiles()
+
+	held, err := f.OpenFile("obj", os.O_CREATE|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+
+	tmp, err := f.OpenFile("tmp", os.O_CREATE|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	require.NoError(t, tmp.Close())
+
+	require.ErrorIs(t, f.Rename("tmp", "obj"), fs.ErrPermission)
+
+	require.NoError(t, held.Close())
+	require.NoError(t, held.Close(), "closing twice releases the file once")
+	require.NoError(t, f.Rename("tmp", "obj"))
+}
