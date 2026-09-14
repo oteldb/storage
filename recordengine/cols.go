@@ -119,6 +119,9 @@ type recordCols struct {
 	// rowScratch is a reusable kept-row index buffer for the in-place row compactions
 	// (filterPrefix / trimBelow), so they stay allocation-free in a steady loop.
 	rowScratch []int
+	// orderScratch is the permutation [recordCols.sortByTs] sorts into; it never leaves the sort. Kept
+	// apart from rowScratch so neither buffer's correctness depends on the order the two run in.
+	orderScratch []int
 	// viewBufs memoizes the per-byte-column [][]byte view slices materialized at the
 	// [fetch.NamedColumn] boundary, reused across fetches when the accumulator is pooled.
 	viewBufs [][][]byte
@@ -494,10 +497,12 @@ func (c *recordCols) tsOrder(dst []int) []int {
 // the buffer follows: a cell view is valid until the buffer is next appended to or re-armed, and a
 // sort is both.
 func (c *recordCols) sortByTs() {
-	idx := c.tsOrder(nil)
+	idx := c.tsOrder(c.orderScratch[:0])
 	if idx == nil {
 		return
 	}
+
+	c.orderScratch = idx
 
 	c.ts = permute(c.ts, idx)
 	for k := range c.ints {
