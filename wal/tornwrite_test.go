@@ -2,6 +2,9 @@ package wal
 
 import (
 	"fmt"
+	"io/fs"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -190,4 +193,118 @@ func TestTornSegmentCheckpointedBeforeHeal(t *testing.T) {
 	got, err := sides(fsys)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"next"}, got)
+}
+
+// TestHealRetriesDirSyncAfterRename: a restore whose rename landed but whose directory sync failed is
+// not healed — the rename may not have reached the disk — so the retry syncs the directory before any
+// segment is opened behind the torn one.
+func TestHealRetriesDirSyncAfterRename(t *testing.T) {
+	t.Parallel()
+
+	fsys := faultfs.New()
+
+	w, err := createFS(fsys, 0)
+	require.NoError(t, err)
+	require.NoError(t, w.WriteSide([]byte("committed")))
+
+	errDirSync := errors.New("injected directory sync failure")
+	fsys.Add(faultfs.Rule{Op: faultfs.OpSyncDir, Err: errDirSync, Times: 1})
+
+	failNextSegmentWrite(fsys, sideFrameLen("lost")/2)
+	require.ErrorIs(t, w.WriteSide([]byte("lost")), errDiskFull)
+	require.NoError(t, w.WriteSide([]byte("after")))
+	require.NoError(t, w.Close())
+
+	calls := fsys.Calls()
+	renamed := slices.IndexFunc(calls, func(c faultfs.Call) bool { return c.Op == faultfs.OpRename })
+	require.NotEqual(t, -1, renamed)
+
+	opened := slices.IndexFunc(calls[renamed:], func(c faultfs.Call) bool {
+		return c.Op == faultfs.OpCreate && strings.HasSuffix(c.Name, segmentExt)
+	})
+	require.NotEqual(t, -1, opened)
+
+	syncs := 0
+	for _, c := range calls[renamed : renamed+opened] {
+		if c.Op == faultfs.OpSyncDir {
+			syncs++
+		}
+	}
+
+	assert.Equal(t, 2, syncs, "the failed directory sync is retried before the next segment is opened")
+
+	got, err := sides(fsys)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"committed", "after"}, got)
+}
+
+// TestHealAfterSetEpochReleasesTornSegment: a flush that moves the epoch between a failed restore and
+// its retry must not stop heal from closing the torn segment's handle. On POSIX a handle left open
+// would take the writes after the rename into the replaced file's orphaned bytes; on Windows the rename
+// over it fails and the writer never heals.
+func TestHealAfterSetEpochReleasesTornSegment(t *testing.T) {
+	t.Parallel()
+
+	for _, windows := range []bool{false, true} {
+		t.Run(map[bool]string{false: "POSIX", true: "Windows"}[windows], func(t *testing.T) {
+			t.Parallel()
+
+			fsys := faultfs.New()
+			if windows {
+				fsys.LockOpenFiles()
+			}
+
+			w, err := createFS(fsys, 0)
+			require.NoError(t, err)
+			require.NoError(t, w.WriteSide([]byte("committed")))
+
+			// The restore fails reading the torn segment, before it gets to release the handle.
+			fsys.Add(faultfs.Rule{
+				Op:    faultfs.OpRead,
+				Match: func(c faultfs.Call) bool { return strings.HasSuffix(c.Name, segmentExt) },
+				Err:   errors.New("injected read failure"),
+				Times: 1,
+			})
+			failNextSegmentWrite(fsys, sideFrameLen("lost")/2)
+			require.ErrorIs(t, w.WriteSide([]byte("lost")), errDiskFull)
+
+			w.SetEpoch(2)
+
+			require.NoError(t, w.WriteSide([]byte("after")))
+			require.NoError(t, w.Close())
+
+			got, err := sides(fsys)
+			require.NoError(t, err)
+			assert.Equal(t, []string{"committed", "after"}, got)
+		})
+	}
+}
+
+// TestCreateRemovesRepairTemps: a restore interrupted by a crash leaves its temporary file behind;
+// the next writer removes it, so repeated crashes do not accumulate them.
+func TestCreateRemovesRepairTemps(t *testing.T) {
+	t.Parallel()
+
+	fsys := faultfs.New()
+
+	w, err := createFS(fsys, 0)
+	require.NoError(t, err)
+	require.NoError(t, w.WriteSide([]byte("committed")))
+	require.NoError(t, w.Close())
+
+	tmp := segmentName(1, 1) + repairExt
+	f, err := fsys.OpenFile(tmp, os.O_CREATE|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	resumed, err := createFS(fsys, 0)
+	require.NoError(t, err)
+	require.NoError(t, resumed.Close())
+
+	_, err = fsys.Stat(tmp)
+	require.ErrorIs(t, err, fs.ErrNotExist)
+
+	got, err := sides(fsys)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"committed"}, got)
 }

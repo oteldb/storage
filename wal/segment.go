@@ -18,6 +18,7 @@ import (
 
 const (
 	segmentExt = ".wal"
+	repairExt  = ".repair"
 
 	// DefaultMaxSegmentBytes is the size at which the writer rotates to a new segment.
 	DefaultMaxSegmentBytes = 32 << 20 // 32 MiB
@@ -35,6 +36,7 @@ type SegmentWriter struct {
 	seq      int
 	epoch    uint64 // flush generation stamped into new segment names; see [SegmentWriter.SetEpoch]
 	f        vfs.File
+	name     string // the open segment's name: its epoch is the one current when it was opened
 	size     int
 	w        *Writer
 	sync     bool        // fsync after every framed write (durability vs throughput)
@@ -95,6 +97,10 @@ func createFS(fsys vfs.FS, maxBytes int) (*SegmentWriter, error) {
 	}
 
 	if err := repair(fsys, last); err != nil {
+		return nil, err
+	}
+
+	if err := removeRepairTemps(fsys); err != nil {
 		return nil, err
 	}
 
@@ -256,7 +262,7 @@ func (sw *SegmentWriter) Write(p []byte) (int, error) {
 		return n, nil
 	}
 
-	sw.tornName, sw.tornGood = segmentName(sw.seq, sw.epoch), good
+	sw.tornName, sw.tornGood = sw.name, good
 	if herr := sw.heal(); herr != nil {
 		sw.logger().Warn("wal write failed and its segment could not be restored yet; writes are refused until it is",
 			zap.String("dir", sw.dir), zap.String("segment", sw.tornName), zap.Error(herr))
@@ -451,7 +457,7 @@ func (sw *SegmentWriter) openNext() error {
 		return errors.Wrapf(err, "sync wal dir %q", sw.dir)
 	}
 
-	sw.f, sw.size = f, 0
+	sw.f, sw.name, sw.size = f, name, 0
 	sw.logger().Debug("wal segment opened", zap.String("name", name), zap.Int("seq", sw.seq), zap.Uint64("epoch", sw.epoch))
 
 	return nil
@@ -597,13 +603,15 @@ func repair(fsys vfs.FS, last int) error {
 }
 
 // heal restores the segment a failed write left bytes in to its last whole frame, so nothing is ever
-// written behind a partial frame. It is a no-op when no write has failed, and when the failed write left
-// nothing behind or its segment has since been checkpointed away. The writer then moves to a fresh
-// segment: its open handle may reach bytes the replacement dropped.
+// written behind a partial frame. It is a no-op when no write has failed, and restores nothing when the
+// failed write left nothing behind or its segment has since been checkpointed away. The writer then
+// moves to a fresh segment: its open handle may reach bytes the replacement dropped.
 //
 // The replacement is a new file renamed over the old one, never an in-place truncation: a crash midway
 // through rewriting the segment would take the records already acknowledged from it too. Until heal
-// succeeds every write is refused, including the one that would open the next segment.
+// succeeds every write is refused, including the one that would open the next segment. That includes
+// the directory sync committing the rename, which heal repeats until it succeeds: a retry finding the
+// segment already restored cannot tell whether an earlier attempt's rename reached the disk.
 func (sw *SegmentWriter) heal() error {
 	if sw.tornName == "" {
 		return nil
@@ -618,8 +626,10 @@ func (sw *SegmentWriter) heal() error {
 	case err != nil:
 		return errors.Wrapf(err, "read torn segment %q", name)
 	case len(data) > good:
-		if sw.f != nil && name == segmentName(sw.seq, sw.epoch) {
-			// Closed without a sync: its tail is the partial frame being discarded.
+		// While a tear is unhealed nothing opens another segment, so an open handle is the torn
+		// segment's. It is closed without a sync — its tail is the partial frame being discarded — and
+		// before the rename, which Windows refuses over an open file.
+		if sw.f != nil {
 			_ = sw.f.Close()
 			sw.f = nil
 		}
@@ -632,16 +642,20 @@ func (sw *SegmentWriter) heal() error {
 			zap.String("dir", sw.dir), zap.String("segment", name), zap.Int("kept", good), zap.Int("dropped", len(data)-good))
 	}
 
+	if err := sw.fsys.SyncDir("."); err != nil {
+		return errors.Wrapf(err, "sync wal dir %q", sw.dir)
+	}
+
 	sw.tornName, sw.tornGood = "", 0
 
 	return nil
 }
 
-// replaceSegment atomically replaces name's contents with data: data goes to a temporary file that is
-// synced and renamed over name, and the rename is committed by syncing the directory. The temporary
-// name does not parse as a segment, so one left behind by a crash is never replayed.
+// replaceSegment replaces name's contents with data: data goes to a temporary file that is synced and
+// renamed over name. The rename is durable only once the caller syncs the directory. The temporary name
+// does not parse as a segment, so one left behind is never replayed, and [Create] removes it.
 func replaceSegment(fsys vfs.FS, name string, data []byte) error {
-	tmp := name + ".repair"
+	tmp := name + repairExt
 
 	if err := writeNew(fsys, tmp, data); err != nil {
 		_ = fsys.Remove(tmp)
@@ -655,7 +669,28 @@ func replaceSegment(fsys vfs.FS, name string, data []byte) error {
 		return err
 	}
 
-	return fsys.SyncDir(".")
+	return nil
+}
+
+// removeRepairTemps removes the temporary files a restore interrupted by a crash, or whose cleanup
+// failed, left behind.
+func removeRepairTemps(fsys vfs.FS) error {
+	entries, err := fsys.ReadDir(".")
+	if err != nil {
+		return errors.Wrap(err, "read wal dir")
+	}
+
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), repairExt) {
+			continue
+		}
+
+		if err := fsys.Remove(e.Name()); err != nil && !os.IsNotExist(err) {
+			return errors.Wrapf(err, "remove %q", e.Name())
+		}
+	}
+
+	return nil
 }
 
 func writeNew(fsys vfs.FS, name string, data []byte) error {
