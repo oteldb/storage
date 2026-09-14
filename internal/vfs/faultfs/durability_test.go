@@ -243,3 +243,36 @@ func TestLockOpenFilesRefusesRenameOverOpenFile(t *testing.T) {
 	require.NoError(t, held.Close(), "closing twice releases the file once")
 	require.NoError(t, f.Rename("tmp", "obj"))
 }
+
+// TestLockOpenFilesSurvivesRestart: the filesystem a crash or a process death leaves behind is still
+// Windows-like, so a test restarting on it keeps checking that files are released before a rename.
+func TestLockOpenFilesSurvivesRestart(t *testing.T) {
+	t.Parallel()
+
+	for name, restart := range map[string]func(*faultfs.FS) *faultfs.FS{
+		"Crash": (*faultfs.FS).Crash,
+		"Kill":  (*faultfs.FS).Kill,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			f := faultfs.New().LockOpenFiles()
+			for _, n := range []string{"obj", "tmp"} {
+				w, err := f.OpenFile(n, os.O_CREATE|os.O_WRONLY, 0o600)
+				require.NoError(t, err)
+				require.NoError(t, w.Sync())
+				require.NoError(t, w.Close())
+			}
+
+			require.NoError(t, f.SyncDir("."))
+
+			after := restart(f)
+
+			held, err := after.OpenFile("obj", os.O_WRONLY, 0)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = held.Close() })
+
+			require.ErrorIs(t, after.Rename("tmp", "obj"), fs.ErrPermission)
+		})
+	}
+}

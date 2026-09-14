@@ -149,7 +149,8 @@ func New() *FS {
 }
 
 // LockOpenFiles makes a rename over a file some handle still holds open fail, as it does on Windows,
-// so code that must release a file before replacing it is tested on any platform.
+// so code that must release a file before replacing it is tested on any platform. The setting carries
+// over to the filesystem [FS.Crash] and [FS.Kill] return; rules do not.
 func (f *FS) LockOpenFiles() *FS {
 	f.mu.Lock()
 	defer f.mu.Unlock()
