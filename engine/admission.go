@@ -51,6 +51,25 @@ func (r AppendResult) Rejected() int {
 	return r.RejectedOOO + r.RejectedCardinality + r.RejectedBytes
 }
 
+// with returns r with one more sample counted under out.
+func (r AppendResult) with(out admitOutcome) AppendResult {
+	switch out {
+	case admitted:
+		r.Accepted++
+	case admittedOverflow:
+		r.Accepted++
+		r.Overflowed++
+	case rejectOOO:
+		r.RejectedOOO++
+	case rejectCardinality:
+		r.RejectedCardinality++
+	case rejectBytes:
+		r.RejectedBytes++
+	}
+
+	return r
+}
+
 // admitOutcome is the per-sample decision inside the head.
 type admitOutcome uint8
 

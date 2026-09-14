@@ -49,6 +49,18 @@ and re-appends do not re-index.
 first sight, under one lock. `appendByID` does one map probe: a present buffer means the series is
 known, so no `signal.Series` is built or hashed. WAL frames group by series, one write a batch.
 
+**A logged write decides, logs, then applies.** With a WAL, `Append` and `AppendBatch` —
+and `ApplyPrimary` always — stage every sample in `walBatch` — admitted exactly as `appendByID` would admit it had
+the samples before it been applied — log the staged batch as a single WAL write, and only then apply
+it. Applying first left a failed log write's samples in the head, and worse for a series seen for the
+first time: its buffer already existed, so the retry skipped the identity record and logged samples
+that replay drops, losing an acknowledged write at the next crash. One write per batch is what makes
+the log side all-or-nothing: a failed write lands nothing a retry would log again (a part-way failure
+is healed by the WAL itself, `../wal/ARCH.md`). An engine with no WAL keeps the one-pass `appendByID`,
+which nothing can interrupt; `FuzzStagedAdmissionMatchesDirect` pins the two to the same outcome and
+the same head. The head's age starts at the first staged sample, not when the log write returns, so a
+slow disk does not delay an age-triggered flush.
+
 ## Flush
 
 Drains the head into one flat part, one row per sample:
@@ -909,7 +921,11 @@ accumulated durations on one span plus a planning child span, not sub-spans (`AD
 | `RefreshReplica` | reloads parts from the store and trims the head against each series' own flushed watermark |
 
 `ApplyPrimary` OOO-checks and admission-checks each sample, returning the accepted set re-framed plus a
-per-reason reject breakdown.
+per-reason reject breakdown. The accepted frames are encoded from the staged batch, so a sample routed
+to an overflow series replicates under that series, and every series in them carries its identity
+record: a replica that joined or restarted since the series' last write does not hold it, and would
+drop samples without it. A payload that fails to decode or to log applies nothing, not its valid
+prefix.
 
 **The replica trim watermark is per series, never one figure across the head.** A series absent from
 every part keeps its whole head, and a series present keeps every sample past *its own* newest flushed
