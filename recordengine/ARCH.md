@@ -150,6 +150,14 @@ requirement — the detached buffers stay fetchable through `e.flushing` while t
 the lock, so a concurrent fetch is reading them (§ Flush failure). An already-ordered stream, the
 common case, computes no permutation at all.
 
+**A merge searches a stream's window only in a part it has checked.** Both writers leave each stream's
+rows ts-ascending, and the retention merge binary-searches `[retainFrom, ∞)` on that order. Nothing
+checks it when a part opens, though, and on a part that broke it a search would skip in-window rows the
+merge then retires with the part. `readForMerge` already decodes the whole `ts` column, so it verifies
+the order per stream (`decodedPart.tsSorted`); a part that fails is merged row by row, logged, and
+counted as `corruption.detected{component="stream_order"}`, since its windowed fetches are already
+wrong.
+
 ## Flush failure
 
 A flush detaches the head, then writes the part off the lock, so **every step after the detach must be
@@ -316,6 +324,20 @@ path, a map write for every record. The run carries its own watermark, so a reco
 against the newest record ahead of it in the same run; `commit` publishes it. A run that admits
 nothing leaves the head untouched, which is what keeps `needsStreamRecord` true for a stream whose
 whole batch was rejected.
+
+**A logged write decides, logs, then applies.** With a WAL, `AppendBatch` and `ApplyPrimary` run every
+record through `streamAppender.admit` — the out-of-order and in-flight-byte checks, charged against
+the bytes already admitted in the same write rather than the head's growth — then write the log, and
+only then `apply` the admitted records and `commit` the watermark. Applying first would leave a failed
+log write's records in the head un-logged while the caller, seeing the error, retried; records are
+append-only, so the retry would store them twice. Deciding first admits exactly what applying first
+did, because under the exclusive lock the head grows only by this write's own records. Replay and the
+replica apply keep the one-pass `append`: their records are already durable.
+
+The side delta goes to the log **before** the records, and `ApplyPrimary` puts every side frame ahead
+of the records in its payload. A delta is content-addressed and absorbing it again is a dedup, so a
+delta that reached the log without its records costs nothing on retry; records that reached it ahead
+of a failed delta would be replayed and then logged again.
 
 ## Fetch
 
@@ -509,7 +531,8 @@ and bounded by `MaxSketchGroups`, so the sketch state is a budget rather than gr
 
 The WAL frame is signal-agnostic — an opaque engine-encoded payload plus an optional side frame.
 `recordengine` owns the codec and `EncodeWAL`, the cluster write form, which appends the side frame so
-the profile symbol store replicates. `ApplyPrimary`/`ApplyReplicated` mirror the metric engine's
+the profile symbol store replicates. The accepted payload `ApplyPrimary` returns leads with the side
+frames instead (see "A logged write decides, logs, then applies"); replicas apply either order. `ApplyPrimary`/`ApplyReplicated` mirror the metric engine's
 primary-authoritative contract, and so does `RefreshReplica`'s **per-stream** trim watermark
 ([`../engine/ARCH.md`](../engine/ARCH.md), "Cluster surface"): a stream absent from every part keeps
 its whole head, one present keeps every record past *its own* newest flushed timestamp — the bucket

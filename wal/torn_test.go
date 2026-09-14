@@ -127,3 +127,20 @@ func TestRepairLeavesCorruptSegment(t *testing.T) {
 	_, err = sides(fsys)
 	require.ErrorIs(t, err, ErrCorrupt)
 }
+
+// TestCreateFSWritesThroughFS: the exported seam logs into the filesystem it is handed, in the form
+// replay reads back.
+func TestCreateFSWritesThroughFS(t *testing.T) {
+	t.Parallel()
+
+	fsys := faultfs.New()
+
+	w, err := CreateFS(fsys, 0)
+	require.NoError(t, err)
+	require.NoError(t, w.WriteSide([]byte("delta")))
+	require.NoError(t, w.Close())
+
+	got, err := sides(fsys)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"delta"}, got)
+}

@@ -189,6 +189,11 @@ type Engine struct {
 	// A part is written by a flush or a merge, both of which run under flushMu, so the same
 	// single-writer argument as flushBuf applies — see [Engine.blooms].
 	bloomBuf *bloomBuilder
+	// walBuf and admitRows are the WAL payload and admitted-row scratch of [Engine.appendLogged], which
+	// runs under the exclusive lock. The WAL copies a payload before returning, so the next write may
+	// reuse it; one larger than walBufKeepBytes is dropped rather than kept resident.
+	walBuf    []byte
+	admitRows []int
 	// flushedEpoch is the WAL flush watermark: the generation of the most recently flushed head
 	// (persisted in the bucket index, under this writer's [Config.WriterID] slot). Current head
 	// records are written to the WAL at flushedEpoch+1,
@@ -384,57 +389,11 @@ func (e *Engine) AppendBatch(b *Batch, limits AppendLimits) (AppendResult, error
 
 	e.head.ensureStream(b.Stream, identity, limits.MaxSeries)
 
-	scratch := rec{ints: make([]int64, len(b.Ints)), bytes: make([][]byte, len(b.Bytes))}
-
-	var (
-		res     AppendResult
-		walRecs []rec
-	)
-
-	app := e.head.appenderFor(b.Stream)
-	defer app.commit()
-
-	for i := range b.Ts {
-		scratch.ts = b.Ts[i]
-		for k := range b.Ints {
-			scratch.ints[k] = b.Ints[k][i]
-		}
-
-		for k := range b.Bytes {
-			scratch.bytes[k] = b.Bytes[k][i]
-		}
-
-		switch app.append(scratch, e.cfg.OOOWindow, limits.MaxInFlightBytes) {
-		case admitted:
-			res.Accepted++
-		case rejectOOO:
-			res.RejectedOOO++
-
-			continue
-		case rejectBytes:
-			res.RejectedBytes++
-
-			continue
-		}
-
-		if e.cfg.WAL != nil {
-			walRecs = append(walRecs, cloneRec(scratch))
-		}
+	if e.cfg.WAL == nil {
+		return e.appendUnlogged(b, limits)
 	}
 
-	if e.cfg.WAL != nil && res.Accepted > 0 {
-		if err := e.logWAL(b, walRecs); err != nil {
-			return res, err
-		}
-	}
-
-	if e.cfg.SideStore != nil && res.Accepted > 0 && len(b.Side) > 0 {
-		if err := e.cfg.SideStore.Absorb(b.Side); err != nil {
-			return res, errors.Wrap(err, "absorb side delta")
-		}
-	}
-
-	return res, nil
+	return e.appendLogged(b, limits)
 }
 
 // HeadBytes returns the engine's buffered record bytes — the in-flight memory measure for
@@ -993,16 +952,14 @@ func (e *Engine) HeadRecordCount() int {
 // logWAL durably logs a batch's accepted records and — when present — its side-store delta, so a WAL
 // replay reconstructs the head and the symbols those records reference. The stream's identity is
 // logged separately, at registration time (see [Engine.AppendBatch]).
-func (e *Engine) logWAL(b *Batch, walRecs []rec) error {
-	if err := e.cfg.WAL.WriteRecords(b.Stream, encodeRecs(walRecs)); err != nil {
-		return err
-	}
-
+func (e *Engine) logWAL(b *Batch, records []byte) error {
 	if len(b.Side) > 0 {
-		return e.cfg.WAL.WriteSide(b.Side)
+		if err := e.cfg.WAL.WriteSide(b.Side); err != nil {
+			return err
+		}
 	}
 
-	return nil
+	return e.cfg.WAL.WriteRecords(b.Stream, records)
 }
 
 // replayHandlers builds the WAL handlers that rebuild the head and side store from a record log

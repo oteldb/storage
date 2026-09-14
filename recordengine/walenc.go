@@ -31,16 +31,45 @@ func EncodeWAL(b *Batch) []byte {
 func encodeBatchRecs(b *Batch) []byte {
 	dst := binary.AppendUvarint(nil, uint64(b.Len()))
 	for i := range b.Ts {
-		dst = binary.AppendVarint(dst, b.Ts[i])
-		for k := range b.Ints {
-			dst = binary.AppendVarint(dst, b.Ints[k][i])
-		}
-
-		for k := range b.Bytes {
-			dst = binary.AppendUvarint(dst, uint64(len(b.Bytes[k][i])))
-			dst = append(dst, b.Bytes[k][i]...)
-		}
+		dst = appendBatchRec(dst, b, i)
 	}
 
 	return dst
+}
+
+// appendBatchRec appends record i of b in the per-record layout of [encodeBatchRecs].
+func appendBatchRec(dst []byte, b *Batch, i int) []byte {
+	dst = binary.AppendVarint(dst, b.Ts[i])
+	for k := range b.Ints {
+		dst = binary.AppendVarint(dst, b.Ints[k][i])
+	}
+
+	for k := range b.Bytes {
+		dst = binary.AppendUvarint(dst, uint64(len(b.Bytes[k][i])))
+		dst = append(dst, b.Bytes[k][i]...)
+	}
+
+	return dst
+}
+
+// recsCountRoom is the room [openRecs] reserves for a payload's record count, which is known only once
+// every record has been encoded.
+const recsCountRoom = binary.MaxVarintLen64
+
+// openRecs starts an [encodeBatchRecs]-layout payload in dst, to be filled by [appendBatchRec] and
+// finished by [sealRecs].
+func openRecs(dst []byte) []byte {
+	return append(dst[:0], make([]byte, recsCountRoom)...)
+}
+
+// sealRecs writes the record count into the room [openRecs] reserved and returns the payload, which
+// is byte-identical to encoding the same records with [encodeBatchRecs].
+func sealRecs(buf []byte, count int) []byte {
+	var n [binary.MaxVarintLen64]byte
+
+	w := binary.PutUvarint(n[:], uint64(count))
+	start := recsCountRoom - w
+	copy(buf[start:recsCountRoom], n[:w])
+
+	return buf[start:]
 }

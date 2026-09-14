@@ -23,7 +23,7 @@ type Corruption struct {
 }
 
 // Detected accounts one corrupt artifact: component names what failed its check (wal, part,
-// bucket_index, marks, bloom, part_identity, series_index, series_stats), disposition is
+// bucket_index, marks, bloom, part_identity, series_index, series_stats, stream_order), disposition is
 // [CorruptTolerated] or [CorruptFatal].
 func (c *Corruption) Detected(ctx context.Context, component, disposition string) {
 	c.detected.Add(ctx, 1, metric.WithAttributes(

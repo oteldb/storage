@@ -12,19 +12,6 @@ import (
 // order), then the byte columns (length-prefixed, schema order). encode/decode agree on the column
 // counts via the schema.
 
-// cloneRec deep-copies r so it can outlive the caller's scratch (used to stage WAL records).
-func cloneRec(r rec) rec {
-	ints := make([]int64, len(r.ints))
-	copy(ints, r.ints)
-
-	byts := make([][]byte, len(r.bytes))
-	for k := range r.bytes {
-		byts[k] = cloneBytes(r.bytes[k])
-	}
-
-	return rec{ts: r.ts, ints: ints, bytes: byts}
-}
-
 func encodeRecs(recs []rec) []byte {
 	dst := binary.AppendUvarint(nil, uint64(len(recs)))
 	for i := range recs {
