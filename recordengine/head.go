@@ -459,9 +459,18 @@ func appendColsWindow(buf, acc *recordCols, start, end int64) error {
 
 // bufInRange reports whether buf holds any record with timestamp in [start, end]. No-op (false) when
 // buf is nil.
+//
+// The tracked bounds answer most calls without the scan. They widen on every append and never narrow
+// when rows are dropped, so they always contain the live rows' timestamps: a window outside them holds
+// no row, and a window containing them holds every row — provided there is one, since a buffer trimmed
+// to empty keeps the bounds of the rows it lost.
 func bufInRange(buf *recordCols, start, end int64) bool {
-	if buf == nil {
+	if buf == nil || buf.len() == 0 || end < buf.tsMin || start > buf.tsMax {
 		return false
+	}
+
+	if start <= buf.tsMin && buf.tsMax <= end {
+		return true
 	}
 
 	for _, t := range buf.ts {
