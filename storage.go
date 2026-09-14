@@ -168,12 +168,16 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 
 	// Recover previously-flushed data from a durable backend so a fresh process serves it.
 	if err := s.recover(ctx); err != nil {
+		s.releaseWALs()
+
 		return nil, err
 	}
 
 	// Join the cluster (membership + replica server + routed writes) when configured.
 	if o.Cluster != nil {
 		if o.nodeLocalBackendUnshared() {
+			s.releaseWALs()
+
 			return nil, errors.Errorf(
 				"cluster backend %T is node-private but cluster.Config.PrivateBackend is false: "+
 					"flushed parts would not be replicated between nodes, so after a rebalance handoff or a "+
@@ -188,6 +192,8 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 		s.noteRecoveryGaps()
 
 		if err := s.startCluster(ctx, o.Cluster); err != nil {
+			s.releaseWALs()
+
 			return nil, errors.Wrap(err, "start cluster")
 		}
 	}
@@ -881,11 +887,33 @@ func (f seedFetcher) Unwrap() fetch.Fetcher { return f.inner }
 // through one loop.
 type engineCloser interface {
 	Close(ctx context.Context) error
+	CloseWAL() error
 }
 
 // closeEngines drains every tenant engine's head to a durable part and closes its WAL, returning
 // the first error while still closing the rest.
 func (s *Storage) closeEngines(ctx context.Context) error {
+	var firstErr error
+
+	for _, eng := range s.allEngines() {
+		if err := eng.Close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
+}
+
+// releaseWALs closes every engine's WAL without flushing, for an [Open] that fails after recovery
+// created engines: nothing was acknowledged, and a flush would write parts from a store that never
+// opened. The segments stay for the next Open to replay.
+func (s *Storage) releaseWALs() {
+	for _, eng := range s.allEngines() {
+		_ = eng.CloseWAL()
+	}
+}
+
+func (s *Storage) allEngines() []engineCloser {
 	all := make([]engineCloser, 0,
 		len(s.engineSnapshot())+len(s.logEngineSnapshot())+len(s.traceEngineSnapshot())+len(s.profileEngineSnapshot())+
 			len(s.exemplarEngineSnapshot()))
@@ -910,15 +938,7 @@ func (s *Storage) closeEngines(ctx context.Context) error {
 		all = append(all, eng)
 	}
 
-	var firstErr error
-
-	for _, eng := range all {
-		if err := eng.Close(ctx); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-
-	return firstErr
+	return all
 }
 
 // baseFetcher builds the unwrapped read seam for the tenant set: owner-aware per tenant in
