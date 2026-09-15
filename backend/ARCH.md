@@ -62,9 +62,16 @@ a demonstration.
   commits its *bytes*; the directory entry that names them is a separate promise, and a rename is
   the classic case a journalling filesystem does not make for free. Every publish therefore ends by
   syncing the destination directory — after the rename in `Write` and `ObjectWriter.Commit`, after
-  the link in `PutIfAbsent`, after the unlink and each rmdir in `Delete` — and, when the write had
-  to create a directory chain, by syncing that chain from the outermost in, since a child's entry
-  only means something once its parent's entry is on the disk. Without that last barrier the
+  the link in `PutIfAbsent`, after the unlink and each rmdir in `Delete` — and then by syncing the
+  entry of every ancestor not yet known durable, innermost first, so no entry reaches the disk
+  before what it names. "Not known durable", not "created by this call": a directory a concurrent
+  writer made exists before its entry is synced, and a writer that skipped it would lose its
+  acknowledged object to a power cut that lands before the creator's sync. Known-durable directories
+  live in a set shared by every `File` over one root directory (matched by file identity, so symlinks and bind mounts share it) — within one process, the
+  same limit as the backend's CAS; a directory leaves it *before* its rmdir (a
+  writer recreating it in between would otherwise skip the sync), and a removal during a publish
+  discards that publish's additions. `New` syncs every entry on the root's path, since a publish
+  stops at the root. Steady state stays one directory fsync. Without that barrier the
   bucket-index CAS (the commit point, and the only `CompareAndSwap` call site) can revert under a
   power cut while the WAL checkpoint that follows it has already deleted the segments replay would
   need: silent loss of acknowledged records. It costs one directory fsync per published object —

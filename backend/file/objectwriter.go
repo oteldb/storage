@@ -33,7 +33,7 @@ func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter
 		return nil, err
 	}
 
-	tmp, name, created, err := createTemp(root, path.Dir(p))
+	tmp, name, err := createTemp(root, path.Dir(p))
 	if err != nil {
 		_ = root.Close()
 
@@ -41,13 +41,13 @@ func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter
 	}
 
 	return &objectWriter{
-		root:    root,
-		key:     key,
-		path:    p,
-		tmp:     tmp,
-		name:    name,
-		created: created,
-		buf:     bufio.NewWriterSize(tmp, objectWriteBufferBytes),
+		file: f,
+		root: root,
+		key:  key,
+		path: p,
+		tmp:  tmp,
+		name: name,
+		buf:  bufio.NewWriterSize(tmp, objectWriteBufferBytes),
 	}, nil
 }
 
@@ -56,13 +56,13 @@ func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter
 // The root handle stays open for the writer's lifetime — the temp file it holds is only published
 // at commit — and is released by [objectWriter.Commit] or [objectWriter.Abort].
 type objectWriter struct {
-	root    vfs.FS
-	key     string
-	path    string
-	tmp     vfs.File
-	name    string
-	created []string
-	buf     *bufio.Writer
+	file *File
+	root vfs.FS
+	key  string
+	path string
+	tmp  vfs.File
+	name string
+	buf  *bufio.Writer
 }
 
 func (w *objectWriter) Write(p []byte) (int, error) {
@@ -117,7 +117,7 @@ func (w *objectWriter) Commit(_ context.Context) error {
 		return errors.Wrapf(err, "rename into %q", w.key)
 	}
 
-	if err := publish(w.root, w.created, path.Dir(w.path)); err != nil {
+	if err := w.file.publish(w.root, path.Dir(w.path)); err != nil {
 		_ = w.root.Close()
 
 		return errors.Wrapf(err, "publish %q", w.key)

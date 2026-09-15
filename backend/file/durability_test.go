@@ -145,9 +145,10 @@ func TestWriteIsDurableOnlyAfterDirectorySync(t *testing.T) {
 	assert.Equal(t, []byte("m"), read(t, after, key))
 }
 
-// TestWriteSyncsCreatedDirectoryChain asserts the order the chain is committed in: a directory's
+// TestWriteSyncsCreatedDirectoryChain asserts the chain is committed innermost first: a directory's
 // own entry lives in its parent, so syncing only the leaf leaves the object named by a path whose
-// upper components a power cut can still take away.
+// upper components a power cut can still take away, and syncing an entry before what it names lets
+// the disk hold a directory whose contents are not there yet.
 func TestWriteSyncsCreatedDirectoryChain(t *testing.T) {
 	t.Parallel()
 
@@ -162,7 +163,7 @@ func TestWriteSyncsCreatedDirectoryChain(t *testing.T) {
 		}
 	}
 
-	assert.Equal(t, []string{".", "t1", "t1/metrics", "t1/metrics/0001"}, synced)
+	assert.Equal(t, []string{"t1/metrics/0001", "t1/metrics", "t1", "."}, synced)
 }
 
 // TestWriteSyncsOneDirectoryWhenNoneAreCreated keeps the cost of the fix visible: publishing into a
@@ -231,4 +232,58 @@ func TestListSkipsDirectoryRemovedMidWalk(t *testing.T) {
 	keys, err := b.List(ctx, "t1/traces/")
 	require.NoError(t, err)
 	require.Equal(t, []string{"t1/traces/01M22YPD9JSHCNTBC1ABBM90G1/manifest"}, keys)
+}
+
+// TestWriteSurvivesConcurrentDirectoryCreator is the race where the writer that finds a directory
+// already made is not the one that syncs its entry: B publishes under a tenant directory A created,
+// and a power cut before A syncs the root takes B's acknowledged object with it.
+func TestWriteSurvivesConcurrentDirectoryCreator(t *testing.T) {
+	t.Parallel()
+
+	const (
+		creator = "t1/logs/0001/manifest"
+		key     = "t1/metrics/0001/manifest"
+	)
+
+	ctx := context.Background()
+	gate := faultfs.NewGate()
+	fsys := faultfs.New()
+	fsys.Add(gate.Rule(faultfs.OpRename, func(c faultfs.Call) bool { return c.To == creator }))
+
+	b := newFS(fsys)
+
+	done := make(chan error, 1)
+	go func() { done <- b.Write(ctx, creator, []byte("a")) }()
+
+	gate.Await(t)
+	require.NoError(t, b.Write(ctx, key, []byte("b")))
+
+	after := newFS(fsys.Crash())
+
+	gate.Release()
+	require.NoError(t, <-done)
+
+	keys, err := after.List(ctx, "")
+	require.NoError(t, err)
+	assert.Contains(t, keys, key)
+}
+
+// TestWriteAfterPrunedDirectoriesSurvivesPowerLoss recreates directories a delete pruned: a
+// directory remembered as synced before the prune is a new, unsynced one after it.
+func TestWriteAfterPrunedDirectoriesSurvivesPowerLoss(t *testing.T) {
+	t.Parallel()
+
+	const key = "t1/metrics/0001/manifest"
+
+	ctx := context.Background()
+	fsys := faultfs.New()
+	b := newFS(fsys)
+
+	require.NoError(t, b.Write(ctx, key, []byte("m")))
+	require.NoError(t, b.Delete(ctx, key))
+	require.NoError(t, b.Write(ctx, key, []byte("m")))
+
+	keys, err := newFS(fsys.Crash()).List(ctx, "")
+	require.NoError(t, err)
+	assert.Equal(t, []string{key}, keys)
 }
