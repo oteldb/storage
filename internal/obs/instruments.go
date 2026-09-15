@@ -38,13 +38,22 @@ func (b *imb) i64hist(name, desc, unit string) metric.Int64Histogram {
 	return h
 }
 
+// durationBuckets spans a page-cache backend read (~100µs) to a multi-minute merge. The SDK default
+// boundaries (0–10000) assume milliseconds, so a seconds-valued instrument without these lands
+// every observation in the first bucket.
+var durationBuckets = []float64{
+	0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+	0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300,
+}
+
 // f64hist builds a seconds-valued duration histogram (every duration instrument is in seconds).
 func (b *imb) f64hist(name, desc string) metric.Float64Histogram {
 	if b.err != nil {
 		return nil
 	}
 
-	h, err := b.m.Float64Histogram(name, metric.WithDescription(desc), metric.WithUnit("s"))
+	h, err := b.m.Float64Histogram(name, metric.WithDescription(desc), metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(durationBuckets...))
 	b.err = err
 
 	return h

@@ -163,7 +163,7 @@ func (e *Engine) MergeRunning() bool { return e.mergeRunning.Load() }
 // of the selector's inputs.
 func (e *Engine) MergeBacklog() int { return e.MergeShape().Backlog }
 
-// WALState returns the current WAL segment count, the open segment's byte size, and the active flush
+// WALState returns the WAL segments on disk, the bytes they hold, and the active flush
 // epoch. ok is false when the engine has no WAL (the ephemeral in-memory engine). It takes a read
 // lock, excluding concurrent appends (which hold the write lock).
 func (e *Engine) WALState() (segments int, bytes int64, epoch uint64, ok bool) {
@@ -174,7 +174,7 @@ func (e *Engine) WALState() (segments int, bytes int64, epoch uint64, ok bool) {
 		return 0, 0, 0, false
 	}
 
-	return e.cfg.WAL.Seq(), int64(e.cfg.WAL.Size()), e.cfg.WAL.Epoch(), true
+	return e.cfg.WAL.Segments(), e.cfg.WAL.Bytes(), e.cfg.WAL.Epoch(), true
 }
 
 // Cardinality summarizes the engine's label cardinality from the head's inverted index (which spans

@@ -84,9 +84,10 @@ type SignalStats struct {
 	// WAL is true when this engine has a write-ahead log (false for the ephemeral in-memory engine);
 	// the WAL* fields below are meaningful only when it is true.
 	WAL bool
-	// WALSegments is the WAL's current segment sequence number (segments opened so far).
+	// WALSegments is the WAL segment files on disk: closed ones no flush has checkpointed yet, plus
+	// the open one.
 	WALSegments int
-	// WALBytes is the byte size of the WAL's currently-open segment.
+	// WALBytes is the bytes those segments hold.
 	WALBytes int64
 	// WALEpoch is the WAL's active flush generation (the epoch stamped onto new segments). The same
 	// generation across both engine families; not the recovery watermark.
