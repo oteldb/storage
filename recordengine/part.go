@@ -98,20 +98,9 @@ type part struct {
 func (p *part) acquire() { p.refs.Add(1) }
 func (p *part) release() { p.refs.Add(-1) }
 
-// deletePart removes every backend object of the part at prefix.
+// deletePart removes every backend object of the part at prefix. See [block.DeletePart].
 func deletePart(ctx context.Context, b backend.Backend, prefix string) error {
-	keys, err := b.List(ctx, prefix)
-	if err != nil {
-		return err
-	}
-
-	for _, k := range keys {
-		if err := b.Delete(ctx, k); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return block.DeletePart(ctx, b, prefix)
 }
 
 // openPart opens the part at prefix and builds its StreamID → row-range index and bloom set.

@@ -146,8 +146,9 @@ type ecBackend struct {
 }
 
 var (
-	_ backend.Backend = (*ecBackend)(nil)
-	_ backend.Viewer  = (*ecBackend)(nil)
+	_ backend.Backend        = (*ecBackend)(nil)
+	_ backend.Viewer         = (*ecBackend)(nil)
+	_ backend.DeferredSyncer = (*ecBackend)(nil)
 )
 
 // Read returns the object under key, reconstructing an erasure-coded part object when no full
@@ -209,6 +210,27 @@ func (e *ecBackend) CompareAndSwap(
 
 func (e *ecBackend) ReadVersioned(ctx context.Context, key string) ([]byte, backend.Version, error) {
 	return e.inner.ReadVersioned(ctx, key)
+}
+
+// WriteDeferred, CreateObjectDeferred and SyncPrefix forward the [backend.DeferredSyncer]
+// capability, so an EC tenant's parts are synced once per part like any other.
+func (e *ecBackend) WriteDeferred(ctx context.Context, key string, data []byte) error {
+	return backend.WriteDeferred(ctx, e.inner, key, data)
+}
+
+func (e *ecBackend) CreateObjectDeferred(ctx context.Context, key string) (backend.ObjectWriter, error) {
+	return backend.CreateObjectDeferred(ctx, e.inner, key)
+}
+
+func (e *ecBackend) SyncPrefix(ctx context.Context, prefix string) error {
+	return backend.SyncPrefix(ctx, e.inner, prefix)
+}
+
+// DeleteDeferred deletes synchronously. A converted part's commit marker is its EC sidecar, and a
+// manifest past the full-copy floor is sharded, so deleting the top-level manifest first does not
+// retire the part: a removal a power cut undoes could bring back shards a reader still finds.
+func (e *ecBackend) DeleteDeferred(ctx context.Context, key string) error {
+	return e.inner.Delete(ctx, key)
 }
 
 func (e *ecBackend) IsEphemeral() bool { return e.inner.IsEphemeral() }

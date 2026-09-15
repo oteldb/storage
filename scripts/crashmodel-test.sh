@@ -3,7 +3,7 @@
 #
 # It validates internal/vfs/faultfs's Crash() against ext4 on a dm-flakey device that drops writes
 # — a simulated power cut. That needs Linux, root, device-mapper and mkfs.ext4, and it creates
-# loopback devices, so it is opt-in: an ordinary `go test ./...` does not compile it (the file is
+# loopback devices, so an ordinary `go test ./...` does not compile it (the file is
 # behind `//go:build linux && crashmodel`).
 #
 # The model half of the same scenario table runs unconditionally as TestModel.

@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
@@ -229,7 +230,7 @@ func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 		return nil, errors.Wrapf(err, "write part %q", prefix)
 	}
 
-	if err := p.e.cfg.Backend.Write(ctx, sidxKey(prefix), encodeSeriesIndexRuns(p.runs)); err != nil {
+	if err := backend.WriteDeferred(ctx, p.e.cfg.Backend, sidxKey(prefix), encodeSeriesIndexRuns(p.runs)); err != nil {
 		return nil, errors.Wrapf(err, "write series-index sidecar %q", prefix)
 	}
 
@@ -237,14 +238,18 @@ func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 		return nil, err
 	}
 
-	if err := p.e.cfg.Backend.Write(ctx, watermark.Key(prefix), watermark.Encode(nil, p.wmarks)); err != nil {
+	if err := backend.WriteDeferred(ctx, p.e.cfg.Backend, watermark.Key(prefix), watermark.Encode(nil, p.wmarks)); err != nil {
 		return nil, errors.Wrapf(err, "write watermark sidecar %q", prefix)
 	}
 
 	if p.withStats && !p.sampled {
-		if err := p.e.cfg.Backend.Write(ctx, statsKey(prefix), encodeSeriesStats(p.statsIDs, p.stats)); err != nil {
+		if err := backend.WriteDeferred(ctx, p.e.cfg.Backend, statsKey(prefix), encodeSeriesStats(p.statsIDs, p.stats)); err != nil {
 			return nil, errors.Wrapf(err, "write stats sidecar %q", prefix)
 		}
+	}
+
+	if err := backend.SyncPrefix(ctx, p.e.cfg.Backend, prefix); err != nil {
+		return nil, errors.Wrapf(err, "sync part %q", prefix)
 	}
 
 	part, err := openPart(ctx, p.e.cfg.Backend, prefix, p.e.cfg.Obs.Corruption)

@@ -2,6 +2,7 @@ package block
 
 import (
 	"context"
+	"slices"
 	"strconv"
 	"sync"
 
@@ -207,7 +208,8 @@ func (w *PartWriter) sortKeyIndex() int {
 
 // WritePart serializes the writer's columns and writes the part's objects under prefix
 // on b. Column and marks objects are written first; the manifest is written LAST so the
-// part only becomes readable once fully committed.
+// part only becomes readable once fully committed. The objects are written deferred: the caller
+// runs [backend.SyncPrefix] on prefix before anything durable names the part.
 func WritePart(ctx context.Context, b backend.Backend, prefix string, w *PartWriter) error {
 	built, err := w.build()
 	if err != nil {
@@ -235,17 +237,47 @@ func (p builtPart) write(ctx context.Context, b backend.Backend, prefix string) 
 			continue // constant column: value lives in the manifest
 		}
 
-		if err := b.Write(ctx, columnKey(prefix, i), obj); err != nil {
+		if err := backend.WriteDeferred(ctx, b, columnKey(prefix, i), obj); err != nil {
 			return errors.Wrapf(err, "write column %d", i)
 		}
 	}
 
-	if err := b.Write(ctx, marksKey(prefix), p.marks); err != nil {
+	if err := backend.WriteDeferred(ctx, b, marksKey(prefix), p.marks); err != nil {
 		return errors.Wrap(err, "write marks")
 	}
 
-	if err := b.Write(ctx, manifestKey(prefix), p.manifest); err != nil {
+	if err := backend.WriteDeferred(ctx, b, manifestKey(prefix), p.manifest); err != nil {
 		return errors.Wrap(err, "write manifest")
+	}
+
+	return nil
+}
+
+// DeletePart removes every object under the part at prefix. The manifest goes first and durably,
+// which retires the part in one directory sync: the rest are deleted deferred, and a power cut
+// that brings any of them back leaves an orphan with no manifest, which no reader takes for a part
+// and the open-time sweep removes.
+func DeletePart(ctx context.Context, b backend.Backend, prefix string) error {
+	keys, err := b.List(ctx, prefix+"/")
+	if err != nil {
+		return err
+	}
+
+	manifest := manifestKey(prefix)
+	if slices.Contains(keys, manifest) {
+		if err := b.Delete(ctx, manifest); err != nil {
+			return err
+		}
+	}
+
+	for _, k := range keys {
+		if k == manifest {
+			continue
+		}
+
+		if err := backend.DeleteDeferred(ctx, b, k); err != nil {
+			return err
+		}
 	}
 
 	return nil

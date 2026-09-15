@@ -64,7 +64,7 @@ func (s identitySet) entriesFor(col []chunk.U128) []series.Entry {
 func writeIdentity(ctx context.Context, b backend.Backend, prefix string, entries []series.Entry) error {
 	// Written uncached: read on recovery and by a replica adopting the part, never on the query
 	// path, so a cache entry would only evict part data.
-	if err := backend.WriteUncached(ctx, b, identityKey(prefix), identity.Encode(nil, entries)); err != nil {
+	if err := backend.WriteUncachedDeferred(ctx, b, identityKey(prefix), identity.Encode(nil, entries)); err != nil {
 		return errors.Wrapf(err, "write identity object %q", prefix)
 	}
 

@@ -9,6 +9,7 @@ import (
 	"github.com/go-faster/sdk/zctx"
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 )
 
@@ -417,13 +418,17 @@ func (s *Syncer) copyPart(ctx context.Context, addr, enginePrefix, partPrefix st
 				return st, errors.Wrapf(err, "fetch %q", k)
 			}
 
-			if err := s.local.Write(ctx, k, data); err != nil {
-				return st, errors.Wrapf(err, "write %q", k)
+			if err := s.writeObject(ctx, partOf(k, enginePrefix), k, data); err != nil {
+				return st, err
 			}
 
 			st.Copied++
 			st.CopiedBytes += int64(len(data))
 		}
+	}
+
+	if err := backend.SyncPrefix(ctx, s.local, partPrefix); err != nil {
+		return st, errors.Wrapf(err, "sync part %q", partPrefix)
 	}
 
 	st.Synced = st.Copied > 0

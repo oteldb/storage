@@ -23,6 +23,16 @@ const objectWriteBufferBytes = 64 << 10
 // then, so the atomicity contract is the same one; the difference is only that the bytes reach the
 // filesystem as they are produced rather than all at once. Implements [backend.ObjectCreator].
 func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter, error) {
+	return f.createObject(key, true)
+}
+
+// CreateObjectDeferred is [File.CreateObject] whose commit leaves the name for [File.SyncPrefix].
+// Implements [backend.DeferredSyncer].
+func (f *File) CreateObjectDeferred(_ context.Context, key string) (backend.ObjectWriter, error) {
+	return f.createObject(key, false)
+}
+
+func (f *File) createObject(key string, durable bool) (backend.ObjectWriter, error) {
 	p, err := f.rel(key)
 	if err != nil {
 		return nil, err
@@ -33,7 +43,7 @@ func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter
 		return nil, err
 	}
 
-	tmp, name, created, err := createTemp(root, path.Dir(p))
+	tmp, name, err := createTemp(root, path.Dir(p))
 	if err != nil {
 		_ = root.Close()
 
@@ -41,12 +51,13 @@ func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter
 	}
 
 	return &objectWriter{
+		file:    f,
+		durable: durable,
 		root:    root,
 		key:     key,
 		path:    p,
 		tmp:     tmp,
 		name:    name,
-		created: created,
 		buf:     bufio.NewWriterSize(tmp, objectWriteBufferBytes),
 	}, nil
 }
@@ -56,12 +67,13 @@ func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter
 // The root handle stays open for the writer's lifetime — the temp file it holds is only published
 // at commit — and is released by [objectWriter.Commit] or [objectWriter.Abort].
 type objectWriter struct {
+	file    *File
+	durable bool
 	root    vfs.FS
 	key     string
 	path    string
 	tmp     vfs.File
 	name    string
-	created []string
 	buf     *bufio.Writer
 }
 
@@ -117,10 +129,12 @@ func (w *objectWriter) Commit(_ context.Context) error {
 		return errors.Wrapf(err, "rename into %q", w.key)
 	}
 
-	if err := publish(w.root, w.created, path.Dir(w.path)); err != nil {
-		_ = w.root.Close()
+	if w.durable {
+		if err := w.file.publish(w.root, path.Dir(w.path)); err != nil {
+			_ = w.root.Close()
 
-		return errors.Wrapf(err, "publish %q", w.key)
+			return errors.Wrapf(err, "publish %q", w.key)
+		}
 	}
 
 	if err := w.root.Close(); err != nil {

@@ -271,7 +271,7 @@ func (w *StreamWriter) objectOpener(i int) func() (backend.ObjectWriter, error) 
 	}
 
 	return func() (backend.ObjectWriter, error) {
-		return backend.CreateObject(w.ctx, w.b, columnKey(w.prefix, i))
+		return backend.CreateObjectDeferred(w.ctx, w.b, columnKey(w.prefix, i))
 	}
 }
 
@@ -386,7 +386,8 @@ func (w *StreamWriter) sortKeyIndex() int {
 }
 
 // WriteStreamPart serializes w and writes the part under prefix on b, in the same order and under
-// the same keys as [WritePart] — manifest last, so the part becomes readable only once committed.
+// the same keys as [WritePart] — manifest last, so the part becomes readable only once committed,
+// and deferred, so the caller runs [backend.SyncPrefix] on prefix before anything durable names it.
 //
 // For a writer from [NewStreamWriterTo], b and prefix must be the ones it was given: its column
 // objects commit here, and only the marks and manifest are written from memory. A failure leaves

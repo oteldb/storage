@@ -220,7 +220,9 @@ dead-fraction thresholds.
 first, the bucket index last, then checkpoints the WAL through the sealed sequence, keeping the
 segments that hold records appended during the part write (`wal/ARCH.md`, "Epochs"). The bucket index carries the flush watermark replay starts from — one slot per
 writer, since the index is shared and the watermark is not (`wal/ARCH.md`, "Epochs") — so
-writing it is the commit point and only what is already durable may be committed. A committed part
+writing it is the commit point and only what is already durable may be committed — each part is
+written deferred and synced once with `backend.SyncPrefix` after its last sidecar (the `sym-*.bin`
+side data lands after `openPart`, so the sync follows it). A committed part
 whose identities were missing would be **unrecoverable**: it holds rows no matcher can name, while the
 advanced watermark makes replay skip the WAL records that would have re-registered them. The reverse
 leftover is harmless — an uncommitted part is an orphan the next open sweeps, its identities never

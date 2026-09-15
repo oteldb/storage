@@ -372,7 +372,10 @@ the client verifies). A `Syncer` **mirrors an engine prefix from the newest peer
 peer's bucket index, pick the newest, copy missing objects — **manifest after the part's other
 objects, bucket index after everything**, so the local index only ever references fully-copied
 parts (the same commit-point discipline as flush; a crashed sync leaves an orphan retried next
-pass).
+pass). Part objects are written deferred and every copied part is synced once with
+`backend.SyncPrefix`; the install also syncs every part it adopts that the local index did not name,
+since a pass whose sync failed, or whose process died first, leaves objects the next pass finds
+present and does not refetch. `copyPart` syncs its part before `FetchWants` hands it to a commit.
 
 The pass reads the peer twice — its index, then its key listing — and an owner merge landing between
 the two skews them: the index names a part whose objects the listing no longer offers, and no copy

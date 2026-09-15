@@ -78,6 +78,37 @@ func Scenarios() []Scenario {
 			Expect: []Expect{durable("d/pub5", "zeta"), erased("d/tmp5")},
 		},
 		{
+			Name: "RenamesPublishedByOneLaterSync",
+			Why:  "one directory sync publishes every rename made in it since the last one — a part's deferred objects",
+			Run: func(t *testing.T, f vfs.FS) {
+				t.Helper()
+				base(t, f)
+				writeSync(t, f, "d/tmp9a", "iota")
+				require.NoError(t, f.Rename("d/tmp9a", "d/pub9a"))
+				writeSync(t, f, "d/tmp9b", "kappa")
+				require.NoError(t, f.Rename("d/tmp9b", "d/pub9b"))
+				require.NoError(t, f.SyncDir(dir))
+			},
+			Expect: []Expect{
+				durable("d/pub9a", "iota"), erased("d/tmp9a"),
+				durable("d/pub9b", "kappa"), erased("d/tmp9b"),
+			},
+		},
+		{
+			Name: "NestedDirsSyncedInnermostFirst",
+			Why:  "syncing a new directory chain from the leaf up publishes a file below it — a part's SyncPrefix",
+			Run: func(t *testing.T, f vfs.FS) {
+				t.Helper()
+				base(t, f)
+				require.NoError(t, f.MkdirAll("d/part10/c", 0o750))
+				writeSync(t, f, "d/part10/c/x", "lambda")
+				require.NoError(t, f.SyncDir("d/part10/c"))
+				require.NoError(t, f.SyncDir("d/part10"))
+				require.NoError(t, f.SyncDir(dir))
+			},
+			Expect: []Expect{durable("d/part10/c/x", "lambda")},
+		},
+		{
 			Name: "RenameUnsyncedDir",
 			Why:  "a rename is a name change, so it is owed only once the directory is synced",
 			Run: func(t *testing.T, f vfs.FS) {

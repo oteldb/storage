@@ -49,7 +49,7 @@ func sidecarKey(prefix, name string) string { return prefix + "/sym-" + name + "
 // writeSidecars writes each named side-store payload under prefix.
 func writeSidecars(ctx context.Context, b backend.Backend, prefix string, m map[string][]byte) error {
 	for name, data := range m {
-		if err := b.Write(ctx, sidecarKey(prefix, name), data); err != nil {
+		if err := backend.WriteDeferred(ctx, b, sidecarKey(prefix, name), data); err != nil {
 			return errors.Wrapf(err, "write sidecar %q", name)
 		}
 	}

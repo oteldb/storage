@@ -240,3 +240,48 @@ func result(err error) string {
 		return "error"
 	}
 }
+
+var _ backend.DeferredSyncer = (*instrumentedBackend)(nil)
+
+// WriteDeferred forwards the deferred write, metered as a write. Implements
+// [backend.DeferredSyncer].
+func (b *instrumentedBackend) WriteDeferred(ctx context.Context, key string, data []byte) error {
+	start := time.Now()
+	err := backend.WriteDeferred(ctx, b.inner, key, data)
+	b.m.Record(ctx, "write", result(err), time.Since(start), int64(len(data)))
+	zctx.From(ctx).Debug("backend write",
+		zap.String("key", key), zap.Int("bytes", len(data)), zap.Bool("deferred", true),
+		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
+
+	return err
+}
+
+// CreateObjectDeferred forwards the deferred incremental write, metered at commit like
+// [instrumentedStreamBackend.CreateObject]. Implements [backend.DeferredSyncer].
+func (b *instrumentedBackend) CreateObjectDeferred(ctx context.Context, key string) (backend.ObjectWriter, error) {
+	w, err := backend.CreateObjectDeferred(ctx, b.inner, key)
+	if err != nil {
+		return nil, err
+	}
+
+	return &instrumentedObjectWriter{ObjectWriter: w, b: b, key: key}, nil
+}
+
+// DeleteDeferred forwards the deferred delete, metered as a delete. Implements
+// [backend.DeferredSyncer].
+func (b *instrumentedBackend) DeleteDeferred(ctx context.Context, key string) error {
+	start := time.Now()
+	err := backend.DeleteDeferred(ctx, b.inner, key)
+	b.m.Record(ctx, "delete", result(err), time.Since(start), 0)
+	zctx.From(ctx).Debug("backend delete",
+		zap.String("key", key), zap.Bool("deferred", true),
+		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
+
+	return err
+}
+
+// SyncPrefix forwards the durability barrier, unmetered: it is not an object operation. Implements
+// [backend.DeferredSyncer].
+func (b *instrumentedBackend) SyncPrefix(ctx context.Context, prefix string) error {
+	return backend.SyncPrefix(ctx, b.inner, prefix)
+}

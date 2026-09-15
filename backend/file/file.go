@@ -1,9 +1,10 @@
 // Package file implements a [backend.Backend] over a local directory tree. Keys map to
 // files under a root; writes are atomic (temp file + rename) and durable (the temp file is
-// fsynced, then the directory holding the published name is), so a reader never observes a
-// partially written object and a power cut never takes a name a write already reported as
-// stored — the property the "manifest written last" part commit relies on (DESIGN.md §8,
-// _ref/docs/storage-engine.md §2).
+// fsynced, then every directory entry up to one already known on the disk), so a reader never
+// observes a partially written object and a power cut never takes a name a write already reported
+// as stored — the property the "manifest written last" part commit relies on. The deferred
+// operations of [backend.DeferredSyncer] are the exception: their names are owed only once
+// [File.SyncPrefix] returns.
 package file
 
 import (
@@ -44,6 +45,7 @@ import (
 type File struct {
 	dir  string
 	open func() (vfs.FS, error)
+	dirs *dirCache
 }
 
 var _ backend.Backend = (*File)(nil)
@@ -55,11 +57,16 @@ func New(dir string) (*File, error) {
 		return nil, errors.Wrapf(err, "resolve root %q", dir)
 	}
 
-	if err := os.MkdirAll(abs, 0o750); err != nil {
-		return nil, errors.Wrapf(err, "create root %q", abs)
+	if err := createRoot(abs); err != nil {
+		return nil, err
 	}
 
-	f := &File{dir: abs, open: func() (vfs.FS, error) { return vfs.Open(abs) }}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, errors.Wrapf(err, "stat root %q", abs)
+	}
+
+	f := &File{dir: abs, open: func() (vfs.FS, error) { return vfs.Open(abs) }, dirs: dirCacheFor(info)}
 
 	// Fail at construction rather than at the first operation if the tree cannot be opened.
 	root, err := f.openRoot()
@@ -76,11 +83,69 @@ func New(dir string) (*File, error) {
 	return f, nil
 }
 
+// createRoot creates dir and syncs the entry of every directory on its resolved path, innermost
+// first: [File.publish] stops at the root, so a root that is not itself on the disk would take every
+// object under it on a power cut. The whole path, not only what this call created: a previous
+// attempt may have created it and failed to sync. The resolved path, because the entry naming a
+// symlinked root lives under the link's target. A parent this process may not open is skipped only
+// when its child already existed; one this call just created an entry in must sync.
+func createRoot(dir string) error {
+	existing, missing := dir, []string(nil)
+	for ; filepath.Dir(existing) != existing; existing = filepath.Dir(existing) {
+		if _, err := os.Stat(existing); err == nil {
+			break
+		}
+
+		missing = append(missing, filepath.Base(existing))
+	}
+
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return errors.Wrapf(err, "create root %q", dir)
+	}
+
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return errors.Wrapf(err, "resolve root %q", dir)
+	}
+
+	base, err := filepath.EvalSymlinks(existing)
+	if err != nil {
+		return errors.Wrapf(err, "resolve %q", existing)
+	}
+
+	created := map[string]bool{}
+
+	for _, name := range slices.Backward(missing) {
+		base = filepath.Join(base, name)
+		created[base] = true
+	}
+
+	for d := resolved; filepath.Dir(d) != d; d = filepath.Dir(d) {
+		parent, err := vfs.Open(filepath.Dir(d))
+		if errors.Is(err, fs.ErrPermission) && !created[d] {
+			continue
+		}
+
+		if err != nil {
+			return errors.Wrapf(err, "open parent of %q", d)
+		}
+
+		err = parent.SyncDir(".")
+		_ = parent.Close()
+
+		if err != nil {
+			return errors.Wrapf(err, "sync parent of %q", d)
+		}
+	}
+
+	return nil
+}
+
 // newFS returns a backend over fsys, sharing the one filesystem across operations. It is the test
 // seam for durability: only a fake filesystem can present the state a power cut leaves behind, and
 // that state is not reachable through [New].
 func newFS(fsys vfs.FS) *File {
-	return &File{open: func() (vfs.FS, error) { return nopCloseFS{fsys}, nil }}
+	return &File{open: func() (vfs.FS, error) { return nopCloseFS{fsys}, nil }, dirs: newDirCache()}
 }
 
 // nopCloseFS keeps a shared filesystem alive across the per-operation Close every path here does.
@@ -97,56 +162,9 @@ func (*File) IsNodeLocal() bool { return true }
 
 // Write stores data under key atomically and durably: it writes a temp file in the destination
 // directory, fsyncs it, renames it over the final path, and fsyncs the directories the new name
-// hangs from.
-func (f *File) Write(_ context.Context, key string, data []byte) (rerr error) {
-	p, err := f.rel(key)
-	if err != nil {
-		return err
-	}
-
-	root, err := f.openRoot()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = root.Close() }()
-
-	tmp, tmpName, created, err := createTemp(root, path.Dir(p))
-	if err != nil {
-		return err
-	}
-
-	// On any failure past this point, remove the temp file.
-	defer func() {
-		if rerr != nil {
-			_ = root.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-
-		return errors.Wrap(err, "write temp")
-	}
-
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-
-		return errors.Wrap(err, "sync temp")
-	}
-
-	if err := tmp.Close(); err != nil {
-		return errors.Wrap(err, "close temp")
-	}
-
-	if err := root.Rename(tmpName, p); err != nil {
-		return errors.Wrapf(err, "rename into %q", key)
-	}
-
-	if err := publish(root, created, path.Dir(p)); err != nil {
-		return errors.Wrapf(err, "publish %q", key)
-	}
-
-	return nil
+// hangs from that are not yet known durable.
+func (f *File) Write(_ context.Context, key string, data []byte) error {
+	return f.write(key, data, true)
 }
 
 // PutIfAbsent stores data under key only if it does not already exist, returning whether the
@@ -166,7 +184,7 @@ func (f *File) PutIfAbsent(_ context.Context, key string, data []byte) (written 
 	}
 	defer func() { _ = root.Close() }()
 
-	tmp, tmpName, created, err := createTemp(root, path.Dir(p))
+	tmp, tmpName, err := createTemp(root, path.Dir(p))
 	if err != nil {
 		return false, err
 	}
@@ -197,7 +215,7 @@ func (f *File) PutIfAbsent(_ context.Context, key string, data []byte) (written 
 		return false, errors.Wrapf(err, "link into %q", key)
 	}
 
-	if err := publish(root, created, path.Dir(p)); err != nil {
+	if err := f.publish(root, path.Dir(p)); err != nil {
 		return false, errors.Wrapf(err, "publish %q", key)
 	}
 
@@ -391,32 +409,7 @@ func isDir(root vfs.FS, name string) bool {
 
 // Delete removes key, or returns an [backend.ErrNotExist]-wrapping error if absent.
 func (f *File) Delete(_ context.Context, key string) error {
-	p, err := f.rel(key)
-	if err != nil {
-		return err
-	}
-
-	root, err := f.openRoot()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = root.Close() }()
-
-	if err := root.Remove(p); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return errors.Wrapf(backend.ErrNotExist, "delete %q", key)
-		}
-
-		return errors.Wrapf(err, "delete %q", key)
-	}
-
-	if err := root.SyncDir(path.Dir(p)); err != nil {
-		return errors.Wrapf(err, "sync dir of %q", key)
-	}
-
-	pruneParents(root, p)
-
-	return nil
+	return f.remove(key, true)
 }
 
 // openRoot opens a filesystem handle for one operation. The caller closes it.
@@ -425,11 +418,14 @@ func (f *File) openRoot() (vfs.FS, error) { return f.open() }
 // pruneParents removes the directories left empty by deleting p, up to (but never including)
 // the root. Without it a deleted part leaves its directories behind forever, and every List
 // keeps paying for them: the traversal cost grows with parts ever created, not parts retained.
-func pruneParents(root vfs.FS, p string) {
+func (f *File) pruneParents(root vfs.FS, p string, durable bool) {
 	for dir := path.Dir(p); dir != "." && dir != "/"; dir = path.Dir(dir) {
-		// Fails with ENOTEMPTY as soon as a directory still holds objects.
-		if err := root.Remove(dir); err != nil {
+		if !f.removeEmptyDir(root, dir) {
 			return
+		}
+
+		if !durable {
+			continue
 		}
 
 		if err := root.SyncDir(path.Dir(dir)); err != nil {
@@ -456,7 +452,7 @@ func (f *File) pruneEmpty(root vfs.FS, dir string) bool {
 		}
 
 		sub := path.Join(dir, e.Name())
-		if f.pruneEmpty(root, sub) && root.Remove(sub) == nil {
+		if f.pruneEmpty(root, sub) && f.removeEmptyDir(root, sub) {
 			continue
 		}
 
@@ -470,19 +466,15 @@ func (f *File) pruneEmpty(root vfs.FS, dir string) bool {
 const tmpPrefix = ".tmp-"
 
 // createTemp creates a temp file in dir (relative to the root), creating dir first, and returns
-// it with its root-relative name and the directories it had to create, outermost first — those
-// are names their own parents must sync before the published object's name means anything. It
-// retries once when dir vanishes between the two: a concurrent [File.Delete] prunes directories
-// its last object leaves empty.
+// it with its root-relative name. It retries once when dir vanishes between the two: a concurrent
+// [File.Delete] prunes directories its last object leaves empty.
 //
 // [vfs.FS] has no CreateTemp, so the exclusive-create loop is here: O_EXCL makes the name
 // claim atomic, and a collision just draws another.
-func createTemp(root vfs.FS, dir string) (vfs.File, string, []string, error) {
+func createTemp(root vfs.FS, dir string) (vfs.File, string, error) {
 	for attempt := 0; ; attempt++ {
-		created := missingDirs(root, dir)
-
 		if err := root.MkdirAll(dir, 0o750); err != nil {
-			return nil, "", nil, errors.Wrapf(err, "mkdir %q", dir)
+			return nil, "", errors.Wrapf(err, "mkdir %q", dir)
 		}
 
 		for range 10 {
@@ -490,7 +482,7 @@ func createTemp(root vfs.FS, dir string) (vfs.File, string, []string, error) {
 
 			tmp, err := root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 			if err == nil {
-				return tmp, name, created, nil
+				return tmp, name, nil
 			}
 
 			if errors.Is(err, fs.ErrExist) {
@@ -502,49 +494,55 @@ func createTemp(root vfs.FS, dir string) (vfs.File, string, []string, error) {
 				break
 			}
 
-			return nil, "", nil, errors.Wrap(err, "create temp")
+			return nil, "", errors.Wrap(err, "create temp")
 		}
 
 		if attempt > 0 {
-			return nil, "", nil, errors.Errorf("create temp in %q: no free name", dir)
+			return nil, "", errors.Errorf("create temp in %q: no free name", dir)
 		}
 	}
 }
 
-// missingDirs returns the components of dir that do not exist yet, outermost first. A racing
-// writer may create one of them in between, which only costs a redundant directory sync later.
-func missingDirs(root vfs.FS, dir string) []string {
-	var missing []string
-
-	for d := dir; d != "." && d != "/"; d = path.Dir(d) {
-		if _, err := root.Stat(d); err == nil {
-			break
-		}
-
-		missing = append(missing, d)
-	}
-
-	slices.Reverse(missing)
-
-	return missing
-}
-
-// publish makes a just-renamed or just-linked name durable: the directories created for it, from
-// the outermost in (a child's entry only means something once its parent's entry is on the disk),
-// then the directory the name itself lives in. Without this the object's bytes are on the disk
-// with nothing naming them, and a power cut takes the write back.
-func publish(root vfs.FS, created []string, dir string) error {
-	for _, d := range created {
-		if err := root.SyncDir(path.Dir(d)); err != nil {
-			return errors.Wrapf(err, "sync dir %q", path.Dir(d))
-		}
-	}
+// publish makes a just-renamed or just-linked name durable: the directory the name lives in, then
+// the entry of every ancestor not known durable, innermost first. Checking ancestors rather than
+// only the directories this call created matters: a directory a concurrent writer made exists
+// here without its entry being synced yet, and a power cut would take this name with it.
+//
+// Innermost first means no directory entry reaches the disk before what it names already has.
+// The renamed name keeps every ancestor non-empty, so none can be pruned under the walk.
+func (f *File) publish(root vfs.FS, dir string) error {
+	epoch := f.dirs.snapshot()
 
 	if err := root.SyncDir(dir); err != nil {
 		return errors.Wrapf(err, "sync dir %q", dir)
 	}
 
+	var synced []string
+
+	for d := dir; !f.dirs.durable(d); d = path.Dir(d) {
+		if err := root.SyncDir(path.Dir(d)); err != nil {
+			return errors.Wrapf(err, "sync dir %q", path.Dir(d))
+		}
+
+		synced = append(synced, d)
+	}
+
+	f.dirs.mark(synced, epoch)
+
 	return nil
+}
+
+// removeEmptyDir removes dir if it holds nothing, reporting whether it did. The directory stops
+// being known durable before the remove, not after: in between, a writer could recreate it and
+// skip the sync the new entry needs.
+func (f *File) removeEmptyDir(root vfs.FS, dir string) bool {
+	if entries, err := root.ReadDir(dir); err != nil || len(entries) > 0 {
+		return false
+	}
+
+	f.dirs.forget(dir)
+
+	return root.Remove(dir) == nil
 }
 
 // rel maps a slash-delimited key to a path relative to the root, rejecting any key that would
@@ -563,4 +561,90 @@ func (f *File) rel(key string) (string, error) {
 	}
 
 	return p, nil
+}
+
+func (f *File) write(key string, data []byte, durable bool) (rerr error) {
+	p, err := f.rel(key)
+	if err != nil {
+		return err
+	}
+
+	root, err := f.openRoot()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+
+	tmp, tmpName, err := createTemp(root, path.Dir(p))
+	if err != nil {
+		return err
+	}
+
+	// On any failure past this point, remove the temp file.
+	defer func() {
+		if rerr != nil {
+			_ = root.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+
+		return errors.Wrap(err, "write temp")
+	}
+
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+
+		return errors.Wrap(err, "sync temp")
+	}
+
+	if err := tmp.Close(); err != nil {
+		return errors.Wrap(err, "close temp")
+	}
+
+	if err := root.Rename(tmpName, p); err != nil {
+		return errors.Wrapf(err, "rename into %q", key)
+	}
+
+	if !durable {
+		return nil
+	}
+
+	if err := f.publish(root, path.Dir(p)); err != nil {
+		return errors.Wrapf(err, "publish %q", key)
+	}
+
+	return nil
+}
+
+func (f *File) remove(key string, durable bool) error {
+	p, err := f.rel(key)
+	if err != nil {
+		return err
+	}
+
+	root, err := f.openRoot()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+
+	if err := root.Remove(p); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return errors.Wrapf(backend.ErrNotExist, "delete %q", key)
+		}
+
+		return errors.Wrapf(err, "delete %q", key)
+	}
+
+	if durable {
+		if err := root.SyncDir(path.Dir(p)); err != nil {
+			return errors.Wrapf(err, "sync dir of %q", key)
+		}
+	}
+
+	f.pruneParents(root, p, durable)
+
+	return nil
 }

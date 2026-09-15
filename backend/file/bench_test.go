@@ -115,3 +115,59 @@ func BenchmarkPutIfAbsent(b *testing.B) {
 		i++
 	}
 }
+
+// benchPartObjects is a trace part's object count: columns, manifest, marks and sidecars.
+const benchPartObjects = 16
+
+// BenchmarkPartWrite writes a whole part per iteration, through the per-object durable path and
+// through deferred writes plus one SyncPrefix — the directory syncs a flush or merge pays per part.
+func BenchmarkPartWrite(b *testing.B) {
+	for _, mode := range []string{"sync", "deferred"} {
+		b.Run(mode, func(b *testing.B) {
+			ctx := context.Background()
+
+			bk, err := file.New(b.TempDir())
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			data := make([]byte, 4<<10)
+
+			if err := bk.Write(ctx, "t0/metrics/warm", data); err != nil {
+				b.Fatal(err)
+			}
+
+			b.SetBytes(int64(benchPartObjects * len(data)))
+			b.ReportAllocs()
+
+			part := 0
+
+			for b.Loop() {
+				prefix := fmt.Sprintf("t0/metrics/%010d", part)
+
+				for i := range benchPartObjects {
+					key := fmt.Sprintf("%s/c/%d", prefix, i)
+					if i >= benchPartObjects/2 {
+						key = fmt.Sprintf("%s/side%d", prefix, i)
+					}
+
+					if mode == "sync" {
+						err = bk.Write(ctx, key, data)
+					} else {
+						err = bk.WriteDeferred(ctx, key, data)
+					}
+
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+
+				if err := backend.SyncPrefix(ctx, bk, prefix); err != nil {
+					b.Fatal(err)
+				}
+
+				part++
+			}
+		})
+	}
+}

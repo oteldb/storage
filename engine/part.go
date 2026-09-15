@@ -343,21 +343,9 @@ func (p *part) release() {
 	}
 }
 
-// deletePart removes every backend object of the part at prefix (manifest, marks, and
-// column objects), found by listing the prefix.
+// deletePart removes every backend object of the part at prefix. See [block.DeletePart].
 func deletePart(ctx context.Context, b backend.Backend, prefix string) error {
-	keys, err := b.List(ctx, prefix)
-	if err != nil {
-		return err
-	}
-
-	for _, k := range keys {
-		if err := b.Delete(ctx, k); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return block.DeletePart(ctx, b, prefix)
 }
 
 // openPart opens the part at prefix and attaches its SeriesID → row-range index: the paged form
