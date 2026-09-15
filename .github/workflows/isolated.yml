@@ -6,6 +6,10 @@ name: isolated
 # which breaks two kinds of test for reasons unrelated to what they assert: one measures allocation
 # as a process-global runtime.MemStats delta, the other drives six cluster nodes through
 # timing-sensitive convergence waits. Both are skipped by default and enabled here by env var.
+#
+# The crash model runs here for a different reason: it checks internal/vfs/faultfs, which every
+# durability test trusts, against ext4 on a dm-flakey device that drops writes, so it needs root,
+# device-mapper and loopback devices. The model half of its scenario table runs in the main suite.
 
 on:
   push:
@@ -92,3 +96,40 @@ jobs:
         env:
           OTELDB_EC_CHAOS: "1"
         run: go test -timeout 15m -count 1 -p 1 -v -run 'TestClusterECChaos' .
+
+  crashmodel:
+    name: dm-flakey conformance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Get Go environment
+        shell: bash
+        run: |
+          echo "cache=$(go env GOCACHE)" >> $GITHUB_ENV
+          echo "modcache=$(go env GOMODCACHE)" >> $GITHUB_ENV
+
+      - name: Set up cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.cache }}
+            ${{ env.modcache }}
+          key: ${{ runner.os }}-${{ runner.arch }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-
+
+      - name: Install device-mapper tooling
+        run: sudo apt-get update && sudo apt-get install -y dmsetup e2fsprogs
+
+      - name: Run crash-model conformance
+        run: ./scripts/crashmodel-test.sh
