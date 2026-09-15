@@ -76,9 +76,7 @@ a demonstration.
   power cut while the WAL checkpoint that follows it has already deleted the segments replay would
   need: silent loss of acknowledged records. It costs one directory fsync per published object —
   measured at +86% on a 4 KiB `Write` on btrfs/NVMe (1.41 → 2.63 ms/op), where the file fsync
-  already dominates. A per-flush barrier that syncs a part's directory once instead of once per
-  column would recover most of that; it needs an optional interface on `backend.Backend`, and
-  correctness comes first. Off unix the directory sync is a no-op: there is no directory handle to
+  already dominates. Part objects avoid most of it through `backend.DeferredSyncer` (below). Off unix the directory sync is a no-op: there is no directory handle to
   fsync, and the atomic-replace primitive carries the ordering instead.
 
   Filesystem access goes through `internal/vfs` (a rooted `FS`/`File` interface over `os.Root`)
@@ -274,6 +272,27 @@ a demonstration.
   (`engine/ARCH.md`). **A wrapper must forward it**, and must not claim it over an inner backend
   that lacks it: `Cached` returns a second type that carries `CreateObject` only in that case,
   rather than a method that would always answer yes.
+- **`backend.DeferredSyncer`** — optional `WriteDeferred`/`CreateObjectDeferred`/`DeleteDeferred`
+  plus `SyncPrefix(prefix)`: a part's objects are made durable once, not one by one. **A part is
+  unreachable until the bucket-index CAS names it**, so its objects need to be on the disk before
+  that commit and no earlier; the engines and `cluster/partsync` write every part object deferred and
+  call `SyncPrefix` on the part after its last sidecar, before any index can name it. `file`
+  still fsyncs each object's bytes, skips the directory syncs, and `SyncPrefix` syncs the part's
+  subtree children-first and then the unknown ancestors — stateless, so an aborted part leaks
+  nothing. A part costs N file fsyncs plus ~3 directory syncs instead of ~2N+2. Until `SyncPrefix`
+  a power cut may keep any subset of the names, a manifest without its columns included; that is
+  an orphan with a manifest, which only the open-time sweep sees before anything is served.
+  **Every helper falls back to the synchronous operation** (and `SyncPrefix` to nothing), so a
+  wrapper that drops the capability loses the saving, never durability, and `Memory`/`s3` need
+  nothing. Wrappers forward all four together (`Cached` with the same store/invalidate rules as
+  `Write`/`Delete`, the metered backend under the `write`/`delete` labels). `faultbackend` and
+  `backendtest.Capacity` forward none. **Deletes** (`block.DeletePart`) remove the manifest first and
+  durably, one directory sync that retires the part, then everything else deferred: a resurrected
+  object has no manifest, so no reader or `partsync` peer listing takes it for a part, and the owner's
+  open-time sweep removes it. A `RefreshReplica` or `ReadOnly` handle, or a prefix with no index
+  that is never loaded, does not sweep, so there it is leaked space until an owner open. The EC
+  wrapper deletes synchronously: a converted part's commit marker is its `ecmeta` sidecar, and a manifest
+  past the full-copy floor is sharded, so the top-level manifest is not what retires it.
 - **`backend.NodeLocal`** — optional `IsNodeLocal()`, implemented by `Memory` (a process heap) and
   `file` (a directory tree), not by object stores. It reports the *medium*, and a `file` root on a
   network mount answers true as well — which is correct rather than imprecise, since a shared mount

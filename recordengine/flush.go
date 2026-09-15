@@ -339,7 +339,7 @@ func writePart(
 
 	// Watermark sidecar: the newest timestamp per stream, so a replica refresh trims its head
 	// against this part without decoding the timestamp column (see part.streamWatermarks).
-	if err := b.Write(ctx, watermark.Key(prefix), watermark.Encode(nil, computeWatermarks(f))); err != nil {
+	if err := backend.WriteDeferred(ctx, b, watermark.Key(prefix), watermark.Encode(nil, computeWatermarks(f))); err != nil {
 		return errors.Wrapf(err, "write watermark sidecar %q", prefix)
 	}
 

@@ -589,9 +589,9 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 	// has an object we lack is worth taking whichever way the indexes order.
 	if supersedes && !bytes.Equal(installedRaw, localRaw) {
 		// Installed last (the commit point) — it only ever references parts whose objects are
-		// already local.
-		if err := s.local.Write(ctx, indexKey, installedRaw); err != nil {
-			return st, errors.Wrap(err, "install index")
+		// already local, and durable.
+		if err := installIndex(ctx, s.local, indexKey, installed, installedRaw, localIndex); err != nil {
+			return st, err
 		}
 
 		st.Copied++
@@ -823,14 +823,20 @@ func (s *Syncer) copyMissing(
 
 	immutable, manifests, mutable := classifyFetch(remote, enginePrefix, indexKey, have)
 
+	// Copied parts are synced here as well as before an install: a reconcile refills parts the
+	// local index already names, and installs nothing.
+	copied := make(map[string]struct{})
+
 	for _, group := range [][]string{immutable, manifests, mutable} {
 		for _, k := range group {
+			part := partOf(k, enginePrefix)
+
 			data, err := s.client.Fetch(ctx, addr, k)
 			if err != nil {
 				if errors.Is(err, ErrNotExist) {
 					// Raced a merge on the peer: the object went away with its part. Tolerated,
 					// but the part is no longer one this pass can vouch for.
-					if part := partOf(k, enginePrefix); part != "" {
+					if part != "" {
 						unbacked[part] = struct{}{}
 					}
 
@@ -840,12 +846,22 @@ func (s *Syncer) copyMissing(
 				return nil, err
 			}
 
-			if err := s.local.Write(ctx, k, data); err != nil {
-				return nil, errors.Wrapf(err, "write %q", k)
+			if err := s.writeObject(ctx, part, k, data); err != nil {
+				return nil, err
+			}
+
+			if part != "" {
+				copied[part] = struct{}{}
 			}
 
 			st.Copied++
 			st.CopiedBytes += int64(len(data))
+		}
+	}
+
+	for part := range copied {
+		if err := backend.SyncPrefix(ctx, s.local, part); err != nil {
+			return nil, errors.Wrapf(err, "sync part %q", part)
 		}
 	}
 
@@ -855,6 +871,65 @@ func (s *Syncer) copyMissing(
 	s.mu.Unlock()
 
 	return unbacked, nil
+}
+
+func installIndex(
+	ctx context.Context, b backend.Backend, key string, installed *bucketindex.Index, raw []byte, local *bucketindex.Index,
+) error {
+	if err := syncAdopted(ctx, b, installed, local); err != nil {
+		return err
+	}
+
+	if err := b.Write(ctx, key, raw); err != nil {
+		return errors.Wrap(err, "install index")
+	}
+
+	return nil
+}
+
+// syncAdopted makes durable every part installed names that local does not, before installed
+// replaces it. Part objects are written deferred, and not only by this pass: one whose sync failed,
+// or whose process died before it, left objects the next pass finds present and does not refetch.
+// A part the local index already names was synced before that index was installed.
+func syncAdopted(ctx context.Context, b backend.Backend, installed, local *bucketindex.Index) error {
+	named := make(map[string]struct{}, len(local.Entries))
+	for i := range local.Entries {
+		named[local.Entries[i].Prefix] = struct{}{}
+	}
+
+	for i := range installed.Entries {
+		e := &installed.Entries[i]
+		if e.Hole {
+			continue
+		}
+
+		if _, ok := named[e.Prefix]; ok {
+			continue
+		}
+
+		if err := backend.SyncPrefix(ctx, b, e.Prefix); err != nil {
+			return errors.Wrapf(err, "sync part %q", e.Prefix)
+		}
+	}
+
+	return nil
+}
+
+// writeObject stores a fetched object: deferred when it belongs to a part, which is synced before
+// an index naming it is installed ([syncAdopted], or the end of copyPart), and durably otherwise.
+func (s *Syncer) writeObject(ctx context.Context, part, key string, data []byte) error {
+	var err error
+	if part != "" {
+		err = backend.WriteDeferred(ctx, s.local, key, data)
+	} else {
+		err = s.local.Write(ctx, key, data)
+	}
+
+	if err != nil {
+		return errors.Wrapf(err, "write %q", key)
+	}
+
+	return nil
 }
 
 // unbackedParts is the set of index entries the peer's own listing no longer backs with any

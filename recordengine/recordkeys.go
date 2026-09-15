@@ -134,7 +134,7 @@ func writeRecordKeys(ctx context.Context, b backend.Backend, schema *Schema, pre
 		return nil
 	}
 
-	if err := b.Write(ctx, recordKeysKey(prefix), encodeRecordKeys(keys)); err != nil {
+	if err := backend.WriteDeferred(ctx, b, recordKeysKey(prefix), encodeRecordKeys(keys)); err != nil {
 		return errors.Wrap(err, "write record-keys footer")
 	}
 

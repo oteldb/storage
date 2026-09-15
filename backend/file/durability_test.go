@@ -2,6 +2,8 @@ package file
 
 import (
 	"context"
+	"slices"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -286,4 +288,200 @@ func TestWriteAfterPrunedDirectoriesSurvivesPowerLoss(t *testing.T) {
 	keys, err := newFS(fsys.Crash()).List(ctx, "")
 	require.NoError(t, err)
 	assert.Equal(t, []string{key}, keys)
+}
+
+// deferredPart writes a part the way the engines do: every object deferred, the manifest last.
+func deferredPart(t *testing.T, b *File, prefix string) []string {
+	t.Helper()
+
+	ctx := context.Background()
+	keys := []string{prefix + "/c/0", prefix + "/c/1", prefix + "/marks", prefix + "/manifest", prefix + "/smax"}
+
+	for _, k := range keys {
+		require.NoError(t, b.WriteDeferred(ctx, k, []byte(k)))
+	}
+
+	slices.Sort(keys)
+
+	return keys
+}
+
+func syncDirs(calls []faultfs.Call) []string {
+	var out []string
+
+	for _, c := range calls {
+		if c.Op == faultfs.OpSyncDir {
+			out = append(out, c.Name)
+		}
+	}
+
+	return out
+}
+
+func countOps(calls []faultfs.Call, op faultfs.Op) int {
+	var n int
+
+	for _, c := range calls {
+		if c.Op == op {
+			n++
+		}
+	}
+
+	return n
+}
+
+func TestSyncPrefixMakesDeferredPartDurable(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsys := faultfs.New()
+	b := newFS(fsys)
+
+	keys := deferredPart(t, b, "t1/metrics/0001")
+	require.NoError(t, b.SyncPrefix(ctx, "t1/metrics/0001"))
+
+	got, err := newFS(fsys.Crash()).List(ctx, "")
+	require.NoError(t, err)
+	assert.Equal(t, keys, got)
+}
+
+// TestSyncPrefixNeverExposesPartialPart crashes at every directory sync SyncPrefix makes: what
+// survives is either none of the part or all of it, never a manifest without what it names.
+func TestSyncPrefixNeverExposesPartialPart(t *testing.T) {
+	t.Parallel()
+
+	const part = "t1/metrics/0001"
+
+	for step := range 5 {
+		t.Run(strconv.Itoa(step), func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			fsys := faultfs.New()
+			b := newFS(fsys)
+			keys := deferredPart(t, b, part)
+
+			gate := faultfs.NewGate()
+			seen := 0
+			fsys.Add(faultfs.Rule{Op: faultfs.OpSyncDir, Before: func(c faultfs.Call) {
+				seen++
+				if seen == step+1 {
+					gate.Rule(faultfs.OpSyncDir, nil).Before(c)
+				}
+			}})
+
+			done := make(chan error, 1)
+			go func() { done <- b.SyncPrefix(ctx, part) }()
+
+			held := gate.Await(t)
+			after := newFS(fsys.Crash())
+
+			gate.Release()
+			require.NoError(t, <-done)
+
+			got, err := after.List(ctx, "")
+			require.NoError(t, err)
+
+			if len(got) > 0 {
+				assert.Equal(t, keys, got, "crash before syncing %q", held.Name)
+			}
+		})
+	}
+}
+
+// TestDeferredPartSyncCount pins the saving: a part costs a file fsync per object and, once its
+// engine directory is known durable, three directory syncs however many objects it has.
+func TestDeferredPartSyncCount(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsys := faultfs.New()
+	b := newFS(fsys)
+
+	deferredPart(t, b, "t1/metrics/0001")
+	require.NoError(t, b.SyncPrefix(ctx, "t1/metrics/0001"))
+
+	before := len(fsys.Calls())
+	keys := deferredPart(t, b, "t1/metrics/0002")
+	require.NoError(t, b.SyncPrefix(ctx, "t1/metrics/0002"))
+
+	calls := fsys.Calls()[before:]
+	assert.Equal(t, len(keys), countOps(calls, faultfs.OpSync))
+	assert.Equal(t, []string{"t1/metrics/0002/c", "t1/metrics/0002", "t1/metrics"}, syncDirs(calls))
+}
+
+func TestDeferredDeleteSyncCount(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsys := faultfs.New()
+	b := newFS(fsys)
+
+	keys := deferredPart(t, b, "t1/metrics/0001")
+	require.NoError(t, b.SyncPrefix(ctx, "t1/metrics/0001"))
+	require.NoError(t, b.Write(ctx, "t1/metrics/index", []byte("i")))
+
+	before := len(fsys.Calls())
+	require.NoError(t, b.Delete(ctx, "t1/metrics/0001/manifest"))
+
+	for _, k := range keys {
+		if k != "t1/metrics/0001/manifest" {
+			require.NoError(t, b.DeleteDeferred(ctx, k))
+		}
+	}
+
+	assert.Equal(t, []string{"t1/metrics/0001"}, syncDirs(fsys.Calls()[before:]))
+
+	got, err := newFS(fsys.Crash()).List(ctx, "")
+	require.NoError(t, err)
+	assert.NotContains(t, got, "t1/metrics/0001/manifest")
+}
+
+// TestDeferredDeleteForgetsPrunedDirectories rewrites a part a deferred delete pruned: the
+// directories are new, and SyncPrefix must not trust what it remembered about the old ones.
+func TestDeferredDeleteForgetsPrunedDirectories(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsys := faultfs.New()
+	b := newFS(fsys)
+
+	keys := deferredPart(t, b, "t1/metrics/0001")
+	require.NoError(t, b.SyncPrefix(ctx, "t1/metrics/0001"))
+
+	for _, k := range keys {
+		require.NoError(t, b.DeleteDeferred(ctx, k))
+	}
+
+	deferredPart(t, b, "t1/metrics/0001")
+	require.NoError(t, b.SyncPrefix(ctx, "t1/metrics/0001"))
+
+	got, err := newFS(fsys.Crash()).List(ctx, "")
+	require.NoError(t, err)
+	assert.Equal(t, keys, got)
+}
+
+func TestCreateObjectDeferredWaitsForSyncPrefix(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsys := faultfs.New()
+	b := newFS(fsys)
+
+	w, err := b.CreateObjectDeferred(ctx, "t1/metrics/0001/c/0")
+	require.NoError(t, err)
+	_, err = w.Write([]byte("column"))
+	require.NoError(t, err)
+	require.NoError(t, w.Commit(ctx))
+
+	assert.Empty(t, syncDirs(fsys.Calls()))
+
+	require.NoError(t, b.SyncPrefix(ctx, "t1/metrics/0001"))
+	assert.Equal(t, []byte("column"), read(t, newFS(fsys.Crash()), "t1/metrics/0001/c/0"))
+}
+
+func TestSyncPrefixOfMissingPrefix(t *testing.T) {
+	t.Parallel()
+
+	assert.NoError(t, newFS(faultfs.New()).SyncPrefix(context.Background(), "t1/metrics/0001"))
 }

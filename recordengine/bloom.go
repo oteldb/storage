@@ -474,7 +474,7 @@ func writeBlooms(
 		}
 
 		data := bb.build(col.Bloom, cols.cellsAt(k))
-		if err := b.Write(ctx, bloomKey(prefix, col.Name), data); err != nil {
+		if err := backend.WriteDeferred(ctx, b, bloomKey(prefix, col.Name), data); err != nil {
 			return errors.Wrapf(err, "write bloom %q", col.Name)
 		}
 	}

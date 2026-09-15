@@ -111,7 +111,9 @@ brand-new head, so data time cannot say how long a flush has been stalled.
 ### Publish order: the part's objects first, the bucket index last
 
 The bucket index makes a part durably visible, so writing it is the commit point and a readable part
-always carries the identities its rows resolve through. A crash in between leaves an orphan — objects
+always carries the identities its rows resolve through. Every part object, sidecars included, is
+written deferred and the part is made durable by one `backend.SyncPrefix` after its last sidecar
+(`backend/ARCH.md`, `DeferredSyncer`), so the index never names a part a power cut could still take. A crash in between leaves an orphan — objects
 and identity together — swept at the next open, stranding nothing.
 
 `CheckpointThrough` runs last and is the WAL's commit point, so replay recovers a part that failed

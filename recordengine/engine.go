@@ -1427,6 +1427,10 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 			}
 		}
 
+		if err := backend.SyncPrefix(ctx, e.cfg.Backend, prefix); err != nil {
+			return 0, 0, e.abortFlush(ctx, detached, detachedBytes, side, errors.Wrapf(err, "sync part %q", prefix))
+		}
+
 		newParts = append(newParts, p)
 	}
 

@@ -4,11 +4,13 @@ import (
 	"context"
 	"time"
 
+	"github.com/go-faster/errors"
 	"github.com/go-faster/sdk/zctx"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/internal/obs"
 )
 
@@ -440,6 +442,10 @@ func (e *Engine) writeMergedPart(ctx context.Context, src []*part, f *flushColum
 		if err := e.mergeSidecars(ctx, src, prefix); err != nil {
 			return nil, err
 		}
+	}
+
+	if err := backend.SyncPrefix(ctx, e.cfg.Backend, prefix); err != nil {
+		return nil, errors.Wrapf(err, "sync part %q", prefix)
 	}
 
 	return p, nil

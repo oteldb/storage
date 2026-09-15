@@ -193,7 +193,7 @@ func writePart(
 	// layout, so opening the part needs neither the series-column read nor a resident per-series
 	// index (see sidx.go). Written after the manifest commit — a crash in between leaves a valid
 	// part that openPart handles via the resident fallback.
-	if err := b.Write(ctx, sidxKey(prefix), encodeSeriesIndex(cols.series)); err != nil {
+	if err := backend.WriteDeferred(ctx, b, sidxKey(prefix), encodeSeriesIndex(cols.series)); err != nil {
 		return errors.Wrapf(err, "write series-index sidecar %q", prefix)
 	}
 
@@ -206,7 +206,7 @@ func writePart(
 
 	// Watermark sidecar: the newest timestamp per series, so a replica refresh trims its head
 	// against this part without decoding the timestamp column (see part.seriesWatermarks).
-	if err := b.Write(ctx, watermark.Key(prefix), watermark.Encode(nil, computeWatermarks(cols))); err != nil {
+	if err := backend.WriteDeferred(ctx, b, watermark.Key(prefix), watermark.Encode(nil, computeWatermarks(cols))); err != nil {
 		return errors.Wrapf(err, "write watermark sidecar %q", prefix)
 	}
 
@@ -216,9 +216,13 @@ func writePart(
 	// sampled part falls back to the weighted decode path.
 	if writeStats && cols.sf == nil {
 		ids, stats := computeSeriesStats(cols)
-		if err := b.Write(ctx, statsKey(prefix), encodeSeriesStats(ids, stats)); err != nil {
+		if err := backend.WriteDeferred(ctx, b, statsKey(prefix), encodeSeriesStats(ids, stats)); err != nil {
 			return errors.Wrapf(err, "write stats sidecar %q", prefix)
 		}
+	}
+
+	if err := backend.SyncPrefix(ctx, b, prefix); err != nil {
+		return errors.Wrapf(err, "sync part %q", prefix)
 	}
 
 	return nil
