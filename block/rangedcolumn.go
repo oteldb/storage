@@ -40,6 +40,10 @@ const dirProbeBytes = 4096
 // A bytes column is read through [Decoder.DecodeBytes], which takes its shared dictionary —
 // [Decoder.SharedEntries] — from the object head this open already peeled.
 func (r *PartReader) ColumnBlocks(ctx context.Context, name string) (*Decoder, error) {
+	return r.openDecoder(ctx, name, 0)
+}
+
+func (r *PartReader) openDecoder(ctx context.Context, name string, window int64) (*Decoder, error) {
 	i, ok := r.byName[name]
 	if !ok {
 		return nil, errors.Errorf("block: no column %q", name)
@@ -70,7 +74,7 @@ func (r *PartReader) ColumnBlocks(ctx context.Context, name string) (*Decoder, e
 
 	cr := newColumnReader(desc, nil, r.compressorFor(desc.Compress), r.manifest.RowCount)
 
-	dir, shared, err := readBlockDir(ctx, r.b, key, desc, cr.comp, size)
+	dir, shared, err := readBlockDir(ctx, r.b, key, desc, cr.comp, size, window)
 	if err != nil {
 		return nil, errors.Wrapf(err, "column %q", name)
 	}
@@ -95,7 +99,8 @@ func (r *PartReader) ColumnBlocks(ctx context.Context, name string) (*Decoder, e
 // [ColumnReader.blockDir]; reading the directory out of the raw object instead parses dictionary
 // bytes as a directory, which fails as corruption on healthy data.
 func readBlockDir(
-	ctx context.Context, b backend.Backend, key string, desc ColumnDesc, comp *compress.Compressor, size int64,
+	ctx context.Context, b backend.Backend, key string, desc ColumnDesc,
+	comp *compress.Compressor, size, window int64,
 ) (blockDir, [][]byte, error) {
 	if !desc.Framed {
 		// The legacy one-compressed-block-per-granule directory has no length it can be found by
@@ -128,7 +133,10 @@ func readBlockDir(
 	}
 
 	d.col = desc.Name
-	d.src = &frameSource{ctx: ctx, b: b, key: key, base: d.dataOff}
+	d.src = &frameSource{
+		ctx: ctx, b: b, key: key, base: d.dataOff,
+		window: window, frameOff: d.frameOff,
+	}
 
 	return d, shared, nil
 }
@@ -371,6 +379,12 @@ func varintLen(v uint64) int {
 
 // frameSource fetches a column's compression frames from the backend as they are needed, so a
 // decoder holds one frame rather than the column.
+//
+// With a read-ahead window set it fetches whole frames up to that many bytes at a time instead of
+// one frame per request. That is the difference between a merge completing over S3 and not: a frame
+// is [defaultCompressBlockBytes] *uncompressed*, so a 256 MiB column is thousands of frames, and
+// [backend.Cache] deliberately does not cache ranged reads — nothing amortizes them. Window is the
+// read side's memory budget, one buffer per open column, so it is the caller's to size.
 type frameSource struct {
 	// ctx belongs to the operation that opened the decoder and bounds its reads; the decoder is
 	// built per fetch and must not outlive it. Held because the decode calls it serves take no ctx
@@ -379,19 +393,40 @@ type frameSource struct {
 	b    backend.Backend
 	key  string
 	base int64 // absolute offset of the frame data region within the object
+
+	// Read-ahead, off when window is 0. frameOff is the directory's frame table, so a window is
+	// snapped to a frame boundary and a frame is never held in halves.
+	window   int64
+	frameOff []int32
+	ahead    []byte
+	lo, hi   int64 // data-region extent ahead covers
 }
 
-// frame returns frame [off, off+n) of the data region, read from the backend. The bytes are taken
-// as a read-only view where the backend can offer one: a frame is decompressed on arrival and never
-// retained or mutated, so ranging costs the in-memory backend no copy it did not pay before.
-func (s *frameSource) frame(off, n int64) ([]byte, error) {
+// frame returns frame f, spanning [off, off+n) of the data region. The bytes are taken as a
+// read-only view where the backend can offer one: a frame is decompressed on arrival and never
+// mutated, so ranging costs the in-memory backend no copy it did not pay before.
+func (s *frameSource) frame(f int, off, n int64) ([]byte, error) {
+	if s.window > 0 {
+		return s.readAhead(f, off, n)
+	}
+
+	buf, err := s.read(off, n)
+	if err != nil {
+		return nil, err
+	}
+
+	return buf, nil
+}
+
+// read fetches [off, off+n) of the data region, rejecting a short answer rather than decoding one.
+func (s *frameSource) read(off, n int64) ([]byte, error) {
 	buf, err := backend.ReadViewAt(s.ctx, s.b, s.key, s.base+off, n)
 	if err != nil {
-		return nil, errors.Wrapf(err, "read frame at [%d,+%d)", s.base+off, n)
+		return nil, errors.Wrapf(err, "read frames at [%d,+%d)", s.base+off, n)
 	}
 
 	if int64(len(buf)) != n {
-		return nil, errors.Wrapf(ErrCorrupt, "frame at [%d,+%d) is %d bytes", s.base+off, n, len(buf))
+		return nil, errors.Wrapf(ErrCorrupt, "frames at [%d,+%d) are %d bytes", s.base+off, n, len(buf))
 	}
 
 	return buf, nil
