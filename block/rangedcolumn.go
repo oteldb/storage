@@ -7,6 +7,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/encoding/compress"
 )
 
 // A block-framed column is read one compression frame at a time rather than whole: the directory
@@ -22,9 +23,9 @@ import (
 // Where it sits depends on the layout the column was written under ([ColumnDesc.Footer]), and that
 // changes only how it is found, never how it is parsed.
 
-// dirProbeBytes is the first read of a directory-leading column: enough for the three header
-// uvarints, from which the directory's exact extent follows. Sized at a filesystem block rather
-// than the ~15 bytes actually needed, since no backend charges less for a smaller read.
+// dirProbeBytes is the first read of a column header — a leading directory's three uvarints, or a
+// shared dictionary's two — from which that header's exact extent follows. Sized at a filesystem
+// block rather than the ~15 bytes actually needed, since no backend charges less for a smaller read.
 const dirProbeBytes = 4096
 
 // ColumnBlocks returns a per-block decoder for the named column that reads only the block directory
@@ -36,6 +37,8 @@ const dirProbeBytes = 4096
 // holds ctx for its frame reads, so it must not outlive the operation that opened it.
 //
 // The column must be block-framed and not constant-collapsed; [PartReader.Column] handles those.
+// A bytes column is read through [Decoder.DecodeBytes], which takes its shared dictionary —
+// [Decoder.SharedEntries] — from the object head this open already peeled.
 func (r *PartReader) ColumnBlocks(ctx context.Context, name string) (*Decoder, error) {
 	i, ok := r.byName[name]
 	if !ok {
@@ -65,62 +68,156 @@ func (r *PartReader) ColumnBlocks(ctx context.Context, name string) (*Decoder, e
 		}
 	}
 
-	dir, err := readBlockDir(ctx, r.b, key, desc, size)
+	cr := newColumnReader(desc, nil, r.compressorFor(desc.Compress), r.manifest.RowCount)
+
+	dir, shared, err := readBlockDir(ctx, r.b, key, desc, cr.comp, size)
 	if err != nil {
 		return nil, errors.Wrapf(err, "column %q", name)
 	}
 
-	cr := newColumnReader(desc, nil, r.compressorFor(desc.Compress), r.manifest.RowCount)
-
 	return &Decoder{
 		rows:    r.manifest.RowCount,
+		kind:    desc.Kind,
 		i64:     cr.int64Decoder(),
 		f64:     cr.float64Decoder(),
+		shared:  shared,
 		streams: newBlockStreams(dir, cr.comp),
 	}, nil
 }
 
 // readBlockDir reads and parses a block-framed column's directory without reading its frames,
-// leaving the returned [blockDir] pointed at the backend for those.
+// leaving the returned [blockDir] pointed at the backend for those. It also returns the column's
+// shared dictionary, nil for a column without one.
+//
+// A shared-dictionary column's block-framed container does not start at the object's head: the
+// dictionary sits ahead of it (see shareddict.go), and both directory layouts are parsed relative to
+// where the container actually begins. The whole-object reader peels the same header in
+// [ColumnReader.blockDir]; reading the directory out of the raw object instead parses dictionary
+// bytes as a directory, which fails as corruption on healthy data.
 func readBlockDir(
-	ctx context.Context, b backend.Backend, key string, desc ColumnDesc, size int64,
-) (blockDir, error) {
+	ctx context.Context, b backend.Backend, key string, desc ColumnDesc, comp *compress.Compressor, size int64,
+) (blockDir, [][]byte, error) {
 	if !desc.Framed {
 		// The legacy one-compressed-block-per-granule directory has no length it can be found by
 		// without walking it, and no part written since predates the framed form.
-		return blockDir{}, errors.Wrap(ErrCorrupt, "the legacy blocked layout cannot be read by range")
+		return blockDir{}, nil, errors.Wrap(ErrCorrupt, "the legacy blocked layout cannot be read by range")
 	}
 
 	var (
-		d   blockDir
-		err error
+		shared [][]byte
+		off    int64
+		err    error
 	)
 
+	if desc.SharedDict {
+		if shared, off, err = readSharedDict(ctx, b, key, comp, size, desc.Checked); err != nil {
+			return blockDir{}, nil, err
+		}
+	}
+
+	var d blockDir
+
 	if desc.Footer {
-		d, err = readFooterDir(ctx, b, key, size, desc.Checked)
+		d, err = readFooterDir(ctx, b, key, off, size-off, desc.Checked)
 	} else {
-		d, err = readLeadingDir(ctx, b, key, size, desc.Checked)
+		d, err = readLeadingDir(ctx, b, key, off, size-off, desc.Checked)
 	}
 
 	if err != nil {
-		return blockDir{}, err
+		return blockDir{}, nil, err
 	}
 
 	d.col = desc.Name
 	d.src = &frameSource{ctx: ctx, b: b, key: key, base: d.dataOff}
 
-	return d, nil
+	return d, shared, nil
+}
+
+// readSharedDict reads a shared-dictionary column's leading header and returns its entries together
+// with the offset at which the block-framed container begins. The two header uvarints give the
+// header's exact extent, so a dictionary larger than the probe costs one further read and no more.
+func readSharedDict(
+	ctx context.Context, b backend.Backend, key string, comp *compress.Compressor, size int64, checked bool,
+) ([][]byte, int64, error) {
+	head, err := backend.ReadAt(ctx, b, key, 0, min(size, dirProbeBytes))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	n, err := sharedDictHeadLen(head, size, checked)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if n > int64(len(head)) {
+		if head, err = backend.ReadAt(ctx, b, key, 0, n); err != nil {
+			return nil, 0, err
+		}
+
+		if int64(len(head)) != n {
+			return nil, 0, errors.Wrap(ErrCorrupt, "shared dict: truncated")
+		}
+	}
+
+	entries, rest, err := parseSharedDict(head, comp, checked)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return entries, int64(len(head) - len(rest)), nil
+}
+
+// sharedDictHeadLen is the byte length of a shared-dictionary header, read from the two uvarints
+// that open it. It is what lets the header be fetched exactly rather than guessed at.
+func sharedDictHeadLen(head []byte, size int64, checked bool) (int64, error) {
+	_, n := binary.Uvarint(head)
+	if n <= 0 {
+		return 0, errors.Wrap(ErrCorrupt, "shared dict: bad entry count")
+	}
+
+	total := int64(n)
+
+	packedLen, n := binary.Uvarint(head[total:])
+	if n <= 0 {
+		return 0, errors.Wrap(ErrCorrupt, "shared dict: bad dictionary length")
+	}
+
+	total += int64(n)
+
+	if total >= size {
+		return 0, errors.Wrap(ErrCorrupt, "shared dict: truncated")
+	}
+
+	if packedLen > uint64(size-total) {
+		return 0, errors.Wrapf(ErrCorrupt, "shared dict: length %d past object %d", packedLen, size)
+	}
+
+	total += int64(packedLen)
+
+	if checked {
+		total += objectCRCBytes
+	}
+
+	if total > size {
+		return 0, errors.Wrap(ErrCorrupt, "shared dict: truncated before its checksum")
+	}
+
+	return total, nil
 }
 
 // readFooterDir reads the directory of a column that carries it after its frames. The trailing
 // length is at a known offset from the end, so one read of the tail usually lands the whole
 // directory and the second read is needed only for a directory larger than the probe.
+//
+// off is where the column's block-framed container begins within the object and size its length:
+// nonzero for a shared-dictionary column, whose frames start after the dictionary rather than at
+// the object's head.
 func readFooterDir(
-	ctx context.Context, b backend.Backend, key string, size int64, checked bool,
+	ctx context.Context, b backend.Backend, key string, off, size int64, checked bool,
 ) (blockDir, error) {
 	probe := min(size, dirProbeBytes)
 
-	tail, err := backend.ReadAt(ctx, b, key, size-probe, probe)
+	tail, err := backend.ReadAt(ctx, b, key, off+size-probe, probe)
 	if err != nil {
 		return blockDir{}, err
 	}
@@ -134,11 +231,11 @@ func readFooterDir(
 		return blockDir{}, errors.Wrapf(ErrCorrupt, "block dir footer len %d exceeds object", dirLen)
 	}
 
-	dataOff := size - footerLenBytes - dirLen
+	frameBytes := size - footerLenBytes - dirLen
 
 	raw := tail[:len(tail)-footerLenBytes]
 	if dirLen > int64(len(raw)) {
-		if raw, err = backend.ReadAt(ctx, b, key, dataOff, dirLen); err != nil {
+		if raw, err = backend.ReadAt(ctx, b, key, off+frameBytes, dirLen); err != nil {
 			return blockDir{}, err
 		}
 
@@ -149,7 +246,7 @@ func readFooterDir(
 
 	raw = raw[int64(len(raw))-dirLen:]
 
-	d, pos, total, err := parseFramedDirFields(raw, int(dataOff), checked)
+	d, pos, total, err := parseFramedDirFields(raw, int(frameBytes), checked)
 	if err != nil {
 		return blockDir{}, err
 	}
@@ -166,12 +263,12 @@ func readFooterDir(
 		return blockDir{}, errors.Wrapf(ErrCorrupt, "block dir footer has %d trailing bytes", dirLen-int64(pos))
 	}
 
-	if int64(total) != dataOff {
-		return blockDir{}, errors.Wrapf(ErrCorrupt, "block dir frames total %d, want %d", total, dataOff)
+	if int64(total) != frameBytes {
+		return blockDir{}, errors.Wrapf(ErrCorrupt, "block dir frames total %d, want %d", total, frameBytes)
 	}
 
-	// Frames start at the object's head under this layout.
-	d.dataOff = 0
+	// Frames start at the container's head under this layout.
+	d.dataOff = off
 
 	return d, nil
 }
@@ -181,10 +278,12 @@ func readFooterDir(
 // most a granule-count varint plus a length varint, and every granule at most a length varint. That
 // bound is tight enough to read in one further request — ~1.4 MB for a directory over an 833 MB
 // column, against the 15 MB a worst-case-varint bound would ask for.
+//
+// off and size delimit the column's block-framed container within the object, as in [readFooterDir].
 func readLeadingDir(
-	ctx context.Context, b backend.Backend, key string, size int64, checked bool,
+	ctx context.Context, b backend.Backend, key string, off, size int64, checked bool,
 ) (blockDir, error) {
-	raw, err := backend.ReadAt(ctx, b, key, 0, min(size, dirProbeBytes))
+	raw, err := backend.ReadAt(ctx, b, key, off, min(size, dirProbeBytes))
 	if err != nil {
 		return blockDir{}, err
 	}
@@ -196,7 +295,7 @@ func readLeadingDir(
 
 	bound := dirBound(nGranules, nFrames, size, checked)
 	if bound > int64(len(raw)) {
-		if raw, err = backend.ReadAt(ctx, b, key, 0, min(bound, size)); err != nil {
+		if raw, err = backend.ReadAt(ctx, b, key, off, min(bound, size)); err != nil {
 			return blockDir{}, err
 		}
 	}
@@ -218,7 +317,7 @@ func readLeadingDir(
 		return blockDir{}, errors.Wrapf(ErrCorrupt, "block dir describes %d bytes, object holds %d", int64(pos)+int64(total), size)
 	}
 
-	d.dataOff = int64(pos)
+	d.dataOff = off + int64(pos)
 
 	return d, nil
 }

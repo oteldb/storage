@@ -1067,8 +1067,13 @@ func decodeBlockedRange[T any](
 // block. Obtain one via [ColumnReader.Decoder]; it holds the column's already-read object.
 type Decoder struct {
 	rows int
+	kind Kind
 	i64  decodeFunc[int64]
 	f64  decodeFunc[float64]
+
+	// shared is the column's shared dictionary, nil for a column without one. Every granule that
+	// joined it carries only ids into it, so it is peeled at open and resolved against here.
+	shared [][]byte
 
 	// streams holds the decompressed compression frame, reused across this decoder's blocks. A
 	// decoder decodes its column's blocks serially (never concurrently), and each block's decoded
@@ -1110,6 +1115,24 @@ func (d *Decoder) DecodeFloat64(blk int) ([]float64, error) {
 // DecodeFloat64Into is the float64 analog of [Decoder.DecodeInt64Into].
 func (d *Decoder) DecodeFloat64Into(blk int, dst []float64) ([]float64, error) {
 	return decodeOneBlockInto(&d.streams, d.rows, blk, dst, d.f64)
+}
+
+// SharedEntries returns the column's shared dictionary, nil for a column without one. The entries
+// are read-only and shared with every column this decoder produces.
+func (d *Decoder) SharedEntries() [][]byte { return d.shared }
+
+// DecodeBytes decodes the named blocks of a bytes column, in ascending order, merged into one
+// [chunk.DictColumn] over their concatenated rows; a nil selection decodes the whole column.
+//
+// It takes a block set rather than a single block because each granule may carry its own dictionary,
+// so ids only become comparable once [chunk.DictMerger] has remapped them into a shared one — the
+// same reason [ColumnReader.DecodeBlocksBytes] has this shape and the int64/float64 paths do not.
+func (d *Decoder) DecodeBytes(blocks []int) (*chunk.DictColumn, error) {
+	if d.kind != KindBytes {
+		return nil, errors.Errorf("block: column is %s, not bytes", d.kind)
+	}
+
+	return decodeBlockedBytes(d.streams.dir, d.streams.comp, d.rows, blocks, d.shared)
 }
 
 // decodeOneBlockInto decompresses and decodes a single block into dst (reusing dst's backing array
