@@ -38,11 +38,15 @@ type streamBackend struct {
 	free int64
 }
 
+var _ backend.ObjectCreator = streamBackend{}
+
 func (s streamBackend) FreeSpace(context.Context) (int64, error) { return s.free, nil }
 
 func (streamBackend) CreateObject(context.Context, string) (backend.ObjectWriter, error) {
 	return nil, errors.New("not used")
 }
+
+func (streamBackend) StreamsWrites() bool { return true }
 
 // concurrencyFunc adapts a fixed count to the config callback; 0 means unset.
 func concurrencyFunc(n int) func() int {

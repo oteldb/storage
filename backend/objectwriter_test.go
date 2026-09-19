@@ -27,6 +27,8 @@ func (b *streamingMemory) CreateObject(_ context.Context, key string) (backend.O
 	return &memoryObjectWriter{b: b.Backend, key: key}, nil
 }
 
+func (*streamingMemory) StreamsWrites() bool { return true }
+
 type memoryObjectWriter struct {
 	b   backend.Backend
 	key string
@@ -68,18 +70,17 @@ func TestCachedConformance(t *testing.T) {
 }
 
 // TestStreamsWritesIsNotClaimedByWrappers is the trap the [backend.SpaceReporter] forwarding already
-// fell into, in reverse: a wrapper that forwards [backend.ObjectCreator] unconditionally would
-// report a streaming write over an inner backend that buffers, and the merge engine sizes parts on
-// that answer.
+// fell into, in reverse: a wrapper that reported a streaming write over an inner backend that
+// buffers would have the merge engine size parts against memory it does not have.
 //
-// [backend.ObjectCreator] is the capability this rule binds, because its *presence* is the answer
-// to a sizing question. The others — [backend.ReaderAt], [backend.Viewer], [backend.SpaceReporter],
-// [backend.DeferredSyncer] — are asked through package helpers that degrade inside, so a wrapper
-// implementing them unconditionally promises nothing it cannot keep.
+// The rule is enforced by shape rather than by this test: [backend.ObjectCreator.StreamsWrites] is
+// a value a wrapper must forward, so a wrapper that omits it does not compile, where one that
+// forgot a conditional variant type used to compile and lie. Every wrapper in the tree still
+// belongs in the table below, answering for the backend beneath it in both directions.
 //
-// Every wrapper in the tree belongs in the table below, and each must answer for the backend
-// beneath it in both directions. The exception, deliberately, is backendtest.Deferred: a test
-// helper whose whole purpose is to force a buffering backend down the streaming path.
+// backendtest.Deferred is the deliberate exception to the *other* half: it implements CreateObject
+// unconditionally to force a buffering backend down the streaming path, while StreamsWrites still
+// answers honestly for that backend.
 func TestStreamsWritesIsNotClaimedByWrappers(t *testing.T) {
 	t.Parallel()
 
@@ -90,6 +91,7 @@ func TestStreamsWritesIsNotClaimedByWrappers(t *testing.T) {
 		"Cached":         func(b backend.Backend) backend.Backend { return backend.Cached(b, 1<<20) },
 		"Cached(0)":      func(b backend.Backend) backend.Backend { return backend.Cached(b, 0) },
 		"Cached(Cached)": func(b backend.Backend) backend.Backend { return backend.Cached(backend.Cached(b, 1<<20), 1<<20) },
+		"Deferred":       func(b backend.Backend) backend.Backend { return backendtest.WithDeferred(b) },
 	}
 
 	for name, wrap := range wrappers {
@@ -159,9 +161,9 @@ func TestCachedStreamedAbortKeepsCache(t *testing.T) {
 	assert.Equal(t, []byte("first"), got)
 }
 
-// TestUncachedHelpersSeeStreamingWrapper guards the second type [backend.Cached] can return: the
-// uncached helpers recognize a cached backend by assertion, and a plain one would miss it and
-// silently start caching the identity sets they exist to keep out.
+// TestUncachedHelpersSeeStreamingWrapper guards the assertion the uncached helpers recognize a
+// cached backend by: miss it and they would silently start caching the identity sets they exist to
+// keep out.
 func TestUncachedHelpersSeeStreamingWrapper(t *testing.T) {
 	t.Parallel()
 

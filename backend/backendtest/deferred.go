@@ -11,8 +11,9 @@ import (
 
 // Deferred wraps a backend with a [backend.DeferredSyncer] that remembers which deferred writes
 // and deletes no SyncPrefix has covered yet, so a test can assert that nothing durable names a
-// prefix while it still has some. It also claims [backend.ObjectCreator], so a streaming writer
-// takes its streaming path over a backend that buffers.
+// prefix while it still has some. It also implements [backend.ObjectCreator], so a streaming writer
+// takes its streaming path over a backend that buffers — while StreamsWrites still answers for
+// that backend, which does not.
 type Deferred struct {
 	backend.Backend
 
@@ -68,6 +69,9 @@ func (d *Deferred) Delete(ctx context.Context, key string) error {
 func (d *Deferred) CreateObject(ctx context.Context, key string) (backend.ObjectWriter, error) {
 	return backend.CreateObject(ctx, d.Backend, key)
 }
+
+// StreamsWrites answers for the wrapped backend. Implements [backend.ObjectCreator].
+func (d *Deferred) StreamsWrites() bool { return backend.StreamsWrites(d.Backend) }
 
 // WriteDeferred implements [backend.DeferredSyncer].
 func (d *Deferred) WriteDeferred(ctx context.Context, key string, data []byte) error {

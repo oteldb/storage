@@ -22,11 +22,15 @@ type streamingMemory struct {
 	backend.Backend
 }
 
+var _ backend.ObjectCreator = (*streamingMemory)(nil)
+
 func newStreamingMemory() *streamingMemory { return &streamingMemory{Backend: backend.Memory()} }
 
 func (b *streamingMemory) CreateObject(_ context.Context, key string) (backend.ObjectWriter, error) {
 	return &memoryObjectWriter{b: b.Backend, key: key}, nil
 }
+
+func (*streamingMemory) StreamsWrites() bool { return true }
 
 type memoryObjectWriter struct {
 	b   backend.Backend

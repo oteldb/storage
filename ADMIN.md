@@ -417,8 +417,8 @@ A part's large columns can be handed to the backend as they are produced instead
 a writer's resident set is a frame rather than an object. `file` does this with a temp file;
 `s3` does it with a multipart upload, available when the `ObjectStore` implements
 `s3.MultipartObjectStore` (the `NewAWS` adapter does). `backend.StreamsWrites(b)` answers whether a
-given backend actually streams — every wrapper forwards the capability only when the backend
-beneath it has it, because a merge sizes its output part against that answer.
+given backend actually streams — a wrapper answers for the backend beneath it, because a merge
+sizes its output part against that answer.
 
 Objects below `8 MiB` never start an upload: they accumulate and commit as one `PutObject`, so
 marks, manifests, watermarks and small columns cost the same requests they did before.

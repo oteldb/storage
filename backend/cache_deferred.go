@@ -17,7 +17,7 @@ func (c *cachedBackend) WriteDeferred(ctx context.Context, key string, data []by
 }
 
 // CreateObjectDeferred forwards the deferred incremental write, invalidating like
-// [cachedStreamBackend.CreateObject]. Implements [DeferredSyncer].
+// [cachedBackend.CreateObject]. Implements [DeferredSyncer].
 func (c *cachedBackend) CreateObjectDeferred(ctx context.Context, key string) (ObjectWriter, error) {
 	w, err := CreateObjectDeferred(ctx, c.inner, key)
 	if err != nil {
@@ -44,12 +44,11 @@ func (c *cachedBackend) SyncPrefix(ctx context.Context, prefix string) error {
 
 // WriteUncachedDeferred is [WriteUncached] through b's deferred write.
 func WriteUncachedDeferred(ctx context.Context, b Backend, key string, data []byte) error {
-	cb, ok := b.(cached)
+	c, ok := b.(*cachedBackend)
 	if !ok {
 		return WriteDeferred(ctx, b, key, data)
 	}
 
-	c := cb.cache()
 	if err := WriteDeferred(ctx, c.inner, key, data); err != nil {
 		return err
 	}

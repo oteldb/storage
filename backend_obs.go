@@ -24,35 +24,26 @@ type instrumentedBackend struct {
 // instrumentBackend wraps b so its operations are metered. It is applied only when a meter is
 // configured, so the default path is the bare backend.
 func instrumentBackend(b backend.Backend, m *obs.Backend) backend.Backend {
-	i := &instrumentedBackend{inner: b, m: m}
-
-	// Forwarded by a distinct type rather than a method, so metering claims the incremental-write
-	// capability only when the wrapped backend actually has it — a method would make
-	// [backend.StreamsWrites] report a streaming write over a backend that buffers.
-	if backend.StreamsWrites(b) {
-		return &instrumentedStreamBackend{instrumentedBackend: i}
-	}
-
-	return i
+	return &instrumentedBackend{inner: b, m: m}
 }
 
-// instrumentedStreamBackend is [instrumentedBackend] over a backend that streams object writes.
-type instrumentedStreamBackend struct {
-	*instrumentedBackend
-}
-
-var _ backend.ObjectCreator = (*instrumentedStreamBackend)(nil)
+var _ backend.ObjectCreator = (*instrumentedBackend)(nil)
 
 // CreateObject forwards the incremental write, metering the object once it commits — the point at
-// which its bytes become an object, and the only point at which their total is known.
-func (b *instrumentedStreamBackend) CreateObject(ctx context.Context, key string) (backend.ObjectWriter, error) {
+// which its bytes become an object, and the only point at which their total is known. Implements
+// [backend.ObjectCreator].
+func (b *instrumentedBackend) CreateObject(ctx context.Context, key string) (backend.ObjectWriter, error) {
 	w, err := backend.CreateObject(ctx, b.inner, key)
 	if err != nil {
 		return nil, err
 	}
 
-	return &instrumentedObjectWriter{ObjectWriter: w, b: b.instrumentedBackend, key: key}, nil
+	return &instrumentedObjectWriter{ObjectWriter: w, b: b, key: key}, nil
 }
+
+// StreamsWrites answers for the metered backend: metering neither adds streaming nor hides it.
+// Implements [backend.ObjectCreator].
+func (b *instrumentedBackend) StreamsWrites() bool { return backend.StreamsWrites(b.inner) }
 
 // instrumentedObjectWriter records a streamed object as one write of its total bytes.
 type instrumentedObjectWriter struct {
@@ -257,7 +248,7 @@ func (b *instrumentedBackend) WriteDeferred(ctx context.Context, key string, dat
 }
 
 // CreateObjectDeferred forwards the deferred incremental write, metered at commit like
-// [instrumentedStreamBackend.CreateObject]. Implements [backend.DeferredSyncer].
+// [instrumentedBackend.CreateObject]. Implements [backend.DeferredSyncer].
 func (b *instrumentedBackend) CreateObjectDeferred(ctx context.Context, key string) (backend.ObjectWriter, error) {
 	w, err := backend.CreateObjectDeferred(ctx, b.inner, key)
 	if err != nil {

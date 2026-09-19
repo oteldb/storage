@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
-	"github.com/oteldb/storage/backend/backendtest"
+	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/ec"
 	"github.com/oteldb/storage/cluster/etcd"
@@ -501,11 +501,12 @@ func TestClusterECShardRepair(t *testing.T) {
 func TestECBackendClaimsStreamingOnlyWhenInnerDoes(t *testing.T) {
 	t.Parallel()
 
-	buffering := backend.Memory()
-	assert.False(t, backend.StreamsWrites(wrapEC(&ecBackend{inner: buffering})))
+	assert.False(t, backend.StreamsWrites(&ecBackend{inner: backend.Memory()}))
 
-	streaming := backendtest.WithDeferred(backend.Memory()) // claims ObjectCreator
-	wrapped := wrapEC(&ecBackend{inner: streaming})
+	streaming, err := file.New(t.TempDir())
+	require.NoError(t, err)
+
+	wrapped := &ecBackend{inner: streaming}
 	require.True(t, backend.StreamsWrites(wrapped))
 
 	ctx := context.Background()

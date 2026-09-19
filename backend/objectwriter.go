@@ -35,10 +35,23 @@ type ObjectWriter interface {
 // [Backend.Write] for backends without the capability, so callers stay correct everywhere. Use
 // [StreamsWrites] to ask whether that fallback would be taken — the caller that *sizes* its output
 // against memory needs to know, since the fallback puts the object back in RAM.
+//
+// The two methods answer two different questions, which is why StreamsWrites is a value rather than
+// the mere presence of CreateObject. A **wrapper** implements CreateObject unconditionally, since
+// forwarding through [CreateObject] is correct over any inner backend — a wrapper has to write its
+// own method anyway wherever the returned writer needs wrapping, as the read cache's does to
+// invalidate on commit. What it must not do is *claim* a streaming write over an inner backend that
+// buffers, and answering that with a forwarded bool makes the claim impossible to get wrong: a
+// wrapper that forgets it does not compile, where a wrapper that forgets a conditional variant type
+// silently lies. [NodeLocal] is the same shape for the same reason.
 type ObjectCreator interface {
 	// CreateObject returns a writer building the object stored under key. Nothing is stored until
 	// the writer commits.
 	CreateObject(ctx context.Context, key string) (ObjectWriter, error)
+
+	// StreamsWrites reports whether the writers this returns keep finished bytes out of RAM.
+	// A wrapper answers for the backend beneath it; see [StreamsWrites].
+	StreamsWrites() bool
 }
 
 // CreateObject returns an [ObjectWriter] for key, using b's [ObjectCreator] fast path when it has
@@ -55,9 +68,9 @@ func CreateObject(ctx context.Context, b Backend, key string) (ObjectWriter, err
 // a writer that keeps finished bytes out of RAM. It is a sizing question, not a correctness one:
 // [CreateObject] works over any backend.
 func StreamsWrites(b Backend) bool {
-	_, ok := b.(ObjectCreator)
+	c, ok := b.(ObjectCreator)
 
-	return ok
+	return ok && c.StreamsWrites()
 }
 
 // bufferedObjectWriter is the [ObjectWriter] fallback for a backend without [ObjectCreator]: it

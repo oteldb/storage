@@ -49,29 +49,25 @@ const uploadPartBytes = 8 << 20
 // has stopped answering.
 const abortTimeout = 30 * time.Second
 
-// multipartBackend is [Backend] over a store that can upload an object in parts.
-//
-// It is a distinct type, rather than a method on [Backend], so the capability is claimed only when
-// the store beneath actually has it: a Backend advertising [backend.ObjectCreator] unconditionally
-// would promise a merge that its output leaves RAM and then buffer the whole part, which is the
-// cost the streamed write exists to avoid.
-type multipartBackend struct {
-	*Backend
-
-	mp MultipartObjectStore
-}
-
-var _ backend.ObjectCreator = (*multipartBackend)(nil)
+var _ backend.ObjectCreator = (*Backend)(nil)
 
 // CreateObject returns a writer that uploads key's object in parts once it exceeds
-// [uploadPartBytes], and issues a single PutObject below that. Implements [backend.ObjectCreator].
-func (b *multipartBackend) CreateObject(ctx context.Context, key string) (backend.ObjectWriter, error) {
+// [uploadPartBytes], and issues a single PutObject below that — which is also what it does for the
+// whole object when the store cannot upload in parts at all. Implements [backend.ObjectCreator].
+func (b *Backend) CreateObject(ctx context.Context, key string) (backend.ObjectWriter, error) {
 	return &objectWriter{ctx: ctx, store: b.store, mp: b.mp, key: b.key(key), name: key}, nil
 }
 
+// StreamsWrites reports whether the store can actually upload in parts. Without it the writer above
+// still works — it just holds the object, which is what a caller sizing its output against memory
+// needs to know. Implements [backend.ObjectCreator].
+func (b *Backend) StreamsWrites() bool { return b.mp != nil }
+
 // objectWriter builds one object out of multipart uploads. Bytes accumulate until a whole part is
 // due, so an object that never reaches [uploadPartBytes] — marks, manifests, watermarks, small
-// columns — creates no upload at all and commits as a plain put.
+// columns — creates no upload at all and commits as a plain put. A nil mp is the same path for
+// every size: the store cannot upload in parts, so the object is held and put whole, which is what
+// [Backend.StreamsWrites] reports.
 type objectWriter struct {
 	ctx   context.Context //nolint:containedctx // Abort takes none, and it must still reach the store
 	store ObjectStore
@@ -94,7 +90,7 @@ func (w *objectWriter) Write(p []byte) (int, error) {
 	}
 
 	w.buf = append(w.buf, p...)
-	if len(w.buf) >= uploadPartBytes {
+	if w.mp != nil && len(w.buf) >= uploadPartBytes {
 		if err := w.flushPart(w.ctx); err != nil {
 			return 0, err
 		}

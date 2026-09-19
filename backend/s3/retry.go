@@ -36,39 +36,26 @@ type retryStore struct {
 	cas         retry.Policy // conditional put (conservative)
 }
 
-// rangeRetryStore is [retryStore] plus ranged reads. It is a separate type so the capability is
-// claimed only when the wrapped store actually has it: a wrapper that advertises [RangeObjectStore]
-// over a store without it would satisfy the type assertion and then fall back to reading whole
-// objects, which is the cost a ranged read exists to avoid.
-type rangeRetryStore struct {
-	*retryStore
-
-	rng RangeObjectStore
+// rangeRetry wraps a [RangeObjectStore]'s reads in the hedged GET policy. It carries only that
+// capability, so [newRetryStore] hands it back on its own rather than folding it into the store's
+// type.
+type rangeRetry struct {
+	rng         RangeObjectStore
+	read        retry.Policy
+	maxAttempts int
 }
 
-func (s *rangeRetryStore) GetObjectRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
+func (s *rangeRetry) GetObjectRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
 	return retry.Hedge(ctx, s.read, retry.Repeat(func(ctx context.Context) ([]byte, error) {
 		return s.rng.GetObjectRange(ctx, key, off, n)
 	}, s.maxAttempts))
 }
 
-// multipartRetry wraps a [MultipartObjectStore]'s calls in the retry policy each one can bear. It
-// is a type of its own rather than methods on [retryStore] so that the range and multipart
-// capabilities compose without the wrappers' method sets colliding.
+// multipartRetry wraps a [MultipartObjectStore]'s calls in the retry policy each one can bear.
 type multipartRetry struct {
 	mp    MultipartObjectStore
 	write retry.Policy
 	cas   retry.Policy
-}
-
-type multipartRetryStore struct {
-	*retryStore
-	*multipartRetry
-}
-
-type rangeMultipartRetryStore struct {
-	*rangeRetryStore
-	*multipartRetry
 }
 
 // CreateMultipartUpload retries like an idempotent write. It is not idempotent — a retry that
@@ -110,7 +97,11 @@ func (s *multipartRetry) AbortMultipartUpload(ctx context.Context, key, uploadID
 	return err
 }
 
-func newRetryStore(inner ObjectStore, c reliability.RetryConfig) ObjectStore {
+// newRetryStore wraps inner and its optional capabilities, returning each separately: the store,
+// its ranged reads (nil when it has none) and its multipart uploads (nil when it has none).
+func newRetryStore(
+	inner ObjectStore, c reliability.RetryConfig,
+) (ObjectStore, RangeObjectStore, MultipartObjectStore) {
 	base := retry.Policy{
 		MaxAttempts:   c.MaxAttempts,
 		PerTryTimeout: c.PerTryTimeout,
@@ -133,27 +124,24 @@ func newRetryStore(inner ObjectStore, c reliability.RetryConfig) ObjectStore {
 
 	s := &retryStore{inner: inner, maxAttempts: max(c.MaxAttempts, 1), read: read, list: list, write: write, cas: cas}
 
-	rng, hasRange := inner.(RangeObjectStore)
-	mp, hasMultipart := inner.(MultipartObjectStore)
+	// Each optional capability is returned separately rather than folded into the store's type. A
+	// wrapper claiming one it does not have is the bug this guards (a ranged read that fetches whole
+	// objects, a streamed write that buffers), and the type-per-combination alternative grows as
+	// 2**capabilities while this stays flat.
+	var (
+		rng RangeObjectStore
+		mp  MultipartObjectStore
+	)
 
-	var mpr *multipartRetry
-	if hasMultipart {
-		mpr = &multipartRetry{mp: mp, write: write, cas: cas}
+	if inner, ok := inner.(RangeObjectStore); ok {
+		rng = &rangeRetry{rng: inner, read: read, maxAttempts: s.maxAttempts}
 	}
 
-	switch {
-	case hasRange && hasMultipart:
-		return &rangeMultipartRetryStore{
-			rangeRetryStore: &rangeRetryStore{retryStore: s, rng: rng},
-			multipartRetry:  mpr,
-		}
-	case hasRange:
-		return &rangeRetryStore{retryStore: s, rng: rng}
-	case hasMultipart:
-		return &multipartRetryStore{retryStore: s, multipartRetry: mpr}
-	default:
-		return s
+	if inner, ok := inner.(MultipartObjectStore); ok {
+		mp = &multipartRetry{mp: inner, write: write, cas: cas}
 	}
+
+	return s, rng, mp
 }
 
 func (s *retryStore) GetObject(ctx context.Context, key string) ([]byte, error) {

@@ -60,33 +60,7 @@ func Cached(inner Backend, maxBytes int64) Backend {
 		return c.inner.Read(ctx, key)
 	})
 
-	// [ObjectCreator] is forwarded by a distinct type rather than a method on cachedBackend, so the
-	// wrapper claims the capability only when the inner backend actually has it: a method would make
-	// [StreamsWrites] report a streaming write over an inner that buffers.
-	if _, ok := inner.(ObjectCreator); ok {
-		return &cachedStreamBackend{cachedBackend: c}
-	}
-
 	return c
-}
-
-// cachedStreamBackend is [cachedBackend] over an inner backend that implements [ObjectCreator].
-type cachedStreamBackend struct {
-	*cachedBackend
-}
-
-var _ ObjectCreator = (*cachedStreamBackend)(nil)
-
-// CreateObject forwards the incremental write and drops any stale entry under key once it commits.
-// The written bytes are never cached: an object worth streaming is one the caller does not want
-// resident, which is exactly what the cache would undo. Implements [ObjectCreator].
-func (c *cachedStreamBackend) CreateObject(ctx context.Context, key string) (ObjectWriter, error) {
-	w, err := CreateObject(ctx, c.inner, key)
-	if err != nil {
-		return nil, err
-	}
-
-	return &cacheInvalidatingWriter{ObjectWriter: w, cache: c.cachedBackend, key: key}, nil
 }
 
 // cacheInvalidatingWriter drops the cached value under key when the object it builds commits, so a
@@ -139,6 +113,24 @@ func (c *cachedBackend) IsEphemeral() bool { return c.inner.IsEphemeral() }
 
 // IsNodeLocal forwards the [NodeLocal] capability; without it a cached backend would look shared.
 func (c *cachedBackend) IsNodeLocal() bool { return IsNodeLocal(c.inner) }
+
+var _ ObjectCreator = (*cachedBackend)(nil)
+
+// CreateObject forwards the incremental write and drops any stale entry under key once it commits.
+// The written bytes are never cached: an object worth streaming is one the caller does not want
+// resident, which is exactly what the cache would undo. Implements [ObjectCreator].
+func (c *cachedBackend) CreateObject(ctx context.Context, key string) (ObjectWriter, error) {
+	w, err := CreateObject(ctx, c.inner, key)
+	if err != nil {
+		return nil, err
+	}
+
+	return &cacheInvalidatingWriter{ObjectWriter: w, cache: c, key: key}, nil
+}
+
+// StreamsWrites answers for the inner backend: caching neither adds streaming nor hides it.
+// Implements [ObjectCreator].
+func (c *cachedBackend) StreamsWrites() bool { return StreamsWrites(c.inner) }
 
 // FreeSpace forwards the [SpaceReporter] capability. Without this the wrapper would hide it and
 // every cached backend would silently fall back to the merge ceiling.
@@ -307,24 +299,17 @@ func (c *cachedBackend) Stats() CacheStats {
 	}
 }
 
-// cached is how [WriteUncached]/[ReadUncached] recognize a cached backend: a plain type assertion
-// would miss [cachedStreamBackend], which wraps the same cache in a second type.
-type cached interface{ cache() *cachedBackend }
-
-func (c *cachedBackend) cache() *cachedBackend { return c }
-
 // WriteUncached writes through b, keeping data out of the read cache while still dropping any
 // stale entry under key (a reader must never be served the superseded value). Use it for the few
 // objects that are rewritten far more often than they are read — the engines' identity sets, which
 // are written on every flush and read only on recovery: caching one is pure eviction pressure, and
 // a single large one can occupy most of the budget. Every other object goes through [Backend.Write].
 func WriteUncached(ctx context.Context, b Backend, key string, data []byte) error {
-	cb, ok := b.(cached)
+	c, ok := b.(*cachedBackend)
 	if !ok {
 		return b.Write(ctx, key, data)
 	}
 
-	c := cb.cache()
 	if err := c.inner.Write(ctx, key, data); err != nil {
 		return err
 	}
@@ -338,8 +323,8 @@ func WriteUncached(ctx context.Context, b Backend, key string, data []byte) erro
 // inner backend is the truth). It is the read half of [WriteUncached]: an object written uncached
 // would otherwise land in the cache the first time it is read.
 func ReadUncached(ctx context.Context, b Backend, key string) ([]byte, error) {
-	if c, ok := b.(cached); ok {
-		return c.cache().inner.Read(ctx, key)
+	if c, ok := b.(*cachedBackend); ok {
+		return c.inner.Read(ctx, key)
 	}
 
 	return b.Read(ctx, key)
