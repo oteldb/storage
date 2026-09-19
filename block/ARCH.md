@@ -245,6 +245,31 @@ is what lets it fetch only those bytes.
   dictionary carries its own, so ids only become comparable once `chunk.DictMerger` has remapped
   them into one. That is also why it cannot decode into a caller's buffer as the numeric paths do.
 
+### Scanning a column forward
+
+`PartReader.ColumnScan(ctx, name, window)` is the same decoder with **read-ahead**: a miss fetches
+whole frames up to `window` bytes instead of one frame. It exists because the two access shapes want
+opposite things, not because one is a tuned version of the other.
+
+A query touches a handful of frames out of thousands, scattered, so reading ahead fetches bytes it
+never decodes. A merge touches every frame exactly once in order — and a frame is 64 KiB
+*uncompressed*, so a 256 MiB column is ~4000 frames, 8 sources × 6 columns is ~200k serialized
+ranged reads, and `backend.Cache` deliberately does not cache ranged reads, so nothing amortizes
+them. At S3 latencies that is the difference between a merge finishing and not.
+
+- The window is **the read side's memory budget**, one buffer per open column: 8 parts × 6 columns
+  × 1 MiB is 48 MiB. Streaming bounds the merge's resident set; it does not make it constant, and
+  this is the term that stays.
+- A window covering the whole column collapses to a single request — `PartReader.Column` minus the
+  cache write, which is the right path for the memory backend and for small parts.
+- A **frame is indivisible**: one larger than the window is served alone rather than refused, so the
+  window is a target, not a cap on what a single fetch may hold.
+- `Decoder.DecodeBytesBlock` decodes one granule against the cached frame. The result **aliases that
+  frame buffer** and dies at the next decode crossing a frame — deliberately: a merge reads a
+  granule's ids and appends them, and copying every value back would be the per-row cost this path
+  exists to remove. A granule on the shared dictionary yields the *column's* entry table unchanged,
+  so ids stay comparable across granules and nothing is rehashed per granule.
+
 ## At-rest checksums
 
 Every byte a part stores is covered by a CRC32C, so a column that comes back from the store altered

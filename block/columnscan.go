@@ -1,0 +1,153 @@
+package block
+
+import (
+	"context"
+
+	"github.com/go-faster/errors"
+
+	"github.com/oteldb/storage/encoding/chunk"
+)
+
+// The sequential counterpart of the ranged read path. A query touches a handful of granules out of
+// thousands and wants each frame fetched alone; a merge touches every granule exactly once in order
+// and wants as many frames per request as it can hold. Same directory, same decode — the difference
+// is read-ahead ([frameSource.window]) and, for bytes, decoding one granule at a time against the
+// cached frame rather than merging a set of them.
+
+// ColumnScan returns a decoder over the named column tuned for a forward walk: instead of one ranged
+// read per compression frame it fetches whole frames up to window bytes at a time.
+//
+// It is [PartReader.ColumnBlocks]' sequential counterpart, and the distinction is not a tuning knob.
+// A query touches a handful of frames out of thousands, scattered, so reading ahead would fetch
+// bytes it never decodes. A merge touches every frame exactly once in order, and a frame is
+// [defaultCompressBlockBytes] *uncompressed* — so without coalescing a multi-source merge issues
+// hundreds of thousands of serialized ranged reads that nothing caches.
+//
+// window is the read side's memory budget for this column: the decoder holds one buffer that large.
+// A column whose frames all fit inside it is fetched in a single request, which is [PartReader.Column]
+// minus the cache write. A window at or below zero disables read-ahead.
+func (r *PartReader) ColumnScan(ctx context.Context, name string, window int64) (*Decoder, error) {
+	return r.openDecoder(ctx, name, max(window, 0))
+}
+
+// readAhead serves frame f from the buffered run, refilling it when the frame is not covered. A
+// forward walk therefore pays one request per window; a caller that seeks backwards or skips past
+// the window refills, which is why this is not the query path's reader.
+func (s *frameSource) readAhead(f int, off, n int64) ([]byte, error) {
+	if off < s.lo || off+n > s.hi {
+		if err := s.fill(f, off, n); err != nil {
+			return nil, err
+		}
+	}
+
+	return s.ahead[off-s.lo : off-s.lo+n], nil
+}
+
+// fill reads the longest run of whole frames starting at f that fits the window, always at least
+// frame f — a frame larger than the window is still served, in one request of its own.
+func (s *frameSource) fill(f int, off, n int64) error {
+	hi := off + n
+
+	for j := f + 1; j < len(s.frameOff)-1; j++ {
+		end := int64(s.frameOff[j+1])
+		if end-off > s.window {
+			break
+		}
+
+		hi = end
+	}
+
+	buf, err := s.read(off, hi-off)
+	if err != nil {
+		return err
+	}
+
+	s.ahead, s.lo, s.hi = buf, off, hi
+
+	return nil
+}
+
+// DecodeBytesBlock decodes one granule of a bytes column against the decoder's cached frame, which
+// is what a forward walk wants: [Decoder.DecodeBytes] takes a block set because it merges their
+// dictionaries, and merging is exactly what a caller consuming one granule at a time does not need.
+//
+// The result **aliases the decoder's frame buffer** and is valid only until the next decode that
+// crosses a frame boundary. That is the point — a merge reads a granule's ids and appends them, so
+// copying every value to hand it back would be the per-row cost this path exists to avoid. A caller
+// that retains the column past its next call must copy it.
+//
+// For a granule on the column's shared dictionary the result carries that dictionary and the
+// granule's ids unchanged, so its entries are the column's, not the granule's.
+func (d *Decoder) DecodeBytesBlock(blk int) (*chunk.DictColumn, error) {
+	if d.kind != KindBytes {
+		return nil, errors.Errorf("block: column is %s, not bytes", d.kind)
+	}
+
+	dir := d.streams.dir
+
+	if blk < 0 || blk >= dir.nBlocks() {
+		return nil, errors.Errorf("block: block %d out of range [0,%d)", blk, dir.nBlocks())
+	}
+
+	lo := blk * dir.blockRows
+	if lo >= d.rows {
+		return nil, errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", blk, lo, d.rows)
+	}
+
+	n := min(lo+dir.blockRows, d.rows) - lo
+
+	stream, err := d.streams.granule(blk)
+	if err != nil {
+		return nil, err
+	}
+
+	if d.shared != nil {
+		col, done, err := d.sharedBlock(stream, n)
+		if err != nil {
+			return nil, errors.Wrapf(err, "decode block %d", blk)
+		}
+
+		if done {
+			return col, nil
+		}
+
+		stream = stream[1:] // a self-encoded granule: its own chunk stream follows the mode byte
+	}
+
+	var dc chunk.DictColumn
+
+	if _, err := dc.DecodeBytes(stream); err != nil {
+		return nil, errors.Wrapf(err, "decode block %d", blk)
+	}
+
+	if dc.Len() != n {
+		return nil, errors.Wrapf(ErrCorrupt, "block %d decoded %d rows, want %d", blk, dc.Len(), n)
+	}
+
+	return &dc, nil
+}
+
+// sharedBlock decodes a granule that joined the column's shared dictionary, reporting whether it did.
+func (d *Decoder) sharedBlock(stream []byte, rows int) (*chunk.DictColumn, bool, error) {
+	mode, ids, err := splitSharedGranule(stream)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if mode != modeShared {
+		return nil, false, nil
+	}
+
+	width := sharedIDWidth(d.shared)
+
+	if len(ids) != rows*width {
+		return nil, false, errors.Wrapf(ErrCorrupt,
+			"shared dict: %d id bytes for %d rows at width %d", len(ids), rows, width)
+	}
+
+	if err := boundSharedIDs(ids, width, rows, d.shared); err != nil {
+		return nil, false, err
+	}
+
+	return &chunk.DictColumn{Entries: d.shared, IDs: ids, IDWidth: width}, true, nil
+}

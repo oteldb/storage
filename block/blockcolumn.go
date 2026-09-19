@@ -237,7 +237,7 @@ func (d blockDir) frame(f int) ([]byte, error) {
 
 	if d.src == nil {
 		raw = d.data[lo:hi]
-	} else if raw, err = d.src.frame(int64(lo), int64(hi-lo)); err != nil {
+	} else if raw, err = d.src.frame(f, int64(lo), int64(hi-lo)); err != nil {
 		return nil, err
 	}
 
