@@ -212,3 +212,87 @@ func TestS3DisabledByDefault(t *testing.T) {
 	require.Error(t, err, "no retry wrapper ⇒ the single transient failure surfaces")
 	assert.Equal(t, int32(1), fs.getN.Load())
 }
+
+// rangeFaultStore is a [faultStore] that also serves ranged reads, so a test can tell a real ranged
+// read from the whole-object fallback [s3.Backend.ReadAt] uses when the store cannot range.
+type rangeFaultStore struct {
+	*faultStore
+
+	rangeN     atomic.Int32
+	rangeFails int // first N ranged reads fail transiently
+}
+
+func newRangeFaultStore() *rangeFaultStore {
+	return &rangeFaultStore{faultStore: newFaultStore()}
+}
+
+func (f *rangeFaultStore) GetObjectRange(_ context.Context, key string, off, n int64) ([]byte, error) {
+	if int(f.rangeN.Add(1)) <= f.rangeFails {
+		return nil, errFault
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	v, ok := f.objs[key]
+	if !ok {
+		return nil, s3.ErrObjectNotFound
+	}
+
+	if off >= int64(len(v)) {
+		return []byte{}, nil
+	}
+
+	return v[off:min(off+n, int64(len(v)))], nil
+}
+
+// TestS3RetryForwardsRangedReads is the regression guard for a wrapper that silently drops an
+// optional capability. WithRetry replaces the store, so a wrapper without GetObjectRange makes
+// ReadAt fall back to reading the whole object — correct, but it defeats every ranged read on the
+// query and merge paths, with nothing to show for it.
+func TestS3RetryForwardsRangedReads(t *testing.T) {
+	t.Parallel()
+
+	fs := newRangeFaultStore()
+	fs.objs["oteldb/k"] = []byte("0123456789")
+
+	b := s3.New(fs, "oteldb/", s3.WithRetry(reliability.RetryConfig{MaxAttempts: 3, PerTryTimeout: time.Second}))
+
+	got, err := backend.ReadAt(context.Background(), b, "k", 3, 4)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("3456"), got)
+	assert.Equal(t, int32(1), fs.rangeN.Load(), "served by a real ranged read")
+	assert.Zero(t, fs.getN.Load(), "the whole object was never fetched")
+}
+
+// TestS3RetryRetriesRangedReads: a forwarded ranged read gets the same retry policy as a whole GET.
+func TestS3RetryRetriesRangedReads(t *testing.T) {
+	t.Parallel()
+
+	fs := newRangeFaultStore()
+	fs.objs["oteldb/k"] = []byte("0123456789")
+	fs.rangeFails = 2
+
+	b := s3.New(fs, "oteldb/", s3.WithRetry(reliability.RetryConfig{MaxAttempts: 3, PerTryTimeout: time.Second}))
+
+	got, err := backend.ReadAt(context.Background(), b, "k", 0, 2)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("01"), got)
+	assert.Equal(t, int32(3), fs.rangeN.Load())
+}
+
+// TestS3RetryDoesNotInventRangedReads: the mirror image — the wrapper must not advertise a
+// capability its inner store lacks, or ReadAt would route to a method that cannot serve it.
+func TestS3RetryDoesNotInventRangedReads(t *testing.T) {
+	t.Parallel()
+
+	fs := newFaultStore() // no GetObjectRange
+	fs.objs["oteldb/k"] = []byte("0123456789")
+
+	b := s3.New(fs, "oteldb/", s3.WithRetry(reliability.RetryConfig{MaxAttempts: 2, PerTryTimeout: time.Second}))
+
+	got, err := backend.ReadAt(context.Background(), b, "k", 3, 4)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("3456"), got)
+	assert.Positive(t, fs.getN.Load(), "fell back to the whole object, as it must")
+}

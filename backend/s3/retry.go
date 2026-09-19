@@ -36,7 +36,23 @@ type retryStore struct {
 	cas         retry.Policy // conditional put (conservative)
 }
 
-func newRetryStore(inner ObjectStore, c reliability.RetryConfig) *retryStore {
+// rangeRetryStore is [retryStore] plus ranged reads. It is a separate type so the capability is
+// claimed only when the wrapped store actually has it: a wrapper that advertises [RangeObjectStore]
+// over a store without it would satisfy the type assertion and then fall back to reading whole
+// objects, which is the cost a ranged read exists to avoid.
+type rangeRetryStore struct {
+	*retryStore
+
+	rng RangeObjectStore
+}
+
+func (s *rangeRetryStore) GetObjectRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	return retry.Hedge(ctx, s.read, retry.Repeat(func(ctx context.Context) ([]byte, error) {
+		return s.rng.GetObjectRange(ctx, key, off, n)
+	}, s.maxAttempts))
+}
+
+func newRetryStore(inner ObjectStore, c reliability.RetryConfig) ObjectStore {
 	base := retry.Policy{
 		MaxAttempts:   c.MaxAttempts,
 		PerTryTimeout: c.PerTryTimeout,
@@ -57,7 +73,13 @@ func newRetryStore(inner ObjectStore, c reliability.RetryConfig) *retryStore {
 	cas := base
 	cas.Retryable = retry.ConnFailure
 
-	return &retryStore{inner: inner, maxAttempts: max(c.MaxAttempts, 1), read: read, list: list, write: write, cas: cas}
+	s := &retryStore{inner: inner, maxAttempts: max(c.MaxAttempts, 1), read: read, list: list, write: write, cas: cas}
+
+	if rng, ok := inner.(RangeObjectStore); ok {
+		return &rangeRetryStore{retryStore: s, rng: rng}
+	}
+
+	return s
 }
 
 func (s *retryStore) GetObject(ctx context.Context, key string) ([]byte, error) {
