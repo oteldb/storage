@@ -234,6 +234,16 @@ is what lets it fetch only those bytes.
   the object size would come up short and the directory would parse as corrupt.
 - The **compression frame is the floor**: it is the smallest unit a ranged read can fetch, so a
   single-series fetch pays one frame per column however few rows it wants.
+- A **shared-dictionary bytes column's container does not start at the object's head**: the
+  dictionary sits ahead of it, so both directory layouts are located relative to where the container
+  begins rather than to the object. The dictionary is read at open, exactly — its two header uvarints
+  give its extent — because every granule that joined it resolves ids against it, and a granule that
+  declined carries its own values inline. Reading the directory out of the raw object instead parses
+  dictionary bytes as a directory and fails as corruption on healthy data, which on a load path is
+  fatal rather than degrading.
+- `Decoder.DecodeBytes` takes a **block set**, not a block: a granule that declined the shared
+  dictionary carries its own, so ids only become comparable once `chunk.DictMerger` has remapped
+  them into one. That is also why it cannot decode into a caller's buffer as the numeric paths do.
 
 ## At-rest checksums
 
