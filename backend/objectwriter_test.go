@@ -71,16 +71,37 @@ func TestCachedConformance(t *testing.T) {
 // fell into, in reverse: a wrapper that forwards [backend.ObjectCreator] unconditionally would
 // report a streaming write over an inner backend that buffers, and the merge engine sizes parts on
 // that answer.
+//
+// [backend.ObjectCreator] is the capability this rule binds, because its *presence* is the answer
+// to a sizing question. The others — [backend.ReaderAt], [backend.Viewer], [backend.SpaceReporter],
+// [backend.DeferredSyncer] — are asked through package helpers that degrade inside, so a wrapper
+// implementing them unconditionally promises nothing it cannot keep.
+//
+// Every wrapper in the tree belongs in the table below, and each must answer for the backend
+// beneath it in both directions. The exception, deliberately, is backendtest.Deferred: a test
+// helper whose whole purpose is to force a buffering backend down the streaming path.
 func TestStreamsWritesIsNotClaimedByWrappers(t *testing.T) {
 	t.Parallel()
 
 	assert.False(t, backend.StreamsWrites(backend.Memory()))
 	assert.True(t, backend.StreamsWrites(newStreamingMemory()))
 
-	assert.False(t, backend.StreamsWrites(backend.Cached(backend.Memory(), 1<<20)),
-		"caching a whole-object backend does not make it stream")
-	assert.True(t, backend.StreamsWrites(backend.Cached(newStreamingMemory(), 1<<20)),
-		"caching a streaming backend must not hide the capability")
+	wrappers := map[string]func(backend.Backend) backend.Backend{
+		"Cached":         func(b backend.Backend) backend.Backend { return backend.Cached(b, 1<<20) },
+		"Cached(0)":      func(b backend.Backend) backend.Backend { return backend.Cached(b, 0) },
+		"Cached(Cached)": func(b backend.Backend) backend.Backend { return backend.Cached(backend.Cached(b, 1<<20), 1<<20) },
+	}
+
+	for name, wrap := range wrappers {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.False(t, backend.StreamsWrites(wrap(backend.Memory())),
+				"wrapping a whole-object backend does not make it stream")
+			assert.True(t, backend.StreamsWrites(wrap(newStreamingMemory())),
+				"wrapping a streaming backend must not hide the capability")
+		})
+	}
 }
 
 // TestCachedStreamedWriteInvalidates covers the coherence rule: a streamed object replaces the key,

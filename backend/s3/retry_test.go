@@ -2,6 +2,8 @@ package s3_test
 
 import (
 	"context"
+	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -295,4 +297,235 @@ func TestS3RetryDoesNotInventRangedReads(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("3456"), got)
 	assert.Positive(t, fs.getN.Load(), "fell back to the whole object, as it must")
+}
+
+// multipartParts is the [s3.MultipartObjectStore] half of a fault store, kept free of the store it
+// is composed with so the range and multipart capabilities can be mixed without their embedded
+// method sets colliding. Parts are held by number and concatenated on complete, like the real thing.
+type multipartParts struct {
+	mu      sync.Mutex
+	uploads map[string]map[int32][]byte
+	nextID  int
+	objs    map[string][]byte // where a completed upload lands; the store's own map
+
+	startN      atomic.Int32
+	partN       atomic.Int32
+	completeN   atomic.Int32
+	abortN      atomic.Int32
+	completeErr error
+}
+
+func newMultipartParts(objs map[string][]byte) *multipartParts {
+	return &multipartParts{uploads: map[string]map[int32][]byte{}, objs: objs}
+}
+
+func (m *multipartParts) CreateMultipartUpload(_ context.Context, key string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.startN.Add(1)
+	m.nextID++
+	id := key + "#" + strconv.Itoa(m.nextID)
+	m.uploads[id] = map[int32][]byte{}
+
+	return id, nil
+}
+
+func (m *multipartParts) UploadPart(
+	_ context.Context, _, uploadID string, partNum int32, data []byte,
+) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.partN.Add(1)
+
+	parts, ok := m.uploads[uploadID]
+	if !ok {
+		return "", errors.New("no such upload")
+	}
+
+	parts[partNum] = slices.Clone(data)
+
+	return strconv.Itoa(int(partNum)), nil
+}
+
+func (m *multipartParts) CompleteMultipartUpload(_ context.Context, key, uploadID string, etags []string) error {
+	m.completeN.Add(1)
+
+	if m.completeErr != nil {
+		return m.completeErr
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	parts, ok := m.uploads[uploadID]
+	if !ok {
+		return errors.New("no such upload")
+	}
+
+	var obj []byte
+	for i := range etags {
+		obj = append(obj, parts[int32(i+1)]...)
+	}
+
+	delete(m.uploads, uploadID)
+	m.objs[key] = obj
+
+	return nil
+}
+
+func (m *multipartParts) AbortMultipartUpload(_ context.Context, _, uploadID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.abortN.Add(1)
+	delete(m.uploads, uploadID)
+
+	return nil
+}
+
+func (m *multipartParts) pending() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return len(m.uploads)
+}
+
+type multipartFaultStore struct {
+	*faultStore
+	*multipartParts
+}
+
+func newMultipartFaultStore() *multipartFaultStore {
+	fs := newFaultStore()
+
+	return &multipartFaultStore{faultStore: fs, multipartParts: newMultipartParts(fs.objs)}
+}
+
+type rangeMultipartFaultStore struct {
+	*rangeFaultStore
+	*multipartParts
+}
+
+func newRangeMultipartFaultStore() *rangeMultipartFaultStore {
+	fs := newRangeFaultStore()
+
+	return &rangeMultipartFaultStore{rangeFaultStore: fs, multipartParts: newMultipartParts(fs.objs)}
+}
+
+// TestS3RetryForwardsCapabilityCombinations pins the wrapper's whole capability matrix at once. The
+// retry wrapper replaces the store, so each optional capability it fails to forward is silently
+// lost — ranged reads become whole-object reads, and streamed writes go back into RAM. The ranged
+// half is asserted by behavior, not by type: the Backend always has a ReadAt, and what the missing
+// capability costs is that the method fetches the whole object to serve it.
+func TestS3RetryForwardsCapabilityCombinations(t *testing.T) {
+	t.Parallel()
+
+	cfg := reliability.RetryConfig{MaxAttempts: 3, PerTryTimeout: time.Second}
+
+	// Each case builds its store and hands back the ranged-read counter, nil when it has none.
+	tests := []struct {
+		name          string
+		build         func() (s3.ObjectStore, func() int32)
+		wantRange     bool
+		wantMultipart bool
+	}{
+		{
+			name:  "neither",
+			build: func() (s3.ObjectStore, func() int32) { return newFaultStore(), nil },
+		},
+		{
+			name: "range only",
+			build: func() (s3.ObjectStore, func() int32) {
+				fs := newRangeFaultStore()
+
+				return fs, fs.rangeN.Load
+			},
+			wantRange: true,
+		},
+		{
+			name:          "multipart only",
+			build:         func() (s3.ObjectStore, func() int32) { return newMultipartFaultStore(), nil },
+			wantMultipart: true,
+		},
+		{
+			name: "both",
+			build: func() (s3.ObjectStore, func() int32) {
+				fs := newRangeMultipartFaultStore()
+
+				return fs, fs.rangeN.Load
+			},
+			wantRange:     true,
+			wantMultipart: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			store, ranged := tt.build()
+			b := s3.New(store, "oteldb/", s3.WithRetry(cfg))
+
+			assert.Equal(t, tt.wantMultipart, backend.StreamsWrites(b))
+
+			require.NoError(t, b.Write(ctx, "k", []byte("0123456789")))
+
+			got, err := backend.ReadAt(ctx, b, "k", 3, 4)
+			require.NoError(t, err)
+			assert.Equal(t, []byte("3456"), got)
+
+			if !tt.wantRange {
+				return
+			}
+
+			assert.Positive(t, ranged(), "a forwarded range capability serves the read")
+		})
+	}
+}
+
+// TestS3RetryStreamsThroughWrapper is the forwarding proven by behavior rather than by assertion:
+// the bytes must actually reach the store as parts.
+func TestS3RetryStreamsThroughWrapper(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fs := newRangeMultipartFaultStore()
+	b := s3.New(fs, "oteldb/", s3.WithRetry(reliability.RetryConfig{MaxAttempts: 3, PerTryTimeout: time.Second}))
+	want := payload(streamedBytes)
+
+	w, err := backend.CreateObject(ctx, b, "part/col")
+	require.NoError(t, err)
+	defer w.Abort()
+
+	writeStreamed(t, w, want)
+	require.NoError(t, w.Commit(ctx))
+
+	got, err := b.Read(ctx, "part/col")
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+	assert.Equal(t, int32(1), fs.startN.Load())
+	assert.Equal(t, int32(3), fs.partN.Load())
+}
+
+// TestS3RetryDoesNotRepeatComplete is the conservative half of the retry policy. A multipart
+// complete is the object's commit point and S3 can answer it 200 with an error body, so an
+// uncertain result does not say whether the object became visible. Re-sending it is a decision
+// this layer cannot make, exactly as for the conditional put.
+func TestS3RetryDoesNotRepeatComplete(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fs := newMultipartFaultStore()
+	fs.completeErr = errFault
+	b := s3.New(fs, "oteldb/", s3.WithRetry(reliability.RetryConfig{MaxAttempts: 3, PerTryTimeout: time.Second}))
+
+	w, err := backend.CreateObject(ctx, b, "part/col")
+	require.NoError(t, err)
+
+	writeStreamed(t, w, payload(streamedBytes))
+	require.Error(t, w.Commit(ctx))
+	assert.Equal(t, int32(1), fs.completeN.Load(), "a transient failure of the commit point is not re-sent")
+
+	w.Abort()
+	assert.Zero(t, fs.pending(), "the failed writer still cleans up after itself")
 }

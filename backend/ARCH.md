@@ -263,15 +263,34 @@ a demonstration.
   incrementally: `Write` appends, `Commit` publishes atomically (nothing is visible under the key
   before it), `Abort` discards and is a no-op after a commit. `file` implements it with the same
   temp+fsync+rename+dirsync it writes whole objects with, so the bytes reach the filesystem as they
-  are produced; `Memory` and `s3` do not, and `backend.CreateObject` buffers into a single `Write` for
-  them, so callers stream unconditionally. Several writers may target one key — that is how a
+  are produced; `s3` implements it with a **multipart upload** (below); `Memory` does not, and
+  `backend.CreateObject` buffers into a single `Write` for it, so callers stream unconditionally.
+  Several writers may target one key — that is how a
   part's rival codecs race, only the winner committing. It exists for the one object class far
   larger than the writer wants resident: a merged part's column (`block/ARCH.md`, "Two writers").
   `backend.StreamsWrites(b)` answers whether the fallback would be taken, which is a *sizing*
   question — the merge cap stops pricing part size against memory when it would not be
   (`engine/ARCH.md`). **A wrapper must forward it**, and must not claim it over an inner backend
-  that lacks it: `Cached` returns a second type that carries `CreateObject` only in that case,
-  rather than a method that would always answer yes.
+  that lacks it: `Cached` and the EC wrapper each return a second type carrying `CreateObject` only
+  in that case, rather than a method that would always answer yes. Presence is what makes this
+  capability different from `ReaderAt`/`Sizer`/`DeferredSyncer`, whose helpers degrade inside and
+  which wrappers may therefore implement unconditionally.
+- **`s3.MultipartObjectStore`** — optional on the `ObjectStore` seam beside `RangeObjectStore`
+  (`CreateMultipartUpload`/`UploadPart`/`CompleteMultipartUpload`/`AbortMultipartUpload`), and what
+  makes `ObjectCreator` available over S3. The writer accumulates **8 MiB** before starting an
+  upload at all — above S3's 5 MiB minimum part size, and far enough above it that a large column
+  stays well inside the 10,000-part limit — so every small object (marks, manifest, watermark,
+  small columns) commits as one `PutObject` and creates no upload. The conditional put is **never**
+  multipart: it is the bucket-index and manifest commit point, and a multipart complete carries no
+  precondition. `retryStore` forwards the capability by variant type in all four range × multipart
+  combinations; `UploadPart` retries freely (a part number names its slot, so a re-send replaces
+  itself) while `CompleteMultipartUpload` retries only where the request provably never reached the
+  server, the conditional put's rule — S3 can answer a complete 200 with an error body, so an
+  uncertain result does not say whether the object became visible. `Abort` detaches its context's
+  cancellation, because the merge that aborts is usually the merge whose context just died.
+  **An incomplete upload is not an object**: it appears in no listing, so no orphan sweep can
+  reclaim it, and the bucket's `AbortIncompleteMultipartUpload` lifecycle rule is the only thing
+  that ever does (`ADMIN.md`).
 - **`backend.DeferredSyncer`** — optional `WriteDeferred`/`CreateObjectDeferred`/`DeleteDeferred`
   plus `SyncPrefix(prefix)`: a part's objects are made durable once, not one by one. **A part is
   unreachable until the bucket-index CAS names it**, so its objects need to be on the disk before

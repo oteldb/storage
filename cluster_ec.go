@@ -27,7 +27,33 @@ func (s *Storage) backendFor(shardKey signal.TenantID) backend.Backend {
 		return s.backend
 	}
 
-	return &ecBackend{inner: s.backend, s: s, shardKey: shardKey, scheme: scheme}
+	return wrapEC(&ecBackend{inner: s.backend, s: s, shardKey: shardKey, scheme: scheme})
+}
+
+// wrapEC gives e the variant type matching the capabilities of the backend beneath it. Like
+// [backend.Cached], the streaming capability is claimed by a distinct type rather than a method, so
+// the wrapper cannot advertise one its inner backend lacks: a merge told its part leaves RAM by a
+// backend that buffers would size the part against memory it does not have.
+func wrapEC(e *ecBackend) backend.Backend {
+	if backend.StreamsWrites(e.inner) {
+		return &ecStreamBackend{ecBackend: e}
+	}
+
+	return e
+}
+
+// ecStreamBackend is [ecBackend] over a backend that builds objects incrementally.
+type ecStreamBackend struct {
+	*ecBackend
+}
+
+var _ backend.ObjectCreator = (*ecStreamBackend)(nil)
+
+// CreateObject forwards the incremental write. An EC tenant's objects are written as plain full
+// copies — only reads of already-converted parts differ — so there is nothing to intercept here.
+// Implements [backend.ObjectCreator].
+func (e *ecStreamBackend) CreateObject(ctx context.Context, key string) (backend.ObjectWriter, error) {
+	return backend.CreateObject(ctx, e.inner, key)
 }
 
 // ecSchemeFor resolves the erasure-coding scheme for shardKey, reporting ok=false when EC does

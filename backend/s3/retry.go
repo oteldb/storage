@@ -52,6 +52,64 @@ func (s *rangeRetryStore) GetObjectRange(ctx context.Context, key string, off, n
 	}, s.maxAttempts))
 }
 
+// multipartRetry wraps a [MultipartObjectStore]'s calls in the retry policy each one can bear. It
+// is a type of its own rather than methods on [retryStore] so that the range and multipart
+// capabilities compose without the wrappers' method sets colliding.
+type multipartRetry struct {
+	mp    MultipartObjectStore
+	write retry.Policy
+	cas   retry.Policy
+}
+
+type multipartRetryStore struct {
+	*retryStore
+	*multipartRetry
+}
+
+type rangeMultipartRetryStore struct {
+	*rangeRetryStore
+	*multipartRetry
+}
+
+// CreateMultipartUpload retries like an idempotent write. It is not idempotent — a retry that
+// lands twice starts a second upload — but the extra upload is never completed, so it becomes no
+// object; the bucket's AbortIncompleteMultipartUpload rule reaps it.
+func (s *multipartRetry) CreateMultipartUpload(ctx context.Context, key string) (string, error) {
+	return retry.Do(ctx, s.write, func(ctx context.Context) (string, error) {
+		return s.mp.CreateMultipartUpload(ctx, key)
+	})
+}
+
+// UploadPart retries freely: a part number identifies its slot, so a re-sent part replaces itself.
+func (s *multipartRetry) UploadPart(
+	ctx context.Context, key, uploadID string, partNum int32, data []byte,
+) (string, error) {
+	return retry.Do(ctx, s.write, func(ctx context.Context) (string, error) {
+		return s.mp.UploadPart(ctx, key, uploadID, partNum, data)
+	})
+}
+
+// CompleteMultipartUpload retries only where the request provably never reached the server, the
+// same rule the conditional put follows. S3 can answer a complete with 200 and an error body, so
+// an uncertain result does not say whether the object became visible, and re-sending is not a
+// question this layer can answer — it is the commit point of the object.
+func (s *multipartRetry) CompleteMultipartUpload(ctx context.Context, key, uploadID string, etags []string) error {
+	_, err := retry.Do(ctx, s.cas, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, s.mp.CompleteMultipartUpload(ctx, key, uploadID, etags)
+	})
+
+	return err
+}
+
+// AbortMultipartUpload retries like an idempotent delete.
+func (s *multipartRetry) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
+	_, err := retry.Do(ctx, s.write, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, s.mp.AbortMultipartUpload(ctx, key, uploadID)
+	})
+
+	return err
+}
+
 func newRetryStore(inner ObjectStore, c reliability.RetryConfig) ObjectStore {
 	base := retry.Policy{
 		MaxAttempts:   c.MaxAttempts,
@@ -75,11 +133,27 @@ func newRetryStore(inner ObjectStore, c reliability.RetryConfig) ObjectStore {
 
 	s := &retryStore{inner: inner, maxAttempts: max(c.MaxAttempts, 1), read: read, list: list, write: write, cas: cas}
 
-	if rng, ok := inner.(RangeObjectStore); ok {
-		return &rangeRetryStore{retryStore: s, rng: rng}
+	rng, hasRange := inner.(RangeObjectStore)
+	mp, hasMultipart := inner.(MultipartObjectStore)
+
+	var mpr *multipartRetry
+	if hasMultipart {
+		mpr = &multipartRetry{mp: mp, write: write, cas: cas}
 	}
 
-	return s
+	switch {
+	case hasRange && hasMultipart:
+		return &rangeMultipartRetryStore{
+			rangeRetryStore: &rangeRetryStore{retryStore: s, rng: rng},
+			multipartRetry:  mpr,
+		}
+	case hasRange:
+		return &rangeRetryStore{retryStore: s, rng: rng}
+	case hasMultipart:
+		return &multipartRetryStore{retryStore: s, multipartRetry: mpr}
+	default:
+		return s
+	}
 }
 
 func (s *retryStore) GetObject(ctx context.Context, key string) ([]byte, error) {

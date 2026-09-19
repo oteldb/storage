@@ -11,6 +11,7 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	fsserver "github.com/go-faster/fs/server"
 	"github.com/go-faster/fs/storagemem"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
@@ -55,4 +56,61 @@ func TestS3IntegrationEmbedded(t *testing.T) {
 
 		return s3.New(store, strings.ReplaceAll(t.Name(), "/", "_")+"/")
 	})
+}
+
+// TestS3IntegrationStreamedObject drives the streamed write over real HTTP and XML: create, several
+// UploadParts, complete. The in-memory fake reproduces the adapter's calls but not the wire shape
+// of the part list, which is where a multipart upload is most easily got wrong.
+func TestS3IntegrationStreamedObject(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "oteldb-stream"
+
+	ctx := context.Background()
+	b := s3.New(s3.NewAWS(embeddedS3(t, bucket), bucket), "oteldb/")
+	require.True(t, backend.StreamsWrites(b), "the AWS adapter uploads in parts")
+
+	want := payload(streamedBytes)
+
+	w, err := backend.CreateObject(ctx, b, "part/col")
+	require.NoError(t, err)
+	defer w.Abort()
+
+	writeStreamed(t, w, want)
+	require.NoError(t, w.Commit(ctx))
+
+	got, err := b.Read(ctx, "part/col")
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+
+	// A ranged read of the assembled object is what the merge's read side will do to it, and a
+	// multipart object's ETag is not its digest — so this also pins that nothing downstream reads
+	// the ETag as one.
+	head, err := backend.ReadAt(ctx, b, "part/col", 1<<20, 4096)
+	require.NoError(t, err)
+	assert.Equal(t, want[1<<20:(1<<20)+4096], head)
+}
+
+// TestS3IntegrationStreamedAbort pins the other half over the wire: an aborted upload leaves no
+// object and no upload the bucket would keep billing.
+func TestS3IntegrationStreamedAbort(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "oteldb-stream-abort"
+
+	ctx := context.Background()
+	b := s3.New(s3.NewAWS(embeddedS3(t, bucket), bucket), "oteldb/")
+
+	w, err := backend.CreateObject(ctx, b, "part/col")
+	require.NoError(t, err)
+
+	writeStreamed(t, w, payload(streamedBytes))
+	w.Abort()
+
+	_, err = b.Read(ctx, "part/col")
+	require.ErrorIs(t, err, backend.ErrNotExist)
+
+	keys, err := b.List(ctx, "")
+	require.NoError(t, err)
+	assert.Empty(t, keys, "an aborted stream leaves no debris behind")
 }

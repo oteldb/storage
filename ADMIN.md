@@ -410,3 +410,28 @@ optional `Sizer` capability (`Size(ctx, key) (int64, error)`) does. Use `backend
 it takes the `Sizer` fast path when available and falls back to a full `Read` otherwise. Memory and
 file backends implement `Size` cheaply (in-RAM length / `os.Stat`); the cache and instrumentation
 wrappers delegate; s3 uses the `Read` fallback.
+
+## Streamed writes over S3 (`backend.ObjectCreator`)
+
+A part's large columns can be handed to the backend as they are produced instead of held whole, so
+a writer's resident set is a frame rather than an object. `file` does this with a temp file;
+`s3` does it with a multipart upload, available when the `ObjectStore` implements
+`s3.MultipartObjectStore` (the `NewAWS` adapter does). `backend.StreamsWrites(b)` answers whether a
+given backend actually streams — every wrapper forwards the capability only when the backend
+beneath it has it, because a merge sizes its output part against that answer.
+
+Objects below `8 MiB` never start an upload: they accumulate and commit as one `PutObject`, so
+marks, manifests, watermarks and small columns cost the same requests they did before.
+
+**The bucket needs an `AbortIncompleteMultipartUpload` lifecycle rule (1 day is enough). This is a
+precondition, not a recommendation.** A crashed writer leaves an incomplete upload, and an
+incomplete upload is *not an object*: it appears in no `ListObjects`, so the orphan sweep that
+reclaims a crashed writer's committed objects cannot see it. The lifecycle rule is the only
+mechanism that ever reclaims one, and until it runs the uploaded parts are billed storage. The
+writer aborts its own upload on a clean failure path — on a context detached from the cancelled
+one, precisely so a cancelled merge still cleans up — but a killed process cannot.
+
+The conditional put is never a multipart upload. `PutIfAbsent` and `CompareAndSwap` are the
+bucket-index and manifest commit points and stay single conditional requests, whatever their size;
+a multipart complete carries no precondition, so routing one through it would turn a CAS into an
+unconditional overwrite.

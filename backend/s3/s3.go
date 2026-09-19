@@ -80,10 +80,15 @@ type Backend struct {
 
 var _ backend.Backend = (*Backend)(nil)
 
-// New returns a [Backend] over store, rooting all keys under keyPrefix (which may be empty). Pass
-// [WithRetry] to make it resilient to a lossy/slow endpoint (per-attempt timeouts, bounded retries,
-// hedged GETs).
-func New(store ObjectStore, keyPrefix string, opts ...Option) *Backend {
+// New returns a [backend.Backend] over store, rooting all keys under keyPrefix (which may be
+// empty). Pass [WithRetry] to make it resilient to a lossy/slow endpoint (per-attempt timeouts,
+// bounded retries, hedged GETs).
+//
+// The result is an interface, not a *[Backend], because the optional capabilities it claims depend
+// on the store's: a store implementing [MultipartObjectStore] yields a backend that also implements
+// [backend.ObjectCreator], and one without it must not, or a caller sizing its output against
+// memory would be told the bytes stream when they are buffered.
+func New(store ObjectStore, keyPrefix string, opts ...Option) backend.Backend {
 	var cfg config
 	for _, opt := range opts {
 		opt(&cfg)
@@ -93,7 +98,13 @@ func New(store ObjectStore, keyPrefix string, opts ...Option) *Backend {
 		store = newRetryStore(store, cfg.retry)
 	}
 
-	return &Backend{store: store, prefix: keyPrefix}
+	b := &Backend{store: store, prefix: keyPrefix}
+
+	if mp, ok := store.(MultipartObjectStore); ok {
+		return &multipartBackend{Backend: b, mp: mp}
+	}
+
+	return b
 }
 
 // IsEphemeral reports false: objects persist in the store.

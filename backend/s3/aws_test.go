@@ -28,11 +28,17 @@ import (
 // If-None-Match conditional put, and paginates ListObjectsV2 (small page size) so the
 // adapter's pagination and error-translation are exercised. apiErr small helper below.
 type fakeAWS struct {
-	mu   sync.Mutex
-	objs map[string][]byte
+	mu      sync.Mutex
+	objs    map[string][]byte
+	uploads map[string]map[int32][]byte
+	nextID  int
+	starts  int
+	parts   int
 }
 
-func newFakeAWS() *fakeAWS { return &fakeAWS{objs: make(map[string][]byte)} }
+func newFakeAWS() *fakeAWS {
+	return &fakeAWS{objs: make(map[string][]byte), uploads: make(map[string]map[int32][]byte)}
+}
 
 func apiErr(code string) error { return &smithy.GenericAPIError{Code: code, Message: code} }
 
@@ -162,6 +168,123 @@ func (f *fakeAWS) ListObjectsV2(_ context.Context, in *awss3.ListObjectsV2Input,
 	}
 
 	return out, nil
+}
+
+// uploadKey names an in-progress upload by key and id, so two uploads racing the same key stay
+// distinct the way real S3 keeps them.
+func uploadKey(key, uploadID string) string { return key + "\x00" + uploadID }
+
+func (f *fakeAWS) CreateMultipartUpload(
+	_ context.Context, in *awss3.CreateMultipartUploadInput, _ ...func(*awss3.Options),
+) (*awss3.CreateMultipartUploadOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.nextID++
+	f.starts++
+	id := strconv.Itoa(f.nextID)
+	f.uploads[uploadKey(*in.Key, id)] = make(map[int32][]byte)
+
+	return &awss3.CreateMultipartUploadOutput{UploadId: aws.String(id)}, nil
+}
+
+func (f *fakeAWS) UploadPart(
+	_ context.Context, in *awss3.UploadPartInput, _ ...func(*awss3.Options),
+) (*awss3.UploadPartOutput, error) {
+	data, err := io.ReadAll(in.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	parts, ok := f.uploads[uploadKey(*in.Key, *in.UploadId)]
+	if !ok {
+		return nil, apiErr("NoSuchUpload")
+	}
+
+	stored := clone(data)
+	parts[*in.PartNumber] = stored
+	f.parts++
+
+	return &awss3.UploadPartOutput{ETag: aws.String(`"` + etagOf(stored) + `"`)}, nil
+}
+
+func (f *fakeAWS) CompleteMultipartUpload(
+	_ context.Context, in *awss3.CompleteMultipartUploadInput, _ ...func(*awss3.Options),
+) (*awss3.CompleteMultipartUploadOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	uk := uploadKey(*in.Key, *in.UploadId)
+
+	parts, ok := f.uploads[uk]
+	if !ok {
+		return nil, apiErr("NoSuchUpload")
+	}
+
+	var obj []byte
+	for _, p := range in.MultipartUpload.Parts {
+		data, ok := parts[*p.PartNumber]
+		if !ok {
+			return nil, apiErr("InvalidPart")
+		}
+
+		// The ETag is the part's identity: a complete naming one the part does not carry is how a
+		// mismatched or re-uploaded part is caught, so the fake must check it too.
+		if strings.Trim(*p.ETag, `"`) != etagOf(data) {
+			return nil, apiErr("InvalidPart")
+		}
+
+		obj = append(obj, data...)
+	}
+
+	delete(f.uploads, uk)
+	f.objs[*in.Key] = obj
+
+	return &awss3.CompleteMultipartUploadOutput{ETag: aws.String(`"` + etagOf(obj) + `"`)}, nil
+}
+
+func (f *fakeAWS) AbortMultipartUpload(
+	_ context.Context, in *awss3.AbortMultipartUploadInput, _ ...func(*awss3.Options),
+) (*awss3.AbortMultipartUploadOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	uk := uploadKey(*in.Key, *in.UploadId)
+	if _, ok := f.uploads[uk]; !ok {
+		return nil, apiErr("NoSuchUpload")
+	}
+
+	delete(f.uploads, uk)
+
+	return &awss3.AbortMultipartUploadOutput{}, nil
+}
+
+// pendingUploads reports how many uploads were started and neither completed nor aborted. A
+// streamed write that leaves one behind is billed storage no listing can find.
+func (f *fakeAWS) pendingUploads() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return len(f.uploads)
+}
+
+// startedUploads and uploadedParts count what the writer actually did, which is what separates a
+// streamed object from one the writer held whole and put in a single request.
+func (f *fakeAWS) startedUploads() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.starts
+}
+
+func (f *fakeAWS) uploadedParts() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.parts
 }
 
 func TestAWSAdapterConformance(t *testing.T) {
