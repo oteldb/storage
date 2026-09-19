@@ -114,3 +114,24 @@ func TestS3IntegrationStreamedAbort(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, keys, "an aborted stream leaves no debris behind")
 }
+
+// TestS3IntegrationAbortIsIdempotent pins the adapter's one error translation against a real
+// server's codes rather than against a fake that returns them by construction: an upload the store
+// no longer knows leaves nothing to abort, so the cleanup path must read that as success.
+func TestS3IntegrationAbortIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "oteldb-abort"
+
+	ctx := context.Background()
+
+	store, ok := s3.NewAWS(embeddedS3(t, bucket), bucket).(s3.MultipartObjectStore)
+	require.True(t, ok)
+
+	require.NoError(t, store.AbortMultipartUpload(ctx, "k", "never-existed"))
+
+	id, err := store.CreateMultipartUpload(ctx, "k")
+	require.NoError(t, err)
+	require.NoError(t, store.AbortMultipartUpload(ctx, "k", id))
+	require.NoError(t, store.AbortMultipartUpload(ctx, "k", id))
+}
