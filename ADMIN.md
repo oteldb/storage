@@ -80,6 +80,7 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 | `Parts` | flushed immutable part count |
 | `MinTimeUnixNano` / `MaxTimeUnixNano` | data time span (min over parts; max includes the head) |
 | `MergeRunning` | a compaction is executing on this engine right now |
+| `MergeDeferred` | the last merge had parts to compact and no merge-memory budget to do it with, so it compacted nothing; see "Merge memory admission" |
 | `SealedParts` | parts already at the merge cap. A merge never reconsiders them, so this is the share of `Parts` no compaction will reduce |
 | `MergeBacklog` | parts a merge may still take (`Parts − SealedParts`) — the backlog in the literal sense, not the part count |
 | `MergeCandidates` | parts the **next** merge would select. `0` with a non-zero `MergeBacklog` is the stuck state a maintenance cycle cannot fix by itself; `Admin.CompactNow` is the override |
@@ -217,7 +218,7 @@ Metric instruments (all prefixed `storage.`):
 | `ingest.sampled_dropped` / `ingest.overflowed` | `signal` | budgeted sampling / overflow routing |
 | `flush.total` / `flush.duration` / `flush.rows` / `flush.bytes` | `signal` | head flushes; `flush.bytes` is the part bytes written, the denominator of write amplification |
 | `merge.total` / `merge.duration` / `merge.parts_in` / `merge.bytes_in` / `merge.bytes_out` | `signal` | background merges; `bytes_out` against `flush.bytes` is how many times the engine rewrites what it ingests, `bytes_out`/`bytes_in` what one cycle gains |
-| `merge.deferred` | `signal` | merges that selected parts and could not claim the process merge memory budget, so compacted nothing and left the work for the next cycle. Any sustained rate says compaction is bounded by `MergeMemoryBytes` — raise it (or `MaintenanceConcurrency`, which caps how many merges the budget is divided into) if part counts climb with it |
+| `merge.deferred` | `signal` | merges that selected parts and could not claim the process merge memory budget, so compacted nothing and left the work for the next cycle. Any sustained rate says compaction is bounded by `MergeMemoryBytes` — raise `MergeMemoryBytes` if part counts climb with it. Raising `MaintenanceConcurrency` does not help: a deferral only happens when the budget already admits fewer merges than the fan-out |
 | `fetch.total` / `fetch.duration` / `fetch.series_matched` / `fetch.rows_returned` / `fetch.parts_scanned` | `signal` | reads; the metric engine's reads are streaming, so these are recorded when the iterator is **closed** — `duration` covers the whole iteration (the consumer's own per-batch work included) and `rows_returned` counts what was actually consumed |
 | `fetch.decode_budget_forced_admissions` | `signal` | queries admitted **over** the decode-memory ceiling after their wait stalled (see below); a non-zero rate means the ceiling is not holding |
 | `backend.ops` / `backend.bytes` / `backend.latency` | `op`(, `result`) | ops: read/write/list/delete/cas/size; results: ok/not_found/error |
@@ -448,10 +449,11 @@ number of starved ones. A 16-core node with a 2 GiB limit runs 4 concurrent merg
 total resident bytes, a longer compaction cycle in wall-clock.
 
 A background merge that finds the budget committed is **deferred**, not queued: it compacts nothing,
-increments `storage.merge.deferred`, and the next cycle retries it — ahead of the other engines, so
-the budget rotates instead of going to the highest-ingest tenants every cycle. The maintenance loop
-is one goroutine shared with size-triggered flushes, and parking it on a busy budget would hold back
-the memory relief the budget exists to bound.
+increments `storage.merge.deferred`, sets `MergeDeferred` on that engine's `SignalStats`, and the
+next cycle retries it — ordered ahead of the other engines, though that only rotates the budget when
+there are more engines than maintenance workers (#646). `runMaintenance` cannot service a
+size-triggered flush until a whole cycle's fan-out returns, so parking a merge on a busy budget
+would hold back the memory relief the budget exists to bound.
 
 `Admin.Compact`, `Admin.CompactNow` and `Admin.Retention` **wait** for the budget instead of
 deferring, so an operator command never silently does nothing. `Admin.MaintainNow` runs the

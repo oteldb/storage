@@ -1600,14 +1600,21 @@ func (s *Storage) recordWALSync(ctx context.Context, errs []error) {
 // record engine expose SyncWAL, so the loop fans out over them uniformly.
 type walSyncer interface{ SyncWAL() error }
 
-// maintain flushes then merges (with retention) every tenant engine once. Errors are
-// swallowed: a transient backend failure must not crash the background loop, and the next
-// maintTask is one engine's maintenance work plus its flush pressure (head bytes), used to order
-// the cycle so the fullest heads flush first (fair scheduling — see maintain).
+// maintTask is one engine's maintenance work, plus the two keys the cycle is ordered by.
+type maintTask struct {
+	run      func()
+	pressure int64 // head bytes: the fullest heads flush first
+	// deferred marks an engine whose last merge could not claim the process merge budget.
+	deferred bool
+}
+
 // sortMaintTasks orders a cycle's work: engines whose last merge was deferred for want of the
-// memory budget first, then by flush pressure descending. [parallel.ForEach] dispatches in index
-// order, so this is what decides who gets the budget and who drains their head first — and the
-// deferred term is what keeps the budget from going to the same highest-ingest engines every cycle.
+// merge-memory budget first, then by flush pressure descending, so the fullest heads flush first.
+//
+// The deferred key only bites when there are more engines than maintenance workers. Below that
+// [parallel.ForEach] raises its limit to the task count and starts every task at once, so index
+// order decides nothing and which engine reaches the budget first is decided by how long its flush
+// took — which is #646: a deferred engine can lose that race every cycle.
 func sortMaintTasks(tasks []maintTask) {
 	sort.SliceStable(tasks, func(i, j int) bool {
 		if tasks[i].deferred != tasks[j].deferred {
@@ -1618,15 +1625,8 @@ func sortMaintTasks(tasks []maintTask) {
 	})
 }
 
-type maintTask struct {
-	run      func()
-	pressure int64
-	// deferred marks an engine whose last merge could not claim the process merge budget. Such an
-	// engine sorts ahead of pressure, so the budget rotates instead of going to the same
-	// highest-ingest engines every cycle.
-	deferred bool
-}
-
+// maintain flushes then merges (with retention) every tenant engine once. Errors are
+// swallowed: a transient backend failure must not crash the background loop, and the next
 // tick retries. In cluster mode only the tenants this node owns (its compaction claims) are
 // flushed/merged, so exactly one node writes a tenant's parts to the shared object store.
 func (s *Storage) maintain(ctx context.Context) {
@@ -1741,10 +1741,11 @@ func (s *Storage) maintain(ctx context.Context) {
 	// across engines parallelizes freely. Build one flat work list and fan out under a bound — a
 	// sequential pass would take the sum of every engine's compaction I/O.
 	//
-	// Fair scheduling: the work list is ordered by flush pressure (head bytes) descending, and
-	// parallel.ForEach dispatches in index order, so the fullest heads flush first within a cycle.
-	// This keeps one noisy tenant from delaying the relief of others when the work exceeds the
-	// concurrency bound, and drains the most in-flight memory soonest.
+	// Fair scheduling: the work list is ordered by a deferred merge first and then by flush pressure
+	// (head bytes) descending, and parallel.ForEach dispatches in index order, so the fullest heads
+	// flush first within a cycle. This keeps one noisy tenant from delaying the relief of others when
+	// the work exceeds the concurrency bound, and drains the most in-flight memory soonest. See
+	// sortMaintTasks for what the deferred key does and does not buy.
 	tasks := make([]maintTask, 0,
 		len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines)+len(exemplarEngines))
 
@@ -1991,9 +1992,9 @@ func (s *Storage) recordEnginesBySignal() map[signal.Signal]map[signal.TenantID]
 // per-merge share real: every engine in the process draws on one pool, so concurrent merges cannot
 // collectively hold more than [Options.MergeMemoryBytes].
 //
-// Only an operator-requested merge waits. The background ones run on [Storage.runMaintenance]'s
-// single goroutine, which also services size-triggered flushes, so one of them parking here would
-// hold back every engine's memory relief for the rest of the cycle.
+// Every caller waits except the maintenance cycle's own merges. [Storage.runMaintenance] cannot
+// service a size-triggered flush until the whole cycle's fan-out returns, so a merge parking here
+// would hold back every engine's memory relief for the rest of the cycle.
 func (s *Storage) admitMerge(ctx context.Context, bytes int64, wait bool) (func(), bool, error) {
 	if !wait {
 		release, ok := s.mergePool.TryAcquire(bytes)

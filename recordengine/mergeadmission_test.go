@@ -13,8 +13,9 @@ import (
 )
 
 // admissionRecorder stands in for the process-wide merge pool, recording what each merge asked for
-// and whether it said it could wait. busy makes every request decline, which is what a background
-// merge meets when the budget is fully committed.
+// and whether it said it could wait. busy declines every request that will not wait, which is what
+// a background merge meets when the budget is fully committed; a waiting caller is admitted, as the
+// real pool would once a holder released.
 type admissionRecorder struct {
 	busy bool
 
@@ -31,7 +32,8 @@ func (a *admissionRecorder) admit(_ context.Context, bytes int64, wait bool) (fu
 	busy := a.busy
 	a.mu.Unlock()
 
-	if busy {
+	// Only a caller that declined to wait can be turned away; the real pool queues the others.
+	if busy && !wait {
 		return nil, false, nil
 	}
 

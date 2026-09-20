@@ -125,18 +125,31 @@ func (e *Engine) mergeConcurrency() int {
 // admitMerge reserves the memory this merge intends to hold. It is called once the merge knows it
 // has work, so a no-op cycle never consults the budget at all.
 //
-// A [MergeOptions.Background] merge does not wait: the facade's maintenance loop is one goroutine
-// shared with flush pressure, so parking there would delay every engine's flush — the mechanism
-// that gives memory back — in order to bound the memory merges take. It declines and the next cycle
-// retries. Every other caller waits, because a merge someone asked for must not silently no-op.
+// A [MergeOptions.Background] merge does not wait: the facade cannot service a size-triggered flush
+// until a whole maintenance cycle's fan-out returns, so parking there would delay every engine's
+// flush — the mechanism that gives memory back — in order to bound the memory merges take. It
+// declines and the next cycle retries. Every other caller waits, because a merge someone asked for
+// must not silently no-op.
 //
 // Waiting still holds this engine's flushMu, which the merge takes before reaching here, so a
-// waiting merge delays its own engine's flush for as long as it queues. That is bounded: the pool
-// admits no new holders while anyone is queued, so the wait is at most one merge long.
+// waiting merge delays its own engine's flush for as long as it queues. The pool admits no new
+// holders while anyone is queued, so the wait is bounded by the merges already running plus
+// whatever is queued ahead.
 func (e *Engine) admitMerge(ctx context.Context, background bool) (func(), bool, error) {
 	if e.cfg.MergeAdmission == nil {
 		return func() {}, true, nil
 	}
 
-	return e.cfg.MergeAdmission(ctx, e.mergeMemoryBudgetBytes(), !background)
+	release, ok, err := e.cfg.MergeAdmission(ctx, e.mergeMemoryBudgetBytes(), !background)
+	switch {
+	case err != nil:
+		return nil, false, err
+	case ok, background:
+		return release, ok, nil
+	}
+
+	// A caller that said it would wait and was refused anyway is a broken admission callback. The
+	// alternative to erroring is returning nil having compacted nothing, which is the silent no-op
+	// this whole path exists to prevent — so it surfaces rather than disappears.
+	return nil, false, errors.New("merge admission declined a merge that asked to wait")
 }

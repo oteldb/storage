@@ -101,11 +101,10 @@ type Config struct {
 	// that hands them back. A division of one budget across concurrent merges is only real if
 	// something stops more than that many from starting.
 	//
-	// wait reports whether this caller may block for the budget. An operator-requested merge
-	// (MergeOptions.Force) waits, because it runs on its own goroutine with its own context; a
-	// background one does not, because the maintenance loop is shared with flush pressure and must
-	// not park — it takes what is free and defers to the next cycle otherwise. ok=false with a nil
-	// error is that deferral, not a failure.
+	// wait reports whether this caller may block for the budget. Every caller waits except the
+	// maintenance loop's own merges ([MergeOptions.Background]), which run on goroutines the loop
+	// must reclaim before it can service flush pressure — they take what is free and defer to the
+	// next cycle otherwise. ok=false with a nil error is that deferral, not a failure.
 	//
 	// It is called *after* selection, so a cycle with nothing to compact never consults it at all.
 	// nil admits every merge, which is the single-engine and test default.

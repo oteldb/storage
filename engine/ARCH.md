@@ -420,14 +420,14 @@ memory merges take.
 Waiting is the **default**, and `Background` is opt-in, set only by that loop: a merge someone asked
 for — an operator command, a test, an embedder driving the engine — must produce one, not a silent
 no-op. A waiting merge does hold its own engine's `flushMu`, which `merge` takes before reaching
-admission, so that engine's flush waits with it; the pool admits no new holders while anyone is
-queued, so the wait is at most one merge long.
+admission, so that engine's flush waits with it. The pool admits no new holders while anyone is
+queued, so the wait is bounded by the merges already running plus whatever is queued ahead.
 
 **A deferral is visible.** It increments `storage.merge.deferred` (`ADMIN.md`), sets
 `Engine.MergeDeferred`, and does *not* log "nothing to compact" — which is what it would otherwise
-look like. The facade sorts a deferred engine ahead of head-bytes pressure on its next pass, so the
-budget rotates rather than going to the highest-ingest engines every cycle, which would strand a
-quiet tenant's part count. The idle-waiver counter is zeroed only once a merge is admitted: a
+look like. The facade sorts a deferred engine ahead of head-bytes pressure on its next pass — which rotates
+the budget only when there are more engines than maintenance workers; below that every task starts
+at once and the order decides nothing (#646). The idle-waiver counter is zeroed only once a merge is admitted: a
 deferral has not broken the fixed point the waiver exists to escape.
 
 **The trade is throughput.** A 16-core node with a 2 GiB limit runs 4 concurrent merges rather than

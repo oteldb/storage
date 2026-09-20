@@ -66,6 +66,10 @@ type SignalStats struct {
 	MaxTimeUnixNano int64
 	// MergeRunning is true while a compaction/merge is executing on this engine.
 	MergeRunning bool
+	// MergeDeferred is true when the last merge selected parts and could not claim the process
+	// merge-memory budget, so it compacted nothing. Part counts climbing while merges look idle and
+	// this is set means compaction is bounded by [Options.MergeMemoryBytes], not by the selector.
+	MergeDeferred bool
 	// SealedParts is the parts already at the merge cap. A merge never reconsiders them, so they are
 	// the share of Parts no compaction will ever reduce.
 	SealedParts int
@@ -242,8 +246,9 @@ func (s *Storage) Inspect() StoreStats {
 			Signal: signal.Metric, Series: es.Series, HeadItems: es.HeadSamples, HeadBytes: es.HeadBytes,
 			HeadAge:       es.HeadAge,
 			IdentityBytes: es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
-			MergeRunning: eng.MergeRunning(),
-			SealedParts:  sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
+			MergeRunning:  eng.MergeRunning(),
+			MergeDeferred: eng.MergeDeferred(),
+			SealedParts:   sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
 			MergeCapBytes: sh.CapBytes, OutOfSpace: es.OutOfSpace,
 			WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 			WantedParts: es.WantedParts, Holes: es.Holes, LostParts: es.LostParts,
@@ -269,8 +274,9 @@ func (s *Storage) Inspect() StoreStats {
 				Signal: sig, Series: es.Streams, HeadItems: es.HeadRecords, HeadBytes: es.HeadBytes,
 				HeadAge:       es.HeadAge,
 				IdentityBytes: es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
-				MergeRunning: eng.MergeRunning(),
-				SealedParts:  sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
+				MergeRunning:  eng.MergeRunning(),
+				MergeDeferred: eng.MergeDeferred(),
+				SealedParts:   sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
 				MergeCapBytes: sh.CapBytes, OutOfSpace: es.OutOfSpace,
 				WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 				WantedParts: es.WantedParts, Holes: es.Holes, LostParts: es.LostParts,

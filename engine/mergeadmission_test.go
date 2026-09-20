@@ -15,8 +15,9 @@ import (
 )
 
 // admissionRecorder stands in for the process-wide merge pool, recording what each merge asked for
-// and whether it said it could wait. busy makes every request decline, which is what a background
-// merge meets when the budget is fully committed.
+// and whether it said it could wait. busy declines every request that will not wait, which is what
+// a background merge meets when the budget is fully committed; a waiting caller is admitted, as the
+// real pool would once a holder released.
 type admissionRecorder struct {
 	busy bool
 
@@ -33,7 +34,8 @@ func (a *admissionRecorder) admit(_ context.Context, bytes int64, wait bool) (fu
 	busy := a.busy
 	a.mu.Unlock()
 
-	if busy {
+	// Only a caller that declined to wait can be turned away; the real pool queues the others.
+	if busy && !wait {
 		return nil, false, nil
 	}
 
@@ -257,4 +259,70 @@ func TestDeferralKeepsTheIdleWaiverLadder(t *testing.T) {
 	rec.busy = false
 	require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Background: true}))
 	assert.Zero(t, e.MergeShape().IdleRounds, "an admitted merge does reset it")
+}
+
+// TestNonBackgroundNeverDefers is the invariant the Background polarity exists to make
+// unrepresentable: any caller that did not mark its merge as the maintenance loop's own must get a
+// merge, not a silent nil. Before the polarity was inverted, Admin.Compact and Admin.Retention —
+// neither of which sets Force, the discriminator at the time — returned nil having done nothing.
+func TestNonBackgroundNeverDefers(t *testing.T) {
+	t.Parallel()
+
+	shapes := map[string]engine.MergeOptions{
+		"zero value":      {},
+		"forced":          {Force: true},
+		"with retention":  {RetainFrom: 1},
+		"forced + retain": {Force: true, RetainFrom: 1},
+	}
+
+	for name, opts := range shapes {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			// busy would decline anything that asked not to wait; none of these may ask.
+			rec := &admissionRecorder{busy: true}
+
+			e := engine.New(engine.Config{
+				Backend:          backend.Memory(),
+				Prefix:           "m",
+				MergeMemoryBytes: 1 << 30,
+				MergeAdmission:   rec.admit,
+			})
+
+			flushTinyParts(t, e, 4)
+			require.NoError(t, e.MergeWith(ctx, opts))
+
+			require.Len(t, rec.waits(), 1)
+			assert.True(t, rec.waits()[0], "a merge nobody marked Background must wait, not decline")
+			assert.False(t, e.MergeDeferred(), "and must not be recorded as deferred")
+		})
+	}
+}
+
+// TestRefusedWaiterIsAnError closes the same invariant from the other side. Nothing in the callback
+// signature stops an embedder from returning ok=false to a caller that said it would wait; if the
+// engine took that as a deferral, a non-Background merge would return nil having done nothing —
+// exactly the silent no-op the Background polarity exists to prevent.
+func TestRefusedWaiterIsAnError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	refuse := func(context.Context, int64, bool) (func(), bool, error) { return nil, false, nil }
+
+	e := engine.New(engine.Config{
+		Backend:          backend.Memory(),
+		Prefix:           "m",
+		MergeMemoryBytes: 1 << 30,
+		MergeAdmission:   refuse,
+	})
+
+	flushTinyParts(t, e, 4)
+
+	require.Error(t, e.Merge(ctx, 0), "a refused waiter must surface, not vanish")
+
+	// A Background merge asked not to wait, so the same answer is a legitimate deferral.
+	require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Background: true}))
+	assert.True(t, e.MergeDeferred())
 }

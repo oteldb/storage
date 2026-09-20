@@ -309,3 +309,38 @@ func TestMergeCapUsesRecordedPartSize(t *testing.T) {
 	assert.Equal(t, int64(10*partRowBytes), legacy.sizeBytes(),
 		"a part with no recorded size falls back to the uncompressed row estimate")
 }
+
+// TestAdmissionRequestMatchesCapDerivation is the coherence invariant between the two halves of the
+// budget: the bytes a merge reserves from the pool must be the share its cap was derived from, and
+// the pool must admit at least as many merges as the cap arithmetic assumed. When those disagree
+// the bound is wrong in one direction or the other — the first round of this work divided the disk
+// by one number and admitted merges by another, and nothing caught it.
+func TestAdmissionRequestMatchesCapDerivation(t *testing.T) {
+	t.Parallel()
+
+	budgets := []int64{16 << 20, 64 << 20, 256 << 20, 1 << 30, 3 << 30, 64 << 30}
+	fanouts := []int{1, 2, 4, 16}
+
+	for _, budget := range budgets {
+		for _, fanout := range fanouts {
+			e := New(Config{
+				Backend: backend.Memory(), Prefix: "t",
+				MergeMemoryBytes: budget,
+				MergeConcurrency: concurrencyFunc(fanout),
+			})
+
+			k := e.mergeConcurrency()
+			request := e.mergeMemoryBudgetBytes()
+
+			assert.LessOrEqual(t, k, fanout, "the fan-out caps how many merges the budget admits")
+			assert.Positive(t, request)
+			assert.Equal(t, memlimit.MergeShare(budget, k, 1), request,
+				"a merge must reserve the share its own concurrency implies")
+
+			// The pool is sized at the whole budget and each merge takes `request`, so this is the
+			// number that actually fits. It must not be fewer than the cap arithmetic assumed.
+			assert.GreaterOrEqual(t, memlimit.MergeBudget(budget)/request, int64(k),
+				"the pool must admit every merge the cap was divided for")
+		}
+	}
+}
