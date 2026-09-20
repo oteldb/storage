@@ -372,8 +372,9 @@ by the read seam.
 ```
 concurrency   = clamp( mergeMemory / 64 MiB, 1, MergeConcurrency )   ← memory decides, cores cap
 mergeCapBytes = min( MergeCeilingBytes,
-                     free        / concurrency / 2,
-                     mergeMemory / concurrency / 2 )  ← whole-object backends only
+                     free        / MergeConcurrency / 2,   ← merges that can *run*
+                     mergeMemory / concurrency      / 2 )  ← merges the budget *admits*
+                                                              (whole-object backends only)
 ```
 
 **Why not a constant:** cardinality spends the budget in *breadth*, so a fixed cap shrinks a part's
@@ -395,14 +396,30 @@ each merge 32 MiB and produce a great many merges too small to keep up with inge
 makes the same split from the other side — its merge workers are CPU-bound and CPU-counted, while
 `memory.Allowed()` sizes the *parts* (`getMaxInmemoryPartSize`, `getMaxSmallPartSize`).
 
-**And the division is enforced, not assumed.** `internal/memlimit.Pool` is a process-wide byte
-semaphore that every engine of every signal draws on through `Config.MergeAdmission`; a merge
+**The two divisors differ on purpose.** Free space is divided by `MergeConcurrency` — the merges
+that can *run* — because without an admission pool that is how many may be writing at once. Memory
+is divided by the smaller, budget-derived number, which is how many are admitted. Dividing the disk
+by the memory-derived count would size each output against a share more merges than that could be
+producing.
+
+**And the memory division is enforced, not assumed.** `internal/memlimit.Pool` is a process-wide
+byte semaphore that every engine of every signal draws on through `Config.MergeAdmission`; a merge
 reserves its resident share once it has selected sources and holds it until it ends. Without it the
 share is arithmetic nobody keeps: the facade fans merges out on its own schedule, so the division
-understated what a merge may hold *and* overstated how many may hold it, at once. Admission is taken
-**after** selection so an engine with nothing to compact never queues behind one that has work; the
-cost is that a merge waiting for bytes also delays its own engine's next flush, since `flushMu` spans
-the whole merge.
+understated what a merge may hold *and* overstated how many may hold it, at once. Note the bound is
+the *request*, not measured residency: below the cap floors (`minMergeCapBytes` here,
+`MaxPartBytes` in `recordengine`) a merge can hold more than it asked for.
+
+**A background merge does not wait for its budget; it defers.** Admission is taken after selection,
+so a cycle with nothing to compact never consults the budget — and when the budget is committed the
+merge declines and the next cycle retries. Parking would be worse than it looks: the engine holds
+`flushMu` across the whole merge, and the facade runs maintenance on *one* goroutine that also
+services size-triggered flushes, so one waiting merge would hold back every engine's memory relief
+for the rest of the cycle — to bound the memory merges take. Only an operator-requested merge
+(`MergeOptions.Force`) waits, on its own goroutine and its own cancellable context.
+
+**The trade is throughput.** A 16-core node with a 2 GiB limit runs 4 concurrent merges rather than
+16 — the same total resident bytes, a longer compaction cycle in wall-clock.
 
 **Degenerate cases.** Backends that cannot report free space (`Memory`, object stores) keep the
 ceiling. A nearly full disk falls to `minMergeCapBytes` rather than sealing everything, since stranding

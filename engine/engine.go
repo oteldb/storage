@@ -81,8 +81,15 @@ type Config struct {
 	// 0 ⇒ a share of GOMEMLIMIT, or defaultMergeMemoryBytes when the process declares no limit;
 	// negative ⇒ unbounded (only the ceiling and free space then apply).
 	MergeMemoryBytes int64
-	// MergeConcurrency reports how many merges may run concurrently against this backend, dividing
-	// the free space so they cannot collectively exhaust the disk. nil or ≤ 1 ⇒ no division.
+	// MergeConcurrency reports how many merges may run concurrently against this backend — the
+	// caller's fan-out. It divides the free space, so concurrent merges cannot collectively exhaust
+	// the disk, and it *caps* how many the memory budget admits. nil or ≤ 1 ⇒ no division.
+	//
+	// It is the ceiling on the memory side, not the divisor: [MergeMemoryBytes] decides how many
+	// merges get a usable allowance, and dividing a memory budget by a number that tracks the core
+	// count instead would price memory in CPUs. Nothing here *enforces* either number — that is
+	// [Config.MergeAdmission]'s job, and without one this engine's merges are bounded only by how
+	// many the caller starts.
 	//
 	// A callback because the answer moves: fan-out is bounded by the node's engine count as much as
 	// by its worker limit, and engines appear lazily. Fixing it at engine creation would divide a
@@ -91,12 +98,18 @@ type Config struct {
 
 	// MergeAdmission gates a merge on the memory it intends to hold: it is called once a merge has
 	// selected its sources, with the bytes that merge may hold resident, and returns the function
-	// that hands them back. Blocking is the point — a budget divided across concurrent merges is
-	// only real if something stops more than that many from starting.
+	// that hands them back. A division of one budget across concurrent merges is only real if
+	// something stops more than that many from starting.
 	//
-	// It is called *after* selection, so a cycle with nothing to compact never queues behind a merge
-	// that does. nil admits every merge, which is the single-engine and test default.
-	MergeAdmission func(ctx context.Context, bytes int64) (release func(), err error)
+	// wait reports whether this caller may block for the budget. An operator-requested merge
+	// (MergeOptions.Force) waits, because it runs on its own goroutine with its own context; a
+	// background one does not, because the maintenance loop is shared with flush pressure and must
+	// not park — it takes what is free and defers to the next cycle otherwise. ok=false with a nil
+	// error is that deferral, not a failure.
+	//
+	// It is called *after* selection, so a cycle with nothing to compact never consults it at all.
+	// nil admits every merge, which is the single-engine and test default.
+	MergeAdmission func(ctx context.Context, bytes int64, wait bool) (release func(), ok bool, err error)
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each part,
 	// so [Engine.AggregateRange] answers a range-covering aggregate from it without decoding the
 	// value column. It costs a little storage per series; off by default. AggregateRange works

@@ -72,7 +72,9 @@ enter; the flush cap and the tiering target bound the disk.
 
 `concurrency` is derived from the memory budget rather than from the core count, and enforced by the
 process-wide `internal/memlimit.Pool` through `Config.MergeAdmission` — `engine/ARCH.md` ("Merge
-cap") has the reasoning; both engines draw on the same pool because they share one process.
+cap") has the reasoning, including why a background merge defers rather than waits. Both engines
+draw on the same pool because they share one process. There is no free-space term here, so unlike
+the metric engine this cap has only the one divisor.
 
 ### Merge shape and forcing (`mergeshape.go`)
 

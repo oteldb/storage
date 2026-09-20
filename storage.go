@@ -1959,11 +1959,26 @@ func (s *Storage) recordEnginesBySignal() map[signal.Signal]map[signal.TenantID]
 	return out
 }
 
-// admitMerge reserves bytes from the process-wide merge budget, blocking until they are free. It is
-// what makes each engine's per-merge share real: every engine in the process draws on one pool, so
-// concurrent merges cannot collectively hold more than [Options.MergeMemoryBytes].
-func (s *Storage) admitMerge(ctx context.Context, bytes int64) (func(), error) {
-	return s.mergePool.Acquire(ctx, bytes)
+// admitMerge reserves bytes from the process-wide merge budget. It is what makes each engine's
+// per-merge share real: every engine in the process draws on one pool, so concurrent merges cannot
+// collectively hold more than [Options.MergeMemoryBytes].
+//
+// Only an operator-requested merge waits. The background ones run on [Storage.runMaintenance]'s
+// single goroutine, which also services size-triggered flushes, so one of them parking here would
+// hold back every engine's memory relief for the rest of the cycle.
+func (s *Storage) admitMerge(ctx context.Context, bytes int64, wait bool) (func(), bool, error) {
+	if !wait {
+		release, ok := s.mergePool.TryAcquire(bytes)
+
+		return release, ok, nil
+	}
+
+	release, err := s.mergePool.Acquire(ctx, bytes)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return release, true, nil
 }
 
 // mergeConcurrency is the *ceiling* on how many merges may run at once — the maintenance fan-out,

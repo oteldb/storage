@@ -49,6 +49,10 @@ func (e *Engine) mergeCapBytes(ctx context.Context) int64 {
 		ceiling = defaultMergeCeilingBytes
 	}
 
+	// The two bounds divide by different numbers on purpose. Memory is divided by the merges the
+	// budget admits; free space by the merges that can *run*, which without a [Config.MergeAdmission]
+	// pool is the full fan-out. Dividing the disk by the smaller memory-derived count would size each
+	// output against a share more merges than that could be writing at once.
 	concurrency := e.mergeConcurrency()
 
 	derived := int64(math.MaxInt64)
@@ -70,7 +74,7 @@ func (e *Engine) mergeCapBytes(ctx context.Context) int64 {
 	default:
 		// Nearly full keeps merging small groups rather than sealing everything: stranding the part
 		// count high is worst exactly when compaction matters most.
-		derived = min(derived, max(free/int64(concurrency)/freeSpaceDivisor, minMergeCapBytes))
+		derived = min(derived, max(free/int64(e.mergeFanout())/freeSpaceDivisor, minMergeCapBytes))
 	}
 
 	// The floor applies to the derived bounds, not to the ceiling: an embedder that configures a cap
@@ -100,30 +104,36 @@ func (e *Engine) mergeMemoryBudgetBytes() int64 {
 	return memlimit.MergeShare(e.cfg.MergeMemoryBytes, e.mergeConcurrency(), 1)
 }
 
-// mergeConcurrency is how many merges may be running against this engine's backend at once. It
-// divides both the disk and the memory a single merge may claim, so it is derived from the memory
-// budget — enough merges that each gets a usable allowance — with [Config.MergeConcurrency] as the
-// ceiling rather than the divisor.
-func (e *Engine) mergeConcurrency() int {
-	cpu := 1
-	if e.cfg.MergeConcurrency != nil {
-		cpu = e.cfg.MergeConcurrency()
+// mergeFanout is how many merges may be running against this engine's backend at once, per
+// [Config.MergeConcurrency]. It is the bound on *disk* a merge may claim.
+func (e *Engine) mergeFanout() int {
+	if e.cfg.MergeConcurrency == nil {
+		return 1
 	}
 
-	return memlimit.MergeConcurrency(e.cfg.MergeMemoryBytes, cpu)
+	return max(e.cfg.MergeConcurrency(), 1)
 }
 
-// admitMerge reserves the memory this merge intends to hold, blocking until the process has it to
-// spare. It is called once the merge knows it has work: a no-op cycle must not queue behind a merge
-// that is running, or one busy engine would stall every other engine's maintenance pass.
+// mergeConcurrency is how many merges the memory budget admits: enough that each gets a usable
+// allowance, capped by [Engine.mergeFanout]. It is the divisor for a merge's *memory* share, and
+// deriving it from memory is the point — taking it from the fan-out, which tracks the core count,
+// prices a memory quantity in CPUs.
+func (e *Engine) mergeConcurrency() int {
+	return memlimit.MergeConcurrency(e.cfg.MergeMemoryBytes, e.mergeFanout())
+}
+
+// admitMerge reserves the memory this merge intends to hold. It is called once the merge knows it
+// has work, so a no-op cycle never consults the budget at all.
 //
-// The engine holds flushMu across the whole merge, so a merge waiting here also delays this engine's
-// next flush. That is the intended back-pressure — the alternative is merges that collectively hold
-// more than the process has — but it is why admission is taken after selection and not before.
-func (e *Engine) admitMerge(ctx context.Context) (func(), error) {
+// A background merge does not wait: the engine holds flushMu across its whole body, and the
+// facade's maintenance loop is one goroutine shared with flush pressure, so parking here would
+// delay every engine's flush — the mechanism that gives memory back — to bound the memory merges
+// take. It declines instead and the next cycle retries. An operator-requested merge waits, on its
+// own goroutine and its own cancellable context.
+func (e *Engine) admitMerge(ctx context.Context, force bool) (func(), bool, error) {
 	if e.cfg.MergeAdmission == nil {
-		return func() {}, nil
+		return func() {}, true, nil
 	}
 
-	return e.cfg.MergeAdmission(ctx, e.mergeMemoryBudgetBytes())
+	return e.cfg.MergeAdmission(ctx, e.mergeMemoryBudgetBytes(), force)
 }

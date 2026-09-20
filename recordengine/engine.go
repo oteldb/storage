@@ -76,18 +76,29 @@ type Config struct {
 	// size a working set the process cannot hold. 0 ⇒ a share of the process memory budget
 	// (GOMEMLIMIT, else the cgroup limit, else host memory); negative ⇒ unbounded.
 	MergeMemoryBytes int64
-	// MergeConcurrency reports how many merges may run concurrently in this process, dividing the
-	// merge memory allowance so they cannot collectively exceed it. nil or ≤ 1 ⇒ no division.
+	// MergeConcurrency reports how many merges may run concurrently in this process — the caller's
+	// fan-out, which *caps* how many the memory budget admits rather than dividing it. nil or ≤ 1 ⇒
+	// no cap beyond one.
+	//
+	// [MergeMemoryBytes] is what divides the allowance: it decides how many merges each get a usable
+	// share, and taking the divisor from a number that tracks the core count instead would price a
+	// memory quantity in CPUs. Nothing here enforces the division — that is [Config.MergeAdmission].
 	MergeConcurrency func() int
 
 	// MergeAdmission gates a merge on the memory it intends to hold: it is called once a merge has
 	// selected its sources, with the bytes that merge may hold resident, and returns the function
-	// that hands them back. Blocking is the point — a budget divided across concurrent merges is
-	// only real if something stops more than that many from starting.
+	// that hands them back. A division of one budget across concurrent merges is only real if
+	// something stops more than that many from starting.
 	//
-	// It is called *after* selection, so a cycle with nothing to compact never queues behind a merge
-	// that does. nil admits every merge, which is the single-engine and test default.
-	MergeAdmission func(ctx context.Context, bytes int64) (release func(), err error)
+	// wait reports whether this caller may block for the budget. An operator-requested merge
+	// (MergeOptions.Force) waits, because it runs on its own goroutine with its own context; a
+	// background one does not, because the maintenance loop is shared with flush pressure and must
+	// not park — it takes what is free and defers to the next cycle otherwise. ok=false with a nil
+	// error is that deferral, not a failure.
+	//
+	// It is called *after* selection, so a cycle with nothing to compact never consults it at all.
+	// nil admits every merge, which is the single-engine and test default.
+	MergeAdmission func(ctx context.Context, bytes int64, wait bool) (release func(), ok bool, err error)
 	// MergeCompression block-compresses the columns of merged (compacted) parts on top of their chunk
 	// codecs — the cold, long-lived data. Flushed parts stay codec-only so ingest is cheap; the
 	// background merge is where recompression is amortized. Record byte columns are dict-coded but not

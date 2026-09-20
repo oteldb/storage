@@ -14,23 +14,34 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// admissionRecorder stands in for the process-wide merge pool, recording what each merge asked for.
+// admissionRecorder stands in for the process-wide merge pool, recording what each merge asked for
+// and whether it said it could wait. busy makes every request decline, which is what a background
+// merge meets when the budget is fully committed.
 type admissionRecorder struct {
+	busy bool
+
 	mu       sync.Mutex
 	asked    []int64
+	waited   []bool
 	released int
 }
 
-func (a *admissionRecorder) admit(_ context.Context, bytes int64) (func(), error) {
+func (a *admissionRecorder) admit(_ context.Context, bytes int64, wait bool) (func(), bool, error) {
 	a.mu.Lock()
 	a.asked = append(a.asked, bytes)
+	a.waited = append(a.waited, wait)
+	busy := a.busy
 	a.mu.Unlock()
+
+	if busy {
+		return nil, false, nil
+	}
 
 	return func() {
 		a.mu.Lock()
 		a.released++
 		a.mu.Unlock()
-	}, nil
+	}, true, nil
 }
 
 func (a *admissionRecorder) calls() []int64 {
@@ -38,6 +49,13 @@ func (a *admissionRecorder) calls() []int64 {
 	defer a.mu.Unlock()
 
 	return append([]int64(nil), a.asked...)
+}
+
+func (a *admissionRecorder) waits() []bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return append([]bool(nil), a.waited...)
 }
 
 // flushTinyParts writes n parts of a few series each, so a merge has something to select.
@@ -142,4 +160,55 @@ func TestMergeWithoutAdmissionStillMerges(t *testing.T) {
 	require.NoError(t, e.Merge(ctx, 0))
 
 	assert.Len(t, e.Parts(), 1)
+}
+
+// TestBackgroundMergeDefersWhenTheBudgetIsBusy is why admission is non-blocking for the background
+// path. The facade runs it on one goroutine shared with size-triggered flushes, so a merge that
+// parked waiting for memory would hold back the mechanism that gives memory back. It declines, the
+// parts stay, and the next cycle retries.
+func TestBackgroundMergeDefersWhenTheBudgetIsBusy(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	rec := &admissionRecorder{busy: true}
+
+	e := engine.New(engine.Config{
+		Backend:          backend.Memory(),
+		Prefix:           "m",
+		MergeMemoryBytes: 1 << 30,
+		MergeAdmission:   rec.admit,
+	})
+
+	flushTinyParts(t, e, 4)
+	before := len(e.Parts())
+
+	require.NoError(t, e.Merge(ctx, 0), "a declined merge is a deferral, not a failure")
+	assert.Len(t, e.Parts(), before, "nothing was compacted")
+	assert.Equal(t, []bool{false}, rec.waits(), "a background merge does not wait")
+
+	// The budget frees up; the same parts merge on the next cycle.
+	rec.busy = false
+	require.NoError(t, e.Merge(ctx, 0))
+	assert.Less(t, len(e.Parts()), before)
+}
+
+// TestOperatorMergeWaitsForTheBudget is the other half: Admin.Compact runs on its own goroutine with
+// its own cancellable context, so it must actually compact rather than silently decline.
+func TestOperatorMergeWaitsForTheBudget(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	rec := &admissionRecorder{}
+
+	e := engine.New(engine.Config{
+		Backend:          backend.Memory(),
+		Prefix:           "m",
+		MergeMemoryBytes: 1 << 30,
+		MergeAdmission:   rec.admit,
+	})
+
+	flushTinyParts(t, e, 4)
+	require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Force: true}))
+
+	assert.Equal(t, []bool{true}, rec.waits(), "a forced merge may block for its budget")
 }

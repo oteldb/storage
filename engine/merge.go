@@ -126,10 +126,19 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 
 	// Past here the merge decodes and buffers, so this is where its memory allowance must be one it
 	// actually holds rather than one it assumed.
-	release, err := e.admitMerge(ctx)
+	release, admitted, err := e.admitMerge(ctx, opts.Force)
 	if err != nil {
 		return mergeResult{}, err
 	}
+
+	if !admitted {
+		zctx.From(ctx).Debug("merge deferred; the process merge budget is fully committed",
+			zap.String("prefix", e.cfg.Prefix), zap.Int("selected", len(selected)))
+		e.reclaimRetired(ctx)
+
+		return mergeResult{parts: dropped}, nil
+	}
+
 	defer release()
 
 	bytesIn := partsBytes(selected)

@@ -69,8 +69,11 @@ func (p *Pool) Waiting() int {
 //
 // A request larger than the whole pool is clamped to it: such a merge runs alone rather than never,
 // because a bound that can deadlock its own work is worse than one that is occasionally exceeded.
-// Waiters are served strictly in arrival order — which costs nothing here because every caller asks
-// for its engine's constant allowance, so there are no large requests for small ones to starve.
+//
+// Waiters are served strictly in arrival order, so a queued large request delays smaller ones behind
+// it rather than being starved by them. Requests are near-uniform — each caller asks for its share of
+// one budget — but not identical: the share is divided by a concurrency that rises as engines appear,
+// so a waiter queued when the process held one engine asks for more than one queued later.
 func (p *Pool) Acquire(ctx context.Context, n int64) (release func(), err error) {
 	if p == nil || p.total <= 0 {
 		return func() {}, nil
@@ -101,6 +104,30 @@ func (p *Pool) Acquire(ctx context.Context, n int64) (release func(), err error)
 
 		return nil, ctx.Err()
 	}
+}
+
+// TryAcquire takes n bytes if they are free right now, reporting whether it got them. It never
+// queues, so a caller on a shared goroutine — the maintenance loop, which also services flush
+// pressure — can decline the work and come back next cycle instead of parking everything behind it.
+func (p *Pool) TryAcquire(n int64) (release func(), ok bool) {
+	if p == nil || p.total <= 0 {
+		return func() {}, true
+	}
+
+	n = min(max(n, 1), p.total)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Yielding to a queue that is already waiting keeps a blocked operator merge from being starved
+	// by background ones that keep arriving.
+	if len(p.waiters) > 0 || p.free < n {
+		return nil, false
+	}
+
+	p.free -= n
+
+	return p.releaser(n), true
 }
 
 // releaser returns the idempotent hand-back for n bytes.
@@ -146,6 +173,10 @@ func (p *Pool) abandon(w *waiter) {
 
 	if i := slices.Index(p.waiters, w); i >= 0 {
 		p.waiters = slices.Delete(p.waiters, i, i+1)
+
+		// The waiter that left may have been the head that did not fit, holding back one behind it
+		// that does. Nothing else will look: a grant only happens on release, and no bytes moved.
+		p.grantLocked()
 	}
 
 	p.mu.Unlock()
