@@ -125,8 +125,9 @@ func TestMergeWithoutAdmissionStillMerges(t *testing.T) {
 	assert.Less(t, len(e.PartPrefixes()), 4, "the parts were compacted")
 }
 
-// TestBackgroundMergeDefersWhenTheBudgetIsBusy mirrors the metric engine: the background path
-// declines rather than parking the facade's shared maintenance goroutine, and retries next cycle.
+// TestBackgroundMergeDefersWhenTheBudgetIsBusy mirrors the metric engine: the maintenance loop's own
+// merge declines rather than parking the goroutine it shares with flush pressure, and retries next
+// cycle. Waiting is the default; Background is what the loop opts into.
 func TestBackgroundMergeDefersWhenTheBudgetIsBusy(t *testing.T) {
 	t.Parallel()
 
@@ -145,12 +146,37 @@ func TestBackgroundMergeDefersWhenTheBudgetIsBusy(t *testing.T) {
 	flushParts(t, e, 4)
 	before := len(e.PartPrefixes())
 
-	require.NoError(t, e.Merge(ctx, 0), "a declined merge is a deferral, not a failure")
+	require.NoError(t, e.MergeWith(ctx, recordengine.MergeOptions{Force: true, Background: true}),
+		"a declined merge is a deferral, not a failure")
 	assert.Len(t, e.PartPrefixes(), before, "nothing was compacted")
 	assert.Equal(t, []bool{false}, rec.waits(), "a background merge does not wait")
+	assert.True(t, e.MergeDeferred(), "the deferral is remembered, so the facade can retry it first")
 
 	rec.busy = false
-	require.NoError(t, e.MergeWith(ctx, recordengine.MergeOptions{Force: true}))
+	require.NoError(t, e.MergeWith(ctx, recordengine.MergeOptions{Force: true, Background: true}))
 	assert.Less(t, len(e.PartPrefixes()), before)
-	assert.Equal(t, []bool{false, true}, rec.waits(), "a forced merge may block for its budget")
+	assert.False(t, e.MergeDeferred(), "and is cleared once the merge is admitted")
+}
+
+// TestWaitingIsTheDefault is the polarity: Background is opt-in, so Admin.Compact, Admin.Retention,
+// a test, or an embedder driving the engine gets a merge rather than a silent no-op.
+func TestWaitingIsTheDefault(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	rec := &admissionRecorder{}
+
+	e := recordengine.New(recordengine.Config{
+		Schema:           testSchema,
+		Backend:          backend.Memory(),
+		Prefix:           "t/recs",
+		MaxPartBytes:     1 << 20,
+		MergeMemoryBytes: 1 << 30,
+		MergeAdmission:   rec.admit,
+	})
+
+	flushParts(t, e, 4)
+	require.NoError(t, e.MergeWith(ctx, recordengine.MergeOptions{Force: true}))
+
+	assert.Equal(t, []bool{true}, rec.waits(), "a merge nobody marked Background waits for its budget")
 }

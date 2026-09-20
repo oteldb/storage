@@ -69,7 +69,7 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 			zap.Bool("downsample", len(opts.Downsample) > 0),
 			zap.Bool("recompress", opts.Recompress != nil),
 			zap.Duration("took", time.Since(startNs)))
-	} else {
+	} else if !res.deferred {
 		log.Debug("merge no-op (nothing to compact)", zap.String("prefix", e.cfg.Prefix))
 	}
 
@@ -122,24 +122,35 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{parts: dropped}, nil
 	}
 
-	e.idleMerges.Store(0)
-
 	// Past here the merge decodes and buffers, so this is where its memory allowance must be one it
 	// actually holds rather than one it assumed.
-	release, admitted, err := e.admitMerge(ctx, opts.Force)
+	release, admitted, err := e.admitMerge(ctx, opts.Background)
 	if err != nil {
 		return mergeResult{}, err
 	}
 
 	if !admitted {
+		// Remembered so the facade can order this engine first next cycle. Without it the task
+		// order — by head bytes, which the highest-ingest engines keep winning — would hand the
+		// budget to the same engines every cycle and a quiet tenant's part count would grow without
+		// bound.
+		e.mergeDeferred.Store(true)
+		e.cfg.Obs.Merge.Deferred(ctx, metricSignal)
 		zctx.From(ctx).Debug("merge deferred; the process merge budget is fully committed",
 			zap.String("prefix", e.cfg.Prefix), zap.Int("selected", len(selected)))
 		e.reclaimRetired(ctx)
 
-		return mergeResult{parts: dropped}, nil
+		return mergeResult{deferred: true, parts: dropped}, nil
 	}
 
+	e.mergeDeferred.Store(false)
+
 	defer release()
+
+	// Only now: a merge that selected a run but could not get the memory to run it has not broken
+	// the fixed point, and zeroing the counter here would make the idle waiver climb from scratch
+	// every cycle — the engine could never escape.
+	e.idleMerges.Store(0)
 
 	bytesIn := partsBytes(selected)
 
@@ -221,6 +232,9 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 type mergeResult struct {
 	parts             int
 	bytesIn, bytesOut int64
+	// deferred reports that a run was selected but the process merge budget had nothing to give it,
+	// so nothing was compacted. It is not an error: the next cycle retries.
+	deferred bool
 }
 
 // partsBytes sums the on-disk size of ps.

@@ -169,6 +169,24 @@ func TestMergeCapBytes(t *testing.T) {
 			want:        128 << 20,
 		},
 		{
+			// The two terms divide by different numbers, and this is the case that tells them apart.
+			// The budget admits 4 merges (256 MiB / 64 MiB) while 16 can *run*, and without an
+			// admission pool 16 may be writing at once — so the disk must be divided by the fan-out,
+			// not by the smaller admitted count.
+			//
+			//   disk (fan-out 16):     512 MiB / 16 / 2 = 16 MiB  ← correct, and binds
+			//   disk (admitted 4):     512 MiB /  4 / 2 = 64 MiB  ← would over-commit the volume
+			//   memory (admitted 4):   256 MiB /  4 / 2 = 32 MiB
+			//
+			// Sharing one divisor gives 32 MiB here, so this case fails if the terms are merged.
+			name:        "disk divides by the fan-out, memory by what the budget admits",
+			ceiling:     1 << 40,
+			memory:      256 << 20,
+			concurrency: 16,
+			backend:     spaceBackend{Backend: backend.Memory(), free: 512 << 20},
+			want:        16 << 20,
+		},
+		{
 			name:    "a memory budget below the floor still merges",
 			ceiling: 1 << 40,
 			memory:  1 << 10,

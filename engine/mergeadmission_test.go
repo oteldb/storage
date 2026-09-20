@@ -162,8 +162,8 @@ func TestMergeWithoutAdmissionStillMerges(t *testing.T) {
 	assert.Len(t, e.Parts(), 1)
 }
 
-// TestBackgroundMergeDefersWhenTheBudgetIsBusy is why admission is non-blocking for the background
-// path. The facade runs it on one goroutine shared with size-triggered flushes, so a merge that
+// TestBackgroundMergeDefersWhenTheBudgetIsBusy is why admission is non-blocking for the maintenance
+// loop. The facade runs it on one goroutine shared with size-triggered flushes, so a merge that
 // parked waiting for memory would hold back the mechanism that gives memory back. It declines, the
 // parts stay, and the next cycle retries.
 func TestBackgroundMergeDefersWhenTheBudgetIsBusy(t *testing.T) {
@@ -182,19 +182,23 @@ func TestBackgroundMergeDefersWhenTheBudgetIsBusy(t *testing.T) {
 	flushTinyParts(t, e, 4)
 	before := len(e.Parts())
 
-	require.NoError(t, e.Merge(ctx, 0), "a declined merge is a deferral, not a failure")
+	require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Background: true}),
+		"a declined merge is a deferral, not a failure")
 	assert.Len(t, e.Parts(), before, "nothing was compacted")
 	assert.Equal(t, []bool{false}, rec.waits(), "a background merge does not wait")
+	assert.True(t, e.MergeDeferred(), "the deferral is remembered, so the facade can retry it first")
 
 	// The budget frees up; the same parts merge on the next cycle.
 	rec.busy = false
-	require.NoError(t, e.Merge(ctx, 0))
+	require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Background: true}))
 	assert.Less(t, len(e.Parts()), before)
+	assert.False(t, e.MergeDeferred(), "and is cleared once the merge is admitted")
 }
 
-// TestOperatorMergeWaitsForTheBudget is the other half: Admin.Compact runs on its own goroutine with
-// its own cancellable context, so it must actually compact rather than silently decline.
-func TestOperatorMergeWaitsForTheBudget(t *testing.T) {
+// TestWaitingIsTheDefault is the polarity that matters: MergeOptions.Background is opt-in, set only
+// by the maintenance loop. Every other caller — Admin.Compact, Admin.Retention, a test, an embedder
+// driving the engine — must get a merge rather than a silent no-op, so it waits.
+func TestWaitingIsTheDefault(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -208,7 +212,49 @@ func TestOperatorMergeWaitsForTheBudget(t *testing.T) {
 	})
 
 	flushTinyParts(t, e, 4)
-	require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Force: true}))
 
-	assert.Equal(t, []bool{true}, rec.waits(), "a forced merge may block for its budget")
+	require.NoError(t, e.Merge(ctx, 0))
+	assert.Equal(t, []bool{true}, rec.waits(), "a plain Merge waits for its budget")
+}
+
+// TestDeferralKeepsTheIdleWaiverLadder pins a trap: the metric engine escapes a merge fixed point by
+// counting fruitless cycles and then waiving its write-amplification guard. A deferral selected a
+// run and merely could not fund it, so it has not broken the fixed point — zeroing the count there
+// would restart the climb every cycle and a starved engine could never escape.
+func TestDeferralKeepsTheIdleWaiverLadder(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	rec := &admissionRecorder{}
+
+	e := engine.New(engine.Config{
+		Backend:          backend.Memory(),
+		Prefix:           "m",
+		MergeMemoryBytes: 1 << 30,
+		MergeAdmission:   rec.admit,
+	})
+
+	// One part: nothing to merge with, so the idle counter climbs and admission is never consulted.
+	flushTinyParts(t, e, 1)
+
+	for range 2 {
+		require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Background: true}))
+	}
+
+	climbed := e.MergeShape().IdleRounds
+	require.Positive(t, climbed, "the engine must have climbed the ladder for the test to mean anything")
+	assert.Empty(t, rec.calls(), "a cycle that selects nothing never consults the budget")
+
+	// Now there is a run to select, but no budget to fund it.
+	rec.busy = true
+	flushTinyParts(t, e, 3)
+	require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Background: true}))
+
+	require.Len(t, rec.calls(), 1, "the run was selected and admission was asked")
+	assert.Equal(t, climbed, e.MergeShape().IdleRounds,
+		"a deferral leaves the idle count where it was; only an admitted merge resets it")
+
+	rec.busy = false
+	require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Background: true}))
+	assert.Zero(t, e.MergeShape().IdleRounds, "an admitted merge does reset it")
 }

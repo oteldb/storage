@@ -101,7 +101,9 @@ one wedged at a fixed point — a deployment sat at 59 parts for thousands of cy
 like an idle one. The three numbers beside it answer it directly:
 
 - `SealedParts == Parts` — everything is at the cap; the count is the floor and nothing is wrong.
-- `MergeBacklog > 0`, `MergeCandidates > 0` — a merge is coming on the next cycle.
+- `MergeBacklog > 0`, `MergeCandidates > 0` — a merge is due. It arrives on the next cycle unless
+  `merge.deferred` is climbing, which says the work is selected and waiting on the memory budget
+  rather than on the selector.
 - `MergeBacklog > 0`, `MergeCandidates == 0` — **stuck**: parts remain mergeable but none qualify.
   The metric engine waives its write-amplification guard after a few idle cycles and unwedges
   itself; the record engines do not. `Admin.CompactNow` breaks it either way.
@@ -215,6 +217,7 @@ Metric instruments (all prefixed `storage.`):
 | `ingest.sampled_dropped` / `ingest.overflowed` | `signal` | budgeted sampling / overflow routing |
 | `flush.total` / `flush.duration` / `flush.rows` / `flush.bytes` | `signal` | head flushes; `flush.bytes` is the part bytes written, the denominator of write amplification |
 | `merge.total` / `merge.duration` / `merge.parts_in` / `merge.bytes_in` / `merge.bytes_out` | `signal` | background merges; `bytes_out` against `flush.bytes` is how many times the engine rewrites what it ingests, `bytes_out`/`bytes_in` what one cycle gains |
+| `merge.deferred` | `signal` | merges that selected parts and could not claim the process merge memory budget, so compacted nothing and left the work for the next cycle. Any sustained rate says compaction is bounded by `MergeMemoryBytes` — raise it (or `MaintenanceConcurrency`, which caps how many merges the budget is divided into) if part counts climb with it |
 | `fetch.total` / `fetch.duration` / `fetch.series_matched` / `fetch.rows_returned` / `fetch.parts_scanned` | `signal` | reads; the metric engine's reads are streaming, so these are recorded when the iterator is **closed** — `duration` covers the whole iteration (the consumer's own per-batch work included) and `rows_returned` counts what was actually consumed |
 | `fetch.decode_budget_forced_admissions` | `signal` | queries admitted **over** the decode-memory ceiling after their wait stalled (see below); a non-zero rate means the ceiling is not holding |
 | `backend.ops` / `backend.bytes` / `backend.latency` | `op`(, `result`) | ops: read/write/list/delete/cas/size; results: ok/not_found/error |
@@ -435,3 +438,21 @@ The conditional put is never a multipart upload. `PutIfAbsent` and `CompareAndSw
 bucket-index and manifest commit points and stay single conditional requests, whatever their size;
 a multipart complete carries no precondition, so routing one through it would turn a CAS into an
 unconditional overwrite.
+
+## Merge memory admission (`MergeMemoryBytes`)
+
+Every engine in the process draws its merge memory from one budget. How many merges run at once is
+derived from that budget — enough that each gets a usable allowance — capped by the maintenance
+fan-out, so lowering `MergeMemoryBytes` buys **fewer, better-fed merges** rather than the same
+number of starved ones. A 16-core node with a 2 GiB limit runs 4 concurrent merges, not 16: the same
+total resident bytes, a longer compaction cycle in wall-clock.
+
+A background merge that finds the budget committed is **deferred**, not queued: it compacts nothing,
+increments `storage.merge.deferred`, and the next cycle retries it — ahead of the other engines, so
+the budget rotates instead of going to the highest-ingest tenants every cycle. The maintenance loop
+is one goroutine shared with size-triggered flushes, and parking it on a busy budget would hold back
+the memory relief the budget exists to bound.
+
+`Admin.Compact`, `Admin.CompactNow` and `Admin.Retention` **wait** for the budget instead of
+deferring, so an operator command never silently does nothing. `Admin.MaintainNow` runs the
+background cycle and therefore defers like it.

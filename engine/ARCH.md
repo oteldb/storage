@@ -410,16 +410,34 @@ understated what a merge may hold *and* overstated how many may hold it, at once
 the *request*, not measured residency: below the cap floors (`minMergeCapBytes` here,
 `MaxPartBytes` in `recordengine`) a merge can hold more than it asked for.
 
-**A background merge does not wait for its budget; it defers.** Admission is taken after selection,
-so a cycle with nothing to compact never consults the budget — and when the budget is committed the
-merge declines and the next cycle retries. Parking would be worse than it looks: the engine holds
-`flushMu` across the whole merge, and the facade runs maintenance on *one* goroutine that also
-services size-triggered flushes, so one waiting merge would hold back every engine's memory relief
-for the rest of the cycle — to bound the memory merges take. Only an operator-requested merge
-(`MergeOptions.Force`) waits, on its own goroutine and its own cancellable context.
+**A `MergeOptions.Background` merge does not wait for its budget; it defers.** Admission is taken
+after selection, so a cycle with nothing to compact never consults the budget — and when the budget
+is committed the merge declines and the next cycle retries. Parking would be worse than it looks:
+the facade runs maintenance on *one* goroutine that also services size-triggered flushes, so one
+waiting merge would hold back every engine's memory relief for the rest of the cycle — to bound the
+memory merges take.
+
+Waiting is the **default**, and `Background` is opt-in, set only by that loop: a merge someone asked
+for — an operator command, a test, an embedder driving the engine — must produce one, not a silent
+no-op. A waiting merge does hold its own engine's `flushMu`, which `merge` takes before reaching
+admission, so that engine's flush waits with it; the pool admits no new holders while anyone is
+queued, so the wait is at most one merge long.
+
+**A deferral is visible.** It increments `storage.merge.deferred` (`ADMIN.md`), sets
+`Engine.MergeDeferred`, and does *not* log "nothing to compact" — which is what it would otherwise
+look like. The facade sorts a deferred engine ahead of head-bytes pressure on its next pass, so the
+budget rotates rather than going to the highest-ingest engines every cycle, which would strand a
+quiet tenant's part count. The idle-waiver counter is zeroed only once a merge is admitted: a
+deferral has not broken the fixed point the waiver exists to escape.
 
 **The trade is throughput.** A 16-core node with a 2 GiB limit runs 4 concurrent merges rather than
 16 — the same total resident bytes, a longer compaction cycle in wall-clock.
+
+**The pool is sized once, at `Open`; a merge's request is computed per merge.** Both read the same
+`MergeMemoryBytes`, and a configured value cannot drift. A *derived* one re-reads `GOMEMLIMIT` per
+request (`internal/memlimit.Bytes`), so an embedder that changes the limit at runtime moves the
+requests without moving the pool: lowering it under-uses the pool, raising it makes each request
+larger than the pool, which clamps to the total and serializes merges.
 
 **Degenerate cases.** Backends that cannot report free space (`Memory`, object stores) keep the
 ceiling. A nearly full disk falls to `minMergeCapBytes` rather than sealing everything, since stranding

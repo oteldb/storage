@@ -1604,9 +1604,27 @@ type walSyncer interface{ SyncWAL() error }
 // swallowed: a transient backend failure must not crash the background loop, and the next
 // maintTask is one engine's maintenance work plus its flush pressure (head bytes), used to order
 // the cycle so the fullest heads flush first (fair scheduling — see maintain).
+// sortMaintTasks orders a cycle's work: engines whose last merge was deferred for want of the
+// memory budget first, then by flush pressure descending. [parallel.ForEach] dispatches in index
+// order, so this is what decides who gets the budget and who drains their head first — and the
+// deferred term is what keeps the budget from going to the same highest-ingest engines every cycle.
+func sortMaintTasks(tasks []maintTask) {
+	sort.SliceStable(tasks, func(i, j int) bool {
+		if tasks[i].deferred != tasks[j].deferred {
+			return tasks[i].deferred
+		}
+
+		return tasks[i].pressure > tasks[j].pressure
+	})
+}
+
 type maintTask struct {
 	run      func()
 	pressure int64
+	// deferred marks an engine whose last merge could not claim the process merge budget. Such an
+	// engine sorts ahead of pressure, so the budget rotates instead of going to the same
+	// highest-ingest engines every cycle.
+	deferred bool
 }
 
 // tick retries. In cluster mode only the tenants this node owns (its compaction claims) are
@@ -1735,7 +1753,12 @@ func (s *Storage) maintain(ctx context.Context) {
 	// identity, and because it runs on the owned path only — the live set is derived from this node's
 	// parts, so a replica mid-sync must not decide what is dead.
 	mergeMetrics := func(tid signal.TenantID, eng *engine.Engine) error {
-		if err := eng.MergeWith(ctx, s.metricMergeOptions(tid, sizeCutoffs[tid].at(signal.Metric))); err != nil {
+		opts := s.metricMergeOptions(tid, sizeCutoffs[tid].at(signal.Metric))
+		// This loop is the one caller that may skip a merge rather than wait for the memory budget:
+		// it runs on a single goroutine shared with flush pressure.
+		opts.Background = true
+
+		if err := eng.MergeWith(ctx, opts); err != nil {
 			return err
 		}
 
@@ -1759,7 +1782,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	}
 
 	for tid, eng := range metricEngines {
-		tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
+		tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), deferred: eng.MergeDeferred(), run: func() {
 			maintainEngine(tid, metricsPrefix, func() error { return eng.Flush(ctx) },
 				func() error { return mergeMetrics(tid, eng) },
 				func() error { return refreshMetrics(eng) },
@@ -1772,7 +1795,12 @@ func (s *Storage) maintain(ctx context.Context) {
 	// part set, since that is the only thing that kills a stream identity. A replica reaches it
 	// only through the refresh — it never merges.
 	mergeRecords := func(tid signal.TenantID, eng *recordengine.Engine, sig signal.Signal) error {
-		if err := eng.Merge(ctx, s.retainFrom(tid, sig, sizeCutoffs[tid].at(sig))); err != nil {
+		opts := recordengine.MergeOptions{
+			RetainFrom: s.retainFrom(tid, sig, sizeCutoffs[tid].at(sig)),
+			Background: true, // see mergeMetrics: this loop skips rather than waits
+		}
+
+		if err := eng.MergeWith(ctx, opts); err != nil {
 			return err
 		}
 
@@ -1793,7 +1821,7 @@ func (s *Storage) maintain(ctx context.Context) {
 
 	addRecord := func(engines map[signal.TenantID]*recordengine.Engine, sig signal.Signal, signalPrefix string) {
 		for tid, eng := range engines {
-			tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
+			tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), deferred: eng.MergeDeferred(), run: func() {
 				maintainEngine(tid, signalPrefix, func() error { return eng.Flush(ctx) },
 					func() error { return mergeRecords(tid, eng, sig) },
 					func() error { return refreshRecords(eng) },
@@ -1809,7 +1837,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	addRecord(exemplarEngines, signal.Exemplar, exemplarsPrefix)
 
 	s.maintStats.lastTasks.Store(int64(len(tasks)))
-	sort.Slice(tasks, func(i, j int) bool { return tasks[i].pressure > tasks[j].pressure })
+	sortMaintTasks(tasks)
 
 	parallel.ForEach(len(tasks), s.maintenanceConcurrency(), func(i int) { tasks[i].run() })
 

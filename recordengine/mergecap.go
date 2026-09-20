@@ -53,15 +53,18 @@ func (e *Engine) mergeMemoryBudgetBytes() int64 {
 // admitMerge reserves the memory this merge intends to hold. It is called once the merge knows it
 // has work, so a no-op cycle never consults the budget at all.
 //
-// A background merge does not wait: the engine holds flushMu across its whole body, and the
-// facade's maintenance loop is one goroutine shared with flush pressure, so parking here would
-// delay every engine's flush — the mechanism that gives memory back — to bound the memory merges
-// take. It declines instead and the next cycle retries. An operator-requested merge waits, on its
-// own goroutine and its own cancellable context.
-func (e *Engine) admitMerge(ctx context.Context, force bool) (func(), bool, error) {
+// A [MergeOptions.Background] merge does not wait: the facade's maintenance loop is one goroutine
+// shared with flush pressure, so parking there would delay every engine's flush — the mechanism
+// that gives memory back — in order to bound the memory merges take. It declines and the next cycle
+// retries. Every other caller waits, because a merge someone asked for must not silently no-op.
+//
+// Waiting still holds this engine's flushMu, which the merge takes before reaching here, so a
+// waiting merge delays its own engine's flush for as long as it queues. That is bounded: the pool
+// admits no new holders while anyone is queued, so the wait is at most one merge long.
+func (e *Engine) admitMerge(ctx context.Context, background bool) (func(), bool, error) {
 	if e.cfg.MergeAdmission == nil {
 		return func() {}, true, nil
 	}
 
-	return e.cfg.MergeAdmission(ctx, e.mergeMemoryBudgetBytes(), force)
+	return e.cfg.MergeAdmission(ctx, e.mergeMemoryBudgetBytes(), !background)
 }
