@@ -100,12 +100,30 @@ func (e *Engine) mergeMemoryBudgetBytes() int64 {
 	return memlimit.MergeShare(e.cfg.MergeMemoryBytes, e.mergeConcurrency(), 1)
 }
 
-// mergeConcurrency is how many merges may be running against this engine's backend at once, per
-// [Config.MergeConcurrency]. It divides both the disk and the memory a single merge may claim.
+// mergeConcurrency is how many merges may be running against this engine's backend at once. It
+// divides both the disk and the memory a single merge may claim, so it is derived from the memory
+// budget — enough merges that each gets a usable allowance — with [Config.MergeConcurrency] as the
+// ceiling rather than the divisor.
 func (e *Engine) mergeConcurrency() int {
-	if e.cfg.MergeConcurrency == nil {
-		return 1
+	cpu := 1
+	if e.cfg.MergeConcurrency != nil {
+		cpu = e.cfg.MergeConcurrency()
 	}
 
-	return max(e.cfg.MergeConcurrency(), 1)
+	return memlimit.MergeConcurrency(e.cfg.MergeMemoryBytes, cpu)
+}
+
+// admitMerge reserves the memory this merge intends to hold, blocking until the process has it to
+// spare. It is called once the merge knows it has work: a no-op cycle must not queue behind a merge
+// that is running, or one busy engine would stall every other engine's maintenance pass.
+//
+// The engine holds flushMu across the whole merge, so a merge waiting here also delays this engine's
+// next flush. That is the intended back-pressure — the alternative is merges that collectively hold
+// more than the process has — but it is why admission is taken after selection and not before.
+func (e *Engine) admitMerge(ctx context.Context) (func(), error) {
+	if e.cfg.MergeAdmission == nil {
+		return func() {}, nil
+	}
+
+	return e.cfg.MergeAdmission(ctx, e.mergeMemoryBudgetBytes())
 }

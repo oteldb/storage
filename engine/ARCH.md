@@ -370,9 +370,10 @@ Splitting at row boundaries is safe: parts are independent, and a series spannin
 by the read seam.
 
 ```
+concurrency   = clamp( mergeMemory / 64 MiB, 1, MergeConcurrency )   ← memory decides, cores cap
 mergeCapBytes = min( MergeCeilingBytes,
-                     free        / MergeConcurrency / 2,
-                     mergeMemory / MergeConcurrency / 2 )  ← whole-object backends only
+                     free        / concurrency / 2,
+                     mergeMemory / concurrency / 2 )  ← whole-object backends only
 ```
 
 **Why not a constant:** cardinality spends the budget in *breadth*, so a fixed cap shrinks a part's
@@ -380,11 +381,28 @@ time span as active series grow, and a fixed-range query opens proportionally mo
 references size against storage instead (VictoriaMetrics `getMaxOutBytes`, ClickHouse
 `max_bytes_to_merge_at_max_space_in_pool` lowered by free space).
 
-**Why divided:** by `MergeConcurrency`, so concurrent merges cannot collectively fill the disk; halved
+**Why divided:** by the concurrency, so concurrent merges cannot collectively fill the disk; halved
 again to let a merge's output coexist with inputs it has not yet retired. `MergeConcurrency` is a
 **callback**, since fan-out is bounded by the node's engine count as much as by the worker limit and
 engines appear lazily; fixed at engine creation it would divide a single-tenant node's disk by its core
 count, leaving a 32-core box a thirty-second of it.
+
+**The divisor is a memory quantity, not a core count.** `MergeConcurrency` is the *ceiling*;
+`memlimit.MergeConcurrency` lowers it to however many merges the budget can give a usable allowance,
+64 MiB each — the read side of a streaming merge (k sources × columns × the read-ahead window).
+Dividing by the core count instead prices memory in CPUs: a 16-core pod with a 4 GiB limit would hand
+each merge 32 MiB and produce a great many merges too small to keep up with ingest. VictoriaMetrics
+makes the same split from the other side — its merge workers are CPU-bound and CPU-counted, while
+`memory.Allowed()` sizes the *parts* (`getMaxInmemoryPartSize`, `getMaxSmallPartSize`).
+
+**And the division is enforced, not assumed.** `internal/memlimit.Pool` is a process-wide byte
+semaphore that every engine of every signal draws on through `Config.MergeAdmission`; a merge
+reserves its resident share once it has selected sources and holds it until it ends. Without it the
+share is arithmetic nobody keeps: the facade fans merges out on its own schedule, so the division
+understated what a merge may hold *and* overstated how many may hold it, at once. Admission is taken
+**after** selection so an engine with nothing to compact never queues behind one that has work; the
+cost is that a merge waiting for bytes also delays its own engine's next flush, since `flushMu` spans
+the whole merge.
 
 **Degenerate cases.** Backends that cannot report free space (`Memory`, object stores) keep the
 ceiling. A nearly full disk falls to `minMergeCapBytes` rather than sealing everything, since stranding

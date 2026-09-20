@@ -144,6 +144,11 @@ type Options struct {
 	// still holds. Either way it is what keeps compaction inside the memory budget. Zero ⇒ a share of
 	// GOMEMLIMIT (a fixed default when the process declares no limit); negative ⇒ unbounded, for an
 	// embedder that bounds merge memory itself.
+	//
+	// It also decides how many merges run at once: the budget admits as many as can each hold a
+	// usable allowance, up to [Options.MaintenanceConcurrency]. Lowering it therefore buys fewer,
+	// better-fed merges rather than the same number of starved ones — a merge admitted with too
+	// little memory compacts fewer parts per pass than the next flush adds.
 	MergeMemoryBytes int64
 
 	// MinFreeBytes is the headroom each engine leaves unused on a backend that reports free space.

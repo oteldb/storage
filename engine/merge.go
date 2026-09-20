@@ -124,6 +124,14 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 
 	e.idleMerges.Store(0)
 
+	// Past here the merge decodes and buffers, so this is where its memory allowance must be one it
+	// actually holds rather than one it assumed.
+	release, err := e.admitMerge(ctx)
+	if err != nil {
+		return mergeResult{}, err
+	}
+	defer release()
+
 	bytesIn := partsBytes(selected)
 
 	start := minInt64

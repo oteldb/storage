@@ -4,6 +4,7 @@ import (
 	"context"
 	"io/fs"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,6 +21,7 @@ import (
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/fetch"
@@ -79,6 +81,12 @@ type Storage struct {
 	// maxQueryBytes is the per-query read bound ([Options.MaxQueryBytes]) resolved once against the
 	// process memory budget. 0 ⇒ no limiter is installed at all.
 	maxQueryBytes int64
+
+	// mergePool is the process-wide merge-memory admission budget ([Options.MergeMemoryBytes]),
+	// shared by every engine of every signal: they run in one process against one memory limit, and
+	// the maintenance loop fans them out together. Without it each engine's per-merge share is
+	// arithmetic nobody enforces. nil ⇒ unlimited.
+	mergePool *memlimit.Pool
 
 	admitMu sync.Mutex                           // guards admit
 	admit   map[signal.TenantID]*tenantAdmission // per-tenant admission state (rate valve + counters)
@@ -142,6 +150,12 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	}
 
 	s.maxQueryBytes = readbudget.ProcessShare(o.MaxQueryBytes)
+	// An opted-out budget (MergeMemoryBytes < 0) is unbounded, and an unbounded pool is not the same
+	// thing as a very large one: each merge would ask for the whole of it and they would run one at a
+	// time. Install no pool instead.
+	if budget := memlimit.MergeBudget(o.MergeMemoryBytes); budget < math.MaxInt64 {
+		s.mergePool = memlimit.NewPool(budget)
+	}
 
 	observer, err := obs.New(obs.Config{Logger: o.Logger, TracerProvider: o.TracerProvider, MeterProvider: o.MeterProvider})
 	if err != nil {
@@ -1305,6 +1319,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		// and the part count a query opens — tracks the deployment rather than a constant.
 		MergeCeilingBytes: limits.MaxMergePartSize,
 		MergeConcurrency:  s.mergeConcurrency,
+		MergeAdmission:    s.admitMerge,
 		MergeMemoryBytes:  s.opts.MergeMemoryBytes,
 		MinFreeBytes:      s.opts.MinFreeBytes,
 		MinFreeInodes:     s.opts.MinFreeInodes,
@@ -1944,11 +1959,19 @@ func (s *Storage) recordEnginesBySignal() map[signal.Signal]map[signal.TenantID]
 	return out
 }
 
-// mergeConcurrency is how many merges may realistically run at once — the maintenance fan-out,
-// bounded by the number of engines there are to merge. It divides both the free space and the
-// memory a single merge may claim, so a single-engine node divides by one rather than by its core
-// count. Every signal's engines count: they share one process and one disk, and the maintenance
-// loop merges them through the same fan-out.
+// admitMerge reserves bytes from the process-wide merge budget, blocking until they are free. It is
+// what makes each engine's per-merge share real: every engine in the process draws on one pool, so
+// concurrent merges cannot collectively hold more than [Options.MergeMemoryBytes].
+func (s *Storage) admitMerge(ctx context.Context, bytes int64) (func(), error) {
+	return s.mergePool.Acquire(ctx, bytes)
+}
+
+// mergeConcurrency is the *ceiling* on how many merges may run at once — the maintenance fan-out,
+// bounded by the number of engines there are to merge. The engines lower it further from their
+// memory budget ([memlimit.MergeConcurrency]), so a small-memory node runs few merges with a usable
+// allowance each rather than many that each hold too little to make progress. Every signal's
+// engines count: they share one process and one disk, and the maintenance loop merges them through
+// the same fan-out.
 func (s *Storage) mergeConcurrency() int {
 	s.tmu.Lock()
 	n := len(s.tenants) + len(s.logTenants) + len(s.traceTenants) + len(s.profileTenants) + len(s.exemplarTenants)

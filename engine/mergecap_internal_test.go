@@ -148,6 +148,27 @@ func TestMergeCapBytes(t *testing.T) {
 			want:        512 << 20,
 		},
 		{
+			// The core count is a ceiling, not the divisor. 256 MiB across 16 cores would give each
+			// merge 8 MiB — the floor, i.e. no merge worth running — so the budget supports four
+			// merges instead, and each gets 256/4/2 = 32 MiB.
+			name:        "memory lowers concurrency below the core count",
+			ceiling:     1 << 40,
+			memory:      256 << 20,
+			concurrency: 16,
+			backend:     backend.Memory(),
+			want:        32 << 20,
+		},
+		{
+			// The same budget on a single-core node: nothing to lower, and the whole budget is one
+			// merge's.
+			name:        "one core takes the whole budget",
+			ceiling:     1 << 40,
+			memory:      256 << 20,
+			concurrency: 1,
+			backend:     backend.Memory(),
+			want:        128 << 20,
+		},
+		{
 			name:    "a memory budget below the floor still merges",
 			ceiling: 1 << 40,
 			memory:  1 << 10,

@@ -130,6 +130,14 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{parts: dropped}, nil
 	}
 
+	// Past here the merge decodes every selected part and buffers the output, so this is where its
+	// memory allowance must be one it actually holds rather than one it assumed.
+	release, err := e.admitMerge(ctx)
+	if err != nil {
+		return mergeResult{parts: dropped}, err
+	}
+	defer release()
+
 	start := minInt64
 	if retainFrom > 0 {
 		start = retainFrom

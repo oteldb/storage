@@ -79,6 +79,15 @@ type Config struct {
 	// MergeConcurrency reports how many merges may run concurrently in this process, dividing the
 	// merge memory allowance so they cannot collectively exceed it. nil or ≤ 1 ⇒ no division.
 	MergeConcurrency func() int
+
+	// MergeAdmission gates a merge on the memory it intends to hold: it is called once a merge has
+	// selected its sources, with the bytes that merge may hold resident, and returns the function
+	// that hands them back. Blocking is the point — a budget divided across concurrent merges is
+	// only real if something stops more than that many from starting.
+	//
+	// It is called *after* selection, so a cycle with nothing to compact never queues behind a merge
+	// that does. nil admits every merge, which is the single-engine and test default.
+	MergeAdmission func(ctx context.Context, bytes int64) (release func(), err error)
 	// MergeCompression block-compresses the columns of merged (compacted) parts on top of their chunk
 	// codecs — the cold, long-lived data. Flushed parts stay codec-only so ingest is cheap; the
 	// background merge is where recompression is amortized. Record byte columns are dict-coded but not

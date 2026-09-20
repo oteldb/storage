@@ -88,6 +88,15 @@ type Config struct {
 	// by its worker limit, and engines appear lazily. Fixing it at engine creation would divide a
 	// single-tenant node's disk by its core count, undoing most of the widening.
 	MergeConcurrency func() int
+
+	// MergeAdmission gates a merge on the memory it intends to hold: it is called once a merge has
+	// selected its sources, with the bytes that merge may hold resident, and returns the function
+	// that hands them back. Blocking is the point — a budget divided across concurrent merges is
+	// only real if something stops more than that many from starting.
+	//
+	// It is called *after* selection, so a cycle with nothing to compact never queues behind a merge
+	// that does. nil admits every merge, which is the single-engine and test default.
+	MergeAdmission func(ctx context.Context, bytes int64) (release func(), err error)
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each part,
 	// so [Engine.AggregateRange] answers a range-covering aggregate from it without decoding the
 	// value column. It costs a little storage per series; off by default. AggregateRange works
