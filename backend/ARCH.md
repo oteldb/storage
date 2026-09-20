@@ -263,15 +263,40 @@ a demonstration.
   incrementally: `Write` appends, `Commit` publishes atomically (nothing is visible under the key
   before it), `Abort` discards and is a no-op after a commit. `file` implements it with the same
   temp+fsync+rename+dirsync it writes whole objects with, so the bytes reach the filesystem as they
-  are produced; `Memory` and `s3` do not, and `backend.CreateObject` buffers into a single `Write` for
-  them, so callers stream unconditionally. Several writers may target one key — that is how a
-  part's rival codecs race, only the winner committing. It exists for the one object class far
+  are produced; `s3` implements it with a **multipart upload** (below); `Memory` does not, and
+  `backend.CreateObject` buffers into a single `Write` for it, so callers stream unconditionally.
+  Several writers may target one key — that is how a part's rival codecs race, only the winner
+  committing. It exists for the one object class far
   larger than the writer wants resident: a merged part's column (`block/ARCH.md`, "Two writers").
-  `backend.StreamsWrites(b)` answers whether the fallback would be taken, which is a *sizing*
-  question — the merge cap stops pricing part size against memory when it would not be
-  (`engine/ARCH.md`). **A wrapper must forward it**, and must not claim it over an inner backend
-  that lacks it: `Cached` returns a second type that carries `CreateObject` only in that case,
-  rather than a method that would always answer yes.
+  The interface carries a **second method, `StreamsWrites() bool`** — the *sizing* question, which
+  the merge cap prices part size against (`engine/ARCH.md`) — because the two are different
+  questions and only one of them is about the method set. A wrapper implements `CreateObject`
+  unconditionally (forwarding through the helper is correct over any inner, and a wrapper usually
+  has to wrap the returned writer anyway — the read cache invalidates on commit, the metered backend
+  counts there), and answers `StreamsWrites` for the backend beneath it. **Making the claim a value
+  is what keeps it honest:** a wrapper that omits it does not compile, where a wrapper that forgot
+  to add itself to a per-capability variant type compiles and lies. `NodeLocal` is the same shape
+  for the same reason. The alternative — a wrapper type per capability it forwards — costs
+  2^capabilities types per wrapper to guard a bug that this removes outright.
+- **`s3.MultipartObjectStore`** — optional on the `ObjectStore` seam beside `RangeObjectStore`
+  (`CreateMultipartUpload`/`UploadPart`/`CompleteMultipartUpload`/`AbortMultipartUpload`), and what
+  makes `ObjectCreator` available over S3. The writer accumulates **8 MiB** before starting an
+  upload at all — above S3's 5 MiB minimum part size, and far enough above it that a large column
+  stays well inside the 10,000-part limit — so every small object (marks, manifest, watermark,
+  small columns) commits as one `PutObject` and creates no upload. The conditional put is **never**
+  multipart: it is the bucket-index and manifest commit point, and a multipart complete carries no
+  precondition. `retryStore` wraps the capability and **returns it beside the store** rather than
+  folding it into the store's type, and `s3.Backend` holds the store, its ranged reads and its
+  multipart uploads as three fields resolved once at construction — which also keeps an interface
+  assertion off the ranged-read path a merge takes per frame. `UploadPart` retries freely (a part number names its
+  slot, so a re-send replaces itself) while `CompleteMultipartUpload` retries only where the request
+  provably never reached the server, the conditional put's rule — S3 can answer a complete 200 with
+  an error body, so an uncertain result does not say whether the object became visible. `Abort`
+  detaches its context's cancellation, because the merge that aborts is usually the merge whose
+  context just died.
+  **An incomplete upload is not an object**: it appears in no listing, so no orphan sweep can
+  reclaim it, and the bucket's `AbortIncompleteMultipartUpload` lifecycle rule is the only thing
+  that ever does (`ADMIN.md`).
 - **`backend.DeferredSyncer`** — optional `WriteDeferred`/`CreateObjectDeferred`/`DeleteDeferred`
   plus `SyncPrefix(prefix)`: a part's objects are made durable once, not one by one. **A part is
   unreachable until the bucket-index CAS names it**, so its objects need to be on the disk before

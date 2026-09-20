@@ -26,6 +26,10 @@ func (f *File) CreateObject(_ context.Context, key string) (backend.ObjectWriter
 	return f.createObject(key, true)
 }
 
+// StreamsWrites reports true: the bytes reach the filesystem as they are produced. Implements
+// [backend.ObjectCreator].
+func (*File) StreamsWrites() bool { return true }
+
 // CreateObjectDeferred is [File.CreateObject] whose commit leaves the name for [File.SyncPrefix].
 // Implements [backend.DeferredSyncer].
 func (f *File) CreateObjectDeferred(_ context.Context, key string) (backend.ObjectWriter, error) {

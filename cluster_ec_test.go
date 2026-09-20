@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/ec"
 	"github.com/oteldb/storage/cluster/etcd"
@@ -491,4 +492,33 @@ func TestClusterECShardRepair(t *testing.T) {
 		require.Lenf(t, got, 1, "%s serves the series post-repair", id)
 		assert.Equalf(t, vals, got[0].Values, "%s values", id)
 	}
+}
+
+// TestECBackendClaimsStreamingOnlyWhenInnerDoes is the capability rule at the EC wrapper. An EC
+// tenant's objects are plain full copies written straight through, so the wrapper must pass the
+// streaming capability along — and must not invent one, since a merge sizes its output part
+// against the answer.
+func TestECBackendClaimsStreamingOnlyWhenInnerDoes(t *testing.T) {
+	t.Parallel()
+
+	assert.False(t, backend.StreamsWrites(&ecBackend{inner: backend.Memory()}))
+
+	streaming, err := file.New(t.TempDir())
+	require.NoError(t, err)
+
+	wrapped := &ecBackend{inner: streaming}
+	require.True(t, backend.StreamsWrites(wrapped))
+
+	ctx := context.Background()
+
+	w, err := backend.CreateObject(ctx, wrapped, "part/col")
+	require.NoError(t, err)
+
+	_, err = w.Write([]byte("streamed"))
+	require.NoError(t, err)
+	require.NoError(t, w.Commit(ctx))
+
+	got, err := wrapped.Read(ctx, "part/col")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("streamed"), got)
 }

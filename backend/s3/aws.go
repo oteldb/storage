@@ -9,6 +9,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithy "github.com/aws/smithy-go"
 	"github.com/go-faster/errors"
 )
@@ -22,6 +23,16 @@ type AWSAPI interface {
 	HeadObject(ctx context.Context, in *awss3.HeadObjectInput, optFns ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error)
 	DeleteObject(ctx context.Context, in *awss3.DeleteObjectInput, optFns ...func(*awss3.Options)) (*awss3.DeleteObjectOutput, error)
 	ListObjectsV2(ctx context.Context, in *awss3.ListObjectsV2Input, optFns ...func(*awss3.Options)) (*awss3.ListObjectsV2Output, error)
+	CreateMultipartUpload(
+		ctx context.Context, in *awss3.CreateMultipartUploadInput, optFns ...func(*awss3.Options),
+	) (*awss3.CreateMultipartUploadOutput, error)
+	UploadPart(ctx context.Context, in *awss3.UploadPartInput, optFns ...func(*awss3.Options)) (*awss3.UploadPartOutput, error)
+	CompleteMultipartUpload(
+		ctx context.Context, in *awss3.CompleteMultipartUploadInput, optFns ...func(*awss3.Options),
+	) (*awss3.CompleteMultipartUploadOutput, error)
+	AbortMultipartUpload(
+		ctx context.Context, in *awss3.AbortMultipartUploadInput, optFns ...func(*awss3.Options),
+	) (*awss3.AbortMultipartUploadOutput, error)
 }
 
 // NewAWS returns an [ObjectStore] backed by an aws-sdk-go-v2 S3 client over the given bucket.
@@ -167,6 +178,81 @@ func (s *awsStore) PutObjectIfVersion(
 	}
 
 	return unquoteETag(out.ETag), true, nil
+}
+
+// CreateMultipartUpload starts an upload for key. Implements [MultipartObjectStore].
+func (s *awsStore) CreateMultipartUpload(ctx context.Context, key string) (string, error) {
+	out, err := s.api.CreateMultipartUpload(ctx, &awss3.CreateMultipartUploadInput{Bucket: &s.bucket, Key: &key})
+	if err != nil {
+		return "", errors.Wrapf(err, "create multipart upload %q", key)
+	}
+
+	if out.UploadId == nil {
+		return "", errors.Errorf("no upload id for %q", key)
+	}
+
+	return *out.UploadId, nil
+}
+
+// UploadPart stores one part of an upload. Implements [MultipartObjectStore].
+func (s *awsStore) UploadPart(
+	ctx context.Context, key, uploadID string, partNum int32, data []byte,
+) (string, error) {
+	out, err := s.api.UploadPart(ctx, &awss3.UploadPartInput{
+		Bucket: &s.bucket, Key: &key, UploadId: &uploadID, PartNumber: &partNum, Body: bytes.NewReader(data),
+	})
+	if err != nil {
+		return "", errors.Wrapf(err, "upload part %d of %q", partNum, key)
+	}
+
+	return unquoteETag(out.ETag), nil
+}
+
+// CompleteMultipartUpload publishes the uploaded parts as the object. The part list is etags in
+// order, numbered from 1 exactly as [awsStore.UploadPart] numbered them. Implements
+// [MultipartObjectStore].
+func (s *awsStore) CompleteMultipartUpload(ctx context.Context, key, uploadID string, etags []string) error {
+	parts := make([]types.CompletedPart, len(etags))
+	for i, etag := range etags {
+		parts[i] = types.CompletedPart{ETag: aws.String(quoteETag(etag)), PartNumber: aws.Int32(int32(i + 1))}
+	}
+
+	if _, err := s.api.CompleteMultipartUpload(ctx, &awss3.CompleteMultipartUploadInput{
+		Bucket: &s.bucket, Key: &key, UploadId: &uploadID,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	}); err != nil {
+		return errors.Wrapf(err, "complete multipart upload %q", key)
+	}
+
+	return nil
+}
+
+// AbortMultipartUpload discards an upload and its parts. An upload the store no longer knows is
+// already gone, so that answer is success. Implements [MultipartObjectStore].
+func (s *awsStore) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
+	if _, err := s.api.AbortMultipartUpload(ctx, &awss3.AbortMultipartUploadInput{
+		Bucket: &s.bucket, Key: &key, UploadId: &uploadID,
+	}); err != nil {
+		if isNoSuchUpload(err) {
+			return nil
+		}
+
+		return errors.Wrapf(err, "abort multipart upload %q", key)
+	}
+
+	return nil
+}
+
+// isNoSuchUpload reports whether err says the upload is unknown to the store — already aborted,
+// already completed, or reaped by the bucket's lifecycle rule. All three mean there is nothing
+// left to abort.
+func isNoSuchUpload(err error) bool {
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		return ae.ErrorCode() == "NoSuchUpload"
+	}
+
+	return false
 }
 
 // quoteETag renders an ETag as the conditional headers require it, quoted.

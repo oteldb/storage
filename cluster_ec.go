@@ -149,6 +149,7 @@ var (
 	_ backend.Backend        = (*ecBackend)(nil)
 	_ backend.Viewer         = (*ecBackend)(nil)
 	_ backend.DeferredSyncer = (*ecBackend)(nil)
+	_ backend.ObjectCreator  = (*ecBackend)(nil)
 )
 
 // Read returns the object under key, reconstructing an erasure-coded part object when no full
@@ -221,6 +222,17 @@ func (e *ecBackend) WriteDeferred(ctx context.Context, key string, data []byte) 
 func (e *ecBackend) CreateObjectDeferred(ctx context.Context, key string) (backend.ObjectWriter, error) {
 	return backend.CreateObjectDeferred(ctx, e.inner, key)
 }
+
+// CreateObject forwards the incremental write. An EC tenant's objects are written as plain full
+// copies — only reads of already-converted parts differ — so there is nothing to intercept here.
+// Implements [backend.ObjectCreator].
+func (e *ecBackend) CreateObject(ctx context.Context, key string) (backend.ObjectWriter, error) {
+	return backend.CreateObject(ctx, e.inner, key)
+}
+
+// StreamsWrites answers for the raw backend: the EC wrapper changes reads, not writes. Implements
+// [backend.ObjectCreator].
+func (e *ecBackend) StreamsWrites() bool { return backend.StreamsWrites(e.inner) }
 
 func (e *ecBackend) SyncPrefix(ctx context.Context, prefix string) error {
 	return backend.SyncPrefix(ctx, e.inner, prefix)
