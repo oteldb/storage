@@ -5,28 +5,27 @@ import (
 	"context"
 	"slices"
 
-	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/internal/mergestream"
 )
 
-// sortedSeriesIDs returns the union of every series id across src, sorted, so a compaction visits
-// each series once in (series, ts) part order.
-func sortedSeriesIDs(ctx context.Context, src []*part) ([]signal.SeriesID, error) {
-	idSet := make(map[signal.SeriesID]struct{})
+// mergeKeys arms k over the union of every series id across src, so a compaction visits each series
+// once in (series, ts) part order without building a set of them. A paged index resolves its
+// entries here, up front, so the traversal itself cannot fail.
+func mergeKeys(ctx context.Context, src []*part, k *mergestream.Keys) error {
+	sources := make([]mergestream.Source, len(src))
 
-	for _, p := range src {
-		if err := p.index.forEachID(ctx, func(id signal.SeriesID) { idSet[id] = struct{}{} }); err != nil {
-			return nil, err
+	for i, p := range src {
+		s, err := p.index.idSource(ctx)
+		if err != nil {
+			return err
 		}
+
+		sources[i] = s
 	}
 
-	ids := make([]signal.SeriesID, 0, len(idSet))
-	for id := range idSet {
-		ids = append(ids, id)
-	}
+	k.Reset(sources)
 
-	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
-
-	return ids, nil
+	return nil
 }
 
 // Size-tiered compaction (DESIGN.md §4). The engine does not re-merge its whole part set on every

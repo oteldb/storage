@@ -11,6 +11,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/internal/memlimit"
+	"github.com/oteldb/storage/internal/mergestream"
 )
 
 // The merge cap is the size a merged part grows to before it is sealed, in bytes on disk. It is
@@ -89,6 +90,12 @@ func (e *Engine) mergeCapBytes(ctx context.Context) int64 {
 // part the process cannot hold.
 func (e *Engine) mergeMemoryCapBytes(concurrency int) int64 {
 	return memlimit.MergeShare(e.cfg.MergeMemoryBytes, concurrency, mergeBufferAmplification)
+}
+
+// mergeBudget is the pair a streamed merge seals an output part on: capBytes on disk, and this
+// merge's share of memory resident. The two are separate units and neither bounds the other.
+func (e *Engine) mergeBudget(capBytes int64) mergestream.Budget {
+	return mergestream.Budget{DiskBytes: capBytes, ResidentBytes: e.mergeMemoryBudgetBytes()}
 }
 
 // mergeMemoryBudgetBytes is what one merge may hold resident, the bound that replaces the part-size

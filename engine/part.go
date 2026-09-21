@@ -13,6 +13,7 @@ import (
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
+	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
@@ -143,6 +144,32 @@ func (idx partIndex) forEachID(ctx context.Context, fn func(signal.SeriesID)) er
 
 	return nil
 }
+
+// idSource exposes the part's ascending series ids to a k-way merge. A paged index resolves its
+// entries once here, so indexing them afterwards needs neither a context nor an error path.
+func (idx partIndex) idSource(ctx context.Context) (mergestream.Source, error) {
+	p := idx.paged
+	if p == nil {
+		return mergestream.SeriesIDs(idx.ids), nil
+	}
+
+	ents, err := p.entries(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return sidxIDs{ents: ents, n: p.n}, nil
+}
+
+// sidxIDs reads ids straight out of the on-disk sidecar's fixed-width entries, so a merge over a
+// paged part materializes no id slice.
+type sidxIDs struct {
+	ents []byte
+	n    int
+}
+
+func (s sidxIDs) Len() int                 { return s.n }
+func (s sidxIDs) At(i int) signal.SeriesID { return sidxEntryID(s.ents, i) }
 
 // forEachRange calls fn for every series in the part with its row range, ascending by id.
 func (idx partIndex) forEachRange(ctx context.Context, fn func(signal.SeriesID, rowRange)) error {
