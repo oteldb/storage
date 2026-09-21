@@ -4,6 +4,7 @@ import (
 	"context"
 	"io/fs"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,6 +21,7 @@ import (
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/query/fetch"
@@ -79,6 +81,12 @@ type Storage struct {
 	// maxQueryBytes is the per-query read bound ([Options.MaxQueryBytes]) resolved once against the
 	// process memory budget. 0 ⇒ no limiter is installed at all.
 	maxQueryBytes int64
+
+	// mergePool is the process-wide merge-memory admission budget ([Options.MergeMemoryBytes]),
+	// shared by every engine of every signal: they run in one process against one memory limit, and
+	// the maintenance loop fans them out together. Without it each engine's per-merge share is
+	// arithmetic nobody enforces. nil ⇒ unlimited.
+	mergePool *memlimit.Pool
 
 	admitMu sync.Mutex                           // guards admit
 	admit   map[signal.TenantID]*tenantAdmission // per-tenant admission state (rate valve + counters)
@@ -142,6 +150,12 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	}
 
 	s.maxQueryBytes = readbudget.ProcessShare(o.MaxQueryBytes)
+	// An opted-out budget (MergeMemoryBytes < 0) is unbounded, and an unbounded pool is not the same
+	// thing as a very large one: each merge would ask for the whole of it and they would run one at a
+	// time. Install no pool instead.
+	if budget := memlimit.MergeBudget(o.MergeMemoryBytes); budget < math.MaxInt64 {
+		s.mergePool = memlimit.NewPool(budget)
+	}
 
 	observer, err := obs.New(obs.Config{Logger: o.Logger, TracerProvider: o.TracerProvider, MeterProvider: o.MeterProvider})
 	if err != nil {
@@ -1305,6 +1319,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		// and the part count a query opens — tracks the deployment rather than a constant.
 		MergeCeilingBytes: limits.MaxMergePartSize,
 		MergeConcurrency:  s.mergeConcurrency,
+		MergeAdmission:    s.admitMerge,
 		MergeMemoryBytes:  s.opts.MergeMemoryBytes,
 		MinFreeBytes:      s.opts.MinFreeBytes,
 		MinFreeInodes:     s.opts.MinFreeInodes,
@@ -1585,15 +1600,33 @@ func (s *Storage) recordWALSync(ctx context.Context, errs []error) {
 // record engine expose SyncWAL, so the loop fans out over them uniformly.
 type walSyncer interface{ SyncWAL() error }
 
-// maintain flushes then merges (with retention) every tenant engine once. Errors are
-// swallowed: a transient backend failure must not crash the background loop, and the next
-// maintTask is one engine's maintenance work plus its flush pressure (head bytes), used to order
-// the cycle so the fullest heads flush first (fair scheduling — see maintain).
+// maintTask is one engine's maintenance work, plus the two keys the cycle is ordered by.
 type maintTask struct {
 	run      func()
-	pressure int64
+	pressure int64 // head bytes: the fullest heads flush first
+	// deferred marks an engine whose last merge could not claim the process merge budget.
+	deferred bool
 }
 
+// sortMaintTasks orders a cycle's work: engines whose last merge was deferred for want of the
+// merge-memory budget first, then by flush pressure descending, so the fullest heads flush first.
+//
+// The deferred key only bites when there are more engines than maintenance workers. Below that
+// [parallel.ForEach] raises its limit to the task count and starts every task at once, so index
+// order decides nothing and which engine reaches the budget first is decided by how long its flush
+// took — which is #646: a deferred engine can lose that race every cycle.
+func sortMaintTasks(tasks []maintTask) {
+	sort.SliceStable(tasks, func(i, j int) bool {
+		if tasks[i].deferred != tasks[j].deferred {
+			return tasks[i].deferred
+		}
+
+		return tasks[i].pressure > tasks[j].pressure
+	})
+}
+
+// maintain flushes then merges (with retention) every tenant engine once. Errors are
+// swallowed: a transient backend failure must not crash the background loop, and the next
 // tick retries. In cluster mode only the tenants this node owns (its compaction claims) are
 // flushed/merged, so exactly one node writes a tenant's parts to the shared object store.
 func (s *Storage) maintain(ctx context.Context) {
@@ -1708,10 +1741,11 @@ func (s *Storage) maintain(ctx context.Context) {
 	// across engines parallelizes freely. Build one flat work list and fan out under a bound — a
 	// sequential pass would take the sum of every engine's compaction I/O.
 	//
-	// Fair scheduling: the work list is ordered by flush pressure (head bytes) descending, and
-	// parallel.ForEach dispatches in index order, so the fullest heads flush first within a cycle.
-	// This keeps one noisy tenant from delaying the relief of others when the work exceeds the
-	// concurrency bound, and drains the most in-flight memory soonest.
+	// Fair scheduling: the work list is ordered by a deferred merge first and then by flush pressure
+	// (head bytes) descending, and parallel.ForEach dispatches in index order, so the fullest heads
+	// flush first within a cycle. This keeps one noisy tenant from delaying the relief of others when
+	// the work exceeds the concurrency bound, and drains the most in-flight memory soonest. See
+	// sortMaintTasks for what the deferred key does and does not buy.
 	tasks := make([]maintTask, 0,
 		len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines)+len(exemplarEngines))
 
@@ -1720,7 +1754,12 @@ func (s *Storage) maintain(ctx context.Context) {
 	// identity, and because it runs on the owned path only — the live set is derived from this node's
 	// parts, so a replica mid-sync must not decide what is dead.
 	mergeMetrics := func(tid signal.TenantID, eng *engine.Engine) error {
-		if err := eng.MergeWith(ctx, s.metricMergeOptions(tid, sizeCutoffs[tid].at(signal.Metric))); err != nil {
+		opts := s.metricMergeOptions(tid, sizeCutoffs[tid].at(signal.Metric))
+		// This loop is the one caller that may skip a merge rather than wait for the memory budget:
+		// it runs on a single goroutine shared with flush pressure.
+		opts.Background = true
+
+		if err := eng.MergeWith(ctx, opts); err != nil {
 			return err
 		}
 
@@ -1744,7 +1783,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	}
 
 	for tid, eng := range metricEngines {
-		tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
+		tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), deferred: eng.MergeDeferred(), run: func() {
 			maintainEngine(tid, metricsPrefix, func() error { return eng.Flush(ctx) },
 				func() error { return mergeMetrics(tid, eng) },
 				func() error { return refreshMetrics(eng) },
@@ -1757,7 +1796,12 @@ func (s *Storage) maintain(ctx context.Context) {
 	// part set, since that is the only thing that kills a stream identity. A replica reaches it
 	// only through the refresh — it never merges.
 	mergeRecords := func(tid signal.TenantID, eng *recordengine.Engine, sig signal.Signal) error {
-		if err := eng.Merge(ctx, s.retainFrom(tid, sig, sizeCutoffs[tid].at(sig))); err != nil {
+		opts := recordengine.MergeOptions{
+			RetainFrom: s.retainFrom(tid, sig, sizeCutoffs[tid].at(sig)),
+			Background: true, // see mergeMetrics: this loop skips rather than waits
+		}
+
+		if err := eng.MergeWith(ctx, opts); err != nil {
 			return err
 		}
 
@@ -1778,7 +1822,7 @@ func (s *Storage) maintain(ctx context.Context) {
 
 	addRecord := func(engines map[signal.TenantID]*recordengine.Engine, sig signal.Signal, signalPrefix string) {
 		for tid, eng := range engines {
-			tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), run: func() {
+			tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), deferred: eng.MergeDeferred(), run: func() {
 				maintainEngine(tid, signalPrefix, func() error { return eng.Flush(ctx) },
 					func() error { return mergeRecords(tid, eng, sig) },
 					func() error { return refreshRecords(eng) },
@@ -1794,7 +1838,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	addRecord(exemplarEngines, signal.Exemplar, exemplarsPrefix)
 
 	s.maintStats.lastTasks.Store(int64(len(tasks)))
-	sort.Slice(tasks, func(i, j int) bool { return tasks[i].pressure > tasks[j].pressure })
+	sortMaintTasks(tasks)
 
 	parallel.ForEach(len(tasks), s.maintenanceConcurrency(), func(i int) { tasks[i].run() })
 
@@ -1944,11 +1988,34 @@ func (s *Storage) recordEnginesBySignal() map[signal.Signal]map[signal.TenantID]
 	return out
 }
 
-// mergeConcurrency is how many merges may realistically run at once — the maintenance fan-out,
-// bounded by the number of engines there are to merge. It divides both the free space and the
-// memory a single merge may claim, so a single-engine node divides by one rather than by its core
-// count. Every signal's engines count: they share one process and one disk, and the maintenance
-// loop merges them through the same fan-out.
+// admitMerge reserves bytes from the process-wide merge budget. It is what makes each engine's
+// per-merge share real: every engine in the process draws on one pool, so concurrent merges cannot
+// collectively hold more than [Options.MergeMemoryBytes].
+//
+// Every caller waits except the maintenance cycle's own merges. [Storage.runMaintenance] cannot
+// service a size-triggered flush until the whole cycle's fan-out returns, so a merge parking here
+// would hold back every engine's memory relief for the rest of the cycle.
+func (s *Storage) admitMerge(ctx context.Context, bytes int64, wait bool) (func(), bool, error) {
+	if !wait {
+		release, ok := s.mergePool.TryAcquire(bytes)
+
+		return release, ok, nil
+	}
+
+	release, err := s.mergePool.Acquire(ctx, bytes)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return release, true, nil
+}
+
+// mergeConcurrency is the *ceiling* on how many merges may run at once — the maintenance fan-out,
+// bounded by the number of engines there are to merge. The engines lower it further from their
+// memory budget ([memlimit.MergeConcurrency]), so a small-memory node runs few merges with a usable
+// allowance each rather than many that each hold too little to make progress. Every signal's
+// engines count: they share one process and one disk, and the maintenance loop merges them through
+// the same fan-out.
 func (s *Storage) mergeConcurrency() int {
 	s.tmu.Lock()
 	n := len(s.tenants) + len(s.logTenants) + len(s.traceTenants) + len(s.profileTenants) + len(s.exemplarTenants)

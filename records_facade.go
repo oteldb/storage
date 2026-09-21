@@ -90,6 +90,7 @@ func (s *Storage) recordEngineCached(
 		// part size, which says nothing about the memory this process has.
 		MergeMemoryBytes: s.opts.MergeMemoryBytes,
 		MergeConcurrency: s.mergeConcurrency,
+		MergeAdmission:   s.admitMerge,
 		MinFreeBytes:     s.opts.MinFreeBytes,
 		MinFreeInodes:    s.opts.MinFreeInodes,
 		// ZSTD-compress compacted parts: record byte columns are dict-coded but not entropy-coded, so

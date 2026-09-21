@@ -370,9 +370,11 @@ Splitting at row boundaries is safe: parts are independent, and a series spannin
 by the read seam.
 
 ```
+concurrency   = clamp( mergeMemory / 64 MiB, 1, MergeConcurrency )   ← memory decides, cores cap
 mergeCapBytes = min( MergeCeilingBytes,
-                     free        / MergeConcurrency / 2,
-                     mergeMemory / MergeConcurrency / 2 )  ← whole-object backends only
+                     free        / MergeConcurrency / 2,   ← merges that can *run*
+                     mergeMemory / concurrency      / 2 )  ← merges the budget *admits*
+                                                              (whole-object backends only)
 ```
 
 **Why not a constant:** cardinality spends the budget in *breadth*, so a fixed cap shrinks a part's
@@ -380,11 +382,62 @@ time span as active series grow, and a fixed-range query opens proportionally mo
 references size against storage instead (VictoriaMetrics `getMaxOutBytes`, ClickHouse
 `max_bytes_to_merge_at_max_space_in_pool` lowered by free space).
 
-**Why divided:** by `MergeConcurrency`, so concurrent merges cannot collectively fill the disk; halved
+**Why divided:** by the concurrency, so concurrent merges cannot collectively fill the disk; halved
 again to let a merge's output coexist with inputs it has not yet retired. `MergeConcurrency` is a
 **callback**, since fan-out is bounded by the node's engine count as much as by the worker limit and
 engines appear lazily; fixed at engine creation it would divide a single-tenant node's disk by its core
 count, leaving a 32-core box a thirty-second of it.
+
+**The divisor is a memory quantity, not a core count.** `MergeConcurrency` is the *ceiling*;
+`memlimit.MergeConcurrency` lowers it to however many merges the budget can give a usable allowance,
+64 MiB each — the read side of a streaming merge (k sources × columns × the read-ahead window).
+Dividing by the core count instead prices memory in CPUs: a 16-core pod with a 4 GiB limit would hand
+each merge 32 MiB and produce a great many merges too small to keep up with ingest. VictoriaMetrics
+makes the same split from the other side — its merge workers are CPU-bound and CPU-counted, while
+`memory.Allowed()` sizes the *parts* (`getMaxInmemoryPartSize`, `getMaxSmallPartSize`).
+
+**The two divisors differ on purpose.** Free space is divided by `MergeConcurrency` — the merges
+that can *run* — because without an admission pool that is how many may be writing at once. Memory
+is divided by the smaller, budget-derived number, which is how many are admitted. Dividing the disk
+by the memory-derived count would size each output against a share more merges than that could be
+producing.
+
+**And the memory division is enforced, not assumed.** `internal/memlimit.Pool` is a process-wide
+byte semaphore that every engine of every signal draws on through `Config.MergeAdmission`; a merge
+reserves its resident share once it has selected sources and holds it until it ends. Without it the
+share is arithmetic nobody keeps: the facade fans merges out on its own schedule, so the division
+understated what a merge may hold *and* overstated how many may hold it, at once. Note the bound is
+the *request*, not measured residency: below the cap floors (`minMergeCapBytes` here,
+`MaxPartBytes` in `recordengine`) a merge can hold more than it asked for.
+
+**A `MergeOptions.Background` merge does not wait for its budget; it defers.** Admission is taken
+after selection, so a cycle with nothing to compact never consults the budget — and when the budget
+is committed the merge declines and the next cycle retries. Parking would be worse than it looks:
+the facade runs maintenance on *one* goroutine that also services size-triggered flushes, so one
+waiting merge would hold back every engine's memory relief for the rest of the cycle — to bound the
+memory merges take.
+
+Waiting is the **default**, and `Background` is opt-in, set only by that loop: a merge someone asked
+for — an operator command, a test, an embedder driving the engine — must produce one, not a silent
+no-op. A waiting merge does hold its own engine's `flushMu`, which `merge` takes before reaching
+admission, so that engine's flush waits with it. The pool admits no new holders while anyone is
+queued, so the wait is bounded by the merges already running plus whatever is queued ahead.
+
+**A deferral is visible.** It increments `storage.merge.deferred` (`ADMIN.md`), sets
+`Engine.MergeDeferred`, and does *not* log "nothing to compact" — which is what it would otherwise
+look like. The facade sorts a deferred engine ahead of head-bytes pressure on its next pass — which rotates
+the budget only when there are more engines than maintenance workers; below that every task starts
+at once and the order decides nothing (#646). The idle-waiver counter is zeroed only once a merge is admitted: a
+deferral has not broken the fixed point the waiver exists to escape.
+
+**The trade is throughput.** A 16-core node with a 2 GiB limit runs 4 concurrent merges rather than
+16 — the same total resident bytes, a longer compaction cycle in wall-clock.
+
+**The pool is sized once, at `Open`; a merge's request is computed per merge.** Both read the same
+`MergeMemoryBytes`, and a configured value cannot drift. A *derived* one re-reads `GOMEMLIMIT` per
+request (`internal/memlimit.Bytes`), so an embedder that changes the limit at runtime moves the
+requests without moving the pool: lowering it under-uses the pool, raising it makes each request
+larger than the pool, which clamps to the total and serializes merges.
 
 **Degenerate cases.** Backends that cannot report free space (`Memory`, object stores) keep the
 ceiling. A nearly full disk falls to `minMergeCapBytes` rather than sealing everything, since stranding

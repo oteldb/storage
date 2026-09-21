@@ -29,6 +29,15 @@ type MergeOptions struct {
 	// RetainFrom drops records older than this absolute unix-nanosecond cutoff (retention);
 	// ≤ 0 disables it.
 	RetainFrom int64
+	// Background marks this merge as the maintenance loop's own, where declining costs nothing: if
+	// the process merge budget ([Config.MergeAdmission]) is fully committed the merge is skipped and
+	// the next cycle retries it, rather than waiting.
+	//
+	// It is opt-in because waiting is the safe default. A caller that asked for a merge — an
+	// operator command, a test, an embedder driving the engine itself — must get one, not a silent
+	// no-op; the maintenance loop is the only caller for which the opposite is true, because it runs
+	// on one goroutine that also services flush pressure and must not park on a busy budget.
+	Background bool
 	// Force compacts a bucket's unsealed parts whatever their tiers, instead of waiting for one tier
 	// to accumulate minTierParts of them — the operator escape from a part set the tier rule will
 	// never select. It bypasses the selection heuristic only: sealing, the time-bucket ladder, and
@@ -71,11 +80,13 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 		span.SetAttributes(attribute.Int("storage.merge.parts_in", res.parts),
 			attribute.Int64("storage.merge.bytes_out", res.bytesOut))
 		e.cfg.Obs.Merge.Record(ctx, e.cfg.Signal, time.Since(startNs), int64(res.parts), res.bytesIn, res.bytesOut)
+		// deferred says those parts were dropped by retention, not compacted; see the metric engine.
 		log.Debug("merged parts",
+			zap.Bool("deferred", res.deferred),
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
 			zap.Int("parts_in", res.parts), zap.Int64("bytes_in", res.bytesIn),
 			zap.Int64("bytes_out", res.bytesOut), zap.Duration("took", time.Since(startNs)))
-	} else {
+	} else if !res.deferred {
 		log.Debug("merge no-op (nothing to compact)",
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix))
 	}
@@ -125,10 +136,36 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 				zap.Int("tiers", sh.Tiers), zap.Int("largest_tier_parts", sh.LargestTierParts))
 		}
 
+		e.mergeDeferred.Store(false)
 		e.reclaimRetired(ctx) // nothing to compact, but still sweep pending deletions
 
 		return mergeResult{parts: dropped}, nil
 	}
+
+	// Past here the merge decodes every selected part and buffers the output, so this is where its
+	// memory allowance must be one it actually holds rather than one it assumed.
+	release, admitted, err := e.admitMerge(ctx, opts.Background)
+	if err != nil {
+		e.mergeDeferred.Store(false)
+
+		return mergeResult{parts: dropped}, err
+	}
+
+	if !admitted {
+		// Remembered so the facade can order this engine first next cycle; see the metric engine.
+		e.mergeDeferred.Store(true)
+		e.cfg.Obs.Merge.Deferred(ctx, e.cfg.Signal)
+		zctx.From(ctx).Debug("merge deferred; the process merge budget is fully committed",
+			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
+			zap.Int("selected", len(selected)))
+		e.reclaimRetired(ctx)
+
+		return mergeResult{deferred: true, parts: dropped}, nil
+	}
+
+	e.mergeDeferred.Store(false)
+
+	defer release()
 
 	start := minInt64
 	if retainFrom > 0 {
@@ -191,6 +228,9 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 type mergeResult struct {
 	parts             int
 	bytesIn, bytesOut int64
+	// deferred reports that a run was selected but the process merge budget had nothing to give it,
+	// so nothing was compacted. It is not an error: the next cycle retries.
+	deferred bool
 }
 
 // partsBytes sums the on-disk size of ps.

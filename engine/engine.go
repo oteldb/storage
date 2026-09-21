@@ -81,13 +81,34 @@ type Config struct {
 	// 0 ⇒ a share of GOMEMLIMIT, or defaultMergeMemoryBytes when the process declares no limit;
 	// negative ⇒ unbounded (only the ceiling and free space then apply).
 	MergeMemoryBytes int64
-	// MergeConcurrency reports how many merges may run concurrently against this backend, dividing
-	// the free space so they cannot collectively exhaust the disk. nil or ≤ 1 ⇒ no division.
+	// MergeConcurrency reports how many merges may run concurrently against this backend — the
+	// caller's fan-out. It divides the free space, so concurrent merges cannot collectively exhaust
+	// the disk, and it *caps* how many the memory budget admits. nil or ≤ 1 ⇒ no division.
+	//
+	// It is the ceiling on the memory side, not the divisor: [MergeMemoryBytes] decides how many
+	// merges get a usable allowance, and dividing a memory budget by a number that tracks the core
+	// count instead would price memory in CPUs. Nothing here *enforces* either number — that is
+	// [Config.MergeAdmission]'s job, and without one this engine's merges are bounded only by how
+	// many the caller starts.
 	//
 	// A callback because the answer moves: fan-out is bounded by the node's engine count as much as
 	// by its worker limit, and engines appear lazily. Fixing it at engine creation would divide a
 	// single-tenant node's disk by its core count, undoing most of the widening.
 	MergeConcurrency func() int
+
+	// MergeAdmission gates a merge on the memory it intends to hold: it is called once a merge has
+	// selected its sources, with the bytes that merge may hold resident, and returns the function
+	// that hands them back. A division of one budget across concurrent merges is only real if
+	// something stops more than that many from starting.
+	//
+	// wait reports whether this caller may block for the budget. Every caller waits except the
+	// maintenance loop's own merges ([MergeOptions.Background]), which run on goroutines the loop
+	// must reclaim before it can service flush pressure — they take what is free and defer to the
+	// next cycle otherwise. ok=false with a nil error is that deferral, not a failure.
+	//
+	// It is called *after* selection, so a cycle with nothing to compact never consults it at all.
+	// nil admits every merge, which is the single-engine and test default.
+	MergeAdmission func(ctx context.Context, bytes int64, wait bool) (release func(), ok bool, err error)
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each part,
 	// so [Engine.AggregateRange] answers a range-covering aggregate from it without decoding the
 	// value column. It costs a little storage per series; off by default. AggregateRange works
@@ -205,6 +226,12 @@ type Engine struct {
 	// mergeRunning is true while a [Engine.MergeWith] is executing (introspection liveness; see
 	// [Engine.MergeRunning]). Set/cleared around the merge, not held during it.
 	mergeRunning atomic.Bool
+
+	// mergeDeferred records that the last merge selected a run and could not get the memory budget
+	// to compact it. The facade reads it to order such an engine first next cycle — task order is by
+	// head bytes, which the highest-ingest engines keep winning, so without this a quiet tenant
+	// could be declined every cycle while its part count grew.
+	mergeDeferred atomic.Bool
 	// retiring holds parts removed from the live set by flush/merge, pending backend deletion once
 	// their in-flight fetch readers drain (deferred reclamation; see reclaim.go).
 	retiring []*part
@@ -481,6 +508,12 @@ func (e *Engine) AppendBatch(
 
 	return res, nil
 }
+
+// MergeDeferred reports whether the last merge selected parts but could not claim the process merge
+// budget, so it compacted nothing. The maintenance loop schedules such an engine ahead of the
+// others on its next pass; it is also the signal an operator wants when part counts climb while
+// merges look idle.
+func (e *Engine) MergeDeferred() bool { return e.mergeDeferred.Load() }
 
 // HeadBytes returns the head's current buffered sample bytes — the in-flight memory measure a
 // consumer compares against a per-tenant cap (see [AppendLimits.MaxInFlightBytes]) and the basis

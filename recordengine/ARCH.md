@@ -61,7 +61,7 @@ assumed average row size, and the spread is what makes it unsafe: real structure
 ```
 cap = max( one flushed part,                              ← floor: retention must always
            min( mergeHeight × MaxPartBytes,                       be able to rewrite one
-                MergeMemoryBytes / MergeConcurrency / 3 ) )
+                MergeMemoryBytes / concurrency / 3 ) )
 ```
 
 The metric engine has the same memory term, for the same reason: a cap sized against storage says
@@ -69,6 +69,12 @@ nothing about what the process can hold. It is *decoded* bytes here, because tha
 this merge holds — sources are decoded up front and the output accumulates decoded before it is
 encoded, hence dividing by three (sources + output buffer + the encode of it). Free space does not
 enter; the flush cap and the tiering target bound the disk.
+
+`concurrency` is derived from the memory budget rather than from the core count, and enforced by the
+process-wide `internal/memlimit.Pool` through `Config.MergeAdmission` — `engine/ARCH.md` ("Merge
+cap") has the reasoning, including why a `MergeOptions.Background` merge defers rather than waits. Both engines
+draw on the same pool because they share one process. There is no free-space term here, so unlike
+the metric engine this cap has only the one divisor.
 
 ### Merge shape and forcing (`mergeshape.go`)
 

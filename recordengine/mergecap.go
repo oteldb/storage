@@ -1,6 +1,12 @@
 package recordengine
 
-import "github.com/oteldb/storage/internal/memlimit"
+import (
+	"context"
+
+	"github.com/go-faster/errors"
+
+	"github.com/oteldb/storage/internal/memlimit"
+)
 
 // mergeCapBytes returns the decoded size at which a merged part is sealed, and with it the bound on
 // what one merge may hold: the tiering target (mergeHeight × MaxPartBytes), lowered to the memory
@@ -19,14 +25,61 @@ func (e *Engine) mergeCapBytes() int64 {
 
 	target := e.cfg.MaxPartBytes * mergeHeight
 
-	concurrency := 1
-	if e.cfg.MergeConcurrency != nil {
-		concurrency = max(e.cfg.MergeConcurrency(), 1)
-	}
-
-	share := memlimit.MergeShare(e.cfg.MergeMemoryBytes, concurrency, mergeBufferAmplification)
+	share := memlimit.MergeShare(e.cfg.MergeMemoryBytes, e.mergeConcurrency(), mergeBufferAmplification)
 
 	// A merge that cannot even hold one flushed part's worth would make no progress; the flush cap
 	// already bounds that much, so the floor is the flush cap rather than the share.
 	return max(min(target, share), e.cfg.MaxPartBytes)
+}
+
+// mergeConcurrency is how many merges the memory budget admits: enough that each gets a usable
+// allowance, capped by the [Config.MergeConcurrency] fan-out. Deriving it from memory is the point —
+// taking it from the fan-out, which tracks the core count, prices a memory quantity in CPUs. This
+// engine's cap has no free-space term, so unlike the metric engine it needs no second number.
+func (e *Engine) mergeConcurrency() int {
+	fanout := 1
+	if e.cfg.MergeConcurrency != nil {
+		fanout = max(e.cfg.MergeConcurrency(), 1)
+	}
+
+	return memlimit.MergeConcurrency(e.cfg.MergeMemoryBytes, fanout)
+}
+
+// mergeMemoryBudgetBytes is what one merge may hold resident: its share of the budget, undoubled.
+// It is what [Config.MergeAdmission] is asked for, so the share a merge is sized against is one it
+// has actually been given.
+func (e *Engine) mergeMemoryBudgetBytes() int64 {
+	return memlimit.MergeShare(e.cfg.MergeMemoryBytes, e.mergeConcurrency(), 1)
+}
+
+// admitMerge reserves the memory this merge intends to hold. It is called once the merge knows it
+// has work, so a no-op cycle never consults the budget at all.
+//
+// A [MergeOptions.Background] merge does not wait: the facade cannot service a size-triggered flush
+// until a whole maintenance cycle's fan-out returns, so parking there would delay every engine's
+// flush — the mechanism that gives memory back — in order to bound the memory merges take. It
+// declines and the next cycle retries. Every other caller waits, because a merge someone asked for
+// must not silently no-op.
+//
+// Waiting still holds this engine's flushMu, which the merge takes before reaching here, so a
+// waiting merge delays its own engine's flush for as long as it queues. The pool admits no new
+// holders while anyone is queued, so the wait is bounded by the merges already running plus
+// whatever is queued ahead.
+func (e *Engine) admitMerge(ctx context.Context, background bool) (func(), bool, error) {
+	if e.cfg.MergeAdmission == nil {
+		return func() {}, true, nil
+	}
+
+	release, ok, err := e.cfg.MergeAdmission(ctx, e.mergeMemoryBudgetBytes(), !background)
+	switch {
+	case err != nil:
+		return nil, false, err
+	case ok, background:
+		return release, ok, nil
+	}
+
+	// A caller that said it would wait and was refused anyway is a broken admission callback. The
+	// alternative to erroring is returning nil having compacted nothing, which is the silent no-op
+	// this whole path exists to prevent — so it surfaces rather than disappears.
+	return nil, false, errors.New("merge admission declined a merge that asked to wait")
 }

@@ -148,6 +148,45 @@ func TestMergeCapBytes(t *testing.T) {
 			want:        512 << 20,
 		},
 		{
+			// The core count is a ceiling, not the divisor. 256 MiB across 16 cores would give each
+			// merge 8 MiB — the floor, i.e. no merge worth running — so the budget supports four
+			// merges instead, and each gets 256/4/2 = 32 MiB.
+			name:        "memory lowers concurrency below the core count",
+			ceiling:     1 << 40,
+			memory:      256 << 20,
+			concurrency: 16,
+			backend:     backend.Memory(),
+			want:        32 << 20,
+		},
+		{
+			// The same budget on a single-core node: nothing to lower, and the whole budget is one
+			// merge's.
+			name:        "one core takes the whole budget",
+			ceiling:     1 << 40,
+			memory:      256 << 20,
+			concurrency: 1,
+			backend:     backend.Memory(),
+			want:        128 << 20,
+		},
+		{
+			// The two terms divide by different numbers, and this is the case that tells them apart.
+			// The budget admits 4 merges (256 MiB / 64 MiB) while 16 can *run*, and without an
+			// admission pool 16 may be writing at once — so the disk must be divided by the fan-out,
+			// not by the smaller admitted count.
+			//
+			//   disk (fan-out 16):     512 MiB / 16 / 2 = 16 MiB  ← correct, and binds
+			//   disk (admitted 4):     512 MiB /  4 / 2 = 64 MiB  ← would over-commit the volume
+			//   memory (admitted 4):   256 MiB /  4 / 2 = 32 MiB
+			//
+			// Sharing one divisor gives 32 MiB here, so this case fails if the terms are merged.
+			name:        "disk divides by the fan-out, memory by what the budget admits",
+			ceiling:     1 << 40,
+			memory:      256 << 20,
+			concurrency: 16,
+			backend:     spaceBackend{Backend: backend.Memory(), free: 512 << 20},
+			want:        16 << 20,
+		},
+		{
 			name:    "a memory budget below the floor still merges",
 			ceiling: 1 << 40,
 			memory:  1 << 10,
@@ -269,4 +308,39 @@ func TestMergeCapUsesRecordedPartSize(t *testing.T) {
 	legacy := &part{index: partIndex{starts: []int32{0, 10}}}
 	assert.Equal(t, int64(10*partRowBytes), legacy.sizeBytes(),
 		"a part with no recorded size falls back to the uncompressed row estimate")
+}
+
+// TestAdmissionRequestMatchesCapDerivation is the coherence invariant between the two halves of the
+// budget: the bytes a merge reserves from the pool must be the share its cap was derived from, and
+// the pool must admit at least as many merges as the cap arithmetic assumed. When those disagree
+// the bound is wrong in one direction or the other — the first round of this work divided the disk
+// by one number and admitted merges by another, and nothing caught it.
+func TestAdmissionRequestMatchesCapDerivation(t *testing.T) {
+	t.Parallel()
+
+	budgets := []int64{16 << 20, 64 << 20, 256 << 20, 1 << 30, 3 << 30, 64 << 30}
+	fanouts := []int{1, 2, 4, 16}
+
+	for _, budget := range budgets {
+		for _, fanout := range fanouts {
+			e := New(Config{
+				Backend: backend.Memory(), Prefix: "t",
+				MergeMemoryBytes: budget,
+				MergeConcurrency: concurrencyFunc(fanout),
+			})
+
+			k := e.mergeConcurrency()
+			request := e.mergeMemoryBudgetBytes()
+
+			assert.LessOrEqual(t, k, fanout, "the fan-out caps how many merges the budget admits")
+			assert.Positive(t, request)
+			assert.Equal(t, memlimit.MergeShare(budget, k, 1), request,
+				"a merge must reserve the share its own concurrency implies")
+
+			// The pool is sized at the whole budget and each merge takes `request`, so this is the
+			// number that actually fits. It must not be fewer than the cap arithmetic assumed.
+			assert.GreaterOrEqual(t, memlimit.MergeBudget(budget)/request, int64(k),
+				"the pool must admit every merge the cap was divided for")
+		}
+	}
 }

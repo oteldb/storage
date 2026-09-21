@@ -28,6 +28,15 @@ type MergeOptions struct {
 	// pass. The cutoffs are absolute (the caller resolves now − After into Before). Empty keeps
 	// every part lossless.
 	Precision []PrecisionTier
+	// Background marks this merge as the maintenance loop's own, where declining costs nothing: if
+	// the process merge budget ([Config.MergeAdmission]) is fully committed the merge is skipped and
+	// the next cycle retries it, rather than waiting.
+	//
+	// It is opt-in because waiting is the safe default. A caller that asked for a merge — an
+	// operator command, a test, an embedder driving the engine itself — must get one, not a silent
+	// no-op; the maintenance loop is the only caller for which the opposite is true, because it runs
+	// on one goroutine that also services flush pressure and must not park on a busy budget.
+	Background bool
 	// Force takes the best run of unsealed parts even when it does not earn its rewrite, instead of
 	// selecting nothing — the operator escape from a fixed point where every run scores below
 	// [minMergeMultiplier] and the engine would sit on its part count until the idle waiver fires.

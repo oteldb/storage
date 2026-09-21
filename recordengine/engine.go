@@ -76,9 +76,28 @@ type Config struct {
 	// size a working set the process cannot hold. 0 ⇒ a share of the process memory budget
 	// (GOMEMLIMIT, else the cgroup limit, else host memory); negative ⇒ unbounded.
 	MergeMemoryBytes int64
-	// MergeConcurrency reports how many merges may run concurrently in this process, dividing the
-	// merge memory allowance so they cannot collectively exceed it. nil or ≤ 1 ⇒ no division.
+	// MergeConcurrency reports how many merges may run concurrently in this process — the caller's
+	// fan-out, which *caps* how many the memory budget admits rather than dividing it. nil or ≤ 1 ⇒
+	// no cap beyond one.
+	//
+	// [MergeMemoryBytes] is what divides the allowance: it decides how many merges each get a usable
+	// share, and taking the divisor from a number that tracks the core count instead would price a
+	// memory quantity in CPUs. Nothing here enforces the division — that is [Config.MergeAdmission].
 	MergeConcurrency func() int
+
+	// MergeAdmission gates a merge on the memory it intends to hold: it is called once a merge has
+	// selected its sources, with the bytes that merge may hold resident, and returns the function
+	// that hands them back. A division of one budget across concurrent merges is only real if
+	// something stops more than that many from starting.
+	//
+	// wait reports whether this caller may block for the budget. Every caller waits except the
+	// maintenance loop's own merges ([MergeOptions.Background]), which run on goroutines the loop
+	// must reclaim before it can service flush pressure — they take what is free and defer to the
+	// next cycle otherwise. ok=false with a nil error is that deferral, not a failure.
+	//
+	// It is called *after* selection, so a cycle with nothing to compact never consults it at all.
+	// nil admits every merge, which is the single-engine and test default.
+	MergeAdmission func(ctx context.Context, bytes int64, wait bool) (release func(), ok bool, err error)
 	// MergeCompression block-compresses the columns of merged (compacted) parts on top of their chunk
 	// codecs — the cold, long-lived data. Flushed parts stay codec-only so ingest is cheap; the
 	// background merge is where recompression is amortized. Record byte columns are dict-coded but not
@@ -157,6 +176,12 @@ type Engine struct {
 	// mergeRunning is true while a [Engine.Merge] is executing (introspection liveness; see
 	// [Engine.MergeRunning]). Set/cleared around the merge, not held during it.
 	mergeRunning atomic.Bool
+
+	// mergeDeferred records that the last merge selected a run and could not get the memory budget
+	// to compact it. The facade reads it to order such an engine first next cycle — task order is by
+	// head bytes, which the highest-ingest engines keep winning, so without this a quiet tenant
+	// could be declined every cycle while its part count grew.
+	mergeDeferred atomic.Bool
 	// retiring holds parts removed from the live set by flush/merge, pending backend deletion once
 	// their in-flight fetch readers drain (deferred reclamation; see reclaim.go).
 	retiring []*part
@@ -395,6 +420,12 @@ func (e *Engine) AppendBatch(b *Batch, limits AppendLimits) (AppendResult, error
 
 	return e.appendLogged(b, limits)
 }
+
+// MergeDeferred reports whether the last merge selected parts but could not claim the process merge
+// budget, so it compacted nothing. The maintenance loop schedules such an engine ahead of the
+// others on its next pass; it is also the signal an operator wants when part counts climb while
+// merges look idle.
+func (e *Engine) MergeDeferred() bool { return e.mergeDeferred.Load() }
 
 // HeadBytes returns the engine's buffered record bytes — the in-flight memory measure for
 // [AppendLimits.MaxInFlightBytes]. It counts the live head plus the buffers an in-flight flush has
