@@ -28,8 +28,8 @@ func mergeCorpus(t *testing.T, series, samples, parts int, value func(r *rand.Ra
 	ctx := context.Background()
 	// MergeMemoryBytes is pinned because the merge cap is otherwise derived from the host's memory
 	// (GOMEMLIMIT, else the cgroup or machine figure), which decides how many parts the merge seals —
-	// so whether it produces the single part this test asserts on would depend on the runner. A
-	// gigabyte is far above the ~62 MiB of raw rows the corpus holds, so the cap never binds.
+	// so the allocation this test measures would vary with the runner. A gigabyte is far above the
+	// ~62 MiB of raw rows the corpus holds, so the cap never binds.
 	e := engine.New(engine.Config{
 		Backend: backend.Memory(), Prefix: "m", MaxPartBytes: 0, MergeMemoryBytes: 1 << 30,
 	})
@@ -118,7 +118,23 @@ func TestMergeAllocatesBelowRawRows(t *testing.T) {
 				"merge allocated %.1f MiB for %.1f MiB of raw rows (%.1fx); the output should stream, "+
 					"not accumulate whole columns", alloced/(1<<20), raw/(1<<20), alloced/raw)
 
-			assert.Equal(t, 1, e.PartCount(), "the merge should have produced a single part")
+			// One Merge compacts a single bounded run inside one time bucket, and that run must clear
+			// the selector's spread and multiplier guards — so "one cycle collapses everything" is a
+			// property of this corpus, not one the engine promises (#155). Measured here: only that
+			// the merge did real work; convergence is asserted at a fixed point below.
+			assert.Less(t, e.PartCount(), parts, "the merge compacted nothing")
+
+			for range parts {
+				prev := e.PartCount()
+
+				require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Force: true}))
+
+				if e.PartCount() == prev {
+					break
+				}
+			}
+
+			assert.Equal(t, 1, e.PartCount(), "merging to a fixed point should leave a single part")
 		})
 	}
 }
