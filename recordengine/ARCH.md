@@ -70,6 +70,13 @@ this merge holds — sources are decoded up front and the output accumulates dec
 encoded, hence dividing by three (sources + output buffer + the encode of it). Free space does not
 enter; the flush cap and the tiering target bound the disk.
 
+The cap reaches the merge as `mergestream.Budget{ResidentBytes: cap}` — one type for both engines'
+seal units, so this engine cannot grow a second, differently-named one when it gains a disk bound
+(`internal/mergestream/ARCH.md`). The stream union the merge walks comes from the same package:
+`mergestream.Keys` over each part's already-sorted `ranges`, a k-way heap rather than a map of every
+distinct stream. It collapses repeats within a part as the map did, which matters because an
+unsorted stream column leaves `buildRanges` with two runs carrying the same id.
+
 `concurrency` is derived from the memory budget rather than from the core count, and enforced by the
 process-wide `internal/memlimit.Pool` through `Config.MergeAdmission` — `engine/ARCH.md` ("Merge
 cap") has the reasoning, including why a `MergeOptions.Background` merge defers rather than waits. Both engines

@@ -5,6 +5,7 @@ import (
 	"math/bits"
 	"slices"
 
+	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -182,22 +183,20 @@ func capGroup(group []*part, capBytes int64) []*part {
 	return group
 }
 
-// idSetOf returns the sorted union of every stream id across parts, so a compaction visits each stream
-// once in (stream, ts) order.
-func idSetOf(parts []*part) []signal.SeriesID {
-	set := make(map[signal.SeriesID]struct{})
-	for _, p := range parts {
-		for _, sr := range p.ranges {
-			set[sr.id] = struct{}{}
-		}
+// streamIDs adapts a part's stream ranges, which [buildRanges] leaves sorted by id, to
+// [mergestream.Source].
+type streamIDs []streamRange
+
+func (s streamIDs) Len() int                 { return len(s) }
+func (s streamIDs) At(i int) signal.SeriesID { return s[i].id }
+
+// mergeKeys arms k over the union of every stream id across parts, so a compaction visits each
+// stream once in (stream, ts) order without building a set of them.
+func mergeKeys(parts []*part, k *mergestream.Keys) {
+	src := make([]mergestream.Source, len(parts))
+	for i, p := range parts {
+		src[i] = streamIDs(p.ranges)
 	}
 
-	ids := make([]signal.SeriesID, 0, len(set))
-	for id := range set {
-		ids = append(ids, id)
-	}
-
-	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
-
-	return ids
+	k.Reset(src)
 }

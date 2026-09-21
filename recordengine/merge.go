@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/obs"
 )
 
@@ -363,8 +364,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 		decoded[i] = d
 	}
 
-	// Split output only when a part-size cap applies and there is no side store to anchor per-part.
-	split := capBytes > 0 && e.cfg.SideStore == nil
+	budget := e.mergeBudget(capBytes)
 
 	// Union the sources' byte-column dictionaries once, before any row moves: a column every source
 	// dictionary-encoded is then carried through the merge as ids into that union and handed to the
@@ -409,7 +409,13 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 	acc := newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
 	acc.armSplit(dicts)
 
-	for _, id := range idSetOf(src) {
+	var keys mergestream.Keys
+
+	mergeKeys(src, &keys)
+
+	for keys.Next() {
+		id := keys.Key()
+
 		acc.prepare(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
 
 		// Oldest → newest part order; records are append-only (no dedup), so the stream is just
@@ -443,7 +449,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 		// count is only as good as that assumption. A stream whose own run overshoots the cap is split
 		// at the next stream boundary (parts are independent; the read seam concatenates a stream
 		// spanning parts), keeping the buffer at ≈ one part regardless of a heavy stream.
-		if split && buf.byteSize() >= capBytes {
+		if budget.Reached(0, buf.byteSize()) {
 			if err := emit(); err != nil {
 				return nil, err
 			}

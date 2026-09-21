@@ -6,6 +6,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/internal/memlimit"
+	"github.com/oteldb/storage/internal/mergestream"
 )
 
 // mergeCapBytes returns the decoded size at which a merged part is sealed, and with it the bound on
@@ -30,6 +31,17 @@ func (e *Engine) mergeCapBytes() int64 {
 	// A merge that cannot even hold one flushed part's worth would make no progress; the flush cap
 	// already bounds that much, so the floor is the flush cap rather than the share.
 	return max(min(target, share), e.cfg.MaxPartBytes)
+}
+
+// mergeBudget is what a merge seals an output part on. The record merge holds its output decoded
+// until it is sealed, so its cap is the resident unit and nothing bounds the part on disk; a side
+// store (profiles) anchors the unioned symbol sidecar to one part, so it disables sealing entirely.
+func (e *Engine) mergeBudget(capBytes int64) mergestream.Budget {
+	if e.cfg.SideStore != nil {
+		return mergestream.Budget{}
+	}
+
+	return mergestream.Budget{ResidentBytes: capBytes}
 }
 
 // mergeConcurrency is how many merges the memory budget admits: enough that each gets a usable

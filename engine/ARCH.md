@@ -366,6 +366,12 @@ assertions, so a `Backend` decorator that does not forward them silently turns a
 | flush | `MaxPartBytes` | approximate uncompressed bytes | it sizes rows already in the head |
 | merge | `mergeCapBytes` (`mergecap.go`) | bytes on disk | what the writer actually encoded |
 
+The merge's two seal numbers — that disk cap and `mergeMemoryBudgetBytes` — are paired as
+`mergestream.Budget` (`mergeBudget`), so the record engine cannot invent a second unit for the same
+pair; `internal/mergestream/ARCH.md` says why they are separate. The series union a merge walks is
+`mergestream.Keys` over each part's index (`mergeKeys`), a k-way heap rather than a set of every
+distinct series — a paged index feeds it straight out of the sidecar entries.
+
 Splitting at row boundaries is safe: parts are independent, and a series spanning two is merged back
 by the read seam.
 

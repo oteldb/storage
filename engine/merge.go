@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -375,8 +376,8 @@ func (e *Engine) writeMergedPart(ctx context.Context, cols *flushColumns, opts M
 // columns sorted by (series, ts). The returned columns are empty when no sample survives. It reads
 // the parts off the engine lock; src is the immutable snapshot the caller planned over.
 func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tiers []DownsampleTier) (*flushColumns, error) {
-	ids, err := sortedSeriesIDs(ctx, src)
-	if err != nil {
+	var keys mergestream.Keys
+	if err := mergeKeys(ctx, src, &keys); err != nil {
 		return nil, err
 	}
 
@@ -386,7 +387,9 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 	// series of every part), instead of re-decoding the whole part per series.
 	decoded := make(partDecodeCache, len(src))
 
-	for _, id := range ids {
+	for keys.Next() {
+		id := keys.Key()
+
 		var m sampleMerge
 
 		// Oldest → newest part, so a later part's value wins on a duplicate timestamp.
@@ -436,8 +439,8 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 func (e *Engine) compactStream(
 	ctx context.Context, src []*part, start int64, capBytes int64, opts MergeOptions,
 ) ([]*part, error) {
-	ids, err := sortedSeriesIDs(ctx, src)
-	if err != nil {
+	var keys mergestream.Keys
+	if err := mergeKeys(ctx, src, &keys); err != nil {
 		return nil, err
 	}
 
@@ -454,7 +457,7 @@ func (e *Engine) compactStream(
 
 	scratch := make([]rangeBuf, len(src))
 	comp, precision, withSF := mergeEncoding(src, capBytes, opts)
-	memBytes := e.mergeMemoryBudgetBytes()
+	budget := e.mergeBudget(capBytes)
 
 	var (
 		newParts []*part
@@ -486,7 +489,9 @@ func (e *Engine) compactStream(
 		return nil
 	}
 
-	for _, id := range ids {
+	for keys.Next() {
+		id := keys.Key()
+
 		m, err := mergeStreamedSeries(ctx, src, streams, scratch, id, start)
 		if err != nil {
 			return nil, err
@@ -519,7 +524,7 @@ func (e *Engine) compactStream(
 		// The second bound is the part's resident footprint, which is not a function of its size on
 		// disk: the per-series sidecars grow with distinct series, so a merge of very short series
 		// reaches the memory budget long before the disk cap.
-		if (capBytes > 0 && cur.encodedBytes() >= capBytes) || cur.residentBytes() >= memBytes {
+		if budget.Reached(cur.encodedBytes(), cur.residentBytes()) {
 			if err := emit(); err != nil {
 				return nil, err
 			}

@@ -48,6 +48,7 @@ engines over the fetch seam (`query/fetch`).
 | [`query/ARCH.md`](query/ARCH.md) | fetch contract, scale decorators, PromQL adapter, EXPLAIN ANALYZE |
 | [`cluster/ARCH.md`](cluster/ARCH.md) | ring, membership, replication, rebalance, sharding, partsync, erasure coding |
 | [`internal/vfs/ARCH.md`](internal/vfs/ARCH.md) | the filesystem seam, `SyncDir`, and what each crash mode of the fake does and does not model |
+| [`internal/mergestream/ARCH.md`](internal/mergestream/ARCH.md) | the seam both merge engines share: the k-way key union, the two seal units, the forward-cursor contract, the conformance suite |
 | [`ADMIN.md`](ADMIN.md) | operator surface: `Inspect`, `Admin`, drill-downs, metrics catalog |
 
 ---
@@ -275,6 +276,6 @@ engine/               metrics vertical
 recordengine/         shared record engine (logs/traces/profiles/exemplars)
 query/{fetch,scale,profile,promql}           read seam · scale-out decorators · EXPLAIN ANALYZE · Prom adapter
 cluster/{,ring,etcd,replica,rebalance,partsync,ec,router}   L0 distribution
-internal/{obs,retry,simd,parallel,partid,diskguard,vfs,memlimit,memsize,watermark,reproduce,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids · disk-pressure guard · heap accounting · per-series watermark sidecar codec · gated defect reproducers · filesystem seam + crash model (validated against ext4 on dm-flakey by `internal/vfs/crashmodel`, `-tags crashmodel`)
+internal/{obs,retry,simd,parallel,partid,diskguard,vfs,memlimit,memsize,watermark,mergestream,reproduce,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids · disk-pressure guard · heap accounting · per-series watermark sidecar codec · the merge seam both engines share (k-way key union, seal units, conformance suite) · gated defect reproducers · filesystem seam + crash model (validated against ext4 on dm-flakey by `internal/vfs/crashmodel`, `-tags crashmodel`)
 reliability/          public RetryConfig presets
 ```
