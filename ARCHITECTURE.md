@@ -268,7 +268,7 @@ signal/               identity model (Value/KeyValue/Attributes/SeriesID) + Sign
   signal/{metric,log,trace,profile,exemplar}   per-signal ingest batch + projection
 otlp/pdataconv        optional OTel-Go bridge (only package importing pdata)
 tenant/               policy model + Resolver
-backend/{,file,s3,bucketindex,backendtest}   L1 seam, implementations, part index, conformance suite
+backend/{,file,s3,bucketindex,backendtest,s3/s3test}   L1 seam, implementations, part index, conformance suite + test wrappers, in-process S3
 block/                immutable columnar part format
 index/{symbols,series,postings,identity,bloom}  identity index + inverted index + per-part identity object + token blooms
 wal/                  segmented CRC-framed WAL

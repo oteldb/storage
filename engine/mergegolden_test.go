@@ -4,15 +4,9 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
-	"net/http/httptest"
 	"strconv"
 	"testing"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
-	fsserver "github.com/go-faster/fs/server"
-	"github.com/go-faster/fs/storagemem"
 	"github.com/go-faster/sdk/gold"
 	"github.com/stretchr/testify/require"
 
@@ -20,33 +14,11 @@ import (
 	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/backend/s3"
+	"github.com/oteldb/storage/backend/s3/s3test"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/reliability"
 	"github.com/oteldb/storage/signal"
 )
-
-func inProcessS3(t *testing.T, bucket string) *awss3.Client {
-	t.Helper()
-
-	store := storagemem.New()
-	require.NoError(t, store.CreateBucket(context.Background(), bucket))
-
-	srv := httptest.NewServer(fsserver.NewHandler(store))
-	httpClient := srv.Client()
-
-	t.Cleanup(func() {
-		httpClient.CloseIdleConnections()
-		srv.Close()
-	})
-
-	return awss3.New(awss3.Options{
-		Region:       "us-east-1",
-		BaseEndpoint: aws.String(srv.URL),
-		UsePathStyle: true,
-		HTTPClient:   httpClient,
-		Credentials:  credentials.NewStaticCredentialsProvider("test", "test", ""),
-	})
-}
 
 // goldenMergeCorpus covers each source-column form the metric merge reads: a noisy value column
 // spanning several compression frames, a later part overwriting an earlier one's timestamps, a
@@ -167,7 +139,7 @@ func TestMergeOutputGolden(t *testing.T) {
 		{"s3", func(t *testing.T) backend.Backend {
 			t.Helper()
 
-			return s3.New(s3.NewAWS(inProcessS3(t, "golden"), "golden"), "", s3.WithRetry(reliability.Default()))
+			return s3test.Backend(t, "golden", s3.WithRetry(reliability.Default()))
 		}},
 		{"whole-object", func(*testing.T) backend.Backend { return backendtest.WithoutCapabilities(backend.Memory()) }},
 	} {
