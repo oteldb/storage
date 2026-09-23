@@ -25,8 +25,8 @@ var benchLogSchema = NewSchema(
 )
 
 // benchMergeEngine flushes parts log-shaped parts of rows records each, spread over 16 streams.
-func benchMergeEngine(b *testing.B, be backend.Backend, parts, rows int) *Engine {
-	b.Helper()
+func benchMergeEngine(tb testing.TB, be backend.Backend, parts, rows int) *Engine {
+	tb.Helper()
 
 	ctx := context.Background()
 	e := New(Config{Schema: benchLogSchema, Backend: be, Prefix: "bench/logs", MergeMemoryBytes: -1})
@@ -67,16 +67,121 @@ func benchMergeEngine(b *testing.B, be backend.Backend, parts, rows int) *Engine
 			}
 
 			if _, err := e.AppendBatch(batch, AppendLimits{}); err != nil {
-				b.Fatal(err)
+				tb.Fatal(err)
 			}
 		}
 
 		if err := e.Flush(ctx); err != nil {
-			b.Fatal(err)
+			tb.Fatal(err)
 		}
 	}
 
 	return e
+}
+
+// benchTraceSchema is trace-shaped: several int columns, a raw id, and dictionary columns that repeat
+// enough to be written on a shared dictionary — every column a merge can read by granule.
+var benchTraceSchema = NewSchema(
+	Column{Name: "duration", Kind: KindInt64, Codec: chunk.CodecT64},
+	Column{Name: "parent", Kind: KindInt64, Codec: chunk.CodecT64},
+	Column{Name: "left", Kind: KindInt64, Codec: chunk.CodecT64},
+	Column{Name: "right", Kind: KindInt64, Codec: chunk.CodecT64},
+	Column{Name: "trace_id", Kind: KindBytes, Codec: chunk.CodecBytesRaw},
+	Column{Name: "name", Kind: KindBytes, Codec: chunk.CodecDict},
+	Column{Name: "attrs", Kind: KindBytes, Codec: chunk.CodecDict},
+)
+
+// benchTraceEngine flushes the given number of trace-shaped parts of rows records each over be, 1024
+// per stream. Streams stay the same length as the parts grow, because a merge accumulates a whole
+// stream before it seals: a corpus of few long streams measures the stream, not the read side.
+func benchTraceEngine(tb testing.TB, be backend.Backend, parts, rows int) *Engine {
+	tb.Helper()
+
+	ctx := context.Background()
+	e := New(Config{Schema: benchTraceSchema, Backend: be, Prefix: "bench/traces", MergeMemoryBytes: -1})
+	r := rand.New(rand.NewPCG(3, 5))
+
+	const perStream = 1024
+
+	for p := range parts {
+		for s := range rows / perStream {
+			series := signal.Series{Resource: signal.Resource{Attributes: signal.NewAttributes(
+				signal.KeyValue{Key: []byte("service.name"), Value: signal.StringValue([]byte("svc-" + strconv.Itoa(s)))},
+			)}}
+
+			batch := &Batch{
+				Stream: series.Hash(), Identity: func() signal.Series { return series },
+				Ints: make([][]int64, 4), Bytes: make([][][]byte, 3),
+			}
+
+			for i := range perStream {
+				batch.Ts = append(batch.Ts, int64(p*perStream+i)*1_000_000+r.Int64N(1000))
+
+				for k := range batch.Ints {
+					batch.Ints[k] = append(batch.Ints[k], r.Int64N(1<<40))
+				}
+
+				var id [16]byte
+				for j := range id {
+					id[j] = byte(r.Uint32())
+				}
+
+				batch.Bytes[0] = append(batch.Bytes[0], id[:])
+				batch.Bytes[1] = append(batch.Bytes[1], fmt.Appendf(nil, "GET /api/v1/items/{id} op=%d", r.IntN(40)))
+				batch.Bytes[2] = append(batch.Bytes[2], signal.NewAttributes(
+					signal.KeyValue{Key: []byte("host"), Value: signal.StringValue([]byte("node-" + strconv.Itoa(r.IntN(12))))},
+				).AppendHashInput(nil))
+			}
+
+			if _, err := e.AppendBatch(batch, AppendLimits{}); err != nil {
+				tb.Fatal(err)
+			}
+		}
+
+		if err := e.Flush(ctx); err != nil {
+			tb.Fatal(err)
+		}
+	}
+
+	return e
+}
+
+// BenchmarkMergeCompactTraces is [BenchmarkMergeCompact] over trace-shaped parts, whose columns a
+// merge reads granule by granule rather than whole.
+func BenchmarkMergeCompactTraces(b *testing.B) {
+	for _, rows := range []int{64 << 10, 256 << 10} {
+		b.Run(fmt.Sprintf("file/parts=4/rows=%d", rows), func(b *testing.B) {
+			ctx := context.Background()
+
+			be, err := file.New(b.TempDir())
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			e := benchTraceEngine(b, be, 4, rows)
+			src := e.parts
+
+			b.SetBytes(partsBytes(src))
+			b.ReportAllocs()
+
+			for b.Loop() {
+				out, err := e.compactParts(ctx, src, minInt64, 0)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				b.StopTimer()
+
+				for _, p := range out {
+					if err := deletePart(ctx, be, p.prefix); err != nil {
+						b.Fatal(err)
+					}
+				}
+
+				b.StartTimer()
+			}
+		})
+	}
 }
 
 // BenchmarkMergeCompact times one record merge of every flushed part into one output part: reading

@@ -7,17 +7,17 @@ import (
 	"github.com/oteldb/storage/encoding/chunk"
 )
 
-// decodedPart is one source part decoded for a merge: the fixed-width columns as plain slices, and each
-// byte column kept dict-compressed where possible ([mergeByteCol]). A merge interleaves streams across
-// all selected parts, so every selected part stays resident during the stream sweep; holding the byte
-// columns dict-compressed (rather than expanding each to a full uncompressed blob, as the fetch-path
-// readCols does) keeps that resident set small when values repeat — the common log case (templated
-// bodies, low-cardinality attributes). Selection already bounds how many parts this covers; this bounds
-// the per-part constant.
+// decodedPart is one source part decoded whole for a merge, the fallback for a part a forward cursor
+// cannot read ([forwardReadable]): the fixed-width columns as plain slices, and each byte column kept
+// dict-compressed where possible ([mergeByteCol]). It stays resident for the whole stream sweep, so
+// holding the byte columns dict-compressed rather than expanded keeps it small when values repeat.
 type decodedPart struct {
 	ts    []int64
 	ints  [][]int64
 	bytes []mergeByteCol
+	// remap[k] maps byte column k's dictionary ids to the merge's union ids, for a column on the
+	// split carry.
+	remap [][]int32
 	// tsSorted is whether every stream's rows are ts-ascending, as both part writers leave them. Only then
 	// may a merge binary-search a stream's window: on a part that breaks the order, a search would skip
 	// in-window rows, and the merge would retire the part that held them.
@@ -61,44 +61,12 @@ func newMergeByteCol(dc *chunk.DictColumn) mergeByteCol {
 	return mergeByteCol{flat: bc}
 }
 
-// expandedBytes is the blob the column's cells occupy once materialized: what it already holds in
-// the flat form, and the sum of its rows' entry lengths for a dictionary. It sizes the merge output
-// buffer, which would otherwise grow each byte column out of nothing. Walking a dictionary costs one
-// table lookup per row over the packed ids — no cell is touched — against the ~log₂(size) full blob
-// re-copies the sizing avoids.
-func (m *mergeByteCol) expandedBytes() int64 {
-	if m.dict == nil {
-		return m.flat.byteSize()
-	}
-
-	dc := m.dict
-
-	lens := make([]int32, len(dc.Entries))
-	for i, e := range dc.Entries {
-		lens[i] = int32(len(e))
-	}
-
-	var total int64
-
-	if dc.IDWidth == 1 {
-		for _, id := range dc.IDs {
-			total += int64(lens[id])
-		}
-
-		return total
-	}
-
-	for i := 0; i+1 < len(dc.IDs); i += 2 {
-		total += int64(lens[uint16(dc.IDs[i])<<8|uint16(dc.IDs[i+1])])
-	}
-
-	return total
-}
-
 // entryID returns row i's index into the column's dictionary entry table. Only defined for the dict
-// form (the merge's split carry, which is armed only when every source has one).
-func (m *mergeByteCol) entryID(i int) int32 {
-	dc := m.dict
+// form.
+func (m *mergeByteCol) entryID(i int) int32 { return dictID(m.dict, i) }
+
+// dictID returns row i's entry id in a dictionary-encoded column (IDWidth 1 or 2).
+func dictID(dc *chunk.DictColumn, i int) int32 {
 	if dc.IDWidth == 1 {
 		return int32(dc.IDs[i])
 	}
@@ -155,58 +123,10 @@ func (p *part) readForMerge(ctx context.Context) (*decodedPart, error) {
 	return d, nil
 }
 
-// decodedShape sizes a merge's output buffer from its decoded sources: their total row count and,
-// per byte column, the blob their cells expand to. capBytes (0 ⇒ no seal) scales it down to what one
-// output part holds, so a merge emitting many parts does not size its buffer for all of them.
-//
-// A column carrying the split form (dicts[k] non-nil) accumulates ids, not bytes, so it gets no blob
-// hint — its rows-sized id array is what [recordCols.prepare] arms. Its expanded bytes still count
-// towards the total that scales the row estimate: that is the decoded footprint capBytes bounds.
-//
-// The estimate is an upper bound — retention drops rows the sources still carry — and the buffer
-// grows past it as normal if it is short.
-func decodedShape(decoded []*decodedPart, dicts []*mergeDict, capBytes int64) (rows int, blob []int) {
-	if len(decoded) == 0 {
-		return 0, nil
-	}
-
-	blob = make([]int, len(decoded[0].bytes))
-
-	var total int64
-
-	for _, d := range decoded {
-		rows += len(d.ts)
-		total += int64(len(d.ts)) * int64(8+8*len(d.ints)+streamIDBytes)
-
-		for k := range d.bytes {
-			n := d.bytes[k].expandedBytes()
-			total += n
-
-			if len(dicts) == 0 || dicts[k] == nil {
-				blob[k] += int(n)
-			}
-		}
-	}
-
-	if capBytes <= 0 || total <= capBytes {
-		return rows, blob
-	}
-
-	scale := float64(capBytes) / float64(total)
-	rows = int(float64(rows) * scale)
-
-	for k := range blob {
-		blob[k] = int(float64(blob[k]) * scale)
-	}
-
-	return rows, blob
-}
-
-// appendMergeRow appends row i of decoded source part number part to c (every schema column; the
-// merge rewrites them all). A split byte column takes the row's dictionary id through the union
-// remap — no cell is read or copied; a flat one copies the cell into c's blob, so it no longer
-// aliases the source part.
-func (c *recordCols) appendMergeRow(d *decodedPart, part, i int) {
+// appendMergeRow appends row i of decoded source part d to c (every schema column; the merge rewrites
+// them all). A split byte column takes the row's dictionary id through the union remap — no cell is
+// read or copied; a flat one copies the cell into c's blob, so it no longer aliases the source part.
+func (c *recordCols) appendMergeRow(d *decodedPart, i int) {
 	c.ts = append(c.ts, d.ts[i])
 	c.noteTS(d.ts[i])
 
@@ -214,27 +134,23 @@ func (c *recordCols) appendMergeRow(d *decodedPart, part, i int) {
 		c.ints[k] = append(c.ints[k], d.ints[k][i])
 	}
 
-	split := c.splitBytes
 	for k := range c.bytes {
-		if split != nil {
-			if sc := split[k]; sc != nil {
-				sc.append(sc.dict.remap[part][d.bytes[k].entryID(i)])
+		if sc := c.splitAt(k); sc != nil {
+			sc.append(d.remap[k][d.bytes[k].entryID(i)])
 
-				continue
-			}
+			continue
 		}
 
 		c.bytes[k].appendCell(d.bytes[k].at(i))
 	}
 }
 
-// appendMergeWindow appends rows [rng.start, rng.end) of source part number part whose timestamp is
-// in [start, end] to acc.
-func appendMergeWindow(acc *recordCols, d *decodedPart, part int, rng rowRange, start, end int64) {
+// appendMergeWindow appends rows [rng.start, rng.end) of d whose timestamp is in [start, end] to acc.
+func appendMergeWindow(acc *recordCols, d *decodedPart, rng rowRange, start, end int64) {
 	if d.tsSorted {
 		w := tsWindow(d.ts, rng, start, end)
 		for i := w.start; i < w.end; i++ {
-			acc.appendMergeRow(d, part, i)
+			acc.appendMergeRow(d, i)
 		}
 
 		return
@@ -242,7 +158,7 @@ func appendMergeWindow(acc *recordCols, d *decodedPart, part int, rng rowRange, 
 
 	for i := rng.start; i < rng.end; i++ {
 		if d.ts[i] >= start && d.ts[i] <= end {
-			acc.appendMergeRow(d, part, i)
+			acc.appendMergeRow(d, i)
 		}
 	}
 }

@@ -155,7 +155,7 @@ func (c *goldenCorpus) mergeAll(t *testing.T, retainFrom int64) {
 // goldenMergeCorpus builds a store over b and merges it twice: first the flushed parts, then those
 // merged parts together with new flushes under retention, so the second round reads merge output —
 // compressed, and carrying the merge's own dictionary layout — as well as flushed parts.
-func goldenMergeCorpus(t *testing.T, b backend.Backend, maxPartBytes int64) *recordengine.Engine {
+func goldenMergeCorpus(t *testing.T, b backend.Backend, maxPartBytes, window int64) *recordengine.Engine {
 	t.Helper()
 
 	ctx := context.Background()
@@ -167,6 +167,7 @@ func goldenMergeCorpus(t *testing.T, b backend.Backend, maxPartBytes int64) *rec
 		}),
 		rnd: rand.New(rand.NewPCG(7, 11)),
 	}
+	c.e.SetMergeReadWindow(window)
 	t.Cleanup(func() { require.NoError(t, c.e.Close(context.WithoutCancel(ctx))) })
 
 	for s := range goldenStreams {
@@ -219,7 +220,8 @@ func partDigest(t *testing.T, e *recordengine.Engine, b backend.Backend) string 
 }
 
 // TestMergeOutputGolden pins the merged parts byte for byte, whatever backend the sources are read
-// through: how a merge reads its sources is not allowed to change what it writes.
+// through and however far ahead: how a merge reads its sources is not allowed to change what it
+// writes. A zero window reads frame by frame; 4 KiB is below one frame, so every read serves one.
 func TestMergeOutputGolden(t *testing.T) {
 	t.Parallel()
 
@@ -259,14 +261,16 @@ func TestMergeOutputGolden(t *testing.T) {
 			{"single", 0, "merge_output_single.txt"},
 			{"split", 256 << 10, "merge_output_split.txt"},
 		} {
-			t.Run(tc.name+"/"+shape.name, func(t *testing.T) {
-				t.Parallel()
+			for _, window := range []int64{0, 4 << 10, 1 << 20} {
+				t.Run(fmt.Sprintf("%s/%s/window=%d", tc.name, shape.name, window), func(t *testing.T) {
+					t.Parallel()
 
-				b := tc.open(t)
-				e := goldenMergeCorpus(t, b, shape.maxPart)
+					b := tc.open(t)
+					e := goldenMergeCorpus(t, b, shape.maxPart, window)
 
-				gold.Str(t, partDigest(t, e, b), shape.goldFile)
-			})
+					gold.Str(t, partDigest(t, e, b), shape.goldFile)
+				})
+			}
 		}
 	}
 }

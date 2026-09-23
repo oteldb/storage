@@ -264,6 +264,35 @@ func (c *recordCols) armSplit(dicts []*mergeDict) {
 	}
 }
 
+// unsplit moves byte column k from the split carry to the flat one, expanding the ids it holds into
+// cells. The blob is reserved for as many rows as the timestamp column has room for, at the average
+// cell size so far, and at least reserve bytes — so a merge buffer that falls back part-way does not
+// regrow from here.
+func (c *recordCols) unsplit(k, reserve int) {
+	sc := c.splitAt(k)
+	if sc == nil {
+		return
+	}
+
+	rows := max(cap(c.ts), len(sc.ids))
+
+	blob := sc.bytes
+	if n := int64(len(sc.ids)); n > 0 {
+		blob = sc.bytes * int64(rows) / n
+	}
+
+	var bc byteCol
+
+	bc.ensureBytes(rows, max(int(blob), reserve))
+
+	for _, id := range sc.ids {
+		bc.appendCell(sc.dict.entries[id])
+	}
+
+	c.bytes[k] = bc
+	c.splitBytes[k] = nil
+}
+
 // splitAt returns byte column k's split carrier, or nil when it is on the flat path.
 func (c *recordCols) splitAt(k int) *splitCol {
 	if c.splitBytes == nil {

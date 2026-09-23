@@ -14,19 +14,188 @@ var mergeSplitDict = true
 // only (see export_test.go); nil in every non-test build.
 var mergeSplitObserver func(split []bool)
 
-// mergeDict is the union of the selected source parts' byte-column dictionaries for one column,
-// built once per merge. entries is distinct by value — the precondition [block.Column]'s split form
-// imposes — and remap[p][id] is the union id of source part p's entry id.
+// mergeDict is the union of one byte column's dictionary entries across a merge's sources, built as
+// the sources are read: a granule's entries are looked up, and added when new, once per granule rather
+// than once per row. entries is distinct by value — the precondition [block.Column]'s split form
+// imposes — and owns its bytes, since a streamed granule's entries alias a decode buffer that the
+// next granule reuses.
 //
-// Building it costs one hash probe per distinct entry per source part, never one per row: a column
-// of tens of millions of rows over a few thousand distinct values pays a few thousand probes, where
-// the flat path copies and re-hashes every cell twice.
-//
-// The union may exceed 65536 entries with no fallback needed. The writer renumbers per granule, so
-// the emitted id width is bounded by a granule's distinct count, not the union's.
+// Its order is first-seen, not any source's. That is free to differ from a whole decode's, because
+// the writer renumbers per granule and emits the same object for any entry order.
 type mergeDict struct {
 	entries [][]byte
-	remap   [][]int32
+	// index is taken from its pool on the first entry, not when the merge arms the column: columns
+	// open one after another and each hands its index back when its sources have all opened, so a
+	// merge reuses one grown index across columns rather than growing one per column.
+	index   *pool.ByteIntMap
+	settled bool
+	slab    []byte
+}
+
+// mergeDictSlabBytes is the arena chunk union entries are copied into, so a union of small values
+// costs one allocation per chunk rather than one per entry.
+const mergeDictSlabBytes = 64 << 10
+
+func newMergeDict() *mergeDict { return &mergeDict{} }
+
+// id returns v's union id, adding a copy of v when the union does not hold it yet.
+func (m *mergeDict) id(v []byte) int32 { return m.add(v, false) }
+
+// add returns v's union id, adding v when the union does not hold it yet: as is when stable says v
+// outlives the merge's use of the union, as a copy otherwise.
+func (m *mergeDict) add(v []byte, stable bool) int32 {
+	if m.index == nil {
+		if m.settled {
+			panic("recordengine: entry added to a settled merge union")
+		}
+
+		m.index = pool.NewByteIntMap()
+	}
+
+	if id, ok := m.index.Get(v); ok {
+		return int32(id)
+	}
+
+	if !stable {
+		v = m.own(v)
+	}
+
+	id := len(m.entries)
+	m.entries = append(m.entries, v)
+	m.index.Put(v, id)
+
+	return int32(id)
+}
+
+// remap appends the union id of every entry of src to dst[:0]; stable is as for [mergeDict.add].
+func (m *mergeDict) remap(dst []int32, src [][]byte, stable bool) []int32 {
+	dst = dst[:0]
+	for _, v := range src {
+		dst = append(dst, m.add(v, stable))
+	}
+
+	return dst
+}
+
+func (m *mergeDict) own(v []byte) []byte {
+	if len(v) > mergeDictSlabBytes/8 {
+		return append([]byte(nil), v...)
+	}
+
+	if cap(m.slab)-len(m.slab) < len(v) {
+		m.slab = make([]byte, 0, mergeDictSlabBytes)
+	}
+
+	m.slab = append(m.slab, v...)
+
+	return m.slab[len(m.slab)-len(v) : len(m.slab) : len(m.slab)]
+}
+
+// release returns the lookup index to its pool; the union takes no entry after it. The entries stay
+// valid for whoever still holds them.
+func (m *mergeDict) release() {
+	m.settled = true
+
+	if m.index != nil {
+		m.index.PutBack()
+		m.index = nil
+	}
+}
+
+// mergeUnionEntriesPerSource bounds a union at this many entries per source part: the most a column
+// can carry while every source holds a real dictionary of its own. A package var only so a test can
+// reach the bound without writing parts of that many distinct values.
+var mergeUnionEntriesPerSource = 1 << 16
+
+// mergeCarry is one merge's byte-column carry: per column, the union dictionary its rows move as ids
+// into, or nil where the column moves as copied cells, together with the two accumulators armed with
+// them. The per-column choice starts from the codec and can only fall back, never return: see
+// [mergeCarry.flatten].
+type mergeCarry struct {
+	dicts []*mergeDict
+	// lazy counts per column the sources that resolve entries into its union as they read it.
+	lazy       []int
+	acc, buf   *recordCols
+	maxEntries int
+	// flatBlob is the blob the output buffer reserves per column should it fall back, for a column
+	// that falls back before its average cell size is known.
+	flatBlob []int
+}
+
+// newMergeCarry arms acc and buf for a merge of sources parts. A column takes the split carry when
+// the schema's codec accepts the split form; a raw column has no dictionary for the writer to take.
+func newMergeCarry(schema *Schema, sources int, acc, buf *recordCols) *mergeCarry {
+	m := &mergeCarry{
+		dicts:      make([]*mergeDict, schema.numBytes()),
+		lazy:       make([]int, schema.numBytes()),
+		acc:        acc,
+		buf:        buf,
+		maxEntries: max(sources, 1) * mergeUnionEntriesPerSource,
+	}
+
+	split := make([]bool, len(m.dicts))
+
+	for k := range m.dicts {
+		codec := schema.byteColumn(k).Codec
+		if mergeSplitDict && (codec == chunk.CodecNone || codec == chunk.CodecDict) {
+			m.dicts[k] = newMergeDict()
+			split[k] = true
+		}
+	}
+
+	observeMergeSplit(split)
+
+	acc.armSplit(m.dicts)
+	buf.armSplit(m.dicts)
+
+	return m
+}
+
+// settle drops column k's lookup index once no source will add to its union any more: when every
+// source was read whole, and so resolved into it as it opened. Only a source read granule by granule
+// meets new entries during the stream sweep.
+func (m *mergeCarry) settle(k int) {
+	if d := m.dicts[k]; d != nil && m.lazy[k] == 0 {
+		d.release()
+	}
+}
+
+// grew checks column k's union after it took new entries, falling the column back to the flat
+// carry once the union outgrows the bound.
+func (m *mergeCarry) grew(k int) {
+	if d := m.dicts[k]; d != nil && len(d.entries) > m.maxEntries {
+		m.flatten(k)
+	}
+}
+
+// flatten moves byte column k onto the flat carry for the rest of the merge, expanding the ids both
+// accumulators already hold. A column falls back when its union grows past the bound or a source
+// hands it a granule with no dictionary at all — the >65536-distinct fallback — whose rows would
+// otherwise each add an entry. The output is the same object either way; only what the merge holds
+// to produce it changes.
+func (m *mergeCarry) flatten(k int) {
+	d := m.dicts[k]
+	if d == nil {
+		return
+	}
+
+	var reserve int
+	if k < len(m.flatBlob) {
+		reserve = m.flatBlob[k]
+	}
+
+	m.acc.unsplit(k, 0)
+	m.buf.unsplit(k, reserve)
+	d.release()
+	m.dicts[k] = nil
+}
+
+func (m *mergeCarry) release() {
+	for _, d := range m.dicts {
+		if d != nil {
+			d.release()
+		}
+	}
 }
 
 // splitCol carries one byte column of a merge accumulator as ids into a shared [mergeDict] rather
@@ -103,86 +272,8 @@ func (s *splitCol) keep(lo, hi int) {
 	}
 }
 
-// buildMergeDicts builds the per-byte-column union dictionary for a merge, or nil where the column
-// must stay on the flat path. The decision is per column and made once, before any row is appended:
-// a column takes the split path only when *every* selected source decoded to a real dictionary and
-// the schema's codec accepts the split form. A mixed set is therefore normal — one column carries
-// ids while its neighbor carries a blob, in the same merge and the same accumulator.
-//
-// A single flat source (the >65536-distinct dictionary fallback, or a [chunk.CodecBytesRaw] column
-// such as trace_id, both of which decode with IDWidth 0) has no entry table to union, so its column
-// keeps the flat path for the whole merge rather than being expanded into a synthetic one.
-func buildMergeDicts(schema *Schema, decoded []*decodedPart) []*mergeDict {
-	if !mergeSplitDict || len(decoded) == 0 {
-		observeMergeSplit(make([]bool, schema.numBytes()))
-
-		return nil
-	}
-
-	var (
-		out  = make([]*mergeDict, schema.numBytes())
-		some bool
-	)
-
-	for k := range out {
-		out[k] = buildMergeDict(schema.byteColumn(k), decoded, k)
-		some = some || out[k] != nil
-	}
-
-	if mergeSplitObserver != nil {
-		split := make([]bool, len(out))
-		for k := range out {
-			split[k] = out[k] != nil
-		}
-
-		observeMergeSplit(split)
-	}
-
-	if !some {
-		return nil
-	}
-
-	return out
-}
-
 func observeMergeSplit(split []bool) {
 	if mergeSplitObserver != nil {
 		mergeSplitObserver(split)
 	}
-}
-
-func buildMergeDict(col Column, decoded []*decodedPart, k int) *mergeDict {
-	// The split form is dictionary-only at the block seam; a raw column would be rejected there.
-	if col.Codec != chunk.CodecNone && col.Codec != chunk.CodecDict {
-		return nil
-	}
-
-	for _, d := range decoded {
-		if d.bytes[k].dict == nil {
-			return nil
-		}
-	}
-
-	m := &mergeDict{remap: make([][]int32, len(decoded))}
-
-	idx := pool.NewByteIntMap()
-	defer idx.PutBack()
-
-	for p, d := range decoded {
-		src := d.bytes[k].dict.Entries
-		remap := make([]int32, len(src))
-
-		for i, e := range src {
-			id, existed := idx.PutOrGet(e, len(m.entries))
-			if !existed {
-				m.entries = append(m.entries, e)
-			}
-
-			remap[i] = int32(id)
-		}
-
-		m.remap[p] = remap
-	}
-
-	return m
 }

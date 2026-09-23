@@ -58,6 +58,6 @@ func BenchmarkMergeRetentionWindow(b *testing.B) {
 		}
 
 		acc.prepare(headTestSchema, 0, fullSel(headTestSchema))
-		appendMergeWindow(acc, d, 0, rng, n/2, maxInt64)
+		appendMergeWindow(acc, d, rng, n/2, maxInt64)
 	}
 }

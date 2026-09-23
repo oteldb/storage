@@ -270,12 +270,15 @@ them. At S3 latencies that is the difference between a merge finishing and not.
   read the column once per window. The check is by type, so a wrapper that claims `ReaderAt` over a
   store that cannot range (an `s3.ObjectStore` without `RangeObjectStore`) still pays per window.
 - `Decoder.TsCursor` / `Decoder.FloatCursor` are `ColumnReader`'s forward cursors over the decoder's
-  frames, which is how the metrics merge reads its sources.
+  frames, which is how the metrics merge reads its sources. The record merge decodes granules instead
+  (`DecodeInt64Into`, `DecodeBytesBlock`), since it filters rows and remaps dictionaries per granule.
 - `Decoder.DecodeBytesBlock` decodes one granule against the cached frame. The result **aliases that
   frame buffer** and dies at the next decode crossing a frame — deliberately: a merge reads a
   granule's ids and appends them, and copying every value back would be the per-row cost this path
-  exists to remove. A granule on the shared dictionary yields the *column's* entry table unchanged,
-  so ids stay comparable across granules and nothing is rehashed per granule.
+  exists to remove. A granule on the shared dictionary yields the *column's* entry table unchanged —
+  the very slice `SharedEntries` returns, which is how the record merge recognizes it and resolves
+  the dictionary into its union once — so ids stay comparable across granules and nothing is
+  rehashed per granule.
 
 ## At-rest checksums
 

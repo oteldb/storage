@@ -34,7 +34,7 @@ func mergeWindowPart(ts []int64) *decodedPart {
 
 func appendedWindow(d *decodedPart, rng rowRange, start, end int64) *recordCols {
 	acc := newRecordCols(headTestSchema, 0, fullSel(headTestSchema))
-	appendMergeWindow(acc, d, 0, rng, start, end)
+	appendMergeWindow(acc, d, rng, start, end)
 
 	return acc
 }
