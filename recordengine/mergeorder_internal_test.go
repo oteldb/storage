@@ -252,3 +252,67 @@ func TestMergeCopiesSelfGranuleEntries(t *testing.T) {
 
 	assert.Equal(t, partObjects(t, be, whole), partObjects(t, be, streamed))
 }
+
+// TestMergeFailsOnUndrainedCursor: a forward cursor serves a stream only when the sweep asks for it by
+// id, so a sweep that skipped one would leave the cursor holding every later stream of the part, and
+// the merge would write a part without their rows. It must fail instead, naming the part and stream.
+func TestMergeFailsOnUndrainedCursor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := backend.Memory()
+	e := New(Config{Schema: headTestSchema, Backend: be, Prefix: "t/drain"})
+	p := writeTestPart(t, e, be, streamColumns(t, e, map[string][]int64{"a": {1, 2}, "b": {3}, "c": {4}}))
+	require.Len(t, p.ranges, 3)
+
+	acc := newRecordCols(headTestSchema, 0, fullSel(headTestSchema))
+	buf := newRecordCols(headTestSchema, 0, fullSel(headTestSchema))
+	carry := newMergeCarry(headTestSchema, 1, acc, buf)
+	t.Cleanup(carry.release)
+
+	sources, err := e.openMergeSources(ctx, []*part{p}, carry)
+	require.NoError(t, err)
+
+	acc.prepare(headTestSchema, 0, fullSel(headTestSchema))
+	require.NoError(t, sources[0].appendStream(acc, p.ranges[0].id, minInt64, maxInt64))
+	require.NoError(t, sources[0].appendStream(acc, p.ranges[2].id, minInt64, maxInt64),
+		"the cursor ignores a stream it is not positioned at")
+
+	err = checkDrained([]*part{p}, sources)
+	require.ErrorIs(t, err, block.ErrCorrupt)
+	assert.Contains(t, err.Error(), p.prefix)
+	assert.Contains(t, err.Error(), p.ranges[1].id.String())
+	assert.Contains(t, err.Error(), "2 of 3 streams unread")
+
+	require.NoError(t, sources[0].appendStream(acc, p.ranges[1].id, minInt64, maxInt64))
+	require.NoError(t, sources[0].appendStream(acc, p.ranges[2].id, minInt64, maxInt64))
+	require.NoError(t, checkDrained([]*part{p}, sources))
+}
+
+// TestCompactPartsFailsWhenTheSweepSkipsAStream: the merge itself, not only the check, refuses to
+// write a part once a stream went unread — before the final part is written.
+//
+//nolint:paralleltest // flips a package-level seam
+func TestCompactPartsFailsWhenTheSweepSkipsAStream(t *testing.T) {
+	ctx := context.Background()
+	be := backend.Memory()
+	e := New(Config{Schema: headTestSchema, Backend: be, Prefix: "t/skip"})
+	p := writeTestPart(t, e, be, streamColumns(t, e, map[string][]int64{"a": {1, 2}, "b": {3}, "c": {4}}))
+	skipped := p.ranges[1].id
+
+	before, err := be.List(ctx, "")
+	require.NoError(t, err)
+
+	mergeSkipStream = func(id signal.SeriesID) bool { return id == skipped }
+
+	t.Cleanup(func() { mergeSkipStream = nil })
+
+	out, err := e.compactParts(ctx, []*part{p}, minInt64, 0)
+	require.ErrorIs(t, err, block.ErrCorrupt)
+	assert.Contains(t, err.Error(), skipped.String())
+	assert.Empty(t, out)
+
+	after, err := be.List(ctx, "")
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "no part was written")
+}

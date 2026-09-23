@@ -208,8 +208,12 @@ arrived unsorted, so its sorted ids can point backwards through the rows. `forwa
 `p.ranges` once at open (`mergestream.CheckForward`); a part that fails is decoded whole
 (`readForMerge`, `wholeSource`) and counted as `stream_order` corruption. The cursor addresses granules
 by row, so a range stepping back would only cost it re-fetched frames; but it takes one range per
-stream, and an unsorted stream column can hold a stream in two runs, adjacent after the sort. The
-whole source appends *every* run — a lookup returning one of them loses the other's rows.
+stream, and an unsorted stream column can hold a stream in two runs, adjacent after the sort. So
+`forwardReadable` also requires strictly ascending ids, and the whole source appends *every* run — a
+lookup returning one of them loses the other's rows. A cursor serves a stream only when the sweep asks
+for its id, so one the sweep skipped would strand every later stream of the part; `checkDrained` fails
+the merge with `block.ErrCorrupt` before its last part is written rather than commit a part missing
+them.
 
 **What it holds, measured.** The output is still buffered, so the read side lowers the peak only where
 the sources were a term of it. `TestMergeResidentFlatInPartSize` (trace-shaped, file backend, output

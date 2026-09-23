@@ -28,6 +28,10 @@ type mergeSource interface {
 // [partCursor] rather than decoded whole. Test seam only (see export_test.go).
 var mergeReadObserver func(streamed []bool)
 
+// mergeSkipStream, when non-nil, makes the stream sweep pass over the streams it reports: the sweep
+// losing a stream, which [checkDrained] must turn into a failed merge. Test seam only.
+var mergeSkipStream func(id signal.SeriesID) bool
+
 // mergeReadWhole forces every source onto the whole decode, the oracle a [partCursor] merge is
 // compared against. Test seam only; never set outside tests.
 var mergeReadWhole = false
@@ -120,13 +124,18 @@ func (e *Engine) disorderReporter(ctx context.Context, p *part) func(msg string)
 	}
 }
 
-// forwardReadable reports whether a forward cursor can serve the part's streams in id order: each
-// stream's rows must begin at or past where the previous stream's ended. [buildRanges] sorts the
-// ranges of a part whose stream column arrived unsorted, and those then point backwards.
+// forwardReadable reports whether a forward cursor can serve the part's streams in id order: ids must
+// be strictly ascending, since the cursor takes one range per stream, and each stream's rows must
+// begin at or past where the previous stream's ended. [buildRanges] sorts the ranges of a part whose
+// stream column arrived unsorted, and those then point backwards or repeat an id.
 func forwardReadable(ranges []streamRange) bool {
 	pos := 0
 
-	for _, r := range ranges {
+	for i, r := range ranges {
+		if i > 0 && r.id.Compare(ranges[i-1].id) <= 0 {
+			return false
+		}
+
 		if mergestream.CheckForward(pos, r.start, r.end) != nil {
 			return false
 		}
@@ -135,6 +144,23 @@ func forwardReadable(ranges []streamRange) bool {
 	}
 
 	return true
+}
+
+// checkDrained fails a merge in which a forward cursor was left holding streams: the sweep never
+// asked for them, so their rows are missing from the output, and a merge that lost rows must not
+// commit.
+func checkDrained(src []*part, sources []mergeSource) error {
+	for i, s := range sources {
+		c, ok := s.(*partCursor)
+		if !ok || c.next == len(c.ranges) {
+			continue
+		}
+
+		return errors.Wrapf(block.ErrCorrupt, "merge left part %q at stream %v, %d of %d streams unread",
+			src[i].prefix, c.ranges[c.next].id, len(c.ranges)-c.next, len(c.ranges))
+	}
+
+	return nil
 }
 
 // mergeShape sizes a merge's output buffer from its sources' manifests, without reading a column:

@@ -198,6 +198,8 @@ func TestForwardReadable(t *testing.T) {
 		{"gap", []streamRange{rng(1, 0, 3), rng(2, 4, 5)}, true},
 		{"backwards", []streamRange{rng(1, 3, 5), rng(2, 0, 3)}, false},
 		{"repeated stream", []streamRange{rng(1, 0, 1), rng(1, 2, 3), rng(2, 1, 2)}, false},
+		{"repeated stream in row order", []streamRange{rng(1, 0, 1), rng(1, 1, 2)}, false},
+		{"descending ids in row order", []streamRange{rng(2, 0, 1), rng(1, 1, 2)}, false},
 		{"inverted", []streamRange{rng(1, 2, 1)}, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

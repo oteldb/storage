@@ -393,6 +393,9 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 
 	for keys.Next() {
 		id := keys.Key()
+		if mergeSkipStream != nil && mergeSkipStream(id) {
+			continue
+		}
 
 		acc.prepare(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
 
@@ -429,6 +432,10 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 				return nil, err
 			}
 		}
+	}
+
+	if err := checkDrained(src, sources); err != nil {
+		return nil, err
 	}
 
 	if err := emit(); err != nil {
