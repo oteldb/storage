@@ -143,28 +143,6 @@ type densityResult struct {
 	bppTotal, bppParts float64
 }
 
-// isPartKey reports whether a backend key names a flushed value part (`{prefix}/{seq:010d}`),
-// as opposed to the identity index (`series.bin`) or the bucket index. Part objects have an
-// all-digit final path segment.
-func isPartKey(key string) bool {
-	last := key
-	for i := len(key) - 1; i >= 0; i-- {
-		if key[i] == '/' {
-			last = key[i+1:]
-			break
-		}
-	}
-	if last == "" {
-		return false
-	}
-	for i := range len(last) {
-		if last[i] < '0' || last[i] > '9' {
-			return false
-		}
-	}
-	return true
-}
-
 // measureDensity ingests one profile into a durable in-memory backend, flushes + compacts it
 // to steady-state parts, and totals the resulting on-disk bytes. It uses the public backend
 // seam (List + Read) so the number is backend-agnostic and would be identical on file/S3.
@@ -196,7 +174,7 @@ func measureDensity(tb testing.TB, p corpusProfile) densityResult {
 
 		n := int64(len(data))
 		res.totalBytes += n
-		if isPartKey(k) {
+		if goldenIsPartKey(k) {
 			res.partBytes += n
 		} else {
 			res.indexBytes += n
@@ -275,7 +253,7 @@ func measureLossyDensity(tb testing.TB, p corpusProfile, bits uint8) densityResu
 
 		n := int64(len(data))
 		res.totalBytes += n
-		if isPartKey(k) {
+		if goldenIsPartKey(k) {
 			res.partBytes += n
 		} else {
 			res.indexBytes += n

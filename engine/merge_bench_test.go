@@ -20,6 +20,9 @@ import (
 // each source column is held as one read-ahead window and decoded one series range at a time, so
 // neither a source's decoded nor its encoded column is resident. TestMergeResidentFlatInPartSize
 // measures it; the file cases here price the ranged reads that buy it.
+//
+// Throughput is the logical samples merged × [engine.SampleBytes], neither the parts' on-disk nor
+// their decoded bytes, so its MB/s does not compare with the record engine's merge benchmarks.
 func BenchmarkMergeResidentMemory(b *testing.B) {
 	for _, cfg := range []struct {
 		name    string
@@ -45,7 +48,7 @@ func BenchmarkMergeResidentMemory(b *testing.B) {
 			}
 
 			b.ReportAllocs()
-			b.SetBytes(int64(cfg.series * cfg.samples * cfg.parts * 16))
+			b.SetBytes(int64(cfg.series*cfg.samples*cfg.parts) * engine.SampleBytes)
 			b.ResetTimer()
 
 			for range b.N {
@@ -64,32 +67,9 @@ func BenchmarkMergeResidentMemory(b *testing.B) {
 					Backend: be, Prefix: "default/metrics", MaxPartBytes: 0,
 				})
 
-				for p := range cfg.parts {
-					// cfg.samples consecutive samples per series in this flush: ids repeats each
-					// series id cfg.samples times (AppendBatch writes one sample per ids[i]).
-					n := cfg.series * cfg.samples
-					batchIDs := make([]signal.SeriesID, n)
-					ts := make([]int64, n)
-					vals := make([]float64, n)
-
-					k := 0
-					for i := range cfg.series {
-						for s := range cfg.samples {
-							batchIDs[k] = ids[i]
-							ts[k] = int64(p*cfg.samples+s)*15 + int64(i)
-							vals[k] = float64(p*cfg.series + i)
-							k++
-						}
-					}
-
-					if _, err := e.AppendBatch(batchIDs, ts, vals, nil, func(i int) signal.Series { return series[i/cfg.samples] }, engine.AppendLimits{}); err != nil {
-						b.Fatal(err)
-					}
-
-					if err := e.Flush(ctx); err != nil {
-						b.Fatal(err)
-					}
-				}
+				flushCorpus(b, ctx, e, series, ids, cfg.samples, cfg.parts,
+					func(p, i, s int) int64 { return int64(p*cfg.samples+s)*15 + int64(i) },
+					func(p, i, _ int) float64 { return float64(p*cfg.series + i) })
 
 				b.StartTimer()
 

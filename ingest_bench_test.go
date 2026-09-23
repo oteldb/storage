@@ -10,7 +10,7 @@ import (
 // The live /src/oteldb/benchmark profile shows oteldb's at-rest CPU is 100% ingest (vmagent
 // remote-writes 2560 node_exporter series every 15s), and the top live-heap holder is
 // slices.Clone[uint8] — the per-series label/attribute byte clones taken on the head append path.
-// This benchmark drives that exact path with the node_exporter-shaped headCorpus (2560 series,
+// This benchmark drives that exact path with the node_exporter-shaped head-scale corpus (2560 series,
 // 4 labels each: job/instance on the resource, cpu/mode on the points) so the clone + projection +
 // head-append costs show up cleanly under pprof, isolated from the docker harness:
 //
@@ -25,7 +25,7 @@ import (
 func BenchmarkHeadIngest(b *testing.B) {
 	ctx := context.Background()
 
-	md := headCorpus()
+	md := nodeCPUCorpus(headInstances, headCPUs, headPoints)
 	total := headSeries * headPoints
 
 	// ~1M buffered points between resets: amortizes one-time series registration over many appends

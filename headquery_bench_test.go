@@ -24,9 +24,6 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/oteldb/storage/signal"
-	"github.com/oteldb/storage/signal/metric"
 )
 
 const (
@@ -39,46 +36,6 @@ const (
 	headPoints = 64
 	headSeries = headInstances * headCPUs * nodeModes // 2560
 )
-
-// headCorpus builds the deterministic node_cpu_seconds_total workload at head scale (no RNG): per
-// instance, a cumulative monotonic counter over every (cpu, mode) pair, each a ramp of headPoints
-// samples. Mirrors nodeCPUCorpus but at headInstances width so the head holds ~2560 series.
-func headCorpus() metric.Metrics {
-	var md metric.Metrics
-
-	for inst := range headInstances {
-		rm := md.AddResource()
-		rm.Resource = signal.Resource{Attributes: signal.NewAttributes(
-			signal.KeyValue{Key: []byte("job"), Value: signal.StringValue([]byte("node_exporter"))},
-			signal.KeyValue{Key: []byte("instance"), Value: signal.StringValue(append([]byte("host-"), itoa(inst)...))},
-		)}
-
-		mt := rm.AddScope().AddMetric()
-		mt.Name = nodeCPUName
-		mt.Kind = metric.KindSum
-		mt.Temporality = metric.TemporalityCumulative
-		mt.Monotonic = true
-
-		for cpu := range headCPUs {
-			for mode := range nodeCPUModes {
-				attrs := signal.NewAttributes(
-					signal.KeyValue{Key: []byte("cpu"), Value: signal.StringValue([]byte(itoa(cpu)))},
-					signal.KeyValue{Key: []byte("mode"), Value: signal.StringValue([]byte(nodeCPUModes[mode]))},
-				)
-
-				for p := range headPoints {
-					pt := mt.AddPoint()
-					pt.Ts = goldenStartTs + int64(p)*goldenInterval
-					pt.StartTs = goldenStartTs
-					pt.Value = float64(p)
-					pt.Attributes = attrs
-				}
-			}
-		}
-	}
-
-	return md
-}
 
 // headCPUStore ingests the head-scale corpus into an ephemeral (head-resident, never flushed) store,
 // so queries exercise the live head fetch path. Deliberately NO flush: the corpus stays in the head,
@@ -94,7 +51,7 @@ func headCPUStore(b *testing.B) *Storage {
 		b.Fatal(err)
 	}
 
-	if _, err := s.WriteMetrics(ctx, headCorpus()); err != nil {
+	if _, err := s.WriteMetrics(ctx, nodeCPUCorpus(headInstances, headCPUs, headPoints)); err != nil {
 		b.Fatal(err)
 	}
 

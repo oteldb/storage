@@ -1,6 +1,7 @@
 package chunk
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -49,7 +50,7 @@ type dictIDCase struct {
 func distinctEntries(n int) [][]byte {
 	entries := make([][]byte, n)
 	for i := range n {
-		entries[i] = []byte("v-" + itoa(i))
+		entries[i] = []byte("v-" + strconv.Itoa(i))
 	}
 
 	return entries

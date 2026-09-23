@@ -45,27 +45,9 @@ func mergeCorpus(t *testing.T, series, samples, parts int, value func(r *rand.Ra
 		ids[i] = ser[i].Hash()
 	}
 
-	n := series * samples
-	batch := make([]signal.SeriesID, n)
-	ts := make([]int64, n)
-	vals := make([]float64, n)
-
-	for p := range parts {
-		k := 0
-		for i := range series {
-			for s := range samples {
-				batch[k] = ids[i]
-				ts[k] = int64((p*samples+s)*5000 + i%7)
-				vals[k] = value(r, i, p*samples+s)
-				k++
-			}
-		}
-
-		resolve := func(i int) signal.Series { return ser[i/samples] }
-		_, err := e.AppendBatch(batch, ts, vals, nil, resolve, engine.AppendLimits{})
-		require.NoError(t, err)
-		require.NoError(t, e.Flush(ctx))
-	}
+	flushCorpus(t, ctx, e, ser, ids, samples, parts,
+		func(p, i, s int) int64 { return int64((p*samples+s)*5000 + i%7) },
+		func(p, i, s int) float64 { return value(r, i, p*samples+s) })
 
 	return e, series * samples * parts
 }

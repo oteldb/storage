@@ -177,14 +177,14 @@ func TestPruneIdentitiesReclaimsHeap(t *testing.T) {
 
 	require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{RetainFrom: 500}))
 
-	before := heapAlloc()
+	before := liveHeap()
 	reportedBefore := e.Stats().IdentityBytes
 
 	removed, err := e.PruneIdentities(ctx)
 	require.NoError(t, err)
 	require.Equal(t, total-keep, removed)
 
-	after := heapAlloc()
+	after := liveHeap()
 	reportedAfter := e.Stats().IdentityBytes
 	runtime.KeepAlive(e)
 

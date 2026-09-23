@@ -22,10 +22,11 @@ var errFault = errors.New("transient fault")
 
 // faultStore is an [s3.ObjectStore] that injects latency and failures to exercise the retry/hedge
 // wrapper: the first GET may stall (getDelay), the first getFails GETs fail transiently, and CAS can
-// return a scripted error. It otherwise behaves like a tiny in-memory store.
+// return a scripted error. Unlike [fakeStore] it stores and returns values without copying, versions
+// every object "v", and lists nothing; Head and Delete are fakeStore's.
 type faultStore struct {
-	mu       sync.Mutex
-	objs     map[string][]byte
+	*fakeStore
+
 	getN     atomic.Int32
 	casN     atomic.Int32
 	getDelay time.Duration // applied on the first GET only
@@ -34,7 +35,7 @@ type faultStore struct {
 	casErr   error         // error returned by every PutObjectIfAbsent
 }
 
-func newFaultStore() *faultStore { return &faultStore{objs: map[string][]byte{}} }
+func newFaultStore() *faultStore { return &faultStore{fakeStore: newFakeStore()} }
 
 func (f *faultStore) GetObject(ctx context.Context, key string) ([]byte, error) {
 	n := f.getN.Add(1)
@@ -115,22 +116,6 @@ func (f *faultStore) PutObjectIfVersion(
 	f.objs[key] = data
 
 	return "v", true, nil
-}
-
-func (f *faultStore) HeadObject(_ context.Context, key string) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_, ok := f.objs[key]
-
-	return ok, nil
-}
-
-func (f *faultStore) DeleteObject(_ context.Context, key string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.objs, key)
-
-	return nil
 }
 
 func (f *faultStore) ListObjects(_ context.Context, _ string) ([]string, error) { return nil, nil }

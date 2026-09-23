@@ -2,6 +2,7 @@ package pool
 
 import (
 	"encoding/binary"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -131,10 +132,10 @@ func TestByteIntMapGrow(t *testing.T) {
 	defer m.PutBack()
 
 	for i := range 200 {
-		m.Put([]byte("key-"+itoa(i)), i)
+		m.Put([]byte("key-"+strconv.Itoa(i)), i)
 	}
 	for i := range 200 {
-		v, ok := m.Get([]byte("key-" + itoa(i)))
+		v, ok := m.Get([]byte("key-" + strconv.Itoa(i)))
 		require.Truef(t, ok, "Get(key-%d) missing", i)
 		require.Equalf(t, i, v, "Get(key-%d)", i)
 	}
@@ -223,20 +224,6 @@ func TestByteIntMapDeleteAllAndReinsert(t *testing.T) {
 	v, ok := m.Get([]byte("d"))
 	assert.True(t, ok)
 	assert.Equal(t, 4, v, "Get(d) after reinsert")
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
 }
 
 // TestByteIntMapDropsOversizedOnPutBack pins that a map which grew past [maxPooledSlots] is not

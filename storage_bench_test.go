@@ -56,21 +56,14 @@ var benchShapes = []struct {
 	{"10000series_1point", 10000, 1},
 }
 
-// reportIngestMetrics adds the point-oriented custom metrics that make an ingest benchmark
-// readable: the throughput (million points/sec) and the per-point cost (ns/point). Both are
-// derived from b.Elapsed (the timed duration, which excludes the reset work wrapped in
-// StopTimer) over the total points ingested across all b.N iterations.
+// reportIngestMetrics is [goldenReportPoints] plus the per-point cost (ns/point), both over
+// b.Elapsed, which excludes the reset work wrapped in StopTimer.
 func reportIngestMetrics(b *testing.B, pointsPerOp int) {
 	b.Helper()
 
-	totalPoints := float64(pointsPerOp) * float64(b.N)
-	secs := b.Elapsed().Seconds()
-	if totalPoints == 0 || secs == 0 {
-		return
+	if secs := goldenReportPoints(b, pointsPerOp); secs > 0 {
+		b.ReportMetric(secs*1e9, "ns/point")
 	}
-
-	b.ReportMetric(totalPoints/secs/1e6, "Mpoints/s")
-	b.ReportMetric(secs*1e9/totalPoints, "ns/point")
 }
 
 // BenchmarkWriteMetrics measures the end-to-end point-ingestion throughput of the storage

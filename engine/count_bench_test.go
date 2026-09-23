@@ -2,6 +2,7 @@ package engine_test
 
 import (
 	"context"
+	"strconv"
 	"testing"
 
 	"github.com/oteldb/storage/backend"
@@ -211,7 +212,7 @@ func buildGroupedSeries(n int, name string, groups int) ([]signal.Series, []sign
 	ids := make([]signal.SeriesID, n)
 
 	for i := range n {
-		ser[i] = mkSeries("__name__", name, "instance", "host-"+itoa(i), "cpu", itoa(i%groups))
+		ser[i] = mkSeries("__name__", name, "instance", "host-"+strconv.Itoa(i), "cpu", strconv.Itoa(i%groups))
 		ids[i] = ser[i].Hash()
 	}
 

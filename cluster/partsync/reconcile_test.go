@@ -7,6 +7,7 @@ package partsync_test
 
 import (
 	"context"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -21,7 +22,7 @@ const reconcilePrefix = "t/logs"
 
 // partObjects is every object writePart lands under seq.
 func partObjects(seq int) []string {
-	p := reconcilePrefix + "/000000000" + itoa(seq)
+	p := reconcilePrefix + "/000000000" + strconv.Itoa(seq)
 
 	return []string{p + "/c/0", p + "/marks", p + "/manifest"}
 }

@@ -151,42 +151,20 @@ func benchTraceEngine(tb testing.TB, be backend.Backend, parts, rows int) *Engin
 func BenchmarkMergeCompactTraces(b *testing.B) {
 	for _, rows := range []int{64 << 10, 256 << 10} {
 		b.Run(fmt.Sprintf("file/parts=4/rows=%d", rows), func(b *testing.B) {
-			ctx := context.Background()
-
 			be, err := file.New(b.TempDir())
 			if err != nil {
 				b.Fatal(err)
 			}
 
-			e := benchTraceEngine(b, be, 4, rows)
-			src := e.parts
-
-			b.SetBytes(partsBytes(src))
-			b.ReportAllocs()
-
-			for b.Loop() {
-				out, err := e.compactParts(ctx, src, minInt64, 0)
-				if err != nil {
-					b.Fatal(err)
-				}
-
-				b.StopTimer()
-
-				for _, p := range out {
-					if err := deletePart(ctx, be, p.prefix); err != nil {
-						b.Fatal(err)
-					}
-				}
-
-				b.StartTimer()
-			}
+			benchCompact(b, benchTraceEngine(b, be, 4, rows), be)
 		})
 	}
 }
 
 // BenchmarkMergeCompact times one record merge of every flushed part into one output part: reading
 // the sources, the stream sweep, and writing the output with its blooms and sidecars. Throughput is
-// the sources' decoded bytes.
+// the sources' decoded bytes ([partsBytes]), not their on-disk size, so its MB/s does not compare
+// with the metric engine's merge benchmarks.
 func BenchmarkMergeCompact(b *testing.B) {
 	for _, tc := range []struct {
 		name string
@@ -206,31 +184,38 @@ func BenchmarkMergeCompact(b *testing.B) {
 	} {
 		for _, shape := range []struct{ parts, rows int }{{4, 32 << 10}, {8, 64 << 10}} {
 			b.Run(fmt.Sprintf("%s/parts=%d/rows=%d", tc.name, shape.parts, shape.rows), func(b *testing.B) {
-				ctx := context.Background()
 				be := tc.open(b)
-				e := benchMergeEngine(b, be, shape.parts, shape.rows)
-				src := e.parts
-
-				b.SetBytes(partsBytes(src))
-				b.ReportAllocs()
-
-				for b.Loop() {
-					out, err := e.compactParts(ctx, src, minInt64, 0)
-					if err != nil {
-						b.Fatal(err)
-					}
-
-					b.StopTimer()
-
-					for _, p := range out {
-						if err := deletePart(ctx, be, p.prefix); err != nil {
-							b.Fatal(err)
-						}
-					}
-
-					b.StartTimer()
-				}
+				benchCompact(b, benchMergeEngine(b, be, shape.parts, shape.rows), be)
 			})
 		}
+	}
+}
+
+// benchCompact times merging every part of e into one, deleting the output between rounds so each
+// round starts from the same sources. Throughput is [partsBytes] of the sources.
+func benchCompact(b *testing.B, e *Engine, be backend.Backend) {
+	b.Helper()
+
+	ctx := context.Background()
+	src := e.parts
+
+	b.SetBytes(partsBytes(src))
+	b.ReportAllocs()
+
+	for b.Loop() {
+		out, err := e.compactParts(ctx, src, minInt64, 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		b.StopTimer()
+
+		for _, p := range out {
+			if err := deletePart(ctx, be, p.prefix); err != nil {
+				b.Fatal(err)
+			}
+		}
+
+		b.StartTimer()
 	}
 }

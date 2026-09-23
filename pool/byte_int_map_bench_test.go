@@ -1,11 +1,14 @@
 package pool
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 func benchmarkByteIntKeys(rows, card int) [][]byte {
 	keys := make([][]byte, rows)
 	for i := range keys {
-		keys[i] = []byte("key-" + itoa(i%card))
+		keys[i] = []byte("key-" + strconv.Itoa(i%card))
 	}
 	return keys
 }

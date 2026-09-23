@@ -233,7 +233,8 @@ type mergeResult struct {
 	deferred bool
 }
 
-// partsBytes sums the on-disk size of ps.
+// partsBytes sums the decoded footprint of ps ([part.sizeBytes]), not its on-disk size — unlike the
+// metric engine's namesake.
 func partsBytes(ps []*part) int64 {
 	var n int64
 	for _, p := range ps {

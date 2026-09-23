@@ -96,27 +96,11 @@ func mergeResident(t *testing.T, series, samples, parts int, window int64) (resi
 
 	r := rand.New(rand.NewPCG(3, 5))
 
-	for p := range parts {
-		n := series * samples
-		batch := make([]signal.SeriesID, 0, n)
-		ts := make([]int64, 0, n)
-		vals := make([]float64, 0, n)
-
-		for i := range series {
-			for s := range samples {
-				batch = append(batch, ids[i])
-				// Jittered, or delta-of-delta collapses the timestamp column below one window and
-				// only the value column would measure anything.
-				ts = append(ts, int64(p*samples+s)*15_000+r.Int64N(1000))
-				vals = append(vals, r.Float64()*1e6)
-			}
-		}
-
-		_, err := e.AppendBatch(batch, ts, vals, nil,
-			func(i int) signal.Series { return ser[i/samples] }, engine.AppendLimits{})
-		require.NoError(t, err)
-		require.NoError(t, e.Flush(ctx))
-	}
+	// Jittered, or delta-of-delta collapses the timestamp column below one window and only the value
+	// column would measure anything.
+	flushCorpus(t, ctx, e, ser, ids, samples, parts,
+		func(p, _, s int) int64 { return int64(p*samples+s)*15_000 + r.Int64N(1000) },
+		func(_, _, _ int) float64 { return r.Float64() * 1e6 })
 
 	require.Equal(t, parts, e.PartCount())
 
