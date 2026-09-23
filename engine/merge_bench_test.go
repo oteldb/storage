@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/signal"
 )
@@ -27,9 +28,12 @@ func BenchmarkMergeResidentMemory(b *testing.B) {
 		series  int
 		samples int
 		parts   int
+		file    bool
 	}{
-		{"200s60x4p", 200, 60, 4},
-		{"500s400x4p", 500, 400, 4},
+		{"200s60x4p", 200, 60, 4, false},
+		{"500s400x4p", 500, 400, 4, false},
+		{"file-500s400x4p", 500, 400, 4, true},
+		{"file-500s2000x4p", 500, 2000, 4, true},
 	} {
 		b.Run(cfg.name, func(b *testing.B) {
 			ctx := context.Background()
@@ -43,14 +47,23 @@ func BenchmarkMergeResidentMemory(b *testing.B) {
 			}
 
 			b.ReportAllocs()
+			b.SetBytes(int64(cfg.series * cfg.samples * cfg.parts * 16))
 			b.ResetTimer()
 
 			for range b.N {
 				b.StopTimer()
 				// Unlimited part size (MaxPartBytes 0) so each flush is one part; merge compacts the
 				// cfg.parts flushes into one.
+				be := backend.Memory()
+				if cfg.file {
+					var err error
+					if be, err = file.New(b.TempDir()); err != nil {
+						b.Fatal(err)
+					}
+				}
+
 				e := engine.New(engine.Config{
-					Backend: backend.Memory(), Prefix: "default/metrics", MaxPartBytes: 0,
+					Backend: be, Prefix: "default/metrics", MaxPartBytes: 0,
 				})
 
 				for p := range cfg.parts {
