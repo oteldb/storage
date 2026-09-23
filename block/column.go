@@ -936,10 +936,18 @@ func (r *ColumnReader) BlockDecoder() (*Decoder, error) {
 		return nil, errors.Wrapf(err, "column %q", r.desc.Name)
 	}
 
+	shared, err := r.sharedEntries()
+	if err != nil {
+		return nil, err
+	}
+
 	return &Decoder{
 		rows:    r.rows,
+		kind:    r.desc.Kind,
+		codec:   r.desc.Codec,
 		i64:     r.int64Decoder(),
 		f64:     r.float64Decoder(),
+		shared:  shared,
 		streams: newBlockStreams(dir, r.comp),
 	}, nil
 }

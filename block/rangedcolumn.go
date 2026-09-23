@@ -82,6 +82,7 @@ func (r *PartReader) openDecoder(ctx context.Context, name string, window int64)
 	return &Decoder{
 		rows:    r.manifest.RowCount,
 		kind:    desc.Kind,
+		codec:   desc.Codec,
 		i64:     cr.int64Decoder(),
 		f64:     cr.float64Decoder(),
 		shared:  shared,

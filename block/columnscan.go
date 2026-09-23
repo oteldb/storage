@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/encoding/chunk"
 )
 
@@ -26,8 +27,55 @@ import (
 // window is the read side's memory budget for this column: the decoder holds one buffer that large.
 // A column whose frames all fit inside it is fetched in a single request, which is [PartReader.Column]
 // minus the cache write. A window at or below zero disables read-ahead.
+//
+// A column the ranged path cannot serve is read whole, once: the legacy unframed layout, and any
+// column over a backend offering neither [backend.ReaderAt] nor [backend.ViewerAt], where every
+// ranged read is itself a whole-object read and a windowed walk would repeat it per window.
 func (r *PartReader) ColumnScan(ctx context.Context, name string, window int64) (*Decoder, error) {
+	if desc, ok := r.ColumnDescByName(name); ok && desc.Blocked && !desc.Const &&
+		(!desc.Framed || !rangesNatively(r.b)) {
+		col, err := r.Column(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+
+		return col.BlockDecoder()
+	}
+
 	return r.openDecoder(ctx, name, max(window, 0))
+}
+
+func rangesNatively(b backend.Backend) bool {
+	switch b.(type) {
+	case backend.ReaderAt, backend.ViewerAt:
+		return true
+	default:
+		return false
+	}
+}
+
+// TsCursor returns a forward cursor over an int64 timestamp column, walking its granules in order.
+// It is [ColumnReader.TsCursor] over this decoder's frames, so under [PartReader.ColumnScan] a merge
+// holds one read-ahead window of the column rather than its object.
+func (d *Decoder) TsCursor() (chunk.TsCursor, error) {
+	if d.kind != KindInt64 {
+		return nil, errors.Errorf("block: column is %s, not int64", d.kind)
+	}
+
+	if d.codec != chunk.CodecDoD && d.codec != chunk.CodecDoDScaled {
+		return nil, errors.Errorf("block: codec %s not a streamable timestamp codec", d.codec)
+	}
+
+	return newBlockedTsCursor(d.streams.dir, d.streams.comp, d.codec, d.rows), nil
+}
+
+// FloatCursor is the float64 analog of [Decoder.TsCursor].
+func (d *Decoder) FloatCursor() (chunk.FloatDecoder, error) {
+	if d.kind != KindFloat64 {
+		return nil, errors.Errorf("block: column is %s, not float64", d.kind)
+	}
+
+	return newBlockedFloatCursor(d.streams.dir, d.streams.comp, d.codec, d.rows), nil
 }
 
 // readAhead serves frame f from the buffered run, refilling it when the frame is not covered. A

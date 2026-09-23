@@ -1066,10 +1066,11 @@ func decodeBlockedRange[T any](
 // that decodes several blocks (e.g. a per-block cache filling its misses) does not re-parse it per
 // block. Obtain one via [ColumnReader.Decoder]; it holds the column's already-read object.
 type Decoder struct {
-	rows int
-	kind Kind
-	i64  decodeFunc[int64]
-	f64  decodeFunc[float64]
+	rows  int
+	kind  Kind
+	codec chunk.Codec
+	i64   decodeFunc[int64]
+	f64   decodeFunc[float64]
 
 	// shared is the column's shared dictionary, nil for a column without one. Every granule that
 	// joined it carries only ids into it, so it is peeled at open and resolved against here.
