@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/signal"
@@ -166,25 +167,10 @@ func BenchmarkMergeCompactTraces(b *testing.B) {
 // the sources' decoded bytes ([partsBytes]), not their on-disk size, so its MB/s does not compare
 // with the metric engine's merge benchmarks.
 func BenchmarkMergeCompact(b *testing.B) {
-	for _, tc := range []struct {
-		name string
-		open func(b *testing.B) backend.Backend
-	}{
-		{"memory", func(*testing.B) backend.Backend { return backend.Memory() }},
-		{"file", func(b *testing.B) backend.Backend {
-			b.Helper()
-
-			fb, err := file.New(b.TempDir())
-			if err != nil {
-				b.Fatal(err)
-			}
-
-			return fb
-		}},
-	} {
+	for _, tc := range []backendtest.Case{backendtest.Memory(), backendtest.Dir("file", file.New)} {
 		for _, shape := range []struct{ parts, rows int }{{4, 32 << 10}, {8, 64 << 10}} {
-			b.Run(fmt.Sprintf("%s/parts=%d/rows=%d", tc.name, shape.parts, shape.rows), func(b *testing.B) {
-				be := tc.open(b)
+			b.Run(fmt.Sprintf("%s/parts=%d/rows=%d", tc.Name, shape.parts, shape.rows), func(b *testing.B) {
+				be := tc.Open(b)
 				benchCompact(b, benchMergeEngine(b, be, shape.parts, shape.rows), be)
 			})
 		}

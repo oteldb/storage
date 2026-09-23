@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/signal"
@@ -24,17 +24,19 @@ import (
 // Throughput is the logical samples merged × [engine.SampleBytes], neither the parts' on-disk nor
 // their decoded bytes, so its MB/s does not compare with the record engine's merge benchmarks.
 func BenchmarkMergeResidentMemory(b *testing.B) {
+	memory, onDisk := backendtest.Memory(), backendtest.Dir("file", file.New)
+
 	for _, cfg := range []struct {
 		name    string
 		series  int
 		samples int
 		parts   int
-		file    bool
+		backend backendtest.Case
 	}{
-		{"200s60x4p", 200, 60, 4, false},
-		{"500s400x4p", 500, 400, 4, false},
-		{"file-500s400x4p", 500, 400, 4, true},
-		{"file-500s2000x4p", 500, 2000, 4, true},
+		{"200s60x4p", 200, 60, 4, memory},
+		{"500s400x4p", 500, 400, 4, memory},
+		{"file-500s400x4p", 500, 400, 4, onDisk},
+		{"file-500s2000x4p", 500, 2000, 4, onDisk},
 	} {
 		b.Run(cfg.name, func(b *testing.B) {
 			ctx := context.Background()
@@ -55,16 +57,8 @@ func BenchmarkMergeResidentMemory(b *testing.B) {
 				b.StopTimer()
 				// Unlimited part size (MaxPartBytes 0) so each flush is one part; merge compacts the
 				// cfg.parts flushes into one.
-				be := backend.Memory()
-				if cfg.file {
-					var err error
-					if be, err = file.New(b.TempDir()); err != nil {
-						b.Fatal(err)
-					}
-				}
-
 				e := engine.New(engine.Config{
-					Backend: be, Prefix: "default/metrics", MaxPartBytes: 0,
+					Backend: cfg.backend.Open(b), Prefix: "default/metrics", MaxPartBytes: 0,
 				})
 
 				flushCorpus(b, ctx, e, series, ids, cfg.samples, cfg.parts,

@@ -61,3 +61,12 @@ func Backend(tb testing.TB, bucket string, opts ...s3.Option) backend.Backend {
 
 	return Shared(tb, bucket, opts...)()
 }
+
+// Case is the "s3" [backendtest.Case]: each Open starts its own server.
+func Case(bucket string, opts ...s3.Option) backendtest.Case {
+	return backendtest.Case{Name: "s3", Open: func(tb testing.TB) backend.Backend {
+		tb.Helper()
+
+		return Backend(tb, bucket, opts...)
+	}}
+}

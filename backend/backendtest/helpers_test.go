@@ -165,6 +165,33 @@ func TestDigest(t *testing.T) {
 		backendtest.Digest(t, b, []string{"p1", "p2"}))
 }
 
+func TestMatrix(t *testing.T) {
+	t.Parallel()
+
+	var dirs []string
+
+	onDisk := backendtest.Dir("disk", func(dir string) (backend.Backend, error) {
+		dirs = append(dirs, dir)
+
+		return backend.Memory(), nil
+	})
+	remote := backendtest.Case{Name: "remote", Open: func(testing.TB) backend.Backend { return backend.Memory() }}
+
+	matrix := backendtest.Matrix(onDisk, remote)
+	names := make([]string, 0, len(matrix))
+
+	for _, c := range matrix {
+		names = append(names, c.Name)
+
+		b := c.Open(t)
+		require.NoError(t, b.Write(context.Background(), "k", []byte("v")))
+	}
+
+	assert.Equal(t, []string{"memory", "disk", "cached-disk", "remote", "whole-object"}, names)
+	require.Len(t, dirs, 2, "the cached case opens its own directory")
+	assert.NotEqual(t, dirs[0], dirs[1])
+}
+
 func assertHides[C any](t *testing.T, b backend.Backend) {
 	t.Helper()
 

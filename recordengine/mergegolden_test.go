@@ -166,34 +166,10 @@ func goldenMergeCorpus(t *testing.T, b backend.Backend, maxPartBytes, window int
 func TestMergeOutputGolden(t *testing.T) {
 	t.Parallel()
 
-	for _, tc := range []struct {
-		name string
-		open func(t *testing.T) backend.Backend
-	}{
-		{"memory", func(*testing.T) backend.Backend { return backend.Memory() }},
-		{"file", func(t *testing.T) backend.Backend {
-			t.Helper()
-
-			b, err := file.New(t.TempDir())
-			require.NoError(t, err)
-
-			return b
-		}},
-		{"cached-file", func(t *testing.T) backend.Backend {
-			t.Helper()
-
-			b, err := file.New(t.TempDir())
-			require.NoError(t, err)
-
-			return backend.Cached(b, 1<<20)
-		}},
-		{"s3", func(t *testing.T) backend.Backend {
-			t.Helper()
-
-			return s3test.Backend(t, "golden", s3.WithRetry(reliability.Default()))
-		}},
-		{"whole-object", func(*testing.T) backend.Backend { return backendtest.WithoutCapabilities(backend.Memory()) }},
-	} {
+	for _, tc := range backendtest.Matrix(
+		backendtest.Dir("file", file.New),
+		s3test.Case("golden", s3.WithRetry(reliability.Default())),
+	) {
 		for _, shape := range []struct {
 			name     string
 			maxPart  int64
@@ -203,10 +179,10 @@ func TestMergeOutputGolden(t *testing.T) {
 			{"split", 256 << 10, "merge_output_split.txt"},
 		} {
 			for _, window := range []int64{0, 4 << 10, 1 << 20} {
-				t.Run(fmt.Sprintf("%s/%s/window=%d", tc.name, shape.name, window), func(t *testing.T) {
+				t.Run(fmt.Sprintf("%s/%s/window=%d", tc.Name, shape.name, window), func(t *testing.T) {
 					t.Parallel()
 
-					b := tc.open(t)
+					b := tc.Open(t)
 					e := goldenMergeCorpus(t, b, shape.maxPart, window)
 
 					gold.Str(t, backendtest.Digest(t, b, e.PartPrefixes()), shape.goldFile)

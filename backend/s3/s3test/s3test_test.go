@@ -24,6 +24,20 @@ func TestBackendConformance(t *testing.T) {
 	})
 }
 
+func TestCaseOpensItsOwnServer(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	c := s3test.Case("case")
+	require.Equal(t, "s3", c.Name)
+
+	first, second := c.Open(t), c.Open(t)
+	require.NoError(t, first.Write(ctx, "k", []byte("v")))
+
+	_, err := second.Read(ctx, "k")
+	require.ErrorIs(t, err, backend.ErrNotExist)
+}
+
 func TestSharedSeesOneBucket(t *testing.T) {
 	t.Parallel()
 

@@ -40,10 +40,12 @@ conformance suite all of them pass under `-race`.
 capabilities it forwards, because tests measure exactly that: `WithoutCapabilities` and `Counting`
 (per-key reads, n-th write failure) forward none; `StreamingMemory` adds only `ObjectCreator`;
 `ByteCounter` serves `Viewer` and `ReaderAt` and hides `Sizer`, which `SizedByteCounter` adds back.
-It imports only `backend` and `internal/partid`, since block's internal tests use it; the in-process
-S3 server, which needs the AWS SDK and go-faster/fs, lives in `backend/s3/s3test` for that reason.
-Every s3test server serializes conditional PUTs (`backendtest.AtomicConditionalPut`): go-faster/fs
-checks a precondition and writes in two steps, so two racing CAS writers could both win.
+`Matrix` is the table of read paths a merge golden must be identical over (memory, file, cached file,
+s3, whole-object); the caller passes the file and s3 cases. `backendtest` imports only `backend` and
+`internal/partid`, since block's internal tests use it; the in-process S3 server, which needs the AWS
+SDK and go-faster/fs, lives in `backend/s3/s3test` for that reason. Every s3test server serializes
+conditional PUTs (`backendtest.AtomicConditionalPut`): go-faster/fs checks a precondition and writes
+in two steps, so two racing CAS writers could both win.
 
 **`backend/faultbackend`** is the fault-injection wrapper for tests: rules match an operation by
 kind and key (`CompareAndSwap` and `ReadVersioned` included — a gate there is how a test states the
