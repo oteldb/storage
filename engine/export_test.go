@@ -67,3 +67,6 @@ func (e *Engine) PartPrefixes() []string {
 
 	return out
 }
+
+// SetMergeReadWindow sets how much of each source column a merge reads ahead.
+func (e *Engine) SetMergeReadWindow(n int64) { e.mergeReadWindow = n }

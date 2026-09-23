@@ -264,6 +264,13 @@ them. At S3 latencies that is the difference between a merge finishing and not.
   cache write, which is the right path for the memory backend and for small parts.
 - A **frame is indivisible**: one larger than the window is served alone rather than refused, so the
   window is a target, not a cap on what a single fetch may hold.
+- A column the ranged path cannot serve is **read whole, once**: the legacy unframed layout, and any
+  column over a backend offering neither `backend.ReaderAt` nor `backend.ViewerAt`. There every ranged
+  read — the directory probe, each window — is itself a whole-object read, so a windowed walk would
+  read the column once per window. The check is by type, so a wrapper that claims `ReaderAt` over a
+  store that cannot range (an `s3.ObjectStore` without `RangeObjectStore`) still pays per window.
+- `Decoder.TsCursor` / `Decoder.FloatCursor` are `ColumnReader`'s forward cursors over the decoder's
+  frames, which is how the metrics merge reads its sources.
 - `Decoder.DecodeBytesBlock` decodes one granule against the cached frame. The result **aliases that
   frame buffer** and dies at the next decode crossing a frame — deliberately: a merge reads a
   granule's ids and appends them, and copying every value back would be the per-row cost this path

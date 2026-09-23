@@ -431,8 +431,8 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 // compactStream merges several source parts, streaming both sides so neither the whole merged
 // dataset nor a whole output part is ever materialized: each source is read through a forward
 // [partStream] decoding one series range at a time, and each merged series is handed straight to a
-// [partStreamWriter]. The merge therefore holds O(parts × one series range) + the *encoded* output
-// part. capBytes ≤ 0 writes a single output part.
+// [partStreamWriter]. The merge therefore holds O(parts × (columns × read window + one series
+// range)) + the output writer's state. capBytes ≤ 0 writes a single output part.
 //
 // Series are visited in (series, ts) order; within a series the parts are visited oldest→newest so
 // a later part's value wins a duplicate timestamp, then the result is downsampled.
@@ -447,7 +447,7 @@ func (e *Engine) compactStream(
 	// One forward cursor per source part; one reusable per-part destination per series range.
 	streams := make([]*partStream, len(src))
 	for i, p := range src {
-		s, err := newPartStream(ctx, p)
+		s, err := newPartStream(ctx, p, e.mergeReadWindow)
 		if err != nil {
 			return nil, err
 		}

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/signal"
 )
@@ -16,20 +17,21 @@ import (
 // scratch buffers recycle across the series of a merge, so cumulative allocation is byte-identical.
 //
 // The streaming merge's win is peak *resident* memory, which alloc-byte benchmarks do not capture:
-// the old path held every source part's whole decoded column resident simultaneously during the
-// merge, while the streaming path holds one series range per part. That win scales with part size
-// (at the production 64 MiB part / 8-way merge the old path pinned ≈256 MiB; the streaming path
-// holds ≈ KB) and is verified structurally — the cursors decode one range at a time into reused
-// scratch, never a whole column.
+// each source column is held as one read-ahead window and decoded one series range at a time, so
+// neither a source's decoded nor its encoded column is resident. TestMergeResidentFlatInPartSize
+// measures it; the file cases here price the ranged reads that buy it.
 func BenchmarkMergeResidentMemory(b *testing.B) {
 	for _, cfg := range []struct {
 		name    string
 		series  int
 		samples int
 		parts   int
+		file    bool
 	}{
-		{"200s60x4p", 200, 60, 4},
-		{"500s400x4p", 500, 400, 4},
+		{"200s60x4p", 200, 60, 4, false},
+		{"500s400x4p", 500, 400, 4, false},
+		{"file-500s400x4p", 500, 400, 4, true},
+		{"file-500s2000x4p", 500, 2000, 4, true},
 	} {
 		b.Run(cfg.name, func(b *testing.B) {
 			ctx := context.Background()
@@ -43,14 +45,23 @@ func BenchmarkMergeResidentMemory(b *testing.B) {
 			}
 
 			b.ReportAllocs()
+			b.SetBytes(int64(cfg.series * cfg.samples * cfg.parts * 16))
 			b.ResetTimer()
 
 			for range b.N {
 				b.StopTimer()
 				// Unlimited part size (MaxPartBytes 0) so each flush is one part; merge compacts the
 				// cfg.parts flushes into one.
+				be := backend.Memory()
+				if cfg.file {
+					var err error
+					if be, err = file.New(b.TempDir()); err != nil {
+						b.Fatal(err)
+					}
+				}
+
 				e := engine.New(engine.Config{
-					Backend: backend.Memory(), Prefix: "default/metrics", MaxPartBytes: 0,
+					Backend: be, Prefix: "default/metrics", MaxPartBytes: 0,
 				})
 
 				for p := range cfg.parts {

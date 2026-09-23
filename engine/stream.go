@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 )
 
@@ -13,12 +14,15 @@ import (
 // so a sorted merge advances each part's cursor monotonically through contiguous ranges).
 var errNonContiguousDecode = errors.New("engine: non-contiguous streaming decode")
 
+// defaultMergeReadWindow is how much of each source column a merge reads ahead, and so the read
+// side's resident term: sources × columns × window, whatever the sources' size.
+const defaultMergeReadWindow = 1 << 20
+
 // partStream is a per-merge forward cursor over a part's (series-sorted) ts/value(/sf) columns. It
-// decodes one series range at a time, advancing strictly forward through the part's rows, so a
-// streaming merge holds only the current range resident per source part instead of the part's whole
-// decoded column (issue #25, item 1's full fix). Because rows are sorted by (series, ts) and the
-// merge visits series in ascending order, a part's series ranges are contiguous and the cursors move
-// monotonically — each part's column is decoded exactly once across the merge.
+// decodes one series range at a time, advancing strictly forward through the part's rows. Because
+// rows are sorted by (series, ts) and the merge visits series in ascending order, a part's series
+// ranges are contiguous and the cursors move monotonically — each column is read and decoded exactly
+// once across the merge, one read-ahead window at a time.
 type partStream struct {
 	ts  chunk.TsCursor
 	val chunk.FloatDecoder
@@ -26,24 +30,17 @@ type partStream struct {
 	pos int                // next undecoded row; a requested range's start must equal pos
 }
 
-// newPartStream opens forward cursors over p's ts/value(/sf) columns.
-func newPartStream(ctx context.Context, p *part) (*partStream, error) {
-	tsCol, err := p.reader.Column(ctx, colTs)
+// newPartStream opens forward cursors over p's ts/value(/sf) columns, each reading window bytes of
+// its encoded column ahead.
+func newPartStream(ctx context.Context, p *part, window int64) (*partStream, error) {
+	ts, err := scanColumn(ctx, p.reader, colTs, window,
+		(*block.ColumnReader).TsCursor, (*block.Decoder).TsCursor)
 	if err != nil {
 		return nil, err
 	}
 
-	ts, err := tsCol.TsCursor()
-	if err != nil {
-		return nil, err
-	}
-
-	valCol, err := p.reader.Column(ctx, colValue)
-	if err != nil {
-		return nil, err
-	}
-
-	val, err := valCol.FloatCursor()
+	val, err := scanColumn(ctx, p.reader, colValue, window,
+		(*block.ColumnReader).FloatCursor, (*block.Decoder).FloatCursor)
 	if err != nil {
 		return nil, err
 	}
@@ -51,17 +48,39 @@ func newPartStream(ctx context.Context, p *part) (*partStream, error) {
 	var sf chunk.FloatDecoder
 
 	if p.hasSF {
-		sfCol, err := p.reader.Column(ctx, colSF)
-		if err != nil {
-			return nil, err
-		}
-
-		if sf, err = sfCol.FloatCursor(); err != nil {
+		if sf, err = scanColumn(ctx, p.reader, colSF, window,
+			(*block.ColumnReader).FloatCursor, (*block.Decoder).FloatCursor); err != nil {
 			return nil, err
 		}
 	}
 
 	return &partStream{ts: ts, val: val, sf: sf}, nil
+}
+
+// scanColumn opens a forward cursor over the named column. A constant or unblocked column has no
+// frames to window over — the first costs no I/O, the second is one small stream — so it takes the
+// whole-object reader.
+func scanColumn[C any](
+	ctx context.Context, r *block.PartReader, name string, window int64,
+	whole func(*block.ColumnReader) (C, error), scan func(*block.Decoder) (C, error),
+) (C, error) {
+	var zero C
+
+	if desc, ok := r.ColumnDescByName(name); ok && (desc.Const || !desc.Blocked) {
+		col, err := r.Column(ctx, name)
+		if err != nil {
+			return zero, err
+		}
+
+		return whole(col)
+	}
+
+	d, err := r.ColumnScan(ctx, name, window)
+	if err != nil {
+		return zero, errors.Wrapf(err, "scan column %q", name)
+	}
+
+	return scan(d)
 }
 
 // rangeBuf is a reusable per-part destination for one series' decoded range, recycled across the
