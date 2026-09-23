@@ -38,12 +38,18 @@ func inProcessS3(t *testing.T, bucket string) *awss3.Client {
 	require.NoError(t, store.CreateBucket(context.Background(), bucket))
 
 	srv := httptest.NewServer(fsserver.NewHandler(store))
-	t.Cleanup(srv.Close)
+	httpClient := srv.Client()
+
+	t.Cleanup(func() {
+		httpClient.CloseIdleConnections()
+		srv.Close()
+	})
 
 	return awss3.New(awss3.Options{
 		Region:       "us-east-1",
 		BaseEndpoint: aws.String(srv.URL),
 		UsePathStyle: true,
+		HTTPClient:   httpClient,
 		Credentials:  credentials.NewStaticCredentialsProvider("test", "test", ""),
 	})
 }
@@ -60,6 +66,7 @@ func goldenMergeCorpus(t *testing.T, b backend.Backend, window int64) *engine.En
 		Backend: b, Prefix: "golden/metrics", MaxPartBytes: 0, MergeMemoryBytes: 1 << 30,
 	})
 	e.SetMergeReadWindow(window)
+	t.Cleanup(func() { require.NoError(t, e.Close(context.WithoutCancel(ctx))) })
 
 	const series, samples = 300, 64
 

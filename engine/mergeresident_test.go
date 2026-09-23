@@ -132,6 +132,10 @@ func mergeResident(t *testing.T, series, samples, parts int, window int64) (resi
 		}
 	}
 
+	// Heap other tests in the process left behind can still be draining; a second cycle finishes
+	// what the first one's finalizers released.
+	runtime.GC()
+
 	base := liveHeap()
 
 	// The output's compression level steps with its row count, and a denser level's encoder is
@@ -171,6 +175,12 @@ func TestMergeResidentFlatInPartSize(t *testing.T) {
 		series = 1024
 		parts  = 4
 		window = 64 << 10
+		// ts and value; the corpus has no weight column.
+		readColumns = 2
+		// What the read side holds by design. The measured baseline is process-wide, so heap another
+		// test frees during the merge can push the small case toward zero; the ratio is taken against
+		// at least this, never against noise.
+		readBound = parts * readColumns * window
 	)
 
 	smallResident, smallSource := mergeResident(t, series, 64, parts, window)
@@ -179,14 +189,21 @@ func TestMergeResidentFlatInPartSize(t *testing.T) {
 	t.Logf("small: source %.1f MiB, resident %.1f MiB", float64(smallSource)/(1<<20), float64(smallResident)/(1<<20))
 	t.Logf("large: source %.1f MiB, resident %.1f MiB", float64(largeSource)/(1<<20), float64(largeResident)/(1<<20))
 
-	require.Greater(t, smallSource, uint64(parts*2*window),
+	require.Greater(t, smallSource, uint64(parts*readColumns*window),
 		"the small corpus must already span several windows per column, or both sizes read whole")
 	require.Greater(t, float64(largeSource)/float64(smallSource), 6.0,
 		"the corpus did not grow the sources enough to tell flat from proportional")
 
-	assert.Less(t, float64(largeResident)/float64(smallResident), 2.0,
+	growth := float64(largeResident) / float64(max(smallResident, readBound))
+
+	assert.Less(t, growth, 2.0,
 		"sources grew %.1fx and the merge's live heap grew %.1fx (%.1f → %.1f MiB): the merge holds "+
 			"source columns, not a window of them",
-		float64(largeSource)/float64(smallSource), float64(largeResident)/float64(smallResident),
+		float64(largeSource)/float64(smallSource), growth,
 		float64(smallResident)/(1<<20), float64(largeResident)/(1<<20))
+
+	// Independent of the small run's baseline: holding the sources whole costs about their size.
+	assert.Less(t, largeResident, largeSource/3,
+		"the merge held %.1f MiB against %.1f MiB of sources: it holds source columns, not a window of them",
+		float64(largeResident)/(1<<20), float64(largeSource)/(1<<20))
 }
