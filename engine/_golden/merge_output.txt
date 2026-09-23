@@ -1,0 +1,9 @@
+c/0                          5408 72490cadc7cc1b689a2fc014123391b908286d35dc2dadcbad6f6461e743c6c7
+c/1                          2513 8af3aa4c0b72ac40804768ca855a3ef028f556eb3cf48eb86ffb8db35deb32fa
+c/2                        340450 69a8309ff7850e4ed8c9ce76b2131eee77add5deb24014365d3ebaacfae90d0b
+c/3                          1101 150a696c127ad47720d07be6170ff2367d85980ca59e0bec6441dfb0f3bbc044
+identity                    11989 dfebe0ecb904accf43943bf53adfd0b7f3fd356fa0a41922fafb6e9dfa647558
+manifest                      112 55344d09c7e28f7195666af359b89796d6a9b6f6c324ca6fe91fc9511c6994ef
+marks                         575 e39f66a06676561eed56ef2b74cf760d00cf91ead96436330c6c6ec5add9871e
+sidx                         6014 af0195b16af187359ea78aacaa20c541b8daa83d0c7b44630063085834777ee7
+smax                         7210 85f25be557938080ff55354781d4e9ec1e95e6ef23c66e2f092da2b5bd63d2eb
