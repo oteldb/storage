@@ -3,13 +3,13 @@ package block
 import (
 	"context"
 	"math"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
 )
@@ -142,22 +142,6 @@ func TestDecoderCursorRejectsWrongColumn(t *testing.T) {
 	require.Error(t, err, "only delta-of-delta timestamps stream row by row")
 }
 
-// wholeReadBackend offers neither ranged nor view reads and counts every whole-object read by key.
-type wholeReadBackend struct {
-	backend.Backend
-
-	mu    sync.Mutex
-	reads map[string]int
-}
-
-func (b *wholeReadBackend) Read(ctx context.Context, key string) ([]byte, error) {
-	b.mu.Lock()
-	b.reads[key]++
-	b.mu.Unlock()
-
-	return b.Backend.Read(ctx, key)
-}
-
 // TestColumnScanReadsWholeObjectOnceWithoutRanges: over a backend that can only read whole objects,
 // every ranged read — the directory probe, each window — is itself a whole-object read, so a
 // windowed walk would re-read the column once per window. The scan reads it once instead.
@@ -188,11 +172,11 @@ func TestColumnScanReadsWholeObjectOnceWithoutRanges(t *testing.T) {
 	rr, err := OpenPart(ctx, ranged, "p")
 	require.NoError(t, err)
 
-	ranged.reset()
+	ranged.Reset()
 	want := walk(rr)
-	require.Greater(t, ranged.reads.Load(), int64(4), "the corpus must span several windows")
+	require.Greater(t, ranged.Reads(), int64(4), "the corpus must span several windows")
 
-	whole := &wholeReadBackend{Backend: ranged.Backend, reads: map[string]int{}}
+	whole := backendtest.NewCounting(ranged.Backend)
 
 	wr, err := OpenPart(ctx, whole, "p")
 	require.NoError(t, err)
@@ -201,7 +185,7 @@ func TestColumnScanReadsWholeObjectOnceWithoutRanges(t *testing.T) {
 
 	i, ok := wr.byName["ts"]
 	require.True(t, ok)
-	assert.Equal(t, 1, whole.reads[columnKey("p", i)], "the column object must be read exactly once")
+	assert.Equal(t, 1, whole.Reads()[columnKey("p", i)], "the column object must be read exactly once")
 }
 
 // TestColumnScanReadsLegacyLayout: the pre-framing layout has no directory a range can find, so a

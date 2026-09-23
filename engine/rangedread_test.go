@@ -2,88 +2,16 @@ package engine_test
 
 import (
 	"context"
-	"fmt"
-	"maps"
-	"slices"
-	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 )
-
-// countingBackend records the object bytes a fetch actually pulls, whichever way it pulls them.
-type countingBackend struct {
-	backend.Backend
-
-	bytes atomic.Int64
-
-	mu     sync.Mutex
-	perKey map[string]int64
-}
-
-func newCountingBackend() *countingBackend {
-	return &countingBackend{Backend: backend.Memory(), perKey: map[string]int64{}}
-}
-
-func (b *countingBackend) Read(ctx context.Context, key string) ([]byte, error) {
-	v, err := b.Backend.Read(ctx, key)
-	b.note(key, len(v))
-
-	return v, err
-}
-
-// ReadView is what the part reader takes, so it must be counted too — and forwarded, or the
-// no-copy capability disappears under this wrapper.
-func (b *countingBackend) ReadView(ctx context.Context, key string) ([]byte, error) {
-	v, err := backend.ReadView(ctx, b.Backend, key)
-	b.note(key, len(v))
-
-	return v, err
-}
-
-func (b *countingBackend) ReadAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
-	v, err := backend.ReadAt(ctx, b.Backend, key, off, n)
-	b.note(key, len(v))
-
-	return v, err
-}
-
-func (b *countingBackend) note(key string, n int) {
-	b.bytes.Add(int64(n))
-	b.mu.Lock()
-	b.perKey[key] += int64(n)
-	b.mu.Unlock()
-}
-
-func (b *countingBackend) read() int64 { return b.bytes.Load() }
-
-func (b *countingBackend) reset() {
-	b.bytes.Store(0)
-	b.mu.Lock()
-	clear(b.perKey)
-	b.mu.Unlock()
-}
-
-// report renders the per-key totals, so a failure says which object was read rather than only how
-// much.
-func (b *countingBackend) report() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	var sb strings.Builder
-	for _, k := range slices.Sorted(maps.Keys(b.perKey)) {
-		fmt.Fprintf(&sb, "\n  %-44s %8d", k, b.perKey[k])
-	}
-
-	return sb.String()
-}
 
 // TestSelectiveFetchReadsAFractionOfTheColumn is the property #303 is about: a selector matching a
 // few of many series must not pay for the whole column. The columns are one object each, so before
@@ -92,7 +20,7 @@ func TestSelectiveFetchReadsAFractionOfTheColumn(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	b := newCountingBackend()
+	b := backendtest.NewByteCounter(backend.Memory())
 
 	// The block-sliced read path needs the decode cache; without it the engine falls back to decoding
 	// whole columns and the column object is read whole by design.
@@ -119,7 +47,7 @@ func TestSelectiveFetchReadsAFractionOfTheColumn(t *testing.T) {
 	columnBytes := partColumnBytes(t, ctx, b.Backend, "t/metrics")
 	require.Positive(t, columnBytes)
 
-	b.reset()
+	b.Reset()
 
 	// One series of 400, over a window covering a fraction of its samples.
 	got := fetchAll(t, e, fetch.Request{
@@ -129,9 +57,9 @@ func TestSelectiveFetchReadsAFractionOfTheColumn(t *testing.T) {
 	require.Len(t, got, 1)
 	require.NotEmpty(t, got[0].Values)
 
-	read := b.read()
+	read := b.Bytes()
 	t.Logf("selective fetch read %d of %d column bytes (%.1f%%)%s",
-		read, columnBytes, 100*float64(read)/float64(columnBytes), b.report())
+		read, columnBytes, 100*float64(read)/float64(columnBytes), b.Report())
 
 	// The floor is the compression frame: it is the smallest unit a ranged read can fetch, so a
 	// single-series fetch pays one frame per column however few rows it wants. What matters is that
@@ -159,7 +87,7 @@ func TestSelectiveFetchCostDoesNotGrowWithThePart(t *testing.T) {
 	measure := func(t *testing.T, series int) (read, columns int64) {
 		t.Helper()
 
-		b := newCountingBackend()
+		b := backendtest.NewByteCounter(backend.Memory())
 		e := engine.New(engine.Config{Backend: b, Prefix: "t/metrics", DecodeCacheBytes: 1 << 20})
 
 		for s := range series {
@@ -172,7 +100,7 @@ func TestSelectiveFetchCostDoesNotGrowWithThePart(t *testing.T) {
 		require.NoError(t, e.Flush(ctx))
 
 		columns = partColumnBytes(t, ctx, b.Backend, "t/metrics")
-		b.reset()
+		b.Reset()
 
 		got := fetchAll(t, e, fetch.Request{
 			Start: 0, End: 20 * sampleStep,
@@ -180,7 +108,7 @@ func TestSelectiveFetchCostDoesNotGrowWithThePart(t *testing.T) {
 		})
 		require.Len(t, got, 1)
 
-		return b.read(), columns
+		return b.Bytes(), columns
 	}
 
 	smallRead, smallColumns := measure(t, 250)
@@ -228,7 +156,7 @@ func TestSelectiveFetchIsCorrectOverRangedReads(t *testing.T) {
 
 	// The whole-column path (no decode cache ⇒ no block slicing) is the reference.
 	ref := build(backend.Memory(), 0)
-	ranged := build(newCountingBackend(), 1<<20)
+	ranged := build(backendtest.NewByteCounter(backend.Memory()), 1<<20)
 
 	for s := range series {
 		lbl := instLabel(s)

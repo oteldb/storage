@@ -2,7 +2,6 @@ package recordengine_test
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"math/rand/v2"
 	"net/http/httptest"
@@ -20,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/backend/s3"
 	"github.com/oteldb/storage/encoding/chunk"
@@ -28,10 +28,6 @@ import (
 	"github.com/oteldb/storage/reliability"
 	"github.com/oteldb/storage/signal"
 )
-
-// wholeObjectBackend offers no ranged or view reads, so every read a merge makes is a whole-object
-// Read — the shape of a minimal embedder backend.
-type wholeObjectBackend struct{ backend.Backend }
 
 func inProcessS3(t *testing.T, bucket string) *awss3.Client {
 	t.Helper()
@@ -192,33 +188,6 @@ func goldenMergeCorpus(t *testing.T, b backend.Backend, maxPartBytes, window int
 	return c.e
 }
 
-// partDigest renders every object of every live part, keyed by its name within the part, since the
-// part's own prefix is random.
-func partDigest(t *testing.T, e *recordengine.Engine, b backend.Backend) string {
-	t.Helper()
-
-	ctx := context.Background()
-
-	var lines []string
-
-	for _, prefix := range e.PartPrefixes() {
-		keys, err := b.List(ctx, prefix+"/")
-		require.NoError(t, err)
-
-		for _, key := range keys {
-			data, err := b.Read(ctx, key)
-			require.NoError(t, err)
-
-			lines = append(lines, fmt.Sprintf("%-24s %8d %x",
-				strings.TrimPrefix(key, prefix+"/"), len(data), sha256.Sum256(data)))
-		}
-	}
-
-	slices.Sort(lines)
-
-	return strings.Join(lines, "\n") + "\n"
-}
-
 // TestMergeOutputGolden pins the merged parts byte for byte, whatever backend the sources are read
 // through and however far ahead: how a merge reads its sources is not allowed to change what it
 // writes. A zero window reads frame by frame; 4 KiB is below one frame, so every read serves one.
@@ -251,7 +220,7 @@ func TestMergeOutputGolden(t *testing.T) {
 
 			return s3.New(s3.NewAWS(inProcessS3(t, "golden"), "golden"), "", s3.WithRetry(reliability.Default()))
 		}},
-		{"whole-object", func(*testing.T) backend.Backend { return wholeObjectBackend{backend.Memory()} }},
+		{"whole-object", func(*testing.T) backend.Backend { return backendtest.WithoutCapabilities(backend.Memory()) }},
 	} {
 		for _, shape := range []struct {
 			name     string
@@ -268,7 +237,7 @@ func TestMergeOutputGolden(t *testing.T) {
 					b := tc.open(t)
 					e := goldenMergeCorpus(t, b, shape.maxPart, window)
 
-					gold.Str(t, partDigest(t, e, b), shape.goldFile)
+					gold.Str(t, backendtest.Digest(t, b, e.PartPrefixes()), shape.goldFile)
 				})
 			}
 		}

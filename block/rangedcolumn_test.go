@@ -3,75 +3,24 @@ package block
 import (
 	"context"
 	"math/rand/v2"
-	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
 )
 
-// countingBackend records the bytes each read pulls, so a test can assert on what a ranged open
-// actually costs rather than only on what it returns.
-type countingBackend struct {
-	backend.Backend
-
-	bytes atomic.Int64
-	reads atomic.Int64
-}
-
-func newCountingBackend(inner backend.Backend) *countingBackend {
-	return &countingBackend{Backend: inner}
-}
-
-func (b *countingBackend) Read(ctx context.Context, key string) ([]byte, error) {
-	v, err := b.Backend.Read(ctx, key)
-	b.note(len(v))
-
-	return v, err
-}
-
-func (b *countingBackend) ReadView(ctx context.Context, key string) ([]byte, error) {
-	v, err := backend.ReadView(ctx, b.Backend, key)
-	b.note(len(v))
-
-	return v, err
-}
-
-func (b *countingBackend) ReadAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
-	v, err := backend.ReadAt(ctx, b.Backend, key, off, n)
-	b.note(len(v))
-
-	return v, err
-}
-
-// Size must be forwarded: the interface embedding above does not promote it, and without it a
-// ranged open falls back to reading the whole object to learn its length — silently undoing the
-// thing being tested.
-func (b *countingBackend) Size(ctx context.Context, key string) (int64, error) {
-	return backend.SizeOf(ctx, b.Backend, key)
-}
-
-func (b *countingBackend) note(n int) {
-	b.bytes.Add(int64(n))
-	b.reads.Add(1)
-}
-
-func (b *countingBackend) reset() {
-	b.bytes.Store(0)
-	b.reads.Store(0)
-}
-
 // writeRangedPart writes rows as a part and returns the backend it landed on. streamed selects the
 // footer directory layout ([NewStreamWriterTo]) over the directory-first one.
-func writeRangedPart(t *testing.T, rows metricRows, streamed bool, opts ...PartOption) *countingBackend {
+func writeRangedPart(t *testing.T, rows metricRows, streamed bool, opts ...PartOption) backendtest.SizedByteCounter {
 	t.Helper()
 
 	ctx := context.Background()
-	b := newCountingBackend(newStreamingMemory())
+	b := backendtest.NewSizedByteCounter(backendtest.NewStreamingMemory())
 
 	if streamed {
 		rows.writeStreamTo(t, ctx, b, "p", false, opts...)
@@ -176,17 +125,17 @@ func TestColumnBlocksReadsOnlyWhatItDecodes(t *testing.T) {
 			r, err := OpenPart(ctx, b, "p")
 			require.NoError(t, err)
 
-			b.reset()
+			b.Reset()
 
 			d, err := r.ColumnBlocks(ctx, "value")
 			require.NoError(t, err)
 
-			opened := b.bytes.Load()
+			opened := b.Bytes()
 
 			_, err = d.DecodeFloat64(0)
 			require.NoError(t, err)
 
-			total := b.bytes.Load()
+			total := b.Bytes()
 			t.Logf("open read %d bytes, one block %d more, of a %d byte column", opened, total-opened, size)
 
 			assert.Less(t, total, size/2, "decoding one block must not read the column")

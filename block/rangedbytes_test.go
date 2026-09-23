@@ -11,17 +11,18 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
 )
 
 // writeBytesPart writes vals as a single block-framed bytes column and returns a reader over it,
 // together with the counting backend it landed on.
-func writeBytesPart(t *testing.T, vals [][]byte, granule int, opts ...PartOption) (*PartReader, *countingBackend) {
+func writeBytesPart(t *testing.T, vals [][]byte, granule int, opts ...PartOption) (*PartReader, backendtest.SizedByteCounter) {
 	t.Helper()
 
 	ctx := context.Background()
-	b := newCountingBackend(newStreamingMemory())
+	b := backendtest.NewSizedByteCounter(backendtest.NewStreamingMemory())
 
 	opts = append([]PartOption{
 		WithGranuleSize(granule),
@@ -198,7 +199,7 @@ func TestColumnBlocksBytesReadsOnlyWhatItDecodes(t *testing.T) {
 	require.True(t, ok)
 	require.True(t, desc.Blocked)
 
-	b.reset()
+	b.Reset()
 
 	d, err := r.ColumnBlocks(ctx, "attrs")
 	require.NoError(t, err)
@@ -206,7 +207,7 @@ func TestColumnBlocksBytesReadsOnlyWhatItDecodes(t *testing.T) {
 	_, err = d.DecodeBytes([]int{0})
 	require.NoError(t, err)
 
-	assert.Less(t, b.bytes.Load(), desc.Bytes,
+	assert.Less(t, b.Bytes(), desc.Bytes,
 		"a one-granule ranged decode read the whole %d-byte column", desc.Bytes)
 }
 

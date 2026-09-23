@@ -2,9 +2,6 @@ package recordengine_test
 
 import (
 	"context"
-	"maps"
-	"path"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
-	"github.com/oteldb/storage/internal/partid"
+	"github.com/oteldb/storage/backend/backendtest"
 )
 
 // rejectReads wraps a backend and fails Read for keys with a given suffix while armed. It aborts a
@@ -45,32 +42,6 @@ func partObjects(t *testing.T, be backend.Backend, id string) []string {
 	return keys
 }
 
-// isPartObject reports whether key names an object inside a part directory rather than an
-// engine-level object (the bucket index, the stream index).
-func isPartObject(key string) bool {
-	return slices.ContainsFunc(strings.Split(path.Dir(key), "/"), partid.Valid)
-}
-
-// partDirs returns the sorted part ids that have objects under the engine prefix — part ids are
-// minted, so a test cannot name them up front and asserts over this set instead.
-func partDirs(t *testing.T, be backend.Backend) []string {
-	t.Helper()
-
-	keys, err := be.List(context.Background(), "t/recs/")
-	require.NoError(t, err)
-
-	seen := make(map[string]struct{}, len(keys))
-
-	for _, k := range keys {
-		dir, _, ok := strings.Cut(strings.TrimPrefix(k, "t/recs/"), "/")
-		if ok && partid.Valid(dir) {
-			seen[dir] = struct{}{}
-		}
-	}
-
-	return slices.Sorted(maps.Keys(seen))
-}
-
 // TestFailedFlushBurnsPartID verifies a flush that wrote part objects and then failed does not hand
 // its id to the retry: reusing the prefix would overwrite only the objects the retry itself
 // produces, and two of a part's objects are conditional (the record-key footer, the side-store
@@ -89,7 +60,7 @@ func TestFailedFlushBurnsPartID(t *testing.T) {
 	require.Error(t, e.Flush(ctx))
 	be.armed.Store(false)
 
-	orphans := partDirs(t, be)
+	orphans := backendtest.PartDirs(ctx, t, be, enginePrefix)
 	require.Len(t, orphans, 1)
 	require.NotEmpty(t, partObjects(t, be, orphans[0]), "the failed attempt's objects are still there")
 
@@ -97,7 +68,7 @@ func TestFailedFlushBurnsPartID(t *testing.T) {
 	require.NoError(t, e.Flush(ctx))
 	require.Equal(t, 1, e.PartCount())
 
-	dirs := partDirs(t, be)
+	dirs := backendtest.PartDirs(ctx, t, be, enginePrefix)
 	require.Len(t, dirs, 2, "the retry must write to a fresh id, leaving the burnt one behind")
 	require.Contains(t, dirs, orphans[0])
 	require.Equal(t, []string{"orphan"}, streamBodies(t, e))
@@ -118,7 +89,7 @@ func TestLoadPartsSweepsOrphanParts(t *testing.T) {
 	require.Error(t, e.Flush(ctx))
 	be.armed.Store(false)
 
-	orphans := partDirs(t, be)
+	orphans := backendtest.PartDirs(ctx, t, be, enginePrefix)
 	require.Len(t, orphans, 1)
 	require.NotEmpty(t, partObjects(t, be, orphans[0]))
 
@@ -133,7 +104,7 @@ func TestLoadPartsSweepsOrphanParts(t *testing.T) {
 	ingest(t, r, mkBatch("api", rrec{ts: 200, body: "live"}))
 	require.NoError(t, r.Flush(ctx))
 
-	dirs := partDirs(t, be)
+	dirs := backendtest.PartDirs(ctx, t, be, enginePrefix)
 	require.Len(t, dirs, 1)
 	require.NotEqual(t, orphans[0], dirs[0], "the new part must not land on the orphan's id")
 	require.NotContains(t, keyScopes(r.Keys(0, 1<<60)), "http.method")
@@ -177,7 +148,7 @@ func TestRefreshReplicaKeepsUncommittedParts(t *testing.T) {
 	replica := newEngine(t, be)
 	require.NoError(t, replica.RefreshReplica(ctx))
 
-	orphans := partDirs(t, be)
+	orphans := backendtest.PartDirs(ctx, t, be, enginePrefix)
 	require.Len(t, orphans, 1)
 	require.NotEmpty(t, partObjects(t, be, orphans[0]),
 		"a replica must not delete part objects the owner may still be committing")

@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/recordengine"
 )
 
@@ -73,7 +74,7 @@ type blockWrite struct {
 }
 
 func (b *blockWrite) Write(ctx context.Context, key string, data []byte) error {
-	if isPartObject(key) {
+	if backendtest.IsPartObject(key) {
 		b.once.Do(func() { close(b.entered) })
 		<-b.release
 	}

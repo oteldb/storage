@@ -36,6 +36,12 @@ of an error there would let a flush report success over a dropped entry.
 Implementations are **interchangeable** — `backend/backendtest.Run(t, factory)` is the shared
 conformance suite all of them pass under `-race`.
 
+`backendtest` also holds the test wrappers every package would otherwise copy, and each states which
+capabilities it forwards, because tests measure exactly that: `WithoutCapabilities` and `Counting`
+(per-key reads, n-th write failure) forward none; `StreamingMemory` adds only `ObjectCreator`;
+`ByteCounter` serves `Viewer` and `ReaderAt` and hides `Sizer`, which `SizedByteCounter` adds back.
+It imports only `backend` and `internal/partid`, since block's internal tests use it.
+
 **`backend/faultbackend`** is the fault-injection wrapper for tests: rules match an operation by
 kind and key (`CompareAndSwap` and `ReadVersioned` included — a gate there is how a test states the
 commit-protocol interleaving) and either fail it, rewrite the bytes a read returns, or run a hook

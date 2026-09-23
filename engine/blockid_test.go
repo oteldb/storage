@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/engine"
@@ -34,7 +35,7 @@ func flushIDs(ctx context.Context, t *testing.T, e *engine.Engine, be backend.Ba
 		require.NoError(t, e.Flush(ctx))
 	}
 
-	ids := diskPartIDs(ctx, t, be)
+	ids := backendtest.PartDirs(ctx, t, be, lostPrefix)
 	require.Len(t, ids, n)
 
 	return ids
@@ -180,7 +181,7 @@ func TestBlocksSurviveRestart(t *testing.T) {
 			"a restart must not renumber a part")
 	}
 
-	fresh := diskPartIDs(ctx, t, be)
+	fresh := backendtest.PartDirs(ctx, t, be, lostPrefix)
 	require.Len(t, fresh, 3)
 	assert.Equal(t, bucketindex.Interval{Min: 3, Max: 3}, after[lostPrefix+"/"+fresh[2]].Blocks,
 		"the new owner allocates above what it inherited")
@@ -235,7 +236,7 @@ func TestRebaseAllocatesAboveTheRival(t *testing.T) {
 	require.Equal(t, bucketindex.Interval{Min: 1, Max: 1}, got[rival].Blocks,
 		"the winner keeps the block it claimed")
 
-	mine := diskPartIDs(ctx, t, inner)
+	mine := backendtest.PartDirs(ctx, t, inner, lostPrefix)
 	require.Len(t, mine, 1)
 	assert.Equal(t, bucketindex.Interval{Min: 2, Max: 2}, got[lostPrefix+"/"+mine[0]].Blocks,
 		"the loser re-allocates above the winner")
