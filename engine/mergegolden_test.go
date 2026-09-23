@@ -5,17 +5,25 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math/rand/v2"
+	"net/http/httptest"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	fsserver "github.com/go-faster/fs/server"
+	"github.com/go-faster/fs/storagemem"
 	"github.com/go-faster/sdk/gold"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/file"
+	"github.com/oteldb/storage/backend/s3"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/reliability"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -23,17 +31,35 @@ import (
 // Read — the shape of a minimal embedder backend.
 type wholeObjectBackend struct{ backend.Backend }
 
+func inProcessS3(t *testing.T, bucket string) *awss3.Client {
+	t.Helper()
+
+	store := storagemem.New()
+	require.NoError(t, store.CreateBucket(context.Background(), bucket))
+
+	srv := httptest.NewServer(fsserver.NewHandler(store))
+	t.Cleanup(srv.Close)
+
+	return awss3.New(awss3.Options{
+		Region:       "us-east-1",
+		BaseEndpoint: aws.String(srv.URL),
+		UsePathStyle: true,
+		Credentials:  credentials.NewStaticCredentialsProvider("test", "test", ""),
+	})
+}
+
 // goldenMergeCorpus covers each source-column form the metric merge reads: a noisy value column
 // spanning several compression frames, a later part overwriting an earlier one's timestamps, a
 // constant-collapsed value column, a weight column, and — in the second round — a source that is
 // itself a merge output, so the streamed column layout is read back as well as the flushed one.
-func goldenMergeCorpus(t *testing.T, b backend.Backend) *engine.Engine {
+func goldenMergeCorpus(t *testing.T, b backend.Backend, window int64) *engine.Engine {
 	t.Helper()
 
 	ctx := context.Background()
 	e := engine.New(engine.Config{
 		Backend: b, Prefix: "golden/metrics", MaxPartBytes: 0, MergeMemoryBytes: 1 << 30,
 	})
+	e.SetMergeReadWindow(window)
 
 	const series, samples = 300, 64
 
@@ -138,7 +164,8 @@ func partDigest(t *testing.T, e *engine.Engine, b backend.Backend) string {
 }
 
 // TestMergeOutputGolden pins the merged part byte for byte, whatever backend the sources are read
-// through: how a merge reads its sources is not allowed to change what it writes.
+// through and however far ahead: how a merge reads its sources is not allowed to change what it
+// writes. A zero window reads frame by frame; 4 KiB is below one frame, so every read serves one.
 func TestMergeOutputGolden(t *testing.T) {
 	t.Parallel()
 
@@ -155,15 +182,30 @@ func TestMergeOutputGolden(t *testing.T) {
 
 			return b
 		}},
+		{"cached-file", func(t *testing.T) backend.Backend {
+			t.Helper()
+
+			b, err := file.New(t.TempDir())
+			require.NoError(t, err)
+
+			return backend.Cached(b, 1<<20)
+		}},
+		{"s3", func(t *testing.T) backend.Backend {
+			t.Helper()
+
+			return s3.New(s3.NewAWS(inProcessS3(t, "golden"), "golden"), "", s3.WithRetry(reliability.Default()))
+		}},
 		{"whole-object", func(*testing.T) backend.Backend { return wholeObjectBackend{backend.Memory()} }},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+		for _, window := range []int64{0, 4 << 10, 1 << 20} {
+			t.Run(fmt.Sprintf("%s/window=%d", tc.name, window), func(t *testing.T) {
+				t.Parallel()
 
-			b := tc.open(t)
-			e := goldenMergeCorpus(t, b)
+				b := tc.open(t)
+				e := goldenMergeCorpus(t, b, window)
 
-			gold.Str(t, partDigest(t, e, b), "merge_output.txt")
-		})
+				gold.Str(t, partDigest(t, e, b), "merge_output.txt")
+			})
+		}
 	}
 }

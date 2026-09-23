@@ -581,14 +581,36 @@ whether a rising part count is parts that grew or a merge that stopped taking th
 ### Streaming both ways (`compactStream`)
 
 ```
-source part ─ forward cursor ┐
-source part ─ forward cursor ┼→ merge per series → partStreamWriter → block.StreamWriter
-source part ─ forward cursor ┘  (one series range   (streampart.go)    encodes a full granule
-                                 at a time)
+source part ─ ColumnScan cursors ┐
+source part ─ ColumnScan cursors ┼→ merge per series → partStreamWriter → block.StreamWriter
+source part ─ ColumnScan cursors ┘  (one series range   (streampart.go)    encodes a full granule
+ (one read-ahead window per column)   at a time)
 ```
 
-Working set is O(parts × one series range) plus the *encoded* output — not O(dataset), and not the
-output's uncompressed rows. That second half decouples granularity from memory: the row cap sets part
+Working set is O(parts × (columns × read window + one series range)) plus the *encoded* output — not
+O(dataset), not the sources' encoded columns, and not the output's uncompressed rows.
+
+**The read side.** Each source column is read through `block.PartReader.ColumnScan` with a
+`defaultMergeReadWindow` (1 MiB) read-ahead, so a merge holds one window per source column rather than
+its object: 8 sources × 3 columns is 24 MiB at most, whatever the sources' size. That is a bound, not a
+constant, and it is not charged against `mergeMemoryBudgetBytes`, which prices only the output side.
+Measured (`TestMergeResidentFlatInPartSize`, file backend, 64 KiB window): growing the sources 7.6×
+(2.5 → 18.9 MiB) moves the merge's peak live heap from 1.6 to 1.8 MiB; reading whole objects instead
+moves it from 2.4 to 18.9 MiB. The file and s3 backends have no zero-copy view, so a whole-object read
+is a heap copy the merge holds for its whole duration — which is what this replaced.
+
+Ranged reads bypass `backend.Cache`, so a merge no longer evicts the query read cache with its sources.
+Two cases still read a column whole, once: a constant or unblocked column (no frames; the first costs
+no I/O, the second is one small stream), and a backend offering neither `ReaderAt` nor `ViewerAt` —
+the EC wrapper, a minimal embedder backend — where each ranged read would itself be a whole read. An
+`s3.ObjectStore` without `RangeObjectStore` claims `ReaderAt` yet answers every range with a whole GET,
+so a merge over it re-reads each column once per window.
+
+**The merge unit is still one whole series.** `decodeRange` holds a series' range per source and
+`collect` materializes the merged series before downsampling, so a part of few series with many samples
+each holds O(one series × parts), and one hot series can approach a whole part.
+
+**The write side.** Streaming the output decouples granularity from memory: the row cap sets part
 size only, where buffering the output would also make it the peak-memory knob (`capRows × 32 B`, 512
 MiB at the default), so a cap raised to widen parts would raise merge RSS with it. On a 2M-row merge
 streaming costs 3.7–5.4× less total allocation and 2.9–3.8× less peak heap than buffering, the wider

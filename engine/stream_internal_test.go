@@ -95,7 +95,7 @@ func BenchmarkDecodeResident(b *testing.B) {
 			var before runtime.MemStats
 			runtime.ReadMemStats(&before)
 
-			s, err := newPartStream(ctx, p)
+			s, err := newPartStream(ctx, p, defaultMergeReadWindow)
 			if err != nil {
 				b.Fatal(err)
 			}

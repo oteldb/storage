@@ -208,6 +208,9 @@ type Engine struct {
 	// constant, only so a test can write the [chunk.CodecDoD] parts earlier builds wrote and check
 	// they merge.
 	tsCodec chunk.Codec
+	// mergeReadWindow is each source column's read-ahead during a merge ([block.PartReader.ColumnScan]).
+	// A field for the same reason as tsCodec: a test shrinks it to span many windows on a small corpus.
+	mergeReadWindow int64
 	// idleMerges counts consecutive merges that selected nothing, so the selector can waive its
 	// write-amplification guard for parts that would otherwise never merge (see pickMergeRun).
 	// Written only under flushMu, which a merge holds across its whole body; atomic so
@@ -370,7 +373,7 @@ func New(cfg Config) *Engine {
 		cfg.Obs = obs.NewNop()
 	}
 
-	e := &Engine{cfg: cfg, head: newHead(), tsCodec: chunk.CodecDoDScaled}
+	e := &Engine{cfg: cfg, head: newHead(), tsCodec: chunk.CodecDoDScaled, mergeReadWindow: defaultMergeReadWindow}
 	e.repairGate = make(chan struct{}, 1)
 	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
 	// The decode free list covers the peak in-flight decoded parts: prefetch can decode
