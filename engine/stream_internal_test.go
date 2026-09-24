@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/heaptest"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -63,22 +64,18 @@ func BenchmarkDecodeResident(b *testing.B) {
 		for range b.N {
 			runtime.GC()
 
-			var before runtime.MemStats
-			runtime.ReadMemStats(&before)
+			var d *decodedPart
 
-			d, err := p.decode(ctx, colNeed{values: true})
-			if err != nil {
-				b.Fatal(err)
-			}
-
-			var after runtime.MemStats
-			runtime.ReadMemStats(&after)
+			delta := heaptest.InuseGrowth(func() {
+				var err error
+				if d, err = p.decode(ctx, colNeed{values: true}); err != nil {
+					b.Fatal(err)
+				}
+			})
 
 			decodeResidentSink ^= d.ts[0] // keep the decoded columns resident through the measurement
 
-			if delta := after.HeapInuse - before.HeapInuse; delta > peak {
-				peak = delta
-			}
+			peak = max(peak, delta)
 		}
 
 		b.ReportMetric(float64(peak)/(1<<20), "peakMB")
@@ -92,47 +89,41 @@ func BenchmarkDecodeResident(b *testing.B) {
 		for range b.N {
 			runtime.GC()
 
-			var before runtime.MemStats
-			runtime.ReadMemStats(&before)
-
-			s, err := newPartStream(ctx, p, defaultMergeReadWindow)
-			if err != nil {
-				b.Fatal(err)
-			}
-
-			var dst rangeBuf
-
-			var partIDs []signal.SeriesID
-			if err := p.index.forEachID(ctx, func(id signal.SeriesID) { partIDs = append(partIDs, id) }); err != nil {
-				b.Fatal(err)
-			}
-
-			for _, id := range partIDs {
-				rng, ok, err := p.index.lookup(ctx, id)
+			delta := heaptest.InuseGrowth(func() {
+				s, err := newPartStream(ctx, p, defaultMergeReadWindow)
 				if err != nil {
 					b.Fatal(err)
 				}
 
-				if !ok {
-					continue
-				}
+				var dst rangeBuf
 
-				tsv, _, _, err := s.decodeRange(rng, &dst)
-				if err != nil {
+				var partIDs []signal.SeriesID
+				if err := p.index.forEachID(ctx, func(id signal.SeriesID) { partIDs = append(partIDs, id) }); err != nil {
 					b.Fatal(err)
 				}
 
-				if len(tsv) > 0 {
-					decodeResidentSink ^= tsv[0]
+				for _, id := range partIDs {
+					rng, ok, err := p.index.lookup(ctx, id)
+					if err != nil {
+						b.Fatal(err)
+					}
+
+					if !ok {
+						continue
+					}
+
+					tsv, _, _, err := s.decodeRange(rng, &dst)
+					if err != nil {
+						b.Fatal(err)
+					}
+
+					if len(tsv) > 0 {
+						decodeResidentSink ^= tsv[0]
+					}
 				}
-			}
+			})
 
-			var after runtime.MemStats
-			runtime.ReadMemStats(&after)
-
-			if delta := after.HeapInuse - before.HeapInuse; delta > peak {
-				peak = delta
-			}
+			peak = max(peak, delta)
 		}
 
 		b.ReportMetric(float64(peak)/(1<<20), "peakMB")

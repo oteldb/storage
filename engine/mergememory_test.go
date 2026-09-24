@@ -17,6 +17,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/heaptest"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -80,18 +81,11 @@ func TestMergeAllocatesBelowRawRows(t *testing.T) {
 			ctx := context.Background()
 			e, rows := mergeCorpus(t, series, samples, parts, tc.value)
 
-			var before, after runtime.MemStats
-
 			runtime.GC()
-			runtime.ReadMemStats(&before)
-
-			require.NoError(t, e.Merge(ctx, 0))
-
-			runtime.ReadMemStats(&after)
 
 			var (
+				alloced = float64(heaptest.Allocated(func() { require.NoError(t, e.Merge(ctx, 0)) }))
 				raw     = float64(rows * partRowBytes)
-				alloced = float64(after.TotalAlloc - before.TotalAlloc)
 			)
 
 			t.Logf("rows=%d raw=%.1f MiB alloced=%.1f MiB ratio=%.2fx", rows, raw/(1<<20), alloced/(1<<20), alloced/raw)

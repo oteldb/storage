@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/heaptest"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/signal"
@@ -142,7 +143,7 @@ func TestMergeKeysHoldsNoSet(t *testing.T) {
 
 	var k mergestream.Keys
 
-	heap := allocBytes(func() {
+	heap := heaptest.BytesPerOp(func() {
 		require.NoError(t, mergeKeys(ctx, src, &k))
 
 		for k.Next() {
@@ -150,22 +151,11 @@ func TestMergeKeysHoldsNoSet(t *testing.T) {
 		}
 	})
 
-	set := allocBytes(func() {
+	set := heaptest.BytesPerOp(func() {
 		_, err := legacySortedSeriesIDs(ctx, src)
 		require.NoError(t, err)
 	})
 
 	assert.Less(t, heap, int64(1<<10))
 	assert.Greater(t, set, int64(series*16), "the reference allocated per series")
-}
-
-func allocBytes(fn func()) int64 {
-	return testing.Benchmark(func(b *testing.B) {
-		b.Helper()
-		b.ReportAllocs()
-
-		for b.Loop() {
-			fn()
-		}
-	}).AllocedBytesPerOp()
 }

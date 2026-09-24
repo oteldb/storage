@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	backendfile "github.com/oteldb/storage/backend/file"
+	"github.com/oteldb/storage/internal/heaptest"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
@@ -94,14 +95,8 @@ func TestRecordMergeBoundedWorkingSet(t *testing.T) {
 		require.True(t, ok)
 		require.NoError(t, eng.Flush(ctx))
 
-		var before, after runtime.MemStats
 		runtime.GC()
-		runtime.ReadMemStats(&before)
-
-		require.NoError(t, eng.Merge(ctx, 0))
-
-		runtime.ReadMemStats(&after)
-		allocs[round] = float64(after.TotalAlloc-before.TotalAlloc) / (1 << 20)
+		allocs[round] = float64(heaptest.Allocated(func() { require.NoError(t, eng.Merge(ctx, 0)) })) / (1 << 20)
 
 		t.Logf("%-6d %-8d %-16.1f %-16d", round, eng.PartCount(), allocs[round], int64((round+1)*services*perService))
 	}

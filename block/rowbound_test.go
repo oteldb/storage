@@ -1,12 +1,12 @@
 package block
 
 import (
-	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/internal/heaptest"
 )
 
 // TestColumnRowsBoundDecode checks that a column whose stream states more rows than the part does is
@@ -57,14 +57,10 @@ func TestColumnRowsBoundDecode(t *testing.T) {
 
 			require.NoError(t, tc.read(newColumnReader(desc, obj, noneComp(), rows)), "the honest count decodes")
 
-			var before, after runtime.MemStats
-
-			runtime.ReadMemStats(&before)
-			err = tc.read(newColumnReader(desc, obj, noneComp(), rows-5))
-			runtime.ReadMemStats(&after)
+			alloced := heaptest.Allocated(func() { err = tc.read(newColumnReader(desc, obj, noneComp(), rows-5)) })
 
 			require.Error(t, err)
-			require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(1<<20))
+			require.Less(t, alloced, uint64(1<<20))
 		})
 	}
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/oteldb/storage/internal/heaptest"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/signal"
 )
@@ -101,7 +102,7 @@ func TestMergeKeysHoldsNoSet(t *testing.T) {
 
 	var k mergestream.Keys
 
-	heap := allocBytes(func() {
+	heap := heaptest.BytesPerOp(func() {
 		mergeKeys(src, &k)
 
 		for k.Next() {
@@ -110,16 +111,5 @@ func TestMergeKeysHoldsNoSet(t *testing.T) {
 	})
 
 	assert.Less(t, heap, int64(1<<10))
-	assert.Greater(t, allocBytes(func() { _ = legacyIDSetOf(src) }), int64(streams*16), "the reference allocated per stream")
-}
-
-func allocBytes(fn func()) int64 {
-	return testing.Benchmark(func(b *testing.B) {
-		b.Helper()
-		b.ReportAllocs()
-
-		for b.Loop() {
-			fn()
-		}
-	}).AllocedBytesPerOp()
+	assert.Greater(t, heaptest.BytesPerOp(func() { _ = legacyIDSetOf(src) }), int64(streams*16), "the reference allocated per stream")
 }
