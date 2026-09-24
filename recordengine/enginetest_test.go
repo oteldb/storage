@@ -6,11 +6,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/internal/enginetest"
+	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/recordengine"
+	"github.com/oteldb/storage/signal"
 )
 
 // recordEngine adapts the record engine to the shared suite: a Row is one record of the stream
@@ -25,21 +25,31 @@ func (e recordEngine) Append(t *testing.T, rows ...enginetest.Row) {
 	}
 }
 
-func (e recordEngine) Rows(t *testing.T, stream string) []enginetest.Row {
-	t.Helper()
+func (e recordEngine) Read(ctx context.Context, stream string) ([]enginetest.Row, error) {
+	it, err := e.Fetch(ctx, req(stream))
+	if err != nil {
+		return nil, err
+	}
+
+	batches, err := fetch.Drain(ctx, it)
+	if err != nil {
+		return nil, err
+	}
 
 	var out []enginetest.Row
 
-	for _, b := range fetchAll(t, e.Engine, req(stream)) {
+	for _, b := range batches {
 		for i, body := range bodies(b) {
 			v, err := strconv.ParseInt(body, 10, 64)
-			require.NoError(t, err)
+			if err != nil {
+				return nil, err
+			}
 
 			out = append(out, enginetest.Row{Stream: stream, Ts: b.Timestamps[i], Val: v})
 		}
 	}
 
-	return out
+	return out, nil
 }
 
 func (e recordEngine) AttrNames(*testing.T) []string {
@@ -94,6 +104,13 @@ func (f recordFetcher) FetchWants(ctx context.Context, wants []bucketindex.Want)
 	}
 
 	return out
+}
+
+// streamIdentity is the identity mkBatch gives a stream of the named service.
+func streamIdentity(svc string) signal.Series {
+	return signal.Series{Resource: signal.Resource{Attributes: signal.NewAttributes(
+		signal.KeyValue{Key: []byte("service.name"), Value: signal.StringValue([]byte(svc))},
+	)}}
 }
 
 var recordKind = enginetest.Kind{

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend/bucketindex"
@@ -15,7 +16,7 @@ import (
 )
 
 // metricEngine adapts the metric engine to the shared suite: a Row is one sample of the series
-// {job=<stream>}.
+// {job=<stream>}. Read also enforces the fetch contract of one batch per series.
 type metricEngine struct{ *engine.Engine }
 
 func (e metricEngine) Append(t *testing.T, rows ...enginetest.Row) {
@@ -31,20 +32,34 @@ func (e metricEngine) Append(t *testing.T, rows ...enginetest.Row) {
 	}
 }
 
-func (e metricEngine) Rows(t *testing.T, stream string) []enginetest.Row {
-	t.Helper()
+func (e metricEngine) Read(ctx context.Context, stream string) ([]enginetest.Row, error) {
+	it, err := e.Fetch(ctx, fetch.Request{Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{eqMatcher("job", stream)}})
+	if err != nil {
+		return nil, err
+	}
+
+	batches, err := fetch.Drain(ctx, it)
+	if err != nil {
+		return nil, err
+	}
 
 	var out []enginetest.Row
 
-	for _, b := range fetchAll(t, e.Engine, fetch.Request{
-		Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{eqMatcher("job", stream)},
-	}) {
+	seen := make(map[signal.SeriesID]struct{}, len(batches))
+
+	for _, b := range batches {
+		if _, dup := seen[b.ID]; dup {
+			return nil, errors.Errorf("series %v split across batches", b.ID)
+		}
+
+		seen[b.ID] = struct{}{}
+
 		for i, ts := range b.Timestamps {
 			out = append(out, enginetest.Row{Stream: stream, Ts: ts, Val: int64(b.Values[i])})
 		}
 	}
 
-	return out
+	return out, nil
 }
 
 func (e metricEngine) AttrNames(t *testing.T) []string {

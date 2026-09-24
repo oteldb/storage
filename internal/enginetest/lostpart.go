@@ -31,7 +31,7 @@ func gonePartBecomesWant(t *testing.T, k Kind) {
 	r := k.open(t, be)
 	require.NoError(t, r.LoadParts(ctx), "one gone part must not fail the load")
 	require.Equal(t, 1, r.PartCount())
-	require.Equal(t, []Row{api(200, 2)}, r.Rows(t, "api"))
+	require.Equal(t, []Row{api(200, 2)}, rows(t, r, apiStream))
 
 	ix := k.loadIndex(t, be)
 	require.Equal(t, []string{k.Prefix + "/" + ids[1]}, prefixes(ix.Entries))

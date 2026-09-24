@@ -11,7 +11,6 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/recordengine"
-	"github.com/oteldb/storage/wal"
 )
 
 var errWriteRejected = errors.New("injected write failure")
@@ -37,73 +36,6 @@ func streamBodies(t *testing.T, e *recordengine.Engine) []string {
 	}
 
 	return out
-}
-
-// TestFlushFailureKeepsRows verifies a flush that fails before publishing a part folds the detached
-// head buffers back, so the records are retried by the next flush instead of being stranded in the
-// in-flight buffer (which the next flush would overwrite — silent, permanent loss).
-func TestFlushFailureKeepsRows(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	be := faultbackend.Wrap(backend.Memory())
-	e := newEngine(t, be)
-
-	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "buffered-1"}, rrec{ts: 200, body: "buffered-2"}))
-
-	rejectWrites(be, "", errWriteRejected)
-	require.Error(t, e.Flush(ctx), "flush must fail while the backend rejects writes")
-	be.Reset()
-
-	require.Equal(t, []string{"buffered-1", "buffered-2"}, streamBodies(t, e), "readable after the failed flush")
-	require.Positive(t, e.HeadBytes(), "the folded-back rows are accounted as head bytes again")
-
-	ingest(t, e, mkBatch("api", rrec{ts: 300, body: "later"}))
-	require.NoError(t, e.Flush(ctx))
-
-	require.Equal(t, []string{"buffered-1", "buffered-2", "later"}, streamBodies(t, e),
-		"the retried flush persists both the folded-back rows and the ones appended after it")
-	require.Equal(t, 1, e.PartCount())
-}
-
-// TestFlushFailureKeepsRowsAcrossRestart is [TestFlushFailureKeepsRows] with durability: because the
-// failed flush's records stay in the head, the next flush persists them and the WAL checkpoint only
-// discards segments the committed part supersedes.
-func TestFlushFailureKeepsRowsAcrossRestart(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	be := faultbackend.Wrap(backend.Memory())
-	walDir := t.TempDir()
-
-	w, err := wal.Create(walDir, 0)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = w.Close() })
-
-	e := recordengine.New(recordengine.Config{Schema: testSchema, Backend: be, Prefix: "t/recs", WAL: w})
-
-	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "buffered-1"}, rrec{ts: 200, body: "buffered-2"}))
-	require.NoError(t, w.Sync())
-
-	rejectWrites(be, "", errWriteRejected)
-	require.Error(t, e.Flush(ctx))
-	be.Reset()
-
-	ingest(t, e, mkBatch("api", rrec{ts: 300, body: "later"}))
-	require.NoError(t, w.Sync())
-	require.NoError(t, e.Flush(ctx))
-
-	// Restart: recover the watermark from the bucket index, then replay whatever WAL is left.
-	w2, err := wal.Create(walDir, 0)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = w2.Close() })
-
-	e2 := recordengine.New(recordengine.Config{Schema: testSchema, Backend: be, Prefix: "t/recs", WAL: w2})
-	require.NoError(t, e2.LoadParts(ctx))
-	require.NoError(t, e2.Replay(t.Context(), walDir))
-
-	require.Equal(t, []string{"buffered-1", "buffered-2", "later"}, streamBodies(t, e2),
-		"records logged to the WAL must survive a restart after a failed flush")
 }
 
 // TestFlushFailureRestoresSideStore verifies the side-store snapshot taken with the head detach is

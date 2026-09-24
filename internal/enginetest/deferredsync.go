@@ -1,4 +1,4 @@
-package recordengine_test
+package enginetest
 
 import (
 	"context"
@@ -13,7 +13,8 @@ import (
 )
 
 // syncedCommits fails a test whose index commit names a part with deferred objects no SyncPrefix
-// has covered: a power cut after that commit could take the part the index promises.
+// has covered: a power cut after that commit could take the part the index promises. It forwards
+// the deferred-sync capability, which faultbackend does not.
 type syncedCommits struct {
 	*backendtest.Deferred
 
@@ -42,15 +43,16 @@ func (c *syncedCommits) CompareAndSwap(
 	return c.Deferred.CompareAndSwap(ctx, key, expected, data)
 }
 
-func TestPartsSyncedBeforeIndexCommit(t *testing.T) {
-	t.Parallel()
+func partsSyncedBeforeIndexCommit(t *testing.T, k Kind) {
+	t.Helper()
 
 	ctx := context.Background()
-	be := &syncedCommits{Deferred: backendtest.WithDeferred(backend.Memory()), t: t, key: indexKey()}
-	e := newEngine(t, be)
+	be := &syncedCommits{Deferred: backendtest.WithDeferred(backend.Memory()), t: t, key: k.indexKey()}
+	e := k.open(t, be)
 
-	for i := range 3 {
-		ingest(t, e, mkBatch("api", rrec{ts: int64(100 * (i + 1)), body: "r", attr: [2]string{"k", "v"}}))
+	for i := range int64(3) {
+		ts := 100 * (i + 1)
+		e.Append(t, Row{Stream: apiStream, Ts: ts, Val: i, Attr: [2]string{"k", "v"}}, Row{Stream: "db", Ts: ts, Val: i})
 		require.NoError(t, e.Flush(ctx))
 	}
 

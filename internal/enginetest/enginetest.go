@@ -70,8 +70,8 @@ type Engine interface {
 type Store interface {
 	// Append buffers rows in the head, failing t on error.
 	Append(t *testing.T, rows ...Row)
-	// Rows returns every row stream holds, in timestamp order, with Attr unset.
-	Rows(t *testing.T, stream string) []Row
+	// Read returns every row stream holds, in the engine's fetch order, with Attr unset.
+	Read(ctx context.Context, stream string) ([]Row, error)
 	Flush(ctx context.Context) error
 	Merge(ctx context.Context, retainFrom int64) error
 	LoadParts(ctx context.Context) error
@@ -145,6 +145,31 @@ var suite = []struct {
 	{"FailedWantCommitAppliesNeither", failedWantCommitAppliesNeither},
 	{"WantSurvivesLaterCommits", wantSurvivesLaterCommits},
 	{"EntriesLeaveOnlyIntoRemovedOrWanted", entriesLeaveOnlyIntoRemovedOrWanted},
+
+	{"FailedFlushBurnsPartID", failedFlushBurnsPartID},
+	{"LoadPartsSweepsOrphanParts", loadPartsSweepsOrphanParts},
+	{"LoadPartsKeepsLiveParts", loadPartsKeepsLiveParts},
+	{"RefreshReplicaKeepsUncommittedParts", refreshReplicaKeepsUncommittedParts},
+	{"MergeIndexCommitFailureKeepsSources", mergeIndexCommitFailureKeepsSources},
+	{"PartsSyncedBeforeIndexCommit", partsSyncedBeforeIndexCommit},
+	{"FlushFailureKeepsRows", flushFailureKeepsRows},
+	{"FlushFailureKeepsRowsAcrossRestart", flushFailureKeepsRowsAcrossRestart},
+	{"FlushFailureMergesConcurrentAppends", flushFailureMergesConcurrentAppends},
+	{"PublishCommitsBucketIndexLast", publishCommitsBucketIndexLast},
+	{"UncommittedPartIdentityIsNotLoaded", uncommittedPartIdentityIsNotLoaded},
+	{"PublishWritesIdentityBeforeCommit", publishWritesIdentityBeforeCommit},
+
+	{"ResetWaitsForInFlightFlush", resetWaitsForInFlightFlush},
+	{"ResetKeepsPartsUnderRead", resetKeepsPartsUnderRead},
+	{"ConcurrentFlushIsSerialized", concurrentFlushIsSerialized},
+	{"PartIdentityRetentionSelfCleaning", partIdentityRetentionSelfCleaning},
+	{"PartIdentityMergedPartCarriesUnion", partIdentityMergedPartCarriesUnion},
+	{"LegacyIdentityObjectStillResolves", legacyIdentityObjectStillResolves},
+	{"LegacyIdentityObjectDeletedOnceMigrated", legacyIdentityObjectDeletedOnceMigrated},
+	{"PartIdentityWriteAmplification", partIdentityWriteAmplification},
+	{"WALResolvesStreamAfterCheckpoint", walResolvesStreamAfterCheckpoint},
+	{"HeadAgeTracksFlushLag", headAgeTracksFlushLag},
+	{"MergeShapeReportsBytes", mergeShapeReportsBytes},
 }
 
 // Run runs every suite test against k, each as <test>/<k.Name>.

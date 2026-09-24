@@ -13,6 +13,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/query/fetch"
 )
 
 // fakeFetcher stands in for the cluster layer's part-sync pull: it records what repair asked for
@@ -67,6 +68,16 @@ func (f *fakeFetcher) fetchCalls() int {
 	defer f.mu.Unlock()
 
 	return f.calls
+}
+
+// seriesSamples returns the timestamps and values the engine holds for the "api" series.
+func seriesSamples(t *testing.T, e *engine.Engine) ([]int64, []float64) {
+	t.Helper()
+
+	got := fetchAll(t, e, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
+	require.Len(t, got, 1)
+
+	return got[0].Timestamps, got[0].Values
 }
 
 func newRepairEngine(t *testing.T, be backend.Backend, r engine.PartFetcher) *engine.Engine {

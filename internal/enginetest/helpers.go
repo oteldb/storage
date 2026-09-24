@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
@@ -13,7 +14,23 @@ import (
 	"github.com/oteldb/storage/backend/faultbackend"
 )
 
-func api(ts, val int64) Row { return Row{Stream: "api", Ts: ts, Val: val} }
+var (
+	errReadRejected  = errors.New("injected read failure")
+	errWriteRejected = errors.New("injected write failure")
+)
+
+const apiStream = "api"
+
+func api(ts, val int64) Row { return Row{Stream: apiStream, Ts: ts, Val: val} }
+
+func rows(t *testing.T, e Engine, stream string) []Row {
+	t.Helper()
+
+	out, err := e.Read(context.Background(), stream)
+	require.NoError(t, err)
+
+	return out
+}
 
 // rejectReads fails every Read of a key ending in suffix with err. On "/manifest" it aborts a flush
 // after the part's objects are fully written (at the openPart read-back), which is what leaves an
@@ -24,6 +41,15 @@ func rejectReads(be *faultbackend.Backend, suffix string, err error) {
 		Match: func(op faultbackend.Op) bool { return strings.HasSuffix(op.Key, suffix) },
 		Err:   err,
 	})
+}
+
+// rejectWrites fails every Write and CompareAndSwap of a key ending in suffix with err; an empty
+// suffix matches every key. CompareAndSwap is the path the bucket-index commit takes, so a suffix
+// naming the index must reject it too.
+func rejectWrites(be *faultbackend.Backend, suffix string, err error) {
+	match := func(op faultbackend.Op) bool { return strings.HasSuffix(op.Key, suffix) }
+	be.Add(faultbackend.Rule{Kind: faultbackend.Write, Match: match, Err: err})
+	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Match: match, Err: err})
 }
 
 func (k Kind) loadIndex(t *testing.T, be backend.Backend) *bucketindex.Index {
