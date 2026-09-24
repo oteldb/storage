@@ -158,6 +158,7 @@ var suite = []struct {
 	{"FailedWantCommitAppliesNeither", failedWantCommitAppliesNeither},
 	{"WantSurvivesLaterCommits", wantSurvivesLaterCommits},
 	{"EntriesLeaveOnlyIntoRemovedOrWanted", entriesLeaveOnlyIntoRemovedOrWanted},
+	{"FailedLoadKeepsUnopenedParts", failedLoadKeepsUnopenedParts},
 
 	{"FailedFlushBurnsPartID", failedFlushBurnsPartID},
 	{"LoadPartsSweepsOrphanParts", loadPartsSweepsOrphanParts},
