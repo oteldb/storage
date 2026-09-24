@@ -12,6 +12,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/obs"
 )
@@ -76,16 +77,16 @@ func observedRepair(t *testing.T, reader *sdkmetric.ManualReader) engine.RepairS
 func TestRepairFailedCommitObservesNoLoss(t *testing.T) {
 	t.Parallel()
 
-	be := &rejectIndexWrites{Backend: backend.Memory()}
+	be := faultbackend.Wrap(backend.Memory())
 	e, reader := newObservedRepairEngine(t, be, answerAlways(bucketindex.WantAbsent, nil))
 
 	lost := loseFirstOfTwo(t, e, be)
 
 	mergeTimes(t, e, 2)
 
-	be.armed.Store(true)
+	rejectWrites(be, "/"+bucketindex.Object, errWriteRejected)
 	mergeTimes(t, e, 1)
-	be.armed.Store(false)
+	be.Reset()
 
 	assert.Equal(t, []string{lost}, e.WantPrefixes(), "the want is still owed")
 	assert.Empty(t, e.Holes())

@@ -2,7 +2,6 @@ package engine_test
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/backendtest"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 )
@@ -115,31 +115,6 @@ func TestLoadPartsCorruptIndexesError(t *testing.T) {
 	}
 }
 
-// failKeyWrite fails Write for keys ending in suffix, passing everything else through.
-type failKeyWrite struct {
-	backend.Backend
-
-	suffix string
-}
-
-func (f failKeyWrite) Write(ctx context.Context, key string, data []byte) error {
-	if strings.HasSuffix(key, f.suffix) {
-		return assert.AnError
-	}
-
-	return f.Backend.Write(ctx, key, data)
-}
-
-func (f failKeyWrite) CompareAndSwap(
-	ctx context.Context, key string, expected backend.Version, data []byte,
-) (backend.Version, bool, error) {
-	if strings.HasSuffix(key, f.suffix) {
-		return backend.VersionAbsent, false, assert.AnError
-	}
-
-	return f.Backend.CompareAndSwap(ctx, key, expected, data)
-}
-
 func TestFlushIndexWriteErrorsPropagate(t *testing.T) {
 	t.Parallel()
 
@@ -147,7 +122,9 @@ func TestFlushIndexWriteErrorsPropagate(t *testing.T) {
 		t.Run(suffix, func(t *testing.T) {
 			t.Parallel()
 
-			be := failKeyWrite{Backend: backend.Memory(), suffix: suffix}
+			be := faultbackend.Wrap(backend.Memory())
+			rejectWrites(be, suffix, assert.AnError)
+
 			e := engine.New(engine.Config{Backend: be, Prefix: "default/metrics"})
 			mustAppend(t, e, mkSeries("job", "api"), 100, 1.0)
 
@@ -156,29 +133,13 @@ func TestFlushIndexWriteErrorsPropagate(t *testing.T) {
 	}
 }
 
-// countKeyWrite counts Writes of keys ending in suffix.
-type countKeyWrite struct {
-	backend.Backend
-
-	suffix string
-	n      int
-}
-
-func (c *countKeyWrite) Write(ctx context.Context, key string, data []byte) error {
-	if strings.HasSuffix(key, c.suffix) {
-		c.n++
-	}
-
-	return c.Backend.Write(ctx, key, data)
-}
-
 // TestPartIdentityIsPerPart checks identity is scoped to the part that holds it: every flush writes
 // its part's own identity object, and the engine prefix keeps no whole-set object to rewrite.
 func TestPartIdentityIsPerPart(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &countKeyWrite{Backend: backend.Memory(), suffix: "/identity"}
+	be := faultbackend.Wrap(backend.Memory())
 	cfg := engine.Config{Backend: be, Prefix: "default/metrics"}
 
 	e := engine.New(cfg)
@@ -189,7 +150,7 @@ func TestPartIdentityIsPerPart(t *testing.T) {
 		require.NoError(t, e.Flush(ctx))
 	}
 
-	assert.Equal(t, 4, be.n, "one identity object per flushed part")
+	assert.Equal(t, 4, be.Count(identityWrite), "one identity object per flushed part")
 
 	_, err := backend.ReadUncached(ctx, be, "default/metrics/series.bin")
 	require.ErrorIs(t, err, backend.ErrNotExist, "no whole-set identity object is written")

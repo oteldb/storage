@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -201,13 +202,6 @@ func TestFlushScopeAndResourceLabels(t *testing.T) {
 	}
 }
 
-// failWriteBackend wraps a backend but fails every Write, to exercise the flush error path.
-type failWriteBackend struct{ backend.Backend }
-
-func (failWriteBackend) Write(context.Context, string, []byte) error {
-	return errWriteFailed
-}
-
 var errWriteFailed = writeError{}
 
 type writeError struct{}
@@ -217,7 +211,10 @@ func (writeError) Error() string { return "write failed" }
 func TestFlushWriteError(t *testing.T) {
 	t.Parallel()
 
-	e := engine.New(engine.Config{Backend: failWriteBackend{backend.Memory()}, Prefix: "default/metrics"})
+	be := faultbackend.Wrap(backend.Memory())
+	be.Add(faultbackend.Rule{Kind: faultbackend.Write, Err: errWriteFailed})
+
+	e := engine.New(engine.Config{Backend: be, Prefix: "default/metrics"})
 	mustAppend(t, e, mkSeries("job", "api"), 100, 1.0)
 
 	err := e.Flush(context.Background())
