@@ -4,55 +4,16 @@ import (
 	"context"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/backendtest"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 )
-
-// gateWrites blocks the first Write of a part object until released, holding a flush open in its
-// off-lock build phase.
-type gateWrites struct {
-	backend.Backend
-
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (g *gateWrites) Write(ctx context.Context, key string, data []byte) error {
-	if backendtest.IsPartObject(key) {
-		g.once.Do(func() { close(g.entered) })
-		<-g.release
-	}
-
-	return g.Backend.Write(ctx, key, data)
-}
-
-// gateReads blocks the first read of a part column once armed, holding a fetch inside its lock-free
-// part read (where it has the part acquired).
-type gateReads struct {
-	backend.Backend
-
-	armed   atomic.Bool
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (g *gateReads) Read(ctx context.Context, key string) ([]byte, error) {
-	if g.armed.Load() && strings.Contains(key, "/c/") {
-		g.once.Do(func() { close(g.entered) })
-		<-g.release
-	}
-
-	return g.Backend.Read(ctx, key)
-}
 
 func objectCount(t *testing.T, be backend.Backend, prefix string) int {
 	t.Helper()
@@ -70,7 +31,9 @@ func TestResetWaitsForInFlightFlush(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &gateWrites{Backend: backend.Memory(), entered: make(chan struct{}), release: make(chan struct{})}
+	be := faultbackend.Wrap(backend.Memory())
+	gate := faultbackend.NewGate()
+	be.Add(gate.RuleAll(faultbackend.Write, func(op faultbackend.Op) bool { return backendtest.IsPartObject(op.Key) }))
 	e := engine.New(engine.Config{Backend: be, Prefix: "default/metrics"})
 
 	mustAppend(t, e, mkSeries("job", "api"), 100, 1.0)
@@ -78,12 +41,12 @@ func TestResetWaitsForInFlightFlush(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- e.Flush(ctx) }()
 
-	<-be.entered // the flush has detached the head and is writing its part
+	gate.Await(t) // the flush has detached the head and is writing its part
 
 	reset := make(chan error, 1)
 	go func() { reset <- e.Reset(ctx) }()
 
-	close(be.release)
+	gate.Release()
 	require.NoError(t, <-done)
 	require.NoError(t, <-reset)
 
@@ -100,7 +63,8 @@ func TestResetKeepsPartsUnderRead(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &gateReads{Backend: backend.Memory(), entered: make(chan struct{}), release: make(chan struct{})}
+	be := faultbackend.Wrap(backend.Memory())
+	gate := faultbackend.NewGate()
 	e := engine.New(engine.Config{Backend: be, Prefix: "default/metrics"})
 
 	// Enough distinct values that the columns are real objects the fetch must read (a single-valued
@@ -118,7 +82,8 @@ func TestResetKeepsPartsUnderRead(t *testing.T) {
 	dirs := backendtest.PartDirs(ctx, t, be, "default/metrics")
 	require.Len(t, dirs, 1)
 
-	be.armed.Store(true)
+	// Armed only now, so the flush's own read-back was not held.
+	be.Add(gate.RuleAll(faultbackend.Read, func(op faultbackend.Op) bool { return strings.Contains(op.Key, "/c/") }))
 
 	type result struct {
 		ts  []int64
@@ -150,14 +115,14 @@ func TestResetKeepsPartsUnderRead(t *testing.T) {
 		got <- result{ts: ts}
 	}()
 
-	<-be.entered // the fetch holds the part and is reading its columns
+	gate.Await(t) // the fetch holds the part and is reading its columns
 
 	require.NoError(t, e.Reset(ctx))
 	require.Positive(t, objectCount(t, be, "default/metrics/"+dirs[0]+"/"),
 		"a part a fetch is reading must outlive the reset")
 
-	be.armed.Store(false)
-	close(be.release)
+	be.Reset()
+	gate.Release()
 
 	r := <-got
 	require.NoError(t, r.err)

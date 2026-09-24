@@ -12,6 +12,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/backendtest"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -156,20 +157,8 @@ func TestLegacyIdentityObjectDeletedOnceMigrated(t *testing.T) {
 	assert.Equal(t, 1, r2.SeriesCount())
 }
 
-// sizeKeyWrite sums the bytes written to keys ending in suffix.
-type sizeKeyWrite struct {
-	backend.Backend
-
-	suffix string
-	bytes  int
-}
-
-func (c *sizeKeyWrite) Write(ctx context.Context, key string, data []byte) error {
-	if strings.HasSuffix(key, c.suffix) {
-		c.bytes += len(data)
-	}
-
-	return c.Backend.Write(ctx, key, data)
+func identityWrite(op faultbackend.Op) bool {
+	return op.Kind == faultbackend.Write && strings.HasSuffix(op.Key, "/identity")
 }
 
 // TestPartIdentityWriteAmplification is the write-side point of part-scoping: a flush persists the
@@ -182,7 +171,7 @@ func TestPartIdentityWriteAmplification(t *testing.T) {
 	const seed = 20_000
 
 	ctx := context.Background()
-	be := &sizeKeyWrite{Backend: backend.Memory(), suffix: "/identity"}
+	be := faultbackend.Wrap(backend.Memory())
 	e := engine.New(engine.Config{Backend: be, Prefix: "t/amplification"})
 
 	for i := range seed {
@@ -191,14 +180,14 @@ func TestPartIdentityWriteAmplification(t *testing.T) {
 
 	require.NoError(t, e.Flush(ctx))
 
-	first := be.bytes
+	first := be.Bytes(identityWrite)
 	require.Positive(t, first)
 
 	// One new series arrives; the tenant's cardinality is unchanged otherwise.
 	mustAppend(t, e, mkSeries("job", "api", "inst", "new"), 200, 1)
 	require.NoError(t, e.Flush(ctx))
 
-	second := be.bytes - first
+	second := be.Bytes(identityWrite) - first
 	t.Logf("identity bytes: first flush (%d series) %d B (%.1f B/series), second flush (1 series) %d B",
 		seed, first, float64(first)/seed, second)
 

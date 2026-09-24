@@ -2,7 +2,6 @@ package recordengine_test
 
 import (
 	"context"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/backendtest"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/recordengine"
 )
 
@@ -63,25 +63,6 @@ func TestAppendBatchInFlightBytesLimit(t *testing.T) {
 	assert.Equal(t, 1, r2.Accepted, "flush reopened the valve")
 }
 
-// blockWrite gates the part-object writes of the first flush on a channel, so a test can hold that
-// flush open at the write step while the detached buffers are still resident.
-type blockWrite struct {
-	backend.Backend
-
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (b *blockWrite) Write(ctx context.Context, key string, data []byte) error {
-	if backendtest.IsPartObject(key) {
-		b.once.Do(func() { close(b.entered) })
-		<-b.release
-	}
-
-	return b.Backend.Write(ctx, key, data)
-}
-
 // TestAppendBatchInFlightBytesCountsFlushingHead pins the in-flight measure to the memory that is
 // actually resident: a flush detaches the head's buffers, but they (and the flush columns built from
 // them) stay alive until the part is published, so HeadBytes and the MaxInFlightBytes valve must keep
@@ -90,7 +71,9 @@ func TestAppendBatchInFlightBytesCountsFlushingHead(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	be := &blockWrite{Backend: backend.Memory(), entered: make(chan struct{}), release: make(chan struct{})}
+	be := faultbackend.Wrap(backend.Memory())
+	gate := faultbackend.NewGate()
+	be.Add(gate.RuleAll(faultbackend.Write, func(op faultbackend.Op) bool { return backendtest.IsPartObject(op.Key) }))
 	e := newEngine(t, be)
 
 	// Each record is 16 bytes (ts + sev) + len(body); body "a" ⇒ 17. Cap at two records' worth.
@@ -105,7 +88,7 @@ func TestAppendBatchInFlightBytesCountsFlushingHead(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- e.Flush(ctx) }()
 
-	<-be.entered // the flush has detached the head and is writing the part
+	gate.Await(t) // the flush has detached the head and is writing the part
 
 	assert.Equal(t, before, e.HeadBytes(),
 		"records detached by an in-flight flush are still resident and must stay in the in-flight measure")
@@ -116,7 +99,7 @@ func TestAppendBatchInFlightBytesCountsFlushingHead(t *testing.T) {
 	assert.Equal(t, 0, rd.Accepted, "the flushing head still occupies the byte budget")
 	assert.Equal(t, 1, rd.RejectedBytes)
 
-	close(be.release)
+	gate.Release()
 	require.NoError(t, <-done)
 
 	// Publishing the part releases the detached buffers, reopening the valve.
@@ -133,7 +116,7 @@ func TestInFlightBytesRestoredByFailedFlush(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	be := &rejectWrites{Backend: backend.Memory()}
+	be := faultbackend.Wrap(backend.Memory())
 	e := newEngine(t, be)
 
 	r, err := e.AppendBatch(mkBatch("a", rrec{ts: 1, body: "a"}, rrec{ts: 2, body: "a"}), recordengine.AppendLimits{})
@@ -142,9 +125,9 @@ func TestInFlightBytesRestoredByFailedFlush(t *testing.T) {
 
 	before := e.HeadBytes()
 
-	be.armed.Store(true)
+	rejectWrites(be, "", errWriteRejected)
 	require.Error(t, e.Flush(ctx))
-	be.armed.Store(false)
+	be.Reset()
 
 	assert.Equal(t, before, e.HeadBytes(), "folded-back rows are counted once, not doubled")
 

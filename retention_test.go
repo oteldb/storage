@@ -12,6 +12,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/backendtest"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -194,18 +195,7 @@ func TestMaintainAppliesSizeRetentionToLogs(t *testing.T) {
 	assert.Contains(t, bodies, "body-1200", "the newest log records are retained")
 }
 
-// listCountingBackend counts the List calls the part-size enumeration makes.
-type listCountingBackend struct {
-	backend.Backend
-
-	lists atomic.Int64
-}
-
-func (b *listCountingBackend) List(ctx context.Context, prefix string) ([]string, error) {
-	b.lists.Add(1)
-
-	return b.Backend.List(ctx, prefix)
-}
+func isList(op faultbackend.Op) bool { return op.Kind == faultbackend.List }
 
 // TestSizeCutoffsSkipsUnchangedPartSet pins the memoization: the cutoff is a pure function of the
 // part set and the budget, so a cycle that follows one with no flush, merge, or delete in between
@@ -213,7 +203,7 @@ func (b *listCountingBackend) List(ctx context.Context, prefix string) ([]string
 func TestSizeCutoffsSkipsUnchangedPartSet(t *testing.T) {
 	t.Parallel()
 
-	be := &listCountingBackend{Backend: backend.Memory()}
+	be := faultbackend.Wrap(backend.Memory())
 	s, err := Open(context.Background(), Options{},
 		WithBackend(be),
 		WithFlushInterval(-1), // no background loop: this test drives maintain itself
@@ -233,23 +223,23 @@ func TestSizeCutoffsSkipsUnchangedPartSet(t *testing.T) {
 
 	tids := map[signal.TenantID]struct{}{"default": {}}
 
-	be.lists.Store(0)
+	lists := be.Count(isList)
 	s.sizeCutoffs(ctx, tids)
-	require.Positive(t, be.lists.Load(), "the first resolution enumerates the parts")
+	require.Positive(t, be.Count(isList)-lists, "the first resolution enumerates the parts")
 
-	be.lists.Store(0)
+	lists = be.Count(isList)
 	s.sizeCutoffs(ctx, tids)
 	s.sizeCutoffs(ctx, tids)
-	assert.Zero(t, be.lists.Load(), "an unchanged part set must not re-enumerate part sizes")
+	assert.Zero(t, be.Count(isList)-lists, "an unchanged part set must not re-enumerate part sizes")
 
 	// A new part changes the fingerprint, so the cutoff is resolved again.
 	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{now + 1}, []float64{2}))
 	require.NoError(t, err)
 	s.maintain(ctx)
 
-	be.lists.Store(0)
+	lists = be.Count(isList)
 	s.sizeCutoffs(ctx, tids)
-	assert.Positive(t, be.lists.Load(), "a changed part set must re-enumerate")
+	assert.Positive(t, be.Count(isList)-lists, "a changed part set must re-enumerate")
 }
 
 // TestSizeRetentionMemoDropsUnheldTenants covers the cache prune: a tenant that stops appearing in
@@ -576,7 +566,7 @@ func TestSizeRetentionPooledBoundsPerSignalBudgets(t *testing.T) {
 func TestSizeCutoffsSkipsUnbudgetedSignals(t *testing.T) {
 	t.Parallel()
 
-	be := &listCountingBackend{Backend: backend.Memory()}
+	be := faultbackend.Wrap(backend.Memory())
 	s, err := Open(context.Background(), Options{},
 		WithBackend(be),
 		WithFlushInterval(-1), // no background loop: this test drives maintain itself
@@ -596,16 +586,16 @@ func TestSizeCutoffsSkipsUnbudgetedSignals(t *testing.T) {
 
 	tids := map[signal.TenantID]struct{}{"default": {}}
 
-	be.lists.Store(0)
+	lists := be.Count(isList)
 	s.sizeCutoffs(ctx, tids)
-	assert.Zero(t, be.lists.Load(), "a metric-only store under a log-only budget enumerates nothing")
+	assert.Zero(t, be.Count(isList)-lists, "a metric-only store under a log-only budget enumerates nothing")
 
 	writeMixedLogs(t, s, mixedLogBase)
 	s.maintain(ctx)
 
-	be.lists.Store(0)
+	lists = be.Count(isList)
 	s.sizeCutoffs(ctx, tids)
-	assert.Positive(t, be.lists.Load(), "the budgeted signal is measured")
+	assert.Positive(t, be.Count(isList)-lists, "the budgeted signal is measured")
 }
 
 func TestBudgetsOf(t *testing.T) {

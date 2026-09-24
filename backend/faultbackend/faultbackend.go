@@ -54,6 +54,9 @@ func (k Kind) String() string {
 type Op struct {
 	Kind Kind
 	Key  string
+	// Bytes is the length of the data a Write, PutIfAbsent or CompareAndSwap stores; zero for the
+	// other kinds.
+	Bytes int
 }
 
 // Rule decides what happens to the operations it matches. A rule with no Match matches every
@@ -71,6 +74,13 @@ type Rule struct {
 	// It applies to [Read] alone; the wrapper implements no [backend.Viewer], so every read of an
 	// object's bytes — including one made through [backend.ReadView] — passes through it.
 	Replace func(Op, []byte) []byte
+	// Lose, when true, makes a [PutIfAbsent] or [CompareAndSwap] report that it lost the race
+	// without error or storing anything: the endlessly contended key an error cannot model.
+	Lose bool
+	// After, when non-nil, runs once the operation succeeded — for a conditional write, only once it
+	// landed — with the bytes it stored or, for a read, returned. It is where an invariant checker
+	// sees every committed value.
+	After func(Op, []byte)
 	// Times limits how many operations the rule applies to. Zero ⇒ unlimited.
 	Times int
 
@@ -131,39 +141,78 @@ func (b *Backend) Count(match func(Op) bool) int {
 	return n
 }
 
+// Bytes returns the summed [Op.Bytes] of the recorded operations that satisfy match.
+func (b *Backend) Bytes(match func(Op) bool) int {
+	var n int
+	for _, op := range b.Ops() {
+		if match(op) {
+			n += op.Bytes
+		}
+	}
+
+	return n
+}
+
 // Read implements [backend.Backend].
 func (b *Backend) Read(ctx context.Context, key string) ([]byte, error) {
 	op := Op{Kind: Read, Key: key}
 
 	r := b.intercept(op)
-	if r != nil && r.Err != nil {
+	if r.fails() {
 		return nil, r.Err
 	}
 
 	data, err := b.Backend.Read(ctx, key)
-	if err != nil || r == nil || r.Replace == nil {
+	if err != nil {
 		return data, err
 	}
 
-	return r.Replace(op, data), nil
+	if r != nil && r.Replace != nil {
+		data = r.Replace(op, data)
+	}
+
+	r.after(op, data)
+
+	return data, nil
 }
 
 // Write implements [backend.Backend].
 func (b *Backend) Write(ctx context.Context, key string, data []byte) error {
-	if r := b.intercept(Op{Kind: Write, Key: key}); r != nil && r.Err != nil {
+	op := Op{Kind: Write, Key: key, Bytes: len(data)}
+
+	r := b.intercept(op)
+	if r.fails() {
 		return r.Err
 	}
 
-	return b.Backend.Write(ctx, key, data)
+	if err := b.Backend.Write(ctx, key, data); err != nil {
+		return err
+	}
+
+	r.after(op, data)
+
+	return nil
 }
 
 // PutIfAbsent implements [backend.Backend].
 func (b *Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
-	if r := b.intercept(Op{Kind: PutIfAbsent, Key: key}); r != nil && r.Err != nil {
+	op := Op{Kind: PutIfAbsent, Key: key, Bytes: len(data)}
+
+	r := b.intercept(op)
+	if r.fails() {
 		return false, r.Err
 	}
 
-	return b.Backend.PutIfAbsent(ctx, key, data)
+	if r.loses() {
+		return false, nil
+	}
+
+	ok, err := b.Backend.PutIfAbsent(ctx, key, data)
+	if err == nil && ok {
+		r.after(op, data)
+	}
+
+	return ok, err
 }
 
 // CompareAndSwap implements [backend.Backend]. Gating it is how a test states the interleaving
@@ -172,38 +221,89 @@ func (b *Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (boo
 func (b *Backend) CompareAndSwap(
 	ctx context.Context, key string, expected backend.Version, data []byte,
 ) (backend.Version, bool, error) {
-	if r := b.intercept(Op{Kind: CompareAndSwap, Key: key}); r != nil && r.Err != nil {
+	op := Op{Kind: CompareAndSwap, Key: key, Bytes: len(data)}
+
+	r := b.intercept(op)
+	if r.fails() {
 		return backend.VersionAbsent, false, r.Err
 	}
 
-	return b.Backend.CompareAndSwap(ctx, key, expected, data)
+	if r.loses() {
+		return backend.VersionAbsent, false, nil
+	}
+
+	version, ok, err := b.Backend.CompareAndSwap(ctx, key, expected, data)
+	if err == nil && ok {
+		r.after(op, data)
+	}
+
+	return version, ok, err
 }
 
 // ReadVersioned implements [backend.Backend].
 func (b *Backend) ReadVersioned(ctx context.Context, key string) ([]byte, backend.Version, error) {
-	if r := b.intercept(Op{Kind: ReadVersioned, Key: key}); r != nil && r.Err != nil {
+	op := Op{Kind: ReadVersioned, Key: key}
+
+	r := b.intercept(op)
+	if r.fails() {
 		return nil, backend.VersionAbsent, r.Err
 	}
 
-	return b.Backend.ReadVersioned(ctx, key)
+	data, version, err := b.Backend.ReadVersioned(ctx, key)
+	if err != nil {
+		return data, version, err
+	}
+
+	r.after(op, data)
+
+	return data, version, nil
 }
 
 // List implements [backend.Backend].
 func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
-	if r := b.intercept(Op{Kind: List, Key: prefix}); r != nil && r.Err != nil {
+	op := Op{Kind: List, Key: prefix}
+
+	r := b.intercept(op)
+	if r.fails() {
 		return nil, r.Err
 	}
 
-	return b.Backend.List(ctx, prefix)
+	keys, err := b.Backend.List(ctx, prefix)
+	if err != nil {
+		return keys, err
+	}
+
+	r.after(op, nil)
+
+	return keys, nil
 }
 
 // Delete implements [backend.Backend].
 func (b *Backend) Delete(ctx context.Context, key string) error {
-	if r := b.intercept(Op{Kind: Delete, Key: key}); r != nil && r.Err != nil {
+	op := Op{Kind: Delete, Key: key}
+
+	r := b.intercept(op)
+	if r.fails() {
 		return r.Err
 	}
 
-	return b.Backend.Delete(ctx, key)
+	if err := b.Backend.Delete(ctx, key); err != nil {
+		return err
+	}
+
+	r.after(op, nil)
+
+	return nil
+}
+
+func (r *Rule) fails() bool { return r != nil && r.Err != nil }
+
+func (r *Rule) loses() bool { return r != nil && r.Lose }
+
+func (r *Rule) after(op Op, data []byte) {
+	if r != nil && r.After != nil {
+		r.After(op, data)
+	}
 }
 
 // intercept records op and returns the rule governing it, if any. The rule's Before hook runs

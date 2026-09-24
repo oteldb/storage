@@ -73,25 +73,16 @@ func TestFlushFailsWhenTheIndexCommitCannotLand(t *testing.T) {
 	ctx := context.Background()
 	const prefix = "default/metrics"
 
-	be := &alwaysLosesIndexCommit{Backend: backend.Memory()}
+	// Every conditional index write loses, as on an endlessly contended prefix: the retry loop must
+	// give up and say so rather than spin.
+	be := faultbackend.Wrap(backend.Memory())
+	be.Add(faultbackend.Rule{
+		Kind:  faultbackend.CompareAndSwap,
+		Match: func(op faultbackend.Op) bool { return strings.HasSuffix(op.Key, "/"+bucketindex.Object) },
+		Lose:  true,
+	})
 	e := engine.New(engine.Config{Backend: be, Prefix: prefix})
 	mustAppend(t, e, mkSeries("job", "api"), 100, 1.0)
 
 	require.ErrorIs(t, e.Flush(ctx), bucketindex.ErrConflict)
-}
-
-// alwaysLosesIndexCommit refuses every conditional index write, as an endlessly contended prefix
-// would. The retry loop must give up and say so rather than spin.
-type alwaysLosesIndexCommit struct {
-	backend.Backend
-}
-
-func (b *alwaysLosesIndexCommit) CompareAndSwap(
-	ctx context.Context, key string, expected backend.Version, data []byte,
-) (backend.Version, bool, error) {
-	if strings.HasSuffix(key, "/"+bucketindex.Object) {
-		return backend.VersionAbsent, false, nil
-	}
-
-	return b.Backend.CompareAndSwap(ctx, key, expected, data)
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/backend/faultbackend"
 )
 
 func TestAddKeepsSortedAndReplaces(t *testing.T) {
@@ -188,20 +189,14 @@ func TestLoadCorruptErrors(t *testing.T) {
 	require.ErrorIs(t, err, bucketindex.ErrCorrupt)
 }
 
-// failWrite is a backend whose conditional write always fails, to exercise Save's error path.
-type failWrite struct{ backend.Backend }
-
-func (failWrite) CompareAndSwap(
-	context.Context, string, backend.Version, []byte,
-) (backend.Version, bool, error) {
-	return backend.VersionAbsent, false, assert.AnError
-}
-
 func TestSaveError(t *testing.T) {
 	t.Parallel()
 
+	be := faultbackend.Wrap(backend.Memory())
+	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Err: assert.AnError})
+
 	ix := &bucketindex.Index{Entries: []bucketindex.Entry{{Prefix: "p"}}}
-	_, err := ix.Save(context.Background(), failWrite{backend.Memory()}, "k", backend.VersionAbsent)
+	_, err := ix.Save(context.Background(), be, "k", backend.VersionAbsent)
 	require.Error(t, err)
 }
 

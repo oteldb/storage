@@ -17,6 +17,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/cluster/ec"
 	"github.com/oteldb/storage/cluster/partsync"
 )
@@ -612,7 +613,8 @@ func TestListHandlerLogsFailure(t *testing.T) {
 	core, logs := observer.New(zap.ErrorLevel)
 	ctx := zctx.Base(context.Background(), zap.New(core))
 
-	be := &listErrBackend{Backend: backend.Memory()}
+	be := faultbackend.Wrap(backend.Memory())
+	be.Add(faultbackend.Rule{Kind: faultbackend.List, Err: errors.New("disk on fire")})
 
 	req := httptest.NewRequestWithContext(ctx, http.MethodGet, partsync.ListPath+"?prefix=t/logs", http.NoBody)
 	rec := httptest.NewRecorder()
@@ -621,12 +623,4 @@ func TestListHandlerLogsFailure(t *testing.T) {
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
 	require.Equal(t, 1, logs.Len())
 	require.Contains(t, logs.All()[0].ContextMap()["error"], "disk on fire")
-}
-
-type listErrBackend struct {
-	backend.Backend
-}
-
-func (*listErrBackend) List(context.Context, string) ([]string, error) {
-	return nil, errors.New("disk on fire")
 }

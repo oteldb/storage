@@ -39,15 +39,15 @@ func TestFlushFailureKeepsSamples(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectWrites{Backend: backend.Memory()}
+	be := faultbackend.Wrap(backend.Memory())
 	e := engine.New(engine.Config{Backend: be, Prefix: "t/metrics"})
 	api := mkSeries("job", "api")
 
 	mustAppend(t, e, api, 100, 1.0)
 
-	be.armed.Store(true)
+	rejectWrites(be, "", errWriteRejected)
 	require.Error(t, e.Flush(ctx), "flush must fail while the backend rejects writes")
-	be.armed.Store(false)
+	be.Reset()
 
 	assert.Equal(t, []int64{100}, apiSamples(t, e), "readable after the failed flush")
 	require.Positive(t, e.HeadBytes(), "the folded-back samples are accounted as head bytes again")
@@ -67,7 +67,7 @@ func TestFlushFailureKeepsSamplesAcrossRestart(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectWrites{Backend: backend.Memory()}
+	be := faultbackend.Wrap(backend.Memory())
 	dir := t.TempDir()
 	cfg := engine.Config{Backend: be, Prefix: "t/metrics"}
 	api := mkSeries("job", "api")
@@ -81,9 +81,9 @@ func TestFlushFailureKeepsSamplesAcrossRestart(t *testing.T) {
 	mustAppend(t, e, api, 100, 1.0)
 	require.NoError(t, w.Sync())
 
-	be.armed.Store(true)
+	rejectWrites(be, "", errWriteRejected)
 	require.Error(t, e.Flush(ctx))
-	be.armed.Store(false)
+	be.Reset()
 
 	mustAppend(t, e, api, 200, 2.0)
 	require.NoError(t, w.Sync())

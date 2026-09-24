@@ -3,7 +3,6 @@ package engine_test
 import (
 	"context"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/go-faster/errors"
@@ -12,37 +11,20 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 )
 
-// rejectWrites wraps a backend and fails Write while armed. A non-empty only restricts the failure
-// to keys with that suffix, which models a crash at one specific point of the publish sequence.
-type rejectWrites struct {
-	backend.Backend
+var errWriteRejected = errors.New("injected write failure")
 
-	armed atomic.Bool
-	only  string
-}
-
-func (r *rejectWrites) Write(ctx context.Context, key string, data []byte) error {
-	if r.armed.Load() && (r.only == "" || strings.HasSuffix(key, r.only)) {
-		return errors.New("injected write failure")
-	}
-
-	return r.Backend.Write(ctx, key, data)
-}
-
-// CompareAndSwap is the path the bucket-index commit takes, so a suffix naming the index must
-// reject it too.
-func (r *rejectWrites) CompareAndSwap(
-	ctx context.Context, key string, expected backend.Version, data []byte,
-) (backend.Version, bool, error) {
-	if r.armed.Load() && (r.only == "" || strings.HasSuffix(key, r.only)) {
-		return backend.VersionAbsent, false, errors.New("injected write failure")
-	}
-
-	return r.Backend.CompareAndSwap(ctx, key, expected, data)
+// rejectWrites fails every Write and CompareAndSwap of a key ending in suffix with err; an empty
+// suffix matches every key. CompareAndSwap is the path the bucket-index commit takes, so a suffix
+// naming the index must reject it too.
+func rejectWrites(be *faultbackend.Backend, suffix string, err error) {
+	match := func(op faultbackend.Op) bool { return strings.HasSuffix(op.Key, suffix) }
+	be.Add(faultbackend.Rule{Kind: faultbackend.Write, Match: match, Err: err})
+	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Match: match, Err: err})
 }
 
 // TestPublishCommitsBucketIndexLast verifies the publish ordering: the bucket index is what makes a
@@ -57,15 +39,15 @@ func TestPublishCommitsBucketIndexLast(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectWrites{Backend: backend.Memory(), only: "/identity"}
+	be := faultbackend.Wrap(backend.Memory())
 	cfg := engine.Config{Backend: be, Prefix: "t/metrics"}
 
 	w := engine.New(cfg)
 	mustAppend(t, w, mkSeries("job", "api"), 100, 1.0)
 
-	be.armed.Store(true)
+	rejectWrites(be, "/identity", errWriteRejected)
 	require.Error(t, w.Flush(ctx), "flush must fail while the part's identities cannot be written")
-	be.armed.Store(false)
+	be.Reset()
 
 	// A fresh reader reconstructs purely from the object store.
 	r := engine.New(cfg)
@@ -85,16 +67,16 @@ func TestUncommittedPartIdentityIsNotLoaded(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectWrites{Backend: backend.Memory(), only: "/" + bucketindex.Object}
+	be := faultbackend.Wrap(backend.Memory())
 	cfg := engine.Config{Backend: be, Prefix: "t/metrics"}
 
 	w := engine.New(cfg)
 	mustAppend(t, w, mkSeries("job", "api"), 100, 1.0)
 
 	// The part's objects land, the bucket index does not: an orphan part, swept at the next open.
-	be.armed.Store(true)
+	rejectWrites(be, "/"+bucketindex.Object, errWriteRejected)
 	require.Error(t, w.Flush(ctx))
-	be.armed.Store(false)
+	be.Reset()
 
 	r := engine.New(cfg)
 	require.NoError(t, r.LoadParts(ctx))

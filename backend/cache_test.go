@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/faultbackend"
 )
 
 // countingBackend counts inner Read calls so a test can prove cache hits never reach the backend.
@@ -218,24 +219,6 @@ func TestCacheConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-// blockingBackend holds every inner read until the gate opens and announces each entry on entered,
-// so a test can pin a read in flight and know the cache has registered it.
-type blockingBackend struct {
-	backend.Backend
-
-	reads   atomic.Int64
-	entered chan struct{}
-	gate    chan struct{}
-}
-
-func (b *blockingBackend) Read(ctx context.Context, key string) ([]byte, error) {
-	b.reads.Add(1)
-	b.entered <- struct{}{}
-	<-b.gate
-
-	return b.Backend.Read(ctx, key)
-}
-
 // dedupBurst runs one burst of readers concurrently missing the same key and returns how many of them
 // reached the inner backend.
 func dedupBurst(t *testing.T, readers int) int64 {
@@ -243,12 +226,13 @@ func dedupBurst(t *testing.T, readers int) int64 {
 
 	ctx := context.Background()
 
-	inner := &blockingBackend{
-		Backend: backend.Memory(),
-		entered: make(chan struct{}, readers),
-		gate:    make(chan struct{}),
-	}
+	// Every inner read is held until the gate opens, so a test can pin a read in flight and know the
+	// cache has registered it.
+	inner := faultbackend.Wrap(backend.Memory())
 	require.NoError(t, inner.Write(ctx, "k", []byte("value")))
+
+	gate := faultbackend.NewGate()
+	inner.Add(gate.RuleAll(faultbackend.Read, nil))
 
 	c := backend.Cached(inner, 1<<20)
 
@@ -286,7 +270,7 @@ func dedupBurst(t *testing.T, readers int) int64 {
 	wg.Add(1)
 
 	go read()
-	<-inner.entered
+	gate.Await(t)
 
 	var arrived sync.WaitGroup
 
@@ -303,7 +287,7 @@ func dedupBurst(t *testing.T, readers int) int64 {
 	arrived.Wait()
 	runtime.Gosched()
 
-	close(inner.gate)
+	gate.Release()
 	wg.Wait()
 	close(results)
 
@@ -312,7 +296,7 @@ func dedupBurst(t *testing.T, readers int) int64 {
 		require.Equal(t, []byte("value"), r.value)
 	}
 
-	return inner.reads.Load()
+	return int64(inner.Count(func(op faultbackend.Op) bool { return op.Kind == faultbackend.Read }))
 }
 
 // TestCacheDedupsConcurrentMisses is the point of a loading cache: on an object store a burst of

@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/go-faster/errors"
@@ -12,50 +11,26 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/backend/faultbackend"
 )
 
 var errBackendDown = errors.New("injected: backend unavailable")
 
-// flakyBackend fails every read under one key prefix with an error that is not
+// failUnder fails every Read and ReadVersioned under prefix with an error that is not
 // [backend.ErrNotExist]: a backend that could not answer, as opposed to one that said "not there".
-// Embedding hides the inner backend's optional interfaces, so every sized, viewed or ranged read
-// falls back to Read and is failed here too.
-type flakyBackend struct {
-	backend.Backend
+// It replaces any earlier prefix; an empty one heals the backend. The wrapper hides the inner
+// backend's optional interfaces, so every sized, viewed or ranged read falls back to Read and is
+// failed here too.
+func failUnder(be *faultbackend.Backend, prefix string) {
+	be.Reset()
 
-	mu   sync.Mutex
-	down string
-}
-
-func (b *flakyBackend) Read(ctx context.Context, key string) ([]byte, error) {
-	b.mu.Lock()
-	down := b.down
-	b.mu.Unlock()
-
-	if down != "" && strings.HasPrefix(key, down) {
-		return nil, errBackendDown
+	if prefix == "" {
+		return
 	}
 
-	return b.Backend.Read(ctx, key)
-}
-
-func (b *flakyBackend) ReadVersioned(ctx context.Context, key string) ([]byte, backend.Version, error) {
-	b.mu.Lock()
-	down := b.down
-	b.mu.Unlock()
-
-	if down != "" && strings.HasPrefix(key, down) {
-		return nil, backend.VersionAbsent, errBackendDown
-	}
-
-	return b.Backend.ReadVersioned(ctx, key)
-}
-
-func (b *flakyBackend) failUnder(prefix string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.down = prefix
+	match := func(op faultbackend.Op) bool { return strings.HasPrefix(op.Key, prefix) }
+	be.Add(faultbackend.Rule{Kind: faultbackend.Read, Match: match, Err: errBackendDown})
+	be.Add(faultbackend.Rule{Kind: faultbackend.ReadVersioned, Match: match, Err: errBackendDown})
 }
 
 func TestSoleOwnerRepairerEvidence(t *testing.T) {
@@ -103,7 +78,7 @@ func TestSoleOwnerRepairerEvidence(t *testing.T) {
 			t.Parallel()
 			ctx := context.Background()
 
-			be := &flakyBackend{Backend: backend.Memory()}
+			be := faultbackend.Wrap(backend.Memory())
 			_, err := tc.index.Save(ctx, be, prefix+"/"+bucketindex.Object, backend.VersionAbsent)
 			require.NoError(t, err)
 
@@ -111,7 +86,7 @@ func TestSoleOwnerRepairerEvidence(t *testing.T) {
 				require.NoError(t, be.Write(ctx, lost+"/manifest", []byte("unreadable")))
 			}
 
-			be.failUnder(tc.down)
+			failUnder(be, tc.down)
 
 			got := soleOwnerRepairer{backend: be, prefix: prefix}.FetchWants(ctx, []bucketindex.Want{want})
 			require.Len(t, got, 1)

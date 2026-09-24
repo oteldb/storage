@@ -12,6 +12,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/recordengine"
 )
 
@@ -392,7 +393,7 @@ func TestRepairCommitFailureKeepsWant(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectIndexWrites{Backend: backend.Memory()}
+	be := faultbackend.Wrap(backend.Memory())
 	peer := backend.Memory()
 
 	f := &fakeFetcher{}
@@ -417,9 +418,9 @@ func TestRepairCommitFailureKeepsWant(t *testing.T) {
 		return bucketindex.Entry{Prefix: w.Prefix, MinTime: 100, MaxTime: 100, Blocks: w.Blocks}, bucketindex.WantSatisfied, nil
 	}
 
-	be.armed.Store(true)
+	rejectWrites(be, "/"+bucketindex.Object, errWriteRejected)
 	require.Error(t, e.Merge(ctx, 0))
-	be.armed.Store(false)
+	be.Reset()
 
 	assert.Equal(t, []string{lost}, e.WantPrefixes(),
 		"an index write that never landed cannot discharge an obligation")

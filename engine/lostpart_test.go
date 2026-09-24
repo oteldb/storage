@@ -5,7 +5,6 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/go-faster/errors"
@@ -15,6 +14,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -62,48 +62,9 @@ func erasePart(ctx context.Context, t *testing.T, be backend.Backend, id string)
 	}
 }
 
-// failReads wraps a backend and answers Read for keys with a given suffix with err — an injected
-// *transient* failure when err is anything but [backend.ErrNotExist].
-type failReads struct {
-	backend.Backend
-
-	armed atomic.Bool
-	only  string
-	err   error
-}
-
-func (f *failReads) Read(ctx context.Context, key string) ([]byte, error) {
-	if f.armed.Load() && strings.HasSuffix(key, f.only) {
-		return nil, f.err
-	}
-
-	return f.Backend.Read(ctx, key)
-}
-
-// countCAS wraps a backend and counts the compare-and-swaps against one key, optionally refusing
-// them all so a caller sees a permanently lost race.
-type countCAS struct {
-	backend.Backend
-
-	key    string
-	n      atomic.Int64
-	refuse atomic.Bool
-}
-
-func (c *countCAS) CompareAndSwap(
-	ctx context.Context, key string, expected backend.Version, data []byte,
-) (backend.Version, bool, error) {
-	if key != c.key {
-		return c.Backend.CompareAndSwap(ctx, key, expected, data)
-	}
-
-	c.n.Add(1)
-
-	if c.refuse.Load() {
-		return backend.VersionAbsent, false, nil
-	}
-
-	return c.Backend.CompareAndSwap(ctx, key, expected, data)
+// indexCommit matches the compare-and-swaps against the bucket index.
+func indexCommit(op faultbackend.Op) bool {
+	return op.Kind == faultbackend.CompareAndSwap && op.Key == lostIndexKey()
 }
 
 func newLostEngine(be backend.Backend) *engine.Engine {
@@ -218,15 +179,15 @@ func TestTransientOpenFailureRecordsNoWant(t *testing.T) {
 			t.Parallel()
 
 			ctx := context.Background()
-			be := &failReads{Backend: backend.Memory(), only: "/manifest", err: tc.err}
+			be := faultbackend.Wrap(backend.Memory())
 			e := newLostEngine(be)
 			ids := twoParts(t, e, be, mkSeries("job", "api"))
 
 			before := loadIndex(t, be, lostPrefix)
 
-			be.armed.Store(true)
+			rejectReads(be, "/manifest", tc.err)
 			err := newLostEngine(be).LoadParts(ctx)
-			be.armed.Store(false)
+			be.Reset()
 
 			after := loadIndex(t, be, lostPrefix)
 			assert.Empty(t, after.Wanted, "a transient failure is not evidence of loss")
@@ -267,16 +228,16 @@ func TestWantIsRecordedInOneCommit(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &countCAS{Backend: backend.Memory(), key: lostIndexKey()}
+	be := faultbackend.Wrap(backend.Memory())
 	e := newLostEngine(be)
 	ids := twoParts(t, e, be, mkSeries("job", "api"))
 
 	erasePart(ctx, t, be, ids[0])
 
-	be.n.Store(0)
+	before := be.Count(indexCommit)
 	require.NoError(t, newLostEngine(be).LoadParts(ctx))
 
-	require.Equal(t, int64(1), be.n.Load(), "the drop and the want are one commit, not two")
+	require.Equal(t, 1, be.Count(indexCommit)-before, "the drop and the want are one commit, not two")
 
 	ix := loadIndex(t, be, lostPrefix)
 	require.NotContains(t, prefixes(ix.Entries), lostPrefix+"/"+ids[0])
@@ -290,17 +251,17 @@ func TestFailedWantCommitAppliesNeither(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &countCAS{Backend: backend.Memory(), key: lostIndexKey()}
+	be := faultbackend.Wrap(backend.Memory())
 	e := newLostEngine(be)
 	ids := twoParts(t, e, be, mkSeries("job", "api"))
 
 	before := loadIndex(t, be, lostPrefix)
 	erasePart(ctx, t, be, ids[0])
 
-	be.refuse.Store(true)
+	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Match: indexCommit, Lose: true})
 	require.Error(t, newLostEngine(be).LoadParts(ctx),
 		"a commit that never lands must not be reported as success")
-	be.refuse.Store(false)
+	be.Reset()
 
 	after := loadIndex(t, be, lostPrefix)
 	require.Equal(t, prefixes(before.Entries), prefixes(after.Entries), "the entry is still there")
@@ -341,36 +302,35 @@ func TestWantSurvivesLaterCommits(t *testing.T) {
 	require.Equal(t, []string{lostPrefix + "/" + ids[0]}, wantPrefixes(loadIndex(t, be, lostPrefix).Wanted))
 }
 
-// invariantCAS asserts, on every index commit that lands, that no part vanished from Entries
+// invariantBackend asserts, on every index commit that lands, that no part vanished from Entries
 // without landing in exactly one of Removed and Wanted. It sits on the real commit path, so every
 // flush, merge, retention drop and lossy load in a test is checked.
-type invariantCAS struct {
-	backend.Backend
+func invariantBackend(ctx context.Context, t *testing.T, key string) *faultbackend.Backend {
+	t.Helper()
 
-	t   *testing.T
-	key string
-}
+	inner := backend.Memory()
+	be := faultbackend.Wrap(inner)
 
-func (c *invariantCAS) CompareAndSwap(
-	ctx context.Context, key string, expected backend.Version, data []byte,
-) (backend.Version, bool, error) {
-	if key != c.key {
-		return c.Backend.CompareAndSwap(ctx, key, expected, data)
-	}
+	// Shared by one commit's Before and After; the tests commit from one goroutine at a time.
+	var prev *bucketindex.Index
 
-	prev, err := bucketindex.Load(ctx, c.Backend, key)
-	require.NoError(c.t, err)
+	be.Add(faultbackend.Rule{
+		Kind:  faultbackend.CompareAndSwap,
+		Match: func(op faultbackend.Op) bool { return op.Key == key },
+		Before: func(faultbackend.Op) {
+			var err error
 
-	version, ok, err := c.Backend.CompareAndSwap(ctx, key, expected, data)
-	if err != nil || !ok {
-		return version, ok, err
-	}
+			prev, err = bucketindex.Load(ctx, inner, key)
+			require.NoError(t, err)
+		},
+		After: func(_ faultbackend.Op, data []byte) {
+			next, err := bucketindex.Decode(data)
+			require.NoError(t, err)
+			assertLeavesIntoOneList(t, prev, next)
+		},
+	})
 
-	next, decErr := bucketindex.Decode(data)
-	require.NoError(c.t, decErr)
-	assertLeavesIntoOneList(c.t, prev, next)
-
-	return version, ok, err
+	return be
 }
 
 func assertLeavesIntoOneList(t *testing.T, prev, next *bucketindex.Index) {
@@ -408,7 +368,7 @@ func TestEntriesLeaveOnlyIntoRemovedOrWanted(t *testing.T) {
 			t.Parallel()
 
 			rng := rand.New(rand.NewPCG(seed, 0x5eed))
-			be := &invariantCAS{Backend: backend.Memory(), t: t, key: lostIndexKey()}
+			be := invariantBackend(ctx, t, lostIndexKey())
 			s := mkSeries("job", "api")
 			e := newLostEngine(be)
 			ts := int64(100)

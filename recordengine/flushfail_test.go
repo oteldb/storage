@@ -3,45 +3,26 @@ package recordengine_test
 import (
 	"context"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/wal"
 )
 
-// rejectWrites wraps a backend and fails Write while armed — the routine case a flush must survive:
-// a transient object-store error. A non-empty only restricts the failure to keys with that suffix,
-// which models a crash at one specific point of the publish sequence.
-type rejectWrites struct {
-	backend.Backend
+var errWriteRejected = errors.New("injected write failure")
 
-	armed atomic.Bool
-	only  string
-}
-
-func (r *rejectWrites) Write(ctx context.Context, key string, data []byte) error {
-	if r.armed.Load() && (r.only == "" || strings.HasSuffix(key, r.only)) {
-		return errors.New("injected write failure")
-	}
-
-	return r.Backend.Write(ctx, key, data)
-}
-
-// CompareAndSwap is the path the bucket-index commit takes, so a suffix naming the index must
-// reject it too.
-func (r *rejectWrites) CompareAndSwap(
-	ctx context.Context, key string, expected backend.Version, data []byte,
-) (backend.Version, bool, error) {
-	if r.armed.Load() && (r.only == "" || strings.HasSuffix(key, r.only)) {
-		return backend.VersionAbsent, false, errors.New("injected write failure")
-	}
-
-	return r.Backend.CompareAndSwap(ctx, key, expected, data)
+// rejectWrites fails every Write and CompareAndSwap of a key ending in suffix with err; an empty
+// suffix matches every key. CompareAndSwap is the path the bucket-index commit takes, so a suffix
+// naming the index must reject it too.
+func rejectWrites(be *faultbackend.Backend, suffix string, err error) {
+	match := func(op faultbackend.Op) bool { return strings.HasSuffix(op.Key, suffix) }
+	be.Add(faultbackend.Rule{Kind: faultbackend.Write, Match: match, Err: err})
+	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Match: match, Err: err})
 }
 
 // streamBodies returns every body the engine holds for the "api" stream, over all time.
@@ -65,14 +46,14 @@ func TestFlushFailureKeepsRows(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectWrites{Backend: backend.Memory()}
+	be := faultbackend.Wrap(backend.Memory())
 	e := newEngine(t, be)
 
 	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "buffered-1"}, rrec{ts: 200, body: "buffered-2"}))
 
-	be.armed.Store(true)
+	rejectWrites(be, "", errWriteRejected)
 	require.Error(t, e.Flush(ctx), "flush must fail while the backend rejects writes")
-	be.armed.Store(false)
+	be.Reset()
 
 	require.Equal(t, []string{"buffered-1", "buffered-2"}, streamBodies(t, e), "readable after the failed flush")
 	require.Positive(t, e.HeadBytes(), "the folded-back rows are accounted as head bytes again")
@@ -92,7 +73,7 @@ func TestFlushFailureKeepsRowsAcrossRestart(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectWrites{Backend: backend.Memory()}
+	be := faultbackend.Wrap(backend.Memory())
 	walDir := t.TempDir()
 
 	w, err := wal.Create(walDir, 0)
@@ -104,9 +85,9 @@ func TestFlushFailureKeepsRowsAcrossRestart(t *testing.T) {
 	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "buffered-1"}, rrec{ts: 200, body: "buffered-2"}))
 	require.NoError(t, w.Sync())
 
-	be.armed.Store(true)
+	rejectWrites(be, "", errWriteRejected)
 	require.Error(t, e.Flush(ctx))
-	be.armed.Store(false)
+	be.Reset()
 
 	ingest(t, e, mkBatch("api", rrec{ts: 300, body: "later"}))
 	require.NoError(t, w.Sync())
@@ -131,7 +112,7 @@ func TestFlushFailureRestoresSideStore(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectWrites{Backend: backend.Memory()}
+	be := faultbackend.Wrap(backend.Memory())
 	fs := newFakeSide()
 	e := sideEngine(be, fs)
 
@@ -139,9 +120,9 @@ func TestFlushFailureRestoresSideStore(t *testing.T) {
 	b.Side = encodeSide(map[uint64][]byte{1: []byte("a"), 2: []byte("b")})
 	ingest(t, e, b)
 
-	be.armed.Store(true)
+	rejectWrites(be, "", errWriteRejected)
 	require.Error(t, e.Flush(ctx))
-	be.armed.Store(false)
+	be.Reset()
 
 	require.Equal(t, 1, fs.restores)
 	require.Len(t, fs.acc, 2, "the snapshot is back in the live accumulator")
