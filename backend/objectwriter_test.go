@@ -36,41 +36,14 @@ func TestCachedConformance(t *testing.T) {
 	})
 }
 
-// TestStreamsWritesIsNotClaimedByWrappers is the trap the [backend.SpaceReporter] forwarding already
-// fell into, in reverse: a wrapper that reported a streaming write over an inner backend that
-// buffers would have the merge engine size parts against memory it does not have.
-//
-// The rule is enforced by shape rather than by this test: [backend.ObjectCreator.StreamsWrites] is
-// a value a wrapper must forward, so a wrapper that omits it does not compile, where one that
-// forgot a conditional variant type used to compile and lie. Every wrapper in the tree still
-// belongs in the table below, answering for the backend beneath it in both directions.
-//
-// backendtest.Deferred is the deliberate exception to the *other* half: it implements CreateObject
-// unconditionally to force a buffering backend down the streaming path, while StreamsWrites still
-// answers honestly for that backend.
-func TestStreamsWritesIsNotClaimedByWrappers(t *testing.T) {
+// TestMemoryDoesNotStream: memory has no disk to keep finished bytes on, so claiming a streaming
+// write would size merge output against one. Wrappers are covered by the root package's
+// TestWrappersForwardExactlyTheirInnerCapabilities.
+func TestMemoryDoesNotStream(t *testing.T) {
 	t.Parallel()
 
 	assert.False(t, backend.StreamsWrites(backend.Memory()))
 	assert.True(t, backend.StreamsWrites(backendtest.NewStreamingMemory()))
-
-	wrappers := map[string]func(backend.Backend) backend.Backend{
-		"Cached":         func(b backend.Backend) backend.Backend { return backend.Cached(b, 1<<20) },
-		"Cached(0)":      func(b backend.Backend) backend.Backend { return backend.Cached(b, 0) },
-		"Cached(Cached)": func(b backend.Backend) backend.Backend { return backend.Cached(backend.Cached(b, 1<<20), 1<<20) },
-		"Deferred":       func(b backend.Backend) backend.Backend { return backendtest.WithDeferred(b) },
-	}
-
-	for name, wrap := range wrappers {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			assert.False(t, backend.StreamsWrites(wrap(backend.Memory())),
-				"wrapping a whole-object backend does not make it stream")
-			assert.True(t, backend.StreamsWrites(wrap(backendtest.NewStreamingMemory())),
-				"wrapping a streaming backend must not hide the capability")
-		})
-	}
 }
 
 // TestCachedStreamedWriteInvalidates covers the coherence rule: a streamed object replaces the key,

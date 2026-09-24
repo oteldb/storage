@@ -608,6 +608,13 @@ rack/server/disk hierarchy; a scheme is rack-safe with at least `ceil(Shards/Par
   part-object read hits it — a surviving full copy is a zero-copy view, a converted object is
   reconstructed from valid Data shards (own slot locally, the rest from slot-owning peers).
   Writes/list/delete pass through, so flush, partsync and the converter see the plain layout.
+  A ranged or size read of a full copy forwards; a converted object has no ranged form and is
+  reconstructed whole, then sliced or measured.
+- **Writes stream as the inner backend does.** EC is not on the write path: a flush or merge writes
+  full copies, so the wrapper forwards `CreateObject` and answers `StreamsWrites` for the raw backend,
+  and the merge cap sizes against the disk the output really lands on. Encoding needs the whole
+  object — the systematic split sizes every shard from the object's length — so it cannot run
+  inline over a stream; `Convert` does it later, one object at a time, off the merge path.
 - **Convert** runs on cold parts from the compaction owner's maintenance branch: shard every
   at-or-above-floor object, write the sidecar **as the commit point**, delete the full copies.
   Crash-safe at every step (before the sidecar ⇒ readable full-copy part; mid-delete ⇒ still

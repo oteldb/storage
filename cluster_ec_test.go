@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"math/rand/v2"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -11,11 +12,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/ec"
 	"github.com/oteldb/storage/cluster/etcd"
 	"github.com/oteldb/storage/cluster/etcd/etcdtest"
+	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
@@ -495,31 +498,107 @@ func TestClusterECShardRepair(t *testing.T) {
 	}
 }
 
-// TestECBackendClaimsStreamingOnlyWhenInnerDoes is the capability rule at the EC wrapper. An EC
-// tenant's objects are plain full copies written straight through, so the wrapper must pass the
-// streaming capability along — and must not invent one, since a merge sizes its output part
-// against the answer.
-func TestECBackendClaimsStreamingOnlyWhenInnerDoes(t *testing.T) {
-	t.Parallel()
+// TestECBackendMergeOutputMatchesRaw pins the write side of the EC wrapper: it changes where a
+// part's bytes live, never what a merge writes. Each source is converted and loses this node's own
+// shard slot before the merge, so every sharded column is read back through parity reconstruction.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestECBackendMergeOutputMatchesRaw(t *testing.T) {
+	endpoint := etcdtest.Start(t)
+	s := openClusterNodeEC(t, endpoint, "node-a", 2, 1, time.Hour)
 
-	assert.False(t, backend.StreamsWrites(&ecBackend{inner: backend.Memory()}))
-
-	streaming, err := file.New(t.TempDir())
-	require.NoError(t, err)
-
-	wrapped := &ecBackend{inner: streaming}
-	require.True(t, backend.StreamsWrites(wrapped))
+	require.Eventually(t, func() bool {
+		return ringSize(s) == 1
+	}, 10*time.Second, 50*time.Millisecond)
 
 	ctx := context.Background()
+	scheme := ec.Scheme{Data: 2, Parity: 1}
 
-	w, err := backend.CreateObject(ctx, wrapped, "part/col")
+	raw, err := file.New(t.TempDir())
 	require.NoError(t, err)
 
-	_, err = w.Write([]byte("streamed"))
+	disk, err := file.New(t.TempDir())
 	require.NoError(t, err)
-	require.NoError(t, w.Commit(ctx))
 
-	got, err := wrapped.Read(ctx, "part/col")
-	require.NoError(t, err)
-	assert.Equal(t, []byte("streamed"), got)
+	wrapped := &ecBackend{inner: disk, s: s, shardKey: "default", scheme: scheme}
+	require.True(t, backend.StreamsWrites(wrapped))
+
+	want := mergedDigest(t, raw, func(string) {})
+	got := mergedDigest(t, wrapped, func(prefix string) {
+		meta, err := ec.Convert(ctx, disk, prefix, scheme)
+		require.NoError(t, err)
+		require.NotEmpty(t, meta.Objects)
+
+		for _, o := range meta.Objects {
+			require.NoError(t, disk.Delete(ctx, ec.ShardKey(prefix, 0, o.Name)))
+		}
+
+		size, err := backend.SizeOf(ctx, wrapped, prefix+"/"+meta.Objects[0].Name)
+		require.NoError(t, err)
+		require.Equal(t, meta.Objects[0].Size, size)
+
+		_, err = backend.SizeOf(ctx, wrapped, prefix+"/absent")
+		require.ErrorIs(t, err, backend.ErrNotExist)
+		_, err = backend.ReadAt(ctx, wrapped, prefix+"/absent", 0, 1)
+		require.ErrorIs(t, err, backend.ErrNotExist)
+	})
+
+	assert.Equal(t, want, got)
+	assert.Positive(t, s.ecStats.reconstructs.Load(), "the merge read its sources through reconstruction")
+}
+
+// mergedDigest flushes a fixed corpus into three overlapping parts, hands each to beforeMerge, and
+// digests the part they merge into.
+func mergedDigest(t *testing.T, b backend.Backend, beforeMerge func(prefix string)) string {
+	t.Helper()
+
+	ctx := context.Background()
+	e := engine.New(engine.Config{Backend: b, Prefix: "ec/metrics", MergeMemoryBytes: 1 << 30})
+	t.Cleanup(func() { require.NoError(t, e.Close(context.WithoutCancel(ctx))) })
+
+	const series, samples = 200, 64
+
+	ser := make([]signal.Series, series)
+	for i := range ser {
+		ser[i] = signal.Series{Attributes: signal.NewAttributes(signal.KeyValue{
+			Key: []byte("instance"), Value: signal.StringValue([]byte("host-" + strconv.Itoa(i))),
+		})}
+	}
+
+	r := rand.New(rand.NewPCG(3, 5))
+
+	for round := range 3 {
+		ids := make([]signal.SeriesID, 0, series*samples)
+		ts := make([]int64, 0, series*samples)
+		vals := make([]float64, 0, series*samples)
+		owner := make([]int, 0, series*samples)
+
+		for s := range series {
+			for i := range samples {
+				ids = append(ids, ser[s].Hash())
+				ts = append(ts, int64(round*samples/2+i)*15_000)
+				vals = append(vals, r.Float64()*1e6)
+				owner = append(owner, s)
+			}
+		}
+
+		_, err := e.AppendBatch(ids, ts, vals, nil,
+			func(i int) signal.Series { return ser[owner[i]] }, engine.AppendLimits{})
+		require.NoError(t, err)
+		require.NoError(t, e.Flush(ctx))
+	}
+
+	require.Equal(t, 3, e.PartCount())
+
+	for _, p := range e.Parts() {
+		beforeMerge(p.ID)
+	}
+
+	for e.PartCount() > 1 {
+		prev := e.PartCount()
+		require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Force: true}))
+		require.Less(t, e.PartCount(), prev)
+	}
+
+	return backendtest.Digest(t, b, []string{e.Parts()[0].ID})
 }

@@ -148,8 +148,14 @@ type ecBackend struct {
 var (
 	_ backend.Backend        = (*ecBackend)(nil)
 	_ backend.Viewer         = (*ecBackend)(nil)
+	_ backend.ViewerAt       = (*ecBackend)(nil)
+	_ backend.ReaderAt       = (*ecBackend)(nil)
+	_ backend.Sizer          = (*ecBackend)(nil)
 	_ backend.DeferredSyncer = (*ecBackend)(nil)
 	_ backend.ObjectCreator  = (*ecBackend)(nil)
+	_ backend.NodeLocal      = (*ecBackend)(nil)
+	_ backend.SpaceReporter  = (*ecBackend)(nil)
+	_ backend.InodeReporter  = (*ecBackend)(nil)
 )
 
 // Read returns the object under key, reconstructing an erasure-coded part object when no full
@@ -180,6 +186,44 @@ func (e *ecBackend) ReadView(ctx context.Context, key string) ([]byte, error) {
 	}
 
 	return e.reconstruct(ctx, key)
+}
+
+// ReadAt forwards the ranged read of a full-copy object. A converted one has no ranged form, so it
+// is reconstructed whole and sliced. Implements [backend.ReaderAt].
+func (e *ecBackend) ReadAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	data, err := backend.ReadAt(ctx, e.inner, key, off, n)
+	if !errors.Is(err, backend.ErrNotExist) {
+		return data, err
+	}
+
+	return e.reconstructRange(ctx, key, off, n)
+}
+
+// ReadViewAt is [ecBackend.ReadAt] keeping the inner backend's no-copy view. Implements
+// [backend.ViewerAt].
+func (e *ecBackend) ReadViewAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	data, err := backend.ReadViewAt(ctx, e.inner, key, off, n)
+	if !errors.Is(err, backend.ErrNotExist) {
+		return data, err
+	}
+
+	return e.reconstructRange(ctx, key, off, n)
+}
+
+// Size forwards the size probe of a full-copy object and measures a converted one by reconstructing
+// it. Implements [backend.Sizer].
+func (e *ecBackend) Size(ctx context.Context, key string) (int64, error) {
+	size, err := backend.SizeOf(ctx, e.inner, key)
+	if !errors.Is(err, backend.ErrNotExist) {
+		return size, err
+	}
+
+	data, err := e.reconstruct(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+
+	return int64(len(data)), nil
 }
 
 func (e *ecBackend) Write(ctx context.Context, key string, data []byte) error {
@@ -276,6 +320,19 @@ func (e *ecBackend) reconstruct(ctx context.Context, key string) ([]byte, error)
 	e.s.ecStats.reconstructs.Add(1)
 
 	return data, nil
+}
+
+// reconstructRange clamps like [backend.ReadAt]; the reconstructed object is caller-owned, so the
+// slice needs no copy.
+func (e *ecBackend) reconstructRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	data, err := e.reconstruct(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+
+	end := int64(len(data))
+
+	return data[min(off, end):min(off+n, end)], nil
 }
 
 // reader builds an [ec.Reader] over the current ring: this node's shard slot (its index in the
