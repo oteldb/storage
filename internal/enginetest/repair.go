@@ -10,7 +10,7 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 )
 
-func (k Kind) openRepair(t *testing.T, be backend.Backend, f PartFetcher) Engine {
+func (k Kind) openRepair(t *testing.T, be backend.Backend, f bucketindex.PartFetcher) Engine {
 	t.Helper()
 
 	return k.Open(t, Config{Backend: be, Repair: f})

@@ -8,7 +8,6 @@ import (
 
 	"github.com/go-faster/errors"
 
-	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/internal/enginetest"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/recordengine"
@@ -101,24 +100,6 @@ func (e recordEngine) MergeShape() enginetest.MergeShape {
 	return enginetest.MergeShape{Parts: sh.Parts, Bytes: sh.Bytes}
 }
 
-func (e recordEngine) RepairStats() enginetest.RepairStats {
-	return enginetest.RepairStats(e.Engine.RepairStats())
-}
-
-// recordFetcher bridges the suite's PartFetcher to the engine's.
-type recordFetcher struct{ enginetest.PartFetcher }
-
-func (f recordFetcher) FetchWants(ctx context.Context, wants []bucketindex.Want) []recordengine.FetchResult {
-	res := f.PartFetcher.FetchWants(ctx, wants)
-
-	out := make([]recordengine.FetchResult, len(res))
-	for i := range res {
-		out[i] = recordengine.FetchResult(res[i])
-	}
-
-	return out
-}
-
 // streamIdentity is the identity mkBatch gives a stream of the named service.
 func streamIdentity(svc string) signal.Series {
 	return signal.Series{Resource: signal.Resource{Attributes: signal.NewAttributes(
@@ -132,10 +113,7 @@ var recordKind = enginetest.Kind{
 	Open: func(t *testing.T, cfg enginetest.Config) enginetest.Engine {
 		t.Helper()
 
-		c := recordengine.Config{Schema: testSchema, Backend: cfg.Backend, Prefix: enginePrefix, WAL: cfg.WAL, Obs: cfg.Obs, WriterID: cfg.WriterID}
-		if cfg.Repair != nil {
-			c.Repair = recordFetcher{cfg.Repair}
-		}
+		c := recordengine.Config{Schema: testSchema, Backend: cfg.Backend, Prefix: enginePrefix, WAL: cfg.WAL, Obs: cfg.Obs, WriterID: cfg.WriterID, Repair: cfg.Repair}
 
 		return recordEngine{recordengine.New(c)}
 	},

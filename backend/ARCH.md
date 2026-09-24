@@ -221,6 +221,10 @@ a demonstration.
   read path's question — is *this* window short? — and an unrepaired shard stays readable outside the
   range it actually lost. A want with no bounds at all names a part of unknown extent and therefore
   covers everything: a want is a claim of ignorance and errs wide.
+- **The repair seam's types live beside the want.** `PartFetcher` and `FetchResult` are made of
+  `Want`, `Entry` and `WantOutcome`, and `RepairStats` counts their outcomes. Both engines alias
+  all three, so one fetcher serves a metric and a record engine with no per-engine result type to
+  re-label.
 - **A hole is an entry, not a side list.** When no owner can supply a wanted part, the owner commits
   `Entry{Hole: true}` at that part's identity (`RecordHole`): the hole enters `Entries`, the want
   leaves `Wanted`, and the monotone `Index.LostParts` rises — one mutation, so one CAS commit

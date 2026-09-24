@@ -231,7 +231,7 @@ func repairWithoutCallbackIsNoOp(t *testing.T, k Kind) {
 	require.NoError(t, e.Merge(ctx, 0))
 
 	assert.Equal(t, []string{lost}, e.WantPrefixes())
-	assert.Equal(t, RepairStats{}, e.RepairStats())
+	assert.Equal(t, bucketindex.RepairStats{}, e.RepairStats())
 }
 
 // repairUnreadablePartKeepsWant covers the half-copied case: the objects arrived but the part will

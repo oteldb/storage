@@ -187,7 +187,7 @@ func repairConcurrentMergesFetchOnce(t *testing.T, k Kind) {
 
 		assert.Equal(t, []string{lost}, f.Asks(), "the wanted part is copied from a peer once")
 		assert.Equal(t, 1, f.Calls())
-		assert.Equal(t, RepairStats{Fetched: 1}, e.RepairStats(), "one published part, one counted fetch and nothing else")
+		assert.Equal(t, bucketindex.RepairStats{Fetched: 1}, e.RepairStats(), "one published part, one counted fetch and nothing else")
 		assert.Empty(t, e.WantPrefixes())
 		assert.Empty(t, k.loadIndex(t, be).Wanted)
 	})

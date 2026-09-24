@@ -8,7 +8,6 @@ import (
 	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/require"
 
-	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/enginetest"
 	"github.com/oteldb/storage/query/fetch"
@@ -102,34 +101,13 @@ func (e metricEngine) MergeShape() enginetest.MergeShape {
 	return enginetest.MergeShape{Parts: sh.Parts, Bytes: sh.Bytes}
 }
 
-func (e metricEngine) RepairStats() enginetest.RepairStats {
-	return enginetest.RepairStats(e.Engine.RepairStats())
-}
-
-// metricFetcher bridges the suite's PartFetcher to the engine's.
-type metricFetcher struct{ enginetest.PartFetcher }
-
-func (f metricFetcher) FetchWants(ctx context.Context, wants []bucketindex.Want) []engine.FetchResult {
-	res := f.PartFetcher.FetchWants(ctx, wants)
-
-	out := make([]engine.FetchResult, len(res))
-	for i := range res {
-		out[i] = engine.FetchResult(res[i])
-	}
-
-	return out
-}
-
 var metricKind = enginetest.Kind{
 	Name:   "metrics",
 	Prefix: "default/metrics",
 	Open: func(t *testing.T, cfg enginetest.Config) enginetest.Engine {
 		t.Helper()
 
-		c := engine.Config{Backend: cfg.Backend, Prefix: "default/metrics", WAL: cfg.WAL, Obs: cfg.Obs, WriterID: cfg.WriterID}
-		if cfg.Repair != nil {
-			c.Repair = metricFetcher{cfg.Repair}
-		}
+		c := engine.Config{Backend: cfg.Backend, Prefix: "default/metrics", WAL: cfg.WAL, Obs: cfg.Obs, WriterID: cfg.WriterID, Repair: cfg.Repair}
 
 		return metricEngine{engine.New(c)}
 	},

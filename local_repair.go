@@ -9,7 +9,6 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
-	"github.com/oteldb/storage/engine"
 )
 
 // soleOwnerRepairer is the repair seam of a writable store opened without a cluster layer. It copies
@@ -22,9 +21,9 @@ type soleOwnerRepairer struct {
 	prefix  string
 }
 
-// FetchWants implements the engines' PartFetcher.
-func (r soleOwnerRepairer) FetchWants(ctx context.Context, wants []bucketindex.Want) []engine.FetchResult {
-	out := make([]engine.FetchResult, len(wants))
+// FetchWants implements [bucketindex.PartFetcher].
+func (r soleOwnerRepairer) FetchWants(ctx context.Context, wants []bucketindex.Want) []bucketindex.FetchResult {
+	out := make([]bucketindex.FetchResult, len(wants))
 
 	ix, err := bucketindex.Load(ctx, r.backend, r.prefix+"/"+bucketindex.Object)
 	if err != nil {
@@ -44,19 +43,19 @@ func (r soleOwnerRepairer) FetchWants(ctx context.Context, wants []bucketindex.W
 
 // probe concludes absence only when the committed index still states the loss and the backend says
 // the part's manifest does not exist. Anything else is either no evidence or a transient failure.
-func (r soleOwnerRepairer) probe(ctx context.Context, ix *bucketindex.Index, w bucketindex.Want) engine.FetchResult {
+func (r soleOwnerRepairer) probe(ctx context.Context, ix *bucketindex.Index, w bucketindex.Want) bucketindex.FetchResult {
 	if !committedLoss(ix, w) {
-		return engine.FetchResult{Outcome: bucketindex.WantIncomplete}
+		return bucketindex.FetchResult{Outcome: bucketindex.WantIncomplete}
 	}
 
 	present, err := block.PartPresent(ctx, r.backend, w.Prefix)
 	switch {
 	case err != nil:
-		return engine.FetchResult{Err: err}
+		return bucketindex.FetchResult{Err: err}
 	case present:
-		return engine.FetchResult{Err: errors.Errorf("part %q is present but does not open", w.Prefix)}
+		return bucketindex.FetchResult{Err: errors.Errorf("part %q is present but does not open", w.Prefix)}
 	default:
-		return engine.FetchResult{Outcome: bucketindex.WantAbsent}
+		return bucketindex.FetchResult{Outcome: bucketindex.WantAbsent}
 	}
 }
 

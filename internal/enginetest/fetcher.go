@@ -8,18 +8,6 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 )
 
-// FetchResult mirrors the engines' identical FetchResult; an adapter converts it field for field.
-type FetchResult struct {
-	Entry   bucketindex.Entry
-	Outcome bucketindex.WantOutcome
-	Err     error
-}
-
-// PartFetcher mirrors the engines' PartFetcher over [FetchResult]; an adapter bridges it.
-type PartFetcher interface {
-	FetchWants(ctx context.Context, wants []bucketindex.Want) []FetchResult
-}
-
 // Answer is how a [Fetcher] answers one want.
 type Answer func(w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error)
 
@@ -51,8 +39,8 @@ func (f *Fetcher) SetAnswer(a Answer) {
 	f.answer = a
 }
 
-// FetchWants implements [PartFetcher].
-func (f *Fetcher) FetchWants(_ context.Context, wants []bucketindex.Want) []FetchResult {
+// FetchWants implements [bucketindex.PartFetcher].
+func (f *Fetcher) FetchWants(_ context.Context, wants []bucketindex.Want) []bucketindex.FetchResult {
 	f.mu.Lock()
 	f.calls++
 
@@ -63,7 +51,7 @@ func (f *Fetcher) FetchWants(_ context.Context, wants []bucketindex.Want) []Fetc
 	answer := f.answer
 	f.mu.Unlock()
 
-	out := make([]FetchResult, len(wants))
+	out := make([]bucketindex.FetchResult, len(wants))
 
 	for i := range wants {
 		if answer == nil {
@@ -73,7 +61,7 @@ func (f *Fetcher) FetchWants(_ context.Context, wants []bucketindex.Want) []Fetc
 		}
 
 		ent, outcome, err := answer(wants[i])
-		out[i] = FetchResult{Entry: ent, Outcome: outcome, Err: err}
+		out[i] = bucketindex.FetchResult{Entry: ent, Outcome: outcome, Err: err}
 	}
 
 	return out

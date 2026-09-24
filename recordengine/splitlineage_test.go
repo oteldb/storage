@@ -254,7 +254,7 @@ func TestSplitLineageWantBecomesHole(t *testing.T) {
 
 	// The cluster layer's answer to a want: the best part in the peer's index satisfying it, copied
 	// over; definitive absence when the index names none.
-	fetcher := recordFetcher{enginetest.NewFetcher(func(w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
+	fetcher := enginetest.NewFetcher(func(w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
 		ent, ok := loadIndex(t, peer).Satisfying(w)
 		if !ok {
 			return bucketindex.Entry{}, bucketindex.WantAbsent, nil
@@ -263,7 +263,7 @@ func TestSplitLineageWantBecomesHole(t *testing.T) {
 		enginetest.CopyObjects(t, peer, be, ent.Prefix+"/")
 
 		return ent, bucketindex.WantSatisfied, nil
-	})}
+	})
 
 	_, id, _ := strings.Cut(lost.Prefix, enginePrefix+"/")
 	erasePart(ctx, t, be, id)

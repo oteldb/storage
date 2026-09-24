@@ -28,7 +28,7 @@ type Row struct {
 // Config is what the suite varies when opening an engine; everything else is the adapter's.
 type Config struct {
 	Backend backend.Backend
-	Repair  PartFetcher
+	Repair  bucketindex.PartFetcher
 	WAL     *wal.SegmentWriter
 	Obs     *obs.Obs
 	// WriterID names the writer whose flush watermark the engine keeps in the bucket index.
@@ -53,11 +53,6 @@ type Stats struct {
 type MergeShape struct {
 	Parts int
 	Bytes int64
-}
-
-// RepairStats mirrors the engines' identical RepairStats, so an adapter converts rather than copies.
-type RepairStats struct {
-	Local, Fetched, Unsatisfiable, Incomplete, Failed, Lost, Revoked int64
 }
 
 // Engine is one engine adapted for the suite. Methods that share a name with the engine's own mean
@@ -118,7 +113,7 @@ type Repairer interface {
 	WantOverlaps(start, end int64) bool
 	Holes() []bucketindex.Entry
 	LostParts() uint64
-	RepairStats() RepairStats
+	RepairStats() bucketindex.RepairStats
 }
 
 // Kind is one engine the suite runs against.

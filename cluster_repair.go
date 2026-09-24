@@ -22,7 +22,7 @@ type partRepairer struct {
 	prefix string
 }
 
-// FetchWants implements the engines' PartFetcher.
+// FetchWants implements [bucketindex.PartFetcher].
 //
 // The owner set is resolved once for the cycle, so every want in it is judged against the same
 // view of who holds the shard.
@@ -38,8 +38,8 @@ type partRepairer struct {
 // currently returns. A cluster permanently running fewer nodes than its RF therefore never
 // acknowledges a loss, which is the safe direction: an outstanding want is visible and
 // recoverable, a hole over live data is neither.
-func (r *partRepairer) FetchWants(ctx context.Context, wants []bucketindex.Want) []engine.FetchResult {
-	out := make([]engine.FetchResult, len(wants))
+func (r *partRepairer) FetchWants(ctx context.Context, wants []bucketindex.Want) []bucketindex.FetchResult {
+	out := make([]bucketindex.FetchResult, len(wants))
 
 	// An engine recovery built is handed this seam before the cluster layer starts. There is no
 	// owner set to ask yet, so nothing may be concluded.
@@ -72,31 +72,12 @@ func (r *partRepairer) FetchWants(ctx context.Context, wants []bucketindex.Want)
 
 		switch {
 		case res.Err != nil:
-			out[i] = engine.FetchResult{Outcome: bucketindex.WantIncomplete, Err: res.Err}
+			out[i] = bucketindex.FetchResult{Outcome: bucketindex.WantIncomplete, Err: res.Err}
 		case res.OK:
-			out[i] = engine.FetchResult{Entry: res.Entry, Outcome: bucketindex.WantSatisfied}
+			out[i] = bucketindex.FetchResult{Entry: res.Entry, Outcome: bucketindex.WantSatisfied}
 		default:
-			out[i] = engine.FetchResult{Outcome: absent}
+			out[i] = bucketindex.FetchResult{Outcome: absent}
 		}
-	}
-
-	return out
-}
-
-// recordPartRepairer adapts a metric repair seam to the record engines' identical one; the two
-// engines declare their own result type, so the wrapper only re-labels the fields.
-type recordPartRepairer struct{ engine.PartFetcher }
-
-// FetchWants implements recordengine.PartFetcher.
-func (r recordPartRepairer) FetchWants(
-	ctx context.Context, wants []bucketindex.Want,
-) []recordengine.FetchResult {
-	src := r.PartFetcher.FetchWants(ctx, wants)
-
-	out := make([]recordengine.FetchResult, len(src))
-	for i := range src {
-		s := &src[i]
-		out[i] = recordengine.FetchResult{Entry: s.Entry, Outcome: s.Outcome, Err: s.Err}
 	}
 
 	return out
@@ -149,7 +130,7 @@ func (s *Storage) repairerFor(tid signal.TenantID, prefix string) *partRepairer 
 //
 // The mode is read from the options, not from s.cluster: recovery creates engines before the
 // cluster layer starts, and a cluster node's engine must never take the single-node evidence rule.
-func (s *Storage) repairSeamFor(tid signal.TenantID, prefix string) engine.PartFetcher {
+func (s *Storage) repairSeamFor(tid signal.TenantID, prefix string) bucketindex.PartFetcher {
 	if s.opts.Cluster == nil && !s.opts.ReadOnly {
 		return soleOwnerRepairer{backend: s.backendFor(tid), prefix: prefix}
 	}
@@ -162,12 +143,7 @@ func (s *Storage) repairSeamFor(tid signal.TenantID, prefix string) engine.PartF
 }
 
 func (s *Storage) recordRepairerFor(tid signal.TenantID, prefix string) recordengine.PartFetcher {
-	r := s.repairSeamFor(tid, prefix)
-	if r == nil {
-		return nil
-	}
-
-	return recordPartRepairer{r}
+	return s.repairSeamFor(tid, prefix)
 }
 
 func (s *Storage) metricRepairerFor(tid signal.TenantID, prefix string) engine.PartFetcher {

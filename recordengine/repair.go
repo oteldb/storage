@@ -37,31 +37,8 @@ const repairFetchesPerCycle = 4
 // entire class of momentarily-wrong views.
 const holeConfirmations = 3
 
-// RepairStats counts what repair has done over this engine's lifetime. A want that no peer can
-// satisfy stays outstanding until the loss is acknowledged, so Unsatisfiable climbing while Lost
-// does not is the signal that repair is stuck rather than idle.
-type RepairStats struct {
-	// Local is the wants discharged with no network call, because this engine's own index gained a
-	// part containing them.
-	Local int64
-	// Fetched is the parts pulled from a peer to discharge a want.
-	Fetched int64
-	// Unsatisfiable is the attempts that ended with no peer holding the part or any successor of
-	// it — definitive absence, and an unrepaired shard.
-	Unsatisfiable int64
-	// Incomplete is the attempts that found nothing but could not have found everything: the peers
-	// asked were a strict subset of the shard's expected owners, so the want stays outstanding and
-	// no evidence of loss accrues.
-	Incomplete int64
-	// Failed is the attempts that ended in a transient failure (an unreachable peer, a copy that
-	// did not finish); the want is retried on the next merge.
-	Failed int64
-	// Lost is the wants converted into a hole because no owner could supply the part. It is this
-	// node's view of the index's monotone data-loss counter (see [Engine.LostParts]).
-	Lost int64
-	// Revoked is the holes replaced by the real part turning up after all.
-	Revoked int64
-}
+// RepairStats counts what repair has done over this engine's lifetime.
+type RepairStats = bucketindex.RepairStats
 
 // RepairStats returns a snapshot of what repair has done.
 func (e *Engine) RepairStats() RepairStats {
@@ -187,7 +164,7 @@ func (e *Engine) repairWants(ctx context.Context) {
 	held, remote := e.openHeld(ctx, pending, &stats)
 
 	results, failed, fetchStats := e.fetchWants(ctx, remote)
-	stats.add(fetchStats)
+	stats.Add(fetchStats)
 
 	results = append(results, held...)
 
@@ -197,7 +174,7 @@ func (e *Engine) repairWants(ctx context.Context) {
 	// members are only knowable once one of them is in hand, which is why this is a second round.
 	if extra := siblingTargets(&ix, wants, results); len(extra) > 0 {
 		more, _, extraStats := e.fetchWants(ctx, extra)
-		stats.add(extraStats)
+		stats.Add(extraStats)
 
 		results = append(results, dropIncompleteGroups(&ix, results, more)...)
 	}
@@ -439,7 +416,7 @@ func (e *Engine) publishRepaired(
 		// Nothing changed, so there is nothing to commit; a want nobody could satisfy is left in
 		// the index exactly as it was, and only the counters move.
 		e.mu.Lock()
-		e.repaired.add(stats)
+		e.repaired.Add(stats)
 		e.mu.Unlock()
 
 		return stats
@@ -538,7 +515,7 @@ func (e *Engine) publishRepaired(
 		e.retireLocked(retired)
 	}
 
-	e.repaired.add(stats)
+	e.repaired.Add(stats)
 	e.mu.Unlock()
 
 	if err != nil {
@@ -565,16 +542,6 @@ func supersededBy(parts []*part, fetched []bucketindex.Entry) map[string]struct{
 	}
 
 	return bucketindex.Subsumed(live, fetched)
-}
-
-func (s *RepairStats) add(o RepairStats) {
-	s.Local += o.Local
-	s.Fetched += o.Fetched
-	s.Unsatisfiable += o.Unsatisfiable
-	s.Incomplete += o.Incomplete
-	s.Failed += o.Failed
-	s.Lost += o.Lost
-	s.Revoked += o.Revoked
 }
 
 // siblingTargets are the extra fetches a want answered by a split group needs: the members of that

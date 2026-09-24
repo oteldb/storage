@@ -16,7 +16,7 @@ import (
 	"github.com/oteldb/storage/internal/obs"
 )
 
-func (k Kind) openObservedRepair(t *testing.T, be backend.Backend, f PartFetcher) (Engine, *sdkmetric.ManualReader) {
+func (k Kind) openObservedRepair(t *testing.T, be backend.Backend, f bucketindex.PartFetcher) (Engine, *sdkmetric.ManualReader) {
 	t.Helper()
 
 	reader := sdkmetric.NewManualReader()
@@ -27,15 +27,15 @@ func (k Kind) openObservedRepair(t *testing.T, be backend.Backend, f PartFetcher
 	return k.Open(t, Config{Backend: be, Repair: f, Obs: o}), reader
 }
 
-// observedRepair reads the repair instruments back into the shape of [RepairStats], so the two
+// observedRepair reads the repair instruments back into the shape of [bucketindex.RepairStats], so the two
 // operator surfaces compare field by field.
-func observedRepair(t *testing.T, reader *sdkmetric.ManualReader) RepairStats {
+func observedRepair(t *testing.T, reader *sdkmetric.ManualReader) bucketindex.RepairStats {
 	t.Helper()
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(context.Background(), &rm))
 
-	var s RepairStats
+	var s bucketindex.RepairStats
 
 	attempts := map[string]*int64{
 		"local": &s.Local, "fetched": &s.Fetched, "absent": &s.Unsatisfiable,
