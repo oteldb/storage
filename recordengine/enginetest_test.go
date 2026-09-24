@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-faster/errors"
+
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/internal/enginetest"
 	"github.com/oteldb/storage/query/fetch"
@@ -14,7 +16,8 @@ import (
 )
 
 // recordEngine adapts the record engine to the shared suite: a Row is one record of the stream
-// {service.name=<stream>} whose body is the decimal Val.
+// {service.name=<stream>} whose body is the decimal Val. Read also enforces the fetch contract of
+// one batch per stream.
 type recordEngine struct{ *recordengine.Engine }
 
 func (e recordEngine) Append(t *testing.T, rows ...enginetest.Row) {
@@ -34,6 +37,10 @@ func (e recordEngine) Read(ctx context.Context, stream string) ([]enginetest.Row
 	batches, err := fetch.Drain(ctx, it)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(batches) > 1 {
+		return nil, errors.Errorf("stream %q split across %d batches", stream, len(batches))
 	}
 
 	var out []enginetest.Row
@@ -64,6 +71,8 @@ func (e recordEngine) AttrNames(*testing.T) []string {
 }
 
 func (e recordEngine) StreamCount() int { return int(e.Engine.Stats().Streams) }
+
+func (e recordEngine) HeadRows() int { return e.HeadRecordCount() }
 
 func (e recordEngine) Parts() []enginetest.Part {
 	parts := e.Engine.Parts()

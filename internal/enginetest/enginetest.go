@@ -94,6 +94,8 @@ type Introspector interface {
 	AttrNames(t *testing.T) []string
 	// StreamCount is the number of distinct stream identities the engine knows.
 	StreamCount() int
+	// HeadRows is the number of rows buffered in the head.
+	HeadRows() int
 	Parts() []Part
 	PartCount() int
 	PartPrefixes() []string
@@ -216,6 +218,9 @@ var suite = []struct {
 	{"LoadPartsReadOnlySweepsNothing", loadPartsReadOnlySweepsNothing},
 	{"AdoptedWantIsRepairedIntoTheIndex", adoptedWantIsRepairedIntoTheIndex},
 	{"AdoptWantsIgnoresWhatIsAlreadyHere", adoptWantsIgnoresWhatIsAlreadyHere},
+	{"RefreshReplicaTrimsPerStream", refreshReplicaTrimsPerStream},
+	{"PromotedReplicaKeepsLateRow", promotedReplicaKeepsLateRow},
+	{"MidFlushAppendSurvivesCrash", midFlushAppendSurvivesCrash},
 }
 
 // Run runs every suite test against k, each as <test>/<k.Name>.

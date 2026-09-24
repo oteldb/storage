@@ -73,6 +73,8 @@ func (e metricEngine) AttrNames(t *testing.T) []string {
 
 func (e metricEngine) StreamCount() int { return e.SeriesCount() }
 
+func (e metricEngine) HeadRows() int { return e.HeadSampleCount() }
+
 func (e metricEngine) Parts() []enginetest.Part {
 	parts := e.Engine.Parts()
 
