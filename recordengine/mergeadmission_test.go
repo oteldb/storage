@@ -12,6 +12,22 @@ import (
 	"github.com/oteldb/storage/recordengine"
 )
 
+// flushParts writes n one-record parts, returning their prefixes.
+func flushParts(t *testing.T, e *recordengine.Engine, n int) []string {
+	t.Helper()
+	ctx := context.Background()
+
+	for i := range n {
+		ingest(t, e, mkBatch("api", rrec{ts: int64(100 * (i + 1)), body: "p" + string(rune('1'+i))}))
+		require.NoError(t, e.Flush(ctx))
+	}
+
+	parts := e.PartPrefixes()
+	require.Len(t, parts, n)
+
+	return parts
+}
+
 // admissionRecorder stands in for the process-wide merge pool, recording what each merge asked for
 // and whether it said it could wait. busy declines every request that will not wait, which is what
 // a background merge meets when the budget is fully committed; a waiting caller is admitted, as the

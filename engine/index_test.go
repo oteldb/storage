@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -15,8 +14,6 @@ import (
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 )
-
-var errWriteRejected = errors.New("injected write failure")
 
 // rejectWrites fails every Write and CompareAndSwap of a key ending in suffix with err; an empty
 // suffix matches every key. CompareAndSwap is the path the bucket-index commit takes, so a suffix

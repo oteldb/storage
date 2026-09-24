@@ -15,6 +15,7 @@ import (
 	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/enginetest"
 	"github.com/oteldb/storage/query/fetch"
 )
 
@@ -211,7 +212,7 @@ func TestSplitLineageWantBecomesHole(t *testing.T) {
 	inputs := flushInputs(ctx, t, be, true)
 	lost := inputs[1]
 
-	copyObjects(t, be, peer, lostPrefix+"/")
+	enginetest.CopyObjects(t, be, peer, lostPrefix+"/")
 	splitMerge(ctx, t, peer, inputs)
 
 	served := splitLineageEngine(peer, splitCeilingBytes, nil)
@@ -220,16 +221,16 @@ func TestSplitLineageWantBecomesHole(t *testing.T) {
 
 	// The cluster layer's answer to a want: the best part in the peer's index satisfying it, copied
 	// over; definitive absence when the index names none.
-	fetcher := &fakeFetcher{answer: func(w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
+	fetcher := metricFetcher{enginetest.NewFetcher(func(w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
 		ent, ok := loadIndex(t, peer, lostPrefix).Satisfying(w)
 		if !ok {
 			return bucketindex.Entry{}, bucketindex.WantAbsent, nil
 		}
 
-		copyObjects(t, peer, be, ent.Prefix+"/")
+		enginetest.CopyObjects(t, peer, be, ent.Prefix+"/")
 
 		return ent, bucketindex.WantSatisfied, nil
-	}}
+	})}
 
 	_, id, _ := strings.Cut(lost.Prefix, lostPrefix+"/")
 	erasePart(ctx, t, be, id)

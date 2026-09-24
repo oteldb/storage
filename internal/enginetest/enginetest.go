@@ -62,6 +62,7 @@ type RepairStats struct {
 // the same thing.
 type Engine interface {
 	Store
+	Loader
 	Introspector
 	Repairer
 }
@@ -74,11 +75,17 @@ type Store interface {
 	Read(ctx context.Context, stream string) ([]Row, error)
 	Flush(ctx context.Context) error
 	Merge(ctx context.Context, retainFrom int64) error
-	LoadParts(ctx context.Context) error
-	RefreshReplica(ctx context.Context) error
 	Reset(ctx context.Context) error
-	Replay(ctx context.Context, dir string) error
 	HeadBytes() int64
+}
+
+// Loader is how an engine recovers state from its backend and WAL.
+type Loader interface {
+	LoadParts(ctx context.Context) error
+	LoadPartsUnclaimed(ctx context.Context) error
+	LoadPartsReadOnly(ctx context.Context) error
+	RefreshReplica(ctx context.Context) error
+	Replay(ctx context.Context, dir string) error
 }
 
 // Introspector is what the engine reports about itself.
@@ -97,6 +104,7 @@ type Introspector interface {
 // Repairer is the repair-obligation surface, including the test-only LosePart and SetPartBlocks.
 type Repairer interface {
 	LosePart(prefix string, blocks bucketindex.Interval)
+	AdoptWants(ws []bucketindex.Want)
 	SetPartBlocks(prefix string, blocks bucketindex.Interval, level uint32)
 	WantPrefixes() []string
 	HasWants() bool
@@ -170,6 +178,44 @@ var suite = []struct {
 	{"WALResolvesStreamAfterCheckpoint", walResolvesStreamAfterCheckpoint},
 	{"HeadAgeTracksFlushLag", headAgeTracksFlushLag},
 	{"MergeShapeReportsBytes", mergeShapeReportsBytes},
+
+	{"HoleCommittedAfterRepeatedAbsence", holeCommittedAfterRepeatedAbsence},
+	{"IncompletePeerSetNeverHoles", incompletePeerSetNeverHoles},
+	{"TransientFailureNeverHoles", transientFailureNeverHoles},
+	{"AbsenceEvidenceResetsOnAnyOtherOutcome", absenceEvidenceResetsOnAnyOtherOutcome},
+	{"HoleRevokedByExactPrefix", holeRevokedByExactPrefix},
+	{"HoleRevokedByLostSuccessor", holeRevokedByLostSuccessor},
+	{"HoleRevokedByContainingSuccessor", holeRevokedByContainingSuccessor},
+	{"HoleSurvivesReload", holeSurvivesReload},
+	{"HoleNotOfferedToAPeer", holeNotOfferedToAPeer},
+	{"RepairStatsSurfaceLoss", repairStatsSurfaceLoss},
+	{"WantOverlapIsBoundedByTheLostPart", wantOverlapIsBoundedByTheLostPart},
+	{"CommittedHoleLetsReadsThrough", committedHoleLetsReadsThrough},
+	{"TransientErrorBreaksAbsenceRun", transientErrorBreaksAbsenceRun},
+	{"UnattemptedWantKeepsAbsenceEvidence", unattemptedWantKeepsAbsenceEvidence},
+	{"RepairConcurrentMergesFetchOnce", repairConcurrentMergesFetchOnce},
+	{"WantsPastBoundStayOwed", wantsPastBoundStayOwed},
+	{"RefreshReplicaGonePartBecomesPendingWant", refreshReplicaGonePartBecomesPendingWant},
+	{"BlockNumbersSurviveAnEmptiedShard", blockNumbersSurviveAnEmptiedShard},
+	{"RepairFetchesWantedPartFromPeer", repairFetchesWantedPartFromPeer},
+	{"RepairDischargedByContainingSuccessor", repairDischargedByContainingSuccessor},
+	{"RepairDischargedByLocalPart", repairDischargedByLocalPart},
+	{"RepairNoPeerLeavesWant", repairNoPeerLeavesWant},
+	{"RepairTransientFailureKeepsWant", repairTransientFailureKeepsWant},
+	{"RepairWithoutCallbackIsNoOp", repairWithoutCallbackIsNoOp},
+	{"RepairUnreadablePartKeepsWant", repairUnreadablePartKeepsWant},
+	{"RepairCommitFailureKeepsWant", repairCommitFailureKeepsWant},
+	{"RepairAsksTheFetcherOncePerCycle", repairAsksTheFetcherOncePerCycle},
+	{"RepairCoveredWantIsNotAFailure", repairCoveredWantIsNotAFailure},
+	{"RepairFailedCommitObservesNoLoss", repairFailedCommitObservesNoLoss},
+	{"RepairUnopenablePartObservedAsFailed", repairUnopenablePartObservedAsFailed(phantomCopy)},
+	{"RepairTruncatedPartObservedAsFailed", repairUnopenablePartObservedAsFailed(truncatedCopyOf)},
+	{"RepairDischargedByPartHeldOnDisk", repairDischargedByPartHeldOnDisk},
+	{"LoadPartsUnclaimedDefersTheWant", loadPartsUnclaimedDefersTheWant},
+	{"LoadPartsUnclaimedWantIsRepaired", loadPartsUnclaimedWantIsRepaired},
+	{"LoadPartsReadOnlySweepsNothing", loadPartsReadOnlySweepsNothing},
+	{"AdoptedWantIsRepairedIntoTheIndex", adoptedWantIsRepairedIntoTheIndex},
+	{"AdoptWantsIgnoresWhatIsAlreadyHere", adoptWantsIgnoresWhatIsAlreadyHere},
 }
 
 // Run runs every suite test against k, each as <test>/<k.Name>.

@@ -1,4 +1,4 @@
-package recordengine_test
+package enginetest
 
 import (
 	"context"
@@ -14,12 +14,9 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/internal/obs"
-	"github.com/oteldb/storage/recordengine"
 )
 
-func newObservedRepairEngine(
-	t *testing.T, be backend.Backend, r recordengine.PartFetcher,
-) (*recordengine.Engine, *sdkmetric.ManualReader) {
+func (k Kind) openObservedRepair(t *testing.T, be backend.Backend, f PartFetcher) (Engine, *sdkmetric.ManualReader) {
 	t.Helper()
 
 	reader := sdkmetric.NewManualReader()
@@ -27,20 +24,18 @@ func newObservedRepairEngine(
 	o, err := obs.New(obs.Config{MeterProvider: sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))})
 	require.NoError(t, err)
 
-	return recordengine.New(recordengine.Config{
-		Schema: testSchema, Backend: be, Prefix: "t/recs", Repair: r, Obs: o,
-	}), reader
+	return k.Open(t, Config{Backend: be, Repair: f, Obs: o}), reader
 }
 
-// observedRepair reads the repair instruments back into the shape of [recordengine.RepairStats], so
-// the two operator surfaces compare field by field.
-func observedRepair(t *testing.T, reader *sdkmetric.ManualReader) recordengine.RepairStats {
+// observedRepair reads the repair instruments back into the shape of [RepairStats], so the two
+// operator surfaces compare field by field.
+func observedRepair(t *testing.T, reader *sdkmetric.ManualReader) RepairStats {
 	t.Helper()
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(context.Background(), &rm))
 
-	var s recordengine.RepairStats
+	var s RepairStats
 
 	attempts := map[string]*int64{
 		"local": &s.Local, "fetched": &s.Fetched, "absent": &s.Unsatisfiable,
@@ -74,13 +69,13 @@ func observedRepair(t *testing.T, reader *sdkmetric.ManualReader) recordengine.R
 	return s
 }
 
-// TestRepairFailedCommitObservesNoLoss: a pass that concluded a part lost but could not commit the
-// hole acknowledged nothing, so the monotone lost_parts counter must not move.
-func TestRepairFailedCommitObservesNoLoss(t *testing.T) {
-	t.Parallel()
+// repairFailedCommitObservesNoLoss: a pass that concluded a part lost but could not commit the hole
+// acknowledged nothing, so the monotone lost_parts counter must not move.
+func repairFailedCommitObservesNoLoss(t *testing.T, k Kind) {
+	t.Helper()
 
 	be := faultbackend.Wrap(backend.Memory())
-	e, reader := newObservedRepairEngine(t, be, answerAlways(bucketindex.WantAbsent, nil))
+	e, reader := k.openObservedRepair(t, be, AnswerAlways(bucketindex.WantAbsent, nil))
 
 	lost := loseFirstOfTwo(t, e, be)
 
@@ -104,29 +99,39 @@ func TestRepairFailedCommitObservesNoLoss(t *testing.T) {
 	assert.Equal(t, e.RepairStats(), observedRepair(t, reader))
 }
 
-// TestRepairUnopenablePartObservedAsFailed: a fetched part that will not open is a failure on both
-// surfaces, not a fetch on one and a failure on the other.
-func TestRepairUnopenablePartObservedAsFailed(t *testing.T) {
-	t.Parallel()
+// repairUnopenablePartObservedAsFailed: a fetched part that will not open is a failure on both
+// surfaces, not a fetch on one and a failure on the other. open answers the want with that part.
+func repairUnopenablePartObservedAsFailed(open func(t *testing.T, k Kind, be backend.Backend) Answer) func(*testing.T, Kind) {
+	return func(t *testing.T, k Kind) {
+		t.Helper()
 
-	ctx := context.Background()
-	be := backend.Memory()
+		be := backend.Memory()
+		f := NewFetcher(nil)
+		e, reader := k.openObservedRepair(t, be, f)
 
-	f := &fakeFetcher{}
-	e, reader := newObservedRepairEngine(t, be, f)
+		lost := loseOneOfThree(t, e, be)
+		f.SetAnswer(open(t, k, be))
 
-	lost := loseOneOfThree(t, e, be)
+		require.NoError(t, e.Merge(context.Background(), 0))
 
-	f.answer = func(w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
-		require.NoError(t, be.Write(ctx, w.Prefix+"/manifest", []byte("truncated")))
-
-		return bucketindex.Entry{Prefix: w.Prefix, Blocks: w.Blocks}, bucketindex.WantSatisfied, nil
+		assert.Equal(t, []string{lost}, e.WantPrefixes())
+		assert.Zero(t, e.RepairStats().Fetched)
+		assert.Equal(t, int64(1), e.RepairStats().Failed)
+		assert.Equal(t, e.RepairStats(), observedRepair(t, reader))
 	}
+}
 
-	require.NoError(t, e.Merge(ctx, 0))
+// phantomCopy answers a want with a part whose objects nothing wrote.
+func phantomCopy(t *testing.T, k Kind, _ backend.Backend) Answer {
+	t.Helper()
 
-	assert.Equal(t, []string{lost}, e.WantPrefixes())
-	assert.Zero(t, e.RepairStats().Fetched)
-	assert.Equal(t, int64(1), e.RepairStats().Failed)
-	assert.Equal(t, e.RepairStats(), observedRepair(t, reader))
+	return func(w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
+		return bucketindex.Entry{Prefix: k.phantom(), MinTime: 100, MaxTime: 100, Blocks: w.Blocks}, bucketindex.WantSatisfied, nil
+	}
+}
+
+func truncatedCopyOf(t *testing.T, _ Kind, be backend.Backend) Answer {
+	t.Helper()
+
+	return truncatedCopy(t, be)
 }
