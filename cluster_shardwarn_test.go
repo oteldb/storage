@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 )
 
 const singleShardMsg = "cluster is running one shard per tenant: writes cannot spread"
@@ -22,7 +23,7 @@ const singleShardMsg = "cluster is running one shard per tenant: writes cannot s
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestSingleShardWarning(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	core, logs := observer.New(zap.WarnLevel)
@@ -58,7 +59,7 @@ func TestSingleShardWarning(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestSingleShardWarningSilentOnOneNode(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	core, logs := observer.New(zap.WarnLevel)
 	s := openClusterNodeWith(t, endpoint, "solo", backend.Memory(), WithLogger(zap.New(core)))
@@ -74,7 +75,7 @@ func TestSingleShardWarningSilentOnOneNode(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestSingleShardWarningSilentWhenSharded(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	core, logs := observer.New(zap.WarnLevel)
 

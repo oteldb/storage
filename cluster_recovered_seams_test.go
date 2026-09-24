@@ -13,6 +13,7 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/cluster"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/signal"
 )
@@ -51,7 +52,7 @@ func newRecoveredPair(t *testing.T) *recoveredPair {
 	t.Helper()
 
 	p := &recoveredPair{
-		endpoint: startEtcd(t),
+		endpoint: etcdtest.Start(t),
 		dirs:     map[string]string{"node-a": t.TempDir(), "node-b": t.TempDir()},
 		nodes:    make(map[string]*Storage, 2),
 	}

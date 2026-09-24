@@ -4,63 +4,19 @@ import (
 	"context"
 	"net"
 	"net/http"
-	"net/url"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/server/v3/embed"
 
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/cluster/router"
 	"github.com/oteldb/storage/signal"
 )
-
-const httpScheme = "http"
-
-func freeAddr(t *testing.T) string {
-	t.Helper()
-
-	var lc net.ListenConfig
-
-	l, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer func() { _ = l.Close() }()
-
-	return l.Addr().String()
-}
-
-// startEtcd runs an embedded etcd for the test and returns its client endpoint.
-func startEtcd(t *testing.T) string {
-	t.Helper()
-
-	lc := url.URL{Scheme: httpScheme, Host: freeAddr(t)}
-	lp := url.URL{Scheme: httpScheme, Host: freeAddr(t)}
-
-	cfg := embed.NewConfig()
-	cfg.Dir = t.TempDir()
-	cfg.LogLevel = "error"
-	cfg.ListenClientUrls = []url.URL{lc}
-	cfg.AdvertiseClientUrls = []url.URL{lc}
-	cfg.ListenPeerUrls = []url.URL{lp}
-	cfg.AdvertisePeerUrls = []url.URL{lp}
-	cfg.InitialCluster = cfg.Name + "=" + lp.String()
-
-	e, err := embed.StartEtcd(cfg)
-	require.NoError(t, err)
-	t.Cleanup(e.Close)
-
-	select {
-	case <-e.Server.ReadyNotify():
-	case <-time.After(30 * time.Second):
-		t.Fatal("embedded etcd did not become ready")
-	}
-
-	return lc.String()
-}
 
 // joinNode registers a member the way a storage node does, so the router resolves against a real
 // membership rather than a hand-built ring.
@@ -85,7 +41,7 @@ func joinNode(t *testing.T, endpoint, root, id, addr string) {
 func TestRouterCloseReportsSuccess(t *testing.T) {
 	const root = "/test"
 
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	joinNode(t, endpoint, root, "node-a", "10.0.0.1:9000")
 
 	r, err := router.Open(t.Context(), router.Config{
@@ -101,7 +57,7 @@ func TestRouterResolvesPlacement(t *testing.T) {
 
 	const root = "/test"
 
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	for _, n := range []struct{ id, addr string }{
 		{"node-a", "10.0.0.1:9000"},
 		{"node-b", "10.0.0.2:9000"},
@@ -145,7 +101,7 @@ func TestRouterShardKeysMatchClusterDerivation(t *testing.T) {
 		shards = 8
 	)
 
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	joinNode(t, endpoint, root, "node-a", "10.0.0.1:9000")
 
 	r, err := router.Open(t.Context(), router.Config{
@@ -187,19 +143,19 @@ func TestRouterPrimaryWrite(t *testing.T) {
 			return cluster.Reject{OOO: 2}, nil
 		}))
 
-	addr := freeAddr(t)
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-
 	var lc net.ListenConfig
 
-	ln, err := lc.Listen(t.Context(), "tcp", addr)
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
+
+	addr := ln.Addr().String()
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	go func() { _ = srv.Serve(ln) }()
 
 	t.Cleanup(func() { _ = srv.Close() })
 
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	joinNode(t, endpoint, root, "node-a", addr)
 
 	r, err := router.Open(t.Context(), router.Config{Etcd: []string{endpoint}, Root: root, RF: 1})
@@ -219,7 +175,7 @@ func TestRouterPrimaryWrite(t *testing.T) {
 func TestRouterPrimaryWriteFailsOnEmptyRing(t *testing.T) {
 	t.Parallel()
 
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	r, err := router.Open(t.Context(), router.Config{Etcd: []string{endpoint}, Root: "/test"})
 	require.NoError(t, err)

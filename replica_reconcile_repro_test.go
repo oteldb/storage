@@ -9,6 +9,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -30,7 +31,7 @@ func (c *readPolicyCluster) readIndex(t *testing.T, id, indexKey string) []byte 
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestRepro551ReplicaLossUnderStableOwnerIndex(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	c := newReadPolicyCluster(t, endpoint)

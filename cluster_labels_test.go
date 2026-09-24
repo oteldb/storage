@@ -15,6 +15,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/cluster"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
@@ -119,7 +120,7 @@ func eqMatcher(name, value string) fetch.Matcher {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredLabelsUnionAcrossShards(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	const shards = 4
 
@@ -145,7 +146,7 @@ func TestClusteredLabelsUnionAcrossShards(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredLabelsFailOverFromShardlessOwner(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	const shards = 4
 
@@ -176,7 +177,7 @@ func TestClusteredLabelsTakeIndexRoute(t *testing.T) {
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 	t.Cleanup(func() { otel.SetTextMapPropagator(prev) })
 
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	ids := []string{"node-a", "node-b", "node-c"}
 	recByID := make(map[string]*tracetest.SpanRecorder, len(ids))
@@ -237,7 +238,7 @@ func TestClusteredLabelsTakeIndexRoute(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterLabelsRecordSignalUnsupported(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := t.Context()
 
 	nodes := map[string]*Storage{
@@ -273,7 +274,7 @@ func TestClusterLabelsRecordSignalUnsupported(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterLabelsRejectsUnpushableMatcher(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	nodes := map[string]*Storage{"node-a": openClusterNode(t, endpoint, "node-a")}
 	awaitMembership(t, nodes)

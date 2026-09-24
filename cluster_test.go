@@ -2,22 +2,19 @@ package storage
 
 import (
 	"context"
-	"net"
-	"net/url"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/server/v3/embed"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/s3/s3test"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	qprofile "github.com/oteldb/storage/query/profile"
@@ -27,86 +24,6 @@ import (
 	"github.com/oteldb/storage/signal/profile"
 	"github.com/oteldb/storage/tenant"
 )
-
-// freeAddr returns a free localhost host:port for the embedded etcd's advertise URLs (etcd
-// needs concrete URLs up front, unlike the cluster nodes, which bind ":0" and advertise the
-// listener's actual port). Probe-then-rebind is racy in principle; etcd is the only remaining
-// user, two ports per test.
-func freeAddr(t *testing.T) string {
-	t.Helper()
-
-	var lc net.ListenConfig
-
-	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr := l.Addr().String()
-	require.NoError(t, l.Close())
-
-	return addr
-}
-
-// etcdStartAttempts bounds startEtcd's retries. freeAddr can only reserve a port by closing its
-// listener, so between that close and etcd's own bind another test — or a socket still in
-// TIME_WAIT — can take it, and the whole suite fails on "address already in use". Retrying with
-// fresh ports costs nothing when the first attempt works.
-const etcdStartAttempts = 5
-
-// startEtcd boots an in-process single-node etcd and returns its client endpoint URL, retrying on
-// a port collision (see [etcdStartAttempts]).
-func startEtcd(t *testing.T) string {
-	t.Helper()
-
-	var err error
-
-	for range etcdStartAttempts {
-		var endpoint string
-
-		if endpoint, err = tryStartEtcd(t); err == nil {
-			return endpoint
-		}
-
-		t.Logf("embedded etcd failed to start, retrying with fresh ports: %v", err)
-	}
-
-	require.NoError(t, err, "embedded etcd did not start in %d attempts", etcdStartAttempts)
-
-	return ""
-}
-
-// tryStartEtcd is one startEtcd attempt: it registers the shutdown only once the server is up, so a
-// failed attempt leaves nothing behind.
-func tryStartEtcd(t *testing.T) (string, error) {
-	t.Helper()
-
-	lc := url.URL{Scheme: httpScheme, Host: freeAddr(t)}
-	lp := url.URL{Scheme: httpScheme, Host: freeAddr(t)}
-
-	cfg := embed.NewConfig()
-	cfg.Dir = t.TempDir()
-	cfg.LogLevel = "error"
-	cfg.ListenClientUrls = []url.URL{lc}
-	cfg.AdvertiseClientUrls = []url.URL{lc}
-	cfg.ListenPeerUrls = []url.URL{lp}
-	cfg.AdvertisePeerUrls = []url.URL{lp}
-	cfg.InitialCluster = cfg.Name + "=" + lp.String()
-
-	e, err := embed.StartEtcd(cfg)
-	if err != nil {
-		return "", err
-	}
-
-	select {
-	case <-e.Server.ReadyNotify():
-	case <-time.After(30 * time.Second):
-		e.Close()
-
-		return "", errors.New("embedded etcd did not become ready")
-	}
-
-	t.Cleanup(e.Close)
-
-	return lc.String(), nil
-}
 
 func openClusterNode(t *testing.T, endpoint, id string) *Storage {
 	t.Helper()
@@ -206,7 +123,7 @@ func awaitMembership(t *testing.T, nodes map[string]*Storage) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterPerSeriesShardingSpreadsAndGathers(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	const shards = 4
@@ -273,7 +190,7 @@ func TestClusterPerSeriesShardingSpreadsAndGathers(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterAggregateWindowGathersAcrossShards(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	const (
@@ -348,7 +265,7 @@ func TestClusterAggregateWindowGathersAcrossShards(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredStorageReplicatesAcrossNodes(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	a := openClusterNode(t, endpoint, "node-a")
@@ -383,7 +300,7 @@ func TestClusteredStorageReplicatesAcrossNodes(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterOnlyPrimaryCompacts(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{
@@ -434,7 +351,7 @@ func TestClusterOnlyPrimaryCompacts(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterReplicaTrimsHeadAfterOwnerFlush(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	newBackend := s3test.Shared(t, "oteldb")
 	ctx := context.Background()
 
@@ -492,7 +409,7 @@ func TestClusterReplicaTrimsHeadAfterOwnerFlush(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredLogsReplicateAndRead(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{
@@ -520,7 +437,7 @@ func TestClusteredLogsReplicateAndRead(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredTracesReplicateAndRead(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{
@@ -559,7 +476,7 @@ func TestClusteredTracesReplicateAndRead(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredProfilesReplicateAndRead(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{
@@ -614,7 +531,7 @@ func TestClusteredProfilesReplicateAndRead(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredLogsAccountForRejected(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	s := openClusterNodeWith(t, endpoint, "node-a", backend.Memory(), WithOOOWindow(50))
@@ -641,7 +558,7 @@ func TestClusteredLogsAccountForRejected(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterPrimaryAccountsForRejectedSamples(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	s := openClusterNodeWith(t, endpoint, "node-a", backend.Memory(), WithOOOWindow(50))
@@ -669,7 +586,7 @@ func TestClusterPrimaryAccountsForRejectedSamples(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterPrimaryAppliesCardinalityLimit(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	s := openClusterNodeWith(t, endpoint, "node-a", backend.Memory(),
@@ -699,7 +616,7 @@ func TestClusterPrimaryAppliesCardinalityLimit(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredReadFansOutToOwners(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{
@@ -766,7 +683,7 @@ func TestClusteredReadFansOutToOwners(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredLogEnumerationFansOut(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{
@@ -828,7 +745,7 @@ func TestClusteredLogEnumerationFansOut(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestInspectClusterSection(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	s := openClusterNodeShared(t, endpoint, "node-a")
@@ -858,7 +775,7 @@ func TestInspectClusterSection(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestAdminCompactOwnershipGate(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{
@@ -893,7 +810,7 @@ func TestAdminCompactOwnershipGate(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredRecordShardingGathersAllStreams(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	const shards = 4
@@ -929,7 +846,7 @@ func TestClusteredRecordShardingGathersAllStreams(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredRecordShardingEnumeratesAcrossShards(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	const shards = 4
@@ -980,7 +897,7 @@ func TestClusteredRecordShardingEnumeratesAcrossShards(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredShardedTraceByID(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	const shards = 4
@@ -1020,7 +937,7 @@ func TestClusteredShardedTraceByID(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredShardedProfileResolver(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	const shards = 4
@@ -1064,7 +981,7 @@ func TestClusteredShardedProfileResolver(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterReadFailsOverFromShardlessOwner(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	const shards = 4
@@ -1128,7 +1045,7 @@ func TestShardHelpers(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterExplainAnalyzeRemote(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{
@@ -1189,7 +1106,7 @@ func TestClusterExplainAnalyzeRemote(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterPerTenantRF(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	// Every tenant resolves to RF=3 (the "gold" durability tier); the cluster default stays 2.
@@ -1236,7 +1153,7 @@ func TestClusterPerTenantRF(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterRFDefaultsWithoutPolicy(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	s := openClusterNode(t, endpoint, "node-a") // cluster.Config.RF = 2, no Tenancy
 	require.Equal(t, 2, s.rfFor("default"), "zero durability policy falls back to cluster RF")
@@ -1267,7 +1184,7 @@ func openClusterNodePrivate(t *testing.T, endpoint, id string, rf int) *Storage 
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterSharedNothingReplicatesParts(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{
@@ -1336,7 +1253,7 @@ func TestClusterSharedNothingReplicatesParts(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterSharedNothingSurvivesNodeLoss(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{
@@ -1401,7 +1318,7 @@ func TestClusterSharedNothingSurvivesNodeLoss(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterSharedNothingReplicatesLogParts(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{
@@ -1472,7 +1389,7 @@ func TestSplitEnginePrefix(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterSharedNothingPushNotify(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{
@@ -1522,7 +1439,7 @@ func TestClusterSharedNothingPushNotify(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusteredReadFanOutKeepsScaleFactors(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{

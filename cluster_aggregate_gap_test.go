@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -52,7 +53,7 @@ func dropProfileEngine(t *testing.T, s *Storage, shard signal.TenantID) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestAggregateDoesNotDivergeAcrossCoordinators(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{
@@ -106,7 +107,7 @@ func TestAggregateDoesNotDivergeAcrossCoordinators(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestProfileSymbolsDoNotDivergeAcrossCoordinators(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{

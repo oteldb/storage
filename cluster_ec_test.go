@@ -15,6 +15,7 @@ import (
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/ec"
 	"github.com/oteldb/storage/cluster/etcd"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
@@ -114,7 +115,7 @@ func openClusterNodeECDomains(t *testing.T, endpoint, id string, domains []strin
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterECRackAwarePlacement(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	// Six nodes: 3 racks × 2 servers, one node (disk) each.
 	a := openClusterNodeECDomains(t, endpoint, "n1", []string{"rack1", "s1"}, 4, 2)
@@ -158,7 +159,7 @@ func TestClusterECRackAwarePlacement(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterECRackShortfallDetected(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	// Three nodes, all in one rack (different servers) — cannot be rack-safe for ec(2,1).
 	a := openClusterNodeECDomains(t, endpoint, "n1", []string{"rack1", "s1"}, 2, 1)
@@ -189,7 +190,7 @@ func TestClusterECRackShortfallDetected(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterECSingleNodeConvertsAndServes(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	// Enough distinct series that the flushed value column clears the 4 KiB shard floor.
@@ -227,7 +228,7 @@ func TestClusterECSingleNodeConvertsAndServes(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterECHotPartStaysFullCopy(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	s := openClusterNodeEC(t, endpoint, "node-a", 2, 1, time.Hour) // hot window: 1h
@@ -267,7 +268,7 @@ func TestClusterECHotPartStaysFullCopy(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestECSchemeForGating(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	// EC policy but shared backend (PrivateBackend false) ⇒ EC does not apply.
 	shared := openClusterNodeShared(t, endpoint, "node-a",
@@ -287,7 +288,7 @@ func TestECSchemeForGating(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterECSlotFiltering(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	// ec(2,1) over three racks: one shard per node, one node per rack.
@@ -400,7 +401,7 @@ func distinctSlots(t *testing.T, ctx context.Context, be backend.Backend) int {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterECShardRepair(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{

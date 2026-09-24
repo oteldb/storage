@@ -7,6 +7,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 )
 
 // TestClusterECRoutedWritePreservesValues is a regression test for the interaction between a
@@ -24,7 +26,7 @@ import (
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterECRoutedWritePreservesValues(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{

@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 )
 
 // eventually polls cond until it holds, so a watch-driven assertion does not depend on timing.
@@ -19,7 +21,7 @@ func TestWatchSeesMembersWithoutJoining(t *testing.T) {
 	t.Parallel()
 
 	ctx := t.Context()
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 
 	joined, err := Join(ctx, client, "/test", Member{ID: "node-a", Zone: "z1", Addr: "10.0.0.1:9000"}, 0)
 	require.NoError(t, err)
@@ -53,7 +55,7 @@ func TestWatchCloseRevokesNothing(t *testing.T) {
 	t.Parallel()
 
 	ctx := t.Context()
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 
 	joined, err := Join(ctx, client, "/test", Member{ID: "node-a", Addr: "10.0.0.1:9000"}, 0)
 	require.NoError(t, err)
@@ -73,7 +75,7 @@ func TestWatchOnEmptyClusterIsUsable(t *testing.T) {
 	t.Parallel()
 
 	ctx := t.Context()
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 
 	obs, err := Watch(ctx, client, "/test")
 	require.NoError(t, err)

@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 )
 
 // claimLease returns the lease a shard's claim key is bound to, and whether the key exists.
@@ -35,7 +37,7 @@ func claimLease(t *testing.T, client *clientv3.Client, shard string) (clientv3.L
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestOwnershipRestartRebindsClaimToLiveLease(t *testing.T) {
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 	ctx := context.Background()
 
 	dead, err := client.Grant(ctx, 30)
@@ -100,7 +102,7 @@ func TestOwnershipRestartRebindsClaimToLiveLease(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestOwnershipRestartAdoptionAdvancesTerm(t *testing.T) {
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 	ctx := context.Background()
 
 	dead, err := client.Grant(ctx, 30)
@@ -134,7 +136,7 @@ func TestOwnershipRestartAdoptionAdvancesTerm(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestOwnershipRestartDoesNotStealPeerClaim(t *testing.T) {
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 	ctx := context.Background()
 
 	b := ownerOn(t, client, "b")

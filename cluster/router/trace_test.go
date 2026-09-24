@@ -10,6 +10,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/cluster/router"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -26,7 +27,7 @@ func openRouterTraced(t *testing.T, rec *tracetest.SpanRecorder, peers ...*peer)
 
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
 
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	for i, p := range peers {
 		joinNode(t, endpoint, root, "node-"+string(rune('a'+i)), p.serve(t))
 	}

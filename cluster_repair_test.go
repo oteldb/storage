@@ -11,6 +11,7 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -38,7 +39,7 @@ func openRepairNode(t *testing.T, endpoint, id string, rf int) *Storage {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestRepairCompleteOwnerSetIsAbsence(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	a := openRepairNode(t, endpoint, "a", 2)
@@ -65,7 +66,7 @@ func TestRepairCompleteOwnerSetIsAbsence(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestRepairShortOwnerSetIsIncomplete(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	a := openRepairNode(t, endpoint, "a", 3)
@@ -92,7 +93,7 @@ func TestRepairShortOwnerSetIsIncomplete(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestRepairSingleOwnerShardIsComplete(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	a := openRepairNode(t, endpoint, "solo", 1)

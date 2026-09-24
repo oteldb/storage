@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 )
 
 // compactPast advances the store past rev and compacts, so a watch starting at rev is canceled
@@ -40,7 +42,7 @@ func currentRev(ctx context.Context, t *testing.T, client *clientv3.Client) int6
 
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestConsumeReportsCancellation(t *testing.T) {
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 	ctx := context.Background()
 
 	m := &Membership{client: client, prefix: "/oteldb/members/", members: map[string]Member{}}
@@ -58,7 +60,7 @@ func TestConsumeReportsCancellation(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestWatchResubscribesAfterCancellation(t *testing.T) {
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 	ctx := context.Background()
 
 	stale := currentRev(ctx, t, client)
@@ -99,7 +101,7 @@ func TestWatchResubscribesAfterCancellation(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestResyncSignalsSelfAbsence(t *testing.T) {
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 	ctx := context.Background()
 
 	m := &Membership{
@@ -142,7 +144,7 @@ func TestResyncSignalsSelfAbsence(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestObserverCheckSelfIsNoop(t *testing.T) {
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 
 	m := &Membership{client: client, prefix: "/oteldb/members/", members: map[string]Member{}}
 	m.checkSelf() // Must not panic on the nil channel.

@@ -72,6 +72,12 @@ therefore drops such a key under a value+lease guard and recreates it under the 
 also makes the restart a real new tenure: the recreated claim takes a higher term, so the
 incarnation's writes outrank the dead one's.
 
+Tests boot etcd through **`cluster/etcd/etcdtest`**, which binds its listeners to port 0 and reads
+the client port back from the socket. Probing a free port and releasing it for etcd to bind is
+racy: anything, including etcd clients' own ephemeral ports, can take it in between. Only
+`Server.Restart` rebinds a known port, since clients must find etcd where it was. `etcdtest` must
+not import `cluster/etcd`, whose internal tests use it.
+
 ### Lease fencing — the boundary on acting as primary
 
 A node that stops renewing its lease keeps a ring frozen at its last etcd view, so it goes on

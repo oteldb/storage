@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
 )
@@ -19,7 +20,7 @@ import (
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterAdmissionStatsTallied(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	// MaxSeries is enforced per engine by the primary, so one metric series and one log stream both
