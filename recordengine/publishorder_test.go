@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/wal"
 )
@@ -20,7 +21,7 @@ func TestPublishWritesIdentityBeforeCommit(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectWrites{Backend: backend.Memory(), only: "/identity"}
+	be := faultbackend.Wrap(backend.Memory())
 	walDir := t.TempDir()
 
 	w, err := wal.Create(walDir, 0)
@@ -32,9 +33,9 @@ func TestPublishWritesIdentityBeforeCommit(t *testing.T) {
 	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "stranded"}))
 	require.NoError(t, w.Sync())
 
-	be.armed.Store(true)
+	rejectWrites(be, "/identity", errWriteRejected)
 	require.Error(t, e.Flush(ctx), "flush must fail while the part's identities cannot be written")
-	be.armed.Store(false)
+	be.Reset()
 
 	// Restart: recover the part set and watermark from the bucket index, then replay the WAL.
 	w2, err := wal.Create(walDir, 0)

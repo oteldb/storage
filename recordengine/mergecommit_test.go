@@ -2,44 +2,14 @@ package recordengine_test
 
 import (
 	"context"
-	"strings"
-	"sync/atomic"
 	"testing"
 
-	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/backend/faultbackend"
 )
-
-// rejectIndexWrites wraps a backend and fails only the bucket index write while armed: a merge that
-// writes its compacted part fine but cannot commit the part set.
-type rejectIndexWrites struct {
-	backend.Backend
-
-	armed atomic.Bool
-}
-
-func (r *rejectIndexWrites) Write(ctx context.Context, key string, data []byte) error {
-	if r.armed.Load() && strings.HasSuffix(key, "/"+bucketindex.Object) {
-		return errors.New("injected write failure")
-	}
-
-	return r.Backend.Write(ctx, key, data)
-}
-
-// CompareAndSwap is the path the index commit actually takes; failing only Write would leave the
-// commit untouched.
-func (r *rejectIndexWrites) CompareAndSwap(
-	ctx context.Context, key string, expected backend.Version, data []byte,
-) (backend.Version, bool, error) {
-	if r.armed.Load() && strings.HasSuffix(key, "/"+bucketindex.Object) {
-		return backend.VersionAbsent, false, errors.New("injected write failure")
-	}
-
-	return r.Backend.CompareAndSwap(ctx, key, expected, data)
-}
 
 // TestMergeIndexCommitFailureKeepsSources verifies a merge whose index commit fails does not retire
 // its source parts: the persisted index still names them, so reclaim must not delete their objects —
@@ -48,7 +18,7 @@ func TestMergeIndexCommitFailureKeepsSources(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectIndexWrites{Backend: backend.Memory()}
+	be := faultbackend.Wrap(backend.Memory())
 	e := newEngine(t, be)
 
 	// Two parts, so a merge has something to compact.
@@ -60,9 +30,9 @@ func TestMergeIndexCommitFailureKeepsSources(t *testing.T) {
 
 	// The compacted part is written, but the index commit fails: the merge must roll back to the
 	// committed part set instead of publishing one that is not durable.
-	be.armed.Store(true)
+	rejectWrites(be, "/"+bucketindex.Object, errWriteRejected)
 	require.Error(t, e.Merge(ctx, 0))
-	be.armed.Store(false)
+	be.Reset()
 
 	require.Equal(t, 2, e.PartCount(), "the uncommitted merge output must not be observable as published")
 	require.Equal(t, []string{"p1", "p2"}, streamBodies(t, e), "the source parts stay readable")

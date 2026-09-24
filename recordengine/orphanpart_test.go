@@ -3,7 +3,6 @@ package recordengine_test
 import (
 	"context"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/go-faster/errors"
@@ -11,24 +10,20 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/backendtest"
+	"github.com/oteldb/storage/backend/faultbackend"
 )
 
-// rejectReads wraps a backend and fails Read for keys with a given suffix while armed. It aborts a
-// flush *after* the part's objects are fully written (at the openPart read-back), which is what
-// leaves an orphan part behind.
-type rejectReads struct {
-	backend.Backend
+var errReadRejected = errors.New("injected read failure")
 
-	armed atomic.Bool
-	only  string
-}
-
-func (r *rejectReads) Read(ctx context.Context, key string) ([]byte, error) {
-	if r.armed.Load() && strings.HasSuffix(key, r.only) {
-		return nil, errors.New("injected read failure")
-	}
-
-	return r.Backend.Read(ctx, key)
+// rejectReads fails every Read of a key ending in suffix with err. On "/manifest" it aborts a flush
+// *after* the part's objects are fully written (at the openPart read-back), which is what leaves an
+// orphan part behind.
+func rejectReads(be *faultbackend.Backend, suffix string, err error) {
+	be.Add(faultbackend.Rule{
+		Kind:  faultbackend.Read,
+		Match: func(op faultbackend.Op) bool { return strings.HasSuffix(op.Key, suffix) },
+		Err:   err,
+	})
 }
 
 // partObjects returns the backend keys under the engine prefix that belong to the part with the given
@@ -50,15 +45,15 @@ func TestFailedFlushBurnsPartID(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectReads{Backend: backend.Memory(), only: "/manifest"}
+	be := faultbackend.Wrap(backend.Memory())
 	e := newEngine(t, be)
 
 	// Attempt 1: the part's objects (columns, blooms, keys.bin) are written; the openPart read-back
 	// fails, so it is never published and its objects are orphaned under its id.
 	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "orphan", attr: [2]string{"http.method", "GET"}}))
-	be.armed.Store(true)
+	rejectReads(be, "/manifest", errReadRejected)
 	require.Error(t, e.Flush(ctx))
-	be.armed.Store(false)
+	be.Reset()
 
 	orphans := backendtest.PartDirs(ctx, t, be, enginePrefix)
 	require.Len(t, orphans, 1)
@@ -81,13 +76,13 @@ func TestLoadPartsSweepsOrphanParts(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectReads{Backend: backend.Memory(), only: "/manifest"}
+	be := faultbackend.Wrap(backend.Memory())
 	e := newEngine(t, be)
 
 	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "orphan", attr: [2]string{"http.method", "GET"}}))
-	be.armed.Store(true)
+	rejectReads(be, "/manifest", errReadRejected)
 	require.Error(t, e.Flush(ctx))
-	be.armed.Store(false)
+	be.Reset()
 
 	orphans := backendtest.PartDirs(ctx, t, be, enginePrefix)
 	require.Len(t, orphans, 1)
@@ -137,13 +132,13 @@ func TestRefreshReplicaKeepsUncommittedParts(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	be := &rejectReads{Backend: backend.Memory(), only: "/manifest"}
+	be := faultbackend.Wrap(backend.Memory())
 	e := newEngine(t, be)
 
 	ingest(t, e, mkBatch("api", rrec{ts: 100, body: "uncommitted"}))
-	be.armed.Store(true)
+	rejectReads(be, "/manifest", errReadRejected)
 	require.Error(t, e.Flush(ctx))
-	be.armed.Store(false)
+	be.Reset()
 
 	replica := newEngine(t, be)
 	require.NoError(t, replica.RefreshReplica(ctx))

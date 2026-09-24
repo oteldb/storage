@@ -12,6 +12,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/backendtest"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
@@ -67,20 +68,8 @@ func TestPartIdentityMergedPartCarriesUnion(t *testing.T) {
 	assert.EqualValues(t, 3, fresh.Stats().Streams, "the merged part carries every input identity")
 }
 
-// sizeKeyWrite sums the bytes written to keys ending in suffix.
-type sizeKeyWrite struct {
-	backend.Backend
-
-	suffix string
-	bytes  int
-}
-
-func (c *sizeKeyWrite) Write(ctx context.Context, key string, data []byte) error {
-	if strings.HasSuffix(key, c.suffix) {
-		c.bytes += len(data)
-	}
-
-	return c.Backend.Write(ctx, key, data)
+func identityWrite(op faultbackend.Op) bool {
+	return op.Kind == faultbackend.Write && strings.HasSuffix(op.Key, "/identity")
 }
 
 // TestPartIdentityWriteAmplification: a flush persists the identities it wrote, not every stream
@@ -92,7 +81,7 @@ func TestPartIdentityWriteAmplification(t *testing.T) {
 	const seed = 2_000
 
 	ctx := context.Background()
-	be := &sizeKeyWrite{Backend: backend.Memory(), suffix: "/identity"}
+	be := faultbackend.Wrap(backend.Memory())
 	e := recordengine.New(recordengine.Config{Schema: testSchema, Backend: be, Prefix: "t/recs"})
 
 	for i := range seed {
@@ -101,13 +90,13 @@ func TestPartIdentityWriteAmplification(t *testing.T) {
 
 	require.NoError(t, e.Flush(ctx))
 
-	first := be.bytes
+	first := be.Bytes(identityWrite)
 	require.Positive(t, first)
 
 	ingest(t, e, mkBatch("svc-new", rrec{ts: 200, body: "x"}))
 	require.NoError(t, e.Flush(ctx))
 
-	second := be.bytes - first
+	second := be.Bytes(identityWrite) - first
 	t.Logf("identity bytes: first flush (%d streams) %d B (%.1f B/stream), second flush (1 stream) %d B",
 		seed, first, float64(first)/seed, second)
 
