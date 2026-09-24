@@ -71,6 +71,10 @@ func (e metricEngine) AttrNames(t *testing.T) []string {
 	return names
 }
 
+func (e metricEngine) ForceMerge(ctx context.Context) error {
+	return e.MergeWith(ctx, engine.MergeOptions{Force: true})
+}
+
 func (e metricEngine) StreamCount() int { return e.SeriesCount() }
 
 func (e metricEngine) HeadRows() int { return e.HeadSampleCount() }

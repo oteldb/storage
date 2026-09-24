@@ -80,34 +80,3 @@ func refreshReplicaGonePartBecomesPendingWant(t *testing.T, k Kind) {
 	assert.Zero(t, replica.Stats().WantedParts, "the part coming back discharges the want")
 	assert.False(t, replica.WantOverlaps(gone.MinTime, gone.MaxTime))
 }
-
-// blockNumbersSurviveAnEmptiedShard pins that numbering never rewinds. Retention drops every part in
-// the shard, leaving tombstones that carry no blocks, and the next flush must still number above
-// what the shard has ever held.
-//
-// Identity has to be unique over a shard's whole life, not its current contents: numbering derived
-// from the live set hands a new part the identity an expired one had, at which point a stale peer's
-// old part satisfies a want for the new one and expired data is committed as a repair.
-func blockNumbersSurviveAnEmptiedShard(t *testing.T, k Kind) {
-	t.Helper()
-
-	ctx := context.Background()
-	be := backend.Memory()
-	e := k.open(t, be)
-
-	k.flushEach(t, e, be, api(100, 1), api(200, 2))
-
-	// Retention horizon past every row: both parts are dropped whole (tombstoned).
-	require.NoError(t, e.Merge(ctx, 1<<40))
-
-	ix := k.loadIndex(t, be)
-	require.Empty(t, ix.Entries)
-	require.EqualValues(t, 3, ix.NextBlock(), "the high-water mark outlives every part it numbered")
-
-	e.Append(t, api(1<<41, 1))
-	require.NoError(t, e.Flush(ctx))
-
-	ix = k.loadIndex(t, be)
-	require.Len(t, ix.Entries, 1)
-	require.Equal(t, bucketindex.Interval{Min: 3, Max: 3}, ix.Entries[0].Blocks, "block numbers are never reused within a shard")
-}

@@ -70,6 +70,10 @@ func (e recordEngine) AttrNames(*testing.T) []string {
 	return out
 }
 
+func (e recordEngine) ForceMerge(ctx context.Context) error {
+	return e.MergeWith(ctx, recordengine.MergeOptions{Force: true})
+}
+
 func (e recordEngine) StreamCount() int { return int(e.Engine.Stats().Streams) }
 
 func (e recordEngine) HeadRows() int { return e.HeadRecordCount() }

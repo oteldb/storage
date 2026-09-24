@@ -75,6 +75,8 @@ type Store interface {
 	Read(ctx context.Context, stream string) ([]Row, error)
 	Flush(ctx context.Context) error
 	Merge(ctx context.Context, retainFrom int64) error
+	// ForceMerge merges every part into one, whatever the merge policy would pick.
+	ForceMerge(ctx context.Context) error
 	Reset(ctx context.Context) error
 	HeadBytes() int64
 }
@@ -198,7 +200,6 @@ var suite = []struct {
 	{"RepairConcurrentMergesFetchOnce", repairConcurrentMergesFetchOnce},
 	{"WantsPastBoundStayOwed", wantsPastBoundStayOwed},
 	{"RefreshReplicaGonePartBecomesPendingWant", refreshReplicaGonePartBecomesPendingWant},
-	{"BlockNumbersSurviveAnEmptiedShard", blockNumbersSurviveAnEmptiedShard},
 	{"RepairFetchesWantedPartFromPeer", repairFetchesWantedPartFromPeer},
 	{"RepairDischargedByContainingSuccessor", repairDischargedByContainingSuccessor},
 	{"RepairDischargedByLocalPart", repairDischargedByLocalPart},
@@ -221,6 +222,15 @@ var suite = []struct {
 	{"RefreshReplicaTrimsPerStream", refreshReplicaTrimsPerStream},
 	{"PromotedReplicaKeepsLateRow", promotedReplicaKeepsLateRow},
 	{"MidFlushAppendSurvivesCrash", midFlushAppendSurvivesCrash},
+	{"FlushAllocatesABlock", flushAllocatesABlock},
+	{"MergeUnionsItsInputs", mergeUnionsItsInputs},
+	{"MergedNeighboursDoNotDischargeAWant", mergedNeighboursDoNotDischargeAWant},
+	{"BlocksSurviveRestart", blocksSurviveRestart},
+	{"RebaseAllocatesAboveTheRival", rebaseAllocatesAboveTheRival},
+	{"OutstandingWantHoldsItsBlock", outstandingWantHoldsItsBlock},
+	{"PreV5PartsMigrateOnMerge", preV5PartsMigrateOnMerge},
+	{"MixedMergeInheritsTheKnownInputs", mixedMergeInheritsTheKnownInputs},
+	{"BlockNumbersSurviveAnEmptiedShard", blockNumbersSurviveAnEmptiedShard},
 }
 
 // Run runs every suite test against k, each as <test>/<k.Name>.

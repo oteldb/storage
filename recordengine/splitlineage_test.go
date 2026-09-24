@@ -32,6 +32,31 @@ const (
 // rewrites the part without emptying it.
 const retainFrom = 50
 
+// blocksByPrefix maps each entry's prefix to the block interval and level it carries.
+func blocksByPrefix(ix *bucketindex.Index) map[string]bucketindex.Entry {
+	out := make(map[string]bucketindex.Entry, len(ix.Entries))
+	for i := range ix.Entries {
+		out[ix.Entries[i].Prefix] = ix.Entries[i]
+	}
+
+	return out
+}
+
+// flushIDs flushes n one-record parts and returns their ids in flush order.
+func flushIDs(ctx context.Context, t *testing.T, e *recordengine.Engine, be backend.Backend, n int) []string {
+	t.Helper()
+
+	for i := range n {
+		ingest(t, e, mkBatch("api", rrec{ts: int64(100 * (i + 1)), body: "p" + string(rune('1'+i))}))
+		require.NoError(t, e.Flush(ctx))
+	}
+
+	ids := backendtest.PartDirs(ctx, t, be, enginePrefix)
+	require.Len(t, ids, n)
+
+	return ids
+}
+
 func splitLineageEngine(be backend.Backend, maxPartBytes int64, repair recordengine.PartFetcher) *recordengine.Engine {
 	return recordengine.New(recordengine.Config{
 		Schema: testSchema, Backend: be, Prefix: enginePrefix,
