@@ -608,8 +608,15 @@ rack/server/disk hierarchy; a scheme is rack-safe with at least `ceil(Shards/Par
   part-object read hits it — a surviving full copy is a zero-copy view, a converted object is
   reconstructed from valid Data shards (own slot locally, the rest from slot-owning peers).
   Writes/list/delete pass through, so flush, partsync and the converter see the plain layout.
-  A ranged or size read of a full copy forwards; a converted object has no ranged form and is
-  reconstructed whole, then sliced or measured.
+  A reconstruction gathers Data valid shards and decodes only missing data shards, so a read that
+  finds every data shard does no Reed-Solomon work.
+- **A converted object has no ranged form.** A ranged read of a full copy forwards, but one of a
+  converted object reconstructs it whole and slices, so the wrapper's `RangesNatively` denies it and
+  a merge's sequential scan reads it once instead of once per 1 MiB window (a 3.6 MiB column over
+  three sources: 6 reconstructions against 27). Serving the range from the covering data shards
+  alone would not help: a shard's checksum covers the whole shard, and the peer object endpoint
+  serves whole objects, so a verified read still fetches whole shards — per window, more bytes than
+  one reconstruction. `Size` answers a converted object from the sidecar without reading a shard.
 - **Writes stream as the inner backend does.** EC is not on the write path: a flush or merge writes
   full copies, so the wrapper forwards `CreateObject` and answers `StreamsWrites` for the raw backend,
   and the merge cap sizes against the disk the output really lands on. Encoding needs the whole

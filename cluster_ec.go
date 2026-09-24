@@ -150,6 +150,7 @@ var (
 	_ backend.Viewer         = (*ecBackend)(nil)
 	_ backend.ViewerAt       = (*ecBackend)(nil)
 	_ backend.ReaderAt       = (*ecBackend)(nil)
+	_ backend.RangeHinter    = (*ecBackend)(nil)
 	_ backend.Sizer          = (*ecBackend)(nil)
 	_ backend.DeferredSyncer = (*ecBackend)(nil)
 	_ backend.ObjectCreator  = (*ecBackend)(nil)
@@ -210,20 +211,27 @@ func (e *ecBackend) ReadViewAt(ctx context.Context, key string, off, n int64) ([
 	return e.reconstructRange(ctx, key, off, n)
 }
 
-// Size forwards the size probe of a full-copy object and measures a converted one by reconstructing
-// it. Implements [backend.Sizer].
+// RangesNatively denies a converted object: each ranged read of one reconstructs it whole, so a
+// sequential scan must read it once rather than once per window. Implements [backend.RangeHinter].
+func (e *ecBackend) RangesNatively(ctx context.Context, key string) bool {
+	if !backend.RangesNatively(ctx, e.inner, key) {
+		return false
+	}
+
+	_, err := backend.SizeOf(ctx, e.inner, key)
+
+	return err == nil
+}
+
+// Size forwards the size probe of a full-copy object and answers a converted one from its part's
+// sidecar. Implements [backend.Sizer].
 func (e *ecBackend) Size(ctx context.Context, key string) (int64, error) {
 	size, err := backend.SizeOf(ctx, e.inner, key)
 	if !errors.Is(err, backend.ErrNotExist) {
 		return size, err
 	}
 
-	data, err := e.reconstruct(ctx, key)
-	if err != nil {
-		return 0, err
-	}
-
-	return int64(len(data)), nil
+	return (&ec.Reader{Local: e.inner}).Size(ctx, key)
 }
 
 func (e *ecBackend) Write(ctx context.Context, key string, data []byte) error {

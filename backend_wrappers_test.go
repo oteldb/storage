@@ -58,6 +58,17 @@ var capabilityProbes = []struct {
 
 		return counted.Bytes() == 4
 	}},
+	{"RangeHinter", func(t *testing.T, wrap wrapFunc) bool {
+		t.Helper()
+
+		ctx := context.Background()
+		// An EC wrapper without the key's full copy has ReaderAt yet denies ranging it, so only a
+		// forwarded hint turns the answer false; the type check alone would say true.
+		denying := &ecBackend{inner: backend.Memory()}
+
+		return backend.RangesNatively(ctx, wrap(seeded(t, backend.Memory())), probeKey) &&
+			!backend.RangesNatively(ctx, wrap(denying), probeKey)
+	}},
 	{"Sizer", func(t *testing.T, wrap wrapFunc) bool {
 		t.Helper()
 
@@ -181,6 +192,7 @@ func assertFallbacks(t *testing.T, w backend.Backend) {
 
 	assert.False(t, backend.StreamsWrites(w), "StreamsWrites")
 	assert.False(t, backend.IsNodeLocal(w), "IsNodeLocal")
+	assert.False(t, backend.RangesNatively(ctx, w, probeKey), "RangesNatively")
 
 	_, err := backend.FreeSpace(ctx, w)
 	require.ErrorIs(t, err, backend.ErrSpaceUnknown)

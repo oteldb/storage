@@ -46,6 +46,19 @@ func TestMemoryDoesNotStream(t *testing.T) {
 	assert.True(t, backend.StreamsWrites(backendtest.NewStreamingMemory()))
 }
 
+func TestRangesNatively(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	bare := backendtest.WithoutCapabilities(backend.Memory())
+
+	assert.True(t, backend.RangesNatively(ctx, backend.Memory(), "k"))
+	assert.False(t, backend.RangesNatively(ctx, bare, "k"))
+	assert.True(t, backend.RangesNatively(ctx, backend.Cached(backend.Memory(), 1<<20), "k"))
+	assert.False(t, backend.RangesNatively(ctx, backend.Cached(bare, 1<<20), "k"),
+		"a cache over a whole-object store serves every ranged miss whole")
+}
+
 // TestCachedStreamedWriteInvalidates covers the coherence rule: a streamed object replaces the key,
 // so a value cached from the old one must not survive it.
 func TestCachedStreamedWriteInvalidates(t *testing.T) {

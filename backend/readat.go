@@ -48,6 +48,28 @@ func ReadAt(ctx context.Context, b Backend, key string, off, n int64) ([]byte, e
 	return clampRange(data, off, n), nil
 }
 
+// RangeHinter is the optional capability of a backend that ranges natively for some objects only.
+// [RangesNatively] asks it before falling back to the type check.
+type RangeHinter interface {
+	RangesNatively(ctx context.Context, key string) bool
+}
+
+// RangesNatively reports whether a ranged read of key costs about the range rather than the whole
+// object. A sequential scan asks it before reading ahead window by window, which over a
+// whole-object read would fetch the object once per window.
+func RangesNatively(ctx context.Context, b Backend, key string) bool {
+	if h, ok := b.(RangeHinter); ok {
+		return h.RangesNatively(ctx, key)
+	}
+
+	switch b.(type) {
+	case ReaderAt, ViewerAt:
+		return true
+	default:
+		return false
+	}
+}
+
 // ViewerAt is [ReaderAt]'s no-copy counterpart, the ranged form of [Viewer]: it returns the range as
 // a **read-only view** that may alias shared state instead of a caller-owned copy. The same contract
 // applies — never mutate it, and it stays valid indefinitely because a stored value is never mutated

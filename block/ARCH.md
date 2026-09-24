@@ -265,10 +265,11 @@ them. At S3 latencies that is the difference between a merge finishing and not.
 - A **frame is indivisible**: one larger than the window is served alone rather than refused, so the
   window is a target, not a cap on what a single fetch may hold.
 - A column the ranged path cannot serve is **read whole, once**: the legacy unframed layout, and any
-  column over a backend offering neither `backend.ReaderAt` nor `backend.ViewerAt`. There every ranged
-  read — the directory probe, each window — is itself a whole-object read, so a windowed walk would
-  read the column once per window. The check is by type, so a wrapper that claims `ReaderAt` over a
-  store that cannot range (an `s3.ObjectStore` without `RangeObjectStore`) still pays per window.
+  column object `backend.RangesNatively` denies. There every ranged read — the directory probe, each
+  window — is itself a whole-object read, so a windowed walk would read the column once per window.
+  The question is per object, not per backend: an EC tenant's backend ranges a hot full copy but not
+  a converted one, which it can only reconstruct whole. A backend without the `RangeHinter` answer is
+  judged by type, so an `s3.ObjectStore` without `RangeObjectStore` still pays per window.
 - `Decoder.TsCursor` / `Decoder.FloatCursor` are `ColumnReader`'s forward cursors over the decoder's
   frames, which is how the metrics merge reads its sources. The record merge decodes granules instead
   (`DecodeInt64Into`, `DecodeBytesBlock`), since it filters rows and remaps dictionaries per granule.

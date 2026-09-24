@@ -148,6 +148,28 @@ func TestReaderRejectsCorruptShards(t *testing.T) {
 	assert.Equal(t, objects["c/0"], got)
 }
 
+// TestReaderSizeFromSidecar: a sharded object's size comes from the sidecar with every shard gone.
+func TestReaderSizeFromSidecar(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	s := ec.Scheme{Data: 2, Parity: 1}
+	objects := testObjects(rand.New(rand.NewPCG(9, 10)))
+	nodes := buildECPart(t, s, objects)
+	require.NoError(t, nodes[0].Delete(ctx, ec.ShardKey(partPrefix, 0, "c/0")))
+
+	r := &ec.Reader{Local: nodes[0], Slot: 0}
+
+	size, err := r.Size(ctx, partPrefix+"/c/0")
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(objects["c/0"])), size)
+
+	_, err = r.Size(ctx, partPrefix+"/marks")
+	require.ErrorIs(t, err, backend.ErrNotExist, "a full-copy object is not in the sidecar")
+	_, err = r.Size(ctx, "default/metrics/01M0000000000000000000000B/c/0")
+	require.ErrorIs(t, err, backend.ErrNotExist)
+}
+
 func TestReaderPassthroughAndNotExist(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

@@ -498,9 +498,10 @@ func TestClusterECShardRepair(t *testing.T) {
 	}
 }
 
-// TestECBackendMergeOutputMatchesRaw pins the write side of the EC wrapper: it changes where a
-// part's bytes live, never what a merge writes. Each source is converted and loses this node's own
-// shard slot before the merge, so every sharded column is read back through parity reconstruction.
+// TestECBackendMergeOutputMatchesRaw pins what the EC wrapper may cost a merge: its output is
+// byte-identical to the same merge over a raw backend, and each sharded source object is
+// reconstructed at most once however many read-ahead windows its column spans. Each source is
+// converted and loses this node's own shard slot first, so every sharded read decodes parity.
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestECBackendMergeOutputMatchesRaw(t *testing.T) {
@@ -523,6 +524,8 @@ func TestECBackendMergeOutputMatchesRaw(t *testing.T) {
 	wrapped := &ecBackend{inner: disk, s: s, shardKey: "default", scheme: scheme}
 	require.True(t, backend.StreamsWrites(wrapped))
 
+	var columns, largest, merging int64
+
 	want := mergedDigest(t, raw, func(string) {})
 	got := mergedDigest(t, wrapped, func(prefix string) {
 		meta, err := ec.Convert(ctx, disk, prefix, scheme)
@@ -531,20 +534,47 @@ func TestECBackendMergeOutputMatchesRaw(t *testing.T) {
 
 		for _, o := range meta.Objects {
 			require.NoError(t, disk.Delete(ctx, ec.ShardKey(prefix, 0, o.Name)))
+
+			if strings.HasPrefix(o.Name, "c/") {
+				columns++
+			}
+			largest = max(largest, o.Size)
 		}
 
-		size, err := backend.SizeOf(ctx, wrapped, prefix+"/"+meta.Objects[0].Name)
+		converted := prefix + "/" + meta.Objects[0].Name
+		assert.False(t, backend.RangesNatively(ctx, wrapped, converted))
+
+		size, err := backend.SizeOf(ctx, wrapped, converted)
 		require.NoError(t, err)
 		require.Equal(t, meta.Objects[0].Size, size)
+
+		whole, err := wrapped.Read(ctx, converted)
+		require.NoError(t, err)
+
+		ranged, err := backend.ReadAt(ctx, wrapped, converted, 10, 20)
+		require.NoError(t, err)
+		require.Equal(t, whole[10:30], ranged)
+
+		ranged, err = backend.ReadViewAt(ctx, wrapped, converted, size-5, 100)
+		require.NoError(t, err)
+		require.Equal(t, whole[size-5:], ranged, "a range past the end is clamped")
 
 		_, err = backend.SizeOf(ctx, wrapped, prefix+"/absent")
 		require.ErrorIs(t, err, backend.ErrNotExist)
 		_, err = backend.ReadAt(ctx, wrapped, prefix+"/absent", 0, 1)
 		require.ErrorIs(t, err, backend.ErrNotExist)
+
+		merging = s.ecStats.reconstructs.Load()
 	})
 
 	assert.Equal(t, want, got)
-	assert.Positive(t, s.ecStats.reconstructs.Load(), "the merge read its sources through reconstruction")
+
+	reconstructs := s.ecStats.reconstructs.Load() - merging
+	t.Logf("sharded source columns %d, largest %d bytes, reconstructions during merge %d",
+		columns, largest, reconstructs)
+	require.Greater(t, largest, int64(3<<20), "a sharded column must span several read-ahead windows")
+	assert.Positive(t, reconstructs, "the merge read its sources through reconstruction")
+	assert.LessOrEqual(t, reconstructs, columns, "a sharded column is reconstructed at most once per merge")
 }
 
 // mergedDigest flushes a fixed corpus into three overlapping parts, hands each to beforeMerge, and
@@ -556,7 +586,7 @@ func mergedDigest(t *testing.T, b backend.Backend, beforeMerge func(prefix strin
 	e := engine.New(engine.Config{Backend: b, Prefix: "ec/metrics", MergeMemoryBytes: 1 << 30})
 	t.Cleanup(func() { require.NoError(t, e.Close(context.WithoutCancel(ctx))) })
 
-	const series, samples = 200, 64
+	const series, samples = 200, 2560
 
 	ser := make([]signal.Series, series)
 	for i := range ser {

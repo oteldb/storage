@@ -190,6 +190,12 @@ func (c *cachedBackend) ReadAt(ctx context.Context, key string, off, n int64) ([
 	return ReadAt(ctx, c.inner, key, off, n)
 }
 
+// RangesNatively answers for the inner backend, which serves every ranged miss. Implements
+// [RangeHinter].
+func (c *cachedBackend) RangesNatively(ctx context.Context, key string) bool {
+	return RangesNatively(ctx, c.inner, key)
+}
+
 // ReadViewAt is [cachedBackend.ReadAt] without the copy, under the [Viewer] contract: a resident
 // entry is never mutated in place, so a slice of one stays valid. Implements [ViewerAt].
 func (c *cachedBackend) ReadViewAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
