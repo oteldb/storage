@@ -2,7 +2,6 @@ package engine_test
 
 import (
 	"context"
-	"runtime"
 	"strconv"
 	"testing"
 
@@ -11,6 +10,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/heaptest"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -130,7 +130,7 @@ func BenchmarkFetchResident(b *testing.B) {
 
 	// Each consumer reads the iterator and returns the fold (so nothing is optimized away) plus the
 	// live heap measured *while it holds its working set*: mid-iteration for stream (one batch),
-	// after the drain for drain (every batch). liveHeap forces a GC, so what it reports is resident
+	// after the drain for drain (every batch). heaptest.Live forces a GC, so what it reports is resident
 	// data, not floating garbage — at the cost of making ns/op a lower bound only.
 	consumers := []struct {
 		name string
@@ -157,7 +157,7 @@ func BenchmarkFetchResident(b *testing.B) {
 
 				seen++
 				if seen == series/2 { // measure while a batch is in hand
-					live = liveHeap()
+					live = heaptest.Live()
 				}
 
 				batch.Release()
@@ -171,7 +171,7 @@ func BenchmarkFetchResident(b *testing.B) {
 				b.Fatal(err)
 			}
 
-			live := liveHeap()
+			live := heaptest.Live()
 
 			var sum float64
 
@@ -211,7 +211,7 @@ func BenchmarkFetchResident(b *testing.B) {
 						b.Fatal(err)
 					}
 
-					base := liveHeap()
+					base := heaptest.Live()
 					sum, live := c.read(b, it, s.series)
 
 					if live > base && live-base > peak {
@@ -231,14 +231,4 @@ func BenchmarkFetchResident(b *testing.B) {
 			})
 		}
 	}
-}
-
-// liveHeap is the heap that survives a collection — the resident set at this instant.
-func liveHeap() uint64 {
-	var ms runtime.MemStats
-
-	runtime.GC()
-	runtime.ReadMemStats(&ms)
-
-	return ms.HeapAlloc
 }

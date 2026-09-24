@@ -3,26 +3,19 @@ package storage
 import (
 	"context"
 	"net"
-	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-faster/errors"
-	fsserver "github.com/go-faster/fs/server"
-	"github.com/go-faster/fs/storagemem"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/server/v3/embed"
 
 	"github.com/oteldb/storage/backend"
-	"github.com/oteldb/storage/backend/backendtest"
-	"github.com/oteldb/storage/backend/s3"
+	"github.com/oteldb/storage/backend/s3/s3test"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
 	"github.com/oteldb/storage/engine"
@@ -349,26 +342,6 @@ func TestClusterAggregateWindowGathersAcrossShards(t *testing.T) {
 	}
 }
 
-// sharedS3 starts one in-process S3 server and returns a factory of backends over the same
-// bucket — so multiple cluster nodes share an object store (the object-store-native model).
-func sharedS3(t *testing.T) func() backend.Backend {
-	t.Helper()
-
-	store := storagemem.New()
-	require.NoError(t, store.CreateBucket(context.Background(), "oteldb"))
-	srv := httptest.NewServer(backendtest.AtomicConditionalPut(fsserver.NewHandler(store)))
-	t.Cleanup(srv.Close)
-
-	client := awss3.New(awss3.Options{
-		Region:       "us-east-1",
-		BaseEndpoint: aws.String(srv.URL),
-		UsePathStyle: true,
-		Credentials:  credentials.NewStaticCredentialsProvider("test", "test", ""),
-	})
-
-	return func() backend.Backend { return s3.New(s3.NewAWS(client, "oteldb"), "") }
-}
-
 // TestClusteredStorageReplicatesAcrossNodes is the M6 facade capstone: two clustered Storage
 // nodes share an etcd; a write to one is routed by the ring and replicated to both, so each
 // node serves it from its own engine.
@@ -462,7 +435,7 @@ func TestClusterOnlyPrimaryCompacts(t *testing.T) {
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterReplicaTrimsHeadAfterOwnerFlush(t *testing.T) {
 	endpoint := startEtcd(t)
-	newBackend := sharedS3(t)
+	newBackend := s3test.Shared(t, "oteldb")
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{

@@ -23,6 +23,22 @@ type durableBackend struct{ backend.Backend }
 
 func (durableBackend) IsEphemeral() bool { return false }
 
+// flushDefault flushes the default tenant's record engine for sig, reporting false when there is none.
+func flushDefault(tb testing.TB, s *Storage, sig signal.Signal) bool {
+	tb.Helper()
+
+	e, ok := s.lookupRecordEngine(sig, "default")
+	if !ok {
+		return false
+	}
+
+	if err := e.Flush(context.Background()); err != nil {
+		tb.Fatal(err)
+	}
+
+	return true
+}
+
 // gaugeBatch builds a one-gauge internal batch under resource service.name=service.
 func gaugeBatch(service, name string, ts []int64, values []float64) metric.Metrics {
 	var md metric.Metrics

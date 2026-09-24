@@ -70,8 +70,8 @@ type Config struct {
 	// re-materialize the whole dataset every cycle. 0 ⇒ unlimited (merge everything into one part;
 	// the legacy behavior, unbounded working set). The facade resolves it from the tenant policy.
 	MaxPartBytes int64
-	// MergeMemoryBytes is how much memory all concurrent merges together may hold. A merge holds its
-	// selected sources decoded plus the output buffer it is filling, so this bounds the merge cap
+	// MergeMemoryBytes is how much memory all concurrent merges together may hold. A merge holds a
+	// read-ahead window of each source column plus the output buffer it is filling, so this bounds the merge cap
 	// (see mergecap.go) independently of MaxPartBytes — a tiering target sized for the disk must not
 	// size a working set the process cannot hold. 0 ⇒ a share of the process memory budget
 	// (GOMEMLIMIT, else the cgroup limit, else host memory); negative ⇒ unbounded.
@@ -182,6 +182,9 @@ type Engine struct {
 	// head bytes, which the highest-ingest engines keep winning, so without this a quiet tenant
 	// could be declined every cycle while its part count grew.
 	mergeDeferred atomic.Bool
+	// mergeReadWindow is how much of each source column a merge reads ahead per request
+	// ([block.PartReader.ColumnScan]).
+	mergeReadWindow int64
 	// retiring holds parts removed from the live set by flush/merge, pending backend deletion once
 	// their in-flight fetch readers drain (deferred reclamation; see reclaim.go).
 	retiring []*part
@@ -322,7 +325,7 @@ func New(cfg Config) *Engine {
 		cfg.Signal = "record"
 	}
 
-	e := &Engine{cfg: cfg, head: newHead(cfg.Schema)}
+	e := &Engine{cfg: cfg, head: newHead(cfg.Schema), mergeReadWindow: defaultMergeReadWindow}
 	e.repairGate = make(chan struct{}, 1)
 	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
 	e.recycle = func(b *fetch.Batch) {

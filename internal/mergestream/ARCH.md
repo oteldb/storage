@@ -71,5 +71,6 @@ the same way:
 - `Keys` matches sort-and-dedup, under fuzz.
 
 An engine instantiates it by adapting its own ingest/merge/read to `Store`. The suite's `Backend`
-counts reads per key and injects the write failure; it embeds the `backend.Backend` *interface*, so
-it implements neither `Viewer` nor `Sizer` and every read funnels through `Read` where it is seen.
+(`backendtest.Counting`) counts reads per key and injects the write failure; it embeds the
+`backend.Backend` *interface*, so it implements neither `Viewer` nor `Sizer` and every read funnels
+through `Read` where it is seen.

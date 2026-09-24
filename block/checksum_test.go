@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/encoding/chunk"
 )
 
@@ -214,7 +215,7 @@ func TestFooterColumnCorruptionIsDetected(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	b := newStreamingMemory()
+	b := backendtest.NewStreamingMemory()
 	rows := gen(4, 64, func(r *rand.Rand, _, _ int) float64 { return r.Float64() }, 7)
 
 	rows.writeStreamTo(t, ctx, b, "p", false, WithSortKey("ts"), WithGranuleSize(8), WithCompressBlockBytes(64))
@@ -332,7 +333,7 @@ func TestVersion1PartStillReads(t *testing.T) {
 	}
 	v1.manifest = m.Encode(nil)
 
-	b := newStreamingMemory()
+	b := backendtest.NewStreamingMemory()
 	require.NoError(t, v1.write(ctx, b, "old"))
 
 	r, err := OpenPart(ctx, b, "old")

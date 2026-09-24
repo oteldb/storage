@@ -2,6 +2,7 @@ package engine_test
 
 import (
 	"context"
+	"strconv"
 	"testing"
 
 	"github.com/oteldb/storage/backend"
@@ -26,7 +27,7 @@ func BenchmarkRecentQuery(b *testing.B) {
 		ser := make([]signal.Series, series)
 		ids := make([]signal.SeriesID, series)
 		for i := range ser {
-			ser[i] = mkSeries("__name__", "cpu", "host", "h"+itoa(i))
+			ser[i] = mkSeries("__name__", "cpu", "host", "h"+strconv.Itoa(i))
 			ids[i] = ser[i].Hash()
 		}
 
@@ -59,23 +60,9 @@ func BenchmarkRecentQuery(b *testing.B) {
 
 			// `flushes` flushes, each appending `series` samples at an increasing ts — one part per
 			// flush, so a recent query overlaps all of them.
-			ts := make([]int64, series)
-			vals := make([]float64, series)
-
-			for f := range flushes {
-				for i := range series {
-					ts[i] = int64(f)*15 + int64(i)
-					vals[i] = float64(f*series + i)
-				}
-
-				if _, err := e.AppendBatch(ids, ts, vals, nil, func(i int) signal.Series { return ser[i] }, engine.AppendLimits{}); err != nil {
-					b.Fatal(err)
-				}
-
-				if err := e.Flush(ctx); err != nil {
-					b.Fatal(err)
-				}
-			}
+			flushCorpus(b, ctx, e, ser, ids, 1, flushes,
+				func(f, i, _ int) int64 { return int64(f)*15 + int64(i) },
+				func(f, i, _ int) float64 { return float64(f*series + i) })
 
 			req := fetch.Request{Start: 0, End: 1 << 62}
 
@@ -99,31 +86,4 @@ func BenchmarkRecentQuery(b *testing.B) {
 			}
 		})
 	}
-}
-
-func itoa(i int) string {
-	// small, allocation-light int→string for the bench corpus
-	if i == 0 {
-		return "0"
-	}
-
-	var buf [12]byte
-	pos := len(buf)
-	neg := i < 0
-	if neg {
-		i = -i
-	}
-
-	for i > 0 {
-		pos--
-		buf[pos] = byte('0' + i%10)
-		i /= 10
-	}
-
-	if neg {
-		pos--
-		buf[pos] = '-'
-	}
-
-	return string(buf[pos:])
 }

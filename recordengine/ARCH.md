@@ -66,8 +66,9 @@ cap = max( one flushed part,                              ← floor: retention m
 
 The metric engine has the same memory term, for the same reason: a cap sized against storage says
 nothing about what the process can hold. It is *decoded* bytes here, because that is what
-this merge holds — sources are decoded up front and the output accumulates decoded before it is
-encoded, hence dividing by three (sources + output buffer + the encode of it). Free space does not
+this merge holds — the output accumulates decoded before it is encoded. The divisor of three prices
+sources + output buffer + the encode of it, and it overstates the first term: sources are read
+through a read-ahead window per column (§ Merge read side), not held decoded. Free space does not
 enter; the flush cap and the tiering target bound the disk.
 
 The cap reaches the merge as `mergestream.Budget{ResidentBytes: cap}` — one type for both engines'
@@ -118,31 +119,45 @@ per-row form, so writing a part never materializes a view per row.
 **Every bulk accumulation is pre-sized.** A `byteCol` grown from nothing doubles its way to size,
 re-copying its blob ~log₂(size) times and leaving each intermediate for the collector — and merge
 accumulates a whole part's worth of bodies. So the flush buffer is sized from the head's tracked
-per-stream byte counts, and the merge output buffer from `decodedShape`: the sources' expanded blob
-per column (a walk over a dictionary's packed ids, touching no cell), scaled down to `capBytes` when
-the merge will emit more than one part. That buffer is then re-armed after each part rather than
-reallocated — the part is read back from the backend, so nothing outlives the write holding it.
+per-stream byte counts, and the merge output buffer from `mergeShape`: the sources' manifests — row
+counts, and per byte column the bytes its objects hold — scaled down to `capBytes` when the merge will
+emit more than one part. That reads no column, so it is exact only for a column whose object is its
+decoded size (a raw or near-unique column written uncompressed, the usual flat ones) and an
+undercount the blob grows past otherwise. A column that falls back to the flat carry mid-merge
+reserves the larger of that hint and its average cell size so far. The buffer is re-armed after each
+part rather than reallocated — the part is read back from the backend, so nothing outlives the write
+holding it.
 
 ### The merge carries byte columns as a dictionary and ids
 
-A merge never expands a byte column it was handed dictionary-encoded. It **unions the selected
-sources' dictionaries once**, before any row moves (`mergeDict`: entries distinct by value, plus a
-source-entry → union-id table per source part), and the accumulator then carries the column as ids
-into that union (`splitCol`) instead of copying cells into a blob. `writePart` hands `BytesDict` +
-`BytesIDs` straight to `block.Column`, which encodes it byte-identically to the blob form. So a merge
-copies no cell and re-hashes no row to rebuild a dictionary its sources already had: the union costs
-one hash probe per distinct entry per source part — a few thousand probes for a column of tens of
-millions of rows — where expanding cost one map probe and one blob copy per row, the engine's largest
-allocation site.
+A merge never expands a byte column it was handed dictionary-encoded. It **unions the sources'
+dictionaries** (`mergeDict`: entries distinct by value) and the accumulator carries the column as
+ids into that union (`splitCol`) instead of copying cells into a blob. `writePart` hands `BytesDict`
++ `BytesIDs` straight to `block.Column`, which encodes it byte-identically to the blob form. So a
+merge copies no cell and re-hashes no row to rebuild a dictionary its sources already had: resolving
+a source into the union costs one hash probe per distinct entry of a granule (per shared dictionary
+once), where expanding cost one map probe and one blob copy per row, the engine's largest allocation
+site.
 
-The union is unbounded: above 65536 entries the writer's per-granule renumbering still keeps the
-emitted id width bounded by a granule's distinct count.
+**The union is built as the sources are read**, since a streamed source's entries arrive a granule at
+a time: its order is first-seen, which is free to differ from any whole decode's because the writer
+renumbers per granule and emits the same object for any entry order. Entries a source owns for the
+whole merge — a shared dictionary, a column read whole — are kept as they are; a granule's own
+entries alias a frame the next granule overwrites, so they are copied into an arena
+(`TestMergeCopiesSelfGranuleEntries` is the shape that exposes an alias; the golden corpus does not).
+The lookup index lives only while a source can still add entries: a column whose sources were all
+read whole is resolved as they open and its index handed back before the next column takes one, which
+is why byte columns open column by column and why the index is taken on first use — one grown index
+serves every column in turn. Holding every column's index at once cost 21.7 MiB of a 62 MiB peak on
+`BenchmarkMergeCompact`'s near-unique log corpus, and taking one per column up front +14% B/op.
 
-**The decision is per column and made once.** A column takes this path only when *every* selected
-source decoded to a real dictionary and the schema's codec accepts the split form. One flat source —
-the >65536-distinct dictionary fallback, or a `CodecBytesRaw` column such as `trace_id`, both of
-which decode with `IDWidth 0` — leaves that column on the flat blob path for the whole merge; there
-is no entry table to union and synthesizing one would be the copy this avoids. A mixed set is the
+**The decision starts from the codec and can only fall back.** A column takes the split carry when
+the schema's codec accepts the split form: a `CodecBytesRaw` column such as `trace_id` has no
+dictionary to hand the writer and stays flat. A split column falls back to the flat carry for the
+rest of the merge (`mergeCarry.flatten` expands the ids both accumulators hold) when a source hands
+it no dictionary — a whole column or granule past 65536 distinct, decoded flat — or when the union
+passes 65536 entries per source, the most it holds while every source has a real dictionary. That
+bounds the union at the resident size the flat carry would have, not above it. A mixed set is the
 normal case: `body` and `attrs` carry ids while `trace_id` carries a blob, in the same accumulator.
 
 **Size accounting stays expanded.** `byteSize`/`rowBytes` are what seal an output part
@@ -163,13 +178,54 @@ requirement — the detached buffers stay fetchable through `e.flushing` while t
 the lock, so a concurrent fetch is reading them (§ Flush failure). An already-ordered stream, the
 common case, computes no permutation at all.
 
-**A merge searches a stream's window only in a part it has checked.** Both writers leave each stream's
-rows ts-ascending, and the retention merge binary-searches `[retainFrom, ∞)` on that order. Nothing
-checks it when a part opens, though, and on a part that broke it a search would skip in-window rows the
-merge then retires with the part. `readForMerge` already decodes the whole `ts` column, so it verifies
-the order per stream (`decodedPart.tsSorted`); a part that fails is merged row by row, logged, and
-counted as `corruption.detected{component="stream_order"}`, since its windowed fetches are already
-wrong.
+**A merge filters a stream's window row by row.** Both writers leave each stream's rows ts-ascending,
+but nothing checks it when a part opens, and on a part that broke it a binary search would skip
+in-window rows the merge then retires with the part. The forward cursor decodes each stream's `ts`
+anyway, so it keeps each row by its own timestamp and loses nothing; a stream found out of order is
+logged and counted as `corruption.detected{component="stream_order"}`, since the part's windowed
+fetches are already wrong. A part decoded whole checks the order up front (`decodedPart.tsSorted`) and
+binary-searches only where it holds.
+
+### Merge read side (`mergesource.go`)
+
+```
+source part ─ partCursor: ts, ints, bytes ┐   one granule per column,
+source part ─ partCursor: ts, ints, bytes ┼→  one window per column   → acc (one stream) → buf (one output part)
+source part ─ wholeSource (fallback)      ┘   (block.PartReader.ColumnScan)
+```
+
+Each source is a `mergeSource` the stream sweep asks for one stream's rows at a time. A `partCursor`
+opens every column through `block.PartReader.ColumnScan` with `defaultMergeReadWindow` (1 MiB)
+read-ahead and decodes one granule at a time (`Decoder.DecodeInt64Into`, `Decoder.DecodeBytesBlock`),
+so a source costs a window and a granule per column rather than its decoded columns. A constant column
+costs no read. A column with no granules is read whole: the pre-framing layout, and — a *current*
+layout — a dictionary column none of whose granules joined a shared dictionary, which the writer emits
+as one unframed stream. Near-unique log columns (`trace_id`, `span_id`, high-cardinality bodies) are
+often that shape, and the forward cursor cannot bound them; only the writer framing them can.
+
+**Forward is checked, not assumed.** `buildRanges` sorts the ranges of a part whose stream column
+arrived unsorted, so its sorted ids can point backwards through the rows. `forwardReadable` walks
+`p.ranges` once at open (`mergestream.CheckForward`); a part that fails is decoded whole
+(`readForMerge`, `wholeSource`) and counted as `stream_order` corruption. The cursor addresses granules
+by row, so a range stepping back would only cost it re-fetched frames; but it takes one range per
+stream, and an unsorted stream column can hold a stream in two runs, adjacent after the sort. So
+`forwardReadable` also requires strictly ascending ids, and the whole source appends *every* run — a
+lookup returning one of them loses the other's rows. A cursor serves a stream only when the sweep asks
+for its id, so one the sweep skipped would strand every later stream of the part; `checkDrained` fails
+the merge with `block.ErrCorrupt` before its last part is written rather than commit a part missing
+them.
+
+**What it holds, measured.** The output is still buffered, so the read side lowers the peak only where
+the sources were a term of it. `TestMergeResidentFlatInPartSize` (trace-shaped, file backend, output
+sealed at 4 MiB): growing the sources 8× (28.5 → 227.8 MiB decoded) moves the peak live heap from 20.4
+to 37.4 MiB, the growth being the windows filling to 1 MiB; decoding the sources whole moves it from
+21.4 to 130.1 MiB. A merge that writes one part holds that part decoded plus its encode, however it
+reads: 257 MiB against 292 MiB for the same 228 MiB of sources, sampled per stream as well. CPU moves
+by −6% on those parts (`BenchmarkMergeCompactTraces`) and within ±2% on `BenchmarkMergeCompact`'s log
+corpus, whose large columns are unframed and read whole either way. The merge unit is still **one whole
+stream** — `acc` gathers a stream across every source before it is sorted and sealed at a stream
+boundary — so a few long streams hold O(stream × sources), and the budget divisor above has not been
+re-derived for any of it.
 
 ## Flush failure
 

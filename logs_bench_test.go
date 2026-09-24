@@ -115,11 +115,7 @@ func BenchmarkLogTextSearch(b *testing.B) {
 
 		// Flush this round to its own part (no merge), so the store holds many parts and
 		// cross-part pruning is exercised.
-		if eng, ok := s.lookupLogEngine("default"); ok {
-			if err := eng.Flush(ctx); err != nil {
-				b.Fatal(err)
-			}
-		}
+		flushDefault(b, s, signal.Log)
 	}
 
 	req := func(c fetch.Condition, projection ...string) fetch.Request {
@@ -186,11 +182,7 @@ func logReadStore(b *testing.B) (*Storage, int64) {
 			b.Fatal(err)
 		}
 
-		if eng, ok := s.lookupLogEngine("default"); ok {
-			if err := eng.Flush(ctx); err != nil {
-				b.Fatal(err)
-			}
-		}
+		flushDefault(b, s, signal.Log)
 	}
 
 	return s, logical
@@ -362,11 +354,7 @@ func BenchmarkLogByTraceID(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		if eng, ok := s.lookupLogEngine("default"); ok {
-			if err := eng.Flush(ctx); err != nil {
-				b.Fatal(err)
-			}
-		}
+		flushDefault(b, s, signal.Log)
 	}
 
 	cases := []struct {

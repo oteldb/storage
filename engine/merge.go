@@ -245,7 +245,7 @@ type mergeResult struct {
 	deferred bool
 }
 
-// partsBytes sums the on-disk size of ps.
+// partsBytes sums the on-disk (encoded) size of ps. The record engine's namesake sums decoded bytes.
 func partsBytes(ps []*part) int64 {
 	var n int64
 	for _, p := range ps {

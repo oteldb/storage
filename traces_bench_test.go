@@ -126,11 +126,7 @@ func loadTraceStore(b *testing.B, services, tracesPerSvc, spansPerTrace, rounds 
 		}
 
 		// Flush each round to its own part (no merge) so cross-part pruning is exercised.
-		if eng, ok := s.lookupTraceEngine("default"); ok {
-			if err := eng.Flush(ctx); err != nil {
-				b.Fatal(err)
-			}
-		}
+		flushDefault(b, s, signal.Trace)
 	}
 
 	return s, logical

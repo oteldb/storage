@@ -242,9 +242,7 @@ func TestFacadeExemplarsSurviveFlush(t *testing.T) {
 	}))
 	require.NoError(t, err)
 
-	eng, ok := s.lookupExemplarEngine("default")
-	require.True(t, ok)
-	require.NoError(t, eng.Flush(ctx))
+	require.True(t, flushDefault(t, s, signal.Exemplar))
 
 	got, err := fetch.Drain(ctx, must(s.ExemplarFetcher("default").Fetch(ctx, fetch.Request{
 		Signal: signal.Exemplar, Start: 0, End: 1 << 60,
@@ -272,9 +270,7 @@ func TestExemplarsMatchableAfterReopen(t *testing.T) {
 	}))
 	require.NoError(t, err)
 
-	eng, ok := s1.lookupExemplarEngine("default")
-	require.True(t, ok)
-	require.NoError(t, eng.Flush(ctx))
+	require.True(t, flushDefault(t, s1, signal.Exemplar))
 	require.NoError(t, s1.Close(ctx))
 
 	s2 := reopenDurable(t, dataDir, walDir)

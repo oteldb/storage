@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 )
@@ -217,7 +218,7 @@ func TestPartIdentityNotCached(t *testing.T) {
 	require.NoError(t, e.Flush(ctx))
 	require.NoError(t, engine.New(cfg).LoadParts(ctx))
 
-	dirs := partDirs(t, be, "default/metrics")
+	dirs := backendtest.PartDirs(ctx, t, be, "default/metrics")
 	require.Len(t, dirs, 1)
 
 	key := "default/metrics/" + dirs[0] + "/identity"

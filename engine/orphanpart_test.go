@@ -2,9 +2,6 @@ package engine_test
 
 import (
 	"context"
-	"maps"
-	"path"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,8 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/internal/partid"
 	"github.com/oteldb/storage/query/fetch"
 )
 
@@ -46,32 +43,6 @@ func partObjects(t *testing.T, be backend.Backend, id string) []string {
 	return keys
 }
 
-// isPartObject reports whether key names an object inside a part directory rather than an
-// engine-level object (the bucket index, the legacy series set).
-func isPartObject(key string) bool {
-	return slices.ContainsFunc(strings.Split(path.Dir(key), "/"), partid.Valid)
-}
-
-// partDirs returns the sorted part ids that have objects under the engine prefix — part ids are
-// minted, so a test cannot name them up front and asserts over this set instead.
-func partDirs(t *testing.T, be backend.Backend, enginePrefix string) []string {
-	t.Helper()
-
-	keys, err := be.List(context.Background(), enginePrefix+"/")
-	require.NoError(t, err)
-
-	seen := make(map[string]struct{}, len(keys))
-
-	for _, k := range keys {
-		dir, _, ok := strings.Cut(strings.TrimPrefix(k, enginePrefix+"/"), "/")
-		if ok && partid.Valid(dir) {
-			seen[dir] = struct{}{}
-		}
-	}
-
-	return slices.Sorted(maps.Keys(seen))
-}
-
 // TestFailedFlushBurnsPartID verifies a flush that wrote part objects and then failed does not hand
 // its id to the retry: a rewrite replaces only the objects it itself produces, so a part landing on
 // the leftovers can inherit objects it never wrote.
@@ -90,7 +61,7 @@ func TestFailedFlushBurnsPartID(t *testing.T) {
 	require.Error(t, e.Flush(ctx))
 	be.armed.Store(false)
 
-	orphans := partDirs(t, be, "default/metrics")
+	orphans := backendtest.PartDirs(ctx, t, be, "default/metrics")
 	require.Len(t, orphans, 1)
 	require.NotEmpty(t, partObjects(t, be, orphans[0]), "the failed attempt's objects are still there")
 	require.Equal(t, 0, e.PartCount())
@@ -100,7 +71,7 @@ func TestFailedFlushBurnsPartID(t *testing.T) {
 
 	require.Equal(t, 1, e.PartCount())
 
-	dirs := partDirs(t, be, "default/metrics")
+	dirs := backendtest.PartDirs(ctx, t, be, "default/metrics")
 	require.Len(t, dirs, 2, "the retry must write to a fresh id, leaving the burnt one behind")
 	require.Contains(t, dirs, orphans[0])
 }
@@ -122,7 +93,7 @@ func TestLoadPartsSweepsOrphanParts(t *testing.T) {
 	require.Error(t, e.Flush(ctx))
 	be.armed.Store(false)
 
-	orphans := partDirs(t, be, "default/metrics")
+	orphans := backendtest.PartDirs(ctx, t, be, "default/metrics")
 	require.Len(t, orphans, 1)
 	require.NotEmpty(t, partObjects(t, be, orphans[0]))
 
@@ -134,7 +105,7 @@ func TestLoadPartsSweepsOrphanParts(t *testing.T) {
 	mustAppend(t, r, s, 200, 2.0)
 	require.NoError(t, r.Flush(ctx))
 
-	dirs := partDirs(t, be, "default/metrics")
+	dirs := backendtest.PartDirs(ctx, t, be, "default/metrics")
 	require.Len(t, dirs, 1)
 	require.NotEqual(t, orphans[0], dirs[0], "the new part must not land on the orphan's id")
 
@@ -185,7 +156,7 @@ func TestRefreshReplicaKeepsUncommittedParts(t *testing.T) {
 	replica := engine.New(engine.Config{Backend: be, Prefix: "default/metrics"})
 	require.NoError(t, replica.RefreshReplica(ctx))
 
-	orphans := partDirs(t, be, "default/metrics")
+	orphans := backendtest.PartDirs(ctx, t, be, "default/metrics")
 	require.Len(t, orphans, 1)
 	require.NotEmpty(t, partObjects(t, be, orphans[0]),
 		"a replica must not delete part objects the owner may still be committing")

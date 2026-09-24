@@ -11,43 +11,10 @@ import (
 	"github.com/oteldb/storage/backend/backendtest"
 )
 
-// streamingMemory is [backend.Memory] plus the incremental-write capability, standing in for the
-// file backend so the wrapper behavior can be tested without touching a disk.
-type streamingMemory struct {
-	backend.Backend
-
-	creates int
-}
-
-func newStreamingMemory() *streamingMemory { return &streamingMemory{Backend: backend.Memory()} }
-
-func (b *streamingMemory) CreateObject(_ context.Context, key string) (backend.ObjectWriter, error) {
-	b.creates++
-
-	return &memoryObjectWriter{b: b.Backend, key: key}, nil
-}
-
-func (*streamingMemory) StreamsWrites() bool { return true }
-
-type memoryObjectWriter struct {
-	b   backend.Backend
-	key string
-	buf []byte
-}
-
-func (w *memoryObjectWriter) Write(p []byte) (int, error) {
-	w.buf = append(w.buf, p...)
-
-	return len(p), nil
-}
-
-func (w *memoryObjectWriter) Commit(ctx context.Context) error { return w.b.Write(ctx, w.key, w.buf) }
-func (w *memoryObjectWriter) Abort()                           { w.buf = nil }
-
 func TestStreamingMemoryConformance(t *testing.T) {
 	t.Parallel()
 	backendtest.Run(t, func(*testing.T) backend.Backend {
-		return newStreamingMemory()
+		return backendtest.NewStreamingMemory()
 	})
 }
 
@@ -64,7 +31,7 @@ func TestCachedConformance(t *testing.T) {
 	t.Run("over a streaming backend", func(t *testing.T) {
 		t.Parallel()
 		backendtest.Run(t, func(*testing.T) backend.Backend {
-			return backend.Cached(newStreamingMemory(), 1<<20)
+			return backend.Cached(backendtest.NewStreamingMemory(), 1<<20)
 		})
 	})
 }
@@ -85,7 +52,7 @@ func TestStreamsWritesIsNotClaimedByWrappers(t *testing.T) {
 	t.Parallel()
 
 	assert.False(t, backend.StreamsWrites(backend.Memory()))
-	assert.True(t, backend.StreamsWrites(newStreamingMemory()))
+	assert.True(t, backend.StreamsWrites(backendtest.NewStreamingMemory()))
 
 	wrappers := map[string]func(backend.Backend) backend.Backend{
 		"Cached":         func(b backend.Backend) backend.Backend { return backend.Cached(b, 1<<20) },
@@ -100,7 +67,7 @@ func TestStreamsWritesIsNotClaimedByWrappers(t *testing.T) {
 
 			assert.False(t, backend.StreamsWrites(wrap(backend.Memory())),
 				"wrapping a whole-object backend does not make it stream")
-			assert.True(t, backend.StreamsWrites(wrap(newStreamingMemory())),
+			assert.True(t, backend.StreamsWrites(wrap(backendtest.NewStreamingMemory())),
 				"wrapping a streaming backend must not hide the capability")
 		})
 	}
@@ -112,7 +79,7 @@ func TestCachedStreamedWriteInvalidates(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	inner := newStreamingMemory()
+	inner := backendtest.NewStreamingMemory()
 	c := backend.Cached(inner, 1<<20)
 
 	require.NoError(t, c.Write(ctx, "k", []byte("first")))
@@ -132,7 +99,7 @@ func TestCachedStreamedWriteInvalidates(t *testing.T) {
 	assert.Equal(t, []byte("first"), got, "an uncommitted stream must not disturb the cached value")
 
 	require.NoError(t, w.Commit(ctx))
-	assert.Equal(t, 1, inner.creates, "the wrapper must forward, not buffer")
+	assert.Equal(t, int64(1), inner.Creates(), "the wrapper must forward, not buffer")
 
 	got, err = c.Read(ctx, "k")
 	require.NoError(t, err)
@@ -145,7 +112,7 @@ func TestCachedStreamedAbortKeepsCache(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	c := backend.Cached(newStreamingMemory(), 1<<20)
+	c := backend.Cached(backendtest.NewStreamingMemory(), 1<<20)
 
 	require.NoError(t, c.Write(ctx, "k", []byte("first")))
 
@@ -168,7 +135,7 @@ func TestUncachedHelpersSeeStreamingWrapper(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	c := backend.Cached(newStreamingMemory(), 1<<20)
+	c := backend.Cached(backendtest.NewStreamingMemory(), 1<<20)
 
 	require.NoError(t, backend.WriteUncached(ctx, c, "k", []byte("v")))
 

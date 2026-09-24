@@ -93,18 +93,18 @@ func TestColumnScanCoalescesReads(t *testing.T) {
 	frameAtATime, err := r.ColumnBlocks(ctx, "attrs")
 	require.NoError(t, err)
 
-	b.reset()
+	b.Reset()
 	walk(frameAtATime)
 
-	unwindowed := b.reads.Load()
+	unwindowed := b.Reads()
 
 	scan, err := r.ColumnScan(ctx, "attrs", 1<<20)
 	require.NoError(t, err)
 
-	b.reset()
+	b.Reset()
 	walk(scan)
 
-	windowed := b.reads.Load()
+	windowed := b.Reads()
 
 	require.Greater(t, unwindowed, int64(8), "the corpus does not span enough frames to measure this")
 	assert.Equal(t, int64(1), windowed,

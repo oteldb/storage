@@ -43,8 +43,9 @@ const (
 	tierFloorBytes = 4 << 20
 
 	// mergeBufferAmplification converts the merge's memory allowance into a cap on the bytes it may
-	// hold. A merge holds its selected sources decoded *and* the output buffer it is filling from
-	// them, and the write then encodes that buffer, so the peak is about three times the cap.
+	// hold: the sources, the output buffer filled from them, and the encode of that buffer. The
+	// sources term is a read-ahead window per column, not the sources decoded, so three overstates
+	// the peak; it stands until the budget is re-derived.
 	mergeBufferAmplification = 3
 
 	// recordRowBytes is the assumed average uncompressed size of one record. It survives only for a

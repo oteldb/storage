@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/obs/obstest"
@@ -206,9 +207,6 @@ func FuzzSeriesIndexParse(f *testing.F) {
 	})
 }
 
-// hiddenViewer wraps a backend, hiding its [backend.Viewer] capability — the bare cold-tier shape.
-type hiddenViewer struct{ backend.Backend }
-
 // TestPagedIndexDropAndReload pins the residency lifecycle: with a Viewer backend the entries view
 // drops on release (refs == 0) and reloads on the next use; without one the view is kept for the
 // part's life (no re-read regression on a cache-less cold tier).
@@ -247,7 +245,7 @@ func TestPagedIndexDropAndReload(t *testing.T) {
 	assert.Nil(t, paged.view.Load(), "last release drops the view")
 
 	// A backend without Viewer keeps the view (loads once, stays resident).
-	hidden := hiddenViewer{Backend: be}
+	hidden := backendtest.WithoutCapabilities(be)
 	kept, ok := openPagedIndex(ctx, hidden, "p", len(col), obs.NewNop().Corruption)
 	require.True(t, ok)
 	require.True(t, kept.keep)

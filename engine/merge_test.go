@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -28,7 +29,7 @@ func TestMergeCompactsParts(t *testing.T) {
 	require.NoError(t, e.Flush(context.Background()))
 	assert.Equal(t, 3, e.PartCount())
 
-	sources := partDirs(t, b, "default/metrics")
+	sources := backendtest.PartDirs(context.Background(), t, b, "default/metrics")
 	require.Len(t, sources, 3)
 
 	require.NoError(t, e.Merge(context.Background(), 0))

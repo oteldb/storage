@@ -15,7 +15,7 @@ func TestDeferredFallsBackToSynchronous(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	b := withoutCapabilities{backend.Memory()}
+	b := backendtest.WithoutCapabilities(backend.Memory())
 
 	require.NoError(t, backend.WriteDeferred(ctx, b, "p/a", []byte("a")))
 

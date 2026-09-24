@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/engine"
@@ -112,7 +113,7 @@ func TestSharedBackendFlushKeepsPeerPartObjects(t *testing.T) {
 	mustAppend(t, a, mkSeries("job", "a"), 100, 1.0)
 	require.NoError(t, a.Flush(ctx))
 
-	first := partDirs(t, be, sharedPrefix)
+	first := backendtest.PartDirs(ctx, t, be, sharedPrefix)
 	require.Len(t, first, 1)
 
 	// b has never seen a's part: it mints from its own state, exactly the split-brain case.
@@ -122,7 +123,7 @@ func TestSharedBackendFlushKeepsPeerPartObjects(t *testing.T) {
 	mustAppend(t, b, mkSeries("job", "b"), 200, 2.0)
 	require.NoError(t, b.Flush(ctx))
 
-	both := partDirs(t, be, sharedPrefix)
+	both := backendtest.PartDirs(ctx, t, be, sharedPrefix)
 	require.Len(t, both, 2, "the two engines must mint distinct part ids")
 	require.Contains(t, both, first[0])
 

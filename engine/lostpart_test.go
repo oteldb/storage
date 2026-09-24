@@ -2,7 +2,6 @@ package engine_test
 
 import (
 	"context"
-	"maps"
 	"math/rand/v2"
 	"slices"
 	"strings"
@@ -14,9 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/internal/partid"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -51,25 +50,6 @@ func diskPartKeys(ctx context.Context, t *testing.T, be backend.Backend, id stri
 	require.NoError(t, err)
 
 	return keys
-}
-
-// diskPartIDs returns the sorted ids of the parts that have objects under the engine prefix — part ids
-// are minted, so a test cannot name them up front and asserts over this set instead.
-func diskPartIDs(ctx context.Context, t *testing.T, be backend.Backend) []string {
-	t.Helper()
-
-	keys, err := be.List(ctx, lostPrefix+"/")
-	require.NoError(t, err)
-
-	seen := make(map[string]struct{}, len(keys))
-
-	for _, k := range keys {
-		if dir, _, ok := strings.Cut(strings.TrimPrefix(k, lostPrefix+"/"), "/"); ok && partid.Valid(dir) {
-			seen[dir] = struct{}{}
-		}
-	}
-
-	return slices.Sorted(maps.Keys(seen))
 }
 
 // erasePart deletes every backend object of the part with the given id, the disk failure a repair
@@ -141,7 +121,7 @@ func twoParts(t *testing.T, e *engine.Engine, be backend.Backend, s signal.Serie
 	mustAppend(t, e, s, 200, 2.0)
 	require.NoError(t, e.Flush(ctx))
 
-	ids := diskPartIDs(ctx, t, be)
+	ids := backendtest.PartDirs(ctx, t, be, lostPrefix)
 	require.Len(t, ids, 2)
 
 	return ids
@@ -446,7 +426,7 @@ func TestEntriesLeaveOnlyIntoRemovedOrWanted(t *testing.T) {
 					// Retention: parts wholly below the horizon are dropped, not merged.
 					require.NoError(t, e.Merge(ctx, ts-150))
 				case 4:
-					ids := diskPartIDs(ctx, t, be)
+					ids := backendtest.PartDirs(ctx, t, be, lostPrefix)
 					if len(ids) == 0 {
 						continue
 					}

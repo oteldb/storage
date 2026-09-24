@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/recordengine"
@@ -85,7 +86,7 @@ func flushInputs(ctx context.Context, t *testing.T, be backend.Backend, bystande
 		flushRecordRun(ctx, t, e, recordsPerPart*i, i < 3)
 	}
 
-	ids := diskPartIDs(ctx, t, be)
+	ids := backendtest.PartDirs(ctx, t, be, enginePrefix)
 	require.Len(t, ids, n, "one part per flush")
 
 	ix, err := bucketindex.Load(ctx, be, indexKey())

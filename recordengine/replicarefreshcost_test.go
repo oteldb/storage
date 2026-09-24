@@ -2,48 +2,18 @@ package recordengine_test
 
 import (
 	"context"
-	"maps"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/recordengine"
 )
-
-// readCounter counts reads per key. It embeds the interface rather than the concrete backend, so it
-// implements neither Viewer nor Sizer and every read — including a size probe — funnels through
-// Read and is counted.
-type readCounter struct {
-	backend.Backend
-
-	mu     sync.Mutex
-	counts map[string]int
-}
-
-func newReadCounter() *readCounter {
-	return &readCounter{Backend: backend.Memory(), counts: map[string]int{}}
-}
-
-func (c *readCounter) Read(ctx context.Context, key string) ([]byte, error) {
-	c.mu.Lock()
-	c.counts[key]++
-	c.mu.Unlock()
-
-	return c.Backend.Read(ctx, key)
-}
-
-func (c *readCounter) snapshot() map[string]int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return maps.Clone(c.counts)
-}
 
 // seedBulkyParts flushes two parts holding enough records per stream that the timestamp column is a
 // real object: a one-record part collapses it into the manifest, which would hide the whole-column
@@ -82,14 +52,14 @@ func TestRefreshReplicaDoesNotRereadParts(t *testing.T) {
 	const refreshes = 5
 
 	ctx := context.Background()
-	be := newReadCounter()
+	be := backendtest.NewCounting(backend.Memory())
 	seedBulkyParts(t, be)
 
 	replica := newEngine(t, be)
 	require.NoError(t, replica.RefreshReplica(ctx))
 	require.Equal(t, 2, replica.PartCount())
 
-	before := be.snapshot()
+	before := be.Reads()
 
 	// The sidecar's other half: a cold replica resolves the watermarks without touching the
 	// timestamp column at all, so a part freshly mirrored here costs no whole-column decode.
@@ -103,7 +73,7 @@ func TestRefreshReplicaDoesNotRereadParts(t *testing.T) {
 		require.NoError(t, replica.RefreshReplica(ctx))
 	}
 
-	for key, n := range be.snapshot() {
+	for key, n := range be.Reads() {
 		grew := n - before[key]
 
 		switch {

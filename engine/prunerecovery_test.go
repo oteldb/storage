@@ -12,6 +12,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/heaptest"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/wal"
 )
@@ -177,14 +178,14 @@ func TestPruneIdentitiesReclaimsHeap(t *testing.T) {
 
 	require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{RetainFrom: 500}))
 
-	before := heapAlloc()
+	before := heaptest.Live()
 	reportedBefore := e.Stats().IdentityBytes
 
 	removed, err := e.PruneIdentities(ctx)
 	require.NoError(t, err)
 	require.Equal(t, total-keep, removed)
 
-	after := heapAlloc()
+	after := heaptest.Live()
 	reportedAfter := e.Stats().IdentityBytes
 	runtime.KeepAlive(e)
 

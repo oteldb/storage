@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -416,7 +417,7 @@ func TestSyncKeepFilterMirrorsSubset(t *testing.T) {
 	ix := &bucketindex.Index{}
 	ix.Add(bucketindex.Entry{Prefix: "t/metrics/0000000001", MinTime: 1, MaxTime: 9})
 	for slot := range 3 {
-		require.NoError(t, owner.Write(ctx, "t/metrics/0000000001/ecshard/"+itoa(slot)+"/c/0", []byte("shard-"+itoa(slot))))
+		require.NoError(t, owner.Write(ctx, "t/metrics/0000000001/ecshard/"+strconv.Itoa(slot)+"/c/0", []byte("shard-"+strconv.Itoa(slot))))
 	}
 	require.NoError(t, owner.Write(ctx, "t/metrics/0000000001/ecmeta", []byte("meta")))
 	saveIndex(t, owner, "t/metrics", ix)
@@ -439,7 +440,7 @@ func TestSyncKeepFilterMirrorsSubset(t *testing.T) {
 	_, err = replica.Read(ctx, "t/metrics/0000000001/ecmeta")
 	require.NoError(t, err, "sidecar mirrored")
 	for _, slot := range []int{0, 2} {
-		_, err = replica.Read(ctx, "t/metrics/0000000001/ecshard/"+itoa(slot)+"/c/0")
+		_, err = replica.Read(ctx, "t/metrics/0000000001/ecshard/"+strconv.Itoa(slot)+"/c/0")
 		require.ErrorIsf(t, err, backend.ErrNotExist, "slot %d not mirrored", slot)
 	}
 
@@ -462,9 +463,9 @@ func TestSyncFilterKeepsLiveForeignShards(t *testing.T) {
 	ix := &bucketindex.Index{}
 	ix.Add(bucketindex.Entry{Prefix: "t/metrics/0000000001", MinTime: 1, MaxTime: 9})
 	for slot := range 3 {
-		require.NoError(t, owner.Write(ctx, "t/metrics/0000000001/ecshard/"+itoa(slot)+"/c/0", []byte("s"+itoa(slot))))
+		require.NoError(t, owner.Write(ctx, "t/metrics/0000000001/ecshard/"+strconv.Itoa(slot)+"/c/0", []byte("s"+strconv.Itoa(slot))))
 		// The replica already holds every slot (from an earlier unfiltered mirror).
-		require.NoError(t, replica.Write(ctx, "t/metrics/0000000001/ecshard/"+itoa(slot)+"/c/0", []byte("s"+itoa(slot))))
+		require.NoError(t, replica.Write(ctx, "t/metrics/0000000001/ecshard/"+strconv.Itoa(slot)+"/c/0", []byte("s"+strconv.Itoa(slot))))
 	}
 	require.NoError(t, owner.Write(ctx, "t/metrics/0000000001/ecmeta", []byte("meta")))
 	require.NoError(t, replica.Write(ctx, "t/metrics/0000000001/ecmeta", []byte("meta")))
@@ -487,7 +488,7 @@ func TestSyncFilterKeepsLiveForeignShards(t *testing.T) {
 	}
 
 	for slot := range 3 {
-		_, err := replica.Read(ctx, "t/metrics/0000000001/ecshard/"+itoa(slot)+"/c/0")
+		_, err := replica.Read(ctx, "t/metrics/0000000001/ecshard/"+strconv.Itoa(slot)+"/c/0")
 		require.NoErrorf(t, err, "live-part slot %d kept", slot)
 	}
 
@@ -500,8 +501,6 @@ func TestSyncFilterKeepsLiveForeignShards(t *testing.T) {
 	_, err := replica.Read(ctx, "t/metrics/0000000000/ecshard/1/c/0")
 	require.ErrorIs(t, err, backend.ErrNotExist, "superseded part's shard pruned")
 }
-
-func itoa(n int) string { return string(rune('0' + n)) }
 
 // TestSyncProtectsOwnSlotShard pins the fix for the owner-prune/slot-filter interaction: a
 // replica's own-slot shard for a LIVE part must never be pruned just because the source (the

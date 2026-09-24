@@ -3,6 +3,7 @@ package chunk
 import (
 	"bytes"
 	"math/rand/v2"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -46,7 +47,7 @@ func TestDictLargeCardinality(t *testing.T) {
 
 	vals := make([][]byte, 500)
 	for i := range vals {
-		vals[i] = []byte("val-" + itoa(i))
+		vals[i] = []byte("val-" + strconv.Itoa(i))
 	}
 
 	enc := EncodeBytes(nil, vals)
@@ -62,7 +63,7 @@ func TestDictFlatFallback(t *testing.T) {
 
 	vals := make([][]byte, 70000)
 	for i := range vals {
-		vals[i] = []byte("v" + itoa(i))
+		vals[i] = []byte("v" + strconv.Itoa(i))
 	}
 
 	enc := EncodeBytes(nil, vals)
@@ -203,7 +204,7 @@ func TestDictColumnDecodeReuse(t *testing.T) {
 func makeDistinctBytes(n int) [][]byte {
 	vals := make([][]byte, n)
 	for i := range vals {
-		vals[i] = []byte("val-" + itoa(i))
+		vals[i] = []byte("val-" + strconv.Itoa(i))
 	}
 
 	return vals
@@ -216,7 +217,7 @@ func makeLowCardBytes(n, cardinality int) [][]byte {
 
 	templates := make([][]byte, cardinality)
 	for i := range cardinality {
-		templates[i] = []byte("label-" + itoa(i))
+		templates[i] = []byte("label-" + strconv.Itoa(i))
 	}
 
 	vals := make([][]byte, n)
@@ -225,34 +226,6 @@ func makeLowCardBytes(n, cardinality int) [][]byte {
 	}
 
 	return vals
-}
-
-// itoa is a minimal int→string without strconv to keep the test import-light.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-
-	var buf [20]byte
-
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-
-	return string(buf[i:])
 }
 
 // Ensure rand is used (for potential future randomized tests).

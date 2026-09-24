@@ -12,7 +12,6 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/internal/mergestream"
-	"github.com/oteldb/storage/internal/obs"
 )
 
 // Merge runs one size-tiered compaction cycle, dropping records older than retainFrom (retention;
@@ -143,7 +142,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{parts: dropped}, nil
 	}
 
-	// Past here the merge decodes every selected part and buffers the output, so this is where its
+	// Past here the merge reads every selected part and buffers the output, so this is where its
 	// memory allowance must be one it actually holds rather than one it assumed.
 	release, admitted, err := e.admitMerge(ctx, opts.Background)
 	if err != nil {
@@ -234,7 +233,8 @@ type mergeResult struct {
 	deferred bool
 }
 
-// partsBytes sums the on-disk size of ps.
+// partsBytes sums the decoded footprint of ps ([part.sizeBytes]), not its on-disk size — unlike the
+// metric engine's namesake.
 func partsBytes(ps []*part) int64 {
 	var n int64
 	for _, p := range ps {
@@ -333,54 +333,40 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 	return writeSidecars(ctx, e.cfg.Backend, newPrefix, merged)
 }
 
-// compactParts compacts the selected source parts into bounded output part(s): it decodes each part
-// once (reused across all its streams), concatenates every stream's in-window records across parts
-// (retention applied via start), re-sorts each stream by ts, and writes a new part whenever the
-// accumulated *decoded* bytes reach capBytes — so both the merge's decoded working set and each
-// output part stay within the cap, never O(dataset). When the engine has a side store (profiles) the
-// output is a single part (no split) so the unioned symbol sidecar has one home. Returns the new parts
-// (empty when retention dropped every record). Reads the parts off the engine lock; src is the
-// immutable snapshot the caller planned over.
+// compactParts compacts the selected source parts into bounded output part(s): it reads every stream's
+// in-window records from each part (retention applied via start), concatenates them across parts,
+// re-sorts each stream by ts, and writes a new part whenever the accumulated *decoded* bytes reach
+// capBytes — so each output part stays within the cap, never O(dataset). A source is read forward a
+// granule at a time per column ([partCursor]) unless its layout rules that out, when it is decoded
+// whole. When the engine has a side store (profiles) the output is a single part (no split) so the
+// unioned symbol sidecar has one home. Returns the new parts (empty when retention dropped every
+// record). Reads the parts off the engine lock; src is the immutable snapshot the caller planned over.
 func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes int64) ([]*part, error) {
-	// Decode each source part once, keeping byte columns dict-compressed (see decodedPart). A merge
-	// reads every stream of every part, so decoding per-stream (the old appendWindow path) re-decoded
-	// the whole part once per stream; decoding up front is O(selected parts), which selection bounds to
-	// ≈ one sealed part's worth, and the dict-compressed byte columns keep the per-part constant small.
-	decoded := make([]*decodedPart, len(src))
-	for i, p := range src {
-		d, err := p.readForMerge(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		if !d.tsSorted {
-			// Both writers sort a stream's rows by timestamp, and fetch trusts it. The merge scans such
-			// a part row by row, so it loses nothing, but the part's windowed reads are already wrong.
-			zctx.From(ctx).Warn("part rows are not timestamp-ordered within a stream; merging it without the windowed search",
-				zap.String("part", p.prefix))
-			e.cfg.Obs.Corruption.Detected(ctx, "stream_order", obs.CorruptTolerated)
-		}
-
-		decoded[i] = d
-	}
-
 	budget := e.mergeBudget(capBytes)
 
-	// Union the sources' byte-column dictionaries once, before any row moves: a column every source
-	// dictionary-encoded is then carried through the merge as ids into that union and handed to the
-	// writer in split form, so no cell is copied and no row is re-hashed to rebuild a dictionary the
-	// sources already had.
-	dicts := buildMergeDicts(e.cfg.Schema, decoded)
-
-	// One output buffer, pre-sized from the sources and re-armed after each part instead of allocated
-	// fresh. A byte column starting from nothing doubles its way to the seal threshold, re-copying a
-	// part's worth of bodies at every step and leaving each intermediate blob for the GC — the single
-	// largest allocation site in the engine, and most of the collector time a compaction spends.
-	bufRows, bufBlob := decodedShape(decoded, dicts, capBytes)
-
+	// One output buffer, re-armed after each part instead of allocated fresh, and one accumulator,
+	// re-armed per stream: a merge visits every stream of the selected parts (tens of thousands on real
+	// log data), so allocating either anew churned a part's worth of column buffers — and their
+	// doubling growth — through the GC.
 	buf := &flushColumns{cols: newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))}
-	buf.cols.armSplit(dicts)
+	acc := newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
+
+	// A byte column the sources dictionary-encode is carried through the merge as ids into a union of
+	// their dictionaries and handed to the writer in split form, so no cell is copied and no row is
+	// re-hashed to rebuild a dictionary the sources already had.
+	carry := newMergeCarry(e.cfg.Schema, len(src), acc, buf.cols)
+	defer carry.release()
+
+	sources, err := e.openMergeSources(ctx, src, carry)
+	if err != nil {
+		return nil, err
+	}
+
+	// Pre-sized from the sources: a byte column starting from nothing doubles its way to the seal
+	// threshold, re-copying a part's worth of bodies at every step.
+	bufRows, bufBlob := mergeShape(e.cfg.Schema, src, capBytes)
 	buf.reset(e.cfg.Schema, bufRows, bufBlob)
+	carry.flatBlob = bufBlob
 
 	var newParts []*part
 
@@ -402,31 +388,24 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 		return nil
 	}
 
-	// One accumulator, re-armed per stream: a merge visits every stream of the selected parts (tens of
-	// thousands on real log data), so allocating one per stream churned a fresh set of column buffers
-	// — and their doubling growth — through the GC for each. [recordCols.prepare] keeps the backing
-	// arrays.
-	acc := newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
-	acc.armSplit(dicts)
-
 	var keys mergestream.Keys
 
 	mergeKeys(src, &keys)
 
 	for keys.Next() {
 		id := keys.Key()
+		if mergeSkipStream != nil && mergeSkipStream(id) {
+			continue
+		}
 
 		acc.prepare(e.cfg.Schema, 0, fullSel(e.cfg.Schema))
 
 		// Oldest → newest part order; records are append-only (no dedup), so the stream is just
 		// concatenated across parts and re-sorted by ts below.
-		for i, p := range src {
-			rng, ok := p.lookup(id)
-			if !ok {
-				continue
+		for _, s := range sources {
+			if err := s.appendStream(acc, id, start, maxInt64); err != nil {
+				return nil, err
 			}
-
-			appendMergeWindow(acc, decoded[i], i, rng, start, maxInt64)
 		}
 
 		if acc.len() == 0 {
@@ -454,6 +433,10 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 				return nil, err
 			}
 		}
+	}
+
+	if err := checkDrained(src, sources); err != nil {
+		return nil, err
 	}
 
 	if err := emit(); err != nil {

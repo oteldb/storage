@@ -11,41 +11,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
 )
-
-// streamingMemory is [backend.Memory] with the incremental-write capability bolted on. The real
-// implementation is the file backend's; this one exists so the streamed layout — and the code that
-// only runs under it — is exercised everywhere the package already tests in memory.
-type streamingMemory struct {
-	backend.Backend
-}
-
-var _ backend.ObjectCreator = (*streamingMemory)(nil)
-
-func newStreamingMemory() *streamingMemory { return &streamingMemory{Backend: backend.Memory()} }
-
-func (b *streamingMemory) CreateObject(_ context.Context, key string) (backend.ObjectWriter, error) {
-	return &memoryObjectWriter{b: b.Backend, key: key}, nil
-}
-
-func (*streamingMemory) StreamsWrites() bool { return true }
-
-type memoryObjectWriter struct {
-	b   backend.Backend
-	key string
-	buf []byte
-}
-
-func (w *memoryObjectWriter) Write(p []byte) (int, error) {
-	w.buf = append(w.buf, p...)
-
-	return len(p), nil
-}
-
-func (w *memoryObjectWriter) Commit(ctx context.Context) error { return w.b.Write(ctx, w.key, w.buf) }
-func (w *memoryObjectWriter) Abort()                           { w.buf = nil }
 
 // writeStreamTo builds the part with a streaming writer targeting b, so its column objects are
 // committed through the backend rather than returned.
@@ -125,7 +94,7 @@ func TestStreamWriterToMatchesBuffered(t *testing.T) {
 						WithCompression(compress.AlgorithmZSTD), WithCompressBlockBytes(64),
 					}
 
-					b := newStreamingMemory()
+					b := backendtest.NewStreamingMemory()
 					tc.rows.writeStreamTo(t, ctx, b, "streamed", autoCodec, opts...)
 
 					buffered := backend.Memory()
@@ -219,7 +188,7 @@ func TestStreamWriterToDiskBytesMatchesObjects(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	b := newStreamingMemory()
+	b := backendtest.NewStreamingMemory()
 	rows := gen(20, 40, func(r *rand.Rand, _, _ int) float64 { return r.Float64() }, 42)
 
 	rows.writeStreamTo(t, ctx, b, "p", true,
@@ -254,7 +223,7 @@ func TestStreamWriterToConstColumnStaysUnwritten(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	b := newStreamingMemory()
+	b := backendtest.NewStreamingMemory()
 	rows := gen(4, 20, func(*rand.Rand, int, int) float64 { return 7 }, 1)
 
 	rows.writeStreamTo(t, ctx, b, "p", false, WithSortKey("ts"), WithGranuleSize(4))
@@ -280,7 +249,7 @@ func TestStreamWriterToAbortLeavesNothing(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	b := newStreamingMemory()
+	b := backendtest.NewStreamingMemory()
 	rows := gen(10, 50, func(r *rand.Rand, _, _ int) float64 { return r.Float64() }, 3)
 
 	w := NewStreamWriterTo(ctx, b, "p", WithSortKey("ts"), WithGranuleSize(8), WithCompressBlockBytes(64))
@@ -303,7 +272,7 @@ func TestStreamWriterToResidentBytesStaysFlat(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	b := newStreamingMemory()
+	b := backendtest.NewStreamingMemory()
 	// The production granule and frame sizes: the directory a streamed part keeps is O(granules), so
 	// a test at a toy granule size would measure that term instead of the one this change removes.
 	opts := []PartOption{WithSortKey("ts"), WithGranuleSize(8192), WithCompressBlockBytes(64 << 10)}
@@ -358,7 +327,7 @@ func TestParseFooterDirRejectsCorrupt(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	b := newStreamingMemory()
+	b := backendtest.NewStreamingMemory()
 	rows := gen(3, 40, func(r *rand.Rand, _, _ int) float64 { return r.Float64() }, 11)
 
 	rows.writeStreamTo(t, ctx, b, "p", false, WithSortKey("ts"), WithGranuleSize(8), WithCompressBlockBytes(64))
@@ -420,7 +389,7 @@ var footerDesc = ColumnDesc{Name: "v", Kind: KindFloat64, Blocked: true, Framed:
 // that could slice past it.
 func FuzzParseFooterDir(f *testing.F) {
 	ctx := context.Background()
-	b := newStreamingMemory()
+	b := backendtest.NewStreamingMemory()
 	rows := gen(3, 40, func(r *rand.Rand, _, _ int) float64 { return r.Float64() }, 12)
 
 	rows.writeStreamTo(f, ctx, b, "p", false, WithSortKey("ts"), WithGranuleSize(8), WithCompressBlockBytes(64))

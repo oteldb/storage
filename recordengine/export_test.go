@@ -87,3 +87,33 @@ func (e *Engine) PartPrefixes() []string {
 
 	return out
 }
+
+// SetMergeReadWindow sets how much of each source column a merge reads ahead.
+func (e *Engine) SetMergeReadWindow(n int64) { e.mergeReadWindow = n }
+
+// SetMergeReadWhole forces every merge source onto the whole decode, the oracle the forward cursor is
+// compared against, and returns the restore.
+func SetMergeReadWhole(v bool) func() {
+	old := mergeReadWhole
+	mergeReadWhole = v
+
+	return func() { mergeReadWhole = old }
+}
+
+// ObserveMergeReads installs fn to receive, per source of each merge, whether it was read forward
+// rather than decoded whole, and returns the removal.
+func ObserveMergeReads(fn func(streamed []bool)) func() {
+	old := mergeReadObserver
+	mergeReadObserver = fn
+
+	return func() { mergeReadObserver = old }
+}
+
+// SetMergeUnionEntriesPerSource sets the per-source bound on a merge's union dictionary and returns
+// the restore.
+func SetMergeUnionEntriesPerSource(n int) func() {
+	old := mergeUnionEntriesPerSource
+	mergeUnionEntriesPerSource = n
+
+	return func() { mergeUnionEntriesPerSource = old }
+}

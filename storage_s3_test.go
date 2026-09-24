@@ -7,52 +7,22 @@ package storage_test
 
 import (
 	"context"
-	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
-	fsserver "github.com/go-faster/fs/server"
-	"github.com/go-faster/fs/storagemem"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage"
-	"github.com/oteldb/storage/backend"
-	"github.com/oteldb/storage/backend/s3"
+	"github.com/oteldb/storage/backend/s3/s3test"
 	"github.com/oteldb/storage/signal/metric"
 )
-
-// s3Backend starts an in-process S3 server and returns a fresh durable backend over it. The
-// returned backends share the same bucket, so two Storage instances over them see the same
-// objects — modeling two processes against one object store.
-func s3Backend(t *testing.T) func() backend.Backend {
-	t.Helper()
-
-	const bucket = "oteldb"
-	store := storagemem.New()
-	require.NoError(t, store.CreateBucket(context.Background(), bucket))
-
-	srv := httptest.NewServer(fsserver.NewHandler(store))
-	t.Cleanup(srv.Close)
-
-	client := awss3.New(awss3.Options{
-		Region:       "us-east-1",
-		BaseEndpoint: aws.String(srv.URL),
-		UsePathStyle: true,
-		Credentials:  credentials.NewStaticCredentialsProvider("test", "test", ""),
-	})
-
-	return func() backend.Backend { return s3.New(s3.NewAWS(client, bucket), "") }
-}
 
 func TestFullVerticalOnS3(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	newBackend := s3Backend(t)
+	newBackend := s3test.Shared(t, "oteldb")
 
 	// Process 1: ingest and flush to the object store, then close.
 	s1, err := storage.Open(ctx, storage.Options{}, storage.WithBackend(newBackend()))

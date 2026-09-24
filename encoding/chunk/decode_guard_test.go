@@ -3,10 +3,11 @@ package chunk
 import (
 	"encoding/binary"
 	"math"
-	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/oteldb/storage/internal/heaptest"
 )
 
 // uvarint encodes x as a uvarint (the row-count header every column stream starts with).
@@ -85,14 +86,12 @@ func TestDecodeRowsFromCaller(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, rows := range []int{0, 3, claimed - 1, claimed + 1, -1} {
-				var before, after runtime.MemStats
+				var err error
 
-				runtime.ReadMemStats(&before)
-				err := tc.dec(rows)
-				runtime.ReadMemStats(&after)
+				alloced := heaptest.Allocated(func() { err = tc.dec(rows) })
 
 				require.Error(t, err, "rows %d", rows)
-				require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(1<<20), "rows %d: rejected before allocating", rows)
+				require.Less(t, alloced, uint64(1<<20), "rows %d: rejected before allocating", rows)
 			}
 		})
 	}

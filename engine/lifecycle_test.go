@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 )
@@ -25,7 +26,7 @@ type gateWrites struct {
 }
 
 func (g *gateWrites) Write(ctx context.Context, key string, data []byte) error {
-	if isPartObject(key) {
+	if backendtest.IsPartObject(key) {
 		g.once.Do(func() { close(g.entered) })
 		<-g.release
 	}
@@ -114,7 +115,7 @@ func TestResetKeepsPartsUnderRead(t *testing.T) {
 
 	require.NoError(t, e.Flush(ctx))
 
-	dirs := partDirs(t, be, "default/metrics")
+	dirs := backendtest.PartDirs(ctx, t, be, "default/metrics")
 	require.Len(t, dirs, 1)
 
 	be.armed.Store(true)

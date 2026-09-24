@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -106,7 +107,7 @@ func TestLegacyIdentityObjectStillResolves(t *testing.T) {
 	mustAppend(t, e, api, 100, 1)
 	require.NoError(t, e.Flush(ctx))
 
-	dirs := partDirs(t, be, "t/legacy")
+	dirs := backendtest.PartDirs(ctx, t, be, "t/legacy")
 	require.Len(t, dirs, 1)
 
 	// Age the prefix: drop the part's identity object and leave the whole-set one in its place.

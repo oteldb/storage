@@ -17,6 +17,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/heaptest"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -45,27 +46,9 @@ func mergeCorpus(t *testing.T, series, samples, parts int, value func(r *rand.Ra
 		ids[i] = ser[i].Hash()
 	}
 
-	n := series * samples
-	batch := make([]signal.SeriesID, n)
-	ts := make([]int64, n)
-	vals := make([]float64, n)
-
-	for p := range parts {
-		k := 0
-		for i := range series {
-			for s := range samples {
-				batch[k] = ids[i]
-				ts[k] = int64((p*samples+s)*5000 + i%7)
-				vals[k] = value(r, i, p*samples+s)
-				k++
-			}
-		}
-
-		resolve := func(i int) signal.Series { return ser[i/samples] }
-		_, err := e.AppendBatch(batch, ts, vals, nil, resolve, engine.AppendLimits{})
-		require.NoError(t, err)
-		require.NoError(t, e.Flush(ctx))
-	}
+	flushCorpus(t, ctx, e, ser, ids, samples, parts,
+		func(p, i, s int) int64 { return int64((p*samples+s)*5000 + i%7) },
+		func(p, i, s int) float64 { return value(r, i, p*samples+s) })
 
 	return e, series * samples * parts
 }
@@ -98,18 +81,11 @@ func TestMergeAllocatesBelowRawRows(t *testing.T) {
 			ctx := context.Background()
 			e, rows := mergeCorpus(t, series, samples, parts, tc.value)
 
-			var before, after runtime.MemStats
-
 			runtime.GC()
-			runtime.ReadMemStats(&before)
-
-			require.NoError(t, e.Merge(ctx, 0))
-
-			runtime.ReadMemStats(&after)
 
 			var (
+				alloced = float64(heaptest.Allocated(func() { require.NoError(t, e.Merge(ctx, 0)) }))
 				raw     = float64(rows * partRowBytes)
-				alloced = float64(after.TotalAlloc - before.TotalAlloc)
 			)
 
 			t.Logf("rows=%d raw=%.1f MiB alloced=%.1f MiB ratio=%.2fx", rows, raw/(1<<20), alloced/(1<<20), alloced/raw)

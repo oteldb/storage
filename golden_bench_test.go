@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strconv"
 	"testing"
 	"time"
 
@@ -59,7 +60,7 @@ func goldenCorpus() metric.Metrics {
 	mt.Monotonic = true
 
 	for s := range goldenSeries {
-		route := append([]byte("/route/"), []byte(itoa(s))...)
+		route := append([]byte("/route/"), []byte(strconv.Itoa(s))...)
 		attrs := signal.NewAttributes(signal.KeyValue{Key: []byte("route"), Value: signal.StringValue(route)})
 		for p := range goldenPoints {
 			pt := mt.AddPoint()
@@ -71,23 +72,6 @@ func goldenCorpus() metric.Metrics {
 	}
 
 	return md
-}
-
-// itoa is a tiny allocation-light base-10 formatter (avoids importing strconv only for this).
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-
-	return string(buf[i:])
 }
 
 func goldenMatcher() fetch.Matcher {
@@ -163,17 +147,20 @@ func goldenDrain(b *testing.B, ctx context.Context, it fetch.Iterator) int {
 	return rows
 }
 
-// goldenReportPoints reports Mpoints/s and ns/point from the timed window over the points ingested.
-func goldenReportPoints(b *testing.B, pointsPerOp int) {
+// goldenReportPoints reports Mpoints/s from the timed window over the points ingested, and returns
+// the seconds per point (0 when nothing was timed).
+func goldenReportPoints(b *testing.B, pointsPerOp int) float64 {
 	b.Helper()
 
 	total := float64(pointsPerOp) * float64(b.N)
 	secs := b.Elapsed().Seconds()
 	if total == 0 || secs == 0 {
-		return
+		return 0
 	}
 
 	b.ReportMetric(total/secs/1e6, "Mpoints/s")
+
+	return secs / total
 }
 
 // goldenIsPartKey reports whether a backend key names a flushed value part (all-digit final
@@ -255,15 +242,15 @@ var (
 )
 
 // nodeCPUCorpus builds the deterministic node_cpu_seconds_total workload (no RNG): per instance, a
-// cumulative monotonic counter over every (cpu, mode) pair, each a ramp of nodeCPUPoints samples.
-func nodeCPUCorpus() metric.Metrics {
+// cumulative monotonic counter over every (cpu, mode) pair, each a ramp of points samples.
+func nodeCPUCorpus(instances, cpus, points int) metric.Metrics {
 	var md metric.Metrics
 
-	for inst := range nodeInstances {
+	for inst := range instances {
 		rm := md.AddResource()
 		rm.Resource = signal.Resource{Attributes: signal.NewAttributes(
 			signal.KeyValue{Key: []byte("job"), Value: signal.StringValue([]byte("node_exporter"))},
-			signal.KeyValue{Key: []byte("instance"), Value: signal.StringValue(append([]byte("host-"), itoa(inst)...))},
+			signal.KeyValue{Key: []byte("instance"), Value: signal.StringValue(append([]byte("host-"), strconv.Itoa(inst)...))},
 		)}
 
 		mt := rm.AddScope().AddMetric()
@@ -272,14 +259,14 @@ func nodeCPUCorpus() metric.Metrics {
 		mt.Temporality = metric.TemporalityCumulative
 		mt.Monotonic = true
 
-		for cpu := range nodeCPUs {
+		for cpu := range cpus {
 			for mode := range nodeCPUModes {
 				attrs := signal.NewAttributes(
-					signal.KeyValue{Key: []byte("cpu"), Value: signal.StringValue([]byte(itoa(cpu)))},
+					signal.KeyValue{Key: []byte("cpu"), Value: signal.StringValue([]byte(strconv.Itoa(cpu)))},
 					signal.KeyValue{Key: []byte("mode"), Value: signal.StringValue([]byte(nodeCPUModes[mode]))},
 				)
 
-				for p := range nodeCPUPoints {
+				for p := range points {
 					pt := mt.AddPoint()
 					pt.Ts = goldenStartTs + int64(p)*goldenInterval
 					pt.StartTs = goldenStartTs
@@ -305,7 +292,7 @@ func nodeCPUStore(b *testing.B) *Storage {
 		b.Fatal(err)
 	}
 
-	if _, err := s.WriteMetrics(ctx, nodeCPUCorpus()); err != nil {
+	if _, err := s.WriteMetrics(ctx, nodeCPUCorpus(nodeInstances, nodeCPUs, nodeCPUPoints)); err != nil {
 		b.Fatal(err)
 	}
 
@@ -743,14 +730,14 @@ func goldenLogRound(round int, logical *int64) log.Logs {
 	for s := range goldenLogStreams {
 		rl := ld.AddResource()
 		rl.Resource = signal.Resource{Attributes: signal.NewAttributes(
-			signal.KeyValue{Key: []byte("service.name"), Value: signal.StringValue(append([]byte("svc-"), itoa(s)...))},
+			signal.KeyValue{Key: []byte("service.name"), Value: signal.StringValue(append([]byte("svc-"), strconv.Itoa(s)...))},
 		)}
 		sl := rl.AddScope()
 
 		for i := range goldenLogPerStream {
-			body := append([]byte("GET /route/"), itoa(i%goldenLogTemplates)...)
+			body := append([]byte("GET /route/"), strconv.Itoa(i%goldenLogTemplates)...)
 			body = append(body, " status=200 latency=5ms done"...)
-			msg := append([]byte("processed region="), itoa(round)...)
+			msg := append([]byte("processed region="), strconv.Itoa(round)...)
 
 			r := sl.AddRecord()
 			r.Timestamp = int64(round*goldenLogPerStream+i) * goldenInterval

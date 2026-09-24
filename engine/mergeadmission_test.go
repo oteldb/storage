@@ -76,22 +76,9 @@ func flushTinyParts(t *testing.T, e *engine.Engine, n int) {
 		ids[i] = ser[i].Hash()
 	}
 
-	for p := range n {
-		batch := make([]signal.SeriesID, series)
-		ts := make([]int64, series)
-		vals := make([]float64, series)
-
-		for i := range series {
-			batch[i] = ids[i]
-			ts[i] = int64(p*1000 + i)
-			vals[i] = float64(p)
-		}
-
-		_, err := e.AppendBatch(batch, ts, vals, nil,
-			func(i int) signal.Series { return ser[i] }, engine.AppendLimits{})
-		require.NoError(t, err)
-		require.NoError(t, e.Flush(ctx))
-	}
+	flushCorpus(t, ctx, e, ser, ids, 1, n,
+		func(p, i, _ int) int64 { return int64(p*1000 + i) },
+		func(p, _, _ int) float64 { return float64(p) })
 }
 
 // TestMergeAdmissionIsTakenOnlyWhenThereIsWork is the placement rule. Admission is deliberately

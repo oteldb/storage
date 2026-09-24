@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -295,29 +296,12 @@ func TestPartSetFingerprintOrderIndependent(t *testing.T) {
 // what every cycle cost before the memo; the file backend is the deployed shape, where the
 // enumeration is syscalls rather than map lookups.
 func BenchmarkSizeCutoffsIdle(b *testing.B) {
-	backends := []struct {
-		name string
-		open func(b *testing.B) backend.Backend
-	}{
-		{"memory", func(*testing.B) backend.Backend { return backend.Memory() }},
-		{"file", func(b *testing.B) backend.Backend {
-			b.Helper()
-
-			be, err := file.New(b.TempDir())
-			if err != nil {
-				b.Fatal(err)
-			}
-
-			return be
-		}},
-	}
-
-	for _, bk := range backends {
-		b.Run(bk.name, func(b *testing.B) {
+	for _, bk := range []backendtest.Case{backendtest.Memory(), backendtest.Dir("file", file.New)} {
+		b.Run(bk.Name, func(b *testing.B) {
 			ctx := context.Background()
 
 			s, err := Open(ctx, Options{},
-				WithBackend(bk.open(b)),
+				WithBackend(bk.Open(b)),
 				WithFlushInterval(-1), // no background loop: the benchmark drives maintenance
 				WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
 					return tenant.Policy{

@@ -11,6 +11,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/heaptest"
 )
 
 func TestIdentityBytesOutlivesFlush(t *testing.T) {
@@ -69,7 +70,7 @@ func TestIdentityBytesApproximatesHeap(t *testing.T) {
 	ctx := context.Background()
 	e := engine.New(engine.Config{Backend: backend.Memory(), Prefix: "t/identity-heap"})
 
-	base := heapAlloc()
+	base := int64(heaptest.Live())
 
 	for i := range series {
 		mustAppend(t, e, mkSeries("job", "api", "region", "eu", "inst", strconv.Itoa(i)), int64(i), 1)
@@ -82,7 +83,7 @@ func TestIdentityBytesApproximatesHeap(t *testing.T) {
 	require.EqualValues(t, series, st.Series)
 
 	// Keep the engine (and so its identity state) reachable across the measurement.
-	grew := heapAlloc() - base
+	grew := int64(heaptest.Live()) - base
 	runtime.KeepAlive(e)
 
 	reported := st.IdentityBytes
@@ -95,16 +96,4 @@ func TestIdentityBytesApproximatesHeap(t *testing.T) {
 	// without going green on a genuinely broken counter.
 	assert.Greater(t, reported, grew*3/4, "identity accounting must not under-report by >25 %")
 	assert.Less(t, reported, grew*5/4, "identity accounting must not over-report by >25 %")
-}
-
-// heapAlloc returns the live heap after a collection, so two readings bracket what a workload
-// retained rather than what it churned through.
-func heapAlloc() int64 {
-	runtime.GC()
-
-	var ms runtime.MemStats
-
-	runtime.ReadMemStats(&ms)
-
-	return int64(ms.HeapAlloc)
 }

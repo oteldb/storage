@@ -4,6 +4,7 @@ import (
 	"context"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -158,20 +159,34 @@ func buildNamedSeries(n int, name string) ([]signal.Series, []signal.SeriesID) {
 	ids := make([]signal.SeriesID, n)
 
 	for i := range n {
-		ser[i] = mkSeries("__name__", name, "instance", "host-"+itoa(i), "device", "sda")
+		ser[i] = mkSeries("__name__", name, "instance", "host-"+strconv.Itoa(i), "device", "sda")
 		ids[i] = ser[i].Hash()
 	}
 
 	return ser, ids
 }
 
-// flushParts writes `samples` consecutive samples per series into one flushed part.
+// flushParts writes `samples` consecutive samples per series into each of `parts` flushed parts.
 func flushParts(b *testing.B, ctx context.Context, e *engine.Engine, ser []signal.Series, ids []signal.SeriesID, samples, stepSec, parts int) {
 	b.Helper()
 
+	flushCorpus(b, ctx, e, ser, ids, samples, parts,
+		func(p, i, s int) int64 { return int64(p*samples+s)*int64(stepSec) + int64(i) },
+		func(_, i, _ int) float64 { return float64(i) })
+}
+
+// flushCorpus flushes `parts` parts, each holding `samples` consecutive samples of every series.
+// Series i's s-th sample in part p is (ts(p, i, s), val(p, i, s)), and ts is called before val, so
+// a shared RNG draws in the same order either way.
+func flushCorpus(
+	tb testing.TB, ctx context.Context, e *engine.Engine, ser []signal.Series, ids []signal.SeriesID,
+	samples, parts int, ts func(p, i, s int) int64, val func(p, i, s int) float64,
+) {
+	tb.Helper()
+
 	n := len(ids) * samples
 	batchIDs := make([]signal.SeriesID, n)
-	ts := make([]int64, n)
+	tss := make([]int64, n)
 	vals := make([]float64, n)
 
 	for p := range parts {
@@ -179,19 +194,19 @@ func flushParts(b *testing.B, ctx context.Context, e *engine.Engine, ser []signa
 		for i := range ids {
 			for s := range samples {
 				batchIDs[k] = ids[i]
-				ts[k] = int64(p*samples+s)*int64(stepSec) + int64(i)
-				vals[k] = float64(i)
+				tss[k] = ts(p, i, s)
+				vals[k] = val(p, i, s)
 				k++
 			}
 		}
 
 		resolve := func(i int) signal.Series { return ser[i/samples] }
-		if _, err := e.AppendBatch(batchIDs, ts, vals, nil, resolve, engine.AppendLimits{}); err != nil {
-			b.Fatal(err)
+		if _, err := e.AppendBatch(batchIDs, tss, vals, nil, resolve, engine.AppendLimits{}); err != nil {
+			tb.Fatal(err)
 		}
 
 		if err := e.Flush(ctx); err != nil {
-			b.Fatal(err)
+			tb.Fatal(err)
 		}
 	}
 }
