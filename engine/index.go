@@ -44,10 +44,14 @@ const indexCommitAttempts = 8
 // where every replica of a shard writes one index object) makes the commit fail rather than
 // overwrite: the loser then rebases on what was committed and tries again, so neither writer's
 // part is dropped from the index that survives. It is a no-op for a head-only engine (no
-// backend). Caller holds e.mu.
+// backend), and refused while the engine is fenced ([Engine.fenceLocked]). Caller holds e.mu.
 func (e *Engine) updateIndexLocked(ctx context.Context) error {
 	if e.cfg.Backend == nil {
 		return nil
+	}
+
+	if err := e.fenceLocked(); err != nil {
+		return err
 	}
 
 	for range indexCommitAttempts {
@@ -473,35 +477,36 @@ func (p *part) matchesEntry(ent *bucketindex.Entry) bool {
 		p.level == ent.Level && p.blocks.Equal(ent.Blocks) && p.claim.Equal(ent.Claim)
 }
 
-// loadPartsLocked is [Engine.LoadParts] under a [loadMode]. Caller holds e.mu.
-func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
-	sweep := mode != loadReplica
+// indexLoad is the state a load replaces, read and opened into locals so that a load failing
+// anywhere before [Engine.adoptLoadLocked] leaves the engine exactly as it was.
+type indexLoad struct {
+	ix      *bucketindex.Index
+	version backend.Version
+	parts   []*part
+	indexed map[string]struct{}
+	holes   []bucketindex.Entry
+	lost    []bucketindex.Want
+	// dropped reports that a handle the engine held is neither in the new set nor carried.
+	dropped bool
+	// carried reports that parts holds flushed parts whose commit never landed.
+	carried bool
+}
 
-	if e.cfg.Backend == nil {
-		return nil
-	}
-
+// readIndexLocked loads the bucket index and opens the parts it names, writing nothing on the
+// engine. Caller holds e.mu.
+func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, error) {
 	ix, version, err := bucketindex.LoadVersioned(ctx, e.cfg.Backend, e.indexKey())
 	if err != nil {
 		e.countCorrupt(ctx, err, "bucket_index", obs.CorruptFatal)
 
-		return errors.Wrap(err, "load bucket index")
+		return nil, errors.Wrap(err, "load bucket index")
 	}
 
-	// The loaded state is now the one this engine's next commit conditions on, and it accounts
-	// for every entry the index names, so nothing is foreign any more.
-	e.indexVersion = version
-	e.foreign = nil
-	// Everything the index names is opened below, so the adopted handles have no separate life
-	// left. Their objects belong to their writer and are not deleted here.
-	e.foreignParts = nil
-
-	parts := make([]*part, 0, len(ix.Entries))
-
-	var (
-		holes []bucketindex.Entry
-		lost  []bucketindex.Want
-	)
+	l := &indexLoad{
+		ix: ix, version: version,
+		parts:   make([]*part, 0, len(ix.Entries)),
+		indexed: make(map[string]struct{}, len(ix.Entries)),
+	}
 
 	// The previous load's handles, which [Engine.livePart] reuses and takes out of the map; each is
 	// therefore claimed by at most one entry, and whatever is left over was dropped by this index.
@@ -510,13 +515,16 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 		open[p.prefix] = p
 	}
 
+	named := make(map[string]struct{}, len(ix.Entries))
+
 	for i := range ix.Entries {
 		ent := &ix.Entries[i]
+		named[ent.Prefix] = struct{}{}
 
 		// A hole names no objects, so there is nothing to open: it is carried as what it is, an
 		// acknowledged loss the next repair pass re-attempts.
 		if ent.Hole {
-			holes = append(holes, *ent)
+			l.holes = append(l.holes, *ent)
 
 			continue
 		}
@@ -526,41 +534,126 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 			if !partGone(err) {
 				e.countCorrupt(ctx, err, "part", obs.CorruptFatal)
 
-				return err
+				return nil, err
 			}
 
 			zctx.From(ctx).Error("part named by the index is gone; recording a repair",
 				zap.String("prefix", ent.Prefix), zap.Error(err))
 
-			lost = append(lost, bucketindex.WantOf(*ent, e.generation))
+			l.lost = append(l.lost, bucketindex.WantOf(*ent, e.generation))
 
 			continue
 		}
 
-		parts = append(parts, p)
+		l.parts = append(l.parts, p)
+		// Only the parts that opened: a lost one left out is what keeps the next commit from also
+		// calling it a removal, which would restate a loss as a deliberate deletion.
+		l.indexed[p.prefix] = struct{}{}
 	}
 
-	e.holes, e.lostParts, e.allocated = holes, ix.LostParts, ix.AllocatedBlocks
+	// A flushed part whose commit failed is in no index, and its rows have already left the head:
+	// dropping the handle here would leave them readable nowhere until a restart replays the WAL.
+	// It is kept for the next commit to publish, as it would have been without the reload.
+	for _, p := range e.parts {
+		if _, ok := named[p.prefix]; ok || p.pending == nil {
+			continue
+		}
+
+		l.parts = append(l.parts, p)
+		l.carried = true
+
+		delete(open, p.prefix)
+	}
+
+	l.dropped = len(open) > 0
+
+	return l, nil
+}
+
+// adoptLoadLocked makes l the engine's state and lifts the commit fence. It cannot fail, which is
+// what makes a load all-or-nothing. Caller holds e.mu.
+func (e *Engine) adoptLoadLocked(l *indexLoad) {
+	// The loaded index is the one the next commit conditions on, and it accounts for every entry it
+	// names, so nothing is foreign any more. The adopted handles' objects belong to their writer and
+	// are not deleted here.
+	e.indexVersion = l.version
+	e.foreign, e.foreignParts = nil, nil
+
+	e.holes, e.lostParts, e.allocated = l.holes, l.ix.LostParts, l.ix.AllocatedBlocks
 
 	// A part disappearing means identities may have died with it, which is what arms the identity
 	// prune on a node that never merges (a replica adopting the owner's part set).
-	if len(open) > 0 {
+	if l.dropped {
 		e.identityDirty = true
 	}
 
-	e.parts = parts
-	e.flushedEpoch = ix.WriterEpoch(e.cfg.WriterID)
-	e.epochs, e.anonEpoch = ix.Epochs, ix.FlushedEpoch
-	e.generation = ix.Generation
-	e.removals = ix.Removed
-	e.wants, e.pendingWants = ix.Wanted, lost
-	e.indexed = make(map[string]struct{}, len(parts))
+	e.parts, e.indexed = l.parts, l.indexed
 
-	// Only the parts that opened: a lost one left out of e.indexed is what keeps the commit below
-	// from also calling it a removal, which would restate a loss as a deliberate deletion.
-	for _, p := range parts {
-		e.indexed[p.prefix] = struct{}{}
+	// A carried part holds the records of a flush this engine counted but never committed, so the
+	// watermark must not fall below it.
+	flushed := l.ix.WriterEpoch(e.cfg.WriterID)
+	if l.carried {
+		flushed = max(flushed, e.flushedEpoch)
 	}
+
+	e.flushedEpoch = flushed
+	e.epochs, e.anonEpoch = l.ix.Epochs, l.ix.FlushedEpoch
+	e.generation = l.ix.Generation
+	e.removals = l.ix.Removed
+	e.wants, e.pendingWants = l.ix.Wanted, l.lost
+	e.loadErr = nil
+}
+
+// fenceLocked is the error every commit returns while the last index load failed, nil otherwise.
+// Caller holds e.mu.
+func (e *Engine) fenceLocked() error {
+	if e.loadErr == nil {
+		return nil
+	}
+
+	return errors.Wrapf(bucketindex.ErrFenced, "%s: last load: %v", e.cfg.Prefix, e.loadErr)
+}
+
+func (e *Engine) fence() error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	return e.fenceLocked()
+}
+
+// ReloadFenced retries the index load of an engine whose last load failed, lifting the commit fence
+// once one succeeds; a no-op when the engine is not fenced. It loads like [Engine.RefreshReplica]
+// but trims no head: an owner's head holds records that are in no part yet.
+func (e *Engine) ReloadFenced(ctx context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.loadErr == nil {
+		return nil
+	}
+
+	return e.loadPartsLocked(ctx, loadReplica)
+}
+
+// loadPartsLocked is [Engine.LoadParts] under a [loadMode]. A load that fails before the index is
+// adopted changes nothing but the fence: every commit is refused until a load succeeds. Caller holds
+// e.mu.
+func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
+	sweep := mode != loadReplica
+
+	if e.cfg.Backend == nil {
+		return nil
+	}
+
+	l, err := e.readIndexLocked(ctx)
+	if err != nil {
+		e.loadErr = err
+		e.cfg.Obs.Corruption.FencedLoad(ctx, metricSignal)
+
+		return err
+	}
+
+	e.adoptLoadLocked(l)
 
 	// New head records belong to the generation past the recovered watermark; replay (which the
 	// facade runs next) then skips everything the loaded parts already hold.
@@ -575,14 +668,16 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 	}
 
 	// One commit drops the gone parts from Entries and states the wants that replace them. It runs
-	// before the rest of the load so the obligation is durable even if identity recovery fails.
-	if len(lost) > 0 && mode == loadOwner {
+	// before the rest of the load so the obligation is durable even if identity recovery fails. A
+	// carried part's identity would be stamped by this commit, which does not hold flushMu, so the
+	// wants then stay pending for the next flush or merge to commit.
+	if len(l.lost) > 0 && mode == loadOwner && !l.carried {
 		if err := e.updateIndexLocked(ctx); err != nil {
 			return errors.Wrap(err, "record repair wants")
 		}
 	}
 
-	complete, err := e.loadIdentitiesLocked(ctx, parts)
+	complete, err := e.loadIdentitiesLocked(ctx, l.parts)
 	if err != nil {
 		return err
 	}

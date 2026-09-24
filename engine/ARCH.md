@@ -281,6 +281,36 @@ verifier reclaimed objects from the directory it was pointed at. It backs `stora
 which then keeps the guarantee at the facade for the life of the handle.
 
 
+## A failed load changes nothing, and fences every commit
+
+A load is all-or-nothing. `readIndexLocked` reads the index and opens every part it names into
+locals, touching nothing on the engine, and `adoptLoadLocked` — which cannot fail — installs the
+whole set at once: the CAS token, the parts, `foreign`, holes, wants, epochs, generation, removals,
+`indexed`. Adopting any of them early is the failure this orders against: a load that takes the new
+index version and then fails on a part leaves the engine with the new token and the old part set,
+and its next commit passes the compare-and-swap and drops every entry it never opened.
+
+A load that fails before adopting also **fences** the engine (`loadErr`): `updateIndexLocked`, the
+single commit path, refuses with `bucketindex.ErrFenced`, so flush, merge, retention drops, repair,
+the owner-load want commit, a rebase and `CompactNow` are all covered by one check. Keeping the old
+state is not enough on its own: committing on a view that is known to be stale can still race a
+peer's backfill. Flush and merge also check before doing their I/O, and flush checks again under
+the lock that publishes its part, so a flush fenced mid-write folds its records back into the head
+rather than publishing a part the next reload would not keep. Reads keep serving the old part set.
+
+The fence lifts only when a load succeeds. An owner reloads only after a backfill, so the facade's
+maintenance calls `ReloadFenced` every cycle, before the flush; a replica's `RefreshReplica` is
+already a load each cycle. `ReloadFenced` loads without the replica's head trim, since an owner's
+head holds records no part has. An unopenable part is deliberately not turned into a want the way a
+gone one is (see below): it keeps the engine fenced, retried every cycle and surfaced as
+`Stats.IndexFenced` and the `index.fenced_loads` counter (`ADMIN.md`), for an operator to resolve.
+
+A reload keeps a flushed part whose commit failed (identity still pending, named by no index):
+its records already left the head, so dropping the handle would make them unreadable until a
+restart replays the WAL. The next commit publishes it, and the flush watermark does not fall below
+the flush that wrote it.
+
+
 ## A part the owner cannot read becomes a want, not a removal
 
 A part `LoadParts` cannot open must not fail the whole engine — that turns one lost part into a node
@@ -1066,8 +1096,9 @@ The owner's commit is the one writer of a published part's block identity. `upda
 `blocks`/`claim`/`level` onto a part only once its CAS lands, and a flush whose commit failed leaves
 its part published with the identity still pending. That is safe because the one reader of those
 fields outside `e.mu`, `planMergeBlocks`, runs under `flushMu`. Every commit that can find a pending
-identity holds `flushMu` too: flush, merge, retention drop and repair. A reload clears none, because it
-publishes only handles with nothing pending.
+identity holds `flushMu` too: flush, merge, retention drop and repair. A reload stamps none: the only
+pending handles it publishes are flushed parts whose commit failed, carried over as they are, and an
+owner load that carries one leaves its want commit to the next flush or merge.
 
 Reuse cannot skip noticing that a part's objects have gone away, which is what turns a lost part into
 a want. A reused handle is probed with `block.PartPresent` — the manifest, the commit point of a part

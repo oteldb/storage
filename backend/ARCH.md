@@ -159,7 +159,9 @@ a demonstration.
   their generation above the winner's, record the winner's entries as *foreign* — entries they
   neither wrote nor removed, carried into every later commit so they are never dropped — **open**
   them, and retry, bounded at 8 attempts. Exhausting the bound fails the flush or merge that asked for the commit,
-  because a part whose entry never landed is unreachable.
+  because a part whose entry never landed is unreachable. A writer whose last load failed refuses
+  to commit at all and wraps `ErrFenced`: a version is only safe to commit against together with
+  the part set read with it (`engine/ARCH.md`).
 - **Part identity is a block *set* plus a level** (`bucketindex.Interval`, `Entry.Level`, format
   v6). A flush writes `{n}` at level 0; a merge writes the union of what its inputs covered, above
   them. `Entry.Supersedes` is then decidable from identity alone — no index diff, no bookkeeping,

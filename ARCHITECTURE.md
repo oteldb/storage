@@ -201,7 +201,10 @@ to fail over to: a read overlapping a want fails.
   part swept by a later open once it is older than `OrphanGrace` (younger, it may be another
   writer's uncommitted part) — never rows that are committed but unresolvable. The commit is a
   `backend.CompareAndSwap` against the version the writer read, so two writers over one prefix (a
-  shared store) cannot overwrite each other's entries; the loser reloads and retries.
+  shared store) cannot overwrite each other's entries; the loser reloads and retries. The version
+  and the part set it guards move together: a load either adopts the whole index or changes nothing,
+  and one that fails fences the writer — no commit — until a load succeeds (`engine/ARCH.md`, *A
+  failed load changes nothing, and fences every commit*).
 - **Mutating the backend at open is opt-out, and opting out is total.** Recovery's orphan sweep is
   the one write that happens before any caller-settable state exists, so a reader that only wanted to
   look — a backup, a verifier, an offline inspector — reclaimed objects from the directory it was

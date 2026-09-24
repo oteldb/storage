@@ -92,7 +92,10 @@ func (e metricEngine) Parts() []enginetest.Part {
 func (e metricEngine) Stats() enginetest.Stats {
 	st := e.Engine.Stats()
 
-	return enginetest.Stats{HeadAge: st.HeadAge, WantedParts: st.WantedParts, Holes: st.Holes, LostParts: st.LostParts}
+	return enginetest.Stats{
+		HeadAge: st.HeadAge, WantedParts: st.WantedParts, Holes: st.Holes, LostParts: st.LostParts,
+		IndexFenced: st.IndexFenced,
+	}
 }
 
 func (e metricEngine) MergeShape() enginetest.MergeShape {

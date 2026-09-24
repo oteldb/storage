@@ -773,6 +773,11 @@ func LoadVersioned(ctx context.Context, b backend.Backend, key string) (*Index, 
 // about. The caller reloads and retries; only exhausting its retries is a real failure.
 var ErrConflict = errors.New("bucketindex: index changed since it was loaded")
 
+// ErrFenced is returned (wrapped) by a writer that refuses to commit because its last index load
+// failed: its view of the index is not the stored one, so a commit from it could drop entries it
+// never opened. The fence lifts when a later load succeeds.
+var ErrFenced = errors.New("bucketindex: commit fenced by a failed index load")
+
 // Save commits the index under key, replacing the version the caller loaded and nothing else.
 // It returns the version the committed index now has, which the committer holds for its next
 // commit without re-reading the object. Pass [backend.VersionAbsent] as expected to commit an

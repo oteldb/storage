@@ -48,6 +48,12 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 		zap.Bool("downsample", len(opts.Downsample) > 0),
 		zap.Bool("recompress", opts.Recompress != nil))
 
+	// A fenced engine would do the whole merge, and repair's peer fetches, only for the commit to
+	// refuse them.
+	if err := e.fence(); err != nil {
+		return err
+	}
+
 	// Repair first: a part pulled back from a peer joins this cycle's compaction, and a merge that
 	// cannot repair still compacts.
 	e.repairWants(ctx)

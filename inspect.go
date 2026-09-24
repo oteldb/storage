@@ -125,6 +125,12 @@ type SignalStats struct {
 	// owner reads the same number, so it is the durable answer to "did this shard ever lose data?"
 	// — unlike Holes, which is the current state.
 	LostParts uint64
+	// IndexFenced is true while this engine's last bucket-index load failed (an unreadable index,
+	// or a part it names that could not be opened). The engine then commits nothing — flush, merge,
+	// retention and repair are all refused, so the head keeps its records and grows — and every
+	// maintenance cycle retries the load. Reads keep answering from the last part set that loaded.
+	// It clears when a load succeeds; one that stays set is a part this node cannot read.
+	IndexFenced bool
 }
 
 // ClusterStats is the cluster-mode view of this node.
@@ -252,6 +258,7 @@ func (s *Storage) Inspect() StoreStats {
 			MergeCapBytes: sh.CapBytes, OutOfSpace: es.OutOfSpace,
 			WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 			WantedParts: es.WantedParts, Holes: es.Holes, LostParts: es.LostParts,
+			IndexFenced: es.IndexFenced,
 		})
 		s.attachReadGap(&ts.Signals[len(ts.Signals)-1], signal.Metric, tid)
 
@@ -280,6 +287,7 @@ func (s *Storage) Inspect() StoreStats {
 				MergeCapBytes: sh.CapBytes, OutOfSpace: es.OutOfSpace,
 				WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 				WantedParts: es.WantedParts, Holes: es.Holes, LostParts: es.LostParts,
+				IndexFenced: es.IndexFenced,
 			})
 			s.attachReadGap(&ts.Signals[len(ts.Signals)-1], sig, tid)
 		}

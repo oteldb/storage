@@ -1,8 +1,11 @@
 package engine
 
 import (
+	"fmt"
+	"maps"
 	"slices"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 )
 
@@ -70,3 +73,46 @@ func (e *Engine) PartPrefixes() []string {
 
 // SetMergeReadWindow sets how much of each source column a merge reads ahead.
 func (e *Engine) SetMergeReadWindow(n int64) { e.mergeReadWindow = n }
+
+// LoadState snapshots every field an index load replaces, so a test can tell that a failed load
+// changed none of them. Part handles compare by identity.
+func (e *Engine) LoadState() any {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	parts := make([]string, 0, len(e.parts))
+	for _, p := range e.parts {
+		parts = append(parts, fmt.Sprintf("%s@%p", p.prefix, p))
+	}
+
+	foreign := make([]string, 0, len(e.foreignParts))
+	for prefix, p := range e.foreignParts {
+		foreign = append(foreign, fmt.Sprintf("%s@%p", prefix, p))
+	}
+
+	slices.Sort(foreign)
+
+	return struct {
+		IndexVersion  backend.Version
+		Foreign       []bucketindex.Entry
+		ForeignParts  []string
+		Parts         []string
+		Indexed       map[string]struct{}
+		Holes         []bucketindex.Entry
+		LostParts     uint64
+		Allocated     uint64
+		IdentityDirty bool
+		FlushedEpoch  uint64
+		Epochs        []bucketindex.WriterEpoch
+		AnonEpoch     uint64
+		Generation    bucketindex.Generation
+		Removals      []bucketindex.Removal
+		Wants         []bucketindex.Want
+		PendingWants  []bucketindex.Want
+	}{
+		e.indexVersion, slices.Clone(e.foreign), foreign, parts, maps.Clone(e.indexed),
+		slices.Clone(e.holes), e.lostParts, e.allocated, e.identityDirty, e.flushedEpoch,
+		slices.Clone(e.epochs), e.anonEpoch, e.generation, slices.Clone(e.removals),
+		slices.Clone(e.wants), slices.Clone(e.pendingWants),
+	}
+}

@@ -16,7 +16,7 @@ func countingEngineOps(calls *int) engineOps {
 	noop := func() error { return nil }
 
 	return engineOps{
-		flush: noop, merge: noop, refresh: noop,
+		flush: noop, merge: noop, refresh: noop, reload: noop,
 		adopt: func([]bucketindex.Want) {},
 		ecParts: func() []ecPartRef {
 			*calls++

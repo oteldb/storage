@@ -1363,7 +1363,10 @@ func (s *Storage) walFor(prefix string) (*wal.SegmentWriter, error) {
 // engineOps is one engine's maintenance callbacks, bound by the caller that holds the engine.
 type engineOps struct {
 	flush, merge, refresh func() error
-	adopt                 func([]bucketindex.Want)
+	// reload retries a fenced engine's failed index load, a no-op otherwise. An owner reloads only
+	// after a backfill, so without it one failed load would refuse its commits for good.
+	reload func() error
+	adopt  func([]bucketindex.Want)
 	// ecParts is passed unevaluated: the EC callees run it past their scheme guard, so a tenant
 	// without EC never pays for the parts snapshot.
 	ecParts func() []ecPartRef
@@ -1402,6 +1405,8 @@ func (s *Storage) maintainOneEngine(
 		// flushing so the part sequence advances past the synced parts.
 		s.refreshOrLog(ctx, "backfill refresh failed", enginePrefix, ops.refresh)
 	}
+
+	s.refreshOrLog(ctx, "fenced index reload failed", enginePrefix, ops.reload)
 
 	_ = ops.flush()
 	_ = ops.merge()
@@ -1710,11 +1715,11 @@ func (s *Storage) maintain(ctx context.Context) {
 	// own backend; the owner backfills strictly-newer peer parts before compacting, so a
 	// newly-gained owner never restarts a shard's part sequence from scratch.
 	maintainEngine := func(
-		tid signal.TenantID, signalPrefix string, flush, merge, refresh func() error,
+		tid signal.TenantID, signalPrefix string, flush, merge, refresh, reload func() error,
 		adopt func([]bucketindex.Want), ecParts func() []ecPartRef,
 	) {
 		s.maintainOneEngine(ctx, tid, signalPrefix, owned, engineOps{
-			flush: flush, merge: merge, refresh: refresh, adopt: adopt, ecParts: ecParts,
+			flush: flush, merge: merge, refresh: refresh, reload: reload, adopt: adopt, ecParts: ecParts,
 		})
 	}
 
@@ -1788,6 +1793,7 @@ func (s *Storage) maintain(ctx context.Context) {
 			maintainEngine(tid, metricsPrefix, func() error { return eng.Flush(ctx) },
 				func() error { return mergeMetrics(tid, eng) },
 				func() error { return refreshMetrics(eng) },
+				func() error { return eng.ReloadFenced(ctx) },
 				eng.AdoptWants,
 				func() []ecPartRef { return coldMetric(eng) })
 		}})
@@ -1827,6 +1833,7 @@ func (s *Storage) maintain(ctx context.Context) {
 				maintainEngine(tid, signalPrefix, func() error { return eng.Flush(ctx) },
 					func() error { return mergeRecords(tid, eng, sig) },
 					func() error { return refreshRecords(eng) },
+					func() error { return eng.ReloadFenced(ctx) },
 					eng.AdoptWants,
 					func() []ecPartRef { return coldRecord(eng) })
 			}})

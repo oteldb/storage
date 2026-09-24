@@ -91,7 +91,10 @@ func (e recordEngine) Parts() []enginetest.Part {
 func (e recordEngine) Stats() enginetest.Stats {
 	st := e.Engine.Stats()
 
-	return enginetest.Stats{HeadAge: st.HeadAge, WantedParts: st.WantedParts, Holes: st.Holes, LostParts: st.LostParts}
+	return enginetest.Stats{
+		HeadAge: st.HeadAge, WantedParts: st.WantedParts, Holes: st.Holes, LostParts: st.LostParts,
+		IndexFenced: st.IndexFenced,
+	}
 }
 
 func (e recordEngine) MergeShape() enginetest.MergeShape {
