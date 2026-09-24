@@ -32,6 +32,12 @@ func (g *Gate) Rule(kind Kind, match func(Op) bool) Rule {
 	return Rule{Kind: kind, Match: match, Before: g.hold, Times: 1}
 }
 
+// RuleAll is [Gate.Rule] holding every matching operation, not only the first, until
+// [Gate.Release]. [Gate.Await] still reports the first to arrive.
+func (g *Gate) RuleAll(kind Kind, match func(Op) bool) Rule {
+	return Rule{Kind: kind, Match: match, Before: g.hold}
+}
+
 // Await blocks until an operation is suspended at the gate and returns it, failing the test if
 // none arrives.
 func (g *Gate) Await(tb testing.TB) Op {

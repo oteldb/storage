@@ -2,8 +2,10 @@ package faultbackend_test
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/assert"
@@ -104,7 +106,7 @@ func TestOpsRecordsEveryOperation(t *testing.T) {
 	require.NoError(t, be.Delete(ctx, "k"))
 
 	assert.Equal(t, []faultbackend.Op{
-		{Kind: faultbackend.Write, Key: "k"},
+		{Kind: faultbackend.Write, Key: "k", Bytes: 1},
 		{Kind: faultbackend.Read, Key: "k"},
 		{Kind: faultbackend.Delete, Key: "k"},
 	}, be.Ops())
@@ -139,7 +141,7 @@ func TestGateSuspendsUntilReleased(t *testing.T) {
 		assert.NoError(t, be.Write(ctx, "gated", []byte("late")))
 	})
 
-	assert.Equal(t, faultbackend.Op{Kind: faultbackend.Write, Key: "gated"}, gate.Await(t))
+	assert.Equal(t, faultbackend.Op{Kind: faultbackend.Write, Key: "gated", Bytes: 4}, gate.Await(t))
 
 	_, err := be.Read(ctx, "gated")
 	require.ErrorIs(t, err, backend.ErrNotExist, "a gated write must not reach the store before release")
@@ -222,4 +224,216 @@ func TestReplaceLeavesAFailedReadAlone(t *testing.T) {
 
 	_, err := be.Read(ctx, "k")
 	require.ErrorIs(t, err, errInjected)
+}
+
+func TestOpBytesRecordsStoredLength(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+	require.NoError(t, be.Write(ctx, "w", []byte("abc")))
+	_, err := be.PutIfAbsent(ctx, "p", []byte("de"))
+	require.NoError(t, err)
+	_, _, err = be.CompareAndSwap(ctx, "c", backend.VersionAbsent, []byte("f"))
+	require.NoError(t, err)
+	_, err = be.Read(ctx, "w")
+	require.NoError(t, err)
+
+	assert.Equal(t, []faultbackend.Op{
+		{Kind: faultbackend.Write, Key: "w", Bytes: 3},
+		{Kind: faultbackend.PutIfAbsent, Key: "p", Bytes: 2},
+		{Kind: faultbackend.CompareAndSwap, Key: "c", Bytes: 1},
+		{Kind: faultbackend.Read, Key: "w"},
+	}, be.Ops())
+	assert.Equal(t, 6, be.Bytes(func(faultbackend.Op) bool { return true }))
+	assert.Equal(t, 3, be.Bytes(func(op faultbackend.Op) bool { return op.Kind == faultbackend.Write }))
+}
+
+func TestLoseReportsALostRaceWithoutError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+	be.Add(faultbackend.Rule{Kind: faultbackend.PutIfAbsent, Lose: true})
+	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Lose: true})
+
+	ok, err := be.PutIfAbsent(ctx, "p", []byte("v"))
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	version, ok, err := be.CompareAndSwap(ctx, "c", backend.VersionAbsent, []byte("v"))
+	require.NoError(t, err)
+	assert.False(t, ok)
+	assert.Equal(t, backend.VersionAbsent, version)
+
+	for _, key := range []string{"p", "c"} {
+		_, err := be.Read(ctx, key)
+		require.ErrorIs(t, err, backend.ErrNotExist, "a lost race stores nothing")
+	}
+}
+
+func TestErrTakesPrecedenceOverLose(t *testing.T) {
+	t.Parallel()
+
+	be := faultbackend.Wrap(backend.Memory())
+	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Lose: true, Err: errInjected})
+
+	_, _, err := be.CompareAndSwap(context.Background(), "c", backend.VersionAbsent, nil)
+	require.ErrorIs(t, err, errInjected)
+}
+
+// TestAfterSeesOnlyLandedValues guards what an invariant checker relies on: it is shown every value
+// that landed, and nothing that did not.
+func TestAfterSeesOnlyLandedValues(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+
+	var seen []string
+	be.Add(faultbackend.Rule{
+		Kind:  faultbackend.CompareAndSwap,
+		After: func(op faultbackend.Op, data []byte) { seen = append(seen, op.Key+"="+string(data)) },
+	})
+
+	v1, ok, err := be.CompareAndSwap(ctx, "k", backend.VersionAbsent, []byte("1"))
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	_, ok, err = be.CompareAndSwap(ctx, "k", backend.VersionAbsent, []byte("stale"))
+	require.NoError(t, err)
+	require.False(t, ok, "a genuinely lost race")
+
+	_, ok, err = be.CompareAndSwap(ctx, "k", v1, []byte("2"))
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	assert.Equal(t, []string{"k=1", "k=2"}, seen)
+}
+
+func TestAfterSkipsFailedOperations(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+
+	var calls int
+	after := func(faultbackend.Op, []byte) { calls++ }
+	be.Add(faultbackend.Rule{Kind: faultbackend.Write, Err: errInjected, After: after})
+	be.Add(faultbackend.Rule{Kind: faultbackend.PutIfAbsent, Lose: true, After: after})
+	be.Add(faultbackend.Rule{Kind: faultbackend.Read, After: after})
+
+	require.ErrorIs(t, be.Write(ctx, "k", nil), errInjected)
+	_, err := be.PutIfAbsent(ctx, "k", nil)
+	require.NoError(t, err)
+	_, err = be.Read(ctx, "k")
+	require.ErrorIs(t, err, backend.ErrNotExist)
+
+	assert.Zero(t, calls)
+}
+
+func TestAfterRunsForEveryKind(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+
+	var seen []faultbackend.Kind
+	for _, kind := range []faultbackend.Kind{
+		faultbackend.Read, faultbackend.Write, faultbackend.PutIfAbsent, faultbackend.CompareAndSwap,
+		faultbackend.ReadVersioned, faultbackend.List, faultbackend.Delete,
+	} {
+		be.Add(faultbackend.Rule{Kind: kind, After: func(op faultbackend.Op, _ []byte) { seen = append(seen, op.Kind) }})
+	}
+
+	require.NoError(t, be.Write(ctx, "w", []byte("v")))
+	_, err := be.Read(ctx, "w")
+	require.NoError(t, err)
+	_, err = be.PutIfAbsent(ctx, "p", nil)
+	require.NoError(t, err)
+	_, _, err = be.CompareAndSwap(ctx, "c", backend.VersionAbsent, nil)
+	require.NoError(t, err)
+	_, _, err = be.ReadVersioned(ctx, "w")
+	require.NoError(t, err)
+	_, err = be.List(ctx, "")
+	require.NoError(t, err)
+	require.NoError(t, be.Delete(ctx, "w"))
+
+	assert.Equal(t, []faultbackend.Kind{
+		faultbackend.Write, faultbackend.Read, faultbackend.PutIfAbsent, faultbackend.CompareAndSwap,
+		faultbackend.ReadVersioned, faultbackend.List, faultbackend.Delete,
+	}, seen)
+}
+
+func TestAfterSeesReplacedRead(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+	require.NoError(t, be.Write(ctx, "k", []byte("v")))
+
+	var got []byte
+	be.Add(faultbackend.Rule{
+		Kind:    faultbackend.Read,
+		Replace: func(_ faultbackend.Op, data []byte) []byte { return append(data, '!') },
+		After:   func(_ faultbackend.Op, data []byte) { got = data },
+	})
+
+	_, err := be.Read(ctx, "k")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v!"), got, "After sees what the caller sees")
+}
+
+// TestGateRuleAllHoldsEveryMatch covers the hold-all mode: every matching operation waits for the
+// release, not only the first.
+func TestGateRuleAllHoldsEveryMatch(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+	gate := faultbackend.NewGate()
+	be.Add(gate.RuleAll(faultbackend.Write, nil))
+
+	const writers = 3
+
+	var wg sync.WaitGroup
+	for i := range writers {
+		wg.Go(func() { assert.NoError(t, be.Write(ctx, strconv.Itoa(i), []byte("v"))) })
+	}
+
+	gate.Await(t)
+
+	// An operation is recorded before its hold, so once all are recorded all are held.
+	require.Eventually(t, func() bool {
+		return be.Count(func(op faultbackend.Op) bool { return op.Kind == faultbackend.Write }) == writers
+	}, 10*time.Second, time.Millisecond)
+
+	keys, err := be.List(ctx, "")
+	require.NoError(t, err)
+	assert.Empty(t, keys, "no held write reaches the store before release")
+
+	gate.Release()
+	wg.Wait()
+
+	keys, err = be.List(ctx, "")
+	require.NoError(t, err)
+	assert.Len(t, keys, writers)
+}
+
+func TestGateRuleHoldsOnlyTheFirst(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+	gate := faultbackend.NewGate()
+	be.Add(gate.Rule(faultbackend.Write, nil))
+
+	var wg sync.WaitGroup
+	wg.Go(func() { assert.NoError(t, be.Write(ctx, "held", nil)) })
+
+	gate.Await(t)
+	require.NoError(t, be.Write(ctx, "free", nil), "a later match is not held")
+
+	gate.Release()
+	wg.Wait()
 }

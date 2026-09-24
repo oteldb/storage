@@ -49,12 +49,15 @@ in two steps, so two racing CAS writers could both win.
 
 **`backend/faultbackend`** is the fault-injection wrapper for tests: rules match an operation by
 kind and key (`CompareAndSwap` and `ReadVersioned` included — a gate there is how a test states the
-commit-protocol interleaving) and either fail it, rewrite the bytes a read returns, or run a hook
-before it. The rewrite models the failure an error cannot — a store handing back data that is not
-what was written, and saying nothing. The hook is the point of the package — a
-`Gate` suspends the matching operation *inside* the backend until the test releases it, so a test
-states a distributed interleaving instead of racing for one with sleeps, and the code under test
-needs no seams of its own. It forwards none of the optional capabilities below: each has a
+commit-protocol interleaving) and either fail it, make a conditional write lose without an error,
+rewrite the bytes a read returns, or run a hook before it or after it lands. The rewrite models the
+failure an error cannot — a store handing back data that is not what was written, and saying
+nothing. The after-hook sees every landed value, which is how an invariant checker rides the real
+commit path. Every operation is logged with its key and stored length, so tests count calls and
+bytes off the log. The before-hook is the point of the package — a `Gate` suspends the first
+matching operation (with `RuleAll`, every one) *inside* the backend until the test releases it, so a
+test states a distributed interleaving instead of racing for one with sleeps, and the code under
+test needs no seams of its own. It forwards none of the optional capabilities below: each has a
 mandatory fallback, so a wrapped backend runs the same code, only slower.
 
 The tests it drives that describe an *unfixed* defect are gated by `internal/reproduce`: they skip
