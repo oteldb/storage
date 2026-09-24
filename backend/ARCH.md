@@ -45,7 +45,10 @@ s3, whole-object); the caller passes the file and s3 cases. `backendtest` import
 `internal/partid`, since block's internal tests use it; the in-process S3 server, which needs the AWS
 SDK and go-faster/fs, lives in `backend/s3/s3test` for that reason. Every s3test server serializes
 conditional PUTs (`backendtest.AtomicConditionalPut`): go-faster/fs checks a precondition and writes
-in two steps, so two racing CAS writers could both win.
+in two steps, so two racing CAS writers could both win. `internal/heaptest.FileSampler`, the
+live-heap sampler the resident-merge tests read through, embeds `*file.File` instead of wrapping
+`Backend`, so it forwards every capability the file backend has and measures the path a bare file
+backend takes.
 
 **`backend/faultbackend`** is the fault-injection wrapper for tests: rules match an operation by
 kind and key (`CompareAndSwap` and `ReadVersioned` included — a gate there is how a test states the
