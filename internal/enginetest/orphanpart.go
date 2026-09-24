@@ -2,6 +2,7 @@ package enginetest
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,6 +11,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/internal/obs/obstest"
+	"github.com/oteldb/storage/internal/reproduce"
 )
 
 var orphanRow = Row{Stream: apiStream, Ts: 100, Val: 1, Attr: [2]string{"http.method", "GET"}}
@@ -96,6 +98,47 @@ func loadPartsKeepsLiveParts(t *testing.T, k Kind) {
 	require.NoError(t, r.LoadParts(ctx))
 	require.Equal(t, 2, r.PartCount())
 	require.Equal(t, []Row{api(100, 1), api(200, 2)}, rows(t, r, apiStream))
+}
+
+// sweepSparesInFlightPart: on a shared store a second engine's load runs while the owner is between
+// writing a part's objects and committing the index that names them. The sweep must leave that part
+// alone, or the owner commits an index naming a part with no objects.
+func sweepSparesInFlightPart(t *testing.T, k Kind) {
+	t.Helper()
+	reproduce.Unfixed(t, 686, "a load on a shared store deletes another writer's uncommitted part")
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+	owner := k.open(t, be)
+
+	gate := faultbackend.NewGate()
+	be.Add(gate.Rule(faultbackend.CompareAndSwap, k.indexCommit))
+
+	owner.Append(t, api(100, 1))
+
+	var (
+		wg       sync.WaitGroup
+		flushErr error
+	)
+
+	wg.Go(func() { flushErr = owner.Flush(ctx) })
+
+	gate.Await(t)
+
+	dirs := k.partDirs(ctx, t, be)
+	require.Len(t, dirs, 1)
+	require.NoError(t, k.open(t, be).LoadPartsUnclaimed(ctx))
+
+	gate.Release()
+	wg.Wait()
+	require.NoError(t, flushErr)
+
+	assert.NotEmpty(t, k.partKeys(ctx, t, be, dirs[0]), "the in-flight part's objects must survive the sweep")
+
+	r := k.open(t, be)
+	require.NoError(t, r.LoadParts(ctx))
+	assert.Equal(t, []Row{api(100, 1)}, rows(t, r, apiStream), "the committed part must still serve its rows")
+	assert.Zero(t, r.Stats().WantedParts)
 }
 
 // refreshReplicaKeepsUncommittedParts: a replica's refresh does not sweep. It shares the prefix with

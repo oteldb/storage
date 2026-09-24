@@ -160,6 +160,7 @@ var suite = []struct {
 	{"LoadPartsSweepsOrphanParts", loadPartsSweepsOrphanParts},
 	{"LoadPartsKeepsLiveParts", loadPartsKeepsLiveParts},
 	{"RefreshReplicaKeepsUncommittedParts", refreshReplicaKeepsUncommittedParts},
+	{"SweepSparesInFlightPart", sweepSparesInFlightPart},
 	{"MergeIndexCommitFailureKeepsSources", mergeIndexCommitFailureKeepsSources},
 	{"PartsSyncedBeforeIndexCommit", partsSyncedBeforeIndexCommit},
 	{"FlushFailureKeepsRows", flushFailureKeepsRows},
