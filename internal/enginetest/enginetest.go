@@ -16,7 +16,7 @@ import (
 	"github.com/oteldb/storage/wal"
 )
 
-// Row is one sample or record. Val is the metric value or, for records, the body.
+// Row is one sample or record. Val is a sample's value, or a record's body in decimal.
 type Row struct {
 	Stream string
 	Ts     int64
@@ -31,6 +31,8 @@ type Config struct {
 	Repair  PartFetcher
 	WAL     *wal.SegmentWriter
 	Obs     *obs.Obs
+	// WriterID names the writer whose flush watermark the engine keeps in the bucket index.
+	WriterID string
 }
 
 // Part is one live part as [Engine.Parts] reports it.
@@ -88,6 +90,7 @@ type Loader interface {
 	LoadPartsReadOnly(ctx context.Context) error
 	RefreshReplica(ctx context.Context) error
 	Replay(ctx context.Context, dir string) error
+	WALState() (segments int, bytes int64, epoch uint64, ok bool)
 }
 
 // Introspector is what the engine reports about itself.
@@ -240,6 +243,9 @@ var suite = []struct {
 	{"FlushRebasesOnARivalIndexCommit", flushRebasesOnARivalIndexCommit},
 	{"FlushFailsWhenTheIndexCommitCannotLand", flushFailsWhenTheIndexCommitCannotLand},
 	{"RebasedFlushServesTheAdoptedPart", rebasedFlushServesTheAdoptedPart},
+	{"ReplaySkipsSegmentsBelowFlushWatermark", replaySkipsSegmentsBelowFlushWatermark},
+	{"FlushWatermarkIsPerWriter", flushWatermarkIsPerWriter},
+	{"RebasedCommitKeepsPeerWatermark", rebasedCommitKeepsPeerWatermark},
 }
 
 // Run runs every suite test against k, each as <test>/<k.Name>.

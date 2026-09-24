@@ -126,7 +126,7 @@ var metricKind = enginetest.Kind{
 	Open: func(t *testing.T, cfg enginetest.Config) enginetest.Engine {
 		t.Helper()
 
-		c := engine.Config{Backend: cfg.Backend, Prefix: "default/metrics", WAL: cfg.WAL, Obs: cfg.Obs}
+		c := engine.Config{Backend: cfg.Backend, Prefix: "default/metrics", WAL: cfg.WAL, Obs: cfg.Obs, WriterID: cfg.WriterID}
 		if cfg.Repair != nil {
 			c.Repair = metricFetcher{cfg.Repair}
 		}

@@ -132,7 +132,7 @@ var recordKind = enginetest.Kind{
 	Open: func(t *testing.T, cfg enginetest.Config) enginetest.Engine {
 		t.Helper()
 
-		c := recordengine.Config{Schema: testSchema, Backend: cfg.Backend, Prefix: enginePrefix, WAL: cfg.WAL, Obs: cfg.Obs}
+		c := recordengine.Config{Schema: testSchema, Backend: cfg.Backend, Prefix: enginePrefix, WAL: cfg.WAL, Obs: cfg.Obs, WriterID: cfg.WriterID}
 		if cfg.Repair != nil {
 			c.Repair = recordFetcher{cfg.Repair}
 		}
