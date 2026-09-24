@@ -13,7 +13,6 @@ package etcd
 
 import (
 	"context"
-	"net/url"
 	"slices"
 	"strconv"
 	"testing"
@@ -22,8 +21,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/server/v3/embed"
 
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/cluster/ring"
 )
 
@@ -35,79 +34,6 @@ const (
 	settle = 30 * time.Second
 	tick   = 10 * time.Millisecond
 )
-
-// etcdServer is an embedded etcd that can be stopped and restarted on the same client URL and
-// data directory — what an etcd rollout looks like to a node that keeps running across it.
-type etcdServer struct {
-	t      *testing.T
-	client url.URL
-	peer   url.URL
-	dir    string
-	e      *embed.Etcd
-}
-
-func startEtcdServer(t *testing.T) *etcdServer {
-	t.Helper()
-
-	s := &etcdServer{
-		t:      t,
-		client: url.URL{Scheme: httpScheme, Host: freeAddr(t)},
-		peer:   url.URL{Scheme: httpScheme, Host: freeAddr(t)},
-		dir:    t.TempDir(),
-	}
-	s.start()
-	t.Cleanup(s.stop)
-
-	return s
-}
-
-func (s *etcdServer) start() {
-	s.t.Helper()
-
-	cfg := embed.NewConfig()
-	cfg.Dir = s.dir
-	cfg.LogLevel = "error"
-	cfg.ListenClientUrls = []url.URL{s.client}
-	cfg.AdvertiseClientUrls = []url.URL{s.client}
-	cfg.ListenPeerUrls = []url.URL{s.peer}
-	cfg.AdvertisePeerUrls = []url.URL{s.peer}
-	cfg.InitialCluster = cfg.Name + "=" + s.peer.String()
-
-	e, err := embed.StartEtcd(cfg)
-	require.NoError(s.t, err)
-
-	select {
-	case <-e.Server.ReadyNotify():
-	case <-time.After(30 * time.Second):
-		e.Close()
-		s.t.Fatal("embedded etcd did not become ready")
-	}
-
-	s.e = e
-}
-
-func (s *etcdServer) stop() {
-	if s.e == nil {
-		return
-	}
-
-	s.e.Close()
-	s.e = nil
-}
-
-// dial returns a client for this server, closed with the test.
-func (s *etcdServer) dial() *clientv3.Client {
-	s.t.Helper()
-
-	c, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{s.client.String()},
-		DialTimeout: 5 * time.Second,
-	})
-	require.NoError(s.t, err)
-	s.t.Cleanup(func() { _ = c.Close() })
-
-	return c
-}
 
 // memberKeys returns the live member keys with the lease each hangs off, or nil if etcd cannot
 // be read right now — it is polled from inside Eventually predicates, where a read against a
@@ -196,8 +122,8 @@ func joinAll(t *testing.T, client *clientv3.Client, ttl time.Duration, ids ...st
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestMembershipRejoinsAfterLeaseExpiry(t *testing.T) {
-	srv := startEtcdServer(t)
-	client := srv.dial()
+	srv := etcdtest.NewServer(t)
+	client := srv.Dial()
 	ctx := context.Background()
 
 	nodes := joinAll(t, client, 5*time.Second, "node-a", "node-b")
@@ -207,7 +133,7 @@ func TestMembershipRejoinsAfterLeaseExpiry(t *testing.T) {
 	require.NotEqual(t, clientv3.NoLease, lost)
 
 	// Expire node-b's lease from outside, exactly as etcd does when keep-alives stop arriving.
-	_, err := srv.dial().Revoke(ctx, lost)
+	_, err := srv.Dial().Revoke(ctx, lost)
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool { return b.Rejoins() >= 1 }, settle, tick,
@@ -226,13 +152,13 @@ func TestMembershipRejoinsAfterLeaseExpiry(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestMembershipRejoinsAfterWholeRingLeaseLoss(t *testing.T) {
-	srv := startEtcdServer(t)
-	client := srv.dial()
+	srv := etcdtest.NewServer(t)
+	client := srv.Dial()
 	ctx := context.Background()
 
 	nodes := joinAll(t, client, 5*time.Second, "node-a", "node-b", "node-c")
 
-	killer := srv.dial()
+	killer := srv.Dial()
 	for _, m := range nodes {
 		_, err := killer.Revoke(ctx, m.LeaseID())
 		require.NoError(t, err)
@@ -253,8 +179,8 @@ func TestMembershipRejoinsAfterWholeRingLeaseLoss(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestMembershipRejoinsAfterExternalKeyDelete(t *testing.T) {
-	srv := startEtcdServer(t)
-	client := srv.dial()
+	srv := etcdtest.NewServer(t)
+	client := srv.Dial()
 	ctx := context.Background()
 
 	nodes := joinAll(t, client, 5*time.Second, "node-a", "node-b")
@@ -262,7 +188,7 @@ func TestMembershipRejoinsAfterExternalKeyDelete(t *testing.T) {
 
 	held := b.LeaseID()
 
-	_, err := srv.dial().Delete(ctx, testPrefix+"node-b")
+	_, err := srv.Dial().Delete(ctx, testPrefix+"node-b")
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool { return b.Rejoins() >= 1 }, settle, tick,
@@ -279,14 +205,14 @@ func TestMembershipRejoinsAfterExternalKeyDelete(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestMembershipRejoinIsIdempotent(t *testing.T) {
-	srv := startEtcdServer(t)
-	client := srv.dial()
+	srv := etcdtest.NewServer(t)
+	client := srv.Dial()
 	ctx := context.Background()
 
 	nodes := joinAll(t, client, 5*time.Second, "node-a", "node-b")
 	b := nodes[1]
 
-	killer := srv.dial()
+	killer := srv.Dial()
 
 	const rounds = 5
 
@@ -312,19 +238,19 @@ func TestMembershipRejoinIsIdempotent(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestMembershipRejoinsAfterEtcdRestart(t *testing.T) {
-	srv := startEtcdServer(t)
-	client := srv.dial()
+	srv := etcdtest.NewServer(t)
+	client := srv.Dial()
 
 	nodes := joinAll(t, client, 2*time.Second, "node-a", "node-b")
 
-	srv.stop()
+	srv.Stop()
 
 	for _, m := range nodes {
 		require.Eventually(t, m.SelfAbsent, settle, tick,
 			"%s notices it is absent while etcd is down", m.self.ID)
 	}
 
-	srv.start()
+	srv.Restart()
 
 	requireConverged(t, client, nodes, "node-a", "node-b")
 }
@@ -336,8 +262,8 @@ func TestMembershipRejoinsAfterEtcdRestart(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestOwnershipRebindsToNewLease(t *testing.T) {
-	srv := startEtcdServer(t)
-	client := srv.dial()
+	srv := etcdtest.NewServer(t)
+	client := srv.Dial()
 	ctx := context.Background()
 
 	first, err := client.Grant(ctx, 30)
@@ -382,8 +308,8 @@ func TestOwnershipRebindsToNewLease(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestWatchObserverNeverRejoins(t *testing.T) {
-	srv := startEtcdServer(t)
-	client := srv.dial()
+	srv := etcdtest.NewServer(t)
+	client := srv.Dial()
 	ctx := context.Background()
 
 	nodes := joinAll(t, client, 5*time.Second, "node-a")
@@ -395,7 +321,7 @@ func TestWatchObserverNeverRejoins(t *testing.T) {
 
 	require.Eventually(t, func() bool { return obs.Ring().Len() == 1 }, settle, tick)
 
-	_, err = srv.dial().Revoke(ctx, nodes[0].LeaseID())
+	_, err = srv.Dial().Revoke(ctx, nodes[0].LeaseID())
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool { return nodes[0].Rejoins() >= 1 }, settle, tick)

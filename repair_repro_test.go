@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -56,7 +57,7 @@ func (c *readPolicyCluster) logStats(id string) (parts int, wanted int, holes in
 
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestRepro387ReplicaInstallsDamagedIndexThenOwnerHoles(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	c := newReadPolicyCluster(t, endpoint)
@@ -119,7 +120,7 @@ func TestRepro387ReplicaInstallsDamagedIndexThenOwnerHoles(t *testing.T) {
 
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestRepro387HoleFreezesReplicaIndexInstall(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	c := newReadPolicyCluster(t, endpoint)
@@ -173,7 +174,7 @@ func TestRepro387HoleFreezesReplicaIndexInstall(t *testing.T) {
 
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestRepro387ReplicaLossPropagatesToOwner(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	c := newReadPolicyCluster(t, endpoint)

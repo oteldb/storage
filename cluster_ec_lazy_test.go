@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -49,7 +50,7 @@ func TestMaintainEcPartsLazy(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestMaintainEcPartsSharedSnapshot(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	s := openClusterNodeEC(t, endpoint, "node-a", 2, 1, 0)

@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -19,7 +20,7 @@ import (
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestRepro557ReplicaRefreshRecordsGonePart(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	c := newReadPolicyCluster(t, endpoint)

@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/cluster/etcd"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -23,7 +24,7 @@ func pressureFlushCluster(t *testing.T) (c *readPolicyCluster, owner, replica st
 	t.Helper()
 	ctx := context.Background()
 
-	c = newReadPolicyCluster(t, startEtcd(t), WithFlushInterval(int64(time.Hour)))
+	c = newReadPolicyCluster(t, etcdtest.Start(t), WithFlushInterval(int64(time.Hour)))
 	c.write(t)
 
 	owner, replica = c.compactionOwnerOf(t)

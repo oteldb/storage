@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 )
 
 // TestClusterRoutedPointsCountedOnRoutingNode pins the coordinator side of a clustered write:
@@ -19,7 +20,7 @@ import (
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterRoutedPointsCountedOnRoutingNode(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	ids := []string{"node-a", "node-b", "node-c"}

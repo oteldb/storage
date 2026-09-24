@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -134,7 +135,7 @@ func TestAdminRebalanceSingleNodeNoOp(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestAdminRebalanceClusteredReportsSuccess(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	s := openClusterNodeShared(t, endpoint, "node-a")

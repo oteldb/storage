@@ -16,6 +16,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/internal/obs/obstest"
 	"github.com/oteldb/storage/query/fetch"
 )
@@ -131,7 +132,7 @@ func (p *etcdProxy) restore() {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterFencedPrimaryRejectsWrites(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	proxies := map[string]*etcdProxy{"node-a": newEtcdProxy(t, endpoint), "node-b": newEtcdProxy(t, endpoint)}

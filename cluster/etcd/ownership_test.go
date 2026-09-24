@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/cluster/rebalance"
 	"github.com/oteldb/storage/cluster/ring"
 )
@@ -15,7 +16,7 @@ import (
 func twoOwners(t *testing.T) (ctx context.Context, a, b *Ownership) {
 	t.Helper()
 
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 	ctx = context.Background()
 
 	la, err := client.Grant(ctx, 30)
@@ -163,7 +164,7 @@ func shardsOf(rs []rebalance.Reassignment) []string {
 
 //nolint:paralleltest // owns an embedded etcd
 func TestOwnershipHandoffOnLeaseExpiry(t *testing.T) {
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 	ctx := context.Background()
 
 	la, err := client.Grant(ctx, 1) // short TTL

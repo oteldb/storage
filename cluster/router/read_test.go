@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/cluster"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/cluster/router"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
@@ -45,8 +46,6 @@ type peer struct {
 // serve mounts the peer's endpoints and returns its address.
 func (p *peer) serve(t *testing.T) string {
 	t.Helper()
-
-	p.addr = freeAddr(t)
 
 	batches := make([]*fetch.Batch, 0, len(p.series))
 	for i := range p.series {
@@ -114,8 +113,10 @@ func (p *peer) serve(t *testing.T) string {
 
 	var lc net.ListenConfig
 
-	ln, err := lc.Listen(t.Context(), "tcp", p.addr)
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
+
+	p.addr = ln.Addr().String()
 
 	go func() { _ = srv.Serve(ln) }()
 
@@ -131,7 +132,7 @@ func openRouter(t *testing.T, peers ...*peer) *router.Router {
 
 	const root = "/test"
 
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	for i, p := range peers {
 		joinNode(t, endpoint, root, "node-"+string(rune('a'+i)), p.serve(t))
 	}
@@ -285,7 +286,7 @@ func TestReadsEmptyWhenEveryOwnerDisclaims(t *testing.T) {
 func TestReadsEmptyOnEmptyRing(t *testing.T) {
 	t.Parallel()
 
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	r, err := router.Open(t.Context(), router.Config{Etcd: []string{endpoint}, Root: "/test"})
 	require.NoError(t, err)

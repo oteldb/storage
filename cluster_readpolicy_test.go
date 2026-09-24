@@ -11,6 +11,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/cluster"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -162,7 +163,7 @@ func fetchLogs(ctx context.Context, s *Storage, start, end int64) ([]*fetch.Batc
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestReadOverlappingWantFailsOverToCompleteOwner(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	c := newReadPolicyCluster(t, endpoint)
@@ -188,7 +189,7 @@ func TestReadOverlappingWantFailsOverToCompleteOwner(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestReadFailsWhenEveryOwnerIsIncomplete(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	c := newReadPolicyCluster(t, endpoint)
@@ -211,7 +212,7 @@ func TestReadFailsWhenEveryOwnerIsIncomplete(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestReadOutsideTheWantIsServedLocally(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	c := newReadPolicyCluster(t, endpoint)
@@ -239,7 +240,7 @@ func TestReadOutsideTheWantIsServedLocally(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestShardNoOwnerHoldsStillReadsEmpty(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	c := newReadPolicyCluster(t, endpoint)
@@ -265,7 +266,7 @@ func TestShardNoOwnerHoldsStillReadsEmpty(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestSingleNodeReadFailsWithNothingToFailOverTo(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	s := openClusterNodePrivate(t, endpoint, "solo", 1)
@@ -327,7 +328,7 @@ func loseOldestLogPart(t *testing.T, s *Storage, shard signal.TenantID) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestEnumerationSoleOwnerIncompleteFails(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	s := openClusterNodePrivate(t, endpoint, "solo", 1)
@@ -353,7 +354,7 @@ func TestEnumerationSoleOwnerIncompleteFails(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestEnumerationLocalIncompleteDeniesRemoteAbsence(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	a := openClusterNodePrivate(t, endpoint, "node-a", 2)

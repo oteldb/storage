@@ -15,6 +15,7 @@ import (
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 )
 
 // sharedStore is a backend every node can read: it declines the [backend.NodeLocal] capability the
@@ -56,7 +57,7 @@ func TestNodeLocalBackendUnshared(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterRefusesNodeLocalBackendUnshared(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	_, err := Open(context.Background(), Options{}, WithBackend(backend.Memory()),
 		WithCluster(&cluster.Config{
@@ -75,7 +76,7 @@ func TestClusterRefusesNodeLocalBackendUnshared(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterQuietWhenPrivateBackendDeclared(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 
 	core, logs := observer.New(zap.WarnLevel)
 

@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/cluster"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -96,7 +97,7 @@ func TestCanAnswerSeparatesAbsenceFromIncompleteness(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestEnumerationFailsOverWhenLocalShardIsIncomplete(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{

@@ -275,7 +275,7 @@ wal/                  segmented CRC-framed WAL
 engine/               metrics vertical
 recordengine/         shared record engine (logs/traces/profiles/exemplars)
 query/{fetch,scale,profile,promql}           read seam · scale-out decorators · EXPLAIN ANALYZE · Prom adapter
-cluster/{,ring,etcd,replica,rebalance,partsync,ec,router}   L0 distribution
+cluster/{,ring,etcd,etcd/etcdtest,replica,rebalance,partsync,ec,router}   L0 distribution · in-process etcd for tests
 internal/{obs,retry,simd,parallel,partid,diskguard,vfs,memlimit,memsize,watermark,mergestream,reproduce,heaptest,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids · disk-pressure guard · heap accounting · per-series watermark sidecar codec · the merge seam both engines share (k-way key union, seal units, conformance suite) · gated defect reproducers · heap and allocation measurement for tests · filesystem seam + crash model (validated against ext4 on dm-flakey by `internal/vfs/crashmodel`, `-tags crashmodel`)
 reliability/          public RetryConfig presets
 ```

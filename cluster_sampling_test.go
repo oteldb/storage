@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
@@ -20,7 +21,7 @@ import (
 func samplingNodes(t *testing.T, budget int64) (nodes map[string]*Storage, nonOwner *Storage) {
 	t.Helper()
 
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	pol := WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
 		return tenant.Policy{Sampling: tenant.Sampling{MaxRowsPerSecond: budget}}
 	}))

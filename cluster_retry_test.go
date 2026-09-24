@@ -12,6 +12,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/cluster"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/reliability"
@@ -168,7 +169,7 @@ func partition(t *testing.T, s *Storage) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterReadSurvivesDownOwner(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	ids := []string{"node-a", "node-b", "node-c"}
@@ -217,7 +218,7 @@ func TestClusterReadSurvivesDownOwner(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterProfileEnumSurvivesDownOwner(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	ids := []string{"node-a", "node-b", "node-c"}

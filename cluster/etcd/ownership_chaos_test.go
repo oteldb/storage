@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/cluster/ring"
 )
 
@@ -97,7 +98,7 @@ func assertOwnedByPrimary(t *testing.T, client *clientv3.Client, r *ring.Ring, s
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestOwnershipConcurrentClaimSingleWinner(t *testing.T) {
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 	ctx := context.Background()
 
 	const contenders = 12
@@ -139,7 +140,7 @@ func TestOwnershipConcurrentClaimSingleWinner(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestOwnershipReconcileConvergesUnderChurn(t *testing.T) {
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 
 	ids := []string{"a", "b", "c", "d"}
 	owners := make([]*Ownership, len(ids))
@@ -169,7 +170,7 @@ func TestOwnershipReconcileConvergesUnderChurn(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestOwnershipMassFailoverOnLeaseExpiry(t *testing.T) {
-	client := startEtcd(t)
+	client := etcdtest.NewServer(t).Dial()
 	ctx := context.Background()
 
 	dying, err := client.Grant(ctx, 30)

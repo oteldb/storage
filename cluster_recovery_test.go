@@ -11,6 +11,7 @@ import (
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -56,7 +57,7 @@ func TestClusterDurableWithWALAccepted(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterRestartServesUnflushedHead(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 	dataDir, walDir := t.TempDir(), t.TempDir()
 
@@ -107,7 +108,7 @@ func TestClusterRestartServesUnflushedHead(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterRestartedReplicaFailsOverInsteadOfServingAHole(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 	dataDir := t.TempDir() // one shared durable backend, as a cluster over an object store has
 	walDirs := map[string]string{"node-a": t.TempDir(), "node-b": t.TempDir()}
@@ -214,7 +215,7 @@ func TestClusterRestartedReplicaFailsOverInsteadOfServingAHole(t *testing.T) {
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterLaggingMirrorReplicaAnswersCompletely(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{

@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/cluster"
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/query/fetch"
 )
 
@@ -19,7 +20,7 @@ import (
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestClusterGainedOwnerBootstrap(t *testing.T) {
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 
 	nodes := map[string]*Storage{

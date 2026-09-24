@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/query/fetch"
 )
 
@@ -54,7 +55,7 @@ func TestClusterECChaos(t *testing.T) {
 func runECChaos(t *testing.T, seed uint64) {
 	t.Helper()
 
-	endpoint := startEtcd(t)
+	endpoint := etcdtest.Start(t)
 	ctx := context.Background()
 	rng := rand.New(rand.NewPCG(seed, seed+1))
 
