@@ -554,16 +554,16 @@ func (m *Membership) consume(ctx context.Context, rev int64) (delivered bool) {
 
 		changed := false
 		for _, ev := range resp.Events {
-			switch ev.Type {
+			switch ev.GetType() {
 			case clientv3.EventTypePut:
-				if mem, err := decodeMember(ev.Kv.GetValue()); err == nil {
+				if mem, err := decodeMember(ev.GetKv().GetValue()); err == nil {
 					m.set(mem)
 					changed = true
 					m.logger().Info("member joined",
 						zap.String("id", mem.ID), zap.String("zone", mem.Zone), zap.String("addr", mem.Addr))
 				}
 			case clientv3.EventTypeDelete:
-				id := strings.TrimPrefix(string(ev.Kv.GetKey()), m.prefix)
+				id := strings.TrimPrefix(string(ev.GetKv().GetKey()), m.prefix)
 				m.remove(id)
 				changed = true
 
