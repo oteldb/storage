@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/engine"
@@ -129,7 +130,7 @@ func lossCases() []lossCase {
 // seedLoss writes two single-row parts of c's signal, at 100 and 300, into a durable directory and
 // destroys every object of the first behind the store's back. The next open finds the index naming
 // a part the backend says does not exist — the one fact a want is minted from.
-func seedLoss(t *testing.T, c lossCase) (be *flakyBackend, dir, lost string) {
+func seedLoss(t *testing.T, c lossCase) (be *faultbackend.Backend, dir, lost string) {
 	t.Helper()
 	ctx := context.Background()
 	dir = t.TempDir()
@@ -137,7 +138,7 @@ func seedLoss(t *testing.T, c lossCase) (be *flakyBackend, dir, lost string) {
 	fb, err := file.New(dir)
 	require.NoError(t, err)
 
-	be = &flakyBackend{Backend: fb}
+	be = faultbackend.Wrap(fb)
 
 	s, err := Open(ctx, Options{}, WithBackend(be), WithFlushInterval(-1))
 	require.NoError(t, err)
@@ -170,7 +171,7 @@ func seedLoss(t *testing.T, c lossCase) (be *flakyBackend, dir, lost string) {
 	return be, dir, lost
 }
 
-func openLoss(t *testing.T, be *flakyBackend) *Storage {
+func openLoss(t *testing.T, be *faultbackend.Backend) *Storage {
 	t.Helper()
 
 	s, err := Open(context.Background(), Options{}, WithBackend(be), WithFlushInterval(-1))
@@ -278,7 +279,7 @@ func TestSingleNodeTransientErrorIsNeverEvidence(t *testing.T) {
 			s := openLoss(t, be)
 			t.Cleanup(func() { require.NoError(t, s.Close(ctx)) })
 
-			be.failUnder(lost + "/")
+			failUnder(be, lost+"/")
 			maintainTimes(t, s, 2*holeConfirmations)
 
 			v := c.repair(t, s)
@@ -290,7 +291,7 @@ func TestSingleNodeTransientErrorIsNeverEvidence(t *testing.T) {
 			_, err := c.rows(s, 0, 1<<62)
 			require.ErrorIs(t, err, cluster.ErrShardIncomplete)
 
-			be.failUnder("")
+			failUnder(be, "")
 			maintainTimes(t, s, holeConfirmations-1)
 			require.Zero(t, c.repair(t, s).holes, "the failed passes contributed no evidence")
 
