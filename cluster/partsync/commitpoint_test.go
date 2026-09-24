@@ -12,7 +12,6 @@ package partsync_test
 import (
 	"context"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/go-faster/errors"
@@ -21,48 +20,24 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/cluster/partsync"
 )
 
 var errCrashed = errors.New("partsync test: backend crashed")
 
-// crashBackend passes writes through until the budget runs out, then fails every further write —
-// modeling a node that dies part-way through a mirroring pass. Reads, lists and deletes always
-// pass through, so the post-crash state is inspectable.
-type crashBackend struct {
-	backend.Backend
-
-	mu     sync.Mutex
-	budget int
-	writes int
-}
-
-func (b *crashBackend) Write(ctx context.Context, key string, data []byte) error {
-	b.mu.Lock()
-	if b.budget <= 0 {
-		b.mu.Unlock()
-
-		return errCrashed
+// crashAfter returns a backend that passes budget writes through, then fails every further write
+// — a node that dies part-way through a mirroring pass. Reads, lists and deletes always pass
+// through, so the post-crash state is inspectable; [faultbackend.Backend.Reset] heals it.
+func crashAfter(budget int) *faultbackend.Backend {
+	be := faultbackend.Wrap(backend.Memory())
+	if budget > 0 {
+		be.Add(faultbackend.Rule{Kind: faultbackend.Write, Times: budget})
 	}
-	b.budget--
-	b.writes++
-	b.mu.Unlock()
 
-	return b.Backend.Write(ctx, key, data)
-}
+	be.Add(faultbackend.Rule{Kind: faultbackend.Write, Err: errCrashed})
 
-func (b *crashBackend) heal() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.budget = 1 << 30
-}
-
-func (b *crashBackend) written() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	return b.writes
+	return be
 }
 
 // ownerWithParts builds a peer holding parts 1..n under prefix, plus the mutable identity object,
@@ -141,11 +116,11 @@ func TestSyncCrashNeverInstallsIndexOverHalfCopiedPart(t *testing.T) {
 
 	// One uninterrupted mirror establishes how many writes a full pass performs, and the reference
 	// bytes every healed retry below must reproduce.
-	reference := &crashBackend{Backend: backend.Memory(), budget: 1 << 30}
+	reference := faultbackend.Wrap(backend.Memory())
 	_, err := partsync.New(reference, &partsync.Client{}).Sync(ctx, prefix, []string{addr}, false, nil)
 	require.NoError(t, err)
 
-	total := reference.written()
+	total := reference.Count(func(op faultbackend.Op) bool { return op.Kind == faultbackend.Write })
 	require.Positive(t, total)
 
 	want := make(map[string][]byte)
@@ -160,7 +135,7 @@ func TestSyncCrashNeverInstallsIndexOverHalfCopiedPart(t *testing.T) {
 	}
 
 	for budget := range total {
-		local := &crashBackend{Backend: backend.Memory(), budget: budget}
+		local := crashAfter(budget)
 		s := partsync.New(local, &partsync.Client{})
 
 		_, err := s.Sync(ctx, prefix, []string{addr}, false, nil)
@@ -171,7 +146,7 @@ func TestSyncCrashNeverInstallsIndexOverHalfCopiedPart(t *testing.T) {
 
 		// The next pass, on a healthy backend, finishes the job: the orphans left behind are
 		// completed rather than confusing the diff.
-		local.heal()
+		local.Reset()
 
 		_, err = s.Sync(ctx, prefix, []string{addr}, false, nil)
 		require.NoErrorf(t, err, "budget %d: the retry pass converges", budget)
@@ -202,7 +177,7 @@ func TestSyncCrashLeavesNoIndexBeforeParts(t *testing.T) {
 	addr := ownerWithParts(t, prefix, 4)
 
 	// Enough budget for a few objects, never enough for all four parts plus the index.
-	local := &crashBackend{Backend: backend.Memory(), budget: 5}
+	local := crashAfter(5)
 
 	_, err := partsync.New(local, &partsync.Client{}).Sync(ctx, prefix, []string{addr}, false, nil)
 	require.ErrorIs(t, err, errCrashed)
