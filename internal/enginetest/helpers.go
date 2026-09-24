@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/require"
@@ -12,6 +13,7 @@ import (
 	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/backend/faultbackend"
+	"github.com/oteldb/storage/internal/partid"
 )
 
 var (
@@ -20,6 +22,10 @@ var (
 )
 
 const apiStream = "api"
+
+// aged is a clock far enough ahead that every part written before it is past the default orphan
+// grace.
+func aged() time.Time { return time.Now().Add(partid.DefaultOrphanGrace + time.Minute) }
 
 func api(ts, val int64) Row { return Row{Stream: apiStream, Ts: ts, Val: val} }
 

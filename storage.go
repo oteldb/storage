@@ -1323,6 +1323,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		MergeMemoryBytes:  s.opts.MergeMemoryBytes,
 		MinFreeBytes:      s.opts.MinFreeBytes,
 		MinFreeInodes:     s.opts.MinFreeInodes,
+		OrphanGrace:       s.opts.OrphanGrace,
 		Repair:            s.metricRepairerFor(tid, prefix),
 	})
 	s.tenants[tid] = e

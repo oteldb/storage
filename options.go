@@ -172,6 +172,21 @@ type Options struct {
 	// default; negative ⇒ the inode axis is not checked.
 	MinFreeInodes int64
 
+	// OrphanGrace is how long after it was written a part that no bucket index names stays exempt
+	// from the orphan sweep an engine runs when it loads its parts (at [Open], and on a cluster
+	// owner's backfill reload). A flush or merge writes a part's objects before it commits the index
+	// that names them, so over a store several nodes write — S3, or any backend every node sees — an
+	// unnamed part may be another node's work still in flight, and deleting it would lose the rows
+	// that node then commits. The age is read from the part's id, which carries the writer's clock.
+	//
+	// It must exceed the longest flush or merge plus the clock skew between nodes. A merge is the
+	// long one: at the default 16 GiB merge ceiling it reads and writes up to 32 GiB, which one hour
+	// covers above ~10 MiB/s sustained. Raise it with the merge ceiling
+	// ([tenant.Limits.MaxMergePartSize]) or over a slower store. The cost of a larger value is that
+	// a failed flush's leftovers wait that long, and then until the next load, before they are
+	// reclaimed; the storage.parts.orphans_deferred counter shows them. Zero ⇒ one hour.
+	OrphanGrace time.Duration
+
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each metric
 	// part, so [Storage.AggregateMetrics] answers a range-covering aggregate without decoding the
 	// value column — returning one number per series instead of every sample. It costs a little
@@ -391,6 +406,10 @@ func WithDiskReserve(minFreeBytes, minFreeInodes int64) Option {
 		o.MinFreeBytes, o.MinFreeInodes = minFreeBytes, minFreeInodes
 	}
 }
+
+// WithOrphanGrace sets how old an unnamed part must be before a load's orphan sweep deletes it. See
+// [Options.OrphanGrace].
+func WithOrphanGrace(d time.Duration) Option { return func(o *Options) { o.OrphanGrace = d } }
 
 // WithAggregateStats writes the per-series aggregate sidecar that lets [Storage.AggregateMetrics]
 // answer range-covering aggregates without decoding. See [Options.AggregateStats].

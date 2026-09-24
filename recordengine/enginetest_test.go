@@ -113,7 +113,10 @@ var recordKind = enginetest.Kind{
 	Open: func(t *testing.T, cfg enginetest.Config) enginetest.Engine {
 		t.Helper()
 
-		c := recordengine.Config{Schema: testSchema, Backend: cfg.Backend, Prefix: enginePrefix, WAL: cfg.WAL, Obs: cfg.Obs, WriterID: cfg.WriterID, Repair: cfg.Repair}
+		c := recordengine.Config{
+			Schema: testSchema, Backend: cfg.Backend, Prefix: enginePrefix, WAL: cfg.WAL, Obs: cfg.Obs, WriterID: cfg.WriterID,
+			Repair: cfg.Repair, OrphanGrace: cfg.OrphanGrace, Now: cfg.Now,
+		}
 
 		return recordEngine{recordengine.New(c)}
 	},

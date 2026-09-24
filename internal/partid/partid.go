@@ -68,6 +68,21 @@ func (id ID) Time() time.Time {
 	return time.UnixMilli(int64(ms)).UTC()
 }
 
+// DefaultOrphanGrace is the [ID.Settled] grace used when the caller configures none.
+const DefaultOrphanGrace = time.Hour
+
+// Settled reports whether id was minted more than grace before now (grace ≤ 0 ⇒
+// [DefaultOrphanGrace]): old enough that no writer can still be between writing the part's objects
+// and committing the index that names it. An id dated after now, minted by a writer whose clock runs
+// ahead, is never settled.
+func (id ID) Settled(now time.Time, grace time.Duration) bool {
+	if grace <= 0 {
+		grace = DefaultOrphanGrace
+	}
+
+	return now.Sub(id.Time()) > grace
+}
+
 func randomize(b []byte) {
 	// crypto/rand.Read never fails since Go 1.24; it panics internally instead.
 	_, _ = rand.Read(b)

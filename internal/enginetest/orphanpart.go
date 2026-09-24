@@ -3,7 +3,9 @@ package enginetest
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -11,7 +13,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/internal/obs/obstest"
-	"github.com/oteldb/storage/internal/reproduce"
+	"github.com/oteldb/storage/internal/partid"
 )
 
 var orphanRow = Row{Stream: apiStream, Ts: 100, Val: 1, Attr: [2]string{"http.method", "GET"}}
@@ -60,7 +62,8 @@ func failedFlushBurnsPartID(t *testing.T, k Kind) {
 }
 
 // loadPartsSweepsOrphanParts: the objects of a part the bucket index does not name are deleted at
-// open, and a part written after the restart lands on a fresh id rather than on the orphan's.
+// open once the part is past the orphan grace, and a part written after the restart lands on a fresh
+// id rather than on the orphan's.
 func loadPartsSweepsOrphanParts(t *testing.T, k Kind) {
 	t.Helper()
 
@@ -71,10 +74,11 @@ func loadPartsSweepsOrphanParts(t *testing.T, k Kind) {
 	objects := len(k.partKeys(ctx, t, be, orphan))
 
 	o, m := obstest.New(t)
-	r := k.Open(t, Config{Backend: be, Obs: o})
+	r := k.Open(t, Config{Backend: be, Obs: o, Now: aged})
 	require.NoError(t, r.LoadParts(ctx))
 	require.Empty(t, k.partKeys(ctx, t, be, orphan), "an orphan part's objects must be swept at open")
 	require.Equal(t, int64(objects), m.Counter("storage.parts.orphans_swept"))
+	require.Zero(t, m.Counter("storage.parts.orphans_deferred"))
 
 	r.Append(t, api(200, 2))
 	require.NoError(t, r.Flush(ctx))
@@ -105,7 +109,6 @@ func loadPartsKeepsLiveParts(t *testing.T, k Kind) {
 // alone, or the owner commits an index naming a part with no objects.
 func sweepSparesInFlightPart(t *testing.T, k Kind) {
 	t.Helper()
-	reproduce.Unfixed(t, 686, "a load on a shared store deletes another writer's uncommitted part")
 
 	ctx := context.Background()
 	be := faultbackend.Wrap(backend.Memory())
@@ -141,8 +144,56 @@ func sweepSparesInFlightPart(t *testing.T, k Kind) {
 	assert.Zero(t, r.Stats().WantedParts)
 }
 
-// refreshReplicaKeepsUncommittedParts: a replica's refresh does not sweep. It shares the prefix with
-// the owner, whose freshly written but not yet committed part must survive.
+// sweepDefersYoungOrphanUntilItAges: an unnamed part younger than the grace survives a load and is
+// counted as deferred; the first load after it ages sweeps it.
+func sweepDefersYoungOrphanUntilItAges(t *testing.T, k Kind) {
+	t.Helper()
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+	orphan := k.failOrphanFlush(ctx, t, k.open(t, be), be)
+	objects := k.partKeys(ctx, t, be, orphan)
+
+	var ahead atomic.Int64
+
+	now := func() time.Time { return time.Now().Add(time.Duration(ahead.Load())) }
+
+	o, m := obstest.New(t)
+	r := k.Open(t, Config{Backend: be, Obs: o, Now: now})
+
+	require.NoError(t, r.LoadParts(ctx))
+	require.Equal(t, objects, k.partKeys(ctx, t, be, orphan), "a part younger than the grace is not swept")
+	assert.Equal(t, int64(len(objects)), m.Counter("storage.parts.orphans_deferred"))
+	assert.Zero(t, m.Counter("storage.parts.orphans_swept"))
+
+	ahead.Store(int64(partid.DefaultOrphanGrace + time.Minute))
+	require.NoError(t, r.LoadParts(ctx))
+	require.Empty(t, k.partKeys(ctx, t, be, orphan), "the first load after the part ages sweeps it")
+	assert.Equal(t, int64(len(objects)), m.Counter("storage.parts.orphans_swept"))
+	assert.Equal(t, int64(len(objects)), m.Counter("storage.parts.orphans_deferred"), "only the first load deferred it")
+}
+
+// sweepSparesFutureDatedPart: a part id dated after this node's clock was minted by a writer whose
+// clock runs ahead, so it may be in flight however small the grace; the same part under the same
+// grace is swept once this node's clock passes it.
+func sweepSparesFutureDatedPart(t *testing.T, k Kind) {
+	t.Helper()
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+	orphan := k.failOrphanFlush(ctx, t, k.open(t, be), be)
+
+	behind := func() time.Time { return time.Now().Add(-time.Hour) }
+	require.NoError(t, k.Open(t, Config{Backend: be, OrphanGrace: time.Nanosecond, Now: behind}).LoadParts(ctx))
+	require.NotEmpty(t, k.partKeys(ctx, t, be, orphan), "a future-dated part is never swept")
+
+	ahead := func() time.Time { return time.Now().Add(time.Millisecond) }
+	require.NoError(t, k.Open(t, Config{Backend: be, OrphanGrace: time.Nanosecond, Now: ahead}).LoadParts(ctx))
+	require.Empty(t, k.partKeys(ctx, t, be, orphan), "the configured grace, not the default, decides")
+}
+
+// refreshReplicaKeepsUncommittedParts: a replica's refresh does not sweep, however old the part. It
+// shares the prefix with the owner, whose written but not yet committed part must survive.
 func refreshReplicaKeepsUncommittedParts(t *testing.T, k Kind) {
 	t.Helper()
 
@@ -150,7 +201,7 @@ func refreshReplicaKeepsUncommittedParts(t *testing.T, k Kind) {
 	be := faultbackend.Wrap(backend.Memory())
 	orphan := k.failOrphanFlush(ctx, t, k.open(t, be), be)
 
-	require.NoError(t, k.open(t, be).RefreshReplica(ctx))
+	require.NoError(t, k.Open(t, Config{Backend: be, Now: aged}).RefreshReplica(ctx))
 	require.Equal(t, []string{orphan}, k.partDirs(ctx, t, be))
 	require.NotEmpty(t, k.partKeys(ctx, t, be, orphan),
 		"a replica must not delete part objects the owner may still be committing")

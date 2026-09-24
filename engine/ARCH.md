@@ -114,7 +114,7 @@ The bucket index makes a part durably visible, so writing it is the commit point
 always carries the identities its rows resolve through. Every part object, sidecars included, is
 written deferred and the part is made durable by one `backend.SyncPrefix` after its last sidecar
 (`backend/ARCH.md`, `DeferredSyncer`), so the index never names a part a power cut could still take. A crash in between leaves an orphan — objects
-and identity together — swept at the next open, stranding nothing.
+and identity together — swept by a later open, stranding nothing.
 
 `CheckpointThrough` runs last and is the WAL's commit point, so replay recovers a part that failed
 to publish. It discards only through the sequence the flush sealed at detach, leaving the segments
@@ -251,9 +251,28 @@ part reusing a prefix would inherit leftovers it never wrote.
 
 `LoadParts` sweeps that residue — a failed attempt's objects, or a retired part whose reclaim delete
 failed. It lists the prefix and deletes every object under a part directory the bucket index does not
-name; a directory is a part's when its name parses as a part id. The sweep assumes this node **owns**
-the prefix, so a replica's `RefreshReplica` skips it: the owner's in-flight part is not in the index
-yet.
+name; a directory is a part's when its name parses as a part id. A replica's `RefreshReplica` skips
+it: the owner's in-flight part is not in the index yet.
+
+**An unnamed part is not yet an orphan.** A flush or merge writes the part's objects before the
+commit that names them, so over a shared store another writer's in-flight part looks exactly like
+residue — and `LoadPartsUnclaimed`, which every clustered node runs at startup before it holds any
+claim, would delete it, leaving that writer to commit an index naming a part with no objects. The
+sweep therefore deletes a part only once its id is older than `Config.OrphanGrace`
+(`partid.ID.Settled`): the id carries its mint time, so no writer-side bookkeeping is needed. A part
+dated after this node's clock was minted by a writer running ahead and is never swept. The grace has
+to outlast the longest write-to-commit window plus the clock skew between writers. The long window is
+a merge: a streaming merge mints its first output id while it is still reading its inputs and commits
+after its last output, so it spans up to 16 GiB read and 16 GiB written at the default
+`MergeCeilingBytes`. The
+one-hour default covers that above ~10 MiB/s of sustained throughput. What it costs is reclamation
+latency: a younger orphan survives the load, is counted in `storage.parts.orphans_deferred`, and
+goes at the first load after it ages. The guard applies to private backends too. There only this
+node writes the prefix, but a sweep that behaved differently by backend kind would be one more mode
+to get wrong, and on a single node the cost is only that latency. It does not cover a part
+`cluster/partsync` is copying in: the copy keeps the peer's id, which may be old. A sweep that races
+such a copy leaves an index naming a part this node cannot open, which is the want path's to repair
+from the peer that still holds it rather than a silent loss.
 
 `LoadPartsReadOnly` is that same sweep-nothing load reached deliberately rather than through the
 replica path. It exists because the sweep is the one backend mutation an open performs before the
@@ -631,7 +650,7 @@ A merge retires its sources only after the bucket index naming their replacement
 index is what a restart and every replica read, so a part it still names must never become reclaimable:
 retiring first would let the next reclaim delete referenced objects, and every later load would drop
 the part into a want repair can never satisfy. A failed commit rolls the in-memory swap back, so the uncommitted output is
-never observable as published; its objects are orphans, swept at the next open.
+never observable as published; its objects are orphans, swept by a later open.
 
 ### Repair — a want is discharged by committing a part
 
@@ -787,15 +806,14 @@ but will not open is a failure too, never absence.
 peer may still hold the part; here nothing else can serve those bytes. What remains is whether
 another *writer* shares the prefix and removed the part on purpose — merged it into a successor or
 expired it — in a commit this engine has not rebased onto. In a supported deployment none does: a
-writable store's open sweeps every object its index does not name, which would delete a concurrent
-writer's in-flight part, so a non-clustered prefix has one writer by construction, and the one
-supported co-tenant, a read-only handle, never writes. The seam still re-reads the committed index
+non-clustered prefix has one writer, and the one supported co-tenant, a read-only handle, never
+writes. The seam still re-reads the committed index
 on every pass and counts absence only while that index states the loss — a want or a hole at the
 prefix, not tombstoned, not contained in a committed part — so a rival's merge or expiry makes the
 pass inconclusive (`WantIncomplete`) rather than a loss. A rival committing between the last pass and
 the hole commit is not covered: the CAS retry lands the hole beside the rival's successor, the next
-commit revokes it, and `LostParts` over-counts by one — only in a deployment the open-time sweep
-already makes unsafe.
+commit revokes it, and `LostParts` over-counts by one — only in a deployment that is already
+unsupported.
 
 **A read-only store never concludes.** Acknowledging a loss is an index commit, so its seam is nil.
 It keeps the pending want its load found and the read policy fails reads overlapping it: it neither
