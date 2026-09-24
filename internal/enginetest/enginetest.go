@@ -231,6 +231,15 @@ var suite = []struct {
 	{"PreV5PartsMigrateOnMerge", preV5PartsMigrateOnMerge},
 	{"MixedMergeInheritsTheKnownInputs", mixedMergeInheritsTheKnownInputs},
 	{"BlockNumbersSurviveAnEmptiedShard", blockNumbersSurviveAnEmptiedShard},
+	{"RetentionDropsWholePartWithoutRewrite", retentionDropsWholePartWithoutRewrite},
+	{"RetentionDropsExpiredAndRewritesStraddler", retentionDropsExpiredAndRewritesStraddler},
+	{"RetentionDropReclaimsObjects", retentionDropReclaimsObjects},
+	{"RetentionDropSurvivesRestart", retentionDropSurvivesRestart},
+	{"RetentionDropIsNotIdle", retentionDropIsNotIdle},
+	{"RetentionDropsEveryPart", retentionDropsEveryPart},
+	{"FlushRebasesOnARivalIndexCommit", flushRebasesOnARivalIndexCommit},
+	{"FlushFailsWhenTheIndexCommitCannotLand", flushFailsWhenTheIndexCommitCannotLand},
+	{"RebasedFlushServesTheAdoptedPart", rebasedFlushServesTheAdoptedPart},
 }
 
 // Run runs every suite test against k, each as <test>/<k.Name>.
