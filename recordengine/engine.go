@@ -125,35 +125,11 @@ type Config struct {
 	Repair PartFetcher
 }
 
-// PartFetcher makes the objects of the parts discharging a repair cycle's wants local, so the
-// engine can open them and commit them back into the index. It is the engine's whole view of the
-// cluster during repair: part identities in, the entries of the parts actually copied out.
-//
-// A whole cycle goes in one call because the cluster-side cost is per cycle, not per want: one
-// read of each peer's bucket index answers every want, and one copy of a part discharges every
-// want it contains. Splitting the cycle multiplies both by the number of wants.
-//
-// The outcome qualifies a fetch that brought nothing back, and the qualification is what decides
-// whether the owner may ever conclude the data is gone — see [bucketindex.WantOutcome]. Any error is transient
-// (a peer that could not be reached says nothing about whether the data exists), and the want is
-// retried on the next merge.
-//
-// The entry need not name the wanted prefix: a peer that has merged the part away answers with the
-// successor containing it, which is what makes repair terminate.
-type PartFetcher interface {
-	// FetchWants answers every want, returning one result per want in the same order.
-	FetchWants(ctx context.Context, wants []bucketindex.Want) []FetchResult
-}
+// PartFetcher is the repair seam to the cluster; see [bucketindex.PartFetcher].
+type PartFetcher = bucketindex.PartFetcher
 
 // FetchResult is one want's outcome from a [PartFetcher].
-type FetchResult struct {
-	// Entry names the part that came across, valid only when Outcome is [bucketindex.WantSatisfied].
-	Entry bucketindex.Entry
-	// Outcome qualifies a fetch that brought nothing back.
-	Outcome bucketindex.WantOutcome
-	// Err is a transient failure; the want is retried on the next merge.
-	Err error
-}
+type FetchResult = bucketindex.FetchResult
 
 // Engine is one tenant's record store for a signal. Safe for concurrent use.
 type Engine struct {

@@ -685,6 +685,8 @@ backend where every replica reads the same objects, or a read-only store) makes 
 is definitive absence and leaves the want outstanding, counted in `RepairStats.Unsatisfiable`; an
 error is transient and retried next cycle. The two are never merged: an unreachable peer is not
 evidence that data is gone.
+The seam's types are `backend/bucketindex`'s, aliased here and in `recordengine`, so the facade
+hands both engines the same fetcher.
 
 The seam takes the **whole cycle's wants in one call**, capped at `repairFetchesPerCycle`, and gets
 one result per want back. The cluster-side cost is per cycle, not per want — one read of each peer's

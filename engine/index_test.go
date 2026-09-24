@@ -2,6 +2,7 @@ package engine_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,6 +14,15 @@ import (
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 )
+
+// rejectWrites fails every Write and CompareAndSwap of a key ending in suffix with err; an empty
+// suffix matches every key. CompareAndSwap is the path the bucket-index commit takes, so a suffix
+// naming the index must reject it too.
+func rejectWrites(be *faultbackend.Backend, suffix string, err error) {
+	match := func(op faultbackend.Op) bool { return strings.HasSuffix(op.Key, suffix) }
+	be.Add(faultbackend.Rule{Kind: faultbackend.Write, Match: match, Err: err})
+	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Match: match, Err: err})
+}
 
 // TestStatelessReadFromObjectStore is the M5 exit check: a fresh engine reconstructs both the
 // part set (bucket index) and the identity index (series object) from the backend alone, and

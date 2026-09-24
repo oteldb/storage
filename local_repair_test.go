@@ -108,7 +108,9 @@ func TestRepairerForSelectsTheEvidenceRule(t *testing.T) {
 	t.Parallel()
 
 	assert.IsType(t, soleOwnerRepairer{}, (&Storage{opts: Options{}}).metricRepairerFor("t", "t/metrics"))
-	assert.IsType(t, recordPartRepairer{}, (&Storage{opts: Options{}}).recordRepairerFor("t", "t/logs"))
+	s := &Storage{opts: Options{}}
+	assert.Equal(t, soleOwnerRepairer{prefix: "t/logs"}, s.recordRepairerFor("t", "t/logs"),
+		"record engines take the same seam as metric engines, with no wrapper")
 	assert.Nil(t, (&Storage{opts: Options{ReadOnly: true}}).metricRepairerFor("t", "t/metrics"),
 		"a read-only store must never commit a hole")
 	assert.Nil(t, (&Storage{opts: Options{ReadOnly: true}}).recordRepairerFor("t", "t/logs"))

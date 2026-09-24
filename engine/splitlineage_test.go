@@ -15,7 +15,9 @@ import (
 	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/enginetest"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/signal"
 )
 
 // splitCeilingBytes is a merge ceiling the streamed rewrite of three parts crosses several times, so
@@ -31,6 +33,31 @@ const (
 // retainFrom drops an expiring part's first sample per series and keeps the rest, so a retention
 // merge rewrites the part without emptying it.
 const retainFrom = 50
+
+// blocksByPrefix maps each entry's prefix to the block interval and level it carries.
+func blocksByPrefix(ix *bucketindex.Index) map[string]bucketindex.Entry {
+	out := make(map[string]bucketindex.Entry, len(ix.Entries))
+	for i := range ix.Entries {
+		out[ix.Entries[i].Prefix] = ix.Entries[i]
+	}
+
+	return out
+}
+
+// flushIDs flushes n one-sample parts and returns their ids in flush order.
+func flushIDs(ctx context.Context, t *testing.T, e *engine.Engine, be backend.Backend, s signal.Series, n int) []string {
+	t.Helper()
+
+	for i := range n {
+		mustAppend(t, e, s, int64(100*(i+1)), float64(i+1))
+		require.NoError(t, e.Flush(ctx))
+	}
+
+	ids := backendtest.PartDirs(ctx, t, be, lostPrefix)
+	require.Len(t, ids, n)
+
+	return ids
+}
 
 func splitLineageEngine(be backend.Backend, ceiling int64, repair engine.PartFetcher) *engine.Engine {
 	return engine.New(engine.Config{Backend: be, Prefix: lostPrefix, MergeCeilingBytes: ceiling, Repair: repair})
@@ -211,7 +238,7 @@ func TestSplitLineageWantBecomesHole(t *testing.T) {
 	inputs := flushInputs(ctx, t, be, true)
 	lost := inputs[1]
 
-	copyObjects(t, be, peer, lostPrefix+"/")
+	enginetest.CopyObjects(t, be, peer, lostPrefix+"/")
 	splitMerge(ctx, t, peer, inputs)
 
 	served := splitLineageEngine(peer, splitCeilingBytes, nil)
@@ -220,16 +247,16 @@ func TestSplitLineageWantBecomesHole(t *testing.T) {
 
 	// The cluster layer's answer to a want: the best part in the peer's index satisfying it, copied
 	// over; definitive absence when the index names none.
-	fetcher := &fakeFetcher{answer: func(w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
+	fetcher := enginetest.NewFetcher(func(w bucketindex.Want) (bucketindex.Entry, bucketindex.WantOutcome, error) {
 		ent, ok := loadIndex(t, peer, lostPrefix).Satisfying(w)
 		if !ok {
 			return bucketindex.Entry{}, bucketindex.WantAbsent, nil
 		}
 
-		copyObjects(t, peer, be, ent.Prefix+"/")
+		enginetest.CopyObjects(t, peer, be, ent.Prefix+"/")
 
 		return ent, bucketindex.WantSatisfied, nil
-	}}
+	})
 
 	_, id, _ := strings.Cut(lost.Prefix, lostPrefix+"/")
 	erasePart(ctx, t, be, id)

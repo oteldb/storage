@@ -13,7 +13,18 @@ import (
 	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/watermark"
+	"github.com/oteldb/storage/query/fetch"
 )
+
+const replicaPrefix = "default/metrics"
+
+func fetchJob(t *testing.T, e *engine.Engine, job string) []*fetch.Batch {
+	t.Helper()
+
+	return fetchAll(t, e, fetch.Request{
+		Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{eqMatcher("job", job)},
+	})
+}
 
 // seedBulkyParts flushes two parts holding enough samples per series that the timestamp column is a
 // real object: a one-sample part collapses it into the manifest, which would hide the whole-column
@@ -73,7 +84,7 @@ func TestRefreshReplicaDoesNotRereadParts(t *testing.T) {
 		switch {
 		case strings.HasSuffix(key, "/manifest"):
 			// The liveness probe: a part whose objects went away must still become a repair want
-			// (TestRefreshReplicaGonePartBecomesPendingWant), and this is what notices.
+			// (TestEngineSuite/RefreshReplicaGonePartBecomesPendingWant), and this is what notices.
 			assert.LessOrEqual(t, grew, refreshes, key)
 		case !strings.Contains(key, "/c/") && !strings.HasSuffix(key, "/sidx") &&
 			!strings.HasSuffix(key, "/identity") && !strings.HasSuffix(key, watermark.Key("")):

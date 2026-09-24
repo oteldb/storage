@@ -311,7 +311,7 @@ above the index's persisted high-water mark, and every assignment is made per CA
 written onto the part only once the commit lands. See [`../engine/ARCH.md`](../engine/ARCH.md),
 "Block identity is allocated by the commit that publishes the part".
 
-**Repair** is identical to the metric engine, down to `Config.Repair`, the satisfaction rule (the
+**Repair** is identical to the metric engine, down to `Config.Repair` and its `bucketindex` types, the satisfaction rule (the
 exact part, the largest containing part at a higher level, or a split group whose members are all
 present), the second fetch round that completes such a group inside one commit, and the two gates a
 want must clear before its loss is acknowledged as a revocable hole. See [`../engine/ARCH.md`](../engine/ARCH.md),

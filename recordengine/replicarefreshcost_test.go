@@ -79,7 +79,7 @@ func TestRefreshReplicaDoesNotRereadParts(t *testing.T) {
 		switch {
 		case strings.HasSuffix(key, "/manifest"):
 			// The liveness probe: a part whose objects went away must still become a repair want
-			// (TestRefreshReplicaGonePartBecomesPendingWant), and this is what notices.
+			// (TestEngineSuite/RefreshReplicaGonePartBecomesPendingWant), and this is what notices.
 			assert.LessOrEqual(t, grew, refreshes, key)
 		case !strings.Contains(key, "/c/") && !strings.Contains(key, "/bloom-") &&
 			!strings.HasSuffix(key, "/keys.bin") && !strings.HasSuffix(key, "/identity") &&
