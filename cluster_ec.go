@@ -213,12 +213,16 @@ func (e *ecBackend) ReadViewAt(ctx context.Context, key string, off, n int64) ([
 
 // RangesNatively denies a converted object: each ranged read of one reconstructs it whole, so a
 // sequential scan must read it once rather than once per window. Implements [backend.RangeHinter].
+//
+// The full copy is probed with a one-byte ranged read, not [backend.SizeOf]: that falls back to a
+// whole read on a backend without [backend.Sizer], and merge admission asks this before it has
+// reserved any memory.
 func (e *ecBackend) RangesNatively(ctx context.Context, key string) bool {
 	if !backend.RangesNatively(ctx, e.inner, key) {
 		return false
 	}
 
-	_, err := backend.SizeOf(ctx, e.inner, key)
+	_, err := backend.ReadAt(ctx, e.inner, key, 0, 1)
 
 	return err == nil
 }

@@ -498,6 +498,23 @@ func TestClusterECShardRepair(t *testing.T) {
 	}
 }
 
+// TestECBackendRangesNativelyReadsOneByte: merge admission asks the hint before it reserves memory,
+// so over a backend without [backend.Sizer] the full-copy probe must not read the object whole.
+func TestECBackendRangesNativelyReadsOneByte(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	mem := backend.Memory()
+	require.NoError(t, mem.Write(ctx, "p/c/body", make([]byte, 1<<20)))
+
+	counter := backendtest.NewByteCounter(mem)
+	wrapped := &ecBackend{inner: counter}
+
+	assert.True(t, backend.RangesNatively(ctx, wrapped, "p/c/body"))
+	assert.LessOrEqual(t, counter.Bytes(), int64(1))
+	assert.False(t, backend.RangesNatively(ctx, wrapped, "p/c/missing"))
+}
+
 // TestECBackendMergeOutputMatchesRaw pins what the EC wrapper may cost a merge: its output is
 // byte-identical to the same merge over a raw backend, and each sharded source object is
 // reconstructed at most once however many read-ahead windows its column spans. Each source is
