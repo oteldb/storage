@@ -130,6 +130,11 @@ func (b *instrumentedBackend) ReadAt(ctx context.Context, key string, off, n int
 	return v, err
 }
 
+// RangesNatively forwards the [backend.RangeHinter] capability.
+func (b *instrumentedBackend) RangesNatively(ctx context.Context, key string) bool {
+	return backend.RangesNatively(ctx, b.inner, key)
+}
+
 // ReadViewAt forwards the no-copy ranged read, so metering does not reintroduce a copy per frame on
 // the query path. Implements [backend.ViewerAt].
 func (b *instrumentedBackend) ReadViewAt(ctx context.Context, key string, off, n int64) ([]byte, error) {

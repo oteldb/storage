@@ -29,29 +29,23 @@ import (
 // minus the cache write. A window at or below zero disables read-ahead.
 //
 // A column the ranged path cannot serve is read whole, once: the legacy unframed layout, and any
-// column over a backend offering neither [backend.ReaderAt] nor [backend.ViewerAt], where every
-// ranged read is itself a whole-object read and a windowed walk would repeat it per window.
+// column object [backend.RangesNatively] denies, where every ranged read is itself a whole-object
+// read and a windowed walk would repeat it per window.
 func (r *PartReader) ColumnScan(ctx context.Context, name string, window int64) (*Decoder, error) {
-	if desc, ok := r.ColumnDescByName(name); ok && desc.Blocked && !desc.Const &&
-		(!desc.Framed || !rangesNatively(r.b)) {
-		col, err := r.Column(ctx, name)
-		if err != nil {
-			return nil, err
-		}
+	if i, ok := r.byName[name]; ok {
+		desc := r.manifest.Columns[i]
+		if desc.Blocked && !desc.Const &&
+			(!desc.Framed || !backend.RangesNatively(ctx, r.b, columnKey(r.prefix, i))) {
+			col, err := r.Column(ctx, name)
+			if err != nil {
+				return nil, err
+			}
 
-		return col.BlockDecoder()
+			return col.BlockDecoder()
+		}
 	}
 
 	return r.openDecoder(ctx, name, max(window, 0))
-}
-
-func rangesNatively(b backend.Backend) bool {
-	switch b.(type) {
-	case backend.ReaderAt, backend.ViewerAt:
-		return true
-	default:
-		return false
-	}
 }
 
 // TsCursor returns a forward cursor over an int64 timestamp column, walking its granules in order.

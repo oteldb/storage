@@ -275,6 +275,14 @@ a demonstration.
   range from a resident whole-object entry and otherwise forwards **without caching** — going
   through the loading path would fetch the whole object to answer a range, which is the cost being
   avoided.
+- **`backend.RangeHinter`** — optional `RangesNatively(ctx,key)`: whether a ranged read of *this
+  object* costs the range. `ReaderAt` is a method set and cannot say that a backend ranges some
+  objects and not others, yet the EC wrapper does exactly that — a converted object is reconstructed
+  whole on every ranged read. `backend.RangesNatively` asks the hint and otherwise falls back to the
+  type check; `block`'s sequential scan uses it to choose one whole read over a read per window.
+  Wrappers forward it, and the read cache answers for its inner store, which serves every ranged miss. S3
+  answers by its store: `ReaderAt` is always present there, but without `RangeObjectStore` it reads
+  the whole object.
 - **`backend.Sizer`** — optional `Size(ctx,key)` for byte accounting without reading (used by
   `PartsDetailed`); `backend.SizeOf` falls back to a full read. **That fallback is a trap on the
   ranged read path**: a wrapper that hides `Sizer` would make opening a column read the whole
@@ -366,6 +374,15 @@ a demonstration.
   (`internal/diskguard`, see [`../engine/ARCH.md`](../engine/ARCH.md)) latches on it and the ingest
   path rejects with it, so an embedder tells an exhausted node from a transient backend fault with
   one `errors.Is`.
+- **A production wrapper has exactly its inner backend's capabilities.** `Cached`, the metered
+  backend and the EC wrapper implement every capability method unconditionally, forwarding through
+  the package helper, and answer each value claim (`StreamsWrites`, `IsNodeLocal`, `RangesNatively`,
+  the capacity reports) for the backend beneath. A dropped capability fails silently — every helper has a
+  fallback — so one table (`TestWrappersForwardExactlyTheirInnerCapabilities`, root package) probes
+  every capability through every wrapper by behavior, not type assertion, in both directions: over
+  a backend that has it, the inner fast path must be reached; over one with none, no claim may
+  appear. The EC wrapper's synchronous `DeleteDeferred` is the one listed exception. `s3`'s
+  `retryStore` holds the same rule on the `ObjectStore` seam, pinned per range × multipart combination.
 
 ## Stateless read path
 

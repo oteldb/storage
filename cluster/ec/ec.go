@@ -14,6 +14,7 @@ package ec
 
 import (
 	"encoding/binary"
+	"slices"
 
 	"github.com/go-faster/errors"
 	"github.com/klauspost/reedsolomon"
@@ -116,6 +117,25 @@ func Reconstruct(s Scheme, shards [][]byte) error {
 	}
 
 	if err := enc.Reconstruct(shards); err != nil {
+		return errors.Wrap(err, "reconstruct")
+	}
+
+	return nil
+}
+
+// reconstructData is [Reconstruct] for a reader, which needs only the data shards: missing parity
+// stays nil, and a complete data set is returned without touching the encoder.
+func reconstructData(s Scheme, shards [][]byte) error {
+	if !slices.ContainsFunc(shards[:s.Data], func(sh []byte) bool { return sh == nil }) || allEmpty(shards) {
+		return nil
+	}
+
+	enc, err := encoderFor(s)
+	if err != nil {
+		return err
+	}
+
+	if err := enc.ReconstructData(shards); err != nil {
 		return errors.Wrap(err, "reconstruct")
 	}
 

@@ -250,6 +250,7 @@ func TestS3RetryForwardsRangedReads(t *testing.T) {
 	assert.Equal(t, []byte("3456"), got)
 	assert.Equal(t, int32(1), fs.rangeN.Load(), "served by a real ranged read")
 	assert.Zero(t, fs.getN.Load(), "the whole object was never fetched")
+	assert.True(t, backend.RangesNatively(context.Background(), b, "k"))
 }
 
 // TestS3RetryRetriesRangedReads: a forwarded ranged read gets the same retry policy as a whole GET.
@@ -282,6 +283,8 @@ func TestS3RetryDoesNotInventRangedReads(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("3456"), got)
 	assert.Positive(t, fs.getN.Load(), "fell back to the whole object, as it must")
+	assert.False(t, backend.RangesNatively(context.Background(), b, "k"))
+	assert.False(t, backend.RangesNatively(context.Background(), backend.Cached(b, 1<<20), "k"))
 }
 
 // multipartParts is the [s3.MultipartObjectStore] half of a fault store, kept free of the store it
@@ -400,46 +403,46 @@ func newRangeMultipartFaultStore() *rangeMultipartFaultStore {
 // retry wrapper replaces the store, so each optional capability it fails to forward is silently
 // lost — ranged reads become whole-object reads, and streamed writes go back into RAM. The ranged
 // half is asserted by behavior, not by type: the Backend always has a ReadAt, and what the missing
-// capability costs is that the method fetches the whole object to serve it.
+// capability costs is that the method fetches the whole object to serve it. The multipart half is
+// asserted both ways: the claim, and a large streamed write reaching the store as an upload.
 func TestS3RetryForwardsCapabilityCombinations(t *testing.T) {
 	t.Parallel()
 
 	cfg := reliability.RetryConfig{MaxAttempts: 3, PerTryTimeout: time.Second}
 
-	// Each case builds its store and hands back the ranged-read counter, nil when it has none.
+	// Each case builds its store and hands back its ranged-read and upload counters, nil when it
+	// has no such capability.
 	tests := []struct {
-		name          string
-		build         func() (s3.ObjectStore, func() int32)
-		wantRange     bool
-		wantMultipart bool
+		name  string
+		build func() (s3.ObjectStore, func() int32, func() int32)
 	}{
 		{
 			name:  "neither",
-			build: func() (s3.ObjectStore, func() int32) { return newFaultStore(), nil },
+			build: func() (s3.ObjectStore, func() int32, func() int32) { return newFaultStore(), nil, nil },
 		},
 		{
 			name: "range only",
-			build: func() (s3.ObjectStore, func() int32) {
+			build: func() (s3.ObjectStore, func() int32, func() int32) {
 				fs := newRangeFaultStore()
 
-				return fs, fs.rangeN.Load
+				return fs, fs.rangeN.Load, nil
 			},
-			wantRange: true,
 		},
 		{
-			name:          "multipart only",
-			build:         func() (s3.ObjectStore, func() int32) { return newMultipartFaultStore(), nil },
-			wantMultipart: true,
+			name: "multipart only",
+			build: func() (s3.ObjectStore, func() int32, func() int32) {
+				fs := newMultipartFaultStore()
+
+				return fs, nil, fs.startN.Load
+			},
 		},
 		{
 			name: "both",
-			build: func() (s3.ObjectStore, func() int32) {
+			build: func() (s3.ObjectStore, func() int32, func() int32) {
 				fs := newRangeMultipartFaultStore()
 
-				return fs, fs.rangeN.Load
+				return fs, fs.rangeN.Load, fs.startN.Load
 			},
-			wantRange:     true,
-			wantMultipart: true,
 		},
 	}
 
@@ -448,10 +451,10 @@ func TestS3RetryForwardsCapabilityCombinations(t *testing.T) {
 			t.Parallel()
 
 			ctx := context.Background()
-			store, ranged := tt.build()
+			store, ranged, uploads := tt.build()
 			b := s3.New(store, "oteldb/", s3.WithRetry(cfg))
 
-			assert.Equal(t, tt.wantMultipart, backend.StreamsWrites(b))
+			assert.Equal(t, uploads != nil, backend.StreamsWrites(b))
 
 			require.NoError(t, b.Write(ctx, "k", []byte("0123456789")))
 
@@ -459,11 +462,26 @@ func TestS3RetryForwardsCapabilityCombinations(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, []byte("3456"), got)
 
-			if !tt.wantRange {
-				return
+			if ranged != nil {
+				assert.Positive(t, ranged(), "a forwarded range capability serves the read")
 			}
 
-			assert.Positive(t, ranged(), "a forwarded range capability serves the read")
+			want := payload(streamedBytes)
+
+			w, err := backend.CreateObject(ctx, b, "big")
+			require.NoError(t, err)
+			defer w.Abort()
+
+			writeStreamed(t, w, want)
+			require.NoError(t, w.Commit(ctx))
+
+			got, err = b.Read(ctx, "big")
+			require.NoError(t, err)
+			assert.Equal(t, want, got)
+
+			if uploads != nil {
+				assert.Positive(t, uploads(), "a forwarded multipart capability takes the write")
+			}
 		})
 	}
 }

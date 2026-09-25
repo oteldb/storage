@@ -48,31 +48,52 @@ func (r *Reader) Read(ctx context.Context, key string) ([]byte, error) {
 		return nil, err
 	}
 
+	partPrefix, scheme, om, err := r.sharded(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+
+	return r.assemble(ctx, partPrefix, scheme, om)
+}
+
+// Size returns the original size of a sharded object from the sidecar, reading no shard. Unlike
+// Read it does not consult a full copy.
+func (r *Reader) Size(ctx context.Context, key string) (int64, error) {
+	_, _, om, err := r.sharded(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+
+	return om.Size, nil
+}
+
+// sharded looks key up in its part's sidecar.
+func (r *Reader) sharded(ctx context.Context, key string) (string, Scheme, ObjectMeta, error) {
 	partPrefix, object, ok := SplitKey(key)
 	if !ok {
-		return nil, errors.Wrapf(backend.ErrNotExist, "read %q", key)
+		return "", Scheme{}, ObjectMeta{}, errors.Wrapf(backend.ErrNotExist, "read %q", key)
 	}
 
 	metaRaw, err := backend.ReadView(ctx, r.Local, MetaKey(partPrefix))
 	if err != nil {
 		if errors.Is(err, backend.ErrNotExist) {
-			return nil, errors.Wrapf(backend.ErrNotExist, "read %q (no full copy, no EC sidecar)", key)
+			return "", Scheme{}, ObjectMeta{}, errors.Wrapf(backend.ErrNotExist, "read %q (no full copy, no EC sidecar)", key)
 		}
 
-		return nil, errors.Wrap(err, "read ec sidecar")
+		return "", Scheme{}, ObjectMeta{}, errors.Wrap(err, "read ec sidecar")
 	}
 
 	meta, err := DecodeMeta(metaRaw)
 	if err != nil {
-		return nil, errors.Wrapf(err, "part %q", partPrefix)
+		return "", Scheme{}, ObjectMeta{}, errors.Wrapf(err, "part %q", partPrefix)
 	}
 
 	om, ok := findObject(meta, object)
 	if !ok {
-		return nil, errors.Wrapf(backend.ErrNotExist, "read %q (not in EC sidecar)", key)
+		return "", Scheme{}, ObjectMeta{}, errors.Wrapf(backend.ErrNotExist, "read %q (not in EC sidecar)", key)
 	}
 
-	return r.assemble(ctx, partPrefix, meta.Scheme, om)
+	return partPrefix, meta.Scheme, om, nil
 }
 
 // assemble gathers any Scheme.Data valid shards of one object — this node's slot from the
@@ -133,7 +154,7 @@ func (r *Reader) assemble(ctx context.Context, partPrefix string, s Scheme, om O
 			om.Name, partPrefix, have, s.Data)
 	}
 
-	if err := Reconstruct(s, shards); err != nil {
+	if err := reconstructData(s, shards); err != nil {
 		return nil, errors.Wrapf(err, "object %q in part %q", om.Name, partPrefix)
 	}
 

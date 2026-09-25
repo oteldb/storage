@@ -10,14 +10,18 @@ import (
 // StreamingMemory is [backend.Memory] plus the incremental-write [backend.ObjectCreator], standing in
 // for the file backend so the streamed write path runs without a disk. Its writer buffers and
 // commits with one Write. It embeds the Backend interface, so memory's other capabilities
-// ([backend.Viewer], [backend.Sizer], [backend.ReaderAt], …) are hidden.
+// ([backend.Viewer], [backend.Sizer], …) are hidden, except ranged reads: memory serves those
+// natively, and a merge chooses between a windowed and a whole read by [backend.RangesNatively].
 type StreamingMemory struct {
 	backend.Backend
 
 	creates atomic.Int64
 }
 
-var _ backend.ObjectCreator = (*StreamingMemory)(nil)
+var (
+	_ backend.ObjectCreator = (*StreamingMemory)(nil)
+	_ backend.ReaderAt      = (*StreamingMemory)(nil)
+)
 
 // NewStreamingMemory returns an empty StreamingMemory.
 func NewStreamingMemory() *StreamingMemory { return &StreamingMemory{Backend: backend.Memory()} }
@@ -30,6 +34,11 @@ func (b *StreamingMemory) CreateObject(_ context.Context, key string) (backend.O
 	b.creates.Add(1)
 
 	return &memoryObjectWriter{b: b.Backend, key: key}, nil
+}
+
+// ReadAt implements [backend.ReaderAt].
+func (b *StreamingMemory) ReadAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	return backend.ReadAt(ctx, b.Backend, key, off, n)
 }
 
 // StreamsWrites implements [backend.ObjectCreator].
