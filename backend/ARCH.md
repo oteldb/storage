@@ -280,7 +280,9 @@ a demonstration.
   objects and not others, yet the EC wrapper does exactly that — a converted object is reconstructed
   whole on every ranged read. `backend.RangesNatively` asks the hint and otherwise falls back to the
   type check; `block`'s sequential scan uses it to choose one whole read over a read per window.
-  Wrappers forward it, and the read cache answers for its inner store, which serves every ranged miss.
+  Wrappers forward it, and the read cache answers for its inner store, which serves every ranged miss. S3
+  answers by its store: `ReaderAt` is always present there, but without `RangeObjectStore` it reads
+  the whole object.
 - **`backend.Sizer`** — optional `Size(ctx,key)` for byte accounting without reading (used by
   `PartsDetailed`); `backend.SizeOf` falls back to a full read. **That fallback is a trap on the
   ranged read path**: a wrapper that hides `Sizer` would make opening a column read the whole

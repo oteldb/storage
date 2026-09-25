@@ -250,6 +250,7 @@ func TestS3RetryForwardsRangedReads(t *testing.T) {
 	assert.Equal(t, []byte("3456"), got)
 	assert.Equal(t, int32(1), fs.rangeN.Load(), "served by a real ranged read")
 	assert.Zero(t, fs.getN.Load(), "the whole object was never fetched")
+	assert.True(t, backend.RangesNatively(context.Background(), b, "k"))
 }
 
 // TestS3RetryRetriesRangedReads: a forwarded ranged read gets the same retry policy as a whole GET.
@@ -282,6 +283,8 @@ func TestS3RetryDoesNotInventRangedReads(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("3456"), got)
 	assert.Positive(t, fs.getN.Load(), "fell back to the whole object, as it must")
+	assert.False(t, backend.RangesNatively(context.Background(), b, "k"))
+	assert.False(t, backend.RangesNatively(context.Background(), backend.Cached(b, 1<<20), "k"))
 }
 
 // multipartParts is the [s3.MultipartObjectStore] half of a fault store, kept free of the store it

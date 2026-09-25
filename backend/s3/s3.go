@@ -85,7 +85,10 @@ type Backend struct {
 	prefix string               // root key prefix (e.g. "oteldb/"); may be empty
 }
 
-var _ backend.Backend = (*Backend)(nil)
+var (
+	_ backend.Backend     = (*Backend)(nil)
+	_ backend.RangeHinter = (*Backend)(nil)
+)
 
 // New returns a [Backend] over store, rooting all keys under keyPrefix (which may be empty). Pass
 // [WithRetry] to make it resilient to a lossy/slow endpoint (per-attempt timeouts, bounded retries,
@@ -171,6 +174,10 @@ func (b *Backend) ReadAt(ctx context.Context, key string, off, n int64) ([]byte,
 
 	return data, nil
 }
+
+// RangesNatively reports whether [Backend.ReadAt] is a ranged GET rather than a whole-object read
+// sliced. Implements [backend.RangeHinter].
+func (b *Backend) RangesNatively(context.Context, string) bool { return b.rng != nil }
 
 // List returns, sorted ascending, every key with the given prefix.
 func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
