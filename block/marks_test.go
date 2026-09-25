@@ -3,6 +3,7 @@ package block
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -92,6 +93,34 @@ func TestMarksRejectsCorruption(t *testing.T) {
 	require.ErrorIs(t, err, ErrCorrupt)
 }
 
+func TestMarksRejectsOutOfRangeFields(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range outOfRangeMarks() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := DecodeMarks(tc.src)
+			require.ErrorIs(t, err, ErrCorrupt)
+		})
+	}
+}
+
+// outOfRangeMarks are CRC-valid marks whose granule size or first row would go negative as an int.
+func outOfRangeMarks() []struct {
+	name string
+	src  []byte
+} {
+	return []struct {
+		name string
+		src  []byte
+	}{
+		{"granuleSize 2^63", Marks{GranuleSize: math.MinInt64}.Encode(nil)},
+		{"granuleSize maxPartRows+1", Marks{GranuleSize: int(maxPartRows) + 1}.Encode(nil)},
+		{"firstRow 2^63", Marks{GranuleSize: 2, Granules: []Granule{{FirstRow: math.MinInt64}}}.Encode(nil)},
+	}
+}
+
 func TestMarksTruncationSweep(t *testing.T) {
 	t.Parallel()
 
@@ -111,6 +140,10 @@ func TestMarksTruncationSweep(t *testing.T) {
 func FuzzMarksDecode(f *testing.F) {
 	f.Add(BuildMarks([]int64{1, 2, 3}, 2).Encode(nil))
 	f.Add([]byte{})
+
+	for _, tc := range outOfRangeMarks() {
+		f.Add(tc.src)
+	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		m, err := DecodeMarks(data)
