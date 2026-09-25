@@ -125,6 +125,16 @@ type SignalStats struct {
 	// owner reads the same number, so it is the durable answer to "did this shard ever lose data?"
 	// — unlike Holes, which is the current state.
 	LostParts uint64
+	// IndexFenced is true while this engine's last bucket-index load failed (an unreadable index,
+	// or a part it names that could not be opened). The engine then commits nothing — flush, merge,
+	// retention and repair are all refused, so the head keeps its records and grows — and every
+	// maintenance cycle retries the load. Without a cluster, reads keep answering from the last part
+	// set that loaded; a cluster node disclaims the shard's reads so they fail over. It clears when a
+	// load succeeds, or when a part that stayed corrupt over three loads is handed to repair as a want.
+	IndexFenced bool
+	// IndexLoadError is the error of the failed load behind IndexFenced: which part or index, and
+	// why. Empty while not fenced.
+	IndexLoadError string
 }
 
 // ClusterStats is the cluster-mode view of this node.
@@ -252,6 +262,7 @@ func (s *Storage) Inspect() StoreStats {
 			MergeCapBytes: sh.CapBytes, OutOfSpace: es.OutOfSpace,
 			WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 			WantedParts: es.WantedParts, Holes: es.Holes, LostParts: es.LostParts,
+			IndexFenced: es.IndexFenced, IndexLoadError: errText(es.IndexLoadErr),
 		})
 		s.attachReadGap(&ts.Signals[len(ts.Signals)-1], signal.Metric, tid)
 
@@ -280,6 +291,7 @@ func (s *Storage) Inspect() StoreStats {
 				MergeCapBytes: sh.CapBytes, OutOfSpace: es.OutOfSpace,
 				WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 				WantedParts: es.WantedParts, Holes: es.Holes, LostParts: es.LostParts,
+				IndexFenced: es.IndexFenced, IndexLoadError: errText(es.IndexLoadErr),
 			})
 			s.attachReadGap(&ts.Signals[len(ts.Signals)-1], sig, tid)
 		}
@@ -315,6 +327,14 @@ func (s *Storage) Inspect() StoreStats {
 	}
 
 	return out
+}
+
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	return err.Error()
 }
 
 // clusterStats builds the cluster-mode section of [StoreStats], or nil in single-node mode.

@@ -20,7 +20,11 @@ func (k Kind) openRepair(t *testing.T, be backend.Backend, f bucketindex.PartFet
 // to the objects of a part it pulls back. It fails t when prefix holds nothing.
 func CopyObjects(t *testing.T, src, dst backend.Backend, prefix string) {
 	t.Helper()
-	ctx := context.Background()
+	copyObjects(context.Background(), t, src, dst, prefix)
+}
+
+func copyObjects(ctx context.Context, t *testing.T, src, dst backend.Backend, prefix string) {
+	t.Helper()
 
 	keys, err := src.List(ctx, prefix)
 	require.NoError(t, err)

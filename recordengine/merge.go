@@ -63,6 +63,12 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 		zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
 		zap.Int64("retain_from", retainFrom), zap.Bool("force", opts.Force))
 
+	// A fenced engine would do the whole merge, and repair's peer fetches, only for the commit to
+	// refuse them.
+	if err := e.fence(); err != nil {
+		return err
+	}
+
 	// Repair first: a part pulled back from a peer joins this cycle's compaction, and a merge that
 	// cannot repair still compacts.
 	e.repairWants(ctx)

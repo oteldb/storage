@@ -310,6 +310,12 @@ type Engine struct {
 	// own them — it never merges, removes or deletes them — and treating them as its own would let
 	// its next commit resurrect a part their writer had removed.
 	foreignParts map[string]*part
+	// loadErr is the error of the last index load that failed, nil once one succeeds. While it is
+	// set the engine's view of the index is not the stored one, and every commit is refused.
+	loadErr error
+	// corruptLoads counts, per part prefix, the consecutive failed loads that found the part corrupt;
+	// reaching [corruptLoadsBeforeWant] turns the part into a repair want.
+	corruptLoads map[string]int
 	// blockCache memoizes decoded column blocks across fetches (LRU, keyed by part/column/block); nil
 	// ⇒ decode every fetch. A fetch caches only the blocks its matched series touch, so the resident
 	// set is the useful blocks across live parts rather than every whole part touched.
@@ -554,6 +560,11 @@ type Stats struct {
 	// writers have ever committed, including ones since revoked. It never decreases, and every
 	// owner of the shard reads the same number.
 	LostParts uint64
+	// IndexFenced is set while the last index load failed: the engine refuses every commit, so
+	// flushes keep their samples in the head, and it retries the load until one succeeds.
+	IndexFenced bool
+	// IndexLoadErr is the error of the failed load behind IndexFenced, nil while not fenced.
+	IndexLoadErr error
 }
 
 // Stats returns an in-memory snapshot of the engine's state under a single read lock. It does no
@@ -573,6 +584,8 @@ func (e *Engine) Stats() Stats {
 		WantedParts:   len(e.wants) + len(e.pendingWants) + len(e.adoptedWants),
 		Holes:         len(e.holes),
 		LostParts:     e.lostParts,
+		IndexFenced:   e.loadErr != nil,
+		IndexLoadErr:  e.loadErr,
 		MaxTime:       e.head.newest,
 	}
 
@@ -1523,6 +1536,14 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		return 0, 0, nil
 	}
 
+	// Checked after the detach so an empty head flushes as a no-op even while fenced.
+	if err := e.fenceLocked(); err != nil {
+		e.head.reattach(detached, detachedBytes, detachedSince)
+		e.mu.Unlock()
+
+		return 0, 0, err
+	}
+
 	e.flushing = detached
 	// Snapshot the flushed series' identities while still under the lock: the part write runs
 	// off-lock, and the resident index keeps being mutated by ingest.
@@ -1584,6 +1605,15 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	// and never both (no double count). The small index writes and WAL checkpoint stay under the lock
 	// so the parts swap and the durable commit remain atomic.
 	e.mu.Lock()
+
+	// A load that failed while the part was being written fenced the engine: the samples go back to
+	// the head rather than into a part set the next reload would not keep.
+	if err := e.fenceLocked(); err != nil {
+		e.mu.Unlock()
+
+		return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
+	}
+
 	for _, p := range newParts {
 		e.parts = appendPart(e.parts, p)
 	}

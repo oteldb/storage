@@ -50,6 +50,7 @@ type Stats struct {
 	WantedParts int
 	Holes       int
 	LostParts   uint64
+	IndexFenced bool
 }
 
 // MergeShape is the subset of the engine's merge shape the suite asserts on.
@@ -87,6 +88,7 @@ type Loader interface {
 	LoadPartsUnclaimed(ctx context.Context) error
 	LoadPartsReadOnly(ctx context.Context) error
 	RefreshReplica(ctx context.Context) error
+	ReloadFenced(ctx context.Context) error
 	Replay(ctx context.Context, dir string) error
 	WALState() (segments int, bytes int64, epoch uint64, ok bool)
 }
@@ -104,6 +106,8 @@ type Introspector interface {
 	PartPrefixes() []string
 	Stats() Stats
 	MergeShape() MergeShape
+	// LoadState is every field an index load replaces, comparable with assert.Equal.
+	LoadState() any
 }
 
 // Repairer is the repair-obligation surface, including the test-only LosePart and SetPartBlocks.
@@ -158,6 +162,18 @@ var suite = []struct {
 	{"FailedWantCommitAppliesNeither", failedWantCommitAppliesNeither},
 	{"WantSurvivesLaterCommits", wantSurvivesLaterCommits},
 	{"EntriesLeaveOnlyIntoRemovedOrWanted", entriesLeaveOnlyIntoRemovedOrWanted},
+	{"FailedLoadKeepsUnopenedParts", failedLoadKeepsUnopenedParts},
+	{"FailedLoadChangesNothing", failedLoadChangesNothing},
+	{"FenceLiftsOnReload", fenceLiftsOnReload},
+	{"PersistentFenceStaysFenced", persistentFenceStaysFenced},
+	{"EveryCommitterIsFenced", everyCommitterIsFenced},
+	{"MergeFencedMidwayRollsBack", mergeFencedMidwayRollsBack},
+	{"FlushFencedMidwayKeepsRows", flushFencedMidwayKeepsRows},
+	{"ReloadKeepsUncommittedFlush", reloadKeepsUncommittedFlush},
+	{"CorruptPartBecomesWant", corruptPartBecomesWant},
+	{"OtherFailuresNeverExit", otherFailuresNeverExit},
+	{"CorruptRunResets", corruptRunResets},
+	{"CorruptPartsExitTogether", corruptPartsExitTogether},
 
 	{"FailedFlushBurnsPartID", failedFlushBurnsPartID},
 	{"LoadPartsSweepsOrphanParts", loadPartsSweepsOrphanParts},

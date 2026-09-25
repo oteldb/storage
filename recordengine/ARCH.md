@@ -341,6 +341,13 @@ fails the load, and the sweep spares a wanted part's remaining objects
 removal"). `AdoptWants` is shared with it too: obligations partsync discovers for parts a peer
 holds that this index never named, which survive a load because nothing in the index implies them.
 
+A load is all-or-nothing and a failed one fences every commit until a load succeeds, retried by
+`ReloadFenced` each maintenance cycle; a reload keeps a flushed part whose commit failed; a part
+corrupt over three consecutive loads becomes a want. All of it is shared with the metric engine
+([`../engine/ARCH.md`](../engine/ARCH.md), "A failed load changes nothing, and fences every commit"
+and "Corruption that persists is a want"). A corrupt record-keys footer (`ErrCorruptKeys`) counts as
+corruption here too.
+
 ## Lifecycle guards
 
 Flush and merge run under one `flushMu`, and `Reset` takes it too, with the same rationale and the same

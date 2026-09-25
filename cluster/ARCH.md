@@ -206,6 +206,13 @@ of the shard is served here as usual. It ends when repair fetches the part back,
 acknowledged as a hole — which discharges the want — so failing reads is bounded by repair or by an
 operator accepting the loss, never open-ended.
 
+A **fenced** engine — its last index load failed (`engine/ARCH.md`) — disclaims the whole shard, not a
+window: its part set is the one from its last good load, and whatever the stored index gained since
+is exactly what it cannot see. It ends when a load succeeds, or when a part that stayed corrupt is
+handed to repair as a want, which narrows the disclaim to that part's range. A store without the
+cluster layer does not disclaim a fenced engine: with no owner to fail over to, the old part set is
+the best answer there is, and the fence is reported as a health error instead (`ADMIN.md`).
+
 **The two disclaims are not the same fact, and they end differently.** Both fail over, and in a
 cluster that is usually the end of it: a complete owner answers and the query succeeds. The
 difference bites only when *every* owner disclaims. "No owner holds the shard" means it has no data

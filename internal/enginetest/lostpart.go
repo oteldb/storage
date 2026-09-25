@@ -108,8 +108,9 @@ func transientOpenFailureRecordsNoWant(t *testing.T, k Kind) {
 }
 
 // corruptPartIsNotAWant pins the narrow trigger: objects that are present but unreadable are a
-// different failure with a different remedy, and widening the trigger to cover them is how a repair
-// path becomes a data-destruction path.
+// different failure with a different remedy, and widening the trigger to cover them on the load that
+// meets them is how a repair path becomes a data-destruction path ([corruptPartBecomesWant] is the
+// exit a persistent run earns).
 func corruptPartIsNotAWant(t *testing.T, k Kind) {
 	t.Helper()
 

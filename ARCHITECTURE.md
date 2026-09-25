@@ -152,7 +152,8 @@ jittered backoff; **idempotent reads hedge** across replicas, **writes stay at-m
 routed to a **holder**, not to a ring owner: an owner that has no data for the shard answers
 `cluster.ErrShardAbsent`, which fails over to an owner that does, so a ring/data disagreement never
 degrades into a silently partial result. An owner that *holds* the shard and knows it is missing data
-for the window — a head lost at restart, or a part its index names but it cannot read — answers
+for the window — a head lost at restart, a part its index names but it cannot read, or an index
+load that failed and fenced it — answers
 `cluster.ErrShardIncomplete`, which fails over the same way but never collapses to an empty success:
 when every owner disclaims, "no owner holds it" reads as empty and "an owner holds it and is short"
 fails the read (`cluster.Disclaims`). A store without the cluster layer keeps the rule with nothing
@@ -201,7 +202,12 @@ to fail over to: a read overlapping a want fails.
   part swept by a later open once it is older than `OrphanGrace` (younger, it may be another
   writer's uncommitted part) — never rows that are committed but unresolvable. The commit is a
   `backend.CompareAndSwap` against the version the writer read, so two writers over one prefix (a
-  shared store) cannot overwrite each other's entries; the loser reloads and retries.
+  shared store) cannot overwrite each other's entries; the loser reloads and retries. The version
+  and the part set it guards move together: a load either adopts the whole index or changes nothing,
+  and one that fails fences the writer — no commit — until a load succeeds (`engine/ARCH.md`, *A
+  failed load changes nothing, and fences every commit*). The one exit is a part that stays corrupt
+  over three consecutive loads: it becomes a repair want, as a gone part does. A part in a newer
+  format never exits.
 - **Mutating the backend at open is opt-out, and opting out is total.** Recovery's orphan sweep is
   the one write that happens before any caller-settable state exists, so a reader that only wanted to
   look — a backup, a verifier, an offline inspector — reclaimed objects from the directory it was

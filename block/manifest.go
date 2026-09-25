@@ -111,6 +111,10 @@ const (
 // bad magic, CRC mismatch, truncation, or an out-of-range field.
 var ErrCorrupt = errors.New("block: corrupt metadata")
 
+// ErrUnsupportedVersion is returned (wrapped) for a manifest newer than this reader: an intact part
+// written by a later release. It wraps [ErrCorrupt], so callers that only fail on corruption still do.
+var ErrUnsupportedVersion = errors.Wrap(ErrCorrupt, "newer than this reader")
+
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 // ColumnDesc describes one column in a part: its identity, codecs, constant value (if
@@ -338,7 +342,12 @@ func DecodeManifest(src []byte) (Manifest, error) {
 		return Manifest{}, errors.Wrap(ErrCorrupt, "version")
 	}
 
-	if version < uint64(manifestVersionMin) || version > uint64(manifestVersion) {
+	if version > uint64(manifestVersion) {
+		return Manifest{}, errors.Wrapf(ErrUnsupportedVersion,
+			"unsupported version %d, want %d..%d", version, manifestVersionMin, manifestVersion)
+	}
+
+	if version < uint64(manifestVersionMin) {
 		return Manifest{}, errors.Wrapf(ErrCorrupt,
 			"unsupported version %d, want %d..%d", version, manifestVersionMin, manifestVersion)
 	}
