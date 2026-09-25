@@ -153,7 +153,8 @@ func (e *Engine) PartsDetailed(ctx context.Context) ([]PartDetailStat, error) {
 		}
 
 		cols := make([]ColumnStat, 0, len(man.Columns))
-		for i, c := range man.Columns {
+		for i := range man.Columns {
+			c := &man.Columns[i]
 			cols = append(cols, ColumnStat{
 				Name: c.Name, Kind: c.Kind.String(), Codec: c.Codec.String(), Compress: c.Compress.String(),
 				Level: int(c.Level), Bytes: sizes.Columns[i],

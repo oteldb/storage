@@ -30,16 +30,18 @@ func bytesColumn(t *testing.T, vals [][]byte, codec chunk.Codec, granule int) *C
 		Compress: noneComp().Algorithm(), Blocked: true, Framed: true, Checked: true,
 	}
 
-	obj, ok, err := trySharedDict(c, codec, noneComp(), granule, defaultCompressBlockBytes)
-	require.NoError(t, err)
+	if codec == chunk.CodecDict {
+		obj, dict, _, ok, err := encodeTrailerDictBytes(c, noneComp(), defaultLayout(granule), false)
+		require.NoError(t, err)
 
-	if ok {
-		desc.SharedDict = true
+		if ok {
+			dict.apply(&desc)
 
-		return newColumnReader(desc, obj, noneComp(), len(vals))
+			return newColumnReader(desc, obj, noneComp(), len(vals))
+		}
 	}
 
-	obj, err = encodeBlocked(c, codec, 0, noneComp(), granule, defaultCompressBlockBytes)
+	obj, err := encodeBlocked(c, codec, 0, noneComp(), granule, defaultCompressBlockBytes)
 	require.NoError(t, err)
 
 	return newColumnReader(desc, obj, noneComp(), len(vals))

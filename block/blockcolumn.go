@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"math"
+	"sync"
 
 	"github.com/go-faster/errors"
 
@@ -71,85 +72,63 @@ const defaultCompressBlockBytes = 64 << 10
 func encodeBlocked(
 	c Column, codec chunk.Codec, budget uint8, comp *compress.Compressor, blockRows, compressBytes int,
 ) ([]byte, error) {
-	return encodeBlockedWith(c.rows(), comp, blockRows, compressBytes,
+	acc, err := accumulateColumn(c, codec, budget, comp, blockRows, compressBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return acc.finishBuffered(blockRows, nil), nil
+}
+
+func accumulateColumn(
+	c Column, codec chunk.Codec, budget uint8, comp *compress.Compressor, blockRows, compressBytes int,
+) (*blockAccum, error) {
+	return accumulateBlocked(c.rows(), comp, blockRows, compressBytes,
 		func(dst []byte, lo, hi int) ([]byte, error) {
 			return appendBlockStream(dst, c, codec, budget, lo, hi)
 		})
 }
 
-// encodeBlockedWith is [encodeBlocked] over an arbitrary per-granule stream builder, so an encoding
-// that needs column-wide state (the shared bytes dictionary) can reuse the framing and directory.
+// encodeBlockedWith is [encodeBlocked] over an arbitrary per-granule stream builder, under the
+// leading-directory layout.
 func encodeBlockedWith(
 	n int, comp *compress.Compressor, blockRows, compressBytes int,
 	appendStream func(dst []byte, lo, hi int) ([]byte, error),
 ) ([]byte, error) {
+	acc, err := accumulateBlocked(n, comp, blockRows, compressBytes, appendStream)
+	if err != nil {
+		return nil, err
+	}
+
+	return acc.finishBuffered(blockRows, nil), nil
+}
+
+// accumulateBlocked packs n rows' granule streams, built by appendStream, into sealed compression
+// frames: the layout-independent half of a framed column, whose directory and dictionary the caller
+// places.
+func accumulateBlocked(
+	n int, comp *compress.Compressor, blockRows, compressBytes int,
+	appendStream func(dst []byte, lo, hi int) ([]byte, error),
+) (*blockAccum, error) {
 	if blockRows <= 0 {
 		return nil, errors.Errorf("block: blockRows must be > 0, got %d", blockRows)
 	}
 
-	if compressBytes <= 0 {
-		compressBytes = defaultCompressBlockBytes
-	}
-
-	var (
-		frames    [][]byte
-		frameLens []int // granules per frame
-		gLens     []int // per-granule stream length within its frame
-		pending   []byte
-		inFrame   int
-	)
-
-	seal := func() {
-		if inFrame == 0 {
-			return
-		}
-
-		frames = append(frames, comp.Compress(nil, pending))
-		frameLens = append(frameLens, inFrame)
-		pending, inFrame = pending[:0], 0
-	}
+	acc := newBlockAccum(comp, compressBytes)
 
 	for lo := 0; lo < n; lo += blockRows {
 		hi := min(lo+blockRows, n)
 
-		before := len(pending)
-
-		var err error
-		if pending, err = appendStream(pending, lo, hi); err != nil {
+		if err := acc.addGranule(func(dst []byte) ([]byte, error) { return appendStream(dst, lo, hi) }); err != nil {
 			return nil, err
 		}
-
-		gLens = append(gLens, len(pending)-before)
-		inFrame++
-
-		if len(pending) >= compressBytes {
-			seal()
-		}
 	}
 
-	seal()
-
-	dst := binary.AppendUvarint(nil, uint64(len(gLens)))
-	dst = binary.AppendUvarint(dst, uint64(blockRows))
-	dst = binary.AppendUvarint(dst, uint64(len(frames)))
-
-	for i, f := range frames {
-		dst = binary.AppendUvarint(dst, uint64(frameLens[i]))
-		dst = binary.AppendUvarint(dst, uint64(len(f)))
-		dst = binary.LittleEndian.AppendUint32(dst, crc32.Checksum(f, castagnoli))
+	if err := acc.seal(); err != nil {
+		return nil, err
 	}
 
-	for _, l := range gLens {
-		dst = binary.AppendUvarint(dst, uint64(l))
-	}
-
-	dst = binary.LittleEndian.AppendUint32(dst, crc32.Checksum(dst, castagnoli))
-
-	for _, f := range frames {
-		dst = append(dst, f...)
-	}
-
-	return dst, nil
+	return acc, nil
 }
 
 // appendBlockStream codec-encodes c's rows [lo,hi) onto dst as a single chunk stream: the per-row
@@ -210,6 +189,11 @@ type blockDir struct {
 	gFrame    []int32  // per granule: owning frame; nil in the legacy layout
 	gOff      []int32  // per granule: byte offset within the decompressed frame
 	gLen      []int32  // per granule: byte length within the decompressed frame
+	// frameRaw is each frame's decompressed length, the sum of its granules' lengths: the exact
+	// size its decompression is held to. nil in the legacy layout, whose frames are held to
+	// legacyMax instead (unlimited when negative).
+	frameRaw  []int32
+	legacyMax int64
 
 	// col names the column in checksum errors, which otherwise report a frame index against no
 	// column at all.
@@ -253,6 +237,32 @@ func (d blockDir) frame(f int) ([]byte, error) {
 	return raw, nil
 }
 
+// decompress decompresses frame f's raw bytes onto dst, held to the frame's recorded size.
+func (d blockDir) decompress(comp *compress.Compressor, dst []byte, f int, raw []byte) ([]byte, error) {
+	var (
+		out []byte
+		err error
+	)
+
+	if d.frameRaw != nil {
+		out, err = decompressBounded(comp, dst, raw, int64(d.frameRaw[f]), true)
+	} else {
+		out, err = decompressBounded(comp, dst, raw, d.legacyMax, false)
+	}
+
+	if err != nil {
+		return nil, errors.Wrapf(err, "decompress frame %d", f)
+	}
+
+	return out, nil
+}
+
+// residentBytes is what the parsed directory holds.
+func (d blockDir) residentBytes() int64 {
+	return 4*int64(len(d.frameOff)+len(d.frameCRC)+len(d.frameRaw)) +
+		4*int64(len(d.gFrame)+len(d.gOff)+len(d.gLen))
+}
+
 // frameOf returns the frame holding granule g.
 func (d blockDir) frameOf(g int) int {
 	if d.gFrame == nil {
@@ -280,25 +290,62 @@ func (d blockDir) granuleStream(g int, frame []byte) ([]byte, error) {
 // directory's byte length so a reader can find its start from the object's end.
 const footerLenBytes = 4
 
-// parseBlockDir reads the directory from a blocked column object. framed and footer select the
-// layout: the frame-packed directory leading the frames, the same directory trailing them, or the
-// legacy one-compressed-block-per-granule form. It bounds-checks every field against the object
-// length so a corrupt object errors rather than panics.
+// dirCheck is what a directory must agree with beyond its own bytes.
+type dirCheck struct {
+	checked bool
+	// sizing is the manifest's record of the directory, nil when it keeps none. Counts are compared
+	// before any array is allocated, so a directory cannot claim more than the manifest charged.
+	sizing *ColumnSizing
+	// rawMax plus rawPerGranule per granule bounds the frames' decompressed total; unlimited when
+	// rawMax is negative.
+	rawMax, rawPerGranule int64
+}
+
+func newDirCheck(desc ColumnDesc, lim decodeLimits) dirCheck {
+	chk := dirCheck{checked: desc.Checked, rawMax: lim.frames, rawPerGranule: lim.framesPerGranule}
+	if desc.HasSizing {
+		sz := desc.Sizing
+		chk.sizing = &sz
+	}
+
+	return chk
+}
+
+// dirLen checks a directory's encoded length against the manifest's record of it.
+func (c dirCheck) dirLen(n int) error {
+	if c.sizing != nil && int64(n) != c.sizing.DirLen {
+		return errors.Wrapf(ErrCorrupt, "block dir of %d bytes, the manifest says %d", n, c.sizing.DirLen)
+	}
+
+	return nil
+}
+
+// parseBlockDir reads the directory from a blocked column object, selecting the layout desc records.
+// It bounds-checks every field against the object length so a corrupt object errors rather than
+// panics.
 func parseBlockDir(object []byte, desc ColumnDesc) (blockDir, error) {
+	return parseBlockDirWith(object, desc, columnLimits(desc, 0, 0))
+}
+
+func parseBlockDirWith(object []byte, desc ColumnDesc, lim decodeLimits) (blockDir, error) {
 	var (
 		d   blockDir
 		err error
 	)
 
+	chk := newDirCheck(desc, lim)
+
 	switch {
+	case desc.TrailerDict:
+		d, err = parseTrailerDir(object, desc, chk)
 	case desc.Footer:
-		d, err = parseFooterDir(object, desc.Checked)
+		d, err = parseFooterDir(object, chk)
 	case desc.Framed:
-		d, err = parseFramedDir(object, desc.Checked)
+		d, err = parseFramedDir(object, chk)
 	default:
 		// The legacy one-compressed-block-per-granule layout predates the checksums and no writer
 		// emits it, so a directory in that form never carries them.
-		d, err = parseLegacyDir(object)
+		d, err = parseLegacyDir(object, lim.stream)
 	}
 
 	if err != nil {
@@ -317,7 +364,7 @@ func parseBlockDir(object []byte, desc ColumnDesc) (blockDir, error) {
 // The directory bytes are the frame-packed ones [parseFramedDir] reads — including their trailing
 // checksum, which dirLen counts — so the two layouts differ only in where the reader finds them and
 // where each frame's offset is measured from.
-func parseFooterDir(object []byte, checked bool) (blockDir, error) {
+func parseFooterDir(object []byte, chk dirCheck) (blockDir, error) {
 	if len(object) < footerLenBytes {
 		return blockDir{}, errors.Wrap(ErrCorrupt, "block dir footer truncated")
 	}
@@ -331,12 +378,25 @@ func parseFooterDir(object []byte, checked bool) (blockDir, error) {
 
 	dataEnd := end - dirLen
 
-	d, err := parseFramedDirAt(object[dataEnd:end], object[:dataEnd], checked)
-	if err != nil {
-		return blockDir{}, err
+	return parseFramedDirAt(object[dataEnd:end], object[:dataEnd], chk)
+}
+
+// parseTrailerDir parses a trailer-dictionary column's directory: the footer layout with the
+// dictionary region between the frames and the directory, where the manifest places it.
+func parseTrailerDir(object []byte, desc ColumnDesc, chk dirCheck) (blockDir, error) {
+	regionEnd := desc.DictOff + desc.DictLen
+	if regionEnd > int64(len(object))-footerLenBytes {
+		return blockDir{}, errors.Wrapf(ErrCorrupt,
+			"trailer dictionary [%d,+%d) past object %d", desc.DictOff, desc.DictLen, len(object))
 	}
 
-	return d, nil
+	end := len(object) - footerLenBytes
+	if dirLen := int64(binary.LittleEndian.Uint32(object[end:])); dirLen != int64(end)-regionEnd {
+		return blockDir{}, errors.Wrapf(ErrCorrupt,
+			"block dir footer len %d, the trailer leaves %d", dirLen, int64(end)-regionEnd)
+	}
+
+	return parseFramedDirAt(object[regionEnd:end], object[:desc.DictOff], chk)
 }
 
 // dirCursor reads the uvarint fields of a block directory, tracking the read position and turning a
@@ -374,18 +434,22 @@ func (c *dirCursor) uvarint(what string) (uint64, error) {
 
 // parseFramedDir parses the frame-packed directory leading the frames it describes (see the layout
 // comment above).
-func parseFramedDir(object []byte, checked bool) (blockDir, error) {
-	d, pos, total, err := parseFramedDirFields(object, len(object), checked)
+func parseFramedDir(object []byte, chk dirCheck) (blockDir, error) {
+	d, pos, total, err := parseFramedDirFields(object, len(object), chk)
 	if err != nil {
 		return blockDir{}, err
 	}
 
-	if checked {
+	if chk.checked {
 		if err := verifyDirCRC(object, pos); err != nil {
 			return blockDir{}, err
 		}
 
 		pos += dirCRCBytes
+	}
+
+	if err := chk.dirLen(pos); err != nil {
+		return blockDir{}, err
 	}
 
 	if pos+total > len(object) {
@@ -418,13 +482,26 @@ func verifyDirCRC(dir []byte, pos int) error {
 // where dir trails the frames in data rather than leading them. The frames' lengths must account for
 // data exactly: a directory describing fewer bytes than the object holds is as corrupt as one
 // describing more.
-func parseFramedDirAt(dir, data []byte, checked bool) (blockDir, error) {
-	d, pos, total, err := parseFramedDirFields(dir, len(data), checked)
+func parseFramedDirAt(dir, data []byte, chk dirCheck) (blockDir, error) {
+	d, err := parseDetachedDir(dir, int64(len(data)), chk)
 	if err != nil {
 		return blockDir{}, err
 	}
 
-	if checked {
+	d.data = data
+
+	return d, nil
+}
+
+// parseDetachedDir parses a directory held apart from the frameBytes of frames it describes,
+// requiring it to span dir exactly and the frames to total frameBytes.
+func parseDetachedDir(dir []byte, frameBytes int64, chk dirCheck) (blockDir, error) {
+	d, pos, total, err := parseFramedDirFields(dir, int(frameBytes), chk)
+	if err != nil {
+		return blockDir{}, err
+	}
+
+	if chk.checked {
 		if err := verifyDirCRC(dir, pos); err != nil {
 			return blockDir{}, err
 		}
@@ -436,11 +513,13 @@ func parseFramedDirAt(dir, data []byte, checked bool) (blockDir, error) {
 		return blockDir{}, errors.Wrapf(ErrCorrupt, "block dir footer has %d trailing bytes", len(dir)-pos)
 	}
 
-	if total != len(data) {
-		return blockDir{}, errors.Wrapf(ErrCorrupt, "block dir frames total %d, want %d", total, len(data))
+	if err := chk.dirLen(pos); err != nil {
+		return blockDir{}, err
 	}
 
-	d.data = data
+	if int64(total) != frameBytes {
+		return blockDir{}, errors.Wrapf(ErrCorrupt, "block dir frames total %d, want %d", total, frameBytes)
+	}
 
 	return d, nil
 }
@@ -449,7 +528,7 @@ func parseFramedDirAt(dir, data []byte, checked bool) (blockDir, error) {
 // directory (without its data), the byte position just past the fields, and the frames' total
 // compressed length. dataMax bounds that total — the byte count available to the frames, which is
 // the object itself in the leading layout and the region before the directory in the footer one.
-func parseFramedDirFields(dir []byte, dataMax int, checked bool) (blockDir, int, int, error) {
+func parseFramedDirFields(dir []byte, dataMax int, chk dirCheck) (blockDir, int, int, error) {
 	c := dirCursor{object: dir, dataMax: dataMax}
 
 	nGranules64, err := c.uvarint("nGranules")
@@ -477,29 +556,36 @@ func parseFramedDirFields(dir []byte, dataMax int, checked bool) (blockDir, int,
 		return blockDir{}, 0, 0, errors.Wrapf(ErrCorrupt, "block dir counts %d/%d exceed object", nGranules64, nFrames64)
 	}
 
+	if sz := chk.sizing; sz != nil && (nGranules64 != uint64(sz.NumGranules) || nFrames64 != uint64(sz.NumFrames)) {
+		return blockDir{}, 0, 0, errors.Wrapf(ErrCorrupt, "block dir counts %d/%d, the manifest says %d/%d",
+			nGranules64, nFrames64, sz.NumGranules, sz.NumFrames)
+	}
+
 	nGranules, nFrames := int(nGranules64), int(nFrames64)
 
-	// One allocation for all four index arrays.
-	buf := make([]int32, nFrames+1+3*nGranules)
+	// One allocation for all five index arrays.
+	buf := make([]int32, 2*nFrames+1+3*nGranules)
 	d := blockDir{
 		blockRows: int(blockRows64),
 		granules:  nGranules,
 		frameOff:  buf[:nFrames+1],
-		gFrame:    buf[nFrames+1 : nFrames+1+nGranules],
-		gOff:      buf[nFrames+1+nGranules : nFrames+1+2*nGranules],
-		gLen:      buf[nFrames+1+2*nGranules:],
+		frameRaw:  buf[nFrames+1 : 2*nFrames+1],
+		gFrame:    buf[2*nFrames+1 : 2*nFrames+1+nGranules],
+		gOff:      buf[2*nFrames+1+nGranules : 2*nFrames+1+2*nGranules],
+		gLen:      buf[2*nFrames+1+2*nGranules:],
+		legacyMax: unlimited,
 	}
 
-	if checked {
+	if chk.checked {
 		d.frameCRC = make([]uint32, nFrames)
 	}
 
-	total, err := readFrameTable(&c, &d, nFrames)
+	total, err := readFrameTable(&c, &d, nFrames, chk.sizing)
 	if err != nil {
 		return blockDir{}, 0, 0, err
 	}
 
-	if err := readGranuleLens(&c, &d); err != nil {
+	if err := readGranuleLens(&c, &d, chk); err != nil {
 		return blockDir{}, 0, 0, err
 	}
 
@@ -508,8 +594,8 @@ func parseFramedDirFields(dir []byte, dataMax int, checked bool) (blockDir, int,
 
 // readFrameTable reads the per-frame (granule count, compressed length) pairs, filling d.frameOff and
 // d.gFrame, and returns the frames' total compressed byte length.
-func readFrameTable(c *dirCursor, d *blockDir, nFrames int) (int, error) {
-	total, g := 0, 0
+func readFrameTable(c *dirCursor, d *blockDir, nFrames int, sz *ColumnSizing) (int, error) {
+	total, g, largest := 0, 0, uint64(0)
 
 	for f := range nFrames {
 		count, err := c.uvarint("frame granules")
@@ -547,6 +633,8 @@ func readFrameTable(c *dirCursor, d *blockDir, nFrames int) (int, error) {
 			return 0, errors.Wrapf(ErrCorrupt, "frame %d len too large", f)
 		}
 
+		largest = max(largest, clen)
+
 		total += int(clen)
 		if total < 0 || total > c.dataMax {
 			return 0, errors.Wrapf(ErrCorrupt, "frame %d data exceeds object", f)
@@ -559,13 +647,26 @@ func readFrameTable(c *dirCursor, d *blockDir, nFrames int) (int, error) {
 		return 0, errors.Wrapf(ErrCorrupt, "block dir frames hold %d granules, want %d", g, d.granules)
 	}
 
+	if sz != nil && largest != uint64(sz.MaxFrameBytes) {
+		return 0, errors.Wrapf(ErrCorrupt, "largest frame %d bytes, the manifest says %d", largest, sz.MaxFrameBytes)
+	}
+
 	return total, nil
 }
 
 // readGranuleLens reads the per-granule stream lengths and turns them into (offset, length) spans
-// within each granule's decompressed frame. Requires d.gFrame to be filled.
-func readGranuleLens(c *dirCursor, d *blockDir) error {
-	off, prevFrame := int32(0), int32(-1)
+// within each granule's decompressed frame, and each frame's decompressed length. Requires d.gFrame
+// to be filled.
+func readGranuleLens(c *dirCursor, d *blockDir, chk dirCheck) error {
+	var (
+		off, prevFrame           = int32(0), int32(-1)
+		total, maxGran, maxFrame int64
+	)
+
+	rawMax := chk.rawMax
+	if rawMax >= 0 {
+		rawMax = satAdd(rawMax, satMul(chk.rawPerGranule, int64(d.granules)))
+	}
 
 	for i := range d.granules {
 		l, err := c.uvarint("granule len")
@@ -588,14 +689,35 @@ func readGranuleLens(c *dirCursor, d *blockDir) error {
 
 		d.gOff[i], d.gLen[i] = off, int32(l)
 		off += int32(l)
+		d.frameRaw[prevFrame] = off
+
+		total += int64(l)
+		maxGran, maxFrame = max(maxGran, int64(l)), max(maxFrame, int64(off))
+
+		if sz := chk.sizing; sz != nil && (maxGran > sz.MaxGranuleRaw || maxFrame > sz.MaxFrameRaw) {
+			return errors.Wrapf(ErrCorrupt, "granule %d: a granule of %d or frame of %d bytes past the manifest's %d/%d",
+				i, l, off, sz.MaxGranuleRaw, sz.MaxFrameRaw)
+		}
+
+		if rawMax >= 0 && total > rawMax {
+			return errors.Wrapf(ErrCorrupt, "granules decompress to over %d bytes", rawMax)
+		}
+	}
+
+	if sz := chk.sizing; sz != nil &&
+		(total != sz.StreamRaw || maxGran != sz.MaxGranuleRaw || maxFrame != sz.MaxFrameRaw) {
+		return errors.Wrapf(ErrCorrupt,
+			"granules total %d (largest %d, frame %d), the manifest says %d (%d, %d)",
+			total, maxGran, maxFrame, sz.StreamRaw, sz.MaxGranuleRaw, sz.MaxFrameRaw)
 	}
 
 	return nil
 }
 
 // parseLegacyDir parses the pre-framing directory, where each granule is its own compressed block:
-// [uvarint nBlocks][uvarint blockRows][nBlocks × uvarint blockLen] followed by the blocks.
-func parseLegacyDir(object []byte) (blockDir, error) {
+// [uvarint nBlocks][uvarint blockRows][nBlocks × uvarint blockLen] followed by the blocks. Its
+// blocks record no decompressed size, so each is held to frameMax.
+func parseLegacyDir(object []byte, frameMax int64) (blockDir, error) {
 	nBlocks64, n := binary.Uvarint(object)
 	if n <= 0 {
 		return blockDir{}, errors.Wrap(ErrCorrupt, "block dir nBlocks")
@@ -654,6 +776,7 @@ func parseLegacyDir(object []byte) (blockDir, error) {
 		blockRows: int(blockRows64),
 		granules:  nBlocks,
 		frameOff:  offsets,
+		legacyMax: frameMax,
 		data:      object[pos : pos+total],
 	}, nil
 }
@@ -673,6 +796,35 @@ func newBlockStreams(dir blockDir, comp *compress.Compressor) blockStreams {
 	return blockStreams{dir: dir, comp: comp, frame: -1}
 }
 
+// maxPooledFrameBuf caps the buffers [walkBufs] keeps: a frame is 64 KiB by default, and an
+// outsized one is not worth holding until the next collection.
+const maxPooledFrameBuf = 4 << 20
+
+// walkBufs recycles the frame buffers of walks that copy out what they decode. A bounded zstd
+// decode needs a block of slack past the frame, which a fresh buffer per walk would allocate and
+// zero every time.
+var walkBufs sync.Pool
+
+// newWalkStreams is [newBlockStreams] with a recycled buffer; the walk must [blockStreams.release]
+// it and must not let anything it returns alias a frame.
+func newWalkStreams(dir blockDir, comp *compress.Compressor) blockStreams {
+	s := newBlockStreams(dir, comp)
+	if p, ok := walkBufs.Get().(*[]byte); ok {
+		s.buf = *p
+	}
+
+	return s
+}
+
+func (s *blockStreams) release() {
+	if s.buf != nil && cap(s.buf) <= maxPooledFrameBuf {
+		buf := s.buf[:0]
+		walkBufs.Put(&buf)
+	}
+
+	s.buf, s.frame = nil, -1
+}
+
 // granule returns granule g's codec stream. The result aliases the cached frame buffer and stays
 // valid until the next call that crosses a frame boundary.
 func (s *blockStreams) granule(g int) ([]byte, error) {
@@ -683,9 +835,9 @@ func (s *blockStreams) granule(g int) ([]byte, error) {
 			return nil, errors.Wrapf(err, "frame %d", f)
 		}
 
-		buf, err := s.comp.Decompress(s.buf[:0], raw)
+		buf, err := s.dir.decompress(s.comp, s.buf[:0], f, raw)
 		if err != nil {
-			return nil, errors.Wrapf(err, "decompress frame %d", f)
+			return nil, err
 		}
 
 		s.buf, s.frame = buf, f
@@ -700,13 +852,8 @@ func (s *blockStreams) granule(g int) ([]byte, error) {
 // Unlike the int64/float64 paths this cannot decode into a preallocated destination: each granule
 // carries its own dictionary, so the ids only become comparable after [chunk.DictMerger] remaps
 // them into a shared one.
-//
-// Frames are decompressed into a fresh buffer each — not the recycled one [blockStreams] uses —
-// because the merged column's entries *alias* the decoded frames rather than copying them. Copying
-// instead would cost a second pass over every byte of a high-cardinality column; letting the merged
-// column hold the frames alive costs the same allocation the decompression needed anyway.
 func decodeBlockedBytes(
-	dir blockDir, comp *compress.Compressor, rows int, blocks []int, shared [][]byte,
+	dir blockDir, comp *compress.Compressor, rows int, blocks []int, sd sharedDict,
 ) (*chunk.DictColumn, error) {
 	// A nil selection means the whole column; materializing it lets the whole-column decode take the
 	// same shared-dictionary fast path a pruned one does.
@@ -717,15 +864,15 @@ func decodeBlockedBytes(
 		}
 	}
 
-	if shared != nil {
-		if col, ok, err := decodeSharedIDs(dir, comp, rows, blocks, shared, false); err != nil {
+	if sd.on {
+		if col, ok, err := decodeSharedIDs(dir, comp, rows, blocks, sd, false); err != nil {
 			return nil, err
 		} else if ok {
 			return col, nil
 		}
 	}
 
-	w := bytesWalk{dir: dir, comp: comp, rows: rows, shared: shared, curFrame: -1}
+	w := newBytesWalk(dir, comp, rows, blocks, sd)
 
 	for _, g := range blocks {
 		if err := w.decode(g); err != nil {
@@ -746,17 +893,18 @@ func decodeBlockedBytes(
 // decodeBlockedBytesScatter is [decodeBlockedBytes] placing each granule at its own row offset, so
 // the result spans the whole column and part row indices stay valid through a pruned decode.
 func decodeBlockedBytesScatter(
-	dir blockDir, comp *compress.Compressor, rows int, blocks []int, shared [][]byte,
+	dir blockDir, comp *compress.Compressor, rows int, blocks []int, sd sharedDict,
 ) (*chunk.DictColumn, error) {
-	if shared != nil {
-		if col, ok, err := decodeSharedIDs(dir, comp, rows, blocks, shared, true); err != nil {
+	if sd.on {
+		if col, ok, err := decodeSharedIDs(dir, comp, rows, blocks, sd, true); err != nil {
 			return nil, err
 		} else if ok {
 			return col, nil
 		}
 	}
 
-	w := bytesWalk{dir: dir, comp: comp, rows: rows, shared: shared, curFrame: -1, scatter: true}
+	w := newBytesWalk(dir, comp, rows, blocks, sd)
+	w.scatter = true
 	w.merger.Scatter(rows)
 
 	for _, g := range blocks {
@@ -777,17 +925,51 @@ func decodeBlockedBytesScatter(
 
 // bytesWalk carries the state of one decode walk over a block-framed bytes column: the current
 // decompressed frame and the merge accumulating the granules decoded so far.
+//
+// The merged column's entries alias the decoded frames, so every frame the walk touches stays live
+// until the column dies. They are decoded back to back into one arena sized to their recorded total
+// plus one decoder slack: decoding each into its own buffer would retain the slack a bounded zstd
+// decode needs once per frame — about three times the column at 64 KiB frames.
 type bytesWalk struct {
-	dir    blockDir
-	comp   *compress.Compressor
-	rows   int
-	shared [][]byte
+	dir  blockDir
+	comp *compress.Compressor
+	rows int
+	sd   sharedDict
 
 	merger   chunk.DictMerger
+	arena    []byte
+	slack    int
 	frameBuf []byte
 	curFrame int
 	want     int
 	scatter  bool
+}
+
+func newBytesWalk(dir blockDir, comp *compress.Compressor, rows int, blocks []int, sd sharedDict) *bytesWalk {
+	w := &bytesWalk{dir: dir, comp: comp, rows: rows, sd: sd, curFrame: -1, slack: comp.OutputSlack()}
+
+	if dir.frameRaw == nil {
+		return w
+	}
+
+	total, last := int64(0), -1
+
+	for _, g := range blocks {
+		if g < 0 || g >= dir.nBlocks() {
+			continue // decode reports it
+		}
+
+		if f := dir.frameOf(g); f != last {
+			total += int64(dir.frameRaw[f])
+			last = f
+		}
+	}
+
+	if total > 0 {
+		w.arena = make([]byte, 0, int(total)+w.slack)
+	}
+
+	return w
 }
 
 // frame returns granule g's codec stream, decompressing its frame if it is not the current one.
@@ -798,61 +980,26 @@ func (w *bytesWalk) frame(g int) ([]byte, error) {
 			return nil, errors.Wrapf(err, "frame %d", f)
 		}
 
-		buf, err := w.comp.Decompress(nil, raw)
+		// A frame the arena was not sized for (an unordered selection revisiting one) decodes on
+		// its own.
+		var dst []byte
+		if n := len(w.arena); f < len(w.dir.frameRaw) && cap(w.arena)-n >= int(w.dir.frameRaw[f])+w.slack {
+			dst = w.arena[n : n : n+int(w.dir.frameRaw[f])+w.slack]
+		}
+
+		buf, err := w.dir.decompress(w.comp, dst, f, raw)
 		if err != nil {
-			return nil, errors.Wrapf(err, "decompress frame %d", f)
+			return nil, err
+		}
+
+		if dst != nil {
+			w.arena = w.arena[:len(w.arena)+len(buf)]
 		}
 
 		w.frameBuf, w.curFrame = buf, f
 	}
 
 	return w.dir.granuleStream(g, w.frameBuf)
-}
-
-// decodeSharedMode handles a granule of a shared-dictionary column, reporting whether it consumed it.
-//
-// A granule that uses the shared dictionary carries only ids into it, so it is appended through the
-// merge's one-time seed rather than as a dictionary of its own. Handing the merge the column
-// dictionary per granule instead costs a hash probe per entry *per granule*, which is what made a
-// column mixing both modes several times slower to decode whole than one using either mode alone.
-func (w *bytesWalk) decodeSharedMode(stream []byte, rows, lo int) (bool, error) {
-	mode, payload, err := splitSharedGranule(stream)
-	if err != nil {
-		return false, err
-	}
-
-	if mode != modeShared {
-		return false, nil
-	}
-
-	return true, w.appendShared(payload, rows, lo)
-}
-
-// appendShared validates a shared-dictionary granule's ids and appends them to the merge through its
-// one-time seed of the column dictionary. lo is the granule's first row, used in scatter mode.
-func (w *bytesWalk) appendShared(ids []byte, rows, lo int) error {
-	idWidth := sharedIDWidth(w.shared)
-
-	if len(ids) != rows*idWidth {
-		return errors.Wrapf(ErrCorrupt,
-			"shared dict: %d id bytes for %d rows at width %d", len(ids), rows, idWidth)
-	}
-
-	// Bounds-checked here rather than left to the merge's remap lookup: a corrupt id would otherwise
-	// panic inside the merger with nothing naming the granule it came from.
-	if err := boundSharedIDs(ids, idWidth, rows, w.shared); err != nil {
-		return err
-	}
-
-	w.merger.SeedShared(w.shared)
-
-	if w.scatter {
-		w.merger.AppendSharedAt(ids, idWidth, rows, lo)
-	} else {
-		w.merger.AppendShared(ids, idWidth, rows)
-	}
-
-	return nil
 }
 
 // decode appends granule g's rows to the walk's merge.
@@ -873,19 +1020,19 @@ func (w *bytesWalk) decode(g int) error {
 
 	n := min(lo+w.dir.blockRows, w.rows) - lo
 
-	if w.shared != nil {
-		done, err := w.decodeSharedMode(stream, n, lo)
+	if w.sd.on {
+		ids, width, self, err := w.sd.granule(stream, n)
 		if err != nil {
 			return errors.Wrapf(err, "decode block %d", g)
 		}
 
-		if done {
-			w.want += n
+		if !self {
+			w.appendShared(ids, width, n, lo)
 
 			return nil
 		}
 
-		stream = stream[1:] // a self-encoded granule: its own chunk stream follows the mode byte
+		stream = ids
 	}
 
 	var dc chunk.DictColumn
@@ -907,6 +1054,21 @@ func (w *bytesWalk) decode(g int) error {
 	}
 
 	return nil
+}
+
+// appendShared appends a granule of ids into the column dictionary through the merge's one-time
+// seed of it. Handing the merge the dictionary per granule instead costs a hash probe per entry per
+// granule. lo is the granule's first row, used in scatter mode.
+func (w *bytesWalk) appendShared(ids []byte, width, rows, lo int) {
+	w.merger.SeedShared(w.sd.entries)
+
+	if w.scatter {
+		w.merger.AppendSharedAt(ids, width, rows, lo)
+	} else {
+		w.merger.AppendShared(ids, width, rows)
+	}
+
+	w.want += rows
 }
 
 // decodeFunc decodes one column stream, which must hold exactly rows values.
@@ -937,7 +1099,8 @@ func decodeBlockedColumn[T any](
 	out = out[:rows]
 
 	base := 0
-	streams := newBlockStreams(dir, comp)
+	streams := newWalkStreams(dir, comp)
+	defer streams.release()
 
 	for i := range dir.nBlocks() {
 		stream, err := streams.granule(i)
@@ -980,7 +1143,8 @@ func decodeBlocksInto[T any](
 		return errors.New("block: nil decoder")
 	}
 
-	streams := newBlockStreams(dir, comp)
+	streams := newWalkStreams(dir, comp)
+	defer streams.release()
 
 	for _, b := range blocks {
 		if b < 0 || b >= dir.nBlocks() {
@@ -1033,7 +1197,8 @@ func decodeBlockedRange[T any](
 	}
 
 	out := dst[:0]
-	streams := newBlockStreams(dir, comp)
+	streams := newWalkStreams(dir, comp)
+	defer streams.release()
 
 	var scratch []T
 
@@ -1072,9 +1237,9 @@ type Decoder struct {
 	i64   decodeFunc[int64]
 	f64   decodeFunc[float64]
 
-	// shared is the column's shared dictionary, nil for a column without one. Every granule that
-	// joined it carries only ids into it, so it is peeled at open and resolved against here.
-	shared [][]byte
+	// shared is the column's shared dictionary. Every granule that joined it carries only ids into
+	// it, so it is parsed at open and resolved against here.
+	shared sharedDict
 
 	// streams holds the decompressed compression frame, reused across this decoder's blocks. A
 	// decoder decodes its column's blocks serially (never concurrently), and each block's decoded
@@ -1120,7 +1285,7 @@ func (d *Decoder) DecodeFloat64Into(blk int, dst []float64) ([]float64, error) {
 
 // SharedEntries returns the column's shared dictionary, nil for a column without one. The entries
 // are read-only and shared with every column this decoder produces.
-func (d *Decoder) SharedEntries() [][]byte { return d.shared }
+func (d *Decoder) SharedEntries() [][]byte { return d.shared.entries }
 
 // DecodeBytes decodes the named blocks of a bytes column, in ascending order, merged into one
 // [chunk.DictColumn] over their concatenated rows; a nil selection decodes the whole column.

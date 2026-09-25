@@ -362,6 +362,7 @@ func FuzzStreamWriterMatchesPartWriter(f *testing.F) {
 	f.Add(uint64(1), 3, 5, 4, 0)
 	f.Add(uint64(7), 1, 40, 8, 1)
 	f.Add(uint64(9), 20, 1, 2, 2)
+	f.Add(uint64(3), 7, 30, 5, 5)
 
 	f.Fuzz(func(t *testing.T, seed uint64, nSeries, samplesPer, gsize, shape int) {
 		if nSeries < 0 || nSeries > 40 || samplesPer < 0 || samplesPer > 60 || gsize < 1 || gsize > 64 {
@@ -389,6 +390,10 @@ func FuzzStreamWriterMatchesPartWriter(f *testing.F) {
 		opts := []PartOption{
 			WithSortKey("ts"), WithGranuleSize(gsize),
 			WithCompression(compress.AlgorithmZSTD), WithCompressBlockBytes(32),
+		}
+
+		if shape&4 != 0 {
+			opts = append(opts, WithSizingStats())
 		}
 
 		batch := rows.writeBatch(t, false, opts...)

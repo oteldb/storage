@@ -450,10 +450,8 @@ func (p *part) seriesStat(ctx context.Context, id signal.SeriesID) (SeriesAgg, b
 // basis for the recompression fixed point: a part already at the target algorithm and level is not
 // rewritten again.
 func (p *part) compressedAt() (compress.Algorithm, compress.Level) {
-	for _, c := range p.reader.Manifest().Columns {
-		if c.Name == colValue {
-			return c.Compress, c.Level
-		}
+	if c, ok := p.reader.ColumnDescByName(colValue); ok {
+		return c.Compress, c.Level
 	}
 
 	return compress.AlgorithmNone, 0

@@ -476,8 +476,8 @@ func FuzzBlockedDecodeNoPanic(f *testing.F) {
 
 		_, _ = newColumnReader(unchecked, object, noneComp(), 32).Int64(nil)
 
-		for _, d := range []ColumnDesc{desc, unchecked, legacy} {
-			cur, err := newColumnReader(d, object, noneComp(), 32).TsCursor()
+		for _, d := range []*ColumnDesc{&desc, &unchecked, &legacy} {
+			cur, err := newColumnReader(*d, object, noneComp(), 32).TsCursor()
 			if err != nil {
 				continue
 			}
@@ -489,8 +489,8 @@ func FuzzBlockedDecodeNoPanic(f *testing.F) {
 			}
 		}
 
-		for _, d := range []ColumnDesc{desc, unchecked, legacy} {
-			if dir, err := parseBlockDir(object, d); err == nil {
+		for _, d := range []*ColumnDesc{&desc, &unchecked, &legacy} {
+			if dir, err := parseBlockDir(object, *d); err == nil {
 				_ = dir.nBlocks()
 			}
 		}

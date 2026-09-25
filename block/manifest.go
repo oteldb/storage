@@ -57,11 +57,14 @@ const (
 	// The version, rather than a per-column flag, carries it because all eight flag bits are spent
 	// and because a checksum is not a per-column choice: within one part either every column object
 	// is checked or none is.
-	manifestVersion uint32 = 2
+	manifestVersion uint32 = 3
 	// manifestVersionMin is the oldest version this reader accepts.
 	manifestVersionMin uint32 = 1
 	// manifestVersionChecked is the first version whose column objects carry checksums.
 	manifestVersionChecked uint32 = 2
+	// manifestVersionExt is the first version whose column descriptors carry an xflags byte. A
+	// writer emits it only for a part that sets some xflags bit and version 2 otherwise.
+	manifestVersionExt uint32 = 3
 
 	// maxPartRows is the defensive ceiling on a decoded row count; a count above it is a corrupt
 	// manifest. It is not 1<<31: merges write metric parts past that (3.3 B rows seen), which then
@@ -106,6 +109,22 @@ const (
 	// on a column of repeating blobs is most of them. Meaningful only with flagBlocked.
 	flagSharedDict byte = 1 << 7
 )
+
+// xflags bits, the per-column extension byte of a version-3 descriptor. Unlike the flags byte, an
+// unknown bit is [ErrUnsupportedVersion]: each bit gates fields a reader must parse.
+const (
+	// xTrailerDict marks a shared-dictionary column whose dictionary sits after its frames.
+	xTrailerDict byte = 1 << 0
+	// xSizing marks a column carrying [ColumnDesc.Sizing].
+	xSizing byte = 1 << 1
+
+	xKnown = xTrailerDict | xSizing
+)
+
+// maxSharedDictRaw is the format ceiling on a shared dictionary's decompressed size. Writers clamp
+// their byte cap to it ([WithSharedDictBytes]), so no written dictionary exceeds what a reader
+// accepts.
+const maxSharedDictRaw = 64 << 20
 
 // ErrCorrupt is returned when a manifest (or any part metadata) fails to parse:
 // bad magic, CRC mismatch, truncation, or an out-of-range field.
@@ -179,6 +198,41 @@ type ColumnDesc struct {
 	// no compression). Persisted only when non-zero, via [flagLevel]. Decode ignores it; the merge
 	// engine reads it as the fixed point of the compression ladder.
 	Level compress.Level
+
+	// TrailerDict marks a [ColumnDesc.SharedDict] column laid out as frames, then its dictionary,
+	// then its footer directory. DictOff and DictLen locate the dictionary region, DictRaw is its
+	// decompressed size and DictEntries its entry count; all four are zero otherwise.
+	TrailerDict                            bool
+	DictOff, DictLen, DictRaw, DictEntries int64
+
+	// HasSizing reports that Sizing is set, which a writer given [WithSizingStats] does for every
+	// column with an object.
+	HasSizing bool
+	Sizing    ColumnSizing
+}
+
+// ColumnSizing is what bounds a column's decode, recorded so a merge can be sized from the manifest
+// alone. An unframed column sets only StreamRaw. Readers verify it against the directory, so a
+// manifest cannot understate the column it describes.
+type ColumnSizing struct {
+	// DirLen is the directory's encoded length, its checksum included and a footer's length word
+	// excluded.
+	DirLen      int64
+	NumGranules int64
+	NumFrames   int64
+	// MaxFrameBytes is the largest compressed frame; MaxFrameRaw the largest decompressed one.
+	MaxFrameBytes int64
+	MaxFrameRaw   int64
+	MaxGranuleRaw int64
+	// StreamRaw is the granule streams' total, or an unframed column's decompressed stream.
+	StreamRaw int64
+}
+
+func (s *ColumnSizing) fields() [7]*int64 {
+	return [7]*int64{
+		&s.DirLen, &s.NumGranules, &s.NumFrames,
+		&s.MaxFrameBytes, &s.MaxFrameRaw, &s.MaxGranuleRaw, &s.StreamRaw,
+	}
 }
 
 // Manifest is the part descriptor: format version, row count, time range, granule size,
@@ -233,13 +287,41 @@ func (c *ColumnDesc) flags() byte {
 	return flags
 }
 
+func (c *ColumnDesc) xflags() byte {
+	var x byte
+	if c.TrailerDict {
+		x |= xTrailerDict
+	}
+
+	if c.HasSizing {
+		x |= xSizing
+	}
+
+	return x
+}
+
+// writerVersion is the version a part with these columns is written under: the extension version
+// only when some column needs it, so a part that does not stays readable by a version-2 reader.
+func writerVersion(cols []ColumnDesc) uint32 {
+	for i := range cols {
+		if cols[i].xflags() != 0 {
+			return manifestVersionExt
+		}
+	}
+
+	return manifestVersionChecked
+}
+
 // Encode appends the binary manifest to dst and returns the extended slice. Layout:
 //
 //	[u32 magic][uvarint version][uvarint rowCount][varint minTime][varint maxTime]
 //	[uvarint granuleSize][uvarint colCount]
 //	  per column: [uvarint nameLen][name][byte kind][byte codec][byte compress][byte flags]
+//	              [byte xflags if version ≥ 3]
 //	              [byte precisionBits if flagLossy][byte level if flagLevel]
 //	              [uvarint objectBytes if flagBytes]
+//	              [uvarint dictOff, dictLen, dictRaw, dictEntries if xTrailerDict]
+//	              [uvarint the seven ColumnSizing fields, in declaration order, if xSizing]
 //	              [numeric min/max per kind][const value per kind if flagConst]
 //	[uvarint diskBytes][uvarint rawBytes]
 //	[u32 CRC32C over all the above]
@@ -266,6 +348,12 @@ func (m Manifest) Encode(dst []byte) []byte {
 		flags := c.flags()
 		_ = w.WriteByte(flags)
 
+		var x byte
+		if m.Version >= manifestVersionExt {
+			x = c.xflags()
+			_ = w.WriteByte(x)
+		}
+
 		if flags&flagLossy != 0 {
 			_ = w.WriteByte(c.FloatPrecisionBits)
 		}
@@ -276,6 +364,18 @@ func (m Manifest) Encode(dst []byte) []byte {
 
 		if flags&flagBytes != 0 {
 			w.WriteUvarint(uint64(c.Bytes))
+		}
+
+		if x&xTrailerDict != 0 {
+			for _, v := range [...]int64{c.DictOff, c.DictLen, c.DictRaw, c.DictEntries} {
+				w.WriteUvarint(uint64(v))
+			}
+		}
+
+		if x&xSizing != 0 {
+			for _, v := range c.Sizing.fields() {
+				w.WriteUvarint(uint64(*v))
+			}
 		}
 
 		switch c.Kind {
@@ -401,7 +501,7 @@ func DecodeManifest(src []byte) (Manifest, error) {
 
 	m.Columns = make([]ColumnDesc, 0, colCount)
 	for i := range colCount {
-		c, err := decodeColumnDesc(r, m.Version)
+		c, err := decodeColumnDesc(r, m.Version, rowCount)
 		if err != nil {
 			return Manifest{}, errors.Wrapf(err, "column %d", i)
 		}
@@ -453,7 +553,7 @@ func readBytesView(r *bitstream.Reader, field string) ([]byte, error) {
 	return view, nil
 }
 
-func decodeColumnDesc(r *bitstream.Reader, version uint32) (ColumnDesc, error) {
+func decodeColumnDesc(r *bitstream.Reader, version uint32, rows uint64) (ColumnDesc, error) {
 	c := ColumnDesc{Checked: version >= manifestVersionChecked}
 
 	name, err := readBytesView(r, "name")
@@ -498,6 +598,17 @@ func decodeColumnDesc(r *bitstream.Reader, version uint32) (ColumnDesc, error) {
 	c.SharedDict = flags&flagSharedDict != 0
 	c.Footer = flags&flagFooter != 0
 
+	var x byte
+	if version >= manifestVersionExt {
+		if x, err = r.ReadByte(); err != nil {
+			return c, errors.Wrap(ErrCorrupt, "xflags")
+		}
+
+		if x&^xKnown != 0 {
+			return c, errors.Wrapf(ErrUnsupportedVersion, "unknown xflags %#x", x&^xKnown)
+		}
+	}
+
 	if flags&flagLossy != 0 {
 		bits, err := r.ReadByte()
 		if err != nil {
@@ -525,6 +636,10 @@ func decodeColumnDesc(r *bitstream.Reader, version uint32) (ColumnDesc, error) {
 		if c.Bytes, err = toInt64(n, "objectBytes"); err != nil {
 			return c, err
 		}
+	}
+
+	if err := decodeColumnExt(r, &c, x, version, rows); err != nil {
+		return c, err
 	}
 
 	switch c.Kind {

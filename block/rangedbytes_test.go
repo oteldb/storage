@@ -171,11 +171,14 @@ func TestColumnBlocksSharedEntriesMatchesWholeColumn(t *testing.T) {
 
 	want, err := col.sharedEntries()
 	require.NoError(t, err)
-	require.NotEmpty(t, want)
+	require.True(t, want.on)
+
+	wantEntries := want.entries
+	require.NotEmpty(t, wantEntries)
 
 	d, err := r.ColumnBlocks(ctx, "attrs")
 	require.NoError(t, err)
-	require.Equal(t, want, d.SharedEntries())
+	require.Equal(t, wantEntries, d.SharedEntries())
 }
 
 // TestColumnBlocksBytesReadsOnlyWhatItDecodes is the point of ranging a bytes column: a granule's
@@ -320,10 +323,10 @@ func TestBlockDirReadsContainerAtOffset(t *testing.T) {
 				read = readFooterDir
 			}
 
-			want, err := read(ctx, inner, key, 0, desc.Bytes, desc.Checked)
+			want, err := read(ctx, inner, key, 0, desc.Bytes, dirCheck{checked: desc.Checked, rawMax: unlimited})
 			require.NoError(t, err)
 
-			got, err := read(ctx, shifted, key, pad, desc.Bytes, desc.Checked)
+			got, err := read(ctx, shifted, key, pad, desc.Bytes, dirCheck{checked: desc.Checked, rawMax: unlimited})
 			require.NoError(t, err)
 			require.Equal(t, want.nBlocks(), got.nBlocks())
 			require.Equal(t, want.dataOff+pad, got.dataOff)
@@ -430,7 +433,7 @@ func TestColumnBlocksReadsDictionaryLargerThanProbe(t *testing.T) {
 		}
 	}
 
-	r, _ := writeBytesPart(t, vals, rows)
+	r, _ := writeLeadingBytesPart(t, vals, rows)
 
 	desc, ok := r.ColumnDescByName("attrs")
 	require.True(t, ok)
@@ -441,14 +444,17 @@ func TestColumnBlocksReadsDictionaryLargerThanProbe(t *testing.T) {
 
 	want, err := col.sharedEntries()
 	require.NoError(t, err)
+	require.True(t, want.on)
 
-	_, off, err := readSharedDict(ctx, r.b, columnKey("p", r.byName["attrs"]), zstdComp(), desc.Bytes, desc.Checked)
+	wantEntries := want.entries
+
+	_, off, err := readSharedDict(ctx, r.b, columnKey("p", r.byName["attrs"]), zstdComp(), desc.Bytes, desc.Checked, unlimited)
 	require.NoError(t, err)
 	require.Greater(t, off, int64(dirProbeBytes), "the dictionary fits the probe, so this covers nothing")
 
 	d, err := r.ColumnBlocks(ctx, "attrs")
 	require.NoError(t, err)
-	require.Equal(t, want, d.SharedEntries())
+	require.Equal(t, wantEntries, d.SharedEntries())
 
 	got, err := d.DecodeBytes(nil)
 	require.NoError(t, err)
@@ -538,7 +544,7 @@ func TestColumnBlocksRejectsShortDictionaryRead(t *testing.T) {
 		}
 	}
 
-	r, b := writeBytesPart(t, vals, rows)
+	r, b := writeLeadingBytesPart(t, vals, rows)
 
 	desc, ok := r.ColumnDescByName("attrs")
 	require.True(t, ok)
@@ -546,6 +552,6 @@ func TestColumnBlocksRejectsShortDictionaryRead(t *testing.T) {
 
 	short := &shortReadBackend{Backend: b, key: columnKey("p", r.byName["attrs"]), max: dirProbeBytes}
 
-	_, _, err := readSharedDict(ctx, short, short.key, zstdComp(), desc.Bytes, desc.Checked)
+	_, _, err := readSharedDict(ctx, short, short.key, zstdComp(), desc.Bytes, desc.Checked, unlimited)
 	require.ErrorIs(t, err, ErrCorrupt)
 }

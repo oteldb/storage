@@ -296,7 +296,7 @@ func (w *StreamWriter) build() (builtPart, error) {
 	sizes := make([]int64, len(w.cols))
 
 	for i, c := range w.cols {
-		desc, obj, n, err := c.finish(w.ctx, w.granuleSize)
+		desc, obj, n, err := c.finish(w.ctx, w.granuleSize, w.sizing)
 		if err != nil {
 			return builtPart{}, errors.Wrapf(err, "column %q", c.name)
 		}
@@ -316,7 +316,7 @@ func (w *StreamWriter) build() (builtPart, error) {
 	}
 
 	m := Manifest{
-		Version:     manifestVersion,
+		Version:     writerVersion(descs),
 		RowCount:    rows,
 		GranuleSize: w.granuleSize,
 		Columns:     descs,
@@ -704,7 +704,7 @@ func (c *streamColumn) decimalGranuleRoundTrips(vals []float64) bool {
 // finish encodes the trailing partial granule and returns the column's descriptor, its object, and
 // the object's byte size. A streamed column commits its object to the backend here and returns a nil
 // one — the size is what the caller needs, since the bytes are already gone.
-func (c *streamColumn) finish(ctx context.Context, granuleSize int) (ColumnDesc, []byte, int64, error) {
+func (c *streamColumn) finish(ctx context.Context, granuleSize int, sizing bool) (ColumnDesc, []byte, int64, error) {
 	desc := ColumnDesc{Name: c.name, Kind: c.kind, Codec: c.codec, Compress: c.comp.Algorithm(), Checked: true}
 	if desc.Compress != compress.AlgorithmNone {
 		desc.Level = c.comp.Level()
@@ -713,7 +713,7 @@ func (c *streamColumn) finish(ctx context.Context, granuleSize int) (ColumnDesc,
 	if c.kind == KindInt128 {
 		// No stats and never constant-collapsed: the RLE codec already shrinks a single-id column
 		// to a handful of bytes.
-		obj := sealStream(c.comp, chunk.EncodeU128Runs(nil, c.runs))
+		desc, obj := unframedColumn(desc, c.comp, chunk.EncodeU128Runs(nil, c.runs), sizing)
 
 		return desc, obj, int64(len(obj)), nil
 	}
@@ -775,6 +775,10 @@ func (c *streamColumn) finish(ctx context.Context, granuleSize int) (ColumnDesc,
 	obj, n, err := acc.finish(ctx, granuleSize)
 	if err != nil {
 		return ColumnDesc{}, nil, 0, err
+	}
+
+	if sizing {
+		desc.HasSizing, desc.Sizing = true, acc.sizing()
 	}
 
 	return desc, obj, n, nil
@@ -851,10 +855,12 @@ type blockAccum struct {
 	frameGranules []int
 	frameBytes    []int
 	frameCRC      []uint32 // per sealed frame: CRC32C over its compressed bytes
+	frameRaw      []int    // per sealed frame: its decompressed length
 	gLens         []int    // per-granule stream length within its frame
 	pending       []byte
 	inFrame       int
 	bytes         int // compressed bytes sealed so far, the size the codec choice compares on
+	dirLen        int // the directory's encoded length, once finished
 
 	sink    backend.ObjectWriter
 	written int64 // bytes handed to the sink
@@ -878,8 +884,8 @@ func (a *blockAccum) residentBytes() int64 {
 		return 0
 	}
 
-	// Two ints per frame and one per granule, all in slices that grow amortized.
-	dir := int64(cap(a.frameGranules)+cap(a.frameBytes)+cap(a.gLens))*8 + int64(cap(a.frameCRC))*4
+	// Three ints per frame and one per granule, all in slices that grow amortized.
+	dir := int64(cap(a.frameGranules)+cap(a.frameBytes)+cap(a.frameRaw)+cap(a.gLens))*8 + int64(cap(a.frameCRC))*4
 
 	resident := int64(cap(a.pending)) + dir + int64(cap(a.frames))*8
 	if a.sink == nil {
@@ -958,6 +964,7 @@ func (a *blockAccum) seal() error {
 	a.frameGranules = append(a.frameGranules, a.inFrame)
 	a.frameBytes = append(a.frameBytes, len(f))
 	a.frameCRC = append(a.frameCRC, crc32.Checksum(f, castagnoli))
+	a.frameRaw = append(a.frameRaw, len(a.pending))
 	a.bytes += len(f)
 	a.pending, a.inFrame = a.pending[:0], 0
 
@@ -989,28 +996,74 @@ func (a *blockAccum) finish(ctx context.Context, blockRows int) ([]byte, int64, 
 		return nil, 0, err
 	}
 
-	dir := a.encodeDir(blockRows)
-
 	if a.sink != nil {
+		dir := a.encodeDir(blockRows)
+		a.dirLen = len(dir)
+
 		n, err := a.finishStreamed(ctx, dir)
 
 		return nil, n, err
 	}
 
-	// Allocated to the exact final size and drained frame by frame. On a merged part's column this
-	// buffer is hundreds of MiB: appending into a growing one would transiently hold two copies of
-	// it, and keeping the frames alive past their copy a third.
-	dst := make([]byte, 0, len(dir)+a.bytes)
-	dst = append(dst, dir...)
+	obj := a.finishBuffered(blockRows, nil)
+
+	return obj, int64(len(obj)), nil
+}
+
+// finishBuffered serializes a sealed, unsunk accumulator's object: the directory leading the frames,
+// or — given a dictionary region — the trailer layout [frames][region][directory][u32le dirLen].
+//
+// Allocated to the exact final size and drained frame by frame. On a merged part's column this
+// buffer is hundreds of MiB: appending into a growing one would transiently hold two copies of it,
+// and keeping the frames alive past their copy a third.
+func (a *blockAccum) finishBuffered(blockRows int, region []byte) []byte {
+	dir := a.encodeDir(blockRows)
+	a.dirLen = len(dir)
+
+	size := len(dir) + a.bytes
+	if region != nil {
+		size += len(region) + footerLenBytes
+	}
+
+	dst := make([]byte, 0, size)
+	if region == nil {
+		dst = append(dst, dir...)
+	}
 
 	for i, f := range a.frames {
 		dst = append(dst, f...)
 		a.frames[i] = nil
 	}
 
+	if region != nil {
+		dst = append(dst, region...)
+		dst = append(dst, dir...)
+		dst = binary.LittleEndian.AppendUint32(dst, uint32(len(dir)))
+	}
+
 	a.pending = nil
 
-	return dst, int64(len(dst)), nil
+	return dst
+}
+
+// sizing is the finished column's [ColumnSizing].
+func (a *blockAccum) sizing() ColumnSizing {
+	s := ColumnSizing{DirLen: int64(a.dirLen), NumGranules: int64(len(a.gLens)), NumFrames: int64(len(a.frameGranules))}
+
+	for _, n := range a.frameBytes {
+		s.MaxFrameBytes = max(s.MaxFrameBytes, int64(n))
+	}
+
+	for _, n := range a.frameRaw {
+		s.MaxFrameRaw = max(s.MaxFrameRaw, int64(n))
+	}
+
+	for _, n := range a.gLens {
+		s.MaxGranuleRaw = max(s.MaxGranuleRaw, int64(n))
+		s.StreamRaw += int64(n)
+	}
+
+	return s
 }
 
 // finishStreamed writes the directory after the frames, closes it with its own little-endian length

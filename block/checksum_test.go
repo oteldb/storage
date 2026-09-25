@@ -196,10 +196,13 @@ func TestSharedDictCorruptionIsDetected(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, desc.SharedDict)
 
-	// The dictionary blob sits after the two header uvarints.
-	_, n1 := binary.Uvarint(obj)
-	packedLen, n2 := binary.Uvarint(obj[n1:])
-	dictAt := n1 + n2
+	require.True(t, desc.TrailerDict)
+
+	// The dictionary blob sits after the region's two header uvarints.
+	region := obj[desc.DictOff:]
+	_, n1 := binary.Uvarint(region)
+	packedLen, n2 := binary.Uvarint(region[n1:])
+	dictAt := int(desc.DictOff) + n1 + n2
 
 	bad := append([]byte(nil), obj...)
 	bad[dictAt+int(packedLen)/2] ^= 0x01
