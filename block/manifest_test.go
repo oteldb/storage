@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"hash/crc32"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -312,11 +313,92 @@ func FuzzManifestDecode(f *testing.F) {
 		if err != nil {
 			return
 		}
-		// Accepted ⇒ re-encode must round-trip.
-		got, err := DecodeManifest(m.Encode(nil))
+		// Accepted ⇒ re-encode must round-trip. Compared as bytes: a NaN min/max round-trips
+		// bit-exactly yet never equals itself.
+		enc := m.Encode(nil)
+		got, err := DecodeManifest(enc)
 		require.NoError(t, err)
-		assert.Equal(t, m, got)
+		assert.Equal(t, enc, got.Encode(nil))
 	})
+}
+
+// outOfRangeManifestBodies are CRC-less manifest bodies, each carrying one field past what a
+// writer can produce, so its conversion to int or int64 would wrap or panic.
+func outOfRangeManifestBodies() []struct {
+	name string
+	body []byte
+} {
+	encoded := func(mutate func(*Manifest)) []byte {
+		m := sampleManifest()
+		mutate(&m)
+		enc := m.Encode(nil)
+
+		return enc[:len(enc)-4]
+	}
+	raw := func(version uint64, column func(w *bitstream.Writer)) []byte {
+		w := bitstream.NewWriter(nil)
+		putU32(w, manifestMagic)
+		w.WriteUvarint(version)
+		w.WriteUvarint(1)    // rowCount
+		w.WriteVarint(0)     // minTime
+		w.WriteVarint(0)     // maxTime
+		w.WriteUvarint(8192) // granuleSize
+
+		if column == nil {
+			w.WriteUvarint(0)
+		} else {
+			w.WriteUvarint(1)
+			column(w)
+		}
+
+		w.WriteUvarint(0) // diskBytes
+		w.WriteUvarint(0) // rawBytes
+		w.PadToByte()
+
+		return w.Bytes()
+	}
+
+	return []struct {
+		name string
+		body []byte
+	}{
+		{"version 2^32+2", raw(1<<32+uint64(manifestVersion), nil)},
+		{"nameLen 2^63", raw(uint64(manifestVersion), func(w *bitstream.Writer) {
+			w.WriteUvarint(1 << 63)
+			w.AppendString("x")
+		})},
+		{"constBytes len 2^63", raw(uint64(manifestVersion), func(w *bitstream.Writer) {
+			w.WriteUvarint(1)
+			w.AppendString("x")
+			_ = w.WriteByte(byte(KindBytes))
+			_ = w.WriteByte(byte(chunk.CodecDict))
+			_ = w.WriteByte(byte(compress.AlgorithmNone))
+			_ = w.WriteByte(flagConst)
+			w.WriteUvarint(1 << 63)
+			w.AppendString("x")
+		})},
+		{"granuleSize MaxUint64", encoded(func(m *Manifest) { m.GranuleSize = -1 })},
+		{"granuleSize maxPartRows+1", encoded(func(m *Manifest) { m.GranuleSize = int(maxPartRows) + 1 })},
+		{"objectBytes 2^63", encoded(func(m *Manifest) { m.Columns[0].Bytes = math.MinInt64 })},
+		{"diskBytes 2^63", encoded(func(m *Manifest) { m.DiskBytes = math.MinInt64 })},
+		{"rawBytes 2^63", encoded(func(m *Manifest) { m.RawBytes = math.MinInt64 })},
+		{"rawBytes MaxUint64", encoded(func(m *Manifest) { m.RawBytes = -1 })},
+	}
+}
+
+func TestDecodeManifestRejectsOutOfRangeFields(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range outOfRangeManifestBodies() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := binary.BigEndian.AppendUint32(append([]byte(nil), tc.body...), crc32.Checksum(tc.body, castagnoli))
+
+			_, err := DecodeManifest(src)
+			require.ErrorIs(t, err, ErrCorrupt)
+		})
+	}
 }
 
 // FuzzManifestDecodeBody fuzzes the body with a repaired CRC, so mutations reach the field parsing
@@ -326,6 +408,10 @@ func FuzzManifestDecodeBody(f *testing.F) {
 	f.Add(enc[:len(enc)-4])
 	f.Add([]byte{})
 
+	for _, tc := range outOfRangeManifestBodies() {
+		f.Add(tc.body)
+	}
+
 	f.Fuzz(func(t *testing.T, body []byte) {
 		src := binary.BigEndian.AppendUint32(append([]byte(nil), body...), crc32.Checksum(body, castagnoli))
 
@@ -334,8 +420,9 @@ func FuzzManifestDecodeBody(f *testing.F) {
 			return
 		}
 
-		got, err := DecodeManifest(m.Encode(nil))
+		enc := m.Encode(nil)
+		got, err := DecodeManifest(enc)
 		require.NoError(t, err)
-		assert.Equal(t, m, got)
+		assert.Equal(t, enc, got.Encode(nil))
 	})
 }

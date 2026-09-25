@@ -342,7 +342,9 @@ answer a window belongs to the cluster layer.
   flag-gating is what keeps lossless and pre-existing parts byte-identical (no version bump, no
   golden churn); `flagBlocked`/`flagFramed`/`flagFooter`/`flagBytes`/`flagSharedDict` are additive the same way.
   `flagBytes` carries the column object's own byte size, so a ranged open needs no size round trip.
-  Decode bounds-checks every field (fuzzed).
+  Decode bounds every uvarint as `uint64` before converting it — lengths by the unread remainder,
+  row count and granule size by `maxPartRows`, byte sizes by `MaxInt64` — so a CRC-valid manifest
+  with an out-of-range field is `ErrCorrupt`, never a wrapped value or a panic (fuzzed).
 - **Marks** — sparse granule index over the sort-key column (per-granule first row + min/max,
   delta-encoded, CRC-checked). `Overlapping(lo,hi)` prunes granules for a time window.
 

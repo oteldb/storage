@@ -145,6 +145,10 @@ func DecodeMarks(src []byte) (Marks, error) {
 		return Marks{}, errors.Wrapf(ErrCorrupt, "marks count %d exceeds body", count)
 	}
 
+	if granuleSize > maxPartRows {
+		return Marks{}, errors.Wrapf(ErrCorrupt, "marks granuleSize %d exceeds %d", granuleSize, maxPartRows)
+	}
+
 	m := Marks{GranuleSize: int(granuleSize), Granules: make([]Granule, 0, count)}
 
 	var prevMin int64
@@ -153,6 +157,10 @@ func DecodeMarks(src []byte) (Marks, error) {
 		firstRow, err := r.ReadUvarint()
 		if err != nil {
 			return Marks{}, errors.Wrapf(ErrCorrupt, "granule %d firstRow", i)
+		}
+
+		if firstRow > maxPartRows {
+			return Marks{}, errors.Wrapf(ErrCorrupt, "granule %d firstRow %d exceeds %d", i, firstRow, maxPartRows)
 		}
 
 		minDelta, err := r.ReadVarint()
