@@ -84,6 +84,33 @@ func TestTime(t *testing.T) {
 	assert.False(t, got.After(after))
 }
 
+func TestSettled(t *testing.T) {
+	t.Parallel()
+
+	id := partid.New()
+	minted := id.Time()
+
+	for _, tc := range []struct {
+		name  string
+		now   time.Time
+		grace time.Duration
+		want  bool
+	}{
+		{"young", minted.Add(time.Minute), time.Hour, false},
+		{"at grace", minted.Add(time.Hour), time.Hour, false},
+		{"past grace", minted.Add(time.Hour + time.Millisecond), time.Hour, true},
+		{"future-dated", minted.Add(-time.Hour), time.Minute, false},
+		{"zero grace is default, young", minted.Add(partid.DefaultOrphanGrace), 0, false},
+		{"zero grace is default, old", minted.Add(partid.DefaultOrphanGrace + time.Second), 0, true},
+		{"negative grace is default", minted.Add(time.Minute), -time.Hour, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, id.Settled(tc.now, tc.grace))
+		})
+	}
+}
+
 func TestStringLen(t *testing.T) {
 	t.Parallel()
 

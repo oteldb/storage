@@ -140,6 +140,7 @@ type Parts struct {
 	capBytes   metric.Int64Gauge
 	bytes      metric.Int64Gauge
 	orphans    metric.Int64Counter
+	deferred   metric.Int64Counter
 }
 
 // Record publishes one signal's part shape, summed over the tenants this node holds. The values are
@@ -160,6 +161,14 @@ func (p *Parts) Record(ctx context.Context, sig string, total, sealed, backlog, 
 func (p *Parts) OrphansSwept(ctx context.Context, sig string, n int64) {
 	if n > 0 {
 		p.orphans.Add(ctx, n, sigAttr(sig))
+	}
+}
+
+// OrphansDeferred accounts n unnamed part objects the sweep left in place because their part is
+// younger than the orphan grace, so it may be a writer's uncommitted part. A zero n is ignored.
+func (p *Parts) OrphansDeferred(ctx context.Context, sig string, n int64) {
+	if n > 0 {
+		p.deferred.Add(ctx, n, sigAttr(sig))
 	}
 }
 
@@ -444,6 +453,8 @@ func newParts(m metric.Meter) (*Parts, error) {
 		bytes:      b.gauge("storage.parts.bytes", "bytes the flushed parts occupy on disk", "By"),
 		orphans: b.counter("storage.parts.orphans_swept",
 			"part objects no index entry names, deleted by the sweep at open", "{object}"),
+		deferred: b.counter("storage.parts.orphans_deferred",
+			"unnamed part objects the sweep kept because their part is younger than the grace", "{object}"),
 	}
 
 	return p, b.err

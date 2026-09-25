@@ -3,6 +3,7 @@ package recordengine
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/go-faster/errors"
 	"github.com/go-faster/sdk/zctx"
@@ -70,8 +71,10 @@ func (e *Engine) retireLocked(parts []*part) {
 
 // sweepOrphansLocked deletes every object under the engine's prefix that belongs to a part the loaded
 // bucket index does not name: the residue of a flush or merge that wrote a part's objects and then
-// failed before committing it, or of a reclaim whose delete failed. Deletes are best-effort (a failure
-// leaves the object for a later open); a failed List is fatal. Caller holds e.mu.
+// failed before committing it, or of a reclaim whose delete failed. A part whose id is not yet
+// [partid.ID.Settled] is left for a later sweep, since a writer sharing the prefix may still commit
+// it. Deletes are best-effort (a failure leaves the object for a later open); a failed List is fatal.
+// Caller holds e.mu.
 func (e *Engine) sweepOrphansLocked(ctx context.Context) error {
 	root := e.cfg.Prefix + "/"
 
@@ -100,7 +103,11 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context) error {
 		live[e.adoptedWants[i].Prefix] = struct{}{}
 	}
 
-	var orphans []string
+	var (
+		orphans  []string
+		deferred int64
+		now      = e.now()
+	)
 
 	for _, k := range keys {
 		dir, _, ok := strings.Cut(strings.TrimPrefix(k, root), "/")
@@ -108,7 +115,8 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context) error {
 			continue // an engine-level object (bucket index, stream index), not part of a part
 		}
 
-		if !partid.Valid(dir) {
+		id, err := partid.Parse(dir)
+		if err != nil {
 			continue
 		}
 
@@ -116,8 +124,16 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context) error {
 			continue
 		}
 
+		if !id.Settled(now, e.cfg.OrphanGrace) {
+			deferred++
+
+			continue
+		}
+
 		orphans = append(orphans, k)
 	}
+
+	e.cfg.Obs.Parts.OrphansDeferred(ctx, e.cfg.Signal, deferred)
 
 	if len(orphans) == 0 {
 		return nil
@@ -133,10 +149,18 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context) error {
 
 	zctx.From(ctx).Debug("swept orphan part objects",
 		zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
-		zap.Int("objects", len(orphans)), zap.Int("failed", failed))
+		zap.Int("objects", len(orphans)), zap.Int("failed", failed), zap.Int64("deferred", deferred))
 	e.cfg.Obs.Parts.OrphansSwept(ctx, e.cfg.Signal, int64(len(orphans)-failed))
 
 	return nil
+}
+
+func (e *Engine) now() time.Time {
+	if e.cfg.Now != nil {
+		return e.cfg.Now()
+	}
+
+	return time.Now()
 }
 
 // reclaimRetired deletes the backend objects of retired parts whose readers have all drained, doing the

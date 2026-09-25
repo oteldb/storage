@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -78,7 +79,7 @@ func TestReadOnlyOpenLeavesBackendUntouched(t *testing.T) {
 	be, err := file.New(dir)
 	require.NoError(t, err)
 
-	ro, err := Open(ctx, Options{}, WithBackend(be), WithReadOnly())
+	ro, err := Open(ctx, Options{}, WithBackend(be), WithReadOnly(), WithOrphanGrace(time.Nanosecond))
 	require.NoError(t, err)
 
 	// The flushed data still reads back: a read-only open declines to sweep, it does not decline
@@ -92,11 +93,12 @@ func TestReadOnlyOpenLeavesBackendUntouched(t *testing.T) {
 	require.NoError(t, ro.Close(ctx))
 	assert.Equal(t, before, backendDigest(t, dir), "read-only open must not mutate the backend")
 
-	// The contrast that gives the assertion above its meaning: the default open does sweep.
+	// The contrast that gives the assertion above its meaning: the default open does sweep, once the
+	// orphan is past the grace.
 	be2, err := file.New(dir)
 	require.NoError(t, err)
 
-	rw, err := Open(ctx, Options{}, WithBackend(be2), WithFlushInterval(-1))
+	rw, err := Open(ctx, Options{}, WithBackend(be2), WithFlushInterval(-1), WithOrphanGrace(time.Nanosecond))
 	require.NoError(t, err)
 	require.NoError(t, rw.Close(ctx))
 

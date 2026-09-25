@@ -33,6 +33,9 @@ type Config struct {
 	Obs     *obs.Obs
 	// WriterID names the writer whose flush watermark the engine keeps in the bucket index.
 	WriterID string
+	// OrphanGrace and Now are the engine's orphan-sweep age guard and its clock.
+	OrphanGrace time.Duration
+	Now         func() time.Time
 }
 
 // Part is one live part as [Engine.Parts] reports it.
@@ -160,6 +163,9 @@ var suite = []struct {
 	{"LoadPartsSweepsOrphanParts", loadPartsSweepsOrphanParts},
 	{"LoadPartsKeepsLiveParts", loadPartsKeepsLiveParts},
 	{"RefreshReplicaKeepsUncommittedParts", refreshReplicaKeepsUncommittedParts},
+	{"SweepSparesInFlightPart", sweepSparesInFlightPart},
+	{"SweepDefersYoungOrphanUntilItAges", sweepDefersYoungOrphanUntilItAges},
+	{"SweepSparesFutureDatedPart", sweepSparesFutureDatedPart},
 	{"MergeIndexCommitFailureKeepsSources", mergeIndexCommitFailureKeepsSources},
 	{"PartsSyncedBeforeIndexCommit", partsSyncedBeforeIndexCommit},
 	{"FlushFailureKeepsRows", flushFailureKeepsRows},

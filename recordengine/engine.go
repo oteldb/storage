@@ -38,6 +38,15 @@ type Config struct {
 	Backend backend.Backend
 	// Prefix is the backend key prefix under which this engine's parts are written.
 	Prefix string
+	// OrphanGrace is how long after its id was minted a part no index entry names is spared by the
+	// orphan sweep a load runs. A part's objects are written before the index commit that names them,
+	// so over a shared store an unnamed part younger than this may be another writer's flush or merge
+	// still in flight. It must outlast the longest write-to-commit window, a merge sized by
+	// [Config.MaxPartBytes] and [Config.MergeMemoryBytes] written at the backend's sustained
+	// throughput, plus the clock skew between the writers of the prefix. 0 ⇒ one hour.
+	OrphanGrace time.Duration
+	// Now is the clock [Config.OrphanGrace] is measured against. nil ⇒ [time.Now].
+	Now func() time.Time
 	// Term reports this writer's current ownership term for Prefix — which tenure of the shard
 	// this engine is writing as. It is stamped into every bucket index written, so a reader can
 	// order two indexes of the same prefix even when neither the part names nor FlushedEpoch

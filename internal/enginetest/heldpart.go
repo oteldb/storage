@@ -122,7 +122,7 @@ func loadPartsReadOnlySweepsNothing(t *testing.T, k Kind) {
 
 	before := k.loadIndex(t, be)
 
-	e := k.open(t, be)
+	e := k.Open(t, Config{Backend: be, Now: aged})
 	require.NoError(t, e.LoadPartsReadOnly(ctx))
 
 	assert.Equal(t, 1, e.Stats().WantedParts)
@@ -132,7 +132,7 @@ func loadPartsReadOnlySweepsNothing(t *testing.T, k Kind) {
 	require.NoError(t, err, "a read-only load sweeps no orphan")
 	assert.Equal(t, before.Generation, k.loadIndex(t, be).Generation, "nothing was committed")
 
-	require.NoError(t, k.open(t, be).LoadParts(ctx))
+	require.NoError(t, k.Open(t, Config{Backend: be, Now: aged}).LoadParts(ctx))
 
 	_, err = be.Read(ctx, orphan)
 	assert.ErrorIs(t, err, backend.ErrNotExist, "the owning load reclaims it")

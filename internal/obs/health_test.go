@@ -85,6 +85,17 @@ func TestPartsOrphansSwept(t *testing.T) {
 	assert.Equal(t, int64(4), counterSum(t, collect(), "storage.parts.orphans_swept", map[string]string{"signal": "trace"}))
 }
 
+func TestPartsOrphansDeferred(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	o, collect := newMetered(t)
+
+	o.Parts.OrphansDeferred(ctx, "log", 3)
+	o.Parts.OrphansDeferred(ctx, "log", 0)
+
+	assert.Equal(t, int64(3), counterSum(t, collect(), "storage.parts.orphans_deferred", map[string]string{"signal": "log"}))
+}
+
 func TestHealthNop(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -95,4 +106,5 @@ func TestHealthNop(t *testing.T) {
 	o.Cluster.PrimaryRefused(ctx, "metric")
 	o.WAL.SyncFailed(ctx, 1, true)
 	o.Parts.OrphansSwept(ctx, "metric", 1)
+	o.Parts.OrphansDeferred(ctx, "metric", 1)
 }

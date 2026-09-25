@@ -294,7 +294,7 @@ written deferred and synced once with `backend.SyncPrefix` after its last sideca
 side data lands after `openPart`, so the sync follows it). A committed part
 whose identities were missing would be **unrecoverable**: it holds rows no matcher can name, while the
 advanced watermark makes replay skip the WAL records that would have re-registered them. The reverse
-leftover is harmless — an uncommitted part is an orphan the next open sweeps, its identities never
+leftover is harmless — an uncommitted part is an orphan a later open sweeps, its identities never
 loaded.
 
 **Merge** is identical to the metric engine: sources are retired only after the bucket index naming
@@ -322,7 +322,9 @@ hole" and "A store without a cluster layer is its own complete owner set".
 
 Part prefixes are `<prefix>/{partid}`, a minted globally unique id, and `LoadParts` sweeps orphans at
 open — exactly as in the metric engine ([`../engine/ARCH.md`](../engine/ARCH.md), "Lifecycle and part
-identity"), including the replica exception: `RefreshReplica` sweeps nothing, because the owner's
+identity"), including the `Config.OrphanGrace` age guard that spares another writer's in-flight part
+(a record merge is bounded by `MaxPartBytes` and `MergeMemoryBytes` rather than a ceiling, well
+inside the one-hour default), and the replica exception: `RefreshReplica` sweeps nothing, because the owner's
 in-flight part is not in the index yet, and a part the store lacks becomes a *pending* want rather than
 an error — counted and disclaimed over (`Stats.WantedParts`, `Engine.WantOverlaps`) until a refresh
 finds it or this node commits as an owner. `LoadPartsReadOnly` reaches that same sweep-nothing load

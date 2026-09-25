@@ -198,7 +198,8 @@ to fail over to: a read overlapping a want fails.
   commit point in both engines: everything a committed part needs to stay readable must be durable
   first — its column objects and, in `engine`, the part's own identity object naming its series.
   Publish order is chosen to leave recoverable slack on a crash — unreferenced objects, an orphan
-  part swept at the next open — never rows that are committed but unresolvable. The commit is a
+  part swept by a later open once it is older than `OrphanGrace` (younger, it may be another
+  writer's uncommitted part) — never rows that are committed but unresolvable. The commit is a
   `backend.CompareAndSwap` against the version the writer read, so two writers over one prefix (a
   shared store) cannot overwrite each other's entries; the loser reloads and retries.
 - **Mutating the backend at open is opt-out, and opting out is total.** Recovery's orphan sweep is
