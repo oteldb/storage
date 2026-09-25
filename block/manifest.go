@@ -338,11 +338,12 @@ func DecodeManifest(src []byte) (Manifest, error) {
 		return Manifest{}, errors.Wrap(ErrCorrupt, "version")
 	}
 
-	m.Version = uint32(version)
-	if m.Version < manifestVersionMin || m.Version > manifestVersion {
+	if version < uint64(manifestVersionMin) || version > uint64(manifestVersion) {
 		return Manifest{}, errors.Wrapf(ErrCorrupt,
-			"unsupported version %d, want %d..%d", m.Version, manifestVersionMin, manifestVersion)
+			"unsupported version %d, want %d..%d", version, manifestVersionMin, manifestVersion)
 	}
+
+	m.Version = uint32(version)
 
 	rowCount, err := r.ReadUvarint()
 	if err != nil {
@@ -371,6 +372,12 @@ func DecodeManifest(src []byte) (Manifest, error) {
 		return Manifest{}, errors.Wrap(ErrCorrupt, "granuleSize")
 	}
 
+	// A granule never holds more rows than a part can, and the bound keeps the readers'
+	// RowCount+GranuleSize-1 granule-count arithmetic from overflowing.
+	if granuleSize > maxPartRows {
+		return Manifest{}, errors.Wrapf(ErrCorrupt, "granuleSize %d exceeds %d", granuleSize, maxPartRows)
+	}
+
 	m.GranuleSize = int(granuleSize)
 
 	colCount, err := r.ReadUvarint()
@@ -395,27 +402,54 @@ func DecodeManifest(src []byte) (Manifest, error) {
 
 	// Optional, in order: absent in a manifest written before they existed, which reads as 0.
 	if diskBytes, err := r.ReadUvarint(); err == nil {
-		m.DiskBytes = int64(diskBytes)
+		if m.DiskBytes, err = toInt64(diskBytes, "diskBytes"); err != nil {
+			return Manifest{}, err
+		}
 
 		if raw, err := r.ReadUvarint(); err == nil {
-			m.RawBytes = int64(raw)
+			if m.RawBytes, err = toInt64(raw, "rawBytes"); err != nil {
+				return Manifest{}, err
+			}
 		}
 	}
 
 	return m, nil
 }
 
+func toInt64(v uint64, field string) (int64, error) {
+	if v > math.MaxInt64 {
+		return 0, errors.Wrapf(ErrCorrupt, "%s %d exceeds MaxInt64", field, v)
+	}
+
+	return int64(v), nil
+}
+
+// readBytesView reads a uvarint length and that many bytes, rejecting a length past the unread
+// remainder before int conversion: a value ≥ 2⁶³ would go negative and panic [bitstream.Reader].
+func readBytesView(r *bitstream.Reader, field string) ([]byte, error) {
+	n, err := r.ReadUvarint()
+	if err != nil {
+		return nil, errors.Wrapf(ErrCorrupt, "%s length", field)
+	}
+
+	if n > uint64(r.Remaining()) {
+		return nil, errors.Wrapf(ErrCorrupt, "%s length %d exceeds remaining %d", field, n, r.Remaining())
+	}
+
+	view, err := r.ReadBytesView(int(n))
+	if err != nil {
+		return nil, errors.Wrap(ErrCorrupt, field)
+	}
+
+	return view, nil
+}
+
 func decodeColumnDesc(r *bitstream.Reader, version uint32) (ColumnDesc, error) {
 	c := ColumnDesc{Checked: version >= manifestVersionChecked}
 
-	nameLen, err := r.ReadUvarint()
+	name, err := readBytesView(r, "name")
 	if err != nil {
-		return c, errors.Wrap(ErrCorrupt, "nameLen")
-	}
-
-	name, err := r.ReadBytesView(int(nameLen))
-	if err != nil {
-		return c, errors.Wrap(ErrCorrupt, "name")
+		return c, err
 	}
 
 	c.Name = string(name)
@@ -479,7 +513,9 @@ func decodeColumnDesc(r *bitstream.Reader, version uint32) (ColumnDesc, error) {
 			return c, errors.Wrap(ErrCorrupt, "objectBytes")
 		}
 
-		c.Bytes = int64(n)
+		if c.Bytes, err = toInt64(n, "objectBytes"); err != nil {
+			return c, err
+		}
 	}
 
 	switch c.Kind {
@@ -550,14 +586,9 @@ func decodeBytesCol(r *bitstream.Reader, c *ColumnDesc) error {
 		return nil
 	}
 
-	n, err := r.ReadUvarint()
+	view, err := readBytesView(r, "constBytes")
 	if err != nil {
-		return errors.Wrap(ErrCorrupt, "constBytesLen")
-	}
-
-	view, err := r.ReadBytesView(int(n))
-	if err != nil {
-		return errors.Wrap(ErrCorrupt, "constBytes")
+		return err
 	}
 
 	c.ConstBytes = append([]byte(nil), view...)
