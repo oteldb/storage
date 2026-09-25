@@ -56,6 +56,10 @@ assumed average row size, and the spread is what makes it unsafe: real structure
 **~950 B**, so an assumption low by 4× decodes 4× the intended bytes per merge. `recordRowBytes`
 (1024 B, calibrated to that measurement) is only the fallback for a part whose manifest omits the figure.
 
+Parts also record per-column sizing stats (`block.WithSizingStats`), so what reading a source column
+holds is known from its manifest (`block.PartReader.ColumnInputSize`), and write manifest version 3
+for it (`ADMIN.md`, the upgrade rule).
+
 ### Merge cap
 
 ```

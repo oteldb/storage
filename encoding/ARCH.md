@@ -60,6 +60,18 @@ Rules that matter beyond the code:
 when compression does not shrink. zstd and lz4 both compress (lz4 framed as `[uvarint origLen][lz4
 block]`, the block format carrying no length of its own); none = identity. Encoders/decoders pooled.
 
+`DecompressLimit` is the bounded decode every part read uses: it fails with `ErrLimit` rather than
+produce more than a limit, allocating at most the bound plus `DecodeWorkspace`. Raw and lz4 check
+their recorded length before allocating. zstd cannot be bounded by capping the decoder: its stream
+decoder's history is window-sized (512 MiB by default), and its whole-buffer decode checks a cap only
+after appending each block, through plain appends that grow the buffer first. So the frame is
+validated before decoding — exactly one frame, block headers walked to the last, no block over
+128 KiB, a content size within the limit — and decoded into a buffer of the content size plus one
+block of slack, which the decode can then never outgrow. A frame without a content size is accepted
+only as one block (klauspost omits it only below 256 bytes, and every writer here emits one frame
+per call); several blocks would each append unchecked. Both builds decode through klauspost, since
+the cgo decoder takes no cap.
+
 ## `pool` (sibling package)
 
 `ByteIntMap`: open-addressing `[]byte → int` map (xxh3 + `bytes.Equal`) for the dictionary hot

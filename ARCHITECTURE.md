@@ -244,7 +244,9 @@ to fail over to: a read overlapping a want fails.
   the union over live parts plus the unflushed head, and is metered as `IdentityBytes`.
 - **Injected, no-op-default observability** (above).
 - **Stable formats.** Golden-tested and version-guarded: the `Codec` enum and per-codec framing,
-  part manifest (`OTPM`) / marks (`OTMK`) / column object framing and key layout, the attribute
+  part manifest (`OTPM`, version 3: a per-column `xflags` byte for the trailer dictionary and the
+  merge-sizing stats; versions 1 and 2 still read) / marks (`OTMK`) / column object framing (the
+  trailer-dictionary bytes column; the leading layout still read) and key layout, the attribute
   hash+binary encoding (the SeriesID pre-image), symbol table (`OTSY`), the bucket index (format
   v6: entries with their block sets and split claims, tombstones, wants, per-writer flush
   watermarks and the block high-water mark — readable back to v1, not writable by older
