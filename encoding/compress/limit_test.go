@@ -3,6 +3,7 @@ package compress
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"runtime"
 	"testing"
 
@@ -67,6 +68,60 @@ func TestDecompressLimitReusesDst(t *testing.T) {
 }
 
 func unsafeFirst(b []byte) *byte { return &b[:1][0] }
+
+// TestDecompressLimitDiscardsBuf: a full buffer is scratch, not a prefix, so a small block decoded
+// into it allocates the block alone.
+//
+//nolint:paralleltest // reads process-wide heap counters
+func TestDecompressLimitDiscardsBuf(t *testing.T) {
+	full := make([]byte, 64<<20)
+
+	for _, alg := range []Algorithm{AlgorithmNone, AlgorithmZSTD, AlgorithmLZ4} {
+		c := NewCompressor(alg, LevelDefault)
+		data := makeRepetitive(4096, "abc")
+		src := c.Compress(nil, data)
+
+		var (
+			got []byte
+			err error
+		)
+
+		allocated := heaptest.Allocated(func() { got, err = c.DecompressLimit(full, src, len(data)) })
+		require.NoError(t, err)
+		assert.Equal(t, data, got, alg.String())
+		assert.LessOrEqual(t, allocated, uint64(len(data)+DecodeWorkspace), alg.String())
+	}
+}
+
+// TestDecompressLimitHugeLengths: lengths near MaxInt under a MaxInt limit are rejected, not
+// allocated.
+func TestDecompressLimitHugeLengths(t *testing.T) {
+	t.Parallel()
+
+	fcs := binary.LittleEndian.AppendUint64([]byte{FlagCompressed, 0x28, 0xb5, 0x2f, 0xfd, 3<<6 | 1<<5}, math.MaxInt64)
+
+	for _, tc := range []struct {
+		name string
+		alg  Algorithm
+		src  []byte
+	}{
+		{"lz4 MaxInt64", AlgorithmLZ4, append(binary.AppendUvarint([]byte{FlagCompressed}, math.MaxInt64), lz4Literal("abc")...)},
+		{"lz4 MaxInt64-1", AlgorithmLZ4, append(binary.AppendUvarint([]byte{FlagCompressed}, math.MaxInt64-1), lz4Literal("abc")...)},
+		{"zstd FCS MaxInt64", AlgorithmZSTD, append(fcs, append(blockHeader(true, 0, 1), 'a')...)},
+		{"zstd FCS MaxInt64 RLE", AlgorithmZSTD, append(fcs, append(blockHeader(true, 1, zstdMaxBlock), 'a')...)},
+	} {
+		_, err := NewCompressor(tc.alg, LevelDefault).DecompressLimit(nil, tc.src, math.MaxInt)
+		require.ErrorIs(t, err, ErrMalformed, tc.name)
+	}
+
+	data := makeRepetitive(1<<20, "raw")
+	for _, alg := range []Algorithm{AlgorithmNone, AlgorithmZSTD, AlgorithmLZ4} {
+		c := NewCompressor(alg, LevelDefault)
+		got, err := c.DecompressLimit(nil, c.Compress(nil, data), math.MaxInt)
+		require.NoError(t, err, alg.String())
+		assert.Equal(t, data, got, alg.String())
+	}
+}
 
 func TestOutputSlack(t *testing.T) {
 	t.Parallel()

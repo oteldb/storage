@@ -60,12 +60,14 @@ var limitDecoders = sync.Pool{New: func() any {
 }}
 
 // DecompressLimit is [Compressor.Decompress] that fails with [ErrLimit] rather than produce more
-// than limit bytes, and with [ErrMalformed] on input it cannot bound. It appends to dst, reusing its
-// spare capacity when that covers the bound and otherwise allocating the bound exactly; dst is never
-// grown by append. Allocation is at most the bound plus [DecodeWorkspace].
-func (c *Compressor) DecompressLimit(dst, src []byte, limit int) ([]byte, error) {
+// than limit bytes, and with [ErrMalformed] on input it cannot bound. Unlike Decompress it does not
+// append: it decodes into buf's capacity, discarding buf's contents, when that covers the bound and
+// otherwise into a buffer of exactly the bound. It allocates at most the bound plus
+// [DecodeWorkspace].
+func (c *Compressor) DecompressLimit(buf, src []byte, limit int) ([]byte, error) {
+	buf = buf[:0]
 	if len(src) == 0 {
-		return dst, nil
+		return buf, nil
 	}
 
 	limit = max(limit, 0)
@@ -74,71 +76,74 @@ func (c *Compressor) DecompressLimit(dst, src []byte, limit int) ([]byte, error)
 	switch src[0] {
 	case FlagRaw:
 		if len(body) > limit {
-			return dst, errors.Wrapf(ErrLimit, "raw block of %d bytes, limit %d", len(body), limit)
+			return buf, errors.Wrapf(ErrLimit, "raw block of %d bytes, limit %d", len(body), limit)
 		}
 
-		return append(reserve(dst, len(body)), body...), nil
+		return append(reserve(buf, len(body)), body...), nil
 	case FlagCompressed:
 		switch c.alg {
 		case AlgorithmZSTD:
-			return decompressZstdLimit(dst, body, limit)
+			return decompressZstdLimit(buf, body, limit)
 		case AlgorithmLZ4:
-			return decompressLZ4Limit(dst, body, limit)
+			return decompressLZ4Limit(buf, body, limit)
 		default:
-			return dst, errors.Wrapf(ErrMalformed, "compressed block under %s", c.alg)
+			return buf, errors.Wrapf(ErrMalformed, "compressed block under %s", c.alg)
 		}
 	default:
-		return dst, errors.Wrapf(ErrMalformed, "unknown block flag %d", src[0])
+		return buf, errors.Wrapf(ErrMalformed, "unknown block flag %d", src[0])
 	}
 }
 
-// reserve returns dst with room for n more bytes without reallocating on append.
-func reserve(dst []byte, n int) []byte {
-	if cap(dst)-len(dst) >= n {
-		return dst
+// reserve returns an empty buf with capacity for n bytes.
+func reserve(buf []byte, n int) []byte {
+	if cap(buf) >= n {
+		return buf[:0]
 	}
 
-	out := make([]byte, len(dst), len(dst)+n)
-	copy(out, dst)
-
-	return out
+	return make([]byte, 0, n)
 }
 
-func decompressLZ4Limit(dst, body []byte, limit int) ([]byte, error) {
+// lz4MaxRatio bounds an lz4 block's expansion, just above the 255 bytes a match regenerates per
+// input byte (16 MiB of zeros compresses 254.9 to 1).
+const lz4MaxRatio = 256
+
+func decompressLZ4Limit(buf, body []byte, limit int) ([]byte, error) {
 	// A writer stores empty input raw, and the block decoder faults on an empty destination.
 	origLen, k := binary.Uvarint(body)
 	if k <= 0 || origLen == 0 {
-		return dst, errors.Wrap(ErrMalformed, "lz4 length")
+		return buf, errors.Wrap(ErrMalformed, "lz4 length")
 	}
 
 	if origLen > uint64(limit) {
-		return dst, errors.Wrapf(ErrLimit, "lz4 block of %d bytes, limit %d", origLen, limit)
+		return buf, errors.Wrapf(ErrLimit, "lz4 block of %d bytes, limit %d", origLen, limit)
+	}
+
+	if block := uint64(len(body) - k); origLen > block*lz4MaxRatio {
+		return buf, errors.Wrapf(ErrMalformed, "lz4 block of %d bytes claims %d", block, origLen)
 	}
 
 	n := int(origLen)
-	out := reserve(dst, n)
-	base := len(out)
+	out := reserve(buf, n)[:n]
 
-	got, err := lz4.UncompressBlock(body[k:], out[base:base+n])
+	got, err := lz4.UncompressBlock(body[k:], out)
 	if err != nil {
-		return dst, errors.Wrapf(ErrMalformed, "lz4: %v", err)
+		return buf, errors.Wrapf(ErrMalformed, "lz4: %v", err)
 	}
 
 	if got != n {
-		return dst, errors.Wrapf(ErrMalformed, "lz4 block decoded %d bytes, header says %d", got, n)
+		return buf, errors.Wrapf(ErrMalformed, "lz4 block decoded %d bytes, header says %d", got, n)
 	}
 
-	return out[:base+n], nil
+	return out, nil
 }
 
-func decompressZstdLimit(dst, body []byte, limit int) ([]byte, error) {
+func decompressZstdLimit(buf, body []byte, limit int) ([]byte, error) {
 	bound, err := zstdContentBound(body, limit)
 	if err != nil {
-		return dst, err
+		return buf, err
 	}
 
-	out := reserve(dst, bound+zstdSlack)
-	base := len(out)
+	out := reserve(buf, bound+zstdSlack)
 
 	dec, _ := limitDecoders.Get().(*zstd.Decoder)
 	res, err := dec.DecodeAll(body, out)
@@ -146,11 +151,11 @@ func decompressZstdLimit(dst, body []byte, limit int) ([]byte, error) {
 
 	switch {
 	case errors.Is(err, zstd.ErrDecoderSizeExceeded), errors.Is(err, zstd.ErrFrameSizeExceeded):
-		return dst, errors.Wrapf(ErrLimit, "zstd: %v", err)
+		return buf, errors.Wrapf(ErrLimit, "zstd: %v", err)
 	case err != nil:
-		return dst, errors.Wrapf(ErrMalformed, "zstd: %v", err)
-	case len(res)-base > bound:
-		return dst, errors.Wrapf(ErrLimit, "zstd frame decoded %d bytes, bound %d", len(res)-base, bound)
+		return buf, errors.Wrapf(ErrMalformed, "zstd: %v", err)
+	case len(res) > bound:
+		return buf, errors.Wrapf(ErrLimit, "zstd frame decoded %d bytes, bound %d", len(res), bound)
 	}
 
 	return res, nil
@@ -214,9 +219,14 @@ func zstdContentBound(src []byte, limit int) (int, error) {
 		return 0, errors.Wrapf(ErrMalformed, "zstd: %d bytes past the frame", len(rest))
 	}
 
+	// A block regenerates at most zstdMaxBlock, so a content size past that per block is a lie, and
+	// capping it here keeps the bound plus slack from overflowing.
 	if h.HasFCS {
-		if h.FrameContentSize > uint64(limit) {
+		switch {
+		case h.FrameContentSize > uint64(limit):
 			return 0, errors.Wrapf(ErrLimit, "zstd frame of %d bytes, limit %d", h.FrameContentSize, limit)
+		case h.FrameContentSize > uint64(blocks)*zstdMaxBlock:
+			return 0, errors.Wrapf(ErrMalformed, "zstd frame of %d blocks claims %d bytes", blocks, h.FrameContentSize)
 		}
 
 		return int(h.FrameContentSize), nil

@@ -61,8 +61,11 @@ when compression does not shrink. zstd and lz4 both compress (lz4 framed as `[uv
 block]`, the block format carrying no length of its own); none = identity. Encoders/decoders pooled.
 
 `DecompressLimit` is the bounded decode every part read uses: it fails with `ErrLimit` rather than
-produce more than a limit, allocating at most the bound plus `DecodeWorkspace`. Raw and lz4 check
-their recorded length before allocating. zstd cannot be bounded by capping the decoder: its stream
+produce more than a limit, allocating at most the bound plus `DecodeWorkspace`. It decodes into its
+buffer's capacity rather than appending, so a caller's full buffer is scratch and never a prefix
+that the allocation would have to repeat. Raw and lz4 check their recorded length before allocating,
+lz4 also against its 255-to-1 expansion ceiling and zstd against 128 KiB per block, so a length near
+`MaxInt` under a `MaxInt` limit is malformed rather than an allocation. zstd cannot be bounded by capping the decoder: its stream
 decoder's history is window-sized (512 MiB by default), and its whole-buffer decode checks a cap only
 after appending each block, through plain appends that grow the buffer first. So the frame is
 validated before decoding — exactly one frame, block headers walked to the last, no block over
