@@ -53,6 +53,7 @@ func TestDecompressLZ4Malformed(t *testing.T) {
 	c := NewCompressor(AlgorithmLZ4, LevelDefault)
 	for _, body := range [][]byte{
 		{FlagCompressed},                           // no length
+		{FlagCompressed, 0, 0x10, 0x61},            // zero length over a non-empty block
 		{FlagCompressed, 0xff, 0xff, 0xff, 0xff},   // huge length, no block
 		append([]byte{FlagCompressed, 8}, 0xab, 1), // length 8, garbage block
 	} {

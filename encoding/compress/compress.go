@@ -172,7 +172,7 @@ func (c *Compressor) decompressPool(dst, src []byte) []byte {
 		// against the block length (LZ4's max expansion is ~255×) so a malformed length cannot
 		// trigger a huge allocation.
 		origLen, k := binary.Uvarint(src)
-		if k <= 0 || origLen > uint64(len(src))*256+1024 {
+		if k <= 0 || origLen == 0 || origLen > uint64(len(src))*256+1024 {
 			return dst // malformed; best-effort, matching the zstd path's swallow
 		}
 
