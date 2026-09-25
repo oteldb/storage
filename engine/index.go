@@ -492,14 +492,21 @@ type indexLoad struct {
 	carried bool
 }
 
+// corruptLoadsBeforeWant is how many consecutive loads must find a part corrupt before the next one
+// records it as a repair want: a manifest is written once, whole, as the part's commit point, so
+// corruption that repeats over three loads (three maintenance cycles) is the object, not the read,
+// the same bar repair sets before concluding a part is gone ([holeConfirmations]).
+const corruptLoadsBeforeWant = holeConfirmations
+
 // readIndexLocked loads the bucket index and opens the parts it names, writing nothing on the
-// engine. Caller holds e.mu.
-func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, error) {
+// engine. A load that failed on corrupt parts also returns every part it found corrupt. Caller holds
+// e.mu.
+func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, error) {
 	ix, version, err := bucketindex.LoadVersioned(ctx, e.cfg.Backend, e.indexKey())
 	if err != nil {
 		e.countCorrupt(ctx, err, "bucket_index", obs.CorruptFatal)
 
-		return nil, errors.Wrap(err, "load bucket index")
+		return nil, nil, errors.Wrap(err, "load bucket index")
 	}
 
 	l := &indexLoad{
@@ -517,6 +524,11 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, error) {
 
 	named := make(map[string]struct{}, len(ix.Entries))
 
+	var (
+		corrupt    []string
+		corruptErr error
+	)
+
 	for i := range ix.Entries {
 		ent := &ix.Entries[i]
 		named[ent.Prefix] = struct{}{}
@@ -531,14 +543,32 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, error) {
 
 		p, err := e.livePart(ctx, ent, open)
 		if err != nil {
-			if !partGone(err) {
+			switch {
+			case partGone(err):
+				zctx.From(ctx).Error("part named by the index is gone; recording a repair",
+					zap.String("prefix", ent.Prefix), zap.Error(err))
+			case !partCorrupt(err):
 				e.countCorrupt(ctx, err, "part", obs.CorruptFatal)
 
-				return nil, err
-			}
+				return nil, nil, err
+			case e.corruptLoads[ent.Prefix] < corruptLoadsBeforeWant:
+				// Scanned on past, so every corrupt part advances its count: stopping at the first
+				// would let two of them reset each other's run forever.
+				e.countCorrupt(ctx, err, "part", obs.CorruptFatal)
 
-			zctx.From(ctx).Error("part named by the index is gone; recording a repair",
-				zap.String("prefix", ent.Prefix), zap.Error(err))
+				corrupt = append(corrupt, ent.Prefix)
+				if corruptErr == nil {
+					corruptErr = err
+				}
+
+				continue
+			default:
+				e.countCorrupt(ctx, err, "part", obs.CorruptWanted)
+				zctx.From(ctx).Error("part named by the index stayed corrupt; recording a repair",
+					zap.String("prefix", ent.Prefix), zap.Int("loads", e.corruptLoads[ent.Prefix]), zap.Error(err))
+
+				corrupt = append(corrupt, ent.Prefix)
+			}
 
 			l.lost = append(l.lost, bucketindex.WantOf(*ent, e.generation))
 
@@ -549,6 +579,10 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, error) {
 		// Only the parts that opened: a lost one left out is what keeps the next commit from also
 		// calling it a removal, which would restate a loss as a deliberate deletion.
 		l.indexed[p.prefix] = struct{}{}
+	}
+
+	if corruptErr != nil {
+		return nil, corrupt, corruptErr
 	}
 
 	// A flushed part whose commit failed is in no index, and its rows have already left the head:
@@ -567,7 +601,7 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, error) {
 
 	l.dropped = len(open) > 0
 
-	return l, nil
+	return l, nil, nil
 }
 
 // adoptLoadLocked makes l the engine's state and lifts the commit fence. It cannot fail, which is
@@ -601,7 +635,7 @@ func (e *Engine) adoptLoadLocked(l *indexLoad) {
 	e.generation = l.ix.Generation
 	e.removals = l.ix.Removed
 	e.wants, e.pendingWants = l.ix.Wanted, l.lost
-	e.loadErr = nil
+	e.loadErr, e.corruptLoads = nil, nil
 }
 
 // fenceLocked is the error every commit returns while the last index load failed, nil otherwise.
@@ -612,6 +646,30 @@ func (e *Engine) fenceLocked() error {
 	}
 
 	return errors.Wrapf(bucketindex.ErrFenced, "%s: last load: %v", e.cfg.Prefix, e.loadErr)
+}
+
+// nextCorruptLoads advances the run of each part a failed load found corrupt. A part that load did
+// not find corrupt starts over, and a load that failed for any other reason clears every run.
+func nextCorruptLoads(prev map[string]int, corrupt []string) map[string]int {
+	if len(corrupt) == 0 {
+		return nil
+	}
+
+	next := make(map[string]int, len(corrupt))
+	for _, prefix := range corrupt {
+		next[prefix] = prev[prefix] + 1
+	}
+
+	return next
+}
+
+// IndexFenced reports whether the last index load failed, so the engine refuses every commit and
+// its part set may be missing what the stored index names.
+func (e *Engine) IndexFenced() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	return e.loadErr != nil
 }
 
 func (e *Engine) fence() error {
@@ -645,10 +703,11 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 		return nil
 	}
 
-	l, err := e.readIndexLocked(ctx)
+	l, corrupt, err := e.readIndexLocked(ctx)
 	if err != nil {
 		e.loadErr = err
-		e.cfg.Obs.Corruption.FencedLoad(ctx, metricSignal)
+		e.corruptLoads = nextCorruptLoads(e.corruptLoads, corrupt)
+		e.cfg.Obs.Corruption.FencedLoad(ctx, metricSignal, fenceReason(err))
 
 		return err
 	}

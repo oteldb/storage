@@ -284,6 +284,9 @@ type Engine struct {
 	// loadErr is the error of the last index load that failed, nil once one succeeds. While it is
 	// set the engine's view of the index is not the stored one, and every commit is refused.
 	loadErr error
+	// corruptLoads counts, per part prefix, the consecutive failed loads that found the part corrupt;
+	// reaching [corruptLoadsBeforeWant] turns the part into a repair want.
+	corruptLoads map[string]int
 
 	// recPool recycles per-stream fetch accumulators (*recordCols) when a caller opts into batch
 	// reuse via fetch.Request.Recycle and releases each batch. The accumulator's columns back the
@@ -473,6 +476,8 @@ type Stats struct {
 	// IndexFenced is set while the last index load failed: the engine refuses every commit, so
 	// flushes keep their records in the head, and it retries the load until one succeeds.
 	IndexFenced bool
+	// IndexLoadErr is the error of the failed load behind IndexFenced, nil while not fenced.
+	IndexLoadErr error
 }
 
 // Stats returns an in-memory snapshot of the engine's state under a single read lock (no backend
@@ -492,6 +497,7 @@ func (e *Engine) Stats() Stats {
 		Holes:         len(e.holes),
 		LostParts:     e.lostParts,
 		IndexFenced:   e.loadErr != nil,
+		IndexLoadErr:  e.loadErr,
 		MaxTime:       e.head.newest,
 	}
 

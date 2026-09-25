@@ -315,7 +315,10 @@ per-column choice. The **manifest version** carries it. Version 2 is what the wr
 "every column object is checked"; version 1 parts carry no column checksums and are read unverified,
 so no migration is forced. The reader accepts the range 1..2 and rejects anything outside it, so an
 older binary — which accepts version 1 only — refuses a version-2 part outright with
-`unsupported version 2` wrapping `ErrCorrupt`, rather than misreading it.
+`unsupported version 2` wrapping `ErrCorrupt`, rather than misreading it. A version above the
+reader's range wraps `ErrUnsupportedVersion`, itself an `ErrCorrupt`: callers that only fail keep
+failing, and the engines can tell an intact part written by a newer release from a damaged one,
+which they hand to repair after repeated loads (`engine/ARCH.md`) and must never do for a newer one.
 
 Cost: 4 bytes per compression frame (0.006% of a 64 KiB frame), 4 per column directory, 4 per
 unblocked object. The hashing itself is hardware CRC32C on both paths and did not move any `block/`

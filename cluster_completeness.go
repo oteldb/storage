@@ -153,15 +153,36 @@ func (s *Storage) hasWants(sig signal.Signal, shard signal.TenantID) bool {
 	return ok && eng.HasWants()
 }
 
+// fencedInCluster reports whether the shard's local engine is fenced by a failed index load on a
+// cluster node. Its part set may lack whatever the stored index gained since its last good load, so
+// the whole shard disclaims, not a window. Without a cluster there is no owner to fail over to, and
+// the old part set keeps answering.
+func (s *Storage) fencedInCluster(sig signal.Signal, shard signal.TenantID) bool {
+	if s.cluster == nil {
+		return false
+	}
+
+	if sig == signal.Metric {
+		eng, ok := s.lookupEngine(shard)
+
+		return ok && eng.IndexFenced()
+	}
+
+	eng, ok := s.lookupRecordEngine(sig, shard)
+
+	return ok && eng.IndexFenced()
+}
+
 // canAnswer returns the error to disclaim the shard with when this node may not serve it for
 // [start, end], and nil when it may. held says whether this node has an engine for the shard at all;
 // passing it through here rather than branching at the call site is what keeps the two disclaims —
 // "I hold nothing" and "I hold it and it is short" — decided in one place.
 //
-// It meters and logs the incomplete case, which is the one an operator acts on. Two facts reach it:
-// a read gap (the unflushed head this node came back without) and an unsatisfied want (a part its
-// index names but it cannot read). They are the same statement — this node cannot answer completely
-// for that range — and both fail over. A committed hole is neither: acknowledging a loss discharges
+// It meters and logs the incomplete case, which is the one an operator acts on. Three facts reach
+// it: a fenced engine on a cluster node (its last index load failed), a read gap (the unflushed head
+// this node came back without) and an unsatisfied want (a part its index names but it cannot read).
+// They are the same statement — this node cannot answer completely for that range — and all fail
+// over. A committed hole is neither: acknowledging a loss discharges
 // its want, so reads resume.
 //
 // The enumeration RPCs spell "no time filter" as a zero window; widen it, since an unbounded listing
@@ -180,6 +201,8 @@ func (s *Storage) canAnswer(
 	var reason string
 
 	switch {
+	case s.fencedInCluster(sig, shard):
+		reason = "fenced by a failed index load"
 	case s.readGapOverlaps(sig, shard, start, end):
 		reason = "missing its unflushed head"
 	case s.wantOverlaps(sig, shard, start, end):
@@ -279,7 +302,7 @@ func (g gapFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator,
 func (s *Storage) gapGuarded(
 	sig signal.Signal, shard signal.TenantID, local fetch.Fetcher, remotes []fetch.Fetcher,
 ) fetch.Fetcher {
-	if !s.hasReadGap(sig, shard) && !s.hasWants(sig, shard) {
+	if !s.hasReadGap(sig, shard) && !s.hasWants(sig, shard) && !s.fencedInCluster(sig, shard) {
 		return local
 	}
 

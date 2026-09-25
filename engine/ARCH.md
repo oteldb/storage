@@ -296,14 +296,17 @@ the owner-load want commit, a rebase and `CompactNow` are all covered by one che
 state is not enough on its own: committing on a view that is known to be stale can still race a
 peer's backfill. Flush and merge also check before doing their I/O, and flush checks again under
 the lock that publishes its part, so a flush fenced mid-write folds its records back into the head
-rather than publishing a part the next reload would not keep. Reads keep serving the old part set.
+rather than publishing a part the next reload would not keep. Without a cluster, reads keep serving
+the old part set, the best answer with no owner to fail over to; a cluster node disclaims the whole
+shard instead (`cluster/ARCH.md`), since what its stale set lacks is unknown.
 
 The fence lifts only when a load succeeds. An owner reloads only after a backfill, so the facade's
 maintenance calls `ReloadFenced` every cycle, before the flush; a replica's `RefreshReplica` is
 already a load each cycle. `ReloadFenced` loads without the replica's head trim, since an owner's
-head holds records no part has. An unopenable part is deliberately not turned into a want the way a
-gone one is (see below): it keeps the engine fenced, retried every cycle and surfaced as
-`Stats.IndexFenced` and the `index.fenced_loads` counter (`ADMIN.md`), for an operator to resolve.
+head holds records no part has. Until then the fence is surfaced as `Stats.IndexFenced`, the failing
+load's error as `Stats.IndexLoadErr`, and every attempt in `index.fenced_loads` by reason
+(`ADMIN.md`). A part that stays corrupt is the one failure a load may stop failing on
+(below): left fenced, one damaged object would stop flush, merge and retention for good.
 
 A reload keeps a flushed part whose commit failed (identity still pending, named by no index):
 its records already left the head, so dropping the handle would make them unreadable until a
@@ -335,7 +338,7 @@ Pending wants count — a want a load discovered but no commit has published yet
 is already unreadable — while a hole does not, since acknowledging a loss discharges its want and
 lets reads resume.
 
-**Only `backend.ErrNotExist` may become a want.** Every other failure — a timeout, a canceled
+**Only `backend.ErrNotExist` becomes a want at once.** Every other failure — a timeout, a canceled
 context, a full disk, a denied request, a throttled bucket — leaves the part's existence unknown,
 and a want is a statement that it is gone. Recording one on an unknown would drop a live part from
 the index and start a repair for data that was never missing; over a shared backend a single
@@ -344,9 +347,23 @@ non-absence error fails the load exactly as it did before (`partGone`, the count
 ClickHouse's `isRetryableException` rethrow in `checkDataPart`).
 
 The trigger stays narrow in the other direction too: a part whose objects are **present but
-unreadable** — a corrupt manifest, a truncated column — is not a want. It is a different failure
-with a different remedy, and widening the trigger is how a repair path turns into a
-data-destruction path. It still fails the load.
+unreadable** — a corrupt manifest, a truncated column — is not a want on the load that meets it.
+That load fails and fences the engine: one bad read of an intact object must not start a repair,
+and widening the trigger is how a repair path turns into a data-destruction path.
+
+**Corruption that persists is a want.** After `corruptLoadsBeforeWant` (3) consecutive loads that
+each found a part corrupt, the next load records it as a want exactly as a gone part, and the
+fence lifts. Three is the bar repair sets for absence (`holeConfirmations`): a manifest is written
+once, whole, as the part's commit point, so damage repeating over three maintenance cycles is the
+object, not the read. The runs are per part and in memory (`corruptLoads`): a load failing for any
+other reason clears them all, a part the failing load did not find corrupt starts over, and a
+restart forgets. A failing load still opens every entry, so each corrupt part advances its own run;
+stopping at the first would let two corrupt parts reset each other forever. Two failures never
+exit. A backend error says nothing about the part. `block.ErrUnsupportedVersion` is an intact part
+from a newer release: repair would replace a readable part with a hole, when the remedy is a binary
+that reads it, so it stays fenced. Without a cluster the want cannot resolve on its own — the sole
+owner's repair seam refuses to call a present part absent — so reads over its range fail until an
+operator removes the objects or restores the part; the fence it replaces stopped the whole engine.
 
 Two consequences fall out of the entry no longer being there:
 

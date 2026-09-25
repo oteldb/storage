@@ -170,6 +170,10 @@ var suite = []struct {
 	{"MergeFencedMidwayRollsBack", mergeFencedMidwayRollsBack},
 	{"FlushFencedMidwayKeepsRows", flushFencedMidwayKeepsRows},
 	{"ReloadKeepsUncommittedFlush", reloadKeepsUncommittedFlush},
+	{"CorruptPartBecomesWant", corruptPartBecomesWant},
+	{"OtherFailuresNeverExit", otherFailuresNeverExit},
+	{"CorruptRunResets", corruptRunResets},
+	{"CorruptPartsExitTogether", corruptPartsExitTogether},
 
 	{"FailedFlushBurnsPartID", failedFlushBurnsPartID},
 	{"LoadPartsSweepsOrphanParts", loadPartsSweepsOrphanParts},

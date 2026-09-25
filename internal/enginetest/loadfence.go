@@ -205,7 +205,8 @@ func fenceLiftsOnReload(t *testing.T, k Kind) {
 }
 
 // persistentFenceStaysFenced: a part that stays unopenable keeps the engine fenced across every
-// retry, commits nothing, and says so on each attempt.
+// retry short of the corrupt-part exit ([corruptPartBecomesWant]), commits nothing, and says so on
+// each attempt.
 func persistentFenceStaysFenced(t *testing.T, k Kind) {
 	t.Helper()
 
@@ -218,7 +219,7 @@ func persistentFenceStaysFenced(t *testing.T, k Kind) {
 	commits := s.be.Count(k.indexCommit)
 	s.e.Append(t, api(400, 4))
 
-	const retries = 3
+	const retries = corruptLoads - 1
 	for range retries {
 		require.Error(t, s.e.ReloadFenced(ctx))
 		require.True(t, s.e.Stats().IndexFenced)

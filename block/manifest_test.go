@@ -7,6 +7,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -200,6 +201,41 @@ func TestManifestRejectsHugeColCount(t *testing.T) {
 
 	_, err := DecodeManifest(out)
 	require.ErrorIs(t, err, ErrCorrupt)
+}
+
+func TestManifestUnsupportedVersion(t *testing.T) {
+	t.Parallel()
+
+	require.ErrorIs(t, ErrUnsupportedVersion, ErrCorrupt)
+
+	withVersion := func(version uint64) []byte {
+		w := bitstream.NewWriter(nil)
+		binary.BigEndian.PutUint32(w.AppendBytes(4), manifestMagic)
+		w.WriteUvarint(version)
+		w.PadToByte()
+
+		body := w.Bytes()
+
+		return binary.BigEndian.AppendUint32(body, crc32.Checksum(body, castagnoli))
+	}
+
+	for _, tc := range []struct {
+		name        string
+		version     uint64
+		unsupported bool
+	}{
+		{"newer", uint64(manifestVersion) + 1, true},
+		{"truncates to a supported one", 1<<32 + uint64(manifestVersion), true},
+		{"below the oldest", uint64(manifestVersionMin) - 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := DecodeManifest(withVersion(tc.version))
+			require.ErrorIs(t, err, ErrCorrupt)
+			assert.Equal(t, tc.unsupported, errors.Is(err, ErrUnsupportedVersion))
+		})
+	}
 }
 
 // TestManifestGolden pins the exact on-disk bytes of a fixed manifest so an accidental
