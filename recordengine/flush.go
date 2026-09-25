@@ -274,7 +274,7 @@ func writePart(
 	ctx context.Context, b backend.Backend, schema *Schema, prefix string, f *flushColumns,
 	idents identitySet, comp compress.Algorithm, level compress.Level, bb *bloomBuilder,
 ) error {
-	opts := []block.PartOption{block.WithSortKey(colTs)}
+	opts := []block.PartOption{block.WithSortKey(colTs), block.WithSizingStats()}
 	if comp != compress.AlgorithmNone {
 		opts = append(opts, block.WithCompression(comp), block.WithCompressionLevel(level))
 	}
