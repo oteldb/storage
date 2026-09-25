@@ -54,11 +54,12 @@ func columnLimits(desc ColumnDesc, rawBytes int64, rows int) decodeLimits {
 	return l
 }
 
-// decompressBounded decompresses src onto dst held to limit bytes, exactly limit when exact. A
-// negative limit decodes unbounded. A bound violation is [ErrCorrupt] wrapping the compress error.
+// decompressBounded decompresses src into dst's capacity held to limit bytes, exactly limit when
+// exact. A negative limit decodes unbounded. A bound violation is [ErrCorrupt] wrapping the compress
+// error.
 func decompressBounded(comp *compress.Compressor, dst, src []byte, limit int64, exact bool) ([]byte, error) {
 	if limit < 0 {
-		return comp.Decompress(dst, src)
+		return comp.Decompress(dst[:0], src)
 	}
 
 	out, err := comp.DecompressLimit(dst, src, int(min(limit, math.MaxInt)))
@@ -66,11 +67,72 @@ func decompressBounded(comp *compress.Compressor, dst, src []byte, limit int64, 
 		return nil, errors.Errorf("%w: %w", ErrCorrupt, err)
 	}
 
-	if got := int64(len(out) - len(dst)); exact && got != limit {
-		return nil, errors.Wrapf(ErrCorrupt, "decompressed %d bytes, want %d", got, limit)
+	if exact && int64(len(out)) != limit {
+		return nil, errors.Wrapf(ErrCorrupt, "decompressed %d bytes, want %d", len(out), limit)
 	}
 
 	return out, nil
+}
+
+// decompressKept is [decompressBounded] for a buffer the caller keeps. A bounded zstd decode needs a
+// block of slack past the content, which a kept buffer would hold for its whole life, so unless dst
+// already has that room the frame decodes into a pooled scratch and is copied into dst, or into an
+// exact-size buffer when dst is short.
+func decompressKept(comp *compress.Compressor, dst, src []byte, limit int64, exact bool) ([]byte, error) {
+	slack := int64(comp.OutputSlack())
+	if slack == 0 || limit < 0 || int64(cap(dst)) >= satAdd(limit, slack) {
+		return decompressBounded(comp, dst, src, limit, exact)
+	}
+
+	scratch := getScratch()
+
+	out, err := decompressBounded(comp, scratch, src, limit, exact)
+	if err != nil {
+		putScratch(scratch)
+
+		return nil, err
+	}
+
+	kept := dst[:0]
+	if cap(kept) < len(out) {
+		kept = make([]byte, 0, len(out))
+	}
+
+	kept = append(kept, out...)
+	putScratch(out)
+
+	return kept, nil
+}
+
+// Scratch buffers for [decompressKept], held in a fixed set that survives collections: a
+// [sync.Pool] is emptied by every other collection, and a scratch rebuilt on each miss costs the
+// frame plus its slack, which is what a kept buffer avoids holding. The set holds at most
+// scratchBufs × maxScratchBuf for the process.
+const (
+	scratchBufs   = 4
+	maxScratchBuf = 1 << 20
+)
+
+var scratches = make(chan []byte, scratchBufs)
+
+func getScratch() []byte {
+	select {
+	case buf := <-scratches:
+		return buf
+	default:
+		return nil
+	}
+}
+
+func putScratch(buf []byte) {
+	if buf == nil || cap(buf) > maxScratchBuf {
+		return
+	}
+
+	select {
+	case scratches <- buf[:0]:
+	default:
+	}
 }
 
 func satAdd(a, b int64) int64 {

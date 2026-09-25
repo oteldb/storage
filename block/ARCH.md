@@ -390,10 +390,14 @@ row. A part recording no `RawBytes` decodes unbounded, as before; it is never me
 
 A bounded zstd decode goes into a destination of the content size plus 128 KiB + 16: the decoder
 appends a block before checking it, so without the slack the append would grow the buffer past the
-bound. The slack lives as long as the buffer, which matters where decoded bytes are kept:
+bound. The slack lives as long as the buffer, so nothing kept past a decode carries it:
 
-- a **dictionary**'s entries alias its buffer, so it keeps the slack for its life; `ColumnInputSize`
-  charges it;
+- a **kept buffer** — a dictionary, whose entries alias it; a decoder's frame buffer, which lives as
+  long as the decoder; an unframed stream — decodes into a scratch buffer and is copied out at its
+  exact size. Keeping the slack would cost 128 KiB per open zstd dictionary and per open decoder,
+  over a gigabyte for 1000 parts × 5 open columns. The scratch buffers come from a fixed set of four
+  of at most 1 MiB that survives collections: a `sync.Pool` empties on every other collection, and
+  rebuilding a scratch per miss put a ranged open 16% over its allocation before the slack;
 - a **whole-column bytes walk** keeps every frame it decoded (the merged column aliases them), so the
   frames decode back to back into one arena sized to their recorded total plus one slack, instead of
   a slack per frame — about three times the column at 64 KiB frames;
@@ -438,9 +442,9 @@ slack); `compress.DecodeWorkspace` rounds it to 512 KiB.
     total. Readers check the directory against it — counts before any index array is allocated,
     maxima and totals exactly — so a manifest cannot understate the column it sizes.
 - **`ColumnInputSize`** turns a descriptor into what reading the column holds, from the manifest
-  alone. With sizing it is per column: the dictionary plus its decoded headers and the zstd slack its
-  buffer keeps, the frame and directory sizes, the bytes an open reads (the trailer tail, or `DirLen`),
-  and the whole-read footprint. Without sizing a column is bounded only through its part's `RawBytes`,
+  alone. With sizing it is per column: the dictionary plus its decoded headers, the frame and
+  directory sizes, the bytes an open reads (the trailer tail, or `DirLen`), and the whole-read
+  footprint. Without sizing a column is bounded only through its part's `RawBytes`,
   so it is charged as a whole read of the whole part (`SourceWide`): `RawBytes` twice — the decoded
   values and the decompressed stream of the column being decoded, a second copy for a numeric one —
   plus each column's per-row stream slack and decoded headers, per-granule stream overhead and zstd

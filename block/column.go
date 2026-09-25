@@ -1101,7 +1101,7 @@ func (r *ColumnReader) stream() ([]byte, error) {
 		return nil, err
 	}
 
-	out, err := decompressBounded(r.comp, nil, body, r.limits.stream, r.limits.exact)
+	out, err := decompressKept(r.comp, nil, body, r.limits.stream, r.limits.exact)
 	if err != nil {
 		return nil, errors.Wrapf(err, "decompress column %q", r.desc.Name)
 	}

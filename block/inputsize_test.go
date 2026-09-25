@@ -332,14 +332,26 @@ func TestDictLenPastWriterMaxRejectedBeforeRead(t *testing.T) {
 	assert.Equal(t, int64(1), b.Reads(), "only the manifest: %s", b.Report())
 }
 
+// settledLive is the live heap with the pools and the decode scratch set emptied, so neither a
+// pooled decoder nor a scratch buffer counts as retained.
+func settledLive() int64 {
+	for len(scratches) > 0 {
+		<-scratches
+	}
+
+	runtime.GC()
+	runtime.GC()
+
+	return int64(heaptest.Live())
+}
+
 // TestRetainedHeapWithinCharge: what an open and a whole-column walk keep live stays within the
-// Resident and WholeResident charges, the decoded buffers' zstd slack included.
+// Resident and WholeResident charges. A zstd decode's slack is never kept: the tolerance is far
+// below the 128 KiB a kept dictionary or frame buffer would add.
 //
 //nolint:paralleltest // reads process-wide heap counters
 func TestRetainedHeapWithinCharge(t *testing.T) {
-	// Readers and slice headers, plus the pooled zstd decoder: the workspace a merge charges once as
-	// [compress.DecodeWorkspace], live here because a pool keeps it through one collection.
-	const tolerance = 16<<10 + compress.DecodeWorkspace
+	const tolerance = 16 << 10 // readers and slice headers
 
 	ctx := context.Background()
 	b := backend.Memory()
@@ -351,11 +363,7 @@ func TestRetainedHeapWithinCharge(t *testing.T) {
 	in, err := r.ColumnInputSize("attrs")
 	require.NoError(t, err)
 
-	// Two collections empty the pools, whose encoders would otherwise drop out of a later sample.
-	runtime.GC()
-	runtime.GC()
-
-	base := heaptest.Live()
+	base := settledLive()
 
 	col, err := r.Column(ctx, "attrs")
 	require.NoError(t, err)
@@ -363,20 +371,34 @@ func TestRetainedHeapWithinCharge(t *testing.T) {
 	_, err = col.sharedEntries()
 	require.NoError(t, err)
 
-	opened := heaptest.Live()
-	assert.LessOrEqual(t, int64(opened)-int64(base), in.Resident+tolerance, "open")
+	opened := settledLive() - base
+	assert.LessOrEqual(t, opened, in.Resident+tolerance, "open")
 
 	dc, err := col.Bytes()
 	require.NoError(t, err)
 
-	walked := heaptest.Live()
-	assert.LessOrEqual(t, int64(walked)-int64(base), in.WholeResident+in.DirBytes+tolerance, "walk")
-
-	t.Logf("resident %d/%d, whole %d/%d", int64(opened)-int64(base), in.Resident,
-		int64(walked)-int64(base), in.WholeResident)
+	walked := settledLive() - base
+	assert.LessOrEqual(t, walked, in.WholeResident+in.DirBytes+tolerance, "walk")
 
 	runtime.KeepAlive(col)
 	runtime.KeepAlive(dc)
+
+	// A ranged open keeps the dictionary, the directory and one frame.
+	base = settledLive()
+
+	d, err := r.ColumnBlocks(ctx, "attrs")
+	require.NoError(t, err)
+
+	_, err = d.DecodeBytesBlock(0)
+	require.NoError(t, err)
+
+	ranged := settledLive() - base
+	assert.LessOrEqual(t, ranged, in.Resident+in.DirBytes+in.MaxFrameRaw+tolerance, "ranged open")
+
+	t.Logf("open %d/%d, walk %d/%d, ranged %d/%d", opened, in.Resident, walked, in.WholeResident,
+		ranged, in.Resident+in.DirBytes+in.MaxFrameRaw)
+
+	runtime.KeepAlive(d)
 }
 
 // TestDecodeBombsAreCorrupt: an unframed stream or leading dictionary decompressing far past its

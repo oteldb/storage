@@ -151,7 +151,7 @@ func parseSharedDict(
 		rest = rest[objectCRCBytes:]
 	}
 
-	dict, err := decompressBounded(comp, nil, packed, lim.limit, lim.exact)
+	dict, err := decompressKept(comp, nil, packed, lim.limit, lim.exact)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "shared dictionary")
 	}

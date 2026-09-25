@@ -237,18 +237,20 @@ func (d blockDir) frame(f int) ([]byte, error) {
 	return raw, nil
 }
 
-// decompress decompresses frame f's raw bytes onto dst, held to the frame's recorded size.
-func (d blockDir) decompress(comp *compress.Compressor, dst []byte, f int, raw []byte) ([]byte, error) {
-	var (
-		out []byte
-		err error
-	)
-
+// decompress decompresses frame f's raw bytes into dst, held to the frame's recorded size. keep
+// says the caller holds the result past the walk, which must then carry no decode slack.
+func (d blockDir) decompress(comp *compress.Compressor, dst []byte, f int, raw []byte, keep bool) ([]byte, error) {
+	limit, exact := d.legacyMax, false
 	if d.frameRaw != nil {
-		out, err = decompressBounded(comp, dst, raw, int64(d.frameRaw[f]), true)
-	} else {
-		out, err = decompressBounded(comp, dst, raw, d.legacyMax, false)
+		limit, exact = int64(d.frameRaw[f]), true
 	}
+
+	decode := decompressBounded
+	if keep {
+		decode = decompressKept
+	}
+
+	out, err := decode(comp, dst, raw, limit, exact)
 
 	if err != nil {
 		return nil, errors.Wrapf(err, "decompress frame %d", f)
@@ -790,6 +792,8 @@ type blockStreams struct {
 	comp  *compress.Compressor
 	frame int    // index of the frame in buf, -1 when empty
 	buf   []byte // the decompressed frame
+	// pooled marks a buffer from [walkBufs] that returns there, so it may keep decode slack.
+	pooled bool
 }
 
 func newBlockStreams(dir blockDir, comp *compress.Compressor) blockStreams {
@@ -809,20 +813,29 @@ var walkBufs sync.Pool
 // it and must not let anything it returns alias a frame.
 func newWalkStreams(dir blockDir, comp *compress.Compressor) blockStreams {
 	s := newBlockStreams(dir, comp)
-	if p, ok := walkBufs.Get().(*[]byte); ok {
-		s.buf = *p
-	}
+	s.buf, s.pooled = getWalkBuf(), true
 
 	return s
 }
 
 func (s *blockStreams) release() {
-	if s.buf != nil && cap(s.buf) <= maxPooledFrameBuf {
-		buf := s.buf[:0]
-		walkBufs.Put(&buf)
+	putWalkBuf(s.buf)
+	s.buf, s.frame = nil, -1
+}
+
+func getWalkBuf() []byte {
+	if p, ok := walkBufs.Get().(*[]byte); ok {
+		return *p
 	}
 
-	s.buf, s.frame = nil, -1
+	return nil
+}
+
+func putWalkBuf(buf []byte) {
+	if buf != nil && cap(buf) <= maxPooledFrameBuf {
+		buf = buf[:0]
+		walkBufs.Put(&buf)
+	}
 }
 
 // granule returns granule g's codec stream. The result aliases the cached frame buffer and stays
@@ -835,7 +848,7 @@ func (s *blockStreams) granule(g int) ([]byte, error) {
 			return nil, errors.Wrapf(err, "frame %d", f)
 		}
 
-		buf, err := s.dir.decompress(s.comp, s.buf[:0], f, raw)
+		buf, err := s.dir.decompress(s.comp, s.buf, f, raw, !s.pooled)
 		if err != nil {
 			return nil, err
 		}
@@ -987,7 +1000,7 @@ func (w *bytesWalk) frame(g int) ([]byte, error) {
 			dst = w.arena[n : n : n+int(w.dir.frameRaw[f])+w.slack]
 		}
 
-		buf, err := w.dir.decompress(w.comp, dst, f, raw)
+		buf, err := w.dir.decompress(w.comp, dst, f, raw, true)
 		if err != nil {
 			return nil, err
 		}

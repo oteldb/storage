@@ -71,7 +71,7 @@ func sizedInput(desc ColumnDesc, rows int64) ColumnInputSize {
 
 	var dict int64
 	if desc.TrailerDict {
-		dict = satAdd(satAdd(desc.DictRaw, slack), satMul(decodedEntryHeader, desc.DictEntries))
+		dict = satAdd(desc.DictRaw, satMul(decodedEntryHeader, desc.DictEntries))
 	}
 
 	in.WholeResident = satAdd(s.StreamRaw, slack)
@@ -145,8 +145,8 @@ func (r *PartReader) sourceWideInput(desc ColumnDesc) ColumnInputSize {
 			perRow += decodedEntryHeader + decodedBytesRow
 		}
 
-		// Every stream's fixed overhead, and the output slack a decoded stream and dictionary keep.
-		overhead := satAdd(satMul(streamSlack, granules), 2*int64(compress.OutputSlack(c.Compress)))
+		// Every stream's fixed overhead, and the output slack a whole-column bytes walk keeps.
+		overhead := satAdd(satMul(streamSlack, granules), int64(compress.OutputSlack(c.Compress)))
 		charge = satAdd(charge, satAdd(satMul(perRow, rows), overhead))
 	}
 
