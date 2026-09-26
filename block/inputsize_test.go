@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"math"
 	"runtime"
+	"runtime/metrics"
 	"slices"
 	"testing"
 
@@ -110,7 +111,7 @@ func TestColumnInputSizeMatchesDirectory(t *testing.T) {
 
 				dir := d.streams.dir
 				assert.Equal(t, in.DirBytes, dir.residentBytes(), name)
-				assert.Equal(t, in.DictEntries, int64(len(d.SharedEntries())), name)
+				assert.Equal(t, in.DictEntries, int64(len(sharedEntriesOf(d))), name)
 
 				var maxBytes, maxRaw, maxGran int64
 				for f := range len(dir.frameOff) - 1 {
@@ -334,6 +335,9 @@ func TestDictLenPastWriterMaxRejectedBeforeRead(t *testing.T) {
 
 // settledLive is the live heap with the pools and the decode scratch set emptied, so neither a
 // pooled decoder nor a scratch buffer counts as retained.
+//
+// It reads the heap marked live by the last collection, not HeapAlloc, which also counts whatever
+// any goroutine allocated after that collection finished.
 func settledLive() int64 {
 	for len(scratches) > 0 {
 		<-scratches
@@ -342,12 +346,21 @@ func settledLive() int64 {
 	runtime.GC()
 	runtime.GC()
 
-	return int64(heaptest.Live())
+	sample := []metrics.Sample{{Name: "/gc/heap/live:bytes"}}
+	metrics.Read(sample)
+
+	return int64(sample[0].Value.Uint64())
 }
 
 // TestRetainedHeapWithinCharge: what an open and a whole-column walk keep live stays within the
 // Resident and WholeResident charges. A zstd decode's slack is never kept: the tolerance is far
 // below the 128 KiB a kept dictionary or frame buffer would add.
+//
+// The paths run once untimed first, so state the process initializes lazily on first use (pools,
+// decoder tables, the metrics reader) is in both samples of a measured run rather than in one. Each
+// figure is then the least of several runs: what the code retains is the same every run, while an
+// allocation by a goroutine an earlier test left behind lands in some runs only (about 11 KiB, in
+// one or two whole-package runs in a hundred under load).
 //
 //nolint:paralleltest // reads process-wide heap counters
 func TestRetainedHeapWithinCharge(t *testing.T) {
@@ -363,6 +376,28 @@ func TestRetainedHeapWithinCharge(t *testing.T) {
 	in, err := r.ColumnInputSize("attrs")
 	require.NoError(t, err)
 
+	retainedHeap(ctx, t, r)
+
+	opened, walked, ranged := retainedHeap(ctx, t, r)
+
+	for range 2 {
+		o, w, rg := retainedHeap(ctx, t, r)
+		opened, walked, ranged = min(opened, o), min(walked, w), min(ranged, rg)
+	}
+
+	assert.LessOrEqual(t, opened, in.Resident+tolerance, "open")
+	assert.LessOrEqual(t, walked, in.WholeResident+in.DirBytes+tolerance, "walk")
+	assert.LessOrEqual(t, ranged, in.Resident+in.DirBytes+in.MaxFrameRaw+tolerance, "ranged open")
+
+	t.Logf("open %d/%d, walk %d/%d, ranged %d/%d", opened, in.Resident, walked, in.WholeResident,
+		ranged, in.Resident+in.DirBytes+in.MaxFrameRaw)
+}
+
+// retainedHeap measures what opening the attrs column, walking it whole, and opening it ranged with
+// one granule decoded each keep live.
+func retainedHeap(ctx context.Context, t *testing.T, r *PartReader) (opened, walked, ranged int64) {
+	t.Helper()
+
 	base := settledLive()
 
 	col, err := r.Column(ctx, "attrs")
@@ -371,14 +406,12 @@ func TestRetainedHeapWithinCharge(t *testing.T) {
 	_, err = col.sharedEntries()
 	require.NoError(t, err)
 
-	opened := settledLive() - base
-	assert.LessOrEqual(t, opened, in.Resident+tolerance, "open")
+	opened = settledLive() - base
 
 	dc, err := col.Bytes()
 	require.NoError(t, err)
 
-	walked := settledLive() - base
-	assert.LessOrEqual(t, walked, in.WholeResident+in.DirBytes+tolerance, "walk")
+	walked = settledLive() - base
 
 	runtime.KeepAlive(col)
 	runtime.KeepAlive(dc)
@@ -389,16 +422,17 @@ func TestRetainedHeapWithinCharge(t *testing.T) {
 	d, err := r.ColumnBlocks(ctx, "attrs")
 	require.NoError(t, err)
 
-	_, err = d.DecodeBytesBlock(0)
+	granuleG, err := d.DecodeBytesBlock(0)
+
+	granule := granuleG.dc
 	require.NoError(t, err)
+	require.NotNil(t, granule)
 
-	ranged := settledLive() - base
-	assert.LessOrEqual(t, ranged, in.Resident+in.DirBytes+in.MaxFrameRaw+tolerance, "ranged open")
-
-	t.Logf("open %d/%d, walk %d/%d, ranged %d/%d", opened, in.Resident, walked, in.WholeResident,
-		ranged, in.Resident+in.DirBytes+in.MaxFrameRaw)
+	ranged = settledLive() - base
 
 	runtime.KeepAlive(d)
+
+	return opened, walked, ranged
 }
 
 // TestDecodeBombsAreCorrupt: an unframed stream or leading dictionary decompressing far past its

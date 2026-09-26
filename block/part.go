@@ -9,6 +9,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
 )
 
@@ -126,6 +127,15 @@ func NewPartWriter(opts ...PartOption) *PartWriter {
 func (w *PartWriter) AddColumn(c Column) error {
 	if !c.Kind.valid() {
 		return errors.Errorf("block: column %q has invalid kind %d", c.Name, c.Kind)
+	}
+
+	codec := c.Codec
+	if codec == chunk.CodecNone {
+		codec = defaultCodec(c.Kind)
+	}
+
+	if err := c.checkObserver(codec); err != nil {
+		return err
 	}
 
 	n := c.rows()

@@ -157,11 +157,15 @@ func TestTrailerColumnGolden(t *testing.T) {
 	dec, err := newColumnReader(desc, obj, noneComp(), len(vals)).BlockDecoder()
 	require.NoError(t, err)
 
-	narrow, err := dec.DecodeBytesBlock(0)
+	narrowG, err := dec.DecodeBytesBlock(0)
+
+	narrow := narrowG.dc
 	require.NoError(t, err)
 	assert.Equal(t, 1, narrow.IDWidth, "a granule sealed before the 257th entry keeps 1-byte ids")
 
-	wide, err := dec.DecodeBytesBlock(9)
+	wideG, err := dec.DecodeBytesBlock(9)
+
+	wide := wideG.dc
 	require.NoError(t, err)
 	assert.Equal(t, 2, wide.IDWidth)
 
@@ -478,7 +482,7 @@ func TestSharedDictCapChargesNewValuesOnly(t *testing.T) {
 	a, bv := big, []byte("b")
 	vals := [][]byte{a, a, a, a, a, a, a, bv}
 
-	b := newSharedDictBuilder(defaultSharedDictBytes)
+	b := newSharedDictBuilder(defaultSharedDictBytes, false)
 	defer b.release()
 
 	ids := make([]int32, 4)
@@ -487,7 +491,7 @@ func TestSharedDictCapChargesNewValuesOnly(t *testing.T) {
 	assert.Equal(t, [][]byte{a, bv}, b.entries)
 	assert.Equal(t, []int32{0, 0, 0, 1}, ids)
 
-	tight := newSharedDictBuilder(17 << 20)
+	tight := newSharedDictBuilder(17<<20, false)
 	defer tight.release()
 
 	require.False(t, tight.addValues(Column{Kind: KindBytes, Bytes: vals}, 0, 4, ids), "a value past the cap declines")
@@ -506,7 +510,7 @@ func TestSharedDictCapBindsOnlyWhenReached(t *testing.T) {
 	c := Column{Kind: KindBytes, Bytes: vals}
 
 	decide := func(dictCap int64, split bool) ([]bool, [][]byte) {
-		b := newSharedDictBuilder(dictCap)
+		b := newSharedDictBuilder(dictCap, false)
 		defer b.release()
 
 		sc := c
@@ -725,7 +729,9 @@ func FuzzTrailerColumnDecode(f *testing.F) {
 		read(newColumnReader(d, object, noneComp(), len(vals)).DecodeBlocksBytesIntoColumn([]int{0, 9, 11}))
 
 		if dec, err := newColumnReader(d, object, noneComp(), len(vals)).BlockDecoder(); err == nil {
-			read(dec.DecodeBytesBlock(9))
+			dcG, err := dec.DecodeBytesBlock(9)
+			dc := dcG.dc
+			read(dc, err)
 		}
 	})
 }

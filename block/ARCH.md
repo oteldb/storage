@@ -160,7 +160,9 @@ decision only when D would really outgrow it; below it the decisions are the unc
 builder works a granule at a time: the flat-value path hashes each row once and each distinct value
 once more (the prior build hashed every row twice), the split path hashes nothing.
 
-A column where no granule joins is written unframed, as before.
+A column where no granule joins is written unframed, as before — by `PartWriter` and a buffered
+`StreamWriter`, which see the whole column. A streamed column has handed its frames out by then, so it
+keeps the trailer layout with an empty dictionary; readers take either.
 
 ### Decoding a shared-dictionary column
 
@@ -199,7 +201,8 @@ result. Measured on a real attributes column, whole-column decode: 324699 flat r
 
 `PartWriter` takes whole columns and serializes them in one pass. `StreamWriter` builds the same
 part incrementally: the schema is declared up front, rows arrive through `AppendInt64` /
-`AppendFloat64` / `AppendU128Run`, and each column encodes a granule as soon as one fills. Only one
+`AppendFloat64` / `AppendU128Run` / `AppendBytes` / `AppendBytesBlob` / a `Binding`, and each column
+encodes a granule as soon as one fills. Only one
 granule of raw rows per column is ever resident, so the writer's working set is the *encoded* part
 rather than its uncompressed rows. Output is byte-identical to `PartWriter`'s from the same rows,
 tested case-by-case and by fuzz.
@@ -219,15 +222,68 @@ describes. Two consequences worth stating:
 - **A column cannot stream from its first granule.** A column that turns out constant collapses into
   the manifest and has *no* object, and an object cannot be un-created once bytes are on their way.
   So a column buffers until the rows prove it non-constant — which is monotone (two differing values
-  can never become one) and, for real data, the second row. Constant data is also where buffering
-  costs least: a run of one value is what these codecs compress hardest.
-`StreamWriter.ResidentBytes()` reports the footprint directly, so a caller bounded by memory rather
+  can never become one) and, for real data, the second row — or until it holds one frame of sealed
+  output (`constRetainBytes`), whichever comes first. A constant stream compresses to almost nothing,
+  so one frame covers a very long prefix; past it the column attaches anyway and is aborted if it
+  ends constant, costing one wasted object write instead of an unbounded buffer.
+`StreamWriter.ResidentBytes()` reports the footprint directly — for a bytes column including G, D and
+its bindings' caches, which stay flat in rows once D stops growing — so a caller bounded by memory rather
 than by disk seals on the thing it is actually bounded by (`engine/ARCH.md`).
 
 Only encodings that restart per granule can stream, which is the same property block framing needs:
-blocked `Int64`/`Float64`, plus `Int128` whose RLE codec is fed runs directly and never materializes
-its rows. An unblocked int64/float64 column is rejected rather than silently buffered — its single
-codec stream cannot resume across appends.
+blocked `Int64`/`Float64`/`Bytes`, plus `Int128` whose RLE codec is fed runs directly and never
+materializes its rows. An unblocked column of the other kinds is rejected rather than silently
+buffered — its single codec stream cannot resume across appends.
+
+### Streaming a bytes column
+
+A `CodecBytesRaw` column stages one granule of values and encodes it at the boundary. A `CodecDict`
+column stages the output granule G — its distinct values in first-occurrence order, their counts, each
+row's index into them — and at the boundary decides G against the column dictionary D with the same
+`sharedDictBuilder` rule and byte cap `PartWriter` uses, so the two write the same granule streams and
+a trailer column object is byte-identical from either writer, buffered or streamed. D copies what
+joins it into chunked arenas that never reallocate, so an entry stays put while D grows; at close D is
+serialized into the region, then the directory and its length follow the frames.
+
+Rows reach G three ways. None hashes a row more than twice (G's index, then D's), plus one insert
+per value new to the granule:
+
+- **Values** (`AppendBytes`, `AppendBytesBlob`, a flat granule): a probe of G's index, which holds only
+  values absent from D, then of D. Values are copied into G's arena.
+- **A `Binding`** to a source's dictionary table caches per entry a stamp, its G index and its D id,
+  so a repeated entry costs an array lookup and a D entry already in G (`gOfD`) no probe at all. A D
+  id stays valid for the writer's life; the stamps die with each granule.
+- **`BindStable`** is a binding over entries that are never overwritten — a decoder's shared
+  dictionary — which G references instead of copying. A granule's own table lives in the decoder's
+  reused frame buffer, so it is bound with `Bind`, which copies.
+
+Streamed at 8192-row granules, a 512-value attribute column encodes at 1.7 GB/s from values and
+4.5 GB/s through a binding, a near-unique body column at 0.38 and 0.43 GB/s (`PartWriter`: 2.3 and
+0.35 GB/s from a blob); `ResidentBytes` stays at 0.41 MiB and 2.65 MiB respectively from 64 Ki to
+1 Mi rows (`BenchmarkStreamWriterBytes`, `BenchmarkStreamWriterToBytesResident`).
+
+A table is named by a `DictGen` token: a pointer to its owner plus the owner's epoch, comparable and
+allocation-free, with no process-wide counter — two decoders over one part never issue equal tokens.
+A decoder owns two: the shared dictionary's, whose epoch never moves, so `SharedEntries` and every
+shared granule hand back one token valid for the decoder's life; and the granules', which every
+decode retires before it may overwrite the frame buffer. That one issues each self table's token and
+every decoded granule's lease, since a granule's ids alias the frame whichever table they index.
+
+`DecodeBytesBlock` returns a `DecodedGranule` — the column, its table token and a lease that records
+the column it was issued for — and `AppendDict` takes it whole, so a column cannot be paired with
+another decode's validity. It requires the bound token and a live granule, so a stale self table or
+stale shared ids are an error even while the binding still holds the token; `BindStable` refuses a
+self token outright, since a reference would outlive the frame. Retiring on every decode, not only
+on a frame change, is conservative: a merge cursor decodes a granule only after leaving the last.
+`NewDictGen` gives a caller-built table its own owner, and `OwnedGranule` wraps a caller-built
+column over it; over a decoder's token it yields a granule that is never live. Bindings belong to
+one writer and die when it finishes.
+
+`Column.Observer` (`BytesObserver`) is the seam for per-value side structures such as blooms. Both
+writers report every declined granule's distinct values with counts, then D with its counts once at
+close, before the object commits; counts sum to the column's rows. The streaming writer reports a
+granule when it seals, so a column that later collapses to a constant may have reported granules but
+gets no `Dictionary` call.
 
 Two things the batch writer settles by looking at a finished column, a streaming one cannot:
 
@@ -315,10 +371,9 @@ them. At S3 latencies that is the difference between a merge finishing and not.
 - `Decoder.DecodeBytesBlock` decodes one granule against the cached frame. The result **aliases that
   frame buffer** and dies at the next decode crossing a frame — deliberately: a merge reads a
   granule's ids and appends them, and copying every value back would be the per-row cost this path
-  exists to remove. A granule on the shared dictionary yields the *column's* entry table unchanged —
-  the very slice `SharedEntries` returns, which is how the record merge recognizes it and resolves
-  the dictionary into its union once — so ids stay comparable across granules and nothing is
-  rehashed per granule. Its `IDWidth` is the granule's own, so a trailer column hands back 1-byte
+  exists to remove. A granule on the shared dictionary yields the *column's* entry table unchanged,
+  with the `DictGen` token `SharedEntries` returns — so ids stay comparable across granules and
+  nothing is rehashed per granule; any other granule gets a token retired by the next decode, and the granule itself is retired the same way. Its `IDWidth` is the granule's own, so a trailer column hands back 1-byte
   ids for granules written before the dictionary passed 256 entries.
 
 ## At-rest checksums

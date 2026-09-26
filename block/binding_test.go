@@ -1,0 +1,415 @@
+package block
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"math"
+	"strconv"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/encoding/compress"
+)
+
+// scanSource is a part's bytes column open for a forward walk, as a merge source holds it.
+func scanSource(t *testing.T, vals [][]byte, gsize int) *Decoder {
+	t.Helper()
+
+	ctx := context.Background()
+	b := backend.Memory()
+
+	w := NewPartWriter(WithGranuleSize(gsize), WithCompression(compress.AlgorithmZSTD), WithCompressBlockBytes(64))
+	require.NoError(t, w.AddColumn(Column{Name: "b", Kind: KindBytes, Bytes: vals, Block: true}))
+	require.NoError(t, WritePart(ctx, b, "src", w))
+
+	r, err := OpenPart(ctx, b, "src")
+	require.NoError(t, err)
+
+	d, err := r.ColumnScan(ctx, "b", 1<<10)
+	require.NoError(t, err)
+
+	return d
+}
+
+// walker routes a source's granules the way a merge cursor does: a granule on the shared dictionary
+// through the binding bound once to it, any other through a binding re-bound per granule.
+type walker struct {
+	d            *Decoder
+	shared, self *Binding
+	sharedGen    DictGen
+}
+
+func newWalker(t *testing.T, d *Decoder, w *StreamWriter, col int) *walker {
+	t.Helper()
+
+	shared, err := w.Binding(col)
+	require.NoError(t, err)
+	self, err := w.Binding(col)
+	require.NoError(t, err)
+
+	entries, gen := d.SharedEntries()
+	require.NoError(t, shared.BindStable(entries, gen))
+
+	return &walker{d: d, shared: shared, self: self, sharedGen: gen}
+}
+
+func (wk *walker) granule(t *testing.T, blk int, lo, hi int) {
+	t.Helper()
+
+	g, err := wk.d.DecodeBytesBlock(blk)
+	require.NoError(t, err)
+
+	if g.Table() == wk.sharedGen {
+		require.NoError(t, wk.shared.AppendDict(g, lo, hi, nil))
+
+		return
+	}
+
+	require.NoError(t, wk.self.Bind(g.Column().Entries, g.Table()))
+	require.NoError(t, wk.self.AppendDict(g, lo, hi, nil))
+}
+
+// TestBindingWalkAcrossPartSplit walks a source whose granules go shared → self → shared, narrow and
+// wide, into two output parts cut mid-granule, and checks each against [PartWriter] over its rows.
+// The bindings of the first part die with it; the second part binds afresh.
+func TestBindingWalkAcrossPartSplit(t *testing.T) {
+	t.Parallel()
+
+	vals := transitionValues()
+	d := scanSource(t, vals, transitionGranule)
+	cut := 5*transitionGranule + transitionGranule/2
+
+	outGranule := 48
+	opts := []PartOption{WithGranuleSize(outGranule), WithCompression(compress.AlgorithmZSTD)}
+
+	var second *StreamWriter
+
+	first := NewStreamWriter(opts...)
+	require.NoError(t, first.AddColumn(Column{Name: "b", Kind: KindBytes, Block: true}))
+
+	wk := newWalker(t, d, first, 0)
+	stale := wk.shared
+
+	for blk := range d.NumBlocks() {
+		lo, hi := d.BlockSpan(blk)
+
+		switch {
+		case hi <= cut:
+			wk.granule(t, blk, 0, hi-lo)
+		case lo < cut:
+			wk.granule(t, blk, 0, cut-lo)
+
+			part := buildStream(t, first)
+			assert.Equal(t, batchObjects(t, vals[:cut], opts), part.objects)
+
+			sharedEntries, sharedGen := d.SharedEntries()
+			require.ErrorIs(t, stale.Bind(sharedEntries, sharedGen), errWriterFinished)
+
+			second = NewStreamWriter(opts...)
+			require.NoError(t, second.AddColumn(Column{Name: "b", Kind: KindBytes, Block: true}))
+
+			wk = newWalker(t, d, second, 0)
+			wk.granule(t, blk, cut-lo, hi-lo)
+		default:
+			wk.granule(t, blk, 0, hi-lo)
+		}
+	}
+
+	require.NotNil(t, second)
+	assert.Equal(t, batchObjects(t, vals[cut:], opts), buildStream(t, second).objects)
+}
+
+func batchObjects(t *testing.T, vals [][]byte, opts []PartOption) [][]byte {
+	t.Helper()
+
+	w := NewPartWriter(opts...)
+	require.NoError(t, w.AddColumn(Column{Name: "b", Kind: KindBytes, Bytes: vals, Block: true}))
+
+	built, err := w.build()
+	require.NoError(t, err)
+
+	return built.objects
+}
+
+// TestBindingRejectsForeignTokens: a table is named by its owner's token, so a granule from another
+// decoder and the zero token are errors, never a silent mis-map.
+func TestBindingRejectsForeignTokens(t *testing.T) {
+	t.Parallel()
+
+	vals := transitionValues()
+	d := scanSource(t, vals, transitionGranule)
+	other := scanSource(t, vals, transitionGranule)
+
+	w := NewStreamWriter(WithGranuleSize(transitionGranule))
+	require.NoError(t, w.AddColumn(Column{Name: "b", Kind: KindBytes, Block: true}))
+
+	wk := newWalker(t, d, w, 0)
+
+	shared, err := d.DecodeBytesBlock(0)
+	require.NoError(t, err)
+	assert.True(t, sameToken(wk.sharedGen, shared.Table()))
+
+	otherShared, err := other.DecodeBytesBlock(0)
+	require.NoError(t, err)
+	assert.False(t, sameToken(shared.Table(), otherShared.Table()), "two decoders over one part never share a token")
+	require.Error(t, wk.shared.AppendDict(otherShared, 0, 1, nil), "another decoder's granule")
+	require.Error(t, wk.shared.AppendDict(DecodedGranule{}, 0, 1, nil), "the zero granule")
+	require.Error(t, wk.self.Bind(nil, DictGen{}), "binding the zero token")
+
+	otherSelf, err := other.DecodeBytesBlock(8)
+	require.NoError(t, err)
+
+	self, err := d.DecodeBytesBlock(8)
+	require.NoError(t, err)
+	assert.False(t, sameToken(otherSelf.Table(), self.Table()), "two decoders' self tokens differ")
+	assert.False(t, sameToken(wk.sharedGen, self.Table()), "a self granule gets its own token")
+	require.Error(t, wk.shared.AppendDict(self, 0, 1, nil))
+	require.Error(t, wk.self.BindStable(self.Column().Entries, self.Table()), "a frame-backed table cannot be kept by reference")
+
+	require.NoError(t, wk.self.Bind(self.Column().Entries, self.Table()))
+	require.NoError(t, wk.self.AppendDict(self, 0, 1, nil))
+}
+
+// TestBindingRejectsOverwrittenGranules is the stale-granule case: a decoded granule aliases the
+// decoder's frame, so once a later decode crosses a frame boundary it is dead even though the
+// binding still holds its table's token — a self granule's table and ids, and a shared granule's ids
+// alike. The shared dictionary's token itself survives, so fresh shared granules still append.
+func TestBindingRejectsOverwrittenGranules(t *testing.T) {
+	t.Parallel()
+
+	vals := transitionValues()
+	d := scanSource(t, vals, transitionGranule)
+	other := scanSource(t, vals, transitionGranule)
+
+	w := NewStreamWriter(WithGranuleSize(transitionGranule))
+	require.NoError(t, w.AddColumn(Column{Name: "b", Kind: KindBytes, Block: true}))
+
+	wk := newWalker(t, d, w, 0)
+
+	self, err := d.DecodeBytesBlock(8)
+	require.NoError(t, err)
+	require.NoError(t, wk.self.Bind(self.Column().Entries, self.Table()))
+	require.NoError(t, wk.self.AppendDict(self, 0, 1, nil))
+
+	sharedA, err := d.DecodeBytesBlock(0)
+	require.NoError(t, err)
+	require.Error(t, wk.self.AppendDict(self, 1, 2, nil), "an overwritten self table")
+	require.Error(t, wk.self.Bind(self.Column().Entries, self.Table()), "rebinding a retired token")
+	require.NoError(t, wk.shared.AppendDict(sharedA, 0, 1, nil))
+
+	require.NotEqual(t, d.streams.dir.frameOf(0), d.streams.dir.frameOf(11), "the next decode crosses a frame")
+
+	next, err := d.DecodeBytesBlock(11)
+	require.NoError(t, err)
+	require.NotNil(t, next.dc)
+	require.Error(t, wk.shared.AppendDict(sharedA, 1, 2, nil),
+		"a shared granule whose frame was reused, under the live shared token")
+
+	sharedB, err := d.DecodeBytesBlock(9)
+	require.NoError(t, err)
+
+	foreign, err := other.DecodeBytesBlock(9)
+	require.NoError(t, err)
+
+	stale := sharedA.dc
+	for name, g := range map[string]DecodedGranule{
+		"with no lease":            {dc: stale, table: sharedA.Table()},
+		"with the live granule's":  {dc: stale, table: sharedA.Table(), lease: sharedB.lease},
+		"with a foreign decoder's": {dc: stale, table: sharedA.Table(), lease: foreign.lease},
+		"as an owned column":       OwnedGranule(stale, sharedA.Table()),
+	} {
+		require.Error(t, wk.shared.AppendDict(g, 0, 1, nil), "a stale shared column %s lease", name)
+	}
+
+	require.True(t, sameToken(wk.sharedGen, sharedB.Table()), "one shared token for the decoder's life")
+	require.NoError(t, wk.shared.AppendDict(sharedB, 0, 2, nil), "self decodes leave the shared token live")
+
+	_, gen2 := d.SharedEntries()
+	assert.True(t, sameToken(wk.sharedGen, gen2))
+}
+
+// TestBindingColumnTransplant: a caller cannot put a stale column under a live granule. Column hands
+// back a copy of the header, so the transplant — copy granule A's column, decode B, write the copy
+// through B's column — has no pointer to write through; overwriting the copy leaves what a binding
+// reads from B unchanged, and B still appends its own rows.
+func TestBindingColumnTransplant(t *testing.T) {
+	t.Parallel()
+
+	vals := transitionValues()
+	d := scanSource(t, vals, transitionGranule)
+
+	w := NewStreamWriter(WithGranuleSize(transitionGranule))
+	require.NoError(t, w.AddColumn(Column{Name: "b", Kind: KindBytes, Block: true}))
+
+	wk := newWalker(t, d, w, 0)
+
+	a, err := d.DecodeBytesBlock(0)
+	require.NoError(t, err)
+
+	staleA := a.Column()
+
+	b, err := d.DecodeBytesBlock(9)
+	require.NoError(t, err)
+
+	transplanted := b.Column()
+	transplanted.IDs, transplanted.IDWidth = staleA.IDs, staleA.IDWidth
+	require.NotEqual(t, transplanted.IDWidth, b.Column().IDWidth, "A is narrow, B wide: the copies differ")
+	assert.Same(t, b.dc, b.lease.dc, "B's column is untouched")
+
+	require.NoError(t, wk.shared.AppendDict(b, 0, transitionGranule, nil))
+
+	want := batchObjects(t, vals[9*transitionGranule:10*transitionGranule], []PartOption{WithGranuleSize(transitionGranule)})
+	assert.Equal(t, want, buildStream(t, w).objects, "B's own rows were appended")
+}
+
+// TestBindingAppendDictRejects covers AppendDict's argument checks.
+func TestBindingAppendDictRejects(t *testing.T) {
+	t.Parallel()
+
+	w := NewStreamWriter(WithGranuleSize(4))
+	require.NoError(t, w.AddColumn(Column{Name: "b", Kind: KindBytes, Block: true}))
+
+	b, err := w.Binding(0)
+	require.NoError(t, err)
+
+	entries := valuesOf(3, func(i int) string { return fmt.Sprint("e", i) })
+	gen := NewDictGen()
+	require.NoError(t, b.Bind(entries, gen))
+
+	dc := &chunk.DictColumn{Entries: entries, IDs: []byte{0, 1, 2, 1}, IDWidth: 1}
+
+	require.Error(t, b.AppendDict(OwnedGranule(dc, gen), -1, 2, nil), "negative lo")
+	require.Error(t, b.AppendDict(OwnedGranule(dc, gen), 3, 2, nil), "hi below lo")
+	require.Error(t, b.AppendDict(OwnedGranule(dc, gen), 0, 5, nil), "past the rows")
+	require.Error(t, b.AppendDict(OwnedGranule(dc, gen), 0, 2, []bool{true}), "keep of the wrong length")
+	require.Error(t, b.AppendDict(OwnedGranule(&chunk.DictColumn{Entries: entries, IDs: []byte{0, 0, 0}, IDWidth: 3}, gen), 0, 1, nil), "id width 3")
+	require.Error(t, b.AppendDict(OwnedGranule(&chunk.DictColumn{Entries: entries[:2], IDs: []byte{0}, IDWidth: 1}, gen), 0, 1, nil), "another table's size")
+	require.ErrorIs(t, b.AppendDict(OwnedGranule(&chunk.DictColumn{Entries: entries, IDs: []byte{7}, IDWidth: 1}, gen), 0, 1, nil), ErrCorrupt)
+	require.NoError(t, b.AppendDict(OwnedGranule(dc, gen), 0, 4, []bool{true, false, true, true}))
+	assert.Equal(t, 3, w.Rows())
+}
+
+// TestBindingIDWidths feeds the same rows at every id width and flat, against [PartWriter].
+func TestBindingIDWidths(t *testing.T) {
+	t.Parallel()
+
+	entries := make([][]byte, 0, 300)
+	for i := range 300 {
+		entries = append(entries, fmt.Appendf(nil, "entry-%d", i))
+	}
+
+	vals := make([][]byte, 0, 96)
+	for i := range 96 {
+		vals = append(vals, entries[(i*7)%12])
+	}
+
+	want := batchObjects(t, vals, []PartOption{WithGranuleSize(16)})
+
+	for _, width := range []int{0, 1, 2} {
+		t.Run(strconv.Itoa(width), func(t *testing.T) {
+			t.Parallel()
+
+			w := NewStreamWriter(WithGranuleSize(16))
+			require.NoError(t, w.AddColumn(Column{Name: "b", Kind: KindBytes, Block: true}))
+
+			b, err := w.Binding(0)
+			require.NoError(t, err)
+
+			tab := entries[:12]
+			if width == 2 {
+				tab = entries
+			}
+
+			dc := idsColumn(tab, vals, func(v []byte) int {
+				for i, e := range tab {
+					if bytes.Equal(e, v) {
+						return i
+					}
+				}
+
+				return -1
+			})
+
+			if width == 0 {
+				dc, tab = &chunk.DictColumn{Entries: vals}, vals
+			}
+
+			require.Equal(t, width, dc.IDWidth)
+
+			gen := NewDictGen()
+			require.NoError(t, b.Bind(tab, gen))
+			require.NoError(t, b.AppendDict(OwnedGranule(dc, gen), 0, 40, nil))
+			require.NoError(t, b.AppendDict(OwnedGranule(dc, gen), 40, len(vals), nil))
+			assert.Equal(t, want, buildStream(t, w).objects)
+		})
+	}
+}
+
+// TestBindingSurvivesGenerationWrap pins the stamp epoch: when the granule generation wraps, every
+// cached stamp is cleared rather than read as current.
+func TestBindingSurvivesGenerationWrap(t *testing.T) {
+	t.Parallel()
+
+	vals := valuesOf(64, func(i int) string { return fmt.Sprint("v", (i*5)%9) })
+	want := batchObjects(t, vals, []PartOption{WithGranuleSize(8)})
+
+	w := NewStreamWriter(WithGranuleSize(8))
+	require.NoError(t, w.AddColumn(Column{Name: "b", Kind: KindBytes, Block: true}))
+	w.cols[0].bytes.g.gen = math.MaxUint32 - 2
+
+	b, err := w.Binding(0)
+	require.NoError(t, err)
+
+	entries, _ := splitBytesForm(vals)
+	dc := idsColumn(entries, vals, func(v []byte) int {
+		for i, e := range entries {
+			if bytes.Equal(e, v) {
+				return i
+			}
+		}
+
+		return -1
+	})
+
+	gen := NewDictGen()
+	require.NoError(t, b.Bind(entries, gen))
+
+	for lo := 0; lo < len(vals); lo += 5 {
+		require.NoError(t, b.AppendDict(OwnedGranule(dc, gen), lo, min(lo+5, len(vals)), nil))
+	}
+
+	assert.Equal(t, uint32(1), w.cols[0].bytes.g.epoch)
+	assert.Equal(t, want, buildStream(t, w).objects)
+}
+
+// TestBindingRawColumn: a binding to a raw column appends each row's value.
+func TestBindingRawColumn(t *testing.T) {
+	t.Parallel()
+
+	vals := valuesOf(20, func(i int) string { return fmt.Sprint("r", i%3) })
+
+	pw := NewPartWriter(WithGranuleSize(8))
+	require.NoError(t, pw.AddColumn(Column{Name: "b", Kind: KindBytes, Codec: chunk.CodecBytesRaw, Bytes: vals, Block: true}))
+	want, err := pw.build()
+	require.NoError(t, err)
+
+	w := NewStreamWriter(WithGranuleSize(8))
+	require.NoError(t, w.AddColumn(Column{Name: "b", Kind: KindBytes, Codec: chunk.CodecBytesRaw, Block: true}))
+
+	b, err := w.Binding(0)
+	require.NoError(t, err)
+
+	tab := valuesOf(3, func(i int) string { return fmt.Sprint("r", i) })
+	gen := NewDictGen()
+	require.NoError(t, b.Bind(tab, gen))
+	require.NoError(t, b.AppendDict(OwnedGranule(idsColumn(tab, vals, func(v []byte) int { return int(v[1] - '0') }), gen), 0, len(vals), nil))
+	assert.Equal(t, want.objects, buildStream(t, w).objects)
+}
+
+// sameToken compares by owner identity; testify's Equal would compare the owners' contents.
+func sameToken(a, b DictGen) bool { return a == b }

@@ -67,6 +67,19 @@ type Column struct {
 	// float64) are blockable — the metric ts/value/sf columns. The zero value keeps the prior
 	// single-stream layout. See blockcolumn.go.
 	Block bool
+	// Observer, when set, is told the values the writer encodes. Valid only on a block-framed
+	// [KindBytes] [chunk.CodecDict] column.
+	Observer BytesObserver
+}
+
+// checkObserver rejects an Observer on a column that has no dictionary granules to report.
+func (c Column) checkObserver(codec chunk.Codec) error {
+	if c.Observer == nil || (c.Kind == KindBytes && codec == chunk.CodecDict && c.Block) {
+		return nil
+	}
+
+	return errors.Errorf("block: column %q: an observer needs a block-framed %s %s column",
+		c.Name, KindBytes, chunk.CodecDict)
 }
 
 // rows returns the column's row count from the active typed slice.
@@ -959,13 +972,14 @@ func (r *ColumnReader) BlockDecoder() (*Decoder, error) {
 	}
 
 	return &Decoder{
-		rows:    r.rows,
-		kind:    r.desc.Kind,
-		codec:   r.desc.Codec,
-		i64:     r.int64Decoder(),
-		f64:     r.float64Decoder(),
-		shared:  sd,
-		streams: newBlockStreams(dir, r.comp),
+		rows:     r.rows,
+		kind:     r.desc.Kind,
+		codec:    r.desc.Codec,
+		i64:      r.int64Decoder(),
+		f64:      r.float64Decoder(),
+		shared:   sd,
+		granules: dictOwner{framed: true},
+		streams:  newBlockStreams(dir, r.comp),
 	}, nil
 }
 
@@ -1150,12 +1164,20 @@ func buildFramedColumn(
 // buildDictColumn writes a dictionary bytes column under the trailer-dictionary layout, or as one
 // unframed stream when no granule joins the dictionary.
 func buildDictColumn(c Column, desc ColumnDesc, comp *compress.Compressor, l columnLayout) (ColumnDesc, []byte, error) {
+	if c.Observer != nil && l.blockRows <= 0 {
+		return ColumnDesc{}, nil, errors.Errorf("block: column %q: an observed column needs a positive granule size", c.Name)
+	}
+
 	obj, dict, sizing, ok, err := encodeTrailerDictBytes(c, comp, l, false)
 	if err != nil {
 		return ColumnDesc{}, nil, err
 	}
 
 	if !ok {
+		if c.Observer != nil {
+			c.Observer.Dictionary(nil, nil)
+		}
+
 		stream, err := encodeStream(c, chunk.CodecDict)
 		if err != nil {
 			return ColumnDesc{}, nil, err
