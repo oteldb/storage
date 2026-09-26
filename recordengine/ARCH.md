@@ -50,8 +50,10 @@ stale exemplars with their original timestamps makes every flush a straddler, an
 merged none of 12,735 such parts. The fix heals them but does not stop them being written; dropping
 re-exported exemplars at ingest is its own change. Record specifics:
 
-- A forward `partCursor` decodes only the timestamp column for a stream with no row in the window, so
-  a pass costs a decode of its own rows plus the timestamps.
+- The window is cut on the record timestamps read, unlike the metric engine's output cut: records are
+  never aggregated, so a pass holds no state another needs. A forward `partCursor` decodes only the
+  timestamp column for a stream with no row in the window, so a pass costs a decode of its own rows
+  plus the timestamps.
 - A side-store engine (profiles) writes the unioned symbol sidecar under each window's part, since
   each window's part is the one home a reader looks in.
 - A split merge takes about cap / part size straddlers. Measured on the stand's shape (655 stale

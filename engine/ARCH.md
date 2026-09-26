@@ -623,16 +623,23 @@ so each straddler is rewritten once.
 Batching is what converges a backlog: straddlers sharing their stale end write that end into one
 bucket, so one merge of N straddlers leaves roughly one part for the stale day plus one per fresh day
 it covers, not 2N. Straddlers go after the ladder because a split leaves fragments the ladder must
-absorb; a straddler that waits a cycle only joins the next batch. A window pass costs a decode of the
-rows inside it plus the timestamps outside: each pass reports the earliest sample past its end and
-the next starts there, so an empty day costs nothing.
+absorb; a straddler that waits a cycle only joins the next batch.
+
+**The window is cut on output timestamps.** Each pass merges and downsamples every series whole, then
+writes only the samples its day holds; the next pass starts at the earliest output past the day, so
+an empty day costs nothing. Cutting the *input* instead would break a rollup: intervals are
+unrestricted and aligned to absolute multiples, so a 7h bucket starting 21:00 holds samples from both
+sides of midnight, two input windows would each emit a partial aggregate at 21:00, and the read's
+freshest-wins dedup would keep one. A rollup lands at its bucket start, which falls in exactly one
+window, so the aggregate is whole. The cost is a decode of the whole input per written day, bounded
+by the cap and `maxMergeParts`. The first window is open below, because a rollup's bucket start can
+precede every sample it aggregates; the part it lands in then straddles and is split again the next
+cycle, where the rollup sits in its own day.
 
 The fragments of one split live in different day buckets and never merge together again, so their
 joint `bucketindex.Claim` is never folded back into an interval: a removed straddler is accounted for
 by `Index.Covered` over its fragments' successors, not by any single `Supersedes`, subject to the
-one-claim-per-output limit every split has. A downsample interval that does not divide a day can put
-a rollup timestamp before its window's start; the part it lands in straddles and is split again the
-next cycle, where the rollup sits in its own day.
+one-claim-per-output limit every split has.
 
 ### Run selection (`compact.go`)
 

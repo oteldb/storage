@@ -438,24 +438,28 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 // one top-level bucket.
 //
 // Sources spanning more than one top-level bucket — a straddler — are merged one bucket-wide window
-// at a time. Each pass reports the earliest sample past its window, which is where the next one
-// starts: a bucket with no samples costs no pass, and the passes cover [start, ∞) end to end.
+// at a time. The window is cut on the timestamps a series *writes*, after downsampling, not on the
+// ones it reads: every pass merges and rolls up each series whole, so a rollup bucket crossing a
+// window boundary aggregates all its samples in one pass instead of emitting two partial aggregates
+// at one timestamp. Each pass reports the earliest output past its window, which is where the next
+// one starts, so a bucket with nothing to write costs no pass. The first window is open below: a
+// rollup lands at its bucket start, which can precede every sample it aggregates.
 func (e *Engine) compactAligned(
 	ctx context.Context, src []*part, start, capBytes int64, opts MergeOptions,
 ) ([]*part, error) {
 	if !splitsOutput(src, start) {
-		out, _, err := e.compactStream(ctx, src, start, maxInt64, capBytes, opts)
+		out, _, err := e.compactStream(ctx, src, start, minInt64, maxInt64, capBytes, opts)
 
 		return out, err
 	}
 
 	lo, _ := spanOf(src)
-	end := bucketEnd(max(lo, start), topLevel())
+	from, end := minInt64, bucketEnd(max(lo, start), topLevel())
 
 	var out []*part
 
 	for {
-		parts, past, err := e.compactStream(ctx, src, start, end, capBytes, opts)
+		parts, past, err := e.compactStream(ctx, src, start, from, end, capBytes, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -466,11 +470,11 @@ func (e *Engine) compactAligned(
 			return out, nil
 		}
 
-		start, end = past.ts, bucketEnd(past.ts, topLevel())
+		from, end = past.ts, bucketEnd(past.ts, topLevel())
 	}
 }
 
-// pastEnd is the earliest sample time a windowed merge pass read past its window's end.
+// pastEnd is the earliest timestamp a windowed merge pass would have written past its window's end.
 type pastEnd struct {
 	ts int64
 	ok bool
@@ -482,8 +486,9 @@ func (p *pastEnd) note(ts int64) {
 	}
 }
 
-// compactStream merges the source parts' samples in [start, end], streaming both sides so neither
-// the whole merged dataset nor a whole output part is ever materialized: each source is read
+// compactStream merges the source parts' samples from start on and writes the merged, downsampled
+// samples whose timestamps lie in [from, end], streaming both sides so neither the whole merged
+// dataset nor a whole output part is ever materialized: each source is read
 // through a forward [partStream] decoding one series range at a time, and each merged series is
 // handed straight to a [partStreamWriter]. The merge therefore holds O(parts × (columns × read
 // window + one series range)) + the output writer's state. capBytes ≤ 0 writes a single output
@@ -492,7 +497,7 @@ func (p *pastEnd) note(ts int64) {
 // Series are visited in (series, ts) order; within a series the parts are visited oldest→newest so
 // a later part's value wins a duplicate timestamp, then the result is downsampled.
 func (e *Engine) compactStream(
-	ctx context.Context, src []*part, start, end, capBytes int64, opts MergeOptions,
+	ctx context.Context, src []*part, start, from, end, capBytes int64, opts MergeOptions,
 ) ([]*part, pastEnd, error) {
 	var (
 		keys mergestream.Keys
@@ -551,13 +556,14 @@ func (e *Engine) compactStream(
 	for keys.Next() {
 		id := keys.Key()
 
-		m, err := mergeStreamedSeries(ctx, src, streams, scratch, id, start, end, &past)
+		m, err := mergeStreamedSeries(ctx, src, streams, scratch, id, start)
 		if err != nil {
 			return nil, past, err
 		}
 
 		ts, values, sf := m.collect(nil, nil)
 		ts, values, sf = downsample(ts, values, sf, opts.Downsample)
+		ts, values, sf = clipOutput(ts, values, sf, from, end, &past)
 
 		if len(ts) == 0 {
 			continue
@@ -650,12 +656,26 @@ func rowCapFor(p *part, capBytes int64) int {
 	return max(int(capBytes*int64(rows)/size), 1)
 }
 
-// mergeStreamedSeries gathers one series' samples in [start, end] across the source parts (oldest →
-// newest, so a later part's value wins on a duplicate timestamp), each read through its forward
-// stream cursor, noting in past the earliest sample beyond end.
+// clipOutput keeps a series' merged samples in [from, end], noting in past the first one beyond end.
+// ts must be ascending.
+func clipOutput(ts []int64, values, sf []float64, from, end int64, past *pastEnd) ([]int64, []float64, []float64) {
+	lo, hi := lowerBound(ts, from), upperBound(ts, end)
+	if hi < len(ts) {
+		past.note(ts[hi])
+	}
+
+	if sf != nil {
+		sf = sf[lo:hi]
+	}
+
+	return ts[lo:hi], values[lo:hi], sf
+}
+
+// mergeStreamedSeries gathers one series' samples across the source parts (oldest → newest, so a
+// later part's value wins on a duplicate timestamp), each read through its forward stream cursor.
 func mergeStreamedSeries(
 	ctx context.Context, src []*part, streams []*partStream, scratch []rangeBuf,
-	id signal.SeriesID, start, end int64, past *pastEnd,
+	id signal.SeriesID, start int64,
 ) (sampleMerge, error) {
 	var m sampleMerge
 
@@ -674,11 +694,7 @@ func mergeStreamedSeries(
 			return m, err
 		}
 
-		m.add(ts, vals, sf, start, end)
-
-		if hi := upperBound(ts, end); hi < len(ts) {
-			past.note(ts[hi])
-		}
+		m.add(ts, vals, sf, start, maxInt64)
 	}
 
 	return m, nil

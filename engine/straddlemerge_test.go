@@ -12,6 +12,7 @@ import (
 
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/signal"
 )
 
 const (
@@ -129,6 +130,44 @@ func TestForceReachesStraddlers(t *testing.T) {
 
 	requireAligned(t, e)
 	assert.Equal(t, 2, e.PartCount(), "five straddlers of two days split into one part per day")
+}
+
+// TestSplitKeepsDownsampleBucketsWhole pins a rollup bucket crossing the day boundary a split cuts
+// on: a 7h grid puts 23:00 and 01:00 in one bucket starting at 21:00, and splitting the samples by
+// day would emit two partial aggregates at 21:00, of which the read keeps one.
+func TestSplitKeepsDownsampleBucketsWhole(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		agg  signal.Aggregation
+		want float64
+	}{
+		{signal.AggSum, 4},
+		{signal.AggCount, 2},
+		{signal.AggAvg, 2},
+		{signal.AggFirst, 1},
+		{signal.AggLast, 3},
+	} {
+		t.Run(tt.agg.String(), func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			e := flushEngine()
+			api := mkSeries("job", "api")
+
+			mustAppend(t, e, api, straddleDay-straddleHour, 1)
+			mustAppend(t, e, api, straddleDay+straddleHour, 3)
+			require.NoError(t, e.Flush(ctx))
+
+			tiers := []engine.DownsampleTier{{Before: 1 << 62, Interval: 7 * straddleHour, Agg: tt.agg}}
+			require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Downsample: tiers}))
+
+			got := fetchOne(t, e, "api")
+			assert.Equal(t, []int64{21 * straddleHour}, got.Timestamps)
+			assert.Equal(t, []float64{tt.want}, got.Values)
+			requireAligned(t, e)
+		})
+	}
 }
 
 // TestRetentionSplitsStraddler checks a retention rewrite of a straddler both drops the expired
