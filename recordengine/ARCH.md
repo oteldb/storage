@@ -44,18 +44,21 @@ record row carries far more bytes than a sample, so opening an unneeded part cos
 
 **Straddlers are split on day boundaries**, as in the metric engine (`../engine/ARCH.md`, "A straddler
 is split, never grouped"): `selectStraddlers` batches parts that fit no level oldest-first up to the
-cap, after forced rewrites and the ladder, and `compactParts` writes any merge spanning more than one
-day one day-wide window at a time. Records are where this bites: an exemplar producer re-exporting
+cap, after forced rewrites and the ladder, and `compactParts` routes each stream's rows to a buffer
+per day in one pass over the sources. Records are where this bites: an exemplar producer re-exporting
 stale exemplars with their original timestamps makes every flush a straddler, and the ladder alone
 merged none of 12,735 such parts. The fix heals them but does not stop them being written; dropping
 re-exported exemplars at ingest is its own change. Record specifics:
 
-- The window is cut on the record timestamps read, unlike the metric engine's output cut: records are
-  never aggregated, so a pass holds no state another needs. A forward `partCursor` decodes only the
-  timestamp column for a stream with no row in the window, so a pass costs a decode of its own rows
-  plus the timestamps.
-- A side-store engine (profiles) writes the unioned symbol sidecar under each window's part, since
-  each window's part is the one home a reader looks in.
+- The day buffers share the merge's byte-column carry: one union dictionary per column, which a
+  fallback to the flat carry expands in every buffer. Only the first buffer is pre-sized to a part;
+  the rest grow, so the buffers together hold what the resident budget allows rather than a part each.
+- A side-store engine (profiles) writes the unioned symbol sidecar under each day's part, since each is
+  the one home a reader looks in.
+- Measured on a 17-day batch (16 parts × 64 streams, hourly; `BenchmarkMergeStraddlers17Days`): per-day
+  passes read 16.6 MB from the backend, allocated 426 MB and took 246 ms; the single pass reads 1.0 MB,
+  allocates 156 MB and takes 166 ms, at a peak live heap of 90 MB against 52 MB with no cap set, the day
+  buffers together holding the whole batch.
 - A split merge takes about cap / part size straddlers. Measured on the stand's shape (655 stale
   records plus one fresh per part, ≈44 KiB decoded, 64 MiB cap): 4,000 straddlers converged to 6
   parts in 6 cycles — 3 split merges of ≈1,500, 3 ladder merges — in 4 s in memory.

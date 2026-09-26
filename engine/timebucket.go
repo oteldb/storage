@@ -23,10 +23,6 @@ var mergeLadder = timebucket.Ladder
 
 func bucketOf(ts, level int64) int64 { return timebucket.Of(ts, level) }
 
-func bucketEnd(ts, level int64) int64 { return timebucket.End(ts, level) }
-
-func topLevel() int64 { return timebucket.Top() }
-
 func partSpan(p *part) (lo, hi int64) { return p.minTime, p.maxTime }
 
 func fitsLevel(p *part, level int64) bool { return timebucket.Fits(p.minTime, p.maxTime, level) }
@@ -38,8 +34,8 @@ func finestLevel(p *part) (int64, bool) { return timebucket.Finest(p.minTime, p.
 
 func spanOf(parts []*part) (lo, hi int64) { return timebucket.Union(parts, partSpan) }
 
-// splitsOutput reports whether merging src from start on writes more than one top-level bucket, so
-// [Engine.compactAligned] must cut its output on bucket boundaries.
+// splitsOutput reports whether merging src from start on writes more than one top-level bucket, which
+// only [Engine.compactStream] cuts on.
 func splitsOutput(src []*part, start int64) bool { return timebucket.SplitsFrom(src, partSpan, start) }
 
 // selectStraddlers returns the straddlers to split this cycle, at most maxMergeParts of them.

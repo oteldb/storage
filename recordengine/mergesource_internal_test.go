@@ -53,7 +53,7 @@ func newTestCarry(t *testing.T, schema *Schema, sources int) (*mergeCarry, *reco
 	buf := newRecordCols(schema, 0, fullSel(schema))
 	m := &mergeCarry{
 		dicts: make([]*mergeDict, schema.numBytes()), lazy: make([]int, schema.numBytes()),
-		acc: acc, buf: buf, maxEntries: sources * mergeUnionEntriesPerSource,
+		acc: acc, bufs: []*recordCols{buf}, maxEntries: sources * mergeUnionEntriesPerSource,
 	}
 
 	for k := range m.dicts {

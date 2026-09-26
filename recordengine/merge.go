@@ -11,7 +11,9 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/internal/mergestream"
+	"github.com/oteldb/storage/internal/timebucket"
 )
 
 // Merge runs one size-tiered compaction cycle, dropping records older than retainFrom (retention;
@@ -344,64 +346,20 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 	return writeSidecars(ctx, e.cfg.Backend, newPrefix, stored)
 }
 
-// compactParts compacts the selected source parts into bounded output part(s), dropping records
-// older than start (retention). Returns the new parts (empty when retention dropped every record).
-// Reads the parts off the engine lock; src is the immutable snapshot the caller planned over.
-//
-// Sources spanning more than one top-level bucket — a straddler — are compacted one bucket-wide
-// window at a time, so no output part crosses a top-level boundary and every output fits a ladder
-// level. Each pass reports the earliest record past its window, which is where the next one starts:
-// a bucket with no records costs no pass, and the passes cover [start, ∞) end to end.
+// compactParts compacts the selected source parts into bounded output part(s): it reads every stream's
+// records from start on (retention) from each part, concatenates them across parts, re-sorts each
+// stream by ts, and routes its rows by timestamp to a buffer per day ([timebucket.Router]), writing a
+// buffer out as a part whenever the buffers' *decoded* bytes reach capBytes between them — so each
+// output part stays within the cap and fits one day, never O(dataset), in one pass over the sources.
+// A source is read forward a granule at a time per column ([partCursor]) unless its layout rules that
+// out, when it is decoded whole. When the engine has a side store (profiles) a day is written as a
+// single part (no cap split) so the unioned symbol sidecar has one home per day. Returns the new parts
+// (empty when retention dropped every record). Reads the parts off the engine lock; src is the
+// immutable snapshot the caller planned over.
 func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes int64) ([]*part, error) {
-	if !splitsOutput(src, start) {
-		out, _, err := e.compactWindow(ctx, src, start, maxInt64, capBytes)
-
-		return out, err
-	}
-
-	lo, _ := spanOf(src)
-	end := bucketEnd(max(lo, start), topLevel())
-
-	var out []*part
-
-	for {
-		parts, past, err := e.compactWindow(ctx, src, start, end, capBytes)
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, parts...)
-
-		if !past.ok {
-			return out, nil
-		}
-
-		start, end = past.ts, bucketEnd(past.ts, topLevel())
-	}
-}
-
-// pastEnd is the earliest record time a windowed merge pass read past its window's end.
-type pastEnd struct {
-	ts int64
-	ok bool
-}
-
-func (p *pastEnd) note(ts int64) {
-	if !p.ok || ts < p.ts {
-		p.ts, p.ok = ts, true
-	}
-}
-
-// compactWindow compacts the sources' records in [start, end]: it concatenates each stream's
-// records across parts, re-sorts them by ts, and writes a new part whenever the accumulated
-// *decoded* bytes reach capBytes — so each output part stays within the cap, never O(dataset). A
-// source is read forward a granule at a time per column ([partCursor]) unless its layout rules that
-// out, when it is decoded whole. When the engine has a side store (profiles) a window is written as
-// a single part (no cap split) so the unioned symbol sidecar has one home per window.
-func (e *Engine) compactWindow(ctx context.Context, src []*part, start, end, capBytes int64) ([]*part, pastEnd, error) {
 	budget := e.mergeBudget(capBytes)
 
-	// One output buffer, re-armed after each part instead of allocated fresh, and one accumulator,
+	// Output buffers are re-armed after each part instead of allocated fresh, and the accumulator is
 	// re-armed per stream: a merge visits every stream of the selected parts (tens of thousands on real
 	// log data), so allocating either anew churned a part's worth of column buffers — and their
 	// doubling growth — through the GC.
@@ -416,34 +374,20 @@ func (e *Engine) compactWindow(ctx context.Context, src []*part, start, end, cap
 
 	sources, err := e.openMergeSources(ctx, src, carry)
 	if err != nil {
-		return nil, pastEnd{}, err
+		return nil, err
 	}
 
-	// Pre-sized from the sources: a byte column starting from nothing doubles its way to the seal
-	// threshold, re-copying a part's worth of bodies at every step.
+	// The first buffer is pre-sized from the sources: a byte column starting from nothing doubles its
+	// way to the seal threshold, re-copying a part's worth of bodies at every step. A merge touching
+	// several days grows the others instead, so the buffers never reserve more than one part.
 	bufRows, bufBlob := mergeShape(e.cfg.Schema, src, capBytes)
 	buf.reset(e.cfg.Schema, bufRows, bufBlob)
 	carry.flatBlob = bufBlob
 
 	var newParts []*part
 
-	emit := func() error {
-		if buf.len() == 0 {
-			return nil
-		}
-
-		p, err := e.writeMergedPart(ctx, src, buf)
-		if err != nil {
-			return err
-		}
-
-		newParts = append(newParts, p)
-		// The written part is read back from the backend, so nothing outlives the call holding the
-		// buffer's arrays: the next part reuses them at the size the first one settled on.
-		buf.reset(e.cfg.Schema, bufRows, bufBlob)
-
-		return nil
-	}
+	router := e.dayBuffers(ctx, src, buf, carry, budget.ResidentBytes, &newParts)
+	defer router.Drop(func(*flushColumns) {})
 
 	var keys mergestream.Keys
 
@@ -460,8 +404,8 @@ func (e *Engine) compactWindow(ctx context.Context, src []*part, start, end, cap
 		// Oldest → newest part order; records are append-only (no dedup), so the stream is just
 		// concatenated across parts and re-sorted by ts below.
 		for _, s := range sources {
-			if err := s.appendStream(acc, id, start, end); err != nil {
-				return nil, pastEnd{}, err
+			if err := s.appendStream(acc, id, start, maxInt64); err != nil {
+				return nil, err
 			}
 		}
 
@@ -471,44 +415,95 @@ func (e *Engine) compactWindow(ctx context.Context, src []*part, start, end, cap
 
 		acc.sortByTs()
 
-		u := idToU128(id)
-		for range acc.ts {
-			buf.stream = append(buf.stream, u)
+		if err := routeStream(router, acc, idToU128(id)); err != nil {
+			return nil, err
 		}
 
-		// The stream's rows are contiguous in both buffers, so they move as one blob copy per column
-		// rather than a cell-at-a-time append.
-		buf.cols.appendRange(acc, 0, acc.len())
-
-		// Flush a full part once the buffer reaches the cap, measured in the decoded bytes it actually
-		// holds rather than in rows times an assumed row size — records are variable-width, so a row
-		// count is only as good as that assumption. A stream whose own run overshoots the cap is split
-		// at the next stream boundary (parts are independent; the read seam concatenates a stream
-		// spanning parts), keeping the buffer at ≈ one part regardless of a heavy stream.
-		if budget.Reached(0, buf.byteSize()) {
-			if err := emit(); err != nil {
-				return nil, pastEnd{}, err
-			}
+		// Flush a full part once the buffers reach the cap, measured in the decoded bytes they
+		// actually hold rather than in rows times an assumed row size — records are variable-width,
+		// so a row count is only as good as that assumption. A stream whose own run overshoots the
+		// cap is split at the next stream boundary (parts are independent; the read seam concatenates
+		// a stream spanning parts), keeping the buffers at ≈ one part regardless of a heavy stream.
+		if err := router.Shed(); err != nil {
+			return nil, err
 		}
 	}
 
 	if err := checkDrained(src, sources); err != nil {
-		return nil, pastEnd{}, err
+		return nil, err
 	}
 
-	if err := emit(); err != nil {
-		return nil, pastEnd{}, err
+	if err := router.Close(); err != nil {
+		return nil, err
 	}
 
-	var past pastEnd
+	return newParts, nil
+}
 
-	for _, s := range sources {
-		if p := s.readPast(); p.ok {
-			past.note(p.ts)
+// dayBuffers routes a merge's rows to an output buffer per day, writing a buffer out as a part of
+// src into out when the router finishes it. first is the merge's pre-sized buffer; the rest are
+// armed on carry as they open and recycled once written.
+func (e *Engine) dayBuffers(
+	ctx context.Context, src []*part, first *flushColumns, carry *mergeCarry, limit int64, out *[]*part,
+) *timebucket.Router[*flushColumns] {
+	free := []*flushColumns{first}
+	noBlob := make([]int, e.cfg.Schema.numBytes())
+
+	return &timebucket.Router[*flushColumns]{
+		Open: func(int64) (*flushColumns, error) {
+			if n := len(free); n > 0 {
+				f := free[n-1]
+				free = free[:n-1]
+
+				return f, nil
+			}
+
+			f := &flushColumns{cols: newRecordCols(e.cfg.Schema, 0, fullSel(e.cfg.Schema))}
+			carry.arm(f.cols)
+			f.reset(e.cfg.Schema, 0, noBlob)
+
+			return f, nil
+		},
+		Finish: func(f *flushColumns) error {
+			if f.len() > 0 {
+				p, err := e.writeMergedPart(ctx, src, f)
+				if err != nil {
+					return err
+				}
+
+				*out = append(*out, p)
+			}
+
+			// The written part is read back from the backend, so nothing outlives the call holding
+			// the buffer's arrays: the next part reuses them at the size this one settled on.
+			f.reset(e.cfg.Schema, 0, noBlob)
+			free = append(free, f)
+
+			return nil
+		},
+		Resident:      (*flushColumns).byteSize,
+		MaxOpen:       timebucket.MaxOpenWriters,
+		ResidentLimit: limit,
+	}
+}
+
+// routeStream appends one ts-sorted stream to the buffers of the days its rows fall in. A day's rows
+// are contiguous, so each moves as one blob copy per column rather than a cell-at-a-time append.
+func routeStream(router *timebucket.Router[*flushColumns], acc *recordCols, u chunk.U128) error {
+	return timebucket.Runs(acc.ts, func(lo, hi int) error {
+		f, err := router.Writer(acc.ts[lo])
+		if err != nil {
+			return err
 		}
-	}
 
-	return newParts, past, nil
+		for range hi - lo {
+			f.stream = append(f.stream, u)
+		}
+
+		f.cols.appendRange(acc, lo, hi)
+
+		return nil
+	})
 }
 
 // writeMergedPart writes f as an output part, reads it back, stamps its time bounds, and — when the

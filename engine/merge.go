@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/internal/mergestream"
+	"github.com/oteldb/storage/internal/timebucket"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -177,26 +178,35 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	// source parts stay live (not retired) until publish, so they can't be reclaimed here.
 	var newParts []*part
 
+	var single *flushColumns
+
 	if len(selected) == 1 && !splitsOutput(selected, start) {
 		// A single forced part: decode it (bounded — one part), apply retention/downsample, and skip
 		// the rewrite if it is already at its target (the fixed point), avoiding backend churn.
-		var cols *flushColumns
-		if cols, err = e.compactParts(ctx, selected, start, opts.Downsample); err != nil {
+		if single, err = e.compactParts(ctx, selected, start, opts.Downsample); err != nil {
 			return mergeResult{parts: dropped}, err
 		}
 
 		p := selected[0]
-		if opts.RetainFrom <= 0 && len(cols.ts) == p.rows() &&
+		if opts.RetainFrom <= 0 && len(single.ts) == p.rows() &&
 			!recompressApplies(p, opts.Recompress) && !precisionApplies(p, opts.Precision) {
 			e.reclaimRetired(ctx)
 
 			return mergeResult{parts: dropped}, nil
 		}
 
-		if newParts, err = e.writeColumns(ctx, cols, rowCapFor(p, capBytes), opts); err != nil {
+		// A rollup lands at its bucket start, which can precede the part's day; only the streamed
+		// path cuts on days.
+		if lo, hi := colsTimeRange(single); !timebucket.Fits(lo, hi, timebucket.Top()) {
+			single = nil
+		}
+	}
+
+	if single != nil {
+		if newParts, err = e.writeColumns(ctx, single, rowCapFor(selected[0], capBytes), opts); err != nil {
 			return mergeResult{parts: dropped}, err
 		}
-	} else if newParts, err = e.compactAligned(ctx, selected, start, capBytes, opts); err != nil {
+	} else if newParts, err = e.compactStream(ctx, selected, start, capBytes, opts); err != nil {
 		return mergeResult{parts: dropped}, err
 	}
 
@@ -434,78 +444,23 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 	return cols, nil
 }
 
-// compactAligned merges the source parts from start on (retention) into output parts that each fit
-// one top-level bucket.
-//
-// Sources spanning more than one top-level bucket — a straddler — are merged one bucket-wide window
-// at a time. The window is cut on the timestamps a series *writes*, after downsampling, not on the
-// ones it reads: every pass merges and rolls up each series whole, so a rollup bucket crossing a
-// window boundary aggregates all its samples in one pass instead of emitting two partial aggregates
-// at one timestamp. Each pass reports the earliest output past its window, which is where the next
-// one starts, so a bucket with nothing to write costs no pass. The first window is open below: a
-// rollup lands at its bucket start, which can precede every sample it aggregates.
-func (e *Engine) compactAligned(
-	ctx context.Context, src []*part, start, capBytes int64, opts MergeOptions,
-) ([]*part, error) {
-	if !splitsOutput(src, start) {
-		out, _, err := e.compactStream(ctx, src, start, minInt64, maxInt64, capBytes, opts)
-
-		return out, err
-	}
-
-	lo, _ := spanOf(src)
-	from, end := minInt64, bucketEnd(max(lo, start), topLevel())
-
-	var out []*part
-
-	for {
-		parts, past, err := e.compactStream(ctx, src, start, from, end, capBytes, opts)
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, parts...)
-
-		if !past.ok {
-			return out, nil
-		}
-
-		from, end = past.ts, bucketEnd(past.ts, topLevel())
-	}
-}
-
-// pastEnd is the earliest timestamp a windowed merge pass would have written past its window's end.
-type pastEnd struct {
-	ts int64
-	ok bool
-}
-
-func (p *pastEnd) note(ts int64) {
-	if !p.ok || ts < p.ts {
-		p.ts, p.ok = ts, true
-	}
-}
-
-// compactStream merges the source parts' samples from start on and writes the merged, downsampled
-// samples whose timestamps lie in [from, end], streaming both sides so neither the whole merged
-// dataset nor a whole output part is ever materialized: each source is read
+// compactStream merges several source parts from start on (retention), streaming both sides so
+// neither the whole merged dataset nor a whole output part is ever materialized: each source is read
 // through a forward [partStream] decoding one series range at a time, and each merged series is
 // handed straight to a [partStreamWriter]. The merge therefore holds O(parts × (columns × read
-// window + one series range)) + the output writer's state. capBytes ≤ 0 writes a single output
-// part.
+// window + one series range)) + the open writers' state. capBytes ≤ 0 writes one part per day.
 //
 // Series are visited in (series, ts) order; within a series the parts are visited oldest→newest so
-// a later part's value wins a duplicate timestamp, then the result is downsampled.
+// a later part's value wins a duplicate timestamp, then the result is downsampled. Its samples are
+// then routed by their own, post-downsampling timestamp to a writer per day ([timebucket.Router]),
+// so every output part fits a ladder level in one pass over the sources: a straddler's days, and a
+// rollup whose bucket starts on the day before its samples, each land in their own part.
 func (e *Engine) compactStream(
-	ctx context.Context, src []*part, start, from, end, capBytes int64, opts MergeOptions,
-) ([]*part, pastEnd, error) {
-	var (
-		keys mergestream.Keys
-		past pastEnd
-	)
-
+	ctx context.Context, src []*part, start, capBytes int64, opts MergeOptions,
+) ([]*part, error) {
+	var keys mergestream.Keys
 	if err := mergeKeys(ctx, src, &keys); err != nil {
-		return nil, past, err
+		return nil, err
 	}
 
 	// One forward cursor per source part; one reusable per-part destination per series range.
@@ -513,7 +468,7 @@ func (e *Engine) compactStream(
 	for i, p := range src {
 		s, err := newPartStream(ctx, p, e.mergeReadWindow)
 		if err != nil {
-			return nil, past, err
+			return nil, err
 		}
 
 		streams[i] = s
@@ -523,84 +478,87 @@ func (e *Engine) compactStream(
 	comp, precision, withSF := mergeEncoding(src, capBytes, opts)
 	budget := e.mergeBudget(capBytes)
 
-	var (
-		newParts []*part
-		cur      *partStreamWriter
-	)
+	var newParts []*part
+
+	router := timebucket.Router[*partStreamWriter]{
+		Open: func(int64) (*partStreamWriter, error) {
+			return newPartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats)
+		},
+		Finish: func(w *partStreamWriter) error {
+			p, err := w.finish(ctx)
+			if err != nil {
+				return err
+			}
+
+			newParts = append(newParts, p)
+
+			return nil
+		},
+		Resident:      (*partStreamWriter).residentBytes,
+		MaxOpen:       timebucket.MaxOpenWriters,
+		ResidentLimit: budget.ResidentBytes,
+	}
 
 	// A part under way holds column objects the backend has not published yet; leaving on any path
-	// but emit must release them rather than strand them.
-	defer func() {
-		if cur != nil {
-			cur.abort()
-		}
-	}()
-
-	emit := func() error {
-		if cur == nil {
-			return nil
-		}
-
-		p, err := cur.finish(ctx)
-		cur = nil
-
-		if err != nil {
-			return err
-		}
-
-		newParts = append(newParts, p)
-
-		return nil
-	}
+	// but Close must release them rather than strand them.
+	defer router.Drop((*partStreamWriter).abort)
 
 	for keys.Next() {
 		id := keys.Key()
 
 		m, err := mergeStreamedSeries(ctx, src, streams, scratch, id, start)
 		if err != nil {
-			return nil, past, err
+			return nil, err
 		}
 
 		ts, values, sf := m.collect(nil, nil)
 		ts, values, sf = downsample(ts, values, sf, opts.Downsample)
-		ts, values, sf = clipOutput(ts, values, sf, from, end, &past)
 
-		if len(ts) == 0 {
-			continue
-		}
+		u := idToU128(id)
 
-		if cur == nil {
-			if cur, err = newPartStreamWriter(
-				ctx, e, comp, precision, withSF, e.cfg.AggregateStats,
-			); err != nil {
-				return nil, past, err
+		err = timebucket.Runs(ts, func(lo, hi int) error {
+			w, err := router.Writer(ts[lo])
+			if err != nil {
+				return err
 			}
-		}
 
-		if err := cur.appendSeries(idToU128(id), ts, values, sf); err != nil {
-			return nil, past, err
-		}
-
-		// Sealing on what has actually been written, rather than on rows times an assumed
-		// bytes-per-row, is what makes the cap comparable to the free space it comes from. A series
-		// overshooting the cap is split at the next series boundary — parts are independent, and
-		// the read seam merges a series spanning two.
-		//
-		// The second bound is the part's resident footprint, which is not a function of its size on
-		// disk: the per-series sidecars grow with distinct series, so a merge of very short series
-		// reaches the memory budget long before the disk cap.
-		if budget.Reached(cur.encodedBytes(), cur.residentBytes()) {
-			if err := emit(); err != nil {
-				return nil, past, err
+			var runSF []float64
+			if sf != nil {
+				runSF = sf[lo:hi]
 			}
+
+			if err := w.appendSeries(u, ts[lo:hi], values[lo:hi], runSF); err != nil {
+				return err
+			}
+
+			// Sealing on what has actually been written, rather than on rows times an assumed
+			// bytes-per-row, is what makes the cap comparable to the free space it comes from. A
+			// series overshooting the cap is split at the next series boundary — parts are
+			// independent, and the read seam merges a series spanning two.
+			//
+			// The second bound is the part's resident footprint, which is not a function of its
+			// size on disk: the per-series sidecars grow with distinct series, so a merge of very
+			// short series reaches the memory budget long before the disk cap.
+			if budget.Reached(w.encodedBytes(), w.residentBytes()) {
+				return router.Seal(ts[lo])
+			}
+
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		if err := router.Shed(); err != nil {
+			return nil, err
 		}
 	}
 
-	if err := emit(); err != nil {
-		return nil, past, err
+	if err := router.Close(); err != nil {
+		return nil, err
 	}
 
-	return newParts, past, nil
+	return newParts, nil
 }
 
 // mergeEncoding fixes what a streamed merge's output parts are encoded under. The decisions must be
@@ -654,21 +612,6 @@ func rowCapFor(p *part, capBytes int64) int {
 	}
 
 	return max(int(capBytes*int64(rows)/size), 1)
-}
-
-// clipOutput keeps a series' merged samples in [from, end], noting in past the first one beyond end.
-// ts must be ascending.
-func clipOutput(ts []int64, values, sf []float64, from, end int64, past *pastEnd) ([]int64, []float64, []float64) {
-	lo, hi := lowerBound(ts, from), upperBound(ts, end)
-	if hi < len(ts) {
-		past.note(ts[hi])
-	}
-
-	if sf != nil {
-		sf = sf[lo:hi]
-	}
-
-	return ts[lo:hi], values[lo:hi], sf
 }
 
 // mergeStreamedSeries gathers one series' samples across the source parts (oldest → newest, so a

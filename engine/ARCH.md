@@ -611,9 +611,9 @@ that crosses a day boundary — a straddler, which fits no ladder level and join
 cannot merge through the ladder at any count or size: a live stand held 12,735 exemplar parts spanning
 290–334h each (a producer re-exporting week-old exemplars every minute) and merged none of them in days.
 The selector therefore takes straddlers as a third kind of work, after forced rewrites and the ladder
-(`selectStraddlers`): oldest first, batched up to the cap and `maxMergeParts`. Every merge whose inputs
-span more than one day bucket — a straddler batch, or a forced rewrite of one — writes its output one
-day-wide window at a time (`compactAligned`), so **every merge output fits a level**, which is the
+(`selectStraddlers`): oldest first, batched up to the cap and `maxMergeParts`. Every merge routes each
+output sample to a writer for its day (`timebucket.Router`), so **every merge output fits a level**,
+which is the
 invariant the shared suite's `StraddlingPartsCompact` and `MergeConvergesWithStraddlers` pin against
 both engines. A straddler's samples land in the buckets
 they belong to and the ladder folds them into their neighbours; no part a merge writes is a straddler,
@@ -630,16 +630,21 @@ bucket, so one merge of N straddlers leaves roughly one part for the stale day p
 it covers, not 2N. Straddlers go after the ladder because a split leaves fragments the ladder must
 absorb; a straddler that waits a cycle only joins the next batch.
 
-**The window is cut on output timestamps.** Each pass merges and downsamples every series whole, then
-writes only the samples its day holds; the next pass starts at the earliest output past the day, so
-an empty day costs nothing. Cutting the *input* instead would break a rollup: intervals are
-unrestricted and aligned to absolute multiples, so a 7h bucket starting 21:00 holds samples from both
-sides of midnight, two input windows would each emit a partial aggregate at 21:00, and the read's
-freshest-wins dedup would keep one. A rollup lands at its bucket start, which falls in exactly one
-window, so the aggregate is whole. The cost is a decode of the whole input per written day, bounded
-by the cap and `maxMergeParts`. The first window is open below, because a rollup's bucket start can
-precede every sample it aggregates; the part it lands in then straddles and is split again the next
-cycle, where the rollup sits in its own day.
+**One pass, routed on output timestamps.** The merge decodes each source once, merges and downsamples
+every series whole, and hands each day's run of the result to that day's writer. Routing on the
+*output* is what keeps a rollup whole and in its own day: intervals are unrestricted and aligned to
+absolute multiples, so a 7h bucket starting 21:00 aggregates samples from both sides of midnight and
+lands on the earlier day. Cutting the input by day would emit two partial aggregates at 21:00 (the
+read keeps one); keeping a rollup in a part with younger raw samples of the next day would leave a
+straddler whose re-merge re-counts a `Count` representative as 1.
+
+At most `timebucket.MaxOpenWriters` (32) writers are open, and together they stay under the merge's
+resident budget; past either the largest is finished early, so a day may get several parts, each still
+day-aligned, which the ladder folds together later. A per-day pass structure costs a full decode per
+day written instead. Measured on a 17-day batch (16 parts × 64 series, hourly;
+`BenchmarkMergeStraddlers17Days`, in memory): per-day passes read 13.1 MB from the backend, allocated
+232 MB and took 628 ms; the single pass reads 0.79 MB, allocates 86 MB and takes 62 ms, at a peak live
+heap of 42 MB against 14 MB, the 17 writers being open at once.
 
 The fragments of one split live in different day buckets and never merge together again, so their
 joint `bucketindex.Claim` is never folded back into an interval: a removed straddler is accounted for
