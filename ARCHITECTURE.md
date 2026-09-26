@@ -63,8 +63,9 @@ engines over the fetch seam (`query/fetch`).
   `WriteMetrics` also stores any exemplars its points carry, best-effort, into the separate
   exemplars record engine (`signal/exemplar`) — see below.
   Tenant is **derived** from Resource+Scope by the `Options.Tenant` callback, never passed.
-  An id whose first `/` segment is `wal` is reserved and its records are rejected
-  (`reserved_tenant`): no engine prefix may alias a WAL kept at `<backend root>/wal`.
+  An id whose first `/` segment is `wal` (any case), or that contains `\`, is reserved and its
+  records are rejected (`reserved_tenant`): no engine prefix may alias a WAL kept at
+  `<backend root>/wal`.
   Returns `Accepted{Accepted, Rejected, RejectedReason}` (OTLP partial success).
 - **Read** — `Fetcher(tenants...)` and the per-signal variants return a `fetch.Fetcher` over
   head ∪ parts; no tenants ⇒ all (cross-tenant fan-out, merged by series id). Plus the

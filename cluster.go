@@ -193,6 +193,10 @@ func (s *Storage) syncPartsResult(
 		return false, partsync.Stats{}, nil
 	}
 
+	if s.skipReserved(ctx, tid, string(tid)+signalPrefix, reservedSourcePartsync) {
+		return false, partsync.Stats{}, nil
+	}
+
 	local, remotes := s.shardOwners(tid)
 	if !local || len(remotes) == 0 {
 		return false, partsync.Stats{}, nil

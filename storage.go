@@ -1120,6 +1120,12 @@ func (s *Storage) recover(ctx context.Context) error {
 	exemplarSuffix := exemplarsPrefix + "/" + bucketindex.Object
 
 	for _, k := range keys {
+		if prefix, ok := strings.CutSuffix(k, "/"+bucketindex.Object); ok {
+			if tid, _, ok := splitEnginePrefix(prefix); ok && s.skipReserved(ctx, tid, prefix, reservedSourceRecovery) {
+				continue
+			}
+		}
+
 		switch {
 		case strings.HasSuffix(k, metricSuffix):
 			tid := signal.TenantID(strings.TrimSuffix(k, metricSuffix))
@@ -1201,8 +1207,13 @@ func (s *Storage) recoverWAL(ctx context.Context) error {
 			return err
 		}
 
+		tid := signal.TenantID(filepath.ToSlash(rel))
+		if s.skipReserved(ctx, tid, path, reservedSourceWAL) {
+			return nil
+		}
+
 		// A damaged segment does not fail this: the engines salvage it, counting each skipped region.
-		return replay(ctx, signal.TenantID(filepath.ToSlash(rel)), path)
+		return replay(ctx, tid, path)
 	})
 }
 

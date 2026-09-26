@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/internal/obs/obstest"
@@ -36,6 +37,10 @@ func TestTenantReserved(t *testing.T) {
 		"wal":        true,
 		"wal/logs":   true,
 		"wal/_s1":    true,
+		"WAL/logs":   true,
+		"Wal":        true,
+		`wal\logs`:   true,
+		`logs\x`:     true,
 		"walrus":     false,
 		"wal_":       false,
 		"x/wal":      false,
@@ -309,4 +314,145 @@ func TestReservedTenantCannotReachWAL(t *testing.T) {
 	info, err := os.Stat(victim)
 	require.NoError(t, err, "the WAL directory survives close")
 	assert.True(t, info.IsDir())
+}
+
+func TestPathsOverlapByIdentity(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("creating a symlink needs a privilege Windows test runners usually lack")
+	}
+
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	link := filepath.Join(dir, "link")
+	require.NoError(t, os.Mkdir(root, 0o750))
+	require.NoError(t, os.Symlink(root, link))
+
+	assert.True(t, pathsOverlap(filepath.Join(link, "wal", "x"), root), "a missing WAL below an alias of the root")
+	assert.True(t, pathsOverlap(root, link), "the root under another name")
+	assert.False(t, pathsOverlap(filepath.Join(dir, "wal"), root), "a sibling")
+	assert.False(t, pathsOverlap(filepath.Join(dir, "rootwal"), root), "a sibling sharing a name prefix")
+}
+
+func TestOpenRefusesWALInsideCaseAliasOfRoot(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	root := filepath.Join(dir, "Parts")
+	require.NoError(t, os.Mkdir(root, 0o750))
+
+	if _, err := os.Stat(filepath.Join(dir, "parts")); err != nil {
+		t.Skip("the temp filesystem is case-sensitive, so no case alias of the root exists")
+	}
+
+	be, err := file.New(root)
+	require.NoError(t, err)
+
+	_, err = Open(context.Background(), Options{}, WithBackend(be), WithWALDir(filepath.Join(dir, "parts", "wal")))
+	require.ErrorContains(t, err, "overlaps the backend directory")
+}
+
+// TestRecoverySkipsReservedTenant persists a tenant under the reserved id, as a release predating the
+// reservation could, both as flushed parts and as unflushed WAL segments. Open must still succeed and
+// serve every other tenant, leaving the reserved tenant's data where it is.
+func TestRecoverySkipsReservedTenant(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	root, walDir := t.TempDir(), t.TempDir()
+
+	open := func(opts ...Option) *Storage {
+		t.Helper()
+
+		be, err := file.New(root)
+		require.NoError(t, err)
+
+		s, err := Open(ctx, Options{}, append([]Option{
+			WithBackend(be), WithWALDir(walDir), WithFlushInterval(-1), WithTenant(tenantByService),
+		}, opts...)...)
+		require.NoError(t, err)
+
+		return s
+	}
+
+	s1 := open()
+	for _, svc := range []string{"legacy", "api"} {
+		_, err := s1.WriteMetrics(ctx, gaugeBatch(svc, "m", []int64{1}, []float64{1}))
+		require.NoError(t, err)
+		_, err = s1.WriteLogs(ctx, logBatch(svc, [3]any{1, 9, "flushed"}))
+		require.NoError(t, err)
+	}
+
+	s1.maintain(ctx)
+
+	for _, svc := range []string{"legacy", "api"} {
+		_, err := s1.WriteMetrics(ctx, gaugeBatch(svc, "m", []int64{2}, []float64{2}))
+		require.NoError(t, err)
+	}
+
+	crash(t, s1)
+
+	require.NoError(t, os.Rename(filepath.Join(root, "legacy"), filepath.Join(root, walTenant)))
+	require.NoError(t, os.Rename(filepath.Join(walDir, "legacy"), filepath.Join(walDir, walTenant)))
+
+	mp, m := obstest.Provider(t)
+	s2 := open(WithMeterProvider(mp))
+	t.Cleanup(func() { _ = s2.Close(ctx) })
+
+	batches := mustDrain(t, s2.Fetcher("api"), fetch.Request{Start: 0, End: 1 << 60, Matchers: []fetch.Matcher{nameMatcher("m")}})
+	require.Len(t, batches, 1)
+	assert.Equal(t, []int64{1, 2}, batches[0].Timestamps, "the other tenant serves its parts and its replayed WAL")
+
+	_, ok := s2.lookupEngine(walTenant)
+	assert.False(t, ok)
+	_, ok = s2.lookupLogEngine(walTenant)
+	assert.False(t, ok)
+
+	assert.Equal(t, int64(2), m.Counter("storage.tenant.reserved_skipped", "source", reservedSourceRecovery),
+		"one bucket index per signal")
+	assert.Equal(t, int64(1), m.Counter("storage.tenant.reserved_skipped", "source", reservedSourceWAL))
+
+	_, err := os.Stat(filepath.Join(root, walTenant, "metrics", bucketindex.Object))
+	require.NoError(t, err, "the reserved tenant's parts stay on disk")
+
+	segments, err := filepath.Glob(filepath.Join(walDir, walTenant, "metrics", "*.wal"))
+	require.NoError(t, err)
+	assert.NotEmpty(t, segments, "the reserved tenant's WAL stays on disk")
+}
+
+// TestPartSyncSkipsReservedTenant has a peer hold a tenant under the reserved id, as a node running a
+// release predating the reservation could. Mirroring it must do no I/O on this node's backend.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestPartSyncSkipsReservedTenant(t *testing.T) {
+	endpoint := etcdtest.Start(t)
+	ctx := context.Background()
+
+	beA, beB := backend.Memory(), backend.Memory()
+	mp, m := obstest.Provider(t)
+
+	nodes := map[string]*Storage{
+		"node-a": openClusterNodeWith(t, endpoint, "node-a", beA, WithMeterProvider(mp)),
+		"node-b": openClusterNodeWith(t, endpoint, "node-b", beB),
+	}
+	awaitMembership(t, nodes)
+
+	standIn := walTenant + "/metrics/00000000000000000001-00000000000000000001.wal"
+
+	require.NoError(t, beA.Write(ctx, standIn, []byte("segment")))
+	require.NoError(t, beB.Write(ctx, walTenant+"/metrics/"+bucketindex.Object, []byte("index")))
+	require.NoError(t, beB.Write(ctx, walTenant+"/metrics/01M3EYF8X9KT5H1BRB7H82SGMB/manifest", []byte("part")))
+
+	for _, strict := range []bool{false, true} {
+		synced, st, err := nodes["node-a"].syncPartsResult(ctx, walTenant, metricsPrefix, strict)
+		require.NoError(t, err)
+		assert.False(t, synced)
+		assert.Zero(t, st)
+	}
+
+	keys, err := beA.List(ctx, walTenant+"/")
+	require.NoError(t, err)
+	assert.Equal(t, []string{standIn}, keys, "nothing copied, nothing pruned")
+	assert.Equal(t, int64(2), m.Counter("storage.tenant.reserved_skipped", "source", reservedSourcePartsync))
 }

@@ -31,9 +31,11 @@ type Options struct {
 	// Tenant derives a record's tenant id from its Resource and Scope (so one OTLP
 	// batch may fan out to many tenants). If nil, every record routes to "default".
 	//
-	// The id "wal", and any id whose first "/"-separated segment is "wal", is reserved: it would
-	// key its data under the directory a WAL kept at <backend root>/wal occupies. Records routed to
-	// it are rejected with reason "reserved_tenant".
+	// The id "wal", and any id whose first "/"-separated segment is "wal" in any letter case, is
+	// reserved: it would key its data under the directory a WAL kept at <backend root>/wal occupies.
+	// So is any id containing a backslash, a path separator on Windows. Records routed to one are
+	// rejected with reason "reserved_tenant"; one already persisted is skipped at [Open] and never
+	// served (see storage.tenant.reserved_skipped).
 	Tenant func(signal.Resource, signal.Scope) signal.TenantID
 
 	// Tenancy resolves a tenant id to limits, retention, downsampling, and routing.

@@ -200,9 +200,16 @@ an engine owns every key under `{tenant}/{signal}/`: its orphan sweep lists that
 and merges delete under it, and the file backend prunes directories they leave empty. Two guards
 keep the trees apart. `Open` refuses a `WALDir` equal to, inside, or containing a backend that
 reports its directory (`backend.LocalDir`), both resolved through symlinks. And the tenant id `wal`
-(any id whose first `/` segment is `wal`) is reserved — rejected at derivation as
-`reserved_tenant`, and refused again at engine creation — so a WAL at `<root>/wal` under a backend
+(any id whose first `/` segment is `wal` in any case, or containing `\`) is reserved — rejected at
+derivation as `reserved_tenant`, and refused again at engine creation — so a WAL at `<root>/wal` under a backend
 that cannot report its root still cannot be aliased by an engine prefix.
+
+Placement compares paths lexically and by identity (`os.SameFile` over each path's nearest existing
+ancestors), so a case alias of the root on a case-insensitive filesystem is refused too. A tenant
+persisted under a reserved id by a release without the reservation is **skipped, not fatal**: recovery,
+WAL replay, bootstrap from etcd claims and part sync each leave it untouched, log it at Error and
+count it in `storage.tenant.reserved_skipped`. One legacy tenant cannot keep the store from opening,
+and its data stays on disk for an operator to move.
 
 Segments go through `internal/vfs`, the rooted filesystem seam, so the crash model is testable
 rather than argued: `faultfs` keeps only what was synced *through a synced directory*, and
