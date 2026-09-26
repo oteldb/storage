@@ -110,7 +110,7 @@ func TestColumnInputSizeMatchesDirectory(t *testing.T) {
 
 				dir := d.streams.dir
 				assert.Equal(t, in.DirBytes, dir.residentBytes(), name)
-				assert.Equal(t, in.DictEntries, int64(len(d.SharedEntries())), name)
+				assert.Equal(t, in.DictEntries, int64(len(sharedEntriesOf(d))), name)
 
 				var maxBytes, maxRaw, maxGran int64
 				for f := range len(dir.frameOff) - 1 {
@@ -389,7 +389,7 @@ func TestRetainedHeapWithinCharge(t *testing.T) {
 	d, err := r.ColumnBlocks(ctx, "attrs")
 	require.NoError(t, err)
 
-	_, err = d.DecodeBytesBlock(0)
+	_, _, err = d.DecodeBytesBlock(0)
 	require.NoError(t, err)
 
 	ranged := settledLive() - base

@@ -178,7 +178,7 @@ func TestColumnBlocksSharedEntriesMatchesWholeColumn(t *testing.T) {
 
 	d, err := r.ColumnBlocks(ctx, "attrs")
 	require.NoError(t, err)
-	require.Equal(t, wantEntries, d.SharedEntries())
+	require.Equal(t, wantEntries, sharedEntriesOf(d))
 }
 
 // TestColumnBlocksBytesReadsOnlyWhatItDecodes is the point of ranging a bytes column: a granule's
@@ -233,7 +233,7 @@ func TestColumnBlocksRejectsBytesDecodeOfNumericColumn(t *testing.T) {
 
 	_, err = d.DecodeBytes(nil)
 	require.Error(t, err)
-	assert.Nil(t, d.SharedEntries())
+	assert.Nil(t, sharedEntriesOf(d))
 }
 
 // offsetBackend serves one key's object shifted right by pad bytes, so a reader that must locate a
@@ -454,7 +454,7 @@ func TestColumnBlocksReadsDictionaryLargerThanProbe(t *testing.T) {
 
 	d, err := r.ColumnBlocks(ctx, "attrs")
 	require.NoError(t, err)
-	require.Equal(t, wantEntries, d.SharedEntries())
+	require.Equal(t, wantEntries, sharedEntriesOf(d))
 
 	got, err := d.DecodeBytes(nil)
 	require.NoError(t, err)

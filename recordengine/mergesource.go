@@ -551,7 +551,8 @@ func (c *byteCursor) open(ctx context.Context, r *block.PartReader, name string,
 			return errors.Wrapf(err, "scan column %q", name)
 		}
 
-		c.dec, c.shared = d, d.SharedEntries()
+		c.dec = d
+		c.shared, _ = d.SharedEntries()
 
 		if carry.dicts[c.k] != nil {
 			carry.lazy[c.k]++
@@ -607,7 +608,7 @@ func (c *byteCursor) load(row int) error {
 
 	blk := row / c.dec.BlockRows()
 
-	col, err := c.dec.DecodeBytesBlock(blk)
+	col, _, err := c.dec.DecodeBytesBlock(blk)
 	if err != nil {
 		return err
 	}

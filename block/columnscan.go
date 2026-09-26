@@ -119,38 +119,39 @@ func (s *frameSource) fill(f int, off, n int64) error {
 // that retains the column past its next call must copy it.
 //
 // For a granule on the column's shared dictionary the result carries that dictionary and the
-// granule's ids unchanged, so its entries are the column's, not the granule's.
-func (d *Decoder) DecodeBytesBlock(blk int) (*chunk.DictColumn, error) {
+// granule's ids unchanged, so its entries are the column's, not the granule's, and the token is the
+// one [Decoder.SharedEntries] returns. Any other granule gets a fresh token.
+func (d *Decoder) DecodeBytesBlock(blk int) (*chunk.DictColumn, DictGen, error) {
 	if d.kind != KindBytes {
-		return nil, errors.Errorf("block: column is %s, not bytes", d.kind)
+		return nil, DictGen{}, errors.Errorf("block: column is %s, not bytes", d.kind)
 	}
 
 	dir := d.streams.dir
 
 	if blk < 0 || blk >= dir.nBlocks() {
-		return nil, errors.Errorf("block: block %d out of range [0,%d)", blk, dir.nBlocks())
+		return nil, DictGen{}, errors.Errorf("block: block %d out of range [0,%d)", blk, dir.nBlocks())
 	}
 
 	lo := blk * dir.blockRows
 	if lo >= d.rows {
-		return nil, errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", blk, lo, d.rows)
+		return nil, DictGen{}, errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", blk, lo, d.rows)
 	}
 
 	n := min(lo+dir.blockRows, d.rows) - lo
 
 	stream, err := d.streams.granule(blk)
 	if err != nil {
-		return nil, err
+		return nil, DictGen{}, err
 	}
 
 	if d.shared.on {
 		ids, width, self, err := d.shared.granule(stream, n)
 		if err != nil {
-			return nil, errors.Wrapf(err, "decode block %d", blk)
+			return nil, DictGen{}, errors.Wrapf(err, "decode block %d", blk)
 		}
 
 		if !self {
-			return &chunk.DictColumn{Entries: d.shared.entries, IDs: ids, IDWidth: width}, nil
+			return &chunk.DictColumn{Entries: d.shared.entries, IDs: ids, IDWidth: width}, d.sharedGen, nil
 		}
 
 		stream = ids
@@ -159,12 +160,12 @@ func (d *Decoder) DecodeBytesBlock(blk int) (*chunk.DictColumn, error) {
 	var dc chunk.DictColumn
 
 	if _, err := dc.DecodeBytes(stream); err != nil {
-		return nil, errors.Wrapf(err, "decode block %d", blk)
+		return nil, DictGen{}, errors.Wrapf(err, "decode block %d", blk)
 	}
 
 	if dc.Len() != n {
-		return nil, errors.Wrapf(ErrCorrupt, "block %d decoded %d rows, want %d", blk, dc.Len(), n)
+		return nil, DictGen{}, errors.Wrapf(ErrCorrupt, "block %d decoded %d rows, want %d", blk, dc.Len(), n)
 	}
 
-	return &dc, nil
+	return &dc, NewDictGen(), nil
 }

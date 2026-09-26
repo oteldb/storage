@@ -83,7 +83,7 @@ func TestColumnScanCoalescesReads(t *testing.T) {
 		t.Helper()
 
 		for g := range d.NumBlocks() {
-			_, err := d.DecodeBytesBlock(g)
+			_, _, err := d.DecodeBytesBlock(g)
 			require.NoErrorf(t, err, "granule %d", g)
 		}
 	}
@@ -185,7 +185,7 @@ func TestColumnScanRereadsOnBackwardSeek(t *testing.T) {
 
 	order := []int{0, granules - 1, 1, granules / 2, 0, granules - 1}
 	for _, g := range order {
-		got, err := scan.DecodeBytesBlock(g)
+		got, _, err := scan.DecodeBytesBlock(g)
 		require.NoErrorf(t, err, "granule %d", g)
 
 		for i := range rows {
@@ -228,7 +228,7 @@ func TestDecodeBytesBlockMatchesWholeColumn(t *testing.T) {
 				lo, hi := scan.BlockSpan(g)
 				require.Equal(t, g*rows, lo)
 
-				got, err := scan.DecodeBytesBlock(g)
+				got, _, err := scan.DecodeBytesBlock(g)
 				require.NoErrorf(t, err, "granule %d", g)
 				require.Equalf(t, hi-lo, got.Len(), "granule %d row count", g)
 
@@ -263,13 +263,13 @@ func TestDecodeBytesBlockSharesTheColumnDictionary(t *testing.T) {
 	scan, err := r.ColumnScan(ctx, "attrs", 1<<20)
 	require.NoError(t, err)
 
-	shared := scan.SharedEntries()
+	shared, _ := scan.SharedEntries()
 	require.NotEmpty(t, shared)
 
 	var joined, declined int
 
 	for g := range granules {
-		got, err := scan.DecodeBytesBlock(g)
+		got, _, err := scan.DecodeBytesBlock(g)
 		require.NoErrorf(t, err, "granule %d", g)
 
 		if sameSlice(got.Entries, shared) {
@@ -308,7 +308,7 @@ func TestColumnScanRejectsBytesBlockOfNumericColumn(t *testing.T) {
 	scan, err := r.ColumnScan(ctx, "ts", 1<<20)
 	require.NoError(t, err)
 
-	_, err = scan.DecodeBytesBlock(0)
+	_, _, err = scan.DecodeBytesBlock(0)
 	require.Error(t, err)
 }
 
@@ -359,10 +359,10 @@ func TestDecodeBytesBlockRejectsBlockOutOfRange(t *testing.T) {
 	scan, err := r.ColumnScan(ctx, "attrs", 1<<20)
 	require.NoError(t, err)
 
-	_, err = scan.DecodeBytesBlock(-1)
+	_, _, err = scan.DecodeBytesBlock(-1)
 	require.Error(t, err)
 
-	_, err = scan.DecodeBytesBlock(scan.NumBlocks())
+	_, _, err = scan.DecodeBytesBlock(scan.NumBlocks())
 	require.Error(t, err)
 }
 
@@ -404,7 +404,7 @@ func FuzzColumnScan(f *testing.F) {
 		for g := range scan.NumBlocks() {
 			lo, hi := scan.BlockSpan(g)
 
-			got, err := scan.DecodeBytesBlock(g)
+			got, _, err := scan.DecodeBytesBlock(g)
 			if err != nil {
 				t.Fatalf("granule %d: %v", g, err)
 			}
@@ -420,4 +420,10 @@ func FuzzColumnScan(f *testing.F) {
 			}
 		}
 	})
+}
+
+func sharedEntriesOf(d *Decoder) [][]byte {
+	entries, _ := d.SharedEntries()
+
+	return entries
 }

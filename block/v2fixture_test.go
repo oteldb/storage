@@ -202,7 +202,7 @@ func checkDecoderRows(t *testing.T, d *Decoder, want [][]byte, what string) {
 	requireRows(t, want, all, what+" decoder")
 
 	for g := range d.NumBlocks() {
-		gc, err := d.DecodeBytesBlock(g)
+		gc, _, err := d.DecodeBytesBlock(g)
 		require.NoError(t, err)
 
 		lo, hi := d.BlockSpan(g)
