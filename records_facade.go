@@ -60,6 +60,9 @@ func (s *Storage) recordEngineCached(
 	}
 
 	prefix := string(s.normalizeTenant(tid)) + suffix
+	if err := checkEnginePrefix(prefix); err != nil {
+		return nil, err
+	}
 
 	w, err := s.walFor(prefix)
 	if err != nil {
@@ -151,6 +154,12 @@ func (s *Storage) writeRecordsLocal(
 
 		id := b.Identity()
 		tid := s.tenantFor(id.Resource, id.Scope)
+		if tenantReserved(tid) {
+			rej.reserved += int64(b.Len())
+
+			return
+		}
+
 		if lastEng == nil || tid != lastTenant {
 			eng, err := engineFor(tid)
 			if err != nil {
@@ -213,10 +222,17 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 		lastAdmit  *tenantAdmission
 		lastLimits tenant.Limits
 		haveTenant bool
+		reserved   int64
 	)
 
 	frames := cluster.FrameRecords(cluster.RecordProjector(project), s.cluster.shardCount(), s.opts.Tenant,
 		func(tid signal.TenantID, b *recordengine.Batch) bool {
+			if tenantReserved(tid) {
+				reserved += int64(b.Len())
+
+				return false
+			}
+
 			if !haveTenant || tid != lastTenant {
 				lastTenant, haveTenant = tid, true
 				lastAdmit = s.admissionFor(tid)
@@ -262,7 +278,7 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 	})
 
 	// Combine the origin rate rejections with each primary's per-reason breakdown.
-	rej := rejectTally{rate: rateRejected}
+	rej := rejectTally{rate: rateRejected - reserved, reserved: reserved}
 	for _, r := range rejects {
 		rej.ooo += int64(r.OOO)
 		rej.cardinality += int64(r.Cardinality)

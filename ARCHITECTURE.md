@@ -63,6 +63,8 @@ engines over the fetch seam (`query/fetch`).
   `WriteMetrics` also stores any exemplars its points carry, best-effort, into the separate
   exemplars record engine (`signal/exemplar`) — see below.
   Tenant is **derived** from Resource+Scope by the `Options.Tenant` callback, never passed.
+  An id whose first `/` segment is `wal` is reserved and its records are rejected
+  (`reserved_tenant`): no engine prefix may alias a WAL kept at `<backend root>/wal`.
   Returns `Accepted{Accepted, Rejected, RejectedReason}` (OTLP partial success).
 - **Read** — `Fetcher(tenants...)` and the per-signal variants return a `fetch.Fetcher` over
   head ∪ parts; no tenants ⇒ all (cross-tenant fan-out, merged by series id). Plus the
@@ -173,7 +175,7 @@ to fail over to: a read overlapping a want fails.
   precision and EC conversion are all one background merge pass. No parallel subsystem.
 - **Backends are interchangeable**; the in-memory/ephemeral path is first-class and every layer
   must work with no disk or object store. Optional capabilities (`Viewer`, `Sizer`, `ReaderAt`,
-  `NodeLocal`, `SpaceReporter`, `InodeReporter`) are type assertions with mandatory fallbacks, so a
+  `NodeLocal`, `LocalDir`, `SpaceReporter`, `InodeReporter`) are type assertions with mandatory fallbacks, so a
   wrapper that does not forward one silently disables the behavior it feeds.
 - **A node never accepts what it cannot store.** Out of bytes or out of inodes is a distinct,
   latched, observable state that rejects writes with `backend.ErrNoSpace` and keeps serving reads —

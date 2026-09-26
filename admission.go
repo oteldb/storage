@@ -328,15 +328,17 @@ func (s *Storage) emitAdmission(ctx context.Context, sig signal.Signal, accepted
 	a.Rejected(ctx, rej.rate, name, reasonRateLimit)
 	a.Rejected(ctx, rej.cardinality, name, reasonMaxSeries)
 	a.Rejected(ctx, rej.inflight, name, reasonMaxInFlightBytes)
+	a.Rejected(ctx, rej.reserved, name, reasonReservedTenant)
 	a.SampledDropped(ctx, sampled, name)
 	a.Overflowed(ctx, overflowed, name)
 
 	// Shedding is the overload/backpressure event — log it (Warn) so operators see it without
 	// scraping metrics. Only fires when something was actually rejected, so it stays coarse.
-	if total := rej.ooo + rej.rate + rej.cardinality + rej.inflight; total > 0 {
+	if total := rej.total(); total > 0 {
 		zctx.From(ctx).Warn("admission shed writes",
 			zap.String("signal", name), zap.Int64("rejected", total),
 			zap.Int64(reasonOutOfOrder, rej.ooo), zap.Int64(reasonRateLimit, rej.rate),
-			zap.Int64(reasonMaxSeries, rej.cardinality), zap.Int64(reasonMaxInFlightBytes, rej.inflight))
+			zap.Int64(reasonMaxSeries, rej.cardinality), zap.Int64(reasonMaxInFlightBytes, rej.inflight),
+			zap.Int64(reasonReservedTenant, rej.reserved))
 	}
 }

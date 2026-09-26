@@ -358,6 +358,11 @@ a demonstration.
   replicates and the gap reads as real absence. Being a heuristic is why that is a warning and not a
   refusal. **A wrapper must forward it** (`Cached` does), or a wrapped local disk looks shared and
   the diagnostic goes quiet on exactly the deployment it is for.
+- **`backend.LocalDir`** — optional `Dir()`, implemented by `file` (its absolute root). Its one
+  consumer is `Open`, which refuses a `WALDir` overlapping that directory: the backend owns every
+  file under its root (listing, orphan sweeps, retention, empty-directory pruning), so WAL segments
+  there are exposed to all of it. An object store has no directory and is unaffected. **A wrapper
+  must forward it** (`Cached` does), or a wrapped file backend accepts the overlapping layout.
 - **`backend.SpaceReporter`** — optional `FreeSpace(ctx)`, implemented by `file` (statfs, and
   reporting the *unprivileged* figure so the root reserve is never counted as usable). The merge
   engine sizes its output parts against it instead of a constant, so part size tracks the disk the

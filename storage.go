@@ -388,13 +388,7 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 	// The tenant (hence the engine) is derived from Resource+Scope, which are constant within
 	// a metric, so points arrive in tenant-contiguous runs. Cache the last resolution to skip
 	// the locked engine-map lookup and policy resolve per metric.
-	var (
-		lastTenant   signal.TenantID
-		lastEng      *engine.Engine
-		lastAdmit    *tenantAdmission
-		lastLimits   tenant.Limits
-		lastSampling int64
-	)
+	var run metricRun
 
 	var firstErr error
 
@@ -404,27 +398,25 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 		}
 
 		tid := s.tenantFor(b.Resource(), b.Scope())
-		if lastEng == nil || tid != lastTenant {
-			eng, err := s.engineFor(tid)
-			if err != nil {
-				firstErr = err
+		if tenantReserved(tid) {
+			rej.reserved += int64(b.Len())
 
-				return
-			}
+			return
+		}
 
-			pol := s.tenant.Resolve(s.normalizeTenant(tid))
-			lastTenant, lastEng = tid, eng
-			lastAdmit = s.admissionFor(tid)
-			lastLimits = pol.Limits
-			lastSampling = pol.Sampling.MaxRowsPerSecond
+		var err error
+		if run, err = s.metricRunFor(run, tid); err != nil {
+			firstErr = err
+
+			return
 		}
 
 		// Admission stage (between tenant resolution and the engine, DESIGN §8a): the ingest-rate
 		// valve sheds a whole over-budget batch up front; cardinality and in-flight-memory limits
 		// are enforced per sample inside the engine (race-free under its lock).
-		if !lastAdmit.allowRate(lastLimits, int64(b.Len())*engine.SampleBytes, s.now()) {
+		if !run.admit.allowRate(run.limits, int64(b.Len())*engine.SampleBytes, s.now()) {
 			rej.rate += int64(b.Len())
-			lastAdmit.addRate(int64(b.Len()))
+			run.admit.addRate(int64(b.Len()))
 
 			return
 		}
@@ -435,7 +427,7 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 		ids, tss, vals, sf := b.IDs, b.Ts, b.Values, []float64(nil)
 		mat := b.Series
 
-		if weights, dropped := lastAdmit.sampleBatch(lastSampling, s.now(), b.IDs, b.Ts); weights != nil {
+		if weights, dropped := run.admit.sampleBatch(run.sampling, s.now(), b.IDs, b.Ts); weights != nil {
 			fids := make([]signal.SeriesID, 0, len(weights))
 			fts := make([]int64, 0, len(weights))
 			fvals := make([]float64, 0, len(weights))
@@ -459,11 +451,11 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 			sampledDropped += dropped
 		}
 
-		res, err := lastEng.AppendBatch(ids, tss, vals, sf, mat, engine.AppendLimits{
-			MaxSeries:        lastLimits.MaxSeries,
-			MaxSeriesSoft:    lastLimits.MaxSeriesSoft,
+		res, err := run.eng.AppendBatch(ids, tss, vals, sf, mat, engine.AppendLimits{
+			MaxSeries:        run.limits.MaxSeries,
+			MaxSeriesSoft:    run.limits.MaxSeriesSoft,
 			Overflow:         metricOverflow,
-			MaxInFlightBytes: lastLimits.MaxInFlightBytes,
+			MaxInFlightBytes: run.limits.MaxInFlightBytes,
 		})
 		if err != nil {
 			firstErr = err
@@ -474,14 +466,14 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 		rej.ooo += int64(res.RejectedOOO)
 		rej.cardinality += int64(res.RejectedCardinality)
 		rej.inflight += int64(res.RejectedBytes)
-		lastAdmit.record(int64(res.Accepted), int64(res.RejectedOOO), int64(res.RejectedCardinality), int64(res.RejectedBytes))
+		run.admit.record(int64(res.Accepted), int64(res.RejectedOOO), int64(res.RejectedCardinality), int64(res.RejectedBytes))
 
 		if res.Overflowed > 0 {
 			overflowed += int64(res.Overflowed)
-			lastAdmit.recordOverflowed(int64(res.Overflowed))
+			run.admit.recordOverflowed(int64(res.Overflowed))
 		}
 
-		s.pokeFlush(lastEng)
+		s.pokeFlush(run.eng)
 	})
 
 	if firstErr != nil {
@@ -506,6 +498,7 @@ const (
 	reasonRateLimit        = "rate_limit"
 	reasonMaxSeries        = "max_series"
 	reasonMaxInFlightBytes = "max_in_flight_bytes"
+	reasonReservedTenant   = "reserved_tenant"
 )
 
 // defaultMaxPartBytes is the per-part size cap applied when a tenant's policy leaves MaxPartSize
@@ -551,9 +544,12 @@ type rejectTally struct {
 	rate        int64
 	cardinality int64
 	inflight    int64
+	reserved    int64
 }
 
-func (r rejectTally) total() int64 { return r.ooo + r.rate + r.cardinality + r.inflight }
+func (r rejectTally) total() int64 {
+	return r.ooo + r.rate + r.cardinality + r.inflight + r.reserved
+}
 
 // reason returns a machine-readable reason for the rejections. When several reasons fired it
 // reports the largest contributor (suffixed to signal it was not the only one), so a producer
@@ -569,6 +565,7 @@ func (r rejectTally) reason() string {
 		{reasonRateLimit, r.rate},
 		{reasonMaxSeries, r.cardinality},
 		{reasonMaxInFlightBytes, r.inflight},
+		{reasonReservedTenant, r.reserved},
 	}
 
 	var top kv
@@ -1290,6 +1287,9 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 	}
 
 	prefix := string(s.normalizeTenant(tid)) + metricsPrefix
+	if err := checkEnginePrefix(prefix); err != nil {
+		return nil, err
+	}
 
 	w, err := s.walFor(prefix)
 	if err != nil {
@@ -2184,3 +2184,33 @@ type Accepted struct {
 // this is a columnar storage library, and the embedder owns the query languages
 // (PromQL/LogQL/TraceQL) — driving them over [fetch.Fetcher] (see the optional query/promql
 // adapter). There is deliberately no Storage.Query / query-language type here.
+
+// metricRun is what [Storage.WriteMetrics] resolves once per tenant-contiguous run of batches.
+type metricRun struct {
+	tenant   signal.TenantID
+	eng      *engine.Engine
+	admit    *tenantAdmission
+	limits   tenant.Limits
+	sampling int64
+}
+
+func (s *Storage) metricRunFor(run metricRun, tid signal.TenantID) (metricRun, error) {
+	if run.eng != nil && run.tenant == tid {
+		return run, nil
+	}
+
+	eng, err := s.engineFor(tid)
+	if err != nil {
+		return metricRun{}, err
+	}
+
+	pol := s.tenant.Resolve(s.normalizeTenant(tid))
+
+	return metricRun{
+		tenant:   tid,
+		eng:      eng,
+		admit:    s.admissionFor(tid),
+		limits:   pol.Limits,
+		sampling: pol.Sampling.MaxRowsPerSecond,
+	}, nil
+}

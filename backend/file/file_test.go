@@ -40,6 +40,21 @@ func TestFileIsNodeLocal(t *testing.T) {
 	assert.True(t, backend.IsNodeLocal(b))
 }
 
+func TestFileDir(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir()
+	b, err := file.New(filepath.Join(tmp, "x", "..", "root"))
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(tmp, "root"), b.Dir())
+
+	for _, be := range []backend.Backend{b, backend.Cached(b, 1<<20)} {
+		dir, ok := backend.DirOf(be)
+		assert.True(t, ok)
+		assert.Equal(t, b.Dir(), dir)
+	}
+}
+
 func TestFilePersistsAcrossReopen(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

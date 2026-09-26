@@ -205,6 +205,7 @@ engines still bucket by tier and wait for `MinTierParts` of them.
 Per-tenant cumulative admission tally (shared across signals — the valves are keyed by tenant):
 `Accepted`, `RejectedOOO`, `RejectedRate`, `RejectedCardinality`, `RejectedInFlight`,
 `SampledDropped`, `Overflowed`, plus the `Rejected()` total. Drives "why is this tenant being shed?".
+Records routed to a reserved tenant id (`reserved_tenant`) appear only in `ingest.rejected`.
 
 ### Injected metrics / traces / logs (`internal/obs`)
 
@@ -216,7 +217,7 @@ Metric instruments (all prefixed `storage.`):
 
 | Instrument | Tags | Notes |
 |-----------|------|-------|
-| `ingest.accepted` / `ingest.rejected` | `signal`(, `reason`) | reasons: `out_of_order`, `rate_limit`, `max_series`, `max_in_flight_bytes` |
+| `ingest.accepted` / `ingest.rejected` | `signal`(, `reason`) | reasons: `out_of_order`, `rate_limit`, `max_series`, `max_in_flight_bytes`, `reserved_tenant` (the `Tenant` callback derived an id in the reserved `wal` namespace; not counted in `AdmissionStats`, since no such tenant exists) |
 | `ingest.sampled_dropped` / `ingest.overflowed` | `signal` | budgeted sampling / overflow routing |
 | `flush.total` / `flush.duration` / `flush.rows` / `flush.bytes` | `signal` | head flushes; `flush.bytes` is the part bytes written, the denominator of write amplification |
 | `merge.total` / `merge.duration` / `merge.parts_in` / `merge.bytes_in` / `merge.bytes_out` | `signal` | background merges; `bytes_out` against `flush.bytes` is how many times the engine rewrites what it ingests, `bytes_out`/`bytes_in` what one cycle gains |

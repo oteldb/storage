@@ -195,6 +195,15 @@ concurrent ingest.
 `Options.WALDir` attaches one writer per (tenant, signal) engine. `Options.WALSync` picks the fsync
 policy: `None` (default — page cache), `Always` (per record), `Interval` (background timer).
 
+**The WAL never shares a namespace with parts.** Segments live at `{WALDir}/{tenant}/{signal}/`, and
+an engine owns every key under `{tenant}/{signal}/`: its orphan sweep lists that prefix, retention
+and merges delete under it, and the file backend prunes directories they leave empty. Two guards
+keep the trees apart. `Open` refuses a `WALDir` equal to, inside, or containing a backend that
+reports its directory (`backend.LocalDir`), both resolved through symlinks. And the tenant id `wal`
+(any id whose first `/` segment is `wal`) is reserved — rejected at derivation as
+`reserved_tenant`, and refused again at engine creation — so a WAL at `<root>/wal` under a backend
+that cannot report its root still cannot be aliased by an engine prefix.
+
 Segments go through `internal/vfs`, the rooted filesystem seam, so the crash model is testable
 rather than argued: `faultfs` keeps only what was synced *through a synced directory*, and
 distinguishes `Crash()` (power loss) from `Kill()` (process death).

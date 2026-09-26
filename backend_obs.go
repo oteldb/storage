@@ -78,6 +78,13 @@ func (b *instrumentedBackend) IsEphemeral() bool { return b.inner.IsEphemeral() 
 // shared.
 func (b *instrumentedBackend) IsNodeLocal() bool { return backend.IsNodeLocal(b.inner) }
 
+// Dir forwards the [backend.LocalDir] capability.
+func (b *instrumentedBackend) Dir() string {
+	dir, _ := backend.DirOf(b.inner)
+
+	return dir
+}
+
 // FreeSpace forwards the [backend.SpaceReporter] capability, unmetered — it is a statfs, not an
 // object operation. Without it a metered backend would hide the disk from the merge cap and every
 // merge would fall back to the ceiling.

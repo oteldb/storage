@@ -156,6 +156,9 @@ func (nopCloseFS) Close() error { return nil }
 // IsEphemeral reports false: data persists on disk.
 func (*File) IsEphemeral() bool { return false }
 
+// Dir returns the absolute root directory; "" for a backend over an injected filesystem.
+func (f *File) Dir() string { return f.dir }
+
 // IsNodeLocal reports true: a directory tree is private to its node unless the root happens to be a
 // shared mount, which the backend cannot tell. See [backend.NodeLocal] for how to read that.
 func (*File) IsNodeLocal() bool { return true }
