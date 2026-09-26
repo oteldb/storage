@@ -133,28 +133,35 @@ func (m *Merge) Deferred(ctx context.Context, sig string) {
 // line because the question they answer — is compaction ever going to reduce this part count? — is
 // asked of a dashboard over time, not of one cycle.
 type Parts struct {
-	total      metric.Int64Gauge
-	sealed     metric.Int64Gauge
-	backlog    metric.Int64Gauge
-	candidates metric.Int64Gauge
-	capBytes   metric.Int64Gauge
-	bytes      metric.Int64Gauge
-	orphans    metric.Int64Counter
-	deferred   metric.Int64Counter
-	reserved   metric.Int64Counter
+	total           metric.Int64Gauge
+	sealed          metric.Int64Gauge
+	backlog         metric.Int64Gauge
+	candidates      metric.Int64Gauge
+	forceCandidates metric.Int64Gauge
+	capBytes        metric.Int64Gauge
+	bytes           metric.Int64Gauge
+	orphans         metric.Int64Counter
+	deferred        metric.Int64Counter
+	reserved        metric.Int64Counter
+}
+
+// PartShape is one signal's part shape as [Parts.Record] publishes it.
+type PartShape struct {
+	Total, Sealed, Backlog, Candidates, ForceCandidates, CapBytes, Bytes int64
 }
 
 // Record publishes one signal's part shape, summed over the tenants this node holds. The values are
 // tagged by signal only: tenant ids are unbounded, and [storage.Storage.Inspect] is the per-tenant
 // surface.
-func (p *Parts) Record(ctx context.Context, sig string, total, sealed, backlog, candidates, capBytes, bytes int64) {
+func (p *Parts) Record(ctx context.Context, sig string, sh PartShape) {
 	a := sigAttr(sig)
-	p.total.Record(ctx, total, a)
-	p.sealed.Record(ctx, sealed, a)
-	p.backlog.Record(ctx, backlog, a)
-	p.candidates.Record(ctx, candidates, a)
-	p.capBytes.Record(ctx, capBytes, a)
-	p.bytes.Record(ctx, bytes, a)
+	p.total.Record(ctx, sh.Total, a)
+	p.sealed.Record(ctx, sh.Sealed, a)
+	p.backlog.Record(ctx, sh.Backlog, a)
+	p.candidates.Record(ctx, sh.Candidates, a)
+	p.forceCandidates.Record(ctx, sh.ForceCandidates, a)
+	p.capBytes.Record(ctx, sh.CapBytes, a)
+	p.bytes.Record(ctx, sh.Bytes, a)
 }
 
 // OrphansSwept accounts n part objects the open-time sweep deleted because no index entry names
@@ -456,8 +463,10 @@ func newParts(m metric.Meter) (*Parts, error) {
 		sealed:     b.gauge("storage.parts.sealed", "parts at the merge cap, which no merge reconsiders", "{part}"),
 		backlog:    b.gauge("storage.parts.merge_backlog", "unsealed parts a merge may still take", "{part}"),
 		candidates: b.gauge("storage.parts.merge_candidates", "parts the next merge would select", "{part}"),
-		capBytes:   b.gauge("storage.merge.cap_bytes", "seal threshold in effect for a merged part", "By"),
-		bytes:      b.gauge("storage.parts.bytes", "bytes the flushed parts occupy on disk", "By"),
+		forceCandidates: b.gauge("storage.parts.merge_force_candidates",
+			"parts a forced merge (Admin.CompactNow) would select", "{part}"),
+		capBytes: b.gauge("storage.merge.cap_bytes", "seal threshold in effect for a merged part", "By"),
+		bytes:    b.gauge("storage.parts.bytes", "bytes the flushed parts occupy on disk", "By"),
 		orphans: b.counter("storage.parts.orphans_swept",
 			"part objects no index entry names, deleted by the sweep at open", "{object}"),
 		deferred: b.counter("storage.parts.orphans_deferred",

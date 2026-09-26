@@ -1870,6 +1870,19 @@ func (s *Storage) maintain(ctx context.Context) {
 	s.warnSingleShard(ctx)
 }
 
+// metricShape is a metric engine's merge shape under the policy its next merge resolves, with the
+// size cutoff as last computed, so it reads no backend.
+func (s *Storage) metricShape(tid signal.TenantID, eng *engine.Engine) engine.MergeShape {
+	return eng.MergeShapeWith(s.metricMergeOptions(tid, s.sizeCutoffCached(tenantOfShard(tid)).at(signal.Metric)))
+}
+
+// recordShape is [Storage.metricShape] for a record engine.
+func (s *Storage) recordShape(sig signal.Signal, tid signal.TenantID, eng *recordengine.Engine) recordengine.MergeShape {
+	cutoff := s.retainFrom(tid, sig, s.sizeCutoffCached(tenantOfShard(tid)).at(sig))
+
+	return eng.MergeShapeWith(recordengine.MergeOptions{RetainFrom: cutoff})
+}
+
 // recordPartShape publishes the merge selector's view of every engine's parts as gauges, once per
 // maintenance cycle — right after the merges, so the numbers describe the set the next cycle will
 // look at. It is the durable form of the "why did nothing merge?" diagnostic: an engine whose merge
@@ -1877,41 +1890,40 @@ func (s *Storage) maintain(ctx context.Context) {
 // this cadence shows. Summed over tenants, tagged by signal (tenant ids are unbounded; per-tenant
 // detail is [Storage.Inspect]).
 func (s *Storage) recordPartShape(ctx context.Context) {
-	type shape struct{ total, sealed, backlog, candidates, capBytes, bytes int64 }
+	shapes := make(map[signal.Signal]*obs.PartShape, 4)
 
-	shapes := make(map[signal.Signal]*shape, 4)
-
-	add := func(sig signal.Signal, total, sealed, backlog, candidates, capBytes, bytes int64) {
+	add := func(sig signal.Signal, parts, sealed, backlog, candidates, force int, capBytes, bytes int64) {
 		sh, ok := shapes[sig]
 		if !ok {
-			sh = &shape{}
+			sh = &obs.PartShape{}
 			shapes[sig] = sh
 		}
 
-		sh.total += total
-		sh.sealed += sealed
-		sh.backlog += backlog
-		sh.candidates += candidates
-		sh.bytes += bytes
+		sh.Total += int64(parts)
+		sh.Sealed += int64(sealed)
+		sh.Backlog += int64(backlog)
+		sh.Candidates += int64(candidates)
+		sh.ForceCandidates += int64(force)
+		sh.Bytes += bytes
 		// The cap is a per-engine threshold, not a quantity: the largest in effect is the one that
 		// explains the sealed counts, and summing it would be meaningless.
-		sh.capBytes = max(sh.capBytes, capBytes)
+		sh.CapBytes = max(sh.CapBytes, capBytes)
 	}
 
-	for _, eng := range s.engineSnapshotByTenant() {
-		m := eng.MergeShape()
-		add(signal.Metric, int64(m.Parts), int64(m.Sealed), int64(m.Backlog), int64(m.Candidates), m.CapBytes, m.Bytes)
+	for tid, eng := range s.engineSnapshotByTenant() {
+		m := s.metricShape(tid, eng)
+		add(signal.Metric, m.Parts, m.Sealed, m.Backlog, m.Candidates, m.ForceCandidates, m.CapBytes, m.Bytes)
 	}
 
 	for sig, engines := range s.recordEnginesBySignal() {
-		for _, eng := range engines {
-			m := eng.MergeShape()
-			add(sig, int64(m.Parts), int64(m.Sealed), int64(m.Backlog), int64(m.Candidates), m.CapBytes, m.Bytes)
+		for tid, eng := range engines {
+			m := s.recordShape(sig, tid, eng)
+			add(sig, m.Parts, m.Sealed, m.Backlog, m.Candidates, m.ForceCandidates, m.CapBytes, m.Bytes)
 		}
 	}
 
 	for sig, sh := range shapes {
-		s.obs.Parts.Record(ctx, sig.String(), sh.total, sh.sealed, sh.backlog, sh.candidates, sh.capBytes, sh.bytes)
+		s.obs.Parts.Record(ctx, sig.String(), *sh)
 	}
 }
 

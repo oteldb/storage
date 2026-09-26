@@ -97,10 +97,12 @@ func (e recordEngine) Stats() enginetest.Stats {
 	}
 }
 
-func (e recordEngine) MergeShape() enginetest.MergeShape {
-	sh := e.Engine.MergeShape()
+func (e recordEngine) MergeShape(retainFrom int64) enginetest.MergeShape {
+	sh := e.MergeShapeWith(recordengine.MergeOptions{RetainFrom: retainFrom})
 
-	return enginetest.MergeShape{Parts: sh.Parts, Bytes: sh.Bytes}
+	return enginetest.MergeShape{
+		Parts: sh.Parts, Bytes: sh.Bytes, Candidates: sh.Candidates, ForceCandidates: sh.ForceCandidates,
+	}
 }
 
 // streamIdentity is the identity mkBatch gives a stream of the named service.

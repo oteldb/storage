@@ -114,7 +114,8 @@ otherwise indistinguishable from an idle engine. `MergeShape.Bytes` sums the par
 different tiers of one bucket are a *permanent* fixed point, and `MergeOptions.Force` is the only way
 out. It takes a bucket's unsealed parts smallest-first whatever their tiers, still truncated at the
 cumulative-bytes cap and still confined to one bucket — the tier rule is waived, the memory bound is
-not. `Candidates` and `ForceCandidates` run the real selector with and without `Force`, so the two
+not. `Candidates` and `ForceCandidates` run the real merge — retention's whole-part drops, then the
+selector under the cutoff passed to `MergeShapeWith` — with and without `Force`, so the two
 zero states separate: `ForceCandidates > 0` is a tier spread only `Force` breaks, both zero is every
 unsealed part alone in its bucket, which nothing reduces without widening a part.
 

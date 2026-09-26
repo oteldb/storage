@@ -133,6 +133,21 @@ func sizeRetentionCutoff(parts []sizedPart, maxBytes int64) int64 {
 	return cutoff
 }
 
+// sizeCutoffCached is [Storage.sizeCutoffFor] without its backend reads: the memoized cutoffs while
+// the tenant's part set is the one they were computed for, and none otherwise.
+func (s *Storage) sizeCutoffCached(t signal.TenantID) bySignal {
+	t = s.normalizeTenant(t)
+
+	b := budgetsOf(s.tenant.Resolve(t).Retention)
+	if b.empty() {
+		return bySignal{}
+	}
+
+	cutoffs, _ := s.sizeRetention.lookup(t, s.partSetFingerprint(t, b))
+
+	return cutoffs
+}
+
 // sizeCutoffFor resolves the size-retention cutoffs of one tenant (a real tenant id, not a shard
 // key), one per signal: a zero cutoff where the signal has no budget, is already under it, or its
 // part sizes cannot be read. Every budget spans all of the tenant's locally-held shards, since it

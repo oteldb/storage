@@ -678,7 +678,8 @@ never reduce for thousands of cycles with nothing saying so. The cap comes from 
 than being derived on demand: deriving it reads free space, and introspection does no I/O.
 `MergeShape.Bytes` sums the parts' manifest sizes (no backend stat calls), so the same snapshot says
 whether a rising part count is parts that grew or a merge that stopped taking them. `Candidates` and
-`ForceCandidates` run the real selector (ladder and straddlers, at the current and at the waived idle
+`ForceCandidates` run the real merge (retention's whole-part drops, then the selector under the
+policy passed to `MergeShapeWith`, at the current and at the waived idle
 count), so a zero means the merge would select nothing rather than that no run exists somewhere in
 the store regardless of buckets.
 

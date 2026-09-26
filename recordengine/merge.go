@@ -134,7 +134,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		if dropped == 0 {
 			// A no-op is indistinguishable from a healthy engine without the shape of what it looked
 			// at; these are the exact inputs to that decision (mirrors the metric engine).
-			sh := shapeOf(src, capBytes)
+			sh := shapeOf(src, retainFrom, capBytes)
 			zctx.From(ctx).Debug("merge selected nothing",
 				zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
 				zap.Int("parts", sh.Parts), zap.Int("sealed", sh.Sealed),

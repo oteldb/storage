@@ -13,8 +13,9 @@ type MergeShape struct {
 	// Bytes is what the flushed parts occupy on disk. Divided by Parts it is the average part size,
 	// which is what says whether a rising part count is a merge that stopped or an ingest that grew.
 	Bytes int64
-	// Candidates is how many parts the next merge would select right now, and ForceCandidates how
-	// many a [MergeOptions.Force] merge would. Candidates 0 with ForceCandidates above it is a tier
+	// Candidates is how many parts the next merge under the given retention would take right now —
+	// retention's whole-part drops included — and ForceCandidates how many a [MergeOptions.Force]
+	// merge would. Candidates 0 with ForceCandidates above it is a tier
 	// spread only Force breaks; both 0 with a non-zero Backlog is every unsealed part alone in its
 	// time bucket, the ladder's resting state, which no merge reduces without widening a part.
 	Candidates      int
@@ -31,18 +32,22 @@ type MergeShape struct {
 	MinTierParts int
 }
 
-// MergeShape returns the selector's view of the engine's parts. It takes a brief read lock, does no
-// backend I/O and decodes nothing, so it is safe to poll at dashboard cadence.
-func (e *Engine) MergeShape() MergeShape {
+// MergeShape is [Engine.MergeShapeWith] without retention.
+func (e *Engine) MergeShape() MergeShape { return e.MergeShapeWith(MergeOptions{}) }
+
+// MergeShapeWith returns the selector's view of the engine's parts under the retention a merge
+// would run with (opts.Force is ignored; ForceCandidates sets it). It takes a brief read lock, does
+// no backend I/O and decodes nothing, so it is safe to poll at dashboard cadence.
+func (e *Engine) MergeShapeWith(opts MergeOptions) MergeShape {
 	e.mu.RLock()
 	src := e.parts
 	e.mu.RUnlock()
 
-	return shapeOf(src, e.mergeCapBytes())
+	return shapeOf(src, opts.RetainFrom, e.mergeCapBytes())
 }
 
-// shapeOf summarizes what the selector sees in src at the given seal threshold.
-func shapeOf(src []*part, capBytes int64) MergeShape {
+// shapeOf summarizes what the selector sees in src at the given retention cutoff and seal threshold.
+func shapeOf(src []*part, retainFrom, capBytes int64) MergeShape {
 	unsealed := unsealedOf(src, capBytes)
 
 	var bytes int64
@@ -65,11 +70,29 @@ func shapeOf(src []*part, capBytes int64) MergeShape {
 		Sealed:           len(src) - len(unsealed),
 		Backlog:          len(unsealed),
 		Bytes:            bytes,
-		Candidates:       len(selectMergeParts(src, 0, capBytes, false)),
-		ForceCandidates:  len(selectMergeParts(src, 0, capBytes, true)),
+		Candidates:       nextMergeParts(src, retainFrom, capBytes, false),
+		ForceCandidates:  nextMergeParts(src, retainFrom, capBytes, true),
 		CapBytes:         capBytes,
 		Tiers:            len(byTier),
 		LargestTierParts: largest,
 		MinTierParts:     minTierParts,
 	}
+}
+
+// nextMergeParts counts the parts one merge over src takes: those retention drops whole, then the
+// selection over the rest.
+func nextMergeParts(src []*part, retainFrom, capBytes int64, force bool) int {
+	live := src
+
+	if retainFrom > 0 {
+		live = make([]*part, 0, len(src))
+
+		for _, p := range src {
+			if p.maxTime >= retainFrom {
+				live = append(live, p)
+			}
+		}
+	}
+
+	return len(src) - len(live) + len(selectMergeParts(live, retainFrom, capBytes, force))
 }

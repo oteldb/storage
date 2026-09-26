@@ -252,7 +252,7 @@ func (s *Storage) Inspect() StoreStats {
 	for tid, eng := range s.engineSnapshotByTenant() {
 		es := eng.Stats()
 		segs, walBytes, epoch, hasWAL := eng.WALState()
-		sh := eng.MergeShape()
+		sh := s.metricShape(tid, eng)
 		ts := tenantStats(tid)
 		ts.Signals = append(ts.Signals, SignalStats{
 			Signal: signal.Metric, Series: es.Series, HeadItems: es.HeadSamples, HeadBytes: es.HeadBytes,
@@ -282,7 +282,7 @@ func (s *Storage) Inspect() StoreStats {
 		for tid, eng := range engines {
 			es := eng.Stats()
 			segs, walBytes, epoch, hasWAL := eng.WALState()
-			sh := eng.MergeShape()
+			sh := s.recordShape(sig, tid, eng)
 			ts := tenantStats(tid)
 			ts.Signals = append(ts.Signals, SignalStats{
 				Signal: sig, Series: es.Streams, HeadItems: es.HeadRecords, HeadBytes: es.HeadBytes,

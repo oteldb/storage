@@ -55,8 +55,9 @@ type Stats struct {
 
 // MergeShape is the subset of the engine's merge shape the suite asserts on.
 type MergeShape struct {
-	Parts int
-	Bytes int64
+	Parts                       int
+	Bytes                       int64
+	Candidates, ForceCandidates int
 }
 
 // Engine is one engine adapted for the suite. Methods that share a name with the engine's own mean
@@ -105,7 +106,8 @@ type Introspector interface {
 	PartCount() int
 	PartPrefixes() []string
 	Stats() Stats
-	MergeShape() MergeShape
+	// MergeShape is the merge shape under a retention cutoff (≤ 0 disables it).
+	MergeShape(retainFrom int64) MergeShape
 	// LoadState is every field an index load replaces, comparable with assert.Equal.
 	LoadState() any
 }
@@ -202,6 +204,7 @@ var suite = []struct {
 	{"WALResolvesStreamAfterCheckpoint", walResolvesStreamAfterCheckpoint},
 	{"HeadAgeTracksFlushLag", headAgeTracksFlushLag},
 	{"MergeShapeReportsBytes", mergeShapeReportsBytes},
+	{"MergeShapeCountsRetentionWork", mergeShapeCountsRetentionWork},
 
 	{"HoleCommittedAfterRepeatedAbsence", holeCommittedAfterRepeatedAbsence},
 	{"IncompletePeerSetNeverHoles", incompletePeerSetNeverHoles},
