@@ -638,13 +638,16 @@ lands on the earlier day. Cutting the input by day would emit two partial aggreg
 read keeps one); keeping a rollup in a part with younger raw samples of the next day would leave a
 straddler whose re-merge re-counts a `Count` representative as 1.
 
-At most `timebucket.MaxOpenWriters` (32) writers are open, and together they stay under the merge's
-resident budget; past either the largest is finished early, so a day may get several parts, each still
-day-aligned, which the ladder folds together later. A per-day pass structure costs a full decode per
-day written instead. Measured on a 17-day batch (16 parts × 64 series, hourly;
-`BenchmarkMergeStraddlers17Days`, in memory): per-day passes read 13.1 MB from the backend, allocated
-232 MB and took 628 ms; the single pass reads 0.79 MB, allocates 86 MB and takes 62 ms, at a peak live
-heap of 42 MB against 14 MB, the 17 writers being open at once.
+At most `timebucket.MaxOpenWriters` (32) writers are open, and after every day run lands the open
+ones hold less than the merge's resident budget together; past either bound the largest is finished
+early, so a day may get several parts, each still day-aligned, which the ladder folds together later.
+Checking per run rather than per series is the difference between one run of overshoot and a writer's
+worth per day: one series spanning 32 days would otherwise leave every writer just under the budget
+(`TestStraddlerMergeHoldsResidentShare` holds the peak to budget + one run). A per-day pass structure
+costs a full decode per day written instead. Measured on a 17-day batch (16 parts × 64 series, hourly;
+`BenchmarkMergeStraddlers17Days`, in memory, default merge share): per-day passes read 13.1 MB from the
+backend, allocated 232 MB and took 628 ms; the single pass reads 0.79 MB, allocates 86 MB and takes
+65 ms, its writers peaking at 1.3 MB together against a 1 GiB share, at a 42 MB peak live heap.
 
 The fragments of one split live in different day buckets and never merge together again, so their
 joint `bucketindex.Claim` is never folded back into an interval: a removed straddler is accounted for

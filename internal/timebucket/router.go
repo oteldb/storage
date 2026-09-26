@@ -12,9 +12,11 @@ const MaxOpenWriters = 32
 // Router hands a merge's output rows to one writer per top-level bucket, so a merge whose rows span
 // several days writes a part per day in a single pass over its inputs.
 //
-// At most MaxOpen writers are open, and together they hold at most ResidentLimit (≤ 0 ⇒ unbounded):
-// past either bound the writer holding the most is finished early. A day can therefore end up in
-// several parts, each of which still fits the day, and the ladder merges them later.
+// At most MaxOpen writers are open, and together they hold less than ResidentLimit (≤ 0 ⇒
+// unbounded) after every run [Router.Append] routes: past either bound the writer holding the most is
+// finished early. A day can therefore end up in several parts, each of which still fits the day, and
+// the ladder merges them later. The limit is checked per run rather than per series, so one series
+// spanning every open day overshoots it by one run, not by one writer's worth per day.
 type Router[W any] struct {
 	Open          func(bucket int64) (W, error)
 	Finish        func(W) error
@@ -23,7 +25,41 @@ type Router[W any] struct {
 	ResidentLimit int64
 
 	open map[int64]W
+	// peak is the most the open writers held together, seen as each run landed; run the most one
+	// run added.
+	peak, run int64
 }
+
+// Append routes one run of rows, all in the top-level bucket holding ts, to that day's writer: add
+// appends it and reports whether the writer is full, which finishes it. The open writers are then
+// shed back under ResidentLimit.
+func (r *Router[W]) Append(ts int64, add func(W) (full bool, err error)) error {
+	w, err := r.Writer(ts)
+	if err != nil {
+		return err
+	}
+
+	before := r.Resident(w)
+
+	full, err := add(w)
+	if err != nil {
+		return err
+	}
+
+	r.run = max(r.run, r.Resident(w)-before)
+
+	if full {
+		if err := r.Seal(ts); err != nil {
+			return err
+		}
+	}
+
+	return r.Shed()
+}
+
+// Peak returns the most the open writers held together as a run landed, and the most one run added
+// to a writer: the first exceeds ResidentLimit by at most the second.
+func (r *Router[W]) Peak() (total, run int64) { return r.peak, r.run }
 
 // Writer returns the writer for the top-level bucket holding ts, opening it if needed.
 func (r *Router[W]) Writer(ts int64) (W, error) {
@@ -74,10 +110,14 @@ func (r *Router[W]) Shed() error {
 		return nil
 	}
 
-	for len(r.open) > 0 {
+	for first := true; len(r.open) > 0; first = false {
 		var total int64
 		for _, w := range r.open {
 			total += r.Resident(w)
+		}
+
+		if first {
+			r.peak = max(r.peak, total)
 		}
 
 		if total < r.ResidentLimit {

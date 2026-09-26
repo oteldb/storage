@@ -1,6 +1,8 @@
 package recordengine
 
 import (
+	"slices"
+
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/pool"
 )
@@ -206,6 +208,11 @@ func (m *mergeCarry) flatten(k int) {
 func (m *mergeCarry) arm(buf *recordCols) {
 	buf.armSplit(m.dicts)
 	m.bufs = append(m.bufs, buf)
+}
+
+// drop stops carrying a written output buffer, so its arrays can be reclaimed.
+func (m *mergeCarry) drop(buf *recordCols) {
+	m.bufs = slices.DeleteFunc(m.bufs, func(b *recordCols) bool { return b == buf })
 }
 
 func (m *mergeCarry) release() {

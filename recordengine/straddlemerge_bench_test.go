@@ -45,7 +45,7 @@ func peakHeap() (stop func() uint64) {
 }
 
 // BenchmarkMergeStraddlers17Days merges one straddler batch whose records cover 17 days: 16 parts of
-// 64 streams logging hourly. It reports what the merge reads from the backend and its peak live heap,
+// 64 streams logging hourly, at the storage's default 64 MiB part size. It reports what the merge reads from the backend and its peak live heap,
 // the costs a per-day pass structure multiplies by the days it writes.
 func BenchmarkMergeStraddlers17Days(b *testing.B) {
 	const (
@@ -56,9 +56,12 @@ func BenchmarkMergeStraddlers17Days(b *testing.B) {
 	)
 
 	var (
-		read, peak uint64
-		rows       int
+		read, peak     uint64
+		rows           int
+		writers, limit int64
 	)
+
+	defer recordengine.SetMergeResidentObserver(func(p, _, l int64) { writers, limit = max(writers, p), l })()
 
 	ctx := context.Background()
 
@@ -68,7 +71,9 @@ func BenchmarkMergeStraddlers17Days(b *testing.B) {
 		b.StopTimer()
 
 		be := backendtest.NewByteCounter(backend.Memory())
-		e := recordengine.New(recordengine.Config{Schema: testSchema, Backend: be, Prefix: "t/recs"})
+		e := recordengine.New(recordengine.Config{
+			Schema: testSchema, Backend: be, Prefix: "t/recs", MaxPartBytes: 64 << 20,
+		})
 
 		rows = 0
 
@@ -117,4 +122,6 @@ func BenchmarkMergeStraddlers17Days(b *testing.B) {
 	b.ReportMetric(float64(rows), "rows")
 	b.ReportMetric(float64(read), "read-B")
 	b.ReportMetric(float64(peak), "peak-heap-B")
+	b.ReportMetric(float64(writers), "writers-peak-B")
+	b.ReportMetric(float64(limit), "resident-limit-B")
 }

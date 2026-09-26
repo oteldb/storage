@@ -444,6 +444,10 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 	return cols, nil
 }
 
+// mergeResidentObserver, when non-nil, receives after each streamed merge the most its open writers
+// held together, the most one run added, and the resident limit. Test seam only.
+var mergeResidentObserver func(peak, run, limit int64)
+
 // compactStream merges several source parts from start on (retention), streaming both sides so
 // neither the whole merged dataset nor a whole output part is ever materialized: each source is read
 // through a forward [partStream] decoding one series range at a time, and each merged series is
@@ -517,45 +521,39 @@ func (e *Engine) compactStream(
 		u := idToU128(id)
 
 		err = timebucket.Runs(ts, func(lo, hi int) error {
-			w, err := router.Writer(ts[lo])
-			if err != nil {
-				return err
-			}
+			return router.Append(ts[lo], func(w *partStreamWriter) (bool, error) {
+				var runSF []float64
+				if sf != nil {
+					runSF = sf[lo:hi]
+				}
 
-			var runSF []float64
-			if sf != nil {
-				runSF = sf[lo:hi]
-			}
+				if err := w.appendSeries(u, ts[lo:hi], values[lo:hi], runSF); err != nil {
+					return false, err
+				}
 
-			if err := w.appendSeries(u, ts[lo:hi], values[lo:hi], runSF); err != nil {
-				return err
-			}
-
-			// Sealing on what has actually been written, rather than on rows times an assumed
-			// bytes-per-row, is what makes the cap comparable to the free space it comes from. A
-			// series overshooting the cap is split at the next series boundary — parts are
-			// independent, and the read seam merges a series spanning two.
-			//
-			// The second bound is the part's resident footprint, which is not a function of its
-			// size on disk: the per-series sidecars grow with distinct series, so a merge of very
-			// short series reaches the memory budget long before the disk cap.
-			if budget.Reached(w.encodedBytes(), w.residentBytes()) {
-				return router.Seal(ts[lo])
-			}
-
-			return nil
+				// Sealing on what has actually been written, rather than on rows times an assumed
+				// bytes-per-row, is what makes the cap comparable to the free space it comes from.
+				// A series overshooting the cap is split at the next run — parts are independent,
+				// and the read seam merges a series spanning two.
+				//
+				// The second bound is the part's resident footprint, which is not a function of
+				// its size on disk: the per-series sidecars grow with distinct series, so a merge
+				// of very short series reaches the memory budget long before the disk cap.
+				return budget.Reached(w.encodedBytes(), w.residentBytes()), nil
+			})
 		})
 		if err != nil {
-			return nil, err
-		}
-
-		if err := router.Shed(); err != nil {
 			return nil, err
 		}
 	}
 
 	if err := router.Close(); err != nil {
 		return nil, err
+	}
+
+	if mergeResidentObserver != nil {
+		peak, run := router.Peak()
+		mergeResidentObserver(peak, run, budget.ResidentBytes)
 	}
 
 	return newParts, nil

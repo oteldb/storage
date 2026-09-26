@@ -2,12 +2,14 @@ package engine_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/timebucket"
 	"github.com/oteldb/storage/signal"
@@ -105,6 +107,44 @@ func TestSplitAcrossAgeBands(t *testing.T) {
 				assert.True(t, ok, "part [%v, %v] fits no ladder level",
 					time.Duration(p.MinTime), time.Duration(p.MaxTime))
 			}
+		})
+	}
+}
+
+// TestStraddlerMergeHoldsResidentShare bounds what one large series spread over many days makes the
+// day writers hold together: the merge's resident share, overshot by at most one day's run, not a
+// writer's worth per day.
+//
+//nolint:paralleltest // sets the package-global resident observer
+func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
+	const minute = int64(time.Minute)
+
+	for _, days := range []int{17, 32} { //nolint:paralleltest // shares the observer
+		t.Run(fmt.Sprintf("%d days", days), func(t *testing.T) {
+			var peak, run, limit int64
+
+			defer engine.SetMergeResidentObserver(func(p, r, l int64) {
+				peak, run, limit = max(peak, p), max(run, r), l
+			})()
+
+			ctx := context.Background()
+			e := engine.New(engine.Config{Backend: backend.Memory(), Prefix: "default/metrics", MergeMemoryBytes: 256 << 10})
+			api := mkSeries("job", "api")
+
+			samples := days * 24 * 60
+			for m := range samples {
+				mustAppend(t, e, api, int64(m)*minute, float64(m))
+			}
+
+			require.NoError(t, e.Flush(ctx))
+			require.NoError(t, e.Merge(ctx, 0))
+
+			require.Positive(t, limit)
+			assert.LessOrEqual(t, peak, limit+run, "the day writers outgrew the resident share")
+			assert.Less(t, run, limit, "one day's run must fit the share for the bound to mean anything")
+			assert.Greater(t, peak, limit/2, "the writers must come near the share for the bound to be tested")
+			assert.GreaterOrEqual(t, e.PartCount(), days)
+			assert.Len(t, fetchOne(t, e, "api").Timestamps, samples)
 		})
 	}
 }

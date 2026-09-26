@@ -20,20 +20,35 @@ type recorder struct {
 	timebucket.Router[*writer]
 
 	finished []int64
+	live     map[*writer]struct{}
 	failOpen error
 }
 
+// held is what the open writers hold together.
+func (r *recorder) held() int64 {
+	var n int64
+	for w := range r.live {
+		n += w.rows
+	}
+
+	return n
+}
+
 func newRecorder(maxOpen int, limit int64) *recorder {
-	r := &recorder{}
+	r := &recorder{live: map[*writer]struct{}{}}
 	r.Router = timebucket.Router[*writer]{
 		Open: func(b int64) (*writer, error) {
 			if r.failOpen != nil {
 				return nil, r.failOpen
 			}
 
-			return &writer{bucket: b}, nil
+			w := &writer{bucket: b}
+			r.live[w] = struct{}{}
+
+			return w, nil
 		},
 		Finish: func(w *writer) error {
+			delete(r.live, w)
 			r.finished = append(r.finished, w.bucket)
 
 			return nil
@@ -110,6 +125,52 @@ func TestRouterShed(t *testing.T) {
 	unbounded.add(t, 0, 1<<40)
 	require.NoError(t, unbounded.Shed())
 	assert.Empty(t, unbounded.finished)
+}
+
+// TestRouterAppendShedsPerRun is the aggregate bound: one series spanning every open day must not
+// fill each day's writer before the limit is checked, so after every run the open writers hold
+// under the limit and at their peak exceed it by at most one run.
+func TestRouterAppendShedsPerRun(t *testing.T) {
+	t.Parallel()
+
+	for _, days := range []int64{17, 32} {
+		const (
+			limit   = 100
+			runRows = 7
+		)
+
+		r := newRecorder(timebucket.MaxOpenWriters, limit)
+
+		for series := range 20 {
+			for d := range days {
+				require.NoError(t, r.Append(d*day+int64(series), func(w *writer) (bool, error) {
+					w.rows += runRows
+
+					return false, nil
+				}))
+
+				require.Less(t, r.held(), int64(limit), "%d days, series %d, day %d", days, series, d)
+			}
+		}
+
+		peak, run := r.Peak()
+		assert.Equal(t, int64(runRows), run)
+		assert.LessOrEqual(t, peak, int64(limit+runRows), "%d days", days)
+	}
+}
+
+func TestRouterAppendSealsFullWriter(t *testing.T) {
+	t.Parallel()
+
+	r := newRecorder(0, 0)
+	require.NoError(t, r.Append(hour, func(*writer) (bool, error) { return true, nil }))
+	assert.Equal(t, []int64{0}, r.finished)
+
+	errAdd := errors.New("add")
+	require.ErrorIs(t, r.Append(hour, func(*writer) (bool, error) { return false, errAdd }), errAdd)
+
+	r.failOpen = errAdd
+	require.ErrorIs(t, r.Append(day, func(*writer) (bool, error) { return false, nil }), errAdd)
 }
 
 func TestRouterDrop(t *testing.T) {

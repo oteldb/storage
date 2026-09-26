@@ -62,9 +62,12 @@ func BenchmarkMergeStraddlers17Days(b *testing.B) {
 	}
 
 	var (
-		read, peak uint64
-		rows       int
+		read, peak     uint64
+		rows           int
+		writers, limit int64
 	)
+
+	defer engine.SetMergeResidentObserver(func(p, _, l int64) { writers, limit = max(writers, p), l })()
 
 	ctx := context.Background()
 
@@ -120,4 +123,6 @@ func BenchmarkMergeStraddlers17Days(b *testing.B) {
 	b.ReportMetric(float64(rows), "rows")
 	b.ReportMetric(float64(read), "read-B")
 	b.ReportMetric(float64(peak), "peak-heap-B")
+	b.ReportMetric(float64(writers), "writers-peak-B")
+	b.ReportMetric(float64(limit), "resident-limit-B")
 }

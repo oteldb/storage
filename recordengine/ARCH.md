@@ -51,14 +51,15 @@ merged none of 12,735 such parts. The fix heals them but does not stop them bein
 re-exported exemplars at ingest is its own change. Record specifics:
 
 - The day buffers share the merge's byte-column carry: one union dictionary per column, which a
-  fallback to the flat carry expands in every buffer. Only the first buffer is pre-sized to a part;
-  the rest grow, so the buffers together hold what the resident budget allows rather than a part each.
+  fallback to the flat carry expands in every buffer. A merge inside one day keeps its single buffer
+  pre-sized and reuses it per part; a merge across days grows a buffer per day and drops each once
+  written, so no idle buffer holds capacity the resident budget does not count.
 - A side-store engine (profiles) writes the unioned symbol sidecar under each day's part, since each is
   the one home a reader looks in.
-- Measured on a 17-day batch (16 parts × 64 streams, hourly; `BenchmarkMergeStraddlers17Days`): per-day
-  passes read 16.6 MB from the backend, allocated 426 MB and took 246 ms; the single pass reads 1.0 MB,
-  allocates 156 MB and takes 166 ms, at a peak live heap of 90 MB against 52 MB with no cap set, the day
-  buffers together holding the whole batch.
+- Measured on a 17-day batch (16 parts × 64 streams, hourly, 64 MiB parts;
+  `BenchmarkMergeStraddlers17Days`): per-day passes read 16.6 MB from the backend, allocated 426 MB and
+  took 246 ms; the single pass reads 1.0 MB, allocates 143 MB and takes 166 ms, its buffers peaking at
+  17 MB of decoded records against a 341 MiB share, at a 52–57 MB peak live heap.
 - A split merge takes about cap / part size straddlers. Measured on the stand's shape (655 stale
   records plus one fresh per part, ≈44 KiB decoded, 64 MiB cap): 4,000 straddlers converged to 6
   parts in 6 cycles — 3 split merges of ≈1,500, 3 ladder merges — in 4 s in memory.
