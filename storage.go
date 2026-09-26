@@ -1870,17 +1870,17 @@ func (s *Storage) maintain(ctx context.Context) {
 	s.warnSingleShard(ctx)
 }
 
-// metricShape is a metric engine's merge shape under the policy its next merge resolves, with the
-// size cutoff as last computed, so it reads no backend.
-func (s *Storage) metricShape(tid signal.TenantID, eng *engine.Engine) engine.MergeShape {
-	return eng.MergeShapeWith(s.metricMergeOptions(tid, s.sizeCutoffCached(tenantOfShard(tid)).at(signal.Metric)))
+// metricShape is a metric engine's merge shape under the policy its next merge resolves, given the
+// tenant's size-retention cutoffs.
+func (s *Storage) metricShape(tid signal.TenantID, eng *engine.Engine, size bySignal) engine.MergeShape {
+	return eng.MergeShapeWith(s.metricMergeOptions(tid, size.at(signal.Metric)))
 }
 
 // recordShape is [Storage.metricShape] for a record engine.
-func (s *Storage) recordShape(sig signal.Signal, tid signal.TenantID, eng *recordengine.Engine) recordengine.MergeShape {
-	cutoff := s.retainFrom(tid, sig, s.sizeCutoffCached(tenantOfShard(tid)).at(sig))
-
-	return eng.MergeShapeWith(recordengine.MergeOptions{RetainFrom: cutoff})
+func (s *Storage) recordShape(
+	sig signal.Signal, tid signal.TenantID, eng *recordengine.Engine, size bySignal,
+) recordengine.MergeShape {
+	return eng.MergeShapeWith(recordengine.MergeOptions{RetainFrom: s.retainFrom(tid, sig, size.at(sig))})
 }
 
 // recordPartShape publishes the merge selector's view of every engine's parts as gauges, once per
@@ -1891,6 +1891,21 @@ func (s *Storage) recordShape(sig signal.Signal, tid signal.TenantID, eng *recor
 // detail is [Storage.Inspect]).
 func (s *Storage) recordPartShape(ctx context.Context) {
 	shapes := make(map[signal.Signal]*obs.PartShape, 4)
+
+	// The cycle's merges changed the part set its size cutoffs were resolved for, so they are resolved
+	// again (memoized: the next cycle finds them current unless something flushes first).
+	tids := make(map[signal.TenantID]struct{})
+	for tid := range s.engineSnapshotByTenant() {
+		tids[tid] = struct{}{}
+	}
+
+	for _, engines := range s.recordEnginesBySignal() {
+		for tid := range engines {
+			tids[tid] = struct{}{}
+		}
+	}
+
+	size := s.sizeCutoffs(ctx, tids)
 
 	add := func(sig signal.Signal, parts, sealed, backlog, candidates, force int, capBytes, bytes int64) {
 		sh, ok := shapes[sig]
@@ -1911,13 +1926,13 @@ func (s *Storage) recordPartShape(ctx context.Context) {
 	}
 
 	for tid, eng := range s.engineSnapshotByTenant() {
-		m := s.metricShape(tid, eng)
+		m := s.metricShape(tid, eng, size[tid])
 		add(signal.Metric, m.Parts, m.Sealed, m.Backlog, m.Candidates, m.ForceCandidates, m.CapBytes, m.Bytes)
 	}
 
 	for sig, engines := range s.recordEnginesBySignal() {
 		for tid, eng := range engines {
-			m := s.recordShape(sig, tid, eng)
+			m := s.recordShape(sig, tid, eng, size[tid])
 			add(sig, m.Parts, m.Sealed, m.Backlog, m.Candidates, m.ForceCandidates, m.CapBytes, m.Bytes)
 		}
 	}

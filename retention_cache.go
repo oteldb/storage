@@ -44,6 +44,17 @@ func (c *sizeRetentionCache) lookup(t signal.TenantID, parts uint64) (bySignal, 
 	return e.cutoffs, true
 }
 
+// latest returns the tenant's last memoized cutoffs whatever part set they were computed for, and
+// whether that is the given one.
+func (c *sizeRetentionCache) latest(t signal.TenantID, parts uint64) (bySignal, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	e := c.byTenant[t]
+
+	return e.cutoffs, e.parts == parts
+}
+
 func (c *sizeRetentionCache) store(t signal.TenantID, parts uint64, cutoffs bySignal) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
