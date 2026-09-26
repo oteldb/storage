@@ -3,7 +3,8 @@ package recordengine
 import (
 	"cmp"
 	"slices"
-	"time"
+
+	"github.com/oteldb/storage/internal/timebucket"
 )
 
 // Time-bucketed merge selection for the record engine, mirroring engine/timebucket.go. Size-tiered
@@ -14,122 +15,39 @@ import (
 // and recent ("the last 15 minutes of one service"), and a record row carries far more bytes than a
 // sample, so opening a part the window did not need costs more.
 //
-// mergeLadder is the bucket ladder, ascending; each level must divide the next so buckets nest
-// exactly (TestMergeLadderDivides). The top level is the widest part the engine will build, and so
-// the coarsest time locality a query can rely on.
-var mergeLadder = []int64{
-	int64(time.Hour),
-	int64(6 * time.Hour),
-	int64(24 * time.Hour),
-}
+// The ladder and its bucket arithmetic are [timebucket]'s, shared with the metric engine.
+var mergeLadder = timebucket.Ladder
 
-// bucketOf returns the start of the level-aligned bucket holding ts, rounding toward negative
-// infinity so buckets stay contiguous across the epoch (Go's % keeps the dividend's sign, which
-// would make the bucket at ts = -1 start at 0 and overlap its successor).
-func bucketOf(ts, level int64) int64 {
-	m := ts % level
-	if m < 0 {
-		m += level
-	}
+func bucketOf(ts, level int64) int64 { return timebucket.Of(ts, level) }
 
-	return ts - m
-}
+func bucketEnd(ts, level int64) int64 { return timebucket.End(ts, level) }
 
-// fitsLevel reports whether p lies entirely within one level-aligned bucket.
-func fitsLevel(p *part, level int64) bool {
-	return bucketOf(p.minTime, level) == bucketOf(p.maxTime, level)
-}
+func topLevel() int64 { return timebucket.Top() }
+
+func partSpan(p *part) (lo, hi int64) { return p.minTime, p.maxTime }
+
+func fitsLevel(p *part, level int64) bool { return timebucket.Fits(p.minTime, p.maxTime, level) }
 
 // finestLevel returns the narrowest ladder level whose bucket contains p whole, reporting false for
 // a straddler: a part crossing a top-level boundary. Flush does not split by time, so one late
 // record makes one. A straddler joins no ladder group; [selectStraddlers] picks it instead.
-func finestLevel(p *part) (int64, bool) {
-	for _, level := range mergeLadder {
-		if fitsLevel(p, level) {
-			return level, true
-		}
-	}
+func finestLevel(p *part) (int64, bool) { return timebucket.Finest(p.minTime, p.maxTime) }
 
-	return 0, false
-}
-
-// topLevel is the widest ladder level, and so the boundary every merge output is split on.
-func topLevel() int64 {
-	return mergeLadder[len(mergeLadder)-1]
-}
-
-// bucketEnd returns the last timestamp of the level-aligned bucket holding ts, saturating at the
-// int64 maximum instead of overflowing past it.
-func bucketEnd(ts, level int64) int64 {
-	b := bucketOf(ts, level)
-	if b > maxInt64-(level-1) {
-		return maxInt64
-	}
-
-	return b + level - 1
-}
-
-// spanOf returns the union of the parts' record bounds.
-func spanOf(parts []*part) (lo, hi int64) {
-	lo, hi = maxInt64, minInt64
-	for _, p := range parts {
-		lo, hi = min(lo, p.minTime), max(hi, p.maxTime)
-	}
-
-	return lo, hi
-}
+func spanOf(parts []*part) (lo, hi int64) { return timebucket.Union(parts, partSpan) }
 
 // splitsOutput reports whether merging src from start on writes more than one top-level bucket, so
 // [Engine.compactParts] must cut its output on bucket boundaries.
-func splitsOutput(src []*part, start int64) bool {
-	lo, hi := spanOf(src)
+func splitsOutput(src []*part, start int64) bool { return timebucket.SplitsFrom(src, partSpan, start) }
 
-	return bucketOf(max(lo, start), topLevel()) != bucketOf(hi, topLevel())
-}
-
-// selectStraddlers returns the straddlers to split this cycle: oldest first, up to capBytes of them
-// (maxTierParts when part size is unlimited) and at least one, in src order.
-//
-// Merging straddlers together rather than one at a time is what makes a backlog converge: their
-// records land in the same few buckets, so one merge writes a part per bucket touched, not per
-// straddler.
+// selectStraddlers returns the straddlers to split this cycle, at most maxTierParts of them when part
+// size is unlimited.
 func selectStraddlers(src []*part, capBytes int64) []*part {
-	var straddlers []*part
-
-	order := make(map[*part]int, len(src))
-
-	for i, p := range src {
-		order[p] = i
-
-		if _, ok := finestLevel(p); !ok {
-			straddlers = append(straddlers, p)
-		}
+	maxParts := 0
+	if capBytes <= 0 {
+		maxParts = maxTierParts
 	}
 
-	if len(straddlers) == 0 {
-		return nil
-	}
-
-	slices.SortStableFunc(straddlers, func(a, b *part) int { return cmp.Compare(a.minTime, b.minTime) })
-
-	var total int64
-
-	n := 0
-	for ; n < len(straddlers); n++ {
-		size := straddlers[n].sizeBytes()
-
-		full := (capBytes > 0 && total+size > capBytes) || (capBytes <= 0 && n >= maxTierParts)
-		if n > 0 && full {
-			break
-		}
-
-		total += size
-	}
-
-	group := straddlers[:n]
-	slices.SortFunc(group, func(a, b *part) int { return cmp.Compare(order[a], order[b]) })
-
-	return group
+	return timebucket.Straddlers(src, partSpan, (*part).sizeBytes, capBytes, maxParts)
 }
 
 // newestBucket returns the start of the level-aligned bucket holding the newest record in src —

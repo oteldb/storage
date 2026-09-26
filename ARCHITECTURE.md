@@ -49,6 +49,7 @@ engines over the fetch seam (`query/fetch`).
 | [`cluster/ARCH.md`](cluster/ARCH.md) | ring, membership, replication, rebalance, sharding, partsync, erasure coding |
 | [`internal/vfs/ARCH.md`](internal/vfs/ARCH.md) | the filesystem seam, `SyncDir`, and what each crash mode of the fake does and does not model |
 | [`internal/mergestream/ARCH.md`](internal/mergestream/ARCH.md) | the seam both merge engines share: the k-way key union, the two seal units, the forward-cursor contract, the conformance suite |
+| `internal/timebucket` | the merge bucket ladder both engines confine merges to, and the straddler batch over it; rationale in `engine/ARCH.md` |
 | [`ADMIN.md`](ADMIN.md) | operator surface: `Inspect`, `Admin`, drill-downs, metrics catalog |
 
 ---
