@@ -424,7 +424,7 @@ func retainedHeap(ctx context.Context, t *testing.T, r *PartReader) (opened, wal
 
 	granuleG, err := d.DecodeBytesBlock(0)
 
-	granule := granuleG.Column()
+	granule := granuleG.dc
 	require.NoError(t, err)
 	require.NotNil(t, granule)
 

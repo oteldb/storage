@@ -206,7 +206,7 @@ func TestBindingRejectsOverwrittenGranules(t *testing.T) {
 
 	next, err := d.DecodeBytesBlock(11)
 	require.NoError(t, err)
-	require.NotNil(t, next.Column())
+	require.NotNil(t, next.dc)
 	require.Error(t, wk.shared.AppendDict(sharedA, 1, 2, nil),
 		"a shared granule whose frame was reused, under the live shared token")
 
@@ -216,7 +216,7 @@ func TestBindingRejectsOverwrittenGranules(t *testing.T) {
 	foreign, err := other.DecodeBytesBlock(9)
 	require.NoError(t, err)
 
-	stale := sharedA.Column()
+	stale := sharedA.dc
 	for name, g := range map[string]DecodedGranule{
 		"with no lease":            {dc: stale, table: sharedA.Table()},
 		"with the live granule's":  {dc: stale, table: sharedA.Table(), lease: sharedB.lease},
@@ -231,6 +231,40 @@ func TestBindingRejectsOverwrittenGranules(t *testing.T) {
 
 	_, gen2 := d.SharedEntries()
 	assert.True(t, sameToken(wk.sharedGen, gen2))
+}
+
+// TestBindingColumnTransplant: a caller cannot put a stale column under a live granule. Column hands
+// back a copy of the header, so the transplant — copy granule A's column, decode B, write the copy
+// through B's column — has no pointer to write through; overwriting the copy leaves what a binding
+// reads from B unchanged, and B still appends its own rows.
+func TestBindingColumnTransplant(t *testing.T) {
+	t.Parallel()
+
+	vals := transitionValues()
+	d := scanSource(t, vals, transitionGranule)
+
+	w := NewStreamWriter(WithGranuleSize(transitionGranule))
+	require.NoError(t, w.AddColumn(Column{Name: "b", Kind: KindBytes, Block: true}))
+
+	wk := newWalker(t, d, w, 0)
+
+	a, err := d.DecodeBytesBlock(0)
+	require.NoError(t, err)
+
+	staleA := a.Column()
+
+	b, err := d.DecodeBytesBlock(9)
+	require.NoError(t, err)
+
+	transplanted := b.Column()
+	transplanted.IDs, transplanted.IDWidth = staleA.IDs, staleA.IDWidth
+	require.NotEqual(t, transplanted.IDWidth, b.Column().IDWidth, "A is narrow, B wide: the copies differ")
+	assert.Same(t, b.dc, b.lease.dc, "B's column is untouched")
+
+	require.NoError(t, wk.shared.AppendDict(b, 0, transitionGranule, nil))
+
+	want := batchObjects(t, vals[9*transitionGranule:10*transitionGranule], []PartOption{WithGranuleSize(transitionGranule)})
+	assert.Equal(t, want, buildStream(t, w).objects, "B's own rows were appended")
 }
 
 // TestBindingAppendDictRejects covers AppendDict's argument checks.

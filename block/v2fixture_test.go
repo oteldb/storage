@@ -203,7 +203,7 @@ func checkDecoderRows(t *testing.T, d *Decoder, want [][]byte, what string) {
 
 	for g := range d.NumBlocks() {
 		gcG, err := d.DecodeBytesBlock(g)
-		gc := gcG.Column()
+		gc := gcG.dc
 		require.NoError(t, err)
 
 		lo, hi := d.BlockSpan(g)

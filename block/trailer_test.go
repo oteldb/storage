@@ -159,13 +159,13 @@ func TestTrailerColumnGolden(t *testing.T) {
 
 	narrowG, err := dec.DecodeBytesBlock(0)
 
-	narrow := narrowG.Column()
+	narrow := narrowG.dc
 	require.NoError(t, err)
 	assert.Equal(t, 1, narrow.IDWidth, "a granule sealed before the 257th entry keeps 1-byte ids")
 
 	wideG, err := dec.DecodeBytesBlock(9)
 
-	wide := wideG.Column()
+	wide := wideG.dc
 	require.NoError(t, err)
 	assert.Equal(t, 2, wide.IDWidth)
 
@@ -730,7 +730,7 @@ func FuzzTrailerColumnDecode(f *testing.F) {
 
 		if dec, err := newColumnReader(d, object, noneComp(), len(vals)).BlockDecoder(); err == nil {
 			dcG, err := dec.DecodeBytesBlock(9)
-			dc := dcG.Column()
+			dc := dcG.dc
 			read(dc, err)
 		}
 	})

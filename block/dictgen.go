@@ -57,9 +57,16 @@ func OwnedGranule(dc *chunk.DictColumn, table DictGen) DecodedGranule {
 	return g
 }
 
-// Column returns the decoded column. It aliases the decoder's frame, so it is valid only while the
-// granule is live.
-func (g DecodedGranule) Column() *chunk.DictColumn { return g.dc }
+// Column returns a copy of the decoded column's header; its slices alias the decoder's frame, so it
+// is valid only while the granule is live. Being a copy, changing it cannot change what a [Binding]
+// reads from g.
+func (g DecodedGranule) Column() chunk.DictColumn {
+	if g.dc == nil {
+		return chunk.DictColumn{}
+	}
+
+	return *g.dc
+}
 
 // Table returns the token naming the entry table the column's ids index.
 func (g DecodedGranule) Table() DictGen { return g.table }

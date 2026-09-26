@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/block"
+	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/signal"
@@ -507,6 +508,8 @@ type byteCursor struct {
 	dec    *block.Decoder
 	lo, hi int
 	col    mergeByteCol
+	// granule holds the current granule's column, so the cursor's view of it needs no allocation.
+	granule chunk.DictColumn
 
 	constant bool
 	value    []byte
@@ -613,9 +616,8 @@ func (c *byteCursor) load(row int) error {
 		return err
 	}
 
-	col := g.Column()
-
-	c.col, c.lo, c.hi, c.remapped = mergeByteCol{dict: col}, lo, hi, false
+	c.granule = g.Column()
+	c.col, c.lo, c.hi, c.remapped = mergeByteCol{dict: &c.granule}, lo, hi, false
 
 	return nil
 }
