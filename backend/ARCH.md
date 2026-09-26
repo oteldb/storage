@@ -72,8 +72,10 @@ a demonstration.
 - **`backend/file`** — directory tree with a `..` traversal guard; atomic write via temp+fsync+
   rename, `PutIfAbsent` via temp + link. **The key prefix bounds the traversal, not just the
   result**: `List` walks only the prefix's subtree, and `Delete` rmdirs the directories its object
-  leaves empty (`New` sweeps pre-existing ones once). Otherwise a listing costs a full-tree walk
-  whose size grows with parts *ever created* — maintenance lists per tenant/signal every tick.
+  leaves empty. Otherwise a listing costs a full-tree walk whose size grows with parts *ever
+  created* — maintenance lists per tenant/signal every tick. `New` never removes anything: other
+  owners may share the root, and an empty directory there can be one a writer still holds open (a WAL's,
+  after a clean close), and a read-only open must not mutate the tree.
 
   **Durability against power loss, not only against a process crash.** Syncing the temp file
   commits its *bytes*; the directory entry that names them is a separate promise, and a rename is

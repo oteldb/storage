@@ -274,8 +274,8 @@ func TestFileListMissingPrefix(t *testing.T) {
 	assert.Empty(t, keys)
 }
 
-// TestFileDeletePrunesEmptyDirs pins the second half of the fix: a deleted part must not leave
-// its directories behind, or every later List keeps paying for them.
+// TestFileDeletePrunesEmptyDirs pins that a deleted part does not leave its directories behind,
+// or every later List keeps paying for them.
 func TestFileDeletePrunesEmptyDirs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -308,33 +308,47 @@ func TestFileDeletePrunesEmptyDirs(t *testing.T) {
 	assert.Empty(t, keys)
 }
 
-// TestFileNewSweepsEmptyDirs covers the one-time sweep for deployments that already leaked
-// directories under a pre-pruning version.
-func TestFileNewSweepsEmptyDirs(t *testing.T) {
+// TestFileNewKeepsEmptyDirs pins that opening a backend never removes a directory it did not
+// create: a WAL under the same root owns empty directories while a writer holds them.
+func TestFileNewKeepsEmptyDirs(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
-	root := t.TempDir()
 
-	require.NoError(t, os.MkdirAll(filepath.Join(root, "t", "metrics", "0000000001", "c"), 0o750))
-	require.NoError(t, os.MkdirAll(filepath.Join(root, "t", "logs", "0000000002"), 0o750))
-	require.NoError(t, os.MkdirAll(filepath.Join(root, "t", "traces", "0000000003"), 0o750))
-	live := filepath.Join(root, "t", "traces", "0000000003", "manifest")
-	require.NoError(t, os.WriteFile(live, []byte("v"), 0o600))
-
-	b, err := file.New(root)
-	require.NoError(t, err)
-
-	for _, dead := range []string{
-		filepath.Join(root, "t", "metrics"),
-		filepath.Join(root, "t", "logs"),
+	for _, tt := range []struct {
+		name    string
+		objects []string
+	}{
+		{name: "Alone"},
+		{name: "WithSiblingObjects", objects: []string{"t/metrics/0000000001/c/col", "t/metrics/0000000001/manifest"}},
 	} {
-		_, serr := os.Stat(dead)
-		require.ErrorIs(t, serr, os.ErrNotExist, "empty subtree must be swept: %s", dead)
-	}
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			root := t.TempDir()
+			walDir := filepath.Join(root, "wal", "default", "metrics")
+			require.NoError(t, os.MkdirAll(walDir, 0o750))
 
-	keys, err := b.List(ctx, "")
-	require.NoError(t, err)
-	assert.Equal(t, []string{"t/traces/0000000003/manifest"}, keys)
+			for _, key := range tt.objects {
+				full := filepath.Join(root, filepath.FromSlash(key))
+				require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o750))
+				require.NoError(t, os.WriteFile(full, []byte("v"), 0o600))
+			}
+
+			b, err := file.New(root)
+			require.NoError(t, err)
+			require.DirExists(t, walDir)
+
+			keys, err := b.List(ctx, "")
+			require.NoError(t, err)
+			assert.ElementsMatch(t, tt.objects, keys)
+
+			for _, key := range tt.objects {
+				require.NoError(t, b.Delete(ctx, key))
+			}
+
+			assert.NoDirExists(t, filepath.Join(root, "t"), "delete still prunes the part's own parents")
+			assert.DirExists(t, walDir)
+		})
+	}
 }
 
 func TestFileAtomicWriteLeavesNoTemp(t *testing.T) {
