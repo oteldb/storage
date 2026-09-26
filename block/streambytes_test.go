@@ -207,7 +207,7 @@ func (s *bindSource) feedDict(rows [][]byte, rng *rand.Rand) {
 	case 0:
 		cells, keep := interleave(rows, s.sharedTab[0])
 		dc := idsColumn(s.sharedTab, cells, func(v []byte) int { return s.sharedIdx[string(v)] })
-		require.NoError(tb, s.shared.AppendDict(dc, s.sharedGen, 0, len(cells), keep))
+		require.NoError(tb, s.shared.AppendDict(dc, s.sharedGen, Lease{}, 0, len(cells), keep))
 	case 1:
 		cells, keep := interleave(rows, []byte("filler-never-kept"))
 		entries, _ := splitBytesForm(cells)
@@ -220,12 +220,12 @@ func (s *bindSource) feedDict(rows [][]byte, rng *rand.Rand) {
 		gen := NewDictGen()
 		require.NoError(tb, s.self.Bind(entries, gen))
 		require.NoError(tb, s.self.AppendDict(
-			idsColumn(entries, cells, func(v []byte) int { return idx[string(v)] }), gen, 0, len(cells), keep))
+			idsColumn(entries, cells, func(v []byte) int { return idx[string(v)] }), gen, Lease{}, 0, len(cells), keep))
 	default:
 		cells, keep := interleave(rows, []byte("filler-never-kept"))
 		gen := NewDictGen()
 		require.NoError(tb, s.self.Bind(cells, gen))
-		require.NoError(tb, s.self.AppendDict(&chunk.DictColumn{Entries: cells}, gen, 0, len(cells), keep))
+		require.NoError(tb, s.self.AppendDict(&chunk.DictColumn{Entries: cells}, gen, Lease{}, 0, len(cells), keep))
 	}
 }
 

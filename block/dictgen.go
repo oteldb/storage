@@ -27,6 +27,13 @@ func (g DictGen) IsZero() bool { return g.owner == nil }
 
 func (g DictGen) live() bool { return g.owner != nil && g.owner.epoch == g.epoch }
 
+// Lease says whether a decoded granule — its ids, and a self granule's table — is still intact. A
+// [Decoder] retires every lease at its next decode, which may overwrite the frame the granule
+// aliases. The zero Lease is for a column the caller holds itself and never expires.
+type Lease struct{ g DictGen }
+
+func (l Lease) live() bool { return l.g.owner == nil || l.g.live() }
+
 func (o *dictOwner) token() DictGen { return DictGen{owner: o, epoch: o.epoch} }
 
 // retire invalidates every token o has issued, before the table they name is overwritten.

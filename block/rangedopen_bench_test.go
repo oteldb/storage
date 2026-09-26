@@ -62,7 +62,7 @@ func BenchmarkColumnBlocksOpen(b *testing.B) {
 					b.Fatal(err)
 				}
 
-				if _, _, err := d.DecodeBytesBlock(blk); err != nil {
+				if _, _, _, err := d.DecodeBytesBlock(blk); err != nil {
 					b.Fatal(err)
 				}
 			}

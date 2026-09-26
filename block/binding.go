@@ -50,8 +50,9 @@ func (b *Binding) Bind(entries [][]byte, gen DictGen) error { return b.bind(entr
 func (b *Binding) BindStable(entries [][]byte, gen DictGen) error { return b.bind(entries, gen, true) }
 
 // AppendDict appends rows [lo,hi) of dc, those keep marks when keep is non-nil (keep[j] for row
-// lo+j), to the bound column. dc must decode against the bound table, which gen must name.
-func (b *Binding) AppendDict(dc *chunk.DictColumn, gen DictGen, lo, hi int, keep []bool) error {
+// lo+j), to the bound column. dc must decode against the bound table, which gen must name, and lease
+// must be the one its decode returned: a granule a later decode may have overwritten is refused.
+func (b *Binding) AppendDict(dc *chunk.DictColumn, gen DictGen, lease Lease, lo, hi int, keep []bool) error {
 	c := b.c
 	if c.bytes.finished {
 		return errWriterFinished
@@ -63,6 +64,10 @@ func (b *Binding) AppendDict(dc *chunk.DictColumn, gen DictGen, lo, hi int, keep
 
 	if !gen.live() {
 		return errors.Errorf("block: column %q: dictionary table was overwritten by a later decode", c.name)
+	}
+
+	if !lease.live() {
+		return errors.Errorf("block: column %q: granule was overwritten by a later decode", c.name)
 	}
 
 	if lo < 0 || hi < lo || hi > dc.Len() {

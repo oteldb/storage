@@ -608,7 +608,7 @@ func (c *byteCursor) load(row int) error {
 
 	blk := row / c.dec.BlockRows()
 
-	col, _, err := c.dec.DecodeBytesBlock(blk)
+	col, _, _, err := c.dec.DecodeBytesBlock(blk)
 	if err != nil {
 		return err
 	}

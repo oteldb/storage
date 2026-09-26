@@ -972,14 +972,14 @@ func (r *ColumnReader) BlockDecoder() (*Decoder, error) {
 	}
 
 	return &Decoder{
-		rows:    r.rows,
-		kind:    r.desc.Kind,
-		codec:   r.desc.Codec,
-		i64:     r.int64Decoder(),
-		f64:     r.float64Decoder(),
-		shared:  sd,
-		selfGen: dictOwner{framed: true},
-		streams: newBlockStreams(dir, r.comp),
+		rows:     r.rows,
+		kind:     r.desc.Kind,
+		codec:    r.desc.Codec,
+		i64:      r.int64Decoder(),
+		f64:      r.float64Decoder(),
+		shared:   sd,
+		granules: dictOwner{framed: true},
+		streams:  newBlockStreams(dir, r.comp),
 	}, nil
 }
 

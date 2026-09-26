@@ -265,13 +265,15 @@ Streamed at 8192-row granules, a 512-value attribute column encodes at 1.7 GB/s 
 A table is named by a `DictGen` token: a pointer to its owner plus the owner's epoch, comparable and
 allocation-free, with no process-wide counter — two decoders over one part never issue equal tokens.
 A decoder owns two: the shared dictionary's, whose epoch never moves, so `SharedEntries` and every
-shared granule hand back one token valid for the decoder's life; and the self granules', which every
-decode retires before it may overwrite the frame buffer a self table aliases. `AppendDict` requires
-the bound token *and* a live one, so a stale self table is an error even while the binding still
-holds its token; `BindStable` refuses a self token outright, since a reference would outlive the
-frame. A shared granule's ids alias the frame all the same — the token names entries, not ids — so
-they are the caller's to use before the next decode. `NewDictGen` gives a caller-built table its own
-owner. Bindings belong to one writer and die when it finishes.
+shared granule hand back one token valid for the decoder's life; and the granules', which every
+decode retires before it may overwrite the frame buffer. That one issues each self table's token and
+every decoded granule's `Lease`, since a granule's ids alias the frame whichever table they index.
+`AppendDict` requires the bound, live token *and* a live lease, so a stale self table or stale shared
+ids are an error even while the binding still holds its token; `BindStable` refuses a self token
+outright, since a reference would outlive the frame. Retiring on every decode, not only on a frame
+change, is conservative: a merge cursor decodes a granule only after leaving the last. `NewDictGen`
+gives a caller-built table its own owner, and the zero `Lease` marks a column the caller holds
+itself. Bindings belong to one writer and die when it finishes.
 
 `Column.Observer` (`BytesObserver`) is the seam for per-value side structures such as blooms. Both
 writers report every declined granule's distinct values with counts, then D with its counts once at
@@ -367,7 +369,7 @@ them. At S3 latencies that is the difference between a merge finishing and not.
   granule's ids and appends them, and copying every value back would be the per-row cost this path
   exists to remove. A granule on the shared dictionary yields the *column's* entry table unchanged,
   with the `DictGen` token `SharedEntries` returns — so ids stay comparable across granules and
-  nothing is rehashed per granule; any other granule gets a token retired by the next decode. Its `IDWidth` is the granule's own, so a trailer column hands back 1-byte
+  nothing is rehashed per granule; any other granule gets a token retired by the next decode, and every granule a `Lease` retired the same way. Its `IDWidth` is the granule's own, so a trailer column hands back 1-byte
   ids for granules written before the dictionary passed 256 entries.
 
 ## At-rest checksums

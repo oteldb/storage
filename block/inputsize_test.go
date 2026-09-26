@@ -389,8 +389,9 @@ func TestRetainedHeapWithinCharge(t *testing.T) {
 	d, err := r.ColumnBlocks(ctx, "attrs")
 	require.NoError(t, err)
 
-	_, _, err = d.DecodeBytesBlock(0)
+	granule, _, _, err := d.DecodeBytesBlock(0)
 	require.NoError(t, err)
+	require.NotNil(t, granule)
 
 	ranged := settledLive() - base
 	assert.LessOrEqual(t, ranged, in.Resident+in.DirBytes+in.MaxFrameRaw+tolerance, "ranged open")

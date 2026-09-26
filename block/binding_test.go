@@ -23,7 +23,7 @@ func scanSource(t *testing.T, vals [][]byte, gsize int) *Decoder {
 	ctx := context.Background()
 	b := backend.Memory()
 
-	w := NewPartWriter(WithGranuleSize(gsize), WithCompression(compress.AlgorithmZSTD))
+	w := NewPartWriter(WithGranuleSize(gsize), WithCompression(compress.AlgorithmZSTD), WithCompressBlockBytes(64))
 	require.NoError(t, w.AddColumn(Column{Name: "b", Kind: KindBytes, Bytes: vals, Block: true}))
 	require.NoError(t, WritePart(ctx, b, "src", w))
 
@@ -61,17 +61,17 @@ func newWalker(t *testing.T, d *Decoder, w *StreamWriter, col int) *walker {
 func (wk *walker) granule(t *testing.T, blk int, lo, hi int) {
 	t.Helper()
 
-	dc, gen, err := wk.d.DecodeBytesBlock(blk)
+	dc, gen, lease, err := wk.d.DecodeBytesBlock(blk)
 	require.NoError(t, err)
 
 	if gen == wk.sharedGen {
-		require.NoError(t, wk.shared.AppendDict(dc, gen, lo, hi, nil))
+		require.NoError(t, wk.shared.AppendDict(dc, gen, lease, lo, hi, nil))
 
 		return
 	}
 
 	require.NoError(t, wk.self.Bind(dc.Entries, gen))
-	require.NoError(t, wk.self.AppendDict(dc, gen, lo, hi, nil))
+	require.NoError(t, wk.self.AppendDict(dc, gen, lease, lo, hi, nil))
 }
 
 // TestBindingWalkAcrossPartSplit walks a source whose granules go shared → self → shared, narrow and
@@ -150,34 +150,35 @@ func TestBindingRejectsForeignTokens(t *testing.T) {
 
 	wk := newWalker(t, d, w, 0)
 
-	shared, sharedGen, err := d.DecodeBytesBlock(0)
+	shared, sharedGen, lease, err := d.DecodeBytesBlock(0)
 	require.NoError(t, err)
 	assert.True(t, sameToken(wk.sharedGen, sharedGen))
 
 	_, otherGen := other.SharedEntries()
 	assert.False(t, sameToken(sharedGen, otherGen), "two decoders over one part never share a token")
-	require.Error(t, wk.shared.AppendDict(shared, otherGen, 0, 1, nil), "another decoder's token")
-	require.Error(t, wk.shared.AppendDict(shared, DictGen{}, 0, 1, nil), "the zero token")
+	require.Error(t, wk.shared.AppendDict(shared, otherGen, lease, 0, 1, nil), "another decoder's token")
+	require.Error(t, wk.shared.AppendDict(shared, DictGen{}, lease, 0, 1, nil), "the zero token")
 	require.Error(t, wk.self.Bind(nil, DictGen{}), "binding the zero token")
 
-	_, otherSelf, err := other.DecodeBytesBlock(8)
+	_, otherSelf, _, err := other.DecodeBytesBlock(8)
 	require.NoError(t, err)
 
-	self, selfGen, err := d.DecodeBytesBlock(8)
+	self, selfGen, selfLease, err := d.DecodeBytesBlock(8)
 	require.NoError(t, err)
 	assert.False(t, sameToken(otherSelf, selfGen), "two decoders' self tokens differ")
 	assert.False(t, sameToken(wk.sharedGen, selfGen), "a self granule gets its own token")
-	require.Error(t, wk.shared.AppendDict(self, selfGen, 0, 1, nil))
+	require.Error(t, wk.shared.AppendDict(self, selfGen, selfLease, 0, 1, nil))
 	require.Error(t, wk.self.BindStable(self.Entries, selfGen), "a frame-backed table cannot be kept by reference")
 
 	require.NoError(t, wk.self.Bind(self.Entries, selfGen))
-	require.NoError(t, wk.self.AppendDict(self, selfGen, 0, 1, nil))
+	require.NoError(t, wk.self.AppendDict(self, selfGen, selfLease, 0, 1, nil))
 }
 
-// TestBindingRejectsOverwrittenSelfTable is the stale-table case: a self granule's table aliases the
-// decoder's frame, so once a later decode crosses a frame boundary its token is dead even though the
-// binding still holds it. The shared dictionary's token survives the same decodes.
-func TestBindingRejectsOverwrittenSelfTable(t *testing.T) {
+// TestBindingRejectsOverwrittenGranules is the stale-granule case: a decoded granule aliases the
+// decoder's frame, so once a later decode crosses a frame boundary its lease is dead even though the
+// binding still holds the table's token — a self granule's table and ids, and a shared granule's ids
+// alike. The shared dictionary's token itself survives, so fresh shared granules still append.
+func TestBindingRejectsOverwrittenGranules(t *testing.T) {
 	t.Parallel()
 
 	vals := transitionValues()
@@ -188,23 +189,30 @@ func TestBindingRejectsOverwrittenSelfTable(t *testing.T) {
 
 	wk := newWalker(t, d, w, 0)
 
-	self, selfGen, err := d.DecodeBytesBlock(8)
+	self, selfGen, selfLease, err := d.DecodeBytesBlock(8)
 	require.NoError(t, err)
 	require.NoError(t, wk.self.Bind(self.Entries, selfGen))
-	require.NoError(t, wk.self.AppendDict(self, selfGen, 0, 1, nil))
+	require.NoError(t, wk.self.AppendDict(self, selfGen, selfLease, 0, 1, nil))
 
-	_, _, err = d.DecodeBytesBlock(0)
+	sharedA, sharedGen, leaseA, err := d.DecodeBytesBlock(0)
 	require.NoError(t, err)
-	require.Error(t, wk.self.AppendDict(self, selfGen, 1, 2, nil), "an overwritten table with the bound token")
+	require.Error(t, wk.self.AppendDict(self, selfGen, selfLease, 1, 2, nil), "an overwritten self table")
 	require.Error(t, wk.self.Bind(self.Entries, selfGen), "rebinding a retired token")
+	require.NoError(t, wk.shared.AppendDict(sharedA, sharedGen, leaseA, 0, 1, nil))
 
-	_, _, err = d.DecodeBytesBlock(11)
-	require.NoError(t, err)
+	require.NotEqual(t, d.streams.dir.frameOf(0), d.streams.dir.frameOf(11), "the next decode crosses a frame")
 
-	shared, sharedGen, err := d.DecodeBytesBlock(9)
+	next, _, _, err := d.DecodeBytesBlock(11)
 	require.NoError(t, err)
-	require.True(t, sameToken(wk.sharedGen, sharedGen), "one shared token for the decoder's life")
-	require.NoError(t, wk.shared.AppendDict(shared, sharedGen, 0, 2, nil), "self decodes leave the shared token live")
+	require.NotNil(t, next)
+	require.Error(t, wk.shared.AppendDict(sharedA, sharedGen, leaseA, 1, 2, nil),
+		"a shared granule whose frame was reused, under the live shared token")
+
+	sharedB, sharedGenB, leaseB, err := d.DecodeBytesBlock(9)
+	require.NoError(t, err)
+	require.True(t, sameToken(wk.sharedGen, sharedGenB), "one shared token for the decoder's life")
+	require.NoError(t, wk.shared.AppendDict(sharedB, sharedGenB, leaseB, 0, 2, nil),
+		"self decodes leave the shared token live")
 
 	_, gen2 := d.SharedEntries()
 	assert.True(t, sameToken(wk.sharedGen, gen2))
@@ -226,14 +234,14 @@ func TestBindingAppendDictRejects(t *testing.T) {
 
 	dc := &chunk.DictColumn{Entries: entries, IDs: []byte{0, 1, 2, 1}, IDWidth: 1}
 
-	require.Error(t, b.AppendDict(dc, gen, -1, 2, nil), "negative lo")
-	require.Error(t, b.AppendDict(dc, gen, 3, 2, nil), "hi below lo")
-	require.Error(t, b.AppendDict(dc, gen, 0, 5, nil), "past the rows")
-	require.Error(t, b.AppendDict(dc, gen, 0, 2, []bool{true}), "keep of the wrong length")
-	require.Error(t, b.AppendDict(&chunk.DictColumn{Entries: entries, IDs: []byte{0, 0, 0}, IDWidth: 3}, gen, 0, 1, nil), "id width 3")
-	require.Error(t, b.AppendDict(&chunk.DictColumn{Entries: entries[:2], IDs: []byte{0}, IDWidth: 1}, gen, 0, 1, nil), "another table's size")
-	require.ErrorIs(t, b.AppendDict(&chunk.DictColumn{Entries: entries, IDs: []byte{7}, IDWidth: 1}, gen, 0, 1, nil), ErrCorrupt)
-	require.NoError(t, b.AppendDict(dc, gen, 0, 4, []bool{true, false, true, true}))
+	require.Error(t, b.AppendDict(dc, gen, Lease{}, -1, 2, nil), "negative lo")
+	require.Error(t, b.AppendDict(dc, gen, Lease{}, 3, 2, nil), "hi below lo")
+	require.Error(t, b.AppendDict(dc, gen, Lease{}, 0, 5, nil), "past the rows")
+	require.Error(t, b.AppendDict(dc, gen, Lease{}, 0, 2, []bool{true}), "keep of the wrong length")
+	require.Error(t, b.AppendDict(&chunk.DictColumn{Entries: entries, IDs: []byte{0, 0, 0}, IDWidth: 3}, gen, Lease{}, 0, 1, nil), "id width 3")
+	require.Error(t, b.AppendDict(&chunk.DictColumn{Entries: entries[:2], IDs: []byte{0}, IDWidth: 1}, gen, Lease{}, 0, 1, nil), "another table's size")
+	require.ErrorIs(t, b.AppendDict(&chunk.DictColumn{Entries: entries, IDs: []byte{7}, IDWidth: 1}, gen, Lease{}, 0, 1, nil), ErrCorrupt)
+	require.NoError(t, b.AppendDict(dc, gen, Lease{}, 0, 4, []bool{true, false, true, true}))
 	assert.Equal(t, 3, w.Rows())
 }
 
@@ -286,8 +294,8 @@ func TestBindingIDWidths(t *testing.T) {
 
 			gen := NewDictGen()
 			require.NoError(t, b.Bind(tab, gen))
-			require.NoError(t, b.AppendDict(dc, gen, 0, 40, nil))
-			require.NoError(t, b.AppendDict(dc, gen, 40, len(vals), nil))
+			require.NoError(t, b.AppendDict(dc, gen, Lease{}, 0, 40, nil))
+			require.NoError(t, b.AppendDict(dc, gen, Lease{}, 40, len(vals), nil))
 			assert.Equal(t, want, buildStream(t, w).objects)
 		})
 	}
@@ -323,7 +331,7 @@ func TestBindingSurvivesGenerationWrap(t *testing.T) {
 	require.NoError(t, b.Bind(entries, gen))
 
 	for lo := 0; lo < len(vals); lo += 5 {
-		require.NoError(t, b.AppendDict(dc, gen, lo, min(lo+5, len(vals)), nil))
+		require.NoError(t, b.AppendDict(dc, gen, Lease{}, lo, min(lo+5, len(vals)), nil))
 	}
 
 	assert.Equal(t, uint32(1), w.cols[0].bytes.g.epoch)
@@ -350,7 +358,7 @@ func TestBindingRawColumn(t *testing.T) {
 	tab := valuesOf(3, func(i int) string { return fmt.Sprint("r", i) })
 	gen := NewDictGen()
 	require.NoError(t, b.Bind(tab, gen))
-	require.NoError(t, b.AppendDict(idsColumn(tab, vals, func(v []byte) int { return int(v[1] - '0') }), gen, 0, len(vals), nil))
+	require.NoError(t, b.AppendDict(idsColumn(tab, vals, func(v []byte) int { return int(v[1] - '0') }), gen, Lease{}, 0, len(vals), nil))
 	assert.Equal(t, want.objects, buildStream(t, w).objects)
 }
 

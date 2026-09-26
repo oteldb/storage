@@ -82,7 +82,7 @@ func BenchmarkStreamWriterBytes(b *testing.B) {
 
 					for lo := 0; lo < rows; lo += batch {
 						if feed == feedBind {
-							err = bnd.AppendDict(dc, gen, lo, lo+batch, nil)
+							err = bnd.AppendDict(dc, gen, Lease{}, lo, lo+batch, nil)
 						} else {
 							err = w.AppendBytes(0, cells[lo:lo+batch])
 						}

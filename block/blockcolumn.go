@@ -1253,10 +1253,10 @@ type Decoder struct {
 	// shared is the column's shared dictionary. Every granule that joined it carries only ids into
 	// it, so it is parsed at open and resolved against here.
 	shared sharedDict
-	// sharedGen names the shared dictionary for the decoder's life; selfGen names each self granule
-	// until the next decode.
+	// sharedGen names the shared dictionary for the decoder's life; granules issues each decoded
+	// granule's lease, and a self granule's table token, until the next decode.
 	sharedGen dictOwner
-	selfGen   dictOwner
+	granules  dictOwner
 
 	// streams holds the decompressed compression frame, reused across this decoder's blocks. A
 	// decoder decodes its column's blocks serially (never concurrently), and each block's decoded
@@ -1316,7 +1316,7 @@ func (d *Decoder) DecodeBytes(blocks []int) (*chunk.DictColumn, error) {
 		return nil, errors.Errorf("block: column is %s, not bytes", d.kind)
 	}
 
-	d.selfGen.retire()
+	d.granules.retire()
 
 	return decodeBlockedBytes(d.streams.dir, d.streams.comp, d.rows, blocks, d.shared)
 }
