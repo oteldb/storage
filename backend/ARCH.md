@@ -74,8 +74,8 @@ a demonstration.
   result**: `List` walks only the prefix's subtree, and `Delete` rmdirs the directories its object
   leaves empty. Otherwise a listing costs a full-tree walk whose size grows with parts *ever
   created* — maintenance lists per tenant/signal every tick. `New` never removes anything: other
-  owners share the root (oteldb's WAL defaults to `<root>/wal`, whose directories sit empty after a
-  clean close while a writer still holds them), and a read-only open must not mutate the tree.
+  owners may share the root, and an empty directory there can be one a writer still holds open (a WAL's,
+  after a clean close), and a read-only open must not mutate the tree.
 
   **Durability against power loss, not only against a process crash.** Syncing the temp file
   commits its *bytes*; the directory entry that names them is a separate promise, and a rename is
