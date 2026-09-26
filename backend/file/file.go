@@ -73,12 +73,7 @@ func New(dir string) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = root.Close() }()
-
-	// Directories left behind by a version without Delete-time pruning (or by a crash between
-	// an object delete and its rmdir) make every List traverse dead subtrees forever. Sweep
-	// them once at open; best-effort, an unreadable subtree is not a reason to fail.
-	f.pruneEmpty(root, ".")
+	_ = root.Close()
 
 	return f, nil
 }
@@ -432,34 +427,6 @@ func (f *File) pruneParents(root vfs.FS, p string, durable bool) {
 			return
 		}
 	}
-}
-
-// pruneEmpty removes every empty directory under dir (not dir itself), reporting whether dir
-// is empty afterwards. Errors are ignored: it is an optimization, not a correctness step.
-func (f *File) pruneEmpty(root vfs.FS, dir string) bool {
-	entries, err := root.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-
-	empty := true
-
-	for _, e := range entries {
-		if !e.IsDir() {
-			empty = false
-
-			continue
-		}
-
-		sub := path.Join(dir, e.Name())
-		if f.pruneEmpty(root, sub) && f.removeEmptyDir(root, sub) {
-			continue
-		}
-
-		empty = false
-	}
-
-	return empty
 }
 
 // tmpPrefix names the half-written files [List] must not report as objects.
