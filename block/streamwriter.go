@@ -61,7 +61,8 @@ func NewStreamWriter(opts ...PartOption) *StreamWriter {
 // The column objects it produces carry their directory as a footer ([ColumnDesc.Footer]) — with the
 // directory leading, no byte of the object could be final until the last frame sealed. A column that
 // turns out to be constant is written under neither layout: it collapses into the manifest, so it
-// stays buffered until it is known non-constant (which for real data is the second row).
+// stays buffered until it is known non-constant (which for real data is the second row) or holds one
+// frame of output, past which it streams and is discarded if it ends constant.
 //
 // ctx spans the writer's whole life, appends included. Nothing is stored under prefix until the
 // writer finishes; a writer that will not finish must be released with [StreamWriter.Abort].
@@ -633,12 +634,11 @@ func (c *streamColumn) disableAlt() {
 }
 
 // maybeAttach hands the column's accumulators their object writers the first time the rows prove it
-// non-constant. Before that the frames must stay in memory: a constant column collapses into the
-// manifest and has no object, and an object cannot be un-created once its bytes are on their way to
-// the backend. Constant data is also the case where buffering costs least — a run of one value is
-// what every codec here compresses hardest.
+// non-constant, or once its retained output reaches [streamColumn.constRetainBytes]. Before that the
+// frames stay in memory: a constant column collapses into the manifest and has no object, so one
+// attached early is aborted at the end, costing one wasted object write.
 func (c *streamColumn) maybeAttach() error {
-	if c.open == nil || c.streaming || !c.knownNonConst() {
+	if c.open == nil || c.streaming || (!c.knownNonConst() && c.retained() < c.constRetainBytes()) {
 		return nil
 	}
 
@@ -653,6 +653,19 @@ func (c *streamColumn) maybeAttach() error {
 	}
 
 	return nil
+}
+
+// constRetainBytes bounds the sealed output a column not yet known non-constant holds: one frame.
+// A constant stream compresses to almost nothing, so this covers a very long constant prefix.
+func (c *streamColumn) constRetainBytes() int { return c.blk.compressBytes }
+
+func (c *streamColumn) retained() int {
+	n := c.blk.bytes
+	if c.alt != nil && c.altOK {
+		n += c.alt.bytes
+	}
+
+	return n
 }
 
 // knownNonConst reports whether the rows appended so far already rule out the constant collapse that
