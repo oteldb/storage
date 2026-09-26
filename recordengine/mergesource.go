@@ -608,10 +608,12 @@ func (c *byteCursor) load(row int) error {
 
 	blk := row / c.dec.BlockRows()
 
-	col, _, _, err := c.dec.DecodeBytesBlock(blk)
+	g, err := c.dec.DecodeBytesBlock(blk)
 	if err != nil {
 		return err
 	}
+
+	col := g.Column()
 
 	c.col, c.lo, c.hi, c.remapped = mergeByteCol{dict: col}, lo, hi, false
 

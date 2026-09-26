@@ -422,7 +422,9 @@ func retainedHeap(ctx context.Context, t *testing.T, r *PartReader) (opened, wal
 	d, err := r.ColumnBlocks(ctx, "attrs")
 	require.NoError(t, err)
 
-	granule, _, _, err := d.DecodeBytesBlock(0)
+	granuleG, err := d.DecodeBytesBlock(0)
+
+	granule := granuleG.Column()
 	require.NoError(t, err)
 	require.NotNil(t, granule)
 

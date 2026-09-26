@@ -157,11 +157,15 @@ func TestTrailerColumnGolden(t *testing.T) {
 	dec, err := newColumnReader(desc, obj, noneComp(), len(vals)).BlockDecoder()
 	require.NoError(t, err)
 
-	narrow, _, _, err := dec.DecodeBytesBlock(0)
+	narrowG, err := dec.DecodeBytesBlock(0)
+
+	narrow := narrowG.Column()
 	require.NoError(t, err)
 	assert.Equal(t, 1, narrow.IDWidth, "a granule sealed before the 257th entry keeps 1-byte ids")
 
-	wide, _, _, err := dec.DecodeBytesBlock(9)
+	wideG, err := dec.DecodeBytesBlock(9)
+
+	wide := wideG.Column()
 	require.NoError(t, err)
 	assert.Equal(t, 2, wide.IDWidth)
 
@@ -299,7 +303,7 @@ func requireCorruptEverywhere(t *testing.T, desc ColumnDesc, obj []byte, rows in
 	require.ErrorIs(t, err, ErrCorrupt, "DecodeBlocksBytesIntoColumn")
 
 	if dec, err := r().BlockDecoder(); err == nil {
-		_, _, _, err = dec.DecodeBytesBlock(0)
+		_, err = dec.DecodeBytesBlock(0)
 		require.ErrorIs(t, err, ErrCorrupt, "DecodeBytesBlock")
 	} else {
 		require.ErrorIs(t, err, ErrCorrupt, "BlockDecoder")
@@ -725,7 +729,8 @@ func FuzzTrailerColumnDecode(f *testing.F) {
 		read(newColumnReader(d, object, noneComp(), len(vals)).DecodeBlocksBytesIntoColumn([]int{0, 9, 11}))
 
 		if dec, err := newColumnReader(d, object, noneComp(), len(vals)).BlockDecoder(); err == nil {
-			dc, _, _, err := dec.DecodeBytesBlock(9)
+			dcG, err := dec.DecodeBytesBlock(9)
+			dc := dcG.Column()
 			read(dc, err)
 		}
 	})

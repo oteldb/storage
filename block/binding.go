@@ -49,26 +49,24 @@ func (b *Binding) Bind(entries [][]byte, gen DictGen) error { return b.bind(entr
 // caller's own table. A self-granule table aliases a reused frame and is refused.
 func (b *Binding) BindStable(entries [][]byte, gen DictGen) error { return b.bind(entries, gen, true) }
 
-// AppendDict appends rows [lo,hi) of dc, those keep marks when keep is non-nil (keep[j] for row
-// lo+j), to the bound column. dc must decode against the bound table, which gen must name, and lease
-// must be the one its decode returned: a granule a later decode may have overwritten is refused.
-func (b *Binding) AppendDict(dc *chunk.DictColumn, gen DictGen, lease Lease, lo, hi int, keep []bool) error {
+// AppendDict appends rows [lo,hi) of g, those keep marks when keep is non-nil (keep[j] for row
+// lo+j), to the bound column. g's table must be the bound one, and g must still be live: a granule a
+// later decode may have overwritten is refused.
+func (b *Binding) AppendDict(g DecodedGranule, lo, hi int, keep []bool) error {
 	c := b.c
 	if c.bytes.finished {
 		return errWriterFinished
 	}
 
-	if gen != b.gen {
+	if g.table != b.gen {
 		return errors.Errorf("block: column %q: dictionary token is not the bound one", c.name)
 	}
 
-	if !gen.live() {
-		return errors.Errorf("block: column %q: dictionary table was overwritten by a later decode", c.name)
-	}
-
-	if !lease.live() {
+	if !g.live() {
 		return errors.Errorf("block: column %q: granule was overwritten by a later decode", c.name)
 	}
+
+	dc := g.dc
 
 	if lo < 0 || hi < lo || hi > dc.Len() {
 		return errors.Errorf("block: column %q: rows [%d,%d) out of %d", c.name, lo, hi, dc.Len())

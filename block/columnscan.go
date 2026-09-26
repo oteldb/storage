@@ -113,30 +113,29 @@ func (s *frameSource) fill(f int, off, n int64) error {
 // is what a forward walk wants: [Decoder.DecodeBytes] takes a block set because it merges their
 // dictionaries, and merging is exactly what a caller consuming one granule at a time does not need.
 //
-// The result **aliases the decoder's frame buffer** and is valid only until the next decode that
-// crosses a frame boundary. That is the point — a merge reads a granule's ids and appends them, so
-// copying every value to hand it back would be the per-row cost this path exists to avoid. A caller
-// that retains the column past its next call must copy it.
+// The result **aliases the decoder's frame buffer** and is valid only until the next decode. That is
+// the point — a merge reads a granule's ids and appends them, so copying every value to hand it back
+// would be the per-row cost this path exists to avoid. A caller that retains the column past its
+// next call must copy it.
 //
 // For a granule on the column's shared dictionary the result carries that dictionary and the
 // granule's ids unchanged, so its entries are the column's, not the granule's, and the token is the
 // one [Decoder.SharedEntries] returns. Any other granule gets a token that dies at the next decode.
-// The lease covers the granule itself, whose ids alias the frame in either case, and dies at the
-// next decode too.
-func (d *Decoder) DecodeBytesBlock(blk int) (*chunk.DictColumn, DictGen, Lease, error) {
+// The granule itself, whose ids alias the frame in either case, dies at the next decode too.
+func (d *Decoder) DecodeBytesBlock(blk int) (DecodedGranule, error) {
 	if d.kind != KindBytes {
-		return nil, DictGen{}, Lease{}, errors.Errorf("block: column is %s, not bytes", d.kind)
+		return DecodedGranule{}, errors.Errorf("block: column is %s, not bytes", d.kind)
 	}
 
 	dir := d.streams.dir
 
 	if blk < 0 || blk >= dir.nBlocks() {
-		return nil, DictGen{}, Lease{}, errors.Errorf("block: block %d out of range [0,%d)", blk, dir.nBlocks())
+		return DecodedGranule{}, errors.Errorf("block: block %d out of range [0,%d)", blk, dir.nBlocks())
 	}
 
 	lo := blk * dir.blockRows
 	if lo >= d.rows {
-		return nil, DictGen{}, Lease{}, errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", blk, lo, d.rows)
+		return DecodedGranule{}, errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", blk, lo, d.rows)
 	}
 
 	n := min(lo+dir.blockRows, d.rows) - lo
@@ -145,18 +144,17 @@ func (d *Decoder) DecodeBytesBlock(blk int) (*chunk.DictColumn, DictGen, Lease, 
 
 	stream, err := d.streams.granule(blk)
 	if err != nil {
-		return nil, DictGen{}, Lease{}, err
+		return DecodedGranule{}, err
 	}
 
 	if d.shared.on {
 		ids, width, self, err := d.shared.granule(stream, n)
 		if err != nil {
-			return nil, DictGen{}, Lease{}, errors.Wrapf(err, "decode block %d", blk)
+			return DecodedGranule{}, errors.Wrapf(err, "decode block %d", blk)
 		}
 
 		if !self {
-			return &chunk.DictColumn{Entries: d.shared.entries, IDs: ids, IDWidth: width}, d.sharedGen.token(),
-				Lease{d.granules.token()}, nil
+			return d.granule(&chunk.DictColumn{Entries: d.shared.entries, IDs: ids, IDWidth: width}, d.sharedGen.token()), nil
 		}
 
 		stream = ids
@@ -165,12 +163,16 @@ func (d *Decoder) DecodeBytesBlock(blk int) (*chunk.DictColumn, DictGen, Lease, 
 	var dc chunk.DictColumn
 
 	if _, err := dc.DecodeBytes(stream); err != nil {
-		return nil, DictGen{}, Lease{}, errors.Wrapf(err, "decode block %d", blk)
+		return DecodedGranule{}, errors.Wrapf(err, "decode block %d", blk)
 	}
 
 	if dc.Len() != n {
-		return nil, DictGen{}, Lease{}, errors.Wrapf(ErrCorrupt, "block %d decoded %d rows, want %d", blk, dc.Len(), n)
+		return DecodedGranule{}, errors.Wrapf(ErrCorrupt, "block %d decoded %d rows, want %d", blk, dc.Len(), n)
 	}
 
-	return &dc, d.granules.token(), Lease{d.granules.token()}, nil
+	return d.granule(&dc, d.granules.token()), nil
+}
+
+func (d *Decoder) granule(dc *chunk.DictColumn, table DictGen) DecodedGranule {
+	return DecodedGranule{dc: dc, table: table, lease: lease{g: d.granules.token(), dc: dc}}
 }
