@@ -3,10 +3,12 @@ package profile
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"math"
 	"slices"
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -211,51 +213,131 @@ func (b *builder) stackID(idx int32) signal.SeriesID {
 
 const (
 	symMagic   uint32 = 0x4F545350 // "OTSP"
-	symVersion uint32 = 1
+	symVersion uint32 = 2
+	// symVersionRaw stores the body uncompressed and without its length; still read, never written.
+	symVersionRaw uint32 = 1
 )
 
-// encodeTable serializes one table (sorted by id) as [magic][version][uvarint count] then per entry
-// [16B id][uvarint len][bytes], with a trailing CRC32C.
-func encodeTable(m map[signal.SeriesID][]byte) []byte {
-	ids := make([]signal.SeriesID, 0, len(m))
-	for id := range m {
-		ids = append(ids, id)
-	}
+var (
+	sidecarCompressor = compress.NewCompressor(compress.AlgorithmZSTD, compress.LevelDefault)
+	deltaCompressor   = compress.NewCompressor(compress.AlgorithmNone, compress.LevelDefault)
+	lz4Compressor     = compress.NewCompressor(compress.AlgorithmLZ4, compress.LevelDefault)
+)
 
-	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
+func tableCompressor(alg compress.Algorithm) *compress.Compressor {
+	switch alg {
+	case compress.AlgorithmNone:
+		return deltaCompressor
+	case compress.AlgorithmZSTD:
+		return sidecarCompressor
+	case compress.AlgorithmLZ4:
+		return lz4Compressor
+	default:
+		return nil
+	}
+}
+
+// encodeTable serializes one table as [magic][version][algorithm][uvarint body len][compressed
+// body][CRC32C].
+func encodeTable(m map[signal.SeriesID][]byte, c *compress.Compressor) []byte {
+	body := tableBody(m)
 
 	out := binary.BigEndian.AppendUint32(nil, symMagic)
 	out = binary.BigEndian.AppendUint32(out, symVersion)
-	out = binary.AppendUvarint(out, uint64(len(ids)))
-
-	for _, id := range ids {
-		out = id.AppendBinary(out)
-		entry := m[id]
-		out = binary.AppendUvarint(out, uint64(len(entry)))
-		out = append(out, entry...)
-	}
+	out = append(out, byte(c.Algorithm()))
+	out = binary.AppendUvarint(out, uint64(len(body)))
+	out = c.Compress(out, body)
 
 	return binary.BigEndian.AppendUint32(out, crc32.Checksum(out, castagnoli))
 }
 
-// decodeTable parses encodeTable's output into dst (merging, dedup), verifying the CRC and
+// tableBody lays out m as [uvarint count] then, sorted by id, [16B id][uvarint len][bytes].
+func tableBody(m map[signal.SeriesID][]byte) []byte {
+	ids := make([]signal.SeriesID, 0, len(m))
+	size := binary.MaxVarintLen64
+
+	for id, entry := range m {
+		ids = append(ids, id)
+		size += 16 + binary.MaxVarintLen64 + len(entry)
+	}
+
+	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
+
+	body := make([]byte, 0, size)
+	body = binary.AppendUvarint(body, uint64(len(ids)))
+
+	for _, id := range ids {
+		body = id.AppendBinary(body)
+		entry := m[id]
+		body = binary.AppendUvarint(body, uint64(len(entry)))
+		body = append(body, entry...)
+	}
+
+	return body
+}
+
+// decodeTable parses a table of either version into dst (merging, dedup), verifying the CRC and
 // bounds-checking every read.
 func decodeTable(dst map[signal.SeriesID][]byte, data []byte) error {
 	if len(data) < 12 { // magic+version+crc
 		return ErrCorruptSymbols
 	}
 
-	body := data[:len(data)-4]
-	if crc32.Checksum(body, castagnoli) != binary.BigEndian.Uint32(data[len(data)-4:]) {
+	framed := data[:len(data)-4]
+	if crc32.Checksum(framed, castagnoli) != binary.BigEndian.Uint32(data[len(data)-4:]) {
 		return errors.Wrap(ErrCorruptSymbols, "crc mismatch")
 	}
 
-	if binary.BigEndian.Uint32(body) != symMagic || binary.BigEndian.Uint32(body[4:]) != symVersion {
-		return errors.Wrap(ErrCorruptSymbols, "bad header")
+	if binary.BigEndian.Uint32(framed) != symMagic {
+		return errors.Wrap(ErrCorruptSymbols, "bad magic")
 	}
 
-	p := body[8:]
+	switch binary.BigEndian.Uint32(framed[4:]) {
+	case symVersionRaw:
+		return decodeEntries(dst, framed[8:])
+	case symVersion:
+		body, err := decompressBody(framed[8:])
+		if err != nil {
+			return err
+		}
 
+		return decodeEntries(dst, body)
+	default:
+		return errors.Wrap(ErrCorruptSymbols, "bad version")
+	}
+}
+
+// decompressBody inflates a version 2 body to exactly its recorded length, so a corrupt table
+// allocates no more than its header claims.
+func decompressBody(p []byte) ([]byte, error) {
+	if len(p) == 0 {
+		return nil, errCorrupt("algorithm")
+	}
+
+	c := tableCompressor(compress.Algorithm(p[0]))
+	if c == nil {
+		return nil, errCorrupt("algorithm")
+	}
+
+	rawLen, n := binary.Uvarint(p[1:])
+	if n <= 0 || rawLen > math.MaxInt {
+		return nil, errCorrupt("body len")
+	}
+
+	body, err := c.DecompressLimit(nil, p[1+n:], int(rawLen))
+	if err != nil {
+		return nil, errors.Errorf("%w: %w", ErrCorruptSymbols, err)
+	}
+
+	if uint64(len(body)) != rawLen {
+		return nil, errors.Wrapf(ErrCorruptSymbols, "body of %d bytes, header says %d", len(body), rawLen)
+	}
+
+	return body, nil
+}
+
+// decodeEntries parses a table body into dst, copying each entry out of p.
+func decodeEntries(dst map[signal.SeriesID][]byte, p []byte) error {
 	count, n := binary.Uvarint(p)
 	if n <= 0 || count > uint64(len(p)) {
 		return errCorrupt("count")
@@ -294,7 +376,7 @@ func errCorrupt(what string) error { return errors.Wrap(ErrCorruptSymbols, what)
 func encodeDelta(s symTables) []byte {
 	var out []byte
 	for i := range s.t {
-		blob := encodeTable(s.t[i])
+		blob := encodeTable(s.t[i], deltaCompressor)
 		out = binary.AppendUvarint(out, uint64(len(blob)))
 		out = append(out, blob...)
 	}
@@ -342,7 +424,7 @@ func (s *SymbolStore) Absorb(delta []byte) error { return decodeDeltaInto(&s.acc
 func (s *SymbolStore) Encode() map[string][]byte {
 	out := make(map[string][]byte, len(tableNames))
 	for i, name := range tableNames {
-		out[name] = encodeTable(s.acc.t[i])
+		out[name] = encodeTable(s.acc.t[i], sidecarCompressor)
 	}
 
 	return out
@@ -390,7 +472,7 @@ func (s *SymbolStore) Union(parts []map[string][]byte) (map[string][]byte, error
 
 	out := make(map[string][]byte, len(tableNames))
 	for i, name := range tableNames {
-		out[name] = encodeTable(merged.t[i])
+		out[name] = encodeTable(merged.t[i], sidecarCompressor)
 	}
 
 	return out, nil

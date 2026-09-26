@@ -540,7 +540,7 @@ relies on `Condition.Equal` being byte-identical to `Match` for that column — 
 |---|---|
 | `bloom-{col}.bin` | per-column token blooms |
 | `keys.bin` (`OTKY`, magic+version+CRC32C) | the part's distinct per-record **attribute keys** |
-| `sym-{name}.bin` (`OTSP`) | the optional **side store** |
+| `sym-{name}.bin` (`OTSP`) | the optional **side store**, in the signal's format (`../signal/ARCH.md`) |
 
 The blooms are **advisory**: they only ever remove parts the per-row re-check would have removed
 anyway, so a sidecar that is absent *or fails to decode* degrades to "this column does not prune
