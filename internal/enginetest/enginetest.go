@@ -205,6 +205,13 @@ var suite = []struct {
 	{"HeadAgeTracksFlushLag", headAgeTracksFlushLag},
 	{"MergeShapeReportsBytes", mergeShapeReportsBytes},
 	{"MergeShapeCountsRetentionWork", mergeShapeCountsRetentionWork},
+	{"StraddlingPartsCompact", straddlingPartsCompact},
+	{"CoLocatedPartsCompact", coLocatedPartsCompact},
+	{"StraddlerBacklogConverges", straddlerBacklogConverges},
+	{"StraddlersDoNotAccumulate", straddlersDoNotAccumulate},
+	{"ForceReachesStraddlers", forceReachesStraddlers},
+	{"RetentionSplitsStraddler", retentionSplitsStraddler},
+	{"MergeConvergesWithStraddlers", mergeConvergesWithStraddlers},
 
 	{"HoleCommittedAfterRepeatedAbsence", holeCommittedAfterRepeatedAbsence},
 	{"IncompletePeerSetNeverHoles", incompletePeerSetNeverHoles},

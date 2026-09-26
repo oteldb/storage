@@ -581,6 +581,10 @@ Disk-pressure eviction shares `RetainFrom`, so it drops whole parts too.
 
 ### Selection is confined to an aligned time bucket (`timebucket.go`)
 
+The ladder, the bucket arithmetic and the straddler batch live in `internal/timebucket`, shared with
+the record engine; each engine keeps its own walk over the ladder, since the selectors inside a bucket
+differ.
+
 Selection is bucketed by time, not by size alone: size tiers have no notion of time, so an unbucketed
 selector folds an hour-wide part into a day-wide one until every part overlaps every query window.
 
@@ -610,7 +614,8 @@ The selector therefore takes straddlers as a third kind of work, after forced re
 (`selectStraddlers`): oldest first, batched up to the cap and `maxMergeParts`. Every merge whose inputs
 span more than one day bucket — a straddler batch, or a forced rewrite of one — writes its output one
 day-wide window at a time (`compactAligned`), so **every merge output fits a level**, which is the
-invariant `TestSelectMergePartsOutputFitsALadderLevel` pins. A straddler's samples land in the buckets
+invariant the shared suite's `StraddlingPartsCompact` and `MergeConvergesWithStraddlers` pin against
+both engines. A straddler's samples land in the buckets
 they belong to and the ladder folds them into their neighbours; no part a merge writes is a straddler,
 so each straddler is rewritten once.
 
