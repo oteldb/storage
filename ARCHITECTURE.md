@@ -256,7 +256,8 @@ to fail over to: a read overlapping a want fails.
   nodes), WAL record framing
   (additive record types), record-key footer (`OTKY`), the metric part column layout
   (`[series:int128, ts:int64, value:float64]` + optional `sf:float64`), and the profile
-  symbol-store sidecar (`OTSP`). Changing one is an architectural change.
+  symbol-store sidecar (`OTSP`, version 2: a compressed body with its raw length; version 1 still
+  read). Changing one is an architectural change.
 
 ### Testing discipline
 

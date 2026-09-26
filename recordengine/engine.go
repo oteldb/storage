@@ -1436,6 +1436,15 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 
 	newParts := make([]*part, 0, len(ranges))
 
+	var storedSide map[string][]byte
+
+	if side != nil {
+		var err error
+		if storedSide, err = e.cfg.SideStore.Stored(side); err != nil {
+			return 0, 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
+		}
+	}
+
 	for _, rg := range ranges {
 		sub := f
 		if len(ranges) > 1 {
@@ -1461,8 +1470,8 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 
 		// Each part carries its own copy of the side-store delta: a part's columns reference symbols
 		// by id, so every part a split produces must resolve them on its own.
-		if side != nil {
-			if err := writeSidecars(ctx, e.cfg.Backend, prefix, side); err != nil {
+		if storedSide != nil {
+			if err := writeSidecars(ctx, e.cfg.Backend, prefix, storedSide); err != nil {
 				return 0, 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
 			}
 		}

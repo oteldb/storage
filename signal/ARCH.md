@@ -90,6 +90,34 @@ rather than a per-sample column. `stack_id` is content-addressed, computed Merkl
 (string→function→location→stack), so the same stack has the same id everywhere; the symbol store
 rides the part lifecycle through the record engine's side-store hook.
 
+**Symbol tables are compressed.** Each table (`sym-{name}.bin`, and each table of a batch delta) is
+an `OTSP` blob: version 2 is `[magic][version][algorithm][uvarint raw length][compress block][CRC32C]`
+over a body of `[count]` then `[16B id][len][bytes]` sorted by id. The body is mostly 16-byte ids,
+random individually but repeated across the stacks and locations that share frames, which zstd finds.
+On `profile/testdata/cpu.pprof` (a CPU profile of this module's benchmarks: 5067 stacks) zstd takes
+the tables from 1.52 MB to 449 KB, 3.4×: stacks 5.0×, strings 2.2×, locations 2.1×,
+functions 1.6×. Larger tables repeat more: a test-stand part's stacks shrink 8.3× under zstd-19.
+
+- **Only the disk boundary compresses.** `SymbolStore.Stored` re-frames a table's body under zstd,
+  and the engine calls it (`SideStore.Stored`) on exactly what it writes as sidecars: a flush's
+  snapshot once per flush, a merge's union once. Everything else — the batch delta, `Encode`, `Union`
+  output, the `SideSnapshot` a resolver is built from — is `AlgorithmNone`. The resolver is rebuilt
+  from the whole tenant store per profile query, so compressing its input would add a full zstd
+  encode per query only to decode it straight back; the in-memory form costs a copy. A delta rides
+  the WAL and replication per ingest batch, where the wire framing already compresses.
+- **zstd at the default level.** The engine passes the side store no compressor, and its
+  `MergeCompression` does not apply at flush, so the table picks its own; the algorithm byte keeps
+  it a writer decision. zstd-19 gains 1.5% over the default and `LevelFast` saves 10–20% encode time
+  for 3% of the ratio.
+- **The cost is flush and merge encode time.** zstd encodes at 110–270 MB/s against 460–1190 MB/s
+  raw, and decodes at 460–1035 MB/s against 600–1410. A resolver build pays only the decode of
+  flushed parts: `BenchmarkResolverBuild` is no slower than with uncompressed sidecars.
+- **Decode is bounded by the recorded length.** The body inflates through `DecompressLimit` to
+  exactly the raw length in the header, so a corrupt table allocates no more than it claims, and no
+  more than its frame can produce: a frame that inflates past the claim fails before decoding.
+- **Version 1 decodes forever and is never written.** It is the same body stored raw, with no
+  algorithm or length.
+
 ## `otlp/pdataconv`
 
 **The only package importing `go.opentelemetry.io/collector/pdata`**, and optional. It lives at the

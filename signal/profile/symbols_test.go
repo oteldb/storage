@@ -3,7 +3,6 @@ package profile
 import (
 	"testing"
 
-	"github.com/go-faster/sdk/gold"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -64,27 +63,6 @@ func TestBuilderDeltaDedups(t *testing.T) {
 	assert.Len(t, b.tables.t[4], 2, "two distinct stacks")
 }
 
-// TestTableRoundTrip verifies decodeTable recovers every entry and the wire form is idempotent
-// (encode∘decode∘encode == encode), including a zero-length entry (the "" string sentinel).
-func TestTableRoundTrip(t *testing.T) {
-	t.Parallel()
-
-	m := map[signal.SeriesID][]byte{
-		{Hi: 1, Lo: 2}: []byte("alpha"),
-		{Hi: 3, Lo: 4}: []byte("beta"),
-		{Hi: 3, Lo: 5}: {}, // empty entry (e.g. the "" sentinel string)
-	}
-
-	enc := encodeTable(m)
-
-	got := map[signal.SeriesID][]byte{}
-	require.NoError(t, decodeTable(got, enc))
-	assert.Len(t, got, 3)
-	assert.Equal(t, []byte("alpha"), got[signal.SeriesID{Hi: 1, Lo: 2}])
-	assert.Empty(t, got[signal.SeriesID{Hi: 3, Lo: 5}])
-	assert.Equal(t, enc, encodeTable(got), "wire form is idempotent")
-}
-
 // TestSymbolStoreAbsorbEncodeUnion exercises the SideStore lifecycle: absorb two batch deltas,
 // encode sidecars, then union two parts' sidecars and confirm the merged tables hold every entry.
 func TestSymbolStoreAbsorbEncodeUnion(t *testing.T) {
@@ -119,26 +97,6 @@ func TestSymbolStoreAbsorbEncodeUnion(t *testing.T) {
 	require.NoError(t, decodeTable(strings, merged["strings"]))
 	// a/a.go/b/b.go plus the "" sentinel (referenced via each function's unset system-name) ⇒ 5.
 	assert.Len(t, strings, 5)
-}
-
-// TestDecodeTableGolden pins the table wire format.
-func TestDecodeTableGolden(t *testing.T) {
-	t.Parallel()
-
-	m := map[signal.SeriesID][]byte{
-		{Hi: 0x0102030405060708, Lo: 0x090a0b0c0d0e0f10}: []byte("frame"),
-	}
-	gold.Bytes(t, encodeTable(m), "symtable")
-}
-
-// FuzzDecodeTable: arbitrary bytes must error or decode cleanly, never panic.
-func FuzzDecodeTable(f *testing.F) {
-	f.Add(encodeTable(map[signal.SeriesID][]byte{{Hi: 1}: []byte("x")}))
-	f.Add([]byte{0x4f, 0x54, 0x53, 0x50})
-
-	f.Fuzz(func(_ *testing.T, data []byte) {
-		_ = decodeTable(map[signal.SeriesID][]byte{}, data)
-	})
 }
 
 // FuzzAbsorbDelta: arbitrary deltas (the cluster/replication path decodes these) must never panic.

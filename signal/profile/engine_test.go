@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
 )
@@ -73,8 +74,16 @@ func TestEngineSymbolStoreDedupAcrossParts(t *testing.T) {
 
 		data, err := be.Read(ctx, k)
 		require.NoError(t, err)
+		require.Equal(t, byte(compress.AlgorithmZSTD), data[8], "sidecars are stored compressed")
 		require.NoError(t, decodeTable(merged, data))
 	}
 
 	require.Len(t, merged, 1, "shared stack stored once after merge-union")
+
+	snapshot, err := eng.SideSnapshot(ctx)
+	require.NoError(t, err)
+
+	for name, data := range snapshot {
+		require.Equal(t, byte(compress.AlgorithmNone), data[8], "snapshot %s stays uncompressed", name)
+	}
 }

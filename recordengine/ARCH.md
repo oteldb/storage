@@ -540,7 +540,7 @@ relies on `Condition.Equal` being byte-identical to `Match` for that column — 
 |---|---|
 | `bloom-{col}.bin` | per-column token blooms |
 | `keys.bin` (`OTKY`, magic+version+CRC32C) | the part's distinct per-record **attribute keys** |
-| `sym-{name}.bin` (`OTSP`) | the optional **side store** |
+| `sym-{name}.bin` (`OTSP`) | the optional **side store**, in the signal's format (`../signal/ARCH.md`) |
 
 The blooms are **advisory**: they only ever remove parts the per-row re-check would have removed
 anyway, so a sidecar that is absent *or fails to decode* degrades to "this column does not prune
@@ -573,6 +573,12 @@ The side store is a content-addressed auxiliary store a signal attaches per batc
 riding the part lifecycle: absorbed into a live accumulator, written as sidecars on flush, **unioned**
 on merge (content addressing makes the union a plain dedup with no id remap), and **restored** into the
 accumulator when a flush fails. Profiles' symbol store is the first user; nil for logs/traces.
+
+`Encode` and `Union` return the in-memory form, which `SideSnapshot` hands to a resolver per
+query; `SideStore.Stored` converts to the on-disk form, and the engine applies it only to what
+`writeSidecars` writes: the flush snapshot once per flush (shared by every part a split produces)
+and the merged union. A store that compresses its sidecars thus pays that encode at flush and
+merge, never on the query path.
 
 **Symbols follow their records' visibility.** A record is in exactly one of head / `e.flushing` / a
 published part, and `Engine.SideSnapshot` must union the side data of all three the same way a fetch
