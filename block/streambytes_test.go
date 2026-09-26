@@ -712,7 +712,9 @@ func TestStreamWriterToBytesResidentBytesStaysFlat(t *testing.T) {
 				require.NoError(t, w.AddColumn(Column{Name: "r", Kind: KindBytes, Codec: chunk.CodecBytesRaw, Block: true}))
 			}
 
-			var early, earlyBuffered int64
+			// rawAfter is the value bytes the raw column takes after the early sample. Uncompressed, a
+			// buffered writer holds every one of them, whatever the other column's frames compress to.
+			var early, earlyBuffered, rawAfter int64
 
 			const batches = 256
 
@@ -724,14 +726,20 @@ func TestStreamWriterToBytesResidentBytesStaysFlat(t *testing.T) {
 					require.NoError(t, w.AppendBytes(1, vals))
 				}
 
-				if n == batches/8 {
+				switch {
+				case n == batches/8:
 					early, earlyBuffered = streamed.ResidentBytes(), buffered.ResidentBytes()
+				case n > batches/8:
+					for _, v := range vals {
+						rawAfter += int64(len(v))
+					}
 				}
 			}
 
 			require.Positive(t, early)
 			assert.Less(t, streamed.ResidentBytes(), early*3/2, "a streamed bytes column must not grow with the part")
-			assert.Greater(t, buffered.ResidentBytes(), 4*earlyBuffered)
+			assert.GreaterOrEqual(t, buffered.ResidentBytes()-earlyBuffered, rawAfter,
+				"a buffered writer holds the part it builds, the raw column's values at least")
 		})
 	}
 }
