@@ -478,7 +478,7 @@ func TestSharedDictCapChargesNewValuesOnly(t *testing.T) {
 	a, bv := big, []byte("b")
 	vals := [][]byte{a, a, a, a, a, a, a, bv}
 
-	b := newSharedDictBuilder(defaultSharedDictBytes)
+	b := newSharedDictBuilder(defaultSharedDictBytes, false)
 	defer b.release()
 
 	ids := make([]int32, 4)
@@ -487,7 +487,7 @@ func TestSharedDictCapChargesNewValuesOnly(t *testing.T) {
 	assert.Equal(t, [][]byte{a, bv}, b.entries)
 	assert.Equal(t, []int32{0, 0, 0, 1}, ids)
 
-	tight := newSharedDictBuilder(17 << 20)
+	tight := newSharedDictBuilder(17<<20, false)
 	defer tight.release()
 
 	require.False(t, tight.addValues(Column{Kind: KindBytes, Bytes: vals}, 0, 4, ids), "a value past the cap declines")
@@ -506,7 +506,7 @@ func TestSharedDictCapBindsOnlyWhenReached(t *testing.T) {
 	c := Column{Kind: KindBytes, Bytes: vals}
 
 	decide := func(dictCap int64, split bool) ([]bool, [][]byte) {
-		b := newSharedDictBuilder(dictCap)
+		b := newSharedDictBuilder(dictCap, false)
 		defer b.release()
 
 		sc := c

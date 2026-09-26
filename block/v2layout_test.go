@@ -26,7 +26,7 @@ func encodeLeadingSharedDict(c Column, comp *compress.Compressor, blockRows, com
 	joined := make([]bool, (n+blockRows-1)/blockRows)
 	used := false
 
-	b := newSharedDictBuilder(math.MaxInt64)
+	b := newSharedDictBuilder(math.MaxInt64, false)
 	defer b.release()
 
 	for g := range joined {

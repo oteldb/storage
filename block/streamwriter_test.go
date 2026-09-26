@@ -2,6 +2,7 @@ package block
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"testing"
@@ -357,12 +358,16 @@ func TestStreamWriterRejectsUnstreamable(t *testing.T) {
 }
 
 // FuzzStreamWriterMatchesPartWriter drives both writers with the same randomly shaped corpus,
-// varying granule size, batch boundaries and value shape.
+// varying granule size, batch boundaries and value shape, then a bytes column over the same rows
+// through every feed.
 func FuzzStreamWriterMatchesPartWriter(f *testing.F) {
 	f.Add(uint64(1), 3, 5, 4, 0)
 	f.Add(uint64(7), 1, 40, 8, 1)
 	f.Add(uint64(9), 20, 1, 2, 2)
 	f.Add(uint64(3), 7, 30, 5, 5)
+	f.Add(uint64(5), 12, 25, 4, 11)
+	f.Add(uint64(6), 30, 20, 16, 12)
+	f.Add(uint64(2), 20, 60, 64, 7)
 
 	f.Fuzz(func(t *testing.T, seed uint64, nSeries, samplesPer, gsize, shape int) {
 		if nSeries < 0 || nSeries > 40 || samplesPer < 0 || samplesPer > 60 || gsize < 1 || gsize > 64 {
@@ -404,5 +409,39 @@ func FuzzStreamWriterMatchesPartWriter(f *testing.F) {
 		require.Equal(t, batch.objects, stream.objects)
 
 		assertRowsEqual(t, rows, decodeBuilt(t, rows.writeStream(t, true, opts...)))
+
+		codec := chunk.CodecDict
+		if shape&8 != 0 {
+			codec = chunk.CodecBytesRaw
+		}
+
+		checkBytesParity(t, fuzzBytes(rows.ts, shape, seed), codec, bytesFeed(seed%uint64(feedCount)),
+			streamOpts(gsize, compress.AlgorithmZSTD), seed)
 	})
+}
+
+// fuzzBytes derives a bytes column over the fuzzed rows: repeating (every granule joins), unique
+// (every one declines), constant, or runs of each.
+func fuzzBytes(ts []int64, shape int, seed uint64) [][]byte {
+	rng := rand.New(rand.NewPCG(seed, uint64(shape)))
+	vals := make([][]byte, len(ts))
+
+	for i := range vals {
+		switch shape % 4 {
+		case 0:
+			vals[i] = fmt.Appendf(nil, "k%d", rng.IntN(5))
+		case 1:
+			vals[i] = fmt.Appendf(nil, "u%d-%d", i, rng.Uint64())
+		case 2:
+			vals[i] = []byte("same")
+		default:
+			if (i/7)%2 == 0 {
+				vals[i] = fmt.Appendf(nil, "k%d", rng.IntN(300))
+			} else {
+				vals[i] = fmt.Appendf(nil, "u%d", i)
+			}
+		}
+	}
+
+	return vals
 }

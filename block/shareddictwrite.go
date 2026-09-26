@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"slices"
 
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
@@ -51,10 +52,18 @@ type sharedDictBuilder struct {
 	stamp  []uint32
 	gen    uint32
 	firsts []int32
+
+	// Kept only for a [BytesObserver]: rows per D entry, and per distinct value of the granule just
+	// decided (slot maps a source entry to its place in firsts).
+	observe bool
+	counts  []uint64
+	gCounts []uint64
+	gVals   [][]byte
+	slot    []int32
 }
 
-func newSharedDictBuilder(dictCap int64) *sharedDictBuilder {
-	return &sharedDictBuilder{cap: dictCap}
+func newSharedDictBuilder(dictCap int64, observe bool) *sharedDictBuilder {
+	return &sharedDictBuilder{cap: dictCap, observe: observe}
 }
 
 func (b *sharedDictBuilder) release() {
@@ -81,7 +90,28 @@ func (b *sharedDictBuilder) insert(v []byte) int32 {
 	b.charge += charge
 	b.entries = append(b.entries, v)
 
+	if b.observe {
+		b.counts = append(b.counts, 0)
+	}
+
 	return int32(len(b.entries) - 1)
+}
+
+// zeroCounts resets gCounts to distinct zeroed slots, one per distinct value of the granule.
+func (b *sharedDictBuilder) zeroCounts(distinct int) {
+	b.gCounts = slices.Grow(b.gCounts[:0], distinct)[:distinct]
+	clear(b.gCounts)
+}
+
+// region serializes D as a dictionary region, returning it and the blob length it packs.
+func (b *sharedDictBuilder) region(comp *compress.Compressor) ([]byte, int64) {
+	blob := make([]byte, 0, b.raw)
+	for _, e := range b.entries {
+		blob = binary.AppendUvarint(blob, uint64(len(e)))
+		blob = append(blob, e...)
+	}
+
+	return dictRegion(comp, blob, len(b.entries)), int64(len(blob))
 }
 
 // width is the id width a granule joining now is encoded at.
@@ -124,6 +154,16 @@ func (b *sharedDictBuilder) addValues(c Column, lo, hi int, ids []int32) bool {
 		b.rowLocal = append(b.rowLocal, int32(local))
 	}
 
+	if b.observe {
+		b.zeroCounts(len(b.locals))
+
+		for _, l := range b.rowLocal {
+			b.gCounts[l]++
+		}
+
+		b.gVals = b.localVals
+	}
+
 	if !b.joins(len(b.locals), hi-lo, newCharge) {
 		return false
 	}
@@ -132,6 +172,10 @@ func (b *sharedDictBuilder) addValues(c Column, lo, hi int, ids []int32) bool {
 		if did < 0 {
 			b.locals[l] = b.insert(b.localVals[l])
 			b.index.Put(b.localVals[l], int(b.locals[l]))
+		}
+
+		if b.observe {
+			b.counts[b.locals[l]] += b.gCounts[l]
 		}
 	}
 
@@ -149,6 +193,10 @@ func (b *sharedDictBuilder) addIDs(dict [][]byte, src []int32, lo, hi int, ids [
 		// stamp is freshly zeroed and gen starts at 1, so no generation wraps onto a stale stamp.
 		b.stamp = make([]uint32, len(dict))
 		b.remap = make([]int32, len(dict))
+
+		if b.observe {
+			b.slot = make([]int32, len(dict))
+		}
 
 		for i := range b.remap {
 			b.remap[i] = -1
@@ -172,6 +220,11 @@ func (b *sharedDictBuilder) addIDs(dict [][]byte, src []int32, lo, hi int, ids [
 
 		if b.stamp[e] != b.gen {
 			b.stamp[e] = b.gen
+
+			if b.observe {
+				b.slot[e] = int32(len(b.firsts))
+			}
+
 			b.firsts = append(b.firsts, e)
 
 			if b.remap[e] < 0 {
@@ -181,13 +234,30 @@ func (b *sharedDictBuilder) addIDs(dict [][]byte, src []int32, lo, hi int, ids [
 		}
 	}
 
+	if b.observe {
+		b.zeroCounts(len(b.firsts))
+
+		for _, e := range src[lo:hi] {
+			b.gCounts[b.slot[e]]++
+		}
+
+		b.gVals = b.gVals[:0]
+		for _, e := range b.firsts {
+			b.gVals = append(b.gVals, dict[e])
+		}
+	}
+
 	if !b.joins(len(b.firsts), hi-lo, newCharge) {
 		return false
 	}
 
-	for _, e := range b.firsts {
+	for k, e := range b.firsts {
 		if b.remap[e] < 0 {
 			b.remap[e] = b.insert(dict[e])
+		}
+
+		if b.observe {
+			b.counts[b.remap[e]] += b.gCounts[k]
 		}
 	}
 
@@ -215,7 +285,8 @@ func (t trailerDict) apply(desc *ColumnDesc) {
 // The region is byte-identical to the leading layout's header, and each granule stream opens with
 // its mode byte: [modeSelf] then a chunk bytes stream, or [modeSharedNarrow]/[modeSharedWide] then
 // 1- or 2-byte big-endian ids. It reports ok=false when no granule joins, unless framed forces the
-// layout regardless.
+// layout regardless. The column's observer hears every declined granule, and the dictionary only
+// when ok.
 func encodeTrailerDictBytes(
 	c Column, comp *compress.Compressor, l columnLayout, framed bool,
 ) (obj []byte, dict trailerDict, sizing ColumnSizing, ok bool, err error) {
@@ -228,7 +299,7 @@ func encodeTrailerDictBytes(
 	modes := make([]byte, (n+l.blockRows-1)/l.blockRows)
 	used := false
 
-	b := newSharedDictBuilder(l.dictCap)
+	b := newSharedDictBuilder(l.dictCap, c.Observer != nil)
 	defer b.release()
 
 	for g := range modes {
@@ -245,6 +316,10 @@ func encodeTrailerDictBytes(
 		switch {
 		case !joined:
 			modes[g] = modeSelf
+
+			if c.Observer != nil {
+				c.Observer.SelfGranule(b.gVals, b.gCounts)
+			}
 		case b.width() == 1:
 			modes[g], used = modeSharedNarrow, true
 		default:
@@ -259,39 +334,45 @@ func encodeTrailerDictBytes(
 	acc, err := accumulateBlocked(n, comp, l.blockRows, l.compressBytes,
 		func(dst []byte, lo, hi int) ([]byte, error) {
 			mode := modes[lo/l.blockRows]
-			dst = append(dst, mode)
-
-			switch mode {
-			case modeSelf:
-				return appendBlockStream(dst, c, chunk.CodecDict, 0, lo, hi)
-			case modeSharedNarrow:
-				for _, id := range ids[lo:hi] {
-					dst = append(dst, byte(id))
-				}
-			default:
-				for _, id := range ids[lo:hi] {
-					dst = binary.BigEndian.AppendUint16(dst, uint16(id))
-				}
+			if mode == modeSelf {
+				return appendBlockStream(append(dst, mode), c, chunk.CodecDict, 0, lo, hi)
 			}
 
-			return dst, nil
+			return appendSharedIDs(dst, mode, ids[lo:hi]), nil
 		})
 	if err != nil {
 		return nil, trailerDict{}, ColumnSizing{}, false, err
 	}
 
-	blob := make([]byte, 0, b.raw)
-	for _, e := range b.entries {
-		blob = binary.AppendUvarint(blob, uint64(len(e)))
-		blob = append(blob, e...)
+	if c.Observer != nil {
+		c.Observer.Dictionary(b.entries, b.counts)
 	}
 
-	region := dictRegion(comp, blob, len(b.entries))
-	dict = trailerDict{off: int64(acc.bytes), length: int64(len(region)), raw: int64(len(blob)), entries: int64(len(b.entries))}
+	region, raw := b.region(comp)
+	dict = trailerDict{off: int64(acc.bytes), length: int64(len(region)), raw: raw, entries: int64(len(b.entries))}
 
 	obj = acc.finishBuffered(l.blockRows, region)
 
 	return obj, dict, acc.sizing(), true, nil
+}
+
+// appendSharedIDs appends a joined granule: its mode byte, then each row's D id at the mode's width.
+func appendSharedIDs(dst []byte, mode byte, ids []int32) []byte {
+	dst = append(dst, mode)
+
+	if mode == modeSharedNarrow {
+		for _, id := range ids {
+			dst = append(dst, byte(id))
+		}
+
+		return dst
+	}
+
+	for _, id := range ids {
+		dst = binary.BigEndian.AppendUint16(dst, uint16(id))
+	}
+
+	return dst
 }
 
 // dictRegion is a shared dictionary's region:

@@ -17,9 +17,9 @@ import (
 // a granule as soon as one fills, so the working set is the encoded part rather than its
 // uncompressed rows. See ARCH.md ("Two writers") for what that buys and what it costs.
 //
-// Only encodings that restart per granule can stream: blocked [KindInt64]/[KindFloat64], and
-// [KindInt128], whose RLE codec is fed runs. Output matches [PartWriter]'s byte for byte except for
-// an [Column.AutoCodec] column.
+// Only encodings that restart per granule can stream: blocked [KindInt64]/[KindFloat64]/[KindBytes],
+// and [KindInt128], whose RLE codec is fed runs. Output matches [PartWriter]'s byte for byte except
+// for an [Column.AutoCodec] column.
 //
 // Constructed with [NewStreamWriter] it still accumulates the *encoded* part in memory, which caps
 // the part at what the process can hold. [NewStreamWriterTo] removes that ceiling: sealed
@@ -120,6 +120,14 @@ func (w *StreamWriter) AddColumn(c Column) error {
 		codec = defaultCodec(c.Kind)
 	}
 
+	if err := c.checkObserver(codec); err != nil {
+		return err
+	}
+
+	if c.Block && w.granuleSize <= 0 {
+		return errors.Errorf("block: column %q: granule size %d", c.Name, w.granuleSize)
+	}
+
 	alg := c.Compress
 	if alg == compress.AlgorithmNone {
 		alg = w.defaultComp
@@ -132,6 +140,8 @@ func (w *StreamWriter) AddColumn(c Column) error {
 		comp:    w.compressorFor(alg),
 		blocked: c.Block,
 		allSame: true,
+
+		granuleSize: w.granuleSize,
 	}
 
 	switch c.Kind {
@@ -163,6 +173,18 @@ func (w *StreamWriter) AddColumn(c Column) error {
 			sc.altOK = true
 		}
 
+		sc.blk = newBlockAccum(sc.comp, w.compressBytes)
+		sc.open = w.objectOpener(len(w.cols))
+	case KindBytes:
+		if !c.Block {
+			return errors.Errorf("block: column %q: an unblocked %s column cannot be streamed; use PartWriter", c.Name, c.Kind)
+		}
+
+		if codec != chunk.CodecDict && codec != chunk.CodecBytesRaw {
+			return errors.Errorf("block: column %q: codec %s invalid for kind %s", c.Name, codec, c.Kind)
+		}
+
+		sc.bytes = newStreamBytes(codec == chunk.CodecBytesRaw, c.Observer, w.dictCap)
 		sc.blk = newBlockAccum(sc.comp, w.compressBytes)
 		sc.open = w.objectOpener(len(w.cols))
 	default:
@@ -251,7 +273,8 @@ func (w *StreamWriter) EncodedBytes() int64 {
 // proven non-constant — the frames sealed so far.
 //
 // It is what a caller seals a part on when the bound is memory rather than a size on disk. For a
-// [NewStreamWriterTo] writer it settles at a few hundred KiB per column and stops tracking the part;
+// [NewStreamWriterTo] writer it settles at a few hundred KiB per column, plus a dictionary bytes
+// column's dictionary (bounded by [WithSharedDictBytes]), and stops tracking the part;
 // for a buffered one it tracks [StreamWriter.EncodedBytes] and grows without limit.
 func (w *StreamWriter) ResidentBytes() int64 {
 	var total int64
@@ -411,11 +434,12 @@ func WriteStreamPart(ctx context.Context, b backend.Backend, prefix string, w *S
 // streamColumn accumulates one column: the granule currently being filled, the granules already
 // encoded, and the running descriptor stats.
 type streamColumn struct {
-	name    string
-	kind    Kind
-	codec   chunk.Codec
-	comp    *compress.Compressor
-	blocked bool
+	name        string
+	kind        Kind
+	codec       chunk.Codec
+	comp        *compress.Compressor
+	blocked     bool
+	granuleSize int
 
 	rows int
 	// raw is the decoded footprint of the rows appended so far, recorded in the manifest because a
@@ -445,12 +469,14 @@ type streamColumn struct {
 	stageF64 []float64
 
 	runs     []chunk.U128Run // KindInt128 only
+	bytes    *streamBytes    // KindBytes only
 	granules []Granule       // the marks index, built as granules are encoded
 
 	// Running descriptor stats: the incremental form of fillInt64Stats/fillFloat64Stats.
 	minI64, maxI64 int64
 	minF64, maxF64 float64
 	firstBits      uint64
+	first          []byte // a bytes column's first value, kept while every row equals it
 	allSame        bool
 	sawNonFinite   bool
 	haveStats      bool
@@ -640,9 +666,9 @@ func (c *streamColumn) knownNonConst() bool {
 	switch c.kind {
 	case KindInt64:
 		return c.minI64 != c.maxI64
-	case KindFloat64:
+	case KindFloat64, KindBytes:
 		return !c.allSame
-	case KindBytes, KindInt128:
+	case KindInt128:
 		return false
 	default:
 		return false
@@ -661,7 +687,8 @@ func (c *streamColumn) residentBytes() int64 {
 	total := int64(cap(c.stageI64))*8 + int64(cap(c.stageF64))*8
 	total += int64(cap(c.runs)) * runBytes
 	total += int64(cap(c.granules)) * granuleBytes
-	total += c.blk.residentBytes() + c.alt.residentBytes()
+	total += c.blk.residentBytes() + c.alt.residentBytes() + c.bytes.residentBytes()
+	total += int64(cap(c.first))
 
 	return total
 }
@@ -674,6 +701,10 @@ func (c *streamColumn) abort() {
 
 	if c.alt != nil {
 		c.alt.discard()
+	}
+
+	if c.bytes != nil && !c.bytes.finished {
+		c.bytes.release()
 	}
 }
 
@@ -734,6 +765,12 @@ func (c *streamColumn) finish(ctx context.Context, granuleSize int, sizing bool)
 		c.stageF64 = c.stageF64[:0]
 	}
 
+	if c.bytes != nil {
+		if err := c.flushBytes(); err != nil {
+			return ColumnDesc{}, nil, 0, err
+		}
+	}
+
 	switch c.kind {
 	case KindInt64:
 		if c.haveStats {
@@ -744,15 +781,26 @@ func (c *streamColumn) finish(ctx context.Context, granuleSize int, sizing bool)
 		}
 	case KindFloat64:
 		c.fillFloatDesc(&desc)
-	case KindBytes, KindInt128:
-		// Unreachable: AddColumn rejects bytes columns and returns int128 above.
+	case KindBytes:
+		if c.haveStats && c.allSame {
+			desc.Const, desc.ConstBytes = true, c.first
+		}
+	case KindInt128:
+		// Unreachable: returned above.
 	}
 
 	if desc.Const {
-		// A constant column never attaches, so there is nothing committed to undo.
 		c.abort()
 
 		return desc, nil, 0, nil
+	}
+
+	if c.bytes != nil {
+		if !c.bytes.raw {
+			return c.finishDict(ctx, desc, granuleSize, sizing)
+		}
+
+		c.bytes.release()
 	}
 
 	desc.Blocked, desc.Framed = true, true
@@ -772,7 +820,7 @@ func (c *streamColumn) finish(ctx context.Context, granuleSize int, sizing bool)
 
 	desc.Footer = acc.streams()
 
-	obj, n, err := acc.finish(ctx, granuleSize)
+	obj, n, err := acc.finish(ctx, granuleSize, nil)
 	if err != nil {
 		return ColumnDesc{}, nil, 0, err
 	}
@@ -989,9 +1037,10 @@ func (a *blockAccum) emit(f []byte) error {
 }
 
 // finish seals the trailing frame and completes the column object: serialized into one buffer under
-// the directory-first layout, or written to the sink as a footer under the streaming one. It returns
-// the object (nil when it went to the sink) and its byte size.
-func (a *blockAccum) finish(ctx context.Context, blockRows int) ([]byte, int64, error) {
+// the directory-first layout, or written to the sink as a footer under the streaming one. A
+// dictionary region selects the trailer layout under both. It returns the object (nil when it went
+// to the sink) and its byte size.
+func (a *blockAccum) finish(ctx context.Context, blockRows int, region []byte) ([]byte, int64, error) {
 	if err := a.seal(); err != nil {
 		return nil, 0, err
 	}
@@ -1000,12 +1049,12 @@ func (a *blockAccum) finish(ctx context.Context, blockRows int) ([]byte, int64, 
 		dir := a.encodeDir(blockRows)
 		a.dirLen = len(dir)
 
-		n, err := a.finishStreamed(ctx, dir)
+		n, err := a.finishStreamed(ctx, region, dir)
 
 		return nil, n, err
 	}
 
-	obj := a.finishBuffered(blockRows, nil)
+	obj := a.finishBuffered(blockRows, region)
 
 	return obj, int64(len(obj)), nil
 }
@@ -1066,9 +1115,16 @@ func (a *blockAccum) sizing() ColumnSizing {
 	return s
 }
 
-// finishStreamed writes the directory after the frames, closes it with its own little-endian length
-// so a reader can find its start from the object's end, and commits.
-func (a *blockAccum) finishStreamed(ctx context.Context, dir []byte) (int64, error) {
+// finishStreamed writes the region, if any, and the directory after the frames, closes the
+// directory with its own little-endian length so a reader can find its start from the object's end,
+// and commits.
+func (a *blockAccum) finishStreamed(ctx context.Context, region, dir []byte) (int64, error) {
+	if region != nil {
+		if err := a.emit(region); err != nil {
+			return 0, err
+		}
+	}
+
 	dir = binary.LittleEndian.AppendUint32(dir, uint32(len(dir)))
 
 	if err := a.emit(dir); err != nil {
