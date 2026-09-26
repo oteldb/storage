@@ -1252,8 +1252,11 @@ type Decoder struct {
 
 	// shared is the column's shared dictionary. Every granule that joined it carries only ids into
 	// it, so it is parsed at open and resolved against here.
-	shared    sharedDict
-	sharedGen DictGen
+	shared sharedDict
+	// sharedGen names the shared dictionary for the decoder's life; selfGen names each self granule
+	// until the next decode.
+	sharedGen dictOwner
+	selfGen   dictOwner
 
 	// streams holds the decompressed compression frame, reused across this decoder's blocks. A
 	// decoder decodes its column's blocks serially (never concurrently), and each block's decoded
@@ -1300,7 +1303,7 @@ func (d *Decoder) DecodeFloat64Into(blk int, dst []float64) ([]float64, error) {
 // SharedEntries returns the column's shared dictionary, nil for a column without one, and the one
 // token that names it for the decoder's life. The entries are read-only and shared with every column
 // this decoder produces.
-func (d *Decoder) SharedEntries() ([][]byte, DictGen) { return d.shared.entries, d.sharedGen }
+func (d *Decoder) SharedEntries() ([][]byte, DictGen) { return d.shared.entries, d.sharedGen.token() }
 
 // DecodeBytes decodes the named blocks of a bytes column, in ascending order, merged into one
 // [chunk.DictColumn] over their concatenated rows; a nil selection decodes the whole column.
@@ -1312,6 +1315,8 @@ func (d *Decoder) DecodeBytes(blocks []int) (*chunk.DictColumn, error) {
 	if d.kind != KindBytes {
 		return nil, errors.Errorf("block: column is %s, not bytes", d.kind)
 	}
+
+	d.selfGen.retire()
 
 	return decodeBlockedBytes(d.streams.dir, d.streams.comp, d.rows, blocks, d.shared)
 }

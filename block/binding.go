@@ -45,7 +45,8 @@ func (w *StreamWriter) Binding(i int) (*Binding, error) {
 func (b *Binding) Bind(entries [][]byte, gen DictGen) error { return b.bind(entries, gen, false) }
 
 // BindStable is [Binding.Bind] over entries that are never overwritten, which the writer keeps by
-// reference instead of copying: a decoder's shared dictionary, not a granule's frame-backed table.
+// reference instead of copying: a decoder's shared dictionary, valid for the decoder's life, or a
+// caller's own table. A self-granule table aliases a reused frame and is refused.
 func (b *Binding) BindStable(entries [][]byte, gen DictGen) error { return b.bind(entries, gen, true) }
 
 // AppendDict appends rows [lo,hi) of dc, those keep marks when keep is non-nil (keep[j] for row
@@ -56,8 +57,12 @@ func (b *Binding) AppendDict(dc *chunk.DictColumn, gen DictGen, lo, hi int, keep
 		return errWriterFinished
 	}
 
-	if gen.IsZero() || gen != b.gen {
-		return errors.Errorf("block: column %q: dictionary token %d is not the bound %d", c.name, gen.n, b.gen.n)
+	if gen != b.gen {
+		return errors.Errorf("block: column %q: dictionary token is not the bound one", c.name)
+	}
+
+	if !gen.live() {
+		return errors.Errorf("block: column %q: dictionary table was overwritten by a later decode", c.name)
 	}
 
 	if lo < 0 || hi < lo || hi > dc.Len() {
@@ -115,8 +120,12 @@ func (b *Binding) bind(entries [][]byte, gen DictGen, stable bool) error {
 		return errWriterFinished
 	}
 
-	if gen.IsZero() {
-		return errors.New("block: bind to the zero dictionary token")
+	if !gen.live() {
+		return errors.New("block: bind to a zero or retired dictionary token")
+	}
+
+	if stable && gen.owner.framed {
+		return errors.New("block: a frame-backed table cannot be bound stable")
 	}
 
 	b.entries, b.gen, b.stable = entries, gen, stable

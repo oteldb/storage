@@ -136,8 +136,8 @@ func batchObjects(t *testing.T, vals [][]byte, opts []PartOption) [][]byte {
 	return built.objects
 }
 
-// TestBindingRejectsForeignTokens: a table is named by its token, so a granule from another decoder,
-// a stale self table and the zero token are errors, never a silent mis-map.
+// TestBindingRejectsForeignTokens: a table is named by its owner's token, so a granule from another
+// decoder and the zero token are errors, never a silent mis-map.
 func TestBindingRejectsForeignTokens(t *testing.T) {
 	t.Parallel()
 
@@ -150,29 +150,64 @@ func TestBindingRejectsForeignTokens(t *testing.T) {
 
 	wk := newWalker(t, d, w, 0)
 
-	shared, _, err := d.DecodeBytesBlock(0)
+	shared, sharedGen, err := d.DecodeBytesBlock(0)
 	require.NoError(t, err)
+	assert.True(t, sameToken(wk.sharedGen, sharedGen))
 
 	_, otherGen := other.SharedEntries()
+	assert.False(t, sameToken(sharedGen, otherGen), "two decoders over one part never share a token")
 	require.Error(t, wk.shared.AppendDict(shared, otherGen, 0, 1, nil), "another decoder's token")
 	require.Error(t, wk.shared.AppendDict(shared, DictGen{}, 0, 1, nil), "the zero token")
 	require.Error(t, wk.self.Bind(nil, DictGen{}), "binding the zero token")
 
+	_, otherSelf, err := other.DecodeBytesBlock(8)
+	require.NoError(t, err)
+
 	self, selfGen, err := d.DecodeBytesBlock(8)
 	require.NoError(t, err)
-	assert.NotEqual(t, wk.sharedGen, selfGen, "a self granule gets its own token")
+	assert.False(t, sameToken(otherSelf, selfGen), "two decoders' self tokens differ")
+	assert.False(t, sameToken(wk.sharedGen, selfGen), "a self granule gets its own token")
 	require.Error(t, wk.shared.AppendDict(self, selfGen, 0, 1, nil))
+	require.Error(t, wk.self.BindStable(self.Entries, selfGen), "a frame-backed table cannot be kept by reference")
 
 	require.NoError(t, wk.self.Bind(self.Entries, selfGen))
 	require.NoError(t, wk.self.AppendDict(self, selfGen, 0, 1, nil))
+}
 
-	again, againGen, err := d.DecodeBytesBlock(11)
+// TestBindingRejectsOverwrittenSelfTable is the stale-table case: a self granule's table aliases the
+// decoder's frame, so once a later decode crosses a frame boundary its token is dead even though the
+// binding still holds it. The shared dictionary's token survives the same decodes.
+func TestBindingRejectsOverwrittenSelfTable(t *testing.T) {
+	t.Parallel()
+
+	vals := transitionValues()
+	d := scanSource(t, vals, transitionGranule)
+
+	w := NewStreamWriter(WithGranuleSize(transitionGranule))
+	require.NoError(t, w.AddColumn(Column{Name: "b", Kind: KindBytes, Block: true}))
+
+	wk := newWalker(t, d, w, 0)
+
+	self, selfGen, err := d.DecodeBytesBlock(8)
 	require.NoError(t, err)
-	require.NoError(t, wk.self.Bind(again.Entries, againGen))
-	require.Error(t, wk.self.AppendDict(self, selfGen, 1, 2, nil), "a stale self table")
+	require.NoError(t, wk.self.Bind(self.Entries, selfGen))
+	require.NoError(t, wk.self.AppendDict(self, selfGen, 0, 1, nil))
+
+	_, _, err = d.DecodeBytesBlock(0)
+	require.NoError(t, err)
+	require.Error(t, wk.self.AppendDict(self, selfGen, 1, 2, nil), "an overwritten table with the bound token")
+	require.Error(t, wk.self.Bind(self.Entries, selfGen), "rebinding a retired token")
+
+	_, _, err = d.DecodeBytesBlock(11)
+	require.NoError(t, err)
+
+	shared, sharedGen, err := d.DecodeBytesBlock(9)
+	require.NoError(t, err)
+	require.True(t, sameToken(wk.sharedGen, sharedGen), "one shared token for the decoder's life")
+	require.NoError(t, wk.shared.AppendDict(shared, sharedGen, 0, 2, nil), "self decodes leave the shared token live")
 
 	_, gen2 := d.SharedEntries()
-	assert.Equal(t, wk.sharedGen, gen2, "one shared token for the decoder's life")
+	assert.True(t, sameToken(wk.sharedGen, gen2))
 }
 
 // TestBindingAppendDictRejects covers AppendDict's argument checks.
@@ -318,3 +353,6 @@ func TestBindingRawColumn(t *testing.T) {
 	require.NoError(t, b.AppendDict(idsColumn(tab, vals, func(v []byte) int { return int(v[1] - '0') }), gen, 0, len(vals), nil))
 	assert.Equal(t, want.objects, buildStream(t, w).objects)
 }
+
+// sameToken compares by owner identity; testify's Equal would compare the owners' contents.
+func sameToken(a, b DictGen) bool { return a == b }

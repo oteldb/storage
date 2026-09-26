@@ -120,7 +120,8 @@ func (s *frameSource) fill(f int, off, n int64) error {
 //
 // For a granule on the column's shared dictionary the result carries that dictionary and the
 // granule's ids unchanged, so its entries are the column's, not the granule's, and the token is the
-// one [Decoder.SharedEntries] returns. Any other granule gets a fresh token.
+// one [Decoder.SharedEntries] returns. Any other granule gets a token that dies at the next decode.
+// A shared granule's ids alias the frame all the same: the token names the entries, not the ids.
 func (d *Decoder) DecodeBytesBlock(blk int) (*chunk.DictColumn, DictGen, error) {
 	if d.kind != KindBytes {
 		return nil, DictGen{}, errors.Errorf("block: column is %s, not bytes", d.kind)
@@ -139,6 +140,8 @@ func (d *Decoder) DecodeBytesBlock(blk int) (*chunk.DictColumn, DictGen, error) 
 
 	n := min(lo+dir.blockRows, d.rows) - lo
 
+	d.selfGen.retire()
+
 	stream, err := d.streams.granule(blk)
 	if err != nil {
 		return nil, DictGen{}, err
@@ -151,7 +154,7 @@ func (d *Decoder) DecodeBytesBlock(blk int) (*chunk.DictColumn, DictGen, error) 
 		}
 
 		if !self {
-			return &chunk.DictColumn{Entries: d.shared.entries, IDs: ids, IDWidth: width}, d.sharedGen, nil
+			return &chunk.DictColumn{Entries: d.shared.entries, IDs: ids, IDWidth: width}, d.sharedGen.token(), nil
 		}
 
 		stream = ids
@@ -167,5 +170,5 @@ func (d *Decoder) DecodeBytesBlock(blk int) (*chunk.DictColumn, DictGen, error) 
 		return nil, DictGen{}, errors.Wrapf(ErrCorrupt, "block %d decoded %d rows, want %d", blk, dc.Len(), n)
 	}
 
-	return &dc, NewDictGen(), nil
+	return &dc, d.selfGen.token(), nil
 }
