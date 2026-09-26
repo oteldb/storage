@@ -36,6 +36,8 @@ type partConfig struct {
 	compressBytes int
 	defaultComp   compress.Algorithm
 	level         compress.Level
+	dictCap       int64
+	sizing        bool
 }
 
 func newPartConfig(opts []PartOption) partConfig {
@@ -43,6 +45,7 @@ func newPartConfig(opts []PartOption) partConfig {
 		granuleSize:   defaultGranuleSize,
 		compressBytes: defaultCompressBlockBytes,
 		level:         compress.LevelDefault,
+		dictCap:       defaultSharedDictBytes,
 	}
 	for _, opt := range opts {
 		opt(&c)
@@ -94,6 +97,21 @@ func WithCompression(alg compress.Algorithm) PartOption {
 // at — so a merge can rewrite cold parts at a higher ratio with no format change.
 func WithCompressionLevel(level compress.Level) PartOption {
 	return func(c *partConfig) { c.level = level }
+}
+
+// WithSharedDictBytes caps the resident size of a bytes column's shared dictionary: its entries'
+// bytes plus a fixed per-entry overhead (default 32 MiB). A granule whose new values would pass the
+// cap self-encodes instead of joining. n is clamped to [0, 64 MiB], the format's ceiling.
+func WithSharedDictBytes(n int64) PartOption {
+	return func(c *partConfig) { c.dictCap = min(max(n, 0), maxSharedDictRaw) }
+}
+
+// WithSizingStats records [ColumnSizing] for every column with an object, so a merge can bound its
+// memory from the manifest alone. A part carrying it needs a manifest version-3 reader.
+func WithSizingStats() PartOption { return func(c *partConfig) { c.sizing = true } }
+
+func (c *partConfig) layout() columnLayout {
+	return columnLayout{blockRows: c.granuleSize, compressBytes: c.compressBytes, dictCap: c.dictCap, sizing: c.sizing}
 }
 
 // NewPartWriter returns a [PartWriter] with the given options applied.
@@ -155,7 +173,7 @@ func (w *PartWriter) build() (builtPart, error) {
 			alg = w.defaultComp
 		}
 
-		desc, obj, err := buildColumn(*c, w.compressorFor(alg), w.granuleSize, w.compressBytes)
+		desc, obj, err := buildColumnWith(*c, w.compressorFor(alg), w.layout())
 		if err != nil {
 			return builtPart{}, errors.Wrapf(err, "column %q", c.Name)
 		}
@@ -166,7 +184,7 @@ func (w *PartWriter) build() (builtPart, error) {
 	}
 
 	m := Manifest{
-		Version:     manifestVersion,
+		Version:     writerVersion(descs),
 		RowCount:    w.rows,
 		GranuleSize: w.granuleSize,
 		Columns:     descs,
@@ -372,7 +390,7 @@ func (r *PartReader) Column(ctx context.Context, name string) (*ColumnReader, er
 	comp := r.compressorFor(desc.Compress)
 
 	if desc.Const {
-		return newColumnReader(desc, nil, comp, r.manifest.RowCount), nil
+		return r.columnReader(desc, nil, comp), nil
 	}
 
 	obj, err := backend.ReadView(ctx, r.b, columnKey(r.prefix, i))
@@ -380,7 +398,12 @@ func (r *PartReader) Column(ctx context.Context, name string) (*ColumnReader, er
 		return nil, errors.Wrapf(err, "read column %q", name)
 	}
 
-	return newColumnReader(desc, obj, comp, r.manifest.RowCount), nil
+	// Both writers record the exact size, so a mismatch is an object altered or cut short.
+	if desc.Bytes > 0 && int64(len(obj)) != desc.Bytes {
+		return nil, errors.Wrapf(ErrCorrupt, "column %q: object of %d bytes, the manifest says %d", name, len(obj), desc.Bytes)
+	}
+
+	return r.columnReader(desc, obj, comp), nil
 }
 
 // ColumnDescByName returns the named column's descriptor from the already-loaded manifest, without
@@ -403,6 +426,13 @@ func (r *PartReader) Marks(ctx context.Context) (Marks, error) {
 	}
 
 	return DecodeMarks(raw)
+}
+
+func (r *PartReader) columnReader(desc ColumnDesc, obj []byte, comp *compress.Compressor) *ColumnReader {
+	cr := newColumnReader(desc, obj, comp, r.manifest.RowCount)
+	cr.limits = columnLimits(desc, r.manifest.RawBytes, r.manifest.RowCount)
+
+	return cr
 }
 
 func (r *PartReader) compressorFor(alg compress.Algorithm) *compress.Compressor {

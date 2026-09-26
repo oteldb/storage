@@ -31,10 +31,8 @@ func valueColumnProfile(t *testing.T, b backend.Backend) (compress.Algorithm, co
 		r, err := block.OpenPart(ctx, b, strings.TrimSuffix(k, "/manifest"))
 		require.NoError(t, err)
 
-		for _, c := range r.Manifest().Columns {
-			if c.Name == "value" {
-				return c.Compress, c.Level
-			}
+		if c, ok := r.ColumnDescByName("value"); ok {
+			return c.Compress, c.Level
 		}
 	}
 

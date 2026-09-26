@@ -33,14 +33,8 @@ func pickPrecision(tiers []PrecisionTier, maxTime int64) uint8 {
 // column's recorded FloatPrecisionBits, or 64 (lossless) when none was applied. It is the basis
 // for the precision fixed point.
 func partPrecision(p *part) uint8 {
-	for _, c := range p.reader.Manifest().Columns {
-		if c.Name == colValue {
-			if c.FloatPrecisionBits == 0 {
-				return 64
-			}
-
-			return c.FloatPrecisionBits
-		}
+	if c, ok := p.reader.ColumnDescByName(colValue); ok && c.FloatPrecisionBits != 0 {
+		return c.FloatPrecisionBits
 	}
 
 	return 64

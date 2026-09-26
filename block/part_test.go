@@ -2,6 +2,8 @@ package block
 
 import (
 	"context"
+	"encoding/binary"
+	"hash/crc32"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -195,6 +197,15 @@ func TestPartColumnNotFound(t *testing.T) {
 // an error or a valid reader, never panic.
 func FuzzOpenPart(f *testing.F) {
 	f.Add(sampleManifest().Encode(nil))
+	f.Add(v3Manifest().Encode(nil))
+
+	for _, tc := range v3Mutations() {
+		m := v3Manifest()
+		tc.mutate(&m)
+		body := v3Body(f, m, tc.unsupported)
+		f.Add(binary.BigEndian.AppendUint32(body, crc32.Checksum(body, castagnoli)))
+	}
+
 	f.Add([]byte("garbage"))
 	f.Add([]byte{})
 

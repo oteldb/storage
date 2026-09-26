@@ -448,6 +448,15 @@ func FuzzManifestDecodeBody(f *testing.F) {
 		f.Add(tc.body)
 	}
 
+	v3 := v3Manifest().Encode(nil)
+	f.Add(v3[:len(v3)-4])
+
+	for _, tc := range v3Mutations() {
+		m := v3Manifest()
+		tc.mutate(&m)
+		f.Add(v3Body(f, m, tc.unsupported))
+	}
+
 	f.Fuzz(func(t *testing.T, body []byte) {
 		src := binary.BigEndian.AppendUint32(append([]byte(nil), body...), crc32.Checksum(body, castagnoli))
 

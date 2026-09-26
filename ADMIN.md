@@ -391,6 +391,23 @@ fenced and holds nothing, and a node whose ring view is stale still resolves its
 reconciled yet (opened moments ago) reconciles once before refusing, so an operator never waits out a maintenance
 interval for a shard that is plainly its own. Single-node owns everything.
 
+## Upgrading to part manifest version 3
+
+**Every node must run a release that reads manifest version 3 before any node writes one. A rolling
+update across it is unsupported: stop all nodes, upgrade, start.**
+
+Record-engine flushes and merges write version-3 parts (trailer dictionaries and merge-sizing
+stats); metric parts stay version 2. A node on an older release cannot read them:
+
+- a release with the fenced index load refuses the part with `unsupported version 3`, reports
+  `IndexFenced` with `index.fenced_loads{reason="unsupported_version"}` and
+  `corruption.detected{component="part",disposition="fatal"}`, disclaims its reads in a cluster, and
+  stays fenced until upgraded — it never hands the part to repair;
+- a release from before that fence can commit a bucket index without the parts it could not open,
+  and so drop them.
+
+Parts written by earlier releases (versions 1 and 2) stay readable; nothing is rewritten.
+
 ## Ranged column reads (`backend.ReaderAt`)
 
 A part stores one object per column. Without ranged reads, touching any block of a column transfers

@@ -62,13 +62,13 @@ func benchColumn(b *testing.B, vals [][]byte, blocked bool, granule int) *Column
 		Checked: true,
 	}
 
-	obj, ok, err := trySharedDict(c, chunk.CodecDict, zstdComp(), granule, defaultCompressBlockBytes)
+	obj, dict, _, ok, err := encodeTrailerDictBytes(c, zstdComp(), defaultLayout(granule), false)
 	if err != nil {
 		b.Fatal(err)
 	}
 
 	if ok {
-		desc.SharedDict = true
+		dict.apply(&desc)
 
 		return newColumnReader(desc, obj, zstdComp(), len(vals))
 	}

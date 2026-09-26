@@ -2,58 +2,38 @@ package block
 
 import (
 	"encoding/binary"
-	"fmt"
 	"hash/crc32"
 
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
-	"github.com/oteldb/storage/pool"
 )
 
-// Shared-dictionary bytes columns. A block-framed bytes column whose granules each carry their own
-// dictionary loses every repeat that spans a granule boundary. Measured on a real log corpus that
-// costs +74% on the record attributes column, whose blobs repeat across the whole part, against
-// +6% on the message body, whose values are near-unique. The dictionary has to be able to span
-// granules for the first column while getting out of the way for the second.
+// Shared-dictionary bytes columns carry one dictionary for the whole column, each granule holding
+// ids into it or opting out and self-encoding (see ARCH.md). Two layouts exist:
 //
-// So the dictionary is written once for the column and each granule holds only ids into it —
-// ClickHouse's LowCardinality shape, where the dictionary spans granules and rolls over only when
-// it outgrows its id width. A granule that does not benefit (its values are near-unique, so the
-// shared dictionary would grow by a full granule's worth of entries to serve one granule) opts out
-// and self-encodes exactly as before, which is the plain-String path ClickHouse uses for a
-// high-cardinality column.
+//	leading (read only):  [dictionary region][block-framed container]
+//	trailer (written):    [frames][dictionary region][directory][u32le dirLen]
 //
-// Object layout, ahead of the ordinary block-framed container:
+// The dictionary region is the same in both:
 //
 //	[uvarint entryCount][uvarint compressedDictLen][compressed dictionary][u32le CRC32C]
-//	[ block-framed container of granule streams ]
 //
-// The checksum covers the compressed dictionary and is present only when the manifest says the
-// column is checked ([ColumnDesc.Checked]); the granule streams are covered by the per-frame
-// checksums in the block-framed container's directory.
-//
-// The dictionary blob is [uvarint len][bytes] per entry. Each granule stream is prefixed with a mode
-// byte: [modeShared] then idWidth-byte big-endian ids, or [modeSelf] then an ordinary chunk bytes
-// stream. Mixing the two per granule is what lets one column hold both shapes — a service that logs
-// clean structured lines and then dumps a stack trace.
+// its checksum present only when the column is checked ([ColumnDesc.Checked]). The dictionary blob
+// is [uvarint len][bytes] per entry. Each granule stream opens with a mode byte; which modes are
+// valid depends on the layout ([sharedDict.granule]).
 const (
-	// modeShared marks a granule encoded as ids into the column's shared dictionary.
+	// modeShared marks a leading-layout granule of ids into the dictionary, at the width the final
+	// dictionary size implies.
 	modeShared byte = 0
-	// modeSelf marks a granule carrying its own self-describing chunk bytes stream, for values the
-	// shared dictionary would not pay for.
+	// modeSelf marks a granule carrying its own chunk bytes stream.
 	modeSelf byte = 1
 )
 
 // sharedDictMinRepeat is the dedup a granule must show to join the shared dictionary: its distinct
-// values must be at most this fraction of its rows. A granule at or above it repeats enough that
-// entries are worth carrying column-wide; below it, the granule would add roughly one entry per row
-// and the dictionary becomes the column with an id array bolted on.
-//
-// Two rather than a tuned ratio because the decision only has to separate two clearly-separated
-// populations — attribute blobs repeating hundreds of times against near-unique message bodies —
-// and a threshold in between costs nothing to either.
+// values must be at most this fraction of its rows. Two separates the two populations that matter —
+// attribute blobs repeating hundreds of times against near-unique bodies — at no cost to either.
 const sharedDictMinRepeat = 2
 
 // byteAt returns row i of a bytes column in any of its input forms.
@@ -69,241 +49,72 @@ func (c Column) byteAt(i int) []byte {
 	return c.BytesDict[c.BytesIDs[i]]
 }
 
-// sharedDictJoins applies the granule decision: whether a granule of the given row and distinct-value
-// counts joins a column-wide dictionary already holding entries values. Near-unique granules stay out
-// — they would grow the shared dictionary by their whole distinct set to serve themselves alone.
-//
-// The two input forms reach it with the same numbers (entries are distinct by value, so counting
-// distinct indices counts distinct values), which is what keeps their objects byte-identical.
+// sharedDictJoins is the granule decision before the byte cap: whether a granule of the given row
+// and distinct-value counts joins a dictionary already holding entries values.
 func sharedDictJoins(distinct, rows, entries int) bool {
 	return distinct*sharedDictMinRepeat <= rows && entries+distinct <= maxSharedEntries
 }
 
-// buildSharedDictFromValues decides each granule and builds the column dictionary for a column whose
-// cells are flat values, hashing each row twice: once to count the granule's distinct values, once to
-// assign its shared-dictionary id. It fills shared (per granule) and ids (per row, -1 where the
-// granule self-encodes), and reports whether any granule joined.
-func buildSharedDictFromValues(c Column, blockRows int, shared []bool, ids []int32) ([][]byte, bool) {
-	n := len(ids)
-
-	m := pool.NewByteIntMap()
-	defer m.PutBack()
-
-	seen := pool.NewByteIntMap()
-	defer seen.PutBack()
-
-	var (
-		entries [][]byte
-		used    bool
-	)
-
-	for g := range shared {
-		lo := g * blockRows
-		hi := min(lo+blockRows, n)
-
-		distinct := 0
-
-		seen.Reset()
-
-		for i := lo; i < hi; i++ {
-			if _, dup := seen.Get(c.byteAt(i)); !dup {
-				seen.Put(c.byteAt(i), 1)
-
-				distinct++
-			}
-		}
-
-		if !sharedDictJoins(distinct, hi-lo, len(entries)) {
-			for i := lo; i < hi; i++ {
-				ids[i] = -1
-			}
-
-			continue
-		}
-
-		shared[g], used = true, true
-
-		for i := lo; i < hi; i++ {
-			v := c.byteAt(i)
-
-			id, hit := m.Get(v)
-			if !hit {
-				id = len(entries)
-				m.Put(v, id)
-				entries = append(entries, v)
-			}
-
-			ids[i] = int32(id)
-		}
-	}
-
-	return entries, used
-}
-
-// buildSharedDictFromIDs is [buildSharedDictFromValues] for a column already in split form. Both
-// passes become array work over int32s: a per-source-entry stamp counts a granule's distinct ids
-// without clearing between granules, and remap carries a source entry's shared-dictionary id once
-// assigned. No value is hashed or compared.
-func buildSharedDictFromIDs(dict [][]byte, src []int32, blockRows int, shared []bool, ids []int32) ([][]byte, bool) {
-	n := len(ids)
-
-	// stamp is freshly zeroed and gen starts at 1, so no generation ever wraps onto a stale stamp:
-	// gen advances once per granule and a column cannot hold 2³² of them.
-	stamp := make([]uint32, len(dict))
-	remap := make([]int32, len(dict))
-
-	for i := range remap {
-		remap[i] = -1
-	}
-
-	var (
-		entries [][]byte
-		used    bool
-		gen     uint32
-	)
-
-	for g := range shared {
-		lo := g * blockRows
-		hi := min(lo+blockRows, n)
-
-		distinct := 0
-		gen++
-
-		for i := lo; i < hi; i++ {
-			e := src[i]
-
-			// The shared-dictionary path never reaches the chunk encoder's equivalent guard, so it
-			// carries its own, naming the row and the table instead of raising a bare bounds error
-			// from inside the stamp array. Compared against len(stamp) rather than the equal
-			// len(dict) so the compiler can see it dominates the indexing below.
-			if uint32(e) >= uint32(len(stamp)) {
-				panic(fmt.Sprintf(
-					"block: dictionary id %d at row %d is out of range for %d entries", e, i, len(dict)))
-			}
-
-			if stamp[e] != gen {
-				stamp[e] = gen
-
-				distinct++
-			}
-		}
-
-		if !sharedDictJoins(distinct, hi-lo, len(entries)) {
-			for i := lo; i < hi; i++ {
-				ids[i] = -1
-			}
-
-			continue
-		}
-
-		shared[g], used = true, true
-
-		for i := lo; i < hi; i++ {
-			e := src[i]
-
-			id := remap[e]
-			if id < 0 {
-				id = int32(len(entries))
-				remap[e] = id
-				entries = append(entries, dict[e])
-			}
-
-			ids[i] = id
-		}
-	}
-
-	return entries, used
-}
-
-// encodeSharedDictBytes serializes a bytes column as a shared-dictionary block-framed object. It
-// reports ok=false when no granule chose the shared dictionary, leaving the caller on the ordinary
-// per-granule path rather than paying an empty dictionary's header for nothing.
-func encodeSharedDictBytes(
-	c Column, comp *compress.Compressor, blockRows, compressBytes int,
-) (obj []byte, ok bool, err error) {
-	n := c.rows()
-	if n == 0 || blockRows <= 0 {
-		return nil, false, nil
-	}
-
-	ids := make([]int32, n) // shared-dictionary id per row; -1 where the granule self-encodes
-	shared := make([]bool, (n+blockRows-1)/blockRows)
-
-	var (
-		entries [][]byte
-		used    bool
-	)
-
-	if c.bytesSplitForm() {
-		entries, used = buildSharedDictFromIDs(c.BytesDict, c.BytesIDs, blockRows, shared, ids)
-	} else {
-		entries, used = buildSharedDictFromValues(c, blockRows, shared, ids)
-	}
-
-	if !used {
-		return nil, false, nil
-	}
-
-	idWidth := 1
-	if len(entries) > 256 {
-		idWidth = 2
-	}
-
-	body, err := encodeBlockedWith(n, comp, blockRows, compressBytes,
-		func(dst []byte, lo, hi int) ([]byte, error) {
-			g := lo / blockRows
-			if !shared[g] {
-				dst = append(dst, modeSelf)
-
-				return appendBlockStream(dst, c, chunk.CodecDict, 0, lo, hi)
-			}
-
-			dst = append(dst, modeShared)
-
-			for i := lo; i < hi; i++ {
-				if idWidth == 1 {
-					dst = append(dst, byte(ids[i]))
-					continue
-				}
-
-				dst = append(dst, byte(uint16(ids[i])>>8), byte(uint16(ids[i])))
-			}
-
-			return dst, nil
-		})
-	if err != nil {
-		return nil, false, err
-	}
-
-	var dict []byte
-	for _, e := range entries {
-		dict = binary.AppendUvarint(dict, uint64(len(e)))
-		dict = append(dict, e...)
-	}
-
-	packed := comp.Compress(nil, dict)
-
-	obj = binary.AppendUvarint(nil, uint64(len(entries)))
-	obj = binary.AppendUvarint(obj, uint64(len(packed)))
-	obj = append(obj, packed...)
-	obj = binary.LittleEndian.AppendUint32(obj, crc32.Checksum(packed, castagnoli))
-
-	return append(obj, body...), true, nil
-}
-
 // maxSharedEntries is the largest shared dictionary a 2-byte id can address. A column needing more
-// keeps its later granules on the self-encoded path rather than rolling over to a second dictionary:
-// a column that has already produced 65536 distinct values is one whose repeats have stopped paying,
-// which is the case the self-encoded path exists for.
+// keeps its later granules self-encoded rather than rolling over to a second dictionary.
 //
-// A var, not a const, so a test can lower it instead of building the 130k-row column it otherwise
-// takes to reach the ceiling (the same reason [byteColCap] is one in recordengine).
-var maxSharedEntries = 1 << 16
+// A var so a test can lower it instead of building the 130k-row column it otherwise takes.
+var maxSharedEntries = sharedEntriesCeiling
 
-// parseSharedDict peels the dictionary header off a shared-dictionary column object, returning the
-// decoded entries and the ordinary block-framed container that follows.
+// sharedDict is a column's parsed shared dictionary and the granule grammar its layout implies.
+type sharedDict struct {
+	entries [][]byte
+	on      bool
+	trailer bool
+}
+
+// granule splits a granule stream into its ids, one per row, and their width, or reports self with
+// the chunk stream that follows the mode byte. Ids are bounds-checked here: they outlive the decode
+// inside the returned column, where an unchecked one would panic at [chunk.DictColumn.At].
+func (sd sharedDict) granule(stream []byte, rows int) (ids []byte, width int, self bool, err error) {
+	if len(stream) == 0 {
+		return nil, 0, false, errors.Wrap(ErrCorrupt, "shared dict: empty granule stream")
+	}
+
+	mode, payload := stream[0], stream[1:]
+
+	switch {
+	case mode == modeSelf:
+		return payload, 0, true, nil
+	case !sd.trailer && mode == modeShared:
+		width = sharedIDWidth(sd.entries)
+	case sd.trailer && mode == modeSharedNarrow:
+		width = 1
+	case sd.trailer && mode == modeSharedWide && len(sd.entries) > 256:
+		width = 2
+	default:
+		return nil, 0, false, errors.Wrapf(ErrCorrupt,
+			"shared dict: granule mode %d invalid for %d entries (trailer %v)", mode, len(sd.entries), sd.trailer)
+	}
+
+	if len(payload) != rows*width {
+		return nil, 0, false, errors.Wrapf(ErrCorrupt,
+			"shared dict: %d id bytes for %d rows at width %d", len(payload), rows, width)
+	}
+
+	if err := boundSharedIDs(payload, width, rows, sd.entries); err != nil {
+		return nil, 0, false, err
+	}
+
+	return payload, width, false, nil
+}
+
+// dictLimit bounds a dictionary's decompression: an exact size, or an upper bound, or none when
+// limit is negative.
+type dictLimit struct {
+	limit int64
+	exact bool
+}
+
+// parseSharedDict parses a dictionary region at the head of object, returning the entries and the
+// bytes after the region.
 func parseSharedDict(
-	object []byte, comp *compress.Compressor, checked bool,
+	object []byte, comp *compress.Compressor, checked bool, lim dictLimit,
 ) (entries [][]byte, rest []byte, err error) {
 	count, n := binary.Uvarint(object)
 	if n <= 0 {
@@ -340,9 +151,9 @@ func parseSharedDict(
 		rest = rest[objectCRCBytes:]
 	}
 
-	dict, err := comp.Decompress(nil, packed)
+	dict, err := decompressKept(comp, nil, packed, lim.limit, lim.exact)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "decompress shared dictionary")
+		return nil, nil, errors.Wrap(err, "shared dictionary")
 	}
 
 	if count > uint64(len(dict))+1 {
@@ -370,7 +181,28 @@ func parseSharedDict(
 	return entries, rest, nil
 }
 
-// sharedIDWidth is the bytes per row a granule spends on ids into a dictionary of the given size.
+// parseTrailerDict parses a trailer column's dictionary region, which must be exactly what the
+// manifest describes.
+func parseTrailerDict(region []byte, comp *compress.Compressor, desc ColumnDesc) (sharedDict, error) {
+	entries, rest, err := parseSharedDict(region, comp, desc.Checked, dictLimit{limit: desc.DictRaw, exact: true})
+	if err != nil {
+		return sharedDict{}, err
+	}
+
+	if len(rest) != 0 {
+		return sharedDict{}, errors.Wrapf(ErrCorrupt, "shared dict: %d bytes past the region", len(rest))
+	}
+
+	if int64(len(entries)) != desc.DictEntries {
+		return sharedDict{}, errors.Wrapf(ErrCorrupt,
+			"shared dict: %d entries, the manifest says %d", len(entries), desc.DictEntries)
+	}
+
+	return sharedDict{entries: entries, on: true, trailer: true}, nil
+}
+
+// sharedIDWidth is the bytes per row a leading-layout granule spends on ids into a dictionary of
+// the given size.
 func sharedIDWidth(entries [][]byte) int {
 	if len(entries) > 256 {
 		return 2
@@ -388,9 +220,7 @@ func sharedIDAt(ids []byte, idWidth, r int) int {
 	return int(uint16(ids[r*2])<<8 | uint16(ids[r*2+1]))
 }
 
-// boundSharedIDs rejects a granule whose packed ids do not all index entries. Every path that
-// accepts shared-dictionary ids runs it: the ids outlive the decode inside the returned column, so
-// an unchecked one surfaces as a panic at [chunk.DictColumn.At] rather than a decode error.
+// boundSharedIDs rejects a granule whose packed ids do not all index entries.
 func boundSharedIDs(ids []byte, idWidth, rows int, entries [][]byte) error {
 	for r := range rows {
 		if id := sharedIDAt(ids, idWidth, r); id >= len(entries) {
@@ -401,43 +231,18 @@ func boundSharedIDs(ids []byte, idWidth, rows int, entries [][]byte) error {
 	return nil
 }
 
-// splitSharedGranule peels a granule stream's leading mode byte, rejecting a mode this reader does
-// not know rather than treating its payload as one of the two it does.
-func splitSharedGranule(stream []byte) (mode byte, payload []byte, err error) {
-	if len(stream) == 0 {
-		return 0, nil, errors.Wrap(ErrCorrupt, "shared dict: empty granule stream")
-	}
-
-	switch mode = stream[0]; mode {
-	case modeShared, modeSelf:
-		return mode, stream[1:], nil
-	default:
-		return 0, nil, errors.Wrapf(ErrCorrupt, "shared dict: unknown granule mode %d", mode)
-	}
-}
-
 // decodeSharedIDs is the fast path for a shared-dictionary column whose selected granules all use
-// it: their ids already index the column-wide dictionary, so the result is the dictionary plus the
-// granules' id bytes copied into place — no per-granule dictionary to merge, no remap, no hash
-// probes. This is the common case (measured: the shared dictionary is chosen in 33 of 34 parts for
-// a record-attributes column), and it is what keeps a framed decode close to the single-stream one.
+// the dictionary: the result is the dictionary plus the granules' ids copied into place, at the
+// width the whole dictionary needs — a narrow trailer granule is widened — so it equals what the
+// leading layout decodes to. It reports ok=false at the first self-encoded granule, leaving the
+// caller to redo the walk through [chunk.DictMerger].
 //
-// It reports ok=false the moment it meets a self-encoded granule, leaving the caller to redo the
-// walk through [chunk.DictMerger]; only a column mixing both modes pays that second pass.
-//
-// Because the ids are *copied* rather than aliased, this can reuse one decompression buffer across
-// frames — unlike the merge path, whose entries alias the frames and so must keep each alive.
-//
-// In scatter mode the rows no granule covers are left at id 0, i.e. unspecified — the same contract
-// the int64 path has, where decodeBlocksInto leaves unselected rows at whatever the destination
-// held. A caller reads only the rows it selected.
+// Ids are copied, so one decompression buffer serves every frame. In scatter mode rows no granule
+// covers are left at id 0, i.e. unspecified.
 func decodeSharedIDs(
-	dir blockDir, comp *compress.Compressor, rows int, blocks []int, entries [][]byte, scatter bool,
+	dir blockDir, comp *compress.Compressor, rows int, blocks []int, sd sharedDict, scatter bool,
 ) (col *chunk.DictColumn, ok bool, err error) {
-	idWidth := 1
-	if len(entries) > 256 {
-		idWidth = 2
-	}
+	idWidth := sharedIDWidth(sd.entries)
 
 	out := rows
 	if !scatter {
@@ -453,7 +258,8 @@ func decodeSharedIDs(
 	}
 
 	ids := make([]byte, out*idWidth)
-	streams := newBlockStreams(dir, comp)
+	streams := newWalkStreams(dir, comp)
+	defer streams.release()
 	pos := 0
 
 	for _, g := range blocks {
@@ -471,25 +277,15 @@ func decodeSharedIDs(
 			return nil, false, err
 		}
 
-		if len(stream) == 0 {
-			return nil, false, errors.Wrap(ErrCorrupt, "shared dict: empty granule stream")
-		}
-
-		if stream[0] != modeShared {
-			return nil, false, nil // a self-encoded granule: the caller redoes this through the merge
-		}
-
 		n := min(lo+dir.blockRows, rows) - lo
-		if len(stream[1:]) != n*idWidth {
-			return nil, false, errors.Wrapf(ErrCorrupt,
-				"shared dict: %d id bytes for %d rows at width %d", len(stream[1:]), n, idWidth)
+
+		gids, width, self, err := sd.granule(stream, n)
+		if err != nil {
+			return nil, false, err
 		}
 
-		// Bounds-checked here as the merge path does in appendShared: an unchecked id survives into
-		// the returned column and panics later at chunk.DictColumn.At, inside the caller's row loop
-		// with nothing naming the granule it came from.
-		if err := boundSharedIDs(stream[1:], idWidth, n, entries); err != nil {
-			return nil, false, err
+		if self {
+			return nil, false, nil
 		}
 
 		at := pos
@@ -497,9 +293,17 @@ func decodeSharedIDs(
 			at = lo
 		}
 
-		copy(ids[at*idWidth:], stream[1:])
+		dst := ids[at*idWidth : (at+n)*idWidth]
+		if width == idWidth {
+			copy(dst, gids)
+		} else {
+			for r, id := range gids {
+				dst[2*r+1] = id
+			}
+		}
+
 		pos += n
 	}
 
-	return &chunk.DictColumn{Entries: entries, IDs: ids, IDWidth: idWidth}, true, nil
+	return &chunk.DictColumn{Entries: sd.entries, IDs: ids, IDWidth: idWidth}, true, nil
 }

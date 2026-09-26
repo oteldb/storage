@@ -143,17 +143,17 @@ func (d *Decoder) DecodeBytesBlock(blk int) (*chunk.DictColumn, error) {
 		return nil, err
 	}
 
-	if d.shared != nil {
-		col, done, err := d.sharedBlock(stream, n)
+	if d.shared.on {
+		ids, width, self, err := d.shared.granule(stream, n)
 		if err != nil {
 			return nil, errors.Wrapf(err, "decode block %d", blk)
 		}
 
-		if done {
-			return col, nil
+		if !self {
+			return &chunk.DictColumn{Entries: d.shared.entries, IDs: ids, IDWidth: width}, nil
 		}
 
-		stream = stream[1:] // a self-encoded granule: its own chunk stream follows the mode byte
+		stream = ids
 	}
 
 	var dc chunk.DictColumn
@@ -167,29 +167,4 @@ func (d *Decoder) DecodeBytesBlock(blk int) (*chunk.DictColumn, error) {
 	}
 
 	return &dc, nil
-}
-
-// sharedBlock decodes a granule that joined the column's shared dictionary, reporting whether it did.
-func (d *Decoder) sharedBlock(stream []byte, rows int) (*chunk.DictColumn, bool, error) {
-	mode, ids, err := splitSharedGranule(stream)
-	if err != nil {
-		return nil, false, err
-	}
-
-	if mode != modeShared {
-		return nil, false, nil
-	}
-
-	width := sharedIDWidth(d.shared)
-
-	if len(ids) != rows*width {
-		return nil, false, errors.Wrapf(ErrCorrupt,
-			"shared dict: %d id bytes for %d rows at width %d", len(ids), rows, width)
-	}
-
-	if err := boundSharedIDs(ids, width, rows, d.shared); err != nil {
-		return nil, false, err
-	}
-
-	return &chunk.DictColumn{Entries: d.shared, IDs: ids, IDWidth: width}, true, nil
 }

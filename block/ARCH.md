@@ -60,11 +60,11 @@ on all coincide.
 
 Two consumers pay for the form, and the split one is cheap in both:
 
-- The **shared-dictionary build** (below) otherwise hashes every row twice — once to count a
-  granule's distinct values for the join decision, once to assign each row its dictionary id. Given
-  entry indices both become array work over `int32`s: a per-entry generation stamp counts distinct
-  ids without a clear between granules, and a persistent source-entry → shared-id remap replaces the
-  interning map.
+- The **shared-dictionary build** (below) otherwise hashes every row once, into a granule-local
+  set that yields the join decision and each row's local id, and each distinct value once more, to
+  find it in the column dictionary. Given entry indices both become array work over `int32`s: a
+  per-entry generation stamp counts distinct ids without a clear between granules, and a persistent
+  source-entry → shared-id remap replaces the interning map.
 - The **per-granule chunk encode** (`chunk.EncodeBytesDictRange`, for granules that decline the
   shared dictionary) otherwise probes a hash map per row; from the split form it renumbers indices
   through an array.
@@ -73,8 +73,8 @@ Measured on a 64 Ki-row block-framed column, blob input against split, same obje
 
 | column shape | blob | split | |
 |---|---:|---:|---|
-| 512 distinct attribute blobs — every granule joins the shared dictionary | 3.33 ms | 290 µs | 11.5x |
-| near-unique message bodies — every granule declines and self-encodes | 11.17 ms | 1.65 ms | 6.8x |
+| 512 distinct attribute blobs — every granule joins the shared dictionary | 1.45 ms | 217 µs | 6.7x |
+| near-unique message bodies — every granule declines and self-encodes | 8.95 ms | 2.76 ms | 3.2x |
 
 The first isolates the shared-dictionary build: its granules hold raw ids, so no chunk stream is
 written at all. The second is dominated by the per-granule encode, plus the shared-dictionary scan
@@ -124,6 +124,43 @@ attribution is necessarily an apportionment of a frame (see `StreamCosts` in `AD
 unframed or constant column reports one extent covering every row, so the caller needs no special
 case; the extents' bytes sum to less than `ObjectBytes` by the directory and any shared dictionary,
 which belong to no single frame.
+
+### Shared-dictionary layout
+
+A dictionary bytes column carries one dictionary D for the whole column; each granule either holds
+ids into D or declines it and self-encodes. The writer emits the **trailer** layout:
+
+```
+[frames][dictionary region][directory][u32le dirLen]      DictOff/DictLen locate the region
+region: [uvarint entries][uvarint packedLen][packed][u32le CRC32C(packed)]
+```
+
+The region is byte-identical to the **leading** layout's header (`[region][block-framed
+container]`), which parts written before manifest version 3 use and which stays readable. The
+dictionary moved behind the frames so a writer can seal granules before D is final — the precondition
+for streaming a bytes column — and so `[DictOff, size)` is one ranged read holding both the dictionary
+and the directory, against two to four reads for the leading layout.
+
+| mode byte | layout | payload | reader check |
+|---|---|---|---|
+| 0 shared | leading only | ids at the width the final D implies | `id < len(D)` |
+| 1 self | both | a chunk bytes stream | — |
+| 2 narrow | trailer only | 1-byte ids | `id < len(D)` |
+| 3 wide | trailer only | 2-byte big-endian ids | `id < len(D)`, `len(D) > 256` |
+
+A trailer granule's width is fixed when it joins: narrow while D holds at most 256 entries, wide
+after. A whole-column decode widens narrow granules when D ends past 256, so it returns the same
+`DictColumn` the leading layout decodes to.
+
+The join decision is today's (`distinct*2 ≤ rows`, `len(D)+distinct ≤ 65536`) plus a **byte cap**
+(`WithSharedDictBytes`, 32 MiB default, clamped to the 64 MiB format ceiling `maxSharedDictRaw`). The
+cap is charged only for values a granule would *add* to D, each at its serialized size plus 147 B of
+resident overhead (slice header, count, index share), so `DictRaw ≤ charge ≤ cap` and the cap changes a
+decision only when D would really outgrow it; below it the decisions are the uncapped ones. The
+builder works a granule at a time: the flat-value path hashes each row once and each distinct value
+once more (the prior build hashed every row twice), the split path hashes nothing.
+
+A column where no granule joins is written unframed, as before.
 
 ### Decoding a shared-dictionary column
 
@@ -234,13 +271,15 @@ is what lets it fetch only those bytes.
   the object size would come up short and the directory would parse as corrupt.
 - The **compression frame is the floor**: it is the smallest unit a ranged read can fetch, so a
   single-series fetch pays one frame per column however few rows it wants.
-- A **shared-dictionary bytes column's container does not start at the object's head**: the
-  dictionary sits ahead of it, so both directory layouts are located relative to where the container
-  begins rather than to the object. The dictionary is read at open, exactly — its two header uvarints
-  give its extent — because every granule that joined it resolves ids against it, and a granule that
-  declined carries its own values inline. Reading the directory out of the raw object instead parses
-  dictionary bytes as a directory and fails as corruption on healthy data, which on a load path is
-  fatal rather than degrading.
+- A **trailer-dictionary column opens with one read**: `[DictOff, size)` is the dictionary region
+  and the directory, both located by the manifest. A column with sizing stats (below) reads a
+  footer or leading directory in exactly one read of `DirLen` too.
+- A **leading-dictionary column's container does not start at the object's head**: the dictionary
+  sits ahead of it, so both directory layouts are located relative to where the container begins
+  rather than to the object. The dictionary is read at open, exactly — its two header uvarints give
+  its extent. Reading the directory out of the raw object instead parses dictionary bytes as a
+  directory and fails as corruption on healthy data, which on a load path is fatal rather than
+  degrading.
 - `Decoder.DecodeBytes` takes a **block set**, not a block: a granule that declined the shared
   dictionary carries its own, so ids only become comparable once `chunk.DictMerger` has remapped
   them into one. That is also why it cannot decode into a caller's buffer as the numeric paths do.
@@ -279,7 +318,8 @@ them. At S3 latencies that is the difference between a merge finishing and not.
   exists to remove. A granule on the shared dictionary yields the *column's* entry table unchanged —
   the very slice `SharedEntries` returns, which is how the record merge recognizes it and resolves
   the dictionary into its union once — so ids stay comparable across granules and nothing is
-  rehashed per granule.
+  rehashed per granule. Its `IDWidth` is the granule's own, so a trailer column hands back 1-byte
+  ids for granules written before the dictionary passed 256 entries.
 
 ## At-rest checksums
 
@@ -311,14 +351,14 @@ granule lengths and `blockRows` are never compared against frame bytes, so a fli
 place decoded rows at wrong offsets with every frame checksum still passing.
 
 It is not a per-column flag: all eight descriptor flag bits are spent, and a checksum is not a
-per-column choice. The **manifest version** carries it. Version 2 is what the writer emits and means
-"every column object is checked"; version 1 parts carry no column checksums and are read unverified,
-so no migration is forced. The reader accepts the range 1..2 and rejects anything outside it, so an
-older binary — which accepts version 1 only — refuses a version-2 part outright with
-`unsupported version 2` wrapping `ErrCorrupt`, rather than misreading it. A version above the
-reader's range wraps `ErrUnsupportedVersion`, itself an `ErrCorrupt`: callers that only fail keep
-failing, and the engines can tell an intact part written by a newer release from a damaged one,
-which they hand to repair after repeated loads (`engine/ARCH.md`) and must never do for a newer one.
+per-column choice. The **manifest version** carries it. Version 2 and later mean "every column object
+is checked"; version 1 parts carry no column checksums and are read unverified, so no migration is
+forced. The reader accepts the range 1..3 and rejects anything outside it, so an older binary refuses
+a newer part outright with `unsupported version N` wrapping `ErrCorrupt`, rather than misreading it. A
+version above the reader's range wraps `ErrUnsupportedVersion`, itself an `ErrCorrupt`: callers that
+only fail keep failing, and the engines can tell an intact part written by a newer release from a
+damaged one, which they hand to repair after repeated loads (`engine/ARCH.md`) and must never do for
+a newer one.
 
 Cost: 4 bytes per compression frame (0.006% of a 64 KiB frame), 4 per column directory, 4 per
 unblocked object. The hashing itself is hardware CRC32C on both paths and did not move any `block/`
@@ -327,6 +367,45 @@ encode or decode benchmark out of the noise.
 `block` reports corruption; choosing another copy is not its concern. Turning an `ErrCorrupt` into
 the `cluster.ErrShardAbsent` failover that `cluster_completeness.go` runs for a node which cannot
 answer a window belongs to the cluster layer.
+
+## Bounded decompression
+
+Every decompression is held to a size the part records, through `compress.DecompressLimit`, so a
+CRC-valid object that decompresses past it fails as `ErrCorrupt` (wrapping `compress.ErrLimit`) having
+allocated no more than the bound plus the decoder workspace:
+
+| what | bound |
+|---|---|
+| a trailer dictionary | `DictRaw`, exactly |
+| a frame, any version | its granules' lengths from the directory, exactly |
+| an unframed stream with sizing | `StreamRaw`, exactly |
+| an unframed stream without, or a legacy frame | `RawBytes + 16·rows + 1 KiB` |
+| a framed column's frames together, without sizing | `RawBytes + 16·rows + 1 KiB·granules` |
+| a leading dictionary | `RawBytes + 5·65536` |
+
+Without sizing the part's `RawBytes` bounds any one column: a chunk stream is its values plus at most
+16 B per row (ids, length prefixes, a Gorilla value's worst case) plus a fixed overhead per stream,
+which T64 makes large — it writes its last 64-row block's bit planes whole, up to 538 bytes for one
+row. A part recording no `RawBytes` decodes unbounded, as before; it is never merged (`ColumnInputSize`).
+
+A bounded zstd decode goes into a destination of the content size plus 128 KiB + 16: the decoder
+appends a block before checking it, so without the slack the append would grow the buffer past the
+bound. The slack lives as long as the buffer, so nothing kept past a decode carries it:
+
+- a **kept buffer** — a dictionary, whose entries alias it; a decoder's frame buffer, which lives as
+  long as the decoder; an unframed stream — decodes into a scratch buffer and is copied out at its
+  exact size. Keeping the slack would cost 128 KiB per open zstd dictionary and per open decoder,
+  over a gigabyte for 1000 parts × 5 open columns. The scratch buffers come from a fixed set of four
+  of at most 1 MiB that survives collections: a `sync.Pool` empties on every other collection, and
+  rebuilding a scratch per miss put a ranged open 16% over its allocation before the slack;
+- a **whole-column bytes walk** keeps every frame it decoded (the merged column aliases them), so the
+  frames decode back to back into one arena sized to their recorded total plus one slack, instead of
+  a slack per frame — about three times the column at 64 KiB frames;
+- a walk that copies out what it decodes (the numeric decodes, the shared-id fast path) reuses a
+  pooled frame buffer, so it neither keeps nor re-zeroes the slack per call.
+
+The zstd decoder workspace is measured at 298 KiB with a cold pool (block buffers, tables, and the
+slack); `compress.DecodeWorkspace` rounds it to 512 KiB.
 
 ## Manifest & marks
 
@@ -349,6 +428,27 @@ answer a window belongs to the cluster layer.
   Decode bounds every uvarint as `uint64` before converting it — lengths by the unread remainder,
   row count and granule size by `maxPartRows`, byte sizes by `MaxInt64` — so a CRC-valid manifest
   with an out-of-range field is `ErrCorrupt`, never a wrapped value or a panic (fuzzed).
+- **Version 3** adds a per-column `xflags` byte after `flags`; an unknown bit is
+  `ErrUnsupportedVersion`, since each gates fields a reader must parse. A writer emits version 3
+  only when some column sets a bit and version 2 otherwise, so metric parts stay readable by a
+  version-2 reader.
+  - `xTrailerDict` → `DictOff, DictLen, DictRaw, DictEntries`. Bounded by subtraction only against
+    `Bytes`, and `DictLen` by the largest region a writer produces for `DictRaw` bytes (compression
+    never adds more than its flag byte), so no manifest makes a reader request more than ≈64 MiB for
+    a dictionary. It requires a blocked, framed, footer, shared-dictionary `CodecDict` bytes column
+    with an object; in version 3 a footer shared dictionary without it is corrupt.
+  - `xSizing` → `ColumnSizing` (`WithSizingStats`, which the record engine passes): the directory's
+    length and counts, the largest compressed and decompressed frame and granule, and the stream
+    total. Readers check the directory against it — counts before any index array is allocated,
+    maxima and totals exactly — so a manifest cannot understate the column it sizes.
+- **`ColumnInputSize`** turns a descriptor into what reading the column holds, from the manifest
+  alone. With sizing it is per column: the dictionary plus its decoded headers, the frame and
+  directory sizes, the bytes an open reads (the trailer tail, or `DirLen`), and the whole-read
+  footprint. Without sizing a column is bounded only through its part's `RawBytes`,
+  so it is charged as a whole read of the whole part (`SourceWide`): `RawBytes` twice — the decoded
+  values and the decompressed stream of the column being decoded, a second copy for a numeric one —
+  plus each column's per-row stream slack and decoded headers, per-granule stream overhead and zstd
+  slack. A part without `RawBytes` or without an object size cannot be bounded and saturates.
 - **Marks** — sparse granule index over the sort-key column (per-granule first row + min/max,
   delta-encoded, CRC-checked). `Overlapping(lo,hi)` prunes granules for a time window.
 

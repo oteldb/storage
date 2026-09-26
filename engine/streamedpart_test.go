@@ -124,7 +124,9 @@ func assertColumnsStreamed(t *testing.T, ctx context.Context, b backend.Backend)
 		r, err := block.OpenPart(ctx, b, prefix)
 		require.NoError(t, err)
 
-		for _, c := range r.Manifest().Columns {
+		cols := r.Manifest().Columns
+		for i := range cols {
+			c := &cols[i]
 			if !c.Footer {
 				continue
 			}

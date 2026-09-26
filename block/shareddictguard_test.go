@@ -64,7 +64,7 @@ func TestSharedDictRejectsOutOfRangeID(t *testing.T) {
 					blocks[i] = i
 				}
 
-				_, _, err = decodeSharedIDs(dir, noneComp(), n, blocks, entries, scatter)
+				_, _, err = decodeSharedIDs(dir, noneComp(), n, blocks, sharedDict{entries: entries, on: true}, scatter)
 				require.ErrorIs(t, err, ErrCorrupt)
 			})
 		}
