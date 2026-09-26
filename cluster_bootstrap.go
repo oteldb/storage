@@ -53,7 +53,7 @@ func (s *Storage) bootstrapGainedTenants(ctx context.Context) {
 	for _, shard := range shards {
 		tid := signal.TenantID(shard)
 
-		if !s.ownsShard(tid) {
+		if !s.ownsShard(tid) || s.skipReserved(ctx, tid, shard, reservedSourceBootstrap) {
 			continue
 		}
 

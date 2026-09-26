@@ -306,6 +306,13 @@ func (e *ecBackend) IsEphemeral() bool { return e.inner.IsEphemeral() }
 // IsNodeLocal forwards the [backend.NodeLocal] capability.
 func (e *ecBackend) IsNodeLocal() bool { return backend.IsNodeLocal(e.inner) }
 
+// Dir forwards the [backend.LocalDir] capability.
+func (e *ecBackend) Dir() string {
+	dir, _ := backend.DirOf(e.inner)
+
+	return dir
+}
+
 // FreeSpace and FreeInodes forward the capacity capabilities. Without them an EC tenant's engine
 // would see an unbounded medium and neither the merge cap nor the disk-pressure guard would bind.
 func (e *ecBackend) FreeSpace(ctx context.Context) (int64, error) {

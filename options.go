@@ -30,6 +30,12 @@ type Options struct {
 
 	// Tenant derives a record's tenant id from its Resource and Scope (so one OTLP
 	// batch may fan out to many tenants). If nil, every record routes to "default".
+	//
+	// The id "wal", and any id whose first "/"-separated segment is "wal" in any letter case, is
+	// reserved: it would key its data under the directory a WAL kept at <backend root>/wal occupies.
+	// So is any id containing a backslash, a path separator on Windows. Records routed to one are
+	// rejected with reason "reserved_tenant"; one already persisted is skipped at [Open] and never
+	// served (see storage.tenant.reserved_skipped).
 	Tenant func(signal.Resource, signal.Scope) signal.TenantID
 
 	// Tenancy resolves a tenant id to limits, retention, downsampling, and routing.
@@ -70,6 +76,11 @@ type Options struct {
 	// Ignored when [Durability] is [DurabilityEphemeral]; required in cluster mode
 	// ([Cluster]) on a durable backend, where a node that cannot restore its unflushed
 	// head on restart would serve reads as a ring owner with that head missing.
+	//
+	// It must not overlap a local backend's directory ([backend.LocalDir], e.g. the file
+	// backend's root): [Open] refuses a WALDir equal to, inside, or containing it, since the
+	// backend lists, deletes and prunes directories anywhere under its root. Keep the two
+	// side by side instead (e.g. /data/parts and /data/wal).
 	WALDir string
 
 	// WALSync is the WAL fsync policy (default [WALSyncNone]). Ignored without a WAL.
@@ -492,6 +503,10 @@ func (o *Options) validate() error {
 	}
 
 	if err := o.validateReadOnly(); err != nil {
+		return err
+	}
+
+	if err := o.validateWALPlacement(); err != nil {
 		return err
 	}
 

@@ -141,6 +141,7 @@ type Parts struct {
 	bytes      metric.Int64Gauge
 	orphans    metric.Int64Counter
 	deferred   metric.Int64Counter
+	reserved   metric.Int64Counter
 }
 
 // Record publishes one signal's part shape, summed over the tenants this node holds. The values are
@@ -170,6 +171,12 @@ func (p *Parts) OrphansDeferred(ctx context.Context, sig string, n int64) {
 	if n > 0 {
 		p.deferred.Add(ctx, n, sigAttr(sig))
 	}
+}
+
+// ReservedTenantSkipped accounts one tenant (or engine prefix) left untouched because its id is
+// reserved, by where it was found.
+func (p *Parts) ReservedTenantSkipped(ctx context.Context, source string) {
+	p.reserved.Add(ctx, 1, metric.WithAttributes(attribute.String("source", source)))
 }
 
 // Fetch instruments a fetch over the head ∪ parts.
@@ -455,6 +462,8 @@ func newParts(m metric.Meter) (*Parts, error) {
 			"part objects no index entry names, deleted by the sweep at open", "{object}"),
 		deferred: b.counter("storage.parts.orphans_deferred",
 			"unnamed part objects the sweep kept because their part is younger than the grace", "{object}"),
+		reserved: b.counter("storage.tenant.reserved_skipped",
+			"tenants found on disk, in the WAL, in etcd or at a peer whose id is reserved, left untouched", "{tenant}"),
 	}
 
 	return p, b.err

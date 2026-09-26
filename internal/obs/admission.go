@@ -60,7 +60,7 @@ func (a *Admission) Accepted(ctx context.Context, n int64, sig string) {
 }
 
 // Rejected records n points shed for the given signal and reason (e.g. out_of_order, rate_limit,
-// max_series, max_in_flight_bytes). A zero n is ignored.
+// max_series, max_in_flight_bytes, reserved_tenant). A zero n is ignored.
 func (a *Admission) Rejected(ctx context.Context, n int64, sig, reason string) {
 	if n <= 0 {
 		return

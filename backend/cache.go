@@ -114,6 +114,13 @@ func (c *cachedBackend) IsEphemeral() bool { return c.inner.IsEphemeral() }
 // IsNodeLocal forwards the [NodeLocal] capability; without it a cached backend would look shared.
 func (c *cachedBackend) IsNodeLocal() bool { return IsNodeLocal(c.inner) }
 
+// Dir forwards the [LocalDir] capability.
+func (c *cachedBackend) Dir() string {
+	dir, _ := DirOf(c.inner)
+
+	return dir
+}
+
 var _ ObjectCreator = (*cachedBackend)(nil)
 
 // CreateObject forwards the incremental write and drops any stale entry under key once it commits.

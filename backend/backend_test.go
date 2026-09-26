@@ -21,6 +21,16 @@ func TestMemoryIsEphemeral(t *testing.T) {
 	}
 }
 
+func TestDirOfWithoutLocalDir(t *testing.T) {
+	t.Parallel()
+
+	for _, b := range []backend.Backend{backend.Memory(), backend.Cached(backend.Memory(), 1<<20)} {
+		if dir, ok := backend.DirOf(b); ok {
+			t.Fatalf("a backend without a directory reported %q", dir)
+		}
+	}
+}
+
 func TestIsNodeLocal(t *testing.T) {
 	t.Parallel()
 

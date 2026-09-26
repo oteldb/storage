@@ -10,6 +10,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/backendtest"
+	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/internal/obs"
 )
 
@@ -115,6 +116,16 @@ var capabilityProbes = []struct {
 	{"NodeLocal", func(_ *testing.T, wrap wrapFunc) bool {
 		return backend.IsNodeLocal(wrap(backend.Memory()))
 	}},
+	{"LocalDir", func(t *testing.T, wrap wrapFunc) bool {
+		t.Helper()
+
+		f, err := file.New(t.TempDir())
+		require.NoError(t, err)
+
+		dir, ok := backend.DirOf(wrap(f))
+
+		return ok && dir == f.Dir()
+	}},
 	{"SpaceReporter", func(_ *testing.T, wrap wrapFunc) bool {
 		n, err := backend.FreeSpace(context.Background(), wrap(backendtest.WithCapacity(backend.Memory(), 123, backendtest.Unknown)))
 
@@ -192,6 +203,9 @@ func assertFallbacks(t *testing.T, w backend.Backend) {
 
 	assert.False(t, backend.StreamsWrites(w), "StreamsWrites")
 	assert.False(t, backend.IsNodeLocal(w), "IsNodeLocal")
+
+	_, ok := backend.DirOf(w)
+	assert.False(t, ok, "LocalDir")
 	assert.False(t, backend.RangesNatively(ctx, w, probeKey), "RangesNatively")
 
 	_, err := backend.FreeSpace(ctx, w)

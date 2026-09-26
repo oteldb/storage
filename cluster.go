@@ -193,6 +193,10 @@ func (s *Storage) syncPartsResult(
 		return false, partsync.Stats{}, nil
 	}
 
+	if s.skipReserved(ctx, tid, string(tid)+signalPrefix, reservedSourcePartsync) {
+		return false, partsync.Stats{}, nil
+	}
+
 	local, remotes := s.shardOwners(tid)
 	if !local || len(remotes) == 0 {
 		return false, partsync.Stats{}, nil
@@ -1522,10 +1526,17 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 		haveTenant   bool
 
 		sampledDropped int64
+		reserved       int64
 	)
 
 	frames := cluster.FrameMetrics(md, s.cluster.shardCount(), s.opts.Tenant,
 		func(tid signal.TenantID, b *metric.Batch) ([]float64, bool) {
+			if tenantReserved(tid) {
+				reserved += int64(b.Len())
+
+				return nil, false
+			}
+
 			if !haveTenant || tid != lastTenant {
 				lastTenant, haveTenant = tid, true
 				lastAdmit = s.admissionFor(tid)
@@ -1579,7 +1590,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 	})
 
 	// Combine the origin rate rejections with each primary's per-reason breakdown.
-	rej := rejectTally{rate: rateRejected}
+	rej := rejectTally{rate: rateRejected - reserved, reserved: reserved}
 	for _, r := range rejects {
 		rej.ooo += int64(r.OOO)
 		rej.cardinality += int64(r.Cardinality)
