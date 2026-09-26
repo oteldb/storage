@@ -76,10 +76,12 @@ type SignalStats struct {
 	// MergeBacklog is the parts a merge may still take (Parts − SealedParts). It is the backlog in
 	// the literal sense — work compaction still has to do — not the part count.
 	MergeBacklog int
-	// MergeCandidates is how many parts the next merge would select. Zero with a non-zero
-	// MergeBacklog is the stuck state that a cycle cannot fix by itself: parts remain mergeable but
-	// none of them qualify, which is what [Admin.CompactNow] overrides.
-	MergeCandidates int
+	// MergeCandidates is how many parts the next merge would select, and MergeForceCandidates how
+	// many [Admin.CompactNow] would. MergeCandidates zero with MergeForceCandidates above it is the
+	// state a cycle cannot fix by itself and CompactNow breaks; both zero with a non-zero
+	// MergeBacklog is every unsealed part alone in its time bucket, which no merge reduces.
+	MergeCandidates      int
+	MergeForceCandidates int
 	// MergeCapBytes is the seal threshold in effect — the size at which a merged part is sealed, and
 	// the bound on what one merge may hold. It is derived per merge (from free space and the merge
 	// memory allowance) for metrics, so it reads 0 until the engine's first merge; for the record
@@ -259,7 +261,8 @@ func (s *Storage) Inspect() StoreStats {
 			MergeRunning:  eng.MergeRunning(),
 			MergeDeferred: eng.MergeDeferred(),
 			SealedParts:   sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
-			MergeCapBytes: sh.CapBytes, OutOfSpace: es.OutOfSpace,
+			MergeForceCandidates: sh.ForceCandidates,
+			MergeCapBytes:        sh.CapBytes, OutOfSpace: es.OutOfSpace,
 			WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 			WantedParts: es.WantedParts, Holes: es.Holes, LostParts: es.LostParts,
 			IndexFenced: es.IndexFenced, IndexLoadError: errText(es.IndexLoadErr),
@@ -288,7 +291,8 @@ func (s *Storage) Inspect() StoreStats {
 				MergeRunning:  eng.MergeRunning(),
 				MergeDeferred: eng.MergeDeferred(),
 				SealedParts:   sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
-				MergeCapBytes: sh.CapBytes, OutOfSpace: es.OutOfSpace,
+				MergeForceCandidates: sh.ForceCandidates,
+				MergeCapBytes:        sh.CapBytes, OutOfSpace: es.OutOfSpace,
 				WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 				WantedParts: es.WantedParts, Holes: es.Holes, LostParts: es.LostParts,
 				IndexFenced: es.IndexFenced, IndexLoadError: errText(es.IndexLoadErr),

@@ -13,10 +13,12 @@ type MergeShape struct {
 	// Bytes is what the flushed parts occupy on disk. Divided by Parts it is the average part size,
 	// which is what says whether a rising part count is a merge that stopped or an ingest that grew.
 	Bytes int64
-	// Candidates is how many parts the next merge would select right now. 0 with a non-zero Backlog
-	// is the stuck state: parts remain mergeable but no tier of any time bucket holds minTierParts
-	// of them, which is what [MergeOptions.Force] exists to break.
-	Candidates int
+	// Candidates is how many parts the next merge would select right now, and ForceCandidates how
+	// many a [MergeOptions.Force] merge would. Candidates 0 with ForceCandidates above it is a tier
+	// spread only Force breaks; both 0 with a non-zero Backlog is every unsealed part alone in its
+	// time bucket, the ladder's resting state, which no merge reduces without widening a part.
+	Candidates      int
+	ForceCandidates int
 	// CapBytes is the seal threshold in effect, in decoded bytes (0 ⇒ sealing disabled).
 	CapBytes int64
 	// Tiers is how many distinct size tiers the unsealed parts fall into and LargestTierParts the
@@ -63,7 +65,8 @@ func shapeOf(src []*part, capBytes int64) MergeShape {
 		Sealed:           len(src) - len(unsealed),
 		Backlog:          len(unsealed),
 		Bytes:            bytes,
-		Candidates:       len(selectLadderGroup(src, capBytes, false)),
+		Candidates:       len(selectMergeParts(src, 0, capBytes, false)),
+		ForceCandidates:  len(selectMergeParts(src, 0, capBytes, true)),
 		CapBytes:         capBytes,
 		Tiers:            len(byTier),
 		LargestTierParts: largest,

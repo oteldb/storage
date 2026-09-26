@@ -45,11 +45,9 @@ func fitsLevel(p *part, level int64) bool {
 	return bucketOf(p.minTime, level) == bucketOf(p.maxTime, level)
 }
 
-// finestLevel returns the narrowest ladder level whose bucket contains p whole. It reports false
-// for a part that straddles a boundary at every level — one wider than the top level, or one
-// written across a boundary before flush-time splitting existed. Such a part cannot join any group
-// without widening its group's output, so the selector leaves it alone; splitting it is the
-// straddle-split change, not this one.
+// finestLevel returns the narrowest ladder level whose bucket contains p whole, reporting false for
+// a straddler: a part crossing a top-level boundary. Flush does not split by time, so one late
+// sample makes one. A straddler joins no ladder group; [selectStraddlers] picks it instead.
 func finestLevel(p *part) (int64, bool) {
 	for _, level := range mergeLadder {
 		if fitsLevel(p, level) {
@@ -58,6 +56,76 @@ func finestLevel(p *part) (int64, bool) {
 	}
 
 	return 0, false
+}
+
+// topLevel is the widest ladder level, and so the boundary every merge output is split on.
+func topLevel() int64 {
+	return mergeLadder[len(mergeLadder)-1]
+}
+
+// bucketEnd returns the last timestamp of the level-aligned bucket holding ts, saturating at the
+// int64 maximum instead of overflowing past it.
+func bucketEnd(ts, level int64) int64 {
+	b := bucketOf(ts, level)
+	if b > maxInt64-(level-1) {
+		return maxInt64
+	}
+
+	return b + level - 1
+}
+
+// spanOf returns the union of the parts' sample bounds.
+func spanOf(parts []*part) (lo, hi int64) {
+	lo, hi = maxInt64, minInt64
+	for _, p := range parts {
+		lo, hi = min(lo, p.minTime), max(hi, p.maxTime)
+	}
+
+	return lo, hi
+}
+
+// splitsOutput reports whether merging src from start on writes more than one top-level bucket, so
+// [Engine.compactAligned] must cut its output on bucket boundaries.
+func splitsOutput(src []*part, start int64) bool {
+	lo, hi := spanOf(src)
+
+	return bucketOf(max(lo, start), topLevel()) != bucketOf(hi, topLevel())
+}
+
+// selectStraddlers returns the straddlers to split this cycle: oldest first, up to capBytes and
+// maxMergeParts of them and at least one, in src order.
+//
+// Merging straddlers together rather than one at a time is what makes a backlog converge: their
+// samples land in the same few buckets, so one merge writes a part per bucket touched, not per
+// straddler.
+func selectStraddlers(src []*part, capBytes int64) []*part {
+	var straddlers []*part
+
+	for _, p := range src {
+		if _, ok := finestLevel(p); !ok {
+			straddlers = append(straddlers, p)
+		}
+	}
+
+	if len(straddlers) == 0 {
+		return nil
+	}
+
+	slices.SortStableFunc(straddlers, func(a, b *part) int { return cmp.Compare(a.minTime, b.minTime) })
+
+	var total int64
+
+	n := 0
+	for ; n < min(len(straddlers), maxMergeParts); n++ {
+		size := straddlers[n].sizeBytes()
+		if n > 0 && capBytes > 0 && total+size > capBytes {
+			break
+		}
+
+		total += size
+	}
+
+	return inSrcOrder(straddlers[:n], srcOrder(src))
 }
 
 // newestBucket returns the start of the level-aligned bucket holding the newest sample in src. That
@@ -142,8 +210,7 @@ func selectLadderRun(src []*part, capBytes int64, idle int) []*part {
 // narrows, and doing it on the cycle most likely to run.
 //
 // The oldest forced part decides the bucket, so age-driven work still progresses oldest-first, one
-// bucket per cycle. A part straddling every level is rewritten alone rather than skipped: retention
-// correctness does not get to wait on the straddle-split change.
+// bucket per cycle. A straddler is rewritten alone, and the merge splits it on bucket boundaries.
 //
 // The rest of that bucket is folded in when it fits the cap. Merging inside a bucket cannot widen
 // the output past the bucket, so absorbing the neighbors costs one rewrite that was already

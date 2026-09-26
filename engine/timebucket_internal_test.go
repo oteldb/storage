@@ -22,17 +22,6 @@ func partAt(seq int, size, minTime, maxTime int64) *part {
 	return p
 }
 
-// spanOf returns the span a merge of parts would produce — the union of their bounds, which is what
-// the output part's own bounds become.
-func spanOf(parts []*part) (lo, hi int64) {
-	lo, hi = maxInt64, minInt64
-	for _, p := range parts {
-		lo, hi = min(lo, p.minTime), max(hi, p.maxTime)
-	}
-
-	return lo, hi
-}
-
 // TestMergeLadderDivides is the invariant the ladder rests on: each level divides the next, so a
 // bucket nests exactly inside its parent and a part that fits level L still fits level L+1. Without
 // it a part could fit a narrow bucket yet straddle the wide one containing it, and promotion would
@@ -145,7 +134,8 @@ func TestSelectMergePartsSpansStoreWithoutBuckets(t *testing.T) {
 		partAt(1, 1<<20, 47*hour, 48*hour),
 	}
 
-	assert.Empty(t, selectMergeParts(src, MergeOptions{}, 64<<20, mergeIdleRounds),
+	// The newer part ends on the day boundary, so it is a straddler and may be selected alone.
+	assert.Less(t, len(selectMergeParts(src, MergeOptions{}, 64<<20, mergeIdleRounds)), 2,
 		"parts two days apart share no bucket at any level, so no merge may pair them")
 }
 
@@ -227,9 +217,8 @@ func TestSelectForcedAbsorbsBucketNeighbours(t *testing.T) {
 		"a co-located unforced part rides along rather than being left as a fragment")
 }
 
-// TestSelectForcedRewritesStraddlerAlone checks retention correctness does not wait on straddle
-// splitting: a part crossing every level's boundary belongs to no bucket, and must still be
-// rewritten rather than silently skipped forever.
+// TestSelectForcedRewritesStraddlerAlone checks a straddler retention forces is rewritten alone:
+// it belongs to no bucket, and the merge splits it on day boundaries.
 func TestSelectForcedRewritesStraddlerAlone(t *testing.T) {
 	t.Parallel()
 

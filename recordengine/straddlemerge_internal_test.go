@@ -1,20 +1,21 @@
 package recordengine
 
 import (
+	"math/rand/v2"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/oteldb/storage/internal/reproduce"
 )
 
 const (
 	straddleCapBytes  = 64 << 20
 	straddlePartBytes = 1 << 20
 	straddlePartCount = 5
+	// straddleRounds bounds a merge loop that must reach its fixpoint well before it.
+	straddleRounds = 1000
 )
 
 // partsAcrossDayBoundary returns five 2-minute parts that each cross the same day boundary, so each
@@ -41,30 +42,31 @@ func partsWithinOneHour() []*part {
 	return out
 }
 
-// compactToFixpoint applies selectMergeParts until it stops reducing the part count, replacing each
-// selection with the part that merge would produce. A selection of fewer than two parts rewrites a
-// part into itself and ends the loop; every other round drops at least one part, so len(src) rounds
-// reach the fixpoint.
-func compactToFixpoint(tb testing.TB, src []*part) []*part {
+// compactToFixpoint applies selectMergeParts until it selects nothing, replacing each selection
+// with the parts that merge would produce.
+func compactToFixpoint(tb testing.TB, src []*part, force bool) []*part {
 	tb.Helper()
 
 	parts := slices.Clone(src)
 
-	for range src {
-		selected := selectMergeParts(parts, 0, straddleCapBytes, true)
-		if len(selected) < 2 {
-			break
+	for range straddleRounds {
+		selected := selectMergeParts(parts, 0, straddleCapBytes, force)
+		if len(selected) == 0 {
+			return parts
 		}
 
-		parts = applyMerge(parts, selected)
+		parts, _ = applyMerge(parts, selected)
 	}
 
-	return parts
+	require.FailNow(tb, "merge selection did not reach a fixpoint", "%d rounds", straddleRounds)
+
+	return nil
 }
 
-// applyMerge replaces selected with the single part merging them yields: their union span, their
-// summed size.
-func applyMerge(parts, selected []*part) []*part {
+// mergeOutputs models what merging selected writes: the union span cut on top-level boundaries,
+// one part per bucket, the bytes shared evenly. The real merge writes a bucket only when a record
+// lands in it, so the model is an upper bound on the part count.
+func mergeOutputs(selected []*part) []*part {
 	lo, hi := spanOf(selected)
 
 	var total int64
@@ -72,27 +74,41 @@ func applyMerge(parts, selected []*part) []*part {
 		total += p.sizeBytes()
 	}
 
-	out := make([]*part, 0, len(parts)-len(selected)+1)
+	var out []*part
+
+	for b := bucketOf(lo, topLevel()); b <= hi; b += topLevel() {
+		out = append(out, partAt(0, max(lo, b), min(hi, b+topLevel()-1)))
+	}
+
+	for _, p := range out {
+		p.rawBytes = max(total/int64(len(out)), 1)
+	}
+
+	return out
+}
+
+// applyMerge replaces selected with [mergeOutputs] of it, returning the new part set and the
+// outputs.
+func applyMerge(parts, selected []*part) (next, merged []*part) {
+	merged = mergeOutputs(selected)
+
+	next = make([]*part, 0, len(parts)-len(selected)+len(merged))
 	for _, p := range parts {
 		if !slices.Contains(selected, p) {
-			out = append(out, p)
+			next = append(next, p)
 		}
 	}
 
-	return append(out, partAt(total, lo, hi))
+	return append(next, merged...), merged
 }
 
-// TestStraddlingPartsCompact is the defect: a part that crosses a boundary at every ladder level
-// fits no level, so partitionGroups drops it from every group and size-driven selection can never
-// see it, however small it is. Five such parts sit two minutes apart and still never merge — on a
-// live stand that was 2847 parts of 39 KiB and no merge in 24h.
+// TestStraddlingPartsCompact is #450: a part that crosses a boundary at every ladder level fits no
+// level, so partitionGroups drops it from every group and size-driven selection never sees it,
+// however small it is. On a live stand that was 12,735 exemplar parts and no merge in days.
 //
-// The assertion is only that merging reduces the part count, not that the straddlers end up in one
-// part: merging two day-straddlers would emit a part wider than the top level, which
-// TestSelectMergePartsNeverWidensPastTopLevel forbids.
+// The assertion is only that merging reduces the part count, not the shape straddlers end up in.
 func TestStraddlingPartsCompact(t *testing.T) {
 	t.Parallel()
-	reproduce.Unfixed(t, 450, "a part straddling every ladder level joins no merge group, so no number of merges reduces the part count")
 
 	src := partsAcrossDayBoundary()
 	for _, p := range src {
@@ -100,19 +116,23 @@ func TestStraddlingPartsCompact(t *testing.T) {
 			"the fixture must cross the day boundary")
 	}
 
-	got := compactToFixpoint(t, src)
+	got := compactToFixpoint(t, src, false)
 	assert.Less(t, len(got), len(src), "repeated merges must reduce the part count")
+
+	for _, p := range got {
+		_, ok := finestLevel(p)
+		assert.True(t, ok, "[%v,%v] still fits no ladder level", time.Duration(p.minTime), time.Duration(p.maxTime))
+	}
 }
 
 // TestCoLocatedPartsCompact is the control for [TestStraddlingPartsCompact]: the same five parts
-// aligned inside one 1h bucket, under the same assertion. It passes today, which is what makes
-// alignment the only variable between the two.
+// aligned inside one 1h bucket, under the same assertion.
 func TestCoLocatedPartsCompact(t *testing.T) {
 	t.Parallel()
 
 	src := partsWithinOneHour()
 
-	got := compactToFixpoint(t, src)
+	got := compactToFixpoint(t, src, false)
 	assert.Less(t, len(got), len(src), "repeated merges must reduce the part count")
 }
 
@@ -129,34 +149,75 @@ func partsAcrossDaysWithStraddlers() []*part {
 	return append(src, partsAcrossDayBoundary()...)
 }
 
+// randomPopulation returns normal parts, each inside one random 1h/6h/24h bucket, mixed with
+// straddlers of random span up to four days, across a week, at sizes from 1 KiB to 32 MiB.
+func randomPopulation(rng *rand.Rand) []*part {
+	n := 1 + rng.IntN(64)
+	out := make([]*part, 0, n)
+
+	for range n {
+		size := int64(1) << (10 + rng.IntN(16))
+		start := rng.Int64N(7 * day)
+
+		if rng.IntN(3) == 0 {
+			out = append(out, partAt(size, start, start+1+rng.Int64N(4*day)))
+
+			continue
+		}
+
+		level := mergeLadder[rng.IntN(len(mergeLadder))]
+		lo := bucketOf(start, level)
+		out = append(out, partAt(size, lo+rng.Int64N(level/2), bucketEnd(lo, level)-rng.Int64N(level/2)))
+	}
+
+	return out
+}
+
+// TestMergeConvergesWithStraddlers is the convergence property over random populations: repeated
+// merges reach a fixpoint, forced or not, and the fixpoint holds no straddler.
+func TestMergeConvergesWithStraddlers(t *testing.T) {
+	t.Parallel()
+
+	for seed := range uint64(256) {
+		for _, force := range []bool{false, true} {
+			got := compactToFixpoint(t, randomPopulation(rand.New(rand.NewPCG(seed, seed+1))), force)
+
+			for _, p := range got {
+				_, ok := finestLevel(p)
+				require.True(t, ok, "seed %d force=%v: [%v,%v] straddles at the fixpoint",
+					seed, force, time.Duration(p.minTime), time.Duration(p.maxTime))
+			}
+		}
+	}
+}
+
 // TestSelectMergePartsOutputFitsALadderLevel is the alignment half of the no-widening property. The
 // width bound alone admits a narrow part that fits no bucket at any level — five 2-minute parts
 // across a day boundary merge to 2m40s, well under the top level — and such a part is then invisible
-// to every later merge, which is the defect [TestStraddlingPartsCompact] holds open. So whatever the
-// size-driven path selects, the part merging it would produce must still fit a level.
-//
-// The forced path is exempt: retention rewrites a lone straddler on purpose
-// ([TestSelectForcedRewritesStraddlerAlone]), so only selections of two or more parts are checked.
+// to the ladder. So every part a merge of the selection writes must fit a level.
 func TestSelectMergePartsOutputFitsALadderLevel(t *testing.T) {
 	t.Parallel()
 
 	for _, force := range []bool{false, true} {
 		parts := partsAcrossDaysWithStraddlers()
 
-		for round := range parts {
+		for round := range straddleRounds {
 			selected := selectMergeParts(parts, 0, straddleCapBytes, force)
-			if len(selected) < 2 {
+			if len(selected) == 0 {
 				break
 			}
 
-			parts = applyMerge(parts, selected)
+			var merged []*part
 
-			merged := parts[len(parts)-1]
-			_, ok := finestLevel(merged)
-			require.True(t, ok,
-				"force=%v round=%d: merging %d parts yields [%v,%v], %s wide, which fits no ladder level",
-				force, round, len(selected), time.Duration(merged.minTime), time.Duration(merged.maxTime),
-				time.Duration(merged.maxTime-merged.minTime))
+			parts, merged = applyMerge(parts, selected)
+
+			for _, p := range merged {
+				_, ok := finestLevel(p)
+				require.True(t, ok,
+					"force=%v round=%d: merging %d parts writes [%v,%v], %s wide, which fits no ladder level",
+					force, round, len(selected), time.Duration(p.minTime), time.Duration(p.maxTime),
+					time.Duration(p.maxTime-p.minTime))
+			}
 		}
 	}
 }

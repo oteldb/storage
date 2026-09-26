@@ -109,8 +109,12 @@ func TestReseedHorizonRate(t *testing.T) {
 
 	var unexplained int
 
+	// A part a merge split on a day boundary lives on in no single successor, only in the split
+	// group's joint claim, which the index's coverage realizes.
+	covered := ixFinal.Covered()
+
 	for _, ent := range removed {
-		sup := false
+		sup := covered.Contains(ent.Blocks)
 
 		for i := range ixFinal.Entries {
 			if ixFinal.Entries[i].Supersedes(ent) {
@@ -126,7 +130,7 @@ func TestReseedHorizonRate(t *testing.T) {
 	}
 
 	// The two claims the horizon documentation rests on, with orders of magnitude of margin: a
-	// merged-away part is accounted for by its successor without any tombstone, and the live part
+	// merged-away part is accounted for by its successors without any tombstone, and the live part
 	// set — which is what bounds a node's wants — stays far below the reseed horizon.
 	require.Zero(t, unexplained, "a merge-consumed part must stay accounted for by its successor")
 	require.Less(t, len(ixFinal.Entries), bucketindex.MaxWants)

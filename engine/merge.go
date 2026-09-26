@@ -177,7 +177,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	// source parts stay live (not retired) until publish, so they can't be reclaimed here.
 	var newParts []*part
 
-	if len(selected) == 1 {
+	if len(selected) == 1 && !splitsOutput(selected, start) {
 		// A single forced part: decode it (bounded — one part), apply retention/downsample, and skip
 		// the rewrite if it is already at its target (the fixed point), avoiding backend churn.
 		var cols *flushColumns
@@ -196,7 +196,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		if newParts, err = e.writeColumns(ctx, cols, rowCapFor(p, capBytes), opts); err != nil {
 			return mergeResult{parts: dropped}, err
 		}
-	} else if newParts, err = e.compactStream(ctx, selected, start, capBytes, opts); err != nil {
+	} else if newParts, err = e.compactAligned(ctx, selected, start, capBytes, opts); err != nil {
 		return mergeResult{parts: dropped}, err
 	}
 
@@ -434,20 +434,73 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 	return cols, nil
 }
 
-// compactStream merges several source parts, streaming both sides so neither the whole merged
-// dataset nor a whole output part is ever materialized: each source is read through a forward
-// [partStream] decoding one series range at a time, and each merged series is handed straight to a
-// [partStreamWriter]. The merge therefore holds O(parts × (columns × read window + one series
-// range)) + the output writer's state. capBytes ≤ 0 writes a single output part.
+// compactAligned merges the source parts from start on (retention) into output parts that each fit
+// one top-level bucket.
+//
+// Sources spanning more than one top-level bucket — a straddler — are merged one bucket-wide window
+// at a time. Each pass reports the earliest sample past its window, which is where the next one
+// starts: a bucket with no samples costs no pass, and the passes cover [start, ∞) end to end.
+func (e *Engine) compactAligned(
+	ctx context.Context, src []*part, start, capBytes int64, opts MergeOptions,
+) ([]*part, error) {
+	if !splitsOutput(src, start) {
+		out, _, err := e.compactStream(ctx, src, start, maxInt64, capBytes, opts)
+
+		return out, err
+	}
+
+	lo, _ := spanOf(src)
+	end := bucketEnd(max(lo, start), topLevel())
+
+	var out []*part
+
+	for {
+		parts, past, err := e.compactStream(ctx, src, start, end, capBytes, opts)
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, parts...)
+
+		if !past.ok {
+			return out, nil
+		}
+
+		start, end = past.ts, bucketEnd(past.ts, topLevel())
+	}
+}
+
+// pastEnd is the earliest sample time a windowed merge pass read past its window's end.
+type pastEnd struct {
+	ts int64
+	ok bool
+}
+
+func (p *pastEnd) note(ts int64) {
+	if !p.ok || ts < p.ts {
+		p.ts, p.ok = ts, true
+	}
+}
+
+// compactStream merges the source parts' samples in [start, end], streaming both sides so neither
+// the whole merged dataset nor a whole output part is ever materialized: each source is read
+// through a forward [partStream] decoding one series range at a time, and each merged series is
+// handed straight to a [partStreamWriter]. The merge therefore holds O(parts × (columns × read
+// window + one series range)) + the output writer's state. capBytes ≤ 0 writes a single output
+// part.
 //
 // Series are visited in (series, ts) order; within a series the parts are visited oldest→newest so
 // a later part's value wins a duplicate timestamp, then the result is downsampled.
 func (e *Engine) compactStream(
-	ctx context.Context, src []*part, start int64, capBytes int64, opts MergeOptions,
-) ([]*part, error) {
-	var keys mergestream.Keys
+	ctx context.Context, src []*part, start, end, capBytes int64, opts MergeOptions,
+) ([]*part, pastEnd, error) {
+	var (
+		keys mergestream.Keys
+		past pastEnd
+	)
+
 	if err := mergeKeys(ctx, src, &keys); err != nil {
-		return nil, err
+		return nil, past, err
 	}
 
 	// One forward cursor per source part; one reusable per-part destination per series range.
@@ -455,7 +508,7 @@ func (e *Engine) compactStream(
 	for i, p := range src {
 		s, err := newPartStream(ctx, p, e.mergeReadWindow)
 		if err != nil {
-			return nil, err
+			return nil, past, err
 		}
 
 		streams[i] = s
@@ -498,9 +551,9 @@ func (e *Engine) compactStream(
 	for keys.Next() {
 		id := keys.Key()
 
-		m, err := mergeStreamedSeries(ctx, src, streams, scratch, id, start)
+		m, err := mergeStreamedSeries(ctx, src, streams, scratch, id, start, end, &past)
 		if err != nil {
-			return nil, err
+			return nil, past, err
 		}
 
 		ts, values, sf := m.collect(nil, nil)
@@ -514,12 +567,12 @@ func (e *Engine) compactStream(
 			if cur, err = newPartStreamWriter(
 				ctx, e, comp, precision, withSF, e.cfg.AggregateStats,
 			); err != nil {
-				return nil, err
+				return nil, past, err
 			}
 		}
 
 		if err := cur.appendSeries(idToU128(id), ts, values, sf); err != nil {
-			return nil, err
+			return nil, past, err
 		}
 
 		// Sealing on what has actually been written, rather than on rows times an assumed
@@ -532,16 +585,16 @@ func (e *Engine) compactStream(
 		// reaches the memory budget long before the disk cap.
 		if budget.Reached(cur.encodedBytes(), cur.residentBytes()) {
 			if err := emit(); err != nil {
-				return nil, err
+				return nil, past, err
 			}
 		}
 	}
 
 	if err := emit(); err != nil {
-		return nil, err
+		return nil, past, err
 	}
 
-	return newParts, nil
+	return newParts, past, nil
 }
 
 // mergeEncoding fixes what a streamed merge's output parts are encoded under. The decisions must be
@@ -597,11 +650,12 @@ func rowCapFor(p *part, capBytes int64) int {
 	return max(int(capBytes*int64(rows)/size), 1)
 }
 
-// mergeStreamedSeries gathers one series' samples across the source parts (oldest → newest, so a
-// later part's value wins on a duplicate timestamp), each read through its forward stream cursor.
+// mergeStreamedSeries gathers one series' samples in [start, end] across the source parts (oldest →
+// newest, so a later part's value wins on a duplicate timestamp), each read through its forward
+// stream cursor, noting in past the earliest sample beyond end.
 func mergeStreamedSeries(
 	ctx context.Context, src []*part, streams []*partStream, scratch []rangeBuf,
-	id signal.SeriesID, start int64,
+	id signal.SeriesID, start, end int64, past *pastEnd,
 ) (sampleMerge, error) {
 	var m sampleMerge
 
@@ -620,7 +674,11 @@ func mergeStreamedSeries(
 			return m, err
 		}
 
-		m.add(ts, vals, sf, start, maxInt64)
+		m.add(ts, vals, sf, start, end)
+
+		if hi := upperBound(ts, end); hi < len(ts) {
+			past.note(ts[hi])
+		}
 	}
 
 	return m, nil

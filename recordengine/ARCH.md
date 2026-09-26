@@ -42,6 +42,22 @@ here, there being no scoring heuristic to waive.
 It matters more here than for metrics: record queries are overwhelmingly narrow and recent, and a
 record row carries far more bytes than a sample, so opening an unneeded part costs more.
 
+**Straddlers are split on day boundaries**, as in the metric engine (`../engine/ARCH.md`, "A straddler
+is split, never grouped"): `selectStraddlers` batches parts that fit no level oldest-first up to the
+cap, after forced rewrites and the ladder, and `compactParts` writes any merge spanning more than one
+day one day-wide window at a time. Records are where this bites: an exemplar producer re-exporting
+stale exemplars with their original timestamps makes every flush a straddler, and the ladder alone
+merged none of 12,735 such parts. The fix heals them but does not stop them being written; dropping
+re-exported exemplars at ingest is its own change. Record specifics:
+
+- A forward `partCursor` decodes only the timestamp column for a stream with no row in the window, so
+  a pass costs a decode of its own rows plus the timestamps.
+- A side-store engine (profiles) writes the unioned symbol sidecar under each window's part, since
+  each window's part is the one home a reader looks in.
+- A split merge takes about cap / part size straddlers. Measured on the stand's shape (655 stale
+  records plus one fresh per part, ≈44 KiB decoded, 64 MiB cap): 4,000 straddlers converged to 6
+  parts in 6 cycles — 3 split merges of ≈1,500, 3 ladder merges — in 4 s in memory.
+
 ### Every size is measured
 
 | what | measured as |
@@ -96,7 +112,9 @@ otherwise indistinguishable from an idle engine. `MergeShape.Bytes` sums the par
 different tiers of one bucket are a *permanent* fixed point, and `MergeOptions.Force` is the only way
 out. It takes a bucket's unsealed parts smallest-first whatever their tiers, still truncated at the
 cumulative-bytes cap and still confined to one bucket — the tier rule is waived, the memory bound is
-not.
+not. `Candidates` and `ForceCandidates` run the real selector with and without `Force`, so the two
+zero states separate: `ForceCandidates > 0` is a tier spread only `Force` breaks, both zero is every
+unsealed part alone in its bucket, which nothing reduces without widening a part.
 
 ## Schema
 

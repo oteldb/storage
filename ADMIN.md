@@ -83,7 +83,8 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 | `MergeDeferred` | the last merge had parts to compact and no merge-memory budget to do it with, so it compacted nothing; see "Merge memory admission" |
 | `SealedParts` | parts already at the merge cap. A merge never reconsiders them, so this is the share of `Parts` no compaction will reduce |
 | `MergeBacklog` | parts a merge may still take (`Parts − SealedParts`) — the backlog in the literal sense, not the part count |
-| `MergeCandidates` | parts the **next** merge would select. `0` with a non-zero `MergeBacklog` is the stuck state a maintenance cycle cannot fix by itself; `Admin.CompactNow` is the override |
+| `MergeCandidates` | parts the **next** merge would select, straddlers awaiting a split included. `0` with a non-zero `MergeBacklog` is either of the two states below |
+| `MergeForceCandidates` | parts `Admin.CompactNow` would select. Above `0` while `MergeCandidates` is `0`: a tier spread only a forced merge breaks. `0`: `CompactNow` is a no-op |
 | `MergeCapBytes` | the seal threshold in effect. Derived per merge for metrics (from free space and the merge memory allowance), so it reads `0` until that engine's first merge; a static function of configuration for the record signals |
 | `WAL` | the engine has a write-ahead log (false for the ephemeral in-memory engine) |
 | `WALSegments` / `WALBytes` | WAL segment files on disk (closed ones not yet checkpointed, plus the open one) and the bytes they hold. Growing without bound means flushes are not retiring segments |
@@ -107,9 +108,16 @@ like an idle one. The three numbers beside it answer it directly:
 - `MergeBacklog > 0`, `MergeCandidates > 0` — a merge is due. It arrives on the next cycle unless
   `merge.deferred` is climbing, which says the work is selected and waiting on the memory budget
   rather than on the selector.
-- `MergeBacklog > 0`, `MergeCandidates == 0` — **stuck**: parts remain mergeable but none qualify.
-  The metric engine waives its write-amplification guard after a few idle cycles and unwedges
-  itself; the record engines do not. `Admin.CompactNow` breaks it either way.
+- `MergeBacklog > 0`, `MergeCandidates == 0`, `MergeForceCandidates > 0` — **stuck**: parts share a
+  time bucket but no size tier or run of them qualifies. The metric engine waives its
+  write-amplification guard after a few idle cycles and unwedges itself; the record engines do not.
+  `Admin.CompactNow` breaks it either way.
+- `MergeBacklog > 0`, `MergeCandidates == 0`, `MergeForceCandidates == 0` — **resting**: every
+  unsealed part is alone in its time bucket at each ladder level, or waits in the still-filling
+  newest bucket. No merge reduces this without building a part wider than a bucket, so neither a
+  cycle nor `CompactNow` changes it. A part crossing a day boundary — a straddler, which one late
+  sample or record in a flush makes — is never in this state: it is a candidate until a merge splits
+  it on day boundaries.
 
 Each engine's own `MergeShape()` (`engine`, `recordengine`) carries the rest of the selector's
 inputs behind these fields — the metric engine's `BestMultiplier`/`MinMultiplier`/`IdleRounds`/
@@ -246,7 +254,7 @@ Metric instruments (all prefixed `storage.`):
 | `cluster.primary_refusals` | `signal` | writes this node refused as a shard primary because it could not prove its claim (`cluster.ErrNotPrimary`). Counted on the refusing node — the only one that knows why — on every refusal, so a fence shorter than a maintenance cycle still shows here |
 | `wal.segments` / `wal.bytes` | `signal` | gauges: the durability backlog on disk, published with the head gauges below. Segments accumulate exactly while flushes are not retiring them, so a rising count is `head.age` seen from the disk. Zero (not absent) for an engine with no WAL — the ephemeral in-memory one |
 | `head.bytes` / `head.items` / `head.series` / `head.identity_bytes` / `head.age` | `signal` | gauges: the unflushed side, which no `parts.*` gauge reaches. Published **before** the cycle's flushes, so they report the cycle's high-water mark rather than the empty head a healthy flush leaves behind. `age` is seconds since the head took its first bytes after the last flush (0 means an empty head, and only that — a live head is floored above 0, since a coarse clock would otherwise report a freshly filled one as empty) — the flush lag, and the oldest of this node's tenants rather than an average that a freshly drained one would hide. `series` / `identity_bytes` span the all-time identity set, which a flush does not drain (see `IdentityBytes` above) |
-| `parts.total` / `parts.sealed` / `parts.merge_backlog` / `parts.merge_candidates` / `parts.bytes` / `merge.cap_bytes` | `signal` | gauges: the merge selector's view of the parts, published once per maintenance cycle, summed over this node's tenants (`cap_bytes` is the largest threshold in effect, not a sum — it is a threshold, not a quantity). `merge_backlog` flat with `merge_candidates` pinned at 0 is the stuck engine above. `parts.bytes` over `parts.total` is the average part size, which says whether a rising count is parts that grew or a merge that stopped. Per-tenant detail is `Inspect`, which needs no meter |
+| `parts.total` / `parts.sealed` / `parts.merge_backlog` / `parts.merge_candidates` / `parts.bytes` / `merge.cap_bytes` | `signal` | gauges: the merge selector's view of the parts, published once per maintenance cycle, summed over this node's tenants (`cap_bytes` is the largest threshold in effect, not a sum — it is a threshold, not a quantity). `merge_backlog` flat with `merge_candidates` pinned at 0 is one of the two states above, which `Inspect`'s `MergeForceCandidates` tells apart. `parts.bytes` over `parts.total` is the average part size, which says whether a rising count is parts that grew or a merge that stopped. Per-tenant detail is `Inspect`, which needs no meter |
 
 Tracing emits coarse spans (`engine.flush`, `engine.merge`, `engine.fetch`, backend ops, cluster
 RPCs) with W3C trace-context propagation across the cluster transport. Logs are context-plumbed via
@@ -339,7 +347,7 @@ Imperative operator control, complementing the background maintenance loop (it h
   (retention cutoff, plus downsampling/recompression/precision for metrics). The same merge engine
   the loop runs — no parallel path.
 - `CompactNow(ctx, key, signal)` — compact even when the selector would decline: the escape from the
-  fixed point above (`MergeBacklog > 0`, `MergeCandidates == 0`), which `Compact`/`MaintainNow`
+  stuck state above (`MergeCandidates == 0`, `MergeForceCandidates > 0`), which `Compact`/`MaintainNow`
   cannot break because a cycle that selects nothing is a no-op. It overrides the **selection
   heuristic only** — the seal threshold, the run's cumulative-bytes cap and the merge memory bound
   still apply, so a forced merge reads, writes and holds no more than a background one, and never

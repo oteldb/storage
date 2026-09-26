@@ -344,15 +344,61 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 	return writeSidecars(ctx, e.cfg.Backend, newPrefix, stored)
 }
 
-// compactParts compacts the selected source parts into bounded output part(s): it reads every stream's
-// in-window records from each part (retention applied via start), concatenates them across parts,
-// re-sorts each stream by ts, and writes a new part whenever the accumulated *decoded* bytes reach
-// capBytes — so each output part stays within the cap, never O(dataset). A source is read forward a
-// granule at a time per column ([partCursor]) unless its layout rules that out, when it is decoded
-// whole. When the engine has a side store (profiles) the output is a single part (no split) so the
-// unioned symbol sidecar has one home. Returns the new parts (empty when retention dropped every
-// record). Reads the parts off the engine lock; src is the immutable snapshot the caller planned over.
+// compactParts compacts the selected source parts into bounded output part(s), dropping records
+// older than start (retention). Returns the new parts (empty when retention dropped every record).
+// Reads the parts off the engine lock; src is the immutable snapshot the caller planned over.
+//
+// Sources spanning more than one top-level bucket — a straddler — are compacted one bucket-wide
+// window at a time, so no output part crosses a top-level boundary and every output fits a ladder
+// level. Each pass reports the earliest record past its window, which is where the next one starts:
+// a bucket with no records costs no pass, and the passes cover [start, ∞) end to end.
 func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes int64) ([]*part, error) {
+	if !splitsOutput(src, start) {
+		out, _, err := e.compactWindow(ctx, src, start, maxInt64, capBytes)
+
+		return out, err
+	}
+
+	lo, _ := spanOf(src)
+	end := bucketEnd(max(lo, start), topLevel())
+
+	var out []*part
+
+	for {
+		parts, past, err := e.compactWindow(ctx, src, start, end, capBytes)
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, parts...)
+
+		if !past.ok {
+			return out, nil
+		}
+
+		start, end = past.ts, bucketEnd(past.ts, topLevel())
+	}
+}
+
+// pastEnd is the earliest record time a windowed merge pass read past its window's end.
+type pastEnd struct {
+	ts int64
+	ok bool
+}
+
+func (p *pastEnd) note(ts int64) {
+	if !p.ok || ts < p.ts {
+		p.ts, p.ok = ts, true
+	}
+}
+
+// compactWindow compacts the sources' records in [start, end]: it concatenates each stream's
+// records across parts, re-sorts them by ts, and writes a new part whenever the accumulated
+// *decoded* bytes reach capBytes — so each output part stays within the cap, never O(dataset). A
+// source is read forward a granule at a time per column ([partCursor]) unless its layout rules that
+// out, when it is decoded whole. When the engine has a side store (profiles) a window is written as
+// a single part (no cap split) so the unioned symbol sidecar has one home per window.
+func (e *Engine) compactWindow(ctx context.Context, src []*part, start, end, capBytes int64) ([]*part, pastEnd, error) {
 	budget := e.mergeBudget(capBytes)
 
 	// One output buffer, re-armed after each part instead of allocated fresh, and one accumulator,
@@ -370,7 +416,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 
 	sources, err := e.openMergeSources(ctx, src, carry)
 	if err != nil {
-		return nil, err
+		return nil, pastEnd{}, err
 	}
 
 	// Pre-sized from the sources: a byte column starting from nothing doubles its way to the seal
@@ -414,8 +460,8 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 		// Oldest → newest part order; records are append-only (no dedup), so the stream is just
 		// concatenated across parts and re-sorted by ts below.
 		for _, s := range sources {
-			if err := s.appendStream(acc, id, start, maxInt64); err != nil {
-				return nil, err
+			if err := s.appendStream(acc, id, start, end); err != nil {
+				return nil, pastEnd{}, err
 			}
 		}
 
@@ -441,20 +487,28 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 		// spanning parts), keeping the buffer at ≈ one part regardless of a heavy stream.
 		if budget.Reached(0, buf.byteSize()) {
 			if err := emit(); err != nil {
-				return nil, err
+				return nil, pastEnd{}, err
 			}
 		}
 	}
 
 	if err := checkDrained(src, sources); err != nil {
-		return nil, err
+		return nil, pastEnd{}, err
 	}
 
 	if err := emit(); err != nil {
-		return nil, err
+		return nil, pastEnd{}, err
 	}
 
-	return newParts, nil
+	var past pastEnd
+
+	for _, s := range sources {
+		if p := s.readPast(); p.ok {
+			past.note(p.ts)
+		}
+	}
+
+	return newParts, past, nil
 }
 
 // writeMergedPart writes f as an output part, reads it back, stamps its time bounds, and — when the

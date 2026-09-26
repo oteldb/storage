@@ -22,6 +22,8 @@ const defaultMergeReadWindow = 1 << 20
 type mergeSource interface {
 	// appendStream appends the part's rows of stream id whose timestamps lie in [start, end] to acc.
 	appendStream(acc *recordCols, id signal.SeriesID, start, end int64) error
+	// readPast is the earliest timestamp past end among the rows appendStream read.
+	readPast() pastEnd
 }
 
 // mergeReadObserver, when non-nil, receives per source of each merge whether it was read through a
@@ -209,6 +211,7 @@ func mergeShape(schema *Schema, src []*part, capBytes int64) (rows int, blob []i
 type wholeSource struct {
 	ranges []streamRange
 	d      *decodedPart
+	past   pastEnd
 }
 
 func openWholeSource(ctx context.Context, p *part) (*wholeSource, error) {
@@ -256,9 +259,32 @@ func (s *wholeSource) appendStream(acc *recordCols, id signal.SeriesID, start, e
 
 	for ; i < len(s.ranges) && s.ranges[i].id == id; i++ {
 		appendMergeWindow(acc, s.d, s.ranges[i].rowRange, start, end)
+		s.notePast(s.ranges[i].rowRange, end)
 	}
 
 	return nil
+}
+
+func (s *wholeSource) readPast() pastEnd { return s.past }
+
+func (s *wholeSource) notePast(rng rowRange, end int64) {
+	if end == maxInt64 {
+		return
+	}
+
+	if s.d.tsSorted {
+		if w := tsWindow(s.d.ts, rng, end, end); w.end < rng.end {
+			s.past.note(s.d.ts[w.end])
+		}
+
+		return
+	}
+
+	for _, t := range s.d.ts[rng.start:rng.end] {
+		if t > end {
+			s.past.note(t)
+		}
+	}
 }
 
 // partCursor reads one source part forward: every column decodes one granule at a time, reached
@@ -279,6 +305,7 @@ type partCursor struct {
 
 	tsBuf []int64
 	keep  []bool
+	past  pastEnd
 }
 
 func openPartCursor(
@@ -349,6 +376,8 @@ func (c *partCursor) appendStream(acc *recordCols, id signal.SeriesID, start, en
 	return nil
 }
 
+func (c *partCursor) readPast() pastEnd { return c.past }
+
 // window selects the decoded stream's rows with a timestamp in [start, end]: keep is nil when every
 // row is selected, and kept counts the selection. The rows are filtered one by one rather than
 // binary-searched, so a stream out of ts order loses nothing; it is reported.
@@ -358,6 +387,8 @@ func (c *partCursor) window(start, end int64) (keep []bool, kept int) {
 	for i, t := range ts {
 		if t >= start && t <= end {
 			kept++
+		} else if t > end {
+			c.past.note(t)
 		}
 
 		if i > 0 && t < ts[i-1] {

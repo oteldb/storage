@@ -602,9 +602,37 @@ rest of that bucket rides along if it fits the cap, and the size-tiered run wait
 would merge parts from opposite ends of the store into one spanning both. Merging inside a bucket
 cannot widen.
 
-**A straddler belongs to no bucket** and cannot join one without widening the output, so it is left out
-of ladder groups, and a store can hold wide parts the ladder never narrows. A forced straddler is
-rewritten *alone* rather than skipped: retention correctness does not depend on splitting it.
+**A straddler is split, never grouped.** Flush does not cut by time, so one late sample makes a part
+that crosses a day boundary — a straddler, which fits no ladder level and joins no group. Such parts
+cannot merge through the ladder at any count or size: a live stand held 12,735 exemplar parts spanning
+290–334h each (a producer re-exporting week-old exemplars every minute) and merged none of them in days.
+The selector therefore takes straddlers as a third kind of work, after forced rewrites and the ladder
+(`selectStraddlers`): oldest first, batched up to the cap and `maxMergeParts`. Every merge whose inputs
+span more than one day bucket — a straddler batch, or a forced rewrite of one — writes its output one
+day-wide window at a time (`compactAligned`), so **every merge output fits a level**, which is the
+invariant `TestSelectMergePartsOutputFitsALadderLevel` pins. A straddler's samples land in the buckets
+they belong to and the ladder folds them into their neighbours; no part a merge writes is a straddler,
+so each straddler is rewritten once.
+
+| alternative | cost |
+|---|---|
+| overflow group merging straddlers with each other | its output still spans every input's range, so every query window opens it and the ladder never reaches it — the defect with fewer parts |
+| split at flush | prevents new straddlers but heals no existing one, and still needs a split merge for a retention rewrite |
+| cut at the finest level (1h) | up to 24× the output parts per day the ladder then has to fold back up |
+
+Batching is what converges a backlog: straddlers sharing their stale end write that end into one
+bucket, so one merge of N straddlers leaves roughly one part for the stale day plus one per fresh day
+it covers, not 2N. Straddlers go after the ladder because a split leaves fragments the ladder must
+absorb; a straddler that waits a cycle only joins the next batch. A window pass costs a decode of the
+rows inside it plus the timestamps outside: each pass reports the earliest sample past its end and
+the next starts there, so an empty day costs nothing.
+
+The fragments of one split live in different day buckets and never merge together again, so their
+joint `bucketindex.Claim` is never folded back into an interval: a removed straddler is accounted for
+by `Index.Covered` over its fragments' successors, not by any single `Supersedes`, subject to the
+one-claim-per-output limit every split has. A downsample interval that does not divide a day can put
+a rollup timestamp before its window's start; the part it lands in straddles and is split again the
+next cycle, where the rollup sits in its own day.
 
 ### Run selection (`compact.go`)
 
@@ -642,7 +670,10 @@ merge is otherwise indistinguishable from an idle engine, and a store can sit at
 never reduce for thousands of cycles with nothing saying so. The cap comes from the last merge rather
 than being derived on demand: deriving it reads free space, and introspection does no I/O.
 `MergeShape.Bytes` sums the parts' manifest sizes (no backend stat calls), so the same snapshot says
-whether a rising part count is parts that grew or a merge that stopped taking them.
+whether a rising part count is parts that grew or a merge that stopped taking them. `Candidates` and
+`ForceCandidates` run the real selector (ladder and straddlers, at the current and at the waived idle
+count), so a zero means the merge would select nothing rather than that no run exists somewhere in
+the store regardless of buckets.
 
 ### Streaming both ways (`compactStream`)
 

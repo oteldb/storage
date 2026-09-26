@@ -13,9 +13,13 @@ type MergeShape struct {
 	// Bytes is what the flushed parts occupy on disk. Divided by Parts it is the average part size,
 	// which is what says whether a rising part count is a merge that stopped or an ingest that grew.
 	Bytes int64
-	// Candidates is how many parts the next size-driven merge would select right now. 0 with a
-	// non-zero Backlog is the stuck state: parts remain mergeable but no run of them qualifies.
-	Candidates int
+	// Candidates is how many parts the next merge would select right now, and ForceCandidates how
+	// many a [MergeOptions.Force] merge would. Candidates 0 with ForceCandidates above it is a run
+	// the score guard declines until the idle waiver; both 0 with a non-zero Backlog is every
+	// unsealed part alone in its time bucket, the ladder's resting state, which no merge reduces
+	// without widening a part.
+	Candidates      int
+	ForceCandidates int
 	// CapBytes is the seal threshold in effect, in bytes on disk. It is derived per merge from free
 	// space and the merge memory allowance, so it is reported as of the last merge — 0 before the
 	// first one, and 0 when sealing is disabled.
@@ -47,16 +51,17 @@ func (e *Engine) MergeShape() MergeShape {
 	}
 
 	return MergeShape{
-		Parts:          len(src),
-		Bytes:          bytes,
-		Sealed:         sealedN,
-		Backlog:        backlog,
-		Candidates:     len(pickMergeRun(src, capBytes, idle)),
-		CapBytes:       capBytes,
-		BestMultiplier: bestM,
-		MinMultiplier:  minMergeMultiplier,
-		IdleRounds:     idle,
-		WaiveAfter:     mergeIdleRounds,
+		Parts:           len(src),
+		Bytes:           bytes,
+		Sealed:          sealedN,
+		Backlog:         backlog,
+		Candidates:      len(selectMergeParts(src, MergeOptions{}, capBytes, idle)),
+		ForceCandidates: len(selectMergeParts(src, MergeOptions{}, capBytes, mergeIdleRounds)),
+		CapBytes:        capBytes,
+		BestMultiplier:  bestM,
+		MinMultiplier:   minMergeMultiplier,
+		IdleRounds:      idle,
+		WaiveAfter:      mergeIdleRounds,
 	}
 }
 
