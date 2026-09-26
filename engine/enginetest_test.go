@@ -98,10 +98,12 @@ func (e metricEngine) Stats() enginetest.Stats {
 	}
 }
 
-func (e metricEngine) MergeShape() enginetest.MergeShape {
-	sh := e.Engine.MergeShape()
+func (e metricEngine) MergeShape(retainFrom int64) enginetest.MergeShape {
+	sh := e.MergeShapeWith(engine.MergeOptions{RetainFrom: retainFrom})
 
-	return enginetest.MergeShape{Parts: sh.Parts, Bytes: sh.Bytes}
+	return enginetest.MergeShape{
+		Parts: sh.Parts, Bytes: sh.Bytes, Candidates: sh.Candidates, ForceCandidates: sh.ForceCandidates,
+	}
 }
 
 var metricKind = enginetest.Kind{

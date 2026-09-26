@@ -71,17 +71,20 @@ func retentionForces(p *part, retainFrom int64) bool {
 	return retainFrom > 0 && p.minTime < retainFrom
 }
 
-// selectMergeParts chooses the source parts to compact this cycle. Both paths — the retention-forced
-// rewrite and the size-tiered group — are confined to one aligned time bucket, so a merge can never
-// emit a part wider than a ladder level and time locality survives compaction (see timebucket.go).
-// It returns nil when nothing is worth doing — fewer than minTierParts in every tier of every bucket
-// and no retention-forced part — so the merge is a no-op without decoding anything. capBytes is the
-// seal threshold in decoded bytes (0 ⇒ unlimited, so no part is ever sealed and a bucket is one
-// tier).
+// selectMergeParts chooses the source parts to compact this cycle, in priority order: the
+// retention-forced rewrite, the size-tiered group, then straddlers to split. The first two are
+// confined to one aligned time bucket and a straddler's merge is split on top-level boundaries, so
+// no merge emits a part wider than a ladder level and time locality survives compaction (see
+// timebucket.go). It returns nil when nothing is worth doing — fewer than minTierParts in every
+// tier of every bucket, no straddler, and no retention-forced part — so the merge is a no-op
+// without decoding anything. capBytes is the seal threshold in decoded bytes (0 ⇒ unlimited, so no
+// part is ever sealed and a bucket is one tier).
 //
 // Forced work wins the cycle outright rather than being unioned with a tier group, because the two
-// are now in general in different buckets and merging across them is the widening this prevents. The
-// tier group is picked up on the next cycle.
+// are in general in different buckets. Straddlers go last: splitting one leaves a fragment in each
+// bucket it touched, which the ladder then folds in, and a straddler waiting a cycle only batches
+// with the next.
+//
 // force takes a bucket's unsealed parts whatever their tiers, so an operator can compact a part set
 // the tier rule declines to touch; the seal threshold and the cumulative-bytes cap still bound the
 // merge, and the ladder still confines it to one time bucket.
@@ -90,7 +93,11 @@ func selectMergeParts(src []*part, retainFrom, capBytes int64, force bool) []*pa
 		return forced
 	}
 
-	return selectLadderGroup(src, capBytes, force)
+	if group := selectLadderGroup(src, capBytes, force); len(group) > 0 {
+		return group
+	}
+
+	return selectStraddlers(src, capBytes)
 }
 
 // pickTierGroup returns the group of unsealed parts to compact for size reduction: the tier holding the

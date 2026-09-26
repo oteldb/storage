@@ -3,7 +3,8 @@ package recordengine
 import (
 	"cmp"
 	"slices"
-	"time"
+
+	"github.com/oteldb/storage/internal/timebucket"
 )
 
 // Time-bucketed merge selection for the record engine, mirroring engine/timebucket.go. Size-tiered
@@ -14,43 +15,31 @@ import (
 // and recent ("the last 15 minutes of one service"), and a record row carries far more bytes than a
 // sample, so opening a part the window did not need costs more.
 //
-// mergeLadder is the bucket ladder, ascending; each level must divide the next so buckets nest
-// exactly (TestMergeLadderDivides). The top level is the widest part the engine will build, and so
-// the coarsest time locality a query can rely on.
-var mergeLadder = []int64{
-	int64(time.Hour),
-	int64(6 * time.Hour),
-	int64(24 * time.Hour),
-}
+// The ladder and its bucket arithmetic are [timebucket]'s, shared with the metric engine.
+var mergeLadder = timebucket.Ladder
 
-// bucketOf returns the start of the level-aligned bucket holding ts, rounding toward negative
-// infinity so buckets stay contiguous across the epoch (Go's % keeps the dividend's sign, which
-// would make the bucket at ts = -1 start at 0 and overlap its successor).
-func bucketOf(ts, level int64) int64 {
-	m := ts % level
-	if m < 0 {
-		m += level
-	}
+func bucketOf(ts, level int64) int64 { return timebucket.Of(ts, level) }
 
-	return ts - m
-}
+func partSpan(p *part) (lo, hi int64) { return p.minTime, p.maxTime }
 
-// fitsLevel reports whether p lies entirely within one level-aligned bucket.
-func fitsLevel(p *part, level int64) bool {
-	return bucketOf(p.minTime, level) == bucketOf(p.maxTime, level)
-}
+func fitsLevel(p *part, level int64) bool { return timebucket.Fits(p.minTime, p.maxTime, level) }
 
 // finestLevel returns the narrowest ladder level whose bucket contains p whole, reporting false for
-// a part that straddles a boundary at every level — one wider than the top level, or one written
-// before bucketing existed. Such a part cannot join a group without widening its group's output.
-func finestLevel(p *part) (int64, bool) {
-	for _, level := range mergeLadder {
-		if fitsLevel(p, level) {
-			return level, true
-		}
+// a straddler: a part crossing a top-level boundary. Flush does not split by time, so one late
+// record makes one. A straddler joins no ladder group; [selectStraddlers] picks it instead.
+func finestLevel(p *part) (int64, bool) { return timebucket.Finest(p.minTime, p.maxTime) }
+
+func spanOf(parts []*part) (lo, hi int64) { return timebucket.Union(parts, partSpan) }
+
+// selectStraddlers returns the straddlers to split this cycle, at most maxTierParts of them when part
+// size is unlimited.
+func selectStraddlers(src []*part, capBytes int64) []*part {
+	maxParts := 0
+	if capBytes <= 0 {
+		maxParts = maxTierParts
 	}
 
-	return 0, false
+	return timebucket.Straddlers(src, partSpan, (*part).sizeBytes, capBytes, maxParts)
 }
 
 // newestBucket returns the start of the level-aligned bucket holding the newest record in src —
@@ -137,9 +126,8 @@ func selectLadderGroup(src []*part, capBytes int64, force bool) []*part {
 //
 // The oldest forced part picks the bucket, so age-driven work still progresses oldest-first, one
 // bucket per cycle. The rest of that bucket rides along when it fits the cap, since merging inside a
-// bucket cannot widen the output and leaving a co-located part behind would only fragment. A part
-// straddling every level is rewritten alone rather than skipped: retention correctness does not wait
-// on straddle splitting.
+// bucket cannot widen the output and leaving a co-located part behind would only fragment. A
+// straddler is rewritten alone, and the merge splits it on bucket boundaries.
 func selectForced(src []*part, retainFrom, capBytes int64) []*part {
 	var oldest *part
 

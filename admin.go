@@ -72,6 +72,7 @@ func (a Admin) Compact(ctx context.Context, key signal.TenantID, sig signal.Sign
 // the escape from the fixed point where parts remain mergeable ([SignalStats.MergeBacklog] > 0) but
 // none of them qualify ([SignalStats.MergeCandidates] == 0), which a plain [Admin.Compact] or
 // [Admin.MaintainNow] cannot break because a cycle that selects nothing is a no-op.
+// [SignalStats.MergeForceCandidates] is what it would take; at zero it has nothing to do.
 //
 // It is the same merge, with the *selection heuristic* overridden and nothing else: the seal
 // threshold, the cumulative-bytes cap and the merge memory bound still apply, so a forced compaction

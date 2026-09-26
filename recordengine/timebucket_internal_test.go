@@ -19,87 +19,6 @@ func partAt(size, minTime, maxTime int64) *part {
 	return &part{rawBytes: size, minTime: minTime, maxTime: maxTime}
 }
 
-// spanOf returns the span a merge of parts would produce: the union of their bounds, which becomes
-// the output part's own.
-func spanOf(parts []*part) (lo, hi int64) {
-	lo, hi = maxInt64, minInt64
-	for _, p := range parts {
-		lo, hi = min(lo, p.minTime), max(hi, p.maxTime)
-	}
-
-	return lo, hi
-}
-
-// TestMergeLadderDivides is the invariant the ladder rests on: each level divides the next, so a
-// bucket nests exactly inside its parent and a part that fits level L still fits level L+1. Without
-// it a part could fit a narrow bucket yet straddle the wide one containing it, and promotion would
-// silently widen a part past the level it was promoted to.
-func TestMergeLadderDivides(t *testing.T) {
-	t.Parallel()
-
-	require.NotEmpty(t, mergeLadder)
-
-	for i, level := range mergeLadder {
-		require.Positive(t, level, "level %d must be positive", i)
-
-		if i == 0 {
-			continue
-		}
-
-		prev := mergeLadder[i-1]
-		require.Greater(t, level, prev, "levels must ascend")
-		require.Zero(t, level%prev, "level %d (%s) must divide by %s", i, time.Duration(level), time.Duration(prev))
-	}
-}
-
-// TestBucketOfFloorsTowardNegativeInfinity pins the rounding: Go's % keeps the dividend's sign, so
-// the naive ts-ts%level puts ts=-1 in the bucket starting at 0 — the same bucket as ts=+1 — and two
-// parts an hour apart would be judged co-located.
-func TestBucketOfFloorsTowardNegativeInfinity(t *testing.T) {
-	t.Parallel()
-
-	for _, tt := range []struct {
-		ts, want int64
-	}{
-		{0, 0},
-		{hour - 1, 0},
-		{hour, hour},
-		{-1, -hour},
-		{-hour, -hour},
-		{-hour - 1, -2 * hour},
-	} {
-		assert.Equal(t, tt.want, bucketOf(tt.ts, hour), "bucketOf(%d)", tt.ts)
-	}
-}
-
-func TestFinestLevel(t *testing.T) {
-	t.Parallel()
-
-	for _, tt := range []struct {
-		name       string
-		minT, maxT int64
-		want       int64
-		ok         bool
-	}{
-		{"within an hour", 0, hour - 1, hour, true},
-		{"straddles an hour, within six", hour - 1, hour + 1, 6 * hour, true},
-		{"straddles six hours, within a day", 6*hour - 1, 6*hour + 1, day, true},
-		{"straddles a day", day - 1, day + 1, 0, false},
-		{"wider than the top level", 0, 3 * day, 0, false},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			level, ok := finestLevel(partAt(1, tt.minT, tt.maxT))
-			assert.Equal(t, tt.ok, ok)
-
-			if tt.ok {
-				assert.Equal(t, time.Duration(tt.want), time.Duration(level))
-			}
-		})
-	}
-}
-
 // TestSelectMergePartsNeverWidensPastTopLevel is the property the change exists for: whatever the
 // selector returns, merging it must not produce a part wider than the widest ladder level. The
 // inputs are the shape the old size-only selector collapsed into one store-wide part — parts spread
@@ -137,7 +56,8 @@ func TestSelectMergePartsRefusesDistantParts(t *testing.T) {
 		partAt(1<<20, 47*hour, 48*hour),
 	}
 
-	assert.Empty(t, selectMergeParts(src, 0, 64<<20, false),
+	// The newer part ends on the day boundary, so it is a straddler and may be selected alone.
+	assert.Less(t, len(selectMergeParts(src, 0, 64<<20, false)), 2,
 		"parts two days apart share no bucket at any level, so no merge may pair them")
 }
 
@@ -201,9 +121,8 @@ func TestSelectForcedConfinedToBucket(t *testing.T) {
 	assert.LessOrEqual(t, hi-lo, mergeLadder[len(mergeLadder)-1])
 }
 
-// TestSelectForcedRewritesStraddlerAlone checks retention correctness does not wait on straddle
-// splitting: a part crossing every level's boundary belongs to no bucket and must still be
-// rewritten rather than skipped forever.
+// TestSelectForcedRewritesStraddlerAlone checks a straddler retention forces is rewritten alone:
+// it belongs to no bucket, and the merge splits it on day boundaries.
 func TestSelectForcedRewritesStraddlerAlone(t *testing.T) {
 	t.Parallel()
 

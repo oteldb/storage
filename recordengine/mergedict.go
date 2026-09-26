@@ -1,6 +1,8 @@
 package recordengine
 
 import (
+	"slices"
+
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/pool"
 )
@@ -115,7 +117,8 @@ type mergeCarry struct {
 	dicts []*mergeDict
 	// lazy counts per column the sources that resolve entries into its union as they read it.
 	lazy       []int
-	acc, buf   *recordCols
+	acc        *recordCols
+	bufs       []*recordCols
 	maxEntries int
 	// flatBlob is the blob the output buffer reserves per column should it fall back, for a column
 	// that falls back before its average cell size is known.
@@ -129,7 +132,7 @@ func newMergeCarry(schema *Schema, sources int, acc, buf *recordCols) *mergeCarr
 		dicts:      make([]*mergeDict, schema.numBytes()),
 		lazy:       make([]int, schema.numBytes()),
 		acc:        acc,
-		buf:        buf,
+		bufs:       []*recordCols{buf},
 		maxEntries: max(sources, 1) * mergeUnionEntriesPerSource,
 	}
 
@@ -185,9 +188,31 @@ func (m *mergeCarry) flatten(k int) {
 	}
 
 	m.acc.unsplit(k, 0)
-	m.buf.unsplit(k, reserve)
+
+	// Only the first buffer reserves a part's worth: the rest serve the other days of a straddler
+	// batch, and reserving for each would multiply the merge's footprint by its days.
+	for i, b := range m.bufs {
+		if i > 0 {
+			reserve = 0
+		}
+
+		b.unsplit(k, reserve)
+	}
+
 	d.release()
 	m.dicts[k] = nil
+}
+
+// arm carries another output buffer on the merge's current per-column choice, so a column that later
+// falls back falls back in it too.
+func (m *mergeCarry) arm(buf *recordCols) {
+	buf.armSplit(m.dicts)
+	m.bufs = append(m.bufs, buf)
+}
+
+// drop stops carrying a written output buffer, so its arrays can be reclaimed.
+func (m *mergeCarry) drop(buf *recordCols) {
+	m.bufs = slices.DeleteFunc(m.bufs, func(b *recordCols) bool { return b == buf })
 }
 
 func (m *mergeCarry) release() {

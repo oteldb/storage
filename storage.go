@@ -113,6 +113,11 @@ type Storage struct {
 	// computed from, so an idle cycle costs no part enumeration (see sizeCutoffFor).
 	sizeRetention sizeRetentionCache
 
+	// lastCandidates is each signal's last published candidate gauges measured with a known size
+	// cutoff, kept through a cycle whose part sizes could not be read (see recordPartShape).
+	shapeMu        sync.Mutex
+	lastCandidates map[signal.Signal][2]int64
+
 	ecStats    ecCounters    // cumulative erasure-coding activity (Inspect → ClusterStats.EC)
 	maintStats maintCounters // cumulative maintenance-loop activity (Inspect → StoreStats.Maintenance)
 	walSync    walSyncCounters
@@ -1870,6 +1875,19 @@ func (s *Storage) maintain(ctx context.Context) {
 	s.warnSingleShard(ctx)
 }
 
+// metricShape is a metric engine's merge shape under the policy its next merge resolves, given the
+// tenant's size-retention cutoffs.
+func (s *Storage) metricShape(tid signal.TenantID, eng *engine.Engine, size bySignal) engine.MergeShape {
+	return eng.MergeShapeWith(s.metricMergeOptions(tid, size.at(signal.Metric)))
+}
+
+// recordShape is [Storage.metricShape] for a record engine.
+func (s *Storage) recordShape(
+	sig signal.Signal, tid signal.TenantID, eng *recordengine.Engine, size bySignal,
+) recordengine.MergeShape {
+	return eng.MergeShapeWith(recordengine.MergeOptions{RetainFrom: s.retainFrom(tid, sig, size.at(sig))})
+}
+
 // recordPartShape publishes the merge selector's view of every engine's parts as gauges, once per
 // maintenance cycle — right after the merges, so the numbers describe the set the next cycle will
 // look at. It is the durable form of the "why did nothing merge?" diagnostic: an engine whose merge
@@ -1877,41 +1895,80 @@ func (s *Storage) maintain(ctx context.Context) {
 // this cadence shows. Summed over tenants, tagged by signal (tenant ids are unbounded; per-tenant
 // detail is [Storage.Inspect]).
 func (s *Storage) recordPartShape(ctx context.Context) {
-	type shape struct{ total, sealed, backlog, candidates, capBytes, bytes int64 }
+	shapes := make(map[signal.Signal]*obs.PartShape, 4)
 
-	shapes := make(map[signal.Signal]*shape, 4)
+	// The cycle's merges changed the part set its size cutoffs were resolved for, so they are resolved
+	// again (memoized: the next cycle finds them current unless something flushes first).
+	tids := make(map[signal.TenantID]struct{})
+	for tid := range s.engineSnapshotByTenant() {
+		tids[tid] = struct{}{}
+	}
 
-	add := func(sig signal.Signal, total, sealed, backlog, candidates, capBytes, bytes int64) {
+	for _, engines := range s.recordEnginesBySignal() {
+		for tid := range engines {
+			tids[tid] = struct{}{}
+		}
+	}
+
+	size, failed := s.measureSizeCutoffs(ctx, tids)
+	stale := make(map[signal.Signal]bool)
+
+	add := func(sig signal.Signal, parts, sealed, backlog, candidates, force int, capBytes, bytes int64) {
 		sh, ok := shapes[sig]
 		if !ok {
-			sh = &shape{}
+			sh = &obs.PartShape{}
 			shapes[sig] = sh
 		}
 
-		sh.total += total
-		sh.sealed += sealed
-		sh.backlog += backlog
-		sh.candidates += candidates
-		sh.bytes += bytes
+		sh.Total += int64(parts)
+		sh.Sealed += int64(sealed)
+		sh.Backlog += int64(backlog)
+		sh.Candidates += int64(candidates)
+		sh.ForceCandidates += int64(force)
+		sh.Bytes += bytes
 		// The cap is a per-engine threshold, not a quantity: the largest in effect is the one that
 		// explains the sealed counts, and summing it would be meaningless.
-		sh.capBytes = max(sh.capBytes, capBytes)
+		sh.CapBytes = max(sh.CapBytes, capBytes)
 	}
 
-	for _, eng := range s.engineSnapshotByTenant() {
-		m := eng.MergeShape()
-		add(signal.Metric, int64(m.Parts), int64(m.Sealed), int64(m.Backlog), int64(m.Candidates), m.CapBytes, m.Bytes)
+	for tid, eng := range s.engineSnapshotByTenant() {
+		if _, bad := failed[tid]; bad {
+			stale[signal.Metric] = true
+		}
+
+		m := s.metricShape(tid, eng, size[tid])
+		add(signal.Metric, m.Parts, m.Sealed, m.Backlog, m.Candidates, m.ForceCandidates, m.CapBytes, m.Bytes)
 	}
 
 	for sig, engines := range s.recordEnginesBySignal() {
-		for _, eng := range engines {
-			m := eng.MergeShape()
-			add(sig, int64(m.Parts), int64(m.Sealed), int64(m.Backlog), int64(m.Candidates), m.CapBytes, m.Bytes)
+		for tid, eng := range engines {
+			if _, bad := failed[tid]; bad {
+				stale[sig] = true
+			}
+
+			m := s.recordShape(sig, tid, eng, size[tid])
+			add(sig, m.Parts, m.Sealed, m.Backlog, m.Candidates, m.ForceCandidates, m.CapBytes, m.Bytes)
 		}
 	}
 
+	s.shapeMu.Lock()
+	defer s.shapeMu.Unlock()
+
+	if s.lastCandidates == nil {
+		s.lastCandidates = make(map[signal.Signal][2]int64)
+	}
+
+	// Without part sizes the size cutoff falls back to none, which would publish every size-forced
+	// rewrite as gone: the signal keeps the counts it last measured and says they are stale.
 	for sig, sh := range shapes {
-		s.obs.Parts.Record(ctx, sig.String(), sh.total, sh.sealed, sh.backlog, sh.candidates, sh.capBytes, sh.bytes)
+		if stale[sig] {
+			last := s.lastCandidates[sig]
+			sh.Candidates, sh.ForceCandidates, sh.Stale = last[0], last[1], true
+		} else {
+			s.lastCandidates[sig] = [2]int64{sh.Candidates, sh.ForceCandidates}
+		}
+
+		s.obs.Parts.Record(ctx, sig.String(), *sh)
 	}
 }
 

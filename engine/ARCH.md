@@ -581,6 +581,10 @@ Disk-pressure eviction shares `RetainFrom`, so it drops whole parts too.
 
 ### Selection is confined to an aligned time bucket (`timebucket.go`)
 
+The ladder, the bucket arithmetic and the straddler batch live in `internal/timebucket`, shared with
+the record engine; each engine keeps its own walk over the ladder, since the selectors inside a bucket
+differ.
+
 Selection is bucketed by time, not by size alone: size tiers have no notion of time, so an unbucketed
 selector folds an hour-wide part into a day-wide one until every part overlaps every query window.
 
@@ -602,9 +606,55 @@ rest of that bucket rides along if it fits the cap, and the size-tiered run wait
 would merge parts from opposite ends of the store into one spanning both. Merging inside a bucket
 cannot widen.
 
-**A straddler belongs to no bucket** and cannot join one without widening the output, so it is left out
-of ladder groups, and a store can hold wide parts the ladder never narrows. A forced straddler is
-rewritten *alone* rather than skipped: retention correctness does not depend on splitting it.
+**A straddler is split, never grouped.** Flush does not cut by time, so one late sample makes a part
+that crosses a day boundary — a straddler, which fits no ladder level and joins no group. Such parts
+cannot merge through the ladder at any count or size: a live stand held 12,735 exemplar parts spanning
+290–334h each (a producer re-exporting week-old exemplars every minute) and merged none of them in days.
+The selector therefore takes straddlers as a third kind of work, after forced rewrites and the ladder
+(`selectStraddlers`): oldest first, batched up to the cap and `maxMergeParts`. Every merge routes each
+output sample to a writer for its day (`timebucket.Router`), so **every merge output fits a level**,
+which is the
+invariant the shared suite's `StraddlingPartsCompact` and `MergeConvergesWithStraddlers` pin against
+both engines. A straddler's samples land in the buckets
+they belong to and the ladder folds them into their neighbours; no part a merge writes is a straddler,
+so each straddler is rewritten once.
+
+| alternative | cost |
+|---|---|
+| overflow group merging straddlers with each other | its output still spans every input's range, so every query window opens it and the ladder never reaches it — the defect with fewer parts |
+| split at flush | prevents new straddlers but heals no existing one, and still needs a split merge for a retention rewrite |
+| cut at the finest level (1h) | up to 24× the output parts per day the ladder then has to fold back up |
+
+Batching is what converges a backlog: straddlers sharing their stale end write that end into one
+bucket, so one merge of N straddlers leaves roughly one part for the stale day plus one per fresh day
+it covers, not 2N. Straddlers go after the ladder because a split leaves fragments the ladder must
+absorb; a straddler that waits a cycle only joins the next batch.
+
+**One pass, routed on output timestamps.** The merge decodes each source once, merges and downsamples
+every series whole, and hands each day's run of the result to that day's writer. Routing on the
+*output* is what keeps a rollup whole and in its own day: intervals are unrestricted and aligned to
+absolute multiples, so a 7h bucket starting 21:00 aggregates samples from both sides of midnight and
+lands on the earlier day. Cutting the input by day would emit two partial aggregates at 21:00 (the
+read keeps one); keeping a rollup in a part with younger raw samples of the next day would leave a
+straddler whose re-merge re-counts a `Count` representative as 1.
+
+At most `timebucket.MaxOpenWriters` (32) writers are open, and after every day run lands the open
+ones hold less than the merge's resident budget together; past either bound the largest is finished
+early, so a day may get several parts, each still day-aligned, which the ladder folds together later.
+Checking per run rather than per series is the difference between one run of overshoot and a writer's
+worth per day: one series spanning 32 days would otherwise leave every writer just under the budget
+(`TestStraddlerMergeHoldsResidentShare` holds the peak to budget + one run). A metric run needs no
+further split: a writer seals its column frames to the backend as they fill, so a run grows it by a
+frame per column and its per-series state, not by the run's samples. A per-day pass structure
+costs a full decode per day written instead. Measured on a 17-day batch (16 parts × 64 series, hourly;
+`BenchmarkMergeStraddlers17Days`, in memory, default merge share): per-day passes read 13.1 MB from the
+backend, allocated 232 MB and took 628 ms; the single pass reads 0.79 MB, allocates 86 MB and takes
+65 ms, its writers peaking at 1.3 MB together against a 1 GiB share, at a 42 MB peak live heap.
+
+The fragments of one split live in different day buckets and never merge together again, so their
+joint `bucketindex.Claim` is never folded back into an interval: a removed straddler is accounted for
+by `Index.Covered` over its fragments' successors, not by any single `Supersedes`, subject to the
+one-claim-per-output limit every split has.
 
 ### Run selection (`compact.go`)
 
@@ -642,7 +692,11 @@ merge is otherwise indistinguishable from an idle engine, and a store can sit at
 never reduce for thousands of cycles with nothing saying so. The cap comes from the last merge rather
 than being derived on demand: deriving it reads free space, and introspection does no I/O.
 `MergeShape.Bytes` sums the parts' manifest sizes (no backend stat calls), so the same snapshot says
-whether a rising part count is parts that grew or a merge that stopped taking them.
+whether a rising part count is parts that grew or a merge that stopped taking them. `Candidates` and
+`ForceCandidates` run the real merge (retention's whole-part drops, then the selector under the
+policy passed to `MergeShapeWith`, at the current and at the waived idle
+count), so a zero means the merge would select nothing rather than that no run exists somewhere in
+the store regardless of buckets.
 
 ### Streaming both ways (`compactStream`)
 

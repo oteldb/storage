@@ -42,6 +42,33 @@ here, there being no scoring heuristic to waive.
 It matters more here than for metrics: record queries are overwhelmingly narrow and recent, and a
 record row carries far more bytes than a sample, so opening an unneeded part costs more.
 
+**Straddlers are split on day boundaries**, as in the metric engine (`../engine/ARCH.md`, "A straddler
+is split, never grouped"): `selectStraddlers` batches parts that fit no level oldest-first up to the
+cap, after forced rewrites and the ladder, and `compactParts` routes each stream's rows to a buffer
+per day in one pass over the sources. Records are where this bites: an exemplar producer re-exporting
+stale exemplars with their original timestamps makes every flush a straddler, and the ladder alone
+merged none of 12,735 such parts. The fix heals them but does not stop them being written; dropping
+re-exported exemplars at ingest is its own change. Record specifics:
+
+- The day buffers share the merge's byte-column carry: one union dictionary per column, which a
+  fallback to the flat carry expands in every buffer. A merge inside one day keeps its single buffer
+  pre-sized and reuses it per part; a merge across days grows a buffer per day and drops each once
+  written, so no idle buffer holds capacity the resident budget does not count.
+- A stream's day is routed in runs of at most a quarter of the resident budget, the buffers shed
+  between them, so they peak at 1.25× the budget however many rows one stream holds in one day. A
+  retention rewrite takes every forced part of its bucket regardless of the cap, which can make that
+  day far larger than the budget (`TestRetentionRewriteHoldsResidentShare`); the per-stream
+  accumulator still holds the whole stream, as it does in a single-day merge.
+- A side-store engine (profiles) writes the unioned symbol sidecar under each day's part, since each is
+  the one home a reader looks in.
+- Measured on a 17-day batch (16 parts × 64 streams, hourly, 64 MiB parts;
+  `BenchmarkMergeStraddlers17Days`): per-day passes read 16.6 MB from the backend, allocated 426 MB and
+  took 246 ms; the single pass reads 1.0 MB, allocates 143 MB and takes 166 ms, its buffers peaking at
+  17 MB of decoded records against a 341 MiB share, at a 52–57 MB peak live heap.
+- A split merge takes about cap / part size straddlers. Measured on the stand's shape (655 stale
+  records plus one fresh per part, ≈44 KiB decoded, 64 MiB cap): 4,000 straddlers converged to 6
+  parts in 6 cycles — 3 split merges of ≈1,500, 3 ladder merges — in 4 s in memory.
+
 ### Every size is measured
 
 | what | measured as |
@@ -96,7 +123,10 @@ otherwise indistinguishable from an idle engine. `MergeShape.Bytes` sums the par
 different tiers of one bucket are a *permanent* fixed point, and `MergeOptions.Force` is the only way
 out. It takes a bucket's unsealed parts smallest-first whatever their tiers, still truncated at the
 cumulative-bytes cap and still confined to one bucket — the tier rule is waived, the memory bound is
-not.
+not. `Candidates` and `ForceCandidates` run the real merge — retention's whole-part drops, then the
+selector under the cutoff passed to `MergeShapeWith` — with and without `Force`, so the two
+zero states separate: `ForceCandidates > 0` is a tier spread only `Force` breaks, both zero is every
+unsealed part alone in its bucket, which nothing reduces without widening a part.
 
 ## Schema
 

@@ -223,6 +223,9 @@ func TestSizeCutoffsSkipsUnchangedPartSet(t *testing.T) {
 
 	tids := map[signal.TenantID]struct{}{"default": {}}
 
+	// The cycle already resolved the cutoff for the part set it left; start from an empty memo.
+	s.sizeRetention.forget("default")
+
 	lists := be.Count(isList)
 	s.sizeCutoffs(ctx, tids)
 	require.Positive(t, be.Count(isList)-lists, "the first resolution enumerates the parts")
@@ -235,7 +238,7 @@ func TestSizeCutoffsSkipsUnchangedPartSet(t *testing.T) {
 	// A new part changes the fingerprint, so the cutoff is resolved again.
 	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{now + 1}, []float64{2}))
 	require.NoError(t, err)
-	s.maintain(ctx)
+	require.NoError(t, s.Admin().Flush(ctx, "default", signal.Metric))
 
 	lists = be.Count(isList)
 	s.sizeCutoffs(ctx, tids)
@@ -591,7 +594,7 @@ func TestSizeCutoffsSkipsUnbudgetedSignals(t *testing.T) {
 	assert.Zero(t, be.Count(isList)-lists, "a metric-only store under a log-only budget enumerates nothing")
 
 	writeMixedLogs(t, s, mixedLogBase)
-	s.maintain(ctx)
+	require.NoError(t, s.Admin().Flush(ctx, "default", signal.Log))
 
 	lists = be.Count(isList)
 	s.sizeCutoffs(ctx, tids)

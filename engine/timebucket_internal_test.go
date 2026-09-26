@@ -22,90 +22,6 @@ func partAt(seq int, size, minTime, maxTime int64) *part {
 	return p
 }
 
-// spanOf returns the span a merge of parts would produce — the union of their bounds, which is what
-// the output part's own bounds become.
-func spanOf(parts []*part) (lo, hi int64) {
-	lo, hi = maxInt64, minInt64
-	for _, p := range parts {
-		lo, hi = min(lo, p.minTime), max(hi, p.maxTime)
-	}
-
-	return lo, hi
-}
-
-// TestMergeLadderDivides is the invariant the ladder rests on: each level divides the next, so a
-// bucket nests exactly inside its parent and a part that fits level L still fits level L+1. Without
-// it a part could fit a narrow bucket yet straddle the wide one containing it, and promotion would
-// silently widen a part past the level it was promoted to.
-func TestMergeLadderDivides(t *testing.T) {
-	t.Parallel()
-
-	require.NotEmpty(t, mergeLadder)
-
-	for i, level := range mergeLadder {
-		require.Positive(t, level, "level %d must be positive", i)
-
-		if i == 0 {
-			continue
-		}
-
-		prev := mergeLadder[i-1]
-		require.Greater(t, level, prev, "levels must ascend")
-		require.Zero(t, level%prev, "level %d (%s) must divide by %s", i, time.Duration(level), time.Duration(prev))
-	}
-}
-
-// TestBucketOfFloorsTowardNegativeInfinity pins the rounding. Go's % keeps the dividend's sign, so
-// the naive ts-ts%level puts ts=-1 in the bucket starting at 0 — the same bucket as ts=+1 — and two
-// parts an hour apart would be judged co-located. Timestamps before the epoch are unusual but not
-// impossible, and a selector that silently widens on them is worse than one that refuses.
-func TestBucketOfFloorsTowardNegativeInfinity(t *testing.T) {
-	t.Parallel()
-
-	for _, tt := range []struct {
-		ts, want int64
-	}{
-		{0, 0},
-		{1, 0},
-		{hour - 1, 0},
-		{hour, hour},
-		{-1, -hour},
-		{-hour, -hour},
-		{-hour - 1, -2 * hour},
-	} {
-		assert.Equal(t, tt.want, bucketOf(tt.ts, hour), "bucketOf(%d)", tt.ts)
-	}
-}
-
-func TestFinestLevel(t *testing.T) {
-	t.Parallel()
-
-	for _, tt := range []struct {
-		name       string
-		minT, maxT int64
-		want       int64
-		ok         bool
-	}{
-		{"within an hour", 0, hour - 1, hour, true},
-		{"straddles an hour, within six", hour - 1, hour + 1, 6 * hour, true},
-		{"straddles six hours, within a day", 6*hour - 1, 6*hour + 1, day, true},
-		{"straddles a day", day - 1, day + 1, 0, false},
-		{"wider than the top level", 0, 3 * day, 0, false},
-		{"instant", 5 * hour, 5 * hour, hour, true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			level, ok := finestLevel(partAt(0, 1, tt.minT, tt.maxT))
-			assert.Equal(t, tt.ok, ok)
-
-			if tt.ok {
-				assert.Equal(t, time.Duration(tt.want), time.Duration(level))
-			}
-		})
-	}
-}
-
 // TestSelectMergePartsNeverWidensPastTopLevel is the property issue #308 is about: whatever the
 // selector returns, merging it must not produce a part wider than the widest ladder level. The
 // inputs are deliberately adversarial — parts spread across four days at wildly different sizes,
@@ -145,7 +61,8 @@ func TestSelectMergePartsSpansStoreWithoutBuckets(t *testing.T) {
 		partAt(1, 1<<20, 47*hour, 48*hour),
 	}
 
-	assert.Empty(t, selectMergeParts(src, MergeOptions{}, 64<<20, mergeIdleRounds),
+	// The newer part ends on the day boundary, so it is a straddler and may be selected alone.
+	assert.Less(t, len(selectMergeParts(src, MergeOptions{}, 64<<20, mergeIdleRounds)), 2,
 		"parts two days apart share no bucket at any level, so no merge may pair them")
 }
 
@@ -227,9 +144,8 @@ func TestSelectForcedAbsorbsBucketNeighbours(t *testing.T) {
 		"a co-located unforced part rides along rather than being left as a fragment")
 }
 
-// TestSelectForcedRewritesStraddlerAlone checks retention correctness does not wait on straddle
-// splitting: a part crossing every level's boundary belongs to no bucket, and must still be
-// rewritten rather than silently skipped forever.
+// TestSelectForcedRewritesStraddlerAlone checks a straddler retention forces is rewritten alone:
+// it belongs to no bucket, and the merge splits it on day boundaries.
 func TestSelectForcedRewritesStraddlerAlone(t *testing.T) {
 	t.Parallel()
 

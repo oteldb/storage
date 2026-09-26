@@ -163,3 +163,12 @@ func (e *Engine) LoadState() any {
 		slices.Clone(e.wants), slices.Clone(e.pendingWants),
 	}
 }
+
+// SetMergeResidentObserver installs fn to receive each merge's peak buffer residency, its largest
+// run and its resident limit, and returns the restore. Callers must not run in parallel.
+func SetMergeResidentObserver(fn func(peak, run, limit int64)) func() {
+	old := mergeResidentObserver
+	mergeResidentObserver = fn
+
+	return func() { mergeResidentObserver = old }
+}

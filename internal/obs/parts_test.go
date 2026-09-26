@@ -49,8 +49,10 @@ func TestPartsGaugesRecord(t *testing.T) {
 	o, err := obs.New(obs.Config{MeterProvider: mp})
 	require.NoError(t, err)
 
-	o.Parts.Record(ctx, "metric", 9, 4, 5, 2, 64<<20, 700<<20)
-	o.Parts.Record(ctx, "log", 3, 0, 3, 0, 8<<20, 12<<20)
+	o.Parts.Record(ctx, "metric", obs.PartShape{
+		Total: 9, Sealed: 4, Backlog: 5, Candidates: 2, ForceCandidates: 3, CapBytes: 64 << 20, Bytes: 700 << 20,
+	})
+	o.Parts.Record(ctx, "log", obs.PartShape{Total: 3, Backlog: 3, CapBytes: 8 << 20, Bytes: 12 << 20})
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(ctx, &rm))
@@ -60,6 +62,7 @@ func TestPartsGaugesRecord(t *testing.T) {
 	assert.Equal(t, int64(4), gaugeValue(t, rm, "storage.parts.sealed", metricSig))
 	assert.Equal(t, int64(5), gaugeValue(t, rm, "storage.parts.merge_backlog", metricSig))
 	assert.Equal(t, int64(2), gaugeValue(t, rm, "storage.parts.merge_candidates", metricSig))
+	assert.Equal(t, int64(3), gaugeValue(t, rm, "storage.parts.merge_force_candidates", metricSig))
 	assert.Equal(t, int64(64<<20), gaugeValue(t, rm, "storage.merge.cap_bytes", metricSig))
 	assert.Equal(t, int64(700<<20), gaugeValue(t, rm, "storage.parts.bytes", metricSig))
 
@@ -72,5 +75,5 @@ func TestPartsGaugesRecord(t *testing.T) {
 func TestPartsGaugesNop(t *testing.T) {
 	t.Parallel()
 
-	obs.NewNop().Parts.Record(context.Background(), "metric", 1, 0, 1, 0, 0, 0)
+	obs.NewNop().Parts.Record(context.Background(), "metric", obs.PartShape{Total: 1, Backlog: 1})
 }
