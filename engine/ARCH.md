@@ -643,7 +643,9 @@ ones hold less than the merge's resident budget together; past either bound the 
 early, so a day may get several parts, each still day-aligned, which the ladder folds together later.
 Checking per run rather than per series is the difference between one run of overshoot and a writer's
 worth per day: one series spanning 32 days would otherwise leave every writer just under the budget
-(`TestStraddlerMergeHoldsResidentShare` holds the peak to budget + one run). A per-day pass structure
+(`TestStraddlerMergeHoldsResidentShare` holds the peak to budget + one run). A metric run needs no
+further split: a writer seals its column frames to the backend as they fill, so a run grows it by a
+frame per column and its per-series state, not by the run's samples. A per-day pass structure
 costs a full decode per day written instead. Measured on a 17-day batch (16 parts × 64 series, hourly;
 `BenchmarkMergeStraddlers17Days`, in memory, default merge share): per-day passes read 13.1 MB from the
 backend, allocated 232 MB and took 628 ms; the single pass reads 0.79 MB, allocates 86 MB and takes

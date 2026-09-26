@@ -54,6 +54,11 @@ re-exported exemplars at ingest is its own change. Record specifics:
   fallback to the flat carry expands in every buffer. A merge inside one day keeps its single buffer
   pre-sized and reuses it per part; a merge across days grows a buffer per day and drops each once
   written, so no idle buffer holds capacity the resident budget does not count.
+- A stream's day is routed in runs of at most a quarter of the resident budget, the buffers shed
+  between them, so they peak at 1.25× the budget however many rows one stream holds in one day. A
+  retention rewrite takes every forced part of its bucket regardless of the cap, which can make that
+  day far larger than the budget (`TestRetentionRewriteHoldsResidentShare`); the per-stream
+  accumulator still holds the whole stream, as it does in a single-day merge.
 - A side-store engine (profiles) writes the unioned symbol sidecar under each day's part, since each is
   the one home a reader looks in.
 - Measured on a 17-day batch (16 parts × 64 streams, hourly, 64 MiB parts;

@@ -65,3 +65,53 @@ func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
 		})
 	}
 }
+
+// TestRetentionRewriteHoldsResidentShare bounds one stream's single day: retention forces every part
+// of its bucket at once, however many, so the stream's surviving rows of that day are one run many
+// times the resident share. The buffers must still peak at the share plus a fixed fraction of it.
+//
+//nolint:paralleltest // sets the package-global resident observer
+func TestRetentionRewriteHoldsResidentShare(t *testing.T) {
+	const (
+		parts = 40
+		step  = int64(time.Minute)
+	)
+
+	var peak, limit int64
+
+	defer recordengine.SetMergeResidentObserver(func(p, _, l int64) { peak, limit = max(peak, p), l })()
+
+	ctx := context.Background()
+	e := recordengine.New(recordengine.Config{
+		Schema: testSchema, Backend: backend.Memory(), Prefix: "t/recs", MaxPartBytes: 16 << 10,
+	})
+
+	body := strings.Repeat("x", 200)
+	stored := 0
+
+	for p := range parts {
+		recs := make([]rrec, 0, 51)
+		recs = append(recs, rrec{ts: int64(p), body: body})
+		for i := range 50 {
+			recs = append(recs, rrec{ts: int64(2*60+i)*step + int64(p), body: body})
+		}
+
+		ingest(t, e, mkBatch("api", recs...))
+		require.NoError(t, e.Flush(ctx))
+
+		stored += len(recs)
+	}
+
+	require.Len(t, e.Parts(), parts, "one part per flush, each reaching back past the cutoff")
+	require.NoError(t, e.Merge(ctx, int64(time.Hour)))
+
+	require.Positive(t, limit)
+	assert.LessOrEqual(t, peak, limit+limit/4+1024, "the day's run must be routed in bounded pieces")
+
+	got := 0
+	for _, b := range fetchAll(t, e, req("api")) {
+		got += len(bodies(b))
+	}
+
+	assert.Equal(t, stored-parts, got, "retention drops the one expired record of each part")
+}

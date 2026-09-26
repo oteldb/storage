@@ -425,7 +425,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 		// assumption. A run that overshoots the cap is split at the next run (parts are independent;
 		// the read seam concatenates a stream spanning parts), keeping the buffers at ≈ one part
 		// regardless of a heavy stream.
-		if err := routeStream(router, acc, idToU128(id)); err != nil {
+		if err := routeStream(router, acc, idToU128(id), budget.ResidentBytes/mergeRunFraction); err != nil {
 			return nil, err
 		}
 	}
@@ -504,19 +504,46 @@ func (e *Engine) dayBuffers(
 	}
 }
 
-// routeStream appends one ts-sorted stream to the buffers of the days its rows fall in. A day's rows
-// are contiguous, so each moves as one blob copy per column rather than a cell-at-a-time append.
-func routeStream(router *timebucket.Router[*flushColumns], acc *recordCols, u chunk.U128) error {
+// mergeRunFraction is how much of the resident limit one routed run may add before the buffers are
+// shed: the buffers peak at the limit plus this share of it, however many rows one stream holds in
+// one day.
+const mergeRunFraction = 4
+
+// routeStream appends one ts-sorted stream to the buffers of the days its rows fall in, in runs of at
+// most runBytes decoded bytes (≤ 0 ⇒ a day per run). A run's rows are contiguous, so each moves as
+// one blob copy per column rather than a cell-at-a-time append.
+func routeStream(router *timebucket.Router[*flushColumns], acc *recordCols, u chunk.U128, runBytes int64) error {
 	return timebucket.Runs(acc.ts, func(lo, hi int) error {
-		return router.Append(acc.ts[lo], func(f *flushColumns) (bool, error) {
-			for range hi - lo {
-				f.stream = append(f.stream, u)
+		for lo < hi {
+			end := lo + 1
+
+			if runBytes > 0 {
+				size := acc.rowBytes(lo) + streamIDBytes
+				for end < hi && size < runBytes {
+					size += acc.rowBytes(end) + streamIDBytes
+					end++
+				}
+			} else {
+				end = hi
 			}
 
-			f.cols.appendRange(acc, lo, hi)
+			err := router.Append(acc.ts[lo], func(f *flushColumns) (bool, error) {
+				for range end - lo {
+					f.stream = append(f.stream, u)
+				}
 
-			return false, nil
-		})
+				f.cols.appendRange(acc, lo, end)
+
+				return false, nil
+			})
+			if err != nil {
+				return err
+			}
+
+			lo = end
+		}
+
+		return nil
 	})
 }
 
