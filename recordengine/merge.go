@@ -336,7 +336,12 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 		return err
 	}
 
-	return writeSidecars(ctx, e.cfg.Backend, newPrefix, merged)
+	stored, err := e.cfg.SideStore.Stored(merged)
+	if err != nil {
+		return err
+	}
+
+	return writeSidecars(ctx, e.cfg.Backend, newPrefix, stored)
 }
 
 // compactParts compacts the selected source parts into bounded output part(s): it reads every stream's

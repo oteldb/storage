@@ -25,6 +25,7 @@ type fakeSide struct {
 	resets   int
 	restores int
 	unions   int
+	stores   int
 }
 
 func newFakeSide() *fakeSide { return &fakeSide{acc: map[uint64][]byte{}} }
@@ -104,6 +105,12 @@ func (f *fakeSide) Union(parts []map[string][]byte) (map[string][]byte, error) {
 	}
 
 	return map[string][]byte{"table": encodeSide(merged)}, nil
+}
+
+func (f *fakeSide) Stored(tables map[string][]byte) (map[string][]byte, error) {
+	f.stores++
+
+	return tables, nil
 }
 
 // sideIDs reads every sidecar object under the engine prefix and returns the union of ids it holds.
@@ -252,9 +259,16 @@ func TestSideStoreMergeUnions(t *testing.T) {
 	require.NoError(t, e.Flush(ctx))
 
 	require.Equal(t, 2, e.PartCount())
+	require.Equal(t, 2, fs.stores, "each flush stores its sidecars")
+
+	_, err := e.SideSnapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 2, fs.stores, "a snapshot stays in memory")
+
 	require.NoError(t, e.Merge(ctx, 0))
 	require.Equal(t, 1, e.PartCount())
 	require.GreaterOrEqual(t, fs.unions, 1)
+	require.Equal(t, 3, fs.stores, "the merge stores its union")
 
 	// One merged part, one sidecar, the union of both parts' symbols.
 	require.Equal(t, []uint64{1, 2, 4}, sideIDs(t, be))

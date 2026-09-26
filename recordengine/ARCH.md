@@ -574,6 +574,12 @@ riding the part lifecycle: absorbed into a live accumulator, written as sidecars
 on merge (content addressing makes the union a plain dedup with no id remap), and **restored** into the
 accumulator when a flush fails. Profiles' symbol store is the first user; nil for logs/traces.
 
+`Encode` and `Union` return the in-memory form, which `SideSnapshot` hands to a resolver per
+query; `SideStore.Stored` converts to the on-disk form, and the engine applies it only to what
+`writeSidecars` writes: the flush snapshot once per flush (shared by every part a split produces)
+and the merged union. A store that compresses its sidecars thus pays that encode at flush and
+merge, never on the query path.
+
 **Symbols follow their records' visibility.** A record is in exactly one of head / `e.flushing` / a
 published part, and `Engine.SideSnapshot` must union the side data of all three the same way a fetch
 reads all three. The flush's `Encode`+`Reset` at detach hands the accumulator's snapshot to

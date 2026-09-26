@@ -20,8 +20,8 @@ func TestSidecarCompression(t *testing.T) {
 	var rawTotal, zstdTotal int
 
 	for i, name := range tableNames {
-		raw := len(encodeTable(corpus.t[i], deltaCompressor))
-		packed := len(encodeTable(corpus.t[i], sidecarCompressor))
+		raw := len(encodeTable(corpus.t[i], memoryCompressor))
+		packed := len(encodeTable(corpus.t[i], storageCompressor))
 		rawTotal += raw
 		zstdTotal += packed
 
@@ -34,7 +34,7 @@ func TestSidecarCompression(t *testing.T) {
 
 	stacks := corpus.t[4]
 	require.NotEmpty(t, stacks)
-	assert.Less(t, 3*len(encodeTable(stacks, sidecarCompressor)), len(encodeTable(stacks, deltaCompressor)),
+	assert.Less(t, 3*len(encodeTable(stacks, storageCompressor)), len(encodeTable(stacks, memoryCompressor)),
 		"stacks compress at least 3×")
 }
 
@@ -46,7 +46,7 @@ func BenchmarkSymbolTable(b *testing.B) {
 
 		for i, name := range tableNames {
 			table := corpus.t[i]
-			logical := int64(len(encodeTable(table, deltaCompressor)))
+			logical := int64(len(encodeTable(table, memoryCompressor)))
 			enc := encodeTable(table, c)
 
 			b.Run(alg.String()+"/"+name+"/Encode", func(b *testing.B) {

@@ -219,17 +219,17 @@ const (
 )
 
 var (
-	sidecarCompressor = compress.NewCompressor(compress.AlgorithmZSTD, compress.LevelDefault)
-	deltaCompressor   = compress.NewCompressor(compress.AlgorithmNone, compress.LevelDefault)
+	storageCompressor = compress.NewCompressor(compress.AlgorithmZSTD, compress.LevelDefault)
+	memoryCompressor  = compress.NewCompressor(compress.AlgorithmNone, compress.LevelDefault)
 	lz4Compressor     = compress.NewCompressor(compress.AlgorithmLZ4, compress.LevelDefault)
 )
 
 func tableCompressor(alg compress.Algorithm) *compress.Compressor {
 	switch alg {
 	case compress.AlgorithmNone:
-		return deltaCompressor
+		return memoryCompressor
 	case compress.AlgorithmZSTD:
-		return sidecarCompressor
+		return storageCompressor
 	case compress.AlgorithmLZ4:
 		return lz4Compressor
 	default:
@@ -240,8 +240,10 @@ func tableCompressor(alg compress.Algorithm) *compress.Compressor {
 // encodeTable serializes one table as [magic][version][algorithm][uvarint body len][compressed
 // body][CRC32C].
 func encodeTable(m map[signal.SeriesID][]byte, c *compress.Compressor) []byte {
-	body := tableBody(m)
+	return frameBody(tableBody(m), c)
+}
 
+func frameBody(body []byte, c *compress.Compressor) []byte {
 	out := binary.BigEndian.AppendUint32(nil, symMagic)
 	out = binary.BigEndian.AppendUint32(out, symVersion)
 	out = append(out, byte(c.Algorithm()))
@@ -279,31 +281,36 @@ func tableBody(m map[signal.SeriesID][]byte) []byte {
 // decodeTable parses a table of either version into dst (merging, dedup), verifying the CRC and
 // bounds-checking every read.
 func decodeTable(dst map[signal.SeriesID][]byte, data []byte) error {
+	body, err := tableBodyOf(data)
+	if err != nil {
+		return err
+	}
+
+	return decodeEntries(dst, body)
+}
+
+// tableBodyOf verifies a table of either version and returns its uncompressed body.
+func tableBodyOf(data []byte) ([]byte, error) {
 	if len(data) < 12 { // magic+version+crc
-		return ErrCorruptSymbols
+		return nil, ErrCorruptSymbols
 	}
 
 	framed := data[:len(data)-4]
 	if crc32.Checksum(framed, castagnoli) != binary.BigEndian.Uint32(data[len(data)-4:]) {
-		return errors.Wrap(ErrCorruptSymbols, "crc mismatch")
+		return nil, errors.Wrap(ErrCorruptSymbols, "crc mismatch")
 	}
 
 	if binary.BigEndian.Uint32(framed) != symMagic {
-		return errors.Wrap(ErrCorruptSymbols, "bad magic")
+		return nil, errors.Wrap(ErrCorruptSymbols, "bad magic")
 	}
 
 	switch binary.BigEndian.Uint32(framed[4:]) {
 	case symVersionRaw:
-		return decodeEntries(dst, framed[8:])
+		return framed[8:], nil
 	case symVersion:
-		body, err := decompressBody(framed[8:])
-		if err != nil {
-			return err
-		}
-
-		return decodeEntries(dst, body)
+		return decompressBody(framed[8:])
 	default:
-		return errors.Wrap(ErrCorruptSymbols, "bad version")
+		return nil, errors.Wrap(ErrCorruptSymbols, "bad version")
 	}
 }
 
@@ -376,7 +383,7 @@ func errCorrupt(what string) error { return errors.Wrap(ErrCorruptSymbols, what)
 func encodeDelta(s symTables) []byte {
 	var out []byte
 	for i := range s.t {
-		blob := encodeTable(s.t[i], deltaCompressor)
+		blob := encodeTable(s.t[i], memoryCompressor)
 		out = binary.AppendUvarint(out, uint64(len(blob)))
 		out = append(out, blob...)
 	}
@@ -420,14 +427,30 @@ func NewSymbolStore() *SymbolStore { return &SymbolStore{acc: newSymTables()} }
 // Absorb merges one batch's encoded symbol delta into the accumulator.
 func (s *SymbolStore) Absorb(delta []byte) error { return decodeDeltaInto(&s.acc, delta) }
 
-// Encode returns the accumulated tables as named sidecar payloads.
+// Encode returns the accumulated tables as named payloads, uncompressed until [SymbolStore.Stored].
 func (s *SymbolStore) Encode() map[string][]byte {
 	out := make(map[string][]byte, len(tableNames))
 	for i, name := range tableNames {
-		out[name] = encodeTable(s.acc.t[i], sidecarCompressor)
+		out[name] = encodeTable(s.acc.t[i], memoryCompressor)
 	}
 
 	return out
+}
+
+// Stored returns tables compressed for writing as part sidecars.
+func (s *SymbolStore) Stored(tables map[string][]byte) (map[string][]byte, error) {
+	out := make(map[string][]byte, len(tables))
+
+	for name, data := range tables {
+		body, err := tableBodyOf(data)
+		if err != nil {
+			return nil, errors.Wrapf(err, "store table %q", name)
+		}
+
+		out[name] = frameBody(body, storageCompressor)
+	}
+
+	return out, nil
 }
 
 // Reset clears the accumulator.
@@ -472,7 +495,7 @@ func (s *SymbolStore) Union(parts []map[string][]byte) (map[string][]byte, error
 
 	out := make(map[string][]byte, len(tableNames))
 	for i, name := range tableNames {
-		out[name] = encodeTable(merged.t[i], sidecarCompressor)
+		out[name] = encodeTable(merged.t[i], memoryCompressor)
 	}
 
 	return out, nil

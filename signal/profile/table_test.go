@@ -120,14 +120,14 @@ func TestDecodeTableV2Fixture(t *testing.T) {
 	got := map[signal.SeriesID][]byte{}
 	require.NoError(t, decodeTable(got, data))
 	requireSameTable(t, fixtureTable(), got)
-	assert.Less(t, len(data), len(encodeTable(got, deltaCompressor)), "the fixture is compressed")
+	assert.Less(t, len(data), len(encodeTable(got, memoryCompressor)), "the fixture is compressed")
 }
 
 // TestTableGolden pins the version 2 framing on a table too small to compress.
 func TestTableGolden(t *testing.T) {
 	t.Parallel()
 
-	enc := encodeTable(goldenEntry(), sidecarCompressor)
+	enc := encodeTable(goldenEntry(), storageCompressor)
 	gold.Bytes(t, enc, "symtable-v2")
 	assert.Equal(t, compress.FlagRaw, enc[10], "zstd falls back to a raw block")
 }
@@ -161,41 +161,60 @@ func TestTableRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSidecarsCompressed checks the sidecars a store writes carry zstd and the delta stays raw.
-func TestSidecarsCompressed(t *testing.T) {
+func storedSidecars(tb testing.TB, s *SymbolStore) map[string][]byte {
+	tb.Helper()
+
+	stored, err := s.Stored(s.Encode())
+	require.NoError(tb, err)
+
+	return stored
+}
+
+// TestSidecarsCompressedOnlyStored checks only [SymbolStore.Stored] compresses: the delta, Encode
+// and Union — everything a resolver build touches — stay raw.
+func TestSidecarsCompressedOnlyStored(t *testing.T) {
 	t.Parallel()
 
 	corpus := pprofCorpus(t)
 	delta := encodeDelta(corpus)
 
+	_, n := binary.Uvarint(delta)
+	require.Positive(t, n)
+	assert.Equal(t, byte(compress.AlgorithmNone), delta[n+8], "delta")
+
 	s := NewSymbolStore()
 	require.NoError(t, s.Absorb(delta))
 
-	for i, name := range tableNames {
-		blob := s.Encode()[name]
-		require.Equal(t, byte(compress.AlgorithmZSTD), blob[8], name)
+	stored := storedSidecars(t, s)
+	union, err := NewSymbolStore().Union([]map[string][]byte{s.Encode(), stored})
+	require.NoError(t, err)
 
-		got := map[signal.SeriesID][]byte{}
-		require.NoError(t, decodeTable(got, blob))
-		requireSameTable(t, corpus.t[i], got)
+	for i, name := range tableNames {
+		assert.Equal(t, byte(compress.AlgorithmNone), s.Encode()[name][8], "encode %s", name)
+		assert.Equal(t, byte(compress.AlgorithmNone), union[name][8], "union %s", name)
+		require.Equal(t, byte(compress.AlgorithmZSTD), stored[name][8], "stored %s", name)
+
+		for _, data := range [][]byte{stored[name], union[name]} {
+			got := map[signal.SeriesID][]byte{}
+			require.NoError(t, decodeTable(got, data))
+			requireSameTable(t, corpus.t[i], got)
+		}
 	}
 
-	ln, n := binary.Uvarint(delta)
-	require.Positive(t, n)
-	assert.Equal(t, byte(compress.AlgorithmNone), delta[n+8], "delta tables are raw")
-	assert.Positive(t, ln)
+	_, err = s.Stored(map[string][]byte{"stacks": {1, 2, 3}})
+	require.ErrorIs(t, err, ErrCorruptSymbols)
 }
 
 func decodeRejects() map[string][]byte {
-	zeros := sidecarCompressor.Compress(nil, make([]byte, 256<<10))
+	zeros := storageCompressor.Compress(nil, make([]byte, 256<<10))
 	body := tableBody(fixtureTable())
 	bodyLen := uint64(len(body))
-	block := sidecarCompressor.Compress(nil, body)
+	block := storageCompressor.Compress(nil, body)
 
-	badCRC := encodeTable(fixtureTable(), sidecarCompressor)
+	badCRC := encodeTable(fixtureTable(), storageCompressor)
 	badCRC[len(badCRC)-1] ^= 1
 
-	badMagic := encodeTable(fixtureTable(), sidecarCompressor)
+	badMagic := encodeTable(fixtureTable(), storageCompressor)
 	badMagic[0] ^= 1
 
 	return map[string][]byte{
@@ -258,7 +277,7 @@ func TestDecodeTableBombAllocation(t *testing.T) {
 func FuzzDecodeTable(f *testing.F) {
 	f.Add(readFixture(f, "symtable-v1.bin"))
 	f.Add(readFixture(f, "symtable-v2-zstd.bin"))
-	f.Add(encodeTable(goldenEntry(), sidecarCompressor))
+	f.Add(encodeTable(goldenEntry(), storageCompressor))
 	f.Add([]byte{0x4f, 0x54, 0x53, 0x50})
 
 	for _, data := range decodeRejects() {
@@ -282,7 +301,7 @@ func FuzzDecodeTable(f *testing.F) {
 		}
 
 		got := map[signal.SeriesID][]byte{}
-		if err := decodeTable(got, encodeTable(m, deltaCompressor)); err != nil {
+		if err := decodeTable(got, encodeTable(m, memoryCompressor)); err != nil {
 			t.Fatalf("re-encoded table: %v", err)
 		}
 
