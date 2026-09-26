@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -108,4 +109,27 @@ func TestMergeCandidatesFollowSizeRetention(t *testing.T) {
 	metricSig := map[string]string{"signal": "metric"}
 	assert.Equal(t, int64(exact.Candidates), partGauge(t, rm, "storage.parts.merge_candidates", metricSig))
 	assert.Equal(t, int64(exact.ForceCandidates), partGauge(t, rm, "storage.parts.merge_force_candidates", metricSig))
+	assert.Zero(t, partGauge(t, rm, "storage.parts.merge_candidates_stale", metricSig))
+
+	// Part sizes that cannot be read when the cycle re-measures must not publish the fallback's
+	// zero cutoff as the truth: the gauges keep what they last measured and say they are stale.
+	write(now - 100*int64(time.Second))
+	require.NoError(t, s.Admin().Flush(ctx, "default", signal.Metric))
+	be.Add(faultbackend.Rule{Kind: faultbackend.List, Err: errSizesUnreadable})
+	s.recordPartShape(ctx)
+
+	require.NoError(t, reader.Collect(ctx, &rm))
+	assert.Equal(t, int64(1), partGauge(t, rm, "storage.parts.merge_candidates_stale", metricSig))
+	assert.Equal(t, int64(exact.Candidates), partGauge(t, rm, "storage.parts.merge_candidates", metricSig))
+	assert.Equal(t, int64(exact.ForceCandidates), partGauge(t, rm, "storage.parts.merge_force_candidates", metricSig))
+	assert.True(t, metricStats().MergeCandidatesStale)
+
+	be.Reset()
+	s.recordPartShape(ctx)
+
+	require.NoError(t, reader.Collect(ctx, &rm))
+	assert.Zero(t, partGauge(t, rm, "storage.parts.merge_candidates_stale", metricSig), "a readable measurement clears it")
+	assert.False(t, metricStats().MergeCandidatesStale)
 }
+
+var errSizesUnreadable = errors.New("part sizes unreadable")

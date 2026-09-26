@@ -165,16 +165,24 @@ func (s *Storage) sizeCutoffCached(t signal.TenantID) (cutoffs bySignal, current
 // nothing flushed, merged, or was dropped since the last cycle the enumeration would re-read every
 // part's object sizes to arrive at the same numbers.
 func (s *Storage) sizeCutoffFor(ctx context.Context, t signal.TenantID) bySignal {
+	cutoffs, _ := s.measureSizeCutoff(ctx, t)
+
+	return cutoffs
+}
+
+// measureSizeCutoff is [Storage.sizeCutoffFor] reporting whether the cutoffs were measured: false
+// when the part sizes could not be read and the zero cutoffs are a fallback, not a result.
+func (s *Storage) measureSizeCutoff(ctx context.Context, t signal.TenantID) (bySignal, bool) {
 	t = s.normalizeTenant(t) // engines are keyed by the normalized id
 
 	b := budgetsOf(s.tenant.Resolve(t).Retention)
 	if b.empty() {
-		return bySignal{}
+		return bySignal{}, true
 	}
 
 	fp := s.partSetFingerprint(t, b)
 	if cutoffs, ok := s.sizeRetention.lookup(t, fp); ok {
-		return cutoffs
+		return cutoffs, true
 	}
 
 	parts, err := s.sizedParts(ctx, t, b)
@@ -184,7 +192,7 @@ func (s *Storage) sizeCutoffFor(ctx context.Context, t signal.TenantID) bySignal
 		s.obs.Logger(ctx).Warn("size retention: part sizes unavailable",
 			zap.String("tenant", string(t)), zap.Error(err))
 
-		return bySignal{}
+		return bySignal{}, false
 	}
 
 	var cutoffs bySignal
@@ -207,7 +215,7 @@ func (s *Storage) sizeCutoffFor(ctx context.Context, t signal.TenantID) bySignal
 
 	s.sizeRetention.store(t, fp, cutoffs)
 
-	return cutoffs
+	return cutoffs, true
 }
 
 // sizedParts collects the flushed parts this node holds for a tenant, bucketed by signal and pooled
@@ -262,28 +270,43 @@ func (s *Storage) sizedParts(ctx context.Context, t signal.TenantID, b sizeBudge
 // budget are absent (the common case costs nothing); a tenant sharded across engines is resolved
 // once.
 func (s *Storage) sizeCutoffs(ctx context.Context, tids map[signal.TenantID]struct{}) map[signal.TenantID]bySignal {
-	var (
-		byTenant map[signal.TenantID]bySignal
-		out      map[signal.TenantID]bySignal
-	)
+	out, _ := s.measureSizeCutoffs(ctx, tids)
 
+	return out
+}
+
+// measureSizeCutoffs is [Storage.sizeCutoffs] also returning the shard keys whose tenant's part
+// sizes could not be read.
+func (s *Storage) measureSizeCutoffs(
+	ctx context.Context, tids map[signal.TenantID]struct{},
+) (out map[signal.TenantID]bySignal, failed map[signal.TenantID]struct{}) {
+	type measured struct {
+		cutoffs bySignal
+		ok      bool
+	}
+
+	byTenant := make(map[signal.TenantID]measured)
 	resolved := make(map[signal.TenantID]struct{}, len(tids))
 
 	for tid := range tids {
 		t := s.normalizeTenant(tenantOfShard(tid)) // the memo is keyed by the normalized id
 		resolved[t] = struct{}{}
 
-		cutoffs, ok := byTenant[t]
-		if !ok {
-			cutoffs = s.sizeCutoffFor(ctx, t)
-
-			if byTenant == nil {
-				byTenant = make(map[signal.TenantID]bySignal)
-			}
-
-			byTenant[t] = cutoffs
+		m, seen := byTenant[t]
+		if !seen {
+			m.cutoffs, m.ok = s.measureSizeCutoff(ctx, t)
+			byTenant[t] = m
 		}
 
+		if !m.ok {
+			if failed == nil {
+				failed = make(map[signal.TenantID]struct{})
+			}
+
+			failed[tid] = struct{}{}
+		}
+
+		cutoffs := m.cutoffs
 		if cutoffs.any() {
 			if out == nil {
 				out = make(map[signal.TenantID]bySignal)
@@ -295,5 +318,5 @@ func (s *Storage) sizeCutoffs(ctx context.Context, tids map[signal.TenantID]stru
 
 	s.sizeRetention.retain(resolved)
 
-	return out
+	return out, failed
 }

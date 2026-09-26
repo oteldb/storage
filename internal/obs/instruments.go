@@ -138,6 +138,7 @@ type Parts struct {
 	backlog         metric.Int64Gauge
 	candidates      metric.Int64Gauge
 	forceCandidates metric.Int64Gauge
+	stale           metric.Int64Gauge
 	capBytes        metric.Int64Gauge
 	bytes           metric.Int64Gauge
 	orphans         metric.Int64Counter
@@ -145,9 +146,11 @@ type Parts struct {
 	reserved        metric.Int64Counter
 }
 
-// PartShape is one signal's part shape as [Parts.Record] publishes it.
+// PartShape is one signal's part shape as [Parts.Record] publishes it. Stale marks candidate counts
+// carried over from an earlier cycle.
 type PartShape struct {
 	Total, Sealed, Backlog, Candidates, ForceCandidates, CapBytes, Bytes int64
+	Stale                                                                bool
 }
 
 // Record publishes one signal's part shape, summed over the tenants this node holds. The values are
@@ -160,6 +163,13 @@ func (p *Parts) Record(ctx context.Context, sig string, sh PartShape) {
 	p.backlog.Record(ctx, sh.Backlog, a)
 	p.candidates.Record(ctx, sh.Candidates, a)
 	p.forceCandidates.Record(ctx, sh.ForceCandidates, a)
+
+	var stale int64
+	if sh.Stale {
+		stale = 1
+	}
+
+	p.stale.Record(ctx, stale, a)
 	p.capBytes.Record(ctx, sh.CapBytes, a)
 	p.bytes.Record(ctx, sh.Bytes, a)
 }
@@ -465,6 +475,8 @@ func newParts(m metric.Meter) (*Parts, error) {
 		candidates: b.gauge("storage.parts.merge_candidates", "parts the next merge would select", "{part}"),
 		forceCandidates: b.gauge("storage.parts.merge_force_candidates",
 			"parts a forced merge (Admin.CompactNow) would select", "{part}"),
+		stale: b.gauge("storage.parts.merge_candidates_stale",
+			"1 while the candidate gauges repeat an earlier cycle's, the part sizes being unreadable", "1"),
 		capBytes: b.gauge("storage.merge.cap_bytes", "seal threshold in effect for a merged part", "By"),
 		bytes:    b.gauge("storage.parts.bytes", "bytes the flushed parts occupy on disk", "By"),
 		orphans: b.counter("storage.parts.orphans_swept",

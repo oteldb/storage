@@ -113,6 +113,11 @@ type Storage struct {
 	// computed from, so an idle cycle costs no part enumeration (see sizeCutoffFor).
 	sizeRetention sizeRetentionCache
 
+	// lastCandidates is each signal's last published candidate gauges measured with a known size
+	// cutoff, kept through a cycle whose part sizes could not be read (see recordPartShape).
+	shapeMu        sync.Mutex
+	lastCandidates map[signal.Signal][2]int64
+
 	ecStats    ecCounters    // cumulative erasure-coding activity (Inspect → ClusterStats.EC)
 	maintStats maintCounters // cumulative maintenance-loop activity (Inspect → StoreStats.Maintenance)
 	walSync    walSyncCounters
@@ -1905,7 +1910,8 @@ func (s *Storage) recordPartShape(ctx context.Context) {
 		}
 	}
 
-	size := s.sizeCutoffs(ctx, tids)
+	size, failed := s.measureSizeCutoffs(ctx, tids)
+	stale := make(map[signal.Signal]bool)
 
 	add := func(sig signal.Signal, parts, sealed, backlog, candidates, force int, capBytes, bytes int64) {
 		sh, ok := shapes[sig]
@@ -1926,18 +1932,42 @@ func (s *Storage) recordPartShape(ctx context.Context) {
 	}
 
 	for tid, eng := range s.engineSnapshotByTenant() {
+		if _, bad := failed[tid]; bad {
+			stale[signal.Metric] = true
+		}
+
 		m := s.metricShape(tid, eng, size[tid])
 		add(signal.Metric, m.Parts, m.Sealed, m.Backlog, m.Candidates, m.ForceCandidates, m.CapBytes, m.Bytes)
 	}
 
 	for sig, engines := range s.recordEnginesBySignal() {
 		for tid, eng := range engines {
+			if _, bad := failed[tid]; bad {
+				stale[sig] = true
+			}
+
 			m := s.recordShape(sig, tid, eng, size[tid])
 			add(sig, m.Parts, m.Sealed, m.Backlog, m.Candidates, m.ForceCandidates, m.CapBytes, m.Bytes)
 		}
 	}
 
+	s.shapeMu.Lock()
+	defer s.shapeMu.Unlock()
+
+	if s.lastCandidates == nil {
+		s.lastCandidates = make(map[signal.Signal][2]int64)
+	}
+
+	// Without part sizes the size cutoff falls back to none, which would publish every size-forced
+	// rewrite as gone: the signal keeps the counts it last measured and says they are stale.
 	for sig, sh := range shapes {
+		if stale[sig] {
+			last := s.lastCandidates[sig]
+			sh.Candidates, sh.ForceCandidates, sh.Stale = last[0], last[1], true
+		} else {
+			s.lastCandidates[sig] = [2]int64{sh.Candidates, sh.ForceCandidates}
+		}
+
 		s.obs.Parts.Record(ctx, sig.String(), *sh)
 	}
 }
