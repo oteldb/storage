@@ -274,8 +274,14 @@ is deferred. `TestSourceBoundCoversOpened` holds the manifest bound at or above 
 sources report, and `TestScanBoundCoversOpenPeak` a large incompressible dictionary's open.
 
 The writers get what the grant leaves beside the opened sources and the encoders
-(`mergeWriterBudget`), less what the parts sealed so far keep until the merge commits (their ranges,
-blooms and record keys, the router's `Held`). Of that the router keeps room for one append
+(`mergeWriterBudget`), less what it keeps of the parts sealed so far (the router's `Held`). That is
+only each part's prefix, bounds and row count (`sealedPart`): a part is opened — its reader, ranges,
+blooms and record keys — only once every writer is finished and the sources and coders are released
+(`openSealed`), so a merge spanning years of sparse days does not hold a part's metadata per day
+beside its writers. Opening them, one stream id column read back at a time, is checked against the
+grant, which is topped up without waiting and past that counted in `merge.over_budget_bytes` with a
+warning, since the parts are already written (`TestMergeSparseYearsHoldsItsGrant`: 700 days, 1,400
+parts, heap 5.9 MiB within a 6.3 MiB grant). Of that the router keeps room for one append
 (`timebucket.Router.ReserveRun`): a writer binding every source's dictionaries, 12 B an entry, plus
 one run and the least a writer charges for its finish, or the largest append so far if that is more.
 A writer charges its own finish from the start (`finishBytes`, part of `residentBytes`): the block

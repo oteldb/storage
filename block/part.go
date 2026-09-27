@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"unsafe"
 
 	"github.com/go-faster/errors"
 
@@ -402,6 +403,22 @@ type PartReader struct {
 	compsMu sync.Mutex
 	comps   map[compress.Algorithm]*compress.Compressor
 	level   compress.Level
+}
+
+// ResidentBytes bounds what the open reader holds: its decoded manifest — a descriptor, name, constant
+// value and name-index slot per column — and the reader itself. Columns it reads are not included;
+// each read is its caller's.
+func (r *PartReader) ResidentBytes() int64 {
+	const mapSlot = 64
+
+	n := int64(unsafe.Sizeof(*r)) + int64(len(r.prefix)) + int64(len(r.manifest.Columns))*int64(unsafe.Sizeof(ColumnDesc{}))
+
+	for i := range r.manifest.Columns {
+		c := &r.manifest.Columns[i]
+		n += 2*int64(len(c.Name)) + int64(len(c.ConstBytes)) + mapSlot
+	}
+
+	return n
 }
 
 // PartPresent reports whether the part at prefix still exists, by probing its manifest — the object

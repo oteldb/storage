@@ -319,10 +319,18 @@ func mergeObjectBytes(src []*part, buffered bool) int {
 	return int(min(largest, math.MaxInt))
 }
 
-// residentBytes is what an open part holds in RAM beyond its reader: its stream ranges, blooms and
-// record keys. A merge keeps the parts it seals until it commits them.
+// partOverheadBytes is what an open part holds beside what [part.residentBytes] counts item by item —
+// its bloom map, block plan and the allocator's rounding: ~480 B measured on a sparse merge's
+// thousand-odd parts, charged at twice that.
+const partOverheadBytes = 1 << 10
+
+// residentBytes is what an open part holds in RAM: its reader and manifest, stream ranges, blooms and
+// record keys.
 func (p *part) residentBytes() int64 {
-	n := int64(cap(p.ranges)) * int64(unsafe.Sizeof(streamRange{}))
+	n := partOverheadBytes + int64(unsafe.Sizeof(*p)) + int64(cap(p.ranges))*int64(unsafe.Sizeof(streamRange{}))
+	if p.reader != nil {
+		n += p.reader.ResidentBytes()
+	}
 
 	for _, f := range p.blooms {
 		n += f.SizeBytes()

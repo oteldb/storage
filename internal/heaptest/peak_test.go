@@ -9,13 +9,14 @@ import (
 	"github.com/oteldb/storage/internal/heaptest"
 )
 
-// TestPeak: a run that holds several buffers at once, then drops them, peaks at their sum.
+// TestPeak: a run that holds several buffers at once and samples while they are held peaks at their
+// sum, however much it frees before returning.
 //
 //nolint:paralleltest // samples the process-wide heap
 func TestPeak(t *testing.T) {
 	const chunk = 8 << 20
 
-	peak := heaptest.Peak(func() {
+	peak := heaptest.Peak(func(sample func()) {
 		held := make([][]byte, 0, 8)
 		for range 8 {
 			b := make([]byte, chunk)
@@ -23,15 +24,11 @@ func TestPeak(t *testing.T) {
 			held = append(held, b)
 		}
 
-		// Allocations after the peak let a collection see it before the buffers are dropped.
-		for range 64 {
-			_ = make([]byte, 1<<20)
-		}
-
+		sample()
 		runtime.KeepAlive(held)
 	})
 
 	t.Logf("peak %.1f MiB", float64(peak)/(1<<20))
-	assert.GreaterOrEqual(t, peak, uint64(7*chunk))
-	assert.Less(t, peak, uint64(10*chunk))
+	assert.Greater(t, peak, uint64(8*chunk-chunk/8))
+	assert.Less(t, peak, uint64(9*chunk))
 }

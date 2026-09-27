@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -138,4 +139,38 @@ func TestMergeFinishHoldsItsGrant(t *testing.T) {
 
 	t.Logf("%d sources × %d days: merge heap %.1f MiB, grant %.1f MiB", sources, days, float64(heap)/(1<<20), float64(grant)/(1<<20))
 	assert.LessOrEqual(t, heap, grant, "the finishes outgrew the merge's grant")
+}
+
+// TestMergeSparseYearsHoldsItsGrant: a merge whose rows span years of sparse days writes a part per
+// day. It keeps only each written part's prefix and bounds until its writers and sources are gone,
+// then opens them, so the heap stays inside the grant however many days there are.
+//
+//nolint:paralleltest // samples the process-wide heap
+func TestMergeSparseYearsHoldsItsGrant(t *testing.T) {
+	fb, err := file.New(t.TempDir())
+	require.NoError(t, err)
+
+	b := &heaptest.FileSampler{File: fb, Writes: true}
+	e := New(Config{Schema: headTestSchema, Backend: b, Prefix: "t/recs", MergeMemoryBytes: 1 << 20})
+
+	const (
+		sources = 3
+		days    = 700
+	)
+
+	day := int64(24 * time.Hour)
+
+	for s := range sources {
+		ts := make([]int64, days)
+		for d := range ts {
+			ts[d] = int64(d)*day + int64(s)
+		}
+
+		e.parts = append(e.parts, writeTestPart(t, e, b, streamColumns(t, e, map[string][]int64{"api": ts, "db": ts})))
+	}
+
+	heap, grant := mergeGrantPeak(t, e, b)
+
+	t.Logf("%d sources × %d days: merge heap %.1f MiB, grant %.1f MiB", sources, days, float64(heap)/(1<<20), float64(grant)/(1<<20))
+	assert.LessOrEqual(t, heap, grant, "the sealed parts outgrew the merge's grant")
 }

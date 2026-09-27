@@ -139,8 +139,10 @@ functions 1.6×. Larger tables repeat more: a test-stand part's stacks shrink 8.
   length from its frame header and charges fourteen bytes a body byte (the merged maps, the maps of
   what the refs keep, sharing the entries' bytes, and the kept entries encoded back, at the smallest
   entry a table holds) plus the largest body decompressed. It cannot see the refs, so it charges as
-  if they keep everything. `TestUnionBytesCoversUnion` keeps every entry and samples the union's peak
-  at 1.1–1.4 body bytes a body byte, from 1-byte to 1 KiB entries.
+  if they keep everything. `TestUnionBytesCoversUnion` keeps every entry and samples the heap at
+  every point inside `Union` its peak can fall, then with the stored union live, at 0.8–0.9 body bytes
+  a body byte, from 1-byte to 1 KiB entries; the bound is loose because a table's header carries its
+  body length but not its entry count.
 - **Only the disk boundary compresses.** `SymbolStore.Stored` re-frames a table's body under zstd,
   and the engine calls it (`SideStore.Stored`) on exactly what it writes as sidecars: a flush's
   snapshot once per flush, a merge's union once. Everything else — the batch delta, `Encode`, `Union`

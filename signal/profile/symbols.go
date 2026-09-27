@@ -547,8 +547,24 @@ func (s *SymbolStore) Union(parts []map[string][]byte, refs iter.Seq[[]byte]) (m
 		}
 	}
 
+	sampleUnion()
+
 	union := &SymbolStore{acc: merged}
 	union.Retain(refs)
+	sampleUnion()
 
-	return union.Encode(), nil
+	out := union.Encode()
+	sampleUnion()
+
+	return out, nil
+}
+
+// unionSample, when non-nil, is called at every point [SymbolStore.Union]'s peak can fall. Test seam
+// only.
+var unionSample func()
+
+func sampleUnion() {
+	if unionSample != nil {
+		unionSample()
+	}
 }

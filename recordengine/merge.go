@@ -417,28 +417,34 @@ func (e *Engine) compactStreamed(
 
 	e.reportOverBudget(ctx, grant.bytes)
 
-	var (
-		newParts []*part
-		sealed   int64
-	)
+	var sealed []sealedPart
+
+	// What a failed attempt leaves behind: the parts it wrote, by prefix, for the caller to delete.
+	written := func() []*part {
+		out := make([]*part, len(sealed))
+		for i, s := range sealed {
+			out[i] = &part{prefix: s.prefix}
+		}
+
+		return out
+	}
 
 	router := timebucket.Router[*recordPartStreamWriter]{
 		Open: func(int64) (*recordPartStreamWriter, error) {
 			return newRecordPartStreamWriter(ctx, e, src, coders)
 		},
 		Finish: func(w *recordPartStreamWriter) error {
-			p, err := w.finish(ctx)
+			s, err := w.finish(ctx)
 			if err != nil {
 				return err
 			}
 
-			newParts = append(newParts, p)
-			sealed += p.residentBytes()
+			sealed = append(sealed, s)
 
 			return nil
 		},
 		Resident:      (*recordPartStreamWriter).residentBytes,
-		Held:          func() int64 { return sealed },
+		Held:          func() int64 { return int64(len(sealed)) * sealedPartBytes },
 		MaxOpen:       timebucket.MaxOpenWriters,
 		ResidentLimit: writerLimit,
 		ReserveRun:    appendReserve,
@@ -462,7 +468,7 @@ func (e *Engine) compactStreamed(
 		}
 
 		if err := heap.reset(sources, id, start); err != nil {
-			return newParts, err
+			return written(), err
 		}
 
 		u := idToU128(id)
@@ -479,7 +485,7 @@ func (e *Engine) compactStreamed(
 				return partBytes > 0 && w.decodedBytes() >= partBytes, nil
 			})
 			if err != nil {
-				return newParts, err
+				return written(), err
 			}
 		}
 	}
@@ -492,12 +498,66 @@ func (e *Engine) compactStreamed(
 		return nil, err
 	}
 
+	// The writers are finished; the sources and the coders go before the outputs open.
+	clear(sources)
+
+	coders = nil
+
+	out, err := e.openSealed(ctx, sealed, grant)
+	if err != nil {
+		return written(), err
+	}
+
 	if mergeResidentObserver != nil {
 		peak, run := router.Peak()
 		mergeResidentObserver(peak, run, writerLimit, grant.bytes)
 	}
 
-	return newParts, nil
+	return out, nil
+}
+
+// openSealed opens a merge's written parts once it holds nothing else. Keeping every sealed part
+// open until commit would hold their ranges, blooms and record keys for however many days the merge
+// spans; opened last, they are what the part set holds once the merge commits, in place of the
+// sources'. Each open reads the stream id column back, 16 B a row, beside what the parts opened
+// before it keep. Past its grant the merge tops the grant up without waiting, and past that counts
+// the excess as over budget and warns: the parts are written, and dropping them would only redo the
+// work.
+func (e *Engine) openSealed(ctx context.Context, sealed []sealedPart, grant *mergeGrant) ([]*part, error) {
+	const idBytes = 16
+
+	out := make([]*part, 0, len(sealed))
+
+	var held int64
+
+	for _, s := range sealed {
+		if need := held + int64(s.rows)*idBytes; grant.bytes > 0 && need > grant.bytes {
+			topped, err := grant.top(ctx, need-grant.bytes)
+			if err != nil {
+				return nil, err
+			}
+
+			if !topped {
+				over := need - grant.bytes
+				e.cfg.Obs.Merge.OverBudget(ctx, e.cfg.Signal, over)
+				zctx.From(ctx).Warn("merge opens its written parts past its grant",
+					zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
+					zap.Int64("need", need), zap.Int64("grant", grant.bytes))
+				grant.bytes = need
+			}
+		}
+
+		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, s.prefix, e.cfg.Obs.Corruption, e.readCompressors)
+		if err != nil {
+			return nil, err
+		}
+
+		p.minTime, p.maxTime = s.minT, s.maxT
+		held += p.residentBytes()
+		out = append(out, p)
+	}
+
+	return out, nil
 }
 
 // mergeResidentObserver, when non-nil, receives after each merge the most its open writers held in

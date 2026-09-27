@@ -378,14 +378,26 @@ func identityBytes(s signal.Series, scratch *[]byte) int64 {
 // abort releases the part's in-flight column objects; a no-op once the part is written.
 func (w *recordPartStreamWriter) abort() { w.w.Abort() }
 
-// finish writes the part and its sidecars in the order [writePart] does, opens it and stamps its
-// time bounds. The router opens a writer only for rows it is about to append, so an empty one is a
-// bug: it would burn a part id and leave an unreadable prefix.
-func (w *recordPartStreamWriter) finish(ctx context.Context) (*part, error) {
+// sealedPart is a merge output part written and synced but not yet opened: its prefix, time bounds
+// and row count, which is all a merge keeps of it until its writers and sources are gone
+// ([Engine.openSealed]).
+type sealedPart struct {
+	prefix     string
+	minT, maxT int64
+	rows       int
+}
+
+// sealedPartBytes is what a merge keeps per [sealedPart]: the struct and its prefix string.
+const sealedPartBytes = int64(unsafe.Sizeof(sealedPart{})) + 64
+
+// finish writes the part and its sidecars in the order [writePart] does. The router opens a writer
+// only for rows it is about to append, so an empty one is a bug: it would burn a part id and leave an
+// unreadable prefix.
+func (w *recordPartStreamWriter) finish(ctx context.Context) (sealedPart, error) {
 	if w.rows == 0 {
 		w.abort()
 
-		return nil, errors.New("recordengine: finishing a merge output part with no rows")
+		return sealedPart{}, errors.New("recordengine: finishing a merge output part with no rows")
 	}
 
 	e, b, prefix, schema := w.e, w.e.cfg.Backend, w.prefix, w.e.cfg.Schema
@@ -393,15 +405,15 @@ func (w *recordPartStreamWriter) finish(ctx context.Context) (*part, error) {
 	if err := w.flushStream(); err != nil {
 		w.abort()
 
-		return nil, err
+		return sealedPart{}, err
 	}
 
 	if err := block.WriteStreamPart(ctx, b, prefix, w.w); err != nil {
-		return nil, errors.Wrapf(err, "write part %q", prefix)
+		return sealedPart{}, errors.Wrapf(err, "write part %q", prefix)
 	}
 
 	if err := writeIdentity(ctx, b, prefix, w.identityEntries()); err != nil {
-		return nil, err
+		return sealedPart{}, err
 	}
 
 	for k, s := range w.sinks {
@@ -411,40 +423,33 @@ func (w *recordPartStreamWriter) finish(ctx context.Context) (*part, error) {
 
 		name := schema.byteColumn(k).Name
 		if err := backend.WriteDeferred(ctx, b, bloomKey(prefix, name), s.bloom.encode()); err != nil {
-			return nil, errors.Wrapf(err, "write bloom %q", name)
+			return sealedPart{}, errors.Wrapf(err, "write bloom %q", name)
 		}
 	}
 
 	if err := backend.WriteDeferred(ctx, b, watermark.Key(prefix), watermark.Encode(nil, w.wmarks)); err != nil {
-		return nil, errors.Wrapf(err, "write watermark sidecar %q", prefix)
+		return sealedPart{}, errors.Wrapf(err, "write watermark sidecar %q", prefix)
 	}
 
 	if k, ok := schema.attrsByteCol(); ok {
 		if keys := w.sinks[k].keys.sorted(); len(keys) > 0 {
 			if err := backend.WriteDeferred(ctx, b, recordKeysKey(prefix), encodeRecordKeys(keys)); err != nil {
-				return nil, errors.Wrap(err, "write record-keys footer")
+				return sealedPart{}, errors.Wrap(err, "write record-keys footer")
 			}
 		}
 	}
 
-	p, err := openPart(ctx, b, schema, prefix, e.cfg.Obs.Corruption, e.readCompressors)
-	if err != nil {
-		return nil, err
-	}
-
-	p.minTime, p.maxTime = w.minT, w.maxT
-
 	if e.cfg.SideStore != nil {
 		if err := e.mergeSidecars(ctx, w.src, prefix, w.refCells); err != nil {
-			return nil, err
+			return sealedPart{}, err
 		}
 	}
 
 	if err := backend.SyncPrefix(ctx, b, prefix); err != nil {
-		return nil, errors.Wrapf(err, "sync part %q", prefix)
+		return sealedPart{}, errors.Wrapf(err, "sync part %q", prefix)
 	}
 
-	return p, nil
+	return sealedPart{prefix: prefix, minT: w.minT, maxT: w.maxT, rows: w.rows}, nil
 }
 
 // identityEntries resolves the part's streams under one read lock.

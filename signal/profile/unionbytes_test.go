@@ -5,6 +5,7 @@ package profile
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"runtime"
 	"strconv"
 	"testing"
 
@@ -16,9 +17,9 @@ import (
 )
 
 // TestUnionBytesCoversUnion: merging large incompressible stored tables — Union, then Stored, as a
-// merge does for every part it writes — holds no more at its peak than UnionBytes reserves for it
-// beside the loaded sidecars, for entries from the smallest a table can hold to large ones, when the
-// refs keep every entry.
+// merge does for every part it writes — holds no more, sampled at every point the union's peak can
+// fall and with the stored union live, than UnionBytes reserves for it beside the loaded sidecars, for
+// entries from the smallest a table can hold to large ones, when the refs keep every entry.
 //
 //nolint:paralleltest // samples the process-wide heap
 func TestUnionBytesCoversUnion(t *testing.T) {
@@ -121,12 +122,21 @@ func unionBytesCoversUnion(t *testing.T, size int) {
 
 	var merged map[string][]byte
 
-	peak := heaptest.Peak(func() {
+	peak := heaptest.Peak(func(sample func()) {
+		unionSample = sample
+
+		defer func() { unionSample = nil }()
+
 		merged, err = s.Union(parts, each)
 		require.NoError(t, err)
 
-		_, err = s.Stored(merged)
+		sample()
+
+		stored, err := s.Stored(merged)
 		require.NoError(t, err)
+
+		sample()
+		runtime.KeepAlive(stored)
 	})
 
 	kept := NewSymbolStore()
