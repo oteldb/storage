@@ -218,6 +218,8 @@ var suite = []struct {
 	{"MergeConvergesWithStraddlers", mergeConvergesWithStraddlers},
 	{"ForcedBacklogStaysWithinCap", forcedBacklogStaysWithinCap},
 	{"OversizedForcedPartProgresses", oversizedForcedPartProgresses},
+	{"SplitOfSeveralInputsKeepsEveryLineage", splitOfSeveralInputsKeepsEveryLineage},
+	{"SplitOfSeveralInputsRepairsFromPeer", splitOfSeveralInputsRepairsFromPeer},
 
 	{"HoleCommittedAfterRepeatedAbsence", holeCommittedAfterRepeatedAbsence},
 	{"IncompletePeerSetNeverHoles", incompletePeerSetNeverHoles},
