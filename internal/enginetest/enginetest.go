@@ -38,6 +38,8 @@ type Config struct {
 	Now         func() time.Time
 	// MergeCapBytes is the merge cap in the unit of [Part.Bytes]; 0 keeps the engine's derived cap.
 	MergeCapBytes int64
+	// Term is the writer's ownership term; nil is a writer with no cluster.
+	Term func() uint64
 }
 
 // Part is one live part as [Engine.Parts] reports it.
@@ -286,6 +288,9 @@ var suite = []struct {
 	{"ReplaySkipsSegmentsBelowFlushWatermark", replaySkipsSegmentsBelowFlushWatermark},
 	{"FlushWatermarkIsPerWriter", flushWatermarkIsPerWriter},
 	{"RebasedCommitKeepsPeerWatermark", rebasedCommitKeepsPeerWatermark},
+	{"SplitBrainMergeSameInputs", splitBrainMergeSameInputs},
+	{"SplitBrainMergeOverlappingInputs", splitBrainMergeOverlappingInputs},
+	{"DisplacedWriterKeepsItsTerm", displacedWriterKeepsItsTerm},
 }
 
 // Run runs every suite test against k, each as <test>/<k.Name>.

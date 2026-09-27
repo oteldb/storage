@@ -120,7 +120,7 @@ var recordKind = enginetest.Kind{
 
 		c := recordengine.Config{
 			Schema: testSchema, Backend: cfg.Backend, Prefix: enginePrefix, WAL: cfg.WAL, Obs: cfg.Obs, WriterID: cfg.WriterID,
-			Repair: cfg.Repair, OrphanGrace: cfg.OrphanGrace, Now: cfg.Now,
+			Repair: cfg.Repair, OrphanGrace: cfg.OrphanGrace, Now: cfg.Now, Term: cfg.Term,
 			// A memory budget of the cap puts the merge share under it, so the cap is its
 			// MaxPartBytes floor.
 			MaxPartBytes: cfg.MergeCapBytes, MergeMemoryBytes: cfg.MergeCapBytes,
