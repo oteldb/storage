@@ -296,6 +296,65 @@ func TestSideStoreReplicaRefreshDropsRejectedDeltas(t *testing.T) {
 	assert.Equal(t, 3, fs.retains)
 }
 
+// TestSideStoreDemotedPrimaryDropsRejectedDelta: a primary absorbs a write's delta before admission
+// rejects its records. Demoted before any flush, its refresh has no part and trims no row, and must
+// still drop that delta.
+func TestSideStoreDemotedPrimaryDropsRejectedDelta(t *testing.T) {
+	t.Parallel()
+
+	fs := newFakeSide()
+	e := sideEngine(backend.Memory(), fs)
+
+	kept := mkBatch("api", rrec{ts: 1, id: "1"})
+	kept.Side = encodeSide(map[uint64][]byte{1: []byte("a")})
+	_, _, err := e.ApplyPrimary(recordengine.EncodeWAL(kept), recordengine.AppendLimits{})
+	require.NoError(t, err)
+
+	shed := mkBatch("shed", rrec{ts: 1, id: "10"})
+	shed.Side = encodeSide(map[uint64][]byte{10: []byte("rejected")})
+	_, res, err := e.ApplyPrimary(recordengine.EncodeWAL(shed), recordengine.AppendLimits{MaxSeries: 1})
+	require.NoError(t, err)
+	require.Equal(t, 1, res.RejectedCardinality)
+
+	require.NoError(t, e.RefreshReplica(t.Context()))
+	assert.Equal(t, []uint64{1}, accIDs(fs))
+	assert.Equal(t, 1, fs.retains)
+}
+
+// TestSideStoreIdleFlushDropsRejectedDeltas: an owner whose writes are all rejected keeps an empty
+// head, so no flush writes a part, and each flush must drop the deltas instead.
+func TestSideStoreIdleFlushDropsRejectedDeltas(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	fs := newFakeSide()
+	e := recordengine.New(recordengine.Config{
+		Schema: testSchema, Backend: backend.Memory(), Prefix: "t/recs", SideStore: fs, OOOWindow: 10,
+	})
+
+	newest := mkBatch("api", rrec{ts: 100, id: "1"})
+	newest.Side = encodeSide(map[uint64][]byte{1: []byte("a")})
+	_, _, err := e.ApplyPrimary(recordengine.EncodeWAL(newest), recordengine.AppendLimits{})
+	require.NoError(t, err)
+	require.NoError(t, e.Flush(ctx))
+
+	for i := range 3 {
+		late := mkBatch("api", rrec{ts: 1, id: "2"})
+		late.Side = encodeSide(map[uint64][]byte{uint64(2 + i): []byte("rejected")})
+
+		_, res, err := e.ApplyPrimary(recordengine.EncodeWAL(late), recordengine.AppendLimits{})
+		require.NoError(t, err)
+		require.Equal(t, 1, res.RejectedOOO)
+
+		require.NoError(t, e.Flush(ctx))
+		assert.Empty(t, accIDs(fs), "round %d", i)
+	}
+
+	resets := fs.resets
+	require.NoError(t, e.Flush(ctx))
+	assert.Equal(t, resets, fs.resets, "an idle flush with nothing absorbed leaves the store alone")
+}
+
 func TestSideStoreRetainRejectsNonByteRefColumn(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

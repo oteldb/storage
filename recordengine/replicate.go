@@ -160,7 +160,7 @@ func (a *primaryApply) side(payload []byte) error {
 	// Absorb the symbol delta locally and forward it to the secondaries (content-addressed, so
 	// re-absorbing on every replica is an idempotent dedup).
 	if a.e.cfg.SideStore != nil {
-		if err := a.e.cfg.SideStore.Absorb(payload); err != nil {
+		if err := a.e.absorbSideLocked(payload); err != nil {
 			return err
 		}
 	}

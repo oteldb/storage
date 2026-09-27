@@ -641,9 +641,16 @@ Correctness rests on two facts:
 
 The rebuild derives liveness from the head because nothing else records it: a record carries no link
 to the delta that brought its symbols. It costs one pass over the head's reference cells plus the kept
-entries, and runs only when a trim dropped rows or a replicated or replayed delta landed since the last
-rebuild. The second trigger matters: the primary forwards the delta of a write whose records it all
-rejected, which grows the accumulator without adding a row for any trim to drop.
+entries, and runs only when a trim dropped rows or a delta landed since the accumulator was last reset
+or rebuilt.
+
+**Rejected writes leave deltas behind.** A delta is absorbed before admission decides, and
+`ApplyPrimary` forwards it even when every record is rejected, so the accumulator grows with no row to
+trim or flush. Every absorb goes through `absorbSideLocked`, which marks the accumulator dirty; the
+mark covers both roles. A replica, or a primary demoted before its next flush, rebuilds on refresh. An
+owner whose head stays empty resets the store in the flush that finds nothing to detach: an empty head
+references nothing, so a plain `Reset` is exact and needs no walk. A non-empty flush already drains
+the store, rejected deltas included, into its sidecars.
 
 ## Cost attribution
 
