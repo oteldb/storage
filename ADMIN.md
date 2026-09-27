@@ -423,6 +423,12 @@ stats); metric parts stay version 2. A node on an older release cannot read them
 
 Parts written by earlier releases (versions 1 and 2) stay readable; nothing is rewritten.
 
+## Upgrading to the downsample rollup marker
+
+**Every node must run a release that writes the rollup marker before any node runs maintenance on it;
+a rolling update across it is unsupported.** An older node ignores and drops the marker, putting the
+parts it rewrites back on age-only forcing.
+
 ## Ranged column reads (`backend.ReaderAt`)
 
 A part stores one object per column. Without ranged reads, touching any block of a column transfers
