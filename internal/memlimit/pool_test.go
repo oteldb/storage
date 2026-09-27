@@ -299,7 +299,7 @@ func TestTryAcquireYieldsToTheQueue(t *testing.T) {
 	ctx := context.Background()
 	p := memlimit.NewPool(100)
 
-	held, err := p.Acquire(ctx, 100)
+	held, err := p.Acquire(ctx, 60)
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
@@ -312,12 +312,14 @@ func TestTryAcquireYieldsToTheQueue(t *testing.T) {
 
 	require.Eventually(t, func() bool { return p.Waiting() == 1 }, time.Second, 50*time.Microsecond)
 
-	held()
+	// 40 bytes are free, but a waiter is queued ahead, so this must decline.
+	release, ok := p.TryAcquire(1)
+	if ok {
+		release()
+	}
 
-	// The queued waiter takes the whole pool, so this declines — but it must decline even once bytes
-	// are free again, for as long as someone is queued ahead of it.
-	_, ok := p.TryAcquire(1)
 	assert.False(t, ok)
 
+	held()
 	wg.Wait()
 }
