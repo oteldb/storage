@@ -3,10 +3,13 @@ package recordengine_test
 import (
 	"context"
 	"encoding/binary"
+	"iter"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
@@ -19,13 +22,15 @@ import (
 // ([uvarint count] then per entry [uvarint id][uvarint len][bytes], sorted by id), so Union is a
 // plain dedup. It records how many times each lifecycle method ran.
 type fakeSide struct {
-	acc      map[uint64][]byte
-	absorbed int
-	encoded  int
-	resets   int
-	restores int
-	unions   int
-	stores   int
+	acc       map[uint64][]byte
+	refColumn string
+	absorbed  int
+	encoded   int
+	resets    int
+	retains   int
+	restores  int
+	unions    int
+	stores    int
 }
 
 func newFakeSide() *fakeSide { return &fakeSide{acc: map[uint64][]byte{}} }
@@ -77,6 +82,29 @@ func (f *fakeSide) Encode() map[string][]byte {
 func (f *fakeSide) Reset() {
 	f.resets++
 	f.acc = map[uint64][]byte{}
+}
+
+func (f *fakeSide) RefColumn() string {
+	if f.refColumn != "" {
+		return f.refColumn
+	}
+
+	return "id"
+}
+
+// Retain keeps the entries whose id is a ref cell in decimal.
+func (f *fakeSide) Retain(refs iter.Seq[[]byte]) {
+	f.retains++
+	kept := map[uint64][]byte{}
+
+	for ref := range refs {
+		id, err := strconv.ParseUint(string(ref), 10, 64)
+		if entry, ok := f.acc[id]; err == nil && ok {
+			kept[id] = entry
+		}
+	}
+
+	f.acc = kept
 }
 
 func (f *fakeSide) Restore(snapshot map[string][]byte) error {
@@ -197,6 +225,61 @@ func TestSideStoreReplicates(t *testing.T) {
 	want := []uint64{1, 2}
 	require.Equal(t, want, accIDs(fsP), "primary absorbed the symbols")
 	require.Equal(t, want, accIDs(fsS), "secondary absorbed the forwarded symbols")
+}
+
+func replicateSide(t *testing.T, primary, replica *recordengine.Engine, b *recordengine.Batch) {
+	t.Helper()
+
+	accepted, _, err := primary.ApplyPrimary(recordengine.EncodeWAL(b), recordengine.AppendLimits{})
+	require.NoError(t, err)
+	require.NoError(t, replica.ApplyReplicated(accepted))
+}
+
+// TestSideStoreReplicaRefreshRetainsHead: a replica never flushes, so its refresh is what shrinks
+// the accumulator, to the entries the records left after the trim reference.
+func TestSideStoreReplicaRefreshRetainsHead(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	be := backend.Memory()
+	primary := sideEngine(be, newFakeSide())
+	fs := newFakeSide()
+	replica := sideEngine(be, fs)
+
+	flushed := mkBatch("api", rrec{ts: 1, id: "1"})
+	flushed.Side = encodeSide(map[uint64][]byte{1: []byte("a"), 9: []byte("unreferenced")})
+	replicateSide(t, primary, replica, flushed)
+	require.NoError(t, primary.Flush(ctx))
+
+	pending := mkBatch("api", rrec{ts: 2, id: "2"})
+	pending.Side = encodeSide(map[uint64][]byte{2: []byte("b")})
+	replicateSide(t, primary, replica, pending)
+
+	require.NoError(t, replica.RefreshReplica(ctx))
+	require.Equal(t, 1, replica.HeadRecordCount())
+	assert.Equal(t, []uint64{2}, accIDs(fs), "only the unflushed record's entry is kept")
+	assert.Equal(t, 1, fs.retains)
+
+	require.NoError(t, replica.RefreshReplica(ctx))
+	assert.Equal(t, 1, fs.retains, "a refresh that trims nothing leaves the accumulator alone")
+}
+
+func TestSideStoreRetainRejectsNonByteRefColumn(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	for _, column := range []string{"sev", "missing"} {
+		be := backend.Memory()
+		primary := sideEngine(be, newFakeSide())
+		fs := newFakeSide()
+		fs.refColumn = column
+		replica := sideEngine(be, fs)
+
+		replicateSide(t, primary, replica, mkBatch("api", rrec{ts: 1, id: "1"}))
+		require.NoError(t, primary.Flush(ctx))
+
+		require.ErrorContains(t, replica.RefreshReplica(ctx), column)
+	}
 }
 
 // TestSideStoreWALReplay verifies the side delta is logged to the WAL and a fresh engine's Replay

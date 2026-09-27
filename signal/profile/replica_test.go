@@ -9,7 +9,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
 )
@@ -108,7 +107,6 @@ func requireResolves(t *testing.T, r *Resolver, stacks []stackCase) {
 // replica refreshes. Its symbol accumulator must hold only what its remaining head references, while
 // every stack still resolves on the replica and survives the replica's promotion.
 func TestReplicaSideStoreBoundedByHead(t *testing.T) {
-	reproduce.Unfixed(t, 704, "a replica's side store keeps every symbol ever replicated to it")
 	t.Parallel()
 
 	ctx := context.Background()

@@ -627,6 +627,23 @@ that restores it into the accumulator on abort. Without that hop the snapshot li
 flush-local variable, and for the length of an object-store flush the detached records resolve their
 symbols against an empty set — wrong answers, not an error.
 
+**A replica's accumulator is bounded by its head.** A non-owning replica absorbs every replicated
+delta and never flushes, so no `Reset` drains it. A `RefreshReplica` whose trim dropped rows calls
+`SideStore.Retain` with the `RefColumn` cells of the records left in the head; the store keeps what
+they reach and drops the rest. Correctness rests on two facts:
+
+- **Trimmed records resolve from the parts that cover them.** The owner wrote those parts' sidecars
+  from an accumulator that had absorbed the records' deltas. The sidecars are durable before the part
+  is committed, and partsync copies a part's manifest after its other objects, so a part a replica
+  loads has them.
+- **Promotion stays complete.** Every head record's entries survive the rebuild, so the promoted node's
+  first flush writes sidecars that cover its parts.
+
+The rebuild derives liveness from the head because nothing else records it: a record carries no link
+to the delta that brought its symbols. It costs one pass over the head's reference cells plus the kept
+entries, and runs only when a trim dropped rows. A delta whose records were all rejected stays until
+the next trim.
+
 ## Cost attribution
 
 `Engine.StreamCost` (`streamcost.go`) attributes the live parts to streams — or to a label's values

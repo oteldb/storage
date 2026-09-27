@@ -744,10 +744,10 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 
 // RefreshReplica brings a replica node's view up to date with the shared object store: it
 // reconstructs the flushed parts and trims its head to the still-unflushed window, stream by stream
-// (see [head.trimBelowCovered]). With no shared store, a safe no-op. A part the index names but the
-// store lacks is not an error: it leaves the part set and is counted as a pending want
-// ([Stats.WantedParts], [Engine.WantOverlaps]) until a refresh finds it again or this node commits
-// as an owner.
+// (see [head.trimBelowCovered]), and its side store to what that window references. With no shared
+// store, a safe no-op. A part the index names but the store lacks is not an error: it leaves the part
+// set and is counted as a pending want ([Stats.WantedParts], [Engine.WantOverlaps]) until a refresh
+// finds it again or this node commits as an owner.
 func (e *Engine) RefreshReplica(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -779,7 +779,29 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 		}
 	}
 
-	e.head.trimBelowCovered(covered)
+	if e.head.trimBelowCovered(covered) == 0 {
+		return nil
+	}
+
+	return e.retainSideLocked()
+}
+
+// retainSideLocked shrinks the side-store accumulator to what the head still references. Only a
+// replica needs it: no flush drains its accumulator, and the records its trim dropped resolve from
+// the covering parts' sidecars. Caller holds e.mu.
+func (e *Engine) retainSideLocked() error {
+	if e.cfg.SideStore == nil {
+		return nil
+	}
+
+	name := e.cfg.SideStore.RefColumn()
+
+	ref, ok := e.cfg.Schema.ref(name)
+	if !ok || ref.kind != KindBytes {
+		return errors.Errorf("side store reference column %q is not a byte column", name)
+	}
+
+	e.cfg.SideStore.Retain(e.head.byteCells(ref.idx))
 
 	return nil
 }
