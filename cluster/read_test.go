@@ -192,7 +192,9 @@ func TestEnumShardAbsentOverHTTP(t *testing.T) {
 			return nil, cluster.ErrShardAbsent
 		}))
 	mux.Handle(cluster.SidePath, cluster.SideHandler(
-		func(context.Context, string) (map[string][]byte, error) { return nil, cluster.ErrShardAbsent }))
+		func(context.Context, string, int64, int64) (map[string][]byte, error) {
+			return nil, cluster.ErrShardAbsent
+		}))
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -205,6 +207,6 @@ func TestEnumShardAbsentOverHTTP(t *testing.T) {
 	_, err = cluster.FetchKeys(ctx, nil, addr, signal.Log, "acme", 0, 0, nil)
 	require.ErrorIs(t, err, cluster.ErrShardAbsent)
 
-	_, err = cluster.FetchSide(ctx, nil, addr, signal.Profile, "acme", nil)
+	_, err = cluster.FetchSide(ctx, nil, addr, signal.Profile, "acme", 0, 0, nil)
 	require.ErrorIs(t, err, cluster.ErrShardAbsent)
 }

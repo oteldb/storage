@@ -89,7 +89,7 @@ func TestProfilesAdapterFlamegraph(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, batches, 1)
 
-	resolver, err := s.ProfileResolver(ctx, "default")
+	resolver, err := s.ProfileResolver(ctx, "default", 0, 0)
 	require.NoError(t, err)
 	require.NotNil(t, resolver)
 
@@ -115,9 +115,9 @@ func TestProfilesAdapterFlamegraph(t *testing.T) {
 	assert.Equal(t, int64(30), main.children["idle"].self)
 
 	// After a flush the symbols live in a part sidecar, not the head; the resolver still resolves
-	// (SideSnapshot unions parts) — content ids are stable across the flush.
+	// — content ids are stable across the flush.
 	require.NoError(t, mustEngine(s.profileEngineFor("default")).Flush(ctx))
-	flushed, err := s.ProfileResolver(ctx, "default")
+	flushed, err := s.ProfileResolver(ctx, "default", 0, 0)
 	require.NoError(t, err)
 
 	var anyStackID []byte

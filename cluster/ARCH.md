@@ -251,9 +251,10 @@ node coordinating a query against its own shards calls the very code that serves
 so a coordinator cannot serve an engine the peer path would have disclaimed. The alternative — a
 placement check followed by a direct engine call — is what makes the answer depend on which node was
 asked, silently and without an error, and it is unreachable by construction only if the local seam
-has no route to the engine that skips the guard. Profile symbols take the same guard with no window:
-the store has no time domain, symbols are interned as samples arrive, so any open Profile gap
-disclaims the whole store rather than serving a snapshot missing whatever the lost head held.
+has no route to the engine that skips the guard. Profile symbols take the same guard over the
+resolver's window: a sample's symbols live in its part (or in the head beside it), so a lost head
+takes them exactly where it takes the samples, and a gap disclaims the symbols wherever it disclaims
+the samples. A whole-store read (zero window) overlaps every gap.
 
 Matchers are opaque Go closures and **not serializable**, so the RPC carries the tenant
 + window and the requester **re-applies the matchers** to the returned superset (which the contract
@@ -360,7 +361,9 @@ shard; reads gather across all N and merge. Policy (retention, RF, downsampling)
 
 Cross-shard reassembly is explicit: trace-by-id runs across every shard (a trace's spans scatter
 across service streams), series listings concatenate, key and value listings union (values re-truncated
-to the limit after the union), and the profile symbol store is unioned (content-addressed ⇒ a plain dedup).
+to the limit after the union), and every shard's profile symbols for the window become resolver layers
+(content-addressed ⇒ no merge; see `../signal/ARCH.md`). A remote owner answers the side RPC with its
+windowed layers unioned into one table set, so the wire carries each symbol once.
 
 ## `rebalance`
 

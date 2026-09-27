@@ -101,22 +101,48 @@ functions 1.6×. Larger tables repeat more: a test-stand part's stacks shrink 8.
 - **Only the disk boundary compresses.** `SymbolStore.Stored` re-frames a table's body under zstd,
   and the engine calls it (`SideStore.Stored`) on exactly what it writes as sidecars: a flush's
   snapshot once per flush, a merge's union once. Everything else — the batch delta, `Encode`, `Union`
-  output, the `SideSnapshot` a resolver is built from — is `AlgorithmNone`. The resolver is rebuilt
-  from the whole tenant store per profile query, so compressing its input would add a full zstd
-  encode per query only to decode it straight back; the in-memory form costs a copy. A delta rides
-  the WAL and replication per ingest batch, where the wire framing already compresses.
+  output, the side RPC's reply — is `AlgorithmNone`: each is decoded straight back, so a zstd encode
+  would buy nothing. A delta rides the WAL and replication per ingest batch, where the wire framing
+  already compresses.
 - **zstd at the default level.** The engine passes the side store no compressor, and its
   `MergeCompression` does not apply at flush, so the table picks its own; the algorithm byte keeps
   it a writer decision. zstd-19 gains 1.5% over the default and `LevelFast` saves 10–20% encode time
   for 3% of the ratio.
 - **The cost is flush and merge encode time.** zstd encodes at 110–270 MB/s against 460–1190 MB/s
-  raw, and decodes at 460–1035 MB/s against 600–1410. A resolver build pays only the decode of
-  flushed parts: `BenchmarkResolverBuild` is no slower than with uncompressed sidecars.
+  raw, and decodes at 460–1035 MB/s against 600–1410. A resolver pays a part's decode once, on a
+  symbol-cache miss.
 - **Decode is bounded by the recorded length.** The body inflates through `DecompressLimit` to
   exactly the raw length in the header, so a corrupt table allocates no more than it claims, and no
   more than its frame can produce: a frame that inflates past the claim fails before decoding.
 - **Version 1 decodes forever and is never written.** It is the same body stored raw, with no
   algorithm or length.
+
+**The resolver reads layers, not a union.** `Storage.ProfileResolver(ctx, tenant, start, end)` builds
+a `Resolver` over `Tables` layers: the live accumulator (its maps copied under the engine lock;
+absorbed entries are never mutated, so the entries are shared), an in-flight flush's snapshot, then
+every part overlapping the window, newest first (`recordengine.Engine.ReadSide`). Symbols carry their
+samples' time domain through the parts that hold them, so a window's resolver resolves every stack
+the window's samples reference and need not resolve any other.
+
+- **A part decodes once.** Its `Tables` come from a `SymbolCache` keyed by part prefix — immutable,
+  so never invalidated — bounded by decoded bytes (`Options.ProfileSymbolCacheBytes`, 128 MiB by
+  default) and built on otter like the backend read cache. A decoded entry slices its table's
+  decompressed body, so a cached part costs its raw body plus about 48 B per entry for the map.
+- **Merging layers per query is the cost being avoided.** A union of N cached parts is still N ×
+  entries map operations on every call, and on a store whose every part repeats the working set that
+  is nearly the whole decode again. A lookup instead probes the layers in order, trying the stack's
+  own layer first for its frames: a part holds the closure of every stack it holds, so each frame is
+  one probe. Only the stack probe walks the layers — one probe when the newest layer holds it, one
+  per newer layer when only an old part does. Content addressing makes any layer's entry for an id
+  identical, so the order sets the cost, never the answer.
+- **Measured** (`BenchmarkProfileResolver`, parts that each repeat a 2000-stack working set). A
+  whole-store build over 32 parts costs 13 µs warm and 6 ms with the cache off, against 38 ms for a
+  union decoded, re-encoded and decoded again; a window holding one part costs 0.6 µs warm. The hint
+  keeps resolution flat in the layer count: `cpu.pprof`'s 5067 stacks resolve in about 15 ms over one
+  layer and over 32 copies of it alike.
+- **Cluster.** Each shard contributes its layers. A remote owner's reply is its window's layers
+  unioned into one table set (one copy of each symbol on the wire), decoded into one layer and not
+  cached, since it includes the owner's head.
 
 ## `otlp/pdataconv`
 

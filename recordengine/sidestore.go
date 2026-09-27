@@ -1,7 +1,9 @@
 package recordengine
 
 import (
+	"cmp"
 	"context"
+	"slices"
 
 	"github.com/go-faster/errors"
 
@@ -79,4 +81,77 @@ func loadSidecars(ctx context.Context, b backend.Backend, prefix string, names [
 	}
 
 	return out, nil
+}
+
+// SidePart is one readable part's side data.
+type SidePart struct {
+	// Key is the part prefix. No other part reuses it and a part never changes, so it keys a cache
+	// of the decoded side data.
+	Key string
+
+	be    backend.Backend
+	names []string
+}
+
+// Load reads the part's sidecars, skipping any that are absent.
+func (p SidePart) Load(ctx context.Context) (map[string][]byte, error) {
+	return loadSidecars(ctx, p.be, p.Key, p.names)
+}
+
+// SideRead is the side data a read over a window needs, besides the live accumulator. Its parts stay
+// readable until [SideRead.Release].
+type SideRead struct {
+	// Flushing is the side snapshot of the records an in-flight flush detached: they are fetchable
+	// and in no part yet. nil when no flush is in flight.
+	Flushing map[string][]byte
+	// Parts are the readable parts overlapping the window, newest first.
+	Parts []SidePart
+
+	pinned []*part
+}
+
+// Release lets a merge or retention reclaim the parts. Idempotent.
+func (r *SideRead) Release() {
+	for _, p := range r.pinned {
+		p.release()
+	}
+
+	r.pinned = nil
+}
+
+// ReadSide pins the side data a read over [start, end] needs (a zero start AND end selects every
+// part) and calls head with the live side store under the engine's read lock, where the caller
+// snapshots the unflushed side data; head must not retain it. The read is empty and head is not
+// called when the engine has no side store. Safe for concurrent use.
+func (e *Engine) ReadSide(start, end int64, head func(live SideStore)) *SideRead {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	r := &SideRead{}
+	if e.cfg.SideStore == nil {
+		return r
+	}
+
+	head(e.cfg.SideStore)
+	r.Flushing = e.flushingSide
+
+	for _, p := range e.readablePartsLocked() {
+		if partInWindow(p, start, end) {
+			p.acquire()
+			r.pinned = append(r.pinned, p)
+		}
+	}
+
+	slices.SortFunc(r.pinned, func(a, b *part) int {
+		return cmp.Or(cmp.Compare(b.maxTime, a.maxTime), cmp.Compare(b.prefix, a.prefix))
+	})
+
+	names := e.cfg.SideStore.Names()
+	r.Parts = make([]SidePart, len(r.pinned))
+
+	for i, p := range r.pinned {
+		r.Parts[i] = SidePart{Key: p.prefix, be: e.cfg.Backend, names: names}
+	}
+
+	return r
 }

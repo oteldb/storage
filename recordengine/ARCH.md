@@ -604,14 +604,23 @@ riding the part lifecycle: absorbed into a live accumulator, written as sidecars
 on merge (content addressing makes the union a plain dedup with no id remap), and **restored** into the
 accumulator when a flush fails. Profiles' symbol store is the first user; nil for logs/traces.
 
-`Encode` and `Union` return the in-memory form, which `SideSnapshot` hands to a resolver per
-query; `SideStore.Stored` converts to the on-disk form, and the engine applies it only to what
-`writeSidecars` writes: the flush snapshot once per flush (shared by every part a split produces)
-and the merged union. A store that compresses its sidecars thus pays that encode at flush and
-merge, never on the query path.
+`Encode` and `Union` return the in-memory form; `SideStore.Stored` converts to the on-disk form,
+and the engine applies it only to what `writeSidecars` writes: the flush snapshot once per flush
+(shared by every part a split produces) and the merged union. A store that compresses its sidecars
+thus pays that encode at flush and merge, never on the query path.
+
+**Reads hand out the pieces, not a union.** `Engine.ReadSide(start, end, head)` calls `head` with the
+live store under the read lock (the signal snapshots it in its own form), and returns the in-flight
+flush's snapshot plus the parts overlapping the window, newest first, acquired like a fetch's parts
+so a merge cannot reclaim them before `Release`. Sidecar reads happen off the lock. Each part's side
+data is self-sufficient — flush writes the accumulator every one of its records' batches was absorbed
+into, and merge unions its inputs whole — so a window's parts plus the head and the flush snapshot
+hold every entry the window's records reference. A `SidePart.Key` is the part prefix: unique and
+immutable, it keys a cache of the decoded side data without invalidation. The engine never unions on
+the read path; merging N parts' tables per query is exactly the cost a signal-side cache avoids.
 
 **Symbols follow their records' visibility.** A record is in exactly one of head / `e.flushing` / a
-published part, and `Engine.SideSnapshot` must union the side data of all three the same way a fetch
+published part, and `Engine.ReadSide` must return the side data of all three the same way a fetch
 reads all three. The flush's `Encode`+`Reset` at detach hands the accumulator's snapshot to
 `e.flushingSide`, cleared under the same lock that publishes the part (whose sidecars now carry it) or
 that restores it into the accumulator on abort. Without that hop the snapshot lives only in a

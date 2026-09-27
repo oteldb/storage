@@ -30,6 +30,7 @@ import (
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
+	"github.com/oteldb/storage/signal/profile"
 	"github.com/oteldb/storage/tenant"
 	"github.com/oteldb/storage/wal"
 )
@@ -72,6 +73,8 @@ type Storage struct {
 	gaps  map[gapKey]readGap
 
 	queryCache scale.Cache // shared results cache for Fetcher; nil ⇒ caching disabled
+
+	profileSymbols *profile.SymbolCache // decoded symbol tables per part; nil ⇒ decoded per call
 
 	// decodeBudget is the process-wide decode-memory admission budget ([Options.DecodeMemoryBytes]),
 	// shared by every tenant engine so concurrent queries cannot multiply resident decoded bytes
@@ -184,6 +187,8 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	if o.QueryCacheEntries > 0 {
 		s.queryCache = scale.NewMemoryCache(o.QueryCacheEntries)
 	}
+
+	s.profileSymbols = profile.NewSymbolCache(o.profileSymbolCacheBytes())
 
 	// Recover previously-flushed data from a durable backend so a fresh process serves it.
 	if err := s.recover(ctx); err != nil {

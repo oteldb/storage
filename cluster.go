@@ -1138,18 +1138,31 @@ func (s *Storage) localValues(ctx context.Context, r cluster.ValuesRequest) ([][
 	})
 }
 
-// localProfileSymbols serves a peer's profile symbol store from the local engine. The store has no
-// time domain, so an open Profile read gap disclaims it outright: symbols are interned as samples
-// are ingested, and a node that lost its unflushed head lost the symbols that came with it.
-func (s *Storage) localProfileSymbols(ctx context.Context, tenant string) (map[string][]byte, error) {
-	tid := s.normalizeTenant(signal.TenantID(tenant))
-
-	eng, ok := s.lookupProfileEngine(tid)
-	if err := s.canAnswer(ctx, rpcOpSide, signal.Profile, tid, ok, 0, 0); err != nil {
+// localProfileSymbols serves a peer's profile symbols for [start, end] from the local engine,
+// unioned into one set of tables.
+func (s *Storage) localProfileSymbols(ctx context.Context, tenant string, start, end int64) (map[string][]byte, error) {
+	layers, err := s.localProfileLayers(ctx, signal.TenantID(tenant), start, end)
+	if err != nil {
 		return nil, err
 	}
 
-	return eng.SideSnapshot(ctx)
+	return profile.EncodeTables(layers), nil
+}
+
+// localProfileLayers returns the local engine's profile symbols for [start, end]. Symbols share
+// their samples' parts, so a read gap disclaims them for the windows it overlaps, as it does the
+// samples: a node that lost its unflushed head lost the symbols that came with it.
+func (s *Storage) localProfileLayers(
+	ctx context.Context, tenant signal.TenantID, start, end int64,
+) ([]*profile.Tables, error) {
+	tid := s.normalizeTenant(tenant)
+
+	eng, ok := s.lookupProfileEngine(tid)
+	if err := s.canAnswer(ctx, rpcOpSide, signal.Profile, tid, ok, start, end); err != nil {
+		return nil, err
+	}
+
+	return s.profileSymbolLayers(ctx, eng, start, end)
 }
 
 // clusterSeries lists a record signal's streams for a tenant in cluster mode: locally if this node
@@ -1341,50 +1354,61 @@ func (s *Storage) shardValues(ctx context.Context, r cluster.ValuesRequest) ([][
 	})
 }
 
-// clusterProfileSymbols returns a tenant's symbol-store tables in cluster mode: locally if owned,
-// else from an owner (failover). Each owner is a complete replica (symbols ride the write path).
-func (s *Storage) clusterProfileSymbols(ctx context.Context, tid signal.TenantID) (map[string][]byte, error) {
+// clusterProfileSymbols returns a tenant's profile symbols for [start, end] in cluster mode, one
+// or more layers per shard. A stack's symbols live in whichever shard ingested it, so every shard
+// contributes; content addressing lets the resolver read the layers without merging them.
+func (s *Storage) clusterProfileSymbols(
+	ctx context.Context, tid signal.TenantID, start, end int64,
+) ([]*profile.Tables, error) {
 	tenant := s.normalizeTenant(tid)
 	n := s.cluster.shardCount()
 
-	// A stack's symbols live in whichever shard ingested it, so collect every shard's symbol tables
-	// and union them — content-addressing makes the union a plain dedup, no id remap. A flamegraph
-	// over samples from several shards then resolves every stack_id.
-	parts := make([]map[string][]byte, 0, n)
+	var layers []*profile.Tables
 
 	for idx := range n {
-		tables, err := s.shardSymbols(ctx, shardKeyOf(tenant, idx, n))
+		shard, err := s.shardSymbols(ctx, shardKeyOf(tenant, idx, n), start, end)
 		if err != nil {
 			return nil, err
 		}
 
-		if len(tables) > 0 {
-			parts = append(parts, tables)
-		}
+		layers = append(layers, shard...)
 	}
 
-	return profile.NewSymbolStore().Union(parts)
+	return layers, nil
 }
 
-// shardSymbols returns one profile shard's unioned symbol tables: locally if owned, else hedged
-// across its remote owners (each a complete replica — symbols ride the write path).
-func (s *Storage) shardSymbols(ctx context.Context, shardKey signal.TenantID) (map[string][]byte, error) {
+// shardSymbols returns one profile shard's symbols for [start, end]: the cached local layers if
+// owned, else one owner's union, hedged across the remote owners (each a complete replica — symbols
+// ride the write path).
+func (s *Storage) shardSymbols(
+	ctx context.Context, shardKey signal.TenantID, start, end int64,
+) ([]*profile.Tables, error) {
 	local, remotes := s.shardPlacement(ctx, rpcOpSide, signal.Profile, shardKey)
 
 	var selfDisclaim error
 
 	if local {
-		tables, err := s.localProfileSymbols(ctx, string(shardKey))
+		layers, err := s.localProfileLayers(ctx, shardKey, start, end)
 		if !disclaimedLocally(err) {
-			return tables, err
+			return layers, err
 		}
 
 		selfDisclaim = err
 	}
 
-	return hedgeOwners(ctx, s, rpcOpSide, remotes, selfDisclaim, func(ctx context.Context, addr string) (map[string][]byte, error) {
-		return cluster.FetchSide(ctx, s.cluster.httpc, addr, signal.Profile, string(shardKey), s.clusterOpts...)
+	tables, err := hedgeOwners(ctx, s, rpcOpSide, remotes, selfDisclaim, func(ctx context.Context, addr string) (map[string][]byte, error) {
+		return cluster.FetchSide(ctx, s.cluster.httpc, addr, signal.Profile, string(shardKey), start, end, s.clusterOpts...)
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	remote, err := profile.DecodeTables(tables)
+	if err != nil {
+		return nil, errors.Wrapf(err, "decode shard %q symbols", shardKey)
+	}
+
+	return []*profile.Tables{remote}, nil
 }
 
 // clusterRecordFetcherFor returns a record signal's read seam for one tenant in cluster mode. A

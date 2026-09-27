@@ -12,6 +12,7 @@ import (
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/signal/profile"
 )
 
 // dropMetricEngine replaces a node's engine for the shard with a freshly built one over the same
@@ -102,8 +103,8 @@ func TestAggregateDoesNotDivergeAcrossCoordinators(t *testing.T) {
 // TestProfileSymbolsDoNotDivergeAcrossCoordinators: profile symbols are interned into the head as
 // samples arrive, so a node that lost its head lost them too — yet the symbol RPC consulted no gap
 // and served the truncated store as authoritative, resolving a flamegraph's stacks to nothing while
-// the samples themselves failed over correctly. The store has no time domain, so the guard disclaims
-// it outright.
+// the samples themselves failed over correctly. A whole-store read overlaps every gap, so the guard
+// disclaims it.
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
 func TestProfileSymbolsDoNotDivergeAcrossCoordinators(t *testing.T) {
@@ -121,17 +122,18 @@ func TestProfileSymbolsDoNotDivergeAcrossCoordinators(t *testing.T) {
 	_, err := a.WriteProfiles(ctx, profileBatch("api", 1000, sampleSpec{"cpu", "nanoseconds", 50}))
 	require.NoError(t, err)
 
-	want, err := b.clusterProfileSymbols(ctx, "default")
+	want, err := b.clusterProfileSymbols(ctx, "default", 0, 0)
 	require.NoError(t, err)
 	require.NotEmpty(t, want, "the peer coordinator sees the replicated symbol store")
 
 	dropProfileEngine(t, a, shardKeyOf("default", 0, a.cluster.shardCount()))
 
-	got, err := a.clusterProfileSymbols(ctx, "default")
+	got, err := a.clusterProfileSymbols(ctx, "default", 0, 0)
 	require.NoError(t, err)
-	assert.Equal(t, want, got, "the restarted coordinator must serve the peer's symbol store")
+	assert.Equal(t, profile.EncodeTables(want), profile.EncodeTables(got),
+		"the restarted coordinator must serve the peer's symbol store")
 
-	res, err := a.ProfileResolver(ctx, "default")
+	res, err := a.ProfileResolver(ctx, "default", 0, 0)
 	require.NoError(t, err)
 	assert.NotNil(t, res)
 }

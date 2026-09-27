@@ -4,8 +4,8 @@ import (
 	"testing"
 )
 
-// BenchmarkResolverBuild is the per-query resolver path: union the head with a flushed part's
-// sidecars as the backend returns them, then decode the union into a resolver.
+// BenchmarkResolverBuild is the per-query resolver path on a cache miss: snapshot the head, decode a
+// flushed part's sidecars as the backend returns them, and layer the two into a resolver.
 func BenchmarkResolverBuild(b *testing.B) {
 	corpus := pprofCorpus(b)
 
@@ -24,25 +24,29 @@ func BenchmarkResolverBuild(b *testing.B) {
 	part := storedSidecars(b, s)
 
 	for _, bc := range []struct {
-		name  string
-		parts func() []map[string][]byte
+		name string
+		part bool
 	}{
-		{"Head", func() []map[string][]byte { return []map[string][]byte{s.Encode()} }},
-		{"HeadAndPart", func() []map[string][]byte { return []map[string][]byte{s.Encode(), part} }},
+		{"Head", false},
+		{"HeadAndPart", true},
 	} {
 		b.Run(bc.name, func(b *testing.B) {
 			b.SetBytes(logical)
 			b.ReportAllocs()
 
 			for b.Loop() {
-				union, err := NewSymbolStore().Union(bc.parts())
-				if err != nil {
-					b.Fatal(err)
+				layers := []*Tables{s.Tables()}
+
+				if bc.part {
+					t, err := DecodeTables(part)
+					if err != nil {
+						b.Fatal(err)
+					}
+
+					layers = append(layers, t)
 				}
 
-				if _, err := NewResolver(union); err != nil {
-					b.Fatal(err)
-				}
+				NewResolverFrom(layers...)
 			}
 		})
 	}

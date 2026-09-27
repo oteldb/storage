@@ -39,8 +39,9 @@ type SeriesFunc func(
 	ctx context.Context, sig signal.Signal, tenant string, start, end int64, matchers []fetch.Matcher,
 ) ([]signal.Series, error)
 
-// SideFunc returns the local store's side-store tables (name → encoded payload) for a tenant.
-type SideFunc func(ctx context.Context, tenant string) (map[string][]byte, error)
+// SideFunc returns the local store's side-store tables (name → encoded payload) for a tenant, scoped
+// to the window (a zero window selects all).
+type SideFunc func(ctx context.Context, tenant string, start, end int64) (map[string][]byte, error)
 
 // KeysFunc returns the distinct record-attribute keys (with their scope bitset) present in a
 // signal+tenant's records within the window.
@@ -265,7 +266,7 @@ func SideHandler(fn SideFunc, opts ...Option) http.Handler {
 		defer func() { endSpan(span, err) }()
 
 		var tables map[string][]byte
-		tables, err = fn(ctx, r.tenant)
+		tables, err = fn(ctx, r.tenant, r.start, r.end)
 		if err != nil {
 			writeRPCError(w, err)
 
@@ -366,15 +367,16 @@ func FetchKeys(
 	return keys, nil
 }
 
-// FetchSide returns a peer's side-store tables for the signal+tenant. Without [WithTracerProvider]
-// its spans report through a no-op tracer.
+// FetchSide returns a peer's side-store tables for the signal+tenant within the window (a zero
+// window selects all). Without [WithTracerProvider] its spans report through a no-op tracer.
 func FetchSide(
-	ctx context.Context, client *http.Client, addr string, sig signal.Signal, tenant string, opts ...Option,
+	ctx context.Context, client *http.Client, addr string, sig signal.Signal, tenant string, start, end int64,
+	opts ...Option,
 ) (_ map[string][]byte, err error) {
 	ctx, span := enumClientSpan(ctx, resolveOpts(opts), "cluster.side", addr, sig)
 	defer func() { endSpan(span, err) }()
 
-	body, err := postEnum(ctx, client, addr, SidePath, EncodeFetchRequest(sig, tenant, 0, 0, nil))
+	body, err := postEnum(ctx, client, addr, SidePath, EncodeFetchRequest(sig, tenant, start, end, nil))
 	if err != nil {
 		return nil, err
 	}

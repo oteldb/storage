@@ -93,7 +93,7 @@ func (p *peer) serve(t *testing.T) string {
 
 			return p.values, nil
 		}))
-	mux.Handle(cluster.SidePath, cluster.SideHandler(func(context.Context, string) (map[string][]byte, error) {
+	mux.Handle(cluster.SidePath, cluster.SideHandler(func(context.Context, string, int64, int64) (map[string][]byte, error) {
 		if p.absent {
 			return nil, cluster.ErrShardAbsent
 		}
@@ -223,7 +223,7 @@ func TestEnumerationFailOver(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, [][]byte{[]byte("GET")}, values)
 
-	side, err := r.Side(t.Context(), signal.Profile, "acme")
+	side, err := r.Side(t.Context(), signal.Profile, "acme", 0, 0)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("abc"), side["stacks"])
 }
@@ -265,7 +265,7 @@ func TestReadsEmptyWhenEveryOwnerDisclaims(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, values)
 
-	side, err := r.Side(t.Context(), signal.Profile, "acme")
+	side, err := r.Side(t.Context(), signal.Profile, "acme", 0, 0)
 	require.NoError(t, err)
 	assert.Empty(t, side)
 

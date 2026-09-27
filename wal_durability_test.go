@@ -113,7 +113,7 @@ func TestWALRecoversUnflushedProfiles(t *testing.T) {
 	assert.Equal(t, []int64{42}, profValues(batches[0]))
 
 	// Symbol store recovered (the side frames replayed), so the stack resolves to its frames.
-	resolver, err := s2.ProfileResolver(ctx, "default")
+	resolver, err := s2.ProfileResolver(ctx, "default", 0, 0)
 	require.NoError(t, err)
 	stacks, _ := batches[0].Column(profile.ColStackID)
 	frames := resolver.Resolve(stacks.Bytes[0])
