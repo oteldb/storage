@@ -1,13 +1,13 @@
 package bucketindex_test
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend/bucketindex"
-	"github.com/oteldb/storage/internal/reproduce"
 )
 
 func members3(name string, first uint64, claimed bucketindex.Interval, level uint32) []bucketindex.Entry {
@@ -36,7 +36,6 @@ func prefixSet(entries ...bucketindex.Entry) map[string]struct{} {
 // ancestry at a higher level holds every member's rows, though it contains none of their own blocks.
 func TestSuccessorOfAGroupSubsumesEveryMember(t *testing.T) {
 	t.Parallel()
-	reproduce.Unfixed(t, 721, "a part covering a group's claim supersedes none of its members")
 
 	group := members3("f", 10, bucketindex.Blocks(1), 1)
 	succ := bucketindex.Entry{Prefix: "s", Blocks: bucketindex.Interval{Min: 1, Max: 2}, Level: 2}
@@ -90,7 +89,7 @@ func TestSuccessorOfAGroupSubsumesEveryMember(t *testing.T) {
 
 		// f2 was merged with block 7 and split again, into g over 20..22.
 		inner := members3("g", 20, bucketindex.Blocks(7, 12), 2)
-		live := append(group[:2:2], inner...)
+		live := slices.Concat(group[:2], inner)
 		succ := bucketindex.Entry{Prefix: "s", Blocks: bucketindex.Blocks(1, 2, 7), Level: 3}
 
 		assert.Equal(t, prefixSet(live...), bucketindex.Subsumed(live, []bucketindex.Entry{succ}),

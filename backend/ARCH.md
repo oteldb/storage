@@ -193,6 +193,16 @@ a demonstration.
   into an ordinary interval, so the lineage rejoins rather than staying severed forever.
   A group answer is deliberately *partial*: `Satisfying` names one member, and `Index.Missing`
   names the members a repair still has to fetch, by block.
+  **A part holding a group's whole claimed ancestry holds every member's rows**, though it contains
+  none of their fresh blocks, so at a higher level it supersedes each member (`Entry.Supersedes`,
+  from the member's own claim) and satisfies a want for one. `Lineage` relates identities over a
+  whole set of claims: `Subsumes` follows a group split again through the outer one, and
+  `Overlaps` says whether two parts may share rows. A split partitions what it consumed, so
+  descendants of different members of one group are disjoint; descendants of one ancestor through
+  *different* groups — two replicas that split it apart differently — may overlap, and nothing
+  short of reading the rows says how. A part covering only some of a group's claim therefore
+  overlaps every member while replacing none; no single-part rule resolves it, and repair refuses
+  to publish one beside the other (`engine/ARCH.md`, "Repair").
   **Allocation is the shard owner's alone**: `Index.NextBlock` is one above `AllocatedBlocks`, the
   persisted high-water mark, and above every block the live entries, wants and group runs still
   name. The mark is what keeps identity unique over a shard's *whole life* rather than over its

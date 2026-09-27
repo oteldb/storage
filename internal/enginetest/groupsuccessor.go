@@ -11,7 +11,6 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
-	"github.com/oteldb/storage/internal/reproduce"
 )
 
 // splitGroupBesideSuccessorIsRepaired is #721: one repair brings back a complete split group and a
@@ -20,16 +19,16 @@ import (
 // alone, or every row of the group is live twice and the next merge persists the duplicates.
 func splitGroupBesideSuccessorIsRepaired(t *testing.T, k Kind) {
 	t.Helper()
-	reproduce.Unfixed(t, 721, "the group and the successor covering its claim are both published")
 
 	ctx := context.Background()
 	s := k.loseSplitStraddler(t, 3)
 
-	var other bucketindex.Entry
-	for _, ent := range k.loadIndex(t, s.be).Entries {
-		if ent.Prefix != s.lost.Prefix {
-			other = ent
-		}
+	entries := k.loadIndex(t, s.be).Entries
+	require.Len(t, entries, 2)
+
+	other := entries[0]
+	if other.Prefix == s.lost.Prefix {
+		other = entries[1]
 	}
 
 	_, id, _ := strings.Cut(other.Prefix, k.Prefix+"/")
@@ -47,9 +46,9 @@ func splitGroupBesideSuccessorIsRepaired(t *testing.T, k Kind) {
 	succ.Blocks = s.lost.Blocks.Union(other.Blocks)
 	succ.Level = 2
 
-	for _, f := range s.fragments {
-		require.True(t, succ.Blocks.Contains(f.Claim.Blocks), "the successor holds the group's whole ancestry")
-		require.Greater(t, succ.Level, f.Level)
+	for i := range s.fragments {
+		require.True(t, succ.Blocks.Contains(s.fragments[i].Claim.Blocks), "the successor holds the group's whole ancestry")
+		require.Greater(t, succ.Level, s.fragments[i].Level)
 	}
 
 	fromPeer := s.answer(t, k, nil)
@@ -71,8 +70,9 @@ func splitGroupBesideSuccessorIsRepaired(t *testing.T, k Kind) {
 	assert.Zero(t, r.LostParts())
 	assert.Equal(t, int64(1), r.RepairStats().Fetched, "only the successor is published")
 
-	for _, f := range s.fragments {
-		assert.NotContains(t, prefixes(k.loadIndex(t, s.be).Entries), f.Prefix, "no member is live beside the successor")
+	live := prefixes(k.loadIndex(t, s.be).Entries)
+	for i := range s.fragments {
+		assert.NotContains(t, live, s.fragments[i].Prefix, "no member is live beside the successor")
 	}
 
 	assert.Equal(t, s.want, rows(t, r, apiStream), "every lost row is back once")
