@@ -20,6 +20,7 @@ import (
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/internal/diskguard"
 	"github.com/oteldb/storage/internal/obs"
+	"github.com/oteldb/storage/internal/repair"
 	"github.com/oteldb/storage/pool"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/profile"
@@ -205,12 +206,9 @@ type Engine struct {
 	// sealing is disabled). [Engine.MergeShape] reports and reasons against it because deriving the
 	// cap reads the backend's free space, which an introspection call must not do.
 	lastMergeCap atomic.Int64
-	// repairGate serializes this engine's repair passes: [Engine.MergeWith] is callable
-	// concurrently, and two passes over the same wants copy the same part from a peer twice and
-	// count both fetches though only one commit lands. A buffered channel rather than a mutex so a
-	// waiter honors ctx cancellation; repair's own gate rather than flushMu so a remote fetch
-	// never blocks a flush.
-	repairGate chan struct{}
+	// repairs is what repair keeps across passes: its single-flight gate, absence evidence and
+	// lifetime counts.
+	repairs repair.State
 	// mergeRunning is true while a [Engine.MergeWith] is executing (introspection liveness; see
 	// [Engine.MergeRunning]). Set/cleared around the merge, not held during it.
 	mergeRunning atomic.Bool
@@ -266,11 +264,6 @@ type Engine struct {
 	// the next repair pass all see them. They are kept out of e.parts — a hole names no objects
 	// and there is nothing to open.
 	holes []bucketindex.Entry
-	// holeEvidence counts, per want prefix, the consecutive repair attempts that concluded
-	// definitive absence over the shard's complete owner set; any other outcome resets it. It is
-	// deliberately in memory: a restart forgets the evidence and repair has to earn it again,
-	// which errs toward leaving a want outstanding rather than toward inventing a hole.
-	holeEvidence map[string]int
 	// lostParts is the index's monotone data-loss counter, carried across commits and raised to a
 	// rival's on rebase, so it is a cluster-visible fact and not a level a restart clears.
 	lostParts uint64
@@ -293,9 +286,6 @@ type Engine struct {
 	// pendingBlocks are the block identities the index under construction chose for the parts that
 	// do not have one yet. Applied only by the commit that lands — see [blockAssignment].
 	pendingBlocks []blockAssignment
-	// repaired counts what repair did, for the operator surface and for tests: a want cannot be
-	// left silently outstanding.
-	repaired RepairStats
 	// indexVersion is the backend version of the bucket index this engine last read or committed —
 	// the token its next commit conditions on, so a rewrite that another writer got in front of is
 	// refused rather than silently overwriting it (#392).
@@ -365,7 +355,6 @@ func New(cfg Config) *Engine {
 	}
 
 	e := &Engine{cfg: cfg, head: newHead(), tsCodec: chunk.CodecDoDScaled, mergeReadWindow: defaultMergeReadWindow}
-	e.repairGate = make(chan struct{}, 1)
 	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
 	// The decode free list covers the peak in-flight decoded parts: prefetch can decode
 	// prefetchConcurrency parts concurrently per fetch, and several fetches overlap, so a

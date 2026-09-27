@@ -272,7 +272,7 @@ Invariants both engines must hold (part lifecycle, index commit, repair and hole
 in `internal/enginetest` and run against each engine through an adapter in its external test
 package, so the suite imports neither engine; `mergestreamtest` does the same for the merge. The repair
 pass itself — target selection, the rounds that complete a split group, absence evidence and which
-parts a commit may publish — is one implementation, `internal/repair`, behind each engine's commit.
+parts a commit may publish — is one implementation, `internal/repair`, driving each engine through a thin `repair.Host` adapter.
 
 ---
 

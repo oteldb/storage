@@ -768,8 +768,9 @@ every split group the unit's parts belong to that neither the local index nor th
 holds. Those members are asked for by block rather than by prefix (no prefix is known for them), in
 further fetch rounds of the same pass — one `PartFetcher` call per round for every unit — until no
 unit lacks a member it has not asked for. A member that was itself split again pulls in its own
-group the same way, one round later. The pass logic is shared by both engines (`internal/repair`);
-each engine keeps only the part opening and the commit.
+group the same way, one round later. The pass, commit included, is shared by both engines (`internal/repair`,
+`repair.Drive`); each engine supplies only a `repair.Host` adapter over its private part set, locks
+and index commit.
 
 **A unit is committed whole or not at all** (`repair.Admit`). A fragment committed beside the
 ancestors it partly duplicates, with nothing yet able to retire them, has those rows read twice. On
@@ -868,7 +869,7 @@ would spend the maintenance cycle in the network and never compact; a shard need
 handful of parts back is past what part-by-part repair is for. The *serving* side, where the real
 budget belongs (see `cluster/ARCH.md`), is uncapped.
 
-A pass is single-flight, gated by `repairGate` — its own gate, not `flushMu`. `MergeWith` is
+A pass is single-flight, gated by `repair.State` — its own gate, not `flushMu`. `MergeWith` is
 callable concurrently (an operator's `Admin.MaintainNow` alongside the maintenance loop), and two
 passes snapshotting the same wants copy the same part from a peer twice into one object prefix.
 Only one of them commits — the winner's parts already carry the prefix — so the index stays right,
