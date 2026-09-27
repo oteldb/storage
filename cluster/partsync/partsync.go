@@ -711,17 +711,17 @@ func partOf(key, enginePrefix string) string {
 		return part
 	}
 
-	rest, ok := strings.CutPrefix(key, enginePrefix+"/")
-	if !ok {
+	n := len(enginePrefix)
+	if len(key) <= n || key[n] != '/' || key[:n] != enginePrefix {
 		return ""
 	}
 
-	seg, _, ok := strings.Cut(rest, "/")
-	if !ok {
+	seg := strings.IndexByte(key[n+1:], '/')
+	if seg < 0 {
 		return "" // a direct child of the engine prefix is a sidecar, not a part.
 	}
 
-	return enginePrefix + "/" + seg
+	return key[:n+1+seg]
 }
 
 // livePartSet is the set of part prefixes prune must protect: the peer's index when that index
@@ -1112,14 +1112,17 @@ func (s *Syncer) prune(ctx context.Context, st *Stats, enginePrefix string, keep
 	return nil
 }
 
-// livePart reports whether key belongs to a part still listed in the index. A shard key
-// (`{part}/ecshard/{slot}/{obj}`) is checked by its part prefix; any other key under a live
-// part prefix also qualifies. A key belonging to no live part (superseded by a merge) is not
-// protected and falls through to pruning.
 // shardMarker separates a part prefix from a shard slot in an erasure-coded shard key (kept in
 // sync with the cluster/ec layout).
 const shardMarker = "/ecshard/"
 
+// livePart reports whether key belongs to a part still listed in the index. A shard key
+// (`{part}/ecshard/{slot}/{obj}`) is checked by its part prefix; any other key under a live
+// part prefix also qualifies. A key belonging to no live part (superseded by a merge) is not
+// protected and falls through to pruning.
+//
+// prune calls this for every local object, so it probes the set once per '/' in key rather than
+// scanning the set per key.
 func livePart(key string, liveParts map[string]struct{}) bool {
 	if part, _, ok := strings.Cut(key, shardMarker); ok {
 		_, live := liveParts[part]
@@ -1127,8 +1130,12 @@ func livePart(key string, liveParts map[string]struct{}) bool {
 		return live
 	}
 
-	for part := range liveParts {
-		if strings.HasPrefix(key, part+"/") {
+	for i := range len(key) {
+		if key[i] != '/' {
+			continue
+		}
+
+		if _, ok := liveParts[key[:i]]; ok {
 			return true
 		}
 	}
