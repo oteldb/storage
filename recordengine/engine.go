@@ -195,6 +195,10 @@ type Engine struct {
 	// trim to drop or a flush to write. Set by [Engine.absorbSideLocked] and a flush's restore, cleared
 	// when the accumulator is reset or retained.
 	sideAbsorbed bool
+	// sideStray reports that the accumulator may hold entries no head record references even on an
+	// owner: a delta absorbed by a write that rejected records, or replayed without its write's
+	// admission decision. The next flush retains the accumulator to the head before snapshotting it.
+	sideStray bool
 	// space latches disk pressure: a flush that finds the backend short of bytes or inodes (or one
 	// that gets ENOSPC anyway) closes the ingest path until a later flush finds room. Without it a
 	// full disk is invisible — the write is acked, the flush fails, and the head grows behind it.
@@ -348,7 +352,8 @@ type Batch struct {
 	Ints     [][]int64  // len == schema int count; Ints[k][row]
 	Bytes    [][][]byte // len == schema byte count; Bytes[k][row]
 	// Side is an optional encoded side-store delta (the content-addressed symbols this batch's
-	// records reference) absorbed by [Config.SideStore]. nil when the engine has no side store.
+	// records reference, and nothing else: a fully accepted batch's delta is flushed without a
+	// reachability walk) absorbed by [Config.SideStore]. nil when the engine has no side store.
 	Side []byte
 }
 
@@ -870,6 +875,12 @@ func (e *Engine) Reset(ctx context.Context) error {
 	e.flushing = nil // discarded with the head: Reset drops the records, it does not flush them
 	e.flushingSide = nil
 
+	if e.cfg.SideStore != nil {
+		e.cfg.SideStore.Reset()
+	}
+
+	e.sideAbsorbed, e.sideStray = false, false
+
 	if e.cfg.Backend == nil {
 		e.parts, e.retiring = nil, nil
 		e.mu.Unlock()
@@ -955,6 +966,31 @@ func (e *Engine) HeadRecordCount() int {
 	return n
 }
 
+// settleSideLocked drops the accumulated entries no head record references before a flush snapshots
+// the accumulator: every entry when the head is empty, and whatever a retain walk does not reach when
+// a rejected or replayed delta may have left strays. Caller holds e.mu.
+func (e *Engine) settleSideLocked() error {
+	if e.cfg.SideStore == nil {
+		return nil
+	}
+
+	if !e.head.hasRows() {
+		if e.sideAbsorbed {
+			e.cfg.SideStore.Reset()
+			e.sideAbsorbed = false
+			e.sideStray = false
+		}
+
+		return nil
+	}
+
+	if e.sideStray {
+		return e.retainSideLocked()
+	}
+
+	return nil
+}
+
 // absorbSideLocked is the only way a delta enters the side store. Caller holds e.mu.
 func (e *Engine) absorbSideLocked(delta []byte) error {
 	e.sideAbsorbed = true
@@ -999,6 +1035,8 @@ func (e *Engine) replayHandlers() wal.Handlers {
 			if e.cfg.SideStore == nil {
 				return nil
 			}
+
+			e.sideStray = true
 
 			return e.absorbSideLocked(payload)
 		},
@@ -1354,13 +1392,15 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	// a concurrent append's symbols aren't lost by the Reset). Part ids are minted per part below, as
 	// the parts are written.
 	e.mu.Lock()
+
+	if err := e.settleSideLocked(); err != nil {
+		e.mu.Unlock()
+
+		return 0, 0, err
+	}
+
 	detached, detachedBytes := e.head.detach()
 	if detached == nil {
-		if e.sideAbsorbed && e.cfg.SideStore != nil {
-			e.cfg.SideStore.Reset() // an empty head references nothing; only rejected writes' deltas remain
-			e.sideAbsorbed = false
-		}
-
 		e.mu.Unlock()
 		e.reclaimRetired(ctx) // nothing to flush, but still sweep pending deletions
 
@@ -1401,6 +1441,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		side = e.cfg.SideStore.Encode()
 		e.cfg.SideStore.Reset()
 		e.sideAbsorbed = false
+		e.sideStray = false
 		e.flushingSide = side
 	}
 

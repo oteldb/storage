@@ -46,8 +46,9 @@ type SideStore interface {
 	// may produce). A part missing a named sidecar is skipped.
 	Names() []string
 	// Union merges the loaded sidecars of the compacted parts (one map per part) and returns the
-	// merged named payloads to write under the new part. Pure; ignores the live accumulator.
-	Union(parts []map[string][]byte) (map[string][]byte, error)
+	// named payloads to write under the new part: only the entries the refs (the [SideStore.RefColumn]
+	// cells of that part) reach, directly or transitively. Pure; ignores the live accumulator.
+	Union(parts []map[string][]byte, refs iter.Seq[[]byte]) (map[string][]byte, error)
 	// Stored re-encodes named payloads in their on-disk form. The engine applies it to exactly what
 	// it writes as sidecars, so [SideStore.Encode] and [SideStore.Union] can return a form that is
 	// cheap to decode again in memory. Pure, like Union.

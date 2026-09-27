@@ -120,7 +120,7 @@ func (f *fakeSide) Restore(snapshot map[string][]byte) error {
 
 func (f *fakeSide) Names() []string { return []string{"table"} }
 
-func (f *fakeSide) Union(parts []map[string][]byte) (map[string][]byte, error) {
+func (f *fakeSide) Union(parts []map[string][]byte, refs iter.Seq[[]byte]) (map[string][]byte, error) {
 	f.unions++
 	merged := map[uint64][]byte{}
 
@@ -132,7 +132,16 @@ func (f *fakeSide) Union(parts []map[string][]byte) (map[string][]byte, error) {
 		}
 	}
 
-	return map[string][]byte{"table": encodeSide(merged)}, nil
+	kept := map[uint64][]byte{}
+
+	for ref := range refs {
+		id, err := strconv.ParseUint(string(ref), 10, 64)
+		if entry, ok := merged[id]; err == nil && ok {
+			kept[id] = entry
+		}
+	}
+
+	return map[string][]byte{"table": encodeSide(kept)}, nil
 }
 
 func (f *fakeSide) Stored(tables map[string][]byte) (map[string][]byte, error) {
@@ -413,7 +422,7 @@ func accIDs(f *fakeSide) []uint64 {
 }
 
 // TestSideStoreMergeUnions verifies a merge unions the sidecars of the compacted parts into the new
-// part's sidecar (content-addressed dedup, no remap).
+// part's sidecar (content-addressed dedup, no remap), keeping what the part's rows reference.
 func TestSideStoreMergeUnions(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -422,12 +431,12 @@ func TestSideStoreMergeUnions(t *testing.T) {
 	fs := newFakeSide()
 	e := sideEngine(be, fs)
 
-	b1 := mkBatch("api", rrec{ts: 1, body: "x"})
+	b1 := mkBatch("api", rrec{ts: 1, body: "x", id: "1"}, rrec{ts: 1, body: "x", id: "2"})
 	b1.Side = encodeSide(map[uint64][]byte{1: []byte("a"), 2: []byte("b")})
 	ingest(t, e, b1)
 	require.NoError(t, e.Flush(ctx))
 
-	b2 := mkBatch("api", rrec{ts: 2, body: "y"})
+	b2 := mkBatch("api", rrec{ts: 2, body: "y", id: "2"}, rrec{ts: 2, body: "y", id: "4"})
 	b2.Side = encodeSide(map[uint64][]byte{2: []byte("b"), 4: []byte("d")})
 	ingest(t, e, b2)
 	require.NoError(t, e.Flush(ctx))

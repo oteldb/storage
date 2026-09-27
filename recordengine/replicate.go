@@ -37,6 +37,14 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 	}
 	a.sides, a.w = wal.NewWriter(&a.sideBuf), wal.NewWriter(&a.recBuf)
 
+	applied := false
+
+	defer func() {
+		if a.sideBuf.Len() > 0 && (!applied || a.res.Rejected() > 0) {
+			e.sideStray = true
+		}
+	}()
+
 	if err := wal.Replay(data, wal.Handlers{OnSeries: a.series, OnRecords: a.records, OnSide: a.side}); err != nil {
 		return nil, AppendResult{}, err
 	}
@@ -64,6 +72,8 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 	for _, app := range a.appenders {
 		app.commit()
 	}
+
+	applied = true
 
 	return accepted, a.res, nil
 }

@@ -2,6 +2,7 @@ package recordengine
 
 import (
 	"context"
+	"iter"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -314,10 +315,10 @@ func (e *Engine) dropExpired(ctx context.Context, src []*part, retainFrom int64)
 	return remaining, len(expired), nil
 }
 
-// mergeSidecars unions the side-store sidecars of the compacted parts and writes the merged tables
-// under the new part. No-op when the engine has no side store. Content-addressing makes the union a
-// plain dedup — no id remap.
-func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix string) error {
+// mergeSidecars unions the side-store sidecars of the compacted parts, keeps what the new part's
+// refs reach, and writes the result under the new part. No-op when the engine has no side store.
+// Content-addressing makes the union a plain dedup — no id remap.
+func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix string, refs iter.Seq[[]byte]) error {
 	if e.cfg.SideStore == nil {
 		return nil
 	}
@@ -332,7 +333,7 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 		parts = append(parts, m)
 	}
 
-	merged, err := e.cfg.SideStore.Union(parts)
+	merged, err := e.cfg.SideStore.Union(parts, refs)
 	if err != nil {
 		return err
 	}
@@ -355,7 +356,7 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 // after every append of at most a granule — so either bound is overshot by at most one append, a
 // stream may continue in the next part, and the merge never holds a stream or a part.
 // When the engine has a side store (profiles) the cap does not split a day, but the resident bound
-// still can, and every part it writes carries the whole unioned symbol sidecar. Returns the new parts
+// still can, and every part it writes carries the symbols its own rows reach. Returns the new parts
 // (empty when retention dropped every record). Reads the parts off the engine lock; src is the
 // immutable snapshot the caller planned over.
 func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes int64) ([]*part, error) {

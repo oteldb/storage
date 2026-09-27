@@ -91,7 +91,7 @@ func TestProjectFlattensSamples(t *testing.T) {
 	}
 
 	// The profile type is folded into the stream identity as reserved labels.
-	series := streamSeries(svcResource("api"), signal.Scope{}, resolveType(d, pr))
+	series := streamSeries(svcResource("api"), signal.Scope{}, resolveType(d, pr), nil)
 	assert.Equal(t, series.Hash(), b.Stream)
 	v, ok := series.Resource.Attributes.Get(LabelSampleType)
 	require.True(t, ok)

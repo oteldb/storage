@@ -15,7 +15,7 @@ import (
 )
 
 // fullStoreResolver is the whole-store resolver: the head, an in-flight flush and every part's
-// sidecars unioned into one set of tables and decoded.
+// sidecars, each decoded as one layer.
 func fullStoreResolver(t *testing.T, s *Storage) *profile.Resolver {
 	t.Helper()
 
@@ -37,13 +37,16 @@ func fullStoreResolver(t *testing.T, s *Storage) *profile.Resolver {
 		tables = append(tables, m)
 	}
 
-	union, err := profile.NewSymbolStore().Union(tables)
-	require.NoError(t, err)
+	layers := make([]*profile.Tables, 0, len(tables))
 
-	r, err := profile.NewResolver(union)
-	require.NoError(t, err)
+	for _, m := range tables {
+		l, err := profile.DecodeTables(m)
+		require.NoError(t, err)
 
-	return r
+		layers = append(layers, l)
+	}
+
+	return profile.NewResolverFrom(layers...)
 }
 
 // TestProfileResolverWindow checks a windowed resolver resolves every stack the samples in its

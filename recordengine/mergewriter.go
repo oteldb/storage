@@ -2,6 +2,7 @@ package recordengine
 
 import (
 	"context"
+	"slices"
 	"unsafe"
 
 	"github.com/go-faster/errors"
@@ -63,6 +64,12 @@ type recordPartStreamWriter struct {
 	// buffered is set over a backend that takes an object whole: every frame a column hands over
 	// stays in RAM until the part commits.
 	buffered bool
+
+	// refs is the distinct side-store reference cells written, which bound the part's sidecars:
+	// refCol is their byte column (-1 without a side store) and refBytes their resident size.
+	refs     map[string]struct{}
+	refCol   int
+	refBytes int64
 }
 
 type sourceBindings struct {
@@ -97,6 +104,16 @@ func newRecordPartStreamWriter(
 		buffered: !backend.StreamsWrites(e.cfg.Backend),
 		sinks:    make([]*columnSink, schema.numBytes()),
 		binds:    make([]sourceBindings, len(src)*schema.numBytes()),
+		refCol:   -1,
+	}
+
+	if e.cfg.SideStore != nil {
+		ref, ok := schema.ref(e.cfg.SideStore.RefColumn())
+		if !ok || ref.kind != KindBytes {
+			return nil, errors.Errorf("side store reference column %q is not a byte column", e.cfg.SideStore.RefColumn())
+		}
+
+		w.refCol, w.refs = ref.idx, make(map[string]struct{})
 	}
 	w.w = block.NewStreamWriterTo(ctx, e.cfg.Backend, w.prefix, opts...)
 
@@ -194,7 +211,39 @@ func (w *recordPartStreamWriter) appendBytes(
 		}
 	}
 
+	if k == w.refCol {
+		w.addRefs(g.Column(), lo, hi)
+	}
+
 	return nil
+}
+
+func (w *recordPartStreamWriter) addRefs(dc chunk.DictColumn, lo, hi int) {
+	const refEntryBytes = 48
+
+	var last []byte
+
+	for r := lo; r < hi; r++ {
+		v := dc.At(r)
+		if r > lo && slices.Equal(v, last) {
+			continue
+		}
+
+		last = v
+
+		if _, ok := w.refs[string(v)]; !ok {
+			w.refs[string(v)] = struct{}{}
+			w.refBytes += int64(len(v)) + refEntryBytes
+		}
+	}
+}
+
+func (w *recordPartStreamWriter) refCells(yield func([]byte) bool) {
+	for ref := range w.refs {
+		if !yield([]byte(ref)) {
+			return
+		}
+	}
 }
 
 func (w *recordPartStreamWriter) binding(
@@ -264,7 +313,7 @@ func (w *recordPartStreamWriter) residentBytes() int64 {
 		n += s.residentBytes()
 	}
 
-	return n
+	return n + w.refBytes
 }
 
 // abort releases the part's in-flight column objects; a no-op once the part is written.
@@ -327,7 +376,7 @@ func (w *recordPartStreamWriter) finish(ctx context.Context) (*part, error) {
 	p.minTime, p.maxTime = w.minT, w.maxT
 
 	if e.cfg.SideStore != nil {
-		if err := e.mergeSidecars(ctx, w.src, prefix); err != nil {
+		if err := e.mergeSidecars(ctx, w.src, prefix, w.refCells); err != nil {
 			return nil, err
 		}
 	}

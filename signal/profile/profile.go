@@ -5,8 +5,9 @@
 // A profile is a pprof-style graph: samples reference stacks, stacks reference locations, locations
 // reference functions and mappings, and everything bottoms out in an interned string table — all
 // index-based, with the tables shared across a whole batch in a [Dictionary] (OTLP's
-// ProfilesDictionary). The stream identity of a sample is its producing Resource+Scope; each sample
-// flattens to a record row (value, sample-type id, stack id, profile id, trace/span ids, attributes)
+// ProfilesDictionary). The stream identity of a sample is its producing Resource+Scope plus its
+// profile's type and attributes; each sample flattens to a record row (value, stack id, profile id,
+// trace/span ids, sample attributes)
 // the record engine filters by condition, while the symbol tables ride along as a deduplicated,
 // content-addressed side store. See [Project] and the symbol store in symbols.go.
 package profile
@@ -31,8 +32,8 @@ type ResourceProfiles struct {
 	Scopes   []ScopeProfiles
 }
 
-// ScopeProfiles groups the profiles emitted under one [signal.Scope]. A (Resource, Scope) pair is
-// one profile **stream**.
+// ScopeProfiles groups the profiles emitted under one [signal.Scope]. Its profiles form one stream
+// per (type, attributes) pair; see [Project].
 type ScopeProfiles struct {
 	Scope    signal.Scope
 	Profiles []Profile
@@ -40,7 +41,8 @@ type ScopeProfiles struct {
 
 // Profile is a single profile: a set of samples sharing one value type (SampleType), collected at
 // TimeNanos over DurationNanos. ProfileID is 16 bytes (or nil). AttributeIndices reference the
-// dictionary's attribute table. Values/timestamps live per [Sample].
+// dictionary's attribute table and are part of the stream identity, so data that differs per
+// profile belongs on the samples instead. Values/timestamps live per [Sample].
 type Profile struct {
 	Samples          []Sample
 	AttributeIndices []int32
@@ -54,8 +56,9 @@ type Profile struct {
 }
 
 // Sample is one stack occurrence. StackIndex references the dictionary stack table. A sample carries
-// either one aggregated Value (Values[0], no timestamps) or paired Values/TimestampsUnixNano arrays
-// (one observation each). AttributeIndices/LinkIndex reference the dictionary.
+// either one aggregated Value (Values[0], no timestamps), paired Values/TimestampsUnixNano arrays
+// (one observation each), or TimestampsUnixNano alone (each observation counts 1).
+// AttributeIndices/LinkIndex reference the dictionary.
 type Sample struct {
 	Values             []int64
 	TimestampsUnixNano []uint64

@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/go-faster/sdk/gold"
@@ -186,7 +187,12 @@ func TestSidecarsCompressedOnlyStored(t *testing.T) {
 	require.NoError(t, s.Absorb(delta))
 
 	stored := storedSidecars(t, s)
-	union, err := NewSymbolStore().Union([]map[string][]byte{s.Encode(), stored})
+	refs := make([][]byte, 0, len(corpus.t[tableStacks]))
+	for id := range corpus.t[tableStacks] {
+		refs = append(refs, id.AppendBinary(nil))
+	}
+
+	union, err := NewSymbolStore().Union([]map[string][]byte{s.Encode(), stored}, slices.Values(refs))
 	require.NoError(t, err)
 
 	for i, name := range tableNames {
