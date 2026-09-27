@@ -5,6 +5,8 @@ import (
 	"math"
 
 	"github.com/go-faster/errors"
+	"github.com/go-faster/sdk/zctx"
+	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/internal/memlimit"
 )
@@ -152,6 +154,21 @@ func (e *Engine) mergeGrantBytes(ctx context.Context, src []*part, capBytes int6
 	}
 
 	return share
+}
+
+// reportOverBudget accounts a merge that holds need against the whole process merge budget: past
+// it, admission can only clamp the request to the budget, so the merge runs alone and holds the rest
+// over it, which is counted and logged rather than left silent.
+func (e *Engine) reportOverBudget(ctx context.Context, need int64) {
+	budget := memlimit.MergeBudget(e.cfg.MergeMemoryBytes)
+	if budget == math.MaxInt64 || need <= budget {
+		return
+	}
+
+	e.cfg.Obs.Merge.OverBudget(ctx, e.cfg.Signal, need-budget)
+	zctx.From(ctx).Warn("merge needs more than the whole merge memory budget; it runs alone and holds past it",
+		zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
+		zap.Int64("need", need), zap.Int64("budget", budget))
 }
 
 // mergeConcurrency is how many merges the memory budget admits: enough that each gets a usable

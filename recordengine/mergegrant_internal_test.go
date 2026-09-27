@@ -59,6 +59,8 @@ func TestOpenGrantedCoversAShortGrant(t *testing.T) {
 		{name: "busy waiting", busy: true, wait: true, wantWaitLast: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			var waits []bool
 
 			admit := func(_ context.Context, _ int64, wait bool) (func(), bool, error) {

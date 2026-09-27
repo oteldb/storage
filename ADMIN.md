@@ -235,6 +235,7 @@ Metric instruments (all prefixed `storage.`):
 | `flush.total` / `flush.duration` / `flush.rows` / `flush.bytes` | `signal` | head flushes; `flush.bytes` is the part bytes written, the denominator of write amplification |
 | `merge.total` / `merge.duration` / `merge.parts_in` / `merge.bytes_in` / `merge.bytes_out` | `signal` | background merges; `bytes_out` against `flush.bytes` is how many times the engine rewrites what it ingests, `bytes_out`/`bytes_in` what one cycle gains |
 | `merge.deferred` | `signal` | merges that selected parts and could not claim the process merge memory budget, so compacted nothing and left the work for the next cycle. Any sustained rate says compaction is bounded by `MergeMemoryBytes` — raise `MergeMemoryBytes` if part counts climb with it. Raising `MaintenanceConcurrency` does not help: a deferral only happens when the budget already admits fewer merges than the fan-out |
+| `merge.over_budget_bytes` | `signal` | bytes a merge needed beyond the whole `MergeMemoryBytes` budget. Such a merge reserves the whole budget and runs alone, holding this much more than the budget; each one also logs `merge needs more than the whole merge memory budget`. A sustained rate says the budget is smaller than one merge of the store's parts — raise `MergeMemoryBytes` |
 | `fetch.total` / `fetch.duration` / `fetch.series_matched` / `fetch.rows_returned` / `fetch.parts_scanned` | `signal` | reads; the metric engine's reads are streaming, so these are recorded when the iterator is **closed** — `duration` covers the whole iteration (the consumer's own per-batch work included) and `rows_returned` counts what was actually consumed |
 | `fetch.decode_budget_forced_admissions` | `signal` | queries admitted **over** the decode-memory ceiling after their wait stalled (see below); a non-zero rate means the ceiling is not holding |
 | `backend.ops` / `backend.bytes` / `backend.latency` | `op`(, `result`) | ops: read/write/list/delete/cas/size; results: ok/not_found/error |
@@ -502,8 +503,10 @@ manifests bound them (read-ahead windows, frame buffers, dictionaries), its enco
 for its writers. A merge over parts the manifest cannot size (written before sizing stats) reserves
 its share and tops it up once it has opened them — never waiting while it holds — or, when it would
 have to wait, hands its grant back and queues for the whole; a background merge that finds the
-difference taken is deferred like any other. A request above the whole budget is clamped to it, so
-such a merge runs alone. The need can be several shares: a flushed log part whose body column was
+difference taken is deferred like any other. A request above the whole budget is clamped to it: a
+waiting merge queues for the whole pool and runs alone once it drains, a background one takes it only
+when it is all free (at the start of a cycle, where deferred engines go first), and either counts what
+it holds past the budget in `merge.over_budget_bytes`. The need can be several shares: a flushed log part whose body column was
 written unframed is read whole, and a merge of four such parts (154 MiB decoded) reserves 193.6 MiB,
 of which it holds 158 MiB, whatever a smaller share says.
 

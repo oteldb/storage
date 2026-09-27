@@ -412,6 +412,8 @@ func (e *Engine) compactStreamed(
 		return nil, err
 	}
 
+	e.reportOverBudget(ctx, grant.bytes)
+
 	var newParts []*part
 
 	router := timebucket.Router[*recordPartStreamWriter]{
@@ -525,7 +527,8 @@ func (e *Engine) openGranted(
 			return nil, 0, 0, errMergeDeclined
 		}
 
-		sources = nil
+		// Dropped before queueing, so the wait holds none of what it was not granted.
+		clear(sources)
 
 		if err := grant.regrant(ctx, need); err != nil {
 			return nil, 0, 0, err

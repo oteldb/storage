@@ -276,7 +276,10 @@ attribute dictionaries, ZSTD best, 64 MiB cap) the merge adds 158 MiB to the hea
 193.6 MiB reservation, whatever the share: the sources read their unframed body columns whole
 (~19 MiB each) and the two encoders take 40 MiB. Its writers get the floor, 48 MiB, and seal three
 parts of 44–55 MiB where the cap alone seals 60–66 MiB parts — as many parts, each short of the cap
-by the append reserve.
+by the append reserve. Block-framing record body columns at flush would bound the dominant term to a
+window per source, at the cost of the blocked-bytes full scan. A need past the whole process budget
+reserves all of it (the pool clamps), runs alone, and counts the excess in
+`merge.over_budget_bytes` with a warning (`TestMergeNeedingMoreThanTheBudgetCompletes`).
 
 **Sidecars are built from the same rows.** Identities and watermarks are per stream. A bloom cannot be
 sized before its column's last row, so `bloomAccum` keeps each distinct token as its probe hashes (16 B,
