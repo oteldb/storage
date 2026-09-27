@@ -132,6 +132,16 @@ func (f *flushColumns) slice(lo, hi int) *flushColumns {
 	return &flushColumns{stream: f.stream[lo:hi], cols: cols}
 }
 
+func (h *head) hasRows() bool {
+	for _, buf := range h.records {
+		if buf.len() > 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
 // detach moves the head's record buffers aside for a flush and installs fresh empty buffers, so new
 // appends are unaffected, returning the detached buffers (nil if no stream holds a record) and the
 // buffered byte count they carried. The stream index is retained — identities outlive a flush. The
@@ -139,16 +149,7 @@ func (f *flushColumns) slice(lo, hi int) *flushColumns {
 // concurrent fetch never loses sight of the records mid-flush; on a failed flush it hands them back
 // via [head.reattach].
 func (h *head) detach() (map[signal.SeriesID]*recordCols, int64) {
-	hasRows := false
-	for _, buf := range h.records {
-		if buf.len() > 0 {
-			hasRows = true
-
-			break
-		}
-	}
-
-	if !hasRows {
+	if !h.hasRows() {
 		return nil, 0
 	}
 

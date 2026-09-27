@@ -796,9 +796,10 @@ func (e *Engine) coveredLocked(ctx context.Context) (map[signal.SeriesID]int64, 
 	return covered, nil
 }
 
-// retainSideLocked shrinks the side-store accumulator to what the head still references. Only a
-// replica needs it: no flush drains its accumulator, and the records its trim dropped resolve from
-// the covering parts' sidecars. Caller holds e.mu.
+// retainSideLocked shrinks the side-store accumulator to what the head still references: on a
+// replica, whose accumulator no flush drains (the records its trim dropped resolve from the covering
+// parts' sidecars), and before a flush that would otherwise write rejected writes' entries. Caller
+// holds e.mu.
 func (e *Engine) retainSideLocked() error {
 	if e.cfg.SideStore == nil {
 		return nil
@@ -813,6 +814,7 @@ func (e *Engine) retainSideLocked() error {
 
 	e.cfg.SideStore.Retain(e.head.byteCells(ref.idx))
 	e.sideAbsorbed = false
+	e.sideStray = false
 
 	return nil
 }

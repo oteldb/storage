@@ -678,8 +678,17 @@ or rebuilt.
 trim or flush. Every absorb goes through `absorbSideLocked`, which marks the accumulator dirty; the
 mark covers both roles. A replica, or a primary demoted before its next flush, rebuilds on refresh. An
 owner whose head stays empty resets the store in the flush that finds nothing to detach: an empty head
-references nothing, so a plain `Reset` is exact and needs no walk. A non-empty flush already drains
-the store, rejected deltas included, into its sidecars.
+references nothing, so a plain `Reset` is exact and needs no walk.
+
+A non-empty flush would drain rejected deltas into its sidecars, and merges union sidecars whole, so
+a rejected record's entries would stay for as long as the data does. A second mark, `sideStray`, is
+set when a write that absorbed a delta rejected any record, or failed after the absorb. It is also
+set on every replayed delta (WAL restart, `ApplyReplicated`), which arrives without its write's
+admission decision. A flush that finds the mark set runs the replica's `Retain` over the head before
+the snapshot. A flush whose writes were all accepted skips that walk: a signal's delta carries only
+what its batch's records reference (profiles resolve no stack for a dropped zero observation), so
+the accumulator is already exact. The primary still forwards the rejected write's delta, so replicas
+receive it. Their own refresh or flush retains it away the same way.
 
 ## Cost attribution
 
