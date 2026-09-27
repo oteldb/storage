@@ -264,6 +264,38 @@ func TestSideStoreReplicaRefreshRetainsHead(t *testing.T) {
 	assert.Equal(t, 1, fs.retains, "a refresh that trims nothing leaves the accumulator alone")
 }
 
+// TestSideStoreReplicaRefreshDropsRejectedDeltas: the primary forwards the side delta of a write whose
+// records it all rejected. That adds no row for a trim to drop, so the refresh must retain anyway.
+func TestSideStoreReplicaRefreshDropsRejectedDeltas(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	be := backend.Memory()
+	primary := sideEngine(be, newFakeSide())
+	fs := newFakeSide()
+	replica := sideEngine(be, fs)
+
+	kept := mkBatch("api", rrec{ts: 1, id: "1"})
+	kept.Side = encodeSide(map[uint64][]byte{1: []byte("a")})
+	replicateSide(t, primary, replica, kept)
+
+	for i := range 3 {
+		shed := mkBatch("shed", rrec{ts: 1, id: "10"})
+		shed.Side = encodeSide(map[uint64][]byte{uint64(10 + i): []byte("rejected")})
+
+		accepted, res, err := primary.ApplyPrimary(recordengine.EncodeWAL(shed), recordengine.AppendLimits{MaxSeries: 1})
+		require.NoError(t, err)
+		require.Equal(t, 1, res.RejectedCardinality)
+		require.NoError(t, replica.ApplyReplicated(accepted))
+
+		require.NoError(t, replica.RefreshReplica(ctx))
+		assert.Equal(t, []uint64{1}, accIDs(fs), "round %d", i)
+	}
+
+	assert.Equal(t, 1, replica.HeadRecordCount())
+	assert.Equal(t, 3, fs.retains)
+}
+
 func TestSideStoreRetainRejectsNonByteRefColumn(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

@@ -756,20 +756,33 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 		return err
 	}
 
-	if len(e.parts) == 0 {
+	if e.cfg.Backend == nil {
 		return nil
 	}
 
+	covered, err := e.coveredLocked(ctx)
+	if err != nil {
+		return err
+	}
+
+	if e.head.trimBelowCovered(covered) == 0 && !e.sideAbsorbed {
+		return nil
+	}
+
+	return e.retainSideLocked()
+}
+
+// coveredLocked returns each stream's newest timestamp in a loaded part. Each stream is trimmed
+// against its own, not the newest in the part set: a stream absent from every part keeps its whole
+// head (the primary would otherwise be the sole holder of quorum-acked records), and one present
+// keeps everything past what is durable *for it*. Caller holds e.mu.
+func (e *Engine) coveredLocked(ctx context.Context) (map[signal.SeriesID]int64, error) {
 	covered := make(map[signal.SeriesID]int64)
 
-	// Each stream is trimmed against its own newest flushed timestamp, not the newest in the part
-	// set: a stream absent from every part keeps its whole head (the primary would otherwise be the
-	// sole holder of quorum-acked records), and one present keeps everything past what is durable
-	// *for it*.
 	for _, p := range e.parts {
 		wmarks, err := p.streamWatermarks(ctx)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		for _, w := range wmarks {
@@ -779,11 +792,7 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 		}
 	}
 
-	if e.head.trimBelowCovered(covered) == 0 {
-		return nil
-	}
-
-	return e.retainSideLocked()
+	return covered, nil
 }
 
 // retainSideLocked shrinks the side-store accumulator to what the head still references. Only a
@@ -802,6 +811,7 @@ func (e *Engine) retainSideLocked() error {
 	}
 
 	e.cfg.SideStore.Retain(e.head.byteCells(ref.idx))
+	e.sideAbsorbed = false
 
 	return nil
 }

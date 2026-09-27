@@ -184,6 +184,10 @@ type Engine struct {
 	// symbol-visibility gap that mirrors the record gap [Engine.flushing] closes. nil when no flush is
 	// in flight or the engine has no side store.
 	flushingSide map[string][]byte
+	// sideAbsorbed is set when a replayed or replicated side delta lands, and cleared by
+	// [Engine.retainSideLocked]: a delta whose records were all rejected adds no row for a trim to
+	// drop, yet still grows the accumulator.
+	sideAbsorbed bool
 	// space latches disk pressure: a flush that finds the backend short of bytes or inodes (or one
 	// that gets ENOSPC anyway) closes the ingest path until a later flush finds room. Without it a
 	// full disk is invisible — the write is acked, the flush fails, and the head grows behind it.
@@ -987,6 +991,8 @@ func (e *Engine) replayHandlers() wal.Handlers {
 			if e.cfg.SideStore == nil {
 				return nil
 			}
+
+			e.sideAbsorbed = true
 
 			return e.cfg.SideStore.Absorb(payload)
 		},
