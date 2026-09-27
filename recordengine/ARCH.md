@@ -291,10 +291,11 @@ the part opens and its ranges, each bloom built, encoded and read back, the reco
 encoded and read back, the watermarks, and the identity object as it is encoded. The router finishes
 one writer at a time, so the one finishing is always inside what it counts
 (`TestMergeFinishHoldsItsGrant`, `TestMergeGatherHoldsItsGrant`). A side store's finish also loads
-every source's sidecars, unions them and re-encodes the union; that is charged once, beside the
-encoders, since finishes do not overlap: the sidecars' stored sizes plus what the store reports its
-union and re-encode hold for them (`SideStore.UnionBytes`, shown each sidecar's size and head), read
-at admission (`TestMergeSidecarUnionHoldsItsGrant`).
+every source's sidecars, decodes their union once and re-encodes what the part's refs keep of it;
+that is charged once, beside the encoders, since finishes do not overlap: the sidecars' stored sizes
+plus what the store reports its union, retain and re-encode hold for them (`SideStore.UnionBytes`,
+shown each sidecar's size and head, and charged as if the refs keep everything), read at admission
+(`TestMergeSidecarUnionHoldsItsGrant`). The refs themselves are the writer's, in its resident bytes.
 
 `TestMergeWritersHoldAdmittedShare` (8 sources × 3 dictionary columns of ~14k entries × 8 days, ZSTD,
 file backend, heap measured above the written sources): unbounded, the writers hold 93.4 MiB and the

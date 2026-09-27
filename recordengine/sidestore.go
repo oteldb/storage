@@ -53,10 +53,10 @@ type SideStore interface {
 	// it writes as sidecars, so [SideStore.Encode] and [SideStore.Union] can return a form that is
 	// cheap to decode again in memory. Pure, like Union.
 	Stored(tables map[string][]byte) (map[string][]byte, error)
-	// UnionBytes bounds what Union and then Stored hold at once, beside the loaded sidecars
-	// themselves, over stored sidecars of the given byte lengths whose first bytes are heads (at
-	// most [SidecarHeadBytes] each). A merge reserves it for each part it writes before reading a
-	// sidecar, so it must not undercount.
+	// UnionBytes bounds what Union, whatever its refs keep, and then Stored hold at once, beside the
+	// loaded sidecars themselves, over stored sidecars of the given byte lengths whose first bytes
+	// are heads (at most [SidecarHeadBytes] each). A merge reserves it for each part it writes before
+	// reading a sidecar, so it must not undercount.
 	UnionBytes(sizes []int64, heads [][]byte) (int64, error)
 }
 
