@@ -260,9 +260,12 @@ copy; the sources open one column at a time and before any writer, so the need i
 steady figures plus the larger of the biggest such open peak and the writers' share: the two
 encoders' workspace (`compress.Compressor.EncodeWorkspace`, below) and the writers' floor: two
 appends and one writer's finish at the cap (`writerFinishAtCap`: the cap's share of the rows as
-stream ids, each byte column's dictionary region at the least of its sources' dictionaries and
-streams, the cap and the dictionary cap, and the sources' blooms, record keys and identities), so a
-writer is not shed for its own finish charge before its part reaches the cap (`mergeNeed`). A merge reserves that through `Config.MergeAdmission` when it is more than its share
+stream ids; for each dictionary-coded column some source built a shared dictionary for, its region
+at the least of the sources' dictionaries, the cap and the dictionary cap; and the sources' blooms,
+record keys and identities), so a writer is not shed for its own finish charge before its part
+reaches the cap (`mergeNeed`). The estimate sizes the floor and is not itself a charge: a writer
+charges its actual finish, so a merged dictionary past its sources' seals that part early instead
+of holding more than the grant. A merge reserves that through `Config.MergeAdmission` when it is more than its share
 (`admitMerge`). A manifest that cannot bound a source (no sizing stats, a leading dictionary) leaves
 the share reserved; once the sources are open and measured the merge tops the grant up without
 waiting, since waiting while holding could deadlock two merges, and a merge that may wait otherwise
@@ -289,17 +292,16 @@ at admission (`TestMergeSidecarUnionHoldsItsGrant`).
 
 `TestMergeWritersHoldAdmittedShare` (8 sources × 3 dictionary columns of ~14k entries × 8 days, ZSTD,
 file backend, heap measured above the written sources): unbounded, the writers hold 93.4 MiB and the
-merge adds 102 MiB to the heap; at a 32 MiB share the merge reserves 74.9 MiB, its writers get
-30.2 MiB and report at most 28.5 MiB, and the merge adds 45.7 MiB. The charges are bounds: the windows are charged full before a
+merge adds 102–106 MiB to the heap; at a 32 MiB share the merge reserves 71.9 MiB, its writers get
+27.2 MiB and report at most 27.0 MiB, and the merge adds 44.4 MiB. The charges are bounds: the windows are charged full before a
 frame is read, a dictionary region as if it did not compress, and the manifest bounds a granule's
 rows from the granule count. On a one-day, logs-shaped merge of four flushed parts (154 MiB decoded,
 body columns flushed unframed, ~29k-entry attribute dictionaries, ZSTD best, 64 MiB cap) the merge
-adds 159 MiB to the heap against a 329.9 MiB reservation, whatever the share: the sources read their
+adds 159 MiB to the heap against a 237.3 MiB reservation, whatever the share: the sources read their
 unframed body columns whole (~19 MiB each) and the two encoders take 40 MiB. Its writers get the
-floor, 184.4 MiB, of which they use 52 MiB, and seal three parts of 65.8 / 65.8 / 22.6 MiB, as the cap
-alone does. The floor's finish estimate is what makes the reservation twice what is held: it charges
-the unframed body column a dictionary at the dictionary cap, which a column of unique values never
-builds. Block-framing record body columns at flush would bound the
+floor, 91.8 MiB, of which they use 52 MiB, and seal three parts of 65.8 / 65.8 / 22.6 MiB, as the cap
+alone does. The body column, which no source wrote a dictionary for, is charged its last frame and
+no region. Block-framing record body columns at flush would bound the
 dominant term to a window per source, at the cost of the blocked-bytes full scan. A need past the
 whole process budget reserves all of it (the pool clamps), runs alone, and counts the excess in
 `merge.over_budget_bytes` with a warning (`TestMergeNeedingMoreThanTheBudgetCompletes`).

@@ -10,6 +10,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
+	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
 )
 
@@ -337,9 +338,14 @@ func (p *part) residentBytes() int64 {
 // writerFinishAtCap estimates what one writer charges for its finish
 // ([recordPartStreamWriter.finishBytes]) once it holds a part at the cap, so the writers' floor lets a
 // part reach it: the cap's share of the sources' rows as stream ids, every source stream's range,
-// watermark and identity, each byte column's dictionary serialized and compressed at the least of its
-// sources' dictionaries and streams, the cap and the dictionary cap, and the sources' blooms and
-// record keys built, encoded and read back. With no cap, or a side store, a part is the whole merge.
+// watermark and identity, the sources' blooms and record keys built, encoded and read back, and for
+// each dictionary-coded column its region, serialized and compressed, at the least of its sources'
+// shared dictionaries, the cap and the dictionary cap; a column no source built a dictionary for
+// charges only its last frame. With no cap, or a side store, a part is the whole merge.
+//
+// It sizes the floor, not a charge: a writer charges its actual finish in its resident, so an output
+// dictionary past its sources' — values their declined granules held joining the merged one — seals
+// that part early rather than holding more than the grant.
 func (e *Engine) writerFinishAtCap(src []*part, capBytes int64) int64 {
 	const (
 		idBytes    = 16
@@ -377,11 +383,15 @@ func (e *Engine) writerFinishAtCap(src []*part, capBytes int64) int64 {
 	n += e.identitiesBound(src)
 
 	for k := range e.cfg.Schema.numBytes() {
+		if e.cfg.Schema.byteColumn(k).Codec != chunk.CodecDict {
+			continue
+		}
+
 		var dict int64
 
 		for _, p := range src {
-			if desc, ok := p.reader.ColumnDescByName(p.schema.byteColumn(k).Name); ok {
-				dict += desc.DictRaw + desc.Sizing.StreamRaw
+			if desc, ok := p.reader.ColumnDescByName(p.schema.byteColumn(k).Name); ok && desc.SharedDict {
+				dict += desc.DictRaw
 			}
 		}
 
