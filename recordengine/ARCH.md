@@ -251,34 +251,49 @@ dropped: 29.3 MiB reported, 22.1 MiB released over the memory backend, the diffe
 objects counted at twice their size.
 
 **A merge reserves what it holds.** Before it opens anything, a merge bounds its sources from their
-manifests (`sourceBound`: per column `block.PartReader.ScanBound` — read-ahead window, frame buffers,
-shared dictionary, one granule — or a whole decode's columns), adds its two encoders' workspace
-(`compress.Compressor.EncodeWorkspace`, below) and a floor of two appends for its writers, and reserves that through `Config.MergeAdmission` when it is more than its
-share (`mergeNeed`, `admitMerge`). A manifest that cannot bound a source (no sizing stats, a leading
-dictionary) leaves the share reserved; once the sources are open and measured the merge tops the
-grant up without waiting, since waiting while holding could deadlock two merges, and a merge that may
-wait otherwise drops its sources, hands the grant back and queues for the whole (`openGranted`); a
-background merge is deferred. `TestSourceBoundCoversOpened` holds the manifest bound at or above what
-the opened sources report. The writers get what the grant leaves beside the opened sources and the
-encoder (`mergeWriterBudget`); of that the router keeps room for one append
+manifests (`sourceBound`): per column `block.PartReader.ScanBound` — read-ahead window, frame buffers,
+shared dictionary, one granule — or a whole decode's columns plus the most a stream gathered and
+sorted out of them can hold (`gatherBound`: five times the part's decoded size and 8 + 40 B a row per
+byte column, from the copies, sort index, second column set and views the gather makes). Opening a
+column also holds its tail as read and its dictionary decompressed into scratch beside the kept
+copy; the sources open one column at a time and before any writer, so the need is the sources'
+steady figures plus the larger of the biggest such open peak and the writers' share: the two
+encoders' workspace (`compress.Compressor.EncodeWorkspace`, below) and a floor of two appends
+(`mergeNeed`). A merge reserves that through `Config.MergeAdmission` when it is more than its share
+(`admitMerge`). A manifest that cannot bound a source (no sizing stats, a leading dictionary) leaves
+the share reserved; once the sources are open and measured the merge tops the grant up without
+waiting, since waiting while holding could deadlock two merges, and a merge that may wait otherwise
+drops its sources, hands the grant back and queues for the whole (`openGranted`); a background merge
+is deferred. `TestSourceBoundCoversOpened` holds the manifest bound at or above what the opened
+sources report, and `TestScanBoundCoversOpenPeak` a large incompressible dictionary's open.
+
+The writers get what the grant leaves beside the opened sources and the encoders
+(`mergeWriterBudget`), less what the parts sealed so far keep until the merge commits (their ranges,
+blooms and record keys, the router's `Held`). Of that the router keeps room for one append
 (`timebucket.Router.ReserveRun`): a writer binding every source's dictionaries, 12 B an entry, plus
-one run, or the largest append so far if that is more. The one term still uncharged is the finish's
-transients — the bloom filters and record keys encoded and read back, and the output's stream column
-decoded as it opens.
+one run and the least a writer charges for its finish, or the largest append so far if that is more.
+A writer charges its own finish from the start (`finishBytes`, part of `residentBytes`): the block
+writer's last seals and dictionary regions (`block.StreamWriter.FinishBytes` — the dictionary
+serialized and the one buffer its region is compressed into), the stream id column decoded back as
+the part opens and its ranges, each bloom built, encoded and read back, the record keys sorted,
+encoded and read back, the watermarks, and the identity object as it is encoded. The router finishes
+one writer at a time, so the one finishing is always inside what it counts
+(`TestMergeFinishHoldsItsGrant`, `TestMergeGatherHoldsItsGrant`).
+
 `TestMergeWritersHoldAdmittedShare` (8 sources × 3 dictionary columns of ~14k entries × 8 days, ZSTD,
-file backend, heap measured above the written sources): unbounded, the writers hold 85.7 MiB and the
-merge adds 102–106 MiB to the heap; at a 32 MiB share the merge reserves 56.8 MiB, its writers get
-12.1 MiB and report at most 8.0 MiB — one append, which binds every source, fills the room left — and
+file backend, heap measured above the written sources): unbounded, the writers hold 93.4 MiB and the
+merge adds 102 MiB to the heap; at a 32 MiB share the merge reserves 57.4 MiB, its writers get
+12.7 MiB and report at most 9.8 MiB — one append, which binds every source, fills the room left — and
 the merge adds 28–31 MiB (runs vary). The charges are bounds: the windows are charged full before a
-frame is read, and the manifest bounds a granule's rows from the granule count. On a one-day,
-logs-shaped merge of four flushed parts (154 MiB decoded, body columns flushed unframed, ~29k-entry
-attribute dictionaries, ZSTD best, 64 MiB cap) the merge adds 158 MiB to the heap against a
-193.6 MiB reservation, whatever the share: the sources read their unframed body columns whole
-(~19 MiB each) and the two encoders take 40 MiB. Its writers get the floor, 48 MiB, and seal three
-parts of 44–55 MiB where the cap alone seals 60–66 MiB parts — as many parts, each short of the cap
-by the append reserve. Block-framing record body columns at flush would bound the dominant term to a
-window per source, at the cost of the blocked-bytes full scan. A need past the whole process budget
-reserves all of it (the pool clamps), runs alone, and counts the excess in
+frame is read, a dictionary region as if it did not compress, and the manifest bounds a granule's
+rows from the granule count. On a one-day, logs-shaped merge of four flushed parts (154 MiB decoded,
+body columns flushed unframed, ~29k-entry attribute dictionaries, ZSTD best, 64 MiB cap) the merge
+adds 151 MiB to the heap against a 194.2 MiB reservation, whatever the share: the sources read their
+unframed body columns whole (~19 MiB each) and the two encoders take 40 MiB. Its writers get the
+floor, 48.7 MiB, and with each charging its finish seal five parts of 34–37 MiB (12 MiB last) where
+the cap alone seals three of 60–66 MiB. Block-framing record body columns at flush would bound the
+dominant term to a window per source, at the cost of the blocked-bytes full scan. A need past the
+whole process budget reserves all of it (the pool clamps), runs alone, and counts the excess in
 `merge.over_budget_bytes` with a warning (`TestMergeNeedingMoreThanTheBudgetCompletes`).
 
 **Sidecars are built from the same rows.** Identities and watermarks are per stream. A bloom cannot be

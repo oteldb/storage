@@ -84,7 +84,7 @@ func TestOpenGrantedCoversAShortGrant(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, sources, len(e.parts))
 
-			_, reserve, need := mergeWriterBudget(g.bytes, sources, encoders, 0)
+			_, reserve, need := mergeWriterBudget(e.cfg.Schema, g.bytes, sources, encoders, 0)
 			assert.GreaterOrEqual(t, g.bytes, need, "the grant must cover what the opened sources need")
 			assert.GreaterOrEqual(t, limit, 2*reserve)
 			assert.Equal(t, tc.wantWaitLast, waits[len(waits)-1])

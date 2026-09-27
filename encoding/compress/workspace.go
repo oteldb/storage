@@ -20,3 +20,27 @@ func (c *Compressor) EncodeWorkspace() int64 {
 		return 0
 	}
 }
+
+// CompressBound is the most [Compressor.Compress] appends for n bytes of input, compressed or stored
+// raw: a destination with that much spare capacity takes the output without growing.
+func (c *Compressor) CompressBound(n int) int {
+	return n + n/255 + 64
+}
+
+// CompressTransient bounds what one [Compressor.Compress] call over n bytes allocates: into a fresh
+// destination, the bound twice over for the append growth that builds it — into a presized one,
+// nothing — and for lz4 the block it compresses into first.
+func (c *Compressor) CompressTransient(n int, presized bool) int64 {
+	bound := int64(c.CompressBound(n))
+
+	var out int64
+	if !presized {
+		out = 2 * bound
+	}
+
+	if c.alg == AlgorithmLZ4 {
+		out += bound
+	}
+
+	return out
+}

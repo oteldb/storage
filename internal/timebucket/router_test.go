@@ -198,6 +198,34 @@ func TestRouterReserveRunKeepsTheLimit(t *testing.T) {
 	}
 }
 
+// TestRouterHeldCountsAgainstTheLimit: what the caller holds beside the writers leaves them only the
+// rest of the limit, and is part of the peak.
+func TestRouterHeldCountsAgainstTheLimit(t *testing.T) {
+	t.Parallel()
+
+	const (
+		limit = 100
+		held  = 60
+	)
+
+	r := newRecorder(0, limit)
+	r.Held = func() int64 { return held }
+
+	for d := range int64(8) {
+		require.NoError(t, r.Append(d*day, func(w *writer) (bool, error) {
+			w.rows += 10
+
+			return false, nil
+		}))
+
+		require.Less(t, held+r.held(), int64(limit), "day %d", d)
+	}
+
+	peak, _ := r.Peak()
+	assert.Greater(t, peak, int64(held), "the peak must count what the caller holds")
+	assert.LessOrEqual(t, peak, int64(limit+10))
+}
+
 func TestRouterAppendSealsFullWriter(t *testing.T) {
 	t.Parallel()
 

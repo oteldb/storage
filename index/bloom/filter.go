@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"math"
+	"slices"
 
 	"github.com/go-faster/errors"
 	"github.com/zeebo/xxh3"
@@ -60,6 +61,12 @@ func Bits(n int, p float64) uint64 {
 	return (m + 63) &^ 63 // round up to a whole 64-bit word
 }
 
+// SizeBytes is what the filter's bits hold in RAM.
+func (f *Filter) SizeBytes() int64 { return int64(len(f.bits)) * 8 }
+
+// EncodedBytes is the length [Filter.Encode] appends, which it allocates at once.
+func (f *Filter) EncodedBytes() int { return 1 + 2*binary.MaxVarintLen64 + 8*len(f.bits) + 4 }
+
 // Add records item in the filter.
 func (f *Filter) Add(item []byte) {
 	h1, h2 := hashes(item)
@@ -105,6 +112,7 @@ func hashes(item []byte) (uint64, uint64) {
 // [version][uvarint k][uvarint m][bits little-endian]…[u32 CRC32C of the preceding bytes].
 func (f *Filter) Encode(dst []byte) []byte {
 	start := len(dst)
+	dst = slices.Grow(dst, f.EncodedBytes())
 	dst = append(dst, encodeVersion)
 	dst = binary.AppendUvarint(dst, uint64(f.k))
 	dst = binary.AppendUvarint(dst, f.m)

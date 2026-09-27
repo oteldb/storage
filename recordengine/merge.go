@@ -414,7 +414,10 @@ func (e *Engine) compactStreamed(
 
 	e.reportOverBudget(ctx, grant.bytes)
 
-	var newParts []*part
+	var (
+		newParts []*part
+		sealed   int64
+	)
 
 	router := timebucket.Router[*recordPartStreamWriter]{
 		Open: func(int64) (*recordPartStreamWriter, error) {
@@ -427,10 +430,12 @@ func (e *Engine) compactStreamed(
 			}
 
 			newParts = append(newParts, p)
+			sealed += p.residentBytes()
 
 			return nil
 		},
 		Resident:      (*recordPartStreamWriter).residentBytes,
+		Held:          func() int64 { return sealed },
 		MaxOpen:       timebucket.MaxOpenWriters,
 		ResidentLimit: writerLimit,
 		ReserveRun:    appendReserve,
@@ -510,7 +515,7 @@ func (e *Engine) openGranted(
 			return nil, 0, 0, err
 		}
 
-		limit, reserve, need := mergeWriterBudget(grant.bytes, sources, encoders, runBytes)
+		limit, reserve, need := mergeWriterBudget(e.cfg.Schema, grant.bytes, sources, encoders, runBytes)
 		if grant.bytes == 0 || need <= grant.bytes {
 			return sources, limit, reserve, nil
 		}
@@ -520,7 +525,7 @@ func (e *Engine) openGranted(
 		case err != nil:
 			return nil, 0, 0, err
 		case topped:
-			limit, reserve, _ = mergeWriterBudget(grant.bytes, sources, encoders, runBytes)
+			limit, reserve, _ = mergeWriterBudget(e.cfg.Schema, grant.bytes, sources, encoders, runBytes)
 
 			return sources, limit, reserve, nil
 		case !grant.wait:

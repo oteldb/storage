@@ -55,7 +55,7 @@ func (e *Engine) mergePartBytes(capBytes int64) int64 {
 // ([appendReserve]). need is what the grant must be for the writers to get at least two appends; a
 // grant of 0 bounds nothing.
 func mergeWriterBudget(
-	grant int64, sources []mergeSource, encoders, runBytes int64,
+	schema *Schema, grant int64, sources []mergeSource, encoders, runBytes int64,
 ) (limit, reserve, need int64) {
 	held := encoders
 	entries := 0
@@ -65,7 +65,7 @@ func mergeWriterBudget(
 		entries += s.dictEntries()
 	}
 
-	reserve = appendReserve(entries, runBytes)
+	reserve = appendReserve(schema, entries, runBytes)
 	need = held + 2*reserve
 
 	if grant <= 0 {

@@ -52,7 +52,7 @@ func TestRecordPartWriterResidentTracksHeap(t *testing.T) {
 		}
 	}
 
-	claim := w.residentBytes()
+	claim := w.residentBytes() - w.finishBytes()
 
 	runtime.GC()
 

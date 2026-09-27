@@ -13,6 +13,7 @@ import (
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/watermark"
+	"github.com/oteldb/storage/signal"
 )
 
 // Column ordinals of a merged record part, fixed by the order [newRecordPartStreamWriter] declares
@@ -53,6 +54,11 @@ type recordPartStreamWriter struct {
 	wmarks  []watermark.Entry
 	minT    int64
 	maxT    int64
+
+	// identityBytes bounds the identity object of the streams taken so far, as it is encoded;
+	// idScratch is the buffer each stream's identity is measured in.
+	identityBytes int64
+	idScratch     []byte
 
 	sinks []*columnSink
 	// binds holds, per source and byte column, the binding to a table that outlives the source's
@@ -155,6 +161,7 @@ func (w *recordPartStreamWriter) appendRows(u chunk.U128, ts []int64, bytes int6
 
 		w.cur = u
 		w.wmarks = append(w.wmarks, watermark.Entry{ID: u128ToID(u), Max: minInt64})
+		w.identityBytes += w.identityBound(u128ToID(u))
 	}
 
 	if w.rows == 0 {
@@ -308,12 +315,58 @@ func (w *recordPartStreamWriter) residentBytes() int64 {
 	}
 
 	n += int64(cap(w.binds))*int64(unsafe.Sizeof(sourceBindings{})) + int64(w.bound)*bindingBytes
+	n += int64(cap(w.idScratch)) + w.finishBytes()
 
 	for _, s := range w.sinks {
 		n += s.residentBytes()
 	}
 
 	return n + w.refBytes
+}
+
+// finishBytes bounds what finishing the part allocates past what the writer holds: the block
+// writer's last seals and dictionary regions ([block.StreamWriter.FinishBytes]), the stream id column
+// read and decoded back as the part opens and the ranges built from it, the sidecars, the watermarks
+// encoded, and the identity entries and object. The router finishes one writer at a time, and each
+// charges its own finish until then, so the one under way is inside what the router counts.
+func (w *recordPartStreamWriter) finishBytes() int64 {
+	const (
+		idBytes    = 16
+		runBytes   = 24
+		wmarkBytes = 24
+	)
+
+	streams := int64(len(w.wmarks))
+	n := w.w.FinishBytes() + int64(w.rows)*idBytes + w.identityBytes
+	n += streams * (runBytes + int64(unsafe.Sizeof(streamRange{})) + wmarkBytes + int64(unsafe.Sizeof(series.Entry{})))
+
+	for _, s := range w.sinks {
+		n += s.finishBytes()
+	}
+
+	return n
+}
+
+// identityBound bounds what stream id adds to the identity object as it is encoded: its wire form
+// in the body, in the symbol table and in the object assembled from both, and a table entry and a
+// reference per symbol.
+func (w *recordPartStreamWriter) identityBound(id signal.SeriesID) int64 {
+	const symbolBytes = 96
+
+	e := w.e
+
+	e.mu.RLock()
+	s, ok := e.head.series.Get(id)
+	e.mu.RUnlock()
+
+	if !ok {
+		return 0
+	}
+
+	w.idScratch = s.AppendHashInput(w.idScratch[:0])
+	symbols := 4 + 2*(len(s.Resource.Attributes)+len(s.Scope.Attributes)+len(s.Attributes))
+
+	return 3*int64(len(w.idScratch)) + int64(symbols)*symbolBytes
 }
 
 // abort releases the part's in-flight column objects; a no-op once the part is written.

@@ -454,7 +454,7 @@ func TestScanBoundCoversDecoder(t *testing.T) {
 	r, _ := writeBytesPart(t, vals, 512, WithCompressBlockBytes(4096), WithSizingStats())
 
 	for _, window := range []int64{0, 1, 4096, 1 << 20} {
-		bound, ok := r.ScanBound(ctx, "attrs", window)
+		bound, _, ok := r.ScanBound(ctx, "attrs", window)
 		require.True(t, ok, "window %d", window)
 
 		scan, err := r.ColumnScan(ctx, "attrs", window)
@@ -465,10 +465,10 @@ func TestScanBoundCoversDecoder(t *testing.T) {
 
 	unsized, _ := writeBytesPart(t, vals, 512)
 
-	_, ok := unsized.ScanBound(ctx, "attrs", 1<<20)
+	_, _, ok := unsized.ScanBound(ctx, "attrs", 1<<20)
 	assert.False(t, ok, "a part without sizing stats cannot be bounded from its manifest")
 
-	_, ok = r.ScanBound(ctx, "missing", 1<<20)
+	_, _, ok = r.ScanBound(ctx, "missing", 1<<20)
 	assert.False(t, ok)
 }
 

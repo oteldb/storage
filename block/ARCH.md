@@ -362,7 +362,12 @@ them. At S3 latencies that is the difference between a merge finishing and not.
   decompressed frame twice over while a larger one replaces it, and one decoded granule — so a merge
   can charge its sources before reading a frame. `PartReader.ScanBound` bounds the same figure from
   the manifest alone (sizing stats, the trailer dictionary's size and entry count, the granule count),
-  so a merge can reserve before it opens a column; it declines a column the manifest cannot size.
+  and separately what the open holds on top — the tail as read and the dictionary decompressed into
+  scratch beside its kept copy — so a merge can reserve before it opens a column; it declines a
+  column the manifest cannot size. A dictionary region is compressed into one buffer sized for the
+  worst case, with its header written before the payload, so building it costs the serialized
+  dictionary and that buffer and nothing grows or is copied (`StreamWriter.FinishBytes` bounds a
+  writer's finish from it).
 - `WithFrameCompressors` hands a `StreamWriter` compressors for its frames alone, while dictionary
   regions and unframed columns keep the writer's own: a frame is bounded by the compress block plus
   one granule, so its encoder can be sized for it (`NewFrameCompressor`, a 1 MiB window).

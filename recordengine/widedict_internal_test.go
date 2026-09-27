@@ -97,10 +97,10 @@ func TestSourceBoundCoversOpened(t *testing.T) {
 			require.NoError(t, err)
 
 			for i, p := range e.parts {
-				bytes, entries, ok := e.sourceBound(ctx, p)
+				b, ok := e.sourceBound(ctx, p)
 				require.True(t, ok, "source %d", i)
-				assert.GreaterOrEqual(t, bytes, sources[i].residentBytes(), "source %d", i)
-				assert.GreaterOrEqual(t, entries, sources[i].dictEntries(), "source %d", i)
+				assert.GreaterOrEqual(t, b.steady, sources[i].residentBytes(), "source %d", i)
+				assert.GreaterOrEqual(t, b.entries, sources[i].dictEntries(), "source %d", i)
 			}
 		})
 	}

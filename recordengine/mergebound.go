@@ -4,17 +4,31 @@ import (
 	"context"
 	"encoding/binary"
 	"math"
+	"unsafe"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/compress"
 )
 
-// sourceBound bounds from p's manifest what the merge source it opens as will report
-// ([mergeSource.residentBytes]) and how many stable dictionary entries it will hand a writer
-// ([mergeSource.dictEntries]), so a merge can reserve its memory before opening anything. ok is false
-// when the manifest cannot size a column the source reads.
-func (e *Engine) sourceBound(ctx context.Context, p *part) (bytes int64, entries int, ok bool) {
+// sourceBudget is what a merge source costs, bounded from its part's manifest: steady is what it
+// reports once open ([mergeSource.residentBytes]), open what opening one of its columns holds on top
+// at most, and entries the stable dictionary entries it hands a writer ([mergeSource.dictEntries]).
+type sourceBudget struct {
+	steady, open int64
+	entries      int
+}
+
+// wholeReadOpen is what reading and decoding one column whole holds beside what it keeps: the object
+// as read and, for a compressed one, the stream decompressed into scratch.
+func wholeReadOpen(desc block.ColumnDesc) int64 {
+	return desc.Bytes + desc.Sizing.StreamRaw + desc.DictRaw + int64(compress.OutputSlack(desc.Compress))
+}
+
+// sourceBound bounds from p's manifest what the merge source it opens as will cost, so a merge can
+// reserve its memory before opening anything. ok is false when the manifest cannot size a column the
+// source reads.
+func (e *Engine) sourceBound(ctx context.Context, p *part) (b sourceBudget, ok bool) {
 	if !forwardReadable(p.ranges) || mergeReadWhole || p.tsDisorder.Load() {
 		return wholeBound(p)
 	}
@@ -26,33 +40,41 @@ func (e *Engine) sourceBound(ctx context.Context, p *part) (bytes int64, entries
 
 	rows := int64(p.reader.RowCount())
 
-	intCol := func(name string, fillRows int) (int64, bool) {
+	intCol := func(name string, fillRows int) bool {
 		desc, ok := p.reader.ColumnDescByName(name)
 		switch {
 		case !ok:
-			return 0, false
+			return false
 		case desc.Const:
-			return int64(fillRows) * 8, true
+			b.steady += int64(fillRows) * 8
 		case !desc.Blocked:
-			return rows * 8, true
+			if !desc.HasSizing {
+				return false
+			}
+
+			b.steady += rows * 8
+			b.open = max(b.open, wholeReadOpen(desc))
 		default:
-			return p.reader.ScanBound(ctx, name, e.mergeReadWindow)
+			steady, open, ok := p.reader.ScanBound(ctx, name, e.mergeReadWindow)
+			if !ok {
+				return false
+			}
+
+			b.steady += steady
+			b.open = max(b.open, open)
 		}
+
+		return true
 	}
 
-	n, ok := intCol(colTs, longest)
-	if !ok {
-		return 0, 0, false
+	if !intCol(colTs, longest) {
+		return sourceBudget{}, false
 	}
-
-	bytes += n
 
 	for k := range p.schema.numInts() {
-		if n, ok = intCol(p.schema.intColumn(k).Name, mergeGranuleRows); !ok {
-			return 0, 0, false
+		if !intCol(p.schema.intColumn(k).Name, mergeGranuleRows) {
+			return sourceBudget{}, false
 		}
-
-		bytes += n
 	}
 
 	for k := range p.schema.numBytes() {
@@ -60,94 +82,159 @@ func (e *Engine) sourceBound(ctx context.Context, p *part) (bytes int64, entries
 
 		desc, ok := p.reader.ColumnDescByName(name)
 		if !ok {
-			return 0, 0, false
+			return sourceBudget{}, false
 		}
 
 		switch {
 		case desc.Const:
-			bytes += mergeGranuleRows
+			b.steady += mergeGranuleRows
 		case !desc.Blocked:
 			if !desc.HasSizing {
-				return 0, 0, false
+				return sourceBudget{}, false
 			}
 
-			bytes += desc.Sizing.StreamRaw + rows*(viewBytes+binary.MaxVarintLen32+4)
-			entries += int(rows)
+			b.steady += desc.Sizing.StreamRaw + rows*(viewBytes+binary.MaxVarintLen32+4)
+			b.open = max(b.open, wholeReadOpen(desc))
+			b.entries += int(rows)
 		default:
-			if n, ok = p.reader.ScanBound(ctx, name, e.mergeReadWindow); !ok {
-				return 0, 0, false
+			steady, open, ok := p.reader.ScanBound(ctx, name, e.mergeReadWindow)
+			if !ok {
+				return sourceBudget{}, false
 			}
 
-			bytes += n
-			entries += int(desc.DictEntries)
+			b.steady += steady
+			b.open = max(b.open, open)
+			b.entries += int(desc.DictEntries)
 		}
 	}
 
-	return bytes, entries, true
+	return b, true
 }
 
 // wholeBound is [Engine.sourceBound] for a part decoded whole: its columns as [part.readForMerge]
 // decodes them, a byte column's dictionary and values allowed their full growth, since they are built
-// by appending.
-func wholeBound(p *part) (bytes int64, entries int, ok bool) {
+// by appending, and the most a stream gathered and sorted out of it can hold ([gatherBound]).
+func wholeBound(p *part) (b sourceBudget, ok bool) {
 	rows := int64(p.reader.RowCount())
-	bytes = 8 * rows * int64(1+p.schema.numInts())
+	b.steady = 8*rows*int64(1+p.schema.numInts()) + gatherBound(p)
+
+	for _, name := range append([]string{colTs}, intColumnNames(p.schema)...) {
+		desc, ok := p.reader.ColumnDescByName(name)
+		switch {
+		case !ok:
+			return sourceBudget{}, false
+		case desc.Const:
+		case !desc.HasSizing:
+			return sourceBudget{}, false
+		default:
+			b.open = max(b.open, wholeReadOpen(desc))
+		}
+	}
 
 	for k := range p.schema.numBytes() {
 		desc, ok := p.reader.ColumnDescByName(p.schema.byteColumn(k).Name)
 		switch {
 		case !ok:
-			return 0, 0, false
+			return sourceBudget{}, false
 		case desc.Const:
-			bytes += int64(len(desc.ConstBytes)) + viewBytes + binary.MaxVarintLen32 + rows
-			entries++
+			b.steady += int64(len(desc.ConstBytes)) + viewBytes + binary.MaxVarintLen32 + rows
+			b.entries++
 
 			continue
 		case !desc.HasSizing:
-			return 0, 0, false
+			return sourceBudget{}, false
 		}
 
 		values := rows + desc.DictEntries
-		bytes += desc.DictRaw + desc.Sizing.StreamRaw + 2*values*(viewBytes+binary.MaxVarintLen32) + 2*4*rows
-		entries += int(values)
+		b.steady += desc.DictRaw + desc.Sizing.StreamRaw + 2*values*(viewBytes+binary.MaxVarintLen32) + 2*4*rows
+		b.open = max(b.open, wholeReadOpen(desc))
+		b.entries += int(values)
 	}
 
-	return bytes, entries, true
+	return b, true
+}
+
+func intColumnNames(schema *Schema) []string {
+	names := make([]string, schema.numInts())
+	for k := range names {
+		names[k] = schema.intColumn(k).Name
+	}
+
+	return names
+}
+
+// gatherBound is the most a whole-decoded part's gather can hold ([gatherRun]): one stream's rows —
+// at most the part's, d decoded bytes over r rows — copied out with append growth (2d plus 2×4 B of
+// offset a row per byte column), sorted through an index (8 B a row) into fresh timestamp and int
+// arrays (at most d again) and a second set of byte blobs and offsets (2d plus the offsets again),
+// with a view a row per byte column (24 B): 5d + (8 + 40 per byte column) B a row.
+func gatherBound(p *part) int64 {
+	rows := int64(p.reader.RowCount())
+
+	return 5*p.sizeBytes() + rows*(8+40*int64(p.schema.numBytes()))
 }
 
 // mergeFloorRun is the run the writer budget assumes for a merge not bound by a part size.
 const mergeFloorRun = 1 << 20
 
 // appendReserve is the room the router keeps for one append: a writer binding every source's
-// dictionaries, 12 B an entry, plus one run.
-func appendReserve(entries int, runBytes int64) int64 {
+// dictionaries, 12 B an entry, plus one run, plus what a writer charges for its finish before it holds
+// anything ([writerFinishBase]).
+func appendReserve(schema *Schema, entries int, runBytes int64) int64 {
 	const bindEntryBytes = 12
 
 	if runBytes <= 0 {
 		runBytes = mergeFloorRun
 	}
 
-	return runBytes + int64(entries)*bindEntryBytes
+	return runBytes + int64(entries)*bindEntryBytes + writerFinishBase(schema)
+}
+
+// writerFinishBase is the least a writer charges for its finish ([recordPartStreamWriter.finishBytes]):
+// one frame of the default compress block compressed, and each bloom column's smallest filter built,
+// encoded and read back.
+func writerFinishBase(schema *Schema) int64 {
+	const (
+		frame  = 64 << 10
+		header = 32
+	)
+
+	n := 2 * (frame + frame/255 + 64)
+
+	for k := range schema.numBytes() {
+		if schema.byteColumn(k).Bloom != BloomNone {
+			n += 3 * (smallFilterBytes + header)
+		}
+	}
+
+	return int64(n)
 }
 
 // mergeNeed is what a merge of src must be able to hold before anything opens: the sources as their
-// manifests bound them, the encoders, and the writers' floor of two appends. ok is false when a
-// source's manifest cannot say.
+// manifests bound them, and on top the larger of what opening one column holds — the sources open
+// one column at a time, before any writer — and the encoders with the writers' floor of two appends.
+// ok is false when a source's manifest cannot say.
 func (e *Engine) mergeNeed(ctx context.Context, src []*part, capBytes int64) (int64, bool) {
-	need := e.newMergeCoders(src).workspace()
-	entries := 0
+	var (
+		steady, open int64
+		entries      int
+	)
 
 	for _, p := range src {
-		n, k, ok := e.sourceBound(ctx, p)
+		b, ok := e.sourceBound(ctx, p)
 		if !ok {
 			return 0, false
 		}
 
-		need += n
-		entries += k
+		steady += b.steady
+		open = max(open, b.open)
+		entries += b.entries
 	}
 
-	return need + 2*appendReserve(entries, e.mergePartBytes(capBytes)/mergeRunFraction), true
+	writers := e.newMergeCoders(src).workspace() +
+		2*appendReserve(e.cfg.Schema, entries, e.mergePartBytes(capBytes)/mergeRunFraction)
+
+	return steady + max(open, writers), true
 }
 
 // mergeCoders are the compressors a merge's day writers share: frames go through a 1 MiB-window
@@ -211,4 +298,20 @@ func mergeObjectBytes(src []*part, buffered bool) int {
 	}
 
 	return int(min(largest, math.MaxInt))
+}
+
+// residentBytes is what an open part holds in RAM beyond its reader: its stream ranges, blooms and
+// record keys. A merge keeps the parts it seals until it commits them.
+func (p *part) residentBytes() int64 {
+	n := int64(cap(p.ranges)) * int64(unsafe.Sizeof(streamRange{}))
+
+	for _, f := range p.blooms {
+		n += f.SizeBytes()
+	}
+
+	for _, k := range p.recordKeys {
+		n += int64(len(k)) + viewBytes
+	}
+
+	return n
 }

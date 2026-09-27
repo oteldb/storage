@@ -378,12 +378,23 @@ func appendSharedIDs(dst []byte, mode byte, ids []int32) []byte {
 // dictRegion is a shared dictionary's region:
 //
 //	[uvarint entryCount][uvarint packedLen][packed][u32le CRC32C(packed)]
+//
+// It is built in one buffer sized for the worst case: the payload is compressed into it past room
+// for the two uvarints, which are then written right-aligned before it, so neither the payload nor
+// the region is copied or grown.
 func dictRegion(comp *compress.Compressor, blob []byte, entries int) []byte {
-	packed := comp.Compress(nil, blob)
+	const head = 2 * binary.MaxVarintLen64
 
-	dst := binary.AppendUvarint(nil, uint64(entries))
-	dst = binary.AppendUvarint(dst, uint64(len(packed)))
-	dst = append(dst, packed...)
+	buf := make([]byte, head, head+comp.CompressBound(len(blob))+objectCRCBytes)
+	packed := comp.Compress(buf[head:], blob)
 
-	return binary.LittleEndian.AppendUint32(dst, crc32.Checksum(packed, castagnoli))
+	var h [head]byte
+
+	n := len(binary.AppendUvarint(binary.AppendUvarint(h[:0], uint64(entries)), uint64(len(packed))))
+	start := head - n
+	copy(buf[start:head], h[:n])
+
+	region := buf[start : head+len(packed)]
+
+	return binary.LittleEndian.AppendUint32(region, crc32.Checksum(packed, castagnoli))
 }

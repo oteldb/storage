@@ -51,23 +51,31 @@ func (r *PartReader) ColumnScan(ctx context.Context, name string, window int64) 
 }
 
 // ScanBound bounds, from the manifest alone, what [Decoder.ResidentBytes] reports for
-// ColumnScan(ctx, name, window), so a caller can reserve memory before opening the column. ok is
-// false for a column the manifest cannot size: one written without [WithSizingStats], an unframed
-// or leading-dictionary layout, a constant or unblocked column, or none by that name.
-func (r *PartReader) ScanBound(ctx context.Context, name string, window int64) (n int64, ok bool) {
+// ColumnScan(ctx, name, window) — steady — and what opening it holds on top while it reads and parses
+// the column's tail — open: the dictionary region and directory as read, and the dictionary
+// decompressed into scratch before it is kept. A caller can reserve both before opening the column.
+// ok is false for a column the manifest cannot size: one written without [WithSizingStats], an
+// unframed or leading-dictionary layout, a constant or unblocked column, or none by that name.
+func (r *PartReader) ScanBound(ctx context.Context, name string, window int64) (steady, open int64, ok bool) {
 	i, ok := r.byName[name]
 	if !ok {
-		return 0, false
+		return 0, 0, false
 	}
 
 	desc := r.manifest.Columns[i]
 	if desc.Const || !desc.Blocked || !desc.Framed || !desc.HasSizing || (desc.SharedDict && !desc.TrailerDict) {
-		return 0, false
+		return 0, 0, false
 	}
 
 	sz := desc.Sizing
+	slack := int64(compress.OutputSlack(desc.Compress))
 
-	n = 4 * (3*sz.NumFrames + 1 + 3*sz.NumGranules)
+	open = sz.DirLen + dirProbeBytes + footerLenBytes
+	if desc.TrailerDict {
+		open = desc.Bytes - desc.DictOff + desc.DictRaw + slack
+	}
+
+	n := 4 * (3*sz.NumFrames + 1 + 3*sz.NumGranules)
 	n += desc.DictRaw + (binary.MaxVarintLen32+24)*desc.DictEntries
 
 	switch {
@@ -81,7 +89,7 @@ func (r *PartReader) ScanBound(ctx context.Context, name string, window int64) (
 		n += sz.MaxFrameBytes
 	}
 
-	n += 2 * (sz.MaxFrameRaw + int64(compress.OutputSlack(desc.Compress)))
+	n += 2 * (sz.MaxFrameRaw + slack)
 
 	// The granule count is ceil(rows / granule rows), so a granule holds fewer than rows / (count-1).
 	rows, granules := int64(r.manifest.RowCount), sz.NumGranules
@@ -89,7 +97,7 @@ func (r *PartReader) ScanBound(ctx context.Context, name string, window int64) (
 		rows = rows/(granules-1) + 1
 	}
 
-	return n + rows*desc.Kind.decodedRowBytes(), true
+	return n + rows*desc.Kind.decodedRowBytes(), open, true
 }
 
 // ResidentBytes bounds what a forward walk over the decoder holds at any point: the directory and

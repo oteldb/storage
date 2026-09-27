@@ -178,6 +178,8 @@ type wholeSource struct {
 	d      *decodedPart
 	served arrayRun
 	gather gatherRun
+	// gatherMax is the most gather can grow to ([gatherBound]), charged from the start.
+	gatherMax int64
 }
 
 func openWholeSource(ctx context.Context, p *part) (*wholeSource, error) {
@@ -192,14 +194,14 @@ func openWholeSource(ctx context.Context, p *part) (*wholeSource, error) {
 		}
 	}
 
-	s := &wholeSource{schema: p.schema, ranges: p.ranges, d: d}
+	s := &wholeSource{schema: p.schema, ranges: p.ranges, d: d, gatherMax: gatherBound(p)}
 	s.served.init(p.schema)
 	s.gather.init(p.schema)
 
 	return s, nil
 }
 
-func (s *wholeSource) residentBytes() int64 { return s.d.residentBytes() }
+func (s *wholeSource) residentBytes() int64 { return s.d.residentBytes() + s.gatherMax }
 
 func (s *wholeSource) dictEntries() int {
 	var n int

@@ -12,7 +12,8 @@ const MaxOpenWriters = 32
 // Router hands a merge's output rows to one writer per top-level bucket, so a merge whose rows span
 // several days writes a part per day in a single pass over its inputs.
 //
-// At most MaxOpen writers are open, and together they hold less than ResidentLimit (≤ 0 ⇒
+// At most MaxOpen writers are open, and together with Held — what the caller holds beside them —
+// they hold less than ResidentLimit (≤ 0 ⇒
 // unbounded) after every run [Router.Append] routes: past either bound the writer holding the most is
 // finished early. A writer's size is whatever Resident reports, so it must count everything the
 // writer holds. A day can therefore end up in several parts, each of which still fits the day, and
@@ -25,6 +26,7 @@ type Router[W any] struct {
 	Open          func(bucket int64) (W, error)
 	Finish        func(W) error
 	Resident      func(W) int64
+	Held          func() int64
 	MaxOpen       int
 	ResidentLimit int64
 	ReserveRun    int64
@@ -119,6 +121,10 @@ func (r *Router[W]) Seal(ts int64) error {
 func (r *Router[W]) Shed() error {
 	for first := true; len(r.open) > 0; first = false {
 		var total int64
+		if r.Held != nil {
+			total = r.Held()
+		}
+
 		for _, w := range r.open {
 			total += r.Resident(w)
 		}
