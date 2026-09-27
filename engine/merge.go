@@ -115,7 +115,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	}
 
 	var unnested []DownsampleTier
-	if opts.Downsample, unnested = nestedTiers(src, opts.Downsample); len(unnested) > 0 &&
+	if opts.Downsample, unnested = resolvePolicy(src, opts.Downsample); len(unnested) > 0 &&
 		e.unnestedWarned.CompareAndSwap(false, true) {
 		zctx.From(ctx).Warn("downsample tier not applied: its interval does not nest with one a part already records",
 			zap.String("prefix", e.cfg.Prefix), zap.Int64("interval", unnested[0].Interval))

@@ -498,3 +498,48 @@ func TestRerollReadFoldsRepresentatives(t *testing.T) {
 		})
 	}
 }
+
+// TestRerollAggChangeLateRolledAlone: after an Agg change, a late part in a range already rolled with
+// Sum is rolled on its own before it meets the Sum part. It must be rolled with Sum too, so that the
+// merge joining them folds and records one Agg; had it been rolled with Count, the fold and the marker
+// would disagree on which one.
+func TestRerollAggChangeLateRolledAlone(t *testing.T) {
+	t.Parallel()
+
+	sum := tiersOf(signal.AggSum, engine.DownsampleTier{Before: rerollBase + dayNanos, Interval: 6 * hr})
+	count := tiersOf(signal.AggCount, engine.DownsampleTier{Before: rerollBase + dayNanos, Interval: 6 * hr})
+
+	r := newRerollEngine(t)
+	// The ladder leaves the newest day open; a sample two days on closes the one under test.
+	r.write(rerollBase+2*dayNanos, 1)
+	r.flush()
+
+	r.write(rerollBase+min1, 2)
+	r.write(rerollBase+2*min1, 3)
+	r.flush()
+	r.merge(sum)
+
+	// A straddler is rewritten alone, so the late samples are rolled without the Sum part.
+	r.write(rerollBase-sec, 100)
+	r.write(rerollBase+3*hr, 4)
+	r.write(rerollBase+7*hr, 6)
+	r.flush()
+	r.merge(count)
+	require.Equal(t, 4, r.e.PartCount(), "the late part was rolled alone")
+
+	count.RetainFrom = rerollBase
+	r.merge(count)
+	r.merge(count)
+
+	r.write(rerollBase+4*hr, 10)
+	r.flush()
+
+	count.Force = true
+	for range 4 {
+		r.merge(count)
+	}
+
+	require.Equal(t, 2, r.e.PartCount())
+
+	r.assertOneRollup(sum.Downsample, rerollBase)
+}

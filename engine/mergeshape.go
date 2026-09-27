@@ -85,7 +85,7 @@ func nextMergeParts(src []*part, opts MergeOptions, capBytes int64, idle int) in
 		}
 	}
 
-	opts.Downsample, _ = nestedTiers(live, opts.Downsample)
+	opts.Downsample, _ = resolvePolicy(live, opts.Downsample)
 
 	return len(src) - len(live) + len(selectMergeParts(live, opts, capBytes, idle))
 }

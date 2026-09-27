@@ -150,7 +150,7 @@ func TestCollectMany(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			ts, values, sf := collectMany(tt.runs, nil, nil, nil, nil)
+			ts, values, sf := collectMany(tt.runs, nil, nil, nil, nil, nil)
 			require.Equal(t, tt.wantTS, ts)
 			require.Equal(t, tt.wantVal, values)
 			require.Equal(t, tt.wantSF, sf)
@@ -208,7 +208,7 @@ func TestCollectManyMatchesNaive(t *testing.T) {
 			runs = append(runs, tsRun{ts: ts, vals: vals, sf: sf})
 		}
 
-		gotTS, gotVal, gotSF := collectMany(runs, nil, nil, nil, nil)
+		gotTS, gotVal, gotSF := collectMany(runs, nil, nil, nil, nil, nil)
 		wantTS, wantVal, wantSF := collectManyNaive(runs)
 
 		require.Equalf(t, wantTS, gotTS, "iter %d timestamps", iter)

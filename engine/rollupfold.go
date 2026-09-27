@@ -80,12 +80,16 @@ func appendTags(tags []rollupTag, r *tsRun, layout []DownsampleTier, lo, hi, n, 
 }
 
 // foldTie consumes every run's sample at ts and returns the one sample kept there. Raw samples
-// dedup freshest-wins. Representatives combine by their recorded Agg instead, with the freshest raw
-// sample folded in as one more sample: two sources can each hold a representative of one bucket
-// start, or a late raw sample can land on one, and freshest-wins would drop the other's data.
-// Runs are visited newest first, so a value-selecting tie goes to the freshest sample.
-func foldTie(runs []tsRun, layouts [][]DownsampleTier, cur []int, ts int64) (float64, float64, rollupTag) {
-	raw, reps := -1, 0
+// dedup freshest-wins. Representatives combine instead, with the freshest raw sample folded in as one
+// more sample: two sources can each hold a representative of one bucket start, or a late raw sample
+// can land on one, and freshest-wins would drop the other's data. They combine by the Agg layout
+// assigns ts, the one a merge records; without it, by the oldest source's, which is the one the merge
+// layout lists first. Runs are visited newest first, so a value-selecting tie goes to the freshest
+// sample.
+func foldTie(
+	runs []tsRun, layouts [][]DownsampleTier, layout []DownsampleTier, cur []int, ts int64,
+) (float64, float64, rollupTag) {
+	raw, reps, oldest := -1, 0, -1
 
 	for i := len(runs) - 1; i >= 0; i-- {
 		r := &runs[i]
@@ -96,6 +100,7 @@ func foldTie(runs []tsRun, layouts [][]DownsampleTier, cur []int, ts int64) (flo
 		switch {
 		case runTag(layoutOf(layouts, i), ts).interval > 0:
 			reps++
+			oldest = i
 		case raw < 0:
 			raw = i
 		}
@@ -112,6 +117,11 @@ func foldTie(runs []tsRun, layouts [][]DownsampleTier, cur []int, ts int64) (flo
 		acc bucketAcc
 		tag rollupTag
 	)
+
+	acc.repAgg, acc.hasRep = runTag(layoutOf(layouts, oldest), ts).agg, true
+	if t, ok := tierAt(layout, ts); ok {
+		acc.repAgg = t.Agg
+	}
 
 	for i := len(runs) - 1; i >= 0; i-- {
 		r := &runs[i]
@@ -150,19 +160,20 @@ func advanceTie(runs []tsRun, cur []int, ts int64) {
 }
 
 // rollTarget returns the bucket width a sample at ts rolls into and the Agg a bucket it opens starts
-// with: the wider of the tier active assigns ts and the sample's own recorded tier. A representative
-// in the bucket overrides the Agg ([bucketAcc.addRep]). Width 0 leaves the sample raw.
-func rollTarget(active []DownsampleTier, ts int64, tag rollupTag) (int64, signal.Aggregation) {
-	interval, agg := int64(0), signal.AggLast
+// with: the wider of the tier active assigns ts and the sample's own recorded tier. fixed reports the
+// Agg is active's, which representatives do not override ([bucketAcc.addRep]). Width 0 leaves the
+// sample raw.
+func rollTarget(active []DownsampleTier, ts int64, tag rollupTag) (interval int64, agg signal.Aggregation, fixed bool) {
+	agg = signal.AggLast
 	if t, ok := pickTier(active, ts); ok {
-		interval, agg = t.Interval, t.Agg
+		interval, agg, fixed = t.Interval, t.Agg, true
 	}
 
 	if tag.interval > interval {
-		interval, agg = tag.interval, tag.agg
+		interval, agg, fixed = tag.interval, tag.agg, false
 	}
 
-	return interval, agg
+	return interval, agg, fixed
 }
 
 // repBucketShared reports whether a representative shares its bucket with another sample its
@@ -191,7 +202,7 @@ func repBucketShared(ts []int64, tags []rollupTag) bool {
 // rollSeries merges one series' sources and rolls the result up under tiers, combining the
 // representatives the sources recorded rather than re-aggregating them as raw samples.
 func rollSeries(m *sampleMerge, tiers []DownsampleTier) (ts []int64, values, sf []float64, covered []int64) {
-	ts, values, sf, tags := m.collectTagged()
+	ts, values, sf, tags := m.collectTagged(tiers)
 
 	return downsampleCovering(ts, values, sf, tags, tiers)
 }

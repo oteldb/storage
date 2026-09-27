@@ -163,6 +163,32 @@ func partOptions(blockRows int, comp compressProfile, rollup *block.Rollup) []bl
 	return opts
 }
 
+// resolvePolicy is the tiers a merge over the live parts src applies: the tiers those parts record,
+// then the policy's tiers that nest with them ([nestedTiers]), which it also returns as dropped when
+// they do not. Recorded tiers go first, so a range already rolled keeps its recorded Agg and width
+// for data rolled later, even when that data never meets the part that recorded them: otherwise a late
+// part rolled alone under a changed Agg would hold representatives that no single marker describes
+// once it meets the older part.
+func resolvePolicy(src []*part, tiers []DownsampleTier) (applied, dropped []DownsampleTier) {
+	kept, dropped := nestedTiers(src, tiers)
+
+	var recorded []DownsampleTier
+
+	for _, p := range src {
+		for _, t := range p.rollup {
+			if !slices.Contains(recorded, t) {
+				recorded = append(recorded, t)
+			}
+		}
+	}
+
+	if len(recorded) == 0 {
+		return kept, dropped
+	}
+
+	return compactLayout(append(recorded, kept...)), dropped
+}
+
 // nestedTiers splits tiers into those whose Interval nests with every Interval a part of src records
 // and those that do not. Coarsening a representative into a bucket that does not hold its whole
 // bucket cannot be exact, and a marker cannot confine a tier to part of its range, so a non-nesting
@@ -215,9 +241,9 @@ type rollupPlan struct {
 // current tiers where some source is pending. Where every source already holds that layout the rollup
 // only folds representatives sharing a bucket, so tiers stays nil and a ladder merge of rolled parts
 // takes the fast path. A lone pending part is rewritten verbatim, its data then holding the layout as
-// if applied, when rolling it would change nothing: for a marked part, no timestamp, value or weight;
-// for an unmarked one, no timestamp, since its values may already be representatives that a re-roll
-// would corrupt.
+// if applied, when rolling it would change no timestamp, value or weight. A part without a marker is
+// raw to that test as to every fold: were timestamps alone enough, raw samples on bucket starts would
+// be stamped as representatives of a count they never had.
 func (e *Engine) planRollup(ctx context.Context, src []*part, start int64, tiers []DownsampleTier) (rollupPlan, error) {
 	if !slices.ContainsFunc(src, func(p *part) bool { return downsamplePending(p, tiers) }) {
 		layout := mergeLayout(src, nil)
@@ -233,7 +259,7 @@ func (e *Engine) planRollup(ctx context.Context, src []*part, start int64, tiers
 	layout := mergeLayout(src, tiers)
 
 	if len(src) == 1 {
-		changes, err := e.rollupChanges(ctx, src[0], start, layout, src[0].rollupKnown)
+		changes, err := e.rollupChanges(ctx, src[0], start, layout)
 		if err != nil {
 			return rollupPlan{}, err
 		}
@@ -305,11 +331,11 @@ func coversSpan(tiers []DownsampleTier, hi int64) bool {
 	return ok
 }
 
-// rollupChanges reports whether rolling p up under tiers changes any series: its timestamps, and
-// with exact also its values and weights. It streams p one series range at a time and stops at the
+// rollupChanges reports whether rolling p up under tiers changes any series: its timestamps, values
+// or weights. It streams p one series range at a time and stops at the
 // first series that changes, so its footprint is a merge source's read window, released before the
 // rewrite that follows allocates.
-func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers []DownsampleTier, exact bool) (bool, error) {
+func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers []DownsampleTier) (bool, error) {
 	src := []*part{p}
 
 	var keys mergestream.Keys
@@ -333,14 +359,14 @@ func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers 
 			return false, err
 		}
 
-		ts, vals, sf, tags := m.collectTagged()
+		ts, vals, sf, tags := m.collectTagged(tiers)
 
 		rolledTs, rolledVals, rolledSF, _ := downsampleCovering(ts, vals, sf, tags, tiers)
 		if !slices.Equal(rolledTs, ts) {
 			return true, nil
 		}
 
-		if exact && (!sameBits(rolledVals, vals) || !sameWeights(rolledSF, sf, len(ts))) {
+		if !sameBits(rolledVals, vals) || !sameWeights(rolledSF, sf, len(ts)) {
 			return true, nil
 		}
 	}

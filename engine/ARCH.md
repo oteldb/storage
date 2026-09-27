@@ -618,17 +618,23 @@ another would add Sum and Count twice; repair never commits a part beside ancest
 the recent tier's raw copy of a sample already rolled up would fold into its representative; the tier
 holds only the last flush window, far younger than any tier's cutoff.
 
-**Recorded Agg wins.** Changing a tier's Agg applies only to data not yet rolled up: a bucket keeps
-the Agg it was rolled with, and a late sample landing in it folds by that Agg. Where a recorded and a
-current tier tie on Interval and `Before`, the merge layout lists recorded tiers first, and tier
-selection keeps the first of a tie. A bucket can hold representatives of two Aggs only if a late
-sample was rolled alone under the new Agg before meeting the older part. It keeps the Agg of the first
-representative folded and folds the rest as plain samples; that is exact when the later one is a
-single anchored sample.
+**Recorded Agg wins.** Changing a tier's Agg applies only to time ranges not yet rolled up: a range
+keeps the Agg it was rolled with, and data landing in it later is rolled by that Agg. Every merge
+resolves the policy against the tiers the live parts record (`resolvePolicy`), recorded tiers first,
+so this holds even for a late part rolled on its own before it meets the part that recorded the
+range. Without that, the late part would record the new Agg over the same range, and once the two
+met no single marker could describe both.
+
+The fold and the marker share one precedence. A merge's bucket takes the Agg the merge layout assigns
+it, and a same-timestamp tie folds by that Agg too. The layout is recorded tiers first, oldest source
+first, and tier selection keeps the first of a tie. A representative of any other Agg folds as a plain
+sample. Parts that already disagree, such as parts written by a node with a different policy, thus
+merge into data that matches its marker, if not the one-pass rollup. A read tie has no layout, so it
+takes the oldest source's Agg, the one the layout would list first.
 
 **Non-nesting history.** `Validate` checks a policy only against itself. A policy tier whose Interval
 does not nest with one a live part already records (5m data, then a 7m tier) is not applied at all
-(`nestedTiers`), and the engine warns once. Coarsening a representative into a bucket that does not
+(`nestedTiers`, within `resolvePolicy`), and the engine warns once. Coarsening a representative into a bucket that does not
 hold its whole bucket cannot be exact, and a marker cannot confine a tier to part of its range. The
 tier applies again once retention drops the last part recording the one it conflicts with.
 
@@ -654,10 +660,12 @@ layout, even when the policy no longer has a tier there. Removing or narrowing a
 un-rolls nothing, and a late raw sample in a recorded-rolled range is still rolled by the recorded
 layout. The marker then describes the output exactly, so a merge of marked parts is always marked.
 
-Only a writer predating the marker leaves a part unknown. Its samples are raw to the fold; a legacy
-Count representative merged beside other parts counts as one sample. A merge with an unknown source
-the layout does not wholly cover records unknown, since past the layout its samples may be legacy
-representatives the marker would call raw.
+Only a writer predating the marker leaves a part unknown. Its samples are raw, to the fold and to the
+lone-part check below alike, so a legacy Count representative counts as one sample. Taking values on
+bucket starts for representatives instead would stamp raw samples with a count they never had (a raw
+100 becoming a count of 100), and a raw part on scrape-aligned bucket starts is the common case. A
+merge with an unknown source the layout does not wholly cover records unknown, since past the layout
+nothing checked its samples.
 
 A part is forced only while the current tiers assign some timestamp in `[minTime, maxTime]` a wider
 Interval than the recorded layout; a recorded layout wider than the policy is not pending, since rolled
@@ -675,17 +683,12 @@ over its span. That is the ladder merge of rolled parts: it only folds represent
 bucket, and a series with none takes the pass-through path after one linear scan
 (`repBucketShared`). A lone pending part
 is first streamed once, one series range at a time, stopping at the first series the rollup would
-change; if none changes, it is rewritten verbatim and records the union with the current tiers. What
-counts as a change depends on what the marker says the values are. For a marked part they are known
-raw (or narrower), so the rollup must be a no-op on timestamps, values *and* weights: a raw sample on
-a bucket start is still a raw value, which a count tier turns into 1 and a weighted sum into
-value·weight, and copying it verbatim would record a layout it never had. For an unmarked part the
-values may already be representatives, so only timestamps are compared: a part rolled before the
-marker existed sits on its bucket starts, and re-rolling its counts would turn each into 1. A raw
-sample alone in its bucket compares equal under Last/First/Min/Max and Avg too, and there the copy is
-exactly the rollup: those emit the sample itself. The cost
-is that a raw legacy part whose samples happen to sit on bucket starts is recorded as rolled without
-being aggregated — the same trade as reading a legacy part's missing size field conservatively.
+change; if none changes, it is rewritten verbatim and records the union with the current tiers. The
+rollup must be a no-op on timestamps, values *and* weights: a raw sample on a bucket start is still a
+raw value, which a count tier turns into 1 and a weighted sum into value·weight, and copying it
+verbatim would record a layout it never had. A raw sample alone in its bucket compares equal under
+Last/First/Min/Max and Avg, and there the copy is exactly the rollup. An unmarked part is not left
+unknown after a verbatim copy: it would stay forced by age, and be rewritten every cycle.
 
 **Weight-aware:** compaction and rollup honor the lossy-sampling scale factor, keeping a sampled series
 unbiased.

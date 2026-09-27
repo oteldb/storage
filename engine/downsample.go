@@ -102,9 +102,10 @@ func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int
 // replica trims its head through must not fall back with it. covered is nil when it equals the
 // output timestamps.
 //
-// A representative rolls into the wider of its own recorded tier and the one tiers assign it, and
-// combines by its recorded Agg, which the bucket keeps over the tier's. Rolled data thus keeps the Agg
-// it was rolled with, and a Count representative adds its count rather than counting as 1.
+// A representative rolls into the wider of its own recorded tier and the one tiers assign it. A bucket
+// tiers cover takes their Agg, the one a merge's marker records; a merge lists recorded tiers first,
+// so rolled data keeps the Agg it was rolled with. A representative of another Agg folds as a plain
+// sample, and a Count representative adds its count rather than counting as 1.
 func downsampleCovering(
 	ts []int64, values, sf []float64, tags []rollupTag, tiers []DownsampleTier,
 ) ([]int64, []float64, []float64, []int64) {
@@ -140,7 +141,7 @@ func downsampleCovering(
 
 	for i, t := range ts {
 		tag := tagAt(tags, i)
-		interval, agg := rollTarget(active, t, tag)
+		interval, agg, fixed := rollTarget(active, t, tag)
 
 		k := key{interval: 0, start: t} // raw, pass through
 		if interval > 0 {
@@ -150,6 +151,10 @@ func downsampleCovering(
 		b := buckets[k]
 		if b == nil {
 			b = &bucketAcc{agg: agg}
+			if fixed {
+				b.repAgg, b.hasRep = agg, true
+			}
+
 			buckets[k] = b
 			order = append(order, k)
 		}
@@ -276,8 +281,9 @@ func alignDown(ts, interval int64) int64 {
 // count is nWeighted with each Count representative contributing the count it carries; wsum sums
 // value·weight (the estimated original total), compensated by wcomp (Neumaier) so a long bucket's
 // total is rounded once rather than once per sample. min/max track the earliest sample holding the
-// extreme non-NaN value, or the first sample while every value so far is NaN. repAgg is the recorded
-// Agg of the first representative added, which the bucket keeps over agg.
+// extreme non-NaN value, or the first sample while every value so far is NaN. repAgg, once hasRep is
+// set, is the Agg the bucket folds representatives by and emits, over agg: the layout's where the
+// caller fixes it, else the first representative's.
 type bucketAcc struct {
 	agg       signal.Aggregation
 	repAgg    signal.Aggregation
