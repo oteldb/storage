@@ -588,8 +588,8 @@ leading NaN win a fine bucket and hide a smaller value from the coarse one. Firs
 sample whatever it is, and a NaN or opposing infinities make a Sum or Avg NaN in either grouping.
 
 Changing a tier's Agg applies only to data not yet rolled up; a rolled bucket keeps the Agg it was
-rolled with. Merges do not enforce that: one that re-rolls a representative aggregates it by the
-current Agg.
+rolled with. The marker keeps a same-width Agg change from forcing a rewrite, but a merge that re-rolls
+a representative for another reason — a pending source beside it — aggregates it by the current Agg.
 
 Anchoring is paid in the ts column, measured on a 1m rollup of 15s scrapes: +0.01 B/row with no scrape
 jitter, +1.1 at ±5ms, +2.0 at ±50ms, against 1.1–6.8 B/row for the value column. The sf column of an
@@ -625,7 +625,7 @@ other bucket's rollup, the ladder and straddler splits.
 
 A merge downsamples only when some source is pending, so a ladder merge of parts already at least as
 wide as the policy does not re-roll their representatives: that re-roll moves no timestamp, and its
-only effect is to corrupt count (a representative recounts as 1) and weighted avg. A lone pending part
+only effect is to corrupt count (a representative recounts as 1). A lone pending part
 is first streamed once, one series range at a time, stopping at the first series the rollup would
 change; if none changes, it is rewritten verbatim and records the union with the current tiers. What
 counts as a change depends on what the marker says the values are. For a marked part they are known
@@ -633,7 +633,9 @@ raw (or narrower), so the rollup must be a no-op on timestamps, values *and* wei
 a bucket start is still a raw value, which a count tier turns into 1 and a weighted sum into
 value·weight, and copying it verbatim would record a layout it never had. For an unmarked part the
 values may already be representatives, so only timestamps are compared: a part rolled before the
-marker existed sits on its bucket starts, and re-rolling its counts would turn each into 1. The cost
+marker existed sits on its bucket starts, and re-rolling its counts would turn each into 1. A raw
+sample alone in its bucket compares equal under Last/First/Min/Max and Avg too, and there the copy is
+exactly the rollup: those emit the sample itself. The cost
 is that a raw legacy part whose samples happen to sit on bucket starts is recorded as rolled without
 being aggregated — the same trade as reading a legacy part's missing size field conservatively. A merge that mixes a pending source
 with already-rolled ones still re-rolls the rolled ones; combining representatives by their aggregation
