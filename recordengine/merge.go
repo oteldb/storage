@@ -191,9 +191,10 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	// unselected part, including any a concurrent flush may have added) and persist the index. The
 	// sources are retired — queued for backend deletion — only once that commit succeeds: the persisted
 	// index is what a restart and every other replica read, so a part it still names must never become
-	// reclaimable. A failed commit rolls the swap back to the committed set, leaving the merge output as
-	// orphan objects the next [Engine.LoadParts] sweeps. The retired parts' objects are deleted by
-	// reclaimRetired once their readers drain.
+	// reclaimable. A failed commit rolls the swap back to the committed set and deletes the merge output,
+	// unless the commit may have landed: then the index may name it, and only the next
+	// [Engine.LoadParts], which reads that index, can tell an orphan from a part. The retired parts'
+	// objects are deleted by reclaimRetired once their readers drain.
 	removed := make(map[string]struct{}, len(selected))
 	for _, p := range selected {
 		removed[p.prefix] = struct{}{}
@@ -206,6 +207,10 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	if err = e.updateIndexLocked(ctx); err != nil {
 		e.parts = committed
 		e.mu.Unlock()
+
+		if !commitMayHaveLanded(err) {
+			e.discardOutputs(ctx, newParts)
+		}
 
 		return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, err
 	}
@@ -378,25 +383,42 @@ func (e *Engine) compactParts(
 
 	for {
 		out, err := e.compactStreamed(ctx, src, start, capBytes, grant)
+		if err == nil {
+			return out, nil
+		}
 
+		// A failed attempt returns the parts it sealed, and nothing will ever index them: a merge that
+		// keeps failing the same way would otherwise leave a full set of outputs behind every cycle.
+		e.discardOutputs(ctx, out)
+
+		// Rows of the disordered stream may already be written out of order, so the attempt is redone
+		// with that source decoded whole, which sorts what it serves.
 		var disorder *sourceDisorderError
 		if !errors.As(err, &disorder) {
-			return out, err
+			return nil, err
 		}
 
-		// Rows of the disordered stream may already be written out of order, so the attempt is
-		// dropped whole and redone with that source decoded whole, which sorts what it serves. The
-		// parts it sealed are removed now; an object that is not is an orphan the next open sweeps.
 		src[disorder.src].tsDisorder.Store(true)
-
-		for _, p := range out {
-			_ = deletePart(ctx, e.cfg.Backend, p.prefix)
-		}
 	}
 }
 
-// compactStreamed is one attempt at [Engine.compactParts]. On a [sourceDisorderError] it returns the
-// parts it had already sealed with the error.
+// discardOutputs deletes the parts a failed merge wrote. It outlives a canceled ctx, which is the
+// likeliest reason the merge failed; a part it cannot delete is left for [Engine.LoadParts] to sweep.
+func (e *Engine) discardOutputs(ctx context.Context, parts []*part) {
+	for _, p := range parts {
+		e.discardOutput(ctx, p.prefix)
+	}
+}
+
+func (e *Engine) discardOutput(ctx context.Context, prefix string) {
+	if err := deletePart(context.WithoutCancel(ctx), e.cfg.Backend, prefix); err != nil {
+		zctx.From(ctx).Warn("merge could not delete an output part it abandoned",
+			zap.String("signal", e.cfg.Signal), zap.String("part", prefix), zap.Error(err))
+	}
+}
+
+// compactStreamed is one attempt at [Engine.compactParts]. Once it has written a part, a failure
+// returns the parts it sealed with the error; a part it was finishing it deletes itself.
 func (e *Engine) compactStreamed(
 	ctx context.Context, src []*part, start, capBytes int64, grant *mergeGrant,
 ) ([]*part, error) {
@@ -436,6 +458,8 @@ func (e *Engine) compactStreamed(
 		Finish: func(w *recordPartStreamWriter) error {
 			s, err := w.finish(ctx)
 			if err != nil {
+				e.discardOutput(ctx, w.prefix)
+
 				return err
 			}
 
@@ -491,11 +515,11 @@ func (e *Engine) compactStreamed(
 	}
 
 	if err := checkDrained(src, sources); err != nil {
-		return nil, err
+		return written(), err
 	}
 
 	if err := router.Close(); err != nil {
-		return nil, err
+		return written(), err
 	}
 
 	// The writers are finished; the sources and the coders go before the outputs open.

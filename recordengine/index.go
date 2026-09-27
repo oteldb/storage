@@ -74,7 +74,7 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 		}
 
 		if !errors.Is(err, bucketindex.ErrConflict) {
-			return errors.Wrap(err, "save bucket index")
+			return &commitUnknownError{err: errors.Wrap(err, "save bucket index")}
 		}
 
 		if err := e.adoptIndexLocked(ctx); err != nil {
@@ -84,6 +84,21 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 
 	return errors.Wrapf(bucketindex.ErrConflict,
 		"commit bucket index after %d attempts", indexCommitAttempts)
+}
+
+// commitUnknownError is a bucket-index save that failed without saying whether it landed. Every
+// other [Engine.updateIndexLocked] failure is a commit that definitely did not.
+type commitUnknownError struct{ err error }
+
+func (e *commitUnknownError) Error() string { return e.err.Error() }
+func (e *commitUnknownError) Unwrap() error { return e.err }
+
+// commitMayHaveLanded reports whether a failed [Engine.updateIndexLocked] may still have committed,
+// so the index may name what it published.
+func commitMayHaveLanded(err error) bool {
+	var unknown *commitUnknownError
+
+	return errors.As(err, &unknown)
 }
 
 // adoptIndexLocked rebases this engine on the index a rival writer committed: it takes that

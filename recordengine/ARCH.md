@@ -469,6 +469,15 @@ Reuse would be unsound here for one extra reason: two of a part's objects are co
 is skipped when the rows carry no record attributes, the `sym-*.bin` sidecars when there is no side
 data — so a new part would silently adopt a failed attempt's.
 
+A merge that fails after writing deletes its own outputs rather than leaving them to the sweep, which
+runs only at open: a merge failing the same way every cycle would otherwise strand a full set of
+outputs per cycle until the next restart. Every sealed part and the one being finished are deleted
+best-effort, past a canceled context, on any failure before the commit — reading an output back,
+finishing a part, a source left undrained. A failed index commit deletes them too, unless the save
+failed without saying whether it landed (`commitUnknownError`, any non-conflict save error): then
+the index may name them, and they wait for the sweep that reads it. A delete that fails is logged and
+likewise waits for the sweep; it never replaces the merge's own error.
+
 A part the owner cannot open is handled identically: only `backend.ErrNotExist` drops it from
 `Entries` and records a `bucketindex.Want` in the same compare-and-swap, every other error still
 fails the load, and the sweep spares a wanted part's remaining objects
