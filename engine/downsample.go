@@ -2,6 +2,7 @@ package engine
 
 import (
 	"cmp"
+	"math"
 	"slices"
 
 	"github.com/oteldb/storage/signal"
@@ -80,9 +81,10 @@ func downsampleApplies(tiers []DownsampleTier, minTime int64) bool {
 // Last/First/Min/Max emit the chosen sample itself — its timestamp, value and weight — so a
 // representative is a real sample and re-rolling it is exact. Sum and Count emit at the bucket
 // start with weight 1 (the weight is folded into the value); Avg emits the weighted mean at the
-// bucket start with the bucket's total weight, so a coarser Avg over Avg representatives is the
-// exact weighted mean. Count is the one aggregation a re-roll corrupts: re-counting a
-// representative yields 1, not the count it carried.
+// bucket start with the bucket's total weight. A coarser Sum or Avg over representatives is
+// therefore the one-pass rollup up to floating-point grouping: the same sum, added in a different
+// order, since each representative was rounded once when stored. Count is the one aggregation a
+// re-roll corrupts: re-counting a representative yields 1, not the count it carried.
 func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int64, []float64, []float64) {
 	active := make([]DownsampleTier, 0, len(tiers))
 	for _, t := range tiers {
@@ -225,13 +227,15 @@ func alignDown(ts, interval int64) int64 {
 // bucketAcc accumulates the samples of one downsample bucket, weight-aware so sampled data stays
 // unbiased. Input timestamps within a bucket are unique (sampleMerge dedups by ts), so first/last
 // are unambiguous. n counts samples; nWeighted sums their weights (the estimated original count);
-// wsum sums value·weight (the estimated original total). min/max track the earliest sample holding
-// the extreme value.
+// wsum sums value·weight (the estimated original total), compensated by wcomp (Neumaier) so a long
+// bucket's total is rounded once rather than once per sample. min/max track the earliest sample
+// holding the extreme value.
 type bucketAcc struct {
 	agg       signal.Aggregation
 	n         int64
 	nWeighted float64
 	wsum      float64
+	wcomp     float64
 	min, max  float64
 	minTs     int64
 	maxTs     int64
@@ -273,9 +277,30 @@ func (b *bucketAcc) add(ts int64, v, sf float64) {
 		b.lastTs, b.lastVal, b.lastSF = ts, v, sf
 	}
 
-	b.wsum += v * sf
+	b.addWeighted(v * sf)
 	b.nWeighted += sf
 	b.n++
+}
+
+func (b *bucketAcc) addWeighted(x float64) {
+	t := b.wsum + x
+	if math.Abs(b.wsum) >= math.Abs(x) {
+		b.wcomp += (b.wsum - t) + x
+	} else {
+		b.wcomp += (x - t) + b.wsum
+	}
+
+	b.wsum = t
+}
+
+// total is the compensated sum. Once wsum is infinite or NaN the compensation is meaningless (it
+// turns into NaN), so wsum stands alone.
+func (b *bucketAcc) total() float64 {
+	if math.IsInf(b.wsum, 0) || math.IsNaN(b.wsum) {
+		return b.wsum
+	}
+
+	return b.wsum + b.wcomp
 }
 
 // result returns the bucket's representative (ts, value, weight); start is the bucket's aligned
@@ -289,13 +314,13 @@ func (b *bucketAcc) result(start int64) (int64, float64, float64) {
 	case signal.AggMax:
 		return b.maxTs, b.max, b.maxSF
 	case signal.AggSum:
-		return start, b.wsum, 1
+		return start, b.total(), 1
 	case signal.AggAvg:
 		if b.n == 1 {
 			return start, b.lastVal, b.lastSF // v·w/w can round; a re-rolled representative must not drift
 		}
 
-		return start, b.wsum / b.nWeighted, b.nWeighted
+		return start, b.total() / b.nWeighted, b.nWeighted
 	case signal.AggCount:
 		return start, b.nWeighted, 1
 	default: // signal.AggLast

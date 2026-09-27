@@ -235,8 +235,8 @@ func TestDownsampleNestedTiersStepwise(t *testing.T) {
 
 				wantTs, wantVals, wantSF := downsample(rawTs, rawVals, rawSF, tiersAt(end))
 				assert.Equal(t, wantTs, ts)
-				if agg == signal.AggAvg {
-					assert.InDeltaSlice(t, wantVals, vals, 1e-9, "a weighted mean of means rounds differently")
+				if agg == signal.AggSum || agg == signal.AggAvg {
+					assert.InDeltaSlice(t, wantVals, vals, regroupTolerance(rawVals, rawSF), "the one-pass rollup, regrouped")
 				} else {
 					assert.Equal(t, wantVals, vals)
 				}
