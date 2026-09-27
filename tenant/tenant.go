@@ -126,14 +126,18 @@ func (r Retention) AgeFor(sig signal.Signal) time.Duration {
 // Q rather than on every maintenance cycle. The cost is lag: a sample is rolled up between
 // After and After + Q past its timestamp, plus up to one maintenance interval.
 //
-// Every enabled tier must use the same Agg, so a coarser tier re-aggregates the finer tier's
-// representatives exactly. Last, First, Min and Max keep the chosen sample, at its own
-// timestamp. Sum keeps the bucket total at the bucket start. Avg keeps the bucket mean at
-// the bucket start, weighted by the bucket's population through the sample's scale factor
-// (fetch.Batch.ScaleFactors), so a coarser mean is the exact mean of the raw samples. Count
-// is not yet exact once a merge rolls its representatives again. A different Agg per tier
-// would aggregate the finer tier's results instead of the raw samples (a 1m Sum then a 1h
-// Max is the max of per-minute sums), so such a policy is rejected.
+// Every enabled tier must use the same Agg, so a coarser tier can re-aggregate the finer
+// tier's representatives. Last, First, Min and Max keep the chosen sample, at its own
+// timestamp, and coarsen exactly. Sum keeps the bucket total at the bucket start. Avg keeps
+// the bucket mean at the bucket start, weighted by the bucket's population through the
+// sample's scale factor (fetch.Batch.ScaleFactors). A coarser Sum or Avg equals one rollup
+// of the raw samples up to floating-point grouping: the same sum, added in a different
+// order. Count is not yet exact once a merge rolls its representatives again. A different
+// Agg per tier would aggregate the finer tier's results instead of the raw samples (a 1m Sum
+// then a 1h Max is the max of per-minute sums), so such a policy is rejected.
+//
+// Changing Agg applies only to data not yet rolled up: a bucket keeps the Agg it was rolled
+// up with.
 //
 // A sample written late into a bucket that is already rolled up combines with the bucket's
 // representative as new data. It cannot replace a raw sample that is already rolled up,

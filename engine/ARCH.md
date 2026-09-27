@@ -561,18 +561,30 @@ and drags 121m samples into the previous hour; the facade rejects such a policy
 (`tenant.Downsample.Validate`) rather than downsample it inexactly.
 
 **Representatives compose.** A policy uses one Agg across its tiers (`tenant.Downsample.Validate`), and
-each representative carries what a coarser tier needs to re-aggregate it exactly:
+each representative carries what a coarser tier needs to re-aggregate it:
 
 - Last/First/Min/Max emit the chosen sample itself, at its own timestamp. A representative is then a
   real sample, so a re-roll, a coarser tier, a late sample and a same-timestamp duplicate all see raw
-  data, and a Last-rolled counter is not shifted back to the bucket start under `rate`.
+  data and coarsen exactly, and a Last-rolled counter is not shifted back to the bucket start under
+  `rate`.
 - Sum emits the bucket total at the bucket start, weight 1.
 - Avg emits the mean at the bucket start with the bucket's population as its scale factor, the weight
-  a sampled row carries, so a coarser Avg is the exact weighted mean and `SeriesAgg` and a weight-aware
-  query read it unchanged. A part holding Avg representatives therefore has the sf column and no stats
-  sidecar.
+  a sampled row carries, so a coarser Avg is the weighted mean and `SeriesAgg` and a weight-aware query
+  read it unchanged. A part holding Avg representatives therefore has the sf column and no stats
+  sidecar. Its points are bucket means, not counter values, so `rate`/`increase` over an Avg-rolled
+  counter are approximate.
 - Count is exact only on the first roll: a merge that rolls its representative again counts it as one
   sample.
+
+A coarser Sum or Avg equals the one-pass rollup up to floating-point grouping: each representative is
+rounded once when stored, so coarsening adds the same values in a different order. Within a bucket the
+total is compensated (Neumaier), so one bucket rounds once however many samples it holds; across
+buckets the error stays within the recursive-summation bound, and cancellation shows it (fine buckets
+[1e16] and [−1e16, 1] coarsen to 0, one pass gives 1).
+
+Changing a tier's Agg applies only to data not yet rolled up; a rolled bucket keeps the Agg it was
+rolled with. Merges do not enforce that: one that re-rolls a representative aggregates it by the
+current Agg.
 
 Anchoring is paid in the ts column, measured on a 1m rollup of 15s scrapes: +0.01 B/row with no scrape
 jitter, +1.1 at ±5ms, +2.0 at ±50ms, against 1.1–6.8 B/row for the value column. The sf column of an
