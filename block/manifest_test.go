@@ -451,6 +451,13 @@ func FuzzManifestDecodeBody(f *testing.F) {
 	v3 := v3Manifest().Encode(nil)
 	f.Add(v3[:len(v3)-4])
 
+	for _, r := range []*Rollup{{}, sampleRollup()} {
+		m := markedManifest()
+		m.Rollup = r
+		marked := m.Encode(nil)
+		f.Add(marked[:len(marked)-4])
+	}
+
 	for _, tc := range v3Mutations() {
 		m := v3Manifest()
 		tc.mutate(&m)

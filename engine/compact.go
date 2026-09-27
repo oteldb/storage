@@ -80,7 +80,7 @@ func forcedRewrite(p *part, opts MergeOptions) bool {
 		return true
 	}
 
-	return downsampleApplies(opts.Downsample, p.minTime) ||
+	return downsamplePending(p, opts.Downsample) ||
 		recompressApplies(p, opts.Recompress) ||
 		precisionApplies(p, opts.Precision)
 }

@@ -1581,7 +1581,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		prefix := e.newPartPrefix()
 
 		if err := writePart(ctx, e.cfg.Backend, prefix, sub, idents,
-			compressProfile{}, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows, e.tsCodec); err != nil {
+			compressProfile{}, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows, e.tsCodec, &block.Rollup{}); err != nil {
 			return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
 		}
 

@@ -485,6 +485,16 @@ slack); `compress.DecodeWorkspace` rounds it to 512 KiB.
   Decode bounds every uvarint as `uint64` before converting it — lengths by the unread remainder,
   row count and granule size by `maxPartRows`, byte sizes by `MaxInt64` — so a CRC-valid manifest
   with an out-of-range field is `ErrCorrupt`, never a wrapped value or a panic (fuzzed).
+- **Rollup marker** — an optional trailer after `RawBytes`: `[uvarint n]` then n ×
+  `[varint Before][uvarint Interval][byte Agg]`, the downsampling layout the part's rows have had
+  applied, the widest per range (`WithRollup`; `Agg` is an id `block` does not interpret). Presence
+  is explicit: `Manifest.Rollup == nil` is *unknown*, and a non-nil marker with no tiers is *raw*. No value of a
+  field could carry that distinction — an absent uvarint reads as 0, and aggregation 0 is a real
+  one. An absent, truncated or malformed marker (a count past the remaining bytes, an `Interval` of 0
+  or past `MaxInt64`) decodes as unknown, never as raw and never as `ErrCorrupt`: reading it as raw
+  would license re-rolling downsampled data, and failing would strand a readable part — the same trap
+  as a size field whose absence two readers interpret differently. A writer that does not set it
+  (the record engine) stays byte-identical, so there is no version bump.
 - **Version 3** adds a per-column `xflags` byte after `flags`; an unknown bit is
   `ErrUnsupportedVersion`, since each gates fields a reader must parse. A writer emits version 3
   only when some column sets a bit and version 2 otherwise, so metric parts stay readable by a

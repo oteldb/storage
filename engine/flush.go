@@ -9,7 +9,6 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
-	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/partid"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
@@ -142,6 +141,7 @@ const (
 func writePart(
 	ctx context.Context, b backend.Backend, prefix string, cols *flushColumns, idents identitySet,
 	comp compressProfile, precisionBits uint8, writeStats bool, blockRows int, tsCodec chunk.Codec,
+	rollup *block.Rollup,
 ) error {
 	if blockRows <= 0 {
 		blockRows = DefaultMetricBlockRows
@@ -150,11 +150,7 @@ func writePart(
 	// Block the ts/value/sf columns at blockRows so the engine can decode only the blocks a query
 	// touches; the block size also drives the marks granules (WithGranuleSize). The series id column
 	// (RLE) is not blocked — it is read whole when the part is opened to build the row-range index.
-	opts := []block.PartOption{block.WithSortKey(colTs), block.WithGranuleSize(blockRows)}
-	if comp.Algorithm != compress.AlgorithmNone {
-		opts = append(opts, block.WithCompression(comp.Algorithm), block.WithCompressionLevel(comp.Level))
-	}
-
+	opts := partOptions(blockRows, comp, rollup)
 	w := block.NewPartWriter(opts...)
 	if err := w.AddColumn(block.Column{Name: colSeries, Kind: block.KindInt128, Int128: cols.series}); err != nil {
 		return err

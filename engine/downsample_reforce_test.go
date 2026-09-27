@@ -10,15 +10,11 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
 
 const (
-	reforceIssue    = 710
-	reforceBehavior = "a rolled-up part still reads as forced, so the oldest bucket's part is reselected " +
-		"alone every cycle as a no-op and nothing else merges"
 	reforceCycles = 10
 	dayNanos      = 24 * int64(time.Hour)
 )
@@ -54,7 +50,6 @@ func sampleTimes(t *testing.T, e *engine.Engine) []int64 {
 // not only the oldest: two parts two days apart, both past the cutoff, each two minutes of
 // per-second samples.
 func TestDownsampleRollsUpEveryOldBucket(t *testing.T) {
-	reproduce.Unfixed(t, reforceIssue, reforceBehavior)
 	t.Parallel()
 
 	ctx := context.Background()
@@ -75,7 +70,6 @@ func TestDownsampleRollsUpEveryOldBucket(t *testing.T) {
 // TestDownsampleLeavesLadderRunning checks enabling downsampling does not stop the ladder: once the
 // old part is rolled up, two fresh parts sharing an hour must still merge.
 func TestDownsampleLeavesLadderRunning(t *testing.T) {
-	reproduce.Unfixed(t, reforceIssue, reforceBehavior)
 	t.Parallel()
 
 	ctx := context.Background()
