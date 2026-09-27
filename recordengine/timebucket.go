@@ -1,7 +1,6 @@
 package recordengine
 
 import (
-	"cmp"
 	"slices"
 
 	"github.com/oteldb/storage/internal/timebucket"
@@ -24,22 +23,23 @@ func partSpan(p *part) (lo, hi int64) { return p.minTime, p.maxTime }
 
 func fitsLevel(p *part, level int64) bool { return timebucket.Fits(p.minTime, p.maxTime, level) }
 
-// finestLevel returns the narrowest ladder level whose bucket contains p whole, reporting false for
-// a straddler: a part crossing a top-level boundary. Flush does not split by time, so one late
-// record makes one. A straddler joins no ladder group; [selectStraddlers] picks it instead.
-func finestLevel(p *part) (int64, bool) { return timebucket.Finest(p.minTime, p.maxTime) }
-
 func spanOf(parts []*part) (lo, hi int64) { return timebucket.Union(parts, partSpan) }
 
-// selectStraddlers returns the straddlers to split this cycle, at most maxTierParts of them when part
-// size is unlimited.
+// selectStraddlers returns the straddlers to split this cycle. A straddler crosses a top-level
+// boundary, which one late record makes since flush does not split by time, so it fits no level and
+// joins no ladder group.
 func selectStraddlers(src []*part, capBytes int64) []*part {
-	maxParts := 0
+	return timebucket.Straddlers(src, partSpan, (*part).sizeBytes, capBytes, uncappedMergeParts(capBytes))
+}
+
+// uncappedMergeParts bounds a merge's part count only when part size is unlimited, where no byte
+// budget does.
+func uncappedMergeParts(capBytes int64) int {
 	if capBytes <= 0 {
-		maxParts = maxTierParts
+		return maxTierParts
 	}
 
-	return timebucket.Straddlers(src, partSpan, (*part).sizeBytes, capBytes, maxParts)
+	return 0
 }
 
 // newestBucket returns the start of the level-aligned bucket holding the newest record in src —
@@ -118,74 +118,11 @@ func selectLadderGroup(src []*part, capBytes int64, force bool) []*part {
 	return nil
 }
 
-// selectForced returns the parts retention must rewrite this cycle, confined to a single bucket.
-//
-// The confinement is the point: the forced set was previously unioned with the tier group and merged
-// as one part, so a retention pass over a store with any age spread rewrote parts from opposite ends
-// of it into a single part spanning both — re-widening on the cycle most likely to run.
-//
-// The oldest forced part picks the bucket, so age-driven work still progresses oldest-first, one
-// bucket per cycle. The rest of that bucket rides along when it fits the cap, since merging inside a
-// bucket cannot widen the output and leaving a co-located part behind would only fragment. A
-// straddler is rewritten alone, and the merge splits it on bucket boundaries.
+// selectForced returns the parts retention must rewrite this cycle: one bucket's worth, up to the cap
+// ([timebucket.Forced]).
 func selectForced(src []*part, retainFrom, capBytes int64) []*part {
-	var oldest *part
-
-	for _, p := range src {
-		if retentionForces(p, retainFrom) && (oldest == nil || p.minTime < oldest.minTime) {
-			oldest = p
-		}
-	}
-
-	if oldest == nil {
-		return nil
-	}
-
-	level, ok := finestLevel(oldest)
-	if !ok {
-		return []*part{oldest}
-	}
-
-	bucket := bucketOf(oldest.minTime, level)
-	inBucket := func(p *part) bool {
-		return fitsLevel(p, level) && bucketOf(p.minTime, level) == bucket
-	}
-
-	var (
-		out    []*part
-		others []*part
-		total  int64
-		order  = make(map[*part]int, len(src))
-	)
-
-	for i, p := range src {
-		order[p] = i
-
-		switch {
-		case !inBucket(p):
-		case retentionForces(p, retainFrom):
-			out = append(out, p)
-			total += p.sizeBytes()
-		case capBytes <= 0 || p.sizeBytes() < capBytes:
-			others = append(others, p)
-		}
-	}
-
-	// Smallest first, so a cap cutoff strands the part that is cheapest to carry.
-	slices.SortFunc(others, func(a, b *part) int { return cmp.Compare(a.sizeBytes(), b.sizeBytes()) })
-
-	for _, p := range others {
-		if capBytes > 0 && total+p.sizeBytes() > capBytes {
-			break
-		}
-
-		out = append(out, p)
-		total += p.sizeBytes()
-	}
-
-	// Restore the engine's part order: the merge visits sources oldest → newest so a later part's
-	// record wins a duplicate.
-	slices.SortFunc(out, func(a, b *part) int { return cmp.Compare(order[a], order[b]) })
-
-	return out
+	return timebucket.Forced(src, partSpan, (*part).sizeBytes,
+		func(p *part) bool { return retentionForces(p, retainFrom) },
+		func(p *part) bool { return sealed(p, capBytes) },
+		capBytes, uncappedMergeParts(capBytes))
 }

@@ -82,7 +82,7 @@ func (e recordEngine) Parts() []enginetest.Part {
 
 	out := make([]enginetest.Part, 0, len(parts))
 	for _, p := range parts {
-		out = append(out, enginetest.Part{ID: p.ID, MinTime: p.MinTime, MaxTime: p.MaxTime})
+		out = append(out, enginetest.Part{ID: p.ID, MinTime: p.MinTime, MaxTime: p.MaxTime, Bytes: p.SizeBytes})
 	}
 
 	return out
@@ -121,6 +121,9 @@ var recordKind = enginetest.Kind{
 		c := recordengine.Config{
 			Schema: testSchema, Backend: cfg.Backend, Prefix: enginePrefix, WAL: cfg.WAL, Obs: cfg.Obs, WriterID: cfg.WriterID,
 			Repair: cfg.Repair, OrphanGrace: cfg.OrphanGrace, Now: cfg.Now,
+			// A memory budget of the cap puts the merge share under it, so the cap is its
+			// MaxPartBytes floor.
+			MaxPartBytes: cfg.MergeCapBytes, MergeMemoryBytes: cfg.MergeCapBytes,
 		}
 
 		return recordEngine{recordengine.New(c)}

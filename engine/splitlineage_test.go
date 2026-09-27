@@ -20,12 +20,10 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// splitCeilingBytes is a merge ceiling the streamed rewrite of three parts crosses several times, so
-// a retention rewrite over them — forced regardless of the seal — splits its output. The writer
-// seals on frames already compressed, and a frame holds 64 KiB of encoded values, so the parts have
-// to carry tens of thousands of incompressible samples for the ceiling to be reached at all.
+// splitCeilingBytes is a merge ceiling one part crosses several times, so a retention rewrite of it
+// — forced regardless of the seal, and alone since it exceeds the ceiling — splits its output.
 const (
-	splitCeilingBytes = 1024
+	splitCeilingBytes = 32 << 10
 	seriesPerPart     = 5
 	samplesPerSeries  = 2000
 )
@@ -89,21 +87,17 @@ func countSeries(t *testing.T, e *engine.Engine) int {
 	return len(fetchAll(t, e, fetch.Request{Start: 0, End: 1 << 60}))
 }
 
-// flushInputs flushes three expiring parts — the inputs of the split — and, with a bystander, a
-// fourth that retention leaves alone and the ceiling seals, so it keeps the top block number live
-// while the split runs. It returns the committed entries in flush order.
-func flushInputs(ctx context.Context, t *testing.T, be backend.Backend, bystander bool) []bucketindex.Entry {
+// flushInputs flushes three parts, of which only split holds a sample retention drops: the input
+// of the split. It returns the committed entries in flush order.
+func flushInputs(ctx context.Context, t *testing.T, be backend.Backend, split int) []bucketindex.Entry {
 	t.Helper()
 
 	e := splitLineageEngine(be, splitCeilingBytes, nil)
 
-	n := 3
-	if bystander {
-		n = 4
-	}
+	const n = 3
 
 	for i := range n {
-		flushSeriesRun(ctx, t, e, seriesPerPart*i, i < 3)
+		flushSeriesRun(ctx, t, e, seriesPerPart*i, i == split)
 	}
 
 	ids := backendtest.PartDirs(ctx, t, be, lostPrefix)
@@ -124,9 +118,9 @@ func flushInputs(ctx context.Context, t *testing.T, be backend.Backend, bystande
 	return out
 }
 
-// splitMerge rewrites the expiring parts for retention under the split ceiling and returns the
-// committed index, which must hold several outputs in their place.
-func splitMerge(ctx context.Context, t *testing.T, be backend.Backend, before []bucketindex.Entry) *bucketindex.Index {
+// splitMerge rewrites the expiring input for retention under the split ceiling and returns the
+// committed index and the fragments it holds in the input's place.
+func splitMerge(ctx context.Context, t *testing.T, be backend.Backend, before []bucketindex.Entry) (*bucketindex.Index, []bucketindex.Entry) {
 	t.Helper()
 
 	e := splitLineageEngine(be, splitCeilingBytes, nil)
@@ -135,36 +129,36 @@ func splitMerge(ctx context.Context, t *testing.T, be backend.Backend, before []
 
 	ix, err := bucketindex.Load(ctx, be, lostIndexKey())
 	require.NoError(t, err)
-	require.Len(t, ix.Removed, 3, "the rewrite retires the three expiring inputs")
+	require.Len(t, ix.Removed, 1, "the rewrite retires the expiring input")
 
-	fragments := 0
+	var fragments []bucketindex.Entry
 
 	for i := range ix.Entries {
 		ent := &ix.Entries[i]
 		if !slices.ContainsFunc(before, func(in bucketindex.Entry) bool { return in.Prefix == ent.Prefix }) {
-			fragments++
+			fragments = append(fragments, *ent)
 		}
 	}
 
-	require.Greater(t, fragments, 1, "and splits its output under the ceiling")
+	require.Greater(t, len(fragments), 1, "and splits its output under the ceiling")
 
-	return ix
+	return ix, fragments
 }
 
 // TestSplitMergeAllocatesAboveItsInputs pins that a split output never takes a block number one of
 // its inputs held, even though the commit that publishes the fragments is the one that retires
 // those inputs. Numbering runs above the persisted high-water mark rather than above the live set,
 // so nothing rewinds into the identity of a part the same commit removed — a fragment holding a
-// third of the rows would otherwise supersede a whole input, and answer a peer's want with it.
+// fraction of the rows would otherwise supersede the whole input, and answer a peer's want with it.
 func TestSplitMergeAllocatesAboveItsInputs(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	be := backend.Memory()
-	inputs := flushInputs(ctx, t, be, false)
+	inputs := flushInputs(ctx, t, be, 2)
 
-	ix := splitMerge(ctx, t, be, inputs)
-	for _, f := range ix.Entries {
+	_, fragments := splitMerge(ctx, t, be, inputs)
+	for _, f := range fragments {
 		assert.Greater(t, f.Blocks.Min, inputs[2].Blocks.Max, "fragment %+v is numbered below a retired input", f)
 
 		for _, in := range inputs {
@@ -174,7 +168,7 @@ func TestSplitMergeAllocatesAboveItsInputs(t *testing.T) {
 }
 
 // TestSplitMergeSeversLineage pins that a split does not sever the lineage. The fragments take fresh
-// blocks and none of them supersedes an input on its own, but they carry the inputs' blocks as a
+// blocks and none of them supersedes the input on its own, but they carry the input's blocks as a
 // joint claim, so the group answers a want for a pre-split part while it is spread across them and a
 // merge that consumes the whole group folds the claim back into one ordinary interval — which every
 // later merge then inherits.
@@ -183,11 +177,11 @@ func TestSplitMergeSeversLineage(t *testing.T) {
 
 	ctx := context.Background()
 	be := backend.Memory()
-	inputs := flushInputs(ctx, t, be, true)
+	inputs := flushInputs(ctx, t, be, 1)
 	lost := inputs[1]
 	want := bucketindex.WantOf(lost, bucketindex.Generation{})
 
-	ix := splitMerge(ctx, t, be, inputs)
+	ix, _ := splitMerge(ctx, t, be, inputs)
 	for _, f := range ix.Entries {
 		require.False(t, f.Supersedes(lost), "a fragment holds a fraction of the input and must not claim it: %+v", f)
 	}
@@ -209,14 +203,14 @@ func TestSplitMergeSeversLineage(t *testing.T) {
 		require.NoError(t, rejoin.MergeWith(ctx, engine.MergeOptions{Force: true}))
 	}
 
-	require.Equal(t, 4*seriesPerPart, countSeries(t, rejoin), "every row of the lost part is inside the rejoined set")
+	require.Equal(t, 3*seriesPerPart, countSeries(t, rejoin), "every row of the lost part is inside the rejoined set")
 
 	ix = loadIndex(t, be, lostPrefix)
 	require.Len(t, ix.Entries, 1, "the forced merges collapse the part set")
 	assert.True(t, ix.Entries[0].Supersedes(lost),
 		"the rejoined part %+v holds all of %+v and must supersede it", ix.Entries[0], lost)
 
-	flushSeriesRun(ctx, t, rejoin, 4*seriesPerPart, false)
+	flushSeriesRun(ctx, t, rejoin, 3*seriesPerPart, false)
 	require.NoError(t, rejoin.MergeWith(ctx, engine.MergeOptions{Force: true}))
 
 	ix = loadIndex(t, be, lostPrefix)
@@ -235,7 +229,7 @@ func TestSplitLineageWantBecomesHole(t *testing.T) {
 
 	ctx := context.Background()
 	be, peer := backend.Memory(), backend.Memory()
-	inputs := flushInputs(ctx, t, be, true)
+	inputs := flushInputs(ctx, t, be, 1)
 	lost := inputs[1]
 
 	enginetest.CopyObjects(t, be, peer, lostPrefix+"/")
@@ -243,7 +237,7 @@ func TestSplitLineageWantBecomesHole(t *testing.T) {
 
 	served := splitLineageEngine(peer, splitCeilingBytes, nil)
 	require.NoError(t, served.LoadParts(ctx))
-	require.Equal(t, 4*seriesPerPart, countSeries(t, served), "the peer holds every row of the lost part")
+	require.Equal(t, 3*seriesPerPart, countSeries(t, served), "the peer holds every row of the lost part")
 
 	// The cluster layer's answer to a want: the best part in the peer's index satisfying it, copied
 	// over; definitive absence when the index names none.
@@ -271,7 +265,7 @@ func TestSplitLineageWantBecomesHole(t *testing.T) {
 
 	ix := loadIndex(t, be, lostPrefix)
 	assert.Zero(t, ix.LostParts, "the peer holds the data, so no loss may be acknowledged; holes: %v", prefixes(ix.Holes()))
-	assert.Equal(t, 4*seriesPerPart, countSeries(t, r), "repair brings the lost rows back from the peer")
+	assert.Equal(t, 3*seriesPerPart, countSeries(t, r), "repair brings the lost rows back from the peer")
 }
 
 // TestMergeAroundALostPartKeepsItsWant pins that a merge of a lost part's neighbors claims none of

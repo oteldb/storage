@@ -83,7 +83,7 @@ func (e metricEngine) Parts() []enginetest.Part {
 
 	out := make([]enginetest.Part, 0, len(parts))
 	for _, p := range parts {
-		out = append(out, enginetest.Part{ID: p.ID, MinTime: p.MinTime, MaxTime: p.MaxTime})
+		out = append(out, enginetest.Part{ID: p.ID, MinTime: p.MinTime, MaxTime: p.MaxTime, Bytes: p.SizeBytes})
 	}
 
 	return out
@@ -114,7 +114,7 @@ var metricKind = enginetest.Kind{
 
 		c := engine.Config{
 			Backend: cfg.Backend, Prefix: "default/metrics", WAL: cfg.WAL, Obs: cfg.Obs, WriterID: cfg.WriterID,
-			Repair: cfg.Repair, OrphanGrace: cfg.OrphanGrace, Now: cfg.Now,
+			Repair: cfg.Repair, OrphanGrace: cfg.OrphanGrace, Now: cfg.Now, MergeCeilingBytes: cfg.MergeCapBytes,
 		}
 
 		return metricEngine{engine.New(c)}

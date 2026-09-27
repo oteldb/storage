@@ -1,6 +1,7 @@
 // Package timebucket is the aligned time-bucket ladder both engines confine merges to, and the
-// straddler selection over it. The engines' ladder walks differ (size tiers against scored runs);
-// what is shared here is the bucket arithmetic and the handling of a part that fits no bucket.
+// straddler and forced-rewrite selection over it. The engines' ladder walks differ (size tiers
+// against scored runs); what is shared here is the bucket arithmetic, the handling of a part that
+// fits no bucket, and the capped selection of the parts a policy forces a rewrite of.
 package timebucket
 
 import (
@@ -105,25 +106,7 @@ func Straddlers[P any](src []P, span func(P) (lo, hi int64), size func(P) int64,
 		return cmp.Compare(alo, blo)
 	})
 
-	var total int64
+	b := budget[P]{size: size, capBytes: capBytes, maxParts: maxParts}
 
-	n := 0
-	for ; n < len(idx); n++ {
-		sz := size(src[idx[n]])
-		if n > 0 && ((capBytes > 0 && total+sz > capBytes) || (maxParts > 0 && n >= maxParts)) {
-			break
-		}
-
-		total += sz
-	}
-
-	picked := idx[:n]
-	slices.Sort(picked)
-
-	out := make([]P, len(picked))
-	for i, j := range picked {
-		out[i] = src[j]
-	}
-
-	return out
+	return pick(src, b.take(src, idx))
 }

@@ -36,12 +36,16 @@ type Config struct {
 	// OrphanGrace and Now are the engine's orphan-sweep age guard and its clock.
 	OrphanGrace time.Duration
 	Now         func() time.Time
+	// MergeCapBytes is the merge cap in the unit of [Part.Bytes]; 0 keeps the engine's derived cap.
+	MergeCapBytes int64
 }
 
 // Part is one live part as [Engine.Parts] reports it.
 type Part struct {
 	ID               string
 	MinTime, MaxTime int64
+	// Bytes is the size the merge selector weighs the part at.
+	Bytes int64
 }
 
 // Stats is the subset of the engine's stats the suite asserts on.
@@ -212,6 +216,8 @@ var suite = []struct {
 	{"ForceReachesStraddlers", forceReachesStraddlers},
 	{"RetentionSplitsStraddler", retentionSplitsStraddler},
 	{"MergeConvergesWithStraddlers", mergeConvergesWithStraddlers},
+	{"ForcedBacklogStaysWithinCap", forcedBacklogStaysWithinCap},
+	{"OversizedForcedPartProgresses", oversizedForcedPartProgresses},
 
 	{"HoleCommittedAfterRepeatedAbsence", holeCommittedAfterRepeatedAbsence},
 	{"IncompletePeerSetNeverHoles", incompletePeerSetNeverHoles},
