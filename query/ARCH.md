@@ -117,11 +117,16 @@ The library implements **no** query language. This package bridges the fetch sea
   sampled series turns an overload-degradation mechanism into a query outage for the majority of
   queries that are unbiased. So the adapter serves rows as stored, attaches **`SampledWarning`**
   (a `PromQLWarning` the engine propagates to the result's warnings) when any returned series has a
-  weight above 1 — weights are `ceil(observed/budget) ≥ 1`, so a 0 or 1 carries no information and
-  is never multiplied in — and exposes the weights on every series via **`WeightedSeries`**, in
-  iterator order, for an embedder's weight-aware operator. Unbiased per-sample counts/sums over a
-  sampled tenant belong to a consumer that reads the weight — this adapter or the fetch seam
-  directly — not to the Prometheus engine.
+  weight above 1 — a weight counts the rows a point stands for (`ceil(observed/budget)` for a sampled
+  row, the bucket's population for an Avg downsample representative), so a 0 or 1 carries no
+  information and is never multiplied in — and exposes the weights on every series via
+  **`WeightedSeries`**, in iterator order, for an embedder's weight-aware operator. Unbiased
+  per-sample counts/sums over a sampled tenant belong to a consumer that reads the weight — this
+  adapter or the fetch seam directly — not to the Prometheus engine.
+- **The warning claims nothing is exact.** Only a sampling weight leaves a cumulative counter's
+  `rate` intact; an Avg rollup replaces counter values with bucket means, so `rate`, `increase`,
+  `resets` and other reset-sensitive functions over it are approximate. A weight does not say which
+  kind it is, so `SampledWarning` says both counts and rates may be off.
 - `PushableMatchers`/`MatchesAll`/`PromLabels` are exported as the single source of truth for the
   Prom↔storage projection, so an embedder building its own pushdown reuses them.
 

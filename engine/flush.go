@@ -23,6 +23,9 @@ type flushColumns struct {
 	ts     []int64
 	value  []float64
 	sf     []float64
+	// covered is each row's newest source timestamp when a rollup made it differ from ts: the
+	// watermark a replica trims its head through. nil ⇒ ts.
+	covered []int64
 }
 
 // partRowBytes is the approximate uncompressed bytes a metric part row occupies (series int128 +
@@ -67,7 +70,24 @@ func (c *flushColumns) slice(a, b int) *flushColumns {
 		out.sf = c.sf[a:b]
 	}
 
+	if c.covered != nil {
+		out.covered = c.covered[a:b]
+	}
+
 	return out
+}
+
+// noteCovered records the newest source timestamp of the row appendRow just added, materializing
+// the covered column lazily the first time it differs from ts.
+func (c *flushColumns) noteCovered(covered int64) {
+	n := len(c.ts)
+
+	switch {
+	case c.covered != nil:
+		c.covered = append(c.covered, covered)
+	case covered != c.ts[n-1]:
+		c.covered = append(slices.Clone(c.ts[:n-1]), covered)
+	}
 }
 
 // appendRow appends one (series, ts, value, sf) row, materializing the sf column lazily the first
@@ -224,21 +244,26 @@ func writePart(
 	return nil
 }
 
-// computeWatermarks folds the (series, ts)-sorted flush columns into one newest timestamp per
-// series, in the order series first appear — which, given the sort, is each series' contiguous run
-// and so the ascending id order a part's series index enumerates.
+// computeWatermarks folds the (series, ts)-sorted flush columns into one newest covered timestamp
+// per series, in the order series first appear — which, given the sort, is each series' contiguous
+// run and so the ascending id order a part's series index enumerates.
 func computeWatermarks(cols *flushColumns) []watermark.Entry {
 	var out []watermark.Entry
 
+	covered := cols.covered
+	if covered == nil {
+		covered = cols.ts
+	}
+
 	for i := range cols.series {
 		if i == 0 || cols.series[i] != cols.series[i-1] {
-			out = append(out, watermark.Entry{ID: u128ToID(cols.series[i]), Max: cols.ts[i]})
+			out = append(out, watermark.Entry{ID: u128ToID(cols.series[i]), Max: covered[i]})
 
 			continue
 		}
 
 		last := &out[len(out)-1]
-		last.Max = max(last.Max, cols.ts[i])
+		last.Max = max(last.Max, covered[i])
 	}
 
 	return out

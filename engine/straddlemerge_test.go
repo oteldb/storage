@@ -24,14 +24,15 @@ func TestSplitKeepsDownsampleBucketsWhole(t *testing.T) {
 	const hour = int64(time.Hour)
 
 	for _, tt := range []struct {
-		agg  signal.Aggregation
-		want float64
+		agg    signal.Aggregation
+		wantTs int64
+		want   float64
 	}{
-		{signal.AggSum, 4},
-		{signal.AggCount, 2},
-		{signal.AggAvg, 2},
-		{signal.AggFirst, 1},
-		{signal.AggLast, 3},
+		{signal.AggSum, 21 * hour, 4},
+		{signal.AggCount, 21 * hour, 2},
+		{signal.AggAvg, 21 * hour, 2},
+		{signal.AggFirst, 23 * hour, 1},
+		{signal.AggLast, 25 * hour, 3},
 	} {
 		t.Run(tt.agg.String(), func(t *testing.T) {
 			t.Parallel()
@@ -48,7 +49,7 @@ func TestSplitKeepsDownsampleBucketsWhole(t *testing.T) {
 			require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Downsample: tiers}))
 
 			got := fetchOne(t, e, "api")
-			assert.Equal(t, []int64{21 * hour}, got.Timestamps)
+			assert.Equal(t, []int64{tt.wantTs}, got.Timestamps)
 			assert.Equal(t, []float64{tt.want}, got.Values)
 		})
 	}
@@ -56,7 +57,8 @@ func TestSplitKeepsDownsampleBucketsWhole(t *testing.T) {
 
 // TestSplitAcrossAgeBands pins a straddler whose rollups move samples into an earlier day than the
 // ones left raw: two age bands and raw samples over three days, where the 7h band puts 25:00 and
-// 25:30 at 21:00 of the day before while 27:00 and 28:00 roll up in their own day. Every rollup must
+// 25:30 at 21:00 of the day before (for the bucket-start aggregations) while 27:00 and 28:00 roll
+// up in their own day. Every rollup must
 // land in a part of its own day, or that part straddles, is merged again, and a Count re-counts its
 // one representative as 1.
 func TestSplitAcrossAgeBands(t *testing.T) {
@@ -65,16 +67,17 @@ func TestSplitAcrossAgeBands(t *testing.T) {
 	const hour = int64(time.Hour)
 
 	for _, tt := range []struct {
-		agg          signal.Aggregation
-		old, younger float64
+		agg              signal.Aggregation
+		oldTs, youngerTs int64
+		old, younger     float64
 	}{
-		{signal.AggSum, 3, 7},
-		{signal.AggCount, 2, 2},
-		{signal.AggAvg, 1.5, 3.5},
-		{signal.AggFirst, 1, 3},
-		{signal.AggLast, 2, 4},
-		{signal.AggMin, 1, 3},
-		{signal.AggMax, 2, 4},
+		{signal.AggSum, 21 * hour, 27 * hour, 3, 7},
+		{signal.AggCount, 21 * hour, 27 * hour, 2, 2},
+		{signal.AggAvg, 21 * hour, 27 * hour, 1.5, 3.5},
+		{signal.AggFirst, 25 * hour, 27 * hour, 1, 3},
+		{signal.AggLast, 25*hour + hour/2, 28 * hour, 2, 4},
+		{signal.AggMin, 25 * hour, 27 * hour, 1, 3},
+		{signal.AggMax, 25*hour + hour/2, 28 * hour, 2, 4},
 	} {
 		t.Run(tt.agg.String(), func(t *testing.T) {
 			t.Parallel()
@@ -99,7 +102,7 @@ func TestSplitAcrossAgeBands(t *testing.T) {
 			}
 
 			got := fetchOne(t, e, "api")
-			assert.Equal(t, []int64{21 * hour, 27 * hour, 30 * hour, 49 * hour}, got.Timestamps)
+			assert.Equal(t, []int64{tt.oldTs, tt.youngerTs, 30 * hour, 49 * hour}, got.Timestamps)
 			assert.Equal(t, []float64{tt.old, tt.younger, 5, 6}, got.Values)
 
 			for _, p := range e.Parts() {

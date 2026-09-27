@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"fmt"
+	"math"
 	"slices"
 	"testing"
 
@@ -37,26 +39,30 @@ func TestDownsampleAggregations(t *testing.T) {
 		return []DownsampleTier{{Before: 100, Interval: 10, Agg: a}}
 	}
 
+	// The value-selecting aggregations emit the chosen sample; the summarizing ones the bucket start.
 	cases := []struct {
-		agg  signal.Aggregation
-		want []float64
+		agg    signal.Aggregation
+		wantTs []int64
+		want   []float64
+		wantSF []float64
 	}{
-		{signal.AggLast, []float64{3, 4, 5, 6}},  // bucket10 last=ts15, bucket20=4, raw 5,6
-		{signal.AggFirst, []float64{1, 4, 5, 6}}, // bucket10 first=ts10
-		{signal.AggMin, []float64{1, 4, 5, 6}},
-		{signal.AggMax, []float64{3, 4, 5, 6}},
-		{signal.AggSum, []float64{6, 4, 5, 6}},   // 1+2+3
-		{signal.AggAvg, []float64{2, 4, 5, 6}},   // (1+2+3)/3
-		{signal.AggCount, []float64{3, 1, 5, 6}}, // raw samples keep their value
+		{signal.AggLast, []int64{15, 25, 105, 110}, []float64{3, 4, 5, 6}, nil},
+		{signal.AggFirst, []int64{10, 25, 105, 110}, []float64{1, 4, 5, 6}, nil},
+		{signal.AggMin, []int64{10, 25, 105, 110}, []float64{1, 4, 5, 6}, nil},
+		{signal.AggMax, []int64{15, 25, 105, 110}, []float64{3, 4, 5, 6}, nil},
+		{signal.AggSum, []int64{10, 20, 105, 110}, []float64{6, 4, 5, 6}, nil},
+		{signal.AggAvg, []int64{10, 20, 105, 110}, []float64{2, 4, 5, 6}, []float64{3, 1, 1, 1}},
+		{signal.AggCount, []int64{10, 20, 105, 110}, []float64{3, 1, 5, 6}, nil}, // raw samples keep their value
 	}
 
 	for _, c := range cases {
 		t.Run(c.agg.String(), func(t *testing.T) {
 			t.Parallel()
 
-			gotTs, gotVal, _ := downsample(ts, vals, nil, tier(c.agg))
-			assert.Equal(t, []int64{10, 20, 105, 110}, gotTs)
+			gotTs, gotVal, gotSF := downsample(ts, vals, nil, tier(c.agg))
+			assert.Equal(t, c.wantTs, gotTs)
 			assert.Equal(t, c.want, gotVal)
+			assert.Equal(t, c.wantSF, gotSF)
 		})
 	}
 }
@@ -75,7 +81,7 @@ func TestDownsampleMultiTier(t *testing.T) {
 	}
 
 	gotTs, gotVal, _ := downsample(ts, vals, nil, tiers)
-	assert.Equal(t, []int64{0, 20, 70, 120}, gotTs)
+	assert.Equal(t, []int64{15, 30, 75, 120}, gotTs)
 	assert.Equal(t, []float64{2, 3, 5, 6}, gotVal)
 }
 
@@ -170,8 +176,132 @@ func TestAlignDown(t *testing.T) {
 	assert.Equal(t, int64(-20), alignDown(-11, 10))
 }
 
-// FuzzDownsample asserts the structural invariants hold for arbitrary input and that AggLast is a
-// fixed point under re-downsampling.
+// regroupTolerance bounds how far a Sum or Avg rolled up fine-then-coarse may land from the one-pass
+// rollup of the same samples. Recursive summation of n terms errs by at most (n−1)·u·Σ|x| (u = 2⁻⁵³).
+// Regrouping adds one rounding per stored representative, and Avg one more for the divide and one
+// for re-weighting the mean, so with m ≤ n representatives both results lie within (n+3m)·u·Σ|x| of
+// the true sum; 3n+4 machine epsilons (2u each) covers both, and an Avg, divided by a weight ≥ 1,
+// errs by no more than its sum.
+func regroupTolerance(vals, sf []float64) float64 {
+	var abs float64
+
+	for i, v := range vals {
+		w := 1.0
+		if sf != nil {
+			w = sf[i]
+		}
+
+		if x := math.Abs(v * w); !math.IsInf(x, 0) && !math.IsNaN(x) {
+			abs += x
+		}
+	}
+
+	return float64(3*len(vals)+4) * 0x1p-52 * abs
+}
+
+// requireSameFloats compares value columns where NaN equals NaN and an infinity must match exactly;
+// finite values may differ by tol.
+func requireSameFloats(t *testing.T, want, got []float64, tol float64, msg string) {
+	t.Helper()
+
+	require.Len(t, got, len(want), msg)
+
+	for i := range want {
+		w, g := want[i], got[i]
+
+		switch {
+		case math.IsNaN(w) || math.IsNaN(g):
+			require.True(t, math.IsNaN(w) && math.IsNaN(g), "%s: [%d] want %v, got %v", msg, i, w, g)
+		case math.IsInf(w, 0) || math.IsInf(g, 0):
+			require.True(t, math.IsInf(w, 0) && math.IsInf(g, 0) && math.Signbit(w) == math.Signbit(g),
+				"%s: [%d] want %v, got %v", msg, i, w, g)
+		default:
+			require.InDelta(t, w, g, tol, "%s: [%d]", msg, i)
+		}
+	}
+}
+
+// TestDownsampleNaNComposes puts NaN at every subset of positions across two fine buckets and checks
+// rolling up fine-then-coarse matches one coarse rollup. Min and Max skip NaN unless a bucket holds
+// nothing else, which keeps them associative: [0, NaN] and [−100] must give −100 either way.
+func TestDownsampleNaNComposes(t *testing.T) {
+	t.Parallel()
+
+	ts := []int64{0, 1, 2, 10, 11, 12}
+	base := []float64{3, 1, 2, 5, -100, 4}
+
+	for _, agg := range []signal.Aggregation{
+		signal.AggMin, signal.AggMax, signal.AggFirst, signal.AggLast, signal.AggSum, signal.AggAvg,
+	} {
+		t.Run(agg.String(), func(t *testing.T) {
+			t.Parallel()
+
+			fine := []DownsampleTier{{Before: 100, Interval: 10, Agg: agg}}
+			coarse := append(slices.Clone(fine), DownsampleTier{Before: 100, Interval: 20, Agg: agg})
+
+			for mask := range 1 << len(ts) {
+				vals := slices.Clone(base)
+				for i := range vals {
+					if mask&(1<<i) != 0 {
+						vals[i] = math.NaN()
+					}
+				}
+
+				wantTs, wantVals, wantSF := downsample(ts, vals, nil, coarse)
+				fineTs, fineVals, fineSF := downsample(ts, vals, nil, fine)
+				gotTs, gotVals, gotSF := downsample(fineTs, fineVals, fineSF, coarse)
+
+				msg := fmt.Sprintf("NaN mask %06b", mask)
+				require.Equal(t, wantTs, gotTs, msg)
+				require.Equal(t, wantSF, gotSF, msg)
+				requireSameFloats(t, wantVals, gotVals, 0, msg)
+
+				if agg == signal.AggMin || agg == signal.AggMax {
+					allNaN := mask == 1<<len(ts)-1
+					require.Equal(t, allNaN, math.IsNaN(wantVals[0]), "%s: NaN only when nothing else", msg)
+				}
+			}
+		})
+	}
+}
+
+// TestDownsampleCoarseningCancellation pins the bound regrouping is held to: fine buckets [1e16] and
+// [−1e16, 1] store −1e16 for the second (1e16 − 1 is not a float64), so the coarse Sum is 0 where one
+// pass over the raw samples gives 1.
+func TestDownsampleCoarseningCancellation(t *testing.T) {
+	t.Parallel()
+
+	ts := []int64{0, 10, 11}
+	vals := []float64{1e16, -1e16, 1}
+
+	for _, agg := range []signal.Aggregation{signal.AggSum, signal.AggAvg} {
+		t.Run(agg.String(), func(t *testing.T) {
+			t.Parallel()
+
+			fine := []DownsampleTier{{Before: 100, Interval: 10, Agg: agg}}
+			coarse := append(slices.Clone(fine), DownsampleTier{Before: 100, Interval: 20, Agg: agg})
+
+			_, direct, _ := downsample(ts, vals, nil, coarse)
+			fineTs, fineVals, fineSF := downsample(ts, vals, nil, fine)
+			_, regrouped, _ := downsample(fineTs, fineVals, fineSF, coarse)
+
+			want, lost := 1.0, 0.0
+			if agg == signal.AggAvg {
+				want = 1.0 / 3
+			}
+
+			assert.Equal(t, []float64{want}, direct, "one pass is compensated")
+			assert.Equal(t, []float64{lost}, regrouped, "the stored representative already rounded the 1 away")
+			assert.InDelta(t, direct[0], regrouped[0], regroupTolerance(vals, nil))
+		})
+	}
+}
+
+// FuzzDownsample asserts the structural invariants hold for arbitrary input, that every aggregation
+// but Count is a fixed point under re-downsampling, and that coarsening a rollup equals rolling the
+// raw samples up at the coarse interval once: exactly for the value-selecting aggregations, within
+// [regroupTolerance] for Sum and Avg. Values span twenty decades and both signs, so sums cancel, and
+// include NaN and ±Inf.
 func FuzzDownsample(f *testing.F) {
 	f.Add([]byte{1, 2, 3, 4, 5, 6}, int64(100), int64(10), uint8(0))
 	f.Add([]byte{0, 0, 9, 9}, int64(5), int64(3), uint8(4))
@@ -190,7 +320,17 @@ func FuzzDownsample(f *testing.F) {
 
 			seen[v] = struct{}{}
 			ts = append(ts, v)
-			vals = append(vals, float64(i))
+			val := float64(int8(b*37)) * math.Pow10(i%20)
+			switch b % 23 {
+			case 0:
+				val = math.NaN()
+			case 1:
+				val = math.Inf(1)
+			case 2:
+				val = math.Inf(-1)
+			}
+
+			vals = append(vals, val)
 		}
 
 		slices.Sort(ts)
@@ -207,10 +347,30 @@ func FuzzDownsample(f *testing.F) {
 			require.NotEqual(t, gotTs[i-1], gotTs[i], "output timestamps are unique")
 		}
 
-		if agg == signal.AggLast {
-			ts2, val2, _ := downsample(gotTs, gotVal, gotSF, tiers)
-			require.Equal(t, gotTs, ts2, "AggLast is a fixed point")
-			require.Equal(t, gotVal, val2, "AggLast is a fixed point")
+		if agg == signal.AggCount || interval <= 0 {
+			return
 		}
+
+		ts2, val2, sf2 := downsample(gotTs, gotVal, gotSF, tiers)
+		require.Equal(t, gotTs, ts2, "fixed point")
+		requireSameFloats(t, gotVal, val2, 0, "fixed point")
+		require.Equal(t, gotSF, sf2, "fixed point")
+
+		if interval > 1<<40 {
+			return // the coarse interval would overflow
+		}
+
+		coarse := append(slices.Clone(tiers), DownsampleTier{Before: before, Interval: interval * int64(2+aggByte%3), Agg: agg})
+		wantTs, wantVal, wantSF := downsample(ts, vals, nil, coarse)
+		gotTs, gotVal, gotSF = downsample(gotTs, gotVal, gotSF, coarse)
+		require.Equal(t, wantTs, gotTs, "coarsening keeps the one-pass timestamps")
+		require.Equal(t, wantSF, gotSF, "coarsening keeps the one-pass weights")
+
+		tol := 0.0
+		if agg == signal.AggSum || agg == signal.AggAvg {
+			tol = regroupTolerance(vals, nil)
+		}
+
+		requireSameFloats(t, wantVal, gotVal, tol, "coarsening is the one-pass rollup, regrouped")
 	})
 }

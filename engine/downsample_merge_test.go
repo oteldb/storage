@@ -52,8 +52,8 @@ func TestMergeWithDownsample(t *testing.T) {
 
 	got := fetchAll(t, e, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
 	require.Len(t, got, 1)
-	// bucket[10]=last(10,12)=2, bucket[20]=last(23,28)=4, then raw 150,160.
-	assert.Equal(t, []int64{10, 20, 150, 160}, got[0].Timestamps)
+	// bucket[10]=last(10,12)=2 at 12, bucket[20]=last(23,28)=4 at 28, then raw 150,160.
+	assert.Equal(t, []int64{12, 28, 150, 160}, got[0].Timestamps)
 	assert.Equal(t, []float64{2, 4, 5, 6}, got[0].Values)
 
 	// Re-merging with the same options is a fixed point: still one part, identical data.
@@ -97,4 +97,31 @@ func TestMergeWithDownsampleSinglePart(t *testing.T) {
 	// Second merge: already at target resolution ⇒ no rewrite (same backend objects).
 	require.NoError(t, e.MergeWith(ctx, opts))
 	assert.Equal(t, keysAfter, listKeys(t, b), "fixed point: no part churn on re-merge")
+}
+
+// TestMergeWithDownsampleAvgKeepsWeight checks a streamed merge of unweighted parts keeps an Avg
+// representative's population as its weight, so a later coarsening takes the weighted mean.
+func TestMergeWithDownsampleAvgKeepsWeight(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	e := flushEngine()
+	s := mkSeries("job", "api")
+
+	mustAppend(t, e, s, 10, 1)
+	mustAppend(t, e, s, 12, 2)
+	require.NoError(t, e.Flush(ctx))
+	mustAppend(t, e, s, 14, 6)
+	mustAppend(t, e, s, 25, 4)
+	require.NoError(t, e.Flush(ctx))
+
+	opts := engine.MergeOptions{Downsample: []engine.DownsampleTier{{Before: 100, Interval: 10, Agg: signal.AggAvg}}}
+	require.NoError(t, e.MergeWith(ctx, opts))
+	require.Equal(t, 1, e.PartCount())
+
+	got := fetchAll(t, e, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
+	require.Len(t, got, 1)
+	assert.Equal(t, []int64{10, 20}, got[0].Timestamps)
+	assert.Equal(t, []float64{3, 4}, got[0].Values)
+	assert.Equal(t, []float64{3, 1}, got[0].ScaleFactors)
 }

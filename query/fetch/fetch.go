@@ -166,10 +166,12 @@ type Batch struct {
 	Timestamps []int64
 	Values     []float64
 
-	// ScaleFactors carries each sample's lossy-sampling weight (metrics only): a kept sample
-	// with ScaleFactors[i] = N "represents" N original samples that budgeted sampling dropped
-	// (DESIGN §8a). It is nil when no sampling occurred (every weight is 1), so the common path
-	// is unaffected; when non-nil its length matches Values. The storage layer only *carries* the
+	// ScaleFactors carries each sample's weight (metrics only): a kept sample with
+	// ScaleFactors[i] = N "represents" N original samples — the ones budgeted sampling dropped
+	// (DESIGN §8a), or, for an Avg downsample representative, the samples its bucket held (so a
+	// weighted mean over representatives is the mean of the raw samples). It is nil when every
+	// weight is 1, so the common path is unaffected; when non-nil its length matches Values.
+	// The storage layer only *carries* the
 	// weight — an embedder's aggregation multiplies it back into count/sum/rate to stay unbiased
 	// (a gauge read ignores it). Use [Batch.ScaleFactor] to read it with the nil default.
 	ScaleFactors []float64

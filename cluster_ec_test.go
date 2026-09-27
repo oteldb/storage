@@ -19,6 +19,7 @@ import (
 	"github.com/oteldb/storage/cluster/etcd"
 	"github.com/oteldb/storage/cluster/etcd/etcdtest"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
@@ -517,7 +518,8 @@ func TestECBackendRangesNativelyReadsOneByte(t *testing.T) {
 
 // TestECBackendMergeOutputMatchesRaw pins what the EC wrapper may cost a merge: its output is
 // byte-identical to the same merge over a raw backend, and each sharded source object is
-// reconstructed at most once however many read-ahead windows its column spans. Each source is
+// reconstructed at most once however many read-ahead windows its column spans. The merge reads each
+// source's columns and its watermark sidecar, which carries a rolled-up series' coverage forward. Each source is
 // converted and loses this node's own shard slot first, so every sharded read decodes parity.
 //
 //nolint:paralleltest // owns an embedded etcd; runs serially
@@ -541,7 +543,7 @@ func TestECBackendMergeOutputMatchesRaw(t *testing.T) {
 	wrapped := &ecBackend{inner: disk, s: s, shardKey: "default", scheme: scheme}
 	require.True(t, backend.StreamsWrites(wrapped))
 
-	var columns, largest, merging int64
+	var columns, sidecars, largest, merging int64
 
 	want := mergedDigest(t, raw, func(string) {})
 	got := mergedDigest(t, wrapped, func(prefix string) {
@@ -552,8 +554,11 @@ func TestECBackendMergeOutputMatchesRaw(t *testing.T) {
 		for _, o := range meta.Objects {
 			require.NoError(t, disk.Delete(ctx, ec.ShardKey(prefix, 0, o.Name)))
 
-			if strings.HasPrefix(o.Name, "c/") {
+			switch {
+			case strings.HasPrefix(o.Name, "c/"):
 				columns++
+			case prefix+"/"+o.Name == watermark.Key(prefix):
+				sidecars++
 			}
 			largest = max(largest, o.Size)
 		}
@@ -591,7 +596,7 @@ func TestECBackendMergeOutputMatchesRaw(t *testing.T) {
 		columns, largest, reconstructs)
 	require.Greater(t, largest, int64(3<<20), "a sharded column must span several read-ahead windows")
 	assert.Positive(t, reconstructs, "the merge read its sources through reconstruction")
-	assert.LessOrEqual(t, reconstructs, columns, "a sharded column is reconstructed at most once per merge")
+	assert.LessOrEqual(t, reconstructs, columns+sidecars, "a sharded object is reconstructed at most once per merge")
 }
 
 // mergedDigest flushes a fixed corpus into three overlapping parts, hands each to beforeMerge, and

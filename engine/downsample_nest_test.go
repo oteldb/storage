@@ -172,8 +172,8 @@ func TestMergeNestedTiersRollOnce(t *testing.T) {
 }
 
 // TestDownsampleNestedTiersStepwise feeds an ingesting series through a 1m/5m/1h/6h policy one
-// quantum at a time and checks the result equals a single rollup at the final cutoffs. Avg and Count
-// are left out: coarsening a representative is exact only for aggregations that compose.
+// quantum at a time and checks the result equals a single rollup at the final cutoffs. Count is left
+// out: re-counting a representative is not exact until merges combine representatives (#726).
 func TestDownsampleNestedTiersStepwise(t *testing.T) {
 	t.Parallel()
 
@@ -190,7 +190,9 @@ func TestDownsampleNestedTiersStepwise(t *testing.T) {
 	end := base + 40*hour
 
 	for _, weighted := range []bool{false, true} {
-		for _, agg := range []signal.Aggregation{signal.AggLast, signal.AggFirst, signal.AggMin, signal.AggMax, signal.AggSum} {
+		for _, agg := range []signal.Aggregation{
+			signal.AggLast, signal.AggFirst, signal.AggMin, signal.AggMax, signal.AggSum, signal.AggAvg,
+		} {
 			name := agg.String()
 			if weighted {
 				name += "/weighted"
@@ -233,7 +235,11 @@ func TestDownsampleNestedTiersStepwise(t *testing.T) {
 
 				wantTs, wantVals, wantSF := downsample(rawTs, rawVals, rawSF, tiersAt(end))
 				assert.Equal(t, wantTs, ts)
-				assert.Equal(t, wantVals, vals)
+				if agg == signal.AggSum || agg == signal.AggAvg {
+					assert.InDeltaSlice(t, wantVals, vals, regroupTolerance(rawVals, rawSF), "the one-pass rollup, regrouped")
+				} else {
+					assert.Equal(t, wantVals, vals)
+				}
 				assert.Equal(t, normalizeSF(wantSF, len(wantTs)), sf)
 			})
 		}

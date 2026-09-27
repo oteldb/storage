@@ -605,6 +605,22 @@ func (p *part) seriesMaxTimes(ctx context.Context) ([]watermark.Entry, error) {
 	return out, nil
 }
 
+// seriesWatermark returns the watermark this part records for series id; ok is false when the part
+// does not hold id.
+func (p *part) seriesWatermark(ctx context.Context, id signal.SeriesID) (t int64, ok bool, err error) {
+	ents, err := p.seriesWatermarks(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+
+	i, ok := slices.BinarySearchFunc(ents, id, func(e watermark.Entry, id signal.SeriesID) int { return e.ID.Compare(id) })
+	if !ok {
+		return 0, false, nil
+	}
+
+	return ents[i].Max, true, nil
+}
+
 // forEachSeriesMaxTime calls fn for every series in the part with its newest timestamp there.
 func (p *part) forEachSeriesMaxTime(ctx context.Context, fn func(signal.SeriesID, int64)) error {
 	ents, err := p.seriesWatermarks(ctx)

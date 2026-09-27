@@ -192,8 +192,8 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 			return mergeResult{parts: dropped}, err
 		}
 
-		// A rollup lands at its bucket start, which can precede the part's day; only the streamed
-		// path cuts on days.
+		// A Sum, Avg or Count rollup lands at its bucket start, which can precede the part's day; only
+		// the streamed path cuts on days.
 		if lo, hi := colsTimeRange(single); !timebucket.Fits(lo, hi, timebucket.Top()) {
 			single = nil
 		}
@@ -428,8 +428,13 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 			d.mergeSeriesInto(rng, &m, start, maxInt64)
 		}
 
+		srcCovered, err := sourceCovered(ctx, src, id)
+		if err != nil {
+			return nil, err
+		}
+
 		ts, values, sf := m.collect(nil, nil)
-		ts, values, sf = downsample(ts, values, sf, tiers)
+		ts, values, sf, covered := downsampleCovering(ts, values, sf, tiers)
 
 		u := idToU128(id)
 		for i := range ts {
@@ -439,10 +444,75 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 			}
 
 			cols.appendRow(u, ts[i], values[i], w)
+
+			c := ts[i]
+			if covered != nil {
+				c = covered[i]
+			}
+
+			if i == len(ts)-1 {
+				c = max(c, srcCovered)
+			}
+
+			cols.noteCovered(c)
 		}
 	}
 
 	return cols, nil
+}
+
+// sourceCovered is the newest timestamp any source part covers for series id (minInt64 when none
+// holds it). A rolled source may cover past its newest stored sample, so the merge output's
+// watermark takes it rather than re-deriving coverage from the timestamps alone.
+func sourceCovered(ctx context.Context, src []*part, id signal.SeriesID) (int64, error) {
+	covered := minInt64
+
+	for _, p := range src {
+		t, ok, err := p.seriesWatermark(ctx, id)
+		if err != nil {
+			return 0, err
+		}
+
+		if ok {
+			covered = max(covered, t)
+		}
+	}
+
+	return covered, nil
+}
+
+// rolledSeries is one series' merge output, cut into per-day runs by the streamed merge.
+type rolledSeries struct {
+	ts         []int64
+	values, sf []float64
+	// covered is each row's newest source timestamp (nil ⇒ ts); srcCovered what the source parts
+	// recorded for the series.
+	covered    []int64
+	srcCovered int64
+}
+
+// run returns rows [lo, hi) and the watermark they record. The last run also takes srcCovered, so
+// the series' watermark across the output never falls below what its sources claimed.
+func (s *rolledSeries) run(lo, hi int) (ts []int64, values, sf []float64, watermark int64) {
+	if s.sf != nil {
+		sf = s.sf[lo:hi]
+	}
+
+	covered := s.ts[lo:hi]
+	if s.covered != nil {
+		covered = s.covered[lo:hi]
+	}
+
+	watermark = minInt64
+	if hi == len(s.ts) {
+		watermark = s.srcCovered
+	}
+
+	for _, t := range covered {
+		watermark = max(watermark, t)
+	}
+
+	return s.ts[lo:hi], s.values[lo:hi], sf, watermark
 }
 
 // mergeResidentObserver, when non-nil, receives after each streamed merge the most its open writers
@@ -481,7 +551,7 @@ func (e *Engine) compactStream(
 	}
 
 	scratch := make([]rangeBuf, len(src))
-	comp, precision, withSF := mergeEncoding(src, capBytes, opts)
+	comp, precision, withSF := mergeEncoding(src, capBytes, opts, plan.tiers)
 	budget := e.mergeBudget(capBytes)
 
 	var newParts []*part
@@ -517,19 +587,21 @@ func (e *Engine) compactStream(
 			return nil, err
 		}
 
-		ts, values, sf := m.collect(nil, nil)
-		ts, values, sf = downsample(ts, values, sf, plan.tiers)
+		srcCovered, err := sourceCovered(ctx, src, id)
+		if err != nil {
+			return nil, err
+		}
+
+		rs := rolledSeries{srcCovered: srcCovered}
+		rs.ts, rs.values, rs.sf = m.collect(nil, nil)
+		rs.ts, rs.values, rs.sf, rs.covered = downsampleCovering(rs.ts, rs.values, rs.sf, plan.tiers)
 
 		u := idToU128(id)
 
-		err = timebucket.Runs(ts, func(lo, hi int) error {
-			return router.Append(ts[lo], func(w *partStreamWriter) (bool, error) {
-				var runSF []float64
-				if sf != nil {
-					runSF = sf[lo:hi]
-				}
-
-				if err := w.appendSeries(u, ts[lo:hi], values[lo:hi], runSF); err != nil {
+		err = timebucket.Runs(rs.ts, func(lo, hi int) error {
+			return router.Append(rs.ts[lo], func(w *partStreamWriter) (bool, error) {
+				ts, values, sf, watermark := rs.run(lo, hi)
+				if err := w.appendSeries(u, ts, values, sf, watermark); err != nil {
 					return false, err
 				}
 
@@ -573,10 +645,11 @@ func (e *Engine) compactStream(
 //     stamped maxTime, so the estimate is self-correcting rather than sticky.
 //   - The compression ladder is a step function of row count, estimated from the source rows scaled
 //     by the share of the group's bytes one output part will hold.
-//   - The weight column is declared if any source carries one, and cannot appear from nowhere: with
-//     no sampled input every collected weight is 1, and downsample returns a nil weight vector when
-//     every output weight is 1. If they all turn out to be 1 anyway, the column is dropped at finish.
-func mergeEncoding(src []*part, capBytes int64, opts MergeOptions) (compressProfile, uint8, bool) {
+//   - The weight column is declared if any source carries one or an Avg tier can emit one (an Avg
+//     representative carries its bucket's population as its weight). Otherwise it cannot appear:
+//     every collected weight is 1, and downsample returns a nil weight vector when every output
+//     weight is 1. If they all turn out to be 1 anyway, the column is dropped at finish.
+func mergeEncoding(src []*part, capBytes int64, opts MergeOptions, tiers []DownsampleTier) (compressProfile, uint8, bool) {
 	var (
 		maxT     = minInt64
 		rows     int
@@ -589,6 +662,10 @@ func mergeEncoding(src []*part, capBytes int64, opts MergeOptions) (compressProf
 		rows += p.rows()
 		srcBytes += p.sizeBytes()
 		withSF = withSF || p.hasSF
+	}
+
+	for _, t := range tiers {
+		withSF = withSF || t.Interval > 0 && t.Agg == signal.AggAvg
 	}
 
 	if capBytes > 0 && srcBytes > capBytes {

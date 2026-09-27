@@ -551,8 +551,8 @@ engine; no parallel subsystem.
 per pass — and grid-aligned downsample buckets, so a rollup does not depend on when the merge runs.
 
 **Stable cutoffs:** the caller floors each tier's `Before` to whole buckets of at least an hour, so a
-cutoff never splits a bucket (a split bucket is re-rolled with its own representative, which avg and
-count cannot absorb) and moves once per quantum rather than once per tick. Quantized cutoffs tie, so a
+cutoff never splits a bucket (a split bucket is re-rolled with its own representative, which count
+cannot absorb) and moves once per quantum rather than once per tick. Quantized cutoffs tie, so a
 sample goes to the widest tier it qualifies for rather than the one with the earliest cutoff.
 Exactness also needs tier Intervals to nest, each dividing the next: a coarse cutoff then lies on every
 finer grid, so a fine bucket is never split across tiers and its representative, once coarsened, lands
@@ -560,9 +560,47 @@ in the coarse bucket its samples belong to. Under 7m + 1h a 7m bucket at 119m st
 and drags 121m samples into the previous hour; the facade rejects such a policy
 (`tenant.Downsample.Validate`) rather than downsample it inexactly.
 
-**Fixed points:** repeated merges are stable for last/first/min/max/sum/avg, count being the documented
-exception. Recompression checks the part's recorded algorithm *and* level, precision the manifest's
-recorded budget; only an upgrade rewrites, and a part denser than the target is left alone.
+**Representatives compose.** A policy uses one Agg across its tiers (`tenant.Downsample.Validate`), and
+each representative carries what a coarser tier needs to re-aggregate it:
+
+- Last/First/Min/Max emit the chosen sample itself, at its own timestamp. A representative is then a
+  real sample, so a re-roll, a coarser tier, a late sample and a same-timestamp duplicate all see raw
+  data and coarsen exactly, and a Last-rolled counter is not shifted back to the bucket start under
+  `rate`.
+- Sum emits the bucket total at the bucket start, weight 1.
+- Avg emits the mean at the bucket start with the bucket's population as its scale factor, the weight
+  a sampled row carries, so a coarser Avg is the weighted mean and `SeriesAgg` and a weight-aware query
+  read it unchanged. A part holding Avg representatives therefore has the sf column and no stats
+  sidecar. Its points are bucket means, not counter values, so `rate`/`increase` over an Avg-rolled
+  counter are approximate.
+- Count is exact only on the first roll: a merge that rolls its representative again counts it as one
+  sample.
+
+A coarser Sum or Avg equals the one-pass rollup up to floating-point grouping: each representative is
+rounded once when stored, so coarsening adds the same values in a different order. Within a bucket the
+total is compensated (Neumaier), so one bucket rounds once however many samples it holds; across
+buckets the error stays within the recursive-summation bound, and cancellation shows it (fine buckets
+[1e16] and [−1e16, 1] coarsen to 0, one pass gives 1).
+
+NaN composes too. Min and Max skip NaN while a bucket holds any other value and emit the first NaN
+only when it holds nothing else; seeding from the first sample and comparing with `<` would let a
+leading NaN win a fine bucket and hide a smaller value from the coarse one. First and Last take the
+sample whatever it is, and a NaN or opposing infinities make a Sum or Avg NaN in either grouping.
+
+Changing a tier's Agg applies only to data not yet rolled up; a rolled bucket keeps the Agg it was
+rolled with. The marker keeps a same-width Agg change from forcing a rewrite, but a merge that re-rolls
+a representative for another reason — a pending source beside it — aggregates it by the current Agg.
+
+Anchoring is paid in the ts column, measured on a 1m rollup of 15s scrapes: +0.01 B/row with no scrape
+jitter, +1.1 at ±5ms, +2.0 at ±50ms, against 1.1–6.8 B/row for the value column. The sf column of an
+Avg rollup costs 0.025 B/row. Mixed Aggs would need full per-bucket state (count, sum, min, max,
+first, last), 5–7× a Last-only part. A late sample in a rolled bucket combines as new data; a late
+write reusing the timestamp of a raw sample already rolled up cannot replace it, since that value is
+gone.
+
+**Fixed points:** repeated merges are stable for every Agg but Count. Recompression checks the part's
+recorded algorithm *and* level, precision the manifest's recorded budget; only an upgrade rewrites,
+and a part denser than the target is left alone.
 
 Downsampling checks the tier layout recorded in the manifest's rollup marker: per timestamp, the widest
 (Interval, Agg) the part's data there has had applied. A flush records raw. A merge records the union
@@ -587,7 +625,7 @@ other bucket's rollup, the ladder and straddler splits.
 
 A merge downsamples only when some source is pending, so a ladder merge of parts already at least as
 wide as the policy does not re-roll their representatives: that re-roll moves no timestamp, and its
-only effect is to corrupt count (a representative recounts as 1) and weighted avg. A lone pending part
+only effect is to corrupt count (a representative recounts as 1). A lone pending part
 is first streamed once, one series range at a time, stopping at the first series the rollup would
 change; if none changes, it is rewritten verbatim and records the union with the current tiers. What
 counts as a change depends on what the marker says the values are. For a marked part they are known
@@ -595,7 +633,9 @@ raw (or narrower), so the rollup must be a no-op on timestamps, values *and* wei
 a bucket start is still a raw value, which a count tier turns into 1 and a weighted sum into
 value·weight, and copying it verbatim would record a layout it never had. For an unmarked part the
 values may already be representatives, so only timestamps are compared: a part rolled before the
-marker existed sits on its bucket starts, and re-rolling its counts would turn each into 1. The cost
+marker existed sits on its bucket starts, and re-rolling its counts would turn each into 1. A raw
+sample alone in its bucket compares equal under Last/First/Min/Max and Avg too, and there the copy is
+exactly the rollup: those emit the sample itself. The cost
 is that a raw legacy part whose samples happen to sit on bucket starts is recorded as rolled without
 being aggregated — the same trade as reading a legacy part's missing size field conservatively. A merge that mixes a pending source
 with already-rolled ones still re-rolls the rolled ones; combining representatives by their aggregation
@@ -1262,6 +1302,17 @@ or one that has just mirrored a part with `cluster/partsync` — resolves them w
 timestamp column at all. A part written before the sidecar existed, or one whose sidecar is corrupt or
 does not cover its series, falls back to decoding the column; absence is not an error. Either way the
 result is held on the part handle at ~24 bytes per series, on top of the 20 the resident index costs.
+
+**A merge never lowers a series' watermark.** The sidecar records the newest timestamp a part *covers*,
+not the newest it stores: a rollup representative sits at or before the samples it replaced (First,
+Min and Max pick an earlier sample, Sum/Avg/Count the bucket start), and a watermark read off the
+timestamps would leave a replica that refreshes after the rollup holding raw samples the part already
+accounts for — extra rows on replica reads, re-flushed on promotion. So a merge takes each bucket's
+newest source timestamp, and each series' last output run also takes the largest watermark its source
+parts recorded, since a re-rolled representative no longer shows what it covered. The decode fallback
+reads timestamps only, so it can land lower — never higher — than the sidecar, which keeps a replica's
+head rather than trimming what is not durable. Part `minTime`/`maxTime` still bound the stored
+timestamps, since pruning must cover the representatives.
 
 **A reloaded index reuses the part handles the engine already holds** (`loadPartsLocked`) when the
 handle already carries everything its entry records — time bounds, block identity, claim, level — and

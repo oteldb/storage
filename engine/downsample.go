@@ -2,6 +2,7 @@ package engine
 
 import (
 	"cmp"
+	"math"
 	"slices"
 
 	"github.com/oteldb/storage/signal"
@@ -71,20 +72,34 @@ func downsampleApplies(tiers []DownsampleTier, minTime int64) bool {
 
 // downsample rolls up (ts, values, sf) — sorted ascending by ts with no duplicate timestamps, as
 // produced by sampleMerge.collect — according to tiers, returning the rolled-up series (still
-// sorted ascending, unique ts). sf carries each input sample's lossy-sampling weight (nil ⇒ every
-// weight is 1); the returned sf is nil when every output weight is 1. Samples younger than every
-// tier's Before pass through unchanged (weight included). A sample old enough for a tier is
-// assigned to the coarsest applicable tier and contributes to that tier's Interval bucket; the
-// bucket emits one sample at its aligned start timestamp.
+// sorted ascending, unique ts). sf carries each input sample's weight (nil ⇒ every weight is 1);
+// the returned sf is nil when every output weight is 1. Samples younger than every tier's Before
+// pass through unchanged (weight included). A sample old enough for a tier is assigned to the
+// coarsest applicable tier and contributes to that tier's Interval bucket, which emits one
+// representative.
 //
-// The rollup is weight-aware so a sampled series stays unbiased: Sum emits Σ(value·sf) with weight
-// 1, Count emits Σsf (the estimated original count) with weight 1, Avg emits the weighted mean
-// with weight 1, and Last/First/Min/Max carry the representative sample's value and its weight.
+// Last/First/Min/Max emit the chosen sample itself — its timestamp, value and weight — so a
+// representative is a real sample and re-rolling it is exact. Sum and Count emit at the bucket
+// start with weight 1 (the weight is folded into the value); Avg emits the weighted mean at the
+// bucket start with the bucket's total weight. A coarser Sum or Avg over representatives is
+// therefore the one-pass rollup up to floating-point grouping: the same sum, added in a different
+// order, since each representative was rounded once when stored. Count is the one aggregation a
+// re-roll corrupts: re-counting a representative yields 1, not the count it carried.
 //
-// The transform is a fixed point for an already-rolled-up series under Last/First/Min/Max/Sum/Avg
-// (a one-sample bucket aggregates to itself), so repeated merges are stable. Count is the
-// exception — re-counting a representative yields 1 — and is documented as non-idempotent.
+// Min and Max ignore NaN while the bucket holds any other value; an all-NaN bucket emits its first
+// NaN. First and Last take the sample whatever its value, and a NaN in a Sum or Avg bucket makes
+// its representative NaN, so every aggregation composes the same way with NaN as without.
 func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int64, []float64, []float64) {
+	ts, values, sf, _ = downsampleCovering(ts, values, sf, tiers)
+
+	return ts, values, sf
+}
+
+// downsampleCovering is [downsample] that also returns each output sample's newest source
+// timestamp: a representative can sit before samples it rolled up (First, Min, Max, and every
+// bucket-start aggregation), and the watermark a replica trims its head through must not fall back
+// with it. covered is nil when it equals the output timestamps.
+func downsampleCovering(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int64, []float64, []float64, []int64) {
 	active := make([]DownsampleTier, 0, len(tiers))
 	for _, t := range tiers {
 		if t.Interval > 0 {
@@ -93,7 +108,7 @@ func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int
 	}
 
 	if len(active) == 0 || len(ts) == 0 {
-		return ts, values, sf
+		return ts, values, sf, nil
 	}
 
 	weight := func(i int) float64 {
@@ -142,43 +157,81 @@ func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int
 		b.add(t, values[i], weight(i))
 	}
 
-	// Emit one sample per bucket at its start ts. Sort by ts, finer interval first, so an
-	// overlap on a misaligned boundary deterministically keeps the finer (more accurate) value.
-	slices.SortFunc(order, func(a, b key) int {
-		if c := cmp.Compare(a.start, b.start); c != 0 {
+	reps := make([]rollupRep, 0, len(order))
+	for _, k := range order {
+		b := buckets[k]
+		ts, v, w := b.result(k.start)
+		reps = append(reps, rollupRep{ts: ts, interval: k.interval, covered: b.lastTs, v: v, w: w})
+	}
+
+	// Finer interval first on a timestamp tie, so an overlap on a misaligned boundary
+	// deterministically keeps the finer (more accurate) value.
+	slices.SortFunc(reps, func(a, b rollupRep) int {
+		if c := cmp.Compare(a.ts, b.ts); c != 0 {
 			return c
 		}
 
 		return cmp.Compare(a.interval, b.interval)
 	})
 
-	outTs := make([]int64, 0, len(order))
-	outVal := make([]float64, 0, len(order))
-
-	var outSF []float64
-
-	for _, k := range order {
-		if n := len(outTs); n > 0 && outTs[n-1] == k.start {
-			continue // a finer bucket already emitted this timestamp
-		}
-
-		v, w := buckets[k].result()
-		outTs = append(outTs, k.start)
-		outVal = append(outVal, v)
-
-		if w != 1 && outSF == nil {
-			outSF = make([]float64, len(outTs)-1, len(order))
-			for i := range outSF {
-				outSF[i] = 1
-			}
-		}
-
-		if outSF != nil {
-			outSF = append(outSF, w)
-		}
+	out := rollupOut{ts: make([]int64, 0, len(reps)), val: make([]float64, 0, len(reps))}
+	for _, r := range reps {
+		out.add(r)
 	}
 
-	return outTs, outVal, outSF
+	return out.ts, out.val, out.sf, out.covered
+}
+
+// rollupRep is one bucket's representative, with the newest source timestamp it covers.
+type rollupRep struct {
+	ts, interval, covered int64
+	v, w                  float64
+}
+
+// rollupOut collects the representatives in timestamp order. sf and covered stay nil until a row
+// differs from its default (weight 1, covered = ts).
+type rollupOut struct {
+	ts      []int64
+	val     []float64
+	sf      []float64
+	covered []int64
+}
+
+func (o *rollupOut) add(r rollupRep) {
+	if n := len(o.ts); n > 0 && o.ts[n-1] == r.ts {
+		// The coarser bucket's value is dropped, but the samples it held are still covered.
+		if o.covered == nil && r.covered > o.ts[n-1] {
+			o.covered = slices.Clone(o.ts)
+		}
+
+		if o.covered != nil {
+			o.covered[n-1] = max(o.covered[n-1], r.covered)
+		}
+
+		return
+	}
+
+	o.ts = append(o.ts, r.ts)
+	o.val = append(o.val, r.v)
+
+	switch {
+	case o.covered != nil:
+		o.covered = append(o.covered, r.covered)
+	case r.covered != r.ts:
+		o.covered = append(slices.Clone(o.ts[:len(o.ts)-1]), r.covered)
+	}
+
+	switch {
+	case o.sf != nil:
+		o.sf = append(o.sf, r.w)
+	case r.w != 1:
+		o.sf = make([]float64, len(o.ts)-1, cap(o.ts))
+		for i := range o.sf {
+			o.sf[i] = 1
+		}
+
+		o.sf = append(o.sf, r.w)
+	}
 }
 
 // widestFirst orders tiers so the first a sample qualifies for is the coarsest. Before order would not
@@ -216,14 +269,18 @@ func alignDown(ts, interval int64) int64 {
 // bucketAcc accumulates the samples of one downsample bucket, weight-aware so sampled data stays
 // unbiased. Input timestamps within a bucket are unique (sampleMerge dedups by ts), so first/last
 // are unambiguous. n counts samples; nWeighted sums their weights (the estimated original count);
-// wsum sums value·weight (the estimated original total). min/max track the extreme value and the
-// weight of the sample that set it.
+// wsum sums value·weight (the estimated original total), compensated by wcomp (Neumaier) so a long
+// bucket's total is rounded once rather than once per sample. min/max track the earliest sample
+// holding the extreme non-NaN value, or the first sample while every value so far is NaN.
 type bucketAcc struct {
 	agg       signal.Aggregation
 	n         int64
 	nWeighted float64
 	wsum      float64
+	wcomp     float64
 	min, max  float64
+	minTs     int64
+	maxTs     int64
 	minSF     float64
 	maxSF     float64
 	firstTs   int64
@@ -237,6 +294,7 @@ type bucketAcc struct {
 func (b *bucketAcc) add(ts int64, v, sf float64) {
 	if b.n == 0 {
 		b.min, b.max = v, v
+		b.minTs, b.maxTs = ts, ts
 		b.minSF, b.maxSF = sf, sf
 		b.firstTs, b.firstVal, b.firstSF = ts, v, sf
 		b.lastTs, b.lastVal, b.lastSF = ts, v, sf
@@ -245,12 +303,12 @@ func (b *bucketAcc) add(ts int64, v, sf float64) {
 		return
 	}
 
-	if v < b.min {
-		b.min, b.minSF = v, sf
+	if v < b.min || math.IsNaN(b.min) && !math.IsNaN(v) {
+		b.min, b.minTs, b.minSF = v, ts, sf
 	}
 
-	if v > b.max {
-		b.max, b.maxSF = v, sf
+	if v > b.max || math.IsNaN(b.max) && !math.IsNaN(v) {
+		b.max, b.maxTs, b.maxSF = v, ts, sf
 	}
 
 	if ts < b.firstTs {
@@ -261,29 +319,53 @@ func (b *bucketAcc) add(ts int64, v, sf float64) {
 		b.lastTs, b.lastVal, b.lastSF = ts, v, sf
 	}
 
-	b.wsum += v * sf
+	b.addWeighted(v * sf)
 	b.nWeighted += sf
 	b.n++
 }
 
-// result returns the bucket's representative (value, weight). The value-selecting aggregations
-// carry the chosen sample's weight; the summarizing ones fold the weight into the value and emit
-// weight 1 (already unbiased).
-func (b *bucketAcc) result() (float64, float64) {
+func (b *bucketAcc) addWeighted(x float64) {
+	t := b.wsum + x
+	if math.Abs(b.wsum) >= math.Abs(x) {
+		b.wcomp += (b.wsum - t) + x
+	} else {
+		b.wcomp += (x - t) + b.wsum
+	}
+
+	b.wsum = t
+}
+
+// total is the compensated sum. Once wsum is infinite or NaN the compensation is meaningless (it
+// turns into NaN), so wsum stands alone.
+func (b *bucketAcc) total() float64 {
+	if math.IsInf(b.wsum, 0) || math.IsNaN(b.wsum) {
+		return b.wsum
+	}
+
+	return b.wsum + b.wcomp
+}
+
+// result returns the bucket's representative (ts, value, weight); start is the bucket's aligned
+// start.
+func (b *bucketAcc) result(start int64) (int64, float64, float64) {
 	switch b.agg {
 	case signal.AggFirst:
-		return b.firstVal, b.firstSF
+		return b.firstTs, b.firstVal, b.firstSF
 	case signal.AggMin:
-		return b.min, b.minSF
+		return b.minTs, b.min, b.minSF
 	case signal.AggMax:
-		return b.max, b.maxSF
+		return b.maxTs, b.max, b.maxSF
 	case signal.AggSum:
-		return b.wsum, 1
+		return start, b.total(), 1
 	case signal.AggAvg:
-		return b.wsum / b.nWeighted, 1
+		if b.n == 1 {
+			return start, b.lastVal, b.lastSF // v·w/w can round; a re-rolled representative must not drift
+		}
+
+		return start, b.total() / b.nWeighted, b.nWeighted
 	case signal.AggCount:
-		return b.nWeighted, 1
+		return start, b.nWeighted, 1
 	default: // signal.AggLast
-		return b.lastVal, b.lastSF
+		return b.lastTs, b.lastVal, b.lastSF
 	}
 }
