@@ -3,19 +3,32 @@ package recordengine
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/backend/faultbackend"
+	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/internal/partid"
 	"github.com/oteldb/storage/internal/watermark"
 )
 
 var errInjected = errors.New("injected")
+
+// compactParts is [Engine.compact] with the abandoned outputs deleted, as [Engine.merge] does.
+func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes int64, grant *mergeGrant) ([]*part, error) {
+	out, abandoned, err := e.compact(ctx, src, start, capBytes, grant)
+	e.discardOutputs(ctx, abandoned)
+
+	return out, err
+}
 
 // unindexedParts returns the part prefixes under the engine's prefix that its part set does not name.
 func unindexedParts(t *testing.T, e *Engine) map[string]struct{} {
@@ -149,4 +162,70 @@ func TestFailedMergeDeletesItsOutputs(t *testing.T) {
 			}
 		})
 	}
+}
+
+// stalledDeletes is a backend whose Delete, once stalled, answers only when its context ends.
+type stalledDeletes struct {
+	backend.Backend
+
+	stalled  atomic.Bool
+	onDelete func()
+}
+
+func (b *stalledDeletes) Delete(ctx context.Context, key string) error {
+	if !b.stalled.Load() {
+		return b.Backend.Delete(ctx, key)
+	}
+
+	b.onDelete()
+	<-ctx.Done()
+
+	return ctx.Err()
+}
+
+// TestFailedMergeCleanupIsBounded: a failed merge whose output deletes never answer returns after
+// [discardTimeout], and holds neither flushMu nor its grant while it waits.
+func TestFailedMergeCleanupIsBounded(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		const budget = 1 << 30
+
+		ctx := context.Background()
+		pool := memlimit.NewPool(budget)
+		faults := faultbackend.Wrap(backend.Memory())
+		be := &stalledDeletes{Backend: faults}
+		e := wideDictEngine(t, be, Config{MergeMemoryBytes: budget, MergeAdmission: poolAdmission(pool)}, 3, 4, 8<<10, 4)
+
+		var deletes, flushFree, grantFree int
+
+		be.onDelete = func() {
+			deletes++
+
+			if e.flushMu.TryLock() {
+				flushFree++
+
+				e.flushMu.Unlock()
+			}
+
+			if release, ok := pool.TryAcquire(budget); ok {
+				grantFree++
+
+				release()
+			}
+		}
+
+		faults.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Lose: true,
+			Match: func(op faultbackend.Op) bool { return op.Key == e.indexKey() }})
+		be.stalled.Store(true)
+
+		start := time.Now()
+		err := e.MergeWith(ctx, MergeOptions{Force: true})
+
+		require.ErrorIs(t, err, bucketindex.ErrConflict)
+		assert.Equal(t, discardTimeout, time.Since(start), "the cleanup gives up at its deadline")
+		assert.Equal(t, 1, deletes, "the cleanup stops at its deadline rather than trying every part")
+		assert.Equal(t, 1, flushFree, "flushMu is released before the cleanup")
+		assert.Equal(t, 1, grantFree, "the grant is released before the cleanup")
+	})
 }

@@ -472,8 +472,10 @@ data — so a new part would silently adopt a failed attempt's.
 A merge that fails after writing deletes its own outputs rather than leaving them to the sweep, which
 runs only at open: a merge failing the same way every cycle would otherwise strand a full set of
 outputs per cycle until the next restart. Every sealed part and the one being finished are deleted
-best-effort, past a canceled context, on any failure before the commit — reading an output back,
-finishing a part, a source left undrained. A failed index commit deletes them too, unless the save
+best-effort on any failure before the commit — reading an output back, finishing a part, a source
+left undrained. The deletes run after the merge has released `flushMu` and its grant, so a stalled
+backend holds up no flush and no other merge, and past a canceled context but within a 30 s
+deadline, so a backend that stops answering delays only the failed merge, and only that long. A failed index commit deletes them too, unless the save
 failed without saying whether it landed (`commitUnknownError`, any non-conflict save error): then
 the index may name them, and they wait for the sweep that reads it. A delete that fails is logged and
 likewise waits for the sweep; it never replaces the merge's own error.

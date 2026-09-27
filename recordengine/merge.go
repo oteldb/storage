@@ -108,8 +108,21 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 // reads, the compacted-part write/read-back, and the sidecar union happen off the engine lock; only the
 // small metadata publish runs under it. The old parts are retired (not deleted inline) and reclaimed
 // once their in-flight readers drain. Only the background maintenance task calls merge, so the parts
-// mutation has a single writer.
+// mutation has a single writer. A failed merge deletes the outputs it wrote only once it has released
+// flushMu and its grant, so a stalled backend delays this merge alone, and for at most
+// [discardTimeout].
 func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, error) {
+	var abandoned []*part
+
+	res, err := e.mergeHeld(ctx, opts, &abandoned)
+	e.discardOutputs(ctx, abandoned)
+
+	return res, err
+}
+
+// mergeHeld is [Engine.merge] under flushMu and the merge's grant. It leaves the outputs a failure
+// abandons in abandoned.
+func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]*part) (mergeResult, error) {
 	retainFrom := opts.RetainFrom
 
 	e.flushMu.Lock()
@@ -176,7 +189,9 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	// they cannot be reclaimed underneath this read.
 	bytesIn := partsBytes(selected)
 
-	newParts, err := e.compactParts(ctx, selected, start, capBytes, grant)
+	newParts, discard, err := e.compact(ctx, selected, start, capBytes, grant)
+	*abandoned = discard
+
 	if errors.Is(err, errMergeDeclined) {
 		return e.deferMerge(ctx, dropped, len(selected)), nil
 	}
@@ -209,7 +224,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		e.mu.Unlock()
 
 		if !commitMayHaveLanded(err) {
-			e.discardOutputs(ctx, newParts)
+			*abandoned = newParts
 		}
 
 		return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, err
@@ -359,7 +374,7 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 	return writeSidecars(ctx, e.cfg.Backend, newPrefix, stored)
 }
 
-// compactParts compacts the selected source parts into bounded output part(s), dropping records older
+// compact compacts the selected source parts into bounded output part(s), dropping records older
 // than start (retention). It streams both sides: each source is read forward a granule at a time per
 // column ([partCursor]) unless its layout rules that out, when it is decoded whole; each stream's rows
 // are merged across the sources by a k-way heap on (timestamp, source), and routed by timestamp to a
@@ -372,53 +387,65 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 // would reserve, taken with no admission.
 // When the engine has a side store (profiles) the cap does not split a day, but the resident bound
 // still can, and every part it writes carries the symbols its own rows reach. Returns the new parts
-// (empty when retention dropped every record). Reads the parts off the engine lock; src is the
-// immutable snapshot the caller planned over.
-func (e *Engine) compactParts(
+// (empty when retention dropped every record) and the parts failed attempts wrote, which nothing will
+// ever index: a merge that keeps failing the same way would otherwise leave a full set of outputs
+// behind every cycle. Reads the parts off the engine lock; src is the immutable snapshot the caller
+// planned over.
+func (e *Engine) compact(
 	ctx context.Context, src []*part, start, capBytes int64, grant *mergeGrant,
-) ([]*part, error) {
+) (out, abandoned []*part, err error) {
 	if grant == nil {
 		grant = &mergeGrant{bytes: e.mergeGrantBytes(ctx, src, capBytes)}
 	}
 
 	for {
-		out, err := e.compactStreamed(ctx, src, start, capBytes, grant)
+		out, err = e.compactStreamed(ctx, src, start, capBytes, grant)
 		if err == nil {
-			return out, nil
+			return out, abandoned, nil
 		}
 
-		// A failed attempt returns the parts it sealed, and nothing will ever index them: a merge that
-		// keeps failing the same way would otherwise leave a full set of outputs behind every cycle.
-		e.discardOutputs(ctx, out)
+		abandoned = append(abandoned, out...)
 
 		// Rows of the disordered stream may already be written out of order, so the attempt is redone
 		// with that source decoded whole, which sorts what it serves.
 		var disorder *sourceDisorderError
 		if !errors.As(err, &disorder) {
-			return nil, err
+			return nil, abandoned, err
 		}
 
 		src[disorder.src].tsDisorder.Store(true)
 	}
 }
 
-// discardOutputs deletes the parts a failed merge wrote. It outlives a canceled ctx, which is the
-// likeliest reason the merge failed; a part it cannot delete is left for [Engine.LoadParts] to sweep.
+// discardTimeout bounds how long a failed merge spends deleting its outputs. The deletes outlive a
+// canceled ctx, the likeliest reason the merge failed, but not a backend that stops answering.
+const discardTimeout = 30 * time.Second
+
+// discardOutputs deletes the parts a failed merge wrote, best-effort: a part it cannot delete within
+// [discardTimeout] is left for [Engine.LoadParts] to sweep.
 func (e *Engine) discardOutputs(ctx context.Context, parts []*part) {
-	for _, p := range parts {
-		e.discardOutput(ctx, p.prefix)
+	if len(parts) == 0 {
+		return
+	}
+
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), discardTimeout)
+	defer cancel()
+
+	for i, p := range parts {
+		if err := deletePart(dctx, e.cfg.Backend, p.prefix); err != nil {
+			zctx.From(ctx).Warn("merge could not delete an output part it abandoned",
+				zap.String("signal", e.cfg.Signal), zap.String("part", p.prefix),
+				zap.Int("left", len(parts)-i), zap.Error(err))
+
+			if dctx.Err() != nil {
+				return
+			}
+		}
 	}
 }
 
-func (e *Engine) discardOutput(ctx context.Context, prefix string) {
-	if err := deletePart(context.WithoutCancel(ctx), e.cfg.Backend, prefix); err != nil {
-		zctx.From(ctx).Warn("merge could not delete an output part it abandoned",
-			zap.String("signal", e.cfg.Signal), zap.String("part", prefix), zap.Error(err))
-	}
-}
-
-// compactStreamed is one attempt at [Engine.compactParts]. Once it has written a part, a failure
-// returns the parts it sealed with the error; a part it was finishing it deletes itself.
+// compactStreamed is one attempt at [Engine.compact]. Once it has written a part, a failure returns
+// the parts it sealed, and the one it failed to finish, with the error.
 func (e *Engine) compactStreamed(
 	ctx context.Context, src []*part, start, capBytes int64, grant *mergeGrant,
 ) ([]*part, error) {
@@ -439,13 +466,20 @@ func (e *Engine) compactStreamed(
 
 	e.reportOverBudget(ctx, grant.bytes)
 
-	var sealed []sealedPart
+	var (
+		sealed    []sealedPart
+		finishing []string
+	)
 
 	// What a failed attempt leaves behind: the parts it wrote, by prefix, for the caller to delete.
 	written := func() []*part {
-		out := make([]*part, len(sealed))
-		for i, s := range sealed {
-			out[i] = &part{prefix: s.prefix}
+		out := make([]*part, 0, len(sealed)+len(finishing))
+		for _, s := range sealed {
+			out = append(out, &part{prefix: s.prefix})
+		}
+
+		for _, prefix := range finishing {
+			out = append(out, &part{prefix: prefix})
 		}
 
 		return out
@@ -458,7 +492,7 @@ func (e *Engine) compactStreamed(
 		Finish: func(w *recordPartStreamWriter) error {
 			s, err := w.finish(ctx)
 			if err != nil {
-				e.discardOutput(ctx, w.prefix)
+				finishing = append(finishing, w.prefix)
 
 				return err
 			}
