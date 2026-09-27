@@ -373,7 +373,7 @@ func PartPresent(ctx context.Context, b backend.Backend, prefix string) (bool, e
 // OpenPart reads a part's manifest from b under prefix and returns a reader. It returns
 // an error (wrapping [ErrCorrupt] or [backend.ErrNotExist]) if the manifest is absent or
 // malformed — an incompletely written part (no manifest) is therefore not readable.
-func OpenPart(ctx context.Context, b backend.Backend, prefix string) (*PartReader, error) {
+func OpenPart(ctx context.Context, b backend.Backend, prefix string, opts ...ReadOption) (*PartReader, error) {
 	// Column/marks/manifest objects are decoded, never mutated, so the no-copy read view is safe.
 	raw, err := backend.ReadView(ctx, b, manifestKey(prefix))
 	if err != nil {
@@ -390,14 +390,43 @@ func OpenPart(ctx context.Context, b backend.Backend, prefix string) (*PartReade
 		byName[m.Columns[i].Name] = i
 	}
 
-	return &PartReader{
+	r := &PartReader{
 		b:        b,
 		prefix:   prefix,
 		manifest: m,
 		byName:   byName,
 		comps:    make(map[compress.Algorithm]*compress.Compressor),
 		level:    compress.LevelDefault,
-	}, nil
+	}
+
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r, nil
+}
+
+// ReadOption configures a [PartReader].
+type ReadOption func(*PartReader)
+
+// WithReadCompressors makes the reader decompress through cs, one per algorithm, instead of
+// compressors of its own, so every reader of one owner shares its pooled decoders: a zstd decoder
+// costs its buffers and tables anew in each pool it is built in, and a store holds thousands of parts.
+func WithReadCompressors(cs ...*compress.Compressor) ReadOption {
+	return func(r *PartReader) {
+		for _, c := range cs {
+			r.comps[c.Algorithm()] = c
+		}
+	}
+}
+
+// NewReadCompressors returns a [WithReadCompressors] over a fresh compressor for every algorithm a
+// part may be written in, for an owner to hand every reader it opens.
+func NewReadCompressors() ReadOption {
+	return WithReadCompressors(
+		compress.NewCompressor(compress.AlgorithmZSTD, compress.LevelDefault),
+		compress.NewCompressor(compress.AlgorithmLZ4, compress.LevelDefault),
+	)
 }
 
 // Manifest returns the part's decoded manifest.

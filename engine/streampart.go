@@ -252,7 +252,7 @@ func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 		return nil, errors.Wrapf(err, "sync part %q", prefix)
 	}
 
-	part, err := openPart(ctx, p.e.cfg.Backend, prefix, p.e.cfg.Obs.Corruption)
+	part, err := openPart(ctx, p.e.cfg.Backend, prefix, p.e.cfg.Obs.Corruption, p.e.readCompressors)
 	if err != nil {
 		return nil, err
 	}

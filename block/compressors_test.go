@@ -62,3 +62,36 @@ func TestWithCompressors(t *testing.T) {
 
 	assert.Equal(t, write(), write(WithCompressors(given)))
 }
+
+// TestWithReadCompressors: every reader handed the same set decompresses through it.
+func TestWithReadCompressors(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	b := backend.Memory()
+
+	w := NewPartWriter(WithCompression(compress.AlgorithmZSTD))
+	require.NoError(t, w.AddColumn(Column{Name: "v", Kind: KindInt64, Int64: []int64{1, 2, 3}}))
+	require.NoError(t, WritePart(ctx, b, "p", w))
+
+	shared := NewReadCompressors()
+
+	r1, err := OpenPart(ctx, b, "p", shared)
+	require.NoError(t, err)
+	r2, err := OpenPart(ctx, b, "p", shared)
+	require.NoError(t, err)
+	own, err := OpenPart(ctx, b, "p")
+	require.NoError(t, err)
+
+	zstd := r1.compressorFor(compress.AlgorithmZSTD)
+	assert.Same(t, zstd, r2.compressorFor(compress.AlgorithmZSTD))
+	assert.Same(t, r1.compressorFor(compress.AlgorithmLZ4), r2.compressorFor(compress.AlgorithmLZ4))
+	assert.NotSame(t, zstd, own.compressorFor(compress.AlgorithmZSTD))
+
+	col, err := r2.Column(ctx, "v")
+	require.NoError(t, err)
+
+	got, err := col.Int64(nil)
+	require.NoError(t, err)
+	assert.Equal(t, []int64{1, 2, 3}, got)
+}

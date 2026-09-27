@@ -17,6 +17,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/internal/diskguard"
 	"github.com/oteldb/storage/internal/obs"
@@ -197,6 +198,8 @@ type Engine struct {
 	// mergeReadWindow is each source column's read-ahead during a merge ([block.PartReader.ColumnScan]).
 	// A field for the same reason as tsCodec: a test shrinks it to span many windows on a small corpus.
 	mergeReadWindow int64
+	// readCompressors is the one set of decompressors every part this engine opens reads through.
+	readCompressors block.ReadOption
 	// idleMerges counts consecutive merges that selected nothing, so the selector can waive its
 	// write-amplification guard for parts that would otherwise never merge (see pickMergeRun).
 	// Written only under flushMu, which a merge holds across its whole body; atomic so
@@ -354,7 +357,10 @@ func New(cfg Config) *Engine {
 		cfg.Obs = obs.NewNop()
 	}
 
-	e := &Engine{cfg: cfg, head: newHead(), tsCodec: chunk.CodecDoDScaled, mergeReadWindow: defaultMergeReadWindow}
+	e := &Engine{
+		cfg: cfg, head: newHead(), tsCodec: chunk.CodecDoDScaled, mergeReadWindow: defaultMergeReadWindow,
+		readCompressors: block.NewReadCompressors(),
+	}
 	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
 	// The decode free list covers the peak in-flight decoded parts: prefetch can decode
 	// prefetchConcurrency parts concurrently per fetch, and several fetches overlap, so a
@@ -1579,7 +1585,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 			return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
 		}
 
-		p, err := openPart(ctx, e.cfg.Backend, prefix, e.cfg.Obs.Corruption)
+		p, err := openPart(ctx, e.cfg.Backend, prefix, e.cfg.Obs.Corruption, e.readCompressors)
 		if err != nil {
 			return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
 		}

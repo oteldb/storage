@@ -107,8 +107,10 @@ func deletePart(ctx context.Context, b backend.Backend, prefix string) error {
 }
 
 // openPart opens the part at prefix and builds its StreamID → row-range index and bloom set.
-func openPart(ctx context.Context, b backend.Backend, schema *Schema, prefix string, corrupt *obs.Corruption) (*part, error) {
-	r, err := block.OpenPart(ctx, b, prefix)
+func openPart(
+	ctx context.Context, b backend.Backend, schema *Schema, prefix string, corrupt *obs.Corruption, opts ...block.ReadOption,
+) (*part, error) {
+	r, err := block.OpenPart(ctx, b, prefix, opts...)
 	if err != nil {
 		return nil, err
 	}

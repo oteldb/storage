@@ -69,7 +69,7 @@ func (h repairHost) Identity(p *part) bucketindex.Entry {
 }
 
 func (h repairHost) Open(ctx context.Context, prefix string) (*part, error) {
-	return openPart(ctx, h.e.cfg.Backend, prefix, h.e.cfg.Obs.Corruption)
+	return openPart(ctx, h.e.cfg.Backend, prefix, h.e.cfg.Obs.Corruption, h.e.readCompressors)
 }
 
 func (h repairHost) AdoptLocked(ctx context.Context, p *part, ent *bucketindex.Entry) error {

@@ -377,7 +377,7 @@ func (e *Engine) writeMergedPart(ctx context.Context, cols *flushColumns, opts M
 		return nil, err
 	}
 
-	p, err := openPart(ctx, e.cfg.Backend, prefix, e.cfg.Obs.Corruption)
+	p, err := openPart(ctx, e.cfg.Backend, prefix, e.cfg.Obs.Corruption, e.readCompressors)
 	if err != nil {
 		return nil, err
 	}

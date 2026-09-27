@@ -319,7 +319,7 @@ func (w *recordPartStreamWriter) finish(ctx context.Context) (*part, error) {
 		}
 	}
 
-	p, err := openPart(ctx, b, schema, prefix, e.cfg.Obs.Corruption)
+	p, err := openPart(ctx, b, schema, prefix, e.cfg.Obs.Corruption, e.readCompressors)
 	if err != nil {
 		return nil, err
 	}
