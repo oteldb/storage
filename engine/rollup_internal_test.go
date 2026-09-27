@@ -545,9 +545,9 @@ func TestDownsampleTierRemovedThenReadded(t *testing.T) {
 	requireCounts(t, e, []int64{0, hour}, 12)
 }
 
-// TestDownsampleEmptyTierRolledWithRaw checks the union of a rolled and a raw part: the rolled layout
-// is kept when it stops short of the raw part's samples, and the marker is unknown when it would
-// claim them.
+// TestDownsampleEmptyTierRolledWithRaw checks a merge of a rolled and a raw part applying no tiers
+// records the rolled layout either way: raw samples past the rolled range stay raw, and raw samples
+// inside it are rolled by the recorded layout, since removing a policy does not un-roll the range.
 func TestDownsampleEmptyTierRolledWithRaw(t *testing.T) {
 	t.Parallel()
 
@@ -555,12 +555,12 @@ func TestDownsampleEmptyTierRolledWithRaw(t *testing.T) {
 	tiers := countTiers(hour, time.Minute)
 
 	for _, tc := range []struct {
-		name  string
-		rawAt int64
-		want  bool
+		name   string
+		rawAt  int64
+		wantTs []int64
 	}{
-		{"raw past the rolled range", hour, true},
-		{"raw inside the rolled range", 30 * minute, false},
+		{"raw past the rolled range", hour, append([]int64{0, minute}, stepsFrom(hour, 12, step)...)},
+		{"raw inside the rolled range", 30 * minute, []int64{0, minute, 30 * minute, 31 * minute}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -578,16 +578,28 @@ func TestDownsampleEmptyTierRolledWithRaw(t *testing.T) {
 			require.Equal(t, 2, e.PartCount())
 
 			p := oldPart(t, e)
-			require.Equal(t, tc.want, p.rollupKnown)
+			require.True(t, p.rollupKnown)
+			assert.Equal(t, currentLayout(tiers), p.rollup)
 
-			if tc.want {
-				assert.Equal(t, currentLayout(tiers), p.rollup)
+			ts, vals := samplesBefore(t, e, anchorAt)
+			assert.Equal(t, tc.wantTs, ts)
+
+			for i := range ts {
+				if ts[i] < hour {
+					assert.InDelta(t, 6, vals[i], 0, "a count of the minute's samples")
+				}
 			}
-
-			ts, _ := samplesBefore(t, e, anchorAt)
-			assert.Len(t, ts, 2+12)
 		})
 	}
+}
+
+func stepsFrom(from int64, n int, step int64) []int64 {
+	out := make([]int64, n)
+	for i := range out {
+		out[i] = from + int64(i)*step
+	}
+
+	return out
 }
 
 // TestDownsampleCappedBucketRollsEveryPart checks that under a merge cap too small for a bucket's
@@ -627,4 +639,74 @@ func TestDownsampleCappedBucketRollsEveryPart(t *testing.T) {
 	}
 
 	assert.Less(t, e.PartCount(), parts, "the ladder ran once the bucket was rolled")
+}
+
+// TestDownsampleLegacyBesideMarkedIsRaw pins the rule for a part without a marker merged beside
+// others: its samples are raw to the fold, so a legacy Count representative counts as one sample. Only
+// a writer predating the marker leaves a part unknown; merges of marked parts always record one.
+func TestDownsampleLegacyBesideMarkedIsRaw(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	minute, step := int64(time.Minute), 10*int64(time.Second)
+	tiers := countTiers(1<<62, time.Minute)
+	b := backend.Memory()
+
+	legacy := reopenRollup(t, b, Config{})
+	flushEvery(t, legacy, 0, minute, step, 1)
+	require.NoError(t, legacy.MergeWith(ctx, MergeOptions{Downsample: tiers}))
+	stripRollups(t, b)
+
+	e := reopenRollup(t, b, Config{})
+	flushEvery(t, e, 5*step+step/2, 5*step+step/2+1, step, 1)
+
+	parts := liveParts(e)
+	require.Len(t, parts, 2)
+	require.NotEqual(t, parts[0].rollupKnown, parts[1].rollupKnown)
+
+	require.NoError(t, e.MergeWith(ctx, MergeOptions{Downsample: tiers}))
+	require.Equal(t, 1, e.PartCount())
+
+	ts, vals := rollupSamples(t, e)
+	assert.Equal(t, []int64{0}, ts)
+	assert.Equal(t, []float64{2}, vals, "the legacy count of 6 is one sample, the late sample another")
+	assert.True(t, liveParts(e)[0].rollupKnown)
+}
+
+// TestDownsampleUnnestedTierNotApplied checks a policy tier whose Interval does not nest with one a
+// part already records is not applied: the part is not forced, and a late raw part in its range is
+// rolled by the recorded layout, exactly.
+func TestDownsampleUnnestedTierNotApplied(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	minute, step := int64(time.Minute), 10*int64(time.Second)
+	recorded := countTiers(rolledBefore, 5*time.Minute)
+	unnested := MergeOptions{Downsample: countTiers(rolledBefore, 7*time.Minute)}
+
+	e := reopenRollup(t, backend.Memory(), Config{})
+	flushEvery(t, e, 0, 10*minute, step, 1)
+	require.NoError(t, e.MergeWith(ctx, MergeOptions{Downsample: recorded}))
+	require.Equal(t, currentLayout(recorded), oldPart(t, e).rollup)
+
+	require.Equal(t, 1, forcedParts(e, unnested), "the unnested tier alone would widen it")
+	require.Zero(t, e.MergeShapeWith(unnested).Candidates, "so the merge does not take it")
+
+	kept, dropped := nestedTiers(liveParts(e), unnested.Downsample)
+	assert.Empty(t, kept)
+	assert.Equal(t, unnested.Downsample, dropped)
+
+	flushEvery(t, e, 2*minute+step/2, 3*minute, step, 1)
+	flushEvery(t, e, anchorAt, anchorAt+1, step, 1)
+
+	for range 4 {
+		require.NoError(t, e.MergeWith(ctx, unnested))
+	}
+
+	require.Equal(t, 2, e.PartCount())
+	assert.Equal(t, currentLayout(recorded), oldPart(t, e).rollup)
+
+	ts, vals := samplesBefore(t, e, anchorAt)
+	assert.Equal(t, []int64{0, 5 * minute}, ts)
+	assert.Equal(t, []float64{36, 30}, vals)
 }

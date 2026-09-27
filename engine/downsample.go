@@ -83,23 +83,31 @@ func downsampleApplies(tiers []DownsampleTier, minTime int64) bool {
 // start with weight 1 (the weight is folded into the value); Avg emits the weighted mean at the
 // bucket start with the bucket's total weight. A coarser Sum or Avg over representatives is
 // therefore the one-pass rollup up to floating-point grouping: the same sum, added in a different
-// order, since each representative was rounded once when stored. Count is the one aggregation a
-// re-roll corrupts: re-counting a representative yields 1, not the count it carried.
+// order, since each representative was rounded once when stored. A Count representative carries its
+// count in its value, so only a merge that knows it is one ([downsampleCovering] with tags) can
+// combine it; here it would recount as 1.
 //
 // Min and Max ignore NaN while the bucket holds any other value; an all-NaN bucket emits its first
 // NaN. First and Last take the sample whatever its value, and a NaN in a Sum or Avg bucket makes
 // its representative NaN, so every aggregation composes the same way with NaN as without.
 func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int64, []float64, []float64) {
-	ts, values, sf, _ = downsampleCovering(ts, values, sf, tiers)
+	ts, values, sf, _ = downsampleCovering(ts, values, sf, nil, tiers)
 
 	return ts, values, sf
 }
 
-// downsampleCovering is [downsample] that also returns each output sample's newest source
-// timestamp: a representative can sit before samples it rolled up (First, Min, Max, and every
-// bucket-start aggregation), and the watermark a replica trims its head through must not fall back
-// with it. covered is nil when it equals the output timestamps.
-func downsampleCovering(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int64, []float64, []float64, []int64) {
+// downsampleCovering is [downsample] over samples tagged with what they stand for (tags nil: all
+// raw), returning also each output sample's newest source timestamp: a representative can sit before
+// samples it rolled up (First, Min, Max, and every bucket-start aggregation), and the watermark a
+// replica trims its head through must not fall back with it. covered is nil when it equals the
+// output timestamps.
+//
+// A representative rolls into the wider of its own recorded tier and the one tiers assign it, and
+// combines by its recorded Agg, which the bucket keeps over the tier's. Rolled data thus keeps the Agg
+// it was rolled with, and a Count representative adds its count rather than counting as 1.
+func downsampleCovering(
+	ts []int64, values, sf []float64, tags []rollupTag, tiers []DownsampleTier,
+) ([]int64, []float64, []float64, []int64) {
 	active := make([]DownsampleTier, 0, len(tiers))
 	for _, t := range tiers {
 		if t.Interval > 0 {
@@ -107,7 +115,7 @@ func downsampleCovering(ts []int64, values, sf []float64, tiers []DownsampleTier
 		}
 	}
 
-	if len(active) == 0 || len(ts) == 0 {
+	if len(ts) == 0 || len(active) == 0 && !repBucketShared(ts, tags) {
 		return ts, values, sf, nil
 	}
 
@@ -119,7 +127,7 @@ func downsampleCovering(ts []int64, values, sf []float64, tiers []DownsampleTier
 		return sf[i]
 	}
 
-	slices.SortFunc(active, widestFirst)
+	slices.SortStableFunc(active, widestFirst)
 
 	// Bucket key: the (interval, aligned-start) pair. Including the interval disambiguates the
 	// rare case where two tiers' aligned starts coincide across a misaligned Before boundary;
@@ -131,30 +139,26 @@ func downsampleCovering(ts []int64, values, sf []float64, tiers []DownsampleTier
 	order := make([]key, 0, len(ts))
 
 	for i, t := range ts {
-		tier, ok := pickTier(active, t)
-		if !ok {
-			k := key{interval: 0, start: t} // raw, pass through
-			b := buckets[k]
-			if b == nil {
-				b = &bucketAcc{agg: signal.AggLast}
-				buckets[k] = b
-				order = append(order, k)
-			}
+		tag := tagAt(tags, i)
+		interval, agg := rollTarget(active, t, tag)
 
-			b.add(t, values[i], weight(i))
-
-			continue
+		k := key{interval: 0, start: t} // raw, pass through
+		if interval > 0 {
+			k = key{interval: interval, start: alignDown(t, interval)}
 		}
 
-		k := key{interval: tier.Interval, start: alignDown(t, tier.Interval)}
 		b := buckets[k]
 		if b == nil {
-			b = &bucketAcc{agg: tier.Agg}
+			b = &bucketAcc{agg: agg}
 			buckets[k] = b
 			order = append(order, k)
 		}
 
-		b.add(t, values[i], weight(i))
+		if tag.interval > 0 {
+			b.addRep(t, values[i], weight(i), tag.agg)
+		} else {
+			b.add(t, values[i], weight(i))
+		}
 	}
 
 	reps := make([]rollupRep, 0, len(order))
@@ -269,13 +273,18 @@ func alignDown(ts, interval int64) int64 {
 // bucketAcc accumulates the samples of one downsample bucket, weight-aware so sampled data stays
 // unbiased. Input timestamps within a bucket are unique (sampleMerge dedups by ts), so first/last
 // are unambiguous. n counts samples; nWeighted sums their weights (the estimated original count);
-// wsum sums value·weight (the estimated original total), compensated by wcomp (Neumaier) so a long
-// bucket's total is rounded once rather than once per sample. min/max track the earliest sample
-// holding the extreme non-NaN value, or the first sample while every value so far is NaN.
+// count is nWeighted with each Count representative contributing the count it carries; wsum sums
+// value·weight (the estimated original total), compensated by wcomp (Neumaier) so a long bucket's
+// total is rounded once rather than once per sample. min/max track the earliest sample holding the
+// extreme non-NaN value, or the first sample while every value so far is NaN. repAgg is the recorded
+// Agg of the first representative added, which the bucket keeps over agg.
 type bucketAcc struct {
 	agg       signal.Aggregation
+	repAgg    signal.Aggregation
+	hasRep    bool
 	n         int64
 	nWeighted float64
+	count     float64
 	wsum      float64
 	wcomp     float64
 	min, max  float64
@@ -292,13 +301,34 @@ type bucketAcc struct {
 }
 
 func (b *bucketAcc) add(ts int64, v, sf float64) {
+	b.addCounted(ts, v, sf, sf)
+}
+
+// addRep adds a representative rolled up by agg. Every representative but Count's already carries
+// what the bucket needs as an ordinary sample: an anchored sample, a total with weight 1, or a mean
+// weighted by its population. A Count representative adds its value to the count. One of another
+// Agg than the bucket's (only after an Agg change) folds as a plain sample.
+func (b *bucketAcc) addRep(ts int64, v, sf float64, agg signal.Aggregation) {
+	if !b.hasRep {
+		b.repAgg, b.hasRep = agg, true
+	}
+
+	counted := sf
+	if agg == signal.AggCount && b.repAgg == signal.AggCount {
+		counted = v
+	}
+
+	b.addCounted(ts, v, sf, counted)
+}
+
+func (b *bucketAcc) addCounted(ts int64, v, sf, counted float64) {
 	if b.n == 0 {
 		b.min, b.max = v, v
 		b.minTs, b.maxTs = ts, ts
 		b.minSF, b.maxSF = sf, sf
 		b.firstTs, b.firstVal, b.firstSF = ts, v, sf
 		b.lastTs, b.lastVal, b.lastSF = ts, v, sf
-		b.wsum, b.nWeighted, b.n = v*sf, sf, 1
+		b.wsum, b.nWeighted, b.count, b.n = v*sf, sf, counted, 1
 
 		return
 	}
@@ -321,6 +351,7 @@ func (b *bucketAcc) add(ts int64, v, sf float64) {
 
 	b.addWeighted(v * sf)
 	b.nWeighted += sf
+	b.count += counted
 	b.n++
 }
 
@@ -348,7 +379,12 @@ func (b *bucketAcc) total() float64 {
 // result returns the bucket's representative (ts, value, weight); start is the bucket's aligned
 // start.
 func (b *bucketAcc) result(start int64) (int64, float64, float64) {
-	switch b.agg {
+	agg := b.agg
+	if b.hasRep {
+		agg = b.repAgg
+	}
+
+	switch agg {
 	case signal.AggFirst:
 		return b.firstTs, b.firstVal, b.firstSF
 	case signal.AggMin:
@@ -364,7 +400,7 @@ func (b *bucketAcc) result(start int64) (int64, float64, float64) {
 
 		return start, b.total() / b.nWeighted, b.nWeighted
 	case signal.AggCount:
-		return start, b.nWeighted, 1
+		return start, b.count, 1
 	default: // signal.AggLast
 		return b.lastTs, b.lastVal, b.lastSF
 	}

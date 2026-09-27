@@ -221,6 +221,9 @@ type Engine struct {
 	// head bytes, which the highest-ingest engines keep winning, so without this a quiet tenant
 	// could be declined every cycle while its part count grew.
 	mergeDeferred atomic.Bool
+	// unnestedWarned records that a merge already warned of a policy tier it dropped for not nesting
+	// with a recorded one ([nestedTiers]).
+	unnestedWarned atomic.Bool
 	// retiring holds parts removed from the live set by flush/merge, pending backend deletion once
 	// their in-flight fetch readers drain (deferred reclamation; see reclaim.go).
 	retiring []*part
@@ -813,7 +816,7 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 			return m, err
 		}
 
-		d.mergeSeriesInto(rng, &m, p.start, p.end)
+		d.mergeSeriesInto(rng, &m, part.rollup, p.start, p.end)
 	}
 
 	for _, b := range p.memBatches(id) {
@@ -821,7 +824,7 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 			continue
 		}
 
-		m.add(b.Timestamps, b.Values, b.ScaleFactors, p.start, p.end)
+		m.add(b.Timestamps, b.Values, b.ScaleFactors, nil, p.start, p.end)
 	}
 
 	return m, nil
@@ -1045,16 +1048,21 @@ func (r tsRun) weight(i int) float64 {
 
 // sampleMerge merges one series' samples from several already-sorted sources, deduplicating by
 // timestamp with **freshest-wins**: sources are added oldest → newest, and on a timestamp tie the
-// latest-added source's value (and weight) is kept. It holds the sources as zero-copy run views and
-// merges them once in collect — no per-series map (which dominated the read-path allocations).
+// latest-added source's value (and weight) is kept, unless a representative takes part in the tie
+// ([foldTie]). It holds the sources as zero-copy run views and merges them once in collect — no
+// per-series map (which dominated the read-path allocations).
 type sampleMerge struct {
 	runs []tsRun // oldest → newest; a higher index wins a timestamp tie
+	// layouts holds each run's source's recorded rollup: a sample it assigns a tier is that tier's
+	// representative. It stays nil until a run has one, so a read of raw parts carries none.
+	layouts [][]DownsampleTier
 }
 
 // add registers a source's [start, end] window as a run. ts must be ascending; the window bounds are
 // found by binary search (a no-op clip for an already-windowed head/flush source). Empty windows are
-// skipped. sf carries each sample's weight (nil ⇒ every weight is 1).
-func (m *sampleMerge) add(ts []int64, values, sf []float64, start, end int64) {
+// skipped. sf carries each sample's weight (nil ⇒ every weight is 1); layout is the source's recorded
+// rollup (nil for raw or unknown).
+func (m *sampleMerge) add(ts []int64, values, sf []float64, layout []DownsampleTier, start, end int64) {
 	lo := lowerBound(ts, start) // first i with ts[i] >= start
 	hi := upperBound(ts, end)   // first i with ts[i] > end
 	if lo >= hi {
@@ -1066,6 +1074,14 @@ func (m *sampleMerge) add(ts []int64, values, sf []float64, start, end int64) {
 		sfw = sf[lo:hi]
 	}
 
+	if m.layouts == nil && len(layout) > 0 {
+		m.layouts = make([][]DownsampleTier, len(m.runs), cap(m.runs)+1)
+	}
+
+	if m.layouts != nil {
+		m.layouts = append(m.layouts, layout)
+	}
+
 	m.runs = append(m.runs, tsRun{ts: ts[lo:hi], vals: values[lo:hi], sf: sfw})
 }
 
@@ -1074,13 +1090,30 @@ func (m *sampleMerge) add(ts []int64, values, sf []float64, start, end int64) {
 // them to the needed size. The returned sf slice is nil when every weight is 1 (the unsampled common
 // case), else len == len(ts).
 func (m *sampleMerge) collect(tsBuf []int64, valsBuf []float64) (tsOut []int64, values, sf []float64) {
+	return m.gather(tsBuf, valsBuf, nil)
+}
+
+// collectTagged is collect that also returns what each sample stands for; tags is nil when no sample
+// is a representative.
+func (m *sampleMerge) collectTagged() (tsOut []int64, values, sf []float64, tags []rollupTag) {
+	tsOut, values, sf = m.gather(nil, nil, &tags)
+
+	return tsOut, values, sf, tags
+}
+
+func (m *sampleMerge) gather(tsBuf []int64, valsBuf []float64, tags *[]rollupTag) (tsOut []int64, values, sf []float64) {
 	switch len(m.runs) {
 	case 0:
 		return tsBuf[:0], valsBuf[:0], nil
 	case 1:
-		return collectOne(m.runs[0], tsBuf, valsBuf)
+		tsOut, values, sf = collectOne(m.runs[0], tsBuf, valsBuf)
+		if tags != nil {
+			*tags = tagSamples(tsOut, layoutOf(m.layouts, 0))
+		}
+
+		return tsOut, values, sf
 	default:
-		return collectMany(m.runs, tsBuf, valsBuf)
+		return collectMany(m.runs, m.layouts, tsBuf, valsBuf, tags)
 	}
 }
 
@@ -1115,7 +1148,9 @@ func collectOne(r tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64, value
 }
 
 // collectMany k-way-merges several sorted runs into the destination buffers, emitting each
-// timestamp once and taking its value/weight from the highest-indexed (freshest) run that holds it.
+// timestamp once and taking its value/weight from the highest-indexed (freshest) run that holds it,
+// or from [foldTie] when a representative is among them. layouts is [sampleMerge.layouts]; tags,
+// when non-nil, receives each emitted sample's [rollupTag].
 //
 // The scan finds the two smallest heads rather than just the smallest, which turns the common case
 // into a copy: while the leading run's timestamps stay strictly below every other head, no other run
@@ -1124,7 +1159,9 @@ func collectOne(r tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64, value
 // head" — a block-sliced part contributes one run per block ([seriesBlockReader.addRange]), so a
 // two-day range over six parts arrives as ~40 runs whose stretches are hundreds of rows long. Per
 // row the old O(rows × runs) scan re-derived what one comparison per stretch establishes.
-func collectMany(runs []tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64, values, sf []float64) {
+func collectMany(
+	runs []tsRun, layouts [][]DownsampleTier, tsBuf []int64, valsBuf []float64, tags *[]rollupTag,
+) (tsOut []int64, values, sf []float64) {
 	total := 0
 	for i := range runs {
 		total += len(runs[i].ts)
@@ -1150,19 +1187,15 @@ func collectMany(runs []tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64,
 		}
 
 		if rival && leadTs == rivalTs {
-			// Tie: every run sitting on this timestamp advances, and the freshest supplies the value.
-			var winVal, winW float64 = 0, 1
-
-			for i := range runs {
-				if cur[i] < len(runs[i].ts) && runs[i].ts[cur[i]] == leadTs {
-					winVal, winW = runs[i].vals[cur[i]], runs[i].weight(cur[i])
-					cur[i]++
-				}
-			}
+			v, w, tag := foldTie(runs, layouts, cur, leadTs)
 
 			tsOut = append(tsOut, leadTs)
-			values = append(values, winVal)
-			sf = appendWeight(sf, winW, len(values), total)
+			values = append(values, v)
+			sf = appendWeight(sf, w, len(values), total)
+
+			if tags != nil {
+				*tags = appendTag(*tags, tag, len(values), total)
+			}
 
 			continue
 		}
@@ -1175,6 +1208,10 @@ func collectMany(runs []tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64,
 		}
 
 		tsOut, values, sf = emitRange(r, lo, hi, tsOut, values, sf, total)
+		if tags != nil {
+			*tags = appendTags(*tags, r, layoutOf(layouts, lead), lo, hi, len(values), total)
+		}
+
 		cur[lead] = hi
 	}
 

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/go-faster/sdk/zctx"
@@ -111,6 +112,13 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	src, dropped, err := e.dropExpired(ctx, src, opts)
 	if err != nil {
 		return mergeResult{}, err
+	}
+
+	var unnested []DownsampleTier
+	if opts.Downsample, unnested = nestedTiers(src, opts.Downsample); len(unnested) > 0 &&
+		e.unnestedWarned.CompareAndSwap(false, true) {
+		zctx.From(ctx).Warn("downsample tier not applied: its interval does not nest with one a part already records",
+			zap.String("prefix", e.cfg.Prefix), zap.Int64("interval", unnested[0].Interval))
 	}
 
 	selected := selectMergeParts(src, opts, capBytes, e.mergeIdle(opts))
@@ -425,7 +433,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 				return nil, err
 			}
 
-			d.mergeSeriesInto(rng, &m, start, maxInt64)
+			d.mergeSeriesInto(rng, &m, p.rollup, start, maxInt64)
 		}
 
 		srcCovered, err := sourceCovered(ctx, src, id)
@@ -433,8 +441,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 			return nil, err
 		}
 
-		ts, values, sf := m.collect(nil, nil)
-		ts, values, sf, covered := downsampleCovering(ts, values, sf, tiers)
+		ts, values, sf, covered := rollSeries(&m, tiers)
 
 		u := idToU128(id)
 		for i := range ts {
@@ -593,8 +600,7 @@ func (e *Engine) compactStream(
 		}
 
 		rs := rolledSeries{srcCovered: srcCovered}
-		rs.ts, rs.values, rs.sf = m.collect(nil, nil)
-		rs.ts, rs.values, rs.sf, rs.covered = downsampleCovering(rs.ts, rs.values, rs.sf, plan.tiers)
+		rs.ts, rs.values, rs.sf, rs.covered = rollSeries(&m, plan.tiers)
 
 		u := idToU128(id)
 
@@ -645,10 +651,11 @@ func (e *Engine) compactStream(
 //     stamped maxTime, so the estimate is self-correcting rather than sticky.
 //   - The compression ladder is a step function of row count, estimated from the source rows scaled
 //     by the share of the group's bytes one output part will hold.
-//   - The weight column is declared if any source carries one or an Avg tier can emit one (an Avg
-//     representative carries its bucket's population as its weight). Otherwise it cannot appear:
-//     every collected weight is 1, and downsample returns a nil weight vector when every output
-//     weight is 1. If they all turn out to be 1 anyway, the column is dropped at finish.
+//   - The weight column is declared if any source carries one or an Avg tier, applied or recorded,
+//     can emit one (an Avg representative carries its bucket's population as its weight, and two
+//     unweighted one-sample Avg representatives of one bucket combine into weight 2). Otherwise it
+//     cannot appear: every collected weight is 1, and downsample returns a nil weight vector when
+//     every output weight is 1. If they all turn out to be 1 anyway, the column is dropped at finish.
 func mergeEncoding(src []*part, capBytes int64, opts MergeOptions, tiers []DownsampleTier) (compressProfile, uint8, bool) {
 	var (
 		maxT     = minInt64
@@ -661,18 +668,20 @@ func mergeEncoding(src []*part, capBytes int64, opts MergeOptions, tiers []Downs
 		maxT = max(maxT, p.maxTime)
 		rows += p.rows()
 		srcBytes += p.sizeBytes()
-		withSF = withSF || p.hasSF
+		withSF = withSF || p.hasSF || hasAvgTier(p.rollup)
 	}
 
-	for _, t := range tiers {
-		withSF = withSF || t.Interval > 0 && t.Agg == signal.AggAvg
-	}
+	withSF = withSF || hasAvgTier(tiers)
 
 	if capBytes > 0 && srcBytes > capBytes {
 		rows = int(int64(rows) * capBytes / srcBytes)
 	}
 
 	return mergeProfile(opts.Recompress, maxT, rows), pickPrecision(opts.Precision, maxT), withSF
+}
+
+func hasAvgTier(tiers []DownsampleTier) bool {
+	return slices.ContainsFunc(tiers, func(t DownsampleTier) bool { return t.Interval > 0 && t.Agg == signal.AggAvg })
 }
 
 // rowCapFor converts the byte cap into a row cap for the whole-column rewrite path, which holds
@@ -714,7 +723,7 @@ func mergeStreamedSeries(
 			return m, err
 		}
 
-		m.add(ts, vals, sf, start, maxInt64)
+		m.add(ts, vals, sf, p.rollup, start, maxInt64)
 	}
 
 	return m, nil

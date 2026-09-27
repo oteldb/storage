@@ -947,14 +947,14 @@ func (p *part) decodeValueCols(ctx context.Context, valDst, sfDst []float64) (va
 }
 
 // mergeSeriesInto adds series row-range rng's samples within [start, end] to m, slicing the
-// already-decoded columns (no per-series decode or allocation).
-func (d *decodedPart) mergeSeriesInto(rng rowRange, m *sampleMerge, start, end int64) {
+// already-decoded columns (no per-series decode or allocation). layout is the part's recorded rollup.
+func (d *decodedPart) mergeSeriesInto(rng rowRange, m *sampleMerge, layout []DownsampleTier, start, end int64) {
 	var sf []float64
 	if d.sf != nil {
 		sf = d.sf[rng.start:rng.end]
 	}
 
-	m.add(d.ts[rng.start:rng.end], d.vals[rng.start:rng.end], sf, start, end)
+	m.add(d.ts[rng.start:rng.end], d.vals[rng.start:rng.end], sf, layout, start, end)
 }
 
 // partDecodeCache memoizes one [decodedPart] per part for the lifetime of a single fetch or

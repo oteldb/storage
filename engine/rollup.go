@@ -163,63 +163,137 @@ func partOptions(blockRows int, comp compressProfile, rollup *block.Rollup) []bl
 	return opts
 }
 
+// nestedTiers splits tiers into those whose Interval nests with every Interval a part of src records
+// and those that do not. Coarsening a representative into a bucket that does not hold its whole
+// bucket cannot be exact, and a marker cannot confine a tier to part of its range, so a non-nesting
+// tier is not applied at all until retention drops the last part recording the tier it conflicts
+// with. The policy validates only against itself; this is the same check against the history.
+func nestedTiers(src []*part, tiers []DownsampleTier) (kept, dropped []DownsampleTier) {
+	if !activeTiers(tiers) {
+		return tiers, nil
+	}
+
+	var recorded []int64
+
+	for _, p := range src {
+		for _, t := range p.rollup {
+			if !slices.Contains(recorded, t.Interval) {
+				recorded = append(recorded, t.Interval)
+			}
+		}
+	}
+
+	nests := func(t DownsampleTier) bool {
+		return t.Interval <= 0 || !slices.ContainsFunc(recorded, func(iv int64) bool {
+			return t.Interval%iv != 0 && iv%t.Interval != 0
+		})
+	}
+
+	if !slices.ContainsFunc(tiers, func(t DownsampleTier) bool { return !nests(t) }) {
+		return tiers, nil
+	}
+
+	for _, t := range tiers {
+		if nests(t) {
+			kept = append(kept, t)
+		} else {
+			dropped = append(dropped, t)
+		}
+	}
+
+	return kept, dropped
+}
+
 // rollupPlan is the downsampling a merge applies and the marker its outputs record.
 type rollupPlan struct {
 	tiers  []DownsampleTier
 	marker *block.Rollup
 }
 
-// planRollup decides a merge's downsampling: tiers when some source is pending, else none, so
-// representatives already at least as wide are not re-rolled. A lone pending part is rewritten
-// verbatim, its data then holding the tiers as if applied, when rolling it would change nothing: for
-// a marked part, no timestamp, value or weight; for an unmarked one, no timestamp, since its values
-// may already be representatives that a re-roll would corrupt.
+// planRollup decides a merge's downsampling. A merge rolls every sample up to the layout it records:
+// the tiers its known sources record, which rolled data keeps whatever the policy says now, and the
+// current tiers where some source is pending. Where every source already holds that layout the rollup
+// only folds representatives sharing a bucket, so tiers stays nil and a ladder merge of rolled parts
+// takes the fast path. A lone pending part is rewritten verbatim, its data then holding the layout as
+// if applied, when rolling it would change nothing: for a marked part, no timestamp, value or weight;
+// for an unmarked one, no timestamp, since its values may already be representatives that a re-roll
+// would corrupt.
 func (e *Engine) planRollup(ctx context.Context, src []*part, start int64, tiers []DownsampleTier) (rollupPlan, error) {
 	if !slices.ContainsFunc(src, func(p *part) bool { return downsamplePending(p, tiers) }) {
-		return rollupPlan{marker: unionRollup(src, nil, false)}, nil
+		layout := mergeLayout(src, nil)
+		plan := rollupPlan{marker: unionRollup(src, layout, false)}
+
+		if !holdsLayout(src, layout) {
+			plan.tiers = layout
+		}
+
+		return plan, nil
 	}
 
+	layout := mergeLayout(src, tiers)
+
 	if len(src) == 1 {
-		changes, err := e.rollupChanges(ctx, src[0], start, tiers, src[0].rollupKnown)
+		changes, err := e.rollupChanges(ctx, src[0], start, layout, src[0].rollupKnown)
 		if err != nil {
 			return rollupPlan{}, err
 		}
 
 		if !changes {
-			return rollupPlan{marker: unionRollup(src, tiers, true)}, nil
+			return rollupPlan{marker: unionRollup(src, layout, true)}, nil
 		}
 	}
 
-	return rollupPlan{tiers: tiers, marker: unionRollup(src, tiers, false)}, nil
+	return rollupPlan{tiers: layout, marker: unionRollup(src, layout, false)}, nil
 }
 
-// unionRollup is the marker of a merge of src that applied tiers: per timestamp, the widest layout
-// the merged data there has had applied. It is nil (unknown) when that cannot be expressed as one
-// layout over every source's span: sources disagree on a range they share, or one source's rolled
-// range reaches into another's raw data. A source without a marker counts as having had tiers
-// applied only when they cover its whole span, or when checked is set because the caller verified
-// its samples against tiers; otherwise the result is unknown too.
-func unionRollup(src []*part, tiers []DownsampleTier, checked bool) *block.Rollup {
-	union := slices.Clone(tiers)
+// mergeLayout is the layout a merge of src applying tiers rolls its samples up to: every known
+// source's recorded tiers, then tiers. Recorded tiers go first: where a recorded and a current tier
+// tie on Interval and Before but differ in Agg, the rolled data keeps its recorded Agg, and [tierAt]
+// and [pickTier] keep the first of a tie.
+func mergeLayout(src []*part, tiers []DownsampleTier) []DownsampleTier {
+	var layout []DownsampleTier
 
 	for _, p := range src {
-		union = append(union, p.rollup...)
+		layout = append(layout, p.rollup...)
 	}
 
-	union = compactLayout(union)
+	return compactLayout(append(layout, tiers...))
+}
 
+// holdsLayout reports whether rolling src up to layout can only fold representatives sharing a
+// bucket: every known source records layout over its own span, and no unknown source holds a sample
+// layout would roll.
+func holdsLayout(src []*part, layout []DownsampleTier) bool {
 	for _, p := range src {
-		if !p.rollupKnown && !checked && !coversSpan(tiers, p.maxTime) {
-			return nil
+		if !p.rollupKnown {
+			if _, ok := tierAt(layout, p.minTime); ok {
+				return false
+			}
+
+			continue
 		}
 
-		held := append(slices.Clone(tiers), p.rollup...)
-		if layoutsDiffer(held, union, p.minTime, p.maxTime) {
+		if layoutsDiffer(p.rollup, layout, p.minTime, p.maxTime) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// unionRollup is the marker of a merge of src that rolled every sample up to layout: per timestamp,
+// the widest layout the merged data there has had applied. A source without a marker counts as
+// rolled only when layout covers its whole span, or when checked is set because the caller verified
+// its samples against layout: past the layout its samples may be legacy representatives the marker
+// would call raw, so the result is unknown instead. A merge of known parts is therefore always known.
+func unionRollup(src []*part, layout []DownsampleTier, checked bool) *block.Rollup {
+	for _, p := range src {
+		if !p.rollupKnown && !checked && !coversSpan(layout, p.maxTime) {
 			return nil
 		}
 	}
 
-	m := rollupMarker(union)
+	m := rollupMarker(layout)
 
 	return &m
 }
@@ -251,8 +325,6 @@ func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers 
 	var (
 		streams = []*partStream{s}
 		scratch = make([]rangeBuf, 1)
-		tsBuf   []int64
-		valBuf  []float64
 	)
 
 	for keys.Next() {
@@ -261,16 +333,14 @@ func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers 
 			return false, err
 		}
 
-		var sf []float64
+		ts, vals, sf, tags := m.collectTagged()
 
-		tsBuf, valBuf, sf = m.collect(tsBuf, valBuf)
-
-		rolledTs, rolledVals, rolledSF := downsample(tsBuf, valBuf, sf, tiers)
-		if !slices.Equal(rolledTs, tsBuf) {
+		rolledTs, rolledVals, rolledSF, _ := downsampleCovering(ts, vals, sf, tags, tiers)
+		if !slices.Equal(rolledTs, ts) {
 			return true, nil
 		}
 
-		if exact && (!sameBits(rolledVals, valBuf) || !sameWeights(rolledSF, sf, len(tsBuf))) {
+		if exact && (!sameBits(rolledVals, vals) || !sameWeights(rolledSF, sf, len(ts))) {
 			return true, nil
 		}
 	}

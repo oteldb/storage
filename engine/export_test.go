@@ -125,3 +125,7 @@ func SetMergeResidentObserver(fn func(peak, run, limit int64)) func() {
 
 	return func() { mergeResidentObserver = old }
 }
+
+// RegroupTolerance is how far an unweighted Sum or Avg over vals may land from the one-pass rollup
+// once rolled up in more than one grouping.
+func RegroupTolerance(vals []float64) float64 { return regroupTolerance(vals, nil) }
