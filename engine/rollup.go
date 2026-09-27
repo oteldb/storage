@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"math"
 	"slices"
 
 	"github.com/oteldb/storage/block"
@@ -169,21 +170,22 @@ type rollupPlan struct {
 }
 
 // planRollup decides a merge's downsampling: tiers when some source is pending, else none, so
-// representatives already at least as wide are not re-rolled. A lone pending part is rolled only if
-// that moves some sample; one already at its bucket starts is rewritten verbatim, since re-rolling is
-// not idempotent for every aggregation, and its data then holds the tiers as if applied.
+// representatives already at least as wide are not re-rolled. A lone pending part is rewritten
+// verbatim, its data then holding the tiers as if applied, when rolling it would change nothing: for
+// a marked part, no timestamp, value or weight; for an unmarked one, no timestamp, since its values
+// may already be representatives that a re-roll would corrupt.
 func (e *Engine) planRollup(ctx context.Context, src []*part, start int64, tiers []DownsampleTier) (rollupPlan, error) {
 	if !slices.ContainsFunc(src, func(p *part) bool { return downsamplePending(p, tiers) }) {
 		return rollupPlan{marker: unionRollup(src, nil, false)}, nil
 	}
 
 	if len(src) == 1 {
-		moves, err := e.rollupMoves(ctx, src[0], start, tiers)
+		changes, err := e.rollupChanges(ctx, src[0], start, tiers, src[0].rollupKnown)
 		if err != nil {
 			return rollupPlan{}, err
 		}
 
-		if !moves {
+		if !changes {
 			return rollupPlan{marker: unionRollup(src, tiers, true)}, nil
 		}
 	}
@@ -229,10 +231,11 @@ func coversSpan(tiers []DownsampleTier, hi int64) bool {
 	return ok
 }
 
-// rollupMoves reports whether rolling p up under tiers changes any series' timestamps. It streams
-// p one series range at a time and stops at the first series that changes, so its footprint is a
-// merge source's read window, released before the rewrite that follows allocates.
-func (e *Engine) rollupMoves(ctx context.Context, p *part, start int64, tiers []DownsampleTier) (bool, error) {
+// rollupChanges reports whether rolling p up under tiers changes any series: its timestamps, and
+// with exact also its values and weights. It streams p one series range at a time and stops at the
+// first series that changes, so its footprint is a merge source's read window, released before the
+// rewrite that follows allocates.
+func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers []DownsampleTier, exact bool) (bool, error) {
 	src := []*part{p}
 
 	var keys mergestream.Keys
@@ -262,10 +265,40 @@ func (e *Engine) rollupMoves(ctx context.Context, p *part, start int64, tiers []
 
 		tsBuf, valBuf, sf = m.collect(tsBuf, valBuf)
 
-		if rolled, _, _ := downsample(tsBuf, valBuf, sf, tiers); !slices.Equal(rolled, tsBuf) {
+		rolledTs, rolledVals, rolledSF := downsample(tsBuf, valBuf, sf, tiers)
+		if !slices.Equal(rolledTs, tsBuf) {
+			return true, nil
+		}
+
+		if exact && (!sameBits(rolledVals, valBuf) || !sameWeights(rolledSF, sf, len(tsBuf))) {
 			return true, nil
 		}
 	}
 
 	return false, nil
+}
+
+// sameBits compares floats by bit pattern, so a NaN sample equals itself.
+func sameBits(a, b []float64) bool {
+	return slices.EqualFunc(a, b, func(x, y float64) bool { return math.Float64bits(x) == math.Float64bits(y) })
+}
+
+// sameWeights compares two weight vectors of n samples, nil meaning every weight is 1.
+func sameWeights(a, b []float64, n int) bool {
+	for i := range n {
+		wa, wb := 1.0, 1.0
+		if a != nil {
+			wa = a[i]
+		}
+
+		if b != nil {
+			wb = b[i]
+		}
+
+		if math.Float64bits(wa) != math.Float64bits(wb) {
+			return false
+		}
+	}
+
+	return true
 }

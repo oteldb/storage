@@ -588,10 +588,16 @@ other bucket's rollup, the ladder and straddler splits.
 A merge downsamples only when some source is pending, so a ladder merge of parts already at least as
 wide as the policy does not re-roll their representatives: that re-roll moves no timestamp, and its
 only effect is to corrupt count (a representative recounts as 1) and weighted avg. A lone pending part
-is first streamed once, one series range at a time and stopping at the first series whose rollup moves
-a timestamp; if none moves, it is rewritten verbatim and records the union with the current tiers,
-which its samples were just checked against. That keeps a part rolled before the marker existed from
-having its counts re-rolled by a rewrite that rolls nothing new. A merge that mixes a pending source
+is first streamed once, one series range at a time, stopping at the first series the rollup would
+change; if none changes, it is rewritten verbatim and records the union with the current tiers. What
+counts as a change depends on what the marker says the values are. For a marked part they are known
+raw (or narrower), so the rollup must be a no-op on timestamps, values *and* weights: a raw sample on
+a bucket start is still a raw value, which a count tier turns into 1 and a weighted sum into
+value·weight, and copying it verbatim would record a layout it never had. For an unmarked part the
+values may already be representatives, so only timestamps are compared: a part rolled before the
+marker existed sits on its bucket starts, and re-rolling its counts would turn each into 1. The cost
+is that a raw legacy part whose samples happen to sit on bucket starts is recorded as rolled without
+being aggregated — the same trade as reading a legacy part's missing size field conservatively. A merge that mixes a pending source
 with already-rolled ones still re-rolls the rolled ones; combining representatives by their aggregation
 instead is #726.
 

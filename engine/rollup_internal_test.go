@@ -321,6 +321,67 @@ func TestDownsampleLegacyPart(t *testing.T) {
 	}
 }
 
+// TestDownsampleMarkedRawAlignedIsRolled checks a raw part whose samples already sit on bucket starts
+// is still rolled when the rollup changes their values or weights: its marker says the values are raw,
+// so a verbatim copy would record a layout it did not apply.
+func TestDownsampleMarkedRawAlignedIsRolled(t *testing.T) {
+	t.Parallel()
+
+	minute := int64(time.Minute)
+
+	for _, tc := range []struct {
+		name      string
+		agg       signal.Aggregation
+		value, sf float64
+		want      float64
+	}{
+		{"count", signal.AggCount, 5, 1, 1},
+		{"weighted sum", signal.AggSum, 3, 2, 6},
+		{"weighted avg", signal.AggAvg, 3, 2, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			e := reopenRollup(t, backend.Memory(), Config{})
+			s := rollupSeries()
+
+			for i := range int64(10) {
+				_, err := e.AppendBatch([]signal.SeriesID{s.Hash()}, []int64{i * minute}, []float64{tc.value},
+					[]float64{tc.sf}, func(int) signal.Series { return s }, AppendLimits{})
+				require.NoError(t, err)
+			}
+
+			require.NoError(t, e.Flush(ctx))
+
+			parts := liveParts(e)
+			require.Len(t, parts, 1)
+			require.True(t, parts[0].rollupKnown)
+			require.Empty(t, parts[0].rollup)
+
+			tiers := []DownsampleTier{{Before: 1 << 62, Interval: minute, Agg: tc.agg}}
+			require.NoError(t, e.MergeWith(ctx, MergeOptions{Downsample: tiers}))
+
+			it, err := e.Fetch(ctx, fetch.Request{Start: 0, End: 1 << 62})
+			require.NoError(t, err)
+			got, err := fetch.Drain(ctx, it)
+			require.NoError(t, err)
+			require.Len(t, got, 1)
+			require.Len(t, got[0].Timestamps, 10)
+
+			for i := range got[0].Values {
+				assert.InDelta(t, tc.want, got[0].Values[i], 0)
+
+				if got[0].ScaleFactors != nil {
+					assert.InDelta(t, 1, got[0].ScaleFactors[i], 0, "the rollup folded the weight")
+				}
+			}
+
+			assert.Equal(t, currentLayout(tiers), liveParts(e)[0].rollup)
+		})
+	}
+}
+
 // TestDownsampleMarkedWithUnmarked checks a merge of a marked and an unmarked part records the
 // current layout.
 func TestDownsampleMarkedWithUnmarked(t *testing.T) {
