@@ -224,7 +224,7 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 		e.mu.Unlock()
 
 		if !commitMayHaveLanded(err) {
-			*abandoned = newParts
+			*abandoned = append(*abandoned, newParts...)
 		}
 
 		return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, err

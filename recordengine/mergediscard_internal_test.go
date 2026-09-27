@@ -17,7 +17,9 @@ import (
 	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/internal/partid"
+	"github.com/oteldb/storage/internal/timebucket"
 	"github.com/oteldb/storage/internal/watermark"
+	"github.com/oteldb/storage/signal"
 )
 
 var errInjected = errors.New("injected")
@@ -228,4 +230,55 @@ func TestFailedMergeCleanupIsBounded(t *testing.T) {
 		assert.Equal(t, 1, flushFree, "flushMu is released before the cleanup")
 		assert.Equal(t, 1, grantFree, "the grant is released before the cleanup")
 	})
+}
+
+// TestFailedCommitDeletesDisorderRetryOutputs: a merge that sealed parts before it met a disordered
+// source, retried with that source decoded whole, and then lost its commit deletes the parts of both
+// attempts.
+func TestFailedCommitDeletesDisorderRetryOutputs(t *testing.T) {
+	t.Parallel()
+
+	const days = timebucket.MaxOpenWriters + 8
+
+	ctx := context.Background()
+	be := faultbackend.Wrap(backend.Memory())
+	e := New(Config{Schema: headTestSchema, Backend: be, Prefix: "t/disorder"})
+
+	id := func(svc string) signal.SeriesID {
+		return signal.Series{Resource: signal.Resource{Attributes: signal.NewAttributes(
+			signal.KeyValue{Key: []byte("service.name"), Value: signal.StringValue([]byte(svc))},
+		)}}.Hash()
+	}
+
+	// The merge walks streams in id order: the sorted one goes first and, spanning more days than the
+	// merge keeps writers open, seals parts before the merge meets the other one's disorder.
+	sorted, disordered := "x", "y"
+	if id(disordered).Less(id(sorted)) {
+		sorted, disordered = disordered, sorted
+	}
+
+	ts := make([]int64, days)
+	for d := range ts {
+		ts[d] = streamedDay * int64(d+1)
+	}
+
+	f := streamColumns(t, e, map[string][]int64{sorted: ts, disordered: {1, 2, 3}})
+	for i, s := range f.stream {
+		if u128ToID(s) == id(disordered) {
+			f.cols.ts[i] = -f.cols.ts[i]
+		}
+	}
+
+	bad := writeTestPart(t, e, be, f)
+	require.True(t, forwardReadable(bad.ranges))
+
+	e.parts = []*part{bad, writeTestPart(t, e, be, streamColumns(t, e, map[string][]int64{sorted: {5}}))}
+
+	lose := func(op faultbackend.Op) bool { return op.Key == e.indexKey() }
+	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Lose: true, Match: lose})
+	be.Add(faultbackend.Rule{Kind: faultbackend.PutIfAbsent, Lose: true, Match: lose})
+
+	require.ErrorIs(t, e.MergeWith(ctx, MergeOptions{Force: true}), bucketindex.ErrConflict)
+	require.True(t, bad.tsDisorder.Load(), "the merge must have retried past the disorder")
+	assert.Empty(t, unindexedParts(t, e), "no part either attempt wrote is left behind")
 }
