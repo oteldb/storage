@@ -65,7 +65,7 @@ func TestMergeWithDownsample(t *testing.T) {
 	assert.Equal(t, got[0].Values, got2[0].Values)
 }
 
-// TestMergeWithDownsampleSinglePart confirms a lone part is rolled up (downsampleApplies), and that
+// TestMergeWithDownsampleSinglePart confirms a lone raw part is rolled up, and that
 // once at target resolution a further merge does not rewrite it (the fixed-point churn guard).
 func TestMergeWithDownsampleSinglePart(t *testing.T) {
 	t.Parallel()

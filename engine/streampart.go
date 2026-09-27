@@ -8,7 +8,6 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
-	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
@@ -58,7 +57,7 @@ type partStreamWriter struct {
 // newPartStreamWriter starts an output part. comp and precisionBits are fixed for the whole part —
 // chosen per merge, see mergeEncoding — because a streamed column cannot be re-encoded once the
 // part is under way. withSF declares the weight column, dropped again at finish if every weight
-// turned out to be 1.
+// turned out to be 1. rollup is the downsampling layout the part records (nil: unknown).
 //
 // ctx spans the part, not just its construction: the writer hands each sealed compression frame to
 // the backend as it is produced, so the part's size is bounded by the disk it lands on rather than
@@ -66,17 +65,14 @@ type partStreamWriter struct {
 // with abort.
 func newPartStreamWriter(
 	ctx context.Context, e *Engine, comp compressProfile, precisionBits uint8, withSF, withStats bool,
+	rollup *block.Rollup,
 ) (*partStreamWriter, error) {
 	blockRows := e.cfg.MetricBlockRows
 	if blockRows <= 0 {
 		blockRows = DefaultMetricBlockRows
 	}
 
-	opts := []block.PartOption{block.WithSortKey(colTs), block.WithGranuleSize(blockRows)}
-	if comp.Algorithm != compress.AlgorithmNone {
-		opts = append(opts, block.WithCompression(comp.Algorithm), block.WithCompressionLevel(comp.Level))
-	}
-
+	opts := partOptions(blockRows, comp, rollup)
 	prefix := e.newPartPrefix()
 	w := block.NewStreamWriterTo(ctx, e.cfg.Backend, prefix, opts...)
 

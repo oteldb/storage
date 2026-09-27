@@ -310,6 +310,11 @@ type part struct {
 
 	diskBytes int64 // from the manifest; 0 for a part predating the field, see sizeBytes
 
+	// rollup is the downsampling layout the part's rows have had applied, from its manifest;
+	// rollupKnown is false for a part written without one.
+	rollup      []DownsampleTier
+	rollupKnown bool
+
 	// statsOnce lazily loads the per-series aggregate sidecar (statsKey) on first aggregate query;
 	// stats is nil when the sidecar is absent/corrupt or the part is sampled, signaling the
 	// aggregate path to fall back to decoding this part.
@@ -404,14 +409,18 @@ func openPart(
 		idx = buildPartIndex(ids)
 	}
 
+	rollup, rollupKnown := appliedRollup(r.Manifest().Rollup)
+
 	return &part{
-		reader:    r,
-		be:        b,
-		corrupt:   corrupt,
-		prefix:    prefix,
-		index:     idx,
-		hasSF:     slices.Contains(r.ColumnNames(), colSF),
-		diskBytes: r.Manifest().DiskBytes,
+		reader:      r,
+		be:          b,
+		corrupt:     corrupt,
+		prefix:      prefix,
+		index:       idx,
+		hasSF:       slices.Contains(r.ColumnNames(), colSF),
+		diskBytes:   r.Manifest().DiskBytes,
+		rollup:      rollup,
+		rollupKnown: rollupKnown,
 	}, nil
 }
 

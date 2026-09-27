@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/timebucket"
 	"github.com/oteldb/storage/signal"
@@ -180,19 +181,15 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 
 	var single *flushColumns
 
+	plan, err := e.planRollup(ctx, selected, start, opts.Downsample)
+	if err != nil {
+		return mergeResult{parts: dropped}, err
+	}
+
 	if len(selected) == 1 && !splitsOutput(selected, start) {
-		// A single forced part: decode it (bounded — one part), apply retention/downsample, and skip
-		// the rewrite if it is already at its target (the fixed point), avoiding backend churn.
-		if single, err = e.compactParts(ctx, selected, start, opts.Downsample); err != nil {
+		// A single forced part: decode it (bounded — one part) and apply retention/downsample.
+		if single, err = e.compactParts(ctx, selected, start, plan.tiers); err != nil {
 			return mergeResult{parts: dropped}, err
-		}
-
-		p := selected[0]
-		if opts.RetainFrom <= 0 && len(single.ts) == p.rows() &&
-			!recompressApplies(p, opts.Recompress) && !precisionApplies(p, opts.Precision) {
-			e.reclaimRetired(ctx)
-
-			return mergeResult{parts: dropped}, nil
 		}
 
 		// A rollup lands at its bucket start, which can precede the part's day; only the streamed
@@ -203,10 +200,10 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	}
 
 	if single != nil {
-		if newParts, err = e.writeColumns(ctx, single, rowCapFor(selected[0], capBytes), opts); err != nil {
+		if newParts, err = e.writeColumns(ctx, single, rowCapFor(selected[0], capBytes), opts, plan.marker); err != nil {
 			return mergeResult{parts: dropped}, err
 		}
-	} else if newParts, err = e.compactStream(ctx, selected, start, capBytes, opts); err != nil {
+	} else if newParts, err = e.compactStream(ctx, selected, start, capBytes, plan, opts); err != nil {
 		return mergeResult{parts: dropped}, err
 	}
 
@@ -339,7 +336,9 @@ func (e *Engine) dropExpired(ctx context.Context, src []*part, opts MergeOptions
 // when capRows ≤ 0), writes each, and reads it back. Used for the single-part merge path; the
 // multi-part path streams (see compactStream). Returns nil when cols is empty (e.g. retention
 // dropped every sample).
-func (e *Engine) writeColumns(ctx context.Context, cols *flushColumns, capRows int, opts MergeOptions) ([]*part, error) {
+func (e *Engine) writeColumns(
+	ctx context.Context, cols *flushColumns, capRows int, opts MergeOptions, rollup *block.Rollup,
+) ([]*part, error) {
 	if len(cols.ts) == 0 {
 		return nil, nil
 	}
@@ -350,7 +349,7 @@ func (e *Engine) writeColumns(ctx context.Context, cols *flushColumns, capRows i
 	for _, rg := range ranges {
 		sub := cols.slice(rg[0], rg[1])
 
-		p, err := e.writeMergedPart(ctx, sub, opts)
+		p, err := e.writeMergedPart(ctx, sub, opts, rollup)
 		if err != nil {
 			return nil, err
 		}
@@ -363,8 +362,10 @@ func (e *Engine) writeColumns(ctx context.Context, cols *flushColumns, capRows i
 
 // writeMergedPart writes cols as an output part with the compression its size and age select
 // ([mergeProfile]) and the precision its own newest sample selects, reads it back, and stamps its
-// time bounds.
-func (e *Engine) writeMergedPart(ctx context.Context, cols *flushColumns, opts MergeOptions) (*part, error) {
+// time bounds. It records rollup as the part's downsampling layout (nil: unknown).
+func (e *Engine) writeMergedPart(
+	ctx context.Context, cols *flushColumns, opts MergeOptions, rollup *block.Rollup,
+) (*part, error) {
 	minT, maxT := colsTimeRange(cols)
 	prefix := e.newPartPrefix()
 	// The merged part's identities come from the resident index, which spans every live series —
@@ -373,7 +374,7 @@ func (e *Engine) writeMergedPart(ctx context.Context, cols *flushColumns, opts M
 
 	if err := writePart(ctx, e.cfg.Backend, prefix, cols, idents,
 		mergeProfile(opts.Recompress, maxT, len(cols.ts)), pickPrecision(opts.Precision, maxT),
-		e.cfg.AggregateStats, e.cfg.MetricBlockRows, e.tsCodec); err != nil {
+		e.cfg.AggregateStats, e.cfg.MetricBlockRows, e.tsCodec, rollup); err != nil {
 		return nil, err
 	}
 
@@ -455,12 +456,13 @@ var mergeResidentObserver func(peak, run, limit int64)
 // window + one series range)) + the open writers' state. capBytes ≤ 0 writes one part per day.
 //
 // Series are visited in (series, ts) order; within a series the parts are visited oldest→newest so
-// a later part's value wins a duplicate timestamp, then the result is downsampled. Its samples are
-// then routed by their own, post-downsampling timestamp to a writer per day ([timebucket.Router]),
-// so every output part fits a ladder level in one pass over the sources: a straddler's days, and a
-// rollup whose bucket starts on the day before its samples, each land in their own part.
+// a later part's value wins a duplicate timestamp, then the result is downsampled per plan. Its
+// samples are then routed by their own, post-downsampling timestamp to a writer per day
+// ([timebucket.Router]), so every output part fits a ladder level in one pass over the sources: a
+// straddler's days, and a rollup whose bucket starts on the day before its samples, each land in
+// their own part. Every output part records plan's marker.
 func (e *Engine) compactStream(
-	ctx context.Context, src []*part, start, capBytes int64, opts MergeOptions,
+	ctx context.Context, src []*part, start, capBytes int64, plan rollupPlan, opts MergeOptions,
 ) ([]*part, error) {
 	var keys mergestream.Keys
 	if err := mergeKeys(ctx, src, &keys); err != nil {
@@ -486,7 +488,7 @@ func (e *Engine) compactStream(
 
 	router := timebucket.Router[*partStreamWriter]{
 		Open: func(int64) (*partStreamWriter, error) {
-			return newPartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats)
+			return newPartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker)
 		},
 		Finish: func(w *partStreamWriter) error {
 			p, err := w.finish(ctx)
@@ -516,7 +518,7 @@ func (e *Engine) compactStream(
 		}
 
 		ts, values, sf := m.collect(nil, nil)
-		ts, values, sf = downsample(ts, values, sf, opts.Downsample)
+		ts, values, sf = downsample(ts, values, sf, plan.tiers)
 
 		u := idToU128(id)
 

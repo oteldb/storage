@@ -564,6 +564,37 @@ and drags 121m samples into the previous hour; the facade rejects such a policy
 exception. Recompression checks the part's recorded algorithm *and* level, precision the manifest's
 recorded budget; only an upgrade rewrites, and a part denser than the target is left alone.
 
+Downsampling checks the tier layout recorded in the manifest's rollup marker: per timestamp, the widest
+(Interval, Agg) the part's data there has had applied. A flush records raw. A merge records the union
+of what it applied and every source's recorded layout, the widest per range, because rolled data stays
+rolled whatever the policy says next: recording a loosened policy, or raw after a merge with no tiers,
+would let a later policy re-roll the representatives, and a re-rolled count is 1. The union is kept
+only when it describes every source exactly over its own span; where one source's rolled range would
+reach into another's raw samples, or a source without a marker is not wholly covered by the applied
+tiers, the output is unknown instead.
+
+A part is forced only while the current tiers assign some timestamp in `[minTime, maxTime]` a wider
+Interval than the recorded layout; a recorded layout wider than the policy is not pending, since rolled
+data cannot be un-rolled. Nor is an Agg change at the same Interval: it does not apply to data already
+rolled at that Interval, whose buckets hold one representative each, and re-aggregating that
+representative under the new Agg would change nothing but a count, which it would corrupt. The assignment is piecewise constant and changes only at a `Before`, so
+comparing at `minTime` and at each recorded or current `Before` inside the span is exact, including for
+a multi-tier part straddling a cutoff; with stable cutoffs the part at the frontier is forced once per
+quantum. A part without a marker (written before it existed, or an unknown union) falls back to the age
+test, `minTime` older than some `Before`. Age alone cannot be the test for every part: a rolled part
+stays old, so it would be forced every cycle, and forced work winning selection would then starve every
+other bucket's rollup, the ladder and straddler splits.
+
+A merge downsamples only when some source is pending, so a ladder merge of parts already at least as
+wide as the policy does not re-roll their representatives: that re-roll moves no timestamp, and its
+only effect is to corrupt count (a representative recounts as 1) and weighted avg. A lone pending part
+is first streamed once, one series range at a time and stopping at the first series whose rollup moves
+a timestamp; if none moves, it is rewritten verbatim and records the union with the current tiers,
+which its samples were just checked against. That keeps a part rolled before the marker existed from
+having its counts re-rolled by a rewrite that rolls nothing new. A merge that mixes a pending source
+with already-rolled ones still re-rolls the rolled ones; combining representatives by their aggregation
+instead is #726.
+
 **Weight-aware:** compaction and rollup honor the lossy-sampling scale factor, keeping a sampled series
 unbiased.
 
@@ -757,9 +788,10 @@ calls, each run- or series-shaped, so they cost O(distinct series), not O(rows).
 must be fixed before the first row — compression profile, precision budget, whether a weight column
 exists — so `mergeEncoding` derives them from the sources up front; its doc has why that is equivalent.
 
-The single-part forced-rewrite path (`writeColumns`) buffers whole columns: its fixed-point check needs
-the post-downsample row count before deciding to write at all. It is bounded by one part, and is not
-the routine compaction tick.
+The single-part forced-rewrite path (`writeColumns`) buffers whole columns. It is bounded by one part,
+and is not the routine compaction tick. It has no fixed-point check of its own: a lone part reaches it
+only when forced, and every forced trigger is a manifest test its own rewrite settles. The one pass it may make before
+buffering, whether a rollup moves any sample, streams (above).
 
 ### Publish ordering
 
