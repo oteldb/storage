@@ -249,6 +249,7 @@ var suite = []struct {
 	{"LoadPartsReadOnlySweepsNothing", loadPartsReadOnlySweepsNothing},
 	{"AdoptedWantIsRepairedIntoTheIndex", adoptedWantIsRepairedIntoTheIndex},
 	{"AdoptWantsIgnoresWhatIsAlreadyHere", adoptWantsIgnoresWhatIsAlreadyHere},
+	{"WideSplitGroupIsRepaired", wideSplitGroupIsRepaired},
 	{"RefreshReplicaTrimsPerStream", refreshReplicaTrimsPerStream},
 	{"PromotedReplicaKeepsLateRow", promotedReplicaKeepsLateRow},
 	{"MidFlushAppendSurvivesCrash", midFlushAppendSurvivesCrash},
