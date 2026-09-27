@@ -303,44 +303,6 @@ func (w *StreamWriter) FinishBytes() int64 {
 	return retained + transient
 }
 
-func (c *streamColumn) finishBytes() (retained, transient int64) {
-	const runBytes = 24
-
-	transient = max(c.blk.sealBytes(), c.alt.sealBytes())
-
-	if len(c.runs) > 0 && c.comp != nil {
-		raw := len(c.runs) * runBytes
-		transient = max(transient, int64(raw)+c.comp.CompressTransient(raw, false))
-	}
-
-	bc := c.bytes
-	if bc == nil || c.blk == nil || bc.d == nil {
-		return 0, transient
-	}
-
-	buffered := !c.blk.streams()
-
-	switch {
-	case len(bc.d.entries) > 0:
-		// The dictionary serialized, and the region buffer it compresses into ([dictRegion]).
-		region := int64(c.comp.CompressBound(int(bc.d.raw))) + 2*binary.MaxVarintLen64 + objectCRCBytes
-		transient = max(transient, bc.d.raw+region+c.comp.CompressTransient(int(bc.d.raw), true))
-
-		if buffered {
-			retained = region
-		}
-	case buffered:
-		raw := int64(cap(c.blk.pending))
-		for _, f := range c.blk.frameRaw {
-			raw += int64(f)
-		}
-
-		transient = max(transient, raw+c.comp.CompressTransient(int(raw), false))
-	}
-
-	return retained, transient
-}
-
 // objectOpener returns the factory for column i's object writer, or nil when the writer buffers.
 // The id column gets none: its RLE stream is built from runs at the end and is already O(distinct
 // series), not O(rows).
@@ -755,6 +717,44 @@ func (c *streamColumn) residentBytes() int64 {
 	total += int64(cap(c.first))
 
 	return total
+}
+
+func (c *streamColumn) finishBytes() (retained, transient int64) {
+	const runBytes = 24
+
+	transient = max(c.blk.sealBytes(), c.alt.sealBytes())
+
+	if len(c.runs) > 0 && c.comp != nil {
+		raw := len(c.runs) * runBytes
+		transient = max(transient, int64(raw)+c.comp.CompressTransient(raw, false))
+	}
+
+	bc := c.bytes
+	if bc == nil || c.blk == nil || bc.d == nil {
+		return 0, transient
+	}
+
+	buffered := !c.blk.streams()
+
+	switch {
+	case len(bc.d.entries) > 0:
+		// The dictionary serialized, and the region buffer it compresses into ([dictRegion]).
+		region := int64(c.comp.CompressBound(int(bc.d.raw))) + 2*binary.MaxVarintLen64 + objectCRCBytes
+		transient = max(transient, bc.d.raw+region+c.comp.CompressTransient(int(bc.d.raw), true))
+
+		if buffered {
+			retained = region
+		}
+	case buffered:
+		raw := int64(cap(c.blk.pending))
+		for _, f := range c.blk.frameRaw {
+			raw += int64(f)
+		}
+
+		transient = max(transient, raw+c.comp.CompressTransient(int(raw), false))
+	}
+
+	return retained, transient
 }
 
 // abort releases the column's in-flight object writers without publishing them.

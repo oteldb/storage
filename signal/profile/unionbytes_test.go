@@ -79,12 +79,10 @@ func unionBytesCoversUnion(t *testing.T, size int) {
 
 	s := NewSymbolStore()
 
-	var (
-		parts []map[string][]byte
-		refs  [][]byte
-		sizes []int64
-		heads [][]byte
-	)
+	parts := make([]map[string][]byte, 0, sources)
+	refs := make([][]byte, 0, sources*chains)
+	sizes := make([]int64, 0, sources*len(tableNames))
+	heads := make([][]byte, 0, sources*len(tableNames))
 
 	for range sources {
 		tables, stacks := reachableTables(chains, size)
