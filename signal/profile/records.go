@@ -78,6 +78,7 @@ func (t profileType) key() string {
 // A scope's profiles are grouped by their type so each emitted stream carries exactly one type
 // (folded into its identity). Each sample flattens to rows: a sample with TimestampsUnixNano emits
 // one row per (timestamp, value); an aggregated sample emits one row at the profile's TimeNanos.
+// An observation whose value is 0 emits no row, and a stream left with no rows is not emitted.
 // Out-of-range dictionary indices are tolerated (resolve to zero), so a malformed batch never panics.
 func Project(pd *Profiles, emit func(*recordengine.Batch)) (rows int) {
 	d := &pd.Dictionary
@@ -197,11 +198,19 @@ func fillBatch(b *recordengine.Batch, d *Dictionary, res signal.Resource, scope 
 	for _, pr := range profiles {
 		for sx := range pr.Samples {
 			s := &pr.Samples[sx]
+			if !hasObservation(s) {
+				continue
+			}
+
 			stackID := bld.stackID(s.StackIndex).AppendBinary(nil)
 			traceID, spanID := linkIDs(d, s.LinkIndex)
 			attrs := resolveAttributes(d, pr.AttributeIndices, s.AttributeIndices).AppendHashInput(nil)
 
 			emitRow := func(ts, value int64) {
+				if value == 0 {
+					return
+				}
+
 				b.Ts = append(b.Ts, ts)
 				b.Ints[iValue] = append(b.Ints[iValue], value)
 				b.Ints[iPeriod] = append(b.Ints[iPeriod], pr.Period)
@@ -216,13 +225,13 @@ func fillBatch(b *recordengine.Batch, d *Dictionary, res signal.Resource, scope 
 
 			if len(s.TimestampsUnixNano) > 0 {
 				for i, ts := range s.TimestampsUnixNano {
-					emitRow(int64(ts), valueAt(s.Values, i))
+					emitRow(int64(ts), observedValue(s, i))
 				}
 
 				continue
 			}
 
-			emitRow(pr.TimeNanos, valueAt(s.Values, 0))
+			emitRow(pr.TimeNanos, observedValue(s, 0))
 		}
 	}
 
@@ -231,13 +240,31 @@ func fillBatch(b *recordengine.Batch, d *Dictionary, res signal.Resource, scope 
 	return rows
 }
 
-// valueAt returns vals[i] or 0 if out of range.
-func valueAt(vals []int64, i int) int64 {
-	if i >= 0 && i < len(vals) {
-		return vals[i]
+// observedValue is the value of a sample's i-th observation. A sample with timestamps and no values
+// counts each timestamp once, as OTLP specifies; a value missing from a malformed sample is 0.
+func observedValue(s *Sample, i int) int64 {
+	if len(s.Values) == 0 && len(s.TimestampsUnixNano) > 0 {
+		return 1
+	}
+
+	if i >= 0 && i < len(s.Values) {
+		return s.Values[i]
 	}
 
 	return 0
+}
+
+// hasObservation reports whether any of a sample's observations is non-zero, so a sample that
+// projects to no row resolves no stack into the symbol delta.
+func hasObservation(s *Sample) bool {
+	n := max(len(s.TimestampsUnixNano), 1)
+	for i := range n {
+		if observedValue(s, i) != 0 {
+			return true
+		}
+	}
+
+	return false
 }
 
 // linkIDs resolves a sample's link index to the linked span's (trace id, span id), or (nil, nil) if

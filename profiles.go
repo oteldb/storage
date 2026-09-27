@@ -20,7 +20,8 @@ const profilesPrefix = "/profiles"
 // WriteProfiles ingests a profiles batch. It projects each sample into a record row (flattening
 // timestamped samples and denormalizing profile fields) and a content-addressed symbol delta,
 // derives each sample's tenant from its Resource+Scope, and appends to that tenant's profiles
-// engine — which persists the symbol store as part sidecars. Returns OTLP partial-success counts.
+// engine — which persists the symbol store as part sidecars. Returns OTLP partial-success counts
+// over rows; a zero-valued observation is not stored and counts as neither accepted nor rejected.
 func (s *Storage) WriteProfiles(ctx context.Context, pd profile.Profiles) (acc Accepted, err error) {
 	ctx, finish := s.writeSpan(ctx, "storage.write.profiles")
 	defer finish(&acc, &err)

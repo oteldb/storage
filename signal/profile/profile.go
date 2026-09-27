@@ -54,8 +54,9 @@ type Profile struct {
 }
 
 // Sample is one stack occurrence. StackIndex references the dictionary stack table. A sample carries
-// either one aggregated Value (Values[0], no timestamps) or paired Values/TimestampsUnixNano arrays
-// (one observation each). AttributeIndices/LinkIndex reference the dictionary.
+// either one aggregated Value (Values[0], no timestamps), paired Values/TimestampsUnixNano arrays
+// (one observation each), or TimestampsUnixNano alone (each observation counts 1).
+// AttributeIndices/LinkIndex reference the dictionary.
 type Sample struct {
 	Values             []int64
 	TimestampsUnixNano []uint64

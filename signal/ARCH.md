@@ -92,6 +92,16 @@ rides the part lifecycle through the record engine's side-store hook. Its refere
 `stack_id`: `SymbolStore.Retain` walks the same graph down from the head's stack ids to find the
 entries a replica must keep.
 
+**A zero observation is not a row.** Every profile aggregate sums `value` (flame graph, top, diff),
+so a 0 contributes nothing; a row count was never a sample count, since a timestamped sample
+explodes per timestamp. Go heap profiles are where it matters: one pprof sample carries all four
+types, so the `inuse_*` profiles repeat every stack the `alloc_*` ones hold, and on a test stand
+98.7% of those rows were 0. Dropping them halves a heap scrape's rows. The drop is per (sample,
+type, timestamp) observation, and a sample that keeps none resolves no stack, so the symbol delta
+carries only what kept rows reference: an owner's merges union sidecars whole and never collect,
+so a stack only a dropped row referenced would otherwise be pinned for the data's lifetime. A
+`timestamps_unix_nano`-only sample counts 1 per timestamp, as OTLP defines, so it is never dropped.
+
 **Symbol tables are compressed.** Each table (`sym-{name}.bin`, and each table of a batch delta) is
 an `OTSP` blob: version 2 is `[magic][version][algorithm][uvarint raw length][compress block][CRC32C]`
 over a body of `[count]` then `[16B id][len][bytes]` sorted by id. The body is mostly 16-byte ids,
