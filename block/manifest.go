@@ -258,6 +258,23 @@ type Manifest struct {
 	//
 	// Trailing, like DiskBytes, and 0 in a manifest written before it existed.
 	RawBytes int64
+	// Rollup is the downsampling layout the part's rows have had applied. nil is unknown: what a
+	// manifest without it, or with a malformed one, decodes to. Trailing, after RawBytes.
+	Rollup *Rollup
+}
+
+// Rollup is the downsampling layout a part was last written under. No tiers means none was
+// applied: the rows are raw.
+type Rollup struct {
+	Tiers []RollupTier
+}
+
+// RollupTier is one tier of a [Rollup]: rows older than Before reduced to one per Interval-wide
+// bucket by Agg, an aggregation id this package does not interpret. Interval must be positive.
+type RollupTier struct {
+	Before   int64
+	Interval int64
+	Agg      uint8
 }
 
 // flags packs the descriptor's flag-gated fields into the manifest flags byte. Each optional field
@@ -324,6 +341,7 @@ func writerVersion(cols []ColumnDesc) uint32 {
 //	              [uvarint the seven ColumnSizing fields, in declaration order, if xSizing]
 //	              [numeric min/max per kind][const value per kind if flagConst]
 //	[uvarint diskBytes][uvarint rawBytes]
+//	[uvarint n][n × (varint before, uvarint interval, byte agg)] if Rollup != nil
 //	[u32 CRC32C over all the above]
 func (m Manifest) Encode(dst []byte) []byte {
 	start := len(dst)
@@ -403,9 +421,7 @@ func (m Manifest) Encode(dst []byte) []byte {
 		}
 	}
 
-	w.WriteUvarint(uint64(m.DiskBytes))
-	w.WriteUvarint(uint64(m.RawBytes))
-
+	m.encodeTrailer(w)
 	w.PadToByte()
 	out := w.Bytes()
 	crc := crc32.Checksum(out[start:], castagnoli)
@@ -519,10 +535,69 @@ func DecodeManifest(src []byte) (Manifest, error) {
 			if m.RawBytes, err = toInt64(raw, "rawBytes"); err != nil {
 				return Manifest{}, err
 			}
+
+			m.Rollup = decodeRollup(r)
 		}
 	}
 
 	return m, nil
+}
+
+// encodeTrailer writes the optional fields that follow the column descriptors.
+func (m Manifest) encodeTrailer(w *bitstream.Writer) {
+	w.WriteUvarint(uint64(m.DiskBytes))
+	w.WriteUvarint(uint64(m.RawBytes))
+
+	if m.Rollup == nil {
+		return
+	}
+
+	w.WriteUvarint(uint64(len(m.Rollup.Tiers)))
+
+	for _, t := range m.Rollup.Tiers {
+		w.WriteVarint(t.Before)
+		w.WriteUvarint(uint64(t.Interval))
+		_ = w.WriteByte(t.Agg)
+	}
+}
+
+// rollupTierMinBytes is the smallest encoding of a [RollupTier]: one byte per field.
+const rollupTierMinBytes = 3
+
+// decodeRollup reads the optional rollup marker, returning nil (unknown) rather than an error for a
+// marker that is absent, truncated or malformed: reading it as raw would re-roll a downsampled part,
+// and as corrupt would strand a readable one.
+func decodeRollup(r *bitstream.Reader) *Rollup {
+	n, err := r.ReadUvarint()
+	if err != nil || n > uint64(r.Remaining()/rollupTierMinBytes) {
+		return nil
+	}
+
+	if n == 0 {
+		return &Rollup{}
+	}
+
+	tiers := make([]RollupTier, n)
+	for i := range tiers {
+		before, err := r.ReadVarint()
+		if err != nil {
+			return nil
+		}
+
+		interval, err := r.ReadUvarint()
+		if err != nil || interval == 0 || interval > math.MaxInt64 {
+			return nil
+		}
+
+		agg, err := r.ReadByte()
+		if err != nil {
+			return nil
+		}
+
+		tiers[i] = RollupTier{Before: before, Interval: int64(interval), Agg: agg}
+	}
+
+	return &Rollup{Tiers: tiers}
 }
 
 func toInt64(v uint64, field string) (int64, error) {

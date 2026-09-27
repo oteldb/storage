@@ -39,6 +39,7 @@ type partConfig struct {
 	level         compress.Level
 	dictCap       int64
 	sizing        bool
+	rollup        *Rollup
 
 	// given are compressors the caller hands in to share across writers; comps is what this writer
 	// compresses through, per algorithm.
@@ -121,6 +122,14 @@ func WithSharedDictBytes(n int64) PartOption {
 // WithSizingStats records [ColumnSizing] for every column with an object, so a merge can bound its
 // memory from the manifest alone. A part carrying it needs a manifest version-3 reader.
 func WithSizingStats() PartOption { return func(c *partConfig) { c.sizing = true } }
+
+// WithRollup records r as the downsampling layout the part's rows were written under
+// ([Manifest.Rollup]). Without it the manifest carries none and reads as unknown.
+func WithRollup(r Rollup) PartOption {
+	return func(c *partConfig) {
+		c.rollup = &Rollup{Tiers: slices.Clone(r.Tiers)}
+	}
+}
 
 func (c *partConfig) layout() columnLayout {
 	return columnLayout{blockRows: c.granuleSize, compressBytes: c.compressBytes, dictCap: c.dictCap, sizing: c.sizing}
@@ -226,6 +235,7 @@ func (w *PartWriter) build() (builtPart, error) {
 		RowCount:    w.rows,
 		GranuleSize: w.granuleSize,
 		Columns:     descs,
+		Rollup:      w.rollup,
 	}
 
 	marks := Marks{GranuleSize: w.granuleSize}

@@ -342,6 +342,7 @@ func (w *StreamWriter) build() (builtPart, error) {
 		RowCount:    rows,
 		GranuleSize: w.granuleSize,
 		Columns:     descs,
+		Rollup:      w.rollup,
 	}
 
 	marks := Marks{GranuleSize: w.granuleSize}

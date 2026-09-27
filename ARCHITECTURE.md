@@ -249,7 +249,8 @@ to fail over to: a read overlapping a want fails.
 - **Injected, no-op-default observability** (above).
 - **Stable formats.** Golden-tested and version-guarded: the `Codec` enum and per-codec framing,
   part manifest (`OTPM`, version 3: a per-column `xflags` byte for the trailer dictionary and the
-  merge-sizing stats; versions 1 and 2 still read) / marks (`OTMK`) / column object framing (the
+  merge-sizing stats; versions 1 and 2 still read; an optional trailing rollup marker whose absence
+  reads as unknown, never raw) / marks (`OTMK`) / column object framing (the
   trailer-dictionary bytes column; the leading layout still read) and key layout, the attribute
   hash+binary encoding (the SeriesID pre-image), symbol table (`OTSY`), the bucket index (format
   v6: entries with their block sets and split claims, tombstones, wants, per-writer flush
