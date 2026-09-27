@@ -1,7 +1,10 @@
 package tenant
 
 import (
+	"slices"
 	"time"
+
+	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/signal"
 )
@@ -114,11 +117,17 @@ func (r Retention) AgeFor(sig signal.Signal) time.Duration {
 // are aligned to absolute multiples of Interval (not to ingest time), so the rollup of a
 // time range is independent of when the merge runs — repeated merges are stable.
 //
-// A tier's cutoff is now − After floored to a multiple of Q = Interval × ⌈1h / Interval⌉:
-// one hour for any Interval dividing an hour, 63m for 7m, Interval itself from 1h up. A
-// bucket is therefore rolled up whole and once, and the cutoff moves once per Q rather
-// than on every maintenance cycle. The cost is lag: a sample is rolled up between After
-// and After + Q past its timestamp, plus up to one maintenance interval.
+// Intervals must nest: ordered by Interval, each strictly divides the next (1m, 5m, 1h, 6h
+// nests; 7m with 1h does not). A tier's cutoff is now − After floored to a multiple of
+// Q = Interval × ⌈1h / Interval⌉: one hour for any Interval dividing an hour, Interval
+// itself from 1h up. Nesting puts every cutoff on the grid of every finer tier, so no bucket
+// straddles a cutoff: each is rolled up whole, once, by one tier, and a finer representative
+// later coarsened lands in the coarse bucket its samples belong to. The cutoff moves once per
+// Q rather than on every maintenance cycle. The cost is lag: a sample is rolled up between
+// After and After + Q past its timestamp, plus up to one maintenance interval.
+//
+// A policy that fails [Downsample.Validate] is rejected whole: the tenant is not downsampled
+// at all, and the storage logs a warning once.
 type DownsampleTier struct {
 	// After is the age past which this tier applies (relative to now at merge time, the
 	// cutoff floored as described above).
@@ -136,6 +145,27 @@ type Downsample struct {
 	// Tiers are the age-banded rollup resolutions, applied at merge time. Order does not
 	// matter; the engine assigns each sample to the coarsest applicable tier.
 	Tiers []DownsampleTier
+}
+
+// Validate reports whether the enabled tiers' Intervals nest (see [DownsampleTier]).
+func (d Downsample) Validate() error {
+	var intervals []time.Duration
+
+	for _, t := range d.Tiers {
+		if t.Interval > 0 {
+			intervals = append(intervals, t.Interval)
+		}
+	}
+
+	slices.Sort(intervals)
+
+	for i := 1; i < len(intervals); i++ {
+		if fine, coarse := intervals[i-1], intervals[i]; coarse == fine || coarse%fine != 0 {
+			return errors.Errorf("downsample interval %s does not nest in %s", fine, coarse)
+		}
+	}
+
+	return nil
 }
 
 // Sampling is the per-tenant lossy admission policy (DESIGN §8a): when ingest exceeds the

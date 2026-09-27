@@ -554,6 +554,11 @@ per pass — and grid-aligned downsample buckets, so a rollup does not depend on
 cutoff never splits a bucket (a split bucket is re-rolled with its own representative, which avg and
 count cannot absorb) and moves once per quantum rather than once per tick. Quantized cutoffs tie, so a
 sample goes to the widest tier it qualifies for rather than the one with the earliest cutoff.
+Exactness also needs tier Intervals to nest, each dividing the next: a coarse cutoff then lies on every
+finer grid, so a fine bucket is never split across tiers and its representative, once coarsened, lands
+in the coarse bucket its samples belong to. Under 7m + 1h a 7m bucket at 119m straddles a 120m cutoff
+and drags 121m samples into the previous hour; the facade rejects such a policy
+(`tenant.Downsample.Validate`) rather than downsample it inexactly.
 
 **Fixed points:** repeated merges are stable for last/first/min/max/sum/avg, count being the documented
 exception. Recompression checks the part's recorded algorithm *and* level, precision the manifest's

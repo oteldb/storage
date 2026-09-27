@@ -96,6 +96,8 @@ type Storage struct {
 	admit   map[signal.TenantID]*tenantAdmission // per-tenant admission state (rate valve + counters)
 	now     func() int64                         // unix-nano clock for admission and metric merge cutoffs; overridable in tests
 
+	downsampleRejected sync.Map // signal.TenantID → struct{}: tenants already warned of a rejected policy
+
 	obs *obs.Obs // injected logging/tracing/metrics (no-op by default); never nil after Open
 
 	// clusterOpts wraps opts.TracerProvider into cluster.Option once, so every cluster.* RPC call
@@ -2163,21 +2165,8 @@ func (s *Storage) retainFrom(tid signal.TenantID, sig signal.Signal, sizeCutoff 
 func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engine.MergeOptions {
 	now := s.now()
 	// In cluster mode tid is a shard key ({tenant}/_s{idx}); policy is per real tenant.
-	p := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid)))
-
-	var tiers []engine.DownsampleTier
-
-	for _, t := range p.Downsample.Tiers {
-		if t.Interval <= 0 {
-			continue
-		}
-
-		tiers = append(tiers, engine.DownsampleTier{
-			Before:   downsampleCutoff(now, t),
-			Interval: t.Interval.Nanoseconds(),
-			Agg:      t.Agg,
-		})
-	}
+	realTenant := s.normalizeTenant(tenantOfShard(tid))
+	p := s.tenant.Resolve(realTenant)
 
 	var recompress *engine.RecompressSpec
 
@@ -2209,10 +2198,39 @@ func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engi
 
 	return engine.MergeOptions{
 		RetainFrom: max(retentionCutoff(p.Retention, signal.Metric, now), sizeCutoff),
-		Downsample: tiers,
+		Downsample: s.downsampleTiers(realTenant, p.Downsample, now),
 		Recompress: recompress,
 		Precision:  precision,
 	}
+}
+
+// downsampleTiers resolves a tenant's downsampling policy against now, or nil when the policy fails
+// [tenant.Downsample.Validate], warning once per tenant.
+func (s *Storage) downsampleTiers(tid signal.TenantID, policy tenant.Downsample, now int64) []engine.DownsampleTier {
+	if err := policy.Validate(); err != nil {
+		if _, warned := s.downsampleRejected.LoadOrStore(tid, struct{}{}); !warned {
+			s.obs.Log.Warn("downsample policy rejected; tenant is not downsampled",
+				zap.String("tenant", string(tid)), zap.Error(err))
+		}
+
+		return nil
+	}
+
+	var tiers []engine.DownsampleTier
+
+	for _, t := range policy.Tiers {
+		if t.Interval <= 0 {
+			continue
+		}
+
+		tiers = append(tiers, engine.DownsampleTier{
+			Before:   downsampleCutoff(now, t),
+			Interval: t.Interval.Nanoseconds(),
+			Agg:      t.Agg,
+		})
+	}
+
+	return tiers
 }
 
 // downsampleCutoff is now − After floored to whole rollup buckets of at least an hour, so the cutoff

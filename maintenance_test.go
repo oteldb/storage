@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/encoding/compress"
+	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
@@ -261,6 +262,50 @@ func TestMetricMergeOptionsDownsampleCutoff(t *testing.T) {
 			assert.Equal(t, first+q, before(quantumStart+q), "the next quantum")
 		})
 	}
+}
+
+func TestMetricMergeOptionsDownsampleNesting(t *testing.T) {
+	t.Parallel()
+
+	resolve := func(t *testing.T, intervals ...time.Duration) []engine.DownsampleTier {
+		t.Helper()
+
+		var tiers []tenant.DownsampleTier
+		for i, iv := range intervals {
+			tiers = append(tiers, tenant.DownsampleTier{After: time.Duration(i+1) * time.Hour, Interval: iv})
+		}
+
+		s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+			return tenant.Policy{Downsample: tenant.Downsample{Tiers: tiers}}
+		})))
+		require.NoError(t, err)
+
+		now := time.Date(2026, 1, 1, 13, 37, 0, 0, time.UTC).UnixNano()
+		s.now = func() int64 { return now }
+
+		return s.metricMergeOptions("default", 0).Downsample
+	}
+
+	t.Run("Rejected", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Empty(t, resolve(t, 7*time.Minute, time.Hour))
+	})
+
+	t.Run("OnEveryFinerGrid", func(t *testing.T) {
+		t.Parallel()
+
+		tiers := resolve(t, time.Minute, 5*time.Minute, time.Hour, 6*time.Hour)
+		require.Len(t, tiers, 4)
+
+		for _, coarse := range tiers {
+			for _, fine := range tiers {
+				if fine.Interval <= coarse.Interval {
+					assert.Zero(t, coarse.Before%fine.Interval, "cutoff %d on the %d grid", coarse.Before, fine.Interval)
+				}
+			}
+		}
+	})
 }
 
 // TestMaintainRollsUpEachBucketOnce ticks maintenance every 10s on a synthetic clock while a gauge
