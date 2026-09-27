@@ -347,7 +347,7 @@ written onto the part only once the commit lands. See [`../engine/ARCH.md`](../e
 
 **Repair** is identical to the metric engine, down to `Config.Repair` and its `bucketindex` types, the satisfaction rule (the
 exact part, the largest containing part at a higher level, or a split group whose members are all
-present), the member rounds that complete such a group and commit it whole or not at all, and the
+present), the member rounds that complete such a group and commit it whole where a lone member would duplicate rows, and the
 two gates a want must clear before its loss is acknowledged as a revocable hole — the pass itself is
 one shared implementation, `internal/repair`. A group committed piecemeal costs this engine more than
 the metric one: records do not collapse by timestamp, so a lone fragment re-committed every cycle is

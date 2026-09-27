@@ -11,13 +11,14 @@ import (
 )
 
 // Admit returns the entries a repair commit publishes out of units, given live, the engine's part
-// set, and counts each unit's parts into stats as published or failed.
+// set, and counts into stats what it publishes and what it leaves out.
 //
 // open makes a part readable for the commit; a part that will not open fails its whole unit, unless
 // what it was fetched for is already covered by this commit, in which case it is skipped. A part
-// already live, or admitted by an earlier unit, is not opened again. A unit whose split groups are
-// not complete once its parts are open is dropped whole: a member committed without the rest of its
-// group sits beside the ancestors it partly duplicates, with nothing able to retire them.
+// already live, or admitted by an earlier unit, is not opened again. A unit that is not
+// [committable] once its parts are open is dropped whole. Last, a part another published or live
+// part supersedes is left out: a peer that merged between two rounds can answer one unit with both
+// a member and the successor containing it, and publishing both would read its rows twice.
 func Admit(
 	ctx context.Context, live []bucketindex.Entry, units []Unit, open func(*Result) error, stats *bucketindex.RepairStats,
 ) []bucketindex.Entry {
@@ -26,16 +27,20 @@ func Admit(
 		have[live[i].Prefix] = struct{}{}
 	}
 
-	var admitted []bucketindex.Entry
+	var (
+		admitted []bucketindex.Entry
+		picked   []*Result
+	)
 
 	for _, u := range units {
-		held := slices.Concat(live, admitted)
-		base := len(admitted)
+		base := slices.Concat(live, admitted)
+		held := slices.Clone(base)
+		added := make([]*Result, 0, len(u))
 		ok := true
 
 		for i := range u {
 			r := &u[i]
-			if _, dup := have[r.Entry.Prefix]; dup {
+			if _, dup := have[r.Entry.Prefix]; dup || slices.ContainsFunc(added, r.samePart) {
 				continue
 			}
 
@@ -52,12 +57,11 @@ func Admit(
 				break
 			}
 
-			have[r.Entry.Prefix] = struct{}{}
 			held = append(held, r.Entry)
-			admitted = append(admitted, r.Entry)
+			added = append(added, r)
 		}
 
-		if ok && !complete(held, u) {
+		if ok && !committable(base, u[0].Want, held[len(base):]) {
 			zctx.From(ctx).Warn("repaired split group is not complete at commit",
 				zap.String("want", u[0].Want.Prefix))
 
@@ -65,30 +69,45 @@ func Admit(
 		}
 
 		if !ok {
-			for i := base; i < len(admitted); i++ {
-				delete(have, admitted[i].Prefix)
-			}
-
-			admitted = admitted[:base]
 			stats.Failed += int64(len(u))
 
 			continue
 		}
 
-		for i := range u {
-			switch {
-			case u[i].Hole:
-				stats.Revoked++
-			case u[i].Held:
-				stats.Local++
-			default:
-				stats.Fetched++
-			}
+		if u[0].Hole {
+			stats.Revoked++
+		}
+
+		for _, r := range added {
+			have[r.Entry.Prefix] = struct{}{}
+			admitted = append(admitted, r.Entry)
+			picked = append(picked, r)
 		}
 	}
 
-	return admitted
+	superseded := bucketindex.Subsumed(admitted, slices.Concat(live, admitted))
+	out := admitted[:0]
+
+	for i, r := range picked {
+		if _, drop := superseded[r.Entry.Prefix]; drop {
+			continue
+		}
+
+		switch {
+		case r.Hole:
+		case r.Held:
+			stats.Local++
+		default:
+			stats.Fetched++
+		}
+
+		out = append(out, admitted[i])
+	}
+
+	return out
 }
+
+func (r *Result) samePart(o *Result) bool { return r.Entry.Prefix == o.Entry.Prefix }
 
 // ConfirmLost advances evidence, the per-want count of consecutive definitive-absence conclusions,
 // with a pass's attempts and returns the wants that have earned a hole. Only [bucketindex.WantAbsent]

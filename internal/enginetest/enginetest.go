@@ -252,6 +252,7 @@ var suite = []struct {
 	{"WideSplitGroupIsRepaired", wideSplitGroupIsRepaired},
 	{"SplitGroupAtCycleBoundaryIsRepaired", splitGroupAtCycleBoundaryIsRepaired},
 	{"SplitGroupMemberLostEverywhereBecomesHole", splitGroupMemberLostEverywhereBecomesHole},
+	{"SplitMemberRepairsWithoutItsGroup", splitMemberRepairsWithoutItsGroup},
 	{"RefreshReplicaTrimsPerStream", refreshReplicaTrimsPerStream},
 	{"PromotedReplicaKeepsLateRow", promotedReplicaKeepsLateRow},
 	{"MidFlushAppendSurvivesCrash", midFlushAppendSurvivesCrash},

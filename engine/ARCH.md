@@ -772,14 +772,22 @@ group the same way, one round later. The pass, commit included, is shared by bot
 `repair.Drive`); each engine supplies only a `repair.Host` adapter over its private part set, locks
 and index commit.
 
-**A unit is committed whole or not at all** (`repair.Admit`). A fragment committed beside the
-ancestors it partly duplicates, with nothing yet able to retire them, has those rows read twice. On
-the record engine, where rows do not collapse by timestamp, it is worse than a read: the next merge
-folds the lone fragment into a local part, the want stays outstanding, and the next pass commits the
-same fragment again — one duplicate per cycle. The member that answered the want is under the same
-rule as the rest, so a unit still short of a member after its rounds, or one whose member will not
-open at commit, contributes nothing and the next pass starts it over. Completing a group retires the
-parts its claim covers, through `bucketindex.Subsumed`, the same swap a merge publishes.
+**A unit is committed whole or not at all** (`repair.Admit`), where "whole" means two things.
+First, the unit must answer its want, so a want the peer answered only jointly needs its whole group.
+Second, every group whose claimed ancestry overlaps what this node already holds must be complete. A
+fragment committed beside the ancestors it partly duplicates, with nothing yet able to retire them,
+has those rows read twice. On the record engine, where rows do not collapse by timestamp, it is worse
+than a read: the next merge folds the lone fragment into a local part, the want stays outstanding,
+and the next pass commits the same fragment again — one duplicate per cycle. Completing the group is
+what retires those ancestors, through `bucketindex.Subsumed`, the same swap a merge publishes.
+
+A member of a group whose ancestry this node no longer holds is different: its rows are rows the
+node lacks, so it is committed on its own, whatever became of its siblings. Requiring the group there
+would buy nothing and cost a part that exists — a lost sibling would hold it back for ever and, as
+evidence, turn it into a hole. A unit still short of what it needs after its rounds, or one whose part
+will not open at commit, contributes nothing and the next pass starts it over. Within one commit a
+part another published or live part supersedes is left out: a peer that merged between two rounds can
+answer one unit with a member and with the successor containing it.
 
 **The per-cycle cap counts units, not parts.** `repair.FetchesPerCycle` (4) bounds the wants and
 holes one pass asks peers for; the members their answers need do not count against it. Counting them
@@ -793,13 +801,19 @@ span, plus any writer the router sealed early for size or residency — the rout
 terminate because a unit asks for each block at most once per pass, and one answer serves every unit
 needing that block.
 
-**A member no owner holds ends in a hole.** A unit left short gives its want the unit's outcome as
-absence evidence: `WantAbsent` only when every member it could not get came back absent,
-`WantIncomplete` when any came back incomplete, and a failure — no evidence, the run reset — when any
-fetch failed. A group completable nowhere therefore earns its hole over `repair.HoleConfirmations`
-passes like any absent part, instead of an endless run of passes in which the answering member comes
-back "satisfied" and resets the evidence. When no owner can realize the group at all, the peers
-answer the want itself `WantAbsent` and the member rounds never start.
+**A member no owner holds ends in a hole — only for the want it answers.** Evidence is per
+target. A unit whose own answer satisfies its want — the exact part, a containing successor, or a
+part held on this disk — concludes nothing from a missing member: it is a failure, the run reset, and
+the want stays outstanding rather than becoming a hole over data that exists. A unit that needed the
+group to answer its want gives the want the members' outcome instead: `WantAbsent` only when every
+member it could not get came back absent, `WantIncomplete` when any came back incomplete, and a
+failure when any fetch failed. A group completable nowhere therefore earns that want its hole over
+`repair.HoleConfirmations` passes like any absent part, instead of an endless run of passes in which
+the answering member comes back "satisfied" and resets the evidence. When no owner can realize the
+group at all, the peers answer the want itself `WantAbsent` and the member rounds never start. A
+member want names blocks, not a prefix, so the fetcher answers it from peer indexes only; a member on
+a peer's disk but in no index is absent to it, which is why that absence only ever counts against a
+want nothing else answers.
 
 Member targets are **never wants**: nothing about them reaches the index, so the obligation stays the
 original want's and `Entries → Removed | Wanted` is untouched. That is what makes repair terminate: by the time

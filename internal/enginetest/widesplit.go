@@ -1,7 +1,9 @@
 package enginetest
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -212,4 +214,51 @@ func splitGroupMemberLostEverywhereBecomesHole(t *testing.T, k Kind) {
 			assert.Zero(t, r.RepairStats().Fetched, "nothing was published")
 		})
 	}
+}
+
+// splitMemberRepairsWithoutItsGroup loses two fragments of a group this node wrote itself, whose
+// ancestors it has already retired, and one of them is gone from every owner. The survivor holds
+// rows nothing here duplicates, so it must come back on its own; only the other becomes a hole.
+func splitMemberRepairsWithoutItsGroup(t *testing.T, k Kind) {
+	t.Helper()
+
+	ctx := context.Background()
+	s := splitLoss{be: backend.Memory(), peer: backend.Memory()}
+
+	e := k.open(t, s.be)
+	for d := range int64(3) {
+		s.want = append(s.want, api(d*day+hour, d))
+	}
+
+	e.Append(t, s.want...)
+	require.NoError(t, e.Flush(ctx))
+	e.Append(t, otherRow)
+	require.NoError(t, e.Flush(ctx))
+	require.NoError(t, e.ForceMerge(ctx))
+
+	ix := k.loadIndex(t, s.be)
+	fragments := slices.DeleteFunc(ix.Entries, func(e bucketindex.Entry) bool { return !e.Claim.Valid() })
+	require.Len(t, fragments, 3, "a fragment per day")
+	slices.SortFunc(fragments, func(a, b bucketindex.Entry) int { return cmp.Compare(a.MinTime, b.MinTime) })
+
+	copyObjects(ctx, t, s.be, s.peer, k.Prefix+"/")
+
+	back, gone := fragments[0], fragments[1]
+	for _, lost := range []string{back.Prefix, gone.Prefix} {
+		_, id, _ := strings.Cut(lost, k.Prefix+"/")
+		k.erasePart(ctx, t, s.be, id)
+	}
+
+	r := k.openRepair(t, s.be, NewFetcher(s.answer(t, k, func(_ bucketindex.Want, ent bucketindex.Entry) bool {
+		return ent.Prefix == gone.Prefix
+	})))
+	require.NoError(t, r.LoadParts(ctx))
+	require.ElementsMatch(t, []string{back.Prefix, gone.Prefix}, r.WantPrefixes())
+
+	repairCycles(t, r, 3*3)
+
+	assert.Empty(t, r.WantPrefixes())
+	assert.Equal(t, uint64(1), r.LostParts(), "only the fragment no owner holds is lost")
+	assert.Equal(t, []Row{s.want[0], s.want[2]}, rows(t, r, apiStream))
+	assert.Equal(t, []Row{otherRow}, rows(t, r, otherRow.Stream))
 }

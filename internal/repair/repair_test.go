@@ -249,12 +249,24 @@ func TestRunShortGroup(t *testing.T) {
 		failed   bool
 		observed func(s bucketindex.RepairStats) int64
 	}{
-		{"Absent", bucketindex.FetchResult{Outcome: bucketindex.WantAbsent}, bucketindex.WantAbsent, false,
-			func(s bucketindex.RepairStats) int64 { return s.Unsatisfiable }},
-		{"Incomplete", bucketindex.FetchResult{Outcome: bucketindex.WantIncomplete}, bucketindex.WantIncomplete, false,
-			func(s bucketindex.RepairStats) int64 { return s.Incomplete }},
-		{"Error", bucketindex.FetchResult{Err: errors.New("unreachable")}, 0, true,
-			func(s bucketindex.RepairStats) int64 { return s.Failed - 14 }},
+		{
+			"Absent",
+			bucketindex.FetchResult{Outcome: bucketindex.WantAbsent},
+			bucketindex.WantAbsent, false,
+			func(s bucketindex.RepairStats) int64 { return s.Unsatisfiable },
+		},
+		{
+			"Incomplete",
+			bucketindex.FetchResult{Outcome: bucketindex.WantIncomplete},
+			bucketindex.WantIncomplete, false,
+			func(s bucketindex.RepairStats) int64 { return s.Incomplete },
+		},
+		{
+			"Error",
+			bucketindex.FetchResult{Err: errors.New("unreachable")},
+			0, true,
+			func(s bucketindex.RepairStats) int64 { return s.Failed - 14 },
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -337,7 +349,7 @@ func TestAdmit(t *testing.T) {
 
 		var stats bucketindex.RepairStats
 
-		plain := bucketindex.Entry{Prefix: "p", Blocks: bucketindex.Blocks(5)}
+		plain := bucketindex.Entry{Prefix: "b", Blocks: bucketindex.Blocks(5)}
 		open, _ := opener("f02")
 		got := Admit(ctx, nil, []Unit{
 			unit("a", false, false, members...),
@@ -379,8 +391,8 @@ func TestAdmit(t *testing.T) {
 
 		assert.Equal(t, []bucketindex.Entry{members[1], members[2], succ}, got)
 		assert.Equal(t, []string{"f01", "f02", "s"}, *opened, "a live part is not opened again")
-		assert.Equal(t, bucketindex.RepairStats{Fetched: 3, Local: 1, Revoked: 1}, stats,
-			"a copy the commit already covers is no failure")
+		assert.Equal(t, bucketindex.RepairStats{Fetched: 2, Local: 1, Revoked: 1}, stats,
+			"only parts published count, and a copy the commit already covers is no failure")
 	})
 }
 

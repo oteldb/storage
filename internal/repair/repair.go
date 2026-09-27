@@ -327,18 +327,15 @@ func (u *unit) entries(ix *bucketindex.Index) []bucketindex.Entry {
 	return out
 }
 
-// missing is the member blocks of the unit's split groups that neither the index nor the unit's own
-// parts hold, and that the unit has not asked for yet.
+// missing is the member blocks the unit still needs and has not asked for: every group of its parts
+// while its target is not yet answered, and otherwise the groups whose lone members would duplicate
+// rows the index already holds ([groupsNeeded]).
 func (u *unit) missing(ix *bucketindex.Index) []uint64 {
-	held := (&bucketindex.Index{Entries: u.entries(ix)}).Covered()
+	entries := u.entries(ix)
+	held := (&bucketindex.Index{Entries: entries}).Covered()
 	out := make(map[uint64]struct{})
 
-	for i := range u.results {
-		c := u.results[i].Entry.Claim
-		if !c.Valid() {
-			continue
-		}
-
+	for _, c := range groupsNeeded(ix.Entries, u.results[0].Want, entries[len(ix.Entries):]) {
 		c.Group.Each(func(b uint64) bool {
 			if _, asked := u.asked[b]; !asked && !held.Contains(bucketindex.Blocks(b)) {
 				out[b] = struct{}{}
@@ -370,29 +367,20 @@ func (u *unit) take(a attempt) {
 	}
 }
 
-// whole reports whether every split group the unit's parts belong to is complete with the index.
-// A unit that stopped short for no recorded reason is a failure, never evidence.
+// whole reports whether the unit may be committed over the index ([committable]). A unit that
+// stopped short for no recorded reason is a failure, never evidence; so is one whose target's own
+// answer satisfies it, because a member's absence says nothing about a part that exists.
 func (u *unit) whole(ix *bucketindex.Index) bool {
-	if complete(u.entries(ix), u.results) {
+	entries := u.entries(ix)
+	if committable(ix.Entries, u.results[0].Want, entries[len(ix.Entries):]) {
 		return true
 	}
 
-	if u.worst == outcomeNone {
+	target := u.results[0]
+	if _, own := (&bucketindex.Index{Entries: []bucketindex.Entry{target.Entry}}).Satisfying(target.Want); own ||
+		u.worst == outcomeNone {
 		u.worst = outcomeFailed
 	}
 
 	return false
-}
-
-func complete(entries []bucketindex.Entry, results []Result) bool {
-	held := (&bucketindex.Index{Entries: entries}).Covered()
-
-	for i := range results {
-		c := results[i].Entry.Claim
-		if c.Valid() && !held.Contains(c.Group) {
-			return false
-		}
-	}
-
-	return true
 }
