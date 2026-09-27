@@ -130,7 +130,12 @@ the window's samples reference and need not resolve any other.
   decompressed body, so a cached part costs its raw body plus about 48 B per entry for the map. The
   views pin the body's whole backing array, and zstd decompression reserves its bound plus about
   128 KiB of slack, so a small table would pin several times its size outside the budget. Bodies
-  therefore decompress into pooled scratch, and only an exact-length copy is retained and charged.
+  therefore decompress into reused scratch, and only an exact-length copy is retained and charged.
+  The scratch also sits outside the budget, so it is a fixed free list, not a `sync.Pool`: at most 16
+  buffers of at most 4 MiB each, 64 MiB in total. 16 is the resolver's widest concurrent part
+  load; with only 4 slots a cold 32-part build allocates 34% more (73.5 MiB against 54.8 MiB). 4 MiB
+  holds a test-stand part's largest table (stacks, about 3.2 MB) plus the slack. A larger body's
+  scratch is dropped after the decode.
 - **Merging layers per query is the cost being avoided.** A union of N cached parts is still N ×
   entries map operations on every call, and on a store whose every part repeats the working set that
   is nearly the whole decode again. A lookup instead probes the layers in order, trying the stack's

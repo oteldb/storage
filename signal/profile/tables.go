@@ -3,7 +3,6 @@ package profile
 import (
 	"encoding/binary"
 	"maps"
-	"sync"
 
 	"github.com/go-faster/errors"
 
@@ -30,8 +29,8 @@ func DecodeTables(tables map[string][]byte) (*Tables, error) {
 	// Decompression reserves its bound plus a fixed slack of about 128 KiB, and the entry views would
 	// pin that whole array: a small table would hold several times its size. It decompresses into
 	// reused scratch instead, and only an exact-length copy is retained.
-	scratch, _ := bodyScratch.Get().(*[]byte)
-	defer bodyScratch.Put(scratch)
+	scratch := getScratch()
+	defer func() { putScratch(scratch) }()
 
 	for i, name := range tableNames {
 		data, ok := tables[name]
@@ -39,13 +38,13 @@ func DecodeTables(tables map[string][]byte) (*Tables, error) {
 			continue
 		}
 
-		body, err := tableBodyTo((*scratch)[:0], data)
+		body, err := tableBodyTo(scratch[:0], data)
 		if err != nil {
 			return nil, errors.Wrapf(err, "decode table %q", name)
 		}
 
-		if binary.BigEndian.Uint32(data[4:]) != symVersionRaw && cap(body) > cap(*scratch) {
-			*scratch = body[:0]
+		if binary.BigEndian.Uint32(data[4:]) != symVersionRaw && cap(body) > cap(scratch) {
+			scratch = body[:0]
 		}
 
 		body = exactCopy(body)
@@ -61,7 +60,37 @@ func DecodeTables(tables map[string][]byte) (*Tables, error) {
 	return out, nil
 }
 
-var bodyScratch = sync.Pool{New: func() any { return new([]byte) }}
+// Decompression scratch is a bounded free list rather than a sync.Pool: what it keeps sits outside
+// the symbol-cache budget, so it is capped at scratchSlots buffers of at most maxScratchBytes each
+// (64 MiB), however large a table or however many concurrent decodes. 16 slots match the most part
+// loads a resolver runs at once; 4 MiB holds a test-stand part's largest table (stacks, about
+// 3.2 MB raw) plus the decompression slack. A larger body is dropped after use instead of kept.
+const (
+	scratchSlots    = 16
+	maxScratchBytes = 4 << 20
+)
+
+var bodyScratch = make(chan []byte, scratchSlots)
+
+func getScratch() []byte {
+	select {
+	case b := <-bodyScratch:
+		return b
+	default:
+		return nil
+	}
+}
+
+func putScratch(b []byte) {
+	if b == nil || cap(b) > maxScratchBytes {
+		return
+	}
+
+	select {
+	case bodyScratch <- b[:0]:
+	default:
+	}
+}
 
 func exactCopy(b []byte) []byte {
 	out := make([]byte, len(b))

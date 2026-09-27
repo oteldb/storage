@@ -90,6 +90,51 @@ func TestDecodeTablesRejects(t *testing.T) {
 	require.ErrorIs(t, err, ErrCorruptSymbols)
 }
 
+// TestDecodeTablesScratchBounded checks the decompression scratch never keeps a buffer beyond its
+// cap, whether the oversized body decoded or failed, and never keeps more than its slots.
+func TestDecodeTablesScratchBounded(t *testing.T) {
+	t.Parallel()
+
+	big := map[signal.SeriesID][]byte{{Hi: 1}: make([]byte, 2*maxScratchBytes)}
+	body := tableBody(big)
+	block := storageCompressor.Compress(nil, body)
+
+	got, err := DecodeTables(map[string][]byte{"stacks": encodeTable(big, storageCompressor)})
+	require.NoError(t, err)
+	require.Len(t, got.t.t[tableStacks][signal.SeriesID{Hi: 1}], 2*maxScratchBytes)
+
+	_, err = DecodeTables(map[string][]byte{
+		"stacks": frameTable(compress.AlgorithmZSTD, uint64(len(body))+1, block),
+	})
+	require.ErrorIs(t, err, ErrCorruptSymbols)
+
+	_, err = DecodeTables(map[string][]byte{"stacks": encodeTable(goldenEntry(), storageCompressor)})
+	require.NoError(t, err)
+
+	putScratch(make([]byte, 0, maxScratchBytes+1))
+
+	var kept [][]byte
+
+	for len(kept) <= scratchSlots {
+		select {
+		case b := <-bodyScratch:
+			kept = append(kept, b)
+
+			continue
+		default:
+		}
+
+		break
+	}
+
+	for _, b := range kept {
+		assert.LessOrEqual(t, cap(b), maxScratchBytes, "an oversized scratch is dropped")
+		putScratch(b)
+	}
+
+	assert.LessOrEqual(t, len(kept), scratchSlots)
+}
+
 // TestSymbolStoreTablesSnapshot checks the snapshot does not see what the accumulator absorbs later.
 func TestSymbolStoreTablesSnapshot(t *testing.T) {
 	t.Parallel()
