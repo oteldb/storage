@@ -33,6 +33,22 @@ func TestCompressRoundTrip(t *testing.T) {
 	}
 }
 
+func TestShared(t *testing.T) {
+	t.Parallel()
+
+	c := Shared(AlgorithmZSTD, LevelBest)
+	assert.Same(t, c, Shared(AlgorithmZSTD, LevelBest))
+	assert.NotSame(t, c, Shared(AlgorithmZSTD, LevelDefault))
+	assert.NotSame(t, c, Shared(AlgorithmLZ4, LevelBest))
+	assert.Equal(t, AlgorithmZSTD, c.Algorithm())
+	assert.Equal(t, LevelBest, c.Level())
+
+	src := makeRepetitive(4096, "ab")
+	out, err := c.Decompress(nil, c.Compress(nil, src))
+	require.NoError(t, err)
+	assert.Equal(t, src, out)
+}
+
 func TestCompressLZ4Shrinks(t *testing.T) {
 	t.Parallel()
 	data := makeRepetitive(8192, "hello world! ")

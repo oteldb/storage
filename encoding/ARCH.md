@@ -59,6 +59,9 @@ Rules that matter beyond the code:
 1-byte-flagged frame around a column/block: raw or compressed, automatically falling back to raw
 when compression does not shrink. zstd and lz4 both compress (lz4 framed as `[uvarint origLen][lz4
 block]`, the block format carrying no length of its own); none = identity. Encoders/decoders pooled.
+Writers take their compressor from `Shared(alg, level)`, one per process: a zstd encoder at the best
+level holds ~24 MiB of window and hash tables while its pool keeps it, so a pool per writer cost that
+once per writer open at the same time — 193 MiB of encoders for a merge writing eight day parts.
 
 `DecompressLimit` is the bounded decode every part read uses: it fails with `ErrLimit` rather than
 produce more than a limit, allocating at most the bound plus `DecodeWorkspace`. It decodes into its

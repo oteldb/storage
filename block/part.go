@@ -64,7 +64,6 @@ type PartWriter struct {
 	columns  []Column
 	rows     int
 	haveRows bool
-	comps    map[compress.Algorithm]*compress.Compressor
 }
 
 // PartOption configures a [PartWriter] or a [StreamWriter].
@@ -119,7 +118,6 @@ func (c *partConfig) layout() columnLayout {
 func NewPartWriter(opts ...PartOption) *PartWriter {
 	return &PartWriter{
 		partConfig: newPartConfig(opts),
-		comps:      make(map[compress.Algorithm]*compress.Compressor),
 	}
 }
 
@@ -150,13 +148,7 @@ func (w *PartWriter) AddColumn(c Column) error {
 }
 
 func (w *PartWriter) compressorFor(alg compress.Algorithm) *compress.Compressor {
-	c, ok := w.comps[alg]
-	if !ok {
-		c = compress.NewCompressor(alg, w.level)
-		w.comps[alg] = c
-	}
-
-	return c
+	return compress.Shared(alg, w.level)
 }
 
 // builtPart is the in-memory serialized form of a part: one object per column (nil for

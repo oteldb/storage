@@ -79,6 +79,29 @@ func NewCompressor(alg Algorithm, level Level) *Compressor {
 	return c
 }
 
+// shared holds one [Compressor] per algorithm and level for the whole process.
+var shared sync.Map // compressorKey → *Compressor
+
+type compressorKey struct {
+	alg   Algorithm
+	level Level
+}
+
+// Shared returns the process-wide [Compressor] for alg and level, so every writer in the process
+// borrows its encoders from one pool. A zstd encoder holds its window and hash tables — tens of MiB at
+// the best level — for as long as its pool keeps it, so a pool per writer costs that once per writer
+// open at the same time.
+func Shared(alg Algorithm, level Level) *Compressor {
+	key := compressorKey{alg: alg, level: level}
+	if c, ok := shared.Load(key); ok {
+		return c.(*Compressor)
+	}
+
+	c, _ := shared.LoadOrStore(key, NewCompressor(alg, level))
+
+	return c.(*Compressor)
+}
+
 // Algorithm returns the compressor's algorithm.
 func (c *Compressor) Algorithm() Algorithm { return c.alg }
 
