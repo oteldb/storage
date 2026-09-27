@@ -351,8 +351,6 @@ func (w *recordPartStreamWriter) finishBytes() int64 {
 // in the body, in the symbol table and in the object assembled from both, and a table entry and a
 // reference per symbol.
 func (w *recordPartStreamWriter) identityBound(id signal.SeriesID) int64 {
-	const symbolBytes = 96
-
 	e := w.e
 
 	e.mu.RLock()
@@ -363,10 +361,18 @@ func (w *recordPartStreamWriter) identityBound(id signal.SeriesID) int64 {
 		return 0
 	}
 
-	w.idScratch = s.AppendHashInput(w.idScratch[:0])
+	return identityBytes(s, &w.idScratch)
+}
+
+// identityBytes bounds what one stream adds to an identity object as it is encoded, measuring its
+// wire form in scratch.
+func identityBytes(s signal.Series, scratch *[]byte) int64 {
+	const symbolBytes = 96
+
+	*scratch = s.AppendHashInput((*scratch)[:0])
 	symbols := 4 + 2*(len(s.Resource.Attributes)+len(s.Scope.Attributes)+len(s.Attributes))
 
-	return 3*int64(len(w.idScratch)) + int64(symbols)*symbolBytes
+	return 3*int64(len(*scratch)) + int64(symbols)*symbolBytes
 }
 
 // abort releases the part's in-flight column objects; a no-op once the part is written.

@@ -410,7 +410,7 @@ func (e *Engine) compactStreamed(
 		return nil, err
 	}
 
-	sources, writerLimit, appendReserve, err := e.openGranted(ctx, src, grant, coders, runBytes)
+	sources, writerLimit, appendReserve, err := e.openGranted(ctx, src, grant, coders, runBytes, e.writerFinishAtCap(src, capBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -511,14 +511,14 @@ var mergeResidentObserver func(peak, run, limit, grant int64)
 // — drops the sources, hands the grant back and queues for the whole, so it holds nothing it was not
 // granted while it waits. One that may not wait is declined.
 func (e *Engine) openGranted(
-	ctx context.Context, src []*part, grant *mergeGrant, coders *mergeCoders, runBytes int64,
+	ctx context.Context, src []*part, grant *mergeGrant, coders *mergeCoders, runBytes, finish int64,
 ) (sources []mergeSource, limit, reserve int64, err error) {
 	for {
 		if sources, err = e.openMergeSources(ctx, src); err != nil {
 			return nil, 0, 0, err
 		}
 
-		limit, reserve, need := mergeWriterBudget(e.cfg.Schema, grant.bytes, sources, coders, runBytes)
+		limit, reserve, need := mergeWriterBudget(e.cfg.Schema, grant.bytes, sources, coders, runBytes, finish)
 		if grant.bytes == 0 || need <= grant.bytes {
 			return sources, limit, reserve, nil
 		}
@@ -528,7 +528,7 @@ func (e *Engine) openGranted(
 		case err != nil:
 			return nil, 0, 0, err
 		case topped:
-			limit, reserve, _ = mergeWriterBudget(e.cfg.Schema, grant.bytes, sources, coders, runBytes)
+			limit, reserve, _ = mergeWriterBudget(e.cfg.Schema, grant.bytes, sources, coders, runBytes, finish)
 
 			return sources, limit, reserve, nil
 		case !grant.wait:

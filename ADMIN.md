@@ -507,8 +507,9 @@ difference taken is deferred like any other. A request above the whole budget is
 waiting merge queues for the whole pool and runs alone once it drains, a background one takes it only
 when it is all free (at the start of a cycle, where deferred engines go first), and either counts what
 it holds past the budget in `merge.over_budget_bytes`. The need can be several shares: a flushed log part whose body column was
-written unframed is read whole, and a merge of four such parts (154 MiB decoded) reserves 194.2 MiB,
-of which it holds 151 MiB, whatever a smaller share says.
+written unframed is read whole, and a merge of four such parts (154 MiB decoded) reserves 329.9 MiB,
+of which it holds 159 MiB, whatever a smaller share says. The reservation leaves the writers room
+for one part at the cap and its finish, so a merge seals parts at the cap, not below it.
 
 `Admin.Compact`, `Admin.CompactNow` and `Admin.Retention` **wait** for the budget instead of
 deferring, so an operator command never silently does nothing. `Admin.MaintainNow` runs the

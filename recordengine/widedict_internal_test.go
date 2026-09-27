@@ -12,6 +12,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -104,4 +105,43 @@ func TestSourceBoundCoversOpened(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestWriterFinishAtCapCoversAWholePart: the floor's estimate of a finish at the cap is at least what
+// a writer holding a whole part charges for its finish, so the floor never sheds a writer for its own
+// finish before its part is full.
+func TestWriterFinishAtCapCoversAWholePart(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	e := wideDictEngine(t, backend.Memory(), Config{MergeMemoryBytes: -1}, 6, 4, 32<<10, 1)
+	src := e.parts
+
+	sources, err := e.openMergeSources(ctx, src)
+	require.NoError(t, err)
+
+	w, err := newRecordPartStreamWriter(ctx, e, src, nil)
+	require.NoError(t, err)
+
+	var (
+		keys mergestream.Keys
+		heap runHeap
+	)
+
+	mergeKeys(src, &keys)
+
+	for keys.Next() {
+		id := keys.Key()
+		require.NoError(t, heap.reset(sources, id, minInt64))
+
+		for heap.len() > 0 {
+			require.NoError(t, heap.fill(w, idToU128(id), maxInt64, 0))
+		}
+	}
+
+	estimate := e.writerFinishAtCap(src, 0)
+	t.Logf("finish charged %.1f MiB, estimated at the cap %.1f MiB", float64(w.finishBytes())/(1<<20), float64(estimate)/(1<<20))
+	assert.GreaterOrEqual(t, estimate, w.finishBytes())
+
+	w.abort()
 }

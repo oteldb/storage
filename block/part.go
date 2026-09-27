@@ -136,6 +136,10 @@ func NewFrameCompressor(alg compress.Algorithm, level compress.Level) *compress.
 // the history of the default 8 MiB window.
 const frameCompressorInput = 1 << 20
 
+// DefaultSharedDictBytes is the cap [WithSharedDictBytes] defaults to. The cap charges each entry
+// its bytes and more, so a dictionary's raw bytes never exceed it.
+const DefaultSharedDictBytes = defaultSharedDictBytes
+
 // WithSharedDictBytes caps the resident size of a bytes column's shared dictionary: its entries'
 // bytes plus a fixed per-entry overhead (default 32 MiB). A granule whose new values would pass the
 // cap self-encodes instead of joining. n is clamped to [0, 64 MiB], the format's ceiling.

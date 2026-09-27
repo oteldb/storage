@@ -52,10 +52,10 @@ func (e *Engine) mergePartBytes(capBytes int64) int64 {
 // mergeWriterBudget splits a merge's grant. What the sources hold from the moment they open
 // (read-ahead windows, frame buffers, dictionaries or whole decodes) and the encoders' workspace come
 // off the top; the writers get the rest, of which the router keeps room for one append
-// ([appendReserve]). need is what the grant must be for the writers to get at least two appends; a
-// grant of 0 bounds nothing.
+// ([appendReserve]). need is what the grant must be for the writers to get their floor: two appends
+// and finish, one writer's finish at the cap. A grant of 0 bounds nothing.
 func mergeWriterBudget(
-	schema *Schema, grant int64, sources []mergeSource, coders *mergeCoders, runBytes int64,
+	schema *Schema, grant int64, sources []mergeSource, coders *mergeCoders, runBytes, finish int64,
 ) (limit, reserve, need int64) {
 	held := coders.workspace()
 	entries := 0
@@ -66,7 +66,7 @@ func mergeWriterBudget(
 	}
 
 	reserve = appendReserve(schema, entries, runBytes)
-	need = held + 2*reserve
+	need = held + 2*reserve + finish
 
 	if grant <= 0 {
 		return 0, reserve, need

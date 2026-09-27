@@ -6,6 +6,8 @@ import (
 	"math"
 	"unsafe"
 
+	"github.com/oteldb/storage/index/series"
+
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/compress"
@@ -212,7 +214,8 @@ func writerFinishBase(schema *Schema) int64 {
 
 // mergeNeed is what a merge of src must be able to hold before anything opens: the sources as their
 // manifests bound them, and on top the larger of what opening one column holds — the sources open
-// one column at a time, before any writer — and the encoders with the writers' floor of two appends.
+// one column at a time, before any writer — and the encoders with the writers' floor: two appends and
+// one writer's finish at the cap ([Engine.writerFinishAtCap]).
 // ok is false when a source's manifest cannot say.
 func (e *Engine) mergeNeed(ctx context.Context, src []*part, capBytes int64) (int64, bool) {
 	var (
@@ -236,7 +239,7 @@ func (e *Engine) mergeNeed(ctx context.Context, src []*part, capBytes int64) (in
 		return 0, false
 	}
 
-	writers := coders.workspace() +
+	writers := coders.workspace() + e.writerFinishAtCap(src, capBytes) +
 		2*appendReserve(e.cfg.Schema, entries, e.mergePartBytes(capBytes)/mergeRunFraction)
 
 	return steady + max(open, writers), true
@@ -326,6 +329,87 @@ func (p *part) residentBytes() int64 {
 
 	for _, k := range p.recordKeys {
 		n += int64(len(k)) + viewBytes
+	}
+
+	return n
+}
+
+// writerFinishAtCap estimates what one writer charges for its finish
+// ([recordPartStreamWriter.finishBytes]) once it holds a part at the cap, so the writers' floor lets a
+// part reach it: the cap's share of the sources' rows as stream ids, every source stream's range,
+// watermark and identity, each byte column's dictionary serialized and compressed at the least of its
+// sources' dictionaries and streams, the cap and the dictionary cap, and the sources' blooms and
+// record keys built, encoded and read back. With no cap, or a side store, a part is the whole merge.
+func (e *Engine) writerFinishAtCap(src []*part, capBytes int64) int64 {
+	const (
+		idBytes    = 16
+		runBytes   = 24
+		wmarkBytes = 24
+	)
+
+	var rows, decoded, streams, sidecars int64
+
+	for _, p := range src {
+		rows += int64(p.reader.RowCount())
+		decoded += p.sizeBytes()
+		streams += int64(len(p.ranges))
+
+		for _, f := range p.blooms {
+			sidecars += 3 * f.SizeBytes()
+		}
+
+		for _, k := range p.recordKeys {
+			sidecars += 3 * (int64(len(k)) + viewBytes)
+		}
+	}
+
+	part := decoded
+	if c := e.mergePartBytes(capBytes); c > 0 {
+		part = min(part, c)
+	}
+
+	n := sidecars + writerFinishBase(e.cfg.Schema)
+	if decoded > 0 {
+		n += int64(idBytes * float64(rows) * float64(part) / float64(decoded))
+	}
+
+	n += streams * (runBytes + int64(unsafe.Sizeof(streamRange{})) + wmarkBytes + int64(unsafe.Sizeof(series.Entry{})))
+	n += e.identitiesBound(src)
+
+	for k := range e.cfg.Schema.numBytes() {
+		var dict int64
+
+		for _, p := range src {
+			if desc, ok := p.reader.ColumnDescByName(p.schema.byteColumn(k).Name); ok {
+				dict += desc.DictRaw + desc.Sizing.StreamRaw
+			}
+		}
+
+		// The dictionary serialized, and the region buffer it compresses into at worst.
+		dict = min(dict, part, block.DefaultSharedDictBytes)
+		n += 2*dict + dict/255 + 128
+	}
+
+	return n
+}
+
+// identitiesBound bounds the identity objects of the sources' streams as a finish encodes them
+// ([recordPartStreamWriter.identityBound]).
+func (e *Engine) identitiesBound(src []*part) int64 {
+	var (
+		n       int64
+		scratch []byte
+	)
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	for _, p := range src {
+		for _, r := range p.ranges {
+			if s, ok := e.head.series.Get(r.id); ok {
+				n += identityBytes(s, &scratch)
+			}
+		}
 	}
 
 	return n
