@@ -278,6 +278,15 @@ func TestMetricMergeOptionsDownsampleNesting(t *testing.T) {
 		return resolveTiers(t, tiers)
 	}
 
+	t.Run("MixedAggRejected", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Empty(t, resolveTiers(t, []tenant.DownsampleTier{
+			{After: time.Hour, Interval: time.Minute, Agg: signal.AggSum},
+			{After: 2 * time.Hour, Interval: time.Hour, Agg: signal.AggMax},
+		}))
+	})
+
 	t.Run("Rejected", func(t *testing.T) {
 		t.Parallel()
 

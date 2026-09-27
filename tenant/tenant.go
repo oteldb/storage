@@ -126,6 +126,21 @@ func (r Retention) AgeFor(sig signal.Signal) time.Duration {
 // Q rather than on every maintenance cycle. The cost is lag: a sample is rolled up between
 // After and After + Q past its timestamp, plus up to one maintenance interval.
 //
+// Every enabled tier must use the same Agg, so a coarser tier re-aggregates the finer tier's
+// representatives exactly. Last, First, Min and Max keep the chosen sample, at its own
+// timestamp. Sum keeps the bucket total at the bucket start. Avg keeps the bucket mean at
+// the bucket start, weighted by the bucket's population through the sample's scale factor
+// (fetch.Batch.ScaleFactors), so a coarser mean is the exact mean of the raw samples. Count
+// is not yet exact once a merge rolls its representatives again. A different Agg per tier
+// would aggregate the finer tier's results instead of the raw samples (a 1m Sum then a 1h
+// Max is the max of per-minute sums), so such a policy is rejected.
+//
+// A sample written late into a bucket that is already rolled up combines with the bucket's
+// representative as new data. It cannot replace a raw sample that is already rolled up,
+// because that value is gone: a late write reusing its timestamp is combined with the
+// aggregate, or replaces it on the representative's own timestamp. Set After beyond the
+// ingest lateness the tenant must tolerate.
+//
 // A policy that fails [Downsample.Validate] is rejected whole: the tenant is not downsampled
 // at all, and the storage logs a warning once.
 type DownsampleTier struct {
@@ -134,7 +149,8 @@ type DownsampleTier struct {
 	After time.Duration
 	// Interval is the rollup bucket width. Zero ⇒ the tier is disabled.
 	Interval time.Duration
-	// Agg combines the samples in a bucket. The zero value is [signal.AggLast].
+	// Agg combines the samples in a bucket. The zero value is [signal.AggLast]. Every
+	// enabled tier of a policy must use the same Agg.
 	Agg signal.Aggregation
 }
 
@@ -147,14 +163,25 @@ type Downsample struct {
 	Tiers []DownsampleTier
 }
 
-// Validate reports whether the enabled tiers' Intervals nest (see [DownsampleTier]).
+// Validate reports whether the enabled tiers' Intervals nest and share one Agg (see
+// [DownsampleTier]).
 func (d Downsample) Validate() error {
-	var intervals []time.Duration
+	var (
+		intervals []time.Duration
+		agg       signal.Aggregation
+	)
 
 	for _, t := range d.Tiers {
-		if t.Interval > 0 {
-			intervals = append(intervals, t.Interval)
+		if t.Interval <= 0 {
+			continue
 		}
+
+		if len(intervals) > 0 && t.Agg != agg {
+			return errors.Errorf("downsample tiers mix aggregations %s and %s", agg, t.Agg)
+		}
+
+		agg = t.Agg
+		intervals = append(intervals, t.Interval)
 	}
 
 	slices.Sort(intervals)
