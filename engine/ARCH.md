@@ -353,7 +353,7 @@ and widening the trigger is how a repair path turns into a data-destruction path
 
 **Corruption that persists is a want.** After `corruptLoadsBeforeWant` (3) consecutive loads that
 each found a part corrupt, the next load records it as a want exactly as a gone part, and the
-fence lifts. Three is the bar repair sets for absence (`holeConfirmations`): a manifest is written
+fence lifts. Three is the bar repair sets for absence (`repair.HoleConfirmations`): a manifest is written
 once, whole, as the part's commit point, so damage repeating over three maintenance cycles is the
 object, not the read. The runs are per part and in memory (`corruptLoads`): a load failing for any
 other reason clears them all, a part the failing load did not find corrupt starts over, and a
@@ -768,21 +768,71 @@ shard that cannot be repaired must still compact.
 
 Satisfaction follows `Index.Satisfying` — the exact part, **or the largest live part whose block
 set contains the want's at a higher level**, or, when no single part does, **a split group whose
-members are all present and whose joint claim covers it**. A group is answered one member at a time,
-so repair runs a second fetch round in the same cycle: the first round's answer names the group, and
-`Index.Missing` names the members still to fetch, by block rather than by prefix (no prefix is known
-for them). The whole group therefore lands in **one commit**, which matters — a fragment committed
-beside the ancestors it partly duplicates, with nothing yet able to retire them, would have those
-rows read twice. A round that cannot complete a group inside the per-cycle fetch budget commits none
-of it (`dropIncompleteGroups`) and the next cycle asks again. Completing a group retires the parts
-its claim covers, through `bucketindex.Subsumed`, the same swap a merge publishes.
+members are all present and whose joint claim covers it**. A peer answers a group one member at a
+time, so a want (or hole) answered by a member becomes a **unit**: the answer plus every member of
+every split group the unit's parts belong to that neither the local index nor the unit already
+holds. Those members are asked for by block rather than by prefix (no prefix is known for them), in
+further fetch rounds of the same pass — one `PartFetcher` call per round for every unit — until no
+unit lacks a member it has not asked for. A member that was itself split again pulls in its own
+group the same way, one round later. The pass, commit included, is shared by both engines (`internal/repair`,
+`repair.Drive`); each engine supplies only a `repair.Host` adapter over its private part set, locks
+and index commit.
 
-A group with a member no peer can supply therefore **stays outstanding rather than becoming a hole**:
-each cycle answers the want with a member it already has, which resets the absence evidence, so the
-two gates a hole needs are never both cleared. That is the safe direction — an outstanding want is
-visible and recoverable, a hole over live data is neither — but it is a stuck state, and the signal
-for it is `RepairStats.Fetched` climbing while the wanted count does not fall.
-These targets are **never wants**: nothing about them reaches the index, so the obligation stays the
+**A unit is committed whole or not at all** (`repair.Admit`), where "whole" means two things.
+First, the unit must answer its want, so a want the peer answered only jointly needs its whole group.
+Second, every group whose claimed ancestry overlaps what this node already holds must be complete. A
+fragment committed beside the ancestors it partly duplicates, with nothing yet able to retire them,
+has those rows read twice. On the record engine, where rows do not collapse by timestamp, it is worse
+than a read: the next merge folds the lone fragment into a local part, the want stays outstanding,
+and the next pass commits the same fragment again — one duplicate per cycle. Completing the group is
+what retires those ancestors, through `bucketindex.Subsumed`, the same swap a merge publishes.
+
+A member of a group whose ancestry this node no longer holds is different: its rows are rows the
+node lacks, so it is committed on its own, whatever became of its siblings. Requiring the group there
+would buy nothing and cost a part that exists — a lost sibling would hold it back for ever and, as
+evidence, turn it into a hole. A unit still short of what it needs after its rounds, or one whose part
+will not open at commit, contributes nothing and the next pass starts it over. Within one commit a
+part another published or live part supersedes is left out: a peer that merged between two rounds can
+answer one unit with a member and with the successor containing it.
+
+**The per-cycle cap counts units, not parts.** `repair.FetchesPerCycle` (4) bounds the wants and
+holes one pass asks peers for; the members their answers need do not count against it. Counting them
+would make any group wider than the cap plus one unrepairable, since every pass would fetch the same
+first members and drop them, and wide groups are the straddler merge's normal output: it splits per
+day, so a batch of ~14-day straddlers is a ~14-fragment group. A pass therefore copies at most four
+units, and a unit at most one merge's output per level of nesting: a group is what one merge wrote,
+its inputs capped by the merge's byte cap and `maxMergeParts`. Its fragment count is the merge's day
+span, plus any writer the router sealed early for size or residency — the router holds at most
+`timebucket.MaxOpenWriters` (32) days open at once, which bounds memory, not fragments. The rounds
+terminate because a unit asks for each block at most once per pass, and one answer serves every unit
+needing that block.
+
+**A member no owner holds ends in a hole — only for the want it answers.** Evidence is per
+target. A unit whose own answer satisfies its want — the exact part, a containing successor, or a
+part held on this disk — concludes nothing from a missing member: it is a failure, the run reset, and
+the want stays outstanding rather than becoming a hole over data that exists. A unit that needed the
+group to answer its want gives the want the members' outcome instead: `WantAbsent` only when every
+member it could not get came back absent, `WantIncomplete` when any came back incomplete, and a
+failure when any fetch failed. A group completable nowhere therefore earns that want its hole over
+`repair.HoleConfirmations` passes like any absent part, instead of an endless run of passes in which
+the answering member comes back "satisfied" and resets the evidence. When no owner can realize the
+group at all, the peers answer the want itself `WantAbsent` and the member rounds never start. A
+member want names blocks, not a prefix, so the fetcher answers it from peer indexes only; a member on
+a peer's disk but in no index is absent to it, which is why that absence only ever counts against a
+want nothing else answers.
+
+**The cap takes the least recently tried first** (`repair.State`), so wants that make no progress
+cannot hold the four slots against the rest: with n outstanding, each is sent to peers at least once
+every ⌈n/4⌉ passes. The order lives in memory and a restart starts over in prefix order; nothing
+depends on it but fairness. One want can stay outstanding for good with its data present on a peer:
+a member whose group must be complete, because this node still holds ancestry the group shares,
+while a sibling is already a hole. Committing the member would duplicate the rows it shares with
+that ancestor, and retiring the ancestor needs the whole group. Counting the hole as the missing
+member would retire the ancestor anyway, and the rows the lost sibling held exist here only in that
+ancestor, so a duplicate would become a loss. The want therefore stays visible in `WantedParts`,
+fails each pass without earning evidence, and only needs diverged histories to arise.
+
+Member targets are **never wants**: nothing about them reaches the index, so the obligation stays the
 original want's and `Entries → Removed | Wanted` is untouched. That is what makes repair terminate: by the time
 a want is serviced the data may exist only inside a merged successor, and chasing a prefix that no
 longer exists anywhere would never converge. The local index is asked first, so a want this
@@ -814,8 +864,8 @@ evidence that data is gone.
 The seam's types are `backend/bucketindex`'s, aliased here and in `recordengine`, so the facade
 hands both engines the same fetcher.
 
-The seam takes the **whole cycle's wants in one call**, capped at `repairFetchesPerCycle`, and gets
-one result per want back. The cluster-side cost is per cycle, not per want — one read of each peer's
+The seam takes the **whole cycle's wants in one call**, capped at `repair.FetchesPerCycle`, and gets
+one result per want back; each member round above is one more call of the same shape. The cluster-side cost is per cycle, not per want — one read of each peer's
 bucket index answers every want, and one copy of a merged successor discharges every want inside it
 — so splitting the cycle into per-want calls would multiply both by the want count. Fetch
 concurrency therefore belongs to the implementation, not to the engine.
@@ -823,8 +873,8 @@ concurrency therefore belongs to the implementation, not to the engine.
 Publishing a repaired part is the same swap a merge publishes — it is committed into `Entries`, and
 the commit's want trim discharges every want it satisfies. A fetched **successor** also retires the
 local parts it supersedes, because their rows are inside it and keeping both would count them
-twice. A part whose objects arrived but will not open is rolled back to a failure, so the want
-stays.
+twice. A part whose objects arrived but will not open is rolled back to a failure together with the
+rest of its unit, so the want stays.
 
 **No count trims an outstanding want.** `bucketindex.MaxWants` (4096) is the horizon past which a
 node owes more than part-by-part repair can converge on; the commit logs past it and keeps every
@@ -843,13 +893,14 @@ served short with nothing to say so. Refusing the commit instead would keep the 
 (the entries stay) but wedge the node — flush, merge and the repair commit that discharges wants all
 go through the same commit — for the same index bytes, since a want costs what its entry did.
 
-One cycle attempts at most `repairFetchesPerCycle` (4) wants with `repairFetchConcurrency` (2)
-copies in flight. A repair fetch copies a whole part, so an unbounded pass on a badly damaged node
+One cycle attempts at most `repair.FetchesPerCycle` (4) wants and holes, plus the members that
+complete their groups, with the fetcher bounding the copies in flight (`cluster/partsync` runs 2). A
+repair fetch copies a whole part, so an unbounded pass on a badly damaged node
 would spend the maintenance cycle in the network and never compact; a shard needing more than a
 handful of parts back is past what part-by-part repair is for. The *serving* side, where the real
 budget belongs (see `cluster/ARCH.md`), is uncapped.
 
-A pass is single-flight, gated by `repairGate` — its own gate, not `flushMu`. `MergeWith` is
+A pass is single-flight, gated by `repair.State` — its own gate, not `flushMu`. `MergeWith` is
 callable concurrently (an operator's `Admin.MaintainNow` alongside the maintenance loop), and two
 passes snapshotting the same wants copy the same part from a peer twice into one object prefix.
 Only one of them commits — the winner's parts already carry the prefix — so the index stays right,
@@ -882,7 +933,7 @@ hole over data that was never lost is neither.
    part says nothing about the third that holds it. The cluster layer decides this against the
    *configured* replication factor, not against whatever the ring currently returns, so a cluster
    permanently short of nodes never acknowledges a loss (`cluster/ARCH.md`).
-2. **The conclusion must repeat over `holeConfirmations` (3) consecutive attempts.** One pass is a
+2. **The conclusion must repeat over `repair.HoleConfirmations` (3) consecutive attempts.** One pass is a
    snapshot: a peer that is up, in the ring and has not finished loading its bucket index answers
    "no such part" truthfully and prematurely. Any other outcome — a fetch, an error, an incomplete
    owner set — resets the count. The evidence lives only in memory, so a restart forgets it and
@@ -904,7 +955,7 @@ With no peer to fetch from, a single-node want can never be satisfied, and witho
 ends: every read reaching into it fails for the life of the shard (the read policy,
 `cluster/ARCH.md`). So the store acknowledges the loss itself. The facade hands the engine a
 `PartFetcher` (`soleOwnerRepairer`) that copies nothing and answers for an owner set of one. Both
-gates above stand unchanged — `WantAbsent` only, over `holeConfirmations` consecutive passes, each
+gates above stand unchanged — `WantAbsent` only, over `repair.HoleConfirmations` consecutive passes, each
 re-probing the backend — and so does the rule a want is minted by: absence is the backend saying the
 part's manifest does not exist. Any other error is a failed attempt, and a manifest that is present
 but will not open is a failure too, never absence.

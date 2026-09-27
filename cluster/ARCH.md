@@ -529,7 +529,11 @@ per prefix so a notify can never install an older index over a newer one.
 index, runs `Index.Satisfying` over each, and copies the objects of the best answer per want —
 widest block set, then deepest level, so one fetch recovers the most data. A want naming blocks
 rather than a prefix — one member of a split group the asking engine still needs — is answered from
-the peers' indexes only: the empty prefix matches no listing, so the disk fallback below skips it. It installs no
+the peers' indexes only: the empty prefix matches no listing, so the disk fallback below skips it.
+The engine sends every member a group needs in one further call, whatever the group's width, and
+commits the group whole or not at all when it must; a member answered `WantAbsent` is absence
+evidence only against a want the group answered jointly — a disk-only member is absent here, and
+must not turn a satisfied want into a hole (`engine/ARCH.md`, "Repair"). It installs no
 index: committing the entries is the owner's own commit, which is what discharges the wants.
 
 **The batch is the unit because the cost is per cycle, not per want.** Each peer's index is read

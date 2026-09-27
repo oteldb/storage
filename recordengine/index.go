@@ -13,6 +13,7 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/internal/obs"
+	"github.com/oteldb/storage/internal/repair"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -483,8 +484,8 @@ type indexLoad struct {
 // corruptLoadsBeforeWant is how many consecutive loads must find a part corrupt before the next one
 // records it as a repair want: a manifest is written once, whole, as the part's commit point, so
 // corruption that repeats over three loads (three maintenance cycles) is the object, not the read,
-// the same bar repair sets before concluding a part is gone ([holeConfirmations]).
-const corruptLoadsBeforeWant = holeConfirmations
+// the same bar repair sets before concluding a part is gone ([repair.HoleConfirmations]).
+const corruptLoadsBeforeWant = repair.HoleConfirmations
 
 // readIndexLocked loads the bucket index and opens the parts it names, writing nothing on the
 // engine. A load that failed on corrupt parts also returns every part it found corrupt. Caller holds

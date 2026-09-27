@@ -41,8 +41,9 @@ type RepairStats struct {
 	// Incomplete is the attempts that found nothing, but asked only a strict subset of the shard's
 	// expected owners, so no evidence of loss accrues.
 	Incomplete int64
-	// Failed is the attempts that ended in a transient failure; the want is retried on the next
-	// merge.
+	// Failed is the attempts that ended in a transient failure, and the parts that arrived but were
+	// left out of the commit, such as every member of a split group the pass could not complete; the
+	// want is retried on the next merge.
 	Failed int64
 	// Lost is the wants converted into a hole because no owner could supply the part: this node's
 	// view of [Index.LostParts].
