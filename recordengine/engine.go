@@ -168,6 +168,8 @@ type Engine struct {
 	// mergeReadWindow is how much of each source column a merge reads ahead per request
 	// ([block.PartReader.ColumnScan]).
 	mergeReadWindow int64
+	// mergeGranule is the granule a merge writes its output at ([mergeGranuleRows]).
+	mergeGranule int
 	// retiring holds parts removed from the live set by flush/merge, pending backend deletion once
 	// their in-flight fetch readers drain (deferred reclamation; see reclaim.go).
 	retiring []*part
@@ -311,7 +313,7 @@ func New(cfg Config) *Engine {
 		cfg.Signal = "record"
 	}
 
-	e := &Engine{cfg: cfg, head: newHead(cfg.Schema), mergeReadWindow: defaultMergeReadWindow}
+	e := &Engine{cfg: cfg, head: newHead(cfg.Schema), mergeReadWindow: defaultMergeReadWindow, mergeGranule: mergeGranuleRows}
 	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
 	e.recycle = func(b *fetch.Batch) {
 		if c, ok := b.ReleaseState().(*recordCols); ok {

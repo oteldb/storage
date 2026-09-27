@@ -54,11 +54,6 @@ func (f *flushColumns) reset(schema *Schema, rows int, blob []int) {
 	f.cols.prepare(schema, rows, fullSel(schema))
 
 	for k := range f.cols.bytes {
-		// A split column has no blob; prepare already armed its id array. See [splitCol].
-		if f.cols.splitAt(k) != nil {
-			continue
-		}
-
 		f.cols.bytes[k].ensureBytes(rows, blob[k])
 	}
 }
@@ -103,9 +98,7 @@ func byteRanges(f *flushColumns, capBytes int64) [][2]int {
 	return append(out, [2]int{lo, n})
 }
 
-// slice returns a read-only view of rows [lo, hi) of f, sharing every backing array (no copy). Only
-// the flush splits its buffer this way — a merge seals whole output parts at a stream boundary — so
-// it has no split (dictionary + ids) form to carry: see [recordCols.splitBytes]. The
+// slice returns a read-only view of rows [lo, hi) of f, sharing every backing array (no copy). The
 // byte columns keep the whole blob and reslice their offset index instead of rebasing it — cell i of
 // the view is data[offsets[i]:offsets[i+1]] either way, so an offset index that does not start at 0
 // is a valid column everywhere it is read or encoded (see [byteCol]).
@@ -272,9 +265,9 @@ func flushShape(schema *Schema, records map[signal.SeriesID]*recordCols, ids []s
 // kept cheap), while the cold merge passes ZSTD to entropy-code the long-lived compacted data.
 func writePart(
 	ctx context.Context, b backend.Backend, schema *Schema, prefix string, f *flushColumns,
-	idents identitySet, comp compress.Algorithm, level compress.Level, bb *bloomBuilder,
+	idents identitySet, comp compress.Algorithm, level compress.Level, bb *bloomBuilder, extra ...block.PartOption,
 ) error {
-	opts := []block.PartOption{block.WithSortKey(colTs), block.WithSizingStats()}
+	opts := append([]block.PartOption{block.WithSortKey(colTs), block.WithSizingStats()}, extra...)
 	if comp != compress.AlgorithmNone {
 		opts = append(opts, block.WithCompression(comp), block.WithCompressionLevel(level))
 	}
@@ -304,20 +297,14 @@ func writePart(
 	}
 
 	for k := range schema.byteCols {
-		// Pass-through in whichever form the buffer holds: blob+offsets from the head, or the merge's
-		// union dictionary + ids. [block.Column] encodes both to byte-identical objects, so a part
-		// write materializes no per-row [][]byte view and the merge re-hashes no row.
+		// Passed through as blob+offsets, so a part write materializes no per-row [][]byte view.
 		col := schema.byteColumn(k)
-		bcol := block.Column{Name: col.Name, Kind: block.KindBytes, Codec: col.Codec, Block: true}
+		bc := &f.cols.bytes[k]
 
-		if sc := f.cols.splitAt(k); sc != nil {
-			bcol.BytesDict, bcol.BytesIDs = sc.dict.entries, sc.ids
-		} else {
-			bc := &f.cols.bytes[k]
-			bcol.BytesBlob, bcol.BytesOffsets = bc.data, bc.offsets
-		}
-
-		if err := w.AddColumn(bcol); err != nil {
+		if err := w.AddColumn(block.Column{
+			Name: col.Name, Kind: block.KindBytes, Codec: col.Codec, Block: true,
+			BytesBlob: bc.data, BytesOffsets: bc.offsets,
+		}); err != nil {
 			return err
 		}
 	}

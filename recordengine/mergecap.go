@@ -9,14 +9,12 @@ import (
 	"github.com/oteldb/storage/internal/mergestream"
 )
 
-// mergeCapBytes returns the decoded size at which a merged part is sealed, and with it the bound on
-// what one merge may hold: the tiering target (mergeHeight × MaxPartBytes), lowered to the memory
-// this merge may claim.
+// mergeCapBytes returns the decoded size at which a merged part is sealed: the tiering target
+// (mergeHeight × MaxPartBytes), lowered by the memory share this merge may claim.
 //
-// Unlike the metric engine's cap this is denominated in *decoded* bytes, because that is what the
-// record merge holds — the output accumulates as decoded columns before it is encoded. Free space
-// therefore does not enter into it: the disk is bounded by the flush cap and the tiering target,
-// memory by this.
+// Unlike the metric engine's cap this is denominated in *decoded* bytes, the unit tiering compares
+// parts in ([part.sizeBytes]). Free space does not enter into it: the disk is bounded by the flush cap
+// and the tiering target.
 //
 // 0 (never seal, one merge takes maxTierParts) when MaxPartBytes is unlimited, the legacy behavior.
 func (e *Engine) mergeCapBytes() int64 {
@@ -33,9 +31,9 @@ func (e *Engine) mergeCapBytes() int64 {
 	return max(min(target, share), e.cfg.MaxPartBytes)
 }
 
-// mergeBudget is what a merge seals an output part on. The record merge holds its output decoded
-// until it is sealed, so its cap is the resident unit and nothing bounds the part on disk; a side
-// store (profiles) anchors the unioned symbol sidecar to one part, so it disables sealing entirely.
+// mergeBudget is what a merge seals an output part on: its cap, in the decoded rows the open writers
+// have taken, and nothing on disk. A side store (profiles) anchors the unioned symbol sidecar to one
+// part, so it disables sealing entirely.
 func (e *Engine) mergeBudget(capBytes int64) mergestream.Budget {
 	if e.cfg.SideStore != nil {
 		return mergestream.Budget{}

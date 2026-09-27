@@ -8,9 +8,9 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// BenchmarkMergeRetentionWindow times what a retention merge spends per source part before any row is
-// written: decoding the part and gathering one stream's rows at or after the retention horizon, which
-// here drops the older half.
+// BenchmarkMergeRetentionWindow times what a retention merge spends on a whole-decoded source part
+// before any row is written: decoding the part and finding one stream's rows at or after the
+// retention horizon, which here drops the older half.
 func BenchmarkMergeRetentionWindow(b *testing.B) {
 	ctx := context.Background()
 	e := New(Config{Schema: headTestSchema, Backend: backend.Memory(), Prefix: "t/w"})
@@ -41,12 +41,6 @@ func BenchmarkMergeRetentionWindow(b *testing.B) {
 	}
 
 	p := e.parts[0]
-	rng, ok := p.lookup(series.Hash())
-	if !ok {
-		b.Fatal("stream not in part")
-	}
-
-	acc := newRecordCols(headTestSchema, 0, fullSel(headTestSchema))
 
 	b.SetBytes(int64(n) * 16)
 	b.ReportAllocs()
@@ -57,7 +51,12 @@ func BenchmarkMergeRetentionWindow(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		acc.prepare(headTestSchema, 0, fullSel(headTestSchema))
-		appendMergeWindow(acc, d, rng, n/2, maxInt64)
+		s := &wholeSource{schema: headTestSchema, ranges: p.ranges, d: d}
+		s.served.init(headTestSchema)
+		s.gather.init(headTestSchema)
+
+		if _, ok, err := s.run(series.Hash(), n/2); err != nil || !ok {
+			b.Fatal("stream not in part", err)
+		}
 	}
 }

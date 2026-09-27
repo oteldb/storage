@@ -1,11 +1,9 @@
 package recordengine
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"hash/crc32"
-	"slices"
 
 	"github.com/go-faster/errors"
 
@@ -37,25 +35,14 @@ func distinctRecordKeys(schema *Schema, cols *recordCols) [][]byte {
 		return nil
 	}
 
-	seen := make(map[string]struct{})
+	keys := make(recordKeySet)
 
-	bc := cols.cellsAt(k)
+	bc := &cols.bytes[k]
 	for i := range bc.rows() {
-		forEachAttrKey(bc.at(i), func(key []byte) { seen[string(key)] = struct{}{} })
+		keys.add(bc.at(i))
 	}
 
-	if len(seen) == 0 {
-		return nil
-	}
-
-	out := make([][]byte, 0, len(seen))
-	for key := range seen {
-		out = append(out, []byte(key))
-	}
-
-	slices.SortFunc(out, bytes.Compare)
-
-	return out
+	return keys.sorted()
 }
 
 // encodeRecordKeys serializes a part's distinct record-attribute keys. Layout:

@@ -82,6 +82,9 @@ type part struct {
 	// the backend objects between. A retired part (removed from the live set by flush/merge) is not
 	// deleted from the backend until its refs reach zero, so a lock-free reader never races a delete.
 	refs atomic.Int32
+	// tsDisorder is set once a merge finds a stream of this part out of timestamp order, so every
+	// later merge decodes it whole instead of reading it forward.
+	tsDisorder atomic.Bool
 
 	// streamMaxMu guards streamMax, the per-stream watermarks of [part.streamWatermarks]. A mutex
 	// rather than a sync.Once so a failed load (a transient backend error) is retried instead of

@@ -15,9 +15,9 @@ import (
 	"github.com/oteldb/storage/recordengine"
 )
 
-// TestStraddlerMergeHoldsResidentShare bounds what one large stream spread over many days makes the
-// day buffers hold together: the merge's resident share, overshot by at most one day's run, not a
-// buffer's worth per day.
+// TestStraddlerMergeHoldsResidentShare bounds the decoded rows one large stream spread over many days
+// makes the open day writers take together before one is sealed: the merge's share, overshot by at
+// most one append, not a part's worth per day.
 //
 //nolint:paralleltest // sets the package-global resident observer
 func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
@@ -53,9 +53,9 @@ func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
 			}
 
 			require.Positive(t, limit)
-			assert.LessOrEqual(t, peak, limit+run, "the day buffers outgrew the resident share")
+			assert.LessOrEqual(t, peak, limit+run, "the day writers outgrew the resident share")
 			assert.Less(t, run, limit, "one day's run must fit the share for the bound to mean anything")
-			assert.Greater(t, peak, limit/2, "the buffers must come near the share for the bound to be tested")
+			assert.Greater(t, peak, limit/2, "the writers must come near the share for the bound to be tested")
 
 			got := 0
 			for _, b := range fetchAll(t, e, req("api")) {
@@ -69,7 +69,7 @@ func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
 
 // TestRetentionRewriteHoldsResidentShare bounds one stream's single day: retention forces every part
 // of its bucket, and each merge takes as many as the cap admits, so the stream's surviving rows of
-// that day are one run about the size of the resident share. The buffers must still peak at the
+// that day are one run about the size of the resident share. The writers must still peak at the
 // share plus a fixed fraction of it, and the backlog must drain.
 //
 //nolint:paralleltest // sets the package-global resident observer

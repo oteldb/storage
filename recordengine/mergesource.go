@@ -3,6 +3,7 @@ package recordengine
 import (
 	"context"
 	"slices"
+	"strconv"
 
 	"github.com/go-faster/errors"
 	"github.com/go-faster/sdk/zctx"
@@ -21,8 +22,23 @@ const defaultMergeReadWindow = 1 << 20
 
 // mergeSource is one source part as a merge reads it, stream by stream in ascending id order.
 type mergeSource interface {
-	// appendStream appends the part's rows of stream id whose timestamps lie in [start, end] to acc.
-	appendStream(acc *recordCols, id signal.SeriesID, start, end int64) error
+	// run returns the part's rows of stream id with a timestamp at or after start, in the order the
+	// merge writes them; ok is false when there are none.
+	run(id signal.SeriesID, start int64) (r mergeRun, ok bool, err error)
+}
+
+// mergeRun is one source's rows of one stream, ordered by timestamp and then by their row in the
+// part — the order of a stable sort by timestamp, which is what makes a k-way merge of runs equal
+// to concatenating them in source order and sorting stably.
+type mergeRun interface {
+	// ahead returns the timestamps from the current row to the end of what the run holds decoded,
+	// at most [mergeGranuleRows]; it is empty once the run is drained.
+	ahead() ([]int64, error)
+	// rowBytes is the decoded size of the i-th row ahead, stream id included.
+	rowBytes(i int) int64
+	// emit appends every column but the timestamp of the next n rows ahead to w, as source si, and
+	// advances past them.
+	emit(w *recordPartStreamWriter, si, n int) error
 }
 
 // mergeReadObserver, when non-nil, receives per source of each merge whether it was read through a
@@ -38,15 +54,11 @@ var mergeSkipStream func(id signal.SeriesID) bool
 var mergeReadWhole = false
 
 // openMergeSources opens a reader over every source part. A part whose streams occupy ascending row
-// ranges is read forward, a granule at a time per column; any other is decoded whole.
-//
-// Byte columns open column by column across the sources, so a column whose sources are all read
-// whole has its union resolved and its lookup index handed back before the next column builds one.
-func (e *Engine) openMergeSources(ctx context.Context, src []*part, carry *mergeCarry) ([]mergeSource, error) {
+// ranges is read forward, a granule at a time per column; any other is decoded whole, as is one an
+// earlier merge found out of timestamp order ([errRunDisorder]).
+func (e *Engine) openMergeSources(ctx context.Context, src []*part) ([]mergeSource, error) {
 	var (
 		out      = make([]mergeSource, len(src))
-		cursors  = make([]*partCursor, len(src))
-		wholes   = make([]*wholeSource, len(src))
 		streamed = make([]bool, len(src))
 	)
 
@@ -55,13 +67,13 @@ func (e *Engine) openMergeSources(ctx context.Context, src []*part, carry *merge
 
 		forward := forwardReadable(p.ranges)
 
-		if forward && !mergeReadWhole {
-			c, err := openPartCursor(ctx, p, e.mergeReadWindow, carry, disorder)
+		if forward && !mergeReadWhole && !p.tsDisorder.Load() {
+			c, err := openPartCursor(ctx, p, e.mergeReadWindow)
 			if err != nil {
 				return nil, errors.Wrapf(err, "open part %q for merge", p.prefix)
 			}
 
-			out[i], cursors[i], streamed[i] = c, c, true
+			out[i], streamed[i] = c, true
 
 			continue
 		}
@@ -79,25 +91,7 @@ func (e *Engine) openMergeSources(ctx context.Context, src []*part, carry *merge
 			disorder("part rows are not timestamp-ordered within a stream; merging it without the windowed search")
 		}
 
-		out[i], wholes[i] = s, s
-	}
-
-	for k := range carry.dicts {
-		name := e.cfg.Schema.byteColumn(k).Name
-
-		for i, p := range src {
-			if c := cursors[i]; c != nil {
-				if err := c.bytes[k].open(ctx, p.reader, name, e.mergeReadWindow, carry); err != nil {
-					return nil, errors.Wrapf(err, "open part %q for merge", p.prefix)
-				}
-
-				continue
-			}
-
-			wholes[i].resolve(k, carry)
-		}
-
-		carry.settle(k)
+		out[i] = s
 	}
 
 	if mergeReadObserver != nil {
@@ -164,52 +158,20 @@ func checkDrained(src []*part, sources []mergeSource) error {
 	return nil
 }
 
-// mergeShape sizes a merge's output buffer from its sources' manifests, without reading a column:
-// their total row count and, per byte column, the bytes its objects hold should it be carried flat.
-// That is the decoded size of a raw column written uncompressed or of a near-unique dictionary
-// column, the usual flat ones, and an undercount the blob grows past otherwise. capBytes (0 ⇒ no
-// seal) scales both down to what one output part holds.
-func mergeShape(schema *Schema, src []*part, capBytes int64) (rows int, blob []int) {
-	blob = make([]int, schema.numBytes())
-
-	var total int64
-
-	for _, p := range src {
-		n := p.reader.RowCount()
-		rows += n
-		total += p.sizeBytes()
-
-		for k := range blob {
-			desc, ok := p.reader.ColumnDescByName(schema.byteColumn(k).Name)
-			switch {
-			case !ok:
-			case desc.Const:
-				blob[k] += n * len(desc.ConstBytes)
-			default:
-				blob[k] += int(desc.Bytes)
-			}
-		}
-	}
-
-	if capBytes <= 0 || total <= capBytes {
-		return rows, blob
-	}
-
-	scale := float64(capBytes) / float64(total)
-	rows = int(float64(rows) * scale)
-
-	for k := range blob {
-		blob[k] = int(float64(blob[k]) * scale)
-	}
-
-	return rows, blob
+// fixedRowBytes is the decoded size of a row's fixed-width cells: the stream id, the timestamp and
+// every int column.
+func fixedRowBytes(schema *Schema) int64 {
+	return streamIDBytes + 8 + 8*int64(schema.numInts())
 }
 
 // wholeSource is a source part decoded whole ([part.readForMerge]), for the part a [partCursor]
 // cannot walk forward.
 type wholeSource struct {
+	schema *Schema
 	ranges []streamRange
 	d      *decodedPart
+	served arrayRun
+	gather gatherRun
 }
 
 func openWholeSource(ctx context.Context, p *part) (*wholeSource, error) {
@@ -224,42 +186,188 @@ func openWholeSource(ctx context.Context, p *part) (*wholeSource, error) {
 		}
 	}
 
-	d.remap = make([][]int32, len(d.bytes))
+	s := &wholeSource{schema: p.schema, ranges: p.ranges, d: d}
+	s.served.init(p.schema)
+	s.gather.init(p.schema)
 
-	return &wholeSource{ranges: p.ranges, d: d}, nil
+	return s, nil
 }
 
-// resolve maps byte column k's dictionary into the merge's union, or falls the column back to the
-// flat carry when the part decoded it without one.
-func (s *wholeSource) resolve(k int, carry *mergeCarry) {
-	u := carry.dicts[k]
-	if u == nil || len(s.d.ts) == 0 {
-		return
-	}
-
-	col := &s.d.bytes[k]
-	if col.dict == nil {
-		carry.flatten(k)
-
-		return
-	}
-
-	s.d.remap[k] = u.remap(nil, col.dict.Entries, true)
-	carry.grew(k)
-}
-
-// appendStream appends every run the part holds of stream id: a part whose stream column arrived
-// unsorted can hold several, which [buildRanges] leaves adjacent.
-func (s *wholeSource) appendStream(acc *recordCols, id signal.SeriesID, start, end int64) error {
-	i, _ := slices.BinarySearchFunc(s.ranges, id, func(sr streamRange, target signal.SeriesID) int {
+// run serves one ts-ordered range straight from the decoded columns. A stream whose rows are out of
+// order, or that the part holds in several runs — which [buildRanges] leaves adjacent — is gathered
+// and sorted instead.
+func (s *wholeSource) run(id signal.SeriesID, start int64) (mergeRun, bool, error) {
+	lo, _ := slices.BinarySearchFunc(s.ranges, id, func(sr streamRange, target signal.SeriesID) int {
 		return sr.id.Compare(target)
 	})
 
-	for ; i < len(s.ranges) && s.ranges[i].id == id; i++ {
-		appendMergeWindow(acc, s.d, s.ranges[i].rowRange, start, end)
+	hi := lo
+	for hi < len(s.ranges) && s.ranges[hi].id == id {
+		hi++
 	}
 
+	switch {
+	case lo == hi:
+		return nil, false, nil
+	case hi-lo == 1 && s.d.tsSorted:
+		w := tsWindow(s.d.ts, s.ranges[lo].rowRange, start, maxInt64)
+		if w.start == w.end {
+			return nil, false, nil
+		}
+
+		s.served.over(s.d, w)
+
+		return &s.served, true, nil
+	}
+
+	g := &s.gather
+	g.reset(s.schema)
+
+	for _, r := range s.ranges[lo:hi] {
+		for row := r.start; row < r.end; row++ {
+			if s.d.ts[row] >= start {
+				g.appendDecoded(s.d, row)
+			}
+		}
+	}
+
+	r := g.sorted()
+
+	return r, r != nil, nil
+}
+
+// arrayRun serves a run out of fully decoded columns: a whole-decoded part's range, or a gathered
+// stream ([gatherRun]).
+type arrayRun struct {
+	fixed int64
+	ts    []int64
+	ints  [][]int64
+	bytes []arrayBytes
+	pos   int
+}
+
+// arrayBytes is one byte column of an [arrayRun]: base is the row of col the run's first row is at.
+type arrayBytes struct {
+	col     *chunk.DictColumn
+	g       block.DecodedGranule
+	entries [][]byte
+	stable  bool
+	base    int
+}
+
+func (r *arrayRun) init(schema *Schema) {
+	r.fixed = fixedRowBytes(schema)
+	r.ints = make([][]int64, schema.numInts())
+	r.bytes = make([]arrayBytes, schema.numBytes())
+}
+
+// over points r at rows w of the decoded part d.
+func (r *arrayRun) over(d *decodedPart, w rowRange) {
+	r.ts, r.pos = d.ts[w.start:w.end], 0
+
+	for k := range r.ints {
+		r.ints[k] = d.ints[k][w.start:w.end]
+	}
+
+	for k := range r.bytes {
+		r.bytes[k] = d.bytes[k]
+		r.bytes[k].base = w.start
+	}
+}
+
+func (r *arrayRun) ahead() ([]int64, error) {
+	return r.ts[r.pos:min(len(r.ts), r.pos+mergeGranuleRows)], nil
+}
+
+func (r *arrayRun) rowBytes(i int) int64 {
+	n := r.fixed
+
+	for k := range r.bytes {
+		b := &r.bytes[k]
+		n += int64(len(b.col.At(b.base + r.pos + i)))
+	}
+
+	return n
+}
+
+func (r *arrayRun) emit(w *recordPartStreamWriter, si, n int) error {
+	lo, hi := r.pos, r.pos+n
+
+	for k := range r.ints {
+		if err := w.appendInts(k, r.ints[k][lo:hi]); err != nil {
+			return err
+		}
+	}
+
+	for k := range r.bytes {
+		b := &r.bytes[k]
+		if err := w.appendBytes(si, k, b.g, b.entries, b.stable, b.base+lo, b.base+hi); err != nil {
+			return err
+		}
+	}
+
+	r.pos = hi
+
 	return nil
+}
+
+// gatherRun holds one source's rows of a stream that cannot be served in place — out of timestamp
+// order, or split over several runs of a part — copied out and stably sorted. It is O(the stream's
+// rows in that source), which is why only a part both writers would never produce takes it.
+type gatherRun struct {
+	rows  *recordCols
+	cols  []chunk.DictColumn
+	views [][][]byte
+	run   arrayRun
+}
+
+func (g *gatherRun) init(schema *Schema) {
+	g.rows = newRecordCols(schema, 0, fullSel(schema))
+	g.cols = make([]chunk.DictColumn, schema.numBytes())
+	g.views = make([][][]byte, schema.numBytes())
+	g.run.init(schema)
+}
+
+func (g *gatherRun) reset(schema *Schema) { g.rows.prepare(schema, 0, fullSel(schema)) }
+
+func (g *gatherRun) appendDecoded(d *decodedPart, row int) {
+	c := g.rows
+	c.ts = append(c.ts, d.ts[row])
+
+	for k := range c.ints {
+		c.ints[k] = append(c.ints[k], d.ints[k][row])
+	}
+
+	for k := range c.bytes {
+		c.bytes[k].appendCell(d.bytes[k].col.At(row))
+	}
+}
+
+// sorted sorts the gathered rows by timestamp, stably, and returns them as a run, or nil when none
+// was gathered. The run's values are views into the gathered blob, which the next gather reuses, so
+// they are bound as a table the writer must copy.
+func (g *gatherRun) sorted() mergeRun {
+	c := g.rows
+	if c.len() == 0 {
+		return nil
+	}
+
+	c.sortByTs()
+
+	r := &g.run
+	r.ts, r.pos = c.ts, 0
+
+	for k := range r.ints {
+		r.ints[k] = c.ints[k]
+	}
+
+	for k := range r.bytes {
+		g.views[k] = c.bytes[k].views(g.views[k])
+		g.cols[k] = chunk.DictColumn{Entries: g.views[k]}
+		r.bytes[k] = arrayBytes{col: &g.cols[k], g: block.OwnedGranule(&g.cols[k], block.NewDictGen())}
+	}
+
+	return r
 }
 
 // partCursor reads one source part forward: every column decodes one granule at a time, reached
@@ -269,28 +377,30 @@ func (s *wholeSource) appendStream(acc *recordCols, id signal.SeriesID, start, e
 // Stream ranges are consumed in id order, which [forwardReadable] checked is row order too. A
 // granule is still addressed by row, so a range that did step back would re-read frames rather than
 // return wrong rows.
+//
+// A run is served in place on the premise that its timestamps ascend, which both writers guarantee
+// and nothing checks when the part opens. Every row a run passes over is checked against it, and a
+// run that breaks it fails the merge with [errRunDisorder] — rows already written in the wrong order
+// cannot be taken back.
 type partCursor struct {
-	ranges   []streamRange
-	next     int
-	ts       intCursor
-	ints     []intCursor
-	bytes    []byteCursor
-	carry    *mergeCarry
-	disorder func(msg string)
+	ranges []streamRange
+	next   int
+	fixed  int64
 
-	tsBuf []int64
-	keep  []bool
+	ts    intCursor
+	ints  []intCursor
+	bytes []byteCursor
+
+	pos, end int
+	last     int64
 }
 
-func openPartCursor(
-	ctx context.Context, p *part, window int64, carry *mergeCarry, disorder func(string),
-) (*partCursor, error) {
+func openPartCursor(ctx context.Context, p *part, window int64) (*partCursor, error) {
 	c := &partCursor{
-		ranges:   p.ranges,
-		ints:     make([]intCursor, p.schema.numInts()),
-		bytes:    make([]byteCursor, p.schema.numBytes()),
-		carry:    carry,
-		disorder: disorder,
+		ranges: p.ranges,
+		fixed:  fixedRowBytes(p.schema),
+		ints:   make([]intCursor, p.schema.numInts()),
+		bytes:  make([]byteCursor, p.schema.numBytes()),
 	}
 
 	if err := c.ts.open(ctx, p.reader, colTs, window); err != nil {
@@ -304,92 +414,152 @@ func openPartCursor(
 	}
 
 	for k := range c.bytes {
-		c.bytes[k].k = k
+		if err := c.bytes[k].open(ctx, p.reader, p.schema.byteColumn(k).Name, window); err != nil {
+			return nil, err
+		}
 	}
 
 	return c, nil
 }
 
-func (c *partCursor) appendStream(acc *recordCols, id signal.SeriesID, start, end int64) error {
-	if c.next == len(c.ranges) || c.ranges[c.next].id != id {
-		return nil
+// errRunDisorder reports a source whose stream was found out of timestamp order mid-merge.
+var errRunDisorder = errors.New("part rows are not timestamp-ordered within a stream")
+
+// sourceDisorderError names the source a merge found out of timestamp order, which the retry decodes
+// whole.
+type sourceDisorderError struct{ src int }
+
+func (e *sourceDisorderError) Error() string {
+	return errRunDisorder.Error() + " (source " + strconv.Itoa(e.src) + ")"
+}
+
+func (e *sourceDisorderError) Unwrap() error { return errRunDisorder }
+
+// sourceErr attributes err to source si when it is a disorder, so the merge can retry around it.
+func sourceErr(si int, err error) error {
+	if errors.Is(err, errRunDisorder) {
+		return &sourceDisorderError{src: si}
 	}
 
-	rng := c.ranges[c.next].rowRange
+	return err
+}
+
+func (c *partCursor) run(id signal.SeriesID, start int64) (mergeRun, bool, error) {
+	if c.next == len(c.ranges) || c.ranges[c.next].id != id {
+		return nil, false, nil
+	}
+
+	r := c.ranges[c.next]
 	c.next++
 
-	var err error
-	if c.tsBuf, err = c.ts.appendRange(c.tsBuf[:0], rng.start, rng.end, nil); err != nil {
-		return errors.Wrapf(err, "column %q", colTs)
-	}
+	c.pos, c.end, c.last = r.start, r.end, minInt64
 
-	keep, kept := c.window(start, end)
-	if kept == 0 {
-		return nil
-	}
+	for c.pos < c.end {
+		ts, err := c.ts.from(c.pos, c.end)
+		if err != nil {
+			return nil, false, err
+		}
 
-	for i, t := range c.tsBuf {
-		if len(keep) == 0 || keep[i] {
-			acc.ts = append(acc.ts, t)
-			acc.noteTS(t)
+		for _, t := range ts {
+			if t < c.last {
+				return nil, false, errRunDisorder
+			}
+
+			if t >= start {
+				return c, true, nil
+			}
+
+			c.last = t
+			c.pos++
 		}
 	}
 
+	return nil, false, nil
+}
+
+// ahead loads the granule holding the current row in every column and returns the timestamps up to
+// the nearest granule end, so every row it returns is decoded in every column.
+func (c *partCursor) ahead() ([]int64, error) {
+	if c.pos >= c.end {
+		return nil, nil
+	}
+
+	ts, err := c.ts.from(c.pos, min(c.end, c.pos+mergeGranuleRows))
+	if err != nil {
+		return nil, errors.Wrapf(err, "column %q", colTs)
+	}
+
+	hi := c.pos + len(ts)
+
 	for k := range c.ints {
-		if acc.ints[k], err = c.ints[k].appendRange(acc.ints[k], rng.start, rng.end, keep); err != nil {
-			return errors.Wrapf(err, "column %q", acc.schema.intColumn(k).Name)
+		if err := c.ints[k].ensure(c.pos); err != nil {
+			return nil, err
+		}
+
+		hi = min(hi, c.ints[k].hi)
+	}
+
+	for k := range c.bytes {
+		if err := c.bytes[k].ensure(c.pos); err != nil {
+			return nil, err
+		}
+
+		hi = min(hi, c.bytes[k].hi)
+	}
+
+	return ts[:hi-c.pos], nil
+}
+
+func (c *partCursor) rowBytes(i int) int64 {
+	n, row := c.fixed, c.pos+i
+
+	for k := range c.bytes {
+		n += int64(len(c.bytes[k].at(row)))
+	}
+
+	return n
+}
+
+func (c *partCursor) emit(w *recordPartStreamWriter, si, n int) error {
+	lo, hi := c.pos, c.pos+n
+
+	for _, t := range c.ts.slice(lo, hi) {
+		if t < c.last {
+			return errRunDisorder
+		}
+
+		c.last = t
+	}
+
+	for k := range c.ints {
+		if err := w.appendInts(k, c.ints[k].slice(lo, hi)); err != nil {
+			return err
 		}
 	}
 
 	for k := range c.bytes {
-		if err := c.bytes[k].appendRange(acc, c.carry, rng.start, rng.end, keep); err != nil {
-			return errors.Wrapf(err, "column %q", acc.schema.byteColumn(k).Name)
+		if err := c.bytes[k].emit(w, si, k, lo, hi); err != nil {
+			return err
 		}
 	}
+
+	c.pos = hi
 
 	return nil
-}
-
-// window selects the decoded stream's rows with a timestamp in [start, end]: keep is nil when every
-// row is selected, and kept counts the selection. The rows are filtered one by one rather than
-// binary-searched, so a stream out of ts order loses nothing; it is reported.
-func (c *partCursor) window(start, end int64) (keep []bool, kept int) {
-	ts := c.tsBuf
-
-	for i, t := range ts {
-		if t >= start && t <= end {
-			kept++
-		}
-
-		if i > 0 && t < ts[i-1] {
-			c.disorder("part rows are not timestamp-ordered within a stream")
-		}
-	}
-
-	if kept == len(ts) || kept == 0 {
-		return nil, kept
-	}
-
-	keep = slices.Grow(c.keep[:0], len(ts))[:len(ts)]
-	for i, t := range ts {
-		keep[i] = t >= start && t <= end
-	}
-
-	c.keep = keep
-
-	return keep, kept
 }
 
 // intCursor serves rows of one int64 column from its current granule. A constant column needs no
 // read at all, and an unblocked one — a part written before columns were framed — is one granule
 // spanning the part.
 type intCursor struct {
+	name   string
 	dec    *block.Decoder
 	lo, hi int
 	vals   []int64
 
 	constant bool
 	value    int64
+	fill     []int64
 }
 
 func (c *intCursor) open(ctx context.Context, r *block.PartReader, name string, window int64) error {
@@ -401,6 +571,8 @@ func (c *intCursor) open(ctx context.Context, r *block.PartReader, name string, 
 	if desc.Kind != block.KindInt64 {
 		return errors.Errorf("column %q is %s, not int64", name, desc.Kind)
 	}
+
+	c.name = name
 
 	switch {
 	case desc.Const:
@@ -428,60 +600,67 @@ func (c *intCursor) open(ctx context.Context, r *block.PartReader, name string, 
 	return nil
 }
 
-// appendRange appends the values of rows [lo, hi) selected by keep (nil ⇒ all) to dst.
-func (c *intCursor) appendRange(dst []int64, lo, hi int, keep []bool) ([]int64, error) {
-	for row := lo; row < hi; {
-		if row < c.lo || row >= c.hi {
-			if err := c.load(row); err != nil {
-				return dst, err
-			}
-		}
-
-		end := min(hi, c.hi)
-
-		switch {
-		case c.constant:
-			for i := row; i < end; i++ {
-				if len(keep) == 0 || keep[i-lo] {
-					dst = append(dst, c.value)
-				}
-			}
-		case keep == nil:
-			dst = append(dst, c.vals[row-c.lo:end-c.lo]...)
-		default:
-			for i, v := range c.vals[row-c.lo : end-c.lo] {
-				if keep[row-lo+i] {
-					dst = append(dst, v)
-				}
-			}
-		}
-
-		row = end
+// ensure makes row's granule the current one.
+func (c *intCursor) ensure(row int) error {
+	if row >= c.lo && row < c.hi {
+		return nil
 	}
 
-	return dst, nil
-}
+	if c.dec == nil {
+		return errors.Wrapf(block.ErrCorrupt, "column %q: row %d past %d rows", c.name, row, c.hi)
+	}
 
-func (c *intCursor) load(row int) error {
 	lo, hi, err := granuleOf(c.dec, row)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "column %q", c.name)
 	}
 
 	blk := row / c.dec.BlockRows()
 
 	vals, err := c.dec.DecodeInt64Into(blk, c.vals)
 	if err != nil {
-		return errors.Wrapf(err, "decode granule %d", blk)
+		return errors.Wrapf(err, "column %q: decode granule %d", c.name, blk)
 	}
 
 	if len(vals) != hi-lo {
-		return errors.Wrapf(block.ErrCorrupt, "granule %d decoded %d rows, want %d", blk, len(vals), hi-lo)
+		return errors.Wrapf(block.ErrCorrupt, "column %q: granule %d decoded %d rows, want %d", c.name, blk, len(vals), hi-lo)
 	}
 
 	c.vals, c.lo, c.hi = vals, lo, hi
 
 	return nil
+}
+
+// from returns the values of rows [row, min(end, the granule's end)).
+func (c *intCursor) from(row, end int) ([]int64, error) {
+	if err := c.ensure(row); err != nil {
+		return nil, err
+	}
+
+	return c.slice(row, min(end, c.hi)), nil
+}
+
+// slice returns the values of rows [lo, hi) of the current granule. A constant column's are filled
+// into a buffer the next call reuses.
+func (c *intCursor) slice(lo, hi int) []int64 {
+	if !c.constant {
+		return c.vals[lo-c.lo : hi-c.lo]
+	}
+
+	c.fill = slices.Grow(c.fill[:0], hi-lo)[:hi-lo]
+	for i := range c.fill {
+		c.fill[i] = c.value
+	}
+
+	return c.fill
+}
+
+func (c *intCursor) at(row int) int64 {
+	if c.constant {
+		return c.value
+	}
+
+	return c.vals[row-c.lo]
 }
 
 // granuleOf returns the row span of the granule holding row, failing for a row the column does not
@@ -496,34 +675,34 @@ func granuleOf(d *block.Decoder, row int) (lo, hi int, _ error) {
 	return lo, hi, nil
 }
 
-// byteCursor serves rows of one bytes column from its current granule, either as cells or, for a
-// column on the split carry, as ids into the merge's union — each granule's entries are remapped
-// once, then every row is a table lookup.
+// byteCursor serves rows of one bytes column from its current granule, handed to the writer whole
+// with the table its ids index, so a row costs the writer a cached id lookup rather than a hash.
 //
-// A column with no granules is read whole and resolved into the union as it opens. That is a
-// current layout, not only a legacy one: a dictionary column none of whose granules joined a shared
-// dictionary is written as one unframed stream.
+// A column with no granules is read whole. That is a current layout, not only a legacy one: a
+// dictionary column none of whose granules joined a shared dictionary is written as one unframed
+// stream by the flush.
 type byteCursor struct {
-	k      int
+	name   string
 	dec    *block.Decoder
 	lo, hi int
-	col    mergeByteCol
-	// granule holds the current granule's column, so the cursor's view of it needs no allocation.
-	granule chunk.DictColumn
+
+	g   block.DecodedGranule
+	col chunk.DictColumn
+	// entries is the table the granule's ids index, nil for a granule with one entry per row; stable
+	// says it outlives the cursor's next decode.
+	entries [][]byte
+	stable  bool
+
+	shared    [][]byte
+	sharedGen block.DictGen
 
 	constant bool
-	value    []byte
-
-	// shared is the column's shared dictionary and sharedRemap its union ids, resolved on the first
-	// granule that uses it; selfRemap is the union ids of the current granule's own dictionary.
-	shared      [][]byte
-	sharedRemap []int32
-	selfRemap   []int32
-	remap       []int32
-	remapped    bool
+	constIDs []byte
+	constCol chunk.DictColumn
+	constGen block.DictGen
 }
 
-func (c *byteCursor) open(ctx context.Context, r *block.PartReader, name string, window int64, carry *mergeCarry) error {
+func (c *byteCursor) open(ctx context.Context, r *block.PartReader, name string, window int64) error {
 	desc, ok := r.ColumnDescByName(name)
 	if !ok {
 		return errors.Errorf("no column %q", name)
@@ -533,9 +712,13 @@ func (c *byteCursor) open(ctx context.Context, r *block.PartReader, name string,
 		return errors.Errorf("column %q is %s, not bytes", name, desc.Kind)
 	}
 
+	c.name = name
+
 	switch {
 	case desc.Const:
-		c.constant, c.value, c.hi = true, desc.ConstBytes, r.RowCount()
+		c.constant, c.hi = true, r.RowCount()
+		c.constCol = chunk.DictColumn{Entries: [][]byte{desc.ConstBytes}, IDWidth: 1}
+		c.constGen = block.NewDictGen()
 	case !desc.Blocked:
 		col, err := r.Column(ctx, name)
 		if err != nil {
@@ -547,7 +730,10 @@ func (c *byteCursor) open(ctx context.Context, r *block.PartReader, name string,
 			return errors.Wrapf(err, "column %q", name)
 		}
 
-		c.col, c.hi = newMergeByteCol(dc), dc.Len()
+		c.g, c.col, c.hi, c.stable = block.OwnedGranule(dc, block.NewDictGen()), *dc, dc.Len(), true
+		if dc.IDWidth != 0 {
+			c.entries = dc.Entries
+		}
 	default:
 		d, err := r.ColumnScan(ctx, name, window)
 		if err != nil {
@@ -555,145 +741,68 @@ func (c *byteCursor) open(ctx context.Context, r *block.PartReader, name string,
 		}
 
 		c.dec = d
-		c.shared, _ = d.SharedEntries()
+		c.shared, c.sharedGen = d.SharedEntries()
+	}
 
-		if carry.dicts[c.k] != nil {
-			carry.lazy[c.k]++
-		}
+	return nil
+}
 
+func (c *byteCursor) ensure(row int) error {
+	if row >= c.lo && row < c.hi {
 		return nil
 	}
 
-	if carry.dicts[c.k] != nil {
-		c.remapGranule(carry)
+	if c.dec == nil {
+		return errors.Wrapf(block.ErrCorrupt, "column %q: row %d past %d rows", c.name, row, c.hi)
 	}
 
-	return nil
-}
-
-// appendRange appends rows [lo, hi) selected by keep (nil ⇒ all) to byte column k of acc.
-func (c *byteCursor) appendRange(acc *recordCols, carry *mergeCarry, lo, hi int, keep []bool) error {
-	for row := lo; row < hi; {
-		if row < c.lo || row >= c.hi {
-			if err := c.load(row); err != nil {
-				return err
-			}
-		}
-
-		end := min(hi, c.hi)
-
-		var mask []bool
-		if keep != nil {
-			mask = keep[row-lo : end-lo]
-		}
-
-		if acc.splitAt(c.k) != nil && !c.remapped {
-			c.remapGranule(carry)
-		}
-
-		if sc := acc.splitAt(c.k); sc != nil {
-			c.appendIDs(sc, row-c.lo, end-row, mask)
-		} else {
-			c.appendCells(&acc.bytes[c.k], row-c.lo, end-row, mask)
-		}
-
-		row = end
-	}
-
-	return nil
-}
-
-func (c *byteCursor) load(row int) error {
 	lo, hi, err := granuleOf(c.dec, row)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "column %q", c.name)
 	}
 
 	blk := row / c.dec.BlockRows()
 
 	g, err := c.dec.DecodeBytesBlock(blk)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "column %q", c.name)
 	}
 
-	c.granule = g.Column()
-	c.col, c.lo, c.hi, c.remapped = mergeByteCol{dict: &c.granule}, lo, hi, false
+	c.g, c.col, c.lo, c.hi = g, g.Column(), lo, hi
+
+	switch {
+	case c.col.IDWidth == 0:
+		c.entries, c.stable = nil, false
+	case len(c.shared) > 0 && g.Table() == c.sharedGen:
+		c.entries, c.stable = c.shared, true
+	default:
+		c.entries, c.stable = c.col.Entries, false
+	}
 
 	return nil
 }
 
-// remapGranule resolves the current granule's entries to union ids, falling the column back to the
-// flat carry when the granule has no dictionary or the union outgrows its bound. A granule's entries
-// alias the decoder's frame, which the next granule overwrites, so they are copied into the union; a
-// whole-read column's and the shared dictionary's are the cursor's own and are kept as they are.
-func (c *byteCursor) remapGranule(carry *mergeCarry) {
-	c.remapped = true
-	u := carry.dicts[c.k]
-	dc := c.col.dict
-
-	switch {
-	case c.constant:
-		c.selfRemap = append(c.selfRemap[:0], u.id(c.value))
-		c.remap = c.selfRemap
-	case dc == nil || (dc.IDWidth == 0 && dc.Len() > 0):
-		carry.flatten(c.k)
-
-		return
-	case dc.Len() == 0:
-		return
-	case c.onShared():
-		if c.sharedRemap == nil {
-			c.sharedRemap = u.remap(nil, c.shared, true)
-		}
-
-		c.remap = c.sharedRemap
-	case c.dec == nil:
-		c.remap = u.remap(nil, dc.Entries, true)
-	default:
-		c.selfRemap = u.remap(c.selfRemap, dc.Entries, false)
-		c.remap = c.selfRemap
-	}
-
-	carry.grew(c.k)
-}
-
-// onShared reports whether the current granule's ids index the column's shared dictionary, which
-// [block.Decoder.DecodeBytesBlock] hands back as the granule's own entries.
-func (c *byteCursor) onShared() bool {
-	entries := c.col.dict.Entries
-
-	return len(c.shared) > 0 && len(entries) > 0 && &entries[0] == &c.shared[0]
-}
-
-func (c *byteCursor) appendIDs(sc *splitCol, base, n int, mask []bool) {
+func (c *byteCursor) at(row int) []byte {
 	if c.constant {
-		id := c.remap[0]
-		for j := range n {
-			if len(mask) == 0 || mask[j] {
-				sc.append(id)
-			}
-		}
-
-		return
+		return c.constCol.Entries[0]
 	}
 
-	for j := range n {
-		if len(mask) == 0 || mask[j] {
-			sc.append(c.remap[c.col.entryID(base+j)])
-		}
-	}
+	return c.col.At(row - c.lo)
 }
 
-func (c *byteCursor) appendCells(bc *byteCol, base, n int, mask []bool) {
-	for j := range n {
-		if len(mask) != 0 && !mask[j] {
-			continue
-		}
-
-		if c.constant {
-			bc.appendCell(c.value)
-		} else {
-			bc.appendCell(c.col.at(base + j))
-		}
+// emit appends rows [lo, hi) of the current granule to byte column k of w. A constant column is
+// handed over as a one-entry table.
+func (c *byteCursor) emit(w *recordPartStreamWriter, si, k, lo, hi int) error {
+	if !c.constant {
+		return w.appendBytes(si, k, c.g, c.entries, c.stable, lo-c.lo, hi-c.lo)
 	}
+
+	n := hi - lo
+	if len(c.constIDs) < n {
+		c.constIDs = make([]byte, n)
+	}
+
+	c.constCol.IDs = c.constIDs[:n]
+
+	return w.appendBytes(si, k, block.OwnedGranule(&c.constCol, c.constGen), c.constCol.Entries, true, 0, n)
 }

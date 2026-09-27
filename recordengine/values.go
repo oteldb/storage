@@ -176,7 +176,7 @@ func (a *valueAccumulator) addBuffers(records map[signal.SeriesID]*recordCols, k
 			continue
 		}
 
-		cells := buf.cellsAt(k)
+		cells := &buf.bytes[k]
 		whole := all || (start <= buf.tsMin && buf.tsMax <= end)
 
 		for i := range buf.ts {

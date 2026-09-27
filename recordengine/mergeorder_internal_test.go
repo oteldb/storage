@@ -265,18 +265,20 @@ func TestMergeFailsOnUndrainedCursor(t *testing.T) {
 	p := writeTestPart(t, e, be, streamColumns(t, e, map[string][]int64{"a": {1, 2}, "b": {3}, "c": {4}}))
 	require.Len(t, p.ranges, 3)
 
-	acc := newRecordCols(headTestSchema, 0, fullSel(headTestSchema))
-	buf := newRecordCols(headTestSchema, 0, fullSel(headTestSchema))
-	carry := newMergeCarry(headTestSchema, 1, acc, buf)
-	t.Cleanup(carry.release)
-
-	sources, err := e.openMergeSources(ctx, []*part{p}, carry)
+	sources, err := e.openMergeSources(ctx, []*part{p})
 	require.NoError(t, err)
 
-	acc.prepare(headTestSchema, 0, fullSel(headTestSchema))
-	require.NoError(t, sources[0].appendStream(acc, p.ranges[0].id, minInt64, maxInt64))
-	require.NoError(t, sources[0].appendStream(acc, p.ranges[2].id, minInt64, maxInt64),
-		"the cursor ignores a stream it is not positioned at")
+	run := func(id signal.SeriesID) bool {
+		t.Helper()
+
+		_, ok, err := sources[0].run(id, minInt64)
+		require.NoError(t, err)
+
+		return ok
+	}
+
+	require.True(t, run(p.ranges[0].id))
+	require.False(t, run(p.ranges[2].id), "the cursor ignores a stream it is not positioned at")
 
 	err = checkDrained([]*part{p}, sources)
 	require.ErrorIs(t, err, block.ErrCorrupt)
@@ -284,8 +286,8 @@ func TestMergeFailsOnUndrainedCursor(t *testing.T) {
 	assert.Contains(t, err.Error(), p.ranges[1].id.String())
 	assert.Contains(t, err.Error(), "2 of 3 streams unread")
 
-	require.NoError(t, sources[0].appendStream(acc, p.ranges[1].id, minInt64, maxInt64))
-	require.NoError(t, sources[0].appendStream(acc, p.ranges[2].id, minInt64, maxInt64))
+	require.True(t, run(p.ranges[1].id))
+	require.True(t, run(p.ranges[2].id))
 	require.NoError(t, checkDrained([]*part{p}, sources))
 }
 

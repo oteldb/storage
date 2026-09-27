@@ -3,7 +3,8 @@
 Both verticals merge immutable parts, but they do not merge the same way: the metric engine dedups
 samples by timestamp with later-part-wins and then downsamples, over three fixed columns; the record
 engine concatenates without dedup and re-sorts by timestamp, over `ts` plus n int and m byte columns
-from a *runtime* schema, with a per-column dictionary carry. A generic row cursor over that costs an
+from a *runtime* schema, whose byte columns reach the writer as the sources' dictionary tables. A
+generic row cursor over that costs an
 indirect call per row, on a path where a branch per row is measurable.
 
 So this package is a **seam, not a merge**. Each engine keeps its own driver; what lives here is
