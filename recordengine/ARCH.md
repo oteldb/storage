@@ -61,9 +61,10 @@ re-exported exemplars at ingest is its own change. Record specifics:
   append. A retention rewrite takes its bucket's forced parts only up to the cap, so its day is about
   the budget (`TestRetentionRewriteHoldsResidentShare`), unless one forced part over the cap is
   rewritten alone.
-- A side-store engine (profiles) writes the unioned symbol sidecar under each day's part, since each is
-  the one home a reader looks in. The cap does not split its day, but the resident share can, and every
-  part of that day then carries a full copy of the union — the per-part sidecar cost #694 removes.
+- A side-store engine (profiles) writes a symbol sidecar under each day's part, since each is the one
+  home a reader looks in: the inputs' union, restricted to what that part's rows reach. The cap does not
+  split its day, but the resident share can, and every part of that day then carries its own copy of
+  the entries its rows share with the others — the per-part sidecar cost #694 removes.
 - Measured on a 17-day batch (16 parts × 64 streams, hourly, 64 MiB parts;
   `BenchmarkMergeStraddlers17Days`): per-day passes read 16.6 MB from the backend, allocated 426 MB and
   took 246 ms; the single pass reads 1.0 MB, allocates 143 MB and takes 166 ms, its buffers peaking at
@@ -630,22 +631,28 @@ it, then released after their dictionaries are read.
 
 The side store is a content-addressed auxiliary store a signal attaches per batch (`Batch.Side`),
 riding the part lifecycle: absorbed into a live accumulator, written as sidecars on flush, **unioned**
-on merge (content addressing makes the union a plain dedup with no id remap), and **restored** into the
-accumulator when a flush fails. Profiles' symbol store is the first user; nil for logs/traces.
+on merge (content addressing makes the union a plain dedup with no id remap) and **retained** to what
+the output part's rows reach, and **restored** into the accumulator when a flush fails. Profiles'
+symbol store is the first user; nil for logs/traces.
 
-`Encode` and `Union` return the in-memory form; `SideStore.Stored` converts to the on-disk form,
-and the engine applies it only to what `writeSidecars` writes: the flush snapshot once per flush
-(shared by every part a split produces) and the merged union. A store that compresses its sidecars
-thus pays that encode at flush and merge, never on the query path.
+`Encode`, `Union` and `Retained` return the in-memory form; `SideStore.Stored` converts to the
+on-disk form, and the engine applies it only to what `writeSidecars` writes: the flush snapshot once
+per flush (shared by every part a split produces) and each merge output's retained union. A store
+that compresses its sidecars thus pays that encode at flush and merge, never on the query path.
+
+**A merge keeps only what its rows reach.** Each output writer collects the distinct `RefColumn` cells
+it writes (counted in its resident bytes, O(distinct stacks) of the part), and `SideStore.Retained`
+restricts the inputs' union to their closure. Without it a retention rewrite would carry the symbols of
+every row it dropped, and a split day would copy the whole union into every part.
 
 **Reads hand out the pieces, not a union.** `Engine.ReadSide(start, end, head)` calls `head` with the
 live store under the read lock (the signal snapshots it in its own form), and returns the in-flight
 flush's snapshot plus the parts overlapping the window, newest first, acquired like a fetch's parts
 so a merge cannot reclaim them before `Release`. Sidecar reads happen off the lock. Each part's side
 data is self-sufficient — flush writes the accumulator every one of its records' batches was absorbed
-into, and merge unions its inputs whole — so a window's parts plus the head and the flush snapshot
-hold every entry the window's records reference. A `SidePart.Key` is the part prefix: unique and
-immutable, it keys a cache of the decoded side data without invalidation. The engine never unions on
+into, and merge writes the closure of each output part's own rows — so a window's parts plus the
+head and the flush snapshot hold every entry the window's records reference. A `SidePart.Key` is the
+part prefix: unique and immutable, it keys a cache of the decoded side data without invalidation. The engine never unions on
 the read path; merging N parts' tables per query is exactly the cost a signal-side cache avoids.
 
 **Symbols follow their records' visibility.** A record is in exactly one of head / `e.flushing` / a
@@ -680,8 +687,8 @@ mark covers both roles. A replica, or a primary demoted before its next flush, r
 owner whose head stays empty resets the store in the flush that finds nothing to detach: an empty head
 references nothing, so a plain `Reset` is exact and needs no walk.
 
-A non-empty flush would drain rejected deltas into its sidecars, and merges union sidecars whole, so
-a rejected record's entries would stay for as long as the data does. A second mark, `sideStray`, is
+A non-empty flush would drain rejected deltas into its sidecars, and they would stay until a merge
+retains the part's symbols to its rows. A second mark, `sideStray`, is
 set when a write that absorbed a delta rejected any record, or failed after the absorb. It is also
 set on every replayed delta (WAL restart, `ApplyReplicated`), which arrives without its write's
 admission decision. A flush that finds the mark set runs the replica's `Retain` over the head before
