@@ -85,8 +85,6 @@ func downsampleApplies(tiers []DownsampleTier, minTime int64) bool {
 // (a one-sample bucket aggregates to itself), so repeated merges are stable. Count is the
 // exception — re-counting a representative yields 1 — and is documented as non-idempotent.
 func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int64, []float64, []float64) {
-	// Keep only usable tiers, ordered by Before ascending so the first match for a sample is the
-	// coarsest tier it qualifies for (smallest Before ⇒ largest age threshold).
 	active := make([]DownsampleTier, 0, len(tiers))
 	for _, t := range tiers {
 		if t.Interval > 0 {
@@ -106,7 +104,16 @@ func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int
 		return sf[i]
 	}
 
-	slices.SortFunc(active, func(a, b DownsampleTier) int { return cmp.Compare(a.Before, b.Before) })
+	// Ordered widest Interval first, so the first match for a sample is the coarsest tier it
+	// qualifies for. Before order would not do: quantized cutoffs tie, and tiers whose quanta do not
+	// nest can briefly invert.
+	slices.SortFunc(active, func(a, b DownsampleTier) int {
+		if c := cmp.Compare(b.Interval, a.Interval); c != 0 {
+			return c
+		}
+
+		return cmp.Compare(a.Before, b.Before)
+	})
 
 	// Bucket key: the (interval, aligned-start) pair. Including the interval disambiguates the
 	// rare case where two tiers' aligned starts coincide across a misaligned Before boundary;
@@ -183,7 +190,7 @@ func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int
 	return outTs, outVal, outSF
 }
 
-// pickTier returns the coarsest tier a sample at ts qualifies for (the first, in Before-ascending
+// pickTier returns the coarsest tier a sample at ts qualifies for (the first, in Interval-descending
 // order, with ts < Before), or ok=false when ts is younger than every tier (stays raw).
 func pickTier(active []DownsampleTier, ts int64) (DownsampleTier, bool) {
 	for _, t := range active {

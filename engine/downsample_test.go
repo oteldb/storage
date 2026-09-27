@@ -79,6 +79,39 @@ func TestDownsampleMultiTier(t *testing.T) {
 	assert.Equal(t, []float64{2, 3, 5, 6}, gotVal)
 }
 
+// TestDownsampleWidestTierWins checks a sample past several cutoffs lands in the widest tier however
+// the cutoffs order, including when they tie.
+func TestDownsampleWidestTierWins(t *testing.T) {
+	t.Parallel()
+
+	ts := []int64{10, 15, 30, 70, 75, 120}
+	vals := []float64{1, 2, 3, 4, 5, 6}
+
+	for _, tc := range []struct {
+		name         string
+		fine, coarse int64
+		wantTs       []int64
+		wantVal      []float64
+	}{
+		{name: "Tied", fine: 100, coarse: 100, wantTs: []int64{0, 20, 60, 120}, wantVal: []float64{3, 3, 9, 6}},
+		{name: "Inverted", fine: 50, coarse: 100, wantTs: []int64{0, 20, 60, 120}, wantVal: []float64{3, 3, 9, 6}},
+		{name: "Ordered", fine: 100, coarse: 50, wantTs: []int64{0, 20, 70, 120}, wantVal: []float64{3, 3, 9, 6}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			tiers := []DownsampleTier{
+				{Before: tc.fine, Interval: 10, Agg: signal.AggSum},
+				{Before: tc.coarse, Interval: 20, Agg: signal.AggSum},
+			}
+
+			gotTs, gotVal, _ := downsample(ts, vals, nil, tiers)
+			assert.Equal(t, tc.wantTs, gotTs)
+			assert.Equal(t, tc.wantVal, gotVal)
+		})
+	}
+}
+
 func TestDownsampleNegativeTimestamps(t *testing.T) {
 	t.Parallel()
 
