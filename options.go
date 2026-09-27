@@ -113,7 +113,9 @@ type Options struct {
 
 	// ProfileSymbolCacheBytes bounds the cache of decoded profile symbol tables that
 	// [Storage.ProfileResolver] reads, keyed by part: a part's tables decode once, not on every
-	// flamegraph query. Zero ⇒ [defaultProfileSymbolCacheBytes]; negative disables it.
+	// flamegraph query. Zero ⇒ [defaultProfileSymbolCacheBytes]; negative disables it. Budgets of
+	// 4 GiB or more are capped just below 4 GiB, and a part decoding larger than the budget is served
+	// uncached.
 	ProfileSymbolCacheBytes int64
 
 	// DecodeMemoryBytes caps the total in-flight decoded column bytes across concurrent queries,

@@ -2,6 +2,7 @@ package profile
 
 import (
 	"context"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -85,6 +86,44 @@ func TestSymbolCacheOversized(t *testing.T) {
 
 	assert.Equal(t, int64(2), loads.Load(), "an entry above the budget is not kept")
 	assert.Zero(t, c.Stats().Items)
+}
+
+// TestSymbolCacheHugeEntries checks a budget above what otter's uint32 weights express still holds no
+// entry whose true size its weight cannot carry: two 6 GiB tables must not both sit under 8 GiB.
+func TestSymbolCacheHugeEntries(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	c := NewSymbolCache(8 << 30)
+	require.Equal(t, int64(math.MaxUint32-1), c.maxBytes)
+
+	var loads atomic.Int64
+
+	huge := func(context.Context) (*Tables, error) {
+		loads.Add(1)
+
+		return &Tables{t: newSymTables(), size: 6 << 30}, nil
+	}
+
+	for _, key := range []string{"a", "b", "a", "b"} {
+		got, err := c.get(ctx, key, huge)
+		require.NoError(t, err)
+		assert.Equal(t, int64(6<<30), got.Size(), "served uncached")
+	}
+
+	assert.Equal(t, int64(4), loads.Load(), "never kept")
+
+	st := c.Stats()
+	assert.Zero(t, st.Items)
+	assert.Zero(t, st.Bytes)
+
+	small := func(context.Context) (*Tables, error) {
+		return &Tables{t: newSymTables(), size: math.MaxUint32 - 1}, nil
+	}
+
+	_, err := c.get(ctx, "fits", small)
+	require.NoError(t, err)
+	assert.Equal(t, int64(math.MaxUint32-1), c.Stats().Bytes, "an entry that fits is weighed exactly")
 }
 
 func TestSymbolCacheDisabled(t *testing.T) {
