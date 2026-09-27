@@ -24,6 +24,7 @@ import (
 	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/parallel"
+	"github.com/oteldb/storage/internal/timebucket"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/scale"
 	"github.com/oteldb/storage/readbudget"
@@ -93,7 +94,9 @@ type Storage struct {
 
 	admitMu sync.Mutex                           // guards admit
 	admit   map[signal.TenantID]*tenantAdmission // per-tenant admission state (rate valve + counters)
-	now     func() int64                         // unix-nano clock for admission; overridable in tests
+	now     func() int64                         // unix-nano clock for admission and metric merge cutoffs; overridable in tests
+
+	downsampleRejected sync.Map // signal.TenantID → struct{}: tenants already warned of a rejected policy
 
 	obs *obs.Obs // injected logging/tracing/metrics (no-op by default); never nil after Open
 
@@ -2160,23 +2163,10 @@ func (s *Storage) retainFrom(tid signal.TenantID, sig signal.Signal, sizeCutoff 
 // sizeCutoff is the tenant's size-budget cutoff, folded into RetainFrom the same way (see
 // [Storage.retainFrom]).
 func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engine.MergeOptions {
-	now := time.Now().UnixNano()
+	now := s.now()
 	// In cluster mode tid is a shard key ({tenant}/_s{idx}); policy is per real tenant.
-	p := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid)))
-
-	var tiers []engine.DownsampleTier
-
-	for _, t := range p.Downsample.Tiers {
-		if t.Interval <= 0 {
-			continue
-		}
-
-		tiers = append(tiers, engine.DownsampleTier{
-			Before:   now - t.After.Nanoseconds(),
-			Interval: t.Interval.Nanoseconds(),
-			Agg:      t.Agg,
-		})
-	}
+	realTenant := s.normalizeTenant(tenantOfShard(tid))
+	p := s.tenant.Resolve(realTenant)
 
 	var recompress *engine.RecompressSpec
 
@@ -2208,10 +2198,48 @@ func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engi
 
 	return engine.MergeOptions{
 		RetainFrom: max(retentionCutoff(p.Retention, signal.Metric, now), sizeCutoff),
-		Downsample: tiers,
+		Downsample: s.downsampleTiers(realTenant, p.Downsample, now),
 		Recompress: recompress,
 		Precision:  precision,
 	}
+}
+
+// downsampleTiers resolves a tenant's downsampling policy against now, or nil when the policy fails
+// [tenant.Downsample.Validate], warning once per tenant.
+func (s *Storage) downsampleTiers(tid signal.TenantID, policy tenant.Downsample, now int64) []engine.DownsampleTier {
+	if err := policy.Validate(); err != nil {
+		if _, warned := s.downsampleRejected.LoadOrStore(tid, struct{}{}); !warned {
+			s.obs.Log.Warn("downsample policy rejected; tenant is not downsampled",
+				zap.String("tenant", string(tid)), zap.Error(err))
+		}
+
+		return nil
+	}
+
+	var tiers []engine.DownsampleTier
+
+	for _, t := range policy.Tiers {
+		if t.Interval <= 0 {
+			continue
+		}
+
+		tiers = append(tiers, engine.DownsampleTier{
+			Before:   downsampleCutoff(now, t),
+			Interval: t.Interval.Nanoseconds(),
+			Agg:      t.Agg,
+		})
+	}
+
+	return tiers
+}
+
+// downsampleCutoff is now − After floored to whole rollup buckets of at least an hour, so the cutoff
+// never splits a bucket and holds still for a quantum (see engine/ARCH.md).
+func downsampleCutoff(now int64, t tenant.DownsampleTier) int64 {
+	interval := t.Interval.Nanoseconds()
+	quantum := interval * ((int64(time.Hour) + interval - 1) / interval)
+
+	return timebucket.Of(now-t.After.Nanoseconds(), quantum)
 }
 
 // engineSnapshot returns the current tenant engines (a copy, so callers iterate without

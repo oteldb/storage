@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/encoding/compress"
+	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
@@ -213,4 +215,207 @@ func TestMetricMergeOptionsRecompress(t *testing.T) {
 	s2, err := InMemory()
 	require.NoError(t, err)
 	assert.Nil(t, s2.metricMergeOptions("default", 0).Recompress)
+}
+
+func TestMetricMergeOptionsDownsampleCutoff(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		interval, quantum time.Duration
+	}{
+		{interval: time.Minute, quantum: time.Hour},
+		{interval: 7 * time.Minute, quantum: 63 * time.Minute},
+		{interval: time.Hour, quantum: time.Hour},
+		{interval: 2 * time.Hour, quantum: 2 * time.Hour},
+	} {
+		t.Run(tc.interval.String(), func(t *testing.T) {
+			t.Parallel()
+
+			const after = 90 * time.Minute
+
+			s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+				return tenant.Policy{Downsample: tenant.Downsample{Tiers: []tenant.DownsampleTier{
+					{After: after, Interval: tc.interval},
+				}}}
+			})))
+			require.NoError(t, err)
+
+			var now int64
+
+			s.now = func() int64 { return now }
+			before := func(at int64) int64 {
+				now = at
+
+				tiers := s.metricMergeOptions("default", 0).Downsample
+				require.Len(t, tiers, 1)
+
+				return tiers[0].Before
+			}
+
+			q := int64(tc.quantum)
+			quantumStart := 1000*q + int64(after)
+
+			first := before(quantumStart + int64(time.Second))
+			assert.Zero(t, first%q, "a multiple of the quantum")
+			assert.Equal(t, quantumStart-int64(after), first)
+			assert.Equal(t, first, before(quantumStart+q-1), "still within the quantum")
+			assert.Equal(t, first+q, before(quantumStart+q), "the next quantum")
+		})
+	}
+}
+
+func TestMetricMergeOptionsDownsampleNesting(t *testing.T) {
+	t.Parallel()
+
+	resolve := func(t *testing.T, intervals ...time.Duration) []engine.DownsampleTier {
+		t.Helper()
+
+		tiers := make([]tenant.DownsampleTier, 0, len(intervals))
+		for i, iv := range intervals {
+			tiers = append(tiers, tenant.DownsampleTier{After: time.Duration(i+1) * time.Hour, Interval: iv})
+		}
+
+		s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+			return tenant.Policy{Downsample: tenant.Downsample{Tiers: tiers}}
+		})))
+		require.NoError(t, err)
+
+		now := time.Date(2026, 1, 1, 13, 37, 0, 0, time.UTC).UnixNano()
+		s.now = func() int64 { return now }
+
+		return s.metricMergeOptions("default", 0).Downsample
+	}
+
+	t.Run("Rejected", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Empty(t, resolve(t, 7*time.Minute, time.Hour))
+	})
+
+	t.Run("OnEveryFinerGrid", func(t *testing.T) {
+		t.Parallel()
+
+		tiers := resolve(t, time.Minute, 5*time.Minute, time.Hour, 6*time.Hour)
+		require.Len(t, tiers, 4)
+
+		for _, coarse := range tiers {
+			for _, fine := range tiers {
+				if fine.Interval <= coarse.Interval {
+					assert.Zero(t, coarse.Before%fine.Interval, "cutoff %d on the %d grid", coarse.Before, fine.Interval)
+				}
+			}
+		}
+	})
+}
+
+// TestMaintainRollsUpEachBucketOnce ticks maintenance every 10s on a synthetic clock while a gauge
+// ages past its tier: every bucket must come out equal to one rollup of its raw samples.
+func TestMaintainRollsUpEachBucketOnce(t *testing.T) {
+	t.Parallel()
+
+	const (
+		step     = 10 * time.Second
+		interval = time.Minute
+		after    = 5 * time.Minute
+		ingest   = 20 * time.Minute
+	)
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()
+	aggs := []signal.Aggregation{
+		signal.AggLast, signal.AggFirst, signal.AggMin, signal.AggMax, signal.AggSum, signal.AggAvg, signal.AggCount,
+	}
+
+	for _, agg := range aggs {
+		t.Run(agg.String(), func(t *testing.T) {
+			t.Parallel()
+
+			s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+				return tenant.Policy{Downsample: tenant.Downsample{Tiers: []tenant.DownsampleTier{
+					{After: after, Interval: interval, Agg: agg},
+				}}}
+			})))
+			require.NoError(t, err)
+
+			var now int64
+
+			s.now = func() int64 { return now }
+			ctx := context.Background()
+
+			var (
+				ts   []int64
+				vals []float64
+			)
+
+			for now = base; now < base+int64(ingest); now += int64(step) {
+				v := float64(len(ts)*7%13 + 1)
+				_, err := s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{now}, []float64{v}))
+				require.NoError(t, err)
+
+				ts, vals = append(ts, now), append(vals, v)
+
+				s.maintain(ctx)
+			}
+
+			now = base + int64(time.Hour+after)
+			s.maintain(ctx)
+
+			eng := mustEngine(s.engineFor("default"))
+			it, err := eng.Fetch(ctx, fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{nameMatcher("m")}})
+			require.NoError(t, err)
+			got, err := fetch.Drain(ctx, it)
+			require.NoError(t, err)
+			require.Len(t, got, 1)
+
+			wantTs, wantVals := rollupOnce(ts, vals, int64(interval), agg)
+			assert.Equal(t, wantTs, got[0].Timestamps)
+			assert.Equal(t, wantVals, got[0].Values)
+		})
+	}
+}
+
+// rollupOnce aggregates each interval-aligned bucket of ascending ts once, whole.
+func rollupOnce(ts []int64, vals []float64, interval int64, agg signal.Aggregation) ([]int64, []float64) {
+	var (
+		outTs   []int64
+		outVals []float64
+	)
+
+	for lo := 0; lo < len(ts); {
+		start := ts[lo] - ts[lo]%interval
+
+		hi := lo
+		for hi < len(ts) && ts[hi] < start+interval {
+			hi++
+		}
+
+		bucket := vals[lo:hi]
+
+		var v float64
+
+		switch agg {
+		case signal.AggFirst:
+			v = bucket[0]
+		case signal.AggMin:
+			v = slices.Min(bucket)
+		case signal.AggMax:
+			v = slices.Max(bucket)
+		case signal.AggSum, signal.AggAvg:
+			for _, x := range bucket {
+				v += x
+			}
+
+			if agg == signal.AggAvg {
+				v /= float64(len(bucket))
+			}
+		case signal.AggCount:
+			v = float64(len(bucket))
+		default:
+			v = bucket[len(bucket)-1]
+		}
+
+		outTs, outVals = append(outTs, start), append(outVals, v)
+		lo = hi
+	}
+
+	return outTs, outVals
 }
