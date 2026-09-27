@@ -2,11 +2,11 @@ package recordengine
 
 import (
 	"context"
+	"math"
 
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/internal/memlimit"
-	"github.com/oteldb/storage/internal/mergestream"
 )
 
 // mergeCapBytes returns the decoded size at which a merged part is sealed: the tiering target
@@ -18,6 +18,10 @@ import (
 //
 // 0 (never seal, one merge takes maxTierParts) when MaxPartBytes is unlimited, the legacy behavior.
 func (e *Engine) mergeCapBytes() int64 {
+	if e.mergeCap > 0 {
+		return e.mergeCap
+	}
+
 	if e.cfg.MaxPartBytes <= 0 {
 		return 0
 	}
@@ -31,15 +35,28 @@ func (e *Engine) mergeCapBytes() int64 {
 	return max(min(target, share), e.cfg.MaxPartBytes)
 }
 
-// mergeBudget is what a merge seals an output part on: its cap, in the decoded rows the open writers
-// have taken, and nothing on disk. A side store (profiles) anchors the unioned symbol sidecar to one
-// part, so it disables sealing entirely.
-func (e *Engine) mergeBudget(capBytes int64) mergestream.Budget {
+// mergeBounds are the two numbers a merge seals output parts on, in units that do not convert:
+// partBytes is the decoded size one part may reach, the unit tiering compares parts in, and
+// residentBytes is what the open writers may hold in RAM together, the merge's admitted share. Zero
+// bounds nothing.
+type mergeBounds struct {
+	partBytes, residentBytes int64
+}
+
+// mergeBounds returns the bounds of a merge whose cap is capBytes. A side store (profiles) anchors
+// the unioned symbol sidecar to one part per day, so it lifts the part bound; the resident bound
+// holds for every engine.
+func (e *Engine) mergeBounds(capBytes int64) mergeBounds {
+	b := mergeBounds{partBytes: capBytes}
 	if e.cfg.SideStore != nil {
-		return mergestream.Budget{}
+		b.partBytes = 0
 	}
 
-	return mergestream.Budget{ResidentBytes: capBytes}
+	if share := e.mergeMemoryBudgetBytes(); share != math.MaxInt64 {
+		b.residentBytes = share
+	}
+
+	return b
 }
 
 // mergeConcurrency is how many merges the memory budget admits: enough that each gets a usable

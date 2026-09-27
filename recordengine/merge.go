@@ -349,10 +349,10 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 // column ([partCursor]) unless its layout rules that out, when it is decoded whole; each stream's rows
 // are merged across the sources by a k-way heap on (timestamp, source), and routed by timestamp to a
 // writer per day ([timebucket.Router]) that encodes them as they arrive
-// ([recordPartStreamWriter]). The largest open writer is sealed once the writers have taken capBytes
-// of decoded rows between them, checked after every append of at most a granule — so a part
-// overshoots its cap by at most one append, a stream may continue in the next part, and the merge
-// never holds a stream or a part.
+// ([recordPartStreamWriter]). A writer is sealed once it has taken capBytes of decoded rows, and the
+// largest open writer once the writers together hold the merge's admitted share in RAM, both checked
+// after every append of at most a granule — so either bound is overshot by at most one append, a
+// stream may continue in the next part, and the merge never holds a stream or a part.
 // When the engine has a side store (profiles) a day is written as a single part (no cap split) so
 // the unioned symbol sidecar has one home per day. Returns the new parts (empty when retention
 // dropped every record). Reads the parts off the engine lock; src is the immutable snapshot the
@@ -380,7 +380,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 // compactStreamed is one attempt at [Engine.compactParts]. On a [sourceDisorderError] it returns the
 // parts it had already sealed with the error.
 func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capBytes int64) ([]*part, error) {
-	budget := e.mergeBudget(capBytes)
+	bounds := e.mergeBounds(capBytes)
 
 	sources, err := e.openMergeSources(ctx, src)
 	if err != nil {
@@ -401,9 +401,9 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 
 			return nil
 		},
-		Resident:      (*recordPartStreamWriter).decodedBytes,
+		Resident:      (*recordPartStreamWriter).residentBytes,
 		MaxOpen:       timebucket.MaxOpenWriters,
-		ResidentLimit: budget.ResidentBytes,
+		ResidentLimit: bounds.residentBytes,
 	}
 
 	// A part under way holds column objects the backend has not published yet; leaving on any path
@@ -417,7 +417,7 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 
 	mergeKeys(src, &keys)
 
-	runBytes := budget.ResidentBytes / mergeRunFraction
+	runBytes := bounds.partBytes / mergeRunFraction
 
 	for keys.Next() {
 		id := keys.Key()
@@ -436,7 +436,11 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 			dayEnd := timebucket.End(ts, timebucket.Top())
 
 			err := router.Append(ts, func(w *recordPartStreamWriter) (bool, error) {
-				return false, heap.fill(w, u, dayEnd, runBytes)
+				if err := heap.fill(w, u, dayEnd, runBytes); err != nil {
+					return false, err
+				}
+
+				return bounds.partBytes > 0 && w.decodedBytes() >= bounds.partBytes, nil
 			})
 			if err != nil {
 				return newParts, err
@@ -454,19 +458,19 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 
 	if mergeResidentObserver != nil {
 		peak, run := router.Peak()
-		mergeResidentObserver(peak, run, budget.ResidentBytes)
+		mergeResidentObserver(peak, run, bounds.residentBytes)
 	}
 
 	return newParts, nil
 }
 
-// mergeResidentObserver, when non-nil, receives after each merge the most decoded rows its open
-// writers held together, the most one append added, and the limit. Test seam only.
+// mergeResidentObserver, when non-nil, receives after each merge the most its open writers held in
+// RAM together, the most one append added, and the resident limit. Test seam only.
 var mergeResidentObserver func(peak, run, limit int64)
 
-// mergeRunFraction is how much of the limit one append to a day's writer may add before the writers
-// are checked against it: they peak at the limit plus this share of it, however many rows one stream
-// holds in one day.
+// mergeRunFraction is how much of the part bound one append to a day's writer may add before the
+// writer is checked against it: a part reaches at most the bound plus this share of it, however many
+// rows one stream holds in one day.
 const mergeRunFraction = 4
 
 // Close flushes any buffered records to a part and closes the WAL. It does not stop a background

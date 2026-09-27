@@ -54,11 +54,13 @@ re-exported exemplars at ingest is its own change. Record specifics:
 
 - The day writers stream (§ Merge write side), so a merge across days holds a writer per open day —
   frames, dictionaries and sidecar state — never a day's rows.
-- The writers are checked against the cap after every append, which is at most one output granule and
-  at most a quarter of the cap of one stream's rows in one day, so they peak at 1.25× the cap in
-  decoded rows however many rows one stream holds in one day. A retention rewrite takes its bucket's
-  forced parts only up to the cap, so its day is about the budget
-  (`TestRetentionRewriteHoldsResidentShare`), unless one forced part over the cap is rewritten alone.
+- A writer is sealed once it has taken the cap in decoded rows, and the largest open writer once the
+  writers together hold the merge's admitted share in RAM (§ Merge write side). Both are checked after
+  every append — at most one output granule, and at most a quarter of the cap of one stream's rows in
+  one day — so a part reaches at most 1.25× the cap, and the writers exceed the share by at most one
+  append. A retention rewrite takes its bucket's forced parts only up to the cap, so its day is about
+  the budget (`TestRetentionRewriteHoldsResidentShare`), unless one forced part over the cap is
+  rewritten alone.
 - A side-store engine (profiles) writes the unioned symbol sidecar under each day's part, since each is
   the one home a reader looks in.
 - Measured on a 17-day batch (16 parts × 64 streams, hourly, 64 MiB parts;
@@ -102,9 +104,10 @@ set is read windows and writer state (§ Merge write side), and the divisor of t
 an output buffer the merge never holds. Free space does not enter; the flush cap and the tiering
 target bound the disk.
 
-The cap reaches the merge as `mergestream.Budget{ResidentBytes: cap}` — one type for both engines'
-seal units, so this engine cannot grow a second, differently-named one when it gains a disk bound
-(`internal/mergestream/ARCH.md`). The stream union the merge walks comes from the same package:
+A merge seals on two numbers (`mergeBounds`): the cap, per output part in decoded rows, and the
+merge's admitted share (`mergeMemoryBudgetBytes`, what `Config.MergeAdmission` reserves), over what
+its open writers hold in RAM. Neither bounds the other, and only the second is a memory bound. The
+stream union the merge walks comes from `internal/mergestream`:
 `mergestream.Keys` over each part's already-sorted `ranges`, a k-way heap rather than a map of every
 distinct stream. It collapses repeats within a part as the map did, which matters because an
 unsorted stream column leaves `buildRanges` with two runs carrying the same id.
@@ -213,7 +216,7 @@ the next-best head — each at most one output granule, a quarter of the cap and
 to its day's `recordPartStreamWriter` in one call per column.
 
 **A part is sealed between spans, inside a stream as readily as between two.** The writers are
-checked against the cap after every append (§ Straddlers), so a part overshoots it by at most one
+checked against both bounds after every append (§ Straddlers), so either is overshot by at most one
 append. A stream split by a seal is one contiguous, ts-ordered run in each part — all `part.lookup`,
 `buildRanges` and `tsWindow` require — and the fragments take the split group's joint claim like any
 split: `planMergeBlocks` sees block intervals, never a stream id
@@ -228,6 +231,23 @@ table (`Bind`: copied, since the next decode overwrites it) — so a row costs t
 not a hash. No union of the sources' dictionaries is built. On the real 8-part log merge that union was
 408,552 `attrs` values (129 MiB); the dictionary the writer builds for a part is capped at 65,536
 entries (17.8 MiB there).
+
+**Writers are shed on everything they hold.** A writer's `residentBytes` is what dropping it gives
+back: the block writer's frames, directories, output dictionaries and staged granules; the per-entry
+caches of each source binding, 12 B per entry of every source dictionary it bound; the sidecar state
+below; and, over a backend that takes objects whole, the frames already handed over, at twice their
+size for the buffer's growth. The bindings are what make a straddling merge expensive: every day's
+writer binds every source's dictionaries, so they multiply with sources × columns × open days — 16
+sources, 3 dictionary columns and 32 days at 65,536 entries is 1.1 GiB. A binding's cache maps the
+source's entries into that writer's own dictionary and granule, so it cannot be shared across
+writers; it is made only for a (source, column) the writer receives rows from, and the router sheds
+the largest writer once the open ones reach the share. `TestMergeWritersHoldAdmittedShare` (8 sources
+× 3 dictionary columns of ~16k entries × 8 days): unbounded, the writers hold 85.7 MiB at a 95.6 MiB
+peak heap; at a 32 MiB share they report at most 40 MiB (one append adds up to 8 MiB) at a 53.9 MiB
+peak heap. `TestRecordPartWriterResidentTracksHeap` checks the figure against the heap a writer gives
+back when dropped: 29.3 MiB reported, 22.1 MiB released over the memory backend, the difference being
+buffered objects counted at twice their size. The share bounds the writers only; the read windows and
+the sources' decoded dictionaries are not charged against it.
 
 **Sidecars are built from the same rows.** Identities and watermarks are per stream. A bloom cannot be
 sized before its column's last row, so `bloomAccum` keeps each distinct token as its probe hashes (16 B,

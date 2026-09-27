@@ -14,7 +14,8 @@ const MaxOpenWriters = 32
 //
 // At most MaxOpen writers are open, and together they hold less than ResidentLimit (≤ 0 ⇒
 // unbounded) after every run [Router.Append] routes: past either bound the writer holding the most is
-// finished early. A day can therefore end up in several parts, each of which still fits the day, and
+// finished early. A writer's size is whatever Resident reports, so it must count everything the
+// writer holds. A day can therefore end up in several parts, each of which still fits the day, and
 // the ladder merges them later. The limit is checked per run rather than per series, so one series
 // spanning every open day overshoots it by one run, not by one writer's worth per day.
 type Router[W any] struct {
@@ -26,7 +27,7 @@ type Router[W any] struct {
 
 	open map[int64]W
 	// peak is the most the open writers held together, seen as each run landed; run the most one
-	// run added.
+	// run added, counting the writer it opened.
 	peak, run int64
 }
 
@@ -34,12 +35,17 @@ type Router[W any] struct {
 // appends it and reports whether the writer is full, which finishes it. The open writers are then
 // shed back under ResidentLimit.
 func (r *Router[W]) Append(ts int64, add func(W) (full bool, err error)) error {
+	_, existed := r.open[Of(ts, Top())]
+
 	w, err := r.Writer(ts)
 	if err != nil {
 		return err
 	}
 
-	before := r.Resident(w)
+	var before int64
+	if existed {
+		before = r.Resident(w)
+	}
 
 	full, err := add(w)
 	if err != nil {
@@ -104,12 +110,9 @@ func (r *Router[W]) Seal(ts int64) error {
 	return r.Finish(w)
 }
 
-// Shed finishes the largest writers while the open ones together hold ResidentLimit or more.
+// Shed finishes the largest writers while the open ones together hold ResidentLimit or more. The
+// peak is tracked whether or not a limit is set.
 func (r *Router[W]) Shed() error {
-	if r.ResidentLimit <= 0 {
-		return nil
-	}
-
 	for first := true; len(r.open) > 0; first = false {
 		var total int64
 		for _, w := range r.open {
@@ -120,7 +123,7 @@ func (r *Router[W]) Shed() error {
 			r.peak = max(r.peak, total)
 		}
 
-		if total < r.ResidentLimit {
+		if r.ResidentLimit <= 0 || total < r.ResidentLimit {
 			return nil
 		}
 

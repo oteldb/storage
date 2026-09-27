@@ -42,11 +42,10 @@ which bounds the other:
   index, aggregate sidecar) rather than with encoded bytes, so a merge of very short series reaches
   it long before the disk cap.
 
-Naming both here is the point: the record engine today has only one number, denominated in decoded
-bytes — the resident unit — and the metric engine has both. Giving them one type keeps the record
-engine from inventing a second unit of its own when it grows one, and makes the asymmetry visible at
-the call site instead of buried in a helper's prose. `Budget` changes no threshold; it only names the
-ones the engines already compute.
+The metric engine seals on both. The record engine seals on the resident unit too, but its part
+bound is in *decoded* bytes — the unit its size tiers compare parts in — which is neither of these,
+so it names its pair itself (`recordengine/ARCH.md`, "Merge cap"). `Budget` changes no threshold; it
+only names the ones the engines compute.
 
 ## `CheckForward` / `ErrNotForward`
 

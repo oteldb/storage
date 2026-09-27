@@ -2,6 +2,7 @@ package recordengine
 
 import (
 	"context"
+	"unsafe"
 
 	"github.com/go-faster/errors"
 
@@ -54,8 +55,14 @@ type recordPartStreamWriter struct {
 
 	sinks []*columnSink
 	// binds holds, per source and byte column, the binding to a table that outlives the source's
-	// next decode and the one to a table that does not.
+	// next decode and the one to a table that does not; each is made on the first rows it carries,
+	// and bound counts them.
 	binds []sourceBindings
+	bound int
+
+	// buffered is set over a backend that takes an object whole: every frame a column hands over
+	// stays in RAM until the part commits.
+	buffered bool
 }
 
 type sourceBindings struct {
@@ -75,12 +82,13 @@ func newRecordPartStreamWriter(ctx context.Context, e *Engine, src []*part) (*re
 	}
 
 	w := &recordPartStreamWriter{
-		e:       e,
-		src:     src,
-		prefix:  e.newPartPrefix(),
-		granule: e.mergeGranule,
-		sinks:   make([]*columnSink, schema.numBytes()),
-		binds:   make([]sourceBindings, len(src)*schema.numBytes()),
+		e:        e,
+		src:      src,
+		prefix:   e.newPartPrefix(),
+		granule:  e.mergeGranule,
+		buffered: !backend.StreamsWrites(e.cfg.Backend),
+		sinks:    make([]*columnSink, schema.numBytes()),
+		binds:    make([]sourceBindings, len(src)*schema.numBytes()),
 	}
 	w.w = block.NewStreamWriterTo(ctx, e.cfg.Backend, w.prefix, opts...)
 
@@ -198,6 +206,7 @@ func (w *recordPartStreamWriter) binding(
 		}
 
 		*b = nb
+		w.bound++
 	}
 
 	if *bound == gen {
@@ -221,6 +230,34 @@ func (w *recordPartStreamWriter) binding(
 // decodedBytes is the decoded size of the rows written so far: the part's [part.sizeBytes] once
 // written, and what the merge cap is denominated in.
 func (w *recordPartStreamWriter) decodedBytes() int64 { return w.decoded }
+
+// residentBytes is everything the writer holds in RAM: the block writer's unsealed frames, directories,
+// output dictionaries, staged granules and the per-entry caches of every source binding
+// ([block.StreamWriter.ResidentBytes]), plus the sidecar state — a watermark per stream, and per bloom
+// or attributes column its token hashes, value dedup and keys — and, over a backend that takes objects
+// whole, the frames already handed over. It is what the router sheds writers on,
+// so it must not undercount: the bindings alone are 12 B per entry of every source dictionary bound,
+// for each open day.
+func (w *recordPartStreamWriter) residentBytes() int64 {
+	const (
+		wmarkBytes   = 24
+		bindingBytes = 128
+	)
+
+	n := w.w.ResidentBytes() + int64(cap(w.wmarks))*wmarkBytes
+	if w.buffered {
+		// A buffered object grows by append, so its capacity runs up to twice what it holds.
+		n += 2 * w.w.EncodedBytes()
+	}
+
+	n += int64(cap(w.binds))*int64(unsafe.Sizeof(sourceBindings{})) + int64(w.bound)*bindingBytes
+
+	for _, s := range w.sinks {
+		n += s.residentBytes()
+	}
+
+	return n
+}
 
 // abort releases the part's in-flight column objects; a no-op once the part is written.
 func (w *recordPartStreamWriter) abort() { w.w.Abort() }

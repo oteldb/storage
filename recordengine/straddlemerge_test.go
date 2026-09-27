@@ -15,9 +15,9 @@ import (
 	"github.com/oteldb/storage/recordengine"
 )
 
-// TestStraddlerMergeHoldsResidentShare bounds the decoded rows one large stream spread over many days
-// makes the open day writers take together before one is sealed: the merge's share, overshot by at
-// most one append, not a part's worth per day.
+// TestStraddlerMergeHoldsResidentShare bounds what one large stream spread over many days makes the
+// open day writers hold in RAM together: the merge's share, overshot by at most one append, not a
+// writer's worth per day. Every part stays within the cap too.
 //
 //nolint:paralleltest // sets the package-global resident observer
 func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
@@ -36,6 +36,7 @@ func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
 			ctx := context.Background()
 			e := recordengine.New(recordengine.Config{
 				Schema: testSchema, Backend: backend.Memory(), Prefix: "t/recs", MaxPartBytes: 16 << 10,
+				MergeMemoryBytes: straddleShare,
 			})
 
 			n := days * 24 * 6
@@ -56,6 +57,7 @@ func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
 			assert.LessOrEqual(t, peak, limit+run, "the day writers outgrew the resident share")
 			assert.Less(t, run, limit, "one day's run must fit the share for the bound to mean anything")
 			assert.Greater(t, peak, limit/2, "the writers must come near the share for the bound to be tested")
+			assertPartsWithinCap(t, e, straddleShare/3)
 
 			got := 0
 			for _, b := range fetchAll(t, e, req("api")) {
@@ -67,10 +69,24 @@ func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
 	}
 }
 
+// straddleShare is the merge memory the straddler tests give: small enough that the open day writers
+// reach it, so the bound is exercised.
+const straddleShare = 192 << 10
+
+// assertPartsWithinCap asserts every part is within the merge cap plus the one append the cap is
+// checked after — at most a quarter of it.
+func assertPartsWithinCap(t *testing.T, e *recordengine.Engine, capBytes int64) {
+	t.Helper()
+
+	for _, p := range e.Parts() {
+		assert.LessOrEqual(t, p.SizeBytes, capBytes+capBytes/4+1024, "part %s outgrew the cap", p.ID)
+	}
+}
+
 // TestRetentionRewriteHoldsResidentShare bounds one stream's single day: retention forces every part
 // of its bucket, and each merge takes as many as the cap admits, so the stream's surviving rows of
-// that day are one run about the size of the resident share. The writers must still peak at the
-// share plus a fixed fraction of it, and the backlog must drain.
+// that day are one run about the size of the cap. It is written in parts within the cap, the writers
+// within the resident share, and the backlog must drain.
 //
 //nolint:paralleltest // sets the package-global resident observer
 func TestRetentionRewriteHoldsResidentShare(t *testing.T) {
@@ -79,13 +95,14 @@ func TestRetentionRewriteHoldsResidentShare(t *testing.T) {
 		step  = int64(time.Minute)
 	)
 
-	var peak, limit int64
+	var peak, run, limit int64
 
-	defer recordengine.SetMergeResidentObserver(func(p, _, l int64) { peak, limit = max(peak, p), l })()
+	defer recordengine.SetMergeResidentObserver(func(p, r, l int64) { peak, run, limit = max(peak, p), max(run, r), l })()
 
 	ctx := context.Background()
 	e := recordengine.New(recordengine.Config{
 		Schema: testSchema, Backend: backend.Memory(), Prefix: "t/recs", MaxPartBytes: 16 << 10,
+		MergeMemoryBytes: straddleShare,
 	})
 
 	body := strings.Repeat("x", 200)
@@ -113,7 +130,9 @@ func TestRetentionRewriteHoldsResidentShare(t *testing.T) {
 	}
 
 	require.Positive(t, limit)
-	assert.LessOrEqual(t, peak, limit+limit/4+1024, "the day's run must be routed in bounded pieces")
+	assert.LessOrEqual(t, peak, limit+run, "the writers outgrew the resident share")
+	assert.Greater(t, e.PartCount(), 2, "the day's run must be written in several parts")
+	assertPartsWithinCap(t, e, straddleShare/3)
 
 	got := 0
 	for _, b := range fetchAll(t, e, req("api")) {

@@ -448,8 +448,8 @@ func TestPlanMergeBlocksSameStreamBothSides(t *testing.T) {
 	// The same shape through the engine: fragments committed, each with a fresh block and the joint
 	// claim, and the stream still reads back whole.
 	e2 := New(Config{Schema: headTestSchema, Backend: backend.Memory(), Prefix: "t/midstream",
-		MaxPartBytes: 4 << 10, MergeMemoryBytes: 1})
-	e2.mergeGranule = 16
+		MaxPartBytes: 4 << 10, MergeMemoryBytes: -1})
+	e2.mergeGranule, e2.mergeCap = 16, 4<<10
 
 	for _, p := range src {
 		c, err := p.readCols(ctx, fullSel(headTestSchema), nil, nil)

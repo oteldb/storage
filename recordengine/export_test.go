@@ -77,6 +77,9 @@ func (e *Engine) SetMergeReadWindow(n int64) { e.mergeReadWindow = n }
 // SetMergeGranule sets the granule a merge writes its output at, and so checks it for sealing at.
 func (e *Engine) SetMergeGranule(n int) { e.mergeGranule = n }
 
+// SetMergeCap sets the decoded size a merge seals output parts at, leaving the memory share alone.
+func (e *Engine) SetMergeCap(n int64) { e.mergeCap = n }
+
 // SetMergeReadWhole forces every merge source onto the whole decode, the oracle the forward cursor is
 // compared against, and returns the restore.
 func SetMergeReadWhole(v bool) func() {

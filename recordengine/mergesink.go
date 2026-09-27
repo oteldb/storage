@@ -3,6 +3,7 @@ package recordengine
 import (
 	"bytes"
 	"slices"
+	"unsafe"
 
 	"github.com/zeebo/xxh3"
 
@@ -15,9 +16,31 @@ import (
 type columnSink struct {
 	bloom *bloomAccum
 	keys  recordKeySet
+	// keyBytes is what the keys hold: their bytes and a string header each.
+	keyBytes int64
 	// seen maps a value's hash to its token count, so a repeated value is neither tokenized nor
 	// decoded again; see [bloomBuilder.markRows] for why a 64-bit hash is enough.
 	seen map[uint64]int32
+}
+
+// Resident costs of the sink's maps per entry, rounded up from the runtime's layout: a slot plus its
+// control byte at the table's maximum load, and for a key its string header.
+const (
+	seenEntryBytes = 32
+	keyEntryBytes  = 48
+)
+
+func (s *columnSink) residentBytes() int64 {
+	if s == nil {
+		return 0
+	}
+
+	n := int64(len(s.seen))*seenEntryBytes + s.keyBytes
+	if s.bloom != nil {
+		n += int64(cap(s.bloom.pairs.slots)) * int64(unsafe.Sizeof(hashPair{}))
+	}
+
+	return n
 }
 
 // newColumnSink returns the sink byte column k of schema needs, or nil when it feeds no sidecar.
@@ -73,7 +96,7 @@ func (s *columnSink) add(v []byte) {
 	}
 
 	if s.keys != nil {
-		s.keys.add(v)
+		s.keyBytes += s.keys.add(v)
 	}
 
 	if len(s.seen) < maxDedupRows {
@@ -208,12 +231,18 @@ func (s *hashPairs) each(fn func(h1, h2 uint64)) {
 // recordKeySet is the distinct record-attribute keys of the attribute blobs added to it.
 type recordKeySet map[string]struct{}
 
-func (s recordKeySet) add(blob []byte) {
+// add adds blob's keys, returning what the new ones cost resident.
+func (s recordKeySet) add(blob []byte) int64 {
+	var added int64
+
 	forEachAttrKey(blob, func(key []byte) {
 		if _, ok := s[string(key)]; !ok {
 			s[string(key)] = struct{}{}
+			added += int64(len(key)) + keyEntryBytes
 		}
 	})
+
+	return added
 }
 
 // sorted returns the keys as owned copies, in order.

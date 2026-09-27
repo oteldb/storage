@@ -170,6 +170,9 @@ type Engine struct {
 	mergeReadWindow int64
 	// mergeGranule is the granule a merge writes its output at ([mergeGranuleRows]).
 	mergeGranule int
+	// mergeCap, when positive, replaces [Engine.mergeCapBytes]. Test seam only: it sets the part
+	// bound without the memory share the cap is otherwise derived from.
+	mergeCap int64
 	// retiring holds parts removed from the live set by flush/merge, pending backend deletion once
 	// their in-flight fetch readers drain (deferred reclamation; see reclaim.go).
 	retiring []*part
