@@ -250,6 +250,8 @@ var suite = []struct {
 	{"AdoptedWantIsRepairedIntoTheIndex", adoptedWantIsRepairedIntoTheIndex},
 	{"AdoptWantsIgnoresWhatIsAlreadyHere", adoptWantsIgnoresWhatIsAlreadyHere},
 	{"WideSplitGroupIsRepaired", wideSplitGroupIsRepaired},
+	{"SplitGroupAtCycleBoundaryIsRepaired", splitGroupAtCycleBoundaryIsRepaired},
+	{"SplitGroupMemberLostEverywhereBecomesHole", splitGroupMemberLostEverywhereBecomesHole},
 	{"RefreshReplicaTrimsPerStream", refreshReplicaTrimsPerStream},
 	{"PromotedReplicaKeepsLateRow", promotedReplicaKeepsLateRow},
 	{"MidFlushAppendSurvivesCrash", midFlushAppendSurvivesCrash},

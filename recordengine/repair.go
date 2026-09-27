@@ -2,40 +2,14 @@ package recordengine
 
 import (
 	"context"
-	"maps"
 	"slices"
-	"strings"
-
-	"github.com/go-faster/errors"
 
 	"github.com/go-faster/sdk/zctx"
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/internal/repair"
 )
-
-// repairFetchesPerCycle bounds how many wants one merge cycle tries to repair. The
-// [PartFetcher] bounds how many part copies that cycle runs concurrently.
-//
-// A repair fetch copies a whole part — up to Config.MaxPartBytes — from a peer, so an unbounded
-// pass on a badly damaged node would spend the entire maintenance cycle in the network and never
-// compact. The number is small on purpose: repair is anti-entropy, it runs every cycle, and a
-// shard that needs more than a handful of parts back is past what part-by-part repair is for.
-//
-// The fetching side is not the side that needs the real budget. Under pull, every recovering node
-// converges on whichever peers hold the data, so it is the *serving* side that turns one node's
-// disk failure into a shard-wide degradation; capping it is future work.
-const repairFetchesPerCycle = 4
-
-// holeConfirmations is how many consecutive repair attempts must reach the same definitive-absence
-// conclusion before the loss is acknowledged with a hole.
-//
-// One pass is a snapshot, not evidence. A peer that is up, in the ring, and has not yet finished
-// loading its bucket index answers "no such part" truthfully and prematurely; so does one caught
-// between the two writes of a part commit. Requiring the conclusion to repeat costs a few
-// maintenance cycles of an outstanding want — a visible, recoverable state — and buys out the
-// entire class of momentarily-wrong views.
-const holeConfirmations = 3
 
 // RepairStats counts what repair has done over this engine's lifetime.
 type RepairStats = bucketindex.RepairStats
@@ -63,40 +37,6 @@ func (e *Engine) Holes() []bucketindex.Entry {
 	defer e.mu.Unlock()
 
 	return slices.Clone(e.holes)
-}
-
-// repairTarget is one part repair will try to make local this cycle: an outstanding want, or the
-// identity a hole stands in for — a hole is revocable, so it is re-attempted like a want.
-type repairTarget struct {
-	want bucketindex.Want
-	hole bool
-	// sibling marks a target derived from a split group rather than read from the index: it names
-	// blocks, not a prefix, and nothing about it is ever committed. See [siblingTargets].
-	sibling bool
-}
-
-// repairResult is what one target's fetch concluded.
-type repairResult struct {
-	repairTarget
-
-	entry   bucketindex.Entry
-	outcome bucketindex.WantOutcome
-	// opened is the part when this node's own backend held it; nil for one a peer supplied.
-	opened *part
-}
-
-// uncount reverses what a satisfied target added to the stats when its part will not open.
-func (r *repairResult) uncount(s *RepairStats) {
-	switch {
-	case r.hole:
-		s.Revoked--
-	case r.opened != nil:
-		s.Local--
-	default:
-		s.Fetched--
-	}
-
-	s.Failed++
 }
 
 // repairWants discharges what it can of this engine's outstanding repair obligations before the
@@ -131,62 +71,32 @@ func (e *Engine) repairWants(ctx context.Context) {
 		return
 	}
 
-	// A want the local index already covers is discharged by the commit below and never reaches a
-	// peer: by the time repair runs, this engine's own merges may have produced the successor. The
-	// same test over a hole means the data came back on its own, and the commit revokes it.
-	ix := bucketindex.Index{Entries: entries}
-	pending := make([]repairTarget, 0, len(wants)+len(holes))
+	opened := make(map[string]*part)
+	pass := repair.Pass{
+		Fetcher: e.cfg.Repair,
+		Prefix:  e.cfg.Prefix,
+		Hold: func(ctx context.Context, prefix string) bool {
+			p, err := e.openRepaired(ctx, prefix)
+			if err != nil {
+				return false
+			}
 
-	var stats RepairStats
+			opened[prefix] = p
 
-	for i := range wants {
-		w := &wants[i]
-		if _, ok := ix.Satisfying(*w); ok {
-			stats.Local++
-
-			continue
-		}
-
-		pending = append(pending, repairTarget{want: *w})
+			return true
+		},
 	}
 
-	for i := range holes {
-		w := bucketindex.WantOf(holes[i], bucketindex.Generation{})
-		if _, ok := ix.Satisfying(w); ok {
-			stats.Revoked++
+	plan := pass.Run(ctx, entries, wants, holes)
 
-			continue
-		}
+	lost := e.confirmLost(wants, plan)
+	plan.Stats.Lost = int64(len(lost))
 
-		pending = append(pending, repairTarget{want: w, hole: true})
-	}
+	e.observeRepair(ctx, e.publishRepaired(ctx, plan, opened, lost))
+}
 
-	held, remote := e.openHeld(ctx, pending, &stats)
-
-	results, failed, fetchStats := e.fetchWants(ctx, remote)
-	stats.Add(fetchStats)
-
-	results = append(results, held...)
-
-	// A want answered by a split group is answered with one member of it, and the rest of the group
-	// has to arrive in the same commit: a fragment landing beside the ancestors it partly duplicates,
-	// with nothing yet able to retire them, would have those rows read twice. The group's other
-	// members are only knowable once one of them is in hand, which is why this is a second round.
-	if extra := siblingTargets(&ix, wants, results); len(extra) > 0 {
-		more, _, extraStats := e.fetchWants(ctx, extra)
-		stats.Add(extraStats)
-
-		results = append(results, dropIncompleteGroups(&ix, results, more)...)
-	}
-
-	// Deterministic order so the parts are opened, and any supersession applied, the same way on
-	// every node.
-	slices.SortFunc(results, func(a, b repairResult) int { return strings.Compare(a.want.Prefix, b.want.Prefix) })
-
-	lost := e.confirmLost(wants, results, failed)
-	stats.Lost = int64(len(lost))
-
-	e.observeRepair(ctx, e.publishRepaired(ctx, results, lost, stats))
+func (e *Engine) openRepaired(ctx context.Context, prefix string) (*part, error) {
+	return openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, e.cfg.Obs.Corruption)
 }
 
 // observeRepair publishes the pass to the injected metrics catalog. Lost is a monotone counter
@@ -203,22 +113,9 @@ func (e *Engine) observeRepair(ctx context.Context, s RepairStats) {
 	o.Revoked(ctx, s.Revoked)
 }
 
-// confirmLost advances the per-want evidence that a part is gone and returns the wants that have
-// earned a hole. Two independent conditions must hold, because a hole over live data is worse than
-// an outstanding want in every way an operator cares about.
-//
-// The fetch must have reached every owner the shard is expected to have — [bucketindex.WantAbsent], never
-// [bucketindex.WantIncomplete]. The peer list repair is handed is whoever the cluster layer could offer, and
-// during a rolling restart that is a strict subset of the owners: two reachable peers lacking the
-// part says nothing about a third that holds it and is merely restarting.
-//
-// And the same conclusion must repeat over [holeConfirmations] consecutive attempts. A failed
-// attempt, named in failed, concludes nothing but still breaks the run. Evidence lives only in
-// memory, so a restart forgets it and repair has to earn it again — the bias is deliberately
-// toward leaving the want outstanding.
-func (e *Engine) confirmLost(
-	wants []bucketindex.Want, results []repairResult, failed []string,
-) []bucketindex.Want {
+// confirmLost advances this engine's absence evidence with the pass. The evidence lives only in
+// memory, so a restart forgets it and repair has to earn it again.
+func (e *Engine) confirmLost(wants []bucketindex.Want, plan repair.Plan) []bucketindex.Want {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -226,43 +123,7 @@ func (e *Engine) confirmLost(
 		e.holeEvidence = make(map[string]int)
 	}
 
-	outstanding := make(map[string]struct{}, len(wants))
-	for i := range wants {
-		outstanding[wants[i].Prefix] = struct{}{}
-	}
-
-	maps.DeleteFunc(e.holeEvidence, func(prefix string, _ int) bool {
-		_, ok := outstanding[prefix]
-
-		return !ok
-	})
-
-	for _, prefix := range failed {
-		delete(e.holeEvidence, prefix)
-	}
-
-	var lost []bucketindex.Want
-
-	for i := range results {
-		r := &results[i]
-		if r.hole || r.sibling {
-			continue
-		}
-
-		if r.outcome != bucketindex.WantAbsent {
-			delete(e.holeEvidence, r.want.Prefix)
-
-			continue
-		}
-
-		e.holeEvidence[r.want.Prefix]++
-		if e.holeEvidence[r.want.Prefix] >= holeConfirmations {
-			lost = append(lost, r.want)
-			delete(e.holeEvidence, r.want.Prefix)
-		}
-	}
-
-	return lost
+	return repair.ConfirmLost(e.holeEvidence, wants, plan.Attempts, plan.Failed)
 }
 
 // entriesLocked is this engine's part set as index entries — its own parts plus the ones it
@@ -281,138 +142,22 @@ func (e *Engine) entriesLocked() []bucketindex.Entry {
 	return append(out, e.foreign...)
 }
 
-// openHeld splits the targets into those whose part this node's own backend still holds and those
-// to ask peers for. The index said the part was gone, so the disk is asked before any peer: the
-// index this engine loaded may be a peer's copy that knows nothing of this disk. Holding is proven
-// by opening the part — surviving objects under the prefix are not a readable part.
-func (e *Engine) openHeld(
-	ctx context.Context, pending []repairTarget, stats *RepairStats,
-) (held []repairResult, remote []repairTarget) {
-	for i := range pending {
-		t := &pending[i]
-		if t.sibling {
-			remote = append(remote, *t)
-
-			continue
-		}
-
-		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, t.want.Prefix, e.cfg.Obs.Corruption)
-		if err != nil {
-			remote = append(remote, *t)
-
-			continue
-		}
-
-		if t.hole {
-			stats.Revoked++
-		} else {
-			stats.Local++
-		}
-
-		held = append(held, repairResult{
-			repairTarget: *t, entry: t.want.Entry(), outcome: bucketindex.WantSatisfied, opened: p,
-		})
-	}
-
-	return held, remote
-}
-
-// fetchWants pulls up to [repairFetchesPerCycle] targets' parts from peers in one call — the
-// fetcher answers the whole cycle at once so it can read each peer's index once and copy a part
-// discharging several wants once — and returns what each attempt concluded. A failed attempt
-// concludes nothing, so it is never a result; failed names the wants it was made for.
-func (e *Engine) fetchWants(
-	ctx context.Context, pending []repairTarget,
-) ([]repairResult, []string, RepairStats) {
-	var stats RepairStats
-
-	if e.cfg.Repair == nil || len(pending) == 0 {
-		return nil, nil, stats
-	}
-
-	pending = pending[:min(len(pending), repairFetchesPerCycle)]
-
-	wants := make([]bucketindex.Want, len(pending))
-	for i := range pending {
-		wants[i] = pending[i].want
-	}
-
-	results := e.cfg.Repair.FetchWants(ctx, wants)
-
-	out := make([]repairResult, 0, len(pending))
-
-	var failed []string
-
-	for i := range pending {
-		t := &pending[i]
-
-		// A short answer is a broken fetcher, not evidence: count it as a transient failure so the
-		// want stays outstanding.
-		r := FetchResult{Err: errors.Errorf("repair fetcher returned %d results for %d wants", len(results), len(pending))}
-		if i < len(results) {
-			r = results[i]
-		}
-
-		if r.Err != nil {
-			stats.Failed++
-
-			if !t.hole && !t.sibling {
-				failed = append(failed, t.want.Prefix)
-			}
-
-			zctx.From(ctx).Warn("repair fetch failed",
-				zap.String("prefix", e.cfg.Prefix), zap.String("want", t.want.Prefix), zap.Error(r.Err))
-
-			continue
-		}
-
-		switch r.Outcome {
-		case bucketindex.WantSatisfied:
-			if t.hole {
-				stats.Revoked++
-			} else {
-				stats.Fetched++
-			}
-		case bucketindex.WantAbsent:
-			stats.Unsatisfiable++
-
-			zctx.From(ctx).Warn("no owner holds a part satisfying the want",
-				zap.String("prefix", e.cfg.Prefix), zap.String("want", t.want.Prefix))
-		case bucketindex.WantIncomplete:
-			stats.Incomplete++
-
-			zctx.From(ctx).Warn("repair could not reach every owner of the shard",
-				zap.String("prefix", e.cfg.Prefix), zap.String("want", t.want.Prefix))
-		}
-
-		out = append(out, repairResult{repairTarget: *t, entry: r.Entry, outcome: r.Outcome})
-	}
-
-	return out, failed, stats
-}
-
-// publishRepaired commits the cycle's outcome in one index write: the parts that came back, and
-// the holes standing in for the ones that never will. That single commit is what discharges the
-// wants ([Engine.nextIndexLocked] trims a want the committed entries discharge) and what revokes
-// any hole a committed part covers.
+// publishRepaired commits the pass's outcome in one index write: the parts [repair.Admit] lets
+// back in, and the holes standing in for the ones that never will. That single commit is what
+// discharges the wants ([Engine.nextIndexLocked] trims a want the committed entries discharge) and
+// what revokes any hole a committed part covers.
 //
 // Local parts a repaired one supersedes are retired in the same commit, because their rows are
 // inside it — the same swap a merge publishes.
 //
 // It returns stats as the commit's outcome corrected them, the only value [Engine.observeRepair]
-// may be given: a failed commit acknowledged no loss, and a part that would not open was not fetched.
+// may be given: a failed commit acknowledged no loss.
 func (e *Engine) publishRepaired(
-	ctx context.Context, results []repairResult, lost []bucketindex.Want, stats RepairStats,
+	ctx context.Context, plan repair.Plan, opened map[string]*part, lost []bucketindex.Want,
 ) RepairStats {
-	satisfied := make([]*repairResult, 0, len(results))
+	stats := plan.Stats
 
-	for i := range results {
-		if results[i].outcome == bucketindex.WantSatisfied {
-			satisfied = append(satisfied, &results[i])
-		}
-	}
-
-	if len(satisfied) == 0 && len(lost) == 0 && stats.Local == 0 && stats.Revoked == 0 {
+	if len(plan.Units) == 0 && len(lost) == 0 && stats.Local == 0 && stats.Revoked == 0 {
 		// Nothing changed, so there is nothing to commit; a want nobody could satisfy is left in
 		// the index exactly as it was, and only the counters move.
 		e.mu.Lock()
@@ -427,53 +172,26 @@ func (e *Engine) publishRepaired(
 
 	e.mu.Lock()
 
-	added := make([]*part, 0, len(satisfied))
-	opened := make([]bucketindex.Entry, 0, len(satisfied))
-
-	// Two wants are routinely answered by one merged successor, and a part opened twice would be
-	// committed twice and have its rows counted twice.
-	have := make(map[string]struct{}, len(e.parts))
-	for _, p := range e.parts {
-		have[p.prefix] = struct{}{}
-	}
-
-	// What this commit will hold, grown as parts open. `have` answers "this exact prefix is already
-	// in"; this answers the weaker and more useful question, "the want's blocks are already in" —
-	// which is what decides whether anything is still owed.
-	live := bucketindex.Index{Entries: e.entriesLocked()}
-
-	for _, r := range satisfied {
-		ent := r.entry
-		if _, dup := have[ent.Prefix]; dup {
-			continue
+	admitted := repair.Admit(ctx, e.entriesLocked(), plan.Units, func(r *repair.Result) error {
+		if r.Held {
+			return nil
 		}
 
-		have[ent.Prefix] = struct{}{}
-
-		p := r.opened
-		if p == nil {
-			var err error
-
-			p, err = openPart(ctx, e.cfg.Backend, e.cfg.Schema, ent.Prefix, e.cfg.Obs.Corruption)
-			if err != nil {
-				if _, covered := live.Satisfying(r.want); covered {
-					// Nothing failed and nothing is owed: a part already in this commit contains
-					// the want's blocks, so the copy this entry names has nothing left to
-					// discharge and the next cycle has nothing to retry. Counting it as a
-					// transient failure would report repair as stuck at the moment it converged.
-					continue
-				}
-
-				// The objects are here but unreadable: the want stays, and the next cycle re-copies.
-				zctx.From(ctx).Warn("repaired part is not readable",
-					zap.String("prefix", ent.Prefix), zap.Error(err))
-
-				r.uncount(&stats)
-
-				continue
-			}
+		p, err := e.openRepaired(ctx, r.Entry.Prefix)
+		if err != nil {
+			return err
 		}
 
+		opened[r.Entry.Prefix] = p
+
+		return nil
+	}, &stats)
+
+	added := make([]*part, 0, len(admitted))
+
+	for i := range admitted {
+		ent := &admitted[i]
+		p := opened[ent.Prefix]
 		p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
 		p.blocks, p.claim, p.level = ent.Blocks, ent.Claim, ent.Level
 
@@ -483,11 +201,9 @@ func (e *Engine) publishRepaired(
 		}
 
 		added = append(added, p)
-		opened = append(opened, ent)
-		live.Entries = append(live.Entries, ent)
 	}
 
-	superseded := supersededBy(e.parts, opened)
+	superseded := supersededBy(e.parts, admitted)
 
 	committed := e.parts
 	e.parts = replaceParts(e.parts, superseded, added...)
@@ -542,73 +258,4 @@ func supersededBy(parts []*part, fetched []bucketindex.Entry) map[string]struct{
 	}
 
 	return bucketindex.Subsumed(live, fetched)
-}
-
-// siblingTargets are the extra fetches a want answered by a split group needs: the members of that
-// group this node does not hold yet.
-//
-// A group's claim is realized only where every member is present, so one fetch per cycle would
-// never complete it — a peer names one member per want, and names the same one every time. The
-// missing members are therefore asked for by block instead of by prefix, which any peer resolves
-// against its own index by ordinary containment.
-//
-// They are targets and never wants: nothing about them reaches the index, so a cycle that fetches
-// none leaves it exactly as it was, and the obligation stays the original want's.
-func siblingTargets(ix *bucketindex.Index, wants []bucketindex.Want, got []repairResult) []repairTarget {
-	var out []repairTarget
-
-	seen := make(map[uint64]struct{})
-	known := bucketindex.Index{Entries: slices.Concat(ix.Entries, satisfiedEntries(got))}
-
-	for i := range wants {
-		w := &wants[i]
-		for _, b := range known.Missing(*w) {
-			if _, dup := seen[b]; dup {
-				continue
-			}
-
-			seen[b] = struct{}{}
-			out = append(out, repairTarget{
-				want: bucketindex.Want{
-					Blocks: bucketindex.Blocks(b), MinTime: w.MinTime, MaxTime: w.MaxTime,
-				},
-				sibling: true,
-			})
-		}
-	}
-
-	return out
-}
-
-// satisfiedEntries are the parts a repair round actually made local.
-func satisfiedEntries(results []repairResult) []bucketindex.Entry {
-	out := make([]bucketindex.Entry, 0, len(results))
-	for i := range results {
-		if results[i].outcome == bucketindex.WantSatisfied {
-			out = append(out, results[i].entry)
-		}
-	}
-
-	return out
-}
-
-// dropIncompleteGroups discards the group members a round could not complete — the per-cycle fetch
-// budget cuts a wide split short — so a partial group is never committed. Its rows overlap the
-// ancestors the node still holds and nothing could retire them, so half a group is worse than none;
-// the objects stay copied and the next cycle asks again.
-func dropIncompleteGroups(ix *bucketindex.Index, have, results []repairResult) []repairResult {
-	entries := slices.Concat(ix.Entries, satisfiedEntries(have), satisfiedEntries(results))
-
-	out := results[:0]
-
-	for i := range results {
-		r := &results[i]
-		if r.outcome == bucketindex.WantSatisfied && !r.entry.Complete(entries) {
-			continue
-		}
-
-		out = append(out, *r)
-	}
-
-	return out
 }
