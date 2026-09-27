@@ -16,7 +16,6 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/internal/partid"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/recordengine"
 )
 
@@ -51,29 +50,25 @@ func dumpBackend(t *testing.T, b backend.Backend) map[string][]byte {
 	return canonicalizePartIDs(out)
 }
 
-// partIDPattern matches a part id that follows a path separator, the only shape one takes in a key
-// or in the length-prefixed prefixes an object body embeds.
+// partIDPattern matches a part id that follows a path separator, the only shape one takes in a key.
 var partIDPattern = regexp.MustCompile(`/([0-9A-HJKMNP-TV-Z]{26})`)
 
 // canonicalizePartIDs rewrites every part id in a backend dump — in keys and in object bodies, which
 // embed their own prefix — to its rank in creation order. The stand-in is the same length as an id,
 // so length-prefixed framing inside an object stays byte-identical.
+//
+// Only the id characters right after a store prefix are an id: column data may hold "/" and 26 id
+// characters too, overlapping, and renaming those would make the dump depend on the rename order.
 func canonicalizePartIDs(objs map[string][]byte) map[string][]byte {
+	prefixes := storePrefixes(objs)
 	ids := make(map[string]struct{})
 
-	collect := func(b []byte) {
-		for _, m := range partIDPattern.FindAllSubmatch(b, -1) {
-			if id := string(m[1]); partid.Valid(id) {
-				ids[id] = struct{}{}
+	for k, v := range objs {
+		for _, b := range [][]byte{[]byte(k), v} {
+			for _, at := range partIDOffsets(b, prefixes) {
+				ids[string(b[at:at+partid.EncodedLen])] = struct{}{}
 			}
 		}
-	}
-
-	for k, v := range objs {
-		collect([]byte(k))
-		// Bodies name parts too — the bucket index lists the merge's removed prefixes, which are
-		// gone from the backend and so appear in no key.
-		collect(v)
 	}
 
 	rename := make(map[string]string, len(ids))
@@ -81,24 +76,71 @@ func canonicalizePartIDs(objs map[string][]byte) map[string][]byte {
 		rename[id] = fmt.Sprintf("PART%022d", i)
 	}
 
-	out := make(map[string][]byte, len(objs))
-
-	for k, v := range objs {
-		for id, name := range rename {
-			k = strings.ReplaceAll(k, id, name)
-			v = bytes.ReplaceAll(v, []byte(id), []byte(name))
+	rewrite := func(b []byte) []byte {
+		out := bytes.Clone(b)
+		for _, at := range partIDOffsets(b, prefixes) {
+			copy(out[at:], rename[string(b[at:at+partid.EncodedLen])])
 		}
 
-		out[k] = v
+		return out
+	}
+
+	out := make(map[string][]byte, len(objs))
+	for k, v := range objs {
+		out[string(rewrite([]byte(k)))] = rewrite(v)
 	}
 
 	return out
 }
 
+// storePrefixes returns the prefixes, "/"-terminated, that the dump's parts live under: the path
+// before a part id in a key, or the directory of a key that names no part. The latter covers a dump
+// whose parts are all gone but still listed by the bucket index.
+func storePrefixes(objs map[string][]byte) []string {
+	set := make(map[string]struct{})
+
+	for k := range objs {
+		if m := partIDPattern.FindStringSubmatchIndex(k); len(m) == 4 && partid.Valid(k[m[2]:m[3]]) {
+			set[k[:m[2]]] = struct{}{}
+
+			continue
+		}
+
+		if dir := k[:strings.LastIndexByte(k, '/')+1]; dir != "" {
+			set[dir] = struct{}{}
+		}
+	}
+
+	return slices.Sorted(maps.Keys(set))
+}
+
+// partIDOffsets returns where in b a valid part id directly follows one of prefixes.
+func partIDOffsets(b []byte, prefixes []string) []int {
+	var offsets []int
+
+	for _, p := range prefixes {
+		for i := 0; ; {
+			j := bytes.Index(b[i:], []byte(p))
+			if j < 0 {
+				break
+			}
+
+			at := i + j + len(p)
+			if end := at + partid.EncodedLen; end <= len(b) && partid.Valid(string(b[at:end])) {
+				offsets = append(offsets, at)
+			}
+
+			i += j + 1
+		}
+	}
+
+	return offsets
+}
+
 // TestCanonicalizePartIDsLeavesIDShapedDataAlone: column data can hold "/" and 26 id characters, and
 // overlapping ones at that. Only an id under a store prefix is a part id.
 func TestCanonicalizePartIDsLeavesIDShapedDataAlone(t *testing.T) {
-	reproduce.Unfixed(t, 734, "id-shaped column data is renamed too, in map order")
+	t.Parallel()
 
 	const (
 		id   = "01M3J48M3C2T0B8EXGEW2XKKB6"
