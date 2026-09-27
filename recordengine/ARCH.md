@@ -12,10 +12,10 @@ retention, durable bucket-index, part-scoped identity, stateless read path, `Max
 and the same lock discipline ([`../engine/ARCH.md`](../engine/ARCH.md)).
 
 **All three of the identity's attribute sets are postings-indexed** — resource, scope, and the
-signal-level `Series.Attributes`. Logs, traces and profiles leave the last empty (their per-record
-attributes are a column, and profiles fold their type labels into the resource), so it costs them
-nothing. Exemplars carry the metric's data-point attributes and reserved labels (`__name__`, …)
-there, and a metric selector resolves exemplar streams only because those are matchable.
+signal-level `Series.Attributes`. Logs and traces leave the last empty (their per-record attributes
+are a column), so it costs them nothing. Exemplars carry the metric's data-point attributes and
+reserved labels (`__name__`, …) there, and a metric selector resolves exemplar streams only because
+those are matchable. Profiles carry their profile-level attributes there, for the same reason.
 
 ## Divergences from the metrics engine
 

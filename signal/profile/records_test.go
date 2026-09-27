@@ -133,7 +133,8 @@ func observationSums(pd *Profiles) map[string]int64 {
 		for _, sp := range rp.Scopes {
 			for pi := range sp.Profiles {
 				pr := &sp.Profiles[pi]
-				stream := streamSeries(rp.Resource, sp.Scope, resolveType(d, pr)).Hash()
+				profileAttrs := resolveAttributes(d, pr.AttributeIndices)
+				stream := streamSeries(rp.Resource, sp.Scope, resolveType(d, pr), profileAttrs).Hash()
 
 				for sx := range pr.Samples {
 					s := &pr.Samples[sx]
@@ -150,7 +151,7 @@ func observationSums(pd *Profiles) map[string]int64 {
 					b.Bytes[bProfileID] = [][]byte{pr.ProfileID}
 					b.Bytes[bTraceID] = [][]byte{traceID}
 					b.Bytes[bSpanID] = [][]byte{spanID}
-					b.Bytes[bAttrs] = [][]byte{resolveAttributes(d, pr.AttributeIndices, s.AttributeIndices).AppendHashInput(nil)}
+					b.Bytes[bAttrs] = [][]byte{sampleAttributes(d, profileAttrs, s.AttributeIndices).AppendHashInput(nil)}
 
 					switch {
 					case len(s.TimestampsUnixNano) == 0:
@@ -275,4 +276,94 @@ func randomProfiles(rng *rand.Rand) Profiles {
 	}
 
 	return pd
+}
+
+func attr(d *Dictionary, key, value string) int32 {
+	return d.AddAttribute(KeyValueAndUnit{KeyStrindex: d.InternString([]byte(key)), Value: signal.StringValue([]byte(value))})
+}
+
+func TestProjectProfileAttributesInIdentity(t *testing.T) {
+	t.Parallel()
+
+	var pd Profiles
+	d := &pd.Dictionary
+	st := buildStack(d, "f", "f.go")
+	docURL := attr(d, "pprof.profile.doc_url", "")
+	thread := attr(d, "thread.name", "worker")
+
+	rp := pd.AddResource()
+	rp.Resource = svcResource("api")
+	sp := rp.AddScope()
+
+	for _, attrs := range [][]int32{{docURL}, {docURL}, nil} {
+		pr := sp.AddProfile()
+		pr.TimeNanos = 1
+		pr.AttributeIndices = attrs
+		s := pr.AddSample()
+		s.StackIndex, s.Values, s.AttributeIndices = st, []int64{1}, []int32{thread}
+	}
+
+	var ids []signal.Series
+
+	Project(&pd, func(b *recordengine.Batch) {
+		id := b.Identity()
+		assert.Equal(t, id.Hash(), b.Stream)
+		ids = append(ids, id)
+
+		for _, cell := range b.Bytes[bAttrs] {
+			assert.Equal(t, signal.NewAttributes(
+				signal.KeyValue{Key: []byte("thread.name"), Value: signal.StringValue([]byte("worker"))},
+			).AppendHashInput(nil), cell, "the attrs column holds sample attributes only")
+		}
+	})
+
+	require.Len(t, ids, 2, "profiles sharing attributes share a stream")
+	assert.Equal(t, signal.NewAttributes(
+		signal.KeyValue{Key: []byte("pprof.profile.doc_url"), Value: signal.StringValue([]byte(""))},
+	), ids[0].Attributes)
+	assert.Empty(t, ids[1].Attributes)
+}
+
+// TestProjectDuplicateAttributeKey pins the precedence of a key set at both levels: the profile's
+// value answers a lookup on the row, as it did when both levels shared the attrs column.
+func TestProjectDuplicateAttributeKey(t *testing.T) {
+	t.Parallel()
+
+	var pd Profiles
+	d := &pd.Dictionary
+
+	rp := pd.AddResource()
+	rp.Resource = svcResource("api")
+	pr := rp.AddScope().AddProfile()
+	pr.TimeNanos = 1
+	pr.AttributeIndices = []int32{attr(d, "k", "profile"), attr(d, "p", "only")}
+	s := pr.AddSample()
+	s.StackIndex = buildStack(d, "f", "f.go")
+	s.Values = []int64{1}
+	s.AttributeIndices = []int32{attr(d, "k", "sample"), attr(d, "s", "only")}
+
+	var (
+		identity signal.Attributes
+		cell     []byte
+	)
+
+	Project(&pd, func(b *recordengine.Batch) {
+		identity = b.Identity().Attributes
+		cell = append([]byte(nil), b.Bytes[bAttrs][0]...)
+	})
+
+	v, ok := identity.Get([]byte("k"))
+	require.True(t, ok)
+	assert.Equal(t, "profile", string(v.Str()))
+
+	for key, want := range map[string]string{"k": "profile", "s": "only"} {
+		v, found, err := signal.LookupAttribute(cell, key)
+		require.NoError(t, err)
+		require.True(t, found, key)
+		assert.Equal(t, want, string(v.Str()), key)
+	}
+
+	_, found, err := signal.LookupAttribute(cell, "p")
+	require.NoError(t, err)
+	assert.False(t, found, "a profile attribute no sample shadows stays out of the row")
 }

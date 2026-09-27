@@ -29,11 +29,12 @@ const (
 	ColProfileID = "profile_id" // 16-byte OTLP profile id
 	ColTraceID   = "trace_id"   // linked span's trace id (16 bytes) or empty
 	ColSpanID    = "span_id"    // linked span's span id (8 bytes) or empty
-	ColAttrs     = "attrs"      // serialized per-sample attributes (profile ∪ sample)
+	ColAttrs     = "attrs"      // serialized sample attributes; profile attributes are in the identity
 )
 
 // Schema is the profiles vertical's record-engine column schema: one row per sample observation.
-// The profile type lives in the stream identity (see the reserved labels above), not a column.
+// The profile type and attributes live in the stream identity (see the reserved labels above), not a
+// column.
 // profile_id carries an equality bloom (profile-by-id pruning, future); attrs the attribute bloom.
 var Schema = recordengine.NewSchema(
 	recordengine.Column{Name: ColValue, Kind: recordengine.KindInt64, Codec: chunk.CodecT64},
@@ -71,12 +72,13 @@ func (t profileType) key() string {
 }
 
 // Project iterates a [Profiles] batch and calls emit once per stream — each (Resource, Scope,
-// profile-type) group — with a [recordengine.Batch] of that group's sample rows in the profiles
+// profile type, profile attributes) group — with a [recordengine.Batch] of that group's sample rows in the profiles
 // [Schema]'s column order, plus the content-addressed symbol delta (Batch.Side) the rows reference.
 // It returns the number of rows emitted.
 //
-// A scope's profiles are grouped by their type so each emitted stream carries exactly one type
-// (folded into its identity). Each sample flattens to rows: a sample with TimestampsUnixNano emits
+// A scope's profiles are grouped by type and attributes, so each emitted stream carries exactly one
+// of each: the type folds into the resource, the attributes are the identity's Series.Attributes.
+// A sample's own attributes fill the attrs column. Each sample flattens to rows: a sample with TimestampsUnixNano emits
 // one row per (timestamp, value); an aggregated sample emits one row at the profile's TimeNanos.
 // An observation whose value is 0 emits no row, and a stream left with no rows is not emitted.
 // Out-of-range dictionary indices are tolerated (resolve to zero), so a malformed batch never panics.
@@ -93,10 +95,10 @@ func Project(pd *Profiles, emit func(*recordengine.Batch)) (rows int) {
 		for si := range rp.Scopes {
 			sp := &rp.Scopes[si]
 
-			groups, order := groupByType(d, sp.Profiles)
+			groups, order := groupStreams(d, sp.Profiles)
 			for _, k := range order {
 				g := groups[k]
-				n := fillBatch(&b, d, rp.Resource, sp.Scope, g.typ, g.profiles)
+				n := fillBatch(&b, d, streamSeries(rp.Resource, sp.Scope, g.typ, g.attrs), g.profiles)
 				if n == 0 {
 					continue
 				}
@@ -110,25 +112,28 @@ func Project(pd *Profiles, emit func(*recordengine.Batch)) (rows int) {
 	return rows
 }
 
-type typeGroup struct {
+type streamGroup struct {
 	typ      profileType
+	attrs    signal.Attributes
 	profiles []*Profile
 }
 
-// groupByType buckets a scope's profiles by their resolved type, preserving first-seen order.
-func groupByType(d *Dictionary, profiles []Profile) (map[string]*typeGroup, []string) {
-	groups := map[string]*typeGroup{}
+// groupStreams buckets a scope's profiles by their resolved type and attributes, preserving
+// first-seen order.
+func groupStreams(d *Dictionary, profiles []Profile) (map[string]*streamGroup, []string) {
+	groups := map[string]*streamGroup{}
 
 	var order []string
 
 	for pi := range profiles {
 		pr := &profiles[pi]
 		typ := resolveType(d, pr)
-		k := typ.key()
+		attrs := resolveAttributes(d, pr.AttributeIndices)
+		k := typ.key() + "\x00" + string(attrs.AppendHashInput(nil))
 
 		g := groups[k]
 		if g == nil {
-			g = &typeGroup{typ: typ}
+			g = &streamGroup{typ: typ, attrs: attrs}
 			groups[k] = g
 			order = append(order, k)
 		}
@@ -157,12 +162,13 @@ func dictString(d *Dictionary, idx int32) []byte {
 	return nil
 }
 
-// streamSeries builds the stream identity for a (resource, scope, type): the resource attributes
-// with the four reserved profile-type labels folded in, so the type is matchable and enumerable.
-func streamSeries(res signal.Resource, scope signal.Scope, typ profileType) signal.Series {
-	attrs := make([]signal.KeyValue, 0, len(res.Attributes)+4)
-	attrs = append(attrs, res.Attributes...)
-	attrs = append(attrs,
+// streamSeries builds the stream identity for a (resource, scope, type, profile attributes): the
+// resource attributes with the four reserved profile-type labels folded in, so the type is
+// matchable and enumerable, and the profile attributes as the identity's own attribute set.
+func streamSeries(res signal.Resource, scope signal.Scope, typ profileType, attrs signal.Attributes) signal.Series {
+	labels := make([]signal.KeyValue, 0, len(res.Attributes)+4)
+	labels = append(labels, res.Attributes...)
+	labels = append(labels,
 		signal.KeyValue{Key: LabelSampleType, Value: signal.StringValue(typ.sampleType)},
 		signal.KeyValue{Key: LabelSampleUnit, Value: signal.StringValue(typ.sampleUnit)},
 		signal.KeyValue{Key: LabelPeriodType, Value: signal.StringValue(typ.periodType)},
@@ -170,16 +176,15 @@ func streamSeries(res signal.Resource, scope signal.Scope, typ profileType) sign
 	)
 
 	return signal.Series{
-		Resource: signal.Resource{SchemaURL: res.SchemaURL, Attributes: signal.NewAttributes(attrs...)},
-		Scope:    scope,
+		Resource:   signal.Resource{SchemaURL: res.SchemaURL, Attributes: signal.NewAttributes(labels...)},
+		Scope:      scope,
+		Attributes: attrs,
 	}
 }
 
-// fillBatch resets b and populates it from one (Resource, Scope, type) group's profiles, returning
-// the number of rows. It builds the content-addressed symbol delta into b.Side as it resolves each
-// sample's stack.
-func fillBatch(b *recordengine.Batch, d *Dictionary, res signal.Resource, scope signal.Scope, typ profileType, profiles []*Profile) int {
-	series := streamSeries(res, scope, typ)
+// fillBatch resets b and populates it from one stream's profiles, returning the number of rows. It
+// builds the content-addressed symbol delta into b.Side as it resolves each sample's stack.
+func fillBatch(b *recordengine.Batch, d *Dictionary, series signal.Series, profiles []*Profile) int {
 	b.Stream = series.Hash()
 	b.Identity = func() signal.Series { return series }
 
@@ -194,6 +199,7 @@ func fillBatch(b *recordengine.Batch, d *Dictionary, res signal.Resource, scope 
 
 	bld := newBuilder(d)
 	rows := 0
+	noAttrs := signal.Attributes(nil).AppendHashInput(nil)
 
 	for _, pr := range profiles {
 		for sx := range pr.Samples {
@@ -204,7 +210,10 @@ func fillBatch(b *recordengine.Batch, d *Dictionary, res signal.Resource, scope 
 
 			stackID := bld.stackID(s.StackIndex).AppendBinary(nil)
 			traceID, spanID := linkIDs(d, s.LinkIndex)
-			attrs := resolveAttributes(d, pr.AttributeIndices, s.AttributeIndices).AppendHashInput(nil)
+			attrs := noAttrs
+			if len(s.AttributeIndices) > 0 {
+				attrs = sampleAttributes(d, series.Attributes, s.AttributeIndices).AppendHashInput(nil)
+			}
 
 			emitRow := func(ts, value int64) {
 				if value == 0 {
@@ -277,34 +286,52 @@ func linkIDs(d *Dictionary, idx int32) (traceID, spanID []byte) {
 	return nil, nil
 }
 
-// resolveAttributes builds the [signal.Attributes] for a sample from the profile-level and
-// sample-level attribute indices into the dictionary (out-of-range indices skipped).
-func resolveAttributes(d *Dictionary, profileIdx, sampleIdx []int32) signal.Attributes {
-	if len(profileIdx)+len(sampleIdx) == 0 {
+// resolveAttributes builds the [signal.Attributes] for dictionary attribute indices (out-of-range
+// indices skipped).
+func resolveAttributes(d *Dictionary, indices []int32) signal.Attributes {
+	if len(indices) == 0 {
 		return nil
 	}
 
-	kvs := make([]signal.KeyValue, 0, len(profileIdx)+len(sampleIdx))
+	kvs := make([]signal.KeyValue, 0, len(indices))
 
-	add := func(indices []int32) {
-		for _, ai := range indices {
-			if !inRange(d.Attributes, ai) {
-				continue
-			}
+	for _, ai := range indices {
+		if !inRange(d.Attributes, ai) {
+			continue
+		}
 
-			a := d.Attributes[ai]
+		a := d.Attributes[ai]
 
-			var key []byte
-			if inRange(d.Strings, a.KeyStrindex) {
-				key = d.Strings[a.KeyStrindex]
-			}
+		var key []byte
+		if inRange(d.Strings, a.KeyStrindex) {
+			key = d.Strings[a.KeyStrindex]
+		}
 
-			kvs = append(kvs, signal.KeyValue{Key: key, Value: a.Value})
+		kvs = append(kvs, signal.KeyValue{Key: key, Value: a.Value})
+	}
+
+	return signal.NewAttributes(kvs...)
+}
+
+// sampleAttributes builds a sample's attrs cell. A key the profile also sets keeps the profile's
+// entry ahead of the sample's, so a first-match lookup still answers with the profile's value.
+func sampleAttributes(d *Dictionary, profile signal.Attributes, indices []int32) signal.Attributes {
+	sample := resolveAttributes(d, indices)
+	if len(profile) == 0 {
+		return sample
+	}
+
+	var shadowed []signal.KeyValue
+
+	for _, kv := range sample {
+		if v, ok := profile.Get(kv.Key); ok {
+			shadowed = append(shadowed, signal.KeyValue{Key: kv.Key, Value: v})
 		}
 	}
 
-	add(profileIdx)
-	add(sampleIdx)
+	if len(shadowed) == 0 {
+		return sample
+	}
 
-	return signal.NewAttributes(kvs...)
+	return signal.NewAttributes(append(shadowed, sample...)...)
 }

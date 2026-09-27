@@ -92,11 +92,36 @@ rides the part lifecycle through the record engine's side-store hook. Its refere
 `stack_id`: `SymbolStore.Retain` walks the same graph down from the head's stack ids to find the
 entries a replica must keep.
 
+**Profile attributes are identity; sample attributes are the `attrs` column.** A profile's
+attributes hold for every one of its samples, so a column copies them onto each row: a Go heap
+profile's empty `pprof.profile.*` keys were 96 of a row's 160 decoded bytes, and decoded bytes are
+what seals a merged part. They are the stream's `Series.Attributes` instead, the third identity set
+exemplars use for data-point attributes. The record engine postings-indexes it, so a profile attribute
+is selected by a label matcher, grouped by from `fetch.Batch.Series`, and enumerated through
+`ProfileSeries`. A stream is (resource, scope, profile type, profile attributes).
+
+- **Cardinality.** Every distinct profile-attribute set is a stream. Producers must keep data that
+  varies per profile (ids, timestamps, sequence numbers) off the profile and on its samples. A
+  producer that does not gets one stream per profile, which `MaxSeries` rejects as a cardinality
+  rejection like any other new stream, never silently. A stream still holds a whole profile's rows,
+  not the handful a high-churn log resource leaves per stream.
+- **A key set at both levels.** The identity carries the profile's value. The sample's row carries
+  the profile's entry ahead of its own, so a first-match lookup on `attrs` (`signal.LookupAttribute`,
+  a record condition) answers with the profile's value. That is the precedence the single merged set
+  had. A profile attribute no sample repeats stays out of the row.
+- **Older parts.** Parts written before this layout hold profile attributes in `attrs` and none in
+  the identity. There, a profile attribute is reachable only as a condition, not a matcher. Nothing
+  translates between the two.
+
+On a synthetic scrape shaped like the stand's (`BenchmarkProjectHeap`: 20k samples × 4 types, four
+empty profile attributes), a row decodes to 65 bytes instead of 169.
+
 **A zero observation is not a row.** Every profile aggregate sums `value` (flame graph, top, diff),
 so a 0 contributes nothing; a row count was never a sample count, since a timestamped sample
 explodes per timestamp. Go heap profiles are where it matters: one pprof sample carries all four
 types, so the `inuse_*` profiles repeat every stack the `alloc_*` ones hold, and on a test stand
-98.7% of those rows were 0. Dropping them halves a heap scrape's rows. The drop is per (sample,
+98.7% of those rows were 0. Dropping them halves a heap scrape's rows (`BenchmarkProjectHeap`: 20000
+to 10126 per profile). The drop is per (sample,
 type, timestamp) observation, and a sample that keeps none resolves no stack, so the symbol delta
 carries only what kept rows reference: an owner's merges union sidecars whole and never collect,
 so a stack only a dropped row referenced would otherwise be pinned for the data's lifetime. A
