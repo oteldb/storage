@@ -96,9 +96,29 @@ func (r *rerollEngine) assertOneRollup(tiers []engine.DownsampleTier, retainFrom
 	assert.Equal(r.t, wantVals, gotVals, "values")
 }
 
+// assertRollsUpTo checks that rolling the stored series up once more gives one rollup of the raw
+// data: every representative the stored series holds is exact, even where a bucket still has more
+// than one.
+func (r *rerollEngine) assertRollsUpTo(tiers []engine.DownsampleTier, retainFrom int64) {
+	r.t.Helper()
+
+	gotTs, gotVals := r.got()
+	stored := make([]rawSample, len(gotTs))
+
+	for i := range gotTs {
+		stored[i] = rawSample{ts: gotTs[i], v: gotVals[i]}
+	}
+
+	wantTs, wantVals := oneRollup(r.raw, tiers, retainFrom)
+	rolledTs, rolledVals := oneRollup(stored, tiers, retainFrom)
+	assert.Equal(r.t, wantTs, rolledTs, "timestamps")
+	assert.Equal(r.t, wantVals, rolledVals, "values")
+}
+
 // oneRollup is the oracle: raw samples deduplicated by timestamp (the later write wins), then each
-// sample aggregated once into its bucket of the widest tier it is older than. It shares no code with
-// the engine's downsample.
+// sample aggregated once into its bucket of the widest tier it is older than. Sum, Avg and Count land
+// on the bucket start, the others on the chosen sample. It shares no code with the engine's
+// downsample.
 func oneRollup(raw []rawSample, tiers []engine.DownsampleTier, retainFrom int64) ([]int64, []float64) {
 	latest := make(map[int64]float64, len(raw))
 	for _, s := range raw {
@@ -134,54 +154,65 @@ func oneRollup(raw []rawSample, tiers []engine.DownsampleTier, retainFrom int64)
 		keys = append(keys, k)
 	}
 
-	slices.SortFunc(keys, func(a, b key) int { return cmp.Compare(a.start, b.start) })
-
-	var (
-		outTs   []int64
-		outVals []float64
-	)
+	out := make([]rawSample, 0, len(keys))
 
 	for _, k := range keys {
 		ss := buckets[k]
 		slices.SortFunc(ss, func(a, b rawSample) int { return cmp.Compare(a.ts, b.ts) })
-		outTs = append(outTs, k.start)
 
 		if k.interval == 0 {
-			outVals = append(outVals, ss[0].v)
+			out = append(out, ss[0])
 
 			continue
 		}
 
-		outVals = append(outVals, aggregate(aggs[k], ss))
+		out = append(out, aggregate(aggs[k], k.start, ss))
+	}
+
+	slices.SortFunc(out, func(a, b rawSample) int { return cmp.Compare(a.ts, b.ts) })
+
+	outTs := make([]int64, 0, len(out))
+	outVals := make([]float64, 0, len(out))
+
+	for _, s := range out {
+		outTs, outVals = append(outTs, s.ts), append(outVals, s.v)
 	}
 
 	return outTs, outVals
 }
 
-func aggregate(agg signal.Aggregation, ss []rawSample) float64 {
+// aggregate folds one bucket's samples, sorted by ts; Min and Max pick the earliest extreme.
+func aggregate(agg signal.Aggregation, start int64, ss []rawSample) rawSample {
 	var sum float64
 
-	lo, hi := ss[0].v, ss[0].v
+	lo, hi := ss[0], ss[0]
 	for _, s := range ss {
 		sum += s.v
-		lo, hi = min(lo, s.v), max(hi, s.v)
+
+		if s.v < lo.v {
+			lo = s
+		}
+
+		if s.v > hi.v {
+			hi = s
+		}
 	}
 
 	switch agg {
 	case signal.AggFirst:
-		return ss[0].v
+		return ss[0]
 	case signal.AggMin:
 		return lo
 	case signal.AggMax:
 		return hi
 	case signal.AggSum:
-		return sum
+		return rawSample{ts: start, v: sum}
 	case signal.AggAvg:
-		return sum / float64(len(ss))
+		return rawSample{ts: start, v: sum / float64(len(ss))}
 	case signal.AggCount:
-		return float64(len(ss))
+		return rawSample{ts: start, v: float64(len(ss))}
 	default:
-		return ss[len(ss)-1].v
+		return ss[len(ss)-1]
 	}
 }
 
@@ -251,10 +282,9 @@ func TestRerollCount(t *testing.T) {
 	})
 }
 
-// TestRerollAvgCoarsen: coarsening Avg representatives weighs every fine bucket equally, whatever its
-// population — a mean of means.
+// TestRerollAvgCoarsen: coarsening Avg representatives weighs each fine bucket by its population,
+// not equally.
 func TestRerollAvgCoarsen(t *testing.T) {
-	reproduce.Unfixed(t, rerollIssue, "coarsening Avg representatives takes an unweighted mean of means")
 	t.Parallel()
 
 	fine := engine.DownsampleTier{Before: rerollBase + hr, Interval: min1}
@@ -272,17 +302,25 @@ func TestRerollAvgCoarsen(t *testing.T) {
 	r.assertOneRollup(opts.Downsample, 0)
 }
 
-// TestRerollSameBucketStart: two sources holding a sample at one bucket start keep only the fresher,
-// so a representative is dropped rather than combined.
+// TestRerollSameBucketStart: two sources holding a sample at one bucket start must combine, not keep
+// the fresher. Min and Max representatives sit on their chosen sample, so they never meet there.
 func TestRerollSameBucketStart(t *testing.T) {
-	reproduce.Unfixed(t, rerollIssue, "freshest-wins drops one of two samples at a bucket start")
 	t.Parallel()
 
 	for _, agg := range []signal.Aggregation{signal.AggSum, signal.AggMin, signal.AggMax, signal.AggCount} {
+		gate := func(t *testing.T) {
+			t.Helper()
+
+			if agg == signal.AggSum || agg == signal.AggCount {
+				reproduce.Unfixed(t, rerollIssue, "freshest-wins drops one of two samples at a bucket start")
+			}
+		}
+
 		// Two parts each roll a different hour of one 6h bucket, so each holds a representative at
 		// the bucket start. The second carries a sample from the previous day: that makes it a
 		// straddler, which is rewritten alone, and retention later drops the stray day.
 		t.Run("TwoRepresentatives/"+agg.String(), func(t *testing.T) {
+			gate(t)
 			t.Parallel()
 
 			opts := tiersOf(agg, engine.DownsampleTier{Before: rerollBase + dayNanos, Interval: 6 * hr})
@@ -301,11 +339,20 @@ func TestRerollSameBucketStart(t *testing.T) {
 			opts.RetainFrom = rerollBase
 			r.merge(opts)
 
+			if agg == signal.AggMin || agg == signal.AggMax {
+				// The two anchored representatives sit in different ladder buckets and are not merged
+				// together yet. Neither is lost, so the merge that does bring them together is exact.
+				r.assertRollsUpTo(opts.Downsample, rerollBase)
+
+				return
+			}
+
 			r.assertOneRollup(opts.Downsample, rerollBase)
 		})
 
 		// A late raw sample lands exactly on a rolled bucket's start, where no raw sample was.
 		t.Run("RawAtStart/"+agg.String(), func(t *testing.T) {
+			gate(t)
 			t.Parallel()
 
 			opts := tiersOf(agg, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
@@ -325,65 +372,77 @@ func TestRerollSameBucketStart(t *testing.T) {
 	}
 }
 
-// TestRerollMixedAgg: tiers with different aggregations compose as the coarse Agg over the fine
-// representatives, not over the raw samples: a 1m Sum then 1h Max is the max of per-minute sums.
-func TestRerollMixedAgg(t *testing.T) {
-	reproduce.Unfixed(t, rerollIssue, "a coarse tier aggregates the fine tier's representatives, not the raw samples")
+// TestRerollLateSample: a late sample at a new timestamp inside a rolled bucket combines with the
+// representative as new data.
+func TestRerollLateSample(t *testing.T) {
 	t.Parallel()
 
-	fine := engine.DownsampleTier{Before: rerollBase + hr, Interval: min1, Agg: signal.AggSum}
-	coarse := engine.DownsampleTier{Before: rerollBase + hr, Interval: hr, Agg: signal.AggMax}
+	for _, agg := range []signal.Aggregation{
+		signal.AggLast, signal.AggFirst, signal.AggMin, signal.AggMax, signal.AggSum, signal.AggAvg, signal.AggCount,
+	} {
+		t.Run(agg.String(), func(t *testing.T) {
+			t.Parallel()
 
-	r := newRerollEngine(t)
-	r.write(rerollBase, 4)
-	r.write(rerollBase+sec, 5)
-	r.write(rerollBase+min1, 8)
-	r.flush()
-	r.merge(engine.MergeOptions{Downsample: []engine.DownsampleTier{fine}})
+			if agg == signal.AggCount {
+				reproduce.Unfixed(t, rerollIssue, "a late sample counts a Count representative as one sample")
+			}
 
-	opts := engine.MergeOptions{Downsample: []engine.DownsampleTier{fine, coarse}}
-	r.merge(opts)
+			opts := tiersOf(agg, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
 
-	r.assertOneRollup(opts.Downsample, 0)
+			r := newRerollEngine(t)
+			r.write(rerollBase, 2)
+			r.write(rerollBase+sec, 1)
+			r.write(rerollBase+3*sec, 4)
+			r.flush()
+			r.merge(opts)
+
+			r.write(rerollBase+2*sec, 5)
+			r.flush()
+			r.merge(opts)
+
+			r.assertOneRollup(opts.Downsample, 0)
+		})
+	}
 }
 
-// TestRerollLateWrite: a late write into a rolled bucket meets the representative as if it were a
-// raw sample. On the representative's timestamp it replaces it; an overwrite of a rolled raw sample
-// is aggregated with the representative instead of replacing that sample; and a new sample counts
-// the representative as one. Each case lists the aggregations it breaks.
-func TestRerollLateWrite(t *testing.T) {
-	reproduce.Unfixed(t, rerollIssue, "a late write into a rolled bucket replaces or re-aggregates its representative")
+// TestRerollLateOverwrite: a late write reusing the timestamp of a raw sample that is already rolled
+// up cannot replace it, because the raw value is gone. Where the overwritten sample was folded into
+// the aggregate, the late value is added to it; where it is the representative itself, freshest-wins
+// replaces the bucket's whole aggregate.
+func TestRerollLateOverwrite(t *testing.T) {
+	reproduce.Unfixed(t, 732, "a late overwrite of a rolled sample combines with or replaces the bucket's aggregate")
 	t.Parallel()
 
 	cases := []struct {
 		name string
+		agg  signal.Aggregation
 		ts   int64
-		aggs []signal.Aggregation
+		v    float64
 	}{
-		{"OverwriteRepresentative", rerollBase, []signal.Aggregation{signal.AggSum, signal.AggMin, signal.AggAvg, signal.AggCount}},
-		{"OverwriteRaw", rerollBase + sec, []signal.Aggregation{signal.AggSum, signal.AggMin, signal.AggAvg}},
-		{"NewTimestamp", rerollBase + 2*sec, []signal.Aggregation{signal.AggAvg, signal.AggCount}},
+		{"FoldedSample/sum", signal.AggSum, rerollBase + sec, 5},
+		{"FoldedSample/avg", signal.AggAvg, rerollBase + sec, 5},
+		{"Representative/min", signal.AggMin, rerollBase + sec, 5},
+		{"Representative/max", signal.AggMax, rerollBase + 3*sec, 0},
 	}
 
 	for _, tc := range cases {
-		for _, agg := range tc.aggs {
-			t.Run(tc.name+"/"+agg.String(), func(t *testing.T) {
-				t.Parallel()
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-				opts := tiersOf(agg, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
+			opts := tiersOf(tc.agg, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
 
-				r := newRerollEngine(t)
-				r.write(rerollBase, 2)
-				r.write(rerollBase+sec, 1)
-				r.flush()
-				r.merge(opts)
+			r := newRerollEngine(t)
+			r.write(rerollBase, 2)
+			r.write(rerollBase+sec, 1)
+			r.write(rerollBase+3*sec, 4)
+			r.flush()
+			r.merge(opts)
 
-				r.write(tc.ts, 5)
-				r.flush()
-				r.merge(opts)
+			r.write(tc.ts, tc.v)
+			r.flush()
+			r.merge(opts)
 
-				r.assertOneRollup(opts.Downsample, 0)
-			})
-		}
+			r.assertOneRollup(opts.Downsample, 0)
+		})
 	}
 }

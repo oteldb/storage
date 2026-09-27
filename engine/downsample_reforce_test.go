@@ -63,8 +63,9 @@ func TestDownsampleRollsUpEveryOldBucket(t *testing.T) {
 		require.NoError(t, e.MergeWith(ctx, reforceOpts()))
 	}
 
-	assert.Equal(t, []int64{0, int64(time.Minute), 2 * dayNanos, 2*dayNanos + int64(time.Minute)}, sampleTimes(t, e),
-		"both parts roll up to one sample per minute")
+	lastOf := func(minute int64) int64 { return (minute+1)*int64(time.Minute) - int64(time.Second) }
+	assert.Equal(t, []int64{lastOf(0), lastOf(1), 2*dayNanos + lastOf(0), 2*dayNanos + lastOf(1)}, sampleTimes(t, e),
+		"both parts roll up to each minute's last sample")
 }
 
 // TestDownsampleLeavesLadderRunning checks enabling downsampling does not stop the ladder: once the

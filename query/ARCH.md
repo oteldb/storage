@@ -117,8 +117,9 @@ The library implements **no** query language. This package bridges the fetch sea
   sampled series turns an overload-degradation mechanism into a query outage for the majority of
   queries that are unbiased. So the adapter serves rows as stored, attaches **`SampledWarning`**
   (a `PromQLWarning` the engine propagates to the result's warnings) when any returned series has a
-  weight above 1 — weights are `ceil(observed/budget) ≥ 1`, so a 0 or 1 carries no information and
-  is never multiplied in — and exposes the weights on every series via **`WeightedSeries`**, in
+  weight above 1 — a weight counts the rows a point stands for (`ceil(observed/budget)` for a sampled
+  row, the bucket's population for an Avg downsample representative), so a 0 or 1 carries no
+  information and is never multiplied in — and exposes the weights on every series via **`WeightedSeries`**, in
   iterator order, for an embedder's weight-aware operator. Unbiased per-sample counts/sums over a
   sampled tenant belong to a consumer that reads the weight — this adapter or the fetch seam
   directly — not to the Prometheus engine.

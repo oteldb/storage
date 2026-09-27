@@ -37,26 +37,30 @@ func TestDownsampleAggregations(t *testing.T) {
 		return []DownsampleTier{{Before: 100, Interval: 10, Agg: a}}
 	}
 
+	// The value-selecting aggregations emit the chosen sample; the summarizing ones the bucket start.
 	cases := []struct {
-		agg  signal.Aggregation
-		want []float64
+		agg    signal.Aggregation
+		wantTs []int64
+		want   []float64
+		wantSF []float64
 	}{
-		{signal.AggLast, []float64{3, 4, 5, 6}},  // bucket10 last=ts15, bucket20=4, raw 5,6
-		{signal.AggFirst, []float64{1, 4, 5, 6}}, // bucket10 first=ts10
-		{signal.AggMin, []float64{1, 4, 5, 6}},
-		{signal.AggMax, []float64{3, 4, 5, 6}},
-		{signal.AggSum, []float64{6, 4, 5, 6}},   // 1+2+3
-		{signal.AggAvg, []float64{2, 4, 5, 6}},   // (1+2+3)/3
-		{signal.AggCount, []float64{3, 1, 5, 6}}, // raw samples keep their value
+		{signal.AggLast, []int64{15, 25, 105, 110}, []float64{3, 4, 5, 6}, nil},
+		{signal.AggFirst, []int64{10, 25, 105, 110}, []float64{1, 4, 5, 6}, nil},
+		{signal.AggMin, []int64{10, 25, 105, 110}, []float64{1, 4, 5, 6}, nil},
+		{signal.AggMax, []int64{15, 25, 105, 110}, []float64{3, 4, 5, 6}, nil},
+		{signal.AggSum, []int64{10, 20, 105, 110}, []float64{6, 4, 5, 6}, nil},
+		{signal.AggAvg, []int64{10, 20, 105, 110}, []float64{2, 4, 5, 6}, []float64{3, 1, 1, 1}},
+		{signal.AggCount, []int64{10, 20, 105, 110}, []float64{3, 1, 5, 6}, nil}, // raw samples keep their value
 	}
 
 	for _, c := range cases {
 		t.Run(c.agg.String(), func(t *testing.T) {
 			t.Parallel()
 
-			gotTs, gotVal, _ := downsample(ts, vals, nil, tier(c.agg))
-			assert.Equal(t, []int64{10, 20, 105, 110}, gotTs)
+			gotTs, gotVal, gotSF := downsample(ts, vals, nil, tier(c.agg))
+			assert.Equal(t, c.wantTs, gotTs)
 			assert.Equal(t, c.want, gotVal)
+			assert.Equal(t, c.wantSF, gotSF)
 		})
 	}
 }
@@ -75,7 +79,7 @@ func TestDownsampleMultiTier(t *testing.T) {
 	}
 
 	gotTs, gotVal, _ := downsample(ts, vals, nil, tiers)
-	assert.Equal(t, []int64{0, 20, 70, 120}, gotTs)
+	assert.Equal(t, []int64{15, 30, 75, 120}, gotTs)
 	assert.Equal(t, []float64{2, 3, 5, 6}, gotVal)
 }
 
@@ -170,8 +174,9 @@ func TestAlignDown(t *testing.T) {
 	assert.Equal(t, int64(-20), alignDown(-11, 10))
 }
 
-// FuzzDownsample asserts the structural invariants hold for arbitrary input and that AggLast is a
-// fixed point under re-downsampling.
+// FuzzDownsample asserts the structural invariants hold for arbitrary input, that every aggregation
+// but Count is a fixed point under re-downsampling, and that coarsening a rollup equals rolling the
+// raw samples up at the coarse interval once.
 func FuzzDownsample(f *testing.F) {
 	f.Add([]byte{1, 2, 3, 4, 5, 6}, int64(100), int64(10), uint8(0))
 	f.Add([]byte{0, 0, 9, 9}, int64(5), int64(3), uint8(4))
@@ -207,10 +212,24 @@ func FuzzDownsample(f *testing.F) {
 			require.NotEqual(t, gotTs[i-1], gotTs[i], "output timestamps are unique")
 		}
 
-		if agg == signal.AggLast {
-			ts2, val2, _ := downsample(gotTs, gotVal, gotSF, tiers)
-			require.Equal(t, gotTs, ts2, "AggLast is a fixed point")
-			require.Equal(t, gotVal, val2, "AggLast is a fixed point")
+		if agg == signal.AggCount || interval <= 0 {
+			return
 		}
+
+		ts2, val2, sf2 := downsample(gotTs, gotVal, gotSF, tiers)
+		require.Equal(t, gotTs, ts2, "fixed point")
+		require.Equal(t, gotVal, val2, "fixed point")
+		require.Equal(t, gotSF, sf2, "fixed point")
+
+		if interval > 1<<40 {
+			return // the coarse interval would overflow
+		}
+
+		coarse := append(slices.Clone(tiers), DownsampleTier{Before: before, Interval: interval * int64(2+aggByte%3), Agg: agg})
+		wantTs, wantVal, wantSF := downsample(ts, vals, nil, coarse)
+		gotTs, gotVal, gotSF = downsample(gotTs, gotVal, gotSF, coarse)
+		require.Equal(t, wantTs, gotTs, "coarsening is exact")
+		require.InDeltaSlice(t, wantVal, gotVal, 1e-9, "coarsening is exact")
+		require.Equal(t, wantSF, gotSF, "coarsening is exact")
 	})
 }

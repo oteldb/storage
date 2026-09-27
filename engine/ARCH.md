@@ -551,8 +551,8 @@ engine; no parallel subsystem.
 per pass — and grid-aligned downsample buckets, so a rollup does not depend on when the merge runs.
 
 **Stable cutoffs:** the caller floors each tier's `Before` to whole buckets of at least an hour, so a
-cutoff never splits a bucket (a split bucket is re-rolled with its own representative, which avg and
-count cannot absorb) and moves once per quantum rather than once per tick. Quantized cutoffs tie, so a
+cutoff never splits a bucket (a split bucket is re-rolled with its own representative, which count
+cannot absorb) and moves once per quantum rather than once per tick. Quantized cutoffs tie, so a
 sample goes to the widest tier it qualifies for rather than the one with the earliest cutoff.
 Exactness also needs tier Intervals to nest, each dividing the next: a coarse cutoff then lies on every
 finer grid, so a fine bucket is never split across tiers and its representative, once coarsened, lands
@@ -560,9 +560,30 @@ in the coarse bucket its samples belong to. Under 7m + 1h a 7m bucket at 119m st
 and drags 121m samples into the previous hour; the facade rejects such a policy
 (`tenant.Downsample.Validate`) rather than downsample it inexactly.
 
-**Fixed points:** repeated merges are stable for last/first/min/max/sum/avg, count being the documented
-exception. Recompression checks the part's recorded algorithm *and* level, precision the manifest's
-recorded budget; only an upgrade rewrites, and a part denser than the target is left alone.
+**Representatives compose.** A policy uses one Agg across its tiers (`tenant.Downsample.Validate`), and
+each representative carries what a coarser tier needs to re-aggregate it exactly:
+
+- Last/First/Min/Max emit the chosen sample itself, at its own timestamp. A representative is then a
+  real sample, so a re-roll, a coarser tier, a late sample and a same-timestamp duplicate all see raw
+  data, and a Last-rolled counter is not shifted back to the bucket start under `rate`.
+- Sum emits the bucket total at the bucket start, weight 1.
+- Avg emits the mean at the bucket start with the bucket's population as its scale factor, the weight
+  a sampled row carries, so a coarser Avg is the exact weighted mean and `SeriesAgg` and a weight-aware
+  query read it unchanged. A part holding Avg representatives therefore has the sf column and no stats
+  sidecar.
+- Count is exact only on the first roll: a merge that rolls its representative again counts it as one
+  sample.
+
+Anchoring is paid in the ts column, measured on a 1m rollup of 15s scrapes: +0.01 B/row with no scrape
+jitter, +1.1 at ±5ms, +2.0 at ±50ms, against 1.1–6.8 B/row for the value column. The sf column of an
+Avg rollup costs 0.025 B/row. Mixed Aggs would need full per-bucket state (count, sum, min, max,
+first, last), 5–7× a Last-only part. A late sample in a rolled bucket combines as new data; a late
+write reusing the timestamp of a raw sample already rolled up cannot replace it, since that value is
+gone.
+
+**Fixed points:** repeated merges are stable for every Agg but Count. Recompression checks the part's
+recorded algorithm *and* level, precision the manifest's recorded budget; only an upgrade rewrites,
+and a part denser than the target is left alone.
 
 Downsampling checks the tier layout recorded in the manifest's rollup marker: per timestamp, the widest
 (Interval, Agg) the part's data there has had applied. A flush records raw. A merge records the union

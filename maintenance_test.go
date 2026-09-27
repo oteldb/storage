@@ -114,8 +114,8 @@ func TestMaintainDownsamplesOldData(t *testing.T) {
 	batches, err := fetch.Drain(ctx, it)
 	require.NoError(t, err)
 	require.Len(t, batches, 1)
-	// The three old samples collapse to one at the bucket start (last value 3); the recent stays.
-	assert.Equal(t, []int64{bucket, now}, batches[0].Timestamps)
+	// The three old samples collapse to the last of them; the recent stays.
+	assert.Equal(t, []int64{bucket + 3, now}, batches[0].Timestamps)
 	assert.Equal(t, []float64{3, 9}, batches[0].Values)
 }
 
@@ -275,15 +275,7 @@ func TestMetricMergeOptionsDownsampleNesting(t *testing.T) {
 			tiers = append(tiers, tenant.DownsampleTier{After: time.Duration(i+1) * time.Hour, Interval: iv})
 		}
 
-		s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
-			return tenant.Policy{Downsample: tenant.Downsample{Tiers: tiers}}
-		})))
-		require.NoError(t, err)
-
-		now := time.Date(2026, 1, 1, 13, 37, 0, 0, time.UTC).UnixNano()
-		s.now = func() int64 { return now }
-
-		return s.metricMergeOptions("default", 0).Downsample
+		return resolveTiers(t, tiers)
 	}
 
 	t.Run("Rejected", func(t *testing.T) {
@@ -306,6 +298,21 @@ func TestMetricMergeOptionsDownsampleNesting(t *testing.T) {
 			}
 		}
 	})
+}
+
+// resolveTiers returns the engine tiers the facade resolves from a one-tenant policy at a fixed now.
+func resolveTiers(t *testing.T, tiers []tenant.DownsampleTier) []engine.DownsampleTier {
+	t.Helper()
+
+	s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+		return tenant.Policy{Downsample: tenant.Downsample{Tiers: tiers}}
+	})))
+	require.NoError(t, err)
+
+	now := time.Date(2026, 1, 1, 13, 37, 0, 0, time.UTC).UnixNano()
+	s.now = func() int64 { return now }
+
+	return s.metricMergeOptions("default", 0).Downsample
 }
 
 // TestMaintainRollsUpEachBucketOnce ticks maintenance every 10s on a synthetic clock while a gauge
@@ -373,7 +380,8 @@ func TestMaintainRollsUpEachBucketOnce(t *testing.T) {
 	}
 }
 
-// rollupOnce aggregates each interval-aligned bucket of ascending ts once, whole.
+// rollupOnce aggregates each interval-aligned bucket of ascending ts once, whole: First, Last, Min and
+// Max at the chosen sample, the others at the bucket start.
 func rollupOnce(ts []int64, vals []float64, interval int64, agg signal.Aggregation) ([]int64, []float64) {
 	var (
 		outTs   []int64
@@ -392,13 +400,17 @@ func rollupOnce(ts []int64, vals []float64, interval int64, agg signal.Aggregati
 
 		var v float64
 
+		at := start
+
 		switch agg {
 		case signal.AggFirst:
-			v = bucket[0]
+			at, v = ts[lo], bucket[0]
 		case signal.AggMin:
-			v = slices.Min(bucket)
+			i := slices.Index(bucket, slices.Min(bucket))
+			at, v = ts[lo+i], bucket[i]
 		case signal.AggMax:
-			v = slices.Max(bucket)
+			i := slices.Index(bucket, slices.Max(bucket))
+			at, v = ts[lo+i], bucket[i]
 		case signal.AggSum, signal.AggAvg:
 			for _, x := range bucket {
 				v += x
@@ -410,10 +422,10 @@ func rollupOnce(ts []int64, vals []float64, interval int64, agg signal.Aggregati
 		case signal.AggCount:
 			v = float64(len(bucket))
 		default:
-			v = bucket[len(bucket)-1]
+			at, v = ts[hi-1], bucket[len(bucket)-1]
 		}
 
-		outTs, outVals = append(outTs, start), append(outVals, v)
+		outTs, outVals = append(outTs, at), append(outVals, v)
 		lo = hi
 	}
 

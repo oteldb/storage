@@ -71,19 +71,18 @@ func downsampleApplies(tiers []DownsampleTier, minTime int64) bool {
 
 // downsample rolls up (ts, values, sf) — sorted ascending by ts with no duplicate timestamps, as
 // produced by sampleMerge.collect — according to tiers, returning the rolled-up series (still
-// sorted ascending, unique ts). sf carries each input sample's lossy-sampling weight (nil ⇒ every
-// weight is 1); the returned sf is nil when every output weight is 1. Samples younger than every
-// tier's Before pass through unchanged (weight included). A sample old enough for a tier is
-// assigned to the coarsest applicable tier and contributes to that tier's Interval bucket; the
-// bucket emits one sample at its aligned start timestamp.
+// sorted ascending, unique ts). sf carries each input sample's weight (nil ⇒ every weight is 1);
+// the returned sf is nil when every output weight is 1. Samples younger than every tier's Before
+// pass through unchanged (weight included). A sample old enough for a tier is assigned to the
+// coarsest applicable tier and contributes to that tier's Interval bucket, which emits one
+// representative.
 //
-// The rollup is weight-aware so a sampled series stays unbiased: Sum emits Σ(value·sf) with weight
-// 1, Count emits Σsf (the estimated original count) with weight 1, Avg emits the weighted mean
-// with weight 1, and Last/First/Min/Max carry the representative sample's value and its weight.
-//
-// The transform is a fixed point for an already-rolled-up series under Last/First/Min/Max/Sum/Avg
-// (a one-sample bucket aggregates to itself), so repeated merges are stable. Count is the
-// exception — re-counting a representative yields 1 — and is documented as non-idempotent.
+// Last/First/Min/Max emit the chosen sample itself — its timestamp, value and weight — so a
+// representative is a real sample and re-rolling it is exact. Sum and Count emit at the bucket
+// start with weight 1 (the weight is folded into the value); Avg emits the weighted mean at the
+// bucket start with the bucket's total weight, so a coarser Avg over Avg representatives is the
+// exact weighted mean. Count is the one aggregation a re-roll corrupts: re-counting a
+// representative yields 1, not the count it carried.
 func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int64, []float64, []float64) {
 	active := make([]DownsampleTier, 0, len(tiers))
 	for _, t := range tiers {
@@ -142,39 +141,49 @@ func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int
 		b.add(t, values[i], weight(i))
 	}
 
-	// Emit one sample per bucket at its start ts. Sort by ts, finer interval first, so an
-	// overlap on a misaligned boundary deterministically keeps the finer (more accurate) value.
-	slices.SortFunc(order, func(a, b key) int {
-		if c := cmp.Compare(a.start, b.start); c != 0 {
+	type rep struct {
+		ts, interval int64
+		v, w         float64
+	}
+
+	reps := make([]rep, 0, len(order))
+	for _, k := range order {
+		ts, v, w := buckets[k].result(k.start)
+		reps = append(reps, rep{ts: ts, interval: k.interval, v: v, w: w})
+	}
+
+	// Finer interval first on a timestamp tie, so an overlap on a misaligned boundary
+	// deterministically keeps the finer (more accurate) value.
+	slices.SortFunc(reps, func(a, b rep) int {
+		if c := cmp.Compare(a.ts, b.ts); c != 0 {
 			return c
 		}
 
 		return cmp.Compare(a.interval, b.interval)
 	})
 
-	outTs := make([]int64, 0, len(order))
-	outVal := make([]float64, 0, len(order))
+	outTs := make([]int64, 0, len(reps))
+	outVal := make([]float64, 0, len(reps))
 
 	var outSF []float64
 
-	for _, k := range order {
-		if n := len(outTs); n > 0 && outTs[n-1] == k.start {
-			continue // a finer bucket already emitted this timestamp
+	for _, r := range reps {
+		if n := len(outTs); n > 0 && outTs[n-1] == r.ts {
+			continue
 		}
 
-		v, w := buckets[k].result()
-		outTs = append(outTs, k.start)
-		outVal = append(outVal, v)
+		outTs = append(outTs, r.ts)
+		outVal = append(outVal, r.v)
 
-		if w != 1 && outSF == nil {
-			outSF = make([]float64, len(outTs)-1, len(order))
+		if r.w != 1 && outSF == nil {
+			outSF = make([]float64, len(outTs)-1, len(reps))
 			for i := range outSF {
 				outSF[i] = 1
 			}
 		}
 
 		if outSF != nil {
-			outSF = append(outSF, w)
+			outSF = append(outSF, r.w)
 		}
 	}
 
@@ -216,14 +225,16 @@ func alignDown(ts, interval int64) int64 {
 // bucketAcc accumulates the samples of one downsample bucket, weight-aware so sampled data stays
 // unbiased. Input timestamps within a bucket are unique (sampleMerge dedups by ts), so first/last
 // are unambiguous. n counts samples; nWeighted sums their weights (the estimated original count);
-// wsum sums value·weight (the estimated original total). min/max track the extreme value and the
-// weight of the sample that set it.
+// wsum sums value·weight (the estimated original total). min/max track the earliest sample holding
+// the extreme value.
 type bucketAcc struct {
 	agg       signal.Aggregation
 	n         int64
 	nWeighted float64
 	wsum      float64
 	min, max  float64
+	minTs     int64
+	maxTs     int64
 	minSF     float64
 	maxSF     float64
 	firstTs   int64
@@ -237,6 +248,7 @@ type bucketAcc struct {
 func (b *bucketAcc) add(ts int64, v, sf float64) {
 	if b.n == 0 {
 		b.min, b.max = v, v
+		b.minTs, b.maxTs = ts, ts
 		b.minSF, b.maxSF = sf, sf
 		b.firstTs, b.firstVal, b.firstSF = ts, v, sf
 		b.lastTs, b.lastVal, b.lastSF = ts, v, sf
@@ -246,11 +258,11 @@ func (b *bucketAcc) add(ts int64, v, sf float64) {
 	}
 
 	if v < b.min {
-		b.min, b.minSF = v, sf
+		b.min, b.minTs, b.minSF = v, ts, sf
 	}
 
 	if v > b.max {
-		b.max, b.maxSF = v, sf
+		b.max, b.maxTs, b.maxSF = v, ts, sf
 	}
 
 	if ts < b.firstTs {
@@ -266,24 +278,27 @@ func (b *bucketAcc) add(ts int64, v, sf float64) {
 	b.n++
 }
 
-// result returns the bucket's representative (value, weight). The value-selecting aggregations
-// carry the chosen sample's weight; the summarizing ones fold the weight into the value and emit
-// weight 1 (already unbiased).
-func (b *bucketAcc) result() (float64, float64) {
+// result returns the bucket's representative (ts, value, weight); start is the bucket's aligned
+// start.
+func (b *bucketAcc) result(start int64) (int64, float64, float64) {
 	switch b.agg {
 	case signal.AggFirst:
-		return b.firstVal, b.firstSF
+		return b.firstTs, b.firstVal, b.firstSF
 	case signal.AggMin:
-		return b.min, b.minSF
+		return b.minTs, b.min, b.minSF
 	case signal.AggMax:
-		return b.max, b.maxSF
+		return b.maxTs, b.max, b.maxSF
 	case signal.AggSum:
-		return b.wsum, 1
+		return start, b.wsum, 1
 	case signal.AggAvg:
-		return b.wsum / b.nWeighted, 1
+		if b.n == 1 {
+			return start, b.lastVal, b.lastSF // v·w/w can round; a re-rolled representative must not drift
+		}
+
+		return start, b.wsum / b.nWeighted, b.nWeighted
 	case signal.AggCount:
-		return b.nWeighted, 1
+		return start, b.nWeighted, 1
 	default: // signal.AggLast
-		return b.lastVal, b.lastSF
+		return b.lastTs, b.lastVal, b.lastSF
 	}
 }

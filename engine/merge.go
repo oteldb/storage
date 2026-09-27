@@ -192,8 +192,8 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 			return mergeResult{parts: dropped}, err
 		}
 
-		// A rollup lands at its bucket start, which can precede the part's day; only the streamed
-		// path cuts on days.
+		// A Sum, Avg or Count rollup lands at its bucket start, which can precede the part's day; only
+		// the streamed path cuts on days.
 		if lo, hi := colsTimeRange(single); !timebucket.Fits(lo, hi, timebucket.Top()) {
 			single = nil
 		}
@@ -481,7 +481,7 @@ func (e *Engine) compactStream(
 	}
 
 	scratch := make([]rangeBuf, len(src))
-	comp, precision, withSF := mergeEncoding(src, capBytes, opts)
+	comp, precision, withSF := mergeEncoding(src, capBytes, opts, plan.tiers)
 	budget := e.mergeBudget(capBytes)
 
 	var newParts []*part
@@ -573,10 +573,11 @@ func (e *Engine) compactStream(
 //     stamped maxTime, so the estimate is self-correcting rather than sticky.
 //   - The compression ladder is a step function of row count, estimated from the source rows scaled
 //     by the share of the group's bytes one output part will hold.
-//   - The weight column is declared if any source carries one, and cannot appear from nowhere: with
-//     no sampled input every collected weight is 1, and downsample returns a nil weight vector when
-//     every output weight is 1. If they all turn out to be 1 anyway, the column is dropped at finish.
-func mergeEncoding(src []*part, capBytes int64, opts MergeOptions) (compressProfile, uint8, bool) {
+//   - The weight column is declared if any source carries one or an Avg tier can emit one (an Avg
+//     representative carries its bucket's population as its weight). Otherwise it cannot appear:
+//     every collected weight is 1, and downsample returns a nil weight vector when every output
+//     weight is 1. If they all turn out to be 1 anyway, the column is dropped at finish.
+func mergeEncoding(src []*part, capBytes int64, opts MergeOptions, tiers []DownsampleTier) (compressProfile, uint8, bool) {
 	var (
 		maxT     = minInt64
 		rows     int
@@ -589,6 +590,10 @@ func mergeEncoding(src []*part, capBytes int64, opts MergeOptions) (compressProf
 		rows += p.rows()
 		srcBytes += p.sizeBytes()
 		withSF = withSF || p.hasSF
+	}
+
+	for _, t := range tiers {
+		withSF = withSF || t.Interval > 0 && t.Agg == signal.AggAvg
 	}
 
 	if capBytes > 0 && srcBytes > capBytes {
