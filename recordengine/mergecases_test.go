@@ -16,6 +16,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/internal/partid"
+	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/recordengine"
 )
 
@@ -92,6 +93,31 @@ func canonicalizePartIDs(objs map[string][]byte) map[string][]byte {
 	}
 
 	return out
+}
+
+// TestCanonicalizePartIDsLeavesIDShapedDataAlone: column data can hold "/" and 26 id characters, and
+// overlapping ones at that. Only an id under a store prefix is a part id.
+func TestCanonicalizePartIDsLeavesIDShapedDataAlone(t *testing.T) {
+	reproduce.Unfixed(t, 734, "id-shaped column data is renamed too, in map order")
+
+	const (
+		id   = "01M3J48M3C2T0B8EXGEW2XKKB6"
+		part = "PART0000000000000000000000"
+		data = "0000/000100000100000000000000000000000001000000000000/00100000100000000000000000000/"
+	)
+
+	dump := map[string][]byte{
+		"t/p/" + id + "/c/0":   []byte(data),
+		"t/p/bucket-index.bin": []byte("\x01!t/p/" + id),
+	}
+	want := map[string][]byte{
+		"t/p/" + part + "/c/0": []byte(data),
+		"t/p/bucket-index.bin": []byte("\x01!t/p/" + part),
+	}
+
+	for range 20 {
+		require.Equal(t, want, canonicalizePartIDs(dump))
+	}
 }
 
 // mergeCase is one store to build and merge; each test runs it through two paths whose outputs must
