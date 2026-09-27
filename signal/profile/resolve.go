@@ -14,38 +14,45 @@ type Frame struct {
 	Line     int64
 }
 
+// Table indices, in [tableNames] order.
+const (
+	tableStrings = iota
+	_
+	tableFunctions
+	tableLocations
+	tableStacks
+)
+
 // Resolver resolves a content-addressed stack id (the [ColStackID] column) to its [Frame]s, leaf
-// first. Build one from a [recordengine.Engine.SideSnapshot] (the tenant's unioned symbol store) via
-// [NewResolver]; it is read-only and safe for concurrent use.
+// first, over a stack of [Tables] layers. It is read-only and safe for concurrent use.
 type Resolver struct {
-	strings   map[signal.SeriesID][]byte
-	functions map[signal.SeriesID][]byte
-	locations map[signal.SeriesID][]byte
-	stacks    map[signal.SeriesID][]byte
+	layers []*Tables
 }
 
 // NewResolver decodes the symbol-store tables (as produced by [SymbolStore.Encode]/Union) into a
 // resolver. Absent tables are treated as empty.
 func NewResolver(tables map[string][]byte) (*Resolver, error) {
-	decoded := make([]map[signal.SeriesID][]byte, len(tableNames))
-	for i, name := range tableNames {
-		m := map[signal.SeriesID][]byte{}
-		if data, ok := tables[name]; ok {
-			if err := decodeTable(m, data); err != nil {
-				return nil, err
-			}
-		}
-
-		decoded[i] = m
+	t, err := DecodeTables(tables)
+	if err != nil {
+		return nil, err
 	}
 
-	// tableNames order: strings, mappings, functions, locations, stacks.
-	return &Resolver{
-		strings:   decoded[0],
-		functions: decoded[2],
-		locations: decoded[3],
-		stacks:    decoded[4],
-	}, nil
+	return NewResolverFrom(t), nil
+}
+
+// NewResolverFrom returns a resolver over layers, nil layers skipped. Content addressing makes every
+// layer's entry for an id identical, so the order only sets the lookup cost: put first the layers
+// most stacks resolve from.
+func NewResolverFrom(layers ...*Tables) *Resolver {
+	r := &Resolver{layers: make([]*Tables, 0, len(layers))}
+
+	for _, l := range layers {
+		if l != nil {
+			r.layers = append(r.layers, l)
+		}
+	}
+
+	return r
 }
 
 // Resolve returns the frames of the stack identified by stackID (16 big-endian bytes, as stored in
@@ -57,7 +64,7 @@ func (r *Resolver) Resolve(stackID []byte) []Frame {
 		return nil
 	}
 
-	entry, ok := r.stacks[id]
+	entry, layer, ok := r.lookup(tableStacks, id, 0)
 	if !ok {
 		return nil
 	}
@@ -69,16 +76,40 @@ func (r *Resolver) Resolve(stackID []byte) []Frame {
 
 	var frames []Frame
 	for _, lid := range locIDs {
-		frames = r.appendLocationFrames(frames, lid)
+		frames = r.appendLocationFrames(frames, lid, layer)
 	}
 
 	return frames
 }
 
+// lookup finds id in the table, trying layer hint first and then the rest in order, and returns the
+// layer that held it. A stack's whole closure is in the layer that holds the stack — flush writes the
+// accumulator every batch's closure was absorbed into, and merge unions whole sidecars — so passing
+// the stack's layer as the hint resolves a frame in one probe instead of one per newer layer.
+func (r *Resolver) lookup(table int, id signal.SeriesID, hint int) ([]byte, int, bool) {
+	if hint < len(r.layers) {
+		if entry, ok := r.layers[hint].t.t[table][id]; ok {
+			return entry, hint, true
+		}
+	}
+
+	for i, l := range r.layers {
+		if i == hint {
+			continue
+		}
+
+		if entry, ok := l.t.t[table][id]; ok {
+			return entry, i, true
+		}
+	}
+
+	return nil, hint, false
+}
+
 // appendLocationFrames resolves one location's lines (a location may carry several inlined frames)
 // and appends a [Frame] per line.
-func (r *Resolver) appendLocationFrames(dst []Frame, locID signal.SeriesID) []Frame {
-	entry, ok := r.locations[locID]
+func (r *Resolver) appendLocationFrames(dst []Frame, locID signal.SeriesID, hint int) []Frame {
+	entry, hint, ok := r.lookup(tableLocations, locID, hint)
 	if !ok {
 		return dst
 	}
@@ -124,7 +155,7 @@ func (r *Resolver) appendLocationFrames(dst []Frame, locID signal.SeriesID) []Fr
 			return dst
 		}
 
-		dst = append(dst, r.frame(fnID, line))
+		dst = append(dst, r.frame(fnID, line, hint))
 	}
 
 	return dst
@@ -132,18 +163,20 @@ func (r *Resolver) appendLocationFrames(dst []Frame, locID signal.SeriesID) []Fr
 
 // frame builds a [Frame] from a function id and source line, resolving the function's name/file
 // strings (empty when absent).
-func (r *Resolver) frame(fnID signal.SeriesID, line int64) Frame {
+func (r *Resolver) frame(fnID signal.SeriesID, line int64, hint int) Frame {
 	f := Frame{Line: line}
 
-	entry, ok := r.functions[fnID]
+	entry, hint, ok := r.lookup(tableFunctions, fnID, hint)
 	if !ok || len(entry) < 48 { // nameID + sysID + fileID (3 × 16)
 		return f
 	}
 
 	nameID := signal.SeriesID{Hi: binary.BigEndian.Uint64(entry), Lo: binary.BigEndian.Uint64(entry[8:])}
 	fileID := signal.SeriesID{Hi: binary.BigEndian.Uint64(entry[32:]), Lo: binary.BigEndian.Uint64(entry[40:])}
-	f.Function = string(r.strings[nameID])
-	f.File = string(r.strings[fileID])
+	name, _, _ := r.lookup(tableStrings, nameID, hint)
+	file, _, _ := r.lookup(tableStrings, fileID, hint)
+	f.Function = string(name)
+	f.File = string(file)
 
 	return f
 }

@@ -45,14 +45,15 @@ func (r *Router) Keys(
 		}, attribute.String("storage.signal", sig.String()))
 }
 
-// Side returns one shard's side-store tables (the profile symbol store, for stack resolution),
-// hedged across the shard's owners. Symbols ride the write path, so every owner's copy is complete.
+// Side returns one shard's side-store tables (the profile symbol store, for stack resolution) within
+// the window, hedged across the shard's owners. Symbols ride the write path, so every owner's copy
+// is complete.
 func (r *Router) Side(
-	ctx context.Context, sig signal.Signal, shardKey signal.TenantID,
+	ctx context.Context, sig signal.Signal, shardKey signal.TenantID, start, end int64,
 ) (map[string][]byte, error) {
 	return hedgeOwners(ctx, r, "cluster.side.hedge", shardKey,
 		func(ctx context.Context, addr string) (map[string][]byte, error) {
-			return cluster.FetchSide(ctx, r.httpc, addr, sig, string(shardKey), r.clusterOpts...)
+			return cluster.FetchSide(ctx, r.httpc, addr, sig, string(shardKey), start, end, r.clusterOpts...)
 		}, attribute.String("storage.signal", sig.String()))
 }
 

@@ -57,7 +57,11 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
   a part to one shard per node), and `Reconstructs`/`ReconstructErrors` (read-path object
   reconstructions; a high reconstruct rate on cold reads is expected, growing errors are not).
 - `StoreStats.Caches` — read-path decode-cache totals (hits/misses/bytes and `Items` = cached
-  decoded **blocks**, the cache being keyed by `(part, column, block)`).
+  decoded **blocks**, the cache being keyed by `(part, column, block)`). `Caches.ProfileSymbols` is
+  the decoded profile symbol cache behind `ProfileResolver` (`Options.ProfileSymbolCacheBytes`): the
+  same four fields, `Items` counting cached **parts** and `Bytes` their estimated decoded size. Misses
+  climbing with every flamegraph query mean the queried windows' parts do not fit the budget; it is
+  all zeros when the cache is disabled.
 - `StoreStats.Maintenance` — the background maintenance loop: cumulative `Cycles` (the loop-
   liveness probe), `LastCycleStartUnixNano` / `LastCycleDurationNano` (a growing duration means
   compaction is falling behind ingest), `LastCycleTasks` (engine tasks dispatched in the most

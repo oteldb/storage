@@ -179,7 +179,7 @@ type Engine struct {
 	// becoming live. nil when no flush is in flight.
 	flushing map[signal.SeriesID]*recordCols
 	// flushingSide holds the side-store snapshot an in-progress flush took at detach, kept visible to
-	// [Engine.SideSnapshot] until the part's sidecars are published (then cleared, atomically with
+	// [Engine.ReadSide] until the part's sidecars are published (then cleared, atomically with
 	// adding the part) or the flush aborts and restores it into the live accumulator. It closes the
 	// symbol-visibility gap that mirrors the record gap [Engine.flushing] closes. nil when no flush is
 	// in flight or the engine has no side store.
@@ -919,38 +919,6 @@ func (e *Engine) Replay(ctx context.Context, dir string) error {
 	defer e.mu.Unlock()
 
 	return wal.ReplayDirFrom(dir, e.flushedEpoch, e.salvageHandlers(ctx, dir))
-}
-
-// SideSnapshot returns the engine's full side-store tables — the live head accumulator unioned with
-// every flushed part's sidecars — as named payloads, for a signal to build a resolver over (e.g. the
-// profiles symbol store). nil when the engine has no side store. Safe for concurrent use.
-func (e *Engine) SideSnapshot(ctx context.Context) (map[string][]byte, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	if e.cfg.SideStore == nil {
-		return map[string][]byte{}, nil
-	}
-
-	readable := e.readablePartsLocked()
-
-	parts := make([]map[string][]byte, 0, len(readable)+1)
-	parts = append(parts, e.cfg.SideStore.Encode()) // unflushed head symbols
-
-	if e.flushingSide != nil {
-		parts = append(parts, e.flushingSide) // symbols of the records an in-flight flush detached
-	}
-
-	for _, p := range readable {
-		m, err := loadSidecars(ctx, e.cfg.Backend, p.prefix, e.cfg.SideStore.Names())
-		if err != nil {
-			return nil, err
-		}
-
-		parts = append(parts, m)
-	}
-
-	return e.cfg.SideStore.Union(parts)
 }
 
 // PartCount returns the number of flushed parts (introspection).

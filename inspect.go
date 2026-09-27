@@ -7,6 +7,7 @@ import (
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/signal/profile"
 )
 
 // StoreStats is a point-in-time, in-memory snapshot of store state for an embedder's CLI/UI
@@ -233,6 +234,9 @@ type RebalanceMove struct {
 type CacheStats struct {
 	// Decode is the decoded-column cache, summed across metric engines (zero when unconfigured).
 	Decode engine.DecodeCacheStats
+	// ProfileSymbols is the decoded profile symbol cache ([Options.ProfileSymbolCacheBytes]); Items
+	// counts cached parts.
+	ProfileSymbols profile.CacheStats
 }
 
 // Inspect returns an in-memory snapshot of store state for a dashboard/CLI. It does no backend I/O
@@ -314,7 +318,7 @@ func (s *Storage) Inspect() StoreStats {
 	addRecord(signal.Exemplar, s.exemplarEngineSnapshotByTenant())
 
 	// Attach per-tenant admission and order each tenant's signals deterministically.
-	out := StoreStats{Caches: CacheStats{Decode: decode}}
+	out := StoreStats{Caches: CacheStats{Decode: decode, ProfileSymbols: s.profileSymbols.Stats()}}
 
 	for tid, ts := range byTenant {
 		ts.Admission = s.AdmissionStats(tid)

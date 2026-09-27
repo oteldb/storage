@@ -261,9 +261,8 @@ func TestSideStoreMergeUnions(t *testing.T) {
 	require.Equal(t, 2, e.PartCount())
 	require.Equal(t, 2, fs.stores, "each flush stores its sidecars")
 
-	_, err := e.SideSnapshot(ctx)
-	require.NoError(t, err)
-	require.Equal(t, 2, fs.stores, "a snapshot stays in memory")
+	require.Equal(t, []uint64{1, 2, 4}, snapshotIDs(t, e))
+	require.Equal(t, 2, fs.stores, "a read stays in memory")
 
 	require.NoError(t, e.Merge(ctx, 0))
 	require.Equal(t, 1, e.PartCount())

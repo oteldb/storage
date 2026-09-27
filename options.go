@@ -111,6 +111,13 @@ type Options struct {
 	// RAM-fast). With it, a fetch also prefetches its parts' decodes concurrently. Zero disables it.
 	DecodeCacheBytes int64
 
+	// ProfileSymbolCacheBytes bounds the cache of decoded profile symbol tables that
+	// [Storage.ProfileResolver] reads, keyed by part: a part's tables decode once, not on every
+	// flamegraph query. Zero ⇒ [defaultProfileSymbolCacheBytes]; negative disables it. Budgets of
+	// 4 GiB or more are capped just below 4 GiB, and a part decoding larger than the budget is served
+	// uncached.
+	ProfileSymbolCacheBytes int64
+
 	// DecodeMemoryBytes caps the total in-flight decoded column bytes across concurrent queries,
 	// process-wide (one budget shared by every tenant engine): a query reserves its estimated
 	// decode footprint before reading any part, blocking while the budget is exhausted, so query
@@ -384,6 +391,25 @@ func (o *Options) flushThresholdBytes() int64 {
 // [defaultFlushThresholdBytes]; a negative value disables the size trigger, leaving
 // [Options.FlushInterval] as the only one. See [Options.FlushThresholdBytes].
 func WithFlushThresholdBytes(n int64) Option { return func(o *Options) { o.FlushThresholdBytes = n } }
+
+// defaultProfileSymbolCacheBytes is the profile symbol cache budget when
+// [Options.ProfileSymbolCacheBytes] is left at zero.
+const defaultProfileSymbolCacheBytes = 128 << 20 // 128 MiB
+
+func (o *Options) profileSymbolCacheBytes() int64 {
+	if o.ProfileSymbolCacheBytes == 0 {
+		return defaultProfileSymbolCacheBytes
+	}
+
+	return o.ProfileSymbolCacheBytes
+}
+
+// WithProfileSymbolCache sizes the decoded profile symbol cache. Zero keeps
+// [defaultProfileSymbolCacheBytes]; a negative value disables it. See
+// [Options.ProfileSymbolCacheBytes].
+func WithProfileSymbolCache(maxBytes int64) Option {
+	return func(o *Options) { o.ProfileSymbolCacheBytes = maxBytes }
+}
 
 // WithReadCache enables an in-memory object cache over the backend, sized to maxBytes (the
 // object-store read cache for the cold tier). Skipped for an ephemeral backend. See [Options.ReadCacheBytes].

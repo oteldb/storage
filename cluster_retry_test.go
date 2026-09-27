@@ -258,7 +258,7 @@ func TestClusterProfileEnumSurvivesDownOwner(t *testing.T) {
 	require.Len(t, series, 1, "stream still enumerable from the live replica")
 
 	// symbol-store RPC (rpcOpSide) survives too: building the resolver fetches the side store.
-	resolver, err := reader.ProfileResolver(ctx, "default")
+	resolver, err := reader.ProfileResolver(ctx, "default", 0, 0)
 	require.NoError(t, err)
 
 	got, err := fetch.Drain(ctx, must(reader.ProfileFetcher("default").Fetch(ctx, fetch.Request{

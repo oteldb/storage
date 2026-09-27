@@ -80,10 +80,15 @@ func TestEngineSymbolStoreDedupAcrossParts(t *testing.T) {
 
 	require.Len(t, merged, 1, "shared stack stored once after merge-union")
 
-	snapshot, err := eng.SideSnapshot(ctx)
+	rd := eng.ReadSide(0, 0, func(recordengine.SideStore) {})
+	defer rd.Release()
+
+	require.Len(t, rd.Parts, 1)
+
+	stored, err := rd.Parts[0].Load(ctx)
 	require.NoError(t, err)
 
-	for name, data := range snapshot {
-		require.Equal(t, byte(compress.AlgorithmNone), data[8], "snapshot %s stays uncompressed", name)
-	}
+	tables, err := DecodeTables(stored)
+	require.NoError(t, err)
+	require.Len(t, tables.t.t[tableStacks], 1)
 }

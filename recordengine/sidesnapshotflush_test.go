@@ -15,16 +15,36 @@ import (
 	"github.com/oteldb/storage/recordengine"
 )
 
-// snapshotIDs returns the sorted ids [recordengine.Engine.SideSnapshot] resolves.
+// snapshotIDs returns the sorted ids a full-window [recordengine.Engine.ReadSide] resolves.
 func snapshotIDs(t *testing.T, e *recordengine.Engine) []uint64 {
 	t.Helper()
 
-	tables, err := e.SideSnapshot(context.Background())
-	require.NoError(t, err)
+	return readSideIDs(t, e, 0, 0)
+}
+
+// readSideIDs returns the sorted ids the head, the in-flight flush and the parts [recordengine.Engine.ReadSide]
+// selects for [start, end] hold together.
+func readSideIDs(t *testing.T, e *recordengine.Engine, start, end int64) []uint64 {
+	t.Helper()
 
 	got := map[uint64][]byte{}
-	if data, ok := tables["table"]; ok {
+
+	rd := e.ReadSide(start, end, func(live recordengine.SideStore) {
+		require.NoError(t, decodeSide(live.Encode()["table"], got))
+	})
+	defer rd.Release()
+
+	if data, ok := rd.Flushing["table"]; ok {
 		require.NoError(t, decodeSide(data, got))
+	}
+
+	for _, p := range rd.Parts {
+		tables, err := p.Load(context.Background())
+		require.NoError(t, err)
+
+		if data, ok := tables["table"]; ok {
+			require.NoError(t, decodeSide(data, got))
+		}
 	}
 
 	ids := make([]uint64, 0, len(got))

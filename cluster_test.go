@@ -514,7 +514,7 @@ func TestClusteredProfilesReplicateAndRead(t *testing.T) {
 		assert.Equalf(t, "cpu", string(st.Str()), "%s type label", name)
 
 		// Resolution fan-out: the replicated symbol store resolves the sample's stack to its frames.
-		resolver, err := s.ProfileResolver(ctx, "default")
+		resolver, err := s.ProfileResolver(ctx, "default", 0, 0)
 		require.NoErrorf(t, err, "%s profile resolver", name)
 		stacks, _ := got[0].Column(profile.ColStackID)
 		frames := resolver.Resolve(stacks.Bytes[0])
@@ -966,11 +966,15 @@ func TestClusteredShardedProfileResolver(t *testing.T) {
 		require.GreaterOrEqualf(t, len(got), 3, "%s gathers streams across shards", name)
 
 		// The unioned-across-shards symbol store resolves a stack from any stream.
-		resolver, err := s.ProfileResolver(ctx, "default")
+		resolver, err := s.ProfileResolver(ctx, "default", 0, 0)
 		require.NoErrorf(t, err, "%s profile resolver", name)
 		stacks, _ := got[0].Column(profile.ColStackID)
 		frames := resolver.Resolve(stacks.Bytes[0])
 		assert.NotEmptyf(t, frames, "%s resolves a stack via the cross-shard symbol union", name)
+
+		windowed, err := s.ProfileResolver(ctx, "default", 1000, 1000)
+		require.NoErrorf(t, err, "%s windowed profile resolver", name)
+		assert.Equalf(t, frames, windowed.Resolve(stacks.Bytes[0]), "%s resolves within the samples' window", name)
 	}
 }
 
