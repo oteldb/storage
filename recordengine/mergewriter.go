@@ -77,11 +77,10 @@ type sourceBindings struct {
 	stableGen, framedGen block.DictGen
 }
 
-// newRecordPartStreamWriter starts an output part of a merge over src. comp, when non-nil, is the
-// merge's frame compressor, which all its day writers share; the part's whole objects go through
-// compressors of the writer's own.
+// newRecordPartStreamWriter starts an output part of a merge over src. coders, when non-nil, are the
+// merge's compressors, which all its day writers share.
 func newRecordPartStreamWriter(
-	ctx context.Context, e *Engine, src []*part, comp *compress.Compressor,
+	ctx context.Context, e *Engine, src []*part, coders *mergeCoders,
 ) (*recordPartStreamWriter, error) {
 	schema := e.cfg.Schema
 	opts := []block.PartOption{
@@ -93,8 +92,8 @@ func newRecordPartStreamWriter(
 			block.WithCompressionLevel(e.cfg.MergeCompressionLevel))
 	}
 
-	if comp != nil {
-		opts = append(opts, block.WithFrameCompressors(comp))
+	if coders != nil {
+		opts = append(opts, block.WithFrameCompressors(coders.frames), block.WithCompressors(coders.objects))
 	}
 
 	w := &recordPartStreamWriter{

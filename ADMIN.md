@@ -498,12 +498,14 @@ size-triggered flush until a whole cycle's fan-out returns, so parking a merge o
 would hold back the memory relief the budget exists to bound.
 
 A record merge reserves **its share, or what it needs if that is more**: its sources as their
-manifests bound them (read-ahead windows, frame buffers, dictionaries), its frame encoder and room
+manifests bound them (read-ahead windows, frame buffers, dictionaries), its encoders and room
 for its writers. A merge over parts the manifest cannot size (written before sizing stats) reserves
 its share and tops it up once it has opened them — never waiting while it holds — or, when it would
 have to wait, hands its grant back and queues for the whole; a background merge that finds the
 difference taken is deferred like any other. A request above the whole budget is clamped to it, so
-such a merge runs alone.
+such a merge runs alone. The need can be several shares: a flushed log part whose body column was
+written unframed is read whole, and a merge of four such parts (154 MiB decoded) reserves 193.6 MiB,
+of which it holds 158 MiB, whatever a smaller share says.
 
 `Admin.Compact`, `Admin.CompactNow` and `Admin.Retention` **wait** for the budget instead of
 deferring, so an operator command never silently does nothing. `Admin.MaintainNow` runs the

@@ -46,7 +46,7 @@ func TestOpenGrantedCoversAShortGrant(t *testing.T) {
 
 	ctx := context.Background()
 	e := wideDictEngine(t, backend.Memory(), Config{MergeMemoryBytes: -1}, 3, 4, 8<<10, 2)
-	comp := compress.NewCompressor(compress.AlgorithmZSTD, compress.LevelDefault)
+	encoders := compress.NewCompressor(compress.AlgorithmZSTD, compress.LevelDefault).EncodeWorkspace()
 
 	for _, tc := range []struct {
 		name         string
@@ -72,7 +72,7 @@ func TestOpenGrantedCoversAShortGrant(t *testing.T) {
 
 			g := &mergeGrant{bytes: 1, release: func() {}, wait: tc.wait, admit: admit}
 
-			sources, limit, _, err := e.openGranted(ctx, e.parts, g, comp, 0)
+			sources, limit, _, err := e.openGranted(ctx, e.parts, g, encoders, 0)
 			if tc.declined {
 				require.ErrorIs(t, err, errMergeDeclined)
 
@@ -82,7 +82,7 @@ func TestOpenGrantedCoversAShortGrant(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, sources, len(e.parts))
 
-			_, reserve, need := mergeWriterBudget(g.bytes, sources, comp, 0)
+			_, reserve, need := mergeWriterBudget(g.bytes, sources, encoders, 0)
 			assert.GreaterOrEqual(t, g.bytes, need, "the grant must cover what the opened sources need")
 			assert.GreaterOrEqual(t, limit, 2*reserve)
 			assert.Equal(t, tc.wantWaitLast, waits[len(waits)-1])

@@ -11,8 +11,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
-	"github.com/oteldb/storage/block"
-	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/timebucket"
 )
@@ -405,11 +403,11 @@ func (e *Engine) compactStreamed(
 	partBytes := e.mergePartBytes(capBytes)
 	runBytes := partBytes / mergeRunFraction
 
-	// One frame compressor for every day writer of the merge: a pool per writer would keep an
+	// One set of compressors for every day writer of the merge: a pool per writer would keep an
 	// encoder per open day.
-	comp := block.NewFrameCompressor(e.cfg.MergeCompression, e.cfg.MergeCompressionLevel)
+	coders := e.newMergeCoders(src)
 
-	sources, writerLimit, appendReserve, err := e.openGranted(ctx, src, grant, comp, runBytes)
+	sources, writerLimit, appendReserve, err := e.openGranted(ctx, src, grant, coders.workspace(), runBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -418,7 +416,7 @@ func (e *Engine) compactStreamed(
 
 	router := timebucket.Router[*recordPartStreamWriter]{
 		Open: func(int64) (*recordPartStreamWriter, error) {
-			return newRecordPartStreamWriter(ctx, e, src, comp)
+			return newRecordPartStreamWriter(ctx, e, src, coders)
 		},
 		Finish: func(w *recordPartStreamWriter) error {
 			p, err := w.finish(ctx)
@@ -503,14 +501,14 @@ var mergeResidentObserver func(peak, run, limit, grant int64)
 // — drops the sources, hands the grant back and queues for the whole, so it holds nothing it was not
 // granted while it waits. One that may not wait is declined.
 func (e *Engine) openGranted(
-	ctx context.Context, src []*part, grant *mergeGrant, comp *compress.Compressor, runBytes int64,
+	ctx context.Context, src []*part, grant *mergeGrant, encoders, runBytes int64,
 ) (sources []mergeSource, limit, reserve int64, err error) {
 	for {
 		if sources, err = e.openMergeSources(ctx, src); err != nil {
 			return nil, 0, 0, err
 		}
 
-		limit, reserve, need := mergeWriterBudget(grant.bytes, sources, comp, runBytes)
+		limit, reserve, need := mergeWriterBudget(grant.bytes, sources, encoders, runBytes)
 		if grant.bytes == 0 || need <= grant.bytes {
 			return sources, limit, reserve, nil
 		}
@@ -520,7 +518,7 @@ func (e *Engine) openGranted(
 		case err != nil:
 			return nil, 0, 0, err
 		case topped:
-			limit, reserve, _ = mergeWriterBudget(grant.bytes, sources, comp, runBytes)
+			limit, reserve, _ = mergeWriterBudget(grant.bytes, sources, encoders, runBytes)
 
 			return sources, limit, reserve, nil
 		case !grant.wait:

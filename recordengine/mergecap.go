@@ -6,7 +6,6 @@ import (
 
 	"github.com/go-faster/errors"
 
-	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/memlimit"
 )
 
@@ -49,14 +48,14 @@ func (e *Engine) mergePartBytes(capBytes int64) int64 {
 }
 
 // mergeWriterBudget splits a merge's grant. What the sources hold from the moment they open
-// (read-ahead windows, frame buffers, dictionaries or whole decodes) and the workspace of the one
-// frame encoder the merge borrows at a time come off the top; the writers get the rest, of which the
-// router keeps room for one append ([appendReserve]). need is what the grant must be for the writers
-// to get at least two appends; a grant of 0 bounds nothing.
+// (read-ahead windows, frame buffers, dictionaries or whole decodes) and the encoders' workspace come
+// off the top; the writers get the rest, of which the router keeps room for one append
+// ([appendReserve]). need is what the grant must be for the writers to get at least two appends; a
+// grant of 0 bounds nothing.
 func mergeWriterBudget(
-	grant int64, sources []mergeSource, comp *compress.Compressor, runBytes int64,
+	grant int64, sources []mergeSource, encoders, runBytes int64,
 ) (limit, reserve, need int64) {
-	held := comp.EncodeWorkspace()
+	held := encoders
 	entries := 0
 
 	for _, s := range sources {

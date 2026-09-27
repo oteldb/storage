@@ -3,8 +3,11 @@ package recordengine
 import (
 	"context"
 	"encoding/binary"
+	"math"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
+	"github.com/oteldb/storage/encoding/compress"
 )
 
 // sourceBound bounds from p's manifest what the merge source it opens as will report
@@ -128,10 +131,10 @@ func appendReserve(entries int, runBytes int64) int64 {
 }
 
 // mergeNeed is what a merge of src must be able to hold before anything opens: the sources as their
-// manifests bound them, the frame encoder, and the writers' floor of two appends. ok is false when a
+// manifests bound them, the encoders, and the writers' floor of two appends. ok is false when a
 // source's manifest cannot say.
 func (e *Engine) mergeNeed(ctx context.Context, src []*part, capBytes int64) (int64, bool) {
-	need := block.NewFrameCompressor(e.cfg.MergeCompression, e.cfg.MergeCompressionLevel).EncodeWorkspace()
+	need := e.newMergeCoders(src).workspace()
 	entries := 0
 
 	for _, p := range src {
@@ -145,4 +148,67 @@ func (e *Engine) mergeNeed(ctx context.Context, src []*part, capBytes int64) (in
 	}
 
 	return need + 2*appendReserve(entries, e.mergePartBytes(capBytes)/mergeRunFraction), true
+}
+
+// mergeCoders are the compressors a merge's day writers share: frames go through a 1 MiB-window
+// encoder, whole objects — dictionary regions, a column written unframed, the stream id column —
+// through one whose window fits the largest such object the merge can write. Each is used by one
+// writer at a time, so a merge holds one encoder of each.
+type mergeCoders struct {
+	frames, objects *compress.Compressor
+}
+
+func (e *Engine) newMergeCoders(src []*part) *mergeCoders {
+	alg, level := e.cfg.MergeCompression, e.cfg.MergeCompressionLevel
+
+	return &mergeCoders{
+		frames:  block.NewFrameCompressor(alg, level),
+		objects: compress.NewFrameCompressor(alg, level, mergeObjectBytes(src, !backend.StreamsWrites(e.cfg.Backend))),
+	}
+}
+
+func (c *mergeCoders) workspace() int64 {
+	return c.frames.EncodeWorkspace() + c.objects.EncodeWorkspace()
+}
+
+// mergeObjectBytes bounds the largest whole object a merge of src compresses. An output part's
+// dictionary holds values its sources held in their dictionaries or in their self-encoded granules,
+// so a byte column's dictionary region is at most its sources' dictionaries and streams together.
+// Only a writer that buffers (unframed) rewrites a column no granule of which joined as one stream,
+// the sources' streams merged; a streaming one keeps its frames. The stream id column is a run per
+// stream. A source without sizing stats bounds nothing, and the encoder gets the default window.
+func mergeObjectBytes(src []*part, buffered bool) int {
+	const runBytes = 24
+
+	if len(src) == 0 {
+		return 0
+	}
+
+	var streams, largest int64
+
+	for _, p := range src {
+		streams += int64(len(p.ranges))
+	}
+
+	largest = streams * runBytes
+
+	for k := range src[0].schema.numBytes() {
+		var n int64
+
+		for _, p := range src {
+			desc, ok := p.reader.ColumnDescByName(p.schema.byteColumn(k).Name)
+			switch {
+			case !ok || (!desc.Const && !desc.HasSizing):
+				return math.MaxInt
+			case desc.Const:
+				n += int64(len(desc.ConstBytes)) + binary.MaxVarintLen32
+			case buffered || desc.SharedDict:
+				n += desc.DictRaw + desc.Sizing.StreamRaw
+			}
+		}
+
+		largest = max(largest, n)
+	}
+
+	return int(min(largest, math.MaxInt))
 }
