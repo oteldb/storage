@@ -550,6 +550,11 @@ engine; no parallel subsystem.
 **Determinism:** absolute timestamps, never clock reads — the caller resolves policy against one `now`
 per pass — and grid-aligned downsample buckets, so a rollup does not depend on when the merge runs.
 
+**Stable cutoffs:** the caller floors each tier's `Before` to whole buckets of at least an hour, so a
+cutoff never splits a bucket (a split bucket is re-rolled with its own representative, which avg and
+count cannot absorb) and moves once per quantum rather than once per tick. Quantized cutoffs tie, so a
+sample goes to the widest tier it qualifies for rather than the one with the earliest cutoff.
+
 **Fixed points:** repeated merges are stable for last/first/min/max/sum/avg, count being the documented
 exception. Recompression checks the part's recorded algorithm *and* level, precision the manifest's
 recorded budget; only an upgrade rewrites, and a part denser than the target is left alone.

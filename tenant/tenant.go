@@ -109,12 +109,19 @@ func (r Retention) AgeFor(sig signal.Signal) time.Duration {
 // the bucket's samples combined by Agg. A tier with Interval ≤ 0 is ignored.
 //
 // Tiers coarsen old data: configure increasing After with increasing Interval (e.g. 5m
-// buckets after 24h, 1h buckets after 7d). A sample is rolled up by the coarsest tier
-// whose After it has exceeded; samples younger than every tier's After stay raw. Buckets
+// buckets after 24h, 1h buckets after 7d). A sample is rolled up by the widest-Interval
+// tier whose cutoff it is past; samples younger than every tier's cutoff stay raw. Buckets
 // are aligned to absolute multiples of Interval (not to ingest time), so the rollup of a
 // time range is independent of when the merge runs — repeated merges are stable.
+//
+// A tier's cutoff is now − After floored to a multiple of Q = Interval × ⌈1h / Interval⌉:
+// one hour for any Interval dividing an hour, 63m for 7m, Interval itself from 1h up. A
+// bucket is therefore rolled up whole and once, and the cutoff moves once per Q rather
+// than on every maintenance cycle. The cost is lag: a sample is rolled up between After
+// and After + Q past its timestamp, plus up to one maintenance interval.
 type DownsampleTier struct {
-	// After is the age past which this tier applies (relative to now at merge time).
+	// After is the age past which this tier applies (relative to now at merge time, the
+	// cutoff floored as described above).
 	After time.Duration
 	// Interval is the rollup bucket width. Zero ⇒ the tier is disabled.
 	Interval time.Duration

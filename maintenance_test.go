@@ -10,13 +10,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/encoding/compress"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
 )
-
-const rerollIssue = 722
 
 func TestMaintainFlushesAndMerges(t *testing.T) {
 	t.Parallel()
@@ -219,11 +216,56 @@ func TestMetricMergeOptionsRecompress(t *testing.T) {
 	assert.Nil(t, s2.metricMergeOptions("default", 0).Recompress)
 }
 
+func TestMetricMergeOptionsDownsampleCutoff(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		interval, quantum time.Duration
+	}{
+		{interval: time.Minute, quantum: time.Hour},
+		{interval: 7 * time.Minute, quantum: 63 * time.Minute},
+		{interval: time.Hour, quantum: time.Hour},
+		{interval: 2 * time.Hour, quantum: 2 * time.Hour},
+	} {
+		t.Run(tc.interval.String(), func(t *testing.T) {
+			t.Parallel()
+
+			const after = 90 * time.Minute
+
+			s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+				return tenant.Policy{Downsample: tenant.Downsample{Tiers: []tenant.DownsampleTier{
+					{After: after, Interval: tc.interval},
+				}}}
+			})))
+			require.NoError(t, err)
+
+			var now int64
+
+			s.now = func() int64 { return now }
+			before := func(at int64) int64 {
+				now = at
+
+				tiers := s.metricMergeOptions("default", 0).Downsample
+				require.Len(t, tiers, 1)
+
+				return tiers[0].Before
+			}
+
+			q := int64(tc.quantum)
+			quantumStart := 1000*q + int64(after)
+
+			first := before(quantumStart + int64(time.Second))
+			assert.Zero(t, first%q, "a multiple of the quantum")
+			assert.Equal(t, quantumStart-int64(after), first)
+			assert.Equal(t, first, before(quantumStart+q-1), "still within the quantum")
+			assert.Equal(t, first+q, before(quantumStart+q), "the next quantum")
+		})
+	}
+}
+
 // TestMaintainRollsUpEachBucketOnce ticks maintenance every 10s on a synthetic clock while a gauge
 // ages past its tier: every bucket must come out equal to one rollup of its raw samples.
 func TestMaintainRollsUpEachBucketOnce(t *testing.T) {
-	reproduce.Unfixed(t, rerollIssue, "each tick's cutoff cuts a bucket and the next merge re-rolls its "+
-		"representative with the rest, so avg and count drift")
 	t.Parallel()
 
 	const (

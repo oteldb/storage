@@ -16,7 +16,7 @@ type MergeOptions struct {
 	RetainFrom int64
 	// Downsample, when non-empty, rolls up old samples at merge time (coarsening resolution
 	// with age). It reuses the one merge engine — no separate subsystem. The cutoffs are
-	// absolute (the caller resolves now − After into Before), keeping the merge deterministic.
+	// absolute (the caller floors now − After into Before), keeping the merge deterministic.
 	Downsample []DownsampleTier
 	// Recompress, when non-nil, rewrites a fully-cold merged part (every sample older than its
 	// Before cutoff) with a higher-ratio compression profile — the fourth merge mode after

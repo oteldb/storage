@@ -24,6 +24,7 @@ import (
 	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/parallel"
+	"github.com/oteldb/storage/internal/timebucket"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/scale"
 	"github.com/oteldb/storage/readbudget"
@@ -2172,7 +2173,7 @@ func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engi
 		}
 
 		tiers = append(tiers, engine.DownsampleTier{
-			Before:   now - t.After.Nanoseconds(),
+			Before:   downsampleCutoff(now, t),
 			Interval: t.Interval.Nanoseconds(),
 			Agg:      t.Agg,
 		})
@@ -2212,6 +2213,15 @@ func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engi
 		Recompress: recompress,
 		Precision:  precision,
 	}
+}
+
+// downsampleCutoff is now − After floored to whole rollup buckets of at least an hour, so the cutoff
+// never splits a bucket and holds still for a quantum (see engine/ARCH.md).
+func downsampleCutoff(now int64, t tenant.DownsampleTier) int64 {
+	interval := t.Interval.Nanoseconds()
+	quantum := interval * ((int64(time.Hour) + interval - 1) / interval)
+
+	return timebucket.Of(now-t.After.Nanoseconds(), quantum)
 }
 
 // engineSnapshot returns the current tenant engines (a copy, so callers iterate without
