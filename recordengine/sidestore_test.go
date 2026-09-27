@@ -144,6 +144,17 @@ func (f *fakeSide) Union(parts []map[string][]byte, refs iter.Seq[[]byte]) (map[
 	return map[string][]byte{"table": encodeSide(kept)}, nil
 }
 
+// UnionBytes bounds [fakeSide.Union]: its sidecars are stored as decoded, so per stored byte it holds
+// a copy in the merged map, the map's own entries, and the union encoded back.
+func (f *fakeSide) UnionBytes(sizes []int64, _ [][]byte) (int64, error) {
+	var n int64
+	for _, s := range sizes {
+		n += s
+	}
+
+	return 8 * n, nil
+}
+
 func (f *fakeSide) Stored(tables map[string][]byte) (map[string][]byte, error) {
 	f.stores++
 

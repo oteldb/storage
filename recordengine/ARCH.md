@@ -278,7 +278,11 @@ serialized and the one buffer its region is compressed into), the stream id colu
 the part opens and its ranges, each bloom built, encoded and read back, the record keys sorted,
 encoded and read back, the watermarks, and the identity object as it is encoded. The router finishes
 one writer at a time, so the one finishing is always inside what it counts
-(`TestMergeFinishHoldsItsGrant`, `TestMergeGatherHoldsItsGrant`).
+(`TestMergeFinishHoldsItsGrant`, `TestMergeGatherHoldsItsGrant`). A side store's finish also loads
+every source's sidecars, unions them and re-encodes the union; that is charged once, beside the
+encoders, since finishes do not overlap: the sidecars' stored sizes plus what the store reports its
+union and re-encode hold for them (`SideStore.UnionBytes`, shown each sidecar's size and head), read
+at admission (`TestMergeSidecarUnionHoldsItsGrant`).
 
 `TestMergeWritersHoldAdmittedShare` (8 sources × 3 dictionary columns of ~14k entries × 8 days, ZSTD,
 file backend, heap measured above the written sources): unbounded, the writers hold 93.4 MiB and the
@@ -689,6 +693,10 @@ riding the part lifecycle: absorbed into a live accumulator, written as sidecars
 on merge (content addressing makes the union a plain dedup with no id remap) and **retained** to what
 the output part's rows reach, and **restored** into the accumulator when a flush fails. Profiles'
 symbol store is the first user; nil for logs/traces.
+
+`SideStore.UnionBytes` bounds what `Union` and then `Stored` hold at once over sidecars of given
+sizes and heads, so a merge can reserve the union before loading a sidecar; it must not undercount,
+and it holds whatever the refs keep, since it cannot see them.
 
 `Encode` and `Union` return the in-memory form; `SideStore.Stored` converts to the
 on-disk form, and the engine applies it only to what `writeSidecars` writes: the flush snapshot once

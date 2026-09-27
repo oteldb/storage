@@ -231,31 +231,46 @@ func (e *Engine) mergeNeed(ctx context.Context, src []*part, capBytes int64) (in
 		entries += b.entries
 	}
 
-	writers := e.newMergeCoders(src).workspace() +
+	coders, err := e.newMergeCoders(ctx, src)
+	if err != nil {
+		return 0, false
+	}
+
+	writers := coders.workspace() +
 		2*appendReserve(e.cfg.Schema, entries, e.mergePartBytes(capBytes)/mergeRunFraction)
 
 	return steady + max(open, writers), true
 }
 
-// mergeCoders are the compressors a merge's day writers share: frames go through a 1 MiB-window
-// encoder, whole objects — dictionary regions, a column written unframed, the stream id column —
-// through one whose window fits the largest such object the merge can write. Each is used by one
-// writer at a time, so a merge holds one encoder of each.
+// mergeCoders is what a merge's day writers share: the compressors — frames go through a 1 MiB-window
+// encoder, whole objects (dictionary regions, a column written unframed, the stream id column)
+// through one whose window fits the largest such object the merge can write, each used by one writer
+// at a time, so a merge holds one encoder of each — and sidecars, what a side store's sidecar union
+// holds while a part finishes ([Engine.sidecarBytes]).
 type mergeCoders struct {
 	frames, objects *compress.Compressor
+	sidecars        int64
 }
 
-func (e *Engine) newMergeCoders(src []*part) *mergeCoders {
+func (e *Engine) newMergeCoders(ctx context.Context, src []*part) (*mergeCoders, error) {
 	alg, level := e.cfg.MergeCompression, e.cfg.MergeCompressionLevel
 
-	return &mergeCoders{
-		frames:  block.NewFrameCompressor(alg, level),
-		objects: compress.NewFrameCompressor(alg, level, mergeObjectBytes(src, !backend.StreamsWrites(e.cfg.Backend))),
+	sidecars, err := e.sidecarBytes(ctx, src)
+	if err != nil {
+		return nil, err
 	}
+
+	return &mergeCoders{
+		frames:   block.NewFrameCompressor(alg, level),
+		objects:  compress.NewFrameCompressor(alg, level, mergeObjectBytes(src, !backend.StreamsWrites(e.cfg.Backend))),
+		sidecars: sidecars,
+	}, nil
 }
 
+// workspace is what the merge holds in them beside its writers: an encoder of each compressor, and
+// one sidecar union, since the router finishes one writer at a time.
 func (c *mergeCoders) workspace() int64 {
-	return c.frames.EncodeWorkspace() + c.objects.EncodeWorkspace()
+	return c.frames.EncodeWorkspace() + c.objects.EncodeWorkspace() + c.sidecars
 }
 
 // mergeObjectBytes bounds the largest whole object a merge of src compresses. An output part's

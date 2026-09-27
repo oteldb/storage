@@ -53,7 +53,15 @@ type SideStore interface {
 	// it writes as sidecars, so [SideStore.Encode] and [SideStore.Union] can return a form that is
 	// cheap to decode again in memory. Pure, like Union.
 	Stored(tables map[string][]byte) (map[string][]byte, error)
+	// UnionBytes bounds what Union and then Stored hold at once, beside the loaded sidecars
+	// themselves, over stored sidecars of the given byte lengths whose first bytes are heads (at
+	// most [SidecarHeadBytes] each). A merge reserves it for each part it writes before reading a
+	// sidecar, so it must not undercount.
+	UnionBytes(sizes []int64, heads [][]byte) (int64, error)
 }
+
+// SidecarHeadBytes is how much of each stored sidecar [SideStore.UnionBytes] is shown.
+const SidecarHeadBytes = 32
 
 // sidecarKey is the backend key of a side-store table sidecar under a part prefix (mirrors the
 // per-column bloom sidecars, e.g. {prefix}/sym-stacks.bin).
@@ -88,6 +96,51 @@ func loadSidecars(ctx context.Context, b backend.Backend, prefix string, names [
 	}
 
 	return out, nil
+}
+
+// sidecarBytes bounds what [Engine.mergeSidecars] holds for one output part of a merge over src:
+// every source's stored sidecars as loaded, and what the store's union and re-encode hold beside
+// them ([SideStore.UnionBytes]). It reads only each sidecar's size and head.
+func (e *Engine) sidecarBytes(ctx context.Context, src []*part) (int64, error) {
+	if e.cfg.SideStore == nil {
+		return 0, nil
+	}
+
+	var (
+		loaded int64
+		sizes  []int64
+		heads  [][]byte
+	)
+
+	for _, p := range src {
+		for _, name := range e.cfg.SideStore.Names() {
+			key := sidecarKey(p.prefix, name)
+
+			n, err := backend.SizeOf(ctx, e.cfg.Backend, key)
+			switch {
+			case errors.Is(err, backend.ErrNotExist):
+				continue
+			case err != nil:
+				return 0, errors.Wrapf(err, "size sidecar %q", name)
+			}
+
+			head, err := backend.ReadAt(ctx, e.cfg.Backend, key, 0, min(n, SidecarHeadBytes))
+			if err != nil {
+				return 0, errors.Wrapf(err, "read sidecar %q", name)
+			}
+
+			loaded += n
+			sizes = append(sizes, n)
+			heads = append(heads, head)
+		}
+	}
+
+	union, err := e.cfg.SideStore.UnionBytes(sizes, heads)
+	if err != nil {
+		return 0, errors.Wrap(err, "bound sidecar union")
+	}
+
+	return loaded + union, nil
 }
 
 // SidePart is one readable part's side data.
