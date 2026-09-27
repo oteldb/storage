@@ -333,12 +333,8 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 		parts = append(parts, m)
 	}
 
-	merged, err := e.cfg.SideStore.Union(parts)
+	merged, err := e.cfg.SideStore.Union(parts, refs)
 	if err != nil {
-		return err
-	}
-
-	if merged, err = e.cfg.SideStore.Retained(merged, refs); err != nil {
 		return err
 	}
 

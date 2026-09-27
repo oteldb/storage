@@ -3,6 +3,7 @@ package profile
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"iter"
 	"math"
 	"slices"
 
@@ -479,9 +480,10 @@ func (s *SymbolStore) Restore(snapshot map[string][]byte) error {
 // Names returns the sidecar table names.
 func (s *SymbolStore) Names() []string { return tableNames }
 
-// Union merges the loaded sidecars of compacted parts (one map per part) into one merged set of
-// named tables. Pure: it does not read the live accumulator.
-func (s *SymbolStore) Union(parts []map[string][]byte) (map[string][]byte, error) {
+// Union merges the loaded sidecars of compacted parts (one map per part) and returns the entries the
+// stack ids in refs reach as named tables. The union is decoded once and only the kept entries are
+// encoded. Pure: it does not read the live accumulator.
+func (s *SymbolStore) Union(parts []map[string][]byte, refs iter.Seq[[]byte]) (map[string][]byte, error) {
 	merged := newSymTables()
 
 	for _, part := range parts {
@@ -497,10 +499,8 @@ func (s *SymbolStore) Union(parts []map[string][]byte) (map[string][]byte, error
 		}
 	}
 
-	out := make(map[string][]byte, len(tableNames))
-	for i, name := range tableNames {
-		out[name] = encodeTable(merged.t[i], memoryCompressor)
-	}
+	union := &SymbolStore{acc: merged}
+	union.Retain(refs)
 
-	return out, nil
+	return union.Encode(), nil
 }

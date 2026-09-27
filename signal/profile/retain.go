@@ -24,19 +24,6 @@ func (s *SymbolStore) Retain(refs iter.Seq[[]byte]) {
 	s.acc = kept
 }
 
-// Retained returns tables restricted to the entries the stack ids in refs reach. Pure: it does not
-// read the live accumulator.
-func (s *SymbolStore) Retained(tables map[string][]byte, refs iter.Seq[[]byte]) (map[string][]byte, error) {
-	src := NewSymbolStore()
-	if err := src.Restore(tables); err != nil {
-		return nil, err
-	}
-
-	src.Retain(refs)
-
-	return src.Encode(), nil
-}
-
 // keep copies id's entry of table i into dst and returns it, or reports false when it was kept
 // already or is absent.
 func (s *SymbolStore) keep(dst *symTables, i int, id signal.SeriesID) ([]byte, bool) {

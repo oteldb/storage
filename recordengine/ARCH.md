@@ -635,14 +635,16 @@ on merge (content addressing makes the union a plain dedup with no id remap) and
 the output part's rows reach, and **restored** into the accumulator when a flush fails. Profiles'
 symbol store is the first user; nil for logs/traces.
 
-`Encode`, `Union` and `Retained` return the in-memory form; `SideStore.Stored` converts to the
+`Encode` and `Union` return the in-memory form; `SideStore.Stored` converts to the
 on-disk form, and the engine applies it only to what `writeSidecars` writes: the flush snapshot once
 per flush (shared by every part a split produces) and each merge output's retained union. A store
 that compresses its sidecars thus pays that encode at flush and merge, never on the query path.
 
 **A merge keeps only what its rows reach.** Each output writer collects the distinct `RefColumn` cells
-it writes (counted in its resident bytes, O(distinct stacks) of the part), and `SideStore.Retained`
-restricts the inputs' union to their closure. Without it a retention rewrite would carry the symbols of
+it writes (counted in its resident bytes, O(distinct stacks) of the part), and `SideStore.Union`
+decodes the inputs once and encodes only their closure. The decoded union lives for one output part's
+`finish`; a day split into several parts decodes it once per part rather than holding it across the
+merge's writers. Without it a retention rewrite would carry the symbols of
 every row it dropped, and a split day would copy the whole union into every part.
 
 **Reads hand out the pieces, not a union.** `Engine.ReadSide(start, end, head)` calls `head` with the

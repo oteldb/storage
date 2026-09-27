@@ -1,6 +1,7 @@
 package profile
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -64,7 +65,8 @@ func TestBuilderDeltaDedups(t *testing.T) {
 }
 
 // TestSymbolStoreAbsorbEncodeUnion exercises the SideStore lifecycle: absorb two batch deltas,
-// encode sidecars, then union two parts' sidecars and confirm the merged tables hold every entry.
+// encode sidecars, then union two parts' sidecars and confirm the merged tables hold every entry
+// both stacks reach.
 func TestSymbolStoreAbsorbEncodeUnion(t *testing.T) {
 	t.Parallel()
 
@@ -86,7 +88,8 @@ func TestSymbolStoreAbsorbEncodeUnion(t *testing.T) {
 	require.NoError(t, s2.Absorb(encodeDelta(bb.tables)))
 	part2 := s2.Encode()
 
-	merged, err := NewSymbolStore().Union([]map[string][]byte{part1, part2})
+	refs := slices.Values([][]byte{ba.stackID(stA).AppendBinary(nil), bb.stackID(stB).AppendBinary(nil)})
+	merged, err := NewSymbolStore().Union([]map[string][]byte{part1, part2}, refs)
 	require.NoError(t, err)
 
 	stacks := map[signal.SeriesID][]byte{}

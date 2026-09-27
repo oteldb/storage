@@ -120,7 +120,7 @@ func (f *fakeSide) Restore(snapshot map[string][]byte) error {
 
 func (f *fakeSide) Names() []string { return []string{"table"} }
 
-func (f *fakeSide) Union(parts []map[string][]byte) (map[string][]byte, error) {
+func (f *fakeSide) Union(parts []map[string][]byte, refs iter.Seq[[]byte]) (map[string][]byte, error) {
 	f.unions++
 	merged := map[uint64][]byte{}
 
@@ -132,22 +132,11 @@ func (f *fakeSide) Union(parts []map[string][]byte) (map[string][]byte, error) {
 		}
 	}
 
-	return map[string][]byte{"table": encodeSide(merged)}, nil
-}
-
-func (f *fakeSide) Retained(tables map[string][]byte, refs iter.Seq[[]byte]) (map[string][]byte, error) {
-	all := map[uint64][]byte{}
-	if data, ok := tables["table"]; ok {
-		if err := decodeSide(data, all); err != nil {
-			return nil, err
-		}
-	}
-
 	kept := map[uint64][]byte{}
 
 	for ref := range refs {
 		id, err := strconv.ParseUint(string(ref), 10, 64)
-		if entry, ok := all[id]; err == nil && ok {
+		if entry, ok := merged[id]; err == nil && ok {
 			kept[id] = entry
 		}
 	}
