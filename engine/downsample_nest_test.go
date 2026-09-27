@@ -95,8 +95,8 @@ func TestDownsampleNestedCutoffsNeverStraddle(t *testing.T) {
 	})
 }
 
-// TestMergeNestedTiersRollOnce is the 119m/121m/122m case over two merges, on the nesting analogue
-// of 7m + 1h the facade accepts: the result equals one rollup and the second merge is a fixed point.
+// TestMergeNestedTiersRollOnce is the 119m/121m/122m case over two merges, on the nesting
+// counterpart of 7m + 1h the facade accepts: the result equals one rollup and the second merge is a fixed point.
 func TestMergeNestedTiersRollOnce(t *testing.T) {
 	t.Parallel()
 

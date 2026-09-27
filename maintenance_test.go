@@ -270,7 +270,7 @@ func TestMetricMergeOptionsDownsampleNesting(t *testing.T) {
 	resolve := func(t *testing.T, intervals ...time.Duration) []engine.DownsampleTier {
 		t.Helper()
 
-		var tiers []tenant.DownsampleTier
+		tiers := make([]tenant.DownsampleTier, 0, len(intervals))
 		for i, iv := range intervals {
 			tiers = append(tiers, tenant.DownsampleTier{After: time.Duration(i+1) * time.Hour, Interval: iv})
 		}
