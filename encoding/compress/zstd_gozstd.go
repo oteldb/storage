@@ -39,6 +39,20 @@ func newZstdEncoder(level Level) zstdEncoder {
 	return gzEncoder{level: l}
 }
 
+// zstdEncodeWorkspace is a libzstd compression context at the mapped level. It is C memory, outside
+// the Go heap and GOMEMLIMIT, and unlike the klauspost figures these are not measured: they are
+// round figures meant to sit above a context's window and tables at each level.
+func zstdEncodeWorkspace(level Level) int64 {
+	switch {
+	case level == LevelFast:
+		return 4 << 20
+	case level >= LevelBest:
+		return 128 << 20
+	default:
+		return 64 << 20
+	}
+}
+
 func newZstdDecoder() zstdDecoder { return gzDecoder{} }
 
 type gzStreamDecoder struct{ r *gozstd.Reader }

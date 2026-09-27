@@ -55,10 +55,11 @@ re-exported exemplars at ingest is its own change. Record specifics:
 - The day writers stream (§ Merge write side), so a merge across days holds a writer per open day —
   frames, dictionaries and sidecar state — never a day's rows.
 - A writer is sealed once it has taken the cap in decoded rows, and the largest open writer once the
-  writers together hold the merge's admitted share in RAM (§ Merge write side). Both are checked after
-  every append — at most one output granule, and at most a quarter of the cap of one stream's rows in
-  one day — so a part reaches at most 1.25× the cap, and the writers exceed the share by at most one
-  append. A retention rewrite takes its bucket's forced parts only up to the cap, so its day is about
+  writers leave less than one append's room in what the merge's admitted share leaves beside its
+  sources and encoder (§ Merge write side). Both are checked after every append — at most one output
+  granule, and at most a quarter of the cap of one stream's rows in one day — so a part reaches at
+  most 1.25× the cap, and the writers stay inside their room unless one append outgrows the reserve
+  and every append before it. A retention rewrite takes its bucket's forced parts only up to the cap, so its day is about
   the budget (`TestRetentionRewriteHoldsResidentShare`), unless one forced part over the cap is
   rewritten alone.
 - A side-store engine (profiles) writes a symbol sidecar under each day's part, since each is the one
@@ -107,8 +108,9 @@ an output buffer the merge never holds. Free space does not enter; the flush cap
 target bound the disk.
 
 A merge seals on two numbers (`mergeBounds`): the cap, per output part in decoded rows, and the
-merge's admitted share (`mergeMemoryBudgetBytes`, what `Config.MergeAdmission` reserves), over what
-its open writers hold in RAM. Neither bounds the other, and only the second is a memory bound. The
+merge's admitted share (`mergeMemoryBudgetBytes`, what `Config.MergeAdmission` reserves), of which
+its open writers get what the sources and the encoder leave (`mergeWriterBudget`). Neither bounds the
+other, and only the second is a memory bound. The
 stream union the merge walks comes from `internal/mergestream`:
 `mergestream.Keys` over each part's already-sorted `ranges`, a k-way heap rather than a map of every
 distinct stream. It collapses repeats within a part as the map did, which matters because an
@@ -243,13 +245,26 @@ writer binds every source's dictionaries, so they multiply with sources × colum
 sources, 3 dictionary columns and 32 days at 65,536 entries is 1.1 GiB. A binding's cache maps the
 source's entries into that writer's own dictionary and granule, so it cannot be shared across
 writers; it is made only for a (source, column) the writer receives rows from, and the router sheds
-the largest writer once the open ones reach the share. `TestMergeWritersHoldAdmittedShare` (8 sources
-× 3 dictionary columns of ~16k entries × 8 days): unbounded, the writers hold 85.7 MiB at a 95.6 MiB
-peak heap; at a 32 MiB share they report at most 40 MiB (one append adds up to 8 MiB) at a 53.9 MiB
-peak heap. `TestRecordPartWriterResidentTracksHeap` checks the figure against the heap a writer gives
-back when dropped: 29.3 MiB reported, 22.1 MiB released over the memory backend, the difference being
-buffered objects counted at twice their size. The share bounds the writers only; the read windows and
-the sources' decoded dictionaries are not charged against it.
+the largest writer once the open ones leave less than one append's room in their budget.
+`TestRecordPartWriterResidentTracksHeap` checks the figure against the heap a writer gives back when
+dropped: 29.3 MiB reported, 22.1 MiB released over the memory backend, the difference being buffered
+objects counted at twice their size.
+
+**The writers get what the share leaves.** `mergeWriterBudget` takes off the admitted share what the
+sources hold from the moment they open — per column `block.Decoder.ResidentBytes` (read-ahead window,
+frame buffers, shared dictionary), or a whole decode's columns — and one encoder's workspace
+(`compress.Compressor.EncodeWorkspace`; the merge borrows one at a time). Of the rest the router keeps
+room for one append (`timebucket.Router.ReserveRun`): a writer binding every source's dictionaries,
+12 B an entry, plus one run, or the largest append so far if that is more. The writers never get
+less than two such appends, so a merge whose sources fill its share still progresses, holding more
+than the share. The one term still uncharged is the finish's transients — the bloom filters and the
+record keys encoded and read back, and the output's stream column decoded as it opens.
+`TestMergeWritersHoldAdmittedShare` (8 sources × 3 dictionary columns of ~14k entries × 8 days, ZSTD,
+file backend, heap measured above the written sources): unbounded, the writers hold 85.7 MiB and the
+merge adds 99.2 MiB to the heap; at a 64 MiB share the sources and encoder are charged 44.7 MiB, the
+writers get 19.3 MiB and report at most 16.9 MiB (one append adds up to 8 MiB), and the merge adds
+33.5 MiB. The charges are bounds: the windows are charged full before a frame is read, and the
+encoder at its 8 MiB-window size while a merge compresses 64 KiB frames.
 
 **Sidecars are built from the same rows.** Identities and watermarks are per stream. A bloom cannot be
 sized before its column's last row, so `bloomAccum` keeps each distinct token as its probe hashes (16 B,

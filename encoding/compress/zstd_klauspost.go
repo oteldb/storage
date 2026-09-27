@@ -53,6 +53,19 @@ func newZstdEncoder(level Level) zstdEncoder {
 	return kpEncoder{enc}
 }
 
+// zstdEncodeWorkspace is an encoder's live heap once its window has filled, rounded up from the most
+// TestEncodeWorkspaceBoundsHeap has measured for the three presets: 17.3, 19.7 and 25.2 MiB.
+func zstdEncodeWorkspace(level Level) int64 {
+	switch {
+	case level == LevelFast:
+		return 18 << 20
+	case level >= LevelBest:
+		return 26 << 20
+	default:
+		return 20 << 20
+	}
+}
+
 func newZstdDecoder() zstdDecoder {
 	// DecodeAll never uses the streaming worker pool, so bound concurrency to one and take the
 	// low-memory buffers.

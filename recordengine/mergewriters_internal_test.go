@@ -19,6 +19,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/heaptest"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/signal"
@@ -148,8 +149,10 @@ func TestRecordPartWriterResidentTracksHeap(t *testing.T) {
 
 // TestMergeWritersHoldAdmittedShare: a straddling merge of many sources with large dictionaries binds
 // every source's dictionary in every day's writer, so its writers' state multiplies with sources ×
-// days. The router sheds them at the merge's admitted share, and the heap shows the memory it claims
-// to have shed is really given back.
+// days. The writers get what the admitted share leaves beside the sources and the coders, less room
+// for one append, and the heap the merge adds stays inside the share. The heap is measured above a
+// baseline taken once the sources are written, over the file backend, whose objects are not on the
+// heap.
 //
 //nolint:paralleltest // collects and samples the process-wide heap, so it must not run concurrently
 func TestMergeWritersHoldAdmittedShare(t *testing.T) {
@@ -157,7 +160,7 @@ func TestMergeWritersHoldAdmittedShare(t *testing.T) {
 		t.Skip("ingests 256k rows twice")
 	}
 
-	const share = 32 << 20
+	const share = 64 << 20
 
 	run := func(memory int64) (peak, appended, limit int64, heapPeak uint64) {
 		t.Helper()
@@ -168,7 +171,8 @@ func TestMergeWritersHoldAdmittedShare(t *testing.T) {
 		require.NoError(t, err)
 
 		b := &heaptest.FileSampler{File: fb, KeyContains: "/c/", Writes: true}
-		e := wideDictEngine(t, b, Config{MergeMemoryBytes: memory}, 8, 4, 32<<10, 8)
+		cfg := Config{MergeMemoryBytes: memory, MergeCompression: compress.AlgorithmZSTD}
+		e := wideDictEngine(t, b, cfg, 8, 4, 32<<10, 8)
 
 		defer SetMergeResidentObserver(func(p, r, l int64) { peak, appended, limit = p, r, l })()
 
@@ -186,16 +190,14 @@ func TestMergeWritersHoldAdmittedShare(t *testing.T) {
 	peak, appended, limit, heap := run(share)
 
 	t.Logf("unbounded: writers report %.1f MiB, heap %.1f MiB", float64(unboundedPeak)/(1<<20), float64(unboundedHeap)/(1<<20))
-	t.Logf("share %.1f MiB: writers report %.1f MiB (one append %.1f MiB), heap %.1f MiB",
-		float64(limit)/(1<<20), float64(peak)/(1<<20), float64(appended)/(1<<20), float64(heap)/(1<<20))
+	t.Logf("share %.1f MiB: writers limited to %.1f MiB, report %.1f MiB (one append %.1f MiB), heap %.1f MiB",
+		float64(share)/(1<<20), float64(limit)/(1<<20), float64(peak)/(1<<20), float64(appended)/(1<<20),
+		float64(heap)/(1<<20))
 
-	require.Equal(t, int64(share), limit)
-	require.Greater(t, unboundedPeak, int64(2*share), "the writers must outgrow the share for the bound to be tested")
+	require.Less(t, limit, int64(share), "the sources and coders must come off the share")
+	require.Greater(t, unboundedPeak, 2*limit, "the writers must outgrow their limit for the bound to be tested")
 
-	assert.LessOrEqual(t, peak, limit+appended, "the writers outgrew the admitted share")
-	assert.Less(t, appended, limit/3, "one append must be small against the share for the bound to mean anything")
-
-	shed := unboundedPeak - peak
-	assert.Less(t, float64(heap), float64(unboundedHeap)-0.5*float64(shed),
-		"the heap did not give back the memory the writers claim to have shed")
+	assert.LessOrEqual(t, peak, limit, "the writers outgrew what the share left them")
+	assert.LessOrEqual(t, int64(heap), int64(share), "the merge's heap outgrew its share")
+	assert.Less(t, heap, unboundedHeap, "shedding the writers must give their memory back")
 }

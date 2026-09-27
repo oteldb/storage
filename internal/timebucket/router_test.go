@@ -159,6 +159,45 @@ func TestRouterAppendShedsPerRun(t *testing.T) {
 	}
 }
 
+// TestRouterReserveRunKeepsTheLimit: with room kept for a run at least as large as any so far, runs
+// of one size never take the writers past the limit, and a run that outgrows both the reserve and
+// every earlier run exceeds it by at most the difference.
+func TestRouterReserveRunKeepsTheLimit(t *testing.T) {
+	t.Parallel()
+
+	const limit = 100
+
+	for _, reserve := range []int64{1, 7, 20} {
+		r := newRecorder(timebucket.MaxOpenWriters, limit)
+		r.ReserveRun = reserve
+
+		appendRun := func(ts, rows int64) {
+			t.Helper()
+
+			require.NoError(t, r.Append(ts, func(w *writer) (bool, error) {
+				w.rows += rows
+
+				return false, nil
+			}))
+		}
+
+		for series := range 20 {
+			for d := range int64(17) {
+				appendRun(d*day+int64(series), 7)
+			}
+		}
+
+		peak, run := r.Peak()
+		require.Equal(t, int64(7), run)
+		assert.LessOrEqual(t, peak, int64(limit), "reserve %d: equal runs must fit inside the limit", reserve)
+
+		appendRun(0, 50)
+
+		peak, _ = r.Peak()
+		assert.LessOrEqual(t, peak, limit+50-max(reserve, 7), "reserve %d: a larger run overshoots by what it outgrew", reserve)
+	}
+}
+
 func TestRouterAppendSealsFullWriter(t *testing.T) {
 	t.Parallel()
 

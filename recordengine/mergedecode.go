@@ -2,9 +2,12 @@ package recordengine
 
 import (
 	"context"
+	"encoding/binary"
 	"slices"
+	"unsafe"
 
 	"github.com/oteldb/storage/block"
+	"github.com/oteldb/storage/encoding/chunk"
 )
 
 // decodedPart is one source part decoded whole for a merge, the fallback for a part a forward cursor
@@ -62,6 +65,36 @@ func (p *part) readForMerge(ctx context.Context) (*decodedPart, error) {
 	}
 
 	return d, nil
+}
+
+// residentBytes is what the decoded part holds.
+func (d *decodedPart) residentBytes() int64 {
+	n := int64(cap(d.ts)) * 8
+
+	for k := range d.ints {
+		n += int64(cap(d.ints[k])) * 8
+	}
+
+	for k := range d.bytes {
+		n += dictColumnBytes(d.bytes[k].col)
+	}
+
+	return n
+}
+
+// viewBytes is a []byte header.
+const viewBytes = int64(unsafe.Sizeof([]byte(nil)))
+
+// dictColumnBytes is what a decoded bytes column holds: its values with the length prefix each is
+// decoded from, a view per entry, and its ids.
+func dictColumnBytes(dc *chunk.DictColumn) int64 {
+	n := int64(cap(dc.IDs)) + int64(cap(dc.Entries))*(viewBytes+binary.MaxVarintLen32)
+
+	for _, e := range dc.Entries {
+		n += int64(len(e))
+	}
+
+	return n
 }
 
 func streamsTSSorted(ts []int64, ranges []streamRange) bool {

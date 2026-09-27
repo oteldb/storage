@@ -17,13 +17,17 @@ const MaxOpenWriters = 32
 // finished early. A writer's size is whatever Resident reports, so it must count everything the
 // writer holds. A day can therefore end up in several parts, each of which still fits the day, and
 // the ladder merges them later. The limit is checked per run rather than per series, so one series
-// spanning every open day overshoots it by one run, not by one writer's worth per day.
+// spanning every open day overshoots it by one run, not by one writer's worth per day — unless
+// ReserveRun keeps room for the next run: the writers are then shed once they leave less than
+// ReserveRun or the largest run so far, whichever is more, and exceed the limit only by a run that
+// outgrows both, by the difference.
 type Router[W any] struct {
 	Open          func(bucket int64) (W, error)
 	Finish        func(W) error
 	Resident      func(W) int64
 	MaxOpen       int
 	ResidentLimit int64
+	ReserveRun    int64
 
 	open map[int64]W
 	// peak is the most the open writers held together, seen as each run landed; run the most one
@@ -110,8 +114,8 @@ func (r *Router[W]) Seal(ts int64) error {
 	return r.Finish(w)
 }
 
-// Shed finishes the largest writers while the open ones together hold ResidentLimit or more. The
-// peak is tracked whether or not a limit is set.
+// Shed finishes the largest writers while the open ones together hold ResidentLimit or more, less the
+// room kept for the next run. The peak is tracked whether or not a limit is set.
 func (r *Router[W]) Shed() error {
 	for first := true; len(r.open) > 0; first = false {
 		var total int64
@@ -123,7 +127,7 @@ func (r *Router[W]) Shed() error {
 			r.peak = max(r.peak, total)
 		}
 
-		if r.ResidentLimit <= 0 || total < r.ResidentLimit {
+		if r.ResidentLimit <= 0 || total+r.reserve() < r.ResidentLimit {
 			return nil
 		}
 
@@ -133,6 +137,15 @@ func (r *Router[W]) Shed() error {
 	}
 
 	return nil
+}
+
+// reserve is the room kept for the next run, zero unless ReserveRun asks for it.
+func (r *Router[W]) reserve() int64 {
+	if r.ReserveRun <= 0 {
+		return 0
+	}
+
+	return max(r.ReserveRun, r.run)
 }
 
 // Close finishes every open writer, oldest bucket first.

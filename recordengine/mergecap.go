@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/memlimit"
 )
 
@@ -57,6 +58,39 @@ func (e *Engine) mergeBounds(capBytes int64) mergeBounds {
 	}
 
 	return b
+}
+
+// mergeFloorRun is the run the writer budget assumes for a merge not bound by a part size.
+const mergeFloorRun = 1 << 20
+
+// mergeWriterBudget splits a merge's admitted share. What the sources hold from the moment they open
+// (read-ahead windows, frame buffers, dictionaries or whole decodes) and the workspace of the one
+// encoder the merge borrows at a time come off the top; the writers get the rest, of which the router
+// keeps room for one append — a writer binding every source's dictionaries, 12 B an entry, plus one
+// run. The rest never falls below two such appends, so a merge whose sources fill its share still
+// progresses, at the cost of holding more than the share. A share of 0 bounds nothing.
+func mergeWriterBudget(
+	share int64, sources []mergeSource, comp *compress.Compressor, runBytes int64,
+) (limit, reserve int64) {
+	if share <= 0 {
+		return 0, 0
+	}
+
+	const bindEntryBytes = 12
+
+	if runBytes <= 0 {
+		runBytes = mergeFloorRun
+	}
+
+	held := comp.EncodeWorkspace()
+	reserve = runBytes
+
+	for _, s := range sources {
+		held += s.residentBytes()
+		reserve += int64(s.dictEntries()) * bindEntryBytes
+	}
+
+	return max(share-held, 2*reserve), reserve
 }
 
 // mergeConcurrency is how many merges the memory budget admits: enough that each gets a usable

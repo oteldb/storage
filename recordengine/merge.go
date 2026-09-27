@@ -351,10 +351,11 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 // column ([partCursor]) unless its layout rules that out, when it is decoded whole; each stream's rows
 // are merged across the sources by a k-way heap on (timestamp, source), and routed by timestamp to a
 // writer per day ([timebucket.Router]) that encodes them as they arrive
-// ([recordPartStreamWriter]). A writer is sealed once it has taken capBytes of decoded rows, and the
-// largest open writer once the writers together hold the merge's admitted share in RAM, both checked
-// after every append of at most a granule — so either bound is overshot by at most one append, a
-// stream may continue in the next part, and the merge never holds a stream or a part.
+// ([recordPartStreamWriter]). A writer is sealed once it has taken capBytes of decoded rows, checked
+// after every append of at most a granule, so a part overshoots it by at most one append; the largest
+// open writer is sealed once the writers leave less room than one append in what the merge's
+// admitted share has left beside its sources and coders ([mergeWriterBudget]). A stream may continue
+// in the next part, and the merge never holds a stream or a part.
 // When the engine has a side store (profiles) the cap does not split a day, but the resident bound
 // still can, and every part it writes carries the symbols its own rows reach. Returns the new parts
 // (empty when retention dropped every record). Reads the parts off the engine lock; src is the
@@ -393,6 +394,9 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 		return nil, err
 	}
 
+	runBytes := bounds.partBytes / mergeRunFraction
+	writerLimit, appendReserve := mergeWriterBudget(bounds.residentBytes, sources, comp, runBytes)
+
 	var newParts []*part
 
 	router := timebucket.Router[*recordPartStreamWriter]{
@@ -411,7 +415,8 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 		},
 		Resident:      (*recordPartStreamWriter).residentBytes,
 		MaxOpen:       timebucket.MaxOpenWriters,
-		ResidentLimit: bounds.residentBytes,
+		ResidentLimit: writerLimit,
+		ReserveRun:    appendReserve,
 	}
 
 	// A part under way holds column objects the backend has not published yet; leaving on any path
@@ -424,8 +429,6 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 	)
 
 	mergeKeys(src, &keys)
-
-	runBytes := bounds.partBytes / mergeRunFraction
 
 	for keys.Next() {
 		id := keys.Key()
@@ -466,14 +469,14 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 
 	if mergeResidentObserver != nil {
 		peak, run := router.Peak()
-		mergeResidentObserver(peak, run, bounds.residentBytes)
+		mergeResidentObserver(peak, run, writerLimit)
 	}
 
 	return newParts, nil
 }
 
 // mergeResidentObserver, when non-nil, receives after each merge the most its open writers held in
-// RAM together, the most one append added, and the resident limit. Test seam only.
+// RAM together, the most one append added, and what the writers were limited to. Test seam only.
 var mergeResidentObserver func(peak, run, limit int64)
 
 // mergeRunFraction is how much of the part bound one append to a day's writer may add before the

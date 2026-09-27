@@ -48,6 +48,57 @@ func (r *PartReader) ColumnScan(ctx context.Context, name string, window int64) 
 	return r.openDecoder(ctx, name, max(window, 0))
 }
 
+// ResidentBytes bounds what a forward walk over the decoder holds at any point: the directory and
+// shared dictionary, the read-ahead window (or the object, when the column was read whole), the
+// decompressed frame buffer twice over while a larger frame replaces it, and one decoded granule. It
+// is fixed when the decoder opens, so a caller may charge it before the walk touches a frame.
+func (d *Decoder) ResidentBytes() int64 {
+	dir := d.streams.dir
+	n := dir.residentBytes() + d.shared.residentBytes()
+
+	var maxFrame, maxRaw int64
+
+	for f := 0; f+1 < len(dir.frameOff); f++ {
+		maxFrame = max(maxFrame, int64(dir.frameOff[f+1]-dir.frameOff[f]))
+
+		if dir.frameRaw != nil {
+			maxRaw = max(maxRaw, int64(dir.frameRaw[f]))
+		}
+	}
+
+	if dir.frameRaw == nil {
+		maxRaw = max(dir.legacyMax, 0)
+	}
+
+	switch {
+	case dir.data != nil:
+		n += int64(len(dir.data))
+	case dir.src != nil && dir.src.window > 0 && len(dir.frameOff) > 0:
+		n += min(max(dir.src.window, maxFrame), int64(dir.frameOff[len(dir.frameOff)-1]))
+	default:
+		n += maxFrame
+	}
+
+	if d.streams.comp != nil {
+		maxRaw += int64(d.streams.comp.OutputSlack())
+	}
+
+	return n + 2*maxRaw + int64(dir.blockRows)*d.kind.decodedRowBytes()
+}
+
+// decodedRowBytes is what one decoded row of the kind costs: its value, or for bytes an id and the
+// view a granule's table holds per row at most.
+func (k Kind) decodedRowBytes() int64 {
+	switch k {
+	case KindInt128:
+		return 16
+	case KindBytes:
+		return 4 + 24
+	default:
+		return 8
+	}
+}
+
 // TsCursor returns a forward cursor over an int64 timestamp column, walking its granules in order.
 // It is [ColumnReader.TsCursor] over this decoder's frames, so under [PartReader.ColumnScan] a merge
 // holds one read-ahead window of the column rather than its object.
@@ -98,6 +149,9 @@ func (s *frameSource) fill(f int, off, n int64) error {
 
 		hi = end
 	}
+
+	// Dropped before the read, so the walk holds one window rather than two while it refills.
+	s.ahead, s.lo, s.hi = nil, 0, 0
 
 	buf, err := s.read(off, hi-off)
 	if err != nil {
