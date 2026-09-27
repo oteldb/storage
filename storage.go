@@ -93,7 +93,7 @@ type Storage struct {
 
 	admitMu sync.Mutex                           // guards admit
 	admit   map[signal.TenantID]*tenantAdmission // per-tenant admission state (rate valve + counters)
-	now     func() int64                         // unix-nano clock for admission; overridable in tests
+	now     func() int64                         // unix-nano clock for admission and metric merge cutoffs; overridable in tests
 
 	obs *obs.Obs // injected logging/tracing/metrics (no-op by default); never nil after Open
 
@@ -2160,7 +2160,7 @@ func (s *Storage) retainFrom(tid signal.TenantID, sig signal.Signal, sizeCutoff 
 // sizeCutoff is the tenant's size-budget cutoff, folded into RetainFrom the same way (see
 // [Storage.retainFrom]).
 func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engine.MergeOptions {
-	now := time.Now().UnixNano()
+	now := s.now()
 	// In cluster mode tid is a shard key ({tenant}/_s{idx}); policy is per real tenant.
 	p := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid)))
 

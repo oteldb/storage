@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -9,10 +10,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/encoding/compress"
+	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
 )
+
+const rerollIssue = 722
 
 func TestMaintainFlushesAndMerges(t *testing.T) {
 	t.Parallel()
@@ -213,4 +217,118 @@ func TestMetricMergeOptionsRecompress(t *testing.T) {
 	s2, err := InMemory()
 	require.NoError(t, err)
 	assert.Nil(t, s2.metricMergeOptions("default", 0).Recompress)
+}
+
+// TestMaintainRollsUpEachBucketOnce ticks maintenance every 10s on a synthetic clock while a gauge
+// ages past its tier: every bucket must come out equal to one rollup of its raw samples.
+func TestMaintainRollsUpEachBucketOnce(t *testing.T) {
+	reproduce.Unfixed(t, rerollIssue, "each tick's cutoff cuts a bucket and the next merge re-rolls its "+
+		"representative with the rest, so avg and count drift")
+	t.Parallel()
+
+	const (
+		step     = 10 * time.Second
+		interval = time.Minute
+		after    = 5 * time.Minute
+		ingest   = 20 * time.Minute
+	)
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()
+	aggs := []signal.Aggregation{
+		signal.AggLast, signal.AggFirst, signal.AggMin, signal.AggMax, signal.AggSum, signal.AggAvg, signal.AggCount,
+	}
+
+	for _, agg := range aggs {
+		t.Run(agg.String(), func(t *testing.T) {
+			t.Parallel()
+
+			s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+				return tenant.Policy{Downsample: tenant.Downsample{Tiers: []tenant.DownsampleTier{
+					{After: after, Interval: interval, Agg: agg},
+				}}}
+			})))
+			require.NoError(t, err)
+
+			var now int64
+
+			s.now = func() int64 { return now }
+			ctx := context.Background()
+
+			var (
+				ts   []int64
+				vals []float64
+			)
+
+			for now = base; now < base+int64(ingest); now += int64(step) {
+				v := float64(len(ts)*7%13 + 1)
+				_, err := s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{now}, []float64{v}))
+				require.NoError(t, err)
+
+				ts, vals = append(ts, now), append(vals, v)
+
+				s.maintain(ctx)
+			}
+
+			now = base + int64(time.Hour+after)
+			s.maintain(ctx)
+
+			eng := mustEngine(s.engineFor("default"))
+			it, err := eng.Fetch(ctx, fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{nameMatcher("m")}})
+			require.NoError(t, err)
+			got, err := fetch.Drain(ctx, it)
+			require.NoError(t, err)
+			require.Len(t, got, 1)
+
+			wantTs, wantVals := rollupOnce(ts, vals, int64(interval), agg)
+			assert.Equal(t, wantTs, got[0].Timestamps)
+			assert.Equal(t, wantVals, got[0].Values)
+		})
+	}
+}
+
+// rollupOnce aggregates each interval-aligned bucket of ascending ts once, whole.
+func rollupOnce(ts []int64, vals []float64, interval int64, agg signal.Aggregation) ([]int64, []float64) {
+	var (
+		outTs   []int64
+		outVals []float64
+	)
+
+	for lo := 0; lo < len(ts); {
+		start := ts[lo] - ts[lo]%interval
+
+		hi := lo
+		for hi < len(ts) && ts[hi] < start+interval {
+			hi++
+		}
+
+		bucket := vals[lo:hi]
+
+		var v float64
+
+		switch agg {
+		case signal.AggFirst:
+			v = bucket[0]
+		case signal.AggMin:
+			v = slices.Min(bucket)
+		case signal.AggMax:
+			v = slices.Max(bucket)
+		case signal.AggSum, signal.AggAvg:
+			for _, x := range bucket {
+				v += x
+			}
+
+			if agg == signal.AggAvg {
+				v /= float64(len(bucket))
+			}
+		case signal.AggCount:
+			v = float64(len(bucket))
+		default:
+			v = bucket[len(bucket)-1]
+		}
+
+		outTs, outVals = append(outTs, start), append(outVals, v)
+		lo = hi
+	}
+
+	return outTs, outVals
 }
