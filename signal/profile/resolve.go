@@ -17,7 +17,7 @@ type Frame struct {
 // Table indices, in [tableNames] order.
 const (
 	tableStrings = iota
-	_
+	tableMappings
 	tableFunctions
 	tableLocations
 	tableStacks

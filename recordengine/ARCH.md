@@ -632,6 +632,31 @@ that restores it into the accumulator on abort. Without that hop the snapshot li
 flush-local variable, and for the length of an object-store flush the detached records resolve their
 symbols against an empty set — wrong answers, not an error.
 
+**A replica's accumulator is bounded by its head.** A non-owning replica absorbs every replicated
+delta and never flushes, so no `Reset` drains it. `RefreshReplica` calls `SideStore.Retain` with the
+`RefColumn` cells of the records left in the head; the store keeps what they reach and drops the rest.
+Correctness rests on two facts:
+
+- **Trimmed records resolve from the parts that cover them.** The owner wrote those parts' sidecars
+  from an accumulator that had absorbed the records' deltas. The sidecars are durable before the part
+  is committed, and partsync copies a part's manifest after its other objects, so a part a replica
+  loads has them.
+- **Promotion stays complete.** Every head record's entries survive the rebuild, so the promoted node's
+  first flush writes sidecars that cover its parts.
+
+The rebuild derives liveness from the head because nothing else records it: a record carries no link
+to the delta that brought its symbols. It costs one pass over the head's reference cells plus the kept
+entries, and runs only when a trim dropped rows or a delta landed since the accumulator was last reset
+or rebuilt.
+
+**Rejected writes leave deltas behind.** A delta is absorbed before admission decides, and
+`ApplyPrimary` forwards it even when every record is rejected, so the accumulator grows with no row to
+trim or flush. Every absorb goes through `absorbSideLocked`, which marks the accumulator dirty; the
+mark covers both roles. A replica, or a primary demoted before its next flush, rebuilds on refresh. An
+owner whose head stays empty resets the store in the flush that finds nothing to detach: an empty head
+references nothing, so a plain `Reset` is exact and needs no walk. A non-empty flush already drains
+the store, rejected deltas included, into its sidecars.
+
 ## Cost attribution
 
 `Engine.StreamCost` (`streamcost.go`) attributes the live parts to streams — or to a label's values

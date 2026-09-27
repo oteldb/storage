@@ -3,6 +3,7 @@ package recordengine
 import (
 	"cmp"
 	"context"
+	"iter"
 	"slices"
 
 	"github.com/go-faster/errors"
@@ -31,6 +32,11 @@ type SideStore interface {
 	Encode() map[string][]byte
 	// Reset clears the live accumulator (after a flush drains the head).
 	Reset()
+	// RefColumn names the byte column whose cells are the ids the records reference in this store.
+	RefColumn() string
+	// Retain drops every accumulated entry that the refs (the [SideStore.RefColumn] cells of the
+	// records left in the head) do not reach, directly or transitively.
+	Retain(refs iter.Seq[[]byte])
 	// Restore merges an [SideStore.Encode] snapshot back into the live accumulator. The engine calls
 	// it when a flush fails after the snapshot+Reset: the records return to the head, so their side
 	// data must too. Content-addressing makes the merge a plain dedup with whatever the accumulator

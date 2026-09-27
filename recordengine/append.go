@@ -37,7 +37,7 @@ func (e *Engine) appendUnlogged(b *Batch, limits AppendLimits) (AppendResult, er
 	app.commit()
 
 	if e.cfg.SideStore != nil && res.Accepted > 0 && len(b.Side) > 0 {
-		if err := e.cfg.SideStore.Absorb(b.Side); err != nil {
+		if err := e.absorbSideLocked(b.Side); err != nil {
 			return res, errors.Wrap(err, "absorb side delta")
 		}
 	}
@@ -89,7 +89,7 @@ func (e *Engine) appendLogged(b *Batch, limits AppendLimits) (AppendResult, erro
 	}
 
 	if e.cfg.SideStore != nil && len(b.Side) > 0 {
-		if err := e.cfg.SideStore.Absorb(b.Side); err != nil {
+		if err := e.absorbSideLocked(b.Side); err != nil {
 			return AppendResult{}, errors.Wrap(err, "absorb side delta")
 		}
 	}

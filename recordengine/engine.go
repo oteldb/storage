@@ -182,6 +182,11 @@ type Engine struct {
 	// symbol-visibility gap that mirrors the record gap [Engine.flushing] closes. nil when no flush is
 	// in flight or the engine has no side store.
 	flushingSide map[string][]byte
+	// sideAbsorbed reports that the accumulator may hold entries no head record references: a delta
+	// is absorbed before admission decides, so one whose records were all rejected adds no row for a
+	// trim to drop or a flush to write. Set by [Engine.absorbSideLocked] and a flush's restore, cleared
+	// when the accumulator is reset or retained.
+	sideAbsorbed bool
 	// space latches disk pressure: a flush that finds the backend short of bytes or inodes (or one
 	// that gets ENOSPC anyway) closes the ingest path until a later flush finds room. Without it a
 	// full disk is invisible — the write is acked, the flush fails, and the head grows behind it.
@@ -939,6 +944,13 @@ func (e *Engine) HeadRecordCount() int {
 	return n
 }
 
+// absorbSideLocked is the only way a delta enters the side store. Caller holds e.mu.
+func (e *Engine) absorbSideLocked(delta []byte) error {
+	e.sideAbsorbed = true
+
+	return e.cfg.SideStore.Absorb(delta)
+}
+
 // logWAL durably logs a batch's accepted records and — when present — its side-store delta, so a WAL
 // replay reconstructs the head and the symbols those records reference. The stream's identity is
 // logged separately, at registration time (see [Engine.AppendBatch]).
@@ -977,7 +989,7 @@ func (e *Engine) replayHandlers() wal.Handlers {
 				return nil
 			}
 
-			return e.cfg.SideStore.Absorb(payload)
+			return e.absorbSideLocked(payload)
 		},
 	}
 }
@@ -1333,6 +1345,11 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	e.mu.Lock()
 	detached, detachedBytes := e.head.detach()
 	if detached == nil {
+		if e.sideAbsorbed && e.cfg.SideStore != nil {
+			e.cfg.SideStore.Reset() // an empty head references nothing; only rejected writes' deltas remain
+			e.sideAbsorbed = false
+		}
+
 		e.mu.Unlock()
 		e.reclaimRetired(ctx) // nothing to flush, but still sweep pending deletions
 
@@ -1372,6 +1389,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	if e.cfg.SideStore != nil {
 		side = e.cfg.SideStore.Encode()
 		e.cfg.SideStore.Reset()
+		e.sideAbsorbed = false
 		e.flushingSide = side
 	}
 
@@ -1499,6 +1517,8 @@ func (e *Engine) abortFlush(
 	e.flushingSide = nil
 
 	if side != nil && e.cfg.SideStore != nil {
+		e.sideAbsorbed = true
+
 		if err := e.cfg.SideStore.Restore(side); err != nil {
 			// The rows are back in the head but their side data is not: report it rather than let the
 			// next flush write a part whose sidecars are missing entries the records reference.

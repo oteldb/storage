@@ -88,7 +88,9 @@ row (a sample with `timestamps_unix_nano` explodes to one row per (timestamp, va
 metric's `__name__` — so a type is selected by an ordinary matcher and enumerated through postings
 rather than a per-sample column. `stack_id` is content-addressed, computed Merkle-style bottom-up
 (string→function→location→stack), so the same stack has the same id everywhere; the symbol store
-rides the part lifecycle through the record engine's side-store hook.
+rides the part lifecycle through the record engine's side-store hook. Its reference column is
+`stack_id`: `SymbolStore.Retain` walks the same graph down from the head's stack ids to find the
+entries a replica must keep.
 
 **Symbol tables are compressed.** Each table (`sym-{name}.bin`, and each table of a batch delta) is
 an `OTSP` blob: version 2 is `[magic][version][algorithm][uvarint raw length][compress block][CRC32C]`

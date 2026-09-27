@@ -1,6 +1,7 @@
 package recordengine
 
 import (
+	"iter"
 	"math"
 	"time"
 
@@ -514,7 +515,7 @@ func bufInRange(buf *recordCols, start, end int64) bool {
 // t=100 says nothing about a low-rate one, and trimming the latter at 100 would delete a late record
 // that is legal under its own out-of-order bound and durable nowhere yet — invisible until the
 // owner's next flush, and lost outright if this replica is promoted first.
-func (h *head) trimBelowCovered(covered map[signal.SeriesID]int64) {
+func (h *head) trimBelowCovered(covered map[signal.SeriesID]int64) (dropped int) {
 	for id, buf := range h.records {
 		t, ok := covered[id]
 		if !ok {
@@ -530,11 +531,29 @@ func (h *head) trimBelowCovered(covered map[signal.SeriesID]int64) {
 
 		buf.rowScratch = idx
 		if len(idx) != len(buf.ts) {
+			dropped += len(buf.ts) - len(idx)
 			buf.gatherRows(idx)
 		}
 	}
 
 	h.recountBytes()
+
+	return dropped
+}
+
+// byteCells yields every buffered record's cell of byte column k. A cell is valid only until the
+// next append.
+func (h *head) byteCells(k int) iter.Seq[[]byte] {
+	return func(yield func([]byte) bool) {
+		for _, buf := range h.records {
+			col := &buf.bytes[k]
+			for i := range col.rows() {
+				if !yield(col.at(i)) {
+					return
+				}
+			}
+		}
+	}
 }
 
 // inFlightBytes is the engine's resident record bytes: the live head plus whatever a flush has

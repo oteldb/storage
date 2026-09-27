@@ -3,10 +3,13 @@ package recordengine_test
 import (
 	"context"
 	"encoding/binary"
+	"iter"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
@@ -19,13 +22,15 @@ import (
 // ([uvarint count] then per entry [uvarint id][uvarint len][bytes], sorted by id), so Union is a
 // plain dedup. It records how many times each lifecycle method ran.
 type fakeSide struct {
-	acc      map[uint64][]byte
-	absorbed int
-	encoded  int
-	resets   int
-	restores int
-	unions   int
-	stores   int
+	acc       map[uint64][]byte
+	refColumn string
+	absorbed  int
+	encoded   int
+	resets    int
+	retains   int
+	restores  int
+	unions    int
+	stores    int
 }
 
 func newFakeSide() *fakeSide { return &fakeSide{acc: map[uint64][]byte{}} }
@@ -77,6 +82,29 @@ func (f *fakeSide) Encode() map[string][]byte {
 func (f *fakeSide) Reset() {
 	f.resets++
 	f.acc = map[uint64][]byte{}
+}
+
+func (f *fakeSide) RefColumn() string {
+	if f.refColumn != "" {
+		return f.refColumn
+	}
+
+	return "id"
+}
+
+// Retain keeps the entries whose id is a ref cell in decimal.
+func (f *fakeSide) Retain(refs iter.Seq[[]byte]) {
+	f.retains++
+	kept := map[uint64][]byte{}
+
+	for ref := range refs {
+		id, err := strconv.ParseUint(string(ref), 10, 64)
+		if entry, ok := f.acc[id]; err == nil && ok {
+			kept[id] = entry
+		}
+	}
+
+	f.acc = kept
 }
 
 func (f *fakeSide) Restore(snapshot map[string][]byte) error {
@@ -197,6 +225,152 @@ func TestSideStoreReplicates(t *testing.T) {
 	want := []uint64{1, 2}
 	require.Equal(t, want, accIDs(fsP), "primary absorbed the symbols")
 	require.Equal(t, want, accIDs(fsS), "secondary absorbed the forwarded symbols")
+}
+
+func replicateSide(t *testing.T, primary, replica *recordengine.Engine, b *recordengine.Batch) {
+	t.Helper()
+
+	accepted, _, err := primary.ApplyPrimary(recordengine.EncodeWAL(b), recordengine.AppendLimits{})
+	require.NoError(t, err)
+	require.NoError(t, replica.ApplyReplicated(accepted))
+}
+
+// TestSideStoreReplicaRefreshRetainsHead: a replica never flushes, so its refresh is what shrinks
+// the accumulator, to the entries the records left after the trim reference.
+func TestSideStoreReplicaRefreshRetainsHead(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	be := backend.Memory()
+	primary := sideEngine(be, newFakeSide())
+	fs := newFakeSide()
+	replica := sideEngine(be, fs)
+
+	flushed := mkBatch("api", rrec{ts: 1, id: "1"})
+	flushed.Side = encodeSide(map[uint64][]byte{1: []byte("a"), 9: []byte("unreferenced")})
+	replicateSide(t, primary, replica, flushed)
+	require.NoError(t, primary.Flush(ctx))
+
+	pending := mkBatch("api", rrec{ts: 2, id: "2"})
+	pending.Side = encodeSide(map[uint64][]byte{2: []byte("b")})
+	replicateSide(t, primary, replica, pending)
+
+	require.NoError(t, replica.RefreshReplica(ctx))
+	require.Equal(t, 1, replica.HeadRecordCount())
+	assert.Equal(t, []uint64{2}, accIDs(fs), "only the unflushed record's entry is kept")
+	assert.Equal(t, 1, fs.retains)
+
+	require.NoError(t, replica.RefreshReplica(ctx))
+	assert.Equal(t, 1, fs.retains, "a refresh that trims nothing leaves the accumulator alone")
+}
+
+// TestSideStoreReplicaRefreshDropsRejectedDeltas: the primary forwards the side delta of a write whose
+// records it all rejected. That adds no row for a trim to drop, so the refresh must retain anyway.
+func TestSideStoreReplicaRefreshDropsRejectedDeltas(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	be := backend.Memory()
+	primary := sideEngine(be, newFakeSide())
+	fs := newFakeSide()
+	replica := sideEngine(be, fs)
+
+	kept := mkBatch("api", rrec{ts: 1, id: "1"})
+	kept.Side = encodeSide(map[uint64][]byte{1: []byte("a")})
+	replicateSide(t, primary, replica, kept)
+
+	for i := range 3 {
+		shed := mkBatch("shed", rrec{ts: 1, id: "10"})
+		shed.Side = encodeSide(map[uint64][]byte{uint64(10 + i): []byte("rejected")})
+
+		accepted, res, err := primary.ApplyPrimary(recordengine.EncodeWAL(shed), recordengine.AppendLimits{MaxSeries: 1})
+		require.NoError(t, err)
+		require.Equal(t, 1, res.RejectedCardinality)
+		require.NoError(t, replica.ApplyReplicated(accepted))
+
+		require.NoError(t, replica.RefreshReplica(ctx))
+		assert.Equal(t, []uint64{1}, accIDs(fs), "round %d", i)
+	}
+
+	assert.Equal(t, 1, replica.HeadRecordCount())
+	assert.Equal(t, 3, fs.retains)
+}
+
+// TestSideStoreDemotedPrimaryDropsRejectedDelta: a primary absorbs a write's delta before admission
+// rejects its records. Demoted before any flush, its refresh has no part and trims no row, and must
+// still drop that delta.
+func TestSideStoreDemotedPrimaryDropsRejectedDelta(t *testing.T) {
+	t.Parallel()
+
+	fs := newFakeSide()
+	e := sideEngine(backend.Memory(), fs)
+
+	kept := mkBatch("api", rrec{ts: 1, id: "1"})
+	kept.Side = encodeSide(map[uint64][]byte{1: []byte("a")})
+	_, _, err := e.ApplyPrimary(recordengine.EncodeWAL(kept), recordengine.AppendLimits{})
+	require.NoError(t, err)
+
+	shed := mkBatch("shed", rrec{ts: 1, id: "10"})
+	shed.Side = encodeSide(map[uint64][]byte{10: []byte("rejected")})
+	_, res, err := e.ApplyPrimary(recordengine.EncodeWAL(shed), recordengine.AppendLimits{MaxSeries: 1})
+	require.NoError(t, err)
+	require.Equal(t, 1, res.RejectedCardinality)
+
+	require.NoError(t, e.RefreshReplica(t.Context()))
+	assert.Equal(t, []uint64{1}, accIDs(fs))
+	assert.Equal(t, 1, fs.retains)
+}
+
+// TestSideStoreIdleFlushDropsRejectedDeltas: an owner whose writes are all rejected keeps an empty
+// head, so no flush writes a part, and each flush must drop the deltas instead.
+func TestSideStoreIdleFlushDropsRejectedDeltas(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	fs := newFakeSide()
+	e := recordengine.New(recordengine.Config{
+		Schema: testSchema, Backend: backend.Memory(), Prefix: "t/recs", SideStore: fs, OOOWindow: 10,
+	})
+
+	newest := mkBatch("api", rrec{ts: 100, id: "1"})
+	newest.Side = encodeSide(map[uint64][]byte{1: []byte("a")})
+	_, _, err := e.ApplyPrimary(recordengine.EncodeWAL(newest), recordengine.AppendLimits{})
+	require.NoError(t, err)
+	require.NoError(t, e.Flush(ctx))
+
+	for i := range 3 {
+		late := mkBatch("api", rrec{ts: 1, id: "2"})
+		late.Side = encodeSide(map[uint64][]byte{uint64(2 + i): []byte("rejected")})
+
+		_, res, err := e.ApplyPrimary(recordengine.EncodeWAL(late), recordengine.AppendLimits{})
+		require.NoError(t, err)
+		require.Equal(t, 1, res.RejectedOOO)
+
+		require.NoError(t, e.Flush(ctx))
+		assert.Empty(t, accIDs(fs), "round %d", i)
+	}
+
+	resets := fs.resets
+	require.NoError(t, e.Flush(ctx))
+	assert.Equal(t, resets, fs.resets, "an idle flush with nothing absorbed leaves the store alone")
+}
+
+func TestSideStoreRetainRejectsNonByteRefColumn(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	for _, column := range []string{"sev", "missing"} {
+		be := backend.Memory()
+		primary := sideEngine(be, newFakeSide())
+		fs := newFakeSide()
+		fs.refColumn = column
+		replica := sideEngine(be, fs)
+
+		replicateSide(t, primary, replica, mkBatch("api", rrec{ts: 1, id: "1"}))
+		require.NoError(t, primary.Flush(ctx))
+
+		require.ErrorContains(t, replica.RefreshReplica(ctx), column)
+	}
 }
 
 // TestSideStoreWALReplay verifies the side delta is logged to the WAL and a fresh engine's Replay
