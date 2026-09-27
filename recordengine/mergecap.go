@@ -43,9 +43,9 @@ type mergeBounds struct {
 	partBytes, residentBytes int64
 }
 
-// mergeBounds returns the bounds of a merge whose cap is capBytes. A side store (profiles) anchors
-// the unioned symbol sidecar to one part per day, so it lifts the part bound; the resident bound
-// holds for every engine.
+// mergeBounds returns the bounds of a merge whose cap is capBytes. A side store (profiles) writes
+// the whole unioned symbol sidecar under every part, so it lifts the part bound to write as few as it
+// can; the resident bound holds for every engine and may still split a day.
 func (e *Engine) mergeBounds(capBytes int64) mergeBounds {
 	b := mergeBounds{partBytes: capBytes}
 	if e.cfg.SideStore != nil {

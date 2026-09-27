@@ -353,10 +353,10 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 // largest open writer once the writers together hold the merge's admitted share in RAM, both checked
 // after every append of at most a granule — so either bound is overshot by at most one append, a
 // stream may continue in the next part, and the merge never holds a stream or a part.
-// When the engine has a side store (profiles) a day is written as a single part (no cap split) so
-// the unioned symbol sidecar has one home per day. Returns the new parts (empty when retention
-// dropped every record). Reads the parts off the engine lock; src is the immutable snapshot the
-// caller planned over.
+// When the engine has a side store (profiles) the cap does not split a day, but the resident bound
+// still can, and every part it writes carries the whole unioned symbol sidecar. Returns the new parts
+// (empty when retention dropped every record). Reads the parts off the engine lock; src is the
+// immutable snapshot the caller planned over.
 func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes int64) ([]*part, error) {
 	for {
 		out, err := e.compactStreamed(ctx, src, start, capBytes)

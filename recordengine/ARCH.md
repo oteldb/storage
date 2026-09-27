@@ -62,7 +62,8 @@ re-exported exemplars at ingest is its own change. Record specifics:
   the budget (`TestRetentionRewriteHoldsResidentShare`), unless one forced part over the cap is
   rewritten alone.
 - A side-store engine (profiles) writes the unioned symbol sidecar under each day's part, since each is
-  the one home a reader looks in.
+  the one home a reader looks in. The cap does not split its day, but the resident share can, and every
+  part of that day then carries a full copy of the union — the per-part sidecar cost #694 removes.
 - Measured on a 17-day batch (16 parts × 64 streams, hourly, 64 MiB parts;
   `BenchmarkMergeStraddlers17Days`): per-day passes read 16.6 MB from the backend, allocated 426 MB and
   took 246 ms; the single pass reads 1.0 MB, allocates 143 MB and takes 166 ms, its buffers peaking at
