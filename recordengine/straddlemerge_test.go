@@ -3,6 +3,7 @@ package recordengine_test
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -67,8 +68,9 @@ func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
 }
 
 // TestRetentionRewriteHoldsResidentShare bounds one stream's single day: retention forces every part
-// of its bucket at once, however many, so the stream's surviving rows of that day are one run many
-// times the resident share. The buffers must still peak at the share plus a fixed fraction of it.
+// of its bucket, and each merge takes as many as the cap admits, so the stream's surviving rows of
+// that day are one run about the size of the resident share. The buffers must still peak at the
+// share plus a fixed fraction of it, and the backlog must drain.
 //
 //nolint:paralleltest // sets the package-global resident observer
 func TestRetentionRewriteHoldsResidentShare(t *testing.T) {
@@ -103,7 +105,12 @@ func TestRetentionRewriteHoldsResidentShare(t *testing.T) {
 	}
 
 	require.Len(t, e.Parts(), parts, "one part per flush, each reaching back past the cutoff")
-	require.NoError(t, e.Merge(ctx, int64(time.Hour)))
+
+	cutoff := int64(time.Hour)
+	for cycle := 0; slices.ContainsFunc(e.Parts(), func(p recordengine.PartStat) bool { return p.MinTime < cutoff }); cycle++ {
+		require.Less(t, cycle, parts, "every merge must rewrite at least one forced part")
+		require.NoError(t, e.Merge(ctx, cutoff))
+	}
 
 	require.Positive(t, limit)
 	assert.LessOrEqual(t, peak, limit+limit/4+1024, "the day's run must be routed in bounded pieces")

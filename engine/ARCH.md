@@ -601,10 +601,16 @@ narrowest-first, so each part is rewritten once per level rather than repeatedly
 finest level is exempt: flushes land there, and letting them accumulate is the part-count growth
 sealing exists to bound.
 
-**Forced rewrites are confined too, and win the cycle.** The oldest forced part picks the bucket, the
-rest of that bucket rides along if it fits the cap, and the size-tiered run waits — unioning the two
-would merge parts from opposite ends of the store into one spanning both. Merging inside a bucket
-cannot widen.
+**Forced rewrites are confined too, capped, and win the cycle.** The oldest forced part picks the
+bucket and the size-tiered run waits — unioning the two would merge parts from opposite ends of the
+store into one spanning both. Inside the bucket the forced parts are taken oldest first up to the cap
+and `maxMergeParts`, then the bucket's unsealed parts ride along in what remains; merging inside a
+bucket cannot widen. The first forced part is always taken, so one over the cap is rewritten alone
+rather than stalling retention. Uncapped, a bucket's forced set — every part of it after downtime or
+a shortened retention window — would be one merge of unbounded input, while the merge's admitted
+memory share assumes a capped one. A backlog larger than one merge drains over cycles, and
+`Candidates` counts one cycle's share of it, so it stays above zero until the backlog is gone. The
+selection is `timebucket.Forced`, shared with the record engine; only the forcing predicate differs.
 
 **A straddler is split, never grouped.** Flush does not cut by time, so one late sample makes a part
 that crosses a day boundary — a straddler, which fits no ladder level and joins no group. Such parts
@@ -658,8 +664,8 @@ one-claim-per-output limit every split has.
 
 ### Run selection (`compact.go`)
 
-Picks only what is worth merging: any part a forced rewrite must touch, so age-driven work is never
-starved, plus the best run of *unsealed* parts.
+Picks only what is worth merging: a capped share of the parts a forced rewrite must touch, so
+age-driven work is never starved, or else the best run of *unsealed* parts.
 
 | rule | effect |
 |---|---|

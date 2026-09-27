@@ -33,7 +33,9 @@ sidecars live under its own prefix, so `deletePart` reclaims them with it.
 
 **Merge selection is confined to an aligned time bucket** (`timebucket.go`) — the same `mergeLadder`
 (1h → 6h → 24h, nesting), walked narrowest-first, newest bucket skipped above the finest level, forced
-rewrites confined to one bucket and winning the cycle. [`../engine/ARCH.md`](../engine/ARCH.md),
+rewrites confined to one bucket, capped oldest-first and winning the cycle (`timebucket.Forced`,
+shared; its part-count bound applies only when part size is unlimited, as for straddlers).
+[`../engine/ARCH.md`](../engine/ARCH.md),
 "Selection is confined to an aligned time bucket", has the mechanics of the **bucket** rules and what
 each prevents. The selector inside one bucket differs: `pickTierGroup` takes the fullest size tier once
 it holds `minTierParts`, where the metric engine scores runs — which is why there is no idle waiver
@@ -56,9 +58,9 @@ re-exported exemplars at ingest is its own change. Record specifics:
   written, so no idle buffer holds capacity the resident budget does not count.
 - A stream's day is routed in runs of at most a quarter of the resident budget, the buffers shed
   between them, so they peak at 1.25× the budget however many rows one stream holds in one day. A
-  retention rewrite takes every forced part of its bucket regardless of the cap, which can make that
-  day far larger than the budget (`TestRetentionRewriteHoldsResidentShare`); the per-stream
-  accumulator still holds the whole stream, as it does in a single-day merge.
+  retention rewrite takes its bucket's forced parts only up to the cap, so its day is about the budget
+  (`TestRetentionRewriteHoldsResidentShare`), unless one forced part over the cap is rewritten alone;
+  the per-stream accumulator still holds the whole stream, as it does in a single-day merge.
 - A side-store engine (profiles) writes the unioned symbol sidecar under each day's part, since each is
   the one home a reader looks in.
 - Measured on a 17-day batch (16 parts × 64 streams, hourly, 64 MiB parts;

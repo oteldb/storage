@@ -157,13 +157,16 @@ func pickForcedGroup(src []*part, capBytes int64) []*part {
 	return group
 }
 
-// unsealedOf returns the parts below the seal threshold, in src order. A sealed part is at the cap
-// already: re-merging it would only re-split it into equally-full parts.
+// sealed reports whether p is at the cap already: re-merging it would only re-split it into
+// equally-full parts.
+func sealed(p *part, capBytes int64) bool { return capBytes > 0 && p.sizeBytes() >= capBytes }
+
+// unsealedOf returns the parts below the seal threshold, in src order.
 func unsealedOf(src []*part, capBytes int64) []*part {
 	out := make([]*part, 0, len(src))
 
 	for _, p := range src {
-		if capBytes <= 0 || p.sizeBytes() < capBytes {
+		if !sealed(p, capBytes) {
 			out = append(out, p)
 		}
 	}
