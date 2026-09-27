@@ -9,14 +9,17 @@ import (
 // SampledWarning is the PromQL warning annotation a Select attaches when at least one returned
 // series carries weights (a [fetch.Batch.ScaleFactors] entry above 1): a lossy-sampled row standing
 // for the rows sampling dropped, or an Avg downsample representative standing for its bucket's
-// samples. The Prometheus engine surfaces it in the query result's warnings, so the embedder and
-// the API caller learn a point may stand for several: an instant read, min/max or the rate of a
-// cumulative counter are unaffected, but count_over_time, sum_over_time and any operator that
-// treats each point as an independent event undercount the rows the weights stand for.
+// samples. The Prometheus engine surfaces it in the query result's warnings. The adapter cannot tell
+// the two kinds apart, so the warning claims nothing is exact: count_over_time, sum_over_time and
+// any operator that treats each point as an independent event undercount the rows the weights stand
+// for, and rate, increase, resets and other reset-sensitive functions are approximate over an Avg
+// rollup, whose points are bucket means rather than counter values. Only a sampling weight leaves
+// the rate of a cumulative counter intact.
 //
 //nolint:revive,errname,staticcheck // an annotation, named like the PromQL *Warning sentinels it is matched alongside.
 var SampledWarning = fmt.Errorf(
-	"%w: result computed over weighted series (lossy-sampled or rolled up); per-sample counts and sums undercount the rows behind each point",
+	"%w: result computed over weighted series (lossy-sampled or rolled up); per-sample counts and sums "+
+		"undercount the rows behind each point, and rates over rolled-up series are approximate",
 	annotations.PromQLWarning,
 )
 

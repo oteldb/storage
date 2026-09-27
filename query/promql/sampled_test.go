@@ -178,3 +178,13 @@ func TestUnsampledSelectHasNoWarning(t *testing.T) {
 	assert.InDelta(t, 15, sum, 1e-9, "a zero weight is never multiplied in")
 	assert.Empty(t, warns)
 }
+
+// TestSampledWarningClaimsNoExactness: a weight may be a sampling weight or an Avg rollup's
+// population, and the adapter cannot tell which, so the warning never presents a rate as exact.
+func TestSampledWarningClaimsNoExactness(t *testing.T) {
+	t.Parallel()
+
+	require.ErrorIs(t, SampledWarning, annotations.PromQLWarning)
+	assert.Contains(t, SampledWarning.Error(), "lossy-sampled or rolled up")
+	assert.Contains(t, SampledWarning.Error(), "rates over rolled-up series are approximate")
+}
