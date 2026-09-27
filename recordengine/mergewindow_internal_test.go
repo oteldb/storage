@@ -2,6 +2,7 @@ package recordengine
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"slices"
 	"testing"
@@ -10,6 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/block"
+	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/obs/obstest"
 	"github.com/oteldb/storage/signal"
@@ -17,37 +20,61 @@ import (
 
 func mergeWindowPart(ts []int64) *decodedPart {
 	ints := make([]int64, len(ts))
-	var bodies byteCol
+	entries := make([][]byte, len(ts))
 
 	for i := range ts {
 		ints[i] = int64(i)
-		bodies.appendCell([]byte{byte(i)})
+		entries[i] = []byte{byte(i)}
 	}
+
+	dc := &chunk.DictColumn{Entries: entries}
 
 	return &decodedPart{
 		ts:       ts,
 		ints:     [][]int64{ints},
-		bytes:    []mergeByteCol{{flat: bodies}},
+		bytes:    []arrayBytes{{col: dc, g: block.OwnedGranule(dc, block.NewDictGen()), stable: true}},
 		tsSorted: true,
 	}
 }
 
-func appendedWindow(d *decodedPart, rng rowRange, start, end int64) *recordCols {
-	acc := newRecordCols(headTestSchema, 0, fullSel(headTestSchema))
-	appendMergeWindow(acc, d, rng, start, end)
+// windowRows is what a whole-decoded source serves of rows rng from start on, as rows of
+// "ts/int/value".
+func windowRows(t *testing.T, d *decodedPart, rng rowRange, start int64) []string {
+	t.Helper()
 
-	return acc
+	id := signal.SeriesID{Lo: 1}
+	s := &wholeSource{schema: headTestSchema, ranges: []streamRange{{rowRange: rng, id: id}}, d: d}
+	s.served.init(headTestSchema)
+	s.gather.init(headTestSchema)
+
+	r, ok, err := s.run(id, start)
+	require.NoError(t, err)
+
+	if !ok {
+		return nil
+	}
+
+	a, ok := r.(*arrayRun)
+	require.True(t, ok)
+
+	out := make([]string, 0, len(a.ts))
+	for i := range a.ts {
+		b := &a.bytes[0]
+		out = append(out, fmt.Sprintf("%d/%d/%x", a.ts[i], a.ints[0][i], b.col.At(b.base+i)))
+	}
+
+	return out
 }
 
-// FuzzMergeWindowSearchMatchesScan: on a ts-ascending stream range, the windowed search appends exactly
-// the rows the row-by-row scan appends, in the same order — including runs of equal timestamps at
-// either edge and the open-ended bounds a merge passes.
+// FuzzMergeWindowSearchMatchesScan: on a ts-ascending stream range, serving the window in place by a
+// search yields exactly the rows gathering and sorting the range does, in the same order — including
+// runs of equal timestamps at the edge.
 func FuzzMergeWindowSearchMatchesScan(f *testing.F) {
-	f.Add([]byte{0, 0, 1, 1, 1, 3, 5, 5}, byte(1), byte(6), uint8(1), uint8(5))
-	f.Add([]byte{7}, byte(0), byte(1), uint8(0), uint8(255))
-	f.Add([]byte{}, byte(0), byte(0), uint8(0), uint8(0))
+	f.Add([]byte{0, 0, 1, 1, 1, 3, 5, 5}, byte(1), byte(6), uint8(1))
+	f.Add([]byte{7}, byte(0), byte(1), uint8(0))
+	f.Add([]byte{}, byte(0), byte(0), uint8(0))
 
-	f.Fuzz(func(t *testing.T, steps []byte, lo, hi byte, start, end uint8) {
+	f.Fuzz(func(t *testing.T, steps []byte, lo, hi byte, start uint8) {
 		ts := make([]int64, len(steps))
 
 		var cur int64
@@ -63,20 +90,9 @@ func FuzzMergeWindowSearchMatchesScan(f *testing.F) {
 		a, b := min(int(lo), len(ts)), min(int(hi), len(ts))
 		rng := rowRange{start: min(a, b), end: max(a, b)}
 
-		windows := [][2]int64{
-			{int64(start), int64(end)},
-			{math.MinInt64, int64(end)},
-			{int64(start), math.MaxInt64},
-			{math.MinInt64, math.MaxInt64},
-		}
-
-		for _, w := range windows {
-			got := appendedWindow(sorted, rng, w[0], w[1])
-			want := appendedWindow(scanned, rng, w[0], w[1])
-
-			require.Equal(t, want.ts, got.ts, "window %v over %v", w, ts[rng.start:rng.end])
-			require.Equal(t, want.ints, got.ints)
-			require.Equal(t, want.bytes, got.bytes)
+		for _, from := range []int64{int64(start), math.MinInt64} {
+			require.Equal(t, windowRows(t, scanned, rng, from), windowRows(t, sorted, rng, from),
+				"window from %d over %v", from, ts[rng.start:rng.end])
 		}
 	})
 }

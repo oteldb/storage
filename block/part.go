@@ -39,6 +39,11 @@ type partConfig struct {
 	level         compress.Level
 	dictCap       int64
 	sizing        bool
+
+	// given are compressors the caller hands in to share across writers; comps is what this writer
+	// compresses through, per algorithm.
+	given []*compress.Compressor
+	comps map[compress.Algorithm]*compress.Compressor
 }
 
 func newPartConfig(opts []PartOption) partConfig {
@@ -64,7 +69,6 @@ type PartWriter struct {
 	columns  []Column
 	rows     int
 	haveRows bool
-	comps    map[compress.Algorithm]*compress.Compressor
 }
 
 // PartOption configures a [PartWriter] or a [StreamWriter].
@@ -100,6 +104,13 @@ func WithCompressionLevel(level compress.Level) PartOption {
 	return func(c *partConfig) { c.level = level }
 }
 
+// WithCompressors makes the writer compress through cs, where one matches a column's algorithm and
+// the writer's level, instead of a compressor of its own — so writers open at once share one set of
+// pooled encoders. A zstd encoder at the best level holds tens of MiB while its pool keeps it.
+func WithCompressors(cs ...*compress.Compressor) PartOption {
+	return func(c *partConfig) { c.given = append(c.given, cs...) }
+}
+
 // WithSharedDictBytes caps the resident size of a bytes column's shared dictionary: its entries'
 // bytes plus a fixed per-entry overhead (default 32 MiB). A granule whose new values would pass the
 // cap self-encodes instead of joining. n is clamped to [0, 64 MiB], the format's ceiling.
@@ -119,7 +130,6 @@ func (c *partConfig) layout() columnLayout {
 func NewPartWriter(opts ...PartOption) *PartWriter {
 	return &PartWriter{
 		partConfig: newPartConfig(opts),
-		comps:      make(map[compress.Algorithm]*compress.Compressor),
 	}
 }
 
@@ -149,14 +159,32 @@ func (w *PartWriter) AddColumn(c Column) error {
 	return nil
 }
 
-func (w *PartWriter) compressorFor(alg compress.Algorithm) *compress.Compressor {
-	c, ok := w.comps[alg]
-	if !ok {
-		c = compress.NewCompressor(alg, w.level)
-		w.comps[alg] = c
+// compressorFor returns the compressor for alg at the writer's level: a matching one the caller
+// handed in ([WithCompressors]), else one of the writer's own.
+func (c *partConfig) compressorFor(alg compress.Algorithm) *compress.Compressor {
+	if comp, ok := c.comps[alg]; ok {
+		return comp
 	}
 
-	return c
+	var comp *compress.Compressor
+
+	for _, g := range c.given {
+		if g.Algorithm() == alg && g.Level() == c.level {
+			comp = g
+		}
+	}
+
+	if comp == nil {
+		comp = compress.NewCompressor(alg, c.level)
+	}
+
+	if c.comps == nil {
+		c.comps = make(map[compress.Algorithm]*compress.Compressor)
+	}
+
+	c.comps[alg] = comp
+
+	return comp
 }
 
 // builtPart is the in-memory serialized form of a part: one object per column (nil for
@@ -345,7 +373,7 @@ func PartPresent(ctx context.Context, b backend.Backend, prefix string) (bool, e
 // OpenPart reads a part's manifest from b under prefix and returns a reader. It returns
 // an error (wrapping [ErrCorrupt] or [backend.ErrNotExist]) if the manifest is absent or
 // malformed — an incompletely written part (no manifest) is therefore not readable.
-func OpenPart(ctx context.Context, b backend.Backend, prefix string) (*PartReader, error) {
+func OpenPart(ctx context.Context, b backend.Backend, prefix string, opts ...ReadOption) (*PartReader, error) {
 	// Column/marks/manifest objects are decoded, never mutated, so the no-copy read view is safe.
 	raw, err := backend.ReadView(ctx, b, manifestKey(prefix))
 	if err != nil {
@@ -362,14 +390,43 @@ func OpenPart(ctx context.Context, b backend.Backend, prefix string) (*PartReade
 		byName[m.Columns[i].Name] = i
 	}
 
-	return &PartReader{
+	r := &PartReader{
 		b:        b,
 		prefix:   prefix,
 		manifest: m,
 		byName:   byName,
 		comps:    make(map[compress.Algorithm]*compress.Compressor),
 		level:    compress.LevelDefault,
-	}, nil
+	}
+
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r, nil
+}
+
+// ReadOption configures a [PartReader].
+type ReadOption func(*PartReader)
+
+// WithReadCompressors makes the reader decompress through cs, one per algorithm, instead of
+// compressors of its own, so every reader of one owner shares its pooled decoders: a zstd decoder
+// costs its buffers and tables anew in each pool it is built in, and a store holds thousands of parts.
+func WithReadCompressors(cs ...*compress.Compressor) ReadOption {
+	return func(r *PartReader) {
+		for _, c := range cs {
+			r.comps[c.Algorithm()] = c
+		}
+	}
+}
+
+// NewReadCompressors returns a [WithReadCompressors] over a fresh compressor for every algorithm a
+// part may be written in, for an owner to hand every reader it opens.
+func NewReadCompressors() ReadOption {
+	return WithReadCompressors(
+		compress.NewCompressor(compress.AlgorithmZSTD, compress.LevelDefault),
+		compress.NewCompressor(compress.AlgorithmLZ4, compress.LevelDefault),
+	)
 }
 
 // Manifest returns the part's decoded manifest.

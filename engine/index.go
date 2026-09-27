@@ -172,7 +172,7 @@ func (e *Engine) openForeignLocked(ctx context.Context) {
 			continue
 		}
 
-		p, err := openPart(ctx, e.cfg.Backend, ent.Prefix, e.cfg.Obs.Corruption)
+		p, err := openPart(ctx, e.cfg.Backend, ent.Prefix, e.cfg.Obs.Corruption, e.readCompressors)
 		if err != nil {
 			zctx.From(ctx).Debug("adopted part is not readable here",
 				zap.String("prefix", ent.Prefix), zap.Error(err))
@@ -457,7 +457,7 @@ func (e *Engine) livePart(
 		}
 	}
 
-	p, err := openPart(ctx, e.cfg.Backend, ent.Prefix, e.cfg.Obs.Corruption)
+	p, err := openPart(ctx, e.cfg.Backend, ent.Prefix, e.cfg.Obs.Corruption, e.readCompressors)
 	if err != nil {
 		return nil, errors.Wrapf(err, "open part %q", ent.Prefix)
 	}

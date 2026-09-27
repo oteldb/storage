@@ -258,13 +258,13 @@ func TestBuildColumnBloomDedupIsBitIdentical(t *testing.T) {
 
 		var bb bloomBuilder
 
-		v := cells{flat: values}
+		v := values
 		if dedup {
-			bb.markRows(&v)
+			bb.markRows(v)
 		}
 
-		f := bloom.New(bb.sizeTokens(mode, &v), falsePositiveRate(mode))
-		bb.forEachToken(mode, &v, f.Add)
+		f := bloom.New(bb.sizeTokens(mode, v), falsePositiveRate(mode))
+		bb.forEachToken(mode, v, f.Add)
 
 		return f.Encode(nil)
 	}
@@ -293,7 +293,7 @@ func TestBloomBuilderReuseMatchesFresh(t *testing.T) {
 	// Twice, so a column also sees the state a *previous* pass left behind.
 	for range 2 {
 		for _, tt := range corpus {
-			require.Equal(t, buildColumnBloom(tt.mode, tt.values), bb.build(tt.mode, cells{flat: tt.values}), tt.name)
+			require.Equal(t, buildColumnBloom(tt.mode, tt.values), bb.build(tt.mode, tt.values), tt.name)
 		}
 	}
 }
@@ -320,7 +320,7 @@ func FuzzBuildColumnBloomMatchesReference(f *testing.F) {
 					t.Fatalf("mode %v: filter diverged from reference", mode)
 				}
 
-				if got := bb.build(mode, cells{flat: values}); !bytes.Equal(want, got) {
+				if got := bb.build(mode, values); !bytes.Equal(want, got) {
 					t.Fatalf("mode %v: reused builder diverged from reference", mode)
 				}
 			}
@@ -352,7 +352,7 @@ func benchBuild(b *testing.B, mode BloomMode, c *byteCol) {
 		b.SetBytes(int64(len(c.data)))
 
 		for b.Loop() {
-			bb.build(mode, cells{flat: c})
+			bb.build(mode, c)
 		}
 	})
 

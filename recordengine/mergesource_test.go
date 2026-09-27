@@ -51,7 +51,7 @@ func TestMergeStreamedMatchesWhole(t *testing.T) {
 
 			require.Equal(t, whole, got, "merge output differs between the streamed and whole reads")
 
-			if c.wantSplit == nil {
+			if c.idle {
 				assert.Empty(t, reads)
 
 				return
@@ -87,21 +87,4 @@ func FuzzMergeStreamedMatchesWhole(f *testing.F) {
 		require.Equal(t, whole, got)
 		require.NotEmpty(t, reads)
 	})
-}
-
-// TestMergeUnionFallbackMatchesFlat: a column whose union outgrows its bound mid-merge falls back to
-// the flat carry, and the output is still the one the flat path writes from the start.
-//
-//nolint:paralleltest // flips package-level seams
-func TestMergeUnionFallbackMatchesFlat(t *testing.T) {
-	defer recordengine.SetMergeUnionEntriesPerSource(3)()
-
-	for _, c := range mergeCases() {
-		t.Run(c.name, func(t *testing.T) {
-			flat, _ := runMergeCase(t, c, false)
-			got, _ := runMergeCase(t, c, true)
-
-			require.Equal(t, flat, got)
-		})
-	}
 }

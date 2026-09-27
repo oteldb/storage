@@ -2,7 +2,6 @@ package compress
 
 import (
 	"encoding/binary"
-	"sync"
 
 	"github.com/go-faster/errors"
 	"github.com/klauspost/compress/zstd"
@@ -44,9 +43,9 @@ func OutputSlack(alg Algorithm) int {
 // OutputSlack is [OutputSlack] for c's algorithm.
 func (c *Compressor) OutputSlack() int { return OutputSlack(c.alg) }
 
-// limitDecoders are fixed-option zstd decoders for DecompressLimit, in both builds: the cgo decoder
-// has no output cap.
-var limitDecoders = sync.Pool{New: func() any {
+// newLimitDecoder builds a fixed-option zstd decoder for DecompressLimit, in both builds: the cgo
+// decoder has no output cap.
+func newLimitDecoder() any {
 	dec, err := zstd.NewReader(nil,
 		zstd.WithDecodeAllCapLimit(true),
 		zstd.WithDecoderConcurrency(1),
@@ -57,7 +56,7 @@ var limitDecoders = sync.Pool{New: func() any {
 	}
 
 	return dec
-}}
+}
 
 // DecompressLimit is [Compressor.Decompress] that fails with [ErrLimit] rather than produce more
 // than limit bytes, and with [ErrMalformed] on input it cannot bound. Unlike Decompress it does not
@@ -83,7 +82,7 @@ func (c *Compressor) DecompressLimit(buf, src []byte, limit int) ([]byte, error)
 	case FlagCompressed:
 		switch c.alg {
 		case AlgorithmZSTD:
-			return decompressZstdLimit(buf, body, limit)
+			return c.decompressZstdLimit(buf, body, limit)
 		case AlgorithmLZ4:
 			return decompressLZ4Limit(buf, body, limit)
 		default:
@@ -137,7 +136,7 @@ func decompressLZ4Limit(buf, body []byte, limit int) ([]byte, error) {
 	return out, nil
 }
 
-func decompressZstdLimit(buf, body []byte, limit int) ([]byte, error) {
+func (c *Compressor) decompressZstdLimit(buf, body []byte, limit int) ([]byte, error) {
 	bound, err := zstdContentBound(body, limit)
 	if err != nil {
 		return buf, err
@@ -145,9 +144,9 @@ func decompressZstdLimit(buf, body []byte, limit int) ([]byte, error) {
 
 	out := reserve(buf, bound+zstdSlack)
 
-	dec, _ := limitDecoders.Get().(*zstd.Decoder)
+	dec, _ := c.limitPool.Get().(*zstd.Decoder)
 	res, err := dec.DecodeAll(body, out)
-	limitDecoders.Put(dec)
+	c.limitPool.Put(dec)
 
 	switch {
 	case errors.Is(err, zstd.ErrDecoderSizeExceeded), errors.Is(err, zstd.ErrFrameSizeExceeded):

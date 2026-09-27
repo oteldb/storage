@@ -7,6 +7,7 @@ package recordengine
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"testing"
 
@@ -17,8 +18,8 @@ import (
 )
 
 // mergeResident merges `parts` flushed parts of `rows` records each over the file backend, sealing
-// output parts at capBytes, and returns the merge's peak live heap above what the engine held
-// before it, with the sources' decoded bytes.
+// output parts at capBytes (0 ⇒ one output part), and returns the merge's peak live heap above what
+// the engine held before it, with the sources' decoded bytes.
 func mergeResident(t *testing.T, parts, rows int, capBytes int64) heaptest.Run {
 	t.Helper()
 
@@ -47,20 +48,22 @@ func mergeResident(t *testing.T, parts, rows int, capBytes int64) heaptest.Run {
 		require.NoError(t, err)
 	})
 
-	require.Greater(t, len(out), 1, "the merge must seal several parts")
+	if capBytes > 0 {
+		require.Greater(t, len(out), 1, "the merge must seal several parts")
+	} else {
+		require.Len(t, out, 1)
+	}
 
 	runtime.KeepAlive(e)
 
 	return heaptest.Run{Resident: resident, Source: uint64(partsBytes(src))}
 }
 
-// TestMergeResidentFlatInPartSize is the read side's claim, measured: a merge that seals its output
-// at a fixed size holds a read-ahead window of each source column and one output part, not the
-// sources decoded. Growing the sources eightfold must leave the merge's live heap roughly where it
-// was; decoding them whole grows it with them.
-//
-// The output is still buffered, so the claim needs a sealing merge: a merge that writes one part
-// holds all of it decoded, and its peak is that part, however its sources are read.
+// TestMergeResidentFlatInPartSize is the merge's claim, measured: it holds a read-ahead window of each
+// source column and a granule of each, plus what its writer holds — an unsealed frame and the
+// dictionary of each column, never the part. Growing the sources eightfold must leave the merge's
+// live heap roughly where it was, whether it seals its output or writes it as one part; decoding the
+// sources, or buffering the output, grows it with them.
 //
 //nolint:paralleltest // collects and samples the process-wide heap, so it must not run concurrently
 func TestMergeResidentFlatInPartSize(t *testing.T) {
@@ -69,21 +72,25 @@ func TestMergeResidentFlatInPartSize(t *testing.T) {
 	}
 
 	const (
-		parts    = 4
-		capBytes = 4 << 20
-		window   = defaultMergeReadWindow
+		parts  = 4
+		window = defaultMergeReadWindow
 		// ts, four ints and three bytes columns.
 		readColumns = 8
-		// What the merge holds by design: a window per source column and one output part.
-		modelBound = parts*readColumns*window + capBytes
+		// What the merge holds by design: a window per source column, and per output column a frame
+		// being filled, one being compressed, and the granule being staged.
+		modelBound = parts*readColumns*window + 8<<20
 	)
 
-	small := mergeResident(t, parts, 64<<10, capBytes)
-	large := mergeResident(t, parts, 512<<10, capBytes)
+	for _, capBytes := range []int64{4 << 20, 0} {
+		t.Run(fmt.Sprintf("cap=%d", capBytes), func(t *testing.T) {
+			small := mergeResident(t, parts, 64<<10, capBytes)
+			large := mergeResident(t, parts, 512<<10, capBytes)
 
-	require.Greater(t, small.Source, uint64(2*capBytes), "the small corpus must already seal several parts")
-	require.Greater(t, float64(large.Source)/float64(small.Source), 6.0,
-		"the corpus did not grow the sources enough to tell flat from proportional")
+			require.Greater(t, small.Source, uint64(8<<20), "the small corpus must already outgrow a part's worth of frames")
+			require.Greater(t, float64(large.Source)/float64(small.Source), 6.0,
+				"the corpus did not grow the sources enough to tell flat from proportional")
 
-	heaptest.AssertFlat(t, small, large, heaptest.Flat{Floor: modelBound, MaxGrowth: 2.0, SourceShare: 2})
+			heaptest.AssertFlat(t, small, large, heaptest.Flat{Floor: modelBound, MaxGrowth: 2.0, SourceShare: 4})
+		})
+	}
 }

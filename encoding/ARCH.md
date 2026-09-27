@@ -59,6 +59,14 @@ Rules that matter beyond the code:
 1-byte-flagged frame around a column/block: raw or compressed, automatically falling back to raw
 when compression does not shrink. zstd and lz4 both compress (lz4 framed as `[uvarint origLen][lz4
 block]`, the block format carrying no length of its own); none = identity. Encoders/decoders pooled.
+The pools belong to a `Compressor`, and nothing in the package holds a coder of its own: a zstd
+encoder or decoder hands work to its goroutines over channels made when it is built, and the runtime
+aborts a process that uses one inside a `testing/synctest` bubble it was not built in, or outside the
+one it was. A `Compressor` is shared only by an owner that keeps it in one place — a merge shares one
+across its day writers, an engine one per algorithm across every part it opens — never process-wide.
+Sharing matters on the read path: a zstd decoder is built per pool, so a reader per part with pools
+of its own builds one per part read — 2.9× the bytes allocated reading 1024 parts once each
+(`block.BenchmarkManyPartReaders`) and +16% on a record fetch over 256 parts.
 
 `DecompressLimit` is the bounded decode every part read uses: it fails with `ErrLimit` rather than
 produce more than a limit, allocating at most the bound plus `DecodeWorkspace`. It decodes into its

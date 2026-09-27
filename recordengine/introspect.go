@@ -20,7 +20,7 @@ type PartStat struct {
 	// SizeBytes is the part's *decoded* footprint as recorded in its manifest — what the merge cap
 	// compares against, and so what explains why a part is or is not sealed. It needs no I/O. Unlike
 	// the metric engine's [engine.PartStat.SizeBytes], which is a size on disk, this is the size in
-	// memory: the record merge is bounded by what it holds, not by what it writes. 0 for a part
+	// memory, the unit the record merge cap and size tiers are denominated in. 0 for a part
 	// written before the manifest recorded it (the row estimate then stands in internally).
 	SizeBytes int64
 }

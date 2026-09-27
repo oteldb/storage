@@ -27,8 +27,7 @@ import (
 type StreamWriter struct {
 	partConfig
 
-	comps map[compress.Algorithm]*compress.Compressor
-	cols  []*streamColumn
+	cols []*streamColumn
 
 	// Set by NewStreamWriterTo: where a column's sealed frames go. ctx is held because rows arrive
 	// through the Append methods, which take none; it spans the writer's life, which is one merge's.
@@ -46,7 +45,6 @@ type StreamWriter struct {
 func NewStreamWriter(opts ...PartOption) *StreamWriter {
 	return &StreamWriter{
 		partConfig:  newPartConfig(opts),
-		comps:       make(map[compress.Algorithm]*compress.Compressor),
 		ctx:         context.Background(),
 		omitConstAt: -1,
 	}
@@ -368,16 +366,6 @@ func (w *StreamWriter) build() (builtPart, error) {
 	return builtPart{objects: objects, marks: encodedMarks, manifest: m.Encode(nil)}, nil
 }
 
-func (w *StreamWriter) compressorFor(alg compress.Algorithm) *compress.Compressor {
-	c, ok := w.comps[alg]
-	if !ok {
-		c = compress.NewCompressor(alg, w.level)
-		w.comps[alg] = c
-	}
-
-	return c
-}
-
 func (w *StreamWriter) column(i int, want Kind) (*streamColumn, error) {
 	if i < 0 || i >= len(w.cols) {
 		return nil, errors.Errorf("block: column %d out of range [0,%d)", i, len(w.cols))
@@ -503,7 +491,8 @@ func (c *streamColumn) appendInt64(vals []int64, granuleSize int) error {
 	c.raw += int64(len(vals)) * 8
 
 	// Drain by offset and compact once: a batch spanning many granules must not re-copy the staging
-	// buffer per granule.
+	// buffer per granule, nor a batch draining none copy it at all — a merge appends a few rows at a
+	// time.
 	off := 0
 	for len(c.stageI64)-off >= granuleSize {
 		if err := c.flushGranuleInt64(c.stageI64[off : off+granuleSize]); err != nil {
@@ -513,7 +502,9 @@ func (c *streamColumn) appendInt64(vals []int64, granuleSize int) error {
 		off += granuleSize
 	}
 
-	c.stageI64 = append(c.stageI64[:0], c.stageI64[off:]...)
+	if off > 0 {
+		c.stageI64 = append(c.stageI64[:0], c.stageI64[off:]...)
+	}
 
 	return nil
 }
@@ -556,7 +547,9 @@ func (c *streamColumn) appendFloat64(vals []float64, granuleSize int) error {
 		off += granuleSize
 	}
 
-	c.stageF64 = append(c.stageF64[:0], c.stageF64[off:]...)
+	if off > 0 {
+		c.stageF64 = append(c.stageF64[:0], c.stageF64[off:]...)
+	}
 
 	return nil
 }

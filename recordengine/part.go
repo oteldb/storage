@@ -82,6 +82,9 @@ type part struct {
 	// the backend objects between. A retired part (removed from the live set by flush/merge) is not
 	// deleted from the backend until its refs reach zero, so a lock-free reader never races a delete.
 	refs atomic.Int32
+	// tsDisorder is set once a merge finds a stream of this part out of timestamp order, so every
+	// later merge decodes it whole instead of reading it forward.
+	tsDisorder atomic.Bool
 
 	// streamMaxMu guards streamMax, the per-stream watermarks of [part.streamWatermarks]. A mutex
 	// rather than a sync.Once so a failed load (a transient backend error) is retried instead of
@@ -104,8 +107,10 @@ func deletePart(ctx context.Context, b backend.Backend, prefix string) error {
 }
 
 // openPart opens the part at prefix and builds its StreamID → row-range index and bloom set.
-func openPart(ctx context.Context, b backend.Backend, schema *Schema, prefix string, corrupt *obs.Corruption) (*part, error) {
-	r, err := block.OpenPart(ctx, b, prefix)
+func openPart(
+	ctx context.Context, b backend.Backend, schema *Schema, prefix string, corrupt *obs.Corruption, opts ...block.ReadOption,
+) (*part, error) {
+	r, err := block.OpenPart(ctx, b, prefix, opts...)
 	if err != nil {
 		return nil, err
 	}

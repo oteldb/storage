@@ -378,8 +378,10 @@ func deletePart(ctx context.Context, b backend.Backend, prefix string) error {
 // openPart opens the part at prefix and attaches its SeriesID → row-range index: the paged form
 // when the series-index sidecar is present and valid — skipping the series-column read and its
 // resident decode entirely — else the resident form built by scanning the series column.
-func openPart(ctx context.Context, b backend.Backend, prefix string, corrupt *obs.Corruption) (*part, error) {
-	r, err := block.OpenPart(ctx, b, prefix)
+func openPart(
+	ctx context.Context, b backend.Backend, prefix string, corrupt *obs.Corruption, opts ...block.ReadOption,
+) (*part, error) {
+	r, err := block.OpenPart(ctx, b, prefix, opts...)
 	if err != nil {
 		return nil, err
 	}

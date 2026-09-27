@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
@@ -21,8 +20,7 @@ import (
 )
 
 // mergeRawIDSchema is [testSchema] with the id column raw-coded, the trace_id shape: it decodes with no
-// dictionary, so its column must fall back to the flat merge path while body and attrs still take
-// the split one — the mixed set.
+// dictionary, so the writer takes its rows as values while body and attrs arrive as ids.
 var mergeRawIDSchema = recordengine.NewSchema(
 	recordengine.Column{Name: "sev", Kind: recordengine.KindInt64, Codec: chunk.CodecT64},
 	recordengine.Column{Name: "body", Kind: recordengine.KindBytes, Codec: chunk.CodecDict, Bloom: recordengine.BloomFullText},
@@ -96,42 +94,16 @@ func canonicalizePartIDs(objs map[string][]byte) map[string][]byte {
 	return out
 }
 
-// mergeCase is one merge to run twice — once with the split (union dictionary + ids) carry forced
-// off, once with it on — whose backend must come out byte-identical either way.
+// mergeCase is one store to build and merge; each test runs it through two paths whose outputs must
+// agree.
 type mergeCase struct {
 	name    string
 	schema  *recordengine.Schema
 	maxPart int64
 	retain  int64
 	fill    func(t *testing.T, e *recordengine.Engine)
-	// wantSplit is the expected per-byte-column decision of the (single) merge that decodes
-	// something. Nil means the merge selects nothing and no decision is made.
-	wantSplit []bool
-}
-
-// runMergeCase builds the case's store from scratch, merges it, and returns the backend's objects
-// plus every per-column split decision the merge made.
-func runMergeCase(t *testing.T, c mergeCase, split bool) (map[string][]byte, [][]bool) {
-	t.Helper()
-
-	defer recordengine.SetMergeSplitDict(split)()
-
-	var decisions [][]bool
-
-	defer recordengine.ObserveMergeSplit(func(d []bool) {
-		decisions = append(decisions, append([]bool(nil), d...))
-	})()
-
-	be := backend.Memory()
-	e := recordengine.New(recordengine.Config{
-		Schema: c.schema, Backend: be, Prefix: "t/dict", MaxPartBytes: c.maxPart,
-	})
-
-	c.fill(t, e)
-
-	require.NoError(t, e.Merge(context.Background(), c.retain))
-
-	return dumpBackend(t, be), decisions
+	// idle marks a case whose merge selects nothing, so it proves nothing about a merge path.
+	idle bool
 }
 
 // dictRecs is n log-shaped records: a body drawn from a handful of templates and an attribute value
@@ -167,9 +139,7 @@ func fillParts(count, n int) func(*testing.T, *recordengine.Engine) {
 }
 
 // byteHeavyCase is a merge whose output-part seal is decided by the byte columns rather than by the
-// fixed-width ones: many streams (the seal is only checked at a stream boundary) each holding a few
-// long, heavily repeated bodies. It is the shape that can tell an expanded size accounting from one
-// that reports the id array.
+// fixed-width ones: many streams each holding a few long, heavily repeated bodies.
 func byteHeavyCase() mergeCase {
 	const (
 		streams = 24
@@ -201,35 +171,28 @@ func byteHeavyCase() mergeCase {
 				require.NoError(t, e.Flush(context.Background()))
 			}
 		},
-		wantSplit: []bool{true, true, true},
 	}
 }
 
 func mergeCases() []mergeCase {
-	const allSplit = true
-
 	return []mergeCase{{
-		name:      "repetitive",
-		schema:    testSchema,
-		fill:      fillParts(3, 40),
-		wantSplit: []bool{allSplit, allSplit, allSplit},
+		name:   "repetitive",
+		schema: testSchema,
+		fill:   fillParts(3, 40),
 	}, {
-		name:      "multiple output parts",
-		schema:    testSchema,
-		maxPart:   512, // ≈ a handful of rows per part, so both flush and merge split
-		fill:      fillParts(4, 30),
-		wantSplit: []bool{allSplit, allSplit, allSplit},
+		name:    "multiple output parts",
+		schema:  testSchema,
+		maxPart: 512, // ≈ a handful of rows per part, so both flush and merge split
+		fill:    fillParts(4, 30),
 	}, {
-		name:      "retention drops rows",
-		schema:    testSchema,
-		retain:    45, // inside the first part's range, so the merge rewrites rather than drops it
-		fill:      fillParts(3, 40),
-		wantSplit: []bool{allSplit, allSplit, allSplit},
+		name:   "retention drops rows",
+		schema: testSchema,
+		retain: 45, // inside the first part's range, so the merge rewrites rather than drops it
+		fill:   fillParts(3, 40),
 	}, {
-		name:      "mixed: raw id column stays flat",
-		schema:    mergeRawIDSchema,
-		fill:      fillParts(3, 40),
-		wantSplit: []bool{allSplit, false, allSplit},
+		name:   "mixed: raw id column",
+		schema: mergeRawIDSchema,
+		fill:   fillParts(3, 40),
 	}, {
 		name:   "single distinct value per column",
 		schema: testSchema,
@@ -248,7 +211,6 @@ func mergeCases() []mergeCase {
 				require.NoError(t, e.Flush(context.Background()))
 			}
 		},
-		wantSplit: []bool{allSplit, allSplit, allSplit},
 	}, {
 		name:   "empty column values",
 		schema: testSchema,
@@ -263,10 +225,10 @@ func mergeCases() []mergeCase {
 				require.NoError(t, e.Flush(context.Background()))
 			}
 		},
-		wantSplit: []bool{allSplit, allSplit, allSplit},
 	}, {
 		name:   "nothing to merge",
 		schema: testSchema,
+		idle:   true,
 		fill: func(t *testing.T, e *recordengine.Engine) {
 			t.Helper()
 
@@ -274,60 +236,6 @@ func mergeCases() []mergeCase {
 			require.NoError(t, e.Flush(context.Background()))
 		},
 	}, byteHeavyCase()}
-}
-
-// TestMergeSplitDictMatchesFlat is the property the whole split carry rests on: a merge's output
-// must be byte-identical whether the union-dictionary path or the flat blob path produced it — the
-// same part objects, blooms, identity objects and record-keys footer. Every layer beneath
-// guarantees it, so any mistake in the remap, the row ordering or the size accounting surfaces here.
-//
-//nolint:paralleltest // the split carry is a package-level seam this test flips
-func TestMergeSplitDictMatchesFlat(t *testing.T) {
-	for _, c := range mergeCases() {
-		t.Run(c.name, func(t *testing.T) {
-			flat, flatDecisions := runMergeCase(t, c, false)
-			got, decisions := runMergeCase(t, c, true)
-
-			require.Equal(t, flat, got, "merge output differs between the flat and split paths")
-
-			for _, d := range flatDecisions {
-				assert.NotContains(t, d, true, "forced-off merge took the split path")
-			}
-
-			if c.wantSplit == nil {
-				assert.Empty(t, decisions, "expected no merge to decode anything")
-
-				return
-			}
-
-			require.NotEmpty(t, decisions, "no merge ran, so the case proves nothing")
-			for _, d := range decisions {
-				assert.Equal(t, c.wantSplit, d, "per-column split decision")
-			}
-		})
-	}
-}
-
-// FuzzMergeSplitDictMatchesFlat is [TestMergeSplitDictMatchesFlat] over generated stream/row shapes
-// and column values: the same equality must hold for any of them.
-func FuzzMergeSplitDictMatchesFlat(f *testing.F) {
-	f.Add(byte(2), byte(3), byte(2), []byte("ab"))
-	f.Add(byte(1), byte(1), byte(1), []byte(""))
-	f.Add(byte(5), byte(7), byte(4), []byte("the quick brown fox"))
-	f.Add(byte(3), byte(2), byte(9), []byte{0x00, 0xff, 0x01})
-
-	f.Fuzz(func(t *testing.T, streams, rows, parts byte, values []byte) {
-		c := mergeCase{
-			schema: testSchema,
-			fill:   fuzzFill(int(streams)%6+1, int(rows)%9+1, int(parts)%4+2, values),
-		}
-
-		flat, _ := runMergeCase(t, c, false)
-		got, split := runMergeCase(t, c, true)
-
-		require.Equal(t, flat, got)
-		require.NotEmpty(t, split)
-	})
 }
 
 // fuzzFill flushes parts of records whose byte columns cycle through slices of values, so a shape
@@ -363,34 +271,4 @@ func fuzzFill(streams, rows, parts int, values []byte) func(*testing.T, *recorde
 			require.NoError(t, e.Flush(context.Background()))
 		}
 	}
-}
-
-// TestMergeSplitDictOutputPartsMatch checks the merge seals the same output parts either way, the
-// visible half of the expanded size accounting ([TestSplitColSizeAccountingIsExpanded] pins the
-// accounting itself).
-//
-//nolint:paralleltest // the split carry is a package-level seam this test flips
-func TestMergeSplitDictOutputPartsMatch(t *testing.T) {
-	c := byteHeavyCase()
-
-	flat, _ := runMergeCase(t, c, false)
-	got, _ := runMergeCase(t, c, true)
-
-	require.Equal(t, partPrefixes(flat), partPrefixes(got))
-	assert.Greater(t, len(partPrefixes(got)), 1)
-}
-
-// partPrefixes is the sorted set of part manifests in a backend dump, one per written part.
-func partPrefixes(objs map[string][]byte) []string {
-	var out []string
-
-	for k := range objs {
-		if strings.HasSuffix(k, "/manifest") {
-			out = append(out, k)
-		}
-	}
-
-	slices.Sort(out)
-
-	return out
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/diskguard"
 	"github.com/oteldb/storage/internal/obs"
@@ -168,6 +169,13 @@ type Engine struct {
 	// mergeReadWindow is how much of each source column a merge reads ahead per request
 	// ([block.PartReader.ColumnScan]).
 	mergeReadWindow int64
+	// readCompressors is the one set of decompressors every part this engine opens reads through.
+	readCompressors block.ReadOption
+	// mergeGranule is the granule a merge writes its output at ([mergeGranuleRows]).
+	mergeGranule int
+	// mergeCap, when positive, replaces [Engine.mergeCapBytes]. Test seam only: it sets the part
+	// bound without the memory share the cap is otherwise derived from.
+	mergeCap int64
 	// retiring holds parts removed from the live set by flush/merge, pending backend deletion once
 	// their in-flight fetch readers drain (deferred reclamation; see reclaim.go).
 	retiring []*part
@@ -311,7 +319,10 @@ func New(cfg Config) *Engine {
 		cfg.Signal = "record"
 	}
 
-	e := &Engine{cfg: cfg, head: newHead(cfg.Schema), mergeReadWindow: defaultMergeReadWindow}
+	e := &Engine{
+		cfg: cfg, head: newHead(cfg.Schema), mergeReadWindow: defaultMergeReadWindow, mergeGranule: mergeGranuleRows,
+		readCompressors: block.NewReadCompressors(),
+	}
 	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
 	e.recycle = func(b *fetch.Batch) {
 		if c, ok := b.ReleaseState().(*recordCols); ok {
@@ -1435,7 +1446,7 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 			return 0, 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
 		}
 
-		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, e.cfg.Obs.Corruption)
+		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, prefix, e.cfg.Obs.Corruption, e.readCompressors)
 		if err != nil {
 			return 0, 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
 		}

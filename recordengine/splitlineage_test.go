@@ -19,10 +19,10 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// splitPartBytes is both the flush cap and — with the merge memory allowance driven to nothing — the
-// decoded size at which a merge seals its output. splitCapBytes is that cap for the split itself:
-// one flushed part exceeds it, so a retention rewrite takes the part alone and splits it. The merge
-// seals only at a stream boundary, so every record is its own stream.
+// splitPartBytes is both the flush cap and the decoded size at which a merge seals its output.
+// splitCapBytes is that cap for the split itself: one flushed part exceeds it, so a retention rewrite
+// takes the part alone and splits it. Every record is its own stream, so each part boundary falls
+// between two.
 const (
 	splitPartBytes = 2048
 	splitCapBytes  = splitBodyBytes + splitBodyBytes/2
@@ -60,10 +60,13 @@ func flushIDs(ctx context.Context, t *testing.T, e *recordengine.Engine, be back
 }
 
 func splitLineageEngine(be backend.Backend, maxPartBytes int64, repair recordengine.PartFetcher) *recordengine.Engine {
-	return recordengine.New(recordengine.Config{
+	e := recordengine.New(recordengine.Config{
 		Schema: testSchema, Backend: be, Prefix: enginePrefix,
-		MaxPartBytes: maxPartBytes, MergeMemoryBytes: 1, Repair: repair,
+		MaxPartBytes: maxPartBytes, MergeMemoryBytes: -1, Repair: repair,
 	})
+	e.SetMergeCap(maxPartBytes)
+
+	return e
 }
 
 // flushRecordRun flushes one part holding recordsPerPart single-record streams numbered from base
