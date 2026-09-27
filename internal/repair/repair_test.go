@@ -20,6 +20,8 @@ type peer struct {
 	// member overrides the answer to a member want for a block.
 	member map[uint64]bucketindex.FetchResult
 	calls  [][]bucketindex.Want
+	// disk, when set, receives every part the peer answers with, as a copy would.
+	disk map[string]bucketindex.Entry
 }
 
 func (p *peer) FetchWants(_ context.Context, wants []bucketindex.Want) []bucketindex.FetchResult {
@@ -43,6 +45,10 @@ func (p *peer) FetchWants(_ context.Context, wants []bucketindex.Want) []bucketi
 		}
 
 		out[i].Entry = ent
+
+		if p.disk != nil {
+			p.disk[ent.Prefix] = ent
+		}
 	}
 
 	return out

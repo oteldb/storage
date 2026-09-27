@@ -13,12 +13,13 @@ import (
 // Admit returns the entries a repair commit publishes out of units, given live, the engine's part
 // set, and counts into stats what it publishes and what it leaves out.
 //
-// open makes a part readable for the commit; a part that will not open fails its whole unit, unless
-// what it was fetched for is already covered by this commit, in which case it is skipped. A part
-// already live, or admitted by an earlier unit, is not opened again. A unit that is not
-// [committable] once its parts are open is dropped whole. Last, a part another published or live
-// part supersedes is left out: a peer that merged between two rounds can answer one unit with both
-// a member and the successor containing it, and publishing both would read its rows twice.
+// open makes a part readable for the commit, once per part; a part already live is not opened. A
+// part that will not open fails its unit unless what it was fetched for is covered anyway. Units are
+// then judged together, each against live and every other unit still in: one that is not
+// [committable] is dropped, and the judgement repeats until none is. Judging against the whole set,
+// rather than the units before it, is what makes the outcome independent of unit order. Last, a part
+// another published or live part supersedes is left out: a peer that merged between two rounds can
+// answer one unit with both a member and the successor containing it.
 func Admit(
 	ctx context.Context, live []bucketindex.Entry, units []Unit, open func(*Result) error, stats *bucketindex.RepairStats,
 ) []bucketindex.Entry {
@@ -27,48 +28,19 @@ func Admit(
 		have[live[i].Prefix] = struct{}{}
 	}
 
+	openErr := openAll(ctx, units, have, open)
+	in := settle(live, units, have, openErr)
+
 	var (
 		admitted []bucketindex.Entry
 		picked   []*Result
 	)
 
-	for _, u := range units {
-		base := slices.Concat(live, admitted)
-		held := slices.Clone(base)
-		added := make([]*Result, 0, len(u))
-		ok := true
-
-		for i := range u {
-			r := &u[i]
-			if _, dup := have[r.Entry.Prefix]; dup || slices.ContainsFunc(added, r.samePart) {
-				continue
-			}
-
-			if err := open(r); err != nil {
-				if _, covered := (&bucketindex.Index{Entries: held}).Satisfying(r.Want); covered {
-					continue
-				}
-
-				zctx.From(ctx).Warn("repaired part is not readable",
-					zap.String("part", r.Entry.Prefix), zap.Error(err))
-
-				ok = false
-
-				break
-			}
-
-			held = append(held, r.Entry)
-			added = append(added, r)
-		}
-
-		if ok && !committable(base, u[0].Want, held[len(base):]) {
+	for k, u := range units {
+		if !in[k] {
 			zctx.From(ctx).Warn("repaired split group is not complete at commit",
 				zap.String("want", u[0].Want.Prefix))
 
-			ok = false
-		}
-
-		if !ok {
 			stats.Failed += int64(len(u))
 
 			continue
@@ -78,7 +50,12 @@ func Admit(
 			stats.Revoked++
 		}
 
-		for _, r := range added {
+		for i := range u {
+			r := &u[i]
+			if _, dup := have[r.Entry.Prefix]; dup || openErr[r.Entry.Prefix] != nil {
+				continue
+			}
+
 			have[r.Entry.Prefix] = struct{}{}
 			admitted = append(admitted, r.Entry)
 			picked = append(picked, r)
@@ -107,7 +84,100 @@ func Admit(
 	return out
 }
 
-func (r *Result) samePart(o *Result) bool { return r.Entry.Prefix == o.Entry.Prefix }
+// openAll opens every part of units that is not live, once, and returns what each open concluded.
+func openAll(
+	ctx context.Context, units []Unit, have map[string]struct{}, open func(*Result) error,
+) map[string]error {
+	openErr := make(map[string]error)
+
+	for _, u := range units {
+		for i := range u {
+			r := &u[i]
+			if _, dup := have[r.Entry.Prefix]; dup {
+				continue
+			}
+
+			if _, done := openErr[r.Entry.Prefix]; done {
+				continue
+			}
+
+			err := open(r)
+			if err != nil {
+				zctx.From(ctx).Warn("repaired part is not readable",
+					zap.String("part", r.Entry.Prefix), zap.Error(err))
+			}
+
+			openErr[r.Entry.Prefix] = err
+		}
+	}
+
+	return openErr
+}
+
+// settle returns which units the commit takes: every unit is judged against live and every other
+// unit still in, all at once, until no verdict changes.
+func settle(
+	live []bucketindex.Entry, units []Unit, have map[string]struct{}, openErr map[string]error,
+) []bool {
+	added := make([][]bucketindex.Entry, len(units))
+
+	for k, u := range units {
+		for i := range u {
+			p := u[i].Entry.Prefix
+			if _, dup := have[p]; !dup && openErr[p] == nil {
+				added[k] = append(added[k], u[i].Entry)
+			}
+		}
+	}
+
+	in := make([]bool, len(units))
+	for k := range in {
+		in[k] = true
+	}
+
+	for {
+		verdict := make([]bool, len(units))
+
+		for k, u := range units {
+			if !in[k] {
+				continue
+			}
+
+			base := slices.Clone(live)
+			for o := range units {
+				if o != k && in[o] {
+					base = append(base, added[o]...)
+				}
+			}
+
+			verdict[k] = admissible(base, u, added[k], openErr)
+		}
+
+		if slices.Equal(verdict, in) {
+			return in
+		}
+
+		in = verdict
+	}
+}
+
+// admissible reports whether u may be committed over base with its opened parts added: every part
+// that would not open was fetched for something the commit covers anyway, and u is [committable].
+func admissible(base []bucketindex.Entry, u Unit, added []bucketindex.Entry, openErr map[string]error) bool {
+	all := &bucketindex.Index{Entries: slices.Concat(base, added)}
+
+	for i := range u {
+		if openErr[u[i].Entry.Prefix] == nil {
+			continue
+		}
+
+		if _, covered := all.Satisfying(u[i].Want); !covered {
+			return false
+		}
+	}
+
+	return committable(base, u[0].Want, added)
+}
 
 // ConfirmLost advances evidence, the per-want count of consecutive definitive-absence conclusions,
 // with a pass's attempts and returns the wants that have earned a hole. Only [bucketindex.WantAbsent]

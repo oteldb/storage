@@ -815,6 +815,17 @@ member want names blocks, not a prefix, so the fetcher answers it from peer inde
 a peer's disk but in no index is absent to it, which is why that absence only ever counts against a
 want nothing else answers.
 
+**The cap takes the least recently tried first** (`repair.State`), so wants that make no progress
+cannot hold the four slots against the rest: with n outstanding, each is sent to peers at least once
+every ⌈n/4⌉ passes. The order lives in memory and a restart starts over in prefix order; nothing
+depends on it but fairness. One want can stay outstanding for good with its data present on a peer:
+a member whose group must be complete, because this node still holds ancestry the group shares,
+while a sibling is already a hole. Committing the member would duplicate the rows it shares with
+that ancestor, and retiring the ancestor needs the whole group. Counting the hole as the missing
+member would retire the ancestor anyway, and the rows the lost sibling held exist here only in that
+ancestor, so a duplicate would become a loss. The want therefore stays visible in `WantedParts`,
+fails each pass without earning evidence, and only needs diverged histories to arise.
+
 Member targets are **never wants**: nothing about them reaches the index, so the obligation stays the
 original want's and `Entries → Removed | Wanted` is untouched. That is what makes repair terminate: by the time
 a want is serviced the data may exist only inside a merged successor, and chasing a prefix that no

@@ -51,6 +51,11 @@ type State struct {
 	// gate makes passes single-flight while honoring a waiter's ctx.
 	gate chan struct{}
 
+	// pass numbers the passes; tried is the pass each outstanding want or hole was last sent to
+	// peers in. Both are touched only by the pass holding the gate.
+	pass  uint64
+	tried map[string]uint64
+
 	mu       sync.Mutex
 	evidence map[string]int
 	stats    bucketindex.RepairStats
@@ -62,6 +67,32 @@ func (s *State) Stats() bucketindex.RepairStats {
 	defer s.mu.Unlock()
 
 	return s.stats
+}
+
+// remember records the targets plan sent to peers and forgets any no longer outstanding.
+func (s *State) remember(plan Plan, wants []bucketindex.Want, holes []bucketindex.Entry) {
+	outstanding := make(map[string]struct{}, len(wants)+len(holes))
+	for i := range wants {
+		outstanding[wants[i].Prefix] = struct{}{}
+	}
+
+	for i := range holes {
+		outstanding[holes[i].Prefix] = struct{}{}
+	}
+
+	for prefix := range s.tried {
+		if _, ok := outstanding[prefix]; !ok {
+			delete(s.tried, prefix)
+		}
+	}
+
+	if s.tried == nil {
+		s.tried = make(map[string]uint64)
+	}
+
+	for _, prefix := range plan.Asked {
+		s.tried[prefix] = s.pass
+	}
 }
 
 func (s *State) add(st bucketindex.RepairStats) {
@@ -106,10 +137,13 @@ func Drive[P any](ctx context.Context, s *State, cfg Config, h Host[P]) {
 		return
 	}
 
+	s.pass++
+
 	opened := make(map[string]P)
 	pass := Pass{
 		Fetcher: cfg.Fetcher,
 		Prefix:  cfg.Prefix,
+		Tried:   s.tried,
 		Hold: func(ctx context.Context, prefix string) bool {
 			p, err := h.Open(ctx, prefix)
 			if err != nil {
@@ -123,6 +157,7 @@ func Drive[P any](ctx context.Context, s *State, cfg Config, h Host[P]) {
 	}
 
 	plan := pass.Run(ctx, live, wants, holes)
+	s.remember(plan, wants, holes)
 
 	lost := s.confirmLost(wants, plan)
 	plan.Stats.Lost = int64(len(lost))

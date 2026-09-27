@@ -56,6 +56,9 @@ type Pass struct {
 	Hold func(ctx context.Context, prefix string) bool
 	// Prefix names the engine in logs.
 	Prefix string
+	// Tried is the pass each want or hole was last sent to peers in; the cap takes the least recently
+	// tried first, so wants that make no progress cannot starve the rest.
+	Tried map[string]uint64
 }
 
 // Plan is what a pass concluded before its commit.
@@ -66,6 +69,8 @@ type Plan struct {
 	Attempts []Result
 	// Failed names the wants whose attempt concluded nothing.
 	Failed []string
+	// Asked names the wants and holes sent to peers.
+	Asked []string
 	// Stats counts everything but the parts the commit publishes; [Admit] adds those.
 	Stats bucketindex.RepairStats
 }
@@ -122,11 +127,15 @@ func (p Pass) Run(
 		remote = append(remote, *t)
 	}
 
+	slices.SortStableFunc(remote, func(a, b Target) int {
+		return cmp.Compare(p.Tried[a.Want.Prefix], p.Tried[b.Want.Prefix])
+	})
 	remote = remote[:min(len(remote), FetchesPerCycle)]
 
 	fetched := p.fetch(ctx, remote, &plan.Stats)
 	for i := range fetched {
 		a := &fetched[i]
+		plan.Asked = append(plan.Asked, a.Want.Prefix)
 
 		switch {
 		case a.err != nil:
