@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/internal/reproduce"
 )
 
 // peer answers wants from its index, as the cluster layer does, with per-block overrides.
@@ -313,14 +314,33 @@ func TestAdmit(t *testing.T) {
 	ctx := context.Background()
 	members := group("f", 10, 3, bucketindex.Blocks(1))
 
-	unit := func(prefix string, hole, held bool, entries ...bucketindex.Entry) Unit {
+	unitOf := func(w bucketindex.Want, hole, held bool, entries ...bucketindex.Entry) Unit {
 		u := make(Unit, 0, len(entries))
-		u = append(u, Result{Target: Target{Want: want(prefix, 1), Hole: hole}, Entry: entries[0], Held: held})
+		u = append(u, Result{Target: Target{Want: w, Hole: hole}, Entry: entries[0], Held: held})
 		for _, ent := range entries[1:] {
 			u = append(u, Result{Target: Target{Want: bucketindex.Want{Blocks: ent.Blocks}, Member: true}, Entry: ent})
 		}
 
 		return u
+	}
+
+	unit := func(prefix string, hole, held bool, entries ...bucketindex.Entry) Unit {
+		return unitOf(want(prefix, 1), hole, held, entries...)
+	}
+
+	// final is the live set a commit of got leaves, as the engine's retire step computes it.
+	final := func(live, got []bucketindex.Entry) []string {
+		retired := bucketindex.Subsumed(live, got)
+
+		var out []string
+
+		for _, e := range slices.Concat(live, got) {
+			if _, ok := retired[e.Prefix]; !ok {
+				out = append(out, e.Prefix)
+			}
+		}
+
+		return out
 	}
 
 	opener := func(bad ...string) (func(*Result) error, *[]string) {
@@ -381,6 +401,7 @@ func TestAdmit(t *testing.T) {
 
 	t.Run("AlreadyLiveAndCovered", func(t *testing.T) {
 		t.Parallel()
+		reproduce.Unfixed(t, 721, "the group is published beside the successor covering its claim")
 
 		var stats bucketindex.RepairStats
 
@@ -395,10 +416,64 @@ func TestAdmit(t *testing.T) {
 			unit("c", true, false, phantom),
 		}, open, &stats)
 
-		assert.Equal(t, []bucketindex.Entry{members[1], members[2], succ}, got)
+		assert.Equal(t, []bucketindex.Entry{succ}, got, "the successor holds every member's rows")
+		assert.Equal(t, []string{"s"}, final(live, got), "block 1 is live once, not as the group and the successor")
 		assert.Equal(t, []string{"f01", "f02", "s"}, *opened, "a live part is not opened again")
-		assert.Equal(t, bucketindex.RepairStats{Fetched: 2, Local: 1, Revoked: 1}, stats,
+		assert.Equal(t, bucketindex.RepairStats{Local: 1, Revoked: 1}, stats,
 			"only parts published count, and a copy the commit already covers is no failure")
+	})
+
+	// A part covering only some of a group's claim overlaps every member and replaces none: the
+	// commit keeps one of the two representations, whichever order the units come in.
+	t.Run("PartialSuccessor", func(t *testing.T) {
+		t.Parallel()
+		reproduce.Unfixed(t, 721, "a part overlapping a group's claim is published beside the group")
+
+		wide := group("g", 20, 2, bucketindex.Interval{Min: 1, Max: 2})
+		part := bucketindex.Entry{Prefix: "p", Blocks: bucketindex.Interval{Min: 2, Max: 3}, Level: 2}
+		units := []Unit{
+			unit("a", false, false, wide...),
+			unitOf(want("b", 3), false, false, part),
+		}
+
+		for _, tc := range []struct {
+			name string
+			live []bucketindex.Entry
+			want []bucketindex.Entry
+		}{
+			{"MemberLive", wide[:1], wide[1:]},
+			{"NothingLive", nil, wide},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				for _, order := range [][]Unit{units, {units[1], units[0]}} {
+					var stats bucketindex.RepairStats
+
+					open, _ := opener()
+					got := Admit(ctx, tc.live, order, open, &stats)
+
+					assert.ElementsMatch(t, tc.want, got)
+					assert.Equal(t, int64(1), stats.Failed, "the part left out is counted")
+				}
+			})
+		}
+	})
+
+	t.Run("SuccessorAtTheGroupsLevel", func(t *testing.T) {
+		t.Parallel()
+		reproduce.Unfixed(t, 721, "a rival at the group's level is published beside the group")
+
+		var stats bucketindex.RepairStats
+
+		rival := bucketindex.Entry{Prefix: "r", Blocks: bucketindex.Interval{Min: 1, Max: 2}, Level: 1}
+		open, _ := opener()
+		got := Admit(ctx, members[:1], []Unit{
+			unit("a", false, false, members...),
+			unit("b", false, false, rival),
+		}, open, &stats)
+
+		assert.Equal(t, members[1:], got, "neither replaces the other, and the group is partly live already")
 	})
 }
 
