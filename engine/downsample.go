@@ -86,6 +86,16 @@ func downsampleApplies(tiers []DownsampleTier, minTime int64) bool {
 // order, since each representative was rounded once when stored. Count is the one aggregation a
 // re-roll corrupts: re-counting a representative yields 1, not the count it carried.
 func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int64, []float64, []float64) {
+	ts, values, sf, _ = downsampleCovering(ts, values, sf, tiers)
+
+	return ts, values, sf
+}
+
+// downsampleCovering is [downsample] that also returns each output sample's newest source
+// timestamp: a representative can sit before samples it rolled up (First, Min, Max, and every
+// bucket-start aggregation), and the watermark a replica trims its head through must not fall back
+// with it. covered is nil when it equals the output timestamps.
+func downsampleCovering(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int64, []float64, []float64, []int64) {
 	active := make([]DownsampleTier, 0, len(tiers))
 	for _, t := range tiers {
 		if t.Interval > 0 {
@@ -94,7 +104,7 @@ func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int
 	}
 
 	if len(active) == 0 || len(ts) == 0 {
-		return ts, values, sf
+		return ts, values, sf, nil
 	}
 
 	weight := func(i int) float64 {
@@ -143,20 +153,16 @@ func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int
 		b.add(t, values[i], weight(i))
 	}
 
-	type rep struct {
-		ts, interval int64
-		v, w         float64
-	}
-
-	reps := make([]rep, 0, len(order))
+	reps := make([]rollupRep, 0, len(order))
 	for _, k := range order {
-		ts, v, w := buckets[k].result(k.start)
-		reps = append(reps, rep{ts: ts, interval: k.interval, v: v, w: w})
+		b := buckets[k]
+		ts, v, w := b.result(k.start)
+		reps = append(reps, rollupRep{ts: ts, interval: k.interval, covered: b.lastTs, v: v, w: w})
 	}
 
 	// Finer interval first on a timestamp tie, so an overlap on a misaligned boundary
 	// deterministically keeps the finer (more accurate) value.
-	slices.SortFunc(reps, func(a, b rep) int {
+	slices.SortFunc(reps, func(a, b rollupRep) int {
 		if c := cmp.Compare(a.ts, b.ts); c != 0 {
 			return c
 		}
@@ -164,32 +170,64 @@ func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int
 		return cmp.Compare(a.interval, b.interval)
 	})
 
-	outTs := make([]int64, 0, len(reps))
-	outVal := make([]float64, 0, len(reps))
-
-	var outSF []float64
-
+	out := rollupOut{ts: make([]int64, 0, len(reps)), val: make([]float64, 0, len(reps))}
 	for _, r := range reps {
-		if n := len(outTs); n > 0 && outTs[n-1] == r.ts {
-			continue
-		}
-
-		outTs = append(outTs, r.ts)
-		outVal = append(outVal, r.v)
-
-		if r.w != 1 && outSF == nil {
-			outSF = make([]float64, len(outTs)-1, len(reps))
-			for i := range outSF {
-				outSF[i] = 1
-			}
-		}
-
-		if outSF != nil {
-			outSF = append(outSF, r.w)
-		}
+		out.add(r)
 	}
 
-	return outTs, outVal, outSF
+	return out.ts, out.val, out.sf, out.covered
+}
+
+// rollupRep is one bucket's representative, with the newest source timestamp it covers.
+type rollupRep struct {
+	ts, interval, covered int64
+	v, w                  float64
+}
+
+// rollupOut collects the representatives in timestamp order. sf and covered stay nil until a row
+// differs from its default (weight 1, covered = ts).
+type rollupOut struct {
+	ts      []int64
+	val     []float64
+	sf      []float64
+	covered []int64
+}
+
+func (o *rollupOut) add(r rollupRep) {
+	if n := len(o.ts); n > 0 && o.ts[n-1] == r.ts {
+		// The coarser bucket's value is dropped, but the samples it held are still covered.
+		if o.covered == nil && r.covered > o.ts[n-1] {
+			o.covered = slices.Clone(o.ts)
+		}
+
+		if o.covered != nil {
+			o.covered[n-1] = max(o.covered[n-1], r.covered)
+		}
+
+		return
+	}
+
+	o.ts = append(o.ts, r.ts)
+	o.val = append(o.val, r.v)
+
+	switch {
+	case o.covered != nil:
+		o.covered = append(o.covered, r.covered)
+	case r.covered != r.ts:
+		o.covered = append(slices.Clone(o.ts[:len(o.ts)-1]), r.covered)
+	}
+
+	switch {
+	case o.sf != nil:
+		o.sf = append(o.sf, r.w)
+	case r.w != 1:
+		o.sf = make([]float64, len(o.ts)-1, cap(o.ts))
+		for i := range o.sf {
+			o.sf[i] = 1
+		}
+
+		o.sf = append(o.sf, r.w)
+	}
 }
 
 // widestFirst orders tiers so the first a sample qualifies for is the coarsest. Before order would not

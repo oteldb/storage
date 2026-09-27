@@ -105,8 +105,10 @@ func newPartStreamWriter(
 	return &partStreamWriter{e: e, w: w, prefix: prefix, withSF: withSF, withStats: withStats}, nil
 }
 
-// appendSeries appends one series' samples; a nil sf means every weight is 1.
-func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []float64) error {
+// appendSeries appends one series' samples; a nil sf means every weight is 1. covered is the newest
+// timestamp the run covers, the watermark the replica refresh trims through; a rollup can cover past
+// its newest sample.
+func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []float64, covered int64) error {
 	if len(ts) == 0 {
 		return nil
 	}
@@ -132,12 +134,7 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 	p.runs = append(p.runs, chunk.U128Run{Value: id, Count: len(ts)})
 	p.rows += len(ts)
 
-	newest := ts[0]
-	for _, t := range ts[1:] {
-		newest = max(newest, t)
-	}
-
-	p.wmarks = append(p.wmarks, watermark.Entry{ID: u128ToID(id), Max: newest})
+	p.wmarks = append(p.wmarks, watermark.Entry{ID: u128ToID(id), Max: covered})
 
 	// Rows arrive series-major, so the part's bounds are the running extremes over every series
 	// rather than the first and last row.

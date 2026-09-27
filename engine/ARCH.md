@@ -1296,6 +1296,17 @@ timestamp column at all. A part written before the sidecar existed, or one whose
 does not cover its series, falls back to decoding the column; absence is not an error. Either way the
 result is held on the part handle at ~24 bytes per series, on top of the 20 the resident index costs.
 
+**A merge never lowers a series' watermark.** The sidecar records the newest timestamp a part *covers*,
+not the newest it stores: a rollup representative sits at or before the samples it replaced (First,
+Min and Max pick an earlier sample, Sum/Avg/Count the bucket start), and a watermark read off the
+timestamps would leave a replica that refreshes after the rollup holding raw samples the part already
+accounts for — extra rows on replica reads, re-flushed on promotion. So a merge takes each bucket's
+newest source timestamp, and each series' last output run also takes the largest watermark its source
+parts recorded, since a re-rolled representative no longer shows what it covered. The decode fallback
+reads timestamps only, so it can land lower — never higher — than the sidecar, which keeps a replica's
+head rather than trimming what is not durable. Part `minTime`/`maxTime` still bound the stored
+timestamps, since pruning must cover the representatives.
+
 **A reloaded index reuses the part handles the engine already holds** (`loadPartsLocked`) when the
 handle already carries everything its entry records — time bounds, block identity, claim, level — and
 has no identity pending (`part.matchesEntry`). Reopening throws away the watermarks, the paged series
