@@ -15,9 +15,9 @@ import (
 // TestRefreshReplicaAfterRollup: a replica that missed the raw part and refreshes only after it was
 // rolled up must still trim every sample the rollup covers, including those newer than the
 // representative's own timestamp (First, Min and Max pick an earlier sample, and Sum, Avg and Count
-// sit at the bucket start). It then serves exactly what the owner serves. A second merge re-rolls
-// the representative next to an older part, so the watermark must survive a rewrite that no longer
-// sees the rolled-up samples.
+// sit at the bucket start). It then serves exactly what the owner serves. The watermark must also
+// survive a later rewrite that no longer sees the rolled-up samples: a re-roll next to an older part,
+// and a verbatim copy of the marked part (a precision rewrite).
 func TestRefreshReplicaAfterRollup(t *testing.T) {
 	t.Parallel()
 
@@ -28,10 +28,10 @@ func TestRefreshReplicaAfterRollup(t *testing.T) {
 	for _, agg := range []signal.Aggregation{
 		signal.AggFirst, signal.AggMin, signal.AggMax, signal.AggLast, signal.AggSum, signal.AggAvg, signal.AggCount,
 	} {
-		for _, reroll := range []bool{false, true} {
+		for _, then := range []string{"", "reroll", "copy"} {
 			name := agg.String()
-			if reroll {
-				name += "/reroll"
+			if then != "" {
+				name += "/" + then
 			}
 
 			t.Run(name, func(t *testing.T) {
@@ -54,13 +54,20 @@ func TestRefreshReplicaAfterRollup(t *testing.T) {
 				require.NoError(t, owner.Flush(ctx))
 				require.NoError(t, owner.MergeWith(ctx, opts(agg)))
 
-				if reroll {
+				switch then {
+				case "reroll":
 					write(5, 7)
 					require.NoError(t, owner.Flush(ctx))
 					require.NoError(t, owner.MergeWith(ctx, opts(agg)))
-					require.Equal(t, 1, owner.PartCount())
+				case "copy":
+					before := owner.Parts()
+					o := opts(agg)
+					o.Precision = []engine.PrecisionTier{{Before: 1000, Bits: 12}}
+					require.NoError(t, owner.MergeWith(ctx, o))
+					require.NotEqual(t, before[0].ID, owner.Parts()[0].ID, "the part was rewritten")
 				}
 
+				require.Equal(t, 1, owner.PartCount())
 				require.NoError(t, replica.RefreshReplica(ctx))
 				assert.Zero(t, replica.HeadSampleCount(), "every head sample is covered by the rolled part")
 

@@ -224,16 +224,18 @@ func tiersOf(agg signal.Aggregation, tiers ...engine.DownsampleTier) engine.Merg
 	return engine.MergeOptions{Downsample: tiers}
 }
 
-// TestRerollCount: a later merge that touches a rolled Count bucket counts its representative as one
-// sample. Every path that rewrites rolled data does it: another part in the same ladder bucket, a
-// precision rewrite of the part alone, and a coarser tier.
+// TestRerollCount: a later merge that touches a rolled Count bucket must not count its representative
+// as one sample: another part in the same ladder bucket, a precision rewrite of the part alone (a
+// verbatim copy under its marker), and a coarser tier.
 func TestRerollCount(t *testing.T) {
-	reproduce.Unfixed(t, rerollIssue, "a Count representative re-rolled by a later merge counts as 1")
 	t.Parallel()
+
+	const counted = "a Count representative re-rolled by a later merge counts as 1"
 
 	fine := engine.DownsampleTier{Before: rerollBase + hr, Interval: min1}
 
 	t.Run("SameBucket", func(t *testing.T) {
+		reproduce.Unfixed(t, rerollIssue, counted)
 		t.Parallel()
 
 		r := newRerollEngine(t)
@@ -267,6 +269,7 @@ func TestRerollCount(t *testing.T) {
 	})
 
 	t.Run("Coarsen", func(t *testing.T) {
+		reproduce.Unfixed(t, rerollIssue, counted)
 		t.Parallel()
 
 		r := newRerollEngine(t)

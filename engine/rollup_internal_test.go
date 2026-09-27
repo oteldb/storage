@@ -323,21 +323,22 @@ func TestDownsampleLegacyPart(t *testing.T) {
 
 // TestDownsampleMarkedRawAlignedIsRolled checks a raw part whose samples already sit on bucket starts
 // is still rolled when the rollup changes their values or weights: its marker says the values are raw,
-// so a verbatim copy would record a layout it did not apply.
+// so a verbatim copy would record a layout it did not apply. An Avg over one sample keeps its value
+// and weight, so there the copy is the rollup.
 func TestDownsampleMarkedRawAlignedIsRolled(t *testing.T) {
 	t.Parallel()
 
 	minute := int64(time.Minute)
 
 	for _, tc := range []struct {
-		name      string
-		agg       signal.Aggregation
-		value, sf float64
-		want      float64
+		name         string
+		agg          signal.Aggregation
+		value, sf    float64
+		want, wantSF float64
 	}{
-		{"count", signal.AggCount, 5, 1, 1},
-		{"weighted sum", signal.AggSum, 3, 2, 6},
-		{"weighted avg", signal.AggAvg, 3, 2, 3},
+		{"count", signal.AggCount, 5, 1, 1, 1},
+		{"weighted sum", signal.AggSum, 3, 2, 6, 1},
+		{"weighted avg", signal.AggAvg, 3, 2, 3, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -372,9 +373,7 @@ func TestDownsampleMarkedRawAlignedIsRolled(t *testing.T) {
 			for i := range got[0].Values {
 				assert.InDelta(t, tc.want, got[0].Values[i], 0)
 
-				if got[0].ScaleFactors != nil {
-					assert.InDelta(t, 1, got[0].ScaleFactors[i], 0, "the rollup folded the weight")
-				}
+				assert.InDelta(t, tc.wantSF, got[0].ScaleFactor(i), 0, "the rollup's weight")
 			}
 
 			assert.Equal(t, currentLayout(tiers), liveParts(e)[0].rollup)
@@ -623,7 +622,7 @@ func TestDownsampleCappedBucketRollsEveryPart(t *testing.T) {
 	require.Len(t, ts, parts)
 
 	for i := range ts {
-		assert.Equal(t, int64(i)*minute, ts[i])
+		assert.Equal(t, int64(i+1)*minute-int64(time.Second), ts[i], "each minute's last sample")
 		assert.InDelta(t, float64(i), vals[i], 0)
 	}
 
