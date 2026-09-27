@@ -115,6 +115,7 @@ var metricKind = enginetest.Kind{
 		c := engine.Config{
 			Backend: cfg.Backend, Prefix: "default/metrics", WAL: cfg.WAL, Obs: cfg.Obs, WriterID: cfg.WriterID,
 			Repair: cfg.Repair, OrphanGrace: cfg.OrphanGrace, Now: cfg.Now, MergeCeilingBytes: cfg.MergeCapBytes,
+			Term: cfg.Term,
 		}
 
 		return metricEngine{engine.New(c)}
