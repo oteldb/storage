@@ -128,9 +128,10 @@ func (r Retention) AgeFor(sig signal.Signal) time.Duration {
 //
 // Every enabled tier must use the same Agg, so a coarser tier can re-aggregate the finer
 // tier's representatives. Last, First, Min and Max keep the chosen sample, at its own
-// timestamp, and coarsen exactly. Sum keeps the bucket total at the bucket start. Avg keeps
-// the bucket mean at the bucket start, weighted by the bucket's population through the
-// sample's scale factor (fetch.Batch.ScaleFactors). A coarser Sum or Avg equals one rollup
+// timestamp, and coarsen exactly; Min and Max ignore NaN unless a bucket holds nothing
+// else. Sum keeps the bucket total at the bucket start. Avg keeps the bucket mean at the
+// bucket start, weighted by the bucket's population through the sample's scale factor
+// (fetch.Batch.ScaleFactors). A coarser Sum or Avg equals one rollup
 // of the raw samples up to floating-point grouping: the same sum, added in a different
 // order. Count is not yet exact once a merge rolls its representatives again. A different
 // Agg per tier would aggregate the finer tier's results instead of the raw samples (a 1m Sum

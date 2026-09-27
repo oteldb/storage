@@ -582,6 +582,11 @@ total is compensated (Neumaier), so one bucket rounds once however many samples 
 buckets the error stays within the recursive-summation bound, and cancellation shows it (fine buckets
 [1e16] and [−1e16, 1] coarsen to 0, one pass gives 1).
 
+NaN composes too. Min and Max skip NaN while a bucket holds any other value and emit the first NaN
+only when it holds nothing else; seeding from the first sample and comparing with `<` would let a
+leading NaN win a fine bucket and hide a smaller value from the coarse one. First and Last take the
+sample whatever it is, and a NaN or opposing infinities make a Sum or Avg NaN in either grouping.
+
 Changing a tier's Agg applies only to data not yet rolled up; a rolled bucket keeps the Agg it was
 rolled with. Merges do not enforce that: one that re-rolls a representative aggregates it by the
 current Agg.

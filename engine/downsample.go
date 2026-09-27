@@ -85,6 +85,10 @@ func downsampleApplies(tiers []DownsampleTier, minTime int64) bool {
 // therefore the one-pass rollup up to floating-point grouping: the same sum, added in a different
 // order, since each representative was rounded once when stored. Count is the one aggregation a
 // re-roll corrupts: re-counting a representative yields 1, not the count it carried.
+//
+// Min and Max ignore NaN while the bucket holds any other value; an all-NaN bucket emits its first
+// NaN. First and Last take the sample whatever its value, and a NaN in a Sum or Avg bucket makes
+// its representative NaN, so every aggregation composes the same way with NaN as without.
 func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int64, []float64, []float64) {
 	ts, values, sf, _ = downsampleCovering(ts, values, sf, tiers)
 
@@ -267,7 +271,7 @@ func alignDown(ts, interval int64) int64 {
 // are unambiguous. n counts samples; nWeighted sums their weights (the estimated original count);
 // wsum sums value·weight (the estimated original total), compensated by wcomp (Neumaier) so a long
 // bucket's total is rounded once rather than once per sample. min/max track the earliest sample
-// holding the extreme value.
+// holding the extreme non-NaN value, or the first sample while every value so far is NaN.
 type bucketAcc struct {
 	agg       signal.Aggregation
 	n         int64
@@ -299,11 +303,11 @@ func (b *bucketAcc) add(ts int64, v, sf float64) {
 		return
 	}
 
-	if v < b.min {
+	if v < b.min || math.IsNaN(b.min) && !math.IsNaN(v) {
 		b.min, b.minTs, b.minSF = v, ts, sf
 	}
 
-	if v > b.max {
+	if v > b.max || math.IsNaN(b.max) && !math.IsNaN(v) {
 		b.max, b.maxTs, b.maxSF = v, ts, sf
 	}
 
