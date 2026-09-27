@@ -405,6 +405,29 @@ func TestRerollLateSample(t *testing.T) {
 	}
 }
 
+// TestRerollAggChange: an Agg change applies only to data not yet rolled up. A bucket rolled with Sum
+// keeps Sum when a later merge meets it under a Max policy, so a late raw sample folds into the total
+// rather than competing with it as a maximum.
+func TestRerollAggChange(t *testing.T) {
+	reproduce.Unfixed(t, rerollIssue, "a later merge re-aggregates a representative by the current policy's Agg")
+	t.Parallel()
+
+	sum := tiersOf(signal.AggSum, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
+	maxOpts := tiersOf(signal.AggMax, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
+
+	r := newRerollEngine(t)
+	r.write(rerollBase, 2)
+	r.write(rerollBase+sec, 3)
+	r.flush()
+	r.merge(sum)
+
+	r.write(rerollBase+2*sec, 4)
+	r.flush()
+	r.merge(maxOpts)
+
+	r.assertOneRollup(sum.Downsample, 0)
+}
+
 // TestRerollLateOverwrite: a late write reusing the timestamp of a raw sample that is already rolled
 // up cannot replace it, because the raw value is gone. Where the overwritten sample was folded into
 // the aggregate, the late value is added to it; where it is the representative itself, freshest-wins
