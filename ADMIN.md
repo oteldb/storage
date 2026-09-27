@@ -497,6 +497,14 @@ there are more engines than maintenance workers (#646). `runMaintenance` cannot 
 size-triggered flush until a whole cycle's fan-out returns, so parking a merge on a busy budget
 would hold back the memory relief the budget exists to bound.
 
+A record merge reserves **its share, or what it needs if that is more**: its sources as their
+manifests bound them (read-ahead windows, frame buffers, dictionaries), its frame encoder and room
+for its writers. A merge over parts the manifest cannot size (written before sizing stats) reserves
+its share and tops it up once it has opened them — never waiting while it holds — or, when it would
+have to wait, hands its grant back and queues for the whole; a background merge that finds the
+difference taken is deferred like any other. A request above the whole budget is clamped to it, so
+such a merge runs alone.
+
 `Admin.Compact`, `Admin.CompactNow` and `Admin.Retention` **wait** for the budget instead of
 deferring, so an operator command never silently does nothing. `Admin.MaintainNow` runs the
 background cycle and therefore defers like it.

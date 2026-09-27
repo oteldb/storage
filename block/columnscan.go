@@ -2,11 +2,13 @@ package block
 
 import (
 	"context"
+	"encoding/binary"
 
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/encoding/compress"
 )
 
 // The sequential counterpart of the ranged read path. A query touches a handful of granules out of
@@ -46,6 +48,48 @@ func (r *PartReader) ColumnScan(ctx context.Context, name string, window int64) 
 	}
 
 	return r.openDecoder(ctx, name, max(window, 0))
+}
+
+// ScanBound bounds, from the manifest alone, what [Decoder.ResidentBytes] reports for
+// ColumnScan(ctx, name, window), so a caller can reserve memory before opening the column. ok is
+// false for a column the manifest cannot size: one written without [WithSizingStats], an unframed
+// or leading-dictionary layout, a constant or unblocked column, or none by that name.
+func (r *PartReader) ScanBound(ctx context.Context, name string, window int64) (n int64, ok bool) {
+	i, ok := r.byName[name]
+	if !ok {
+		return 0, false
+	}
+
+	desc := r.manifest.Columns[i]
+	if desc.Const || !desc.Blocked || !desc.Framed || !desc.HasSizing || (desc.SharedDict && !desc.TrailerDict) {
+		return 0, false
+	}
+
+	sz := desc.Sizing
+
+	n = 4 * (3*sz.NumFrames + 1 + 3*sz.NumGranules)
+	n += desc.DictRaw + (binary.MaxVarintLen32+24)*desc.DictEntries
+
+	switch {
+	case !backend.RangesNatively(ctx, r.b, columnKey(r.prefix, i)):
+		n += desc.Bytes
+	case window > 0:
+		// The window never reaches past the frames, which the object holds beside the dictionary
+		// region and the directory.
+		n += min(max(window, sz.MaxFrameBytes), max(desc.Bytes-desc.DictLen-sz.DirLen, sz.MaxFrameBytes))
+	default:
+		n += sz.MaxFrameBytes
+	}
+
+	n += 2 * (sz.MaxFrameRaw + int64(compress.OutputSlack(desc.Compress)))
+
+	// The granule count is ceil(rows / granule rows), so a granule holds fewer than rows / (count-1).
+	rows, granules := int64(r.manifest.RowCount), sz.NumGranules
+	if granules > 1 {
+		rows = rows/(granules-1) + 1
+	}
+
+	return n + rows*desc.Kind.decodedRowBytes(), true
 }
 
 // ResidentBytes bounds what a forward walk over the decoder holds at any point: the directory and

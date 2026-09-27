@@ -360,7 +360,12 @@ them. At S3 latencies that is the difference between a merge finishing and not.
   window, not two. `Decoder.ResidentBytes` bounds the whole walk from the moment the decoder opens —
   directory, shared dictionary, window (at least the largest frame, at most the column), the
   decompressed frame twice over while a larger one replaces it, and one decoded granule — so a merge
-  can charge its sources before reading a frame.
+  can charge its sources before reading a frame. `PartReader.ScanBound` bounds the same figure from
+  the manifest alone (sizing stats, the trailer dictionary's size and entry count, the granule count),
+  so a merge can reserve before it opens a column; it declines a column the manifest cannot size.
+- `WithFrameCompressors` hands a `StreamWriter` compressors for its frames alone, while dictionary
+  regions and unframed columns keep the writer's own: a frame is bounded by the compress block plus
+  one granule, so its encoder can be sized for it (`NewFrameCompressor`, a 1 MiB window).
 - A window covering the whole column collapses to a single request — `PartReader.Column` minus the
   cache write, which is the right path for the memory backend and for small parts.
 - A **frame is indivisible**: one larger than the window is served alone rather than refused, so the

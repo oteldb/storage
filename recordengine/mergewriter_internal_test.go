@@ -182,7 +182,7 @@ func checkStreamedMatchesBuffered(t *testing.T, s streamedShape) {
 	src := e.parts
 	want := rowsByStream(t, src, s.retain)
 
-	out, err := e.compactParts(ctx, src, s.retain, s.capBytes)
+	out, err := e.compactParts(ctx, src, s.retain, s.capBytes, nil)
 	require.NoError(t, err)
 
 	// Output parts of one day are sealed in order, and days do not share a timestamp, so a stable
@@ -419,7 +419,7 @@ func TestPlanMergeBlocksSameStreamBothSides(t *testing.T) {
 	src := e.parts
 	require.Len(t, src, 3)
 
-	out, err := e.compactParts(ctx, src, minInt64, 4<<10)
+	out, err := e.compactParts(ctx, src, minInt64, 4<<10, nil)
 	require.NoError(t, err)
 	require.Greater(t, len(out), 2, "the merge must seal inside the one stream more than once")
 

@@ -189,7 +189,7 @@ func benchCompact(b *testing.B, e *Engine, be backend.Backend) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		out, err := e.compactParts(ctx, src, minInt64, 0)
+		out, err := e.compactParts(ctx, src, minInt64, 0, nil)
 		if err != nil {
 			b.Fatal(err)
 		}

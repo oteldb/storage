@@ -443,6 +443,35 @@ func sharedEntriesOf(d *Decoder) [][]byte {
 	return entries
 }
 
+// TestScanBoundCoversDecoder: what the manifest bounds a scan by before it opens is at least what
+// the opened decoder reports, so memory reserved from the manifest covers the walk.
+func TestScanBoundCoversDecoder(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	vals := scanCorpus(32, 512, map[int]bool{3: true, 17: true})
+
+	r, _ := writeBytesPart(t, vals, 512, WithCompressBlockBytes(4096), WithSizingStats())
+
+	for _, window := range []int64{0, 1, 4096, 1 << 20} {
+		bound, ok := r.ScanBound(ctx, "attrs", window)
+		require.True(t, ok, "window %d", window)
+
+		scan, err := r.ColumnScan(ctx, "attrs", window)
+		require.NoError(t, err)
+
+		assert.GreaterOrEqual(t, bound, scan.ResidentBytes(), "window %d", window)
+	}
+
+	unsized, _ := writeBytesPart(t, vals, 512)
+
+	_, ok := unsized.ScanBound(ctx, "attrs", 1<<20)
+	assert.False(t, ok, "a part without sizing stats cannot be bounded from its manifest")
+
+	_, ok = r.ScanBound(ctx, "missing", 1<<20)
+	assert.False(t, ok)
+}
+
 // TestDecoderResidentBytesBoundsTheWalk: the figure a decoder reports at open covers every buffer a
 // forward walk over it grows, whatever the window.
 func TestDecoderResidentBytesBoundsTheWalk(t *testing.T) {

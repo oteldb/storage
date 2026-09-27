@@ -55,8 +55,8 @@ re-exported exemplars at ingest is its own change. Record specifics:
 - The day writers stream (§ Merge write side), so a merge across days holds a writer per open day —
   frames, dictionaries and sidecar state — never a day's rows.
 - A writer is sealed once it has taken the cap in decoded rows, and the largest open writer once the
-  writers leave less than one append's room in what the merge's admitted share leaves beside its
-  sources and encoder (§ Merge write side). Both are checked after every append — at most one output
+  writers leave less than one append's room in what the merge's grant leaves beside its sources and
+  encoder (§ Merge write side). Both are checked after every append — at most one output
   granule, and at most a quarter of the cap of one stream's rows in one day — so a part reaches at
   most 1.25× the cap, and the writers stay inside their room unless one append outgrows the reserve
   and every append before it. A retention rewrite takes its bucket's forced parts only up to the cap, so its day is about
@@ -107,10 +107,10 @@ set is read windows and writer state (§ Merge write side), and the divisor of t
 an output buffer the merge never holds. Free space does not enter; the flush cap and the tiering
 target bound the disk.
 
-A merge seals on two numbers (`mergeBounds`): the cap, per output part in decoded rows, and the
-merge's admitted share (`mergeMemoryBudgetBytes`, what `Config.MergeAdmission` reserves), of which
-its open writers get what the sources and the encoder leave (`mergeWriterBudget`). Neither bounds the
-other, and only the second is a memory bound. The
+A merge seals on two numbers: the cap, per output part in decoded rows (`mergePartBytes`), and the
+merge's grant — its share (`mergeMemoryBudgetBytes`), or what it needs if that is more, which is what
+`Config.MergeAdmission` reserves — of which its open writers get what the sources and the encoder
+leave (`mergeWriterBudget`). Neither bounds the other, and only the second is a memory bound. The
 stream union the merge walks comes from `internal/mergestream`:
 `mergestream.Keys` over each part's already-sorted `ranges`, a k-way heap rather than a map of every
 distinct stream. It collapses repeats within a part as the map did, which matters because an
@@ -250,21 +250,28 @@ the largest writer once the open ones leave less than one append's room in their
 dropped: 29.3 MiB reported, 22.1 MiB released over the memory backend, the difference being buffered
 objects counted at twice their size.
 
-**The writers get what the share leaves.** `mergeWriterBudget` takes off the admitted share what the
-sources hold from the moment they open — per column `block.Decoder.ResidentBytes` (read-ahead window,
-frame buffers, shared dictionary), or a whole decode's columns — and one encoder's workspace
-(`compress.Compressor.EncodeWorkspace`; the merge borrows one at a time). Of the rest the router keeps
-room for one append (`timebucket.Router.ReserveRun`): a writer binding every source's dictionaries,
-12 B an entry, plus one run, or the largest append so far if that is more. The writers never get
-less than two such appends, so a merge whose sources fill its share still progresses, holding more
-than the share. The one term still uncharged is the finish's transients — the bloom filters and the
-record keys encoded and read back, and the output's stream column decoded as it opens.
+**A merge reserves what it holds.** Before it opens anything, a merge bounds its sources from their
+manifests (`sourceBound`: per column `block.PartReader.ScanBound` — read-ahead window, frame buffers,
+shared dictionary, one granule — or a whole decode's columns), adds its frame encoder's workspace
+(`compress.Compressor.EncodeWorkspace`; the merge borrows one encoder at a time) and a floor of two
+appends for its writers, and reserves that through `Config.MergeAdmission` when it is more than its
+share (`mergeNeed`, `admitMerge`). A manifest that cannot bound a source (no sizing stats, a leading
+dictionary) leaves the share reserved; once the sources are open and measured the merge tops the
+grant up without waiting, since waiting while holding could deadlock two merges, and a merge that may
+wait otherwise drops its sources, hands the grant back and queues for the whole (`openGranted`); a
+background merge is deferred. `TestSourceBoundCoversOpened` holds the manifest bound at or above what
+the opened sources report. The writers get what the grant leaves beside the opened sources and the
+encoder (`mergeWriterBudget`); of that the router keeps room for one append
+(`timebucket.Router.ReserveRun`): a writer binding every source's dictionaries, 12 B an entry, plus
+one run, or the largest append so far if that is more. The one term still uncharged is the finish's
+transients — the bloom filters and record keys encoded and read back, the output's stream column
+decoded as it opens, and the encoder its whole objects go through (below).
 `TestMergeWritersHoldAdmittedShare` (8 sources × 3 dictionary columns of ~14k entries × 8 days, ZSTD,
 file backend, heap measured above the written sources): unbounded, the writers hold 85.7 MiB and the
-merge adds 99.2 MiB to the heap; at a 64 MiB share the sources and encoder are charged 44.7 MiB, the
-writers get 19.3 MiB and report at most 16.9 MiB (one append adds up to 8 MiB), and the merge adds
-33.5 MiB. The charges are bounds: the windows are charged full before a frame is read, and the
-encoder at its 8 MiB-window size while a merge compresses 64 KiB frames.
+merge adds 102–106 MiB to the heap; at a 32 MiB share the merge reserves 43.8 MiB, its writers get
+12.1 MiB and report at most 8.0 MiB — one append, which binds every source, fills the room left — and
+the merge adds 28–31 MiB (runs vary). The charges are bounds: the windows are charged full before a frame is read,
+and the manifest bounds a granule's rows from the granule count.
 
 **Sidecars are built from the same rows.** Identities and watermarks are per stream. A bloom cannot be
 sized before its column's last row, so `bloomAccum` keeps each distinct token as its probe hashes (16 B,
@@ -281,12 +288,19 @@ that differs is a dictionary column no granule of which joined: the flush sees t
 writes one unframed stream, the merge has handed its frames out and keeps a trailer column with an
 empty dictionary — which the next merge then reads by granule.
 
-**A merge shares one compressor.** Several day writers are open at once, and a zstd encoder at the best
-level holds ~24 MiB for as long as its pool keeps it, so the merge makes one compressor and hands it to
-every day writer (`block.WithCompressors`). A pool per writer held 193 MiB of encoders at the peak of
-the real 8-day log merge; the merge's one pool holds 48 MiB. It is not shared wider than the merge: a
-compressor's coders must stay inside the `testing/synctest` bubble they were built in
-(`../encoding/ARCH.md`).
+**A merge shares one frame compressor.** Several day writers are open at once, and a zstd encoder
+holds its tables and window history for as long as its pool keeps it, so the merge makes one
+compressor and hands it to every day writer for their frames (`block.WithFrameCompressors`). A pool
+per writer held 193 MiB of encoders at the peak of the real 8-day log merge, with the default 8 MiB
+window. The merge's compressor is `block.NewFrameCompressor`, whose window is 1 MiB: a frame is the
+64 KiB block plus one granule's stream, so every frame whose granule stream is under 960 KiB
+compresses to the bytes the default window gives (the merge goldens are unchanged), and a larger one
+matches no further back than 1 MiB. Its encoder is charged at 5 / 7 / 13 MiB (fast / default / best)
+against 19 / 21 / 27 MiB at the default window. A part's whole objects — its dictionary regions, a
+column written unframed, the stream id column — are not bounded by a frame, so they go through a
+compressor of the writer's own at the default window, built when the part finishes. The frame
+compressor is not shared wider than the merge: a compressor's coders must stay inside the
+`testing/synctest` bubble they were built in (`../encoding/ARCH.md`).
 
 **What it holds, measured.** `TestMergeResidentFlatInPartSize` (trace-shaped, file backend): growing
 the sources 8× (28.5 → 227.8 MiB decoded) moves the peak live heap from 16.4 to 34.3 MiB when the

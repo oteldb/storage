@@ -23,7 +23,15 @@ type gzDecoder struct{}
 
 func (gzDecoder) decodeAll(dst, src []byte) ([]byte, error) { return gozstd.Decompress(dst, src) }
 
-func newZstdEncoder(level Level) zstdEncoder {
+// minEncoderWindow is libzstd's smallest window.
+const minEncoderWindow = 1 << 10
+
+// encoderWindowBytes is the window [NewCompressor] asks for; libzstd sizes its own.
+const encoderWindowBytes = 8 << 20
+
+// newZstdEncoder ignores window: a one-shot libzstd compress of a known source size already fits
+// the context's window and tables to the source.
+func newZstdEncoder(level Level, _ int) zstdEncoder {
 	// Map the abstract level to a real libzstd level: LevelFast → 1, LevelBest → 19 (the cold tier),
 	// else → 12 (libzstd's sweet spot vs klauspost — comparable encode time, markedly better ratio on
 	// structured data; L19 is far denser but ~40× slower, so it fits only cold recompression).
@@ -40,9 +48,9 @@ func newZstdEncoder(level Level) zstdEncoder {
 }
 
 // zstdEncodeWorkspace is a libzstd compression context at the mapped level. It is C memory, outside
-// the Go heap and GOMEMLIMIT, and unlike the klauspost figures these are not measured: they are
-// round figures meant to sit above a context's window and tables at each level.
-func zstdEncodeWorkspace(level Level) int64 {
+// the Go heap and GOMEMLIMIT, which the heap measurements behind the klauspost figures cannot see, so
+// these are round figures meant to sit above a context's window and tables at each level, unmeasured.
+func zstdEncodeWorkspace(level Level, _ int) int64 {
 	switch {
 	case level == LevelFast:
 		return 4 << 20

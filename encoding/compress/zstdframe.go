@@ -24,7 +24,7 @@ type ZSTDFramer struct {
 // NewZSTDFramer returns a [ZSTDFramer] compressing at the given level.
 func NewZSTDFramer(level Level) *ZSTDFramer {
 	f := &ZSTDFramer{}
-	f.encPool = sync.Pool{New: func() any { return newZstdEncoder(level) }}
+	f.encPool = sync.Pool{New: func() any { return newZstdEncoder(level, encoderWindowBytes) }}
 	f.decPool = sync.Pool{New: func() any { return newZstdStreamDecoder() }}
 
 	return f

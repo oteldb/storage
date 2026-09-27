@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/timebucket"
@@ -152,7 +153,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 
 	// Past here the merge reads the selected parts and writes its output, so this is where its memory
 	// allowance must be one it actually holds rather than one it assumed.
-	release, admitted, err := e.admitMerge(ctx, opts.Background)
+	grant, admitted, err := e.admitMerge(ctx, selected, capBytes, opts.Background)
 	if err != nil {
 		e.mergeDeferred.Store(false)
 
@@ -160,20 +161,12 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	}
 
 	if !admitted {
-		// Remembered so the facade can order this engine first next cycle; see the metric engine.
-		e.mergeDeferred.Store(true)
-		e.cfg.Obs.Merge.Deferred(ctx, e.cfg.Signal)
-		zctx.From(ctx).Debug("merge deferred; the process merge budget is fully committed",
-			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
-			zap.Int("selected", len(selected)))
-		e.reclaimRetired(ctx)
-
-		return mergeResult{deferred: true, parts: dropped}, nil
+		return e.deferMerge(ctx, dropped, len(selected)), nil
 	}
 
 	e.mergeDeferred.Store(false)
 
-	defer release()
+	defer grant.done()
 
 	start := minInt64
 	if retainFrom > 0 {
@@ -185,7 +178,11 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	// they cannot be reclaimed underneath this read.
 	bytesIn := partsBytes(selected)
 
-	newParts, err := e.compactParts(ctx, selected, start, capBytes)
+	newParts, err := e.compactParts(ctx, selected, start, capBytes, grant)
+	if errors.Is(err, errMergeDeclined) {
+		return e.deferMerge(ctx, dropped, len(selected)), nil
+	}
+
 	if err != nil {
 		return mergeResult{parts: dropped}, err
 	}
@@ -228,6 +225,19 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	e.reclaimRetired(ctx)
 
 	return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, nil
+}
+
+// deferMerge records a merge the process merge budget could not admit. It is remembered so the
+// facade can order this engine first next cycle; see the metric engine.
+func (e *Engine) deferMerge(ctx context.Context, dropped, selected int) mergeResult {
+	e.mergeDeferred.Store(true)
+	e.cfg.Obs.Merge.Deferred(ctx, e.cfg.Signal)
+	zctx.From(ctx).Debug("merge deferred; the process merge budget is fully committed",
+		zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
+		zap.Int("selected", selected))
+	e.reclaimRetired(ctx)
+
+	return mergeResult{deferred: true, parts: dropped}
 }
 
 // mergeResult is what one merge moved: the source parts it compacted (including those retention
@@ -353,16 +363,23 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 // writer per day ([timebucket.Router]) that encodes them as they arrive
 // ([recordPartStreamWriter]). A writer is sealed once it has taken capBytes of decoded rows, checked
 // after every append of at most a granule, so a part overshoots it by at most one append; the largest
-// open writer is sealed once the writers leave less room than one append in what the merge's
-// admitted share has left beside its sources and coders ([mergeWriterBudget]). A stream may continue
-// in the next part, and the merge never holds a stream or a part.
+// open writer is sealed once the writers leave less room than one append in what the merge's grant
+// has left beside its sources and encoder ([mergeWriterBudget]). A stream may continue in the next
+// part, and the merge never holds a stream or a part. A nil grant is the one [Engine.admitMerge]
+// would reserve, taken with no admission.
 // When the engine has a side store (profiles) the cap does not split a day, but the resident bound
 // still can, and every part it writes carries the symbols its own rows reach. Returns the new parts
 // (empty when retention dropped every record). Reads the parts off the engine lock; src is the
 // immutable snapshot the caller planned over.
-func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes int64) ([]*part, error) {
+func (e *Engine) compactParts(
+	ctx context.Context, src []*part, start, capBytes int64, grant *mergeGrant,
+) ([]*part, error) {
+	if grant == nil {
+		grant = &mergeGrant{bytes: e.mergeGrantBytes(ctx, src, capBytes)}
+	}
+
 	for {
-		out, err := e.compactStreamed(ctx, src, start, capBytes)
+		out, err := e.compactStreamed(ctx, src, start, capBytes, grant)
 
 		var disorder *sourceDisorderError
 		if !errors.As(err, &disorder) {
@@ -382,20 +399,20 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 
 // compactStreamed is one attempt at [Engine.compactParts]. On a [sourceDisorderError] it returns the
 // parts it had already sealed with the error.
-func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capBytes int64) ([]*part, error) {
-	bounds := e.mergeBounds(capBytes)
+func (e *Engine) compactStreamed(
+	ctx context.Context, src []*part, start, capBytes int64, grant *mergeGrant,
+) ([]*part, error) {
+	partBytes := e.mergePartBytes(capBytes)
+	runBytes := partBytes / mergeRunFraction
 
-	// One compressor for every day writer of the merge: a zstd encoder at the best level holds
-	// ~24 MiB while its pool keeps it, and a pool per writer keeps one per open day.
-	comp := compress.NewCompressor(e.cfg.MergeCompression, e.cfg.MergeCompressionLevel)
+	// One frame compressor for every day writer of the merge: a pool per writer would keep an
+	// encoder per open day.
+	comp := block.NewFrameCompressor(e.cfg.MergeCompression, e.cfg.MergeCompressionLevel)
 
-	sources, err := e.openMergeSources(ctx, src)
+	sources, writerLimit, appendReserve, err := e.openGranted(ctx, src, grant, comp, runBytes)
 	if err != nil {
 		return nil, err
 	}
-
-	runBytes := bounds.partBytes / mergeRunFraction
-	writerLimit, appendReserve := mergeWriterBudget(bounds.residentBytes, sources, comp, runBytes)
 
 	var newParts []*part
 
@@ -451,7 +468,7 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 					return false, err
 				}
 
-				return bounds.partBytes > 0 && w.decodedBytes() >= bounds.partBytes, nil
+				return partBytes > 0 && w.decodedBytes() >= partBytes, nil
 			})
 			if err != nil {
 				return newParts, err
@@ -469,15 +486,54 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 
 	if mergeResidentObserver != nil {
 		peak, run := router.Peak()
-		mergeResidentObserver(peak, run, writerLimit)
+		mergeResidentObserver(peak, run, writerLimit, grant.bytes)
 	}
 
 	return newParts, nil
 }
 
 // mergeResidentObserver, when non-nil, receives after each merge the most its open writers held in
-// RAM together, the most one append added, and what the writers were limited to. Test seam only.
-var mergeResidentObserver func(peak, run, limit int64)
+// RAM together, the most one append added, what the writers were limited to, and the merge's grant.
+// Test seam only.
+var mergeResidentObserver func(peak, run, limit, grant int64)
+
+// openGranted opens the merge's sources and splits its grant ([mergeWriterBudget]). The grant was
+// reserved from the sources' manifests, which cover what they open to; a source its manifest could
+// not bound may leave it short, and the merge then tops it up without waiting, or — when it may wait
+// — drops the sources, hands the grant back and queues for the whole, so it holds nothing it was not
+// granted while it waits. One that may not wait is declined.
+func (e *Engine) openGranted(
+	ctx context.Context, src []*part, grant *mergeGrant, comp *compress.Compressor, runBytes int64,
+) (sources []mergeSource, limit, reserve int64, err error) {
+	for {
+		if sources, err = e.openMergeSources(ctx, src); err != nil {
+			return nil, 0, 0, err
+		}
+
+		limit, reserve, need := mergeWriterBudget(grant.bytes, sources, comp, runBytes)
+		if grant.bytes == 0 || need <= grant.bytes {
+			return sources, limit, reserve, nil
+		}
+
+		topped, err := grant.top(ctx, need-grant.bytes)
+		switch {
+		case err != nil:
+			return nil, 0, 0, err
+		case topped:
+			limit, reserve, _ = mergeWriterBudget(grant.bytes, sources, comp, runBytes)
+
+			return sources, limit, reserve, nil
+		case !grant.wait:
+			return nil, 0, 0, errMergeDeclined
+		}
+
+		sources = nil
+
+		if err := grant.regrant(ctx, need); err != nil {
+			return nil, 0, 0, err
+		}
+	}
+}
 
 // mergeRunFraction is how much of the part bound one append to a day's writer may add before the
 // writer is checked against it: a part reaches at most the bound plus this share of it, however many

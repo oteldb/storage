@@ -42,9 +42,11 @@ type partConfig struct {
 	rollup        *Rollup
 
 	// given are compressors the caller hands in to share across writers; comps is what this writer
-	// compresses through, per algorithm.
-	given []*compress.Compressor
-	comps map[compress.Algorithm]*compress.Compressor
+	// compresses through, per algorithm. givenFrames are the ones a [StreamWriter] compresses its
+	// frames through instead.
+	given       []*compress.Compressor
+	comps       map[compress.Algorithm]*compress.Compressor
+	givenFrames []*compress.Compressor
 }
 
 func newPartConfig(opts []PartOption) partConfig {
@@ -111,6 +113,28 @@ func WithCompressionLevel(level compress.Level) PartOption {
 func WithCompressors(cs ...*compress.Compressor) PartOption {
 	return func(c *partConfig) { c.given = append(c.given, cs...) }
 }
+
+// WithFrameCompressors makes a [StreamWriter] compress its columns' frames through cs, where one
+// matches a column's algorithm and the writer's level; whole objects — a dictionary region, a
+// column written unframed — still go through [WithCompressors] or the writer's own. A frame is
+// bounded where those are not, so its encoder can be sized for it ([NewFrameCompressor]).
+func WithFrameCompressors(cs ...*compress.Compressor) PartOption {
+	return func(c *partConfig) { c.givenFrames = append(c.givenFrames, cs...) }
+}
+
+// NewFrameCompressor returns a compressor sized for the frames a writer seals at the default
+// compression block size. A frame seals at the first granule that takes it past the block size, so
+// it is the block plus at most one granule's stream; frameCompressorInput covers that for granule
+// streams of up to 960 KiB, and a frame that fits compresses to the same bytes a default
+// compressor's would.
+func NewFrameCompressor(alg compress.Algorithm, level compress.Level) *compress.Compressor {
+	return compress.NewFrameCompressor(alg, level, frameCompressorInput)
+}
+
+// frameCompressorInput is the frame a [NewFrameCompressor] is sized for. A zstd encoder's tables do
+// not shrink with the window, so a window this size costs little over a 128 KiB one, and saves
+// the history of the default 8 MiB window.
+const frameCompressorInput = 1 << 20
 
 // WithSharedDictBytes caps the resident size of a bytes column's shared dictionary: its entries'
 // bytes plus a fixed per-entry overhead (default 32 MiB). A granule whose new values would pass the
@@ -194,6 +218,18 @@ func (c *partConfig) compressorFor(alg compress.Algorithm) *compress.Compressor 
 	c.comps[alg] = comp
 
 	return comp
+}
+
+// frameCompressorFor returns the compressor frames of alg go through: a matching one handed in
+// ([WithFrameCompressors]), else [partConfig.compressorFor]'s.
+func (c *partConfig) frameCompressorFor(alg compress.Algorithm) *compress.Compressor {
+	for _, g := range c.givenFrames {
+		if g.Algorithm() == alg && g.Level() == c.level {
+			return g
+		}
+	}
+
+	return c.compressorFor(alg)
 }
 
 // builtPart is the in-memory serialized form of a part: one object per column (nil for

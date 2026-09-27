@@ -61,7 +61,7 @@ func BenchmarkMergeStraddlers17Days(b *testing.B) {
 		writers, limit int64
 	)
 
-	defer recordengine.SetMergeResidentObserver(func(p, _, l int64) { writers, limit = max(writers, p), l })()
+	defer recordengine.SetMergeResidentObserver(func(p, _, l, _ int64) { writers, limit = max(writers, p), l })()
 
 	ctx := context.Background()
 

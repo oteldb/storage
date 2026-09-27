@@ -78,7 +78,8 @@ type sourceBindings struct {
 }
 
 // newRecordPartStreamWriter starts an output part of a merge over src. comp, when non-nil, is the
-// merge's compressor, which all its day writers share.
+// merge's frame compressor, which all its day writers share; the part's whole objects go through
+// compressors of the writer's own.
 func newRecordPartStreamWriter(
 	ctx context.Context, e *Engine, src []*part, comp *compress.Compressor,
 ) (*recordPartStreamWriter, error) {
@@ -93,7 +94,7 @@ func newRecordPartStreamWriter(
 	}
 
 	if comp != nil {
-		opts = append(opts, block.WithCompressors(comp))
+		opts = append(opts, block.WithFrameCompressors(comp))
 	}
 
 	w := &recordPartStreamWriter{

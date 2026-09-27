@@ -132,6 +132,7 @@ func (w *StreamWriter) AddColumn(c Column) error {
 		alg = w.defaultComp
 	}
 
+	frames := w.frameCompressorFor(alg)
 	sc := &streamColumn{
 		name:    c.Name,
 		kind:    c.Kind,
@@ -168,11 +169,11 @@ func (w *StreamWriter) AddColumn(c Column) error {
 			}
 
 			sc.codec = chunk.CodecGorilla
-			sc.alt = newBlockAccum(sc.comp, w.compressBytes)
+			sc.alt = newBlockAccum(frames, w.compressBytes)
 			sc.altOK = true
 		}
 
-		sc.blk = newBlockAccum(sc.comp, w.compressBytes)
+		sc.blk = newBlockAccum(frames, w.compressBytes)
 		sc.open = w.objectOpener(len(w.cols))
 	case KindBytes:
 		if !c.Block {
@@ -184,7 +185,7 @@ func (w *StreamWriter) AddColumn(c Column) error {
 		}
 
 		sc.bytes = newStreamBytes(codec == chunk.CodecBytesRaw, c.Observer, w.dictCap)
-		sc.blk = newBlockAccum(sc.comp, w.compressBytes)
+		sc.blk = newBlockAccum(frames, w.compressBytes)
 		sc.open = w.objectOpener(len(w.cols))
 	default:
 		return errors.Errorf("block: column %q: kind %s is not streamable; use PartWriter", c.Name, c.Kind)
