@@ -504,7 +504,7 @@ func TestFinishRefusesEmptyPart(t *testing.T) {
 	be := backend.Memory()
 	e := New(Config{Schema: headTestSchema, Backend: be, Prefix: "t/empty"})
 
-	w, err := newRecordPartStreamWriter(context.Background(), e, nil)
+	w, err := newRecordPartStreamWriter(context.Background(), e, nil, nil)
 	require.NoError(t, err)
 
 	_, err = w.finish(context.Background())

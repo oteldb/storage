@@ -103,7 +103,7 @@ func TestRecordPartWriterResidentTracksHeap(t *testing.T) {
 	sources, err := e.openMergeSources(ctx, src)
 	require.NoError(t, err)
 
-	w, err := newRecordPartStreamWriter(ctx, e, src)
+	w, err := newRecordPartStreamWriter(ctx, e, src, nil)
 	require.NoError(t, err)
 
 	var (

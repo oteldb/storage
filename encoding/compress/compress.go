@@ -61,12 +61,17 @@ const (
 
 // Compressor is a pooled, append-style compressor. It is safe for concurrent use
 // (each Compress/Decompress call borrows a pooled encoder/decoder).
+//
+// A zstd encoder or decoder hands work between its goroutines over channels made when it is built,
+// so one built inside a testing/synctest bubble must not be used outside it. The pools are therefore
+// per Compressor, never package-level: a Compressor's coders are only ever used where it is.
 type Compressor struct {
-	alg     Algorithm
-	level   Level
-	encPool sync.Pool // *zstd.Encoder
-	decPool sync.Pool // *zstd.Decoder
-	lz4Pool sync.Pool // *lz4.Compressor (not safe for concurrent use, so pooled)
+	alg       Algorithm
+	level     Level
+	encPool   sync.Pool // *zstd.Encoder
+	decPool   sync.Pool // *zstd.Decoder
+	limitPool sync.Pool // *zstd.Decoder with a capped DecodeAll, for DecompressLimit
+	lz4Pool   sync.Pool // *lz4.Compressor (not safe for concurrent use, so pooled)
 }
 
 // NewCompressor returns a [Compressor] for the given algorithm and level. Level is
@@ -75,31 +80,9 @@ func NewCompressor(alg Algorithm, level Level) *Compressor {
 	c := &Compressor{alg: alg, level: level}
 	c.encPool = sync.Pool{New: c.newEncoder}
 	c.decPool = sync.Pool{New: c.newDecoder}
+	c.limitPool = sync.Pool{New: newLimitDecoder}
 	c.lz4Pool = sync.Pool{New: func() any { return &lz4.Compressor{} }}
 	return c
-}
-
-// shared holds one [Compressor] per algorithm and level for the whole process.
-var shared sync.Map // compressorKey → *Compressor
-
-type compressorKey struct {
-	alg   Algorithm
-	level Level
-}
-
-// Shared returns the process-wide [Compressor] for alg and level, so every writer in the process
-// borrows its encoders from one pool. A zstd encoder holds its window and hash tables — tens of MiB at
-// the best level — for as long as its pool keeps it, so a pool per writer costs that once per writer
-// open at the same time.
-func Shared(alg Algorithm, level Level) *Compressor {
-	key := compressorKey{alg: alg, level: level}
-	if c, ok := shared.Load(key); ok {
-		return c.(*Compressor)
-	}
-
-	c, _ := shared.LoadOrStore(key, NewCompressor(alg, level))
-
-	return c.(*Compressor)
 }
 
 // Algorithm returns the compressor's algorithm.

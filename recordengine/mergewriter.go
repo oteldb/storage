@@ -70,7 +70,11 @@ type sourceBindings struct {
 	stableGen, framedGen block.DictGen
 }
 
-func newRecordPartStreamWriter(ctx context.Context, e *Engine, src []*part) (*recordPartStreamWriter, error) {
+// newRecordPartStreamWriter starts an output part of a merge over src. comp, when non-nil, is the
+// merge's compressor, which all its day writers share.
+func newRecordPartStreamWriter(
+	ctx context.Context, e *Engine, src []*part, comp *compress.Compressor,
+) (*recordPartStreamWriter, error) {
 	schema := e.cfg.Schema
 	opts := []block.PartOption{
 		block.WithSortKey(colTs), block.WithSizingStats(), block.WithGranuleSize(e.mergeGranule),
@@ -79,6 +83,10 @@ func newRecordPartStreamWriter(ctx context.Context, e *Engine, src []*part) (*re
 	if e.cfg.MergeCompression != compress.AlgorithmNone {
 		opts = append(opts, block.WithCompression(e.cfg.MergeCompression),
 			block.WithCompressionLevel(e.cfg.MergeCompressionLevel))
+	}
+
+	if comp != nil {
+		opts = append(opts, block.WithCompressors(comp))
 	}
 
 	w := &recordPartStreamWriter{

@@ -39,6 +39,11 @@ type partConfig struct {
 	level         compress.Level
 	dictCap       int64
 	sizing        bool
+
+	// given are compressors the caller hands in to share across writers; comps is what this writer
+	// compresses through, per algorithm.
+	given []*compress.Compressor
+	comps map[compress.Algorithm]*compress.Compressor
 }
 
 func newPartConfig(opts []PartOption) partConfig {
@@ -99,6 +104,13 @@ func WithCompressionLevel(level compress.Level) PartOption {
 	return func(c *partConfig) { c.level = level }
 }
 
+// WithCompressors makes the writer compress through cs, where one matches a column's algorithm and
+// the writer's level, instead of a compressor of its own — so writers open at once share one set of
+// pooled encoders. A zstd encoder at the best level holds tens of MiB while its pool keeps it.
+func WithCompressors(cs ...*compress.Compressor) PartOption {
+	return func(c *partConfig) { c.given = append(c.given, cs...) }
+}
+
 // WithSharedDictBytes caps the resident size of a bytes column's shared dictionary: its entries'
 // bytes plus a fixed per-entry overhead (default 32 MiB). A granule whose new values would pass the
 // cap self-encodes instead of joining. n is clamped to [0, 64 MiB], the format's ceiling.
@@ -147,8 +159,32 @@ func (w *PartWriter) AddColumn(c Column) error {
 	return nil
 }
 
-func (w *PartWriter) compressorFor(alg compress.Algorithm) *compress.Compressor {
-	return compress.Shared(alg, w.level)
+// compressorFor returns the compressor for alg at the writer's level: a matching one the caller
+// handed in ([WithCompressors]), else one of the writer's own.
+func (c *partConfig) compressorFor(alg compress.Algorithm) *compress.Compressor {
+	if comp, ok := c.comps[alg]; ok {
+		return comp
+	}
+
+	var comp *compress.Compressor
+
+	for _, g := range c.given {
+		if g.Algorithm() == alg && g.Level() == c.level {
+			comp = g
+		}
+	}
+
+	if comp == nil {
+		comp = compress.NewCompressor(alg, c.level)
+	}
+
+	if c.comps == nil {
+		c.comps = make(map[compress.Algorithm]*compress.Compressor)
+	}
+
+	c.comps[alg] = comp
+
+	return comp
 }
 
 // builtPart is the in-memory serialized form of a part: one object per column (nil for

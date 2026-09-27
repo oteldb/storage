@@ -265,10 +265,12 @@ that differs is a dictionary column no granule of which joined: the flush sees t
 writes one unframed stream, the merge has handed its frames out and keeps a trailer column with an
 empty dictionary — which the next merge then reads by granule.
 
-**Compressors are process-wide.** Several day writers are open at once, and a zstd encoder at the best
-level holds ~24 MiB for as long as its pool keeps it, so every writer draws encoders from one pool per
-level (`compress.Shared`). A pool per writer held 193 MiB of encoders at the peak of the real 8-day log
-merge.
+**A merge shares one compressor.** Several day writers are open at once, and a zstd encoder at the best
+level holds ~24 MiB for as long as its pool keeps it, so the merge makes one compressor and hands it to
+every day writer (`block.WithCompressors`). A pool per writer held 193 MiB of encoders at the peak of
+the real 8-day log merge; the merge's one pool holds 48 MiB. It is not shared wider than the merge: a
+compressor's coders must stay inside the `testing/synctest` bubble they were built in
+(`../encoding/ARCH.md`).
 
 **What it holds, measured.** `TestMergeResidentFlatInPartSize` (trace-shaped, file backend): growing
 the sources 8× (28.5 → 227.8 MiB decoded) moves the peak live heap from 16.4 to 34.3 MiB when the

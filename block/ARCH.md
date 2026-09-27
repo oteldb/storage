@@ -204,9 +204,9 @@ part incrementally: the schema is declared up front, rows arrive through `Append
 `AppendFloat64` / `AppendU128Run` / `AppendBytes` / `AppendBytesBlob` / a `Binding`, and each column
 encodes a granule as soon as one fills. Only one
 granule of raw rows per column is ever resident, so the writer's working set is the *encoded* part
-rather than its uncompressed rows. Both writers compress through the process-wide
-`compress.Shared` compressors, so writers open at the same time share one encoder pool. Output is byte-identical to `PartWriter`'s from the same rows,
-tested case-by-case and by fuzz.
+rather than its uncompressed rows. Each writer compresses through compressors of its own unless the
+caller hands it some (`WithCompressors`), which is how writers open at once share one encoder pool.
+Output is byte-identical to `PartWriter`'s from the same rows, tested case-by-case and by fuzz.
 
 `NewStreamWriter` still holds **the whole encoded part**, and `build` then serializes each column's
 frames into one buffer, so its peak is about twice the part it is producing (`blockAccum.finish`

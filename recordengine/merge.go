@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/timebucket"
 )
@@ -382,6 +383,10 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes 
 func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capBytes int64) ([]*part, error) {
 	bounds := e.mergeBounds(capBytes)
 
+	// One compressor for every day writer of the merge: a zstd encoder at the best level holds
+	// ~24 MiB while its pool keeps it, and a pool per writer keeps one per open day.
+	comp := compress.NewCompressor(e.cfg.MergeCompression, e.cfg.MergeCompressionLevel)
+
 	sources, err := e.openMergeSources(ctx, src)
 	if err != nil {
 		return nil, err
@@ -390,7 +395,9 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 	var newParts []*part
 
 	router := timebucket.Router[*recordPartStreamWriter]{
-		Open: func(int64) (*recordPartStreamWriter, error) { return newRecordPartStreamWriter(ctx, e, src) },
+		Open: func(int64) (*recordPartStreamWriter, error) {
+			return newRecordPartStreamWriter(ctx, e, src, comp)
+		},
 		Finish: func(w *recordPartStreamWriter) error {
 			p, err := w.finish(ctx)
 			if err != nil {

@@ -366,10 +366,6 @@ func (w *StreamWriter) build() (builtPart, error) {
 	return builtPart{objects: objects, marks: encodedMarks, manifest: m.Encode(nil)}, nil
 }
 
-func (w *StreamWriter) compressorFor(alg compress.Algorithm) *compress.Compressor {
-	return compress.Shared(alg, w.level)
-}
-
 func (w *StreamWriter) column(i int, want Kind) (*streamColumn, error) {
 	if i < 0 || i >= len(w.cols) {
 		return nil, errors.Errorf("block: column %d out of range [0,%d)", i, len(w.cols))
