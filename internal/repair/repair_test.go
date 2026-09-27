@@ -3,6 +3,7 @@ package repair
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"testing"
@@ -313,14 +314,30 @@ func TestAdmit(t *testing.T) {
 	ctx := context.Background()
 	members := group("f", 10, 3, bucketindex.Blocks(1))
 
-	unit := func(prefix string, hole, held bool, entries ...bucketindex.Entry) Unit {
+	unitOf := func(w bucketindex.Want, hole, held bool, entries ...bucketindex.Entry) Unit {
 		u := make(Unit, 0, len(entries))
-		u = append(u, Result{Target: Target{Want: want(prefix, 1), Hole: hole}, Entry: entries[0], Held: held})
+		u = append(u, Result{Target: Target{Want: w, Hole: hole}, Entry: entries[0], Held: held})
 		for _, ent := range entries[1:] {
 			u = append(u, Result{Target: Target{Want: bucketindex.Want{Blocks: ent.Blocks}, Member: true}, Entry: ent})
 		}
 
 		return u
+	}
+
+	unit := func(prefix string, hole, held bool, entries ...bucketindex.Entry) Unit {
+		return unitOf(want(prefix, 1), hole, held, entries...)
+	}
+
+	final := func(live, got []bucketindex.Entry, retired map[string]struct{}) []string {
+		var out []string
+
+		for _, e := range slices.Concat(live, got) {
+			if _, ok := retired[e.Prefix]; !ok {
+				out = append(out, e.Prefix)
+			}
+		}
+
+		return out
 	}
 
 	opener := func(bad ...string) (func(*Result) error, *[]string) {
@@ -343,7 +360,7 @@ func TestAdmit(t *testing.T) {
 		var stats bucketindex.RepairStats
 
 		open, opened := opener()
-		got := Admit(ctx, nil, []Unit{unit("a", false, false, members...)}, open, &stats)
+		got, _ := Admit(ctx, nil, []Unit{unit("a", false, false, members...)}, open, &stats)
 
 		assert.Equal(t, members, got)
 		assert.Equal(t, []string{"f00", "f01", "f02"}, *opened)
@@ -357,7 +374,7 @@ func TestAdmit(t *testing.T) {
 
 		plain := bucketindex.Entry{Prefix: "b", Blocks: bucketindex.Blocks(5)}
 		open, _ := opener("f02")
-		got := Admit(ctx, nil, []Unit{
+		got, _ := Admit(ctx, nil, []Unit{
 			unit("a", false, false, members...),
 			unit("b", false, false, plain),
 		}, open, &stats)
@@ -373,7 +390,7 @@ func TestAdmit(t *testing.T) {
 		var stats bucketindex.RepairStats
 
 		open, _ := opener()
-		got := Admit(ctx, nil, []Unit{unit("a", false, false, members[:2]...)}, open, &stats)
+		got, _ := Admit(ctx, nil, []Unit{unit("a", false, false, members[:2]...)}, open, &stats)
 
 		assert.Empty(t, got)
 		assert.Equal(t, int64(2), stats.Failed)
@@ -389,16 +406,110 @@ func TestAdmit(t *testing.T) {
 		phantom := bucketindex.Entry{Prefix: "x", Blocks: bucketindex.Blocks(2)}
 
 		open, opened := opener("x")
-		got := Admit(ctx, live, []Unit{
+		got, retired := Admit(ctx, live, []Unit{
 			unit("a", false, false, members...),
 			unit("b", false, true, succ),
 			unit("c", true, false, phantom),
 		}, open, &stats)
 
-		assert.Equal(t, []bucketindex.Entry{members[1], members[2], succ}, got)
+		assert.Equal(t, []bucketindex.Entry{succ}, got, "the successor holds every member's rows")
+		assert.Equal(t, []string{"s"}, final(live, got, retired),
+			"block 1 is live once, not as the group and the successor")
 		assert.Equal(t, []string{"f01", "f02", "s"}, *opened, "a live part is not opened again")
-		assert.Equal(t, bucketindex.RepairStats{Fetched: 2, Local: 1, Revoked: 1}, stats,
+		assert.Equal(t, bucketindex.RepairStats{Local: 1, Revoked: 1}, stats,
 			"only parts published count, and a copy the commit already covers is no failure")
+	})
+
+	// A part covering only some of a group's claim overlaps every member and replaces none: the
+	// commit keeps one of the two representations, whichever order the units come in.
+	t.Run("PartialSuccessor", func(t *testing.T) {
+		t.Parallel()
+
+		wide := group("g", 20, 2, bucketindex.Interval{Min: 1, Max: 2})
+		part := bucketindex.Entry{Prefix: "p", Blocks: bucketindex.Interval{Min: 2, Max: 3}, Level: 2}
+		units := []Unit{
+			unit("a", false, false, wide...),
+			unitOf(want("b", 3), false, false, part),
+		}
+
+		for _, tc := range []struct {
+			name string
+			live []bucketindex.Entry
+			want []bucketindex.Entry
+		}{
+			{"MemberLive", wide[:1], wide[1:]},
+			{"NothingLive", nil, wide},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				for _, order := range [][]Unit{units, {units[1], units[0]}} {
+					var stats bucketindex.RepairStats
+
+					open, _ := opener()
+					got, _ := Admit(ctx, tc.live, order, open, &stats)
+
+					assert.ElementsMatch(t, tc.want, got)
+					assert.Equal(t, int64(1), stats.Failed, "the part left out is counted")
+				}
+			})
+		}
+	})
+
+	t.Run("SuccessorAtTheGroupsLevel", func(t *testing.T) {
+		t.Parallel()
+
+		var stats bucketindex.RepairStats
+
+		rival := bucketindex.Entry{Prefix: "r", Blocks: bucketindex.Interval{Min: 1, Max: 2}, Level: 1}
+		open, _ := opener()
+		got, _ := Admit(ctx, members[:1], []Unit{
+			unit("a", false, false, members...),
+			unit("b", false, false, rival),
+		}, open, &stats)
+
+		assert.Equal(t, members[1:], got, "neither replaces the other, and the group is partly live already")
+	})
+
+	// The outer group's claim is carried only by members the commit leaves out, yet it is what
+	// relates the successor to the live inner group.
+	t.Run("NestedGroup", func(t *testing.T) {
+		t.Parallel()
+
+		inner := group("g", 20, 2, bucketindex.Blocks(7, 12))
+		for i := range inner {
+			inner[i].Level = 2
+		}
+
+		for _, tc := range []struct {
+			name    string
+			blocks  bucketindex.Interval
+			got     []bucketindex.Entry
+			retired []string
+		}{
+			{"Whole", bucketindex.Blocks(1, 2, 7), nil, []string{"g00", "g01"}},
+			{"WithoutBlock7", bucketindex.Blocks(1, 2), members[:2], nil},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				var stats bucketindex.RepairStats
+
+				succ := bucketindex.Entry{Prefix: "s", Blocks: tc.blocks, Level: 3}
+				if tc.got == nil {
+					tc.got = []bucketindex.Entry{succ}
+				}
+
+				open, _ := opener()
+				got, retired := Admit(ctx, inner, []Unit{
+					unit("a", false, false, members[:2]...),
+					unit("b", false, false, succ),
+				}, open, &stats)
+
+				assert.Equal(t, tc.got, got)
+				assert.ElementsMatch(t, tc.retired, slices.Collect(maps.Keys(retired)))
+			})
+		}
 	})
 }
 

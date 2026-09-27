@@ -413,7 +413,7 @@ is on disk (the manifest lands last, so its presence is a complete copy) stays u
 the part itself, states a tombstone for it, or holds a live entry whose identity subsumes it
 (`Entry.Supersedes` — a merge output covers the union of the blocks its inputs covered and nothing
 else, at a higher level, so containment is a statement about which parts were consumed and the rows
-are inside it). An omission is not an account: a part the peer neither names nor explains is one this
+are inside it; a split member is subsumed by an entry covering its group's whole claim). An omission is not an account: a part the peer neither names nor explains is one this
 node holds the only copy of, and installing that index verbatim would leave the rows unreachable
 while the deletion rule below withholds the bytes — unreclaimable at the same time. Containment is
 what keeps this from resurrecting compacted parts forever; it is the same evidence a repair accepts

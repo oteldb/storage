@@ -225,20 +225,27 @@ func (c Claim) Valid() bool { return c.Blocks.Valid() && c.Group.Valid() }
 // Equal reports whether c and o name the same ancestry and the same group.
 func (c Claim) Equal(o Claim) bool { return c.Blocks.Equal(o.Blocks) && c.Group.Equal(o.Group) }
 
-// Supersedes reports whether e's data wholly subsumes o's: e covers every block o covers, and sits
-// at a higher merge level. It is decidable from identity alone — no index comparison, no
-// bookkeeping — which is what lets a repair terminate: by the time a want is serviced the data may
-// exist only inside a merged successor, and that successor has to count as satisfaction.
+// Supersedes reports whether e's data wholly subsumes o's: e sits at a higher merge level and
+// covers every block o covers, or, for a split-group member, the whole ancestry its group claims.
+// It is decidable from identity alone — no index comparison, no bookkeeping — which is what lets a
+// repair terminate: by the time a want is serviced the data may exist only inside a merged
+// successor, and that successor has to count as satisfaction.
 //
-// It is a single-part relation on purpose. A split merge's fragment covers only its own fresh
-// blocks and supersedes nothing, however much of an input it happens to hold; the group's joint
-// claim is resolved against a whole index by [Index.Satisfying], never here.
+// A split merge's fragment covers only its own fresh blocks and supersedes nothing, however much of
+// an input it happens to hold; the group's joint claim is resolved against a whole index by
+// [Index.Satisfying], never here. A member of a group split again reaches the outer group's claim
+// only through claims other entries carry, which [Lineage.Subsumes] resolves over a set of entries.
 //
 // A part written before format v5 carries no interval, so it neither supersedes nor is superseded
 // by anything; wants naming it fall back to exact-prefix matching until a merge rewrites it with
 // an interval.
 func (e Entry) Supersedes(o Entry) bool {
-	return e.Blocks.Contains(o.Blocks) && e.Level > o.Level
+	var own Lineage
+	if o.Claim.Valid() {
+		own = Lineage{o.Claim}
+	}
+
+	return own.Subsumes(e, o)
 }
 
 // NextBlock returns the block number the next part committed to this index takes: one above the
@@ -364,7 +371,7 @@ func (ix *Index) satisfying(w Want, admit func(Entry) bool) (Entry, bool) {
 			return e, true
 		}
 
-		if !e.Blocks.Contains(w.Blocks) {
+		if !e.Blocks.Contains(w.Blocks) && !e.Supersedes(w.Entry()) {
 			continue
 		}
 
@@ -500,18 +507,22 @@ func (e Entry) Complete(entries []Entry) bool {
 	return (&Index{Entries: entries}).Covered().Contains(e.Claim.Group)
 }
 
-// Subsumed returns the prefixes among live whose rows are wholly inside the parts added: one that
-// supersedes them outright, or a split group the addition completes, whose joint claim covers them.
-//
-// The group case is what [Entry.Supersedes] alone cannot give. A repair that brings back the last
-// member of a split makes the whole group's ancestry present, and the parts that ancestry covers
-// would otherwise stay live beside it and have their rows read twice.
+// Subsumed is [Lineage.Subsumed] over the lineage live and added record themselves.
 func Subsumed(live, added []Entry) map[string]struct{} {
+	return LineageOf(slices.Concat(live, added)).Subsumed(live, added)
+}
+
+// Subsumed returns the prefixes among live whose rows are wholly inside the parts added: one added
+// part holds them at a higher level, or a split group the addition completes claims them.
+//
+// Either direction left out keeps two representations of one set of rows live: a part holding a
+// group's whole ancestry beside its members, or the ancestors beside the group a repair completes.
+func (l Lineage) Subsumed(live, added []Entry) map[string]struct{} {
 	out := make(map[string]struct{})
 
 	for i := range added {
 		for j := range live {
-			if live[j].Prefix != added[i].Prefix && added[i].Supersedes(live[j]) {
+			if live[j].Prefix != added[i].Prefix && l.Subsumes(added[i], live[j]) {
 				out[live[j].Prefix] = struct{}{}
 			}
 		}
@@ -525,8 +536,10 @@ func Subsumed(live, added []Entry) map[string]struct{} {
 			continue
 		}
 
+		claimed := l.holds(g.blocks)
+
 		for j := range live {
-			if g.blocks.Contains(live[j].Blocks) && live[j].Level < g.level {
+			if claimed.Contains(live[j].Blocks) && live[j].Level < g.level {
 				out[live[j].Prefix] = struct{}{}
 			}
 		}

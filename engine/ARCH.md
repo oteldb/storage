@@ -767,7 +767,7 @@ across every commit alongside the removals. Repair runs at the head of each merg
 shard that cannot be repaired must still compact.
 
 Satisfaction follows `Index.Satisfying` — the exact part, **or the largest live part whose block
-set contains the want's at a higher level**, or, when no single part does, **a split group whose
+set contains the want's at a higher level** (for a lost split member, its group's whole claim), or, when no single part does, **a split group whose
 members are all present and whose joint claim covers it**. A peer answers a group one member at a
 time, so a want (or hole) answered by a member becomes a **unit**: the answer plus every member of
 every split group the unit's parts belong to that neither the local index nor the unit already
@@ -791,9 +791,21 @@ A member of a group whose ancestry this node no longer holds is different: its r
 node lacks, so it is committed on its own, whatever became of its siblings. Requiring the group there
 would buy nothing and cost a part that exists — a lost sibling would hold it back for ever and, as
 evidence, turn it into a hole. A unit still short of what it needs after its rounds, or one whose part
-will not open at commit, contributes nothing and the next pass starts it over. Within one commit a
-part another published or live part supersedes is left out: a peer that merged between two rounds can
-answer one unit with a member and with the successor containing it.
+will not open at commit, contributes nothing and the next pass starts it over.
+
+**A commit leaves one representation of any row live** (`repair.Admit`, `prune`). A part another
+published or live part subsumes is left out, and the live parts the published ones subsume are
+retired; `Admit` returns both, so the engine retires exactly what the judgement assumed. Both are
+judged over the lineage of everything the commit saw, because the members left out may be the only
+record relating a successor to a live group split again. This covers a peer that merged between two
+rounds and a replica whose lineage diverged: a successor holding a group's whole ancestry at a higher
+level replaces every member, admitted or live. What neither subsumes but `Lineage.Overlaps` relates —
+a part covering only some of a group's claim, or a rival at the group's own level — cannot be kept
+beside the other, so its unit is dropped: every unit overlapping a live part, since that
+representation is already in place, else every unit overlapping the first overlapping unit by target.
+Dropping a unit, or leaving out a part, can change what the rest may commit, so judgement and pruning
+repeat until neither drops one. A dropped unit's want stays outstanding; while every owner answers it
+with an overlapping part it is never repaired, and never earns a hole either.
 
 **The per-cycle cap counts units, not parts.** `repair.FetchesPerCycle` (4) bounds the wants and
 holes one pass asks peers for; the members their answers need do not count against it. Counting them

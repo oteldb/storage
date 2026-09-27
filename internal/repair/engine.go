@@ -211,7 +211,7 @@ func publish[P any](
 
 	state.Lock()
 
-	admitted := Admit(ctx, entriesLocked(h), plan.Units, func(r *Result) error {
+	admitted, superseded := Admit(ctx, entriesLocked(h), plan.Units, func(r *Result) error {
 		if r.Held {
 			return nil
 		}
@@ -227,19 +227,11 @@ func publish[P any](
 	}, &stats)
 
 	committed, _ := h.LiveLocked()
-	own := make([]bucketindex.Entry, len(committed))
-
-	for i, p := range committed {
-		own[i] = h.Identity(p)
-	}
-
-	superseded := bucketindex.Subsumed(own, admitted)
-
 	next := make([]P, 0, len(committed)+len(admitted))
 	retired := make([]P, 0, len(superseded))
 
-	for i, p := range committed {
-		if _, ok := superseded[own[i].Prefix]; ok {
+	for _, p := range committed {
+		if _, ok := superseded[h.Identity(p).Prefix]; ok {
 			retired = append(retired, p)
 		} else {
 			next = append(next, p)

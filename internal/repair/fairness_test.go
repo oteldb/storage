@@ -23,7 +23,7 @@ func TestAdmitIsOrderIndependent(t *testing.T) {
 	for _, units := range [][]Unit{{member, merged}, {merged, member}} {
 		var stats bucketindex.RepairStats
 
-		got := Admit(context.Background(), nil, units, func(*Result) error { return nil }, &stats)
+		got, _ := Admit(context.Background(), nil, units, func(*Result) error { return nil }, &stats)
 
 		assert.Equal(t, []bucketindex.Entry{successor}, got,
 			"the member's rows are inside the successor's ancestry, so it waits for its group")

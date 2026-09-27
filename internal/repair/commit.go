@@ -10,36 +10,62 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 )
 
-// Admit returns the entries a repair commit publishes out of units, given live, the engine's part
-// set, and counts into stats what it publishes and what it leaves out.
+// Admit returns the entries a repair commit publishes out of units and the prefixes of the live
+// parts it retires, given live, the engine's part set, and counts into stats what it publishes and
+// what it leaves out.
 //
 // open makes a part readable for the commit, once per part; a part already live is not opened. A
 // part that will not open fails its unit unless what it was fetched for is covered anyway. Units are
 // then judged together, each against live and every other unit still in: one that is not
 // [committable] is dropped, and the judgement repeats until none is. Judging against the whole set,
-// rather than the units before it, is what makes the outcome independent of unit order. Last, a part
-// another published or live part supersedes is left out: a peer that merged between two rounds can
-// answer one unit with both a member and the successor containing it.
+// rather than the units before it, is what makes the outcome independent of unit order.
+//
+// The units taken are then pruned ([prune]): a part another published or live part subsumes is left
+// out, what the published parts subsume is retired, and a unit that would leave two overlapping
+// representations of some rows live is dropped. Either can change what the rest may commit, so
+// judgement and pruning repeat until neither drops a unit.
 func Admit(
 	ctx context.Context, live []bucketindex.Entry, units []Unit, open func(*Result) error, stats *bucketindex.RepairStats,
-) []bucketindex.Entry {
+) ([]bucketindex.Entry, map[string]struct{}) {
 	have := make(map[string]struct{}, len(live))
 	for i := range live {
 		have[live[i].Prefix] = struct{}{}
 	}
 
 	openErr := openAll(ctx, units, have, open)
-	in := settle(live, units, have, openErr)
+	added := unitParts(units, have, openErr)
 
-	var (
-		admitted []bucketindex.Entry
-		picked   []*Result
-	)
+	in := make([]bool, len(units))
+	for k := range in {
+		in[k] = true
+	}
+
+	why := make([]string, len(units))
+
+	var p pruned
+
+	for {
+		in = settle(live, units, added, openErr, in)
+
+		p = prune(live, units, added, openErr, in)
+		if len(p.drop) == 0 {
+			break
+		}
+
+		for _, k := range p.drop {
+			in[k], why[k] = false, p.reason
+		}
+	}
+
+	var out []bucketindex.Entry
 
 	for k, u := range units {
 		if !in[k] {
-			zctx.From(ctx).Warn("repaired split group is not complete at commit",
-				zap.String("want", u[0].Want.Prefix))
+			if why[k] == "" {
+				why[k] = "repaired split group is not complete at commit"
+			}
+
+			zctx.From(ctx).Warn(why[k], zap.String("want", u[0].Want.Prefix))
 
 			stats.Failed += int64(len(u))
 
@@ -57,31 +83,40 @@ func Admit(
 			}
 
 			have[r.Entry.Prefix] = struct{}{}
-			admitted = append(admitted, r.Entry)
-			picked = append(picked, r)
+
+			if _, ok := p.kept[r.Entry.Prefix]; !ok {
+				continue
+			}
+
+			switch {
+			case r.Hole:
+			case r.Held:
+				stats.Local++
+			default:
+				stats.Fetched++
+			}
+
+			out = append(out, r.Entry)
 		}
 	}
 
-	superseded := bucketindex.Subsumed(admitted, slices.Concat(live, admitted))
-	out := admitted[:0]
+	return out, p.retired
+}
 
-	for i, r := range picked {
-		if _, drop := superseded[r.Entry.Prefix]; drop {
-			continue
+// unitParts is, per unit, the parts it would add: those neither live nor failing to open.
+func unitParts(units []Unit, have map[string]struct{}, openErr map[string]error) [][]bucketindex.Entry {
+	added := make([][]bucketindex.Entry, len(units))
+
+	for k, u := range units {
+		for i := range u {
+			p := u[i].Entry.Prefix
+			if _, dup := have[p]; !dup && openErr[p] == nil {
+				added[k] = append(added[k], u[i].Entry)
+			}
 		}
-
-		switch {
-		case r.Hole:
-		case r.Held:
-			stats.Local++
-		default:
-			stats.Fetched++
-		}
-
-		out = append(out, admitted[i])
 	}
 
-	return out
+	return added
 }
 
 // openAll opens every part of units that is not live, once, and returns what each open concluded.
@@ -114,27 +149,11 @@ func openAll(
 	return openErr
 }
 
-// settle returns which units the commit takes: every unit is judged against live and every other
-// unit still in, all at once, until no verdict changes.
+// settle returns which of the units in the commit takes: every unit is judged against live and every
+// other unit still in, all at once, until no verdict changes. A unit once out stays out.
 func settle(
-	live []bucketindex.Entry, units []Unit, have map[string]struct{}, openErr map[string]error,
+	live []bucketindex.Entry, units []Unit, added [][]bucketindex.Entry, openErr map[string]error, in []bool,
 ) []bool {
-	added := make([][]bucketindex.Entry, len(units))
-
-	for k, u := range units {
-		for i := range u {
-			p := u[i].Entry.Prefix
-			if _, dup := have[p]; !dup && openErr[p] == nil {
-				added[k] = append(added[k], u[i].Entry)
-			}
-		}
-	}
-
-	in := make([]bool, len(units))
-	for k := range in {
-		in[k] = true
-	}
-
 	for {
 		verdict := make([]bool, len(units))
 
