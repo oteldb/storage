@@ -2,6 +2,7 @@ package profile
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -124,6 +125,57 @@ func TestSymbolCacheHugeEntries(t *testing.T) {
 	_, err := c.get(ctx, "fits", small)
 	require.NoError(t, err)
 	assert.Equal(t, int64(math.MaxUint32-1), c.Stats().Bytes, "an entry that fits is weighed exactly")
+}
+
+// TestSymbolCacheChargesRetainedCapacity checks the cache charges the backing arrays decoded entries
+// keep alive, not just their length: zstd decompression reserves a slack far larger than a small
+// table, and many cached parts must not hold it beyond the budget.
+func TestSymbolCacheChargesRetainedCapacity(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	stored := make(map[string][]byte, len(tableNames))
+	for _, name := range tableNames {
+		stored[name] = encodeTable(fixtureTable(), storageCompressor)
+	}
+
+	raw, err := tableBodyOf(stored["stacks"])
+	require.NoError(t, err)
+	require.Greater(t, cap(raw)-len(raw), len(raw), "decompression over-reserves a small table")
+
+	const (
+		parts  = 200
+		budget = 64 << 20
+	)
+
+	c := NewSymbolCache(budget)
+
+	var charged int64
+
+	for i := range parts {
+		got, err := c.Get(ctx, fmt.Sprintf("p/%d", i), func(context.Context) (map[string][]byte, error) {
+			return stored, nil
+		})
+		require.NoError(t, err)
+
+		var retained, entries int64
+
+		for ti, body := range got.bodies {
+			retained += int64(cap(body))
+			entries += int64(len(got.t.t[ti]))
+			assert.Equal(t, len(body), cap(body), "no decompression slack retained")
+		}
+
+		assert.Equal(t, retained+entries*entryOverhead, got.Size(), "charged by retained capacity")
+
+		charged += got.Size()
+	}
+
+	st := c.Stats()
+	assert.Equal(t, parts, st.Items)
+	assert.Equal(t, charged, st.Bytes)
+	assert.LessOrEqual(t, st.Bytes, int64(budget))
 }
 
 func TestSymbolCacheDisabled(t *testing.T) {

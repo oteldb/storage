@@ -3,7 +3,7 @@ package profile
 import (
 	"encoding/binary"
 	"maps"
-	"slices"
+	"sync"
 
 	"github.com/go-faster/errors"
 
@@ -13,8 +13,9 @@ import (
 // Tables is a decoded, read-only set of symbol tables: one part's sidecars, a peer's reply, or a
 // snapshot of the live accumulator. A [Resolver] reads a stack of them. Safe for concurrent reads.
 type Tables struct {
-	t    symTables
-	size int64
+	t      symTables
+	bodies [5][]byte // the arrays the entries slice; retained whole, so charged by capacity
+	size   int64
 }
 
 // entryOverhead approximates the resident cost of one map entry beyond its bytes: the 16-byte key,
@@ -26,29 +27,47 @@ const entryOverhead = 48
 func DecodeTables(tables map[string][]byte) (*Tables, error) {
 	out := &Tables{t: newSymTables()}
 
+	// Decompression reserves its bound plus a fixed slack of about 128 KiB, and the entry views would
+	// pin that whole array: a small table would hold several times its size. It decompresses into
+	// reused scratch instead, and only an exact-length copy is retained.
+	scratch, _ := bodyScratch.Get().(*[]byte)
+	defer bodyScratch.Put(scratch)
+
 	for i, name := range tableNames {
 		data, ok := tables[name]
 		if !ok {
 			continue
 		}
 
-		body, err := tableBodyOf(data)
+		body, err := tableBodyTo((*scratch)[:0], data)
 		if err != nil {
 			return nil, errors.Wrapf(err, "decode table %q", name)
 		}
 
-		if binary.BigEndian.Uint32(data[4:]) == symVersionRaw {
-			body = slices.Clone(body)
+		if binary.BigEndian.Uint32(data[4:]) != symVersionRaw && cap(body) > cap(*scratch) {
+			*scratch = body[:0]
 		}
+
+		body = exactCopy(body)
 
 		if out.t.t[i], err = decodeEntriesView(body); err != nil {
 			return nil, errors.Wrapf(err, "decode table %q", name)
 		}
 
-		out.size += int64(len(body)) + int64(len(out.t.t[i]))*entryOverhead
+		out.bodies[i] = body
+		out.size += int64(cap(body)) + int64(len(out.t.t[i]))*entryOverhead
 	}
 
 	return out, nil
+}
+
+var bodyScratch = sync.Pool{New: func() any { return new([]byte) }}
+
+func exactCopy(b []byte) []byte {
+	out := make([]byte, len(b))
+	copy(out, b)
+
+	return out
 }
 
 // Size is the approximate resident size of t in bytes.

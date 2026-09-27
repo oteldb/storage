@@ -290,7 +290,11 @@ func decodeTable(dst map[signal.SeriesID][]byte, data []byte) error {
 }
 
 // tableBodyOf verifies a table of either version and returns its uncompressed body.
-func tableBodyOf(data []byte) ([]byte, error) {
+func tableBodyOf(data []byte) ([]byte, error) { return tableBodyTo(nil, data) }
+
+// tableBodyTo is [tableBodyOf] decompressing into buf's capacity when it fits. A version 1 body
+// aliases data instead.
+func tableBodyTo(buf, data []byte) ([]byte, error) {
 	if len(data) < 12 { // magic+version+crc
 		return nil, ErrCorruptSymbols
 	}
@@ -308,7 +312,7 @@ func tableBodyOf(data []byte) ([]byte, error) {
 	case symVersionRaw:
 		return framed[8:], nil
 	case symVersion:
-		return decompressBody(framed[8:])
+		return decompressBody(buf, framed[8:])
 	default:
 		return nil, errors.Wrap(ErrCorruptSymbols, "bad version")
 	}
@@ -316,7 +320,7 @@ func tableBodyOf(data []byte) ([]byte, error) {
 
 // decompressBody inflates a version 2 body to exactly its recorded length, so a corrupt table
 // allocates no more than its header claims.
-func decompressBody(p []byte) ([]byte, error) {
+func decompressBody(buf, p []byte) ([]byte, error) {
 	if len(p) == 0 {
 		return nil, errCorrupt("algorithm")
 	}
@@ -331,7 +335,7 @@ func decompressBody(p []byte) ([]byte, error) {
 		return nil, errCorrupt("body len")
 	}
 
-	body, err := c.DecompressLimit(nil, p[1+n:], int(rawLen))
+	body, err := c.DecompressLimit(buf, p[1+n:], int(rawLen))
 	if err != nil {
 		return nil, errors.Errorf("%w: %w", ErrCorruptSymbols, err)
 	}

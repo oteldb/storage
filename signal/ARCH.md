@@ -127,7 +127,10 @@ the window's samples reference and need not resolve any other.
 - **A part decodes once.** Its `Tables` come from a `SymbolCache` keyed by part prefix — immutable,
   so never invalidated — bounded by decoded bytes (`Options.ProfileSymbolCacheBytes`, 128 MiB by
   default) and built on otter like the backend read cache. A decoded entry slices its table's
-  decompressed body, so a cached part costs its raw body plus about 48 B per entry for the map.
+  decompressed body, so a cached part costs its raw body plus about 48 B per entry for the map. The
+  views pin the body's whole backing array, and zstd decompression reserves its bound plus about
+  128 KiB of slack, so a small table would pin several times its size outside the budget. Bodies
+  therefore decompress into pooled scratch, and only an exact-length copy is retained and charged.
 - **Merging layers per query is the cost being avoided.** A union of N cached parts is still N ×
   entries map operations on every call, and on a store whose every part repeats the working set that
   is nearly the whole decode again. A lookup instead probes the layers in order, trying the stack's
