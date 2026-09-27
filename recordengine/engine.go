@@ -875,6 +875,12 @@ func (e *Engine) Reset(ctx context.Context) error {
 	e.flushing = nil // discarded with the head: Reset drops the records, it does not flush them
 	e.flushingSide = nil
 
+	if e.cfg.SideStore != nil {
+		e.cfg.SideStore.Reset()
+	}
+
+	e.sideAbsorbed, e.sideStray = false, false
+
 	if e.cfg.Backend == nil {
 		e.parts, e.retiring = nil, nil
 		e.mu.Unlock()
