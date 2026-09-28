@@ -21,7 +21,7 @@ require (
 	github.com/valyala/gozstd v1.26.0
 	github.com/zeebo/xxh3 v1.1.0
 	go.etcd.io/etcd/client/v3 v3.7.2
-	go.etcd.io/etcd/server/v3 v3.7.1
+	go.etcd.io/etcd/server/v3 v3.7.2
 	go.opentelemetry.io/collector/pdata v1.66.0
 	go.opentelemetry.io/collector/pdata/pprofile v0.160.0
 	go.opentelemetry.io/otel v1.46.0
@@ -85,7 +85,7 @@ require (
 	go.etcd.io/bbolt v1.5.0 // indirect
 	go.etcd.io/etcd/api/v3 v3.7.2 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.7.2 // indirect
-	go.etcd.io/etcd/pkg/v3 v3.7.1 // indirect
+	go.etcd.io/etcd/pkg/v3 v3.7.2 // indirect
 	go.etcd.io/raft/v3 v3.7.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/collector/featuregate v1.66.0 // indirect
