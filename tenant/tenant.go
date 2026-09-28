@@ -137,11 +137,12 @@ func (r Retention) AgeFor(sig signal.Signal) time.Duration {
 // results instead of the raw samples (a 1m Sum then a 1h Max is the max of per-minute sums),
 // so such a policy is rejected.
 //
-// Rolled data stays rolled. Changing Agg applies only to data not yet rolled up: a bucket
-// keeps the Agg it was rolled up with. Removing or narrowing a tier un-rolls nothing, and a
-// sample later written into a time range already rolled up is rolled by the layout that range
-// has. A tier whose Interval does not nest with one already applied to stored data is not
-// applied until retention drops that data.
+// Rolled data stays rolled. Removing or narrowing a tier un-rolls nothing, and a sample later
+// written into a time range already rolled up is rolled by the layout that range has. A tier
+// that conflicts with one already applied to stored data is not applied at all until retention
+// drops that data; what it would roll stays raw meanwhile. A tier conflicts when its Interval
+// does not nest with the applied one, or when its Agg differs, whatever its width. So changing
+// Agg takes effect only once the data rolled with the old Agg has expired.
 //
 // A sample written late into a bucket that is already rolled up combines with the bucket's
 // representative as new data. It cannot replace a raw sample that is already rolled up,

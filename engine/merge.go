@@ -114,14 +114,22 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{}, err
 	}
 
-	var unnested []DownsampleTier
-	if opts.Downsample, unnested = resolvePolicy(src, opts.Downsample); len(unnested) > 0 &&
-		e.unnestedWarned.CompareAndSwap(false, true) {
-		zctx.From(ctx).Warn("downsample tier not applied: its interval does not nest with one a part already records",
-			zap.String("prefix", e.cfg.Prefix), zap.Int64("interval", unnested[0].Interval))
+	pool, quarantined := mergePool(src)
+	if len(quarantined) > 0 && e.quarantineWarned.CompareAndSwap(false, true) {
+		zctx.From(ctx).Warn("parts recording a second downsample aggregation are left unmerged",
+			zap.String("prefix", e.cfg.Prefix), zap.Int("parts", len(quarantined)))
 	}
 
-	selected := selectMergeParts(src, opts, capBytes, e.mergeIdle(opts))
+	var conflicting []DownsampleTier
+	if opts.Downsample, conflicting = resolvePolicy(pool, opts.Downsample); len(conflicting) > 0 &&
+		e.conflictWarned.CompareAndSwap(false, true) {
+		zctx.From(ctx).Warn("downsample tier not applied: its interval does not nest with, or its aggregation "+
+			"differs from, a tier a part already records",
+			zap.String("prefix", e.cfg.Prefix), zap.Int64("interval", conflicting[0].Interval),
+			zap.Stringer("agg", conflicting[0].Agg))
+	}
+
+	selected := selectMergeParts(pool, opts, capBytes, e.mergeIdle(opts))
 	if len(selected) == 0 {
 		if dropped == 0 {
 			idle := int(e.idleMerges.Add(1))

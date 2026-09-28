@@ -702,7 +702,7 @@ func TestDownsampleUnnestedTierNotApplied(t *testing.T) {
 	require.Equal(t, 1, forcedParts(e, unnested), "the unnested tier alone would widen it")
 	require.Zero(t, e.MergeShapeWith(unnested).Candidates, "so the merge does not take it")
 
-	kept, dropped := nestedTiers(liveParts(e), unnested.Downsample)
+	kept, dropped := compatibleTiers(liveParts(e), unnested.Downsample)
 	assert.Empty(t, kept)
 	assert.Equal(t, unnested.Downsample, dropped)
 
@@ -751,4 +751,99 @@ func TestDownsampleLegacyAlignedRawIsCounted(t *testing.T) {
 	ts, vals = rollupSamples(t, e)
 	assert.Equal(t, []int64{0, minute, 2 * minute}, ts)
 	assert.Equal(t, []float64{2, 1, 1}, vals, "the late sample is one more")
+}
+
+// rewriteRollup replaces the marker in part prefix's manifest, as a node running another policy
+// would have written it.
+func rewriteRollup(t *testing.T, b backend.Backend, prefix string, r block.Rollup) {
+	t.Helper()
+
+	ctx := context.Background()
+	key := prefix + "/manifest"
+
+	raw, err := b.Read(ctx, key)
+	require.NoError(t, err)
+
+	m, err := block.DecodeManifest(raw)
+	require.NoError(t, err)
+
+	m.Rollup = &r
+	require.NoError(t, b.Write(ctx, key, m.Encode(nil)))
+}
+
+// TestDownsampleQuarantinesSecondAgg checks a part recording a second Agg, which the engine never
+// writes beside the first but may adopt, is left out of every merge: it stays as written and reads
+// the same, while the rest of the store still compacts and rolls up.
+func TestDownsampleQuarantinesSecondAgg(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	day, minute, step := 2*int64(time.Hour), int64(time.Minute), 10*int64(time.Second)
+	count := MergeOptions{Downsample: countTiers(1<<62, time.Minute)}
+	b := backend.Memory()
+
+	e := reopenRollup(t, b, Config{})
+	flushEvery(t, e, 0, minute, step, 1)
+	flushEvery(t, e, day, day+minute, step, 1)
+	flushEvery(t, e, anchorAt, anchorAt+1, step, 1)
+
+	for range 3 {
+		require.NoError(t, e.MergeWith(ctx, count))
+	}
+
+	require.Equal(t, 3, e.PartCount())
+
+	other := slices.MaxFunc(liveParts(e), func(a, b *part) int {
+		return cmp.Compare(btoi(a.minTime == day), btoi(b.minTime == day))
+	})
+	require.Equal(t, day, other.minTime)
+	rewriteRollup(t, b, other.prefix, rollupMarker(sumTiers(1<<62, time.Minute)))
+
+	e = reopenRollup(t, b, Config{})
+	before, beforeVals := samplesBefore(t, e, anchorAt)
+
+	pool, quarantined := mergePool(liveParts(e))
+	if assert.Len(t, quarantined, 1) {
+		assert.Equal(t, other.prefix, quarantined[0].prefix)
+	}
+
+	assert.Len(t, pool, 2)
+
+	flushEvery(t, e, 3*step+step/2, 3*step+step/2+1, 1, 1)
+
+	for range 4 {
+		require.NoError(t, e.MergeWith(ctx, MergeOptions{Downsample: count.Downsample, Force: true}))
+	}
+
+	var found bool
+
+	for _, p := range liveParts(e) {
+		found = found || p.prefix == other.prefix
+	}
+
+	assert.True(t, found, "the quarantined part is never merged")
+
+	require.Equal(t, []int64{0, day}, before)
+	require.Equal(t, []float64{6, 6}, beforeVals)
+
+	ts, vals := samplesBefore(t, e, anchorAt)
+	assert.Equal(t, before, ts)
+	assert.Equal(t, []float64{7, 6}, vals, "the pool still rolls: the late sample counts into the Count part")
+}
+
+func sumTiers(before int64, intervals ...time.Duration) []DownsampleTier {
+	out := countTiers(before, intervals...)
+	for i := range out {
+		out[i].Agg = signal.AggSum
+	}
+
+	return out
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+
+	return 0
 }

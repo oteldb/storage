@@ -85,9 +85,10 @@ func nextMergeParts(src []*part, opts MergeOptions, capBytes int64, idle int) in
 		}
 	}
 
-	opts.Downsample, _ = resolvePolicy(live, opts.Downsample)
+	pool, _ := mergePool(live)
+	opts.Downsample, _ = resolvePolicy(pool, opts.Downsample)
 
-	return len(src) - len(live) + len(selectMergeParts(live, opts, capBytes, idle))
+	return len(src) - len(live) + len(selectMergeParts(pool, opts, capBytes, idle))
 }
 
 // mergeIdle is the idle-round count the selector sees for this merge: the real one, or one that has

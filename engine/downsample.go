@@ -103,9 +103,9 @@ func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int
 // output timestamps.
 //
 // A representative rolls into the wider of its own recorded tier and the one tiers assign it. A bucket
-// tiers cover takes their Agg, the one a merge's marker records; a merge lists recorded tiers first,
-// so rolled data keeps the Agg it was rolled with. A representative of another Agg folds as a plain
-// sample, and a Count representative adds its count rather than counting as 1.
+// tiers cover takes their Agg, the one a merge's marker records, which a merge's sources share. A
+// representative of another Agg would fold as a plain sample, and a Count representative adds its
+// count rather than counting as 1.
 func downsampleCovering(
 	ts []int64, values, sf []float64, tags []rollupTag, tiers []DownsampleTier,
 ) ([]int64, []float64, []float64, []int64) {

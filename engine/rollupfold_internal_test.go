@@ -114,7 +114,7 @@ func TestFoldTie(t *testing.T) {
 			}
 
 			cur := make([]int, len(runs))
-			v, w, tag := foldTie(runs, layouts, nil, cur, runs[0].ts[0])
+			v, w, tag := foldTie(runs, layouts, cur, runs[0].ts[0])
 			assert.InDelta(t, tc.v, v, 0)
 			assert.InDelta(t, tc.w, w, 0)
 			assert.Equal(t, tc.isRep, tag.interval > 0)
@@ -139,7 +139,7 @@ func TestCollectTaggedMarksRepresentatives(t *testing.T) {
 	m.add([]int64{10, 20, 105}, []float64{3, 4, 5}, nil, tierOf(signal.AggCount), minInt64, maxInt64)
 	m.add([]int64{10, 25}, []float64{9, 9}, nil, nil, minInt64, maxInt64)
 
-	ts, vals, sf, tags := m.collectTagged(nil)
+	ts, vals, sf, tags := m.collectTagged()
 	assert.Equal(t, []int64{10, 20, 25, 105}, ts)
 	assert.Equal(t, []float64{4, 4, 9, 5}, vals)
 	assert.Nil(t, sf)
@@ -156,7 +156,7 @@ func TestCollectTaggedMarksRepresentatives(t *testing.T) {
 
 	var rawTags []rollupTag
 
-	raw.gather(nil, nil, &rawTags, nil)
+	raw.gather(nil, nil, &rawTags)
 	assert.Nil(t, rawTags, "no representative, no tags")
 }
 
@@ -174,8 +174,8 @@ func TestRollSeriesUnknownIsRaw(t *testing.T) {
 	assert.Equal(t, []float64{4, 2}, vals)
 }
 
-// TestRollSeriesKeepsRecordedAgg checks a range rolled with Sum keeps Sum under a policy that has
-// since changed to Max, a raw sample in it folds by Sum, and the policy's Max applies past it.
+// TestRollSeriesKeepsRecordedAgg checks a raw sample landing in a range rolled with Sum folds by Sum,
+// and the same Agg rolls the range past the recorded cutoff.
 func TestRollSeriesKeepsRecordedAgg(t *testing.T) {
 	t.Parallel()
 
@@ -183,11 +183,11 @@ func TestRollSeriesKeepsRecordedAgg(t *testing.T) {
 
 	var m sampleMerge
 	m.add([]int64{10, 20}, []float64{5, 7}, nil, recorded, minInt64, maxInt64)
-	m.add([]int64{12, 34}, []float64{4, 1}, nil, nil, minInt64, maxInt64)
+	m.add([]int64{12, 34, 36}, []float64{4, 1, 2}, nil, nil, minInt64, maxInt64)
 
-	ts, vals, _, _ := rollSeries(&m, compactLayout(append(slices.Clone(recorded), tierOf(signal.AggMax)...)))
-	assert.Equal(t, []int64{10, 20, 34}, ts)
-	assert.Equal(t, []float64{9, 7, 1}, vals, "Sum where rolled, Max for the bucket rolled now")
+	ts, vals, _, _ := rollSeries(&m, compactLayout(append(slices.Clone(recorded), tierOf(signal.AggSum)...)))
+	assert.Equal(t, []int64{10, 20, 30}, ts)
+	assert.Equal(t, []float64{9, 7, 3}, vals)
 }
 
 // TestRollSeriesNoTiersFoldsSharedBuckets checks a merge applying no tiers still folds a tie on a
@@ -371,26 +371,56 @@ func FuzzRollupCombine(f *testing.F) {
 	})
 }
 
-// TestRollSeriesMixedAggPrecedence checks the fold and the merge layout pick the same Agg when two
-// sources record one tier with different Aggs: the oldest source's, which the layout lists first. A
-// representative of the other Agg folds as a plain sample.
-func TestRollSeriesMixedAggPrecedence(t *testing.T) {
+// TestReadTieMixedAggsIndependentOfOrder: parts that disagree on the Agg (only a quarantined part
+// can) must read the same whatever order they arrive in, and whatever merges combine meanwhile. Here
+// A and C hold Sum representatives and B a Count one at the same bucket start. A merge takes A and C
+// together (never B, which records another Agg), and the merged part lands after B.
+func TestReadTieMixedAggsIndependentOfOrder(t *testing.T) {
 	t.Parallel()
 
+	sum, count := tierOf(signal.AggSum), tierOf(signal.AggCount)
+
+	type source struct {
+		ts     []int64
+		vals   []float64
+		layout []DownsampleTier
+	}
+
+	a := source{[]int64{10, 20}, []float64{5, 7}, sum}
+	b := source{[]int64{10, 22}, []float64{3, 4}, count}
+	c := source{[]int64{10, 30}, []float64{2, 1}, sum}
+
+	read := func(srcs ...source) ([]int64, []float64) {
+		var m sampleMerge
+		for _, s := range srcs {
+			m.add(s.ts, s.vals, nil, s.layout, minInt64, maxInt64)
+		}
+
+		ts, vals, _ := m.collect(nil, nil)
+
+		return ts, vals
+	}
+
+	wantTs, wantVals := read(a, b, c)
+	assert.Equal(t, []int64{10, 20, 22, 30}, wantTs)
+	assert.Equal(t, []float64{7, 7, 4, 1}, wantVals, "Sum, the smaller Agg, folds A and C; B's Count is left out")
+
+	for _, order := range [][]source{{a, c, b}, {b, a, c}, {b, c, a}, {c, a, b}, {c, b, a}} {
+		ts, vals := read(order...)
+		assert.Equal(t, wantTs, ts)
+		assert.Equal(t, wantVals, vals)
+	}
+
 	var m sampleMerge
-	m.add([]int64{10, 20}, []float64{5, 7}, nil, tierOf(signal.AggSum), minInt64, maxInt64)
-	m.add([]int64{10, 22}, []float64{3, 4}, nil, tierOf(signal.AggCount), minInt64, maxInt64)
+	m.add(a.ts, a.vals, nil, sum, minInt64, maxInt64)
+	m.add(c.ts, c.vals, nil, sum, minInt64, maxInt64)
 
-	layout := compactLayout(append(tierOf(signal.AggSum), tierOf(signal.AggCount)...))
-	marked, ok := tierAt(layout, 10)
-	require.True(t, ok)
-	require.Equal(t, signal.AggSum, marked.Agg, "the marker")
+	acTs, acVals, _, _ := rollSeries(&m, sum)
+	ac := source{acTs, acVals, sum}
 
-	ts, vals, _, _ := rollSeries(&m, layout)
-	assert.Equal(t, []int64{10, 20}, ts)
-	assert.Equal(t, []float64{8, 11}, vals, "folded by Sum: the Count representatives count as values")
-
-	read, readVals, _ := m.collect(nil, nil)
-	assert.Equal(t, []int64{10, 20, 22}, read)
-	assert.Equal(t, []float64{8, 7, 4}, readVals, "a read tie folds by the same Agg")
+	for _, order := range [][]source{{b, ac}, {ac, b}} {
+		ts, vals := read(order...)
+		assert.Equal(t, wantTs, ts, "after merging A and C")
+		assert.Equal(t, wantVals, vals, "after merging A and C")
+	}
 }

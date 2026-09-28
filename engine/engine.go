@@ -221,9 +221,11 @@ type Engine struct {
 	// head bytes, which the highest-ingest engines keep winning, so without this a quiet tenant
 	// could be declined every cycle while its part count grew.
 	mergeDeferred atomic.Bool
-	// unnestedWarned records that a merge already warned of a policy tier it dropped for not nesting
-	// with a recorded one ([nestedTiers]).
-	unnestedWarned atomic.Bool
+	// conflictWarned records that a merge already warned of a policy tier it dropped for conflicting
+	// with a recorded one ([compatibleTiers]); quarantineWarned, of parts left out of merges for
+	// recording a second Agg ([mergePool]).
+	conflictWarned   atomic.Bool
+	quarantineWarned atomic.Bool
 	// retiring holds parts removed from the live set by flush/merge, pending backend deletion once
 	// their in-flight fetch readers drain (deferred reclamation; see reclaim.go).
 	retiring []*part
@@ -1090,19 +1092,19 @@ func (m *sampleMerge) add(ts []int64, values, sf []float64, layout []DownsampleT
 // them to the needed size. The returned sf slice is nil when every weight is 1 (the unsampled common
 // case), else len == len(ts).
 func (m *sampleMerge) collect(tsBuf []int64, valsBuf []float64) (tsOut []int64, values, sf []float64) {
-	return m.gather(tsBuf, valsBuf, nil, nil)
+	return m.gather(tsBuf, valsBuf, nil)
 }
 
 // collectTagged is collect that also returns what each sample stands for; tags is nil when no sample
-// is a representative. A tie of representatives folds by the Agg layout assigns it ([foldTie]).
-func (m *sampleMerge) collectTagged(layout []DownsampleTier) (tsOut []int64, values, sf []float64, tags []rollupTag) {
-	tsOut, values, sf = m.gather(nil, nil, &tags, layout)
+// is a representative.
+func (m *sampleMerge) collectTagged() (tsOut []int64, values, sf []float64, tags []rollupTag) {
+	tsOut, values, sf = m.gather(nil, nil, &tags)
 
 	return tsOut, values, sf, tags
 }
 
 func (m *sampleMerge) gather(
-	tsBuf []int64, valsBuf []float64, tags *[]rollupTag, layout []DownsampleTier,
+	tsBuf []int64, valsBuf []float64, tags *[]rollupTag,
 ) (tsOut []int64, values, sf []float64) {
 	switch len(m.runs) {
 	case 0:
@@ -1115,7 +1117,7 @@ func (m *sampleMerge) gather(
 
 		return tsOut, values, sf
 	default:
-		return collectMany(m.runs, m.layouts, layout, tsBuf, valsBuf, tags)
+		return collectMany(m.runs, m.layouts, tsBuf, valsBuf, tags)
 	}
 }
 
@@ -1151,8 +1153,8 @@ func collectOne(r tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64, value
 
 // collectMany k-way-merges several sorted runs into the destination buffers, emitting each
 // timestamp once and taking its value/weight from the highest-indexed (freshest) run that holds it,
-// or from [foldTie] when a representative is among them. layouts is [sampleMerge.layouts], layout
-// the one a merge rolls up to; tags, when non-nil, receives each emitted sample's [rollupTag].
+// or from [foldTie] when a representative is among them. layouts is [sampleMerge.layouts]; tags,
+// when non-nil, receives each emitted sample's [rollupTag].
 //
 // The scan finds the two smallest heads rather than just the smallest, which turns the common case
 // into a copy: while the leading run's timestamps stay strictly below every other head, no other run
@@ -1162,8 +1164,7 @@ func collectOne(r tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64, value
 // two-day range over six parts arrives as ~40 runs whose stretches are hundreds of rows long. Per
 // row the old O(rows × runs) scan re-derived what one comparison per stretch establishes.
 func collectMany(
-	runs []tsRun, layouts [][]DownsampleTier, layout []DownsampleTier, tsBuf []int64, valsBuf []float64,
-	tags *[]rollupTag,
+	runs []tsRun, layouts [][]DownsampleTier, tsBuf []int64, valsBuf []float64, tags *[]rollupTag,
 ) (tsOut []int64, values, sf []float64) {
 	total := 0
 	for i := range runs {
@@ -1190,7 +1191,7 @@ func collectMany(
 		}
 
 		if rival && leadTs == rivalTs {
-			v, w, tag := foldTie(runs, layouts, layout, cur, leadTs)
+			v, w, tag := foldTie(runs, layouts, cur, leadTs)
 
 			tsOut = append(tsOut, leadTs)
 			values = append(values, v)

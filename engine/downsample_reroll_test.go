@@ -388,14 +388,15 @@ func TestRerollLateSample(t *testing.T) {
 	}
 }
 
-// TestRerollAggChange: an Agg change applies only to data not yet rolled up. A bucket rolled with Sum
-// keeps Sum when a later merge meets it under a Max policy, so a late raw sample folds into the total
-// rather than competing with it as a maximum.
+// TestRerollAggChange: an Agg change is not applied while a part records the old one. A bucket rolled
+// with Sum keeps Sum when the policy switches to Max, so a late raw sample folds into the total rather
+// than competing with it as a maximum, and data past the recorded cutoff stays raw instead of taking
+// Max.
 func TestRerollAggChange(t *testing.T) {
 	t.Parallel()
 
 	sum := tiersOf(signal.AggSum, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
-	maxOpts := tiersOf(signal.AggMax, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
+	maxOpts := tiersOf(signal.AggMax, engine.DownsampleTier{Before: rerollBase + 2*hr, Interval: min1})
 
 	r := newRerollEngine(t)
 	r.write(rerollBase, 2)
@@ -404,10 +405,60 @@ func TestRerollAggChange(t *testing.T) {
 	r.merge(sum)
 
 	r.write(rerollBase+2*sec, 4)
+	r.write(rerollBase+hr+min1, 7)
+	r.write(rerollBase+hr+min1+sec, 8)
 	r.flush()
 	r.merge(maxOpts)
 
 	r.assertOneRollup(sum.Downsample, 0)
+}
+
+// TestRerollAggChangeCoarsen: 1m Sum representatives under a policy switched to another Agg with a
+// coarse tier. The coarse tier would re-aggregate the minute representatives by an Agg they were not
+// rolled with (a 1h Count counts minutes, not samples), so it is not applied; reads before and after
+// merges, and a late sample, all match one 1m Sum rollup.
+func TestRerollAggChangeCoarsen(t *testing.T) {
+	t.Parallel()
+
+	sum := tiersOf(signal.AggSum, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
+
+	for _, agg := range []signal.Aggregation{signal.AggCount, signal.AggAvg, signal.AggMax} {
+		t.Run(agg.String(), func(t *testing.T) {
+			t.Parallel()
+
+			policy := tiersOf(agg,
+				engine.DownsampleTier{Before: rerollBase + hr, Interval: min1},
+				engine.DownsampleTier{Before: rerollBase + hr, Interval: hr})
+
+			r := newRerollEngine(t)
+			r.write(rerollBase+2*dayNanos, 1)
+			r.flush()
+
+			r.writeRun(rerollBase, 30, 1)
+			r.writeRun(rerollBase+min1, 30, 1)
+			r.flush()
+			r.merge(sum)
+
+			r.assertOneRollup(sum.Downsample, 0)
+
+			policy.Force = true
+			for range 3 {
+				r.merge(policy)
+			}
+
+			r.assertOneRollup(sum.Downsample, 0)
+
+			r.write(rerollBase+min1+45*sec, 100)
+			r.write(rerollBase+2*min1, 5)
+			r.flush()
+
+			for range 3 {
+				r.merge(policy)
+			}
+
+			r.assertOneRollup(sum.Downsample, 0)
+		})
+	}
 }
 
 // TestRerollLateOverwrite: a late write reusing the timestamp of a raw sample that is already rolled
@@ -500,14 +551,14 @@ func TestRerollReadFoldsRepresentatives(t *testing.T) {
 }
 
 // TestRerollAggChangeLateRolledAlone: after an Agg change, a late part in a range already rolled with
-// Sum is rolled on its own before it meets the Sum part. It must be rolled with Sum too, so that the
-// merge joining them folds and records one Agg; had it been rolled with Count, the fold and the marker
-// would disagree on which one.
+// Sum is rolled on its own before it meets the Sum part. It is rolled with Sum, the recorded Agg, so
+// no part ever records Count beside it; and the Count tier is not applied past the recorded cutoff
+// either, so data there stays raw.
 func TestRerollAggChangeLateRolledAlone(t *testing.T) {
 	t.Parallel()
 
 	sum := tiersOf(signal.AggSum, engine.DownsampleTier{Before: rerollBase + dayNanos, Interval: 6 * hr})
-	count := tiersOf(signal.AggCount, engine.DownsampleTier{Before: rerollBase + dayNanos, Interval: 6 * hr})
+	count := tiersOf(signal.AggCount, engine.DownsampleTier{Before: rerollBase + dayNanos + 6*hr, Interval: 6 * hr})
 
 	r := newRerollEngine(t)
 	// The ladder leaves the newest day open; a sample two days on closes the one under test.
@@ -532,6 +583,8 @@ func TestRerollAggChangeLateRolledAlone(t *testing.T) {
 	r.merge(count)
 
 	r.write(rerollBase+4*hr, 10)
+	r.write(rerollBase+dayNanos+hr, 11)
+	r.write(rerollBase+dayNanos+hr+sec, 12)
 	r.flush()
 
 	count.Force = true
@@ -539,7 +592,7 @@ func TestRerollAggChangeLateRolledAlone(t *testing.T) {
 		r.merge(count)
 	}
 
-	require.Equal(t, 2, r.e.PartCount())
+	require.Equal(t, 3, r.e.PartCount(), "one part per day")
 
 	r.assertOneRollup(sum.Downsample, rerollBase)
 }

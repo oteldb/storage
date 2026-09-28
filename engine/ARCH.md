@@ -625,25 +625,35 @@ Folding has no per-sample provenance, so it cannot tell two copies of one sample
   representatives trims the tier below the latest cutoff it applied (`trimRecentBelow`), so a read
   never returns the mirror beside, or folded into, the representative accounting for it.
 
-**Recorded Agg wins.** Changing a tier's Agg applies only to time ranges not yet rolled up: a range
-keeps the Agg it was rolled with, and data landing in it later is rolled by that Agg. Every merge
-resolves the policy against the tiers the live parts record (`resolvePolicy`), recorded tiers first,
-so this holds even for a late part rolled on its own before it meets the part that recorded the
-range. Without that, the late part would record the new Agg over the same range, and once the two
-met no single marker could describe both.
+**The policy is resolved against the history.** `Validate` checks a policy only against itself.
+Every merge also checks it against the tiers the live parts record (`resolvePolicy`,
+`compatibleTiers`):
+- Recorded tiers keep applying with their recorded Agg. Data landing later in a range already
+  rolled is rolled like the rest of it, even in a late part rolled on its own before it meets the
+  part that recorded the range.
+- A policy tier is not applied at all while a live part records a tier it conflicts with, and the
+  engine warns once. Data it would roll stays raw until retention drops the last conflicting part.
+  A tier conflicts in two ways:
+  - Its Interval does not nest (5m data, then a 7m tier): coarsening a representative into a bucket
+    that does not hold its whole bucket cannot be exact.
+  - Its Agg differs, whatever its width: re-aggregating representatives by an Agg they were not
+    rolled with is wrong. A 1h Count over 1m Sum representatives counts minutes, not samples.
+- A marker cannot confine a tier to part of its range, so there is no partial application.
 
-The fold and the marker share one precedence. A merge's bucket takes the Agg the merge layout assigns
-it, and a same-timestamp tie folds by that Agg too. The layout is recorded tiers first, oldest source
-first, and tier selection keeps the first of a tie. A representative of any other Agg folds as a plain
-sample. Parts that already disagree, such as parts written by a node with a different policy, thus
-merge into data that matches its marker, if not the one-pass rollup. A read tie has no layout, so it
-takes the oldest source's Agg, the one the layout would list first.
+**One Agg on disk.** The rule above means the engine never records a second Agg while a live part
+records one. So every merge folds, and every marker records, the single Agg the live parts carry.
+Neither depends on which parts a merge happens to take.
 
-**Non-nesting history.** `Validate` checks a policy only against itself. A policy tier whose Interval
-does not nest with one a live part already records (5m data, then a 7m tier) is not applied at all
-(`nestedTiers`, within `resolvePolicy`), and the engine warns once. Coarsening a representative into a bucket that does not
-hold its whole bucket cannot be exact, and a marker cannot confine a tier to part of its range. The
-tier applies again once retention drops the last part recording the one it conflicts with.
+Parts can disagree anyway, for example parts adopted from a node that ran another policy. Merging
+them would re-aggregate one side by the other's Agg, so they are quarantined (`mergePool`):
+- The oldest marked part's Agg is kept.
+- Parts recording any other Agg are left out of every merge, with a warning once, and stay on disk as
+  written until retention drops them.
+- Taking them out of the pool, rather than refusing a merge that selects them, keeps the selector
+  from picking the same refused run every cycle.
+- A read can still meet representatives of two Aggs at one timestamp. It folds only those of the
+  smallest Agg (by the `signal.Aggregation` value). That choice depends on the samples alone, so a
+  read returns the same whichever parts merges combine meanwhile.
 
 Anchoring is paid in the ts column, measured on a 1m rollup of 15s scrapes: +0.01 B/row with no scrape
 jitter, +1.1 at ±5ms, +2.0 at ±50ms, against 1.1–6.8 B/row for the value column. The sf column of an

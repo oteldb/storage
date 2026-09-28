@@ -164,13 +164,12 @@ func partOptions(blockRows int, comp compressProfile, rollup *block.Rollup) []bl
 }
 
 // resolvePolicy is the tiers a merge over the live parts src applies: the tiers those parts record,
-// then the policy's tiers that nest with them ([nestedTiers]), which it also returns as dropped when
-// they do not. Recorded tiers go first, so a range already rolled keeps its recorded Agg and width
-// for data rolled later, even when that data never meets the part that recorded them: otherwise a late
-// part rolled alone under a changed Agg would hold representatives that no single marker describes
-// once it meets the older part.
+// then the policy's tiers compatible with them ([compatibleTiers]), which it also returns as dropped
+// when they are not. Recorded tiers keep applying with their recorded Agg, so data landing later in a
+// range already rolled is rolled like the rest of it, even when it never meets the part that recorded
+// the range. src must record one Agg at most ([mergePool]).
 func resolvePolicy(src []*part, tiers []DownsampleTier) (applied, dropped []DownsampleTier) {
-	kept, dropped := nestedTiers(src, tiers)
+	kept, dropped := compatibleTiers(src, tiers)
 
 	var recorded []DownsampleTier
 
@@ -189,38 +188,54 @@ func resolvePolicy(src []*part, tiers []DownsampleTier) (applied, dropped []Down
 	return compactLayout(append(recorded, kept...)), dropped
 }
 
-// nestedTiers splits tiers into those whose Interval nests with every Interval a part of src records
-// and those that do not. Coarsening a representative into a bucket that does not hold its whole
-// bucket cannot be exact, and a marker cannot confine a tier to part of its range, so a non-nesting
-// tier is not applied at all until retention drops the last part recording the tier it conflicts
-// with. The policy validates only against itself; this is the same check against the history.
-func nestedTiers(src []*part, tiers []DownsampleTier) (kept, dropped []DownsampleTier) {
+// compatibleTiers splits tiers into those a merge over src can apply exactly and those it cannot:
+// a tier whose Interval does not nest with one a part of src records, or whose Agg differs from one a
+// part records. The first would coarsen a representative into a bucket that does not hold its whole
+// bucket. The second would re-aggregate representatives by an Agg they were not rolled with, whatever
+// the tier's width (a 1h Count over 1m Sum representatives counts minutes, not samples), and a marker
+// records one Agg per range. Either tier is not applied at all until retention drops the last part
+// recording the tier it conflicts with, since a marker cannot confine a tier to part of its range.
+// The policy validates only against itself; this is the same check against the history.
+func compatibleTiers(src []*part, tiers []DownsampleTier) (kept, dropped []DownsampleTier) {
 	if !activeTiers(tiers) {
 		return tiers, nil
 	}
 
-	var recorded []int64
+	var (
+		intervals []int64
+		aggs      []signal.Aggregation
+	)
 
 	for _, p := range src {
 		for _, t := range p.rollup {
-			if !slices.Contains(recorded, t.Interval) {
-				recorded = append(recorded, t.Interval)
+			if !slices.Contains(intervals, t.Interval) {
+				intervals = append(intervals, t.Interval)
+			}
+
+			if !slices.Contains(aggs, t.Agg) {
+				aggs = append(aggs, t.Agg)
 			}
 		}
 	}
 
-	nests := func(t DownsampleTier) bool {
-		return t.Interval <= 0 || !slices.ContainsFunc(recorded, func(iv int64) bool {
+	fits := func(t DownsampleTier) bool {
+		if t.Interval <= 0 {
+			return true
+		}
+
+		nests := !slices.ContainsFunc(intervals, func(iv int64) bool {
 			return t.Interval%iv != 0 && iv%t.Interval != 0
 		})
+
+		return nests && !slices.ContainsFunc(aggs, func(a signal.Aggregation) bool { return a != t.Agg })
 	}
 
-	if !slices.ContainsFunc(tiers, func(t DownsampleTier) bool { return !nests(t) }) {
+	if !slices.ContainsFunc(tiers, func(t DownsampleTier) bool { return !fits(t) }) {
 		return tiers, nil
 	}
 
 	for _, t := range tiers {
-		if nests(t) {
+		if fits(t) {
 			kept = append(kept, t)
 		} else {
 			dropped = append(dropped, t)
@@ -228,6 +243,63 @@ func nestedTiers(src []*part, tiers []DownsampleTier) (kept, dropped []Downsampl
 	}
 
 	return kept, dropped
+}
+
+// mergePool splits the live parts into those merges may take and those they must leave alone. The
+// engine never records a second Agg while a part records one ([compatibleTiers]), so live marked
+// parts carry one Agg. Parts that disagree anyway, adopted from a node running another policy for
+// example, cannot be merged into one marker without re-aggregating one side by the other's Agg. The
+// pool keeps the Agg of the oldest marked part and quarantines every part recording another: those
+// stay on disk as written, readable, and unmerged until retention drops them. Taking them out of the
+// pool, rather than refusing a merge that selects them, keeps the selector from picking the same
+// refused run every cycle.
+func mergePool(src []*part) (pool, quarantined []*part) {
+	var (
+		keep  signal.Aggregation
+		first *part
+	)
+
+	for _, p := range src {
+		if !activeTiers(p.rollup) {
+			continue
+		}
+
+		if first == nil || p.minTime < first.minTime || p.minTime == first.minTime && p.prefix < first.prefix {
+			first = p
+		}
+	}
+
+	if first == nil {
+		return src, nil
+	}
+
+	for _, t := range first.rollup {
+		if t.Interval > 0 {
+			keep = t.Agg
+
+			break
+		}
+	}
+
+	agrees := func(p *part) bool {
+		return !slices.ContainsFunc(p.rollup, func(t DownsampleTier) bool { return t.Interval > 0 && t.Agg != keep })
+	}
+
+	if !slices.ContainsFunc(src, func(p *part) bool { return !agrees(p) }) {
+		return src, nil
+	}
+
+	pool = make([]*part, 0, len(src))
+
+	for _, p := range src {
+		if agrees(p) {
+			pool = append(pool, p)
+		} else {
+			quarantined = append(quarantined, p)
+		}
+	}
+
+	return pool, quarantined
 }
 
 // rollupPlan is the downsampling a merge applies and the marker its outputs record.
@@ -293,9 +365,8 @@ func (e *Engine) planRollup(ctx context.Context, src []*part, start int64, tiers
 }
 
 // mergeLayout is the layout a merge of src applying tiers rolls its samples up to: every known
-// source's recorded tiers, then tiers. Recorded tiers go first: where a recorded and a current tier
-// tie on Interval and Before but differ in Agg, the rolled data keeps its recorded Agg, and [tierAt]
-// and [pickTier] keep the first of a tie.
+// source's recorded tiers, then tiers. The sources and tiers share one Agg ([mergePool],
+// [resolvePolicy]).
 func mergeLayout(src []*part, tiers []DownsampleTier) []DownsampleTier {
 	var layout []DownsampleTier
 
@@ -379,7 +450,7 @@ func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers 
 			return false, err
 		}
 
-		ts, vals, sf, tags := m.collectTagged(tiers)
+		ts, vals, sf, tags := m.collectTagged()
 
 		rolledTs, rolledVals, rolledSF, _ := downsampleCovering(ts, vals, sf, tags, tiers)
 		if !slices.Equal(rolledTs, ts) {
