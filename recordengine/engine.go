@@ -491,6 +491,10 @@ type Stats struct {
 	IndexFenced bool
 	// IndexLoadErr is the error of the failed load behind IndexFenced, nil while not fenced.
 	IndexLoadErr error
+	// TenureUnestablished is set while this clustered engine holds the shard's claim but its
+	// tenure's first commit has not landed: it commits nothing, so flushes keep their rows in the
+	// head, and every flush and merge tries again.
+	TenureUnestablished bool
 }
 
 // Stats returns an in-memory snapshot of the engine's state under a single read lock (no backend
@@ -511,7 +515,9 @@ func (e *Engine) Stats() Stats {
 		LostParts:     e.lostParts,
 		IndexFenced:   e.loadErr != nil,
 		IndexLoadErr:  e.loadErr,
-		MaxTime:       e.head.newest,
+
+		TenureUnestablished: e.tenureUnestablishedLocked(),
+		MaxTime:             e.head.newest,
 	}
 
 	for _, buf := range e.head.records {

@@ -948,7 +948,7 @@ func (e *Engine) establishTenure(ctx context.Context) error {
 // refused — and the fresh load is what makes a predecessor commit that landed first this tenure's
 // starting point, rather than something a rebase of the view held as a replica would carry the
 // consumed inputs back in beside. A no-op once established, without a cluster, or without a claim.
-// It is bounded like any commit, and until it lands every commit of the tenure is refused, so a
+// It makes one attempt per call, and until one lands every commit of the tenure is refused, so a
 // flush keeps its rows in the head and the WAL. Caller holds e.flushMu and e.mu.
 func (e *Engine) establishTenureLocked(ctx context.Context) error {
 	if e.cfg.Term == nil || e.cfg.Backend == nil {
@@ -960,26 +960,45 @@ func (e *Engine) establishTenureLocked(ctx context.Context) error {
 		return nil
 	}
 
-	for range indexCommitAttempts {
-		if err := e.loadPartsLocked(ctx, loadReplica); err != nil {
-			return errors.Wrap(err, "load bucket index to establish the tenure")
-		}
+	// One attempt, not a loop: a failure leaves the engine exactly where a failed flush would, and
+	// the next flush or merge tries again, so a contended or unreachable index costs one load and one
+	// CAS per operation instead of holding the locks through a retry loop.
+	if err := e.loadPartsLocked(ctx, loadReplica); err != nil {
+		e.cfg.Obs.Corruption.EstablishFailed(ctx, e.cfg.Signal, obs.EstablishUnavailable)
 
-		if err := bucketindex.CheckTenure(term, e.term(), e.generation.Term); err != nil {
-			return err
-		}
-
-		landed, err := e.commitOnceLocked(ctx)
-		if err != nil {
-			return err
-		}
-
-		if landed {
-			e.established = term
-
-			return nil
-		}
+		return errors.Wrap(err, "load bucket index to establish the tenure")
 	}
 
-	return errors.Wrapf(bucketindex.ErrConflict, "establish term %d after %d attempts", term, indexCommitAttempts)
+	if err := bucketindex.CheckTenure(term, e.term(), e.generation.Term); err != nil {
+		return err
+	}
+
+	landed, err := e.commitOnceLocked(ctx)
+	if err != nil {
+		e.cfg.Obs.Corruption.EstablishFailed(ctx, e.cfg.Signal, obs.EstablishUnavailable)
+
+		return errors.Wrapf(err, "establish term %d", term)
+	}
+
+	if !landed {
+		e.cfg.Obs.Corruption.EstablishFailed(ctx, e.cfg.Signal, obs.EstablishConflict)
+
+		return errors.Wrapf(bucketindex.ErrConflict, "establish term %d", term)
+	}
+
+	e.established = term
+
+	return nil
+}
+
+// tenureUnestablishedLocked reports a clustered engine that holds a claim whose tenure has not yet
+// made its first commit, so it commits nothing. Caller holds e.mu.
+func (e *Engine) tenureUnestablishedLocked() bool {
+	if e.cfg.Term == nil || e.cfg.Backend == nil {
+		return false
+	}
+
+	term := e.term()
+
+	return term != 0 && e.established != term
 }

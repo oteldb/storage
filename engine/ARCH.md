@@ -304,8 +304,10 @@ merge and `MergeWith` (ahead of repair) first make the tenure's own commit: a fr
 index (`loadReplica`: no sweep, lost parts become pending wants), committed back under the new term,
 which also publishes those wants and any carried part. Until it lands, `tenureLocked` refuses every
 commit of the term, so a flush keeps its rows in the head and the WAL and a merge does nothing; the
-next maintenance cycle tries again, bounded per attempt like any commit, and a backend that cannot
-take the commit could not take the flush either. A load-time want commit skips an unestablished
+next flush or merge tries again — one load and one CAS each, never a loop holding the locks. An
+unestablished tenure therefore drains nothing, exactly like a flush that keeps failing: the head and
+the WAL hold the rows and grow, and the only bound on that is the optional per-tenant in-flight limit
+(mandatory lossless backpressure is #146). A load-time want commit skips an unestablished
 tenure and leaves the wants pending.
 
 It is a load and not a rebase because of what a predecessor may have committed after the claim moved

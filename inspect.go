@@ -143,6 +143,12 @@ type SignalStats struct {
 	// IndexLoadError is the error of the failed load behind IndexFenced: which part or index, and
 	// why. Empty while not fenced.
 	IndexLoadError string
+	// TenureUnestablished is true while this node holds the shard's claim but its tenure's first
+	// index commit has not landed (storage.index.establish_failures counts the attempts). Like a
+	// fenced engine it commits nothing, so the head keeps its records and grows; every flush and
+	// merge tries again. It is set for a moment after every handoff; one that stays set is an index
+	// the node cannot load or commit to.
+	TenureUnestablished bool
 }
 
 // ClusterStats is the cluster-mode view of this node.
@@ -276,6 +282,7 @@ func (s *Storage) Inspect() StoreStats {
 			WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 			WantedParts: es.WantedParts, Holes: es.Holes, LostParts: es.LostParts,
 			IndexFenced: es.IndexFenced, IndexLoadError: errText(es.IndexLoadErr),
+			TenureUnestablished: es.TenureUnestablished,
 		})
 		s.attachReadGap(&ts.Signals[len(ts.Signals)-1], signal.Metric, tid)
 
@@ -307,6 +314,7 @@ func (s *Storage) Inspect() StoreStats {
 				WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 				WantedParts: es.WantedParts, Holes: es.Holes, LostParts: es.LostParts,
 				IndexFenced: es.IndexFenced, IndexLoadError: errText(es.IndexLoadErr),
+				TenureUnestablished: es.TenureUnestablished,
 			})
 			s.attachReadGap(&ts.Signals[len(ts.Signals)-1], sig, tid)
 		}

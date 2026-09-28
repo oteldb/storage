@@ -12,6 +12,8 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/backend/faultbackend"
+	"github.com/oteldb/storage/internal/obs"
+	"github.com/oteldb/storage/internal/obs/obstest"
 )
 
 // staleCommitCannotLandAfterTheSuccessorEstablishes is the check-to-CAS window: A's merge passes its
@@ -118,31 +120,65 @@ func tenuresAllocateDisjointBlocks(t *testing.T, k Kind) {
 }
 
 // unestablishedTenureKeepsRowsInTheHead: until a new tenure's first commit lands, nothing of it
-// commits. A flush whose establishing commit cannot land fails without writing a part, keeps its rows
-// in the head, and the next flush establishes the tenure and publishes them.
+// commits. Each flush and merge makes one attempt — one CAS, no retry loop — and one that cannot land,
+// whether it lost the race or the backend failed, is counted, fails without writing a part and keeps
+// the rows readable in the head. The first attempt that lands establishes the tenure and the same
+// flush publishes every held row.
 func unestablishedTenureKeepsRowsInTheHead(t *testing.T, k Kind) {
 	t.Helper()
+
+	const cycles = 3
 
 	ctx := context.Background()
 	inner := backend.Memory()
 	be := faultbackend.Wrap(inner)
+	o, m := obstest.New(t)
 
-	e := k.openTenure(t, be, ownerTerm, 0)
-	e.Append(t, api(100, 1))
+	e := k.Open(t, Config{Backend: be, Term: termOf(ownerTerm), Obs: o})
+	require.NoError(t, e.LoadParts(ctx))
 
-	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Err: assert.AnError})
-	require.ErrorIs(t, e.Flush(ctx), assert.AnError)
-	assert.Empty(t, k.partDirs(ctx, t, inner), "no part written for a tenure that could not establish")
-	assert.Equal(t, 1, e.HeadRows())
+	held := []Row{api(100, 1), api(200, 2)}
+	e.Append(t, held...)
+
+	commits := func() int { return be.Count(k.indexCommit) }
+
+	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Lose: true})
+
+	for i := range cycles {
+		before := commits()
+		require.ErrorIsf(t, e.Flush(ctx), bucketindex.ErrConflict, "cycle %d", i)
+		require.ErrorIsf(t, e.ForceMerge(ctx), bucketindex.ErrConflict, "cycle %d", i)
+		assert.Equal(t, before+2, commits(), "one attempt per flush and one per merge")
+	}
+
+	assert.EqualValues(t, 2*cycles,
+		m.Counter("storage.index.establish_failures", "reason", obs.EstablishConflict))
 
 	be.Reset()
+	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Err: assert.AnError})
+
+	for range cycles {
+		require.ErrorIs(t, e.Flush(ctx), assert.AnError)
+	}
+
+	assert.EqualValues(t, cycles,
+		m.Counter("storage.index.establish_failures", "reason", obs.EstablishUnavailable))
+	assert.True(t, e.Stats().TenureUnestablished)
+	assert.Empty(t, k.partDirs(ctx, t, inner), "no part written for a tenure that could not establish")
+	assert.Equal(t, len(held), e.HeadRows())
+	assert.Equal(t, held, sortedRows(t, e), "the held rows stay readable from the head")
+
+	be.Reset()
+	e.Append(t, api(300, 3))
 	require.NoError(t, e.Flush(ctx))
 
 	ix := k.loadIndex(t, inner)
 	require.Len(t, ix.Entries, 1)
 	assert.Equal(t, bucketindex.Generation{Term: ownerTerm, Counter: 2}, ix.Generation,
 		"the establishing commit, then the flush")
-	assert.Equal(t, []Row{api(100, 1)}, sortedRows(t, e))
+	assert.False(t, e.Stats().TenureUnestablished)
+	assert.Zero(t, e.HeadRows())
+	assert.Equal(t, []Row{api(100, 1), api(200, 2), api(300, 3)}, sortedRows(t, e))
 }
 
 // writingTermSurvivesTheNextTenure pins that a part's writing term is part of its identity, not of
