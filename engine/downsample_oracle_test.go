@@ -189,14 +189,13 @@ func FuzzRerollOracle(f *testing.F) {
 	})
 }
 
-// dupRollupIssue gates the reproducers of duplicates rolled apart; it names #726 until the defect has
-// an issue of its own.
-const dupRollupIssue = 726
+// rolledApartIssue gates the reproducers of copies of one sample rolled up by separate merges.
+const rolledApartIssue = 739
 
 // TestRerollOracleDuplicates is [TestRerollOracle] where a sample is written twice before either copy
 // is merged, and the copies land in parts a capped merge rolls one at a time.
 func TestRerollOracleDuplicates(t *testing.T) {
-	reproduce.Unfixed(t, dupRollupIssue, "two representatives of copies of one sample, rolled apart, fold as two samples")
+	reproduce.Unfixed(t, rolledApartIssue, "two representatives of copies of one sample, rolled apart, fold as two samples")
 	t.Parallel()
 
 	// Two copies of each sample in separate parts, then capped merges roll each part on its own.
@@ -219,7 +218,7 @@ func FuzzRerollOracleDuplicates(f *testing.F) {
 	f.Add(uint8(6), []byte{0, 5, 2, 0, 0, 5, 2, 0, 3, 0, 3, 0})
 
 	f.Fuzz(func(t *testing.T, aggByte uint8, ops []byte) {
-		reproduce.Unfixed(t, dupRollupIssue, "two representatives of copies of one sample, rolled apart, fold as two samples")
+		reproduce.Unfixed(t, rolledApartIssue, "two representatives of copies of one sample, rolled apart, fold as two samples")
 
 		if len(ops) > 64 {
 			ops = ops[:64]

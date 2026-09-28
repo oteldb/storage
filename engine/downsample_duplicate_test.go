@@ -16,7 +16,7 @@ import (
 // merge rolls sixteen, the next rolls the last alone, and the two representatives then fold as if
 // the repeated sample were two.
 func TestRerollDuplicateSplitByMaxParts(t *testing.T) {
-	reproduce.Unfixed(t, dupRollupIssue, "copies of one sample rolled by separate merges fold as two samples")
+	reproduce.Unfixed(t, rolledApartIssue, "copies of one sample rolled by separate merges fold as two samples")
 	t.Parallel()
 
 	for _, agg := range []signal.Aggregation{signal.AggSum, signal.AggCount, signal.AggAvg} {
@@ -48,9 +48,9 @@ func TestRerollDuplicateSplitByMaxParts(t *testing.T) {
 }
 
 // TestRerollRecentTierOverRolledRange: a recent tier wide enough to reach a range a merge rolls up
-// mirrors raw samples the representative already accounts for, and a read returns both.
+// mirrors raw samples the representative already accounts for; the merge trims them, so a read
+// returns the representative alone.
 func TestRerollRecentTierOverRolledRange(t *testing.T) {
-	reproduce.Unfixed(t, dupRollupIssue, "the recent tier's raw copies read beside, and fold into, the representative holding them")
 	t.Parallel()
 
 	for _, agg := range []signal.Aggregation{signal.AggSum, signal.AggCount} {
@@ -70,4 +70,26 @@ func TestRerollRecentTierOverRolledRange(t *testing.T) {
 			r.assertOneRollup(opts.Downsample, 0)
 		})
 	}
+}
+
+// TestRerollRecentTierOverVerbatimRollup: a part whose rollup changes nothing is copied verbatim and
+// recorded as rolled; the recent tier's copies of its samples are trimmed as for any rollup, or a
+// Sum representative would fold its own mirror in.
+func TestRerollRecentTierOverVerbatimRollup(t *testing.T) {
+	t.Parallel()
+
+	opts := tiersOf(signal.AggSum, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
+
+	r := newRerollEngine(t)
+	r.e = engine.New(engine.Config{Backend: backend.Memory(), Prefix: "default/metrics", RecentWindow: dayNanos})
+
+	for i := range int64(3) {
+		r.write(rerollBase+i*min1, float64(i+1))
+	}
+
+	r.flush()
+	r.merge(opts)
+	require.Equal(t, 1, r.e.PartCount())
+
+	r.assertOneRollup(opts.Downsample, 0)
 }

@@ -47,8 +47,20 @@ func (e *Engine) populateRecent(detached map[signal.SeriesID]*sampleBuf) {
 		}
 	}
 
-	// Trim every tier buffer to the window, dropping series that no longer hold any in-window sample,
-	// and track the tier's min timestamp for the planFetch short-circuit.
+	e.trimRecentBelow(cutoff)
+}
+
+// trimRecentBelow drops every tier sample older than cutoff, and series left without one, and
+// recomputes the tier's min timestamp for the planFetch short-circuit. Caller holds e.mu.
+//
+// A merge that rolls a range up calls it with the cutoff it applied: the tier mirrors raw samples
+// the representatives now account for, and a read would return both, folding the mirror into the
+// representative at its timestamp.
+func (e *Engine) trimRecentBelow(cutoff int64) {
+	if !e.recentEnabled() {
+		return
+	}
+
 	e.recentMin = maxInt64
 
 	for id, rbuf := range e.recent {

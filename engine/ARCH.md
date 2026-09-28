@@ -613,10 +613,17 @@ newest first, so a First or Last tie goes to the freshest sample. The read path 
 equal timestamps fold on read: anchored representatives of one bucket split across parts are real
 samples and read as two until a merge joins them.
 
-Two limits follow from folding without per-sample provenance. A part holding the same rolled data as
-another would add Sum and Count twice; repair never commits a part beside ancestors it duplicates. And
-the recent tier's raw copy of a sample already rolled up would fold into its representative; the tier
-holds only the last flush window, far younger than any tier's cutoff.
+Folding has no per-sample provenance, so it cannot tell two copies of one sample from two samples.
+- Two raw parts holding copies of one sample, an exporter retry for example, that are rolled by
+  separate merges (a merge cap or `maxParts` splitting the parts due in a bucket) fold as two
+  samples: Sum, Avg and Count count the copy twice. Merged together they dedup first. This is #739,
+  whose reproducers are gated. The fix is to roll a bucket only in a merge that holds every part
+  overlapping it.
+- A part holding the same rolled data as another would add Sum and Count twice; repair never commits
+  a part beside ancestors it duplicates.
+- The recent tier mirrors raw samples that may since have been rolled up. A merge that publishes
+  representatives trims the tier below the latest cutoff it applied (`trimRecentBelow`), so a read
+  never returns the mirror beside, or folded into, the representative accounting for it.
 
 **Recorded Agg wins.** Changing a tier's Agg applies only to time ranges not yet rolled up: a range
 keeps the Agg it was rolled with, and data landing in it later is rolled by that Agg. Every merge
@@ -1173,7 +1180,8 @@ absent, corrupt or mismatched marks prune nothing.
 
 **Recent tier** (`Config.RecentWindow`) — mirrors the most recent flush window in RAM across flushes,
 so a query inside the window acquires no part at all; overlap is deduped by the freshest-wins merge
-(the tier holds raw samples, which never fold into each other).
+(the tier holds raw samples, which never fold into each other). A merge that rolls a range up trims
+the tier below its cutoff, since the parts it mirrors no longer hold those samples raw.
 
 The tier is one of three in-memory sample sources — recent tier, mid-flush detached buffers, head —
 and every read path enumerates them through `enginePlan.memSources`, never by naming the maps. That

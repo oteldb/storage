@@ -241,6 +241,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	}
 
 	e.retireLocked(selected)
+	e.trimRecentBelow(plan.rolledBefore())
 	// Rows that did not survive the merge are retention's work: the samples are gone, so the
 	// identities naming them may be dead too and an identity prune has something to find. Merging
 	// without dropping rows (a plain compaction) leaves every identity backed, so it arms nothing.

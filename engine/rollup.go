@@ -236,6 +236,26 @@ type rollupPlan struct {
 	marker *block.Rollup
 }
 
+// rolledBefore is the latest cutoff below which the merge's output holds representatives, minInt64
+// when it rolls nothing.
+func (p rollupPlan) rolledBefore() int64 {
+	cutoff := minInt64
+
+	for _, t := range p.tiers {
+		if t.Interval > 0 {
+			cutoff = max(cutoff, t.Before)
+		}
+	}
+
+	if p.marker != nil {
+		for _, t := range p.marker.Tiers {
+			cutoff = max(cutoff, t.Before)
+		}
+	}
+
+	return cutoff
+}
+
 // planRollup decides a merge's downsampling. A merge rolls every sample up to the layout it records:
 // the tiers its known sources record, which rolled data keeps whatever the policy says now, and the
 // current tiers where some source is pending. Where every source already holds that layout the rollup
