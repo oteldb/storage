@@ -285,6 +285,13 @@ func (s *Storage) Close(ctx context.Context) error {
 	// Final flush: drain every engine's head to a durable part.
 	var firstErr error
 
+	// An owner drains while it still holds its claims: once it has left the cluster no commit of its
+	// is any tenure's, and the engine closes below would leave every head to the WAL, to be flushed
+	// again by whichever node replays or re-replicates it.
+	if s.cluster != nil && !s.opts.ReadOnly {
+		s.flushOwned(ctx)
+	}
+
 	// Leave the cluster first (revoke lease, stop the replica server) so peers stop routing here.
 	if s.cluster != nil {
 		if err := s.cluster.close(ctx); err != nil {
@@ -910,12 +917,23 @@ func (f seedFetcher) Unwrap() fetch.Fetcher { return f.inner }
 // engineCloser is the Close surface both engine types share, so [Storage.Close] drains them all
 // through one loop.
 type engineCloser interface {
+	Flush(ctx context.Context) error
 	Close(ctx context.Context) error
 	CloseWAL() error
 }
 
 // closeEngines drains every tenant engine's head to a durable part and closes its WAL, returning
 // the first error while still closing the rest.
+// flushOwned flushes every engine whose shard this node still holds the claim on. An engine it does
+// not own refuses the flush before writing anything, so it is skipped without an error.
+func (s *Storage) flushOwned(ctx context.Context) {
+	for _, eng := range s.allEngines() {
+		if err := eng.Flush(ctx); err != nil && !errors.Is(err, bucketindex.ErrSuperseded) {
+			s.obs.Logger(ctx).Warn("flush before leaving the cluster failed", zap.Error(err))
+		}
+	}
+}
+
 func (s *Storage) closeEngines(ctx context.Context) error {
 	var firstErr error
 

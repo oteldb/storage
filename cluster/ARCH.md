@@ -78,6 +78,8 @@ term its operation began under, or once the index it builds on carries a higher 
 (`backend/ARCH.md`, *Part identity*). A handoff therefore never stalls a shard: the new owner flushes
 and merges with the freshest view it has. The cost is duplicate rows, never a collision — an old
 owner's last flush that no replica mirrored is re-flushed by the new owner from its replica head.
+`Storage.Close` therefore flushes every engine it owns *before* leaving the cluster, while the claims
+still hold; after leaving, the engines' final flushes are refused and their heads stay in the WAL.
 
 Tests boot etcd through **`cluster/etcd/etcdtest`**, which binds its listeners to port 0 and reads
 the client port back from the socket. Probing a free port and releasing it for etcd to bind is

@@ -297,9 +297,11 @@ builds on (`generation.Term`, which a load or a rebase raises). A writer with no
 not fenced. A merge stamps its term when it picks its inputs: one whose tenure ended and restarted
 while it ran chose them from a view the intervening tenure may have merged differently. A flush,
 a retention drop and a repair commit take the term at commit instead, since what they publish is
-this node's own head or a part it fetched, valid under any tenure the node holds. A refused flush
-keeps its part as a carried, uncommitted part, like any failed commit; a refused merge rolls back
-and leaves its output to the sweep.
+this node's own head or a part it fetched, valid under any tenure the node holds. A flush checks
+before it writes anything, so a refused one folds its rows back into the head (and its WAL); one
+refused only at the commit keeps its part as a carried, uncommitted part, like any failed commit. A
+refused merge rolls back and leaves its output to the sweep. `Close` treats the refusal as nothing to
+flush: the head stays in the WAL for the next start.
 
 ## A failed load changes nothing, and fences every commit
 

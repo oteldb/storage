@@ -1601,8 +1601,14 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		return 0, 0, nil
 	}
 
-	// Checked after the detach so an empty head flushes as a no-op even while fenced.
-	if err := e.fenceLocked(); err != nil {
+	// Checked after the detach so an empty head flushes as a no-op even while fenced, and before any
+	// I/O so a writer without its tenure writes no part it could not commit.
+	err = e.fenceLocked()
+	if err == nil {
+		err = e.tenureLocked(e.term())
+	}
+
+	if err != nil {
 		e.head.reattach(detached, detachedBytes, detachedSince)
 		e.mu.Unlock()
 

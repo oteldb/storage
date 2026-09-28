@@ -118,8 +118,9 @@ func writingTermSurvivesTheNextTenure(t *testing.T, k Kind) {
 }
 
 // lapsedClaimCommitsNothing is the commit fence over a writer's own term: a flush while the claim is
-// gone is refused and keeps its rows, and a merge whose tenure ended and restarted while it ran is
-// refused too, since it chose its inputs under a tenure that is over.
+// gone is refused before it writes anything and keeps its rows in the head, and a merge whose tenure
+// ended and restarted while it ran is refused too, since it chose its inputs under a tenure that is
+// over.
 func lapsedClaimCommitsNothing(t *testing.T, k Kind) {
 	t.Helper()
 
@@ -139,12 +140,14 @@ func lapsedClaimCommitsNothing(t *testing.T, k Kind) {
 	e.Append(t, api(300, 3))
 	require.ErrorIs(t, e.Flush(ctx), bucketindex.ErrSuperseded, "no claim, no commit")
 	assert.Len(t, k.loadIndex(t, inner).Entries, 2)
+	assert.Len(t, k.partDirs(ctx, t, inner), 2, "and no part written for it")
+	assert.Equal(t, 1, e.HeadRows(), "the rows stay in the head")
 
 	term.Store(3)
 	e.Append(t, api(400, 4))
-	require.NoError(t, e.Flush(ctx), "the carried part commits with the next flush once the claim is back")
+	require.NoError(t, e.Flush(ctx), "the head flushes once the claim is back")
 	assert.EqualValues(t, 3, k.loadIndex(t, inner).Generation.Term)
-	assert.Len(t, k.loadIndex(t, inner).Entries, 4)
+	assert.Len(t, k.loadIndex(t, inner).Entries, 3)
 
 	// Held while it writes its output, so the tenure ends and restarts before it reaches the commit.
 	gate := faultbackend.NewGate()
@@ -156,6 +159,6 @@ func lapsedClaimCommitsNothing(t *testing.T, k Kind) {
 	term.Store(4)
 	require.ErrorIs(t, commit(), bucketindex.ErrSuperseded, "a merge that outlived its tenure commits nothing")
 
-	assert.Len(t, k.loadIndex(t, inner).Entries, 4)
+	assert.Len(t, k.loadIndex(t, inner).Entries, 3)
 	assert.Equal(t, []Row{api(100, 1), api(200, 2), api(300, 3), api(400, 4)}, sortedRows(t, e))
 }

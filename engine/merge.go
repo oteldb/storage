@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/timebucket"
@@ -795,7 +796,9 @@ func mergeStreamedSeries(
 // Close flushes any buffered samples to a part and closes the WAL. It does not stop a background
 // loop — the owner ([storage.Storage]) does that before calling Close.
 func (e *Engine) Close(ctx context.Context) error {
-	if _, _, err := e.flush(ctx); err != nil {
+	// A clustered engine without the shard's claim leaves its head to the WAL, for the next start
+	// to replay, rather than failing to close.
+	if _, _, err := e.flush(ctx); err != nil && !errors.Is(err, bucketindex.ErrSuperseded) {
 		return err
 	}
 
