@@ -652,7 +652,8 @@ readable part's:
   rebases onto the rival's index. After every rebase the commit re-checks the parts it adopted that
   the planning never saw. If one does not nest with the output, the output is dropped, its objects
   are reclaimed like any uncommitted part, and the next merge replans with the adopted part in its
-  history.
+  history. An adopted part that does not open escapes the check, since its layout lives only in its
+  manifest, so a rebase that cannot read it can commit an incompatible output beside it (#745).
 - Whichever writer commits second backs off, so a merge never adds an incompatible layout to the
   index.
 

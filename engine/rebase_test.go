@@ -3,15 +3,18 @@ package engine_test
 import (
 	"context"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
+	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -298,4 +301,87 @@ func TestRebaseNeverCommitsTwoGrids(t *testing.T) {
 		got := fetchAll(t, r, fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{eqMatcher("job", job)}})
 		require.Len(t, got, 1, "nothing is lost: %s", job)
 	}
+}
+
+// blindBackend fails reads of the manifests hide names, as a flaky backend or one lagging on a
+// freshly written object would.
+type blindBackend struct {
+	backend.Backend
+
+	mu   sync.Mutex
+	hide map[string]bool
+}
+
+func (b *blindBackend) Read(ctx context.Context, key string) ([]byte, error) {
+	b.mu.Lock()
+	hidden := b.hide[key]
+	b.mu.Unlock()
+
+	if hidden {
+		return nil, errors.New("injected read failure")
+	}
+
+	return b.Backend.Read(ctx, key)
+}
+
+func (b *blindBackend) setHidden(prefixes ...string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.hide = make(map[string]bool, len(prefixes))
+	for _, p := range prefixes {
+		b.hide[p+"/manifest"] = true
+	}
+}
+
+// TestRebaseBlindToAdoptedPart: writer b rolls its part with Sum while writer a commits a Count rollup
+// b has not seen, and b's backend cannot read that part's manifest for a while. b's commit loses the
+// CAS and rebases onto a's index, but the part it adopts does not open, so the rebase guard never
+// sees its layout and b commits its Sum output beside a's Count part. The committed index must never
+// hold both; once the manifest reads again, b's rollup must still go through.
+func TestRebaseBlindToAdoptedPart(t *testing.T) {
+	reproduce.Unfixed(t, 745, "a rebase that cannot open an adopted part commits a rollup beside an incompatible one")
+	t.Parallel()
+
+	ctx := context.Background()
+	shared := backend.Memory()
+	blind := &blindBackend{Backend: shared}
+
+	a := engine.New(engine.Config{Backend: shared, Prefix: sharedPrefix, WriterID: "a"})
+	require.NoError(t, a.LoadParts(ctx))
+	b := engine.New(engine.Config{Backend: blind, Prefix: sharedPrefix, WriterID: "b"})
+	require.NoError(t, b.LoadParts(ctx))
+
+	tier := func(agg signal.Aggregation) engine.MergeOptions {
+		return engine.MergeOptions{Downsample: []engine.DownsampleTier{{Before: 1 << 62, Interval: 1000, Agg: agg}}}
+	}
+
+	for i := range int64(5) {
+		mustAppend(t, a, mkSeries("job", "api"), 100+i, 1)
+		mustAppend(t, b, mkSeries("job", "web"), 100+i, 1)
+	}
+
+	require.NoError(t, a.Flush(ctx))
+	require.NoError(t, b.Flush(ctx))
+	require.NoError(t, a.MergeWith(ctx, tier(signal.AggCount)))
+
+	parts := a.Parts()
+
+	rolled := make([]string, 0, len(parts))
+	for _, p := range parts {
+		rolled = append(rolled, p.ID)
+	}
+
+	blind.setHidden(rolled...)
+	require.NoError(t, b.MergeWith(ctx, tier(signal.AggSum)))
+
+	r := engine.New(engine.Config{Backend: shared, Prefix: sharedPrefix})
+	require.NoError(t, r.LoadParts(ctx))
+	require.Len(t, r.RecordedAggs(), 1, "the committed index holds one Agg while the adopted part is unreadable")
+
+	blind.setHidden()
+	require.NoError(t, b.MergeWith(ctx, tier(signal.AggSum)))
+	require.NoError(t, r.LoadParts(ctx))
+	require.Len(t, r.RecordedAggs(), 1, "and after it reads again")
+	require.ElementsMatch(t, []string{"api", "web"}, queryable(t, shared, "api", "web"), "nothing is lost")
 }
