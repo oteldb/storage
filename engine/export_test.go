@@ -7,6 +7,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/signal"
 )
 
 // LosePart drops the part naming prefix from the live set and records the repair obligation its
@@ -124,4 +125,48 @@ func SetMergeResidentObserver(fn func(peak, run, limit int64)) func() {
 	mergeResidentObserver = fn
 
 	return func() { mergeResidentObserver = old }
+}
+
+// RegroupTolerance is how far an unweighted Sum or Avg over vals may land from the one-pass rollup
+// once rolled up in more than one grouping.
+func RegroupTolerance(vals []float64) float64 { return regroupTolerance(vals, nil) }
+
+// SetMergeCeilingBytes changes [Config.MergeCeilingBytes] between merges. Callers must not run it
+// concurrently with a merge.
+func (e *Engine) SetMergeCeilingBytes(n int64) { e.cfg.MergeCeilingBytes = n }
+
+// RecordedAggs is every distinct Agg a readable part's rollup marker records.
+func (e *Engine) RecordedAggs() []signal.Aggregation {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	var out []signal.Aggregation
+
+	for _, p := range e.readablePartsLocked() {
+		for _, t := range p.rollup {
+			if t.Interval > 0 && !slices.Contains(out, t.Agg) {
+				out = append(out, t.Agg)
+			}
+		}
+	}
+
+	return out
+}
+
+// RecordedIntervals is every distinct Interval a readable part's rollup marker records.
+func (e *Engine) RecordedIntervals() []int64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	var out []int64
+
+	for _, p := range e.readablePartsLocked() {
+		for _, t := range p.rollup {
+			if t.Interval > 0 && !slices.Contains(out, t.Interval) {
+				out = append(out, t.Interval)
+			}
+		}
+	}
+
+	return out
 }

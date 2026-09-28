@@ -131,7 +131,7 @@ func (r *seriesBlockReader) addRange(ctx context.Context, rng rowRange, m *sampl
 			sf = sfBlk[lo:hi]
 		}
 
-		m.add(tsBlk[lo:hi], valBlk[lo:hi], sf, start, end)
+		m.add(tsBlk[lo:hi], valBlk[lo:hi], sf, r.part.rollup, start, end)
 	}
 
 	return nil

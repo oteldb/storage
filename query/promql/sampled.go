@@ -23,6 +23,17 @@ var SampledWarning = fmt.Errorf(
 	annotations.PromQLWarning,
 )
 
+// AmbiguousRollupWarning is the PromQL warning annotation a Select attaches when a returned series
+// is [fetch.Batch.AmbiguousRollup]: at some timestamp it held downsample representatives rolled up
+// with different aggregations, and the result carries one aggregation's and leaves the others out.
+//
+//nolint:revive,errname,staticcheck // an annotation, named like the PromQL *Warning sentinels it is matched alongside.
+var AmbiguousRollupWarning = fmt.Errorf(
+	"%w: result left out downsampled data rolled up with a different aggregation; "+
+		"storage nodes run different downsampling policies for this tenant",
+	annotations.PromQLWarning,
+)
+
 // WeightedSeries is implemented by every series a [Queryable] returns. ScaleFactors returns the
 // per-sample weights in the iterator's sample order, or nil when every weight is 1.
 // A chunkenc.Iterator has no weight channel, so the adapter never folds the weight into a value

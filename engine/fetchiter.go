@@ -93,6 +93,7 @@ func (it *fetchIter) Next(ctx context.Context) (*fetch.Batch, error) {
 		}
 
 		b := &fetch.Batch{ID: id, Series: p.series[i], Timestamps: ts, Values: values, ScaleFactors: sf}
+		b.AmbiguousRollup = p.noteAmbiguous(it.ctx, &m) //nolint:contextcheck // the fetch's own span, as above
 		if it.recycle {
 			b.SetRelease(it.e.recycle) // caller will Release to recycle the ts/value buffers
 		}

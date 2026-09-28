@@ -136,6 +136,7 @@ func (it *mergeIter) combine(id signal.SeriesID) *Batch {
 	for _, i := range it.refill {
 		b := it.cur[i]
 		out.Timestamps, out.Values, out.ScaleFactors = appendSamples(out.Timestamps, out.Values, out.ScaleFactors, b)
+		out.AmbiguousRollup = out.AmbiguousRollup || b.AmbiguousRollup
 
 		// The samples are copied out, so the child's buffers are dead: release them to recycle the
 		// producing engine's pools (the merged batch carries no hook).

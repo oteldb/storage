@@ -132,7 +132,7 @@ func TestDownsampleNegativeTimestamps(t *testing.T) {
 }
 
 // TestDownsampleIdempotent verifies that re-downsampling an already-rolled-up series with the same
-// tiers is a no-op for every aggregation except Count (a one-sample bucket aggregates to itself).
+// tiers is a no-op for every aggregation once its representatives are known as such, Count included.
 func TestDownsampleIdempotent(t *testing.T) {
 	t.Parallel()
 
@@ -140,14 +140,14 @@ func TestDownsampleIdempotent(t *testing.T) {
 	vals := []float64{1, 2, 3, 4, 5, 6, 7}
 
 	for _, agg := range []signal.Aggregation{
-		signal.AggLast, signal.AggFirst, signal.AggMin, signal.AggMax, signal.AggSum, signal.AggAvg,
+		signal.AggLast, signal.AggFirst, signal.AggMin, signal.AggMax, signal.AggSum, signal.AggAvg, signal.AggCount,
 	} {
 		t.Run(agg.String(), func(t *testing.T) {
 			t.Parallel()
 
 			tiers := []DownsampleTier{{Before: 100, Interval: 10, Agg: agg}}
 			ts1, val1, sf1 := downsample(ts, vals, nil, tiers)
-			ts2, val2, sf2 := downsample(ts1, val1, sf1, tiers)
+			ts2, val2, sf2, _ := downsampleCovering(ts1, val1, sf1, recordedTags(ts1, tiers), tiers)
 			assert.Equal(t, ts1, ts2, "timestamps stable under re-merge")
 			assert.Equal(t, val1, val2, "values stable under re-merge")
 			assert.Equal(t, sf1, sf2, "weights stable under re-merge")
@@ -297,11 +297,21 @@ func TestDownsampleCoarseningCancellation(t *testing.T) {
 	}
 }
 
-// FuzzDownsample asserts the structural invariants hold for arbitrary input, that every aggregation
-// but Count is a fixed point under re-downsampling, and that coarsening a rollup equals rolling the
-// raw samples up at the coarse interval once: exactly for the value-selecting aggregations, within
-// [regroupTolerance] for Sum and Avg. Values span twenty decades and both signs, so sums cancel, and
-// include NaN and ±Inf.
+// recordedTags tags ts as a part whose marker records layout holds them.
+func recordedTags(ts []int64, layout []DownsampleTier) []rollupTag {
+	var tags []rollupTag
+	for i, t := range ts {
+		tags = appendTag(tags, runTag(layout, t), i+1, len(ts))
+	}
+
+	return tags
+}
+
+// FuzzDownsample asserts the structural invariants hold for arbitrary input, that a rollup re-rolled
+// as the representatives its marker records is a fixed point, and that coarsening it equals rolling
+// the raw samples up at the coarse interval once: exactly for the value-selecting aggregations and
+// Count, within [regroupTolerance] for Sum and Avg. Values span twenty decades and both signs, so
+// sums cancel, and include NaN and ±Inf.
 func FuzzDownsample(f *testing.F) {
 	f.Add([]byte{1, 2, 3, 4, 5, 6}, int64(100), int64(10), uint8(0))
 	f.Add([]byte{0, 0, 9, 9}, int64(5), int64(3), uint8(4))
@@ -347,11 +357,13 @@ func FuzzDownsample(f *testing.F) {
 			require.NotEqual(t, gotTs[i-1], gotTs[i], "output timestamps are unique")
 		}
 
-		if agg == signal.AggCount || interval <= 0 {
+		if interval <= 0 {
 			return
 		}
 
-		ts2, val2, sf2 := downsample(gotTs, gotVal, gotSF, tiers)
+		tags := recordedTags(gotTs, tiers)
+
+		ts2, val2, sf2, _ := downsampleCovering(gotTs, gotVal, gotSF, tags, tiers)
 		require.Equal(t, gotTs, ts2, "fixed point")
 		requireSameFloats(t, gotVal, val2, 0, "fixed point")
 		require.Equal(t, gotSF, sf2, "fixed point")
@@ -362,7 +374,7 @@ func FuzzDownsample(f *testing.F) {
 
 		coarse := append(slices.Clone(tiers), DownsampleTier{Before: before, Interval: interval * int64(2+aggByte%3), Agg: agg})
 		wantTs, wantVal, wantSF := downsample(ts, vals, nil, coarse)
-		gotTs, gotVal, gotSF = downsample(gotTs, gotVal, gotSF, coarse)
+		gotTs, gotVal, gotSF, _ = downsampleCovering(gotTs, gotVal, gotSF, tags, coarse)
 		require.Equal(t, wantTs, gotTs, "coarsening keeps the one-pass timestamps")
 		require.Equal(t, wantSF, gotSF, "coarsening keeps the one-pass weights")
 

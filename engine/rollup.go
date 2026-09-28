@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"math"
 	"slices"
@@ -163,63 +164,299 @@ func partOptions(blockRows int, comp compressProfile, rollup *block.Rollup) []bl
 	return opts
 }
 
+// resolvePolicy is the tiers a merge over one cohort applies: the tiers history, the cohort's
+// readable parts, records, then the policy's tiers compatible with every readable part
+// ([compatibleTiers]), which it also returns as dropped when they are not. Recorded tiers keep
+// applying with their recorded Agg, so data landing later in a range already rolled is rolled like
+// the rest of it, even when it never meets the part that recorded the range.
+func resolvePolicy(history, readable []*part, tiers []DownsampleTier) (applied, dropped []DownsampleTier) {
+	kept, dropped := compatibleTiers(readable, tiers)
+
+	var recorded []DownsampleTier
+
+	for _, p := range history {
+		for _, t := range p.rollup {
+			if !slices.Contains(recorded, t) {
+				recorded = append(recorded, t)
+			}
+		}
+	}
+
+	if len(recorded) == 0 {
+		return kept, dropped
+	}
+
+	return compactLayout(append(recorded, kept...)), dropped
+}
+
+// compatibleTiers splits tiers into those a merge over src can apply exactly and those it cannot:
+// a tier whose Interval does not nest with one a part of src records, or whose Agg differs from one a
+// part records. The first would coarsen a representative into a bucket that does not hold its whole
+// bucket. The second would re-aggregate representatives by an Agg they were not rolled with, whatever
+// the tier's width (a 1h Count over 1m Sum representatives counts minutes, not samples), and a marker
+// records one Agg per range. Either tier is not applied at all until retention drops the last part
+// recording the tier it conflicts with, since a marker cannot confine a tier to part of its range.
+// The policy validates only against itself; this is the same check against the history.
+func compatibleTiers(src []*part, tiers []DownsampleTier) (kept, dropped []DownsampleTier) {
+	if !activeTiers(tiers) {
+		return tiers, nil
+	}
+
+	var recorded []DownsampleTier
+	for _, p := range src {
+		recorded = append(recorded, p.rollup...)
+	}
+
+	fits := func(t DownsampleTier) bool { return t.Interval <= 0 || fitsLayout(recorded, t) }
+
+	if !slices.ContainsFunc(tiers, func(t DownsampleTier) bool { return !fits(t) }) {
+		return tiers, nil
+	}
+
+	for _, t := range tiers {
+		if fits(t) {
+			kept = append(kept, t)
+		} else {
+			dropped = append(dropped, t)
+		}
+	}
+
+	return kept, dropped
+}
+
+// tiersNest reports whether two active tiers can share one layout: they roll up by one Agg and one
+// Interval divides the other. It is the one definition of compatible layouts: the policy is checked
+// against the history by it ([compatibleTiers]), cohorts are formed by it ([mergeCohorts]), and a
+// commit's rebase guard checks adopted parts by it.
+func tiersNest(a, b DownsampleTier) bool {
+	return a.Agg == b.Agg && (a.Interval%b.Interval == 0 || b.Interval%a.Interval == 0)
+}
+
+// fitsLayout reports whether active tier t nests with every active tier of layout.
+func fitsLayout(layout []DownsampleTier, t DownsampleTier) bool {
+	return !slices.ContainsFunc(layout, func(o DownsampleTier) bool { return o.Interval > 0 && !tiersNest(o, t) })
+}
+
+// layoutsNest reports whether every active tier of b nests with every one of a and of b itself.
+func layoutsNest(a, b []DownsampleTier) bool {
+	for _, t := range b {
+		if t.Interval > 0 && (!fitsLayout(a, t) || !fitsLayout(b, t)) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// mergeCohort is a set of this engine's parts a merge may combine: those whose recorded layouts nest
+// with each other ([tiersNest]), with history every readable part in the cohort, adopted ones
+// included, and layout the tiers they record.
+type mergeCohort struct {
+	layout  []DownsampleTier
+	parts   []*part
+	history []*part
+}
+
+// mergeCohorts partitions own, the parts this engine may merge, into sets whose recorded layouts nest.
+// One writer never records a layout that does not nest with a readable part's ([compatibleTiers], and
+// the commit guard in [Engine.merge]), so there is normally one cohort. Parts that disagree anyway,
+// written by writers running different policies for one tenant, cannot be merged: a second Agg
+// would re-aggregate one side by the other's, and a grid that does not nest (7m beside 1h) would
+// coarsen a 7m bucket straddling an hour into one hour. Each cohort merges only with itself, every
+// output records one nesting layout, and every cohort is still compacted.
+//
+// Marked readable parts are assigned oldest first (by minTime, then prefix), each to the first cohort
+// it nests with, so the assignment depends on the parts alone. Raw and unmarked parts join the
+// primary cohort, the oldest part's: a late raw sample then rolls like the data that was rolled
+// first, whichever writer wrote it. The primary cohort comes first, the rest in the order formed.
+func mergeCohorts(own, readable []*part) []mergeCohort {
+	marked := make([]*part, 0, len(readable))
+
+	for _, p := range readable {
+		if activeTiers(p.rollup) {
+			marked = append(marked, p)
+		}
+	}
+
+	slices.SortFunc(marked, func(a, b *part) int {
+		if c := cmp.Compare(a.minTime, b.minTime); c != 0 {
+			return c
+		}
+
+		return cmp.Compare(a.prefix, b.prefix)
+	})
+
+	var cohorts []mergeCohort
+
+	of := make(map[*part]int, len(marked))
+
+	for _, p := range marked {
+		i := slices.IndexFunc(cohorts, func(c mergeCohort) bool { return layoutsNest(c.layout, p.rollup) })
+		if i < 0 {
+			i = len(cohorts)
+			cohorts = append(cohorts, mergeCohort{})
+		}
+
+		c := &cohorts[i]
+		for _, t := range p.rollup {
+			if t.Interval > 0 && !slices.Contains(c.layout, t) {
+				c.layout = append(c.layout, t)
+			}
+		}
+
+		c.history = append(c.history, p)
+		of[p] = i
+	}
+
+	if len(cohorts) == 0 {
+		cohorts = append(cohorts, mergeCohort{})
+	}
+
+	for _, p := range own {
+		i, ok := of[p]
+		if !ok {
+			i = 0
+		}
+
+		cohorts[i].parts = append(cohorts[i].parts, p)
+	}
+
+	return slices.DeleteFunc(cohorts, func(c mergeCohort) bool { return len(c.parts) == 0 })
+}
+
+// cohortRun is the selection one merge makes: the first cohort, from start round-robin, whose own
+// selection is not empty, with the tiers it applies and the policy tiers it drops. Round-robin keeps
+// a busy cohort from starving the others. The ladder's still-filling bucket is the one holding the
+// newest readable sample, adopted parts included: a writer that stopped ingesting while a rival goes
+// on would otherwise hold its last bucket open for ever.
+func cohortRun(
+	cohorts []mergeCohort, readable []*part, opts MergeOptions, capBytes int64, idle int, start uint64,
+) (selected []*part, tiers, dropped []DownsampleTier) {
+	newest := newestSample(readable)
+
+	for i := range cohorts {
+		c := &cohorts[(start+uint64(i))%uint64(len(cohorts))]
+
+		o := opts
+		o.Downsample, dropped = resolvePolicy(c.history, readable, opts.Downsample)
+
+		if sel := selectMergePartsBefore(c.parts, o, capBytes, idle, newest); len(sel) > 0 {
+			return sel, o.Downsample, dropped
+		}
+	}
+
+	return nil, nil, dropped
+}
+
 // rollupPlan is the downsampling a merge applies and the marker its outputs record.
 type rollupPlan struct {
 	tiers  []DownsampleTier
 	marker *block.Rollup
 }
 
-// planRollup decides a merge's downsampling: tiers when some source is pending, else none, so
-// representatives already at least as wide are not re-rolled. A lone pending part is rewritten
-// verbatim, its data then holding the tiers as if applied, when rolling it would change nothing: for
-// a marked part, no timestamp, value or weight; for an unmarked one, no timestamp, since its values
-// may already be representatives that a re-roll would corrupt.
-func (e *Engine) planRollup(ctx context.Context, src []*part, start int64, tiers []DownsampleTier) (rollupPlan, error) {
-	if !slices.ContainsFunc(src, func(p *part) bool { return downsamplePending(p, tiers) }) {
-		return rollupPlan{marker: unionRollup(src, nil, false)}, nil
+// rolledBefore is the latest cutoff below which the merge's output holds representatives, minInt64
+// when it rolls nothing.
+func (p rollupPlan) rolledBefore() int64 {
+	cutoff := minInt64
+
+	for _, t := range p.tiers {
+		if t.Interval > 0 {
+			cutoff = max(cutoff, t.Before)
+		}
 	}
 
+	if p.marker != nil {
+		for _, t := range p.marker.Tiers {
+			cutoff = max(cutoff, t.Before)
+		}
+	}
+
+	return cutoff
+}
+
+// planRollup decides a merge's downsampling. A merge rolls every sample up to the layout it records:
+// the tiers its known sources record, which rolled data keeps whatever the policy says now, and the
+// current tiers where some source is pending. Where every source already holds that layout the rollup
+// only folds representatives sharing a bucket, so tiers stays nil and a ladder merge of rolled parts
+// takes the fast path. A lone pending part is rewritten verbatim, its data then holding the layout as
+// if applied, when rolling it would change no timestamp, value or weight. A part without a marker is
+// raw to that test as to every fold: were timestamps alone enough, raw samples on bucket starts would
+// be stamped as representatives of a count they never had.
+func (e *Engine) planRollup(ctx context.Context, src []*part, start int64, tiers []DownsampleTier) (rollupPlan, error) {
+	if !slices.ContainsFunc(src, func(p *part) bool { return downsamplePending(p, tiers) }) {
+		layout := mergeLayout(src, nil)
+		plan := rollupPlan{marker: unionRollup(src, layout, false)}
+
+		if !holdsLayout(src, layout) {
+			plan.tiers = layout
+		}
+
+		return plan, nil
+	}
+
+	layout := mergeLayout(src, tiers)
+
 	if len(src) == 1 {
-		changes, err := e.rollupChanges(ctx, src[0], start, tiers, src[0].rollupKnown)
+		changes, err := e.rollupChanges(ctx, src[0], start, layout)
 		if err != nil {
 			return rollupPlan{}, err
 		}
 
 		if !changes {
-			return rollupPlan{marker: unionRollup(src, tiers, true)}, nil
+			return rollupPlan{marker: unionRollup(src, layout, true)}, nil
 		}
 	}
 
-	return rollupPlan{tiers: tiers, marker: unionRollup(src, tiers, false)}, nil
+	return rollupPlan{tiers: layout, marker: unionRollup(src, layout, false)}, nil
 }
 
-// unionRollup is the marker of a merge of src that applied tiers: per timestamp, the widest layout
-// the merged data there has had applied. It is nil (unknown) when that cannot be expressed as one
-// layout over every source's span: sources disagree on a range they share, or one source's rolled
-// range reaches into another's raw data. A source without a marker counts as having had tiers
-// applied only when they cover its whole span, or when checked is set because the caller verified
-// its samples against tiers; otherwise the result is unknown too.
-func unionRollup(src []*part, tiers []DownsampleTier, checked bool) *block.Rollup {
-	union := slices.Clone(tiers)
+// mergeLayout is the layout a merge of src applying tiers rolls its samples up to: every known
+// source's recorded tiers, then tiers. The sources and tiers share one Agg ([mergeCohorts],
+// [resolvePolicy]).
+func mergeLayout(src []*part, tiers []DownsampleTier) []DownsampleTier {
+	var layout []DownsampleTier
 
 	for _, p := range src {
-		union = append(union, p.rollup...)
+		layout = append(layout, p.rollup...)
 	}
 
-	union = compactLayout(union)
+	return compactLayout(append(layout, tiers...))
+}
 
+// holdsLayout reports whether rolling src up to layout can only fold representatives sharing a
+// bucket: every known source records layout over its own span, and no unknown source holds a sample
+// layout would roll.
+func holdsLayout(src []*part, layout []DownsampleTier) bool {
 	for _, p := range src {
-		if !p.rollupKnown && !checked && !coversSpan(tiers, p.maxTime) {
-			return nil
+		if !p.rollupKnown {
+			if _, ok := tierAt(layout, p.minTime); ok {
+				return false
+			}
+
+			continue
 		}
 
-		held := append(slices.Clone(tiers), p.rollup...)
-		if layoutsDiffer(held, union, p.minTime, p.maxTime) {
+		if layoutsDiffer(p.rollup, layout, p.minTime, p.maxTime) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// unionRollup is the marker of a merge of src that rolled every sample up to layout: per timestamp,
+// the widest layout the merged data there has had applied. A source without a marker counts as
+// rolled only when layout covers its whole span, or when checked is set because the caller verified
+// its samples against layout: past the layout its samples may be legacy representatives the marker
+// would call raw, so the result is unknown instead. A merge of known parts is therefore always known.
+func unionRollup(src []*part, layout []DownsampleTier, checked bool) *block.Rollup {
+	for _, p := range src {
+		if !p.rollupKnown && !checked && !coversSpan(layout, p.maxTime) {
 			return nil
 		}
 	}
 
-	m := rollupMarker(union)
+	m := rollupMarker(layout)
 
 	return &m
 }
@@ -231,11 +468,11 @@ func coversSpan(tiers []DownsampleTier, hi int64) bool {
 	return ok
 }
 
-// rollupChanges reports whether rolling p up under tiers changes any series: its timestamps, and
-// with exact also its values and weights. It streams p one series range at a time and stops at the
+// rollupChanges reports whether rolling p up under tiers changes any series: its timestamps, values
+// or weights. It streams p one series range at a time and stops at the
 // first series that changes, so its footprint is a merge source's read window, released before the
 // rewrite that follows allocates.
-func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers []DownsampleTier, exact bool) (bool, error) {
+func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers []DownsampleTier) (bool, error) {
 	src := []*part{p}
 
 	var keys mergestream.Keys
@@ -251,8 +488,6 @@ func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers 
 	var (
 		streams = []*partStream{s}
 		scratch = make([]rangeBuf, 1)
-		tsBuf   []int64
-		valBuf  []float64
 	)
 
 	for keys.Next() {
@@ -261,16 +496,14 @@ func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers 
 			return false, err
 		}
 
-		var sf []float64
+		ts, vals, sf, tags := m.collectTagged()
 
-		tsBuf, valBuf, sf = m.collect(tsBuf, valBuf)
-
-		rolledTs, rolledVals, rolledSF := downsample(tsBuf, valBuf, sf, tiers)
-		if !slices.Equal(rolledTs, tsBuf) {
+		rolledTs, rolledVals, rolledSF, _ := downsampleCovering(ts, vals, sf, tags, tiers)
+		if !slices.Equal(rolledTs, ts) {
 			return true, nil
 		}
 
-		if exact && (!sameBits(rolledVals, valBuf) || !sameWeights(rolledSF, sf, len(tsBuf))) {
+		if !sameBits(rolledVals, vals) || !sameWeights(rolledSF, sf, len(ts)) {
 			return true, nil
 		}
 	}

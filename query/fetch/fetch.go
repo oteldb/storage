@@ -176,6 +176,14 @@ type Batch struct {
 	// (a gauge read ignores it). Use [Batch.ScaleFactor] to read it with the nil default.
 	ScaleFactors []float64
 
+	// AmbiguousRollup reports (metrics only) that at some timestamp the series held downsample
+	// representatives rolled up with different aggregations, which cannot be combined: the read
+	// returned one aggregation's and left the others out. Only parts written under different
+	// downsampling policies for one tenant, such as nodes mid-rollout, produce it. The storage
+	// counts it as storage.fetch.rollup_ambiguous_ties. A decorator that merges batches ORs it,
+	// and one that retains a batch copies it; the cluster fan-out frame does not carry it.
+	AmbiguousRollup bool
+
 	// Columns are the materialized per-record columns (logs); nil for metrics. Each column's
 	// length matches Timestamps. The named layout is the engine's (e.g. severity, body, attrs).
 	Columns []NamedColumn

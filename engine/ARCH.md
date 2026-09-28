@@ -541,7 +541,7 @@ engine; no parallel subsystem.
 
 | mode | effect |
 |---|---|
-| compact | merge per series by timestamp, freshest wins |
+| compact | merge per series by timestamp: freshest wins, representatives fold |
 | retention | drop samples past `RetainFrom` |
 | downsample | roll up by tier |
 | recompress | size-graduated level; the age tier only on a fully cold part |
@@ -551,8 +551,8 @@ engine; no parallel subsystem.
 per pass — and grid-aligned downsample buckets, so a rollup does not depend on when the merge runs.
 
 **Stable cutoffs:** the caller floors each tier's `Before` to whole buckets of at least an hour, so a
-cutoff never splits a bucket (a split bucket is re-rolled with its own representative, which count
-cannot absorb) and moves once per quantum rather than once per tick. Quantized cutoffs tie, so a
+cutoff never splits a bucket (a split bucket is rolled once per side and folded again later, one
+more rounding for Sum and Avg) and moves once per quantum rather than once per tick. Quantized cutoffs tie, so a
 sample goes to the widest tier it qualifies for rather than the one with the earliest cutoff.
 Exactness also needs tier Intervals to nest, each dividing the next: a coarse cutoff then lies on every
 finer grid, so a fine bucket is never split across tiers and its representative, once coarsened, lands
@@ -573,8 +573,9 @@ each representative carries what a coarser tier needs to re-aggregate it:
   read it unchanged. A part holding Avg representatives therefore has the sf column and no stats
   sidecar. Its points are bucket means, not counter values, so `rate`/`increase` over an Avg-rolled
   counter are approximate.
-- Count is exact only on the first roll: a merge that rolls its representative again counts it as one
-  sample.
+- Count emits the bucket's count at the bucket start, weight 1. The count lives in the value, so only
+  a merge that knows the sample is a representative can combine it; re-rolled as a raw sample it
+  would count as one.
 
 A coarser Sum or Avg equals the one-pass rollup up to floating-point grouping: each representative is
 rounded once when stored, so coarsening adds the same values in a different order. Within a bucket the
@@ -587,9 +588,113 @@ only when it holds nothing else; seeding from the first sample and comparing wit
 leading NaN win a fine bucket and hide a smaller value from the coarse one. First and Last take the
 sample whatever it is, and a NaN or opposing infinities make a Sum or Avg NaN in either grouping.
 
-Changing a tier's Agg applies only to data not yet rolled up; a rolled bucket keeps the Agg it was
-rolled with. The marker keeps a same-width Agg change from forcing a rewrite, but a merge that re-rolls
-a representative for another reason — a pending source beside it — aggregates it by the current Agg.
+**Combining, not re-rolling.** A merge knows which samples are representatives from the markers:
+a sample of a part whose recorded layout assigns its timestamp a tier is that tier's representative
+(`sampleMerge.layouts`, tagged per sample by `sampleMerge.collectTagged`). A representative rolls into the
+wider of its own tier and the one the merge applies, and combines by its **recorded** Agg
+(`bucketAcc.addRep`): Sum totals, Avg weights and anchored samples fold as ordinary samples already, and
+a Count representative adds its value to the count. A raw sample in its bucket folds by that Agg too.
+So repeated merges, coarsening, a bucket split across parts and a late sample all equal one rollup of
+the raw data, Count included; `FuzzRollupCombine` checks it on the fold, `FuzzRerollOracle` through
+real flushes and merges.
+
+Count keeps value = count, weight 1: no format change. The alternatives cost a meaning. Weight = count
+with value = count makes a weight-aware sum count², since a weight is the rows a point stands for, each
+carrying the value; value 1 with weight = count reads as 1 to anything unweighted.
+
+**Same timestamp.** Several sources holding one timestamp collapse to one sample (`foldTie`). Raw
+samples keep freshest-wins, so a re-appended duplicate and the recent tier's copy of a flushed sample
+dedup as before. Where a representative takes part, the representatives combine by their recorded
+Agg and the freshest raw sample folds in as one more sample: two parts can each hold a representative
+of one bucket start (a bucket split by a merge cap, `maxParts`, or rolled on either side of a
+straddler), and a late sample can land on one. Freshest-wins would drop the other's data. Runs fold
+newest first, so a First or Last tie goes to the freshest sample. The read path folds through the same
+`collectMany`, so a query over unmerged parts returns what the merge that joins them stores. Only
+equal timestamps fold on read: anchored representatives of one bucket split across parts are real
+samples and read as two until a merge joins them.
+
+Folding has no per-sample provenance, so it cannot tell two copies of one sample from two samples.
+- Two raw parts holding copies of one sample, an exporter retry for example, that are rolled by
+  separate merges (a merge cap or `maxParts` splitting the parts due in a bucket) fold as two
+  samples: Sum, Avg and Count count the copy twice. Merged together they dedup first. This is #739,
+  whose reproducers are gated. The fix is to roll a bucket only in a merge that holds every part
+  overlapping it.
+- A part holding the same rolled data as another would add Sum and Count twice; repair never commits
+  a part beside ancestors it duplicates.
+- The recent tier mirrors raw samples that may since have been rolled up. A merge that publishes
+  representatives trims the tier below the latest cutoff it applied (`trimRecentBelow`), so a read
+  never returns the mirror beside, or folded into, the representative accounting for it.
+
+**The policy is resolved against the history.** `Validate` checks a policy only against itself.
+Every merge also checks it against the tiers the live parts record (`resolvePolicy`,
+`compatibleTiers`):
+- Recorded tiers keep applying with their recorded Agg. Data landing later in a range already
+  rolled is rolled like the rest of it, even in a late part rolled on its own before it meets the
+  part that recorded the range.
+- A policy tier is not applied at all while a live part records a tier it conflicts with, and the
+  engine warns once. Data it would roll stays raw until retention drops the last conflicting part.
+  A tier conflicts in two ways:
+  - Its Interval does not nest (5m data, then a 7m tier): coarsening a representative into a bucket
+    that does not hold its whole bucket cannot be exact.
+  - Its Agg differs, whatever its width: re-aggregating representatives by an Agg they were not
+    rolled with is wrong. A 1h Count over 1m Sum representatives counts minutes, not samples.
+- A marker cannot confine a tier to part of its range, so there is no partial application.
+
+**One nesting layout on disk.** Two layouts are compatible when every pair of their tiers rolls up by
+one Agg and one Interval divides the other (`tiersNest`). That one predicate decides three things:
+the policy against the history (`compatibleTiers`), the merge cohorts (`mergeCohorts`), and a
+commit's rebase guard (`rollupGuard`). One writer never records a layout incompatible with a
+readable part's:
+- The history the policy is checked against is every readable part, including the parts adopted
+  from a rival writer's index.
+- A rival can still commit an incompatible part after this writer planned its merge: another Agg, or
+  a grid that does not nest (7m beside 1h). That part only appears when the commit loses the CAS and
+  rebases onto the rival's index. After every rebase the commit re-checks the parts it adopted that
+  the planning never saw. If one does not nest with the output, the output is dropped, its objects
+  are reclaimed like any uncommitted part, and the next merge replans with the adopted part in its
+  history. An adopted part that does not open escapes the check, since its layout lives only in its
+  manifest, so a rebase that cannot read it can commit an incompatible output beside it (#745).
+- Whichever writer commits second backs off, so a merge never adds an incompatible layout to the
+  index.
+
+Parts can still disagree when independent writers run different policies for one tenant, for
+example nodes during a policy rollout, in a split brain, or under releases without the guard. Merging
+them would be wrong either way. A second Agg re-aggregates one side by the other's. A grid that does
+not nest coarsens a 7m bucket straddling an hour wholly into one hour, moving minutes of data. So
+merges keep them apart:
+- Marked readable parts are assigned oldest first (by `minTime`, then prefix), each to the first
+  cohort whose layout it nests with (`mergeCohorts`), so the assignment depends on the parts alone.
+  A cohort merges only with itself, so every output records one nesting layout.
+- Cohorts are scheduled round-robin, background, idle-waiver and `Force` alike, so every cohort is
+  still compacted (`cohortRun`).
+- The ladder's still-filling bucket is the one holding the newest readable sample: of all the
+  parts, not one cohort's, and of adopted parts too. A cohort that stops receiving data, or a writer
+  that stops ingesting while a rival goes on, would otherwise keep its own newest bucket open for
+  ever.
+- Raw and unmarked parts join the primary cohort, the oldest marked part's, and roll by its layout.
+  A late raw sample then rolls like the data that was rolled first, whichever node wrote it.
+
+A read over disagreeing parts can meet representatives of two Aggs at one timestamp. They cannot be
+combined, so the read folds only those of the smallest Agg (by the `signal.Aggregation` value). That
+choice depends on the samples alone, so a read returns the same whichever parts merges combine
+meanwhile. It is not silent:
+- the batch carries `fetch.Batch.AmbiguousRollup`, and PromQL adds `AmbiguousRollupWarning` beside
+  `SampledWarning`;
+- `fetch.rollup_ambiguous_ties` counts the ties;
+- the first is logged once.
+
+The flag does not cross the cluster fan-out frame; the owner's counter and log record it. Operators
+must not run nodes with different downsampling policies for one tenant, and the counter shows when
+the Aggs differ.
+
+Representatives of one Agg on grids that do not nest also meet on reads, wherever their bucket starts
+coincide (every 7h for 7m and 1h). That tie folds and is not flagged, because folding one Agg loses
+nothing:
+- Sum and Count add, and Avg weights by population, so every total and weight is kept.
+- First, Last, Min and Max representatives are real samples, which tie only as copies of one sample.
+
+The read point then stands for both buckets. A merge never persists that fold, since the cohorts
+keep the parts apart.
 
 Anchoring is paid in the ts column, measured on a 1m rollup of 15s scrapes: +0.01 B/row with no scrape
 jitter, +1.1 at ±5ms, +2.0 at ±50ms, against 1.1–6.8 B/row for the value column. The sf column of an
@@ -598,7 +703,7 @@ first, last), 5–7× a Last-only part. A late sample in a rolled bucket combine
 write reusing the timestamp of a raw sample already rolled up cannot replace it, since that value is
 gone.
 
-**Fixed points:** repeated merges are stable for every Agg but Count. Recompression checks the part's
+**Fixed points:** repeated merges are stable for every Agg. Recompression checks the part's
 recorded algorithm *and* level, precision the manifest's recorded budget; only an upgrade rewrites,
 and a part denser than the target is left alone.
 
@@ -606,16 +711,24 @@ Downsampling checks the tier layout recorded in the manifest's rollup marker: pe
 (Interval, Agg) the part's data there has had applied. A flush records raw. A merge records the union
 of what it applied and every source's recorded layout, the widest per range, because rolled data stays
 rolled whatever the policy says next: recording a loosened policy, or raw after a merge with no tiers,
-would let a later policy re-roll the representatives, and a re-rolled count is 1. The union is kept
-only when it describes every source exactly over its own span; where one source's rolled range would
-reach into another's raw samples, or a source without a marker is not wholly covered by the applied
-tiers, the output is unknown instead.
+would let a later policy re-roll the representatives by the wrong Agg or width. A merge rolls every
+sample up to the layout it records: the union of what its sources record and what it applies
+(`mergeLayout`). Raw samples that fall in a range another source records as rolled are rolled by that
+layout, even when the policy no longer has a tier there. Removing or narrowing a policy therefore
+un-rolls nothing, and a late raw sample in a recorded-rolled range is still rolled by the recorded
+layout. The marker then describes the output exactly, so a merge of marked parts is always marked.
+
+Only a writer predating the marker leaves a part unknown. Its samples are raw, to the fold and to the
+lone-part check below alike, so a legacy Count representative counts as one sample. Taking values on
+bucket starts for representatives instead would stamp raw samples with a count they never had (a raw
+100 becoming a count of 100), and a raw part on scrape-aligned bucket starts is the common case. A
+merge with an unknown source the layout does not wholly cover records unknown, since past the layout
+nothing checked its samples.
 
 A part is forced only while the current tiers assign some timestamp in `[minTime, maxTime]` a wider
 Interval than the recorded layout; a recorded layout wider than the policy is not pending, since rolled
 data cannot be un-rolled. Nor is an Agg change at the same Interval: it does not apply to data already
-rolled at that Interval, whose buckets hold one representative each, and re-aggregating that
-representative under the new Agg would change nothing but a count, which it would corrupt. The assignment is piecewise constant and changes only at a `Before`, so
+rolled at that Interval, which keeps its recorded Agg. The assignment is piecewise constant and changes only at a `Before`, so
 comparing at `minTime` and at each recorded or current `Before` inside the span is exact, including for
 a multi-tier part straddling a cutoff; with stable cutoffs the part at the frontier is forced once per
 quantum. A part without a marker (written before it existed, or an unknown union) falls back to the age
@@ -623,23 +736,17 @@ test, `minTime` older than some `Before`. Age alone cannot be the test for every
 stays old, so it would be forced every cycle, and forced work winning selection would then starve every
 other bucket's rollup, the ladder and straddler splits.
 
-A merge downsamples only when some source is pending, so a ladder merge of parts already at least as
-wide as the policy does not re-roll their representatives: that re-roll moves no timestamp, and its
-only effect is to corrupt count (a representative recounts as 1). A lone pending part
+A merge with no pending source applies no tiers when every source already holds the merge layout
+over its span. That is the ladder merge of rolled parts: it only folds representatives sharing a
+bucket, and a series with none takes the pass-through path after one linear scan
+(`repBucketShared`). A lone pending part
 is first streamed once, one series range at a time, stopping at the first series the rollup would
-change; if none changes, it is rewritten verbatim and records the union with the current tiers. What
-counts as a change depends on what the marker says the values are. For a marked part they are known
-raw (or narrower), so the rollup must be a no-op on timestamps, values *and* weights: a raw sample on
-a bucket start is still a raw value, which a count tier turns into 1 and a weighted sum into
-value·weight, and copying it verbatim would record a layout it never had. For an unmarked part the
-values may already be representatives, so only timestamps are compared: a part rolled before the
-marker existed sits on its bucket starts, and re-rolling its counts would turn each into 1. A raw
-sample alone in its bucket compares equal under Last/First/Min/Max and Avg too, and there the copy is
-exactly the rollup: those emit the sample itself. The cost
-is that a raw legacy part whose samples happen to sit on bucket starts is recorded as rolled without
-being aggregated — the same trade as reading a legacy part's missing size field conservatively. A merge that mixes a pending source
-with already-rolled ones still re-rolls the rolled ones; combining representatives by their aggregation
-instead is #726.
+change; if none changes, it is rewritten verbatim and records the union with the current tiers. The
+rollup must be a no-op on timestamps, values *and* weights: a raw sample on a bucket start is still a
+raw value, which a count tier turns into 1 and a weighted sum into value·weight, and copying it
+verbatim would record a layout it never had. A raw sample alone in its bucket compares equal under
+Last/First/Min/Max and Avg, and there the copy is exactly the rollup. An unmarked part is not left
+unknown after a verbatim copy: it would stay forced by age, and be rewritten every cycle.
 
 **Weight-aware:** compaction and rollup honor the lossy-sampling scale factor, keeping a sampled series
 unbiased.
@@ -727,9 +834,9 @@ absorb; a straddler that waits a cycle only joins the next batch.
 every series whole, and hands each day's run of the result to that day's writer. Routing on the
 *output* is what keeps a rollup whole and in its own day: intervals are unrestricted and aligned to
 absolute multiples, so a 7h bucket starting 21:00 aggregates samples from both sides of midnight and
-lands on the earlier day. Cutting the input by day would emit two partial aggregates at 21:00 (the
-read keeps one); keeping a rollup in a part with younger raw samples of the next day would leave a
-straddler whose re-merge re-counts a `Count` representative as 1.
+lands on the earlier day. Cutting the input by day would emit two partial aggregates at 21:00 in
+parts of different days, joined only by the read's fold; keeping a rollup in a part with younger raw
+samples of the next day would leave a straddler to split again.
 
 At most `timebucket.MaxOpenWriters` (32) writers are open, and after every day run lands the open
 ones hold less than the merge's resident budget together; past either bound the largest is finished
@@ -1123,7 +1230,9 @@ full part scan, a long series being decoded whole and discarded row by row. Deri
 absent, corrupt or mismatched marks prune nothing.
 
 **Recent tier** (`Config.RecentWindow`) — mirrors the most recent flush window in RAM across flushes,
-so a query inside the window acquires no part at all; overlap is deduped by the freshest-wins merge.
+so a query inside the window acquires no part at all; overlap is deduped by the freshest-wins merge
+(the tier holds raw samples, which never fold into each other). A merge that rolls a range up trims
+the tier below its cutoff, since the parts it mirrors no longer hold those samples raw.
 
 The tier is one of three in-memory sample sources — recent tier, mid-flush detached buffers, head —
 and every read path enumerates them through `enginePlan.memSources`, never by naming the maps. That

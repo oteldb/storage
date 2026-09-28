@@ -131,20 +131,23 @@ func (r Retention) AgeFor(sig signal.Signal) time.Duration {
 // timestamp, and coarsen exactly; Min and Max ignore NaN unless a bucket holds nothing
 // else. Sum keeps the bucket total at the bucket start. Avg keeps the bucket mean at the
 // bucket start, weighted by the bucket's population through the sample's scale factor
-// (fetch.Batch.ScaleFactors). A coarser Sum or Avg equals one rollup
-// of the raw samples up to floating-point grouping: the same sum, added in a different
-// order. Count is not yet exact once a merge rolls its representatives again. A different
-// Agg per tier would aggregate the finer tier's results instead of the raw samples (a 1m Sum
-// then a 1h Max is the max of per-minute sums), so such a policy is rejected.
+// (fetch.Batch.ScaleFactors). Count keeps the bucket's count at the bucket start. A coarser
+// Sum or Avg equals one rollup of the raw samples up to floating-point grouping: the same sum,
+// added in a different order. A different Agg per tier would aggregate the finer tier's
+// results instead of the raw samples (a 1m Sum then a 1h Max is the max of per-minute sums),
+// so such a policy is rejected.
 //
-// Changing Agg applies only to data not yet rolled up: a bucket keeps the Agg it was rolled
-// up with.
+// Rolled data stays rolled. Removing or narrowing a tier un-rolls nothing, and a sample later
+// written into a time range already rolled up is rolled by the layout that range has. A tier
+// that conflicts with one already applied to stored data is not applied at all until retention
+// drops that data; what it would roll stays raw meanwhile. A tier conflicts when its Interval
+// does not nest with the applied one, or when its Agg differs, whatever its width. So changing
+// Agg takes effect only once the data rolled with the old Agg has expired.
 //
 // A sample written late into a bucket that is already rolled up combines with the bucket's
 // representative as new data. It cannot replace a raw sample that is already rolled up,
-// because that value is gone: a late write reusing its timestamp is combined with the
-// aggregate, or replaces it on the representative's own timestamp. Set After beyond the
-// ingest lateness the tenant must tolerate.
+// because that value is gone: a late write reusing its timestamp combines with the aggregate
+// as one more sample. Set After beyond the ingest lateness the tenant must tolerate.
 //
 // A policy that fails [Downsample.Validate] is rejected whole: the tenant is not downsampled
 // at all, and the storage logs a warning once.

@@ -17,8 +17,6 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-const rerollIssue = 726
-
 const (
 	sec  = int64(time.Second)
 	min1 = int64(time.Minute)
@@ -230,12 +228,9 @@ func tiersOf(agg signal.Aggregation, tiers ...engine.DownsampleTier) engine.Merg
 func TestRerollCount(t *testing.T) {
 	t.Parallel()
 
-	const counted = "a Count representative re-rolled by a later merge counts as 1"
-
 	fine := engine.DownsampleTier{Before: rerollBase + hr, Interval: min1}
 
 	t.Run("SameBucket", func(t *testing.T) {
-		reproduce.Unfixed(t, rerollIssue, counted)
 		t.Parallel()
 
 		r := newRerollEngine(t)
@@ -269,7 +264,6 @@ func TestRerollCount(t *testing.T) {
 	})
 
 	t.Run("Coarsen", func(t *testing.T) {
-		reproduce.Unfixed(t, rerollIssue, counted)
 		t.Parallel()
 
 		r := newRerollEngine(t)
@@ -311,19 +305,10 @@ func TestRerollSameBucketStart(t *testing.T) {
 	t.Parallel()
 
 	for _, agg := range []signal.Aggregation{signal.AggSum, signal.AggMin, signal.AggMax, signal.AggCount} {
-		gate := func(t *testing.T) {
-			t.Helper()
-
-			if agg == signal.AggSum || agg == signal.AggCount {
-				reproduce.Unfixed(t, rerollIssue, "freshest-wins drops one of two samples at a bucket start")
-			}
-		}
-
 		// Two parts each roll a different hour of one 6h bucket, so each holds a representative at
 		// the bucket start. The second carries a sample from the previous day: that makes it a
 		// straddler, which is rewritten alone, and retention later drops the stray day.
 		t.Run("TwoRepresentatives/"+agg.String(), func(t *testing.T) {
-			gate(t)
 			t.Parallel()
 
 			opts := tiersOf(agg, engine.DownsampleTier{Before: rerollBase + dayNanos, Interval: 6 * hr})
@@ -355,7 +340,6 @@ func TestRerollSameBucketStart(t *testing.T) {
 
 		// A late raw sample lands exactly on a rolled bucket's start, where no raw sample was.
 		t.Run("RawAtStart/"+agg.String(), func(t *testing.T) {
-			gate(t)
 			t.Parallel()
 
 			opts := tiersOf(agg, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
@@ -386,10 +370,6 @@ func TestRerollLateSample(t *testing.T) {
 		t.Run(agg.String(), func(t *testing.T) {
 			t.Parallel()
 
-			if agg == signal.AggCount {
-				reproduce.Unfixed(t, rerollIssue, "a late sample counts a Count representative as one sample")
-			}
-
 			opts := tiersOf(agg, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
 
 			r := newRerollEngine(t)
@@ -408,15 +388,15 @@ func TestRerollLateSample(t *testing.T) {
 	}
 }
 
-// TestRerollAggChange: an Agg change applies only to data not yet rolled up. A bucket rolled with Sum
-// keeps Sum when a later merge meets it under a Max policy, so a late raw sample folds into the total
-// rather than competing with it as a maximum.
+// TestRerollAggChange: an Agg change is not applied while a part records the old one. A bucket rolled
+// with Sum keeps Sum when the policy switches to Max, so a late raw sample folds into the total rather
+// than competing with it as a maximum, and data past the recorded cutoff stays raw instead of taking
+// Max.
 func TestRerollAggChange(t *testing.T) {
-	reproduce.Unfixed(t, rerollIssue, "a later merge re-aggregates a representative by the current policy's Agg")
 	t.Parallel()
 
 	sum := tiersOf(signal.AggSum, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
-	maxOpts := tiersOf(signal.AggMax, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
+	maxOpts := tiersOf(signal.AggMax, engine.DownsampleTier{Before: rerollBase + 2*hr, Interval: min1})
 
 	r := newRerollEngine(t)
 	r.write(rerollBase, 2)
@@ -425,10 +405,60 @@ func TestRerollAggChange(t *testing.T) {
 	r.merge(sum)
 
 	r.write(rerollBase+2*sec, 4)
+	r.write(rerollBase+hr+min1, 7)
+	r.write(rerollBase+hr+min1+sec, 8)
 	r.flush()
 	r.merge(maxOpts)
 
 	r.assertOneRollup(sum.Downsample, 0)
+}
+
+// TestRerollAggChangeCoarsen: 1m Sum representatives under a policy switched to another Agg with a
+// coarse tier. The coarse tier would re-aggregate the minute representatives by an Agg they were not
+// rolled with (a 1h Count counts minutes, not samples), so it is not applied; reads before and after
+// merges, and a late sample, all match one 1m Sum rollup.
+func TestRerollAggChangeCoarsen(t *testing.T) {
+	t.Parallel()
+
+	sum := tiersOf(signal.AggSum, engine.DownsampleTier{Before: rerollBase + hr, Interval: min1})
+
+	for _, agg := range []signal.Aggregation{signal.AggCount, signal.AggAvg, signal.AggMax} {
+		t.Run(agg.String(), func(t *testing.T) {
+			t.Parallel()
+
+			policy := tiersOf(agg,
+				engine.DownsampleTier{Before: rerollBase + hr, Interval: min1},
+				engine.DownsampleTier{Before: rerollBase + hr, Interval: hr})
+
+			r := newRerollEngine(t)
+			r.write(rerollBase+2*dayNanos, 1)
+			r.flush()
+
+			r.writeRun(rerollBase, 30, 1)
+			r.writeRun(rerollBase+min1, 30, 1)
+			r.flush()
+			r.merge(sum)
+
+			r.assertOneRollup(sum.Downsample, 0)
+
+			policy.Force = true
+			for range 3 {
+				r.merge(policy)
+			}
+
+			r.assertOneRollup(sum.Downsample, 0)
+
+			r.write(rerollBase+min1+45*sec, 100)
+			r.write(rerollBase+2*min1, 5)
+			r.flush()
+
+			for range 3 {
+				r.merge(policy)
+			}
+
+			r.assertOneRollup(sum.Downsample, 0)
+		})
+	}
 }
 
 // TestRerollLateOverwrite: a late write reusing the timestamp of a raw sample that is already rolled
@@ -471,4 +501,98 @@ func TestRerollLateOverwrite(t *testing.T) {
 			r.assertOneRollup(opts.Downsample, 0)
 		})
 	}
+}
+
+// TestRerollReadFoldsRepresentatives: a query over two unmerged parts that each hold a representative
+// of one bucket start, and an unflushed raw sample on it, returns what the merge that joins them
+// stores: one rollup of the raw data.
+func TestRerollReadFoldsRepresentatives(t *testing.T) {
+	t.Parallel()
+
+	for _, agg := range []signal.Aggregation{signal.AggSum, signal.AggAvg, signal.AggCount} {
+		t.Run(agg.String(), func(t *testing.T) {
+			t.Parallel()
+
+			opts := tiersOf(agg, engine.DownsampleTier{Before: rerollBase + dayNanos, Interval: 6 * hr})
+
+			r := newRerollEngine(t)
+			r.write(rerollBase+min1, 1)
+			r.write(rerollBase+2*min1, 9)
+			r.flush()
+			r.merge(opts)
+
+			// A straddler is rewritten alone, so this representative lands in a part of its own.
+			r.write(rerollBase-sec, 100)
+			r.write(rerollBase+3*hr, 5)
+			r.flush()
+			r.merge(opts)
+			require.Equal(t, 3, r.e.PartCount(), "two parts hold a representative at the bucket start")
+
+			r.write(rerollBase, 7)
+
+			r.assertOneRollup(opts.Downsample, 0)
+
+			read, readVals := r.got()
+
+			r.flush()
+
+			opts.RetainFrom = rerollBase
+			r.merge(opts)
+			r.merge(opts)
+			require.Equal(t, 1, r.e.PartCount())
+
+			r.assertOneRollup(opts.Downsample, rerollBase)
+
+			merged, mergedVals := r.got()
+			assert.Equal(t, read[1:], merged, "the read before the merge")
+			assert.Equal(t, readVals[1:], mergedVals, "the read before the merge")
+		})
+	}
+}
+
+// TestRerollAggChangeLateRolledAlone: after an Agg change, a late part in a range already rolled with
+// Sum is rolled on its own before it meets the Sum part. It is rolled with Sum, the recorded Agg, so
+// no part ever records Count beside it; and the Count tier is not applied past the recorded cutoff
+// either, so data there stays raw.
+func TestRerollAggChangeLateRolledAlone(t *testing.T) {
+	t.Parallel()
+
+	sum := tiersOf(signal.AggSum, engine.DownsampleTier{Before: rerollBase + dayNanos, Interval: 6 * hr})
+	count := tiersOf(signal.AggCount, engine.DownsampleTier{Before: rerollBase + dayNanos + 6*hr, Interval: 6 * hr})
+
+	r := newRerollEngine(t)
+	// The ladder leaves the newest day open; a sample two days on closes the one under test.
+	r.write(rerollBase+2*dayNanos, 1)
+	r.flush()
+
+	r.write(rerollBase+min1, 2)
+	r.write(rerollBase+2*min1, 3)
+	r.flush()
+	r.merge(sum)
+
+	// A straddler is rewritten alone, so the late samples are rolled without the Sum part.
+	r.write(rerollBase-sec, 100)
+	r.write(rerollBase+3*hr, 4)
+	r.write(rerollBase+7*hr, 6)
+	r.flush()
+	r.merge(count)
+	require.Equal(t, 4, r.e.PartCount(), "the late part was rolled alone")
+
+	count.RetainFrom = rerollBase
+	r.merge(count)
+	r.merge(count)
+
+	r.write(rerollBase+4*hr, 10)
+	r.write(rerollBase+dayNanos+hr, 11)
+	r.write(rerollBase+dayNanos+hr+sec, 12)
+	r.flush()
+
+	count.Force = true
+	for range 4 {
+		r.merge(count)
+	}
+
+	require.Equal(t, 3, r.e.PartCount(), "one part per day")
+
+	r.assertOneRollup(sum.Downsample, rerollBase)
 }
