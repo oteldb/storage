@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/cluster/etcd"
@@ -64,4 +65,40 @@ func TestClusterCloseFlushesWhileTheClaimIsHeld(t *testing.T) {
 	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{300}, []float64{3}))
 	require.NoError(t, err)
 	require.NoError(t, s.Close(ctx), "a node holding no claim closes cleanly, its head left to the WAL")
+}
+
+// TestClusterCloseReportsAFailedOwnedFlush: the flush before leaving the cluster is the only one this
+// node may make. Once the claims are gone the engines' own final flush is refused as superseded, so
+// a failure of the owned flush has to reach Close's caller — or it reports a clean shutdown while
+// acknowledged rows are only in the WAL.
+//
+//nolint:paralleltest // owns an embedded etcd; runs serially
+func TestClusterCloseReportsAFailedOwnedFlush(t *testing.T) {
+	endpoint := etcdtest.Start(t)
+	ctx := context.Background()
+
+	inner, err := file.New(t.TempDir())
+	require.NoError(t, err)
+
+	be := faultbackend.Wrap(inner)
+
+	s, err := Open(ctx, Options{}, WithBackend(be), WithWALDir(t.TempDir()), WithFlushInterval(-1),
+		WithCluster(&cluster.Config{
+			Etcd:           []string{endpoint},
+			Self:           etcd.Member{ID: "node-a", Addr: "127.0.0.1:0"},
+			RF:             1,
+			PrivateBackend: true,
+		}))
+	require.NoError(t, err)
+
+	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "http.requests", []int64{100, 200}, []float64{1, 2}))
+	require.NoError(t, err)
+
+	const shard = signal.TenantID("default")
+
+	_, owned := s.ownedTenants(ctx, map[signal.TenantID]struct{}{shard: {}})[shard]
+	require.True(t, owned)
+
+	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Err: assert.AnError})
+	require.ErrorIs(t, s.Close(ctx), assert.AnError, "the owned flush failed, and Close says so")
 }

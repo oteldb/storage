@@ -289,12 +289,12 @@ func (s *Storage) Close(ctx context.Context) error {
 	// is any tenure's, and the engine closes below would leave every head to the WAL, to be flushed
 	// again by whichever node replays or re-replicates it.
 	if s.cluster != nil && !s.opts.ReadOnly {
-		s.flushOwned(ctx)
+		firstErr = s.flushOwned(ctx)
 	}
 
 	// Leave the cluster first (revoke lease, stop the replica server) so peers stop routing here.
 	if s.cluster != nil {
-		if err := s.cluster.close(ctx); err != nil {
+		if err := s.cluster.close(ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -922,18 +922,24 @@ type engineCloser interface {
 	CloseWAL() error
 }
 
-// closeEngines drains every tenant engine's head to a durable part and closes its WAL, returning
-// the first error while still closing the rest.
-// flushOwned flushes every engine whose shard this node still holds the claim on. An engine it does
-// not own refuses the flush before writing anything, so it is skipped without an error.
-func (s *Storage) flushOwned(ctx context.Context) {
+// flushOwned flushes every engine whose shard this node still holds the claim on, returning the first
+// failure while still flushing the rest. An engine it does not own refuses the flush before writing
+// anything, so it is skipped without an error. A failure has to reach Close's caller: it is the only
+// flush this node may make, since the engines' own final flush runs after the claims are gone.
+func (s *Storage) flushOwned(ctx context.Context) error {
+	var firstErr error
+
 	for _, eng := range s.allEngines() {
-		if err := eng.Flush(ctx); err != nil && !errors.Is(err, bucketindex.ErrSuperseded) {
-			s.obs.Logger(ctx).Warn("flush before leaving the cluster failed", zap.Error(err))
+		if err := eng.Flush(ctx); err != nil && !errors.Is(err, bucketindex.ErrSuperseded) && firstErr == nil {
+			firstErr = errors.Wrap(err, "flush before leaving the cluster")
 		}
 	}
+
+	return firstErr
 }
 
+// closeEngines drains every tenant engine's head to a durable part and closes its WAL, returning
+// the first error while still closing the rest.
 func (s *Storage) closeEngines(ctx context.Context) error {
 	var firstErr error
 
