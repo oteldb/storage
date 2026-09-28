@@ -111,7 +111,7 @@ func flushInputs(ctx context.Context, t *testing.T, be backend.Backend, split in
 
 	for i, id := range ids {
 		ent := byPrefix[lostPrefix+"/"+id]
-		require.Equal(t, bucketindex.Interval{Min: uint64(i + 1), Max: uint64(i + 1)}, ent.Blocks)
+		require.Equal(t, bucketindex.Range(0, uint64(i+1), uint64(i+1)), ent.Blocks)
 		out = append(out, ent)
 	}
 
@@ -159,7 +159,7 @@ func TestSplitMergeAllocatesAboveItsInputs(t *testing.T) {
 
 	_, fragments := splitMerge(ctx, t, be, inputs)
 	for _, f := range fragments {
-		assert.Greater(t, f.Blocks.Min, inputs[2].Blocks.Max, "fragment %+v is numbered below a retired input", f)
+		assert.Positive(t, f.Blocks.Min.Compare(inputs[2].Blocks.Max), "fragment %+v is numbered below a retired input", f)
 
 		for _, in := range inputs {
 			assert.False(t, f.Supersedes(in), "fragment %+v holds a fraction of %+v and must not claim it", f, in)

@@ -29,7 +29,7 @@ func repairDischargedByPartHeldOnDisk(t *testing.T, k Kind) {
 	held := flushTwo(t, e)[0]
 
 	// The index says the part is gone; the objects never left.
-	e.LosePart(held, bucketindex.Interval{Min: 1, Max: 1})
+	e.LosePart(held, bucketindex.Range(0, 1, 1))
 	require.Equal(t, []string{held}, e.WantPrefixes())
 
 	require.NoError(t, e.Merge(ctx, 0))

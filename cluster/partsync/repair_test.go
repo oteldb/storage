@@ -36,13 +36,13 @@ func TestFetchWantExactPart(t *testing.T) {
 	owner, damaged := backend.Memory(), backend.Memory()
 
 	ix := &bucketindex.Index{}
-	part := writeBlockPart(t, owner, ix, "default/logs", "0001", bucketindex.Interval{Min: 1, Max: 1}, 0)
+	part := writeBlockPart(t, owner, ix, "default/logs", "0001", bucketindex.Range(0, 1, 1), 0)
 	saveIndex(t, owner, "default/logs", ix)
 
 	s := partsync.New(damaged, &partsync.Client{})
 
 	ent, ok, err := s.FetchWant(ctx, "default/logs", []string{serve(t, owner)},
-		bucketindex.Want{Prefix: part, Blocks: bucketindex.Interval{Min: 1, Max: 1}})
+		bucketindex.Want{Prefix: part, Blocks: bucketindex.Range(0, 1, 1)})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, part, ent.Prefix)
@@ -64,13 +64,13 @@ func TestFetchWantPrefersContainingSuccessor(t *testing.T) {
 
 	// The wanted part is gone from the peer too — merged into a level-1 successor covering it.
 	ix := &bucketindex.Index{}
-	merged := writeBlockPart(t, owner, ix, "default/logs", "0100", bucketindex.Interval{Min: 1, Max: 4}, 1)
+	merged := writeBlockPart(t, owner, ix, "default/logs", "0100", bucketindex.Range(0, 1, 4), 1)
 	saveIndex(t, owner, "default/logs", ix)
 
 	s := partsync.New(damaged, &partsync.Client{})
 
 	ent, ok, err := s.FetchWant(ctx, "default/logs", []string{serve(t, owner)},
-		bucketindex.Want{Prefix: "default/logs/0002", Blocks: bucketindex.Interval{Min: 2, Max: 2}})
+		bucketindex.Want{Prefix: "default/logs/0002", Blocks: bucketindex.Range(0, 2, 2)})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, merged, ent.Prefix, "the successor containing the want, not the vanished prefix")
@@ -87,17 +87,17 @@ func TestFetchWantPicksWidestAcrossPeers(t *testing.T) {
 	narrow, wide, damaged := backend.Memory(), backend.Memory(), backend.Memory()
 
 	nix := &bucketindex.Index{}
-	writeBlockPart(t, narrow, nix, "default/logs", "0002", bucketindex.Interval{Min: 2, Max: 2}, 0)
+	writeBlockPart(t, narrow, nix, "default/logs", "0002", bucketindex.Range(0, 2, 2), 0)
 	saveIndex(t, narrow, "default/logs", nix)
 
 	wix := &bucketindex.Index{}
-	big := writeBlockPart(t, wide, wix, "default/logs", "0200", bucketindex.Interval{Min: 1, Max: 8}, 2)
+	big := writeBlockPart(t, wide, wix, "default/logs", "0200", bucketindex.Range(0, 1, 8), 2)
 	saveIndex(t, wide, "default/logs", wix)
 
 	s := partsync.New(damaged, &partsync.Client{})
 
 	ent, ok, err := s.FetchWant(ctx, "default/logs", []string{serve(t, narrow), serve(t, wide)},
-		bucketindex.Want{Prefix: "default/logs/0002", Blocks: bucketindex.Interval{Min: 2, Max: 2}})
+		bucketindex.Want{Prefix: "default/logs/0002", Blocks: bucketindex.Range(0, 2, 2)})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, big, ent.Prefix)
@@ -110,13 +110,13 @@ func TestFetchWantNoPeerHasIt(t *testing.T) {
 	owner, damaged := backend.Memory(), backend.Memory()
 
 	ix := &bucketindex.Index{}
-	writeBlockPart(t, owner, ix, "default/logs", "0009", bucketindex.Interval{Min: 9, Max: 9}, 0)
+	writeBlockPart(t, owner, ix, "default/logs", "0009", bucketindex.Range(0, 9, 9), 0)
 	saveIndex(t, owner, "default/logs", ix)
 
 	s := partsync.New(damaged, &partsync.Client{})
 
 	_, ok, err := s.FetchWant(ctx, "default/logs", []string{serve(t, owner)},
-		bucketindex.Want{Prefix: "default/logs/0002", Blocks: bucketindex.Interval{Min: 2, Max: 2}})
+		bucketindex.Want{Prefix: "default/logs/0002", Blocks: bucketindex.Range(0, 2, 2)})
 	require.NoError(t, err, "every peer answered, so absence is definitive rather than an error")
 	assert.False(t, ok)
 }
@@ -128,7 +128,7 @@ func TestFetchWantUnreachablePeerIsTransient(t *testing.T) {
 	s := partsync.New(backend.Memory(), &partsync.Client{})
 
 	_, ok, err := s.FetchWant(ctx, "default/logs", []string{"127.0.0.1:1"},
-		bucketindex.Want{Prefix: "default/logs/0002", Blocks: bucketindex.Interval{Min: 2, Max: 2}})
+		bucketindex.Want{Prefix: "default/logs/0002", Blocks: bucketindex.Range(0, 2, 2)})
 	require.Error(t, err, "a peer we could not ask is not evidence the part is gone")
 	assert.False(t, ok)
 }
@@ -153,14 +153,14 @@ func TestFetchWantPartialPeerObjectsFail(t *testing.T) {
 	ix := &bucketindex.Index{}
 	ix.Add(bucketindex.Entry{
 		Prefix: "default/logs/0001", MinTime: 1, MaxTime: 2,
-		Blocks: bucketindex.Interval{Min: 1, Max: 1},
+		Blocks: bucketindex.Range(0, 1, 1),
 	})
 	saveIndex(t, owner, "default/logs", ix)
 
 	s := partsync.New(damaged, &partsync.Client{})
 
 	_, ok, err := s.FetchWant(ctx, "default/logs", []string{serve(t, owner)},
-		bucketindex.Want{Prefix: "default/logs/0001", Blocks: bucketindex.Interval{Min: 1, Max: 1}})
+		bucketindex.Want{Prefix: "default/logs/0001", Blocks: bucketindex.Range(0, 1, 1)})
 	require.Error(t, err)
 	assert.False(t, ok)
 }

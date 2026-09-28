@@ -197,6 +197,14 @@ to fail over to: a read overlapping a want fails.
   stamping ownership terms, while still serving reads and still applying replicated writes. Gating
   on the lease deadline rather than on etcd reachability is what keeps a blip free and a partition
   safe (`cluster/ARCH.md`, *Lease fencing*).
+- **A clustered writer commits only as the shard's current tenure.** Every index commit first
+  re-checks that the writer still holds its claim, under the term the operation began with, and
+  that the index it builds on was not written by a later term (`bucketindex.CheckTenure`), and a
+  tenure's first commit re-establishes the index under its term, so over a shared store no displaced
+  writer lands a commit after its successor's first. Part identity is scoped the same way: a block is
+  a `(term, n)` pair, so two tenures that never saw each other's index — every handoff over private
+  backends — cannot allocate the same identity. What the fence leaves possible is duplicate rows,
+  never a collision (`backend/ARCH.md`, *Part identity*).
 - **The bucket index commits last, conditionally.** It is what makes a part durably visible — and in
   `recordengine` it also carries the flush watermark (the WAL replay floor, one slot per writer since
   the watermark is per node and the index is shared) — so its write is the
@@ -253,9 +261,9 @@ to fail over to: a read overlapping a want fails.
   reads as unknown, never raw) / marks (`OTMK`) / column object framing (the
   trailer-dictionary bytes column; the leading layout still read) and key layout, the attribute
   hash+binary encoding (the SeriesID pre-image), symbol table (`OTSY`), the bucket index (format
-  v6: entries with their block sets and split claims, tombstones, wants, per-writer flush
-  watermarks and the block high-water mark — readable back to v1, not writable by older
-  nodes), WAL record framing
+  v7: entries with their term-scoped block sets, split claims and writing term, tombstones, wants,
+  per-writer flush watermarks and the block high-water mark — readable back to v1, not writable by
+  older nodes), WAL record framing
   (additive record types), record-key footer (`OTKY`), the metric part column layout
   (`[series:int128, ts:int64, value:float64]` + optional `sf:float64`), and the profile
   symbol-store sidecar (`OTSP`, version 2: a compressed body with its raw length; version 1 still

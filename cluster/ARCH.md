@@ -72,6 +72,24 @@ therefore drops such a key under a value+lease guard and recreates it under the 
 also makes the restart a real new tenure: the recreated claim takes a higher term, so the
 incarnation's writes outrank the dead one's.
 
+The term is also what scopes a tenure's **part identity** and **fences its commits**: blocks are
+allocated as `(term, n)`, and an engine refuses to commit once `Ownership.Term` no longer reports the
+term its operation began under, or once the index it builds on carries a higher one
+(`backend/ARCH.md`, *Part identity*). A new owner's first commit re-establishes the index under its
+term before anything else of the tenure commits. What that buys depends on the mode:
+
+| mode | what orders a displaced owner's commits against its successor's |
+|---|---|
+| shared store | the index CAS: once the successor's first commit lands, a predecessor's held commit fails and is refused, and one that landed earlier is the successor's starting point |
+| `PrivateBackend` | nothing: each node commits its own index, so the protection is identity — term-scoped blocks never collide, and one identity written twice resolves to the later term |
+
+A handoff therefore never stalls a shard: the new owner flushes and merges with the freshest view it
+has. The cost is duplicate rows, never a collision — in either mode, an old owner's last flush that
+no replica mirrored is re-flushed by the new owner from its replica head, and over private backends
+two owners' overlapping merges either side of the handoff both stay.
+`Storage.Close` therefore flushes every engine it owns *before* leaving the cluster, while the claims
+still hold; after leaving, the engines' final flushes are refused and their heads stay in the WAL.
+
 Tests boot etcd through **`cluster/etcd/etcdtest`**, which binds its listeners to port 0 and reads
 the client port back from the socket. Probing a free port and releasing it for etcd to bind is
 racy: anything, including etcd clients' own ephemeral ports, can take it in between. Only

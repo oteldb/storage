@@ -100,7 +100,7 @@ func TestIndexGenerationFollowsTheTerm(t *testing.T) {
 
 	second := loadIndex(t, be, "default/metrics").Generation
 	assert.EqualValues(t, 9, second.Term)
-	assert.EqualValues(t, 1, second.Counter, "a new tenure starts its own sequence")
+	assert.EqualValues(t, 2, second.Counter, "a new tenure starts its own sequence: its establishing commit, then the flush")
 	assert.Equal(t, 1, second.Compare(first))
 }
 

@@ -13,7 +13,6 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/backend/faultbackend"
-	"github.com/oteldb/storage/internal/reproduce"
 )
 
 // The tests below are two tenures of one shard over a shared object store: writer A under term 1,
@@ -99,11 +98,10 @@ func (k Kind) requireStoredOnce(t *testing.T, be backend.Backend, want []Row) {
 }
 
 // splitBrainMergeSameInputs: A's merge of {P1,P2} outlives its lease, B takes the shard and merges
-// the same two parts, then A's merge commits. Both outputs cover blocks 1-2 at level 1.
+// the same two parts, then A's merge tries to commit. Both outputs cover blocks 1-2 at level 1; the
+// rebase shows A a later tenure's index, so A's commit is refused and B's output is the one live.
 func splitBrainMergeSameInputs(t *testing.T, k Kind) {
 	t.Helper()
-	reproduce.Unfixed(t, 725, "a rebased merge adopts the rival's output as foreign and commits its own "+
-		"beside it, so both outputs of the same inputs stay live under one block identity")
 
 	ctx := context.Background()
 	inner := backend.Memory()
@@ -119,17 +117,16 @@ func splitBrainMergeSameInputs(t *testing.T, k Kind) {
 	require.NoError(t, b.ForceMerge(ctx))
 	require.Equal(t, 1, b.PartCount(), "the new owner merged both parts")
 
-	require.NoError(t, commitA())
+	require.ErrorIs(t, commitA(), bucketindex.ErrSuperseded, "the displaced merge commits nothing")
 
 	k.requireStoredOnce(t, inner, want)
 }
 
 // splitBrainMergeOverlappingInputs: A merges {P1,P2} past its lease while B, which sees P1 as sealed
-// under its smaller merge cap, flushes P3 and merges {P2,P3}. P2's rows are in both outputs.
+// under its smaller merge cap, flushes P3 and merges {P2,P3}. P2's rows would be in both outputs, so
+// A's commit is refused.
 func splitBrainMergeOverlappingInputs(t *testing.T, k Kind) {
 	t.Helper()
-	reproduce.Unfixed(t, 725, "a rebased merge adopts the rival's output as foreign and commits its own "+
-		"beside it, so the input both merged is live twice")
 
 	ctx := context.Background()
 	inner := backend.Memory()
@@ -164,7 +161,7 @@ func splitBrainMergeOverlappingInputs(t *testing.T, k Kind) {
 	require.ElementsMatch(t, []Part{parts[1], p3[0]}, removedParts(before, b.Parts()),
 		"the new owner merges P2 and P3, leaving P1 sealed")
 
-	require.NoError(t, commitA())
+	require.ErrorIs(t, commitA(), bucketindex.ErrSuperseded, "the displaced merge commits nothing")
 
 	want := append(slices.Clone(big), api(2000, 2000), api(3000, 3000))
 	k.requireStoredOnce(t, inner, want)
@@ -174,8 +171,6 @@ func splitBrainMergeOverlappingInputs(t *testing.T, k Kind) {
 // hand A the term B's index carries, or A's commit supersedes the owner's tenure with its own write.
 func displacedWriterKeepsItsTerm(t *testing.T, k Kind) {
 	t.Helper()
-	reproduce.Unfixed(t, 725, "a rebase adopts the rival's higher generation and Generation.Next keeps its term, "+
-		"so the displaced writer commits under the new owner's term")
 
 	ctx := context.Background()
 	be := backend.Memory()
@@ -192,7 +187,7 @@ func displacedWriterKeepsItsTerm(t *testing.T, k Kind) {
 	require.Equal(t, uint64(ownerTerm), owner.Term)
 
 	a.Append(t, api(300, 3))
-	_ = a.Flush(ctx)
+	require.ErrorIs(t, a.Flush(ctx), bucketindex.ErrSuperseded)
 
 	got := k.loadIndex(t, be).Generation
 	t.Logf("owner committed %+v, index after the displaced flush %+v", owner, got)

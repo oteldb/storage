@@ -255,10 +255,13 @@ type Engine struct {
 	// lostParts is the index's monotone data-loss counter, carried across commits and raised to a
 	// rival's on rebase, so it is a cluster-visible fact and not a level a restart clears.
 	lostParts uint64
-	// allocated is the block-number high-water mark this engine last committed, carried across
-	// commits and raised to a rival's on rebase for the same reason: identity must stay unique over
-	// the shard's whole life, and the live set it could otherwise be derived from shrinks.
-	allocated uint64
+	// allocated is the block high-water mark this engine last committed, carried across commits
+	// and raised to a rival's on rebase for the same reason: identity must stay unique over the
+	// shard's whole life, and the live set it could otherwise be derived from shrinks.
+	allocated bucketindex.Block
+	// established is the ownership term whose first commit has landed: until it equals the current
+	// term, no commit of that tenure is allowed. See [Engine.establishTenureLocked].
+	established uint64
 	// pendingHoles are the losses the next commit must acknowledge. Like pendingWants they are
 	// held rather than applied on the spot, so a commit that never lands leaves the want
 	// outstanding instead of half-discharged.
@@ -488,6 +491,10 @@ type Stats struct {
 	IndexFenced bool
 	// IndexLoadErr is the error of the failed load behind IndexFenced, nil while not fenced.
 	IndexLoadErr error
+	// TenureUnestablished is set while this clustered engine holds the shard's claim but its
+	// tenure's first commit has not landed: it commits nothing, so flushes keep their rows in the
+	// head, and every flush and merge tries again.
+	TenureUnestablished bool
 }
 
 // Stats returns an in-memory snapshot of the engine's state under a single read lock (no backend
@@ -508,7 +515,9 @@ func (e *Engine) Stats() Stats {
 		LostParts:     e.lostParts,
 		IndexFenced:   e.loadErr != nil,
 		IndexLoadErr:  e.loadErr,
-		MaxTime:       e.head.newest,
+
+		TenureUnestablished: e.tenureUnestablishedLocked(),
+		MaxTime:             e.head.newest,
 	}
 
 	for _, buf := range e.head.records {
@@ -1399,6 +1408,12 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		return 0, 0, err
 	}
 
+	if err := e.establishTenureLocked(ctx); err != nil {
+		e.mu.Unlock()
+
+		return 0, 0, err
+	}
+
 	detached, detachedBytes := e.head.detach()
 	if detached == nil {
 		e.mu.Unlock()
@@ -1407,8 +1422,14 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		return 0, 0, nil
 	}
 
-	// Checked after the detach so an empty head flushes as a no-op even while fenced.
-	if err := e.fenceLocked(); err != nil {
+	// Checked after the detach so an empty head flushes as a no-op even while fenced, and before any
+	// I/O so a writer without its tenure writes no part it could not commit.
+	err = e.fenceLocked()
+	if err == nil {
+		err = e.tenureLocked(e.term())
+	}
+
+	if err != nil {
 		e.head.reattach(detached, detachedBytes)
 		e.mu.Unlock()
 

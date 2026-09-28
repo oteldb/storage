@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/timebucket"
@@ -61,6 +62,11 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 
 	// Repair first: a part pulled back from a peer joins this cycle's compaction, and a merge that
 	// cannot repair still compacts.
+	// Repair commits under the tenure too, so it has to be established before repair runs.
+	if err := e.establishTenure(ctx); err != nil {
+		return err
+	}
+
 	e.repairWants(ctx)
 
 	res, err := e.merge(ctx, opts)
@@ -100,9 +106,19 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
 
+	// The tenure the inputs were chosen under: a merge that outlives it commits nothing.
+	stamp := e.term()
+
 	// Plan (under lock): snapshot the source parts (immutable backing). Output part ids are minted one
 	// at a time, as the parts are written.
 	e.mu.Lock()
+
+	if err := e.establishTenureLocked(ctx); err != nil {
+		e.mu.Unlock()
+
+		return mergeResult{}, err
+	}
+
 	src := e.parts
 	adopted := slices.Collect(maps.Values(e.foreignParts))
 	e.mu.Unlock()
@@ -246,7 +262,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	committed := e.parts
 	e.parts = replaceParts(e.parts, removed, newParts...)
 
-	if err = e.commitIndexLocked(ctx, rollupGuard(readable, plan.marker, e)); err != nil {
+	if err = e.commitIndexLocked(ctx, stamp, rollupGuard(readable, plan.marker, e)); err != nil {
 		e.parts = committed
 
 		if !errors.Is(err, errRollupConflict) {
@@ -792,18 +808,24 @@ func mergeStreamedSeries(
 // Close flushes any buffered samples to a part and closes the WAL. It does not stop a background
 // loop — the owner ([storage.Storage]) does that before calling Close.
 func (e *Engine) Close(ctx context.Context) error {
-	if _, _, err := e.flush(ctx); err != nil {
-		return err
+	// A clustered engine without the shard's claim leaves its head to the WAL, for the next start
+	// to replay, rather than failing to close. A flush that failed otherwise still closes the WAL:
+	// its segments hold the head for the next start either way.
+	_, _, flushErr := e.flush(ctx)
+	if errors.Is(flushErr, bucketindex.ErrSuperseded) {
+		flushErr = nil
 	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.cfg.WAL != nil {
-		return e.cfg.WAL.Close()
+		if err := e.cfg.WAL.Close(); err != nil && flushErr == nil {
+			return err
+		}
 	}
 
-	return nil
+	return flushErr
 }
 
 // CloseWAL closes the engine's open WAL segment file handle without flushing the head or

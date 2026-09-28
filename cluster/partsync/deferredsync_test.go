@@ -62,7 +62,7 @@ func TestFetchWantsSyncsTheCopiedPart(t *testing.T) {
 
 	be := backend.Memory()
 	ix := &bucketindex.Index{}
-	merged := writeBlockPart(t, be, ix, prefix, "0100", bucketindex.Interval{Min: 1, Max: 4}, 1)
+	merged := writeBlockPart(t, be, ix, prefix, "0100", bucketindex.Range(0, 1, 4), 1)
 	saveIndex(t, be, prefix, ix)
 
 	peer := servePeer(t, be, prefix, probeOpts{})

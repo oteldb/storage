@@ -117,8 +117,8 @@ func syncOmissionAfterMerge(t *testing.T, tombstone bool) {
 	ix := &bucketindex.Index{Generation: gen(1, 5)}
 	writePart(t, owner, ix, omitPrefix, 1, 100, 150)
 	writePart(t, owner, ix, omitPrefix, 2, 200, 250)
-	ix.Entries[0].Blocks, ix.Entries[0].Level = bucketindex.Interval{Min: 1, Max: 1}, 0
-	ix.Entries[1].Blocks, ix.Entries[1].Level = bucketindex.Interval{Min: 2, Max: 2}, 0
+	ix.Entries[0].Blocks, ix.Entries[0].Level = bucketindex.Range(0, 1, 1), 0
+	ix.Entries[1].Blocks, ix.Entries[1].Level = bucketindex.Range(0, 2, 2), 0
 	saveIndex(t, owner, omitPrefix, ix)
 
 	addr := serve(t, owner)
@@ -136,7 +136,7 @@ func syncOmissionAfterMerge(t *testing.T, tombstone bool) {
 
 	merged := &bucketindex.Index{Generation: gen(1, 6)}
 	writePart(t, owner, merged, omitPrefix, 3, 100, 250)
-	merged.Entries[0].Blocks, merged.Entries[0].Level = bucketindex.Interval{Min: 1, Max: 2}, 1
+	merged.Entries[0].Blocks, merged.Entries[0].Level = bucketindex.Range(0, 1, 2), 1
 
 	if tombstone {
 		for _, seq := range []int{1, 2} {

@@ -136,7 +136,7 @@ func (m *lineageModel) step() {
 		slices.Sort(rows)
 		m.rnd.Shuffle(len(rows), func(i, j int) { rows[i], rows[j] = rows[j], rows[i] })
 
-		c := bucketindex.Claim{Blocks: union, Group: bucketindex.Interval{Min: m.next + 1, Max: m.next + uint64(k)}}
+		c := bucketindex.Claim{Blocks: union, Group: bucketindex.Range(0, m.next+1, m.next+uint64(k))}
 		for i := range k {
 			m.next++
 			p := modelPart{

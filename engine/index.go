@@ -47,13 +47,16 @@ const indexCommitAttempts = 8
 // part is dropped from the index that survives. It is a no-op for a head-only engine (no
 // backend), and refused while the engine is fenced ([Engine.fenceLocked]). Caller holds e.mu.
 func (e *Engine) updateIndexLocked(ctx context.Context) error {
-	return e.commitIndexLocked(ctx, nil)
+	return e.commitIndexLocked(ctx, e.term(), nil)
 }
 
-// commitIndexLocked is [Engine.updateIndexLocked] that runs guard, when non-nil, after each rebase:
-// an error from it abandons the commit, since the rival's parts it adopted may be ones the caller's
-// own must not be committed beside. Caller holds e.mu.
-func (e *Engine) commitIndexLocked(ctx context.Context, guard func() error) error {
+// commitIndexLocked is [Engine.updateIndexLocked] for an operation that began under ownership term
+// stamp. Every attempt first passes the tenure fence ([Engine.tenureLocked]), so a writer displaced
+// while the operation ran — or one a rebase shows a later tenure has overtaken — commits nothing.
+// guard, when non-nil, runs after each rebase: an error from it abandons the commit, since the
+// rival's parts it adopted may be ones the caller's own must not be committed beside. Caller holds
+// e.mu.
+func (e *Engine) commitIndexLocked(ctx context.Context, stamp uint64, guard func() error) error {
 	if e.cfg.Backend == nil {
 		return nil
 	}
@@ -63,32 +66,13 @@ func (e *Engine) commitIndexLocked(ctx context.Context, guard func() error) erro
 	}
 
 	for range indexCommitAttempts {
-		ix := e.nextIndexLocked(ctx)
-
-		version, err := ix.Save(ctx, e.cfg.Backend, e.indexKey(), e.indexVersion)
-		if err == nil {
-			e.indexVersion = version
-			// Only a commit that landed discharges a want: the obligation is dropped from the
-			// engine's own list here, never while building an index that may not be written.
-			e.wants = ix.Wanted
-			e.pendingWants, e.adoptedWants = nil, nil
-			// Same rule for the blocks this attempt allocated: a part numbered before its CAS
-			// landed would hold a block the winner took, and the retry would not re-allocate.
-			for i := range e.pendingBlocks {
-				a := &e.pendingBlocks[i]
-				a.part.blocks, a.part.claim, a.part.level, a.part.pending = a.blocks, a.claim, a.level, nil
-			}
-
-			e.pendingBlocks = nil
-			e.holes, e.lostParts = ix.Holes(), ix.LostParts
-			e.allocated = ix.AllocatedBlocks
-			e.pendingHoles = nil
-
-			return nil
+		if err := e.tenureLocked(stamp); err != nil {
+			return err
 		}
 
-		if !errors.Is(err, bucketindex.ErrConflict) {
-			return errors.Wrap(err, "save bucket index")
+		landed, err := e.commitOnceLocked(ctx)
+		if err != nil || landed {
+			return err
 		}
 
 		if err := e.adoptIndexLocked(ctx); err != nil {
@@ -104,6 +88,41 @@ func (e *Engine) commitIndexLocked(ctx context.Context, guard func() error) erro
 
 	return errors.Wrapf(bucketindex.ErrConflict,
 		"commit bucket index after %d attempts", indexCommitAttempts)
+}
+
+// commitOnceLocked makes one conditional write of the index this engine would commit now, reporting
+// whether it landed; a lost race is not an error. Caller holds e.mu.
+func (e *Engine) commitOnceLocked(ctx context.Context) (bool, error) {
+	ix := e.nextIndexLocked(ctx)
+
+	version, err := ix.Save(ctx, e.cfg.Backend, e.indexKey(), e.indexVersion)
+	if err != nil {
+		if errors.Is(err, bucketindex.ErrConflict) {
+			return false, nil
+		}
+
+		return false, errors.Wrap(err, "save bucket index")
+	}
+
+	e.indexVersion = version
+	// Only a commit that landed discharges a want: the obligation is dropped from the engine's own
+	// list here, never while building an index that may not be written.
+	e.wants = ix.Wanted
+	e.pendingWants, e.adoptedWants = nil, nil
+	// Same rule for the blocks this attempt allocated: a part numbered before its CAS landed would
+	// hold a block the winner took, and the retry would not re-allocate.
+	for i := range e.pendingBlocks {
+		a := &e.pendingBlocks[i]
+		a.part.blocks, a.part.claim, a.part.level, a.part.term = a.blocks, a.claim, a.level, a.term
+		a.part.pending = nil
+	}
+
+	e.pendingBlocks = nil
+	e.holes, e.lostParts = ix.Holes(), ix.LostParts
+	e.allocated = ix.AllocatedBlocks
+	e.pendingHoles = nil
+
+	return true, nil
 }
 
 // adoptIndexLocked rebases this engine on the index a rival writer committed: it takes that
@@ -142,7 +161,7 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 	// not walk back: the counter only ever rises.
 	e.holes = mergeHoles(e.holes, ix.Holes())
 	e.lostParts = max(e.lostParts, ix.LostParts)
-	e.allocated = max(e.allocated, ix.AllocatedBlocks)
+	e.allocated = bucketindex.MaxBlock(e.allocated, ix.AllocatedBlocks)
 
 	e.foreign = foreignEntries(ix.Entries, e.indexed, e.removals, e.wants)
 	e.openForeignLocked(ctx)
@@ -255,32 +274,31 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 	// Block numbers are allocated here, per attempt, because a rival's entries are only known
 	// after a rebase: allocating once and reusing it across retries would hand a part a block the
 	// winner already claimed. The assignments are held, not applied — see [Engine.updateIndexLocked].
-	next := e.nextBlockLocked(ix)
-	groups := make(map[*splitGroup]*groupRun)
+	alloc := bucketindex.NewAllocator(e.nextBlockLocked(ix))
 
 	var assigned []blockAssignment
 
 	live := make(map[string]struct{}, len(e.parts))
-	for _, p := range e.parts {
-		blocks, claim, level := p.blocks, p.claim, p.level
-		if id := p.pending; id != nil {
-			blocks, claim = allocateBlocks(id, &next, groups)
-			level = id.level
 
-			assigned = append(assigned, blockAssignment{part: p, blocks: blocks, claim: claim, level: level})
+	for _, p := range e.parts {
+		blocks, claim, level, term := p.blocks, p.claim, p.level, p.term
+		if plan := p.pending; plan != nil {
+			blocks, claim = alloc.Assign(plan)
+			level, term = plan.Level, alloc.Term()
+
+			assigned = append(assigned, blockAssignment{part: p, blocks: blocks, claim: claim, level: level, term: term})
 		}
 
 		ix.Add(bucketindex.Entry{
 			Prefix: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
-			Blocks: blocks, Claim: claim, Level: level,
+			Blocks: blocks, Claim: claim, Level: level, Term: term,
 		})
 		live[p.prefix] = struct{}{}
 	}
 
-	// One above the last block handed out, over every source this attempt considered — so the mark
-	// only ever rises, and a shard whose live set has since emptied never renumbers over a part it
-	// once held.
-	ix.AllocatedBlocks = next - 1
+	// The last block handed out, over every source this attempt considered — so the mark only ever
+	// rises, and a shard whose live set has since emptied never renumbers over a part it once held.
+	ix.AllocatedBlocks = alloc.Mark()
 
 	e.pendingBlocks = assigned
 
@@ -479,7 +497,7 @@ func (e *Engine) livePart(
 	delete(open, ent.Prefix)
 
 	p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
-	p.blocks, p.claim, p.level = ent.Blocks, ent.Claim, ent.Level
+	p.blocks, p.claim, p.level, p.term = ent.Blocks, ent.Claim, ent.Level, ent.Term
 
 	return p, nil
 }
@@ -488,7 +506,7 @@ func (e *Engine) livePart(
 // still pending, so reusing it needs no write.
 func (p *part) matchesEntry(ent *bucketindex.Entry) bool {
 	return p.pending == nil && p.minTime == ent.MinTime && p.maxTime == ent.MaxTime &&
-		p.level == ent.Level && p.blocks.Equal(ent.Blocks) && p.claim.Equal(ent.Claim)
+		p.level == ent.Level && p.term == ent.Term && p.blocks.Equal(ent.Blocks) && p.claim.Equal(ent.Claim)
 }
 
 // indexLoad is the state a load replaces, read and opened into locals so that a load failing
@@ -743,8 +761,9 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 	// One commit drops the gone parts from Entries and states the wants that replace them. It runs
 	// before the rest of the load so the obligation is durable even if identity recovery fails. A
 	// carried part's identity would be stamped by this commit, which does not hold flushMu, so the
-	// wants then stay pending for the next flush or merge to commit.
-	if len(l.lost) > 0 && mode == loadOwner && !l.carried {
+	// wants then stay pending for the next flush or merge to commit. So do they on a clustered engine
+	// without an established tenure, which may not commit yet: the load is then an unclaimed one.
+	if len(l.lost) > 0 && mode == loadOwner && !l.carried && e.tenureLocked(e.term()) == nil {
 		if err := e.updateIndexLocked(ctx); err != nil {
 			return errors.Wrap(err, "record repair wants")
 		}
@@ -874,4 +893,98 @@ func colsTimeRange(cols *flushColumns) (minTime, maxTime int64) {
 	}
 
 	return minTime, maxTime
+}
+
+// tenureLocked is the commit fence of a clustered writer ([bucketindex.CheckTenure]) for an
+// operation that began under term stamp, checked against the term of the index the commit builds on.
+// It also refuses a tenure not yet established ([Engine.establishTenureLocked]). A writer with no
+// cluster has no tenure to lose. Caller holds e.mu.
+func (e *Engine) tenureLocked(stamp uint64) error {
+	if e.cfg.Term == nil {
+		return nil
+	}
+
+	current := e.term()
+	if err := bucketindex.CheckTenure(stamp, current, e.generation.Term); err != nil {
+		return err
+	}
+
+	if e.established != current {
+		return errors.Wrapf(bucketindex.ErrSuperseded, "term %d is not established", current)
+	}
+
+	return nil
+}
+
+// establishTenure is [Engine.establishTenureLocked] for a caller holding neither lock.
+func (e *Engine) establishTenure(ctx context.Context) error {
+	e.flushMu.Lock()
+	defer e.flushMu.Unlock()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.establishTenureLocked(ctx)
+}
+
+// establishTenureLocked makes the first commit of the engine's current tenure, before any flush,
+// merge or repair of that tenure may commit: a fresh load of the index, committed back under the new
+// term. The commit is what closes the window between a predecessor's tenure check and its CAS — the
+// index version moves, so a predecessor's held commit can only fail, rebase into this term and be
+// refused — and the fresh load is what makes a predecessor commit that landed first this tenure's
+// starting point, rather than something a rebase of the view held as a replica would carry the
+// consumed inputs back in beside. A no-op once established, without a cluster, or without a claim.
+// It makes one attempt per call, and until one lands every commit of the tenure is refused, so a
+// flush keeps its rows in the head and the WAL. Caller holds e.flushMu and e.mu.
+func (e *Engine) establishTenureLocked(ctx context.Context) error {
+	if e.cfg.Term == nil || e.cfg.Backend == nil {
+		return nil
+	}
+
+	term := e.term()
+	if term == 0 || e.established == term {
+		return nil
+	}
+
+	// One attempt, not a loop: a failure leaves the engine exactly where a failed flush would, and
+	// the next flush or merge tries again, so a contended or unreachable index costs one load and one
+	// CAS per operation instead of holding the locks through a retry loop.
+	if err := e.loadPartsLocked(ctx, loadReplica); err != nil {
+		e.cfg.Obs.Corruption.EstablishFailed(ctx, metricSignal, obs.EstablishUnavailable)
+
+		return errors.Wrap(err, "load bucket index to establish the tenure")
+	}
+
+	if err := bucketindex.CheckTenure(term, e.term(), e.generation.Term); err != nil {
+		return err
+	}
+
+	landed, err := e.commitOnceLocked(ctx)
+	if err != nil {
+		e.cfg.Obs.Corruption.EstablishFailed(ctx, metricSignal, obs.EstablishUnavailable)
+
+		return errors.Wrapf(err, "establish term %d", term)
+	}
+
+	if !landed {
+		e.cfg.Obs.Corruption.EstablishFailed(ctx, metricSignal, obs.EstablishConflict)
+
+		return errors.Wrapf(bucketindex.ErrConflict, "establish term %d", term)
+	}
+
+	e.established = term
+
+	return nil
+}
+
+// tenureUnestablishedLocked reports a clustered engine that holds a claim whose tenure has not yet
+// made its first commit, so it commits nothing. Caller holds e.mu.
+func (e *Engine) tenureUnestablishedLocked() bool {
+	if e.cfg.Term == nil || e.cfg.Backend == nil {
+		return false
+	}
+
+	term := e.term()
+
+	return term != 0 && e.established != term
 }

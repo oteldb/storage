@@ -13,10 +13,10 @@ import (
 
 // members is the block set as a plain sorted list — the naive reference the algebra is checked
 // against, so a bug in the runs-and-gaps encoding cannot hide behind the same bug in the test.
-func members(iv bucketindex.Interval) []uint64 {
-	var out []uint64
+func members(iv bucketindex.Interval) []bucketindex.Block {
+	var out []bucketindex.Block
 
-	iv.Each(func(b uint64) bool {
+	iv.Each(func(b bucketindex.Block) bool {
 		out = append(out, b)
 
 		return true
@@ -25,16 +25,24 @@ func members(iv bucketindex.Interval) []uint64 {
 	return out
 }
 
-func randomSet(rnd *rand.Rand, span uint64) ([]uint64, bucketindex.Interval) {
-	var nums []uint64
+// randomSet draws a set over terms 0 to 2, so runs and gaps also cross the boundary between two
+// tenures' number spaces.
+func randomSet(rnd *rand.Rand, span uint64) ([]bucketindex.Block, bucketindex.Interval) {
+	var (
+		blocks []bucketindex.Block
+		iv     bucketindex.Interval
+	)
 
-	for b := uint64(1); b <= span; b++ {
-		if rnd.IntN(3) == 0 {
-			nums = append(nums, b)
+	for term := range uint64(3) {
+		for n := uint64(1); n <= span; n++ {
+			if rnd.IntN(6) == 0 {
+				blocks = append(blocks, bucketindex.Block{Term: term, N: n})
+				iv = iv.Union(bucketindex.TermBlocks(term, n))
+			}
 		}
 	}
 
-	return nums, bucketindex.Blocks(nums...)
+	return blocks, iv
 }
 
 func TestBlocksMatchesTheNaiveSet(t *testing.T) {
@@ -82,7 +90,7 @@ func TestUnionMatchesSetUnion(t *testing.T) {
 		an, a := randomSet(rnd, 10)
 		bn, b := randomSet(rnd, 10)
 
-		want := slices.Compact(slices.Sorted(slices.Values(slices.Concat(an, bn))))
+		want := slices.Compact(slices.SortedFunc(slices.Values(slices.Concat(an, bn)), bucketindex.Block.Compare))
 
 		ab := a.Union(b)
 		assert.Equal(t, want, members(ab))
@@ -149,7 +157,7 @@ func TestNoHullClaimsAnUnheldBlock(t *testing.T) {
 	rnd := rand.New(rand.NewPCG(43, 47))
 	for range 1000 {
 		inputs := make([]bucketindex.Interval, 0, 4)
-		held := map[uint64]struct{}{}
+		held := map[bucketindex.Block]struct{}{}
 
 		var union bucketindex.Interval
 
@@ -165,7 +173,7 @@ func TestNoHullClaimsAnUnheldBlock(t *testing.T) {
 
 		for _, b := range members(union) {
 			_, ok := held[b]
-			assert.Truef(t, ok, "block %d is claimed by the union of %v but held by no input", b, inputs)
+			assert.Truef(t, ok, "block %v is claimed by the union of %v but held by no input", b, inputs)
 		}
 	}
 }
@@ -188,7 +196,7 @@ func TestJointCoverageNeedsEveryMember(t *testing.T) {
 	partial := &bucketindex.Index{Entries: []bucketindex.Entry{frag("a", 4), frag("b", 5)}}
 	_, ok := partial.Satisfying(want)
 	assert.False(t, ok, "two thirds of a group answers nothing")
-	assert.Equal(t, []uint64{6}, partial.Missing(want), "and the third is what repair must fetch")
+	assert.Equal(t, []bucketindex.Block{{N: 6}}, partial.Missing(want), "and the third is what repair must fetch")
 
 	whole := &bucketindex.Index{Entries: []bucketindex.Entry{frag("a", 4), frag("b", 5), frag("c", 6)}}
 	got, ok := whole.Satisfying(want)

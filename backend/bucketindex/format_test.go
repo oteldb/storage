@@ -16,11 +16,11 @@ func fullIndex() *bucketindex.Index {
 	return &bucketindex.Index{
 		Entries: []bucketindex.Entry{
 			{
-				Prefix: "a", MinTime: 1, MaxTime: 2, Level: 2,
-				Blocks: bucketindex.Interval{Min: 1, Max: 4, Gaps: []bucketindex.Gap{{Min: 2, Max: 3}}},
+				Prefix: "a", MinTime: 1, MaxTime: 2, Level: 2, Term: 3,
+				Blocks: bucketindex.TermBlocks(1, 1, 4).Union(bucketindex.TermBlocks(2, 1)),
 				Claim: bucketindex.Claim{
-					Blocks: bucketindex.Interval{Min: 6, Max: 7},
-					Group:  bucketindex.Interval{Min: 1, Max: 4},
+					Blocks: bucketindex.Range(1, 6, 7),
+					Group:  bucketindex.Range(2, 1, 4),
 				},
 			},
 		},
@@ -33,24 +33,60 @@ func fullIndex() *bucketindex.Index {
 		Wanted: []bucketindex.Want{
 			{
 				Prefix:     "x",
-				Blocks:     bucketindex.Interval{Min: 5, Max: 5},
+				Blocks:     bucketindex.Range(2, 5, 5),
 				Level:      1,
+				Term:       2,
 				MinTime:    13,
 				MaxTime:    14,
 				Generation: bucketindex.Generation{Term: 11, Counter: 12},
 			},
 		},
 		LostParts:       15,
-		AllocatedBlocks: 16,
+		AllocatedBlocks: bucketindex.Block{Term: 2, N: 16},
 	}
 }
 
-// TestGoldenV6 pins the v6 byte layout: an accidental reordering or a dropped field breaks here
+// TestGoldenV7 pins the v7 byte layout: an accidental reordering or a dropped field breaks here
 // before it breaks a deployment.
-func TestGoldenV6(t *testing.T) {
+func TestGoldenV7(t *testing.T) {
 	t.Parallel()
 
 	want := []byte{
+		'B', 'I', 7,
+		// one entry: prefix, zigzag times,
+		1, 1, 'a', 2, 4,
+		// blocks {1:1, 1:4, 2:1}: lowest number 1, its term 1, top term +1, top number 1, and two
+		// gaps, 1:2..1:3 and 1:5..2:0 — the rest of term 1's number space,
+		1, 1, 1, 1, 2, 1, 2, 1, 3, 1, 5, 2, 0,
+		// level 2, flags, a claim on term 1's [6,7] held by term 2's group [1,4], the writer's term,
+		2, 0, 1, 6, 1, 0, 7, 0, 1, 2, 0, 4, 0, 3,
+		3,    // flushed epoch
+		4, 5, // generation
+		1, 1, 'r', 6, 7, // one removal
+		1, 1, 'w', 8, 9, 10, // one writer epoch
+		// one want: prefix, blocks {2:5}, level, times, gen, no claim, the writer's term
+		1, 1, 'x', 5, 2, 0, 5, 0, 1, 26, 28, 11, 12, 0, 2,
+		15,    // lost parts
+		2, 16, // allocated blocks: term, number
+	}
+	assert.Equal(t, want, fullIndex().AppendBinary(nil))
+}
+
+func TestV7RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	in := fullIndex()
+	out, err := bucketindex.Decode(in.AppendBinary(nil))
+	require.NoError(t, err)
+	assert.Equal(t, in, out)
+}
+
+// TestDecodeV6Golden pins the migration from v6: every block is term 0, and so are the writers'
+// terms and the high-water mark.
+func TestDecodeV6Golden(t *testing.T) {
+	t.Parallel()
+
+	got, err := bucketindex.Decode([]byte{
 		'B', 'I', 6,
 		// one entry: prefix, zigzag times, blocks {1} ∪ {4} as bounds 1..4 with one gap 2..3,
 		// level 2, flags, a claim on blocks [6,7] held by group [1,4].
@@ -62,17 +98,18 @@ func TestGoldenV6(t *testing.T) {
 		1, 1, 'x', 5, 5, 0, 1, 26, 28, 11, 12, 0, // one want: prefix, blocks, level, times, gen, no claim
 		15, // lost parts
 		16, // allocated blocks
-	}
-	assert.Equal(t, want, fullIndex().AppendBinary(nil))
-}
-
-func TestV6RoundTrip(t *testing.T) {
-	t.Parallel()
-
-	in := fullIndex()
-	out, err := bucketindex.Decode(in.AppendBinary(nil))
+	})
 	require.NoError(t, err)
-	assert.Equal(t, in, out)
+
+	want := fullIndex()
+	want.Entries[0].Term, want.Wanted[0].Term = 0, 0
+	want.Entries[0].Blocks = bucketindex.Blocks(1, 4)
+	want.Entries[0].Claim = bucketindex.Claim{Blocks: bucketindex.Range(0, 6, 7), Group: bucketindex.Range(0, 1, 4)}
+	want.Wanted[0].Blocks = bucketindex.Blocks(5)
+	want.AllocatedBlocks = bucketindex.Block{N: 16}
+	assert.Equal(t, want, got)
+	assert.Equal(t, bucketindex.Block{N: 17}, got.NextBlock(0), "a writer with no cluster continues term 0")
+	assert.Equal(t, bucketindex.Block{Term: 9, N: 1}, got.NextBlock(9), "a tenure starts its own sequence")
 }
 
 // TestDecodeV5Golden pins the migration: the v5 bytes this reader must keep parsing, and what a v5
@@ -94,11 +131,15 @@ func TestDecodeV5Golden(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	assert.Equal(t, bucketindex.Interval{Min: 1, Max: 4}, got.Entries[0].Blocks)
+	assert.Equal(t, bucketindex.Range(0, 1, 4), got.Entries[0].Blocks)
 	assert.Equal(t, bucketindex.Claim{}, got.Entries[0].Claim)
 	assert.Zero(t, got.AllocatedBlocks)
 	assert.EqualValues(t, 15, got.LostParts)
-	assert.EqualValues(t, 6, got.NextBlock(), "numbering continues above what a v5 index still names")
+	assert.Equal(t, bucketindex.Block{N: 6}, got.NextBlock(0), "numbering continues above what a v5 index still names")
+
+	inverted, err := bucketindex.Decode([]byte{'B', 'I', 5, 1, 1, 'a', 2, 4, 9, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+	require.NoError(t, err)
+	assert.Equal(t, bucketindex.Interval{}, inverted.Entries[0].Blocks, "a hull naming nothing reads as unset")
 }
 
 // TestDecodeV4Compat verifies a v4 index — no block identity, no wanted list — still decodes, with
@@ -136,6 +177,7 @@ func TestDecodeAllVersions(t *testing.T) {
 		4: {'B', 'I', 4, 1, 1, 'a', 2, 4, 3, 4, 5, 0, 0},
 		5: {'B', 'I', 5, 1, 1, 'a', 2, 4, 0, 0, 0, 0, 3, 4, 5, 0, 0, 0, 0},
 		6: {'B', 'I', 6, 1, 1, 'a', 2, 4, 0, 0, 0, 0, 3, 4, 5, 0, 0, 0, 0, 0},
+		7: {'B', 'I', 7, 1, 1, 'a', 2, 4, 0, 0, 0, 0, 0, 3, 4, 5, 0, 0, 0, 0, 0, 0},
 	}
 	for ver, data := range cases {
 		t.Run(fmt.Sprintf("v%d", ver), func(t *testing.T) {
@@ -150,7 +192,7 @@ func TestDecodeAllVersions(t *testing.T) {
 		})
 	}
 
-	_, err := bucketindex.Decode([]byte{'B', 'I', 7, 0})
+	_, err := bucketindex.Decode([]byte{'B', 'I', 8, 0})
 	require.ErrorIs(t, err, bucketindex.ErrCorrupt, "a version this reader does not know is rejected")
 }
 
@@ -169,6 +211,31 @@ func TestDecodeRejectsCorruptV6(t *testing.T) {
 		"claim not a flag":   {'B', 'I', 6, 1, 1, 'a', 2, 4, 1, 4, 0, 0, 0, 2},
 		"claim group unset":  {'B', 'I', 6, 1, 1, 'a', 2, 4, 1, 4, 0, 0, 0, 1, 6, 7, 0, 0},
 		"missing allocated":  {'B', 'I', 6, 0, 0, 0, 0, 0, 0, 0},
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := bucketindex.Decode(data)
+			require.ErrorIs(t, err, bucketindex.ErrCorrupt)
+		})
+	}
+}
+
+// TestDecodeRejectsCorruptV7 covers the fields v7 added: the block terms, the writers' terms and
+// the high-water mark's term.
+func TestDecodeRejectsCorruptV7(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string][]byte{
+		"missing min term":    {'B', 'I', 7, 1, 1, 'a', 2, 4, 1},
+		"missing term span":   {'B', 'I', 7, 1, 1, 'a', 2, 4, 1, 3},
+		"term span overflows": {'B', 'I', 7, 1, 1, 'a', 2, 4, 1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 1, 1, 0},
+		"run across terms":    {'B', 'I', 7, 1, 1, 'a', 2, 4, 5, 1, 1, 3, 0, 0, 0, 0, 0, 3, 4, 5, 0, 0, 0, 0, 0, 0},
+		"missing gap block":   {'B', 'I', 7, 1, 1, 'a', 2, 4, 1, 1, 0, 4, 1, 1},
+		"missing entry term":  {'B', 'I', 7, 1, 1, 'a', 2, 4, 0, 0, 0, 0},
+		"missing want term":   {'B', 'I', 7, 0, 0, 0, 0, 0, 0, 1, 1, 'x', 0, 0, 0, 0, 0, 0, 0},
+		"missing mark term":   {'B', 'I', 7, 0, 0, 0, 0, 0, 0, 0, 0},
+		"missing mark number": {'B', 'I', 7, 0, 0, 0, 0, 0, 0, 0, 0, 5},
 	}
 	for name, data := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -223,7 +290,7 @@ func randomIndex(rnd *rand.Rand) *bucketindex.Index {
 	ix := &bucketindex.Index{
 		FlushedEpoch:    rnd.Uint64(),
 		Generation:      bucketindex.Generation{Term: rnd.Uint64(), Counter: rnd.Uint64()},
-		AllocatedBlocks: rnd.Uint64(),
+		AllocatedBlocks: bucketindex.Block{Term: rnd.Uint64(), N: rnd.Uint64()},
 	}
 
 	for i := range rnd.IntN(6) {
@@ -234,6 +301,7 @@ func randomIndex(rnd *rand.Rand) *bucketindex.Index {
 			Blocks:  randomInterval(rnd),
 			Claim:   randomClaim(rnd),
 			Level:   uint32(rnd.IntN(4)),
+			Term:    rnd.Uint64N(5),
 		})
 	}
 
@@ -254,6 +322,7 @@ func randomIndex(rnd *rand.Rand) *bucketindex.Index {
 			Prefix:     fmt.Sprintf("lost-%02d", i),
 			Blocks:     randomInterval(rnd),
 			Claim:      randomClaim(rnd),
+			Term:       rnd.Uint64(),
 			Generation: bucketindex.Generation{Term: rnd.Uint64(), Counter: rnd.Uint64()},
 		})
 	}
@@ -275,59 +344,70 @@ func randomClaim(rnd *rand.Rand) bucketindex.Claim {
 }
 
 // randomInterval covers the boundaries that matter: unset, block 1, a single block, a wide range,
-// a gapped set, and the top of the number space.
+// a gapped set, one spanning several terms, and the top of the number and term spaces.
 func randomInterval(rnd *rand.Rand) bucketindex.Interval {
-	switch rnd.IntN(6) {
+	switch rnd.IntN(8) {
 	case 5:
 		nums := make([]uint64, 0, 8)
 		for range rnd.IntN(7) + 1 {
 			nums = append(nums, rnd.Uint64N(40)+1)
 		}
 
-		return bucketindex.Blocks(nums...)
+		return bucketindex.TermBlocks(rnd.Uint64N(3), nums...)
+	case 6:
+		var iv bucketindex.Interval
+		for range rnd.IntN(4) + 1 {
+			iv = iv.Union(bucketindex.TermBlocks(rnd.Uint64(), rnd.Uint64N(40)+1))
+		}
+
+		return iv
+	case 7:
+		return bucketindex.Range(math.MaxUint64, math.MaxUint64-1, math.MaxUint64)
 	case 0:
 		return bucketindex.Interval{}
 	case 1:
-		return bucketindex.Interval{Min: 1, Max: 1}
+		return bucketindex.Range(0, 1, 1)
 	case 2:
 		n := rnd.Uint64N(1000) + 1
 
-		return bucketindex.Interval{Min: n, Max: n}
+		return bucketindex.Range(rnd.Uint64(), n, n)
 	case 3:
 		lo := rnd.Uint64N(1000) + 1
 
-		return bucketindex.Interval{Min: lo, Max: lo + rnd.Uint64N(1000)}
+		return bucketindex.Range(0, lo, lo+rnd.Uint64N(1000))
 	default:
-		return bucketindex.Interval{Min: math.MaxUint64 - 1, Max: math.MaxUint64}
+		return bucketindex.Range(0, math.MaxUint64-1, math.MaxUint64)
 	}
 }
 
 // FuzzRoundTrip drives encode∘decode over arbitrary block sets: the entry's own set is built from
-// the fuzzer's bytes so gapped, inverted and out-of-range shapes all reach the encoder.
+// the fuzzer's bytes so gapped, inverted, out-of-range and multi-term shapes all reach the encoder.
+// Each byte is a block: its low 5 bits the number, its high 3 bits added to term.
 func FuzzRoundTrip(f *testing.F) {
-	f.Add([]byte{1}, uint32(0), uint64(0), uint64(0), uint64(0))
-	f.Add([]byte{}, uint32(0), uint64(1), uint64(1), uint64(0))
-	f.Add([]byte{3, 4, 9, 200}, uint32(7), uint64(math.MaxUint64), uint64(math.MaxUint64), uint64(9))
+	f.Add([]byte{1}, uint32(0), uint64(0), uint64(0), uint64(0), uint64(0))
+	f.Add([]byte{}, uint32(0), uint64(1), uint64(1), uint64(0), uint64(0))
+	f.Add([]byte{3, 4, 9, 200}, uint32(7), uint64(math.MaxUint64), uint64(math.MaxUint64), uint64(9), uint64(0))
+	f.Add([]byte{0x21, 0x22, 0x41, 0xff}, uint32(1), uint64(5), uint64(5), uint64(3), uint64(math.MaxUint64-8))
 
-	f.Fuzz(func(t *testing.T, blocks []byte, level uint32, wantMin, wantMax, allocated uint64) {
-		nums := make([]uint64, 0, len(blocks))
+	f.Fuzz(func(t *testing.T, blocks []byte, level uint32, wantMin, wantMax, allocated, term uint64) {
+		var own bucketindex.Interval
 		for _, b := range blocks {
-			nums = append(nums, uint64(b))
+			own = own.Union(bucketindex.TermBlocks(term+uint64(b>>5), uint64(b&0x1f)))
 		}
 
 		// An interval that names no real set of blocks is written as unset (see
 		// TestInvalidIntervalEncodesAsUnset), so the identity is stated over canonical input.
-		wanted := bucketindex.Interval{Min: wantMin, Max: wantMax}
+		wanted := bucketindex.Range(term, wantMin, wantMax)
 		if !wanted.Valid() {
 			wanted = bucketindex.Interval{}
 		}
 
 		in := &bucketindex.Index{
 			Entries: []bucketindex.Entry{
-				{Prefix: "p", MinTime: -1, MaxTime: 1, Blocks: bucketindex.Blocks(nums...), Level: level},
+				{Prefix: "p", MinTime: -1, MaxTime: 1, Blocks: own, Level: level, Term: term},
 			},
-			Wanted:          []bucketindex.Want{{Prefix: "w", Blocks: wanted}},
-			AllocatedBlocks: allocated,
+			Wanted:          []bucketindex.Want{{Prefix: "w", Blocks: wanted, Term: allocated}},
+			AllocatedBlocks: bucketindex.Block{Term: term, N: allocated},
 		}
 
 		out, err := bucketindex.Decode(in.AppendBinary(nil))
@@ -344,10 +424,20 @@ func TestInvalidIntervalEncodesAsUnset(t *testing.T) {
 	t.Parallel()
 
 	cases := map[string]bucketindex.Interval{
-		"names block zero": {Min: 0, Max: 1},
-		"inverted":         {Min: 9, Max: 2},
-		"gap outside":      {Min: 1, Max: 4, Gaps: []bucketindex.Gap{{Min: 7, Max: 8}}},
-		"gaps unordered":   {Min: 1, Max: 9, Gaps: []bucketindex.Gap{{Min: 6, Max: 7}, {Min: 3, Max: 4}}},
+		"names block zero": bucketindex.Range(0, 0, 1),
+		"inverted":         bucketindex.Range(0, 9, 2),
+		"run across terms": {Min: bucketindex.Block{Term: 1, N: 1}, Max: bucketindex.Block{Term: 2, N: 1}},
+		"gap outside": {
+			Min: bucketindex.Block{N: 1}, Max: bucketindex.Block{N: 4},
+			Gaps: []bucketindex.Gap{{Min: bucketindex.Block{N: 7}, Max: bucketindex.Block{N: 8}}},
+		},
+		"gaps unordered": {
+			Min: bucketindex.Block{N: 1}, Max: bucketindex.Block{N: 9},
+			Gaps: []bucketindex.Gap{
+				{Min: bucketindex.Block{N: 6}, Max: bucketindex.Block{N: 7}},
+				{Min: bucketindex.Block{N: 3}, Max: bucketindex.Block{N: 4}},
+			},
+		},
 	}
 	for name, iv := range cases {
 		t.Run(name, func(t *testing.T) {

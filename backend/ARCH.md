@@ -165,8 +165,11 @@ a demonstration.
   to commit at all and wraps `ErrFenced`: a version is only safe to commit against together with
   the part set read with it (`engine/ARCH.md`).
 - **Part identity is a block *set* plus a level** (`bucketindex.Interval`, `Entry.Level`, format
-  v6). A flush writes `{n}` at level 0; a merge writes the union of what its inputs covered, above
-  them. `Entry.Supersedes` is then decidable from identity alone — no index diff, no bookkeeping,
+  v6). A flush writes `{b}` at level 0; a merge writes the union of what its inputs covered, above
+  them. **A block is a `(term, n)` pair** (`bucketindex.Block`, format v7): the ownership term of the
+  tenure that allocated it and a number within that term. Blocks order by term, then number, and a
+  merge across tenures holds each tenure's blocks with the rest of the lower term's number space as
+  an ordinary gap. `Entry.Supersedes` is then decidable from identity alone — no index diff, no bookkeeping,
   no data read — which is what lets a repair terminate: by the time a want is serviced the data may
   exist only inside a merged successor, and `Index.Satisfying` accepts that successor as discharging
   the want.
@@ -203,9 +206,17 @@ a demonstration.
   short of reading the rows says how. A part covering only some of a group's claim therefore
   overlaps every member while replacing none; no single-part rule resolves it, and repair refuses
   to publish one beside the other (`engine/ARCH.md`, "Repair").
-  **Allocation is the shard owner's alone**: `Index.NextBlock` is one above `AllocatedBlocks`, the
-  persisted high-water mark, and above every block the live entries, wants and group runs still
-  name. The mark is what keeps identity unique over a shard's *whole life* rather than over its
+  **Allocation is the shard owner's alone, and scoped to its tenure**: `Index.NextBlock(term)` is one
+  above `AllocatedBlocks`, the persisted high-water mark, and above every block the live entries,
+  wants and group runs still name — within `term`, starting at `(term, 1)` for a tenure the index has
+  not seen. Scoping is what makes identity unique across writers that never see each other's index:
+  a displaced owner and its successor, or two replicas whose lineages diverged, each allocate only
+  under their own claim's etcd create revision, which no other claim shares. The obvious alternative,
+  one number space with the loser of a CAS re-allocating above the winner, holds only while both
+  writers commit to one object; over diverged copies it hands two unrelated parts one identity, and
+  every identity relation then treats them as one part. A term below the index's highest one
+  continues that term's sequence instead of restarting its own; only a writer with no cluster (term
+  0, the prefix's only writer) reaches that, since a clustered one is fenced first (below). The mark is what keeps identity unique over a shard's *whole life* rather than over its
   current contents: the live set shrinks — retention can empty a shard outright, leaving tombstones
   that carry no blocks — and numbering derived from it would rewind and hand a new part the identity
   an expired one held, at which point a stale peer's old part satisfies a want for the new one and
@@ -213,8 +224,34 @@ a demonstration.
   that adds the part; a writer rebasing on a rival's index takes the maximum of the two marks — see
   `engine/ARCH.md`, "Block identity is allocated by the commit that publishes the part". No etcd, no
   round trip on the flush path, and it works with the cluster layer absent. Two owners racing a
-  handoff resolve through that CAS: one commit lands, the loser wraps `ErrConflict`, re-reads, and
-  re-allocates above the winner.
+  handoff over one index resolve through that CAS: one commit lands, the loser wraps `ErrConflict`,
+  re-reads, and re-allocates above the winner.
+  **One identity written by two tenures resolves to the later one** (`Entry.Term`, format v7). Over
+  one shared index the fence below keeps it from arising; over private backends two owners can merge
+  the same inputs either side of a handoff, and the two outputs meet through `cluster/partsync` and
+  repair. Both cover the same blocks at the same level and hold the same rows, so `Lineage.Subsumes`
+  — and through it `Supersedes`, `Satisfying`, `Revokes` and `Subsumed` — lets the higher `Term`
+  replace the lower.
+- **A clustered writer commits only as the shard's current tenure** (`CheckTenure`, `ErrSuperseded`).
+  Before each CAS attempt the engine checks the term it holds now against the term its operation
+  began under and the term of the index it builds on. It refuses when it holds no claim (a lapsed or
+  fenced lease reads as term 0), when its tenure ended and restarted mid-operation, and when a
+  rebase shows a later tenure wrote the index — a rebase never adopts a higher term, so a displaced
+  writer never commits under its successor's. A refused commit leaves its output unreferenced, for
+  the orphan sweep. A writer with no cluster has no tenure and is not fenced.
+  The check reads the claim locally, so on its own it cannot stop a commit that passes it and then
+  lands after the claim moved. **A tenure's first commit is what closes that window**: the new
+  owner reloads the index and commits it back under its term before any flush, merge or repair of
+  the tenure may commit (`engine/ARCH.md`, "A clustered commit is fenced by tenure"). That moves the
+  index version, so a predecessor's held CAS either landed first — and is the new tenure's starting
+  point — or fails, rebases into the higher term and is refused. The CAS is the only serialization
+  point two writers share, so this is also why the guarantee is per index: **over a shared store**
+  a displaced writer never lands a commit after its successor's first one; **over private backends**
+  (`cluster.Config.PrivateBackend`) each node commits to its own index, nothing orders a displaced
+  owner's writes against its successor's, and the protection is identity alone — term-scoped blocks
+  cannot collide and an identical identity resolves to the later tenure. What that admits is
+  duplicate rows — an old owner's last flush, re-flushed by the new owner from its replica head, or
+  overlapping merges — never a collision, a stuck want or a false hole.
 - **`Entries → Removed | Wanted`** is the invariant the repair path enforces: a part leaves
   `Entries` only into a tombstone (`Removal`, a deliberate deletion) or into a `Want` (an
   obligation to fetch it back). Conflating the two would make "am I repaired?" unanswerable, which
@@ -262,13 +299,17 @@ a demonstration.
   is a fact, not a level: a per-node gauge that a restart or a successful repair clears erases the
   only record that a range of a shard was ever acknowledged as gone. It follows ClickHouse's
   `/lost_part_count`.
-- **Format v6 is a hard read break.** `Decode` rejects any version above the one it knows, so
-  reading is backward compatible (v1–v5 still decode, unset fields ordering below everything a
-  writer produces) but **writing is not**: a node on pre-v6 code fails on the first v6 index it
+- **Format v7 is a hard read break.** `Decode` rejects any version above the one it knows, so
+  reading is backward compatible (v1–v6 still decode, unset fields ordering below everything a
+  writer produces) but **writing is not**: a node on pre-v7 code fails on the first v7 index it
   reads. Every node that reads a given index must be upgraded together. The path differs by
   deployment and both matter — on a shared backend every node reads the same index object, and in
   `PrivateBackend` mode `cluster/partsync` reads its peers' indexes.
-  Two things migrate. A **v5 interval is a hull**, and what it actually covered is unknowable once
+  **A v6 index is term 0 throughout**: its blocks, its entries' and wants' writing terms and its
+  high-water mark. A clustered tenure then allocates from `(term, 1)` above all of it, and a writer
+  with no cluster continues term 0's numbering where v6 left it. An interval's lowest block number
+  leads its encoding, so a valid set never starts with the zero byte an unset one is written as.
+  Two things migrate from v5. A **v5 interval is a hull**, and what it actually covered is unknowable once
   decoded, so it is read as the contiguous set of its bounds — the meaning it had when it was
   written. Such an entry can still claim a block no part held, exactly as it did under v5; a merge
   rewriting it produces an exact set, so the defect drains as the shard compacts rather than being

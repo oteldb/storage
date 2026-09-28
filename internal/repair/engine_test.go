@@ -106,7 +106,7 @@ func TestDriveCommitsGroupAndRetiresAncestor(t *testing.T) {
 	t.Parallel()
 
 	ancestor := bucketindex.Entry{Prefix: "other", Blocks: bucketindex.Blocks(2)}
-	members := group("f", 10, 3, bucketindex.Interval{Min: 1, Max: 2})
+	members := group("f", 10, 3, bucketindex.Range(0, 1, 2))
 	h := &host{
 		wants: []bucketindex.Want{want("lost", 1)},
 		parts: []*fakePart{{ent: ancestor}},

@@ -39,7 +39,7 @@ func loseOneOfThree(t *testing.T, e Engine, be backend.Backend) string {
 	lost := flushThree(t, e)[0]
 
 	dropObjects(t, be, lost)
-	e.LosePart(lost, bucketindex.Interval{Min: 1, Max: 1})
+	e.LosePart(lost, bucketindex.Range(0, 1, 1))
 
 	require.True(t, slices.Contains(e.WantPrefixes(), lost))
 
@@ -79,7 +79,7 @@ func repairFetchesWantedPartFromPeer(t *testing.T, k Kind) {
 
 	CopyObjects(t, be, peer, lost)
 	dropObjects(t, be, lost)
-	e.LosePart(lost, bucketindex.Interval{Min: 1, Max: 1})
+	e.LosePart(lost, bucketindex.Range(0, 1, 1))
 
 	f.SetAnswer(satisfyFrom(t, peer, be))
 
@@ -110,11 +110,11 @@ func repairDischargedByContainingSuccessor(t *testing.T, k Kind) {
 	parts := flushTwo(t, e)
 	lost, kept := parts[0], parts[1]
 
-	e.SetPartBlocks(lost, bucketindex.Interval{Min: 1, Max: 1}, 0)
-	e.SetPartBlocks(kept, bucketindex.Interval{Min: 2, Max: 2}, 0)
+	e.SetPartBlocks(lost, bucketindex.Range(0, 1, 1), 0)
+	e.SetPartBlocks(kept, bucketindex.Range(0, 2, 2), 0)
 
 	dropObjects(t, be, lost)
-	e.LosePart(lost, bucketindex.Interval{Min: 1, Max: 1})
+	e.LosePart(lost, bucketindex.Range(0, 1, 1))
 
 	// The peer merged both blocks away into one level-1 part; the wanted prefix is gone there too.
 	successor := k.mergedPeerPart(t, peerBE)
@@ -124,7 +124,7 @@ func repairDischargedByContainingSuccessor(t *testing.T, k Kind) {
 
 		return bucketindex.Entry{
 			Prefix: successor, MinTime: 100, MaxTime: 200,
-			Blocks: bucketindex.Interval{Min: 1, Max: 2}, Level: 1,
+			Blocks: bucketindex.Range(0, 1, 2), Level: 1,
 		}, bucketindex.WantSatisfied, nil
 	})
 
@@ -158,10 +158,10 @@ func repairDischargedByLocalPart(t *testing.T, k Kind) {
 	parts := flushTwo(t, e)
 
 	// The surviving part already covers the wanted blocks at a higher level.
-	e.SetPartBlocks(parts[1], bucketindex.Interval{Min: 1, Max: 4}, 1)
+	e.SetPartBlocks(parts[1], bucketindex.Range(0, 1, 4), 1)
 
 	dropObjects(t, be, parts[0])
-	e.LosePart(parts[0], bucketindex.Interval{Min: 1, Max: 1})
+	e.LosePart(parts[0], bucketindex.Range(0, 1, 1))
 
 	require.NoError(t, e.Merge(ctx, 0))
 
@@ -282,7 +282,7 @@ func repairCommitFailureKeepsWant(t *testing.T, k Kind) {
 	lost := flushThree(t, e)[0]
 	CopyObjects(t, be, peer, lost)
 	dropObjects(t, be, lost)
-	e.LosePart(lost, bucketindex.Interval{Min: 1, Max: 1})
+	e.LosePart(lost, bucketindex.Range(0, 1, 1))
 
 	f.SetAnswer(satisfyFrom(t, peer, be))
 
@@ -308,7 +308,7 @@ func repairAsksTheFetcherOncePerCycle(t *testing.T, k Kind) {
 	parts := flushThree(t, e)
 	for i, p := range parts {
 		dropObjects(t, be, p)
-		e.LosePart(p, bucketindex.Interval{Min: uint64(i + 1), Max: uint64(i + 1)})
+		e.LosePart(p, bucketindex.Range(0, uint64(i+1), uint64(i+1)))
 	}
 
 	require.Len(t, e.WantPrefixes(), len(parts))
@@ -334,16 +334,16 @@ func repairCoveredWantIsNotAFailure(t *testing.T, k Kind) {
 	parts := flushThree(t, e)
 	first, second, kept := parts[0], parts[1], parts[2]
 
-	e.SetPartBlocks(first, bucketindex.Interval{Min: 1, Max: 1}, 0)
-	e.SetPartBlocks(second, bucketindex.Interval{Min: 2, Max: 2}, 0)
-	e.SetPartBlocks(kept, bucketindex.Interval{Min: 3, Max: 3}, 0)
+	e.SetPartBlocks(first, bucketindex.Range(0, 1, 1), 0)
+	e.SetPartBlocks(second, bucketindex.Range(0, 2, 2), 0)
+	e.SetPartBlocks(kept, bucketindex.Range(0, 3, 3), 0)
 
 	for _, lost := range []string{first, second} {
 		dropObjects(t, be, lost)
 	}
 
-	e.LosePart(first, bucketindex.Interval{Min: 1, Max: 1})
-	e.LosePart(second, bucketindex.Interval{Min: 2, Max: 2})
+	e.LosePart(first, bucketindex.Range(0, 1, 1))
+	e.LosePart(second, bucketindex.Range(0, 2, 2))
 
 	successor := k.mergedPeerPart(t, peerBE)
 	phantom := k.phantom()
@@ -357,13 +357,13 @@ func repairCoveredWantIsNotAFailure(t *testing.T, k Kind) {
 
 			return bucketindex.Entry{
 				Prefix: successor, MinTime: 100, MaxTime: 200,
-				Blocks: bucketindex.Interval{Min: 1, Max: 2}, Level: 1,
+				Blocks: bucketindex.Range(0, 1, 2), Level: 1,
 			}, bucketindex.WantSatisfied, nil
 		}
 
 		return bucketindex.Entry{
 			Prefix: phantom, MinTime: 200, MaxTime: 200,
-			Blocks: bucketindex.Interval{Min: 2, Max: 2},
+			Blocks: bucketindex.Range(0, 2, 2),
 		}, bucketindex.WantSatisfied, nil
 	})
 

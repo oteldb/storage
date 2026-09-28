@@ -118,7 +118,7 @@ func (p *probePeer) reset() {
 func wantAt(prefix string, block uint64) bucketindex.Want {
 	return bucketindex.Want{
 		Prefix: prefix,
-		Blocks: bucketindex.Interval{Min: block, Max: block},
+		Blocks: bucketindex.Range(0, block, block),
 	}
 }
 
@@ -136,7 +136,7 @@ func TestFetchWantsReadsEachIndexOncePerCycle(t *testing.T) {
 	for i := range peers {
 		be := backend.Memory()
 		ix := &bucketindex.Index{}
-		writeBlockPart(t, be, ix, prefix, "0100", bucketindex.Interval{Min: 1, Max: 8}, 1)
+		writeBlockPart(t, be, ix, prefix, "0100", bucketindex.Range(0, 1, 8), 1)
 		saveIndex(t, be, prefix, ix)
 
 		peers[i] = servePeer(t, be, prefix, probeOpts{})
@@ -180,7 +180,7 @@ func TestFetchWantsCopiesASharedSuccessorOnce(t *testing.T) {
 
 	be := backend.Memory()
 	ix := &bucketindex.Index{}
-	merged := writeBlockPart(t, be, ix, prefix, "0100", bucketindex.Interval{Min: 1, Max: 4}, 1)
+	merged := writeBlockPart(t, be, ix, prefix, "0100", bucketindex.Range(0, 1, 4), 1)
 	saveIndex(t, be, prefix, ix)
 
 	peer := servePeer(t, be, prefix, probeOpts{})
@@ -221,12 +221,12 @@ func TestFetchWantsSelectionIsOrderIndependent(t *testing.T) {
 		for seed := range uint64(4) {
 			narrow := backend.Memory()
 			nix := &bucketindex.Index{}
-			writeBlockPart(t, narrow, nix, prefix, "0002", bucketindex.Interval{Min: 2, Max: 2}, 0)
+			writeBlockPart(t, narrow, nix, prefix, "0002", bucketindex.Range(0, 2, 2), 0)
 			saveIndex(t, narrow, prefix, nix)
 
 			wide := backend.Memory()
 			wix := &bucketindex.Index{}
-			big := writeBlockPart(t, wide, wix, prefix, "0200", bucketindex.Interval{Min: 1, Max: 8}, 2)
+			big := writeBlockPart(t, wide, wix, prefix, "0200", bucketindex.Range(0, 1, 8), 2)
 			saveIndex(t, wide, prefix, wix)
 
 			fast := servePeer(t, narrow, prefix, probeOpts{})
@@ -306,7 +306,7 @@ func stageIdenticalPeers(t *testing.T, prefix string, n int) (peers []*probePeer
 	for i := range peers {
 		be := backend.Memory()
 		ix := &bucketindex.Index{}
-		part = writeBlockPart(t, be, ix, prefix, "0100", bucketindex.Interval{Min: 1, Max: 4}, 1)
+		part = writeBlockPart(t, be, ix, prefix, "0100", bucketindex.Range(0, 1, 4), 1)
 		saveIndex(t, be, prefix, ix)
 
 		peers[i] = servePeer(t, be, prefix, probeOpts{})
@@ -331,7 +331,7 @@ func TestFetchWantsAggregatesPeerErrors(t *testing.T) {
 		for i := range 4 {
 			be := backend.Memory()
 			ix := &bucketindex.Index{}
-			writeBlockPart(t, be, ix, prefix, "0009", bucketindex.Interval{Min: 9, Max: 9}, 0)
+			writeBlockPart(t, be, ix, prefix, "0009", bucketindex.Range(0, 9, 9), 0)
 			saveIndex(t, be, prefix, ix)
 
 			addrs = append(addrs, servePeer(t, be, prefix, probeOpts{failIndex: i == 0}).addr)

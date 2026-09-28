@@ -57,6 +57,8 @@ type Stats struct {
 	Holes       int
 	LostParts   uint64
 	IndexFenced bool
+	// TenureUnestablished is a clustered engine whose tenure's first commit has not landed.
+	TenureUnestablished bool
 }
 
 // MergeShape is the subset of the engine's merge shape the suite asserts on.
@@ -291,6 +293,12 @@ var suite = []struct {
 	{"SplitBrainMergeSameInputs", splitBrainMergeSameInputs},
 	{"SplitBrainMergeOverlappingInputs", splitBrainMergeOverlappingInputs},
 	{"DisplacedWriterKeepsItsTerm", displacedWriterKeepsItsTerm},
+	{"StaleCommitCannotLandAfterTheSuccessorEstablishes", staleCommitCannotLandAfterTheSuccessorEstablishes},
+	{"PredecessorCommitLandsBeforeTheSuccessorEstablishes", predecessorCommitLandsBeforeTheSuccessorEstablishes},
+	{"UnestablishedTenureKeepsRowsInTheHead", unestablishedTenureKeepsRowsInTheHead},
+	{"TenuresAllocateDisjointBlocks", tenuresAllocateDisjointBlocks},
+	{"LapsedClaimCommitsNothing", lapsedClaimCommitsNothing},
+	{"WritingTermSurvivesTheNextTenure", writingTermSurvivesTheNextTenure},
 }
 
 // Run runs every suite test against k, each as <test>/<k.Name>.

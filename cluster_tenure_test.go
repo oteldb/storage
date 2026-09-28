@@ -104,11 +104,15 @@ func TestClusterHandoffUnsyncedFlushReadsOnce(t *testing.T) {
 	}, 30*time.Second, 20*time.Millisecond, "the old owner rejoins")
 
 	// The old owner installs the new owner's index beside the part it holds, takes the shard back once
-	// the secondary releases it, and merges; the secondary mirrors the result.
-	for range 3 {
+	// the secondary releases it, and merges; the secondary mirrors the result. How many cycles that
+	// takes is timing: a new tenure makes one establishing attempt per flush and merge, and one that
+	// meets a concurrent index write waits for the next cycle.
+	require.Eventually(t, func() bool {
 		oldOwner.maintain(ctx)
 		secondary.maintain(ctx)
-	}
+
+		return oldOwner.claimsShard(shard) && len(om.Parts()) == 1 && len(sm.Parts()) == 1
+	}, 30*time.Second, 20*time.Millisecond, "the old owner takes the shard back, merges, and the secondary mirrors it")
 
 	// The metric half does not duplicate: a read merges a series by timestamp, and so does the merge
 	// that folds the two parts together.
@@ -128,8 +132,8 @@ func TestClusterHandoffUnsyncedFlushReadsOnce(t *testing.T) {
 	})
 
 	t.Run("logs", func(t *testing.T) {
-		reproduce.Unfixed(t, 725, "the new owner re-flushes head rows the old owner's unsynced part holds, and once "+
-			"the old owner is back both parts stay live and merge into one part holding every record twice")
+		reproduce.Unfixed(t, 572, "the old owner's unsynced flush is the accepted cost of a handoff that never "+
+			"stalls: the new owner re-flushes the same head rows under its own term, and nothing dedups the records")
 
 		for id, s := range nodes {
 			got, err := fetchLogs(ctx, s, 0, 1<<62)

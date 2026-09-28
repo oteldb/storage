@@ -93,7 +93,7 @@ func (e recordEngine) Stats() enginetest.Stats {
 
 	return enginetest.Stats{
 		HeadAge: st.HeadAge, WantedParts: st.WantedParts, Holes: st.Holes, LostParts: st.LostParts,
-		IndexFenced: st.IndexFenced,
+		IndexFenced: st.IndexFenced, TenureUnestablished: st.TenureUnestablished,
 	}
 }
 

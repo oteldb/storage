@@ -64,7 +64,7 @@ func (h repairHost) Reclaim(ctx context.Context)                { h.e.reclaimRet
 func (h repairHost) Identity(p *part) bucketindex.Entry {
 	return bucketindex.Entry{
 		Prefix: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
-		Blocks: p.blocks, Claim: p.claim, Level: p.level,
+		Blocks: p.blocks, Claim: p.claim, Level: p.level, Term: p.term,
 	}
 }
 
@@ -74,7 +74,7 @@ func (h repairHost) Open(ctx context.Context, prefix string) (*part, error) {
 
 func (h repairHost) AdoptLocked(ctx context.Context, p *part, ent *bucketindex.Entry) error {
 	p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
-	p.blocks, p.claim, p.level = ent.Blocks, ent.Claim, ent.Level
+	p.blocks, p.claim, p.level, p.term = ent.Blocks, ent.Claim, ent.Level, ent.Term
 
 	_, err := h.e.registerPartIdentitiesLocked(ctx, ent.Prefix)
 

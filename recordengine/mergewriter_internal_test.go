@@ -435,14 +435,14 @@ func TestPlanMergeBlocksSameStreamBothSides(t *testing.T) {
 		union = union.Union(p.blocks)
 	}
 
-	group := out[0].pending.group
+	group := out[0].pending.Group
 	require.NotNil(t, group)
-	assert.Equal(t, len(out), group.n)
-	assert.Equal(t, union, group.blocks)
+	assert.Equal(t, len(out), group.N)
+	assert.Equal(t, union, group.Blocks)
 
 	for _, p := range out {
-		assert.Same(t, group, p.pending.group, "one joint claim for every fragment")
-		assert.False(t, p.pending.blocks.Valid(), "a fragment inherits no block of its own")
+		assert.Same(t, group, p.pending.Group, "one joint claim for every fragment")
+		assert.False(t, p.pending.Blocks.Valid(), "a fragment inherits no block of its own")
 	}
 
 	// The same shape through the engine: fragments committed, each with a fresh block and the joint
@@ -468,7 +468,7 @@ func TestPlanMergeBlocksSameStreamBothSides(t *testing.T) {
 
 	var claims []string
 
-	blocks := map[uint64]bool{}
+	blocks := map[bucketindex.Block]bool{}
 
 	for _, p := range e2.parts {
 		if p.level == 0 {

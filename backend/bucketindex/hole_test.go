@@ -12,7 +12,7 @@ import (
 func lostWant() bucketindex.Want {
 	return bucketindex.Want{
 		Prefix:  "p/0000000002",
-		Blocks:  bucketindex.Interval{Min: 2, Max: 2},
+		Blocks:  bucketindex.Range(0, 2, 2),
 		Level:   1,
 		MinTime: 100,
 		MaxTime: 200,
@@ -108,28 +108,28 @@ func TestRevokes(t *testing.T) {
 		{
 			name: "containing successor",
 			live: bucketindex.Entry{
-				Prefix: "p/0000000009", Blocks: bucketindex.Interval{Min: 1, Max: 4}, Level: 2,
+				Prefix: "p/0000000009", Blocks: bucketindex.Range(0, 1, 4), Level: 2,
 			},
 			want: true,
 		},
 		{
 			name: "overlapping at the same level",
 			live: bucketindex.Entry{
-				Prefix: "p/0000000009", Blocks: bucketindex.Interval{Min: 1, Max: 4}, Level: 1,
+				Prefix: "p/0000000009", Blocks: bucketindex.Range(0, 1, 4), Level: 1,
 			},
 			want: false,
 		},
 		{
 			name: "unrelated part",
 			live: bucketindex.Entry{
-				Prefix: "p/0000000009", Blocks: bucketindex.Interval{Min: 7, Max: 8}, Level: 3,
+				Prefix: "p/0000000009", Blocks: bucketindex.Range(0, 7, 8), Level: 3,
 			},
 			want: false,
 		},
 		{
 			name: "another hole over the same blocks",
 			live: bucketindex.Entry{
-				Prefix: "p/0000000009", Blocks: bucketindex.Interval{Min: 1, Max: 4}, Level: 2, Hole: true,
+				Prefix: "p/0000000009", Blocks: bucketindex.Range(0, 1, 4), Level: 2, Hole: true,
 			},
 			want: false,
 		},
@@ -159,10 +159,10 @@ func TestRevokesRejectsNonHole(t *testing.T) {
 func TestNextBlockCountsHoles(t *testing.T) {
 	t.Parallel()
 
-	hole := bucketindex.Entry{Blocks: bucketindex.Interval{Min: 4, Max: 6}, Hole: true, Prefix: "h"}
+	hole := bucketindex.Entry{Blocks: bucketindex.Range(0, 4, 6), Hole: true, Prefix: "h"}
 	ix := &bucketindex.Index{Entries: []bucketindex.Entry{hole}}
 
-	assert.EqualValues(t, 7, ix.NextBlock())
+	assert.Equal(t, bucketindex.Block{N: 7}, ix.NextBlock(0))
 }
 
 // TestHoleEncodingRoundTrip pins that the flag and the loss count survive the wire.
@@ -200,7 +200,7 @@ func TestWantOfCarriesIdentity(t *testing.T) {
 
 	ent := bucketindex.Entry{
 		Prefix: "p/0000000002", MinTime: 100, MaxTime: 200,
-		Blocks: bucketindex.Interval{Min: 2, Max: 2}, Level: 1,
+		Blocks: bucketindex.Range(0, 2, 2), Level: 1,
 	}
 	g := bucketindex.Generation{Term: 3, Counter: 4}
 

@@ -1,72 +1,153 @@
 package bucketindex
 
-import "slices"
+import (
+	"cmp"
+	"math"
+	"slices"
+)
 
-// Interval is the exact set of block numbers a part covers, the identity it carries alongside its
-// prefix. A flush writes {n}; a merge writes the union of what its inputs covered.
+// Block is one allocated block id: the ownership term that allocated it and its number within that
+// term. A tenure allocates only under its own term, so two tenures of a shard — a displaced owner and
+// its successor, or two replicas whose lineages diverged — never hand out the same id, with no
+// coordination beyond the claim that already orders them. Term 0 is the writer with no cluster, and
+// every block an index written before format v7 names.
 //
-// The set is stored as its bounds plus the runs of numbers it does *not* hold, because a part's
+// Blocks order by term, then number. Numbers start at 1 within each term, so {term, 0} is never a
+// block, only the point below a term's first one.
+type Block struct {
+	Term uint64
+	N    uint64
+}
+
+// Compare orders two blocks, as [cmp.Compare] does.
+func (b Block) Compare(o Block) int {
+	switch {
+	case b.Term != o.Term:
+		return cmp.Compare(b.Term, o.Term)
+	default:
+		return cmp.Compare(b.N, o.N)
+	}
+}
+
+// next is the successor in block order. A number space that ends wraps into the next term.
+func (b Block) next() Block {
+	if b.N == math.MaxUint64 {
+		return Block{Term: b.Term + 1}
+	}
+
+	return Block{Term: b.Term, N: b.N + 1}
+}
+
+// prev is the predecessor in block order, the inverse of [Block.next].
+func (b Block) prev() Block {
+	if b.N == 0 {
+		return Block{Term: b.Term - 1, N: math.MaxUint64}
+	}
+
+	return Block{Term: b.Term, N: b.N - 1}
+}
+
+func (b Block) less(o Block) bool { return b.Compare(o) < 0 }
+
+func minBlock(a, b Block) Block {
+	if a.less(b) {
+		return a
+	}
+
+	return b
+}
+
+// MaxBlock is the later of a and b in block order.
+func MaxBlock(a, b Block) Block {
+	if a.less(b) {
+		return b
+	}
+
+	return a
+}
+
+// Interval is the exact set of blocks a part covers, the identity it carries alongside its prefix.
+// A flush writes {b}; a merge writes the union of what its inputs covered.
+//
+// The set is stored as its bounds plus the runs of blocks it does *not* hold, because a part's
 // blocks are contiguous in every ordinary case and the gap list is then empty. It is a set and not
 // a hull because supersession means "holds these rows": merging the parts on either side of a lost
 // one yields {1,3}, and a hull would claim block 2 — a want discharged by a part holding none of
-// its data.
+// its data. A merge across tenures holds blocks of several terms, and the space between them is a
+// gap like any other.
 //
-// Block numbers start at 1, so the zero value is *unset* rather than a range covering block 0.
-// That distinction is what keeps a part written before format v5 — which carries no interval —
-// from accidentally containing, or being contained by, anything: see [Interval.Valid].
+// The zero value is *unset* rather than a range covering block {0, 0}. That distinction is what
+// keeps a part written before format v5 — which carries no interval — from accidentally containing,
+// or being contained by, anything: see [Interval.Valid].
 type Interval struct {
-	Min uint64
-	Max uint64
+	Min Block
+	Max Block
 	// Gaps are the runs inside (Min, Max) the set does not cover, in ascending order, disjoint and
 	// non-adjacent. The canonical form is the only valid one: two encodings of one set would break
 	// both equality and the encode∘decode identity.
 	Gaps []Gap
 }
 
-// Gap is a run of block numbers an [Interval] skips: the numbers from Min to Max inclusive that
-// lie inside the interval's bounds but that no part in it holds.
+// Gap is a run of blocks an [Interval] skips: the blocks from Min to Max inclusive that lie inside
+// the interval's bounds but that no part in it holds.
 type Gap struct {
-	Min uint64
-	Max uint64
+	Min Block
+	Max Block
 }
 
-// Blocks builds the interval covering exactly the given block numbers, in any order and with
-// duplicates. It returns the unset interval for an empty list or one naming block 0.
-func Blocks(nums ...uint64) Interval {
+// Blocks builds the term-0 interval covering exactly the given block numbers: see [TermBlocks].
+func Blocks(nums ...uint64) Interval { return TermBlocks(0, nums...) }
+
+// TermBlocks builds the interval covering exactly the given block numbers of term, in any order and
+// with duplicates. It returns the unset interval for an empty list or one naming block 0.
+func TermBlocks(term uint64, nums ...uint64) Interval {
 	runs := make([]Gap, 0, len(nums))
 	for _, n := range nums {
 		if n == 0 {
 			return Interval{}
 		}
 
-		runs = append(runs, Gap{Min: n, Max: n})
+		b := Block{Term: term, N: n}
+		runs = append(runs, Gap{Min: b, Max: b})
 	}
 
 	return fromRuns(runs)
 }
 
-// Valid reports whether the interval names a real set of blocks: numbering starts at 1, the bounds
-// are ordered, and the gap list is canonical. Everything else — the zero value of a pre-v5 entry,
-// and any inversion or denormalization a corrupt or hostile encoding could produce — is unset, and
-// takes part in no containment.
+// Range is the contiguous run of term's blocks lo..hi. It is not validated: an inverted or
+// zero-touching range is simply not [Interval.Valid].
+func Range(term, lo, hi uint64) Interval {
+	return Interval{Min: Block{Term: term, N: lo}, Max: Block{Term: term, N: hi}}
+}
+
+// Valid reports whether the interval names a real set of blocks: every held run lies within one
+// term and starts at number 1 or above, the bounds are ordered, and the gap list is canonical.
+// Everything else — the zero value of a pre-v5 entry, and any inversion or denormalization a
+// corrupt or hostile encoding could produce — is unset, and takes part in no containment.
 func (iv Interval) Valid() bool {
-	if iv.Min < 1 || iv.Min > iv.Max {
+	if iv.Max.less(iv.Min) {
 		return false
 	}
 
-	prev := iv.Min
+	lo := iv.Min
 	for _, g := range iv.Gaps {
 		// Strictly inside the bounds, and separated from the previous gap by at least one held
 		// block: otherwise the set has different bounds, or a shorter gap list describes it.
-		if g.Min > g.Max || g.Min <= prev || g.Max >= iv.Max {
+		if g.Max.less(g.Min) || !lo.less(g.Min) || !g.Max.less(iv.Max) {
 			return false
 		}
 
-		prev = g.Max + 1
+		if !validRun(lo, g.Min.prev()) {
+			return false
+		}
+
+		lo = g.Max.next()
 	}
 
-	return true
+	return validRun(lo, iv.Max)
 }
+
+func validRun(lo, hi Block) bool { return lo.N >= 1 && lo.Term == hi.Term && !hi.less(lo) }
 
 // Contains reports whether iv covers every block o covers. Both intervals must be valid: an unset
 // interval neither contains nor is contained, which is the fallback to exact-prefix matching for
@@ -76,15 +157,19 @@ func (iv Interval) Contains(o Interval) bool {
 		return false
 	}
 
-	held := iv.runs()
-	i := 0
+	i, n := 0, iv.nruns()
 
-	for _, r := range o.runs() {
-		for i < len(held) && held[i].Max < r.Min {
+	for j := range o.nruns() {
+		r := o.run(j)
+		for i < n && iv.run(i).Max.less(r.Min) {
 			i++
 		}
 
-		if i >= len(held) || held[i].Min > r.Min || held[i].Max < r.Max {
+		if i >= n {
+			return false
+		}
+
+		if h := iv.run(i); r.Min.less(h.Min) || h.Max.less(r.Max) {
 			return false
 		}
 	}
@@ -101,7 +186,7 @@ func (iv Interval) Union(o Interval) Interval {
 	case !iv.Valid():
 		return o
 	default:
-		return fromRuns(append(iv.runs(), o.runs()...))
+		return fromRuns(o.appendRuns(iv.appendRuns(make([]Gap, 0, iv.nruns()+o.nruns()))))
 	}
 }
 
@@ -118,9 +203,10 @@ func (iv Interval) Len() uint64 {
 		return 0
 	}
 
-	n := iv.Max - iv.Min + 1
-	for _, g := range iv.Gaps {
-		n -= g.Max - g.Min + 1
+	var n uint64
+	for i := range iv.nruns() {
+		r := iv.run(i)
+		n += r.Max.N - r.Min.N + 1
 	}
 
 	return n
@@ -128,66 +214,82 @@ func (iv Interval) Len() uint64 {
 
 // Each calls fn for every block the interval covers, in ascending order, stopping early if fn
 // returns false. It is how a caller enumerates the members of a split group it is missing.
-func (iv Interval) Each(fn func(uint64) bool) {
+func (iv Interval) Each(fn func(Block) bool) {
 	if !iv.Valid() {
 		return
 	}
 
-	for _, r := range iv.runs() {
-		for b := r.Min; b <= r.Max; b++ {
-			if !fn(b) {
+	for i := range iv.nruns() {
+		r := iv.run(i)
+		for n := r.Min.N; ; n++ {
+			if !fn(Block{Term: r.Min.Term, N: n}) {
 				return
+			}
+
+			if n == r.Max.N {
+				break
 			}
 		}
 	}
 }
 
-// runs returns the ascending, disjoint runs of blocks the interval holds. It assumes validity.
-func (iv Interval) runs() []Gap {
-	out := make([]Gap, 0, len(iv.Gaps)+1)
+// nruns and run enumerate the ascending, disjoint runs of blocks the interval holds, without
+// materializing them: the relations over identity run per entry on every commit. They assume
+// validity.
+func (iv Interval) nruns() int { return len(iv.Gaps) + 1 }
 
-	lo := iv.Min
-	for _, g := range iv.Gaps {
-		out = append(out, Gap{Min: lo, Max: g.Min - 1})
-		lo = g.Max + 1
+func (iv Interval) run(i int) Gap {
+	r := Gap{Min: iv.Min, Max: iv.Max}
+	if i > 0 {
+		r.Min = iv.Gaps[i-1].Max.next()
 	}
 
-	return append(out, Gap{Min: lo, Max: iv.Max})
+	if i < len(iv.Gaps) {
+		r.Max = iv.Gaps[i].Min.prev()
+	}
+
+	return r
+}
+
+func (iv Interval) appendRuns(dst []Gap) []Gap {
+	for i := range iv.nruns() {
+		dst = append(dst, iv.run(i))
+	}
+
+	return dst
 }
 
 // fromRuns is the inverse of [Interval.runs] over an arbitrary run list: it sorts, coalesces and
-// derives the canonical bounds-and-gaps form. Runs naming block 0 make the whole set unset, as
-// they do everywhere else.
+// derives the canonical bounds-and-gaps form. A run naming a block numbered 0 makes the whole set
+// unset, as it does everywhere else.
 func fromRuns(runs []Gap) Interval {
 	if len(runs) == 0 {
 		return Interval{}
 	}
 
 	slices.SortFunc(runs, func(a, b Gap) int {
-		switch {
-		case a.Min != b.Min:
-			return int(int64(a.Min) - int64(b.Min))
-		case a.Max < b.Max:
-			return -1
-		case a.Max > b.Max:
-			return 1
-		default:
-			return 0
+		if c := a.Min.Compare(b.Min); c != 0 {
+			return c
 		}
-	})
 
-	if runs[0].Min == 0 {
-		return Interval{}
-	}
+		return a.Max.Compare(b.Max)
+	})
 
 	merged := runs[:1]
 
+	for _, r := range runs {
+		if r.Min.N == 0 {
+			return Interval{}
+		}
+	}
+
 	for _, r := range runs[1:] {
 		last := &merged[len(merged)-1]
-		// r.Min-1, not last.Max+1: the top of the number space is a legal block, and last.Max+1
-		// would wrap to 0 there and split a run that is really contiguous.
-		if r.Min-1 <= last.Max {
-			last.Max = max(last.Max, r.Max)
+		// r.Min.prev(), not last.Max.next(): the top of a term's number space is a legal block,
+		// and last.Max.next() would carry into the next term there and split a run that is
+		// really contiguous.
+		if !last.Max.less(r.Min.prev()) {
+			last.Max = MaxBlock(last.Max, r.Max)
 
 			continue
 		}
@@ -197,7 +299,7 @@ func fromRuns(runs []Gap) Interval {
 
 	iv := Interval{Min: merged[0].Min, Max: merged[len(merged)-1].Max}
 	for i := 1; i < len(merged); i++ {
-		iv.Gaps = append(iv.Gaps, Gap{Min: merged[i-1].Max + 1, Max: merged[i].Min - 1})
+		iv.Gaps = append(iv.Gaps, Gap{Min: merged[i-1].Max.next(), Max: merged[i].Min.prev()})
 	}
 
 	return iv
@@ -226,10 +328,11 @@ func (c Claim) Valid() bool { return c.Blocks.Valid() && c.Group.Valid() }
 func (c Claim) Equal(o Claim) bool { return c.Blocks.Equal(o.Blocks) && c.Group.Equal(o.Group) }
 
 // Supersedes reports whether e's data wholly subsumes o's: e sits at a higher merge level and
-// covers every block o covers, or, for a split-group member, the whole ancestry its group claims.
-// It is decidable from identity alone — no index comparison, no bookkeeping — which is what lets a
-// repair terminate: by the time a want is serviced the data may exist only inside a merged
-// successor, and that successor has to count as satisfaction.
+// covers every block o covers, or, for a split-group member, the whole ancestry its group claims;
+// or e is o's identity written by a later tenure. It is decidable from identity alone — no index
+// comparison, no bookkeeping — which is what lets a repair terminate: by the time a want is
+// serviced the data may exist only inside a merged successor, and that successor has to count as
+// satisfaction.
 //
 // A split merge's fragment covers only its own fresh blocks and supersedes nothing, however much of
 // an input it happens to hold; the group's joint claim is resolved against a whole index by
@@ -248,25 +351,32 @@ func (e Entry) Supersedes(o Entry) bool {
 	return own.Subsumes(e, o)
 }
 
-// NextBlock returns the block number the next part committed to this index takes: one above the
-// highest block ever allocated under this prefix.
+// NextBlock returns the block the next part committed to this index under term takes: one above
+// the highest block ever allocated under this prefix, within term.
 //
 // Allocation is the shard owner's alone, out of its own index, and is claimed by the same CAS
 // commit that adds the part — so it needs no coordination and works with the cluster layer
-// absent. Two writers racing a handoff resolve through that CAS: one commit lands, and the loser
-// re-reads and re-allocates above the winner.
+// absent. Two writers racing over one index resolve through that CAS: one commit lands, and the
+// loser re-reads and re-allocates above the winner. Two tenures that never see each other's
+// index — a displaced owner, replicas whose lineages diverged — cannot collide at all, because each
+// allocates only under its own term.
+//
+// A term below the highest one this index has allocated under continues that term's sequence
+// instead. Only a writer with no cluster — term 0, the only writer of its prefix — reaches that,
+// and continuing is what keeps it from renumbering over blocks a term-0 index retired long ago. A
+// clustered writer below the index's term is refused before it allocates (see [CheckTenure]).
 //
 // The high-water mark is carried in the index rather than recomputed from the live set, because
 // the live set shrinks: retention that empties a shard, or a compaction that retires every part
 // covering a range, would otherwise rewind the counter and hand a new part an identity an expired
 // one held. Outstanding wants and unrealized group claims still count towards it, so an index
 // written before the mark existed does not renumber over a part it is still owed.
-func (ix *Index) NextBlock() uint64 {
-	maxBlock := ix.AllocatedBlocks
+func (ix *Index) NextBlock(term uint64) Block {
+	top := ix.AllocatedBlocks
 
 	bump := func(iv Interval) {
-		if iv.Valid() && iv.Max > maxBlock {
-			maxBlock = iv.Max
+		if iv.Valid() {
+			top = MaxBlock(top, iv.Max)
 		}
 	}
 
@@ -280,7 +390,11 @@ func (ix *Index) NextBlock() uint64 {
 		bump(ix.Wanted[i].Claim.Group)
 	}
 
-	return maxBlock + 1
+	if top.Term < term {
+		return Block{Term: term, N: 1}
+	}
+
+	return Block{Term: top.Term, N: top.N + 1}
 }
 
 // Covered is the set of blocks the index's data-bearing parts hold between them, including the
@@ -290,22 +404,26 @@ func (ix *Index) Covered() Interval { return ix.covered(Entry.Data) }
 
 func (ix *Index) covered(admit func(Entry) bool) Interval {
 	var (
-		held   Interval
+		runs   = make([]Gap, 0, len(ix.Entries))
 		claims []Claim
 	)
 
 	for i := range ix.Entries {
-		e := ix.Entries[i]
-		if !admit(e) {
+		e := &ix.Entries[i]
+		if !admit(*e) {
 			continue
 		}
 
-		held = held.Union(e.Blocks)
+		if e.Blocks.Valid() {
+			runs = e.Blocks.appendRuns(runs)
+		}
 
 		if e.Claim.Valid() {
 			claims = append(claims, e.Claim)
 		}
 	}
+
+	held := fromRuns(runs)
 
 	// A group whose members were themselves split resolves only once the inner group has, so the
 	// pass repeats while it keeps realizing claims. Each round retires at least one claim, so it
@@ -361,6 +479,8 @@ func (ix *Index) satisfying(w Want, admit func(Entry) bool) (Entry, bool) {
 		found bool
 	)
 
+	owed := w.Entry()
+
 	for i := range ix.Entries {
 		e := ix.Entries[i]
 		if !admit(e) {
@@ -371,7 +491,7 @@ func (ix *Index) satisfying(w Want, admit func(Entry) bool) (Entry, bool) {
 			return e, true
 		}
 
-		if !e.Blocks.Contains(w.Blocks) && !e.Supersedes(w.Entry()) {
+		if !e.Blocks.Contains(w.Blocks) && !e.Supersedes(owed) {
 			continue
 		}
 
@@ -419,7 +539,7 @@ func (ix *Index) jointlySatisfying(w Want, admit func(Entry) bool) (Entry, bool)
 // It is what makes a group repairable one member at a time. A want naming a pre-split part is
 // answered by no single peer entry, so repair asks for the group's blocks instead, and the peer
 // resolves each of those against its own index by ordinary containment.
-func (ix *Index) Missing(w Want) []uint64 {
+func (ix *Index) Missing(w Want) []Block {
 	if !w.Blocks.Valid() {
 		return nil
 	}
@@ -429,7 +549,7 @@ func (ix *Index) Missing(w Want) []uint64 {
 		return nil
 	}
 
-	var out []uint64
+	var out []Block
 
 	for i := range ix.Entries {
 		c := ix.Entries[i].Claim
@@ -437,8 +557,8 @@ func (ix *Index) Missing(w Want) []uint64 {
 			continue
 		}
 
-		c.Group.Each(func(b uint64) bool {
-			if !held.Contains(Blocks(b)) && !slices.Contains(out, b) {
+		c.Group.Each(func(b Block) bool {
+			if !held.Contains(Interval{Min: b, Max: b}) && !slices.Contains(out, b) {
 				out = append(out, b)
 			}
 
@@ -446,7 +566,7 @@ func (ix *Index) Missing(w Want) []uint64 {
 		})
 	}
 
-	slices.Sort(out)
+	slices.SortFunc(out, Block.Compare)
 
 	return out
 }
@@ -547,3 +667,6 @@ func (l Lineage) Subsumed(live, added []Entry) map[string]struct{} {
 
 	return out
 }
+
+// Single is the interval holding b alone.
+func Single(b Block) Interval { return Interval{Min: b, Max: b} }

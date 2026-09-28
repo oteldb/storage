@@ -75,7 +75,7 @@ func loseFirstOfTwo(t *testing.T, e Engine, be backend.Backend) string {
 	lost := flushTwo(t, e)[0]
 
 	dropObjects(t, be, lost)
-	e.LosePart(lost, bucketindex.Interval{Min: 1, Max: 1})
+	e.LosePart(lost, bucketindex.Range(0, 1, 1))
 
 	e.Append(t, api(300, 3))
 	require.NoError(t, e.Flush(context.Background()))

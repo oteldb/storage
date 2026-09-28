@@ -42,6 +42,11 @@ type Entry struct {
 	// for every part a merge wrote whole, which is nearly all of them. See [Claim]. Added in
 	// format v6.
 	Claim Claim
+	// Term is the ownership term of the tenure that wrote this part. It is what tells apart two
+	// parts of one identity — two owners that merged the same inputs either side of a handoff — and
+	// resolves them to the later tenure (see [Lineage.Subsumes]). Zero for a writer with no cluster,
+	// and for every part an index written before format v7 names. Added in format v7.
+	Term uint64
 	// Hole marks this entry as an acknowledged loss rather than a part: the writer owed a repair
 	// for these blocks, no owner could supply them, and it committed this in their place so the
 	// obligation stops blocking reads. It names no objects and holds no rows.
@@ -85,11 +90,11 @@ type Index struct {
 	// value it read forward and takes the maximum when it rebases on a rival's commit, so it is a
 	// cluster-visible fact rather than a per-node level a restart resets. Added in format v5.
 	LostParts uint64
-	// AllocatedBlocks is the highest block number ever handed out under this prefix — the
-	// allocation high-water mark [Index.NextBlock] runs above. It is a separate number from
-	// anything the live set says, because the live set shrinks and identity must not: see
-	// [Index.NextBlock]. Added in format v6.
-	AllocatedBlocks uint64
+	// AllocatedBlocks is the highest block ever handed out under this prefix — the allocation
+	// high-water mark [Index.NextBlock] runs above. It is separate from anything the live set says,
+	// because the live set shrinks and identity must not: see [Index.NextBlock]. Added in format v6,
+	// as a term-0 number; a [Block] since format v7.
+	AllocatedBlocks Block
 }
 
 // Add inserts e, replacing any existing entry with the same prefix, keeping the index sorted.
@@ -136,6 +141,9 @@ func (ix *Index) Overlapping(start, end int64) []Entry {
 const (
 	magic0, magic1 = 'B', 'I'
 
+	// v7 scopes every block to the ownership term that allocated it (a [Block] is a term and a
+	// number), and adds the writing tenure's term to entries and wants. A v6 block is read as term 0.
+	//
 	// v6 turns the block interval into an exact set (bounds plus gaps), adds the split-group claim
 	// to entries and wants, and appends the allocation high-water mark. v5 (the block interval,
 	// level and the wanted list), v4 (the per-writer flush watermarks), v3 (Generation + Removed),
@@ -150,7 +158,7 @@ const (
 	// Reading is backward compatible; writing is not. [Decode] rejects any version above this one,
 	// so a node on pre-v5 code cannot read an index this one writes: every node that reads a given
 	// index must be upgraded together. See backend/ARCH.md for the blast radius per deployment.
-	version = 6
+	version = 7
 )
 
 // AppendBinary appends the versioned binary encoding of the index to dst (append-style for
@@ -168,6 +176,7 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 		dst = binary.AppendUvarint(dst, uint64(e.Level))
 		dst = binary.AppendUvarint(dst, entryFlags(*e))
 		dst = appendClaim(dst, e.Claim)
+		dst = binary.AppendUvarint(dst, e.Term)
 	}
 
 	dst = binary.AppendUvarint(dst, ix.FlushedEpoch)
@@ -205,10 +214,12 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 		dst = binary.AppendUvarint(dst, w.Generation.Term)
 		dst = binary.AppendUvarint(dst, w.Generation.Counter)
 		dst = appendClaim(dst, w.Claim)
+		dst = binary.AppendUvarint(dst, w.Term)
 	}
 
 	dst = binary.AppendUvarint(dst, ix.LostParts)
-	dst = binary.AppendUvarint(dst, ix.AllocatedBlocks)
+	dst = binary.AppendUvarint(dst, ix.AllocatedBlocks.Term)
+	dst = binary.AppendUvarint(dst, ix.AllocatedBlocks.N)
 
 	return dst
 }
@@ -295,7 +306,7 @@ func Decode(data []byte) (*Index, error) {
 }
 
 // decodeTail parses the v5+ tail: the outstanding wants, the loss counter, and the v6+ allocation
-// high-water mark.
+// high-water mark (a term-0 number in v6, a [Block] since v7).
 func decodeTail(ix *Index, buf []byte, ver uint8) error {
 	wanted, rest, err := decodeWants(buf, ver)
 	if err != nil {
@@ -317,7 +328,13 @@ func decodeTail(ix *Index, buf []byte, ver uint8) error {
 		return nil
 	}
 
-	if ix.AllocatedBlocks, _, ok = readUvarint(rest); !ok {
+	if ver >= 7 {
+		if ix.AllocatedBlocks.Term, rest, ok = readUvarint(rest); !ok {
+			return errors.Wrap(ErrCorrupt, "bad allocated term")
+		}
+	}
+
+	if ix.AllocatedBlocks.N, _, ok = readUvarint(rest); !ok {
 		return errors.Wrap(ErrCorrupt, "bad allocated blocks")
 	}
 
@@ -412,7 +429,13 @@ func decodeBlockIdentity(buf []byte, ver uint8, e *Entry) ([]byte, bool) {
 	e.Hole = flags&entryFlagHole != 0
 
 	if ver >= 6 {
-		if e.Claim, buf, ok = readClaim(buf); !ok {
+		if e.Claim, buf, ok = readClaim(buf, ver); !ok {
+			return nil, false
+		}
+	}
+
+	if ver >= 7 {
+		if e.Term, buf, ok = readUvarint(buf); !ok {
 			return nil, false
 		}
 	}
@@ -420,27 +443,54 @@ func decodeBlockIdentity(buf []byte, ver uint8, e *Entry) ([]byte, bool) {
 	return buf, true
 }
 
-// appendInterval writes a block set. An unset one costs a single zero byte, and the gap list is
-// written only for a set that has one, so the ordinary contiguous part pays three bytes.
+// appendInterval writes a block set. An unset one costs a single zero byte. A set leads with its
+// lowest block's number, which a valid set never has at 0, so the zero byte stays unambiguous. The
+// upper bound's term is written as a delta, and the gap list only for a set that has one, so the
+// ordinary contiguous part pays for its term once.
 func appendInterval(dst []byte, iv Interval) []byte {
 	if !iv.Valid() {
 		return binary.AppendUvarint(dst, 0)
 	}
 
-	dst = binary.AppendUvarint(dst, iv.Min)
-	dst = binary.AppendUvarint(dst, iv.Max)
+	dst = binary.AppendUvarint(dst, iv.Min.N)
+	dst = binary.AppendUvarint(dst, iv.Min.Term)
+	dst = binary.AppendUvarint(dst, iv.Max.Term-iv.Min.Term)
+	dst = binary.AppendUvarint(dst, iv.Max.N)
 	dst = binary.AppendUvarint(dst, uint64(len(iv.Gaps)))
 
 	for _, g := range iv.Gaps {
-		dst = binary.AppendUvarint(dst, g.Min)
-		dst = binary.AppendUvarint(dst, g.Max)
+		dst = appendBlock(dst, g.Min)
+		dst = appendBlock(dst, g.Max)
 	}
 
 	return dst
 }
 
-// readInterval parses a block set. A v5 encoding carries bounds only and is read as the contiguous
-// set they describe — the meaning a hull had when it was written.
+func appendBlock(dst []byte, b Block) []byte {
+	dst = binary.AppendUvarint(dst, b.Term)
+
+	return binary.AppendUvarint(dst, b.N)
+}
+
+func readBlock(buf []byte) (Block, []byte, bool) {
+	var (
+		b  Block
+		ok bool
+	)
+
+	if b.Term, buf, ok = readUvarint(buf); !ok {
+		return Block{}, nil, false
+	}
+
+	if b.N, buf, ok = readUvarint(buf); !ok {
+		return Block{}, nil, false
+	}
+
+	return b, buf, true
+}
+
+// readInterval parses a block set. Blocks before v7 are term 0. A v5 encoding carries bounds only
+// and is read as the contiguous set they describe — the meaning a hull had when it was written.
 //
 // A set that does not round-trip to its canonical form is rejected rather than normalized: two
 // encodings of one set would break both equality and the encode∘decode identity, and a
@@ -451,23 +501,43 @@ func readInterval(buf []byte, ver uint8) (Interval, []byte, bool) {
 		ok bool
 	)
 
-	if iv.Min, buf, ok = readUvarint(buf); !ok {
+	if iv.Min.N, buf, ok = readUvarint(buf); !ok {
 		return Interval{}, nil, false
 	}
 
 	if ver < 6 {
-		if iv.Max, buf, ok = readUvarint(buf); !ok {
+		if iv.Max.N, buf, ok = readUvarint(buf); !ok {
 			return Interval{}, nil, false
+		}
+
+		// A hull that names no real set — inverted, or touching block 0 — is unset, as it would be
+		// written back; keeping it verbatim would make decode∘encode differ from the identity.
+		if !iv.Valid() {
+			return Interval{}, buf, true
 		}
 
 		return iv, buf, true
 	}
 
-	if iv.Min == 0 {
+	if iv.Min.N == 0 {
 		return Interval{}, buf, true
 	}
 
-	if iv.Max, buf, ok = readUvarint(buf); !ok {
+	if ver >= 7 {
+		var span uint64
+
+		if iv.Min.Term, buf, ok = readUvarint(buf); !ok {
+			return Interval{}, nil, false
+		}
+
+		if span, buf, ok = readUvarint(buf); !ok || span > math.MaxUint64-iv.Min.Term {
+			return Interval{}, nil, false
+		}
+
+		iv.Max.Term = iv.Min.Term + span
+	}
+
+	if iv.Max.N, buf, ok = readUvarint(buf); !ok {
 		return Interval{}, nil, false
 	}
 
@@ -481,11 +551,7 @@ func readInterval(buf []byte, ver uint8) (Interval, []byte, bool) {
 		for range n {
 			var g Gap
 
-			if g.Min, buf, ok = readUvarint(buf); !ok {
-				return Interval{}, nil, false
-			}
-
-			if g.Max, buf, ok = readUvarint(buf); !ok {
+			if buf, ok = readGap(buf, ver, &g); !ok {
 				return Interval{}, nil, false
 			}
 
@@ -500,6 +566,28 @@ func readInterval(buf []byte, ver uint8) (Interval, []byte, bool) {
 	return iv, buf, true
 }
 
+func readGap(buf []byte, ver uint8, g *Gap) ([]byte, bool) {
+	var ok bool
+
+	if ver >= 7 {
+		if g.Min, buf, ok = readBlock(buf); !ok {
+			return nil, false
+		}
+
+		g.Max, buf, ok = readBlock(buf)
+
+		return buf, ok
+	}
+
+	if g.Min.N, buf, ok = readUvarint(buf); !ok {
+		return nil, false
+	}
+
+	g.Max.N, buf, ok = readUvarint(buf)
+
+	return buf, ok
+}
+
 func appendClaim(dst []byte, c Claim) []byte {
 	if !c.Valid() {
 		return binary.AppendUvarint(dst, 0)
@@ -511,7 +599,7 @@ func appendClaim(dst []byte, c Claim) []byte {
 	return appendInterval(dst, c.Group)
 }
 
-func readClaim(buf []byte) (Claim, []byte, bool) {
+func readClaim(buf []byte, ver uint8) (Claim, []byte, bool) {
 	present, buf, ok := readUvarint(buf)
 	if !ok || present > 1 {
 		return Claim{}, nil, false
@@ -523,11 +611,11 @@ func readClaim(buf []byte) (Claim, []byte, bool) {
 
 	var c Claim
 
-	if c.Blocks, buf, ok = readInterval(buf, version); !ok {
+	if c.Blocks, buf, ok = readInterval(buf, ver); !ok {
 		return Claim{}, nil, false
 	}
 
-	if c.Group, buf, ok = readInterval(buf, version); !ok {
+	if c.Group, buf, ok = readInterval(buf, ver); !ok {
 		return Claim{}, nil, false
 	}
 
@@ -595,8 +683,14 @@ func decodeWants(buf []byte, ver uint8) ([]Want, []byte, error) {
 		}
 
 		if ver >= 6 {
-			if w.Claim, buf, ok = readClaim(buf); !ok {
+			if w.Claim, buf, ok = readClaim(buf, ver); !ok {
 				return nil, nil, errors.Wrap(ErrCorrupt, "bad want claim")
+			}
+		}
+
+		if ver >= 7 {
+			if w.Term, buf, ok = readUvarint(buf); !ok {
+				return nil, nil, errors.Wrap(ErrCorrupt, "bad want tenure")
 			}
 		}
 

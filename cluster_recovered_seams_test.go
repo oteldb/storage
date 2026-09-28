@@ -135,23 +135,36 @@ func prefixesOf(parts []PartInfo) []string {
 	return out
 }
 
-// restartLosing closes node-a, lets drop rewrite what it left on disk, and reopens it with the
-// maintenance loop off, so the only thing that can bring the part back is the engine's own repair
-// pass — a partsync mirror would restore the objects and hide a missing seam.
-func (p *recoveredPair) restartLosing(t *testing.T, drop func(be *file.File)) *Storage {
+// restartLosing closes the shard's compaction owner, lets drop rewrite what it left on disk, and
+// reopens it with the maintenance loop off, so the only thing that can bring the part back is the
+// engine's own repair pass — a partsync mirror would restore the objects and hide a missing seam. It
+// has to be the owner: an engine commits only under the shard's claim, which the returned claim
+// func takes back once the peer has let it go.
+func (p *recoveredPair) restartLosing(t *testing.T, drop func(be *file.File)) (*Storage, signal.TenantID, func() bool) {
 	t.Helper()
 
-	require.NoError(t, p.nodes["node-a"].Close(context.Background()))
+	shard := shardKeyOf("default", 0, p.nodes["node-a"].cluster.shardCount())
+	primary, ok := p.nodes["node-a"].cluster.membership.Ring().Primary([]byte(shard))
+	require.True(t, ok)
 
-	be, err := file.New(p.dirs["node-a"])
+	id := primary.ID
+	require.NoError(t, p.nodes[id].Close(context.Background()))
+
+	be, err := file.New(p.dirs[id])
 	require.NoError(t, err)
 	drop(be)
 
-	a := p.open(t, "node-a", WithFlushInterval(-1))
-	p.nodes["node-a"] = a
+	a := p.open(t, id, WithFlushInterval(-1))
+	p.nodes[id] = a
 	awaitMembership(t, p.nodes)
 
-	return a
+	claim := func() bool {
+		_, owned := a.ownedTenants(context.Background(), map[signal.TenantID]struct{}{shard: {}})[shard]
+
+		return owned
+	}
+
+	return a, shard, claim
 }
 
 func dropPartObjects(ctx context.Context, t *testing.T, be *file.File, prefix string) {
@@ -176,14 +189,17 @@ func TestRecoveredEngineRepairsFromPeer(t *testing.T) {
 	p := newRecoveredPair(t)
 	lost := p.sharedPart(t, signal.Log)
 
-	a := p.restartLosing(t, func(be *file.File) { dropPartObjects(ctx, t, be, lost.Prefix) })
+	a, shard, claim := p.restartLosing(t, func(be *file.File) { dropPartObjects(ctx, t, be, lost.Prefix) })
 
-	shard := shardKeyOf("default", 0, a.cluster.shardCount())
 	eng, ok := a.lookupRecordEngine(signal.Log, shard)
 	require.True(t, ok, "the engine exists from recovery, before any write")
 	require.Positive(t, eng.Stats().WantedParts, "recovery recorded the loss")
 
 	require.Eventually(t, func() bool {
+		if !claim() {
+			return false
+		}
+
 		_ = eng.Merge(ctx, 0)
 
 		return eng.Stats().WantedParts == 0
@@ -204,7 +220,7 @@ func TestRecoveredEngineRepairsAdoptedWant(t *testing.T) {
 	p := newRecoveredPair(t)
 	lost := p.sharedPart(t, signal.Metric)
 
-	a := p.restartLosing(t, func(be *file.File) {
+	a, shard, claim := p.restartLosing(t, func(be *file.File) {
 		key := path.Dir(lost.Prefix) + "/" + bucketindex.Object
 
 		ix, err := bucketindex.Load(ctx, be, key)
@@ -215,7 +231,6 @@ func TestRecoveredEngineRepairsAdoptedWant(t *testing.T) {
 		dropPartObjects(ctx, t, be, lost.Prefix)
 	})
 
-	shard := shardKeyOf("default", 0, a.cluster.shardCount())
 	eng, ok := a.lookupEngine(shard)
 	require.True(t, ok, "the engine exists from recovery, before any write")
 	require.False(t, eng.HasWants(), "the local index never named the part, so nothing states it is owed")
@@ -224,6 +239,10 @@ func TestRecoveredEngineRepairsAdoptedWant(t *testing.T) {
 	require.True(t, eng.HasWants())
 
 	require.Eventually(t, func() bool {
+		if !claim() {
+			return false
+		}
+
 		_ = eng.Merge(ctx, 0)
 
 		return !eng.HasWants()
