@@ -76,6 +76,16 @@ func (o *Ownership) SetLease(id clientv3.LeaseID) {
 	o.held = make(map[string]uint64)
 }
 
+// Forget drops every claim this node believes it holds, without touching etcd: for after the lease
+// that bound them was revoked, when the keys are already gone and [Ownership.Term] would otherwise
+// go on reporting tenures that have ended.
+func (o *Ownership) Forget() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.held = make(map[string]uint64)
+}
+
 // SetFence installs the predicate that reports this node's claims unprovable — wire it to
 // [Membership.Fenced]. While it reports true this node holds nothing as far as every caller is
 // concerned: [Ownership.Term] disclaims, [Ownership.Owned] is empty, and [Ownership.Reconcile]

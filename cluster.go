@@ -1517,6 +1517,10 @@ func (n *clusterNode) close(ctx context.Context) error {
 		firstErr = err
 	}
 
+	// The lease went with the claims, so no commit after this is any tenure's: an engine's final
+	// flush past this point is refused and leaves its head in the WAL.
+	n.ownership.Forget()
+
 	if err := n.server.Shutdown(ctx); err != nil && firstErr == nil {
 		firstErr = err
 	}

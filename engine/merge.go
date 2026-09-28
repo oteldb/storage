@@ -809,19 +809,23 @@ func mergeStreamedSeries(
 // loop — the owner ([storage.Storage]) does that before calling Close.
 func (e *Engine) Close(ctx context.Context) error {
 	// A clustered engine without the shard's claim leaves its head to the WAL, for the next start
-	// to replay, rather than failing to close.
-	if _, _, err := e.flush(ctx); err != nil && !errors.Is(err, bucketindex.ErrSuperseded) {
-		return err
+	// to replay, rather than failing to close. A flush that failed otherwise still closes the WAL:
+	// its segments hold the head for the next start either way.
+	_, _, flushErr := e.flush(ctx)
+	if errors.Is(flushErr, bucketindex.ErrSuperseded) {
+		flushErr = nil
 	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.cfg.WAL != nil {
-		return e.cfg.WAL.Close()
+		if err := e.cfg.WAL.Close(); err != nil && flushErr == nil {
+			return err
+		}
 	}
 
-	return nil
+	return flushErr
 }
 
 // CloseWAL closes the engine's open WAL segment file handle without flushing the head or

@@ -53,6 +53,7 @@ func TestClusterCloseFlushesWhileTheClaimIsHeld(t *testing.T) {
 	_, owned := s.ownedTenants(ctx, map[signal.TenantID]struct{}{shard: {}})[shard]
 	require.True(t, owned)
 	require.NoError(t, s.Close(ctx))
+	assert.False(t, s.claimsShard(shard), "leaving the cluster ends the tenure")
 
 	s = open()
 	t.Cleanup(func() { _ = s.Close(ctx) })
