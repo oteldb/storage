@@ -104,11 +104,15 @@ func TestClusterHandoffUnsyncedFlushReadsOnce(t *testing.T) {
 	}, 30*time.Second, 20*time.Millisecond, "the old owner rejoins")
 
 	// The old owner installs the new owner's index beside the part it holds, takes the shard back once
-	// the secondary releases it, and merges; the secondary mirrors the result.
-	for range 3 {
+	// the secondary releases it, and merges; the secondary mirrors the result. How many cycles that
+	// takes is timing: a new tenure makes one establishing attempt per flush and merge, and one that
+	// meets a concurrent index write waits for the next cycle.
+	require.Eventually(t, func() bool {
 		oldOwner.maintain(ctx)
 		secondary.maintain(ctx)
-	}
+
+		return oldOwner.claimsShard(shard) && len(om.Parts()) == 1 && len(sm.Parts()) == 1
+	}, 30*time.Second, 20*time.Millisecond, "the old owner takes the shard back, merges, and the secondary mirrors it")
 
 	// The metric half does not duplicate: a read merges a series by timestamp, and so does the merge
 	// that folds the two parts together.
