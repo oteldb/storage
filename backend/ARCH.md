@@ -226,23 +226,32 @@ a demonstration.
   round trip on the flush path, and it works with the cluster layer absent. Two owners racing a
   handoff over one index resolve through that CAS: one commit lands, the loser wraps `ErrConflict`,
   re-reads, and re-allocates above the winner.
-  **One identity written by two tenures resolves to the later one** (`Entry.Term`, format v7). The
-  fence below leaves one way for it to arise: two owners merge the same inputs either side of a
-  handoff, the earlier one committing while its claim is still provable. Both outputs cover the same
-  blocks at the same level and hold the same rows, so `Lineage.Subsumes` — and through it
-  `Supersedes`, `Satisfying`, `Revokes` and `Subsumed` — lets the higher `Term` replace the lower.
+  **One identity written by two tenures resolves to the later one** (`Entry.Term`, format v7). Over
+  one shared index the fence below keeps it from arising; over private backends two owners can merge
+  the same inputs either side of a handoff, and the two outputs meet through `cluster/partsync` and
+  repair. Both cover the same blocks at the same level and hold the same rows, so `Lineage.Subsumes`
+  — and through it `Supersedes`, `Satisfying`, `Revokes` and `Subsumed` — lets the higher `Term`
+  replace the lower.
 - **A clustered writer commits only as the shard's current tenure** (`CheckTenure`, `ErrSuperseded`).
   Before each CAS attempt the engine checks the term it holds now against the term its operation
   began under and the term of the index it builds on. It refuses when it holds no claim (a lapsed or
   fenced lease reads as term 0), when its tenure ended and restarted mid-operation, and when a
   rebase shows a later tenure wrote the index — a rebase never adopts a higher term, so a displaced
   writer never commits under its successor's. A refused commit leaves its output unreferenced, for
-  the orphan sweep. It is a check before a CAS, not inside one: a commit that passes can still land
-  after the claim lapses, and what bounds that window is the lease fence margin, since a successor
-  can only acquire once the lease has expired. What the window admits is duplicate rows — an old
-  owner's last flush, re-flushed by the new owner from its replica head, or overlapping merges —
-  never a collision, a stuck want or a false hole. A writer with no cluster has no tenure and is not
-  fenced.
+  the orphan sweep. A writer with no cluster has no tenure and is not fenced.
+  The check reads the claim locally, so on its own it cannot stop a commit that passes it and then
+  lands after the claim moved. **A tenure's first commit is what closes that window**: the new
+  owner reloads the index and commits it back under its term before any flush, merge or repair of
+  the tenure may commit (`engine/ARCH.md`, "A clustered commit is fenced by tenure"). That moves the
+  index version, so a predecessor's held CAS either landed first — and is the new tenure's starting
+  point — or fails, rebases into the higher term and is refused. The CAS is the only serialization
+  point two writers share, so this is also why the guarantee is per index: **over a shared store**
+  a displaced writer never lands a commit after its successor's first one; **over private backends**
+  (`cluster.Config.PrivateBackend`) each node commits to its own index, nothing orders a displaced
+  owner's writes against its successor's, and the protection is identity alone — term-scoped blocks
+  cannot collide and an identical identity resolves to the later tenure. What that admits is
+  duplicate rows — an old owner's last flush, re-flushed by the new owner from its replica head, or
+  overlapping merges — never a collision, a stuck want or a false hole.
 - **`Entries → Removed | Wanted`** is the invariant the repair path enforces: a part leaves
   `Entries` only into a tombstone (`Removal`, a deliberate deletion) or into a `Want` (an
   obligation to fetch it back). Conflating the two would make "am I repaired?" unanswerable, which

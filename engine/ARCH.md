@@ -149,10 +149,6 @@ The opens sit on the commit path, which is where the cost is. It is bounded: han
 across the retry loop, and an entry that cannot be opened — a rival merged it away in between — is
 left out of the readable set but kept in the index, since only its writer knows whether it is live.
 
-**An adopted part this engine's own parts subsume is retired instead** (`dropSubsumedForeignLocked`):
-the same merge a displaced tenure committed just before this one, resolved to the later tenure, or
-an input a merge here has since consumed. It is left out of the commit and tombstoned, since
-carrying it forward keeps its rows live twice; its objects are the orphan sweep's.
 
 ### Block identity is allocated by the commit that publishes the part
 
@@ -302,6 +298,24 @@ before it writes anything, so a refused one folds its rows back into the head (a
 refused only at the commit keeps its part as a carried, uncommitted part, like any failed commit. A
 refused merge rolls back and leaves its output to the sweep. `Close` treats the refusal as nothing to
 flush: the head stays in the WAL for the next start.
+
+**Nothing of a tenure commits before the tenure is established** (`establishTenureLocked`). Flush,
+merge and `MergeWith` (ahead of repair) first make the tenure's own commit: a fresh load of the
+index (`loadReplica`: no sweep, lost parts become pending wants), committed back under the new term,
+which also publishes those wants and any carried part. Until it lands, `tenureLocked` refuses every
+commit of the term, so a flush keeps its rows in the head and the WAL and a merge does nothing; the
+next maintenance cycle tries again, bounded per attempt like any commit, and a backend that cannot
+take the commit could not take the flush either. A load-time want commit skips an unestablished
+tenure and leaves the wants pending.
+
+It is a load and not a rebase because of what a predecessor may have committed after the claim moved
+and before this tenure's first write. A rebase carries this engine's own parts forward, so a merge
+the predecessor landed in that window would be kept beside the inputs it consumed; a fresh load
+makes it this tenure's starting point instead. Once the commit lands, the index version has moved
+and a predecessor's held CAS can only fail, rebase and be refused (`backend/ARCH.md`, "A clustered
+writer commits only as the shard's current tenure"). That ordering holds per index: over private
+backends the successor's commit orders nothing on the predecessor's disk, and identity is the
+protection there.
 
 ## A failed load changes nothing, and fences every commit
 

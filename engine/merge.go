@@ -62,6 +62,11 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 
 	// Repair first: a part pulled back from a peer joins this cycle's compaction, and a merge that
 	// cannot repair still compacts.
+	// Repair commits under the tenure too, so it has to be established before repair runs.
+	if err := e.establishTenure(ctx); err != nil {
+		return err
+	}
+
 	e.repairWants(ctx)
 
 	res, err := e.merge(ctx, opts)
@@ -107,6 +112,13 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	// Plan (under lock): snapshot the source parts (immutable backing). Output part ids are minted one
 	// at a time, as the parts are written.
 	e.mu.Lock()
+
+	if err := e.establishTenureLocked(ctx); err != nil {
+		e.mu.Unlock()
+
+		return mergeResult{}, err
+	}
+
 	src := e.parts
 	adopted := slices.Collect(maps.Values(e.foreignParts))
 	e.mu.Unlock()

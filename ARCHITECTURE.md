@@ -199,9 +199,11 @@ to fail over to: a read overlapping a want fails.
   safe (`cluster/ARCH.md`, *Lease fencing*).
 - **A clustered writer commits only as the shard's current tenure.** Every index commit first
   re-checks that the writer still holds its claim, under the term the operation began with, and
-  that the index it builds on was not written by a later term (`bucketindex.CheckTenure`). Part
-  identity is scoped the same way: a block is a `(term, n)` pair, so two tenures that never saw each
-  other's index cannot allocate the same identity. What the fence leaves possible is duplicate rows,
+  that the index it builds on was not written by a later term (`bucketindex.CheckTenure`), and a
+  tenure's first commit re-establishes the index under its term, so over a shared store no displaced
+  writer lands a commit after its successor's first. Part identity is scoped the same way: a block is
+  a `(term, n)` pair, so two tenures that never saw each other's index — every handoff over private
+  backends — cannot allocate the same identity. What the fence leaves possible is duplicate rows,
   never a collision (`backend/ARCH.md`, *Part identity*).
 - **The bucket index commits last, conditionally.** It is what makes a part durably visible — and in
   `recordengine` it also carries the flush watermark (the WAL replay floor, one slot per writer since

@@ -283,6 +283,9 @@ type Engine struct {
 	// and raised to a rival's on rebase for the same reason: identity must stay unique over the
 	// shard's whole life, and the live set it could otherwise be derived from shrinks.
 	allocated bucketindex.Block
+	// established is the ownership term whose first commit has landed: until it equals the current
+	// term, no commit of that tenure is allowed. See [Engine.establishTenureLocked].
+	established uint64
 	// pendingHoles are the losses the next commit must acknowledge. Like pendingWants they are
 	// held rather than applied on the spot, so a commit that never lands leaves the want
 	// outstanding instead of half-discharged.
@@ -1593,6 +1596,13 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	// Plan (under lock): detach the head's sample buffers, keeping them readable via e.flushing so a
 	// concurrent fetch never loses them.
 	e.mu.Lock()
+
+	if err := e.establishTenureLocked(ctx); err != nil {
+		e.mu.Unlock()
+
+		return 0, 0, err
+	}
+
 	detached, detachedBytes, detachedSince := e.head.detach()
 	if detached == nil {
 		e.mu.Unlock()

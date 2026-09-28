@@ -14,33 +14,64 @@ import (
 	"github.com/oteldb/storage/backend/faultbackend"
 )
 
-// splitBrainMergeResolvesToTheLaterTenure is the other order of splitBrainMergeSameInputs: the
-// displaced tenure A still holds its claim when it commits its merge, and B's merge of the same two
-// parts lands second. B's rebase adopts A's output, finds its own output to be the same identity
-// written by a later tenure, and retires A's rather than keeping both.
-func splitBrainMergeResolvesToTheLaterTenure(t *testing.T, k Kind) {
+// staleCommitCannotLandAfterTheSuccessorEstablishes is the check-to-CAS window: A's merge passes its
+// tenure check and is held inside the index CAS while the claim moves to B. B's first write is the
+// commit that establishes its tenure, which changes the index's version, so A's held CAS can only
+// fail, rebase into B's term, and be refused — whatever A's local view of its claim still says.
+func staleCommitCannotLandAfterTheSuccessorEstablishes(t *testing.T, k Kind) {
 	t.Helper()
 
 	ctx := context.Background()
 	inner := backend.Memory()
-	bBe := faultbackend.Wrap(inner)
-	want := []Row{api(100, 1), api(200, 2)}
+	aBe := faultbackend.Wrap(inner)
+	want := []Row{api(100, 1), api(200, 2), api(300, 3)}
 
-	a := k.openTenure(t, inner, displacedTerm, 0)
-	k.flushEach(t, a, inner, want...)
+	a := k.openTenure(t, aBe, displacedTerm, 0)
+	k.flushEach(t, a, inner, want[:2]...)
 
-	b := k.openTenure(t, bBe, ownerTerm, 0)
-	commitB := stallMerge(t, b, gateIndexCommit(bBe))
+	commitA := stallMerge(t, a, gateIndexCommit(aBe))
 
-	require.NoError(t, a.ForceMerge(ctx))
-	require.NoError(t, commitB())
+	b := k.openTenure(t, inner, ownerTerm, 0)
+	b.Append(t, want[2])
+	require.NoError(t, b.Flush(ctx))
+	require.EqualValues(t, ownerTerm, k.loadIndex(t, inner).Generation.Term)
 
-	k.requireStoredOnce(t, inner, want)
+	require.ErrorIs(t, commitA(), bucketindex.ErrSuperseded, "the held commit lands against a moved index")
 
 	ix := k.loadIndex(t, inner)
-	require.Len(t, ix.Entries, 1)
-	assert.EqualValues(t, ownerTerm, ix.Entries[0].Term, "the later tenure's output is the one kept")
-	assert.Len(t, ix.Removed, 3, "both inputs and the earlier output are tombstoned, not dropped silently")
+	assert.Len(t, ix.Entries, 3, "A's output never became live")
+	k.requireStoredOnce(t, inner, want)
+}
+
+// predecessorCommitLandsBeforeTheSuccessorEstablishes is the other side of the same window: A's held
+// merge lands after B took the claim but before B wrote anything. B establishes its tenure over a
+// fresh load of the index, not a rebase of the view it held as a replica, so A's merge is B's starting
+// point — the inputs A consumed are not carried back in beside A's output.
+func predecessorCommitLandsBeforeTheSuccessorEstablishes(t *testing.T, k Kind) {
+	t.Helper()
+
+	ctx := context.Background()
+	inner := backend.Memory()
+	aBe := faultbackend.Wrap(inner)
+	want := []Row{api(100, 1), api(200, 2), api(300, 3)}
+
+	a := k.openTenure(t, aBe, displacedTerm, 0)
+	k.flushEach(t, a, inner, want[:2]...)
+
+	commitA := stallMerge(t, a, gateIndexCommit(aBe))
+
+	b := k.openTenure(t, inner, ownerTerm, 0)
+	require.Equal(t, 2, b.PartCount(), "B's view is the two inputs")
+
+	require.NoError(t, commitA(), "A's merge lands before any write of B's tenure")
+
+	b.Append(t, want[2])
+	require.NoError(t, b.Flush(ctx))
+
+	ix := k.loadIndex(t, inner)
+	assert.EqualValues(t, ownerTerm, ix.Generation.Term)
+	assert.Len(t, ix.Entries, 2, "A's output and B's flush, and not A's inputs again")
+	k.requireStoredOnce(t, inner, want)
 }
 
 // tenuresAllocateDisjointBlocks is #725's block collision: two tenures whose indexes diverged — a
@@ -84,6 +115,34 @@ func tenuresAllocateDisjointBlocks(t *testing.T, k Kind) {
 	require.Len(t, merged, 1)
 	assert.True(t, merged[0].Blocks.Contains(pb.Blocks))
 	assert.False(t, merged[0].Blocks.Contains(pa.Blocks), "the successor never merged the displaced part")
+}
+
+// unestablishedTenureKeepsRowsInTheHead: until a new tenure's first commit lands, nothing of it
+// commits. A flush whose establishing commit cannot land fails without writing a part, keeps its rows
+// in the head, and the next flush establishes the tenure and publishes them.
+func unestablishedTenureKeepsRowsInTheHead(t *testing.T, k Kind) {
+	t.Helper()
+
+	ctx := context.Background()
+	inner := backend.Memory()
+	be := faultbackend.Wrap(inner)
+
+	e := k.openTenure(t, be, ownerTerm, 0)
+	e.Append(t, api(100, 1))
+
+	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Err: assert.AnError})
+	require.ErrorIs(t, e.Flush(ctx), assert.AnError)
+	assert.Empty(t, k.partDirs(ctx, t, inner), "no part written for a tenure that could not establish")
+	assert.Equal(t, 1, e.HeadRows())
+
+	be.Reset()
+	require.NoError(t, e.Flush(ctx))
+
+	ix := k.loadIndex(t, inner)
+	require.Len(t, ix.Entries, 1)
+	assert.Equal(t, bucketindex.Generation{Term: ownerTerm, Counter: 2}, ix.Generation,
+		"the establishing commit, then the flush")
+	assert.Equal(t, []Row{api(100, 1)}, sortedRows(t, e))
 }
 
 // writingTermSurvivesTheNextTenure pins that a part's writing term is part of its identity, not of
