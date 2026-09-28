@@ -29,7 +29,7 @@ func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
 		t.Run(fmt.Sprintf("%d days", days), func(t *testing.T) {
 			var peak, run, limit int64
 
-			defer recordengine.SetMergeResidentObserver(func(p, r, l int64) {
+			defer recordengine.SetMergeResidentObserver(func(p, r, l, _ int64) {
 				peak, run, limit = max(peak, p), max(run, r), l
 			})()
 
@@ -97,7 +97,7 @@ func TestRetentionRewriteHoldsResidentShare(t *testing.T) {
 
 	var peak, run, limit int64
 
-	defer recordengine.SetMergeResidentObserver(func(p, r, l int64) { peak, run, limit = max(peak, p), max(run, r), l })()
+	defer recordengine.SetMergeResidentObserver(func(p, r, l, _ int64) { peak, run, limit = max(peak, p), max(run, r), l })()
 
 	ctx := context.Background()
 	e := recordengine.New(recordengine.Config{

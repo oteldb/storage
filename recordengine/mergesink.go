@@ -43,6 +43,21 @@ func (s *columnSink) residentBytes() int64 {
 	return n
 }
 
+// finishBytes bounds what the sink's sidecars cost the part's finish: the bloom built and encoded,
+// then read back and decoded as the part opens, and the record keys sorted, encoded and read back.
+func (s *columnSink) finishBytes() int64 {
+	if s == nil {
+		return 0
+	}
+
+	n := 3 * s.keyBytes
+	if s.bloom != nil {
+		n += 3 * s.bloom.filterBytes()
+	}
+
+	return n
+}
+
 // newColumnSink returns the sink byte column k of schema needs, or nil when it feeds no sidecar.
 func newColumnSink(schema *Schema, k int) *columnSink {
 	var s columnSink
@@ -139,6 +154,19 @@ func (a *bloomAccum) token(t []byte) {
 	if a.pairs.add(h1, h2) {
 		a.distinct.Add(t)
 	}
+}
+
+// filterBytes bounds the filter [bloomAccum.encode] builds from the rows so far, encoded. [filterItems]
+// sizes it by the occurrence count only while that filter stays small, and otherwise by the distinct
+// estimate, which is taken over exactly the distinct pairs held: an eighth over their count is far
+// past the sketch's error.
+func (a *bloomAccum) filterBytes() int64 {
+	const header = 32
+
+	items := a.pairs.n + a.pairs.n/8 + 64
+	bits := bloom.Bits(items, falsePositiveRate(a.mode))
+
+	return max(int64(bits/8), smallFilterBytes) + header
 }
 
 func (a *bloomAccum) encode() []byte {

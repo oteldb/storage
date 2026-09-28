@@ -2,11 +2,13 @@ package block
 
 import (
 	"context"
+	"encoding/binary"
 
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/encoding/compress"
 )
 
 // The sequential counterpart of the ranged read path. A query touches a handful of granules out of
@@ -46,6 +48,107 @@ func (r *PartReader) ColumnScan(ctx context.Context, name string, window int64) 
 	}
 
 	return r.openDecoder(ctx, name, max(window, 0))
+}
+
+// ScanBound bounds, from the manifest alone, what [Decoder.ResidentBytes] reports for
+// ColumnScan(ctx, name, window) — steady — and what opening it holds on top while it reads and parses
+// the column's tail — open: the dictionary region and directory as read, and the dictionary
+// decompressed into scratch before it is kept. A caller can reserve both before opening the column.
+// ok is false for a column the manifest cannot size: one written without [WithSizingStats], an
+// unframed or leading-dictionary layout, a constant or unblocked column, or none by that name.
+func (r *PartReader) ScanBound(ctx context.Context, name string, window int64) (steady, open int64, ok bool) {
+	i, ok := r.byName[name]
+	if !ok {
+		return 0, 0, false
+	}
+
+	desc := r.manifest.Columns[i]
+	if desc.Const || !desc.Blocked || !desc.Framed || !desc.HasSizing || (desc.SharedDict && !desc.TrailerDict) {
+		return 0, 0, false
+	}
+
+	sz := desc.Sizing
+	slack := int64(compress.OutputSlack(desc.Compress))
+
+	open = sz.DirLen + dirProbeBytes + footerLenBytes
+	if desc.TrailerDict {
+		open = desc.Bytes - desc.DictOff + desc.DictRaw + slack
+	}
+
+	n := 4 * (3*sz.NumFrames + 1 + 3*sz.NumGranules)
+	n += desc.DictRaw + (binary.MaxVarintLen32+24)*desc.DictEntries
+
+	switch {
+	case !backend.RangesNatively(ctx, r.b, columnKey(r.prefix, i)):
+		n += desc.Bytes
+	case window > 0:
+		// The window never reaches past the frames, which the object holds beside the dictionary
+		// region and the directory.
+		n += min(max(window, sz.MaxFrameBytes), max(desc.Bytes-desc.DictLen-sz.DirLen, sz.MaxFrameBytes))
+	default:
+		n += sz.MaxFrameBytes
+	}
+
+	n += 2 * (sz.MaxFrameRaw + slack)
+
+	// The granule count is ceil(rows / granule rows), so a granule holds fewer than rows / (count-1).
+	rows, granules := int64(r.manifest.RowCount), sz.NumGranules
+	if granules > 1 {
+		rows = rows/(granules-1) + 1
+	}
+
+	return n + rows*desc.Kind.decodedRowBytes(), open, true
+}
+
+// ResidentBytes bounds what a forward walk over the decoder holds at any point: the directory and
+// shared dictionary, the read-ahead window (or the object, when the column was read whole), the
+// decompressed frame buffer twice over while a larger frame replaces it, and one decoded granule. It
+// is fixed when the decoder opens, so a caller may charge it before the walk touches a frame.
+func (d *Decoder) ResidentBytes() int64 {
+	dir := d.streams.dir
+	n := dir.residentBytes() + d.shared.residentBytes()
+
+	var maxFrame, maxRaw int64
+
+	for f := 0; f+1 < len(dir.frameOff); f++ {
+		maxFrame = max(maxFrame, int64(dir.frameOff[f+1]-dir.frameOff[f]))
+
+		if dir.frameRaw != nil {
+			maxRaw = max(maxRaw, int64(dir.frameRaw[f]))
+		}
+	}
+
+	if dir.frameRaw == nil {
+		maxRaw = max(dir.legacyMax, 0)
+	}
+
+	switch {
+	case dir.data != nil:
+		n += int64(len(dir.data))
+	case dir.src != nil && dir.src.window > 0 && len(dir.frameOff) > 0:
+		n += min(max(dir.src.window, maxFrame), int64(dir.frameOff[len(dir.frameOff)-1]))
+	default:
+		n += maxFrame
+	}
+
+	if d.streams.comp != nil {
+		maxRaw += int64(d.streams.comp.OutputSlack())
+	}
+
+	return n + 2*maxRaw + int64(dir.blockRows)*d.kind.decodedRowBytes()
+}
+
+// decodedRowBytes is what one decoded row of the kind costs: its value, or for bytes an id and the
+// view a granule's table holds per row at most.
+func (k Kind) decodedRowBytes() int64 {
+	switch k {
+	case KindInt128:
+		return 16
+	case KindBytes:
+		return 4 + 24
+	default:
+		return 8
+	}
 }
 
 // TsCursor returns a forward cursor over an int64 timestamp column, walking its granules in order.
@@ -98,6 +201,9 @@ func (s *frameSource) fill(f int, off, n int64) error {
 
 		hi = end
 	}
+
+	// Dropped before the read, so the walk holds one window rather than two while it refills.
+	s.ahead, s.lo, s.hi = nil, 0, 0
 
 	buf, err := s.read(off, hi-off)
 	if err != nil {

@@ -98,7 +98,7 @@ func TestMergeReadsOutOfOrderStreamColumnWhole(t *testing.T) {
 			want := mergedRows(t, []*part{badPart, goodPart})
 			require.Len(t, want, 10)
 
-			out, err := e.compactParts(ctx, []*part{badPart, goodPart}, minInt64, 0)
+			out, err := e.compactParts(ctx, []*part{badPart, goodPart}, minInt64, 0, nil)
 			require.NoError(t, err)
 
 			assert.Equal(t, want, mergedRows(t, out))
@@ -188,11 +188,11 @@ func TestMergeStreamsUnblockedPart(t *testing.T) {
 	current := writeTestPart(t, e, be, streamColumns(t, e, map[string][]int64{"a": {2, 6}, "c": {7}}))
 	src := []*part{legacy, current}
 
-	streamed, err := e.compactParts(ctx, src, 2, 0)
+	streamed, err := e.compactParts(ctx, src, 2, 0, nil)
 	require.NoError(t, err)
 
 	restore := SetMergeReadWhole(true)
-	whole, err := e.compactParts(ctx, src, 2, 0)
+	whole, err := e.compactParts(ctx, src, 2, 0, nil)
 
 	restore()
 	require.NoError(t, err)
@@ -241,11 +241,11 @@ func TestMergeCopiesSelfGranuleEntries(t *testing.T) {
 	require.True(t, ok)
 	require.True(t, desc.SharedDict, "the repeated granules must join a shared dictionary")
 
-	streamed, err := e.compactParts(ctx, []*part{p}, minInt64, 0)
+	streamed, err := e.compactParts(ctx, []*part{p}, minInt64, 0, nil)
 	require.NoError(t, err)
 
 	restore := SetMergeReadWhole(true)
-	whole, err := e.compactParts(ctx, []*part{p}, minInt64, 0)
+	whole, err := e.compactParts(ctx, []*part{p}, minInt64, 0, nil)
 
 	restore()
 	require.NoError(t, err)
@@ -309,7 +309,7 @@ func TestCompactPartsFailsWhenTheSweepSkipsAStream(t *testing.T) {
 
 	t.Cleanup(func() { mergeSkipStream = nil })
 
-	out, err := e.compactParts(ctx, []*part{p}, minInt64, 0)
+	out, err := e.compactParts(ctx, []*part{p}, minInt64, 0, nil)
 	require.ErrorIs(t, err, block.ErrCorrupt)
 	assert.Contains(t, err.Error(), skipped.String())
 	assert.Empty(t, out)

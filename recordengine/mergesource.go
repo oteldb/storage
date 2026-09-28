@@ -25,6 +25,12 @@ type mergeSource interface {
 	// run returns the part's rows of stream id with a timestamp at or after start, in the order the
 	// merge writes them; ok is false when there are none.
 	run(id signal.SeriesID, start int64) (r mergeRun, ok bool, err error)
+	// residentBytes bounds what the source holds in RAM from the moment it opens: read-ahead windows,
+	// frame buffers and dictionaries for a forward read, the decoded columns for a whole decode.
+	residentBytes() int64
+	// dictEntries is how many entries of stable dictionaries the source hands a writer, which a
+	// writer binding every source caches an id for each of.
+	dictEntries() int
 }
 
 // mergeRun is one source's rows of one stream, ordered by timestamp and then by their row in the
@@ -172,6 +178,8 @@ type wholeSource struct {
 	d      *decodedPart
 	served arrayRun
 	gather gatherRun
+	// gatherMax is the most gather can grow to ([gatherBound]), charged from the start.
+	gatherMax int64
 }
 
 func openWholeSource(ctx context.Context, p *part) (*wholeSource, error) {
@@ -186,11 +194,23 @@ func openWholeSource(ctx context.Context, p *part) (*wholeSource, error) {
 		}
 	}
 
-	s := &wholeSource{schema: p.schema, ranges: p.ranges, d: d}
+	s := &wholeSource{schema: p.schema, ranges: p.ranges, d: d, gatherMax: gatherBound(p)}
 	s.served.init(p.schema)
 	s.gather.init(p.schema)
 
 	return s, nil
+}
+
+func (s *wholeSource) residentBytes() int64 { return s.d.residentBytes() + s.gatherMax }
+
+func (s *wholeSource) dictEntries() int {
+	var n int
+
+	for k := range s.d.bytes {
+		n += len(s.d.bytes[k].entries)
+	}
+
+	return n
 }
 
 // run serves one ts-ordered range straight from the decoded columns. A stream whose rows are out of
@@ -393,6 +413,8 @@ type partCursor struct {
 
 	pos, end int
 	last     int64
+
+	resident int64
 }
 
 func openPartCursor(ctx context.Context, p *part, window int64) (*partCursor, error) {
@@ -419,7 +441,40 @@ func openPartCursor(ctx context.Context, p *part, window int64) (*partCursor, er
 		}
 	}
 
+	// A constant timestamp column is filled a whole stream at a time by [partCursor.run], every
+	// other one a granule at a time.
+	longest := 0
+	for _, r := range p.ranges {
+		longest = max(longest, r.end-r.start)
+	}
+
+	c.resident = c.ts.residentBytes(longest)
+	for k := range c.ints {
+		c.resident += c.ints[k].residentBytes(mergeGranuleRows)
+	}
+
+	for k := range c.bytes {
+		c.resident += c.bytes[k].residentBytes()
+	}
+
 	return c, nil
+}
+
+func (c *partCursor) residentBytes() int64 { return c.resident }
+
+func (c *partCursor) dictEntries() int {
+	var n int
+
+	for k := range c.bytes {
+		b := &c.bytes[k]
+		if b.stable {
+			n += len(b.entries)
+		}
+
+		n += len(b.shared)
+	}
+
+	return n
 }
 
 // errRunDisorder reports a source whose stream was found out of timestamp order mid-merge.
@@ -600,6 +655,19 @@ func (c *intCursor) open(ctx context.Context, r *block.PartReader, name string, 
 	return nil
 }
 
+// residentBytes bounds what the cursor holds: its decoder, the whole column when it was read whole,
+// or for a constant column a fill of up to fillRows.
+func (c *intCursor) residentBytes(fillRows int) int64 {
+	switch {
+	case c.constant:
+		return int64(fillRows) * 8
+	case c.dec != nil:
+		return c.dec.ResidentBytes()
+	default:
+		return int64(cap(c.vals)) * 8
+	}
+}
+
 // ensure makes row's granule the current one.
 func (c *intCursor) ensure(row int) error {
 	if row >= c.lo && row < c.hi {
@@ -745,6 +813,19 @@ func (c *byteCursor) open(ctx context.Context, r *block.PartReader, name string,
 	}
 
 	return nil
+}
+
+// residentBytes bounds what the cursor holds: its decoder, the whole column when it was read whole,
+// or for a constant column the ids of one granule.
+func (c *byteCursor) residentBytes() int64 {
+	switch {
+	case c.constant:
+		return mergeGranuleRows
+	case c.dec != nil:
+		return c.dec.ResidentBytes()
+	default:
+		return dictColumnBytes(&c.col)
+	}
 }
 
 func (c *byteCursor) ensure(row int) error {

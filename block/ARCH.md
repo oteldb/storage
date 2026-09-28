@@ -356,7 +356,21 @@ them. At S3 latencies that is the difference between a merge finishing and not.
 
 - The window is **the read side's memory budget**, one buffer per open column: 8 parts × 6 columns
   × 1 MiB is 48 MiB. Streaming bounds the merge's resident set; it does not make it constant, and
-  this is the term that stays.
+  this is the term that stays. The buffer is dropped before a refill reads, so a walk holds one
+  window, not two. `Decoder.ResidentBytes` bounds the whole walk from the moment the decoder opens —
+  directory, shared dictionary, window (at least the largest frame, at most the column), the
+  decompressed frame twice over while a larger one replaces it, and one decoded granule — so a merge
+  can charge its sources before reading a frame. `PartReader.ScanBound` bounds the same figure from
+  the manifest alone (sizing stats, the trailer dictionary's size and entry count, the granule count),
+  and separately what the open holds on top — the tail as read and the dictionary decompressed into
+  scratch beside its kept copy — so a merge can reserve before it opens a column; it declines a
+  column the manifest cannot size. A dictionary region is compressed into one buffer sized for the
+  worst case, with its header written before the payload, so building it costs the serialized
+  dictionary and that buffer and nothing grows or is copied (`StreamWriter.FinishBytes` bounds a
+  writer's finish from it).
+- `WithFrameCompressors` hands a `StreamWriter` compressors for its frames alone, while dictionary
+  regions and unframed columns keep the writer's own: a frame is bounded by the compress block plus
+  one granule, so its encoder can be sized for it (`NewFrameCompressor`, a 1 MiB window).
 - A window covering the whole column collapses to a single request — `PartReader.Column` minus the
   cache write, which is the right path for the memory backend and for small parts.
 - A **frame is indivisible**: one larger than the window is served alone rather than refused, so the

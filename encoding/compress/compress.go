@@ -68,6 +68,7 @@ const (
 type Compressor struct {
 	alg       Algorithm
 	level     Level
+	window    int
 	encPool   sync.Pool // *zstd.Encoder
 	decPool   sync.Pool // *zstd.Decoder
 	limitPool sync.Pool // *zstd.Decoder with a capped DecodeAll, for DecompressLimit
@@ -77,7 +78,30 @@ type Compressor struct {
 // NewCompressor returns a [Compressor] for the given algorithm and level. Level is
 // only meaningful for ZSTD; LZ4 ignores it.
 func NewCompressor(alg Algorithm, level Level) *Compressor {
-	c := &Compressor{alg: alg, level: level}
+	return newCompressor(alg, level, encoderWindowBytes)
+}
+
+// NewFrameCompressor is [NewCompressor] for inputs of at most maxInput bytes: its zstd encoders
+// match within a window of maxInput rounded up to a power of two, which is what their state is sized
+// by. An input that fits the window compresses to the same bytes [NewCompressor]'s would; a larger
+// one still compresses, with matches no further back than the window.
+func NewFrameCompressor(alg Algorithm, level Level, maxInput int) *Compressor {
+	return newCompressor(alg, level, frameWindow(maxInput))
+}
+
+// frameWindow is the encoder window for inputs of at most n bytes: n rounded up to a power of two
+// within zstd's window bounds and the default window.
+func frameWindow(n int) int {
+	w := minEncoderWindow
+	for w < n && w < encoderWindowBytes {
+		w <<= 1
+	}
+
+	return w
+}
+
+func newCompressor(alg Algorithm, level Level, window int) *Compressor {
+	c := &Compressor{alg: alg, level: level, window: window}
 	c.encPool = sync.Pool{New: c.newEncoder}
 	c.decPool = sync.Pool{New: c.newDecoder}
 	c.limitPool = sync.Pool{New: newLimitDecoder}
@@ -200,7 +224,7 @@ func (c *Compressor) decompressPool(dst, src []byte) []byte {
 // newEncoder / newDecoder build the pooled ZSTD backend for this compressor's level; the concrete
 // implementation is selected at build time (see zstd_klauspost.go / zstd_gozstd.go). Only ZSTD uses
 // the pools; other algorithms bypass compressPool/decompressPool entirely.
-func (c *Compressor) newEncoder() any { return newZstdEncoder(c.level) }
+func (c *Compressor) newEncoder() any { return newZstdEncoder(c.level, c.window) }
 func (c *Compressor) newDecoder() any { return newZstdDecoder() }
 
 // badFlagError is returned when the decompressor sees an unknown flag byte.

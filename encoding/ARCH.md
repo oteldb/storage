@@ -66,7 +66,16 @@ one it was. A `Compressor` is shared only by an owner that keeps it in one place
 across its day writers, an engine one per algorithm across every part it opens — never process-wide.
 Sharing matters on the read path: a zstd decoder is built per pool, so a reader per part with pools
 of its own builds one per part read — 2.9× the bytes allocated reading 1024 parts once each
-(`block.BenchmarkManyPartReaders`) and +16% on a record fetch over 256 parts.
+(`block.BenchmarkManyPartReaders`) and +16% on a record fetch over 256 parts. `EncodeWorkspace` is
+what one pooled encoder holds, so a serial user can charge its compressor. A klauspost encoder is its
+preset's tables, fixed whatever the window, plus history of up to twice the window: at the default
+8 MiB window it measures 13.8–17.3 / 15.6–19.7 / 20.9–25.2 MiB (fast / default / best), at 1 MiB
+2.4 / 4.6 / 10.3 MiB, charged as 3 / 5 / 11 MiB plus twice the window (`TestEncodeWorkspaceBoundsHeap`).
+`NewFrameCompressor` sizes the window to the largest input a caller expects, rounded up to a power of
+two; an input that fits compresses to the same bytes the default window gives, since zstd writes a
+single-segment frame for it either way. libzstd sizes its one-shot context to the input on its own,
+so the gozstd build ignores the window; its workspace figures are unmeasured round numbers, as the C
+memory is invisible to the heap measurements.
 
 `DecompressLimit` is the bounded decode every part read uses: it fails with `ErrLimit` rather than
 produce more than a limit, allocating at most the bound plus `DecodeWorkspace`. It decodes into its

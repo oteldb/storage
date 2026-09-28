@@ -132,7 +132,7 @@ func TestMergeKeepsRowsOfUnsortedPart(t *testing.T) {
 
 	const retainFrom = 25
 
-	out, err := e.compactParts(ctx, []*part{p}, retainFrom, 0)
+	out, err := e.compactParts(ctx, []*part{p}, retainFrom, 0, nil)
 	require.NoError(t, err)
 	require.Len(t, out, 1)
 

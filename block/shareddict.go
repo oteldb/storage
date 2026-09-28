@@ -68,6 +68,18 @@ type sharedDict struct {
 	trailer bool
 }
 
+// residentBytes is the decompressed dictionary blob the entries view, length prefixes included, and
+// the views themselves.
+func (sd sharedDict) residentBytes() int64 {
+	var n int64
+
+	for _, e := range sd.entries {
+		n += int64(len(e)) + binary.MaxVarintLen32 + 24
+	}
+
+	return n
+}
+
 // granule splits a granule stream into its ids, one per row, and their width, or reports self with
 // the chunk stream that follows the mode byte. Ids are bounds-checked here: they outlive the decode
 // inside the returned column, where an unchecked one would panic at [chunk.DictColumn.At].

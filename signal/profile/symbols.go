@@ -480,6 +480,54 @@ func (s *SymbolStore) Restore(snapshot map[string][]byte) error {
 // Names returns the sidecar table names.
 func (s *SymbolStore) Names() []string { return tableNames }
 
+// UnionBytes bounds what [SymbolStore.Union] and then [SymbolStore.Stored] hold at once over stored
+// tables of the given sizes, from the body length each head records (a raw version 1 table's is its
+// size less the frame). Per body byte, the merged union holds at most five — each entry's bytes copied,
+// and its id key, slice header and map slot, half again while the map grows, on an entry of at least
+// 17 body bytes — the retained maps at most four more (the same per entry, sharing the bytes), and the
+// retained entries encoded back at most five more (a body of up to 26 B an entry per 17, then framed by
+// append); the largest one body decompresses beside them.
+func (s *SymbolStore) UnionBytes(sizes []int64, heads [][]byte) (int64, error) {
+	var total, largest int64
+
+	for i, head := range heads {
+		n, err := tableBodyLen(head, sizes[i])
+		if err != nil {
+			return 0, err
+		}
+
+		total += n
+		largest = max(largest, n)
+	}
+
+	return 14*total + largest + compress.DecodeWorkspace, nil
+}
+
+// tableBodyLen is the body length a stored table of size bytes records in its head.
+func tableBodyLen(head []byte, size int64) (int64, error) {
+	if len(head) < 8 || binary.BigEndian.Uint32(head) != symMagic {
+		return 0, errors.Wrap(ErrCorruptSymbols, "bad magic")
+	}
+
+	switch binary.BigEndian.Uint32(head[4:]) {
+	case symVersionRaw:
+		return max(size-12, 0), nil
+	case symVersion:
+		if len(head) < 10 {
+			return 0, errCorrupt("body len")
+		}
+
+		n, k := binary.Uvarint(head[9:])
+		if k <= 0 || n > math.MaxInt64 {
+			return 0, errCorrupt("body len")
+		}
+
+		return int64(n), nil
+	default:
+		return 0, errors.Wrap(ErrCorruptSymbols, "bad version")
+	}
+}
+
 // Union merges the loaded sidecars of compacted parts (one map per part) and returns the entries the
 // stack ids in refs reach as named tables. The union is decoded once and only the kept entries are
 // encoded. Pure: it does not read the live accumulator.
@@ -499,8 +547,24 @@ func (s *SymbolStore) Union(parts []map[string][]byte, refs iter.Seq[[]byte]) (m
 		}
 	}
 
+	sampleUnion()
+
 	union := &SymbolStore{acc: merged}
 	union.Retain(refs)
+	sampleUnion()
 
-	return union.Encode(), nil
+	out := union.Encode()
+	sampleUnion()
+
+	return out, nil
+}
+
+// unionSample, when non-nil, is called at every point [SymbolStore.Union]'s peak can fall. Test seam
+// only.
+var unionSample func()
+
+func sampleUnion() {
+	if unionSample != nil {
+		unionSample()
+	}
 }

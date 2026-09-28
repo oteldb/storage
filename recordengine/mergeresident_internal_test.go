@@ -44,7 +44,7 @@ func mergeResident(t *testing.T, parts, rows int, capBytes int64) heaptest.Run {
 	var out []*part
 
 	resident := heaptest.Resident(t, b, func() {
-		out, err = e.compactParts(ctx, src, minInt64, capBytes)
+		out, err = e.compactParts(ctx, src, minInt64, capBytes, nil)
 		require.NoError(t, err)
 	})
 

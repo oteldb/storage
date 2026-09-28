@@ -19,13 +19,16 @@ type kpDecoder struct{ dec *zstd.Decoder }
 
 func (d kpDecoder) decodeAll(dst, src []byte) ([]byte, error) { return d.dec.DecodeAll(src, dst) }
 
+// minEncoderWindow is the smallest window klauspost accepts.
+const minEncoderWindow = zstd.MinWindowSize
+
 // encoderWindowBytes caps the ZSTD match window. This package only ever calls EncodeAll on a single
 // block (a part column, bounded by the part size), so a huge window buys little — but klauspost sizes
 // the encoder's hash tables to the window, so an unbounded one costs tens of MiB of resident state per
 // encoder. 8 MiB covers a block's locality with negligible ratio loss.
 const encoderWindowBytes = 8 << 20
 
-func newZstdEncoder(level Level) zstdEncoder {
+func newZstdEncoder(level Level, window int) zstdEncoder {
 	// klauspost exposes four presets, not the full 1–22 range. LevelFast → Fastest, LevelBest →
 	// BetterCompression (its BestCompression preset is slower with little/negative ratio gain on
 	// log-shaped data — measured), else Default.
@@ -44,13 +47,29 @@ func newZstdEncoder(level Level) zstdEncoder {
 	enc, err := zstd.NewWriter(io.Discard,
 		zstd.WithEncoderLevel(l),
 		zstd.WithEncoderConcurrency(1),
-		zstd.WithWindowSize(encoderWindowBytes),
+		zstd.WithWindowSize(window),
 	)
 	if err != nil {
 		panic(err)
 	}
 
 	return kpEncoder{enc}
+}
+
+// zstdEncodeWorkspace is an encoder's live heap once its window has filled: a preset's tables, fixed
+// whatever the window, and history buffers of about twice the window. The bases are rounded up from
+// what TestEncodeWorkspaceBoundsHeap measures.
+func zstdEncodeWorkspace(level Level, window int) int64 {
+	base := int64(5 << 20)
+
+	switch {
+	case level == LevelFast:
+		base = 3 << 20
+	case level >= LevelBest:
+		base = 11 << 20
+	}
+
+	return base + 2*int64(window)
 }
 
 func newZstdDecoder() zstdDecoder {

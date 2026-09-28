@@ -96,6 +96,7 @@ type Merge struct {
 	bytesIn  metric.Int64Counter
 	bytesOut metric.Int64Counter
 	deferred metric.Int64Counter
+	over     metric.Int64Counter
 }
 
 // Record accounts one merge that compacted partsIn source parts of bytesIn bytes into bytesOut
@@ -125,6 +126,12 @@ func (m *Merge) Record(ctx context.Context, sig string, dur time.Duration, parts
 // bounded by [Options.MergeMemoryBytes], which is the number to raise if part counts climb.
 func (m *Merge) Deferred(ctx context.Context, sig string) {
 	m.deferred.Add(ctx, 1, sigAttr(sig))
+}
+
+// OverBudget accounts bytes a merge needed beyond the whole process merge budget: it ran alone, with
+// the whole budget reserved, and held that much more.
+func (m *Merge) OverBudget(ctx context.Context, sig string, bytes int64) {
+	m.over.Add(ctx, bytes, sigAttr(sig))
 }
 
 // Parts reports the merge selector's view of a signal's flushed parts as gauges: how many parts
@@ -507,6 +514,8 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 		bytesOut: b.counter("storage.merge.bytes_out", "part bytes written by merges", "By"),
 		deferred: b.counter("storage.merge.deferred",
 			"merges that selected parts but could not claim the process merge memory budget", "{merge}"),
+		over: b.counter("storage.merge.over_budget_bytes",
+			"bytes merges needed beyond the whole process merge memory budget", "By"),
 	}
 	fetch := &Fetch{
 		total:        b.counter("storage.fetch.total", "fetch requests served", "{fetch}"),

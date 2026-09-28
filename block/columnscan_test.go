@@ -442,3 +442,72 @@ func sharedEntriesOf(d *Decoder) [][]byte {
 
 	return entries
 }
+
+// TestScanBoundCoversDecoder: what the manifest bounds a scan by before it opens is at least what
+// the opened decoder reports, so memory reserved from the manifest covers the walk.
+func TestScanBoundCoversDecoder(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	vals := scanCorpus(32, 512, map[int]bool{3: true, 17: true})
+
+	r, _ := writeBytesPart(t, vals, 512, WithCompressBlockBytes(4096), WithSizingStats())
+
+	for _, window := range []int64{0, 1, 4096, 1 << 20} {
+		bound, _, ok := r.ScanBound(ctx, "attrs", window)
+		require.True(t, ok, "window %d", window)
+
+		scan, err := r.ColumnScan(ctx, "attrs", window)
+		require.NoError(t, err)
+
+		assert.GreaterOrEqual(t, bound, scan.ResidentBytes(), "window %d", window)
+	}
+
+	unsized, _ := writeBytesPart(t, vals, 512)
+
+	_, _, ok := unsized.ScanBound(ctx, "attrs", 1<<20)
+	assert.False(t, ok, "a part without sizing stats cannot be bounded from its manifest")
+
+	_, _, ok = r.ScanBound(ctx, "missing", 1<<20)
+	assert.False(t, ok)
+}
+
+// TestDecoderResidentBytesBoundsTheWalk: the figure a decoder reports at open covers every buffer a
+// forward walk over it grows, whatever the window.
+func TestDecoderResidentBytesBoundsTheWalk(t *testing.T) {
+	t.Parallel()
+
+	const (
+		granules = 32
+		rows     = 512
+	)
+
+	ctx := context.Background()
+	vals := scanCorpus(granules, rows, map[int]bool{3: true, 17: true})
+
+	r, _ := writeBytesPart(t, vals, rows, WithCompressBlockBytes(4096))
+
+	for _, window := range []int64{0, 1, 4096, 1 << 20} {
+		t.Run(fmt.Sprintf("window=%d", window), func(t *testing.T) {
+			t.Parallel()
+
+			scan, err := r.ColumnScan(ctx, "attrs", window)
+			require.NoError(t, err)
+
+			bound := scan.ResidentBytes()
+			fixed := scan.streams.dir.residentBytes() + scan.shared.residentBytes()
+
+			for g := range granules {
+				got, err := scan.DecodeBytesBlock(g)
+				require.NoError(t, err)
+
+				held := fixed + int64(cap(scan.streams.buf)) + int64(got.dc.Len())*KindBytes.decodedRowBytes()
+				if src := scan.streams.dir.src; src != nil {
+					held += int64(cap(src.ahead))
+				}
+
+				require.LessOrEqualf(t, held, bound, "granule %d outgrew the figure reported at open", g)
+			}
+		})
+	}
+}

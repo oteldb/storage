@@ -141,9 +141,10 @@ func (e *Engine) LoadState() any {
 	}
 }
 
-// SetMergeResidentObserver installs fn to receive each merge's peak buffer residency, its largest
-// run and its resident limit, and returns the restore. Callers must not run in parallel.
-func SetMergeResidentObserver(fn func(peak, run, limit int64)) func() {
+// SetMergeResidentObserver installs fn to receive each merge's peak writer residency, its largest
+// run, the writers' limit and the merge's grant, and returns the restore. Callers must not run in
+// parallel.
+func SetMergeResidentObserver(fn func(peak, run, limit, grant int64)) func() {
 	old := mergeResidentObserver
 	mergeResidentObserver = fn
 

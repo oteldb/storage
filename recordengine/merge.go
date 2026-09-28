@@ -11,7 +11,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
-	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/timebucket"
 )
@@ -109,8 +108,21 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 // reads, the compacted-part write/read-back, and the sidecar union happen off the engine lock; only the
 // small metadata publish runs under it. The old parts are retired (not deleted inline) and reclaimed
 // once their in-flight readers drain. Only the background maintenance task calls merge, so the parts
-// mutation has a single writer.
+// mutation has a single writer. A failed merge deletes the outputs it wrote only once it has released
+// flushMu and its grant, so a stalled backend delays this merge alone, and for at most
+// [discardTimeout].
 func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, error) {
+	var abandoned []*part
+
+	res, err := e.mergeHeld(ctx, opts, &abandoned)
+	e.discardOutputs(ctx, abandoned)
+
+	return res, err
+}
+
+// mergeHeld is [Engine.merge] under flushMu and the merge's grant. It leaves the outputs a failure
+// abandons in abandoned.
+func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]*part) (mergeResult, error) {
 	retainFrom := opts.RetainFrom
 
 	e.flushMu.Lock()
@@ -152,7 +164,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 
 	// Past here the merge reads the selected parts and writes its output, so this is where its memory
 	// allowance must be one it actually holds rather than one it assumed.
-	release, admitted, err := e.admitMerge(ctx, opts.Background)
+	grant, admitted, err := e.admitMerge(ctx, selected, capBytes, opts.Background)
 	if err != nil {
 		e.mergeDeferred.Store(false)
 
@@ -160,20 +172,12 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	}
 
 	if !admitted {
-		// Remembered so the facade can order this engine first next cycle; see the metric engine.
-		e.mergeDeferred.Store(true)
-		e.cfg.Obs.Merge.Deferred(ctx, e.cfg.Signal)
-		zctx.From(ctx).Debug("merge deferred; the process merge budget is fully committed",
-			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
-			zap.Int("selected", len(selected)))
-		e.reclaimRetired(ctx)
-
-		return mergeResult{deferred: true, parts: dropped}, nil
+		return e.deferMerge(ctx, dropped, len(selected)), nil
 	}
 
 	e.mergeDeferred.Store(false)
 
-	defer release()
+	defer grant.done()
 
 	start := minInt64
 	if retainFrom > 0 {
@@ -185,7 +189,13 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	// they cannot be reclaimed underneath this read.
 	bytesIn := partsBytes(selected)
 
-	newParts, err := e.compactParts(ctx, selected, start, capBytes)
+	newParts, discard, err := e.compact(ctx, selected, start, capBytes, grant)
+	*abandoned = discard
+
+	if errors.Is(err, errMergeDeclined) {
+		return e.deferMerge(ctx, dropped, len(selected)), nil
+	}
+
 	if err != nil {
 		return mergeResult{parts: dropped}, err
 	}
@@ -196,9 +206,10 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	// unselected part, including any a concurrent flush may have added) and persist the index. The
 	// sources are retired — queued for backend deletion — only once that commit succeeds: the persisted
 	// index is what a restart and every other replica read, so a part it still names must never become
-	// reclaimable. A failed commit rolls the swap back to the committed set, leaving the merge output as
-	// orphan objects the next [Engine.LoadParts] sweeps. The retired parts' objects are deleted by
-	// reclaimRetired once their readers drain.
+	// reclaimable. A failed commit rolls the swap back to the committed set and deletes the merge output,
+	// unless the commit may have landed: then the index may name it, and only the next
+	// [Engine.LoadParts], which reads that index, can tell an orphan from a part. The retired parts'
+	// objects are deleted by reclaimRetired once their readers drain.
 	removed := make(map[string]struct{}, len(selected))
 	for _, p := range selected {
 		removed[p.prefix] = struct{}{}
@@ -211,6 +222,10 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	if err = e.updateIndexLocked(ctx); err != nil {
 		e.parts = committed
 		e.mu.Unlock()
+
+		if !commitMayHaveLanded(err) {
+			*abandoned = append(*abandoned, newParts...)
+		}
 
 		return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, err
 	}
@@ -228,6 +243,19 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	e.reclaimRetired(ctx)
 
 	return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, nil
+}
+
+// deferMerge records a merge the process merge budget could not admit. It is remembered so the
+// facade can order this engine first next cycle; see the metric engine.
+func (e *Engine) deferMerge(ctx context.Context, dropped, selected int) mergeResult {
+	e.mergeDeferred.Store(true)
+	e.cfg.Obs.Merge.Deferred(ctx, e.cfg.Signal)
+	zctx.From(ctx).Debug("merge deferred; the process merge budget is fully committed",
+		zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
+		zap.Int("selected", selected))
+	e.reclaimRetired(ctx)
+
+	return mergeResult{deferred: true, parts: dropped}
 }
 
 // mergeResult is what one merge moved: the source parts it compacted (including those retention
@@ -346,72 +374,138 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 	return writeSidecars(ctx, e.cfg.Backend, newPrefix, stored)
 }
 
-// compactParts compacts the selected source parts into bounded output part(s), dropping records older
+// compact compacts the selected source parts into bounded output part(s), dropping records older
 // than start (retention). It streams both sides: each source is read forward a granule at a time per
 // column ([partCursor]) unless its layout rules that out, when it is decoded whole; each stream's rows
 // are merged across the sources by a k-way heap on (timestamp, source), and routed by timestamp to a
 // writer per day ([timebucket.Router]) that encodes them as they arrive
-// ([recordPartStreamWriter]). A writer is sealed once it has taken capBytes of decoded rows, and the
-// largest open writer once the writers together hold the merge's admitted share in RAM, both checked
-// after every append of at most a granule — so either bound is overshot by at most one append, a
-// stream may continue in the next part, and the merge never holds a stream or a part.
+// ([recordPartStreamWriter]). A writer is sealed once it has taken capBytes of decoded rows, checked
+// after every append of at most a granule, so a part overshoots it by at most one append; the largest
+// open writer is sealed once the writers leave less room than one append in what the merge's grant
+// has left beside its sources and encoder ([mergeWriterBudget]). A stream may continue in the next
+// part, and the merge never holds a stream or a part. A nil grant is the one [Engine.admitMerge]
+// would reserve, taken with no admission.
 // When the engine has a side store (profiles) the cap does not split a day, but the resident bound
 // still can, and every part it writes carries the symbols its own rows reach. Returns the new parts
-// (empty when retention dropped every record). Reads the parts off the engine lock; src is the
-// immutable snapshot the caller planned over.
-func (e *Engine) compactParts(ctx context.Context, src []*part, start, capBytes int64) ([]*part, error) {
-	for {
-		out, err := e.compactStreamed(ctx, src, start, capBytes)
+// (empty when retention dropped every record) and the parts failed attempts wrote, which nothing will
+// ever index: a merge that keeps failing the same way would otherwise leave a full set of outputs
+// behind every cycle. Reads the parts off the engine lock; src is the immutable snapshot the caller
+// planned over.
+func (e *Engine) compact(
+	ctx context.Context, src []*part, start, capBytes int64, grant *mergeGrant,
+) (out, abandoned []*part, err error) {
+	if grant == nil {
+		grant = &mergeGrant{bytes: e.mergeGrantBytes(ctx, src, capBytes)}
+	}
 
-		var disorder *sourceDisorderError
-		if !errors.As(err, &disorder) {
-			return out, err
+	for {
+		out, err = e.compactStreamed(ctx, src, start, capBytes, grant)
+		if err == nil {
+			return out, abandoned, nil
 		}
 
-		// Rows of the disordered stream may already be written out of order, so the attempt is
-		// dropped whole and redone with that source decoded whole, which sorts what it serves. The
-		// parts it sealed are removed now; an object that is not is an orphan the next open sweeps.
-		src[disorder.src].tsDisorder.Store(true)
+		abandoned = append(abandoned, out...)
 
-		for _, p := range out {
-			_ = deletePart(ctx, e.cfg.Backend, p.prefix)
+		// Rows of the disordered stream may already be written out of order, so the attempt is redone
+		// with that source decoded whole, which sorts what it serves.
+		var disorder *sourceDisorderError
+		if !errors.As(err, &disorder) {
+			return nil, abandoned, err
+		}
+
+		src[disorder.src].tsDisorder.Store(true)
+	}
+}
+
+// discardTimeout bounds how long a failed merge spends deleting its outputs. The deletes outlive a
+// canceled ctx, the likeliest reason the merge failed, but not a backend that stops answering.
+const discardTimeout = 30 * time.Second
+
+// discardOutputs deletes the parts a failed merge wrote, best-effort: a part it cannot delete within
+// [discardTimeout] is left for [Engine.LoadParts] to sweep.
+func (e *Engine) discardOutputs(ctx context.Context, parts []*part) {
+	if len(parts) == 0 {
+		return
+	}
+
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), discardTimeout)
+	defer cancel()
+
+	for i, p := range parts {
+		if err := deletePart(dctx, e.cfg.Backend, p.prefix); err != nil {
+			zctx.From(ctx).Warn("merge could not delete an output part it abandoned",
+				zap.String("signal", e.cfg.Signal), zap.String("part", p.prefix),
+				zap.Int("left", len(parts)-i), zap.Error(err))
+
+			if dctx.Err() != nil {
+				return
+			}
 		}
 	}
 }
 
-// compactStreamed is one attempt at [Engine.compactParts]. On a [sourceDisorderError] it returns the
-// parts it had already sealed with the error.
-func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capBytes int64) ([]*part, error) {
-	bounds := e.mergeBounds(capBytes)
+// compactStreamed is one attempt at [Engine.compact]. Once it has written a part, a failure returns
+// the parts it sealed, and the one it failed to finish, with the error.
+func (e *Engine) compactStreamed(
+	ctx context.Context, src []*part, start, capBytes int64, grant *mergeGrant,
+) ([]*part, error) {
+	partBytes := e.mergePartBytes(capBytes)
+	runBytes := partBytes / mergeRunFraction
 
-	// One compressor for every day writer of the merge: a zstd encoder at the best level holds
-	// ~24 MiB while its pool keeps it, and a pool per writer keeps one per open day.
-	comp := compress.NewCompressor(e.cfg.MergeCompression, e.cfg.MergeCompressionLevel)
-
-	sources, err := e.openMergeSources(ctx, src)
+	// One set of compressors for every day writer of the merge: a pool per writer would keep an
+	// encoder per open day.
+	coders, err := e.newMergeCoders(ctx, src)
 	if err != nil {
 		return nil, err
 	}
 
-	var newParts []*part
+	sources, writerLimit, appendReserve, err := e.openGranted(ctx, src, grant, coders, runBytes, e.writerFinishAtCap(src, capBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	e.reportOverBudget(ctx, grant.bytes)
+
+	var (
+		sealed    []sealedPart
+		finishing []string
+	)
+
+	// What a failed attempt leaves behind: the parts it wrote, by prefix, for the caller to delete.
+	written := func() []*part {
+		out := make([]*part, 0, len(sealed)+len(finishing))
+		for _, s := range sealed {
+			out = append(out, &part{prefix: s.prefix})
+		}
+
+		for _, prefix := range finishing {
+			out = append(out, &part{prefix: prefix})
+		}
+
+		return out
+	}
 
 	router := timebucket.Router[*recordPartStreamWriter]{
 		Open: func(int64) (*recordPartStreamWriter, error) {
-			return newRecordPartStreamWriter(ctx, e, src, comp)
+			return newRecordPartStreamWriter(ctx, e, src, coders)
 		},
 		Finish: func(w *recordPartStreamWriter) error {
-			p, err := w.finish(ctx)
+			s, err := w.finish(ctx)
 			if err != nil {
+				finishing = append(finishing, w.prefix)
+
 				return err
 			}
 
-			newParts = append(newParts, p)
+			sealed = append(sealed, s)
 
 			return nil
 		},
 		Resident:      (*recordPartStreamWriter).residentBytes,
+		Held:          func() int64 { return int64(len(sealed)) * sealedPartBytes },
 		MaxOpen:       timebucket.MaxOpenWriters,
-		ResidentLimit: bounds.residentBytes,
+		ResidentLimit: writerLimit,
+		ReserveRun:    appendReserve,
 	}
 
 	// A part under way holds column objects the backend has not published yet; leaving on any path
@@ -425,8 +519,6 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 
 	mergeKeys(src, &keys)
 
-	runBytes := bounds.partBytes / mergeRunFraction
-
 	for keys.Next() {
 		id := keys.Key()
 		if mergeSkipStream != nil && mergeSkipStream(id) {
@@ -434,7 +526,7 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 		}
 
 		if err := heap.reset(sources, id, start); err != nil {
-			return newParts, err
+			return written(), err
 		}
 
 		u := idToU128(id)
@@ -448,33 +540,127 @@ func (e *Engine) compactStreamed(ctx context.Context, src []*part, start, capByt
 					return false, err
 				}
 
-				return bounds.partBytes > 0 && w.decodedBytes() >= bounds.partBytes, nil
+				return partBytes > 0 && w.decodedBytes() >= partBytes, nil
 			})
 			if err != nil {
-				return newParts, err
+				return written(), err
 			}
 		}
 	}
 
 	if err := checkDrained(src, sources); err != nil {
-		return nil, err
+		return written(), err
 	}
 
 	if err := router.Close(); err != nil {
-		return nil, err
+		return written(), err
+	}
+
+	// The writers are finished; the sources and the coders go before the outputs open.
+	clear(sources)
+
+	coders = nil
+
+	out, err := e.openSealed(ctx, sealed, grant)
+	if err != nil {
+		return written(), err
 	}
 
 	if mergeResidentObserver != nil {
 		peak, run := router.Peak()
-		mergeResidentObserver(peak, run, bounds.residentBytes)
+		mergeResidentObserver(peak, run, writerLimit, grant.bytes)
 	}
 
-	return newParts, nil
+	return out, nil
+}
+
+// openSealed opens a merge's written parts once it holds nothing else. Keeping every sealed part
+// open until commit would hold their ranges, blooms and record keys for however many days the merge
+// spans; opened last, they are what the part set holds once the merge commits, in place of the
+// sources'. Each open reads the stream id column back, 16 B a row, beside what the parts opened
+// before it keep. Past its grant the merge tops the grant up without waiting, and past that counts
+// the excess as over budget and warns: the parts are written, and dropping them would only redo the
+// work.
+func (e *Engine) openSealed(ctx context.Context, sealed []sealedPart, grant *mergeGrant) ([]*part, error) {
+	const idBytes = 16
+
+	out := make([]*part, 0, len(sealed))
+
+	var held int64
+
+	for _, s := range sealed {
+		if need := held + int64(s.rows)*idBytes; grant.bytes > 0 && need > grant.bytes {
+			topped, err := grant.top(ctx, need-grant.bytes)
+			if err != nil {
+				return nil, err
+			}
+
+			if !topped {
+				over := need - grant.bytes
+				e.cfg.Obs.Merge.OverBudget(ctx, e.cfg.Signal, over)
+				zctx.From(ctx).Warn("merge opens its written parts past its grant",
+					zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
+					zap.Int64("need", need), zap.Int64("grant", grant.bytes))
+				grant.bytes = need
+			}
+		}
+
+		p, err := openPart(ctx, e.cfg.Backend, e.cfg.Schema, s.prefix, e.cfg.Obs.Corruption, e.readCompressors)
+		if err != nil {
+			return nil, err
+		}
+
+		p.minTime, p.maxTime = s.minT, s.maxT
+		held += p.residentBytes()
+		out = append(out, p)
+	}
+
+	return out, nil
 }
 
 // mergeResidentObserver, when non-nil, receives after each merge the most its open writers held in
-// RAM together, the most one append added, and the resident limit. Test seam only.
-var mergeResidentObserver func(peak, run, limit int64)
+// RAM together, the most one append added, what the writers were limited to, and the merge's grant.
+// Test seam only.
+var mergeResidentObserver func(peak, run, limit, grant int64)
+
+// openGranted opens the merge's sources and splits its grant ([mergeWriterBudget]). The grant was
+// reserved from the sources' manifests, which cover what they open to; a source its manifest could
+// not bound may leave it short, and the merge then tops it up without waiting, or — when it may wait
+// — drops the sources, hands the grant back and queues for the whole, so it holds nothing it was not
+// granted while it waits. One that may not wait is declined.
+func (e *Engine) openGranted(
+	ctx context.Context, src []*part, grant *mergeGrant, coders *mergeCoders, runBytes, finish int64,
+) (sources []mergeSource, limit, reserve int64, err error) {
+	for {
+		if sources, err = e.openMergeSources(ctx, src); err != nil {
+			return nil, 0, 0, err
+		}
+
+		limit, reserve, need := mergeWriterBudget(e.cfg.Schema, grant.bytes, sources, coders, runBytes, finish)
+		if grant.bytes == 0 || need <= grant.bytes {
+			return sources, limit, reserve, nil
+		}
+
+		topped, err := grant.top(ctx, need-grant.bytes)
+		switch {
+		case err != nil:
+			return nil, 0, 0, err
+		case topped:
+			limit, reserve, _ = mergeWriterBudget(e.cfg.Schema, grant.bytes, sources, coders, runBytes, finish)
+
+			return sources, limit, reserve, nil
+		case !grant.wait:
+			return nil, 0, 0, errMergeDeclined
+		}
+
+		// Dropped before queueing, so the wait holds none of what it was not granted.
+		clear(sources)
+
+		if err := grant.regrant(ctx, need); err != nil {
+			return nil, 0, 0, err
+		}
+	}
+}
 
 // mergeRunFraction is how much of the part bound one append to a day's writer may add before the
 // writer is checked against it: a part reaches at most the bound plus this share of it, however many

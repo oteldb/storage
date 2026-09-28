@@ -13,6 +13,7 @@ import (
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/watermark"
+	"github.com/oteldb/storage/signal"
 )
 
 // Column ordinals of a merged record part, fixed by the order [newRecordPartStreamWriter] declares
@@ -54,6 +55,11 @@ type recordPartStreamWriter struct {
 	minT    int64
 	maxT    int64
 
+	// identityBytes bounds the identity object of the streams taken so far, as it is encoded;
+	// idScratch is the buffer each stream's identity is measured in.
+	identityBytes int64
+	idScratch     []byte
+
 	sinks []*columnSink
 	// binds holds, per source and byte column, the binding to a table that outlives the source's
 	// next decode and the one to a table that does not; each is made on the first rows it carries,
@@ -77,10 +83,10 @@ type sourceBindings struct {
 	stableGen, framedGen block.DictGen
 }
 
-// newRecordPartStreamWriter starts an output part of a merge over src. comp, when non-nil, is the
-// merge's compressor, which all its day writers share.
+// newRecordPartStreamWriter starts an output part of a merge over src. coders, when non-nil, are the
+// merge's compressors, which all its day writers share.
 func newRecordPartStreamWriter(
-	ctx context.Context, e *Engine, src []*part, comp *compress.Compressor,
+	ctx context.Context, e *Engine, src []*part, coders *mergeCoders,
 ) (*recordPartStreamWriter, error) {
 	schema := e.cfg.Schema
 	opts := []block.PartOption{
@@ -92,8 +98,8 @@ func newRecordPartStreamWriter(
 			block.WithCompressionLevel(e.cfg.MergeCompressionLevel))
 	}
 
-	if comp != nil {
-		opts = append(opts, block.WithCompressors(comp))
+	if coders != nil {
+		opts = append(opts, block.WithFrameCompressors(coders.frames), block.WithCompressors(coders.objects))
 	}
 
 	w := &recordPartStreamWriter{
@@ -155,6 +161,7 @@ func (w *recordPartStreamWriter) appendRows(u chunk.U128, ts []int64, bytes int6
 
 		w.cur = u
 		w.wmarks = append(w.wmarks, watermark.Entry{ID: u128ToID(u), Max: minInt64})
+		w.identityBytes += w.identityBound(u128ToID(u))
 	}
 
 	if w.rows == 0 {
@@ -308,6 +315,7 @@ func (w *recordPartStreamWriter) residentBytes() int64 {
 	}
 
 	n += int64(cap(w.binds))*int64(unsafe.Sizeof(sourceBindings{})) + int64(w.bound)*bindingBytes
+	n += int64(cap(w.idScratch)) + w.finishBytes()
 
 	for _, s := range w.sinks {
 		n += s.residentBytes()
@@ -316,17 +324,80 @@ func (w *recordPartStreamWriter) residentBytes() int64 {
 	return n + w.refBytes
 }
 
+// finishBytes bounds what finishing the part allocates past what the writer holds: the block
+// writer's last seals and dictionary regions ([block.StreamWriter.FinishBytes]), the stream id column
+// read and decoded back as the part opens and the ranges built from it, the sidecars, the watermarks
+// encoded, and the identity entries and object. The router finishes one writer at a time, and each
+// charges its own finish until then, so the one under way is inside what the router counts.
+func (w *recordPartStreamWriter) finishBytes() int64 {
+	const (
+		idBytes    = 16
+		runBytes   = 24
+		wmarkBytes = 24
+	)
+
+	streams := int64(len(w.wmarks))
+	n := w.w.FinishBytes() + int64(w.rows)*idBytes + w.identityBytes
+	n += streams * (runBytes + int64(unsafe.Sizeof(streamRange{})) + wmarkBytes + int64(unsafe.Sizeof(series.Entry{})))
+
+	for _, s := range w.sinks {
+		n += s.finishBytes()
+	}
+
+	return n
+}
+
+// identityBound bounds what stream id adds to the identity object as it is encoded: its wire form
+// in the body, in the symbol table and in the object assembled from both, and a table entry and a
+// reference per symbol.
+func (w *recordPartStreamWriter) identityBound(id signal.SeriesID) int64 {
+	e := w.e
+
+	e.mu.RLock()
+	s, ok := e.head.series.Get(id)
+	e.mu.RUnlock()
+
+	if !ok {
+		return 0
+	}
+
+	return identityBytes(s, &w.idScratch)
+}
+
+// identityBytes bounds what one stream adds to an identity object as it is encoded, measuring its
+// wire form in scratch.
+func identityBytes(s signal.Series, scratch *[]byte) int64 {
+	const symbolBytes = 96
+
+	*scratch = s.AppendHashInput((*scratch)[:0])
+	symbols := 4 + 2*(len(s.Resource.Attributes)+len(s.Scope.Attributes)+len(s.Attributes))
+
+	return 3*int64(len(*scratch)) + int64(symbols)*symbolBytes
+}
+
 // abort releases the part's in-flight column objects; a no-op once the part is written.
 func (w *recordPartStreamWriter) abort() { w.w.Abort() }
 
-// finish writes the part and its sidecars in the order [writePart] does, opens it and stamps its
-// time bounds. The router opens a writer only for rows it is about to append, so an empty one is a
-// bug: it would burn a part id and leave an unreadable prefix.
-func (w *recordPartStreamWriter) finish(ctx context.Context) (*part, error) {
+// sealedPart is a merge output part written and synced but not yet opened: its prefix, time bounds
+// and row count, which is all a merge keeps of it until its writers and sources are gone
+// ([Engine.openSealed]).
+type sealedPart struct {
+	prefix     string
+	minT, maxT int64
+	rows       int
+}
+
+// sealedPartBytes is what a merge keeps per [sealedPart]: the struct and its prefix string.
+const sealedPartBytes = int64(unsafe.Sizeof(sealedPart{})) + 64
+
+// finish writes the part and its sidecars in the order [writePart] does. The router opens a writer
+// only for rows it is about to append, so an empty one is a bug: it would burn a part id and leave an
+// unreadable prefix.
+func (w *recordPartStreamWriter) finish(ctx context.Context) (sealedPart, error) {
 	if w.rows == 0 {
 		w.abort()
 
-		return nil, errors.New("recordengine: finishing a merge output part with no rows")
+		return sealedPart{}, errors.New("recordengine: finishing a merge output part with no rows")
 	}
 
 	e, b, prefix, schema := w.e, w.e.cfg.Backend, w.prefix, w.e.cfg.Schema
@@ -334,15 +405,15 @@ func (w *recordPartStreamWriter) finish(ctx context.Context) (*part, error) {
 	if err := w.flushStream(); err != nil {
 		w.abort()
 
-		return nil, err
+		return sealedPart{}, err
 	}
 
 	if err := block.WriteStreamPart(ctx, b, prefix, w.w); err != nil {
-		return nil, errors.Wrapf(err, "write part %q", prefix)
+		return sealedPart{}, errors.Wrapf(err, "write part %q", prefix)
 	}
 
 	if err := writeIdentity(ctx, b, prefix, w.identityEntries()); err != nil {
-		return nil, err
+		return sealedPart{}, err
 	}
 
 	for k, s := range w.sinks {
@@ -352,40 +423,33 @@ func (w *recordPartStreamWriter) finish(ctx context.Context) (*part, error) {
 
 		name := schema.byteColumn(k).Name
 		if err := backend.WriteDeferred(ctx, b, bloomKey(prefix, name), s.bloom.encode()); err != nil {
-			return nil, errors.Wrapf(err, "write bloom %q", name)
+			return sealedPart{}, errors.Wrapf(err, "write bloom %q", name)
 		}
 	}
 
 	if err := backend.WriteDeferred(ctx, b, watermark.Key(prefix), watermark.Encode(nil, w.wmarks)); err != nil {
-		return nil, errors.Wrapf(err, "write watermark sidecar %q", prefix)
+		return sealedPart{}, errors.Wrapf(err, "write watermark sidecar %q", prefix)
 	}
 
 	if k, ok := schema.attrsByteCol(); ok {
 		if keys := w.sinks[k].keys.sorted(); len(keys) > 0 {
 			if err := backend.WriteDeferred(ctx, b, recordKeysKey(prefix), encodeRecordKeys(keys)); err != nil {
-				return nil, errors.Wrap(err, "write record-keys footer")
+				return sealedPart{}, errors.Wrap(err, "write record-keys footer")
 			}
 		}
 	}
 
-	p, err := openPart(ctx, b, schema, prefix, e.cfg.Obs.Corruption, e.readCompressors)
-	if err != nil {
-		return nil, err
-	}
-
-	p.minTime, p.maxTime = w.minT, w.maxT
-
 	if e.cfg.SideStore != nil {
 		if err := e.mergeSidecars(ctx, w.src, prefix, w.refCells); err != nil {
-			return nil, err
+			return sealedPart{}, err
 		}
 	}
 
 	if err := backend.SyncPrefix(ctx, b, prefix); err != nil {
-		return nil, errors.Wrapf(err, "sync part %q", prefix)
+		return sealedPart{}, errors.Wrapf(err, "sync part %q", prefix)
 	}
 
-	return p, nil
+	return sealedPart{prefix: prefix, minT: w.minT, maxT: w.maxT, rows: w.rows}, nil
 }
 
 // identityEntries resolves the part's streams under one read lock.

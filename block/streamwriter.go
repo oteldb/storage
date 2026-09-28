@@ -132,6 +132,7 @@ func (w *StreamWriter) AddColumn(c Column) error {
 		alg = w.defaultComp
 	}
 
+	frames := w.frameCompressorFor(alg)
 	sc := &streamColumn{
 		name:    c.Name,
 		kind:    c.Kind,
@@ -168,11 +169,11 @@ func (w *StreamWriter) AddColumn(c Column) error {
 			}
 
 			sc.codec = chunk.CodecGorilla
-			sc.alt = newBlockAccum(sc.comp, w.compressBytes)
+			sc.alt = newBlockAccum(frames, w.compressBytes)
 			sc.altOK = true
 		}
 
-		sc.blk = newBlockAccum(sc.comp, w.compressBytes)
+		sc.blk = newBlockAccum(frames, w.compressBytes)
 		sc.open = w.objectOpener(len(w.cols))
 	case KindBytes:
 		if !c.Block {
@@ -184,7 +185,7 @@ func (w *StreamWriter) AddColumn(c Column) error {
 		}
 
 		sc.bytes = newStreamBytes(codec == chunk.CodecBytesRaw, c.Observer, w.dictCap)
-		sc.blk = newBlockAccum(sc.comp, w.compressBytes)
+		sc.blk = newBlockAccum(frames, w.compressBytes)
 		sc.open = w.objectOpener(len(w.cols))
 	default:
 		return errors.Errorf("block: column %q: kind %s is not streamable; use PartWriter", c.Name, c.Kind)
@@ -282,6 +283,24 @@ func (w *StreamWriter) ResidentBytes() int64 {
 	}
 
 	return total
+}
+
+// FinishBytes bounds what the writer allocates past [StreamWriter.ResidentBytes] while it seals a
+// frame or builds the part. Columns finish one at a time, so it is the largest one column's work
+// drops once done — its pending frame compressed, its dictionary region (the dictionary serialized,
+// compressed and framed), a buffered dictionary column no granule joined decompressed back into one
+// stream and recompressed, or the id column's runs encoded — plus every buffered column's region,
+// which stays with the part until it is written.
+func (w *StreamWriter) FinishBytes() int64 {
+	var retained, transient int64
+
+	for _, c := range w.cols {
+		r, t := c.finishBytes()
+		retained += r
+		transient = max(transient, t)
+	}
+
+	return retained + transient
 }
 
 // objectOpener returns the factory for column i's object writer, or nil when the writer buffers.
@@ -700,6 +719,44 @@ func (c *streamColumn) residentBytes() int64 {
 	return total
 }
 
+func (c *streamColumn) finishBytes() (retained, transient int64) {
+	const runBytes = 24
+
+	transient = max(c.blk.sealBytes(), c.alt.sealBytes())
+
+	if len(c.runs) > 0 && c.comp != nil {
+		raw := len(c.runs) * runBytes
+		transient = max(transient, int64(raw)+c.comp.CompressTransient(raw, false))
+	}
+
+	bc := c.bytes
+	if bc == nil || c.blk == nil || bc.d == nil {
+		return 0, transient
+	}
+
+	buffered := !c.blk.streams()
+
+	switch {
+	case len(bc.d.entries) > 0:
+		// The dictionary serialized, and the region buffer it compresses into ([dictRegion]).
+		region := int64(c.comp.CompressBound(int(bc.d.raw))) + 2*binary.MaxVarintLen64 + objectCRCBytes
+		transient = max(transient, bc.d.raw+region+c.comp.CompressTransient(int(bc.d.raw), true))
+
+		if buffered {
+			retained = region
+		}
+	case buffered:
+		raw := int64(cap(c.blk.pending))
+		for _, f := range c.blk.frameRaw {
+			raw += int64(f)
+		}
+
+		transient = max(transient, raw+c.comp.CompressTransient(int(raw), false))
+	}
+
+	return retained, transient
+}
+
 // abort releases the column's in-flight object writers without publishing them.
 func (c *streamColumn) abort() {
 	if c.blk != nil {
@@ -948,6 +1005,15 @@ func (a *blockAccum) residentBytes() int64 {
 	}
 
 	return resident
+}
+
+// sealBytes is what compressing the pending frame allocates for its output.
+func (a *blockAccum) sealBytes() int64 {
+	if a == nil || a.comp == nil {
+		return 0
+	}
+
+	return a.comp.CompressTransient(cap(a.pending), false)
 }
 
 // attach opens the accumulator's object writer and drains everything sealed so far into it, so the

@@ -83,11 +83,11 @@ func TestMergeGathersDisorderedStream(t *testing.T) {
 	good := writeTestPart(t, e, be, streamColumns(t, e, map[string][]int64{"a": {3, 8}, "b": {2}}))
 	src := []*part{bad, good}
 
-	streamed, err := e.compactParts(ctx, src, 2, 0)
+	streamed, err := e.compactParts(ctx, src, 2, 0, nil)
 	require.NoError(t, err)
 
 	restore := SetMergeReadWhole(true)
-	whole, err := e.compactParts(ctx, src, 2, 0)
+	whole, err := e.compactParts(ctx, src, 2, 0, nil)
 
 	restore()
 	require.NoError(t, err)

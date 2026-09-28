@@ -7,10 +7,7 @@ package recordengine
 
 import (
 	"context"
-	"fmt"
-	"math/rand/v2"
 	"runtime"
-	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -18,77 +15,10 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/file"
-	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/heaptest"
 	"github.com/oteldb/storage/internal/mergestream"
-	"github.com/oteldb/storage/signal"
 )
-
-// wideDictSchema has three dictionary columns every source writes on a large shared dictionary, the
-// shape that makes a writer's per-source bindings its largest term; one carries a bloom and one is the
-// attributes column, so the sidecar state is exercised too.
-var wideDictSchema = NewSchema(
-	Column{Name: "sev", Kind: KindInt64, Codec: chunk.CodecT64},
-	Column{Name: "a", Kind: KindBytes, Codec: chunk.CodecDict, Bloom: BloomFullText},
-	Column{Name: "b", Kind: KindBytes, Codec: chunk.CodecDict},
-	Column{Name: "attrs", Kind: KindBytes, Codec: chunk.CodecDict, Bloom: BloomAttrs},
-)
-
-// wideDictEngine flushes `sources` parts over be, each holding `streams` streams of `rows` records spread
-// evenly over `days` days, with column values drawn so every granule joins a shared dictionary that
-// grows by ~2000 entries per 4096 rows.
-func wideDictEngine(tb testing.TB, be backend.Backend, cfg Config, sources, streams, rows, days int) *Engine {
-	tb.Helper()
-
-	ctx := context.Background()
-	cfg.Schema, cfg.Backend, cfg.Prefix = wideDictSchema, be, "t/wide"
-	e := New(cfg)
-	r := rand.New(rand.NewPCG(11, 13))
-
-	for s := range sources {
-		i := 0
-
-		for st := range streams {
-			series := signal.Series{Resource: signal.Resource{Attributes: signal.NewAttributes(
-				signal.KeyValue{Key: []byte("service.name"), Value: signal.StringValue([]byte("svc-" + strconv.Itoa(st)))},
-			)}}
-			b := &Batch{
-				Stream: series.Hash(), Identity: func() signal.Series { return series },
-				Ints: make([][]int64, 1), Bytes: make([][][]byte, 3),
-			}
-
-			per := rows / streams
-			for j := range per {
-				day := int64(j * days / per)
-				pick := func(col int) int { return s*1_000_000 + col*100_000 + (i/4096)*2000 + r.IntN(2000) }
-
-				b.Ts = append(b.Ts, streamedDay+day*streamedDay+int64(j))
-				b.Ints[0] = append(b.Ints[0], int64(j%5))
-				b.Bytes[0] = append(b.Bytes[0], fmt.Appendf(nil, "word%07d text", pick(0)))
-				b.Bytes[1] = append(b.Bytes[1], fmt.Appendf(nil, "value-%07d", pick(1)))
-				b.Bytes[2] = append(b.Bytes[2], signal.NewAttributes(
-					signal.KeyValue{Key: []byte("k"), Value: signal.StringValue(fmt.Appendf(nil, "%07d", pick(2)))},
-				).AppendHashInput(nil))
-				i++
-			}
-
-			_, err := e.AppendBatch(b, AppendLimits{})
-			require.NoError(tb, err)
-		}
-
-		require.NoError(tb, e.Flush(ctx))
-	}
-
-	for _, p := range e.parts {
-		for _, name := range []string{"a", "b", "attrs"} {
-			desc, ok := p.reader.ColumnDescByName(name)
-			require.True(tb, ok)
-			require.True(tb, desc.SharedDict, "column %q must be on a shared dictionary", name)
-		}
-	}
-
-	return e
-}
 
 // TestRecordPartWriterResidentTracksHeap: what a writer reports holding is what dropping it gives
 // back to the heap — its dictionaries, staged granules, frames, bindings to every source's dictionary
@@ -122,7 +52,7 @@ func TestRecordPartWriterResidentTracksHeap(t *testing.T) {
 		}
 	}
 
-	claim := w.residentBytes()
+	claim := w.residentBytes() - w.finishBytes()
 
 	runtime.GC()
 
@@ -148,8 +78,10 @@ func TestRecordPartWriterResidentTracksHeap(t *testing.T) {
 
 // TestMergeWritersHoldAdmittedShare: a straddling merge of many sources with large dictionaries binds
 // every source's dictionary in every day's writer, so its writers' state multiplies with sources ×
-// days. The router sheds them at the merge's admitted share, and the heap shows the memory it claims
-// to have shed is really given back.
+// days. The merge reserves its share, or what its sources, encoder and writers' floor need if that is
+// more; the writers get what the grant leaves beside the sources and the encoder, less room for one
+// append, and the heap the merge adds stays inside the grant. The heap is measured above a baseline
+// taken once the sources are written, over the file backend, whose objects are not on the heap.
 //
 //nolint:paralleltest // collects and samples the process-wide heap, so it must not run concurrently
 func TestMergeWritersHoldAdmittedShare(t *testing.T) {
@@ -159,7 +91,12 @@ func TestMergeWritersHoldAdmittedShare(t *testing.T) {
 
 	const share = 32 << 20
 
-	run := func(memory int64) (peak, appended, limit int64, heapPeak uint64) {
+	type result struct {
+		peak, appended, limit, grant int64
+		heap                         int64
+	}
+
+	run := func(memory int64) result {
 		t.Helper()
 
 		ctx := context.Background()
@@ -168,34 +105,36 @@ func TestMergeWritersHoldAdmittedShare(t *testing.T) {
 		require.NoError(t, err)
 
 		b := &heaptest.FileSampler{File: fb, KeyContains: "/c/", Writes: true}
-		e := wideDictEngine(t, b, Config{MergeMemoryBytes: memory}, 8, 4, 32<<10, 8)
+		cfg := Config{MergeMemoryBytes: memory, MergeCompression: compress.AlgorithmZSTD}
+		e := wideDictEngine(t, b, cfg, 8, 4, 32<<10, 8)
 
-		defer SetMergeResidentObserver(func(p, r, l int64) { peak, appended, limit = p, r, l })()
+		var r result
 
-		heapPeak = heaptest.Resident(t, b, func() {
-			_, err := e.compactParts(ctx, e.parts, minInt64, 0)
+		defer SetMergeResidentObserver(func(p, a, l, g int64) { r.peak, r.appended, r.limit, r.grant = p, a, l, g })()
+
+		r.heap = int64(heaptest.Resident(t, b, func() {
+			_, err := e.compactParts(ctx, e.parts, minInt64, 0, nil)
 			require.NoError(t, err)
-		})
+		}))
 
 		runtime.KeepAlive(e)
 
-		return peak, appended, limit, heapPeak
+		return r
 	}
 
-	unboundedPeak, _, _, unboundedHeap := run(-1)
-	peak, appended, limit, heap := run(share)
+	unbounded := run(-1)
+	r := run(share)
 
-	t.Logf("unbounded: writers report %.1f MiB, heap %.1f MiB", float64(unboundedPeak)/(1<<20), float64(unboundedHeap)/(1<<20))
-	t.Logf("share %.1f MiB: writers report %.1f MiB (one append %.1f MiB), heap %.1f MiB",
-		float64(limit)/(1<<20), float64(peak)/(1<<20), float64(appended)/(1<<20), float64(heap)/(1<<20))
+	t.Logf("unbounded: writers report %.1f MiB, heap %.1f MiB", float64(unbounded.peak)/(1<<20), float64(unbounded.heap)/(1<<20))
+	t.Logf("share %.1f MiB: grant %.1f MiB, writers limited to %.1f MiB, report %.1f MiB (one append %.1f MiB), heap %.1f MiB",
+		float64(share)/(1<<20), float64(r.grant)/(1<<20), float64(r.limit)/(1<<20), float64(r.peak)/(1<<20),
+		float64(r.appended)/(1<<20), float64(r.heap)/(1<<20))
 
-	require.Equal(t, int64(share), limit)
-	require.Greater(t, unboundedPeak, int64(2*share), "the writers must outgrow the share for the bound to be tested")
+	require.GreaterOrEqual(t, r.grant, int64(share), "a merge reserves at least its share")
+	require.Less(t, r.limit, r.grant, "the sources and encoder must come off the grant")
+	require.Greater(t, unbounded.peak, 2*r.limit, "the writers must outgrow their limit for the bound to be tested")
 
-	assert.LessOrEqual(t, peak, limit+appended, "the writers outgrew the admitted share")
-	assert.Less(t, appended, limit/3, "one append must be small against the share for the bound to mean anything")
-
-	shed := unboundedPeak - peak
-	assert.Less(t, float64(heap), float64(unboundedHeap)-0.5*float64(shed),
-		"the heap did not give back the memory the writers claim to have shed")
+	assert.LessOrEqual(t, r.peak, r.limit, "the writers outgrew what the grant left them")
+	assert.LessOrEqual(t, r.heap, r.grant, "the merge's heap outgrew what it reserved")
+	assert.Less(t, r.heap, unbounded.heap, "shedding the writers must give their memory back")
 }
