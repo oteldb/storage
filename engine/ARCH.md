@@ -640,20 +640,42 @@ Every merge also checks it against the tiers the live parts record (`resolvePoli
     rolled with is wrong. A 1h Count over 1m Sum representatives counts minutes, not samples.
 - A marker cannot confine a tier to part of its range, so there is no partial application.
 
-**One Agg on disk.** The rule above means the engine never records a second Agg while a live part
-records one. So every merge folds, and every marker records, the single Agg the live parts carry.
-Neither depends on which parts a merge happens to take.
+**One Agg on disk.** One writer never records a second Agg while a readable part records one:
+- The history the policy is checked against is every readable part, including the parts adopted
+  from a rival writer's index.
+- A rival can still commit a part recording another Agg after this writer planned its merge. That
+  part only appears when the commit loses the CAS and rebases onto the rival's index. After every
+  rebase the commit re-checks the adopted parts (`rollupGuard`). If one records an Agg that neither
+  the planned readable set nor the output records, the output is dropped, its objects are reclaimed
+  like any uncommitted part, and the next merge replans with the adopted part in its history.
+- Whichever writer commits second backs off, so the index never gains a second Agg from a merge.
 
-Parts can disagree anyway, for example parts adopted from a node that ran another policy. Merging
-them would re-aggregate one side by the other's Agg, so they are quarantined (`mergePool`):
-- The oldest marked part's Agg is kept.
-- Parts recording any other Agg are left out of every merge, with a warning once, and stay on disk as
-  written until retention drops them.
-- Taking them out of the pool, rather than refusing a merge that selects them, keeps the selector
-  from picking the same refused run every cycle.
-- A read can still meet representatives of two Aggs at one timestamp. It folds only those of the
-  smallest Agg (by the `signal.Aggregation` value). That choice depends on the samples alone, so a
-  read returns the same whichever parts merges combine meanwhile.
+Parts can still disagree when independent writers run different policies for one tenant, for
+example nodes during a policy rollout, or in a split brain. Merging them would re-aggregate one side
+by the other's Agg, so merges keep them apart:
+- Each set of parts recording one Agg is a cohort (`mergeCohorts`). A cohort merges only with
+  itself, so every output records one Agg.
+- Cohorts are scheduled round-robin, background, idle-waiver and `Force` alike, so every cohort is
+  still compacted (`cohortRun`).
+- The ladder's still-filling bucket is the one holding the newest sample of all the parts, not of
+  one cohort. A cohort that stops receiving data would otherwise keep its own newest bucket open
+  for ever.
+- Raw and unmarked parts join the primary cohort, the one recording the Aggs of the oldest marked
+  readable part (by `minTime`, then prefix). A late raw sample then rolls like the data that was
+  rolled first, whichever node wrote it.
+
+A read over disagreeing parts can meet representatives of two Aggs at one timestamp. They cannot be
+combined, so the read folds only those of the smallest Agg (by the `signal.Aggregation` value). That
+choice depends on the samples alone, so a read returns the same whichever parts merges combine
+meanwhile. It is not silent:
+- the batch carries `fetch.Batch.AmbiguousRollup`, and PromQL adds `AmbiguousRollupWarning` beside
+  `SampledWarning`;
+- `fetch.rollup_ambiguous_ties` counts the ties;
+- the first is logged once.
+
+The flag does not cross the cluster fan-out frame; the owner's counter and log record it. Operators
+must not run nodes with different downsampling Aggs for one tenant, and the counter shows when they
+do.
 
 Anchoring is paid in the ts column, measured on a 1m rollup of 15s scrapes: +0.01 B/row with no scrape
 jitter, +1.1 at ±5ms, +2.0 at ±50ms, against 1.1–6.8 B/row for the value column. The sf column of an

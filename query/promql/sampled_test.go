@@ -188,3 +188,32 @@ func TestSampledWarningClaimsNoExactness(t *testing.T) {
 	assert.Contains(t, SampledWarning.Error(), "lossy-sampled or rolled up")
 	assert.Contains(t, SampledWarning.Error(), "rates over rolled-up series are approximate")
 }
+
+// TestAmbiguousRollupWarning checks a batch that left out representatives of another aggregation is
+// served with [AmbiguousRollupWarning], beside the sampled warning when it also carries weights.
+func TestAmbiguousRollupWarning(t *testing.T) {
+	t.Parallel()
+
+	b := series("events", "r1", [2]int64{10, 1}, [2]int64{20, 2})
+	b.AmbiguousRollup = true
+
+	_, warns := instantScalar(t, NewQueryable(&fakeFetcher{batches: []*fetch.Batch{b}}, "default"),
+		`sum_over_time(events[60s])`, 30)
+
+	var ambiguous bool
+
+	for _, err := range warns.AsErrors() {
+		ambiguous = ambiguous || errors.Is(err, AmbiguousRollupWarning)
+	}
+
+	assert.True(t, ambiguous, "the engine surfaces the warning: %v", warns.AsErrors())
+	assert.False(t, hasSampledWarning(warns), "no weights, no sampled warning")
+
+	weighted := sampledStream("events", sampledWeight, deltaOnes)
+	weighted.AmbiguousRollup = true
+
+	_, warns = instantScalar(t, NewQueryable(&fakeFetcher{batches: []*fetch.Batch{weighted}}, "default"),
+		`sum_over_time(events[60s])`, sampledWindow)
+	assert.True(t, hasSampledWarning(warns))
+	assert.Len(t, warns.AsErrors(), 2)
+}

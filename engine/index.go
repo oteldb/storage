@@ -47,6 +47,13 @@ const indexCommitAttempts = 8
 // part is dropped from the index that survives. It is a no-op for a head-only engine (no
 // backend), and refused while the engine is fenced ([Engine.fenceLocked]). Caller holds e.mu.
 func (e *Engine) updateIndexLocked(ctx context.Context) error {
+	return e.commitIndexLocked(ctx, nil)
+}
+
+// commitIndexLocked is [Engine.updateIndexLocked] that runs guard, when non-nil, after each rebase:
+// an error from it abandons the commit, since the rival's parts it adopted may be ones the caller's
+// own must not be committed beside. Caller holds e.mu.
+func (e *Engine) commitIndexLocked(ctx context.Context, guard func() error) error {
 	if e.cfg.Backend == nil {
 		return nil
 	}
@@ -86,6 +93,12 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 
 		if err := e.adoptIndexLocked(ctx); err != nil {
 			return err
+		}
+
+		if guard != nil {
+			if err := guard(); err != nil {
+				return err
+			}
 		}
 	}
 

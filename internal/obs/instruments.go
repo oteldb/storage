@@ -204,6 +204,7 @@ type Fetch struct {
 	rows         metric.Int64Histogram
 	partsScanned metric.Int64Counter
 	budgetForced metric.Int64Counter
+	ambiguous    metric.Int64Counter
 }
 
 // ForcedAdmission accounts one query admitted over the decode-memory ceiling because its wait made
@@ -211,6 +212,12 @@ type Fetch struct {
 // caller holds several unscoped reads open) and the ceiling is not holding.
 func (f *Fetch) ForcedAdmission(ctx context.Context, sig string) {
 	f.budgetForced.Add(ctx, 1, sigAttr(sig))
+}
+
+// AmbiguousTies accounts n timestamps at which a read met downsample representatives of different
+// aggregations and returned one's. Parts written under different policies for one tenant cause it.
+func (f *Fetch) AmbiguousTies(ctx context.Context, sig string, n int64) {
+	f.ambiguous.Add(ctx, n, sigAttr(sig))
 }
 
 // Record accounts one fetch (matched `series` series, scanned `partsScanned` parts, returned
@@ -516,6 +523,8 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 		partsScanned: b.counter("storage.fetch.parts_scanned", "parts scanned across fetches", "{part}"),
 		budgetForced: b.counter("storage.fetch.decode_budget_forced_admissions",
 			"queries admitted over the decode-memory ceiling after a stalled wait", "{admission}"),
+		ambiguous: b.counter("storage.fetch.rollup_ambiguous_ties",
+			"timestamps where a read met downsample representatives of different aggregations", "{tie}"),
 	}
 
 	return flush, merge, fetch, b.err

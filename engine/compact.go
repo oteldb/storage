@@ -99,11 +99,18 @@ func forcedRewrite(p *part, opts MergeOptions) bool {
 // each bucket it touched, which the ladder then folds in, and a straddler waiting a cycle only
 // batches with the next.
 func selectMergeParts(src []*part, opts MergeOptions, capBytes int64, idle int) []*part {
+	return selectMergePartsBefore(src, opts, capBytes, idle, newestSample(src))
+}
+
+// selectMergePartsBefore is [selectMergeParts] over a subset of the parts (a [mergeCohort]), the
+// still-filling ladder bucket being the one holding newest, the newest sample of all of them: a
+// cohort that stops receiving data would otherwise hold its own newest bucket open for ever.
+func selectMergePartsBefore(src []*part, opts MergeOptions, capBytes int64, idle int, newest int64) []*part {
 	if forced := selectForced(src, opts, capBytes); len(forced) > 0 {
 		return forced
 	}
 
-	if run := selectLadderRun(src, capBytes, idle); len(run) > 0 {
+	if run := ladderRun(src, capBytes, idle, newest); len(run) > 0 {
 		return run
 	}
 

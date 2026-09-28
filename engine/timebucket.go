@@ -39,15 +39,15 @@ func selectStraddlers(src []*part, capBytes int64) []*part {
 	return timebucket.Straddlers(src, partSpan, (*part).sizeBytes, capBytes, maxMergeParts)
 }
 
-// newestBucket returns the start of the level-aligned bucket holding the newest sample in src. That
-// bucket is still filling, so it is the one merging is premature in.
-func newestBucket(src []*part, level int64) int64 {
+// newestSample is the newest sample in src; the level-aligned bucket holding it is still filling, so
+// it is the one merging is premature in.
+func newestSample(src []*part) int64 {
 	newest := minInt64
 	for _, p := range src {
 		newest = max(newest, p.maxTime)
 	}
 
-	return bucketOf(newest, level)
+	return newest
 }
 
 // partitionGroups groups the parts that fit level by their aligned bucket, returning the bucket
@@ -61,6 +61,12 @@ func newestBucket(src []*part, level int64) int64 {
 // them uncompacted until the bucket closes would let part count grow unbounded within it, the very
 // thing size-tiered selection exists to prevent.
 func partitionGroups(src []*part, level int64) ([]int64, [][]*part) {
+	return partitionGroupsBefore(src, level, newestSample(src))
+}
+
+// partitionGroupsBefore is [partitionGroups] with the still-filling bucket the one holding newest,
+// which a caller selecting from a subset of the parts takes from all of them.
+func partitionGroupsBefore(src []*part, level, newest int64) ([]int64, [][]*part) {
 	groups := make(map[int64][]*part, len(src))
 
 	for _, p := range src {
@@ -71,7 +77,7 @@ func partitionGroups(src []*part, level int64) ([]int64, [][]*part) {
 	}
 
 	if level != mergeLadder[0] {
-		delete(groups, newestBucket(src, level))
+		delete(groups, bucketOf(newest, level))
 	}
 
 	starts := make([]int64, 0, len(groups))
@@ -94,8 +100,12 @@ func partitionGroups(src []*part, level int64) ([]int64, [][]*part) {
 // collapsed at level L before the result is eligible to merge with its neighbors at level L+1, so
 // each part is rewritten once per level rather than repeatedly at the widest one.
 func selectLadderRun(src []*part, capBytes int64, idle int) []*part {
+	return ladderRun(src, capBytes, idle, newestSample(src))
+}
+
+func ladderRun(src []*part, capBytes int64, idle int, newest int64) []*part {
 	for _, level := range mergeLadder {
-		_, groups := partitionGroups(src, level)
+		_, groups := partitionGroupsBefore(src, level, newest)
 
 		for _, group := range groups {
 			// A group of one is already collapsed at this level; it is promoted by the next.

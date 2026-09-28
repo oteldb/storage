@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"math"
 	"slices"
@@ -163,17 +164,17 @@ func partOptions(blockRows int, comp compressProfile, rollup *block.Rollup) []bl
 	return opts
 }
 
-// resolvePolicy is the tiers a merge over the live parts src applies: the tiers those parts record,
-// then the policy's tiers compatible with them ([compatibleTiers]), which it also returns as dropped
-// when they are not. Recorded tiers keep applying with their recorded Agg, so data landing later in a
-// range already rolled is rolled like the rest of it, even when it never meets the part that recorded
-// the range. src must record one Agg at most ([mergePool]).
-func resolvePolicy(src []*part, tiers []DownsampleTier) (applied, dropped []DownsampleTier) {
-	kept, dropped := compatibleTiers(src, tiers)
+// resolvePolicy is the tiers a merge over one cohort applies: the tiers history, the cohort's
+// readable parts, records, then the policy's tiers compatible with every readable part
+// ([compatibleTiers]), which it also returns as dropped when they are not. Recorded tiers keep
+// applying with their recorded Agg, so data landing later in a range already rolled is rolled like
+// the rest of it, even when it never meets the part that recorded the range.
+func resolvePolicy(history, readable []*part, tiers []DownsampleTier) (applied, dropped []DownsampleTier) {
+	kept, dropped := compatibleTiers(readable, tiers)
 
 	var recorded []DownsampleTier
 
-	for _, p := range src {
+	for _, p := range history {
 		for _, t := range p.rollup {
 			if !slices.Contains(recorded, t) {
 				recorded = append(recorded, t)
@@ -245,22 +246,44 @@ func compatibleTiers(src []*part, tiers []DownsampleTier) (kept, dropped []Downs
 	return kept, dropped
 }
 
-// mergePool splits the live parts into those merges may take and those they must leave alone. The
-// engine never records a second Agg while a part records one ([compatibleTiers]), so live marked
-// parts carry one Agg. Parts that disagree anyway, adopted from a node running another policy for
-// example, cannot be merged into one marker without re-aggregating one side by the other's Agg. The
-// pool keeps the Agg of the oldest marked part and quarantines every part recording another: those
-// stay on disk as written, readable, and unmerged until retention drops them. Taking them out of the
-// pool, rather than refusing a merge that selects them, keeps the selector from picking the same
-// refused run every cycle.
-func mergePool(src []*part) (pool, quarantined []*part) {
-	var (
-		keep  signal.Aggregation
-		first *part
-	)
+// aggMask is the set of Aggs a layout records, one bit per [signal.Aggregation].
+type aggMask uint16
 
-	for _, p := range src {
-		if !activeTiers(p.rollup) {
+func maskOf(tiers []DownsampleTier) aggMask {
+	var m aggMask
+
+	for _, t := range tiers {
+		if t.Interval > 0 {
+			m |= 1 << t.Agg
+		}
+	}
+
+	return m
+}
+
+// mergeCohort is a set of this engine's parts a merge may combine: those recording one set of Aggs
+// (mask), with history every readable part, adopted ones included, recording the same.
+type mergeCohort struct {
+	mask    aggMask
+	parts   []*part
+	history []*part
+}
+
+// mergeCohorts partitions own, the parts this engine may merge, by the Aggs they record. The engine
+// never records a second Agg while a readable part records one ([compatibleTiers], and the commit
+// guard in [Engine.merge]), so there is normally one cohort. Parts that disagree anyway, written by
+// nodes running different policies for one tenant, cannot be merged into one marker without
+// re-aggregating one side by the other's Agg; each cohort merges only with itself, every output
+// records one Agg, and every cohort is still compacted.
+//
+// Raw and unmarked parts join the primary cohort, the one recording the Aggs of the oldest marked
+// readable part (by minTime, then prefix): a late raw sample then rolls like the data that was
+// rolled first, whichever node wrote it. The primary cohort comes first, the rest by mask.
+func mergeCohorts(own, readable []*part) []mergeCohort {
+	var first *part
+
+	for _, p := range readable {
+		if maskOf(p.rollup) == 0 {
 			continue
 		}
 
@@ -269,37 +292,70 @@ func mergePool(src []*part) (pool, quarantined []*part) {
 		}
 	}
 
-	if first == nil {
-		return src, nil
+	var primary aggMask
+	if first != nil {
+		primary = maskOf(first.rollup)
 	}
 
-	for _, t := range first.rollup {
-		if t.Interval > 0 {
-			keep = t.Agg
+	cohorts := []mergeCohort{{mask: primary}}
+	at := func(m aggMask) *mergeCohort {
+		for i := range cohorts {
+			if cohorts[i].mask == m {
+				return &cohorts[i]
+			}
+		}
 
-			break
+		cohorts = append(cohorts, mergeCohort{mask: m})
+
+		return &cohorts[len(cohorts)-1]
+	}
+
+	for _, p := range own {
+		m := maskOf(p.rollup)
+		if m == 0 {
+			m = primary
+		}
+
+		c := at(m)
+		c.parts = append(c.parts, p)
+	}
+
+	for _, p := range readable {
+		if m := maskOf(p.rollup); m != 0 {
+			c := at(m)
+			c.history = append(c.history, p)
 		}
 	}
 
-	agrees := func(p *part) bool {
-		return !slices.ContainsFunc(p.rollup, func(t DownsampleTier) bool { return t.Interval > 0 && t.Agg != keep })
+	cohorts = slices.DeleteFunc(cohorts, func(c mergeCohort) bool { return len(c.parts) == 0 })
+	slices.SortStableFunc(cohorts[min(1, len(cohorts)):], func(a, b mergeCohort) int { return cmp.Compare(a.mask, b.mask) })
+
+	return cohorts
+}
+
+// cohortRun is the selection one merge makes: the first cohort, from start round-robin, whose own
+// selection is not empty, with the tiers it applies and the policy tiers it drops. Round-robin keeps
+// a busy cohort from starving the others.
+func cohortRun(
+	cohorts []mergeCohort, readable []*part, opts MergeOptions, capBytes int64, idle int, start uint64,
+) (selected []*part, tiers, dropped []DownsampleTier) {
+	newest := minInt64
+	for _, c := range cohorts {
+		newest = max(newest, newestSample(c.parts))
 	}
 
-	if !slices.ContainsFunc(src, func(p *part) bool { return !agrees(p) }) {
-		return src, nil
-	}
+	for i := range cohorts {
+		c := &cohorts[(start+uint64(i))%uint64(len(cohorts))]
 
-	pool = make([]*part, 0, len(src))
+		o := opts
+		o.Downsample, dropped = resolvePolicy(c.history, readable, opts.Downsample)
 
-	for _, p := range src {
-		if agrees(p) {
-			pool = append(pool, p)
-		} else {
-			quarantined = append(quarantined, p)
+		if sel := selectMergePartsBefore(c.parts, o, capBytes, idle, newest); len(sel) > 0 {
+			return sel, o.Downsample, dropped
 		}
 	}
 
-	return pool, quarantined
+	return nil, nil, dropped
 }
 
 // rollupPlan is the downsampling a merge applies and the marker its outputs record.
@@ -365,7 +421,7 @@ func (e *Engine) planRollup(ctx context.Context, src []*part, start int64, tiers
 }
 
 // mergeLayout is the layout a merge of src applying tiers rolls its samples up to: every known
-// source's recorded tiers, then tiers. The sources and tiers share one Agg ([mergePool],
+// source's recorded tiers, then tiers. The sources and tiers share one Agg ([mergeCohorts],
 // [resolvePolicy]).
 func mergeLayout(src []*part, tiers []DownsampleTier) []DownsampleTier {
 	var layout []DownsampleTier

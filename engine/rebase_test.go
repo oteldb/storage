@@ -10,6 +10,7 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/signal"
 )
 
 // These cover what a *rebase* leaves behind. A commit that loses the conditional write reloads the
@@ -102,4 +103,40 @@ func TestRebaseServesTheAdoptedParts(t *testing.T) {
 
 	require.Len(t, got, 1, "an engine must serve every part the index it committed names")
 	require.Equal(t, []int64{100}, got[0].Timestamps)
+}
+
+// TestRebaseNeverCommitsTwoAggs: writer b plans a Sum rollup of its own part while writer a, sharing
+// the prefix, commits a Count rollup b has not seen. b's commit loses the CAS and rebases onto a's
+// index; committing its Sum output beside a's Count part would put two Aggs in the index, which no
+// merge can fold. The committed index must never hold both.
+func TestRebaseNeverCommitsTwoAggs(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := backend.Memory()
+	a, b, _, _ := rivals(t, be)
+
+	tier := func(agg signal.Aggregation) engine.MergeOptions {
+		return engine.MergeOptions{Downsample: []engine.DownsampleTier{{Before: 1 << 62, Interval: 1000, Agg: agg}}}
+	}
+
+	for i := range int64(5) {
+		mustAppend(t, a, mkSeries("job", "api"), 100+i, 1)
+		mustAppend(t, b, mkSeries("job", "web"), 100+i, 1)
+	}
+
+	require.NoError(t, a.Flush(ctx))
+	require.NoError(t, b.Flush(ctx))
+	require.NoError(t, a.MergeWith(ctx, tier(signal.AggCount)))
+	require.NoError(t, b.MergeWith(ctx, tier(signal.AggSum)))
+
+	r := engine.New(engine.Config{Backend: be, Prefix: sharedPrefix})
+	require.NoError(t, r.LoadParts(ctx))
+	require.Len(t, r.RecordedAggs(), 1, "the committed index holds one Agg")
+
+	require.NoError(t, b.MergeWith(ctx, tier(signal.AggSum)))
+	require.NoError(t, r.LoadParts(ctx))
+	require.Len(t, r.RecordedAggs(), 1, "and keeps holding one on the next merge")
+
+	require.ElementsMatch(t, []string{"api", "web"}, queryable(t, be, "api", "web"), "nothing is lost")
 }

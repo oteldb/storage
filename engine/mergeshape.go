@@ -1,5 +1,10 @@
 package engine
 
+import (
+	"maps"
+	"slices"
+)
+
 // MergeShape is the merge selector's view of the flushed parts: the inputs to the decision the
 // background merge makes each cycle. Without them an engine sitting on a part count it will never
 // reduce is indistinguishable from an idle healthy one — the two differ only in whether the parts
@@ -44,9 +49,11 @@ func (e *Engine) MergeShape() MergeShape { return e.MergeShapeWith(MergeOptions{
 func (e *Engine) MergeShapeWith(opts MergeOptions) MergeShape {
 	e.mu.RLock()
 	src := e.parts
+	adopted := slices.Collect(maps.Values(e.foreignParts))
 	e.mu.RUnlock()
 
 	capBytes := e.lastMergeCap.Load()
+	turn := e.cohortTurn.Load()
 	idle := int(e.idleMerges.Load())
 	sealedN, backlog, bestM := mergeShape(src, capBytes)
 
@@ -60,8 +67,8 @@ func (e *Engine) MergeShapeWith(opts MergeOptions) MergeShape {
 		Bytes:           bytes,
 		Sealed:          sealedN,
 		Backlog:         backlog,
-		Candidates:      nextMergeParts(src, opts, capBytes, idle),
-		ForceCandidates: nextMergeParts(src, opts, capBytes, mergeIdleRounds),
+		Candidates:      nextMergeParts(src, adopted, opts, capBytes, idle, turn),
+		ForceCandidates: nextMergeParts(src, adopted, opts, capBytes, mergeIdleRounds, turn),
 		CapBytes:        capBytes,
 		BestMultiplier:  bestM,
 		MinMultiplier:   minMergeMultiplier,
@@ -71,8 +78,8 @@ func (e *Engine) MergeShapeWith(opts MergeOptions) MergeShape {
 }
 
 // nextMergeParts counts the parts one merge over src takes: those retention drops whole, then the
-// selection over the rest.
-func nextMergeParts(src []*part, opts MergeOptions, capBytes int64, idle int) int {
+// selection over the rest, from the cohort the next merge starts at.
+func nextMergeParts(src, adopted []*part, opts MergeOptions, capBytes int64, idle int, turn uint64) int {
 	live := src
 
 	if opts.RetainFrom > 0 {
@@ -85,10 +92,10 @@ func nextMergeParts(src []*part, opts MergeOptions, capBytes int64, idle int) in
 		}
 	}
 
-	pool, _ := mergePool(live)
-	opts.Downsample, _ = resolvePolicy(pool, opts.Downsample)
+	readable := append(slices.Clone(live), adopted...)
+	selected, _, _ := cohortRun(mergeCohorts(live, readable), readable, opts, capBytes, idle, turn)
 
-	return len(src) - len(live) + len(selectMergeParts(pool, opts, capBytes, idle))
+	return len(src) - len(live) + len(selected)
 }
 
 // mergeIdle is the idle-round count the selector sees for this merge: the real one, or one that has

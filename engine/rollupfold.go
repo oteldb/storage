@@ -85,11 +85,11 @@ func appendTags(tags []rollupTag, r *tsRun, layout []DownsampleTier, lo, hi, n, 
 // can land on one, and freshest-wins would drop the other's data. Runs are visited newest first, so
 // a value-selecting tie goes to the freshest sample.
 //
-// Live marked parts record one Agg ([mergePool]), and a merge takes parts of one Agg only. A read can
-// still meet representatives of two Aggs, from a quarantined part; it folds only those of the
-// smallest Agg and returns them, which depends on nothing but the samples, so the read stays the same
-// whichever parts merges combine meanwhile.
-func foldTie(runs []tsRun, layouts [][]DownsampleTier, cur []int, ts int64) (float64, float64, rollupTag) {
+// A merge takes parts of one Agg only ([mergeCohorts]). A read can still meet representatives of two
+// Aggs, from parts written under different policies; it folds only those of the smallest Agg and
+// reports mixed, so the caller can say a cohort was left out. The pick depends on nothing but the
+// samples, so the read stays the same whichever parts merges combine meanwhile.
+func foldTie(runs []tsRun, layouts [][]DownsampleTier, cur []int, ts int64) (v, w float64, tag rollupTag, mixed bool) {
 	var (
 		raw    = -1
 		reps   int
@@ -107,6 +107,8 @@ func foldTie(runs []tsRun, layouts [][]DownsampleTier, cur []int, ts int64) (flo
 		case t.interval > 0:
 			reps++
 
+			mixed = mixed || hasRep && t.agg != agg
+
 			if !hasRep || t.agg < agg {
 				agg, hasRep = t.agg, true
 			}
@@ -116,16 +118,13 @@ func foldTie(runs []tsRun, layouts [][]DownsampleTier, cur []int, ts int64) (flo
 	}
 
 	if reps == 0 {
-		v, w := runs[raw].vals[cur[raw]], runs[raw].weight(cur[raw])
+		v, w = runs[raw].vals[cur[raw]], runs[raw].weight(cur[raw])
 		advanceTie(runs, cur, ts)
 
-		return v, w, rollupTag{}
+		return v, w, rollupTag{}, false
 	}
 
-	var (
-		acc bucketAcc
-		tag rollupTag
-	)
+	var acc bucketAcc
 
 	acc.repAgg, acc.hasRep = agg, true
 
@@ -151,9 +150,9 @@ func foldTie(runs []tsRun, layouts [][]DownsampleTier, cur []int, ts int64) (flo
 
 	advanceTie(runs, cur, ts)
 
-	_, v, w := acc.result(ts)
+	_, v, w = acc.result(ts)
 
-	return v, w, tag
+	return v, w, tag, mixed
 }
 
 func advanceTie(runs []tsRun, cur []int, ts int64) {

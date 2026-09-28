@@ -2,9 +2,11 @@ package engine
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"time"
 
+	"github.com/go-faster/errors"
 	"github.com/go-faster/sdk/zctx"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -102,6 +104,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	// at a time, as the parts are written.
 	e.mu.Lock()
 	src := e.parts
+	adopted := slices.Collect(maps.Values(e.foreignParts))
 	e.mu.Unlock()
 
 	capBytes := e.mergeCapBytes(ctx)
@@ -114,22 +117,24 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{}, err
 	}
 
-	pool, quarantined := mergePool(src)
-	if len(quarantined) > 0 && e.quarantineWarned.CompareAndSwap(false, true) {
-		zctx.From(ctx).Warn("parts recording a second downsample aggregation are left unmerged",
-			zap.String("prefix", e.cfg.Prefix), zap.Int("parts", len(quarantined)))
+	readable := append(slices.Clone(src), adopted...)
+
+	cohorts := mergeCohorts(src, readable)
+	if len(cohorts) > 1 && e.cohortsWarned.CompareAndSwap(false, true) {
+		zctx.From(ctx).Warn("parts record different downsample aggregations; each merges only with its own",
+			zap.String("prefix", e.cfg.Prefix), zap.Int("cohorts", len(cohorts)))
 	}
 
-	var conflicting []DownsampleTier
-	if opts.Downsample, conflicting = resolvePolicy(pool, opts.Downsample); len(conflicting) > 0 &&
-		e.conflictWarned.CompareAndSwap(false, true) {
+	selected, tiers, conflicting := cohortRun(cohorts, readable, opts, capBytes, e.mergeIdle(opts), e.cohortTurn.Add(1)-1)
+	opts.Downsample = tiers
+
+	if len(conflicting) > 0 && e.conflictWarned.CompareAndSwap(false, true) {
 		zctx.From(ctx).Warn("downsample tier not applied: its interval does not nest with, or its aggregation "+
 			"differs from, a tier a part already records",
 			zap.String("prefix", e.cfg.Prefix), zap.Int64("interval", conflicting[0].Interval),
 			zap.Stringer("agg", conflicting[0].Agg))
 	}
 
-	selected := selectMergeParts(pool, opts, capBytes, e.mergeIdle(opts))
 	if len(selected) == 0 {
 		if dropped == 0 {
 			idle := int(e.idleMerges.Add(1))
@@ -241,11 +246,25 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	committed := e.parts
 	e.parts = replaceParts(e.parts, removed, newParts...)
 
-	if err = e.updateIndexLocked(ctx); err != nil {
+	if err = e.commitIndexLocked(ctx, rollupGuard(readable, plan.marker, e)); err != nil {
 		e.parts = committed
-		e.mu.Unlock()
 
-		return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, err
+		if !errors.Is(err, errRollupConflict) {
+			e.mu.Unlock()
+
+			return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, err
+		}
+
+		// Never committed and never readable, so nothing waits on these before they are deleted.
+		e.retireLocked(newParts)
+		e.mu.Unlock()
+		e.reclaimRetired(ctx)
+
+		zctx.From(ctx).Warn("merge output dropped: a rival writer committed a part recording another "+
+			"downsample aggregation; the next merge replans with it",
+			zap.String("prefix", e.cfg.Prefix))
+
+		return mergeResult{parts: dropped}, nil
 	}
 
 	e.retireLocked(selected)
@@ -262,6 +281,44 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	e.reclaimRetired(ctx)
 
 	return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, nil
+}
+
+// errRollupConflict aborts a merge whose commit would put a second Agg in the index.
+var errRollupConflict = errors.New("a rival writer committed a part recording another downsample aggregation")
+
+// rollupGuard is the check a merge's commit runs after each rebase onto a rival writer's index: a
+// part the rival committed that records Aggs neither the merge's readable parts nor its output
+// record means the commit would hold two Aggs, which no later merge can fold. The planning never saw
+// that part, so the merge is dropped and the next one replans with it. A merge whose output records
+// no Agg cannot introduce a conflict. Called with e.mu held.
+func rollupGuard(readable []*part, marker *block.Rollup, e *Engine) func() error {
+	var out aggMask
+	if marker != nil {
+		for _, t := range marker.Tiers {
+			if t.Interval > 0 {
+				out |= 1 << t.Agg
+			}
+		}
+	}
+
+	if out == 0 {
+		return nil
+	}
+
+	known := map[aggMask]bool{out: true}
+	for _, p := range readable {
+		known[maskOf(p.rollup)] = true
+	}
+
+	return func() error {
+		for _, p := range e.foreignParts {
+			if m := maskOf(p.rollup); m != 0 && !known[m] {
+				return errRollupConflict
+			}
+		}
+
+		return nil
+	}
 }
 
 // mergeResult is what one merge moved: the source parts it compacted (including those retention

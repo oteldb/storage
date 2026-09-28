@@ -772,8 +772,8 @@ func rewriteRollup(t *testing.T, b backend.Backend, prefix string, r block.Rollu
 }
 
 // TestDownsampleQuarantinesSecondAgg checks a part recording a second Agg, which the engine never
-// writes beside the first but may adopt, is left out of every merge: it stays as written and reads
-// the same, while the rest of the store still compacts and rolls up.
+// writes beside the first but may adopt, is never merged with the first cohort: alone in its own, it
+// stays as written and reads the same, while the rest of the store still compacts and rolls up.
 func TestDownsampleQuarantinesSecondAgg(t *testing.T) {
 	t.Parallel()
 
@@ -802,12 +802,14 @@ func TestDownsampleQuarantinesSecondAgg(t *testing.T) {
 	e = reopenRollup(t, b, Config{})
 	before, beforeVals := samplesBefore(t, e, anchorAt)
 
-	pool, quarantined := mergePool(liveParts(e))
-	if assert.Len(t, quarantined, 1) {
-		assert.Equal(t, other.prefix, quarantined[0].prefix)
-	}
+	cohorts := mergeCohorts(liveParts(e), liveParts(e))
+	if assert.Len(t, cohorts, 2) {
+		assert.Len(t, cohorts[0].parts, 2, "the primary cohort: the Count part and the anchor")
 
-	assert.Len(t, pool, 2)
+		if assert.Len(t, cohorts[1].parts, 1) {
+			assert.Equal(t, other.prefix, cohorts[1].parts[0].prefix)
+		}
+	}
 
 	flushEvery(t, e, 3*step+step/2, 3*step+step/2+1, 1, 1)
 
@@ -821,7 +823,7 @@ func TestDownsampleQuarantinesSecondAgg(t *testing.T) {
 		found = found || p.prefix == other.prefix
 	}
 
-	assert.True(t, found, "the quarantined part is never merged")
+	assert.True(t, found, "the second cohort's part is never merged with the first")
 
 	require.Equal(t, []int64{0, day}, before)
 	require.Equal(t, []float64{6, 6}, beforeVals)
@@ -846,4 +848,58 @@ func btoi(b bool) int {
 	}
 
 	return 0
+}
+
+// TestDownsampleCohortsCompactSeparately checks parts of a second Agg, kept apart from the first,
+// still compact among themselves: forced merges compact each cohort to one part, and every output
+// records one Agg.
+func TestDownsampleCohortsCompactSeparately(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	hour, minute, step := int64(time.Hour), int64(time.Minute), 10*int64(time.Second)
+	count := MergeOptions{Downsample: countTiers(1<<62, time.Minute)}
+	b := backend.Memory()
+
+	e := reopenRollup(t, b, Config{})
+	for i := range int64(6) {
+		flushEvery(t, e, i*hour, i*hour+minute, step, 1)
+	}
+
+	flushEvery(t, e, anchorAt, anchorAt+1, step, 1)
+
+	for range 6 {
+		require.NoError(t, e.MergeWith(ctx, count))
+	}
+
+	require.Equal(t, 7, e.PartCount(), "each hour rolled on its own")
+
+	for _, p := range liveParts(e) {
+		if p.minTime >= 3*hour && p.minTime < anchorAt {
+			rewriteRollup(t, b, p.prefix, rollupMarker(sumTiers(1<<62, time.Minute)))
+		}
+	}
+
+	e = reopenRollup(t, b, Config{})
+
+	force := count
+	force.Force = true
+
+	for range 8 {
+		require.NoError(t, e.MergeWith(ctx, force))
+	}
+
+	assert.Equal(t, 3, e.PartCount(), "one part per cohort, plus the anchor")
+
+	for _, p := range liveParts(e) {
+		var aggs []signal.Aggregation
+
+		for _, tier := range p.rollup {
+			if !slices.Contains(aggs, tier.Agg) {
+				aggs = append(aggs, tier.Agg)
+			}
+		}
+
+		assert.LessOrEqual(t, len(aggs), 1, "part %s records one Agg", p.prefix)
+	}
 }

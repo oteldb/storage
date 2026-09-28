@@ -114,7 +114,7 @@ func TestFoldTie(t *testing.T) {
 			}
 
 			cur := make([]int, len(runs))
-			v, w, tag := foldTie(runs, layouts, cur, runs[0].ts[0])
+			v, w, tag, _ := foldTie(runs, layouts, cur, runs[0].ts[0])
 			assert.InDelta(t, tc.v, v, 0)
 			assert.InDelta(t, tc.w, w, 0)
 			assert.Equal(t, tc.isRep, tag.interval > 0)
@@ -371,7 +371,7 @@ func FuzzRollupCombine(f *testing.F) {
 	})
 }
 
-// TestReadTieMixedAggsIndependentOfOrder: parts that disagree on the Agg (only a quarantined part
+// TestReadTieMixedAggsIndependentOfOrder: parts that disagree on the Agg (only parts of two writers
 // can) must read the same whatever order they arrive in, and whatever merges combine meanwhile. Here
 // A and C hold Sum representatives and B a Count one at the same bucket start. A merge takes A and C
 // together (never B, which records another Agg), and the merged part lands after B.

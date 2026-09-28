@@ -205,8 +205,12 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.Select
 		*bs = batchSeries{labels: lset, ts: b.Timestamps, vs: b.Values, sf: b.ScaleFactors}
 		series = append(series, bs)
 
-		if warnings == nil && sampled(b.ScaleFactors) {
-			warnings = annotations.New().Add(SampledWarning)
+		if sampled(b.ScaleFactors) {
+			warnings.Add(SampledWarning)
+		}
+
+		if b.AmbiguousRollup {
+			warnings.Add(AmbiguousRollupWarning)
 		}
 	}
 

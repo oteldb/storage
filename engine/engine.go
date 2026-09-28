@@ -222,10 +222,14 @@ type Engine struct {
 	// could be declined every cycle while its part count grew.
 	mergeDeferred atomic.Bool
 	// conflictWarned records that a merge already warned of a policy tier it dropped for conflicting
-	// with a recorded one ([compatibleTiers]); quarantineWarned, of parts left out of merges for
-	// recording a second Agg ([mergePool]).
-	conflictWarned   atomic.Bool
-	quarantineWarned atomic.Bool
+	// with a recorded one ([compatibleTiers]); cohortsWarned, of parts recording more than one Agg
+	// ([mergeCohorts]).
+	conflictWarned atomic.Bool
+	cohortsWarned  atomic.Bool
+	// cohortTurn is where the next merge starts its round-robin over the cohorts ([cohortRun]).
+	cohortTurn atomic.Uint64
+	// ambiguousWarned records that a read already logged a tie of representatives of different Aggs.
+	ambiguousWarned atomic.Bool
 	// retiring holds parts removed from the live set by flush/merge, pending backend deletion once
 	// their in-flight fetch readers drain (deferred reclamation; see reclaim.go).
 	retiring []*part
@@ -970,6 +974,24 @@ func (p *enginePlan) decodeEstimate(ctx context.Context, need colNeed) (int64, e
 	return total, nil
 }
 
+// noteAmbiguous accounts the ties of representatives of different Aggs m's collect met, logging the
+// first the engine sees, and reports whether there were any.
+func (p *enginePlan) noteAmbiguous(ctx context.Context, m *sampleMerge) bool {
+	if m.ambiguous == 0 {
+		return false
+	}
+
+	p.engine.cfg.Obs.Fetch.AmbiguousTies(ctx, metricSignal, int64(m.ambiguous))
+
+	if p.engine.ambiguousWarned.CompareAndSwap(false, true) {
+		zctx.From(ctx).Warn("a read met downsample representatives of different aggregations and left some out; "+
+			"nodes run different downsampling aggregations for one tenant",
+			zap.String("prefix", p.engine.cfg.Prefix), zap.Int("ties", m.ambiguous))
+	}
+
+	return true
+}
+
 // releaseSeriesPins releases every block reader's per-series pins (keeping the memoized blocks
 // pinned). Call it after a series' collect has copied its samples out of the merge — the views the
 // pins protected are dead — so evicted blocks' buffers recirculate while the fetch is running.
@@ -1058,6 +1080,8 @@ type sampleMerge struct {
 	// layouts holds each run's source's recorded rollup: a sample it assigns a tier is that tier's
 	// representative. It stays nil until a run has one, so a read of raw parts carries none.
 	layouts [][]DownsampleTier
+	// ambiguous counts the timestamps collect met representatives of different Aggs at ([foldTie]).
+	ambiguous int
 }
 
 // add registers a source's [start, end] window as a run. ts must be ascending; the window bounds are
@@ -1117,7 +1141,7 @@ func (m *sampleMerge) gather(
 
 		return tsOut, values, sf
 	default:
-		return collectMany(m.runs, m.layouts, tsBuf, valsBuf, tags)
+		return collectMany(m.runs, m.layouts, tsBuf, valsBuf, tags, &m.ambiguous)
 	}
 }
 
@@ -1154,7 +1178,8 @@ func collectOne(r tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64, value
 // collectMany k-way-merges several sorted runs into the destination buffers, emitting each
 // timestamp once and taking its value/weight from the highest-indexed (freshest) run that holds it,
 // or from [foldTie] when a representative is among them. layouts is [sampleMerge.layouts]; tags,
-// when non-nil, receives each emitted sample's [rollupTag].
+// when non-nil, receives each emitted sample's [rollupTag]; ambiguous counts the ties of
+// representatives of different Aggs.
 //
 // The scan finds the two smallest heads rather than just the smallest, which turns the common case
 // into a copy: while the leading run's timestamps stay strictly below every other head, no other run
@@ -1165,6 +1190,7 @@ func collectOne(r tsRun, tsBuf []int64, valsBuf []float64) (tsOut []int64, value
 // row the old O(rows × runs) scan re-derived what one comparison per stretch establishes.
 func collectMany(
 	runs []tsRun, layouts [][]DownsampleTier, tsBuf []int64, valsBuf []float64, tags *[]rollupTag,
+	ambiguous *int,
 ) (tsOut []int64, values, sf []float64) {
 	total := 0
 	for i := range runs {
@@ -1191,7 +1217,10 @@ func collectMany(
 		}
 
 		if rival && leadTs == rivalTs {
-			v, w, tag := foldTie(runs, layouts, cur, leadTs)
+			v, w, tag, mixed := foldTie(runs, layouts, cur, leadTs)
+			if mixed {
+				*ambiguous++
+			}
 
 			tsOut = append(tsOut, leadTs)
 			values = append(values, v)

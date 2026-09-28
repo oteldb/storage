@@ -339,6 +339,7 @@ func (w *windower) series(ctx context.Context, e *Engine, plan *enginePlan, id s
 		var sf []float64
 
 		w.ts, w.vals, sf = m.collect(w.ts[:0], w.vals[:0])
+		plan.noteAmbiguous(ctx, &m)
 		plan.releaseSeriesPins() // samples copied out; recirculate this series' block pins
 		plan.samplesDecoded += len(w.ts)
 
