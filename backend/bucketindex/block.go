@@ -398,32 +398,22 @@ func (ix *Index) NextBlock(term uint64) Block {
 }
 
 // Covered is the set of blocks the index's data-bearing parts hold between them, including the
-// ancestor blocks of every split group whose members are all present. It is what decides a want is
-// met when no single part contains it.
-func (ix *Index) Covered() Interval { return ix.covered(Entry.Data) }
+// ancestor blocks of every split group — any the index's lineage records — whose members are all
+// present. It is what decides a want is met when no single part contains it.
+func (ix *Index) Covered() Interval { return ix.covered(Entry.Data, ix.Lineage()) }
 
-func (ix *Index) covered(admit func(Entry) bool) Interval {
-	var (
-		runs   = make([]Gap, 0, len(ix.Entries))
-		claims []Claim
-	)
+func (ix *Index) covered(admit func(Entry) bool, lineage Lineage) Interval {
+	runs := make([]Gap, 0, len(ix.Entries))
 
 	for i := range ix.Entries {
 		e := &ix.Entries[i]
-		if !admit(*e) {
-			continue
-		}
-
-		if e.Blocks.Valid() {
+		if admit(*e) && e.Blocks.Valid() {
 			runs = e.Blocks.appendRuns(runs)
-		}
-
-		if e.Claim.Valid() {
-			claims = append(claims, e.Claim)
 		}
 	}
 
 	held := fromRuns(runs)
+	claims := slices.Clone(lineage)
 
 	// A group whose members were themselves split resolves only once the inner group has, so the
 	// pass repeats while it keeps realizing claims. Each round retires at least one claim, so it
@@ -514,13 +504,14 @@ func (ix *Index) satisfying(w Want, admit func(Entry) bool, lineage Lineage) (En
 		return best, true
 	}
 
-	return ix.jointlySatisfying(w, admit)
+	return ix.jointlySatisfying(w, admit, lineage)
 }
 
 // jointlySatisfying answers a want no single part contains: it holds only where the whole index
-// covers w's blocks, and then names the best member of the split group that supplies them.
-func (ix *Index) jointlySatisfying(w Want, admit func(Entry) bool) (Entry, bool) {
-	if !w.Blocks.Valid() || !ix.covered(admit).Contains(w.Blocks) {
+// covers w's blocks, and then names the best member of a split group that supplies some of them —
+// one whose group's ancestry, followed through every group lineage records, reaches w's blocks.
+func (ix *Index) jointlySatisfying(w Want, admit func(Entry) bool, lineage Lineage) (Entry, bool) {
+	if !w.Blocks.Valid() || !ix.covered(admit, lineage).Contains(w.Blocks) {
 		return Entry{}, false
 	}
 
@@ -531,7 +522,11 @@ func (ix *Index) jointlySatisfying(w Want, admit func(Entry) bool) (Entry, bool)
 
 	for i := range ix.Entries {
 		e := ix.Entries[i]
-		if !admit(e) || !e.Claim.Blocks.Contains(w.Blocks) {
+		if !admit(e) || !e.Claim.Valid() {
+			continue
+		}
+
+		if up, _ := lineage.With(e.Claim).ancestry(e.Blocks); !meets(up, w.Blocks) {
 			continue
 		}
 
@@ -543,32 +538,45 @@ func (ix *Index) jointlySatisfying(w Want, admit func(Entry) bool) (Entry, bool)
 	return best, found
 }
 
-// Missing returns the blocks of the split groups this index would need to answer w and does not
-// hold: the members of every group whose claim covers w but whose own blocks are not all present.
+// Missing returns the blocks this index would need to answer w and does not hold: the members of
+// every split group derived from w's rows, followed through every group the lineage records, that no
+// later group consumed. A member split again is not asked for; the members of its split are.
 //
 // It is what makes a group repairable one member at a time. A want naming a pre-split part is
 // answered by no single peer entry, so repair asks for the group's blocks instead, and the peer
-// resolves each of those against its own index by ordinary containment.
+// resolves each of those against its own index — through containment, or its own lineage for a
+// member it split again.
 func (ix *Index) Missing(w Want) []Block {
 	if !w.Blocks.Valid() {
 		return nil
 	}
 
-	held := ix.covered(Entry.Data)
-	if held.Contains(w.Blocks) {
+	lineage := ix.Lineage().With(w.Claim)
+	if _, ok := ix.satisfying(w, Entry.Data, lineage); ok {
 		return nil
+	}
+
+	held := ix.covered(Entry.Data, lineage)
+	_, via := lineage.descendants(w.Blocks)
+
+	var consumed Interval
+
+	for i, c := range lineage {
+		if via[i] {
+			consumed = consumed.Union(c.Blocks)
+		}
 	}
 
 	var out []Block
 
-	for i := range ix.Entries {
-		c := ix.Entries[i].Claim
-		if !ix.Entries[i].Data() || !c.Valid() || !c.Blocks.Contains(w.Blocks) {
+	for i, c := range lineage {
+		if !via[i] {
 			continue
 		}
 
 		c.Group.Each(func(b Block) bool {
-			if !held.Contains(Interval{Min: b, Max: b}) && !slices.Contains(out, b) {
+			one := Single(b)
+			if !held.Contains(one) && !consumed.Contains(one) && !slices.Contains(out, b) {
 				out = append(out, b)
 			}
 

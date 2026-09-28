@@ -22,7 +22,8 @@ type pruned struct {
 // judged over the lineage of everything the commit saw: a member left out may be the only record
 // relating what remains.
 func prune(
-	live []bucketindex.Entry, units []Unit, added [][]bucketindex.Entry, openErr map[string]error, in []bool,
+	live []bucketindex.Entry, catalog []bucketindex.Claim, units []Unit, added [][]bucketindex.Entry,
+	openErr map[string]error, in []bool,
 ) pruned {
 	var admitted []bucketindex.Entry
 
@@ -40,7 +41,7 @@ func prune(
 	}
 
 	all := slices.Concat(live, admitted)
-	lineage := bucketindex.LineageOf(all)
+	lineage := bucketindex.LineageOf(all).With(catalog...)
 	subsumed := lineage.Subsumed(admitted, all)
 	published := slices.DeleteFunc(admitted, func(e bucketindex.Entry) bool {
 		_, ok := subsumed[e.Prefix]
@@ -81,7 +82,7 @@ func prune(
 			return slices.ContainsFunc(own[k], func(o bucketindex.Entry) bool { return o.Prefix == e.Prefix })
 		})
 
-		if !admissible(base, units[k], own[k], openErr) {
+		if !admissible(base, catalog, units[k], own[k], openErr) {
 			out.drop = append(out.drop, k)
 		}
 	}

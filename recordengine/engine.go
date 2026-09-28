@@ -265,6 +265,8 @@ type Engine struct {
 	// catalog is the lineage catalog this engine last committed or adopted
 	// ([bucketindex.Index.Catalog]): every split group's claim, kept after its members are gone.
 	catalog []bucketindex.Claim
+	// lineageWarned makes the warning that the catalog outgrew its target a once-per-engine one.
+	lineageWarned atomic.Bool
 	// pendingHoles are the losses the next commit must acknowledge. Like pendingWants they are
 	// held rather than applied on the spot, so a commit that never lands leaves the want
 	// outstanding instead of half-discharged.

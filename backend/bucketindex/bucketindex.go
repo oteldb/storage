@@ -368,11 +368,10 @@ func decodeTail(ix *Index, buf []byte, ver uint8) error {
 }
 
 // readCatalog parses the v8+ lineage catalog. It is canonical like everything else — every claim
-// valid, strictly ascending ([TrimLineage]'s order), at most [MaxLineage] of them — so encode∘decode
-// stays the identity.
+// valid, strictly ascending in [MergeLineage]'s order — so encode∘decode stays the identity.
 func readCatalog(buf []byte) ([]Claim, bool) {
 	n, buf, ok := readUvarint(buf)
-	if !ok || n > uint64(len(buf)) || n > MaxLineage {
+	if !ok || n > uint64(len(buf)) {
 		return nil, false
 	}
 

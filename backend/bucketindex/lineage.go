@@ -104,6 +104,25 @@ func (l Lineage) ancestry(iv Interval) (Interval, []bool) {
 	return iv, via
 }
 
+// descendants is iv with every block derived from its rows, and which groups that derivation passes
+// through: each group whose claimed ancestry iv meets, and again from that group's members.
+func (l Lineage) descendants(iv Interval) (Interval, []bool) {
+	via := make([]bool, len(l))
+
+	for changed := true; changed; {
+		changed = false
+
+		for i, c := range l {
+			if !via[i] && meets(iv, c.Blocks) {
+				via[i], changed = true, true
+				iv = iv.Union(c.Group)
+			}
+		}
+	}
+
+	return iv, via
+}
+
 func meets(a, b Interval) bool { return intersect(a, b).Valid() }
 
 // intersect is the set of blocks both cover, unset when they share none.

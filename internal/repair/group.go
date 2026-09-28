@@ -8,14 +8,16 @@ import (
 
 // committable reports whether added may be committed over base on behalf of want: together they
 // answer it, and every group [groupsNeeded] names is complete.
-func committable(base []bucketindex.Entry, want bucketindex.Want, added []bucketindex.Entry) bool {
-	all := (&bucketindex.Index{Entries: slices.Concat(base, added)})
+func committable(
+	base []bucketindex.Entry, want bucketindex.Want, added []bucketindex.Entry, catalog []bucketindex.Claim,
+) bool {
+	all := &bucketindex.Index{Entries: slices.Concat(base, added), Catalog: catalog}
 	if _, ok := all.Satisfying(want); !ok {
 		return false
 	}
 
 	held := all.Covered()
-	for _, c := range groupsNeeded(base, want, added) {
+	for _, c := range groupsNeeded(base, want, added, catalog) {
 		if !held.Contains(c.Group) {
 			return false
 		}
@@ -30,12 +32,14 @@ func committable(base []bucketindex.Entry, want bucketindex.Want, added []bucket
 // ancestry overlaps what base holds: a lone member of one duplicates rows base already has, and only
 // the complete group retires them. A member of any other group holds rows base lacks, and commits
 // alone.
-func groupsNeeded(base []bucketindex.Entry, want bucketindex.Want, added []bucketindex.Entry) []bucketindex.Claim {
-	_, answered := (&bucketindex.Index{Entries: slices.Concat(base, added)}).Satisfying(want)
+func groupsNeeded(
+	base []bucketindex.Entry, want bucketindex.Want, added []bucketindex.Entry, catalog []bucketindex.Claim,
+) []bucketindex.Claim {
+	_, answered := (&bucketindex.Index{Entries: slices.Concat(base, added), Catalog: catalog}).Satisfying(want)
 
 	var held bucketindex.Interval
 	if answered {
-		held = (&bucketindex.Index{Entries: base}).Covered()
+		held = (&bucketindex.Index{Entries: base, Catalog: catalog}).Covered()
 	}
 
 	var out []bucketindex.Claim

@@ -24,7 +24,7 @@ func benchIndexWithLineage() *bucketindex.Index {
 		})
 	}
 
-	ix.Catalog = bucketindex.TrimLineage(ix.Catalog)
+	ix.Catalog = bucketindex.MergeLineage(ix.Catalog)
 
 	return ix
 }

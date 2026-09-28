@@ -25,7 +25,8 @@ import (
 // representations of some rows live is dropped. Either can change what the rest may commit, so
 // judgement and pruning repeat until neither drops a unit.
 func Admit(
-	ctx context.Context, live []bucketindex.Entry, units []Unit, open func(*Result) error, stats *bucketindex.RepairStats,
+	ctx context.Context, live []bucketindex.Entry, catalog []bucketindex.Claim, units []Unit,
+	open func(*Result) error, stats *bucketindex.RepairStats,
 ) ([]bucketindex.Entry, map[string]struct{}) {
 	have := make(map[string]struct{}, len(live))
 	for i := range live {
@@ -45,9 +46,9 @@ func Admit(
 	var p pruned
 
 	for {
-		in = settle(live, units, added, openErr, in)
+		in = settle(live, catalog, units, added, openErr, in)
 
-		p = prune(live, units, added, openErr, in)
+		p = prune(live, catalog, units, added, openErr, in)
 		if len(p.drop) == 0 {
 			break
 		}
@@ -152,7 +153,8 @@ func openAll(
 // settle returns which of the units in the commit takes: every unit is judged against live and every
 // other unit still in, all at once, until no verdict changes. A unit once out stays out.
 func settle(
-	live []bucketindex.Entry, units []Unit, added [][]bucketindex.Entry, openErr map[string]error, in []bool,
+	live []bucketindex.Entry, catalog []bucketindex.Claim, units []Unit, added [][]bucketindex.Entry,
+	openErr map[string]error, in []bool,
 ) []bool {
 	for {
 		verdict := make([]bool, len(units))
@@ -169,7 +171,7 @@ func settle(
 				}
 			}
 
-			verdict[k] = admissible(base, u, added[k], openErr)
+			verdict[k] = admissible(base, catalog, u, added[k], openErr)
 		}
 
 		if slices.Equal(verdict, in) {
@@ -182,8 +184,10 @@ func settle(
 
 // admissible reports whether u may be committed over base with its opened parts added: every part
 // that would not open was fetched for something the commit covers anyway, and u is [committable].
-func admissible(base []bucketindex.Entry, u Unit, added []bucketindex.Entry, openErr map[string]error) bool {
-	all := &bucketindex.Index{Entries: slices.Concat(base, added)}
+func admissible(
+	base []bucketindex.Entry, catalog []bucketindex.Claim, u Unit, added []bucketindex.Entry, openErr map[string]error,
+) bool {
+	all := &bucketindex.Index{Entries: slices.Concat(base, added), Catalog: catalog}
 
 	for i := range u {
 		if openErr[u[i].Entry.Prefix] == nil {
@@ -195,7 +199,7 @@ func admissible(base []bucketindex.Entry, u Unit, added []bucketindex.Entry, ope
 		}
 	}
 
-	return committable(base, u[0].Want, added)
+	return committable(base, u[0].Want, added, catalog)
 }
 
 // ConfirmLost advances evidence, the per-want count of consecutive definitive-absence conclusions,

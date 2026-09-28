@@ -19,8 +19,10 @@ type Host[P any] interface {
 	// Locks are the engine's state lock and its flush lock.
 	Locks() (state, flush sync.Locker)
 
-	// ObligationsLocked are the wants and holes a pass services.
-	ObligationsLocked() ([]bucketindex.Want, []bucketindex.Entry)
+	// ObligationsLocked are the wants and holes a pass services, and the lineage catalog
+	// ([bucketindex.Index.Catalog]) they are judged by: what relates a successor a peer found through
+	// an outer claim to the want it answers.
+	ObligationsLocked() ([]bucketindex.Want, []bucketindex.Entry, []bucketindex.Claim)
 	// LiveLocked is the engine's own live part set, and the entries it adopted from a rival writer.
 	LiveLocked() ([]P, []bucketindex.Entry)
 	// Identity is p's index identity.
@@ -129,7 +131,7 @@ func Drive[P any](ctx context.Context, s *State, cfg Config, h Host[P]) {
 	state, _ := h.Locks()
 
 	state.Lock()
-	wants, holes := h.ObligationsLocked()
+	wants, holes, catalog := h.ObligationsLocked()
 	live := entriesLocked(h)
 	state.Unlock()
 
@@ -142,6 +144,7 @@ func Drive[P any](ctx context.Context, s *State, cfg Config, h Host[P]) {
 	opened := make(map[string]P)
 	pass := Pass{
 		Fetcher: cfg.Fetcher,
+		Catalog: catalog,
 		Prefix:  cfg.Prefix,
 		Tried:   s.tried,
 		Hold: func(ctx context.Context, prefix string) bool {
@@ -211,7 +214,9 @@ func publish[P any](
 
 	state.Lock()
 
-	admitted, superseded := Admit(ctx, entriesLocked(h), plan.Units, func(r *Result) error {
+	_, _, catalog := h.ObligationsLocked()
+
+	admitted, superseded := Admit(ctx, entriesLocked(h), catalog, plan.Units, func(r *Result) error {
 		if r.Held {
 			return nil
 		}

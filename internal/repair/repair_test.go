@@ -360,7 +360,7 @@ func TestAdmit(t *testing.T) {
 		var stats bucketindex.RepairStats
 
 		open, opened := opener()
-		got, _ := Admit(ctx, nil, []Unit{unit("a", false, false, members...)}, open, &stats)
+		got, _ := Admit(ctx, nil, nil, []Unit{unit("a", false, false, members...)}, open, &stats)
 
 		assert.Equal(t, members, got)
 		assert.Equal(t, []string{"f00", "f01", "f02"}, *opened)
@@ -374,7 +374,7 @@ func TestAdmit(t *testing.T) {
 
 		plain := bucketindex.Entry{Prefix: "b", Blocks: bucketindex.Blocks(5)}
 		open, _ := opener("f02")
-		got, _ := Admit(ctx, nil, []Unit{
+		got, _ := Admit(ctx, nil, nil, []Unit{
 			unit("a", false, false, members...),
 			unit("b", false, false, plain),
 		}, open, &stats)
@@ -390,7 +390,7 @@ func TestAdmit(t *testing.T) {
 		var stats bucketindex.RepairStats
 
 		open, _ := opener()
-		got, _ := Admit(ctx, nil, []Unit{unit("a", false, false, members[:2]...)}, open, &stats)
+		got, _ := Admit(ctx, nil, nil, []Unit{unit("a", false, false, members[:2]...)}, open, &stats)
 
 		assert.Empty(t, got)
 		assert.Equal(t, int64(2), stats.Failed)
@@ -406,7 +406,7 @@ func TestAdmit(t *testing.T) {
 		phantom := bucketindex.Entry{Prefix: "x", Blocks: bucketindex.Blocks(2)}
 
 		open, opened := opener("x")
-		got, retired := Admit(ctx, live, []Unit{
+		got, retired := Admit(ctx, live, nil, []Unit{
 			unit("a", false, false, members...),
 			unit("b", false, true, succ),
 			unit("c", true, false, phantom),
@@ -447,7 +447,7 @@ func TestAdmit(t *testing.T) {
 					var stats bucketindex.RepairStats
 
 					open, _ := opener()
-					got, _ := Admit(ctx, tc.live, order, open, &stats)
+					got, _ := Admit(ctx, tc.live, nil, order, open, &stats)
 
 					assert.ElementsMatch(t, tc.want, got)
 					assert.Equal(t, int64(1), stats.Failed, "the part left out is counted")
@@ -463,7 +463,7 @@ func TestAdmit(t *testing.T) {
 
 		rival := bucketindex.Entry{Prefix: "r", Blocks: bucketindex.Range(0, 1, 2), Level: 1}
 		open, _ := opener()
-		got, _ := Admit(ctx, members[:1], []Unit{
+		got, _ := Admit(ctx, members[:1], nil, []Unit{
 			unit("a", false, false, members...),
 			unit("b", false, false, rival),
 		}, open, &stats)
@@ -501,7 +501,7 @@ func TestAdmit(t *testing.T) {
 				}
 
 				open, _ := opener()
-				got, retired := Admit(ctx, inner, []Unit{
+				got, retired := Admit(ctx, inner, nil, []Unit{
 					unit("a", false, false, members[:2]...),
 					unit("b", false, false, succ),
 				}, open, &stats)

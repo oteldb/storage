@@ -365,7 +365,10 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 	// The lineage of every group this commit publishes joins the catalog here, and reaches e.catalog
 	// only if the commit lands: a group run a lost attempt allocated may be handed to other parts.
 	ix.Catalog = slices.Clone(e.catalog)
-	ix.RecordLineage()
+	if over := ix.RecordLineage(); over > 0 && e.lineageWarned.CompareAndSwap(false, true) {
+		zctx.From(ctx).Warn("lineage catalog holds more reachable groups than its target; none is aged out",
+			zap.String("prefix", e.cfg.Prefix), zap.Int("over", over), zap.Int("target", bucketindex.MaxLineage))
+	}
 
 	// Past the horizon the node needs the wholesale adoption cluster/partsync performs, not
 	// part-by-part repair. The wants stay either way: each is the only record that its part is

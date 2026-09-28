@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/go-faster/errors"
@@ -249,13 +250,13 @@ func retainHeld(peer *bucketindex.Index, h held) *bucketindex.Index {
 // it. Lineage is facts about groups committed anywhere, so installing a peer's index must not forget
 // one: a want for one of its members may still need it.
 func keepLocalLineage(installed *bucketindex.Index, raw []byte, local *bucketindex.Index) (*bucketindex.Index, []byte) {
-	merged := bucketindex.MergeLineage(installed.Catalog, local.Catalog)
-	if len(merged) == len(installed.Catalog) {
+	withLocal := *installed
+	withLocal.Catalog = bucketindex.MergeLineage(installed.Catalog, local.Catalog)
+	withLocal.TrimCatalog()
+
+	if slices.EqualFunc(withLocal.Catalog, installed.Catalog, bucketindex.Claim.Equal) {
 		return installed, raw
 	}
-
-	withLocal := *installed
-	withLocal.Catalog = merged
 
 	return &withLocal, withLocal.AppendBinary(nil)
 }

@@ -211,15 +211,21 @@ a demonstration.
   again leaves the outer claim on no entry at all — yet a want for an inner member can be answered
   by a successor of the outer ancestry only through that claim. So every commit records the claims
   its entries and wants carry (`RecordLineage`), and `Index.Lineage` — the catalog plus the claims
-  still on entries and wants — is what `Satisfying`, `Discharging`, `TrimWants` and `TrimHoles`
-  (so `Revokes`) relate identities by. A claim is a fact about rows wherever it was recorded, so
+  still on entries and wants — is what every identity question is answered by: `Satisfying`,
+  `Discharging`, `TrimWants`, `TrimHoles` (so `Revokes`), joint coverage (`Covered`, which realizes
+  any group the lineage records, transitively) and `Missing` (the members of every group derived from
+  a want's rows that no later group consumed, so a member split again is asked for through its own
+  split). The shared repair pass carries the engine's catalog through every index it builds, down to
+  commit admission (`internal/repair`). A claim is a fact about rows wherever it was recorded, so
   lineages merge freely: a rebase unions the rival's catalog, a replica installing a peer's index
   keeps its own, and `cluster/partsync` answers a want with the wanting node's lineage beside the
   peer's (`SatisfyingWith`), since the peer may never have seen either split. Only a committed
   claim is recorded: a group run a lost CAS attempt allocated is handed out again, maybe to other
-  parts. The catalog is bounded like the tombstones (`MaxLineage` = `MaxRemovals`, lowest groups
-  first); a claim that ages out leaves a nested want where every nested want stood without the
-  catalog — answerable only while some entry still carries the outer claim.
+  parts. `MaxLineage` (= `MaxRemovals`) is a target, not a cap: `TrimCatalog` ages the lowest groups
+  out first but never one an outstanding want's or hole's ancestry passes through, or a live entry
+  carries, since dropping it could turn a want a successor still answers into absence and then a
+  hole. Only unreachable claims go; a catalog every claim of which is reached stays above the target,
+  and the engine warns once.
   **An entry carries its part's rollup layout** (`Entry.Rollup`, format v8; nil is unknown), so a
   writer checks a rival's layout without opening the rival's part (`engine/ARCH.md`, "Merge").
   **Allocation is the shard owner's alone, and scoped to its tenure**: `Index.NextBlock(term)` is one

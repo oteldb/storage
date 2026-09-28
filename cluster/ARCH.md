@@ -443,7 +443,9 @@ peer's `SatisfyingWith` it): a member of a group split again is subsumed by a su
 ancestry only through the outer claim, which a diverged peer may never have recorded. A local index
 that cannot be read makes every unanswered want of that pass an error rather than absence, since
 without its lineage an absence is not evidence. Installing a peer's index keeps the local catalog's
-groups beside the peer's (`bucketindex.MergeLineage`).
+groups beside the peer's (`bucketindex.MergeLineage`), trimmed against the installed index like any
+catalog (`TrimCatalog`), and installs the merged result whenever it differs from the peer's in
+contents — equal length says nothing once the merge aged a group out to make room.
 
 `accountsFor` deliberately stops short of `Satisfying`'s **split-group** case: a peer that holds a
 part's rows only jointly, spread across the fragments of a split, does not account for it and the

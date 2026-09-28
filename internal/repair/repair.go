@@ -52,6 +52,10 @@ type Unit []Result
 // Pass is one engine's repair pass.
 type Pass struct {
 	Fetcher bucketindex.PartFetcher
+	// Catalog is the engine's lineage catalog, which every identity question the pass asks is
+	// answered with: a successor a peer found through an outer claim satisfies the want only
+	// through that claim.
+	Catalog []bucketindex.Claim
 	// Hold opens the part at prefix from this node's own backend and reports whether it is there.
 	Hold func(ctx context.Context, prefix string) bool
 	// Prefix names the engine in logs.
@@ -85,7 +89,7 @@ func (p Pass) Run(
 ) Plan {
 	var plan Plan
 
-	ix := bucketindex.Index{Entries: entries}
+	ix := bucketindex.Index{Entries: entries, Catalog: p.Catalog}
 	pending := make([]Target, 0, len(wants)+len(holes))
 
 	for i := range wants {
@@ -341,17 +345,26 @@ func (u *unit) entries(ix *bucketindex.Index) []bucketindex.Entry {
 // rows the index already holds ([groupsNeeded]).
 func (u *unit) missing(ix *bucketindex.Index) []bucketindex.Block {
 	entries := u.entries(ix)
-	held := (&bucketindex.Index{Entries: entries}).Covered()
+	all := &bucketindex.Index{Entries: entries, Catalog: ix.Catalog}
+	held := all.Covered()
 	out := make(map[bucketindex.Block]struct{})
 
-	for _, c := range groupsNeeded(ix.Entries, u.results[0].Want, entries[len(ix.Entries):]) {
-		c.Group.Each(func(b bucketindex.Block) bool {
-			if _, asked := u.asked[b]; !asked && !held.Contains(bucketindex.Single(b)) {
-				out[b] = struct{}{}
-			}
+	ask := func(b bucketindex.Block) bool {
+		if _, asked := u.asked[b]; !asked && !held.Contains(bucketindex.Single(b)) {
+			out[b] = struct{}{}
+		}
 
-			return true
-		})
+		return true
+	}
+
+	for _, c := range groupsNeeded(ix.Entries, u.results[0].Want, entries[len(ix.Entries):], ix.Catalog) {
+		c.Group.Each(ask)
+	}
+
+	// A want answered jointly across groups split again: the members every group derived from its
+	// rows still lacks, the outer ones included until a peer's answer names their own split.
+	for _, b := range all.Missing(u.results[0].Want) {
+		ask(b)
 	}
 
 	return slices.SortedFunc(maps.Keys(out), bucketindex.Block.Compare)
@@ -381,12 +394,13 @@ func (u *unit) take(a attempt) {
 // answer satisfies it, because a member's absence says nothing about a part that exists.
 func (u *unit) whole(ix *bucketindex.Index) bool {
 	entries := u.entries(ix)
-	if committable(ix.Entries, u.results[0].Want, entries[len(ix.Entries):]) {
+	if committable(ix.Entries, u.results[0].Want, entries[len(ix.Entries):], ix.Catalog) {
 		return true
 	}
 
 	target := u.results[0]
-	if _, own := (&bucketindex.Index{Entries: []bucketindex.Entry{target.Entry}}).Satisfying(target.Want); own ||
+	own := &bucketindex.Index{Entries: []bucketindex.Entry{target.Entry}, Catalog: ix.Catalog}
+	if _, ok := own.Satisfying(target.Want); ok ||
 		u.worst == outcomeNone {
 		u.worst = outcomeFailed
 	}
