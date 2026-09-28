@@ -121,7 +121,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 
 	cohorts := mergeCohorts(src, readable)
 	if len(cohorts) > 1 && e.cohortsWarned.CompareAndSwap(false, true) {
-		zctx.From(ctx).Warn("parts record different downsample aggregations; each merges only with its own",
+		zctx.From(ctx).Warn("parts record downsample layouts that do not nest; each set merges only with its own",
 			zap.String("prefix", e.cfg.Prefix), zap.Int("cohorts", len(cohorts)))
 	}
 
@@ -260,8 +260,8 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		e.mu.Unlock()
 		e.reclaimRetired(ctx)
 
-		zctx.From(ctx).Warn("merge output dropped: a rival writer committed a part recording another "+
-			"downsample aggregation; the next merge replans with it",
+		zctx.From(ctx).Warn("merge output dropped: a rival writer committed a part recording a downsample "+
+			"layout that does not nest with this merge's; the next merge replans with it",
 			zap.String("prefix", e.cfg.Prefix))
 
 		return mergeResult{parts: dropped}, nil
@@ -283,36 +283,30 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, nil
 }
 
-// errRollupConflict aborts a merge whose commit would put a second Agg in the index.
-var errRollupConflict = errors.New("a rival writer committed a part recording another downsample aggregation")
+// errRollupConflict aborts a merge whose commit would put a layout in the index that does not nest
+// with one already there.
+var errRollupConflict = errors.New("a rival writer committed a part recording a downsample layout that does not nest with this merge's")
 
 // rollupGuard is the check a merge's commit runs after each rebase onto a rival writer's index: a
-// part the rival committed that records Aggs neither the merge's readable parts nor its output
-// record means the commit would hold two Aggs, which no later merge can fold. The planning never saw
-// that part, so the merge is dropped and the next one replans with it. A merge whose output records
-// no Agg cannot introduce a conflict. Called with e.mu held.
+// part the rival committed that the merge's planning never saw, and whose recorded layout does not
+// nest with the output's ([tiersNest]: another Agg, or a grid that does not nest), means the commit
+// would leave the index holding layouts no later merge can combine. The merge is dropped and the next
+// one replans with that part. A merge whose output records no tier cannot introduce a conflict.
+// Called with e.mu held.
 func rollupGuard(readable []*part, marker *block.Rollup, e *Engine) func() error {
-	var out aggMask
-	if marker != nil {
-		for _, t := range marker.Tiers {
-			if t.Interval > 0 {
-				out |= 1 << t.Agg
-			}
-		}
-	}
-
-	if out == 0 {
+	out, _ := appliedRollup(marker)
+	if !activeTiers(out) {
 		return nil
 	}
 
-	known := map[aggMask]bool{out: true}
+	planned := make(map[string]struct{}, len(readable))
 	for _, p := range readable {
-		known[maskOf(p.rollup)] = true
+		planned[p.prefix] = struct{}{}
 	}
 
 	return func() error {
 		for _, p := range e.foreignParts {
-			if m := maskOf(p.rollup); m != 0 && !known[m] {
+			if _, ok := planned[p.prefix]; !ok && !layoutsNest(out, p.rollup) {
 				return errRollupConflict
 			}
 		}

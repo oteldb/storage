@@ -2,6 +2,7 @@ package engine_test
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -174,4 +175,127 @@ func TestAdoptedDataClosesOwnedBucket(t *testing.T) {
 
 	require.NoError(t, a.MergeWith(ctx, engine.MergeOptions{}))
 	assert.Equal(t, 1, a.PartCount(), "the merge takes it")
+}
+
+// TestNonNestingGridsStayApart: two writers roll one Agg on grids that do not nest, 7m Sum and 1h
+// Sum, and a store ends up holding both. The rebase guard keeps one engine from committing that,
+// so the second writer's entries are grafted into the first's index here, as a writer that never
+// saw the first would have committed them. After a restart a fresh engine owns every part. Merging
+// the 7m representatives with the 1h ones would coarsen them into hours by their timestamps, moving
+// the minutes of a 7m bucket that straddles an hour into the wrong hour. Forced merges must leave
+// the 7m series exactly as it read before them, and still compact each grid's parts.
+func TestNonNestingGridsStayApart(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := backend.Memory()
+
+	const otherPrefix = "other/metrics"
+
+	a := engine.New(engine.Config{Backend: be, Prefix: sharedPrefix, WriterID: "a"})
+	require.NoError(t, a.LoadParts(ctx))
+	b := engine.New(engine.Config{Backend: be, Prefix: otherPrefix, WriterID: "b"})
+	require.NoError(t, b.LoadParts(ctx))
+
+	minute, hour, day := int64(time.Minute), int64(time.Hour), 24*int64(time.Hour)
+	tier := func(interval int64) engine.MergeOptions {
+		return engine.MergeOptions{Downsample: []engine.DownsampleTier{{Before: 1 << 62, Interval: interval, Agg: signal.AggSum}}}
+	}
+
+	roll := func(e *engine.Engine, job string, from int64, interval int64) {
+		for h := from; h < from+2; h++ {
+			for m := range int64(60) {
+				mustAppend(t, e, mkSeries("job", job), h*hour+m*minute, 1)
+			}
+
+			require.NoError(t, e.Flush(ctx))
+			require.NoError(t, e.MergeWith(ctx, tier(interval)))
+		}
+	}
+
+	roll(a, "api", 0, 7*minute)
+	roll(b, "web", 2, hour)
+
+	mustAppend(t, a, mkSeries("job", "api"), 5*day, 1)
+	require.NoError(t, a.Flush(ctx))
+
+	key := sharedPrefix + "/" + bucketindex.Object
+	ix, version, err := bucketindex.LoadVersioned(ctx, be, key)
+	require.NoError(t, err)
+
+	other, err := bucketindex.Load(ctx, be, otherPrefix+"/"+bucketindex.Object)
+	require.NoError(t, err)
+
+	for _, ent := range other.Entries {
+		ix.Add(ent)
+	}
+
+	_, err = ix.Save(ctx, be, key, version)
+	require.NoError(t, err)
+
+	api := fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{eqMatcher("job", "api")}}
+
+	r := engine.New(engine.Config{Backend: be, Prefix: sharedPrefix})
+	require.NoError(t, r.LoadParts(ctx))
+	require.Equal(t, 5, r.PartCount(), "two parts per grid and the raw anchor")
+
+	before := fetchAll(t, r, api)
+	require.Len(t, before, 1)
+	require.Contains(t, before[0].Timestamps, 56*minute, "a 7m bucket straddles the hour")
+
+	for range 8 {
+		require.NoError(t, r.MergeWith(ctx, engine.MergeOptions{Force: true}))
+	}
+
+	after := fetchAll(t, r, api)
+	require.Len(t, after, 1)
+
+	// The first two hours: the anchor, raw in the 7m cohort, is rolled by its recorded tier.
+	n := slices.Index(before[0].Timestamps, 5*day)
+	require.Positive(t, n)
+	require.Greater(t, len(after[0].Timestamps), n)
+	assert.Equal(t, before[0].Timestamps[:n], after[0].Timestamps[:n], "the 7m buckets keep their attribution")
+	assert.Equal(t, before[0].Values[:n], after[0].Values[:n])
+	assert.Equal(t, 3, r.PartCount(), "each grid compacts on its own, beside the anchor's day")
+}
+
+// TestRebaseNeverCommitsTwoGrids is [TestRebaseNeverCommitsTwoAggs] for one Agg on grids that do not
+// nest: writer a commits a 7m Sum rollup that b has not seen when it rolls its own part with 1h Sum.
+// b's commit rebases onto a's index and must not land beside it.
+func TestRebaseNeverCommitsTwoGrids(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := backend.Memory()
+	a, b, _, _ := rivals(t, be)
+
+	minute, hour := int64(time.Minute), int64(time.Hour)
+	tier := func(interval int64) engine.MergeOptions {
+		return engine.MergeOptions{Downsample: []engine.DownsampleTier{{Before: 1 << 62, Interval: interval, Agg: signal.AggSum}}}
+	}
+
+	for m := range int64(60) {
+		mustAppend(t, b, mkSeries("job", "web"), hour+m*minute, 1)
+		mustAppend(t, a, mkSeries("job", "api"), m*minute, 1)
+	}
+
+	require.NoError(t, b.Flush(ctx))
+	require.NoError(t, a.Flush(ctx))
+	require.NoError(t, a.MergeWith(ctx, tier(7*minute)))
+	require.NoError(t, b.MergeWith(ctx, tier(hour)))
+
+	r := engine.New(engine.Config{Backend: be, Prefix: sharedPrefix})
+	require.NoError(t, r.LoadParts(ctx))
+
+	intervals := r.RecordedIntervals()
+	for _, x := range intervals {
+		for _, y := range intervals {
+			require.True(t, x%y == 0 || y%x == 0, "recorded grids %v nest", intervals)
+		}
+	}
+
+	for _, job := range []string{"api", "web"} {
+		got := fetchAll(t, r, fetch.Request{Start: 0, End: 1 << 62, Matchers: []fetch.Matcher{eqMatcher("job", job)}})
+		require.Len(t, got, 1, "nothing is lost: %s", job)
+	}
 }

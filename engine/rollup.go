@@ -202,34 +202,12 @@ func compatibleTiers(src []*part, tiers []DownsampleTier) (kept, dropped []Downs
 		return tiers, nil
 	}
 
-	var (
-		intervals []int64
-		aggs      []signal.Aggregation
-	)
-
+	var recorded []DownsampleTier
 	for _, p := range src {
-		for _, t := range p.rollup {
-			if !slices.Contains(intervals, t.Interval) {
-				intervals = append(intervals, t.Interval)
-			}
-
-			if !slices.Contains(aggs, t.Agg) {
-				aggs = append(aggs, t.Agg)
-			}
-		}
+		recorded = append(recorded, p.rollup...)
 	}
 
-	fits := func(t DownsampleTier) bool {
-		if t.Interval <= 0 {
-			return true
-		}
-
-		nests := !slices.ContainsFunc(intervals, func(iv int64) bool {
-			return t.Interval%iv != 0 && iv%t.Interval != 0
-		})
-
-		return nests && !slices.ContainsFunc(aggs, func(a signal.Aggregation) bool { return a != t.Agg })
-	}
+	fits := func(t DownsampleTier) bool { return t.Interval <= 0 || fitsLayout(recorded, t) }
 
 	if !slices.ContainsFunc(tiers, func(t DownsampleTier) bool { return !fits(t) }) {
 		return tiers, nil
@@ -246,91 +224,104 @@ func compatibleTiers(src []*part, tiers []DownsampleTier) (kept, dropped []Downs
 	return kept, dropped
 }
 
-// aggMask is the set of Aggs a layout records, one bit per [signal.Aggregation].
-type aggMask uint16
+// tiersNest reports whether two active tiers can share one layout: they roll up by one Agg and one
+// Interval divides the other. It is the one definition of compatible layouts: the policy is checked
+// against the history by it ([compatibleTiers]), cohorts are formed by it ([mergeCohorts]), and a
+// commit's rebase guard checks adopted parts by it.
+func tiersNest(a, b DownsampleTier) bool {
+	return a.Agg == b.Agg && (a.Interval%b.Interval == 0 || b.Interval%a.Interval == 0)
+}
 
-func maskOf(tiers []DownsampleTier) aggMask {
-	var m aggMask
+// fitsLayout reports whether active tier t nests with every active tier of layout.
+func fitsLayout(layout []DownsampleTier, t DownsampleTier) bool {
+	return !slices.ContainsFunc(layout, func(o DownsampleTier) bool { return o.Interval > 0 && !tiersNest(o, t) })
+}
 
-	for _, t := range tiers {
-		if t.Interval > 0 {
-			m |= 1 << t.Agg
+// layoutsNest reports whether every active tier of b nests with every one of a and of b itself.
+func layoutsNest(a, b []DownsampleTier) bool {
+	for _, t := range b {
+		if t.Interval > 0 && (!fitsLayout(a, t) || !fitsLayout(b, t)) {
+			return false
 		}
 	}
 
-	return m
+	return true
 }
 
-// mergeCohort is a set of this engine's parts a merge may combine: those recording one set of Aggs
-// (mask), with history every readable part, adopted ones included, recording the same.
+// mergeCohort is a set of this engine's parts a merge may combine: those whose recorded layouts nest
+// with each other ([tiersNest]), with history every readable part in the cohort, adopted ones
+// included, and layout the tiers they record.
 type mergeCohort struct {
-	mask    aggMask
+	layout  []DownsampleTier
 	parts   []*part
 	history []*part
 }
 
-// mergeCohorts partitions own, the parts this engine may merge, by the Aggs they record. The engine
-// never records a second Agg while a readable part records one ([compatibleTiers], and the commit
-// guard in [Engine.merge]), so there is normally one cohort. Parts that disagree anyway, written by
-// nodes running different policies for one tenant, cannot be merged into one marker without
-// re-aggregating one side by the other's Agg; each cohort merges only with itself, every output
-// records one Agg, and every cohort is still compacted.
+// mergeCohorts partitions own, the parts this engine may merge, into sets whose recorded layouts nest.
+// One writer never records a layout that does not nest with a readable part's ([compatibleTiers], and
+// the commit guard in [Engine.merge]), so there is normally one cohort. Parts that disagree anyway,
+// written by writers running different policies for one tenant, cannot be merged: a second Agg
+// would re-aggregate one side by the other's, and a grid that does not nest (7m beside 1h) would
+// coarsen a 7m bucket straddling an hour into one hour. Each cohort merges only with itself, every
+// output records one nesting layout, and every cohort is still compacted.
 //
-// Raw and unmarked parts join the primary cohort, the one recording the Aggs of the oldest marked
-// readable part (by minTime, then prefix): a late raw sample then rolls like the data that was
-// rolled first, whichever node wrote it. The primary cohort comes first, the rest by mask.
+// Marked readable parts are assigned oldest first (by minTime, then prefix), each to the first cohort
+// it nests with, so the assignment depends on the parts alone. Raw and unmarked parts join the
+// primary cohort, the oldest part's: a late raw sample then rolls like the data that was rolled
+// first, whichever writer wrote it. The primary cohort comes first, the rest in the order formed.
 func mergeCohorts(own, readable []*part) []mergeCohort {
-	var first *part
+	marked := make([]*part, 0, len(readable))
 
 	for _, p := range readable {
-		if maskOf(p.rollup) == 0 {
-			continue
-		}
-
-		if first == nil || p.minTime < first.minTime || p.minTime == first.minTime && p.prefix < first.prefix {
-			first = p
+		if activeTiers(p.rollup) {
+			marked = append(marked, p)
 		}
 	}
 
-	var primary aggMask
-	if first != nil {
-		primary = maskOf(first.rollup)
-	}
+	slices.SortFunc(marked, func(a, b *part) int {
+		if c := cmp.Compare(a.minTime, b.minTime); c != 0 {
+			return c
+		}
 
-	cohorts := []mergeCohort{{mask: primary}}
-	at := func(m aggMask) *mergeCohort {
-		for i := range cohorts {
-			if cohorts[i].mask == m {
-				return &cohorts[i]
+		return cmp.Compare(a.prefix, b.prefix)
+	})
+
+	var cohorts []mergeCohort
+
+	of := make(map[*part]int, len(marked))
+
+	for _, p := range marked {
+		i := slices.IndexFunc(cohorts, func(c mergeCohort) bool { return layoutsNest(c.layout, p.rollup) })
+		if i < 0 {
+			i = len(cohorts)
+			cohorts = append(cohorts, mergeCohort{})
+		}
+
+		c := &cohorts[i]
+		for _, t := range p.rollup {
+			if t.Interval > 0 && !slices.Contains(c.layout, t) {
+				c.layout = append(c.layout, t)
 			}
 		}
 
-		cohorts = append(cohorts, mergeCohort{mask: m})
+		c.history = append(c.history, p)
+		of[p] = i
+	}
 
-		return &cohorts[len(cohorts)-1]
+	if len(cohorts) == 0 {
+		cohorts = append(cohorts, mergeCohort{})
 	}
 
 	for _, p := range own {
-		m := maskOf(p.rollup)
-		if m == 0 {
-			m = primary
+		i, ok := of[p]
+		if !ok {
+			i = 0
 		}
 
-		c := at(m)
-		c.parts = append(c.parts, p)
+		cohorts[i].parts = append(cohorts[i].parts, p)
 	}
 
-	for _, p := range readable {
-		if m := maskOf(p.rollup); m != 0 {
-			c := at(m)
-			c.history = append(c.history, p)
-		}
-	}
-
-	cohorts = slices.DeleteFunc(cohorts, func(c mergeCohort) bool { return len(c.parts) == 0 })
-	slices.SortStableFunc(cohorts[min(1, len(cohorts)):], func(a, b mergeCohort) int { return cmp.Compare(a.mask, b.mask) })
-
-	return cohorts
+	return slices.DeleteFunc(cohorts, func(c mergeCohort) bool { return len(c.parts) == 0 })
 }
 
 // cohortRun is the selection one merge makes: the first cohort, from start round-robin, whose own

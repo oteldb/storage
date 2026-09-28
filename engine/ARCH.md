@@ -640,30 +640,38 @@ Every merge also checks it against the tiers the live parts record (`resolvePoli
     rolled with is wrong. A 1h Count over 1m Sum representatives counts minutes, not samples.
 - A marker cannot confine a tier to part of its range, so there is no partial application.
 
-**One Agg on disk.** One writer never records a second Agg while a readable part records one:
+**One nesting layout on disk.** Two layouts are compatible when every pair of their tiers rolls up by
+one Agg and one Interval divides the other (`tiersNest`). That one predicate decides three things:
+the policy against the history (`compatibleTiers`), the merge cohorts (`mergeCohorts`), and a
+commit's rebase guard (`rollupGuard`). One writer never records a layout incompatible with a
+readable part's:
 - The history the policy is checked against is every readable part, including the parts adopted
   from a rival writer's index.
-- A rival can still commit a part recording another Agg after this writer planned its merge. That
-  part only appears when the commit loses the CAS and rebases onto the rival's index. After every
-  rebase the commit re-checks the adopted parts (`rollupGuard`). If one records an Agg that neither
-  the planned readable set nor the output records, the output is dropped, its objects are reclaimed
-  like any uncommitted part, and the next merge replans with the adopted part in its history.
-- Whichever writer commits second backs off, so the index never gains a second Agg from a merge.
+- A rival can still commit an incompatible part after this writer planned its merge: another Agg, or
+  a grid that does not nest (7m beside 1h). That part only appears when the commit loses the CAS and
+  rebases onto the rival's index. After every rebase the commit re-checks the parts it adopted that
+  the planning never saw. If one does not nest with the output, the output is dropped, its objects
+  are reclaimed like any uncommitted part, and the next merge replans with the adopted part in its
+  history.
+- Whichever writer commits second backs off, so a merge never adds an incompatible layout to the
+  index.
 
 Parts can still disagree when independent writers run different policies for one tenant, for
-example nodes during a policy rollout, or in a split brain. Merging them would re-aggregate one side
-by the other's Agg, so merges keep them apart:
-- Each set of parts recording one Agg is a cohort (`mergeCohorts`). A cohort merges only with
-  itself, so every output records one Agg.
+example nodes during a policy rollout, in a split brain, or under releases without the guard. Merging
+them would be wrong either way. A second Agg re-aggregates one side by the other's. A grid that does
+not nest coarsens a 7m bucket straddling an hour wholly into one hour, moving minutes of data. So
+merges keep them apart:
+- Marked readable parts are assigned oldest first (by `minTime`, then prefix), each to the first
+  cohort whose layout it nests with (`mergeCohorts`), so the assignment depends on the parts alone.
+  A cohort merges only with itself, so every output records one nesting layout.
 - Cohorts are scheduled round-robin, background, idle-waiver and `Force` alike, so every cohort is
   still compacted (`cohortRun`).
 - The ladder's still-filling bucket is the one holding the newest readable sample: of all the
   parts, not one cohort's, and of adopted parts too. A cohort that stops receiving data, or a writer
   that stops ingesting while a rival goes on, would otherwise keep its own newest bucket open for
   ever.
-- Raw and unmarked parts join the primary cohort, the one recording the Aggs of the oldest marked
-  readable part (by `minTime`, then prefix). A late raw sample then rolls like the data that was
-  rolled first, whichever node wrote it.
+- Raw and unmarked parts join the primary cohort, the oldest marked part's, and roll by its layout.
+  A late raw sample then rolls like the data that was rolled first, whichever node wrote it.
 
 A read over disagreeing parts can meet representatives of two Aggs at one timestamp. They cannot be
 combined, so the read folds only those of the smallest Agg (by the `signal.Aggregation` value). That
@@ -675,8 +683,17 @@ meanwhile. It is not silent:
 - the first is logged once.
 
 The flag does not cross the cluster fan-out frame; the owner's counter and log record it. Operators
-must not run nodes with different downsampling Aggs for one tenant, and the counter shows when they
-do.
+must not run nodes with different downsampling policies for one tenant, and the counter shows when
+the Aggs differ.
+
+Representatives of one Agg on grids that do not nest also meet on reads, wherever their bucket starts
+coincide (every 7h for 7m and 1h). That tie folds and is not flagged, because folding one Agg loses
+nothing:
+- Sum and Count add, and Avg weights by population, so every total and weight is kept.
+- First, Last, Min and Max representatives are real samples, which tie only as copies of one sample.
+
+The read point then stands for both buckets. A merge never persists that fold, since the cohorts
+keep the parts apart.
 
 Anchoring is paid in the ts column, measured on a 1m rollup of 15s scrapes: +0.01 B/row with no scrape
 jitter, +1.1 at ±5ms, +2.0 at ±50ms, against 1.1–6.8 B/row for the value column. The sf column of an

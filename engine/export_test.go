@@ -152,3 +152,21 @@ func (e *Engine) RecordedAggs() []signal.Aggregation {
 
 	return out
 }
+
+// RecordedIntervals is every distinct Interval a readable part's rollup marker records.
+func (e *Engine) RecordedIntervals() []int64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	var out []int64
+
+	for _, p := range e.readablePartsLocked() {
+		for _, t := range p.rollup {
+			if t.Interval > 0 && !slices.Contains(out, t.Interval) {
+				out = append(out, t.Interval)
+			}
+		}
+	}
+
+	return out
+}
