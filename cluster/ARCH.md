@@ -437,6 +437,14 @@ while the deletion rule below withholds the bytes — unreclaimable at the same 
 what keeps this from resurrecting compacted parts forever; it is the same evidence a repair accepts
 for a want (`Index.Satisfying`), and it does not depend on tombstones, which are bounded and age out.
 
+The subsumption is judged over **both sides' lineage** — the peer index's catalog and claims, and
+the local one's — and so is a repair fetch's answer (`FetchWants` reads the local index and asks each
+peer's `SatisfyingWith` it): a member of a group split again is subsumed by a successor of the outer
+ancestry only through the outer claim, which a diverged peer may never have recorded. A local index
+that cannot be read makes every unanswered want of that pass an error rather than absence, since
+without its lineage an absence is not evidence. Installing a peer's index keeps the local catalog's
+groups beside the peer's (`bucketindex.MergeLineage`).
+
 `accountsFor` deliberately stops short of `Satisfying`'s **split-group** case: a peer that holds a
 part's rows only jointly, spread across the fragments of a split, does not account for it and the
 local copy is kept. Dropping a part on a joint claim would mean trusting that every member of the

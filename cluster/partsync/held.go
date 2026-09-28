@@ -124,14 +124,18 @@ type peerAccount struct {
 	stated bool
 	// live are its data entries, the successors an absence can be explained by.
 	live []bucketindex.Entry
+	// lineage relates live to what they subsume: the index's own claims and catalog, and the other
+	// side's, since either may be the only one that saw a group split.
+	lineage bucketindex.Lineage
 }
 
-func accountOf(ix *bucketindex.Index) peerAccount {
+func accountOf(ix *bucketindex.Index, other bucketindex.Lineage) peerAccount {
 	a := peerAccount{
 		present: make(map[string]struct{}, len(ix.Entries)),
 		claimed: make(map[string]struct{}, len(ix.Wanted)),
 		removed: ix.Removals(),
 		stated:  ix.RecordsRemovals(),
+		lineage: ix.Lineage().With(other...),
 	}
 
 	for i := range ix.Entries {
@@ -183,8 +187,10 @@ func (a peerAccount) accountsFor(e bucketindex.Entry) bool {
 }
 
 func (a peerAccount) supersedes(e bucketindex.Entry) bool {
+	lineage := a.lineage.With(e.Claim)
+
 	for i := range a.live {
-		if a.live[i].Supersedes(e) {
+		if lineage.Subsumes(a.live[i], e) {
 			return true
 		}
 	}
@@ -237,6 +243,21 @@ func retainHeld(peer *bucketindex.Index, h held) *bucketindex.Index {
 	}
 
 	return &ix
+}
+
+// keepLocalLineage is the index to install with the groups only the local catalog recorded added to
+// it. Lineage is facts about groups committed anywhere, so installing a peer's index must not forget
+// one: a want for one of its members may still need it.
+func keepLocalLineage(installed *bucketindex.Index, raw []byte, local *bucketindex.Index) (*bucketindex.Index, []byte) {
+	merged := bucketindex.MergeLineage(installed.Catalog, local.Catalog)
+	if len(merged) == len(installed.Catalog) {
+		return installed, raw
+	}
+
+	withLocal := *installed
+	withLocal.Catalog = merged
+
+	return &withLocal, withLocal.AppendBinary(nil)
 }
 
 // manifestParts is the parts a listing shows a complete copy of.

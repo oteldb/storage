@@ -59,18 +59,22 @@ func (ix *Index) Holes() []Entry {
 // ClickHouse, which checks non-existence on every replica in one transaction, an owner here can
 // acknowledge a loss while a peer still holds the data. So a hole must never block the real part:
 // it is replaced by it.
-func Revokes(e, h Entry) bool {
+func Revokes(e, h Entry) bool { return revokes(e, h, nil) }
+
+func revokes(e, h Entry, lineage Lineage) bool {
 	if !e.Data() || !h.Hole {
 		return false
 	}
 
-	return e.Prefix == h.Prefix || e.Supersedes(h)
+	return e.Prefix == h.Prefix || lineage.With(h.Claim).Subsumes(e, h)
 }
 
-// TrimHoles drops the holes that live revokes, returning what remains. It runs on every commit, so
-// any path that brings the data back — a repair fetch, a peer's entry adopted under CAS, a merge —
-// revokes the hole as a side effect of committing the part.
-func TrimHoles(holes, live []Entry) []Entry {
+// TrimHoles drops the holes that live revokes, related by the claims live carries and the index's
+// catalog, returning what remains. It runs on every commit, so any path that brings the data back —
+// a repair fetch, a peer's entry adopted under CAS, a merge — revokes the hole as a side effect of
+// committing the part.
+func TrimHoles(holes, live []Entry, catalog ...Claim) []Entry {
+	lineage := (&Index{Entries: live, Catalog: catalog}).Lineage()
 	out := holes[:0]
 
 	for j := range holes {
@@ -78,7 +82,7 @@ func TrimHoles(holes, live []Entry) []Entry {
 		revoked := false
 
 		for i := range live {
-			if Revokes(live[i], *h) {
+			if revokes(live[i], *h, lineage) {
 				revoked = true
 
 				break

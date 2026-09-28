@@ -102,15 +102,18 @@ func (ix *Index) Wants() map[string]Want {
 }
 
 // TrimWants drops the wants already discharged — those naming a part the index holds again, or one
-// a live part supersedes — and nothing else: an outstanding want is the only record that a part is
-// owed, so no count trims it (see [MaxWants]).
-func TrimWants(wants []Want, live []Entry) []Want {
-	ix := Index{Entries: live}
+// a live part supersedes, related by the claims live carries and the index's catalog — and nothing
+// else: an outstanding want is the only record that a part is owed, so no count trims it (see
+// [MaxWants]).
+func TrimWants(wants []Want, live []Entry, catalog ...Claim) []Want {
+	ix := Index{Entries: live, Catalog: catalog}
+	lineage := ix.Lineage()
+	all := func(Entry) bool { return true }
 
 	out := wants[:0]
 	for i := range wants {
 		w := &wants[i]
-		if _, ok := ix.Discharging(*w); ok {
+		if _, ok := ix.satisfying(*w, all, lineage); ok {
 			continue
 		}
 

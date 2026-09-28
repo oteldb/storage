@@ -690,8 +690,17 @@ readable part's:
   rebases onto the rival's index. After every rebase the commit re-checks the parts it adopted that
   the planning never saw. If one does not nest with the output, the output is dropped, its objects
   are reclaimed like any uncommitted part, and the next merge replans with the adopted part in its
-  history. An adopted part that does not open escapes the check, since its layout lives only in its
-  manifest, so a rebase that cannot read it can commit an incompatible output beside it (#745).
+  history.
+- An adopted part that does not open is checked by the layout its index entry records
+  (`bucketindex.Entry.Rollup`): the guard reads it from the entry (`foreignLayoutLocked`), and
+  planning sees it through a reader-less stand-in carrying only prefix, time range and layout
+  (`unopenedLayoutsLocked`), which only the layout checks ever read. Every commit writes its own
+  parts' layouts from their manifests, and fills in an adopted entry's once its part opens
+  (`fillRollup`), so an entry written before the index carried layouts is completed by the first
+  writer that reads the part. An entry whose layout is still unknown and whose part does not open is
+  legacy and counts as raw, like a part without a marker: it constrains nothing, and never aborts a
+  commit. Aborting would stall that merge until the part became readable, since nothing else can
+  fill the layout in; the cost is the check against a part only a pre-v8 index can leave unknown.
 - Whichever writer commits second backs off, so a merge never adds an incompatible layout to the
   index.
 

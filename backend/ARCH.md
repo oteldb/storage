@@ -206,6 +206,22 @@ a demonstration.
   short of reading the rows says how. A part covering only some of a group's claim therefore
   overlaps every member while replacing none; no single-part rule resolves it, and repair refuses
   to publish one beside the other (`engine/ARCH.md`, "Repair").
+  **A group's claim outlives its members in the lineage catalog** (`Index.Catalog`, format v8). A
+  merge that consumes a whole group folds the claim into its output's blocks, and a group split
+  again leaves the outer claim on no entry at all — yet a want for an inner member can be answered
+  by a successor of the outer ancestry only through that claim. So every commit records the claims
+  its entries and wants carry (`RecordLineage`), and `Index.Lineage` — the catalog plus the claims
+  still on entries and wants — is what `Satisfying`, `Discharging`, `TrimWants` and `TrimHoles`
+  (so `Revokes`) relate identities by. A claim is a fact about rows wherever it was recorded, so
+  lineages merge freely: a rebase unions the rival's catalog, a replica installing a peer's index
+  keeps its own, and `cluster/partsync` answers a want with the wanting node's lineage beside the
+  peer's (`SatisfyingWith`), since the peer may never have seen either split. Only a committed
+  claim is recorded: a group run a lost CAS attempt allocated is handed out again, maybe to other
+  parts. The catalog is bounded like the tombstones (`MaxLineage` = `MaxRemovals`, lowest groups
+  first); a claim that ages out leaves a nested want where every nested want stood without the
+  catalog — answerable only while some entry still carries the outer claim.
+  **An entry carries its part's rollup layout** (`Entry.Rollup`, format v8; nil is unknown), so a
+  writer checks a rival's layout without opening the rival's part (`engine/ARCH.md`, "Merge").
   **Allocation is the shard owner's alone, and scoped to its tenure**: `Index.NextBlock(term)` is one
   above `AllocatedBlocks`, the persisted high-water mark, and above every block the live entries,
   wants and group runs still name — within `term`, starting at `(term, 1)` for a tenure the index has
@@ -299,12 +315,17 @@ a demonstration.
   is a fact, not a level: a per-node gauge that a restart or a successful repair clears erases the
   only record that a range of a shard was ever acknowledged as gone. It follows ClickHouse's
   `/lost_part_count`.
-- **Format v7 is a hard read break.** `Decode` rejects any version above the one it knows, so
-  reading is backward compatible (v1–v6 still decode, unset fields ordering below everything a
-  writer produces) but **writing is not**: a node on pre-v7 code fails on the first v7 index it
+- **Format v8 is a hard read break.** `Decode` rejects any version above the one it knows, so
+  reading is backward compatible (v1–v7 still decode, unset fields ordering below everything a
+  writer produces) but **writing is not**: a node on pre-v8 code fails on the first v8 index it
   reads. Every node that reads a given index must be upgraded together. The path differs by
   deployment and both matter — on a shared backend every node reads the same index object, and in
   `PrivateBackend` mode `cluster/partsync` reads its peers' indexes.
+  **A v7 index knows no layout and no catalog.** Every entry's layout is unknown until a writer
+  opens the part and its next commit records the manifest's; the first v8 commit catalogs the claims
+  its entries and wants still carry. A layout rides behind a flag bit in the entry's flag word, so
+  an unknown one costs nothing; the catalog is canonical like the rest — sorted, deduplicated,
+  bounded — and `Decode` rejects any other form.
   **A v6 index is term 0 throughout**: its blocks, its entries' and wants' writing terms and its
   high-water mark. A clustered tenure then allocates from `(term, 1)` above all of it, and a writer
   with no cluster continues term 0's numbering where v6 left it. An interval's lowest block number

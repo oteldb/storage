@@ -47,6 +47,11 @@ type Entry struct {
 	// resolves them to the later tenure (see [Lineage.Subsumes]). Zero for a writer with no cluster,
 	// and for every part an index written before format v7 names. Added in format v7.
 	Term uint64
+	// Rollup is the downsampling layout the part's rows have had applied, as its manifest records
+	// it; nil is unknown: a part whose manifest carries none, or an entry written before format v8,
+	// until the part is opened and its next commit fills it in. It is carried here so a writer can
+	// check a rival's layout against its own without opening the rival's part. Added in format v8.
+	Rollup *Rollup
 	// Hole marks this entry as an acknowledged loss rather than a part: the writer owed a repair
 	// for these blocks, no owner could supply them, and it committed this in their place so the
 	// obligation stops blocking reads. It names no objects and holds no rows.
@@ -95,6 +100,10 @@ type Index struct {
 	// because the live set shrinks and identity must not: see [Index.NextBlock]. Added in format v6,
 	// as a term-0 number; a [Block] since format v7.
 	AllocatedBlocks Block
+	// Catalog is the lineage of every split group this shard's writers committed, newest
+	// [MaxLineage] kept, sorted by group — see [Index.RecordLineage], which is the whole of why it
+	// outlives the entries that carried each claim. Added in format v8.
+	Catalog []Claim
 }
 
 // Add inserts e, replacing any existing entry with the same prefix, keeping the index sorted.
@@ -141,6 +150,8 @@ func (ix *Index) Overlapping(start, end int64) []Entry {
 const (
 	magic0, magic1 = 'B', 'I'
 
+	// v8 adds each entry's rollup layout, behind a flag bit, and appends the lineage catalog.
+	//
 	// v7 scopes every block to the ownership term that allocated it (a [Block] is a term and a
 	// number), and adds the writing tenure's term to entries and wants. A v6 block is read as term 0.
 	//
@@ -158,7 +169,7 @@ const (
 	// Reading is backward compatible; writing is not. [Decode] rejects any version above this one,
 	// so a node on pre-v5 code cannot read an index this one writes: every node that reads a given
 	// index must be upgraded together. See backend/ARCH.md for the blast radius per deployment.
-	version = 7
+	version = 8
 )
 
 // AppendBinary appends the versioned binary encoding of the index to dst (append-style for
@@ -177,6 +188,7 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 		dst = binary.AppendUvarint(dst, entryFlags(*e))
 		dst = appendClaim(dst, e.Claim)
 		dst = binary.AppendUvarint(dst, e.Term)
+		dst = appendRollup(dst, e.Rollup)
 	}
 
 	dst = binary.AppendUvarint(dst, ix.FlushedEpoch)
@@ -220,6 +232,12 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 	dst = binary.AppendUvarint(dst, ix.LostParts)
 	dst = binary.AppendUvarint(dst, ix.AllocatedBlocks.Term)
 	dst = binary.AppendUvarint(dst, ix.AllocatedBlocks.N)
+
+	dst = binary.AppendUvarint(dst, uint64(len(ix.Catalog)))
+	for _, c := range ix.Catalog {
+		dst = appendInterval(dst, c.Blocks)
+		dst = appendInterval(dst, c.Group)
+	}
 
 	return dst
 }
@@ -334,11 +352,56 @@ func decodeTail(ix *Index, buf []byte, ver uint8) error {
 		}
 	}
 
-	if ix.AllocatedBlocks.N, _, ok = readUvarint(rest); !ok {
+	if ix.AllocatedBlocks.N, rest, ok = readUvarint(rest); !ok {
 		return errors.Wrap(ErrCorrupt, "bad allocated blocks")
 	}
 
+	if ver < 8 {
+		return nil
+	}
+
+	if ix.Catalog, ok = readCatalog(rest); !ok {
+		return errors.Wrap(ErrCorrupt, "bad lineage catalog")
+	}
+
 	return nil
+}
+
+// readCatalog parses the v8+ lineage catalog. It is canonical like everything else — every claim
+// valid, strictly ascending ([TrimLineage]'s order), at most [MaxLineage] of them — so encode∘decode
+// stays the identity.
+func readCatalog(buf []byte) ([]Claim, bool) {
+	n, buf, ok := readUvarint(buf)
+	if !ok || n > uint64(len(buf)) || n > MaxLineage {
+		return nil, false
+	}
+
+	if n == 0 {
+		return nil, true
+	}
+
+	out := make([]Claim, 0, n)
+	for range n {
+		var c Claim
+
+		if c.Blocks, buf, ok = readInterval(buf, version); !ok {
+			return nil, false
+		}
+
+		if c.Group, buf, ok = readInterval(buf, version); !ok || !c.Valid() {
+			return nil, false
+		}
+
+		out = append(out, c)
+	}
+
+	for i := 1; i < len(out); i++ {
+		if compareClaims(out[i-1], out[i]) >= 0 {
+			return nil, false
+		}
+	}
+
+	return out, true
 }
 
 // decodeEntries parses the part list, bounding the count by what the buffer could hold as the
@@ -396,16 +459,25 @@ func decodeEntries(buf []byte, ver uint8) ([]Entry, []byte, error) {
 	return out, buf, nil
 }
 
-// entryFlagHole is bit 0 of an entry's flag word, [Entry.Hole]. Every other bit is reserved, and
-// [decodeBlockIdentity] rejects them: an unknown bit must never read as a data-bearing part.
-const entryFlagHole = 1
+// entryFlagHole is bit 0 of an entry's flag word, [Entry.Hole], and entryFlagRollup bit 1, a layout
+// following the entry (format v8). Every other bit is reserved, and [decodeBlockIdentity] rejects
+// them: an unknown bit must never read as a data-bearing part.
+const (
+	entryFlagHole   = 1
+	entryFlagRollup = 2
+)
 
 func entryFlags(e Entry) uint64 {
+	var flags uint64
 	if e.Hole {
-		return entryFlagHole
+		flags |= entryFlagHole
 	}
 
-	return 0
+	if e.Rollup != nil {
+		flags |= entryFlagRollup
+	}
+
+	return flags
 }
 
 func decodeBlockIdentity(buf []byte, ver uint8, e *Entry) ([]byte, bool) {
@@ -422,7 +494,12 @@ func decodeBlockIdentity(buf []byte, ver uint8, e *Entry) ([]byte, bool) {
 	e.Level = uint32(level)
 
 	flags, buf, ok := readUvarint(buf)
-	if !ok || flags & ^uint64(entryFlagHole) != 0 {
+	known := uint64(entryFlagHole)
+	if ver >= 8 {
+		known |= entryFlagRollup
+	}
+
+	if !ok || flags&^known != 0 {
 		return nil, false
 	}
 
@@ -436,6 +513,12 @@ func decodeBlockIdentity(buf []byte, ver uint8, e *Entry) ([]byte, bool) {
 
 	if ver >= 7 {
 		if e.Term, buf, ok = readUvarint(buf); !ok {
+			return nil, false
+		}
+	}
+
+	if flags&entryFlagRollup != 0 {
+		if e.Rollup, buf, ok = readRollup(buf); !ok {
 			return nil, false
 		}
 	}

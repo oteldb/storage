@@ -465,21 +465,31 @@ func (ix *Index) covered(admit func(Entry) bool) Interval {
 //
 // "Largest" is widest interval first, then highest level, then prefix, so the answer does not
 // depend on index order and a caller fetches the fewest objects for the most data.
-func (ix *Index) Satisfying(w Want) (Entry, bool) { return ix.satisfying(w, Entry.Data) }
+func (ix *Index) Satisfying(w Want) (Entry, bool) {
+	return ix.satisfying(w, Entry.Data, ix.Lineage())
+}
+
+// SatisfyingWith is [Index.Satisfying] relating identities by extra lineage as well as this index's
+// own: the catalog of the index that owes w, which is what relates a member of a group split again
+// to a successor of the outer ancestry when the index answering w never saw either split.
+func (ix *Index) SatisfyingWith(w Want, extra Lineage) (Entry, bool) {
+	return ix.satisfying(w, Entry.Data, ix.Lineage().With(extra...))
+}
 
 // Discharging returns the entry that ends w as an obligation: a part satisfying it, or the hole
 // committed in its place. It is what decides a want is no longer outstanding.
 func (ix *Index) Discharging(w Want) (Entry, bool) {
-	return ix.satisfying(w, func(Entry) bool { return true })
+	return ix.satisfying(w, func(Entry) bool { return true }, ix.Lineage())
 }
 
-func (ix *Index) satisfying(w Want, admit func(Entry) bool) (Entry, bool) {
+func (ix *Index) satisfying(w Want, admit func(Entry) bool, lineage Lineage) (Entry, bool) {
 	var (
 		best  Entry
 		found bool
 	)
 
 	owed := w.Entry()
+	lineage = lineage.With(w.Claim)
 
 	for i := range ix.Entries {
 		e := ix.Entries[i]
@@ -491,7 +501,7 @@ func (ix *Index) satisfying(w Want, admit func(Entry) bool) (Entry, bool) {
 			return e, true
 		}
 
-		if !e.Blocks.Contains(w.Blocks) && !e.Supersedes(owed) {
+		if !e.Blocks.Contains(w.Blocks) && !lineage.Subsumes(e, owed) {
 			continue
 		}
 
