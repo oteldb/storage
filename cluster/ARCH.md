@@ -72,6 +72,13 @@ therefore drops such a key under a value+lease guard and recreates it under the 
 also makes the restart a real new tenure: the recreated claim takes a higher term, so the
 incarnation's writes outrank the dead one's.
 
+The term is also what scopes a tenure's **part identity** and **fences its commits**: blocks are
+allocated as `(term, n)`, and an engine refuses to commit once `Ownership.Term` no longer reports the
+term its operation began under, or once the index it builds on carries a higher one
+(`backend/ARCH.md`, *Part identity*). A handoff therefore never stalls a shard: the new owner flushes
+and merges with the freshest view it has. The cost is duplicate rows, never a collision — an old
+owner's last flush that no replica mirrored is re-flushed by the new owner from its replica head.
+
 Tests boot etcd through **`cluster/etcd/etcdtest`**, which binds its listeners to port 0 and reads
 the client port back from the socket. Probing a free port and releasing it for etcd to bind is
 racy: anything, including etcd clients' own ephemeral ports, can take it in between. Only

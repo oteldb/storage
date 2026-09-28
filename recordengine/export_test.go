@@ -124,7 +124,7 @@ func (e *Engine) LoadState() any {
 		Indexed       map[string]struct{}
 		Holes         []bucketindex.Entry
 		LostParts     uint64
-		Allocated     uint64
+		Allocated     bucketindex.Block
 		IdentityDirty bool
 		FlushedEpoch  uint64
 		Epochs        []bucketindex.WriterEpoch

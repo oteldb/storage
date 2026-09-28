@@ -45,9 +45,10 @@ func (g Generation) Zero() bool { return g == Generation{} }
 // Next returns the generation of this writer's next index write within term.
 //
 // A term above the current one restarts the counter — it is a different writer's sequence, and
-// the term already orders it above everything the previous one wrote. A term below is a writer
-// that has been superseded and does not know it yet; its own counter still advances so that its
-// local state stays monotonic, and the term keeps its writes from being adopted anywhere.
+// the term already orders it above everything the previous one wrote. A term below keeps the
+// higher one, which only a writer with no cluster (term 0) may do: a clustered writer below the
+// index's term is refused before it commits ([CheckTenure]), so it never writes under a later
+// tenure's term.
 func (g Generation) Next(term uint64) Generation {
 	if term > g.Term {
 		return Generation{Term: term, Counter: 1}

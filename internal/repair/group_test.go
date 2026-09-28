@@ -93,11 +93,11 @@ func TestSupersededResultIsNotPublished(t *testing.T) {
 	members := group("f", 10, 3, bucketindex.Blocks(1))
 	// Between rounds the peer merged f00 and f01; the output keeps the group's unrealized claim.
 	merged := bucketindex.Entry{
-		Prefix: "t", Blocks: bucketindex.Interval{Min: 10, Max: 11}, Claim: members[0].Claim, Level: 2,
+		Prefix: "t", Blocks: bucketindex.Range(0, 10, 11), Claim: members[0].Claim, Level: 2,
 	}
 	p := &peer{
 		ix:     bucketindex.Index{Entries: members},
-		member: map[uint64]bucketindex.FetchResult{11: {Entry: merged}},
+		member: map[bucketindex.Block]bucketindex.FetchResult{{N: 11}: {Entry: merged}},
 	}
 
 	plan := Pass{Fetcher: p}.Run(context.Background(), nil, []bucketindex.Want{want("lost", 1)}, nil)
@@ -115,7 +115,7 @@ func TestSupersededResultIsNotPublished(t *testing.T) {
 func TestSharedGroupCountsEachPartOnce(t *testing.T) {
 	t.Parallel()
 
-	members := group("f", 10, 3, bucketindex.Interval{Min: 1, Max: 2})
+	members := group("f", 10, 3, bucketindex.Range(0, 1, 2))
 	p := &peer{ix: bucketindex.Index{Entries: members}}
 
 	plan := Pass{Fetcher: p}.Run(context.Background(), nil,

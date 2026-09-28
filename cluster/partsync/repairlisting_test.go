@@ -22,7 +22,7 @@ func stageHeldButUnindexed(t *testing.T, be backend.Backend, prefix string, clai
 	t.Helper()
 
 	staging := &bucketindex.Index{}
-	writeBlockPart(t, be, staging, prefix, "0001", bucketindex.Interval{Min: 1, Max: 1}, 0)
+	writeBlockPart(t, be, staging, prefix, "0001", bucketindex.Range(0, 1, 1), 0)
 	ent := staging.Entries[0]
 
 	ix := &bucketindex.Index{Generation: gen(1, 2)}
@@ -126,7 +126,7 @@ func TestFetchWantsListsEachPeerOncePerCycle(t *testing.T) {
 
 		staging := &bucketindex.Index{}
 		for j, name := range names {
-			writeBlockPart(t, be, staging, prefix, name, bucketindex.Interval{Min: uint64(j + 1), Max: uint64(j + 1)}, 0)
+			writeBlockPart(t, be, staging, prefix, name, bucketindex.Range(0, uint64(j+1), uint64(j+1)), 0)
 			wants[j] = bucketindex.WantOf(staging.Entries[j], gen(0, 0))
 		}
 

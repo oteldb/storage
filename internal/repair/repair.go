@@ -244,12 +244,12 @@ func (p Pass) fetch(ctx context.Context, targets []Target, stats *bucketindex.Re
 // complete runs the member rounds: each asks, in one fetcher call, for every block some unit's split
 // groups still lack. A block is asked for once per pass however many units need it.
 func (p Pass) complete(ctx context.Context, ix *bucketindex.Index, units []*unit, stats *bucketindex.RepairStats) {
-	answers := make(map[uint64]attempt)
+	answers := make(map[bucketindex.Block]attempt)
 
 	for {
 		var (
 			ask      []Target
-			askedBy  = make(map[uint64][]*unit)
+			askedBy  = make(map[bucketindex.Block][]*unit)
 			progress bool
 		)
 
@@ -271,7 +271,7 @@ func (p Pass) complete(ctx context.Context, ix *bucketindex.Index, units []*unit
 				if _, dup := askedBy[b]; !dup {
 					w := u.results[0].Want
 					ask = append(ask, Target{
-						Want:   bucketindex.Want{Blocks: bucketindex.Blocks(b), MinTime: w.MinTime, MaxTime: w.MaxTime},
+						Want:   bucketindex.Want{Blocks: bucketindex.Single(b), MinTime: w.MinTime, MaxTime: w.MaxTime},
 						Member: true,
 					})
 				}
@@ -318,13 +318,13 @@ func (o outcome) want() bucketindex.WantOutcome {
 // unit is a [Unit] under construction.
 type unit struct {
 	results []Result
-	asked   map[uint64]struct{}
+	asked   map[bucketindex.Block]struct{}
 	// worst is why the unit can no longer complete this pass; outcomeNone while it still can.
 	worst outcome
 }
 
 func newUnit(r Result) *unit {
-	return &unit{results: []Result{r}, asked: make(map[uint64]struct{})}
+	return &unit{results: []Result{r}, asked: make(map[bucketindex.Block]struct{})}
 }
 
 func (u *unit) entries(ix *bucketindex.Index) []bucketindex.Entry {
@@ -339,14 +339,14 @@ func (u *unit) entries(ix *bucketindex.Index) []bucketindex.Entry {
 // missing is the member blocks the unit still needs and has not asked for: every group of its parts
 // while its target is not yet answered, and otherwise the groups whose lone members would duplicate
 // rows the index already holds ([groupsNeeded]).
-func (u *unit) missing(ix *bucketindex.Index) []uint64 {
+func (u *unit) missing(ix *bucketindex.Index) []bucketindex.Block {
 	entries := u.entries(ix)
 	held := (&bucketindex.Index{Entries: entries}).Covered()
-	out := make(map[uint64]struct{})
+	out := make(map[bucketindex.Block]struct{})
 
 	for _, c := range groupsNeeded(ix.Entries, u.results[0].Want, entries[len(ix.Entries):]) {
-		c.Group.Each(func(b uint64) bool {
-			if _, asked := u.asked[b]; !asked && !held.Contains(bucketindex.Blocks(b)) {
+		c.Group.Each(func(b bucketindex.Block) bool {
+			if _, asked := u.asked[b]; !asked && !held.Contains(bucketindex.Single(b)) {
 				out[b] = struct{}{}
 			}
 
@@ -354,7 +354,7 @@ func (u *unit) missing(ix *bucketindex.Index) []uint64 {
 		})
 	}
 
-	return slices.Sorted(maps.Keys(out))
+	return slices.SortedFunc(maps.Keys(out), bucketindex.Block.Compare)
 }
 
 func (u *unit) take(a attempt) {

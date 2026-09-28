@@ -22,8 +22,19 @@ func LineageOf(entries []Entry) Lineage {
 
 // Subsumes reports whether e holds every row o holds, at a higher level: e covers o's blocks, or
 // the whole ancestry of the groups o's blocks belong to.
+//
+// Two parts with one identity written by different tenures — two owners that merged the same inputs
+// either side of a handoff — hold the same rows, and the later tenure's copy subsumes the earlier.
 func (l Lineage) Subsumes(e, o Entry) bool {
+	if e.Term > o.Term && e.sameIdentity(o) {
+		return true
+	}
+
 	return e.Level > o.Level && l.holds(e.Blocks).Contains(o.Blocks)
+}
+
+func (e Entry) sameIdentity(o Entry) bool {
+	return e.Level == o.Level && e.Blocks.Valid() && e.Blocks.Equal(o.Blocks) && e.Claim.Equal(o.Claim)
 }
 
 // Overlaps reports whether a and b may hold a row in common.
@@ -101,16 +112,15 @@ func intersect(a, b Interval) Interval {
 		return Interval{}
 	}
 
-	ra, rb := a.runs(), b.runs()
-
 	var out []Gap
 
-	for i, j := 0, 0; i < len(ra) && j < len(rb); {
-		if lo, hi := max(ra[i].Min, rb[j].Min), min(ra[i].Max, rb[j].Max); lo <= hi {
+	for i, j := 0, 0; i < a.nruns() && j < b.nruns(); {
+		ra, rb := a.run(i), b.run(j)
+		if lo, hi := MaxBlock(ra.Min, rb.Min), minBlock(ra.Max, rb.Max); !hi.less(lo) {
 			out = append(out, Gap{Min: lo, Max: hi})
 		}
 
-		if ra[i].Max < rb[j].Max {
+		if ra.Max.less(rb.Max) {
 			i++
 		} else {
 			j++

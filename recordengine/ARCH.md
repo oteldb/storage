@@ -440,8 +440,10 @@ serves stay the same set; the adopted parts are readable but not owned. See
 **Block identity** is allocated the same way: a flush output takes a fresh `{n}` at level 0, a merge
 that writes one part the union of the block sets its inputs covered at one level above them, and a
 merge that splits a fresh contiguous run plus the joint `bucketindex.Claim` over it. Numbering runs
-above the index's persisted high-water mark, and every assignment is made per CAS attempt and
-written onto the part only once the commit lands. See [`../engine/ARCH.md`](../engine/ARCH.md),
+above the index's persisted high-water mark within the committing tenure's term, and every
+assignment is made per CAS attempt and written onto the part only once the commit lands. The
+planning and allocation are the metric engine's (`bucketindex.Plan`), and so is the tenure fence on
+every commit ([`../engine/ARCH.md`](../engine/ARCH.md), "A clustered commit is fenced by tenure"). See [`../engine/ARCH.md`](../engine/ARCH.md),
 "Block identity is allocated by the commit that publishes the part".
 
 **Repair** is identical to the metric engine, down to `Config.Repair` and its `bucketindex` types, the satisfaction rule (the

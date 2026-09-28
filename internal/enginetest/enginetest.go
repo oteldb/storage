@@ -291,6 +291,10 @@ var suite = []struct {
 	{"SplitBrainMergeSameInputs", splitBrainMergeSameInputs},
 	{"SplitBrainMergeOverlappingInputs", splitBrainMergeOverlappingInputs},
 	{"DisplacedWriterKeepsItsTerm", displacedWriterKeepsItsTerm},
+	{"SplitBrainMergeResolvesToTheLaterTenure", splitBrainMergeResolvesToTheLaterTenure},
+	{"TenuresAllocateDisjointBlocks", tenuresAllocateDisjointBlocks},
+	{"LapsedClaimCommitsNothing", lapsedClaimCommitsNothing},
+	{"WritingTermSurvivesTheNextTenure", writingTermSurvivesTheNextTenure},
 }
 
 // Run runs every suite test against k, each as <test>/<k.Name>.

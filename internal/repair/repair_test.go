@@ -19,7 +19,7 @@ import (
 type peer struct {
 	ix bucketindex.Index
 	// member overrides the answer to a member want for a block.
-	member map[uint64]bucketindex.FetchResult
+	member map[bucketindex.Block]bucketindex.FetchResult
 	calls  [][]bucketindex.Want
 	// disk, when set, receives every part the peer answers with, as a copy would.
 	disk map[string]bucketindex.Entry
@@ -70,7 +70,7 @@ func want(prefix string, b uint64) bucketindex.Want {
 
 // group returns the n members of a split group over run [first, first+n) jointly claiming claimed.
 func group(name string, first, n uint64, claimed bucketindex.Interval) []bucketindex.Entry {
-	c := bucketindex.Claim{Blocks: claimed, Group: bucketindex.Interval{Min: first, Max: first + n - 1}}
+	c := bucketindex.Claim{Blocks: claimed, Group: bucketindex.Range(0, first, first+n-1)}
 	out := make([]bucketindex.Entry, n)
 
 	for i := range n {
@@ -94,7 +94,7 @@ func prefixes(u Unit) []string {
 func TestRunLocal(t *testing.T) {
 	t.Parallel()
 
-	local := bucketindex.Entry{Prefix: "succ", Blocks: bucketindex.Interval{Min: 1, Max: 2}, Level: 1}
+	local := bucketindex.Entry{Prefix: "succ", Blocks: bucketindex.Range(0, 1, 2), Level: 1}
 	p := &peer{}
 
 	plan := Pass{Fetcher: p}.Run(context.Background(), []bucketindex.Entry{local},
@@ -221,7 +221,7 @@ func TestRunCompletesWideGroup(t *testing.T) {
 func TestRunSharedGroupAskedOnce(t *testing.T) {
 	t.Parallel()
 
-	members := group("f", 10, 6, bucketindex.Interval{Min: 1, Max: 2})
+	members := group("f", 10, 6, bucketindex.Range(0, 1, 2))
 	p := &peer{ix: bucketindex.Index{Entries: members}}
 
 	plan := Pass{Fetcher: p}.Run(context.Background(), nil,
@@ -281,7 +281,7 @@ func TestRunShortGroup(t *testing.T) {
 			members := group("f", 10, 8, bucketindex.Blocks(1))
 			p := &peer{
 				ix:     bucketindex.Index{Entries: members},
-				member: map[uint64]bucketindex.FetchResult{17: tc.member},
+				member: map[bucketindex.Block]bucketindex.FetchResult{{N: 17}: tc.member},
 			}
 
 			plan := Pass{Fetcher: p}.Run(context.Background(), nil,
@@ -402,7 +402,7 @@ func TestAdmit(t *testing.T) {
 		var stats bucketindex.RepairStats
 
 		live := []bucketindex.Entry{members[0]}
-		succ := bucketindex.Entry{Prefix: "s", Blocks: bucketindex.Interval{Min: 1, Max: 2}, Level: 2}
+		succ := bucketindex.Entry{Prefix: "s", Blocks: bucketindex.Range(0, 1, 2), Level: 2}
 		phantom := bucketindex.Entry{Prefix: "x", Blocks: bucketindex.Blocks(2)}
 
 		open, opened := opener("x")
@@ -425,8 +425,8 @@ func TestAdmit(t *testing.T) {
 	t.Run("PartialSuccessor", func(t *testing.T) {
 		t.Parallel()
 
-		wide := group("g", 20, 2, bucketindex.Interval{Min: 1, Max: 2})
-		part := bucketindex.Entry{Prefix: "p", Blocks: bucketindex.Interval{Min: 2, Max: 3}, Level: 2}
+		wide := group("g", 20, 2, bucketindex.Range(0, 1, 2))
+		part := bucketindex.Entry{Prefix: "p", Blocks: bucketindex.Range(0, 2, 3), Level: 2}
 		units := []Unit{
 			unit("a", false, false, wide...),
 			unitOf(want("b", 3), false, false, part),
@@ -461,7 +461,7 @@ func TestAdmit(t *testing.T) {
 
 		var stats bucketindex.RepairStats
 
-		rival := bucketindex.Entry{Prefix: "r", Blocks: bucketindex.Interval{Min: 1, Max: 2}, Level: 1}
+		rival := bucketindex.Entry{Prefix: "r", Blocks: bucketindex.Range(0, 1, 2), Level: 1}
 		open, _ := opener()
 		got, _ := Admit(ctx, members[:1], []Unit{
 			unit("a", false, false, members...),

@@ -120,7 +120,7 @@ func unattemptedWantKeepsAbsenceEvidence(t *testing.T, k Kind) {
 		require.Less(t, b, lost)
 
 		blockers[b] = struct{}{}
-		e.LosePart(b, bucketindex.Interval{Min: uint64(100 + i), Max: uint64(100 + i)})
+		e.LosePart(b, bucketindex.Range(0, uint64(100+i), uint64(100+i)))
 	}
 
 	before := len(f.Asks())
@@ -131,7 +131,7 @@ func unattemptedWantKeepsAbsenceEvidence(t *testing.T, k Kind) {
 	require.NotContains(t, capped, lost, "the want is past the per-cycle cap")
 
 	// A local part now covers the blockers, so they discharge without a fetch and the want is asked.
-	e.SetPartBlocks(e.PartPrefixes()[0], bucketindex.Interval{Min: 100, Max: 103}, 1)
+	e.SetPartBlocks(e.PartPrefixes()[0], bucketindex.Range(0, 100, 103), 1)
 	mergeTimes(t, e, 1)
 
 	holes := e.Holes()
@@ -158,7 +158,7 @@ func repairConcurrentMergesFetchOnce(t *testing.T, k Kind) {
 
 		CopyObjects(t, be, peer, lost)
 		dropObjects(t, be, lost)
-		e.LosePart(lost, bucketindex.Interval{Min: 1, Max: 1})
+		e.LosePart(lost, bucketindex.Range(0, 1, 1))
 
 		entered := make(chan struct{}, 2)
 		release := make(chan struct{})
@@ -214,7 +214,7 @@ func (k Kind) seedGoneParts(t *testing.T, be backend.Backend, n int) []string {
 		start, end := lostWindow(i)
 		ix.Add(bucketindex.Entry{
 			Prefix: prefix, MinTime: start, MaxTime: end,
-			Blocks: bucketindex.Interval{Min: uint64(i + 1), Max: uint64(i + 1)},
+			Blocks: bucketindex.Range(0, uint64(i+1), uint64(i+1)),
 		})
 		lost = append(lost, prefix)
 	}

@@ -128,8 +128,8 @@ func TestClusterHandoffUnsyncedFlushReadsOnce(t *testing.T) {
 	})
 
 	t.Run("logs", func(t *testing.T) {
-		reproduce.Unfixed(t, 725, "the new owner re-flushes head rows the old owner's unsynced part holds, and once "+
-			"the old owner is back both parts stay live and merge into one part holding every record twice")
+		reproduce.Unfixed(t, 572, "the old owner's unsynced flush is the accepted cost of a handoff that never "+
+			"stalls: the new owner re-flushes the same head rows under its own term, and nothing dedups the records")
 
 		for id, s := range nodes {
 			got, err := fetchLogs(ctx, s, 0, 1<<62)

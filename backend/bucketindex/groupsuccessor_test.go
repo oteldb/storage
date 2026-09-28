@@ -11,7 +11,7 @@ import (
 )
 
 func members3(name string, first uint64, claimed bucketindex.Interval, level uint32) []bucketindex.Entry {
-	c := bucketindex.Claim{Blocks: claimed, Group: bucketindex.Interval{Min: first, Max: first + 2}}
+	c := bucketindex.Claim{Blocks: claimed, Group: bucketindex.Range(0, first, first+2)}
 	out := make([]bucketindex.Entry, 3)
 
 	for i := range out {
@@ -38,7 +38,7 @@ func TestSuccessorOfAGroupSubsumesEveryMember(t *testing.T) {
 	t.Parallel()
 
 	group := members3("f", 10, bucketindex.Blocks(1), 1)
-	succ := bucketindex.Entry{Prefix: "s", Blocks: bucketindex.Interval{Min: 1, Max: 2}, Level: 2}
+	succ := bucketindex.Entry{Prefix: "s", Blocks: bucketindex.Range(0, 1, 2), Level: 2}
 
 	for _, m := range group {
 		assert.True(t, succ.Supersedes(m), "%s holds %s's rows", succ.Prefix, m.Prefix)
@@ -67,8 +67,8 @@ func TestSuccessorOfAGroupSubsumesEveryMember(t *testing.T) {
 	t.Run("PartOfTheClaim", func(t *testing.T) {
 		t.Parallel()
 
-		wide := members3("g", 10, bucketindex.Interval{Min: 1, Max: 2}, 1)
-		part := bucketindex.Entry{Prefix: "p", Blocks: bucketindex.Interval{Min: 2, Max: 3}, Level: 2}
+		wide := members3("g", 10, bucketindex.Range(0, 1, 2), 1)
+		part := bucketindex.Entry{Prefix: "p", Blocks: bucketindex.Range(0, 2, 3), Level: 2}
 		assert.False(t, part.Supersedes(wide[0]), "block 1's rows are in the group and not in the part")
 		assert.Empty(t, bucketindex.Subsumed(wide, []bucketindex.Entry{part}))
 	})

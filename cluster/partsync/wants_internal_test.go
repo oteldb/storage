@@ -28,8 +28,8 @@ func TestUnaccountedEntriesGating(t *testing.T) {
 	t.Parallel()
 
 	g := bucketindex.Generation{Term: 1, Counter: 7}
-	mine := wantEntry("p/mine", bucketindex.Interval{Min: 5, Max: 5}, 500, 600)
-	theirs := wantEntry("p/theirs", bucketindex.Interval{Min: 6, Max: 6}, 700, 800)
+	mine := wantEntry("p/mine", bucketindex.Range(0, 5, 5), 500, 600)
+	theirs := wantEntry("p/theirs", bucketindex.Range(0, 6, 6), 700, 800)
 
 	for name, tc := range map[string]struct {
 		local *bucketindex.Index
@@ -48,7 +48,7 @@ func TestUnaccountedEntriesGating(t *testing.T) {
 		"older than everything kept is not wanted": {
 			local: wantIndex(g, mine),
 			peer: wantIndex(g, mine,
-				wantEntry("p/ancient", bucketindex.Interval{Min: 6, Max: 6}, 1, 2)),
+				wantEntry("p/ancient", bucketindex.Range(0, 6, 6), 1, 2)),
 		},
 		"a pre-tombstone local index wants nothing": {
 			local: wantIndex(bucketindex.Generation{}, mine),
@@ -81,8 +81,8 @@ func TestWantsNeedConfirmation(t *testing.T) {
 	t.Parallel()
 
 	g := bucketindex.Generation{Term: 1, Counter: 7}
-	mine := wantEntry("p/mine", bucketindex.Interval{Min: 5, Max: 5}, 500, 600)
-	theirs := wantEntry("p/theirs", bucketindex.Interval{Min: 6, Max: 6}, 700, 800)
+	mine := wantEntry("p/mine", bucketindex.Range(0, 5, 5), 500, 600)
+	theirs := wantEntry("p/theirs", bucketindex.Range(0, 6, 6), 700, 800)
 
 	s := New(nil, nil)
 	local, peer := wantIndex(g, mine), wantIndex(g, mine, theirs)

@@ -67,11 +67,13 @@ type part struct {
 	// claim is the ancestry this part holds only jointly with the rest of its split group; unset
 	// for every part a merge wrote whole — see [bucketindex.Claim].
 	claim bucketindex.Claim
+	// term is the ownership term of the tenure that wrote the part ([bucketindex.Entry.Term]).
+	term uint64
 
 	// pending is the identity a part this engine just wrote is waiting to be assigned; nil for one
 	// opened from an index, whose identity is whatever that index recorded — including the unset
 	// one of a part written before format v5. See blockid.go.
-	pending *blockPlan
+	pending *bucketindex.Plan
 
 	// rawBytes is the part's decoded footprint per its manifest, 0 for a part written before the
 	// manifest carried one. See [part.sizeBytes].

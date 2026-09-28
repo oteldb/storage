@@ -149,9 +149,17 @@ The opens sit on the commit path, which is where the cost is. It is bounded: han
 across the retry loop, and an entry that cannot be opened — a rival merged it away in between — is
 left out of the readable set but kept in the index, since only its writer knows whether it is live.
 
+**An adopted part this engine's own parts subsume is retired instead** (`dropSubsumedForeignLocked`):
+the same merge a displaced tenure committed just before this one, resolved to the later tenure, or
+an input a merge here has since consumed. It is left out of the commit and tombstoned, since
+carrying it forward keeps its rows live twice; its objects are the orphan sweep's.
+
 ### Block identity is allocated by the commit that publishes the part
 
-A flush output commits `{n}` at level 0, `n` from `bucketindex.Index.NextBlock`. A merge that writes
+A flush output commits `{b}` at level 0, `b` from `bucketindex.Index.NextBlock` under the term the
+commit writes as, so every block is scoped to its tenure (`backend/ARCH.md`, "Part identity"). The
+planning and allocation (`bucketindex.Plan`, `PlanMerge`, `Allocator`) are shared with
+`recordengine`; each engine keeps only the per-attempt bookkeeping over its own parts. A merge that writes
 **one** part commits the union of the block sets its inputs covered, at `max(input level) + 1`, and
 allocates nothing: the merged part covers exactly the blocks its inputs covered — a set, so a run
 that straddles a gap claims no block inside it — and that is what makes `Entry.Supersedes`, and so a
@@ -280,6 +288,18 @@ caller has any say, so without it a store could not be opened for reading only �
 verifier reclaimed objects from the directory it was pointed at. It backs `storage.WithReadOnly`,
 which then keeps the guarantee at the facade for the life of the handle.
 
+
+## A clustered commit is fenced by tenure
+
+Before every CAS attempt, `commitIndexLocked` runs `bucketindex.CheckTenure` (`tenureLocked`) over
+the term the operation began with, the term the engine holds now, and the term of the index it
+builds on (`generation.Term`, which a load or a rebase raises). A writer with no `Config.Term` is
+not fenced. A merge stamps its term when it picks its inputs: one whose tenure ended and restarted
+while it ran chose them from a view the intervening tenure may have merged differently. A flush,
+a retention drop and a repair commit take the term at commit instead, since what they publish is
+this node's own head or a part it fetched, valid under any tenure the node holds. A refused flush
+keeps its part as a carried, uncommitted part, like any failed commit; a refused merge rolls back
+and leaves its output to the sweep.
 
 ## A failed load changes nothing, and fences every commit
 

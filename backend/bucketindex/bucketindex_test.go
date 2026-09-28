@@ -80,11 +80,12 @@ func TestGoldenEncoding(t *testing.T) {
 		FlushedEpoch: 3,
 		Generation:   bucketindex.Generation{Term: 4, Counter: 5},
 	}
-	// magic 'B','I', version 6, count 1, len 1, 'a', zigzag(1)=2, zigzag(2)=4, unset blocks 0,
-	// level 0, flags 0, no claim 0, flushedEpoch 3, generation term 4, generation counter 5,
-	// removal count 0, writer-epoch count 0, want count 0, lost parts 0, allocated blocks 0.
+	// magic 'B','I', version 7, count 1, len 1, 'a', zigzag(1)=2, zigzag(2)=4, unset blocks 0,
+	// level 0, flags 0, no claim 0, writer term 0, flushedEpoch 3, generation term 4, generation
+	// counter 5, removal count 0, writer-epoch count 0, want count 0, lost parts 0, allocated
+	// blocks' term 0 and number 0.
 	assert.Equal(t,
-		[]byte{'B', 'I', 6, 1, 1, 'a', 2, 4, 0, 0, 0, 0, 3, 4, 5, 0, 0, 0, 0, 0},
+		[]byte{'B', 'I', 7, 1, 1, 'a', 2, 4, 0, 0, 0, 0, 0, 3, 4, 5, 0, 0, 0, 0, 0, 0},
 		ix.AppendBinary(nil))
 }
 
@@ -210,6 +211,11 @@ func FuzzDecode(f *testing.F) {
 			{Writer: "node-a", Epoch: 3, Generation: bucketindex.Generation{Term: 1, Counter: 2}},
 		},
 	}).AppendBinary(nil))
+	f.Add(fullIndex().AppendBinary(nil))
+	f.Add([]byte{
+		'B', 'I', 6, 1, 1, 'a', 2, 4, 1, 4, 1, 2, 3, 2, 0, 1, 6, 7, 0, 1, 4, 0, 3, 4, 5, 1, 1, 'r', 6, 7,
+		1, 1, 'w', 8, 9, 10, 1, 1, 'x', 5, 5, 0, 1, 26, 28, 11, 12, 0, 15, 16,
+	})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		ix, err := bucketindex.Decode(data)
@@ -223,5 +229,6 @@ func FuzzDecode(f *testing.F) {
 		assert.Equal(t, ix.Entries, again.Entries)
 		assert.Equal(t, ix.Epochs, again.Epochs)
 		assert.Equal(t, ix.Wanted, again.Wanted)
+		assert.Equal(t, ix.AllocatedBlocks, again.AllocatedBlocks)
 	})
 }

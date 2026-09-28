@@ -42,6 +42,7 @@ type Want struct {
 	Blocks           Interval
 	Claim            Claim
 	Level            uint32
+	Term             uint64
 	MinTime, MaxTime int64
 	Generation       Generation
 }
@@ -49,7 +50,7 @@ type Want struct {
 // WantOf is the repair obligation a lost entry owes, discovered at generation g.
 func WantOf(e Entry, g Generation) Want {
 	return Want{
-		Prefix: e.Prefix, Blocks: e.Blocks, Claim: e.Claim, Level: e.Level,
+		Prefix: e.Prefix, Blocks: e.Blocks, Claim: e.Claim, Level: e.Level, Term: e.Term,
 		MinTime: e.MinTime, MaxTime: e.MaxTime, Generation: g,
 	}
 }
@@ -58,7 +59,7 @@ func WantOf(e Entry, g Generation) Want {
 func (w Want) Entry() Entry {
 	return Entry{
 		Prefix: w.Prefix, MinTime: w.MinTime, MaxTime: w.MaxTime,
-		Blocks: w.Blocks, Claim: w.Claim, Level: w.Level,
+		Blocks: w.Blocks, Claim: w.Claim, Level: w.Level, Term: w.Term,
 	}
 }
 

@@ -340,11 +340,13 @@ type part struct {
 	// claim is the ancestry this part holds only jointly with the rest of its split group; unset
 	// for every part a merge wrote whole — see [bucketindex.Claim].
 	claim bucketindex.Claim
+	// term is the ownership term of the tenure that wrote the part ([bucketindex.Entry.Term]).
+	term uint64
 
 	// pending is the identity a part this engine just wrote is waiting to be assigned; nil for one
 	// opened from an index, whose identity is whatever that index recorded — including the unset
 	// one of a part written before format v5. See blockid.go.
-	pending *blockPlan
+	pending *bucketindex.Plan
 
 	// refs counts in-flight fetches reading this part lock-free. A fetch acquires (under the engine
 	// lock, while the part is still live) the parts it will read and releases them when done; a retired

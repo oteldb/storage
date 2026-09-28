@@ -128,6 +128,9 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
 
+	// The tenure the inputs were chosen under: a merge that outlives it commits nothing.
+	stamp := e.term()
+
 	// Plan (under lock): snapshot the source parts (immutable backing). Output part ids are minted one
 	// at a time, as the parts are written.
 	e.mu.Lock()
@@ -219,7 +222,7 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 	committed := e.parts
 	e.parts = replaceParts(e.parts, removed, newParts...)
 
-	if err = e.updateIndexLocked(ctx); err != nil {
+	if err = e.commitIndexLocked(ctx, stamp); err != nil {
 		e.parts = committed
 		e.mu.Unlock()
 

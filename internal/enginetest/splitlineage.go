@@ -94,7 +94,7 @@ func splitOfSeveralInputsKeepsEveryLineage(t *testing.T, k Kind) {
 		f := &fragments[i]
 		for j := range inputs {
 			in := &inputs[j]
-			assert.Greater(t, f.Blocks.Min, in.Blocks.Max, "fragment %+v is numbered below retired %+v", f, in)
+			assert.Positive(t, f.Blocks.Min.Compare(in.Blocks.Max), "fragment %+v is numbered below retired %+v", f, in)
 			assert.False(t, f.Supersedes(*in), "fragment %+v holds a fraction of %+v and must not claim it", f, in)
 		}
 	}

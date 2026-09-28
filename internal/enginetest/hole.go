@@ -148,7 +148,7 @@ func holeRevokedByExactPrefix(t *testing.T, k Kind) {
 
 	CopyObjects(t, be, peer, lost)
 	dropObjects(t, be, lost)
-	e.LosePart(lost, bucketindex.Interval{Min: 1, Max: 1})
+	e.LosePart(lost, bucketindex.Range(0, 1, 1))
 
 	mergeTimes(t, e, 3)
 	require.Len(t, e.Holes(), 1)
@@ -182,14 +182,14 @@ func holeRevokedByLostSuccessor(t *testing.T, k Kind) {
 	parts := flushTwo(t, e)
 	lost, successor := parts[0], parts[1]
 
-	e.SetPartBlocks(successor, bucketindex.Interval{Min: 1, Max: 4}, 2)
+	e.SetPartBlocks(successor, bucketindex.Range(0, 1, 4), 2)
 	CopyObjects(t, be, peer, successor)
 	dropObjects(t, be, lost)
-	e.LosePart(lost, bucketindex.Interval{Min: 1, Max: 1})
+	e.LosePart(lost, bucketindex.Range(0, 1, 1))
 
 	// The successor is local, so it would discharge the want before a hole could form: take it out
 	// of the way and let the loss be acknowledged first.
-	e.LosePart(successor, bucketindex.Interval{Min: 1, Max: 4})
+	e.LosePart(successor, bucketindex.Range(0, 1, 4))
 	dropObjects(t, be, successor)
 
 	mergeTimes(t, e, 3)
@@ -200,7 +200,7 @@ func holeRevokedByLostSuccessor(t *testing.T, k Kind) {
 
 		return bucketindex.Entry{
 			Prefix: successor, MinTime: 200, MaxTime: 200,
-			Blocks: bucketindex.Interval{Min: 1, Max: 4}, Level: 2,
+			Blocks: bucketindex.Range(0, 1, 4), Level: 2,
 		}, bucketindex.WantSatisfied, nil
 	})
 
@@ -223,15 +223,15 @@ func holeRevokedByContainingSuccessor(t *testing.T, k Kind) {
 
 	parts := flushTwo(t, e)
 	for i, p := range parts {
-		e.SetPartBlocks(p, bucketindex.Interval{Min: uint64(i + 1), Max: uint64(i + 1)}, 0)
+		e.SetPartBlocks(p, bucketindex.Range(0, uint64(i+1), uint64(i+1)), 0)
 	}
 
 	for _, p := range parts {
 		dropObjects(t, be, p)
 	}
 
-	e.LosePart(parts[0], bucketindex.Interval{Min: 1, Max: 1})
-	e.LosePart(parts[1], bucketindex.Interval{Min: 2, Max: 2})
+	e.LosePart(parts[0], bucketindex.Range(0, 1, 1))
+	e.LosePart(parts[1], bucketindex.Range(0, 2, 2))
 
 	// The peer merged both blocks away into one level-1 part.
 	successor := k.mergedPeerPart(t, peerBE)
@@ -244,7 +244,7 @@ func holeRevokedByContainingSuccessor(t *testing.T, k Kind) {
 
 		return bucketindex.Entry{
 			Prefix: successor, MinTime: 100, MaxTime: 200,
-			Blocks: bucketindex.Interval{Min: 1, Max: 2}, Level: 1,
+			Blocks: bucketindex.Range(0, 1, 2), Level: 1,
 		}, bucketindex.WantSatisfied, nil
 	})
 
@@ -298,7 +298,7 @@ func holeNotOfferedToAPeer(t *testing.T, k Kind) {
 	lost := loseFirstOfTwo(t, e, be)
 	mergeTimes(t, e, 3)
 
-	_, ok := k.loadIndex(t, be).Satisfying(bucketindex.Want{Prefix: lost, Blocks: bucketindex.Interval{Min: 1, Max: 1}})
+	_, ok := k.loadIndex(t, be).Satisfying(bucketindex.Want{Prefix: lost, Blocks: bucketindex.Range(0, 1, 1)})
 	assert.False(t, ok)
 }
 

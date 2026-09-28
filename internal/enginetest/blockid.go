@@ -54,7 +54,7 @@ func (k Kind) stripBlocks(ctx context.Context, t *testing.T, be backend.Backend,
 
 	// An index that predates block identity predates the allocation high-water mark too, so the
 	// simulation has to drop it as well or the migrated part numbers above a mark v5 never wrote.
-	ix.AllocatedBlocks = 0
+	ix.AllocatedBlocks = bucketindex.Block{}
 
 	_, err = ix.Save(ctx, be, k.indexKey(), version)
 	require.NoError(t, err)
@@ -71,7 +71,7 @@ func flushAllocatesABlock(t *testing.T, k Kind) {
 	got := blocksByPrefix(k.loadIndex(t, be))
 	for i, id := range ids {
 		ent := got[k.Prefix+"/"+id]
-		assert.Equal(t, bucketindex.Interval{Min: uint64(i + 1), Max: uint64(i + 1)}, ent.Blocks)
+		assert.Equal(t, bucketindex.Range(0, uint64(i+1), uint64(i+1)), ent.Blocks)
 		assert.Zero(t, ent.Level)
 	}
 }
@@ -93,7 +93,7 @@ func mergeUnionsItsInputs(t *testing.T, k Kind) {
 	require.Len(t, ix.Entries, 1, "the forced merge collapses the part set")
 
 	out := ix.Entries[0]
-	assert.Equal(t, bucketindex.Interval{Min: 1, Max: 3}, out.Blocks)
+	assert.Equal(t, bucketindex.Range(0, 1, 3), out.Blocks)
 	assert.Equal(t, uint32(1), out.Level)
 
 	for _, id := range ids {
@@ -126,7 +126,7 @@ func mergedNeighboursDoNotDischargeAWant(t *testing.T, k Kind) {
 
 	lost := ix.Wanted[0]
 	require.True(t, lost.Blocks.Valid(), "the want carries the identity the flush allocated")
-	require.Equal(t, bucketindex.Interval{Min: 2, Max: 2}, lost.Blocks)
+	require.Equal(t, bucketindex.Range(0, 2, 2), lost.Blocks)
 
 	require.NoError(t, r.ForceMerge(ctx))
 
@@ -167,7 +167,7 @@ func blocksSurviveRestart(t *testing.T, k Kind) {
 
 	fresh := k.partDirs(ctx, t, be)
 	require.Len(t, fresh, 3)
-	assert.Equal(t, bucketindex.Interval{Min: 3, Max: 3}, after[k.Prefix+"/"+fresh[2]].Blocks,
+	assert.Equal(t, bucketindex.Range(0, 3, 3), after[k.Prefix+"/"+fresh[2]].Blocks,
 		"the new owner allocates above what it inherited")
 }
 
@@ -203,7 +203,7 @@ func rebaseAllocatesAboveTheRival(t *testing.T, k Kind) {
 	other := &bucketindex.Index{Generation: bucketindex.Generation{Term: 1, Counter: 1}}
 	other.Add(bucketindex.Entry{
 		Prefix: rival, MinTime: 1, MaxTime: 2,
-		Blocks: bucketindex.Interval{Min: 1, Max: 1},
+		Blocks: bucketindex.Range(0, 1, 1),
 	})
 	_, err := other.Save(ctx, inner, k.indexKey(), backend.VersionAbsent)
 	require.NoError(t, err)
@@ -216,11 +216,11 @@ func rebaseAllocatesAboveTheRival(t *testing.T, k Kind) {
 	require.Len(t, ix.Entries, 2)
 
 	got := blocksByPrefix(ix)
-	require.Equal(t, bucketindex.Interval{Min: 1, Max: 1}, got[rival].Blocks, "the winner keeps the block it claimed")
+	require.Equal(t, bucketindex.Range(0, 1, 1), got[rival].Blocks, "the winner keeps the block it claimed")
 
 	mine := k.partDirs(ctx, t, inner)
 	require.Len(t, mine, 1)
-	assert.Equal(t, bucketindex.Interval{Min: 2, Max: 2}, got[k.Prefix+"/"+mine[0]].Blocks, "the loser re-allocates above the winner")
+	assert.Equal(t, bucketindex.Range(0, 2, 2), got[k.Prefix+"/"+mine[0]].Blocks, "the loser re-allocates above the winner")
 
 	for a := range got {
 		for b := range got {
@@ -253,7 +253,7 @@ func outstandingWantHoldsItsBlock(t *testing.T, k Kind) {
 	require.Len(t, ix.Wanted, 1)
 
 	fresh := k.partDirs(ctx, t, be)
-	assert.Equal(t, bucketindex.Interval{Min: 3, Max: 3}, blocksByPrefix(ix)[k.Prefix+"/"+fresh[len(fresh)-1]].Blocks,
+	assert.Equal(t, bucketindex.Range(0, 3, 3), blocksByPrefix(ix)[k.Prefix+"/"+fresh[len(fresh)-1]].Blocks,
 		"the wanted part's block 2 is not handed out again")
 }
 
@@ -274,7 +274,7 @@ func preV5PartsMigrateOnMerge(t *testing.T, k Kind) {
 
 	ix := k.loadIndex(t, be)
 	require.Len(t, ix.Entries, 1)
-	assert.Equal(t, bucketindex.Interval{Min: 1, Max: 1}, ix.Entries[0].Blocks, "the migrated part takes the first free block")
+	assert.Equal(t, bucketindex.Range(0, 1, 1), ix.Entries[0].Blocks, "the migrated part takes the first free block")
 	assert.Equal(t, uint32(1), ix.Entries[0].Level)
 }
 
@@ -296,7 +296,7 @@ func mixedMergeInheritsTheKnownInputs(t *testing.T, k Kind) {
 
 	ix := k.loadIndex(t, be)
 	require.Len(t, ix.Entries, 1)
-	assert.Equal(t, bucketindex.Interval{Min: 2, Max: 3}, ix.Entries[0].Blocks)
+	assert.Equal(t, bucketindex.Range(0, 2, 3), ix.Entries[0].Blocks)
 	assert.Equal(t, uint32(1), ix.Entries[0].Level)
 }
 
@@ -321,12 +321,12 @@ func blockNumbersSurviveAnEmptiedShard(t *testing.T, k Kind) {
 
 	ix := k.loadIndex(t, be)
 	require.Empty(t, ix.Entries)
-	require.EqualValues(t, 3, ix.NextBlock(), "the high-water mark outlives every part it numbered")
+	require.Equal(t, bucketindex.Block{N: 3}, ix.NextBlock(0), "the high-water mark outlives every part it numbered")
 
 	e.Append(t, api(1<<41, 1))
 	require.NoError(t, e.Flush(ctx))
 
 	ix = k.loadIndex(t, be)
 	require.Len(t, ix.Entries, 1)
-	require.Equal(t, bucketindex.Interval{Min: 3, Max: 3}, ix.Entries[0].Blocks, "block numbers are never reused within a shard")
+	require.Equal(t, bucketindex.Range(0, 3, 3), ix.Entries[0].Blocks, "block numbers are never reused within a shard")
 }
