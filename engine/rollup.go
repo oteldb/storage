@@ -335,14 +335,13 @@ func mergeCohorts(own, readable []*part) []mergeCohort {
 
 // cohortRun is the selection one merge makes: the first cohort, from start round-robin, whose own
 // selection is not empty, with the tiers it applies and the policy tiers it drops. Round-robin keeps
-// a busy cohort from starving the others.
+// a busy cohort from starving the others. The ladder's still-filling bucket is the one holding the
+// newest readable sample, adopted parts included: a writer that stopped ingesting while a rival goes
+// on would otherwise hold its last bucket open for ever.
 func cohortRun(
 	cohorts []mergeCohort, readable []*part, opts MergeOptions, capBytes int64, idle int, start uint64,
 ) (selected []*part, tiers, dropped []DownsampleTier) {
-	newest := minInt64
-	for _, c := range cohorts {
-		newest = max(newest, newestSample(c.parts))
-	}
+	newest := newestSample(readable)
 
 	for i := range cohorts {
 		c := &cohorts[(start+uint64(i))%uint64(len(cohorts))]

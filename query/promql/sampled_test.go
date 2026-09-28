@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/query/scale"
 )
 
 // sampledStream models what a tenant under a Sampling budget stores: of an original one-sample-per-
@@ -216,4 +217,85 @@ func TestAmbiguousRollupWarning(t *testing.T) {
 		`sum_over_time(events[60s])`, sampledWindow)
 	assert.True(t, hasSampledWarning(warns))
 	assert.Len(t, warns.AsErrors(), 2)
+}
+
+// hasAmbiguousWarning reports whether w carries [AmbiguousRollupWarning].
+func hasAmbiguousWarning(w annotations.Annotations) bool {
+	for _, err := range w.AsErrors() {
+		if errors.Is(err, AmbiguousRollupWarning) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// TestAmbiguousRollupSurvivesComposition checks the flag reaches PromQL through every fetcher that
+// rebuilds or retains batches: a split-by-interval read merges its sub-windows' batches, a
+// multi-child merge combines one series from several children, and the results cache serves a
+// clone. Only one contributing batch carries the flag, so a copy that drops it, or keeps the first
+// batch's, fails.
+func TestAmbiguousRollupSurvivesComposition(t *testing.T) {
+	t.Parallel()
+
+	plain := func() *fetch.Batch { return series("events", "r1", [2]int64{10, 1}, [2]int64{20, 2}) }
+	flagged := func() *fetch.Batch {
+		b := series("events", "r1", [2]int64{25, 3})
+		b.AmbiguousRollup = true
+
+		return b
+	}
+
+	for _, tc := range []struct {
+		name    string
+		fetcher func() fetch.Fetcher
+	}{
+		{"split", func() fetch.Fetcher {
+			return scale.SplitFetcher{Inner: &windowFetcher{batches: []*fetch.Batch{plain(), flagged()}}, Interval: 10 * sec}
+		}},
+		{"merge", func() fetch.Fetcher {
+			return fetch.Merge(&fakeFetcher{batches: []*fetch.Batch{plain()}}, &fakeFetcher{batches: []*fetch.Batch{flagged()}})
+		}},
+		{"cache", func() fetch.Fetcher {
+			return scale.CacheFetcher{Inner: &fakeFetcher{batches: []*fetch.Batch{flagged()}}, Cache: scale.NewMemoryCache(8)}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			q := NewQueryable(tc.fetcher(), "default")
+
+			for range 2 { // a cache serves its clone on the second read
+				_, warns := instantScalar(t, q, `sum_over_time(events[60s])`, 30)
+				assert.True(t, hasAmbiguousWarning(warns), "the flag reaches PromQL: %v", warns.AsErrors())
+			}
+		})
+	}
+}
+
+// windowFetcher serves, for each request, the batches' samples inside its window, one batch per
+// source batch that has any, as an engine serves a sub-window of a split read.
+type windowFetcher struct {
+	batches []*fetch.Batch
+}
+
+func (f *windowFetcher) Fetch(_ context.Context, r fetch.Request) (fetch.Iterator, error) {
+	var out []*fetch.Batch
+
+	for _, b := range f.batches {
+		w := &fetch.Batch{ID: b.ID, Series: b.Series, AmbiguousRollup: b.AmbiguousRollup}
+
+		for i, ts := range b.Timestamps {
+			if ts >= r.Start && ts <= r.End {
+				w.Timestamps = append(w.Timestamps, ts)
+				w.Values = append(w.Values, b.Values[i])
+			}
+		}
+
+		if len(w.Timestamps) > 0 {
+			out = append(out, w)
+		}
+	}
+
+	return fetch.NewSliceIterator(out), nil
 }

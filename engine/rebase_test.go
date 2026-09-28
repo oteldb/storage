@@ -3,7 +3,9 @@ package engine_test
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
@@ -139,4 +141,37 @@ func TestRebaseNeverCommitsTwoAggs(t *testing.T) {
 	require.Len(t, r.RecordedAggs(), 1, "and keeps holding one on the next merge")
 
 	require.ElementsMatch(t, []string{"api", "web"}, queryable(t, be, "api", "web"), "nothing is lost")
+}
+
+// TestAdoptedDataClosesOwnedBucket: writer a's last parts sit in one day, one per 6h bucket, so only
+// the day level can merge them, and the day is a's newest while a writes nothing newer. Writer b
+// keeps ingesting days later, and a adopts b's parts on its next commit. The day is then no longer
+// the newest of the data a serves, so both a's merge and its merge shape must take the run.
+func TestAdoptedDataClosesOwnedBucket(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	be := backend.Memory()
+	a, b, _, _ := rivals(t, be)
+
+	hour, day := int64(time.Hour), 24*int64(time.Hour)
+	base := 10 * day
+
+	for _, ts := range []int64{base + hour, base + 7*hour, base + 13*hour} {
+		mustAppend(t, a, mkSeries("job", "api"), ts, 1)
+		require.NoError(t, a.Flush(ctx))
+	}
+
+	mustAppend(t, b, mkSeries("job", "web"), base+3*day, 1)
+	require.NoError(t, b.Flush(ctx))
+
+	// A late sample in the same day: a's commit loses the CAS and adopts b's part.
+	mustAppend(t, a, mkSeries("job", "api"), base+19*hour, 1)
+	require.NoError(t, a.Flush(ctx))
+	require.Equal(t, 4, a.PartCount())
+
+	assert.Equal(t, 4, a.MergeShapeWith(engine.MergeOptions{}).Candidates, "the shape takes the day's run")
+
+	require.NoError(t, a.MergeWith(ctx, engine.MergeOptions{}))
+	assert.Equal(t, 1, a.PartCount(), "the merge takes it")
 }

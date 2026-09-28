@@ -657,9 +657,10 @@ by the other's Agg, so merges keep them apart:
   itself, so every output records one Agg.
 - Cohorts are scheduled round-robin, background, idle-waiver and `Force` alike, so every cohort is
   still compacted (`cohortRun`).
-- The ladder's still-filling bucket is the one holding the newest sample of all the parts, not of
-  one cohort. A cohort that stops receiving data would otherwise keep its own newest bucket open
-  for ever.
+- The ladder's still-filling bucket is the one holding the newest readable sample: of all the
+  parts, not one cohort's, and of adopted parts too. A cohort that stops receiving data, or a writer
+  that stops ingesting while a rival goes on, would otherwise keep its own newest bucket open for
+  ever.
 - Raw and unmarked parts join the primary cohort, the one recording the Aggs of the oldest marked
   readable part (by `minTime`, then prefix). A late raw sample then rolls like the data that was
   rolled first, whichever node wrote it.

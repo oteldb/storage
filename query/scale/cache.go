@@ -217,7 +217,8 @@ func (c *MemoryCache) Len() int {
 // would serve a record (log/trace) hit as the right number of rows with no data, and dropping
 // [fetch.Batch.ScaleFactors] would serve a sampled metric hit as if every sample weighed 1, biasing
 // the embedder's counts and rates. A nil field stays nil — that is the "not present" signal for
-// both, and [slices.Clone] preserves it.
+// both, and [slices.Clone] preserves it. [fetch.Batch.AmbiguousRollup] is copied too, or a hit would
+// drop the warning the miss raised.
 func cloneBatches(batches []*fetch.Batch) []*fetch.Batch {
 	out := make([]*fetch.Batch, len(batches))
 	for i, b := range batches {
@@ -228,6 +229,8 @@ func cloneBatches(batches []*fetch.Batch) []*fetch.Batch {
 			Values:       slices.Clone(b.Values),
 			ScaleFactors: slices.Clone(b.ScaleFactors),
 			Columns:      cloneColumns(b.Columns),
+
+			AmbiguousRollup: b.AmbiguousRollup,
 		}
 	}
 

@@ -358,12 +358,13 @@ func MergeBatches(groups ...[]*Batch) []*Batch {
 			if a, ok := byID[b.ID]; ok {
 				a.b.Timestamps, a.b.Values, a.b.ScaleFactors = appendSamples(
 					a.b.Timestamps, a.b.Values, a.b.ScaleFactors, b)
+				a.b.AmbiguousRollup = a.b.AmbiguousRollup || b.AmbiguousRollup
 				a.sources++
 
 				continue
 			}
 
-			nb := &Batch{ID: b.ID, Series: b.Series}
+			nb := &Batch{ID: b.ID, Series: b.Series, AmbiguousRollup: b.AmbiguousRollup}
 			nb.Timestamps, nb.Values, nb.ScaleFactors = appendSamples(nil, nil, nil, b)
 
 			byID[b.ID] = &mergeAcc{b: nb, sources: 1}

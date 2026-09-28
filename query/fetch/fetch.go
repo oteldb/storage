@@ -180,7 +180,8 @@ type Batch struct {
 	// representatives rolled up with different aggregations, which cannot be combined: the read
 	// returned one aggregation's and left the others out. Only parts written under different
 	// downsampling policies for one tenant, such as nodes mid-rollout, produce it. The storage
-	// counts it as storage.fetch.rollup_ambiguous_ties.
+	// counts it as storage.fetch.rollup_ambiguous_ties. A decorator that merges batches ORs it,
+	// and one that retains a batch copies it; the cluster fan-out frame does not carry it.
 	AmbiguousRollup bool
 
 	// Columns are the materialized per-record columns (logs); nil for metrics. Each column's
