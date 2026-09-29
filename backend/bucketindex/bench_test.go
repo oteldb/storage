@@ -1,9 +1,11 @@
 package bucketindex_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 )
 
@@ -59,6 +61,28 @@ func BenchmarkIndexDecode(b *testing.B) {
 
 	for b.Loop() {
 		if _, err := bucketindex.Decode(data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkIndexLoad is the read a load and every rebase pay: a versioned read of the stored index
+// and its decode.
+func BenchmarkIndexLoad(b *testing.B) {
+	ctx := context.Background()
+	be := backend.Memory()
+	key := "default/metrics/" + bucketindex.Object
+
+	ix := benchIndex()
+	if _, err := ix.Save(ctx, be, key, backend.VersionAbsent); err != nil {
+		b.Fatal(err)
+	}
+
+	b.SetBytes(int64(len(ix.AppendBinary(nil))))
+	b.ReportAllocs()
+
+	for b.Loop() {
+		if _, _, err := bucketindex.LoadVersioned(ctx, be, key); err != nil {
 			b.Fatal(err)
 		}
 	}

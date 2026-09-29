@@ -83,6 +83,25 @@ func (s *Syncer) FetchWants(
 
 	views, firstErr := s.peerIndexes(ctx, enginePrefix, peers)
 
+	// This node's own lineage is what relates a want for a member of a group split again to a peer's
+	// successor of the outer ancestry, which the peer's index may never have recorded. Without it an
+	// answer of absence would not be evidence, so a failed read is an error for every silent want.
+	local, err := bucketindex.Load(ctx, s.local, enginePrefix+"/"+bucketindex.Object)
+	if err != nil {
+		local = &bucketindex.Index{}
+
+		if firstErr == nil {
+			firstErr = errors.Wrap(err, "load local index")
+		}
+	}
+
+	// One set of relations per peer, answering every want of the batch with the closures it has
+	// already computed.
+	rels := make([]*bucketindex.Relations, len(views))
+	for i := range views {
+		rels[i] = views[i].ix.Relations(local.Lineage()...)
+	}
+
 	tasks := make(map[string]*copyTask)
 
 	enqueue := func(i int, addr string, ent bucketindex.Entry) {
@@ -98,7 +117,7 @@ func (s *Syncer) FetchWants(
 	var silent []int
 
 	for i := range wants {
-		if addr, ent, ok := selectSatisfying(views, wants[i]); ok {
+		if addr, ent, ok := selectSatisfying(views, rels, wants[i]); ok {
 			enqueue(i, addr, ent)
 		} else {
 			silent = append(silent, i)
@@ -346,9 +365,11 @@ func (s *Syncer) shuffled(peers []string) []string {
 // selectSatisfying picks the best entry discharging w across the peers' indexes. Peers are
 // consulted in the given (shuffled) order and [betterCandidate] is strict, so equal candidates
 // resolve to whichever peer the shuffle put first rather than to a fixed one.
-func selectSatisfying(views []peerView, w bucketindex.Want) (addr string, best bucketindex.Entry, ok bool) {
-	for _, v := range views {
-		cand, found := v.ix.Satisfying(w)
+func selectSatisfying(
+	views []peerView, rels []*bucketindex.Relations, w bucketindex.Want,
+) (addr string, best bucketindex.Entry, ok bool) {
+	for i, v := range views {
+		cand, found := rels[i].Satisfying(w)
 		if !found {
 			continue
 		}

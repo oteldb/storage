@@ -118,6 +118,43 @@ func splitOfSeveralInputsKeepsEveryLineage(t *testing.T, k Kind) {
 	assert.Subset(t, storedRows(t, e, streamNames(splitInputs)...), want)
 }
 
+// splitLineageOutlivesItsMembers: a split group's claim is recorded in the index's lineage catalog by
+// the commit that publishes the group, and stays there once every member has left the index and no
+// entry carries the claim any more — which is what lets a want for a member of a group split again be
+// answered by a successor of the outer ancestry.
+func splitLineageOutlivesItsMembers(t *testing.T, k Kind) {
+	t.Helper()
+
+	ctx := context.Background()
+	be := backend.Memory()
+	inputs := k.flushSplitInputs(t, be)
+
+	_, fragments := k.splitAll(t, be, inputs)
+	claim := fragments[0].Claim
+	require.True(t, claim.Valid())
+
+	requireInCatalog := func(when string) {
+		t.Helper()
+
+		ix := k.loadIndex(t, be)
+		assert.Truef(t, slices.ContainsFunc(ix.Catalog, claim.Equal), "%s: the group's claim is in the catalog", when)
+	}
+
+	requireInCatalog("published")
+
+	e := k.open(t, be)
+	require.NoError(t, e.LoadParts(ctx))
+	require.NoError(t, e.Merge(ctx, 1<<62), "retention past every row drops the members whole")
+
+	ix := k.loadIndex(t, be)
+	require.Empty(t, ix.Entries)
+	requireInCatalog("after every member left the index")
+
+	e.Append(t, api(1, 1))
+	require.NoError(t, e.Flush(ctx))
+	requireInCatalog("after a later commit")
+}
+
 // splitOfSeveralInputsRepairsFromPeer is the loss the joint claim prevents: one replica loses a
 // straddler the other merged into day fragments. The peer's index must answer the want, and repair
 // must bring every lost row back rather than acknowledge a hole.

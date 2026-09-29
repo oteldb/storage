@@ -120,7 +120,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	}
 
 	src := e.parts
-	adopted := slices.Collect(maps.Values(e.foreignParts))
+	adopted := append(slices.Collect(maps.Values(e.foreignParts)), e.unopenedLayoutsLocked()...)
 	e.mu.Unlock()
 
 	capBytes := e.mergeCapBytes(ctx)
@@ -307,8 +307,9 @@ var errRollupConflict = errors.New("a rival writer committed a part recording a 
 // part the rival committed that the merge's planning never saw, and whose recorded layout does not
 // nest with the output's ([tiersNest]: another Agg, or a grid that does not nest), means the commit
 // would leave the index holding layouts no later merge can combine. The merge is dropped and the next
-// one replans with that part. A merge whose output records no tier cannot introduce a conflict.
-// Called with e.mu held.
+// one replans with that part. A merge whose output records no tier cannot introduce a conflict. The
+// layout comes from the adopted entry when its part does not open ([Engine.foreignLayoutLocked]), so
+// a rival part this node cannot read still constrains the commit. Called with e.mu held.
 func rollupGuard(readable []*part, marker *block.Rollup, e *Engine) func() error {
 	out, _ := appliedRollup(marker)
 	if !activeTiers(out) {
@@ -321,8 +322,9 @@ func rollupGuard(readable []*part, marker *block.Rollup, e *Engine) func() error
 	}
 
 	return func() error {
-		for _, p := range e.foreignParts {
-			if _, ok := planned[p.prefix]; !ok && !layoutsNest(out, p.rollup) {
+		for i := range e.foreign {
+			ent := &e.foreign[i]
+			if _, ok := planned[ent.Prefix]; !ok && !layoutsNest(out, e.foreignLayoutLocked(ent)) {
 				return errRollupConflict
 			}
 		}

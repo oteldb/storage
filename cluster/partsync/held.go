@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/go-faster/errors"
@@ -124,14 +125,18 @@ type peerAccount struct {
 	stated bool
 	// live are its data entries, the successors an absence can be explained by.
 	live []bucketindex.Entry
+	// rel relates live to what they subsume, by the index's own claims and catalog and the other
+	// side's, since either may be the only one that saw a group split.
+	rel *bucketindex.Relations
 }
 
-func accountOf(ix *bucketindex.Index) peerAccount {
+func accountOf(ix *bucketindex.Index, other bucketindex.Lineage) peerAccount {
 	a := peerAccount{
 		present: make(map[string]struct{}, len(ix.Entries)),
 		claimed: make(map[string]struct{}, len(ix.Wanted)),
 		removed: ix.Removals(),
 		stated:  ix.RecordsRemovals(),
+		rel:     ix.Relations(other...),
 	}
 
 	for i := range ix.Entries {
@@ -182,15 +187,7 @@ func (a peerAccount) accountsFor(e bucketindex.Entry) bool {
 	return a.supersedes(e)
 }
 
-func (a peerAccount) supersedes(e bucketindex.Entry) bool {
-	for i := range a.live {
-		if a.live[i].Supersedes(e) {
-			return true
-		}
-	}
-
-	return false
-}
+func (a peerAccount) supersedes(e bucketindex.Entry) bool { return a.rel.Supersedes(e) }
 
 func (s *Syncer) holdsManifest(ctx context.Context, partPrefix string) (bool, error) {
 	_, err := backend.ReadView(ctx, s.local, partPrefix+"/"+manifestName)
@@ -237,6 +234,21 @@ func retainHeld(peer *bucketindex.Index, h held) *bucketindex.Index {
 	}
 
 	return &ix
+}
+
+// keepLocalLineage is the index to install with the groups only the local catalog recorded added to
+// it. Lineage is facts about groups committed anywhere, so installing a peer's index must not forget
+// one: a want for one of its members may still need it.
+func keepLocalLineage(installed *bucketindex.Index, raw []byte, local *bucketindex.Index) (*bucketindex.Index, []byte) {
+	withLocal := *installed
+	withLocal.Catalog = bucketindex.MergeLineage(installed.Catalog, local.Catalog)
+	withLocal.TrimCatalog()
+
+	if slices.EqualFunc(withLocal.Catalog, installed.Catalog, bucketindex.Claim.Equal) {
+		return installed, raw
+	}
+
+	return &withLocal, withLocal.AppendBinary(nil)
 }
 
 // manifestParts is the parts a listing shows a complete copy of.

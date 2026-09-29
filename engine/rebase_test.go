@@ -14,7 +14,6 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -340,7 +339,6 @@ func (b *blindBackend) setHidden(prefixes ...string) {
 // sees its layout and b commits its Sum output beside a's Count part. The committed index must never
 // hold both; once the manifest reads again, b's rollup must still go through.
 func TestRebaseBlindToAdoptedPart(t *testing.T) {
-	reproduce.Unfixed(t, 745, "a rebase that cannot open an adopted part commits a rollup beside an incompatible one")
 	t.Parallel()
 
 	ctx := context.Background()

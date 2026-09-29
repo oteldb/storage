@@ -261,9 +261,9 @@ to fail over to: a read overlapping a want fails.
   reads as unknown, never raw) / marks (`OTMK`) / column object framing (the
   trailer-dictionary bytes column; the leading layout still read) and key layout, the attribute
   hash+binary encoding (the SeriesID pre-image), symbol table (`OTSY`), the bucket index (format
-  v7: entries with their term-scoped block sets, split claims and writing term, tombstones, wants,
-  per-writer flush watermarks and the block high-water mark — readable back to v1, not writable by
-  older nodes), WAL record framing
+  v8: entries with their term-scoped block sets, split claims, writing term and rollup layout,
+  tombstones, wants, per-writer flush watermarks, the block high-water mark and the lineage catalog —
+  readable back to v1, not writable by older nodes), WAL record framing
   (additive record types), record-key footer (`OTKY`), the metric part column layout
   (`[series:int128, ts:int64, value:float64]` + optional `sf:float64`), and the profile
   symbol-store sidecar (`OTSP`, version 2: a compressed body with its raw length; version 1 still

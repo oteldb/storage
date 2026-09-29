@@ -506,7 +506,7 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 	}
 
 	cmp := compareIndexes(peerIndex, localIndex)
-	acct := accountOf(peerIndex)
+	acct := accountOf(peerIndex, localIndex.Lineage())
 
 	// The obligations only the local side can state. A peer whose index this one supersedes still
 	// holds parts this one never indexed, and no claim path reaches them: the peer can only omit
@@ -540,6 +540,8 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 				zap.String("prefix", enginePrefix), zap.String("peer", addr),
 				zap.Int("claimed", len(h.claimed)), zap.Int("omitted", len(h.omitted)))
 		}
+
+		installed, installedRaw = keepLocalLineage(installed, installedRaw, localIndex)
 	}
 
 	newer := cmp > 0 || (cmp == 0 && !strict && !bytes.Equal(installedRaw, localRaw))
@@ -999,7 +1001,7 @@ const wantAfterPasses = 3
 // confirmedWants is the obligations this node owes for parts only the peer holds, confirmed across
 // [wantAfterPasses] passes. A part that becomes accounted for in between resets.
 func (s *Syncer) confirmedWants(enginePrefix string, peer, local *bucketindex.Index) []bucketindex.Want {
-	ents := unaccountedEntries(peer, accountOf(local), retentionHorizon(local))
+	ents := unaccountedEntries(peer, accountOf(local, peer.Lineage()), retentionHorizon(local))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

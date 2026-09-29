@@ -398,58 +398,9 @@ func (ix *Index) NextBlock(term uint64) Block {
 }
 
 // Covered is the set of blocks the index's data-bearing parts hold between them, including the
-// ancestor blocks of every split group whose members are all present. It is what decides a want is
-// met when no single part contains it.
-func (ix *Index) Covered() Interval { return ix.covered(Entry.Data) }
-
-func (ix *Index) covered(admit func(Entry) bool) Interval {
-	var (
-		runs   = make([]Gap, 0, len(ix.Entries))
-		claims []Claim
-	)
-
-	for i := range ix.Entries {
-		e := &ix.Entries[i]
-		if !admit(*e) {
-			continue
-		}
-
-		if e.Blocks.Valid() {
-			runs = e.Blocks.appendRuns(runs)
-		}
-
-		if e.Claim.Valid() {
-			claims = append(claims, e.Claim)
-		}
-	}
-
-	held := fromRuns(runs)
-
-	// A group whose members were themselves split resolves only once the inner group has, so the
-	// pass repeats while it keeps realizing claims. Each round retires at least one claim, so it
-	// terminates in at most len(claims) rounds.
-	for len(claims) > 0 {
-		rest := claims[:0]
-
-		for _, c := range claims {
-			if held.Contains(c.Group) {
-				held = held.Union(c.Blocks)
-
-				continue
-			}
-
-			rest = append(rest, c)
-		}
-
-		if len(rest) == len(claims) {
-			break
-		}
-
-		claims = rest
-	}
-
-	return held
-}
+// ancestor blocks of every split group — any the index's lineage records — whose members are all
+// present. It is what decides a want is met when no single part contains it.
+func (ix *Index) Covered() Interval { return ix.Relations().Covered() }
 
 // Satisfying returns a part in this index whose data answers w, if any: the part itself if the
 // index still has it, otherwise the largest part containing every block w covers — or, when no
@@ -465,111 +416,28 @@ func (ix *Index) covered(admit func(Entry) bool) Interval {
 //
 // "Largest" is widest interval first, then highest level, then prefix, so the answer does not
 // depend on index order and a caller fetches the fewest objects for the most data.
-func (ix *Index) Satisfying(w Want) (Entry, bool) { return ix.satisfying(w, Entry.Data) }
+func (ix *Index) Satisfying(w Want) (Entry, bool) { return ix.Relations().Satisfying(w) }
+
+// SatisfyingWith is [Index.Satisfying] relating identities by extra lineage as well as this index's
+// own: the catalog of the index that owes w, which is what relates a member of a group split again
+// to a successor of the outer ancestry when the index answering w never saw either split.
+func (ix *Index) SatisfyingWith(w Want, extra Lineage) (Entry, bool) {
+	return ix.Relations(extra...).Satisfying(w)
+}
 
 // Discharging returns the entry that ends w as an obligation: a part satisfying it, or the hole
 // committed in its place. It is what decides a want is no longer outstanding.
-func (ix *Index) Discharging(w Want) (Entry, bool) {
-	return ix.satisfying(w, func(Entry) bool { return true })
-}
+func (ix *Index) Discharging(w Want) (Entry, bool) { return ix.Relations().Discharging(w) }
 
-func (ix *Index) satisfying(w Want, admit func(Entry) bool) (Entry, bool) {
-	var (
-		best  Entry
-		found bool
-	)
-
-	owed := w.Entry()
-
-	for i := range ix.Entries {
-		e := ix.Entries[i]
-		if !admit(e) {
-			continue
-		}
-
-		if e.Prefix == w.Prefix {
-			return e, true
-		}
-
-		if !e.Blocks.Contains(w.Blocks) && !e.Supersedes(owed) {
-			continue
-		}
-
-		if !found || betterSuccessor(e, best) {
-			best, found = e, true
-		}
-	}
-
-	if found {
-		return best, true
-	}
-
-	return ix.jointlySatisfying(w, admit)
-}
-
-// jointlySatisfying answers a want no single part contains: it holds only where the whole index
-// covers w's blocks, and then names the best member of the split group that supplies them.
-func (ix *Index) jointlySatisfying(w Want, admit func(Entry) bool) (Entry, bool) {
-	if !w.Blocks.Valid() || !ix.covered(admit).Contains(w.Blocks) {
-		return Entry{}, false
-	}
-
-	var (
-		best  Entry
-		found bool
-	)
-
-	for i := range ix.Entries {
-		e := ix.Entries[i]
-		if !admit(e) || !e.Claim.Blocks.Contains(w.Blocks) {
-			continue
-		}
-
-		if !found || betterSuccessor(e, best) {
-			best, found = e, true
-		}
-	}
-
-	return best, found
-}
-
-// Missing returns the blocks of the split groups this index would need to answer w and does not
-// hold: the members of every group whose claim covers w but whose own blocks are not all present.
+// Missing returns the blocks this index would need to answer w and does not hold: the members of
+// every split group derived from w's rows, followed through every group the lineage records, that no
+// later group consumed. A member split again is not asked for; the members of its split are.
 //
 // It is what makes a group repairable one member at a time. A want naming a pre-split part is
 // answered by no single peer entry, so repair asks for the group's blocks instead, and the peer
-// resolves each of those against its own index by ordinary containment.
-func (ix *Index) Missing(w Want) []Block {
-	if !w.Blocks.Valid() {
-		return nil
-	}
-
-	held := ix.covered(Entry.Data)
-	if held.Contains(w.Blocks) {
-		return nil
-	}
-
-	var out []Block
-
-	for i := range ix.Entries {
-		c := ix.Entries[i].Claim
-		if !ix.Entries[i].Data() || !c.Valid() || !c.Blocks.Contains(w.Blocks) {
-			continue
-		}
-
-		c.Group.Each(func(b Block) bool {
-			if !held.Contains(Interval{Min: b, Max: b}) && !slices.Contains(out, b) {
-				out = append(out, b)
-			}
-
-			return true
-		})
-	}
-
-	slices.SortFunc(out, Block.Compare)
-
-	return out
-}
+// resolves each of those against its own index — through containment, or its own lineage for a
+// member it split again.
+func (ix *Index) Missing(w Want) []Block { return ix.Relations().Missing(w) }
 
 func betterSuccessor(a, b Entry) bool {
 	switch {
@@ -580,40 +448,6 @@ func betterSuccessor(a, b Entry) bool {
 	default:
 		return a.Prefix < b.Prefix
 	}
-}
-
-// groupClaim is one split group as an index sees it: what it jointly covers, the members that must
-// all be present for that to hold, and the lowest level any present member sits at.
-type groupClaim struct {
-	blocks Interval
-	group  Interval
-	level  uint32
-}
-
-// groupsOf collects the distinct split groups the data-bearing entries carry. A group's own block
-// run is allocated once per shard, so its bounds identify it.
-func groupsOf(entries []Entry) []groupClaim {
-	var out []groupClaim
-
-	for i := range entries {
-		c := entries[i].Claim
-		if !entries[i].Data() || !c.Valid() {
-			continue
-		}
-
-		k := slices.IndexFunc(out, func(g groupClaim) bool {
-			return g.group.Min == c.Group.Min && g.group.Max == c.Group.Max
-		})
-		if k < 0 {
-			out = append(out, groupClaim{blocks: c.Blocks, group: c.Group, level: entries[i].Level})
-
-			continue
-		}
-
-		out[k].level = min(out[k].level, entries[i].Level)
-	}
-
-	return out
 }
 
 // Complete reports whether every member of the split group e belongs to is present among entries,
@@ -633,33 +467,57 @@ func Subsumed(live, added []Entry) map[string]struct{} {
 }
 
 // Subsumed returns the prefixes among live whose rows are wholly inside the parts added: one added
-// part holds them at a higher level, or a split group the addition completes claims them.
+// part holds them at a higher level, or a split group the lineage records, completed by live and
+// added together, claims them below the level of the parts completing it. The group need not be on
+// any entry: an outer group whose members were all split again is realized through the inner ones.
 //
 // Either direction left out keeps two representations of one set of rows live: a part holding a
 // group's whole ancestry beside its members, or the ancestors beside the group a repair completes.
 func (l Lineage) Subsumed(live, added []Entry) map[string]struct{} {
+	return l.Relater().Subsumed(live, added)
+}
+
+// Subsumed is [Lineage.Subsumed] over r's lineage.
+func (r *Relater) Subsumed(live, added []Entry) map[string]struct{} {
 	out := make(map[string]struct{})
 
 	for i := range added {
 		for j := range live {
-			if live[j].Prefix != added[i].Prefix && l.Subsumes(added[i], live[j]) {
+			if live[j].Prefix != added[i].Prefix && r.Subsumes(added[i], live[j]) {
 				out[live[j].Prefix] = struct{}{}
 			}
 		}
 	}
 
 	all := slices.Concat(live, added)
-	held := (&Index{Entries: all}).Covered()
 
-	for _, g := range groupsOf(all) {
-		if !held.Contains(g.group) {
+	var runs []Gap
+
+	for i := range all {
+		if all[i].Data() && all[i].Blocks.Valid() {
+			runs = all[i].Blocks.appendRuns(runs)
+		}
+	}
+
+	_, complete := r.realize(fromRuns(runs))
+
+	for i, c := range r.l {
+		if !complete[i] {
 			continue
 		}
 
-		claimed := l.holds(g.blocks)
+		claimed := r.holds(c.Blocks)
+		if !slices.ContainsFunc(live, func(e Entry) bool { return claimed.Contains(e.Blocks) }) {
+			continue
+		}
+
+		level, ok := r.level(c.Group, all)
+		if !ok {
+			continue
+		}
 
 		for j := range live {
-			if claimed.Contains(live[j].Blocks) && live[j].Level < g.level {
+			if claimed.Contains(live[j].Blocks) && live[j].Level < level {
 				out[live[j].Prefix] = struct{}{}
 			}
 		}
