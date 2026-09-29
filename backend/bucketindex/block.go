@@ -400,46 +400,7 @@ func (ix *Index) NextBlock(term uint64) Block {
 // Covered is the set of blocks the index's data-bearing parts hold between them, including the
 // ancestor blocks of every split group — any the index's lineage records — whose members are all
 // present. It is what decides a want is met when no single part contains it.
-func (ix *Index) Covered() Interval { return ix.covered(Entry.Data, ix.Lineage()) }
-
-func (ix *Index) covered(admit func(Entry) bool, lineage Lineage) Interval {
-	runs := make([]Gap, 0, len(ix.Entries))
-
-	for i := range ix.Entries {
-		e := &ix.Entries[i]
-		if admit(*e) && e.Blocks.Valid() {
-			runs = e.Blocks.appendRuns(runs)
-		}
-	}
-
-	held := fromRuns(runs)
-	claims := slices.Clone(lineage)
-
-	// A group whose members were themselves split resolves only once the inner group has, so the
-	// pass repeats while it keeps realizing claims. Each round retires at least one claim, so it
-	// terminates in at most len(claims) rounds.
-	for len(claims) > 0 {
-		rest := claims[:0]
-
-		for _, c := range claims {
-			if held.Contains(c.Group) {
-				held = held.Union(c.Blocks)
-
-				continue
-			}
-
-			rest = append(rest, c)
-		}
-
-		if len(rest) == len(claims) {
-			break
-		}
-
-		claims = rest
-	}
-
-	return held
-}
+func (ix *Index) Covered() Interval { return ix.Relations().Covered() }
 
 // Satisfying returns a part in this index whose data answers w, if any: the part itself if the
 // index still has it, otherwise the largest part containing every block w covers — or, when no
@@ -455,88 +416,18 @@ func (ix *Index) covered(admit func(Entry) bool, lineage Lineage) Interval {
 //
 // "Largest" is widest interval first, then highest level, then prefix, so the answer does not
 // depend on index order and a caller fetches the fewest objects for the most data.
-func (ix *Index) Satisfying(w Want) (Entry, bool) {
-	return ix.satisfying(w, Entry.Data, ix.Lineage())
-}
+func (ix *Index) Satisfying(w Want) (Entry, bool) { return ix.Relations().Satisfying(w) }
 
 // SatisfyingWith is [Index.Satisfying] relating identities by extra lineage as well as this index's
 // own: the catalog of the index that owes w, which is what relates a member of a group split again
 // to a successor of the outer ancestry when the index answering w never saw either split.
 func (ix *Index) SatisfyingWith(w Want, extra Lineage) (Entry, bool) {
-	return ix.satisfying(w, Entry.Data, ix.Lineage().With(extra...))
+	return ix.Relations(extra...).Satisfying(w)
 }
 
 // Discharging returns the entry that ends w as an obligation: a part satisfying it, or the hole
 // committed in its place. It is what decides a want is no longer outstanding.
-func (ix *Index) Discharging(w Want) (Entry, bool) {
-	return ix.satisfying(w, func(Entry) bool { return true }, ix.Lineage())
-}
-
-func (ix *Index) satisfying(w Want, admit func(Entry) bool, lineage Lineage) (Entry, bool) {
-	var (
-		best  Entry
-		found bool
-	)
-
-	owed := w.Entry()
-	lineage = lineage.With(w.Claim)
-
-	for i := range ix.Entries {
-		e := ix.Entries[i]
-		if !admit(e) {
-			continue
-		}
-
-		if e.Prefix == w.Prefix {
-			return e, true
-		}
-
-		if !e.Blocks.Contains(w.Blocks) && !lineage.Subsumes(e, owed) {
-			continue
-		}
-
-		if !found || betterSuccessor(e, best) {
-			best, found = e, true
-		}
-	}
-
-	if found {
-		return best, true
-	}
-
-	return ix.jointlySatisfying(w, admit, lineage)
-}
-
-// jointlySatisfying answers a want no single part contains: it holds only where the whole index
-// covers w's blocks, and then names the best member of a split group that supplies some of them —
-// one whose group's ancestry, followed through every group lineage records, reaches w's blocks.
-func (ix *Index) jointlySatisfying(w Want, admit func(Entry) bool, lineage Lineage) (Entry, bool) {
-	if !w.Blocks.Valid() || !ix.covered(admit, lineage).Contains(w.Blocks) {
-		return Entry{}, false
-	}
-
-	var (
-		best  Entry
-		found bool
-	)
-
-	for i := range ix.Entries {
-		e := ix.Entries[i]
-		if !admit(e) || !e.Claim.Valid() {
-			continue
-		}
-
-		if up, _ := lineage.With(e.Claim).ancestry(e.Blocks); !meets(up, w.Blocks) {
-			continue
-		}
-
-		if !found || betterSuccessor(e, best) {
-			best, found = e, true
-		}
-	}
-
-	return best, found
-}
+func (ix *Index) Discharging(w Want) (Entry, bool) { return ix.Relations().Discharging(w) }
 
 // Missing returns the blocks this index would need to answer w and does not hold: the members of
 // every split group derived from w's rows, followed through every group the lineage records, that no
@@ -546,48 +437,7 @@ func (ix *Index) jointlySatisfying(w Want, admit func(Entry) bool, lineage Linea
 // answered by no single peer entry, so repair asks for the group's blocks instead, and the peer
 // resolves each of those against its own index — through containment, or its own lineage for a
 // member it split again.
-func (ix *Index) Missing(w Want) []Block {
-	if !w.Blocks.Valid() {
-		return nil
-	}
-
-	lineage := ix.Lineage().With(w.Claim)
-	if _, ok := ix.satisfying(w, Entry.Data, lineage); ok {
-		return nil
-	}
-
-	held := ix.covered(Entry.Data, lineage)
-	_, via := lineage.descendants(w.Blocks)
-
-	var consumed Interval
-
-	for i, c := range lineage {
-		if via[i] {
-			consumed = consumed.Union(c.Blocks)
-		}
-	}
-
-	var out []Block
-
-	for i, c := range lineage {
-		if !via[i] {
-			continue
-		}
-
-		c.Group.Each(func(b Block) bool {
-			one := Single(b)
-			if !held.Contains(one) && !consumed.Contains(one) && !slices.Contains(out, b) {
-				out = append(out, b)
-			}
-
-			return true
-		})
-	}
-
-	slices.SortFunc(out, Block.Compare)
-
-	return out
-}
+func (ix *Index) Missing(w Want) []Block { return ix.Relations().Missing(w) }
 
 func betterSuccessor(a, b Entry) bool {
 	switch {
@@ -656,11 +506,16 @@ func Subsumed(live, added []Entry) map[string]struct{} {
 // Either direction left out keeps two representations of one set of rows live: a part holding a
 // group's whole ancestry beside its members, or the ancestors beside the group a repair completes.
 func (l Lineage) Subsumed(live, added []Entry) map[string]struct{} {
+	return l.Relater().Subsumed(live, added)
+}
+
+// Subsumed is [Lineage.Subsumed] over r's lineage.
+func (r *Relater) Subsumed(live, added []Entry) map[string]struct{} {
 	out := make(map[string]struct{})
 
 	for i := range added {
 		for j := range live {
-			if live[j].Prefix != added[i].Prefix && l.Subsumes(added[i], live[j]) {
+			if live[j].Prefix != added[i].Prefix && r.Subsumes(added[i], live[j]) {
 				out[live[j].Prefix] = struct{}{}
 			}
 		}
@@ -674,7 +529,7 @@ func (l Lineage) Subsumed(live, added []Entry) map[string]struct{} {
 			continue
 		}
 
-		claimed := l.holds(g.blocks)
+		claimed := r.holds(g.blocks)
 
 		for j := range live {
 			if claimed.Contains(live[j].Blocks) && live[j].Level < g.level {

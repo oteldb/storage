@@ -1,5 +1,7 @@
 package bucketindex
 
+import "slices"
+
 // WantOutcome says what an attempt to repair a [Want] concluded when it brought no part back. The
 // distinction is the whole of the safety argument for acknowledging a loss: "no owner has the
 // data" is evidence, and "I did not manage to ask every owner" never is.
@@ -59,14 +61,14 @@ func (ix *Index) Holes() []Entry {
 // ClickHouse, which checks non-existence on every replica in one transaction, an owner here can
 // acknowledge a loss while a peer still holds the data. So a hole must never block the real part:
 // it is replaced by it.
-func Revokes(e, h Entry) bool { return revokes(e, h, nil) }
+func Revokes(e, h Entry) bool { return revokes(e, h, Lineage{h.Claim}.Relater()) }
 
-func revokes(e, h Entry, lineage Lineage) bool {
+func revokes(e, h Entry, r *Relater) bool {
 	if !e.Data() || !h.Hole {
 		return false
 	}
 
-	return e.Prefix == h.Prefix || lineage.With(h.Claim).Subsumes(e, h)
+	return e.Prefix == h.Prefix || r.Subsumes(e, h)
 }
 
 // TrimHoles drops the holes that live revokes, related by the claims live carries and the index's
@@ -74,7 +76,11 @@ func revokes(e, h Entry, lineage Lineage) bool {
 // a repair fetch, a peer's entry adopted under CAS, a merge — revokes the hole as a side effect of
 // committing the part.
 func TrimHoles(holes, live []Entry, catalog ...Claim) []Entry {
-	lineage := (&Index{Entries: live, Catalog: catalog}).Lineage()
+	if len(holes) == 0 {
+		return holes
+	}
+
+	r := (&Index{Entries: slices.Concat(live, holes), Catalog: catalog}).Lineage().Relater()
 	out := holes[:0]
 
 	for j := range holes {
@@ -82,7 +88,7 @@ func TrimHoles(holes, live []Entry, catalog ...Claim) []Entry {
 		revoked := false
 
 		for i := range live {
-			if revokes(live[i], *h, lineage) {
+			if revokes(live[i], *h, r) {
 				revoked = true
 
 				break

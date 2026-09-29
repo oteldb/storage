@@ -25,13 +25,8 @@ func LineageOf(entries []Entry) Lineage {
 //
 // Two parts with one identity written by different tenures — two owners that merged the same inputs
 // either side of a handoff — hold the same rows, and the later tenure's copy subsumes the earlier.
-func (l Lineage) Subsumes(e, o Entry) bool {
-	if e.Term > o.Term && e.sameIdentity(o) {
-		return true
-	}
-
-	return e.Level > o.Level && l.holds(e.Blocks).Contains(o.Blocks)
-}
+// A caller relating many pairs over one lineage uses a [Relater] instead.
+func (l Lineage) Subsumes(e, o Entry) bool { return l.Relater().Subsumes(e, o) }
 
 func (e Entry) sameIdentity(o Entry) bool {
 	return e.Level == o.Level && e.Blocks.Valid() && e.Blocks.Equal(o.Blocks) && e.Claim.Equal(o.Claim)
@@ -43,85 +38,8 @@ func (e Entry) sameIdentity(o Entry) bool {
 // with itself. A split partitions the rows it consumed, so two parts descending from one ancestor
 // through different members of the same group are disjoint; through different groups — two lineages
 // that split the same ancestor apart differently — nothing says how the rows fell, and they may
-// overlap.
-func (l Lineage) Overlaps(a, b Entry) bool {
-	upA, viaA := l.ancestry(a.Blocks)
-	upB, viaB := l.ancestry(b.Blocks)
-
-	if meets(a.Blocks, upB) || meets(b.Blocks, upA) {
-		return true
-	}
-
-	common := intersect(upA, upB)
-	if !common.Valid() {
-		return false
-	}
-
-	for i, c := range l {
-		if viaA[i] != viaB[i] && meets(c.Blocks, common) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// holds is every block whose rows iv includes: iv, and the members of each group whose claimed
-// ancestry it covers, repeated so a group split again resolves through the outer one.
-func (l Lineage) holds(iv Interval) Interval {
-	used := make([]bool, len(l))
-
-	for changed := true; changed; {
-		changed = false
-
-		for i, c := range l {
-			if !used[i] && iv.Contains(c.Blocks) {
-				used[i], changed = true, true
-				iv = iv.Union(c.Group)
-			}
-		}
-	}
-
-	return iv
-}
-
-// ancestry is iv with every block its rows derive from, and which groups that descent passes
-// through.
-func (l Lineage) ancestry(iv Interval) (Interval, []bool) {
-	via := make([]bool, len(l))
-
-	for changed := true; changed; {
-		changed = false
-
-		for i, c := range l {
-			if !via[i] && meets(iv, c.Group) {
-				via[i], changed = true, true
-				iv = iv.Union(c.Blocks)
-			}
-		}
-	}
-
-	return iv, via
-}
-
-// descendants is iv with every block derived from its rows, and which groups that derivation passes
-// through: each group whose claimed ancestry iv meets, and again from that group's members.
-func (l Lineage) descendants(iv Interval) (Interval, []bool) {
-	via := make([]bool, len(l))
-
-	for changed := true; changed; {
-		changed = false
-
-		for i, c := range l {
-			if !via[i] && meets(iv, c.Blocks) {
-				via[i], changed = true, true
-				iv = iv.Union(c.Group)
-			}
-		}
-	}
-
-	return iv, via
-}
+// overlap. A caller relating many pairs over one lineage uses a [Relater] instead.
+func (l Lineage) Overlaps(a, b Entry) bool { return l.Relater().Overlaps(a, b) }
 
 func meets(a, b Interval) bool { return intersect(a, b).Valid() }
 

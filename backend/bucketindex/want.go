@@ -106,14 +106,16 @@ func (ix *Index) Wants() map[string]Want {
 // else: an outstanding want is the only record that a part is owed, so no count trims it (see
 // [MaxWants]).
 func TrimWants(wants []Want, live []Entry, catalog ...Claim) []Want {
-	ix := Index{Entries: live, Catalog: catalog}
-	lineage := ix.Lineage()
-	all := func(Entry) bool { return true }
+	if len(wants) == 0 {
+		return wants
+	}
+
+	rel := (&Index{Entries: live, Catalog: catalog, Wanted: wants}).Relations()
 
 	out := wants[:0]
 	for i := range wants {
 		w := &wants[i]
-		if _, ok := ix.satisfying(*w, all, lineage); ok {
+		if _, ok := rel.Discharging(*w); ok {
 			continue
 		}
 

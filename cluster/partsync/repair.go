@@ -95,7 +95,12 @@ func (s *Syncer) FetchWants(
 		}
 	}
 
-	lineage := local.Lineage()
+	// One set of relations per peer, answering every want of the batch with the closures it has
+	// already computed.
+	rels := make([]*bucketindex.Relations, len(views))
+	for i := range views {
+		rels[i] = views[i].ix.Relations(local.Lineage()...)
+	}
 
 	tasks := make(map[string]*copyTask)
 
@@ -112,7 +117,7 @@ func (s *Syncer) FetchWants(
 	var silent []int
 
 	for i := range wants {
-		if addr, ent, ok := selectSatisfying(views, wants[i], lineage); ok {
+		if addr, ent, ok := selectSatisfying(views, rels, wants[i]); ok {
 			enqueue(i, addr, ent)
 		} else {
 			silent = append(silent, i)
@@ -361,10 +366,10 @@ func (s *Syncer) shuffled(peers []string) []string {
 // consulted in the given (shuffled) order and [betterCandidate] is strict, so equal candidates
 // resolve to whichever peer the shuffle put first rather than to a fixed one.
 func selectSatisfying(
-	views []peerView, w bucketindex.Want, lineage bucketindex.Lineage,
+	views []peerView, rels []*bucketindex.Relations, w bucketindex.Want,
 ) (addr string, best bucketindex.Entry, ok bool) {
-	for _, v := range views {
-		cand, found := v.ix.SatisfyingWith(w, lineage)
+	for i, v := range views {
+		cand, found := rels[i].Satisfying(w)
 		if !found {
 			continue
 		}

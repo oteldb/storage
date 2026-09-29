@@ -125,9 +125,9 @@ type peerAccount struct {
 	stated bool
 	// live are its data entries, the successors an absence can be explained by.
 	live []bucketindex.Entry
-	// lineage relates live to what they subsume: the index's own claims and catalog, and the other
+	// rel relates live to what they subsume, by the index's own claims and catalog and the other
 	// side's, since either may be the only one that saw a group split.
-	lineage bucketindex.Lineage
+	rel *bucketindex.Relations
 }
 
 func accountOf(ix *bucketindex.Index, other bucketindex.Lineage) peerAccount {
@@ -136,7 +136,7 @@ func accountOf(ix *bucketindex.Index, other bucketindex.Lineage) peerAccount {
 		claimed: make(map[string]struct{}, len(ix.Wanted)),
 		removed: ix.Removals(),
 		stated:  ix.RecordsRemovals(),
-		lineage: ix.Lineage().With(other...),
+		rel:     ix.Relations(other...),
 	}
 
 	for i := range ix.Entries {
@@ -187,17 +187,7 @@ func (a peerAccount) accountsFor(e bucketindex.Entry) bool {
 	return a.supersedes(e)
 }
 
-func (a peerAccount) supersedes(e bucketindex.Entry) bool {
-	lineage := a.lineage.With(e.Claim)
-
-	for i := range a.live {
-		if lineage.Subsumes(a.live[i], e) {
-			return true
-		}
-	}
-
-	return false
-}
+func (a peerAccount) supersedes(e bucketindex.Entry) bool { return a.rel.Supersedes(e) }
 
 func (s *Syncer) holdsManifest(ctx context.Context, partPrefix string) (bool, error) {
 	_, err := backend.ReadView(ctx, s.local, partPrefix+"/"+manifestName)

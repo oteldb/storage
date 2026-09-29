@@ -226,6 +226,14 @@ a demonstration.
   carries, since dropping it could turn a want a successor still answers into absence and then a
   hole. Only unreachable claims go; a catalog every claim of which is reached stays above the target,
   and the engine warns once.
+  **Every identity question over a lineage goes through one `Relater`** (and `Index.Relations` over
+  an index), which indexes the claims' block runs and computes each closure — what a set of blocks
+  holds, derives from, or completes — by a work queue that visits only the claims a newly gained run
+  meets, and remembers it. A batch then pays for each part's closure once: a commit's `TrimWants`,
+  a repair pass, partsync's answers to one peer. The naive fixed point rescans the whole lineage until
+  nothing changes, per candidate per want, which a nested catalog near the target turns into seconds
+  under the state lock: `TrimWants` of 256 nested wants over a 4000-claim catalog and 100 live parts
+  took 6.7s that way and takes 10ms this way.
   **An entry carries its part's rollup layout** (`Entry.Rollup`, format v8; nil is unknown), so a
   writer checks a rival's layout without opening the rival's part (`engine/ARCH.md`, "Merge").
   **Allocation is the shard owner's alone, and scoped to its tenure**: `Index.NextBlock(term)` is one

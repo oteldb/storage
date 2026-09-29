@@ -41,7 +41,7 @@ func prune(
 	}
 
 	all := slices.Concat(live, admitted)
-	lineage := bucketindex.LineageOf(all).With(catalog...)
+	lineage := bucketindex.LineageOf(all).With(catalog...).Relater()
 	subsumed := lineage.Subsumed(admitted, all)
 	published := slices.DeleteFunc(admitted, func(e bucketindex.Entry) bool {
 		_, ok := subsumed[e.Prefix]
@@ -111,7 +111,7 @@ type unitOverlaps struct {
 // representation is already in place; failing that, every one overlapping the first overlapping
 // unit by target.
 func overlapping(
-	lineage bucketindex.Lineage, live []bucketindex.Entry, units []Unit, own [][]bucketindex.Entry,
+	lineage *bucketindex.Relater, live []bucketindex.Entry, units []Unit, own [][]bucketindex.Entry,
 	final []bucketindex.Entry, in []bool,
 ) []int {
 	o := overlapsOf(lineage, live, own, final, in)
@@ -150,7 +150,7 @@ func overlapping(
 }
 
 func overlapsOf(
-	lineage bucketindex.Lineage, live []bucketindex.Entry, own [][]bucketindex.Entry, final []bucketindex.Entry, in []bool,
+	lineage *bucketindex.Relater, live []bucketindex.Entry, own [][]bucketindex.Entry, final []bucketindex.Entry, in []bool,
 ) unitOverlaps {
 	owners := make(map[string][]int)
 

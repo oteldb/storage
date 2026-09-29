@@ -73,6 +73,7 @@ func (ix *Index) TrimCatalog() int {
 // and the claim of every live entry.
 func (ix *Index) reachedClaims() map[claimKey]struct{} {
 	l := ix.Lineage()
+	r := l.Relater()
 	out := make(map[claimKey]struct{})
 
 	reach := func(iv Interval, own Claim) {
@@ -80,7 +81,7 @@ func (ix *Index) reachedClaims() map[claimKey]struct{} {
 			out[own.key()] = struct{}{}
 		}
 
-		_, via := l.ancestry(iv)
+		_, via := r.ancestry(iv)
 		for i, used := range via {
 			if used {
 				out[l[i].key()] = struct{}{}
@@ -148,16 +149,33 @@ func compareClaims(a, b Claim) int {
 // With is l and every valid claim of claims it lacks, without writing into l's backing array and
 // without the [MaxLineage] target a stored catalog has: it relates identities, it is not persisted.
 func (l Lineage) With(claims ...Claim) Lineage {
+	if len(claims) == 0 {
+		return l
+	}
+
+	known := make(map[claimKey]struct{}, len(l)+len(claims))
+	for _, c := range l {
+		known[c.key()] = struct{}{}
+	}
+
 	out := l
 
 	for _, c := range claims {
-		if c.Valid() && !slices.ContainsFunc(out, c.Equal) {
-			if len(out) == len(l) {
-				out = slices.Clip(out)
-			}
-
-			out = append(out, c)
+		if !c.Valid() {
+			continue
 		}
+
+		if _, ok := known[c.key()]; ok {
+			continue
+		}
+
+		known[c.key()] = struct{}{}
+
+		if len(out) == len(l) {
+			out = slices.Clip(out)
+		}
+
+		out = append(out, c)
 	}
 
 	return out

@@ -90,10 +90,11 @@ func (p Pass) Run(
 	var plan Plan
 
 	ix := bucketindex.Index{Entries: entries, Catalog: p.Catalog}
+	rel := ix.Relations()
 	pending := make([]Target, 0, len(wants)+len(holes))
 
 	for i := range wants {
-		if _, ok := ix.Satisfying(wants[i]); ok {
+		if _, ok := rel.Satisfying(wants[i]); ok {
 			plan.Stats.Local++
 
 			continue
@@ -104,7 +105,7 @@ func (p Pass) Run(
 
 	for i := range holes {
 		w := bucketindex.WantOf(holes[i], bucketindex.Generation{})
-		if _, ok := ix.Satisfying(w); ok {
+		if _, ok := rel.Satisfying(w); ok {
 			plan.Stats.Revoked++
 
 			continue
