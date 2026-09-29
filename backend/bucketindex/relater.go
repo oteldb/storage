@@ -137,6 +137,37 @@ func (r *Relater) ancestry(iv Interval) (Interval, []bool) {
 	return out, via
 }
 
+// reachAncestry marks in reached the groups iv's ancestry passes through, as [Relater.ancestry]
+// does, sharing reached across calls: a group some earlier call reached is not followed again, so
+// marking the ancestry of a whole part set costs one visit per group rather than one per part.
+func (r *Relater) reachAncestry(reached []bool, iv Interval) {
+	if !iv.Valid() {
+		return
+	}
+
+	var queue []int
+
+	push := func(i int) {
+		if !reached[i] {
+			reached[i] = true
+			queue = append(queue, i)
+		}
+	}
+
+	for k := range iv.nruns() {
+		r.groups.meeting(iv.run(k), push)
+	}
+
+	for len(queue) > 0 {
+		c := r.l[queue[len(queue)-1]]
+		queue = queue[:len(queue)-1]
+
+		for k := range c.Blocks.nruns() {
+			r.groups.meeting(c.Blocks.run(k), push)
+		}
+	}
+}
+
 // descendants is iv with every block derived from its rows, and which groups that derivation passes
 // through: each group whose claimed ancestry iv meets, and again from that group's members.
 func (r *Relater) descendants(iv Interval) (Interval, []bool) {

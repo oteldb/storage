@@ -6,7 +6,7 @@ import "slices"
 // ages the oldest out, as [MaxRemovals] bounds the tombstones: no writer can know when every replica
 // has seen a group, so it is remembered for a bounded number of groups instead.
 //
-// It is a target, not a hard cap. A claim that some outstanding want or hole, or a live entry, still
+// It is a target, not a hard cap. A claim that some outstanding want, hole or live entry still
 // reaches through its ancestry is never aged out ([Index.TrimCatalog]): dropping it could turn a want
 // a successor still answers into definitive absence, and three of those into a hole over rows that
 // exist. Only unreachable claims go, so the catalog outgrows the target only by lineage something
@@ -41,8 +41,8 @@ func (ix *Index) RecordLineage() int {
 }
 
 // TrimCatalog ages the oldest claims out of a catalog above [MaxLineage], but never one the index
-// still reaches: a claim some outstanding want's or hole's ancestry passes through, or one a live
-// entry carries. It reports how many claims remain above [MaxLineage].
+// still reaches: a claim the ancestry of some outstanding want, hole or live entry passes through.
+// It reports how many claims remain above [MaxLineage].
 func (ix *Index) TrimCatalog() int {
 	over := len(ix.Catalog) - MaxLineage
 	if over <= 0 {
@@ -69,36 +69,39 @@ func (ix *Index) TrimCatalog() int {
 }
 
 // reachedClaims is the catalog's claims the index still depends on: the whole upward ancestry of every
-// want and hole — each group whose members its blocks meet, and again from that group's ancestors —
-// and the claim of every live entry.
+// want, hole and live entry — each group whose members its blocks meet, and again from that group's
+// ancestors. A live entry needs its whole ancestry, not only its own claim: once it is lost, its want
+// carries only that claim, and a successor of an outer ancestor answers it only through the rest.
 func (ix *Index) reachedClaims() map[claimKey]struct{} {
 	l := ix.Lineage()
 	r := l.Relater()
+	reached := make([]bool, len(l))
+
+	for i := range ix.Wanted {
+		r.reachAncestry(reached, ix.Wanted[i].Blocks)
+	}
+
+	for i := range ix.Entries {
+		r.reachAncestry(reached, ix.Entries[i].Blocks)
+	}
+
 	out := make(map[claimKey]struct{})
 
-	reach := func(iv Interval, own Claim) {
-		if own.Valid() {
-			out[own.key()] = struct{}{}
+	for i, ok := range reached {
+		if ok {
+			out[l[i].key()] = struct{}{}
 		}
+	}
 
-		_, via := r.ancestry(iv)
-		for i, used := range via {
-			if used {
-				out[l[i].key()] = struct{}{}
-			}
+	for i := range ix.Entries {
+		if c := ix.Entries[i].Claim; c.Valid() {
+			out[c.key()] = struct{}{}
 		}
 	}
 
 	for i := range ix.Wanted {
-		reach(ix.Wanted[i].Blocks, ix.Wanted[i].Claim)
-	}
-
-	for i := range ix.Entries {
-		e := &ix.Entries[i]
-		if e.Hole {
-			reach(e.Blocks, e.Claim)
-		} else if e.Claim.Valid() {
-			out[e.Claim.key()] = struct{}{}
+		if c := ix.Wanted[i].Claim; c.Valid() {
+			out[c.key()] = struct{}{}
 		}
 	}
 

@@ -1064,7 +1064,8 @@ its inputs capped by the merge's byte cap and `maxMergeParts`. Its fragment coun
 span, plus any writer the router sealed early for size or residency — the router holds at most
 `timebucket.MaxOpenWriters` (32) days open at once, which bounds memory, not fragments. The rounds
 terminate because a unit asks for each block at most once per pass, and one answer serves every unit
-needing that block.
+needing that block. Termination is not a work bound: nothing caps the members, nesting levels or
+outer groups the catalog adds to one pass (#751).
 
 **A member no owner holds ends in a hole — only for the want it answers.** Evidence is per
 target. A unit whose own answer satisfies its want — the exact part, a containing successor, or a

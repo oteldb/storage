@@ -224,10 +224,16 @@ a demonstration.
   peer's (`SatisfyingWith`), since the peer may never have seen either split. Only a committed
   claim is recorded: a group run a lost CAS attempt allocated is handed out again, maybe to other
   parts. `MaxLineage` (= `MaxRemovals`) is a target, not a cap: `TrimCatalog` ages the lowest groups
-  out first but never one an outstanding want's or hole's ancestry passes through, or a live entry
-  carries, since dropping it could turn a want a successor still answers into absence and then a
-  hole. Only unreachable claims go; a catalog every claim of which is reached stays above the target,
-  and the engine warns once.
+  out first but never one the ancestry of an outstanding want, a hole or a live entry passes through,
+  since dropping it could turn a want a successor still answers into absence and then a hole. A live
+  entry reaches its whole ancestry, not only its own claim: once it is lost, its want carries only that
+  claim, and an outer ancestor's successor answers it only through the rest. The walk shares one
+  visited set across the whole part set, so each group is followed once: trimming a catalog 200 over
+  the target with 600 live parts over 4200 claims takes 2.7ms, against 1.7ms following only wants and
+  holes. One closure per part costs 6.6ms there, and one closure over the union of every part's blocks
+  costs 390ms, since growing an interval of thousands of runs rebuilds it on each step. Only
+  unreachable claims go; a catalog every claim of which is reached stays above the target, and the
+  engine warns once.
   **Every identity question over a lineage goes through one `Relater`** (and `Index.Relations` over
   an index), which indexes the claims' block runs and computes each closure — what a set of blocks
   holds, derives from, or completes — by a work queue that visits only the claims a newly gained run

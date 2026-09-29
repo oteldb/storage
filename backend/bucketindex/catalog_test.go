@@ -275,3 +275,28 @@ func TestTrimHolesRevokedByCompleteGroup(t *testing.T) {
 	assert.Len(t, bucketindex.TrimHoles([]bucketindex.Entry{hole}, fragments), 1,
 		"without the outer claim nothing relates the fragments to {1,2}")
 }
+
+// TestTrimCatalogKeepsLiveEntryAncestry is the saturation case for a live nested member: it carries
+// only the inner claim, and the outer one lives only in the catalog, with more than MaxLineage newer
+// groups after it. The outer claim is kept, since the live member's ancestry passes through it, so
+// once the member is lost its want is still answered by a successor of the outer ancestry.
+func TestTrimCatalogKeepsLiveEntryAncestry(t *testing.T) {
+	t.Parallel()
+
+	member := innerWant.Entry()
+
+	ix := &bucketindex.Index{Catalog: bucketindex.MergeLineage([]bucketindex.Claim{outerClaim})}
+	ix.Add(member)
+	ix.Catalog = bucketindex.MergeLineage(ix.Catalog, newerGroups(bucketindex.MaxLineage+10))
+
+	assert.Zero(t, ix.RecordLineage())
+	require.Len(t, ix.Catalog, bucketindex.MaxLineage)
+	assert.True(t, ix.Catalog[0].Equal(outerClaim), "the live member still reaches the oldest group")
+
+	require.True(t, ix.Remove(member.Prefix))
+	ix.RecordWant(bucketindex.WantOf(member, bucketindex.Generation{}))
+
+	peer := &bucketindex.Index{Entries: []bucketindex.Entry{successor}}
+	_, ok := peer.SatisfyingWith(bucketindex.WantOf(member, bucketindex.Generation{}), ix.Lineage())
+	assert.True(t, ok, "so a successor of the outer ancestry answers the lost member")
+}

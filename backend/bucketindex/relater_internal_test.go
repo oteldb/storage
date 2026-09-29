@@ -124,6 +124,17 @@ func TestRelaterMatchesTheFixedPoints(t *testing.T) {
 		require.Equal(t, up, gotUp, "ancestry %v over %v", iv, l)
 		require.Equal(t, via, gotVia)
 
+		other := randomSet(rnd)
+		_, otherVia := naiveClose(l, other, func(c Claim) Interval { return c.Group }, func(c Claim) Interval { return c.Blocks })
+		reached := make([]bool, len(l))
+		r.reachAncestry(reached, iv)
+		require.Equal(t, via, reached, "the groups %v's ancestry passes through over %v", iv, l)
+		r.reachAncestry(reached, other)
+
+		for i := range via {
+			require.Equal(t, via[i] || otherVia[i], reached[i], "reached accumulates across calls")
+		}
+
 		down, dvia := naiveClose(l, iv, func(c Claim) Interval { return c.Blocks }, func(c Claim) Interval { return c.Group })
 		gotDown, gotDvia := r.descendants(iv)
 		require.Equal(t, down, gotDown, "descendants %v over %v", iv, l)

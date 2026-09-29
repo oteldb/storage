@@ -2,6 +2,7 @@ package bucketindex_test
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/oteldb/storage/backend/bucketindex"
@@ -143,5 +144,33 @@ func BenchmarkSubsumedNestedLineage(b *testing.B) {
 				bucketindex.LineageOf(all).With(catalog...).Relater().Subsumed(live, added)
 			}
 		})
+	}
+}
+
+// BenchmarkRecordLineageSaturated is a commit's catalog upkeep past the target: the nested catalog
+// with 200 newer groups nothing reaches, and a live set of every chain's innermost member beside the
+// successors, so trimming walks each live part's whole ancestry.
+func BenchmarkRecordLineageSaturated(b *testing.B) {
+	catalog, inner, ancestors := nestedLineage()
+
+	for i := range uint64(200) {
+		base := uint64(1 << 20)
+		catalog = append(catalog, bucketindex.Claim{
+			Blocks: bucketindex.Blocks(base + 2*i), Group: bucketindex.Blocks(base + 2*i + 1),
+		})
+	}
+
+	catalog = bucketindex.MergeLineage(catalog)
+	live := nestedLive(ancestors)
+
+	for i := range inner {
+		live = append(live, inner[i].Entry())
+	}
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		ix := &bucketindex.Index{Entries: live, Catalog: slices.Clone(catalog)}
+		ix.RecordLineage()
 	}
 }
