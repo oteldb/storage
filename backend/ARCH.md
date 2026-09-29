@@ -213,9 +213,11 @@ a demonstration.
   its entries and wants carry (`RecordLineage`), and `Index.Lineage` — the catalog plus the claims
   still on entries and wants — is what every identity question is answered by: `Satisfying`,
   `Discharging`, `TrimWants`, `TrimHoles` (so `Revokes`), joint coverage (`Covered`, which realizes
-  any group the lineage records, transitively) and `Missing` (the members of every group derived from
-  a want's rows that no later group consumed, so a member split again is asked for through its own
-  split). The shared repair pass carries the engine's catalog through every index it builds, down to
+  any group the lineage records, transitively), `Subsumed` (every group the lineage records that the
+  parts complete, not only the groups some entry still carries) and `Missing` (the members of every
+  group derived from a want's rows that no later group consumed, so a member split again is asked for
+  through its own split). A joint answer names any part descending through a recorded split, not
+  only one carrying a claim: a merge that consumed a whole inner group folded its claim away. The shared repair pass carries the engine's catalog through every index it builds, down to
   commit admission (`internal/repair`). A claim is a fact about rows wherever it was recorded, so
   lineages merge freely: a rebase unions the rival's catalog, a replica installing a peer's index
   keeps its own, and `cluster/partsync` answers a want with the wanting node's lineage beside the
@@ -320,8 +322,9 @@ a demonstration.
 - **A hole is revocable.** The commit is not cross-replica atomic (unlike ClickHouse's
   `createEmptyPartInsteadOfLost`, which checks non-existence on every replica in one transaction),
   so an owner may acknowledge a loss while a peer still holds the data. `Revokes` therefore replaces
-  a hole with any data-bearing entry at the same prefix or any successor containing its blocks, and
-  `TrimHoles` runs on every commit — so a repair fetch, a rival's adopted entry and a merge all
+  a hole with any data-bearing entry at the same prefix or any successor containing its blocks,
+  `TrimHoles` also with a complete split group jointly covering it (the answer `Satisfying` gives the
+  hole's want), and `TrimHoles` runs on every commit — so a repair fetch, a rival's adopted entry and a merge all
   revoke it as a side effect. `NextBlock` counts a hole's interval, because the part it stands for
   may yet come back and two parts must never claim one identity.
 - **`LostParts` is monotone and cluster-visible.** It is carried forward across commits and raised

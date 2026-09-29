@@ -183,3 +183,95 @@ func TestLineageWithDoesNotAlias(t *testing.T) {
 	assert.Len(t, b, 2)
 	assert.Equal(t, base, base.With(outerClaim, bucketindex.Claim{}), "a known or unset claim adds nothing")
 }
+
+// TestSubsumedByCatalogOnlyGroup is {1,2} split into {10,11}, each member split again, so the outer
+// claim is on no entry. The four inner fragments hold every row of {1,2}: a lower copy of block 1
+// beside them is subsumed, and neither the fragments nor a successor above them are.
+func TestSubsumedByCatalogOnlyGroup(t *testing.T) {
+	t.Parallel()
+
+	outer := bucketindex.Claim{Blocks: bucketindex.Blocks(1, 2), Group: bucketindex.Blocks(10, 11)}
+	innerA := bucketindex.Claim{Blocks: bucketindex.Blocks(10), Group: bucketindex.Blocks(20, 21)}
+	innerB := bucketindex.Claim{Blocks: bucketindex.Blocks(11), Group: bucketindex.Blocks(22, 23)}
+
+	var fragments []bucketindex.Entry
+	for b := uint64(20); b <= 23; b++ {
+		c := innerA
+		if b >= 22 {
+			c = innerB
+		}
+
+		fragments = append(fragments, bucketindex.Entry{
+			Prefix: fmt.Sprintf("f%d", b), Blocks: bucketindex.Blocks(b), Claim: c, Level: 3,
+		})
+	}
+
+	ancestor := bucketindex.Entry{Prefix: "anc", Blocks: bucketindex.Blocks(1)}
+	above := bucketindex.Entry{Prefix: "above", Blocks: bucketindex.Blocks(1, 7), Level: 4}
+	live := []bucketindex.Entry{ancestor, above}
+
+	assert.Empty(t, bucketindex.LineageOf(fragments).Subsumed(live, fragments),
+		"without the outer claim nothing relates the fragments to block 1")
+
+	got := bucketindex.LineageOf(fragments).With(outer).Subsumed(live, fragments)
+	assert.Equal(t, map[string]struct{}{"anc": {}}, got)
+
+	short := fragments[:3]
+	assert.Empty(t, bucketindex.LineageOf(short).With(outer).Subsumed(live, short),
+		"an incomplete inner group leaves the outer one incomplete")
+}
+
+// TestJointlySatisfyingByMergedFragments is the outer group completed by parts that carry no claim:
+// each inner group was merged whole, folding its claim into the output's blocks. Only the catalog
+// still relates them to {1}, and the want is answered by one of them.
+func TestJointlySatisfyingByMergedFragments(t *testing.T) {
+	t.Parallel()
+
+	outer := bucketindex.Claim{Blocks: bucketindex.Blocks(1), Group: bucketindex.Blocks(10, 11)}
+	innerA := bucketindex.Claim{Blocks: bucketindex.Blocks(10), Group: bucketindex.Blocks(20, 21)}
+	innerB := bucketindex.Claim{Blocks: bucketindex.Blocks(11), Group: bucketindex.Blocks(30, 31)}
+	want := bucketindex.Want{Prefix: "orig", Blocks: bucketindex.Blocks(1)}
+
+	peer := &bucketindex.Index{
+		Entries: []bucketindex.Entry{
+			{Prefix: "ma", Blocks: bucketindex.Blocks(10, 20, 21), Level: 3},
+			{Prefix: "mb", Blocks: bucketindex.Blocks(11, 30, 31), Level: 3},
+			{Prefix: "other", Blocks: bucketindex.Blocks(5), Level: 3},
+		},
+		Catalog: []bucketindex.Claim{outer, innerA, innerB},
+	}
+
+	got, ok := peer.Satisfying(want)
+	require.True(t, ok, "the merged inner groups jointly cover {10,11}, which the outer claim says holds {1}")
+	assert.Contains(t, []string{"ma", "mb"}, got.Prefix, "answered by a part descending from the split")
+
+	got, ok = peer.Discharging(want)
+	require.True(t, ok)
+	assert.Contains(t, []string{"ma", "mb"}, got.Prefix)
+}
+
+// TestTrimHolesRevokedByCompleteGroup is a hole for {1,2} whose rows came back only as a split: no
+// one part holds them, but the complete group does, which is what [bucketindex.Index.Satisfying]
+// already answers the hole's want with. So the hole is revoked, through an entry-carried group and
+// through one recorded only in the catalog, and not by an incomplete one.
+func TestTrimHolesRevokedByCompleteGroup(t *testing.T) {
+	t.Parallel()
+
+	outer := bucketindex.Claim{Blocks: bucketindex.Blocks(1, 2), Group: bucketindex.Blocks(10, 11)}
+	innerA := bucketindex.Claim{Blocks: bucketindex.Blocks(10), Group: bucketindex.Blocks(20, 21)}
+	innerB := bucketindex.Claim{Blocks: bucketindex.Blocks(11), Group: bucketindex.Blocks(22, 23)}
+	hole := bucketindex.Entry{Prefix: "lost", Blocks: bucketindex.Blocks(1, 2), Level: 1, Hole: true}
+
+	member := func(b uint64, c bucketindex.Claim, level uint32) bucketindex.Entry {
+		return bucketindex.Entry{Prefix: fmt.Sprintf("m%d", b), Blocks: bucketindex.Blocks(b), Claim: c, Level: level}
+	}
+
+	members := []bucketindex.Entry{member(10, outer, 2), member(11, outer, 2)}
+	fragments := []bucketindex.Entry{member(20, innerA, 3), member(21, innerA, 3), member(22, innerB, 3), member(23, innerB, 3)}
+
+	assert.Empty(t, bucketindex.TrimHoles([]bucketindex.Entry{hole}, members))
+	assert.Len(t, bucketindex.TrimHoles([]bucketindex.Entry{hole}, members[:1]), 1)
+	assert.Empty(t, bucketindex.TrimHoles([]bucketindex.Entry{hole}, fragments, outer))
+	assert.Len(t, bucketindex.TrimHoles([]bucketindex.Entry{hole}, fragments), 1,
+		"without the outer claim nothing relates the fragments to {1,2}")
+}

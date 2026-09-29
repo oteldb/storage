@@ -74,13 +74,14 @@ func revokes(e, h Entry, r *Relater) bool {
 // TrimHoles drops the holes that live revokes, related by the claims live carries and the index's
 // catalog, returning what remains. It runs on every commit, so any path that brings the data back —
 // a repair fetch, a peer's entry adopted under CAS, a merge — revokes the hole as a side effect of
-// committing the part.
+// committing the part. A hole whose rows came back only as a split is revoked once the group is
+// complete, as [Index.Satisfying] answers the hole's want.
 func TrimHoles(holes, live []Entry, catalog ...Claim) []Entry {
 	if len(holes) == 0 {
 		return holes
 	}
 
-	r := (&Index{Entries: slices.Concat(live, holes), Catalog: catalog}).Lineage().Relater()
+	rel := (&Index{Entries: slices.Concat(live, holes), Catalog: catalog}).Relations()
 	out := holes[:0]
 
 	for j := range holes {
@@ -88,11 +89,15 @@ func TrimHoles(holes, live []Entry, catalog ...Claim) []Entry {
 		revoked := false
 
 		for i := range live {
-			if revokes(live[i], *h, r) {
+			if revokes(live[i], *h, rel.r) {
 				revoked = true
 
 				break
 			}
+		}
+
+		if !revoked && h.Hole {
+			_, revoked = rel.jointlySatisfying(WantOf(*h, Generation{}), Entry.Data, 0)
 		}
 
 		if !revoked {

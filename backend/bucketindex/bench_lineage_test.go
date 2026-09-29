@@ -95,3 +95,53 @@ func BenchmarkSatisfyingWithNestedLineage(b *testing.B) {
 		})
 	}
 }
+
+// nestedCompletion is, for the first n chains of [nestedLineage], the parts completing each chain's
+// outermost group: the first member of every split and both innermost members, so every group of
+// those chains is complete, the outer ones only through the ones nested in them.
+func nestedCompletion(n int) []bucketindex.Entry {
+	var out []bucketindex.Entry
+
+	for c := range n {
+		anc := 1 + uint64(c)*(1+2*benchDepth)
+		consumed := bucketindex.Blocks(anc)
+
+		for d := range benchDepth {
+			a := anc + 1 + 2*uint64(d)
+			claim := bucketindex.Claim{Blocks: consumed, Group: bucketindex.Blocks(a, a+1)}
+			consumed = bucketindex.Blocks(a + 1)
+
+			members := []uint64{a}
+			if d == benchDepth-1 {
+				members = append(members, a+1)
+			}
+
+			for _, m := range members {
+				out = append(out, bucketindex.Entry{
+					Prefix: fmt.Sprintf("c%04d-%d", c, m), Blocks: bucketindex.Blocks(m), Claim: claim, Level: uint32(d + 1),
+				})
+			}
+		}
+	}
+
+	return out
+}
+
+// BenchmarkSubsumedNestedLineage is a repair commit's pruning: the parts completing n nested chains
+// judged against the live set over the whole catalog.
+func BenchmarkSubsumedNestedLineage(b *testing.B) {
+	catalog, _, ancestors := nestedLineage()
+	live := nestedLive(ancestors)
+
+	for _, n := range []int{1, 16, 256} {
+		b.Run(fmt.Sprintf("chains=%d", n), func(b *testing.B) {
+			added := nestedCompletion(n)
+			all := append(append([]bucketindex.Entry(nil), live...), added...)
+			b.ReportAllocs()
+
+			for b.Loop() {
+				bucketindex.LineageOf(all).With(catalog...).Relater().Subsumed(live, added)
+			}
+		})
+	}
+}

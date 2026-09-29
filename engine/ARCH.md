@@ -1022,12 +1022,17 @@ and index commit.
 
 **A unit is committed whole or not at all** (`repair.Admit`), where "whole" means two things.
 First, the unit must answer its want, so a want the peer answered only jointly needs its whole group.
-Second, every group whose claimed ancestry overlaps what this node already holds must be complete. A
-fragment committed beside the ancestors it partly duplicates, with nothing yet able to retire them,
-has those rows read twice. On the record engine, where rows do not collapse by timestamp, it is worse
+Second, every group the unit's rows derive through whose claimed ancestry overlaps what this node
+already holds must be complete, and with it each of its members split again. That includes a group no
+fetched part carries — an outer one whose members were all split again, known only from the lineage
+catalog — so a lost outer member owed beside a divergent copy of the ancestry pulls in the rest of the
+outer group, through the members' own splits. A fragment committed beside the ancestors it partly
+duplicates, with nothing yet able to retire them, has those rows read twice. On the record engine, where rows do not collapse by timestamp, it is worse
 than a read: the next merge folds the lone fragment into a local part, the want stays outstanding,
 and the next pass commits the same fragment again — one duplicate per cycle. Completing the group is
-what retires those ancestors, through `bucketindex.Subsumed`, the same swap a merge publishes.
+what retires those ancestors, through `bucketindex.Subsumed`, the same swap a merge publishes. It
+judges every group the lineage records, catalog-only ones included, completed by the live and fetched
+parts together, and retires what the group claims below the level of the parts completing it.
 
 A member of a group whose ancestry this node no longer holds is different: its rows are rows the
 node lacks, so it is committed on its own, whatever became of its siblings. Requiring the group there
@@ -1198,8 +1203,8 @@ whether the data exists.
 
 **The hole is revocable and re-attempted.** Because the commit is not cross-replica atomic, an owner
 can acknowledge a loss while a peer still holds the part. So every repair pass targets the holes as
-well as the wants, and a hole is replaced by the part turning up — at its exact prefix, or inside a
-containing successor. Holes are held apart from `parts` (there is nothing to open) and re-read from
+well as the wants, and a hole is replaced by the part turning up — at its exact prefix, inside a
+containing successor, or as a complete split group jointly covering it. Holes are held apart from `parts` (there is nothing to open) and re-read from
 the index on load, so an acknowledgement survives a restart. `LostParts` does not fall when a hole
 is revoked.
 

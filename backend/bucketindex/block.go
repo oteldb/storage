@@ -450,40 +450,6 @@ func betterSuccessor(a, b Entry) bool {
 	}
 }
 
-// groupClaim is one split group as an index sees it: what it jointly covers, the members that must
-// all be present for that to hold, and the lowest level any present member sits at.
-type groupClaim struct {
-	blocks Interval
-	group  Interval
-	level  uint32
-}
-
-// groupsOf collects the distinct split groups the data-bearing entries carry. A group's own block
-// run is allocated once per shard, so its bounds identify it.
-func groupsOf(entries []Entry) []groupClaim {
-	var out []groupClaim
-
-	for i := range entries {
-		c := entries[i].Claim
-		if !entries[i].Data() || !c.Valid() {
-			continue
-		}
-
-		k := slices.IndexFunc(out, func(g groupClaim) bool {
-			return g.group.Min == c.Group.Min && g.group.Max == c.Group.Max
-		})
-		if k < 0 {
-			out = append(out, groupClaim{blocks: c.Blocks, group: c.Group, level: entries[i].Level})
-
-			continue
-		}
-
-		out[k].level = min(out[k].level, entries[i].Level)
-	}
-
-	return out
-}
-
 // Complete reports whether every member of the split group e belongs to is present among entries,
 // so the ancestry it claims is covered as if one part held it. It is false for an entry carrying no
 // claim: there is no group to complete.
@@ -501,7 +467,9 @@ func Subsumed(live, added []Entry) map[string]struct{} {
 }
 
 // Subsumed returns the prefixes among live whose rows are wholly inside the parts added: one added
-// part holds them at a higher level, or a split group the addition completes claims them.
+// part holds them at a higher level, or a split group the lineage records, completed by live and
+// added together, claims them below the level of the parts completing it. The group need not be on
+// any entry: an outer group whose members were all split again is realized through the inner ones.
 //
 // Either direction left out keeps two representations of one set of rows live: a part holding a
 // group's whole ancestry beside its members, or the ancestors beside the group a repair completes.
@@ -522,17 +490,34 @@ func (r *Relater) Subsumed(live, added []Entry) map[string]struct{} {
 	}
 
 	all := slices.Concat(live, added)
-	held := (&Index{Entries: all}).Covered()
 
-	for _, g := range groupsOf(all) {
-		if !held.Contains(g.group) {
+	var runs []Gap
+
+	for i := range all {
+		if all[i].Data() && all[i].Blocks.Valid() {
+			runs = all[i].Blocks.appendRuns(runs)
+		}
+	}
+
+	_, complete := r.realize(fromRuns(runs))
+
+	for i, c := range r.l {
+		if !complete[i] {
 			continue
 		}
 
-		claimed := r.holds(g.blocks)
+		claimed := r.holds(c.Blocks)
+		if !slices.ContainsFunc(live, func(e Entry) bool { return claimed.Contains(e.Blocks) }) {
+			continue
+		}
+
+		level, ok := r.level(c.Group, all)
+		if !ok {
+			continue
+		}
 
 		for j := range live {
-			if claimed.Contains(live[j].Blocks) && live[j].Level < g.level {
+			if claimed.Contains(live[j].Blocks) && live[j].Level < level {
 				out[live[j].Prefix] = struct{}{}
 			}
 		}

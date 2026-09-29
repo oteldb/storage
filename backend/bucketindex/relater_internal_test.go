@@ -129,6 +129,15 @@ func TestRelaterMatchesTheFixedPoints(t *testing.T) {
 		require.Equal(t, down, gotDown, "descendants %v over %v", iv, l)
 		require.Equal(t, dvia, gotDvia)
 
-		require.Equal(t, naiveRealize(l, iv), r.realize(iv), "realize %v over %v", iv, l)
+		held := naiveRealize(l, iv)
+		complete := make([]bool, len(l))
+
+		for i, c := range l {
+			complete[i] = held.Contains(c.Group)
+		}
+
+		gotHeld, gotComplete := r.realize(iv)
+		require.Equal(t, held, gotHeld, "realize %v over %v", iv, l)
+		require.Equal(t, complete, gotComplete, "the groups %v completes over %v", iv, l)
 	}
 }

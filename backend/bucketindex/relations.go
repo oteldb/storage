@@ -123,7 +123,7 @@ func (rel *Relations) covered(admit func(Entry) bool, slot int) Interval {
 		}
 	}
 
-	held := rel.r.realize(fromRuns(runs))
+	held, _ := rel.r.realize(fromRuns(runs))
 	rel.covers[slot] = &held
 
 	return held
@@ -165,8 +165,9 @@ func (rel *Relations) satisfying(w Want, admit func(Entry) bool, slot int) (Entr
 }
 
 // jointlySatisfying answers a want no single part contains: it holds only where the whole index
-// covers w's blocks, and then names the best member of a split group that supplies some of them —
-// one whose group's ancestry, followed through every group lineage records, reaches w's blocks.
+// covers w's blocks, and then names the best part descending from a split that supplies some of
+// them — one whose ancestry, followed through every group lineage records, reaches w's blocks. The
+// part need not carry the claim: a merge that consumed a whole inner group folded it into its blocks.
 func (rel *Relations) jointlySatisfying(w Want, admit func(Entry) bool, slot int) (Entry, bool) {
 	if !w.Blocks.Valid() || !rel.covered(admit, slot).Contains(w.Blocks) {
 		return Entry{}, false
@@ -179,11 +180,11 @@ func (rel *Relations) jointlySatisfying(w Want, admit func(Entry) bool, slot int
 
 	for i := range rel.ix.Entries {
 		e := rel.ix.Entries[i]
-		if !admit(e) || !e.Claim.Valid() {
+		if !admit(e) || !e.Blocks.Valid() {
 			continue
 		}
 
-		if up, _ := rel.forClaim(e.Claim).r.ancestry(e.Blocks); !meets(up, w.Blocks) {
+		if up, via := rel.forClaim(e.Claim).r.ancestry(e.Blocks); !slices.Contains(via, true) || !meets(up, w.Blocks) {
 			continue
 		}
 

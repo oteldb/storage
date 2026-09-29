@@ -84,6 +84,22 @@ func (r *Relater) Overlaps(a, b Entry) bool {
 	return false
 }
 
+// Ancestors returns the claims iv's rows derive through: each group iv's blocks belong to, and
+// again each group the members of that one's ancestry belong to.
+func (r *Relater) Ancestors(iv Interval) []Claim {
+	_, via := r.ancestry(iv)
+
+	var out []Claim
+
+	for i, ok := range via {
+		if ok {
+			out = append(out, r.l[i])
+		}
+	}
+
+	return out
+}
+
 // holds is every block whose rows iv includes: iv, and the members of each group whose claimed
 // ancestry it covers, repeated so a group split again resolves through the outer one.
 func (r *Relater) holds(iv Interval) Interval {
@@ -128,23 +144,43 @@ func (r *Relater) descendants(iv Interval) (Interval, []bool) {
 }
 
 // realize is held with the ancestry of every group whose members it holds, repeated so a group whose
-// members were split again resolves once the inner groups have.
-func (r *Relater) realize(held Interval) Interval {
+// members were split again resolves once the inner groups have, and which groups that completes.
+func (r *Relater) realize(held Interval) (Interval, []bool) {
 	if len(r.l) == 0 {
-		return held
+		return held, []bool{}
 	}
 
 	if c, ok := r.lookup(r.realized, held); ok {
-		return c.out
+		return c.out, c.via
 	}
 
-	out, _ := r.close(held, &r.groups, func(c Claim, held Interval) (bool, Interval) {
+	out, via := r.close(held, &r.groups, func(c Claim, held Interval) (bool, Interval) {
 		return held.Contains(c.Group), c.Blocks
 	})
 
-	r.remember(r.realized, held, out, nil)
+	r.remember(r.realized, held, out, via)
 
-	return out
+	return out, via
+}
+
+// level is the lowest level among the data-bearing entries derived from group: the level its
+// completion stands at, whichever members or descendants of them complete it.
+func (r *Relater) level(group Interval, entries []Entry) (uint32, bool) {
+	d, _ := r.descendants(group)
+
+	var (
+		level uint32
+		found bool
+	)
+
+	for i := range entries {
+		e := &entries[i]
+		if e.Data() && e.Blocks.Valid() && d.Contains(e.Blocks) && (!found || e.Level < level) {
+			level, found = e.Level, true
+		}
+	}
+
+	return level, found
 }
 
 // close grows iv to a fixed point: each claim whose indexed runs meet a run iv gains is offered to
