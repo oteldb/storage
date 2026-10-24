@@ -6,12 +6,16 @@ import (
 )
 
 func (e *Engine) selectMergeParts(src []*part, retainFrom, capBytes int64, force bool) []*part {
-	if selected := selectMergeParts(src, retainFrom, capBytes, force); len(selected) > 0 {
+	idle := int(e.idleMerges.Load())
+	if force {
+		idle = mergeIdleRounds
+	}
+	if selected := selectMergePartsIdle(src, retainFrom, capBytes, idle); len(selected) > 0 {
 		return selected
 	}
 
 	return timebucket.Forced(src, partSpan, (*part).sizeBytes, e.compressionForces,
-		func(p *part) bool { return sealed(p, capBytes) }, capBytes, uncappedMergeParts(capBytes))
+		func(p *part) bool { return sealed(p, capBytes) }, capBytes, maxTierParts)
 }
 
 func (e *Engine) compressionForces(p *part) bool {

@@ -16,12 +16,8 @@ import (
 	"github.com/oteldb/storage/internal/timebucket"
 )
 
-// Merge runs one size-tiered compaction cycle, dropping records older than retainFrom (retention;
-// retainFrom ≤ 0 disables it). It compacts only a bounded group of similarly-sized parts plus any part
-// retention must rewrite (see [selectMergeParts]) — not the whole part set — so a single merge's decoded
-// working set is O(part size), not O(dataset). No-op when no tier has accumulated enough parts and no
-// part needs retention. Records are append-only: a stream's records are concatenated across parts (no
-// value dedup) and re-sorted by timestamp.
+// Merge compacts one bounded group and applies retention (unix-nanosecond cutoff; ≤ 0 disables it).
+// Records sharing a timestamp remain in source order; compaction does not deduplicate them.
 func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 	return e.MergeWith(ctx, MergeOptions{RetainFrom: retainFrom})
 }
@@ -40,10 +36,8 @@ type MergeOptions struct {
 	// no-op; the maintenance loop is the only caller for which the opposite is true, because it runs
 	// on one goroutine that also services flush pressure and must not park on a busy budget.
 	Background bool
-	// Force compacts a bucket's unsealed parts whatever their tiers, instead of waiting for one tier
-	// to accumulate minTierParts of them — the operator escape from a part set the tier rule will
-	// never select. It bypasses the selection heuristic only: sealing, the time-bucket ladder, and
-	// the cumulative-bytes cap still bound what one merge decodes and holds.
+	// Force waives the write-amplification guards immediately. Disk size, memory admission,
+	// source count and the time-bucket ladder still bound the merge.
 	Force bool
 }
 
@@ -114,16 +108,8 @@ func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool
 	return res.parts > 0, nil
 }
 
-// merge compacts a bounded, size-tiered group of the engine's parts and returns the number of source
-// parts compacted (0 ⇒ no-op). It does not re-read the whole part set: [selectMergeParts] picks only
-// the parts worth merging this cycle (a same-size tier group plus any part retention must rewrite), so
-// a single merge's working set is O(part size), not O(dataset). Phased like flush: the source-part
-// reads, the compacted-part write/read-back, and the sidecar union happen off the engine lock; only the
-// small metadata publish runs under it. The old parts are retired (not deleted inline) and reclaimed
-// once their in-flight readers drain. Only the background maintenance task calls merge, so the parts
-// mutation has a single writer. A failed merge deletes the outputs it wrote only once it has released
-// flushMu and its grant, so a stalled backend delays this merge alone, and for at most
-// [discardTimeout].
+// merge writes off the engine lock, publishes under it, then reclaims retired inputs.
+// Failed outputs are discarded after releasing flushMu and the memory grant.
 func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, error) {
 	var abandoned []*part
 
@@ -157,7 +143,8 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 	src := e.parts
 	e.mu.Unlock()
 
-	capBytes := e.mergeCapBytes()
+	capBytes := e.mergeCapBytes(ctx)
+	e.lastMergeCap.Store(capBytes)
 
 	// Retention first, and without decoding: a part every one of whose records is older than the
 	// cutoff is dropped whole rather than rewritten into nothing.
@@ -169,6 +156,7 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 	selected := e.selectMergeParts(src, retainFrom, capBytes, opts.Force)
 	if len(selected) == 0 {
 		if dropped == 0 {
+			e.idleMerges.Add(1)
 			// A no-op is indistinguishable from a healthy engine without the shape of what it looked
 			// at; these are the exact inputs to that decision (mirrors the metric engine).
 			sh := e.shapeOf(src, retainFrom, capBytes)
@@ -176,7 +164,8 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 				zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
 				zap.Int("parts", sh.Parts), zap.Int("sealed", sh.Sealed),
 				zap.Int64("cap_bytes", sh.CapBytes), zap.Int("eligible", sh.Backlog),
-				zap.Int("tiers", sh.Tiers), zap.Int("largest_tier_parts", sh.LargestTierParts))
+				zap.Float64("best_multiplier", sh.BestMultiplier),
+				zap.Int("idle_rounds", sh.IdleRounds), zap.Int("waive_after", sh.WaiveAfter))
 		}
 
 		e.mergeDeferred.Store(false)
@@ -187,7 +176,7 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 
 	// Past here the merge reads the selected parts and writes its output, so this is where its memory
 	// allowance must be one it actually holds rather than one it assumed.
-	grant, admitted, err := e.admitMerge(ctx, selected, capBytes, opts.Background)
+	grant, admitted, err := e.admitMerge(ctx, selected, opts.Background)
 	if err != nil {
 		e.mergeDeferred.Store(false)
 
@@ -222,6 +211,8 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 	if err != nil {
 		return mergeResult{parts: dropped}, err
 	}
+
+	e.idleMerges.Store(0)
 
 	planMergeBlocks(selected, newParts)
 
@@ -292,8 +283,7 @@ type mergeResult struct {
 	deferred bool
 }
 
-// partsBytes sums the decoded footprint of ps ([part.sizeBytes]), not its on-disk size — unlike the
-// metric engine's namesake.
+// partsBytes sums stored column bytes.
 func partsBytes(ps []*part) int64 {
 	var n int64
 	for _, p := range ps {
@@ -397,28 +387,13 @@ func (e *Engine) mergeSidecars(ctx context.Context, old []*part, newPrefix strin
 	return writeSidecars(ctx, e.cfg.Backend, newPrefix, stored)
 }
 
-// compact compacts the selected source parts into bounded output part(s), dropping records older
-// than start (retention). It streams both sides: each source is read forward a granule at a time per
-// column ([partCursor]) unless its layout rules that out, when it is decoded whole; each stream's rows
-// are merged across the sources by a k-way heap on (timestamp, source), and routed by timestamp to a
-// writer per day ([timebucket.Router]) that encodes them as they arrive
-// ([recordPartStreamWriter]). A writer is sealed once it has taken capBytes of decoded rows, checked
-// after every append of at most a granule, so a part overshoots it by at most one append; the largest
-// open writer is sealed once the writers leave less room than one append in what the merge's grant
-// has left beside its sources and encoder ([mergeWriterBudget]). A stream may continue in the next
-// part, and the merge never holds a stream or a part. A nil grant is the one [Engine.admitMerge]
-// would reserve, taken with no admission.
-// When the engine has a side store (profiles) the cap does not split a day, but the resident bound
-// still can, and every part it writes carries the symbols its own rows reach. Returns the new parts
-// (empty when retention dropped every record) and the parts failed attempts wrote, which nothing will
-// ever index: a merge that keeps failing the same way would otherwise leave a full set of outputs
-// behind every cycle. Reads the parts off the engine lock; src is the immutable snapshot the caller
-// planned over.
+// compact streams selected inputs into day writers, sealing on encoded bytes and resident state.
+// It returns both published candidates and the failed attempts' outputs to discard.
 func (e *Engine) compact(
 	ctx context.Context, src []*part, start, capBytes int64, grant *mergeGrant,
 ) (out, abandoned []*part, err error) {
 	if grant == nil {
-		grant = &mergeGrant{bytes: e.mergeGrantBytes(ctx, src, capBytes)}
+		grant = &mergeGrant{bytes: e.mergeGrantBytes(ctx, src)}
 	}
 
 	for {
@@ -473,7 +448,7 @@ func (e *Engine) compactStreamed(
 	ctx context.Context, src []*part, start, capBytes int64, grant *mergeGrant,
 ) ([]*part, error) {
 	partBytes := e.mergePartBytes(capBytes)
-	runBytes := partBytes / mergeRunFraction
+	runBytes := e.mergeRunBytes()
 
 	// One set of compressors for every day writer of the merge: a pool per writer would keep an
 	// encoder per open day.
@@ -482,7 +457,7 @@ func (e *Engine) compactStreamed(
 		return nil, err
 	}
 
-	sources, writerLimit, appendReserve, err := e.openGranted(ctx, src, grant, coders, runBytes, e.writerFinishAtCap(src, capBytes))
+	sources, writerLimit, appendReserve, err := e.openGranted(ctx, src, grant, coders, runBytes, e.writerFinishFloor(src))
 	if err != nil {
 		return nil, err
 	}
@@ -563,7 +538,7 @@ func (e *Engine) compactStreamed(
 					return false, err
 				}
 
-				return partBytes > 0 && w.decodedBytes() >= partBytes, nil
+				return partBytes > 0 && w.w.EncodedBytes() >= partBytes, nil
 			})
 			if err != nil {
 				return written(), err
@@ -684,11 +659,6 @@ func (e *Engine) openGranted(
 		}
 	}
 }
-
-// mergeRunFraction is how much of the part bound one append to a day's writer may add before the
-// writer is checked against it: a part reaches at most the bound plus this share of it, however many
-// rows one stream holds in one day.
-const mergeRunFraction = 4
 
 // Close flushes any buffered records to a part and closes the WAL. It does not stop a background
 // loop — the owner ([storage.Storage]) does that before calling Close.

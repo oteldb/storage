@@ -36,8 +36,8 @@ type Limits struct {
 	// MaxPartSize caps a *flushed* part's (approximate, uncompressed) size: a flush splits its
 	// output so no single part exceeds it. It is a structural cap fixed when a tenant's engine is
 	// first created. Zero ⇒ unlimited (one part). It applies to every signal, exactly for metrics
-	// (fixed 32 B/row) and approximately for the record signals (logs/traces/profiles), whose rows
-	// are variable-width and are converted at an assumed average row size.
+	// (fixed 32 B/row) and by measured row bytes for record signals (logs/traces/profiles/exemplars),
+	// whose rows are variable-width.
 	//
 	// It no longer bounds *merged* parts; see MaxMergePartSize.
 	MaxPartSize int64

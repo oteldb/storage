@@ -65,6 +65,8 @@ func splitLineageEngine(be backend.Backend, maxPartBytes int64, repair recordeng
 		MaxPartBytes: maxPartBytes, MergeMemoryBytes: -1, Repair: repair,
 	})
 	e.SetMergeCap(maxPartBytes)
+	e.SetMergeGranule(1)
+	e.SetMergeFrameBytes(1)
 
 	return e
 }

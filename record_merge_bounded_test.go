@@ -63,13 +63,13 @@ func TestRecordMergeBoundedWorkingSet(t *testing.T) {
 	fb, err := backendfile.New(t.TempDir())
 	require.NoError(t, err)
 
-	// Small MaxPartSize so the seal threshold (mergeHeight × MaxPartSize) is reached within the test's
-	// data — exactly what bounds a real backfill. Background loop disabled; the test drives flush/merge.
+	// Explicit flush and stored-byte merge caps reach the seal threshold within this corpus.
+	// Background maintenance is disabled; the test drives one merge per round.
 	s, err := Open(ctx, Options{},
 		WithBackend(fb),
 		WithFlushInterval(-1),
 		WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
-			return tenant.Policy{Limits: tenant.Limits{MaxPartSize: 1 << 20}} // 1 MiB parts
+			return tenant.Policy{Limits: tenant.Limits{MaxPartSize: 1 << 20, MaxMergePartSize: 128 << 10}} // 1 MiB parts
 		})),
 	)
 	require.NoError(t, err)
@@ -154,4 +154,34 @@ func TestMedianSeparatesRegressionFromGCNoise(t *testing.T) {
 		"GC noise (three ~25 MiB pool refills in one half) must not read as growth")
 	assert.Less(t, ratio(linux), 1.5, "a clean run must pass comfortably")
 	assert.Greater(t, ratio(regression), 1.5, "a merge that grows with the dataset must still fail")
+}
+
+//nolint:paralleltest // allocation counters and GC policy are process-wide
+func TestRecordMergeAllocationCeiling(t *testing.T) {
+	requireCleanProcess(t)
+	ctx := context.Background()
+	fb, err := backendfile.New(t.TempDir())
+	require.NoError(t, err)
+	const budget = 32 << 20
+	s, err := Open(ctx, Options{MergeMemoryBytes: budget}, WithBackend(fb), WithFlushInterval(-1),
+		WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+			return tenant.Policy{Limits: tenant.Limits{MaxPartSize: 1 << 20, MaxMergePartSize: 8 << 20}}
+		})))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close(ctx)) })
+	var logical int64
+	for round := range 6 {
+		_, err = s.WriteLogs(ctx, genLogRound(round, 4, 400, &logical))
+		require.NoError(t, err)
+		eng, ok := s.lookupLogEngine("default")
+		require.True(t, ok)
+		require.NoError(t, eng.Flush(ctx))
+	}
+	eng, ok := s.lookupLogEngine("default")
+	require.True(t, ok)
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	allocated := heaptest.Allocated(func() { require.NoError(t, eng.Merge(ctx, 0)) })
+	assert.LessOrEqual(t, allocated, uint64(2*budget), "allocation volume must stay bounded under a small merge pool")
+	t.Logf("merge allocated %.2f MiB under a 32 MiB pool", float64(allocated)/(1<<20))
 }

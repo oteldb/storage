@@ -17,6 +17,7 @@ import (
 	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/heaptest"
+	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -28,7 +29,7 @@ func mergeGrantPeak(t *testing.T, e *Engine, b *heaptest.FileSampler) (heap, gra
 	defer SetMergeResidentObserver(func(_, _, _, g int64) { grant = g })()
 
 	heap = int64(heaptest.Resident(t, b, func() {
-		_, err := e.compactParts(context.Background(), e.parts, minInt64, e.mergeCapBytes(), nil)
+		_, err := e.compactParts(context.Background(), e.parts, minInt64, e.mergeCapBytes(context.Background()), nil)
 		require.NoError(t, err)
 	}))
 
@@ -173,4 +174,31 @@ func TestMergeSparseYearsHoldsItsGrant(t *testing.T) {
 
 	t.Logf("%d sources × %d days: merge heap %.1f MiB, grant %.1f MiB", sources, days, float64(heap)/(1<<20), float64(grant)/(1<<20))
 	assert.LessOrEqual(t, heap, grant, "the sealed parts outgrew the merge's grant")
+}
+
+//nolint:paralleltest // samples process-wide live heap
+func TestCompressedLogsFitSmallMergeBudget(t *testing.T) {
+	fb, err := file.New(t.TempDir())
+	require.NoError(t, err)
+	b := &heaptest.FileSampler{File: fb, Writes: true}
+	e := budgetLogEngine(t, b, 24)
+	const budget = 32 << 20
+	pool := memlimit.NewPool(budget)
+	e.cfg.MergeAdmission = poolAdmission(pool)
+	var grant int64
+	defer SetMergeResidentObserver(func(_, _, _, g int64) { grant = max(grant, g) })()
+	peak := heaptest.Resident(t, b, func() {
+		for range 30 {
+			_, mergeErr := e.MergeStep(context.Background(), MergeOptions{Background: true})
+			require.NoError(t, mergeErr)
+			if e.PartCount() == 1 {
+				break
+			}
+		}
+	})
+	require.Len(t, e.parts, 1)
+	require.Positive(t, grant)
+	assert.LessOrEqual(t, grant, int64(budget), "this fixture must stay within its configured pool")
+	assert.LessOrEqual(t, peak, uint64(budget), "decoded log volume must not size the working set")
+	t.Logf("192 MiB logical logs: live merge heap %.2f MiB, grant %.2f MiB", float64(peak)/(1<<20), float64(grant)/(1<<20))
 }

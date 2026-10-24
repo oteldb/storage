@@ -31,7 +31,11 @@ func wholeReadOpen(desc block.ColumnDesc) int64 {
 // sourceBound bounds from p's manifest what the merge source it opens as will cost, so a merge can
 // reserve its memory before opening anything. ok is false when the manifest cannot size a column the
 // source reads.
-func (e *Engine) sourceBound(ctx context.Context, p *part) (b sourceBudget, ok bool) {
+func (e *Engine) sourceBound(ctx context.Context, p *part) (sourceBudget, bool) {
+	return e.sourceBoundWindow(ctx, p, e.mergeReadWindow)
+}
+
+func (e *Engine) sourceBoundWindow(ctx context.Context, p *part, window int64) (b sourceBudget, ok bool) {
 	if !forwardReadable(p.ranges) || mergeReadWhole || p.tsDisorder.Load() {
 		return wholeBound(p)
 	}
@@ -58,7 +62,7 @@ func (e *Engine) sourceBound(ctx context.Context, p *part) (b sourceBudget, ok b
 			b.steady += rows * 8
 			b.open = max(b.open, wholeReadOpen(desc))
 		default:
-			steady, open, ok := p.reader.ScanBound(ctx, name, e.mergeReadWindow)
+			steady, open, ok := p.reader.ScanBound(ctx, name, window)
 			if !ok {
 				return false
 			}
@@ -100,7 +104,7 @@ func (e *Engine) sourceBound(ctx context.Context, p *part) (b sourceBudget, ok b
 			b.open = max(b.open, wholeReadOpen(desc))
 			b.entries += int(rows)
 		default:
-			steady, open, ok := p.reader.ScanBound(ctx, name, e.mergeReadWindow)
+			steady, open, ok := p.reader.ScanBound(ctx, name, window)
 			if !ok {
 				return sourceBudget{}, false
 			}
@@ -174,10 +178,10 @@ func intColumnNames(schema *Schema) []string {
 func gatherBound(p *part) int64 {
 	rows := int64(p.reader.RowCount())
 
-	return 5*p.sizeBytes() + rows*(8+40*int64(p.schema.numBytes()))
+	return 5*p.decodedBytes() + rows*(8+40*int64(p.schema.numBytes()))
 }
 
-// mergeFloorRun is the run the writer budget assumes for a merge not bound by a part size.
+// mergeFloorRun bounds decoded bytes appended before the next resident check.
 const mergeFloorRun = 1 << 20
 
 // appendReserve is the room the router keeps for one append: a writer binding every source's
@@ -216,16 +220,16 @@ func writerFinishBase(schema *Schema) int64 {
 // mergeNeed is what a merge of src must be able to hold before anything opens: the sources as their
 // manifests bound them, and on top the larger of what opening one column holds — the sources open
 // one column at a time, before any writer — and the encoders with the writers' floor: two appends and
-// one writer's finish at the cap ([Engine.writerFinishAtCap]).
+// the writer finish floor ([Engine.writerFinishFloor]).
 // ok is false when a source's manifest cannot say.
-func (e *Engine) mergeNeed(ctx context.Context, src []*part, capBytes int64) (int64, bool) {
+func (e *Engine) mergeNeed(ctx context.Context, src []*part) (int64, bool) {
 	var (
 		steady, open int64
 		entries      int
 	)
 
 	for _, p := range src {
-		b, ok := e.sourceBound(ctx, p)
+		b, ok := e.sourceBoundWindow(ctx, p, e.mergeWindow(len(src)))
 		if !ok {
 			return 0, false
 		}
@@ -240,8 +244,8 @@ func (e *Engine) mergeNeed(ctx context.Context, src []*part, capBytes int64) (in
 		return 0, false
 	}
 
-	writers := coders.workspace() + e.writerFinishAtCap(src, capBytes) +
-		2*appendReserve(e.cfg.Schema, entries, e.mergePartBytes(capBytes)/mergeRunFraction)
+	writers := coders.workspace() + e.writerFinishFloor(src) +
+		2*appendReserve(e.cfg.Schema, entries, e.mergeRunBytes())
 
 	return steady + max(open, writers), true
 }
@@ -343,29 +347,19 @@ func (p *part) residentBytes() int64 {
 	return n
 }
 
-// writerFinishAtCap estimates what one writer charges for its finish
-// ([recordPartStreamWriter.finishBytes]) once it holds a part at the cap, so the writers' floor lets a
-// part reach it: the cap's share of the sources' rows as stream ids, every source stream's range,
-// watermark and identity, the sources' blooms and record keys built, encoded and read back, and for
-// each dictionary-coded column its region, serialized and compressed, at the least of its sources'
-// shared dictionaries, the cap and the dictionary cap; a column no source built a dictionary for
-// charges only its last frame. With no cap, or a side store, a part is the whole merge.
-//
-// It sizes the floor, not a charge: a writer charges its actual finish in its resident, so an output
-// dictionary past its sources' — values their declined granules held joining the merged one — seals
-// that part early rather than holding more than the grant.
-func (e *Engine) writerFinishAtCap(src []*part, capBytes int64) int64 {
+// writerFinishFloor reserves room for a bounded writer's finish, independent of its disk target.
+// Actual finish state is charged as it grows, so the router seals before exceeding its grant.
+func (e *Engine) writerFinishFloor(src []*part) int64 {
 	const (
 		idBytes    = 16
 		runBytes   = 24
 		wmarkBytes = 24
 	)
 
-	var rows, decoded, streams, sidecars int64
+	var rows, streams, sidecars int64
 
 	for _, p := range src {
 		rows += int64(p.reader.RowCount())
-		decoded += p.sizeBytes()
 		streams += int64(len(p.ranges))
 
 		for _, f := range p.blooms {
@@ -377,15 +371,8 @@ func (e *Engine) writerFinishAtCap(src []*part, capBytes int64) int64 {
 		}
 	}
 
-	part := decoded
-	if c := e.mergePartBytes(capBytes); c > 0 {
-		part = min(part, c)
-	}
-
-	n := sidecars + writerFinishBase(e.cfg.Schema)
-	if decoded > 0 {
-		n += int64(idBytes * float64(rows) * float64(part) / float64(decoded))
-	}
+	part := min(rows*idBytes, e.mergeMemoryBudgetBytes()/8)
+	n := sidecars + writerFinishBase(e.cfg.Schema) + part
 
 	n += streams * (runBytes + int64(unsafe.Sizeof(streamRange{})) + wmarkBytes + int64(unsafe.Sizeof(series.Entry{})))
 	n += e.identitiesBound(src)
@@ -404,7 +391,7 @@ func (e *Engine) writerFinishAtCap(src []*part, capBytes int64) int64 {
 		}
 
 		// The dictionary serialized, and the region buffer it compresses into at worst.
-		dict = min(dict, part, block.DefaultSharedDictBytes)
+		dict = min(dict, block.DefaultSharedDictBytes)
 		n += 2*dict + dict/255 + 128
 	}
 

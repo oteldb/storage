@@ -74,7 +74,7 @@ func (e *Engine) openMergeSources(ctx context.Context, src []*part) ([]mergeSour
 		forward := forwardReadable(p.ranges)
 
 		if forward && !mergeReadWhole && !p.tsDisorder.Load() {
-			c, err := openPartCursor(ctx, p, e.mergeReadWindow)
+			c, err := openPartCursor(ctx, p, e.mergeWindow(len(src)))
 			if err != nil {
 				return nil, errors.Wrapf(err, "open part %q for merge", p.prefix)
 			}

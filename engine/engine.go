@@ -79,18 +79,11 @@ type Config struct {
 	// output so no single part exceeds it. 0 ⇒ unlimited. A merged part is sized by
 	// MergeCeilingBytes instead.
 	MaxPartBytes int64
-	// MergeCeilingBytes is the upper bound on a merged part's size *on disk*; the effective cap is
-	// the least of it, this merge's share of the backend's free space, and — over a backend that
-	// takes objects whole — what the merge may hold in memory (see mergecap.go). 0 ⇒
-	// defaultMergeCeilingBytes; negative ⇒ unlimited (never seal).
+	// MergeCeilingBytes bounds stored part bytes, lowered by available disk space.
+	// Zero defaults to 16 GiB; negative disables disk sealing. Memory is bounded separately.
 	MergeCeilingBytes int64
-	// MergeMemoryBytes is how much memory all concurrent merges together may hold. Over a backend
-	// that takes objects whole a merged part is buffered encoded in RAM until it is sealed, so this —
-	// not free space — is what stops a part from outgrowing the process on a node whose disk dwarfs
-	// its memory limit. Over one implementing backend.ObjectCreator the part streams out as it is
-	// encoded, so this bounds the per-series state a merge still holds and the disk sizes the part.
-	// 0 ⇒ a share of GOMEMLIMIT, or defaultMergeMemoryBytes when the process declares no limit;
-	// negative ⇒ unbounded (only the ceiling and free space then apply).
+	// MergeMemoryBytes bounds resident merge state, including retained output on whole-object backends.
+	// Zero derives a process share; negative disables memory admission limits.
 	MergeMemoryBytes int64
 	// MergeConcurrency reports how many merges may run concurrently against this backend — the
 	// caller's fan-out. It divides the free space, so concurrent merges cannot collectively exhaust

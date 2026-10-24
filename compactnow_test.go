@@ -33,8 +33,8 @@ func bulkLogRecords(first, n int) [][3]any {
 
 // TestCompactNowBreaksMergeFixedPoint reproduces the state that made #287 an evening's work: one
 // large part and one small one, in different size tiers, so no tier holds the two parts the
-// selector waits for. A maintenance cycle selects nothing however often it runs — the part count is
-// a fixed point — and only a forced compaction moves it.
+// selector waits for. A forced compaction waives the write-amplification guard without waiting
+// for the next background selection to apply its idle waiver.
 func TestCompactNowBreaksMergeFixedPoint(t *testing.T) {
 	t.Parallel()
 
@@ -63,9 +63,9 @@ func TestCompactNowBreaksMergeFixedPoint(t *testing.T) {
 	assert.Equal(t, 0, st.SealedParts, "neither part is near the cap")
 	assert.Equal(t, 2, st.MergeBacklog, "both parts remain mergeable")
 	assert.Zero(t, st.MergeCandidates, "yet the selector would take none of them — the fixed point")
-	assert.Positive(t, st.MergeCapBytes, "the seal threshold in effect is reported")
+	assert.Zero(t, st.MergeCapBytes, "the disk cutoff is measured at the first merge")
 
-	// The background cycle is a no-op here however many times it runs.
+	// Three no-op cycles arm the idle waiver; the operator may waive it immediately.
 	for range 3 {
 		require.NoError(t, s.Admin().MaintainNow(ctx))
 	}

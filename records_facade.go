@@ -74,29 +74,26 @@ func (s *Storage) recordEngineCached(
 		side = newSide()
 	}
 
+	limits := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Limits
 	e := recordengine.New(recordengine.Config{
-		Schema:    schema,
-		OOOWindow: s.opts.OOOWindow,
-		Backend:   s.backendFor(tid),
-		Prefix:    prefix,
-		Term:      s.termFor(tid),
-		WriterID:  s.writerID(),
-		SideStore: side,
-		WAL:       w,
-		Obs:       s.obs,
-		Signal:    sig.String(),
-		// Bound part size so size-tiered compaction can seal large parts and keep the merge's working
-		// set O(part size) instead of O(dataset) (records_facade shares this with the metric engine's
-		// engineFor). Resolved from the tenant policy, falling back to defaultMaxPartBytes when unset.
-		MaxPartBytes: partSizeOrDefault(s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Limits.MaxPartSize),
-		// And bound what the merge may hold while doing it: the tiering target is a multiple of the
-		// part size, which says nothing about the memory this process has.
-		MergeMemoryBytes: s.opts.MergeMemoryBytes,
-		MergeConcurrency: s.mergeConcurrency,
-		MergeAdmission:   s.admitMerge,
-		MinFreeBytes:     s.opts.MinFreeBytes,
-		MinFreeInodes:    s.opts.MinFreeInodes,
-		OrphanGrace:      s.opts.OrphanGrace,
+		Schema:            schema,
+		OOOWindow:         s.opts.OOOWindow,
+		Backend:           s.backendFor(tid),
+		Prefix:            prefix,
+		Term:              s.termFor(tid),
+		WriterID:          s.writerID(),
+		SideStore:         side,
+		WAL:               w,
+		Obs:               s.obs,
+		Signal:            sig.String(),
+		MaxPartBytes:      partSizeOrDefault(limits.MaxPartSize),
+		MergeCeilingBytes: limits.MaxMergePartSize,
+		MergeMemoryBytes:  s.opts.MergeMemoryBytes,
+		MergeConcurrency:  s.mergeConcurrency,
+		MergeAdmission:    s.admitMerge,
+		MinFreeBytes:      s.opts.MinFreeBytes,
+		MinFreeInodes:     s.opts.MinFreeInodes,
+		OrphanGrace:       s.opts.OrphanGrace,
 		// ZSTD-compress compacted parts: record byte columns are dict-coded but not entropy-coded, so
 		// the cold, long-lived data is otherwise stored far larger than necessary (≈10× on logs).
 		// Flushes stay codec-only, so ingest is unaffected.

@@ -107,7 +107,7 @@ func (c *goldenCorpus) mergeAll(t *testing.T, retainFrom int64) {
 
 	ctx := context.Background()
 
-	for range 16 {
+	for range 4*c.e.PartCount() + 16 {
 		prev := c.e.PartPrefixes()
 
 		require.NoError(t, c.e.MergeWith(ctx, recordengine.MergeOptions{RetainFrom: retainFrom, Force: true}))
@@ -130,7 +130,7 @@ func goldenMergeCorpus(t *testing.T, b backend.Backend, maxPartBytes, window int
 	c := &goldenCorpus{
 		e: recordengine.New(recordengine.Config{
 			Schema: goldenSchema, Backend: b, Prefix: "golden/logs",
-			MaxPartBytes: maxPartBytes, MergeMemoryBytes: -1,
+			MaxPartBytes: maxPartBytes, MergeCeilingBytes: maxPartBytes, MergeMemoryBytes: -1,
 			MergeCompression: compress.AlgorithmZSTD,
 		}),
 		rnd: rand.New(rand.NewPCG(7, 11)),
@@ -185,6 +185,9 @@ func TestMergeOutputGolden(t *testing.T) {
 					b := tc.Open(t)
 					e := goldenMergeCorpus(t, b, shape.maxPart, window)
 
+					if shape.name == "split" {
+						require.Greater(t, e.PartCount(), 1)
+					}
 					gold.Str(t, backendtest.Digest(t, b, e.PartPrefixes()), shape.goldFile)
 				})
 			}

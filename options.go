@@ -153,15 +153,10 @@ type Options struct {
 	// memory); negative ⇒ unbounded, for an embedder that bounds reads itself.
 	MaxQueryBytes int64
 
-	// MergeMemoryBytes caps how much memory all concurrent merges together may hold. What that
-	// bounds depends on the backend: one that takes objects whole makes a merge buffer its output
-	// part *encoded* in RAM until it is sealed, so part size and merge memory are the same number and
-	// free space cannot bound it — a small process over a large volume would size parts it cannot
-	// hold. A backend that builds objects incrementally (the file backend) is handed each column as
-	// it is encoded, so the disk sizes the part and this bounds only the per-series state the merge
-	// still holds. Either way it is what keeps compaction inside the memory budget. Zero ⇒ a share of
-	// GOMEMLIMIT (a fixed default when the process declares no limit); negative ⇒ unbounded, for an
-	// embedder that bounds merge memory itself.
+	// MergeMemoryBytes limits resident merge state independently of stored part size. Streamed
+	// outputs hold windows, frames and per-series state; whole-object backends also charge retained
+	// encoded output. Zero derives a share of GOMEMLIMIT (then cgroup or host memory); negative opts out.
+	// Admission may exceed the pool for an indivisible input, reported as an over-budget merge.
 	//
 	// It also decides how many merges run at once: the budget admits as many as can each hold a
 	// usable allowance, capped by the maintenance fan-out (min of [Options.MaintenanceConcurrency]

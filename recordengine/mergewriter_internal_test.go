@@ -200,9 +200,17 @@ func checkStreamedMatchesBuffered(t *testing.T, s streamedShape) {
 		require.Equal(t, day, timebucket.Of(p.maxTime, timebucket.Top()), "an output part fits one day")
 
 		if s.capBytes > 0 && e.cfg.SideStore == nil {
-			granuleBytes := int64(s.granule) * int64(maxRowBytes(t, p))
-			require.LessOrEqual(t, p.sizeBytes(), s.capBytes+max(granuleBytes, s.capBytes/mergeRunFraction)+
-				int64(maxRowBytes(t, p)), "a part overshoots its cap by at most one append")
+			// Stored bytes include dictionaries finalized only at close, plus a frame per column.
+			// The last append can also contain a full source granule.
+			slack := int64(len(p.reader.Manifest().Columns)) * (64 << 10)
+			columns := p.reader.Manifest().Columns
+			for i := range columns {
+				c := &columns[i]
+				slack += c.DictLen
+			}
+			granuleBytes := int64(max(s.granule, mergeGranuleRows)) * int64(maxRowBytes(t, p))
+			require.LessOrEqual(t, p.sizeBytes(), s.capBytes+max(granuleBytes, e.mergeRunBytes())+slack,
+				"stored bytes exceed the disk cap plus one append and unfinished column state")
 		}
 
 		checkPartMatchesBuffered(t, e, p)
@@ -390,6 +398,7 @@ func TestPlanMergeBlocksSameStreamBothSides(t *testing.T) {
 	ctx := context.Background()
 	e := New(Config{Schema: headTestSchema, Backend: backend.Memory(), Prefix: "t/midstream", MergeMemoryBytes: -1})
 	e.mergeGranule = 16
+	e.mergeFrameBytes = 1
 
 	series := signal.Series{Resource: signal.Resource{Attributes: signal.NewAttributes(
 		signal.KeyValue{Key: []byte("service.name"), Value: signal.StringValue([]byte("svc"))},
@@ -448,8 +457,9 @@ func TestPlanMergeBlocksSameStreamBothSides(t *testing.T) {
 	// The same shape through the engine: fragments committed, each with a fresh block and the joint
 	// claim, and the stream still reads back whole.
 	e2 := New(Config{Schema: headTestSchema, Backend: backend.Memory(), Prefix: "t/midstream",
-		MaxPartBytes: 4 << 10, MergeMemoryBytes: -1})
-	e2.mergeGranule, e2.mergeCap = 16, 4<<10
+		MaxPartBytes: 0, MergeMemoryBytes: -1, MergeCompression: compress.AlgorithmZSTD})
+	e2.mergeGranule, e2.mergeCap = 1, 4<<10
+	e2.mergeFrameBytes = 1
 
 	for _, p := range src {
 		c, err := p.readCols(ctx, fullSel(headTestSchema), nil, nil)

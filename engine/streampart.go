@@ -52,6 +52,7 @@ type partStreamWriter struct {
 	rows       int
 	minT, maxT int64
 	haveTime   bool
+	buffered   bool
 }
 
 // newPartStreamWriter starts an output part. comp and precisionBits are fixed for the whole part —
@@ -102,7 +103,10 @@ func newPartStreamWriter(
 		}
 	}
 
-	return &partStreamWriter{e: e, w: w, prefix: prefix, withSF: withSF, withStats: withStats}, nil
+	return &partStreamWriter{
+		e: e, w: w, prefix: prefix, withSF: withSF, withStats: withStats,
+		buffered: !backend.StreamsWrites(e.cfg.Backend),
+	}, nil
 }
 
 // appendSeries appends one series' samples; a nil sf means every weight is 1. covered is the newest
@@ -177,6 +181,9 @@ func (p *partStreamWriter) residentBytes() int64 {
 	total += int64(cap(p.wmarks)) * wmarkBytes
 	total += int64(cap(p.ones)) * 8
 
+	if p.buffered {
+		total += 2 * p.w.EncodedBytes()
+	}
 	return total
 }
 

@@ -139,7 +139,7 @@ func TestWriterFinishAtCapCoversAWholePart(t *testing.T) {
 		}
 	}
 
-	estimate := e.writerFinishAtCap(src, 0)
+	estimate := e.writerFinishFloor(src)
 	t.Logf("finish charged %.1f MiB, estimated at the cap %.1f MiB", float64(w.finishBytes())/(1<<20), float64(estimate)/(1<<20))
 	assert.GreaterOrEqual(t, estimate, w.finishBytes())
 
