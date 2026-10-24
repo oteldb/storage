@@ -229,11 +229,32 @@ merged symbol sidecars stay unbounded.
 ## Lifecycle and part identity
 
 Driven by the facade's single maintenance loop, plus a head-bytes trigger flushing only the
-over-threshold engines. `Engine` is exported and `Close`/`Reset` callable from anywhere, so
-concurrency is enforced, not assumed: flush and merge hold one `flushMu` across their whole body.
+over-threshold engines. A periodic cycle seeds a FIFO queue of selectable merges; a pressure flush
+also seeds it when idle. Work drains between ticks. One turn runs at most the maintenance fan-out of
+single-group merges, or one deferred retry alone. Successful work with candidates left rejoins the tail;
+deferrals retry only while the batch made progress, and errors leave the queue until a later wake.
+`MergeStep` reports actual completed work from the merge result; a successful no-op is not progress.
+Whole-part retention drops count even when compaction then defers. `MergeWith` keeps its error-only
+contract over the same step. Candidate planning uses unopened adopted layouts as the merge does,
+so an unreadable part's recorded aggregation still prevents an incompatible policy rewrite.
+This keeps a busy engine from owning every turn and a busy operator budget from causing a spin.
+Shutdown, the timed cycle and pressure flushes preempt the next catch-up batch; an in-flight merge
+can still delay them. Every attempt rechecks compaction ownership and resolves retention again,
+including byte budgets against the current part set. Peers are notified after a merge; peer sync
+and EC conversion remain part of the timed cycle. Each merge retains its normal repair pass.
+`Admin.MaintainNow` still runs one cycle. `Engine` is exported and `Close`/`Reset` callable from
+anywhere, so concurrency is enforced, not assumed: flush and merge hold one `flushMu` across their whole body.
 `Reset` takes it too, draining an in-flight flush/merge that would otherwise publish its part into the
 emptied engine, dropping detached buffers with the head, and **retiring** live parts rather than
 deleting their objects, so a fetch holding one is not read out from under it.
+
+`BenchmarkMaintenanceDrain` compares equal work over eight daily buckets, two flush parts per bucket,
+for metrics and logs on the memory backend; setup and the timer's idle time are excluded. Six
+single-CPU samples on Linux/amd64, Ryzen 5950X, Go 1.27.3 (`nodwarf5`) take eight full cycles without
+catch-up and one with it. Compute time is 16.76 vs 15.48 ms (-7.63%, p=0.002); catch-up adds 0.01%
+allocated bytes and 0.84% allocations. The scheduler also removes seven timer waits, which the
+compute benchmark does not charge. Run `go test -run '^$' -bench '^BenchmarkMaintenanceDrain$' -benchmem
+-cpu=1 -count=6 -benchtime=300ms .` from the repository root.
 
 **Invariant: a part id is globally unique, and names one part's content forever.** `{partid}`
 (`internal/partid`) is a ULID-shaped 128-bit id — 48-bit unix-millisecond timestamp, 80 random bits,

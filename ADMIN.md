@@ -62,12 +62,19 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
   same four fields, `Items` counting cached **parts** and `Bytes` their estimated decoded size. Misses
   climbing with every flamegraph query mean the queried windows' parts do not fit the budget; it is
   all zeros when the cache is disabled.
-- `StoreStats.Maintenance` — the background maintenance loop: cumulative `Cycles` (the loop-
-  liveness probe), `LastCycleStartUnixNano` / `LastCycleDurationNano` (a growing duration means
-  compaction is falling behind ingest), `LastCycleTasks` (engine tasks dispatched in the most
+- `StoreStats.Maintenance` — the background maintenance loop: cumulative full `Cycles` (the loop-
+  liveness probe), `LastCycleStartUnixNano` / `LastCycleDurationNano` (the full cycle's duration,
+  excluding merge-only catch-up), `LastCycleTasks` (engine tasks dispatched in the most
   recent cycle), and `PressureFlushes` (engines flushed by the head-size trigger
   `Options.FlushThresholdBytes` rather than by the interval — a rising count means ingestion is
   filling heads faster than the flush cadence drains them).
+  Between ticks, successful merges with candidates left rotate through catch-up batches of at most
+  `MaintenanceConcurrency` single-group merges; a deferred retry runs alone. Shutdown, periodic
+  maintenance and pressure flushes are checked before every batch. Admission stalls and errors
+  park that work until a later wake, so a busy budget does not spin. `storage.merge.*` includes
+  catch-up work; `Maintenance.Cycles` and its last-cycle fields describe full cycles only.
+  A successful no-op is not progress and is not rescheduled. Metric candidates include the policy
+  guards from unopened adopted parts' recorded layouts, matching the merge's decision.
 - `StoreStats.WALSync` — the background fsync loop (`WALSyncInterval` mode): cumulative `Failures`,
   and `Failing`, true while the latest sync pass had one. While it stands, acknowledged writes sit in
   the page cache rather than on disk, so the interval's power-loss bound does not hold. The error is
@@ -271,7 +278,7 @@ Metric instruments (all prefixed `storage.`):
 | `cluster.primary_refusals` | `signal` | writes this node refused as a shard primary because it could not prove its claim (`cluster.ErrNotPrimary`). Counted on the refusing node — the only one that knows why — on every refusal, so a fence shorter than a maintenance cycle still shows here |
 | `wal.segments` / `wal.bytes` | `signal` | gauges: the durability backlog on disk, published with the head gauges below. Segments accumulate exactly while flushes are not retiring them, so a rising count is `head.age` seen from the disk. Zero (not absent) for an engine with no WAL — the ephemeral in-memory one |
 | `head.bytes` / `head.items` / `head.series` / `head.identity_bytes` / `head.age` | `signal` | gauges: the unflushed side, which no `parts.*` gauge reaches. Published **before** the cycle's flushes, so they report the cycle's high-water mark rather than the empty head a healthy flush leaves behind. `age` is seconds since the head took its first bytes after the last flush (0 means an empty head, and only that — a live head is floored above 0, since a coarse clock would otherwise report a freshly filled one as empty) — the flush lag, and the oldest of this node's tenants rather than an average that a freshly drained one would hide. `series` / `identity_bytes` span the all-time identity set, which a flush does not drain (see `IdentityBytes` above) |
-| `parts.total` / `parts.sealed` / `parts.merge_backlog` / `parts.merge_candidates` / `parts.merge_force_candidates` / `parts.merge_candidates_stale` / `parts.bytes` / `merge.cap_bytes` | `signal` | gauges: the merge selector's view of the parts, published once per maintenance cycle, summed over this node's tenants (`cap_bytes` is the largest threshold in effect, not a sum — it is a threshold, not a quantity). `merge_candidates` and `merge_force_candidates` are `SignalStats.MergeCandidates` / `MergeForceCandidates`, with the size cutoff re-measured after the cycle's merges. When that re-measure cannot read part sizes the two keep the values they last had and `merge_candidates_stale` reads 1 until a cycle measures again; otherwise it reads 0. `merge_backlog` flat with `merge_candidates` pinned at 0 is stuck work while `merge_force_candidates` is above 0, and an engine at rest while it is 0. `parts.bytes` over `parts.total` is the average part size, which says whether a rising count is parts that grew or a merge that stopped. Per-tenant detail is `Inspect`, which needs no meter |
+| `parts.total` / `parts.sealed` / `parts.merge_backlog` / `parts.merge_candidates` / `parts.merge_force_candidates` / `parts.merge_candidates_stale` / `parts.bytes` / `merge.cap_bytes` | `signal` | gauges: the merge selector's view of the parts, published after a full maintenance cycle and when catch-up drains, summed over this node's tenants (`cap_bytes` is the largest threshold in effect, not a sum — it is a threshold, not a quantity). `merge_candidates` and `merge_force_candidates` are `SignalStats.MergeCandidates` / `MergeForceCandidates`, with the size cutoff re-measured after the cycle's merges. When that re-measure cannot read part sizes the two keep the values they last had and `merge_candidates_stale` reads 1 until a cycle measures again; otherwise it reads 0. `merge_backlog` flat with `merge_candidates` pinned at 0 is stuck work while `merge_force_candidates` is above 0, and an engine at rest while it is 0. `parts.bytes` over `parts.total` is the average part size, which says whether a rising count is parts that grew or a merge that stopped. Per-tenant detail is `Inspect`, which needs no meter |
 
 Tracing emits coarse spans (`engine.flush`, `engine.merge`, `engine.fetch`, backend ops, cluster
 RPCs) with W3C trace-context propagation across the cluster transport. Logs are context-plumbed via
@@ -378,7 +385,8 @@ Imperative operator control, complementing the background maintenance loop (it h
   returns the count rather than a silent no-op. Watch `SignalStats.IdentityBytes` for the effect;
   signals with no engine on this node contribute `0`.
 - `Rebalance(ctx)` — reconcile cluster ownership immediately (no-op single-node).
-- `MaintainNow(ctx)` — run one full maintenance cycle (flush + merge + retention across owned engines).
+- `MaintainNow(ctx)` — run one full maintenance cycle (flush + merge + retention across owned engines);
+  merge-only catch-up between ticks belongs to the background loop.
 
 Every one of these mutates the backend, so on a store opened with `WithReadOnly()` they all return an
 error wrapping `ErrReadOnly` (as do the `Write*` methods and `Reset`); the read side — `Inspect`,

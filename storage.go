@@ -1481,20 +1481,26 @@ func (s *Storage) runMaintenance(interval time.Duration) {
 
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	ctx := context.Background()
+	var pending []mergeTask
 
 	for {
-		select {
-		case <-s.stopCh:
+		switch nextMaintenanceEvent(s.stopCh, s.flushWake, t.C, len(pending) > 0) {
+		case maintenanceStop:
 			return
-		case <-t.C:
-			// The loop owns its lifetime (stopped via stopCh, not a request), so a
-			// background context is correct here.
-			s.maintain(context.Background())
-		case <-s.flushWake:
-			// Size-triggered: flush only the over-threshold engines. Merge and the cluster work
-			// stay on the interval tick — this path exists to give memory back promptly, and a
-			// burst must not turn every write into a compaction cycle.
-			s.flushPressured(context.Background())
+		case maintenanceTick:
+			s.maintain(ctx)
+			pending = s.mergeCatchupTasks(ctx)
+		case maintenanceFlush:
+			s.flushPressured(ctx)
+			if len(pending) == 0 {
+				pending = s.mergeCatchupTasks(ctx)
+			}
+		case maintenanceMerge:
+			pending = runMergeTasks(pending, s.maintenanceConcurrency())
+			if len(pending) == 0 {
+				s.recordPartShape(ctx)
+			}
 		}
 	}
 }

@@ -82,6 +82,10 @@ engines over the fetch seam (`query/fetch`).
 - **Maintenance** — one background loop flushes+merges every (tenant, signal) engine on
   `FlushInterval`. Previously deferred engines run one at a time before the bounded,
   pressure-ordered parallel work, so a merge needing the whole budget gets an admission turn.
+  Between ticks, ready merges rotate through bounded merge-only batches; shutdown, periodic
+  maintenance and pressure flushes are checked before each batch. A deferred retry runs alone,
+  and admission stalls or errors park that work until a later wake rather than spinning.
+  Only an actual part change reported by a merge reschedules it; success alone can be a no-op.
   A head-bytes threshold pokes it early. A durable store always runs it (an unbounded head OOMs).
 - **Read-only** — `WithReadOnly()` opens a handle that never mutates the backend: the sweep-nothing
   load, no maintenance loop, no WAL, no flush on `Close`, and every write and `Admin` mutation

@@ -49,7 +49,7 @@ func (e *Engine) MergeShape() MergeShape { return e.MergeShapeWith(MergeOptions{
 func (e *Engine) MergeShapeWith(opts MergeOptions) MergeShape {
 	e.mu.RLock()
 	src := e.parts
-	adopted := slices.Collect(maps.Values(e.foreignParts))
+	adopted := append(slices.Collect(maps.Values(e.foreignParts)), e.unopenedLayoutsLocked()...)
 	e.mu.RUnlock()
 
 	capBytes := e.lastMergeCap.Load()
