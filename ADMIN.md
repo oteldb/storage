@@ -85,9 +85,9 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 | `MinTimeUnixNano` / `MaxTimeUnixNano` | data time span (min over parts; max includes the head) |
 | `MergeRunning` | a compaction is executing on this engine right now |
 | `MergeDeferred` | the last merge had parts to compact and no merge-memory budget to do it with, so it compacted nothing; see "Merge memory admission" |
-| `SealedParts` | parts already at the merge cap. A merge never reconsiders them, so this is the share of `Parts` no compaction will reduce |
-| `MergeBacklog` | parts a merge may still take (`Parts − SealedParts`) — the backlog in the literal sense, not the part count |
-| `MergeCandidates` | parts the **next** maintenance merge would take: retention's whole-part drops, the forced rewrites the tenant's policy selects (retention; for metrics also downsampling, recompression and precision — a metric part counts toward downsampling only while the policy would roll some of its time range wider than the tier layout its manifest records (the policy is resolved against the tiers live parts already record, recorded first, so a raw part in a range already rolled counts too; a policy tier whose interval does not nest with, or whose aggregation differs from, one a readable part records is not applied, and the merge logs one warning; parts whose recorded layouts do not nest (a different aggregation, or intervals that do not divide each other), written by nodes with different policies, form separate cohorts that merge only among themselves, scheduled round-robin, and the count is the cohort the next merge starts at), and a part without that record counts while it is older than a tier's cutoff, until its first rewrite records one), the size-driven group, and straddlers awaiting a split. Forced rewrites are capped per merge like the rest, so a forced backlog larger than one merge (after downtime, or a shortened retention window) drains over several cycles: the count is one cycle's share of it, and stays above `0` until the backlog is gone. The policy is resolved as the merge resolves it. The size-retention cutoff needs part sizes from the backend, which `Inspect` never reads: it uses the cutoff the last maintenance cycle measured, re-measured at the end of that cycle for the part set its merges left. `0` with a non-zero `MergeBacklog` is either of the two states below |
+| `SealedParts` | parts already at the merge cap, excluded from size compaction. Retention and compression rewrites can still take them |
+| `MergeBacklog` | unsealed parts (`Parts − SealedParts`); excludes sealed parts that may still need a forced rewrite |
+| `MergeCandidates` | parts the **next** maintenance merge would take: retention's whole-part drops, the forced rewrites the tenant's policy selects (retention; for metrics also downsampling, recompression and precision — a metric part counts toward downsampling only while the policy would roll some of its time range wider than the tier layout its manifest records (the policy is resolved against the tiers live parts already record, recorded first, so a raw part in a range already rolled counts too; a policy tier whose interval does not nest with, or whose aggregation differs from, one a readable part records is not applied, and the merge logs one warning; parts whose recorded layouts do not nest (a different aggregation, or intervals that do not divide each other), written by nodes with different policies, form separate cohorts that merge only among themselves, scheduled round-robin, and the count is the cohort the next merge starts at), and a part without that record counts while it is older than a tier's cutoff, until its first rewrite records one), the size-driven group, and straddlers awaiting a split; record signals also count the bounded compression rewrite selected when ordinary compaction has no work. Forced rewrites are capped per merge like the rest, so a forced backlog larger than one merge (after downtime, or a shortened retention window) drains over several cycles: the count is one cycle's share of it, and stays above `0` until the backlog is gone. The policy is resolved as the merge resolves it. The size-retention cutoff needs part sizes from the backend, which `Inspect` never reads: it uses the cutoff the last maintenance cycle measured, re-measured at the end of that cycle for the part set its merges left. `0` with a non-zero `MergeBacklog` is either of the two states below |
 | `MergeForceCandidates` | the same count for `Admin.CompactNow`, which also forces a group the size rule declines. Above `0` while `MergeCandidates` is `0`: a tier spread only a forced merge breaks. `0`: `CompactNow` is a no-op |
 | `MergeCandidatesStale` | the tenant has a size budget and something flushed or merged since the last maintenance cycle, so the two counts above apply a size cutoff measured for an earlier part set; the next cycle re-measures. Always `false` without a size budget |
 | `MergeCapBytes` | the seal threshold in effect. Derived per merge for metrics (from free space and the merge memory allowance), so it reads `0` until that engine's first merge; a static function of configuration for the record signals |
@@ -110,7 +110,7 @@ Part *byte* sizes are intentionally omitted from `Inspect` (they would need back
 one wedged at a fixed point — a deployment sat at 59 parts for thousands of cycles looking exactly
 like an idle one. The three numbers beside it answer it directly:
 
-- `SealedParts == Parts` — everything is at the cap; the count is the floor and nothing is wrong.
+- `SealedParts == Parts`, `MergeCandidates == 0` — everything is at the cap; the count is the floor.
 - `MergeBacklog > 0`, `MergeCandidates > 0` — a merge is due. It arrives on the next cycle unless
   `merge.deferred` is climbing, which says the work is selected and waiting on the memory budget
   rather than on the selector.
@@ -124,6 +124,14 @@ like an idle one. The three numbers beside it answer it directly:
   cycle nor `CompactNow` changes it. A part crossing a day boundary — a straddler, which one late
   sample or record in a flush makes — is never in this state: it is a candidate until a merge splits
   it on day boundaries.
+
+Record candidates also include a compression rewrite when ordinary compaction selects nothing:
+the oldest bucket's parts below the configured merge compression profile, bounded by the same
+decoded-byte cap (at most 16 sources without a cap). Sealed parts can need this rewrite too, so
+`MergeCandidates` may be non-zero with `MergeBacklog == 0`; sealing only excludes size compaction.
+Resting parts have reached their compression fixed point as well. Compression-only work waits
+while ordinary compaction remains busy; it never displaces retention, ladder merging or straddler
+batching. The rewrite uses the same memory admission and deferral as any other merge.
 
 Each engine's own `MergeShape()` (`engine`, `recordengine`) carries the rest of the selector's
 inputs behind these fields — the metric engine's `BestMultiplier`/`MinMultiplier`/`IdleRounds`/
@@ -359,8 +367,9 @@ Imperative operator control, complementing the background maintenance loop (it h
   stuck state above (`MergeCandidates == 0`, `MergeForceCandidates > 0`), which `Compact`/`MaintainNow`
   cannot break because a cycle that selects nothing is a no-op. It overrides the **selection
   heuristic only** — the seal threshold, the run's cumulative-bytes cap and the merge memory bound
-  still apply, so a forced merge reads, writes and holds no more than a background one, and never
-  takes a sealed part. One call compacts one group; call it again to make further progress.
+  still apply, so a forced merge reads, writes and holds no more than a background one. Sealed
+  parts remain excluded from size compaction; retention and compression rewrites can take them.
+  One call compacts one group; call it again to make further progress.
 - `Retention(ctx, key)` — compact every signal for a tenant (drops parts past the policy cutoff).
 - `PruneIdentities(ctx, key) (int, error)` — drop the identities retention left without data across
   **every** of a tenant/shard's signals and report how many went in total. The background loop does
@@ -497,8 +506,10 @@ total resident bytes, a longer compaction cycle in wall-clock.
 
 A background merge that finds the budget committed is **deferred**, not queued: it compacts nothing,
 increments `storage.merge.deferred`, sets `MergeDeferred` on that engine's `SignalStats`, and the
-next cycle retries it — ordered ahead of the other engines, though that only rotates the budget when
-there are more engines than maintenance workers (#646). `runMaintenance` cannot service a
+next cycle retries previously deferred engines **one at a time**, before starting the remaining
+pressure-ordered parallel tasks. Each gets a turn without another task from that cycle holding the pool,
+even when its request exceeds one share; operator merges retain priority and can still defer it.
+Serial retries also serialize those engines' flush and cluster work. `runMaintenance` cannot service a
 size-triggered flush until a whole cycle's fan-out returns, so parking a merge on a busy budget
 would hold back the memory relief the budget exists to bound.
 

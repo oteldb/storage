@@ -113,7 +113,8 @@ type Config struct {
 	// codecs — the cold, long-lived data. Flushed parts stay codec-only so ingest is cheap; the
 	// background merge is where recompression is amortized. Record byte columns are dict-coded but not
 	// entropy-coded, so ZSTD here is a large on-disk win (≈10× on log-shaped data). AlgorithmNone (the
-	// default) keeps the legacy uncompressed behavior.
+	// default) keeps the legacy uncompressed behavior. When ordinary compaction has no work, parts
+	// below this compression profile are rewritten in a bounded group, including sealed singletons.
 	MergeCompression compress.Algorithm
 	// MergeCompressionLevel is the level for MergeCompression (ZSTD only). 0 ⇒ the algorithm default.
 	MergeCompressionLevel compress.Level

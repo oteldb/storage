@@ -1654,31 +1654,6 @@ func (s *Storage) recordWALSync(ctx context.Context, errs []error) {
 // record engine expose SyncWAL, so the loop fans out over them uniformly.
 type walSyncer interface{ SyncWAL() error }
 
-// maintTask is one engine's maintenance work, plus the two keys the cycle is ordered by.
-type maintTask struct {
-	run      func()
-	pressure int64 // head bytes: the fullest heads flush first
-	// deferred marks an engine whose last merge could not claim the process merge budget.
-	deferred bool
-}
-
-// sortMaintTasks orders a cycle's work: engines whose last merge was deferred for want of the
-// merge-memory budget first, then by flush pressure descending, so the fullest heads flush first.
-//
-// The deferred key only bites when there are more engines than maintenance workers. Below that
-// [parallel.ForEach] raises its limit to the task count and starts every task at once, so index
-// order decides nothing and which engine reaches the budget first is decided by how long its flush
-// took — which is #646: a deferred engine can lose that race every cycle.
-func sortMaintTasks(tasks []maintTask) {
-	sort.SliceStable(tasks, func(i, j int) bool {
-		if tasks[i].deferred != tasks[j].deferred {
-			return tasks[i].deferred
-		}
-
-		return tasks[i].pressure > tasks[j].pressure
-	})
-}
-
 // maintain flushes then merges (with retention) every tenant engine once. Errors are
 // swallowed: a transient backend failure must not crash the background loop, and the next
 // tick retries. In cluster mode only the tenants this node owns (its compaction claims) are
@@ -1795,11 +1770,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	// across engines parallelizes freely. Build one flat work list and fan out under a bound — a
 	// sequential pass would take the sum of every engine's compaction I/O.
 	//
-	// Fair scheduling: the work list is ordered by a deferred merge first and then by flush pressure
-	// (head bytes) descending, and parallel.ForEach dispatches in index order, so the fullest heads
-	// flush first within a cycle. This keeps one noisy tenant from delaying the relief of others when
-	// the work exceeds the concurrency bound, and drains the most in-flight memory soonest. See
-	// sortMaintTasks for what the deferred key does and does not buy.
+	// Deferred engines get an exclusive retry before the pressure-ordered parallel work.
 	tasks := make([]maintTask, 0,
 		len(metricEngines)+len(logEngines)+len(traceEngines)+len(profileEngines)+len(exemplarEngines))
 
@@ -1894,9 +1865,7 @@ func (s *Storage) maintain(ctx context.Context) {
 	addRecord(exemplarEngines, signal.Exemplar, exemplarsPrefix)
 
 	s.maintStats.lastTasks.Store(int64(len(tasks)))
-	sortMaintTasks(tasks)
-
-	parallel.ForEach(len(tasks), s.maintenanceConcurrency(), func(i int) { tasks[i].run() })
+	runMaintTasks(tasks, s.maintenanceConcurrency())
 
 	// The pass above is what brings the owner's freshly flushed parts here, so this is where a shard
 	// recovered without its head can stop disclaiming reads.

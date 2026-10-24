@@ -159,12 +159,12 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 		return mergeResult{}, err
 	}
 
-	selected := selectMergeParts(src, retainFrom, capBytes, opts.Force)
+	selected := e.selectMergeParts(src, retainFrom, capBytes, opts.Force)
 	if len(selected) == 0 {
 		if dropped == 0 {
 			// A no-op is indistinguishable from a healthy engine without the shape of what it looked
 			// at; these are the exact inputs to that decision (mirrors the metric engine).
-			sh := shapeOf(src, retainFrom, capBytes)
+			sh := e.shapeOf(src, retainFrom, capBytes)
 			zctx.From(ctx).Debug("merge selected nothing",
 				zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
 				zap.Int("parts", sh.Parts), zap.Int("sealed", sh.Sealed),

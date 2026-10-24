@@ -535,9 +535,12 @@ queued, so the wait is bounded by the merges already running plus whatever is qu
 
 **A deferral is visible.** It increments `storage.merge.deferred` (`ADMIN.md`), sets
 `Engine.MergeDeferred`, and does *not* log "nothing to compact" — which is what it would otherwise
-look like. The facade sorts a deferred engine ahead of head-bytes pressure on its next pass — which rotates
-the budget only when there are more engines than maintenance workers; below that every task starts
-at once and the order decides nothing (#646). The idle-waiver counter is zeroed only once a merge is admitted: a
+look like. The facade runs previously deferred engines one at a time before starting the remaining
+pressure-ordered parallel work. A merge may need several shares or the whole pool, so sorting or
+limiting concurrent retries by the nominal share cannot guarantee it admission. Each retry has no
+other task from that cycle holding the pool; an operator merge can still defer it. Serializing these
+tasks also serializes their flush and cluster work, trading recovery throughput for progress without
+parking on admission. The idle-waiver counter is zeroed only once a merge is admitted: a
 deferral has not broken the fixed point the waiver exists to escape.
 
 **The trade is throughput.** A 16-core node with a 2 GiB limit runs 4 concurrent merges rather than

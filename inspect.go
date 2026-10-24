@@ -71,11 +71,11 @@ type SignalStats struct {
 	// merge-memory budget, so it compacted nothing. Part counts climbing while merges look idle and
 	// this is set means compaction is bounded by [Options.MergeMemoryBytes], not by the selector.
 	MergeDeferred bool
-	// SealedParts is the parts already at the merge cap. A merge never reconsiders them, so they are
-	// the share of Parts no compaction will ever reduce.
+	// SealedParts is the parts at the merge cap, excluded from size compaction. Forced rewrites
+	// may still take them.
 	SealedParts int
-	// MergeBacklog is the parts a merge may still take (Parts − SealedParts). It is the backlog in
-	// the literal sense — work compaction still has to do — not the part count.
+	// MergeBacklog is the unsealed parts (Parts − SealedParts). Sealed parts needing a forced
+	// rewrite are not counted here.
 	MergeBacklog int
 	// MergeCandidates is how many parts the next merge would select, and MergeForceCandidates how
 	// many [Admin.CompactNow] would. MergeCandidates zero with MergeForceCandidates above it is the

@@ -80,8 +80,9 @@ engines over the fetch seam (`query/fetch`).
   overlapping form: a window wider than the step (a 1h range at a 5m step) at a cost proportional
   to the data, not to the overlap.
 - **Maintenance** — one background loop flushes+merges every (tenant, signal) engine on
-  `FlushInterval`, concurrently under a bound, ordered by head pressure. A head-bytes
-  threshold pokes it early. A durable store always runs it (an unbounded head OOMs).
+  `FlushInterval`. Previously deferred engines run one at a time before the bounded,
+  pressure-ordered parallel work, so a merge needing the whole budget gets an admission turn.
+  A head-bytes threshold pokes it early. A durable store always runs it (an unbounded head OOMs).
 - **Read-only** — `WithReadOnly()` opens a handle that never mutates the backend: the sweep-nothing
   load, no maintenance loop, no WAL, no flush on `Close`, and every write and `Admin` mutation
   refused with `ErrReadOnly`. `Open` refuses it alongside a cluster, a WAL dir, or an ephemeral
