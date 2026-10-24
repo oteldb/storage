@@ -178,14 +178,18 @@ func BenchmarkMergeCompact(b *testing.B) {
 }
 
 // benchCompact times merging every part of e into one, deleting the output between rounds so each
-// round starts from the same sources. Throughput is [partsBytes] of the sources.
+// round starts from the same sources. Throughput uses logical, uncompressed source bytes.
 func benchCompact(b *testing.B, e *Engine, be backend.Backend) {
 	b.Helper()
 
 	ctx := context.Background()
 	src := e.parts
 
-	b.SetBytes(partsBytes(src))
+	var logical int64
+	for _, p := range src {
+		logical += p.decodedBytes()
+	}
+	b.SetBytes(logical)
 	b.ReportAllocs()
 
 	for b.Loop() {

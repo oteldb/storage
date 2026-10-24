@@ -32,9 +32,9 @@ func TestShapeOfAccounting(t *testing.T) {
 	assert.Equal(t, minTierParts, sh.MinTierParts)
 
 	// Two parts in one tier are selectable, and the shape says so.
-	sh = e.shapeOf([]*part{partOfSize(0, 1<<20), partOfSize(1, 2<<20)}, 0, capBytes)
-	assert.Equal(t, 1, sh.Tiers)
-	assert.Equal(t, 2, sh.LargestTierParts)
+	sh = e.shapeOf([]*part{partOfSize(0, 3<<19), partOfSize(1, 2<<20)}, 0, capBytes)
+	assert.Equal(t, 2, sh.Tiers)
+	assert.Equal(t, 1, sh.LargestTierParts)
 	assert.Equal(t, 2, sh.Candidates)
 }
 
@@ -53,7 +53,7 @@ func TestPickForcedGroup(t *testing.T) {
 		"the unsealed parts merge across tiers, in src order; the sealed one stays out")
 
 	// The cumulative-bytes cap still bounds the group: the two smallest already reach it.
-	a, b, c := partOfSize(0, 40<<20), partOfSize(1, 50<<20), partOfSize(2, 30<<20)
+	a, b, c := partOfSize(0, 25<<20), partOfSize(1, 50<<20), partOfSize(2, 30<<20)
 	assert.Equal(t, []*part{a, c}, pickForcedGroup([]*part{a, b, c}, capBytes),
 		"the two smallest are chosen and reach the cap, and are handed back in src order")
 

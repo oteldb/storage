@@ -45,7 +45,6 @@ type recordPartStreamWriter struct {
 
 	granule int
 	rows    int
-	decoded int64
 
 	// cur is the stream being appended and curRows its rows so far: the stream id column is handed
 	// one run per stream, so a run split across appends is one run in the column.
@@ -91,6 +90,10 @@ func newRecordPartStreamWriter(
 	schema := e.cfg.Schema
 	opts := []block.PartOption{
 		block.WithSortKey(colTs), block.WithSizingStats(), block.WithGranuleSize(e.mergeGranule),
+	}
+
+	if e.mergeFrameBytes > 0 {
+		opts = append(opts, block.WithCompressBlockBytes(e.mergeFrameBytes))
 	}
 
 	if e.cfg.MergeCompression != compress.AlgorithmNone {
@@ -151,9 +154,8 @@ func newRecordPartStreamWriter(
 	return w, nil
 }
 
-// appendRows starts n = len(ts) rows of stream u, whose decoded size is bytes, by appending their
-// timestamps; the other columns follow through appendInts and appendBytes.
-func (w *recordPartStreamWriter) appendRows(u chunk.U128, ts []int64, bytes int64) error {
+// appendRows starts a stream run; the remaining columns follow through appendInts and appendBytes.
+func (w *recordPartStreamWriter) appendRows(u chunk.U128, ts []int64) error {
 	if w.curRows == 0 || u != w.cur {
 		if err := w.flushStream(); err != nil {
 			return err
@@ -176,7 +178,6 @@ func (w *recordPartStreamWriter) appendRows(u chunk.U128, ts []int64, bytes int6
 
 	w.curRows += len(ts)
 	w.rows += len(ts)
-	w.decoded += bytes
 
 	return w.w.AppendInt64(colTsIdx, ts)
 }
@@ -290,10 +291,6 @@ func (w *recordPartStreamWriter) binding(
 
 	return *b, nil
 }
-
-// decodedBytes is the decoded size of the rows written so far: the part's [part.sizeBytes] once
-// written, and what the merge cap is denominated in.
-func (w *recordPartStreamWriter) decodedBytes() int64 { return w.decoded }
 
 // residentBytes is everything the writer holds in RAM: the block writer's unsealed frames, directories,
 // output dictionaries, staged granules and the per-entry caches of every source binding

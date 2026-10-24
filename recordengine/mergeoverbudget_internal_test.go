@@ -47,7 +47,7 @@ func TestMergeNeedingMoreThanTheBudgetCompletes(t *testing.T) {
 			o, m := obstest.New(t)
 
 			e := wideDictEngine(t, backend.Memory(), Config{MergeMemoryBytes: budget, MergeAdmission: poolAdmission(pool), Obs: o}, 3, 4, 8<<10, 2)
-			need, ok := e.mergeNeed(ctx, e.parts, e.mergeCapBytes())
+			need, ok := e.mergeNeed(ctx, e.parts)
 			require.True(t, ok)
 			require.Greater(t, need, int64(budget), "the merge must need more than the whole budget")
 

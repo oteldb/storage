@@ -75,17 +75,12 @@ type Config struct {
 	// Signal is the signal label for this engine's metrics ("log"/"trace"/"profile"); the facade
 	// sets it per signal. Empty ⇒ "record".
 	Signal string
-	// MaxPartBytes bounds a flushed/merged part's approximate uncompressed size. It is what lets
-	// size-tiered compaction seal large parts and bound both part count and a single merge's decoded
-	// working set (see compact.go) — without it a continuously-ingesting engine's merge grows to
-	// re-materialize the whole dataset every cycle. 0 ⇒ unlimited (merge everything into one part;
-	// the legacy behavior, unbounded working set). The facade resolves it from the tenant policy.
+	// MaxPartBytes bounds flushed parts in decoded bytes. Zero disables flush splitting.
 	MaxPartBytes int64
-	// MergeMemoryBytes is how much memory all concurrent merges together may hold. A merge holds a
-	// read-ahead window of each source column plus the output buffer it is filling, so this bounds the merge cap
-	// (see mergecap.go) independently of MaxPartBytes — a tiering target sized for the disk must not
-	// size a working set the process cannot hold. 0 ⇒ a share of the process memory budget
-	// (GOMEMLIMIT, else the cgroup limit, else host memory); negative ⇒ unbounded.
+	// MergeCeilingBytes bounds merged parts in stored bytes, independently of flush size and memory.
+	// Zero derives the cap from free space, up to 16 GiB; negative disables disk sealing.
+	MergeCeilingBytes int64
+	// MergeMemoryBytes bounds resident merge state. Zero derives a process share; negative is unbounded.
 	MergeMemoryBytes int64
 	// MergeConcurrency reports how many merges may run concurrently in this process — the caller's
 	// fan-out, which *caps* how many the memory budget admits rather than dividing it. nil or ≤ 1 ⇒
@@ -174,9 +169,15 @@ type Engine struct {
 	readCompressors block.ReadOption
 	// mergeGranule is the granule a merge writes its output at ([mergeGranuleRows]).
 	mergeGranule int
-	// mergeCap, when positive, replaces [Engine.mergeCapBytes]. Test seam only: it sets the part
-	// bound without the memory share the cap is otherwise derived from.
+	// mergeFrameBytes overrides frame packing for small split fixtures.
+	mergeFrameBytes int
+	// mergeCap overrides the disk cap in tests.
 	mergeCap int64
+
+	// lastMergeCap keeps introspection free of backend I/O.
+	lastMergeCap atomic.Int64
+	// idleMerges lets settled, uneven runs converge after fruitless selection rounds.
+	idleMerges atomic.Int64
 	// retiring holds parts removed from the live set by flush/merge, pending backend deletion once
 	// their in-flight fetch readers drain (deferred reclamation; see reclaim.go).
 	retiring []*part

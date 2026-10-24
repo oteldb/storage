@@ -17,12 +17,10 @@ type PartStat struct {
 	MaxTime int64
 	Series  int   // distinct streams in the part (len of its row-range index)
 	Rows    int64 // total records (sum of the per-stream row spans)
-	// SizeBytes is the part's *decoded* footprint as recorded in its manifest — what the merge cap
-	// compares against, and so what explains why a part is or is not sealed. It needs no I/O. Unlike
-	// the metric engine's [engine.PartStat.SizeBytes], which is a size on disk, this is the size in
-	// memory, the unit the record merge cap and size tiers are denominated in. 0 for a part
-	// written before the manifest recorded it (the row estimate then stands in internally).
+	// SizeBytes is the decoded footprint from the manifest, or zero for legacy parts.
 	SizeBytes int64
+	// DiskBytes is the stored column size used by merge selection and sealing.
+	DiskBytes int64
 }
 
 // LogicalBytes is the part's uncompressed size for a compression ratio: [PartStat.SizeBytes] when
@@ -34,7 +32,7 @@ func (p PartStat) LogicalBytes() int64 {
 		return p.SizeBytes
 	}
 
-	return p.Rows * recordRowBytes
+	return p.Rows * legacyRecordRowBytes
 }
 
 // PartDetailStat augments [PartStat] with fields that need a backend read: the on-backend byte size
@@ -88,16 +86,15 @@ func (p *part) rows() int64 {
 	return n
 }
 
-// sizeBytes is the part's decoded footprint, as recorded in its manifest: what holding its columns
-// costs a merge, which is the currency the merge cap and the size tiers are denominated in. Records
-// are variable-width, so a part written before the manifest carried the figure falls back to the
-// per-row model — the estimate the exact number replaces.
-func (p *part) sizeBytes() int64 {
+// sizeBytes is the stored column size used by merge selection and sealing.
+func (p *part) sizeBytes() int64 { return max(p.diskBytes, 1) }
+
+// decodedBytes is the logical footprint, with a compatibility estimate for old manifests.
+func (p *part) decodedBytes() int64 {
 	if p.rawBytes > 0 {
 		return p.rawBytes
 	}
-
-	return p.rows() * recordRowBytes
+	return p.rows() * legacyRecordRowBytes
 }
 
 // Parts returns an in-memory snapshot of the parts the engine can serve — its own, plus the ones it
@@ -115,7 +112,7 @@ func (e *Engine) Parts() []PartStat {
 	for _, p := range readable {
 		out = append(out, PartStat{
 			ID: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
-			Series: len(p.ranges), Rows: p.rows(), SizeBytes: p.rawBytes,
+			Series: len(p.ranges), Rows: p.rows(), SizeBytes: p.rawBytes, DiskBytes: p.diskBytes,
 		})
 	}
 
@@ -164,7 +161,7 @@ func (e *Engine) PartsDetailed(ctx context.Context) ([]PartDetailStat, error) {
 		out = append(out, PartDetailStat{
 			PartStat: PartStat{
 				ID: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
-				Series: len(p.ranges), Rows: p.rows(), SizeBytes: p.rawBytes,
+				Series: len(p.ranges), Rows: p.rows(), SizeBytes: p.rawBytes, DiskBytes: p.diskBytes,
 			},
 			Bytes:      sizes.Total,
 			Chunks:     granuleCount(man.RowCount, man.GranuleSize),

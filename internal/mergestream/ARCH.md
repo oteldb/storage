@@ -42,10 +42,12 @@ which bounds the other:
   index, aggregate sidecar) rather than with encoded bytes, so a merge of very short series reaches
   it long before the disk cap.
 
-The metric engine seals on both. The record engine seals on the resident unit too, but its part
-bound is in *decoded* bytes — the unit its size tiers compare parts in — which is neither of these,
-so it names its pair itself (`recordengine/ARCH.md`, "Merge cap"). `Budget` changes no threshold; it
-only names the ones the engines compute.
+Both engines seal on stored output and resident state. `PartCap` derives the common stored-byte
+cutoff from the configured ceiling (default 16 GiB), free space divided across writer fanout, and
+room for inputs to coexist with outputs. Its 8 MiB free-space floor keeps a nearly full volume
+merging; an explicit smaller ceiling is honored. Neither memory nor flush size enters this cutoff.
+Backends with unknown free space keep the ceiling. Resident allowances and frame/sidecar accounting
+remain in each engine, independently of this disk calculation.
 
 ## `CheckForward` / `ErrNotForward`
 

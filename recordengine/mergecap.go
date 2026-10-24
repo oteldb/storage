@@ -9,44 +9,39 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/internal/memlimit"
+	"github.com/oteldb/storage/internal/mergestream"
 )
 
-// mergeCapBytes returns the decoded size at which a merged part is sealed: the tiering target
-// (mergeHeight × MaxPartBytes), lowered by the memory share this merge may claim.
-//
-// Unlike the metric engine's cap this is denominated in *decoded* bytes, the unit tiering compares
-// parts in ([part.sizeBytes]). Free space does not enter into it: the disk is bounded by the flush cap
-// and the tiering target.
-//
-// 0 (never seal, one merge takes maxTierParts) when MaxPartBytes is unlimited, the legacy behavior.
-func (e *Engine) mergeCapBytes() int64 {
+// mergeCapBytes is a disk seal threshold, independent of the resident merge grant.
+func (e *Engine) mergeCapBytes(ctx context.Context) int64 {
 	if e.mergeCap > 0 {
 		return e.mergeCap
 	}
-
-	if e.cfg.MaxPartBytes <= 0 {
-		return 0
+	capBytes, err := mergestream.PartCap(ctx, e.cfg.Backend, e.cfg.MergeCeilingBytes, e.mergeFanout())
+	if err != nil {
+		zctx.From(ctx).Warn("free space unavailable; merge cap falls back to the ceiling",
+			zap.String("prefix", e.cfg.Prefix), zap.Error(err))
 	}
-
-	target := e.cfg.MaxPartBytes * mergeHeight
-
-	share := memlimit.MergeShare(e.cfg.MergeMemoryBytes, e.mergeConcurrency(), mergeBufferAmplification)
-
-	// A merge that cannot even hold one flushed part's worth would make no progress; the flush cap
-	// already bounds that much, so the floor is the flush cap rather than the share.
-	return max(min(target, share), e.cfg.MaxPartBytes)
+	return capBytes
 }
 
-// mergePartBytes is the decoded size one output part of a merge whose cap is capBytes may reach, the
-// unit tiering compares parts in; 0 bounds nothing. A side store (profiles) writes a symbol sidecar
-// under every part, copying the entries its parts share into each, so it lifts the part bound to write
-// as few as it can; the merge's grant holds for every engine and may still split a day.
+// mergePartBytes leaves profile days intact unless resident memory requires a split.
 func (e *Engine) mergePartBytes(capBytes int64) int64 {
 	if e.cfg.SideStore != nil {
 		return 0
 	}
-
 	return capBytes
+}
+
+// mergeRunBytes bounds one append in decoded bytes, independently of the disk target.
+func (e *Engine) mergeRunBytes() int64 {
+	return max(min(mergeFloorRun, e.mergeMemoryBudgetBytes()/16), 1)
+}
+
+// mergeWindow shares half the resident allowance among source columns' read-ahead windows.
+func (e *Engine) mergeWindow(sources int) int64 {
+	columns := 1 + e.cfg.Schema.numInts() + e.cfg.Schema.numBytes()
+	return min(e.mergeReadWindow, e.mergeMemoryBudgetBytes()/int64(max(sources*columns, 1))/2)
 }
 
 // mergeWriterBudget splits a merge's grant. What the sources hold from the moment they open
@@ -143,13 +138,13 @@ var errMergeRefusedWaiter = errors.New("merge admission declined a merge that as
 
 // mergeGrantBytes is what a merge of src reserves: its share, or its need when that is more; 0 when
 // the budget is unbounded.
-func (e *Engine) mergeGrantBytes(ctx context.Context, src []*part, capBytes int64) int64 {
+func (e *Engine) mergeGrantBytes(ctx context.Context, src []*part) int64 {
 	share := e.mergeMemoryBudgetBytes()
 	if share == math.MaxInt64 {
 		return 0
 	}
 
-	if need, ok := e.mergeNeed(ctx, src, capBytes); ok {
+	if need, ok := e.mergeNeed(ctx, src); ok {
 		return max(share, need)
 	}
 
@@ -171,24 +166,22 @@ func (e *Engine) reportOverBudget(ctx context.Context, need int64) {
 		zap.Int64("need", need), zap.Int64("budget", budget))
 }
 
-// mergeConcurrency is how many merges the memory budget admits: enough that each gets a usable
-// allowance, capped by the [Config.MergeConcurrency] fan-out. Deriving it from memory is the point —
-// taking it from the fan-out, which tracks the core count, prices a memory quantity in CPUs. This
-// engine's cap has no free-space term, so unlike the metric engine it needs no second number.
-func (e *Engine) mergeConcurrency() int {
-	fanout := 1
-	if e.cfg.MergeConcurrency != nil {
-		fanout = max(e.cfg.MergeConcurrency(), 1)
+func (e *Engine) mergeFanout() int {
+	if e.cfg.MergeConcurrency == nil {
+		return 1
 	}
+	return max(e.cfg.MergeConcurrency(), 1)
+}
 
-	return memlimit.MergeConcurrency(e.cfg.MergeMemoryBytes, fanout)
+func (e *Engine) mergeConcurrency() int {
+	return memlimit.MergeConcurrency(e.cfg.MergeMemoryBytes, e.mergeFanout())
 }
 
 // mergeMemoryBudgetBytes is what one merge may hold resident: its share of the budget, undoubled.
 // It is what [Config.MergeAdmission] is asked for, so the share a merge is sized against is one it
 // has actually been given.
 func (e *Engine) mergeMemoryBudgetBytes() int64 {
-	return memlimit.MergeShare(e.cfg.MergeMemoryBytes, e.mergeConcurrency(), 1)
+	return memlimit.MergeShare(e.cfg.MergeMemoryBytes, e.mergeConcurrency())
 }
 
 // admitMerge reserves the memory a merge of src intends to hold: its share, or what its sources,
@@ -207,8 +200,8 @@ func (e *Engine) mergeMemoryBudgetBytes() int64 {
 // waiting merge delays its own engine's flush for as long as it queues. The pool admits no new
 // holders while anyone is queued, so the wait is bounded by the merges already running plus
 // whatever is queued ahead.
-func (e *Engine) admitMerge(ctx context.Context, src []*part, capBytes int64, background bool) (*mergeGrant, bool, error) {
-	g := &mergeGrant{bytes: e.mergeGrantBytes(ctx, src, capBytes), wait: !background, admit: e.cfg.MergeAdmission}
+func (e *Engine) admitMerge(ctx context.Context, src []*part, background bool) (*mergeGrant, bool, error) {
+	g := &mergeGrant{bytes: e.mergeGrantBytes(ctx, src), wait: !background, admit: e.cfg.MergeAdmission}
 	if e.cfg.MergeAdmission == nil {
 		return g, true, nil
 	}

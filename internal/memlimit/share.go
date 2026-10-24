@@ -68,16 +68,14 @@ func MergeConcurrency(configured int64, cpuLimit int) int {
 	return max(min(int(budget/minMergeBytes), ceiling), 1)
 }
 
-// MergeShare is how many bytes one merge may hold: [MergeBudget] divided across the merges that may
-// run at once and by amplification, the peak resident per byte of the bound (a merge that holds its
-// output twice over passes 2).
-func MergeShare(configured int64, concurrency, amplification int) int64 {
+// MergeShare is the resident allowance of one merge, divided across admitted merges.
+func MergeShare(configured int64, concurrency int) int64 {
 	budget := MergeBudget(configured)
 	if budget == math.MaxInt64 {
 		return budget
 	}
 
-	return budget / int64(max(concurrency, 1)) / int64(max(amplification, 1))
+	return budget / int64(max(concurrency, 1))
 }
 
 // QueryShare is how many bytes one query may read before it is refused, derived from the process

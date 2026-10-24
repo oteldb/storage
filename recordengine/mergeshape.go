@@ -1,9 +1,6 @@
 package recordengine
 
-// MergeShape is the merge selector's view of the flushed parts: the inputs to the decision the
-// background merge makes each cycle. Without them an engine sitting on a part count it will never
-// reduce is indistinguishable from an idle healthy one — the two differ only in whether the parts
-// are sealed and whether one tier has accumulated enough of the rest.
+// MergeShape describes compaction eligibility without reading or decoding backend objects.
 type MergeShape struct {
 	// Parts is the flushed parts; Sealed those excluded from size compaction at the cap;
 	// Backlog the rest. Retention and compression rewrites may also take sealed parts.
@@ -13,24 +10,22 @@ type MergeShape struct {
 	// Bytes is what the flushed parts occupy on disk. Divided by Parts it is the average part size,
 	// which is what says whether a rising part count is a merge that stopped or an ingest that grew.
 	Bytes int64
-	// Candidates is how many parts the next merge under the given retention would take right now —
-	// retention's whole-part drops included — and ForceCandidates how many a [MergeOptions.Force]
-	// merge would. Candidates 0 with ForceCandidates above it is a tier
-	// spread only Force breaks; both 0 with a non-zero Backlog is every unsealed part alone in its
-	// time bucket, with no pending compression rewrite: the ladder's resting state, which no merge
-	// reduces without widening a part.
+	// Candidates counts the next merge's inputs, including retention drops and compression rewrites.
+	// ForceCandidates applies the idle waiver immediately; the time ladder still bounds both.
 	Candidates      int
 	ForceCandidates int
-	// CapBytes is the seal threshold in effect, in decoded bytes (0 ⇒ sealing disabled).
+	// CapBytes is the stored-byte seal threshold of the last merge (0 before the first merge).
 	CapBytes int64
-	// Tiers is how many distinct size tiers the unsealed parts fall into and LargestTierParts the
-	// count in the fullest of them — a LargestTierParts below minTierParts is why nothing merges.
-	// Tiers span the whole engine here, not one time bucket, so LargestTierParts is an upper bound
-	// on what the ladder can select.
+	// Tiers and LargestTierParts describe stored-byte sizes; they do not govern eligibility.
 	Tiers            int
 	LargestTierParts int
-	// MinTierParts is the same-tier count a merge waits for.
+	// MinTierParts is the minimum ordinary merge input count (retained for compatibility).
 	MinTierParts int
+	// BestMultiplier is the best output-to-largest-input ratio; IdleRounds reaches WaiveAfter
+	// before selection waives the write-amplification guard. Tiers are diagnostic only.
+	BestMultiplier float64
+	IdleRounds     int
+	WaiveAfter     int
 }
 
 // MergeShape is [Engine.MergeShapeWith] without retention.
@@ -44,12 +39,18 @@ func (e *Engine) MergeShapeWith(opts MergeOptions) MergeShape {
 	src := e.parts
 	e.mu.RUnlock()
 
-	return e.shapeOf(src, opts.RetainFrom, e.mergeCapBytes())
+	capBytes := e.lastMergeCap.Load()
+	if e.mergeCap > 0 {
+		capBytes = e.mergeCap
+	}
+	return e.shapeOf(src, opts.RetainFrom, capBytes)
 }
 
 // shapeOf summarizes what the selector sees in src at the given retention cutoff and seal threshold.
 func (e *Engine) shapeOf(src []*part, retainFrom, capBytes int64) MergeShape {
 	unsealed := unsealedOf(src, capBytes)
+	bySize, _ := eligibleBySize(src, capBytes)
+	_, _, best := scanRuns(bySize, capBytes)
 
 	var bytes int64
 	for _, p := range src {
@@ -77,6 +78,7 @@ func (e *Engine) shapeOf(src []*part, retainFrom, capBytes int64) MergeShape {
 		Tiers:            len(byTier),
 		LargestTierParts: largest,
 		MinTierParts:     minTierParts,
+		BestMultiplier:   best, IdleRounds: int(e.idleMerges.Load()), WaiveAfter: mergeIdleRounds,
 	}
 }
 

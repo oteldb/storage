@@ -1,6 +1,7 @@
 package recordengine
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -16,7 +17,7 @@ func partOfSize(seq int, bytes int64) *part {
 	return &part{
 		prefix:   string(rune('a' + seq)),
 		ranges:   []streamRange{{id: signal.SeriesID{Hi: uint64(seq)}, rowRange: rowRange{start: 0, end: 1}}},
-		rawBytes: bytes,
+		rawBytes: bytes, diskBytes: bytes,
 	}
 }
 
@@ -46,10 +47,10 @@ func TestPartSizeBytesFallsBackToRows(t *testing.T) {
 	t.Parallel()
 
 	sized := partOfSize(0, 4096)
-	assert.Equal(t, int64(4096), sized.sizeBytes())
+	assert.Equal(t, int64(4096), sized.decodedBytes())
 
 	legacy := &part{ranges: []streamRange{{id: signal.SeriesID{Hi: 1}, rowRange: rowRange{start: 0, end: 10}}}}
-	assert.Equal(t, int64(10*recordRowBytes), legacy.sizeBytes())
+	assert.Equal(t, int64(10*legacyRecordRowBytes), legacy.decodedBytes())
 }
 
 func TestPickTierGroupUnlimited(t *testing.T) {
@@ -109,7 +110,7 @@ func TestPickTierGroupByteBudgetCap(t *testing.T) {
 
 	assert.GreaterOrEqual(t, len(group), minTierParts, "always makes progress")
 	assert.Less(t, len(group), len(parts), "the byte budget caps the group below the full tier")
-	assert.GreaterOrEqual(t, total, int64(capBytes), "takes parts up to the cap")
+	assert.LessOrEqual(t, total, int64(capBytes), "disk target bounds input bytes")
 }
 
 // TestPickTierGroupIgnoresRowCountForSizing pins what the byte accounting buys: two parts of equal
@@ -141,73 +142,21 @@ func TestSelectMergePartsForcedRetention(t *testing.T) {
 
 func TestMergeCapBytes(t *testing.T) {
 	t.Parallel()
-
-	cases := []struct {
-		name        string
-		maxPart     int64
-		memory      int64
-		concurrency int
-		want        int64
+	for _, tc := range []struct {
+		name                         string
+		flush, memory, ceiling, want int64
 	}{
-		{
-			name:    "unlimited part size never seals",
-			memory:  1 << 40,
-			maxPart: 0,
-			want:    0,
-		},
-		{
-			// Roomy memory: the tiering target stands.
-			name:    "the tiering target stands",
-			maxPart: 64 << 20,
-			memory:  1 << 40,
-			want:    mergeHeight * (64 << 20),
-		},
-		{
-			// The shape that OOMed: a target sized for the disk, in a process that cannot hold it.
-			// 384 MiB of merge memory, thirded for sources + output + encode, is 128 MiB.
-			name:    "memory lowers the target",
-			maxPart: 64 << 20,
-			memory:  384 << 20,
-			want:    128 << 20,
-		},
-		{
-			name:        "concurrency divides the memory",
-			maxPart:     64 << 20,
-			memory:      384 << 20,
-			concurrency: 4,
-			want:        64 << 20, // 32 MiB share, floored at one flushed part
-		},
-		{
-			name:    "negative memory opts out",
-			maxPart: 64 << 20,
-			memory:  -1,
-			want:    mergeHeight * (64 << 20),
-		},
-		{
-			// A merge must still be able to rewrite one flushed part, or retention could never run.
-			name:    "the flush cap floors the merge cap",
-			maxPart: 64 << 20,
-			memory:  1 << 10,
-			want:    64 << 20,
-		},
-	}
-
-	for _, tc := range cases {
+		{"default", 64 << 20, 1 << 20, 0, 16 << 30},
+		{"flush disabled", 0, 1 << 20, 0, 16 << 30},
+		{"larger flush", 1 << 30, 1 << 20, 0, 16 << 30},
+		{"configured disk ceiling", 64 << 20, 1 << 20, 8 << 20, 8 << 20},
+		{"disk ceiling below floor", 64 << 20, 1 << 20, 1024, 1024},
+		{"unlimited disk", 64 << 20, 1 << 20, -1, 0},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-
-			var concurrency func() int
-			if tc.concurrency > 0 {
-				concurrency = func() int { return tc.concurrency }
-			}
-
-			e := &Engine{cfg: Config{
-				MaxPartBytes:     tc.maxPart,
-				MergeMemoryBytes: tc.memory,
-				MergeConcurrency: concurrency,
-			}}
-
-			assert.Equal(t, tc.want, e.mergeCapBytes())
+			e := New(Config{Schema: headTestSchema, MaxPartBytes: tc.flush, MergeMemoryBytes: tc.memory, MergeCeilingBytes: tc.ceiling})
+			assert.Equal(t, tc.want, e.mergeCapBytes(context.Background()))
 		})
 	}
 }
@@ -224,7 +173,7 @@ func TestPartStatLogicalBytes(t *testing.T) {
 		want int64
 	}{
 		{"recorded", PartStat{Rows: 10, SizeBytes: 4096}, 4096},
-		{"legacy", PartStat{Rows: 10}, 10 * recordRowBytes},
+		{"legacy", PartStat{Rows: 10}, 10 * legacyRecordRowBytes},
 		{"legacy empty", PartStat{}, 0},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

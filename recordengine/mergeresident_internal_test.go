@@ -56,7 +56,11 @@ func mergeResident(t *testing.T, parts, rows int, capBytes int64) heaptest.Run {
 
 	runtime.KeepAlive(e)
 
-	return heaptest.Run{Resident: resident, Source: uint64(partsBytes(src))}
+	var decoded int64
+	for _, p := range src {
+		decoded += p.decodedBytes()
+	}
+	return heaptest.Run{Resident: resident, Source: uint64(decoded)}
 }
 
 // TestMergeResidentFlatInPartSize is the merge's claim, measured: it holds a read-ahead window of each

@@ -179,7 +179,8 @@ to fail over to: a read overlapping a want fails.
   (profiles) a side store — nothing more. Storage never learns a language's or signal's concepts;
   matchers and conditions are **callbacks**, never operator enums.
 - **Immutable parts + one merge engine.** Compaction, retention, downsampling, recompression,
-  precision and EC conversion are all one background merge pass. No parallel subsystem.
+  precision and EC conversion are all one background merge pass. Stored-byte part targets and
+  resident memory admission are independent; flush size does not constrain merged parts.
 - **Backends are interchangeable**; the in-memory/ephemeral path is first-class and every layer
   must work with no disk or object store. Optional capabilities (`Viewer`, `Sizer`, `ReaderAt`,
   `NodeLocal`, `LocalDir`, `SpaceReporter`, `InodeReporter`) are type assertions with mandatory fallbacks, so a

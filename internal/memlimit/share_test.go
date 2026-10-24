@@ -24,7 +24,7 @@ func TestMergeBudgetSources(t *testing.T) {
 func TestMergeShareOptOutStaysUnbounded(t *testing.T) {
 	t.Parallel()
 
-	assert.Equal(t, int64(math.MaxInt64), memlimit.MergeShare(-1, 8, 2))
+	assert.Equal(t, int64(math.MaxInt64), memlimit.MergeShare(-1, 8))
 }
 
 // TestMergeConcurrencyFollowsMemory is the rule that replaced dividing a memory budget by a core
@@ -64,7 +64,7 @@ func TestMergeShareNeverFallsBelowTheMinimumItDerived(t *testing.T) {
 
 	for _, budget := range []int64{16 << 20, 64 << 20, 256 << 20, 3 << 30, 64 << 30} {
 		n := memlimit.MergeConcurrency(budget, 16)
-		share := memlimit.MergeShare(budget, n, 1)
+		share := memlimit.MergeShare(budget, n)
 
 		assert.GreaterOrEqual(t, share*int64(n), budget/2,
 			"the concurrency must not strand most of the budget")

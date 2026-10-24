@@ -29,17 +29,7 @@ func spanOf(parts []*part) (lo, hi int64) { return timebucket.Union(parts, partS
 // boundary, which one late record makes since flush does not split by time, so it fits no level and
 // joins no ladder group.
 func selectStraddlers(src []*part, capBytes int64) []*part {
-	return timebucket.Straddlers(src, partSpan, (*part).sizeBytes, capBytes, uncappedMergeParts(capBytes))
-}
-
-// uncappedMergeParts bounds a merge's part count only when part size is unlimited, where no byte
-// budget does.
-func uncappedMergeParts(capBytes int64) int {
-	if capBytes <= 0 {
-		return maxTierParts
-	}
-
-	return 0
+	return timebucket.Straddlers(src, partSpan, (*part).sizeBytes, capBytes, maxTierParts)
 }
 
 // newestBucket returns the start of the level-aligned bucket holding the newest record in src —
@@ -94,6 +84,14 @@ func partitionGroups(src []*part, level int64) ([]int64, [][]*part) {
 // collapsed at level L before the result is eligible to merge with its neighbors at level L+1, so
 // each part is rewritten once per level rather than repeatedly at the widest one.
 func selectLadderGroup(src []*part, capBytes int64, force bool) []*part {
+	idle := 0
+	if force {
+		idle = mergeIdleRounds
+	}
+	return selectLadderGroupIdle(src, capBytes, idle)
+}
+
+func selectLadderGroupIdle(src []*part, capBytes int64, idle int) []*part {
 	for _, level := range mergeLadder {
 		_, groups := partitionGroups(src, level)
 
@@ -103,14 +101,8 @@ func selectLadderGroup(src []*part, capBytes int64, force bool) []*part {
 				continue
 			}
 
-			if picked := pickTierGroup(group, capBytes); len(picked) > 0 {
+			if picked := pickMergeRun(group, capBytes, idle); len(picked) > 0 {
 				return picked
-			}
-
-			if force {
-				if picked := pickForcedGroup(group, capBytes); len(picked) > 0 {
-					return picked
-				}
 			}
 		}
 	}
@@ -124,5 +116,5 @@ func selectForced(src []*part, retainFrom, capBytes int64) []*part {
 	return timebucket.Forced(src, partSpan, (*part).sizeBytes,
 		func(p *part) bool { return retentionForces(p, retainFrom) },
 		func(p *part) bool { return sealed(p, capBytes) },
-		capBytes, uncappedMergeParts(capBytes))
+		capBytes, maxTierParts)
 }

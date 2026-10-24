@@ -16,7 +16,7 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// splitEngine returns an engine whose parts hold ~4 rows each (recordRowBytes ≈ 1 KiB per row).
+// splitEngine returns an engine whose parts hold ~4 rows each (legacyRecordRowBytes ≈ 1 KiB per row).
 func splitEngine(t *testing.T, maxPartBytes int64) *recordengine.Engine {
 	t.Helper()
 

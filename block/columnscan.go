@@ -135,7 +135,7 @@ func (d *Decoder) ResidentBytes() int64 {
 		maxRaw += int64(d.streams.comp.OutputSlack())
 	}
 
-	return n + 2*maxRaw + int64(dir.blockRows)*d.kind.decodedRowBytes()
+	return n + 2*maxRaw + int64(min(dir.blockRows, d.rows))*d.kind.decodedRowBytes()
 }
 
 // decodedRowBytes is what one decoded row of the kind costs: its value, or for bytes an id and the

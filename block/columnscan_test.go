@@ -511,3 +511,15 @@ func TestDecoderResidentBytesBoundsTheWalk(t *testing.T) {
 		})
 	}
 }
+
+func TestScanBoundCoversShortGranule(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	vals := scanCorpus(1, 360, nil)
+	r, _ := writeBytesPart(t, vals, 8192, WithSizingStats())
+	bound, _, ok := r.ScanBound(ctx, "attrs", 1<<20)
+	require.True(t, ok)
+	scan, err := r.ColumnScan(ctx, "attrs", 1<<20)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, bound, scan.ResidentBytes(), "a short part must not be charged for 8192 decoded rows")
+}

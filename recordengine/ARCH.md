@@ -23,135 +23,97 @@ are a column), so it costs them nothing. Exemplars carry the metric's data-point
 reserved labels (`__name__`, …) there, and a metric selector resolves exemplar streams only because
 those are matchable. Profiles carry their profile-level attributes there, for the same reason.
 
-## Divergences from the metrics engine
+## Merge selection and bounds
 
-| area | here |
-|---|---|
-| merge modes | append-only: retention only, no downsample/recompress/precision |
-| sizes | measured, not modeled — records are variable-width |
-| merge cap | decoded bytes, memory-derived; free space does not enter |
-| selection | size tiers (`sizeTier`, `minTierParts`), not the metric engine's scored runs |
-| forcing | no idle waiver; `Force` is the only escape from a fixed point |
+Records concatenate rows without deduplication; metrics resolve equal timestamps and can roll up
+values. Both select scored runs by stored column bytes inside the same 1h → 6h → 24h time ladder.
+At most 16 inputs join any merge, including retention, compression rewrites and straddler splits.
+The count bound limits read windows, dictionaries and metadata independently of compression ratio.
 
-**Retention drops whole parts first** (`dropExpired`), as in the metric engine: a part past the cutoff
-is retired on the manifest alone, only a straddler rewritten. A record part's side-store and bloom
-sidecars live under its own prefix, so `deletePart` reclaims them with it.
+Runs score by total stored bytes / largest input, with a minimum multiplier of 1.7 and a spread
+guard. Rewrites totaling at most 128 KiB bypass those guards. Three consecutive selections with no
+work arm an idle waiver; `Force` applies it immediately. A deferral does not reset the waiver.
+This absorbs geometric leftovers that no future flush can place in the same size tier. Size tiers
+remain diagnostic only, with a 128 KiB floor in stored bytes rather than the decoded-size ladder.
 
-**Merge selection is confined to an aligned time bucket** (`timebucket.go`) — the same `mergeLadder`
-(1h → 6h → 24h, nesting), walked narrowest-first, newest bucket skipped above the finest level, forced
-rewrites confined to one bucket, capped oldest-first and winning the cycle (`timebucket.Forced`,
-shared; its part-count bound applies only when part size is unlimited, as for straddlers).
-[`../engine/ARCH.md`](../engine/ARCH.md),
-"Selection is confined to an aligned time bucket", has the mechanics of the **bucket** rules and what
-each prevents. The selector inside one bucket differs: `pickTierGroup` takes the fullest size tier once
-it holds `minTierParts`, where the metric engine scores runs — which is why there is no idle waiver
-here, there being no scoring heuristic to waive.
+Retention drops fully expired parts on metadata alone. The oldest forced part selects its finest
+aligned bucket; forced work wins, then ordinary compaction, then day-boundary straddlers.
+Compression-only rewrites use that same forced selector when ordinary work has nothing to do,
+including sealed and isolated singletons. They compare persisted algorithms and levels; constants
+need no rewrite, Zstd level zero means 3, and a stronger level alone does not cause rewriting.
+AlgorithmNone disables the fallback. Every selected output uses the configured compression profile.
 
-It matters more here than for metrics: record queries are overwhelmingly narrow and recent, and a
-record row carries far more bytes than a sample, so opening an unneeded part costs more.
+### Disk and resident memory have different units
 
-**Straddlers are split on day boundaries**, as in the metric engine (`../engine/ARCH.md`, "A straddler
-is split, never grouped"): `selectStraddlers` batches parts that fit no level oldest-first up to the
-cap, after forced rewrites and the ladder, and `compactParts` routes each stream's rows to a writer
-per day in one pass over the sources. Records are where this bites: an exemplar producer re-exporting
-stale exemplars with their original timestamps makes every flush a straddler, and the ladder alone
-merged none of 12,735 such parts. The fix heals them but does not stop them being written; dropping
-re-exported exemplars at ingest is its own change. Record specifics:
-
-- The day writers stream (§ Merge write side), so a merge across days holds a writer per open day —
-  frames, dictionaries and sidecar state — never a day's rows.
-- A writer is sealed once it has taken the cap in decoded rows, and the largest open writer once the
-  writers leave less than one append's room in what the merge's grant leaves beside its sources and
-  encoder (§ Merge write side). Both are checked after every append — at most one output
-  granule, and at most a quarter of the cap of one stream's rows in one day — so a part reaches at
-  most 1.25× the cap, and the writers stay inside their room unless one append outgrows the reserve
-  and every append before it. A retention rewrite takes its bucket's forced parts only up to the cap, so its day is about
-  the budget (`TestRetentionRewriteHoldsResidentShare`), unless one forced part over the cap is
-  rewritten alone.
-- A side-store engine (profiles) writes a symbol sidecar under each day's part, since each is the one
-  home a reader looks in: the inputs' union, restricted to what that part's rows reach. The cap does not
-  split its day, but the resident share can, and every part of that day then carries its own copy of
-  the entries its rows share with the others — the per-part sidecar cost #694 removes.
-- Measured on a 17-day batch (16 parts × 64 streams, hourly, 64 MiB parts;
-  `BenchmarkMergeStraddlers17Days`): per-day passes read 16.6 MB from the backend, allocated 426 MB and
-  took 246 ms; the single pass reads 1.0 MB, allocates 143 MB and takes 166 ms, its buffers peaking at
-  17 MB of decoded records against a 341 MiB share, at a 52–57 MB peak live heap.
-- A split merge takes about cap / part size straddlers. Measured on the stand's shape (655 stale
-  records plus one fresh per part, ≈44 KiB decoded, 64 MiB cap): 4,000 straddlers converged to 6
-  parts in 6 cycles — 3 split merges of ≈1,500, 3 ladder merges — in 4 s in memory.
-
-### Every size is measured
-
-| what | measured as |
-|---|---|
-| `MaxPartBytes` | the *decoded* bytes a row holds (`flushColumns.rowBytes`) |
-| flush split | on those bytes (`byteRanges`) |
-| a part's footprint | `Manifest.RawBytes` → `part.sizeBytes`, recorded at write |
-| size tiers, seal threshold | compare those |
-
-A row count cannot stand in: the same count is ten 1 MiB records or ten thousand 1 KiB ones. Nor can an
-assumed average row size, and the spread is what makes it unsafe: real structured-log rows average
-**~950 B**, so an assumption low by 4× decodes 4× the intended bytes per merge. `recordRowBytes`
-(1024 B, calibrated to that measurement) is only the fallback for a part whose manifest omits the figure.
-
-Parts also record per-column sizing stats (`block.WithSizingStats`), so what reading a source column
-holds is known from its manifest (`block.PartReader.ColumnInputSize`), and write manifest version 3
-for it (`ADMIN.md`, the upgrade rule).
-
-### Merge cap
+`MaxPartBytes` splits flushes by measured decoded row bytes. `MergeCeilingBytes`, resolved from
+`tenant.Limits.MaxMergePartSize`, sizes merged parts in stored bytes and is independent of flush
+size and memory. Both engines derive their disk cutoff through `mergestream.PartCap`:
 
 ```
-cap = max( one flushed part,                              ← floor: retention must always
-           min( mergeHeight × MaxPartBytes,                       be able to rewrite one
-                MergeMemoryBytes / concurrency / 3 ) )
+disk cap = min(configured ceiling, max(free space / writer fanout / 2, 8 MiB))
 ```
 
-The metric engine has the same memory term, for the same reason: a cap sized against storage says
-nothing about what the process can hold. It is *decoded* bytes here, the unit tiering compares parts
-in ([part.sizeBytes]). It does not measure what the merge holds: both sides stream, so the resident
-set is read windows and writer state (§ Merge write side), and the divisor of three prices sources and
-an output buffer the merge never holds. Free space does not enter; the flush cap and the tiering
-target bound the disk.
+The default ceiling is 16 GiB; a negative ceiling disables disk sealing. Unknown free space leaves
+the ceiling in force. The disk floor never raises an explicit smaller ceiling. A part at cap / 1.7
+is excluded from ordinary compaction, since it cannot join a useful run below the cap. Retention
+and compression rewrites can still select it. `part.sizeBytes` sums the manifest's stored column
+sizes, present even on legacy parts; raw row estimates never enter disk selection.
 
-A merge seals on two numbers: the cap, per output part in decoded rows (`mergePartBytes`), and the
-merge's grant — its share (`mergeMemoryBudgetBytes`), or what it needs if that is more, which is what
-`Config.MergeAdmission` reserves — of which its open writers get what the sources and the encoder
-leave (`mergeWriterBudget`). Neither bounds the other, and only the second is a memory bound. The
-stream union the merge walks comes from `internal/mergestream`:
-`mergestream.Keys` over each part's already-sorted `ranges`, a k-way heap rather than a map of every
-distinct stream. It collapses repeats within a part as the map did, which matters because an
-unsorted stream column leaves `buildRanges` with two runs carrying the same id.
+Each output day writer checks `StreamWriter.EncodedBytes` after an append. It is a lower bound:
+the final frame, staged granule, stream-id column, dictionaries and sidecars finish later, so the
+completed part can exceed its disk target by that unfinished state and one append. Raw dictionary
+bytes cannot stand in for compressed bytes without sealing compressible parts prematurely.
+Profiles leave a day intact under the disk target because each fragment duplicates its symbol
+sidecar; resident pressure still splits it.
 
-`concurrency` is derived from the memory budget rather than from the core count, and enforced by the
-process-wide `internal/memlimit.Pool` through `Config.MergeAdmission` — `engine/ARCH.md` ("Merge
-cap") has the reasoning, including why a `MergeOptions.Background` merge defers rather than waits. Both engines
-draw on the same pool because they share one process. There is no free-space term here, so unlike
-the metric engine this cap has only the one divisor.
+The resident allowance is `MergeMemoryBytes / admitted concurrency`; zero derives the process
+budget / 8, and negative opts out. The shared admission pool enforces concurrent reservations.
+Half a share, divided among selected source columns, limits read-ahead to at most the configured
+window. One append has an independent decoded limit of at most 1 MiB or share / 16, plus one row.
+Neither quantity grows with the disk target or cumulative decoded rows.
 
-### Merge shape and forcing (`mergeshape.go`)
+Manifest sizing bounds source decoders before they open. Admission reserves at least one share,
+or the source/encoder/writer floor when larger. Sources and encoder workspace leave the remaining
+grant to the day writers; the router seals writers on measured resident state, including binding
+caches, bloom builders and finish scratch. The finish floor reserves bounded stream-id scratch
+(up to share / 8), source sidecars, identities and capped dictionaries, without translating the
+disk target into a decoded size. Legacy unsized sources are measured after opening and top up their
+grant; a background merge defers rather than waiting. An indivisible merge needing more than the
+whole pool runs alone and reports the excess; the pool is admission, not a hard allocation limit.
 
-`Engine.MergeShape` reports the selector's inputs (fields in `ADMIN.md`), because a no-op merge is
-otherwise indistinguishable from an idle engine. `MergeShape.Bytes` sums the parts' manifest sizes
-(no backend stat calls), so the same snapshot separates parts that grew from a merge that stopped. This engine has **no idle waiver**: two parts in
-different tiers of one bucket are a *permanent* fixed point, and `MergeOptions.Force` is the only way
-out. It takes a bucket's unsealed parts smallest-first whatever their tiers, still truncated at the
-cumulative-bytes cap and still confined to one bucket — the tier rule is waived, the memory bound is
-not. `Candidates` and `ForceCandidates` run the real merge — retention's whole-part drops, then the
-selector under the cutoff passed to `MergeShapeWith` — with and without `Force`, so the two
-zero states separate: `ForceCandidates > 0` is a tier spread only `Force` breaks, both zero is every
-unsealed part alone in its bucket with no pending compression rewrite, which nothing reduces
-without widening a part.
+The stream union is `mergestream.Keys` over each part's sorted ranges, a k-way heap rather than a
+set of every stream. Day writers share compressors, stream their frames to capable backends and
+open their finished output parts only after releasing source readers. Buffered backends also charge
+the retained encoded output and its serialization copy as resident state.
 
-When retention, size compaction and straddler splitting select nothing, the same merge rewrites
-parts below `Config.MergeCompression` / `MergeCompressionLevel`, including sealed and time-isolated
-singletons. This fallback uses the forced selector's oldest bucket and cumulative decoded-byte cap
-(at most 16 sources without a cap), so it neither joins distant days nor rewrites the whole store.
-Ordinary work wins: compression-only work can wait while compaction remains busy, preserving
-straddler batching and preventing newly flushed lower-level parts from displacing part-count work.
-The persisted column algorithm and level identify the fixed point even when compression stores a
-raw payload because it would be larger; constant columns need no rewrite, ZSTD level 0 means its
-default 3, and a stronger level alone does not trigger a rewrite. Every selected output uses the
-configured profile. AlgorithmNone disables the fallback.
+### Inspection and logical sizes
+
+`MergeShape.CapBytes` reports the last measured disk cutoff, zero before the first merge, so polling
+never reads free space. `Bytes` sums stored columns. `Candidates` and `ForceCandidates` use the real
+selector, including retention drops and compression fallback. `BestMultiplier`, `IdleRounds` and
+`WaiveAfter` expose scoring; the legacy tier counters remain descriptive rather than eligibility
+conditions. Both candidate counts zero with unsealed parts means the time ladder is resting.
+
+`PartStat.SizeBytes` remains the manifest's decoded footprint for compatibility; `DiskBytes` exposes
+the selection size separately. Query admission and compression ratios use decoded bytes, with a
+1024 B/row fallback only for old manifests without `RawBytes`. A short final source granule charges
+its actual row count, keeping the prospective scan bound consistent with the opened decoder.
+
+### Compaction measurement
+
+`BenchmarkMergeDiskBudget` drains 24 synthetic flushes of 2,048 rows, each body 4 KiB drawn from two
+values, in one stream and hour. Fixture ingestion and final close are excluded; the memory backend,
+32 MiB resident target and fast pure-Go Zstd isolate part selection and streaming. Six single-CPU
+100 ms samples on Linux/amd64, Ryzen 5950X, Go 1.27.3 (`nodwarf5`), compared with v0.49.1, reach one
+part instead of four for 192 MiB logical data. Allocated bytes fall from 13.61 to 8.81 MiB (35.2%),
+allocations from 3,337 to 1,902 (43.0%); draining takes 3.04 rather than 2.82 ms (7.6% longer,
+p=0.015) while achieving the smaller final part set. This corpus exercises the decoded-cap failure,
+not production compression ratios.
+
+A separate file-backed live-heap check admits the same logical corpus through a 32 MiB pool,
+reaches one part and holds about 3 MiB above the baseline. The facade allocation guard uses a
+separate multi-service corpus and caps total allocation volume at twice its 32 MiB pool; allocation
+volume includes scratch that becomes garbage and is distinct from peak resident bytes.
 
 ## Schema
 
@@ -277,13 +239,9 @@ column also holds its tail as read and its dictionary decompressed into scratch 
 copy; the sources open one column at a time and before any writer, so the need is the sources'
 steady figures plus the larger of the biggest such open peak and the writers' share: the two
 encoders' workspace (`compress.Compressor.EncodeWorkspace`, below) and the writers' floor: two
-appends and one writer's finish at the cap (`writerFinishAtCap`: the cap's share of the rows as
-stream ids; for each dictionary-coded column some source built a shared dictionary for, its region
-at the least of the sources' dictionaries, the cap and the dictionary cap; and the sources' blooms,
-record keys and identities), so a writer is not shed for its own finish charge before its part
-reaches the cap (`mergeNeed`). The estimate sizes the floor and is not itself a charge: a writer
-charges its actual finish, so a merged dictionary past its sources' seals that part early instead
-of holding more than the grant. A merge reserves that through `Config.MergeAdmission` when it is more than its share
+appends and `writerFinishFloor`: bounded stream-id scratch, the capped source dictionaries and
+source sidecars/identities. Actual finish state is charged by each writer as it grows; the floor is
+independent of the disk cutoff. A merge reserves that through `Config.MergeAdmission` when it is more than its share
 (`admitMerge`). A manifest that cannot bound a source (no sizing stats, a leading dictionary) leaves
 the share reserved; once the sources are open and measured the merge tops the grant up without
 waiting, since waiting while holding could deadlock two merges, and a merge that may wait otherwise

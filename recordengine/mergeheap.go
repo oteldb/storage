@@ -97,7 +97,7 @@ func (h *runHeap) fill(w *recordPartStreamWriter, u chunk.U128, dayEnd, runBytes
 			m++
 		}
 
-		if err := w.appendRows(u, ts[:m], size); err != nil {
+		if err := w.appendRows(u, ts[:m]); err != nil {
 			return err
 		}
 

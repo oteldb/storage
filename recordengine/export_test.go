@@ -150,3 +150,6 @@ func SetMergeResidentObserver(fn func(peak, run, limit, grant int64)) func() {
 
 	return func() { mergeResidentObserver = old }
 }
+
+// SetMergeFrameBytes changes output frame packing for small split fixtures.
+func (e *Engine) SetMergeFrameBytes(n int) { e.mergeFrameBytes = n }

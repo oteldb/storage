@@ -121,77 +121,12 @@ func TestMergeCapBytes(t *testing.T) {
 			want:    minMergeCapBytes,
 		},
 		{
-			// The output part is buffered in RAM until it is sealed, so a big disk behind a small
-			// memory budget must not size a part the process cannot hold: 4 GiB of merge memory,
-			// halved for the serialize step, is a 2 GiB part however much disk there is.
-			name:    "memory lowers the disk-derived share",
-			ceiling: 1 << 40,
-			memory:  4 << 30,
-			backend: spaceBackend{Backend: backend.Memory(), free: 1 << 45},
-			want:    2 << 30,
+			name: "small memory leaves the disk ceiling unchanged", ceiling: 1 << 30,
+			memory: 1 << 20, backend: backend.Memory(), want: 1 << 30,
 		},
 		{
-			// The memory bound applies to a backend that reports nothing too — that is the OOM
-			// shape, where the ceiling alone used to stand.
-			name:    "memory lowers the ceiling without space reporting",
-			ceiling: 16 << 30,
-			memory:  512 << 20,
-			backend: backend.Memory(),
-			want:    256 << 20,
-		},
-		{
-			name:        "concurrency divides the memory too",
-			ceiling:     1 << 40,
-			memory:      4 << 30,
-			concurrency: 4,
-			backend:     backend.Memory(),
-			want:        512 << 20,
-		},
-		{
-			// The core count is a ceiling, not the divisor. 256 MiB across 16 cores would give each
-			// merge 8 MiB — the floor, i.e. no merge worth running — so the budget supports four
-			// merges instead, and each gets 256/4/2 = 32 MiB.
-			name:        "memory lowers concurrency below the core count",
-			ceiling:     1 << 40,
-			memory:      256 << 20,
-			concurrency: 16,
-			backend:     backend.Memory(),
-			want:        32 << 20,
-		},
-		{
-			// The same budget on a single-core node: nothing to lower, and the whole budget is one
-			// merge's.
-			name:        "one core takes the whole budget",
-			ceiling:     1 << 40,
-			memory:      256 << 20,
-			concurrency: 1,
-			backend:     backend.Memory(),
-			want:        128 << 20,
-		},
-		{
-			// The two terms divide by different numbers, and this is the case that tells them apart.
-			// The budget admits 4 merges (256 MiB / 64 MiB) while 16 can *run*, and without an
-			// admission pool 16 may be writing at once — so the disk must be divided by the fan-out,
-			// not by the smaller admitted count.
-			//
-			//   disk (fan-out 16):     512 MiB / 16 / 2 = 16 MiB  ← correct, and binds
-			//   disk (admitted 4):     512 MiB /  4 / 2 = 64 MiB  ← would over-commit the volume
-			//   memory (admitted 4):   256 MiB /  4 / 2 = 32 MiB
-			//
-			// Sharing one divisor gives 32 MiB here, so this case fails if the terms are merged.
-			name:        "disk divides by the fan-out, memory by what the budget admits",
-			ceiling:     1 << 40,
-			memory:      256 << 20,
-			concurrency: 16,
-			backend:     spaceBackend{Backend: backend.Memory(), free: 512 << 20},
-			want:        16 << 20,
-		},
-		{
-			name:    "a memory budget below the floor still merges",
-			ceiling: 1 << 40,
-			memory:  1 << 10,
-			backend: backend.Memory(),
-			want:    minMergeCapBytes,
+			name: "disk divides by writer fanout", ceiling: 1 << 40, memory: 256 << 20,
+			concurrency: 16, backend: spaceBackend{Backend: backend.Memory(), free: 512 << 20}, want: 16 << 20,
 		},
 		{
 			name:    "negative memory opts out",
@@ -248,29 +183,14 @@ func TestMergeCapBytes(t *testing.T) {
 	}
 }
 
-// TestMergeCapFitsThePodThatOOMed replays the incident with its real numbers: a 3.6 GiB GOMEMLIMIT
-// over a 464 GiB volume, where the disk-derived share (232 GiB) clamped to the 16 GiB ceiling and
-// the merge OOMed building a part the pod could not hold. Not parallel: GOMEMLIMIT is process-wide.
-//
-//nolint:paralleltest // GOMEMLIMIT is process-wide, so this case cannot run alongside the others
-func TestMergeCapFitsThePodThatOOMed(t *testing.T) {
-	const podLimit = 3865470566
-
-	restore := debug.SetMemoryLimit(podLimit)
+//nolint:paralleltest // GOMEMLIMIT is process-wide
+func TestMergeCapIndependentOfPodMemory(t *testing.T) {
+	restore := debug.SetMemoryLimit(3865470566)
 	t.Cleanup(func() { debug.SetMemoryLimit(restore) })
-
-	e := New(Config{
-		Backend: spaceBackend{Backend: backend.Memory(), free: 464 << 30},
-		Prefix:  "t",
-	})
-
+	e := New(Config{Backend: spaceBackend{Backend: backend.Memory(), free: 464 << 30}, Prefix: "t"})
 	capBytes := e.mergeCapBytes(context.Background())
-
-	assert.Positive(t, capBytes)
-	assert.LessOrEqual(t, capBytes, memlimit.MergeShare(0, 1, mergeBufferAmplification),
-		"the cap must fit the merge's share of the pod's memory, not the volume behind it")
-	assert.Less(t, capBytes, int64(podLimit),
-		"a part the pod cannot hold is what OOMKilled it")
+	assert.Equal(t, defaultMergeCeilingBytes, capBytes)
+	assert.Less(t, e.mergeMemoryBudgetBytes(), capBytes)
 }
 
 // TestMergeCapRecoversTheVolumeWhenWritesStream is the incident's numbers again, over a backend that
@@ -292,8 +212,8 @@ func TestMergeCapRecoversTheVolumeWhenWritesStream(t *testing.T) {
 
 	capBytes := e.mergeCapBytes(context.Background())
 
-	assert.Equal(t, int64(defaultMergeCeilingBytes), capBytes)
-	assert.Greater(t, capBytes, memlimit.MergeShare(0, 1, mergeBufferAmplification),
+	assert.Equal(t, defaultMergeCeilingBytes, capBytes)
+	assert.Greater(t, capBytes, memlimit.MergeShare(0, 1),
 		"the cap must no longer be held down by memory the writer does not spend")
 }
 
@@ -334,7 +254,7 @@ func TestAdmissionRequestMatchesCapDerivation(t *testing.T) {
 
 			assert.LessOrEqual(t, k, fanout, "the fan-out caps how many merges the budget admits")
 			assert.Positive(t, request)
-			assert.Equal(t, memlimit.MergeShare(budget, k, 1), request,
+			assert.Equal(t, memlimit.MergeShare(budget, k), request,
 				"a merge must reserve the share its own concurrency implies")
 
 			// The pool is sized at the whole budget and each merge takes `request`, so this is the

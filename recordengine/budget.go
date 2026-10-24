@@ -22,7 +22,7 @@ import (
 // bytesPerRow is the average decoded bytes one accumulated row costs, taken over the parts this
 // plan will read.
 //
-// [part.sizeBytes] is the part's *decoded* footprint as recorded in its manifest, not its compressed
+// [part.decodedBytes] is the part's *decoded* footprint as recorded in its manifest, not its compressed
 // size, so this needs no guessed expansion factor. Records are variable-width, so it is an average:
 // a request whose matched rows are unusually wide is under-counted and one whose rows are narrow is
 // over-counted. With no live parts (a head-only read) it falls back to the same per-row constant the
@@ -31,12 +31,12 @@ func (p *fetchPlan) bytesPerRow() int64 {
 	var bytes, rows int64
 
 	for _, part := range p.liveParts {
-		bytes += part.sizeBytes()
+		bytes += part.decodedBytes()
 		rows += part.rows()
 	}
 
 	if rows <= 0 {
-		return recordRowBytes
+		return legacyRecordRowBytes
 	}
 
 	return max(bytes/rows, 1)

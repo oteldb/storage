@@ -57,7 +57,7 @@ jobs:
       - name: Run allocation guards
         env:
           OTELDB_ALLOC_GUARDS: "1"
-        run: go test -timeout 10m -count 1 -p 1 -v -run 'TestRecordMergeBoundedWorkingSet' .
+        run: go test -timeout 10m -count 1 -p 1 -v -run '^TestRecordMerge(BoundedWorkingSet|AllocationCeiling)$' .
 
   chaos:
     name: EC chaos

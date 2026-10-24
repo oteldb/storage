@@ -77,7 +77,8 @@ type part struct {
 
 	// rawBytes is the part's decoded footprint per its manifest, 0 for a part written before the
 	// manifest carried one. See [part.sizeBytes].
-	rawBytes int64
+	rawBytes  int64
+	diskBytes int64
 
 	// refs counts in-flight fetches reading this part lock-free. A fetch acquires (under the engine
 	// lock, while the part is still live) the parts it will read, releases them when done, and reads
@@ -139,9 +140,14 @@ func openPart(
 		return nil, err
 	}
 
+	var diskBytes int64
+	columns := r.Manifest().Columns
+	for i := range columns {
+		diskBytes += columns[i].Bytes
+	}
 	return &part{
 		schema: schema, reader: r, be: b, prefix: prefix, ranges: ranges,
-		blooms: blooms, recordKeys: recordKeys, rawBytes: r.Manifest().RawBytes,
+		blooms: blooms, recordKeys: recordKeys, rawBytes: r.Manifest().RawBytes, diskBytes: diskBytes,
 	}, nil
 }
 

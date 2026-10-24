@@ -88,10 +88,8 @@ type SignalStats struct {
 	// counts above apply that cutoff rather than the one the next cycle will measure. Inspect never
 	// reads part sizes from the backend to find out.
 	MergeCandidatesStale bool
-	// MergeCapBytes is the seal threshold in effect — the size at which a merged part is sealed, and
-	// the bound on what one merge may hold. It is derived per merge (from free space and the merge
-	// memory allowance) for metrics, so it reads 0 until the engine's first merge; for the record
-	// signals it is a function of configuration and is always populated.
+	// MergeCapBytes is the last measured stored-byte seal threshold, independent of resident memory.
+	// It reads zero before the first merge or when disk sealing is disabled.
 	MergeCapBytes int64
 	// WAL is true when this engine has a write-ahead log (false for the ephemeral in-memory engine);
 	// the WAL* fields below are meaningful only when it is true.

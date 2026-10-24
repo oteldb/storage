@@ -503,9 +503,8 @@ by the read seam.
 ```
 concurrency   = clamp( mergeMemory / 64 MiB, 1, MergeConcurrency )   ← memory decides, cores cap
 mergeCapBytes = min( MergeCeilingBytes,
-                     free        / MergeConcurrency / 2,   ← merges that can *run*
-                     mergeMemory / concurrency      / 2 )  ← merges the budget *admits*
-                                                              (whole-object backends only)
+                     max(free / MergeConcurrency / 2, 8 MiB) )
+resident share = mergeMemory / concurrency
 ```
 
 **Why not a constant:** cardinality spends the budget in *breadth*, so a fixed cap shrinks a part's
@@ -537,9 +536,8 @@ producing.
 byte semaphore that every engine of every signal draws on through `Config.MergeAdmission`; a merge
 reserves its resident share once it has selected sources and holds it until it ends. Without it the
 share is arithmetic nobody keeps: the facade fans merges out on its own schedule, so the division
-understated what a merge may hold *and* overstated how many may hold it, at once. Note the bound is
-the *request*, not measured residency: below the cap floors (`minMergeCapBytes` here,
-`MaxPartBytes` in `recordengine`) a merge can hold more than it asked for.
+understated what a merge may hold *and* overstated how many may hold it, at once. The pool bounds admission requests; it is not a hard allocation limit. An indivisible input or
+append may exceed the nominal share. Disk floors do not set resident allowances.
 
 **A `MergeOptions.Background` merge does not wait for its budget; it defers.** Admission is taken
 after selection, so a cycle with nothing to compact never consults the budget — and when the budget
@@ -578,19 +576,11 @@ ceiling. A nearly full disk falls to `minMergeCapBytes` rather than sealing ever
 the part count high is worst when compaction matters most; that floor binds derived bounds only, so a
 configured ceiling below it is honored.
 
-**Memory bounds the cap only over a backend that takes objects whole.** There the output accumulates in
-RAM until sealed and `build` serializes it into one buffer per column, so peak resident ≈ 2× the part.
-Free space says nothing about that: a 4 GiB pod on a 464 GiB volume derives 232 GiB, clamps to the
-16 GiB ceiling, and OOMs. Hence the third term, split across concurrent merges and halved for the
-serialize step; the allowance defaults to an eighth of the process budget (`GOMEMLIMIT`, else the
-cgroup limit, else host memory — `internal/memlimit`).
-
-Over a `backend.ObjectCreator` (`file`) the term drops: the writer hands each column's frames over as
-they seal (`block/ARCH.md`, "Two writers") and never holds the part. A streamed merge still holds
-**per-series** state — id runs, series index, aggregate sidecar — which is O(distinct series), not a
-function of part bytes; a merge of very short series holds far more per encoded byte. So the loop also
-seals on `partStreamWriter.residentBytes()` against `mergeMemoryBudgetBytes()`, the same allowance at
-face value, bounding memory directly.
+**Resident state bounds memory directly on every backend.** A streaming backend retains windows,
+frames and per-series state; a whole-object backend also retains encoded output until serialization.
+`partStreamWriter.residentBytes` charges that output and its copy explicitly rather than deriving a
+disk cap from an amplification factor. `mergestream.PartCap` sizes disk output identically for both
+engines; `mergeMemoryBudgetBytes` and admission remain separate resident quantities.
 
 ## Merge — one pass, five modes
 

@@ -29,7 +29,7 @@ func TestAdmissionReservesWhatTheSourcesNeed(t *testing.T) {
 	const share = 1 << 20
 
 	e := wideDictEngine(t, backend.Memory(), Config{MergeMemoryBytes: share, MergeAdmission: admit}, 3, 4, 8<<10, 2)
-	need, ok := e.mergeNeed(ctx, e.parts, e.mergeCapBytes())
+	need, ok := e.mergeNeed(ctx, e.parts)
 	require.True(t, ok)
 	require.Greater(t, need, e.mergeMemoryBudgetBytes(), "the sources must need more than the share for the test to mean anything")
 

@@ -97,7 +97,7 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 | `MergeCandidates` | parts the **next** maintenance merge would take: retention's whole-part drops, the forced rewrites the tenant's policy selects (retention; for metrics also downsampling, recompression and precision — a metric part counts toward downsampling only while the policy would roll some of its time range wider than the tier layout its manifest records (the policy is resolved against the tiers live parts already record, recorded first, so a raw part in a range already rolled counts too; a policy tier whose interval does not nest with, or whose aggregation differs from, one a readable part records is not applied, and the merge logs one warning; parts whose recorded layouts do not nest (a different aggregation, or intervals that do not divide each other), written by nodes with different policies, form separate cohorts that merge only among themselves, scheduled round-robin, and the count is the cohort the next merge starts at), and a part without that record counts while it is older than a tier's cutoff, until its first rewrite records one), the size-driven group, and straddlers awaiting a split; record signals also count the bounded compression rewrite selected when ordinary compaction has no work. Forced rewrites are capped per merge like the rest, so a forced backlog larger than one merge (after downtime, or a shortened retention window) drains over several cycles: the count is one cycle's share of it, and stays above `0` until the backlog is gone. The policy is resolved as the merge resolves it. The size-retention cutoff needs part sizes from the backend, which `Inspect` never reads: it uses the cutoff the last maintenance cycle measured, re-measured at the end of that cycle for the part set its merges left. `0` with a non-zero `MergeBacklog` is either of the two states below |
 | `MergeForceCandidates` | the same count for `Admin.CompactNow`, which also forces a group the size rule declines. Above `0` while `MergeCandidates` is `0`: a tier spread only a forced merge breaks. `0`: `CompactNow` is a no-op |
 | `MergeCandidatesStale` | the tenant has a size budget and something flushed or merged since the last maintenance cycle, so the two counts above apply a size cutoff measured for an earlier part set; the next cycle re-measures. Always `false` without a size budget |
-| `MergeCapBytes` | the seal threshold in effect. Derived per merge for metrics (from free space and the merge memory allowance), so it reads `0` until that engine's first merge; a static function of configuration for the record signals |
+| `MergeCapBytes` | the stored-column-byte seal threshold, derived from the configured ceiling and free space independently of resident memory and flush size. It reads `0` before the first merge in either engine |
 | `WAL` | the engine has a write-ahead log (false for the ephemeral in-memory engine) |
 | `WALSegments` / `WALBytes` | WAL segment files on disk (closed ones not yet checkpointed, plus the open one) and the bytes they hold. Growing without bound means flushes are not retiring segments |
 | `WALEpoch` | WAL active flush generation (not the recovery watermark) |
@@ -122,8 +122,8 @@ like an idle one. The three numbers beside it answer it directly:
   `merge.deferred` is climbing, which says the work is selected and waiting on the memory budget
   rather than on the selector.
 - `MergeBacklog > 0`, `MergeCandidates == 0`, `MergeForceCandidates > 0` — **stuck**: parts share a
-  time bucket but no size tier or run of them qualifies. The metric engine waives its
-  write-amplification guard after a few idle cycles and unwedges itself; the record engines do not.
+  time bucket but no size tier or run of them qualifies. Both engines waive their
+  write-amplification guard after three idle cycles and retry the best run.
   `Admin.CompactNow` breaks it either way.
 - `MergeBacklog > 0`, `MergeCandidates == 0`, `MergeForceCandidates == 0` — **resting**: every
   unsealed part is alone in its time bucket at each ladder level, or waits in the still-filling
@@ -134,18 +134,16 @@ like an idle one. The three numbers beside it answer it directly:
 
 Record candidates also include a compression rewrite when ordinary compaction selects nothing:
 the oldest bucket's parts below the configured merge compression profile, bounded by the same
-decoded-byte cap (at most 16 sources without a cap). Sealed parts can need this rewrite too, so
+stored-byte cap and at most 16 sources. Sealed parts can need this rewrite too, so
 `MergeCandidates` may be non-zero with `MergeBacklog == 0`; sealing only excludes size compaction.
 Resting parts have reached their compression fixed point as well. Compression-only work waits
 while ordinary compaction remains busy; it never displaces retention, ladder merging or straddler
 batching. The rewrite uses the same memory admission and deferral as any other merge.
 
-Each engine's own `MergeShape()` (`engine`, `recordengine`) carries the rest of the selector's
-inputs behind these fields — the metric engine's `BestMultiplier`/`MinMultiplier`/`IdleRounds`/
-`WaiveAfter`, the record engines' `Tiers`/`LargestTierParts`/`MinTierParts`. They are per-engine
-because the two selectors reason differently: the metric engine orders parts by size and scores runs
-(it has had no size tiers since the tiering that stranded parts was removed), while the record
-engines still bucket by tier and wait for `MinTierParts` of them.
+Each engine's `MergeShape()` exposes `BestMultiplier`, `IdleRounds` and `WaiveAfter`. Both score
+stored-byte runs and waive the guards after three idle selections. The record shape retains
+`Tiers`/`LargestTierParts`/`MinTierParts` as diagnostics, with a 128 KiB stored-byte tier floor;
+sharing a tier is no longer required for selection.
 
 ### Drill-down per `(tenant, signal)` (`introspect.go`)
 
@@ -153,13 +151,11 @@ engines still bucket by tier and wait for `MinTierParts` of them.
   own, plus the ones it adopted from a rival writer's index over a shared store (`engine/ARCH.md`,
   "Adopted parts"). `ID` (key prefix), time bounds, `Series`, `Rows`. In-memory, no backend I/O —
   safe to poll. The engines' `StoreStats.Parts` counter is the narrower quantity — parts this writer
-  owns, the ones its merge can act on — so the two differ by the adopted set on a shared store. (Each engine's own `PartStat`
-  additionally carries `SizeBytes`, the figure that engine's merge cap compares against, and so the
-  one that explains why a part is or is not sealed. It is deliberately **not** on the cross-signal
-  `PartInfo`: the two are different quantities under one name — `engine.PartStat.SizeBytes` is the
-  part's size *on disk*, since the metric merge is bounded by what it writes, while
-  `recordengine.PartStat.SizeBytes` is its *decoded* footprint, since the record merge is bounded by
-  what it holds.)
+  owns, the ones its merge can act on — so the two differ by the adopted set on a shared store.
+  The engine-specific record `PartStat.SizeBytes` remains decoded bytes for compatibility and
+  compression ratios; its new `DiskBytes` is the stored column size used for selection and sealing.
+  Metric `PartStat.SizeBytes` already uses stored bytes. The cross-signal `PartInfo` omits these
+  engine-specific fields.
 - **`PartsDetailed(ctx, tenant, signal) ([]PartDetail, error)`** — augments each part with `Bytes`
   (summed backend object sizes), `Chunks` (sparse-index granules), `Columns` (`Name`, `Kind`,
   `Codec`, `Compress`, `Level` — the compression level, which for merged metric parts climbs a
@@ -248,8 +244,8 @@ Metric instruments (all prefixed `storage.`):
 |-----------|------|-------|
 | `ingest.accepted` / `ingest.rejected` | `signal`(, `reason`) | reasons: `out_of_order`, `rate_limit`, `max_series`, `max_in_flight_bytes`, `reserved_tenant` (the `Tenant` callback derived an id in the reserved `wal` namespace; not counted in `AdmissionStats`, since no such tenant exists) |
 | `ingest.sampled_dropped` / `ingest.overflowed` | `signal` | budgeted sampling / overflow routing |
-| `flush.total` / `flush.duration` / `flush.rows` / `flush.bytes` | `signal` | head flushes; `flush.bytes` is the part bytes written, the denominator of write amplification |
-| `merge.total` / `merge.duration` / `merge.parts_in` / `merge.bytes_in` / `merge.bytes_out` | `signal` | background merges; `bytes_out` against `flush.bytes` is how many times the engine rewrites what it ingests, `bytes_out`/`bytes_in` what one cycle gains |
+| `flush.total` / `flush.duration` / `flush.rows` / `flush.bytes` | `signal` | head flushes; `flush.bytes` is stored part-column bytes for records (decoded bytes in older versions), the denominator of write amplification |
+| `merge.total` / `merge.duration` / `merge.parts_in` / `merge.bytes_in` / `merge.bytes_out` | `signal` | background merges; record byte counters sum stored column bytes, matching the selection unit (older versions counted decoded bytes). `bytes_out` against `flush.bytes` is how many times the engine rewrites what it ingests, `bytes_out`/`bytes_in` what one cycle gains |
 | `merge.deferred` | `signal` | merges that selected parts and could not claim the process merge memory budget, so compacted nothing and left the work for the next cycle. Any sustained rate says compaction is bounded by `MergeMemoryBytes` — raise `MergeMemoryBytes` if part counts climb with it. Raising `MaintenanceConcurrency` does not help: a deferral only happens when the budget already admits fewer merges than the fan-out |
 | `merge.over_budget_bytes` | `signal` | bytes a merge held beyond what it could reserve. Either it needed more than the whole `MergeMemoryBytes` budget, so it reserved all of it and ran alone (logged as `merge needs more than the whole merge memory budget`); or opening the parts it wrote took more than its grant and the rest was not free (logged as `merge opens its written parts past its grant`). A sustained rate says the budget is smaller than one merge of the store's parts — raise `MergeMemoryBytes` |
 | `fetch.total` / `fetch.duration` / `fetch.series_matched` / `fetch.rows_returned` / `fetch.parts_scanned` | `signal` | reads; the metric engine's reads are streaming, so these are recorded when the iterator is **closed** — `duration` covers the whole iteration (the consumer's own per-batch work included) and `rows_returned` counts what was actually consumed |
