@@ -18,14 +18,14 @@ import (
 //
 //   - A part that has reached the merge cap (mergeHeight × MaxPartBytes) is "sealed": re-merging it
 //     would only re-split it into the same number of equally-full parts (pure churn), so it is never
-//     compacted again. Parts below the cap roll up through progressively taller size tiers, so part
+//     selected for size compaction again. Parts below the cap roll up through taller size tiers, so part
 //     count is bounded at ≈ dataset / (mergeHeight × MaxPartBytes) instead of growing with every flush.
 //   - Among the unsealed parts, those of similar size share a tier; a tier is compacted once it holds
 //     at least minTierParts of them, so small freshly-flushed parts merge up into larger ones without
 //     re-reading the already-compacted large parts.
 //   - A part old enough for retention to drop records from is selected regardless of its tier
-//     (forced), so age-driven work is never starved by sealing. (The record signals have no
-//     downsampling/recompression — retention is the only forced rewrite, unlike the metric engine.)
+//     (forced), so age-driven work is never starved by sealing. Compression rewrites run only when
+//     this selector has no work (recompress.go).
 const (
 	// minTierParts is the number of same-tier parts that must accumulate before they are compacted.
 	minTierParts = 2

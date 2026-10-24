@@ -11,6 +11,7 @@ func TestShapeOfAccounting(t *testing.T) {
 	t.Parallel()
 
 	const capBytes = 64 << 20
+	e := &Engine{}
 
 	// One sealed part, plus two unsealed ones two tiers apart: neither tier reaches minTierParts,
 	// so nothing is selected although both remain mergeable.
@@ -20,7 +21,7 @@ func TestShapeOfAccounting(t *testing.T) {
 		partOfSize(2, 16<<20),
 	}
 
-	sh := shapeOf(parts, 0, capBytes)
+	sh := e.shapeOf(parts, 0, capBytes)
 	assert.Equal(t, 3, sh.Parts)
 	assert.Equal(t, 1, sh.Sealed)
 	assert.Equal(t, 2, sh.Backlog)
@@ -31,7 +32,7 @@ func TestShapeOfAccounting(t *testing.T) {
 	assert.Equal(t, minTierParts, sh.MinTierParts)
 
 	// Two parts in one tier are selectable, and the shape says so.
-	sh = shapeOf([]*part{partOfSize(0, 1<<20), partOfSize(1, 2<<20)}, 0, capBytes)
+	sh = e.shapeOf([]*part{partOfSize(0, 1<<20), partOfSize(1, 2<<20)}, 0, capBytes)
 	assert.Equal(t, 1, sh.Tiers)
 	assert.Equal(t, 2, sh.LargestTierParts)
 	assert.Equal(t, 2, sh.Candidates)

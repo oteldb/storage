@@ -133,7 +133,19 @@ cumulative-bytes cap and still confined to one bucket — the tier rule is waive
 not. `Candidates` and `ForceCandidates` run the real merge — retention's whole-part drops, then the
 selector under the cutoff passed to `MergeShapeWith` — with and without `Force`, so the two
 zero states separate: `ForceCandidates > 0` is a tier spread only `Force` breaks, both zero is every
-unsealed part alone in its bucket, which nothing reduces without widening a part.
+unsealed part alone in its bucket with no pending compression rewrite, which nothing reduces
+without widening a part.
+
+When retention, size compaction and straddler splitting select nothing, the same merge rewrites
+parts below `Config.MergeCompression` / `MergeCompressionLevel`, including sealed and time-isolated
+singletons. This fallback uses the forced selector's oldest bucket and cumulative decoded-byte cap
+(at most 16 sources without a cap), so it neither joins distant days nor rewrites the whole store.
+Ordinary work wins: compression-only work can wait while compaction remains busy, preserving
+straddler batching and preventing newly flushed lower-level parts from displacing part-count work.
+The persisted column algorithm and level identify the fixed point even when compression stores a
+raw payload because it would be larger; constant columns need no rewrite, ZSTD level 0 means its
+default 3, and a stronger level alone does not trigger a rewrite. Every selected output uses the
+configured profile. AlgorithmNone disables the fallback.
 
 ## Schema
 
@@ -851,3 +863,31 @@ strand every later record of that stream. The identity is written *before* the h
 registration (`head.admitStream` decides, `head.ensureStream` commits), so a failed write never leaves a
 registered stream claiming a durability it does not have. An identity frame for a stream that never
 gets rows is cheap and harmless.
+
+## Flush compression measurement
+
+`BenchmarkFlushCompression` measures encoding, identity/bloom sidecars and part read-back over the
+memory backend; head preparation, WAL, index commits and disk latency are excluded. Its companion
+`BenchmarkFlushCompressionFetch` reads all columns and recycles query batches. Both report logical
+uncompressed column throughput. Stored bytes include every part object.
+
+The deterministic synthetic corpora cover 16,384 templated log rows over 16 streams (repeated or
+near-unique bodies), and 360 or 16,384 exemplar rows over 46 streams with random binary ids. They
+exercise compression trade-offs, not a replay of deployment records. On Linux/amd64, Ryzen 5950X,
+Go 1.27.3 (`nodwarf5`), six single-CPU samples give these stored bytes per item at `LevelFast`:
+
+| corpus | codec-only | pure-Go Zstd | `gozstd` |
+|---|---:|---:|---:|
+| logs, repeated | 82.47 | 45.12 | 28.94 |
+| logs, near-unique | 223.90 | 67.65 | 50.41 |
+| exemplars, 360 | 50.15 | 50.17 | 49.33 |
+| exemplars, 16,384 | 37.82 | 36.98 | 36.91 |
+
+Flush remains codec-only: fast Zstd saves substantial log space, but brings negligible savings for
+small high-entropy exemplars while increasing sealing and fetch cost. Pure-Go compressed sealing
+also allocates substantially more memory; `gozstd`'s Go allocation counts omit its native workspace.
+A single compression default across signals therefore hides materially different trade-offs.
+
+Reproduce with `go test -run '^$' -bench '^BenchmarkFlushCompression' -benchmem -cpu=1 -count=6
+-benchtime=500ms ./recordengine`; add `-tags gozstd` for the native backend. `LevelFast` maps to
+klauspost's fastest preset in the default build and level 1 in the native build.

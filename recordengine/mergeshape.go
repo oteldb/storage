@@ -5,8 +5,8 @@ package recordengine
 // reduce is indistinguishable from an idle healthy one — the two differ only in whether the parts
 // are sealed and whether one tier has accumulated enough of the rest.
 type MergeShape struct {
-	// Parts is the flushed parts; Sealed those already at the cap, which no merge reconsiders;
-	// Backlog the rest — the parts a merge may still take.
+	// Parts is the flushed parts; Sealed those excluded from size compaction at the cap;
+	// Backlog the rest. Retention and compression rewrites may also take sealed parts.
 	Parts   int
 	Sealed  int
 	Backlog int
@@ -17,7 +17,8 @@ type MergeShape struct {
 	// retention's whole-part drops included — and ForceCandidates how many a [MergeOptions.Force]
 	// merge would. Candidates 0 with ForceCandidates above it is a tier
 	// spread only Force breaks; both 0 with a non-zero Backlog is every unsealed part alone in its
-	// time bucket, the ladder's resting state, which no merge reduces without widening a part.
+	// time bucket, with no pending compression rewrite: the ladder's resting state, which no merge
+	// reduces without widening a part.
 	Candidates      int
 	ForceCandidates int
 	// CapBytes is the seal threshold in effect, in decoded bytes (0 ⇒ sealing disabled).
@@ -43,11 +44,11 @@ func (e *Engine) MergeShapeWith(opts MergeOptions) MergeShape {
 	src := e.parts
 	e.mu.RUnlock()
 
-	return shapeOf(src, opts.RetainFrom, e.mergeCapBytes())
+	return e.shapeOf(src, opts.RetainFrom, e.mergeCapBytes())
 }
 
 // shapeOf summarizes what the selector sees in src at the given retention cutoff and seal threshold.
-func shapeOf(src []*part, retainFrom, capBytes int64) MergeShape {
+func (e *Engine) shapeOf(src []*part, retainFrom, capBytes int64) MergeShape {
 	unsealed := unsealedOf(src, capBytes)
 
 	var bytes int64
@@ -70,8 +71,8 @@ func shapeOf(src []*part, retainFrom, capBytes int64) MergeShape {
 		Sealed:           len(src) - len(unsealed),
 		Backlog:          len(unsealed),
 		Bytes:            bytes,
-		Candidates:       nextMergeParts(src, retainFrom, capBytes, false),
-		ForceCandidates:  nextMergeParts(src, retainFrom, capBytes, true),
+		Candidates:       e.nextMergeParts(src, retainFrom, capBytes, false),
+		ForceCandidates:  e.nextMergeParts(src, retainFrom, capBytes, true),
 		CapBytes:         capBytes,
 		Tiers:            len(byTier),
 		LargestTierParts: largest,
@@ -81,7 +82,7 @@ func shapeOf(src []*part, retainFrom, capBytes int64) MergeShape {
 
 // nextMergeParts counts the parts one merge over src takes: those retention drops whole, then the
 // selection over the rest.
-func nextMergeParts(src []*part, retainFrom, capBytes int64, force bool) int {
+func (e *Engine) nextMergeParts(src []*part, retainFrom, capBytes int64, force bool) int {
 	live := src
 
 	if retainFrom > 0 {
@@ -94,5 +95,5 @@ func nextMergeParts(src []*part, retainFrom, capBytes int64, force bool) int {
 		}
 	}
 
-	return len(src) - len(live) + len(selectMergeParts(live, retainFrom, capBytes, force))
+	return len(src) - len(live) + len(e.selectMergeParts(live, retainFrom, capBytes, force))
 }

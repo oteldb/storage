@@ -13,7 +13,9 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
+	signallog "github.com/oteldb/storage/signal/log"
 )
 
 // bulkLogBatch builds n log records under one service, each with a body wide enough that a part of
@@ -40,6 +42,12 @@ func TestCompactNowBreaksMergeFixedPoint(t *testing.T) {
 	s, err := InMemory()
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close(ctx) })
+
+	// Keep this fixture codec-only: the facade's compression fallback would heal the tier spread.
+	s.logTenants["default"] = recordengine.New(recordengine.Config{
+		Schema: signallog.Schema, Backend: s.backend, Prefix: "default" + logsPrefix,
+		MaxPartBytes: defaultMaxPartBytes, MergeMemoryBytes: -1,
+	})
 
 	_, err = s.WriteLogs(ctx, logBatch("api", bulkLogRecords(1, 20_000)...))
 	require.NoError(t, err)
@@ -77,6 +85,31 @@ func TestCompactNowBreaksMergeFixedPoint(t *testing.T) {
 		Matchers: []fetch.Matcher{logSvcMatcher("api")},
 	})
 	assert.Len(t, got, 20_001, "no record lost")
+}
+
+func TestMaintainCompressesRestingRecord(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := InMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close(ctx) })
+
+	_, err = s.WriteLogs(ctx, logBatch("api", [3]any{1, 9, "first"}, [3]any{2, 9, "second"}))
+	require.NoError(t, err)
+	require.NoError(t, s.Admin().Flush(ctx, "default", signal.Log))
+	st, ok := findSignal(mustTenant(t, s.Inspect(), "default"), signal.Log)
+	require.True(t, ok)
+	require.Equal(t, 1, st.Parts)
+	assert.Equal(t, 1, st.MergeCandidates, "a singleton still needs compression")
+
+	require.NoError(t, s.Admin().MaintainNow(ctx))
+	st, _ = findSignal(mustTenant(t, s.Inspect(), "default"), signal.Log)
+	assert.Equal(t, 1, st.Parts)
+	assert.Zero(t, st.MergeCandidates, "the facade's merge compression reached its fixed point")
+	assert.Equal(t, []string{"first", "second"}, logBodies(t, s.LogFetcher("default"), fetch.Request{
+		Start: 0, End: 100,
+	}))
 }
 
 // TestCompactNowMetrics covers the metric engine's force path: the same merge, with the
