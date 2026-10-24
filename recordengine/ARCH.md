@@ -11,6 +11,12 @@ store differ. It is the metrics engine's structural twin — head, flush, size-t
 retention, durable bucket-index, part-scoped identity, stateless read path, `MaxPartBytes` splitting,
 and the same lock discipline ([`../engine/ARCH.md`](../engine/ARCH.md)).
 
+The facade drains selectable record merges between maintenance ticks with the same bounded,
+fair catch-up queue as metrics (`../engine/ARCH.md`, "Lifecycle and part identity"). The record
+selector and memory admission still bound each merge; the queue removes the wait for another tick.
+`MergeStep` returns whether a successful call compacted or retired parts; a no-op returns false,
+while retention drops count even if compaction is deferred. `MergeWith` retains its error-only API.
+
 **All three of the identity's attribute sets are postings-indexed** — resource, scope, and the
 signal-level `Series.Attributes`. Logs and traces leave the last empty (their per-record attributes
 are a column), so it costs them nothing. Exemplars carry the metric's data-point attributes and

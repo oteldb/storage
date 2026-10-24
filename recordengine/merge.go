@@ -50,6 +50,13 @@ type MergeOptions struct {
 // MergeWith is [Engine.Merge] with the merge parameterized: the one background-merge entry point,
 // so compaction, retention, and a forced compaction are the same pass over the immutable parts.
 func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
+	_, err := e.MergeStep(ctx, opts)
+	return err
+}
+
+// MergeStep is [Engine.MergeWith], reporting whether a successful pass compacted or retired parts.
+// Retention may change parts even when compaction is deferred.
+func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool, err error) {
 	retainFrom := opts.RetainFrom
 	ctx = e.cfg.Obs.Base(ctx)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "recordengine.merge",
@@ -68,14 +75,14 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 	// A fenced engine would do the whole merge, and repair's peer fetches, only for the commit to
 	// refuse them.
 	if err := e.fence(); err != nil {
-		return err
+		return false, err
 	}
 
 	// Repair first: a part pulled back from a peer joins this cycle's compaction, and a merge that
 	// cannot repair still compacts.
 	// Repair commits under the tenure too, so it has to be established before repair runs.
 	if err := e.establishTenure(ctx); err != nil {
-		return err
+		return false, err
 	}
 
 	e.repairWants(ctx)
@@ -86,7 +93,7 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 		log.Error("merge failed",
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix), zap.Error(err))
 
-		return err
+		return false, err
 	}
 
 	if res.parts > 0 {
@@ -104,7 +111,7 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix))
 	}
 
-	return nil
+	return res.parts > 0, nil
 }
 
 // merge compacts a bounded, size-tiered group of the engine's parts and returns the number of source

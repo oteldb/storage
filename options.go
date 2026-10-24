@@ -231,6 +231,7 @@ type Options struct {
 	// MaintenanceConcurrency caps how many engines the background maintenance loop flushes/merges
 	// (and fsyncs) concurrently. Engines are independent per-tenant/per-signal shards, so this
 	// bounds the parallel compaction fan-out against the backend. Zero ⇒ a CPU-derived default.
+	// Between ticks, one catch-up batch takes at most this many single-group merges.
 	MaintenanceConcurrency int
 
 	// QuerySplitInterval, when > 0, makes [Storage.Fetcher] split a query's time window

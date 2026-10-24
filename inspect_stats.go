@@ -49,11 +49,11 @@ type ECStats struct {
 // MaintenanceStats describes the background maintenance loop: liveness (is it cycling?),
 // recency, and the size of the most recent cycle. Counters only — no backend I/O.
 type MaintenanceStats struct {
-	// Cycles is the completed maintenance cycles since process start (the loop-liveness probe).
+	// Cycles is the completed full maintenance cycles since process start; merge-only catch-up
+	// batches are not counted.
 	Cycles int64
 	// LastCycleStartUnixNano is when the most recent cycle began; LastCycleDurationNano how
-	// long the most recent completed cycle took (a growing duration means compaction is
-	// falling behind the ingest rate).
+	// long the most recent completed full cycle took, excluding merge-only catch-up batches.
 	LastCycleStartUnixNano int64
 	LastCycleDurationNano  int64
 	// LastCycleTasks is the engine tasks (per tenant, per signal: flush+merge on owners,
