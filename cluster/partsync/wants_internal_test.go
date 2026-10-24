@@ -13,6 +13,27 @@ func wantEntry(prefix string, blocks bucketindex.Interval, minT, maxT int64) buc
 	return bucketindex.Entry{Prefix: prefix, Blocks: blocks, MinTime: minT, MaxTime: maxT}
 }
 
+// TestAccountsForThroughEitherLineage: a peer's successor of an outer ancestry accounts for a member
+// of a group split again when either side's lineage records the outer group, so the member's absence
+// from the peer's index is explained rather than left as an omission.
+func TestAccountsForThroughEitherLineage(t *testing.T) {
+	t.Parallel()
+
+	outer := bucketindex.Claim{Blocks: bucketindex.Blocks(1, 2), Group: bucketindex.Blocks(10, 11, 12)}
+	inner := bucketindex.Claim{Blocks: bucketindex.Blocks(7, 12), Group: bucketindex.Blocks(20, 21, 22)}
+	member := bucketindex.Entry{Prefix: "p/m20", Blocks: bucketindex.Blocks(20), Claim: inner, Level: 2}
+
+	peer := &bucketindex.Index{Generation: bucketindex.Generation{Term: 1, Counter: 1}}
+	peer.Add(bucketindex.Entry{Prefix: "p/succ", Blocks: bucketindex.Blocks(1, 2, 7), Level: 3})
+	peer.Tombstone(bucketindex.Removal{Prefix: "p/other"})
+
+	assert.False(t, accountOf(peer, nil).accountsFor(member), "no lineage relates the two")
+	assert.True(t, accountOf(peer, bucketindex.Lineage{outer}).accountsFor(member), "this side's lineage does")
+
+	peer.Catalog = []bucketindex.Claim{outer}
+	assert.True(t, accountOf(peer, nil).accountsFor(member), "and so does the peer's own catalog")
+}
+
 func wantIndex(g bucketindex.Generation, ents ...bucketindex.Entry) *bucketindex.Index {
 	ix := &bucketindex.Index{Generation: g}
 	for i := range ents {
@@ -63,7 +84,7 @@ func TestUnaccountedEntriesGating(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			got := unaccountedEntries(tc.peer, accountOf(tc.local), retentionHorizon(tc.local))
+			got := unaccountedEntries(tc.peer, accountOf(tc.local, nil), retentionHorizon(tc.local))
 
 			prefixes := make([]string, 0, len(got))
 			for i := range got {

@@ -299,6 +299,8 @@ var suite = []struct {
 	{"TenuresAllocateDisjointBlocks", tenuresAllocateDisjointBlocks},
 	{"LapsedClaimCommitsNothing", lapsedClaimCommitsNothing},
 	{"WritingTermSurvivesTheNextTenure", writingTermSurvivesTheNextTenure},
+	{"SplitLineageOutlivesItsMembers", splitLineageOutlivesItsMembers},
+	{"NestedWantRepairedThroughTheCatalog", nestedWantRepairedThroughTheCatalog},
 }
 
 // Run runs every suite test against k, each as <test>/<k.Name>.

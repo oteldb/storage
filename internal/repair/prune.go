@@ -22,7 +22,8 @@ type pruned struct {
 // judged over the lineage of everything the commit saw: a member left out may be the only record
 // relating what remains.
 func prune(
-	live []bucketindex.Entry, units []Unit, added [][]bucketindex.Entry, openErr map[string]error, in []bool,
+	live []bucketindex.Entry, catalog []bucketindex.Claim, units []Unit, added [][]bucketindex.Entry,
+	openErr map[string]error, in []bool,
 ) pruned {
 	var admitted []bucketindex.Entry
 
@@ -40,7 +41,7 @@ func prune(
 	}
 
 	all := slices.Concat(live, admitted)
-	lineage := bucketindex.LineageOf(all)
+	lineage := bucketindex.LineageOf(all).With(catalog...).Relater()
 	subsumed := lineage.Subsumed(admitted, all)
 	published := slices.DeleteFunc(admitted, func(e bucketindex.Entry) bool {
 		_, ok := subsumed[e.Prefix]
@@ -81,7 +82,7 @@ func prune(
 			return slices.ContainsFunc(own[k], func(o bucketindex.Entry) bool { return o.Prefix == e.Prefix })
 		})
 
-		if !admissible(base, units[k], own[k], openErr) {
+		if !admissible(base, catalog, units[k], own[k], openErr) {
 			out.drop = append(out.drop, k)
 		}
 	}
@@ -110,7 +111,7 @@ type unitOverlaps struct {
 // representation is already in place; failing that, every one overlapping the first overlapping
 // unit by target.
 func overlapping(
-	lineage bucketindex.Lineage, live []bucketindex.Entry, units []Unit, own [][]bucketindex.Entry,
+	lineage *bucketindex.Relater, live []bucketindex.Entry, units []Unit, own [][]bucketindex.Entry,
 	final []bucketindex.Entry, in []bool,
 ) []int {
 	o := overlapsOf(lineage, live, own, final, in)
@@ -149,7 +150,7 @@ func overlapping(
 }
 
 func overlapsOf(
-	lineage bucketindex.Lineage, live []bucketindex.Entry, own [][]bucketindex.Entry, final []bucketindex.Entry, in []bool,
+	lineage *bucketindex.Relater, live []bucketindex.Entry, own [][]bucketindex.Entry, final []bucketindex.Entry, in []bool,
 ) unitOverlaps {
 	owners := make(map[string][]int)
 

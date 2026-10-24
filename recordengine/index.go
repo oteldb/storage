@@ -105,6 +105,7 @@ func (e *Engine) commitOnceLocked(ctx context.Context) (bool, error) {
 	e.pendingBlocks = nil
 	e.holes, e.lostParts = ix.Holes(), ix.LostParts
 	e.allocated = ix.AllocatedBlocks
+	e.catalog = ix.Catalog
 	e.pendingHoles = nil
 
 	return true, nil
@@ -162,6 +163,7 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 	e.holes = mergeHoles(e.holes, ix.Holes())
 	e.lostParts = max(e.lostParts, ix.LostParts)
 	e.allocated = bucketindex.MaxBlock(e.allocated, ix.AllocatedBlocks)
+	e.catalog = bucketindex.MergeLineage(e.catalog, ix.Catalog)
 
 	e.foreign = foreignEntries(ix.Entries, e.indexed, e.removals, e.wants)
 	e.openForeignLocked(ctx)
@@ -317,7 +319,7 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 	// as indexed, or the next commit would read it as a removal.
 	ix.LostParts = e.lostParts
 
-	trimmed := bucketindex.TrimHoles(slices.Clone(e.holes), ix.Entries)
+	trimmed := bucketindex.TrimHoles(slices.Clone(e.holes), ix.Entries, e.catalog...)
 	for i := range trimmed {
 		ix.Add(trimmed[i])
 		live[trimmed[i].Prefix] = struct{}{}
@@ -358,7 +360,15 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 	// Committing a part is what discharges a want, so the trim runs against the entries this
 	// commit publishes: a want naming a part the index holds again, or one a live part contains,
 	// is repaired by the act of writing this index.
-	ix.Wanted = bucketindex.TrimWants(ix.Wanted, ix.Entries)
+	ix.Wanted = bucketindex.TrimWants(ix.Wanted, ix.Entries, e.catalog...)
+
+	// The lineage of every group this commit publishes joins the catalog here, and reaches e.catalog
+	// only if the commit lands: a group run a lost attempt allocated may be handed to other parts.
+	ix.Catalog = slices.Clone(e.catalog)
+	if over := ix.RecordLineage(); over > 0 && e.lineageWarned.CompareAndSwap(false, true) {
+		zctx.From(ctx).Warn("lineage catalog holds more reachable groups than its target; none is aged out",
+			zap.String("prefix", e.cfg.Prefix), zap.Int("over", over), zap.Int("target", bucketindex.MaxLineage))
+	}
 
 	// Past the horizon the node needs the wholesale adoption cluster/partsync performs, not
 	// part-by-part repair. The wants stay either way: each is the only record that its part is
@@ -641,6 +651,7 @@ func (e *Engine) adoptLoadLocked(l *indexLoad) {
 	e.foreign, e.foreignParts = nil, nil
 
 	e.holes, e.lostParts, e.allocated = l.holes, l.ix.LostParts, l.ix.AllocatedBlocks
+	e.catalog = l.ix.Catalog
 
 	// A part disappearing means identities may have died with it, which is what arms the identity
 	// prune on a node that never merges (a replica adopting the owner's part set).

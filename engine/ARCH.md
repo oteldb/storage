@@ -690,8 +690,17 @@ readable part's:
   rebases onto the rival's index. After every rebase the commit re-checks the parts it adopted that
   the planning never saw. If one does not nest with the output, the output is dropped, its objects
   are reclaimed like any uncommitted part, and the next merge replans with the adopted part in its
-  history. An adopted part that does not open escapes the check, since its layout lives only in its
-  manifest, so a rebase that cannot read it can commit an incompatible output beside it (#745).
+  history.
+- An adopted part that does not open is checked by the layout its index entry records
+  (`bucketindex.Entry.Rollup`): the guard reads it from the entry (`foreignLayoutLocked`), and
+  planning sees it through a reader-less stand-in carrying only prefix, time range and layout
+  (`unopenedLayoutsLocked`), which only the layout checks ever read. Every commit writes its own
+  parts' layouts from their manifests, and fills in an adopted entry's once its part opens
+  (`fillRollup`), so an entry written before the index carried layouts is completed by the first
+  writer that reads the part. An entry whose layout is still unknown and whose part does not open is
+  legacy and counts as raw, like a part without a marker: it constrains nothing, and never aborts a
+  commit. Aborting would stall that merge until the part became readable, since nothing else can
+  fill the layout in; the cost is the check against a part only a pre-v8 index can leave unknown.
 - Whichever writer commits second backs off, so a merge never adds an incompatible layout to the
   index.
 
@@ -1013,12 +1022,17 @@ and index commit.
 
 **A unit is committed whole or not at all** (`repair.Admit`), where "whole" means two things.
 First, the unit must answer its want, so a want the peer answered only jointly needs its whole group.
-Second, every group whose claimed ancestry overlaps what this node already holds must be complete. A
-fragment committed beside the ancestors it partly duplicates, with nothing yet able to retire them,
-has those rows read twice. On the record engine, where rows do not collapse by timestamp, it is worse
+Second, every group the unit's rows derive through whose claimed ancestry overlaps what this node
+already holds must be complete, and with it each of its members split again. That includes a group no
+fetched part carries — an outer one whose members were all split again, known only from the lineage
+catalog — so a lost outer member owed beside a divergent copy of the ancestry pulls in the rest of the
+outer group, through the members' own splits. A fragment committed beside the ancestors it partly
+duplicates, with nothing yet able to retire them, has those rows read twice. On the record engine, where rows do not collapse by timestamp, it is worse
 than a read: the next merge folds the lone fragment into a local part, the want stays outstanding,
 and the next pass commits the same fragment again — one duplicate per cycle. Completing the group is
-what retires those ancestors, through `bucketindex.Subsumed`, the same swap a merge publishes.
+what retires those ancestors, through `bucketindex.Subsumed`, the same swap a merge publishes. It
+judges every group the lineage records, catalog-only ones included, completed by the live and fetched
+parts together, and retires what the group claims below the level of the parts completing it.
 
 A member of a group whose ancestry this node no longer holds is different: its rows are rows the
 node lacks, so it is committed on its own, whatever became of its siblings. Requiring the group there
@@ -1050,7 +1064,8 @@ its inputs capped by the merge's byte cap and `maxMergeParts`. Its fragment coun
 span, plus any writer the router sealed early for size or residency — the router holds at most
 `timebucket.MaxOpenWriters` (32) days open at once, which bounds memory, not fragments. The rounds
 terminate because a unit asks for each block at most once per pass, and one answer serves every unit
-needing that block.
+needing that block. Termination is not a work bound: nothing caps the members, nesting levels or
+outer groups the catalog adds to one pass (#751).
 
 **A member no owner holds ends in a hole — only for the want it answers.** Evidence is per
 target. A unit whose own answer satisfies its want — the exact part, a containing successor, or a
@@ -1189,8 +1204,8 @@ whether the data exists.
 
 **The hole is revocable and re-attempted.** Because the commit is not cross-replica atomic, an owner
 can acknowledge a loss while a peer still holds the part. So every repair pass targets the holes as
-well as the wants, and a hole is replaced by the part turning up — at its exact prefix, or inside a
-containing successor. Holes are held apart from `parts` (there is nothing to open) and re-read from
+well as the wants, and a hole is replaced by the part turning up — at its exact prefix, inside a
+containing successor, or as a complete split group jointly covering it. Holes are held apart from `parts` (there is nothing to open) and re-read from
 the index on load, so an acknowledgement survives a restart. `LostParts` does not fall when a hole
 is revoked.
 

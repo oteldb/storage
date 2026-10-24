@@ -106,7 +106,7 @@ func TestSupersededResultIsNotPublished(t *testing.T) {
 
 	var stats bucketindex.RepairStats
 
-	got, _ := Admit(context.Background(), nil, plan.Units, func(*Result) error { return nil }, &stats)
+	got, _ := Admit(context.Background(), nil, nil, plan.Units, func(*Result) error { return nil }, &stats)
 
 	assert.Equal(t, []bucketindex.Entry{merged, members[2]}, got, "f00's rows are inside t")
 	assert.Equal(t, int64(2), stats.Fetched)
@@ -124,7 +124,7 @@ func TestSharedGroupCountsEachPartOnce(t *testing.T) {
 
 	var stats bucketindex.RepairStats
 
-	got, _ := Admit(context.Background(), nil, plan.Units, func(*Result) error { return nil }, &stats)
+	got, _ := Admit(context.Background(), nil, nil, plan.Units, func(*Result) error { return nil }, &stats)
 
 	assert.Len(t, got, 3)
 	assert.Equal(t, bucketindex.RepairStats{Fetched: 3}, stats, "three parts published, three fetched")

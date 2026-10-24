@@ -33,7 +33,9 @@ type host struct {
 
 func (h *host) Locks() (state, flush sync.Locker) { return &h.mu, &h.flush }
 
-func (h *host) ObligationsLocked() ([]bucketindex.Want, []bucketindex.Entry) { return h.wants, h.holes }
+func (h *host) ObligationsLocked() ([]bucketindex.Want, []bucketindex.Entry, []bucketindex.Claim) {
+	return h.wants, h.holes, nil
+}
 
 func (h *host) LiveLocked() ([]*fakePart, []bucketindex.Entry) { return h.parts, nil }
 

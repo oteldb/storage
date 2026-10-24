@@ -22,6 +22,7 @@ func fullIndex() *bucketindex.Index {
 					Blocks: bucketindex.Range(1, 6, 7),
 					Group:  bucketindex.Range(2, 1, 4),
 				},
+				Rollup: &bucketindex.Rollup{Tiers: []bucketindex.RollupTier{{Before: 5, Interval: 3, Agg: 2}}},
 			},
 		},
 		FlushedEpoch: 3,
@@ -43,23 +44,27 @@ func fullIndex() *bucketindex.Index {
 		},
 		LostParts:       15,
 		AllocatedBlocks: bucketindex.Block{Term: 2, N: 16},
+		Catalog: []bucketindex.Claim{
+			{Blocks: bucketindex.Range(1, 6, 7), Group: bucketindex.Range(2, 1, 4)},
+		},
 	}
 }
 
-// TestGoldenV7 pins the v7 byte layout: an accidental reordering or a dropped field breaks here
+// TestGoldenV8 pins the v8 byte layout: an accidental reordering or a dropped field breaks here
 // before it breaks a deployment.
-func TestGoldenV7(t *testing.T) {
+func TestGoldenV8(t *testing.T) {
 	t.Parallel()
 
 	want := []byte{
-		'B', 'I', 7,
+		'B', 'I', 8,
 		// one entry: prefix, zigzag times,
 		1, 1, 'a', 2, 4,
 		// blocks {1:1, 1:4, 2:1}: lowest number 1, its term 1, top term +1, top number 1, and two
 		// gaps, 1:2..1:3 and 1:5..2:0 — the rest of term 1's number space,
 		1, 1, 1, 1, 2, 1, 2, 1, 3, 1, 5, 2, 0,
-		// level 2, flags, a claim on term 1's [6,7] held by term 2's group [1,4], the writer's term,
-		2, 0, 1, 6, 1, 0, 7, 0, 1, 2, 0, 4, 0, 3,
+		// level 2, flags (a layout follows), a claim on term 1's [6,7] held by term 2's group [1,4],
+		// the writer's term, and a layout of one tier: zigzag before 5, zigzag interval 3, agg 2,
+		2, 2, 1, 6, 1, 0, 7, 0, 1, 2, 0, 4, 0, 3, 1, 10, 6, 2,
 		3,    // flushed epoch
 		4, 5, // generation
 		1, 1, 'r', 6, 7, // one removal
@@ -68,17 +73,47 @@ func TestGoldenV7(t *testing.T) {
 		1, 1, 'x', 5, 2, 0, 5, 0, 1, 26, 28, 11, 12, 0, 2,
 		15,    // lost parts
 		2, 16, // allocated blocks: term, number
+		1, 6, 1, 0, 7, 0, 1, 2, 0, 4, 0, // the catalog: one claim, its blocks then its group
 	}
 	assert.Equal(t, want, fullIndex().AppendBinary(nil))
 }
 
-func TestV7RoundTrip(t *testing.T) {
+func TestV8RoundTrip(t *testing.T) {
 	t.Parallel()
 
 	in := fullIndex()
 	out, err := bucketindex.Decode(in.AppendBinary(nil))
 	require.NoError(t, err)
 	assert.Equal(t, in, out)
+}
+
+// TestDecodeV7Golden pins the migration from v7: no entry's layout is known and the catalog is
+// empty, until the first v8 commit fills both in.
+func TestDecodeV7Golden(t *testing.T) {
+	t.Parallel()
+
+	got, err := bucketindex.Decode([]byte{
+		'B', 'I', 7,
+		1, 1, 'a', 2, 4,
+		1, 1, 1, 1, 2, 1, 2, 1, 3, 1, 5, 2, 0,
+		2, 0, 1, 6, 1, 0, 7, 0, 1, 2, 0, 4, 0, 3,
+		3,
+		4, 5,
+		1, 1, 'r', 6, 7,
+		1, 1, 'w', 8, 9, 10,
+		1, 1, 'x', 5, 2, 0, 5, 0, 1, 26, 28, 11, 12, 0, 2,
+		15,
+		2, 16,
+	})
+	require.NoError(t, err)
+
+	want := fullIndex()
+	want.Entries[0].Rollup = nil
+	want.Catalog = nil
+	assert.Equal(t, want, got)
+
+	got.RecordLineage()
+	assert.Equal(t, fullIndex().Catalog, got.Catalog, "the first v8 commit records the claims the entries carry")
 }
 
 // TestDecodeV6Golden pins the migration from v6: every block is term 0, and so are the writers'
@@ -102,6 +137,7 @@ func TestDecodeV6Golden(t *testing.T) {
 	require.NoError(t, err)
 
 	want := fullIndex()
+	want.Entries[0].Rollup, want.Catalog = nil, nil
 	want.Entries[0].Term, want.Wanted[0].Term = 0, 0
 	want.Entries[0].Blocks = bucketindex.Blocks(1, 4)
 	want.Entries[0].Claim = bucketindex.Claim{Blocks: bucketindex.Range(0, 6, 7), Group: bucketindex.Range(0, 1, 4)}
@@ -178,6 +214,7 @@ func TestDecodeAllVersions(t *testing.T) {
 		5: {'B', 'I', 5, 1, 1, 'a', 2, 4, 0, 0, 0, 0, 3, 4, 5, 0, 0, 0, 0},
 		6: {'B', 'I', 6, 1, 1, 'a', 2, 4, 0, 0, 0, 0, 3, 4, 5, 0, 0, 0, 0, 0},
 		7: {'B', 'I', 7, 1, 1, 'a', 2, 4, 0, 0, 0, 0, 0, 3, 4, 5, 0, 0, 0, 0, 0, 0},
+		8: {'B', 'I', 8, 1, 1, 'a', 2, 4, 0, 0, 0, 0, 0, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0},
 	}
 	for ver, data := range cases {
 		t.Run(fmt.Sprintf("v%d", ver), func(t *testing.T) {
@@ -192,7 +229,7 @@ func TestDecodeAllVersions(t *testing.T) {
 		})
 	}
 
-	_, err := bucketindex.Decode([]byte{'B', 'I', 8, 0})
+	_, err := bucketindex.Decode([]byte{'B', 'I', 9, 0})
 	require.ErrorIs(t, err, bucketindex.ErrCorrupt, "a version this reader does not know is rejected")
 }
 
@@ -219,6 +256,53 @@ func TestDecodeRejectsCorruptV6(t *testing.T) {
 			require.ErrorIs(t, err, bucketindex.ErrCorrupt)
 		})
 	}
+}
+
+// TestDecodeRejectsCorruptV8 covers the fields v8 added: the entry's layout behind its flag bit, and
+// the lineage catalog, which has to be in its one canonical order.
+func TestDecodeRejectsCorruptV8(t *testing.T) {
+	t.Parallel()
+
+	head := []byte{'B', 'I', 8, 1, 1, 'a', 2, 4, 0, 0}
+	tail := []byte{3, 4, 5, 0, 0, 0, 0, 0, 0, 0}
+	entry := func(flags byte, rest ...byte) []byte {
+		out := append(append([]byte(nil), head...), flags, 0, 0)
+
+		return append(append(out, rest...), tail...)
+	}
+	claim := func(lo, group byte) []byte { return []byte{lo, 0, 0, lo, 0, group, 0, 0, group, 0} }
+
+	cases := map[string][]byte{
+		"unknown flag":        entry(4),
+		"missing layout":      {'B', 'I', 8, 1, 1, 'a', 2, 4, 0, 0, 2, 0, 0},
+		"layout count huge":   entry(2, 200),
+		"missing tier":        {'B', 'I', 8, 1, 1, 'a', 2, 4, 0, 0, 2, 0, 0, 1, 2},
+		"agg overflows":       entry(2, 1, 2, 2, 0x80, 0x02),
+		"missing catalog":     {'B', 'I', 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		"catalog count huge":  {'B', 'I', 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200},
+		"catalog claim unset": append([]byte{'B', 'I', 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, 0, 0),
+		"catalog unsorted": append(append([]byte{'B', 'I', 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}, claim(1, 9)...),
+			claim(1, 5)...),
+		"catalog duplicate": append(append([]byte{'B', 'I', 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}, claim(1, 5)...),
+			claim(1, 5)...),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := bucketindex.Decode(data)
+			require.ErrorIs(t, err, bucketindex.ErrCorrupt)
+		})
+	}
+
+	ok := append([]byte{'B', 'I', 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}, claim(1, 5)...)
+	ok = append(ok, claim(1, 9)...)
+	ix, err := bucketindex.Decode(ok)
+	require.NoError(t, err, "the sorted form of the same catalog decodes")
+	assert.Len(t, ix.Catalog, 2)
+
+	layout, err := bucketindex.Decode(entry(2, 0))
+	require.NoError(t, err)
+	assert.Equal(t, &bucketindex.Rollup{}, layout.Entries[0].Rollup, "a known raw layout is not unknown")
 }
 
 // TestDecodeRejectsCorruptV7 covers the fields v7 added: the block terms, the writers' terms and
@@ -302,7 +386,14 @@ func randomIndex(rnd *rand.Rand) *bucketindex.Index {
 			Claim:   randomClaim(rnd),
 			Level:   uint32(rnd.IntN(4)),
 			Term:    rnd.Uint64N(5),
+			Rollup:  randomRollup(rnd),
 		})
+	}
+
+	for range rnd.IntN(4) {
+		if c := randomClaim(rnd); c.Valid() {
+			ix.Catalog = bucketindex.MergeLineage(ix.Catalog, []bucketindex.Claim{c})
+		}
 	}
 
 	for i := range rnd.IntN(4) {
@@ -328,6 +419,25 @@ func randomIndex(rnd *rand.Rand) *bucketindex.Index {
 	}
 
 	return ix
+}
+
+// randomRollup covers the three states a layout has: unknown, raw, and tiered.
+func randomRollup(rnd *rand.Rand) *bucketindex.Rollup {
+	switch rnd.IntN(3) {
+	case 0:
+		return nil
+	case 1:
+		return &bucketindex.Rollup{}
+	default:
+		r := &bucketindex.Rollup{}
+		for range rnd.IntN(3) + 1 {
+			r.Tiers = append(r.Tiers, bucketindex.RollupTier{
+				Before: rnd.Int64() - math.MaxInt32, Interval: rnd.Int64N(1 << 40), Agg: uint8(rnd.UintN(256)),
+			})
+		}
+
+		return r
+	}
 }
 
 func randomClaim(rnd *rand.Rand) bucketindex.Claim {
@@ -402,12 +512,33 @@ func FuzzRoundTrip(f *testing.F) {
 			wanted = bucketindex.Interval{}
 		}
 
+		// The same bytes as a layout, and as the claims of a catalog: ordered and deduplicated as
+		// Decode requires, the canonical form a writer produces.
+		var rollup *bucketindex.Rollup
+		if level%3 != 0 {
+			rollup = &bucketindex.Rollup{}
+			for i := 0; i+1 < len(blocks) && level%3 == 2; i += 2 {
+				rollup.Tiers = append(rollup.Tiers, bucketindex.RollupTier{
+					Before: int64(blocks[i]) - 128, Interval: int64(blocks[i+1]), Agg: blocks[i] ^ blocks[i+1],
+				})
+			}
+		}
+
+		var catalog []bucketindex.Claim
+		for _, b := range blocks {
+			catalog = bucketindex.MergeLineage(catalog, []bucketindex.Claim{{
+				Blocks: bucketindex.TermBlocks(term, uint64(b)+1),
+				Group:  bucketindex.TermBlocks(term+1, uint64(b)+1),
+			}})
+		}
+
 		in := &bucketindex.Index{
 			Entries: []bucketindex.Entry{
-				{Prefix: "p", MinTime: -1, MaxTime: 1, Blocks: own, Level: level, Term: term},
+				{Prefix: "p", MinTime: -1, MaxTime: 1, Blocks: own, Level: level, Term: term, Rollup: rollup},
 			},
 			Wanted:          []bucketindex.Want{{Prefix: "w", Blocks: wanted, Term: allocated}},
 			AllocatedBlocks: bucketindex.Block{Term: term, N: allocated},
+			Catalog:         catalog,
 		}
 
 		out, err := bucketindex.Decode(in.AppendBinary(nil))

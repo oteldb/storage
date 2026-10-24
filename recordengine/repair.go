@@ -52,8 +52,8 @@ func (h repairHost) Locks() (state, flush sync.Locker) { return &h.e.mu, &h.e.fl
 
 // ObligationsLocked includes pending wants: a load that could not commit them left them for the
 // first commit this engine makes, and the repair commit is one.
-func (h repairHost) ObligationsLocked() ([]bucketindex.Want, []bucketindex.Entry) {
-	return slices.Concat(h.e.wants, h.e.pendingWants, h.e.adoptedWants), slices.Clone(h.e.holes)
+func (h repairHost) ObligationsLocked() ([]bucketindex.Want, []bucketindex.Entry, []bucketindex.Claim) {
+	return slices.Concat(h.e.wants, h.e.pendingWants, h.e.adoptedWants), slices.Clone(h.e.holes), h.e.catalog
 }
 
 func (h repairHost) LiveLocked() ([]*part, []bucketindex.Entry) { return h.e.parts, h.e.foreign }
