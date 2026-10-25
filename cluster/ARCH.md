@@ -289,7 +289,20 @@ carried entirely by conditions pushes nothing: trace-by-id is an equality on `tr
 unbounded window, so every owner streamed its whole span history and the requester kept one trace.
 Hints ride only under `AllConditions` (without it a producer may ignore conditions, so ANDing them
 could drop rows), and are an **append-only tail** of the request encoding — a peer that predates them
-stops after the matchers and answers with the superset it always did. Enumeration RPCs (series, keys, values, side store, aggregate) fan out the same
+stops after the matchers and answers with the superset it always did.
+
+Record fetches append a projection/ordered-limit tail after the condition sets. Empty condition
+and set counts frame that tail when no predicates precede it; older peers ignore the tail and
+return the same correct superset. A narrow projection is sent only without conditions or
+`SecondPass`: a residual predicate may need a schema-defined attributes column, and an opaque
+second pass can inspect any column. A limit is sent only when every matcher has an equality spec,
+there are no row conditions, and no second pass remains. Condition hints are necessary tests,
+not equivalent predicates, so limiting their superset could underfill a correct answer. Each shard
+keeps the full requested N and timestamp boundary ties; the consumer still orders and truncates
+globally. Malformed option counts, names, limits and directions are validated before projection
+metadata is allocated.
+
+Enumeration RPCs (series, keys, values, side store, aggregate) fan out the same
 hedged way. The **values** RPC (`/internal/values`) is the one enumeration with its own request
 shape rather than `EncodeFetchRequest`: it carries a column name (or an attribute key) and a limit. The series RPC is **signal-dispatched**: one endpoint enumerates stream identities for
 logs/traces/profiles and metric series alike, so the metrics label endpoints answer from identities
