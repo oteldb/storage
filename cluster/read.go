@@ -496,6 +496,8 @@ func NewRemoteFetcher(sig signal.Signal, addr string, client *http.Client, opts 
 // matchers and the columnar condition hints — to the peer and returns the decoded batches. The
 // non-serializable predicates (a regex matcher, a condition's Match closure) stay behind, so the
 // answer is a superset the requester re-applies them to.
+//
+//nolint:spancheck // ended by the deferred endSpan below, on every return path
 func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, err error) {
 	ctx, span := f.obs.Tracer.Start(ctx, "cluster.fetch", trace.WithAttributes(
 		attribute.String("storage.rpc.peer", f.addr),
@@ -503,18 +505,8 @@ func (f *RemoteFetcher) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Ite
 	))
 	defer func() { endSpan(span, err) }()
 
-	var eq []fetch.EqualMatcher
-	for i := range r.Matchers {
-		if r.Matchers[i].Spec != nil {
-			eq = append(eq, *r.Matchers[i].Spec)
-		}
-	}
-
-	payload := FetchRequest{
-		Signal: f.sig, Tenant: string(r.Tenant), Start: r.Start, End: r.End,
-		Equal:      eq,
-		Conditions: ConditionHints(r.Conditions, r.AllConditions),
-	}.Encode()
+	r.Signal = f.sig
+	payload := remoteFetchRequest(r).Encode()
 
 	u := (&url.URL{Scheme: httpScheme, Host: f.addr}).JoinPath(ReadPath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))

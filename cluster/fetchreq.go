@@ -30,6 +30,12 @@ type FetchRequest struct {
 	// separate field because feeding a column equality into Equal would resolve it against the
 	// identity index and match no stream at all.
 	Conditions []ConditionHint
+
+	// Projection narrows the returned record columns. Limit and Reverse select an ordered
+	// top-N only after every row-selection predicate has been applied by the peer.
+	Projection []string
+	Limit      int
+	Reverse    bool
 }
 
 // ConditionHint is the serializable part of a [fetch.Condition]: the column (or record-attribute
@@ -110,7 +116,8 @@ func (r FetchRequest) Encode() []byte {
 		buf = appendString(buf, m.Value)
 	}
 
-	if len(r.Conditions) == 0 {
+	options := len(r.Projection) > 0 || r.Limit > 0
+	if len(r.Conditions) == 0 && !options {
 		return buf
 	}
 
@@ -121,7 +128,12 @@ func (r FetchRequest) Encode() []byte {
 		buf = appendString(buf, c.Equal.Value)
 	}
 
-	return appendConditionSets(buf, r.Conditions)
+	buf = appendConditionSets(buf, r.Conditions, options)
+	if options {
+		buf = r.appendOptions(buf)
+	}
+
+	return buf
 }
 
 // appendConditionSets writes the [ConditionHint.AnyEqual] sets as a second append-only tail —
@@ -129,7 +141,7 @@ func (r FetchRequest) Encode() []byte {
 // one does. A peer that predates sets stops after the hints above and ignores the rest (it answers
 // with the superset it always did, which [fetch.Filter] re-narrows), and a payload written without
 // them decodes here as no sets. So, as with the hints themselves, neither side needs a version byte.
-func appendConditionSets(dst []byte, conds []ConditionHint) []byte {
+func appendConditionSets(dst []byte, conds []ConditionHint, force bool) []byte {
 	n := 0
 
 	for _, c := range conds {
@@ -138,7 +150,7 @@ func appendConditionSets(dst []byte, conds []ConditionHint) []byte {
 		}
 	}
 
-	if n == 0 {
+	if n == 0 && !force {
 		return dst
 	}
 
@@ -162,14 +174,14 @@ func appendConditionSets(dst []byte, conds []ConditionHint) []byte {
 }
 
 // takeConditionSets reads the tail [appendConditionSets] wrote back onto conds.
-func takeConditionSets(data []byte, conds []ConditionHint) error {
+func takeConditionSets(data []byte, conds []ConditionHint) ([]byte, error) {
 	if len(data) == 0 {
-		return nil // a request from a peer that predates set pushdown.
+		return nil, nil // a request from a peer that predates set pushdown.
 	}
 
 	n, m := binary.Uvarint(data)
 	if m <= 0 {
-		return errors.New("cluster: malformed condition set count")
+		return nil, errors.New("cluster: malformed condition set count")
 	}
 
 	data = data[m:]
@@ -177,14 +189,14 @@ func takeConditionSets(data []byte, conds []ConditionHint) error {
 	for range n {
 		idx, m := binary.Uvarint(data)
 		if m <= 0 || idx >= uint64(len(conds)) {
-			return errors.New("cluster: malformed condition set index")
+			return nil, errors.New("cluster: malformed condition set index")
 		}
 
 		data = data[m:]
 
 		count, m := binary.Uvarint(data)
 		if m <= 0 || count > uint64(len(data)) {
-			return errors.New("cluster: malformed condition set size")
+			return nil, errors.New("cluster: malformed condition set size")
 		}
 
 		data = data[m:]
@@ -194,7 +206,7 @@ func takeConditionSets(data []byte, conds []ConditionHint) error {
 		for range count {
 			l, m := binary.Uvarint(data)
 			if m <= 0 || l > uint64(len(data)-m) {
-				return errors.New("cluster: malformed condition set member")
+				return nil, errors.New("cluster: malformed condition set member")
 			}
 
 			data = data[m:]
@@ -207,7 +219,7 @@ func takeConditionSets(data []byte, conds []ConditionHint) error {
 		conds[idx].AnyEqual = fetch.AnyEqualSet(set)
 	}
 
-	return nil
+	return data, nil
 }
 
 // ParseFetchRequest decodes a request written by [FetchRequest.Encode].
@@ -287,7 +299,11 @@ func ParseFetchRequest(data []byte) (FetchRequest, error) {
 		r.Conditions = append(r.Conditions, h)
 	}
 
-	if err := takeConditionSets(data, r.Conditions); err != nil {
+	data, err = takeConditionSets(data, r.Conditions)
+	if err != nil {
+		return FetchRequest{}, err
+	}
+	if err := takeFetchOptions(data, &r); err != nil {
 		return FetchRequest{}, err
 	}
 
@@ -299,7 +315,8 @@ func ParseFetchRequest(data []byte) (FetchRequest, error) {
 func (r FetchRequest) Request() fetch.Request {
 	out := fetch.Request{
 		Signal: r.Signal, Tenant: signal.TenantID(r.Tenant), Start: r.Start, End: r.End,
-		Matchers: make([]fetch.Matcher, len(r.Equal)),
+		Matchers:   make([]fetch.Matcher, len(r.Equal)),
+		Projection: r.Projection, Limit: r.Limit, Reverse: r.Reverse,
 	}
 
 	for i := range r.Equal {
