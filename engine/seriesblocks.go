@@ -177,6 +177,10 @@ func (r *seriesBlockReader) tsBlock(ctx context.Context, b int) ([]int64, error)
 		return r.tsHeld, nil
 	}
 
+	if r.engine.blockCache == nil {
+		return r.uncachedTimestampBlock(ctx, b)
+	}
+
 	key := blockKey{prefix: r.part.prefix, col: colTsID, blk: b}
 	if ent, ok := r.engine.blockCache.get(key); ok {
 		r.pins = append(r.pins, ent)

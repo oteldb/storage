@@ -1352,8 +1352,16 @@ projection. They differ in what they ask of the parts:
 
 | call | parts contribute by | decode |
 |---|---|---|
-| `Count`/`CountBy`, exact | sorted intersection, or binary search at a window edge | the two edge parts, ts only |
+| `Count`/`CountBy`, exact | sorted intersection, or timestamp-block existence at a window edge | selected ts blocks only |
 | `Series`, series-only | the matched ids the part's series index holds | never |
+
+Count's edge checks use timestamp-only block readers, independent of value-column framing or a
+constant value, and keep one uncached timestamp block when the decode cache is disabled. The
+cached path pins block views and releases them between series; no sparse full-part array is built.
+Admission charges the selected timestamp blocks, with no result-copy term, and charges nothing for
+fully covered parts answered by the index. Legacy unframed timestamps retain the whole-column
+fallback and its corresponding reservation; their decode scratch returns to the pool after the
+existence check. The same lifetime rules apply to grouped counts.
 
 The intersection applies to a part fully inside the window. `Series` therefore costs matched
 cardinality alone, not the window's depth, and its window filter is **part-granular**: a series in an
