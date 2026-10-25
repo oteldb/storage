@@ -1,7 +1,4 @@
-// Package timebucket is the aligned time-bucket ladder both engines confine merges to, and the
-// straddler and forced-rewrite selection over it. The engines' ladder walks differ (size tiers
-// against scored runs); what is shared here is the bucket arithmetic, the handling of a part that
-// fits no bucket, and the capped selection of the parts a policy forces a rewrite of.
+// Package timebucket shares the aligned merge ladder and bounded selection between both engines.
 package timebucket
 
 import (
@@ -49,6 +46,24 @@ func End(ts, level int64) int64 {
 
 // Fits reports whether [lo, hi] lies within one level-aligned bucket.
 func Fits(lo, hi, level int64) bool { return Of(lo, level) == Of(hi, level) }
+
+// CanCompact reports whether a part may join size compaction at level.
+// The newest larger bucket admits only parts already too wide for its preceding level.
+func CanCompact(lo, hi, level, newest int64) bool {
+	for i, candidate := range Ladder {
+		if candidate != level {
+			continue
+		}
+		if !Fits(lo, hi, level) {
+			return false
+		}
+		if i == 0 || Of(lo, level) != Of(newest, level) {
+			return true
+		}
+		return !Fits(lo, hi, Ladder[i-1])
+	}
+	return false
+}
 
 // Finest returns the narrowest level whose bucket contains [lo, hi], reporting false for a
 // straddler: a span crossing a top-level boundary.

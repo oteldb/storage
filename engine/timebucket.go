@@ -24,8 +24,6 @@ func bucketOf(ts, level int64) int64 { return timebucket.Of(ts, level) }
 
 func partSpan(p *part) (lo, hi int64) { return p.minTime, p.maxTime }
 
-func fitsLevel(p *part, level int64) bool { return timebucket.Fits(p.minTime, p.maxTime, level) }
-
 func spanOf(parts []*part) (lo, hi int64) { return timebucket.Union(parts, partSpan) }
 
 // splitsOutput reports whether merging src from start on writes more than one top-level bucket, which
@@ -39,8 +37,7 @@ func selectStraddlers(src []*part, capBytes int64) []*part {
 	return timebucket.Straddlers(src, partSpan, (*part).sizeBytes, capBytes, maxMergeParts)
 }
 
-// newestSample is the newest sample in src; the level-aligned bucket holding it is still filling, so
-// it is the one merging is premature in.
+// newestSample supplies the data watermark used to defer promotion of fine parts.
 func newestSample(src []*part) int64 {
 	newest := minInt64
 	for _, p := range src {
@@ -50,16 +47,8 @@ func newestSample(src []*part) int64 {
 	return newest
 }
 
-// partitionGroups groups the parts that fit level by their aligned bucket, returning the bucket
-// starts in ascending order alongside the groups so selection is deterministic and prefers older
-// data (which is settled, and whose compaction therefore is not about to be undone by the next
-// flush).
-//
-// Above the finest level the still-filling newest bucket is skipped: merging it now only guarantees
-// merging it again once the rest of the bucket arrives, which is write amplification bought for
-// nothing. The finest level is exempt because that is where freshly flushed parts land — leaving
-// them uncompacted until the bucket closes would let part count grow unbounded within it, the very
-// thing size-tiered selection exists to prevent.
+// partitionGroups groups compactable parts by aligned bucket, oldest first.
+// Fine parts in a newest larger bucket wait for promotion; already-wide parts may merge there.
 func partitionGroups(src []*part, level int64) ([]int64, [][]*part) {
 	return partitionGroupsBefore(src, level, newestSample(src))
 }
@@ -70,14 +59,10 @@ func partitionGroupsBefore(src []*part, level, newest int64) ([]int64, [][]*part
 	groups := make(map[int64][]*part, len(src))
 
 	for _, p := range src {
-		if fitsLevel(p, level) {
+		if timebucket.CanCompact(p.minTime, p.maxTime, level, newest) {
 			b := bucketOf(p.minTime, level)
 			groups[b] = append(groups[b], p)
 		}
-	}
-
-	if level != mergeLadder[0] {
-		delete(groups, bucketOf(newest, level))
 	}
 
 	starts := make([]int64, 0, len(groups))

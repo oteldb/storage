@@ -852,9 +852,14 @@ Parts are grouped by aligned bucket, and the size-tiered selector runs unchanged
 in ClickHouse, where the size selector is only ever fed one partition. The ladder is walked
 narrowest-first, so each part is rewritten once per level rather than repeatedly at the widest.
 
-**The still-filling newest bucket is skipped**, since merging it now guarantees merging it again. The
-finest level is exempt: flushes land there, and letting them accumulate is the part-count growth
-sealing exists to bound.
+**The still-filling newest bucket defers promotion of finer parts.** At the finest level all
+fitting parts remain eligible. Above it, the current bucket admits only parts already spanning
+more than the preceding finer bucket (`timebucket.CanCompact`, shared by both engines). Late data
+can make a flush or day split arrive this wide; withholding it would strand every such part until
+newer-bucket data arrives. Merging those parts preserves their existing time locality, while fine
+parts still wait rather than being promoted repeatedly with every flush. Scoring, input count,
+disk sealing and memory admission keep the work bounded. The newest bucket follows data timestamps,
+not wall clock, including when selecting one metric layout cohort from a larger readable set.
 
 **Forced rewrites are confined too, capped, and win the cycle.** The oldest forced part picks the
 bucket and the size-tiered run waits — unioning the two would merge parts from opposite ends of the
