@@ -78,12 +78,16 @@ func unsealedOf(src []*part, capBytes int64) []*part {
 }
 
 func pickMergeRun(src []*part, capBytes int64, idle int) []*part {
+	return pickMergeRunExpected(src, capBytes, idle, nil)
+}
+
+func pickMergeRunExpected(src []*part, capBytes int64, idle int, expected func([]*part) int) []*part {
 	bySize, order := eligibleBySize(src, capBytes)
 	if len(bySize) < minTierParts {
 		return nil
 	}
 
-	best, fallback, _ := scanRuns(bySize, capBytes)
+	best, fallback, _ := scanRunsExpected(bySize, capBytes, expected)
 	if best == nil {
 		if idle < mergeIdleRounds {
 			return nil
@@ -120,37 +124,43 @@ func eligibleBySize(src []*part, capBytes int64) ([]*part, map[*part]int) {
 	return bySize, order
 }
 
-// scanRuns scores every run of [minTierParts, maxTierParts] adjacent parts that fits the cap and
-// returns the best qualifying run, the best run ignoring the guards (what the idle escape falls
-// back on), and that run's score.
-func scanRuns(bySize []*part, capBytes int64) (best, fallback []*part, fallbackM float64) {
-	bestM := 0.0
+// scanRuns returns the cheapest qualifying and unguarded runs, plus the largest balance multiplier.
+func scanRuns(bySize []*part, capBytes int64) (best, fallback []*part, bestMultiplier float64) {
+	return scanRunsExpected(bySize, capBytes, nil)
+}
 
+func scanRunsExpected(bySize []*part, capBytes int64, expected func([]*part) int) (best, fallback []*part, bestMultiplier float64) {
+	bestCost, fallbackCost := 0.0, 0.0
 	for n := minTierParts; n <= min(maxTierParts, len(bySize)); n++ {
 		for i := 0; i+n <= len(bySize); i++ {
 			run := bySize[i : i+n]
-
 			var total int64
 			for _, p := range run {
 				total += p.sizeBytes()
 			}
-
 			if capBytes > 0 && total > capBytes {
-				break // runs further along this row are only larger
+				break
 			}
-
+			outputs := 1
+			if expected != nil {
+				outputs = expected(run)
+			}
+			removed := n - outputs
+			if removed <= 0 {
+				continue
+			}
+			cost := float64(total) / float64(removed)
 			m := float64(total) / float64(run[n-1].sizeBytes())
-			if m > fallbackM {
-				fallbackM, fallback = m, run
+			bestMultiplier = max(bestMultiplier, m)
+			if fallback == nil || cost < fallbackCost || (cost == fallbackCost && len(run) > len(fallback)) {
+				fallbackCost, fallback = cost, run
 			}
-
-			if m > bestM && runQualifies(run, total, m) {
-				bestM, best = m, run
+			if runQualifies(run, total, m) && (best == nil || cost < bestCost || (cost == bestCost && len(run) > len(best))) {
+				bestCost, best = cost, run
 			}
 		}
 	}
-
-	return best, fallback, fallbackM
+	return best, fallback, bestMultiplier
 }
 
 // runQualifies reports whether a run is worth merging on its own merits. Both tests argue about the

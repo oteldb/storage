@@ -26,6 +26,8 @@ type MergeShape struct {
 	BestMultiplier float64
 	IdleRounds     int
 	WaiveAfter     int
+	// NonReducingMerges counts rejected ordinary rewrites, not durable part changes.
+	NonReducingMerges uint64
 }
 
 // MergeShape is [Engine.MergeShapeWith] without retention.
@@ -79,6 +81,7 @@ func (e *Engine) shapeOf(src []*part, retainFrom, capBytes int64) MergeShape {
 		LargestTierParts: largest,
 		MinTierParts:     minTierParts,
 		BestMultiplier:   best, IdleRounds: int(e.idleMerges.Load()), WaiveAfter: mergeIdleRounds,
+		NonReducingMerges: e.nonReducingMerges.Load(),
 	}
 }
 

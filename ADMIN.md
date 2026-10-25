@@ -145,6 +145,12 @@ Each engine's `MergeShape()` exposes `BestMultiplier`, `IdleRounds` and `WaiveAf
 stored-byte runs and waive the guards after three idle selections. The record shape retains
 `Tiers`/`LargestTierParts`/`MinTierParts` as diagnostics, with a 128 KiB stored-byte tier floor;
 sharing a tier is no longer required for selection.
+Record runs minimize stored bytes per expected part removed. Resident-limited trials that neither
+reduce parts nor perform retention, normalization or a required rewrite are discarded and excluded
+for those exact inputs and resource settings. `recordengine.MergeShape.NonReducingMerges` counts
+these trials; `Force` also respects their feedback. Changed inputs or memory/writer settings permit
+another trial, and increasing the disk cap does so when the previous write sealed on that cap.
+Feedback resets on process restart and does not change the storage format.
 
 ### Drill-down per `(tenant, signal)` (`introspect.go`)
 
@@ -248,6 +254,7 @@ Metric instruments (all prefixed `storage.`):
 | `flush.total` / `flush.duration` / `flush.rows` / `flush.bytes` | `signal` | head flushes; `flush.bytes` is stored part-column bytes for records (decoded bytes in older versions), the denominator of write amplification |
 | `merge.total` / `merge.duration` / `merge.parts_in` / `merge.bytes_in` / `merge.bytes_out` | `signal` | background merges; record byte counters sum stored column bytes, matching the selection unit (older versions counted decoded bytes). `bytes_out` against `flush.bytes` is how many times the engine rewrites what it ingests, `bytes_out`/`bytes_in` what one cycle gains |
 | `merge.deferred` | `signal` | merges that selected parts and could not claim the process merge memory budget, so compacted nothing and left the work for the next cycle. Any sustained rate says compaction is bounded by `MergeMemoryBytes` — raise `MergeMemoryBytes` if part counts climb with it. Raising `MaintenanceConcurrency` does not help: a deferral only happens when the budget already admits fewer merges than the fan-out |
+| `merge.non_reducing` | `signal` | record compaction trials discarded because they neither reduced part count nor applied a required transformation. The selector remembers the exact run under its resource settings and tries other work; rejected bytes are not included in the committed-merge byte counters |
 | `merge.over_budget_bytes` | `signal` | bytes a merge held beyond what it could reserve. Either it needed more than the whole `MergeMemoryBytes` budget, so it reserved all of it and ran alone (logged as `merge needs more than the whole merge memory budget`); or opening the parts it wrote took more than its grant and the rest was not free (logged as `merge opens its written parts past its grant`). A sustained rate says the budget is smaller than one merge of the store's parts — raise `MergeMemoryBytes` |
 | `fetch.total` / `fetch.duration` / `fetch.series_matched` / `fetch.rows_returned` / `fetch.parts_scanned` | `signal` | reads; the metric engine's reads are streaming, so these are recorded when the iterator is **closed** — `duration` covers the whole iteration (the consumer's own per-batch work included) and `rows_returned` counts what was actually consumed |
 | `fetch.decode_budget_forced_admissions` | `signal` | queries admitted **over** the decode-memory ceiling after their wait stalled (see below); a non-zero rate means the ceiling is not holding |

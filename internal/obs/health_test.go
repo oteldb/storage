@@ -28,6 +28,17 @@ func newMetered(t *testing.T) (*obs.Obs, func() metricdata.ResourceMetrics) {
 	}
 }
 
+func TestNonReducingMerges(t *testing.T) {
+	t.Parallel()
+	o, collect := newMetered(t)
+	o.Merge.NonReducing(t.Context(), "log")
+	o.Merge.NonReducing(t.Context(), "log")
+	o.Merge.NonReducing(t.Context(), "exemplar")
+	rm := collect()
+	assert.Equal(t, int64(2), counterSum(t, rm, "storage.merge.non_reducing", map[string]string{"signal": "log"}))
+	assert.Equal(t, int64(1), counterSum(t, rm, "storage.merge.non_reducing", map[string]string{"signal": "exemplar"}))
+}
+
 func TestCorruptionDetected(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

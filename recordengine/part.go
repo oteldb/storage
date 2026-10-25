@@ -79,6 +79,8 @@ type part struct {
 	// manifest carried one. See [part.sizeBytes].
 	rawBytes  int64
 	diskBytes int64
+	// mergeDiskSealed describes this write attempt, not persisted part metadata.
+	mergeDiskSealed bool
 
 	// refs counts in-flight fetches reading this part lock-free. A fetch acquires (under the engine
 	// lock, while the part is still live) the parts it will read, releases them when done, and reads
