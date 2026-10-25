@@ -638,19 +638,15 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, 
 
 	defer plan.releaseParts()
 
-	if planErr != nil {
-		span.RecordError(planErr)
-
-		return nil, planErr
-	}
-
 	defer func() {
-		// Every path that does not hand the caller an iterator must give the reservation back; the
-		// successful one transfers it to the iterator's Close.
 		if rerr != nil || !admitted {
 			plan.releaseBudget()
 		}
 	}()
+	if planErr != nil {
+		span.RecordError(planErr)
+		return nil, planErr
+	}
 
 	if err := plan.readParts(ctx); err != nil {
 		span.RecordError(err)
@@ -684,7 +680,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, 
 	// Limit pushdown: trim the survivors to the global top-N records by timestamp (newest when
 	// Reverse, else oldest), keeping boundary ties so the result is a correct superset.
 	if r.Limit > 0 && total > r.Limit {
-		limitTrim(survivors, r.Limit, r.Reverse)
+		limitTrim(survivors, r.Limit, r.Reverse, plan.memory == nil)
 	}
 
 	// Pass 2: materialize the (trimmed) survivors into batches.
@@ -704,7 +700,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, 
 			continue
 		}
 
-		if r.Recycle { // hand the accumulator back to the pool when the consumer releases this batch
+		if r.Recycle && plan.memory == nil { // budgeted buffers do not retain unaccounted pool capacity
 			b.SetReleaseState(sv.acc)
 			b.SetRelease(e.recycle)
 		}
@@ -735,10 +731,13 @@ var limitScratch = sync.Pool{New: func() any { s := make([]int64, 0, 4096); retu
 // boundary timestamp — so the kept set is a superset of the exact top-N (≥ limit rows), and a caller
 // applying its own ordering+limit never loses a boundary row. Each acc is already ascending by ts.
 // The caller guarantees the survivors hold more than `limit` rows in total.
-func limitTrim(survivors []matchedStream, limit int, reverse bool) {
+func limitTrim(survivors []matchedStream, limit int, reverse, pooled bool) {
 	// Find the boundary timestamp: the limit-th value from the kept end across all survivors. A
 	// pooled scratch holds every timestamp; sorting int64s is allocation-free and reflection-free.
-	bufp := limitScratch.Get().(*[]int64)
+	bufp := new([]int64)
+	if pooled {
+		bufp = limitScratch.Get().(*[]int64)
+	}
 	all := (*bufp)[:0]
 
 	for _, sv := range survivors {
@@ -755,7 +754,9 @@ func limitTrim(survivors []matchedStream, limit int, reverse bool) {
 	}
 
 	*bufp = all
-	limitScratch.Put(bufp)
+	if pooled {
+		limitScratch.Put(bufp)
+	}
 
 	for _, sv := range survivors {
 		ts := sv.acc.ts
@@ -1083,6 +1084,7 @@ func (e *Engine) streamInRangeLocked(id signal.SeriesID, start, end int64) bool 
 // accumulators already seeded from the head, the acquired (ref-held) live parts still to read, and the
 // captured stream identities. Its [fetchPlan.readParts] does the backend I/O off the lock.
 type fetchPlan struct {
+	memory *fetchMemory
 	// releaseBudget returns the plan's memory reservation. Always non-nil after planFetch, including
 	// on an unbudgeted read, so no caller needs a nil check on an error path.
 	releaseBudget func()
@@ -1165,9 +1167,13 @@ func (e *Engine) getRecordCols(n int, sel colSel) *recordCols {
 }
 
 func (e *Engine) planFetch(ctx context.Context, ids []signal.SeriesID, r fetch.Request) (*fetchPlan, error) {
-	noopRelease := func() {}
-	p := &fetchPlan{
-		releaseBudget: noopRelease,
+	memory := newFetchMemory(ctx)
+	p := &fetchPlan{memory: memory, releaseBudget: memory.done}
+	if err := memory.reserve(fetchPlanBytes(e.cfg.Schema, len(ids), len(e.parts)+len(e.foreignParts), len(r.Conditions))); err != nil {
+		return p, err
+	}
+	*p = fetchPlan{
+		memory: memory, releaseBudget: memory.done,
 
 		e:      e,
 		sel:    selectColumns(e.cfg.Schema, r),
@@ -1222,28 +1228,10 @@ func (e *Engine) planFetch(ctx context.Context, ids []signal.SeriesID, r fetch.R
 		}
 	}
 
-	// Admission goes here, between selecting the parts and sizing the accumulators: the loop below
-	// pre-allocates each stream's buffers to the rows it will hold, which is the fetch's largest
-	// allocation and happens before any part is read.
-	var accRows int64
-
-	for k, id := range p.sortedIDs {
-		n := partRows[k] + e.head.recordCount(id)
-		if buf := e.flushing[id]; buf != nil {
-			n += buf.len()
-		}
-
-		accRows += int64(n)
-	}
-
-	release, err := p.admit(ctx, accRows)
-	if err != nil {
-		// Return the plan, not nil: it already holds acquired parts, and [Engine.Fetch] releases them
-		// through its deferred releaseParts even on a planning error.
+	if p.memory != nil {
+		err := p.seedBudgetedHead()
 		return p, err
 	}
-
-	p.releaseBudget = release
 
 	for k, id := range p.sortedIDs {
 		n := partRows[k] + e.head.recordCount(id)
@@ -1320,6 +1308,9 @@ func (p *fetchPlan) sizeStreams(part *part, rows []int) bool {
 // readParts decodes each acquired part (only the referenced columns — lazy decode) and appends its
 // in-window rows to the per-stream accumulators. Runs lock-free: the parts are immutable and ref-held.
 func (p *fetchPlan) readParts(ctx context.Context) error {
+	if p.memory != nil {
+		return p.readBudgetedParts(ctx)
+	}
 	if len(p.conds) > 0 {
 		return p.readPartsLazy(ctx) // filtered path: materialize only matching rows (fetchlazy.go)
 	}

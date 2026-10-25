@@ -117,15 +117,13 @@ The read path has its own bound, on the same principle. `Options.MaxQueryBytes` 
 may hold, refusing it with `readbudget.ErrExceeded` rather than letting an unselective read — every
 span in a wide window to answer one tag lookup — take the process down.
 
-It is a single budget (`readbudget`) carried on the query context, charged where a refusal is still
-worth something: **before** the memory is committed. That rules out wrapping the fetcher, because
-`recordengine.Fetch` reads every part, accumulates every survivor and materializes every batch before
-it returns an iterator — anything around that iterator would reject after the allocation it was meant
-to prevent. So the record engine admits against an estimate of its decoded footprint taken from part
-metadata (`recordengine/budget.go`), the way the metric engine's decode budget does, and releases the
-reservation when the caller closes. The estimate needs no guessed expansion factor: a part's manifest
-records its *decoded* size, so scaling it by the share of rows a request touches is honest, modulo a
-per-part average over variable-width records.
+It is a single budget (`readbudget`) carried on the query context, charged before allocation.
+Budgeted record reads reserve selected-column decoder bounds from manifests one part at a time,
+then projected output as matching in-window rows accumulate. They retain dictionary views rather
+than expanding whole byte columns. Temporary decode/match reservations return between parts;
+accumulated results and their finishing scratch remain charged until iterator Close. Unsized legacy
+columns keep a conservative whole-part bound. The unbudgeted fast path remains available when the
+embedder explicitly disables this guard.
 
 The cluster fan-out body is bounded separately (`cluster/budget.go`), since `io.ReadAll` on a peer
 response is an unbounded remote input nothing else covers. The aggregator sends its remaining
