@@ -751,6 +751,14 @@ engine's derived sidecars (`../engine/ARCH.md`), which fall back on absent or co
 `Engine.Keys` enumerates them across head ∪ in-window parts tagged with a `KeyScope` bitset
 (resource/scope/series/record), so an embedder can list and push down record-attribute labels that
 `Series`-based resolution cannot see. It is the enumeration twin of `Engine.Series`.
+The head's distinct-key cache is append-invalidated and filled under the engine write lock, so
+concurrent enumerations share a complete cache. This snapshot uses only resident identities,
+buffers, part ranges and loaded key footers; it performs no backend I/O. Sorting the copied result
+runs after unlocking. Cold enumeration already excludes writers while scanning the head;
+the write lock also serializes cache hits with other engine readers. On linux/amd64 (Ryzen 9 5950X,
+GOMAXPROCS=2), concurrent warm-cache enumeration over 100 streams × 100 records costs
+70.18 µs/op versus 38.34 µs/op with shared locking (+31.84 µs, six 200 ms runs, p=0.002);
+allocations remain 19.34 KiB and 1,925 per call.
 
 **Values** need no sidecar: `Engine.ColumnValues` (`values.go`) unions each in-window part's
 **column dictionary** — already the part's distinct value set — with a scan of the unflushed head,

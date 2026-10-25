@@ -40,9 +40,6 @@ type KeyInfo struct {
 // part's persisted key footer. Window precision is part-granular and best-effort: a key whose
 // records all fall outside the window may still be returned (harmless). Safe for concurrent use.
 func (e *Engine) Keys(start, end int64) []KeyInfo {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
 	scopes := make(map[string]KeyScope)
 	add := func(key []byte, sc KeyScope) {
 		if len(key) > 0 {
@@ -50,6 +47,7 @@ func (e *Engine) Keys(start, end int64) []KeyInfo {
 		}
 	}
 
+	e.mu.Lock() // The snapshot may populate the head/flushing key caches.
 	// Stream-identity keys: resource/scope/series attributes of every in-window stream. The series index is
 	// authoritative (it survives flush and a stateless reload), so this is sound on all backends.
 	e.head.series.ForEach(func(id signal.SeriesID, s signal.Series) {
@@ -93,6 +91,7 @@ func (e *Engine) Keys(start, end int64) []KeyInfo {
 			add(key, KeyScopeRecord)
 		}
 	}
+	e.mu.Unlock()
 
 	return keyInfoSlice(scopes)
 }
@@ -125,7 +124,7 @@ func keyInfoSlice(scopes map[string]KeyScope) []KeyInfo {
 
 // collectRecordKeys calls emit for every per-record attribute key buffered in records whose record
 // falls in [start, end] (a zero start AND end disables the filter). No-op when the schema has no
-// serialized-attributes column or records is nil. Caller holds the engine lock.
+// serialized-attributes column or records is nil. Caller holds the engine write lock.
 func collectRecordKeys(schema *Schema, records map[signal.SeriesID]*recordCols, start, end int64, emit func(key []byte)) {
 	k, ok := schema.attrsByteCol()
 	if !ok {
