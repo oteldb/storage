@@ -114,7 +114,12 @@ func TestWriterFinishAtCapCoversAWholePart(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	e := wideDictEngine(t, backend.Memory(), Config{MergeMemoryBytes: -1}, 6, 4, 32<<10, 1)
+	rows := 32 << 10
+	if testing.CoverMode() == "atomic" {
+		// Full-size dictionaries remain covered by normal and race-only runs.
+		rows = 8 << 10
+	}
+	e := wideDictEngine(t, backend.Memory(), Config{MergeMemoryBytes: -1}, 6, 4, rows, 1)
 	src := e.parts
 
 	sources, err := e.openMergeSources(ctx, src)

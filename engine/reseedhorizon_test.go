@@ -23,13 +23,16 @@ func TestReseedHorizonRate(t *testing.T) {
 	t.Parallel()
 
 	const (
-		cycles      = 300
-		seriesCount = 400
-		stepsPer    = 16
-		step        = int64(time.Minute)
-		rowBytes    = 32
-		maxRows     = 2048
+		cycles   = 300
+		stepsPer = 16
+		step     = int64(time.Minute)
+		rowBytes = 32
 	)
+	seriesCount, maxRows := 400, int64(2048)
+	if testing.CoverMode() == "atomic" {
+		// Keep the time horizon and flush splitting without multiplying atomic counters by every series.
+		seriesCount, maxRows = 32, 10*stepsPer
+	}
 
 	ctx := context.Background()
 	b := backend.Memory()
@@ -160,14 +163,17 @@ func TestReseedHorizonWithRetention(t *testing.T) {
 	t.Parallel()
 
 	const (
-		cycles      = 300
-		seriesCount = 400
-		stepsPer    = 16
-		step        = int64(time.Minute)
-		rowBytes    = 32
-		maxRows     = 2048
-		retain      = int64(12 * time.Hour)
+		cycles   = 300
+		stepsPer = 16
+		step     = int64(time.Minute)
+		rowBytes = 32
+		retain   = int64(12 * time.Hour)
 	)
+	seriesCount, maxRows := 400, int64(2048)
+	if testing.CoverMode() == "atomic" {
+		// Keep all retention cycles and day crossings in the instrumented profile.
+		seriesCount, maxRows = 32, 10*stepsPer
+	}
 
 	ctx := context.Background()
 	b := backend.Memory()
