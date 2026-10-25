@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/oteldb/storage/internal/heaptest"
 )
 
 func allocated(fn func()) uint64 {
@@ -25,6 +27,7 @@ func allocated(fn func()) uint64 {
 //
 //nolint:paralleltest // measures the process's allocations; a concurrent test would skew them
 func TestUnionDecodesOnce(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	corpus := pprofCorpus(t)
 	part := NewSymbolStore()
 	part.acc = corpus

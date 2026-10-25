@@ -48,6 +48,7 @@ func medianMiB(xs []float64) float64 {
 
 //nolint:paralleltest // measures process-global runtime.MemStats; a parallel test's allocations add noise.
 func TestRecordMergeBoundedWorkingSet(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	requireCleanProcess(t)
 
 	ctx := context.Background()
@@ -158,6 +159,7 @@ func TestMedianSeparatesRegressionFromGCNoise(t *testing.T) {
 
 //nolint:paralleltest // allocation counters and GC policy are process-wide
 func TestRecordMergeAllocationCeiling(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	requireCleanProcess(t)
 	ctx := context.Background()
 	fb, err := backendfile.New(t.TempDir())

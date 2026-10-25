@@ -61,6 +61,7 @@ func TestIdentityBytesResetToZero(t *testing.T) {
 //
 //nolint:paralleltest // reads process-wide heap statistics; a parallel test would pollute them
 func TestIdentityBytesApproximatesHeap(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	if testing.Short() {
 		t.Skip("allocates ~100 MB and measures the heap")
 	}

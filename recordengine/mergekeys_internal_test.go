@@ -88,6 +88,7 @@ func TestMergeKeysMatchesTheSetItReplaced(t *testing.T) {
 //
 //nolint:paralleltest // measures allocations; a parallel test's own allocations add noise.
 func TestMergeKeysHoldsNoSet(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	const streams = 2048
 
 	src := make([]*part, 4)

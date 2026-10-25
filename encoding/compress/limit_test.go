@@ -74,6 +74,7 @@ func unsafeFirst(b []byte) *byte { return &b[:1][0] }
 //
 //nolint:paralleltest // reads process-wide heap counters
 func TestDecompressLimitDiscardsBuf(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	full := make([]byte, 64<<20)
 
 	for _, alg := range []Algorithm{AlgorithmNone, AlgorithmZSTD, AlgorithmLZ4} {
@@ -302,6 +303,7 @@ func decompressionBombs(t *testing.T, limit int) []struct {
 //
 //nolint:paralleltest // reads process-wide heap counters
 func TestDecompressLimitBombs(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	const limit = 1 << 20
 
 	for _, tc := range decompressionBombs(t, limit) {
@@ -326,6 +328,7 @@ func TestDecompressLimitBombs(t *testing.T) {
 //
 //nolint:paralleltest // reads process-wide heap counters
 func TestDecodeWorkspace(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	c := NewCompressor(AlgorithmZSTD, LevelDefault)
 
 	var worst uint64

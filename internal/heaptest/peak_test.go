@@ -14,6 +14,7 @@ import (
 //
 //nolint:paralleltest // samples the process-wide heap
 func TestPeak(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	const chunk = 8 << 20
 
 	peak := heaptest.Peak(func(sample func()) {

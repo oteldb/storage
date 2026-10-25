@@ -260,6 +260,7 @@ func TestDecodeTableRejects(t *testing.T) {
 //
 //nolint:paralleltest // reads process-wide allocation counters
 func TestDecodeTableBombAllocation(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	rejects := decodeRejects()
 
 	for _, tc := range []struct {

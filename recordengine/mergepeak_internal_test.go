@@ -44,6 +44,7 @@ func mergeGrantPeak(t *testing.T, e *Engine, b *heaptest.FileSampler) (heap, gra
 //
 //nolint:paralleltest // samples the process-wide heap
 func TestMergeGatherHoldsItsGrant(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	fb, err := file.New(t.TempDir())
 	require.NoError(t, err)
 
@@ -78,6 +79,7 @@ func TestMergeGatherHoldsItsGrant(t *testing.T) {
 //
 //nolint:paralleltest // samples the process-wide heap
 func TestMergeFinishHoldsItsGrant(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	ctx := context.Background()
 
 	fb, err := file.New(t.TempDir())
@@ -148,6 +150,7 @@ func TestMergeFinishHoldsItsGrant(t *testing.T) {
 //
 //nolint:paralleltest // samples the process-wide heap
 func TestMergeSparseYearsHoldsItsGrant(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	fb, err := file.New(t.TempDir())
 	require.NoError(t, err)
 
@@ -178,6 +181,7 @@ func TestMergeSparseYearsHoldsItsGrant(t *testing.T) {
 
 //nolint:paralleltest // samples process-wide live heap
 func TestCompressedLogsFitSmallMergeBudget(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	fb, err := file.New(t.TempDir())
 	require.NoError(t, err)
 	b := &heaptest.FileSampler{File: fb, Writes: true}

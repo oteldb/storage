@@ -17,6 +17,7 @@ var sink []byte
 
 //nolint:paralleltest // reads process-wide heap counters
 func TestLive(t *testing.T) {
+	SkipUnsupported(t)
 	sink = nil
 	base := Live()
 
@@ -31,12 +32,14 @@ func TestLive(t *testing.T) {
 
 //nolint:paralleltest // reads process-wide heap counters
 func TestAllocated(t *testing.T) {
+	SkipUnsupported(t)
 	assert.GreaterOrEqual(t, Allocated(func() { sink = make([]byte, size) }), uint64(size))
 	sink = nil
 }
 
 //nolint:paralleltest // reads process-wide heap counters
 func TestInuseGrowth(t *testing.T) {
+	SkipUnsupported(t)
 	runtime.GC()
 
 	// Spans the collector swept can return to the page heap inside the window, so the growth is
@@ -47,6 +50,7 @@ func TestInuseGrowth(t *testing.T) {
 
 //nolint:paralleltest // reads process-wide heap counters
 func TestBytesPerOp(t *testing.T) {
+	SkipUnsupported(t)
 	assert.Zero(t, BytesPerOp(func() {}))
 	assert.GreaterOrEqual(t, BytesPerOp(func() { sink = make([]byte, 1024) }), int64(1024))
 	sink = nil
@@ -63,6 +67,7 @@ func newSampler(t *testing.T) *FileSampler {
 
 //nolint:paralleltest // reads process-wide heap counters
 func TestFileSamplerKeys(t *testing.T) {
+	SkipUnsupported(t)
 	ctx := context.Background()
 	s := newSampler(t)
 
@@ -103,6 +108,7 @@ func TestFileSamplerKeys(t *testing.T) {
 
 //nolint:paralleltest // reads process-wide heap counters
 func TestResident(t *testing.T) {
+	SkipUnsupported(t)
 	ctx := context.Background()
 	s := newSampler(t)
 

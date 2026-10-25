@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/internal/heaptest"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/mergestream/mergestreamtest"
 	"github.com/oteldb/storage/signal"
@@ -106,6 +107,7 @@ func TestKeysMatchesNaiveUnion(t *testing.T) {
 //
 //nolint:paralleltest // measures allocations; a parallel test's own allocations add noise.
 func TestKeysHoldsNoSet(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	for _, n := range []int{64, 4096} {
 		src := ascendingSources(4, n)
 		sources := sourcesOf(src)

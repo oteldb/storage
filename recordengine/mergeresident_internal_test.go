@@ -71,6 +71,7 @@ func mergeResident(t *testing.T, parts, rows int, capBytes int64) heaptest.Run {
 //
 //nolint:paralleltest // collects and samples the process-wide heap, so it must not run concurrently
 func TestMergeResidentFlatInPartSize(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	if testing.Short() {
 		t.Skip("ingests 2M rows")
 	}

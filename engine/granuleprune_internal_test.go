@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/block"
+	"github.com/oteldb/storage/internal/heaptest"
 )
 
 // gran builds a granule index at blockRows rows per granule from per-block [min, max] pairs.
@@ -226,6 +227,7 @@ func TestWindowBlocksSharedBoundaryBlock(t *testing.T) {
 //
 //nolint:paralleltest // AllocsPerRun requires exclusive use of the process.
 func TestWindowBlocksDoesNotScaleWithPartSize(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	const blockRows = 1024
 
 	// The same single-block query against a small part and against a part a thousand times larger.
