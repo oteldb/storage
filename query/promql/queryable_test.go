@@ -157,7 +157,7 @@ func TestSelectPushesPositiveMatcher(t *testing.T) {
 	assert.GreaterOrEqual(t, f.last.Start, int64(0))
 }
 
-func TestSelectNegativeMatcherNotPushed(t *testing.T) {
+func TestSelectNegativeMatcherPushed(t *testing.T) {
 	t.Parallel()
 
 	f := &fakeFetcher{batches: []*fetch.Batch{
@@ -168,9 +168,8 @@ func TestSelectNegativeMatcherNotPushed(t *testing.T) {
 	got := selectSeries(t, f, eq(t, "__name__", "m"), neq(t, "route", "/a"))
 	assert.Equal(t, map[string]float64{"/b": 2}, lastByRoute(t, got), "negative matcher filters to /b")
 
-	// Only the index-safe __name__ matcher is pushed down; the negated one is enforced in the
-	// post-fetch re-check, not the postings index.
-	require.Len(t, f.last.Matchers, 1)
+	// Both matchers reach the postings index, with the full set re-checked after projection.
+	require.Len(t, f.last.Matchers, 2)
 	assert.Equal(t, []byte("__name__"), f.last.Matchers[0].Name)
 }
 
@@ -245,7 +244,7 @@ func TestMsToNsClamp(t *testing.T) {
 
 // TestExportedHelpers covers the exported projection helpers an embedder's pushdown path calls
 // directly: PromLabels mirrors the [Queryable]'s label projection, MatchesAll is the
-// post-fetch full-set re-check, and PushableMatchers lowers only the index-safe subset.
+// post-fetch full-set re-check, and PushableMatchers lowers visible-label predicates.
 func TestExportedHelpers(t *testing.T) {
 	t.Parallel()
 
@@ -265,10 +264,9 @@ func TestExportedHelpers(t *testing.T) {
 	assert.True(t, MatchesAll(lset, []*labels.Matcher{neq(t, "absent", "x")}))
 	assert.False(t, MatchesAll(lset, []*labels.Matcher{eq(t, "route", "/b")}))
 
-	// PushableMatchers keeps only index-safe matchers: the equality __name__ (with a serializable
-	// Spec) is pushed, the negated route matcher (which matches "") is not.
+	// Equality carries a serializable hint; the negated predicate is applied locally.
 	pushed := PushableMatchers([]*labels.Matcher{eq(t, "__name__", "m"), neq(t, "route", "/x")})
-	require.Len(t, pushed, 1)
+	require.Len(t, pushed, 2)
 	assert.Equal(t, []byte("__name__"), pushed[0].Name)
 	assert.NotNil(t, pushed[0].Spec, "equality matcher carries a serializable Spec")
 }
@@ -366,7 +364,7 @@ func TestCountSeriesByRecheckFallback(t *testing.T) {
 	t.Parallel()
 
 	// route=a twice, route=b once; one series matches the metric but will be dropped by the
-	// non-pushable != matcher.
+	// != matcher.
 	f := &fakeFetcher{batches: []*fetch.Batch{
 		series("http_requests", "a", [2]int64{1, 1}),
 		series("http_requests", "a2", [2]int64{2, 2}),
@@ -381,8 +379,7 @@ func TestCountSeriesByRecheckFallback(t *testing.T) {
 		CountSeriesBy(ctx context.Context, startMs, endMs int64, label string, matchers ...*labels.Matcher) (map[string]uint64, error)
 	})
 
-	// The != matcher is not pushable, so the fallback fetches and re-checks; grouping by __name__
-	// buckets the two surviving series under the metric name.
+	// Without GroupCounter the exact fallback fetches and re-checks the full matcher set.
 	got, err := counter.CountSeriesBy(
 		context.Background(), 0, 10_000, "route",
 		eq(t, "__name__", "http_requests"), neq(t, "route", "b"),
@@ -447,7 +444,7 @@ func TestLabelMetadataUsesSeriesLister(t *testing.T) {
 	vals, _, err = q.LabelValues(ctx, "route", nil, eq(t, "__name__", "http.requests"), neq(t, "route", "/b"))
 	require.NoError(t, err)
 	assert.Equal(t, []string{"/a"}, vals)
-	require.Len(t, f.lastReq.Matchers, 1, "only the index-safe matcher is pushed")
+	require.Len(t, f.lastReq.Matchers, 2, "both matchers reach the enumeration seam")
 	assert.Equal(t, []byte("__name__"), f.lastReq.Matchers[0].Name)
 	assert.Equal(t, 3, f.calls, "every label call went through the enumeration seam")
 	assert.Zero(t, f.last.End, "the sample path was never taken")
@@ -475,7 +472,7 @@ func TestCountSeriesRecheckStaysExact(t *testing.T) {
 		CountSeriesBy(ctx context.Context, startMs, endMs int64, label string, matchers ...*labels.Matcher) (map[string]uint64, error)
 	})
 
-	// A non-pushable matcher forces the recheck path (the exact one).
+	// Without Counter the exact fallback must not use the coarse identity lister.
 	ms := []*labels.Matcher{eq(t, "__name__", "http.requests"), neq(t, "route", "/zzz")}
 
 	n, err := counter.CountSeries(context.Background(), 0, 10_000, ms...)
@@ -593,10 +590,10 @@ func TestLabelMetadataFallsBackFromLabelLister(t *testing.T) {
 	t.Cleanup(func() { _ = q.Close() })
 	ctx := context.Background()
 
-	// Non-pushable matcher ⇒ the identity path, which re-checks it.
-	vals, _, err := q.LabelValues(ctx, "route", nil, neq(t, "route", "/b"))
+	// A hidden label is interpreted against the projected identity, not the stored value.
+	vals, _, err := q.LabelValues(ctx, "route", nil, eq(t, "__unit__", ""))
 	require.NoError(t, err)
-	assert.Equal(t, []string{"/a"}, vals)
+	assert.Equal(t, []string{"/a", "/b"}, vals)
 	assert.Zero(t, f.valCalls, "the metadata capability cannot re-check a non-pushable matcher")
 	assert.Equal(t, 1, f.calls, "the identity seam answered")
 

@@ -175,7 +175,8 @@ to fail over to: a read overlapping a want fails.
   lifetime is bounded. `[]byte` (not `string`) for keys/values/identity.
 - **One physical engine, many front-ends.** A signal supplies a column schema, a projection and
   (profiles) a side store — nothing more. Storage never learns a language's or signal's concepts;
-  matchers and conditions are **callbacks**, never operator enums.
+  matchers and conditions are **callbacks**, never operator enums. An absent label reaches its
+  matcher as `signal.EmptyValue` in local postings and requester-side RPC rechecks alike.
 - **Immutable parts + one merge engine.** Compaction, retention, downsampling, recompression,
   precision and EC conversion are all one background merge pass. Stored-byte part targets and
   resident memory admission are independent; flush size does not constrain merged parts.

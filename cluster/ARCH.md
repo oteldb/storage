@@ -278,7 +278,9 @@ Matchers are opaque Go closures and **not serializable**, so the RPC carries the
 + window and the requester **re-applies the matchers** to the returned superset (which the contract
 permits). Re-applying is `fetch.Filter` / `fetch.MatchesSeries` — one implementation on the seam,
 shared by the node's fan-out and by `router`, since a superset every consumer must narrow the same
-way is a shared obligation, not a per-consumer one. **Equality is the exception**: `fetch.Matcher` may carry a serializable `EqualMatcher`
+way is a shared obligation, not a per-consumer one. Missing labels are offered as
+`signal.EmptyValue` on both sides, so opaque absent/negative predicates preserve the local answer.
+**Equality is the exception**: `fetch.Matcher` may carry a serializable `EqualMatcher`
 spec, forwarded and pushed down on the peer, so a non-owner read narrows by `__name__` instead of
 pulling the whole window. A `fetch.Condition`'s `Equal` hint rides along the same way, in its **own**
 request field: it names a record column, so reconstructing it as an identity matcher would resolve it
