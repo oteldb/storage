@@ -21,8 +21,6 @@ func bucketOf(ts, level int64) int64 { return timebucket.Of(ts, level) }
 
 func partSpan(p *part) (lo, hi int64) { return p.minTime, p.maxTime }
 
-func fitsLevel(p *part, level int64) bool { return timebucket.Fits(p.minTime, p.maxTime, level) }
-
 func spanOf(parts []*part) (lo, hi int64) { return timebucket.Union(parts, partSpan) }
 
 // selectStraddlers returns the straddlers to split this cycle. A straddler crosses a top-level
@@ -32,8 +30,7 @@ func selectStraddlers(src []*part, capBytes int64) []*part {
 	return timebucket.Straddlers(src, partSpan, (*part).sizeBytes, capBytes, maxTierParts)
 }
 
-// newestBucket returns the start of the level-aligned bucket holding the newest record in src —
-// the bucket still filling, and so the one merging is premature in.
+// newestBucket is the level-aligned bucket holding the newest record in src.
 func newestBucket(src []*part, level int64) int64 {
 	newest := minInt64
 	for _, p := range src {
@@ -43,25 +40,17 @@ func newestBucket(src []*part, level int64) int64 {
 	return bucketOf(newest, level)
 }
 
-// partitionGroups groups the parts that fit level by their aligned bucket, oldest bucket first so
-// selection is deterministic and prefers settled data.
-//
-// Above the finest level the still-filling newest bucket is skipped: merging it now only guarantees
-// merging it again once the rest of the bucket arrives. The finest level is exempt because that is
-// where freshly flushed parts land, and leaving them uncompacted until the bucket closes would let
-// part count grow unbounded within it.
+// partitionGroups groups compactable parts by aligned bucket, oldest first.
+// Fine parts in a newest larger bucket wait for promotion; already-wide parts may merge there.
 func partitionGroups(src []*part, level int64) ([]int64, [][]*part) {
 	groups := make(map[int64][]*part, len(src))
+	newest := newestBucket(src, level)
 
 	for _, p := range src {
-		if fitsLevel(p, level) {
+		if timebucket.CanCompact(p.minTime, p.maxTime, level, newest) {
 			b := bucketOf(p.minTime, level)
 			groups[b] = append(groups[b], p)
 		}
-	}
-
-	if level != mergeLadder[0] {
-		delete(groups, newestBucket(src, level))
 	}
 
 	starts := make([]int64, 0, len(groups))

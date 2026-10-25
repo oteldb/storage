@@ -36,6 +36,12 @@ work arm an idle waiver; `Force` applies it immediately. A deferral does not res
 This absorbs geometric leftovers that no future flush can place in the same size tier. Size tiers
 remain diagnostic only, with a 128 KiB floor in stored bytes rather than the decoded-size ladder.
 
+The shared `timebucket.CanCompact` predicate defers promotion of fine parts in a still-filling
+larger bucket, but admits parts already too wide for the preceding level. Late records can make a
+part arrive at the 6h or 24h level directly; such parts compact without waiting for a newer bucket's
+data. The same scoring, count and memory bounds apply, and merging never crosses the chosen bucket.
+The newest bucket comes from flushed data timestamps rather than elapsed wall time.
+
 Retention drops fully expired parts on metadata alone. The oldest forced part selects its finest
 aligned bucket; forced work wins, then ordinary compaction, then day-boundary straddlers.
 Compression-only rewrites use that same forced selector when ordinary work has nothing to do,

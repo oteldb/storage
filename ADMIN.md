@@ -126,9 +126,10 @@ like an idle one. The three numbers beside it answer it directly:
   write-amplification guard after three idle cycles and retry the best run.
   `Admin.CompactNow` breaks it either way.
 - `MergeBacklog > 0`, `MergeCandidates == 0`, `MergeForceCandidates == 0` — **resting**: every
-  unsealed part is alone in its time bucket at each ladder level, or waits in the still-filling
-  newest bucket. No merge reduces this without building a part wider than a bucket, so neither a
-  cycle nor `CompactNow` changes it. A part crossing a day boundary — a straddler, which one late
+  unsealed part is alone in its eligible time bucket, or fine parts await promotion from the
+  still-filling newest larger bucket. Already-wide parts that cannot fit the preceding finer level
+  remain eligible there; a large group of them is not a resting state. Neither a cycle nor
+  `CompactNow` widens parts across bucket boundaries. A part crossing a day boundary — a straddler, which one late
   sample or record in a flush makes — is never in this state: it is a candidate until a merge splits
   it on day boundaries.
 

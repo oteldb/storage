@@ -13,10 +13,10 @@ const (
 	day  = 24 * hour
 )
 
-// partAt builds a bare part spanning [minTime, maxTime] of the given decoded size — all the
+// partAt builds a bare part spanning [minTime, maxTime] of the given stored size — all the
 // selection logic reads.
 func partAt(size, minTime, maxTime int64) *part {
-	return &part{rawBytes: size, minTime: minTime, maxTime: maxTime}
+	return &part{rawBytes: size, diskBytes: size, minTime: minTime, maxTime: maxTime}
 }
 
 // TestSelectMergePartsNeverWidensPastTopLevel is the property the change exists for: whatever the
