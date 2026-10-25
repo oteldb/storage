@@ -159,7 +159,11 @@ type querier struct {
 // The returned series are zero-copy: each one's iterator reads its batch's timestamp/value slices
 // directly (no per-sample copy or interface boxing). Those buffers stay valid until [querier.Close],
 // which releases the batches — opting into the engine's buffer-recycling lifecycle (Recycle).
-func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+func (q *querier) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+	if hints != nil && hints.Func == "series" {
+		return q.selectSeries(ctx, sortSeries, matchers)
+	}
+
 	req := fetch.Request{
 		Tenant:   q.tenant,
 		Start:    msToNsClamp(q.mint, math.MinInt64),

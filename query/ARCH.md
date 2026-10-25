@@ -105,6 +105,11 @@ The library implements **no** query language. This package bridges the fetch sea
 - **Label projection.** `signal.Series` → `labels.Labels`: attributes flatten, scope name/version
   under `otel.scope.*`, internal reserved labels hidden, `__name__` kept. It is a pure function of
   the content-addressed id, so a `Queryable` memoizes it per id.
+- **Series metadata.** `SelectHints.Func == "series"` uses `SeriesLister` through the same
+  identity projection as label enumeration, with no sample fetch when the capability is available.
+  Projected label sets are deduplicated (several physical identities can hide the same internal
+  labels), and sorted when requested. Limits remain with the caller so truncation warnings retain
+  their boundary lookahead.
 - **Zero-copy samples.** Series iterators read the batch's slices directly (ns→ms on the fly), no
   per-sample copy or interface boxing; Select sets `Recycle` and `querier.Close` releases.
 - **Sampling weights are carried and announced, never applied.** A `chunkenc.Iterator` is a plain
