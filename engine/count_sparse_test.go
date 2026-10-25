@@ -5,9 +5,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/go-faster/errors"
-	"golang.org/x/sync/errgroup"
-
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
@@ -109,27 +106,17 @@ func TestCountSampledShortBlocks(t *testing.T) {
 func TestCountConcurrentSmallCache(t *testing.T) {
 	t.Parallel()
 	e, req := sparseCountEngine(t, 64, 1, false)
-	var group errgroup.Group
-	for range 8 {
-		group.Go(func() error {
+	for worker := range 8 {
+		t.Run(fmt.Sprintf("worker=%d", worker), func(t *testing.T) {
+			t.Parallel()
 			for range 16 {
 				n, err := e.Count(t.Context(), req)
-				if err != nil {
-					return err
-				}
-				if n != 1 {
-					return errors.New("unexpected sparse count")
-				}
+				require.NoError(t, err)
+				require.Equal(t, 1, n)
 				by, err := e.CountBy(t.Context(), req, []byte("instance"))
-				if err != nil {
-					return err
-				}
-				if len(by) != 1 || by["host-0"] != 1 {
-					return errors.New("unexpected sparse grouped count")
-				}
+				require.NoError(t, err)
+				require.Equal(t, map[string]int{"host-0": 1}, by)
 			}
-			return nil
 		})
 	}
-	require.NoError(t, group.Wait())
 }
