@@ -305,6 +305,15 @@ Three things an operator should know:
   unforwarded one reads as an unbounded disk. The in-tree wrappers (read cache, metering, the EC
   read wrapper) forward both.
 
+**Record query refusals.** `Options.MaxQueryBytes` rejects with `readbudget.ErrExceeded` before a
+record fetch allocates past its structural allowance. The charge follows selected-column decode
+scratch and actual in-window result accumulation; it is not the full logical size of overlapping
+parts. Whole timestamp/int arrays and dictionary metadata still cost memory even for a narrow
+window, and unsized legacy columns use conservative whole-part bounds. Refusal reports the new
+reservation, current holding and limit; a zero holding does not imply contention. Decode scratch
+returns between parts and result reservations return on iterator Close. Raising the limit changes
+the query guard for every record read, not just a metadata endpoint.
+
 **Decode-budget forced admissions.** `Options.DecodeMemoryBytes` caps in-flight decoded bytes; a
 query reserves its estimate before reading parts and blocks while it does not fit. That wait is
 bounded on purpose: it ends on the query's context, and a waiter that is the queue head for

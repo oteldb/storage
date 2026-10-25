@@ -121,6 +121,51 @@ reaches one part and holds about 3 MiB above the baseline. The facade allocation
 separate multi-service corpus and caps total allocation volume at twice its 32 MiB pool; allocation
 volume includes scratch that becomes garbage and is distinct from peak resident bytes.
 
+## Query memory admission
+
+Budgeted fetches use the same two-phase dictionary read seam as filtered reads: first timestamps
+and condition columns, then the remaining selected columns only for a part with surviving rows.
+No decoded byte-column expansion is needed to gather selected cells. Unbudgeted fetches retain the
+bulk decode path.
+
+The plan charges its owned/adopted part references and per-stream metadata before allocating them.
+Head and flushing rows are snapshotted under the read lock, with only in-window selected cells
+charged before copying. Part reads run off lock. `fetchDecodeBytes` charges full timestamp/int arrays,
+dictionary IDs and entry tables, whole encoded objects, directories and decoder workspace from
+`ColumnInputSize`; a legacy column without sizing falls back to its whole-part bound. Granule
+pruning reduces work but does not pretend the row-aligned decode arrays are packed selections.
+
+Match indices are sized to the candidate rows within the window. Output grows only for actual
+surviving projected/condition cells, charged before append: three copies of vector/blob data bound
+append replacement and stable-sort permutation; byte views and filter/top-N indices are separate
+terms. The watermark heap grows with observed rows, never with an arbitrary requested limit.
+No record limit is introduced to approximate distinct values.
+
+Budgeted reads use fresh decode/result buffers so a small query cannot import a larger retained
+pool capacity without accounting for it. They do not return these fresh buffers to the unbudgeted
+recycle pool; `Recycle` remains safe but does not promise reuse on this path. Compiled conditions and their dictionaries are dropped
+before returning each part's temporary reservation. Results remain charged until Close; every
+partial planning, decode or append failure releases the complete reservation and part references.
+This is a structural working-memory bound, not an exact Go-heap measurement or a bound on memory
+allocated by consumer-supplied predicates. Projected reads still materialize their matching result rows.
+
+### Projected fetch measurement
+
+`BenchmarkProjectedFetchBudget` reads 4,096 synthetic rows with 1 KiB bodies and two severity
+columns from one memory-backed part. Both versions receive a 32 MiB query allowance; the fixture
+is outside timing. Six 200 ms single-CPU samples on Linux/amd64, Ryzen 5950X, Go 1.27.3 (`nodwarf5`)
+compare v0.49.2 with staged accounting:
+
+| severity projection | v0.49.2 | staged | allocated bytes | peak reservation |
+|---|---:|---:|---:|---:|
+| all 4,096 rows | 102.9 µs | 112.7 µs (+9.5%) | 283.4 → 267.8 KiB (-5.5%) | 4.14 MiB → 718.5 KiB |
+| one-row window | 60.23 µs | 43.06 µs (-28.5%) | 171.46 → 73.86 KiB (-56.9%) | 4.14 MiB → 142.6 KiB |
+
+Both use 77 allocations rather than 88. All reported differences have p=0.002. Full-window reads
+pay for explicit accounting and fresh bounded buffers; narrow windows avoid the whole-part output
+allocation. Throughput reports selected logical bytes, not encoded column size. The synthetic
+corpus demonstrates the projection/window failure and does not predict production query latency.
+
 ## Schema
 
 ```go

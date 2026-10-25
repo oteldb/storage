@@ -136,10 +136,10 @@ type Options struct {
 	// read — every span in a wide window to answer one tag lookup — had nothing between it and the
 	// process memory.
 	//
-	// The record engines reserve their estimated decoded footprint from part metadata before reading,
-	// and release it when the caller closes the iterator. The estimate is a per-part average over
-	// variable-width records, so it is approximate — deliberately in the over-counting direction,
-	// since it counts whole stream ranges rather than the window's slice of them.
+	// Record fetches reserve selected-column decode scratch one part at a time and projected
+	// result buffers as matching in-window rows accumulate. Scratch is returned between parts;
+	// result reservations remain until the iterator closes. Unsized legacy columns use a
+	// conservative whole-part bound. Narrow windows still pay for whole timestamp arrays.
 	//
 	// In cluster mode the aggregator sends its remaining allowance with the request; a receiver may
 	// only use it to tighten its own limit, never to raise it.

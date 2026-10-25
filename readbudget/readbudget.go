@@ -1,16 +1,13 @@
 // Package readbudget bounds how much memory one query may hold at once, so an unselective read
 // fails loudly instead of taking the process down.
 //
-// The bound is charged where a read can still be refused — before the memory is committed — which in
-// practice means at the producer, not around it. The record engine reads every part, accumulates
-// every survivor and materializes every output batch before it returns an iterator at all, so
-// anything wrapping that iterator sees only bytes that are already resident. It therefore admits
-// against an estimate of its decoded footprint taken from part metadata, mirroring what the metric
-// engine's decode budget does with [engine.DecodeBudget].
+// Producers charge before allocating: record fetches reserve selected-column decode scratch
+// per part and projected output as surviving rows accumulate. Scratch is returned between parts;
+// retained result reservations follow the iterator until Close. Wrapping a materializing fetcher
+// would reject only after the allocation the budget is intended to prevent.
 //
-// Unlike that budget, this one *rejects*. Decode admission queues concurrent queries behind a shared
-// ceiling but admits an over-budget query alone rather than refusing it, so it bounds queries against
-// each other and never any one of them against the process.
+// Record query admission rejects. Metric decode admission instead queues concurrent queries behind
+// a shared ceiling and admits an over-budget query alone, bounding queries against each other.
 package readbudget
 
 import (
@@ -64,7 +61,7 @@ func (b *Budget) Reserve(n int64) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.held+n > b.limit {
+	if n > b.limit-b.held {
 		return errors.Wrapf(ErrExceeded, "reserve %d bytes: holding %d of %d", n, b.held, b.limit)
 	}
 
