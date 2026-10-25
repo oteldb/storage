@@ -18,6 +18,7 @@ import (
 //
 //nolint:paralleltest // samples the process-wide heap
 func TestEncodeWorkspaceBoundsHeap(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	src := make([]byte, encoderWindowBytes)
 
 	r := rand.New(rand.NewPCG(1, 2))

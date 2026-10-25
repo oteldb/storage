@@ -23,6 +23,7 @@ import (
 //
 //nolint:paralleltest // counts the process-wide allocations
 func TestScanBoundCoversOpenPeak(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	ctx := context.Background()
 
 	const (

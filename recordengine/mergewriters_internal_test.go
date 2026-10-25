@@ -26,6 +26,7 @@ import (
 //
 //nolint:paralleltest // collects and samples the process-wide heap, so it must not run concurrently
 func TestRecordPartWriterResidentTracksHeap(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	ctx := context.Background()
 	e := wideDictEngine(t, backend.Memory(), Config{MergeMemoryBytes: -1}, 6, 4, 32<<10, 1)
 	src := e.parts
@@ -85,6 +86,7 @@ func TestRecordPartWriterResidentTracksHeap(t *testing.T) {
 //
 //nolint:paralleltest // collects and samples the process-wide heap, so it must not run concurrently
 func TestMergeWritersHoldAdmittedShare(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	if testing.Short() {
 		t.Skip("ingests 256k rows twice")
 	}

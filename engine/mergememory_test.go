@@ -62,6 +62,7 @@ func mergeCorpus(t *testing.T, series, samples, parts int, value func(r *rand.Ra
 //
 //nolint:paralleltest // measures process-wide allocation counters, so it must not run concurrently
 func TestMergeAllocatesBelowRawRows(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	const (
 		series, samples, parts = 4000, 64, 8
 		partRowBytes           = 32

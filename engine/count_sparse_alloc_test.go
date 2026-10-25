@@ -15,6 +15,7 @@ import (
 
 //nolint:paralleltest // allocation volume is process-wide
 func TestCountSparseAllocationBound(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	for _, cache := range []int64{0, 32 << 20} {
 		for _, series := range []int{64, 1024} {
 			t.Run(fmt.Sprintf("cache=%d/series=%d", cache, series), func(t *testing.T) {

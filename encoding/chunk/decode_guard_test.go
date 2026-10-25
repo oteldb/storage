@@ -69,6 +69,7 @@ func TestDecodeRejectsCorruptRowCount(t *testing.T) {
 //
 //nolint:paralleltest // the allocation check reads process-wide counters a parallel sibling would skew
 func TestDecodeRowsFromCaller(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	const claimed = 1 << 31
 
 	u128Run := append(uvarint(claimed), make([]byte, 16)...)

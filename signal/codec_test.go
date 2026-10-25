@@ -5,6 +5,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/oteldb/storage/internal/heaptest"
 )
 
 func TestValueBinaryRoundTrip(t *testing.T) {
@@ -106,6 +108,7 @@ func TestLookupAttribute(t *testing.T) {
 
 //nolint:paralleltest // testing.AllocsPerRun must not run during a parallel test.
 func TestLookupAttributeZeroAlloc(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	blob := NewAttributes(kv("user", sv("alice")), kv("region", sv("eu"))).AppendHashInput(nil)
 
 	allocs := testing.AllocsPerRun(100, func() {

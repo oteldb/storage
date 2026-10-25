@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/oteldb/storage/internal/heaptest"
 )
 
 // TestEncodeBytesDictNoAlloc pins the steady state: with a caller-owned buffer, encoding a granule
@@ -24,6 +26,7 @@ import (
 //
 //nolint:paralleltest // an allocation measurement must not share the process with parallel tests.
 func TestEncodeBytesDictNoAlloc(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	entries := distinctEntries(300)
 	ids := cyclicIDs(8192, 300)
 

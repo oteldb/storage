@@ -146,6 +146,7 @@ func TestColumnInputSizeMatchesDirectory(t *testing.T) {
 //
 //nolint:paralleltest // reads process-wide heap counters
 func TestColumnInputSizeBoundsLegacyWalk(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	ctx := context.Background()
 
 	fixture := backend.Memory()
@@ -296,6 +297,7 @@ func TestSizingMismatchIsCorrupt(t *testing.T) {
 //
 //nolint:paralleltest // reads process-wide heap counters
 func TestSizingCountsCheckedBeforeAllocation(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	ctx := context.Background()
 	b := backend.Memory()
 	sizedPart(ctx, t, b, 16, 1024, compress.AlgorithmNone)
@@ -364,6 +366,7 @@ func settledLive() int64 {
 //
 //nolint:paralleltest // reads process-wide heap counters
 func TestRetainedHeapWithinCharge(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	const tolerance = 16 << 10 // readers and slice headers
 
 	ctx := context.Background()
@@ -441,6 +444,7 @@ func retainedHeap(ctx context.Context, t *testing.T, r *PartReader) (opened, wal
 //
 //nolint:paralleltest // reads process-wide heap counters
 func TestDecodeBombsAreCorrupt(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	ctx := context.Background()
 	huge := make([]byte, 64<<20)
 

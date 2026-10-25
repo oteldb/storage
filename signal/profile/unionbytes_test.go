@@ -23,6 +23,7 @@ import (
 //
 //nolint:paralleltest // samples the process-wide heap
 func TestUnionBytesCoversUnion(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	for _, size := range []int{1, 64, 1024} {
 		t.Run(strconv.Itoa(size), func(t *testing.T) { unionBytesCoversUnion(t, size) })
 	}

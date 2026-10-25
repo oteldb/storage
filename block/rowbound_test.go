@@ -16,6 +16,7 @@ import (
 //
 //nolint:paralleltest // the allocation check reads process-wide counters a parallel sibling would skew
 func TestColumnRowsBoundDecode(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	const rows = 64
 
 	ids := make([]chunk.U128, rows)

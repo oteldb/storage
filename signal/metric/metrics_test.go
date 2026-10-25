@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/internal/heaptest"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -73,6 +74,7 @@ func TestAddPointRetainsExemplarCapacity(t *testing.T) {
 
 //nolint:paralleltest // testing.AllocsPerRun must not run during a parallel test.
 func TestBuilderReuseZeroAlloc(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	name := []byte("m")
 	m := &Metrics{}
 	build := func() {

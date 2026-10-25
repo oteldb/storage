@@ -22,6 +22,7 @@ import (
 //
 //nolint:paralleltest // samples the process-wide heap
 func TestMergeSidecarUnionHoldsItsGrant(t *testing.T) {
+	heaptest.SkipUnsupported(t)
 	ctx := context.Background()
 
 	fb, err := file.New(t.TempDir())
