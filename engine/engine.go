@@ -728,6 +728,7 @@ type enginePlan struct {
 	// plan lock by scanning the live buffers directly — no per-series sorted copy, no batch maps.
 	// nil on a full fetch plan (which snapshots real batches instead).
 	memActive []bool
+	countOnly bool
 	// samplesDecoded counts the samples an aggregate read decoded and folded, as opposed to answered
 	// from a part's stats sidecar. It is the input quantity that explains the read's cost — the
 	// emitted windows say nothing about it — and it is a plain int, not an atomic: an aggregate read
@@ -948,6 +949,9 @@ func (p *enginePlan) decodeEstimate(ctx context.Context, need colNeed) (int64, e
 	blocks := make(map[*part][]int, len(p.liveParts))
 
 	for _, pt := range p.liveParts {
+		if p.countOnly && pt.minTime >= p.start && pt.maxTime <= p.end {
+			continue
+		}
 		cols := int64(1) // timestamps
 		if need.values {
 			cols++ // values
@@ -973,6 +977,9 @@ func (p *enginePlan) decodeEstimate(ctx context.Context, need colNeed) (int64, e
 
 		pinned := min(int64(len(blks))*int64(r.blockRows), int64(pt.rows()))
 
+		if p.countOnly {
+			matched = 0
+		}
 		total += (pinned + matched) * 8 * cols
 	}
 
@@ -1021,7 +1028,7 @@ func (p *enginePlan) releaseParts() {
 	}
 
 	// The fetch stops drawing decode buffers here; shrink the freelist scaling back down.
-	if p.blockReaders != nil {
+	if p.blockReaders != nil && p.engine.blockCache != nil {
 		p.engine.blockCache.fetchEnd()
 	}
 
@@ -1894,9 +1901,8 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 
 // acquireWindowParts acquires every live part overlapping [start, end] into the plan (time-pruning
 // the rest) and, when withReaders and the block cache is on, builds a per-part block reader for
-// each block-sliceable part. A count-shaped plan passes withReaders=false — it never merges block
-// views (edge parts decode timestamps through the plan decode cache), so the per-part readers and
-// the freelist concurrency registration would be dead weight. Caller holds e.mu.
+// each block-sliceable part. Existence planning passes false; Count adds timestamp-only readers
+// after planning, while Series remains index-only. Caller holds e.mu.
 func (e *Engine) acquireWindowParts(p *enginePlan, start, end int64, withReaders bool) {
 	readable := e.readablePartsLocked()
 
@@ -1979,8 +1985,8 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 // count never reads — under concurrent broad counts those slabs alone were the top live-heap
 // entry), it computes one in-memory existence flag per matched id by scanning the live buffers
 // directly under the lock. Identity is snapshotted only when the caller groups by it (CountBy).
-// Parts are acquired without block readers (edge parts decode timestamps via the plan decode
-// cache). Caller holds e.mu (read lock); release with releaseParts as usual.
+// Parts are acquired without readers; Count adds timestamp-only readers after planning.
+// Caller holds e.mu (read lock); release with releaseParts as usual.
 func (e *Engine) planExistence(ids []signal.SeriesID, r fetch.Request, withIdentity bool) *enginePlan {
 	p := &enginePlan{
 		ids:       ids,

@@ -8,17 +8,8 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// Count returns the number of series matching r.Matchers that have at least one sample in
-// [r.Start, r.End]. It is the count-pushdown read path for PromQL `count(<selector>)`: it
-// resolves the matched series and checks each for an in-window sample without materializing
-// samples (no result batches, no value copies) or labels (no projection) — so a query that
-// needs only a cardinality pays none of the per-series decode-to-result cost a full Fetch
-// incurs.
-//
-// Correctness mirrors [Engine.Fetch]: parts are decoded once (shared, pooled) and a series'
-// in-window existence is found by binary search over its sorted timestamp run; head, recent,
-// and mid-flush windows are scanned in memory. A series counts if any source holds an
-// in-window sample. Series with no sample in the window are omitted.
+// Count returns the number of matching series with a sample in the inclusive request window.
+// It reads timestamp blocks at window edges, without materializing result samples or labels.
 func (e *Engine) Count(ctx context.Context, r fetch.Request) (int, error) {
 	ids, plan, err := e.planCount(ctx, r, false)
 	if err != nil {
@@ -97,6 +88,7 @@ func (e *Engine) CountBy(ctx context.Context, r fetch.Request, label []byte) (ma
 // releaseParts, unless it returned an error (the plan is released here).
 func (e *Engine) planCount(ctx context.Context, r fetch.Request, withIdentity bool) ([]signal.SeriesID, *enginePlan, error) {
 	ids, plan := e.planLookup(r, withIdentity)
+	plan.prepareCountReaders()
 
 	// Count decodes timestamps only (existence), and only for window-edge parts; reserve that.
 	if err := plan.acquireDecodeBudget(ctx, r, colNeed{}); err != nil {
@@ -226,6 +218,18 @@ func (p *enginePlan) markEdgePart(ctx context.Context, e *Engine, part *part, id
 		return nil
 	}
 
+	if reader := p.blockReaders[part]; reader != nil {
+		for _, m := range matched {
+			found, err := reader.hasTimestamp(ctx, m.rng, p.start, p.end)
+			if err != nil {
+				return err
+			}
+			active[m.i] = found
+			reader.releaseSeriesPins()
+		}
+		return nil
+	}
+
 	ranges := make([]rowRange, len(matched))
 	for k := range matched {
 		ranges[k] = matched[k].rng
@@ -235,6 +239,8 @@ func (p *enginePlan) markEdgePart(ctx context.Context, e *Engine, part *part, id
 	if err != nil {
 		return err
 	}
+
+	defer e.recycleDecoded(dp)
 
 	for _, m := range matched {
 		// dp.ts[rng.start:rng.end] is sorted ascending; lowerBound finds the first index ≥ start.
