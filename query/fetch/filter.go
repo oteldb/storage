@@ -12,16 +12,14 @@ import (
 // this is the one implementation of it — a consumer of any superset-returning Fetcher needs it, so
 // it lives on the seam rather than in each of them.
 
-// MatchesSeries reports whether s satisfies every matcher, each over the present value of its named
-// label as [SeriesLabel] resolves it.
-//
-// The semantics are positive: a series that does not carry a matcher's label fails it, the same way
-// the engine's postings resolution selects. Absent-label and negated handling stays in the language
-// layer, which resolves them against the full label set rather than one series' identity.
+// MatchesSeries applies every matcher to its label value, or [signal.EmptyValue] when absent.
 func MatchesSeries(s signal.Series, matchers []Matcher) bool {
 	for i := range matchers {
 		v, ok := SeriesLabel(s, matchers[i].Name)
-		if !ok || !matchers[i].Match(v) {
+		if !ok {
+			v = signal.EmptyValue()
+		}
+		if !matchers[i].Match(v) {
 			return false
 		}
 	}

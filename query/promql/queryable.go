@@ -6,10 +6,8 @@
 // this package is the only one importing github.com/prometheus/prometheus, and importing it
 // is opt-in.
 //
-// Condition extraction lives here (the language layer), never in storage: a Prometheus
-// matcher that can match the empty string (e.g. `!=`, `!~`, `=""`) would wrongly exclude
-// series that lack the label if pushed into the postings index, so only index-safe matchers
-// are pushed down; every returned series is then re-checked against the full matcher set.
+// Condition extraction lives here: matchers use canonical text, with absent labels matched as
+// empty strings. Internal labels hidden by projection are checked in this adapter alone.
 package promql
 
 import (
@@ -29,10 +27,6 @@ import (
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
 )
-
-// errCountNotSupported signals a Fetcher that does not implement [fetch.Counter]; the PromQL
-// count() pushdown falls back to Select on this error.
-var errCountNotSupported = errors.New("promql: count pushdown not supported by fetcher")
 
 // msToNs and nsToMs convert between Prometheus' millisecond timeline and the storage
 // nanosecond timeline.
@@ -152,7 +146,7 @@ type querier struct {
 	hashBuf []byte
 }
 
-// Select resolves the matchers to series over [mint, maxt]. Index-safe matchers are pushed
+// Select resolves the matchers to series over [mint, maxt]. Visible-label matchers are pushed
 // into the fetch request; every fetched series is then re-checked against all matchers
 // (with absent labels treated as the empty string) for exact Prometheus semantics.
 //
@@ -221,19 +215,9 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, _ *storage.Select
 	return newSliceSeriesSet(series, warnings)
 }
 
-// CountSeries returns the number of series matching matchers with at least one sample in
-// [startMs, endMs] (Prometheus milliseconds), without materializing samples or labels. It is the
-// count-pushdown hook for the PromQL `count(<selector>)` fast path: the promql-engine's Scanners
-// detects it via interface assertion and routes an instant `count(<selector>)` here instead of
-// building a full SeriesSet. If the backing fetcher does not implement [fetch.Counter], the call
-// errors and the engine falls back to Select.
-//
-// [PushableMatchers] drops any matcher that matches the empty string (e.g. `!=`, `!~`, `=""`)
-// because the postings index cannot apply it without wrongly dropping series that lack the label.
-// The fast [fetch.Counter] path counts over that index-safe subset only, so it would over-count for
-// such selectors. When the matcher set is not fully pushable we fall back to a Fetch-based count
-// that re-checks every resolved series against the full matcher set (mirroring [querier.Select]),
-// preserving exact Prometheus semantics at the cost of label materialization.
+// CountSeries counts matching series with a sample in the exact [startMs, endMs] window.
+// It uses [fetch.Counter], falling back to Fetch when the capability is absent or a matcher
+// refers to an internal label hidden by Prometheus projection.
 func (q *querier) CountSeries(ctx context.Context, startMs, endMs int64, matchers ...*labels.Matcher) (uint64, error) {
 	pushed := PushableMatchers(matchers)
 	if len(pushed) < len(matchers) {
@@ -242,7 +226,7 @@ func (q *querier) CountSeries(ctx context.Context, startMs, endMs int64, matcher
 
 	counter := fetch.CounterOf(q.fetcher)
 	if counter == nil {
-		return 0, errCountNotSupported
+		return q.countSeriesRecheck(ctx, startMs, endMs, matchers, pushed)
 	}
 
 	req := fetch.Request{
@@ -268,9 +252,7 @@ func (q *querier) CountSeries(ctx context.Context, startMs, endMs int64, matcher
 // `count(count by (label)(...))` (the map's length = distinct label values). Series without the
 // label are grouped under "" (PromQL's absent-label group).
 //
-// Matcher pushability follows [querier.CountSeries]: a selector whose matchers are not all
-// index-safe falls back to a Fetch-based grouping that re-checks every resolved series against the
-// full matcher set, preserving exact Prometheus semantics.
+// Matcher pushability and the exact Fetch fallback follow [querier.CountSeries].
 func (q *querier) CountSeriesBy(
 	ctx context.Context, startMs, endMs int64, label string, matchers ...*labels.Matcher,
 ) (map[string]uint64, error) {
@@ -427,7 +409,7 @@ func (q *querier) promLabels(s signal.Series) labels.Labels {
 	return promLabelsInto(&q.lb, &q.scratch, s)
 }
 
-// countSeriesRecheck counts matching series by fetching the index-safe subset (pushed) over the
+// countSeriesRecheck counts matching series by fetching the visible-label subset (pushed) over the
 // window and re-checking each resolved series against the full matcher set. A fetch batch is one
 // series with its in-window samples already filtered, so a batch that passes [MatchesAll] is one
 // matching series with at least one sample in the window.
@@ -444,7 +426,7 @@ func (q *querier) countSeriesRecheck(
 }
 
 // countSeriesByRecheck is [querier.countSeriesRecheck] grouped by one label: it fetches the
-// index-safe subset and groups the series that pass the full matcher set by the label's value in
+// visible-label subset and groups the series that pass the full matcher set by the label's value in
 // their Prometheus label set.
 func (q *querier) countSeriesByRecheck(
 	ctx context.Context, startMs, endMs int64, label string,
@@ -464,7 +446,7 @@ func (q *querier) countSeriesByRecheck(
 }
 
 // seriesLabels resolves the matching series over the querier window and projects each to its
-// Prometheus label set. It mirrors Select's matching (push the index-safe matchers, then re-check
+// Prometheus label set. It mirrors Select's matching (push the visible-label matchers, then re-check
 // every series against the full set) but keeps only the identities, not the samples.
 //
 // It prefers the fetcher's [fetch.SeriesLister] capability, which answers from the series index
@@ -513,7 +495,7 @@ func (q *querier) labelRequest(startMs, endMs int64, pushed []fetch.Matcher) fet
 	}
 }
 
-// fetchedLabels resolves the series matching pushed (the index-safe subset) that have at least one
+// fetchedLabels resolves the series matching pushed (the visible-label subset) that have at least one
 // sample in [startMs, endMs] — exactly, by fetching them — re-checks each against the full matcher
 // set, and returns the label sets that pass, memoized through the querier's [LabelCache]. The count
 // rechecks answer a query, not metadata, so they pay the fetch for that exactness.
@@ -569,23 +551,17 @@ func sortedKeys(set map[string]struct{}) []string {
 	return out
 }
 
-// PushableMatchers returns fetch matchers for the index-safe subset: matchers that do not
-// match the empty string. A matcher that matches "" (negated/absent) cannot prune via the
-// postings index without wrongly dropping series that lack the label, so it is enforced only
-// by the post-fetch re-check in [MatchesAll].
-//
-// It is exported so an embedder building a pushdown path over the fetch/aggregate seam (e.g.
-// oteldb's *_over_time aggregate pushdown) can lower the same index-safe matcher set the
-// [Queryable] uses, keeping matcher translation in one place.
+// PushableMatchers lowers visible-label matchers, including absent and negated predicates.
+// Hidden internal labels remain subject to [MatchesAll] after projection.
 func PushableMatchers(ms []*labels.Matcher) []fetch.Matcher {
 	out := make([]fetch.Matcher, 0, len(ms))
 	for _, m := range ms {
-		if m.Matches("") {
+		if _, hidden := hiddenLabels[m.Name]; hidden {
 			continue
 		}
 
 		fm := fetch.Matcher{Name: []byte(m.Name), Match: valuePredicate(m)}
-		if m.Type == labels.MatchEqual {
+		if m.Type == labels.MatchEqual && !m.Matches("") {
 			// Equality is serializable and exact: let the cluster fan-out push it to peers.
 			fm.Spec = &fetch.EqualMatcher{Name: m.Name, Value: m.Value}
 		}

@@ -66,8 +66,8 @@ func TestMatchesSeries(t *testing.T) {
 	assert.True(t, fetch.MatchesSeries(s, nil))
 	assert.True(t, fetch.MatchesSeries(s, []fetch.Matcher{equals("service.name", "api")}))
 	assert.False(t, fetch.MatchesSeries(s, []fetch.Matcher{equals("service.name", "web")}))
-	// A series that does not carry the label fails, even for a predicate that would accept anything.
-	assert.False(t, fetch.MatchesSeries(s, []fetch.Matcher{{
+	// Missing labels are offered as EmptyValue to the predicate.
+	assert.True(t, fetch.MatchesSeries(s, []fetch.Matcher{{
 		Name: []byte("absent"), Match: func(signal.Value) bool { return true },
 	}}))
 }

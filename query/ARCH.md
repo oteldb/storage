@@ -8,7 +8,8 @@ The library **stops at the fetch contract**. Query languages and planners are th
 Limit, Reverse, Recycle, Scope}` carries two **operator-free** predicate families:
 
 - **Matchers** — `Matcher{Name, Match func(signal.Value) bool}` resolve **identity** over postings
-  (a metric series, a log stream).
+  (a metric series, a log stream). Absent labels are passed to the callback as
+  `signal.EmptyValue`; local postings and requester-side RPC rechecks apply the same rule.
 - **Conditions** — `Condition{Column, Match, Tokens, Equal, AnyEqual}` filter the **per-record
   columns** within that identity. `Tokens`/`Equal`/`AnyEqual` are pruning hints checked against a
   part's blooms, never a replacement for `Match`. `AnyEqual` is a disjunction *inside* one condition
@@ -39,8 +40,8 @@ Optional capabilities, discovered by walking the `Unwraper` decorator chain:
   fetch-based answer decodes every sample of every matching series, so an unmatched selector cost
   (cardinality × window). The price is a **part-granular** window (a series in an overlapping part is
   listed even with no sample inside), which is what Prometheus' block-granular label endpoints
-  return; anything needing the exact "has a sample in the window" test (the count rechecks) keeps
-  fetching. Unlike counting, enumeration **composes across a fan-out** — identities are
+  return; exact existence checks use `Counter` or fetch samples. Enumeration **composes across a
+  fan-out** — identities are
   content-addressed, so `Merge` unions and dedups them (a child without the capability contributes
   the identities of a plain fetch), and the cluster read seam re-exposes its shard gather.
 - **`LabelLister`** — the label-metadata twin, answered from the **inverted index** rather than from
@@ -98,10 +99,13 @@ The library implements **no** query language. This package bridges the fetch sea
 `storage.Queryable` for embedders using the Prometheus engine; it contains **no engine** and is the
 **only package importing prometheus** (importing it is opt-in).
 
-- **Matcher lowering — condition extraction lives here, never in storage.** Only **index-safe**
-  matchers (those that do not match the empty string) are pushed down; a negated/absent matcher
-  would wrongly drop series lacking the label via postings, so every fetched series is
-  **re-checked against the full matcher set** (absent label = empty string).
+- **Matcher lowering — condition extraction lives here, never in storage.** Visible-label
+  predicates include negation and empty-string matches: absence projects to the empty string,
+  and postings unions the missing-label series when the callback accepts it. Hidden internal
+  labels stay in the adapter for checking after projection. Nonempty equality alone receives a
+  serializable hint; an empty equality stays opaque so a peer cannot prune absent series.
+  `Counter`/`GroupCounter` and local `LabelLister` receive these same predicates without a sample
+  fetch. Every fetched identity is still re-checked against the full Prometheus matcher set.
 - **Label projection.** `signal.Series` → `labels.Labels`: attributes flatten, scope name/version
   under `otel.scope.*`, internal reserved labels hidden, `__name__` kept. It is a pure function of
   the content-addressed id, so a `Queryable` memoizes it per id.
