@@ -141,7 +141,7 @@ func (c *recordCols) noteTS(ts int64) {
 }
 
 // distinctAttrKeys returns the buffer's sorted distinct record-attribute keys, decoding the records
-// only when the cache is stale. Keys uses this to avoid re-decoding every head record per call.
+// only when the cache is stale. Caller holds the engine write lock.
 func (c *recordCols) distinctAttrKeys() [][]byte {
 	if c.keyCacheValid {
 		return c.keyCache
