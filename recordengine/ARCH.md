@@ -30,11 +30,26 @@ values. Both select scored runs by stored column bytes inside the same 1h → 6h
 At most 16 inputs join any merge, including retention, compression rewrites and straddler splits.
 The count bound limits read windows, dictionaries and metadata independently of compression ratio.
 
-Runs score by total stored bytes / largest input, with a minimum multiplier of 1.7 and a spread
-guard. Rewrites totaling at most 128 KiB bypass those guards. Three consecutive selections with no
+Record runs minimize stored bytes per expected part removed; an untried run assumes one output.
+The total / largest input multiplier must reach 1.7, with a spread guard.
+Rewrites totaling at most 128 KiB bypass those guards. Three consecutive selections with no
 work arm an idle waiver; `Force` applies it immediately. A deferral does not reset the waiver.
 This absorbs geometric leftovers that no future flush can place in the same size tier. Size tiers
 remain diagnostic only, with a 128 KiB floor in stored bytes rather than the decoded-size ladder.
+
+Resident limits can split a merge into as many outputs as inputs, invalidating the one-output
+assumption. Before publication, ordinary compaction rejects such output and deletes its objects.
+Retention that removes rows, day-boundary normalization, compression-profile upgrades and sizing
+metadata upgrades remain useful even without part reduction. A per-engine, process-local cache
+remembers the exact failed input handles and output count under the effective memory and writer
+profile. Selection skips those runs, including under `Force`, and continues to other groups and
+rewrite classes. Changed inputs or memory/profile settings allow another trial; a larger disk cap
+does so only when the failed write actually sealed at that cap. Mutations prune retired handles;
+inspection never prunes from its potentially stale snapshot. No on-disk metadata changes.
+
+A rejected trial returns `MergeStep == false`. `MergeShape.NonReducingMerges` and
+`storage.merge.non_reducing` count it. Catch-up treats newly learned feedback as planning progress
+and tries remaining candidates without pruning identities or notifying peers of a durable change.
 
 The shared `timebucket.CanCompact` predicate defers promotion of fine parts in a still-filling
 larger bucket, but admits parts already too wide for the preceding level. Late records can make a
@@ -98,7 +113,8 @@ the retained encoded output and its serialization copy as resident state.
 never reads free space. `Bytes` sums stored columns. `Candidates` and `ForceCandidates` use the real
 selector, including retention drops and compression fallback. `BestMultiplier`, `IdleRounds` and
 `WaiveAfter` expose scoring; the legacy tier counters remain descriptive rather than eligibility
-conditions. Both candidate counts zero with unsealed parts means the time ladder is resting.
+conditions. Both candidate counts zero with unsealed parts means the ladder is resting or the
+remaining runs have demonstrated no reduction under the current resource profile.
 
 `PartStat.SizeBytes` remains the manifest's decoded footprint for compatibility; `DiskBytes` exposes
 the selection size separately. Query admission and compression ratios use decoded bytes, with a
@@ -106,6 +122,14 @@ the selection size separately. Query admission and compression ratios use decode
 its actual row count, keeping the prospective scan bound consistent with the opened decoder.
 
 ### Compaction measurement
+
+`BenchmarkResidentLimitedMergeRetries` makes 12 forced turns over three wide-dictionary flushes
+at a 32 MiB resident target and 1 GiB disk cap. Six single-CPU, one-iteration samples on Linux/amd64,
+Ryzen 5950X, leave 2–3 parts instead of 43, take 1.065 rather than 1.665 s (-36%, p=0.002), and
+allocate 846 rather than 1485 MiB (-43%). Row digests and counts are unchanged. The ordinary disk
+budget benchmark has no significant timing change. Selecting an untried 1024-part group takes
+264 rather than 220 us (+20%, p=0.002), with unchanged allocations; the extra scoring is metadata
+work outside the engine lock. Feedback lookups are skipped when there are no observations.
 
 `BenchmarkMergeDiskBudget` drains 24 synthetic flushes of 2,048 rows, each body 4 KiB drawn from two
 values, in one stream and hour. Fixture ingestion and final close are excluded; the memory backend,

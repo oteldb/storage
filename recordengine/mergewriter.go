@@ -68,7 +68,8 @@ type recordPartStreamWriter struct {
 
 	// buffered is set over a backend that takes an object whole: every frame a column hands over
 	// stays in RAM until the part commits.
-	buffered bool
+	buffered   bool
+	diskSealed bool
 
 	// refs is the distinct side-store reference cells written, which bound the part's sidecars:
 	// refCol is their byte column (-1 without a side store) and refBytes their resident size.
@@ -382,6 +383,7 @@ type sealedPart struct {
 	prefix     string
 	minT, maxT int64
 	rows       int
+	diskSealed bool
 }
 
 // sealedPartBytes is what a merge keeps per [sealedPart]: the struct and its prefix string.
@@ -446,7 +448,7 @@ func (w *recordPartStreamWriter) finish(ctx context.Context) (sealedPart, error)
 		return sealedPart{}, errors.Wrapf(err, "sync part %q", prefix)
 	}
 
-	return sealedPart{prefix: prefix, minT: w.minT, maxT: w.maxT, rows: w.rows}, nil
+	return sealedPart{prefix: prefix, minT: w.minT, maxT: w.maxT, rows: w.rows, diskSealed: w.diskSealed}, nil
 }
 
 // identityEntries resolves the part's streams under one read lock.

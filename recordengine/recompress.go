@@ -6,14 +6,27 @@ import (
 )
 
 func (e *Engine) selectMergeParts(src []*part, retainFrom, capBytes int64, force bool) []*part {
+	return e.selectMergePartsProfile(src, retainFrom, capBytes, force, e.mergeProfile())
+}
+
+func (e *Engine) selectMergePartsProfile(src []*part, retainFrom, capBytes int64, force bool, profile mergeProfile) []*part {
 	idle := int(e.idleMerges.Load())
 	if force {
 		idle = mergeIdleRounds
 	}
-	if selected := selectMergePartsIdle(src, retainFrom, capBytes, idle); len(selected) > 0 {
+	if selected := selectForced(src, retainFrom, capBytes); len(selected) > 0 {
 		return selected
 	}
-
+	var expected func([]*part) int
+	if !e.mergeFeedback.empty() {
+		expected = func(run []*part) int { return e.mergeFeedback.expected(run, profile, capBytes) }
+	}
+	if selected := selectLadderGroupExpected(src, capBytes, idle, expected); len(selected) > 0 {
+		return selected
+	}
+	if selected := selectStraddlers(src, capBytes); len(selected) > 0 {
+		return selected
+	}
 	return timebucket.Forced(src, partSpan, (*part).sizeBytes, e.compressionForces,
 		func(p *part) bool { return sealed(p, capBytes) }, capBytes, maxTierParts)
 }

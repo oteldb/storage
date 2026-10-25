@@ -161,7 +161,9 @@ type Engine struct {
 	// to compact it. The facade reads it to order such an engine first next cycle — task order is by
 	// head bytes, which the highest-ingest engines keep winning, so without this a quiet tenant
 	// could be declined every cycle while its part count grew.
-	mergeDeferred atomic.Bool
+	mergeDeferred     atomic.Bool
+	mergeFeedback     mergeFeedback
+	nonReducingMerges atomic.Uint64
 	// mergeReadWindow is how much of each source column a merge reads ahead per request
 	// ([block.PartReader.ColumnScan]).
 	mergeReadWindow int64
@@ -886,6 +888,7 @@ func (e *Engine) Flush(ctx context.Context) error {
 func (e *Engine) Reset(ctx context.Context) error {
 	e.flushMu.Lock() // drain an in-flight flush/merge; it would otherwise publish into the empty engine
 	defer e.flushMu.Unlock()
+	e.mergeFeedback.prune(nil)
 
 	e.mu.Lock()
 	e.head = newHead(e.cfg.Schema)

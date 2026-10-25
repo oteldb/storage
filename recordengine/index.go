@@ -751,6 +751,7 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 	}
 
 	e.adoptLoadLocked(l)
+	e.mergeFeedback.prune(e.parts)
 
 	if sweep {
 		if err := e.sweepOrphansLocked(ctx); err != nil {

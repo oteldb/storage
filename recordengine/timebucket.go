@@ -81,6 +81,10 @@ func selectLadderGroup(src []*part, capBytes int64, force bool) []*part {
 }
 
 func selectLadderGroupIdle(src []*part, capBytes int64, idle int) []*part {
+	return selectLadderGroupExpected(src, capBytes, idle, nil)
+}
+
+func selectLadderGroupExpected(src []*part, capBytes int64, idle int, expected func([]*part) int) []*part {
 	for _, level := range mergeLadder {
 		_, groups := partitionGroups(src, level)
 
@@ -90,7 +94,7 @@ func selectLadderGroupIdle(src []*part, capBytes int64, idle int) []*part {
 				continue
 			}
 
-			if picked := pickMergeRun(group, capBytes, idle); len(picked) > 0 {
+			if picked := pickMergeRunExpected(group, capBytes, idle, expected); len(picked) > 0 {
 				return picked
 			}
 		}

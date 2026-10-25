@@ -270,9 +270,12 @@ func TestFailedCommitDeletesDisorderRetryOutputs(t *testing.T) {
 	}
 
 	bad := writeTestPart(t, e, be, f)
+	bad.minTime, bad.maxTime = -3, streamedDay*days
 	require.True(t, forwardReadable(bad.ranges))
 
-	e.parts = []*part{bad, writeTestPart(t, e, be, streamColumns(t, e, map[string][]int64{sorted: {5}}))}
+	small := writeTestPart(t, e, be, streamColumns(t, e, map[string][]int64{sorted: {5}}))
+	small.minTime, small.maxTime = 5, 5
+	e.parts = []*part{bad, small}
 
 	lose := func(op faultbackend.Op) bool { return op.Key == e.indexKey() }
 	be.Add(faultbackend.Rule{Kind: faultbackend.CompareAndSwap, Lose: true, Match: lose})

@@ -150,7 +150,8 @@ func (s *Storage) catchupRecords(
 		RetainFrom: s.retainFrom(tid, sig, s.sizeCutoffFor(ctx, tenantOfShard(tid)).at(sig)),
 		Background: true,
 	}
-	if eng.MergeShapeWith(opts).Candidates == 0 {
+	before := eng.MergeShapeWith(opts)
+	if before.Candidates == 0 {
 		return mergeTurn{}
 	}
 	changed, err := eng.MergeStep(ctx, opts)
@@ -161,7 +162,9 @@ func (s *Storage) catchupRecords(
 		return mergeTurn{more: true, deferred: true, progress: changed}
 	}
 	if !changed {
-		return mergeTurn{}
+		after := eng.MergeShapeWith(opts)
+		learned := after.NonReducingMerges != before.NonReducingMerges
+		return mergeTurn{more: learned && after.Candidates > 0, progress: learned}
 	}
 	if _, err := eng.PruneIdentities(ctx); err != nil {
 		return mergeTurn{}

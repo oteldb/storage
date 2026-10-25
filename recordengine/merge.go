@@ -153,7 +153,9 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 		return mergeResult{}, err
 	}
 
-	selected := e.selectMergeParts(src, retainFrom, capBytes, opts.Force)
+	profile := e.mergeProfile()
+	e.mergeFeedback.prune(src)
+	selected := e.selectMergePartsProfile(src, retainFrom, capBytes, opts.Force, profile)
 	if len(selected) == 0 {
 		if dropped == 0 {
 			e.idleMerges.Add(1)
@@ -212,6 +214,19 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 		return mergeResult{parts: dropped}, err
 	}
 
+	if !e.usefulMerge(selected, newParts) {
+		e.mu.RLock()
+		e.mergeFeedback.record(selected, profile, capBytes, newParts)
+		e.mergeFeedback.prune(e.parts)
+		e.mu.RUnlock()
+		e.nonReducingMerges.Add(1)
+		e.cfg.Obs.Merge.NonReducing(ctx, e.cfg.Signal)
+		zctx.From(ctx).Debug("merge rejected without part reduction or required transformation",
+			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
+			zap.Int("parts_in", len(selected)), zap.Int("parts_out", len(newParts)))
+		*abandoned = append(*abandoned, newParts...)
+		return mergeResult{parts: dropped}, nil
+	}
 	e.idleMerges.Store(0)
 
 	planMergeBlocks(selected, newParts)
@@ -245,6 +260,7 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 	}
 
 	e.retireLocked(selected)
+	e.mergeFeedback.prune(e.parts)
 	// Rows that did not survive the merge are retention's work: the records are gone, so the
 	// identities naming them may be dead too. Merging without dropping rows leaves every identity
 	// backed, so it arms nothing.
@@ -538,7 +554,8 @@ func (e *Engine) compactStreamed(
 					return false, err
 				}
 
-				return partBytes > 0 && w.w.EncodedBytes() >= partBytes, nil
+				w.diskSealed = partBytes > 0 && w.w.EncodedBytes() >= partBytes
+				return w.diskSealed, nil
 			})
 			if err != nil {
 				return written(), err
@@ -609,6 +626,7 @@ func (e *Engine) openSealed(ctx context.Context, sealed []sealedPart, grant *mer
 		}
 
 		p.minTime, p.maxTime = s.minT, s.maxT
+		p.mergeDiskSealed = s.diskSealed
 		held += p.residentBytes()
 		out = append(out, p)
 	}

@@ -90,13 +90,14 @@ func (f *Flush) Record(ctx context.Context, sig string, dur time.Duration, rows,
 
 // Merge instruments a background merge (compaction/retention/downsample/recompress).
 type Merge struct {
-	total    metric.Int64Counter
-	duration metric.Float64Histogram
-	parts    metric.Int64Histogram
-	bytesIn  metric.Int64Counter
-	bytesOut metric.Int64Counter
-	deferred metric.Int64Counter
-	over     metric.Int64Counter
+	total       metric.Int64Counter
+	duration    metric.Float64Histogram
+	parts       metric.Int64Histogram
+	bytesIn     metric.Int64Counter
+	bytesOut    metric.Int64Counter
+	deferred    metric.Int64Counter
+	over        metric.Int64Counter
+	nonReducing metric.Int64Counter
 }
 
 // Record accounts one merge that compacted partsIn source parts of bytesIn bytes into bytesOut
@@ -127,6 +128,9 @@ func (m *Merge) Record(ctx context.Context, sig string, dur time.Duration, parts
 func (m *Merge) Deferred(ctx context.Context, sig string) {
 	m.deferred.Add(ctx, 1, sigAttr(sig))
 }
+
+// NonReducing accounts an ordinary merge whose output did not reduce parts or apply a required transformation.
+func (m *Merge) NonReducing(ctx context.Context, sig string) { m.nonReducing.Add(ctx, 1, sigAttr(sig)) }
 
 // OverBudget accounts bytes a merge needed beyond the whole process merge budget: it ran alone, with
 // the whole budget reserved, and held that much more.
@@ -521,6 +525,7 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 		bytesOut: b.counter("storage.merge.bytes_out", "part bytes written by merges", "By"),
 		deferred: b.counter("storage.merge.deferred",
 			"merges that selected parts but could not claim the process merge memory budget", "{merge}"),
+		nonReducing: b.counter("storage.merge.non_reducing", "ordinary merges discarded without useful output reduction", "{merge}"),
 		over: b.counter("storage.merge.over_budget_bytes",
 			"bytes merges needed beyond the whole process merge memory budget", "By"),
 	}
