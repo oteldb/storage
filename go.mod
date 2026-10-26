@@ -13,7 +13,7 @@ require (
 	github.com/go-faster/sdk v0.39.1
 	github.com/klauspost/compress v1.20.1
 	github.com/klauspost/reedsolomon v1.14.2
-	github.com/maypok86/otter/v2 v2.3.0
+	github.com/maypok86/otter/v2 v2.4.0
 	github.com/mmcloughlin/avo v0.6.0
 	github.com/pierrec/lz4/v4 v4.1.33
 	github.com/prometheus/prometheus v0.312.0
