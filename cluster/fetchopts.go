@@ -11,8 +11,9 @@ import (
 func remoteFetchRequest(r fetch.Request) FetchRequest {
 	out := FetchRequest{
 		Signal: r.Signal, Tenant: string(r.Tenant), Start: r.Start, End: r.End,
-		Equal:      fetch.EqualitySpecs(r.Matchers),
-		Conditions: ConditionHints(r.Conditions, r.AllConditions),
+		Equal:          fetch.EqualitySpecs(r.Matchers),
+		StringMatchers: fetch.StringSpecs(r.Matchers),
+		Conditions:     ConditionHints(r.Conditions, r.AllConditions),
 	}
 	// A residual condition may read a schema-defined attributes column; SecondPass can read
 	// arbitrary columns. Without dependency metadata their input must remain fully materialized.
@@ -41,30 +42,30 @@ func (r FetchRequest) appendOptions(dst []byte) []byte {
 	return append(dst, 0)
 }
 
-func takeFetchOptions(data []byte, r *FetchRequest) error {
+func takeFetchOptions(data []byte, r *FetchRequest) ([]byte, error) {
 	if len(data) == 0 {
-		return nil
+		return nil, nil
 	}
 	n, m := binary.Uvarint(data)
 	if m <= 0 || n > uint64(len(data)-m) {
-		return errors.New("cluster: malformed projection count")
+		return nil, errors.New("cluster: malformed projection count")
 	}
 	data = data[m:]
 	columns := data
 	for range n {
 		length, size := binary.Uvarint(data)
 		if size <= 0 || length > uint64(len(data)-size) {
-			return errors.New("cluster: malformed projection column")
+			return nil, errors.New("cluster: malformed projection column")
 		}
 		data = data[size+int(length):]
 	}
 	limit, m := binary.Uvarint(data)
 	if m <= 0 || limit > uint64(int(^uint(0)>>1)) {
-		return errors.New("cluster: malformed fetch limit")
+		return nil, errors.New("cluster: malformed fetch limit")
 	}
 	data = data[m:]
 	if len(data) == 0 || data[0] > 1 {
-		return errors.New("cluster: malformed fetch direction")
+		return nil, errors.New("cluster: malformed fetch direction")
 	}
 	// Validate the complete extension before allocating its projection metadata.
 	if n > 0 {
@@ -77,5 +78,5 @@ func takeFetchOptions(data []byte, r *FetchRequest) error {
 	}
 	r.Limit, r.Reverse = int(limit), limit > 0 && data[0] == 1
 
-	return nil
+	return data[1:], nil
 }

@@ -187,7 +187,7 @@ func DecodeSideTables(data []byte) (map[string][]byte, error) {
 	return out, nil
 }
 
-// SeriesHandler serves [SeriesPath]: it reconstructs the pushed-down equality matchers and lists the
+// SeriesHandler serves [SeriesPath]: it reconstructs the pushed-down identity hints and lists the
 // matching stream identities via fn, dispatched to the right engine by the request's signal.
 func SeriesHandler(fn SeriesFunc, opts ...Option) http.Handler {
 	o := resolveOpts(opts)
@@ -305,30 +305,26 @@ func decodeEnumRequest(req *http.Request) (enumReq, error) {
 		return enumReq{}, err
 	}
 
-	sig, tenant, start, end, eq, err := DecodeFetchRequest(body)
+	r, err := ParseFetchRequest(body)
 	if err != nil {
 		return enumReq{}, err
 	}
-
-	matchers := make([]fetch.Matcher, len(eq))
-	for i := range eq {
-		matchers[i] = fetch.Matcher{Name: []byte(eq[i].Name), Match: eq[i].Predicate(), Spec: &eq[i]}
-	}
-
-	return enumReq{sig: sig, tenant: tenant, start: start, end: end, matchers: matchers}, nil
+	return enumReq{sig: r.Signal, tenant: r.Tenant, start: r.Start, end: r.End, matchers: r.Request().Matchers}, nil
 }
 
 // FetchSeries lists a peer's stream identities for the signal+tenant+window, pushing down the
-// serializable (equality) matchers; the caller re-applies any non-equality matchers. Without
+// serializable equality and optional string-set hints; the caller re-applies all matchers. Without
 // [WithTracerProvider] its spans report through a no-op tracer.
 func FetchSeries(
 	ctx context.Context, client *http.Client, addr string, sig signal.Signal,
 	tenant string, start, end int64, eq []fetch.EqualMatcher, opts ...Option,
 ) (_ []signal.Series, err error) {
-	ctx, span := enumClientSpan(ctx, resolveOpts(opts), "cluster.series", addr, sig)
+	settings := resolveRPCOptions(opts)
+	ctx, span := enumClientSpan(ctx, settings.obs, "cluster.series", addr, sig)
 	defer func() { endSpan(span, err) }()
 
-	body, err := postEnum(ctx, client, addr, SeriesPath, EncodeFetchRequest(sig, tenant, start, end, eq))
+	payload := FetchRequest{Signal: sig, Tenant: tenant, Start: start, End: end, Equal: eq, StringMatchers: settings.stringMatchers}.Encode()
+	body, err := postEnum(ctx, client, addr, SeriesPath, payload)
 	if err != nil {
 		return nil, err
 	}

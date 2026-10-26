@@ -35,8 +35,9 @@ type peer struct {
 	// with the unfiltered window here (a superset the router must narrow), whatever it was asked.
 	records []*fetch.Batch
 
-	mu        sync.Mutex
-	lastFetch fetch.Request
+	mu         sync.Mutex
+	lastFetch  fetch.Request
+	lastSeries []fetch.Matcher
 
 	// absent makes every endpoint disclaim the shard, the way an owner that holds no data for it
 	// answers.
@@ -70,7 +71,10 @@ func (p *peer) serve(t *testing.T) string {
 		return p.records, nil
 	}))
 	mux.Handle(cluster.SeriesPath, cluster.SeriesHandler(
-		func(context.Context, signal.Signal, string, int64, int64, []fetch.Matcher) ([]signal.Series, error) {
+		func(_ context.Context, _ signal.Signal, _ string, _, _ int64, matchers []fetch.Matcher) ([]signal.Series, error) {
+			p.mu.Lock()
+			p.lastSeries = matchers
+			p.mu.Unlock()
 			if p.absent {
 				return nil, cluster.ErrShardAbsent
 			}
@@ -344,4 +348,18 @@ func TestFetcherAppliesConditions(t *testing.T) {
 	assert.Equal(t, want, p.lastFetch.Conditions[0].Equal.Value)
 	assert.Equal(t, "trace_id", p.lastFetch.Conditions[0].Column)
 	assert.Empty(t, p.lastFetch.Matchers, "a column equality is not pushed as a series-identity matcher")
+}
+
+func TestSeriesForwardsStringHints(t *testing.T) {
+	t.Parallel()
+	p := &peer{series: []signal.Series{svcSeries("api"), svcSeries("web")}}
+	r := openRouter(t, p)
+	m := regexMatcher("service.name", "^(api|web)$")
+	m.StringValues = fetch.AnyEqualStrings([]string{"api", "web"})
+	got, err := r.Series(t.Context(), signal.Log, "acme", []fetch.Matcher{m}, 0, 10)
+	require.NoError(t, err)
+	assert.Len(t, got, 2)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	assert.Equal(t, fetch.StringSpecs([]fetch.Matcher{m}), fetch.StringSpecs(p.lastSeries))
 }

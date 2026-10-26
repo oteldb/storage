@@ -25,6 +25,8 @@ type FetchRequest struct {
 	// Equal are the series-identity equality matchers ([fetch.Matcher.Spec]): a peer resolves
 	// postings with them, so they select *streams*.
 	Equal []fetch.EqualMatcher
+	// StringMatchers prune string labels while retaining non-string values for requester rechecks.
+	StringMatchers []fetch.StringSetMatcher
 	// Conditions are the columnar equality hints ([fetch.Condition.Equal]): a peer prunes parts by
 	// bloom and filters rows with them, so they select *records within* a stream. They are a
 	// separate field because feeding a column equality into Equal would resolve it against the
@@ -116,7 +118,7 @@ func (r FetchRequest) Encode() []byte {
 		buf = appendString(buf, m.Value)
 	}
 
-	options := len(r.Projection) > 0 || r.Limit > 0
+	options := len(r.Projection) > 0 || r.Limit > 0 || len(r.StringMatchers) > 0
 	if len(r.Conditions) == 0 && !options {
 		return buf
 	}
@@ -133,7 +135,7 @@ func (r FetchRequest) Encode() []byte {
 		buf = r.appendOptions(buf)
 	}
 
-	return buf
+	return appendStringMatchers(buf, r.StringMatchers)
 }
 
 // appendConditionSets writes the [ConditionHint.AnyEqual] sets as a second append-only tail —
@@ -303,7 +305,12 @@ func ParseFetchRequest(data []byte) (FetchRequest, error) {
 	if err != nil {
 		return FetchRequest{}, err
 	}
-	if err := takeFetchOptions(data, &r); err != nil {
+	data, err = takeFetchOptions(data, &r)
+	if err != nil {
+		return FetchRequest{}, err
+	}
+	r.StringMatchers, err = takeStringMatchers(data)
+	if err != nil {
 		return FetchRequest{}, err
 	}
 
@@ -322,6 +329,10 @@ func (r FetchRequest) Request() fetch.Request {
 	for i := range r.Equal {
 		eq := &r.Equal[i]
 		out.Matchers[i] = fetch.Matcher{Name: []byte(eq.Name), Match: eq.Predicate(), Spec: eq}
+	}
+
+	for _, spec := range r.StringMatchers {
+		out.Matchers = append(out.Matchers, spec.Matcher())
 	}
 
 	if len(r.Conditions) > 0 {

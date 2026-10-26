@@ -564,7 +564,7 @@ func PushableMatchers(ms []*labels.Matcher) []fetch.Matcher {
 			continue
 		}
 
-		fm := fetch.Matcher{Name: []byte(m.Name), Match: valuePredicate(m)}
+		fm := fetch.Matcher{Name: []byte(m.Name), Match: valuePredicate(m), StringValues: matcherStrings(m)}
 		if m.Type == labels.MatchEqual && !m.Matches("") {
 			// Equality is serializable and exact: let the cluster fan-out push it to peers.
 			fm.Spec = &fetch.EqualMatcher{Name: m.Name, Value: m.Value}
@@ -579,7 +579,12 @@ func PushableMatchers(ms []*labels.Matcher) []fetch.Matcher {
 // valuePredicate lowers a Prometheus matcher to a fetch predicate over the typed value: the
 // value's canonical text projection is matched by the matcher.
 func valuePredicate(m *labels.Matcher) func(signal.Value) bool {
-	return func(v signal.Value) bool { return m.Matches(string(v.AppendText(nil))) }
+	return func(v signal.Value) bool {
+		if v.Kind() == signal.KindStr {
+			return m.Matches(string(v.Str()))
+		}
+		return m.Matches(string(v.AppendText(nil)))
+	}
 }
 
 // MatchesAll reports whether a series' labels satisfy every matcher, treating an absent
