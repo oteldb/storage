@@ -37,9 +37,15 @@ type Matcher struct {
 	// layer when Match is an exact compare. It lets the cluster fan-out push a selective
 	// matcher (e.g. `__name__="metric"`) to a peer node — the Match closure cannot cross the
 	// wire. It is metadata only: a [Fetcher] always matches via Match; a peer reconstructs an
-	// equivalent closure from Spec. Only equality is carried (it is exact, so a peer's pushdown
-	// never drops a matching series); other predicates fall back to the requester's re-check.
+	// equivalent closure from Spec. Other predicates can carry StringValues as a necessary hint,
+	// with the full predicate left to the requester's recheck.
 	Spec *EqualMatcher
+
+	// StringValues is a necessary finite-set hint for string-valued labels. Every string Match
+	// accepts must belong to this sorted, deduplicated set; nil or empty means no hint. Non-string
+	// values, including absent labels, remain unconstrained and require the original callback.
+	// Unlike Spec this hint is not equivalent to Match and cannot make a remote limit or count exact.
+	StringValues [][]byte
 }
 
 // EqualMatcher is the serializable form of an exact label-equality predicate (see

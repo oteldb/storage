@@ -21,10 +21,11 @@ func (r *Router) Series(
 	matchers []fetch.Matcher, start, end int64,
 ) ([]signal.Series, error) {
 	eq := fetch.EqualitySpecs(matchers)
+	opts := append([]cluster.Option{cluster.WithStringMatchers(fetch.StringSpecs(matchers))}, r.clusterOpts...)
 
 	return hedgeOwners(ctx, r, "cluster.series.hedge", shardKey,
 		func(ctx context.Context, addr string) ([]signal.Series, error) {
-			series, err := cluster.FetchSeries(ctx, r.httpc, addr, sig, string(shardKey), start, end, eq, r.clusterOpts...)
+			series, err := cluster.FetchSeries(ctx, r.httpc, addr, sig, string(shardKey), start, end, eq, opts...)
 			if err != nil {
 				return nil, err
 			}

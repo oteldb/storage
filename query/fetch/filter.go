@@ -131,8 +131,8 @@ func FilterSeries(series []signal.Series, matchers []Matcher) []signal.Series {
 	return kept
 }
 
-// EqualitySpecs extracts the serializable subset of a matcher set — the only part a peer can apply,
-// and so what a fan-out pushes down (see [Matcher.Spec]).
+// EqualitySpecs extracts exact serializable equalities (see [Matcher.Spec]).
+// [StringSpecs] carries the separate, conservative string-value hints.
 func EqualitySpecs(matchers []Matcher) []EqualMatcher {
 	var eq []EqualMatcher
 

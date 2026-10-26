@@ -814,7 +814,8 @@ func (s *Storage) shardAggregate(
 			return s.localAggregate(ctx, string(shardKey), r.Start, r.End, step, r.Matchers)
 		},
 		func(addr string) ([]engine.NamedAgg, error) {
-			return cluster.NewRemoteAggregator(addr, s.cluster.httpc, s.clusterOpts...).
+			opts := append([]cluster.Option{cluster.WithStringMatchers(fetch.StringSpecs(r.Matchers))}, s.clusterOpts...)
+			return cluster.NewRemoteAggregator(addr, s.cluster.httpc, opts...).
 				Aggregate(ctx, string(shardKey), r.Start, r.End, step, eq)
 		})
 }
@@ -830,7 +831,8 @@ func (s *Storage) shardAggregateWindow(
 			return s.localAggregateWindow(ctx, string(shardKey), r.Start, r.End, spec, r.Matchers)
 		},
 		func(addr string) ([]engine.NamedWindowAgg, error) {
-			return cluster.NewRemoteAggregator(addr, s.cluster.httpc, s.clusterOpts...).
+			opts := append([]cluster.Option{cluster.WithStringMatchers(fetch.StringSpecs(r.Matchers))}, s.clusterOpts...)
+			return cluster.NewRemoteAggregator(addr, s.cluster.httpc, opts...).
 				AggregateWindow(ctx, string(shardKey), r.Start, r.End, spec, eq)
 		})
 }
@@ -1211,7 +1213,8 @@ func (s *Storage) shardSeries(
 	}
 
 	return hedgeOwners(ctx, s, rpcOpSeries, remotes, selfDisclaim, func(ctx context.Context, addr string) ([]signal.Series, error) {
-		series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end, eq, s.clusterOpts...)
+		opts := append([]cluster.Option{cluster.WithStringMatchers(fetch.StringSpecs(matchers))}, s.clusterOpts...)
+		series, err := cluster.FetchSeries(ctx, s.cluster.httpc, addr, sig, string(shardKey), start, end, eq, opts...)
 		if err != nil {
 			return nil, err
 		}

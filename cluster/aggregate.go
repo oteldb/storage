@@ -51,25 +51,31 @@ func EncodeAggregateRequest(tenant string, start, end, step int64, eq []fetch.Eq
 //
 //nolint:gocritic // the wire shape is tenant+window+step+matchers+err; a struct would obscure it
 func DecodeAggregateRequest(data []byte) (tenant string, start, end, step int64, eq []fetch.EqualMatcher, err error) {
+	tenant, start, end, step, eq, _, err = decodeAggregateRequest(data)
+	return tenant, start, end, step, eq, err
+}
+
+//nolint:gocritic // the remaining tail extends the existing wire tuple
+func decodeAggregateRequest(data []byte) (tenant string, start, end, step int64, eq []fetch.EqualMatcher, rest []byte, err error) {
 	if tenant, data, err = takeString(data); err != nil {
-		return "", 0, 0, 0, nil, errors.Wrap(err, "tenant")
+		return "", 0, 0, 0, nil, nil, errors.Wrap(err, "tenant")
 	}
 
 	if start, data, err = takeVarint(data, "start"); err != nil {
-		return "", 0, 0, 0, nil, err
+		return "", 0, 0, 0, nil, nil, err
 	}
 
 	if end, data, err = takeVarint(data, "end"); err != nil {
-		return "", 0, 0, 0, nil, err
+		return "", 0, 0, 0, nil, nil, err
 	}
 
 	if step, data, err = takeVarint(data, "step"); err != nil {
-		return "", 0, 0, 0, nil, err
+		return "", 0, 0, 0, nil, nil, err
 	}
 
 	count, m := binary.Uvarint(data)
 	if m <= 0 || count > uint64(len(data)) { // each matcher needs ≥1 downstream byte
-		return "", 0, 0, 0, nil, errors.New("cluster: malformed matcher count")
+		return "", 0, 0, 0, nil, nil, errors.New("cluster: malformed matcher count")
 	}
 	data = data[m:]
 
@@ -77,17 +83,17 @@ func DecodeAggregateRequest(data []byte) (tenant string, start, end, step int64,
 	for range count {
 		var name, value string
 		if name, data, err = takeString(data); err != nil {
-			return "", 0, 0, 0, nil, errors.Wrap(err, "matcher name")
+			return "", 0, 0, 0, nil, nil, errors.Wrap(err, "matcher name")
 		}
 
 		if value, data, err = takeString(data); err != nil {
-			return "", 0, 0, 0, nil, errors.Wrap(err, "matcher value")
+			return "", 0, 0, 0, nil, nil, errors.Wrap(err, "matcher value")
 		}
 
 		eq = append(eq, fetch.EqualMatcher{Name: name, Value: value})
 	}
 
-	return tenant, start, end, step, eq, nil
+	return tenant, start, end, step, eq, data, nil
 }
 
 func takeVarint(data []byte, what string) (int64, []byte, error) {
@@ -286,7 +292,7 @@ func AggregateHandler(fn AggregateFunc, opts ...Option) http.Handler {
 			return
 		}
 
-		tenant, start, end, step, eq, err := DecodeAggregateRequest(body)
+		tenant, start, end, step, eq, tail, err := decodeAggregateRequest(body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 
@@ -297,7 +303,12 @@ func AggregateHandler(fn AggregateFunc, opts ...Option) http.Handler {
 		defer func() { endSpan(span, err) }()
 
 		var aggs []engine.NamedAgg
-		aggs, err = fn(ctx, tenant, start, end, step, matchersFromEq(eq))
+		matchers, err := hintMatchers(tail, eq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		aggs, err = fn(ctx, tenant, start, end, step, matchers)
 		if err != nil {
 			writeRPCError(w, err)
 
@@ -312,9 +323,10 @@ func AggregateHandler(fn AggregateFunc, opts ...Option) http.Handler {
 
 // RemoteAggregator runs an aggregate over a peer node's [AggregateHandler].
 type RemoteAggregator struct {
-	addr   string
-	client *http.Client
-	obs    *obs.Obs
+	addr           string
+	client         *http.Client
+	obs            *obs.Obs
+	stringMatchers []fetch.StringSetMatcher
 }
 
 // NewRemoteAggregator returns an aggregator over the peer at addr. A nil client uses
@@ -324,7 +336,8 @@ func NewRemoteAggregator(addr string, client *http.Client, opts ...Option) *Remo
 		client = http.DefaultClient
 	}
 
-	return &RemoteAggregator{addr: addr, client: client, obs: resolveOpts(opts)}
+	settings := resolveRPCOptions(opts)
+	return &RemoteAggregator{addr: addr, client: client, obs: settings.obs, stringMatchers: settings.stringMatchers}
 }
 
 // Aggregate pushes the tenant, window, step, and equality matchers to the peer and returns its
@@ -335,7 +348,8 @@ func (a *RemoteAggregator) Aggregate(
 	ctx, span := a.clientSpan(ctx, "cluster.aggregate")
 	defer func() { endSpan(span, err) }()
 
-	body, err := a.post(ctx, AggregatePath, EncodeAggregateRequest(tenant, start, end, step, eq), "aggregate")
+	payload := appendStringMatchers(EncodeAggregateRequest(tenant, start, end, step, eq), a.stringMatchers)
+	body, err := a.post(ctx, AggregatePath, payload, "aggregate")
 	if err != nil {
 		return nil, err
 	}

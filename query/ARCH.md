@@ -7,9 +7,13 @@ The library **stops at the fetch contract**. Query languages and planners are th
 `Request{Tenant, Signal, Start, End, Matchers, Conditions, AllConditions, Projection, SecondPass,
 Limit, Reverse, Recycle, Scope}` carries two **operator-free** predicate families:
 
-- **Matchers** — `Matcher{Name, Match func(signal.Value) bool}` resolve **identity** over postings
+- **Matchers** — `Matcher{Name, Match func(signal.Value) bool, Spec, StringValues}` resolve **identity** over postings
   (a metric series, a log stream). Absent labels are passed to the callback as
   `signal.EmptyValue`; local postings and requester-side RPC rechecks apply the same rule.
+  `StringValues` carries a finite necessary set for string-valued labels: owners reject other
+  strings but retain non-string and absent values for the callback recheck. This avoids imposing
+  one text projection on typed attributes. Unlike exact `Spec`, it cannot justify remote limits,
+  numeric counts, label-only metadata, or cache hits without the original callback.
 - **Conditions** — `Condition{Column, Match, Tokens, Equal, AnyEqual}` filter the **per-record
   columns** within that identity. `Tokens`/`Equal`/`AnyEqual` are pruning hints checked against a
   part's blooms, never a replacement for `Match`. `AnyEqual` is a disjunction *inside* one condition
@@ -102,8 +106,11 @@ The library implements **no** query language. This package bridges the fetch sea
 - **Matcher lowering — condition extraction lives here, never in storage.** Visible-label
   predicates include negation and empty-string matches: absence projects to the empty string,
   and postings unions the missing-label series when the callback accepts it. Hidden internal
-  labels stay in the adapter for checking after projection. Nonempty equality alone receives a
-  serializable hint; an empty equality stays opaque so a peer cannot prune absent series.
+  labels stay in the adapter for checking after projection. Nonempty equality receives an exact
+  serializable spec. Empty equality and finite positive regexps receive necessary string-value
+  hints; absent and non-string values retain the full callback. Regexp candidates come from
+  Prometheus after a nonexpanding syntax guard excludes incomplete empty branches and byte-ambiguous
+  patterns. Cluster label-only metadata still declines necessary-only hints and falls back to identities.
   `Counter`/`GroupCounter` and local `LabelLister` receive these same predicates without a sample
   fetch. Every fetched identity is still re-checked against the full Prometheus matcher set.
 - **Label projection.** `signal.Series` → `labels.Labels`: attributes flatten, scope name/version

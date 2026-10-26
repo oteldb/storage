@@ -289,7 +289,14 @@ equality bloom and drops the rows that fail it — sound because a hinted condit
 lacking the value, which is what already makes the local bloom prune sound. Without it a predicate
 carried entirely by conditions pushes nothing: trace-by-id is an equality on `trace_id` over an
 unbounded window, so every owner streamed its whole span history and the requester kept one trace.
-Hints ride only under `AllConditions` (without it a producer may ignore conditions, so ANDing them
+Identity matchers also carry optional finite `StringValues` hints. Fetch, series enumeration,
+and both aggregate RPCs prune nonmember strings on owners, while retaining absent and non-string
+values for the requester's full callback. Bytes and composites can have language-specific text
+projections, so these hints do not compare their text. The fetch wire adds them after projection/
+limit options; aggregate wires append them after equality matchers. Older peers ignore those tails
+and return a superset. They never count as exact matcher serialization.
+
+Column hints ride only under `AllConditions` (without it a producer may ignore conditions, so ANDing them
 could drop rows), and are an **append-only tail** of the request encoding — a peer that predates them
 stops after the matchers and answers with the superset it always did.
 
