@@ -105,6 +105,7 @@ type Batch struct {
 
 	base   Identity      // resource/scope/metric fields shared by every point
 	points []NumberPoint // the metric's points (aliases the source Metrics)
+	source Source
 }
 
 var batchPool = sync.Pool{New: func() any { return &Batch{} }}
@@ -161,20 +162,24 @@ func Project(md Metrics, emit func(*Batch)) (accepted int) {
 	defer func() {
 		b.base = Identity{}
 		b.points = nil
+		b.source = Source{}
 		batchPool.Put(b)
 	}()
 
 	for ri := range md.Resources {
 		rm := &md.Resources[ri]
 		b.base.Series.Resource = rm.Resource
+		b.source.resource = &rm.Resource
 
 		for si := range rm.Scopes {
 			sm := &rm.Scopes[si]
 			b.base.Series.Scope = sm.Scope
+			b.source.scope = &sm.Scope
 			p.setGroup(rm.Resource, sm.Scope)
 
 			for mi := range sm.Metrics {
 				m := &sm.Metrics[mi]
+				b.source.metric = m
 				if len(m.Points) == 0 {
 					continue
 				}

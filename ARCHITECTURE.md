@@ -61,6 +61,10 @@ engines over the fetch seam (`query/fetch`).
 
 - **Write** — `WriteMetrics`/`WriteLogs`/`WriteTraces`/`WriteProfiles` take the library's
   internal `[]byte`-based batches (`signal/{metric,log,trace,profile}`), **not pdata**.
+  Single-node metrics coalesce whole small metrics up to 4,096 points per engine append, within
+  one tenant and one call, preserving order. Larger metrics remain intact. Rate, sampling,
+  cardinality, and in-flight policies retain per-metric admission; disabled sampling still observes
+  each metric for policy transitions. WAL acknowledgement and disk formats are unchanged.
   `WriteMetrics` also stores any exemplars its points carry, best-effort, into the separate
   exemplars record engine (`signal/exemplar`) — see below.
   Tenant is **derived** from Resource+Scope by the `Options.Tenant` callback, never passed.

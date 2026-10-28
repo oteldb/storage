@@ -399,116 +399,23 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 		return s.writeMetricsClustered(ctx, md)
 	}
 
-	var (
-		rej            rejectTally
-		sampledDropped int64
-		overflowed     int64
-	)
-
-	// The tenant (hence the engine) is derived from Resource+Scope, which are constant within
-	// a metric, so points arrive in tenant-contiguous runs. Cache the last resolution to skip
-	// the locked engine-map lookup and policy resolve per metric.
-	var run metricRun
-
-	var firstErr error
-
-	emitted := metric.Project(md, func(b *metric.Batch) {
-		if firstErr != nil {
-			return
-		}
-
-		tid := s.tenantFor(b.Resource(), b.Scope())
-		if tenantReserved(tid) {
-			rej.reserved += int64(b.Len())
-
-			return
-		}
-
-		var err error
-		if run, err = s.metricRunFor(run, tid); err != nil {
-			firstErr = err
-
-			return
-		}
-
-		// Admission stage (between tenant resolution and the engine, DESIGN §8a): the ingest-rate
-		// valve sheds a whole over-budget batch up front; cardinality and in-flight-memory limits
-		// are enforced per sample inside the engine (race-free under its lock).
-		if !run.admit.allowRate(run.limits, int64(b.Len())*engine.SampleBytes, s.now()) {
-			rej.rate += int64(b.Len())
-			run.admit.addRate(int64(b.Len()))
-
-			return
-		}
-
-		// Budgeted (lossy) sampling: keep a representative subset and weight each kept sample with a
-		// scale factor so the embedder's count/sum/rate stays unbiased. Under budget this window the
-		// sampler returns no weights and the batch passes through unchanged (no scale-factor column).
-		ids, tss, vals, sf := b.IDs, b.Ts, b.Values, []float64(nil)
-		mat := b.Series
-
-		if weights, dropped := run.admit.sampleBatch(run.sampling, s.now(), b.IDs, b.Ts); weights != nil {
-			fids := make([]signal.SeriesID, 0, len(weights))
-			fts := make([]int64, 0, len(weights))
-			fvals := make([]float64, 0, len(weights))
-			fsf := make([]float64, 0, len(weights))
-			kept := make([]int, 0, len(weights))
-
-			for i, w := range weights {
-				if w == 0 {
-					continue
-				}
-
-				fids = append(fids, b.IDs[i])
-				fts = append(fts, b.Ts[i])
-				fvals = append(fvals, b.Values[i])
-				fsf = append(fsf, w)
-				kept = append(kept, i)
-			}
-
-			ids, tss, vals, sf = fids, fts, fvals, fsf
-			mat = func(j int) signal.Series { return b.Series(kept[j]) }
-			sampledDropped += dropped
-		}
-
-		res, err := run.eng.AppendBatch(ids, tss, vals, sf, mat, engine.AppendLimits{
-			MaxSeries:        run.limits.MaxSeries,
-			MaxSeriesSoft:    run.limits.MaxSeriesSoft,
-			Overflow:         metricOverflow,
-			MaxInFlightBytes: run.limits.MaxInFlightBytes,
-		})
-		if err != nil {
-			firstErr = err
-
-			return
-		}
-
-		rej.ooo += int64(res.RejectedOOO)
-		rej.cardinality += int64(res.RejectedCardinality)
-		rej.inflight += int64(res.RejectedBytes)
-		run.admit.record(int64(res.Accepted), int64(res.RejectedOOO), int64(res.RejectedCardinality), int64(res.RejectedBytes))
-
-		if res.Overflowed > 0 {
-			overflowed += int64(res.Overflowed)
-			run.admit.recordOverflowed(int64(res.Overflowed))
-		}
-
-		s.pokeFlush(run.eng)
-	})
-
-	if firstErr != nil {
-		return Accepted{}, firstErr
+	buffer := metricAppendPool.Get().(*metricAppendBuffer)
+	defer func() {
+		buffer.reset()
+		metricAppendPool.Put(buffer)
+	}()
+	writer := metricWriter{store: s, buffer: buffer}
+	emitted := metric.Project(md, writer.write)
+	if writer.err == nil {
+		writer.err = writer.flush()
 	}
-
-	total := rej.total()
+	if writer.err != nil {
+		return Accepted{}, writer.err
+	}
+	total := writer.rejected.total()
 	accepted := int64(emitted) - total
-	s.emitAdmission(ctx, signal.Metric, accepted, rej, sampledDropped, overflowed)
-
-	return Accepted{
-		Accepted:       accepted,
-		Rejected:       total,
-		RejectedReason: rej.reason(),
-	}, nil
+	s.emitAdmission(ctx, signal.Metric, accepted, writer.rejected, writer.sampledDropped, writer.overflowed)
+	return Accepted{Accepted: accepted, Rejected: total, RejectedReason: writer.rejected.reason()}, nil
 }
 
 // Machine-readable admission rejection reasons, shared by the OTLP partial-success reason
