@@ -457,7 +457,7 @@ process' lifetime under stream churn: `instance.id`-shaped attributes turn ~24 s
 The **live set** is every live part's stream ids, resident already in `part.ranges` (so unlike the
 metrics engine it costs no I/O), plus the head and the mid-flush detachment. Symbol ids are dense and
 referenced by the postings, so survivors are **rebuilt** into fresh structures off the engine lock
-against `series.Index.Snapshot()` — the append-only entry log, which registration only extends — then
+against `series.Index.View()` — immutable compact arenas, which registration only extends — then
 swapped in under the lock. The swap re-registers what changed meanwhile (entries past the snapshot's
 end, and streams the prune found dead that regained buffered records) and drops the rest's
 out-of-order watermarks by key.

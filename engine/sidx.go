@@ -184,11 +184,13 @@ func sidxEntryStart(entries []byte, k int) int {
 // no cold-latency regression. With a Viewer (memory backend, or any backend behind
 // [backend.Cached]) a reload is a cache-hit view, so dropping is nearly free.
 type pagedIndex struct {
-	be    backend.Backend
-	key   string
-	n     int // distinct series
-	total int // rows
-	keep  bool
+	be     backend.Backend
+	key    string
+	n      int // distinct series
+	total  int // rows
+	keep   bool
+	offset int64
+	fences []signal.SeriesID
 
 	view atomic.Pointer[[]byte] // validated entries region; nil ⇒ load on next use
 }
@@ -307,6 +309,14 @@ func openPagedIndex(
 	_, viewer := b.(backend.Viewer)
 
 	p := &pagedIndex{be: b, key: sidxKey(prefix), n: n, total: total, keep: !viewer}
+	if n >= indexPageEntries*2 && backend.RangesNatively(ctx, b, p.key) {
+		p.keep = false
+		p.offset = int64(len(data) - 4 - len(ents))
+		p.fences = make([]signal.SeriesID, (n+indexPageEntries-1)/indexPageEntries)
+		for i := range p.fences {
+			p.fences[i] = sidxEntryID(ents, i*indexPageEntries)
+		}
+	}
 	p.view.Store(&ents)
 
 	return p, true

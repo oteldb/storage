@@ -207,7 +207,7 @@ Each `sidx` already lists its part's ids, so no new on-disk format. Identities d
 engine whose data only grew skips even the live-set walk.
 
 Symbol ids are dense and referenced by the postings, so nothing is removed in place. Survivors are
-**rebuilt** off-lock against `series.Index.Snapshot()` — the append-only entry log, immutable without
+**rebuilt** off-lock against `series.Index.View()` — the append-only entry log, immutable without
 the lock because registration only extends it — then swapped in under the lock.
 
 | step | 200k identities | 1M |
@@ -1271,11 +1271,14 @@ did not acquire.
 
 Layered optimizations, each opt-in:
 
-**Series index sidecar** (`{prefix}/sidx`) — sorted distinct SeriesIDs and run-start rows, fixed-width,
-binary-searched in the raw bytes and held only while a fetch reads the part, re-fetched through
-`backend.ReadView` as a zero-copy cache hit. Resident index memory then follows the read cache budget
-rather than series count, and opening a part reads no series column. Derived: a missing or corrupt
-sidecar scans the series column once instead, so no migration burden.
+**Series index sidecar** (`{prefix}/sidx`) — sorted distinct SeriesIDs and run-start rows.
+Sparse candidate sets use binary searches; dense sets use linear intersection. Large indexes
+retain one fence ID per 1,024 entries and read the selected 20-KiB leaf pages through the backend's
+shared byte-bounded page cache. A page includes the next entry to bound a run crossing its end.
+Full validation occurs at open; the first query may use that validated view before release.
+
+A missing or corrupt sidecar rebuilds the resident index from the series column. Backends without
+native ranged reads retain the whole-object path. The serialized sidecar format is unchanged.
 
 **Block slicing + decode cache** (`Config.DecodeCacheBytes`) — column blocks are sliced from a
 byte-bounded LRU keyed by `(part, column, block)` and added to the merge as **views**, never

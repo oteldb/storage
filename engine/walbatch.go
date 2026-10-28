@@ -42,7 +42,8 @@ type walSeriesAcc struct {
 	isNew    bool          // the series starts a buffer, so its identity record is logged
 	register bool          // the identity is not in the head's index yet
 	series   signal.Series // the identity, set when isNew
-	newest   int64         // the newest admitted timestamp
+	attrs    signal.Attributes
+	newest   int64 // the newest admitted timestamp
 	ts       []int64
 	values   []float64
 	sf       []float64 // per-sample scale factors (aligned with ts)
@@ -83,8 +84,8 @@ func (b *walBatch) admit(
 		return admitted
 	}
 
-	if s, ok := h.series.Get(id); ok {
-		b.add(id, ts, value, sf, true, false, s)
+	if h.series.Has(id) {
+		b.add(id, ts, value, sf, true, false, signal.Series{})
 
 		return admitted
 	}
@@ -138,6 +139,7 @@ func (b *walBatch) add(id signal.SeriesID, ts int64, value, sf float64, isNew, r
 		acc := walSeriesAcc{isNew: isNew, register: register, series: s, newest: ts}
 		if k < len(b.accs) { // reuse a prior write's accumulator (and its slice capacity)
 			acc.ts, acc.values, acc.sf = b.accs[k].ts[:0], b.accs[k].values[:0], b.accs[k].sf[:0]
+			acc.attrs = b.accs[k].attrs
 			b.accs[k] = acc
 		} else {
 			b.accs = append(b.accs, acc)
@@ -189,11 +191,17 @@ func (b *walBatch) encode(h *head, everySeries bool) error {
 
 		switch {
 		case a.isNew:
-			if err := b.fw.WriteSeries(id, a.series); err != nil {
+			s := a.series
+			if !a.register {
+				s, _ = h.series.GetInto(id, a.attrs)
+				a.attrs = s.Attributes
+			}
+			if err := b.fw.WriteSeries(id, s); err != nil {
 				return err
 			}
 		case everySeries:
-			s, _ := h.series.Get(id) // a buffered series is registered
+			s, _ := h.series.GetInto(id, a.attrs)
+			a.attrs = s.Attributes
 			if err := b.fw.WriteSeries(id, s); err != nil {
 				return err
 			}

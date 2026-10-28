@@ -33,39 +33,43 @@ func identityKey(prefix string) string { return prefix + "/identity" }
 // identitySet is a private snapshot of id → identity, taken under the engine lock and handed to the
 // off-lock part write. A map rather than the index itself: the index keeps being mutated by ingest
 // while a flush or merge is writing.
-type identitySet map[signal.SeriesID]signal.Series
+type identitySet struct {
+	view series.View
+	refs map[signal.SeriesID]uint32
+}
+
+type identitySnapshot struct {
+	view series.View
+	refs []uint32
+}
 
 // entriesFor returns the identity records for the distinct series of a part's (sorted) series
 // column. An id the snapshot does not hold is skipped — it cannot be encoded, and inventing one
 // would write an identity that hashes to something else.
-func (s identitySet) entriesFor(col []chunk.U128) []series.Entry {
-	if len(s) == 0 {
-		return nil
-	}
-
-	out := make([]series.Entry, 0, len(s))
-
+func (s identitySet) entriesFor(col []chunk.U128) identitySnapshot {
+	out := identitySnapshot{view: s.view, refs: make([]uint32, 0, len(s.refs))}
 	for i := range col {
 		if i > 0 && col[i] == col[i-1] {
 			continue
 		}
-
-		id := signal.SeriesID(col[i])
-		if ident, ok := s[id]; ok {
-			out = append(out, series.Entry{ID: id, Series: ident})
+		if ref, ok := s.refs[signal.SeriesID(col[i])]; ok {
+			out.refs = append(out.refs, ref)
 		}
 	}
-
 	return out
 }
 
 // writeIdentity writes a part's identity object. It is written before the part becomes visible (the
 // bucket index is the commit point), so a part is never readable without the identities naming its
 // rows.
-func writeIdentity(ctx context.Context, b backend.Backend, prefix string, entries []series.Entry) error {
+func writeIdentity(ctx context.Context, b backend.Backend, prefix string, entries identitySnapshot) error {
 	// Written uncached: read on recovery and by a replica adopting the part, never on the query
 	// path, so a cache entry would only evict part data.
-	if err := backend.WriteUncachedDeferred(ctx, b, identityKey(prefix), identity.Encode(nil, entries)); err != nil {
+	data := identity.EncodeSorted(nil, len(entries.refs), func(i int, dst signal.Attributes) series.Entry {
+		ref := int(entries.refs[i])
+		return series.Entry{ID: entries.view.ID(ref), Series: entries.view.At(ref, dst)}
+	})
+	if err := backend.WriteUncachedDeferred(ctx, b, identityKey(prefix), data); err != nil {
 		return errors.Wrapf(err, "write identity object %q", prefix)
 	}
 
@@ -75,11 +79,11 @@ func writeIdentity(ctx context.Context, b backend.Backend, prefix string, entrie
 // identitiesOf snapshots the identities of the given series ids from the resident index. Caller
 // holds e.mu (at least for reading).
 func (h *head) identitiesOf(ids map[signal.SeriesID]*sampleBuf) identitySet {
-	out := make(identitySet, len(ids))
+	out := identitySet{view: h.series.View(), refs: make(map[signal.SeriesID]uint32, len(ids))}
 
 	for id := range ids {
-		if s, ok := h.series.Get(id); ok {
-			out[id] = s
+		if ref, ok := h.series.Ref(id); ok {
+			out.refs[id] = ref
 		}
 	}
 
@@ -92,7 +96,7 @@ func (e *Engine) identitiesForColumn(col []chunk.U128) identitySet {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	out := make(identitySet)
+	out := identitySet{view: e.head.series.View(), refs: make(map[signal.SeriesID]uint32)}
 
 	for i := range col {
 		if i > 0 && col[i] == col[i-1] {
@@ -100,8 +104,8 @@ func (e *Engine) identitiesForColumn(col []chunk.U128) identitySet {
 		}
 
 		id := signal.SeriesID(col[i])
-		if s, ok := e.head.series.Get(id); ok {
-			out[id] = s
+		if ref, ok := e.head.series.Ref(id); ok {
+			out.refs[id] = ref
 		}
 	}
 

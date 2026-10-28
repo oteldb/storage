@@ -53,7 +53,7 @@ func TestRebuildIdentity(t *testing.T) {
 	h.newest = 1234
 	h.bytes = 4096
 
-	out := rebuildIdentity(h.series.Snapshot(), live)
+	out := rebuildIdentity(h.series.View(), live)
 
 	assert.Equal(t, 10, out.series.Len(), "only the live identities are carried over")
 	assert.True(t, out.indexSorted(), "the new index is sorted before it is published")
@@ -67,7 +67,7 @@ func TestRebuildIdentitySkipsUnknownIdentity(t *testing.T) {
 	h, live := headWith(10, 10)
 	live[signal.SeriesID{Hi: 1, Lo: 2}] = struct{}{} // an id no identity backs (a lost identity object)
 
-	out := rebuildIdentity(h.series.Snapshot(), live)
+	out := rebuildIdentity(h.series.View(), live)
 
 	assert.Equal(t, 10, out.series.Len(), "an unresolvable id is skipped, not invented")
 }
@@ -79,7 +79,7 @@ func TestHeadSwapIdentity(t *testing.T) {
 	t.Parallel()
 
 	h, live := headWith(100, 10)
-	snap := h.series.Snapshot()
+	snap := h.series.View()
 	dead := deadPositions(snap, live)
 	require.Len(t, dead, 90)
 
@@ -93,8 +93,8 @@ func TestHeadSwapIdentity(t *testing.T) {
 	revived := benchSeries(50).Hash()
 	h.samples[revived] = &sampleBuf{ts: []int64{1}, values: []float64{1}}
 
-	tail := h.series.Snapshot()[len(snap):]
-	require.Len(t, tail, 1)
+	tail := h.series.View()
+	require.Equal(t, 1, tail.Len()-snap.Len())
 
 	h.swapIdentity(rebuilt, snap, tail, dead)
 
@@ -122,7 +122,7 @@ func BenchmarkSwapIdentity(b *testing.B) {
 	for _, live := range []int{200_000, 1_000_000} {
 		b.Run(strconv.Itoa(live/1000)+"k", func(b *testing.B) {
 			h, ids := headWith(live*5/4, live)
-			snap := h.series.Snapshot()
+			snap := h.series.View()
 			dead := deadPositions(snap, ids)
 			rebuilt := rebuildIdentity(snap, ids)
 			watermarks := maps.Clone(h.seriesNewest)
@@ -137,7 +137,7 @@ func BenchmarkSwapIdentity(b *testing.B) {
 				h.seriesNewest = maps.Clone(watermarks)
 
 				b.StartTimer()
-				h.swapIdentity(rebuilt, snap, nil, dead)
+				h.swapIdentity(rebuilt, snap, snap, dead)
 			}
 		})
 	}
@@ -153,7 +153,7 @@ func BenchmarkRebuildIdentity(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 
-			snap := h.series.Snapshot()
+			snap := h.series.View()
 
 			for b.Loop() {
 				out := rebuildIdentity(snap, ids)

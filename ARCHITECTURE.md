@@ -173,6 +173,9 @@ to fail over to: a read overlapping a want fails.
 - **Zero-alloc hot paths.** Append-style codec APIs (`func(dst []byte, …) []byte`), caller-owned
   buffers, pooled+`Reset` scratch, decoders returning views that alias the source where the
   lifetime is bounded. `[]byte` (not `string`) for keys/values/identity.
+- **Compact identities, stable hashes.** Resident series use shared context/key schemas and
+  typed-symbol value arenas. Local dense postings references are translated to canonical
+  128-bit hashes before crossing an engine, durable, or transport boundary.
 - **One physical engine, many front-ends.** A signal supplies a column schema, a projection and
   (profiles) a side store — nothing more. Storage never learns a language's or signal's concepts;
   matchers and conditions are **callbacks**, never operator enums. An absent label reaches its

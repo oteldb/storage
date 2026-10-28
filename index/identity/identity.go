@@ -72,7 +72,11 @@ func Encode(dst []byte, entries []series.Entry) []byte {
 	}
 
 	slices.SortFunc(order, func(a, b int) int { return entries[a].ID.Compare(entries[b].ID) })
+	return EncodeSorted(dst, len(order), func(i int, _ signal.Attributes) series.Entry { return entries[order[i]] })
+}
 
+// EncodeSorted encodes n identities in ascending ID order, reusing one attribute buffer.
+func EncodeSorted(dst []byte, n int, entry func(int, signal.Attributes) series.Entry) []byte {
 	// The series section is built first so its symbol references exist by the time the symbol
 	// section is written; the sections are then emitted symbols-first, as a reader needs them.
 	tab := symbols.New()
@@ -80,9 +84,12 @@ func Encode(dst []byte, entries []series.Entry) []byte {
 
 	var body []byte
 
-	body = binary.AppendUvarint(body, uint64(len(order)))
-	for _, i := range order {
-		body = enc.appendSeries(body, entries[i])
+	body = binary.AppendUvarint(body, uint64(n))
+	var attrs signal.Attributes
+	for i := range n {
+		ent := entry(i, attrs)
+		body = enc.appendSeries(body, ent)
+		attrs = ent.Series.Attributes
 	}
 
 	start := len(dst)

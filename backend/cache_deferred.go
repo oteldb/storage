@@ -31,7 +31,7 @@ func (c *cachedBackend) CreateObjectDeferred(ctx context.Context, key string) (O
 // [DeferredSyncer].
 func (c *cachedBackend) DeleteDeferred(ctx context.Context, key string) error {
 	err := DeleteDeferred(ctx, c.inner, key)
-	c.values.Invalidate(key)
+	c.invalidate(key)
 
 	return err
 }
@@ -53,7 +53,7 @@ func WriteUncachedDeferred(ctx context.Context, b Backend, key string, data []by
 		return err
 	}
 
-	c.values.Invalidate(key)
+	c.invalidate(key)
 
 	return nil
 }

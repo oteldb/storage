@@ -8,7 +8,6 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
-	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
@@ -264,16 +263,16 @@ func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 
 // identityEntries resolves the part's distinct series under a single read lock, rather than one per
 // series.
-func (p *partStreamWriter) identityEntries() []series.Entry {
+func (p *partStreamWriter) identityEntries() identitySnapshot {
 	p.e.mu.RLock()
 	defer p.e.mu.RUnlock()
 
-	out := make([]series.Entry, 0, len(p.runs))
+	out := identitySnapshot{view: p.e.head.series.View(), refs: make([]uint32, 0, len(p.runs))}
 
 	for _, r := range p.runs {
 		id := signal.SeriesID(r.Value)
-		if s, ok := p.e.head.series.Get(id); ok {
-			out = append(out, series.Entry{ID: id, Series: s})
+		if ref, ok := p.e.head.series.Ref(id); ok {
+			out.refs = append(out.refs, ref)
 		}
 	}
 

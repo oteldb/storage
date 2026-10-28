@@ -100,15 +100,18 @@ func (h *head) admitStream(id signal.SeriesID, maxSeries int64) (isNew, ok bool)
 // It reads nothing but its arguments, so it runs **off the engine lock**: snap is the series index's
 // append-only entry log, which registration only extends. The caller installs the result and
 // replays whatever was registered meanwhile ([head.swapIdentity]).
-func rebuildIdentity(schema *Schema, snap []series.Entry, live map[signal.SeriesID]struct{}) *head {
+func rebuildIdentity(schema *Schema, snap series.View, live map[signal.SeriesID]struct{}) *head {
 	out := &head{schema: schema, sym: symbols.New(), series: series.New(), post: postings.NewMemPostings()}
 
-	for i := range snap {
-		if _, ok := live[snap[i].ID]; !ok {
+	var attrs signal.Attributes
+	for i := range snap.Len() {
+		if _, ok := live[snap.ID(i)]; !ok {
 			continue
 		}
 
-		out.register(snap[i].ID, snap[i].Series)
+		ident := snap.At(i, attrs)
+		attrs = ident.Attributes
+		out.register(snap.ID(i), ident)
 	}
 
 	// Sort now, while the index is still private: a reader would otherwise trigger the lazy in-place
@@ -131,20 +134,25 @@ func rebuildIdentity(schema *Schema, snap []series.Entry, live map[signal.Series
 // Every other dead stream loses its out-of-order watermark here: it means nothing without an
 // identity, while a live stream must keep its own or a late record slips back in. The record
 // buffers and the byte measures are untouched — they describe live data. Caller holds the engine lock.
-func (h *head) swapIdentity(rebuilt *head, snap, tail []series.Entry, dead []int32) {
-	for i := range tail {
-		rebuilt.register(tail[i].ID, tail[i].Series)
+func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32) {
+	var attrs signal.Attributes
+	for i := snap.Len(); i < tail.Len(); i++ {
+		ident := tail.At(i, attrs)
+		attrs = ident.Attributes
+		rebuilt.register(tail.ID(i), ident)
 	}
 
 	for _, pos := range dead {
-		e := snap[pos]
-		if _, revived := h.records[e.ID]; revived {
-			rebuilt.register(e.ID, e.Series)
+		id := snap.ID(int(pos))
+		if _, revived := h.records[id]; revived {
+			ident := snap.At(int(pos), attrs)
+			attrs = ident.Attributes
+			rebuilt.register(id, ident)
 
 			continue
 		}
 
-		delete(h.streamNewest, e.ID)
+		delete(h.streamNewest, id)
 	}
 
 	h.sym, h.series, h.post = rebuilt.sym, rebuilt.series, rebuilt.post

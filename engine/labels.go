@@ -295,7 +295,7 @@ func (p *labelProbe) seriesLive(ctx context.Context, e *Engine, id signal.Series
 func (p *labelProbe) valueLive(ctx context.Context, e *Engine, nameID, valueID uint32) (bool, error) {
 	it := e.head.post.Get(nameID, valueID)
 	for it.Next() {
-		live, err := p.seriesLive(ctx, e, it.At())
+		live, err := p.seriesLive(ctx, e, e.head.series.ID(uint32(it.At().Lo)))
 		if err != nil {
 			return false, err
 		}

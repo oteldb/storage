@@ -23,20 +23,21 @@ temporality, profile type) folds into the pre-image as reserved labels at the si
 
 ## `series`
 
-`SeriesID ↔ Series`. `Add` is idempotent (the id *is* the identity hash) and interns key/value
-bytes through the per-index symbol table. Identities live in an **append-only entry log** (the map
-holds positions into it, keeping map slots narrow), so `Snapshot` hands out an immutable view
-without the caller's lock: later `Add`s write past its end or move to a new array, never into it.
-That is what lets the engine rebuild the index off its lock and pick up whatever registered
-meanwhile as the tail past the snapshot's length. It also **deduplicates whole Resource and Scope sets by
-content**, so series sharing a resource/scope point at one owned `[]KeyValue` rather than a
-private clone of the structure that byte interning alone leaves behind. Point attributes are
-near-unique per series, so they are byte-interned only.
+`SeriesID ↔ Series`. Canonical hashes and durable formats use the full typed identity.
+The resident registry uses 32-byte rows: hash, value-arena offset, shared resource/scope
+context, and shared attribute-name schema. Values occupy four-byte typed-symbol references;
+attribute-name sequences are stored once per schema rather than repeated for every series.
+
+`View` captures immutable append-only arenas for off-lock flush and pruning. `GetInto` and
+`View.At` materialize only requested identities into reusable caller buffers. The compatibility
+`Snapshot` API materializes entries; pruning uses compact views. Metrics flush and merge
+encode identities one at a time, so their snapshots do not expand the resident registry.
 
 ## `postings`
 
-The inverted index, keyed on **interned symbol ids** (`nameID → valueID → sorted []SeriesID`) — so
-it is zero-alloc and **type-preserving** (the value id comes from the value's typed encoding).
+The inverted index is keyed on interned name/typed-value symbols. `MemPostings` stores canonical
+128-bit IDs; `Dense` stores four-byte local ordinals. The metrics engine resolves its local ordinals
+back to canonical hashes before accessing parts. Local ordinals never appear in durable data or RPCs.
 
 - Lazy set-op iterators (`Intersect`/`Merge`/`Without`, galloping `Seek`), property-tested against
   a naive reference. `Merge` is a binary-min-heap k-way union (O(N·log k)), so a high-cardinality
