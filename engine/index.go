@@ -12,6 +12,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
+	"github.com/oteldb/storage/internal/indexcommit"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/repair"
 	"github.com/oteldb/storage/signal"
@@ -47,7 +48,7 @@ const indexCommitAttempts = 8
 // part is dropped from the index that survives. It is a no-op for a head-only engine (no
 // backend), and refused while the engine is fenced ([Engine.fenceLocked]). Caller holds e.mu.
 func (e *Engine) updateIndexLocked(ctx context.Context) error {
-	return e.commitIndexLocked(ctx, e.term(), nil)
+	return e.commitIndexLocked(ctx, e.parts, e.flushedEpoch, e.term(), nil)
 }
 
 // commitIndexLocked is [Engine.updateIndexLocked] for an operation that began under ownership term
@@ -56,7 +57,7 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 // guard, when non-nil, runs after each rebase: an error from it abandons the commit, since the
 // rival's parts it adopted may be ones the caller's own must not be committed beside. Caller holds
 // e.mu.
-func (e *Engine) commitIndexLocked(ctx context.Context, stamp uint64, guard func() error) error {
+func (e *Engine) commitIndexLocked(ctx context.Context, parts []*part, epoch, stamp uint64, guard func() error) error {
 	if e.cfg.Backend == nil {
 		return nil
 	}
@@ -70,7 +71,7 @@ func (e *Engine) commitIndexLocked(ctx context.Context, stamp uint64, guard func
 			return err
 		}
 
-		landed, err := e.commitOnceLocked(ctx)
+		landed, err := e.commitOnceLocked(ctx, parts, epoch)
 		if err != nil || landed {
 			return err
 		}
@@ -92,10 +93,14 @@ func (e *Engine) commitIndexLocked(ctx context.Context, stamp uint64, guard func
 
 // commitOnceLocked makes one conditional write of the index this engine would commit now, reporting
 // whether it landed; a lost race is not an error. Caller holds e.mu.
-func (e *Engine) commitOnceLocked(ctx context.Context) (bool, error) {
-	ix := e.nextIndexLocked(ctx)
+func (e *Engine) commitOnceLocked(ctx context.Context, parts []*part, epoch uint64) (bool, error) {
+	ix := e.nextIndexLocked(ctx, parts, epoch)
 
-	version, err := ix.Save(ctx, e.cfg.Backend, e.indexKey(), e.indexVersion)
+	var version backend.Version
+	err := e.mu.WithWriters(func() (err error) {
+		version, err = indexcommit.Save(ctx, ix, e.cfg.Backend, e.indexKey(), e.indexVersion)
+		return err
+	})
 	if err != nil {
 		if errors.Is(err, bucketindex.ErrConflict) {
 			return false, nil
@@ -131,7 +136,12 @@ func (e *Engine) commitOnceLocked(ctx context.Context) (bool, error) {
 // the retry supersedes rather than reads as stale), and records the entries the rival added as
 // [Engine.foreign] so the retry carries them instead of dropping them. Caller holds e.mu.
 func (e *Engine) adoptIndexLocked(ctx context.Context) error {
-	ix, version, err := bucketindex.LoadVersioned(ctx, e.cfg.Backend, e.indexKey())
+	var ix *bucketindex.Index
+	var version backend.Version
+	err := e.mu.WithWriters(func() (err error) {
+		ix, version, err = bucketindex.LoadVersioned(ctx, e.cfg.Backend, e.indexKey())
+		return err
+	})
 	if err != nil {
 		e.countCorrupt(ctx, err, "bucket_index", obs.CorruptFatal)
 
@@ -207,7 +217,11 @@ func (e *Engine) openForeignLocked(ctx context.Context) {
 			continue
 		}
 
-		p, err := openPart(ctx, e.cfg.Backend, ent.Prefix, e.cfg.Obs.Corruption, e.readCompressors)
+		var p *part
+		err := e.mu.WithWriters(func() (err error) {
+			p, err = openPart(ctx, e.cfg.Backend, ent.Prefix, e.cfg.Obs.Corruption, e.readCompressors)
+			return err
+		})
 		if err != nil {
 			zctx.From(ctx).Debug("adopted part is not readable here",
 				zap.String("prefix", ent.Prefix), zap.Error(err))
@@ -222,7 +236,7 @@ func (e *Engine) openForeignLocked(ctx context.Context) {
 
 		// Without its identities the part is open but unresolvable: matchers resolve through the
 		// head's identity index, so the rows would be there and nothing would name them.
-		if _, err := e.registerPartIdentitiesLocked(ctx, ent.Prefix); err != nil {
+		if _, err := e.registerPartIdentities(ctx, ent.Prefix, true); err != nil {
 			zctx.From(ctx).Debug("adopted part identities are not readable here",
 				zap.String("prefix", ent.Prefix), zap.Error(err))
 		}
@@ -252,7 +266,7 @@ func (e *Engine) readablePartsLocked() []*part {
 
 // nextIndexLocked builds the index state this engine wants committed and advances the
 // bookkeeping the next one is diffed against. Caller holds e.mu.
-func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
+func (e *Engine) nextIndexLocked(ctx context.Context, parts []*part, epoch uint64) *bucketindex.Index {
 	// The generation advances on every write, including one that only removes parts — which is
 	// the whole point of it, since that is exactly the rewrite the part names cannot express.
 	e.generation = e.generation.Next(e.term())
@@ -266,7 +280,7 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 		Epochs:       slices.Clone(e.epochs),
 		Generation:   e.generation,
 	}
-	ix.SetWriterEpoch(e.cfg.WriterID, e.flushedEpoch, e.generation)
+	ix.SetWriterEpoch(e.cfg.WriterID, epoch, e.generation)
 	ix.Epochs = bucketindex.TrimWriters(ix.Epochs, e.cfg.WriterID, bucketindex.MaxWriters)
 	e.epochs, e.anonEpoch = ix.Epochs, ix.FlushedEpoch
 
@@ -278,13 +292,13 @@ func (e *Engine) nextIndexLocked(ctx context.Context) *bucketindex.Index {
 	// Block numbers are allocated here, per attempt, because a rival's entries are only known
 	// after a rebase: allocating once and reusing it across retries would hand a part a block the
 	// winner already claimed. The assignments are held, not applied — see [Engine.updateIndexLocked].
-	alloc := bucketindex.NewAllocator(e.nextBlockLocked(ix))
+	alloc := bucketindex.NewAllocator(e.nextBlockLocked(ix, parts))
 
 	var assigned []blockAssignment
 
-	live := make(map[string]struct{}, len(e.parts))
+	live := make(map[string]struct{}, len(parts))
 
-	for _, p := range e.parts {
+	for _, p := range parts {
 		blocks, claim, level, term := p.blocks, p.claim, p.level, p.term
 		if plan := p.pending; plan != nil {
 			blocks, claim = alloc.Assign(plan)
@@ -435,6 +449,8 @@ func foreignEntries(
 // sweeps the part objects the index does not name (see [Engine.sweepOrphansLocked]) and commits a
 // want for each part the index names that is not there.
 func (e *Engine) LoadParts(ctx context.Context) error {
+	e.identityMu.RLock()
+	defer e.identityMu.RUnlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -446,6 +462,8 @@ func (e *Engine) LoadParts(ctx context.Context) error {
 // backend lacks becomes a pending want, committed by the first commit this engine makes as a writer
 // rather than now. Reads over it disclaim meanwhile ([Engine.WantOverlaps]).
 func (e *Engine) LoadPartsUnclaimed(ctx context.Context) error {
+	e.identityMu.RLock()
+	defer e.identityMu.RUnlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -458,6 +476,8 @@ func (e *Engine) LoadPartsUnclaimed(ctx context.Context) error {
 // reads disclaim ([Engine.WantOverlaps]), never a repair commit. It is what backs
 // storage.WithReadOnly (backup, verification, offline inspection).
 func (e *Engine) LoadPartsReadOnly(ctx context.Context) error {
+	e.identityMu.RLock()
+	defer e.identityMu.RUnlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -728,6 +748,8 @@ func (e *Engine) fence() error {
 // once one succeeds; a no-op when the engine is not fenced. It loads like [Engine.RefreshReplica]
 // but trims no head: an owner's head holds records that are in no part yet.
 func (e *Engine) ReloadFenced(ctx context.Context) error {
+	e.identityMu.RLock()
+	defer e.identityMu.RUnlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -748,7 +770,12 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 		return nil
 	}
 
-	l, corrupt, err := e.readIndexLocked(ctx)
+	var l *indexLoad
+	var corrupt []string
+	err := e.mu.WithReaders(func() (err error) {
+		l, corrupt, err = e.readIndexLocked(ctx)
+		return err
+	})
 	if err != nil {
 		e.loadErr = err
 		e.corruptLoads = nextCorruptLoads(e.corruptLoads, corrupt)
@@ -762,29 +789,30 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 	// New head records belong to the generation past the recovered watermark; replay (which the
 	// facade runs next) then skips everything the loaded parts already hold.
 	if e.cfg.WAL != nil {
-		e.cfg.WAL.SetEpoch(e.flushedEpoch + 1)
+		epoch := e.flushedEpoch + 1
+		if e.flushing != nil {
+			epoch = max(epoch, e.cfg.WAL.Epoch())
+		}
+		e.cfg.WAL.SetEpoch(epoch)
 	}
 
-	if sweep {
+	if sweep && e.activeBuilds.Load() == 0 {
 		if err := e.sweepOrphansLocked(ctx); err != nil {
 			return err
-		}
-	}
-
-	// One commit drops the gone parts from Entries and states the wants that replace them. It runs
-	// before the rest of the load so the obligation is durable even if identity recovery fails. A
-	// carried part's identity would be stamped by this commit, which does not hold flushMu, so the
-	// wants then stay pending for the next flush or merge to commit. So do they on a clustered engine
-	// without an established tenure, which may not commit yet: the load is then an unclaimed one.
-	if len(l.lost) > 0 && mode == loadOwner && !l.carried && e.tenureLocked(e.term()) == nil {
-		if err := e.updateIndexLocked(ctx); err != nil {
-			return errors.Wrap(err, "record repair wants")
 		}
 	}
 
 	complete, err := e.loadIdentitiesLocked(ctx, l.parts)
 	if err != nil {
 		return err
+	}
+
+	// Identity and the next WAL epoch must be ready before the repair commit admits readers/writers.
+	// Pending block identities wait for maintenance; an unestablished tenure cannot commit.
+	if len(l.lost) > 0 && mode == loadOwner && !l.carried && e.tenureLocked(e.term()) == nil {
+		if err := e.updateIndexLocked(ctx); err != nil {
+			return errors.Wrap(err, "record repair wants")
+		}
 	}
 
 	// Once every live part carries its own identities, the legacy whole-set object holds nothing
@@ -808,6 +836,8 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 // lacks is not an error: it leaves the part set and is counted as a pending want ([Stats.WantedParts],
 // [Engine.WantOverlaps]) until a refresh finds it again or this node commits as an owner.
 func (e *Engine) RefreshReplica(ctx context.Context) error {
+	e.identityMu.RLock()
+	defer e.identityMu.RUnlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -972,7 +1002,7 @@ func (e *Engine) establishTenureLocked(ctx context.Context) error {
 		return err
 	}
 
-	landed, err := e.commitOnceLocked(ctx)
+	landed, err := e.commitOnceLocked(ctx, e.parts, e.flushedEpoch)
 	if err != nil {
 		e.cfg.Obs.Corruption.EstablishFailed(ctx, metricSignal, obs.EstablishUnavailable)
 

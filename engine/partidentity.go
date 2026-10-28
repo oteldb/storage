@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"iter"
+	"maps"
 
 	"github.com/go-faster/errors"
 	"github.com/go-faster/sdk/zctx"
@@ -11,6 +13,7 @@ import (
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/index/identity"
 	"github.com/oteldb/storage/index/series"
+	"github.com/oteldb/storage/internal/identitysnapshot"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/signal"
 )
@@ -76,40 +79,36 @@ func writeIdentity(ctx context.Context, b backend.Backend, prefix string, entrie
 	return nil
 }
 
-// identitiesOf snapshots the identities of the given series ids from the resident index. Caller
-// holds e.mu (at least for reading).
-func (h *head) identitiesOf(ids map[signal.SeriesID]*sampleBuf) identitySet {
-	out := identitySet{view: h.series.View(), refs: make(map[signal.SeriesID]uint32, len(ids))}
-
-	for id := range ids {
-		if ref, ok := h.series.Ref(id); ok {
-			out.refs[id] = ref
-		}
-	}
-
+// identitiesOf resolves a detached generation outside the reader lock. Caller holds flushMu.
+func (e *Engine) identitiesOf(ids map[signal.SeriesID]*sampleBuf) identitySet {
+	out := identitySet{refs: make(map[signal.SeriesID]uint32, len(ids))}
+	e.captureIdentities(maps.Keys(ids), func(id signal.SeriesID, view series.View, ref uint32) {
+		out.view, out.refs[id] = view, ref
+	})
 	return out
 }
 
-// identitiesForColumn snapshots, under the read lock, the identities of the distinct series in a
-// part's sorted series column — what a merge needs to write its output part's identity object.
+// identitiesForColumn resolves distinct column identities in bounded lock sections. Caller holds flushMu.
 func (e *Engine) identitiesForColumn(col []chunk.U128) identitySet {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	out := identitySet{view: e.head.series.View(), refs: make(map[signal.SeriesID]uint32)}
-
-	for i := range col {
-		if i > 0 && col[i] == col[i-1] {
-			continue
-		}
-
-		id := signal.SeriesID(col[i])
-		if ref, ok := e.head.series.Ref(id); ok {
-			out.refs[id] = ref
+	out := identitySet{refs: make(map[signal.SeriesID]uint32)}
+	ids := func(yield func(signal.SeriesID) bool) {
+		for i, id := range col {
+			if i > 0 && col[i-1] == id {
+				continue
+			}
+			if !yield(signal.SeriesID(id)) {
+				return
+			}
 		}
 	}
-
+	e.captureIdentities(ids, func(id signal.SeriesID, view series.View, ref uint32) {
+		out.view, out.refs[id] = view, ref
+	})
 	return out
+}
+
+func (e *Engine) captureIdentities(ids iter.Seq[signal.SeriesID], emit func(signal.SeriesID, series.View, uint32)) {
+	identitysnapshot.Capture(e.mu.RLocker(), func() *series.Index { return e.head.series }, ids, emit)
 }
 
 // loadIdentitiesLocked rebuilds the resident identity index from the durable state: each live
@@ -156,7 +155,21 @@ func (e *Engine) loadIdentitiesLocked(ctx context.Context, parts []*part) (bool,
 // come from the legacy whole-set object), a corrupt one leaves its rows unresolvable until a merge
 // rewrites the part — neither is fatal. Caller holds e.mu.
 func (e *Engine) registerPartIdentitiesLocked(ctx context.Context, prefix string) (bool, error) {
-	data, err := backend.ReadUncached(ctx, e.cfg.Backend, identityKey(prefix))
+	return e.registerPartIdentities(ctx, prefix, false)
+}
+
+func (e *Engine) registerPartIdentities(ctx context.Context, prefix string, admitWriters bool) (bool, error) {
+	var data []byte
+	read := func() (err error) {
+		data, err = backend.ReadUncached(ctx, e.cfg.Backend, identityKey(prefix))
+		return err
+	}
+	var err error
+	if admitWriters {
+		err = e.mu.WithWriters(read)
+	} else {
+		err = read()
+	}
 	if err != nil {
 		if errors.Is(err, backend.ErrNotExist) {
 			return false, nil

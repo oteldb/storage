@@ -20,6 +20,7 @@ import (
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/internal/diskguard"
+	"github.com/oteldb/storage/internal/engineguard"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/repair"
 	"github.com/oteldb/storage/pool"
@@ -113,6 +114,11 @@ type Config struct {
 	// It is called *after* selection, so a cycle with nothing to compact never consults it at all.
 	// nil admits every merge, which is the single-engine and test default.
 	MergeAdmission func(ctx context.Context, bytes int64, wait bool) (release func(), ok bool, err error)
+	// FlushAdmission reserves the estimated resident flush working set. A non-nil callback enables
+	// one flush build alongside one merge build; nil retains serialized maintenance. An oversized
+	// flush must run alone, and the callback must release its reservation on every error.
+	FlushAdmission func(ctx context.Context, bytes int64) (release func(), err error)
+
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each part,
 	// so [Engine.AggregateRange] answers a range-covering aggregate from it without decoding the
 	// value column. It costs a little storage per series; off by default. AggregateRange works
@@ -176,14 +182,16 @@ const DefaultMetricBlockRows = 1024
 // Engine is a single tenant's storage engine. Safe for concurrent use.
 type Engine struct {
 	cfg Config
-	mu  sync.RWMutex
-	// flushMu serializes the *whole* body of a flush or merge (both mutate parts off e.mu). The facade
-	// drives them from one maintenance goroutine, but the type is exported and Close/Reset are callable
-	// from anywhere, so the single-mutator invariant is enforced here rather than assumed. Always taken
-	// before e.mu, never while holding it.
-	flushMu sync.Mutex
-	head    *head
-	parts   []*part
+	mu  engineguard.Mutex
+	// The build barrier excludes reset, prune and repair; admitted flush/merge builds take read slots.
+	// Identity lifecycle precedes catalog -> writer -> reader-visible state (see ARCH.md).
+	flushMu      sync.RWMutex
+	identityMu   sync.RWMutex
+	activeBuilds atomic.Int32
+	flushRun     sync.Mutex
+	mergeRun     sync.Mutex
+	head         *head
+	parts        []*part
 	// tsCodec is the codec flushes and merges write the timestamp column with. It is a field, not a
 	// constant, only so a test can write the [chunk.CodecDoD] parts earlier builds wrote and check
 	// they merge.
@@ -418,8 +426,8 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 		return false, err
 	}
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.LockWriter()
+	defer e.mu.UnlockWriter()
 
 	if e.cfg.WAL == nil {
 		_, accepted, _ := e.head.append(s, ts, value, e.cfg.OOOWindow)
@@ -434,7 +442,7 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 		return false, nil
 	}
 
-	if err := e.walB.flush(e.head, e.cfg.WAL); err != nil {
+	if err := e.flushWALLocked(); err != nil {
 		return false, err
 	}
 
@@ -459,8 +467,8 @@ func (e *Engine) AppendBatch(
 		return AppendResult{}, err
 	}
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.LockWriter()
+	defer e.mu.UnlockWriter()
 
 	// One closure for the whole run (not one per point): bi selects the current sample for
 	// the lazy materializer, which fires only on a newly-seen series.
@@ -499,7 +507,7 @@ func (e *Engine) AppendBatch(
 		return res, nil
 	}
 
-	if err := e.walB.flush(e.head, e.cfg.WAL); err != nil {
+	if err := e.flushWALLocked(); err != nil {
 		return AppendResult{}, err
 	}
 
@@ -521,7 +529,7 @@ func (e *Engine) HeadBytes() int64 {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	return e.head.bytes
+	return e.head.inFlightBytes()
 }
 
 // IdentityBytes returns the resident bytes of the engine's identity state — the symbol table, the
@@ -586,7 +594,7 @@ func (e *Engine) Stats() Stats {
 	s := Stats{
 		Series:        int64(e.head.series.Len()),
 		OutOfSpace:    e.space.Exhausted(),
-		HeadBytes:     e.head.bytes,
+		HeadBytes:     e.head.inFlightBytes(),
 		HeadAge:       e.head.age(),
 		IdentityBytes: e.head.identityBytes(),
 		Parts:         len(e.parts),
@@ -649,9 +657,9 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, er
 	e.mu.RLock()
 	for !e.head.indexSorted() {
 		e.mu.RUnlock()
-		e.mu.Lock()
+		e.mu.LockState()
 		e.head.ensureIndexSorted()
-		e.mu.Unlock()
+		e.mu.UnlockState()
 		e.mu.RLock()
 	}
 
@@ -1489,8 +1497,8 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 		return nil, AppendResult{}, err
 	}
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.LockWriter()
+	defer e.mu.UnlockWriter()
 
 	// Decided into the staged batch, logged, then applied, as a durable AppendBatch is: an error leaves
 	// the head untouched (see [walBatch]).
@@ -1548,7 +1556,7 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 	// counts on: a restart replays them instead of serving a hole for everything written since the
 	// last flush.
 	if e.cfg.WAL != nil {
-		if err := e.cfg.WAL.WriteFrames(e.walB.frames.Bytes()); err != nil {
+		if err := e.mu.WithReaders(func() error { return e.cfg.WAL.WriteFrames(e.walB.frames.Bytes()) }); err != nil {
 			return nil, AppendResult{}, err
 		}
 	}
@@ -1564,8 +1572,8 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 // replicas hold identical data. A replica holds the unflushed head this way; after a flush the
 // shared object store reconciles them. Safe for concurrent use.
 func (e *Engine) ApplyReplicated(data []byte) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.LockWriter()
+	defer e.mu.UnlockWriter()
 
 	return wal.Replay(data, e.replayHandlers())
 }
@@ -1597,8 +1605,8 @@ func (e *Engine) SeriesCount() int {
 // head detach and the metadata publish run under it. Only the background maintenance task (or Close)
 // calls flush, so the parts mutation has a single writer.
 func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error) {
-	e.flushMu.Lock()
-	defer e.flushMu.Unlock()
+	unlock := e.lockFlush()
+	defer unlock()
 
 	if err := e.admitFlush(ctx); err != nil {
 		return 0, 0, err
@@ -1637,17 +1645,21 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	}
 
 	e.flushing = detached
-	// Snapshot the flushed series' identities while still under the lock: the part write runs
-	// off-lock, and the resident index keeps being mutated by ingest.
-	idents := e.head.identitiesOf(detached)
 
 	// Seal the WAL at the detach point, atomically with it: the part about to be written holds
 	// exactly the samples logged so far, so the checkpoint that publishes it must discard only those
 	// segments. A sample appended during the off-lock part write logs into a later segment at the
 	// next generation, which this flush neither deletes nor makes replay skip.
 	checkpointSeq := -1
+	epoch := e.flushedEpoch + 1
 	if e.cfg.WAL != nil {
-		seq, serr := e.cfg.WAL.Seal(e.flushedEpoch + 2)
+		// An aborted flush may have reattached records logged in a newer generation.
+		epoch = max(epoch, e.cfg.WAL.Epoch())
+		var seq int
+		serr := e.mu.WithReaders(func() (err error) {
+			seq, err = e.cfg.WAL.Seal(epoch + 1)
+			return err
+		})
 		if serr != nil {
 			e.mu.Unlock()
 
@@ -1658,6 +1670,13 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	}
 
 	e.mu.Unlock()
+
+	release, err := e.reserveFlush(ctx, detached, detachedBytes, nil)
+	if err != nil {
+		return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
+	}
+	defer release()
+	idents := e.identitiesOf(detached)
 
 	// Build (lock-free): lay out the detached buffers and write the part. Flush writes freshly-ingested
 	// (warm) data with the default codec-only framing; recompression of cold data happens at merge.
@@ -1692,10 +1711,8 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		newParts = append(newParts, p)
 	}
 
-	// Publish (under lock): add the parts copy-on-write and clear e.flushing in the same critical
-	// section, so a fetch sees the samples either in e.flushing or in a part — never neither (no gap)
-	// and never both (no double count). The small index writes and WAL checkpoint stay under the lock
-	// so the parts swap and the durable commit remain atomic.
+	// Commit the candidate while the frozen head stays readable, then install both sides of the swap.
+	// A WAL checkpoint follows only a confirmed catalog commit.
 	e.mu.Lock()
 
 	// A load that failed while the part was being written fenced the engine: the samples go back to
@@ -1706,17 +1723,23 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
 	}
 
+	next := e.parts
 	for _, p := range newParts {
-		e.parts = appendPart(e.parts, p)
+		next = appendPart(next, p)
 	}
+	epoch = max(epoch, e.flushedEpoch)
+	err = e.commitIndexLocked(ctx, next, epoch, e.term(), nil)
+	// Keep completed flush outputs locally even when commit confirmation fails. Their WAL
+	// remains intact, and the next commit carries these same outputs rather than rewriting rows.
+	e.parts, e.flushedEpoch = next, epoch
 	if e.recentEnabled() {
 		e.populateRecent(detached)
 	}
 	e.flushing = nil
-	// The parts about to be committed supersede every WAL record logged so far, so the watermark
-	// they carry retires that generation and the next head records open a new one.
-	e.flushedEpoch++
-	err = e.publishLocked(ctx, checkpointSeq)
+	e.head.detachedBytes = 0
+	if err == nil {
+		err = e.checkpointLocked(checkpointSeq)
+	}
 	e.mu.Unlock()
 
 	written = partsBytes(newParts)
@@ -1751,23 +1774,11 @@ func (e *Engine) abortFlush(
 	return cause
 }
 
-// publishLocked persists the engine's part set (the bucket index) and checkpoints the WAL through
-// checkpointSeq — the sequence the flush sealed at detach, past which the now-durable part
-// supersedes nothing (negative ⇒ no WAL). Caller holds e.mu.
-func (e *Engine) publishLocked(ctx context.Context, checkpointSeq int) error {
-	// Ordering is a durability invariant: a part's own objects — including the identity object
-	// naming its series — are all written before the bucket index, which is what makes the part
-	// durably visible, so a readable part always has the identities its rows resolve through. The
-	// reverse leftover is harmless: a part whose objects were written but never committed is an
-	// orphan the next open sweeps, and its identities were never loaded.
-	if err := e.updateIndexLocked(ctx); err != nil {
-		return err
-	}
-
+// checkpointLocked retires only the prefix sealed by a durably committed flush. Caller holds e.mu.
+func (e *Engine) checkpointLocked(checkpointSeq int) error {
 	if e.cfg.WAL != nil && checkpointSeq >= 0 {
-		return e.cfg.WAL.CheckpointThrough(checkpointSeq)
+		return e.mu.WithReaders(func() error { return e.cfg.WAL.CheckpointThrough(checkpointSeq) })
 	}
-
 	return nil
 }
 

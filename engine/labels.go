@@ -245,9 +245,9 @@ func (e *Engine) newLabelProbe(ctx context.Context, r fetch.Request) (*labelProb
 	e.mu.RLock()
 	for !e.head.indexSorted() {
 		e.mu.RUnlock()
-		e.mu.Lock()
+		e.mu.LockState()
 		e.head.ensureIndexSorted()
-		e.mu.Unlock()
+		e.mu.UnlockState()
 		e.mu.RLock()
 	}
 

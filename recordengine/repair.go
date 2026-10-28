@@ -40,39 +40,48 @@ func (e *Engine) repairWants(ctx context.Context) {
 	}
 
 	repair.Drive(ctx, &e.repairs, repair.Config{Fetcher: e.cfg.Repair, Obs: e.cfg.Obs.Repair, Prefix: e.cfg.Prefix},
-		repairHost{e})
+		&repairHost{e: e})
 }
 
 // repairHost adapts the engine to [repair.Host].
-type repairHost struct{ e *Engine }
+type repairHost struct {
+	e    *Engine
+	next []*part
+}
 
-var _ repair.Host[*part] = repairHost{}
+var _ repair.Host[*part] = &repairHost{}
 
-func (h repairHost) Locks() (state, flush sync.Locker) { return &h.e.mu, &h.e.flushMu }
+func (h *repairHost) Locks() (state, flush sync.Locker) { return &h.e.mu, &h.e.flushMu }
 
 // ObligationsLocked includes pending wants: a load that could not commit them left them for the
 // first commit this engine makes, and the repair commit is one.
-func (h repairHost) ObligationsLocked() ([]bucketindex.Want, []bucketindex.Entry, []bucketindex.Claim) {
+func (h *repairHost) ObligationsLocked() ([]bucketindex.Want, []bucketindex.Entry, []bucketindex.Claim) {
 	return slices.Concat(h.e.wants, h.e.pendingWants, h.e.adoptedWants), slices.Clone(h.e.holes), h.e.catalog
 }
 
-func (h repairHost) LiveLocked() ([]*part, []bucketindex.Entry) { return h.e.parts, h.e.foreign }
-func (h repairHost) CommitLocked(ctx context.Context) error     { return h.e.updateIndexLocked(ctx) }
-func (h repairHost) RetireLocked(parts []*part)                 { h.e.retireLocked(parts) }
-func (h repairHost) Reclaim(ctx context.Context)                { h.e.reclaimRetired(ctx) }
+func (h *repairHost) LiveLocked() ([]*part, []bucketindex.Entry) { return h.e.parts, h.e.foreign }
+func (h *repairHost) CommitLocked(ctx context.Context) error {
+	if err := h.e.commitIndexLocked(ctx, h.next, h.e.flushedEpoch, h.e.term()); err != nil {
+		return err
+	}
+	h.e.parts = h.next
+	return nil
+}
+func (h *repairHost) RetireLocked(parts []*part)  { h.e.retireLocked(parts) }
+func (h *repairHost) Reclaim(ctx context.Context) { h.e.reclaimRetired(ctx) }
 
-func (h repairHost) Identity(p *part) bucketindex.Entry {
+func (h *repairHost) Identity(p *part) bucketindex.Entry {
 	return bucketindex.Entry{
 		Prefix: p.prefix, MinTime: p.minTime, MaxTime: p.maxTime,
 		Blocks: p.blocks, Claim: p.claim, Level: p.level, Term: p.term,
 	}
 }
 
-func (h repairHost) Open(ctx context.Context, prefix string) (*part, error) {
+func (h *repairHost) Open(ctx context.Context, prefix string) (*part, error) {
 	return openPart(ctx, h.e.cfg.Backend, h.e.cfg.Schema, prefix, h.e.cfg.Obs.Corruption, h.e.readCompressors)
 }
 
-func (h repairHost) AdoptLocked(ctx context.Context, p *part, ent *bucketindex.Entry) error {
+func (h *repairHost) AdoptLocked(ctx context.Context, p *part, ent *bucketindex.Entry) error {
 	p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
 	p.blocks, p.claim, p.level, p.term = ent.Blocks, ent.Claim, ent.Level, ent.Term
 
@@ -81,6 +90,6 @@ func (h repairHost) AdoptLocked(ctx context.Context, p *part, ent *bucketindex.E
 	return err
 }
 
-func (h repairHost) SwapLocked(parts []*part, holes []bucketindex.Want) {
-	h.e.parts, h.e.pendingHoles = parts, holes
+func (h *repairHost) SwapLocked(parts []*part, holes []bucketindex.Want) {
+	h.next, h.e.pendingHoles = parts, holes
 }

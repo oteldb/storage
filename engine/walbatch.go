@@ -74,7 +74,7 @@ func (b *walBatch) admit(
 		}
 	}
 
-	if limits.MaxInFlightBytes > 0 && h.bytes+int64(b.samples)*SampleBytes >= limits.MaxInFlightBytes {
+	if limits.MaxInFlightBytes > 0 && h.inFlightBytes()+int64(b.samples)*SampleBytes >= limits.MaxInFlightBytes {
 		return rejectBytes
 	}
 
@@ -170,14 +170,12 @@ func (b *walBatch) add(id signal.SeriesID, ts int64, value, sf float64, isNew, r
 // empty reports whether the batch staged no samples (so the engine can skip the WAL write).
 func (b *walBatch) empty() bool { return len(b.order) == 0 }
 
-// flush logs the staged write — a series record per series starting a buffer, a samples frame per
-// series — as a single WAL write, so a write that fails logs none of it. It does not reset b.
-func (b *walBatch) flush(h *head, w *wal.SegmentWriter) error {
-	if err := b.encode(h, false); err != nil {
+// flushWALLocked encodes under the state lock, then logs with readers admitted.
+func (e *Engine) flushWALLocked() error {
+	if err := e.walB.encode(e.head, false); err != nil {
 		return err
 	}
-
-	return w.WriteFrames(b.frames.Bytes())
+	return e.mu.WithReaders(func() error { return e.cfg.WAL.WriteFrames(e.walB.frames.Bytes()) })
 }
 
 // encode frames the staged write into b.frames, one samples frame per series, each preceded by its

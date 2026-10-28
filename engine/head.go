@@ -39,7 +39,8 @@ type head struct {
 	// all-time series set the identity index already retains.
 	seriesNewest map[signal.SeriesID]int64
 
-	bytes int64 // buffered sample bytes (SampleBytes each); the in-flight memory measure
+	bytes         int64 // active buffered sample bytes (SampleBytes each)
+	detachedBytes int64 // resident samples held by the single in-flight flush
 	// since is when the head took its first bytes after the last flush (zero while empty). It is
 	// the only wall-clock the head keeps: sample timestamps are data time, which backfill makes
 	// unusable as a measure of how long data has been sitting unflushed.
@@ -274,7 +275,7 @@ func (h *head) appendByID(
 
 	// Memory backpressure applies to every sample (known or new): once the head is at the
 	// in-flight cap, shed until a flush drains it.
-	if limits.MaxInFlightBytes > 0 && h.bytes >= limits.MaxInFlightBytes {
+	if limits.MaxInFlightBytes > 0 && h.inFlightBytes() >= limits.MaxInFlightBytes {
 		return rejectBytes, id, false, signal.Series{}
 	}
 
@@ -661,6 +662,7 @@ func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
 	detached, bytes, since := h.samples, h.bytes, h.since
 	h.samples = make(map[signal.SeriesID]*sampleBuf)
 	h.bytes = 0
+	h.detachedBytes = bytes
 	h.since = time.Time{}
 
 	return detached, bytes, since
@@ -686,6 +688,7 @@ func (h *head) reattach(detached map[signal.SeriesID]*sampleBuf, bytes int64, si
 	}
 
 	h.grow(bytes)
+	h.detachedBytes = 0
 
 	// grow stamps since at now for a head that was empty; the samples coming back are older than
 	// that, so the earlier start wins and the flush interval keeps measuring from it.
@@ -803,3 +806,5 @@ func windowCopy(buf *sampleBuf, start, end int64, e *Engine) ([]int64, []float64
 
 	return ts, values, sf
 }
+
+func (h *head) inFlightBytes() int64 { return h.bytes + h.detachedBytes }

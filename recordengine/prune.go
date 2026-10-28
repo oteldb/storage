@@ -60,6 +60,8 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
+	e.identityMu.Lock()
+	defer e.identityMu.Unlock()
 
 	e.mu.RLock()
 	dirty, total := e.identityDirty, e.head.series.Len()

@@ -172,7 +172,7 @@ func TestMaintenanceCatchesUpBetweenTicks(t *testing.T) {
 		s.stopCh = make(chan struct{})
 		s.flushWake = make(chan struct{}, 1)
 		s.wg.Add(1)
-		go s.runMaintenance(time.Hour)
+		go s.runMaintenance(ctx, time.Hour)
 		time.Sleep(time.Hour)
 		synctest.Wait()
 

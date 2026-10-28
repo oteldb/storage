@@ -153,21 +153,13 @@ type Options struct {
 	// memory); negative ⇒ unbounded, for an embedder that bounds reads itself.
 	MaxQueryBytes int64
 
-	// MergeMemoryBytes limits resident merge state independently of stored part size. Streamed
-	// outputs hold windows, frames and per-series state; whole-object backends also charge retained
-	// encoded output. Zero derives a share of GOMEMLIMIT (then cgroup or host memory); negative opts out.
-	// Admission may exceed the pool for an indivisible input, reported as an over-budget merge.
-	//
-	// It also decides how many merges run at once: the budget admits as many as can each hold a
-	// usable allowance, capped by the maintenance fan-out (min of [Options.MaintenanceConcurrency]
-	// and the engine count). Lowering it therefore buys fewer, better-fed merges rather than the
-	// same number of starved ones — a merge admitted with too little memory compacts fewer parts per
-	// pass than the next flush adds.
-	//
-	// The trade is merge *throughput*: a 16-core node with a 2 GiB limit runs 4 merges rather than
-	// 16, so a compaction cycle takes longer in wall-clock while holding the same total bytes. A
-	// background merge that cannot get its share is deferred to the next cycle rather than queued,
-	// so the maintenance loop — which also services size-triggered flushes — never parks on it.
+	// MergeMemoryBytes budgets resident maintenance work independently of stored part size. Merges
+	// use at most three quarters of this admission pool; flushes can use the remaining reservation.
+	// Both reserve their estimated working sets from the shared pool. An oversized indivisible
+	// operation runs alone, so this is an admission estimate rather than a hard RSS ceiling.
+	// Zero derives one eighth of the process limit; negative disables budgeting and build overlap.
+	// Memory and MaintenanceConcurrency jointly bound merge fan-out. Background merges defer when
+	// their allowance is unavailable; the independent pressure worker still services flush wakes.
 	MergeMemoryBytes int64
 
 	// MinFreeBytes is the headroom each engine leaves unused on a backend that reports free space.

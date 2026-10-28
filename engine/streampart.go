@@ -8,6 +8,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
@@ -261,20 +262,19 @@ func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 	return part, nil
 }
 
-// identityEntries resolves the part's distinct series under a single read lock, rather than one per
-// series.
+// identityEntries resolves the part's identities in bounded lock sections. Caller holds flushMu.
 func (p *partStreamWriter) identityEntries() identitySnapshot {
-	p.e.mu.RLock()
-	defer p.e.mu.RUnlock()
-
-	out := identitySnapshot{view: p.e.head.series.View(), refs: make([]uint32, 0, len(p.runs))}
-
-	for _, r := range p.runs {
-		id := signal.SeriesID(r.Value)
-		if ref, ok := p.e.head.series.Ref(id); ok {
-			out.refs = append(out.refs, ref)
+	out := identitySnapshot{refs: make([]uint32, 0, len(p.runs))}
+	ids := func(yield func(signal.SeriesID) bool) {
+		for _, r := range p.runs {
+			if !yield(signal.SeriesID(r.Value)) {
+				return
+			}
 		}
 	}
-
+	p.e.captureIdentities(ids, func(_ signal.SeriesID, view series.View, ref uint32) {
+		out.view = view
+		out.refs = append(out.refs, ref)
+	})
 	return out
 }

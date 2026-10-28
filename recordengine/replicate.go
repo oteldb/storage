@@ -24,8 +24,8 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 		return nil, AppendResult{}, err
 	}
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.LockWriter()
+	defer e.mu.UnlockWriter()
 
 	a := &primaryApply{
 		e:         e,
@@ -58,7 +58,7 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 	// quorum ack counts on: a restart replays them, instead of serving a hole for everything written
 	// since the last flush. They are already framed for replication, so the log takes them verbatim.
 	if e.cfg.WAL != nil {
-		if err := e.cfg.WAL.WriteFrames(accepted); err != nil {
+		if err := e.mu.WithReaders(func() error { return e.cfg.WAL.WriteFrames(accepted) }); err != nil {
 			return nil, AppendResult{}, err
 		}
 	}
@@ -182,8 +182,8 @@ func (a *primaryApply) side(payload []byte) error {
 // primary already decided the accepted set), so all replicas hold identical data. Safe for
 // concurrent use.
 func (e *Engine) ApplyReplicated(data []byte) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.LockWriter()
+	defer e.mu.UnlockWriter()
 
 	return wal.Replay(data, e.replayHandlers())
 }

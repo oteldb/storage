@@ -6,33 +6,66 @@ the locking discipline below.
 
 ## Locking discipline (shared with `recordengine`)
 
-**Invariant: the engine lock is never held across object-store I/O.** Parts are immutable, so every
-phase is `plan under lock → I/O off lock → publish under lock`.
+`internal/engineguard` separates catalog ownership, writer ordering and reader-visible state.
+The order is catalog → writer → state. Append, replica apply and WAL operations join writer
+ordering; catalog/reload/repair operations take all three. Queries take the state read lock;
+lazy postings sorting takes only state exclusion. None of these locks is reentrant.
 
-| element | rule |
+| operation | ordering |
 |---|---|
-| `parts` slice | copy-on-write; a snapshot stays valid after unlock |
-| published part | never written: a snapshot's parts are read lock-free (see "A published part is never written") |
-| fetch | plans under RLock (matchers, `acquire()`, head seed), then reads lock-free |
-| flush/merge | parts swap, index commit and WAL checkpoint publish atomically |
-| writers | only the maintenance loop mutates `parts` |
-| retired parts | refcounted, reclaimed deferred, so a fetch never races a delete |
-| head detach | detached buffers stay readable via `flushing` until the part lands |
+| append | decide and encode under state; WAL I/O admits readers; apply after success |
+| flush detach | seal WAL and detach under one writer barrier; frozen buffers remain readable |
+| identity capture | capture immutable arenas, resolve at most 256 references per read-lock section |
+| part build | immutable inputs off state; one flush slot and one merge slot when budgeted |
+| catalog commit | candidate parts/epoch stay private; CAS and conflict reads admit writers/readers |
+| publication | install parts and remove frozen buffers together under state exclusion |
+| checkpoint | only the captured sealed prefix, after confirmed catalog commit; readers proceed |
+| reclamation | retired parts wait for query and builder references, then are deleted |
 
-Publishing atomically keeps the durable watermark in step with part discoverability: exactly-once
-crash consistency.
+Reset, repair and pruning take the build barrier exclusively. Pruning also excludes public
+reloads through an identity lifecycle gate; a newly adopted part cannot revive an identity
+between prune planning and installation. Full recovery/reload retains writer ordering while
+it discovers a WAL epoch. Conflict rebase preserves this writer's epoch and admits ingestion.
+A reload during a flush never moves the active WAL back into the sealed generation. A retry
+commits the highest WAL epoch captured at detach, rather than counting successful flushes: a
+failed build may have reattached records alongside writes from the newer sealed generation.
+Owner orphan sweeps are skipped while a local build is active.
 
-**Invariant:** a record is visible in exactly one of head / `flushing` / part. Never neither
-(visibility gap), never both (double count).
+A read plan sees each stored record in head, frozen buffers, or parts exactly once. Published
+part data is immutable. A merge pins committed sources, revalidates their handles at commit,
+and preserves all unselected parts, including a concurrent flush's additions.
 
-**A flush that fails before publishing unwinds** (`abortFlush`): every pre-publish error path — the
-WAL seal, the part write, the read-back — folds the detached buffers back into the head and clears
-`flushing` in one critical section. Leaving them in `flushing` would strand them: the next flush
-overwrites it, and its checkpoint then discards the WAL segments that were the samples' last copy.
-The fold merges — appends kept landing in the fresh buffers during the flush, and the detached
-samples precede them — and restores the byte measure and `head.since`, so the retry is scheduled
-from when the data actually started waiting. Past the publish there is nothing to unwind: the parts
-are already in the live set and the samples are durable.
+A flush failing during seal/build/read-back reattaches its frozen buffers, preserving age and
+memory accounting. Completed outputs whose catalog commit remains unconfirmed stay locally
+queryable and keep their WAL; later commits carry those same outputs instead of rewriting rows.
+A merge failure leaves its inputs visible and retains any output the backend may have committed.
+
+A lost CAS response is reconciled by reading the exact candidate bytes with a bounded context
+that survives caller cancellation. A confirmed success installs state despite cancellation.
+An unconfirmed result is an error, never proof of rollback: outputs and WAL remain protected.
+Foreign identities are loaded before their part handles become readable. Recovery identity and
+legacy-object operations may still hold state across I/O; the progress guarantee covers WAL,
+live catalog CAS/rebase and immutable part building, not every recovery operation.
+
+### Build memory and scheduling
+
+The facade's shared build pool uses `MergeMemoryBytes` (default: one eighth of the process
+limit). A separate merge limiter allows at most three quarters of that allowance, leaving a
+flush reserve. Every merge holds both reservations; flushes acquire the shared build pool.
+Queued work prevents newer merges from consuming its allowance. An oversized flush owns the
+whole build pool and runs alone; nil `FlushAdmission` retains serialized per-engine builds.
+
+Flush estimates charge copied/sorted columns, codec buffers, sidecars, offsets/maps, serialized
+identity records, symbol encoder workspace and decoded attribute materialization. Resource/scope
+references count per series; shared symbol payloads count separately. Nested values are charged
+for expansion. These are conservative admission estimates, not a hard RSS or allocator bound.
+Record side stores lack an active Encode/Stored bound, so their flushes run alone. Metrics keep
+frozen sample bytes in admission until publication, matching the record engine's accounting.
+
+The periodic/catch-up worker and a separate pressure-flush worker have bounded fan-out. A paused
+merge does not stop pressure wakes. Completed pressure passes wake merge catch-up. Close cancels
+queued maintenance admission, drains both workers, then performs the final engine flush. There is
+only one frozen generation per engine; no extra flush queue or parallel appenders are introduced.
 
 ## Head
 
@@ -228,9 +261,8 @@ merged symbol sidecars stay unbounded.
 
 ## Lifecycle and part identity
 
-Driven by the facade's single maintenance loop, plus a head-bytes trigger flushing only the
-over-threshold engines. A periodic cycle seeds a FIFO queue of selectable merges; a pressure flush
-also seeds it when idle. Work drains between ticks. One turn runs at most the maintenance fan-out of
+The periodic maintenance worker seeds a FIFO queue of selectable merges; the independent
+pressure worker flushes over-threshold engines and wakes that queue when idle. Work drains between ticks. One turn runs at most the maintenance fan-out of
 single-group merges, or one deferred retry alone. Successful work with candidates left rejoins the tail;
 deferrals retry only while the batch made progress, and errors leave the queue until a later wake.
 `MergeStep` reports actual completed work from the merge result; a successful no-op is not progress.
@@ -238,15 +270,12 @@ Whole-part retention drops count even when compaction then defers. `MergeWith` k
 contract over the same step. Candidate planning uses unopened adopted layouts as the merge does,
 so an unreadable part's recorded aggregation still prevents an incompatible policy rewrite.
 This keeps a busy engine from owning every turn and a busy operator budget from causing a spin.
-Shutdown, the timed cycle and pressure flushes preempt the next catch-up batch; an in-flight merge
-can still delay them. Every attempt rechecks compaction ownership and resolves retention again,
+Shutdown and the timed cycle preempt the next catch-up batch; pressure flushes run independently. Every attempt rechecks compaction ownership and resolves retention again,
 including byte budgets against the current part set. Peers are notified after a merge; peer sync
 and EC conversion remain part of the timed cycle. Each merge retains its normal repair pass.
-`Admin.MaintainNow` still runs one cycle. `Engine` is exported and `Close`/`Reset` callable from
-anywhere, so concurrency is enforced, not assumed: flush and merge hold one `flushMu` across their whole body.
-`Reset` takes it too, draining an in-flight flush/merge that would otherwise publish its part into the
-emptied engine, dropping detached buffers with the head, and **retiring** live parts rather than
-deleting their objects, so a fetch holding one is not read out from under it.
+`Admin.MaintainNow` runs one cycle. Per-engine slots enforce one flush and one merge, with
+budgeted overlap; reset drains both through the exclusive build barrier and retires live parts
+rather than deleting objects a reader still holds.
 
 `BenchmarkMaintenanceDrain` compares equal work over eight daily buckets, two flush parts per bucket,
 for metrics and logs on the memory backend; setup and the timer's idle time are excluded. Six
@@ -532,25 +561,14 @@ is divided by the smaller, budget-derived number, which is how many are admitted
 by the memory-derived count would size each output against a share more merges than that could be
 producing.
 
-**And the memory division is enforced, not assumed.** `internal/memlimit.Pool` is a process-wide
-byte semaphore that every engine of every signal draws on through `Config.MergeAdmission`; a merge
-reserves its resident share once it has selected sources and holds it until it ends. Without it the
-share is arithmetic nobody keeps: the facade fans merges out on its own schedule, so the division
-understated what a merge may hold *and* overstated how many may hold it, at once. The pool bounds admission requests; it is not a hard allocation limit. An indivisible input or
-append may exceed the nominal share. Disk floors do not set resident allowances.
+**Memory division is enforced by shared admission.** Every engine reserves its resident merge
+allowance from the merge limiter and shared build pool described above. The pool bounds admission
+requests, not actual allocations: an indivisible input may exceed its nominal share and runs alone.
+Disk floors do not set resident allowances.
 
-**A `MergeOptions.Background` merge does not wait for its budget; it defers.** Admission is taken
-after selection, so a cycle with nothing to compact never consults the budget — and when the budget
-is committed the merge declines and the next cycle retries. Parking would be worse than it looks:
-the facade runs maintenance on *one* goroutine that also services size-triggered flushes, so one
-waiting merge would hold back every engine's memory relief for the rest of the cycle — to bound the
-memory merges take.
-
-Waiting is the **default**, and `Background` is opt-in, set only by that loop: a merge someone asked
-for — an operator command, a test, an embedder driving the engine — must produce one, not a silent
-no-op. A waiting merge does hold its own engine's `flushMu`, which `merge` takes before reaching
-admission, so that engine's flush waits with it. The pool admits no new holders while anyone is
-queued, so the wait is bounded by the merges already running plus whatever is queued ahead.
+A background merge defers when its allowance is unavailable; operator-requested work waits.
+The independent pressure worker does not wait for the merge scheduler. It can still wait for memory
+when overlap would exceed the shared allowance. Queued requests prevent later work from starving them.
 
 **A deferral is visible.** It increments `storage.merge.deferred` (`ADMIN.md`), sets
 `Engine.MergeDeferred`, and does *not* log "nothing to compact" — which is what it would otherwise
@@ -1275,7 +1293,9 @@ Layered optimizations, each opt-in:
 Sparse candidate sets use binary searches; dense sets use linear intersection. Large indexes
 retain one fence ID per 1,024 entries and read the selected 20-KiB leaf pages through the backend's
 shared byte-bounded page cache. A page includes the next entry to bound a run crossing its end.
-Full validation occurs at open; the first query may use that validated view before release.
+Full CRC validation occurs at open using an uncached read on durable range-capable backends.
+Large paged indexes then retain only fences: the first lookup reads its selected leaf page.
+Opening a write-only part pins neither the full validation view nor a whole-object cache entry.
 
 A missing or corrupt sidecar rebuilds the resident index from the series column. Backends without
 native ranged reads retain the whole-object path. The serialized sidecar format is unchanged.
@@ -1523,14 +1543,10 @@ checks). `MergeShape` reads the same kind of snapshot but only the part's immuta
 rather than updating the old one in place. A shallow copy is not an option, because the handle holds a
 `sync.Once` and atomics. The rare changed entry costs one open.
 
-The owner's commit is the one writer of a published part's block identity. `updateIndexLocked` stamps
-`blocks`/`claim`/`level` onto a part only once its CAS lands, and a flush whose commit failed leaves
-its part published with the identity still pending. That is safe because the one reader of those
-fields outside `e.mu`, `planMergeBlocks`, runs under `flushMu`. Every commit that can find a pending
-identity holds `flushMu` too: flush, merge, retention drop and repair. A reload stamps none: the only
-pending handles it publishes are flushed parts whose commit failed, carried over as they are, and an
-owner load that carries one leaves its want commit to the next flush or merge.
-
+Block identities are stamped only after their CAS succeeds. A flush with an unconfirmed commit
+keeps its handle pending. Merge planning first retries pending publication and selects only
+committed handles, so concurrent flush publication cannot change its source block metadata.
+Reload replaces changed handles instead of mutating published ones.
 Reuse cannot skip noticing that a part's objects have gone away, which is what turns a lost part into
 a want. A reused handle is probed with `block.PartPresent` — the manifest, the commit point of a part
 write — so a refresh pays one small object per part instead of reopening it.

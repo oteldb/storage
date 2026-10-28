@@ -49,6 +49,7 @@ engines over the fetch seam (`query/fetch`).
 | [`cluster/ARCH.md`](cluster/ARCH.md) | ring, membership, replication, rebalance, sharding, partsync, erasure coding |
 | [`internal/vfs/ARCH.md`](internal/vfs/ARCH.md) | the filesystem seam, `SyncDir`, and what each crash mode of the fake does and does not model |
 | [`internal/mergestream/ARCH.md`](internal/mergestream/ARCH.md) | the seam both merge engines share: the k-way key union, the two seal units, the forward-cursor contract, the conformance suite |
+| [`internal/engineguard/ARCH.md`](internal/engineguard/ARCH.md) | catalog, writer and reader ownership; bounded identity capture and confirmed publication use `identitysnapshot`/`indexcommit`; `buildbudget` estimates flush work |
 | `internal/timebucket` | the merge bucket ladder both engines confine merges to, and the straddler batch over it; rationale in `engine/ARCH.md` |
 | [`ADMIN.md`](ADMIN.md) | operator surface: `Inspect`, `Admin`, drill-downs, metrics catalog |
 
@@ -83,14 +84,12 @@ engines over the fetch seam (`query/fetch`).
   call), so a step-grid range query costs one call rather than one per step. `WindowNamed` is the
   overlapping form: a window wider than the step (a 1h range at a 5m step) at a cost proportional
   to the data, not to the overlap.
-- **Maintenance** — one background loop flushes+merges every (tenant, signal) engine on
-  `FlushInterval`. Previously deferred engines run one at a time before the bounded,
-  pressure-ordered parallel work, so a merge needing the whole budget gets an admission turn.
-  Between ticks, ready merges rotate through bounded merge-only batches; shutdown, periodic
-  maintenance and pressure flushes are checked before each batch. A deferred retry runs alone,
-  and admission stalls or errors park that work until a later wake rather than spinning.
-  Only an actual part change reported by a merge reschedules it; success alone can be a no-op.
-  A head-bytes threshold pokes it early. A durable store always runs it (an unbounded head OOMs).
+- **Maintenance** — a periodic/catch-up worker flushes and merges tenant engines, with deferred
+  tenants receiving an exclusive admission turn before bounded parallel work. An independent
+  pressure worker services head-size wakes even while a merge is building. Engines admit one
+  flush and one merge against a shared memory budget; oversized/opaque flushes run alone.
+  Catalog CAS/rebase admits ingestion, then installs a coherent read view before WAL checkpoint.
+  Close cancels queued work and drains both workers. See `engine/ARCH.md` for lifetime and budgets.
 - **Read-only** — `WithReadOnly()` opens a handle that never mutates the backend: the sweep-nothing
   load, no maintenance loop, no WAL, no flush on `Close`, and every write and `Admin` mutation
   refused with `ErrReadOnly`. `Open` refuses it alongside a cluster, a WAL dir, or an ephemeral
@@ -316,6 +315,6 @@ engine/               metrics vertical
 recordengine/         shared record engine (logs/traces/profiles/exemplars)
 query/{fetch,scale,profile,promql}           read seam · scale-out decorators · EXPLAIN ANALYZE · Prom adapter
 cluster/{,ring,etcd,etcd/etcdtest,replica,rebalance,partsync,ec,router}   L0 distribution · in-process etcd for tests
-internal/{obs,retry,simd,parallel,partid,diskguard,vfs,memlimit,memsize,watermark,mergestream,repair,enginetest,reproduce,heaptest,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids · disk-pressure guard · heap accounting · per-series watermark sidecar codec · the merge seam both engines share (k-way key union, seal units, conformance suite) · the repair pass both engines share · the cross-engine conformance suite · gated defect reproducers · heap and allocation measurement for tests · filesystem seam + crash model (validated against ext4 on dm-flakey by `internal/vfs/crashmodel`, `-tags crashmodel`)
+internal/{obs,retry,simd,parallel,partid,diskguard,vfs,memlimit,memsize,engineguard,identitysnapshot,indexcommit,buildbudget,watermark,mergestream,repair,enginetest,reproduce,heaptest,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids · disk-pressure guard · heap accounting · per-series watermark sidecar codec · the merge seam both engines share (k-way key union, seal units, conformance suite) · the repair pass both engines share · the cross-engine conformance suite · gated defect reproducers · heap and allocation measurement for tests · filesystem seam + crash model (validated against ext4 on dm-flakey by `internal/vfs/crashmodel`, `-tags crashmodel`)
 reliability/          public RetryConfig presets
 ```

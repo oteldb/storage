@@ -91,6 +91,7 @@ type Storage struct {
 	// the maintenance loop fans them out together. Without it each engine's per-merge share is
 	// arithmetic nobody enforces. nil ⇒ unlimited.
 	mergePool *memlimit.Pool
+	buildPool *memlimit.Pool
 
 	admitMu sync.Mutex                           // guards admit
 	admit   map[signal.TenantID]*tenantAdmission // per-tenant admission state (rate valve + counters)
@@ -105,8 +106,9 @@ type Storage struct {
 	// a tracer per call. cluster's exported functions cannot take *obs.Obs directly — it is internal.
 	clusterOpts []cluster.Option
 
-	stopCh chan struct{}  // closed by Close to stop the maintenance loop
-	wg     sync.WaitGroup // tracks the maintenance goroutine
+	maintenanceCancel context.CancelFunc
+	stopCh            chan struct{}  // closed by Close to stop the maintenance loop
+	wg                sync.WaitGroup // tracks the maintenance goroutine
 
 	// flushWake carries the head-size flush trigger ([Options.FlushThresholdBytes]) from the write
 	// path to the maintenance loop: a write that leaves an engine's head at or above the threshold
@@ -114,6 +116,7 @@ type Storage struct {
 	// flushes the over-threshold engines without waiting out the interval. The loop stays the only
 	// flusher, so an engine never has two concurrent flushes reserving the same part sequence.
 	flushWake chan struct{}
+	mergeWake chan struct{}
 
 	// sizeRetention memoizes each tenant's size-retention cutoff against the part set it was
 	// computed from, so an idle cycle costs no part enumeration (see sizeCutoffFor).
@@ -165,7 +168,8 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	// thing as a very large one: each merge would ask for the whole of it and they would run one at a
 	// time. Install no pool instead.
 	if budget := memlimit.MergeBudget(o.MergeMemoryBytes); budget < math.MaxInt64 {
-		s.mergePool = memlimit.NewPool(budget)
+		s.buildPool = memlimit.NewPool(budget)
+		s.mergePool = memlimit.NewPool(max(budget-budget/4, 1))
 	}
 
 	observer, err := obs.New(obs.Config{Logger: o.Logger, TracerProvider: o.TracerProvider, MeterProvider: o.MeterProvider})
@@ -231,15 +235,20 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	}
 
 	if o.FlushInterval > 0 {
+		maintenanceCtx, cancelMaintenance := context.WithCancel(context.Background())
+		s.maintenanceCancel = cancelMaintenance
+		s.mergeWake = make(chan struct{}, 1)
 		s.wg.Add(1)
 
 		if o.flushThresholdBytes() > 0 {
 			s.flushWake = make(chan struct{}, 1)
+			s.wg.Add(1)
+			go s.runPressureFlush(maintenanceCtx) //nolint:contextcheck // Lifetime is owned by Storage.Close.
 		}
 
 		// The maintenance loop's context is created inside the goroutine and scoped to
 		// its own lifetime (stopped via stopCh), not to this Open call.
-		go s.runMaintenance(time.Duration(o.FlushInterval)) //nolint:gosec,contextcheck // G118: loop-scoped context, see runMaintenance
+		go s.runMaintenance(maintenanceCtx, time.Duration(o.FlushInterval)) //nolint:contextcheck // G118: loop-scoped context, see runMaintenance
 	}
 
 	if walSyncEvery > 0 {
@@ -279,6 +288,9 @@ func (s *Storage) Close(ctx context.Context) error {
 
 	if s.stopCh != nil {
 		close(s.stopCh)
+		if s.maintenanceCancel != nil {
+			s.maintenanceCancel()
+		}
 		s.wg.Wait()
 	}
 
@@ -1275,7 +1287,8 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		MergeCeilingBytes: limits.MaxMergePartSize,
 		MergeConcurrency:  s.mergeConcurrency,
 		MergeAdmission:    s.admitMerge,
-		MergeMemoryBytes:  s.opts.MergeMemoryBytes,
+		MergeMemoryBytes:  s.mergeMemoryBytes(),
+		FlushAdmission:    s.flushAdmission(),
 		MinFreeBytes:      s.opts.MinFreeBytes,
 		MinFreeInodes:     s.opts.MinFreeInodes,
 		OrphanGrace:       s.opts.OrphanGrace,
@@ -1383,23 +1396,21 @@ func (s *Storage) maintainOneEngine(
 // it. It is the single background loop driving flush (age), merge+retention, and — poked by the
 // write path via flushWake — the head-size flush trigger ([Options.FlushThresholdBytes]). Both
 // paths run on this one goroutine, so an engine is never flushed twice concurrently.
-func (s *Storage) runMaintenance(interval time.Duration) {
+func (s *Storage) runMaintenance(ctx context.Context, interval time.Duration) {
 	defer s.wg.Done()
 
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	ctx := context.Background()
 	var pending []mergeTask
 
 	for {
-		switch nextMaintenanceEvent(s.stopCh, s.flushWake, t.C, len(pending) > 0) {
+		switch nextMaintenanceEvent(s.stopCh, s.mergeWake, t.C, len(pending) > 0) {
 		case maintenanceStop:
 			return
 		case maintenanceTick:
 			s.maintain(ctx)
 			pending = s.mergeCatchupTasks(ctx)
 		case maintenanceFlush:
-			s.flushPressured(ctx)
 			if len(pending) == 0 {
 				pending = s.mergeCatchupTasks(ctx)
 			}
@@ -1986,18 +1997,37 @@ func (s *Storage) recordEnginesBySignal() map[signal.Signal]map[signal.TenantID]
 // service a size-triggered flush until the whole cycle's fan-out returns, so a merge parking here
 // would hold back every engine's memory relief for the rest of the cycle.
 func (s *Storage) admitMerge(ctx context.Context, bytes int64, wait bool) (func(), bool, error) {
+	var releaseMerge func()
 	if !wait {
-		release, ok := s.mergePool.TryAcquire(bytes)
-
-		return release, ok, nil
+		var ok bool
+		releaseMerge, ok = s.mergePool.TryAcquire(bytes)
+		if !ok {
+			return nil, false, nil
+		}
+	} else {
+		var err error
+		releaseMerge, err = s.mergePool.Acquire(ctx, bytes)
+		if err != nil {
+			return nil, false, err
+		}
 	}
-
-	release, err := s.mergePool.Acquire(ctx, bytes)
-	if err != nil {
-		return nil, false, err
+	var releaseBuild func()
+	if !wait {
+		var ok bool
+		releaseBuild, ok = s.buildPool.TryAcquire(bytes)
+		if !ok {
+			releaseMerge()
+			return nil, false, nil
+		}
+	} else {
+		var err error
+		releaseBuild, err = s.buildPool.Acquire(ctx, bytes)
+		if err != nil {
+			releaseMerge()
+			return nil, false, err
+		}
 	}
-
-	return release, true, nil
+	return func() { releaseBuild(); releaseMerge() }, true, nil
 }
 
 // mergeConcurrency is the *ceiling* on how many merges may run at once — the maintenance fan-out,

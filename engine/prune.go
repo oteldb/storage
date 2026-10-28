@@ -78,6 +78,8 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
+	e.identityMu.Lock()
+	defer e.identityMu.Unlock()
 
 	e.mu.RLock()
 	// readablePartsLocked, not e.parts: the identities of an adopted part back rows this engine

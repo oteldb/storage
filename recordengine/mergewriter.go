@@ -451,20 +451,18 @@ func (w *recordPartStreamWriter) finish(ctx context.Context) (sealedPart, error)
 	return sealedPart{prefix: prefix, minT: w.minT, maxT: w.maxT, rows: w.rows, diskSealed: w.diskSealed}, nil
 }
 
-// identityEntries resolves the part's streams under one read lock.
+// identityEntries resolves the part's streams in bounded lock sections. Caller holds flushMu.
 func (w *recordPartStreamWriter) identityEntries() []series.Entry {
-	e := w.e
-
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
 	out := make([]series.Entry, 0, len(w.wmarks))
-
-	for _, wm := range w.wmarks {
-		if s, ok := e.head.series.Get(wm.ID); ok {
-			out = append(out, series.Entry{ID: wm.ID, Series: s})
+	ids := func(yield func(signal.SeriesID) bool) {
+		for _, wm := range w.wmarks {
+			if !yield(wm.ID) {
+				return
+			}
 		}
 	}
-
+	w.e.captureIdentities(ids, func(id signal.SeriesID, view series.View, ref uint32) {
+		out = append(out, series.Entry{ID: id, Series: view.At(int(ref), nil)})
+	})
 	return out
 }
