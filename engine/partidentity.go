@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"iter"
-	"maps"
 
 	"github.com/go-faster/errors"
 	"github.com/go-faster/sdk/zctx"
@@ -82,7 +81,7 @@ func writeIdentity(ctx context.Context, b backend.Backend, prefix string, entrie
 // identitiesOf resolves a detached generation outside the reader lock. Caller holds flushMu.
 func (e *Engine) identitiesOf(ids map[signal.SeriesID]*sampleBuf) identitySet {
 	out := identitySet{refs: make(map[signal.SeriesID]uint32, len(ids))}
-	e.captureIdentities(maps.Keys(ids), func(id signal.SeriesID, view series.View, ref uint32) {
+	e.captureDetachedIdentities(ids, func(id signal.SeriesID, view series.View, ref uint32) {
 		out.view, out.refs[id] = view, ref
 	})
 	return out
@@ -192,4 +191,10 @@ func (e *Engine) registerPartIdentities(ctx context.Context, prefix string, admi
 	}
 
 	return true, nil
+}
+
+func (e *Engine) captureDetachedIdentities(
+	ids map[signal.SeriesID]*sampleBuf, emit func(signal.SeriesID, series.View, uint32),
+) {
+	identitysnapshot.CaptureMap(e.mu.RLocker(), func() *series.Index { return e.head.series }, ids, emit)
 }

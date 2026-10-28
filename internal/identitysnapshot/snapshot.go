@@ -3,6 +3,7 @@ package identitysnapshot
 
 import (
 	"iter"
+	"maps"
 	"sync"
 
 	"github.com/oteldb/storage/index/series"
@@ -22,7 +23,38 @@ func Capture(
 	index := current()
 	view := index.View()
 	lock.Unlock()
+	captureReferences(lock, index, view, ids, emit)
+}
 
+// CaptureMap resolves an immutable selected set, without guaranteeing iteration order.
+// The caller prevents registry replacement; selected IDs predate capture. emit runs outside lock.
+func CaptureMap[V any](
+	lock sync.Locker, current func() *series.Index, selected map[signal.SeriesID]V,
+	emit func(signal.SeriesID, series.View, uint32),
+) {
+	lock.Lock()
+	index := current()
+	view := index.View()
+	lock.Unlock()
+
+	if len(selected) < view.Len()/4+min(view.Len()%4, 1) {
+		captureReferences(lock, index, view, maps.Keys(selected), emit)
+		return
+	}
+	// Dense flushes scan at most four times their selected cardinality, avoiding writer-preferred
+	// lock reacquisition per chunk. Sparse selections retain bounded lookups into the registry.
+	for i := range view.Len() {
+		id := view.ID(i)
+		if _, ok := selected[id]; ok {
+			emit(id, view, uint32(i))
+		}
+	}
+}
+
+func captureReferences(
+	lock sync.Locker, index *series.Index, view series.View, ids iter.Seq[signal.SeriesID],
+	emit func(signal.SeriesID, series.View, uint32),
+) {
 	var batch [batchSize]signal.SeriesID
 	var refs [batchSize]uint32
 	var found [batchSize]bool

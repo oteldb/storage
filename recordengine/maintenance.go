@@ -2,7 +2,6 @@ package recordengine
 
 import (
 	"context"
-	"maps"
 	"math"
 
 	"github.com/oteldb/storage/index/series"
@@ -45,7 +44,7 @@ func (e *Engine) reserveFlush(
 	for _, buf := range detached {
 		rows = buildbudget.Add(rows, int64(buf.len()))
 	}
-	e.captureIdentities(maps.Keys(detached), func(_ signal.SeriesID, view series.View, ref uint32) {
+	e.captureDetachedIdentities(detached, func(_ signal.SeriesID, view series.View, ref uint32) {
 		identities = buildbudget.Add(identities, view.EncodingBytes(int(ref)))
 		if first {
 			workspace = view.EncodingWorkspace()

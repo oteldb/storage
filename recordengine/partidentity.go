@@ -3,7 +3,6 @@ package recordengine
 import (
 	"context"
 	"iter"
-	"maps"
 
 	"github.com/go-faster/errors"
 	"github.com/go-faster/sdk/zctx"
@@ -77,7 +76,7 @@ func writeIdentity(ctx context.Context, b backend.Backend, prefix string, entrie
 // identitiesOf resolves a detached generation outside the reader lock. Caller holds flushMu.
 func (e *Engine) identitiesOf(ids map[signal.SeriesID]*recordCols) identitySet {
 	out := make(identitySet, len(ids))
-	e.captureIdentities(maps.Keys(ids), func(id signal.SeriesID, view series.View, ref uint32) {
+	e.captureDetachedIdentities(ids, func(id signal.SeriesID, view series.View, ref uint32) {
 		out[id] = view.At(int(ref), nil)
 	})
 	return out
@@ -187,4 +186,10 @@ func (e *Engine) registerPartIdentities(ctx context.Context, prefix string, admi
 	}
 
 	return true, nil
+}
+
+func (e *Engine) captureDetachedIdentities(
+	ids map[signal.SeriesID]*recordCols, emit func(signal.SeriesID, series.View, uint32),
+) {
+	identitysnapshot.CaptureMap(e.mu.RLocker(), func() *series.Index { return e.head.series }, ids, emit)
 }

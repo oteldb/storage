@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"maps"
 
 	"github.com/go-faster/errors"
 	"github.com/go-faster/sdk/zctx"
@@ -48,7 +47,7 @@ func (e *Engine) reserveFlush(
 	for _, buf := range detached {
 		rows = buildbudget.Add(rows, int64(len(buf.ts)))
 	}
-	e.captureIdentities(maps.Keys(detached), func(_ signal.SeriesID, view series.View, ref uint32) {
+	e.captureDetachedIdentities(detached, func(_ signal.SeriesID, view series.View, ref uint32) {
 		identities = buildbudget.Add(identities, view.EncodingBytes(int(ref)))
 		if first {
 			workspace = view.EncodingWorkspace()

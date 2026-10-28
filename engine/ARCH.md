@@ -15,7 +15,7 @@ lazy postings sorting takes only state exclusion. None of these locks is reentra
 |---|---|
 | append | decide and encode under state; WAL I/O admits readers; apply after success |
 | flush detach | seal WAL and detach under one writer barrier; frozen buffers remain readable |
-| identity capture | capture immutable arenas, resolve at most 256 references per read-lock section |
+| identity capture | dense detached maps scan immutable arenas off-lock; sparse/ordered callers resolve at most 256 references per read-lock section |
 | part build | immutable inputs off state; one flush slot and one merge slot when budgeted |
 | catalog commit | candidate parts/epoch stay private; CAS and conflict reads admit writers/readers |
 | publication | install parts and remove frozen buffers together under state exclusion |
@@ -46,6 +46,25 @@ An unconfirmed result is an error, never proof of rollback: outputs and WAL rema
 Foreign identities are loaded before their part handles become readable. Recovery identity and
 legacy-object operations may still hold state across I/O; the progress guarantee covers WAL,
 live catalog CAS/rebase and immutable part building, not every recovery operation.
+
+### Identity capture under write pressure
+
+A frozen map covering at least one quarter of the captured registry scans the immutable view
+and tests membership in that existing map. It takes one read lock per pass, allocates no ID set,
+and scans at most four times the selected cardinality. Smaller selections retain bounded lookup;
+ordered column callers use the original ordered capture. Registry replacement stays excluded by
+the maintenance barrier. Budget estimation still precedes allocating output references.
+
+`BenchmarkIdentityCaptureContended` uses four 4,096-point appenders with a disk-backed WAL.
+Six paired repetitions at GOMAXPROCS=8 on Ryzen 9950X3D2, with a warmed 1,048,576-series head,
+measure two dense passes at 319 ms versus 5.834 s for 256-ID reacquisition (-94.53%, p=0.002).
+Writer throughput is statistically unchanged; observed writer p99 rises from 12.00 to 12.64 ms.
+The fixture excludes cold identity logging and preallocates active sample capacity; these are
+capture scheduling measurements, not a production throughput or memory-capacity prediction.
+At quarter density (262,144 selected IDs in that registry), six paired repetitions measure
+1.448 s versus 125 ms (-91.37%, p=0.002), writer p99 11.81 versus 6.48 ms, and no significant
+writer-throughput change. This shape motivates the quarter-density threshold: a 4M-series
+frozen head in a fully registered 14.5M-series tenant should use the off-lock path.
 
 ### Build memory and scheduling
 
