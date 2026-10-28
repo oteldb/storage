@@ -23,7 +23,12 @@ func (s *Storage) runPressureFlush(ctx context.Context) {
 		select {
 		case <-s.stopCh:
 			return
+		case <-ctx.Done():
+			return
 		case <-s.flushWake:
+			if ctx.Err() != nil {
+				return
+			}
 			s.flushPressured(ctx)
 			select {
 			case s.mergeWake <- struct{}{}:

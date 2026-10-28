@@ -40,6 +40,9 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 // MergeStep is [Engine.MergeWith], reporting whether a successful pass compacted or retired parts.
 // Retention may change parts even when compaction is deferred.
 func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	ctx = e.cfg.Obs.Base(ctx)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.merge",
 		trace.WithAttributes(

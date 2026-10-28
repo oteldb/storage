@@ -126,3 +126,29 @@ func (e *Engine) releaseFlushScratch() {
 		e.flushBuf, e.bloomBuf = nil, nil
 	}
 }
+
+func (e *Engine) canceledFlush(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		if e.HeadBytes() == 0 {
+			return true, nil
+		}
+		return true, err
+	}
+	return false, nil
+}
+
+func (e *Engine) admitFlushWork(ctx context.Context) (func(), error) {
+	if canceled, err := e.canceledFlush(ctx); canceled {
+		return nil, err
+	}
+	unlock := e.lockFlush()
+	if canceled, err := e.canceledFlush(ctx); canceled {
+		unlock()
+		return nil, err
+	}
+	if err := e.admitFlush(ctx); err != nil {
+		unlock()
+		return nil, err
+	}
+	return unlock, nil
+}

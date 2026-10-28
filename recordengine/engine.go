@@ -1397,12 +1397,11 @@ func (p *fetchPlan) releaseParts() {
 // metadata publish run under it. Only the background maintenance task (or Close) calls flush, so the
 // parts mutation has a single writer.
 func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error) {
-	unlock := e.lockFlush()
-	defer unlock()
-
-	if err := e.admitFlush(ctx); err != nil {
+	unlock, err := e.admitFlushWork(ctx)
+	if unlock == nil {
 		return 0, 0, err
 	}
+	defer unlock()
 
 	// Plan (under lock): detach the head's record buffers (keeping them readable via e.flushing so a
 	// concurrent fetch never loses them), snapshot the side-store delta atomically with the detach (so

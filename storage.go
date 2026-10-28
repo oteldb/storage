@@ -1352,6 +1352,9 @@ func (s *Storage) maintainOneEngine(
 	ctx context.Context, tid signal.TenantID, signalPrefix string,
 	owned map[signal.TenantID]struct{}, ops engineOps,
 ) {
+	if ctx.Err() != nil {
+		return
+	}
 	enginePrefix := string(s.normalizeTenant(tid)) + signalPrefix
 
 	if owned != nil {
@@ -1376,8 +1379,17 @@ func (s *Storage) maintainOneEngine(
 
 	s.refreshOrLog(ctx, "fenced index reload failed", enginePrefix, ops.reload)
 
+	if ctx.Err() != nil {
+		return
+	}
 	_ = ops.flush()
+	if ctx.Err() != nil {
+		return
+	}
 	_ = ops.merge()
+	if ctx.Err() != nil {
+		return
+	}
 
 	// Erasure-code the tenant's now-cold parts (shared-nothing + EC policy only; a no-op
 	// otherwise), replacing their full copies with shards, then prune the owner's staged shards
