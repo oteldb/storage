@@ -12,7 +12,7 @@ require (
 	github.com/go-faster/fs v0.15.0
 	github.com/go-faster/jx v1.2.0
 	github.com/go-faster/sdk v0.39.1
-	github.com/klauspost/compress v1.20.1
+	github.com/klauspost/compress v1.20.3
 	github.com/klauspost/reedsolomon v1.14.2
 	github.com/maypok86/otter/v2 v2.4.0
 	github.com/mmcloughlin/avo v0.6.0
