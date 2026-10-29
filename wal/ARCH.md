@@ -182,6 +182,11 @@ tail, then opens lazily beyond the prior run's segments), `SetEpoch` stamps new 
 and stamps the next generation, and `CheckpointThrough` deletes the segments a flush made durable
 (truncate-on-flush), so replay stays bounded.
 
+**Retry coverage follows WAL epochs, not successful flush counts.** A failed build reattaches its
+frozen records, but new appends may already occupy the next WAL epoch. The retry captures the
+current WAL epoch, seals into the next one, and commits that captured coverage. Otherwise a crash
+after the retry's index commit but before checkpoint replays records already in its new part.
+
 **A flush seals at detach, not at publish.** The part holds exactly the records logged when the head
 was detached, and the part write then runs off the engine lock while ingest continues. Sealing there
 — atomically with the detach — puts every later record in a segment beyond the sealed sequence, at

@@ -42,7 +42,8 @@ type walSeriesAcc struct {
 	isNew    bool          // the series starts a buffer, so its identity record is logged
 	register bool          // the identity is not in the head's index yet
 	series   signal.Series // the identity, set when isNew
-	newest   int64         // the newest admitted timestamp
+	attrs    signal.Attributes
+	newest   int64 // the newest admitted timestamp
 	ts       []int64
 	values   []float64
 	sf       []float64 // per-sample scale factors (aligned with ts)
@@ -73,7 +74,7 @@ func (b *walBatch) admit(
 		}
 	}
 
-	if limits.MaxInFlightBytes > 0 && h.bytes+int64(b.samples)*SampleBytes >= limits.MaxInFlightBytes {
+	if limits.MaxInFlightBytes > 0 && h.inFlightBytes()+int64(b.samples)*SampleBytes >= limits.MaxInFlightBytes {
 		return rejectBytes
 	}
 
@@ -83,8 +84,8 @@ func (b *walBatch) admit(
 		return admitted
 	}
 
-	if s, ok := h.series.Get(id); ok {
-		b.add(id, ts, value, sf, true, false, s)
+	if h.series.Has(id) {
+		b.add(id, ts, value, sf, true, false, signal.Series{})
 
 		return admitted
 	}
@@ -138,6 +139,7 @@ func (b *walBatch) add(id signal.SeriesID, ts int64, value, sf float64, isNew, r
 		acc := walSeriesAcc{isNew: isNew, register: register, series: s, newest: ts}
 		if k < len(b.accs) { // reuse a prior write's accumulator (and its slice capacity)
 			acc.ts, acc.values, acc.sf = b.accs[k].ts[:0], b.accs[k].values[:0], b.accs[k].sf[:0]
+			acc.attrs = b.accs[k].attrs
 			b.accs[k] = acc
 		} else {
 			b.accs = append(b.accs, acc)
@@ -168,14 +170,12 @@ func (b *walBatch) add(id signal.SeriesID, ts int64, value, sf float64, isNew, r
 // empty reports whether the batch staged no samples (so the engine can skip the WAL write).
 func (b *walBatch) empty() bool { return len(b.order) == 0 }
 
-// flush logs the staged write — a series record per series starting a buffer, a samples frame per
-// series — as a single WAL write, so a write that fails logs none of it. It does not reset b.
-func (b *walBatch) flush(h *head, w *wal.SegmentWriter) error {
-	if err := b.encode(h, false); err != nil {
+// flushWALLocked encodes under the state lock, then logs with readers admitted.
+func (e *Engine) flushWALLocked() error {
+	if err := e.walB.encode(e.head, false); err != nil {
 		return err
 	}
-
-	return w.WriteFrames(b.frames.Bytes())
+	return e.mu.WithReaders(func() error { return e.cfg.WAL.WriteFrames(e.walB.frames.Bytes()) })
 }
 
 // encode frames the staged write into b.frames, one samples frame per series, each preceded by its
@@ -189,11 +189,17 @@ func (b *walBatch) encode(h *head, everySeries bool) error {
 
 		switch {
 		case a.isNew:
-			if err := b.fw.WriteSeries(id, a.series); err != nil {
+			s := a.series
+			if !a.register {
+				s, _ = h.series.GetInto(id, a.attrs)
+				a.attrs = s.Attributes
+			}
+			if err := b.fw.WriteSeries(id, s); err != nil {
 				return err
 			}
 		case everySeries:
-			s, _ := h.series.Get(id) // a buffered series is registered
+			s, _ := h.series.GetInto(id, a.attrs)
+			a.attrs = s.Attributes
 			if err := b.fw.WriteSeries(id, s); err != nil {
 				return err
 			}

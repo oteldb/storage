@@ -91,6 +91,7 @@ type Storage struct {
 	// the maintenance loop fans them out together. Without it each engine's per-merge share is
 	// arithmetic nobody enforces. nil ⇒ unlimited.
 	mergePool *memlimit.Pool
+	buildPool *memlimit.Pool
 
 	admitMu sync.Mutex                           // guards admit
 	admit   map[signal.TenantID]*tenantAdmission // per-tenant admission state (rate valve + counters)
@@ -105,8 +106,9 @@ type Storage struct {
 	// a tracer per call. cluster's exported functions cannot take *obs.Obs directly — it is internal.
 	clusterOpts []cluster.Option
 
-	stopCh chan struct{}  // closed by Close to stop the maintenance loop
-	wg     sync.WaitGroup // tracks the maintenance goroutine
+	maintenanceCancel context.CancelFunc
+	stopCh            chan struct{}  // closed by Close to stop the maintenance loop
+	wg                sync.WaitGroup // tracks the maintenance goroutine
 
 	// flushWake carries the head-size flush trigger ([Options.FlushThresholdBytes]) from the write
 	// path to the maintenance loop: a write that leaves an engine's head at or above the threshold
@@ -114,6 +116,7 @@ type Storage struct {
 	// flushes the over-threshold engines without waiting out the interval. The loop stays the only
 	// flusher, so an engine never has two concurrent flushes reserving the same part sequence.
 	flushWake chan struct{}
+	mergeWake chan struct{}
 
 	// sizeRetention memoizes each tenant's size-retention cutoff against the part set it was
 	// computed from, so an idle cycle costs no part enumeration (see sizeCutoffFor).
@@ -165,7 +168,8 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	// thing as a very large one: each merge would ask for the whole of it and they would run one at a
 	// time. Install no pool instead.
 	if budget := memlimit.MergeBudget(o.MergeMemoryBytes); budget < math.MaxInt64 {
-		s.mergePool = memlimit.NewPool(budget)
+		s.buildPool = memlimit.NewPool(budget)
+		s.mergePool = memlimit.NewPool(max(budget-budget/4, 1))
 	}
 
 	observer, err := obs.New(obs.Config{Logger: o.Logger, TracerProvider: o.TracerProvider, MeterProvider: o.MeterProvider})
@@ -231,15 +235,20 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	}
 
 	if o.FlushInterval > 0 {
+		maintenanceCtx, cancelMaintenance := context.WithCancel(context.Background())
+		s.maintenanceCancel = cancelMaintenance
+		s.mergeWake = make(chan struct{}, 1)
 		s.wg.Add(1)
 
 		if o.flushThresholdBytes() > 0 {
 			s.flushWake = make(chan struct{}, 1)
+			s.wg.Add(1)
+			go s.runPressureFlush(maintenanceCtx) //nolint:contextcheck // Lifetime is owned by Storage.Close.
 		}
 
 		// The maintenance loop's context is created inside the goroutine and scoped to
 		// its own lifetime (stopped via stopCh), not to this Open call.
-		go s.runMaintenance(time.Duration(o.FlushInterval)) //nolint:gosec,contextcheck // G118: loop-scoped context, see runMaintenance
+		go s.runMaintenance(maintenanceCtx, time.Duration(o.FlushInterval)) //nolint:contextcheck // G118: loop-scoped context, see runMaintenance
 	}
 
 	if walSyncEvery > 0 {
@@ -279,6 +288,9 @@ func (s *Storage) Close(ctx context.Context) error {
 
 	if s.stopCh != nil {
 		close(s.stopCh)
+		if s.maintenanceCancel != nil {
+			s.maintenanceCancel()
+		}
 		s.wg.Wait()
 	}
 
@@ -399,116 +411,23 @@ func (s *Storage) WriteMetrics(ctx context.Context, md metric.Metrics) (acc Acce
 		return s.writeMetricsClustered(ctx, md)
 	}
 
-	var (
-		rej            rejectTally
-		sampledDropped int64
-		overflowed     int64
-	)
-
-	// The tenant (hence the engine) is derived from Resource+Scope, which are constant within
-	// a metric, so points arrive in tenant-contiguous runs. Cache the last resolution to skip
-	// the locked engine-map lookup and policy resolve per metric.
-	var run metricRun
-
-	var firstErr error
-
-	emitted := metric.Project(md, func(b *metric.Batch) {
-		if firstErr != nil {
-			return
-		}
-
-		tid := s.tenantFor(b.Resource(), b.Scope())
-		if tenantReserved(tid) {
-			rej.reserved += int64(b.Len())
-
-			return
-		}
-
-		var err error
-		if run, err = s.metricRunFor(run, tid); err != nil {
-			firstErr = err
-
-			return
-		}
-
-		// Admission stage (between tenant resolution and the engine, DESIGN §8a): the ingest-rate
-		// valve sheds a whole over-budget batch up front; cardinality and in-flight-memory limits
-		// are enforced per sample inside the engine (race-free under its lock).
-		if !run.admit.allowRate(run.limits, int64(b.Len())*engine.SampleBytes, s.now()) {
-			rej.rate += int64(b.Len())
-			run.admit.addRate(int64(b.Len()))
-
-			return
-		}
-
-		// Budgeted (lossy) sampling: keep a representative subset and weight each kept sample with a
-		// scale factor so the embedder's count/sum/rate stays unbiased. Under budget this window the
-		// sampler returns no weights and the batch passes through unchanged (no scale-factor column).
-		ids, tss, vals, sf := b.IDs, b.Ts, b.Values, []float64(nil)
-		mat := b.Series
-
-		if weights, dropped := run.admit.sampleBatch(run.sampling, s.now(), b.IDs, b.Ts); weights != nil {
-			fids := make([]signal.SeriesID, 0, len(weights))
-			fts := make([]int64, 0, len(weights))
-			fvals := make([]float64, 0, len(weights))
-			fsf := make([]float64, 0, len(weights))
-			kept := make([]int, 0, len(weights))
-
-			for i, w := range weights {
-				if w == 0 {
-					continue
-				}
-
-				fids = append(fids, b.IDs[i])
-				fts = append(fts, b.Ts[i])
-				fvals = append(fvals, b.Values[i])
-				fsf = append(fsf, w)
-				kept = append(kept, i)
-			}
-
-			ids, tss, vals, sf = fids, fts, fvals, fsf
-			mat = func(j int) signal.Series { return b.Series(kept[j]) }
-			sampledDropped += dropped
-		}
-
-		res, err := run.eng.AppendBatch(ids, tss, vals, sf, mat, engine.AppendLimits{
-			MaxSeries:        run.limits.MaxSeries,
-			MaxSeriesSoft:    run.limits.MaxSeriesSoft,
-			Overflow:         metricOverflow,
-			MaxInFlightBytes: run.limits.MaxInFlightBytes,
-		})
-		if err != nil {
-			firstErr = err
-
-			return
-		}
-
-		rej.ooo += int64(res.RejectedOOO)
-		rej.cardinality += int64(res.RejectedCardinality)
-		rej.inflight += int64(res.RejectedBytes)
-		run.admit.record(int64(res.Accepted), int64(res.RejectedOOO), int64(res.RejectedCardinality), int64(res.RejectedBytes))
-
-		if res.Overflowed > 0 {
-			overflowed += int64(res.Overflowed)
-			run.admit.recordOverflowed(int64(res.Overflowed))
-		}
-
-		s.pokeFlush(run.eng)
-	})
-
-	if firstErr != nil {
-		return Accepted{}, firstErr
+	buffer := metricAppendPool.Get().(*metricAppendBuffer)
+	defer func() {
+		buffer.reset()
+		metricAppendPool.Put(buffer)
+	}()
+	writer := metricWriter{store: s, buffer: buffer}
+	emitted := metric.Project(md, writer.write)
+	if writer.err == nil {
+		writer.err = writer.flush()
 	}
-
-	total := rej.total()
+	if writer.err != nil {
+		return Accepted{}, writer.err
+	}
+	total := writer.rejected.total()
 	accepted := int64(emitted) - total
-	s.emitAdmission(ctx, signal.Metric, accepted, rej, sampledDropped, overflowed)
-
-	return Accepted{
-		Accepted:       accepted,
-		Rejected:       total,
-		RejectedReason: rej.reason(),
-	}, nil
+	s.emitAdmission(ctx, signal.Metric, accepted, writer.rejected, writer.sampledDropped, writer.overflowed)
+	return Accepted{Accepted: accepted, Rejected: total, RejectedReason: writer.rejected.reason()}, nil
 }
 
 // Machine-readable admission rejection reasons, shared by the OTLP partial-success reason
@@ -1368,7 +1287,8 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		MergeCeilingBytes: limits.MaxMergePartSize,
 		MergeConcurrency:  s.mergeConcurrency,
 		MergeAdmission:    s.admitMerge,
-		MergeMemoryBytes:  s.opts.MergeMemoryBytes,
+		MergeMemoryBytes:  s.mergeMemoryBytes(),
+		FlushAdmission:    s.flushAdmission(),
 		MinFreeBytes:      s.opts.MinFreeBytes,
 		MinFreeInodes:     s.opts.MinFreeInodes,
 		OrphanGrace:       s.opts.OrphanGrace,
@@ -1432,6 +1352,9 @@ func (s *Storage) maintainOneEngine(
 	ctx context.Context, tid signal.TenantID, signalPrefix string,
 	owned map[signal.TenantID]struct{}, ops engineOps,
 ) {
+	if ctx.Err() != nil {
+		return
+	}
 	enginePrefix := string(s.normalizeTenant(tid)) + signalPrefix
 
 	if owned != nil {
@@ -1456,8 +1379,17 @@ func (s *Storage) maintainOneEngine(
 
 	s.refreshOrLog(ctx, "fenced index reload failed", enginePrefix, ops.reload)
 
+	if ctx.Err() != nil {
+		return
+	}
 	_ = ops.flush()
+	if ctx.Err() != nil {
+		return
+	}
 	_ = ops.merge()
+	if ctx.Err() != nil {
+		return
+	}
 
 	// Erasure-code the tenant's now-cold parts (shared-nothing + EC policy only; a no-op
 	// otherwise), replacing their full copies with shards, then prune the owner's staged shards
@@ -1476,23 +1408,21 @@ func (s *Storage) maintainOneEngine(
 // it. It is the single background loop driving flush (age), merge+retention, and — poked by the
 // write path via flushWake — the head-size flush trigger ([Options.FlushThresholdBytes]). Both
 // paths run on this one goroutine, so an engine is never flushed twice concurrently.
-func (s *Storage) runMaintenance(interval time.Duration) {
+func (s *Storage) runMaintenance(ctx context.Context, interval time.Duration) {
 	defer s.wg.Done()
 
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	ctx := context.Background()
 	var pending []mergeTask
 
 	for {
-		switch nextMaintenanceEvent(s.stopCh, s.flushWake, t.C, len(pending) > 0) {
+		switch nextMaintenanceEvent(s.stopCh, s.mergeWake, t.C, len(pending) > 0) {
 		case maintenanceStop:
 			return
 		case maintenanceTick:
 			s.maintain(ctx)
 			pending = s.mergeCatchupTasks(ctx)
 		case maintenanceFlush:
-			s.flushPressured(ctx)
 			if len(pending) == 0 {
 				pending = s.mergeCatchupTasks(ctx)
 			}
@@ -2079,18 +2009,37 @@ func (s *Storage) recordEnginesBySignal() map[signal.Signal]map[signal.TenantID]
 // service a size-triggered flush until the whole cycle's fan-out returns, so a merge parking here
 // would hold back every engine's memory relief for the rest of the cycle.
 func (s *Storage) admitMerge(ctx context.Context, bytes int64, wait bool) (func(), bool, error) {
+	var releaseMerge func()
 	if !wait {
-		release, ok := s.mergePool.TryAcquire(bytes)
-
-		return release, ok, nil
+		var ok bool
+		releaseMerge, ok = s.mergePool.TryAcquire(bytes)
+		if !ok {
+			return nil, false, nil
+		}
+	} else {
+		var err error
+		releaseMerge, err = s.mergePool.Acquire(ctx, bytes)
+		if err != nil {
+			return nil, false, err
+		}
 	}
-
-	release, err := s.mergePool.Acquire(ctx, bytes)
-	if err != nil {
-		return nil, false, err
+	var releaseBuild func()
+	if !wait {
+		var ok bool
+		releaseBuild, ok = s.buildPool.TryAcquire(bytes)
+		if !ok {
+			releaseMerge()
+			return nil, false, nil
+		}
+	} else {
+		var err error
+		releaseBuild, err = s.buildPool.Acquire(ctx, bytes)
+		if err != nil {
+			releaseMerge()
+			return nil, false, err
+		}
 	}
-
-	return release, true, nil
+	return func() { releaseBuild(); releaseMerge() }, true, nil
 }
 
 // mergeConcurrency is the *ceiling* on how many merges may run at once — the maintenance fan-out,

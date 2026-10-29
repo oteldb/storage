@@ -200,8 +200,8 @@ func (e *Engine) MergeBacklog() int { return e.MergeShape().Backlog }
 // epoch. ok is false when the engine has no WAL (ephemeral). It takes a read lock, excluding
 // concurrent appends (which hold the write lock).
 func (e *Engine) WALState() (segments int, bytes int64, epoch uint64, ok bool) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.LockWriter()
+	defer e.mu.UnlockWriter()
 
 	if e.cfg.WAL == nil {
 		return 0, 0, 0, false

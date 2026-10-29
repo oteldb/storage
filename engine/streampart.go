@@ -262,20 +262,19 @@ func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 	return part, nil
 }
 
-// identityEntries resolves the part's distinct series under a single read lock, rather than one per
-// series.
-func (p *partStreamWriter) identityEntries() []series.Entry {
-	p.e.mu.RLock()
-	defer p.e.mu.RUnlock()
-
-	out := make([]series.Entry, 0, len(p.runs))
-
-	for _, r := range p.runs {
-		id := signal.SeriesID(r.Value)
-		if s, ok := p.e.head.series.Get(id); ok {
-			out = append(out, series.Entry{ID: id, Series: s})
+// identityEntries resolves the part's identities in bounded lock sections. Caller holds flushMu.
+func (p *partStreamWriter) identityEntries() identitySnapshot {
+	out := identitySnapshot{refs: make([]uint32, 0, len(p.runs))}
+	ids := func(yield func(signal.SeriesID) bool) {
+		for _, r := range p.runs {
+			if !yield(signal.SeriesID(r.Value)) {
+				return
+			}
 		}
 	}
-
+	p.e.captureIdentities(ids, func(_ signal.SeriesID, view series.View, ref uint32) {
+		out.view = view
+		out.refs = append(out.refs, ref)
+	})
 	return out
 }

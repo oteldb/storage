@@ -84,6 +84,9 @@ func (t *Table) Bytes(b []byte) []byte {
 // Len returns the number of interned symbols.
 func (t *Table) Len() int { return len(t.syms) }
 
+// Snapshot borrows the immutable symbols registered so far; callers must not mutate it.
+func (t *Table) Snapshot() [][]byte { return t.syms }
+
 // SizeBytes returns the table's resident footprint: the interned payloads it owns, the id→bytes
 // slice, and the lookup map's backing arrays. Callers holding references *into* the table (an
 // interned identity) are not double-counted — every byte is owned here.

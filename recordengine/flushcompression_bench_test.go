@@ -102,7 +102,7 @@ func newFlushCompressionCorpus(tb testing.TB, c flushCompressionCorpus) (*Engine
 	}
 
 	columns := buildFlushColumns(schema, e.head.records, nil)
-	idents := e.head.identitiesOf(e.head.records)
+	idents := e.identitiesOf(e.head.records)
 	_, _ = e.head.detach()
 	return e, columns, idents
 }

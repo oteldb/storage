@@ -184,11 +184,13 @@ func sidxEntryStart(entries []byte, k int) int {
 // no cold-latency regression. With a Viewer (memory backend, or any backend behind
 // [backend.Cached]) a reload is a cache-hit view, so dropping is nearly free.
 type pagedIndex struct {
-	be    backend.Backend
-	key   string
-	n     int // distinct series
-	total int // rows
-	keep  bool
+	be     backend.Backend
+	key    string
+	n      int // distinct series
+	total  int // rows
+	keep   bool
+	offset int64
+	fences []signal.SeriesID
 
 	view atomic.Pointer[[]byte] // validated entries region; nil ⇒ load on next use
 }
@@ -287,12 +289,19 @@ func validSidxEntries(entries []byte, n, total int) bool {
 
 // openPagedIndex reads and fully validates the part's series-index sidecar, returning ok=false
 // (absent or corrupt sidecar, or a row total disagreeing with the manifest) to send the caller to
-// the resident fallback. The validated view is retained — the part is being opened to be read, so
-// the first fetch starts warm; it drops at the part's first refs==0 release.
+// the resident fallback. Range-paged indexes retain only fences after validation; otherwise a
+// newly built part could pin the whole object indefinitely without a query to release it.
 func openPagedIndex(
 	ctx context.Context, b backend.Backend, prefix string, manifestRows int, corrupt *obs.Corruption,
 ) (*pagedIndex, bool) {
-	data, err := backend.ReadView(ctx, b, sidxKey(prefix))
+	key := sidxKey(prefix)
+	var data []byte
+	var err error
+	if !b.IsEphemeral() && backend.RangesNatively(ctx, b, key) {
+		data, err = backend.ReadUncached(ctx, b, key)
+	} else {
+		data, err = backend.ReadView(ctx, b, key)
+	}
 	if err != nil {
 		return nil, false // absent (or unreadable) ⇒ resident fallback
 	}
@@ -306,8 +315,18 @@ func openPagedIndex(
 
 	_, viewer := b.(backend.Viewer)
 
-	p := &pagedIndex{be: b, key: sidxKey(prefix), n: n, total: total, keep: !viewer}
-	p.view.Store(&ents)
+	p := &pagedIndex{be: b, key: key, n: n, total: total, keep: !viewer}
+	if n >= indexPageEntries*2 && backend.RangesNatively(ctx, b, p.key) {
+		p.keep = false
+		p.offset = int64(len(data) - 4 - len(ents))
+		p.fences = make([]signal.SeriesID, (n+indexPageEntries-1)/indexPageEntries)
+		for i := range p.fences {
+			p.fences[i] = sidxEntryID(ents, i*indexPageEntries)
+		}
+	}
+	if len(p.fences) == 0 {
+		p.view.Store(&ents)
+	}
 
 	return p, true
 }

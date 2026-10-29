@@ -43,14 +43,14 @@ func planMergeBlocks(src, out []*part) {
 // writer's included, since its blocks are real claims and reusing one would make two different
 // parts share an identity — this engine's own parts, the holes it carries, and every want
 // outstanding or pending, whose part may yet be repaired back into the index. Caller holds e.mu.
-func (e *Engine) nextBlockLocked(ix *bucketindex.Index) bucketindex.Block {
+func (e *Engine) nextBlockLocked(ix *bucketindex.Index, parts []*part) bucketindex.Block {
 	seed := bucketindex.Index{
 		Entries:         slices.Concat(ix.Entries, e.holes),
 		Wanted:          slices.Concat(e.wants, e.pendingWants, e.adoptedWants, e.pendingHoles),
 		AllocatedBlocks: e.allocated,
 	}
 
-	for _, p := range e.parts {
+	for _, p := range parts {
 		seed.Entries = append(seed.Entries, bucketindex.Entry{Blocks: p.blocks, Claim: p.claim})
 	}
 

@@ -23,9 +23,11 @@ identity folds name/unit/kind/temporality/monotonicity into **reserved labels** 
 matches `__name__` like any other label.
 
 `emit` is called **once per metric** with a `*Batch` (id/timestamp/value columns + the context to
-materialize a `signal.Series` lazily), so the engine takes its lock and resolves the tenant once
-per metric, not per point. The `Batch` is pooled; it and the data it aliases are valid only for the
-`emit` call.
+materialize a `signal.Series` lazily). The `Batch` and its projected vectors are pooled and valid
+only for the `emit` call. A borrowed `Source` retains the input hierarchy independently of those
+vectors; it remains valid until the input metrics are changed or released. `Storage.WriteMetrics`
+copies projected vectors into bounded, tenant-contiguous engine batches and uses `Source` for lazy
+identity materialization. It preserves input order and leaves existing large metric batches intact.
 
 **The series id is computed without allocating or sorting**: the resource‖scope hash pre-image is
 built once per scope group and kept resident at the front of a reused buffer; the reserved labels

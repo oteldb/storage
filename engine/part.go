@@ -61,17 +61,7 @@ type partIndex struct {
 // lookup returns id's row range and whether the part holds it.
 func (idx partIndex) lookup(ctx context.Context, id signal.SeriesID) (rowRange, bool, error) {
 	if p := idx.paged; p != nil {
-		ents, err := p.entries(ctx)
-		if err != nil {
-			return rowRange{}, false, err
-		}
-
-		k, ok := p.search(ents, id)
-		if !ok {
-			return rowRange{}, false, nil
-		}
-
-		return p.rangeAt(ents, k), true, nil
+		return p.lookup(ctx, id)
 	}
 
 	i, ok := slices.BinarySearchFunc(idx.ids, id, signal.SeriesID.Compare)
@@ -85,14 +75,8 @@ func (idx partIndex) lookup(ctx context.Context, id signal.SeriesID) (rowRange, 
 // has reports whether the part holds id.
 func (idx partIndex) has(ctx context.Context, id signal.SeriesID) (bool, error) {
 	if p := idx.paged; p != nil {
-		ents, err := p.entries(ctx)
-		if err != nil {
-			return false, err
-		}
-
-		_, ok := p.search(ents, id)
-
-		return ok, nil
+		_, ok, err := p.lookup(ctx, id)
+		return ok, err
 	}
 
 	_, ok := slices.BinarySearchFunc(idx.ids, id, signal.SeriesID.Compare)
@@ -198,6 +182,19 @@ func (idx partIndex) forEachRange(ctx context.Context, fn func(signal.SeriesID, 
 // merge suffices — no per-id binary search. It is the fully-covered-part count shortcut: presence
 // in such a part already implies an in-window sample, so no decode is needed.
 func (idx partIndex) intersectMark(ctx context.Context, ids []signal.SeriesID, active []bool) error {
+	if len(ids) < idx.seriesCount()/64 {
+		for i, id := range ids {
+			if active[i] {
+				continue
+			}
+			found, err := idx.has(ctx, id)
+			if err != nil {
+				return err
+			}
+			active[i] = found
+		}
+		return nil
+	}
 	if p := idx.paged; p != nil {
 		ents, err := p.entries(ctx)
 		if err != nil {

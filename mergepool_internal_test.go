@@ -89,12 +89,12 @@ func TestMergePoolCapsConcurrentHolders(t *testing.T) {
 
 	ctx := context.Background()
 
-	// A quarter of the budget each: four fit, the fifth does not.
+	// A quarter of the build budget each: three merges fit; the remaining quarter serves flushes.
 	const share = 64 << 20
 
-	held := make([]func(), 0, 4)
+	held := make([]func(), 0, 3)
 
-	for i := range 4 {
+	for i := range 3 {
 		release, ok, err := s.admitMerge(ctx, share, false)
 		require.NoError(t, err)
 		require.True(t, ok, "holder %d must fit in the budget", i)

@@ -96,7 +96,7 @@ func (e *Engine) appendLogged(b *Batch, limits AppendLimits) (AppendResult, erro
 		}
 	}
 
-	if err := e.logWAL(b, sealRecs(payload, res.Accepted)); err != nil {
+	if err := e.mu.WithReaders(func() error { return e.logWAL(b, sealRecs(payload, res.Accepted)) }); err != nil {
 		e.sideStray = e.sideStray || len(b.Side) > 0
 
 		return AppendResult{}, err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"slices"
+	"sync"
 
 	"github.com/maypok86/otter/v2"
 	"github.com/maypok86/otter/v2/stats"
@@ -48,16 +49,19 @@ func Cached(inner Backend, maxBytes int64) Backend {
 		stats:    stats.NewCounter(),
 	}
 
-	c.values = otter.Must(&otter.Options[string, []byte]{
+	c.values = otter.Must(&otter.Options[readCacheKey, []byte]{
 		MaximumWeight: uint64(maxBytes),
-		Weigher:       weighValue,
+		Weigher:       func(_ readCacheKey, v []byte) uint32 { return weighValue("", v) },
 		StatsRecorder: c.stats,
 	})
 
 	// Built once: converting a capturing closure to otter.LoaderFunc at the call site boxes it,
 	// which is an allocation on every read — hits included.
-	c.load = otter.LoaderFunc[string, []byte](func(ctx context.Context, key string) ([]byte, error) {
-		return c.inner.Read(ctx, key)
+	c.load = otter.LoaderFunc[readCacheKey, []byte](func(ctx context.Context, key readCacheKey) ([]byte, error) {
+		if key.generation != nil {
+			return ReadAt(ctx, c.inner, key.name, key.offset, key.length)
+		}
+		return c.inner.Read(ctx, key.name)
 	})
 
 	return c
@@ -77,7 +81,7 @@ func (w *cacheInvalidatingWriter) Commit(ctx context.Context) error {
 		return err
 	}
 
-	w.cache.values.Invalidate(w.key)
+	w.cache.invalidate(w.key)
 
 	return nil
 }
@@ -97,15 +101,16 @@ func weighValue(_ string, v []byte) uint32 {
 type CacheStats struct {
 	Hits, Misses int64
 	Bytes        int64 // resident value bytes
-	Items        int   // resident objects
+	Items        int   // resident cache entries (whole objects or pages)
 }
 
 type cachedBackend struct {
 	inner    Backend
 	maxBytes int64
 
-	values *otter.Cache[string, []byte]
-	load   otter.Loader[string, []byte]
+	values *otter.Cache[readCacheKey, []byte]
+	load   otter.Loader[readCacheKey, []byte]
+	pages  sync.Map
 	stats  *stats.Counter
 }
 
@@ -169,7 +174,7 @@ func (c *cachedBackend) Read(ctx context.Context, key string) ([]byte, error) {
 // Concurrent misses on one key share a single inner read; the loader's error is propagated, never
 // cached, so the next call retries.
 func (c *cachedBackend) ReadView(ctx context.Context, key string) ([]byte, error) {
-	v, err := c.values.Get(ctx, key, c.load)
+	v, err := c.values.Get(ctx, readCacheKey{name: key}, c.load)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +184,7 @@ func (c *cachedBackend) ReadView(ctx context.Context, key string) ([]byte, error
 	// over budget, which for a part column can be hundreds of MiB. Dropping it here bounds that to
 	// this call and keeps the rule the same on the read and write paths.
 	if int64(len(v)) > c.maxBytes {
-		c.values.Invalidate(key)
+		c.invalidate(key)
 	}
 
 	return v, nil
@@ -190,7 +195,7 @@ func (c *cachedBackend) ReadView(ctx context.Context, key string) ([]byte, error
 // would fetch the whole object to answer a range, which is exactly the cost the range exists to
 // avoid — and for a part column, one that does not fit the budget anyway. Implements [ReaderAt].
 func (c *cachedBackend) ReadAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
-	if v, ok := c.values.GetIfPresent(key); ok {
+	if v, ok := c.values.GetIfPresent(readCacheKey{name: key}); ok {
 		return slices.Clone(clampRange(v, off, n)), nil
 	}
 
@@ -206,7 +211,7 @@ func (c *cachedBackend) RangesNatively(ctx context.Context, key string) bool {
 // ReadViewAt is [cachedBackend.ReadAt] without the copy, under the [Viewer] contract: a resident
 // entry is never mutated in place, so a slice of one stays valid. Implements [ViewerAt].
 func (c *cachedBackend) ReadViewAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
-	if v, ok := c.values.GetIfPresent(key); ok {
+	if v, ok := c.values.GetIfPresent(readCacheKey{name: key}); ok {
 		return clampRange(v, off, n), nil
 	}
 
@@ -249,7 +254,7 @@ func (c *cachedBackend) CompareAndSwap(
 	// Dropped, never stored: see [cachedBackend.ReadVersioned]. Invalidating on a *lost* swap too
 	// is deliberate — losing proves the object moved under this process, so whatever is resident
 	// is stale by definition.
-	c.values.Invalidate(key)
+	c.invalidate(key)
 
 	return v, ok, nil
 }
@@ -272,14 +277,14 @@ func (c *cachedBackend) ReadVersioned(ctx context.Context, key string) ([]byte, 
 		return nil, VersionAbsent, err
 	}
 
-	c.values.Invalidate(key)
+	c.invalidate(key)
 
 	return data, v, nil
 }
 
 func (c *cachedBackend) Delete(ctx context.Context, key string) error {
 	err := c.inner.Delete(ctx, key)
-	c.values.Invalidate(key) // drop the entry whether or not the object existed
+	c.invalidate(key) // drop the entry whether or not the object existed
 
 	return err
 }
@@ -327,7 +332,7 @@ func WriteUncached(ctx context.Context, b Backend, key string, data []byte) erro
 		return err
 	}
 
-	c.values.Invalidate(key)
+	c.invalidate(key)
 
 	return nil
 }
@@ -347,8 +352,9 @@ func ReadUncached(ctx context.Context, b Backend, key string) ([]byte, error) {
 // buffer after Write returns. An object larger than the whole budget is not cached — and any stale
 // smaller entry under that key is dropped, so a reader cannot be served the superseded value.
 func (c *cachedBackend) store(key string, data []byte) {
+	c.pages.Delete(key)
 	if int64(len(data)) > c.maxBytes {
-		c.values.Invalidate(key)
+		c.invalidate(key)
 
 		return
 	}
@@ -358,5 +364,5 @@ func (c *cachedBackend) store(key string, data []byte) {
 		cp = []byte{}
 	}
 
-	c.values.Set(key, cp)
+	c.values.Set(readCacheKey{name: key}, cp)
 }

@@ -457,7 +457,7 @@ process' lifetime under stream churn: `instance.id`-shaped attributes turn ~24 s
 The **live set** is every live part's stream ids, resident already in `part.ranges` (so unlike the
 metrics engine it costs no I/O), plus the head and the mid-flush detachment. Symbol ids are dense and
 referenced by the postings, so survivors are **rebuilt** into fresh structures off the engine lock
-against `series.Index.Snapshot()` — the append-only entry log, which registration only extends — then
+against `series.Index.View()` — immutable compact arenas, which registration only extends — then
 swapped in under the lock. The swap re-registers what changed meanwhile (entries past the snapshot's
 end, and streams the prune found dead that regained buffered records) and drops the rest's
 out-of-order watermarks by key.
@@ -552,11 +552,12 @@ corruption here too.
 
 ## Lifecycle guards
 
-Flush and merge run under one `flushMu`, and `Reset` takes it too, with the same rationale and the same
-retire-don't-delete behavior as the metric engine ([`../engine/ARCH.md`](../engine/ARCH.md)). Here they
-also reuse the flush column buffer off the engine lock — a third reason the single-mutator invariant is
-enforced rather than assumed.
-
+One flush and one merge may build concurrently when `FlushAdmission` supplies a shared memory
+reservation; nil keeps them serialized. Reset, prune and repair take the build barrier exclusively.
+Flush column/bloom scratch belongs only to the flush slot and is released with its reservation.
+Side-store flushes retain serialized builds and acquire the whole shared pool because their active
+Encode/Stored workspace is opaque. Publication, WAL ordering, reload epochs and source pins follow
+[`../engine/ARCH.md`](../engine/ARCH.md).
 ### Memory accounting
 
 | bound | meters |
@@ -900,8 +901,8 @@ maintenance tick; a reused handle is probed with `block.PartPresent` so a part w
 still becomes a want. As there, a published part is never written. A handle is reused only while its
 entry is unchanged, and a changed entry gets a fresh handle. `MergeShape` (through the ladder
 selector's `fitsLevel`), `PartsDetailed` and the top-N scan (`orderPartsForLimit`, `beyondWatermark`)
-read part fields after releasing the engine lock. The commit's stamping of block identity relies on
-`flushMu` for the same reason given in the metric engine's ARCH.md.
+read part fields after releasing the engine lock. Merge planning selects only committed handles, after retrying any pending publication, so
+concurrent flushes cannot change source block metadata.
 
 **A stream's identity frame is logged when the head registers the stream**, not when it first has an
 accepted record. A stream is new exactly once, and replay drops records it cannot attribute to a

@@ -47,7 +47,7 @@ func (e *Engine) Keys(start, end int64) []KeyInfo {
 		}
 	}
 
-	e.mu.Lock() // The snapshot may populate the head/flushing key caches.
+	e.mu.LockState() // The snapshot may populate the head/flushing key caches.
 	// Stream-identity keys: resource/scope/series attributes of every in-window stream. The series index is
 	// authoritative (it survives flush and a stateless reload), so this is sound on all backends.
 	e.head.series.ForEach(func(id signal.SeriesID, s signal.Series) {
@@ -91,7 +91,7 @@ func (e *Engine) Keys(start, end int64) []KeyInfo {
 			add(key, KeyScopeRecord)
 		}
 	}
-	e.mu.Unlock()
+	e.mu.UnlockState()
 
 	return keyInfoSlice(scopes)
 }

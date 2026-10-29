@@ -27,7 +27,7 @@ var (
 type head struct {
 	sym     *symbols.Table
 	series  *series.Index
-	post    *postings.MemPostings
+	post    *postings.Dense
 	samples map[signal.SeriesID]*sampleBuf
 	newest  int64 // newest timestamp across every series (reported as Inspect.MaxTime)
 
@@ -39,7 +39,8 @@ type head struct {
 	// all-time series set the identity index already retains.
 	seriesNewest map[signal.SeriesID]int64
 
-	bytes int64 // buffered sample bytes (SampleBytes each); the in-flight memory measure
+	bytes         int64 // active buffered sample bytes (SampleBytes each)
+	detachedBytes int64 // resident samples held by the single in-flight flush
 	// since is when the head took its first bytes after the last flush (zero while empty). It is
 	// the only wall-clock the head keeps: sample timestamps are data time, which backfill makes
 	// unusable as a measure of how long data has been sitting unflushed.
@@ -97,7 +98,7 @@ func newHead() *head {
 	return &head{
 		sym:     symbols.New(),
 		series:  series.New(),
-		post:    postings.NewMemPostings(),
+		post:    postings.NewDense(),
 		samples: make(map[signal.SeriesID]*sampleBuf),
 
 		seriesNewest: make(map[signal.SeriesID]int64),
@@ -129,16 +130,18 @@ var watermarkEntryBytes = memsize.MapEntry[signal.SeriesID, int64]()
 // An id in live whose identity snap does not hold is simply absent: it is already unresolvable
 // (only a lost or truncated identity object can produce one), and inventing an entry for it would
 // be worse than leaving the postings without it.
-func rebuildIdentity(snap []series.Entry, live map[signal.SeriesID]struct{}) *head {
-	out := &head{sym: symbols.New(), series: series.New(), post: postings.NewMemPostings()}
+func rebuildIdentity(snap series.View, live map[signal.SeriesID]struct{}) *head {
+	out := &head{sym: symbols.New(), series: series.New(), post: postings.NewDense()}
 
-	for i := range snap {
-		if _, ok := live[snap[i].ID]; !ok {
+	var attrs signal.Attributes
+	for i := range snap.Len() {
+		if _, ok := live[snap.ID(i)]; !ok {
 			continue
 		}
 
-		out.series.Add(snap[i].Series)
-		out.indexLabels(snap[i].ID, snap[i].Series)
+		ident := snap.At(i, attrs)
+		attrs = ident.Attributes
+		out.register(snap.ID(i), ident)
 	}
 
 	// Sort now, while the index is still private: a reader would otherwise trigger the lazy in-place
@@ -163,20 +166,25 @@ func rebuildIdentity(snap []series.Entry, live map[signal.SeriesID]struct{}) *he
 // buffers, the byte measure and the head-global watermark are untouched — they describe live data.
 //
 // Caller holds the engine lock.
-func (h *head) swapIdentity(rebuilt *head, snap, tail []series.Entry, dead []int32) {
-	for i := range tail {
-		rebuilt.register(tail[i].ID, tail[i].Series)
+func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32) {
+	var attrs signal.Attributes
+	for i := snap.Len(); i < tail.Len(); i++ {
+		ident := tail.At(i, attrs)
+		attrs = ident.Attributes
+		rebuilt.register(tail.ID(i), ident)
 	}
 
 	for _, pos := range dead {
-		e := snap[pos]
-		if _, revived := h.samples[e.ID]; revived {
-			rebuilt.register(e.ID, e.Series)
+		id := snap.ID(int(pos))
+		if _, revived := h.samples[id]; revived {
+			ident := snap.At(int(pos), attrs)
+			attrs = ident.Attributes
+			rebuilt.register(id, ident)
 
 			continue
 		}
 
-		delete(h.seriesNewest, e.ID)
+		delete(h.seriesNewest, id)
 	}
 
 	h.sym, h.series, h.post = rebuilt.sym, rebuilt.series, rebuilt.post
@@ -267,7 +275,7 @@ func (h *head) appendByID(
 
 	// Memory backpressure applies to every sample (known or new): once the head is at the
 	// in-flight cap, shed until a flush drains it.
-	if limits.MaxInFlightBytes > 0 && h.bytes >= limits.MaxInFlightBytes {
+	if limits.MaxInFlightBytes > 0 && h.inFlightBytes() >= limits.MaxInFlightBytes {
 		return rejectBytes, id, false, signal.Series{}
 	}
 
@@ -478,28 +486,30 @@ func (h *head) replaySamplesSF(id signal.SeriesID, ts []int64, values, sf []floa
 // scope attributes, the scope name/version, and the (folded) point attributes — into the
 // postings index under id.
 func (h *head) indexLabels(id signal.SeriesID, s signal.Series) {
+	ref, _ := h.series.Ref(id)
+	h.post.AddSeries(ref)
 	for i := range s.Resource.Attributes {
-		h.addLabel(id, s.Resource.Attributes[i].Key, s.Resource.Attributes[i].Value)
+		h.addLabel(ref, s.Resource.Attributes[i].Key, s.Resource.Attributes[i].Value)
 	}
 
 	for i := range s.Scope.Attributes {
-		h.addLabel(id, s.Scope.Attributes[i].Key, s.Scope.Attributes[i].Value)
+		h.addLabel(ref, s.Scope.Attributes[i].Key, s.Scope.Attributes[i].Value)
 	}
 
 	if len(s.Scope.Name) > 0 {
-		h.addLabel(id, labelScopeName, signal.StringValue(s.Scope.Name))
+		h.addLabel(ref, labelScopeName, signal.StringValue(s.Scope.Name))
 	}
 
 	if len(s.Scope.Version) > 0 {
-		h.addLabel(id, labelScopeVersion, signal.StringValue(s.Scope.Version))
+		h.addLabel(ref, labelScopeVersion, signal.StringValue(s.Scope.Version))
 	}
 
 	for i := range s.Attributes {
-		h.addLabel(id, s.Attributes[i].Key, s.Attributes[i].Value)
+		h.addLabel(ref, s.Attributes[i].Key, s.Attributes[i].Value)
 	}
 }
 
-func (h *head) addLabel(id signal.SeriesID, name []byte, v signal.Value) {
+func (h *head) addLabel(id uint32, name []byte, v signal.Value) {
 	nameID := uint32(h.sym.Intern(name))
 	valueID := uint32(h.sym.Intern(signal.AppendValue(nil, v)))
 	h.post.Add(id, nameID, valueID)
@@ -518,10 +528,10 @@ func (h *head) ensureIndexSorted() { h.post.EnsureSorted() }
 // A series that does not carry the label at all is offered [signal.EmptyValue], the same contract
 // [fetch.Condition] has per row: the matcher is operator-free, so only the language knows whether
 // absence satisfies it (a negation or an is-unset matcher does). Such a matcher unions the value
-// scan with the series lacking the label ([postings.MemPostings.WithoutName]).
+// scan with the series lacking the label ([postings.Dense.WithoutName]).
 func (h *head) resolve(matchers []fetch.Matcher) []signal.SeriesID {
 	if len(matchers) == 0 {
-		return drain(h.post.All())
+		return h.canonicalIDs(drain(h.post.All()))
 	}
 
 	its := make([]postings.Postings, len(matchers))
@@ -560,7 +570,15 @@ func (h *head) resolve(matchers []fetch.Matcher) []signal.SeriesID {
 		}
 	}
 
-	return drain(postings.Intersect(its...))
+	return h.canonicalIDs(drain(postings.Intersect(its...)))
+}
+
+func (h *head) canonicalIDs(refs []signal.SeriesID) []signal.SeriesID {
+	for i := range refs {
+		refs[i] = h.series.ID(uint32(refs[i].Lo))
+	}
+	slices.SortFunc(refs, signal.SeriesID.Compare)
+	return refs
 }
 
 func drain(p postings.Postings) []signal.SeriesID {
@@ -644,6 +662,7 @@ func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
 	detached, bytes, since := h.samples, h.bytes, h.since
 	h.samples = make(map[signal.SeriesID]*sampleBuf)
 	h.bytes = 0
+	h.detachedBytes = bytes
 	h.since = time.Time{}
 
 	return detached, bytes, since
@@ -669,6 +688,7 @@ func (h *head) reattach(detached map[signal.SeriesID]*sampleBuf, bytes int64, si
 	}
 
 	h.grow(bytes)
+	h.detachedBytes = 0
 
 	// grow stamps since at now for a head that was empty; the samples coming back are older than
 	// that, so the earlier start wins and the flush interval keeps measuring from it.
@@ -786,3 +806,5 @@ func windowCopy(buf *sampleBuf, start, end int64, e *Engine) ([]int64, []float64
 
 	return ts, values, sf
 }
+
+func (h *head) inFlightBytes() int64 { return h.bytes + h.detachedBytes }

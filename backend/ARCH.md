@@ -126,6 +126,10 @@ a demonstration.
   per cold object, not one per in-flight query), and W-TinyLFU admission keeps a cold historical
   scan from flushing the hot working set — the pattern a strict LRU handles worst. An object
   larger than the whole budget is never retained.
+- **`backend.ReadPageView`** — read-only cached ranges for immutable index pages. Whole objects
+  and pages share one total byte budget and loading-cache miss coalescing. Object generations
+  isolate cached ranges across writes/deletes; existing borrowed views remain valid. Ranged misses
+  call the backend's native `ReadAt`, without loading or copying the whole object.
 - **`backend.WriteUncached` / `backend.ReadUncached`** — the escape hatch from that cache for the
   few *mutable* objects rewritten far more often than they are read: the engines' identity sets,
   written when identity changes and read only on recovery. Caching one is pure eviction pressure (at

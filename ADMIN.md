@@ -15,6 +15,9 @@ tenant normalizes to `"default"`.
 
 ## Observe
 
+Backend read-cache statistics include whole objects and immutable index pages in one byte budget.
+`CacheStats.Items` counts cache entries, including pages; `Bytes` counts their retained value bytes.
+
 ### `Storage.Inspect() StoreStats` — store-wide snapshot (`inspect.go`)
 
 A pull-based, **in-memory** snapshot for a dashboard: it does **no backend I/O and decodes nothing**,

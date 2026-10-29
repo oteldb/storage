@@ -165,11 +165,11 @@ func (e *Engine) MergeRunning() bool { return e.mergeRunning.Load() }
 func (e *Engine) MergeBacklog() int { return e.MergeShape().Backlog }
 
 // WALState returns the WAL segments on disk, the bytes they hold, and the active flush
-// epoch. ok is false when the engine has no WAL (the ephemeral in-memory engine). It takes a read
-// lock, excluding concurrent appends (which hold the write lock).
+// epoch. ok is false when the engine has no WAL. It joins writer ordering because
+// WAL bookkeeping changes while ordinary readers are admitted.
 func (e *Engine) WALState() (segments int, bytes int64, epoch uint64, ok bool) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.LockWriter()
+	defer e.mu.UnlockWriter()
 
 	if e.cfg.WAL == nil {
 		return 0, 0, 0, false

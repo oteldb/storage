@@ -60,11 +60,13 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
+	e.identityMu.Lock()
+	defer e.identityMu.Unlock()
 
 	e.mu.RLock()
 	dirty, total := e.identityDirty, e.head.series.Len()
 	live := e.liveIdentitiesLocked()
-	snap := e.head.series.Snapshot()
+	snap := e.head.series.View()
 	e.mu.RUnlock()
 
 	// Identities die only when retention drops rows or parts, so an engine that has merged nothing
@@ -96,7 +98,7 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 	// Identities registered while the rebuild ran sit past the snapshot's end in the same
 	// append-only log; a stream that merely regained records leaves no such entry, so the swap
 	// re-checks the dead set against the live buffers too.
-	e.head.swapIdentity(rebuilt, snap, e.head.series.Snapshot()[len(snap):], dead)
+	e.head.swapIdentity(rebuilt, snap, e.head.series.View(), dead)
 	e.identityDirty = false
 	remaining := e.head.series.Len()
 	e.mu.Unlock()
@@ -137,11 +139,11 @@ func (e *Engine) liveIdentitiesLocked() map[signal.SeriesID]struct{} {
 // deadPositions returns the positions in snap of the identities live does not hold. Positions rather
 // than ids or entries: the set can be as large as the whole index, and four bytes each keeps the
 // prune's own working set negligible next to what it reclaims.
-func deadPositions(snap []series.Entry, live map[signal.SeriesID]struct{}) []int32 {
+func deadPositions(snap series.View, live map[signal.SeriesID]struct{}) []int32 {
 	var dead []int32
 
-	for i := range snap {
-		if _, ok := live[snap[i].ID]; !ok {
+	for i := range snap.Len() {
+		if _, ok := live[snap.ID(i)]; !ok {
 			dead = append(dead, int32(i))
 		}
 	}

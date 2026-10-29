@@ -40,6 +40,9 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 // MergeStep is [Engine.MergeWith], reporting whether a successful pass compacted or retired parts.
 // Retention may change parts even when compaction is deferred.
 func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	ctx = e.cfg.Obs.Base(ctx)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.merge",
 		trace.WithAttributes(
@@ -108,8 +111,8 @@ func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool
 // picks only the parts worth merging this cycle (a same-size tier group plus any part a forced
 // rewrite must touch), so a single merge's working set is O(part size), not O(dataset).
 func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, error) {
-	e.flushMu.Lock()
-	defer e.flushMu.Unlock()
+	unlock := e.lockMerge()
+	defer unlock()
 
 	// The tenure the inputs were chosen under: a merge that outlives it commits nothing.
 	stamp := e.term()
@@ -124,7 +127,12 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{}, err
 	}
 
-	src := e.parts
+	src, releaseSources, err := e.pinMergeSourcesLocked(ctx)
+	if err != nil {
+		e.mu.Unlock()
+		return mergeResult{}, err
+	}
+	defer releaseSources()
 	adopted := append(slices.Collect(maps.Values(e.foreignParts)), e.unopenedLayoutsLocked()...)
 	e.mu.Unlock()
 
@@ -251,56 +259,13 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 
 	planMergeBlocks(selected, newParts)
 
-	// Publish (under lock): swap the selected parts for the merged one(s) copy-on-write (keeping every
-	// part not selected — including any a concurrent flush may have added) and commit the index. The
-	// sources are retired — queued for backend deletion — only once that commit succeeds: the persisted
-	// index is what a restart and every other replica read, so a part it still names must never become
-	// reclaimable. A failed commit rolls the swap back to the committed set, leaving the merge output as
-	// orphan objects the next [Engine.LoadParts] sweeps. The retired parts' objects are deleted by
-	// reclaimRetired once their readers drain.
-	removed := make(map[string]struct{}, len(selected))
-	for _, p := range selected {
-		removed[p.prefix] = struct{}{}
+	committed, err := e.publishMerge(ctx, selected, newParts, readable, stamp, plan)
+	if err != nil {
+		return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, err
 	}
-
-	e.mu.Lock()
-	committed := e.parts
-	e.parts = replaceParts(e.parts, removed, newParts...)
-
-	if err = e.commitIndexLocked(ctx, stamp, rollupGuard(readable, plan.marker, e)); err != nil {
-		e.parts = committed
-
-		if !errors.Is(err, errRollupConflict) {
-			e.mu.Unlock()
-
-			return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, err
-		}
-
-		// Never committed and never readable, so nothing waits on these before they are deleted.
-		e.retireLocked(newParts)
-		e.mu.Unlock()
-		e.reclaimRetired(ctx)
-
-		zctx.From(ctx).Warn("merge output dropped: a rival writer committed a part recording a downsample "+
-			"layout that does not nest with this merge's; the next merge replans with it",
-			zap.String("prefix", e.cfg.Prefix))
-
+	if !committed {
 		return mergeResult{parts: dropped}, nil
 	}
-
-	e.retireLocked(selected)
-	e.trimRecentBelow(plan.rolledBefore())
-	// Rows that did not survive the merge are retention's work: the samples are gone, so the
-	// identities naming them may be dead too and an identity prune has something to find. Merging
-	// without dropping rows (a plain compaction) leaves every identity backed, so it arms nothing.
-	if partRows(newParts) < partRows(selected) {
-		e.identityDirty = true
-	}
-
-	e.mu.Unlock()
-
-	e.reclaimRetired(ctx)
-
 	return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, nil
 }
 
@@ -392,16 +357,15 @@ func (e *Engine) dropExpired(ctx context.Context, src []*part, opts MergeOptions
 	}
 
 	e.mu.Lock()
-	committed := e.parts
-	e.parts = replaceParts(e.parts, removed)
+	next := replaceParts(e.parts, removed)
 
-	if err := e.updateIndexLocked(ctx); err != nil {
-		e.parts = committed
+	if err := e.commitIndexLocked(ctx, next, e.flushedEpoch, e.term(), nil); err != nil {
 		e.mu.Unlock()
 
 		return nil, 0, err
 	}
 
+	e.parts = next
 	e.retireLocked(expired)
 	// Every sample these parts held is gone, so the identities naming them may be dead — the same
 	// reasoning as a merge that drops rows, and the identity prune has something to find.
@@ -823,11 +787,13 @@ func (e *Engine) Close(ctx context.Context) error {
 		flushErr = nil
 	}
 
+	e.flushMu.Lock()
+	defer e.flushMu.Unlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.cfg.WAL != nil {
-		if err := e.cfg.WAL.Close(); err != nil && flushErr == nil {
+		if err := e.mu.WithReaders(e.cfg.WAL.Close); err != nil && flushErr == nil {
 			return err
 		}
 	}
@@ -846,7 +812,7 @@ func (e *Engine) CloseWAL() error {
 	defer e.mu.Unlock()
 
 	if e.cfg.WAL != nil {
-		return e.cfg.WAL.Close()
+		return e.mu.WithReaders(e.cfg.WAL.Close)
 	}
 
 	return nil
@@ -854,11 +820,11 @@ func (e *Engine) CloseWAL() error {
 
 // SyncWAL fsyncs the engine's WAL, if any (the background WALSyncInterval path). No-op without a WAL.
 func (e *Engine) SyncWAL() error {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.LockWriter()
+	defer e.mu.UnlockWriter()
 
 	if e.cfg.WAL != nil {
-		return e.cfg.WAL.Sync()
+		return e.mu.WithReaders(e.cfg.WAL.Sync)
 	}
 
 	return nil
