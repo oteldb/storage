@@ -216,9 +216,10 @@ size and releases each frame as it copies it; a growing buffer would hold a seco
 hundreds-of-MiB column).
 
 `NewStreamWriterTo(ctx, b, prefix, …)` removes that: each column opens a `backend.ObjectWriter` and
-hands over every frame as it seals, so what stays resident is one unsealed frame per column plus the
-block directory — two ints per frame and one per granule, kilobytes against a column of hundreds of
-MiB. Those columns carry `flagFooter`, since a streamed directory cannot lead the frames it
+hands over every frame as it seals. A streamed column reuses its compressed output buffer only
+after `Write` returns; buffered frames keep their own storage. The output buffer is charged alongside
+the unsealed frame and block directory, and released when the column finishes or is discarded.
+Those columns carry `flagFooter`, since a streamed directory cannot lead the frames it
 describes. Two consequences worth stating:
 
 - **A column cannot stream from its first granule.** A column that turns out constant collapses into

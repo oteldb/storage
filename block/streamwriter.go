@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"math"
+	"slices"
 
 	"github.com/go-faster/errors"
 
@@ -970,6 +971,7 @@ type blockAccum struct {
 	frameRaw      []int    // per sealed frame: its decompressed length
 	gLens         []int    // per-granule stream length within its frame
 	pending       []byte
+	packed        []byte
 	inFrame       int
 	bytes         int // compressed bytes sealed so far, the size the codec choice compares on
 	dirLen        int // the directory's encoded length, once finished
@@ -999,7 +1001,7 @@ func (a *blockAccum) residentBytes() int64 {
 	// Three ints per frame and one per granule, all in slices that grow amortized.
 	dir := int64(cap(a.frameGranules)+cap(a.frameBytes)+cap(a.frameRaw)+cap(a.gLens))*8 + int64(cap(a.frameCRC))*4
 
-	resident := int64(cap(a.pending)) + dir + int64(cap(a.frames))*8
+	resident := int64(cap(a.pending)+cap(a.packed)) + dir + int64(cap(a.frames))*8
 	if a.sink == nil {
 		resident += int64(a.bytes)
 	}
@@ -1013,7 +1015,7 @@ func (a *blockAccum) sealBytes() int64 {
 		return 0
 	}
 
-	return a.comp.CompressTransient(cap(a.pending), false)
+	return a.comp.CompressTransient(cap(a.pending), a.sink != nil && cap(a.packed) >= a.comp.CompressBound(cap(a.pending)))
 }
 
 // attach opens the accumulator's object writer and drains everything sealed so far into it, so the
@@ -1051,7 +1053,7 @@ func (a *blockAccum) discard() {
 		a.sink = nil
 	}
 
-	a.frames, a.pending = nil, nil
+	a.frames, a.pending, a.packed = nil, nil, nil
 }
 
 // addGranule appends one granule's codec stream, produced by enc onto the pending frame buffer, and
@@ -1080,7 +1082,12 @@ func (a *blockAccum) seal() error {
 		return nil
 	}
 
-	f := a.comp.Compress(nil, a.pending)
+	var dst []byte
+	if a.sink != nil {
+		a.packed = slices.Grow(a.packed[:0], a.comp.CompressBound(len(a.pending)))
+		dst = a.packed[:0]
+	}
+	f := a.comp.Compress(dst, a.pending)
 
 	a.frameGranules = append(a.frameGranules, a.inFrame)
 	a.frameBytes = append(a.frameBytes, len(f))
@@ -1095,6 +1102,7 @@ func (a *blockAccum) seal() error {
 		return nil
 	}
 
+	a.packed = f[:0]
 	return a.emit(f)
 }
 
@@ -1207,7 +1215,7 @@ func (a *blockAccum) finishStreamed(ctx context.Context, region, dir []byte) (in
 	n := a.written
 
 	sink := a.sink
-	a.sink, a.pending = nil, nil
+	a.sink, a.pending, a.packed = nil, nil, nil
 
 	if err := sink.Commit(ctx); err != nil {
 		return 0, errors.Wrap(err, "commit column object")

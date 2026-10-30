@@ -8,6 +8,7 @@ import (
 	"github.com/zeebo/xxh3"
 
 	"github.com/oteldb/storage/index/bloom"
+	"github.com/oteldb/storage/signal"
 )
 
 // columnSink takes a merged part's byte-column values as they stream into its writer and derives what
@@ -16,6 +17,7 @@ import (
 type columnSink struct {
 	bloom *bloomAccum
 	keys  recordKeySet
+	attrs signal.Attributes
 	// keyBytes is what the keys hold: their bytes and a string header each.
 	keyBytes int64
 	// seen maps a value's hash to its token count, so a repeated value is neither tokenized nor
@@ -35,7 +37,7 @@ func (s *columnSink) residentBytes() int64 {
 		return 0
 	}
 
-	n := int64(len(s.seen))*seenEntryBytes + s.keyBytes
+	n := int64(len(s.seen))*seenEntryBytes + s.keyBytes + int64(cap(s.attrs))*int64(unsafe.Sizeof(signal.KeyValue{}))
 	if s.bloom != nil {
 		n += int64(cap(s.bloom.pairs.slots)) * int64(unsafe.Sizeof(hashPair{}))
 	}
@@ -111,7 +113,7 @@ func (s *columnSink) add(v []byte) {
 	}
 
 	if s.keys != nil {
-		s.keyBytes += s.keys.add(v)
+		s.keyBytes += s.keys.add(v, &s.attrs)
 	}
 
 	if len(s.seen) < maxDedupRows {
@@ -260,10 +262,10 @@ func (s *hashPairs) each(fn func(h1, h2 uint64)) {
 type recordKeySet map[string]struct{}
 
 // add adds blob's keys, returning what the new ones cost resident.
-func (s recordKeySet) add(blob []byte) int64 {
+func (s recordKeySet) add(blob []byte, scratch *signal.Attributes) int64 {
 	var added int64
 
-	forEachAttrKey(blob, func(key []byte) {
+	forEachAttrKey(blob, scratch, func(key []byte) {
 		if _, ok := s[string(key)]; !ok {
 			s[string(key)] = struct{}{}
 			added += int64(len(key)) + keyEntryBytes

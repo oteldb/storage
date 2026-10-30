@@ -106,6 +106,8 @@ The stream union is `mergestream.Keys` over each part's sorted ranges, a k-way h
 set of every stream. Day writers share compressors, stream their frames to capable backends and
 open their finished output parts only after releasing source readers. Buffered backends also charge
 the retained encoded output and its serialization copy as resident state.
+Attribute-key enumeration reuses decode scratch across rows, clearing references after each walk.
+Streamed writers charge that scratch to resident memory, so reuse does not hide retained capacity.
 
 ### Inspection and logical sizes
 

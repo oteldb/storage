@@ -132,6 +132,7 @@ func collectRecordKeys(schema *Schema, records map[signal.SeriesID]*recordCols, 
 	}
 
 	all := start == 0 && end == 0
+	var scratch signal.Attributes
 
 	for _, buf := range records {
 		if buf.len() == 0 {
@@ -153,19 +154,21 @@ func collectRecordKeys(schema *Schema, records map[signal.SeriesID]*recordCols, 
 			if buf.ts[i] < start || buf.ts[i] > end {
 				continue
 			}
-			forEachAttrKey(blobs.at(i), emit)
+			forEachAttrKey(blobs.at(i), &scratch, emit)
 		}
 	}
 }
 
 // forEachAttrKey decodes the canonical serialized-attributes blob and calls fn for each attribute
 // key (keys alias blob). A malformed blob is skipped — enumeration is best-effort metadata.
-func forEachAttrKey(blob []byte, fn func(key []byte)) {
+func forEachAttrKey(blob []byte, scratch *signal.Attributes, fn func(key []byte)) {
 	if len(blob) == 0 {
 		return
 	}
 
-	a, _, err := signal.DecodeAttributes(blob)
+	a, _, err := signal.AppendAttributes((*scratch)[:0], blob)
+	*scratch = a[:0]
+	defer clear(a)
 	if err != nil {
 		return
 	}
