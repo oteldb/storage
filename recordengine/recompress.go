@@ -28,7 +28,8 @@ func (e *Engine) selectMergePartsProfile(src []*part, retainFrom, capBytes int64
 		return selected
 	}
 	return timebucket.Forced(src, partSpan, (*part).sizeBytes, e.compressionForces,
-		func(p *part) bool { return sealed(p, capBytes) }, capBytes, maxTierParts)
+		// Balanced compaction already had its turn; do not fill a compression-only rewrite with cold neighbors.
+		func(*part) bool { return true }, capBytes, maxTierParts)
 }
 
 func (e *Engine) compressionForces(p *part) bool {
