@@ -64,6 +64,9 @@ encoder or decoder hands work to its goroutines over channels made when it is bu
 aborts a process that uses one inside a `testing/synctest` bubble it was not built in, or outside the
 one it was. A `Compressor` is shared only by an owner that keeps it in one place — a merge shares one
 across its day writers, an engine one per algorithm across every part it opens — never process-wide.
+A compressor retains at most one idle encoder in a GC-stable recycler; concurrent overflow is
+dropped on return. This preserves encoder tables through collections during an active operation
+without a process-wide or per-tenant permanent codec cache. Decoder pools remain GC-reclaimable.
 Sharing matters on the read path: a zstd decoder is built per pool, so a reader per part with pools
 of its own builds one per part read — 2.9× the bytes allocated reading 1024 parts once each
 (`block.BenchmarkManyPartReaders`) and +16% on a record fetch over 256 parts. `EncodeWorkspace` is

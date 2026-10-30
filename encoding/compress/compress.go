@@ -5,6 +5,8 @@ import (
 	"sync"
 
 	"github.com/pierrec/lz4/v4"
+
+	"github.com/oteldb/storage/pool"
 )
 
 // zstdEncoder / zstdDecoder abstract the ZSTD backend so it can be swapped at build time: pure-Go
@@ -19,6 +21,8 @@ type zstdEncoder interface {
 type zstdDecoder interface {
 	decodeAll(dst, src []byte) ([]byte, error)
 }
+
+type cachedEncoder struct{ enc zstdEncoder }
 
 // Algorithm identifies a general-purpose compression algorithm.
 type Algorithm uint8
@@ -69,7 +73,7 @@ type Compressor struct {
 	alg       Algorithm
 	level     Level
 	window    int
-	encPool   sync.Pool // *zstd.Encoder
+	encoders  *pool.FreeList[cachedEncoder]
 	decPool   sync.Pool // *zstd.Decoder
 	limitPool sync.Pool // *zstd.Decoder with a capped DecodeAll, for DecompressLimit
 	lz4Pool   sync.Pool // *lz4.Compressor (not safe for concurrent use, so pooled)
@@ -102,7 +106,9 @@ func frameWindow(n int) int {
 
 func newCompressor(alg Algorithm, level Level, window int) *Compressor {
 	c := &Compressor{alg: alg, level: level, window: window}
-	c.encPool = sync.Pool{New: c.newEncoder}
+	if alg == AlgorithmZSTD {
+		c.encoders = pool.NewFreeList[cachedEncoder](1)
+	}
 	c.decPool = sync.Pool{New: c.newDecoder}
 	c.limitPool = sync.Pool{New: newLimitDecoder}
 	c.lz4Pool = sync.Pool{New: func() any { return &lz4.Compressor{} }}
@@ -162,9 +168,12 @@ const (
 func (c *Compressor) compressPool(dst, src []byte) []byte {
 	switch c.alg {
 	case AlgorithmZSTD:
-		enc := c.encPool.Get().(zstdEncoder)
-		defer c.encPool.Put(enc)
-		return enc.encodeAll(append(dst, FlagCompressed), src)
+		slot := c.encoders.Get()
+		if slot == nil {
+			slot = &cachedEncoder{enc: c.newEncoder().(zstdEncoder)}
+		}
+		defer c.encoders.Put(slot)
+		return slot.enc.encodeAll(append(dst, FlagCompressed), src)
 	case AlgorithmNone:
 		// Identity: store raw (Compress already short-circuits this case).
 		return append(append(dst, FlagRaw), src...)
