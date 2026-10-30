@@ -10,7 +10,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/backend/file"
 )
 
 // splitInputs is how many straddlers one split merge takes together.
@@ -85,7 +87,17 @@ func requireWantsSatisfied(t *testing.T, ix *bucketindex.Index, inputs []bucketi
 func splitOfSeveralInputsKeepsEveryLineage(t *testing.T, k Kind) {
 	t.Helper()
 
-	be := backend.Memory()
+	for _, tc := range []backendtest.Case{backendtest.Memory(), backendtest.Dir("file", file.New)} {
+		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
+			splitOfSeveralInputsKeepsEveryLineageOn(t, k, tc.Open(t))
+		})
+	}
+}
+
+func splitOfSeveralInputsKeepsEveryLineageOn(t *testing.T, k Kind, be backend.Backend) {
+	t.Helper()
+
 	inputs := k.flushSplitInputs(t, be)
 
 	ix, fragments := k.splitAll(t, be, inputs)

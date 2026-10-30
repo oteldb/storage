@@ -152,3 +152,49 @@ func TestRelaterMatchesTheFixedPoints(t *testing.T) {
 		require.Equal(t, complete, gotComplete, "the groups %v completes over %v", iv, l)
 	}
 }
+
+func TestRelaterMixedDirections(t *testing.T) {
+	t.Parallel()
+
+	for _, first := range []string{"holds", "ancestry", "descendants", "realize"} {
+		t.Run(first, func(t *testing.T) {
+			t.Parallel()
+
+			rnd := rand.New(rand.NewPCG(79, 83))
+			for range 300 {
+				l := randomLineage(rnd)
+				r := l.Relater()
+				iv := randomSet(rnd)
+
+				switch first {
+				case "holds":
+					r.holds(iv)
+				case "ancestry":
+					r.ancestry(iv)
+				case "descendants":
+					r.descendants(iv)
+				case "realize":
+					r.realize(iv)
+				}
+
+				for range 2 {
+					iv = randomSet(rnd)
+					require.Equal(t, naiveHolds(l, iv), r.holds(iv))
+
+					up, via := naiveClose(l, iv, func(c Claim) Interval { return c.Group }, func(c Claim) Interval { return c.Blocks })
+					gotUp, gotVia := r.ancestry(iv)
+					require.Equal(t, up, gotUp)
+					require.Equal(t, via, gotVia)
+
+					down, dvia := naiveClose(l, iv, func(c Claim) Interval { return c.Blocks }, func(c Claim) Interval { return c.Group })
+					gotDown, gotDvia := r.descendants(iv)
+					require.Equal(t, down, gotDown)
+					require.Equal(t, dvia, gotDvia)
+
+					held, _ := r.realize(iv)
+					require.Equal(t, naiveRealize(l, iv), held)
+				}
+			}
+		})
+	}
+}

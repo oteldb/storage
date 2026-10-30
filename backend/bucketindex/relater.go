@@ -13,9 +13,10 @@ import (
 // closure just gained. The naive fixed point rescans every claim until nothing changes, which a deeply
 // nested lineage ordered against the scan turns into one pass per level, per candidate, per want.
 type Relater struct {
-	l      Lineage
-	blocks runIndex
-	groups runIndex
+	l           Lineage
+	blocks      runIndex
+	groups      runIndex
+	blocksBuilt bool
 
 	holdsOf  map[string][]closure
 	upOf     map[string][]closure
@@ -39,11 +40,9 @@ func (l Lineage) Relater() *Relater {
 	}
 
 	for i, c := range l {
-		r.blocks.add(c.Blocks, i)
 		r.groups.add(c.Group, i)
 	}
 
-	r.blocks.build()
 	r.groups.build()
 
 	return r
@@ -100,6 +99,19 @@ func (r *Relater) Ancestors(iv Interval) []Claim {
 	return out
 }
 
+func (r *Relater) blockIndex() *runIndex {
+	if !r.blocksBuilt {
+		for i, c := range r.l {
+			r.blocks.add(c.Blocks, i)
+		}
+
+		r.blocks.build()
+		r.blocksBuilt = true
+	}
+
+	return &r.blocks
+}
+
 // holds is every block whose rows iv includes: iv, and the members of each group whose claimed
 // ancestry it covers, repeated so a group split again resolves through the outer one.
 func (r *Relater) holds(iv Interval) Interval {
@@ -111,7 +123,7 @@ func (r *Relater) holds(iv Interval) Interval {
 		return c.out
 	}
 
-	out, _ := r.close(iv, &r.blocks, func(c Claim, held Interval) (bool, Interval) {
+	out, _ := r.close(iv, r.blockIndex(), func(c Claim, held Interval) (bool, Interval) {
 		return held.Contains(c.Blocks), c.Group
 	})
 
@@ -154,24 +166,20 @@ func (r *Relater) reachAncestry(reached []bool, iv Interval) {
 		}
 	}
 
-	for k := range iv.nruns() {
-		r.groups.meeting(iv.run(k), push)
-	}
+	r.groups.meetingInterval(iv, push)
 
 	for len(queue) > 0 {
 		c := r.l[queue[len(queue)-1]]
 		queue = queue[:len(queue)-1]
 
-		for k := range c.Blocks.nruns() {
-			r.groups.meeting(c.Blocks.run(k), push)
-		}
+		r.groups.meetingInterval(c.Blocks, push)
 	}
 }
 
 // descendants is iv with every block derived from its rows, and which groups that derivation passes
 // through: each group whose claimed ancestry iv meets, and again from that group's members.
 func (r *Relater) descendants(iv Interval) (Interval, []bool) {
-	return r.close(iv, &r.blocks, func(c Claim, _ Interval) (bool, Interval) { return true, c.Group })
+	return r.close(iv, r.blockIndex(), func(c Claim, _ Interval) (bool, Interval) { return true, c.Group })
 }
 
 // realize is held with the ancestry of every group whose members it holds, repeated so a group whose
@@ -300,6 +308,28 @@ func (x *runIndex) meeting(q Gap, fn func(claim int)) {
 	for ; i < len(x.runs) && !q.Max.less(x.runs[i].Min); i++ {
 		if !x.runs[i].Max.less(q.Min) {
 			fn(x.runs[i].claim)
+		}
+	}
+}
+
+func (x *runIndex) meetingInterval(iv Interval, fn func(claim int)) {
+	i := 0
+	for k := range iv.nruns() {
+		if i == len(x.runs) {
+			return
+		}
+
+		q := iv.run(k)
+		// Runs advance, so reuse the lower bound until the query moves beyond its reach.
+		if x.reach[i].less(q.Min) {
+			offset, _ := slices.BinarySearchFunc(x.reach[i+1:], q.Min, Block.Compare)
+			i += 1 + offset
+		}
+
+		for j := i; j < len(x.runs) && !q.Max.less(x.runs[j].Min); j++ {
+			if !x.runs[j].Max.less(q.Min) {
+				fn(x.runs[j].claim)
+			}
 		}
 	}
 }
