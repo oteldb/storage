@@ -39,15 +39,18 @@ type walBatch struct {
 }
 
 type walSeriesAcc struct {
-	isNew    bool          // the series starts a buffer, so its identity record is logged
-	register bool          // the identity is not in the head's index yet
-	series   signal.Series // the identity, set when isNew
-	attrs    signal.Attributes
-	newest   int64 // the newest admitted timestamp
-	ts       []int64
-	values   []float64
-	sf       []float64 // per-sample scale factors (aligned with ts)
-	sampled  bool      // true once any sf != 1 — selects the sf-carrying WAL frame on flush
+	isNew       bool          // the series starts a buffer, so its identity record is logged
+	register    bool          // the identity is not in the head's index yet
+	series      signal.Series // the identity, set when isNew
+	attrs       signal.Attributes
+	newest      int64 // the newest admitted timestamp
+	buffer      *sampleBuf
+	priorNewest int64
+	hadNewest   bool
+	ts          []int64
+	values      []float64
+	sf          []float64 // per-sample scale factors (aligned with ts)
+	sampled     bool      // true once any sf != 1 — selects the sf-carrying WAL frame on flush
 }
 
 func newWALBatch() *walBatch {
@@ -63,10 +66,14 @@ func (b *walBatch) admit(
 	h *head, id signal.SeriesID, ts int64, value, sf float64, oooWindow int64, limits AppendLimits,
 	materialize func() signal.Series,
 ) admitOutcome {
+	k, staged := b.pos[id]
+	var newest int64
+	var seen bool
 	if oooWindow > 0 {
-		newest, seen := h.seriesNewest[id]
-		if k, ok := b.pos[id]; ok && (!seen || b.accs[k].newest > newest) {
-			newest, seen = b.accs[k].newest, true
+		if staged {
+			newest, seen = b.accs[k].admissionNewest(), true
+		} else {
+			newest, seen = h.seriesNewest[id]
 		}
 
 		if seen && ts < newest-oooWindow {
@@ -78,15 +85,22 @@ func (b *walBatch) admit(
 		return rejectBytes
 	}
 
-	if b.buffered(h, id) {
-		b.add(id, ts, value, sf, false, false, signal.Series{})
-
+	if staged {
+		b.add(k, ts, value, sf)
 		return admitted
 	}
 
+	if oooWindow <= 0 {
+		newest, seen = h.seriesNewest[id]
+	}
+	acc := walSeriesAcc{buffer: h.samples[id], priorNewest: newest, hadNewest: seen}
+	if acc.buffer != nil {
+		b.add(b.start(id, acc), ts, value, sf)
+		return admitted
+	}
+	acc.isNew = true
 	if h.series.Has(id) {
-		b.add(id, ts, value, sf, true, false, signal.Series{})
-
+		b.add(b.start(id, acc), ts, value, sf)
 		return admitted
 	}
 
@@ -98,67 +112,65 @@ func (b *walBatch) admit(
 	if limits.Overflow != nil && limits.MaxSeriesSoft > 0 && cardinality >= limits.MaxSeriesSoft {
 		ov := limits.Overflow(materialize())
 		oid := ov.Hash()
-
-		switch {
-		case b.buffered(h, oid):
-			b.add(oid, ts, value, sf, false, false, signal.Series{})
-		case h.series.Has(oid):
-			b.add(oid, ts, value, sf, true, false, ov)
-		default:
-			b.add(oid, ts, value, sf, true, true, ov)
+		if k, ok := b.pos[oid]; ok {
+			b.add(k, ts, value, sf)
+		} else {
+			previous, exists := h.seriesNewest[oid]
+			a := walSeriesAcc{buffer: h.samples[oid], priorNewest: previous, hadNewest: exists}
+			a.isNew = a.buffer == nil
+			if a.isNew && !h.series.Has(oid) {
+				a.register, a.series = true, ov
+			}
+			b.add(b.start(oid, a), ts, value, sf)
 		}
 
 		return admittedOverflow
 	}
 
-	b.add(id, ts, value, sf, true, true, materialize())
+	acc.register, acc.series = true, materialize()
+	b.add(b.start(id, acc), ts, value, sf)
 
 	return admitted
 }
 
-// buffered reports whether series id has a sample buffer once b is applied.
-func (b *walBatch) buffered(h *head, id signal.SeriesID) bool {
-	if h.samples[id] != nil {
-		return true
+func (a *walSeriesAcc) admissionNewest() int64 {
+	if a.hadNewest {
+		return max(a.newest, a.priorNewest)
 	}
-
-	_, ok := b.pos[id]
-
-	return ok
+	return a.newest
 }
 
-// add stages one admitted sample for series id with its lossy-sampling weight sf (1 when unsampled).
-// isNew, register and s describe the series' first sample in b and are ignored on later ones.
-func (b *walBatch) add(id signal.SeriesID, ts int64, value, sf float64, isNew, register bool, s signal.Series) {
-	k, ok := b.pos[id]
-	if !ok {
-		k = len(b.order)
-		b.order = append(b.order, id)
-		b.pos[id] = k
-
-		acc := walSeriesAcc{isNew: isNew, register: register, series: s, newest: ts}
-		if k < len(b.accs) { // reuse a prior write's accumulator (and its slice capacity)
-			acc.ts, acc.values, acc.sf = b.accs[k].ts[:0], b.accs[k].values[:0], b.accs[k].sf[:0]
-			acc.attrs = b.accs[k].attrs
-			b.accs[k] = acc
-		} else {
-			b.accs = append(b.accs, acc)
-		}
-
-		if register {
-			b.registered++
-		}
+func (b *walBatch) start(id signal.SeriesID, acc walSeriesAcc) int {
+	k := len(b.order)
+	b.order = append(b.order, id)
+	b.pos[id] = k
+	if k < len(b.accs) {
+		acc.ts, acc.values, acc.sf = b.accs[k].ts[:0], b.accs[k].values[:0], b.accs[k].sf[:0]
+		acc.attrs = b.accs[k].attrs
+		b.accs[k] = acc
+	} else {
+		b.accs = append(b.accs, acc)
 	}
+	if acc.register {
+		b.registered++
+	}
+	return k
+}
 
+func (b *walBatch) add(k int, ts int64, value, sf float64) {
 	if b.samples == 0 {
 		b.first = time.Now()
 	}
 
 	a := &b.accs[k]
+	if len(a.ts) == 0 {
+		a.newest = ts
+	} else {
+		a.newest = max(a.newest, ts)
+	}
 	a.ts = append(a.ts, ts)
 	a.values = append(a.values, value)
 	a.sf = append(a.sf, sf)
-	a.newest = max(a.newest, ts)
 
 	if sf != 1 {
 		a.sampled = true
@@ -235,13 +247,19 @@ func (b *walBatch) apply(h *head) {
 			h.register(id, a.series)
 		}
 
-		buf := h.bufFor(id)
+		buf := a.buffer
+		if buf == nil {
+			buf = h.bufFor(id)
+		}
 		for i := range a.ts {
 			buf.appendSample(a.ts[i], a.values[i], a.sf[i])
 		}
 
 		h.grow(int64(len(a.ts)) * SampleBytes)
-		h.noteTS(id, a.newest)
+		if !a.hadNewest || a.newest > a.priorNewest {
+			h.seriesNewest[id] = a.newest
+		}
+		h.newest = max(h.newest, a.newest)
 	}
 
 	if wasEmpty && h.bytes > 0 {
@@ -250,6 +268,10 @@ func (b *walBatch) apply(h *head) {
 }
 
 func (b *walBatch) reset() {
+	for i := range b.order {
+		b.accs[i].series = signal.Series{}
+		b.accs[i].buffer = nil
+	}
 	b.order = b.order[:0]
 	b.samples, b.registered = 0, 0
 	clear(b.pos)
