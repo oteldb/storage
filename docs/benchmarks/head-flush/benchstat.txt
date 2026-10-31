@@ -1,0 +1,46 @@
+goos: linux
+goarch: amd64
+pkg: github.com/oteldb/storage/engine
+cpu: AMD Ryzen 9 9950X3D2 16-Core Processor         
+                             │ ../head-part-evidence/before-reserve-paired.bench.txt │ ../head-part-evidence/after-reserve-paired.bench.txt │
+                             │                        sec/op                         │             sec/op              vs base              │
+FlushSealedHead/points=1-8                                              50.71m ±  6%                      52.11m ± 8%       ~ (p=0.310 n=6)
+FlushSealedHead/points=8-8                                              69.31m ± 13%                      71.47m ± 6%       ~ (p=0.589 n=6)
+FlushSealedHead/points=128-8                                            349.1m ±  1%                      327.3m ± 4%  -6.26% (p=0.002 n=6)
+geomean                                                                 107.1m                            106.8m       -0.22%
+
+                             │ ../head-part-evidence/before-reserve-paired.bench.txt │ ../head-part-evidence/after-reserve-paired.bench.txt │
+                             │                          B/s                          │              B/s                vs base              │
+FlushSealedHead/points=1-8                                             39.52Mi ±  6%                     38.39Mi ± 7%       ~ (p=0.310 n=6)
+FlushSealedHead/points=8-8                                             230.9Mi ± 12%                     223.9Mi ± 5%       ~ (p=0.589 n=6)
+FlushSealedHead/points=128-8                                           733.3Mi ±  1%                     782.2Mi ± 4%  +6.67% (p=0.002 n=6)
+geomean                                                                188.4Mi                           188.7Mi       +0.17%
+
+                             │ ../head-part-evidence/before-reserve-paired.bench.txt │ ../head-part-evidence/after-reserve-paired.bench.txt │
+                             │                      admit-bytes                      │         admit-bytes           vs base                │
+FlushSealedHead/points=1-8                                              74.71Mi ± 0%                  448.00Mi ± 0%  +499.66% (p=0.002 n=6)
+FlushSealedHead/points=8-8                                              186.7Mi ± 0%                   448.0Mi ± 0%  +139.95% (p=0.002 n=6)
+FlushSealedHead/points=128-8                                           2106.7Mi ± 0%                   448.0Mi ± 0%   -78.73% (p=0.002 n=6)
+geomean                                                                 308.6Mi                        448.0Mi        +45.18%
+
+                             │ ../head-part-evidence/before-reserve-paired.bench.txt │ ../head-part-evidence/after-reserve-paired.bench.txt │
+                             │                       parts/op                        │           parts/op            vs base                │
+FlushSealedHead/points=1-8                                                1.000 ± 0%                     1.000 ± 0%       ~ (p=1.000 n=6) ¹
+FlushSealedHead/points=8-8                                                1.000 ± 0%                     1.000 ± 0%       ~ (p=1.000 n=6) ¹
+FlushSealedHead/points=128-8                                              4.000 ± 0%                     4.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                   1.587                          1.587       +0.00%
+¹ all samples are equal
+
+                             │ ../head-part-evidence/before-reserve-paired.bench.txt │ ../head-part-evidence/after-reserve-paired.bench.txt │
+                             │                         B/op                          │             B/op               vs base               │
+FlushSealedHead/points=1-8                                              73.32Mi ± 0%                    64.79Mi ± 0%  -11.63% (p=0.002 n=6)
+FlushSealedHead/points=8-8                                             114.75Mi ± 0%                    79.66Mi ± 0%  -30.58% (p=0.002 n=6)
+FlushSealedHead/points=128-8                                            830.9Mi ± 0%                    321.0Mi ± 0%  -61.37% (p=0.002 n=6)
+geomean                                                                 191.2Mi                         118.3Mi       -38.12%
+
+                             │ ../head-part-evidence/before-reserve-paired.bench.txt │ ../head-part-evidence/after-reserve-paired.bench.txt │
+                             │                       allocs/op                       │           allocs/op            vs base               │
+FlushSealedHead/points=1-8                                               66.84k ± 0%                     67.60k ± 0%   +1.13% (p=0.002 n=6)
+FlushSealedHead/points=8-8                                               68.42k ± 0%                     71.35k ± 0%   +4.27% (p=0.002 n=6)
+FlushSealedHead/points=128-8                                             94.67k ± 0%                    135.72k ± 0%  +43.36% (p=0.002 n=6)
+geomean                                                                  75.65k                          86.82k       +14.77%

@@ -1,0 +1,48 @@
+goos: linux
+goarch: amd64
+pkg: github.com/oteldb/storage/engine
+cpu: AMD Ryzen 9 9950X3D2 16-Core Processor         
+BenchmarkFlushSealedHead/points=1-8         	       1	  53156980 ns/op	  39.45 MB/s	  78337424 admit-bytes	         1.000 parts/op	76881888 B/op	   66839 allocs/op
+BenchmarkFlushSealedHead/points=8-8         	       1	  68506254 ns/op	 244.90 MB/s	 195777936 admit-bytes	         1.000 parts/op	120327736 B/op	   68423 allocs/op
+BenchmarkFlushSealedHead/points=128-8       	       1	 346565368 ns/op	 774.56 MB/s	2209043856 admit-bytes	         4.000 parts/op	871310064 B/op	   94671 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/oteldb/storage/engine
+cpu: AMD Ryzen 9 9950X3D2 16-Core Processor         
+BenchmarkFlushSealedHead/points=1-8         	       1	  48459775 ns/op	  43.28 MB/s	  78337424 admit-bytes	         1.000 parts/op	76881888 B/op	   66839 allocs/op
+BenchmarkFlushSealedHead/points=8-8         	       1	  77793453 ns/op	 215.66 MB/s	 195777936 admit-bytes	         1.000 parts/op	120327720 B/op	   68423 allocs/op
+BenchmarkFlushSealedHead/points=128-8       	       1	 352959324 ns/op	 760.53 MB/s	2209043856 admit-bytes	         4.000 parts/op	871300640 B/op	   94667 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/oteldb/storage/engine
+cpu: AMD Ryzen 9 9950X3D2 16-Core Processor         
+BenchmarkFlushSealedHead/points=1-8         	       1	  47779485 ns/op	  43.89 MB/s	  78337424 admit-bytes	         1.000 parts/op	76887576 B/op	   66847 allocs/op
+BenchmarkFlushSealedHead/points=8-8         	       1	  68857154 ns/op	 243.65 MB/s	 195777936 admit-bytes	         1.000 parts/op	120327720 B/op	   68423 allocs/op
+BenchmarkFlushSealedHead/points=128-8       	       1	 350144662 ns/op	 766.64 MB/s	2209043856 admit-bytes	         4.000 parts/op	871292424 B/op	   94665 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/oteldb/storage/engine
+cpu: AMD Ryzen 9 9950X3D2 16-Core Processor         
+BenchmarkFlushSealedHead/points=1-8         	       1	  52962276 ns/op	  39.60 MB/s	  78337424 admit-bytes	         1.000 parts/op	76893040 B/op	   66853 allocs/op
+BenchmarkFlushSealedHead/points=8-8         	       1	  69757559 ns/op	 240.51 MB/s	 195777936 admit-bytes	         1.000 parts/op	120327736 B/op	   68423 allocs/op
+BenchmarkFlushSealedHead/points=128-8       	       1	 351309281 ns/op	 764.10 MB/s	2209043856 admit-bytes	         4.000 parts/op	871301816 B/op	   94669 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/oteldb/storage/engine
+cpu: AMD Ryzen 9 9950X3D2 16-Core Processor         
+BenchmarkFlushSealedHead/points=1-8         	       1	  53471082 ns/op	  39.22 MB/s	  78337424 admit-bytes	         1.000 parts/op	76881904 B/op	   66839 allocs/op
+BenchmarkFlushSealedHead/points=8-8         	       1	  67148961 ns/op	 249.85 MB/s	 195777936 admit-bytes	         1.000 parts/op	120327736 B/op	   68423 allocs/op
+BenchmarkFlushSealedHead/points=128-8       	       1	 346443569 ns/op	 774.83 MB/s	2209043856 admit-bytes	         4.000 parts/op	871317088 B/op	   94671 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/oteldb/storage/engine
+cpu: AMD Ryzen 9 9950X3D2 16-Core Processor         
+BenchmarkFlushSealedHead/points=1-8         	       1	  48093245 ns/op	  43.61 MB/s	  78337424 admit-bytes	         1.000 parts/op	76881880 B/op	   66838 allocs/op
+BenchmarkFlushSealedHead/points=8-8         	       1	  78441832 ns/op	 213.88 MB/s	 195777936 admit-bytes	         1.000 parts/op	120327720 B/op	   68423 allocs/op
+BenchmarkFlushSealedHead/points=128-8       	       1	 348115815 ns/op	 771.11 MB/s	2209043856 admit-bytes	         4.000 parts/op	871300640 B/op	   94667 allocs/op
+PASS
