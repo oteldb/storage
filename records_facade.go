@@ -5,6 +5,7 @@ import (
 	"context"
 
 	"github.com/go-faster/errors"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/encoding/compress"
@@ -397,7 +398,11 @@ func (s *Storage) recordSeries(
 func (s *Storage) recordKeys(
 	ctx context.Context, sig signal.Signal, op string, lookup func(signal.TenantID) (*recordengine.Engine, bool),
 	t signal.TenantID, start, end int64,
-) ([]KeyInfo, error) {
+) (_ []KeyInfo, rerr error) {
+	ctx, span := s.obs.Tracer.Start(ctx, "storage.keys")
+	defer span.End()
+	defer func() { recordKeysError(span, rerr) }()
+	span.SetAttributes(attribute.String("storage.signal", sig.String()))
 	if s.closed.Load() {
 		return nil, errors.Wrap(ErrClosed, op)
 	}
@@ -413,14 +418,21 @@ func (s *Storage) recordKeys(
 		return keyInfosFromCluster(raw), nil
 	}
 
+	_, lookupSpan := s.obs.Tracer.Start(ctx, "storage.keys.lookup")
 	eng, ok := lookup(tid)
+	lookupSpan.SetAttributes(attribute.Bool("storage.engine_found", ok))
+	lookupSpan.End()
 	if !ok {
 		return nil, nil
 	}
 
-	if err := s.answerLocally(ctx, rpcOpKeys, sig, tid, eng, start, end); err != nil {
+	gapCtx, gapSpan := s.obs.Tracer.Start(ctx, "storage.keys.gapCheck")
+	err := s.answerLocally(gapCtx, rpcOpKeys, sig, tid, eng, start, end)
+	recordKeysError(gapSpan, err)
+	gapSpan.End()
+	if err != nil {
 		return nil, err
 	}
 
-	return keyInfosFromEngine(eng.Keys(start, end)), nil
+	return keyInfosFromEngine(eng.KeysContext(ctx, start, end)), nil
 }

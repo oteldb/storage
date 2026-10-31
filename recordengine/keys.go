@@ -2,7 +2,10 @@ package recordengine
 
 import (
 	"bytes"
+	"context"
 	"slices"
+
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/oteldb/storage/signal"
 )
@@ -40,6 +43,14 @@ type KeyInfo struct {
 // part's persisted key footer. Window precision is part-granular and best-effort: a key whose
 // records all fall outside the window may still be returned (harmless). Safe for concurrent use.
 func (e *Engine) Keys(start, end int64) []KeyInfo {
+	return e.KeysContext(context.Background(), start, end)
+}
+
+// KeysContext is [Engine.Keys] with tracing attached to ctx.
+func (e *Engine) KeysContext(ctx context.Context, start, end int64) []KeyInfo {
+	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "recordengine.keys")
+	defer span.End()
+
 	scopes := make(map[string]KeyScope)
 	add := func(key []byte, sc KeyScope) {
 		if len(key) > 0 {
@@ -47,13 +58,21 @@ func (e *Engine) Keys(start, end int64) []KeyInfo {
 		}
 	}
 
+	_, lockSpan := e.cfg.Obs.Tracer.Start(ctx, "recordengine.keys.lock")
 	e.mu.LockState() // The snapshot may populate the head/flushing key caches.
+	lockSpan.End()
+	_, streamsSpan := e.cfg.Obs.Tracer.Start(ctx, "recordengine.keys.streams")
+	streams, matched, lookups := 0, 0, 0
 	// Stream-identity keys: resource/scope/series attributes of every in-window stream. The series index is
 	// authoritative (it survives flush and a stateless reload), so this is sound on all backends.
 	e.head.series.ForEach(func(id signal.SeriesID, s signal.Series) {
-		if !e.streamInRangeLocked(id, start, end) {
+		streams++
+		inRange, searched := e.streamInRangeLookupsLocked(id, start, end)
+		lookups += searched
+		if !inRange {
 			return
 		}
+		matched++
 
 		for i := range s.Resource.Attributes {
 			add(s.Resource.Attributes[i].Key, KeyScopeResource)
@@ -75,25 +94,45 @@ func (e *Engine) Keys(start, end int64) []KeyInfo {
 			add(labelScopeVersion, KeyScopeScope)
 		}
 	})
+	streamsSpan.SetAttributes(attribute.Int("storage.streams", streams), attribute.Int("storage.streams_matched", matched),
+		attribute.Int("storage.part_lookups", lookups))
+	streamsSpan.End()
 
 	// Record-attribute keys: the head's still-buffered records (plus any detached mid-flush) and each
 	// in-window part's footer.
+	_, recordsSpan := e.cfg.Obs.Tracer.Start(ctx, "recordengine.keys.records")
 	emitRecord := func(key []byte) { add(key, KeyScopeRecord) }
 	collectRecordKeys(e.cfg.Schema, e.head.records, start, end, emitRecord)
 	collectRecordKeys(e.cfg.Schema, e.flushing, start, end, emitRecord)
+	recordsSpan.End()
 
-	for _, p := range e.readablePartsLocked() {
+	_, partsSpan := e.cfg.Obs.Tracer.Start(ctx, "recordengine.keys.parts")
+	parts := e.readablePartsLocked()
+	partsInWindow := 0
+	for _, p := range parts {
 		if !partInWindow(p, start, end) {
 			continue
 		}
+		partsInWindow++
 
 		for _, key := range p.recordKeys {
 			add(key, KeyScopeRecord)
 		}
 	}
+	partsSpan.SetAttributes(attribute.Int("storage.parts_scanned", len(parts)), attribute.Int("storage.parts_live", partsInWindow))
+	partsSpan.End()
 	e.mu.UnlockState()
 
-	return keyInfoSlice(scopes)
+	_, sortSpan := e.cfg.Obs.Tracer.Start(ctx, "recordengine.keys.sort")
+	keys := keyInfoSlice(scopes)
+	sortSpan.End()
+	span.SetAttributes(
+		attribute.Int("storage.streams", streams), attribute.Int("storage.streams_matched", matched),
+		attribute.Int("storage.parts_scanned", len(parts)), attribute.Int("storage.parts_live", partsInWindow),
+		attribute.Int("storage.keys", len(keys)),
+		attribute.Int("storage.part_lookups", lookups),
+	)
+	return keys
 }
 
 // partInWindow reports whether part p's record bounds overlap [start, end]. A zero start AND end

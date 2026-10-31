@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-faster/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/backend/bucketindex"
@@ -1103,15 +1104,26 @@ func metricSeriesRequest(tid signal.TenantID, matchers []fetch.Matcher, start, e
 // engine (the enumeration twin of localSeries, backing LogKeys' cluster fan-out).
 func (s *Storage) localKeys(
 	ctx context.Context, sig signal.Signal, tenant string, start, end int64,
-) ([]cluster.KeyInfo, error) {
+) (_ []cluster.KeyInfo, rerr error) {
+	ctx, span := s.obs.Tracer.Start(ctx, "storage.keys.local")
+	defer span.End()
+	defer func() { recordKeysError(span, rerr) }()
+	span.SetAttributes(attribute.String("storage.signal", sig.String()))
 	tid := s.normalizeTenant(signal.TenantID(tenant))
 
+	_, lookupSpan := s.obs.Tracer.Start(ctx, "storage.keys.lookup")
 	eng, ok := s.lookupRecordEngine(sig, tid)
-	if err := s.canAnswer(ctx, rpcOpSeries, sig, tid, ok, start, end); err != nil {
+	lookupSpan.SetAttributes(attribute.Bool("storage.engine_found", ok))
+	lookupSpan.End()
+	gapCtx, gapSpan := s.obs.Tracer.Start(ctx, "storage.keys.gapCheck")
+	err := s.canAnswer(gapCtx, rpcOpSeries, sig, tid, ok, start, end)
+	recordKeysError(gapSpan, err)
+	gapSpan.End()
+	if err != nil {
 		return nil, err
 	}
 
-	raw := eng.Keys(start, end)
+	raw := eng.KeysContext(ctx, start, end)
 
 	out := make([]cluster.KeyInfo, len(raw))
 	for i := range raw {

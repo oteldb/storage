@@ -1073,21 +1073,30 @@ func (e *Engine) replayHandlers() wal.Handlers {
 // streamInRangeLocked reports whether stream id has any record in [start, end] (head ∪ in-flight
 // flush buffers ∪ parts). A zero start AND end disables the filter. Caller holds the lock.
 func (e *Engine) streamInRangeLocked(id signal.SeriesID, start, end int64) bool {
+	matched, _ := e.streamInRangeLookupsLocked(id, start, end)
+	return matched
+}
+
+func (e *Engine) streamInRangeLookupsLocked(id signal.SeriesID, start, end int64) (matched bool, lookups int) {
 	if start == 0 && end == 0 {
-		return true
+		return true, 0
 	}
 
 	if bufInRange(e.head.records[id], start, end) || bufInRange(e.flushing[id], start, end) {
-		return true
+		return true, 0
 	}
 
 	for _, p := range e.readablePartsLocked() {
-		if rng, ok := p.lookup(id); ok && rng.start < rng.end && p.maxTime >= start && p.minTime <= end {
-			return true
+		if !partInWindow(p, start, end) {
+			continue
+		}
+		lookups++
+		if rng, ok := p.lookup(id); ok && rng.start < rng.end {
+			return true, lookups
 		}
 	}
 
-	return false
+	return false, lookups
 }
 
 // fetchPlan is the lock-free-readable plan a fetch builds under the engine read lock: per-stream
