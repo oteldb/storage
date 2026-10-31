@@ -43,6 +43,7 @@ engines over the fetch seam (`query/fetch`).
 | [`index/ARCH.md`](index/ARCH.md) | identity (`signal.Series`/`SeriesID`), symbols, series, postings, blooms |
 | [`wal/ARCH.md`](wal/ARCH.md) | segmented CRC-framed WAL, epochs, exactly-once recovery |
 | [`signal/ARCH.md`](signal/ARCH.md) | per-signal ingest models + projection, `otlp/pdataconv` |
+| [`otlp/ARCH.md`](otlp/ARCH.md) | transport-free OTLP protobuf decoding and its borrowed-buffer contract |
 | [`engine/ARCH.md`](engine/ARCH.md) | the metrics vertical: head, flush, merge/retention/downsample, fetch, caches |
 | [`recordengine/ARCH.md`](recordengine/ARCH.md) | the shared record engine for logs/traces/profiles/exemplars |
 | [`query/ARCH.md`](query/ARCH.md) | fetch contract, scale decorators, PromQL adapter, EXPLAIN ANALYZE |
@@ -306,6 +307,7 @@ pool/                 ByteIntMap (xxh3) for dict building
 signal/               identity model (Value/KeyValue/Attributes/SeriesID) + Signal/TenantID/Aggregation
   signal/{metric,log,trace,profile,exemplar}   per-signal ingest batch + projection
 otlp/pdataconv        optional OTel-Go bridge (only package importing pdata)
+otlp/otlpdecode       optional protobuf-to-native converters; transport and routing belong to the embedder
 tenant/               policy model + Resolver
 backend/{,file,s3,bucketindex,backendtest,s3/s3test}   L1 seam, implementations, part index + repair seam, conformance suite + test wrappers, in-process S3
 block/                immutable columnar part format

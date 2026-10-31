@@ -3,6 +3,7 @@ module github.com/oteldb/storage
 go 1.26.6
 
 require (
+	github.com/VictoriaMetrics/easyproto v1.2.0
 	github.com/aws/aws-sdk-go-v2 v1.47.4
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.11
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.5
