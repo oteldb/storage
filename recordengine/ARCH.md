@@ -783,6 +783,14 @@ GOMAXPROCS=2), concurrent warm-cache enumeration over 100 streams × 100 records
 70.18 µs/op versus 38.34 µs/op with shared locking (+31.84 µs, six 200 ms runs, p=0.002);
 allocations remain 19.34 KiB and 1,925 per call.
 
+`KeysContext(ctx, start, end)` preserves `Keys` results while attaching enumeration to the caller's
+trace; `Keys` uses a background context for compatibility. `recordengine.keys.lock` covers waiting
+for `LockState`; sibling `streams`, `records`, `parts`, and `sort` spans cover the work after admission.
+The fixed span count is independent of stream and part counts. Aggregate `storage.streams`,
+`storage.streams_matched`, `storage.parts_scanned`, `storage.parts_live`, `storage.part_lookups`, and
+`storage.keys` attributes describe the work; no keys or values are exported. Stream membership skips
+non-overlapping parts before searching their ranges, preserving inclusive time bounds.
+
 **Values** need no sidecar: `Engine.ColumnValues` (`values.go`) unions each in-window part's
 **column dictionary** — already the part's distinct value set — with a scan of the unflushed head,
 so tag/label autocomplete costs O(distinct values) instead of decoding every record. The flat

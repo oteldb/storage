@@ -333,6 +333,19 @@ counted here. A steady rate means either the budget is undersized for the query 
 holds several iterators open per query without passing a `fetch.Scope` — the latter shows up as
 `scoped=false` in the log line.
 
+#### Key enumeration spans
+
+`LogKeys` and `TraceKeys` emit `storage.keys`; peer-side enumeration emits `storage.keys.local`.
+Their `storage.keys.lookup` and `storage.keys.gapCheck` children separate engine lookup from
+completeness checks. Both propagate context into `recordengine.Engine.KeysContext`.
+
+`recordengine.keys` has fixed children `recordengine.keys.lock`, `.streams`, `.records`, `.parts`,
+and `.sort`. A long `.lock` means state-lock contention; a long `.streams` with many
+`storage.part_lookups` means membership resolution work. `storage.parts_scanned` and
+`storage.parts_live` describe footer enumeration, while `storage.keys` counts distinct results.
+`storage.streams` and `storage.streams_matched` bound identity work. Spans contain counts, not log
+values or attribute keys; EXPLAIN profile nodes remain separate from these OpenTelemetry spans.
+
 #### Aggregate read spans
 
 `engine.aggregateRange` / `engine.aggregateStep` / `engine.aggregateStepNamed` /
