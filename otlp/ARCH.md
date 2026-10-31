@@ -26,3 +26,6 @@ pdata for the facade's local projected-write path. Its stable source materialize
 attributes only on registry misses/soft overflow. Whole requests containing exemplars or decomposed
 metric types use the existing conversion path; clustered storage rejects projection before ingestion.
 Pdata stays outside the core storage dependency graph, and canonical IDs/WAL formats are unchanged.
+
+Point-attribute maps with at most 32 entries sort in bounded stack scratch; larger maps reuse
+projector scratch. Nested maps sort independently, while canonical preimage buffers retain capacity.

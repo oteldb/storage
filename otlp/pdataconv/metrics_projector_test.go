@@ -1,7 +1,9 @@
 package pdataconv
 
 import (
+	"bytes"
 	"math"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -178,6 +180,20 @@ func TestMetricsHashCanonical(t *testing.T) {
 	}{
 		{"empty", func(pcommon.Map) {}},
 		{"typed", typedAttributes},
+		{"empty-containers", func(m pcommon.Map) {
+			m.PutEmptyMap("map")
+			m.PutEmptySlice("slice")
+			m.PutEmptyBytes("bytes")
+		}},
+		{"small-threshold", func(m pcommon.Map) { hashAttributes(8, 0).CopyTo(m) }},
+		{"medium", func(m pcommon.Map) { hashAttributes(9, 0).CopyTo(m) }},
+		{"threshold", func(m pcommon.Map) { hashAttributes(32, 0).CopyTo(m) }},
+		{"fallback", func(m pcommon.Map) { hashAttributes(33, 0).CopyTo(m) }},
+		{"nested-threshold", func(m pcommon.Map) { hashAttributes(2, 32).CopyTo(m) }},
+		{"nested-stack", func(m pcommon.Map) { hashAttributes(32, 2).CopyTo(m) }},
+		{"nested-fallback", func(m pcommon.Map) { hashAttributes(2, 33).CopyTo(m) }},
+		{"fallback-parent", func(m pcommon.Map) { hashAttributes(33, 2).CopyTo(m) }},
+		{"fallback-parent-child", func(m pcommon.Map) { hashAttributes(33, 33).CopyTo(m) }},
 		{"reserved", func(m pcommon.Map) {
 			for _, key := range metricKeys {
 				m.PutStr(key, "point-value")
@@ -206,6 +222,7 @@ func TestMetricsHashCanonical(t *testing.T) {
 func FuzzMetricsHash(f *testing.F) {
 	f.Add("__name__", "value", []byte{0, 1, 2, 3, 4, 5, 6, 7, 8}, uint64(0x7ff8000000000042))
 	f.Add("!before", "a\x00b", []byte{8, 8, 8, 8, 1}, uint64(1<<63))
+	f.Add("__unit__", "nested-fallback", bytes.Repeat([]byte{62}, 32), uint64(42))
 	f.Fuzz(func(t *testing.T, key, value string, data []byte, bits uint64) {
 		if len(key)+len(value)+len(data) > 4096 {
 			t.Skip()
@@ -218,6 +235,7 @@ func FuzzMetricsHash(f *testing.F) {
 			if i >= 32 {
 				break
 			}
+			attrs.PutStr("attribute-"+strconv.Itoa(i), value)
 			v := slice.AppendEmpty()
 			switch b % 9 {
 			case 0:
@@ -237,8 +255,9 @@ func FuzzMetricsHash(f *testing.F) {
 				v.SetEmptyMap().PutStr(key, value)
 			case 8:
 				m := v.SetEmptyMap()
-				m.PutInt("z", 1)
-				m.PutInt("a", 2)
+				for j := int(b)%65 - 1; j >= 0; j-- {
+					m.PutInt("nested-"+strconv.Itoa(j), int64(j))
+				}
 			}
 		}
 		m := pmetric.NewMetric()

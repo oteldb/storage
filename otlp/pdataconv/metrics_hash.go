@@ -33,8 +33,24 @@ func appendHashString(dst []byte, s string) []byte {
 	return append(dst, s...)
 }
 
-func (h *metricsHash) sorted(m pcommon.Map) []mapEntry {
+const (
+	metricsHashSmallStackThreshold = 8
+	metricsHashStackThreshold      = 32
+)
+
+func sortedEntries(m pcommon.Map, entries []mapEntry) []mapEntry {
+	for k, v := range m.All() {
+		entries = append(entries, mapEntry{key: k, value: v})
+	}
+	slices.SortStableFunc(entries, func(a, b mapEntry) int { return strings.Compare(a.key, b.key) })
+	return entries
+}
+
+func (h *metricsHash) sortedLarge(m pcommon.Map) []mapEntry {
 	start := len(h.entries)
+	if size := m.Len(); size > cap(h.entries)-start {
+		h.entries = slices.Grow(h.entries, size)
+	}
 	for k, v := range m.All() {
 		h.entries = append(h.entries, mapEntry{key: k, value: v})
 	}
@@ -44,8 +60,20 @@ func (h *metricsHash) sorted(m pcommon.Map) []mapEntry {
 }
 
 func (h *metricsHash) appendMap(dst []byte, m pcommon.Map) []byte {
+	size := m.Len()
+	if size == 0 {
+		return binary.AppendUvarint(dst, 0)
+	}
 	start := len(h.entries)
-	entries := h.sorted(m)
+	var entries []mapEntry
+	switch {
+	case size <= metricsHashSmallStackThreshold:
+		entries = sortedEntries(m, make([]mapEntry, 0, metricsHashSmallStackThreshold))
+	case size <= metricsHashStackThreshold:
+		entries = sortedEntries(m, make([]mapEntry, 0, metricsHashStackThreshold))
+	default:
+		entries = h.sortedLarge(m)
+	}
 	dst = binary.AppendUvarint(dst, uint64(len(entries)))
 	for _, entry := range entries {
 		dst = appendHashString(dst, entry.key)
@@ -135,7 +163,16 @@ func (h *metricsHash) setMetric(m pmetric.Metric) {
 }
 
 func (h *metricsHash) id(m pcommon.Map) signal.SeriesID {
-	entries := h.sorted(m)
+	var entries []mapEntry
+	switch size := m.Len(); {
+	case size == 0:
+	case size <= metricsHashSmallStackThreshold:
+		entries = sortedEntries(m, make([]mapEntry, 0, metricsHashSmallStackThreshold))
+	case size <= metricsHashStackThreshold:
+		entries = sortedEntries(m, make([]mapEntry, 0, metricsHashStackThreshold))
+	default:
+		entries = h.sortedLarge(m)
+	}
 	dst := binary.AppendUvarint(h.buf[:h.prefix], uint64(len(entries)+len(metricKeys)))
 	reserved := 0
 	for _, entry := range entries {
