@@ -9,6 +9,8 @@ import (
 	"github.com/oteldb/storage/wal"
 )
 
+const maxWALIdentityAttributes = 4096
+
 // walBatch is a logged write staged before it touches the head: its admitted samples grouped by the
 // series they land under, with what admitting them would have done to the head. A durable write is
 // decided into it ([walBatch.admit]), logged from it ([Engine.flushWALLocked]), and only then applied
@@ -25,6 +27,7 @@ type walBatch struct {
 	order []signal.SeriesID       // series in first-admitted order; order[k] ↔ accs[k]
 	pos   map[signal.SeriesID]int // id → its index in order/accs (for this write only)
 	accs  []walSeriesAcc
+	attrs signal.Attributes
 
 	// samples is the admitted sample count and registered the new identities the write registers; both
 	// are what [head.appendByID] would have added to the head's in-flight bytes and series count.
@@ -45,8 +48,7 @@ type walSeriesAcc struct {
 	register    bool // the identity is not in the head's index yet
 	knownRef    bool
 	series      signal.Series // the identity, set when isNew
-	attrs       signal.Attributes
-	newest      int64 // the newest admitted timestamp
+	newest      int64         // the newest admitted timestamp
 	buffer      *sampleBuf
 	priorNewest int64
 	hadNewest   bool
@@ -152,7 +154,6 @@ func (b *walBatch) start(id signal.SeriesID, acc walSeriesAcc) int {
 	b.pos[id] = k
 	if k < len(b.accs) {
 		acc.ts, acc.values, acc.sf = b.accs[k].ts[:0], b.accs[k].values[:0], b.accs[k].sf[:0]
-		acc.attrs = b.accs[k].attrs
 		b.accs[k] = acc
 	} else {
 		b.accs = append(b.accs, acc)
@@ -234,15 +235,13 @@ func (b *walBatch) encode(view series.View, everySeries bool) error {
 		case a.isNew:
 			s := a.series
 			if !a.register {
-				s = a.identity(view)
-				a.attrs = s.Attributes
+				s = b.identity(view, a)
 			}
 			if err := b.fw.WriteSeries(id, s); err != nil {
 				return err
 			}
 		case everySeries:
-			s := a.identity(view)
-			a.attrs = s.Attributes
+			s := b.identity(view, a)
 			if err := b.fw.WriteSeries(id, s); err != nil {
 				return err
 			}
@@ -266,11 +265,15 @@ func (b *walBatch) encode(view series.View, everySeries bool) error {
 	return nil
 }
 
-func (a *walSeriesAcc) identity(view series.View) signal.Series {
+func (b *walBatch) identity(view series.View, a *walSeriesAcc) signal.Series {
 	if !a.knownRef {
 		return signal.Series{}
 	}
-	return view.At(int(a.identityRef), a.attrs)
+	s := view.At(int(a.identityRef), b.attrs)
+	if s.Attributes != nil {
+		b.attrs = s.Attributes
+	}
+	return s
 }
 
 // apply puts the staged samples into the head, leaving it exactly as applying each one through
@@ -306,6 +309,12 @@ func (b *walBatch) apply(h *head) {
 }
 
 func (b *walBatch) reset() {
+	clear(b.attrs[:cap(b.attrs)])
+	if cap(b.attrs) > maxWALIdentityAttributes {
+		b.attrs = nil
+	} else {
+		b.attrs = b.attrs[:0]
+	}
 	for i := range b.order {
 		b.accs[i].series = signal.Series{}
 		b.accs[i].buffer = nil

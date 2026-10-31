@@ -113,16 +113,16 @@ func TestPreparedBatchReleasesReferences(t *testing.T) {
 	_, err := e.appendPrepared([]signal.SeriesID{s.Hash()}, []int64{1}, []float64{1}, nil,
 		func(int) signal.Series { return s }, AppendLimits{}, p)
 	require.NoError(t, err)
-	p.batch.accs[0].attrs = slices.Clone(s.Attributes)
+	p.batch.attrs = slices.Clone(s.Attributes)
 	p.batch.frames.Grow(maxPreparedFrameBytes + 1)
 	pool.release(p)
 	assert.Zero(t, p.batch.frames.Cap())
 	for _, a := range p.batch.accs {
 		assert.Equal(t, signal.Series{}, a.series)
 		assert.Nil(t, a.buffer)
-		for _, attr := range a.attrs[:cap(a.attrs)] {
-			assert.Equal(t, signal.KeyValue{}, attr)
-		}
+	}
+	for _, attr := range p.batch.attrs[:cap(p.batch.attrs)] {
+		assert.Equal(t, signal.KeyValue{}, attr)
 	}
 	p = pool.acquire()
 	p.prepare([]signal.SeriesID{s.Hash()})
@@ -130,6 +130,36 @@ func TestPreparedBatchReleasesReferences(t *testing.T) {
 		func(int) signal.Series { return s }, AppendLimits{}, p)
 	require.NoError(t, err)
 	pool.release(p)
+}
+
+func TestPreparedBatchDropsHiddenReferences(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		shrink bool
+	}{
+		{name: "full batch"},
+		{name: "smaller batch", shrink: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pool := newBatchPreparations()
+			p := pool.acquire()
+			p.batch.accs = make([]walSeriesAcc, 4)
+			for i := range p.batch.accs {
+				p.batch.accs[i].series = stagedTestSeries("borrowed")
+				p.batch.accs[i].buffer = &sampleBuf{}
+			}
+			if tc.shrink {
+				p.batch.accs = p.batch.accs[:1]
+			}
+			pool.release(p)
+			for _, acc := range p.batch.accs[:cap(p.batch.accs)] {
+				assert.Equal(t, signal.Series{}, acc.series)
+				assert.Nil(t, acc.buffer)
+			}
+		})
+	}
 }
 
 func TestPreparationDuringBlockedWriter(t *testing.T) {
