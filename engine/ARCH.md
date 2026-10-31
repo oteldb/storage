@@ -132,17 +132,6 @@ encode/write/apply operation against append, replica, seal, checkpoint and Close
 record engine still encodes under state. This permits readers during metric encoding;
 it does not parallelize writers or change WAL batching/durability.
 
-`BenchmarkAppendWALRegistry` cycles 4,096-point warm appends through 65,536 or 1,048,576
-registered series on a file-backed WAL, with eight parallel callers, GOMAXPROCS=8, and no
-per-append fsync. Six 100ms samples on Ryzen 9950X3D2, Go 1.27.3 (`nodwarf5`), measure
-649→471 µs / 763→474 µs at 65k series (OOO disabled/enabled) and 1321→966 µs /
-1361→971 µs at 1M (-27% to -38%, all p=0.002). The cached accumulator grows from 288 to
-312 bytes on amd64. Input construction and registration are untimed; repeated timestamps
-and growing sample buffers are deliberate. These isolate WAL append work, not receiver,
-flush, query latency or sustainable server capacity; allocation totals vary with buffer growth.
-The 1 GiB segment target avoids timed rotation. [Method and samples](../docs/benchmarks/wal-staging/README.md)
-include the final reader-admitted encoding path.
-
 ## Flush
 
 Drains the head into one flat part, one row per sample:
@@ -164,15 +153,6 @@ per series and repeated column growth. Unordered buffers retain the existing sor
 inputs remain immutable so concurrent reads and rollback keep their original buffers. The
 scale-factor column is allocated once only when an actual non-unit weight occurs. This removes
 intermediate copies; the complete flat output and the detached generation still coexist.
-
-`BenchmarkBuildFlushColumns/short-ordered` lays out 65,536 series with eight points each.
-Six 200 ms single-CPU samples against db64b23 on Linux/amd64, Ryzen 9950X3D2,
-Go 1.27.3 (`nodwarf5`) take 8.205 instead of 17.888 ms (-54.1%), allocate 17.00
-instead of 91.87 MiB (-81.5%), and make 5 instead of 131,180 allocations; all p=0.002.
-Single-point, long ordered, weighted and unordered fixtures preserve the same layout;
-the unordered path still allocates sorting scratch. These are builder measurements,
-not end-to-end ingest capacity. Samples and benchstat are in the
-[benchmark report](https://github.com/oteldb/oteldb/blob/claude/1106-node-exporter-scale-benchmark/dev/local/scale-bench/FLUSH_COPY_RESULTS.md).
 
 ### Identity is part-scoped
 
