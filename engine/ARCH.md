@@ -13,7 +13,7 @@ lazy postings sorting takes only state exclusion. None of these locks is reentra
 
 | operation | ordering |
 |---|---|
-| append | decide and encode under state; WAL I/O admits readers; apply after success |
+| append | decide under state; metrics encoding and WAL I/O admit readers; apply after success |
 | flush detach | seal WAL and detach under one writer barrier; frozen buffers remain readable |
 | identity capture | dense detached maps scan immutable arenas off-lock; sparse/ordered callers resolve at most 256 references per read-lock section |
 | part build | immutable inputs off state; one flush slot and one merge slot when budgeted |
@@ -118,6 +118,20 @@ which nothing can interrupt; `FuzzStagedAdmissionMatchesDirect` pins the two to 
 the same head. The head's age starts at the first staged sample, not when the log write returns, so a
 slow disk does not delay an age-triggered flush.
 
+The staged batch captures each existing sample buffer and original watermark once. Writer
+ownership pins both through WAL I/O; repeated points reuse that admission state and publication
+appends through the captured buffer, avoiding repeated canonical-ID map lookups. Reset drops
+borrowed identities and buffer references while preserving owned numeric scratch capacity.
+No head buffer or watermark changes until the complete WAL write succeeds.
+
+Metrics WAL encoding uses an immutable registry view and local references captured under
+state exclusion. New identities borrow caller payloads until the synchronous append returns;
+known identities materialize from that view, never from a mutable registry map off-lock.
+Reader exclusion covers admission/publication; the writer gate still orders the complete
+encode/write/apply operation against append, replica, seal, checkpoint and Close. The
+record engine still encodes under state. This permits readers during metric encoding;
+it does not parallelize writers or change WAL batching/durability.
+
 ## Flush
 
 Drains the head into one flat part, one row per sample:
@@ -139,15 +153,6 @@ per series and repeated column growth. Unordered buffers retain the existing sor
 inputs remain immutable so concurrent reads and rollback keep their original buffers. The
 scale-factor column is allocated once only when an actual non-unit weight occurs. This removes
 intermediate copies; the complete flat output and the detached generation still coexist.
-
-`BenchmarkBuildFlushColumns/short-ordered` lays out 65,536 series with eight points each.
-Six 200 ms single-CPU samples against db64b23 on Linux/amd64, Ryzen 9950X3D2,
-Go 1.27.3 (`nodwarf5`) take 8.205 instead of 17.888 ms (-54.1%), allocate 17.00
-instead of 91.87 MiB (-81.5%), and make 5 instead of 131,180 allocations; all p=0.002.
-Single-point, long ordered, weighted and unordered fixtures preserve the same layout;
-the unordered path still allocates sorting scratch. These are builder measurements,
-not end-to-end ingest capacity. Samples and benchstat are in the
-[benchmark report](https://github.com/oteldb/oteldb/blob/claude/1106-node-exporter-scale-benchmark/dev/local/scale-bench/FLUSH_COPY_RESULTS.md).
 
 ### Identity is part-scoped
 
