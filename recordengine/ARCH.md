@@ -142,8 +142,8 @@ merges receive turns after the first retention rewrite. Rewritten column bytes f
 from 618.63 to 10.51 KiB (-98.3%), allocation from 22.22 to 0.91 MiB (-95.9%), and merge
 time from 4.540 to 0.451 ms (-90.1%); each difference has p=0.002, n=6. Fixture ingestion
 and close are excluded; logical throughput is per source dataset, not bytes rewritten.
-These synthetic maintenance results do not establish live ingest capacity. Raw samples
-and benchstat are in [`testdata/retention`](testdata/retention/).
+These synthetic maintenance results do not establish live ingest capacity. Measurements
+are recorded in the [performance commit](https://github.com/oteldb/storage/commit/b19bf67).
 
 `BenchmarkResidentLimitedMergeRetries` makes 12 forced turns over three wide-dictionary flushes
 at a 32 MiB resident target and 1 GiB disk cap. Six single-CPU, one-iteration samples on Linux/amd64,
