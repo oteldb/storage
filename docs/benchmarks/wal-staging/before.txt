@@ -1,0 +1,30 @@
+goos: linux
+goarch: amd64
+pkg: github.com/oteldb/storage/engine
+cpu: AMD Ryzen 9 9950X3D2 16-Core Processor         
+BenchmarkAppendWALRegistry/series=65536/ooo=0-8         	     166	    742910 ns/op	  88.22 MB/s	  189578 B/op	    3158 allocs/op
+BenchmarkAppendWALRegistry/series=65536/ooo=0-8         	     163	    683149 ns/op	  95.93 MB/s	  193034 B/op	    3216 allocs/op
+BenchmarkAppendWALRegistry/series=65536/ooo=0-8         	     183	    643406 ns/op	 101.86 MB/s	  171969 B/op	    2865 allocs/op
+BenchmarkAppendWALRegistry/series=65536/ooo=0-8         	     183	    639601 ns/op	 102.46 MB/s	  171910 B/op	    2865 allocs/op
+BenchmarkAppendWALRegistry/series=65536/ooo=0-8         	     183	    647889 ns/op	 101.15 MB/s	  171939 B/op	    2865 allocs/op
+BenchmarkAppendWALRegistry/series=65536/ooo=0-8         	     182	    650992 ns/op	 100.67 MB/s	  172869 B/op	    2880 allocs/op
+BenchmarkAppendWALRegistry/series=65536/ooo=1000-8      	     159	    758559 ns/op	  86.40 MB/s	  197876 B/op	    3297 allocs/op
+BenchmarkAppendWALRegistry/series=65536/ooo=1000-8      	     153	    757193 ns/op	  86.55 MB/s	  205636 B/op	    3426 allocs/op
+BenchmarkAppendWALRegistry/series=65536/ooo=1000-8      	     158	    767875 ns/op	  85.35 MB/s	  199128 B/op	    3318 allocs/op
+BenchmarkAppendWALRegistry/series=65536/ooo=1000-8      	     156	    772398 ns/op	  84.85 MB/s	  201680 B/op	    3361 allocs/op
+BenchmarkAppendWALRegistry/series=65536/ooo=1000-8      	     156	    757423 ns/op	  86.52 MB/s	  201674 B/op	    3361 allocs/op
+BenchmarkAppendWALRegistry/series=65536/ooo=1000-8      	     154	    768317 ns/op	  85.30 MB/s	  204319 B/op	    3404 allocs/op
+BenchmarkAppendWALRegistry/series=1048576/ooo=0-8       	      79	   1415169 ns/op	  46.31 MB/s	  131086 B/op	    8192 allocs/op
+BenchmarkAppendWALRegistry/series=1048576/ooo=0-8       	      91	   1349377 ns/op	  48.57 MB/s	  131163 B/op	    8192 allocs/op
+BenchmarkAppendWALRegistry/series=1048576/ooo=0-8       	      91	   1269280 ns/op	  51.63 MB/s	  131080 B/op	    8192 allocs/op
+BenchmarkAppendWALRegistry/series=1048576/ooo=0-8       	      78	   1313046 ns/op	  49.91 MB/s	  131119 B/op	    8192 allocs/op
+BenchmarkAppendWALRegistry/series=1048576/ooo=0-8       	      78	   1300157 ns/op	  50.41 MB/s	  131082 B/op	    8192 allocs/op
+BenchmarkAppendWALRegistry/series=1048576/ooo=0-8       	      91	   1329257 ns/op	  49.30 MB/s	  131203 B/op	    8192 allocs/op
+BenchmarkAppendWALRegistry/series=1048576/ooo=1000-8    	      88	   1320746 ns/op	  49.62 MB/s	  131086 B/op	    8192 allocs/op
+BenchmarkAppendWALRegistry/series=1048576/ooo=1000-8    	      90	   1355357 ns/op	  48.35 MB/s	  131082 B/op	    8192 allocs/op
+BenchmarkAppendWALRegistry/series=1048576/ooo=1000-8    	      76	   1393663 ns/op	  47.02 MB/s	  131082 B/op	    8192 allocs/op
+BenchmarkAppendWALRegistry/series=1048576/ooo=1000-8    	      90	   1364609 ns/op	  48.03 MB/s	  131163 B/op	    8192 allocs/op
+BenchmarkAppendWALRegistry/series=1048576/ooo=1000-8    	      76	   1366185 ns/op	  47.97 MB/s	  131082 B/op	    8192 allocs/op
+BenchmarkAppendWALRegistry/series=1048576/ooo=1000-8    	      75	   1357358 ns/op	  48.28 MB/s	  131148 B/op	    8192 allocs/op
+PASS
+ok  	github.com/oteldb/storage/engine	52.074s

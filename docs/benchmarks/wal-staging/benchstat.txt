@@ -1,0 +1,36 @@
+goos: linux
+goarch: amd64
+pkg: github.com/oteldb/storage/engine
+cpu: AMD Ryzen 9 9950X3D2 16-Core Processor         
+                                            │ ../wal-ready-evidence/registry-before.txt │ ../wal-ready-evidence/registry-final.txt │
+                                            │                  sec/op                   │      sec/op        vs base               │
+AppendWALRegistry/series=65536/ooo=0-8                                     649.4µ ± 14%        470.8µ ±  2%  -27.50% (p=0.002 n=6)
+AppendWALRegistry/series=65536/ooo=1000-8                                  763.2µ ±  1%        473.8µ ±  2%  -37.92% (p=0.002 n=6)
+AppendWALRegistry/series=1048576/ooo=0-8                                  1321.2µ ±  7%        965.6µ ± 13%  -26.91% (p=0.002 n=6)
+AppendWALRegistry/series=1048576/ooo=1000-8                               1361.0µ ±  3%        971.3µ ±  1%  -28.63% (p=0.002 n=6)
+geomean                                                                    971.6µ              676.3µ        -30.39%
+
+                                            │ ../wal-ready-evidence/registry-before.txt │ ../wal-ready-evidence/registry-final.txt │
+                                            │                    B/s                    │        B/s         vs base               │
+AppendWALRegistry/series=65536/ooo=0-8                                    96.24Mi ± 13%      132.75Mi ±  2%  +37.94% (p=0.002 n=6)
+AppendWALRegistry/series=65536/ooo=1000-8                                 81.90Mi ±  1%      131.91Mi ±  3%  +61.07% (p=0.002 n=6)
+AppendWALRegistry/series=1048576/ooo=0-8                                  47.31Mi ±  7%       64.73Mi ± 11%  +36.82% (p=0.002 n=6)
+AppendWALRegistry/series=1048576/ooo=1000-8                               45.92Mi ±  3%       64.35Mi ±  1%  +40.12% (p=0.002 n=6)
+geomean                                                                   64.33Mi             92.41Mi        +43.66%
+
+                                            │ ../wal-ready-evidence/registry-before.txt │ ../wal-ready-evidence/registry-final.txt │
+                                            │                   B/op                    │       B/op         vs base               │
+AppendWALRegistry/series=65536/ooo=0-8                                    168.4Ki ± 12%       233.8Ki ± 16%  +38.86% (p=0.002 n=6)
+AppendWALRegistry/series=65536/ooo=1000-8                                 197.0Ki ±  2%       219.5Ki ± 13%        ~ (p=0.065 n=6)
+AppendWALRegistry/series=1048576/ooo=0-8                                  128.0Ki ±  0%       128.0Ki ±  0%        ~ (p=0.121 n=6)
+AppendWALRegistry/series=1048576/ooo=1000-8                               128.0Ki ±  0%       128.0Ki ±  0%        ~ (p=0.602 n=6)
+geomean                                                                   152.7Ki             170.3Ki        +11.53%
+
+                                            │ ../wal-ready-evidence/registry-before.txt │ ../wal-ready-evidence/registry-final.txt │
+                                            │                 allocs/op                 │    allocs/op     vs base                 │
+AppendWALRegistry/series=65536/ooo=0-8                                     2.873k ± 12%       2.498k ± 4%  -13.05% (p=0.002 n=6)
+AppendWALRegistry/series=65536/ooo=1000-8                                  3.361k ±  2%       2.471k ± 4%  -26.48% (p=0.002 n=6)
+AppendWALRegistry/series=1048576/ooo=0-8                                   8.192k ±  0%       8.192k ± 0%        ~ (p=1.000 n=6) ¹
+AppendWALRegistry/series=1048576/ooo=1000-8                                8.192k ±  0%       8.192k ± 0%        ~ (p=1.000 n=6) ¹
+geomean                                                                    5.045k             4.511k       -10.58%
+¹ all samples are equal
