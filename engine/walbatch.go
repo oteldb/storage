@@ -195,16 +195,20 @@ func (e *Engine) flushWALLocked(everySeries bool) error {
 }
 
 func (e *Engine) flushBatchWALLocked(b *walBatch, everySeries bool) error {
-	view := b.encodingView(e.head, everySeries)
 	return e.mu.WithReaders(func() error {
-		if err := b.encode(view, everySeries); err != nil {
-			return err
-		}
-		if e.cfg.WAL == nil {
-			return nil
-		}
-		return e.cfg.WAL.WriteFrames(b.frames.Bytes())
+		return e.encodeWriteBatch(b, everySeries)
 	})
+}
+
+func (e *Engine) encodeWriteBatch(b *walBatch, everySeries bool) error {
+	view := b.encodingView(e.head, everySeries)
+	if err := b.encode(view, everySeries); err != nil {
+		return err
+	}
+	if e.cfg.WAL == nil {
+		return nil
+	}
+	return e.cfg.WAL.WriteFrames(b.frames.Bytes())
 }
 
 func (b *walBatch) encodingView(h *head, everySeries bool) series.View {

@@ -495,11 +495,18 @@ func (e *Engine) AppendBatch(
 
 	var res AppendResult
 
-	// With a WAL the run is decided into the staged batch, logged, and only then applied, so a failed
-	// log write leaves the head untouched (see [walBatch]); with none, nothing can fail in between.
-	logged := e.cfg.WAL != nil
-	if logged {
+	if e.cfg.WAL != nil {
 		defer e.walB.reset()
+		err := e.mu.WithReaders(func() error {
+			var err error
+			res, err = e.stageWALBatch(ids, ts, values, sf, materialize, limits)
+			return err
+		})
+		if err != nil {
+			return AppendResult{}, err
+		}
+		e.walB.apply(e.head)
+		return res, nil
 	}
 
 	for i := range ids {
@@ -510,25 +517,9 @@ func (e *Engine) AppendBatch(
 			w = sf[i]
 		}
 
-		var out admitOutcome
-		if logged {
-			out = e.walB.admit(e.head, ids[i], ts[i], values[i], w, e.cfg.OOOWindow, limits, mat)
-		} else {
-			out, _, _, _ = e.head.appendByID(ids[i], ts[i], values[i], w, e.cfg.OOOWindow, limits, mat)
-		}
-
+		out, _, _, _ := e.head.appendByID(ids[i], ts[i], values[i], w, e.cfg.OOOWindow, limits, mat)
 		res = res.with(out)
 	}
-
-	if !logged || e.walB.empty() {
-		return res, nil
-	}
-
-	if err := e.flushWALLocked(false); err != nil {
-		return AppendResult{}, err
-	}
-
-	e.walB.apply(e.head)
 
 	return res, nil
 }
@@ -612,6 +603,7 @@ func (e *Engine) Stats() Stats {
 		Series:        int64(e.head.series.Len()),
 		OutOfSpace:    e.space.Exhausted(),
 		HeadBytes:     e.head.inFlightBytes(),
+		HeadSamples:   e.head.bytes / SampleBytes,
 		HeadAge:       e.head.age(),
 		IdentityBytes: e.head.identityBytes(),
 		Parts:         len(e.parts),
@@ -623,10 +615,6 @@ func (e *Engine) Stats() Stats {
 
 		TenureUnestablished: e.tenureUnestablishedLocked(),
 		MaxTime:             e.head.newest,
-	}
-
-	for _, buf := range e.head.samples {
-		s.HeadSamples += int64(len(buf.ts))
 	}
 
 	for i, p := range e.parts {

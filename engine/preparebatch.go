@@ -119,6 +119,23 @@ func (e *Engine) appendPreparedLocked(
 	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(i int) signal.Series, limits AppendLimits,
 	p *preparedBatch,
 ) (AppendResult, error) {
+	var res AppendResult
+	err := e.mu.WithReaders(func() error {
+		var err error
+		res, err = e.stagePreparedBatch(ids, ts, values, sf, materialize, limits, p)
+		return err
+	})
+	if err != nil {
+		return AppendResult{}, err
+	}
+	p.batch.apply(e.head)
+	return res, nil
+}
+
+func (e *Engine) stagePreparedBatch(
+	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(i int) signal.Series, limits AppendLimits,
+	p *preparedBatch,
+) (AppendResult, error) {
 	var bi int
 	mat := func() signal.Series { return materialize(bi) }
 	var res AppendResult
@@ -134,10 +151,9 @@ func (e *Engine) appendPreparedLocked(
 	if p.batch.empty() {
 		return res, nil
 	}
-	if err := e.flushBatchWALLocked(p.batch, false); err != nil {
+	if err := e.encodeWriteBatch(p.batch, false); err != nil {
 		return AppendResult{}, err
 	}
-	p.batch.apply(e.head)
 	return res, nil
 }
 

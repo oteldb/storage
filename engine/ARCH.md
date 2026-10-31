@@ -13,7 +13,7 @@ lazy postings sorting takes only state exclusion. None of these locks is reentra
 
 | operation | ordering |
 |---|---|
-| append | bounded private grouping before writer ownership; decide under state; metrics encoding and WAL I/O admit readers; apply after success |
+| append | bounded private grouping before writer ownership; metrics staged admission, encoding and WAL I/O admit readers; apply after success |
 | flush detach | seal WAL and detach under one writer barrier; frozen buffers remain readable |
 | identity capture | dense detached maps scan immutable arenas off-lock; sparse/ordered callers resolve at most 256 references per read-lock section |
 | part build | immutable inputs off state; one flush slot and one merge slot when budgeted |
@@ -125,9 +125,14 @@ shared across sequential series records; vectors above 4,096 entries are discard
 This keeps post-flush relogging independent of the batch's distinct-series count. Encoded frames
 own their bytes, while newly registered identities retain their separate input until publication.
 Input remains borrowed until synchronous return. Preparation neither snapshots nor mutates the
-head; admission, WAL encoding/I/O and head publication still share writer ordering.
+head; admission, WAL encoding/I/O and head publication still share writer ordering. Staged
+admission reads head state while retaining writer ownership, so readers proceed; query-only
+sorting changes postings without touching the admission maps. No-WAL appends remain exclusive.
 The prepared admission loop mirrors the serial path and is pinned by differential fuzzing;
 keeping separate loops avoids per-point preparation dispatch in uncontended writes.
+
+`Stats.HeadSamples` derives from active sample-byte accounting, so polling never enumerates
+millions of buffered series while holding the read lock. Frozen samples retain separate accounting.
 
 **A logged write decides, logs, then applies.** With a WAL, `Append` and `AppendBatch` —
 and `ApplyPrimary` always — stage every sample in `walBatch` — admitted exactly as `appendByID` would admit it had
