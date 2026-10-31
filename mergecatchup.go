@@ -20,11 +20,14 @@ const (
 	maintenanceMerge
 )
 
-func nextMaintenanceEvent(stop, flush <-chan struct{}, tick <-chan time.Time, pending bool) maintenanceEvent {
+func nextMaintenanceEvent(stop, flush <-chan struct{}, tick <-chan time.Time, pending, preferMerge bool) maintenanceEvent {
 	select {
 	case <-stop:
 		return maintenanceStop
 	default:
+	}
+	if pending && preferMerge {
+		return maintenanceMerge
 	}
 	select {
 	case <-stop:
@@ -51,10 +54,37 @@ func nextMaintenanceEvent(stop, flush <-chan struct{}, tick <-chan time.Time, pe
 type mergeTask struct {
 	run      func() mergeTurn
 	deferred bool
+	key      mergeTaskKey
+}
+
+type mergeTaskKey struct {
+	tenant signal.TenantID
+	signal signal.Signal
 }
 
 type mergeTurn struct {
 	more, deferred, progress bool
+}
+
+func refreshMergeTasks(pending, fresh []mergeTask) []mergeTask {
+	byKey := make(map[mergeTaskKey]mergeTask, len(fresh))
+	for _, task := range fresh {
+		byKey[task.key] = task
+	}
+	queue := make([]mergeTask, 0, len(fresh))
+	for _, task := range pending {
+		if current, ok := byKey[task.key]; ok {
+			queue = append(queue, current)
+			delete(byKey, task.key)
+		}
+	}
+	for _, task := range fresh {
+		if _, ok := byKey[task.key]; ok {
+			queue = append(queue, task)
+			delete(byKey, task.key)
+		}
+	}
+	return queue
 }
 
 func runMergeTasks(tasks []mergeTask, limit int) []mergeTask {
@@ -92,7 +122,7 @@ func (s *Storage) mergeCatchupTasks(ctx context.Context) []mergeTask {
 		if !s.claimsShard(tid) || s.metricShape(tid, eng, s.sizeCutoffFor(ctx, tenantOfShard(tid))).Candidates == 0 {
 			continue
 		}
-		tasks = append(tasks, mergeTask{deferred: eng.MergeDeferred(), run: func() mergeTurn {
+		tasks = append(tasks, mergeTask{key: mergeTaskKey{tid, signal.Metric}, deferred: eng.MergeDeferred(), run: func() mergeTurn {
 			return s.catchupMetrics(ctx, tid, eng)
 		}})
 	}
@@ -101,7 +131,7 @@ func (s *Storage) mergeCatchupTasks(ctx context.Context) []mergeTask {
 			if !s.claimsShard(tid) || s.recordShape(sig, tid, eng, s.sizeCutoffFor(ctx, tenantOfShard(tid))).Candidates == 0 {
 				continue
 			}
-			tasks = append(tasks, mergeTask{deferred: eng.MergeDeferred(), run: func() mergeTurn {
+			tasks = append(tasks, mergeTask{key: mergeTaskKey{tid, sig}, deferred: eng.MergeDeferred(), run: func() mergeTurn {
 				return s.catchupRecords(ctx, tid, eng, sig, prefix)
 			}})
 		}

@@ -111,6 +111,13 @@ func ladderRun(src []*part, capBytes int64, idle int, newest int64) []*part {
 // precision) must touch this cycle: one bucket's worth, up to the cap and maxMergeParts
 // ([timebucket.Forced]).
 func selectForced(src []*part, opts MergeOptions, capBytes int64) []*part {
+	if !opts.retentionNow.IsZero() {
+		if selected := timebucket.Forced(src, partSpan, (*part).sizeBytes,
+			func(p *part) bool { return retentionForces(p, opts) },
+			func(*part) bool { return true }, capBytes, maxMergeParts); len(selected) > 0 {
+			return selected
+		}
+	}
 	return timebucket.Forced(src, partSpan, (*part).sizeBytes,
 		func(p *part) bool { return forcedRewrite(p, opts) },
 		func(p *part) bool { return sealed(p, capBytes) },

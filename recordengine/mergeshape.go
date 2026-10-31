@@ -45,11 +45,12 @@ func (e *Engine) MergeShapeWith(opts MergeOptions) MergeShape {
 	if e.mergeCap > 0 {
 		capBytes = e.mergeCap
 	}
-	return e.shapeOf(src, opts.RetainFrom, capBytes)
+	opts.Force = false
+	return e.shapeOf(src, opts, capBytes)
 }
 
 // shapeOf summarizes what the selector sees in src at the given retention cutoff and seal threshold.
-func (e *Engine) shapeOf(src []*part, retainFrom, capBytes int64) MergeShape {
+func (e *Engine) shapeOf(src []*part, opts MergeOptions, capBytes int64) MergeShape {
 	unsealed := unsealedOf(src, capBytes)
 	bySize, _ := eligibleBySize(src, capBytes)
 	_, _, best := scanRuns(bySize, capBytes)
@@ -74,8 +75,8 @@ func (e *Engine) shapeOf(src []*part, retainFrom, capBytes int64) MergeShape {
 		Sealed:           len(src) - len(unsealed),
 		Backlog:          len(unsealed),
 		Bytes:            bytes,
-		Candidates:       e.nextMergeParts(src, retainFrom, capBytes, false),
-		ForceCandidates:  e.nextMergeParts(src, retainFrom, capBytes, true),
+		Candidates:       e.nextMergeParts(src, opts, capBytes, false),
+		ForceCandidates:  e.nextMergeParts(src, opts, capBytes, true),
 		CapBytes:         capBytes,
 		Tiers:            len(byTier),
 		LargestTierParts: largest,
@@ -87,18 +88,19 @@ func (e *Engine) shapeOf(src []*part, retainFrom, capBytes int64) MergeShape {
 
 // nextMergeParts counts the parts one merge over src takes: those retention drops whole, then the
 // selection over the rest.
-func (e *Engine) nextMergeParts(src []*part, retainFrom, capBytes int64, force bool) int {
+func (e *Engine) nextMergeParts(src []*part, opts MergeOptions, capBytes int64, force bool) int {
+	opts.Force = force
 	live := src
 
-	if retainFrom > 0 {
+	if opts.RetainFrom > 0 {
 		live = make([]*part, 0, len(src))
 
 		for _, p := range src {
-			if p.maxTime >= retainFrom {
+			if p.maxTime >= opts.RetainFrom {
 				live = append(live, p)
 			}
 		}
 	}
 
-	return len(src) - len(live) + len(e.selectMergeParts(live, retainFrom, capBytes, force))
+	return len(src) - len(live) + len(e.selectMergeParts(live, opts, capBytes))
 }

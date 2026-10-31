@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"math"
 	"slices"
+	"time"
 
 	"github.com/oteldb/storage/signal"
 )
@@ -12,8 +13,7 @@ import (
 // downsampling) — the same effect as the historical Merge(ctx, 0).
 type MergeOptions struct {
 	// RetainFrom drops samples with a timestamp < RetainFrom before the merged part is
-	// written (retention). ≤ 0 disables it. It is an absolute unix-nanosecond cutoff so the
-	// engine stays free of wall-clock dependencies; the caller derives it from tenant policy.
+	// written (retention). ≤ 0 disables it. The caller derives the absolute cutoff from tenant policy.
 	RetainFrom int64
 	// Downsample, when non-empty, rolls up old samples at merge time (coarsening resolution
 	// with age). It reuses the one merge engine — no separate subsystem. The cutoffs are
@@ -37,6 +37,7 @@ type MergeOptions struct {
 	// operator command, a test, an embedder driving the engine itself — must get one, not a silent
 	// no-op; the maintenance loop is the only caller for which the opposite is true, because it runs
 	// on one goroutine that also services flush pressure and must not park on a busy budget.
+	// Partial-retention rewrites are coalesced for one hour; Force bypasses that interval.
 	Background bool
 	// Force takes the best run of unsealed parts even when it does not earn its rewrite, instead of
 	// selecting nothing — the operator escape from a fixed point where every run scores below
@@ -44,6 +45,8 @@ type MergeOptions struct {
 	// It bypasses the selection heuristic only: the seal threshold and the run's cumulative-bytes
 	// cap still bound what one merge reads, writes, and holds.
 	Force bool
+
+	retentionNow time.Time
 }
 
 // DownsampleTier is the absolute (wall-clock-free) form of a tenant downsampling tier: every

@@ -47,6 +47,8 @@ func (e *Engine) MergeShape() MergeShape { return e.MergeShapeWith(MergeOptions{
 // run with (opts.Force is ignored; ForceCandidates sets it). It takes a brief read lock, does no
 // backend I/O and decodes nothing, so it is safe to poll at dashboard cadence.
 func (e *Engine) MergeShapeWith(opts MergeOptions) MergeShape {
+	opts.Force = false
+	opts = e.retentionOptions(opts)
 	e.mu.RLock()
 	src := e.parts
 	adopted := append(slices.Collect(maps.Values(e.foreignParts)), e.unopenedLayoutsLocked()...)
@@ -62,13 +64,16 @@ func (e *Engine) MergeShapeWith(opts MergeOptions) MergeShape {
 		bytes += p.sizeBytes()
 	}
 
+	forced := opts
+	forced.Force = true
+	forced = e.retentionOptions(forced)
 	return MergeShape{
 		Parts:           len(src),
 		Bytes:           bytes,
 		Sealed:          sealedN,
 		Backlog:         backlog,
 		Candidates:      nextMergeParts(src, adopted, opts, capBytes, idle, turn),
-		ForceCandidates: nextMergeParts(src, adopted, opts, capBytes, mergeIdleRounds, turn),
+		ForceCandidates: nextMergeParts(src, adopted, forced, capBytes, mergeIdleRounds, turn),
 		CapBytes:        capBytes,
 		BestMultiplier:  bestM,
 		MinMultiplier:   minMergeMultiplier,

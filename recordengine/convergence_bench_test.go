@@ -49,7 +49,7 @@ func BenchmarkRecordMergeSelection(b *testing.B) {
 			}
 			b.ReportAllocs()
 			for b.Loop() {
-				if len(e.selectMergeParts(parts, 0, 1<<30, false)) != maxTierParts {
+				if len(e.selectMergeParts(parts, MergeOptions{}, 1<<30)) != maxTierParts {
 					b.Fatal("unexpected selection")
 				}
 			}

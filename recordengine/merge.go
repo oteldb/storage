@@ -35,10 +35,13 @@ type MergeOptions struct {
 	// operator command, a test, an embedder driving the engine itself — must get one, not a silent
 	// no-op; the maintenance loop is the only caller for which the opposite is true, because it runs
 	// on one goroutine that also services flush pressure and must not park on a busy budget.
+	// Partial-retention rewrites are coalesced for one hour; Force bypasses that interval.
 	Background bool
 	// Force waives the write-amplification guards immediately. Disk size, memory admission,
 	// source count and the time-bucket ladder still bound the merge.
 	Force bool
+
+	retentionNow time.Time
 }
 
 // MergeWith is [Engine.Merge] with the merge parameterized: the one background-merge entry point,
@@ -125,6 +128,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 // mergeHeld is [Engine.merge] under flushMu and the merge's grant. It leaves the outputs a failure
 // abandons in abandoned.
 func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]*part) (mergeResult, error) {
+	opts = e.retentionOptions(opts)
 	retainFrom := opts.RetainFrom
 
 	unlock := e.lockMerge()
@@ -163,13 +167,13 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 
 	profile := e.mergeProfile()
 	e.mergeFeedback.prune(src)
-	selected := e.selectMergePartsProfile(src, retainFrom, capBytes, opts.Force, profile)
+	selected := e.selectMergePartsProfile(src, opts, capBytes, profile)
 	if len(selected) == 0 {
 		if dropped == 0 {
 			e.idleMerges.Add(1)
 			// A no-op is indistinguishable from a healthy engine without the shape of what it looked
 			// at; these are the exact inputs to that decision (mirrors the metric engine).
-			sh := e.shapeOf(src, retainFrom, capBytes)
+			sh := e.shapeOf(src, opts, capBytes)
 			zctx.From(ctx).Debug("merge selected nothing",
 				zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix),
 				zap.Int("parts", sh.Parts), zap.Int("sealed", sh.Sealed),
@@ -237,6 +241,7 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 	}
 	e.idleMerges.Store(0)
 
+	e.stampRetention(selected, newParts, retainFrom)
 	planMergeBlocks(selected, newParts)
 
 	// Publish (under lock): swap the selected parts for the merged one(s) copy-on-write (keeping every

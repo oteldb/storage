@@ -57,8 +57,15 @@ part arrive at the 6h or 24h level directly; such parts compact without waiting 
 data. The same scoring, count and memory bounds apply, and merging never crosses the chosen bucket.
 The newest bucket comes from flushed data timestamps rather than elapsed wall time.
 
-Retention drops fully expired parts on metadata alone. The oldest forced part selects its finest
-aligned bucket; forced work wins, then ordinary compaction, then day-boundary straddlers.
+Retention drops fully expired parts on metadata alone. A part whose rows were trimmed receives a
+process-local rewrite timestamp, carried through later merges. Background retention may force it
+again after one hour; ordinary merges still trim every expired row they touch. Foreground merges
+and `Force` bypass coalescing. Restarting permits one extra rewrite; no format changes are needed.
+Expired rows may remain queryable during the interval because reads have no age clamp. Whole-part
+expiry remains immediate. A retention-only background rewrite takes only due parts, so another
+newly expired part cannot pull protected or unexpired neighbors into an unbalanced rewrite.
+The oldest due part selects its finest aligned bucket; due work wins, then ordinary compaction,
+then day-boundary straddlers. `internal/retention` shares the interval with the metrics engine.
 Compression-only rewrites use that same forced selector when ordinary work has nothing to do,
 including sealed and isolated singletons, but take only parts needing an upgrade. Already-compressed
 neighbors join through balanced ordinary compaction: filling an upgrade with them bypasses its
@@ -126,6 +133,17 @@ the selection size separately. Query admission and compression ratios use decode
 its actual row count, keeping the prospective scan bound consistent with the opened decoder.
 
 ### Compaction measurement
+
+`BenchmarkRetentionBoundary` advances 60 ten-second maintenance turns over 2,048 rows
+with 4 KiB repeated bodies. Against v0.50.0, six 100 ms single-CPU samples on Linux/amd64,
+Ryzen 9950X3D2, Go 1.27.3 (`nodwarf5`) reduce the boundary's forced rewrites from 60 to 1.
+With 32 additional parts waiting, the final part count is 2 instead of 33: three ordinary
+merges receive turns after the first retention rewrite. Rewritten column bytes fall
+from 618.63 to 10.51 KiB (-98.3%), allocation from 22.22 to 0.91 MiB (-95.9%), and merge
+time from 4.540 to 0.451 ms (-90.1%); each difference has p=0.002, n=6. Fixture ingestion
+and close are excluded; logical throughput is per source dataset, not bytes rewritten.
+These synthetic maintenance results do not establish live ingest capacity. Raw samples
+and benchstat are in [`testdata/retention`](testdata/retention/).
 
 `BenchmarkResidentLimitedMergeRetries` makes 12 forced turns over three wide-dictionary flushes
 at a 32 MiB resident target and 1 GiB disk cap. Six single-CPU, one-iteration samples on Linux/amd64,

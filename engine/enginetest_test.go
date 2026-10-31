@@ -76,6 +76,10 @@ func (e metricEngine) ForceMerge(ctx context.Context) error {
 
 func (e metricEngine) StreamCount() int { return e.SeriesCount() }
 
+func (e metricEngine) BackgroundMerge(ctx context.Context, cutoff int64, force bool) (bool, error) {
+	return e.MergeStep(ctx, engine.MergeOptions{RetainFrom: cutoff, Background: true, Force: force})
+}
+
 func (e metricEngine) HeadRows() int { return e.HeadSampleCount() }
 
 func (e metricEngine) Parts() []enginetest.Part {

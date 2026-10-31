@@ -76,7 +76,7 @@ func sealed(p *part, capBytes int64) bool {
 // precision coarsening to re-encode. The recompress/precision/downsample tests are fixed points (a
 // part already at its target is not forced), so a lone cold part does not churn the backend.
 func forcedRewrite(p *part, opts MergeOptions) bool {
-	if opts.RetainFrom > 0 && p.minTime < opts.RetainFrom {
+	if retentionForces(p, opts) {
 		return true
 	}
 

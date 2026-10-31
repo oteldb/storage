@@ -21,7 +21,7 @@ func TestShapeOfAccounting(t *testing.T) {
 		partOfSize(2, 16<<20),
 	}
 
-	sh := e.shapeOf(parts, 0, capBytes)
+	sh := e.shapeOf(parts, MergeOptions{}, capBytes)
 	assert.Equal(t, 3, sh.Parts)
 	assert.Equal(t, 1, sh.Sealed)
 	assert.Equal(t, 2, sh.Backlog)
@@ -32,7 +32,7 @@ func TestShapeOfAccounting(t *testing.T) {
 	assert.Equal(t, minTierParts, sh.MinTierParts)
 
 	// Two parts in one tier are selectable, and the shape says so.
-	sh = e.shapeOf([]*part{partOfSize(0, 3<<19), partOfSize(1, 2<<20)}, 0, capBytes)
+	sh = e.shapeOf([]*part{partOfSize(0, 3<<19), partOfSize(1, 2<<20)}, MergeOptions{}, capBytes)
 	assert.Equal(t, 2, sh.Tiers)
 	assert.Equal(t, 1, sh.LargestTierParts)
 	assert.Equal(t, 2, sh.Candidates)
