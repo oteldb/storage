@@ -100,6 +100,27 @@ only one frozen generation per engine; no extra flush queue or parallel appender
 
 The index (`symbols`+`series`+`postings`) plus per-series `(ts, value)` buffers.
 
+Metric flushes emit identities in canonical SeriesID order across the whole frozen generation,
+then split that stream by the existing encoding/workspace limits. Parts from one generation have
+non-overlapping ID ranges, except where one oversized series spans several parts. First/last IDs
+from the validated sidecar prune out-of-range probes without a leaf read; planning also slices its
+sorted selected IDs to each part's range before looking up individual rows. Older, overlapping
+parts remain readable.
+
+Dense flushes cache sorted runs of uint32 registry references: four bytes per known identity,
+reported in `IdentityBytes`. Registration remains append-only. Newly registered references are
+sorted in batches of at most 65,536 and size-tiered merges keep the run count logarithmic; a small
+heap merges the runs during flush. Snapshot capture holds the state lock briefly; sorting, merging
+and encoding admit writers. The serialized flush owns this cache, and the exclusive build barrier
+protects reset/prune, which discard it when registry references change. Sparse flushes sort only
+their selected references and charge that temporary array to their encoding workspace. Temporary
+cache-merge arrays reserve build memory before allocation; sample columns remain bounded by the
+existing streaming builder.
+
+The sorted-run/heap merge and part-bound seeking follow
+[VictoriaMetrics mergeset](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/cd2026e4308c253f3ba7fce4b9fa225d779d8f6e/lib/mergeset/merge.go)
+and [VictoriaLogs stream merging](https://github.com/VictoriaMetrics/VictoriaLogs/blob/a408207c2242326e270eb6965d662498b0762321/lib/logstorage/block_stream_merger.go).
+
 **`OOOWindow` is per-series** (`head.seriesNewest`): a sample more than `OOOWindow` behind *that
 series'* newest admitted sample is rejected, so a fast or clock-skewed series cannot shed the slower
 ones sharing the head, and a first sample is never late. Watermarks outlive a flush.

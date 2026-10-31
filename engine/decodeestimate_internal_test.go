@@ -163,6 +163,29 @@ func TestPlannedRangesAvoidRepeatedIndexReads(t *testing.T) {
 	require.Zero(t, counter.Bytes(), "scan reuses both positive and negative planning results")
 }
 
+func TestDecodeEstimatePrunedPartAvoidsMarksReads(t *testing.T) {
+	t.Parallel()
+	counter := backendtest.NewByteCounter(backend.Memory())
+	e := New(Config{Backend: counter, Prefix: "pruned-budget", MetricBlockRows: 32})
+	for i := range 100 {
+		_, err := e.Append(apiSeries(), int64(i), float64(i))
+		require.NoError(t, err)
+	}
+	require.NoError(t, e.Flush(t.Context()))
+	require.Len(t, e.parts, 1)
+	pt := e.parts[0]
+	require.NotNil(t, pt.index.paged)
+	require.Positive(t, pt.index.paged.first.Compare(signal.SeriesID{}))
+	plan := enginePlan{ids: []signal.SeriesID{{}}, liveParts: []*part{pt}, start: 0, end: 100,
+		blockReaders: map[*part]*seriesBlockReader{pt: {part: pt, blockRows: 32}}}
+	counter.Reset()
+	bytes, err := plan.decodeEstimate(t.Context(), colNeed{values: true})
+	require.NoError(t, err)
+	require.Zero(t, bytes)
+	require.Zero(t, counter.Reads(), counter.Report())
+	require.NotNil(t, plan.partRanges[pt])
+}
+
 func FuzzPlannedIndexRanges(f *testing.F) {
 	for _, count := range []uint16{0, 1, 63, 1024, 4099} {
 		f.Add(count, uint64(7), true)

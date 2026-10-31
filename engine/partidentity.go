@@ -183,9 +183,3 @@ func (e *Engine) registerPartIdentities(ctx context.Context, prefix string, admi
 
 	return true, nil
 }
-
-func (e *Engine) captureDetachedIdentities(
-	ids map[signal.SeriesID]*sampleBuf, emit func(signal.SeriesID, series.View, uint32),
-) {
-	identitysnapshot.CaptureMap(e.mu.RLocker(), func() *series.Index { return e.head.series }, ids, emit)
-}

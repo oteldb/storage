@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,6 +58,24 @@ type partIndex struct {
 	ids    []signal.SeriesID
 	starts []int32 // len == len(ids)+1; starts[0] == 0, starts[len(ids)] == total rows
 	paged  *pagedIndex
+}
+
+func (idx partIndex) selectedIDRange(ids []signal.SeriesID) (first, end int) {
+	var low, high signal.SeriesID
+	if p := idx.paged; p != nil {
+		if !p.bounded {
+			return 0, len(ids)
+		}
+		low, high = p.first, p.last
+	} else {
+		if len(idx.ids) == 0 {
+			return 0, 0
+		}
+		low, high = idx.ids[0], idx.ids[len(idx.ids)-1]
+	}
+	first, _ = slices.BinarySearchFunc(ids, low, signal.SeriesID.Compare)
+	end = first + sort.Search(len(ids)-first, func(i int) bool { return ids[first+i].Compare(high) > 0 })
+	return first, end
 }
 
 // lookup returns id's row range and whether the part holds it.
