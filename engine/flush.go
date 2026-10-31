@@ -115,9 +115,13 @@ func (c *flushColumns) appendRow(u chunk.U128, ts int64, value, sf float64) {
 // engine lock.
 func buildFlushColumns(samples map[signal.SeriesID]*sampleBuf) *flushColumns {
 	ids := make([]signal.SeriesID, 0, len(samples))
+	var rows int
+	weighted := false
 	for id, buf := range samples {
 		if len(buf.ts) > 0 {
 			ids = append(ids, id)
+			rows += len(buf.ts)
+			weighted = weighted || slices.ContainsFunc(buf.sf, func(w float64) bool { return w != 1 })
 		}
 	}
 
@@ -127,22 +131,41 @@ func buildFlushColumns(samples map[signal.SeriesID]*sampleBuf) *flushColumns {
 
 	slices.SortFunc(ids, func(a, b signal.SeriesID) int { return a.Compare(b) })
 
-	cols := &flushColumns{}
+	cols := &flushColumns{
+		series: make([]chunk.U128, rows),
+		ts:     make([]int64, rows),
+		value:  make([]float64, rows),
+	}
+	if weighted {
+		cols.sf = make([]float64, rows)
+	}
 
+	offset := 0
 	for _, id := range ids {
 		buf := samples[id]
 
-		ts, values, sf := sortedWindow(buf, minInt64, maxInt64, nil)
-		u := idToU128(id)
-
-		for i := range ts {
-			w := float64(1)
-			if sf != nil {
-				w = sf[i]
-			}
-
-			cols.appendRow(u, ts[i], values[i], w)
+		ts, values, sf := buf.ts, buf.values, buf.sf
+		if !ascendingInt64(ts) {
+			ts, values, sf = sortedWindow(buf, minInt64, maxInt64, nil)
 		}
+		u := idToU128(id)
+		end := offset + len(ts)
+
+		for i := offset; i < end; i++ {
+			cols.series[i] = u
+		}
+		copy(cols.ts[offset:end], ts)
+		copy(cols.value[offset:end], values)
+		if weighted {
+			if sf != nil {
+				copy(cols.sf[offset:end], sf)
+			} else {
+				for i := offset; i < end; i++ {
+					cols.sf[i] = 1
+				}
+			}
+		}
+		offset = end
 	}
 
 	return cols
