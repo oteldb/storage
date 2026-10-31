@@ -1426,6 +1426,11 @@ without enlarging the resident set. Cache-off, or constant/unblocked columns, de
 series-skipped to the blocks the matched row ranges touch. With the cache on a fetch also prefetches
 the parts it will touch.
 
+Metric numeric columns pack codec streams into compression frames of at least 8 KiB. A selective
+host query needs few granules in each part, so large frames amplify its reads and decompression
+scratch. The packing is recorded in the directory and old frame sizes remain readable. Granule
+size still controls numeric decode and cache entries; frame size controls compressed reads.
+
 When a decode budget is configured, planning retains each block-sliced part's positive row ranges
 with their positions in the plan's sorted selected IDs. Prefetch and scanning share that immutable
 query-local result, including absent IDs, rather than repeating the on-disk index searches. Position

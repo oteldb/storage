@@ -150,9 +150,15 @@ func tierAt(tiers []DownsampleTier, ts int64) (DownsampleTier, bool) {
 	return best, ok
 }
 
+const metricCompressBlockBytes = 8 << 10
+
 // partOptions is the layout every metric part is written with; rollup nil leaves the marker unknown.
 func partOptions(blockRows int, comp compressProfile, rollup *block.Rollup) []block.PartOption {
-	opts := []block.PartOption{block.WithSortKey(colTs), block.WithGranuleSize(blockRows)}
+	opts := []block.PartOption{
+		block.WithSortKey(colTs),
+		block.WithGranuleSize(blockRows),
+		block.WithCompressBlockBytes(metricCompressBlockBytes),
+	}
 	if comp.Algorithm != compress.AlgorithmNone {
 		opts = append(opts, block.WithCompression(comp.Algorithm), block.WithCompressionLevel(comp.Level))
 	}
