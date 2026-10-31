@@ -118,6 +118,21 @@ which nothing can interrupt; `FuzzStagedAdmissionMatchesDirect` pins the two to 
 the same head. The head's age starts at the first staged sample, not when the log write returns, so a
 slow disk does not delay an age-triggered flush.
 
+The staged batch captures each existing sample buffer and original watermark once. Writer
+ownership pins both through WAL I/O; repeated points reuse that admission state and publication
+appends through the captured buffer, avoiding repeated canonical-ID map lookups. Reset drops
+borrowed identities and buffer references while preserving owned numeric scratch capacity.
+No head buffer or watermark changes until the complete WAL write succeeds.
+
+`BenchmarkAppendWALRegistry` cycles 4,096-point warm appends through 65,536 or 1,048,576
+registered series on a file-backed WAL, with eight parallel callers, GOMAXPROCS=8, and no
+per-append fsync. Six 100ms samples on Ryzen 9950X3D2, Go 1.27.3 (`nodwarf5`), measure
+649→482 µs / 763→466 µs at 65k series (OOO disabled/enabled) and 1321→970 µs /
+1361→964 µs at 1M (-26% to -39%, all p=0.002). The cached accumulator grows from 288 to
+312 bytes on amd64. Input construction and registration are untimed; repeated timestamps
+and growing sample buffers are deliberate. These isolate WAL append work, not receiver,
+flush, query latency or sustainable server capacity; allocation totals vary with buffer growth.
+
 ## Flush
 
 Drains the head into one flat part, one row per sample:
