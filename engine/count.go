@@ -204,7 +204,7 @@ func (p *enginePlan) markEdgePart(ctx context.Context, e *Engine, part *part, id
 			continue
 		}
 
-		rng, ok, err := part.index.lookup(ctx, id)
+		rng, ok, err := p.lookupRange(ctx, part, id)
 		if err != nil {
 			return err
 		}

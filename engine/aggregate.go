@@ -450,7 +450,7 @@ func (e *Engine) aggViaStats(ctx context.Context, plan *enginePlan, id signal.Se
 	var agg SeriesAgg
 
 	for _, p := range plan.liveParts {
-		rng, ok, err := p.index.lookup(ctx, id)
+		rng, ok, err := plan.lookupRange(ctx, p, id)
 		if err != nil {
 			return SeriesAgg{}, err
 		}

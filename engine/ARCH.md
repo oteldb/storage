@@ -1405,6 +1405,11 @@ without enlarging the resident set. Cache-off, or constant/unblocked columns, de
 series-skipped to the blocks the matched row ranges touch. With the cache on a fetch also prefetches
 the parts it will touch.
 
+When a decode budget is configured, planning retains each block-sliced part's positive row ranges
+with their positions in the plan's sorted selected IDs. Prefetch and scanning share that immutable
+query-local result, including absent IDs, rather than repeating the on-disk index searches. Position
+array capacity is charged to the decode reservation; parts without a memo use their ordinary index.
+
 Every part decode enters through one seam (`Engine.decodeOf`), which owns the whole-part convention:
 `nil` row ranges mean *decode the whole part* and resolve to a whole-column decode there, above both
 the cached and uncached implementations. A block-selecting implementation must never see `nil` — it
