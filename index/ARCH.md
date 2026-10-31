@@ -33,6 +33,10 @@ attribute-name sequences are stored once per schema rather than repeated for eve
 `Snapshot` API materializes entries; pruning uses compact views. Metrics flush and merge
 encode identities one at a time, so their snapshots do not expand the resident registry.
 
+`View.AttributeRefs` borrows the key and canonical typed-value symbol references;
+`ContextRef` and `Context` resolve shared resource/scope data. These references are
+valid only in their captured registry and are never persisted as part-local IDs.
+
 ## `postings`
 
 The inverted index is keyed on interned name/typed-value symbols. `MemPostings` stores canonical
@@ -63,6 +67,13 @@ Scoping identity to the part is what makes retention self-cleaning and gives eac
 identity set derived from its own parts — the shape Prometheus/Mimir blocks and VictoriaMetrics'
 per-partition indexDB have. Fuzzed (decode never panics; encode∘decode is the identity and the
 decoded identity still hashes to its id) and golden-tested.
+
+Metrics part writers use `EncodeView` to remap selected registry symbols directly,
+without decoding point values into attributes. Repeated resource/scope contexts reuse
+their encoded prefix in the append-only record buffer. The symbol section is encoded
+directly into the destination object; existing APIs and readers use the same format.
+Part-local symbol maps remain operation-owned: recycling them into the shared dictionary
+pool changes later writer capacities and can invalidate record-merge workspace estimates.
 
 ## Metering
 

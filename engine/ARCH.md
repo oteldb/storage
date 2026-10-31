@@ -173,6 +173,10 @@ encoded memory tier or delayed read-after-write visibility.
 
 ### Identity is part-scoped
 
+The identity writer remaps encoded registry symbols directly into a part-local table;
+it does not materialize point attributes. Canonical hashes and the durable format stay
+unchanged. Shared resource/scope prefixes are reused within the encoded series records.
+
 Each part carries its own series' identities, written and deleted with its other objects. Three
 properties follow, and they are what a whole-set identity object cannot give:
 

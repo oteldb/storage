@@ -91,7 +91,10 @@ func EncodeSorted(dst []byte, n int, entry func(int, signal.Attributes) series.E
 		body = enc.appendSeries(body, ent)
 		attrs = ent.Series.Attributes
 	}
+	return appendObject(dst, tab, body)
+}
 
+func appendObject(dst []byte, tab *symbols.Table, body []byte) []byte {
 	start := len(dst)
 	dst = binary.BigEndian.AppendUint32(dst, magic)
 	dst = append(dst, version)
@@ -100,17 +103,12 @@ func EncodeSorted(dst []byte, n int, entry func(int, signal.Attributes) series.E
 		toc      []byte
 		sections int
 	)
-
-	for _, sec := range []struct {
-		kind byte
-		data []byte
-	}{
-		{sectionSymbols, tab.Encode(nil)},
-		{sectionSeries, body},
-	} {
-		dst, toc = appendSection(dst, toc, start, sec.kind, sec.data)
-		sections++
-	}
+	symbolsStart := len(dst)
+	dst = tab.Encode(dst)
+	toc = appendSectionTOC(toc, symbolsStart-start, sectionSymbols, dst[symbolsStart:])
+	sections++
+	dst, toc = appendSection(dst, toc, start, sectionSeries, body)
+	sections++
 
 	tocOff := len(dst) - start
 	dst = binary.AppendUvarint(dst, uint64(sections))
@@ -128,12 +126,14 @@ func appendSection(dst, toc []byte, start int, kind byte, data []byte) ([]byte, 
 	off := len(dst) - start
 	dst = append(dst, data...)
 
+	return dst, appendSectionTOC(toc, off, kind, data)
+}
+
+func appendSectionTOC(toc []byte, off int, kind byte, data []byte) []byte {
 	toc = append(toc, kind)
 	toc = binary.AppendUvarint(toc, uint64(off))
 	toc = binary.AppendUvarint(toc, uint64(len(data)))
-	toc = binary.BigEndian.AppendUint32(toc, crc32.Checksum(data, castagnoli))
-
-	return dst, toc
+	return binary.BigEndian.AppendUint32(toc, crc32.Checksum(data, castagnoli))
 }
 
 // encoder writes identities against a symbol table it fills as it goes.
@@ -146,15 +146,17 @@ func (e *encoder) appendSeries(dst []byte, ent series.Entry) []byte {
 	dst = binary.BigEndian.AppendUint64(dst, ent.ID.Hi)
 	dst = binary.BigEndian.AppendUint64(dst, ent.ID.Lo)
 
-	dst = e.appendSym(dst, ent.Series.Resource.SchemaURL)
-	dst = e.appendAttrs(dst, ent.Series.Resource.Attributes)
-
-	dst = e.appendSym(dst, ent.Series.Scope.Name)
-	dst = e.appendSym(dst, ent.Series.Scope.Version)
-	dst = e.appendSym(dst, ent.Series.Scope.SchemaURL)
-	dst = e.appendAttrs(dst, ent.Series.Scope.Attributes)
-
+	dst = e.appendContext(dst, ent.Series.Resource, ent.Series.Scope)
 	return e.appendAttrs(dst, ent.Series.Attributes)
+}
+
+func (e *encoder) appendContext(dst []byte, resource signal.Resource, scope signal.Scope) []byte {
+	dst = e.appendSym(dst, resource.SchemaURL)
+	dst = e.appendAttrs(dst, resource.Attributes)
+	dst = e.appendSym(dst, scope.Name)
+	dst = e.appendSym(dst, scope.Version)
+	dst = e.appendSym(dst, scope.SchemaURL)
+	return e.appendAttrs(dst, scope.Attributes)
 }
 
 func (e *encoder) appendSym(dst, b []byte) []byte {
