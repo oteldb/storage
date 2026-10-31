@@ -7,6 +7,7 @@ reentrant. The lock order is catalog → writer → state; ingestion starts at w
 |---|---|
 | `Lock` / `Unlock` | Catalog and maintenance mutations; also excludes writers and readers. |
 | `LockWriter` / `UnlockWriter` | Admission, apply, replica application and WAL serialization. |
+| `TryLockWriter` | Tests writer ownership without waiting; success still waits for state exclusion. |
 | `RLock` / `RUnlock` | Coherent read planning and state inspection. |
 | `LockState` / `UnlockState` | Derived read caches only; cannot change admission or WAL state. |
 | `WithReaders` | WAL I/O releases state exclusion while retaining writer ownership. |

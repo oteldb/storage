@@ -8,6 +8,32 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestTryLockWriter(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		owned bool
+	}{
+		{name: "available"},
+		{name: "owned", owned: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var m Mutex
+			if tc.owned {
+				m.LockWriter()
+			}
+			ok := m.TryLockWriter()
+			require.Equal(t, !tc.owned, ok)
+			assert.False(t, m.writer.TryLock())
+			assert.False(t, m.state.TryRLock())
+			m.UnlockWriter()
+			require.True(t, m.TryLockWriter())
+			m.UnlockWriter()
+		})
+	}
+}
+
 func TestWithReadersRetainsWriterOwnership(t *testing.T) {
 	t.Parallel()
 	var m Mutex
