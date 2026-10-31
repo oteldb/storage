@@ -1,3 +1,2 @@
-// Package pool provides cross-cutting sync.Pool helpers, capacity-bucketed byte pools,
-// and arena allocation for same-lifetime batches (DESIGN.md §10). Not yet implemented.
+// Package pool provides bounded recyclers, interning maps, and chunked arenas for same-lifetime batches.
 package pool
