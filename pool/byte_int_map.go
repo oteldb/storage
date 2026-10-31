@@ -29,7 +29,7 @@ func init() {
 // Capacity is rounded up to a power of two; the load factor is ≤ 0.75 (probed slots)
 // before [grow] is triggered. Keys are compared with bytes.Equal (no string conversion).
 type ByteIntMap struct {
-	keys   [][]byte // key at slot i; nil is a valid empty byte key
+	keys   [][]byte // Key at slot i; nil is a valid empty byte key.
 	values []int    // value at slot i
 	hashes []uint64 // cached hash (0 is reserved for empty)
 	mask   uint64   // len(hashes)-1
