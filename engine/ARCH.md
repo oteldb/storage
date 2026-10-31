@@ -146,7 +146,8 @@ Go 1.27.3 (`nodwarf5`) take 8.205 instead of 17.888 ms (-54.1%), allocate 17.00
 instead of 91.87 MiB (-81.5%), and make 5 instead of 131,180 allocations; all p=0.002.
 Single-point, long ordered, weighted and unordered fixtures preserve the same layout;
 the unordered path still allocates sorting scratch. These are builder measurements,
-not end-to-end ingest capacity. Samples and benchstat are in [`testdata/flush-copy`](testdata/flush-copy/).
+not end-to-end ingest capacity. Samples and benchstat are in the
+[benchmark report](https://github.com/oteldb/oteldb/blob/claude/1106-node-exporter-scale-benchmark/dev/local/scale-bench/FLUSH_COPY_RESULTS.md).
 
 ### Identity is part-scoped
 
