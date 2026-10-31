@@ -66,6 +66,11 @@ decoded identity still hashes to its id) and golden-tested.
 
 ## Metering
 
+`series.EncodingBudget` estimates one selected identity run's encoder workspace from its immutable
+view. Symbol and context IDs deduplicate payload charges; unused registry entries add no workspace.
+The accumulator clears and reuses its maps between runs while retaining their capacity charge.
+`View.IdentityWorkspace` preflights an indivisible large identity without allocating the estimator.
+
 Each structure reports its resident footprint (`SizeBytes`), accumulated on insert rather than
 walked, so the engine can meter identity state — which no sample/record byte counter sees and which
 a flush does not drain (see `ADMIN.md`'s `IdentityBytes`). Every byte is charged once, where it is

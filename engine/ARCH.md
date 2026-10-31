@@ -79,12 +79,17 @@ flush reserve. Every merge holds both reservations; flushes acquire the shared b
 Queued work prevents newer merges from consuming its allowance. An oversized flush owns the
 whole build pool and runs alone; nil `FlushAdmission` retains serialized per-engine builds.
 
-Flush estimates charge copied/sorted columns, codec buffers, sidecars, offsets/maps, serialized
-identity records, symbol encoder workspace and decoded attribute materialization. Resource/scope
-references count per series; shared symbol payloads count separately. Nested values are charged
-for expansion. These are conservative admission estimates, not a hard RSS or allocator bound.
-Record side stores lack an active Encode/Stored bound, so their flushes run alone. Metrics keep
-frozen sample bytes in admission until publication, matching the record engine's accounting.
+Metric flushes reserve additional workspace against `FlushMemoryBytes` (64 MiB when unset):
+bounded identity runs, codec buffers, sidecars, serialized identities and selected symbol workspace.
+The selected-symbol estimator charges shared payloads once and includes its retained maps. A huge
+unordered series still needs its existing complete sorting scratch; a single oversized identity
+or unordered series takes a larger reservation and can run exclusively. Whole-object backends
+also seal output parts on a workspace-derived row limit because encoded columns remain resident.
+These estimates are not a hard RSS or allocator bound. Record flushes retain their own estimate.
+
+Frozen metric sample bytes remain in `HeadBytes` and `MaxInFlightBytes` until publication. They are
+existing input, not additional build workspace; the build pool does not reserve those same bytes
+again. Completed output handles grow with the number of output parts until atomic publication.
 
 The periodic/catch-up worker and a separate pressure-flush worker have bounded fan-out. A paused
 merge does not stop pressure wakes. Completed pressure passes wake merge catch-up. Close cancels
@@ -158,21 +163,34 @@ bucket index (part list + time bounds)      ← written last: the commit point
 
 Merge writes the same shape, committing the new part set before deleting sources.
 
-The metric flush builder counts rows before allocating its final columns. Ordered detached
-buffers are copied directly into those owned arrays, avoiding a temporary timestamp/value pair
-per series and repeated column growth. Unordered buffers retain the existing sorting path;
-inputs remain immutable so concurrent reads and rollback keep their original buffers. The
-scale-factor column is allocated once only when an actual non-unit weight occurs. This removes
-intermediate copies; the complete flat output and the detached generation still coexist.
+The sealed head is an immutable run source for the shared streaming part encoder. It collects
+bounded local identity references, sorts only that run and feeds ordered sample slices directly
+into the encoder in block-sized chunks. Each output part is internally sorted; separate parts
+need no shared global series order. No complete head-wide ID array, identity-reference map or flat
+sample columns are built. Captured identities go directly to the current part's identity writer,
+avoiding a second registry lookup while ingestion continues.
 
-`BenchmarkBuildFlushColumns/short-ordered` lays out 65,536 series with eight points each.
-Six 200 ms single-CPU samples against db64b23 on Linux/amd64, Ryzen 9950X3D2,
-Go 1.27.3 (`nodwarf5`) take 8.205 instead of 17.888 ms (-54.1%), allocate 17.00
-instead of 91.87 MiB (-81.5%), and make 5 instead of 131,180 allocations; all p=0.002.
-Single-point, long ordered, weighted and unordered fixtures preserve the same layout;
-the unordered path still allocates sorting scratch. These are builder measurements,
-not end-to-end ingest capacity. Samples and benchstat are in the
-[benchmark report](https://github.com/oteldb/oteldb/blob/claude/1106-node-exporter-scale-benchmark/dev/local/scale-bench/FLUSH_COPY_RESULTS.md).
+Consecutive chunks of a series share one series-index run, watermark and aggregate entry. The
+stream writer drops the weight column when every weight is one; sampled parts retain their
+weights and omit the unweighted aggregate sidecar. Unordered buffers keep the existing sorting
+and duplicate-row order, with scratch charged before sorting. Detached buffers stay immutable,
+so readers and failed-flush rollback retain their source data. A missing identity aborts instead
+of publishing only a generation's resolvable prefix.
+
+Every output stays private until the complete generation is built. One catalog operation swaps
+the frozen source for all output parts, and only its confirmed commit permits the captured WAL
+prefix to be checkpointed. This preserves the durable part and WAL formats; there is no separate
+encoded memory tier or delayed read-after-write visibility.
+
+`BenchmarkFlushSealedHead` flushes 65,536 pre-registered series through the file backend, with
+64 MiB output cap and 448 MiB additional-workspace target. Six alternating single-operation
+repetitions at GOMAXPROCS=8 on Ryzen 9950X3D2, Go 1.27.3 (`nodwarf5`), allocate 64.79 instead
+of 73.32 MiB for one point per series (-11.63%), 79.66 instead of 114.75 MiB for eight
+(-30.58%), and 321.0 instead of 830.9 MiB for 128 (-61.37%); all p=0.002. Output counts
+remain 1, 1 and 4. The long fixture takes 327.3 instead of 349.1 ms (-6.26%, p=0.002);
+the two short fixtures have no significant time difference. Allocation counts rise 1.1–43.4%.
+The 448 MiB reservation is a policy allowance, not measured peak heap; small flushes reserve
+more than the former whole-head estimate. These are flush measurements, not ingest capacity.
 
 ### Identity is part-scoped
 
