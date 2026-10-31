@@ -1288,6 +1288,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		MergeConcurrency:  s.mergeConcurrency,
 		MergeAdmission:    s.admitMerge,
 		MergeMemoryBytes:  s.mergeMemoryBytes(),
+		FlushMemoryBytes:  s.metricFlushMemoryBytes(),
 		FlushAdmission:    s.flushAdmission(),
 		MinFreeBytes:      s.opts.MinFreeBytes,
 		MinFreeInodes:     s.opts.MinFreeInodes,
