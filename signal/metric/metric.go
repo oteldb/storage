@@ -102,6 +102,8 @@ type Batch struct {
 	IDs    []signal.SeriesID
 	Ts     []int64
 	Values []float64
+	// StartTs optionally carries start timestamps for externally projected batches.
+	StartTs []int64
 
 	base   Identity      // resource/scope/metric fields shared by every point
 	points []NumberPoint // the metric's points (aliases the source Metrics)
@@ -122,6 +124,9 @@ func (b *Batch) Scope() signal.Scope { return b.base.Series.Scope }
 // Identity returns the i-th point's full [Identity]. The returned value aliases the source
 // batch (zero-copy); clone it if a durable copy is needed.
 func (b *Batch) Identity(i int) Identity {
+	if b.source.materializer != nil {
+		return b.source.Identity(i)
+	}
 	id := b.base
 	id.Series.Attributes = b.points[i].Attributes
 
@@ -130,14 +135,26 @@ func (b *Batch) Identity(i int) Identity {
 
 // Series materializes the i-th point's full [signal.Series] (the folded identity). It is the
 // lazy materializer the engine calls only when registering a newly-seen series.
-func (b *Batch) Series(i int) signal.Series { return b.Identity(i).ToSeries() }
+func (b *Batch) Series(i int) signal.Series { return b.source.Series(i) }
 
 // Exemplars returns the i-th point's exemplars (usually none). The slice aliases the source
 // [Metrics] and is valid only for the duration of the emit call, like the rest of the batch.
-func (b *Batch) Exemplars(i int) []Exemplar { return b.points[i].Exemplars }
+func (b *Batch) Exemplars(i int) []Exemplar {
+	if b.source.materializer != nil {
+		return nil
+	}
+	return b.points[i].Exemplars
+}
 
 // Sample returns the i-th point's [Sample].
 func (b *Batch) Sample(i int) Sample {
+	if b.source.materializer != nil {
+		var start int64
+		if len(b.StartTs) != 0 {
+			start = b.StartTs[i]
+		}
+		return Sample{StartTs: start, Ts: b.Ts[i], Value: b.Values[i]}
+	}
 	pt := &b.points[i]
 
 	return Sample{StartTs: pt.StartTs, Ts: pt.Ts, Value: pt.Value}

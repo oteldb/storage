@@ -69,6 +69,9 @@ engines over the fetch seam (`query/fetch`).
   each metric for policy transitions. WAL acknowledgement and disk formats are unchanged.
   `WriteMetrics` also stores any exemplars its points carry, best-effort, into the separate
   exemplars record engine (`signal/exemplar`) — see below.
+  `WriteProjectedMetrics` accepts trusted prehashed metric batches with stable lazy identity
+  sources, through the same local admission and batching path. It has no exemplar/cluster path;
+  cluster rejection occurs before projection, allowing whole-request `WriteMetrics` fallback.
   Tenant is **derived** from Resource+Scope by the `Options.Tenant` callback, never passed.
   An id whose first `/` segment is `wal` (any case), or that contains `\`, is reserved and its
   records are rejected (`reserved_tenant`): no engine prefix may alias a WAL kept at
