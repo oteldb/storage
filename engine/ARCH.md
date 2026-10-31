@@ -13,7 +13,7 @@ lazy postings sorting takes only state exclusion. None of these locks is reentra
 
 | operation | ordering |
 |---|---|
-| append | decide and encode under state; WAL I/O admits readers; apply after success |
+| append | decide under state; metrics encoding and WAL I/O admit readers; apply after success |
 | flush detach | seal WAL and detach under one writer barrier; frozen buffers remain readable |
 | identity capture | dense detached maps scan immutable arenas off-lock; sparse/ordered callers resolve at most 256 references per read-lock section |
 | part build | immutable inputs off state; one flush slot and one merge slot when budgeted |
@@ -123,6 +123,14 @@ ownership pins both through WAL I/O; repeated points reuse that admission state 
 appends through the captured buffer, avoiding repeated canonical-ID map lookups. Reset drops
 borrowed identities and buffer references while preserving owned numeric scratch capacity.
 No head buffer or watermark changes until the complete WAL write succeeds.
+
+Metrics WAL encoding uses an immutable registry view and local references captured under
+state exclusion. New identities borrow caller payloads until the synchronous append returns;
+known identities materialize from that view, never from a mutable registry map off-lock.
+Reader exclusion covers admission/publication; the writer gate still orders the complete
+encode/write/apply operation against append, replica, seal, checkpoint and Close. The
+record engine still encodes under state. This permits readers during metric encoding;
+it does not parallelize writers or change WAL batching/durability.
 
 `BenchmarkAppendWALRegistry` cycles 4,096-point warm appends through 65,536 or 1,048,576
 registered series on a file-backed WAL, with eight parallel callers, GOMAXPROCS=8, and no
