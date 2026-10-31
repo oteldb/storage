@@ -1476,6 +1476,11 @@ at a time", so the wait is bounded twice and a missing scope costs latency and m
 
 ## Count and series enumeration
 
+An existence plan stops once every selected ID is proven present. When its in-memory flags already
+cover the selection, Count and CountBy skip part-reader setup and decode admission entirely; a
+part scan stops as soon as it completes the proof. Continuing after that point cannot change the
+answer and needlessly loads older indexes into the backend cache.
+
 `Count`/`CountBy`/`Series` share one **existence plan**: matched ids from the head index, which
 outlives a flush, and in-window existence from the live buffers. No batch, no value column, no label
 projection. They differ in what they ask of the parts:
