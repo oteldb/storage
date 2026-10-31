@@ -9,5 +9,8 @@ allow_licenses:
   - "Apache-2.0"
   - "LicenseRef-scancode-google-patent-license-golang"
 allow-dependencies-licenses:
+  # LGPL covers only examples/stadtx; gensimd uses the BSD-licensed generator.
+  # https://github.com/mmcloughlin/avo/tree/v0.6.0/examples/stadtx
+  - "pkg:golang/github.com/mmcloughlin/avo"
   # Used in CI, is not directly linked or used by oteldb.
   - "pkg:actions/go-task/setup-task"
