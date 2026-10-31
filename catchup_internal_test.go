@@ -43,7 +43,7 @@ func TestMaintenanceEventPriority(t *testing.T) {
 			if tc.tick {
 				tick <- time.Time{}
 			}
-			assert.Equal(t, tc.want, nextMaintenanceEvent(stop, flush, tick, tc.pending))
+			assert.Equal(t, tc.want, nextMaintenanceEvent(stop, flush, tick, tc.pending, false))
 		})
 	}
 }
@@ -53,7 +53,7 @@ func TestMaintenanceEventWaitsWithoutWork(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		stop := make(chan struct{})
 		done := make(chan maintenanceEvent, 1)
-		go func() { done <- nextMaintenanceEvent(stop, nil, nil, false) }()
+		go func() { done <- nextMaintenanceEvent(stop, nil, nil, false, false) }()
 		synctest.Wait()
 		select {
 		case event := <-done:

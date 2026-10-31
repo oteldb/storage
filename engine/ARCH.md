@@ -294,7 +294,10 @@ Whole-part retention drops count even when compaction then defers. `MergeWith` k
 contract over the same step. Candidate planning uses unopened adopted layouts as the merge does,
 so an unreadable part's recorded aggregation still prevents an incompatible policy rewrite.
 This keeps a busy engine from owning every turn and a busy operator budget from causing a spin.
-Shutdown and the timed cycle preempt the next catch-up batch; pressure flushes run independently. Every attempt rechecks compaction ownership and resolves retention again,
+Shutdown preempts the next catch-up batch. A timed cycle or pressure wake is followed by one bounded
+catch-up turn before another ready tick can run. Refreshing candidates preserves the FIFO rotation,
+removes completed engines and appends newly eligible ones. Long cycles therefore cannot keep
+restarting the queue at its first engine. Pressure flushes run independently. Every attempt rechecks compaction ownership and resolves retention again,
 including byte budgets against the current part set. Peers are notified after a merge; peer sync
 and EC conversion remain part of the timed cycle. Each merge retains its normal repair pass.
 `Admin.MaintainNow` runs one cycle. Per-engine slots enforce one flush and one merge, with
@@ -875,6 +878,15 @@ it on the manifest alone: no decode, no output part, only a straddler rewritten.
 in the expired data rather than O(bytes), as in Prometheus (whole blocks) and VictoriaMetrics (whole
 partitions). The drop publishes like any merge, so a failed commit rolls back and the parts stay live.
 Disk-pressure eviction shares `RetainFrom`, so it drops whole parts too.
+
+`internal/retention` coalesces forced partial-retention rewrites for one hour in background merges.
+Only outputs receive timestamps, before publication; ordinary merges carry forward the latest
+input stamp, or restart it when they trim expired rows. Failed publication leaves the live inputs'
+stamps unchanged. Foreground merges and `Force` bypass the interval. The stamp is process-local,
+so reopening may cause one extra rewrite without changing the part/index format. Whole-part
+expiry and dropping expired rows during ordinary merges remain immediate. Reads have no age
+clamp, so expired rows may remain queryable during the interval. Background retention forces only
+due parts; unexpired/protected neighbors join through ordinary balanced compaction instead.
 
 ### Selection is confined to an aligned time bucket (`timebucket.go`)
 

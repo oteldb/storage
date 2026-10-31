@@ -134,7 +134,7 @@ func TestCompressionRewritePreservesOrdinaryPriority(t *testing.T) {
 			e := compressionEngine(t, tc.times...)
 			ordinary := selectMergeParts(e.parts, 0, 0, false)
 			require.Len(t, ordinary, 2)
-			assert.Equal(t, ordinary, e.selectMergeParts(e.parts, 0, 0, false))
+			assert.Equal(t, ordinary, e.selectMergeParts(e.parts, MergeOptions{}, 0))
 		})
 	}
 }

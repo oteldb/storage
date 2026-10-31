@@ -97,6 +97,10 @@ func (e recordEngine) Stats() enginetest.Stats {
 	}
 }
 
+func (e recordEngine) BackgroundMerge(ctx context.Context, cutoff int64, force bool) (bool, error) {
+	return e.MergeStep(ctx, recordengine.MergeOptions{RetainFrom: cutoff, Background: true, Force: force})
+}
+
 func (e recordEngine) MergeShape(retainFrom int64) enginetest.MergeShape {
 	sh := e.MergeShapeWith(recordengine.MergeOptions{RetainFrom: retainFrom})
 

@@ -26,7 +26,7 @@ engines over the fetch seam (`query/fetch`).
 | L6 Query languages | promql/logql/traceql | **embedder's** — `query/promql` is an optional fetch→Prometheus-Queryable adapter |
 | L5 Query engine | plan · exec · cache | **embedder's** — except split-by-interval + results cache, expressible over the seam (`query/scale`) |
 | L4 **Fetch contract** | matchers + column conditions + window → batch iterator | `query/fetch`, exposed as `Storage.{,Log,Trace,Profile,Exemplar}Fetcher` |
-| L3 Engine / Index / WAL | head · flush · merge · retention / symbols · series · postings · blooms / WAL | `engine`, `recordengine`, `index`, `wal` |
+| L3 Engine / Index / WAL | head · flush · merge · retention / symbols · series · postings · blooms / WAL | `engine`, `recordengine`, `index`, `wal`, `internal/retention` |
 | L2 Part / Encoding | immutable parts · per-column objects · manifest / bitstream · codecs · compress | `block`, `encoding` |
 | L1 Backend | memory · file · s3 behind one interface, CAS via `PutIfAbsent`/`CompareAndSwap` | `backend` |
 | L0 Cluster | etcd ring · HRW · replication · rebalance · EC | `cluster` |

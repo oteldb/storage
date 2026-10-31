@@ -24,8 +24,7 @@ import (
 // to gain — fewer than two parts and no retention cutoff. Source parts are deleted from
 // the backend after the new part is durably written.
 //
-// Retention is expressed as an absolute timestamp (unix nanoseconds), so the engine stays
-// free of wall-clock dependencies; the caller derives it from the tenant policy. For
+// Retention is expressed as an absolute timestamp (unix nanoseconds), derived from tenant policy. For
 // downsampling, use [Engine.MergeWith].
 func (e *Engine) Merge(ctx context.Context, retainFrom int64) error {
 	return e.MergeWith(ctx, MergeOptions{RetainFrom: retainFrom})
@@ -111,6 +110,7 @@ func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool
 // picks only the parts worth merging this cycle (a same-size tier group plus any part a forced
 // rewrite must touch), so a single merge's working set is O(part size), not O(dataset).
 func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, error) {
+	opts = e.retentionOptions(opts)
 	unlock := e.lockMerge()
 	defer unlock()
 
@@ -257,6 +257,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{parts: dropped}, err
 	}
 
+	e.stampRetention(selected, newParts, opts.RetainFrom)
 	planMergeBlocks(selected, newParts)
 
 	committed, err := e.publishMerge(ctx, selected, newParts, readable, stamp, plan)

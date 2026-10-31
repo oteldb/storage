@@ -48,7 +48,7 @@ type Config struct {
 	// [Config.MaxPartBytes] and [Config.MergeMemoryBytes] written at the backend's sustained
 	// throughput, plus the clock skew between the writers of the prefix. 0 ⇒ one hour.
 	OrphanGrace time.Duration
-	// Now is the clock [Config.OrphanGrace] is measured against. nil ⇒ [time.Now].
+	// Now is the clock for orphan grace and background retention rewrites. nil ⇒ [time.Now].
 	Now func() time.Time
 	// Term reports this writer's current ownership term for Prefix — which tenure of the shard
 	// this engine is writing as. It is stamped into every bucket index written, so a reader can

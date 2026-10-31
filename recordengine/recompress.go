@@ -2,19 +2,28 @@ package recordengine
 
 import (
 	"github.com/oteldb/storage/encoding/compress"
+	"github.com/oteldb/storage/internal/retention"
 	"github.com/oteldb/storage/internal/timebucket"
 )
 
-func (e *Engine) selectMergeParts(src []*part, retainFrom, capBytes int64, force bool) []*part {
-	return e.selectMergePartsProfile(src, retainFrom, capBytes, force, e.mergeProfile())
+func (e *Engine) selectMergeParts(src []*part, opts MergeOptions, capBytes int64) []*part {
+	return e.selectMergePartsProfile(src, opts, capBytes, e.mergeProfile())
 }
 
-func (e *Engine) selectMergePartsProfile(src []*part, retainFrom, capBytes int64, force bool, profile mergeProfile) []*part {
+func (e *Engine) selectMergePartsProfile(src []*part, opts MergeOptions, capBytes int64, profile mergeProfile) []*part {
+	opts = e.retentionOptions(opts)
 	idle := int(e.idleMerges.Load())
-	if force {
+	if opts.Force {
 		idle = mergeIdleRounds
 	}
-	if selected := selectForced(src, retainFrom, capBytes); len(selected) > 0 {
+	due := func(p *part) bool {
+		return retentionForces(p, opts.RetainFrom) && retention.Due(p.retentionAt, opts.retentionNow)
+	}
+	sealedForRetention := func(p *part) bool {
+		return sealed(p, capBytes) || (!opts.retentionNow.IsZero() && !due(p))
+	}
+	if selected := timebucket.Forced(src, partSpan, (*part).sizeBytes, due, sealedForRetention,
+		capBytes, maxTierParts); len(selected) > 0 {
 		return selected
 	}
 	var expected func([]*part) int

@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-faster/errors"
 
@@ -58,6 +59,7 @@ type part struct {
 	// minTime, maxTime are the inclusive unix-ns record bounds of the part (from the columns when
 	// written, from the bucket index when reconstructed), for time pruning.
 	minTime, maxTime int64
+	retentionAt      time.Time
 
 	// blocks and level are the part's identity in block-number space, carried through the bucket
 	// index. They are unset for a part written before that identity existed, which makes it neither

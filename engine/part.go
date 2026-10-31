@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-faster/errors"
 
@@ -328,6 +329,7 @@ type part struct {
 	// bucket index for time pruning. Set from the flush/merge columns when written and from
 	// the index entry when reconstructed (see engine/index.go).
 	minTime, maxTime int64
+	retentionAt      time.Time
 
 	// blocks and level are the part's identity in block-number space, carried through the bucket
 	// index. They are unset for a part written before that identity existed, which makes it neither

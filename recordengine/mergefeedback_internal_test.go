@@ -54,13 +54,13 @@ func TestMergeFeedbackAllowsOtherWork(t *testing.T) {
 	a.minTime, a.maxTime, b.minTime, b.maxTime = 1, 2, 3, 4
 	c.minTime, c.maxTime, d.minTime, d.maxTime = 2*hour, 2*hour+1, 2*hour+2, 2*hour+3
 	e.mergeFeedback.record([]*part{a, b}, e.mergeProfile(), 0, []*part{a, b})
-	assert.ElementsMatch(t, []*part{c, d}, e.selectMergeParts([]*part{a, b, c, d}, 0, 0, true))
-	assert.Empty(t, e.selectMergeParts([]*part{a, b}, 0, 0, true))
-	assert.NotEmpty(t, e.selectMergeParts([]*part{a, b}, 2, 0, true), "retention bypasses ordinary feedback")
+	assert.ElementsMatch(t, []*part{c, d}, e.selectMergeParts([]*part{a, b, c, d}, MergeOptions{Force: true}, 0))
+	assert.Empty(t, e.selectMergeParts([]*part{a, b}, MergeOptions{Force: true}, 0))
+	assert.NotEmpty(t, e.selectMergeParts([]*part{a, b}, MergeOptions{RetainFrom: 2, Force: true}, 0), "retention bypasses ordinary feedback")
 	c.minTime, c.maxTime = 1, 2*streamedDay
-	assert.Equal(t, []*part{c}, e.selectMergeParts([]*part{a, b, c}, 0, 0, true), "an old failed group must not starve straddlers")
+	assert.Equal(t, []*part{c}, e.selectMergeParts([]*part{a, b, c}, MergeOptions{Force: true}, 0), "an old failed group must not starve straddlers")
 	d.minTime, d.maxTime = 5, 6
-	assert.NotEmpty(t, e.selectMergeParts([]*part{a, b, d}, 0, 0, true), "new inputs remain eligible")
+	assert.NotEmpty(t, e.selectMergeParts([]*part{a, b, d}, MergeOptions{Force: true}, 0), "new inputs remain eligible")
 	require.NoError(t, e.Reset(t.Context()))
 	assert.Empty(t, e.mergeFeedback.runs)
 }

@@ -85,6 +85,8 @@ type Store interface {
 	Read(ctx context.Context, stream string) ([]Row, error)
 	Flush(ctx context.Context) error
 	Merge(ctx context.Context, retainFrom int64) error
+	// BackgroundMerge runs automatic maintenance, or a forced automatic turn.
+	BackgroundMerge(ctx context.Context, retainFrom int64, force bool) (bool, error)
 	// ForceMerge merges every part into one, whatever the merge policy would pick.
 	ForceMerge(ctx context.Context) error
 	Reset(ctx context.Context) error
@@ -213,6 +215,11 @@ var suite = []struct {
 	{"HeadAgeTracksFlushLag", headAgeTracksFlushLag},
 	{"MergeShapeReportsBytes", mergeShapeReportsBytes},
 	{"MergeShapeCountsRetentionWork", mergeShapeCountsRetentionWork},
+	{"RetentionCoalescesBackground", retentionCoalescesBackground},
+	{"RetentionYieldsToOrdinaryCompaction", retentionYieldsToOrdinaryCompaction},
+	{"RetentionFailureDoesNotArmGate", retentionFailureDoesNotArmGate},
+	{"RetentionDoesNotPullProtectedNeighbors", retentionDoesNotPullProtectedNeighbors},
+	{"RetentionStampSurvivesOrdinaryMerge", retentionStampSurvivesOrdinaryMerge},
 	{"StraddlingPartsCompact", straddlingPartsCompact},
 	{"CoLocatedPartsCompact", coLocatedPartsCompact},
 	{"StraddlerBacklogConverges", straddlerBacklogConverges},

@@ -1414,20 +1414,24 @@ func (s *Storage) runMaintenance(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	var pending []mergeTask
+	preferMerge := false
 
 	for {
-		switch nextMaintenanceEvent(s.stopCh, s.mergeWake, t.C, len(pending) > 0) {
+		switch nextMaintenanceEvent(s.stopCh, s.mergeWake, t.C, len(pending) > 0, preferMerge) {
 		case maintenanceStop:
 			return
 		case maintenanceTick:
 			s.maintain(ctx)
-			pending = s.mergeCatchupTasks(ctx)
+			pending = refreshMergeTasks(pending, s.mergeCatchupTasks(ctx))
+			preferMerge = true
 		case maintenanceFlush:
 			if len(pending) == 0 {
 				pending = s.mergeCatchupTasks(ctx)
 			}
+			preferMerge = true
 		case maintenanceMerge:
 			pending = runMergeTasks(pending, s.maintenanceConcurrency())
+			preferMerge = false
 			if len(pending) == 0 {
 				s.recordPartShape(ctx)
 			}
@@ -1815,14 +1819,16 @@ func (s *Storage) maintain(ctx context.Context) {
 // metricShape is a metric engine's merge shape under the policy its next merge resolves, given the
 // tenant's size-retention cutoffs.
 func (s *Storage) metricShape(tid signal.TenantID, eng *engine.Engine, size bySignal) engine.MergeShape {
-	return eng.MergeShapeWith(s.metricMergeOptions(tid, size.at(signal.Metric)))
+	opts := s.metricMergeOptions(tid, size.at(signal.Metric))
+	opts.Background = true
+	return eng.MergeShapeWith(opts)
 }
 
 // recordShape is [Storage.metricShape] for a record engine.
 func (s *Storage) recordShape(
 	sig signal.Signal, tid signal.TenantID, eng *recordengine.Engine, size bySignal,
 ) recordengine.MergeShape {
-	return eng.MergeShapeWith(recordengine.MergeOptions{RetainFrom: s.retainFrom(tid, sig, size.at(sig))})
+	return eng.MergeShapeWith(recordengine.MergeOptions{RetainFrom: s.retainFrom(tid, sig, size.at(sig)), Background: true})
 }
 
 // recordPartShape publishes the merge selector's view of every engine's parts as gauges, once per
