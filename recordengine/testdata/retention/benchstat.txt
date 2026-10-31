@@ -1,0 +1,46 @@
+goos: linux
+goarch: amd64
+pkg: github.com/oteldb/storage/recordengine
+cpu: AMD Ryzen 9 9950X3D2 16-Core Processor         
+                             │ /tmp/retention-before.bench.txt │   /tmp/retention-after.bench.txt    │
+                             │             sec/op              │    sec/op     vs base               │
+RetentionBoundary/backlog=0                       3491.6µ ± 5%   144.2µ ± 15%  -95.87% (p=0.002 n=6)
+RetentionBoundary/backlog=32                      4539.9µ ± 4%   450.8µ ±  2%  -90.07% (p=0.002 n=6)
+geomean                                            3.981m        254.9µ        -93.60%
+
+                             │ /tmp/retention-before.bench.txt │     /tmp/retention-after.bench.txt      │
+                             │               B/s               │      B/s        vs base                 │
+RetentionBoundary/backlog=0                       2.242Gi ± 5%   54.300Gi ± 17%  +2322.03% (p=0.002 n=6)
+RetentionBoundary/backlog=32                      1.724Gi ± 4%   17.367Gi ±  2%   +907.12% (p=0.002 n=6)
+geomean                                           1.966Gi         30.71Gi        +1461.81%
+
+                             │ /tmp/retention-before.bench.txt │  /tmp/retention-after.bench.txt   │
+                             │            merges/op            │ merges/op   vs base               │
+RetentionBoundary/backlog=0                        60.000 ± 0%   1.000 ± 0%  -98.33% (p=0.002 n=6)
+RetentionBoundary/backlog=32                       60.000 ± 0%   4.000 ± 0%  -93.33% (p=0.002 n=6)
+geomean                                             60.00        2.000       -96.67%
+
+                             │ /tmp/retention-before.bench.txt │   /tmp/retention-after.bench.txt    │
+                             │              parts              │   parts     vs base                 │
+RetentionBoundary/backlog=0                         1.000 ± 0%   1.000 ± 0%        ~ (p=1.000 n=6) ¹
+RetentionBoundary/backlog=32                       33.000 ± 0%   2.000 ± 0%  -93.94% (p=0.002 n=6)
+geomean                                             5.745        1.414       -75.38%
+¹ all samples are equal
+
+                             │ /tmp/retention-before.bench.txt │   /tmp/retention-after.bench.txt    │
+                             │          rewrite-B/op           │ rewrite-B/op  vs base               │
+RetentionBoundary/backlog=0                      618.63Ki ± 0%   10.34Ki ± 0%  -98.33% (p=0.002 n=6)
+RetentionBoundary/backlog=32                     618.63Ki ± 0%   10.51Ki ± 0%  -98.30% (p=0.002 n=6)
+geomean                                           618.6Ki        10.42Ki       -98.31%
+
+                             │ /tmp/retention-before.bench.txt │   /tmp/retention-after.bench.txt    │
+                             │              B/op               │     B/op      vs base               │
+RetentionBoundary/backlog=0                     19250.7Ki ± 0%   373.5Ki ± 0%  -98.06% (p=0.002 n=6)
+RetentionBoundary/backlog=32                    22750.4Ki ± 0%   931.9Ki ± 0%  -95.90% (p=0.002 n=6)
+geomean                                           20.44Mi        590.0Ki       -97.18%
+
+                             │ /tmp/retention-before.bench.txt │   /tmp/retention-after.bench.txt   │
+                             │            allocs/op            │  allocs/op   vs base               │
+RetentionBoundary/backlog=0                       17.628k ± 0%   1.181k ± 0%  -93.30% (p=0.002 n=6)
+RetentionBoundary/backlog=32                      18.978k ± 0%   3.117k ± 0%  -83.58% (p=0.002 n=6)
+geomean                                            18.29k        1.919k       -89.51%

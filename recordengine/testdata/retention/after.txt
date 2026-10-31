@@ -1,0 +1,18 @@
+goos: linux
+goarch: amd64
+pkg: github.com/oteldb/storage/recordengine
+cpu: AMD Ryzen 9 9950X3D2 16-Core Processor         
+BenchmarkRetentionBoundary/backlog=0         	     775	    160843 ns/op	52255.94 MB/s	         1.000 merges/op	         1.000 parts	     10591 rewrite-B/op	  382496 B/op	    1181 allocs/op
+BenchmarkRetentionBoundary/backlog=0         	    1155	    122746 ns/op	68474.46 MB/s	         1.000 merges/op	         1.000 parts	     10591 rewrite-B/op	  382496 B/op	    1181 allocs/op
+BenchmarkRetentionBoundary/backlog=0         	    1155	    151717 ns/op	55399.18 MB/s	         1.000 merges/op	         1.000 parts	     10591 rewrite-B/op	  382496 B/op	    1181 allocs/op
+BenchmarkRetentionBoundary/backlog=0         	    1162	    143258 ns/op	58670.15 MB/s	         1.000 merges/op	         1.000 parts	     10591 rewrite-B/op	  382496 B/op	    1181 allocs/op
+BenchmarkRetentionBoundary/backlog=0         	    1172	    145069 ns/op	57937.94 MB/s	         1.000 merges/op	         1.000 parts	     10591 rewrite-B/op	  382496 B/op	    1181 allocs/op
+BenchmarkRetentionBoundary/backlog=0         	    1167	    139202 ns/op	60379.64 MB/s	         1.000 merges/op	         1.000 parts	     10591 rewrite-B/op	  382496 B/op	    1181 allocs/op
+BenchmarkRetentionBoundary/backlog=32        	     296	    440118 ns/op	19097.12 MB/s	         4.000 merges/op	         2.000 parts	     10758 rewrite-B/op	  954274 B/op	    3117 allocs/op
+BenchmarkRetentionBoundary/backlog=32        	     264	    459994 ns/op	18271.97 MB/s	         4.000 merges/op	         2.000 parts	     10758 rewrite-B/op	  954319 B/op	    3117 allocs/op
+BenchmarkRetentionBoundary/backlog=32        	     267	    457532 ns/op	18370.28 MB/s	         4.000 merges/op	         2.000 parts	     10758 rewrite-B/op	  954318 B/op	    3117 allocs/op
+BenchmarkRetentionBoundary/backlog=32        	     286	    446945 ns/op	18805.41 MB/s	         4.000 merges/op	         2.000 parts	     10758 rewrite-B/op	  954299 B/op	    3117 allocs/op
+BenchmarkRetentionBoundary/backlog=32        	     292	    447209 ns/op	18794.34 MB/s	         4.000 merges/op	         2.000 parts	     10758 rewrite-B/op	  954287 B/op	    3117 allocs/op
+BenchmarkRetentionBoundary/backlog=32        	     272	    454300 ns/op	18500.99 MB/s	         4.000 merges/op	         2.000 parts	     10758 rewrite-B/op	  954312 B/op	    3117 allocs/op
+PASS
+ok  	github.com/oteldb/storage/recordengine	25.817s
