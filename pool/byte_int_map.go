@@ -29,7 +29,7 @@ func init() {
 // Capacity is rounded up to a power of two; the load factor is ≤ 0.75 (probed slots)
 // before [grow] is triggered. Keys are compared with bytes.Equal (no string conversion).
 type ByteIntMap struct {
-	keys   [][]byte // key at slot i; nil ⇒ empty
+	keys   [][]byte // Key at slot i; nil is a valid empty byte key.
 	values []int    // value at slot i
 	hashes []uint64 // cached hash (0 is reserved for empty)
 	mask   uint64   // len(hashes)-1
@@ -233,7 +233,7 @@ func (m *ByteIntMap) PutBack() {
 // ForEach calls fn for each (key, value) pair. Iteration order is unspecified.
 func (m *ByteIntMap) ForEach(fn func(key []byte, value int)) {
 	for i := range m.hashes {
-		if m.hashes[i] != 0 && m.keys[i] != nil {
+		if m.hashes[i] != 0 {
 			fn(m.keys[i], m.values[i])
 		}
 	}
@@ -250,7 +250,7 @@ func (m *ByteIntMap) grow() {
 	m.count = 0
 	m.used = 0
 	for i := range oldHashes {
-		if oldHashes[i] != 0 && oldKeys[i] != nil {
+		if oldHashes[i] != 0 {
 			m.PutRaw(oldKeys[i], oldVals[i], oldHashes[i])
 		}
 	}

@@ -67,10 +67,7 @@ func (s identitySet) entriesFor(col []chunk.U128) identitySnapshot {
 func writeIdentity(ctx context.Context, b backend.Backend, prefix string, entries identitySnapshot) error {
 	// Written uncached: read on recovery and by a replica adopting the part, never on the query
 	// path, so a cache entry would only evict part data.
-	data := identity.EncodeSorted(nil, len(entries.refs), func(i int, dst signal.Attributes) series.Entry {
-		ref := int(entries.refs[i])
-		return series.Entry{ID: entries.view.ID(ref), Series: entries.view.At(ref, dst)}
-	})
+	data := identity.EncodeView(nil, entries.view, entries.refs)
 	if err := backend.WriteUncachedDeferred(ctx, b, identityKey(prefix), data); err != nil {
 		return errors.Wrapf(err, "write identity object %q", prefix)
 	}
