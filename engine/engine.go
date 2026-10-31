@@ -114,10 +114,15 @@ type Config struct {
 	// It is called *after* selection, so a cycle with nothing to compact never consults it at all.
 	// nil admits every merge, which is the single-engine and test default.
 	MergeAdmission func(ctx context.Context, bytes int64, wait bool) (release func(), ok bool, err error)
-	// FlushAdmission reserves the estimated resident flush working set. A non-nil callback enables
-	// one flush build alongside one merge build; nil retains serialized maintenance. An oversized
+	// FlushAdmission reserves additional flush workspace; existing frozen samples stay in HeadBytes.
+	// A non-nil callback enables one flush build alongside one merge build; nil retains serialized
+	// maintenance. An oversized
 	// flush must run alone, and the callback must release its reservation on every error.
 	FlushAdmission func(ctx context.Context, bytes int64) (release func(), err error)
+	// FlushMemoryBytes targets additional flush workspace; resident head samples remain charged
+	// separately in HeadBytes. Zero uses a bounded default. A single oversized identity or
+	// unordered series can require a larger exclusive reservation.
+	FlushMemoryBytes int64
 
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each part,
 	// so [Engine.AggregateRange] answers a range-covering aggregate from it without decoding the
@@ -1673,44 +1678,9 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 
 	e.mu.Unlock()
 
-	release, err := e.reserveFlush(ctx, detached, detachedBytes, nil)
-	if err != nil {
+	newParts, rows, err := e.streamHead(ctx, detached)
+	if err != nil || rows == 0 {
 		return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
-	}
-	defer release()
-	idents := e.identitiesOf(detached)
-
-	// Build (lock-free): lay out the detached buffers and write the part. Flush writes freshly-ingested
-	// (warm) data with the default codec-only framing; recompression of cold data happens at merge.
-	cols := buildFlushColumns(detached)
-	if cols == nil { // every detached buffer was empty (defensive — detach guarantees ≥1 row)
-		return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, nil)
-	}
-
-	rows = len(cols.ts)
-
-	// Split the flushed columns into one or more parts, each kept under MaxPartBytes (a single part
-	// when unlimited). Flush writes freshly-ingested data with codec-only framing (no recompression).
-	ranges := chunkRanges(rows, maxRowsPerPart(e.cfg.MaxPartBytes))
-
-	newParts := make([]*part, 0, len(ranges))
-	for _, rg := range ranges {
-		sub := cols.slice(rg[0], rg[1])
-		prefix := e.newPartPrefix()
-
-		if err := writePart(ctx, e.cfg.Backend, prefix, sub, idents,
-			compressProfile{}, 0, e.cfg.AggregateStats, e.cfg.MetricBlockRows, e.tsCodec, &block.Rollup{}); err != nil {
-			return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
-		}
-
-		p, err := openPart(ctx, e.cfg.Backend, prefix, e.cfg.Obs.Corruption, e.readCompressors)
-		if err != nil {
-			return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
-		}
-
-		p.minTime, p.maxTime = colsTimeRange(sub)
-		planFlushBlocks(p)
-		newParts = append(newParts, p)
 	}
 
 	// Commit the candidate while the frozen head stays readable, then install both sides of the swap.

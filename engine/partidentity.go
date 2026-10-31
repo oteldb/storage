@@ -78,15 +78,6 @@ func writeIdentity(ctx context.Context, b backend.Backend, prefix string, entrie
 	return nil
 }
 
-// identitiesOf resolves a detached generation outside the reader lock. Caller holds flushMu.
-func (e *Engine) identitiesOf(ids map[signal.SeriesID]*sampleBuf) identitySet {
-	out := identitySet{refs: make(map[signal.SeriesID]uint32, len(ids))}
-	e.captureDetachedIdentities(ids, func(id signal.SeriesID, view series.View, ref uint32) {
-		out.view, out.refs[id] = view, ref
-	})
-	return out
-}
-
 // identitiesForColumn resolves distinct column identities in bounded lock sections. Caller holds flushMu.
 func (e *Engine) identitiesForColumn(col []chunk.U128) identitySet {
 	out := identitySet{refs: make(map[signal.SeriesID]uint32)}

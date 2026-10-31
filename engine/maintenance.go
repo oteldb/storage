@@ -6,10 +6,6 @@ import (
 	"github.com/go-faster/errors"
 	"github.com/go-faster/sdk/zctx"
 	"go.uber.org/zap"
-
-	"github.com/oteldb/storage/index/series"
-	"github.com/oteldb/storage/internal/buildbudget"
-	"github.com/oteldb/storage/signal"
 )
 
 func (e *Engine) lockFlush() func() {
@@ -34,32 +30,6 @@ func (e *Engine) lockMerge() func() {
 	e.flushMu.RLock()
 	e.activeBuilds.Add(1)
 	return func() { e.activeBuilds.Add(-1); e.flushMu.RUnlock(); e.mergeRun.Unlock() }
-}
-
-func (e *Engine) reserveFlush(
-	ctx context.Context, detached map[signal.SeriesID]*sampleBuf, values int64, side map[string][]byte,
-) (func(), error) {
-	if e.cfg.FlushAdmission == nil {
-		return func() {}, nil
-	}
-	var rows, identities, sides, workspace, materialized int64
-	first := true
-	for _, buf := range detached {
-		rows = buildbudget.Add(rows, int64(len(buf.ts)))
-	}
-	e.captureDetachedIdentities(detached, func(_ signal.SeriesID, view series.View, ref uint32) {
-		identities = buildbudget.Add(identities, view.EncodingBytes(int(ref)))
-		if first {
-			workspace = view.EncodingWorkspace()
-			first = false
-		}
-		materialized = max(materialized, view.MaterializationBytes(int(ref)))
-	})
-	for _, data := range side {
-		sides = buildbudget.Add(sides, 256+int64(len(data)))
-	}
-	estimate := buildbudget.Flush(rows, values, identities, int64(len(detached)), int64(4), sides, buildbudget.Add(workspace, materialized))
-	return e.cfg.FlushAdmission(ctx, estimate)
 }
 
 // mergeSourcesLive prevents a concurrent reload from making the merge resurrect removed sources.
