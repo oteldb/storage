@@ -442,7 +442,7 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 		return false, nil
 	}
 
-	if err := e.flushWALLocked(); err != nil {
+	if err := e.flushWALLocked(false); err != nil {
 		return false, err
 	}
 
@@ -507,7 +507,7 @@ func (e *Engine) AppendBatch(
 		return res, nil
 	}
 
-	if err := e.flushWALLocked(); err != nil {
+	if err := e.flushWALLocked(false); err != nil {
 		return AppendResult{}, err
 	}
 
@@ -1548,17 +1548,8 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 	// The accepted frames are framed from the staged batch, so a sample routed to an overflow series
 	// replicates under that series. Every series carries its identity: a secondary's head need not
 	// hold the series the primary's already buffers.
-	if err := e.walB.encode(e.head, true); err != nil {
+	if err := e.flushWALLocked(true); err != nil {
 		return nil, AppendResult{}, err
-	}
-
-	// They are also the primary's durable copy of the shard's unflushed head, the one the quorum ack
-	// counts on: a restart replays them instead of serving a hole for everything written since the
-	// last flush.
-	if e.cfg.WAL != nil {
-		if err := e.mu.WithReaders(func() error { return e.cfg.WAL.WriteFrames(e.walB.frames.Bytes()) }); err != nil {
-			return nil, AppendResult{}, err
-		}
 	}
 
 	e.walB.apply(e.head)

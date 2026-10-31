@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"time"
 
+	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
 )
 
 // walBatch is a logged write staged before it touches the head: its admitted samples grouped by the
 // series they land under, with what admitting them would have done to the head. A durable write is
-// decided into it ([walBatch.admit]), logged from it ([walBatch.flush]), and only then applied
+// decided into it ([walBatch.admit]), logged from it ([Engine.flushWALLocked]), and only then applied
 // ([walBatch.apply]), so a write whose log fails leaves the head as it found it.
 //
 // Applying first — what [head.appendByID] does for an engine with nothing to log — would leave a
@@ -29,6 +30,7 @@ type walBatch struct {
 	// are what [head.appendByID] would have added to the head's in-flight bytes and series count.
 	samples    int
 	registered int
+	relog      bool
 
 	// first is when the write staged its first sample: the head's age starts there if the write is the
 	// first to fill it, as it would had the sample been applied on admission, not once the log returns.
@@ -39,14 +41,16 @@ type walBatch struct {
 }
 
 type walSeriesAcc struct {
-	isNew       bool          // the series starts a buffer, so its identity record is logged
-	register    bool          // the identity is not in the head's index yet
+	isNew       bool // the series starts a buffer, so its identity record is logged
+	register    bool // the identity is not in the head's index yet
+	knownRef    bool
 	series      signal.Series // the identity, set when isNew
 	attrs       signal.Attributes
 	newest      int64 // the newest admitted timestamp
 	buffer      *sampleBuf
 	priorNewest int64
 	hadNewest   bool
+	identityRef uint32
 	ts          []int64
 	values      []float64
 	sf          []float64 // per-sample scale factors (aligned with ts)
@@ -99,7 +103,8 @@ func (b *walBatch) admit(
 		return admitted
 	}
 	acc.isNew = true
-	if h.series.Has(id) {
+	if ref, known := h.series.Ref(id); known {
+		acc.identityRef, acc.knownRef = ref, true
 		b.add(b.start(id, acc), ts, value, sf)
 		return admitted
 	}
@@ -118,8 +123,9 @@ func (b *walBatch) admit(
 			previous, exists := h.seriesNewest[oid]
 			a := walSeriesAcc{buffer: h.samples[oid], priorNewest: previous, hadNewest: exists}
 			a.isNew = a.buffer == nil
-			if a.isNew && !h.series.Has(oid) {
-				a.register, a.series = true, ov
+			if a.isNew {
+				a.identityRef, a.knownRef = h.series.Ref(oid)
+				a.register, a.series = !a.knownRef, ov
 			}
 			b.add(b.start(oid, a), ts, value, sf)
 		}
@@ -154,6 +160,7 @@ func (b *walBatch) start(id signal.SeriesID, acc walSeriesAcc) int {
 	if acc.register {
 		b.registered++
 	}
+	b.relog = b.relog || (acc.isNew && !acc.register)
 	return k
 }
 
@@ -182,18 +189,38 @@ func (b *walBatch) add(k int, ts int64, value, sf float64) {
 // empty reports whether the batch staged no samples (so the engine can skip the WAL write).
 func (b *walBatch) empty() bool { return len(b.order) == 0 }
 
-// flushWALLocked encodes under the state lock, then logs with readers admitted.
-func (e *Engine) flushWALLocked() error {
-	if err := e.walB.encode(e.head, false); err != nil {
-		return err
+func (e *Engine) flushWALLocked(everySeries bool) error {
+	view := e.walB.encodingView(e.head, everySeries)
+	return e.mu.WithReaders(func() error {
+		if err := e.walB.encode(view, everySeries); err != nil {
+			return err
+		}
+		if e.cfg.WAL == nil {
+			return nil
+		}
+		return e.cfg.WAL.WriteFrames(e.walB.frames.Bytes())
+	})
+}
+
+func (b *walBatch) encodingView(h *head, everySeries bool) series.View {
+	if !b.relog && !everySeries {
+		return series.View{}
 	}
-	return e.mu.WithReaders(func() error { return e.cfg.WAL.WriteFrames(e.walB.frames.Bytes()) })
+	if everySeries {
+		for k, id := range b.order {
+			a := &b.accs[k]
+			if !a.isNew {
+				a.identityRef, a.knownRef = h.series.Ref(id)
+			}
+		}
+	}
+	return h.series.View()
 }
 
 // encode frames the staged write into b.frames, one samples frame per series, each preceded by its
 // series record when the series starts a buffer — or always, with everySeries, for frames read by a
 // replica whose head may not hold the identity the primary's does.
-func (b *walBatch) encode(h *head, everySeries bool) error {
+func (b *walBatch) encode(view series.View, everySeries bool) error {
 	b.frames.Reset()
 
 	for k, id := range b.order {
@@ -203,14 +230,14 @@ func (b *walBatch) encode(h *head, everySeries bool) error {
 		case a.isNew:
 			s := a.series
 			if !a.register {
-				s, _ = h.series.GetInto(id, a.attrs)
+				s = a.identity(view)
 				a.attrs = s.Attributes
 			}
 			if err := b.fw.WriteSeries(id, s); err != nil {
 				return err
 			}
 		case everySeries:
-			s, _ := h.series.GetInto(id, a.attrs)
+			s := a.identity(view)
 			a.attrs = s.Attributes
 			if err := b.fw.WriteSeries(id, s); err != nil {
 				return err
@@ -233,6 +260,13 @@ func (b *walBatch) encode(h *head, everySeries bool) error {
 	}
 
 	return nil
+}
+
+func (a *walSeriesAcc) identity(view series.View) signal.Series {
+	if !a.knownRef {
+		return signal.Series{}
+	}
+	return view.At(int(a.identityRef), a.attrs)
 }
 
 // apply puts the staged samples into the head, leaving it exactly as applying each one through
@@ -274,5 +308,6 @@ func (b *walBatch) reset() {
 	}
 	b.order = b.order[:0]
 	b.samples, b.registered = 0, 0
+	b.relog = false
 	clear(b.pos)
 }
