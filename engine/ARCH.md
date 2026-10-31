@@ -137,17 +137,6 @@ encode/write/apply operation against append, replica, seal, checkpoint and Close
 record engine still encodes under state. This permits readers during metric encoding;
 it does not parallelize writers or change WAL batching/durability.
 
-`BenchmarkAppendWALRegistry` cycles 4,096-point warm appends through 65,536 or 1,048,576
-registered series on a file-backed WAL, with eight parallel callers, GOMAXPROCS=8, and no
-per-append fsync. Six 100ms samples on Ryzen 9950X3D2, Go 1.27.3 (`nodwarf5`), measure
-649→471 µs / 763→474 µs at 65k series (OOO disabled/enabled) and 1321→966 µs /
-1361→971 µs at 1M (-27% to -38%, all p=0.002). The cached accumulator grows from 288 to
-312 bytes on amd64. Input construction and registration are untimed; repeated timestamps
-and growing sample buffers are deliberate. These isolate WAL append work, not receiver,
-flush, query latency or sustainable server capacity; allocation totals vary with buffer growth.
-The 1 GiB segment target avoids timed rotation. [Method and samples](../docs/benchmarks/wal-staging/README.md)
-include the final reader-admitted encoding path.
-
 ## Flush
 
 Drains the head into one flat part, one row per sample:
@@ -181,16 +170,6 @@ Every output stays private until the complete generation is built. One catalog o
 the frozen source for all output parts, and only its confirmed commit permits the captured WAL
 prefix to be checkpointed. This preserves the durable part and WAL formats; there is no separate
 encoded memory tier or delayed read-after-write visibility.
-
-`BenchmarkFlushSealedHead` flushes 65,536 pre-registered series through the file backend, with
-64 MiB output cap and 448 MiB additional-workspace target. Six alternating single-operation
-repetitions at GOMAXPROCS=8 on Ryzen 9950X3D2, Go 1.27.3 (`nodwarf5`), allocate 64.79 instead
-of 73.32 MiB for one point per series (-11.63%), 79.66 instead of 114.75 MiB for eight
-(-30.58%), and 321.0 instead of 830.9 MiB for 128 (-61.37%); all p=0.002. Output counts
-remain 1, 1 and 4. The long fixture takes 327.3 instead of 349.1 ms (-6.26%, p=0.002);
-the two short fixtures have no significant time difference. Allocation counts rise 1.1–43.4%.
-The 448 MiB reservation is a policy allowance, not measured peak heap; small flushes reserve
-more than the former whole-head estimate. These are flush measurements, not ingest capacity.
 
 ### Identity is part-scoped
 
