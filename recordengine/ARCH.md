@@ -60,8 +60,10 @@ The newest bucket comes from flushed data timestamps rather than elapsed wall ti
 Retention drops fully expired parts on metadata alone. The oldest forced part selects its finest
 aligned bucket; forced work wins, then ordinary compaction, then day-boundary straddlers.
 Compression-only rewrites use that same forced selector when ordinary work has nothing to do,
-including sealed and isolated singletons. They compare persisted algorithms and levels; constants
-need no rewrite, Zstd level zero means 3, and a stronger level alone does not cause rewriting.
+including sealed and isolated singletons, but take only parts needing an upgrade. Already-compressed
+neighbors join through balanced ordinary compaction: filling an upgrade with them bypasses its
+growth guard and rewrites old data on each fresh flush. They compare persisted algorithms and levels;
+constants need no rewrite, Zstd level zero means 3, and a stronger level alone does not cause rewriting.
 AlgorithmNone disables the fallback. Every selected output uses the configured compression profile.
 
 ### Disk and resident memory have different units
@@ -106,6 +108,8 @@ The stream union is `mergestream.Keys` over each part's sorted ranges, a k-way h
 set of every stream. Day writers share compressors, stream their frames to capable backends and
 open their finished output parts only after releasing source readers. Buffered backends also charge
 the retained encoded output and its serialization copy as resident state.
+Attribute-key enumeration reuses decode scratch across rows, clearing references after each walk.
+Streamed writers charge that scratch to resident memory, so reuse does not hide retained capacity.
 
 ### Inspection and logical sizes
 

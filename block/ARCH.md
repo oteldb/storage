@@ -216,9 +216,10 @@ size and releases each frame as it copies it; a growing buffer would hold a seco
 hundreds-of-MiB column).
 
 `NewStreamWriterTo(ctx, b, prefix, …)` removes that: each column opens a `backend.ObjectWriter` and
-hands over every frame as it seals, so what stays resident is one unsealed frame per column plus the
-block directory — two ints per frame and one per granule, kilobytes against a column of hundreds of
-MiB. Those columns carry `flagFooter`, since a streamed directory cannot lead the frames it
+hands over every frame as it seals. A streamed column reuses its compressed output buffer only
+after `Write` returns; buffered frames keep their own storage. The output buffer is charged alongside
+the unsealed frame and block directory, and released when the column finishes or is discarded.
+Those columns carry `flagFooter`, since a streamed directory cannot lead the frames it
 describes. Two consequences worth stating:
 
 - **A column cannot stream from its first granule.** A column that turns out constant collapses into
@@ -466,8 +467,11 @@ bound. The slack lives as long as the buffer, so nothing kept past a decode carr
 - a **kept buffer** — a dictionary, whose entries alias it; a decoder's frame buffer, which lives as
   long as the decoder; an unframed stream — decodes into a scratch buffer and is copied out at its
   exact size. Keeping the slack would cost 128 KiB per open zstd dictionary and per open decoder,
-  over a gigabyte for 1000 parts × 5 open columns. The scratch buffers come from a fixed set of four
-  of at most 1 MiB that survives collections: a `sync.Pool` empties on every other collection, and
+  over a gigabyte for 1000 parts × 5 open columns. Scratch survives collections in four slots of at
+  most 2 MiB and one separate slot of at most 16 MiB: 24 MiB retained idle process-wide. Active
+  decoding remains covered by its caller's working-set budget. The larger slot covers
+  variable-width frames and dictionary regions without letting small reads pin multiple large
+  buffers. Larger allocations are discarded. A `sync.Pool` empties on every other collection, and
   rebuilding a scratch per miss put a ranged open 16% over its allocation before the slack;
 - a **whole-column bytes walk** keeps every frame it decoded (the merged column aliases them), so the
   frames decode back to back into one arena sized to their recorded total plus one slack, instead of

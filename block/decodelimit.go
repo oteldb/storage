@@ -84,7 +84,7 @@ func decompressKept(comp *compress.Compressor, dst, src []byte, limit int64, exa
 		return decompressBounded(comp, dst, src, limit, exact)
 	}
 
-	scratch := getScratch()
+	scratch := getScratch(satAdd(limit, slack))
 
 	out, err := decompressBounded(comp, scratch, src, limit, exact)
 	if err != nil {
@@ -107,17 +107,26 @@ func decompressKept(comp *compress.Compressor, dst, src []byte, limit int64, exa
 // Scratch buffers for [decompressKept], held in a fixed set that survives collections: a
 // [sync.Pool] is emptied by every other collection, and a scratch rebuilt on each miss costs the
 // frame plus its slack, which is what a kept buffer avoids holding. The set holds at most
-// scratchBufs × maxScratchBuf for the process.
+// four small and one large idle buffer: at most 24 MiB retained for the process.
 const (
-	scratchBufs   = 4
-	maxScratchBuf = 1 << 20
+	scratchBufs        = 4
+	maxScratchBuf      = 2 << 20
+	maxLargeScratchBuf = 16 << 20
 )
 
 var scratches = make(chan []byte, scratchBufs)
+var largeScratches = make(chan []byte, 1)
 
-func getScratch() []byte {
+func getScratch(need int64) []byte {
+	cache := scratches
+	if need > maxScratchBuf {
+		if need > maxLargeScratchBuf {
+			return nil
+		}
+		cache = largeScratches
+	}
 	select {
-	case buf := <-scratches:
+	case buf := <-cache:
 		return buf
 	default:
 		return nil
@@ -125,12 +134,16 @@ func getScratch() []byte {
 }
 
 func putScratch(buf []byte) {
-	if buf == nil || cap(buf) > maxScratchBuf {
+	if buf == nil || cap(buf) > maxLargeScratchBuf {
 		return
+	}
+	cache := scratches
+	if cap(buf) > maxScratchBuf {
+		cache = largeScratches
 	}
 
 	select {
-	case scratches <- buf[:0]:
+	case cache <- buf[:0]:
 	default:
 	}
 }

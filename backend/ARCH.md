@@ -246,6 +246,10 @@ a demonstration.
   nothing changes, per candidate per want, which a nested catalog near the target turns into seconds
   under the state lock: `TrimWants` of 256 nested wants over a 4000-claim catalog and 100 live parts
   took 6.7s that way and takes 10ms this way.
+  Upward-only catalog walks build only the group-run index; the ancestry-block index is built on
+  demand for downward relations. An ordered interval walk reuses its search position across runs.
+  On a catalog with 16,398 claims and 11.49 million gaps, catalog upkeep takes 395ms and allocates
+  18.7MB; eagerly indexing both directions takes 3.30s and allocates 2.73GB on the same snapshot.
   **An entry carries its part's rollup layout** (`Entry.Rollup`, format v8; nil is unknown), so a
   writer checks a rival's layout without opening the rival's part (`engine/ARCH.md`, "Merge").
   **Allocation is the shard owner's alone, and scoped to its tenure**: `Index.NextBlock(term)` is one

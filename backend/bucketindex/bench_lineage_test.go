@@ -174,3 +174,34 @@ func BenchmarkRecordLineageSaturated(b *testing.B) {
 		ix.RecordLineage()
 	}
 }
+
+func BenchmarkRecordLineageGapped(b *testing.B) {
+	for _, runs := range []int{1, 32, 256} {
+		b.Run(fmt.Sprintf("runs=%d", runs), func(b *testing.B) {
+			blocks := make([]uint64, runs)
+			for i := range blocks {
+				blocks[i] = uint64(2*i + 1)
+			}
+
+			seed := bucketindex.TermBlocks(1, blocks...)
+			parent := seed
+			catalog := make([]bucketindex.Claim, bucketindex.MaxLineage+512)
+
+			for i := range catalog {
+				group := bucketindex.Range(2, uint64(2*i+1), uint64(2*i+2))
+				catalog[i] = bucketindex.Claim{Blocks: parent, Group: group}
+				parent = seed.Union(group)
+			}
+
+			live := []bucketindex.Entry{{Prefix: "tip", Blocks: catalog[len(catalog)-1].Group}}
+			b.ReportAllocs()
+
+			for b.Loop() {
+				ix := &bucketindex.Index{Entries: live, Catalog: slices.Clone(catalog)}
+				if over := ix.RecordLineage(); over != 512 {
+					b.Fatalf("lost reachable claims: over=%d", over)
+				}
+			}
+		})
+	}
+}

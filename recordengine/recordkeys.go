@@ -8,6 +8,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/signal"
 )
 
 // A part's distinct per-record attribute keys are persisted next to its column blooms as a small
@@ -36,10 +37,11 @@ func distinctRecordKeys(schema *Schema, cols *recordCols) [][]byte {
 	}
 
 	keys := make(recordKeySet)
+	var scratch signal.Attributes
 
 	bc := &cols.bytes[k]
 	for i := range bc.rows() {
-		keys.add(bc.at(i))
+		keys.add(bc.at(i), &scratch)
 	}
 
 	return keys.sorted()
