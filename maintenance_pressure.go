@@ -9,6 +9,13 @@ func (s *Storage) mergeMemoryBytes() int64 {
 	return s.mergePool.Total()
 }
 
+func (s *Storage) metricFlushMemoryBytes() int64 {
+	if s.buildPool == nil {
+		return 0
+	}
+	return max(s.buildPool.Total()/4, 1)
+}
+
 func (s *Storage) flushAdmission() func(context.Context, int64) (func(), error) {
 	if s.buildPool == nil {
 		return nil
