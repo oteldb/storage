@@ -62,12 +62,14 @@ func (e *Engine) KeysContext(ctx context.Context, start, end int64) []KeyInfo {
 	e.mu.LockState() // The snapshot may populate the head/flushing key caches.
 	lockSpan.End()
 	_, streamsSpan := e.cfg.Obs.Tracer.Start(ctx, "recordengine.keys.streams")
-	streams, matched := 0, 0
+	streams, matched, lookups := 0, 0, 0
 	// Stream-identity keys: resource/scope/series attributes of every in-window stream. The series index is
 	// authoritative (it survives flush and a stateless reload), so this is sound on all backends.
 	e.head.series.ForEach(func(id signal.SeriesID, s signal.Series) {
 		streams++
-		if !e.streamInRangeLocked(id, start, end) {
+		inRange, searched := e.streamInRangeLookupsLocked(id, start, end)
+		lookups += searched
+		if !inRange {
 			return
 		}
 		matched++
@@ -92,7 +94,8 @@ func (e *Engine) KeysContext(ctx context.Context, start, end int64) []KeyInfo {
 			add(labelScopeVersion, KeyScopeScope)
 		}
 	})
-	streamsSpan.SetAttributes(attribute.Int("storage.streams", streams), attribute.Int("storage.streams_matched", matched))
+	streamsSpan.SetAttributes(attribute.Int("storage.streams", streams), attribute.Int("storage.streams_matched", matched),
+		attribute.Int("storage.part_lookups", lookups))
 	streamsSpan.End()
 
 	// Record-attribute keys: the head's still-buffered records (plus any detached mid-flush) and each
@@ -127,6 +130,7 @@ func (e *Engine) KeysContext(ctx context.Context, start, end int64) []KeyInfo {
 		attribute.Int("storage.streams", streams), attribute.Int("storage.streams_matched", matched),
 		attribute.Int("storage.parts_scanned", len(parts)), attribute.Int("storage.parts_live", partsInWindow),
 		attribute.Int("storage.keys", len(keys)),
+		attribute.Int("storage.part_lookups", lookups),
 	)
 	return keys
 }

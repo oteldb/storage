@@ -73,6 +73,11 @@ func TestKeysContext(t *testing.T) {
 						parts = 1
 					}
 					require.Equal(t, parts, attrs["storage.parts_scanned"].AsInt64())
+					lookups := int64(0)
+					if flushed && window.name == "partial" {
+						lookups = 2
+					}
+					require.Equal(t, lookups, attrs["storage.part_lookups"].AsInt64())
 				})
 			}
 		})
