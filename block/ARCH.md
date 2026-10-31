@@ -208,6 +208,8 @@ rather than its uncompressed rows. Each writer compresses through compressors of
 caller hands it some (`WithCompressors`), which is how writers open at once share one encoder pool;
 a `PartReader` likewise takes its owner's decompressors (`WithReadCompressors`), one set per engine.
 Output is byte-identical to `PartWriter`'s from the same rows, tested case-by-case and by fuzz.
+Adjacent `AppendU128Run` chunks with the same identity coalesce into one run, so callers can
+feed bounded sample chunks without growing the ID stream with the number of chunks.
 
 `NewStreamWriter` still holds **the whole encoded part**, and `build` then serializes each column's
 frames into one buffer, so its peak is about twice the part it is producing (`blockAccum.finish`

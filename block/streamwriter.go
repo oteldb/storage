@@ -229,10 +229,26 @@ func (w *StreamWriter) AppendU128Run(i int, v chunk.U128, count int) error {
 		return nil
 	}
 
-	c.runs = append(c.runs, chunk.U128Run{Value: v, Count: count})
+	if n := len(c.runs); n > 0 && c.runs[n-1].Value == v {
+		c.runs[n-1].Count += count
+	} else {
+		c.runs = append(c.runs, chunk.U128Run{Value: v, Count: count})
+	}
 	c.rows += count
 	c.raw += int64(count) * 16
 
+	return nil
+}
+
+// ReserveU128Runs reserves room for n runs in the i-th column without appending rows.
+func (w *StreamWriter) ReserveU128Runs(i, n int) error {
+	c, err := w.column(i, KindInt128)
+	if err != nil {
+		return err
+	}
+	if n > len(c.runs) {
+		c.runs = slices.Grow(c.runs, n-len(c.runs))
+	}
 	return nil
 }
 

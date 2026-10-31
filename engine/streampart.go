@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"slices"
 
 	"github.com/go-faster/errors"
 
@@ -25,7 +26,7 @@ const (
 // the columns, plus the part's sidecars built from the same per-series calls, so they cost
 // O(distinct series) rather than O(rows).
 //
-// Rows must arrive in the part's sort order, one whole series per appendSeries call.
+// Rows must arrive in the part's sort order; consecutive chunks of one series are coalesced.
 type partStreamWriter struct {
 	e      *Engine
 	w      *block.StreamWriter
@@ -135,10 +136,19 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 		}
 	}
 
-	p.runs = append(p.runs, chunk.U128Run{Value: id, Count: len(ts)})
+	sameSeries := len(p.runs) > 0 && p.runs[len(p.runs)-1].Value == id
+	if sameSeries {
+		p.runs[len(p.runs)-1].Count += len(ts)
+		p.wmarks[len(p.wmarks)-1].Max = max(p.wmarks[len(p.wmarks)-1].Max, covered)
+	} else {
+		p.runs = append(p.runs, chunk.U128Run{Value: id, Count: len(ts)})
+		p.wmarks = append(p.wmarks, watermark.Entry{ID: u128ToID(id), Max: covered})
+		if p.withStats {
+			p.statsIDs = append(p.statsIDs, id)
+			p.stats = append(p.stats, SeriesAgg{})
+		}
+	}
 	p.rows += len(ts)
-
-	p.wmarks = append(p.wmarks, watermark.Entry{ID: u128ToID(id), Max: covered})
 
 	// Rows arrive series-major, so the part's bounds are the running extremes over every series
 	// rather than the first and last row.
@@ -150,19 +160,26 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 	}
 
 	if p.withStats {
-		agg := SeriesAgg{}
+		agg := &p.stats[len(p.stats)-1]
 		for _, v := range values {
 			agg.addSample(v, 1) // the sidecar is written only for an unsampled part; see encodeSeriesStats
 		}
-
-		p.statsIDs = append(p.statsIDs, id)
-		p.stats = append(p.stats, agg)
 	}
 
 	return nil
 }
 
 func (p *partStreamWriter) encodedBytes() int64 { return p.w.EncodedBytes() }
+
+func (p *partStreamWriter) reserveSeries(n int) error {
+	p.runs = slices.Grow(p.runs, max(n-len(p.runs), 0))
+	p.wmarks = slices.Grow(p.wmarks, max(n-len(p.wmarks), 0))
+	if p.withStats {
+		p.statsIDs = slices.Grow(p.statsIDs, max(n-len(p.statsIDs), 0))
+		p.stats = slices.Grow(p.stats, max(n-len(p.stats), 0))
+	}
+	return p.w.ReserveU128Runs(colSeriesIdx, n)
+}
 
 // residentBytes is what the part holds in RAM: the block writer's buffers plus the sidecars this
 // type accumulates, which are O(distinct series) rather than O(rows). Once the column frames stream
@@ -220,6 +237,10 @@ func (p *partStreamWriter) weights(sf []float64, n int) []float64 {
 // counterpart of [Engine.writeMergedPart]. At least one series must have been appended: an empty
 // part would mean a burnt part id and an unreadable prefix.
 func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
+	return p.finishWithIdentities(ctx, p.identityEntries())
+}
+
+func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities identitySnapshot) (*part, error) {
 	if p.rows == 0 {
 		return nil, errors.New("engine: finishing a merge output part with no rows")
 	}
@@ -234,7 +255,7 @@ func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 		return nil, errors.Wrapf(err, "write series-index sidecar %q", prefix)
 	}
 
-	if err := writeIdentity(ctx, p.e.cfg.Backend, prefix, p.identityEntries()); err != nil {
+	if err := writeIdentity(ctx, p.e.cfg.Backend, prefix, identities); err != nil {
 		return nil, err
 	}
 

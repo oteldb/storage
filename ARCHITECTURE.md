@@ -92,6 +92,9 @@ engines over the fetch seam (`query/fetch`).
   tenants receiving an exclusive admission turn before bounded parallel work. An independent
   pressure worker services head-size wakes even while a merge is building. Engines admit one
   flush and one merge against a shared memory budget; oversized/opaque flushes run alone.
+  Metric flushes target the reserved quarter for incremental encoding workspace; frozen samples
+  remain charged to head admission until publication. Resident head state is not bounded by
+  the maintenance workspace allowance.
   Catalog CAS/rebase admits ingestion, then installs a coherent read view before WAL checkpoint.
   Close cancels queued work and drains both workers. See `engine/ARCH.md` for lifetime and budgets.
 - **Read-only** — `WithReadOnly()` opens a handle that never mutates the backend: the sweep-nothing

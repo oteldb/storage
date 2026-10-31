@@ -33,6 +33,7 @@ func mergeCorpus(t *testing.T, series, samples, parts int, value func(r *rand.Ra
 	// ~62 MiB of raw rows the corpus holds, so the cap never binds.
 	e := engine.New(engine.Config{
 		Backend: backend.Memory(), Prefix: "m", MaxPartBytes: 0, MergeMemoryBytes: 1 << 30,
+		FlushMemoryBytes: 128 << 20,
 	})
 
 	r := rand.New(rand.NewPCG(1, 2))

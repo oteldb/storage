@@ -153,9 +153,11 @@ type Options struct {
 	// memory); negative ⇒ unbounded, for an embedder that bounds reads itself.
 	MaxQueryBytes int64
 
-	// MergeMemoryBytes budgets resident maintenance work independently of stored part size. Merges
+	// MergeMemoryBytes budgets maintenance workspace independently of stored part size. Merges
 	// use at most three quarters of this admission pool; flushes can use the remaining reservation.
-	// Both reserve their estimated working sets from the shared pool. An oversized indivisible
+	// Metrics flushes reserve incremental encoding workspace; their frozen samples remain in
+	// HeadBytes and tenant in-flight admission. Record flush reservations also include frozen input.
+	// Both reserve estimated working sets from the shared pool. An oversized indivisible
 	// operation runs alone, so this is an admission estimate rather than a hard RSS ceiling.
 	// Zero derives one eighth of the process limit; negative disables budgeting and build overlap.
 	// Memory and MaintenanceConcurrency jointly bound merge fan-out. Background merges defer when
