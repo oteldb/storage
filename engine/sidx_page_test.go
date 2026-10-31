@@ -93,3 +93,88 @@ func TestPagedIndexDoesNotRetainValidationBuffer(t *testing.T) {
 		})
 	}
 }
+
+func TestPagedLookupMatchesResidentRanges(t *testing.T) {
+	t.Parallel()
+	const count = indexPageEntries*3 + 7
+	var col []chunk.U128
+	for i := range count {
+		id := chunk.U128{Hi: uint64(i / 64), Lo: uint64(i%64+1) * 2}
+		for range 1 + i%3 {
+			col = append(col, id)
+		}
+	}
+	data := encodeSeriesIndex(col)
+	want := buildPartIndex(col)
+	for _, resident := range []bool{false, true} {
+		name := "pages"
+		if resident {
+			name = "resident"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			be := backend.Memory()
+			require.NoError(t, be.Write(t.Context(), sidxKey("p"), data))
+			counter := backendtest.NewByteCounter(be)
+			idx, ok := openPagedIndex(t.Context(), backend.Cached(counter, 256<<10), "p", len(col), obs.NewNop().Corruption)
+			require.True(t, ok)
+			require.Len(t, idx.fences, 4)
+			if resident {
+				_, err := idx.entries(t.Context())
+				require.NoError(t, err)
+			}
+			counter.Reset()
+			for i := range count {
+				for _, delta := range []uint64{0, 1} {
+					id := signal.SeriesID{Hi: uint64(i / 64), Lo: uint64(i%64+1)*2 + delta}
+					expected, found, err := want.lookup(t.Context(), id)
+					require.NoError(t, err)
+					got, actual, err := idx.lookup(t.Context(), id)
+					require.NoError(t, err)
+					require.Equal(t, found, actual)
+					require.Equal(t, expected, got)
+				}
+			}
+			for _, id := range []signal.SeriesID{{}, {Hi: ^uint64(0), Lo: ^uint64(0)}} {
+				_, found, err := idx.lookup(t.Context(), id)
+				require.NoError(t, err)
+				require.False(t, found)
+			}
+			if resident {
+				assert.Zero(t, counter.Bytes(), "resident lookup borrows pages without backend reads")
+			}
+		})
+	}
+}
+
+func FuzzPagedIndexLookup(f *testing.F) {
+	for _, count := range []uint16{0, 1, 2047, 2048, 3079, 4096, 4099} {
+		f.Add(count, uint64(17), true)
+		f.Add(count, uint64(23), false)
+	}
+	f.Fuzz(func(t *testing.T, size uint16, probe uint64, resident bool) {
+		count := int(size % 4100)
+		col := make([]chunk.U128, count)
+		for i := range col {
+			col[i] = chunk.U128{Hi: uint64(i+1) * 2, Lo: probe ^ uint64(i)}
+		}
+		be := backend.Memory()
+		require.NoError(t, be.Write(t.Context(), sidxKey("p"), encodeSeriesIndex(col)))
+		idx, ok := openPagedIndex(t.Context(), be, "p", count, obs.NewNop().Corruption)
+		require.True(t, ok)
+		if resident {
+			_, err := idx.entries(t.Context())
+			require.NoError(t, err)
+		}
+		id := signal.SeriesID{Hi: probe % uint64(count*2+3)}
+		if count > 0 && probe&1 == 0 {
+			id = signal.SeriesID(col[probe%uint64(count)])
+		}
+		expected, found, err := buildPartIndex(col).lookup(t.Context(), id)
+		require.NoError(t, err)
+		got, actual, err := idx.lookup(t.Context(), id)
+		require.NoError(t, err)
+		require.Equal(t, found, actual)
+		require.Equal(t, expected, got)
+	})
+}

@@ -236,14 +236,22 @@ func (p *pagedIndex) search(entries []byte, id signal.SeriesID) (int, bool) {
 	lo, hi := 0, p.n
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
-
-		switch c := sidxEntryID(entries, mid).Compare(id); {
-		case c < 0:
+		entry := entries[mid*sidxEntryW:]
+		high := binary.BigEndian.Uint64(entry)
+		switch {
+		case high < id.Hi:
 			lo = mid + 1
-		case c > 0:
+		case high > id.Hi:
 			hi = mid
 		default:
-			return mid, true
+			switch low := binary.BigEndian.Uint64(entry[8:]); {
+			case low < id.Lo:
+				lo = mid + 1
+			case low > id.Lo:
+				hi = mid
+			default:
+				return mid, true
+			}
 		}
 	}
 
