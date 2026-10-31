@@ -495,11 +495,18 @@ func (e *Engine) AppendBatch(
 
 	var res AppendResult
 
-	// With a WAL the run is decided into the staged batch, logged, and only then applied, so a failed
-	// log write leaves the head untouched (see [walBatch]); with none, nothing can fail in between.
-	logged := e.cfg.WAL != nil
-	if logged {
+	if e.cfg.WAL != nil {
 		defer e.walB.reset()
+		err := e.mu.WithReaders(func() error {
+			var err error
+			res, err = e.stageWALBatch(ids, ts, values, sf, materialize, limits)
+			return err
+		})
+		if err != nil {
+			return AppendResult{}, err
+		}
+		e.walB.apply(e.head)
+		return res, nil
 	}
 
 	for i := range ids {
@@ -510,25 +517,9 @@ func (e *Engine) AppendBatch(
 			w = sf[i]
 		}
 
-		var out admitOutcome
-		if logged {
-			out = e.walB.admit(e.head, ids[i], ts[i], values[i], w, e.cfg.OOOWindow, limits, mat)
-		} else {
-			out, _, _, _ = e.head.appendByID(ids[i], ts[i], values[i], w, e.cfg.OOOWindow, limits, mat)
-		}
-
+		out, _, _, _ := e.head.appendByID(ids[i], ts[i], values[i], w, e.cfg.OOOWindow, limits, mat)
 		res = res.with(out)
 	}
-
-	if !logged || e.walB.empty() {
-		return res, nil
-	}
-
-	if err := e.flushWALLocked(false); err != nil {
-		return AppendResult{}, err
-	}
-
-	e.walB.apply(e.head)
 
 	return res, nil
 }
@@ -612,6 +603,7 @@ func (e *Engine) Stats() Stats {
 		Series:        int64(e.head.series.Len()),
 		OutOfSpace:    e.space.Exhausted(),
 		HeadBytes:     e.head.inFlightBytes(),
+		HeadSamples:   e.head.bytes / SampleBytes,
 		HeadAge:       e.head.age(),
 		IdentityBytes: e.head.identityBytes(),
 		Parts:         len(e.parts),
@@ -623,10 +615,6 @@ func (e *Engine) Stats() Stats {
 
 		TenureUnestablished: e.tenureUnestablishedLocked(),
 		MaxTime:             e.head.newest,
-	}
-
-	for _, buf := range e.head.samples {
-		s.HeadSamples += int64(len(buf.ts))
 	}
 
 	for i, p := range e.parts {
@@ -741,13 +729,12 @@ type enginePlan struct {
 	engine       *Engine      // for returning pooled decode buffers on release
 	budgetBytes  int64        // decode-memory budget reserved for this query; released on releaseParts
 	budgetScope  *fetch.Scope // the query scope budgetBytes was charged against, if any
-	// partRanges and partBlocks memoize each block-sliced part's matched row runs and the blocks
-	// they span — what the budget estimate must know and what the prefetch then warms. Both are
-	// filled once, serially, by decodeEstimate and only read afterwards (by the prefetch's per-part
-	// goroutines and the scan), so they need no lock; nil maps just mean every reader recomputes.
-	partRanges map[*part][]rowRange
-	partBlocks map[*part][]int
-	start, end int64
+	// Filled serially before prefetch; immutable during prefetch and scan. Positions index the
+	// sorted ids slice and parallel partRanges; nil maps leave lookups to the part index.
+	partRanges    map[*part][]rowRange
+	partPositions map[*part][]uint32
+	partBlocks    map[*part][]int
+	start, end    int64
 	// memActive is the count-shaped plan's replacement for the head/flush/recent batch snapshots:
 	// one existence flag per matched id (any in-memory sample in [start, end]), computed under the
 	// plan lock by scanning the live buffers directly — no per-series sorted copy, no batch maps.
@@ -798,20 +785,43 @@ func (p *enginePlan) rangesFor(ctx context.Context, part *part) ([]rowRange, err
 		return rngs, nil
 	}
 
-	out := make([]rowRange, 0, len(p.ids))
+	out, _, err := p.matchingRanges(ctx, part, false)
+	return out, err
+}
 
-	for _, id := range p.ids {
+func (p *enginePlan) matchingRanges(ctx context.Context, part *part, positions bool) ([]rowRange, []uint32, error) {
+	out := make([]rowRange, 0) // nil means a whole-part decode, not an empty selection.
+	var matched []uint32
+
+	for i, id := range p.ids {
 		rng, ok, err := part.index.lookup(ctx, id)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		if ok {
 			out = append(out, rng)
+			if positions {
+				matched = append(matched, uint32(i))
+			}
 		}
 	}
 
-	return out, nil
+	return out, matched, nil
+}
+
+func (p *enginePlan) lookupRange(ctx context.Context, part *part, id signal.SeriesID) (rowRange, bool, error) {
+	// Callers only ask for ids selected by this plan.
+	if positions, ok := p.partPositions[part]; ok {
+		k, found := slices.BinarySearchFunc(positions, id, func(pos uint32, target signal.SeriesID) int {
+			return p.ids[pos].Compare(target)
+		})
+		if !found {
+			return rowRange{}, false, nil
+		}
+		return p.partRanges[part][k], true, nil
+	}
+	return part.index.lookup(ctx, id)
 }
 
 // blocksFor returns the blocks of pt that the plan's matched series span and that can hold an
@@ -831,7 +841,7 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 	var m sampleMerge
 
 	for _, part := range p.liveParts {
-		rng, ok, err := part.index.lookup(ctx, id)
+		rng, ok, err := p.lookupRange(ctx, part, id)
 		if err != nil {
 			return m, err
 		}
@@ -971,6 +981,7 @@ func (p *enginePlan) decodeEstimate(ctx context.Context, need colNeed) (int64, e
 	var total int64
 
 	ranges := make(map[*part][]rowRange, len(p.liveParts))
+	positions := make(map[*part][]uint32, len(p.liveParts))
 	blocks := make(map[*part][]int, len(p.liveParts))
 
 	for _, pt := range p.liveParts {
@@ -992,13 +1003,18 @@ func (p *enginePlan) decodeEstimate(ctx context.Context, need colNeed) (int64, e
 			continue
 		}
 
-		rngs, err := p.rangesFor(ctx, pt)
+		memoize := uint64(len(p.ids)) <= uint64(^uint32(0))
+		rngs, matchedIDs, err := p.matchingRanges(ctx, pt, memoize)
 		if err != nil {
 			return 0, err
 		}
 
 		blks, matched := windowBlocks(rngs, r.blockRows, pt.rows(), r.granules(ctx), p.start, p.end)
 		ranges[pt], blocks[pt] = rngs, blks
+		if memoize {
+			positions[pt] = matchedIDs
+			total += int64(cap(matchedIDs)) * 4
+		}
 
 		pinned := min(int64(len(blks))*int64(r.blockRows), int64(pt.rows()))
 
@@ -1009,6 +1025,7 @@ func (p *enginePlan) decodeEstimate(ctx context.Context, need colNeed) (int64, e
 	}
 
 	p.partRanges, p.partBlocks = ranges, blocks
+	p.partPositions = positions
 
 	return total, nil
 }
@@ -1824,6 +1841,13 @@ func (e *Engine) prefetch(ctx context.Context, plan *enginePlan) {
 	var todo []*part
 
 	for _, pt := range plan.liveParts {
+		if ranges, ok := plan.partRanges[pt]; ok {
+			if len(ranges) > 0 {
+				todo = append(todo, pt)
+			}
+			continue
+		}
+
 		// Best-effort membership probe: an index read error here includes the part anyway — the
 		// warm/decode below (and ultimately the merge) surfaces any real failure.
 		touched := false

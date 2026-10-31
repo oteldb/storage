@@ -37,7 +37,11 @@ func TestCountBlockAdmission(t *testing.T) {
 					req := fetch.Request{Start: window.start, End: window.end}
 					ids, plan, err := e.planCount(t.Context(), req, false)
 					require.NoError(t, err)
-					require.Equal(t, window.bytes, plan.budgetBytes, "count reserves timestamp blocks without result-copy space")
+					var lookupBytes int64
+					for _, positions := range plan.partPositions {
+						lookupBytes += int64(cap(positions)) * 4
+					}
+					require.Equal(t, window.bytes+lookupBytes, plan.budgetBytes, "count reserves timestamp blocks and lookup metadata without result-copy space")
 					got, err := plan.activeFlags(t.Context(), ids, e)
 					require.NoError(t, err)
 					require.Equal(t, []bool{true}, got)

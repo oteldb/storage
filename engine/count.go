@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"slices"
 
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -88,6 +89,9 @@ func (e *Engine) CountBy(ctx context.Context, r fetch.Request, label []byte) (ma
 // releaseParts, unless it returned an error (the plan is released here).
 func (e *Engine) planCount(ctx context.Context, r fetch.Request, withIdentity bool) ([]signal.SeriesID, *enginePlan, error) {
 	ids, plan := e.planLookup(r, withIdentity)
+	if !slices.Contains(plan.memActive, false) {
+		return ids, plan, nil
+	}
 	plan.prepareCountReaders()
 
 	// Count decodes timestamps only (existence), and only for window-edge parts; reserve that.
@@ -171,6 +175,9 @@ func (p *enginePlan) activeFlags(ctx context.Context, ids []signal.SeriesID, e *
 	// pruned or fully covered, collapsing decode to at most the two window-edge parts — and even
 	// those decode no values.
 	for _, part := range p.liveParts {
+		if !slices.Contains(active, false) {
+			break
+		}
 		if part.minTime >= p.start && part.maxTime <= p.end {
 			if err := part.index.intersectMark(ctx, ids, active); err != nil {
 				return nil, err
@@ -204,7 +211,7 @@ func (p *enginePlan) markEdgePart(ctx context.Context, e *Engine, part *part, id
 			continue
 		}
 
-		rng, ok, err := part.index.lookup(ctx, id)
+		rng, ok, err := p.lookupRange(ctx, part, id)
 		if err != nil {
 			return err
 		}

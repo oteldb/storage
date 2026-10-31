@@ -13,7 +13,7 @@ lazy postings sorting takes only state exclusion. None of these locks is reentra
 
 | operation | ordering |
 |---|---|
-| append | bounded private grouping before writer ownership; decide under state; metrics encoding and WAL I/O admit readers; apply after success |
+| append | bounded private grouping before writer ownership; metrics staged admission, encoding and WAL I/O admit readers; apply after success |
 | flush detach | seal WAL and detach under one writer barrier; frozen buffers remain readable |
 | identity capture | dense detached maps scan immutable arenas off-lock; sparse/ordered callers resolve at most 256 references per read-lock section |
 | part build | immutable inputs off state; one flush slot and one merge slot when budgeted |
@@ -125,9 +125,14 @@ shared across sequential series records; vectors above 4,096 entries are discard
 This keeps post-flush relogging independent of the batch's distinct-series count. Encoded frames
 own their bytes, while newly registered identities retain their separate input until publication.
 Input remains borrowed until synchronous return. Preparation neither snapshots nor mutates the
-head; admission, WAL encoding/I/O and head publication still share writer ordering.
+head; admission, WAL encoding/I/O and head publication still share writer ordering. Staged
+admission reads head state while retaining writer ownership, so readers proceed; query-only
+sorting changes postings without touching the admission maps. No-WAL appends remain exclusive.
 The prepared admission loop mirrors the serial path and is pinned by differential fuzzing;
 keeping separate loops avoids per-point preparation dispatch in uncontended writes.
+
+`Stats.HeadSamples` derives from active sample-byte accounting, so polling never enumerates
+millions of buffered series while holding the read lock. Frozen samples retain separate accounting.
 
 **A logged write decides, logs, then applies.** With a WAL, `Append` and `AppendBatch` —
 and `ApplyPrimary` always — stage every sample in `walBatch` — admitted exactly as `appendByID` would admit it had
@@ -1400,6 +1405,11 @@ without enlarging the resident set. Cache-off, or constant/unblocked columns, de
 series-skipped to the blocks the matched row ranges touch. With the cache on a fetch also prefetches
 the parts it will touch.
 
+When a decode budget is configured, planning retains each block-sliced part's positive row ranges
+with their positions in the plan's sorted selected IDs. Prefetch and scanning share that immutable
+query-local result, including absent IDs, rather than repeating the on-disk index searches. Position
+array capacity is charged to the decode reservation; parts without a memo use their ordinary index.
+
 Every part decode enters through one seam (`Engine.decodeOf`), which owns the whole-part convention:
 `nil` row ranges mean *decode the whole part* and resolve to a whole-column decode there, above both
 the cached and uncached implementations. A block-selecting implementation must never see `nil` — it
@@ -1465,6 +1475,11 @@ at a time", so the wait is bounded twice and a missing scope costs latency and m
   query. `used == 0` still admits unconditionally.
 
 ## Count and series enumeration
+
+An existence plan stops once every selected ID is proven present. When its in-memory flags already
+cover the selection, Count and CountBy skip part-reader setup and decode admission entirely; a
+part scan stops as soon as it completes the proof. Continuing after that point cannot change the
+answer and needlessly loads older indexes into the backend cache.
 
 `Count`/`CountBy`/`Series` share one **existence plan**: matched ids from the head index, which
 outlives a flush, and in-window existence from the live buffers. No batch, no value column, no label
