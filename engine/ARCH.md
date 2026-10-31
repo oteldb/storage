@@ -133,6 +133,22 @@ bucket index (part list + time bounds)      ← written last: the commit point
 
 Merge writes the same shape, committing the new part set before deleting sources.
 
+The metric flush builder counts rows before allocating its final columns. Ordered detached
+buffers are copied directly into those owned arrays, avoiding a temporary timestamp/value pair
+per series and repeated column growth. Unordered buffers retain the existing sorting path;
+inputs remain immutable so concurrent reads and rollback keep their original buffers. The
+scale-factor column is allocated once only when an actual non-unit weight occurs. This removes
+intermediate copies; the complete flat output and the detached generation still coexist.
+
+`BenchmarkBuildFlushColumns/short-ordered` lays out 65,536 series with eight points each.
+Six 200 ms single-CPU samples against db64b23 on Linux/amd64, Ryzen 9950X3D2,
+Go 1.27.3 (`nodwarf5`) take 8.205 instead of 17.888 ms (-54.1%), allocate 17.00
+instead of 91.87 MiB (-81.5%), and make 5 instead of 131,180 allocations; all p=0.002.
+Single-point, long ordered, weighted and unordered fixtures preserve the same layout;
+the unordered path still allocates sorting scratch. These are builder measurements,
+not end-to-end ingest capacity. Samples and benchstat are in the
+[benchmark report](https://github.com/oteldb/oteldb/blob/claude/1106-node-exporter-scale-benchmark/dev/local/scale-bench/FLUSH_COPY_RESULTS.md).
+
 ### Identity is part-scoped
 
 Each part carries its own series' identities, written and deleted with its other objects. Three
