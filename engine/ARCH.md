@@ -119,7 +119,9 @@ Numeric columns use bounded contiguous scratch instead of growing a slice for ea
 Eight preparation slots are shared across engines; saturation, overflow, small/oversized batches
 and ephemeral writes use the engine-owned staging path. There is no preparation wait queue.
 Scratch returns after writer release; borrowed identities, buffers and decoded attribute values
-are cleared. Cached frames above 4 MiB and attribute scratch beyond 4,096 entries are discarded.
+are cleared. Cached frames above 4 MiB and attribute scratch beyond 65,536 entries per slot are
+discarded. The attribute budget covers every cached accumulator, including truncated tails after
+a smaller batch. It supports ordinary multi-attribute identities when a flush requires WAL relogging.
 Input remains borrowed until synchronous return. Preparation neither snapshots nor mutates the
 head; admission, WAL encoding/I/O and head publication still share writer ordering.
 The prepared admission loop mirrors the serial path and is pinned by differential fuzzing;

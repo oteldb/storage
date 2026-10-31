@@ -132,6 +132,41 @@ func TestPreparedBatchReleasesReferences(t *testing.T) {
 	pool.release(p)
 }
 
+func TestPreparedBatchAttributeCacheBound(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		shrink bool
+	}{
+		{name: "full batch"},
+		{name: "smaller batch", shrink: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pool := newBatchPreparations()
+			p := pool.acquire()
+			p.batch.accs = make([]walSeriesAcc, 4)
+			for i := range p.batch.accs {
+				p.batch.accs[i].attrs = make(signal.Attributes, maxPreparedAttributes/2)
+				p.batch.accs[i].attrs[0] = signal.KeyValue{Key: []byte("borrowed"), Value: signal.StringValue([]byte("value"))}
+			}
+			if tc.shrink {
+				p.batch.accs = p.batch.accs[:1]
+			}
+			pool.release(p)
+			total := 0
+			for _, acc := range p.batch.accs[:cap(p.batch.accs)] {
+				total += cap(acc.attrs)
+				if cap(acc.attrs) > 0 {
+					require.Equal(t, signal.KeyValue{}, acc.attrs[:cap(acc.attrs)][0])
+				}
+			}
+			assert.LessOrEqual(t, total, maxPreparedAttributes)
+			assert.Positive(t, total, "bounded owned scratch remains reusable")
+		})
+	}
+}
+
 func TestPreparationDuringBlockedWriter(t *testing.T) {
 	t.Parallel()
 	e, _ := newFaultWALEngine(t, 0)
