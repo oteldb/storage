@@ -23,6 +23,15 @@ func (m *Mutex) LockWriter() {
 	m.state.Lock()
 }
 
+// TryLockWriter acquires writer and state ownership if no other writer owns it; it may wait for readers.
+func (m *Mutex) TryLockWriter() bool {
+	if !m.writer.TryLock() {
+		return false
+	}
+	m.state.Lock()
+	return true
+}
+
 // Unlock releases state, writer, and catalog ownership.
 func (m *Mutex) Unlock() {
 	m.UnlockWriter()

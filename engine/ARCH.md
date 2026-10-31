@@ -13,7 +13,7 @@ lazy postings sorting takes only state exclusion. None of these locks is reentra
 
 | operation | ordering |
 |---|---|
-| append | decide under state; metrics encoding and WAL I/O admit readers; apply after success |
+| append | bounded private grouping before writer ownership; decide under state; metrics encoding and WAL I/O admit readers; apply after success |
 | flush detach | seal WAL and detach under one writer barrier; frozen buffers remain readable |
 | identity capture | dense detached maps scan immutable arenas off-lock; sparse/ordered callers resolve at most 256 references per read-lock section |
 | part build | immutable inputs off state; one flush slot and one merge slot when budgeted |
@@ -108,8 +108,22 @@ ones sharing the head, and a first sample is never late. Watermarks outlive a fl
 and re-appends do not re-index.
 
 **`AppendBatch`** takes a precomputed `SeriesID`, columns, and a `materialize` callback used only on
-first sight, under one lock. `appendByID` does one map probe: a present buffer means the series is
+first sight. `appendByID` does one map probe: a present buffer means the series is
 known, so no `signal.Series` is built or hashed. WAL frames group by series, one write a batch.
+
+Contended durable batches of 1,024–4,096 points without active overflow routing group IDs and reserve
+private numeric staging before writer ownership. Uncontended writes keep engine-owned scratch.
+Admission visits the original input order through
+precomputed group positions, preserving OOO, byte/cardinality limits and lazy callback order.
+Numeric columns use bounded contiguous scratch instead of growing a slice for each series.
+Eight preparation slots are shared across engines; saturation, overflow, small/oversized batches
+and ephemeral writes use the engine-owned staging path. There is no preparation wait queue.
+Scratch returns after writer release; borrowed identities, buffers and decoded attribute values
+are cleared. Cached frames above 4 MiB and attribute scratch beyond 4,096 entries are discarded.
+Input remains borrowed until synchronous return. Preparation neither snapshots nor mutates the
+head; admission, WAL encoding/I/O and head publication still share writer ordering.
+The prepared admission loop mirrors the serial path and is pinned by differential fuzzing;
+keeping separate loops avoids per-point preparation dispatch in uncontended writes.
 
 **A logged write decides, logs, then applies.** With a WAL, `Append` and `AppendBatch` —
 and `ApplyPrimary` always — stage every sample in `walBatch` — admitted exactly as `appendByID` would admit it had

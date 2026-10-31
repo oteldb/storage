@@ -190,15 +190,19 @@ func (b *walBatch) add(k int, ts int64, value, sf float64) {
 func (b *walBatch) empty() bool { return len(b.order) == 0 }
 
 func (e *Engine) flushWALLocked(everySeries bool) error {
-	view := e.walB.encodingView(e.head, everySeries)
+	return e.flushBatchWALLocked(e.walB, everySeries)
+}
+
+func (e *Engine) flushBatchWALLocked(b *walBatch, everySeries bool) error {
+	view := b.encodingView(e.head, everySeries)
 	return e.mu.WithReaders(func() error {
-		if err := e.walB.encode(view, everySeries); err != nil {
+		if err := b.encode(view, everySeries); err != nil {
 			return err
 		}
 		if e.cfg.WAL == nil {
 			return nil
 		}
-		return e.cfg.WAL.WriteFrames(e.walB.frames.Bytes())
+		return e.cfg.WAL.WriteFrames(b.frames.Bytes())
 	})
 }
 
