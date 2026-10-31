@@ -455,8 +455,9 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 // projection layer, on a reused buffer). ids[i], ts[i], values[i] describe sample i;
 // materialize(i) returns sample i's full identity and is called only when its series is new
 // (first sight), so a repeat series costs just a map probe and a buffer append, with no
-// per-point [signal.Series] construction or hashing. The whole run is appended under a single
-// lock. limits caps cardinality and in-flight memory (0 fields ⇒ unlimited). It returns an
+// per-point [signal.Series] construction or hashing. Preparation can overlap other writers;
+// admission, logging and publication remain ordered. limits caps cardinality and in-flight memory
+// (0 fields ⇒ unlimited). It returns an
 // [AppendResult] breaking accepted/rejected down by reason, so the caller can report an exact
 // OTLP partial-success. sf carries each sample's lossy-sampling weight (nil ⇒ every weight is 1);
 // it is non-nil only when the caller's admission layer sampled the batch. Safe for concurrent use.
@@ -467,7 +468,18 @@ func (e *Engine) AppendBatch(
 		return AppendResult{}, err
 	}
 
-	e.mu.LockWriter()
+	eligible := e.cfg.WAL != nil && (limits.Overflow == nil || limits.MaxSeriesSoft <= 0) &&
+		len(ids) >= minPreparedBatchSamples && len(ids) <= maxPreparedBatchSamples
+	if !eligible || !e.mu.TryLockWriter() {
+		if eligible {
+			if p := metricBatchPreparations.acquire(); p != nil {
+				defer metricBatchPreparations.release(p)
+				p.prepare(ids)
+				return e.appendPrepared(ids, ts, values, sf, materialize, limits, p)
+			}
+		}
+		e.mu.LockWriter()
+	}
 	defer e.mu.UnlockWriter()
 
 	// One closure for the whole run (not one per point): bi selects the current sample for
