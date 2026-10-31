@@ -29,6 +29,16 @@ vectors; it remains valid until the input metrics are changed or released. `Stor
 copies projected vectors into bounded, tenant-contiguous engine batches and uses `Source` for lazy
 identity materialization. It preserves input order and leaves existing large metric batches intact.
 
+`Source` also carries an optional shared `Materializer` pointer plus an integer group coordinate. A projected
+producer computes canonical IDs before constructing native point attributes; registry misses and
+soft overflow request the full `Identity` lazily. Native sources keep direct pointers without
+per-metric interface boxing or closures; `Source` remains comparable. `Batch.SetSource` supplies routing context; `Identity`,
+`Series` and `Sample` retain their semantics, with optional start timestamps and no exemplars.
+Sources outlive reused column batches and stay valid until the enclosing storage write returns.
+Materialized misses remain independent and immutable through WAL encode/apply, even when several
+misses occur in one append. Known identities that need WAL relogging come from the existing registry.
+
+
 **The series id is computed without allocating or sorting**: the resource‖scope hash pre-image is
 built once per scope group and kept resident at the front of a reused buffer; the reserved labels
 once per metric in sorted-key order; per point only the point's already-sorted attributes are
@@ -214,6 +224,18 @@ So all three reuse the engine, merge, downsample and fetch paths with **no histo
 storage code**. Number-point exemplars convert; exemplars on the decomposed types are dropped and
 counted, since no single decomposed series owns them (see `exemplar` above). Conversion necessarily allocates (pdata holds Go strings), which is why it sits
 off the hot path — embedders owning their OTLP decoder build the internal batch directly.
+
+`MetricsProjector` is an optional gauge/sum producer for `Storage.WriteProjectedMetrics`. `Prepare`
+checks the entire request first; decomposed metric types or any exemplars require whole-request
+fallback. Resource/scope context is converted once per group for arbitrary tenant callbacks.
+Point attributes are hashed directly from pdata, sorting reusable references and writing canonical
+typed bytes into scratch. Reserved-label ties preserve point attributes before metric metadata.
+Only lazy misses allocate native attribute payloads; there is no additional identity cache and no
+persisted local reference. Fresh canonical IDs let registry reset/recovery use the current request.
+`Reset` releases all borrowed pdata/context references after the write; a projector is not shared
+between simultaneous requests. Cleared scratch backing arrays exceeding 4 MiB per projector are
+discarded on reset; active input admission remains the embedder's responsibility. Decoder construction and source request lifetime remain the embedder's.
+
 
 **A log record's event time falls back to its observed time.** `time_unix_nano` is optional in OTLP
 — a receiver tailing files or journald with no timestamp parser leaves it unset — and the record's

@@ -53,3 +53,14 @@ func TestSourceSurvivesProjectionReuse(t *testing.T) {
 		}
 	}
 }
+
+func TestSourceComparable(t *testing.T) {
+	t.Parallel()
+	sources := map[Source]bool{{}: true}
+	require.True(t, sources[Source{}])
+	resolver := NewMaterializer(func(_, _ int) Identity { return Identity{Kind: KindSum} })
+	source := NewSource(resolver, 1)
+	sources[source] = true
+	require.True(t, sources[NewSource(resolver, 1)])
+	require.False(t, sources[NewSource(resolver, 2)])
+}
