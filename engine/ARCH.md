@@ -135,11 +135,13 @@ it does not parallelize writers or change WAL batching/durability.
 `BenchmarkAppendWALRegistry` cycles 4,096-point warm appends through 65,536 or 1,048,576
 registered series on a file-backed WAL, with eight parallel callers, GOMAXPROCS=8, and no
 per-append fsync. Six 100ms samples on Ryzen 9950X3D2, Go 1.27.3 (`nodwarf5`), measure
-649→482 µs / 763→466 µs at 65k series (OOO disabled/enabled) and 1321→970 µs /
-1361→964 µs at 1M (-26% to -39%, all p=0.002). The cached accumulator grows from 288 to
+649→471 µs / 763→474 µs at 65k series (OOO disabled/enabled) and 1321→966 µs /
+1361→971 µs at 1M (-27% to -38%, all p=0.002). The cached accumulator grows from 288 to
 312 bytes on amd64. Input construction and registration are untimed; repeated timestamps
 and growing sample buffers are deliberate. These isolate WAL append work, not receiver,
 flush, query latency or sustainable server capacity; allocation totals vary with buffer growth.
+The 1 GiB segment target avoids timed rotation. [Method and samples](../docs/benchmarks/wal-staging/README.md)
+include the final reader-admitted encoding path.
 
 ## Flush
 
