@@ -113,16 +113,16 @@ func TestPreparedBatchReleasesReferences(t *testing.T) {
 	_, err := e.appendPrepared([]signal.SeriesID{s.Hash()}, []int64{1}, []float64{1}, nil,
 		func(int) signal.Series { return s }, AppendLimits{}, p)
 	require.NoError(t, err)
-	p.batch.accs[0].attrs = slices.Clone(s.Attributes)
+	p.batch.attrs = slices.Clone(s.Attributes)
 	p.batch.frames.Grow(maxPreparedFrameBytes + 1)
 	pool.release(p)
 	assert.Zero(t, p.batch.frames.Cap())
 	for _, a := range p.batch.accs {
 		assert.Equal(t, signal.Series{}, a.series)
 		assert.Nil(t, a.buffer)
-		for _, attr := range a.attrs[:cap(a.attrs)] {
-			assert.Equal(t, signal.KeyValue{}, attr)
-		}
+	}
+	for _, attr := range p.batch.attrs[:cap(p.batch.attrs)] {
+		assert.Equal(t, signal.KeyValue{}, attr)
 	}
 	p = pool.acquire()
 	p.prepare([]signal.SeriesID{s.Hash()})
@@ -132,7 +132,7 @@ func TestPreparedBatchReleasesReferences(t *testing.T) {
 	pool.release(p)
 }
 
-func TestPreparedBatchAttributeCacheBound(t *testing.T) {
+func TestPreparedBatchDropsHiddenReferences(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name   string
@@ -147,22 +147,17 @@ func TestPreparedBatchAttributeCacheBound(t *testing.T) {
 			p := pool.acquire()
 			p.batch.accs = make([]walSeriesAcc, 4)
 			for i := range p.batch.accs {
-				p.batch.accs[i].attrs = make(signal.Attributes, maxPreparedAttributes/2)
-				p.batch.accs[i].attrs[0] = signal.KeyValue{Key: []byte("borrowed"), Value: signal.StringValue([]byte("value"))}
+				p.batch.accs[i].series = stagedTestSeries("borrowed")
+				p.batch.accs[i].buffer = &sampleBuf{}
 			}
 			if tc.shrink {
 				p.batch.accs = p.batch.accs[:1]
 			}
 			pool.release(p)
-			total := 0
 			for _, acc := range p.batch.accs[:cap(p.batch.accs)] {
-				total += cap(acc.attrs)
-				if cap(acc.attrs) > 0 {
-					require.Equal(t, signal.KeyValue{}, acc.attrs[:cap(acc.attrs)][0])
-				}
+				assert.Equal(t, signal.Series{}, acc.series)
+				assert.Nil(t, acc.buffer)
 			}
-			assert.LessOrEqual(t, total, maxPreparedAttributes)
-			assert.Positive(t, total, "bounded owned scratch remains reusable")
 		})
 	}
 }

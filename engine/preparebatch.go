@@ -12,7 +12,6 @@ const (
 	maxPreparedBatchSamples = 4096
 	maxPreparedBatches      = 8
 	maxPreparedFrameBytes   = 4 << 20
-	maxPreparedAttributes   = 16 * maxPreparedBatchSamples
 )
 
 var metricBatchPreparations = newBatchPreparations()
@@ -53,18 +52,7 @@ func (p *batchPreparations) release(b *preparedBatch) {
 		b.batch.fw = wal.NewWriter(&b.batch.frames)
 	}
 	b.batch.frames.Reset()
-	remainingAttrs := maxPreparedAttributes
-	accs := b.batch.accs[:cap(b.batch.accs)]
-	for i := range accs {
-		a := &accs[i]
-		clear(a.attrs)
-		attrs := a.attrs[:0]
-		if cap(attrs) > remainingAttrs {
-			attrs = nil
-		}
-		remainingAttrs -= cap(attrs)
-		*a = walSeriesAcc{attrs: attrs}
-	}
+	clear(b.batch.accs[:cap(b.batch.accs)])
 	p.free <- b
 	<-p.active
 }
@@ -200,7 +188,6 @@ func (p *preparedBatch) admit(
 	acc.ts = p.ts[g.offset:g.offset:end]
 	acc.values = p.values[g.offset:g.offset:end]
 	acc.sf = p.sf[g.offset:g.offset:end]
-	acc.attrs = b.accs[k].attrs
 	b.accs[k] = acc
 	if acc.register {
 		b.registered++
