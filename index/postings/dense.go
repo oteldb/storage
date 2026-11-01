@@ -15,6 +15,10 @@ func fromDenseSlice(ids []uint32) Postings {
 	if len(ids) == 0 {
 		return Empty()
 	}
+	// Lists are sorted and unique before iterator construction.
+	if uint64(ids[len(ids)-1])-uint64(ids[0])+1 == uint64(len(ids)) {
+		return &denseRangePostings{first: ids[0], n: len(ids), i: -1}
+	}
 	return &densePostings{ids: ids, i: -1}
 }
 

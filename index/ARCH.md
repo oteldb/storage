@@ -39,7 +39,10 @@ The inverted index is keyed on interned name/typed-value symbols. `MemPostings` 
 128-bit IDs; `Dense` stores four-byte local ordinals. The metrics engine resolves its local ordinals
 back to canonical hashes before accessing parts. Local ordinals never appear in durable data or RPCs.
 
-- Lazy set-op iterators (`Intersect`/`Merge`/`Without`, galloping `Seek`), property-tested against
+Sorted, unique local-ordinal lists that span a contiguous interval use arithmetic iterators with
+constant-time seeks. Gapped lists retain the array iterator and binary-search seek.
+
+- Lazy set-op iterators (`Intersect`/`Merge`/`Without`, monotone `Seek`), property-tested against
   a naive reference. `Merge` is a binary-min-heap k-way union (O(N·log k)), so a high-cardinality
   matcher resolving across thousands of value buckets stays fast.
 - Matching is **callback-based**: `Select(nameID, func(valueID) bool)` hands the predicate a
