@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"slices"
 
 	"github.com/go-faster/errors"
 
@@ -10,9 +9,16 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-const indexPageEntries = 1024
+const (
+	indexPageEntries       = 1024
+	sparseIndexPageEntries = 256
+)
 
 func (p *pagedIndex) lookup(ctx context.Context, id signal.SeriesID) (rowRange, bool, error) {
+	return p.lookupPage(ctx, id, indexPageEntries)
+}
+
+func (p *pagedIndex) lookupPage(ctx context.Context, id signal.SeriesID, pageEntries int) (rowRange, bool, error) {
 	if view := p.view.Load(); view != nil {
 		k, ok := p.search(*view, id)
 		if !ok {
@@ -35,15 +41,11 @@ func (p *pagedIndex) lookup(ctx context.Context, id signal.SeriesID) (rowRange, 
 		return p.rangeAt(entries, k), true, nil
 	}
 
-	page, equal := slices.BinarySearchFunc(p.fences, id, signal.SeriesID.Compare)
-	if !equal {
-		page--
-	}
-	if page < 0 {
+	start := p.pageStart(id, pageEntries)
+	if start < 0 {
 		return rowRange{}, false, nil
 	}
-	start := page * indexPageEntries
-	n := min(indexPageEntries, p.n-start)
+	n := min(pageEntries, p.n-start)
 	// One extra entry supplies the last run's end when the page is not the final one.
 	readN := min(n+1, p.n-start)
 	data, err := backend.ReadPageView(ctx, p.be, p.key, p.offset+int64(start*sidxEntryW), int64(readN*sidxEntryW))
@@ -63,4 +65,26 @@ func (p *pagedIndex) lookup(ctx context.Context, id signal.SeriesID) (rowRange, 
 		end = sidxEntryStart(data, k+1)
 	}
 	return rowRange{start: sidxEntryStart(data, k), end: end}, true, nil
+}
+
+func (p *pagedIndex) pageStart(id signal.SeriesID, pageEntries int) int {
+	const coarseStride = indexPageEntries / sparseIndexPageEntries
+	stride, pages := 1, len(p.fences)
+	if pageEntries == indexPageEntries {
+		stride = coarseStride
+		pages = (pages + coarseStride - 1) / coarseStride
+	}
+	lo, hi := 0, pages
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if p.fences[mid*stride].Compare(id) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == pages || p.fences[lo*stride] != id {
+		lo--
+	}
+	return lo * pageEntries
 }

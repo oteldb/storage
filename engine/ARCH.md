@@ -1428,11 +1428,17 @@ Layered optimizations, each opt-in:
 
 **Series index sidecar** (`{prefix}/sidx`) — sorted distinct SeriesIDs and run-start rows.
 Sparse candidate sets use binary searches; dense sets use linear intersection. Large indexes
-retain one fence ID per 1,024 entries and read the selected 20-KiB leaf pages through the backend's
-shared byte-bounded page cache. A page includes the next entry to bound a run crossing its end.
+retain one fence ID per 256 entries. Default and dense lookups read 1,024-entry (20-KiB) pages;
+memoized plans with fewer than `part series / 1,024` candidates read 256-entry (5-KiB) pages.
+The choice is per call; coarse searches inspect every fourth fence. A page includes the next
+entry to bound a run crossing its end. Pages share the backend's byte-bounded cache.
 Full CRC validation occurs at open using an uncached read on durable range-capable backends.
 Large paged indexes then retain only fences: the first lookup reads its selected leaf page.
 Opening a write-only part pins neither the full validation view nor a whole-object cache entry.
+
+Fine-page plans memoize both matching and missing IDs, so collection needs no second index read.
+Fine and coarse cache keys can overlap and remain resident together; both consume the same byte
+budget, and a cached coarse page does not automatically satisfy a fine-page request.
 
 A missing or corrupt sidecar rebuilds the resident index from the series column. Backends without
 native ranged reads retain the whole-object path. The serialized sidecar format is unchanged.

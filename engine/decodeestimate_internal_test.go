@@ -148,8 +148,10 @@ func TestPlannedRangesAvoidRepeatedIndexReads(t *testing.T) {
 	pt := &part{index: partIndex{paged: idx}}
 	plan := &enginePlan{ids: []signal.SeriesID{{Lo: 2}, {Lo: 3}, {Lo: 4}}, liveParts: []*part{pt},
 		blockReaders: map[*part]*seriesBlockReader{pt: {part: pt, blockRows: 32}}}
+	counter.Reset()
 	_, err := plan.decodeEstimate(t.Context(), colNeed{values: true})
 	require.NoError(t, err)
+	require.EqualValues(t, len(plan.ids)*(sparseIndexPageEntries+1)*sidxEntryW, counter.Bytes())
 	require.Equal(t, []uint32{0, 2}, plan.partPositions[pt])
 	counter.Reset()
 	for _, id := range plan.ids {

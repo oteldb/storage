@@ -29,7 +29,7 @@ func TestSeriesIndexPageReads(t *testing.T) {
 	cached := backend.Cached(count, 64<<10)
 	paged, ok := openPagedIndex(ctx, cached, "p", n, obs.NewNop().Corruption)
 	require.True(t, ok)
-	require.Len(t, paged.fences, 8)
+	require.Len(t, paged.fences, n/sparseIndexPageEntries)
 	assert.Nil(t, paged.view.Load(), "opening a paged index must not pin the validation buffer")
 	count.Reset()
 	idx := partIndex{paged: paged}
@@ -77,7 +77,7 @@ func TestPagedIndexDoesNotRetainValidationBuffer(t *testing.T) {
 			}
 			index, ok := openPagedIndex(t.Context(), be, "p", n, obs.NewNop().Corruption)
 			require.True(t, ok)
-			require.Len(t, index.fences, 4)
+			require.Len(t, index.fences, n/sparseIndexPageEntries)
 			require.Nil(t, index.view.Load(), "no first query is required to release whole-index bytes")
 			if cached {
 				stats := be.(interface{ Stats() backend.CacheStats }).Stats()
@@ -150,7 +150,7 @@ func TestPagedLookupMatchesResidentRanges(t *testing.T) {
 			counter := backendtest.NewByteCounter(be)
 			idx, ok := openPagedIndex(t.Context(), backend.Cached(counter, 256<<10), "p", len(col), obs.NewNop().Corruption)
 			require.True(t, ok)
-			require.Len(t, idx.fences, 4)
+			require.Len(t, idx.fences, (count+sparseIndexPageEntries-1)/sparseIndexPageEntries)
 			if resident {
 				_, err := idx.entries(t.Context())
 				require.NoError(t, err)
@@ -204,7 +204,11 @@ func FuzzPagedIndexLookup(f *testing.F) {
 		}
 		expected, found, err := buildPartIndex(col).lookup(t.Context(), id)
 		require.NoError(t, err)
-		got, actual, err := idx.lookup(t.Context(), id)
+		pageEntries := indexPageEntries
+		if probe&2 != 0 {
+			pageEntries = sparseIndexPageEntries
+		}
+		got, actual, err := idx.lookupPage(t.Context(), id, pageEntries)
 		require.NoError(t, err)
 		require.Equal(t, found, actual)
 		require.Equal(t, expected, got)

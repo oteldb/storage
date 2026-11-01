@@ -333,9 +333,9 @@ func openPagedIndex(
 	if n >= indexPageEntries*2 && backend.RangesNatively(ctx, b, p.key) {
 		p.keep = false
 		p.offset = int64(len(data) - 4 - len(ents))
-		p.fences = make([]signal.SeriesID, (n+indexPageEntries-1)/indexPageEntries)
+		p.fences = make([]signal.SeriesID, (n+sparseIndexPageEntries-1)/sparseIndexPageEntries)
 		for i := range p.fences {
-			p.fences[i] = sidxEntryID(ents, i*indexPageEntries)
+			p.fences[i] = sidxEntryID(ents, i*sparseIndexPageEntries)
 		}
 	}
 	if len(p.fences) == 0 {

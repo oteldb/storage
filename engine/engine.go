@@ -795,9 +795,14 @@ func (p *enginePlan) matchingRanges(ctx context.Context, part *part, positions b
 	var matched []uint32
 
 	first, end := part.index.selectedIDRange(p.ids)
+	pageEntries := indexPageEntries
+	if idx := part.index.paged; positions && idx != nil && end-first < idx.n/indexPageEntries {
+		// Only memoized sparse plans use fine pages; collection reuses positive and negative results.
+		pageEntries = sparseIndexPageEntries
+	}
 	for i := first; i < end; i++ {
 		id := p.ids[i]
-		rng, ok, err := part.index.lookup(ctx, id)
+		rng, ok, err := part.index.lookupPage(ctx, id, pageEntries)
 		if err != nil {
 			return nil, nil, err
 		}
