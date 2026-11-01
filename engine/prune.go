@@ -75,6 +75,14 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 	if e.cfg.Backend == nil {
 		return 0, nil // head-only: nothing is flushed, so no identity can have outlived its data
 	}
+	if !opts.Force {
+		e.mu.RLock()
+		skip := !e.identityDirty || e.head.series.Len() < pruneMinIdentities
+		e.mu.RUnlock()
+		if skip {
+			return 0, nil
+		}
+	}
 
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
