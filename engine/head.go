@@ -25,11 +25,12 @@ var (
 // plus per-series sample buffers in arrival order (sorted on read). It is not safe for
 // concurrent use; the [Engine] holds the lock.
 type head struct {
-	sym     *symbols.Table
-	series  *series.Index
-	post    *postings.Dense
-	samples map[signal.SeriesID]*sampleBuf
-	newest  int64 // newest timestamp across every series (reported as Inspect.MaxTime)
+	sym             *symbols.Table
+	series          *series.Index
+	post            *postings.Dense
+	nonStringLabels map[uint32]struct{}
+	samples         map[signal.SeriesID]*sampleBuf
+	newest          int64 // newest timestamp across every series (reported as Inspect.MaxTime)
 
 	// seriesNewest is each series' own newest admitted timestamp: the OOO window is a per-series
 	// lateness bound, not a cross-series one, so a high-rate (or clock-skewed-ahead) series cannot
@@ -111,8 +112,12 @@ func newHead() *head {
 // a size-triggered flush chase a number it cannot lower. Identity is reported on its own
 // ([Stats.IdentityBytes]) because nothing else counts it, and it only grows.
 func (h *head) identityBytes() int64 {
-	return h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
+	n := h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
 		int64(len(h.seriesNewest))*watermarkEntryBytes
+	if h.nonStringLabels != nil {
+		n += memsize.Map(h.nonStringLabels)
+	}
+	return n
 }
 
 // watermarkEntryBytes is one seriesNewest map entry (series id → timestamp).
@@ -188,6 +193,7 @@ func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32)
 	}
 
 	h.sym, h.series, h.post = rebuilt.sym, rebuilt.series, rebuilt.post
+	h.nonStringLabels = rebuilt.nonStringLabels
 }
 
 // register records and indexes an identity known not to be present.
@@ -512,6 +518,12 @@ func (h *head) indexLabels(id signal.SeriesID, s signal.Series) {
 func (h *head) addLabel(id uint32, name []byte, v signal.Value) {
 	nameID := uint32(h.sym.Intern(name))
 	valueID := uint32(h.sym.Intern(signal.AppendValue(nil, v)))
+	if v.Kind() != signal.KindStr {
+		if h.nonStringLabels == nil {
+			h.nonStringLabels = make(map[uint32]struct{})
+		}
+		h.nonStringLabels[nameID] = struct{}{}
+	}
 	h.post.Add(id, nameID, valueID)
 }
 
@@ -522,8 +534,7 @@ func (h *head) indexSorted() bool { return h.post.Sorted() }
 // exclusive lock so that later concurrent [head.resolve] reads never trigger the lazy sort.
 func (h *head) ensureIndexSorted() { h.post.EnsureSorted() }
 
-// resolve returns the SeriesIDs matching all matchers (their intersection), lowering each
-// callback matcher to a postings value scan over the typed value.
+// resolve intersects matchers' postings, seeking string hints when the label's types permit it.
 //
 // A series that does not carry the label at all is offered [signal.EmptyValue], the same contract
 // [fetch.Condition] has per row: the matcher is operator-free, so only the language knows whether
@@ -551,19 +562,23 @@ func (h *head) resolve(matchers []fetch.Matcher) []signal.SeriesID {
 			continue
 		}
 
-		its[i] = h.post.Select(uint32(nameID), func(valueID uint32) bool {
-			raw, ok := h.sym.Get(symbols.ID(valueID))
-			if !ok {
-				return false
-			}
+		if selected, ok := h.stringPostings(uint32(nameID), matchers[i]); ok {
+			its[i] = selected
+		} else {
+			its[i] = h.post.Select(uint32(nameID), func(valueID uint32) bool {
+				raw, ok := h.sym.Get(symbols.ID(valueID))
+				if !ok {
+					return false
+				}
 
-			v, _, err := signal.DecodeValue(raw)
-			if err != nil {
-				return false
-			}
+				v, _, err := signal.DecodeValue(raw)
+				if err != nil {
+					return false
+				}
 
-			return match(v)
-		})
+				return match(v)
+			})
+		}
 
 		if absent {
 			its[i] = postings.Merge(its[i], h.post.WithoutName(uint32(nameID)))

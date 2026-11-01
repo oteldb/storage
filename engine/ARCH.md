@@ -100,6 +100,11 @@ only one frozen generation per engine; no extra flush queue or parallel appender
 
 The index (`symbols`+`series`+`postings`) plus per-series `(ts, value)` buffers.
 
+Exact matcher specs and finite string hints seek symbol IDs and postings directly when a label
+has only string values. A metered set of names with non-string values keeps those labels on the
+full predicate scan, preserving canonical text equality across types. Necessary hints still run
+the original predicate; absent-label unions are unchanged. Identity rebuilds replace the set too.
+
 Metric flushes emit identities in canonical SeriesID order across the whole frozen generation,
 then split that stream by the existing encoding/workspace limits. Parts from one generation have
 non-overlapping ID ranges, except where one oversized series spans several parts. First/last IDs
