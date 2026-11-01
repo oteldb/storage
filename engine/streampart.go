@@ -50,10 +50,11 @@ type partStreamWriter struct {
 	sampled bool
 	ones    []float64 // unit weights an unsampled series contributes to a declared weight column
 
-	rows       int
-	minT, maxT int64
-	haveTime   bool
-	buffered   bool
+	rows        int
+	minT, maxT  int64
+	haveTime    bool
+	buffered    bool
+	mergeFinish *mergeFinishBudget
 }
 
 // newPartStreamWriter starts an output part. comp and precisionBits are fixed for the whole part —
@@ -67,14 +68,14 @@ type partStreamWriter struct {
 // with abort.
 func newPartStreamWriter(
 	ctx context.Context, e *Engine, comp compressProfile, precisionBits uint8, withSF, withStats bool,
-	rollup *block.Rollup,
+	rollup *block.Rollup, extra ...block.PartOption,
 ) (*partStreamWriter, error) {
 	blockRows := e.cfg.MetricBlockRows
 	if blockRows <= 0 {
 		blockRows = DefaultMetricBlockRows
 	}
 
-	opts := partOptions(blockRows, comp, rollup)
+	opts := append(partOptions(blockRows, comp, rollup), extra...)
 	prefix := e.newPartPrefix()
 	w := block.NewStreamWriterTo(ctx, e.cfg.Backend, prefix, opts...)
 
@@ -117,6 +118,7 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 	if len(ts) == 0 {
 		return nil
 	}
+	sameSeries := len(p.runs) > 0 && p.runs[len(p.runs)-1].Value == id
 
 	if err := p.w.AppendU128Run(colSeriesIdx, id, len(ts)); err != nil {
 		return err
@@ -136,7 +138,6 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 		}
 	}
 
-	sameSeries := len(p.runs) > 0 && p.runs[len(p.runs)-1].Value == id
 	if sameSeries {
 		p.runs[len(p.runs)-1].Count += len(ts)
 		p.wmarks[len(p.wmarks)-1].Max = max(p.wmarks[len(p.wmarks)-1].Max, covered)
@@ -237,6 +238,9 @@ func (p *partStreamWriter) weights(sf []float64, n int) []float64 {
 // counterpart of [Engine.writeMergedPart]. At least one series must have been appended: an empty
 // part would mean a burnt part id and an unreadable prefix.
 func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
+	if b := p.mergeFinish; b != nil {
+		return p.finishWithIdentities(ctx, identitySnapshot{view: b.view, refs: b.refs})
+	}
 	return p.finishWithIdentities(ctx, p.identityEntries())
 }
 

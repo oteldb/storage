@@ -87,6 +87,15 @@ or unordered series takes a larger reservation and can run exclusively. Whole-ob
 also seal output parts on a workspace-derived row limit because encoded columns remain resident.
 These estimates are not a hard RSS or allocator bound. Record flushes retain their own estimate.
 
+Metric merge writers also price finishing before sealing an output part: the selected identity
+references at their retained capacity, shared symbol/context encoding workspace, the largest
+reusable attribute materialization, identity body/destination growth, encoded sidecars, reopening
+and the block writer's finish buffers. Identity references are resolved in 256-entry lock sections
+and reused when writing the identity object; there is no tenant-wide reference cache. Flushes keep
+their separate estimator. One merge shares its frame/object compressors across output writers and
+charges their encoder workspace once, independently of each writer's growing state.
+The existing build barrier prevents registry replacement while the references are held.
+
 Frozen metric sample bytes remain in `HeadBytes` and `MaxInFlightBytes` until publication. They are
 existing input, not additional build workspace; the build pool does not reserve those same bytes
 again. Completed output handles grow with the number of output parts until atomic publication.

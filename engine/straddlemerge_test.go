@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/timebucket"
 	"github.com/oteldb/storage/signal"
@@ -140,7 +142,10 @@ func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
 			}
 
 			require.NoError(t, e.Flush(ctx))
-			require.NoError(t, e.Merge(ctx, 0))
+			// Isolate the day-writer share from compression's separately priced encoder workspace.
+			require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Recompress: &engine.RecompressSpec{
+				Before: math.MaxInt64, Algorithm: compress.AlgorithmNone,
+			}}))
 
 			require.Positive(t, limit)
 			assert.LessOrEqual(t, peak, limit+run, "the day writers outgrew the resident share")

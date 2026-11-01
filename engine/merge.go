@@ -607,13 +607,19 @@ func (e *Engine) compactStream(
 
 	scratch := make([]rangeBuf, len(src))
 	comp, precision, withSF := mergeEncoding(src, capBytes, opts, plan.tiers)
+	coders := newMetricMergeCoders(src, comp)
 	budget := e.mergeBudget(capBytes)
 
 	var newParts []*part
 
 	router := timebucket.Router[*partStreamWriter]{
 		Open: func(int64) (*partStreamWriter, error) {
-			return newPartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker)
+			w, err := newPartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker, coders.options()...)
+			if err != nil {
+				return nil, err
+			}
+			w.mergeFinish = &mergeFinishBudget{}
+			return w, nil
 		},
 		Finish: func(w *partStreamWriter) error {
 			p, err := w.finish(ctx)
@@ -625,7 +631,8 @@ func (e *Engine) compactStream(
 
 			return nil
 		},
-		Resident:      (*partStreamWriter).residentBytes,
+		Resident:      (*partStreamWriter).mergeResidentBytes,
+		Held:          coders.workspace,
 		MaxOpen:       timebucket.MaxOpenWriters,
 		ResidentLimit: budget.ResidentBytes,
 	}
@@ -634,8 +641,10 @@ func (e *Engine) compactStream(
 	// but Close must release them rather than strand them.
 	defer router.Drop((*partStreamWriter).abort)
 
-	for keys.Next() {
-		id := keys.Key()
+	var identities mergeIdentityBatch
+	for identities.next(e, &keys) {
+		i := identities.at - 1
+		id, view, ref, found := identities.ids[i], identities.view, identities.refs[i], identities.found[i]
 
 		m, err := mergeStreamedSeries(ctx, src, streams, scratch, id, start)
 		if err != nil {
@@ -650,12 +659,10 @@ func (e *Engine) compactStream(
 		rs := rolledSeries{srcCovered: srcCovered}
 		rs.ts, rs.values, rs.sf, rs.covered = rollSeries(&m, plan.tiers)
 
-		u := idToU128(id)
-
 		err = timebucket.Runs(rs.ts, func(lo, hi int) error {
 			return router.Append(rs.ts[lo], func(w *partStreamWriter) (bool, error) {
 				ts, values, sf, watermark := rs.run(lo, hi)
-				if err := w.appendSeries(u, ts, values, sf, watermark); err != nil {
+				if err := w.appendMergeSeries(view, ref, found, id, ts, values, sf, watermark); err != nil {
 					return false, err
 				}
 
@@ -667,7 +674,7 @@ func (e *Engine) compactStream(
 				// The second bound is the part's resident footprint, which is not a function of
 				// its size on disk: the per-series sidecars grow with distinct series, so a merge
 				// of very short series reaches the memory budget long before the disk cap.
-				return budget.Reached(w.encodedBytes(), w.residentBytes()), nil
+				return budget.Reached(w.encodedBytes(), coders.workspace()+w.mergeResidentBytes()), nil
 			})
 		})
 		if err != nil {
