@@ -349,6 +349,9 @@ type part struct {
 	// the index entry when reconstructed (see engine/index.go).
 	minTime, maxTime int64
 	retentionAt      time.Time
+	countRetained    int64
+	countTransient   int64
+	countBounded     bool
 
 	// blocks and level are the part's identity in block-number space, carried through the bucket
 	// index. They are unset for a part written before that identity existed, which makes it neither
@@ -431,7 +434,7 @@ func openPart(
 
 	rollup, rollupKnown := appliedRollup(r.Manifest().Rollup)
 
-	return &part{
+	p := &part{
 		reader:      r,
 		be:          b,
 		corrupt:     corrupt,
@@ -441,7 +444,19 @@ func openPart(
 		diskBytes:   r.Manifest().DiskBytes,
 		rollup:      rollup,
 		rollupKnown: rollupKnown,
-	}, nil
+	}
+	p.countRetained, p.countTransient, p.countBounded = r.Int64ScanBound(ctx, colTs)
+	if desc, ok := r.ColumnDescByName(colTs); ok && desc.Kind == block.KindInt64 && desc.Const {
+		p.countBounded = true
+	}
+	if !p.countBounded {
+		if desc, ok := r.ColumnDescByName(colTs); ok && desc.Blocked && desc.Framed && !desc.Const {
+			if d, err := r.ColumnBlocks(ctx, colTs); err == nil {
+				p.countRetained, p.countTransient, p.countBounded = d.Int64StreamBound()
+			}
+		}
+	}
+	return p, nil
 }
 
 // seriesStat returns id's precomputed aggregate from the part's stats sidecar, lazily loading it.

@@ -59,9 +59,13 @@ func (e *Engine) CountGrid(ctx context.Context, r fetch.Request, grid fetch.Wind
 		for _, pt := range p.liveParts {
 			p.prepareTimestampReader(pt)
 		}
-		bytes, err := p.decodeEstimate(ctx, colNeed{})
-		if err != nil {
-			return nil, err
+		bytes, bounded := p.countStreamingEstimate()
+		if !bounded {
+			var err error
+			bytes, err = p.decodeEstimate(ctx, colNeed{})
+			if err != nil {
+				return nil, err
+			}
 		}
 		estimate = buildbudget.Add(estimate, bytes)
 	}
@@ -169,6 +173,12 @@ func (p *enginePlan) proveGridSeries(ctx context.Context, id signal.SeriesID, pr
 }
 
 func (p *enginePlan) gridPart(ctx context.Context, pt *part, rng rowRange, presence *gridPresence) error {
+	if desc, ok := pt.reader.ColumnDescByName(colTs); ok && desc.Const {
+		if ts := desc.ConstInt64; ts >= p.start && ts <= p.end {
+			presence.sample(ts)
+		}
+		return nil
+	}
 	if reader := p.blockReaders[pt]; reader != nil {
 		return reader.gridTimestamps(ctx, rng, p.start, p.end, presence)
 	}
@@ -196,6 +206,9 @@ func (p *enginePlan) gridPart(ctx context.Context, pt *part, rng rowRange, prese
 }
 
 func (r *seriesBlockReader) gridTimestamps(ctx context.Context, rng rowRange, start, end int64, presence *gridPresence) error {
+	if r.countStreaming {
+		return r.streamGridTimestamps(ctx, rng, start, end, presence)
+	}
 	granules := r.granules(ctx)
 	for b, last := rng.start/r.blockRows, (rng.end-1)/r.blockRows; b <= last; b++ {
 		if presence.complete() {
