@@ -822,8 +822,15 @@ func (e *Engine) CloseWAL() error {
 	return nil
 }
 
-// SyncWAL fsyncs the engine's WAL, if any (the background WALSyncInterval path). No-op without a WAL.
+// SyncWAL fsyncs written WAL frames (the background WALSyncInterval path). No-op without a WAL.
 func (e *Engine) SyncWAL() error {
+	if e.memoryPublicationEnabled() {
+		e.mu.RLockWriter()
+		defer e.mu.RUnlockWriter()
+		e.walMu.Lock()
+		defer e.walMu.Unlock()
+		return e.cfg.WAL.Sync()
+	}
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
 
