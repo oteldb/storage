@@ -923,14 +923,20 @@ func (p *enginePlan) acquireDecodeBudget(ctx context.Context, r fetch.Request, n
 		return nil
 	}
 
-	scope := r.Scope
-	if scope == nil {
-		scope = fetch.ScopeFrom(ctx)
-	}
-
 	est, err := p.decodeEstimate(ctx, need)
 	if err != nil {
 		return err
+	}
+	return p.reserveDecodeBudget(ctx, r, est)
+}
+
+func (p *enginePlan) reserveDecodeBudget(ctx context.Context, r fetch.Request, est int64) error {
+	if p.engine.budget == nil {
+		return nil
+	}
+	scope := r.Scope
+	if scope == nil {
+		scope = fetch.ScopeFrom(ctx)
 	}
 
 	p.budgetBytes = est

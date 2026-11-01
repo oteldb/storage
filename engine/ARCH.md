@@ -1514,6 +1514,15 @@ at a time", so the wait is bounded twice and a missing scope costs latency and m
 
 ## Count and series enumeration
 
+`CountGrid` resolves identity once for all left-open, right-closed windows. Head, frozen and recent
+timestamps become compact per-series presence intervals under the read lock. A part wholly in the
+windows' common intersection proves every step from its series index, before any numeric reader
+or decode admission is needed. Remaining series use part-bound proofs followed by timestamp-only
+block reads; older unframed timestamps use the same timestamp-only whole-column fallback as Count.
+Duplicates and sampling weights do not multiply presence. One reusable bitset feeds per-group
+difference arrays; there is no matched-series by step matrix. Admission includes snapshot metadata,
+group outputs and the timestamp decode estimate; head snapshots precede admission as in Fetch.
+
 An existence plan stops once every selected ID is proven present. When its in-memory flags already
 cover the selection, Count and CountBy skip part-reader setup and decode admission entirely; a
 part scan stops as soon as it completes the proof. Continuing after that point cannot change the

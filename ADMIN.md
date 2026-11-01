@@ -348,6 +348,10 @@ values or attribute keys; EXPLAIN profile nodes remain separate from these OpenT
 
 #### Aggregate read spans
 
+`engine.countGrid` reports `storage.series_matched`, `storage.parts_scanned` and
+`storage.grid_steps` for timestamp-only range counts. A common-window existence proof avoids
+numeric decoding; this span does not carry value-aggregate pushdown reasons.
+
 `engine.aggregateRange` / `engine.aggregateStep` / `engine.aggregateStepNamed` /
 `engine.aggregateWindow` carry the attributes that say **why** an aggregate read was slow, not only
 how long it took:
