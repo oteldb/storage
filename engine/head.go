@@ -688,18 +688,18 @@ func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
 // buffers are appended onto the detached ones rather than the reverse, and the merged buffer
 // replaces the live one.
 func (h *head) reattach(detached map[signal.SeriesID]*sampleBuf, bytes int64, since time.Time) {
-	for id, buf := range detached {
-		if len(buf.ts) == 0 {
-			continue
-		}
-
-		if live := h.samples[id]; live != nil {
-			for i := range live.ts {
-				buf.appendSample(live.ts[i], live.values[i], bufSF(live, i))
+	if len(detached) > len(h.samples) {
+		h.samples = reuseDetachedSamples(detached, h.samples)
+	} else {
+		for id, buf := range detached {
+			if len(buf.ts) == 0 {
+				continue
 			}
+			if live := h.samples[id]; live != nil {
+				appendLiveSamples(buf, live)
+			}
+			h.samples[id] = buf
 		}
-
-		h.samples[id] = buf
 	}
 
 	h.grow(bytes)
@@ -709,6 +709,28 @@ func (h *head) reattach(detached map[signal.SeriesID]*sampleBuf, bytes int64, si
 	// that, so the earlier start wins and the flush interval keeps measuring from it.
 	if !since.IsZero() && (h.since.IsZero() || since.Before(h.since)) {
 		h.since = since
+	}
+}
+
+func reuseDetachedSamples(detached, active map[signal.SeriesID]*sampleBuf) map[signal.SeriesID]*sampleBuf {
+	for id, buf := range detached {
+		if len(buf.ts) == 0 {
+			delete(detached, id)
+		}
+	}
+	for id, live := range active {
+		if older := detached[id]; older != nil {
+			appendLiveSamples(older, live)
+		} else {
+			detached[id] = live
+		}
+	}
+	return detached
+}
+
+func appendLiveSamples(older, live *sampleBuf) {
+	for i := range live.ts {
+		older.appendSample(live.ts[i], live.values[i], bufSF(live, i))
 	}
 }
 
