@@ -142,7 +142,7 @@ func (r *seriesBlockReader) addRange(ctx context.Context, rng rowRange, m *sampl
 // (so one per part per fetch at most) keeps the marks read off the per-series path.
 func (r *seriesBlockReader) granules(ctx context.Context) []block.Granule {
 	if !r.granLoaded {
-		r.gran, r.granLoaded = r.part.granuleTimes(ctx), true
+		r.gran, r.granLoaded = r.engine.partGranuleTimes(ctx, r.part), true
 	}
 
 	return r.gran

@@ -279,6 +279,7 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 	}
 
 	part.minTime, part.maxTime = p.minT, p.maxT
+	p.e.cacheWrittenMarks(part, p.w.Marks())
 
 	return part, nil
 }

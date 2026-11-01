@@ -60,7 +60,8 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
   a part to one shard per node), and `Reconstructs`/`ReconstructErrors` (read-path object
   reconstructions; a high reconstruct rate on cold reads is expected, growing errors are not).
 - `StoreStats.Caches` — read-path decode-cache totals (hits/misses/bytes and `Items` = cached
-  decoded **blocks** and immutable decoder metadata, both charged to the same byte budget; cache hits/misses include directory opens). `Caches.ProfileSymbols` is
+  decoded **blocks**, immutable decoder metadata and handed-off time bounds, all charged to the
+  same byte budget; hits/misses cover blocks and directory opens). `Caches.ProfileSymbols` is
   the decoded profile symbol cache behind `ProfileResolver` (`Options.ProfileSymbolCacheBytes`): the
   same four fields, `Items` counting cached **parts** and `Bytes` their estimated decoded size. Misses
   climbing with every flamegraph query mean the queried windows' parts do not fit the budget; it is

@@ -199,6 +199,10 @@ result. Measured on a real attributes column, whole-column decode: 324699 flat r
 
 ## Two writers
 
+After a successful `WriteStreamPart`, `StreamWriter.Marks` exposes its finalized sort-key bounds
+as an immutable view. The writer allocation can pass to a reader without re-reading the marks
+object; no format or durability step changes.
+
 `PartWriter` takes whole columns and serializes them in one pass. `StreamWriter` builds the same
 part incrementally: the schema is declared up front, rows arrive through `AppendInt64` /
 `AppendFloat64` / `AppendU128Run` / `AppendBytes` / `AppendBytesBlob` / a `Binding`, and each column

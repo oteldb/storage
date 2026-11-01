@@ -1478,6 +1478,17 @@ but they are inside one series' row range — where the test applies. Without it
 full part scan, a long series being decoded whole and discarded row by row. Derived and advisory —
 absent, corrupt or mismatched marks prune nothing.
 
+Newly streamed flush and merge parts hand their writer's immutable bounds to the shared decoded
+cache before publication. Bounds consume capacity plus entry overhead from the existing byte
+budget; a handoff larger than one sixteenth of it is skipped. They are never pooled or mutated,
+so readers' slice references remain valid after eviction. Reopened or evicted bounds use the
+existing lazy marks reader. Decode hit/miss counters remain about numeric blocks and decoder
+prototypes; item and byte totals include handed-off bounds.
+
+Per-shard bounds LRUs protect up to one sixteenth of the shared cache from numeric churn.
+This is eviction priority, not a partition: a large decoder can displace bounds and consume the
+whole budget. Prefix retirement evicts both lists; pending reservations still use the same credits.
+
 **Recent tier** (`Config.RecentWindow`) — mirrors the most recent flush window in RAM across flushes,
 so a query inside the window acquires no part at all; overlap is deduped by the freshest-wins merge
 (the tier holds raw samples, which never fold into each other). A merge that rolls a range up trims

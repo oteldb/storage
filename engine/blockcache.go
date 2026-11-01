@@ -36,6 +36,7 @@ type blockCache struct {
 	hits, misses atomic.Int64
 	inflight     atomic.Int64
 	bytes        atomic.Int64 // Linked entries and in-flight insertion reservations.
+	marksBytes   atomic.Int64
 	seed         maphash.Seed
 	shards       []blockCacheShard
 	trimMu       sync.Mutex
@@ -48,8 +49,16 @@ type blockCache struct {
 type blockCacheShard struct {
 	mu       sync.Mutex
 	ll       list.List
+	marks    list.List
 	items    map[blockKey]*list.Element
 	byPrefix map[string]map[blockKey]struct{}
+}
+
+func (s *blockCacheShard) lru(key blockKey) *list.List {
+	if key.col == colMarksID {
+		return &s.marks
+	}
+	return &s.ll
 }
 
 // colID identifies which metric column a cached block belongs to (part of the cache key).
@@ -59,6 +68,7 @@ const (
 	colTsID colID = iota
 	colValID
 	colSFID
+	colMarksID
 )
 
 // blockKey identifies a decoded block; index -1 names the column's immutable decoder metadata.
@@ -74,14 +84,15 @@ type blockKey struct {
 // LRU. The buffer returns to the freelist only when refs hits 0 after evicted is set, so a reader
 // holding a view of an evicted block never sees its buffer recycled underneath it.
 type blockEntry struct {
-	owner   *blockCacheShard
-	key     blockKey
-	i64     []int64
-	f64     []float64
-	decoder *block.Decoder
-	bytes   int64
-	refs    int
-	evicted bool
+	owner    *blockCacheShard
+	key      blockKey
+	i64      []int64
+	f64      []float64
+	decoder  *block.Decoder
+	granules []block.Granule
+	bytes    int64
+	refs     int
+	evicted  bool
 }
 
 func newBlockCache(maxBytes int64) *blockCache {
@@ -115,11 +126,15 @@ func (c *blockCache) get(key blockKey) (*blockEntry, bool) {
 	defer shard.mu.Unlock()
 	el, ok := shard.items[key]
 	if !ok {
-		c.misses.Add(1)
+		if key.col != colMarksID {
+			c.misses.Add(1)
+		}
 		return nil, false
 	}
-	shard.ll.MoveToFront(el)
-	c.hits.Add(1)
+	shard.lru(key).MoveToFront(el)
+	if key.col != colMarksID {
+		c.hits.Add(1)
+	}
 	e := el.Value.(*blockEntry)
 	e.refs++
 	return e, true
@@ -146,8 +161,11 @@ func (c *blockCache) insert(e *blockEntry) *blockEntry {
 		c.bytes.Add(-e.bytes)
 		return c.redundantInsert(shard, el, e)
 	}
-	el := shard.ll.PushFront(e)
+	el := shard.lru(e.key).PushFront(e)
 	shard.items[e.key] = el
+	if e.key.col == colMarksID {
+		c.marksBytes.Add(e.bytes)
+	}
 	set := shard.byPrefix[e.key.prefix]
 	if set == nil {
 		set = make(map[blockKey]struct{})
@@ -159,7 +177,7 @@ func (c *blockCache) insert(e *blockEntry) *blockEntry {
 
 // The caller holds the owning shard; the redundant entry remains private.
 func (c *blockCache) redundantInsert(shard *blockCacheShard, el *list.Element, e *blockEntry) *blockEntry {
-	shard.ll.MoveToFront(el)
+	shard.lru(e.key).MoveToFront(el)
 	current := el.Value.(*blockEntry)
 	current.refs++
 	c.recycle(e)
@@ -191,7 +209,7 @@ func (c *blockCache) reserve(n int64) bool {
 		if c.tryReserve(n) {
 			return true
 		}
-		if !c.evictOldestShardEntry() {
+		if !c.evictOldestShardEntry(n) {
 			return false
 		}
 	}
@@ -202,12 +220,17 @@ func (c *blockCache) tryReserveAvailable(n int64) bool {
 	return !c.trimming.Load() && c.tryReserve(n)
 }
 
-func (c *blockCache) evictOldestShardEntry() bool {
+func (c *blockCache) evictOldestShardEntry(required int64) bool {
 	for range c.shards {
 		shard := &c.shards[c.trimNext]
 		c.trimNext = (c.trimNext + 1) % len(c.shards)
 		shard.mu.Lock()
 		back := shard.ll.Back()
+		if c.marksBytes.Load() > c.maxBytes/marksCacheFraction || required > c.maxBytes-c.maxBytes/marksCacheFraction {
+			if mark := shard.marks.Back(); mark != nil {
+				back = mark
+			}
+		}
 		if back != nil {
 			c.removeElem(shard, back)
 			shard.mu.Unlock()
@@ -234,6 +257,7 @@ func (c *blockCache) release(e *blockEntry) {
 // The entry is private or evicted/unpinned under its shard; only the shared pool locks are needed.
 func (c *blockCache) recycle(e *blockEntry) {
 	e.decoder = nil
+	e.granules = nil
 	if e.i64 != nil {
 		c.i64Free.put(e.i64)
 		e.i64 = nil
@@ -281,8 +305,11 @@ func (c *blockCache) removeElem(shard *blockCacheShard, el *list.Element) {
 func (c *blockCache) removeElemKeepPrefix(shard *blockCacheShard, el *list.Element) {
 	e := el.Value.(*blockEntry)
 	c.bytes.Add(-e.bytes)
+	if e.key.col == colMarksID {
+		c.marksBytes.Add(-e.bytes)
+	}
 	delete(shard.items, e.key)
-	shard.ll.Remove(el)
+	shard.lru(e.key).Remove(el)
 	e.evicted = true
 	if e.refs == 0 {
 		c.recycle(e)
