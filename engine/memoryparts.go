@@ -41,10 +41,17 @@ func (l *partLifetimes) protect(dst map[string]struct{}) {
 
 func (l *partLifetimes) forget(p *part) {
 	l.mu.Lock()
-	if lifetime := l.byPrefix[p.prefix]; lifetime == p.life.Load() && lifetime != nil && lifetime.refs.Load() == 0 {
+	if lifetime := l.byPrefix[p.prefix]; lifetime != nil && lifetime.refs.Load() == 0 {
 		delete(l.byPrefix, p.prefix)
 	}
 	l.mu.Unlock()
+}
+
+func (l *partLifetimes) held(prefix string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lifetime := l.byPrefix[prefix]
+	return lifetime != nil && lifetime.refs.Load() > 0
 }
 
 // Caller owns catalog/state; construction and final retirement stay outside the publication gate.

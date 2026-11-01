@@ -41,7 +41,8 @@ additional workspace through the build pool. Its timestamp heap preserves source
 Warm admission waits before writer-lifecycle ownership when run fanout reaches its bound; an
 unmergeable full directory returns a retryable capacity error. Close cancels and joins this worker.
 `ResidentHeadBytes` counts owned run columns and directory slabs until the last reader/build lease
-ends; pressure flushing uses this physical measure, while `HeadBytes` retains its sample-byte contract.
+ends. Pressure flushing retains the `HeadBytes` sample-byte threshold, excluding retired read
+leases that another flush cannot reclaim. Resident accounting is reported separately.
 
 Flush drains admitted writers before sealing the WAL and freezing the covered root. Readers proceed
 during the seal. Frozen runs stream in global SeriesID order to file writers without materializing

@@ -26,7 +26,7 @@ func memoryRunFromBatch(batch *walBatch, release func()) (*memoryRun, error) {
 	for _, index := range order {
 		sampled = sampled || batch.accs[index].sampled
 	}
-	if prepared := batch.prepared; prepared != nil && prepared.canTransferMemory(batch) {
+	if prepared := batch.prepared; prepared != nil && prepared.canTransferMemory(batch, sampled) {
 		return prepared.transferMemoryRun(order, sampled, release)
 	}
 	entries := make([]memoryRunSeries, len(order))
@@ -68,7 +68,11 @@ func memoryRunFromBatch(batch *walBatch, release func()) (*memoryRun, error) {
 	return newMemoryRun(entries, ts, values, sf, release)
 }
 
-func (p *preparedBatch) canTransferMemory(batch *walBatch) bool {
+func (p *preparedBatch) canTransferMemory(batch *walBatch, sampled bool) bool {
+	if len(p.ts) > 2*batch.samples || cap(p.ts) > 2*len(p.ts) || cap(p.values) > 2*len(p.values) ||
+		sampled && cap(p.sf) > 2*len(p.sf) {
+		return false
+	}
 	for i := range batch.order {
 		if !ascendingInt64(batch.accs[i].ts) {
 			return false

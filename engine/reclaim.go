@@ -186,7 +186,7 @@ func (e *Engine) reclaimRetiredLocked(ctx context.Context) {
 	)
 
 	for _, p := range e.retiring {
-		if p.reclaimable() {
+		if p.reclaimable() && !e.partLifetimes.held(p.prefix) {
 			deletable = append(deletable, p)
 		} else {
 			kept = append(kept, p)
