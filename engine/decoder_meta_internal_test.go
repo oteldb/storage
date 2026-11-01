@@ -36,9 +36,7 @@ func TestDecoderMetadataCacheAvoidsRepeatedReads(t *testing.T) {
 	values, err := second.DecodeInt64(0)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), values[0])
-	e.blockCache.mu.Lock()
-	bytes, budget := e.blockCache.bytes, e.blockCache.maxBytes
-	e.blockCache.mu.Unlock()
+	bytes, budget := e.blockCache.stats().Bytes, e.blockCache.maxBytes
 	require.LessOrEqual(t, bytes, budget)
 	e.blockCache.evictPrefix(p.prefix)
 	values, err = second.DecodeInt64(second.NumBlocks() - 1)
