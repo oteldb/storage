@@ -2,6 +2,7 @@ package engine
 
 import (
 	"container/list"
+	"hash/maphash"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -9,7 +10,7 @@ import (
 	"github.com/oteldb/storage/block"
 )
 
-// blockCache is a byte-bounded LRU over decoded column blocks, keyed by (part prefix, column, block
+// blockCache is a byte-bounded sharded LRU over decoded column blocks, keyed by (part prefix, column, block
 // index). It replaces the whole-part decode cache: a fetch decodes only the blocks its matched series
 // touch (series-skip) and caches those, so the resident set is the *useful* blocks across live parts
 // rather than every column of every touched part — and a later query sharing series/time reuses the
@@ -31,27 +32,24 @@ import (
 // budget-neutral — it never enlarges the resident set (the freelist is small and bounded), it only
 // stops the churn.
 type blockCache struct {
-	maxBytes int64
-
+	maxBytes     int64
 	hits, misses atomic.Int64
+	inflight     atomic.Int64
+	bytes        atomic.Int64 // Linked entries and in-flight insertion reservations.
+	seed         maphash.Seed
+	shards       []blockCacheShard
+	trimMu       sync.Mutex
+	trimming     atomic.Bool
+	trimNext     int
+	i64Free      bufFreeList[int64]
+	f64Free      bufFreeList[float64]
+}
 
-	// inflight counts the fetches currently drawing decode buffers (fetchStart/fetchEnd). The
-	// freelists scale their bound with it: a fetch's pins hold evicted buffers back from the pool
-	// until they are released, so under N concurrent fetches the pool must absorb roughly N fetches'
-	// worth of returned buffers at once — a fixed cap sized for the steady state drops most of a
-	// burst's returns on the floor and the next fetch re-allocates them all.
-	inflight atomic.Int64
-
+type blockCacheShard struct {
 	mu       sync.Mutex
-	ll       *list.List                       // front = most-recently used; Value is *blockEntry
-	items    map[blockKey]*list.Element       // key → element
-	byPrefix map[string]map[blockKey]struct{} // prefix → its keys, for evictPrefix
-	bytes    int64
-
-	// Recycled decode-output buffers, drawn by a miss's decode and refilled by eviction. Their own
-	// locks are always taken while c.mu is held (recycle) or not at all (get), never the reverse.
-	i64Free bufFreeList[int64]
-	f64Free bufFreeList[float64]
+	ll       list.List
+	items    map[blockKey]*list.Element
+	byPrefix map[string]map[blockKey]struct{}
 }
 
 // colID identifies which metric column a cached block belongs to (part of the cache key).
@@ -71,11 +69,12 @@ type blockKey struct {
 }
 
 // blockEntry holds one decoded block or immutable decoder prototype. refs
-// and evicted are guarded by the owning cache's mu: refs counts the fetches currently reading the
+// and evicted are guarded by the owning shard's mu: refs counts the fetches currently reading the
 // block (each get/insert pins, each release unpins), and evicted marks that the entry has left the
 // LRU. The buffer returns to the freelist only when refs hits 0 after evicted is set, so a reader
 // holding a view of an evicted block never sees its buffer recycled underneath it.
 type blockEntry struct {
+	owner   *blockCacheShard
 	key     blockKey
 	i64     []int64
 	f64     []float64
@@ -86,125 +85,159 @@ type blockEntry struct {
 }
 
 func newBlockCache(maxBytes int64) *blockCache {
-	c := &blockCache{
-		maxBytes: maxBytes,
-		ll:       list.New(),
-		items:    make(map[blockKey]*list.Element),
-		byPrefix: make(map[string]map[blockKey]struct{}),
+	shards := min(8, max(1, int(maxBytes/(1<<20))))
+	return newBlockCacheWithShards(maxBytes, shards)
+}
+
+func newBlockCacheWithShards(maxBytes int64, count int) *blockCache {
+	c := &blockCache{maxBytes: maxBytes, seed: maphash.MakeSeed(), shards: make([]blockCacheShard, max(count, 1))}
+	for i := range c.shards {
+		shard := &c.shards[i]
+		shard.items = make(map[blockKey]*list.Element)
+		shard.byPrefix = make(map[string]map[blockKey]struct{})
 	}
-
-	// Both freelists share one bound, scaled by the fetches currently in flight: the resident
-	// contribution stays a few MiB at rest (blockBufCap buffers) and grows only while a burst is
-	// actually holding that many buffers in play.
 	capNow := func() int { return blockBufCap * (1 + int(c.inflight.Load())) }
-	c.i64Free.capNow = capNow
-	c.f64Free.capNow = capNow
-
+	c.i64Free.capNow, c.f64Free.capNow = capNow, capNow
 	return c
 }
 
-// fetchStart registers a fetch that will draw decode buffers; fetchEnd unregisters it. The pair
-// scales the freelist bound with concurrency (see blockCache.inflight).
+func (c *blockCache) shard(key blockKey) *blockCacheShard {
+	return &c.shards[maphash.Comparable(c.seed, key)%uint64(len(c.shards))]
+}
+
+// Fetch ownership scales the one shared pair of decode-buffer freelists.
 func (c *blockCache) fetchStart() { c.inflight.Add(1) }
 func (c *blockCache) fetchEnd()   { c.inflight.Add(-1) }
 
-// get returns the cached block for key (shared, read-only), marking it most-recently-used and pinning
-// it against recycling. On a hit the caller MUST call release once it is done reading the block.
 func (c *blockCache) get(key blockKey) (*blockEntry, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	el, ok := c.items[key]
+	shard := c.shard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	el, ok := shard.items[key]
 	if !ok {
 		c.misses.Add(1)
-
 		return nil, false
 	}
-
-	c.ll.MoveToFront(el)
+	shard.ll.MoveToFront(el)
 	c.hits.Add(1)
-
 	e := el.Value.(*blockEntry)
 	e.refs++
-
 	return e, true
 }
 
-// insert caches e (pinned for the caller) and returns the entry the caller should read and later
-// release. If e.key is already present (a concurrent decode raced us) the resident entry is returned
-// pinned and e's freshly-decoded buffer is recycled. A block larger than the whole budget is not
-// cached but is still returned pinned, so release recycles its buffer. The returned entry always
-// carries the canonical buffer to read (e's own, or the winner's on a race).
 func (c *blockCache) insert(e *blockEntry) *blockEntry {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if el, ok := c.items[e.key]; ok {
-		c.ll.MoveToFront(el)
-		cur := el.Value.(*blockEntry)
-		cur.refs++
-		c.recycle(e) // our decode was redundant; hand its buffer back to the pool
-
-		return cur
+	shard := c.shard(e.key)
+	e.owner = shard
+	shard.mu.Lock()
+	if el, ok := shard.items[e.key]; ok {
+		result := c.redundantInsert(shard, el, e)
+		shard.mu.Unlock()
+		return result
 	}
-
-	e.refs = 1 // pinned for the caller
-
-	if e.bytes > c.maxBytes {
-		e.evicted = true // never linked; release recycles the buffer
-
+	shard.mu.Unlock()
+	e.refs = 1
+	if e.bytes > c.maxBytes || !c.reserve(e.bytes) {
+		e.evicted = true
 		return e
 	}
-
-	el := c.ll.PushFront(e)
-	c.items[e.key] = el
-	c.bytes += e.bytes
-
-	set := c.byPrefix[e.key.prefix]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if el, ok := shard.items[e.key]; ok {
+		c.bytes.Add(-e.bytes)
+		return c.redundantInsert(shard, el, e)
+	}
+	el := shard.ll.PushFront(e)
+	shard.items[e.key] = el
+	set := shard.byPrefix[e.key.prefix]
 	if set == nil {
 		set = make(map[blockKey]struct{})
-		c.byPrefix[e.key.prefix] = set
+		shard.byPrefix[e.key.prefix] = set
 	}
-
 	set[e.key] = struct{}{}
-
-	for c.bytes > c.maxBytes {
-		back := c.ll.Back()
-		if back == nil || back == el { // never evict the entry we just inserted and pinned
-			break
-		}
-
-		c.removeElem(back)
-	}
-
 	return e
 }
 
-// release drops one pin taken by get or insert; once an entry's last pin is dropped after it has been
-// evicted, its buffer returns to the freelist. Calling release exactly once per get/insert keeps the
-// refcount balanced.
+// The caller holds the owning shard; the redundant entry remains private.
+func (c *blockCache) redundantInsert(shard *blockCacheShard, el *list.Element, e *blockEntry) *blockEntry {
+	shard.ll.MoveToFront(el)
+	current := el.Value.(*blockEntry)
+	current.refs++
+	c.recycle(e)
+	return current
+}
+
+func (c *blockCache) tryReserve(n int64) bool {
+	for {
+		used := c.bytes.Load()
+		if used > c.maxBytes-n {
+			return false
+		}
+		if c.bytes.CompareAndSwap(used, used+n) {
+			return true
+		}
+	}
+}
+
+// Credits include in-progress insertions. Never wait for an unlinked reservation while trimming.
+func (c *blockCache) reserve(n int64) bool {
+	if c.tryReserveAvailable(n) {
+		return true
+	}
+	c.trimMu.Lock()
+	defer c.trimMu.Unlock()
+	c.trimming.Store(true)
+	defer c.trimming.Store(false)
+	for {
+		if c.tryReserve(n) {
+			return true
+		}
+		if !c.evictOldestShardEntry() {
+			return false
+		}
+	}
+}
+
+// Freed credits belong to an active trimmer before newer cache misses can use them.
+func (c *blockCache) tryReserveAvailable(n int64) bool {
+	return !c.trimming.Load() && c.tryReserve(n)
+}
+
+func (c *blockCache) evictOldestShardEntry() bool {
+	for range c.shards {
+		shard := &c.shards[c.trimNext]
+		c.trimNext = (c.trimNext + 1) % len(c.shards)
+		shard.mu.Lock()
+		back := shard.ll.Back()
+		if back != nil {
+			c.removeElem(shard, back)
+			shard.mu.Unlock()
+			return true
+		}
+		shard.mu.Unlock()
+	}
+	return false
+}
+
 func (c *blockCache) release(e *blockEntry) {
 	if e == nil {
 		return
 	}
-
-	c.mu.Lock()
+	shard := e.owner
+	shard.mu.Lock()
 	e.refs--
 	if e.refs == 0 && e.evicted {
 		c.recycle(e)
 	}
-	c.mu.Unlock()
+	shard.mu.Unlock()
 }
 
-// recycle returns e's decoded buffer to the matching freelist and clears it, so a later miss decodes
-// into it instead of minting a fresh slice. Caller holds c.mu; e must be evicted and unpinned.
+// The entry is private or evicted/unpinned under its shard; only the shared pool locks are needed.
 func (c *blockCache) recycle(e *blockEntry) {
 	e.decoder = nil
 	if e.i64 != nil {
 		c.i64Free.put(e.i64)
 		e.i64 = nil
 	}
-
 	if e.f64 != nil {
 		c.f64Free.put(e.f64)
 		e.f64 = nil
@@ -221,44 +254,38 @@ func (c *blockCache) getF64Buf(n int) []float64 { return c.f64Free.get(n) }
 // reclaimed only after every fetch that acquired it has released it, so no live fetch is reading these
 // blocks; their buffers recycle immediately (refs == 0).
 func (c *blockCache) evictPrefix(prefix string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for key := range c.byPrefix[prefix] {
-		if el, ok := c.items[key]; ok {
-			c.removeElemKeepPrefix(el)
+	for i := range c.shards {
+		shard := &c.shards[i]
+		shard.mu.Lock()
+		for key := range shard.byPrefix[prefix] {
+			if el, ok := shard.items[key]; ok {
+				c.removeElemKeepPrefix(shard, el)
+			}
 		}
+		delete(shard.byPrefix, prefix)
+		shard.mu.Unlock()
 	}
-
-	delete(c.byPrefix, prefix)
 }
 
-// removeElem drops el from the list, index, prefix set, and byte total. Caller holds c.mu.
-func (c *blockCache) removeElem(el *list.Element) {
-	ent := el.Value.(*blockEntry)
-	if set := c.byPrefix[ent.key.prefix]; set != nil {
-		delete(set, ent.key)
+func (c *blockCache) removeElem(shard *blockCacheShard, el *list.Element) {
+	e := el.Value.(*blockEntry)
+	if set := shard.byPrefix[e.key.prefix]; set != nil {
+		delete(set, e.key)
 		if len(set) == 0 {
-			delete(c.byPrefix, ent.key.prefix)
+			delete(shard.byPrefix, e.key.prefix)
 		}
 	}
-
-	c.removeElemKeepPrefix(el)
+	c.removeElemKeepPrefix(shard, el)
 }
 
-// removeElemKeepPrefix drops el from the list, index, and byte total, but leaves the prefix set to the
-// caller (evictPrefix clears the whole set at once). It marks the entry evicted and recycles its
-// buffer if no fetch is currently reading it; a pinned entry recycles later, on its last release.
-// Caller holds c.mu.
-func (c *blockCache) removeElemKeepPrefix(el *list.Element) {
-	ent := el.Value.(*blockEntry)
-	c.bytes -= ent.bytes
-	delete(c.items, ent.key)
-	c.ll.Remove(el)
-
-	ent.evicted = true
-	if ent.refs == 0 {
-		c.recycle(ent)
+func (c *blockCache) removeElemKeepPrefix(shard *blockCacheShard, el *list.Element) {
+	e := el.Value.(*blockEntry)
+	c.bytes.Add(-e.bytes)
+	delete(shard.items, e.key)
+	shard.ll.Remove(el)
+	e.evicted = true
+	if e.refs == 0 {
+		c.recycle(e)
 	}
 }
 
@@ -332,11 +359,14 @@ type DecodeCacheStats struct {
 }
 
 func (c *blockCache) stats() DecodeCacheStats {
-	c.mu.Lock()
-	bytes, items := c.bytes, len(c.items)
-	c.mu.Unlock()
-
-	return DecodeCacheStats{Hits: c.hits.Load(), Misses: c.misses.Load(), Bytes: bytes, Items: items}
+	items := 0
+	for i := range c.shards {
+		shard := &c.shards[i]
+		shard.mu.Lock()
+		items += len(shard.items)
+		shard.mu.Unlock()
+	}
+	return DecodeCacheStats{Hits: c.hits.Load(), Misses: c.misses.Load(), Bytes: c.bytes.Load(), Items: items}
 }
 
 // DecodeCacheStats returns the engine's decoded-block cache statistics and whether a cache is

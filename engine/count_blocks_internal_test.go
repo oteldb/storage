@@ -49,12 +49,7 @@ func TestCountBlockAdmission(t *testing.T) {
 					require.Zero(t, e.budget.inFlight())
 					if e.blockCache != nil {
 						require.Zero(t, e.blockCache.inflight.Load())
-						e.blockCache.mu.Lock()
-						var refs int
-						for _, entry := range e.blockCache.items {
-							refs += entry.Value.(*blockEntry).refs
-						}
-						e.blockCache.mu.Unlock()
+						refs := blockCachePins(e.blockCache)
 						require.Zero(t, refs)
 					}
 				})
@@ -127,11 +122,19 @@ func TestCountErrorReleasesReaders(t *testing.T) {
 	for _, part := range e.parts {
 		require.Zero(t, part.refs.Load())
 	}
-	e.blockCache.mu.Lock()
-	var refs int
-	for _, entry := range e.blockCache.items {
-		refs += entry.Value.(*blockEntry).refs
-	}
-	e.blockCache.mu.Unlock()
+	refs := blockCachePins(e.blockCache)
 	require.Zero(t, refs, "a later read error must release earlier timestamp pins")
+}
+
+func blockCachePins(c *blockCache) int {
+	refs := 0
+	for i := range c.shards {
+		shard := &c.shards[i]
+		shard.mu.Lock()
+		for _, element := range shard.items {
+			refs += element.Value.(*blockEntry).refs
+		}
+		shard.mu.Unlock()
+	}
+	return refs
 }

@@ -1424,12 +1424,19 @@ A missing or corrupt sidecar rebuilds the resident index from the series column.
 native ranged reads retain the whole-object path. The serialized sidecar format is unchanged.
 
 **Block slicing + decode cache** (`Config.DecodeCacheBytes`) — column blocks are sliced from a
-byte-bounded LRU keyed by `(part, column, block)` and added to the merge as **views**, never
+byte-bounded sharded LRU keyed by `(part, column, block)` and added to the merge as **views**, never
 materializing a decoded part. Entries are immutable and refcounted, released per series after copy-out;
 an evicted, unpinned buffer recirculates through a bounded freelist, cutting miss-path allocation
 without enlarging the resident set. Cache-off, or constant/unblocked columns, decodes per fetch,
 series-skipped to the blocks the matched row ranges touch. With the cache on a fetch also prefetches
 the parts it will touch.
+
+Key/LRU shards share atomic byte credits, so a large decoder prototype can still use the whole
+cache allowance. Insertion reserves credits before locking its shard; a trim coordinator evicts
+one shard entry at a time and prevents newer misses from stealing freed credits. Pending unlinked
+reservations cannot block trimming indefinitely: the new block stays uncached when none can be
+evicted. Duplicate insertion refunds its reservation. Prefix eviction visits every shard; all
+shards retain one shared pair of numeric freelists and one inflight-fetch counter.
 
 The same byte budget caches immutable decoder prototypes, including their validated directories,
 under a separate per-column key. Every operation clones fresh frame state and binds its own context;
