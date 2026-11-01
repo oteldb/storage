@@ -1417,34 +1417,7 @@ func upperBound(s []int64, x int64) int {
 // (the series index is retained). It is a no-op if the head holds no samples. Requires a
 // [Config.Backend].
 func (e *Engine) Flush(ctx context.Context) error {
-	ctx = e.cfg.Obs.Base(ctx)
-	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.flush",
-		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
-	defer span.End()
-
-	startNs := time.Now()
-	log := zctx.From(ctx)
-	log.Debug("flush requested", zap.String("prefix", e.cfg.Prefix))
-
-	rows, written, err := e.flush(ctx)
-	if err != nil {
-		span.RecordError(err)
-		log.Error("flush failed", zap.String("prefix", e.cfg.Prefix), zap.Error(err))
-
-		return err
-	}
-
-	if rows > 0 {
-		span.SetAttributes(attribute.Int("storage.rows", rows), attribute.Int64("storage.flush.bytes", written))
-		e.cfg.Obs.Flush.Record(ctx, metricSignal, time.Since(startNs), int64(rows), written)
-		log.Debug("flushed head to part",
-			zap.String("prefix", e.cfg.Prefix), zap.Int("rows", rows), zap.Int64("bytes", written),
-			zap.Duration("took", time.Since(startNs)))
-	} else {
-		log.Debug("flush no-op (empty head)", zap.String("prefix", e.cfg.Prefix))
-	}
-
-	return nil
+	return e.observeFlush(ctx, e.flush)
 }
 
 // Reset discards all of the engine's data — the in-memory head (samples + series index)
@@ -1640,6 +1613,37 @@ func (e *Engine) SeriesCount() int {
 	return e.head.series.Len()
 }
 
+func (e *Engine) observeFlush(ctx context.Context, flush func(context.Context) (int, int64, error)) error {
+	ctx = e.cfg.Obs.Base(ctx)
+	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.flush",
+		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
+	defer span.End()
+
+	startNs := time.Now()
+	log := zctx.From(ctx)
+	log.Debug("flush requested", zap.String("prefix", e.cfg.Prefix))
+
+	rows, written, err := flush(ctx)
+	if err != nil {
+		span.RecordError(err)
+		log.Error("flush failed", zap.String("prefix", e.cfg.Prefix), zap.Error(err))
+
+		return err
+	}
+
+	if rows > 0 {
+		span.SetAttributes(attribute.Int("storage.rows", rows), attribute.Int64("storage.flush.bytes", written))
+		e.cfg.Obs.Flush.Record(ctx, metricSignal, time.Since(startNs), int64(rows), written)
+		log.Debug("flushed head to part",
+			zap.String("prefix", e.cfg.Prefix), zap.Int("rows", rows), zap.Int64("bytes", written),
+			zap.Duration("took", time.Since(startNs)))
+	} else {
+		log.Debug("flush produced no new parts", zap.String("prefix", e.cfg.Prefix))
+	}
+
+	return nil
+}
+
 // flush drains the head to a new immutable part, returning the rows flushed (0 ⇒ empty head). Phased
 // so the part write and read-back happen off the engine lock (appends and fetches proceed), while the
 // head detach and the metadata publish run under it. Only the background maintenance task (or Close)
@@ -1651,6 +1655,10 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	}
 	defer unlock()
 
+	return e.flushAdmitted(ctx)
+}
+
+func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, err error) {
 	// Plan (under lock): detach the head's sample buffers, keeping them readable via e.flushing so a
 	// concurrent fetch never loses them.
 	e.mu.Lock()

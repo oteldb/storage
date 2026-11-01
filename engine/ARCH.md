@@ -96,6 +96,13 @@ merge does not stop pressure wakes. Completed pressure passes wake merge catch-u
 queued maintenance admission, drains both workers, then performs the final engine flush. There is
 only one frozen generation per engine; no extra flush queue or parallel appenders are introduced.
 
+Single-node background metrics maintenance uses `Engine.FlushIfIdle`: atomic try-locks skip a
+flush already owned by the pressure worker, so compaction can proceed over immutable parts.
+An idle below-threshold head still flushes on the regular ticker. Explicit `Flush`,
+`Admin.MaintainNow`, final close and clustered maintenance retain their blocking flush ordering.
+Skipped background work does not detach a head, change a WAL epoch or checkpoint data.
+Identity pruning made necessary by removed rows still joins the existing build barrier.
+
 ## Head
 
 The index (`symbols`+`series`+`postings`) plus per-series `(ts, value)` buffers.

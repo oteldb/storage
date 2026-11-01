@@ -9,13 +9,33 @@ import (
 )
 
 func (e *Engine) lockFlush() func() {
+	return e.lockFlushWith(false)
+}
+
+func (e *Engine) lockFlushWith(skipBusy bool) func() {
 	if e.cfg.FlushAdmission == nil {
-		e.flushMu.Lock()
+		if skipBusy {
+			if !e.flushMu.TryLock() {
+				return nil
+			}
+		} else {
+			e.flushMu.Lock()
+		}
 		e.activeBuilds.Add(1)
 		return func() { e.activeBuilds.Add(-1); e.flushMu.Unlock() }
 	}
-	e.flushRun.Lock()
-	e.flushMu.RLock()
+	if skipBusy {
+		if !e.flushRun.TryLock() {
+			return nil
+		}
+		if !e.flushMu.TryRLock() {
+			e.flushRun.Unlock()
+			return nil
+		}
+	} else {
+		e.flushRun.Lock()
+		e.flushMu.RLock()
+	}
 	e.activeBuilds.Add(1)
 	return func() { e.activeBuilds.Add(-1); e.flushMu.RUnlock(); e.flushRun.Unlock() }
 }
@@ -134,10 +154,18 @@ func (e *Engine) canceledFlush(ctx context.Context) (bool, error) {
 }
 
 func (e *Engine) admitFlushWork(ctx context.Context) (func(), error) {
+	return e.admitFlushWorkWith(ctx, false)
+}
+
+//nolint:nilnil // Busy background work deliberately skips admission without an error.
+func (e *Engine) admitFlushWorkWith(ctx context.Context, skipBusy bool) (func(), error) {
 	if canceled, err := e.canceledFlush(ctx); canceled {
 		return nil, err
 	}
-	unlock := e.lockFlush()
+	unlock := e.lockFlushWith(skipBusy)
+	if unlock == nil {
+		return nil, nil
+	}
 	if canceled, err := e.canceledFlush(ctx); canceled {
 		unlock()
 		return nil, err
