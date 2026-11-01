@@ -79,7 +79,7 @@ func TestDecodeCacheEvictsRetiredParts(t *testing.T) {
 	require.Equal(t, 1, e.PartCount())
 
 	st, _ = e.DecodeCacheStats()
-	assert.Equal(t, 0, st.Items, "retired source parts' blocks evicted from the decode cache")
+	assert.Equal(t, 1, st.Items, "only the merged part's handed-off marks remain cached")
 
 	got := fetchAll(t, e, req)
 	require.Len(t, got, 1)

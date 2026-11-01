@@ -28,7 +28,8 @@ import (
 type StreamWriter struct {
 	partConfig
 
-	cols []*streamColumn
+	cols  []*streamColumn
+	marks Marks
 
 	// Set by NewStreamWriterTo: where a column's sealed frames go. ctx is held because rows arrive
 	// through the Append methods, which take none; it spans the writer's life, which is one merge's.
@@ -261,6 +262,10 @@ func (w *StreamWriter) Rows() int {
 	return w.cols[0].rows
 }
 
+// Marks returns read-only sort-key bounds after [WriteStreamPart] succeeds.
+// The returned granules remain valid after the writer is discarded.
+func (w *StreamWriter) Marks() Marks { return w.marks }
+
 // EncodedBytes returns the compressed bytes accumulated so far, what a caller seals a part on when
 // the target is a size on disk.
 //
@@ -454,7 +459,14 @@ func WriteStreamPart(ctx context.Context, b backend.Backend, prefix string, w *S
 		return err
 	}
 
-	return built.write(ctx, b, prefix)
+	if err := built.write(ctx, b, prefix); err != nil {
+		return err
+	}
+	w.marks = Marks{GranuleSize: w.granuleSize}
+	if idx := w.sortKeyIndex(); idx >= 0 {
+		w.marks.Granules = w.cols[idx].granules
+	}
+	return nil
 }
 
 // streamColumn accumulates one column: the granule currently being filled, the granules already

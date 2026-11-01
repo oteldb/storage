@@ -826,7 +826,7 @@ func (p *part) granuleTimes(ctx context.Context) []block.Granule {
 			return // absent/corrupt ⇒ prune nothing
 		}
 
-		if len(m.Granules) != (man.RowCount+man.GranuleSize-1)/man.GranuleSize {
+		if !p.validMarks(m) {
 			return
 		}
 
@@ -834,6 +834,15 @@ func (p *part) granuleTimes(ctx context.Context) []block.Granule {
 	})
 
 	return p.granules
+}
+
+func (p *part) validMarks(m block.Marks) bool {
+	if p.reader == nil {
+		return false
+	}
+	man := p.reader.Manifest()
+	return man.GranuleSize > 0 && m.GranuleSize == man.GranuleSize &&
+		len(m.Granules) == (man.RowCount+man.GranuleSize-1)/man.GranuleSize
 }
 
 // blockInWindow reports whether block b can hold a sample in [start, end], from the part's granule
