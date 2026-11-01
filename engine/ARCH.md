@@ -1426,6 +1426,13 @@ without enlarging the resident set. Cache-off, or constant/unblocked columns, de
 series-skipped to the blocks the matched row ranges touch. With the cache on a fetch also prefetches
 the parts it will touch.
 
+The same byte budget caches immutable decoder prototypes, including their validated directories,
+under a separate per-column key. Every operation clones fresh frame state and binds its own context;
+the cached prototype retains no request context or frame scratch. Metadata entries remain pinned
+until their readers finish, including after byte-budget eviction, and retire with their part prefix.
+Parsed directories therefore share the decode-cache ceiling rather than accumulating per part
+outside that budget. Cache hits/misses include metadata opens as well as decoded blocks.
+
 Metric numeric columns pack codec streams into compression frames of at least 8 KiB. A selective
 host query needs few granules in each part, so large frames amplify its reads and decompression
 scratch. The packing is recorded in the directory and old frame sizes remain readable. Granule
