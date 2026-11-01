@@ -32,8 +32,8 @@ func TestIdentityBytesOutlivesFlush(t *testing.T) {
 
 	after := e.Stats()
 	assert.Zero(t, after.HeadBytes, "a flush drains the buffered samples")
-	assert.Equal(t, before.IdentityBytes, after.IdentityBytes,
-		"a flush drains no identity — it outlives the samples it named")
+	assert.Equal(t, before.IdentityBytes+before.Series*4, after.IdentityBytes,
+		"identities remain resident and the cached ordering adds one compact reference per series")
 	assert.Equal(t, after.IdentityBytes, e.IdentityBytes())
 }
 

@@ -94,6 +94,38 @@ func TestPagedIndexDoesNotRetainValidationBuffer(t *testing.T) {
 	}
 }
 
+func TestPagedIndexRejectsOutsideIDBounds(t *testing.T) {
+	t.Parallel()
+	const count = indexPageEntries*4 + 3
+	col := make([]chunk.U128, count)
+	for i := range col {
+		col[i] = chunk.U128{Hi: 100, Lo: uint64(i+1) * 2}
+	}
+	for _, tt := range []struct {
+		name string
+		id   signal.SeriesID
+	}{
+		{"below", signal.SeriesID{Hi: 99, Lo: ^uint64(0)}},
+		{"above high word", signal.SeriesID{Hi: 101}},
+		{"above low word", signal.SeriesID{Hi: 100, Lo: count*2 + 1}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			files, err := file.New(t.TempDir())
+			require.NoError(t, err)
+			counter := backendtest.NewByteCounter(files)
+			require.NoError(t, counter.Write(t.Context(), sidxKey("p"), encodeSeriesIndex(col)))
+			index, ok := openPagedIndex(t.Context(), counter, "p", count, obs.NewNop().Corruption)
+			require.True(t, ok)
+			counter.Reset()
+			_, found, err := index.lookup(t.Context(), tt.id)
+			require.NoError(t, err)
+			require.False(t, found)
+			require.Zero(t, counter.Reads(), "an out-of-range ID must not read a leaf page")
+		})
+	}
+}
+
 func TestPagedLookupMatchesResidentRanges(t *testing.T) {
 	t.Parallel()
 	const count = indexPageEntries*3 + 7

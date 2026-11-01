@@ -20,6 +20,9 @@ func (p *pagedIndex) lookup(ctx context.Context, id signal.SeriesID) (rowRange, 
 		}
 		return p.rangeAt(*view, k), true, nil
 	}
+	if p.bounded && (id.Compare(p.first) < 0 || id.Compare(p.last) > 0) {
+		return rowRange{}, false, nil
+	}
 	if len(p.fences) == 0 {
 		entries, err := p.entries(ctx)
 		if err != nil {

@@ -190,13 +190,14 @@ type Engine struct {
 	mu  engineguard.Mutex
 	// The build barrier excludes reset, prune and repair; admitted flush/merge builds take read slots.
 	// Identity lifecycle precedes catalog -> writer -> reader-visible state (see ARCH.md).
-	flushMu      sync.RWMutex
-	identityMu   sync.RWMutex
-	activeBuilds atomic.Int32
-	flushRun     sync.Mutex
-	mergeRun     sync.Mutex
-	head         *head
-	parts        []*part
+	flushMu       sync.RWMutex
+	identityMu    sync.RWMutex
+	identityOrder identityOrder
+	activeBuilds  atomic.Int32
+	flushRun      sync.Mutex
+	mergeRun      sync.Mutex
+	head          *head
+	parts         []*part
 	// tsCodec is the codec flushes and merges write the timestamp column with. It is a field, not a
 	// constant, only so a test can write the [chunk.CodecDoD] parts earlier builds wrote and check
 	// they merge.
@@ -549,7 +550,7 @@ func (e *Engine) IdentityBytes() int64 {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	return e.head.identityBytes()
+	return e.head.identityBytes() + e.identityOrder.bytes.Load()
 }
 
 // Stats is an in-memory snapshot of an engine's state for introspection (no backend I/O, no decode).
@@ -605,7 +606,7 @@ func (e *Engine) Stats() Stats {
 		HeadBytes:     e.head.inFlightBytes(),
 		HeadSamples:   e.head.bytes / SampleBytes,
 		HeadAge:       e.head.age(),
-		IdentityBytes: e.head.identityBytes(),
+		IdentityBytes: e.head.identityBytes() + e.identityOrder.bytes.Load(),
 		Parts:         len(e.parts),
 		WantedParts:   len(e.wants) + len(e.pendingWants) + len(e.adoptedWants),
 		Holes:         len(e.holes),
@@ -793,7 +794,9 @@ func (p *enginePlan) matchingRanges(ctx context.Context, part *part, positions b
 	out := make([]rowRange, 0) // nil means a whole-part decode, not an empty selection.
 	var matched []uint32
 
-	for i, id := range p.ids {
+	first, end := part.index.selectedIDRange(p.ids)
+	for i := first; i < end; i++ {
+		id := p.ids[i]
 		rng, ok, err := part.index.lookup(ctx, id)
 		if err != nil {
 			return nil, nil, err
@@ -1009,12 +1012,17 @@ func (p *enginePlan) decodeEstimate(ctx context.Context, need colNeed) (int64, e
 			return 0, err
 		}
 
-		blks, matched := windowBlocks(rngs, r.blockRows, pt.rows(), r.granules(ctx), p.start, p.end)
-		ranges[pt], blocks[pt] = rngs, blks
+		ranges[pt] = rngs
 		if memoize {
 			positions[pt] = matchedIDs
 			total += int64(cap(matchedIDs)) * 4
 		}
+		if len(rngs) == 0 {
+			blocks[pt] = nil
+			continue
+		}
+		blks, matched := windowBlocks(rngs, r.blockRows, pt.rows(), r.granules(ctx), p.start, p.end)
+		blocks[pt] = blks
 
 		pinned := min(int64(len(blks))*int64(r.blockRows), int64(pt.rows()))
 
@@ -1448,6 +1456,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 
 	e.mu.Lock()
 	e.head = newHead()
+	e.identityOrder.reset()
 	e.flushing = nil        // discarded with the head: Reset drops the samples, it does not flush them
 	e.identityDirty = false // nothing is left to prune
 	e.clearRecent()         // else pre-Reset samples resurface on the next read

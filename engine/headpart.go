@@ -35,6 +35,7 @@ type headPartBuilder struct {
 	partRefs         []uint32
 	parts            []*part
 	rows             int
+	orderWorkspace   int64
 }
 
 func (e *Engine) flushMemoryBytes() int64 {
@@ -64,21 +65,24 @@ func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sa
 	for _, buf := range samples {
 		expected += len(buf.ts)
 	}
-	var err error
-	e.captureDetachedIdentities(samples, func(id signal.SeriesID, view series.View, ref uint32) {
-		if err != nil {
-			return
+	reserveOrder := func(bytes int64) error {
+		if needed := max(b.target, buildbudget.Add(b.baseBytes(), bytes)); needed > b.reserved {
+			return b.reserve(needed)
 		}
-		if err = ctx.Err(); err != nil {
-			return
-		}
-		buf := samples[id]
-		if len(buf.ts) == 0 {
-			return
-		}
-		b.view = view
-		err = b.add(ref, buf)
-	})
+		return nil
+	}
+	order, err := e.prepareDetachedOrder(ctx, samples, reserveOrder)
+	if err == nil {
+		b.orderWorkspace = order.workspace
+		b.view = order.view
+		err = walkIdentityOrder(ctx, order.view, order.runs, func(id signal.SeriesID, ref uint32) error {
+			buf := samples[id]
+			if buf == nil || len(buf.ts) == 0 {
+				return nil
+			}
+			return b.add(ref, buf)
+		})
+	}
 	if err == nil {
 		err = b.flushRun()
 	}
@@ -97,6 +101,7 @@ func (b *headPartBuilder) baseBytes() int64 {
 		blockRows = DefaultMetricBlockRows
 	}
 	n := buildbudget.Add(8<<20, buildbudget.Mul(int64(blockRows), 64))
+	n = buildbudget.Add(n, b.orderWorkspace)
 	return buildbudget.Add(n, buildbudget.Mul(int64(cap(b.refs)+cap(b.partRefs)), 4))
 }
 
@@ -195,7 +200,6 @@ func (b *headPartBuilder) flushRun() error {
 		return nil
 	}
 	b.partRefs = slices.Grow(b.partRefs, max(len(b.refs)-len(b.partRefs), 0))
-	slices.SortFunc(b.refs, func(a, c uint32) int { return b.view.ID(int(a)).Compare(b.view.ID(int(c))) })
 	for _, ref := range b.refs {
 		if err := b.ctx.Err(); err != nil {
 			return err

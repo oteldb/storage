@@ -127,6 +127,7 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 	// append-only log; a series that merely regained samples leaves no such entry, so the swap
 	// re-checks the dead set against the live buffers too.
 	e.head.swapIdentity(rebuilt, snap, e.head.series.View(), dead)
+	e.identityOrder.reset()
 	e.identityDirty = false
 	remaining := e.head.series.Len()
 	e.mu.Unlock()
