@@ -82,7 +82,8 @@ func EncodeSorted(dst []byte, n int, entry func(int, signal.Attributes) series.E
 	tab := symbols.New()
 	enc := encoder{tab: tab}
 
-	var body []byte
+	// Reserve the common compact record; larger identities can still grow.
+	body := make([]byte, 0, binary.MaxVarintLen64+n*64)
 
 	body = binary.AppendUvarint(body, uint64(n))
 	var attrs signal.Attributes
@@ -93,6 +94,9 @@ func EncodeSorted(dst []byte, n int, entry func(int, signal.Attributes) series.E
 	}
 
 	start := len(dst)
+	symbolData := tab.Encode(nil)
+	const tocBound = binary.MaxVarintLen64 + 2*(1+2*binary.MaxVarintLen64+4) + tocTrailer
+	dst = slices.Grow(dst, headerLen+len(symbolData)+len(body)+tocBound)
 	dst = binary.BigEndian.AppendUint32(dst, magic)
 	dst = append(dst, version)
 
@@ -105,7 +109,7 @@ func EncodeSorted(dst []byte, n int, entry func(int, signal.Attributes) series.E
 		kind byte
 		data []byte
 	}{
-		{sectionSymbols, tab.Encode(nil)},
+		{sectionSymbols, symbolData},
 		{sectionSeries, body},
 	} {
 		dst, toc = appendSection(dst, toc, start, sec.kind, sec.data)
