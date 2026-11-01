@@ -9,6 +9,7 @@ package watermark
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"slices"
 
 	"github.com/go-faster/errors"
 
@@ -41,6 +42,7 @@ func Key(prefix string) string { return prefix + "/smax" }
 // checksum covers only the bytes it appended — whatever dst already held is not part of the record.
 func Encode(dst []byte, entries []Entry) []byte {
 	start := len(dst)
+	dst = slices.Grow(dst, 8+binary.MaxVarintLen64+entryWidth*len(entries))
 	dst = binary.BigEndian.AppendUint32(dst, magic)
 	dst = binary.AppendUvarint(dst, uint64(len(entries)))
 

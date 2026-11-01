@@ -1,6 +1,7 @@
 package identity_test
 
 import (
+	"slices"
 	"strconv"
 	"testing"
 
@@ -210,6 +211,21 @@ func BenchmarkEncode(b *testing.B) {
 
 	for b.Loop() {
 		buf = identity.Encode(buf[:0], entries)
+	}
+}
+
+func BenchmarkEncodeSortedFresh(b *testing.B) {
+	const n = 100_000
+	entries := make([]series.Entry, n)
+	for i := range entries {
+		entries[i] = mkEntry(i)
+	}
+	slices.SortFunc(entries, func(a, b series.Entry) int { return a.ID.Compare(b.ID) })
+	entry := func(i int, _ signal.Attributes) series.Entry { return entries[i] }
+	b.SetBytes(int64(len(identity.EncodeSorted(nil, n, entry))))
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = identity.EncodeSorted(nil, n, entry)
 	}
 }
 
