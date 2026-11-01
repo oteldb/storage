@@ -51,7 +51,7 @@ func Cached(inner Backend, maxBytes int64) Backend {
 
 	c.values = otter.Must(&otter.Options[readCacheKey, []byte]{
 		MaximumWeight: uint64(maxBytes),
-		Weigher:       func(_ readCacheKey, v []byte) uint32 { return weighValue("", v) },
+		Weigher:       weighCacheEntry,
 		StatsRecorder: c.stats,
 	})
 
@@ -97,10 +97,23 @@ func weighValue(_ string, v []byte) uint32 {
 	return uint32(len(v))
 }
 
+// Small pages also pay for their key, entry and eviction metadata.
+func weighCacheEntry(key readCacheKey, value []byte) uint32 {
+	weight := weighValue("", value)
+	if key.generation == nil {
+		return weight
+	}
+	const pageEntryBytes = 256
+	if weight > math.MaxUint32-pageEntryBytes {
+		return math.MaxUint32
+	}
+	return weight + pageEntryBytes
+}
+
 // CacheStats is a snapshot of a cached backend's effectiveness.
 type CacheStats struct {
 	Hits, Misses int64
-	Bytes        int64 // resident value bytes
+	Bytes        int64 // Resident value bytes plus the page-entry metadata allowance.
 	Items        int   // resident cache entries (whole objects or pages)
 }
 
