@@ -158,6 +158,7 @@ func partOptions(blockRows int, comp compressProfile, rollup *block.Rollup) []bl
 		block.WithSortKey(colTs),
 		block.WithGranuleSize(blockRows),
 		block.WithCompressBlockBytes(metricCompressBlockBytes),
+		block.WithSizingStats(),
 	}
 	if comp.Algorithm != compress.AlgorithmNone {
 		opts = append(opts, block.WithCompression(comp.Algorithm), block.WithCompressionLevel(comp.Level))

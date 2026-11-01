@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/oteldb/storage/block"
+	"github.com/oteldb/storage/encoding/chunk"
 )
 
 // seriesBlockReader streams a single part's matched-series samples into a merge by slicing the
@@ -25,6 +26,8 @@ type seriesBlockReader struct {
 	// the column object not at all). One reader serves one part for one fetch and is not used
 	// concurrently (prefetch warms each part on its own goroutine, the scan reads them serially).
 	tsDec, valDec, sfDec *block.Decoder
+	countStreaming       bool
+	countCursor          chunk.TsCursor
 
 	// Last block held per column (index + data), so consecutive matched series that fall in the same
 	// block reuse it instead of re-locking the cache for every series. Series are visited in row

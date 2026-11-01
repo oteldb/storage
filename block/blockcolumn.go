@@ -1263,6 +1263,8 @@ type Decoder struct {
 	// output goes to a separate destination, so the frame buffer is live only during one block's
 	// decode — turning a per-block decompress into one per frame.
 	streams blockStreams
+	// ints is one owned T64 granule for [Decoder.Int64Cursor].
+	ints []int64
 }
 
 // NumBlocks returns the column's block count.
