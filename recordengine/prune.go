@@ -57,6 +57,14 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 	if e.cfg.Backend == nil {
 		return 0, nil // head-only: nothing is flushed, so no identity can have outlived its data
 	}
+	if !opts.Force {
+		e.mu.RLock()
+		skip := !e.identityDirty || e.head.series.Len() < pruneMinIdentities
+		e.mu.RUnlock()
+		if skip {
+			return 0, nil
+		}
+	}
 
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
@@ -65,15 +73,16 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 
 	e.mu.RLock()
 	dirty, total := e.identityDirty, e.head.series.Len()
-	live := e.liveIdentitiesLocked()
-	snap := e.head.series.View()
-	e.mu.RUnlock()
 
 	// Identities die only when retention drops rows or parts, so an engine that has merged nothing
 	// away since the last prune skips the work entirely. An idle tenant pays nothing.
 	if !opts.Force && (!dirty || total < pruneMinIdentities) {
+		e.mu.RUnlock()
 		return 0, nil
 	}
+	live := e.liveIdentitiesLocked()
+	snap := e.head.series.View()
+	e.mu.RUnlock()
 
 	dead := deadPositions(snap, live)
 	if len(dead) == 0 {
