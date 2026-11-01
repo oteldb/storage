@@ -80,8 +80,12 @@ func (idx partIndex) selectedIDRange(ids []signal.SeriesID) (first, end int) {
 
 // lookup returns id's row range and whether the part holds it.
 func (idx partIndex) lookup(ctx context.Context, id signal.SeriesID) (rowRange, bool, error) {
+	return idx.lookupPage(ctx, id, indexPageEntries)
+}
+
+func (idx partIndex) lookupPage(ctx context.Context, id signal.SeriesID, pageEntries int) (rowRange, bool, error) {
 	if p := idx.paged; p != nil {
-		return p.lookup(ctx, id)
+		return p.lookupPage(ctx, id, pageEntries)
 	}
 
 	i, ok := slices.BinarySearchFunc(idx.ids, id, signal.SeriesID.Compare)

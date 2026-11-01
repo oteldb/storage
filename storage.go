@@ -1405,10 +1405,9 @@ func (s *Storage) maintainOneEngine(
 	s.notifyPeers(ctx, tid, signalPrefix)
 }
 
-// runMaintenance periodically flushes and compacts every tenant engine until Close stops
-// it. It is the single background loop driving flush (age), merge+retention, and — poked by the
-// write path via flushWake — the head-size flush trigger ([Options.FlushThresholdBytes]). Both
-// paths run on this one goroutine, so an engine is never flushed twice concurrently.
+// runMaintenance drives periodic flushes and merge catch-up until Close stops it.
+// The independent pressure worker wakes catch-up after flushing an over-threshold head.
+// Per-engine flush ownership serializes the two workers' flushes.
 func (s *Storage) runMaintenance(ctx context.Context, interval time.Duration) {
 	defer s.wg.Done()
 
@@ -1422,7 +1421,7 @@ func (s *Storage) runMaintenance(ctx context.Context, interval time.Duration) {
 		case maintenanceStop:
 			return
 		case maintenanceTick:
-			s.maintain(ctx)
+			s.maintainWith(ctx, true)
 			pending = refreshMergeTasks(pending, s.mergeCatchupTasks(ctx))
 			preferMerge = true
 		case maintenanceFlush:
@@ -1600,6 +1599,10 @@ type walSyncer interface{ SyncWAL() error }
 // tick retries. In cluster mode only the tenants this node owns (its compaction claims) are
 // flushed/merged, so exactly one node writes a tenant's parts to the shared object store.
 func (s *Storage) maintain(ctx context.Context) {
+	s.maintainWith(ctx, false)
+}
+
+func (s *Storage) maintainWith(ctx context.Context, background bool) {
 	ctx = s.obs.Base(ctx)
 
 	cycleStart := time.Now()
@@ -1750,7 +1753,11 @@ func (s *Storage) maintain(ctx context.Context) {
 
 	for tid, eng := range metricEngines {
 		tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), deferred: eng.MergeDeferred(), run: func() {
-			maintainEngine(tid, metricsPrefix, func() error { return eng.Flush(ctx) },
+			flush := eng.Flush
+			if background && s.cluster == nil {
+				flush = eng.FlushIfIdle
+			}
+			maintainEngine(tid, metricsPrefix, func() error { return flush(ctx) },
 				func() error { return mergeMetrics(tid, eng) },
 				func() error { return refreshMetrics(eng) },
 				func() error { return eng.ReloadFenced(ctx) },

@@ -96,6 +96,13 @@ merge does not stop pressure wakes. Completed pressure passes wake merge catch-u
 queued maintenance admission, drains both workers, then performs the final engine flush. There is
 only one frozen generation per engine; no extra flush queue or parallel appenders are introduced.
 
+Single-node background metrics maintenance uses `Engine.FlushIfIdle`: atomic try-locks skip a
+flush already owned by the pressure worker, so compaction can proceed over immutable parts.
+An idle below-threshold head still flushes on the regular ticker. Explicit `Flush`,
+`Admin.MaintainNow`, final close and clustered maintenance retain their blocking flush ordering.
+Skipped background work does not detach a head, change a WAL epoch or checkpoint data.
+Identity pruning made necessary by removed rows still joins the existing build barrier.
+
 ## Head
 
 The index (`symbols`+`series`+`postings`) plus per-series `(ts, value)` buffers.
@@ -1421,11 +1428,17 @@ Layered optimizations, each opt-in:
 
 **Series index sidecar** (`{prefix}/sidx`) — sorted distinct SeriesIDs and run-start rows.
 Sparse candidate sets use binary searches; dense sets use linear intersection. Large indexes
-retain one fence ID per 1,024 entries and read the selected 20-KiB leaf pages through the backend's
-shared byte-bounded page cache. A page includes the next entry to bound a run crossing its end.
+retain one fence ID per 256 entries. Default and dense lookups read 1,024-entry (20-KiB) pages;
+memoized plans with fewer than `part series / 1,024` candidates read 256-entry (5-KiB) pages.
+The choice is per call; coarse searches inspect every fourth fence. A page includes the next
+entry to bound a run crossing its end. Pages share the backend's byte-bounded cache.
 Full CRC validation occurs at open using an uncached read on durable range-capable backends.
 Large paged indexes then retain only fences: the first lookup reads its selected leaf page.
 Opening a write-only part pins neither the full validation view nor a whole-object cache entry.
+
+Fine-page plans memoize both matching and missing IDs, so collection needs no second index read.
+Fine and coarse cache keys can overlap and remain resident together; both consume the same byte
+budget, and a cached coarse page does not automatically satisfy a fine-page request.
 
 A missing or corrupt sidecar rebuilds the resident index from the series column. Backends without
 native ranged reads retain the whole-object path. The serialized sidecar format is unchanged.
