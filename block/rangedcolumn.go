@@ -424,8 +424,8 @@ func varintLen(v uint64) int {
 //
 // With a read-ahead window set it fetches whole frames up to that many bytes at a time instead of
 // one frame per request. That is the difference between a merge completing over S3 and not: a frame
-// is [defaultCompressBlockBytes] *uncompressed*, so a 256 MiB column is thousands of frames, and
-// [backend.Cache] deliberately does not cache ranged reads — nothing amortizes them. Window is the
+// is [defaultCompressBlockBytes] *uncompressed*, so a 256 MiB column is thousands of frames.
+// Point reads share cached immutable frames; sequential windows bypass that cache. Window is the
 // read side's memory budget, one buffer per open column, so it is the caller's to size.
 type frameSource struct {
 	// ctx belongs to the operation that opened the decoder and bounds its reads; the decoder is
@@ -462,7 +462,13 @@ func (s *frameSource) frame(f int, off, n int64) ([]byte, error) {
 
 // read fetches [off, off+n) of the data region, rejecting a short answer rather than decoding one.
 func (s *frameSource) read(off, n int64) ([]byte, error) {
-	buf, err := backend.ReadViewAt(s.ctx, s.b, s.key, s.base+off, n)
+	var buf []byte
+	var err error
+	if s.window == 0 {
+		buf, err = backend.ReadPageView(s.ctx, s.b, s.key, s.base+off, n)
+	} else {
+		buf, err = backend.ReadViewAt(s.ctx, s.b, s.key, s.base+off, n)
+	}
 	if err != nil {
 		return nil, errors.Wrapf(err, "read frames at [%d,+%d)", s.base+off, n)
 	}
