@@ -6,10 +6,30 @@ import "sync"
 // Mutex serializes mutations while allowing readers during a writer's blocking I/O.
 // The zero value is ready to use. Like [sync.RWMutex], it must not be copied or locked recursively.
 type Mutex struct {
+	mode    *sync.RWMutex
 	catalog sync.Mutex
 	writer  sync.Mutex
 	state   sync.RWMutex
 }
+
+// EnableSharedWriters installs a writer lifecycle gate before concurrent use starts.
+func (m *Mutex) EnableSharedWriters() {
+	if m.mode != nil {
+		panic("writer lifecycle gate already enabled")
+	}
+	m.mode = &sync.RWMutex{}
+}
+
+// RLockWriter pins the registry generation for independent warm preparation/publication.
+func (m *Mutex) RLockWriter() {
+	if m.mode == nil {
+		panic("shared writers not enabled")
+	}
+	m.mode.RLock()
+}
+
+// RUnlockWriter releases warm ownership without changing query visibility ownership.
+func (m *Mutex) RUnlockWriter() { m.mode.RUnlock() }
 
 // Lock acquires catalog ownership, then the writer gate and mutable state.
 func (m *Mutex) Lock() {
@@ -17,15 +37,36 @@ func (m *Mutex) Lock() {
 	m.LockWriter()
 }
 
+// TryLock attempts catalog and writer ownership without waiting for either gate.
+func (m *Mutex) TryLock() bool {
+	if !m.catalog.TryLock() {
+		return false
+	}
+	if !m.TryLockWriter() {
+		m.catalog.Unlock()
+		return false
+	}
+	return true
+}
+
 // LockWriter orders ingestion and WAL operations without joining catalog publication.
 func (m *Mutex) LockWriter() {
+	if m.mode != nil {
+		m.mode.Lock()
+	}
 	m.writer.Lock()
 	m.state.Lock()
 }
 
 // TryLockWriter acquires writer and state ownership if no other writer owns it; it may wait for readers.
 func (m *Mutex) TryLockWriter() bool {
+	if m.mode != nil && !m.mode.TryLock() {
+		return false
+	}
 	if !m.writer.TryLock() {
+		if m.mode != nil {
+			m.mode.Unlock()
+		}
 		return false
 	}
 	m.state.Lock()
@@ -42,6 +83,9 @@ func (m *Mutex) Unlock() {
 func (m *Mutex) UnlockWriter() {
 	m.state.Unlock()
 	m.writer.Unlock()
+	if m.mode != nil {
+		m.mode.Unlock()
+	}
 }
 
 // RLock acquires a state snapshot without joining the writer gate.

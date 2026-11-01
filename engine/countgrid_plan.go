@@ -66,12 +66,13 @@ func (e *Engine) snapshotCountGrid(ctx context.Context, r fetch.Request, presenc
 	ids := e.head.resolve(r.Matchers)
 	p := &enginePlan{ids: ids, engine: e, start: r.Start, end: r.End,
 		decoded: make(partDecodeCache), memActive: make([]bool, len(ids))}
+	e.captureReadView(p)
 	cp := &countGridPlan{plan: p, starts: make([]int, len(ids)+1)}
 	if grouped {
 		p.series = e.getSeriesSlice(len(ids))
 	}
 	recent := e.recentEnabled()
-	if !recent || r.Start < e.recentMin {
+	if !p.recentCovers(e, r.Start) {
 		e.acquireWindowParts(p, r.Start, r.End, false)
 	}
 	view := e.head.series.View()

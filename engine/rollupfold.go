@@ -67,13 +67,13 @@ func tagSamples(ts []int64, layout []DownsampleTier) []rollupTag {
 	return tags
 }
 
-func appendTags(tags []rollupTag, r *tsRun, layout []DownsampleTier, lo, hi, n, capHint int) []rollupTag {
+func appendTags(tags []rollupTag, ts []int64, layout []DownsampleTier, before, capHint int) []rollupTag {
 	if tags == nil && len(layout) == 0 {
 		return nil
 	}
 
-	for k := lo; k < hi; k++ {
-		tags = appendTag(tags, runTag(layout, r.ts[k]), n-(hi-k)+1, capHint)
+	for k, timestamp := range ts {
+		tags = appendTag(tags, runTag(layout, timestamp), before+k+1, capHint)
 	}
 
 	return tags
@@ -101,6 +101,9 @@ func foldTie(runs []tsRun, layouts [][]DownsampleTier, cur []int, ts int64) (v, 
 		r := &runs[i]
 		if cur[i] >= len(r.ts) || r.ts[cur[i]] != ts {
 			continue
+		}
+		for cur[i]+1 < len(r.ts) && r.ts[cur[i]+1] == ts {
+			cur[i]++
 		}
 
 		switch t := runTag(layoutOf(layouts, i), ts); {

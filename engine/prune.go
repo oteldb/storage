@@ -126,7 +126,16 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 	// Identities registered while the rebuild ran sit past the snapshot's end in the same
 	// append-only log; a series that merely regained samples leaves no such entry, so the swap
 	// re-checks the dead set against the live buffers too.
-	e.head.swapIdentity(rebuilt, snap, e.head.series.View(), dead)
+	plan := &enginePlan{engine: e, start: minInt64, end: maxInt64}
+	e.captureReadView(plan)
+	e.head.swapIdentityWith(rebuilt, snap, e.head.series.View(), dead, plan.memoryRunPresent)
+	if plan.readView != nil {
+		plan.readView.release()
+	}
+	if e.head.logged != nil {
+		e.loggedIdentities.prepare(e.head.series, e.loggedIdentities.epoch, e.head.series.Len())
+	}
+	e.syncMemoryPartsLocked()
 	e.identityOrder.reset()
 	e.identityDirty = false
 	remaining := e.head.series.Len()
@@ -165,7 +174,10 @@ func (e *Engine) liveIdentities(ctx context.Context, parts []*part) (map[signal.
 	live := make(map[signal.SeriesID]struct{})
 
 	for _, p := range parts {
-		if err := p.index.forEachID(ctx, func(id signal.SeriesID) { live[id] = struct{}{} }); err != nil {
+		p.acquire()
+		err := p.index.forEachID(ctx, func(id signal.SeriesID) { live[id] = struct{}{} })
+		p.release()
+		if err != nil {
 			return nil, errors.Wrapf(err, "enumerate series of part %q", p.prefix)
 		}
 	}
@@ -185,6 +197,17 @@ func (e *Engine) liveIdentities(ctx context.Context, parts []*part) (map[signal.
 
 	for id := range e.recent {
 		live[id] = struct{}{}
+	}
+	plan := &enginePlan{engine: e, start: minInt64, end: maxInt64}
+	e.captureReadView(plan)
+	plan.forEachMemoryRun(func(run *memoryRun) bool {
+		for _, entry := range run.series {
+			live[entry.id] = struct{}{}
+		}
+		return true
+	})
+	if plan.readView != nil {
+		plan.readView.release()
 	}
 
 	return live, nil

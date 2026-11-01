@@ -1445,12 +1445,19 @@ func (s *Storage) runMaintenance(ctx context.Context, interval time.Duration) {
 // measurement it would have to take on every batch.
 type headSized interface{ HeadBytes() int64 }
 
+func residentHeadBytes(eng headSized) int64 {
+	if resident, ok := eng.(interface{ ResidentHeadBytes() int64 }); ok {
+		return resident.ResidentHeadBytes()
+	}
+	return eng.HeadBytes()
+}
+
 // pokeFlush signals the maintenance loop that eng's head may have reached the flush threshold.
 // Called from the write path after an append; non-blocking, so ingestion never waits on the loop (a
 // poke already queued covers this one). When the size trigger is off or there is no loop it returns
 // on a nil check, without measuring the head — the write path must not pay for a disabled trigger.
 func (s *Storage) pokeFlush(eng headSized) {
-	if s.flushWake == nil || eng.HeadBytes() < s.opts.flushThresholdBytes() {
+	if s.flushWake == nil || residentHeadBytes(eng) < s.opts.flushThresholdBytes() {
 		return
 	}
 
@@ -1482,7 +1489,7 @@ func (s *Storage) flushPressured(ctx context.Context) {
 	}
 
 	for tid, eng := range s.engineSnapshotByTenant() {
-		collect(tid, eng.HeadBytes(), eng.Flush)
+		collect(tid, eng.ResidentHeadBytes(), eng.Flush)
 	}
 
 	for _, engines := range []map[signal.TenantID]*recordengine.Engine{

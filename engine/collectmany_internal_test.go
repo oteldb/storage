@@ -36,7 +36,7 @@ func collectManyNaive(runs []tsRun) (ts []int64, values, sf []float64) {
 		var winVal, winW float64 = 0, 1
 
 		for i := range runs {
-			if cur[i] < len(runs[i].ts) && runs[i].ts[cur[i]] == minTs {
+			for cur[i] < len(runs[i].ts) && runs[i].ts[cur[i]] == minTs {
 				winVal, winW = runs[i].vals[cur[i]], runs[i].weight(cur[i])
 				cur[i]++
 			}
@@ -107,13 +107,13 @@ func TestCollectMany(t *testing.T) {
 			wantVal: []float64{100, 200},
 		},
 		{
-			name: "duplicates inside one run are kept",
+			name: "duplicates inside one run keep the last value",
 			runs: []tsRun{
 				run([]int64{1, 1, 2}, []float64{1, 2, 3}, nil),
 				run([]int64{5}, []float64{5}, nil),
 			},
-			wantTS:  []int64{1, 1, 2, 5},
-			wantVal: []float64{1, 2, 3, 5},
+			wantTS:  []int64{1, 2, 5},
+			wantVal: []float64{2, 3, 5},
 		},
 		{
 			name: "weights follow their run across a bulk stretch",

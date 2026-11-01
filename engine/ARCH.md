@@ -22,6 +22,35 @@ lazy postings sorting takes only state exclusion. None of these locks is reentra
 | checkpoint | only the captured sealed prefix, after confirmed catalog commit; readers proceed |
 | reclamation | retired parts wait for query and builder references, then are deleted |
 
+### Standalone durable memory runs
+
+An engine with a WAL and backend, without cluster ownership configuration, publishes immutable
+numeric runs. Known identities use a shared writer-lifecycle lease instead of the exclusive
+writer/state locks. Private preparation is bounded to eight concurrent batches across engines.
+Uncontended ID reservations update one stripe at a time; conflicts use canonical-ID FIFO ordering.
+Reservations remain owned through WAL success, publication and watermark/identity-marker finalization.
+
+WAL frame writes retain one serialized owner. Encoding and run construction happen before that
+owner. Sorted prepared columns transfer to the run; unordered inputs use an owned sorted copy.
+A short publication mutex installs a persistent radix path, preallocated before the WAL write.
+Queries pin one root covering active, frozen and recent runs plus the readable file-part set.
+Numeric reads and result copying happen outside publication ownership.
+
+An owned lazy worker coalesces closed cohorts with at most 64 MiB of source run storage, reserving
+additional workspace through the build pool. Its timestamp heap preserves source order on ties.
+Warm admission waits before writer-lifecycle ownership when run fanout reaches its bound; an
+unmergeable full directory returns a retryable capacity error. Close cancels and joins this worker.
+`ResidentHeadBytes` counts owned run columns and directory slabs until the last reader/build lease
+ends; pressure flushing uses this physical measure, while `HeadBytes` retains its sample-byte contract.
+
+Flush drains admitted writers before sealing the WAL and freezing the covered root. Readers proceed
+during the seal. Frozen runs stream in global SeriesID order to file writers without materializing
+one full set of flush columns. Successful publication replaces frozen runs with file parts; failure
+reattaches descriptors. Replay, pruning, reset and label liveness include the same run sources.
+Recent reads use their pinned completeness boundary. File deletion waits for both query users and
+directory owners, sharing one lifetime across metadata revisions of a physical prefix. Catalog
+ownership excludes prefix revival throughout reclamation and reset deletion while I/O admits writes.
+
 Reset, repair and pruning take the build barrier exclusively. Pruning also excludes public
 reloads through an identity lifecycle gate; a newly adopted part cannot revive an identity
 between prune planning and installation. Full recovery/reload retains writer ordering while

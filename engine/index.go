@@ -200,6 +200,7 @@ func mergeHoles(cur, other []bucketindex.Entry) []bucketindex.Entry {
 // readable set but kept in the index: the entry is what keeps the part reachable, and only its
 // writer knows whether it is still live. Caller holds e.mu.
 func (e *Engine) openForeignLocked(ctx context.Context) {
+	defer e.syncMemoryPartsLocked()
 	if len(e.foreign) == 0 {
 		e.foreignParts = nil
 
@@ -524,6 +525,12 @@ func (e *Engine) livePart(
 	if err != nil {
 		return nil, errors.Wrapf(err, "open part %q", ent.Prefix)
 	}
+	if prior := open[ent.Prefix]; prior != nil {
+		p.life.Store(prior.lifetime())
+	}
+	if e.memoryPublicationEnabled() {
+		e.partLifetimes.bind(p)
+	}
 
 	// The handle this one replaces names a part that is still live, so it is not a dropped one.
 	delete(open, ent.Prefix)
@@ -764,6 +771,7 @@ func (e *Engine) ReloadFenced(ctx context.Context) error {
 // adopted changes nothing but the fence: every commit is refused until a load succeeds. Caller holds
 // e.mu.
 func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
+	defer e.syncMemoryPartsLocked()
 	sweep := mode != loadReplica
 
 	if e.cfg.Backend == nil {
@@ -805,6 +813,9 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 	complete, err := e.loadIdentitiesLocked(ctx, l.parts)
 	if err != nil {
 		return err
+	}
+	if e.head.logged != nil {
+		e.loggedIdentities.prepare(e.head.series, e.cfg.WAL.Epoch(), e.head.series.Len())
 	}
 
 	// Identity and the next WAL epoch must be ready before the repair commit admits readers/writers.

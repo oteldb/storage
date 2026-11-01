@@ -120,6 +120,7 @@ func (e *Engine) planLookup(r fetch.Request, withIdentity bool) ([]signal.Series
 	ids := e.head.resolve(r.Matchers)
 	plan := e.planExistence(ids, r, withIdentity)
 	e.mu.RUnlock()
+	plan.markMemoryRunExistence()
 
 	return ids, plan
 }

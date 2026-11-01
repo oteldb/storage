@@ -368,6 +368,7 @@ func (e *Engine) dropExpired(ctx context.Context, src []*part, opts MergeOptions
 
 	e.parts = next
 	e.retireLocked(expired)
+	e.syncMemoryPartsLocked()
 	// Every sample these parts held is gone, so the identities naming them may be dead — the same
 	// reasoning as a merge that drops rows, and the identity prune has something to find.
 	e.identityDirty = true
@@ -780,6 +781,7 @@ func mergeStreamedSeries(
 // Close flushes any buffered samples to a part and closes the WAL. It does not stop a background
 // loop — the owner ([storage.Storage]) does that before calling Close.
 func (e *Engine) Close(ctx context.Context) error {
+	e.stopMemoryWork()
 	// A clustered engine without the shard's claim leaves its head to the WAL, for the next start
 	// to replay, rather than failing to close. A flush that failed otherwise still closes the WAL:
 	// its segments hold the head for the next start either way.
@@ -809,6 +811,7 @@ func (e *Engine) Close(ctx context.Context) error {
 // on platforms that refuse to delete a file held open by a live process (Windows). No-op without a
 // WAL.
 func (e *Engine) CloseWAL() error {
+	e.stopMemoryWork()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 

@@ -3,6 +3,7 @@ package engine
 import (
 	"cmp"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/oteldb/storage/index/postings"
@@ -25,6 +26,8 @@ var (
 // plus per-series sample buffers in arrival order (sorted on read). It is not safe for
 // concurrent use; the [Engine] holds the lock.
 type head struct {
+	runMarker       *sampleBuf
+	memoryRuns      bool
 	sym             *symbols.Table
 	series          *series.Index
 	post            *postings.Dense
@@ -39,9 +42,15 @@ type head struct {
 	// samples becoming durable — and is cleared only with the head itself, so it grows with the same
 	// all-time series set the identity index already retains.
 	seriesNewest map[signal.SeriesID]int64
+	admission    *seriesReservations
+	logged       *walIdentitySet
 
-	bytes         int64 // active buffered sample bytes (SampleBytes each)
-	detachedBytes int64 // resident samples held by the single in-flight flush
+	bytes            int64 // active buffered sample bytes (SampleBytes each)
+	detachedBytes    int64 // resident samples held by the single in-flight flush
+	runBytes         atomic.Int64
+	runNewest        atomic.Int64
+	runFirst         atomic.Pointer[time.Time]
+	detachedRunBytes int64
 	// since is when the head took its first bytes after the last flush (zero while empty). It is
 	// the only wall-clock the head keeps: sample timestamps are data time, which backfill makes
 	// unusable as a measure of how long data has been sitting unflushed.
@@ -62,11 +71,23 @@ func (h *head) grow(n int64) {
 // head, so a live one floors at a tick: a coarse clock (Windows moves in ~15ms steps) otherwise
 // reports a head that has just taken its first bytes as having none.
 func (h *head) age() time.Duration {
-	if h.bytes == 0 || h.since.IsZero() {
+	since := h.firstSince()
+	if h.activeBytes() == 0 || since.IsZero() {
 		return 0
 	}
 
-	return max(time.Since(h.since), time.Nanosecond)
+	return max(time.Since(since), time.Nanosecond)
+}
+
+func (h *head) activeBytes() int64 { return h.bytes + h.runBytes.Load() }
+func (h *head) maxNewest() int64   { return max(h.newest, h.runNewest.Load()) }
+
+func (h *head) firstSince() time.Time {
+	since := h.since
+	if run := h.runFirst.Load(); run != nil && (since.IsZero() || run.Before(since)) {
+		since = *run
+	}
+	return since
 }
 
 type sampleBuf struct {
@@ -97,10 +118,11 @@ func (b *sampleBuf) appendSample(ts int64, value, sf float64) {
 
 func newHead() *head {
 	return &head{
-		sym:     symbols.New(),
-		series:  series.New(),
-		post:    postings.NewDense(),
-		samples: make(map[signal.SeriesID]*sampleBuf),
+		runMarker: &sampleBuf{},
+		sym:       symbols.New(),
+		series:    series.New(),
+		post:      postings.NewDense(),
+		samples:   make(map[signal.SeriesID]*sampleBuf),
 
 		seriesNewest: make(map[signal.SeriesID]int64),
 	}
@@ -114,6 +136,9 @@ func newHead() *head {
 func (h *head) identityBytes() int64 {
 	n := h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
 		int64(len(h.seriesNewest))*watermarkEntryBytes
+	if h.admission != nil {
+		n += h.admission.newestBytes()
+	}
 	if h.nonStringLabels != nil {
 		n += memsize.Map(h.nonStringLabels)
 	}
@@ -172,6 +197,10 @@ func rebuildIdentity(snap series.View, live map[signal.SeriesID]struct{}) *head 
 //
 // Caller holds the engine lock.
 func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32) {
+	h.swapIdentityWith(rebuilt, snap, tail, dead, nil)
+}
+
+func (h *head) swapIdentityWith(rebuilt *head, snap, tail series.View, dead []int32, live func(signal.SeriesID) bool) {
 	var attrs signal.Attributes
 	for i := snap.Len(); i < tail.Len(); i++ {
 		ident := tail.At(i, attrs)
@@ -181,7 +210,8 @@ func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32)
 
 	for _, pos := range dead {
 		id := snap.ID(int(pos))
-		if _, revived := h.samples[id]; revived {
+		_, revived := h.samples[id]
+		if revived || live != nil && live(id) {
 			ident := snap.At(int(pos), attrs)
 			attrs = ident.Attributes
 			rebuilt.register(id, ident)
@@ -189,7 +219,7 @@ func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32)
 			continue
 		}
 
-		delete(h.seriesNewest, id)
+		h.deleteNewest(id)
 	}
 
 	h.sym, h.series, h.post = rebuilt.sym, rebuilt.series, rebuilt.post
@@ -209,20 +239,44 @@ func (h *head) outOfOrder(id signal.SeriesID, ts, oooWindow int64) bool {
 		return false
 	}
 
-	newest, seen := h.seriesNewest[id]
+	newest, seen := h.committedNewest(id)
 
 	return seen && ts < newest-oooWindow
 }
 
 // noteTS advances series id's own watermark and the head-global one after a sample is admitted.
 func (h *head) noteTS(id signal.SeriesID, ts int64) {
-	if newest, seen := h.seriesNewest[id]; !seen || ts > newest {
-		h.seriesNewest[id] = ts
+	if newest, seen := h.committedNewest(id); !seen || ts > newest {
+		h.setNewest(id, ts)
 	}
 
 	if ts > h.newest {
 		h.newest = ts
 	}
+}
+
+func (h *head) committedNewest(id signal.SeriesID) (int64, bool) {
+	if h.admission != nil {
+		return h.admission.newestFor(id)
+	}
+	timestamp, found := h.seriesNewest[id]
+	return timestamp, found
+}
+
+func (h *head) setNewest(id signal.SeriesID, timestamp int64) {
+	if h.admission != nil {
+		h.admission.setNewest(id, timestamp)
+		return
+	}
+	h.seriesNewest[id] = timestamp
+}
+
+func (h *head) deleteNewest(id signal.SeriesID) {
+	if h.admission != nil {
+		h.admission.deleteNewest(id)
+		return
+	}
+	delete(h.seriesNewest, id)
 }
 
 // append adds one sample for series s, registering and indexing it on first sight. A
@@ -661,12 +715,13 @@ func winBuffers(e *Engine, n int) ([]int64, []float64) {
 // is published, so a concurrent fetch never loses sight of the samples mid-flush, and hands the two
 // bookkeeping values back to [head.reattach] if the flush fails before publishing.
 func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
-	hasRows := false
-	for _, buf := range h.samples {
-		if len(buf.ts) > 0 {
-			hasRows = true
-
-			break
+	hasRows := h.memoryRuns && h.activeBytes() > 0
+	if !hasRows {
+		for _, buf := range h.samples {
+			if len(buf.ts) > 0 {
+				hasRows = true
+				break
+			}
 		}
 	}
 
@@ -674,7 +729,10 @@ func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
 		return nil, 0, time.Time{}
 	}
 
-	detached, bytes, since := h.samples, h.bytes, h.since
+	detached, since := h.samples, h.firstSince()
+	h.detachedRunBytes = h.runBytes.Swap(0)
+	bytes := h.bytes + h.detachedRunBytes
+	h.runFirst.Store(nil)
 	h.samples = make(map[signal.SeriesID]*sampleBuf)
 	h.bytes = 0
 	h.detachedBytes = bytes
@@ -689,6 +747,12 @@ func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
 // replaces the live one.
 func (h *head) reattach(detached map[signal.SeriesID]*sampleBuf, bytes int64, since time.Time) {
 	for id, buf := range detached {
+		if buf == h.runMarker {
+			if h.samples[id] == nil {
+				h.samples[id] = h.runMarker
+			}
+			continue
+		}
 		if len(buf.ts) == 0 {
 			continue
 		}
@@ -702,7 +766,15 @@ func (h *head) reattach(detached map[signal.SeriesID]*sampleBuf, bytes int64, si
 		h.samples[id] = buf
 	}
 
-	h.grow(bytes)
+	h.grow(bytes - h.detachedRunBytes)
+	if h.detachedRunBytes > 0 {
+		h.runBytes.Add(h.detachedRunBytes)
+		if first := h.runFirst.Load(); first == nil || since.Before(*first) {
+			stamp := since
+			h.runFirst.Store(&stamp)
+		}
+	}
+	h.detachedRunBytes = 0
 	h.detachedBytes = 0
 
 	// grow stamps since at now for a head that was empty; the samples coming back are older than
@@ -822,4 +894,4 @@ func windowCopy(buf *sampleBuf, start, end int64, e *Engine) ([]int64, []float64
 	return ts, values, sf
 }
 
-func (h *head) inFlightBytes() int64 { return h.bytes + h.detachedBytes }
+func (h *head) inFlightBytes() int64 { return h.activeBytes() + h.detachedBytes }

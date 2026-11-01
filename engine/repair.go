@@ -65,6 +65,7 @@ func (h *repairHost) CommitLocked(ctx context.Context) error {
 		return err
 	}
 	h.e.parts = h.next
+	h.e.syncMemoryPartsLocked()
 	return nil
 }
 func (h *repairHost) RetireLocked(parts []*part)  { h.e.retireLocked(parts) }

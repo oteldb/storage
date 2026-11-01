@@ -58,12 +58,20 @@ func (k *Keys) Reset(src []Source) {
 
 // Next advances to the next distinct key, reporting false once every source is exhausted.
 func (k *Keys) Next() bool {
+	return k.NextMatched(nil)
+}
+
+// NextMatched visits the first matching position of each input before advancing it.
+func (k *Keys) NextMatched(visit func(Source, int)) bool {
 	if len(k.heap) == 0 {
 		return false
 	}
 
 	k.key = k.heap[0].key
 	for len(k.heap) > 0 && k.heap[0].key == k.key {
+		if visit != nil {
+			visit(k.heap[0].src, k.heap[0].i)
+		}
 		k.skip()
 	}
 

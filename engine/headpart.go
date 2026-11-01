@@ -36,6 +36,7 @@ type headPartBuilder struct {
 	parts            []*part
 	rows             int
 	orderWorkspace   int64
+	direct           bool
 }
 
 func (e *Engine) flushMemoryBytes() int64 {
@@ -142,6 +143,10 @@ func (b *headPartBuilder) add(ref uint32, buf *sampleBuf) error {
 		// sortedWindow retains its tuple scratch and up to three owned numeric columns.
 		sorting = buildbudget.Mul(int64(len(buf.ts)), 48)
 	}
+	return b.addSeries(ref, len(buf.ts), sorting)
+}
+
+func (b *headPartBuilder) addSeries(ref uint32, rows int, sorting int64) error {
 	single := buildbudget.Add(b.baseBytes(), b.view.IdentityWorkspace(int(ref)))
 	single = buildbudget.Add(single, b.view.MaterializationBytes(int(ref)))
 	single = buildbudget.Add(single, sorting)
@@ -155,14 +160,14 @@ func (b *headPartBuilder) add(ref uint32, buf *sampleBuf) error {
 		}
 	}
 	b.identities.Add(b.view, int(ref))
-	estimate := b.estimate(ref, len(buf.ts), sorting)
+	estimate := b.estimate(ref, rows, sorting)
 	maxRows := b.partRows()
-	if len(b.refs) > 0 && (estimate > b.target || maxRows > 0 && b.runRows+int64(len(buf.ts)) > int64(maxRows)) {
+	if len(b.refs) > 0 && (estimate > b.target || maxRows > 0 && b.runRows+int64(rows) > int64(maxRows)) {
 		if err := b.flushRun(); err != nil {
 			return err
 		}
 		b.identities.Add(b.view, int(ref))
-		estimate = b.estimate(ref, len(buf.ts), sorting)
+		estimate = b.estimate(ref, rows, sorting)
 	}
 	if estimate > b.reserved {
 		if err := b.reserve(estimate); err != nil {
@@ -172,7 +177,7 @@ func (b *headPartBuilder) add(ref uint32, buf *sampleBuf) error {
 	b.encoded = buildbudget.Add(b.encoded, b.view.EncodingBytes(int(ref)))
 	b.materialized = max(b.materialized, b.view.MaterializationBytes(int(ref)))
 	b.sorting = max(b.sorting, sorting)
-	b.runRows = buildbudget.Add(b.runRows, int64(len(buf.ts)))
+	b.runRows = buildbudget.Add(b.runRows, int64(rows))
 	b.refs = append(b.refs, ref)
 	return nil
 }
@@ -201,6 +206,9 @@ func (b *headPartBuilder) flushRun() error {
 	}
 	b.partRefs = slices.Grow(b.partRefs, max(len(b.refs)-len(b.partRefs), 0))
 	for _, ref := range b.refs {
+		if b.direct {
+			break
+		}
 		if err := b.ctx.Err(); err != nil {
 			return err
 		}
@@ -241,7 +249,7 @@ func (b *headPartBuilder) append(ref uint32, ts []int64, values, sf []float64) e
 			if err != nil {
 				return err
 			}
-			if err := b.writer.reserveSeries(len(b.refs)); err != nil {
+			if err := b.writer.reserveSeries(b.seriesCapacity()); err != nil {
 				return err
 			}
 			b.writerRows = b.partRows()
@@ -286,4 +294,11 @@ func (b *headPartBuilder) finish() error {
 	b.writer = nil
 	b.partRefs = b.partRefs[:0]
 	return nil
+}
+
+func (b *headPartBuilder) seriesCapacity() int {
+	if b.direct {
+		return cap(b.refs)
+	}
+	return len(b.refs)
 }
