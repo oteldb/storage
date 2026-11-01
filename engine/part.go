@@ -371,6 +371,8 @@ type part struct {
 	// part is not deleted from the backend until its refs reach zero, so a lock-free read never races a
 	// delete.
 	refs atomic.Int32
+	// File lifetime includes directory owners; refs above still controls query index-cache pins.
+	life atomic.Pointer[partLifetime]
 
 	// seriesMaxMu guards seriesMax, the per-series watermarks of [part.forEachSeriesMaxTime]. A
 	// mutex rather than a sync.Once so a failed load (a transient backend error) is retried instead
@@ -384,7 +386,33 @@ type part struct {
 	identityLoaded, identityPresent bool
 }
 
-func (p *part) acquire() { p.refs.Add(1) }
+type partLifetime struct{ refs atomic.Int32 }
+
+func (p *part) lifetime() *partLifetime {
+	if life := p.life.Load(); life != nil {
+		return life
+	}
+	life := &partLifetime{}
+	if p.life.CompareAndSwap(nil, life) {
+		return life
+	}
+	return p.life.Load()
+}
+
+func (p *part) acquire() {
+	p.lifetime().refs.Add(1)
+	p.refs.Add(1)
+}
+
+func (p *part) acquireView() { p.lifetime().refs.Add(1) }
+
+func (p *part) releaseView() {
+	if p.lifetime().refs.Add(-1) < 0 {
+		panic("release unowned part view")
+	}
+}
+
+func (p *part) reclaimable() bool { return p.lifetime().refs.Load() == 0 }
 
 // release drops one fetch's hold. When the last in-flight fetch lets go, a paged index's entries
 // view is released too, so between fetches the index bytes stay only in the (evictable) backend
@@ -393,6 +421,7 @@ func (p *part) release() {
 	if p.refs.Add(-1) == 0 {
 		p.index.dropView()
 	}
+	p.releaseView()
 }
 
 // deletePart removes every backend object of the part at prefix. See [block.DeletePart].

@@ -109,6 +109,7 @@ func (e *Engine) publishMerge(
 	e.parts = next
 	e.retireLocked(selected)
 	e.trimRecentBelow(plan.rolledBefore())
+	e.syncMemoryPartsLocked()
 	// Rows that did not survive the merge are retention's work: the samples are gone, so the
 	// identities naming them may be dead too and an identity prune has something to find. Merging
 	// without dropping rows (a plain compaction) leaves every identity backed, so it arms nothing.

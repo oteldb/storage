@@ -34,7 +34,19 @@ func (p *batchPreparations) acquire() *preparedBatch {
 	default:
 		return nil
 	}
+	return p.take()
+}
 
+func (p *batchPreparations) acquireUntil(done <-chan struct{}) *preparedBatch {
+	select {
+	case p.active <- struct{}{}:
+		return p.take()
+	case <-done:
+		return nil
+	}
+}
+
+func (p *batchPreparations) take() *preparedBatch {
 	select {
 	case b := <-p.free:
 		return b
@@ -58,19 +70,23 @@ func (p *batchPreparations) release(b *preparedBatch) {
 }
 
 type preparedGroup struct {
+	ref    uint32
+	known  bool
 	offset int
 	count  int
 	staged int
 }
 
 type preparedBatch struct {
-	batch     *walBatch
-	positions []int
-	groups    []preparedGroup
-	ts        []int64
-	values    []float64
-	sf        []float64
-	current   int
+	reservation *seriesReservation
+	sortedAccs  []int
+	batch       *walBatch
+	positions   []int
+	groups      []preparedGroup
+	ts          []int64
+	values      []float64
+	sf          []float64
+	current     int
 }
 
 func (p *preparedBatch) prepare(ids []signal.SeriesID) {
@@ -111,6 +127,9 @@ func (e *Engine) appendPrepared(
 	p *preparedBatch,
 ) (AppendResult, error) {
 	e.mu.LockWriter()
+	if err := e.waitMemoryWriterCapacity(); err != nil {
+		return AppendResult{}, err
+	}
 	defer e.mu.UnlockWriter()
 	return e.appendPreparedLocked(ids, ts, values, sf, materialize, limits, p)
 }
@@ -128,7 +147,7 @@ func (e *Engine) appendPreparedLocked(
 	if err != nil {
 		return AppendResult{}, err
 	}
-	p.batch.apply(e.head)
+	e.applyLoggedBatch(p.batch)
 	return res, nil
 }
 
@@ -170,7 +189,7 @@ func (p *preparedBatch) admit(
 		if k >= 0 {
 			newest, seen = b.accs[k].admissionNewest(), true
 		} else {
-			newest, seen = h.seriesNewest[id]
+			newest, seen = h.committedNewest(id)
 		}
 		if seen && ts < newest-oooWindow {
 			return rejectOOO
@@ -184,12 +203,23 @@ func (p *preparedBatch) admit(
 		return admitted
 	}
 	if oooWindow <= 0 {
-		newest, seen = h.seriesNewest[id]
+		newest, seen = h.committedNewest(id)
 	}
-	acc := walSeriesAcc{buffer: h.samples[id], priorNewest: newest, hadNewest: seen}
+	acc := walSeriesAcc{priorNewest: newest, hadNewest: seen}
+	acc.rowOffset = uint32(g.offset)
+	if h.logged == nil {
+		acc.buffer = h.samples[id]
+	}
+	if b.warm {
+		acc.identityRef, acc.knownRef = g.ref, g.known
+	} else if acc.buffer == nil {
+		acc.identityRef, acc.knownRef = h.series.Ref(id)
+	}
 	if acc.buffer == nil {
 		acc.isNew = true
-		acc.identityRef, acc.knownRef = h.series.Ref(id)
+		if acc.knownRef && h.logged != nil {
+			acc.isNew = !h.logged.contains(acc.identityRef)
+		}
 		if !acc.knownRef {
 			if limits.MaxSeries > 0 && int64(h.series.Len()+b.registered) >= limits.MaxSeries {
 				return rejectCardinality

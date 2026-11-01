@@ -88,6 +88,7 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context) error {
 	for _, p := range e.parts {
 		live[p.prefix] = struct{}{}
 	}
+	e.partLifetimes.protect(live)
 
 	// A wanted part's objects are not orphans, they are what is left of it. Deleting the readable
 	// remainder of a part repair is about to fetch destroys evidence and buys nothing: the want
@@ -174,14 +175,18 @@ func (e *Engine) reclaimRetired(ctx context.Context) {
 	}
 
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.reclaimRetiredLocked(ctx)
+}
 
+func (e *Engine) reclaimRetiredLocked(ctx context.Context) {
 	var (
 		deletable []*part
 		kept      []*part
 	)
 
 	for _, p := range e.retiring {
-		if p.refs.Load() == 0 {
+		if p.reclaimable() && !e.partLifetimes.held(p.prefix) {
 			deletable = append(deletable, p)
 		} else {
 			kept = append(kept, p)
@@ -189,31 +194,26 @@ func (e *Engine) reclaimRetired(ctx context.Context) {
 	}
 
 	e.retiring = kept
-	e.mu.Unlock()
-
 	if len(deletable) == 0 {
 		return
 	}
-
-	// A reclaimed part will never be read again — drop its decoded blocks from the cache so they do
-	// not linger as cold weight until LRU pressure evicts them.
-	if e.blockCache != nil {
-		for _, p := range deletable {
-			e.blockCache.evictPrefix(p.prefix)
-		}
-	}
-
 	var failed []*part
-
-	for _, p := range deletable {
-		if err := deletePart(ctx, e.cfg.Backend, p.prefix); err != nil {
-			failed = append(failed, p)
+	// Catalog ownership prevents a reload from reviving this prefix during deletion.
+	// Warm writes and immutable readers remain admitted while the backend does I/O.
+	_ = e.mu.WithWriters(func() error {
+		if e.blockCache != nil {
+			for _, p := range deletable {
+				e.blockCache.evictPrefix(p.prefix)
+			}
 		}
-	}
-
-	if len(failed) > 0 {
-		e.mu.Lock()
-		e.retiring = append(e.retiring, failed...)
-		e.mu.Unlock()
-	}
+		for _, p := range deletable {
+			if err := deletePart(ctx, e.cfg.Backend, p.prefix); err != nil {
+				failed = append(failed, p)
+			} else {
+				e.partLifetimes.forget(p)
+			}
+		}
+		return nil
+	})
+	e.retiring = append(e.retiring, failed...)
 }

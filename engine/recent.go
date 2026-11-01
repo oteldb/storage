@@ -21,8 +21,8 @@ import (
 // within the window) and trims everything older, recomputing the tier's min timestamp. Caller holds
 // e.mu.
 func (e *Engine) populateRecent(detached map[signal.SeriesID]*sampleBuf) {
-	cutoff := e.head.newest - e.cfg.RecentWindow
-	if e.head.newest == 0 { // no samples seen yet ⇒ keep everything this flush
+	cutoff := e.head.maxNewest() - e.cfg.RecentWindow
+	if e.head.maxNewest() == 0 { // no samples seen yet ⇒ keep everything this flush
 		cutoff = 0
 	}
 
@@ -60,6 +60,7 @@ func (e *Engine) trimRecentBelow(cutoff int64) {
 	if !e.recentEnabled() {
 		return
 	}
+	e.trimMemoryRecent(cutoff)
 
 	e.recentMin = maxInt64
 

@@ -34,6 +34,7 @@ func (e *Engine) CountGrid(ctx context.Context, r fetch.Request, grid fetch.Wind
 		return nil, err
 	}
 	p := cp.plan
+	cp.includeMemoryRuns(presence)
 	span.SetAttributes(attribute.Int("storage.series_matched", len(p.ids)),
 		attribute.Int("storage.parts_scanned", len(p.liveParts)), attribute.Int("storage.grid_steps", grid.NumSteps))
 	if len(p.ids) == 0 {

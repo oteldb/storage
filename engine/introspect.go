@@ -168,6 +168,13 @@ func (e *Engine) MergeBacklog() int { return e.MergeShape().Backlog }
 // epoch. ok is false when the engine has no WAL. It joins writer ordering because
 // WAL bookkeeping changes while ordinary readers are admitted.
 func (e *Engine) WALState() (segments int, bytes int64, epoch uint64, ok bool) {
+	if e.memoryPublicationEnabled() {
+		e.mu.RLockWriter()
+		defer e.mu.RUnlockWriter()
+		e.walMu.Lock()
+		defer e.walMu.Unlock()
+		return e.cfg.WAL.Segments(), e.cfg.WAL.Bytes(), e.cfg.WAL.Epoch(), true
+	}
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
 

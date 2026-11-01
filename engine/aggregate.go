@@ -267,17 +267,13 @@ func (e *Engine) bucketSeries(
 		}
 	}
 
-	for _, b := range plan.memBatches(id) {
-		if b == nil {
-			continue
-		}
-
-		for i, ts := range b.Timestamps {
+	plan.forEachMemorySeries(id, func(samples memorySamples) {
+		for i, ts := range samples.ts {
 			if ts >= plan.start && ts <= plan.end {
-				grid.addSample(ts, b.Values[i], b.ScaleFactor(i))
+				grid.addSample(ts, samples.values[i], weightAt(samples.sf, i))
 			}
 		}
-	}
+	})
 
 	return nil
 }
@@ -401,6 +397,13 @@ func planMemSpans(plan *enginePlan, dst []tsSpan) []tsSpan {
 			dst = append(dst, tsSpan{lo, hi})
 		}
 	}
+	plan.forEachMemoryRun(func(run *memoryRun) bool {
+		dst = append(dst, tsSpan{run.minTS, run.maxTS})
+		if run.duplicates {
+			dst = append(dst, tsSpan{run.minTS, run.maxTS})
+		}
+		return true
+	})
 
 	return dst
 }
@@ -422,6 +425,14 @@ func planMemSpan(plan *enginePlan) (lo, hi int64, ok bool) {
 
 		lo, hi = min(lo, l), max(hi, h)
 	}
+	plan.forEachMemoryRun(func(run *memoryRun) bool {
+		if !ok {
+			lo, hi, ok = run.minTS, run.maxTS, true
+		} else {
+			lo, hi = min(lo, run.minTS), max(hi, run.maxTS)
+		}
+		return true
+	})
 
 	return lo, hi, ok
 }
@@ -475,13 +486,13 @@ func (e *Engine) aggViaStats(ctx context.Context, plan *enginePlan, id signal.Se
 		plan.samplesDecoded += foldRange(&agg, dp, rng, plan.start, plan.end)
 	}
 
-	for _, b := range plan.memBatches(id) {
-		if b == nil {
-			continue
+	plan.forEachMemorySeries(id, func(samples memorySamples) {
+		for i, ts := range samples.ts {
+			if ts >= plan.start && ts <= plan.end {
+				agg.addSample(samples.values[i], weightAt(samples.sf, i))
+			}
 		}
-
-		foldBatch(&agg, b, plan.start, plan.end)
-	}
+	})
 
 	return agg, nil
 }
@@ -529,17 +540,6 @@ func foldRange(agg *SeriesAgg, dp *decodedPart, rng rowRange, start, end int64) 
 	}
 
 	return n
-}
-
-// foldBatch folds a fetch batch's values whose timestamp is within [start, end].
-func foldBatch(agg *SeriesAgg, b *fetch.Batch, start, end int64) {
-	for i, ts := range b.Timestamps {
-		if ts < start || ts > end {
-			continue
-		}
-
-		agg.addSample(b.Values[i], b.ScaleFactor(i))
-	}
 }
 
 // weightAt reads sample i's lossy-sampling weight from a scale-factor column, defaulting to 1 when

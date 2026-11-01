@@ -4,6 +4,8 @@ import (
 	"context"
 	"slices"
 
+	"github.com/oteldb/storage/index/postings"
+	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/index/symbols"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -34,20 +36,20 @@ func (e *Engine) LabelNames(ctx context.Context, r fetch.Request) ([]string, err
 
 	defer pr.release()
 
-	e.mu.RLock()
+	pr.lock(e)
 	defer e.mu.RUnlock()
 
 	if len(r.Matchers) > 0 {
-		return e.matchedLabelNames(ctx, pr, r)
+		return e.matchedLabelNames(ctx, pr)
 	}
 
 	var (
 		out    []string
 		names  []uint32
-		nameOf = e.head.sym
+		nameOf = pr.sym
 	)
 
-	e.head.post.ForEachName(func(nameID uint32, _, _ int) { names = append(names, nameID) })
+	pr.post.ForEachName(func(nameID uint32, _, _ int) { names = append(names, nameID) })
 
 	for _, nameID := range names {
 		live, err := pr.nameLive(ctx, e, nameID)
@@ -79,14 +81,14 @@ func (e *Engine) LabelValues(ctx context.Context, r fetch.Request, name []byte) 
 
 	defer pr.release()
 
-	e.mu.RLock()
+	pr.lock(e)
 	defer e.mu.RUnlock()
 
 	if len(r.Matchers) > 0 {
-		return e.matchedLabelValues(ctx, pr, r, name)
+		return e.matchedLabelValues(ctx, pr, name)
 	}
 
-	nameID, ok := e.head.sym.Lookup(name)
+	nameID, ok := pr.sym.Lookup(name)
 	if !ok {
 		return nil, nil
 	}
@@ -96,7 +98,7 @@ func (e *Engine) LabelValues(ctx context.Context, r fetch.Request, name []byte) 
 		scratch []byte
 	)
 
-	for _, valueID := range e.head.post.LabelValues(uint32(nameID)) {
+	for _, valueID := range pr.post.LabelValues(uint32(nameID)) {
 		live, err := pr.valueLive(ctx, e, uint32(nameID), valueID)
 		if err != nil {
 			return nil, err
@@ -106,7 +108,7 @@ func (e *Engine) LabelValues(ctx context.Context, r fetch.Request, name []byte) 
 			continue
 		}
 
-		raw, ok := e.head.sym.Get(symbols.ID(valueID))
+		raw, ok := pr.sym.Get(symbols.ID(valueID))
 		if !ok {
 			continue
 		}
@@ -127,10 +129,10 @@ func (e *Engine) LabelValues(ctx context.Context, r fetch.Request, name []byte) 
 
 // matchedLabelNames is [Engine.LabelNames] restricted to a matcher set: the matched ids are the
 // narrow set already, so it reads each live identity's names directly. Caller holds e.mu.
-func (e *Engine) matchedLabelNames(ctx context.Context, pr *labelProbe, r fetch.Request) ([]string, error) {
+func (e *Engine) matchedLabelNames(ctx context.Context, pr *labelProbe) ([]string, error) {
 	seen := make(map[string]struct{})
 
-	for _, id := range e.head.resolve(r.Matchers) {
+	for _, id := range pr.ids {
 		live, err := pr.seriesLive(ctx, e, id)
 		if err != nil {
 			return nil, err
@@ -140,7 +142,7 @@ func (e *Engine) matchedLabelNames(ctx context.Context, pr *labelProbe, r fetch.
 			continue
 		}
 
-		s, ok := e.head.series.Get(id)
+		s, ok := pr.registry.Get(id)
 		if !ok {
 			continue
 		}
@@ -161,14 +163,14 @@ func (e *Engine) matchedLabelNames(ctx context.Context, pr *labelProbe, r fetch.
 // matchedLabelValues is [Engine.LabelValues] restricted to a matcher set: it reads only the
 // requested name off each live matched identity, never a whole label set. Caller holds e.mu.
 func (e *Engine) matchedLabelValues(
-	ctx context.Context, pr *labelProbe, r fetch.Request, name []byte,
+	ctx context.Context, pr *labelProbe, name []byte,
 ) ([]string, error) {
 	var (
 		seen    = make(map[string]struct{})
 		scratch []byte
 	)
 
-	for _, id := range e.head.resolve(r.Matchers) {
+	for _, id := range pr.ids {
 		live, err := pr.seriesLive(ctx, e, id)
 		if err != nil {
 			return nil, err
@@ -178,7 +180,7 @@ func (e *Engine) matchedLabelValues(
 			continue
 		}
 
-		s, ok := e.head.series.Get(id)
+		s, ok := pr.registry.Get(id)
 		if !ok {
 			continue
 		}
@@ -234,7 +236,23 @@ func forEachLabelName(s signal.Series, fn func(name []byte)) {
 // holds the acquired in-window parts, whose indexes are **warmed before the engine lock is taken**,
 // so every probe under the lock is a pure in-memory binary search.
 type labelProbe struct {
-	plan *enginePlan
+	plan     *enginePlan
+	registry *series.Index
+	post     *postings.Dense
+	sym      *symbols.Table
+	ids      []signal.SeriesID
+	live     map[signal.SeriesID]struct{}
+}
+
+func (p *labelProbe) lock(e *Engine) {
+	e.mu.RLock()
+	for !p.post.Sorted() {
+		e.mu.RUnlock()
+		e.mu.LockState()
+		p.post.EnsureSorted()
+		e.mu.UnlockState()
+		e.mu.RLock()
+	}
 }
 
 func (e *Engine) newLabelProbe(ctx context.Context, r fetch.Request) (*labelProbe, error) {
@@ -252,6 +270,20 @@ func (e *Engine) newLabelProbe(ctx context.Context, r fetch.Request) (*labelProb
 	}
 
 	plan := e.planExistence(nil, r, false)
+	pr := &labelProbe{plan: plan, registry: e.head.series, post: e.head.post, sym: e.head.sym}
+	if len(r.Matchers) > 0 {
+		pr.ids = e.head.resolve(r.Matchers)
+	}
+	for _, buffers := range [3]map[signal.SeriesID]*sampleBuf{e.head.samples, e.flushing, e.recent} {
+		for id, buffer := range buffers {
+			if bufHasInWindow(buffer, r.Start, r.End) {
+				if pr.live == nil {
+					pr.live = make(map[signal.SeriesID]struct{})
+				}
+				pr.live[id] = struct{}{}
+			}
+		}
+	}
 	e.mu.RUnlock()
 
 	for _, p := range plan.liveParts {
@@ -262,21 +294,18 @@ func (e *Engine) newLabelProbe(ctx context.Context, r fetch.Request) (*labelProb
 		}
 	}
 
-	return &labelProbe{plan: plan}, nil
+	return pr, nil
 }
 
 func (p *labelProbe) release() { p.plan.releaseParts() }
 
 // seriesLive reports whether id has an in-window sample in memory or lives in a window-overlapping
 // part. Caller holds e.mu.
-func (p *labelProbe) seriesLive(ctx context.Context, e *Engine, id signal.SeriesID) (bool, error) {
-	start, end := p.plan.start, p.plan.end
-
-	if bufHasInWindow(e.head.samples[id], start, end) || bufHasInWindow(e.flushing[id], start, end) {
+func (p *labelProbe) seriesLive(ctx context.Context, _ *Engine, id signal.SeriesID) (bool, error) {
+	if _, live := p.live[id]; live {
 		return true, nil
 	}
-
-	if e.recentEnabled() && bufHasInWindow(e.recent[id], start, end) {
+	if p.plan.memoryRunPresent(id) {
 		return true, nil
 	}
 
@@ -293,9 +322,9 @@ func (p *labelProbe) seriesLive(ctx context.Context, e *Engine, id signal.Series
 // valueLive reports whether any series carrying nameID=valueID is live, stopping at the first one.
 // Caller holds e.mu.
 func (p *labelProbe) valueLive(ctx context.Context, e *Engine, nameID, valueID uint32) (bool, error) {
-	it := e.head.post.Get(nameID, valueID)
+	it := p.post.Get(nameID, valueID)
 	for it.Next() {
-		live, err := p.seriesLive(ctx, e, e.head.series.ID(uint32(it.At().Lo)))
+		live, err := p.seriesLive(ctx, e, p.registry.ID(uint32(it.At().Lo)))
 		if err != nil {
 			return false, err
 		}
@@ -310,7 +339,7 @@ func (p *labelProbe) valueLive(ctx context.Context, e *Engine, nameID, valueID u
 
 // nameLive reports whether any series carrying nameID (with any value) is live. Caller holds e.mu.
 func (p *labelProbe) nameLive(ctx context.Context, e *Engine, nameID uint32) (bool, error) {
-	for _, valueID := range e.head.post.LabelValues(nameID) {
+	for _, valueID := range p.post.LabelValues(nameID) {
 		live, err := p.valueLive(ctx, e, nameID, valueID)
 		if err != nil {
 			return false, err
