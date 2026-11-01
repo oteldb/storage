@@ -114,7 +114,8 @@ var errStatsCorrupt = errors.New("engine: corrupt series-stats sidecar")
 // weight is 1 there, so Count is integral and equals Rows. A sampled part has no sidecar and takes
 // the weighted decode path, which is why weighting the aggregate needs no format change here.
 func encodeSeriesStats(ids []chunk.U128, stats []SeriesAgg) []byte {
-	buf := make([]byte, 0, 8+len(ids)*40)
+	const entryBytes = 16 + binary.MaxVarintLen64 + 3*8
+	buf := make([]byte, 0, 8+binary.MaxVarintLen64+len(ids)*entryBytes)
 	buf = binary.BigEndian.AppendUint32(buf, statsMagic)
 	buf = binary.AppendUvarint(buf, uint64(len(ids)))
 

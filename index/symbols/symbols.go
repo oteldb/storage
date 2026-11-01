@@ -7,6 +7,7 @@ package symbols
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"math/bits"
 	"slices"
 
 	"github.com/go-faster/errors"
@@ -117,6 +118,11 @@ func (t *Table) Release() {
 //	[u32 CRC32C]
 func (t *Table) Encode(dst []byte) []byte {
 	start := len(dst)
+	bytes := 8 + uvarintLen(uint64(symbolsVersion)) + uvarintLen(uint64(len(t.syms)))
+	for _, symbol := range t.syms {
+		bytes += uvarintLen(uint64(len(symbol))) + len(symbol)
+	}
+	dst = slices.Grow(dst, bytes)
 
 	w := bitstream.NewWriter(dst)
 	binary.BigEndian.PutUint32(w.AppendBytes(4), symbolsMagic)
@@ -133,6 +139,10 @@ func (t *Table) Encode(dst []byte) []byte {
 	crc := crc32.Checksum(out[start:], castagnoli)
 
 	return binary.BigEndian.AppendUint32(out, crc)
+}
+
+func uvarintLen(v uint64) int {
+	return max((bits.Len64(v)+6)/7, 1)
 }
 
 // Decode parses a serialized symbol table. It verifies the CRC and bounds-checks every
