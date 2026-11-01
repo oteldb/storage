@@ -148,7 +148,7 @@ func pickMergeRun(src []*part, capBytes int64, idle int) []*part {
 		best = fallback
 	}
 
-	return inSrcOrder(best, order)
+	return inSrcOrder(preferSeriesLocalRun(bySize, best, capBytes), order)
 }
 
 // eligibleBySize returns the unsealed parts ordered by size, plus each part's position in src so

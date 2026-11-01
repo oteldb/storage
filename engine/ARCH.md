@@ -723,6 +723,13 @@ MergeWith(MergeOptions{RetainFrom, Downsample, Recompress, Precision})
 Compacts a bounded, size-tiered group of parts, never the whole set. All five modes are the one merge
 engine; no parallel subsystem.
 
+Within one time bucket, selection also examines windows ordered by series-ID bounds. A local window
+must retain at least 90% of the size-only run's byte-balance multiplier and double its range density
+(at least two), while preserving byte caps, spread guards and the 16-input limit. Repeated hash ranges
+across flushes can then share per-series sidecars instead of rewriting disjoint identities together.
+Bounds are an overlap estimate, never evidence for dropping samples; unknown bounds keep size-only
+selection. Selected inputs return to source order so duplicate-timestamp precedence is unchanged.
+
 | mode | effect |
 |---|---|
 | compact | merge per series by timestamp: freshest wins, representatives fold |
