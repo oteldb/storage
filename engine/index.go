@@ -961,6 +961,11 @@ func (e *Engine) tenureLocked(stamp uint64) error {
 
 // establishTenure is [Engine.establishTenureLocked] for a caller holding neither lock.
 func (e *Engine) establishTenure(ctx context.Context) error {
+	if e.cfg.Term == nil || e.cfg.Backend == nil {
+		return nil
+	}
+	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.establishTenure")
+	defer span.End()
 	e.flushMu.Lock()
 	defer e.flushMu.Unlock()
 
