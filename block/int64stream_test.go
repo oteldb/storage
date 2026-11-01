@@ -56,6 +56,12 @@ func TestInt64CursorAndBound(t *testing.T) {
 				require.ErrorIs(t, err, ErrCorrupt)
 				_, _, ok = r.Int64ScanBound(t.Context(), "missing")
 				require.False(t, ok)
+				column, err := r.Column(t.Context(), "ts")
+				require.NoError(t, err)
+				whole, err := column.BlockDecoder()
+				require.NoError(t, err)
+				_, _, ok = whole.Int64StreamBound()
+				require.False(t, ok, "a whole-object decoder retains the encoded directory prefix")
 			})
 		}
 	}

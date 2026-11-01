@@ -62,9 +62,9 @@ func (r *PartReader) Int64ScanBound(ctx context.Context, name string) (retained,
 	return retained, transient, true
 }
 
-// Int64StreamBound is [PartReader.Int64ScanBound] recovered from an opened decoder's directory.
+// Int64StreamBound recovers [PartReader.Int64ScanBound] for ranged decoders; whole-object decoders are unsupported.
 func (d *Decoder) Int64StreamBound() (retained, transient int64, ok bool) {
-	if d.kind != KindInt64 || d.shared.on || d.streams.dir.frameRaw == nil || len(d.streams.dir.frameOff) == 0 {
+	if d.kind != KindInt64 || d.shared.on || d.streams.dir.src == nil || d.streams.dir.frameRaw == nil || len(d.streams.dir.frameOff) == 0 {
 		return 0, 0, false
 	}
 	switch d.codec {

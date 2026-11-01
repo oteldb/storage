@@ -7,6 +7,7 @@ import (
 	"github.com/go-faster/errors"
 	"go.opentelemetry.io/otel/attribute"
 
+	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -173,7 +174,7 @@ func (p *enginePlan) proveGridSeries(ctx context.Context, id signal.SeriesID, pr
 }
 
 func (p *enginePlan) gridPart(ctx context.Context, pt *part, rng rowRange, presence *gridPresence) error {
-	if desc, ok := pt.reader.ColumnDescByName(colTs); ok && desc.Const {
+	if desc, ok := pt.reader.ColumnDescByName(colTs); ok && desc.Kind == block.KindInt64 && desc.Const {
 		if ts := desc.ConstInt64; ts >= p.start && ts <= p.end {
 			presence.sample(ts)
 		}
