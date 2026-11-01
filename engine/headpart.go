@@ -2,25 +2,32 @@ package engine
 
 import (
 	"context"
-	"slices"
 
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
+	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/buildbudget"
+	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/signal"
 )
 
 const defaultFlushMemoryBytes = 64 << 20
 
+type headRunEntry struct {
+	id      signal.SeriesID
+	buf     *sampleBuf
+	ref     uint32
+	ordered bool
+}
+
 type headPartBuilder struct {
 	ctx     context.Context //nolint:containedctx // The builder and its streaming writes share one flush lifetime.
 	e       *Engine
-	samples map[signal.SeriesID]*sampleBuf
 	view    series.View
-	refs    []uint32
+	entries []headRunEntry
 
 	identities   series.EncodingBudget
 	encoded      int64
@@ -46,12 +53,15 @@ func (e *Engine) flushMemoryBytes() int64 {
 }
 
 func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sampleBuf) ([]*part, int, error) {
-	b := headPartBuilder{ctx: ctx, e: e, samples: samples, target: e.flushMemoryBytes()}
-	if err := b.reserve(b.target); err != nil {
+	b := headPartBuilder{ctx: ctx, e: e, target: e.flushMemoryBytes()}
+	capacity := min(len(samples), max(1, int(b.target/1024)))
+	buffers := buildbudget.Mul(int64(capacity), memsize.Of[headRunEntry]()+memsize.Of[uint32]())
+	if err := b.reserve(max(b.target, buildbudget.Add(b.baseBytes(), buffers))); err != nil {
 		return nil, 0, err
 	}
-	// Only a bounded run is indexed, even if the frozen generation contains millions of series.
-	b.refs = make([]uint32, 0, min(len(samples), int(b.target/1024)))
+	// Entry buffers never grow: a full run seals before another entry is retained.
+	b.entries = make([]headRunEntry, 0, capacity)
+	b.partRefs = make([]uint32, 0, capacity)
 	defer func() {
 		if b.writer != nil {
 			b.writer.abort()
@@ -80,7 +90,7 @@ func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sa
 			if buf == nil || len(buf.ts) == 0 {
 				return nil
 			}
-			return b.add(ref, buf)
+			return b.add(id, ref, buf)
 		})
 	}
 	if err == nil {
@@ -102,7 +112,7 @@ func (b *headPartBuilder) baseBytes() int64 {
 	}
 	n := buildbudget.Add(8<<20, buildbudget.Mul(int64(blockRows), 64))
 	n = buildbudget.Add(n, b.orderWorkspace)
-	return buildbudget.Add(n, buildbudget.Mul(int64(cap(b.refs)+cap(b.partRefs)), 4))
+	return buildbudget.Add(n, memsize.Slice(b.entries)+memsize.Slice(b.partRefs))
 }
 
 func (b *headPartBuilder) partRows() int {
@@ -136,16 +146,24 @@ func (b *headPartBuilder) reserve(bytes int64) error {
 	return nil
 }
 
-func (b *headPartBuilder) add(ref uint32, buf *sampleBuf) error {
+func (b *headPartBuilder) add(id signal.SeriesID, ref uint32, buf *sampleBuf) error {
+	if len(b.entries) == cap(b.entries) {
+		if err := b.flushRun(); err != nil {
+			return err
+		}
+	}
+	ordered := ascendingInt64(buf.ts)
+	encoded := b.view.EncodingBytes(int(ref))
+	materialized := b.view.MaterializationBytes(int(ref))
 	var sorting int64
-	if !ascendingInt64(buf.ts) {
+	if !ordered {
 		// sortedWindow retains its tuple scratch and up to three owned numeric columns.
 		sorting = buildbudget.Mul(int64(len(buf.ts)), 48)
 	}
 	single := buildbudget.Add(b.baseBytes(), b.view.IdentityWorkspace(int(ref)))
-	single = buildbudget.Add(single, b.view.MaterializationBytes(int(ref)))
+	single = buildbudget.Add(single, materialized)
 	single = buildbudget.Add(single, sorting)
-	single = buildbudget.Add(single, buildbudget.Mul(b.view.EncodingBytes(int(ref)), 4))
+	single = buildbudget.Add(single, buildbudget.Mul(encoded, 4))
 	if single > b.target {
 		if err := b.flushRun(); err != nil {
 			return err
@@ -155,35 +173,35 @@ func (b *headPartBuilder) add(ref uint32, buf *sampleBuf) error {
 		}
 	}
 	b.identities.Add(b.view, int(ref))
-	estimate := b.estimate(ref, len(buf.ts), sorting)
+	estimate := b.estimate(encoded, materialized, len(buf.ts), sorting)
 	maxRows := b.partRows()
-	if len(b.refs) > 0 && (estimate > b.target || maxRows > 0 && b.runRows+int64(len(buf.ts)) > int64(maxRows)) {
+	if len(b.entries) > 0 && (estimate > b.target || maxRows > 0 && b.runRows+int64(len(buf.ts)) > int64(maxRows)) {
 		if err := b.flushRun(); err != nil {
 			return err
 		}
 		b.identities.Add(b.view, int(ref))
-		estimate = b.estimate(ref, len(buf.ts), sorting)
+		estimate = b.estimate(encoded, materialized, len(buf.ts), sorting)
 	}
 	if estimate > b.reserved {
 		if err := b.reserve(estimate); err != nil {
 			return err
 		}
 	}
-	b.encoded = buildbudget.Add(b.encoded, b.view.EncodingBytes(int(ref)))
-	b.materialized = max(b.materialized, b.view.MaterializationBytes(int(ref)))
+	b.encoded = buildbudget.Add(b.encoded, encoded)
+	b.materialized = max(b.materialized, materialized)
 	b.sorting = max(b.sorting, sorting)
 	b.runRows = buildbudget.Add(b.runRows, int64(len(buf.ts)))
-	b.refs = append(b.refs, ref)
+	b.entries = append(b.entries, headRunEntry{id: id, buf: buf, ref: ref, ordered: ordered})
 	return nil
 }
 
-func (b *headPartBuilder) estimate(ref uint32, rows int, sorting int64) int64 {
+func (b *headPartBuilder) estimate(encoded, materialized int64, rows int, sorting int64) int64 {
 	n := b.baseBytes()
 	n = buildbudget.Add(n, b.identities.Bytes())
-	n = buildbudget.Add(n, buildbudget.Mul(buildbudget.Add(b.encoded, b.view.EncodingBytes(int(ref))), 4))
+	n = buildbudget.Add(n, buildbudget.Mul(buildbudget.Add(b.encoded, encoded), 4))
 	// Runs, sidecars, references, their serialized forms and slice growth are per identity.
-	n = buildbudget.Add(n, buildbudget.Mul(int64(len(b.refs)+1), 512))
-	n = buildbudget.Add(n, max(b.materialized, b.view.MaterializationBytes(int(ref))))
+	n = buildbudget.Add(n, buildbudget.Mul(int64(len(b.entries)+1), 512))
+	n = buildbudget.Add(n, max(b.materialized, materialized))
 	n = buildbudget.Add(n, max(b.sorting, sorting))
 	if !backend.StreamsWrites(b.e.cfg.Backend) {
 		partRows := buildbudget.Add(b.runRows, int64(rows))
@@ -196,37 +214,36 @@ func (b *headPartBuilder) estimate(ref uint32, rows int, sorting int64) int64 {
 }
 
 func (b *headPartBuilder) flushRun() error {
-	if len(b.refs) == 0 {
+	if len(b.entries) == 0 {
 		return nil
 	}
-	b.partRefs = slices.Grow(b.partRefs, max(len(b.refs)-len(b.partRefs), 0))
-	for _, ref := range b.refs {
+	for _, entry := range b.entries {
 		if err := b.ctx.Err(); err != nil {
 			return err
 		}
-		id := b.view.ID(int(ref))
-		buf := b.samples[id]
+		buf := entry.buf
 		ts, values, sf := buf.ts, buf.values, buf.sf
-		if !ascendingInt64(ts) {
+		if !entry.ordered {
 			ts, values, sf = sortedWindow(buf, minInt64, maxInt64, nil)
 		}
-		if err := b.append(ref, ts, values, sf); err != nil {
+		if err := b.append(idToU128(entry.id), entry.ref, ts, values, sf); err != nil {
 			return err
 		}
 	}
 	if err := b.finish(); err != nil {
 		return err
 	}
-	b.refs = b.refs[:0]
+	clear(b.entries)
+	b.entries = b.entries[:0]
 	b.identities.Reset()
 	b.encoded, b.materialized, b.sorting, b.runRows = 0, 0, 0, 0
-	if b.reserved > b.target {
-		return b.reserve(b.target)
+	if next := max(b.target, buildbudget.Add(b.baseBytes(), b.identities.Bytes())); b.reserved > next {
+		return b.reserve(next)
 	}
 	return nil
 }
 
-func (b *headPartBuilder) append(ref uint32, ts []int64, values, sf []float64) error {
+func (b *headPartBuilder) append(id chunk.U128, ref uint32, ts []int64, values, sf []float64) error {
 	chunkRows := b.e.cfg.MetricBlockRows
 	if chunkRows <= 0 {
 		chunkRows = DefaultMetricBlockRows
@@ -241,7 +258,7 @@ func (b *headPartBuilder) append(ref uint32, ts []int64, values, sf []float64) e
 			if err != nil {
 				return err
 			}
-			if err := b.writer.reserveSeries(len(b.refs)); err != nil {
+			if err := b.writer.reserveSeries(len(b.entries)); err != nil {
 				return err
 			}
 			b.writerRows = b.partRows()
@@ -255,7 +272,6 @@ func (b *headPartBuilder) append(ref uint32, ts []int64, values, sf []float64) e
 		if sf != nil {
 			weights = sf[lo:hi]
 		}
-		id := idToU128(b.view.ID(int(ref)))
 		if len(b.writer.runs) == 0 || b.writer.runs[len(b.writer.runs)-1].Value != id {
 			b.partRefs = append(b.partRefs, ref)
 		}
