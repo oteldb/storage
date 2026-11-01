@@ -100,6 +100,11 @@ only one frozen generation per engine; no extra flush queue or parallel appender
 
 The index (`symbols`+`series`+`postings`) plus per-series `(ts, value)` buffers.
 
+Exact matcher specs and finite string hints seek symbol IDs and postings directly when a label
+has only string values. A metered set of names with non-string values keeps those labels on the
+full predicate scan, preserving canonical text equality across types. Necessary hints still run
+the original predicate; absent-label unions are unchanged. Identity rebuilds replace the set too.
+
 Metric flushes emit identities in canonical SeriesID order across the whole frozen generation,
 then split that stream by the existing encoding/workspace limits. Parts from one generation have
 non-overlapping ID ranges, except where one oversized series spans several parts. First/last IDs
@@ -1426,6 +1431,13 @@ without enlarging the resident set. Cache-off, or constant/unblocked columns, de
 series-skipped to the blocks the matched row ranges touch. With the cache on a fetch also prefetches
 the parts it will touch.
 
+The same byte budget caches immutable decoder prototypes, including their validated directories,
+under a separate per-column key. Every operation clones fresh frame state and binds its own context;
+the cached prototype retains no request context or frame scratch. Metadata entries remain pinned
+until their readers finish, including after byte-budget eviction, and retire with their part prefix.
+Parsed directories therefore share the decode-cache ceiling rather than accumulating per part
+outside that budget. Cache hits/misses include metadata opens as well as decoded blocks.
+
 Metric numeric columns pack codec streams into compression frames of at least 8 KiB. A selective
 host query needs few granules in each part, so large frames amplify its reads and decompression
 scratch. The packing is recorded in the directory and old frame sizes remain readable. Granule
@@ -1501,6 +1513,15 @@ at a time", so the wait is bounded twice and a missing scope costs latency and m
   query. `used == 0` still admits unconditionally.
 
 ## Count and series enumeration
+
+`CountGrid` resolves identity once for all left-open, right-closed windows. Head, frozen and recent
+timestamps become compact per-series presence intervals under the read lock. A part wholly in the
+windows' common intersection proves every step from its series index, before any numeric reader
+or decode admission is needed. Remaining series use part-bound proofs followed by timestamp-only
+block reads; older unframed timestamps use the same timestamp-only whole-column fallback as Count.
+Duplicates and sampling weights do not multiply presence. One reusable bitset feeds per-group
+difference arrays; there is no matched-series by step matrix. Admission includes snapshot metadata,
+group outputs and the timestamp decode estimate; head snapshots precede admission as in Fetch.
 
 An existence plan stops once every selected ID is proven present. When its in-memory flags already
 cover the selection, Count and CountBy skip part-reader setup and decode admission entirely; a

@@ -312,6 +312,12 @@ Two things the batch writer settles by looking at a finished column, a streaming
 Both are right for different callers: the whole-object form when a caller decodes the whole column,
 the ranged form on the query path, where the matched series' rows lie in a handful of granules.
 
+`Decoder.Clone(ctx)` shares the immutable directory and dictionary while creating fresh context-bound
+frame sources, decode buffers and dictionary-generation owners. `MetadataBytes` estimates only that
+shared state; `ResidentBytes` also bounds the scratch of an active decode walk. An embedder may cache
+an unused prototype within its byte budget and clone it per operation, without sharing mutable read
+state or retaining the prototype creator's request context.
+
 A whole-column read makes cost independent of selectivity — a selector matching 16 of 210k series
 still transfers every column byte — so **part size bounds process memory rather than disk**. The
 engine decodes only the granules it needs (`engine/ARCH.md`, the block-sliced fetch); the ranged form

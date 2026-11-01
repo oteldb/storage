@@ -207,6 +207,9 @@ to fail over to: a read overlapping a want fails.
   matched series (the metric engine and the fan-out `Merge` both hold one series at a time). The
   producer therefore holds the iteration's resources (pinned parts, decode-memory reservation, child
   iterators) until `Close`, which every caller owes it; `fetch.Drain` closes what it drains.
+- **Count grids use presence.** Optional `fetch.GridCounter` answers uniform windows from
+  identity, existence proofs and timestamps. It shares query scope and memory admission with
+  fetches, omits value decoding, and requires explicit fanout support for exact distributed counts.
 - **Coordination is external/minimal.** etcd for membership/claims, backend CAS for commits. No
   homegrown Raft; single-node works with the cluster layer absent.
 - **A write is acked only by a node that can prove it owns the shard.** Compaction claims hang off

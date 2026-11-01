@@ -47,7 +47,8 @@ type seriesBlockReader struct {
 	// has copied the samples out — the fetch releases them per series (releaseSeriesPins) and sweeps
 	// the rest at teardown (releasePins). One entry may appear more than once (a block revisited
 	// after the memo moved on); each pin has one release.
-	pins []*blockEntry
+	pins        []*blockEntry
+	decoderPins []*blockEntry
 }
 
 // newSeriesBlockReader returns a reader for part if it is block-sliceable (ts/value, and sf when
@@ -314,6 +315,10 @@ func (r *seriesBlockReader) releaseSeriesPins() {
 // evicted block's buffer return to the pool. The fetch calls it at teardown, after any views into
 // these blocks are dead.
 func (r *seriesBlockReader) releasePins() {
+	for _, entry := range r.decoderPins {
+		r.engine.blockCache.release(entry)
+	}
+	r.decoderPins = nil
 	for _, e := range r.pins {
 		r.engine.blockCache.release(e)
 	}
@@ -329,5 +334,23 @@ func (r *seriesBlockReader) releasePins() {
 // them are fetched as blocks are decoded. Reading the object whole here is what made a selector
 // matching 16 series pay for all of them.
 func (r *seriesBlockReader) partDecoder(ctx context.Context, name string) (*block.Decoder, error) {
-	return r.part.reader.ColumnBlocks(ctx, name)
+	if r.engine == nil || r.engine.blockCache == nil {
+		return r.part.reader.ColumnBlocks(ctx, name)
+	}
+	var cid colID
+	switch name {
+	case colTs:
+		cid = colTsID
+	case colValue:
+		cid = colValID
+	case colSF:
+		cid = colSFID
+	default:
+		return r.part.reader.ColumnBlocks(ctx, name)
+	}
+	decoder, pin, err := r.engine.partBlockDecoder(ctx, r.part, name, cid)
+	if pin != nil {
+		r.decoderPins = append(r.decoderPins, pin)
+	}
+	return decoder, err
 }

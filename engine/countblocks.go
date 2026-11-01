@@ -8,20 +8,24 @@ func (p *enginePlan) prepareCountReaders() {
 		if pt.minTime >= p.start && pt.maxTime <= p.end {
 			continue
 		}
-		desc, ok := pt.reader.ColumnDescByName(colTs)
-		if !ok || !desc.Blocked || !desc.Framed || pt.reader.Manifest().GranuleSize <= 0 {
-			continue
+		p.prepareTimestampReader(pt)
+	}
+}
+
+func (p *enginePlan) prepareTimestampReader(pt *part) {
+	desc, ok := pt.reader.ColumnDescByName(colTs)
+	if !ok || !desc.Blocked || !desc.Framed || pt.reader.Manifest().GranuleSize <= 0 {
+		return
+	}
+	if p.blockReaders == nil {
+		p.blockReaders = make(map[*part]*seriesBlockReader)
+		if p.engine.blockCache != nil {
+			p.engine.blockCache.fetchStart()
 		}
-		if p.blockReaders == nil {
-			p.blockReaders = make(map[*part]*seriesBlockReader)
-			if p.engine.blockCache != nil {
-				p.engine.blockCache.fetchStart()
-			}
-		}
-		p.blockReaders[pt] = &seriesBlockReader{
-			engine: p.engine, part: pt, blockRows: pt.reader.Manifest().GranuleSize,
-			tsB: -1, valB: -1, sfB: -1,
-		}
+	}
+	p.blockReaders[pt] = &seriesBlockReader{
+		engine: p.engine, part: pt, blockRows: pt.reader.Manifest().GranuleSize,
+		tsB: -1, valB: -1, sfB: -1,
 	}
 }
 

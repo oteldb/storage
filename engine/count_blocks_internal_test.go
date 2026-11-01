@@ -100,6 +100,9 @@ func TestCountLegacyScratchRecycled(t *testing.T) {
 	by, err := e.CountBy(ctx, req, []byte("job"))
 	require.NoError(t, err)
 	require.Equal(t, map[string]int{"api": 1}, by)
+	grid, err := e.CountGrid(ctx, req, fetch.WindowGrid{Start: 51, Step: 2, Width: 1, NumSteps: 3}, []byte("job"))
+	require.NoError(t, err)
+	require.Equal(t, map[string][]int{"api": {1, 1, 1}}, grid)
 	require.Same(t, scratch, e.decPool.Get(), "grouped count must return the borrowed scratch too")
 }
 

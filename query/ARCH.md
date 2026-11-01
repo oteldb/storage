@@ -28,6 +28,13 @@ signal's fields stay zero-valued.
 
 Optional capabilities, discovered by walking the `Unwraper` decorator chain:
 
+- **`GridCounter`** — counts series presence across a nanosecond `WindowGrid`, optionally grouped
+  by one label's canonical text. Windows are left-open and right-closed, additionally clipped by
+  the request. Duplicate timestamps and sampling weights do not multiply presence. Single-child
+  decorators expose it; fanouts require an explicit implementation. `promql.CountSeriesGrid`
+  declines hidden-label predicates/grouping or an absent capability with
+  `ErrCountGridUnsupported`, so the embedder retains its full-aggregate fallback.
+
 - **`Limit`/`Reverse`** — ordered top-N. Filtering runs first, the limit selects over survivors.
   The result is a deliberate **superset** (rows tying at the boundary timestamp are kept), so the
   caller's own exact ordering never loses a boundary row. Honored by the record engine; the metric

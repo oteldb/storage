@@ -5,6 +5,8 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+
+	"github.com/oteldb/storage/block"
 )
 
 // blockCache is a byte-bounded LRU over decoded column blocks, keyed by (part prefix, column, block
@@ -61,14 +63,14 @@ const (
 	colSFID
 )
 
-// blockKey identifies one decoded block: a part's prefix, the column, and the block index.
+// blockKey identifies a decoded block; index -1 names the column's immutable decoder metadata.
 type blockKey struct {
 	prefix string
 	col    colID
 	blk    int
 }
 
-// blockEntry is one cached decoded block: exactly one of i64/f64 is set (by the key's column). refs
+// blockEntry holds one decoded block or immutable decoder prototype. refs
 // and evicted are guarded by the owning cache's mu: refs counts the fetches currently reading the
 // block (each get/insert pins, each release unpins), and evicted marks that the entry has left the
 // LRU. The buffer returns to the freelist only when refs hits 0 after evicted is set, so a reader
@@ -77,6 +79,7 @@ type blockEntry struct {
 	key     blockKey
 	i64     []int64
 	f64     []float64
+	decoder *block.Decoder
 	bytes   int64
 	refs    int
 	evicted bool
@@ -196,6 +199,7 @@ func (c *blockCache) release(e *blockEntry) {
 // recycle returns e's decoded buffer to the matching freelist and clears it, so a later miss decodes
 // into it instead of minting a fresh slice. Caller holds c.mu; e must be evicted and unpinned.
 func (c *blockCache) recycle(e *blockEntry) {
+	e.decoder = nil
 	if e.i64 != nil {
 		c.i64Free.put(e.i64)
 		e.i64 = nil

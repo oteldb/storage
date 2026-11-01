@@ -63,6 +63,8 @@ func (e *Engine) assembleFromBlocks(ctx context.Context, dp *decodedPart, p *par
 // built) lazily — only when a block misses — so a full cache hit reads nothing from the backend.
 func (e *Engine) fillIntBlocks(ctx context.Context, dst []int64, p *part, name string, cid colID, blocks []int, blockRows int) error {
 	var bd *block.Decoder
+	var directory *blockEntry
+	defer func() { e.blockCache.release(directory) }()
 
 	for _, blk := range blocks {
 		key := blockKey{prefix: p.prefix, col: cid, blk: blk}
@@ -74,12 +76,13 @@ func (e *Engine) fillIntBlocks(ctx context.Context, dst []int64, p *part, name s
 		}
 
 		if bd == nil {
-			d, err := e.partBlockDecoder(ctx, p, name)
+			d, pin, err := e.partBlockDecoder(ctx, p, name, cid)
 			if err != nil {
 				return err
 			}
 
 			bd = d
+			directory = pin
 		}
 
 		b, err := bd.DecodeInt64Into(blk, e.blockCache.getI64Buf(blockRows))
@@ -129,6 +132,8 @@ func (e *Engine) fillFloatColumn(
 	out := growLen(dst, rows)
 
 	var bd *block.Decoder
+	var directory *blockEntry
+	defer func() { e.blockCache.release(directory) }()
 
 	for _, blk := range blocks {
 		key := blockKey{prefix: p.prefix, col: cid, blk: blk}
@@ -140,12 +145,13 @@ func (e *Engine) fillFloatColumn(
 		}
 
 		if bd == nil {
-			d, err := e.partBlockDecoder(ctx, p, name)
+			d, pin, err := e.partBlockDecoder(ctx, p, name, cid)
 			if err != nil {
 				return nil, err
 			}
 
 			bd = d
+			directory = pin
 		}
 
 		b, err := bd.DecodeFloat64Into(blk, e.blockCache.getF64Buf(blockRows))
@@ -164,6 +170,19 @@ func (e *Engine) fillFloatColumn(
 // partBlockDecoder returns a per-block decoder over the named column, reading its directory rather
 // than its bytes: this path decodes the blocks a query's matched series fall in, so the column
 // object is fetched one compression frame at a time.
-func (e *Engine) partBlockDecoder(ctx context.Context, p *part, name string) (*block.Decoder, error) {
-	return p.reader.ColumnBlocks(ctx, name)
+func (e *Engine) partBlockDecoder(ctx context.Context, p *part, name string, cid colID) (*block.Decoder, *blockEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	key := blockKey{prefix: p.prefix, col: cid, blk: -1}
+	if entry, ok := e.blockCache.get(key); ok {
+		return entry.decoder.Clone(ctx), entry, nil
+	}
+	decoder, err := p.reader.ColumnBlocks(ctx, name)
+	if err != nil {
+		return nil, nil, err
+	}
+	prototype := decoder.Clone(context.Background()) //nolint:contextcheck // Cached metadata must not retain request contexts or values.
+	entry := e.blockCache.insert(&blockEntry{key: key, decoder: prototype, bytes: prototype.MetadataBytes()})
+	return entry.decoder.Clone(ctx), entry, nil
 }
