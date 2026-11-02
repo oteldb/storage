@@ -1,7 +1,10 @@
 package chunk
 
 import (
+	"bytes"
+	"encoding/binary"
 	"math/rand/v2"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -122,6 +125,19 @@ func TestEncodeU128RunsMatchesExpanded(t *testing.T) {
 			{Value: U128{Lo: 9}, Count: 0},
 			{Value: U128{Lo: 7}, Count: 3},
 		}},
+		{"negative counts", []U128Run{
+			{Value: U128{Lo: 9}, Count: -7},
+			{Value: U128{Lo: 7}, Count: 127},
+			{Value: U128{Lo: 9}, Count: -1},
+			{Value: U128{Lo: 7}, Count: 1},
+			{Value: U128{Lo: 8}, Count: -2},
+		}},
+		{"varint boundaries", []U128Run{
+			{Value: U128{Lo: 1}, Count: 127},
+			{Value: U128{Lo: 2}, Count: 128},
+			{Value: U128{Lo: 3}, Count: 16383},
+			{Value: U128{Lo: 4}, Count: 16384},
+		}},
 	}
 
 	for _, tc := range cases {
@@ -136,6 +152,8 @@ func TestEncodeU128RunsMatchesExpanded(t *testing.T) {
 func FuzzEncodeU128Runs(f *testing.F) {
 	f.Add(uint64(1), uint64(2), 8)
 	f.Add(uint64(7), uint64(11), 64)
+	f.Add(uint64(0), uint64(0), 0)
+	f.Add(uint64(127), uint64(128), 512)
 
 	f.Fuzz(func(t *testing.T, hiSeed, loSeed uint64, n int) {
 		if n < 0 || n > 512 {
@@ -148,12 +166,84 @@ func FuzzEncodeU128Runs(f *testing.F) {
 		for i := range runs {
 			runs[i] = U128Run{
 				Value: U128{Hi: rng.Uint64() % 3, Lo: rng.Uint64() % 5},
-				Count: rng.IntN(4), // includes 0
+				Count: rng.IntN(4) - 1,
+			}
+			if i > 0 && rng.IntN(2) == 0 {
+				runs[i].Value = runs[i-1].Value
+			}
+			if rng.IntN(16) == 0 {
+				runs[i].Count = 127 + rng.IntN(2)
 			}
 		}
-
-		require.Equal(t, EncodeU128(nil, expandRuns(runs)), EncodeU128Runs(nil, runs))
+		prefix := bytes.Repeat([]byte{byte(hiSeed)}, int(loSeed%8))
+		want := append(slices.Clone(prefix), EncodeU128(nil, expandRuns(runs))...)
+		dst := make([]byte, len(prefix), len(want)+int(hiSeed%2))
+		copy(dst, prefix)
+		got := EncodeU128Runs(dst, runs)
+		if !bytes.Equal(want, got) || !bytes.Equal(prefix, dst) {
+			t.Fatal("run encoding differs from the expanded column or changed its prefix")
+		}
 	})
+}
+
+func TestEncodeU128RunsAppend(t *testing.T) {
+	t.Parallel()
+	runs := []U128Run{{Value: U128{Lo: 1}, Count: 127}, {Count: -1},
+		{Value: U128{Lo: 1}, Count: 1}, {Value: U128{Hi: 1}, Count: 128}}
+	prefix := []byte{0xff, 0, 0x81}
+	want := append(slices.Clone(prefix), EncodeU128(nil, expandRuns(runs))...)
+	for _, tc := range []struct {
+		name string
+		cap  int
+	}{
+		{"prefix only", len(prefix)},
+		{"short", len(want) - 1},
+		{"exact", len(want)},
+		{"spare", len(want) + 64},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dst := make([]byte, len(prefix), tc.cap)
+			copy(dst, prefix)
+			got := EncodeU128Runs(dst, runs)
+			require.Equal(t, want, got)
+			require.Equal(t, prefix, dst)
+			if tc.cap >= len(want) {
+				require.Same(t, &dst[0], &got[0])
+			}
+		})
+	}
+}
+
+func TestEncodeU128RunsLargeCounts(t *testing.T) {
+	t.Parallel()
+	maxInt := int(^uint(0) >> 1)
+	wrapped := maxInt
+	wrapped++
+	a, b := U128{Hi: 1, Lo: 2}, U128{Hi: 3, Lo: 4}
+	for _, tc := range []struct {
+		name string
+		runs []U128Run
+		rows int
+		ids  []U128
+		n    []uint64
+	}{
+		{"maximum", []U128Run{{a, maxInt}}, maxInt, []U128{a}, []uint64{uint64(maxInt)}},
+		{"adjacent wrap", []U128Run{{a, maxInt}, {a, 1}}, wrapped, []U128{a}, []uint64{uint64(wrapped)}},
+		{"separate wrap", []U128Run{{a, maxInt}, {b, 1}}, wrapped, []U128{a, b}, []uint64{uint64(maxInt), 1}},
+		{"full wrap", []U128Run{{a, maxInt}, {a, maxInt}, {a, 2}}, 0, []U128{a}, []uint64{0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			want := binary.AppendUvarint(nil, uint64(tc.rows))
+			for i, id := range tc.ids {
+				want = binary.BigEndian.AppendUint64(want, id.Hi)
+				want = binary.BigEndian.AppendUint64(want, id.Lo)
+				want = binary.AppendUvarint(want, tc.n[i])
+			}
+			require.Equal(t, want, EncodeU128Runs(nil, tc.runs))
+		})
+	}
 }
 
 func expandRuns(runs []U128Run) []U128 {
